@@ -51,10 +51,16 @@ Reglas:
 let _visionClient = null;
 function getVisionClient() {
   if (_visionClient) return _visionClient;
+  const keyPath = (process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH || '').trim();
+  if (!keyPath) {
+    throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY_PATH no está configurado — Vision desactivado');
+  }
+  const fs = require('fs');
+  if (!fs.existsSync(keyPath)) {
+    throw new Error(`Archivo de credenciales no encontrado: "${keyPath}" — Vision desactivado`);
+  }
   const { ImageAnnotatorClient } = require('@google-cloud/vision');
-  _visionClient = new ImageAnnotatorClient({
-    keyFilename: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH,
-  });
+  _visionClient = new ImageAnnotatorClient({ keyFilename: keyPath });
   return _visionClient;
 }
 

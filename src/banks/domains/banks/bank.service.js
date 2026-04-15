@@ -129,7 +129,7 @@ async function listMovements(filters) {
     banco, fechaInicio, fechaFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
-    status, categorias,
+    status, categorias, identificadoPor,
   } = filters;
 
   const filter = { isActive: true };
@@ -147,6 +147,13 @@ async function listMovements(filters) {
   if (concepto) {
     const esc = concepto.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     filter.concepto = new RegExp(esc, 'i');
+  }
+
+  if (identificadoPor) {
+    const esc = identificadoPor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re  = new RegExp(esc, 'i');
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [{ 'identificadoPor.nombre': re }, { 'identificadoPor.userId': re }] });
   }
 
   if (fechaInicio || fechaFin) {

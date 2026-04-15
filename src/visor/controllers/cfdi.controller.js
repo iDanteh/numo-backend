@@ -30,11 +30,12 @@ const verificarSATBackground = (cfdiData) => {
   const rfcReceptor = cfdiData.receptor?.rfc || '';
   if (!/^[A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3}$/i.test(rfcEmisor)) return;
 
+  const totalParaSAT = cfdiData.tipoDeComprobante === 'P' ? 0 : cfdiData.total;
   verifyCFDIWithSAT(
     cfdiData.uuid,
     rfcEmisor,
     rfcReceptor,
-    cfdiData.total,
+    totalParaSAT,
     cfdiData.timbreFiscalDigital?.selloCFD || cfdiData.sello || '',
     cfdiData.version || '4.0',
   ).then(satResponse => {

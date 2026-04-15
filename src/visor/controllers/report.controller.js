@@ -5,6 +5,19 @@ const Discrepancy = require('../models/Discrepancy');
 const { asyncHandler } = require('../middleware/errorHandler');
 
 /**
+ * MONTO_EFECTIVO_EXPR — expresión MongoDB para obtener el monto real de un CFDI.
+ * Para tipo P (Complemento de Pago) el campo `total` es 0 por spec del SAT;
+ * el monto real está en complementoPago.totales.montoTotalPagos o en el primer pago.
+ */
+const MONTO_EFECTIVO_EXPR = {
+  $cond: {
+    if:   { $eq: ['$tipoDeComprobante', 'P'] },
+    then: { $ifNull: ['$complementoPago.totales.montoTotalPagos', { $ifNull: ['$complementoPago.pagos.0.monto', 0] }] },
+    else: '$total',
+  },
+};
+
+/**
  * GET /api/reports/dashboard
  */
 const dashboard = asyncHandler(async (req, res) => {
@@ -99,9 +112,9 @@ const dashboard = asyncHandler(async (req, res) => {
       }},
       { $group: {
         _id:             '$sourceGroup',
-        total:           { $sum: { $cond: ['$excluir', 0, '$total'] } },
+        total:           { $sum: { $cond: ['$excluir', 0, MONTO_EFECTIVO_EXPR] } },
         count:           { $sum: { $cond: ['$excluir', 0, 1] } },
-        totalCancelados: { $sum: { $cond: ['$excluir', '$total', 0] } },
+        totalCancelados: { $sum: { $cond: ['$excluir', MONTO_EFECTIVO_EXPR, 0] } },
         countCancelados: { $sum: { $cond: ['$excluir', 1, 0] } },
       }},
     ]),

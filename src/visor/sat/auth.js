@@ -259,14 +259,14 @@ const extraerRfcDeCert = (cert) => {
     if (RFC_EMPRESA.test(val) || RFC_PERSONA.test(val)) return val;
 
     // FIEL de empresa (persona moral): OID 2.5.4.45 = "RFC_EMPRESA / RFC_REPRESENTANTE"
-    // El token SAT se emite para el RFC del representante legal (segundo RFC).
+    // Se prefiere el RFC de la empresa (para quien se emite el token).
     if (val.includes(' / ')) {
       const parts = val.split(' / ').map(p => p.trim()).filter(Boolean);
-      // Preferir RFC_PERSONA (representante) primero
-      const persona = parts.find(p => RFC_PERSONA.test(p));
-      if (persona) return persona;
+      // Preferir RFC_EMPRESA (la empresa) sobre RFC_PERSONA (representante)
       const empresa = parts.find(p => RFC_EMPRESA.test(p));
       if (empresa) return empresa;
+      const persona = parts.find(p => RFC_PERSONA.test(p));
+      if (persona) return persona;
     }
 
     // RFC con sufijo (> 13 chars) — intentar slicing

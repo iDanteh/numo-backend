@@ -91,7 +91,10 @@ const list = asyncHandler(async (req, res) => {
     const uuidList = uuids.split(',').map(u => u.trim().toUpperCase()).filter(Boolean);
     if (uuidList.length) filter.uuid = { $in: uuidList };
   }
-  if (source)             filter.source              = source.toUpperCase();
+  if (source) {
+    const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);
+    filter.source = sources.length === 1 ? sources[0] : { $in: sources };
+  }
   if (tipoDeComprobante)  filter.tipoDeComprobante   = tipoDeComprobante;
   if (rfcEmisor)          filter['emisor.rfc']        = rfcEmisor.toUpperCase();
   if (rfcReceptor)        filter['receptor.rfc']      = rfcReceptor.toUpperCase();

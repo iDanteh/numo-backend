@@ -320,4 +320,91 @@ const extraerToken = (xmlResponse) => {
   return raw;
 };
 
-module.exports = { autenticar, parseCer, parseKey, extraerRfcDeCert };
+/**
+ * Formatea el DN del emisor del certificado para X509IssuerName.
+ * Orden inverso (más específico al más general), formato RFC 2253.
+ */
+const buildIssuerDN = (issuer) => {
+  if (!issuer?.attributes?.length) return '';
+  return [...issuer.attributes]
+    .reverse()
+    .map(a => {
+      const name = a.shortName || a.type;
+      const val  = (a.value ?? '').toString();
+      return val.includes(',') ? `${name}="${val}"` : `${name}=${val}`;
+    })
+    .join(', ');
+};
+
+/**
+ * Crea el elemento <Signature> XML-DSig (enveloped) para insertar dentro de <des:solicitud>.
+ *
+ * El SAT requiere que los servicios SolicitaDescarga y VerificaSolicitudDescarga
+ * incluyan una firma digital dentro del elemento <des:solicitud>.
+ * Ref: Documentación SAT "Servicio de Verificación de Descarga Masiva 2023" §5.
+ *
+ * @param {Buffer} cerBuffer
+ * @param {Buffer} keyBuffer
+ * @param {Buffer} passwordBuffer
+ * @param {string} canonicalSolicitud — forma canónica C14N del <des:solicitud> SIN la firma
+ * @returns {Promise<string>} XML del elemento <Signature> listo para insertar
+ */
+const crearFirmaSolicitud = async (cerBuffer, keyBuffer, passwordBuffer, canonicalSolicitud) => {
+  let privateKey = null;
+  try {
+    const password = passwordBuffer.toString('utf-8');
+    const { cert, b64: certB64 } = parseCer(cerBuffer);
+    privateKey = parseKey(keyBuffer, password);
+
+    // Digest SHA1 del elemento solicitud en forma canónica (sin firma)
+    const md = forge.md.sha1.create();
+    md.update(canonicalSolicitud, 'utf8');
+    const digestB64 = forge.util.encode64(md.digest().bytes());
+
+    // SignedInfo construido en forma canónica (CanonicalizationMethod = c14n estándar)
+    const signedInfo =
+      `<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">` +
+      `<CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"></CanonicalizationMethod>` +
+      `<SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"></SignatureMethod>` +
+      `<Reference URI="">` +
+      `<Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"></Transform></Transforms>` +
+      `<DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"></DigestMethod>` +
+      `<DigestValue>${digestB64}</DigestValue>` +
+      `</Reference>` +
+      `</SignedInfo>`;
+
+    // Firma RSA-SHA1 del SignedInfo canonico
+    const mdSig = forge.md.sha1.create();
+    mdSig.update(signedInfo, 'utf8');
+    const signatureB64 = forge.util.encode64(privateKey.sign(mdSig));
+
+    // Datos del certificado para X509IssuerSerial
+    const issuerName = cert ? buildIssuerDN(cert.issuer) : '';
+    let serialDec = '0';
+    if (cert?.serialNumber) {
+      try { serialDec = BigInt('0x' + cert.serialNumber).toString(); }
+      catch { serialDec = cert.serialNumber; }
+    }
+
+    return (
+      `<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">` +
+      signedInfo +
+      `<SignatureValue>${signatureB64}</SignatureValue>` +
+      `<KeyInfo><X509Data>` +
+      `<X509IssuerSerial>` +
+      `<X509IssuerName>${issuerName}</X509IssuerName>` +
+      `<X509SerialNumber>${serialDec}</X509SerialNumber>` +
+      `</X509IssuerSerial>` +
+      `<X509Certificate>${certB64}</X509Certificate>` +
+      `</X509Data></KeyInfo>` +
+      `</Signature>`
+    );
+  } finally {
+    if (cerBuffer && Buffer.isBuffer(cerBuffer))           cerBuffer.fill(0);
+    if (keyBuffer && Buffer.isBuffer(keyBuffer))           keyBuffer.fill(0);
+    if (passwordBuffer && Buffer.isBuffer(passwordBuffer)) passwordBuffer.fill(0);
+    privateKey = null;
+  }
+};
+
+module.exports = { autenticar, parseCer, parseKey, extraerRfcDeCert, crearFirmaSolicitud };

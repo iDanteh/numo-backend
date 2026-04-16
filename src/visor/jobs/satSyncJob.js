@@ -4,6 +4,7 @@ const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
 const Entity = require('../models/Entity');
+const SatJobCheckpoint = require('../models/SatJobCheckpoint');
 const { compareCFDI } = require('../services/comparisonEngine');
 const { compararArrays } = require('../services/comparisonEngine');
 const { parseCFDI, normalizarCFDI } = require('../services/cfdiParser');
@@ -86,14 +87,22 @@ const ejecutarDescargaMasiva = async () => {
       if (tipos.length === 0) tipos.push('Emitidos');
 
       for (const tipoComprobante of tipos) {
-        const limitCheck = puedeIniciar(rfc);
+        const limitCheck = await puedeIniciar(rfc);
         if (!limitCheck.puede) {
           logger.warn(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): descarga nocturna bloqueada — ${limitCheck.razon}`);
           continue;
         }
-        registrarInicio(rfc);
+        await registrarInicio(rfc);
         try {
           await procesarDescarga({ rfc, fechaInicio, fechaFin, tipoComprobante, creds, ayer, ejercicio, periodo });
+        } catch (descErr) {
+          // Marcar checkpoint con error para diagnóstico
+          const fecha = fechaInicio.slice(0, 10);
+          await SatJobCheckpoint.findOneAndUpdate(
+            { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
+            { $set: { status: 'error', error: descErr.message, updatedAt: new Date() } },
+          ).catch(() => {});
+          throw descErr;
         } finally {
           registrarFin(rfc);
         }
@@ -127,25 +136,61 @@ const ejecutarDescargaMasiva = async () => {
 const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, creds, ayer, ejercicio, periodo, onPaso }) => {
   logger.info(`[SatSyncJob] RFC ${rfc} — solicitando ${tipoComprobante} ${fechaInicio.slice(0, 10)}`);
 
-  // Solicitar descarga (internamente autentica con e.firma y lanza la solicitud SOAP)
-  onPaso?.(1);  // Autenticando con SAT / Solicitando descarga
-  const idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, creds });
+  const fecha = fechaInicio.slice(0, 10); // YYYY-MM-DD
 
-  // Esperar a que el SAT procese (polling cada 60s exactos — puede tardar hasta 60 min)
-  onPaso?.(3);  // Verificando estado
-  const { idsPaquetes, totalCfdis } = await verificar(idSolicitud, rfc, creds);
-  logger.info(`[SatSyncJob] RFC ${rfc}: ${totalCfdis} CFDIs en ${idsPaquetes.length} paquete(s)`);
+  // ── Checkpoint: buscar descarga parcialmente completada ──────────────────
+  let checkpoint = await SatJobCheckpoint.findOne({ rfc: rfc.toUpperCase(), fecha, tipoComprobante });
 
-  if (idsPaquetes.length === 0) {
-    logger.info(`[SatSyncJob] RFC ${rfc}: no hay paquetes que descargar.`);
-    return;
+  let idSolicitud, idsPaquetes, totalCfdis;
+
+  if (checkpoint && checkpoint.status === 'descargando' && checkpoint.idsPaquetes?.length > 0) {
+    // Reanudar — ya tenemos idSolicitud e idsPaquetes del SAT
+    idSolicitud  = checkpoint.idSolicitud;
+    idsPaquetes  = checkpoint.idsPaquetes;
+    totalCfdis   = idsPaquetes.length; // aprox
+    const ya = checkpoint.paquetesProcesados?.length ?? 0;
+    logger.info(`[SatSyncJob] Reanudando desde checkpoint: ${ya}/${idsPaquetes.length} paquetes ya procesados.`);
+    onPaso?.(4);
+  } else {
+    // Crear/sobreescribir checkpoint al inicio
+    checkpoint = await SatJobCheckpoint.findOneAndUpdate(
+      { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
+      { $set: { ejercicio, periodo, status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], error: null, updatedAt: new Date() } },
+      { upsert: true, new: true },
+    );
+
+    // ── Solicitar descarga ─────────────────────────────────────────────────
+    onPaso?.(1);
+    idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, creds });
+    await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
+
+    // ── Verificar (polling 60s) ────────────────────────────────────────────
+    onPaso?.(3);
+    ({ idsPaquetes, totalCfdis } = await verificar(idSolicitud, rfc, creds));
+    logger.info(`[SatSyncJob] RFC ${rfc}: ${totalCfdis} CFDIs en ${idsPaquetes.length} paquete(s)`);
+
+    if (idsPaquetes.length === 0) {
+      logger.info(`[SatSyncJob] RFC ${rfc}: no hay paquetes que descargar.`);
+      await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', updatedAt: new Date() } });
+      return;
+    }
+
+    await SatJobCheckpoint.updateOne(
+      { _id: checkpoint._id },
+      { $set: { idsPaquetes, status: 'descargando', updatedAt: new Date() } },
+    );
+
+    onPaso?.(4);
   }
 
-  // Descargar y parsear todos los paquetes
-  onPaso?.(4);  // Descargando paquetes
+  // ── Descargar paquetes pendientes (uno a uno, con checkpoint por paquete) ─
+  const yaProcessados = new Set(checkpoint.paquetesProcesados ?? []);
+  const pendientes    = idsPaquetes.filter(id => !yaProcessados.has(id));
+
+  // Acumular solo objetos normalizados (mucho más pequeños que los XMLs crudos)
   const cfdisSATRaw = [];
-  for (const idPaquete of idsPaquetes) {
-    const xmls = await descargarPaquete(idPaquete, rfc, creds);
+  for (const idPaquete of pendientes) {
+    let xmls = await descargarPaquete(idPaquete, rfc, creds);
     for (const xml of xmls) {
       try {
         const parsed = await parseCFDI(xml);
@@ -154,6 +199,14 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, c
         logger.warn(`[SatSyncJob] Error parseando XML de paquete ${idPaquete}: ${parseErr.message}`);
       }
     }
+    xmls = null; // liberar array de strings XML
+
+    // Marcar paquete como procesado en MongoDB antes de continuar
+    await SatJobCheckpoint.updateOne(
+      { _id: checkpoint._id },
+      { $addToSet: { paquetesProcesados: idPaquete }, $set: { updatedAt: new Date() } },
+    );
+    logger.info(`[SatSyncJob] Paquete ${idPaquete} procesado y guardado en checkpoint.`);
   }
 
   logger.info(`[SatSyncJob] RFC ${rfc}: ${cfdisSATRaw.length} CFDIs parseados del SAT`);
@@ -226,6 +279,12 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, c
   }
 
   await guardarResultados({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, ejercicio, periodo });
+
+  // Marcar checkpoint como completado
+  await SatJobCheckpoint.updateOne(
+    { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
+    { $set: { status: 'completado', updatedAt: new Date() } },
+  );
 
   return {
     totalSAT:       cfdisSAT.length,

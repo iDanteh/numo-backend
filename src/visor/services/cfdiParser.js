@@ -230,20 +230,32 @@ const parseImpuestos = (impuestosNode) => {
  *   estatus: string
  * }}
  */
-const normalizarCFDI = (cfdi) => ({
-  uuid:            (cfdi.uuid || '').toUpperCase().trim(),
-  serie:           cfdi.serie || '',
-  folio:           cfdi.folio || '',
-  fecha:           cfdi.fecha ? new Date(cfdi.fecha) : null,
-  rfcEmisor:       (cfdi.rfcEmisor || cfdi.emisor?.rfc || '').toUpperCase().trim(),
-  nombreEmisor:    cfdi.nombreEmisor || cfdi.emisor?.nombre || '',
-  rfcReceptor:     (cfdi.rfcReceptor || cfdi.receptor?.rfc || '').toUpperCase().trim(),
-  nombreReceptor:  cfdi.nombreReceptor || cfdi.receptor?.nombre || '',
-  subtotal:        parseFloat(cfdi.subtotal ?? cfdi.subTotal ?? 0),
-  total:           parseFloat(cfdi.total ?? 0),
-  moneda:          cfdi.moneda || 'MXN',
-  tipoComprobante: cfdi.tipoComprobante || cfdi.tipoDeComprobante || '',
-  estatus:         cfdi.estatus || cfdi.satStatus || 'Pendiente',
-});
+const normalizarCFDI = (cfdi) => {
+  const imp = cfdi.impuestos ?? {};
+  const cp  = cfdi.complementoPago ?? {};
+  const montoTotalPagos =
+    cp.totales?.montoTotalPagos ??
+    (Array.isArray(cp.pagos) ? cp.pagos.reduce((s, p) => s + (p.monto ?? 0), 0) : null) ??
+    null;
+
+  return {
+    uuid:                  (cfdi.uuid || '').toUpperCase().trim(),
+    serie:                 cfdi.serie || '',
+    folio:                 cfdi.folio || '',
+    fecha:                 cfdi.fecha ? new Date(cfdi.fecha) : null,
+    rfcEmisor:             (cfdi.rfcEmisor || cfdi.emisor?.rfc || '').toUpperCase().trim(),
+    nombreEmisor:          cfdi.nombreEmisor || cfdi.emisor?.nombre || '',
+    rfcReceptor:           (cfdi.rfcReceptor || cfdi.receptor?.rfc || '').toUpperCase().trim(),
+    nombreReceptor:        cfdi.nombreReceptor || cfdi.receptor?.nombre || '',
+    subtotal:              parseFloat(cfdi.subtotal ?? cfdi.subTotal ?? 0),
+    total:                 parseFloat(cfdi.total ?? 0),
+    moneda:                cfdi.moneda || 'MXN',
+    tipoComprobante:       cfdi.tipoComprobante || cfdi.tipoDeComprobante || '',
+    estatus:               cfdi.estatus || cfdi.satStatus || 'Pendiente',
+    ivaTrasladadoTotal:    parseFloat(imp.totalImpuestosTrasladados ?? 0),
+    ivaRetenidoTotal:      parseFloat(imp.totalImpuestosRetenidos   ?? 0),
+    montoTotalPagos:       montoTotalPagos !== null ? parseFloat(montoTotalPagos) : null,
+  };
+};
 
 module.exports = { parseCFDI, normalizarCFDI };

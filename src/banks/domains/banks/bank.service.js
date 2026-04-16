@@ -130,11 +130,14 @@ async function listMovements(filters) {
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
+    movId,
   } = filters;
 
   const filter = { isActive: true };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
+  // Filtro por ID exacto (usado desde OCR para saltar a un movimiento específico)
+  if (movId)  filter._id   = movId;
 
   if (categorias) {
     // Comma-separated list; __null__ represents null (sin categoría)

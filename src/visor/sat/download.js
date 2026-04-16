@@ -98,6 +98,7 @@ const invalidarToken = (rfc) => {
 
 // Patrón antiguo: token en WS-Security header (usado por DescargaMasivaService)
 const soapCall = async (url, soapAction, body, token) => {
+  const quotedAction = `"${soapAction}"`;
   const envelope = `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Header>
@@ -112,7 +113,7 @@ const soapCall = async (url, soapAction, body, token) => {
     const response = await axios.post(url, envelope, {
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
-        'SOAPAction': soapAction,
+        'SOAPAction': quotedAction,
       },
       timeout: 60000,
     });
@@ -130,11 +131,12 @@ const soapCall = async (url, soapAction, body, token) => {
 
 // Patrón nuevo: header vacío + token como Authorization: bearer (Solicitud, Verifica)
 const soapCallBearer = async (url, soapAction, envelope, token) => {
+  const quotedAction = `"${soapAction}"`;
   try {
     const response = await axios.post(url, envelope, {
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
-        'SOAPAction': soapAction,
+        'SOAPAction': quotedAction,
         'Authorization': `Bearer ${token}`,
       },
       timeout: 60000,

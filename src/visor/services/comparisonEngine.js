@@ -13,6 +13,9 @@ const formatSessionName = (date) => {
 
 const TOLERANCE_AMOUNT = 0.01;
 
+// Redondea a 2 decimales antes de comparar (solo valores ERP que pueden traer más decimales)
+const r2 = (v) => Math.round((v ?? 0) * 100) / 100;
+
 /**
  * Compara un CFDI del ERP contra:
  *  a) El estado en vivo del SAT (SOAP)
@@ -288,7 +291,7 @@ const montoTotalPago = (cfdi) => {
 const compareComplementoPago = (erp, sat) => {
   const diffs = [];
 
-  const erpMonto = montoTotalPago(erp);
+  const erpMonto = r2(montoTotalPago(erp));
   const satMonto = montoTotalPago(sat);
 
   // Comparar monto total
@@ -326,7 +329,7 @@ const compareComplementoPago = (erp, sat) => {
 const compareAmounts = (erp, sat) => {
   const diffs = [];
   for (const [field, severity] of [['total', 'critical'], ['subTotal', 'warning'], ['descuento', 'warning']]) {
-    const erpVal = erp[field] ?? 0;
+    const erpVal = r2(erp[field]);
     const satVal = sat[field] ?? 0;
     if (Math.abs(erpVal - satVal) > TOLERANCE_AMOUNT) {
       diffs.push({
@@ -386,7 +389,7 @@ const compareDates = (erp, sat) => {
 
 const compareTaxes = (erp, sat) => {
   const diffs = [];
-  const erpTras = erp.impuestos?.totalImpuestosTrasladados ?? 0;
+  const erpTras = r2(erp.impuestos?.totalImpuestosTrasladados);
   const satTras = sat.impuestos?.totalImpuestosTrasladados ?? 0;
   // Solo comparar trasladados si el SAT tiene un valor positivo (0 puede indicar
   // que la columna estaba ausente en el reporte Excel, no que realmente no hay IVA).
@@ -400,7 +403,7 @@ const compareTaxes = (erp, sat) => {
       fiscalImpact: { amount: difTras, currency: erp.moneda || 'MXN', taxType: 'IVA' },
     });
   }
-  const erpRet = erp.impuestos?.totalImpuestosRetenidos ?? 0;
+  const erpRet = r2(erp.impuestos?.totalImpuestosRetenidos);
   const satRet = sat.impuestos?.totalImpuestosRetenidos ?? 0;
   const difRet = Math.abs(erpRet - satRet);
   if (satRet > 0 && difRet > 0) {
@@ -697,24 +700,50 @@ const compararArrays = (cfdisSAT, cfdisERP) => {
  */
 const detectarDiferencias = (sat, erp) => {
   const diffs = [];
+  const esPago = (sat.tipoComprobante || erp.tipoComprobante || '').toUpperCase() === 'P';
 
-  const camposNumericos = [['total', 0.01], ['subtotal', 0.01]];
-  for (const [campo, tolerancia] of camposNumericos) {
-    if (Math.abs((sat[campo] || 0) - (erp[campo] || 0)) > tolerancia) {
-      diffs.push({ campo, valorSAT: sat[campo], valorERP: erp[campo] });
+  // ── Montos ────────────────────────────────────────────────────────────────
+  if (esPago) {
+    // Para tipo P el total raíz es 0 por spec SAT; comparar MontoTotalPagos
+    const satMonto = sat.montoTotalPagos ?? sat.total ?? 0;
+    const erpMonto = r2(erp.montoTotalPagos ?? erp.total ?? 0);
+    if (Math.abs(erpMonto - satMonto) > TOLERANCE_AMOUNT) {
+      diffs.push({ campo: 'complementoPago.montoTotalPagos', valorSAT: satMonto, valorERP: erpMonto });
+    }
+  } else {
+    for (const [campo, tolerancia] of [['total', TOLERANCE_AMOUNT], ['subtotal', TOLERANCE_AMOUNT]]) {
+      const erpVal = r2(erp[campo] ?? 0);
+      const satVal = sat[campo] ?? 0;
+      if (Math.abs(erpVal - satVal) > tolerancia) {
+        diffs.push({ campo, valorSAT: satVal, valorERP: erpVal });
+      }
+    }
+
+    // IVA — solo comparar si SAT tiene valor positivo
+    // (0 puede indicar columna ausente en Excel, no ausencia real de IVA)
+    const satTras = sat.ivaTrasladadoTotal ?? 0;
+    const erpTras = r2(erp.ivaTrasladadoTotal ?? 0);
+    if (satTras > 0 && Math.abs(erpTras - satTras) > TOLERANCE_AMOUNT) {
+      diffs.push({ campo: 'impuestos.totalImpuestosTrasladados', valorSAT: satTras, valorERP: erpTras });
+    }
+
+    const satRet = sat.ivaRetenidoTotal ?? 0;
+    const erpRet = r2(erp.ivaRetenidoTotal ?? 0);
+    if (satRet > 0 && Math.abs(erpRet - satRet) > TOLERANCE_AMOUNT) {
+      diffs.push({ campo: 'impuestos.totalImpuestosRetenidos', valorSAT: satRet, valorERP: erpRet });
     }
   }
 
-  const camposTexto = ['rfcEmisor', 'rfcReceptor', 'moneda', 'tipoComprobante'];
-  for (const campo of camposTexto) {
+  // ── Campos de texto críticos ──────────────────────────────────────────────
+  for (const campo of ['rfcEmisor', 'rfcReceptor', 'moneda', 'tipoComprobante']) {
     if ((sat[campo] || '') !== (erp[campo] || '')) {
       diffs.push({ campo, valorSAT: sat[campo], valorERP: erp[campo] });
     }
   }
 
-  // Fecha: comparar solo la parte de la fecha (YYYY-MM-DD)
-  const fechaSAT = sat.fecha ? new Date(sat.fecha).toISOString().slice(0, 10) : null;
-  const fechaERP = erp.fecha ? new Date(erp.fecha).toISOString().slice(0, 10) : null;
+  // ── Fecha: solo YYYY-MM-DD ────────────────────────────────────────────────
+  const fechaSAT = sat.fecha ? toLocalYMD(new Date(sat.fecha)) : null;
+  const fechaERP = erp.fecha ? toLocalYMD(new Date(erp.fecha)) : null;
   if (fechaSAT !== fechaERP) {
     diffs.push({ campo: 'fecha', valorSAT: fechaSAT, valorERP: fechaERP });
   }

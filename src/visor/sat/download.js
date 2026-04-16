@@ -15,7 +15,7 @@
 
 const axios = require('axios');
 const AdmZip = require('adm-zip');
-const { autenticar } = require('./auth');
+const { autenticar, crearFirmaSolicitud } = require('./auth');
 const { logger } = require('../utils/logger');
 
 const SOLICITUD_URL = (process.env.SAT_DESCARGA_MASIVA_SOLICITUD  || 'https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/SolicitaDescargaService.svc').replace(/\?wsdl$/i, '');
@@ -129,7 +129,8 @@ const soapCall = async (url, soapAction, body, token) => {
   }
 };
 
-// Patrón nuevo: header vacío + token como Authorization: bearer (Solicitud, Verifica)
+// Patrón SAT oficial: Authorization: WRAP access_token="Token" (Solicitud, Verifica, Descarga)
+// Ref: Documentación SAT "Servicio de Verificación de Descarga Masiva 2023" §4 y §5
 const soapCallBearer = async (url, soapAction, envelope, token) => {
   const quotedAction = `"${soapAction}"`;
   try {
@@ -137,7 +138,7 @@ const soapCallBearer = async (url, soapAction, envelope, token) => {
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
         'SOAPAction': quotedAction,
-        'Authorization': `Bearer ${token}`,
+        'Authorization': `WRAP access_token="${token}"`,
       },
       timeout: 60000,
     });
@@ -161,6 +162,16 @@ const extraerValor = (xml, tag) => {
 const extraerAtributo = (xml, tag, attr) => {
   const match = xml.match(new RegExp(`<[^:]*:?${tag}[^>]*\\s+${attr}="([^"]+)"`));
   return match ? match[1].trim() : null;
+};
+
+/**
+ * Construye la forma canónica C14N del elemento <des:solicitud> SIN firma.
+ * Atributos en orden alfabético; namespaces en scope declarados explícitamente.
+ * Se usa para calcular el DigestValue de la firma dentro del body SOAP.
+ */
+const canonizarSolicitud = (attrs, ns) => {
+  const attrsStr = Object.keys(attrs).sort().map(k => `${k}="${attrs[k]}"`).join(' ');
+  return `<des:solicitud xmlns:des="${ns}" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" ${attrsStr}></des:solicitud>`;
 };
 
 // ── Operaciones principales ───────────────────────────────────────────────────
@@ -193,64 +204,67 @@ const solicitar = async (params) => {
   const { rfcSolicitante, fechaInicio, fechaFin, tipoSolicitud = 'CFDI', tipoComprobante = 'Emitidos', creds } = params;
 
   const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
-  // rfcCertificado = RFC del certificado FIEL (puede ser el representante legal)
-  // rfcSolicitante = RFC de la empresa cuyos CFDIs se quieren descargar
   const rfcFirma = rfcCertificado ?? rfcSolicitante;
   logger.info(`[SatDownload] solicitar() | rfcFirma=${rfcFirma} rfcEmpresa=${rfcSolicitante} token: ${token?.slice(0, 40)}...`);
 
   const cfg = TIPO_MAP[tipoComprobante] ?? TIPO_MAP.Emitidos;
   const { operacion, rfcAttrKey, tipoDeComprobante } = cfg;
-  const soapAction   = `http://DescargaMasivaTerceros.sat.gob.mx/ISolicitaDescargaService/${operacion}`;
-  const ns           = 'http://DescargaMasivaTerceros.sat.gob.mx';
+  const soapAction = `http://DescargaMasivaTerceros.sat.gob.mx/ISolicitaDescargaService/${operacion}`;
+  const ns         = 'http://DescargaMasivaTerceros.sat.gob.mx';
 
-  // RfcSolicitante = RFC del certificado (quien firma la petición)
-  // RfcEmisor/RfcReceptor = RFC de la empresa (cuyos CFDIs se descargan)
-  const rfcAttr  = `${rfcAttrKey}="${rfcSolicitante}"`;
-  const tipoAttr = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
+  // Construir firma del body — el SAT requiere Signature dentro de <des:solicitud>
+  const buildEnvelope = async (rfcFirmaUsado) => {
+    const solicitudAttrs = {
+      FechaFinal:     fechaFin,
+      FechaInicial:   fechaInicio,
+      [rfcAttrKey]:   rfcSolicitante,
+      RfcSolicitante: rfcFirmaUsado,
+      TipoSolicitud:  tipoSolicitud,
+    };
+    if (tipoDeComprobante) solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
 
-  const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
-            xmlns:des="${ns}">
+    const canonical = canonizarSolicitud(solicitudAttrs, ns);
+    logger.info(`[SatDownload] solicitar() — canonical solicitud: ${canonical}`);
+
+    const cerCopy = Buffer.from(creds.cerBuffer);
+    const keyCopy = Buffer.from(creds.keyBuffer);
+    const pwdCopy = Buffer.from(creds.passwordBuffer);
+    const firma   = await crearFirmaSolicitud(cerCopy, keyCopy, pwdCopy, canonical);
+
+    const tipoAttr = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${ns}">
   <s:Header/>
   <s:Body>
     <des:${operacion}>
-      <des:solicitud RfcSolicitante="${rfcFirma}" ${rfcAttr} FechaInicial="${fechaInicio}" FechaFinal="${fechaFin}" TipoSolicitud="${tipoSolicitud}"${tipoAttr}/>
+      <des:solicitud RfcSolicitante="${rfcFirmaUsado}" ${rfcAttrKey}="${rfcSolicitante}" FechaInicial="${fechaInicio}" FechaFinal="${fechaFin}" TipoSolicitud="${tipoSolicitud}"${tipoAttr}>
+        ${firma}
+      </des:solicitud>
     </des:${operacion}>
   </s:Body>
 </s:Envelope>`;
+  };
 
-  let xmlResp = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, token);
+  const resultTag = `${operacion}Result`;
 
-  // El elemento resultado es SolicitaDescargaEmitidosResult / SolicitaDescargaRecibidosResult
-  // (Traslados, Nomina y Pagos usan SolicitaDescargaEmitidos con filtro TipoDeComprobante)
-  const resultTag  = `${operacion}Result`;
-  let idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') ||
-                    extraerValor(xmlResp, 'IdSolicitud');
+  let envelope   = await buildEnvelope(rfcFirma);
+  let xmlResp    = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, token);
+
+  let idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') || extraerValor(xmlResp, 'IdSolicitud');
   let codEstatus  = extraerAtributo(xmlResp, resultTag, 'CodEstatus');
   let mensaje     = extraerAtributo(xmlResp, resultTag, 'Mensaje');
 
-  // Retry automático si el SAT rechaza el token (300): invalida caché y reintenta una vez
+  // Retry si el SAT rechaza el token (300): invalida caché y reintenta con token fresco
   if (!idSolicitud && codEstatus === '300') {
     logger.warn(`[SatDownload] Token rechazado (300) — invalidando caché y reintentando con token fresco...`);
     invalidarToken(rfcSolicitante);
-    const fresh = await getToken(rfcSolicitante, creds);
-    logger.info(`[SatDownload] Reintento con token fresco (primeros 40 chars): ${fresh.token?.slice(0, 40)}...`);
-
-    // Reconstruir el envelope con el rfcFirma del token fresco — puede diferir del primero
+    const fresh        = await getToken(rfcSolicitante, creds);
     const rfcFirmaFresh = fresh.rfcCertificado ?? rfcSolicitante;
     logger.info(`[SatDownload] rfcFirma en retry: ${rfcFirmaFresh}`);
-    const envelopeFresh = `<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
-            xmlns:des="${ns}">
-  <s:Header/>
-  <s:Body>
-    <des:${operacion}>
-      <des:solicitud RfcSolicitante="${rfcFirmaFresh}" ${rfcAttr} FechaInicial="${fechaInicio}" FechaFinal="${fechaFin}" TipoSolicitud="${tipoSolicitud}"${tipoAttr}/>
-    </des:${operacion}>
-  </s:Body>
-</s:Envelope>`;
 
-    xmlResp     = await soapCallBearer(SOLICITUD_URL, soapAction, envelopeFresh, fresh.token);
+    envelope    = await buildEnvelope(rfcFirmaFresh);
+    xmlResp     = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, fresh.token);
     idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') || extraerValor(xmlResp, 'IdSolicitud');
     codEstatus  = extraerAtributo(xmlResp, resultTag, 'CodEstatus');
     mensaje     = extraerAtributo(xmlResp, resultTag, 'Mensaje');
@@ -260,11 +274,33 @@ const solicitar = async (params) => {
     logger.error(`[SatDownload] solicitar() — respuesta SAT completa:\n${xmlResp}`);
     invalidarToken(rfcSolicitante);
 
-    const errMsg = codEstatus === '300'
-      ? `Token rechazado por el SAT (CodEstatus 300). Causa más común: el certificado subido es un CSD (Sello Digital de CFDI) en lugar de la e.firma (FIEL) personal del representante legal. La Descarga Masiva requiere los archivos .cer y .key de la e.firma personal, no los de facturación. Si el certificado es correcto, puede que esté vencido.`
-      : `SAT error ${codEstatus}: ${mensaje}`;
+    // Códigos especiales documentados por el SAT
+    if (codEstatus === '5005') {
+      throw new Error(
+        `SAT [5005]: Solicitud duplicada — ya existe una solicitud activa con los mismos parámetros ` +
+        `(mismo RFC, fechas y tipo). Espera a que termine o usa el checkpoint existente.`
+      );
+    }
+    if (codEstatus === '5002') {
+      throw new Error(
+        `SAT [5002]: Se agotó el límite de solicitudes de por vida para este RFC y rango de fechas. ` +
+        `No es posible generar otra solicitud con los mismos parámetros.`
+      );
+    }
+    if (codEstatus === '5003') {
+      throw new Error(
+        `SAT [5003]: El rango solicitado supera el tope máximo de CFDIs por solicitud. ` +
+        `Reduce el rango de fechas a períodos más cortos.`
+      );
+    }
+    if (codEstatus === '404') {
+      throw new Error(
+        `SAT [404]: Error no controlado en el servidor SAT. Reintenta la operación. ` +
+        `Si persiste, genera un RMA con el SAT.`
+      );
+    }
 
-    throw new Error(errMsg);
+    throw new Error(`SAT [${codEstatus}]: ${mensaje}`);
   }
 
   logger.info(`[SatDownload] Solicitud aceptada (${operacion}). IdSolicitud: ${idSolicitud}`);
@@ -278,10 +314,12 @@ const solicitar = async (params) => {
  *  3 = Terminada (listo para descargar)
  *  4 = Error
  *  5 = Rechazada
+ *  6 = Vencida (72 horas después de que se generó el paquete — ya no descargable)
  */
 const ESTADO_TERMINADA = '3';
 const ESTADO_ERROR     = '4';
 const ESTADO_RECHAZADA = '5';
+const ESTADO_VENCIDA   = '6';
 
 /**
  * Verifica el estado de una solicitud con polling cada 60 segundos exactos.
@@ -313,13 +351,23 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
     }
     const rfcFirmaVerif = rfcCertificado ?? rfcSolicitante;
 
+    const verNs = 'http://DescargaMasivaTerceros.sat.gob.mx';
+    const verifAttrs = { IdSolicitud: idSolicitud, RfcSolicitante: rfcFirmaVerif };
+    const verifCanonical = canonizarSolicitud(verifAttrs, verNs);
+
+    const cerCopyV = Buffer.from(creds.cerBuffer);
+    const keyCopyV = Buffer.from(creds.keyBuffer);
+    const pwdCopyV = Buffer.from(creds.passwordBuffer);
+    const firmaV   = await crearFirmaSolicitud(cerCopyV, keyCopyV, pwdCopyV, verifCanonical);
+
     const envelope = `<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
-            xmlns:des="http://DescargaMasivaTerceros.sat.gob.mx">
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${verNs}">
   <s:Header/>
   <s:Body>
     <des:VerificaSolicitudDescarga>
-      <des:solicitud IdSolicitud="${idSolicitud}" RfcSolicitante="${rfcFirmaVerif}"/>
+      <des:solicitud IdSolicitud="${idSolicitud}" RfcSolicitante="${rfcFirmaVerif}">
+        ${firmaV}
+      </des:solicitud>
     </des:VerificaSolicitudDescarga>
   </s:Body>
 </s:Envelope>`;
@@ -360,7 +408,19 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
     }
 
     if (estadoSolicitud === ESTADO_ERROR || estadoSolicitud === ESTADO_RECHAZADA) {
-      throw new Error(`SAT rechazó/error la solicitud ${idSolicitud}. Estado: ${estadoSolicitud}, Mensaje: ${mensaje}, CodEstatus: ${codEstatus}`);
+      throw new Error(`SAT [${codEstatus}]: ${mensaje}`);
+    }
+
+    if (estadoSolicitud === ESTADO_VENCIDA) {
+      throw new Error(`SAT: La solicitud ${idSolicitud} venció (72 horas). Genera una nueva solicitud.`);
+    }
+
+    // Errores de verificación aunque el HTTP haya sido exitoso
+    if (codEstatus === '5004') {
+      throw new Error(`SAT [5004]: No se encontró la información de la solicitud ${idSolicitud}. Puede que haya expirado o nunca existió.`);
+    }
+    if (codEstatus === '5011') {
+      throw new Error(`SAT [5011]: Límite de descargas por folio por día alcanzado. Intenta mañana.`);
     }
 
     // Estados 1 (Aceptada) y 2 (En Proceso): esperar exactamente 60 segundos
@@ -393,14 +453,21 @@ const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
       const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
       const rfcFirmaDesc = rfcCertificado ?? rfcSolicitante;
 
-      const body = `<PeticionDescargaMasivaTercerosEntrada xmlns="http://DescargaMasivaTerceros.gob.mx">
-    <peticionDescarga IdPaquete="${idPaquete}" RfcSolicitante="${rfcFirmaDesc}"/>
-  </PeticionDescargaMasivaTercerosEntrada>`;
+      const descNs = 'http://DescargaMasivaTerceros.gob.mx';
+      const descEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${descNs}">
+  <s:Header/>
+  <s:Body>
+    <des:PeticionDescargaMasivaTercerosEntrada>
+      <des:peticionDescarga IdPaquete="${idPaquete}" RfcSolicitante="${rfcFirmaDesc}"/>
+    </des:PeticionDescargaMasivaTercerosEntrada>
+  </s:Body>
+</s:Envelope>`;
 
-      const xmlResp = await soapCall(
+      const xmlResp = await soapCallBearer(
         DESCARGA_URL,
         'http://DescargaMasivaTerceros.gob.mx/IDescargaMasivaService/Descargar',
-        body,
+        descEnvelope,
         token
       );
 
@@ -410,15 +477,19 @@ const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
         throw new Error(`No se encontró el paquete en la respuesta del SAT para IdPaquete: ${idPaquete}`);
       }
 
-      const zipBase64 = paqueteMatch[1].trim();
+      // Liberar la string base64 (33% extra de memoria) antes de crear el Buffer
+      let zipBase64 = paqueteMatch[1].trim();
       const zipBuffer = Buffer.from(zipBase64, 'base64');
+      zipBase64 = null; // eslint-disable-line no-unused-vars
 
-      // Descomprimir en memoria con adm-zip
-      const zip    = new AdmZip(zipBuffer);
-      const xmls   = [];
+      // Descomprimir en memoria con adm-zip, liberar el buffer zip al terminar
+      const zip  = new AdmZip(zipBuffer);
+      const xmls = [];
       for (const entrada of zip.getEntries()) {
         if (entrada.entryName.toLowerCase().endsWith('.xml')) {
-          xmls.push(entrada.getData().toString('utf-8'));
+          const data = entrada.getData();
+          xmls.push(data.toString('utf-8'));
+          data.fill(0); // limpiar buffer de la entrada después de convertir
         }
       }
 
@@ -443,7 +514,7 @@ const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
 // ── Utilidades ────────────────────────────────────────────────────────────────
 
 const descripcionEstado = (estado) => {
-  const map = { '1': 'Aceptada', '2': 'En Proceso', '3': 'Terminada', '4': 'Error', '5': 'Rechazada' };
+  const map = { '1': 'Aceptada', '2': 'En Proceso', '3': 'Terminada', '4': 'Error', '5': 'Rechazada', '6': 'Vencida' };
   return map[estado] || 'Desconocido';
 };
 

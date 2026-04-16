@@ -783,7 +783,7 @@ const exportExcel = asyncHandler(async (req, res) => {
   if (lastComparisonStatus) filter.lastComparisonStatus = lastComparisonStatus;
   if (search) filter.$text = { $search: search };
 
-  const cfdis = await CFDI.find(filter, { xmlContent: 0 }).sort({ fecha: -1 }).limit(5000).lean();
+  const cfdis = await CFDI.find(filter, { xmlContent: 0 }).sort({ fecha: -1 }).lean();
 
   const workbook = new ExcelJS.Workbook();
   const sheet    = workbook.addWorksheet('CFDIs');

@@ -135,6 +135,7 @@ const extraerComplementoPago = (factura) => {
         monedaP:      factura.Moneda ?? 'MXN',
         monto:        montoPlano,
       }],
+      totales: { montoTotalPagos: montoPlano },
     };
   }
 
@@ -538,6 +539,8 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
   if (erpStatus)               doc.erpStatus     = erpStatus;
   if (cfdiRelacionados.length) doc.cfdiRelacionados    = cfdiRelacionados;
   if (Object.keys(timbre).length) doc.timbreFiscalDigital = timbre;
+  const complementoPago = extraerComplementoPago(factura);
+  if (complementoPago) doc.complementoPago = complementoPago;
   // Versión CFDI: desde el TFD si está disponible
   if (tfd?.Version && ['3.3', '4.0'].includes(tfd.Version)) doc.version = tfd.Version;
 

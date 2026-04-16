@@ -10,11 +10,18 @@ const { asyncHandler } = require('../middleware/errorHandler');
  * el monto real está en complementoPago.totales.montoTotalPagos o en el primer pago.
  */
 const MONTO_EFECTIVO_EXPR = {
-  $cond: {
-    if:   { $eq: ['$tipoDeComprobante', 'P'] },
-    then: { $ifNull: ['$complementoPago.totales.montoTotalPagos', { $ifNull: ['$complementoPago.pagos.0.monto', 0] }] },
-    else: '$total',
-  },
+  $round: [{
+    $cond: {
+      // Si total > 0, usarlo directamente (ERP tipo P guardan el importe real en total).
+      // Solo leer complementoPago cuando total === 0 (caso SAT tipo P por spec del SAT).
+      if:   { $and: [{ $eq: ['$tipoDeComprobante', 'P'] }, { $eq: ['$total', 0] }] },
+      then: { $ifNull: [
+        '$complementoPago.totales.montoTotalPagos',
+        { $ifNull: ['$complementoPago.pagos.0.monto', 0] },
+      ]},
+      else: '$total',
+    },
+  }, 2],
 };
 
 /**
@@ -58,7 +65,9 @@ const dashboard = asyncHandler(async (req, res) => {
   // o isActive=1 no serían encontrados con la comparación estricta boolean.
   // MANUAL se agrupa junto con SAT (igual que en comparisonEngine) para que el
   // total SAT del dashboard refleje todos los documentos del lado SAT.
-  const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter };
+  // Sin filtro SINUUID: registros ERP sin UUID son válidos y tienen montos reales.
+  // El filtro SINUUID se mantiene solo en cfdiFilter (conciliación) donde se requiere UUID real.
+  const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter };
   if (rfcEmisor) montosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
   if (Object.keys(dateFilter).length) montosFilter.fecha = dateFilter;
 
@@ -67,8 +76,8 @@ const dashboard = asyncHandler(async (req, res) => {
   if (rfcEmisor) satSoloFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
   if (Object.keys(dateFilter).length) satSoloFilter.fecha = dateFilter;
 
-  // Cancelados ERP: usa erpStatus
-  const canceladosFilter = { isActive: true, source: 'ERP', erpStatus: 'Cancelado', uuid: { $not: /^SINUUID/ }, ...periodoFilter };
+  // Cancelados ERP: solo los que tienen erpStatus = 'Cancelado'
+  const canceladosFilter = { source: 'ERP', erpStatus: 'Cancelado', ...periodoFilter };
   if (rfcEmisor) canceladosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
   if (Object.keys(dateFilter).length) canceladosFilter.fecha = dateFilter;
 
@@ -103,10 +112,10 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: montosFilter },
       { $addFields: {
         sourceGroup: { $cond: { if: { $in: ['$source', ['SAT', 'MANUAL']] }, then: 'SAT', else: '$source' } },
-        // ERP: excluir según erpStatus; SAT/MANUAL: excluir según satStatus
+        // ERP: solo suma Timbrado o Habilitado; SAT/MANUAL: excluir Cancelado/Deshabilitado
         excluir: { $cond: {
           if:   { $eq: ['$source', 'ERP'] },
-          then: { $in: ['$erpStatus', ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente']] },
+          then: { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
           else: { $in: ['$satStatus', ['Cancelado', 'Deshabilitado']] },
         }},
       }},
@@ -183,8 +192,8 @@ const dashboard = asyncHandler(async (req, res) => {
   const vigenteErpSatRow = vigenteErpSatCount[0] ?? { count: 0, total: 0 };
   const erpRow = montosAggregate.find(m => m._id === 'ERP') ?? { total: 0, count: 0, totalCancelados: 0, countCancelados: 0 };
   const satRow = montosAggregate.find(m => m._id === 'SAT') ?? { total: 0, count: 0, totalCancelados: 0, countCancelados: 0 };
-  const totalERP = erpRow.total;           // solo activos (excluye cancelados)
-  const totalSAT = satRow.total;           // solo activos (excluye cancelados)
+  const totalERP = Math.round((erpRow.total ?? 0) * 100) / 100;  // 2 decimales
+  const totalSAT = Math.round((satRow.total ?? 0) * 100) / 100;  // 2 decimales
   const countERP = erpRow.count;           // solo activos
   const countSAT = satRow.count;           // solo activos
 
@@ -270,17 +279,20 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
   if (periodo)           periodoFiltro.periodo           = parseInt(periodo);
   if (tipoDeComprobante) periodoFiltro.tipoDeComprobante = tipoDeComprobante;
 
-  // Excluir ERP cancelados/deshabilitados
-  const erpActivosIds = await CFDI.find({
+  // Solo incluir CFDIs ERP que aún tienen discrepancia en su ÚLTIMA comparación.
+  // lastComparisonStatus es actualizado cada vez que se corre la comparación,
+  // por lo que garantiza que solo aparecen registros actuales, no históricos.
+  const erpConDiscrepanciaIds = await CFDI.find({
     source: 'ERP',
     erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] },
+    lastComparisonStatus: { $in: ['discrepancy', 'warning'] },
     ...periodoFiltro,
   }).select('_id').lean().then(docs => docs.map(d => d._id));
 
   const filter = {
     'differences.field': { $in: camposFiltro },
     status: { $ne: 'cancelled' },
-    erpCfdiId: { $in: erpActivosIds },
+    erpCfdiId: { $in: erpConDiscrepanciaIds },
     ...periodoFiltro,
   };
 
@@ -289,7 +301,7 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
       .select('uuid status differences criticalCount warningCount tipoDeComprobante ejercicio periodo comparedAt erpCfdiId satCfdiId')
       .populate({ path: 'erpCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda' })
       .populate({ path: 'satCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor satStatus moneda' })
-      .sort({ criticalCount: -1, comparedAt: -1 })
+      .sort({ comparedAt: -1, criticalCount: -1 })
       .skip((pg - 1) * lm)
       .limit(lm)
       .lean(),

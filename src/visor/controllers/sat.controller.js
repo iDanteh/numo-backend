@@ -239,6 +239,13 @@ const startDownload = asyncHandler(async (req, res) => {
   const periodo   = parseInt(req.body.periodo,   10);
   const rfcNorm   = rfc.toUpperCase().trim();
 
+  if (!Number.isFinite(ejercicio) || ejercicio < 2000 || ejercicio > 2100) {
+    return res.status(400).json({ error: 'ejercicio debe ser un año válido (ej. 2026).' });
+  }
+  if (!Number.isFinite(periodo) || periodo < 1 || periodo > 12) {
+    return res.status(400).json({ error: 'periodo debe ser un número entre 1 y 12.' });
+  }
+
   // ── Validar y normalizar fechas ANTES de cualquier otra operación ──────────
   let fi, ff;
   try {
@@ -270,13 +277,13 @@ const startDownload = asyncHandler(async (req, res) => {
   }
 
   // ── Validar límites SAT antes de iniciar el job ────────────────────────────
-  const limitCheck = puedeIniciar(rfcNorm);
+  const limitCheck = await puedeIniciar(rfcNorm);
   if (!limitCheck.puede) {
     logger.warn(`[SAT] Descarga bloqueada por límite (${limitCheck.codigo}) para RFC ${rfcNorm}`);
     return res.status(429).json({
       error:   limitCheck.razon,
       codigo:  limitCheck.codigo,
-      limites: getEstado(rfcNorm),
+      limites: await getEstado(rfcNorm),
     });
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -295,7 +302,7 @@ const startDownload = asyncHandler(async (req, res) => {
 
   // Registrar solicitud activa ANTES de lanzar el async (el contador debe
   // reflejarse de inmediato para que otras peticiones concurrentes lo vean)
-  registrarInicio(rfcNorm);
+  await registrarInicio(rfcNorm);
 
   logger.info(`[SAT] Job manual ${jobId} iniciado | rfc=${rfcNorm} fi=${fi} ff=${ff} tipo=${tipoComprobante} periodo=${ejercicio}/${periodo}`);
   res.status(202).json({ message: 'Descarga iniciada', jobId, rfc: rfcNorm });
@@ -378,7 +385,7 @@ const getDownloadStatus = asyncHandler(async (req, res) => {
  */
 const getLimitesEstado = asyncHandler(async (req, res) => {
   const rfc    = req.params.rfc.toUpperCase().trim();
-  const estado = getEstado(rfc);
+  const estado = await getEstado(rfc);
   res.json({ rfc, ...estado });
 });
 
@@ -391,6 +398,7 @@ const getHistory = asyncHandler(async (req, res) => {
   const comparaciones = await Comparison.find({
     comparedBy: 'scheduled',
     comparedAt: { $exists: true },
+    $or: [{ rfcEmisor: rfc }, { rfcReceptor: rfc }],
   })
     .sort({ comparedAt: -1 })
     .limit(200)

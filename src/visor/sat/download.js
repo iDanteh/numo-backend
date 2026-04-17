@@ -453,14 +453,15 @@ const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
       const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
       const rfcFirmaDesc = rfcCertificado ?? rfcSolicitante;
 
-      const descNs = 'http://DescargaMasivaTerceros.gob.mx';
+      // El servicio Descarga requiere namespace default (xmlns="..."), no prefijo (des:).
+      // WCF hace ContractFilter matching literal sobre el local-name + namespace del body element.
       const descEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${descNs}">
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
   <s:Header/>
   <s:Body>
-    <des:PeticionDescargaMasivaTercerosEntrada>
-      <des:peticionDescarga IdPaquete="${idPaquete}" RfcSolicitante="${rfcFirmaDesc}"/>
-    </des:PeticionDescargaMasivaTercerosEntrada>
+    <PeticionDescargaMasivaTercerosEntrada xmlns="http://DescargaMasivaTerceros.gob.mx">
+      <peticionDescarga IdPaquete="${idPaquete}" RfcSolicitante="${rfcFirmaDesc}"/>
+    </PeticionDescargaMasivaTercerosEntrada>
   </s:Body>
 </s:Envelope>`;
 

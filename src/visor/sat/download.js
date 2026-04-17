@@ -174,6 +174,14 @@ const canonizarSolicitud = (attrs, ns) => {
   return `<des:solicitud xmlns:des="${ns}" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" ${attrsStr}></des:solicitud>`;
 };
 
+/**
+ * Construye la forma canónica C14N del elemento <des:peticionDescarga> SIN firma.
+ * Atributos IdPaquete e RfcSolicitante en orden alfabético (I < R).
+ */
+const canonizarPeticionDescarga = (idPaquete, rfcSolicitante, ns) => {
+  return `<des:peticionDescarga xmlns:des="${ns}" xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" IdPaquete="${idPaquete}" RfcSolicitante="${rfcSolicitante}"></des:peticionDescarga>`;
+};
+
 // ── Operaciones principales ───────────────────────────────────────────────────
 
 /**
@@ -453,21 +461,33 @@ const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
       const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
       const rfcFirmaDesc = rfcCertificado ?? rfcSolicitante;
 
-      // El servicio Descarga requiere namespace default (xmlns="..."), no prefijo (des:).
-      // WCF hace ContractFilter matching literal sobre el local-name + namespace del body element.
+      // Namespace correcto del servicio Descarga (sat.gob.mx, no gob.mx)
+      // WCF hace ContractFilter matching sobre SOAPAction + namespace del body element.
+      const ns = 'http://DescargaMasivaTerceros.sat.gob.mx';
+
+      const canonical = canonizarPeticionDescarga(idPaquete, rfcFirmaDesc, ns);
+      logger.info(`[SatDownload] descargarPaquete() — canonical peticionDescarga: ${canonical}`);
+
+      const cerCopy = Buffer.from(creds.cerBuffer);
+      const keyCopy = Buffer.from(creds.keyBuffer);
+      const pwdCopy = Buffer.from(creds.passwordBuffer);
+      const firma   = await crearFirmaSolicitud(cerCopy, keyCopy, pwdCopy, canonical);
+
       const descEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${ns}">
   <s:Header/>
   <s:Body>
-    <PeticionDescargaMasivaTercerosEntrada xmlns="http://DescargaMasivaTerceros.gob.mx">
-      <peticionDescarga IdPaquete="${idPaquete}" RfcSolicitante="${rfcFirmaDesc}"/>
-    </PeticionDescargaMasivaTercerosEntrada>
+    <des:PeticionDescargaMasivaTercerosEntrada>
+      <des:peticionDescarga IdPaquete="${idPaquete}" RfcSolicitante="${rfcFirmaDesc}">
+        ${firma}
+      </des:peticionDescarga>
+    </des:PeticionDescargaMasivaTercerosEntrada>
   </s:Body>
 </s:Envelope>`;
 
       const xmlResp = await soapCallBearer(
         DESCARGA_URL,
-        'http://DescargaMasivaTerceros.gob.mx/IDescargaMasivaService/Descargar',
+        'http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar',
         descEnvelope,
         token
       );

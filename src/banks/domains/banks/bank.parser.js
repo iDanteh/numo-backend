@@ -21,12 +21,17 @@ function makeHash(m) {
   const key = [
     m.banco,
     m.fecha instanceof Date ? m.fecha.toISOString() : String(m.fecha),
-    m.saldo   ?? '',
-    m.deposito ?? '',
-    m.retiro   ?? '',
+    String(m.saldo   ?? ''),
+    String(m.deposito ?? ''),
+    String(m.retiro   ?? ''),
     (m.concepto || '').substring(0, 120),
   ].join('|');
-  return crypto.createHash('sha256').update(key).digest('hex').substring(0, 40);
+  // SHA-256 completo (64 hex). No se trunca: el truncado anterior a 40 chars
+  // reducía la resistencia a colisiones de 2^256 a 2^160 innecesariamente.
+  // NOTA: movimientos ya importados conservan el hash de 40 chars; re-importar
+  // un archivo histórico generará hashes de 64 chars que no colisionarán con
+  // los existentes — esto es intencional y preferible a mantener la debilidad.
+  return crypto.createHash('sha256').update(key).digest('hex');
 }
 
 // ── Patrones que llevan status = 'otros' ─────────────────────────────────────
@@ -358,13 +363,19 @@ function parseBBVA(sheet) {
 
     const concepto = cellText(col2);
 
-    // Extraer autorización: primer token después del '/'
+    // Extraer autorización: primer bloque numérico después del '/'
+    // Se toma solo la parte numérica inicial del token para evitar que
+    // valores como "04711358/7607235" (sin espacio) se almacenen como
+    // un único token compuesto que nunca coincide al normalizar.
     let numeroAutorizacion = null;
     const slashIdx = concepto.indexOf('/');
     if (slashIdx !== -1) {
       const afterSlash = concepto.substring(slashIdx + 1).trim();
       const firstToken = afterSlash.split(/\s+/)[0];
-      if (firstToken) numeroAutorizacion = firstToken;
+      if (firstToken) {
+        const numMatch = firstToken.match(/^(\d+)/);
+        numeroAutorizacion = numMatch ? numMatch[1] : firstToken;
+      }
     }
 
     const cargoRaw = toNumber(col3);

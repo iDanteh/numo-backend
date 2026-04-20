@@ -40,7 +40,7 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
 // POST /api/account-plan
 router.post('/',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     res.status(201).json(await service.create(req.body));
   }),
@@ -49,7 +49,7 @@ router.post('/',
 // PATCH /api/account-plan/:id
 router.patch('/:id',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     res.json(await service.update(req.params.id, req.body));
   }),
@@ -67,7 +67,7 @@ router.delete('/:id',
 // POST /api/account-plan/import
 router.post('/import',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });

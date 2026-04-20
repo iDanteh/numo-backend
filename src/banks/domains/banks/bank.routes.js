@@ -12,7 +12,7 @@ const {
   listMovimientosAuxiliar,
 } = require('./bank-auxiliary.parser');
 const rulesService          = require('./bank-rules.service');
-const { matchAutorizaciones } = require('./bank-autorizaciones.service');
+const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
 
 const router = express.Router();
 
@@ -38,7 +38,13 @@ router.get('/categories', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
-  const buffer = await service.exportMovements(req.query);
+  const query = { ...req.query };
+  // cobranza no puede exportar movimientos identificados
+  if (req.user.role === 'cobranza') {
+    if (query.status === 'identificado') query.status = undefined;
+    if (!query.status) query.status = 'no_identificado';
+  }
+  const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
   const fecha  = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -48,7 +54,15 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
-  res.json(await service.listMovements(req.query));
+  const query = { ...req.query };
+  // cobranza no puede ver movimientos identificados
+  if (req.user.role === 'cobranza') {
+    if (query.status === 'identificado') {
+      return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
+    }
+    if (!query.status) query.status = 'no_identificado';
+  }
+  res.json(await service.listMovements(query));
 }));
 
 // GET /api/banks/summary
@@ -60,7 +74,7 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
 // POST /api/banks/upload
 router.post('/upload',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
@@ -73,7 +87,7 @@ router.post('/upload',
 router.post(
   '/import-individual',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     const { movimiento, banco } = req.body;
 
@@ -95,7 +109,7 @@ router.post(
 // PATCH /api/banks/movements/:id/status
 router.patch('/movements/:id/status',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad', 'cobranza'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateStatus(req.params.id, req.body.status, req.user));
   }),
@@ -104,7 +118,7 @@ router.patch('/movements/:id/status',
 // PATCH /api/banks/movements/:id/erp-ids  (remove individual)
 router.patch('/movements/:id/erp-ids',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad', 'cobranza'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateErpIds(req.params.id, req.body.action, req.body.erpId, req.user));
   }),
@@ -113,7 +127,7 @@ router.patch('/movements/:id/erp-ids',
 // PUT /api/banks/movements/:id/erp-ids  (replace full array)
 router.put('/movements/:id/erp-ids',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad', 'cobranza'),
   asyncHandler(async (req, res) => {
     res.json(await service.setErpIds(req.params.id, req.body.erpLinks, req.user));
   }),
@@ -129,7 +143,7 @@ router.get('/rules', authenticate, asyncHandler(async (req, res) => {
 
 // POST /api/banks/rules
 router.post('/rules',
-  authenticate, authorize('admin', 'contador'),
+  authenticate, authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     const { banco, ...data } = req.body;
     if (!banco) return res.status(400).json({ error: 'banco requerido' });
@@ -139,7 +153,7 @@ router.post('/rules',
 
 // PUT /api/banks/rules/reorder
 router.put('/rules/reorder',
-  authenticate, authorize('admin', 'contador'),
+  authenticate, authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     res.json(await rulesService.reorderRules(req.body.ids));
   }),
@@ -147,7 +161,7 @@ router.put('/rules/reorder',
 
 // PUT /api/banks/rules/:id
 router.put('/rules/:id',
-  authenticate, authorize('admin', 'contador'),
+  authenticate, authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     res.json(await rulesService.updateRule(req.params.id, req.body));
   }),
@@ -155,7 +169,7 @@ router.put('/rules/:id',
 
 // DELETE /api/banks/rules/:id
 router.delete('/rules/:id',
-  authenticate, authorize('admin', 'contador'),
+  authenticate, authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     res.json(await rulesService.deleteRule(req.params.id));
   }),
@@ -163,7 +177,7 @@ router.delete('/rules/:id',
 
 // POST /api/banks/rules/apply
 router.post('/rules/apply',
-  authenticate, authorize('admin', 'contador'),
+  authenticate, authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     const { banco, soloSinCategoria = false } = req.body;
     if (!banco) return res.status(400).json({ error: 'banco requerido' });
@@ -174,7 +188,7 @@ router.post('/rules/apply',
 // POST /api/banks/auxiliar/import
 router.post('/auxiliar/import',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
@@ -186,7 +200,7 @@ router.post('/auxiliar/import',
 // POST /api/banks/auxiliar/aplicar  — cruza catálogo con movimientos
 router.post('/auxiliar/aplicar',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   asyncHandler(async (_req, res) => {
     const result = await applyAuxiliaryMatching();
     res.json(result);
@@ -219,20 +233,31 @@ router.get('/config/:banco', authenticate, asyncHandler(async (req, res) => {
 // PATCH /api/banks/config/:banco
 router.patch('/config/:banco',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   asyncHandler(async (req, res) => {
     res.json(await service.saveConfig(req.params.banco, req.body));
   }),
 );
 
-// POST /api/banks/autorizaciones/match  — match temporal por número de autorización
+// POST /api/banks/autorizaciones/match  — match por número de autorización (vía Excel)
 router.post('/autorizaciones/match',
   authenticate,
-  authorize('admin', 'contador'),
+  authorize('admin', 'contabilidad'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
     const result = await matchAutorizaciones(req.file.buffer);
+    res.json(result);
+  }),
+);
+
+// POST /api/banks/autorizaciones/match-erp  — match desde CxCs del ERP (sin Excel)
+// Body opcional: { banco: 'BBVA' }  — si se omite, busca en todos los bancos.
+router.post('/autorizaciones/match-erp',
+  authenticate,
+  authorize('admin', 'contabilidad'),
+  asyncHandler(async (req, res) => {
+    const result = await matchAutorizacionesDesdeErp({ banco: req.body.banco });
     res.json(result);
   }),
 );

@@ -4,10 +4,10 @@ const User = require('./User.model');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 const { getIo } = require('../../shared/socket');
 
-const ROLES_VALIDOS = ['admin', 'contador', 'viewer'];
+const ROLES_VALIDOS = ['admin', 'contabilidad', 'cobranza', 'tienda'];
 
 /**
- * Busca al usuario por auth0Sub; si no existe lo crea con rol 'viewer'.
+ * Busca al usuario por auth0Sub; si no existe lo crea con rol 'tienda'.
  * Actualiza nombre, email y lastLogin en cada llamada.
  * Usa operaciones atómicas para evitar la condición de carrera que
  * produce E11000 cuando dos peticiones simultáneas intentan crear el mismo usuario.
@@ -29,7 +29,7 @@ async function findOrCreate({ auth0Sub, nombre, email }) {
   if (!user) {
     // 3. Crear nuevo usuario; en caso de race condition (E11000) releer el doc.
     try {
-      user = await User.create({ auth0Sub, nombre, email, role: 'viewer' });
+      user = await User.create({ auth0Sub, nombre, email, role: 'tienda' });
     } catch (err) {
       if (err.code === 11000) {
         user = await User.findOne({ auth0Sub });

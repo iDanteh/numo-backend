@@ -9,6 +9,7 @@ const CFDI = require('../models/CFDI');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { RFC_REGEX } = require('../utils/validators');
 const { logger } = require('../utils/logger');
+const SatDescargaLog = require('../models/SatDescargaLog');
 
 /** Estado en memoria de jobs de descarga manual (jobId → estado). */
 const jobsManales = new Map();
@@ -323,6 +324,7 @@ const startDownload = asyncHandler(async (req, res) => {
         ayer: new Date(fi),
         ejercicio,
         periodo,
+        tipo: 'manual',
         onPaso: (n) => {
           const j = jobsManales.get(jobId);
           if (j) jobsManales.set(jobId, { ...j, paso: n });
@@ -391,40 +393,20 @@ const getLimitesEstado = asyncHandler(async (req, res) => {
 
 /**
  * GET /api/sat/historial/:rfc
+ * GET /api/sat/historial
  */
 const getHistory = asyncHandler(async (req, res) => {
-  const rfc = req.params.rfc.toUpperCase().trim();
+  const rfc = req.params.rfc?.toUpperCase().trim();
 
-  const comparaciones = await Comparison.find({
-    comparedBy: 'scheduled',
-    comparedAt: { $exists: true },
-    $or: [{ rfcEmisor: rfc }, { rfcReceptor: rfc }],
-  })
-    .sort({ comparedAt: -1 })
-    .limit(200)
+  const filter = {};
+  if (rfc) filter.rfc = rfc;
+
+  const logs = await SatDescargaLog.find(filter)
+    .sort({ inicio: -1 })
+    .limit(100)
     .lean();
 
-  const porDia = new Map();
-  for (const comp of comparaciones) {
-    const dia = comp.comparedAt.toISOString().slice(0, 10);
-    if (!porDia.has(dia)) {
-      porDia.set(dia, { fecha: dia, total: 0, coinciden: 0, diferencias: 0, errores: 0, soloSAT: 0, soloERP: 0 });
-    }
-    const bucket = porDia.get(dia);
-    bucket.total++;
-    if      (comp.status === 'match')                                              bucket.coinciden++;
-    else if (comp.status === 'discrepancy')                                        bucket.diferencias++;
-    else if (comp.status === 'not_in_sat')  bucket.soloERP++;
-    else if (comp.status === 'not_in_erp')  bucket.soloSAT++;
-    else if (comp.status === 'error')                                              bucket.errores++;
-  }
-
-  const historial = [...porDia.values()].slice(0, 7).map(dia => ({
-    ...dia,
-    estado: dia.diferencias > 0 ? 'con_diferencias' : dia.errores > 0 ? 'error' : 'ok',
-  }));
-
-  res.json({ rfc, historial });
+  res.json({ rfc: rfc || null, historial: logs });
 });
 
 module.exports = {

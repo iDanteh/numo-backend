@@ -64,6 +64,7 @@ router.post('/descarga-manual',
 
 router.get('/descarga-manual/status/:jobId', authenticate, getDownloadStatus);
 router.get('/limites/:rfc', authenticate, getLimitesEstado);
+router.get('/historial', authenticate, getHistory);
 router.get('/historial/:rfc', authenticate, getHistory);
 
 module.exports = router;

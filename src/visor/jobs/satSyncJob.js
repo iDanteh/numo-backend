@@ -13,6 +13,7 @@ const { obtener, eliminar, tieneCredenciales } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin } = require('../sat/rateLimiter');
 const { derivarPeriodoDesdeFecha, resolverPeriodo } = require('../services/periodoFiscal.service');
 const { logger } = require('../utils/logger');
+const SatDescargaLog = require('../models/SatDescargaLog');
 
 const CRON_HORA = config.sat.cronHora;
 
@@ -133,168 +134,199 @@ const ejecutarDescargaMasiva = async () => {
  * @param {Function} [onPaso]   — Callback opcional (paso: number) para reportar progreso al frontend.
  *                                Pasos: 1=Autenticando, 3=Verificando, 4=Descargando, 5=Procesando.
  */
-const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, creds, ayer, ejercicio, periodo, onPaso }) => {
+const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica' }) => {
   logger.info(`[SatSyncJob] RFC ${rfc} — solicitando ${tipoComprobante} ${fechaInicio.slice(0, 10)}`);
 
   const fecha = fechaInicio.slice(0, 10); // YYYY-MM-DD
 
-  // ── Checkpoint: buscar descarga parcialmente completada ──────────────────
-  let checkpoint = await SatJobCheckpoint.findOne({ rfc: rfc.toUpperCase(), fecha, tipoComprobante });
-
-  let idSolicitud, idsPaquetes, totalCfdis;
-
-  if (checkpoint && checkpoint.status === 'descargando' && checkpoint.idsPaquetes?.length > 0) {
-    // Reanudar — ya tenemos idSolicitud e idsPaquetes del SAT
-    idSolicitud  = checkpoint.idSolicitud;
-    idsPaquetes  = checkpoint.idsPaquetes;
-    totalCfdis   = idsPaquetes.length; // aprox
-    const ya = checkpoint.paquetesProcesados?.length ?? 0;
-    logger.info(`[SatSyncJob] Reanudando desde checkpoint: ${ya}/${idsPaquetes.length} paquetes ya procesados.`);
-    onPaso?.(4);
-  } else {
-    // Crear/sobreescribir checkpoint al inicio
-    checkpoint = await SatJobCheckpoint.findOneAndUpdate(
-      { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
-      { $set: { ejercicio, periodo, status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], error: null, updatedAt: new Date() } },
-      { upsert: true, new: true },
-    );
-
-    // ── Solicitar descarga ─────────────────────────────────────────────────
-    onPaso?.(1);
-    idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, creds });
-    await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
-
-    // ── Verificar (polling 60s) ────────────────────────────────────────────
-    onPaso?.(3);
-    ({ idsPaquetes, totalCfdis } = await verificar(idSolicitud, rfc, creds));
-    logger.info(`[SatSyncJob] RFC ${rfc}: ${totalCfdis} CFDIs en ${idsPaquetes.length} paquete(s)`);
-
-    if (idsPaquetes.length === 0) {
-      logger.info(`[SatSyncJob] RFC ${rfc}: no hay paquetes que descargar.`);
-      await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', updatedAt: new Date() } });
-      return;
-    }
-
-    await SatJobCheckpoint.updateOne(
-      { _id: checkpoint._id },
-      { $set: { idsPaquetes, status: 'descargando', updatedAt: new Date() } },
-    );
-
-    onPaso?.(4);
+  // Crear entrada de log al inicio
+  let logId = null;
+  try {
+    const logEntry = await SatDescargaLog.create({
+      rfc: rfc.toUpperCase(),
+      tipo,
+      tipoComprobante,
+      fechaInicio: fecha,
+      fechaFin: fechaFin.slice(0, 10),
+      ejercicio,
+      periodo,
+      estado: 'en_proceso',
+      inicio: new Date(),
+    });
+    logId = logEntry._id;
+  } catch (logErr) {
+    logger.warn(`[SatSyncJob] No se pudo crear log de descarga: ${logErr.message}`);
   }
 
-  // ── Descargar paquetes pendientes (uno a uno, con checkpoint por paquete) ─
-  const yaProcessados = new Set(checkpoint.paquetesProcesados ?? []);
-  const pendientes    = idsPaquetes.filter(id => !yaProcessados.has(id));
+  const actualizarLog = async (campos) => {
+    if (!logId) return;
+    await SatDescargaLog.updateOne({ _id: logId }, { $set: campos }).catch(() => {});
+  };
 
-  // Acumular solo objetos normalizados (mucho más pequeños que los XMLs crudos)
-  const cfdisSATRaw = [];
-  for (const idPaquete of pendientes) {
-    let xmls = await descargarPaquete(idPaquete, rfc, creds);
-    for (const xml of xmls) {
-      try {
-        const parsed = await parseCFDI(xml);
-        cfdisSATRaw.push(parsed);
-      } catch (parseErr) {
-        logger.warn(`[SatSyncJob] Error parseando XML de paquete ${idPaquete}: ${parseErr.message}`);
+  try {
+    // ── Checkpoint: buscar descarga parcialmente completada ──────────────────
+    let checkpoint = await SatJobCheckpoint.findOne({ rfc: rfc.toUpperCase(), fecha, tipoComprobante });
+
+    let idSolicitud, idsPaquetes, totalCfdis;
+
+    if (checkpoint && checkpoint.status === 'descargando' && checkpoint.idsPaquetes?.length > 0) {
+      idSolicitud  = checkpoint.idSolicitud;
+      idsPaquetes  = checkpoint.idsPaquetes;
+      totalCfdis   = idsPaquetes.length;
+      const ya = checkpoint.paquetesProcesados?.length ?? 0;
+      logger.info(`[SatSyncJob] Reanudando desde checkpoint: ${ya}/${idsPaquetes.length} paquetes ya procesados.`);
+      onPaso?.(4);
+    } else {
+      checkpoint = await SatJobCheckpoint.findOneAndUpdate(
+        { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
+        { $set: { ejercicio, periodo, status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], error: null, updatedAt: new Date() } },
+        { upsert: true, new: true },
+      );
+
+      onPaso?.(1);
+      idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, creds });
+      await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
+
+      onPaso?.(3);
+      ({ idsPaquetes, totalCfdis } = await verificar(idSolicitud, rfc, creds));
+      logger.info(`[SatSyncJob] RFC ${rfc}: ${totalCfdis} CFDIs en ${idsPaquetes.length} paquete(s)`);
+
+      if (idsPaquetes.length === 0) {
+        logger.info(`[SatSyncJob] RFC ${rfc}: no hay paquetes que descargar.`);
+        await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', updatedAt: new Date() } });
+        await actualizarLog({ estado: 'completado', fin: new Date(), totalSAT: 0, totalERP: 0, coinciden: 0, soloSAT: 0, soloERP: 0, diferencias: 0, paquetes: 0 });
+        return { totalSAT: 0, totalERP: 0, coinciden: 0, soloEnSAT: 0, soloEnERP: 0, conDiferencia: 0, paquetes: 0 };
+      }
+
+      await SatJobCheckpoint.updateOne(
+        { _id: checkpoint._id },
+        { $set: { idsPaquetes, status: 'descargando', updatedAt: new Date() } },
+      );
+
+      onPaso?.(4);
+    }
+
+    const yaProcessados = new Set(checkpoint.paquetesProcesados ?? []);
+    const pendientes    = idsPaquetes.filter(id => !yaProcessados.has(id));
+
+    const cfdisSATRaw = [];
+    for (const idPaquete of pendientes) {
+      let xmls = await descargarPaquete(idPaquete, rfc, creds);
+      for (const xml of xmls) {
+        try {
+          const parsed = await parseCFDI(xml);
+          cfdisSATRaw.push(parsed);
+        } catch (parseErr) {
+          logger.warn(`[SatSyncJob] Error parseando XML de paquete ${idPaquete}: ${parseErr.message}`);
+        }
+      }
+      xmls = null;
+
+      await SatJobCheckpoint.updateOne(
+        { _id: checkpoint._id },
+        { $addToSet: { paquetesProcesados: idPaquete }, $set: { updatedAt: new Date() } },
+      );
+      logger.info(`[SatSyncJob] Paquete ${idPaquete} procesado y guardado en checkpoint.`);
+    }
+
+    logger.info(`[SatSyncJob] RFC ${rfc}: ${cfdisSATRaw.length} CFDIs parseados del SAT`);
+
+    const cfdisSAT = cfdisSATRaw.map(normalizarCFDI);
+
+    const inicioDelDia = new Date(fechaInicio);
+    const finDelDia    = new Date(fechaFin);
+
+    const campoRfc = tipoComprobante === 'Recibidos' ? 'receptor.rfc' : 'emisor.rfc';
+    const cfdisERPDocs = await CFDI.find({
+      source: 'ERP',
+      isActive: true,
+      tipoDeComprobante: { $ne: 'T' },
+      [campoRfc]: rfc.toUpperCase(),
+      fecha: { $gte: inicioDelDia, $lte: finDelDia },
+    }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus').lean();
+
+    const cfdisERP = cfdisERPDocs.map(normalizarCFDI);
+
+    const { coinciden, soloEnSAT, soloEnERP, conDiferencia } = compararArrays(cfdisSAT, cfdisERP);
+
+    logger.info(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): coinciden=${coinciden.length}, soloSAT=${soloEnSAT.length}, soloERP=${soloEnERP.length}, diffs=${conDiferencia.length}`);
+
+    onPaso?.(5);
+    if (soloEnSAT.length > 0) {
+      const soloEnSATUuids = new Set(soloEnSAT.map(c => c.uuid.toUpperCase()));
+      const cfdisNuevos = cfdisSATRaw.filter(c => soloEnSATUuids.has((c.uuid || '').toUpperCase()));
+      if (cfdisNuevos.length > 0) {
+        await CFDI.bulkWrite(cfdisNuevos.map(c => ({
+          updateOne: {
+            filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
+            update: { $set: {
+              uuid:               c.uuid.toUpperCase(),
+              source:             'SAT',
+              ejercicio,
+              periodo,
+              satStatus:          'Vigente',
+              isActive:           true,
+              version:            c.version,
+              serie:              c.serie,
+              folio:              c.folio,
+              fecha:              c.fecha,
+              subTotal:           c.subTotal,
+              total:              c.total,
+              moneda:             c.moneda,
+              tipoDeComprobante:  c.tipoDeComprobante,
+              emisor:             c.emisor,
+              receptor:           c.receptor,
+              conceptos:          c.conceptos,
+              impuestos:          c.impuestos,
+              xmlContent:         c.xmlContent,
+              xmlHash:            c.xmlHash,
+              timbreFiscalDigital: c.timbreFiscalDigital,
+              complementoPago:    c.complementoPago,
+              lastComparisonStatus: 'not_in_erp',
+              lastComparisonAt:   new Date(),
+            }},
+            upsert: true,
+          },
+        })));
+        logger.info(`[SatSyncJob] RFC ${rfc}: ${cfdisNuevos.length} CFDIs SAT guardados en colección`);
       }
     }
-    xmls = null; // liberar array de strings XML
 
-    // Marcar paquete como procesado en MongoDB antes de continuar
+    await guardarResultados({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, ejercicio, periodo });
+
     await SatJobCheckpoint.updateOne(
-      { _id: checkpoint._id },
-      { $addToSet: { paquetesProcesados: idPaquete }, $set: { updatedAt: new Date() } },
+      { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
+      { $set: { status: 'completado', updatedAt: new Date() } },
     );
-    logger.info(`[SatSyncJob] Paquete ${idPaquete} procesado y guardado en checkpoint.`);
+
+    const resultado = {
+      totalSAT:      cfdisSAT.length,
+      totalERP:      cfdisERP.length,
+      coinciden:     coinciden.length,
+      soloEnSAT:     soloEnSAT.length,
+      soloEnERP:     soloEnERP.length,
+      conDiferencia: conDiferencia.length,
+      paquetes:      idsPaquetes.length,
+    };
+
+    await actualizarLog({
+      estado:      'completado',
+      fin:         new Date(),
+      totalSAT:    resultado.totalSAT,
+      totalERP:    resultado.totalERP,
+      coinciden:   resultado.coinciden,
+      soloSAT:     resultado.soloEnSAT,
+      soloERP:     resultado.soloEnERP,
+      diferencias: resultado.conDiferencia,
+      paquetes:    resultado.paquetes,
+    });
+
+    return resultado;
+
+  } catch (err) {
+    await actualizarLog({ estado: 'error', error: err.message, fin: new Date() });
+    throw err;
   }
-
-  logger.info(`[SatSyncJob] RFC ${rfc}: ${cfdisSATRaw.length} CFDIs parseados del SAT`);
-
-  // Normalizar CFDIs del SAT
-  const cfdisSAT = cfdisSATRaw.map(normalizarCFDI);
-
-  // Obtener CFDIs del ERP en el mismo rango exacto descargado del SAT
-  // (para el job nocturno: un día; para descarga manual: puede ser todo un mes)
-  const inicioDelDia = new Date(fechaInicio);
-  const finDelDia    = new Date(fechaFin);
-
-  const campoRfc = tipoComprobante === 'Recibidos' ? 'receptor.rfc' : 'emisor.rfc';
-  const cfdisERPDocs = await CFDI.find({
-    source: 'ERP',
-    isActive: true,
-    tipoDeComprobante: { $ne: 'T' },   // Traslados excluidos de la conciliación
-    [campoRfc]: rfc.toUpperCase(),
-    fecha: { $gte: inicioDelDia, $lte: finDelDia },
-  }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus').lean();
-
-  const cfdisERP = cfdisERPDocs.map(normalizarCFDI);
-
-  // Comparar arrays
-  const { coinciden, soloEnSAT, soloEnERP, conDiferencia } = compararArrays(cfdisSAT, cfdisERP);
-
-  logger.info(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): coinciden=${coinciden.length}, soloSAT=${soloEnSAT.length}, soloERP=${soloEnERP.length}, diffs=${conDiferencia.length}`);
-
-  // Persistir CFDIs del SAT que no existen en ERP (source: 'SAT') para que sean
-  // visibles en el listado.  Los que coinciden ya existen como fuente ERP.
-  onPaso?.(5);  // Procesando CFDIs
-  if (soloEnSAT.length > 0) {
-    const soloEnSATUuids = new Set(soloEnSAT.map(c => c.uuid.toUpperCase()));
-    const cfdisNuevos = cfdisSATRaw.filter(c => soloEnSATUuids.has((c.uuid || '').toUpperCase()));
-    if (cfdisNuevos.length > 0) {
-      await CFDI.bulkWrite(cfdisNuevos.map(c => ({
-        updateOne: {
-          filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
-          update: { $set: {
-            uuid:               c.uuid.toUpperCase(),
-            source:             'SAT',
-            ejercicio,
-            periodo,
-            satStatus:          'Vigente',
-            isActive:           true,
-            version:            c.version,
-            serie:              c.serie,
-            folio:              c.folio,
-            fecha:              c.fecha,
-            subTotal:           c.subTotal,
-            total:              c.total,
-            moneda:             c.moneda,
-            tipoDeComprobante:  c.tipoDeComprobante,
-            emisor:             c.emisor,
-            receptor:           c.receptor,
-            conceptos:          c.conceptos,
-            impuestos:          c.impuestos,
-            xmlContent:         c.xmlContent,
-            xmlHash:            c.xmlHash,
-            timbreFiscalDigital: c.timbreFiscalDigital,
-            complementoPago:    c.complementoPago,
-            lastComparisonStatus: 'not_in_erp',
-            lastComparisonAt:   new Date(),
-          }},
-          upsert: true,
-        },
-      })));
-      logger.info(`[SatSyncJob] RFC ${rfc}: ${cfdisNuevos.length} CFDIs SAT guardados en colección`);
-    }
-  }
-
-  await guardarResultados({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, ejercicio, periodo });
-
-  // Marcar checkpoint como completado
-  await SatJobCheckpoint.updateOne(
-    { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
-    { $set: { status: 'completado', updatedAt: new Date() } },
-  );
-
-  return {
-    totalSAT:       cfdisSAT.length,
-    totalERP:       cfdisERP.length,
-    coinciden:      coinciden.length,
-    soloEnSAT:      soloEnSAT.length,
-    soloEnERP:      soloEnERP.length,
-    conDiferencia:  conDiferencia.length,
-    paquetes:       idsPaquetes.length,
-  };
 };
 
 /**

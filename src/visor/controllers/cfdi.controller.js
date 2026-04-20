@@ -80,7 +80,7 @@ const list = asyncHandler(async (req, res) => {
   const {
     page = 1, limit = 20, source, tipoDeComprobante,
     rfcEmisor, rfcReceptor, satStatus, erpStatus, lastComparisonStatus,
-    fechaInicio, fechaFin, search, uuids,
+    fechaInicio, fechaFin, search, uuids, uuid,
     ejercicio, periodo,
   } = req.query;
 
@@ -92,6 +92,7 @@ const list = asyncHandler(async (req, res) => {
     const uuidList = uuids.split(',').map(u => u.trim().toUpperCase()).filter(Boolean);
     if (uuidList.length) filter.uuid = { $in: uuidList };
   }
+  if (uuid) filter.uuid = { $regex: uuid.trim(), $options: 'i' };
   if (source) {
     const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };

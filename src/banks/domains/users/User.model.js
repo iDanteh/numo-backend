@@ -8,8 +8,8 @@ const userSchema = new mongoose.Schema({
   email:    { type: String, default: '' },
   role:     {
     type:    String,
-    enum:    ['admin', 'contador', 'viewer'],
-    default: 'viewer',
+    enum:    ['admin', 'contabilidad', 'cobranza', 'tienda'],
+    default: 'tienda',
   },
   isActive:  { type: Boolean, default: true },
   lastLogin: { type: Date, default: null },

@@ -199,17 +199,35 @@ async function listMovements(filters) {
     filter.$or = orClauses;
   }
 
-  const SORTABLE   = ['fecha', 'banco', 'deposito', 'retiro', 'saldo'];
-  const sortField  = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
+  const SORTABLE   = ['fecha', 'banco', 'deposito', 'retiro', 'saldo', 'saldo-erp', 'diferencia'];
+  const rawSortBy  = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
+  const FIELD_MAP  = { 'saldo-erp': 'saldoErp' };
+  const sortField  = FIELD_MAP[rawSortBy] ?? rawSortBy;
   const sortOrder  = sortDir === 'asc' ? 1 : -1;
   const skip       = (parseInt(page) - 1) * parseInt(limit);
 
-  const [movements, total] = await Promise.all([
-    BankMovement.find(filter)
+  let movementsQuery;
+  if (rawSortBy === 'diferencia') {
+    movementsQuery = BankMovement.aggregate([
+      { $match: filter },
+      { $addFields: { _diferencia: { $subtract: [
+        { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+        { $ifNull: ['$saldoErp', 0] },
+      ] } } },
+      { $sort: { _diferencia: sortOrder, _id: 1 } },
+      { $skip: skip },
+      { $limit: parseInt(limit) },
+    ]);
+  } else {
+    movementsQuery = BankMovement.find(filter)
       .sort({ [sortField]: sortOrder, _id: 1 })
       .skip(skip)
       .limit(parseInt(limit))
-      .lean(),
+      .lean();
+  }
+
+  const [movements, total] = await Promise.all([
+    movementsQuery,
     BankMovement.countDocuments(filter),
   ]);
 
@@ -473,12 +491,20 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
 const ERP_TOLERANCE = 1.00; // $1 MXN de tolerancia para cuadre
 
 // Calcula saldoErp, uuidXML y status a partir de erpLinks del movimiento.
-// Para cada link usa saldoActual cuando está disponible; si es null/undefined
-// cae al total del comprobante (caso: ERP no regresó saldoActual explícito).
+// Para cada link:
+//   - Si saldoActual > 0  → usar saldoActual (pago parcial pendiente en ERP)
+//   - Si saldoActual es null o 0 → usar total del comprobante
+//     (ERP marcó la CxC como cobrada o no devolvió saldo; se compara contra
+//      el importe original para permitir la identificación manual o automática)
 function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
-    ? links.reduce((sum, l) => sum + (l.saldoActual || l.total || 0), 0)
+    ? links.reduce((sum, l) => {
+        const ref = (l.saldoActual != null && l.saldoActual > 0)
+          ? l.saldoActual
+          : (l.total ?? 0);
+        return sum + ref;
+      }, 0)
     : null;
   const uuidXML    = links.find(l => l.folioFiscal)?.folioFiscal?.toUpperCase() ?? null;
   const bankAmount = Math.abs(mov.deposito ?? mov.retiro ?? 0);
@@ -699,13 +725,27 @@ async function exportMovements(filters) {
     filter.$or = orClauses;
   }
 
-  const SORTABLE  = ['fecha', 'banco', 'deposito', 'retiro', 'saldo'];
-  const sortField = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
+  const SORTABLE  = ['fecha', 'banco', 'deposito', 'retiro', 'saldo', 'saldo-erp', 'diferencia'];
+  const rawSortBy = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
+  const FIELD_MAP = { 'saldo-erp': 'saldoErp' };
+  const sortField = FIELD_MAP[rawSortBy] ?? rawSortBy;
   const sortOrder = sortDir === 'asc' ? 1 : -1;
 
-  const movements = await BankMovement.find(filter)
-    .sort({ [sortField]: sortOrder, _id: 1 })
-    .lean();
+  let movements;
+  if (rawSortBy === 'diferencia') {
+    movements = await BankMovement.aggregate([
+      { $match: filter },
+      { $addFields: { _diferencia: { $subtract: [
+        { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+        { $ifNull: ['$saldoErp', 0] },
+      ] } } },
+      { $sort: { _diferencia: sortOrder, _id: 1 } },
+    ]);
+  } else {
+    movements = await BankMovement.find(filter)
+      .sort({ [sortField]: sortOrder, _id: 1 })
+      .lean();
+  }
 
   const ExcelJS = require('exceljs');
   const workbook = new ExcelJS.Workbook();

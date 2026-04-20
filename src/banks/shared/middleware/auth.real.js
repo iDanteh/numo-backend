@@ -25,7 +25,7 @@ const jwtCheck = auth({
 
 /**
  * authenticate — valida el JWT y puebla req.user con datos de la DB.
- * Si el usuario no existe en DB lo crea con rol 'viewer'.
+ * Si el usuario no existe en DB lo crea con rol 'tienda'.
  * Si el usuario está desactivado devuelve 403.
  */
 const authenticate = (req, res, next) => {

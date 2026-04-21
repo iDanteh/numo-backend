@@ -6,7 +6,7 @@ const CFDI = require('../models/CFDI');
 const { parseCFDI } = require('../services/cfdiParser');
 const { compareCFDI } = require('../services/comparisonEngine');
 const { verifyCFDIWithSAT } = require('../services/satVerification');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { normalizeSource } = require('../utils/validators');
 const { paginate, skip } = require('../utils/pagination');
 

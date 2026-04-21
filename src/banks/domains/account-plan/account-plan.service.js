@@ -1,40 +1,32 @@
 'use strict';
 
-const AccountPlan              = require('./AccountPlan.model');
+/**
+ * account-plan/account-plan.service.js
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Lógica de negocio del catálogo de cuentas contables.
+ * Delegada a PostgreSQL mediante account-plan.repository.js.
+ */
+
+const repo                     = require('./repositories/account-plan.repository');
 const { parseAccountPlanFile } = require('./account-plan.parser');
 const { NotFoundError }        = require('../../shared/errors/AppError');
 
 const ALLOWED_UPDATE_FIELDS = ['nombre', 'ctaMayor', 'parentId', 'isActive'];
 
 async function list(filters) {
-  const { tipo, naturaleza, search, includeInactive } = filters;
-  const filter = {};
-  if (!includeInactive) filter.isActive   = true;
-  if (tipo)             filter.tipo       = tipo.toUpperCase();
-  if (naturaleza)       filter.naturaleza = naturaleza.toUpperCase();
-  if (search)           filter.$text      = { $search: search };
-  return AccountPlan.find(filter).sort({ codigo: 1 }).lean();
+  return repo.findAll(filters);
 }
 
 async function tree() {
-  return AccountPlan.find({ isActive: true }).sort({ nivel: 1, codigo: 1 }).lean();
+  return repo.findTree();
 }
 
 async function search(q, tipo) {
-  if (!q || q.length < 1) return [];
-  const filter = {
-    isActive: true,
-    $or: [
-      { codigo: new RegExp(q, 'i') },
-      { nombre: new RegExp(q, 'i') },
-    ],
-  };
-  if (tipo) filter.tipo = tipo.toUpperCase();
-  return AccountPlan.find(filter).sort({ nivel: 1, codigo: 1 }).limit(25).lean();
+  return repo.search(q, tipo);
 }
 
 async function getById(id) {
-  const account = await AccountPlan.findById(id).populate('parentId', 'codigo nombre').lean();
+  const account = await repo.findById(id);
   if (!account) throw new NotFoundError('Cuenta');
   return account;
 }
@@ -45,13 +37,11 @@ async function create(data) {
   // Resolver parentId desde ctaMayor
   let parentId = null;
   if (ctaMayor) {
-    const parent = await AccountPlan.findOne({ codigo: ctaMayor }).select('_id').lean();
-    if (parent) parentId = parent._id;
+    const parent = await repo.findByCodigo(ctaMayor);
+    if (parent) parentId = parent.id;
   }
 
-  const account = new AccountPlan({ codigo, nombre, ctaMayor: ctaMayor || null, parentId });
-  await account.save();
-  return account;
+  return repo.create({ codigo, nombre, ctaMayor: ctaMayor || null, parentId });
 }
 
 async function update(id, data) {
@@ -63,24 +53,22 @@ async function update(id, data) {
   // Si cambió ctaMayor, recalcular parentId
   if (updateData.ctaMayor !== undefined) {
     if (updateData.ctaMayor) {
-      const parent = await AccountPlan.findOne({ codigo: updateData.ctaMayor }).select('_id').lean();
-      updateData.parentId = parent ? parent._id : null;
+      const parent = await repo.findByCodigo(updateData.ctaMayor);
+      updateData.parentId = parent ? parent.id : null;
     } else {
       updateData.parentId = null;
     }
   }
 
-  const account = await AccountPlan.findByIdAndUpdate(
-    id, { $set: updateData }, { new: true, runValidators: true },
-  );
+  const account = await repo.update(id, updateData);
   if (!account) throw new NotFoundError('Cuenta');
   return account;
 }
 
 async function softDelete(id) {
-  const account = await AccountPlan.findByIdAndUpdate(id, { isActive: false }, { new: true });
-  if (!account) throw new NotFoundError('Cuenta');
-  return { message: 'Cuenta desactivada', id: account._id };
+  const result = await repo.softDelete(id);
+  if (!result) throw new NotFoundError('Cuenta');
+  return { message: 'Cuenta desactivada', id: result.id };
 }
 
 async function importFile(buffer, opts = {}) {

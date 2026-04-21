@@ -3,7 +3,7 @@ const config = require('../../config/env');
 const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
-const Entity = require('../models/Entity');
+const entityRepo = require('../repositories/entity.repository');
 const SatJobCheckpoint = require('../models/SatJobCheckpoint');
 const { compareCFDI } = require('../services/comparisonEngine');
 const { compararArrays } = require('../services/comparisonEngine');
@@ -12,7 +12,7 @@ const { solicitar, verificar, descargarPaquete } = require('../sat/download');
 const { obtener, eliminar, tieneCredenciales } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin } = require('../sat/rateLimiter');
 const { derivarPeriodoDesdeFecha, resolverPeriodo } = require('../services/periodoFiscal.service');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 const SatDescargaLog = require('../models/SatDescargaLog');
 
 const CRON_HORA = config.sat.cronHora;
@@ -49,11 +49,8 @@ const ejecutarDescargaMasiva = async () => {
   }
   logger.info(`[SatSyncJob] Periodo fiscal validado: ${ejercicio}/${periodo}`);
 
-  // Entidades con descarga nocturna habilitada
-  const entidades = await Entity.find({
-    isActive: true,
-    'syncConfig.autoSync': true,
-  }, 'rfc nombre syncConfig').lean();
+  // Entidades con descarga nocturna habilitada (PostgreSQL)
+  const entidades = await entityRepo.findWithAutoSync();
 
   if (entidades.length === 0) {
     logger.info('[SatSyncJob] No hay entidades con descarga nocturna habilitada.');

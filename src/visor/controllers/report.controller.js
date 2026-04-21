@@ -2,7 +2,7 @@ const ExcelJS = require('exceljs');
 const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
 
 /**
  * MONTO_EFECTIVO_EXPR — expresión MongoDB para obtener el monto real de un CFDI.

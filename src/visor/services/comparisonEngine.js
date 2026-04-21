@@ -3,7 +3,7 @@ const Comparison = require('../models/Comparison');
 const ComparisonSession = require('../models/ComparisonSession');
 const Discrepancy = require('../models/Discrepancy');
 const { verifyCFDIWithSAT } = require('./satVerification');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 const formatSessionName = (date) => {
   return `Sesión ${date.toLocaleDateString('es-MX', {

@@ -1,6 +1,6 @@
 const axios = require('axios');
 const { parseStringPromise } = require('xml2js');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 const SAT_ENDPOINT = 'https://consultaqr.facturaelectronica.sat.gob.mx/ConsultaCFDIService.svc';
 const SOAP_ACTION  = 'http://tempuri.org/IConsultaCFDIService/Consulta';

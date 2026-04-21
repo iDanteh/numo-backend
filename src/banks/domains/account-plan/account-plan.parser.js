@@ -22,7 +22,7 @@
  */
 
 const ExcelJS  = require('exceljs');
-const AccountPlan = require('./AccountPlan.model');
+const repo     = require('./repositories/account-plan.repository');
 
 // Alias de encabezado aceptados por columna
 const HEADER_ALIASES = {
@@ -162,30 +162,23 @@ async function parseAccountPlanFile(buffer, opts = {}) {
   let actualizados = 0;
   let omitidos     = 0;
   const errores    = [];
-  const codigoToObjId = new Map();
+  const codigoToId = new Map();   // código → PG integer id
 
   for (const row of rawRows) {
     try {
-      const existing = await AccountPlan.findOne({ codigo: row.codigo }).select('_id').lean();
+      const { isNew, record } = await repo.upsertByCodigo({
+        codigo:     row.codigo,
+        nombre:     row.nombre,
+        ctaMayor:   row.ctaMayor,
+        tipo:       row.tipo,
+        naturaleza: row.naturaleza,
+        nivel:      row.nivel,
+        isActive:   true,
+      });
 
-      const doc = await AccountPlan.findOneAndUpdate(
-        { codigo: row.codigo },
-        {
-          $set: {
-            nombre:     row.nombre,
-            ctaMayor:   row.ctaMayor,
-            tipo:       row.tipo,
-            naturaleza: row.naturaleza,
-            nivel:      row.nivel,
-            isActive:   true,
-          },
-        },
-        { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: true },
-      );
-
-      codigoToObjId.set(row.codigo, doc._id);
-      if (existing) actualizados++;
-      else importados++;
+      codigoToId.set(row.codigo, record.id);
+      if (isNew) importados++;
+      else       actualizados++;
     } catch (err) {
       errores.push(`${row.codigo}: ${err.message}`);
       omitidos++;
@@ -196,14 +189,11 @@ async function parseAccountPlanFile(buffer, opts = {}) {
   for (const row of rawRows) {
     if (!row.parentCodigo) continue;
 
-    const parentObjId = codigoToObjId.get(row.parentCodigo);
-    if (!parentObjId) continue; // padre no importado (cuenta parcial), se omite silenciosamente
+    const parentId = codigoToId.get(row.parentCodigo);
+    if (!parentId) continue;   // padre no importado (catálogo parcial), se omite silenciosamente
 
     try {
-      await AccountPlan.updateOne(
-        { codigo: row.codigo },
-        { $set: { parentId: parentObjId } },
-      );
+      await repo.updateParentId(row.codigo, parentId);
     } catch (err) {
       errores.push(`Parentesco ${row.codigo} → ${row.parentCodigo}: ${err.message}`);
     }

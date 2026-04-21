@@ -15,8 +15,8 @@ const { resolverPeriodo }      = require('../services/periodoFiscal.service');
 const { fetchTodasLasFacturas } = require('../services/erp.service');
 const { transformarTolerante }  = require('../services/erp-transformer.service');
 const { upsertFromERP }         = require('../repositories/cfdi.repository');
-const { asyncHandler }          = require('../middleware/errorHandler');
-const { logger }                = require('../utils/logger');
+const { asyncHandler }          = require('../../shared/middleware/error-handler');
+const { logger }                = require('../../shared/utils/logger');
 const CFDI                      = require('../models/CFDI');
 const { parseCFDI }             = require('../services/cfdiParser');
 

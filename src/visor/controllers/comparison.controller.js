@@ -3,7 +3,7 @@ const Comparison = require('../models/Comparison');
 const ComparisonSession = require('../models/ComparisonSession');
 const CFDI = require('../models/CFDI');
 const { batchCompareCFDIs, formatSessionName } = require('../services/comparisonEngine');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { paginate, skip } = require('../utils/pagination');
 
 /**

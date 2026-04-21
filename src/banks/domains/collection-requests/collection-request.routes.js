@@ -2,7 +2,7 @@
 
 const express = require('express');
 const multer  = require('multer');
-const { authenticate, authorize } = require('../../shared/middleware/auth.real');
+const { authenticate, permit }    = require('../../shared/middleware/auth.real');
 const { asyncHandler }            = require('../../shared/middleware/error-handler');
 const service                     = require('./collection-request.service');
 
@@ -36,7 +36,7 @@ router.get('/', authenticate, asyncHandler(async (req, res) => {
 // POST /api/collection-requests
 router.post('/',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('collections:write'),
   asyncHandler(async (req, res) => {
     res.status(201).json(await service.create(req.body, req.user._id));
   }),
@@ -50,7 +50,7 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
 // PATCH /api/collection-requests/:id/confirmar
 router.patch('/:id/confirmar',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('collections:write'),
   asyncHandler(async (req, res) => {
     res.json(await service.confirm(req.params.id, req.body, req.user._id));
   }),
@@ -59,7 +59,7 @@ router.patch('/:id/confirmar',
 // PATCH /api/collection-requests/:id/rechazar
 router.patch('/:id/rechazar',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('collections:write'),
   asyncHandler(async (req, res) => {
     res.json(await service.reject(req.params.id, req.body.notas));
   }),

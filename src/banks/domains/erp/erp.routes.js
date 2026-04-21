@@ -2,7 +2,7 @@
 
 const express = require('express');
 const axios   = require('axios');
-const { authenticate, authorize } = require('../../shared/middleware/auth.real');
+const { authenticate, permit }    = require('../../shared/middleware/auth.real');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const ErpCuentaPendiente = require('./ErpCuentaPendiente.model');
 const BankMovement       = require('../banks/BankMovement.model');
@@ -92,7 +92,7 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
 // POST /api/erp/match/revert
 // Deshace todas las asociaciones realizadas por el motor automático (userId: 'erp-auto').
 // Restaura erpIds, erpLinks, saldoErp, uuidXML y status a su estado original.
-router.post('/match/revert', authenticate, authorize('admin', 'contabilidad'), asyncHandler(async (_req, res) => {
+router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(async (_req, res) => {
   const result = await BankMovement.updateMany(
     { 'identificadoPor.userId': 'erp-auto' },
     {

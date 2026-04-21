@@ -1,6 +1,6 @@
 const express = require('express');
 const { body } = require('express-validator');
-const { authenticate } = require('../middleware/auth');
+const { authenticate } = require('../../shared/middleware/auth');
 const { list, create, remove } = require('../controllers/periodoFiscal.controller');
 
 const router = express.Router();

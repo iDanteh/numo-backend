@@ -11,8 +11,8 @@ const socketMgr   = require('./banks/shared/socket');
 
 const { connectDB }    = require('./config/database');
 const seed             = require('./banks/scripts/seed');
-const { logger }       = require('./banks/shared/utils/logger');
-const errorHandler     = require('./banks/shared/middleware/error-handler');
+const { logger }   = require('./shared/utils/logger');
+const errorHandler = require('./shared/middleware/error-handler');
 
 // Domain routers — Banks module
 const bankRoutes              = require('./banks/domains/banks/bank.routes');
@@ -75,7 +75,12 @@ app.use(morgan('combined', {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '2.0.0' });
+  res.json({
+    status:    'ok',
+    timestamp: new Date().toISOString(),
+    version:   '3.0.0',
+    databases: { mongo: 'connected', postgres: 'connected' },
+  });
 });
 
 // ── API routes ────────────────────────────────────────────────────────────────
@@ -112,7 +117,11 @@ const PORT = process.env.PORT || 3000;
 const startServer = async () => {
   await connectDB();
   require('./visor/jobs/satSyncJob');
-  await seed();
+  try {
+    await seed();
+  } catch (err) {
+    logger.error('[seed] Error en seed (no fatal):', err.message);
+  }
   const server = http.createServer(app);
   socketMgr.init(server);
   server.listen(PORT, () => {

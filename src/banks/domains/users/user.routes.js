@@ -1,48 +1,95 @@
 'use strict';
 
 const express = require('express');
-const { authenticate, authorize } = require('../../shared/middleware/auth.real');
-const { asyncHandler }            = require('../../shared/middleware/error-handler');
-const service                     = require('./user.service');
+const { authenticate, permit } = require('../../shared/middleware/auth.real');
+const { asyncHandler }         = require('../../shared/middleware/error-handler');
+const userSvc = require('./user.service');
+const roleSvc = require('./role.service');
 
 const router = express.Router();
 
-// GET /api/users/me  — perfil del usuario autenticado (rol viene de DB)
-router.get('/me',
-  authenticate,
+// ── Roles CRUD — /api/users/roles ─────────────────────────────────────────────
+
+// Catálogo de roles con permisos (cualquier usuario autenticado)
+router.get('/roles', authenticate,
+  asyncHandler(async (_req, res) => {
+    res.json(await roleSvc.listRoles());
+  }),
+);
+
+router.post('/roles', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
+    res.status(201).json(await roleSvc.createRole(req.body));
+  }),
+);
+
+router.patch('/roles/:value', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    res.json(await roleSvc.updateRole(req.params.value, req.body));
+  }),
+);
+
+router.delete('/roles/:value', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    await roleSvc.deleteRole(req.params.value);
+    res.json({ message: 'Rol eliminado correctamente.' });
+  }),
+);
+
+// ── Permisos CRUD — /api/users/permissions ────────────────────────────────────
+
+// Catálogo de permisos (cualquier usuario autenticado)
+router.get('/permissions', authenticate,
+  asyncHandler(async (_req, res) => {
+    res.json(await roleSvc.listPermissions());
+  }),
+);
+
+router.post('/permissions', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    res.status(201).json(await roleSvc.createPermission(req.body));
+  }),
+);
+
+// :key contiene ":" (ej: banks:read) — Express lo maneja correctamente
+router.delete('/permissions/:key', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    await roleSvc.deletePermission(req.params.key);
+    res.json({ message: 'Permiso eliminado correctamente.' });
+  }),
+);
+
+// ── Usuario actual ────────────────────────────────────────────────────────────
+
+router.get('/me', authenticate,
+  asyncHandler(async (req, res) => {
+    const role = await roleSvc.getRoleByValue(req.user.role);
     res.json({
-      dbId:    req.user.dbId,
-      nombre:  req.user.nombre,
-      role:    req.user.role,
+      dbId:        req.user.dbId,
+      nombre:      req.user.nombre,
+      role:        req.user.role,
+      permissions: role?.permissions ?? [],
     });
   }),
 );
 
-// GET /api/users
-router.get('/',
-  authenticate,
-  authorize('admin'),
+// ── Gestión de usuarios ───────────────────────────────────────────────────────
+
+router.get('/', authenticate, permit('users:manage'),
   asyncHandler(async (_req, res) => {
-    res.json(await service.listUsers());
+    res.json(await userSvc.listUsers());
   }),
 );
 
-// PATCH /api/users/:id/role
-router.patch('/:id/role',
-  authenticate,
-  authorize('admin'),
+router.patch('/:id/role', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
-    res.json(await service.updateRole(req.params.id, req.body.role));
+    res.json(await userSvc.updateRole(req.params.id, req.body.role));
   }),
 );
 
-// PATCH /api/users/:id/toggle
-router.patch('/:id/toggle',
-  authenticate,
-  authorize('admin'),
+router.patch('/:id/toggle', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
-    res.json(await service.toggleActive(req.params.id));
+    res.json(await userSvc.toggleActive(req.params.id));
   }),
 );
 

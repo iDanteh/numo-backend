@@ -1,7 +1,7 @@
 const Discrepancy = require('../models/Discrepancy');
 const Comparison  = require('../models/Comparison');
 const CFDI        = require('../models/CFDI');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { paginate, skip } = require('../utils/pagination');
 
 const ESTADOS_RESUELTOS = ['resolved', 'ignored', 'escalated'];

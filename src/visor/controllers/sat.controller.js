@@ -6,9 +6,9 @@ const { guardar, tieneCredenciales, obtener, eliminar, limpiarBuffers } = requir
 const { puedeIniciar, registrarInicio, registrarFin, getEstado } = require('../sat/rateLimiter');
 const Comparison = require('../models/Comparison');
 const CFDI = require('../models/CFDI');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { RFC_REGEX } = require('../utils/validators');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 const SatDescargaLog = require('../models/SatDescargaLog');
 
 /** Estado en memoria de jobs de descarga manual (jobId → estado). */

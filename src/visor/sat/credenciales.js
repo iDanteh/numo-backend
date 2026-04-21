@@ -13,7 +13,7 @@
 
 const crypto = require('crypto');
 const SATCredencial = require('../models/SATCredencial');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 const ALGORITHM      = 'aes-256-gcm';
 const IV_LENGTH      = 12;   // bytes

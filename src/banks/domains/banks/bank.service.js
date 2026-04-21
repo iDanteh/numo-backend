@@ -1,14 +1,14 @@
 'use strict';
 
 const BankMovement      = require('./BankMovement.model');
-const BankConfig        = require('./BankConfig.model');
+const bankConfigRepo    = require('./repositories/bank-config.repository');
 const Counter           = require('../../shared/models/Counter');
 const CollectionRequest = require('../collection-requests/CollectionRequest.model');
 const { parseBankFile } = require('./bank.parser');
-const { NotFoundError, BadRequestError, ConflictError } = require('../../shared/errors/AppError');
+const { NotFoundError, BadRequestError, ConflictError, ForbiddenError } = require('../../shared/errors/AppError');
 const { emitToUser, emitToBanco } = require('../../shared/socket');
-const { matchRegla } = require('./bank-rules.service');
-const BankRule            = require('./BankRule.model');
+const { matchRegla }   = require('./bank-rules.service');
+const bankRuleRepo     = require('./repositories/bank-rule.repository');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const BANCOS_VALIDOS = [
@@ -49,78 +49,82 @@ function generarFolio(seq) {
 // ── Service ───────────────────────────────────────────────────────────────────
 
 async function getCards() {
-  const agg = await BankMovement.aggregate([
-    { $match: { isActive: true } },
-    { $sort:  { banco: 1, fecha: 1, _id: 1 } },
-    {
-      $group: {
-        _id:            '$banco',
-        movimientos:    { $sum: 1 },
-        totalDepositos: { $sum: { $ifNull: ['$deposito', 0] } },
-        totalRetiros:   { $sum: { $ifNull: ['$retiro',   0] } },
-        ultimaFecha:    { $max: '$fecha' },
-        ultimaImport:   { $max: '$createdAt' },
-        saldoFinal:     { $last: '$saldo' },
-        no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
-        identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
-        otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
-        saldoPendiente:  {
-          $sum: {
-            $cond: [
-              { $in: ['$status', ['no_identificado', null]] },
-              { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-              0,
-            ],
+  // Agregación MongoDB: estadísticas de movimientos por banco.
+  // BankConfig ya no está en MongoDB → el $lookup se eliminó.
+  // El join con la configuración se hace en la capa de aplicación.
+  const [agg, configMap] = await Promise.all([
+    BankMovement.aggregate([
+      { $match: { isActive: true } },
+      { $sort:  { banco: 1, fecha: 1, _id: 1 } },
+      {
+        $group: {
+          _id:            '$banco',
+          movimientos:    { $sum: 1 },
+          totalDepositos: { $sum: { $ifNull: ['$deposito', 0] } },
+          totalRetiros:   { $sum: { $ifNull: ['$retiro',   0] } },
+          ultimaFecha:    { $max: '$fecha' },
+          ultimaImport:   { $max: '$createdAt' },
+          saldoFinal:     { $last: '$saldo' },
+          no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
+          identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
+          otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
+          saldoPendiente:  {
+            $sum: {
+              $cond: [
+                { $in: ['$status', ['no_identificado', null]] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
           },
-        },
-        saldoIdentificado: {
-          $sum: {
-            $cond: [
-              { $eq: ['$status', 'identificado'] },
-              { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-              0,
-            ],
+          saldoIdentificado: {
+            $sum: {
+              $cond: [
+                { $eq: ['$status', 'identificado'] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
           },
-        },
-        saldoOtros: {
-          $sum: {
-            $cond: [
-              { $eq: ['$status', 'otros'] },
-              { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-              0,
-            ],
+          saldoOtros: {
+            $sum: {
+              $cond: [
+                { $eq: ['$status', 'otros'] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
           },
         },
       },
-    },
-    { $sort: { _id: 1 } },
-    {
-      $lookup: {
-        from: 'bank_configs', localField: '_id', foreignField: 'banco', as: 'config',
-      },
-    },
-    { $unwind: { path: '$config', preserveNullAndEmptyArrays: true } },
+      { $sort: { _id: 1 } },
+    ]),
+    // Join en aplicación: config proviene de PostgreSQL
+    bankConfigRepo.findAllAsMap(),
   ]);
 
-  return agg.map((b) => ({
-    banco:          b._id,
-    movimientos:    b.movimientos,
-    totalDepositos: b.totalDepositos,
-    totalRetiros:   b.totalRetiros,
-    saldoFinal:     b.saldoFinal ?? null,
-    ultimaFecha:    b.ultimaFecha,
-    ultimaImport:   b.ultimaImport,
-    cuentaContable: b.config?.cuentaContable ?? null,
-    numeroCuenta:   b.config?.numeroCuenta   ?? null,
-    saldoPendiente:    b.saldoPendiente    ?? 0,
-    saldoIdentificado: b.saldoIdentificado ?? 0,
-    saldoOtros:        b.saldoOtros        ?? 0,
-    porStatus: {
-      no_identificado: b.no_identificado,
-      identificado:    b.identificado,
-      otros:           b.otros,
-    },
-  }));
+  return agg.map((b) => {
+    const cfg = configMap.get(b._id);
+    return {
+      banco:          b._id,
+      movimientos:    b.movimientos,
+      totalDepositos: b.totalDepositos,
+      totalRetiros:   b.totalRetiros,
+      saldoFinal:     b.saldoFinal ?? null,
+      ultimaFecha:    b.ultimaFecha,
+      ultimaImport:   b.ultimaImport,
+      cuentaContable: cfg?.cuentaContable ?? null,
+      numeroCuenta:   cfg?.numeroCuenta   ?? null,
+      saldoPendiente:    b.saldoPendiente    ?? 0,
+      saldoIdentificado: b.saldoIdentificado ?? 0,
+      saldoOtros:        b.saldoOtros        ?? 0,
+      porStatus: {
+        no_identificado: b.no_identificado,
+        identificado:    b.identificado,
+        otros:           b.otros,
+      },
+    };
+  });
 }
 
 async function listMovements(filters) {
@@ -313,12 +317,7 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
 
   // ── 2. Reservar secuenciales solo para los movimientos nuevos ─────────────
   if (nuevos.length > 0) {
-    const counter = await Counter.findOneAndUpdate(
-      { _id: 'bankMovement' },
-      { $inc: { seq: nuevos.length } },
-      { upsert: true, new: true },
-    );
-    const startSeq = counter.seq - nuevos.length + 1;
+    const startSeq = await Counter.nextBatchSeq('bankMovement', nuevos.length);
     nuevos.forEach((m, i) => {
       m.folio = generarFolio(startSeq + i);
     });
@@ -366,9 +365,7 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
     let sinReglasAviso = false;
 
     if (insertados > 0 && bancoValidado) {
-      const rules = await BankRule.find({ banco: bancoValidado })
-        .sort({ orden: 1, createdAt: 1 })
-        .lean();
+      const rules = await bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' });
 
       if (rules.length === 0) {
         sinReglasAviso = true;
@@ -423,13 +420,8 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
   }
 
   // ── 3. Crear folio (secuencial) ────────────────────────────────────
-  const counter = await Counter.findOneAndUpdate(
-    { _id: 'bankMovement' },
-    { $inc: { seq: 1 } },
-    { upsert: true, new: true }
-  );
-
-  const folio = generarFolio(counter.seq);
+  const seq   = await Counter.nextSeq('bankMovement');
+  const folio = generarFolio(seq.seq);
 
   // ── 4. Construir documento ─────────────────────────────────────────
   const nuevo = new BankMovement({
@@ -457,9 +449,7 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
   let categorizado = false;
 
   if (bancoValidado) {
-    const rules = await BankRule.find({ banco: bancoValidado })
-      .sort({ orden: 1, createdAt: 1 })
-      .lean();
+    const rules = await bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' });
 
     for (const rule of rules) {
       if (matchRegla(nuevo, rule)) {
@@ -538,6 +528,17 @@ async function updateStatus(id, status, user) {
   // Para marcar como identificado siempre se requiere al menos un ID ERP asociado
   if (status === 'identificado' && (!mov.erpIds || mov.erpIds.length === 0)) {
     throw new BadRequestError('Para identificar un movimiento debe tener al menos un ID ERP asociado');
+  }
+  // Verificar reglas de bloqueo de identificación (los admins pueden forzar)
+  if (status === 'identificado' && !isAdmin) {
+    const blockRules = await bankRuleRepo.findBlockingRules(mov.banco);
+    for (const rule of blockRules) {
+      if (matchRegla(mov, rule)) {
+        const msg = rule.mensajeBloqueo
+          || `La regla "${rule.nombre}" impide identificar este movimiento`;
+        throw new ForbiddenError(msg);
+      }
+    }
   }
   mov.status = status;
   if (status === 'identificado') {
@@ -644,16 +645,16 @@ async function setErpIds(id, erpLinks, user) {
 }
 
 async function getConfig(banco) {
-  const cfg = await BankConfig.findOne({ banco }).lean();
+  const cfg = await bankConfigRepo.findByBanco(banco);
   return cfg ?? { banco, cuentaContable: null, numeroCuenta: null };
 }
 
 async function saveConfig(banco, data) {
   if (!BANCOS_VALIDOS.includes(banco)) throw new BadRequestError('Banco inválido');
-  const update = {};
-  if (data.cuentaContable !== undefined) update.cuentaContable = data.cuentaContable || null;
-  if (data.numeroCuenta   !== undefined) update.numeroCuenta   = data.numeroCuenta   || null;
-  return BankConfig.findOneAndUpdate({ banco }, { $set: update }, { upsert: true, new: true });
+  const fields = {};
+  if (data.cuentaContable !== undefined) fields.cuentaContable = data.cuentaContable || null;
+  if (data.numeroCuenta   !== undefined) fields.numeroCuenta   = data.numeroCuenta   || null;
+  return bankConfigRepo.upsert(banco, fields);
 }
 
 async function listCategories(banco) {

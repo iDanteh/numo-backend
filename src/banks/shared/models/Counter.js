@@ -25,4 +25,16 @@ counterSchema.statics.nextSeq = async function (key) {
   );
 };
 
+// Reserva `count` secuenciales en una sola operación atómica.
+// Devuelve el primer número del bloque reservado.
+// Ej: si seq estaba en 10 y count=5 → reserva 11-15, retorna 11.
+counterSchema.statics.nextBatchSeq = async function (key, count) {
+  const doc = await this.findOneAndUpdate(
+    { _id: key },
+    { $inc: { seq: count } },
+    { upsert: true, new: true },
+  );
+  return doc.seq - count + 1;
+};
+
 module.exports = mongoose.model('Counter', counterSchema);

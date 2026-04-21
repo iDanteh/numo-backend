@@ -52,9 +52,14 @@ const config = Object.freeze({
   /** Puerto en que escucha Express */
   port: parseInt(process.env.PORT, 10) || 3000,
 
-  /** Base de datos MongoDB */
+  /** Base de datos MongoDB — documentos flexibles (movimientos, CFDIs, SAT…) */
   db: Object.freeze({
     uri: process.env.MONGODB_URI || 'mongodb://localhost:27017/cfdi_comparator',
+  }),
+
+  /** Base de datos PostgreSQL — datos relacionales y estructurados */
+  postgres: Object.freeze({
+    uri: process.env.POSTGRES_URI || 'postgres://postgres:postgres@localhost:5432/numo',
   }),
 
   /** CORS */

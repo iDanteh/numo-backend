@@ -2,7 +2,7 @@ const jwt    = require('jsonwebtoken');
 const config = require('../../config/env');
 const { validationResult } = require('express-validator');
 const User = require('../models/User');
-const { asyncHandler } = require('../middleware/errorHandler');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
 
 /**
  * POST /api/auth/login

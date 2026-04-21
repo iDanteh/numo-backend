@@ -80,7 +80,7 @@ const bankMovementSchema = new mongoose.Schema({
   },
 
   // Auditoría
-  uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  uploadedBy: { type: String, default: null },
   isActive:   { type: Boolean, default: true, index: true },
 }, {
   timestamps: true,

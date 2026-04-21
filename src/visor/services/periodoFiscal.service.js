@@ -1,4 +1,13 @@
-const PeriodoFiscal = require('../models/PeriodoFiscal');
+'use strict';
+
+/**
+ * visor/services/periodoFiscal.service.js
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Utilidades de período fiscal consumidas por el satSyncJob y otros servicios.
+ * Ahora consulta PostgreSQL via periodo-fiscal.repository.
+ */
+
+const periodoRepo = require('../repositories/periodo-fiscal.repository');
 
 /**
  * Verifica que el PeriodoFiscal (ejercicio + periodo mensual) exista en BD.
@@ -6,7 +15,7 @@ const PeriodoFiscal = require('../models/PeriodoFiscal');
  *
  * @param {number} ejercicio
  * @param {number} periodo   — mes (1–12), no acepta null (año completo)
- * @returns {Promise<object>} Documento PeriodoFiscal
+ * @returns {Promise<PeriodoFiscal>}
  */
 const resolverPeriodo = async (ejercicio, periodo) => {
   if (!Number.isInteger(ejercicio) || !Number.isInteger(periodo)) {
@@ -15,7 +24,7 @@ const resolverPeriodo = async (ejercicio, periodo) => {
     throw err;
   }
 
-  const doc = await PeriodoFiscal.findOne({ ejercicio, periodo }).lean();
+  const doc = await periodoRepo.findByEjercicioPeriodo(ejercicio, periodo);
   if (!doc) {
     const err = new Error(
       `El periodo ${periodo}/${ejercicio} no existe. Créalo primero en la sección Ejercicios.`,

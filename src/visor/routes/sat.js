@@ -3,7 +3,7 @@
 const express = require('express');
 const multer  = require('multer');
 const { body } = require('express-validator');
-const { authenticate, authorize } = require('../middleware/auth');
+const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
@@ -13,14 +13,13 @@ const {
 
 const router = express.Router();
 
-// ── Multer: credenciales e.firma (memoria — 2 MB, solo .cer/.key) ────────────
+// Multer: credenciales e.firma (memoria — 2 MB, solo .cer/.key)
 const credUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 2 * 1024 * 1024 },
+  limits:  { fileSize: 2 * 1024 * 1024 },
 });
 
-// ── Rutas existentes (sin cambios) ────────────────────────────────────────────
-
+// ── Verificación ──────────────────────────────────────────────────────────────
 router.post('/verify',
   authenticate,
   [
@@ -32,12 +31,13 @@ router.post('/verify',
   verify,
 );
 
-router.post('/verify-batch', authenticate, authorize('admin', 'contador'), verifyBatch);
-router.get('/status/:uuid', authenticate, getStatus);
+router.post('/verify-batch', authenticate, permit('visor:sat'), verifyBatch);
+router.get('/status/:uuid',  authenticate, getStatus);
 
+// ── Credenciales e.firma ──────────────────────────────────────────────────────
 router.post('/credenciales',
   authenticate,
-  authorize('admin', 'contador'),
+  permit('visor:sat'),
   credUpload.fields([{ name: 'cer', maxCount: 1 }, { name: 'key', maxCount: 1 }]),
   [
     body('rfc').notEmpty().withMessage('RFC requerido'),
@@ -48,23 +48,26 @@ router.post('/credenciales',
 
 router.get('/credenciales/estado/:rfc', authenticate, getCredentialStatus);
 
+// ── Descarga masiva ───────────────────────────────────────────────────────────
 router.post('/descarga-manual',
   authenticate,
-  authorize('admin', 'contador'),
+  permit('visor:sat'),
   [
     body('rfc').notEmpty().withMessage('RFC requerido'),
     body('fechaInicio').isISO8601().withMessage('fechaInicio debe ser fecha válida'),
     body('fechaFin').isISO8601().withMessage('fechaFin debe ser fecha válida'),
-    body('tipoComprobante').optional().isIn(['Emitidos', 'Recibidos', 'Ingresos', 'Egresos', 'Traslados', 'Nomina', 'Pagos']).withMessage('tipoComprobante debe ser uno de: Emitidos, Recibidos, Ingresos, Egresos, Traslados, Nomina, Pagos'),
-    body('ejercicio').isInt({ min: 2000, max: 2100 }).withMessage('ejercicio debe ser un año válido (ej. 2024)'),
-    body('periodo').isInt({ min: 1, max: 12 }).withMessage('periodo debe ser un mes válido (1–12)'),
+    body('tipoComprobante').optional()
+      .isIn(['Emitidos', 'Recibidos', 'Ingresos', 'Egresos', 'Traslados', 'Nomina', 'Pagos'])
+      .withMessage('tipoComprobante inválido'),
+    body('ejercicio').isInt({ min: 2000, max: 2100 }).withMessage('ejercicio inválido'),
+    body('periodo').isInt({ min: 1, max: 12 }).withMessage('periodo debe ser 1-12'),
   ],
   startDownload,
 );
 
 router.get('/descarga-manual/status/:jobId', authenticate, getDownloadStatus);
-router.get('/limites/:rfc', authenticate, getLimitesEstado);
-router.get('/historial', authenticate, getHistory);
-router.get('/historial/:rfc', authenticate, getHistory);
+router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
+router.get('/historial',                     authenticate, getHistory);
+router.get('/historial/:rfc',                authenticate, getHistory);
 
 module.exports = router;

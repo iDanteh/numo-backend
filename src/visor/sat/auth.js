@@ -14,7 +14,7 @@
 
 const forge = require('node-forge');
 const axios = require('axios');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 const AUTENTICACION_URL = (
   process.env.SAT_DESCARGA_MASIVA_AUTENTICACION ||

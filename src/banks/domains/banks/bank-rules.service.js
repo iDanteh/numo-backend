@@ -1,7 +1,7 @@
 'use strict';
 
-const BankRule     = require('./BankRule.model');
-const BankMovement = require('./BankMovement.model');
+const bankRuleRepo  = require('./repositories/bank-rule.repository');
+const BankMovement  = require('./BankMovement.model');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 
 // ── Catálogos ─────────────────────────────────────────────────────────────────
@@ -15,6 +15,7 @@ const OPERADORES_VALIDOS = [
   'mayor_que', 'menor_que', 'mayor_igual', 'menor_igual',
 ];
 const OPERADORES_NUMERICOS = ['mayor_que', 'menor_que', 'mayor_igual', 'menor_igual'];
+const ACCIONES_VALIDAS     = ['categorizar', 'bloquear_identificacion'];
 
 // ── Validación ────────────────────────────────────────────────────────────────
 
@@ -42,6 +43,15 @@ function validarRegla(data) {
   if (data.logica !== undefined && !['Y', 'O'].includes(data.logica)) {
     throw new BadRequestError('Lógica debe ser "Y" o "O"');
   }
+  if (data.accion !== undefined && !ACCIONES_VALIDAS.includes(data.accion)) {
+    throw new BadRequestError(`Acción inválida. Debe ser: ${ACCIONES_VALIDAS.join(', ')}`);
+  }
+  // mensajeBloqueo solo aplica cuando la acción es bloquear
+  if (data.accion === 'bloquear_identificacion' && data.mensajeBloqueo) {
+    if (String(data.mensajeBloqueo).trim().length > 500) {
+      throw new BadRequestError('mensajeBloqueo no puede superar 500 caracteres');
+    }
+  }
 }
 
 // ── Evaluación de condiciones ─────────────────────────────────────────────────
@@ -65,7 +75,7 @@ function matchCondicion(mov, cond) {
   }
 
   const str = String(fieldVal || '').toLowerCase();
-  const val = String(valor || '').toLowerCase().trim();
+  const val = String(valor    || '').toLowerCase().trim();
   switch (operador) {
     case 'contiene':    return str.includes(val);
     case 'no_contiene': return !str.includes(val);
@@ -76,9 +86,14 @@ function matchCondicion(mov, cond) {
   }
 }
 
+/**
+ * Evalúa si un movimiento cumple todas (Y) o alguna (O) condición de la regla.
+ * Funciona con instancias Sequelize y documentos Mongoose (acceso por propiedad).
+ */
 function matchRegla(mov, regla) {
-  const { condiciones, logica } = regla;
-  if (!condiciones || condiciones.length === 0) return false;
+  const condiciones = regla.condiciones ?? [];
+  const logica      = regla.logica      ?? 'Y';
+  if (condiciones.length === 0) return false;
   if (logica === 'O') return condiciones.some(c => matchCondicion(mov, c));
   return condiciones.every(c => matchCondicion(mov, c));
 }
@@ -86,58 +101,43 @@ function matchRegla(mov, regla) {
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
 async function listRules(banco) {
-  return BankRule.find({ banco }).sort({ orden: 1, createdAt: 1 }).lean();
+  const rules = await bankRuleRepo.listByBanco(banco);
+  return rules.map(r => r.toJSON());
 }
 
 async function createRule(banco, data) {
   validarRegla(data);
-  const rule = await BankRule.create({
-    banco,
-    nombre:      String(data.nombre).trim(),
-    condiciones: data.condiciones.map(c => ({
-      campo:    c.campo,
-      operador: c.operador,
-      valor:    String(c.valor).trim(),
-    })),
-    logica: data.logica || 'Y',
-    orden:  Number(data.orden) || 0,
-  });
-  return rule.toObject();
+  const rule = await bankRuleRepo.create(banco, data);
+  return rule.toJSON();
 }
 
 async function updateRule(id, data) {
   validarRegla(data);
-  const rule = await BankRule.findById(id);
+  const rule = await bankRuleRepo.update(id, data);
   if (!rule) throw new NotFoundError('Regla');
-  rule.nombre      = String(data.nombre).trim();
-  rule.condiciones = data.condiciones.map(c => ({
-    campo: c.campo, operador: c.operador, valor: String(c.valor).trim(),
-  }));
-  rule.logica = data.logica ?? rule.logica;
-  if (data.orden !== undefined) rule.orden = Number(data.orden);
-  await rule.save();
-  return rule.toObject();
+  return rule.toJSON();
 }
 
 async function deleteRule(id) {
-  const rule = await BankRule.findByIdAndDelete(id);
-  if (!rule) throw new NotFoundError('Regla');
-  return { deleted: true };
+  const result = await bankRuleRepo.remove(id);
+  if (!result) throw new NotFoundError('Regla');
+  return result;
 }
 
 async function reorderRules(ids) {
   if (!Array.isArray(ids)) throw new BadRequestError('ids debe ser un arreglo');
-  const ops = ids.map((id, idx) => ({
-    updateOne: { filter: { _id: id }, update: { $set: { orden: idx } } },
-  }));
-  await BankRule.bulkWrite(ops, { ordered: false });
-  return { ok: true };
+  return bankRuleRepo.reorder(ids);
 }
 
 // ── Aplicar reglas a movimientos ──────────────────────────────────────────────
 
+/**
+ * Recorre todos los movimientos de un banco y aplica las reglas con
+ * accion='categorizar'. Las reglas de bloqueo no participan en este proceso.
+ */
 async function applyRules(banco, soloSinCategoria = false) {
-  const rules = await BankRule.find({ banco }).sort({ orden: 1, createdAt: 1 }).lean();
+  // Solo reglas de categorización — el bloqueo aplica al momento de identificar
+  const rules = await bankRuleRepo.listByBanco(banco, { accion: 'categorizar' });
 
   const matchFilter = { banco, isActive: true };
   if (soloSinCategoria) {
@@ -145,7 +145,7 @@ async function applyRules(banco, soloSinCategoria = false) {
   }
 
   const BATCH = 500;
-  let skip       = 0;
+  let skip        = 0;
   let actualizados = 0;
   let sinCambio    = 0;
 
@@ -185,5 +185,5 @@ async function applyRules(banco, soloSinCategoria = false) {
 }
 
 module.exports = {
-  listRules, createRule, updateRule, deleteRule, reorderRules, applyRules, matchRegla
+  listRules, createRule, updateRule, deleteRule, reorderRules, applyRules, matchRegla,
 };

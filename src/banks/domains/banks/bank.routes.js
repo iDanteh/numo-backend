@@ -2,7 +2,7 @@
 
 const express = require('express');
 const multer  = require('multer');
-const { authenticate, authorize }  = require('../../shared/middleware/auth.real');
+const { authenticate, permit }     = require('../../shared/middleware/auth.real');
 const { asyncHandler }             = require('../../shared/middleware/error-handler');
 const service                      = require('./bank.service');
 const {
@@ -74,11 +74,11 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
 // POST /api/banks/upload
 router.post('/upload',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:import'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
-    const result = await service.importFile(req.file.buffer, req.body.banco, req.user.dbId, { auth0Sub: req.user._id });
+    const result = await service.importFile(req.file.buffer, req.body.banco, req.user._id, { auth0Sub: req.user._id });
     res.status(207).json(result);
   }),
 );
@@ -87,7 +87,7 @@ router.post('/upload',
 router.post(
   '/import-individual',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:import'),
   asyncHandler(async (req, res) => {
     const { movimiento, banco } = req.body;
 
@@ -98,7 +98,7 @@ router.post(
     const result = await service.importIndividual(
       movimiento,
       banco,
-      req.user.dbId,
+      req.user._id,
       { auth0Sub: req.user._id }
     );
 
@@ -109,7 +109,7 @@ router.post(
 // PATCH /api/banks/movements/:id/status
 router.patch('/movements/:id/status',
   authenticate,
-  authorize('admin', 'contabilidad', 'cobranza'),
+  permit('banks:update'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateStatus(req.params.id, req.body.status, req.user));
   }),
@@ -118,7 +118,7 @@ router.patch('/movements/:id/status',
 // PATCH /api/banks/movements/:id/erp-ids  (remove individual)
 router.patch('/movements/:id/erp-ids',
   authenticate,
-  authorize('admin', 'contabilidad', 'cobranza'),
+  permit('banks:update'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateErpIds(req.params.id, req.body.action, req.body.erpId, req.user));
   }),
@@ -127,7 +127,7 @@ router.patch('/movements/:id/erp-ids',
 // PUT /api/banks/movements/:id/erp-ids  (replace full array)
 router.put('/movements/:id/erp-ids',
   authenticate,
-  authorize('admin', 'contabilidad', 'cobranza'),
+  permit('banks:update'),
   asyncHandler(async (req, res) => {
     res.json(await service.setErpIds(req.params.id, req.body.erpLinks, req.user));
   }),
@@ -143,7 +143,7 @@ router.get('/rules', authenticate, asyncHandler(async (req, res) => {
 
 // POST /api/banks/rules
 router.post('/rules',
-  authenticate, authorize('admin', 'contabilidad'),
+  authenticate, permit('banks:rules'),
   asyncHandler(async (req, res) => {
     const { banco, ...data } = req.body;
     if (!banco) return res.status(400).json({ error: 'banco requerido' });
@@ -153,7 +153,7 @@ router.post('/rules',
 
 // PUT /api/banks/rules/reorder
 router.put('/rules/reorder',
-  authenticate, authorize('admin', 'contabilidad'),
+  authenticate, permit('banks:rules'),
   asyncHandler(async (req, res) => {
     res.json(await rulesService.reorderRules(req.body.ids));
   }),
@@ -161,7 +161,7 @@ router.put('/rules/reorder',
 
 // PUT /api/banks/rules/:id
 router.put('/rules/:id',
-  authenticate, authorize('admin', 'contabilidad'),
+  authenticate, permit('banks:rules'),
   asyncHandler(async (req, res) => {
     res.json(await rulesService.updateRule(req.params.id, req.body));
   }),
@@ -169,7 +169,7 @@ router.put('/rules/:id',
 
 // DELETE /api/banks/rules/:id
 router.delete('/rules/:id',
-  authenticate, authorize('admin', 'contabilidad'),
+  authenticate, permit('banks:rules'),
   asyncHandler(async (req, res) => {
     res.json(await rulesService.deleteRule(req.params.id));
   }),
@@ -177,7 +177,7 @@ router.delete('/rules/:id',
 
 // POST /api/banks/rules/apply
 router.post('/rules/apply',
-  authenticate, authorize('admin', 'contabilidad'),
+  authenticate, permit('banks:rules'),
   asyncHandler(async (req, res) => {
     const { banco, soloSinCategoria = false } = req.body;
     if (!banco) return res.status(400).json({ error: 'banco requerido' });
@@ -188,7 +188,7 @@ router.post('/rules/apply',
 // POST /api/banks/auxiliar/import
 router.post('/auxiliar/import',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:import'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
@@ -200,7 +200,7 @@ router.post('/auxiliar/import',
 // POST /api/banks/auxiliar/aplicar  — cruza catálogo con movimientos
 router.post('/auxiliar/aplicar',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:update'),
   asyncHandler(async (_req, res) => {
     const result = await applyAuxiliaryMatching();
     res.json(result);
@@ -233,7 +233,7 @@ router.get('/config/:banco', authenticate, asyncHandler(async (req, res) => {
 // PATCH /api/banks/config/:banco
 router.patch('/config/:banco',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:config'),
   asyncHandler(async (req, res) => {
     res.json(await service.saveConfig(req.params.banco, req.body));
   }),
@@ -242,7 +242,7 @@ router.patch('/config/:banco',
 // POST /api/banks/autorizaciones/match  — match por número de autorización (vía Excel)
 router.post('/autorizaciones/match',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:import'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
@@ -255,7 +255,7 @@ router.post('/autorizaciones/match',
 // Body opcional: { banco: 'BBVA' }  — si se omite, busca en todos los bancos.
 router.post('/autorizaciones/match-erp',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('banks:import'),
   asyncHandler(async (req, res) => {
     const result = await matchAutorizacionesDesdeErp({ banco: req.body.banco });
     res.json(result);

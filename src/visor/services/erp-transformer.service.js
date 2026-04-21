@@ -12,7 +12,7 @@
  * que necesita modificarse.
  */
 
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 // ─── Mapeos ──────────────────────────────────────────────────────────────────
 

@@ -1,8 +1,10 @@
-const express = require('express');
-const multer = require('multer');
-const { body } = require('express-validator');
-const rateLimit = require('express-rate-limit');
-const { authenticate, authorize } = require('../middleware/auth');
+'use strict';
+
+const express    = require('express');
+const multer     = require('multer');
+const { body }   = require('express-validator');
+const rateLimit  = require('express-rate-limit');
+const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   list, getById, getXml,
   upload, importExcel, importFromErpApi,
@@ -13,23 +15,21 @@ const router = express.Router();
 
 const listLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 150,
+  max:      150,
   standardHeaders: true,
-  legacyHeaders: false,
-  handler: (req, res) => {
-    res.status(429).json({
-      success: false,
-      error: 'Demasiadas peticiones, espera un momento.',
-      code: 'RATE_LIMIT_EXCEEDED',
-      retryAfter: 60,
-    });
-  },
+  legacyHeaders:   false,
+  handler: (_req, res) => res.status(429).json({
+    success: false,
+    error:   'Demasiadas peticiones, espera un momento.',
+    code:    'RATE_LIMIT_EXCEEDED',
+    retryAfter: 60,
+  }),
 });
 
-const xmlUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const xmlUpload   = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const excelUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 },
+  storage:    multer.memoryStorage(),
+  limits:     { fileSize: 20 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => cb(null, /\.(xlsx|xls)$/i.test(file.originalname)),
 });
 
@@ -48,18 +48,20 @@ const handleXmlUpload = (req, res, next) => {
   });
 };
 
-router.get('/', authenticate, listLimiter, list);
-router.get('/export', authenticate, exportExcel);
-router.get('/:id/xml', authenticate, getXml);
-router.get('/:id', authenticate, getById);
+// ── Lectura ───────────────────────────────────────────────────────────────────
+router.get('/',          authenticate, listLimiter, list);
+router.get('/export',    authenticate, exportExcel);
+router.get('/:id/xml',   authenticate, getXml);
+router.get('/:id',       authenticate, getById);
 
-router.post('/upload', authenticate, authorize('admin', 'contador'), handleXmlUpload, upload);
-router.post('/import-excel', authenticate, authorize('admin', 'contador'), excelUpload.single('excelFile'), importExcel);
-router.post('/import-erp-api', authenticate, authorize('admin', 'contador'), importFromErpApi);
-router.post('/:id/compare', authenticate, authorize('admin', 'contador', 'auditor'), compare);
+// ── Escritura ─────────────────────────────────────────────────────────────────
+router.post('/upload',         authenticate, permit('visor:write'), handleXmlUpload, upload);
+router.post('/import-excel',   authenticate, permit('visor:write'), excelUpload.single('excelFile'), importExcel);
+router.post('/import-erp-api', authenticate, permit('visor:write'), importFromErpApi);
+router.post('/:id/compare',    authenticate, permit('visor:write'), compare);
 router.post('/',
   authenticate,
-  authorize('admin', 'contador'),
+  permit('visor:write'),
   [
     body('uuid').isUUID().withMessage('UUID inválido'),
     body('emisor.rfc').notEmpty(),
@@ -71,6 +73,7 @@ router.post('/',
   create,
 );
 
-router.delete('/:id', authenticate, authorize('admin'), remove);
+// ── Admin ─────────────────────────────────────────────────────────────────────
+router.delete('/:id', authenticate, permit('users:manage'), remove);
 
 module.exports = router;

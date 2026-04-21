@@ -13,7 +13,7 @@
 
 const axios  = require('axios');
 const config = require('../../config/env');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 const LIMITE_PG      = 100;    // registros por página — máximo que permite el ERP
 const TIMEOUT        = 30_000; // 30 segundos por petición

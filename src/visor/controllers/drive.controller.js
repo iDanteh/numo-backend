@@ -4,8 +4,8 @@ const AdmZip = require('adm-zip');
 const CFDI = require('../models/CFDI');
 const { parseCFDI } = require('../services/cfdiParser');
 const { verifyCFDIWithSAT } = require('../services/satVerification');
-const { asyncHandler } = require('../middleware/errorHandler');
-const { logger } = require('../utils/logger');
+const { asyncHandler } = require('../../shared/middleware/error-handler');
+const { logger } = require('../../shared/utils/logger');
 
 const SAT_STATUS_VALIDOS = new Set(['Vigente', 'Cancelado', 'No Encontrado']);
 

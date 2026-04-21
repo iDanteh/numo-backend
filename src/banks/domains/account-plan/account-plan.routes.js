@@ -2,7 +2,7 @@
 
 const express = require('express');
 const multer  = require('multer');
-const { authenticate, authorize } = require('../../shared/middleware/auth.real');
+const { authenticate, permit }    = require('../../shared/middleware/auth.real');
 const { asyncHandler }            = require('../../shared/middleware/error-handler');
 const service                     = require('./account-plan.service');
 
@@ -40,7 +40,7 @@ router.get('/:id', authenticate, asyncHandler(async (req, res) => {
 // POST /api/account-plan
 router.post('/',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('account-plan:write'),
   asyncHandler(async (req, res) => {
     res.status(201).json(await service.create(req.body));
   }),
@@ -49,7 +49,7 @@ router.post('/',
 // PATCH /api/account-plan/:id
 router.patch('/:id',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('account-plan:write'),
   asyncHandler(async (req, res) => {
     res.json(await service.update(req.params.id, req.body));
   }),
@@ -58,7 +58,7 @@ router.patch('/:id',
 // DELETE /api/account-plan/:id
 router.delete('/:id',
   authenticate,
-  authorize('admin'),
+  permit('users:manage'),
   asyncHandler(async (req, res) => {
     res.json(await service.softDelete(req.params.id));
   }),
@@ -67,7 +67,7 @@ router.delete('/:id',
 // POST /api/account-plan/import
 router.post('/import',
   authenticate,
-  authorize('admin', 'contabilidad'),
+  permit('account-plan:write'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });

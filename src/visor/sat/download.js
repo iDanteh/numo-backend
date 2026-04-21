@@ -16,7 +16,7 @@
 const axios = require('axios');
 const AdmZip = require('adm-zip');
 const { autenticar, crearFirmaSolicitud } = require('./auth');
-const { logger } = require('../utils/logger');
+const { logger } = require('../../shared/utils/logger');
 
 const SOLICITUD_URL = (process.env.SAT_DESCARGA_MASIVA_SOLICITUD  || 'https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/SolicitaDescargaService.svc').replace(/\?wsdl$/i, '');
 const VERIFICA_URL  = (process.env.SAT_DESCARGA_MASIVA_VERIFICA   || 'https://cfdidescargamasivasolicitud.clouda.sat.gob.mx/VerificaSolicitudDescargaService.svc').replace(/\?wsdl$/i, '');

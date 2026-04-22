@@ -1,10 +1,10 @@
 'use strict';
-
+const { authenticate, permit } = require('../../shared/middleware/auth');
 const express    = require('express');
 const multer     = require('multer');
 const { body }   = require('express-validator');
 const rateLimit  = require('express-rate-limit');
-const { authenticate, permit } = require('../../shared/middleware/auth');
+//const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   list, getById, getXml,
   upload, importExcel, importFromErpApi,
@@ -53,12 +53,12 @@ router.get('/', authenticate, listLimiter, list);
 router.get('/export', authenticate, exportExcel);
 
 // ── Reclasificación Global — deben ir ANTES de /:id para evitar conflicto ────
-router.get('/reclasificacion-global/plan',    authenticate, authorize('admin', 'contador'), planReclasificacionGlobal);
-router.post('/reclasificacion-global/aplicar', authenticate, authorize('admin', 'contador'), aplicarReclasificacionGlobal);
-
+router.get('/reclasificacion-global/plan',    authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
+router.get('/reclasificacion-global/plan', authenticate,permit('admin', 'contador'),planReclasificacionGlobal
+);
 router.get('/:id/xml', authenticate, getXml);
 router.get('/:id', authenticate, getById);
-router.patch('/:id/migrar-periodo', authenticate, authorize('admin', 'contador'), migrarPeriodo);
+router.patch('/:id/migrar-periodo', authenticate, permit('admin', 'contador'), migrarPeriodo);
 // ── Lectura ───────────────────────────────────────────────────────────────────
 router.get('/',          authenticate, listLimiter, list);
 router.get('/export',    authenticate, exportExcel);

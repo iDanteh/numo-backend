@@ -36,6 +36,12 @@ router.get('/categories', authenticate, asyncHandler(async (req, res) => {
   res.json(await service.listCategories(req.query.banco));
 }));
 
+// GET /api/banks/identificadores?banco=BBVA
+router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
+  if (!req.query.banco) return res.status(400).json({ error: 'banco requerido' });
+  res.json(await service.listIdentificadores(req.query.banco));
+}));
+
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
   const query = { ...req.query };

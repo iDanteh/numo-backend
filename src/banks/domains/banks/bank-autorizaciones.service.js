@@ -198,8 +198,10 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
             erpLinks: newLinks,
             saldoErp,
             status:   newStatus,
-            // 'erp-auto' permite que POST /erp/match/revert los encuentre y revierta
-            identificadoPor: { userId: 'erp-auto', nombre: 'Motor ERP', fechaId: new Date() },
+            // 'erp-auto' permite que POST /erp/match/revert los encuentre y revierta.
+            // Array con erpId explícito para que updateErpIds pueda limpiar la entrada
+            // al desvincular la CxC.
+            identificadoPor: [{ userId: 'erp-auto', nombre: 'Motor ERP', fechaId: new Date(), erpId: cxc.erpId }],
           },
         },
       },
@@ -358,7 +360,7 @@ async function ejecutarMatch(rows) {
     const ops = [...idsAIdentificar].map(id => ({
       updateOne: {
         filter: { _id: id },
-        update: { $set: { status: 'identificado', identificadoPor: { userId: 'aut-match', nombre: 'Motor ERP', fechaId: ahora } } },
+        update: { $set: { status: 'identificado', identificadoPor: [{ userId: 'aut-match', nombre: 'Motor ERP', fechaId: ahora }] } },
       },
     }));
     const result = await BankMovement.bulkWrite(ops, { ordered: false });

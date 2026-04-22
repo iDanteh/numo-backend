@@ -157,10 +157,9 @@ async function listMovements(filters) {
   }
 
   if (identificadoPor) {
-    const esc = identificadoPor.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re  = new RegExp(esc, 'i');
+    const ids = identificadoPor.split(',').map(s => s.trim()).filter(Boolean);
     filter.$and = filter.$and ?? [];
-    filter.$and.push({ $or: [{ 'identificadoPor.nombre': re }, { 'identificadoPor.userId': re }] });
+    filter.$and.push({ 'identificadoPor.userId': { $in: ids } });
   }
 
   if (fechaInicio || fechaFin) {
@@ -517,11 +516,12 @@ async function updateStatus(id, status, user) {
     throw new ConflictError('Movimiento bloqueado: el saldo ERP cuadra con el monto bancario');
   }
   // Bloquear si el movimiento fue identificado por otro usuario (admin puede forzar)
+  const idPorEntries = mov.identificadoPor ?? [];
   if (
     !isAdmin &&
     mov.status === 'identificado' &&
-    mov.identificadoPor?.userId &&
-    mov.identificadoPor.userId !== user?._id
+    idPorEntries.length > 0 &&
+    !idPorEntries.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
   }
@@ -541,12 +541,7 @@ async function updateStatus(id, status, user) {
     }
   }
   mov.status = status;
-  if (status === 'identificado') {
-    const displayName = user?.nombre || user?.email || null;
-    mov.identificadoPor = { userId: user?._id ?? null, nombre: displayName, fechaId: new Date() };
-  } else {
-    mov.identificadoPor = { userId: null, nombre: null, fechaId: null };
-  }
+  // identificadoPor es gestionado exclusivamente al vincular/desvincular CxCs — no se toca aquí
   await mov.save();
 
   const updated = { _id: mov._id, banco: mov.banco, status: mov.status, identificadoPor: mov.identificadoPor };
@@ -563,28 +558,31 @@ async function updateErpIds(id, action, erpId, user) {
   const cleanId = erpId.trim();
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
+  const idPorEntries = mov.identificadoPor ?? [];
   if (
     user?.role !== 'admin' &&
     mov.status === 'identificado' &&
-    mov.identificadoPor?.userId &&
-    mov.identificadoPor.userId !== user?._id
+    idPorEntries.length > 0 &&
+    !idPorEntries.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
   }
 
-  mov.erpIds   = (mov.erpIds   || []).filter(x => x !== cleanId);
-  mov.erpLinks = (mov.erpLinks || []).filter(l => l.erpId !== cleanId);
+  mov.erpIds          = (mov.erpIds          || []).filter(x => x !== cleanId);
+  mov.erpLinks        = (mov.erpLinks        || []).filter(l => l.erpId !== cleanId);
+  // Eliminar las entradas de identificadoPor correspondientes a la CxC desvinculada.
+  // Si ya no quedan CxCs vinculadas, limpiar por completo: cubre entradas sin erpId
+  // (erpId: null) almacenadas por el motor automático, que el filtro exacto no elimina.
+  if (mov.erpIds.length === 0) {
+    mov.identificadoPor = [];
+  } else {
+    mov.identificadoPor = (mov.identificadoPor || []).filter(e => e.erpId !== cleanId);
+  }
 
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
   mov.status   = status;
-  if (status === 'identificado') {
-    const displayName = user?.nombre || user?.email || null;
-    mov.identificadoPor = { userId: user?._id ?? null, nombre: displayName, fechaId: new Date() };
-  } else {
-    mov.identificadoPor = { userId: null, nombre: null, fechaId: null };
-  }
   await mov.save();
 
   const updated = {
@@ -610,11 +608,12 @@ async function setErpIds(id, erpLinks, user) {
 
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
+  const idPorSet = mov.identificadoPor ?? [];
   if (
     user?.role !== 'admin' &&
     mov.status === 'identificado' &&
-    mov.identificadoPor?.userId &&
-    mov.identificadoPor.userId !== user?._id
+    idPorSet.length > 0 &&
+    !idPorSet.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
   }
@@ -622,16 +621,23 @@ async function setErpIds(id, erpLinks, user) {
   mov.erpLinks = cleanLinks;
   mov.erpIds   = cleanLinks.map(l => l.erpId);
 
+  // Actualizar identificadoPor: añadir entradas para CxCs nuevas, quitar las eliminadas
+  const prevIds       = new Set((mov.identificadoPor || []).map(e => e.erpId));
+  const newIds        = new Set(cleanLinks.map(l => l.erpId));
+  const displayName   = user?.nombre || user?.email || null;
+  const addedErpIds   = cleanLinks.filter(l => !prevIds.has(l.erpId)).map(l => l.erpId);
+  const removedErpIds = [...prevIds].filter(id => !newIds.has(id));
+
+  let updatedIdPor = (mov.identificadoPor || []).filter(e => !removedErpIds.includes(e.erpId));
+  for (const erpId of addedErpIds) {
+    updatedIdPor.push({ userId: user?._id ?? null, nombre: displayName, fechaId: new Date(), erpId });
+  }
+  mov.identificadoPor = updatedIdPor;
+
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
   mov.status   = status;
-  if (status === 'identificado') {
-    const displayName = user?.nombre || user?.email || null;
-    mov.identificadoPor = { userId: user?._id ?? null, nombre: displayName, fechaId: new Date() };
-  } else {
-    mov.identificadoPor = { userId: null, nombre: null, fechaId: null };
-  }
   await mov.save();
 
   const updated = {
@@ -655,6 +661,15 @@ async function saveConfig(banco, data) {
   if (data.cuentaContable !== undefined) fields.cuentaContable = data.cuentaContable || null;
   if (data.numeroCuenta   !== undefined) fields.numeroCuenta   = data.numeroCuenta   || null;
   return bankConfigRepo.upsert(banco, fields);
+}
+
+async function listIdentificadores(banco) {
+  const docs = await BankMovement.aggregate([
+    { $match: { banco, isActive: true, 'identificadoPor.userId': { $ne: null } } },
+    { $group: { _id: '$identificadoPor.userId', nombre: { $first: '$identificadoPor.nombre' } } },
+    { $sort: { nombre: 1 } },
+  ]);
+  return docs.map(d => ({ userId: d._id, nombre: d.nombre || d._id }));
 }
 
 async function listCategories(banco) {
@@ -808,6 +823,6 @@ async function exportMovements(filters) {
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds,
-  getConfig, saveConfig, listCategories, importIndividual,
+  getConfig, saveConfig, listCategories, listIdentificadores, importIndividual,
   exportMovements,
 };

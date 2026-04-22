@@ -22,7 +22,7 @@ require('dotenv').config();
 const REQUIRED = [
   'JWT_SECRET',          // Firma tokens de sesión
   'CREDS_MASTER_KEY',    // Cifra credenciales e.firma del SAT
-  'ERP_BASE_URL',        // URL base del ERP externo
+  'ERP_CAJA_BASE_URL',        // URL base del ERP externo
   'ERP_TOKEN',           // Token de autenticación del ERP
 ];
 
@@ -75,7 +75,7 @@ const config = Object.freeze({
 
   /** Integración con el ERP externo */
   erp: Object.freeze({
-    baseUrl: process.env.ERP_BASE_URL?.trim(),
+    baseUrl: process.env.ERP_CAJA_BASE_URL?.trim(),
     // Normaliza el token: garantiza el prefijo "Bearer " independientemente
     // de si el .env lo incluye o no.
     token: (() => {

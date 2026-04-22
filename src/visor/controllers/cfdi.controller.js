@@ -1142,5 +1142,5 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
 
 module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
-  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk,
 };

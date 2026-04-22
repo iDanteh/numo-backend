@@ -21,7 +21,7 @@
 
 const CFDI       = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
-const logger = require('../../shared/utils/logger');
+const { logger } = require('../../shared/utils/logger');
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
@@ -239,57 +239,59 @@ const generarPlan = async (filtros = {}) => {
 /**
  * Aplica la reclasificación en MongoDB para todos los CFDIs que lo requieran.
  *
- * IMPORTANTE: Llamar a generarPlan() primero y revisar antes de ejecutar esto.
- *
- * @param {object} filtros — Los mismos filtros usados en generarPlan()
+ * @param {object} filtros   — Filtros para buscar CFDIs (se ignoran si se pasa itemsExplicitos)
+ * @param {Array}  [itemsExplicitos] — Items del plan ya calculado: [{ uuid, mesCorrecto, anoCorrecto, ... }]
+ *   Si se proporciona, se usan directamente sin volver a consultar MongoDB.
  * @returns {Promise<object>} Resumen de lo aplicado
  */
-const aplicarReclasificacion = async (filtros = {}) => {
+const aplicarReclasificacion = async (filtros = {}, itemsExplicitos = null) => {
   logger.info('[ReclasificacionGlobal] Iniciando aplicación de reclasificación...');
 
-  // Generar plan primero para saber qué hay que cambiar
-  const plan = await generarPlan(filtros);
-  const aReclasificar = plan.detalle.filter(d => d.requiereReclasificacion);
+  let aReclasificar;
+  let plan = null;
+
+  if (Array.isArray(itemsExplicitos) && itemsExplicitos.length > 0) {
+    // Modo directo: usar exactamente los items que ya calculó el plan en el frontend
+    aReclasificar = itemsExplicitos;
+    logger.info(`[ReclasificacionGlobal] Modo directo: ${aReclasificar.length} items a migrar`);
+  } else {
+    // Modo plan: re-ejecutar la consulta (usado en contextos automáticos, ej. upload)
+    plan = await generarPlan(filtros);
+    aReclasificar = plan.detalle.filter(d => d.requiereReclasificacion);
+  }
 
   if (aReclasificar.length === 0) {
     logger.info('[ReclasificacionGlobal] No hay CFDIs que requieran reclasificación.');
+    const correctasPlan = plan
+      ? plan.detalle.map(d => ({ uuid: d.uuid, source: d.source, periodo: d.mesCorrecto, ejercicio: d.anoCorrecto }))
+      : [];
     return {
       aplicadoEn:       new Date().toISOString(),
-      totalAnalizadas:  plan.totalAnalizadas,
-      totalCorrectas:   plan.correctas,
+      totalAnalizadas:  plan ? plan.totalAnalizadas : 0,
+      totalCorrectas:   plan ? plan.correctas : 0,
       totalModificados: 0,
-      resumen: {
-        motivoConteo:  {},
-        reglaAplicada: 'Clasificación basada en fecha de emisión (CFDI), ignorando fecha de timbrado.',
-      },
+      resumen: { motivoConteo: {}, reglaAplicada: 'Clasificación basada en InformacionGlobal.Mes del XML SAT.' },
       modificadas: [],
-      correctas: plan.detalle.map(d => ({
-        uuid:      d.uuid,
-        source:    d.source,
-        periodo:   d.mesCorrecto,
-        ejercicio: d.anoCorrecto,
-      })),
+      correctas:   correctasPlan,
     };
   }
 
   logger.info(`[ReclasificacionGlobal] Aplicando ${aReclasificar.length} reclasificaciones...`);
 
+  // IMPORTANTE: El índice único de CFDI es { uuid, source }, puede haber un documento
+  // SAT y uno ERP con el mismo UUID. El filtro DEBE incluir source para actualizar
+  // exactamente el documento que analizó el plan (el SAT con InformacionGlobal).
   const ops = aReclasificar.map(d => ({
     updateOne: {
-      filter: { uuid: d.uuid },
-      update: {
-        $set: {
-          periodo:   d.mesCorrecto,
-          ejercicio: d.anoCorrecto,
-        },
-      },
+      filter: { uuid: d.uuid, source: d.source },
+      update: { $set: { periodo: d.mesCorrecto, ejercicio: d.anoCorrecto } },
     },
   }));
 
   const resultado = await CFDI.bulkWrite(ops, { ordered: false });
+  logger.info(`[ReclasificacionGlobal] bulkWrite CFDI: matched=${resultado.matchedCount}, modified=${resultado.modifiedCount}`);
 
-  // Sincronizar TODOS los Comparison records del UUID — pueden existir varios
-  // de distintas sesiones batch; todos deben reflejar el periodo/ejercicio correcto.
+  // Sincronizar registros Comparison al periodo/ejercicio correcto
   await Comparison.bulkWrite(aReclasificar.map(d => ({
     updateMany: {
       filter: { uuid: d.uuid },
@@ -297,57 +299,47 @@ const aplicarReclasificacion = async (filtros = {}) => {
     },
   })), { ordered: false });
 
-  // Log detallado de cada factura reclasificada
-  logger.info('[ReclasificacionGlobal] ── Log de reclasificaciones aplicadas ──────────────');
+  // Log detallado de cada factura migrada
+  logger.info('[ReclasificacionGlobal] ── Facturas migradas ──────────────────────────────');
   for (const d of aReclasificar) {
-    logger.info(
-      `  UUID: ${d.uuid} | Mes: ${d.cambiosProyectados.periodo.antes} → ${d.cambiosProyectados.periodo.despues}` +
-      ` | Ejercicio: ${d.cambiosProyectados.ejercicio.antes} → ${d.cambiosProyectados.ejercicio.despues}` +
-      ` | Motivo: ${d.motivo}`
-    );
+    const mesAnt = d.mesAnterior ?? d.cambiosProyectados?.periodo?.antes ?? '?';
+    const mesNvo = d.mesCorrecto ?? d.cambiosProyectados?.periodo?.despues ?? '?';
+    logger.info(`  UUID: ${d.uuid} | Source: ${d.source ?? '?'} | Mes: ${mesAnt} → ${mesNvo} | Motivo: ${d.motivo ?? ''}`);
   }
 
   const resumenMotivos = {};
   aReclasificar.forEach(d => {
-    d.motivo.split('; ').forEach(m => {
+    const motivo = d.motivo || 'Mes incorrecto';
+    motivo.split('; ').forEach(m => {
       resumenMotivos[m] = (resumenMotivos[m] || 0) + 1;
     });
   });
 
   logger.info(
-    `[ReclasificacionGlobal] Completado: ${resultado.modifiedCount} documentos modificados. ` +
-    `Motivos: ${JSON.stringify(resumenMotivos)}`
+    `[ReclasificacionGlobal] Completado: ${resultado.modifiedCount} documentos modificados.`
   );
 
-  // Construir detalle completo: modificadas + correctas
-  const correctas = plan.detalle
-    .filter(d => !d.requiereReclasificacion)
-    .map(d => ({
-      uuid:        d.uuid,
-      source:      d.source,
-      periodo:     d.mesCorrecto,
-      ejercicio:   d.anoCorrecto,
-      modificada:  false,
-      motivo:      'Clasificación correcta',
-    }));
+  // Correctas: solo disponibles si se corrió el plan internamente
+  const correctas = plan
+    ? plan.detalle
+        .filter(d => !d.requiereReclasificacion)
+        .map(d => ({ uuid: d.uuid, source: d.source, periodo: d.mesCorrecto, ejercicio: d.anoCorrecto, modificada: false }))
+    : [];
 
   return {
     aplicadoEn:       new Date().toISOString(),
-    totalAnalizadas:  plan.totalAnalizadas,
-    totalCorrectas:   plan.correctas,
+    totalAnalizadas:  plan ? plan.totalAnalizadas : aReclasificar.length,
+    totalCorrectas:   plan ? plan.correctas : 0,
     totalModificados: resultado.modifiedCount,
-    resumen: {
-      motivoConteo:  resumenMotivos,
-      reglaAplicada: 'Clasificación basada en fecha de emisión (CFDI), ignorando fecha de timbrado.',
-    },
+    resumen: { motivoConteo: resumenMotivos, reglaAplicada: 'Clasificación basada en InformacionGlobal.Mes del XML SAT.' },
     modificadas: aReclasificar.map(d => ({
       uuid:        d.uuid,
       source:      d.source,
-      mesAnterior: d.cambiosProyectados.periodo.antes,
-      mesNuevo:    d.cambiosProyectados.periodo.despues,
-      anoAnterior: d.cambiosProyectados.ejercicio.antes,
-      anoNuevo:    d.cambiosProyectados.ejercicio.despues,
-      motivo:      d.motivo,
+      mesAnterior: d.mesAnterior ?? d.cambiosProyectados?.periodo?.antes,
+      mesNuevo:    d.mesCorrecto,
+      anoAnterior: d.anoAnterior ?? d.cambiosProyectados?.ejercicio?.antes,
+      anoNuevo:    d.anoCorrecto,
+      motivo:      d.motivo ?? 'Mes incorrecto',
     })),
     correctas,
   };

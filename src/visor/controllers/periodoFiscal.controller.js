@@ -127,7 +127,7 @@ const create = asyncHandler(async (req, res) => {
     ejercicio,
     periodo: periodo ?? null,
     label,
-    createdBy: req.user?._id ?? null,   // PG integer id del usuario autenticado
+    createdBy: req.user?.dbId ? parseInt(req.user.dbId, 10) : null,
   });
 
   res.status(201).json(doc);

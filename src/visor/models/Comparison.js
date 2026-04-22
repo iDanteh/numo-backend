@@ -54,12 +54,12 @@ const comparisonSchema = new mongoose.Schema({
     enum: ['automatic', 'manual', 'scheduled'],
     default: 'automatic',
   },
-  triggeredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  triggeredBy: { type: String },   // Auth0 sub del usuario que disparó la comparación
 
   // Resolución
   resolved: { type: Boolean, default: false },
   resolvedAt: { type: Date },
-  resolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  resolvedBy: { type: String },    // Auth0 sub del usuario que resolvió
   resolutionNotes: { type: String },
 
   // Ejercicio fiscal y periodo derivados de la fecha del CFDI ERP

@@ -133,7 +133,6 @@ const listSessions = asyncHandler(async (req, res) => {
 
   const [sessions, total] = await Promise.all([
     ComparisonSession.find()
-      .populate('triggeredBy', 'name email')
       .sort({ startedAt: -1 })
       .skip(skip(pg, lm))
       .limit(lm)
@@ -153,7 +152,6 @@ const getSession = asyncHandler(async (req, res) => {
   const lm = parseInt(limit);
 
   const session = await ComparisonSession.findById(req.params.id)
-    .populate('triggeredBy', 'name email')
     .lean();
   if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
 
@@ -179,8 +177,7 @@ const getSession = asyncHandler(async (req, res) => {
 const getById = asyncHandler(async (req, res) => {
   const comparison = await Comparison.findById(req.params.id)
     .populate('erpCfdiId')
-    .populate('satCfdiId')
-    .populate('triggeredBy', 'name email');
+    .populate('satCfdiId');
   if (!comparison) return res.status(404).json({ error: 'Comparación no encontrada' });
   res.json(comparison);
 });

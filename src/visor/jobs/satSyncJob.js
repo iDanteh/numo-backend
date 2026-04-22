@@ -107,8 +107,10 @@ const ejecutarDescargaMasiva = async () => {
         }
       }
 
-      // Actualizar fecha de última sincronización
-      await Entity.findOneAndUpdate({ rfc }, { $set: { 'syncConfig.lastSync': new Date() } });
+      // Actualizar fecha de última sincronización (Sequelize — PostgreSQL)
+      await entityRepo.update(entidad.id, {
+        syncConfig: { ...entidad.syncConfig, lastSync: new Date() },
+      });
 
     } catch (err) {
       logger.error(`[SatSyncJob] Error procesando RFC ${rfc}: ${err.message}`);
@@ -637,7 +639,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
           // Reclasificar facturas globales: corrige periodo/ejercicio según fecha de emisión,
           // no fecha de timbrado. Solo aplica a CFDIs con cfdi:InformacionGlobal.
           try {
-            reclasificacionResultado = await aplicarReclasificacion({ rfc, source: 'SAT' });
+            reclasificacionResultado = await aplicarReclasificacion({ rfc, ejercicio, source: 'SAT' });
             if (reclasificacionResultado.totalModificados > 0) {
               logger.info(`[SatSyncJob] Reclasificación global SAT: ${reclasificacionResultado.totalModificados} CFDI(s) corregidos para RFC ${rfc}`);
             }

@@ -199,13 +199,18 @@ const canonizarPeticionDescarga = (idPaquete, rfcSolicitante, ns) => {
 
 // Mapa de tipo de comprobante a operación SOAP y atributos SAT
 const TIPO_MAP = {
-  Emitidos:  { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: null },
-  Recibidos: { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: null },
-  Ingresos:  { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'I'  },
-  Egresos:   { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'E'  },
-  Traslados: { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'T'  },
-  Nomina:    { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'N'  },
-  Pagos:     { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'P'  },
+  Emitidos:           { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: null },
+  Recibidos:          { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: null },
+  Ingresos:           { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'I'  },
+  Egresos:            { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'E'  },
+  Traslados:          { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'T'  },
+  Nomina:             { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'N'  },
+  Pagos:              { operacion: 'SolicitaDescargaEmitidos',  rfcAttrKey: 'RfcEmisor',   tipoDeComprobante: 'P'  },
+  RecibidosIngresos:  { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: 'I'  },
+  RecibidosEgresos:   { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: 'E'  },
+  RecibidosTraslados: { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: 'T'  },
+  RecibidosNomina:    { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: 'N'  },
+  RecibidosPagos:     { operacion: 'SolicitaDescargaRecibidos', rfcAttrKey: 'RfcReceptor', tipoDeComprobante: 'P'  },
 };
 
 const solicitar = async (params) => {
@@ -396,26 +401,67 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
     logger.info(`[SatDownload] Estado solicitud ${idSolicitud}: ${estadoSolicitud} (${descripcionEstado(estadoSolicitud)})`);
 
     if (estadoSolicitud === ESTADO_TERMINADA) {
-      // Extraer IDs de paquetes
-      const idsPaquetes = [];
-      const regex = /<[^:]*:?IdsPaquetes[^>]*>([^<]+)</g;
+      // Extraer IDs de paquetes — el SAT usa distintos formatos según versión del WSDL:
+      // Formato 1: <IdsPaquetes>id1</IdsPaquetes><IdsPaquetes>id2</IdsPaquetes>  (texto directo)
+      // Formato 2: <a:IdsPaquetes><b:string>id1</b:string><b:string>id2</b:string></a:IdsPaquetes>  (WCF arrays)
+      // Formato 3: IdsPaquetes="id1,id2" como atributo  (raro)
+      const ids = new Set();
       let m;
-      while ((m = regex.exec(xmlResp)) !== null) {
-        idsPaquetes.push(m[1].trim());
+
+      // Formato 1: texto directo dentro de cada <IdsPaquetes>texto</IdsPaquetes>
+      // Ejemplo: <IdsPaquetes>UUID_01</IdsPaquetes><IdsPaquetes>UUID_02</IdsPaquetes>
+      const regex1 = /<[^:]*:?IdsPaquetes[^>]*>([^<]+)/g;
+      while ((m = regex1.exec(xmlResp)) !== null) {
+        const v = m[1].trim();
+        if (v) ids.add(v);
       }
-      // También puede venir como atributos
-      if (idsPaquetes.length === 0) {
-        const attrRegex = /IdsPaquetes="([^"]+)"/g;
-        while ((m = attrRegex.exec(xmlResp)) !== null) {
-          idsPaquetes.push(...m[1].split(',').map(s => s.trim()).filter(Boolean));
+
+      // Formato 2: <b:string> hijos dentro de bloques <IdsPaquetes>…</IdsPaquetes>
+      // Ejemplo: <a:IdsPaquetes><b:string>UUID_01</b:string><b:string>UUID_02</b:string></a:IdsPaquetes>
+      // Se corre SIEMPRE (no solo si ids está vacío) para cubrir respuestas de formato mixto.
+      const bloqueRegex = /<[^:]*:?IdsPaquetes[^>]*>([\s\S]*?)<\/[^:]*:?IdsPaquetes>/g;
+      let bloqueMatch;
+      while ((bloqueMatch = bloqueRegex.exec(xmlResp)) !== null) {
+        const stringRegex = /<[^:]*:?string[^>]*>([^<]+)/g;
+        while ((m = stringRegex.exec(bloqueMatch[1])) !== null) {
+          const v = m[1].trim();
+          if (v) ids.add(v);
         }
       }
 
-      logger.info(`[SatDownload] Solicitud terminada. Paquetes: ${idsPaquetes.length}, CFDIs totales: ${totalCfdis}`);
+      // Formato 3: atributo IdsPaquetes="UUID_01,UUID_02,…"
+      // Se corre SIEMPRE para no perder IDs si se mezcla con otros formatos.
+      const attrRegex = /IdsPaquetes="([^"]+)"/g;
+      while ((m = attrRegex.exec(xmlResp)) !== null) {
+        m[1].split(',').forEach(s => { const v = s.trim(); if (v) ids.add(v); });
+      }
+
+      const idsPaquetes = [...ids];
+      // Nota: NumeroCFDIs en la respuesta del SAT puede ser "0" aunque haya paquetes válidos
+      // (comportamiento documentado en el manual oficial del SAT). No se usa para validar
+      // la completitud — el número de paquetes extraídos es la fuente de verdad.
+      logger.info(`[SatDownload] Solicitud terminada. Paquetes: ${idsPaquetes.length}, CFDIs reportados por SAT: ${totalCfdis || '(no reportado)'}`);
+      if (idsPaquetes.length > 0) {
+        logger.info(`[SatDownload] IdsPaquetes extraídos: ${idsPaquetes.join(', ')}`);
+      } else {
+        logger.warn(`[SatDownload] ⚠ No se pudieron extraer IdsPaquetes. Respuesta SAT:\n${xmlResp.slice(0, 2000)}`);
+      }
       return { idsPaquetes, totalCfdis };
     }
 
-    if (estadoSolicitud === ESTADO_ERROR || estadoSolicitud === ESTADO_RECHAZADA) {
+    if (estadoSolicitud === ESTADO_RECHAZADA) {
+      // EstadoSolicitud=5 significa que el SAT rechazó la solicitud (no el call SOAP).
+      // CodEstatus/Mensaje son del response SOAP y pueden ser engañosos (ej. "5000 Solicitud Aceptada").
+      // Causas frecuentes: solicitud activa previa para el mismo RFC, límite diario alcanzado,
+      // o parámetros duplicados. Se lanza un error con el tag SAT_RECHAZADA para que el
+      // caller pueda detectarlo y hacer retry.
+      throw new Error(
+        `SAT_RECHAZADA: El SAT rechazó la solicitud (EstadoSolicitud=5). ` +
+        `Causa probable: solicitud activa previa para este RFC o límite diario de solicitudes alcanzado. ` +
+        `(CodEstatus=${codEstatus}, Mensaje="${mensaje}")`
+      );
+    }
+    if (estadoSolicitud === ESTADO_ERROR) {
       throw new Error(`SAT [${codEstatus}]: ${mensaje}`);
     }
 
@@ -440,40 +486,32 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
 };
 
 /**
- * Descarga un paquete ZIP en base64, lo descomprime en memoria y retorna los XMLs.
- * El ZIP nunca se escribe en disco.
- *
- * @param {string} idPaquete
- * @param {string} rfcSolicitante
- * @param {{cerBuffer, keyBuffer, passwordBuffer}} creds
- * @returns {Promise<string[]>} array de strings XML (uno por CFDI)
+ * Descarga un paquete ZIP del SAT y retorna el Buffer sin descomprimir.
+ * Compartido por descargarPaquete() y descargarPaqueteMetadata().
  */
-const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
-  const MAX_INTENTOS  = 3;
-  const ESPERA_BASE_MS = 5_000; // 5 s, se duplica en cada intento
-
+const _descargarZipBuffer = async (idPaquete, rfcSolicitante, creds) => {
+  // SAT permite máximo 2 descargas por paquete (error 5008 si se excede).
+  // Usamos exactamente 2 intentos para respetar ese límite.
+  const MAX_INTENTOS   = 2;
+  const ESPERA_BASE_MS = 5_000;
   let ultimoError;
 
   for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
     try {
-      // Renovar token en cada intento (invalida caché si el anterior falló)
       if (intento > 1) invalidarToken(rfcSolicitante);
       const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
       const rfcFirmaDesc = rfcCertificado ?? rfcSolicitante;
 
-      // Namespace correcto del servicio Descarga (sat.gob.mx, no gob.mx)
-      // WCF hace ContractFilter matching sobre SOAPAction + namespace del body element.
-      const ns = 'http://DescargaMasivaTerceros.sat.gob.mx';
-
+      const ns       = 'http://DescargaMasivaTerceros.sat.gob.mx';
       const canonical = canonizarPeticionDescarga(idPaquete, rfcFirmaDesc, ns);
-      logger.info(`[SatDownload] descargarPaquete() — canonical peticionDescarga: ${canonical}`);
+      logger.info(`[SatDownload] descarga canonical: ${canonical}`);
 
       const cerCopy = Buffer.from(creds.cerBuffer);
       const keyCopy = Buffer.from(creds.keyBuffer);
       const pwdCopy = Buffer.from(creds.passwordBuffer);
       const firma   = await crearFirmaSolicitud(cerCopy, keyCopy, pwdCopy, canonical);
 
-      const descEnvelope = `<?xml version="1.0" encoding="UTF-8"?>
+      const envelope = `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${ns}">
   <s:Header/>
   <s:Body>
@@ -488,48 +526,161 @@ const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
       const xmlResp = await soapCallBearer(
         DESCARGA_URL,
         'http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar',
-        descEnvelope,
-        token
+        envelope,
+        token,
       );
 
-      // El SAT retorna el ZIP como base64 dentro de <Paquete>
       const paqueteMatch = xmlResp.match(/<[^:]*:?Paquete[^>]*>([\s\S]+?)<\/[^:]*:?Paquete>/);
       if (!paqueteMatch || !paqueteMatch[1]) {
         throw new Error(`No se encontró el paquete en la respuesta del SAT para IdPaquete: ${idPaquete}`);
       }
 
-      // Liberar la string base64 (33% extra de memoria) antes de crear el Buffer
-      let zipBase64 = paqueteMatch[1].trim();
+      let zipBase64   = paqueteMatch[1].trim();
       const zipBuffer = Buffer.from(zipBase64, 'base64');
       zipBase64 = null; // eslint-disable-line no-unused-vars
-
-      // Descomprimir en memoria con adm-zip, liberar el buffer zip al terminar
-      const zip  = new AdmZip(zipBuffer);
-      const xmls = [];
-      for (const entrada of zip.getEntries()) {
-        if (entrada.entryName.toLowerCase().endsWith('.xml')) {
-          const data = entrada.getData();
-          xmls.push(data.toString('utf-8'));
-          data.fill(0); // limpiar buffer de la entrada después de convertir
-        }
-      }
-
-      logger.info(`[SatDownload] Paquete ${idPaquete} descomprimido: ${xmls.length} XMLs (intento ${intento})`);
-      return xmls;
+      return zipBuffer;
 
     } catch (err) {
       ultimoError = err;
-      logger.warn(`[SatDownload] descargarPaquete intento ${intento}/${MAX_INTENTOS} fallido para ${idPaquete}: ${err.message}`);
-
+      logger.warn(`[SatDownload] _descargarZipBuffer intento ${intento}/${MAX_INTENTOS} fallido para ${idPaquete}: ${err.message}`);
       if (intento < MAX_INTENTOS) {
-        const espera = ESPERA_BASE_MS * intento; // 5 s, 10 s
+        const espera = ESPERA_BASE_MS * intento;
         logger.info(`[SatDownload] Reintentando en ${espera / 1000} s...`);
         await new Promise(r => setTimeout(r, espera));
       }
     }
   }
 
-  throw new Error(`descargarPaquete falló después de ${MAX_INTENTOS} intentos para ${idPaquete}: ${ultimoError?.message}`);
+  throw new Error(`_descargarZipBuffer falló después de ${MAX_INTENTOS} intento(s) para ${idPaquete}: ${ultimoError?.message}. ` +
+    `(SAT limita cada paquete a 2 descargas — error 5008 si se reintenta después de 2 fallos)`);
+};
+
+/**
+ * Parsea el TXT de metadatos del SAT (pipe o tab separado).
+ * Retorna array de objetos con campos normalizados.
+ */
+const parsearMetadataTxt = (contenido) => {
+  const lineas = contenido.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (lineas.length < 2) return [];
+
+  const sep     = lineas[0].includes('|') ? '|' : lineas[0].includes('~') ? '~' : '\t';
+  const limpiar = str => str.replace(/^"|"$/g, '').trim();
+
+  const normalizarClave = (nombre) => {
+    const n = nombre.toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quitar acentos
+      .trim();
+    if (n.includes('folio fiscal'))                              return 'uuid';
+    if (n === 'rfc emisor' || n.startsWith('rfc emisor'))        return 'rfcEmisor';
+    if (n.includes('emisor') && n.includes('razon'))             return 'nombreEmisor';
+    if (n.includes('emisor') && n.includes('nombre'))            return 'nombreEmisor';
+    if (n === 'rfc receptor' || n.startsWith('rfc receptor'))    return 'rfcReceptor';
+    if (n.includes('receptor') && n.includes('razon'))           return 'nombreReceptor';
+    if (n.includes('receptor') && n.includes('nombre'))          return 'nombreReceptor';
+    if (n.includes('fecha') && n.includes('emision'))            return 'fecha';
+    if (n.includes('fecha') && n.includes('certific'))           return 'fechaCert';
+    if (n.includes('pac'))                                       return 'rfcPac';
+    if (n === 'total')                                           return 'total';
+    if (n.includes('efecto'))                                    return 'efecto';
+    if (n.includes('estado'))                                    return 'estado';
+    if (n.includes('fecha') && n.includes('cancel'))             return 'fechaCancelacion';
+    return n.replace(/\s+/g, '_');
+  };
+
+  const claves = lineas[0].split(sep).map(h => normalizarClave(limpiar(h)));
+
+  const registros = [];
+  for (let i = 1; i < lineas.length; i++) {
+    const campos = lineas[i].split(sep).map(limpiar);
+    const obj    = {};
+    claves.forEach((clave, idx) => { obj[clave] = campos[idx] ?? ''; });
+    if (obj.uuid) registros.push(obj);
+  }
+  return registros;
+};
+
+/**
+ * Descarga un paquete ZIP en base64, lo descomprime en memoria y retorna los XMLs.
+ * @returns {Promise<string[]>} array de strings XML (uno por CFDI)
+ */
+const descargarPaquete = async (idPaquete, rfcSolicitante, creds) => {
+  const zipBuffer = await _descargarZipBuffer(idPaquete, rfcSolicitante, creds);
+  const zip  = new AdmZip(zipBuffer);
+  const xmls = [];
+  for (const entrada of zip.getEntries()) {
+    if (entrada.entryName.toLowerCase().endsWith('.xml')) {
+      const data = entrada.getData();
+      xmls.push(data.toString('utf-8'));
+      data.fill(0);
+    }
+  }
+  logger.info(`[SatDownload] Paquete ${idPaquete}: ${xmls.length} XMLs`);
+  return xmls;
+};
+
+/**
+ * Descarga un paquete de metadatos (.txt), lo descomprime y retorna los registros parseados.
+ * @returns {Promise<object[]>} array de objetos con campos uuid, rfcEmisor, rfcReceptor, total, fecha, efecto, estado, etc.
+ */
+const descargarPaqueteMetadata = async (idPaquete, rfcSolicitante, creds) => {
+  const zipBuffer = await _descargarZipBuffer(idPaquete, rfcSolicitante, creds);
+  const zip       = new AdmZip(zipBuffer);
+  const entradas  = zip.getEntries();
+
+  // Loguear siempre el contenido del ZIP para diagnóstico
+  logger.info(`[SatDownload] ZIP ${idPaquete} contiene ${entradas.length} entrada(s): ${entradas.map(e => e.entryName).join(', ')}`);
+
+  const registros = [];
+
+  // Primera pasada: archivos .txt (formato esperado SAT)
+  for (const entrada of entradas) {
+    if (entrada.entryName.toLowerCase().endsWith('.txt')) {
+      // Intentar UTF-8 primero; si falla o da 0 registros, reintentar con latin1
+      let contenido = entrada.getData().toString('utf-8');
+      let parsed    = parsearMetadataTxt(contenido);
+
+      if (parsed.length === 0) {
+        // Diagnóstico: loguear las primeras 3 líneas para ver el formato real
+        const primeras = contenido.split(/\r?\n/).slice(0, 3);
+        logger.warn(`[SatDownload] TXT '${entrada.entryName}' en UTF-8 dio 0 registros. Primeras líneas:`);
+        primeras.forEach((l, i) => logger.warn(`  [${i}] ${JSON.stringify(l)}`));
+
+        // Reintentar decodificando como latin1 (Windows-1252) — común en archivos SAT
+        contenido = entrada.getData().toString('latin1');
+        parsed    = parsearMetadataTxt(contenido);
+        if (parsed.length > 0) {
+          logger.info(`[SatDownload] Metadata recuperada con encoding latin1: ${parsed.length} registros`);
+        } else {
+          const primerasL = contenido.split(/\r?\n/).slice(0, 3);
+          logger.warn(`[SatDownload] TXT '${entrada.entryName}' en latin1 también dio 0 registros. Primeras líneas:`);
+          primerasL.forEach((l, i) => logger.warn(`  [${i}] ${JSON.stringify(l)}`));
+        }
+      }
+
+      registros.push(...parsed);
+    }
+  }
+
+  // Segunda pasada: si no hubo .txt, intentar con cualquier archivo de texto (xml, sin extensión, etc.)
+  if (registros.length === 0) {
+    logger.warn(`[SatDownload] No se encontraron archivos .txt en ${idPaquete}. Intentando con otras entradas...`);
+    for (const entrada of entradas) {
+      const nombre = entrada.entryName.toLowerCase();
+      if (!nombre.endsWith('.zip')) {
+        try {
+          const contenido = entrada.getData().toString('utf-8');
+          const parsed    = parsearMetadataTxt(contenido);
+          if (parsed.length > 0) {
+            logger.info(`[SatDownload] Metadata extraída de '${entrada.entryName}': ${parsed.length} registros`);
+            registros.push(...parsed);
+          }
+        } catch { /* ignorar entradas no parseables */ }
+      }
+    }
+  }
+
+  logger.info(`[SatDownload] Paquete metadata ${idPaquete}: ${registros.length} registros`);
+  return registros;
 };
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
@@ -539,4 +690,4 @@ const descripcionEstado = (estado) => {
   return map[estado] || 'Desconocido';
 };
 
-module.exports = { solicitar, verificar, descargarPaquete, invalidarToken };
+module.exports = { solicitar, verificar, descargarPaquete, descargarPaqueteMetadata, invalidarToken };

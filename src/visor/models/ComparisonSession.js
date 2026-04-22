@@ -3,7 +3,7 @@ const mongoose = require('mongoose');
 const comparisonSessionSchema = new mongoose.Schema({
   name: { type: String, required: true },
 
-  triggeredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  triggeredBy: { type: String },   // Auth0 sub del usuario que disparó la sesión
 
   status: {
     type: String,

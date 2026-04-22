@@ -11,6 +11,7 @@ const { normalizeSource } = require('../utils/validators');
 const { paginate, skip } = require('../utils/pagination');
 const { generarPlan, aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
 const Comparison = require('../models/Comparison');
+const { logger } = require('../../shared/utils/logger');
 
 const TIPOS_COMPROBANTE = {
   ingreso: 'I', egreso: 'E', traslado: 'T',
@@ -260,6 +261,14 @@ const upload = asyncHandler(async (req, res) => {
     procesados, nuevos, actualizados, duplicados,
     errores: failed, success, failed,
   });
+
+  // Reclasificación automática en background para facturas globales SAT/MANUAL
+  if (['SAT', 'MANUAL'].includes(source) && ejercicio && procesados > 0) {
+    setImmediate(() => {
+      aplicarReclasificacion({ ejercicio, source })
+        .catch(err => logger.warn(`[upload] reclasificación background falló: ${err.message}`));
+    });
+  }
 });
 
 /**
@@ -594,6 +603,14 @@ const importExcel = asyncHandler(async (req, res) => {
     procesados, nuevos, actualizados, duplicados,
     errores: failed, success,
   });
+
+  // Reclasificación automática en background para facturas globales SAT/MANUAL
+  if (['SAT', 'MANUAL'].includes(source) && ejercicioNum && procesados > 0) {
+    setImmediate(() => {
+      aplicarReclasificacion({ ejercicio: ejercicioNum, source })
+        .catch(err => logger.warn(`[importExcel] reclasificación background falló: ${err.message}`));
+    });
+  }
 });
 
 /**
@@ -796,6 +813,15 @@ const importFromErpApi = asyncHandler(async (req, res) => {
     procesados, nuevos, actualizados, duplicados,
     errores: failed, success,
   });
+
+  // Reclasificación automática en background: busca CFDIs SAT del mismo ejercicio
+  // con InformacionGlobal.Mes y alinea también los ERP recién importados.
+  if (procesados > 0) {
+    setImmediate(() => {
+      aplicarReclasificacion({ ejercicio: ejercicioNum, source: 'SAT' })
+        .catch(err => logger.warn(`[importFromErpApi] reclasificación background falló: ${err.message}`));
+    });
+  }
 });
 
 /**
@@ -940,7 +966,7 @@ const planReclasificacionGlobal = asyncHandler(async (req, res) => {
  * Body: { ejercicio, periodo, rfc, source, confirmar }
  */
 const aplicarReclasificacionGlobal = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, rfc, source, confirmar } = req.body;
+  const { ejercicio, periodo, rfc, source, confirmar, items } = req.body;
 
   if (!confirmar) {
     return res.status(400).json({
@@ -949,12 +975,15 @@ const aplicarReclasificacionGlobal = asyncHandler(async (req, res) => {
     });
   }
 
+  // Si vienen items explícitos del plan (modo directo), usarlos directamente
+  const itemsExplicitos = Array.isArray(items) && items.length > 0 ? items : null;
+
   const resultado = await aplicarReclasificacion({
     ejercicio: ejercicio ? Number(ejercicio) : undefined,
     periodo:   periodo   ? Number(periodo)   : undefined,
     rfc:       rfc       || undefined,
     source:    source    || undefined,
-  });
+  }, itemsExplicitos);
 
   res.json({ success: true, data: resultado });
 });
@@ -1142,5 +1171,5 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
 
 module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
-  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk,
 };

@@ -4,12 +4,11 @@ const express    = require('express');
 const multer     = require('multer');
 const { body }   = require('express-validator');
 const rateLimit  = require('express-rate-limit');
-//const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   list, getById, getXml,
   upload, importExcel, importFromErpApi,
   create, compare, remove, exportExcel,
-  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk,
 } = require('../controllers/cfdi.controller');
 
 const router = express.Router();
@@ -49,27 +48,16 @@ const handleXmlUpload = (req, res, next) => {
   });
 };
 
-router.get('/', authenticate, listLimiter, list);
+// ── Rutas estáticas — deben ir ANTES de /:id ─────────────────────────────────
+router.get('/',       authenticate, listLimiter, list);
 router.get('/export', authenticate, exportExcel);
 
-// ── Reclasificación Global — deben ir ANTES de /:id para evitar conflicto ────
-router.get('/reclasificacion-global/plan',    authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
-router.get('/reclasificacion-global/plan', authenticate,permit('admin', 'contador'),planReclasificacionGlobal
-);
-router.get('/:id/xml', authenticate, getXml);
-router.get('/:id', authenticate, getById);
-router.patch('/:id/migrar-periodo', authenticate, permit('admin', 'contador'), migrarPeriodo);
-// ── Lectura ───────────────────────────────────────────────────────────────────
-router.get('/',          authenticate, listLimiter, list);
-router.get('/export',    authenticate, exportExcel);
-router.get('/:id/xml',   authenticate, getXml);
-router.get('/:id',       authenticate, getById);
+router.get('/reclasificacion-global/plan', authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
 
-// ── Escritura ─────────────────────────────────────────────────────────────────
-router.post('/upload',         authenticate, permit('visor:write'), handleXmlUpload, upload);
-router.post('/import-excel',   authenticate, permit('visor:write'), excelUpload.single('excelFile'), importExcel);
-router.post('/import-erp-api', authenticate, permit('visor:write'), importFromErpApi);
-router.post('/:id/compare',    authenticate, permit('visor:write'), compare);
+router.post('/migrar-periodo-bulk',        authenticate, permit('admin', 'contador'), migrarPeriodoBulk);
+router.post('/upload',                     authenticate, permit('visor:write'), handleXmlUpload, upload);
+router.post('/import-excel',               authenticate, permit('visor:write'), excelUpload.single('excelFile'), importExcel);
+router.post('/import-erp-api',             authenticate, permit('visor:write'), importFromErpApi);
 router.post('/',
   authenticate,
   permit('visor:write'),
@@ -84,7 +72,11 @@ router.post('/',
   create,
 );
 
-// ── Admin ─────────────────────────────────────────────────────────────────────
-router.delete('/:id', authenticate, permit('users:manage'), remove);
+// ── Rutas con parámetro :id — al final para no capturar rutas estáticas ──────
+router.get('/:id/xml',          authenticate, getXml);
+router.get('/:id',              authenticate, getById);
+router.patch('/:id/migrar-periodo', authenticate, permit('admin', 'contador'), migrarPeriodo);
+router.post('/:id/compare',     authenticate, permit('visor:write'), compare);
+router.delete('/:id',           authenticate, permit('users:manage'), remove);
 
 module.exports = router;

@@ -240,7 +240,15 @@ const cfdiSchema = new mongoose.Schema({
 // Índice único compuesto: un UUID puede existir como ERP y como SAT
 cfdiSchema.index({ uuid: 1, source: 1 }, { unique: true });
 
-// Índices compuestos
+// Índices compuestos — consultas de lista (cobertura total de los filtros más frecuentes)
+// Cubre: isActive + source + ejercicio + periodo + sort fecha
+cfdiSchema.index({ isActive: 1, source: 1, ejercicio: 1, periodo: 1, fecha: -1 });
+// Cubre: filtro por lastComparisonStatus (tabs SAT/ERP con estado de comparación)
+cfdiSchema.index({ isActive: 1, source: 1, lastComparisonStatus: 1, ejercicio: 1, periodo: 1, fecha: -1 });
+// Cubre: pre-consultas del filtro 'migrar' (match SAT + lookup ERP por UUID)
+cfdiSchema.index({ isActive: 1, lastComparisonStatus: 1, source: 1, ejercicio: 1, periodo: 1 });
+
+// Índices compuestos secundarios
 cfdiSchema.index({ 'emisor.rfc': 1, fecha: -1 });
 cfdiSchema.index({ 'receptor.rfc': 1, fecha: -1 });
 cfdiSchema.index({ source: 1, satStatus: 1 });

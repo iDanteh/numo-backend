@@ -11,6 +11,7 @@ const { normalizeSource } = require('../utils/validators');
 const { paginate, skip } = require('../utils/pagination');
 const { generarPlan, aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
 const Comparison = require('../models/Comparison');
+const { logger } = require('../../shared/utils/logger');
 
 const TIPOS_COMPROBANTE = {
   ingreso: 'I', egreso: 'E', traslado: 'T',
@@ -260,6 +261,14 @@ const upload = asyncHandler(async (req, res) => {
     procesados, nuevos, actualizados, duplicados,
     errores: failed, success, failed,
   });
+
+  // Reclasificación automática en background para facturas globales SAT/MANUAL
+  if (['SAT', 'MANUAL'].includes(source) && ejercicio && procesados > 0) {
+    setImmediate(() => {
+      aplicarReclasificacion({ ejercicio, source })
+        .catch(err => logger.warn(`[upload] reclasificación background falló: ${err.message}`));
+    });
+  }
 });
 
 /**
@@ -594,6 +603,14 @@ const importExcel = asyncHandler(async (req, res) => {
     procesados, nuevos, actualizados, duplicados,
     errores: failed, success,
   });
+
+  // Reclasificación automática en background para facturas globales SAT/MANUAL
+  if (['SAT', 'MANUAL'].includes(source) && ejercicioNum && procesados > 0) {
+    setImmediate(() => {
+      aplicarReclasificacion({ ejercicio: ejercicioNum, source })
+        .catch(err => logger.warn(`[importExcel] reclasificación background falló: ${err.message}`));
+    });
+  }
 });
 
 /**

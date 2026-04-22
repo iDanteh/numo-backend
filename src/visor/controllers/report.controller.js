@@ -465,4 +465,54 @@ const satVigenteErpInactivo = asyncHandler(async (req, res) => {
   res.json({ items, total: items.length });
 });
 
-module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo };
+/**
+ * GET /api/reports/discrepancias-criticas
+ * Retorna TODAS las comparaciones con criticalCount > 0 para el periodo dado,
+ * incluyendo not_in_erp, not_in_sat, discrepancias de monto, RFC, etc.
+ */
+const discrepanciasCriticas = asyncHandler(async (req, res) => {
+  const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
+  const lm = Math.min(2000, Math.max(1, parseInt(limit)));
+
+  const periodoFiltro = {};
+  if (ejercicio)         periodoFiltro.ejercicio         = parseInt(ejercicio);
+  if (periodo)           periodoFiltro.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) periodoFiltro.tipoDeComprobante = tipoDeComprobante;
+
+  const filter = {
+    $or: [
+      { criticalCount: { $gt: 0 } },
+      { status: { $in: ['not_in_erp', 'not_in_sat', 'cancelled'] } },
+    ],
+    ...periodoFiltro,
+  };
+
+  const [comparaciones, total] = await Promise.all([
+    Comparison.find(filter)
+      .select('uuid status differences criticalCount warningCount tipoDeComprobante ejercicio periodo comparedAt erpCfdiId satCfdiId')
+      .populate({ path: 'erpCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus' })
+      .populate({ path: 'satCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total tipoDeComprobante emisor receptor satStatus' })
+      .sort({ criticalCount: -1, comparedAt: -1 })
+      .limit(lm)
+      .lean(),
+    Comparison.countDocuments(filter),
+  ]);
+
+  // Deduplicar por UUID — conservar la más reciente (primero tras el sort)
+  const seen = new Set();
+  const items = comparaciones.filter(c => {
+    if (seen.has(c.uuid)) return false;
+    seen.add(c.uuid);
+    return true;
+  });
+
+  // Conteo por status para el resumen del dashboard
+  const porStatus = items.reduce((acc, c) => {
+    acc[c.status] = (acc[c.status] || 0) + 1;
+    return acc;
+  }, {});
+
+  res.json({ items, total, porStatus });
+});
+
+module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas };

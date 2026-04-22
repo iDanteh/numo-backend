@@ -544,6 +544,16 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
   // Versión CFDI: desde el TFD si está disponible
   if (tfd?.Version && ['3.3', '4.0'].includes(tfd.Version)) doc.version = tfd.Version;
 
+  // InformacionGlobal (Factura Global)
+  const ig = factura?.InformacionGlobal ?? null;
+  if (ig) {
+    doc.informacionGlobal = {
+      periodicidad: ig.Periodicidad || null,
+      mes:          ig.Mes || ig.Meses || null,
+      anio:         ig.Anio || ig['Año'] || ig.Ano || null,
+    };
+  }
+
   return { doc, errores };
 };
 

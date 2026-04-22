@@ -30,7 +30,13 @@ const complementoPagoSchema = new mongoose.Schema({
   version: { type: String },
   pagos:   [pagoDetalleSchema],
   totales: {
-    montoTotalPagos: { type: Number },
+    montoTotalPagos:             { type: Number },
+    totalTrasladosBaseIVA16:     { type: Number },
+    totalTrasladosImpuestoIVA16: { type: Number },
+    totalTrasladosBaseIVA8:      { type: Number },
+    totalTrasladosImpuestoIVA8:  { type: Number },
+    totalRetencionesImpuestoIVA: { type: Number },
+    totalRetencionesImpuestoISR: { type: Number },
   },
 }, { _id: false });
 
@@ -153,6 +159,15 @@ const cfdiSchema = new mongoose.Schema({
 
   // Complemento de Pago (solo TipoComprobante === 'P')
   complementoPago: complementoPagoSchema,
+
+  // Información Global (Factura Global — CFDI 4.0)
+  // Presente solo cuando el CFDI agrega ventas al público en general.
+  // Fuente: nodo cfdi:InformacionGlobal en el XML.
+  informacionGlobal: {
+    periodicidad: { type: String },  // "01"=Mensual, "02"=Bimestral, etc.
+    mes:          { type: String },  // "01"–"12"
+    anio:         { type: String },  // "2024", "2025", …
+  },
 
   // Complementos (timbre fiscal, pagos, etc.)
   timbreFiscalDigital: {

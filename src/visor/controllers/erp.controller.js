@@ -19,6 +19,7 @@ const { asyncHandler }          = require('../../shared/middleware/error-handler
 const { logger }                = require('../../shared/utils/logger');
 const CFDI                      = require('../models/CFDI');
 const { parseCFDI }             = require('../services/cfdiParser');
+const { aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
 
 // ─── Mapeo de tipos — compartido por ambos handlers ──────────────────────────
 
@@ -350,7 +351,27 @@ const cargar = asyncHandler(async (req, res) => {
     }
   }
 
-  // ── 6. Log de auditoría ────────────────────────────────────────────────────
+  // ── 6. Reclasificación automática de facturas globales ────────────────────
+  // Corrige periodo/ejercicio según fecha de emisión para CFDIs con InformacionGlobal.
+  // Solo aplica si se guardó al menos una factura nueva.
+  let reclasificacion = null;
+  if (guardadas > 0) {
+    try {
+      const reclass = await aplicarReclasificacion({ ejercicio, periodo, source: 'ERP' });
+      if (reclass.totalModificados > 0) {
+        logger.info(`[ERPController] Reclasificación global ERP: ${reclass.totalModificados} CFDI(s) corregidos en ${ejercicio}/${periodo}`);
+      }
+      reclasificacion = {
+        totalCorregidos: reclass.totalModificados,
+        motivos:         reclass.resumen?.motivoConteo ?? {},
+        detalle:         reclass.modificadas ?? [],
+      };
+    } catch (reclassErr) {
+      logger.warn(`[ERPController] Reclasificación global ERP falló (no crítico): ${reclassErr.message}`);
+    }
+  }
+
+  // ── 7. Log de auditoría ────────────────────────────────────────────────────
   logger.info(
     `[ERPController] Carga completada | ejercicio=${ejercicio} periodo=${periodo} | ` +
     `recibidas=${facturas.length} guardadas=${guardadas} duplicadas=${duplicadas} omitidas=${omitidas} conErrores=${conErrores} | ` +
@@ -364,7 +385,7 @@ const cargar = asyncHandler(async (req, res) => {
     if (detalleErrores.length > 10) logger.warn(`  ... y ${detalleErrores.length - 10} más`);
   }
 
-  // ── 7. Respuesta ───────────────────────────────────────────────────────────
+  // ── 8. Respuesta ───────────────────────────────────────────────────────────
   return res.json({
     procesadas:   facturas.length,
     guardadas,
@@ -372,9 +393,13 @@ const cargar = asyncHandler(async (req, res) => {
     omitidas,
     conErrores,
     detalleErrores,
+    reclasificacion,
     message:
       `${facturas.length} facturas procesadas: ` +
-      `${guardadas} guardadas, ${duplicadas} duplicadas, ${omitidas} omitidas (Traslado), ${conErrores} con errores de campo.`,
+      `${guardadas} guardadas, ${duplicadas} duplicadas, ${omitidas} omitidas (Traslado), ${conErrores} con errores de campo.` +
+      (reclasificacion?.totalCorregidos > 0
+        ? ` ${reclasificacion.totalCorregidos} factura(s) global(es) reclasificadas por fecha de emisión.`
+        : ''),
   });
 });
 

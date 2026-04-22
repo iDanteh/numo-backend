@@ -1,0 +1,52 @@
+# ── Dependencias ──────────────────────────────────────────────────────────────
+# node_modules se instala DENTRO del contenedor con `npm ci`.
+# Nunca los copies: pesan cientos de MB, incluyen binarios compilados para
+# tu OS local (Windows/Mac) que no corren en Linux/Alpine.
+node_modules/
+
+# ── Variables de entorno y secretos ───────────────────────────────────────────
+# NUNCA incluyas credenciales reales en la imagen Docker.
+# Las variables se inyectan en tiempo de ejecución via docker-compose.yml o
+# variables de entorno del sistema.
+.env
+.env.*
+!.env.example
+
+# ── Certificados e.firma / FIEL ───────────────────────────────────────────────
+# Los certs se montan como volumen de solo lectura en producción.
+# Ver docker-compose.yml → volumes: ./certs:/app/certs:ro
+certs/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Tests y herramientas de desarrollo ────────────────────────────────────────
+# No incluyas código de pruebas ni configuración de jest en la imagen de prod.
+**/*.test.js
+**/*.spec.js
+jest.config.*
+coverage/
+.nyc_output/
+
+# ── Control de versiones ──────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Editor / IDE ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Documentación ─────────────────────────────────────────────────────────────
+*.md
+*.pdf
+docs/
+
+# ── Archivos temporales ───────────────────────────────────────────────────────
+tmp/
+temp/
+uploads/

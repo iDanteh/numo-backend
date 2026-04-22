@@ -5,18 +5,20 @@ const axios   = require('axios');
 const { authenticate, permit }    = require('../../shared/middleware/auth.real');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const ErpCuentaPendiente = require('./ErpCuentaPendiente.model');
+const ErpFacturaPago     = require('./ErpFacturaPago.model');
 const BankMovement       = require('../banks/BankMovement.model');
 
 const router = express.Router();
 
-const ERP_BASE_URL = (process.env.ERP_BASE_URL || '').replace(/\/$/, '');
+const ERP_CAJA_BASE_URL = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
+const ERP_FACT_BASE_URL = (process.env.ERP_FACT_BASE_URL || '').replace(/\/$/, '');
 const ERP_TOKEN    = process.env.ERP_TOKEN || '';
 
 // GET /api/erp/cuentas-pendientes
 // Parámetros: fechaDesde, fechaHasta, estadoCobro (opcional; 'pendiente' para solo pendientes)
 router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) => {
-  if (!ERP_BASE_URL) {
-    return res.status(503).json({ error: 'ERP no configurado (ERP_BASE_URL ausente)' });
+  if (!ERP_CAJA_BASE_URL) {
+    return res.status(503).json({ error: 'ERP no configurado (ERP_CAJA_BASE_URL ausente)' });
   }
 
   const { fechaDesde, fechaHasta, estadoCobro } = req.query;
@@ -24,7 +26,7 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
   const params = { fechaDesde, fechaHasta };
   if (estadoCobro) params.estadoCobro = estadoCobro;
 
-  const response = await axios.get(`${ERP_BASE_URL}/cuentas-pendientes`, {
+  const response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
     params,
     headers: { Authorization: `Bearer ${ERP_TOKEN}` },
     timeout: 15000,
@@ -89,6 +91,81 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
   res.json(cuentas);
 }));
 
+// GET /api/erp/facturas/reporte
+// Parámetros: fechaDesde, fechaHasta, tipo_comprobante (opcional)
+router.get('/reporte', authenticate, asyncHandler(async (req, res) => {
+  if (!ERP_FACT_BASE_URL) {
+    return res.status(503).json({ error: 'ERP no configurado (ERP_FACT_BASE_URL ausente)' });
+  }
+
+  const { fechaInicio, fechaFin, tipo_comprobante } = req.query;
+
+  // El ERP externo usa snake_case: fecha_inicio / fecha_fin
+  const params = { fecha_inicio: fechaInicio, fecha_fin: fechaFin };
+  if (tipo_comprobante) params.tipo_comprobante = tipo_comprobante;
+
+  const response = await axios.get(`${ERP_FACT_BASE_URL}/api/facturas/reporte`, {
+    params,
+    headers: { Authorization: `Bearer ${ERP_TOKEN}` },
+    timeout: 15000,
+  });
+
+  // El ERP devuelve PascalCase; el array puede estar en Data[] o Data.facturas[]
+  const dataPayload = response.data?.Data ?? response.data ?? [];
+  const raw = Array.isArray(dataPayload)
+    ? dataPayload
+    : (dataPayload.facturas ?? dataPayload.Facturas ?? []);
+  const now = new Date();
+
+  // Upsert idempotente: cada factura se identifica por su ID del ERP (PascalCase)
+  if (raw.length > 0) {
+    await Promise.all(raw.map(f => ErpFacturaPago.updateOne(
+      { erpId: f.ID },
+      {
+        $set: {
+          erpId:            f.ID,
+          uuid:             f.UUID             ?? null,
+          tipoComprobante:  f.TipoComprobante  ?? null,
+          serie:            f.Serie            ?? null,
+          folio:            f.Folio            ?? null,
+          subtotal:         f.Subtotal         ?? null,
+          totalIva:         f.TotalIVA         ?? null,
+          totalRetenciones: f.TotalRetenciones ?? null,
+          importe:          f.Importe          ?? null,
+          metodoPago:       f.MetodoPago       ?? null,
+          fechaPago:        f.FechaPago        ?? null,
+          fechaTimbrado:    f.FechaTimbrado    ?? null,
+          estatus:          f.Estatus          ?? null,
+          relaciones: (f.Relaciones ?? []).map(r => ({
+            tipoRelacion: r.TipoRelacion ?? null,
+            uuid:         r.UUID         ?? null,
+          })),
+          lastSeenAt: now,
+        },
+      },
+      { upsert: true }
+    )));
+  }
+
+  const facturas = raw.map(f => ({
+    id:               f.ID,
+    uuid:             f.UUID             ?? null,
+    tipoComprobante:  f.TipoComprobante  ?? null,
+    serie:            f.Serie            ?? null,
+    folio:            f.Folio            ?? null,
+    subtotal:         f.Subtotal         ?? null,
+    totalIva:         f.TotalIVA         ?? null,
+    totalRetenciones: f.TotalRetenciones ?? null,
+    importe:          f.Importe          ?? null,
+    metodoPago:       f.MetodoPago       ?? null,
+    fechaPago:        f.FechaPago        ?? null,
+    fechaTimbrado:    f.FechaTimbrado    ?? null,
+    estatus:          f.Estatus          ?? null,
+  }));
+
+  res.json(facturas);
+}));
+
 // POST /api/erp/match/revert
 // Deshace todas las asociaciones realizadas por el motor automático (userId: 'erp-auto').
 // Restaura erpIds, erpLinks, saldoErp, uuidXML y status a su estado original.
@@ -102,7 +179,7 @@ router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(as
         saldoErp: null,
         uuidXML:  null,
         status:   'no_identificado',
-        identificadoPor: { userId: null, nombre: null, fechaId: null },
+        identificadoPor: [],
       },
     },
   );

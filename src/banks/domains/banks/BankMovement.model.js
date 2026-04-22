@@ -57,7 +57,7 @@ const bankMovementSchema = new mongoose.Schema({
       erpId:       { type: String, required: true },
       saldoActual: { type: Number, default: 0 },
       folioFiscal: { type: String, default: null },
-      total:      { type: Number, default: null },
+      total:       { type: Number, default: null },
     }],
     default: [],
   },
@@ -72,11 +72,17 @@ const bankMovementSchema = new mongoose.Schema({
   // volver a cargar el mismo archivo.
   hash: { type: String },
 
-  // Usuario que cambió el status a 'identificado'; se limpia en cualquier otro status
+  // Historial de usuarios que han relacionado una CxC a este movimiento.
+  // Cada entrada representa una asociación (userId + CxC específica).
+  // Se añade al vincular una CxC nueva y se elimina al desvincularla.
   identificadoPor: {
-    userId:  { type: String, default: null },
-    nombre:  { type: String, default: null },
-    fechaId: { type: Date,   default: null },
+    type: [{
+      userId:  { type: String, default: null },
+      nombre:  { type: String, default: null },
+      fechaId: { type: Date,   default: null },
+      erpId:   { type: String, default: null },  // CxC que este usuario asoció
+    }],
+    default: [],
   },
 
   // Auditoría

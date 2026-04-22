@@ -16,6 +16,7 @@ const satJobCheckpointSchema = new mongoose.Schema({
   idSolicitud:         { type: String, default: null },
   idsPaquetes:         [String],                         // lista completa del SAT
   paquetesProcesados:  [String],                         // los ya descargados y guardados
+  totalReportadoSAT:   { type: Number, default: 0 },     // NumeroCFDIs de verificación
 
   status: {
     type: String,

@@ -9,6 +9,7 @@ const {
   list, getById, getXml,
   upload, importExcel, importFromErpApi,
   create, compare, remove, exportExcel,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo,
 } = require('../controllers/cfdi.controller');
 
 const router = express.Router();
@@ -48,6 +49,16 @@ const handleXmlUpload = (req, res, next) => {
   });
 };
 
+router.get('/', authenticate, listLimiter, list);
+router.get('/export', authenticate, exportExcel);
+
+// ── Reclasificación Global — deben ir ANTES de /:id para evitar conflicto ────
+router.get('/reclasificacion-global/plan',    authenticate, authorize('admin', 'contador'), planReclasificacionGlobal);
+router.post('/reclasificacion-global/aplicar', authenticate, authorize('admin', 'contador'), aplicarReclasificacionGlobal);
+
+router.get('/:id/xml', authenticate, getXml);
+router.get('/:id', authenticate, getById);
+router.patch('/:id/migrar-periodo', authenticate, authorize('admin', 'contador'), migrarPeriodo);
 // ── Lectura ───────────────────────────────────────────────────────────────────
 router.get('/',          authenticate, listLimiter, list);
 router.get('/export',    authenticate, exportExcel);

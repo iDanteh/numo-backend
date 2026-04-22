@@ -39,7 +39,21 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
 
   // ── 1. Buscar copia local SAT (siempre, independiente del live check) ──
   // Busca en source='SAT' y también 'MANUAL' (portal SAT descargado manualmente)
-  const satCfdi = await CFDI.findOne({ uuid: erpCfdi.uuid, source: { $in: ['SAT', 'MANUAL'] } });
+  // Se restringe al mismo ejercicio/periodo del CFDI ERP para evitar que una copia SAT
+  // en un periodo diferente (ej. factura global sin informacionGlobal, no reclasificada)
+  // se empareje incorrectamente con un CFDI ERP que está en el periodo contable correcto.
+  const satCfdiQuery = { uuid: erpCfdi.uuid, source: { $in: ['SAT', 'MANUAL'] } };
+  // Filtrar por periodo cuando el ERP CFDI tiene campos explícitos: evita que un CFDI SAT
+  // en un periodo distinto (ej. factura global sin informacionGlobal, no reclasificada)
+  // sea emparejado incorrectamente con el ERP que ya tiene el periodo contable correcto.
+  // El OR incluye CFDIs SAT legacy que no tienen esos campos para compatibilidad.
+  if (erpCfdi.ejercicio != null && erpCfdi.periodo != null) {
+    satCfdiQuery.$or = [
+      { ejercicio, periodo },
+      { ejercicio: { $exists: false } },
+    ];
+  }
+  const satCfdi = await CFDI.findOne(satCfdiQuery);
 
   // ── 2. Live check SAT (best-effort, no bloquea la comparación local) ──
   // RFC válido: 12-13 caracteres alfanuméricos (empresas 12, personas físicas 13)
@@ -546,6 +560,12 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
     hasLocalSATCopy: true,
     ejercicio,
     periodo,
+  });
+
+  // Actualizar el documento CFDI SAT para que los filtros por lastComparisonStatus funcionen
+  await CFDI.findByIdAndUpdate(satCfdiId, {
+    lastComparisonStatus: 'not_in_erp',
+    lastComparisonAt: new Date(),
   });
 
   // Eliminar discrepancias abiertas previas del mismo UUID para evitar duplicados

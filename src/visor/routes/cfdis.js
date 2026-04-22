@@ -52,7 +52,8 @@ const handleXmlUpload = (req, res, next) => {
 router.get('/',       authenticate, listLimiter, list);
 router.get('/export', authenticate, exportExcel);
 
-router.get('/reclasificacion-global/plan', authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
+router.get('/reclasificacion-global/plan',    authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
+router.post('/reclasificacion-global/aplicar', authenticate, permit('admin', 'contador'), aplicarReclasificacionGlobal);
 
 router.post('/migrar-periodo-bulk',        authenticate, permit('admin', 'contador'), migrarPeriodoBulk);
 router.post('/upload',                     authenticate, permit('visor:write'), handleXmlUpload, upload);

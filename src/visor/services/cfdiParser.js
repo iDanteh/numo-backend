@@ -29,6 +29,7 @@ const parseCFDI = async (xmlString) => {
   const impuestosNode = comprobante['cfdi:Impuestos'] || comprobante['Impuestos'] || {};
   const timbreNode = getTimbre(comprobante);
   const complementoPago = getComplementoPago(comprobante);
+  const informacionGlobalNode = comprobante['cfdi:InformacionGlobal'] || comprobante['InformacionGlobal'] || null;
 
   const cfdiData = {
     uuid: timbreNode?.UUID || timbreNode?.['$']?.UUID || null,
@@ -80,11 +81,37 @@ const parseCFDI = async (xmlString) => {
       version: timbreNode.Version,
     } : null,
 
+    informacionGlobal: informacionGlobalNode ? {
+      periodicidad: informacionGlobalNode.Periodicidad || null,
+      // SAT usa "Meses"; algunas variantes usan "Mes"
+      mes:  informacionGlobalNode.Meses || informacionGlobalNode.Mes || null,
+      // SAT usa "Año" (con Ñ); el ERP usa "Anio" o "Ano"
+      anio: informacionGlobalNode['Año'] || informacionGlobalNode.Anio || informacionGlobalNode.Ano || null,
+    } : null,
+
     xmlContent: xmlString,
     xmlHash: crypto.createHash('sha256').update(xmlString).digest('hex'),
   };
 
-  if (complementoPago) cfdiData.complementoPago = complementoPago;
+  if (complementoPago) {
+    cfdiData.complementoPago = complementoPago;
+
+    // Para CFDIs de Pago (tipo 'P'), el IVA no está en cfdi:Impuestos raíz
+    // sino en pago20:Totales. Lo mapeamos al campo impuestos estándar.
+    if (attrs.TipoDeComprobante === 'P' && complementoPago.totales) {
+      const t = complementoPago.totales;
+      const ivaTrasladadoPago =
+        (t.totalTrasladosImpuestoIVA16 || 0) +
+        (t.totalTrasladosImpuestoIVA8  || 0);
+      const ivaRetenidoPago = t.totalRetencionesImpuestoIVA || 0;
+      if (ivaTrasladadoPago !== 0 || ivaRetenidoPago !== 0) {
+        cfdiData.impuestos = {
+          totalImpuestosTrasladados: ivaTrasladadoPago,
+          totalImpuestosRetenidos:   ivaRetenidoPago,
+        };
+      }
+    }
+  }
 
   if (!cfdiData.uuid) {
     throw new Error('CFDI sin UUID (TimbreFiscalDigital no encontrado o UUID vacío)');
@@ -117,8 +144,17 @@ const getComplementoPago = (comprobante) => {
 
     // Totales (solo pago20)
     const totalesNode = pagosNode['pago20:Totales'] || pagosNode['Totales'] || null;
+    const totalesAttrs = totalesNode?.['$'] ?? totalesNode ?? {};
     const totales = totalesNode
-      ? { montoTotalPagos: parseFloat(totalesNode['$']?.MontoTotalPagos ?? totalesNode.MontoTotalPagos) || 0 }
+      ? {
+          montoTotalPagos:              parseFloat(totalesAttrs.MontoTotalPagos)              || 0,
+          totalTrasladosBaseIVA16:      parseFloat(totalesAttrs.TotalTrasladosBaseIVA16)      || 0,
+          totalTrasladosImpuestoIVA16:  parseFloat(totalesAttrs.TotalTrasladosImpuestoIVA16)  || 0,
+          totalTrasladosBaseIVA8:       parseFloat(totalesAttrs.TotalTrasladosBaseIVA8)       || 0,
+          totalTrasladosImpuestoIVA8:   parseFloat(totalesAttrs.TotalTrasladosImpuestoIVA8)   || 0,
+          totalRetencionesImpuestoIVA:  parseFloat(totalesAttrs.TotalRetencionesImpuestoIVA)  || 0,
+          totalRetencionesImpuestoISR:  parseFloat(totalesAttrs.TotalRetencionesImpuestoISR)  || 0,
+        }
       : undefined;
 
     // Pagos individuales

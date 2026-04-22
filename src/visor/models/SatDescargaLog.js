@@ -17,13 +17,16 @@ const satDescargaLogSchema = new mongoose.Schema({
   estado:          { type: String, enum: ['en_proceso', 'completado', 'error'], default: 'en_proceso' },
   error:           { type: String, default: null },
   // Resultados de la descarga
-  totalSAT:    { type: Number, default: 0 },
-  totalERP:    { type: Number, default: 0 },
-  coinciden:   { type: Number, default: 0 },
-  soloSAT:     { type: Number, default: 0 },
-  soloERP:     { type: Number, default: 0 },
-  diferencias: { type: Number, default: 0 },
-  paquetes:    { type: Number, default: 0 },
+  totalSAT:          { type: Number, default: 0 },
+  totalERP:          { type: Number, default: 0 },
+  coinciden:         { type: Number, default: 0 },
+  soloSAT:           { type: Number, default: 0 },
+  soloERP:           { type: Number, default: 0 },
+  diferencias:       { type: Number, default: 0 },
+  paquetes:          { type: Number, default: 0 },
+  // Detección de descarga incompleta
+  totalReportadoSAT: { type: Number, default: 0 }, // NumeroCFDIs reportado por SAT en verificación
+  incompleta:        { type: Boolean, default: false }, // true si se descargó <95% de lo reportado
   inicio: { type: Date, default: Date.now },
   fin:    { type: Date },
 }, { collection: 'sat_descarga_logs', timestamps: false });

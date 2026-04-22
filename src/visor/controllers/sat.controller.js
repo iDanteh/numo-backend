@@ -235,7 +235,9 @@ const startDownload = asyncHandler(async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-  const { rfc, fechaInicio, fechaFin, tipoComprobante = 'Emitidos' } = req.body;
+  const { rfc, fechaInicio, fechaFin, tipoComprobante = 'Emitidos', tipoSolicitud } = req.body;
+  // Pasar null si el frontend no envía modo — deja que procesarDescarga aplique el auto-select por rango.
+  const modoSolicitud = tipoSolicitud === 'CFDI' ? 'CFDI' : tipoSolicitud === 'Metadata' ? 'Metadata' : null;
   const ejercicio = parseInt(req.body.ejercicio, 10);
   const periodo   = parseInt(req.body.periodo,   10);
   const rfcNorm   = rfc.toUpperCase().trim();
@@ -277,14 +279,21 @@ const startDownload = asyncHandler(async (req, res) => {
     });
   }
 
+  // ── Solicitudes SAT necesarias ────────────────────────────────────────────
+  // Modo CFDI + Emitidos: se divide en 5 solicitudes (Ingresos, Egresos, Pagos, Nomina, Traslados).
+  // Modo Metadata o tipos específicos: 1 solicitud.
+  const solicitudesNecesarias = (modoSolicitud === 'CFDI' && tipoComprobante === 'Emitidos') ? 5 : 1;
+  // ──────────────────────────────────────────────────────────────────────────
+
   // ── Validar límites SAT antes de iniciar el job ────────────────────────────
-  const limitCheck = await puedeIniciar(rfcNorm);
+  const limitCheck = await puedeIniciar(rfcNorm, solicitudesNecesarias);
   if (!limitCheck.puede) {
-    logger.warn(`[SAT] Descarga bloqueada por límite (${limitCheck.codigo}) para RFC ${rfcNorm}`);
+    logger.warn(`[SAT] Descarga bloqueada por límite (${limitCheck.codigo}) para RFC ${rfcNorm} — necesita ${solicitudesNecesarias} solicitud(es)`);
     return res.status(429).json({
-      error:   limitCheck.razon,
-      codigo:  limitCheck.codigo,
-      limites: await getEstado(rfcNorm),
+      error:              limitCheck.razon,
+      codigo:             limitCheck.codigo,
+      solicitudesNecesarias,
+      limites:            await getEstado(rfcNorm),
     });
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -301,11 +310,11 @@ const startDownload = asyncHandler(async (req, res) => {
     paso: 0,  // progreso real: 0=credenciales, 1=autenticando, 3=verificando, 4=descargando, 5=procesando
   });
 
-  // Registrar solicitud activa ANTES de lanzar el async (el contador debe
-  // reflejarse de inmediato para que otras peticiones concurrentes lo vean)
-  await registrarInicio(rfcNorm);
+  // Registrar solicitudes ANTES de lanzar el async.
+  // Se registran todas las solicitudes SAT que se harán (1 o 5 para splits).
+  await registrarInicio(rfcNorm, solicitudesNecesarias);
 
-  logger.info(`[SAT] Job manual ${jobId} iniciado | rfc=${rfcNorm} fi=${fi} ff=${ff} tipo=${tipoComprobante} periodo=${ejercicio}/${periodo}`);
+  logger.info(`[SAT] Job manual ${jobId} iniciado | rfc=${rfcNorm} fi=${fi} ff=${ff} tipo=${tipoComprobante} modo=${modoSolicitud} periodo=${ejercicio}/${periodo}`);
   res.status(202).json({ message: 'Descarga iniciada', jobId, rfc: rfcNorm });
 
   // ── Job async con limpieza garantizada en finally ──────────────────────────
@@ -320,6 +329,7 @@ const startDownload = asyncHandler(async (req, res) => {
         fechaInicio: fi,
         fechaFin:    ff,
         tipoComprobante,
+        tipoSolicitud: modoSolicitud,
         creds,
         ayer: new Date(fi),
         ejercicio,

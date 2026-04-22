@@ -9,6 +9,8 @@ const { verifyCFDIWithSAT } = require('../services/satVerification');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { normalizeSource } = require('../utils/validators');
 const { paginate, skip } = require('../utils/pagination');
+const { generarPlan, aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
+const Comparison = require('../models/Comparison');
 
 const TIPOS_COMPROBANTE = {
   ingreso: 'I', egreso: 'E', traslado: 'T',
@@ -115,9 +117,61 @@ const list = asyncHandler(async (req, res) => {
       filter.fecha.$lt = fin;
     }
   }
-  if (ejercicio)             filter.ejercicio             = parseInt(ejercicio);
-  if (periodo)               filter.periodo               = parseInt(periodo);
-  if (lastComparisonStatus)  filter.lastComparisonStatus  = lastComparisonStatus;
+  const ej = ejercicio ? parseInt(ejercicio) : null;
+  const pe = periodo   ? parseInt(periodo)   : null;
+  if (ej) filter.ejercicio = ej;
+  if (pe) filter.periodo   = pe;
+
+  if (lastComparisonStatus) {
+    if (lastComparisonStatus === 'migrar') {
+      // 1. Buscar SAT/MANUAL con 'match' (filtrar por periodo/ejercicio si el usuario los seleccionó)
+      const matchSatCfdis = await CFDI.find(
+        { source: { $in: ['SAT', 'MANUAL'] }, lastComparisonStatus: 'match', isActive: true,
+          ...(ej ? { ejercicio: ej } : {}), ...(pe ? { periodo: pe } : {}) },
+        'uuid _id ejercicio periodo'
+      ).lean();
+
+      // 2. Buscar contrapartes ERP por UUID SIN filtro de periodo/ejercicio.
+      //    Así detectamos cross-period aunque el usuario no tenga un periodo seleccionado,
+      //    comparando directamente los campos ejercicio/periodo de cada par SAT↔ERP.
+      let crossPeriodIds = [];
+      if (matchSatCfdis.length > 0) {
+        const uuids = matchSatCfdis.map(c => c.uuid);
+        const erpCounterparts = await CFDI.find(
+          { source: 'ERP', uuid: { $in: uuids }, isActive: true },
+          'uuid ejercicio periodo'
+        ).lean();
+
+        // Mapa uuid → { ejercicio, periodo } del ERP
+        const erpMap = new Map();
+        for (const erp of erpCounterparts) {
+          erpMap.set(erp.uuid.toUpperCase(), erp);
+        }
+
+        crossPeriodIds = matchSatCfdis
+          .filter(sat => {
+            const erp = erpMap.get(sat.uuid.toUpperCase());
+            if (!erp) return true; // Sin contraparte ERP (status 'match' obsoleto)
+            return erp.ejercicio !== sat.ejercicio || erp.periodo !== sat.periodo;
+          })
+          .map(c => c._id);
+      }
+
+      // 3. $or: factura global SAT not_in_erp ó match cross-period
+      // Restringimos not_in_erp solo a facturas globales (con InformacionGlobal)
+      // para excluir Traslados y otros tipos que no son candidatos a migración.
+      filter.source = { $in: ['SAT', 'MANUAL'] };
+      filter.$or = [
+        {
+          lastComparisonStatus: 'not_in_erp',
+          'informacionGlobal.mes': { $exists: true, $ne: null },
+        },
+        ...(crossPeriodIds.length ? [{ _id: { $in: crossPeriodIds } }] : []),
+      ];
+    } else {
+      filter.lastComparisonStatus = lastComparisonStatus;
+    }
+  }
   if (search) filter.$text = { $search: search };
 
   const [cfdis, total] = await Promise.all([
@@ -861,4 +915,232 @@ const exportExcel = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel };
+// ── Reclasificación Global ────────────────────────────────────────────────────
+
+/**
+ * GET /api/cfdis/reclasificacion-global/plan
+ * Genera el plan de reclasificación SIN modificar datos.
+ * Query params: ejercicio, periodo, rfc, source
+ */
+const planReclasificacionGlobal = asyncHandler(async (req, res) => {
+  const { ejercicio, periodo, rfc, source, mesIG } = req.query;
+  const plan = await generarPlan({
+    ejercicio: ejercicio ? Number(ejercicio) : undefined,
+    periodo:   periodo   ? Number(periodo)   : undefined,
+    rfc:       rfc       || undefined,
+    source:    source    || undefined,
+    mesIG:     mesIG     ? Number(mesIG)     : undefined,
+  });
+  res.json({ success: true, data: plan });
+});
+
+/**
+ * POST /api/cfdis/reclasificacion-global/aplicar
+ * Aplica la reclasificación. Requiere { confirmar: true } en el body.
+ * Body: { ejercicio, periodo, rfc, source, confirmar }
+ */
+const aplicarReclasificacionGlobal = asyncHandler(async (req, res) => {
+  const { ejercicio, periodo, rfc, source, confirmar } = req.body;
+
+  if (!confirmar) {
+    return res.status(400).json({
+      success: false,
+      error:   'Debes enviar { confirmar: true } para ejecutar la reclasificación. Primero genera el plan con GET /plan.',
+    });
+  }
+
+  const resultado = await aplicarReclasificacion({
+    ejercicio: ejercicio ? Number(ejercicio) : undefined,
+    periodo:   periodo   ? Number(periodo)   : undefined,
+    rfc:       rfc       || undefined,
+    source:    source    || undefined,
+  });
+
+  res.json({ success: true, data: resultado });
+});
+
+/**
+ * POST /api/cfdis/migrar-periodo-bulk
+ * Migra varios CFDIs SAT/MANUAL al mismo periodo/ejercicio en una sola llamada.
+ * Body: { ids: string[], ejercicio: number, periodo: number }
+ */
+const migrarPeriodoBulk = asyncHandler(async (req, res) => {
+  const { ids, ejercicio, periodo } = req.body;
+
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'Se requiere un arreglo de IDs.' });
+  }
+  if (!ejercicio || !periodo) {
+    return res.status(400).json({ error: 'Se requieren ejercicio y periodo.' });
+  }
+
+  const ej = parseInt(ejercicio, 10);
+  const pe = parseInt(periodo,   10);
+
+  if (isNaN(ej) || ej < 2000 || ej > 2100) return res.status(400).json({ error: 'Ejercicio inválido.' });
+  if (isNaN(pe) || pe < 1    || pe > 12)   return res.status(400).json({ error: 'Periodo inválido (1-12).' });
+
+  // 1. Obtener todos los CFDIs SAT/MANUAL de la lista
+  const cfdis = await CFDI.find(
+    { _id: { $in: ids }, source: { $in: ['SAT', 'MANUAL'] }, isActive: true },
+    'uuid ejercicio periodo lastComparisonStatus informacionGlobal xmlContent'
+  ).select('+xmlContent').lean();
+
+  // 2. Pre-cargar contrapartes ERP para los que tienen status 'match' sin InformacionGlobal
+  const matchUuids = cfdis
+    .filter(c => c.lastComparisonStatus === 'match' && !c.informacionGlobal?.mes)
+    .map(c => c.uuid);
+
+  const erpMap = new Map();
+  if (matchUuids.length > 0) {
+    const erpCfdis = await CFDI.find(
+      { source: 'ERP', uuid: { $in: matchUuids }, isActive: true },
+      'uuid ejercicio periodo informacionGlobal xmlContent'
+    ).select('+xmlContent').lean();
+    for (const erp of erpCfdis) erpMap.set(erp.uuid.toUpperCase(), erp);
+  }
+
+  // 3. Validar cada CFDI y separar migrables de fallidos
+  const uuidsMigrar = [];
+  const migrados    = [];
+  const fallidos    = [];
+
+  for (const cfdi of cfdis) {
+    const tieneInfoGlobal = cfdi.informacionGlobal?.mes ||
+      (cfdi.xmlContent && /InformacionGlobal/i.test(cfdi.xmlContent));
+
+    let erpEsFG = false;
+    if (!tieneInfoGlobal && cfdi.lastComparisonStatus === 'match') {
+      const erp = erpMap.get(cfdi.uuid.toUpperCase());
+      if (erp) {
+        const erpDistintoPeriodo = erp.ejercicio !== cfdi.ejercicio || erp.periodo !== cfdi.periodo;
+        const erpTieneIG = erp.informacionGlobal?.mes ||
+          (erp.xmlContent && /InformacionGlobal/i.test(erp.xmlContent));
+        erpEsFG = erpDistintoPeriodo && erpTieneIG;
+      }
+    }
+
+    if (!tieneInfoGlobal && !erpEsFG) {
+      fallidos.push({ id: String(cfdi._id), uuid: cfdi.uuid, error: 'No es factura global ni su match ERP lo es.' });
+      continue;
+    }
+
+    uuidsMigrar.push(cfdi.uuid);
+    migrados.push({ id: String(cfdi._id), uuid: cfdi.uuid });
+  }
+
+  // 4. Actualizar en bulk (2 queries, sin N+1)
+  if (uuidsMigrar.length > 0) {
+    await CFDI.updateMany(
+      { uuid: { $in: uuidsMigrar } },
+      { $set: { periodo: pe, ejercicio: ej } }
+    );
+    await Comparison.updateMany(
+      { uuid: { $in: uuidsMigrar } },
+      { $set: { periodo: pe, ejercicio: ej } }
+    );
+  }
+
+  const logger = require('../utils/logger').logger;
+  logger.info(
+    `[MigrarPeriodoBulk] ${migrados.length} CFDI(s) migrados → ${ej}/${pe} por usuario ${req.user._id}`
+  );
+
+  res.json({
+    success: true,
+    migrados: migrados.length,
+    fallidos: fallidos.length,
+    ...(fallidos.length > 0 && { detalleFallidos: fallidos }),
+  });
+});
+
+/**
+ * PATCH /api/cfdis/:id/migrar-periodo
+ * Mueve una factura global SAT/MANUAL a un periodo/ejercicio diferente.
+ * Solo aplica a CFDIs con source SAT o MANUAL que tengan InformacionGlobal.
+ * Body: { ejercicio: number, periodo: number }
+ */
+const migrarPeriodo = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { ejercicio, periodo } = req.body;
+
+  if (!ejercicio || !periodo) {
+    return res.status(400).json({ error: 'Se requieren ejercicio y periodo.' });
+  }
+
+  const ej = parseInt(ejercicio, 10);
+  const pe = parseInt(periodo,   10);
+
+  if (isNaN(ej) || ej < 2000 || ej > 2100) {
+    return res.status(400).json({ error: 'Ejercicio inválido.' });
+  }
+  if (isNaN(pe) || pe < 1 || pe > 12) {
+    return res.status(400).json({ error: 'Periodo inválido (1-12).' });
+  }
+
+  const cfdi = await CFDI.findById(id).select('+xmlContent');
+  if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado.' });
+
+  if (!['SAT', 'MANUAL'].includes(cfdi.source)) {
+    return res.status(400).json({ error: 'Solo se pueden migrar CFDIs de origen SAT o MANUAL.' });
+  }
+
+  // Caso 1: el propio CFDI SAT tiene InformacionGlobal → siempre permitido
+  const tieneInfoGlobal = cfdi.informacionGlobal?.mes ||
+    (cfdi.xmlContent && /InformacionGlobal/i.test(cfdi.xmlContent));
+
+  // Caso 2: el CFDI SAT tiene 'match' con un CFDI ERP que es factura global y está en otro periodo
+  let erpEsFG = false;
+  if (!tieneInfoGlobal && cfdi.lastComparisonStatus === 'match') {
+    const erpMatch = await CFDI.findOne(
+      { uuid: cfdi.uuid, source: 'ERP', isActive: true },
+      'ejercicio periodo informacionGlobal xmlContent'
+    ).select('+xmlContent');
+
+    if (erpMatch) {
+      const erpDistintoPeriodo = erpMatch.ejercicio !== cfdi.ejercicio || erpMatch.periodo !== cfdi.periodo;
+      const erpTieneIG = erpMatch.informacionGlobal?.mes ||
+        (erpMatch.xmlContent && /InformacionGlobal/i.test(erpMatch.xmlContent));
+      erpEsFG = erpDistintoPeriodo && erpTieneIG;
+    }
+  }
+
+  if (!tieneInfoGlobal && !erpEsFG) {
+    return res.status(400).json({ error: 'El CFDI no es una factura global ni su match ERP lo es.' });
+  }
+
+  const periodoAnterior  = cfdi.periodo;
+  const ejercicioAnterior = cfdi.ejercicio;
+
+  // Actualizar CFDI (ambos documentos SAT y ERP con mismo UUID si existen)
+  await CFDI.updateMany(
+    { uuid: cfdi.uuid },
+    { $set: { periodo: pe, ejercicio: ej } },
+  );
+
+  // Actualizar todos los Comparison records del mismo UUID
+  await Comparison.updateMany(
+    { uuid: cfdi.uuid },
+    { $set: { periodo: pe, ejercicio: ej } },
+  );
+
+  const logger = require('../utils/logger').logger;
+  logger.info(
+    `[MigrarPeriodo] UUID ${cfdi.uuid} migrado de ${ejercicioAnterior}/${periodoAnterior} ` +
+    `→ ${ej}/${pe} por usuario ${req.user._id}`,
+  );
+
+  res.json({
+    success: true,
+    uuid: cfdi.uuid,
+    periodoAnterior,
+    ejercicioAnterior,
+    periodoNuevo:   pe,
+    ejercicioNuevo: ej,
+  });
+});
+
+module.exports = {
+  list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo,
+};

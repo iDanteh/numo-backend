@@ -5,9 +5,16 @@ const SatRateLimit = require('../models/SatRateLimit');
 /**
  * Control de límites de Descarga Masiva SAT por RFC.
  *
- * Límites oficiales del SAT:
- *  - 10 solicitudes por RFC por día calendario (reinicio a medianoche CDMX)
- *  - 3 solicitudes activas simultáneas por RFC
+ * Límites del SAT Web Service (según documentación oficial):
+ *  - NO existe un límite diario documentado para solicitudes del WS.
+ *    Los errores relevantes son:
+ *      5002 — "Se agotó las solicitudes de por vida" (límite vitalicio por RFC+fechas+tipo)
+ *      5005 — Solicitud duplicada (ya existe una activa con los mismos parámetros)
+ *      5011 — Límite de descargas por folio por día (en la etapa de descarga de paquetes)
+ *    Empíricamente se reportan ~10 solicitudes/día antes de recibir 5002/throttling.
+ *  - Máximo 2 descargas por paquete (error 5008 al exceder).
+ *  - Los paquetes vencen a las 72 horas (error 5007/5006).
+ *  - Hasta 200,000 CFDIs por solicitud XML; hasta 1,000,000 registros por solicitud Metadata.
  *
  * Estrategia híbrida:
  *  - El Map en memoria es la fuente primaria (sin latencia).
@@ -17,7 +24,7 @@ const SatRateLimit = require('../models/SatRateLimit');
  *    las descargas anteriores ya terminaron.
  */
 
-const MAX_DIARIO  = 10;
+const MAX_DIARIO  = 10; // Límite empírico conservador; la documentación oficial no especifica límite diario para WS
 const MAX_ACTIVOS = 3;
 
 // Map<rfc, { fecha: 'YYYY-MM-DD', solicitudes: number, activas: number }>
@@ -66,17 +73,24 @@ const _persistir = (rfc, solicitudes) => {
 };
 
 /**
- * Verifica si el RFC puede iniciar una nueva solicitud.
- * @returns {Promise<{ puede: boolean, razon?: string, codigo?: string }>}
+ * Verifica si el RFC puede iniciar `count` solicitudes SAT nuevas.
+ * @param {string} rfc
+ * @param {number} [count=1]  — Cuántas solicitudes SAT se harán (1 o 5 para splits por subtipo).
+ * @returns {Promise<{ puede: boolean, razon?: string, codigo?: string, disponibles?: number, necesarias?: number }>}
  */
-const puedeIniciar = async (rfc) => {
+const puedeIniciar = async (rfc, count = 1) => {
   const entry = await _get(rfc);
 
-  if (entry.solicitudes >= MAX_DIARIO) {
+  if (entry.solicitudes + count > MAX_DIARIO) {
+    const disponibles = Math.max(0, MAX_DIARIO - entry.solicitudes);
     return {
-      puede:  false,
-      razon:  `Límite diario alcanzado: ${entry.solicitudes}/${MAX_DIARIO} solicitudes hoy para RFC ${rfc}. El contador se reinicia a medianoche.`,
-      codigo: 'LIMITE_DIARIO',
+      puede:      false,
+      razon:      disponibles === 0
+        ? `Límite diario alcanzado: ${entry.solicitudes}/${MAX_DIARIO} solicitudes hoy para RFC ${rfc}. El contador se reinicia a medianoche.`
+        : `Solicitudes insuficientes: esta descarga necesita ${count} pero solo quedan ${disponibles} de ${MAX_DIARIO} para RFC ${rfc} hoy.`,
+      codigo:     'LIMITE_DIARIO',
+      disponibles,
+      necesarias: count,
     };
   }
 
@@ -91,10 +105,14 @@ const puedeIniciar = async (rfc) => {
   return { puede: true };
 };
 
-/** Registra el inicio de una solicitud (incrementa ambos contadores y persiste). */
-const registrarInicio = async (rfc) => {
+/**
+ * Registra el inicio de un job (incrementa `activas` en 1 y `solicitudes` en `count`).
+ * @param {string} rfc
+ * @param {number} [count=1]  — Cuántas solicitudes SAT consume este job.
+ */
+const registrarInicio = async (rfc, count = 1) => {
   const entry = await _get(rfc);
-  entry.solicitudes++;
+  entry.solicitudes += count;
   entry.activas++;
   _persistir(rfc, entry.solicitudes);
 };

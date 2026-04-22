@@ -21,8 +21,7 @@
 
 const CFDI       = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
-const { logger } = require('../utils/logger');
-
+const logger = require('../../shared/utils/logger');
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**

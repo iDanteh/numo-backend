@@ -1,6 +1,5 @@
 const express = require('express');
-const { authenticate } = require('../middleware/auth');
-const { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas } = require('../controllers/report.controller');
+const { authenticate, permit } = require('../../shared/middleware/auth');const { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas } = require('../controllers/report.controller');
 
 const router = express.Router();
 

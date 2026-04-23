@@ -29,11 +29,11 @@ const config  = require('../src/config/env');
 // ── Parámetros ────────────────────────────────────────────────────────────────
 const CARPETA  = process.argv[2];
 const SOURCE   = 'SAT';
-const EJERCICIO = 2025;
+const EJERCICIO = 2026;
 const PERIODO   = 3;          // Marzo — se aplica solo si el XML no tiene InformacionGlobal
 
 if (!CARPETA) {
-  console.error('\n  Uso: node scripts/migrar-xml-marzo.js <ruta-a-carpeta>\n');
+  console.error('\n Uso: node scripts/migrar-xml-marzo.js <\\\\10.0.1.12\\RecolectorXML\\CCO011113663\\Emitidas\\2026\\02>\n');
   process.exit(1);
 }
 

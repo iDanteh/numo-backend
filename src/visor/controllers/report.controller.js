@@ -132,19 +132,25 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: cfdiFilter },
       { $group: { _id: '$satStatus', count: { $sum: 1 }, totalAmount: { $sum: '$total' } } },
     ]),
-    Comparison.aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } } },
+    // Leer de CFDI.lastComparisonStatus (siempre refleja el resultado más reciente).
+    // La colección Comparison acumula registros históricos de sesiones batch y no
+    // es confiable para contar el estado actual — un CFDI puede tener múltiples
+    // registros Comparison de distintas sesiones con estados contradictorios.
+    CFDI.aggregate([
+      { $match: { isActive: { $ne: false }, uuid: { $not: /^SINUUID/ }, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }), ...(periodoFilter.tipoDeComprobante && { tipoDeComprobante: periodoFilter.tipoDeComprobante }) } },
+      { $group: { _id: '$lastComparisonStatus', count: { $sum: 1 } } },
     ]),
     Discrepancy.aggregate([
+      { $match: { ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) } },
       { $group: { _id: '$severity', count: { $sum: 1 }, fiscalImpact: { $sum: '$fiscalImpact.amount' } } },
     ]),
     Discrepancy.aggregate([
-      { $match: { status: 'open' } },
+      { $match: { status: 'open', ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) } },
       { $group: { _id: '$type', count: { $sum: 1 } } },
       { $sort: { count: -1 } },
       { $limit: 5 },
     ]),
-    Discrepancy.find({ status: 'open' }).sort({ createdAt: -1 }).limit(10).lean(),
+    Discrepancy.find({ status: 'open', ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) }).sort({ createdAt: -1 }).limit(10).lean(),
 
     // IVA por fuente:
     //   ERP      → erpStatus no Cancelado/Deshabilitado, excluye SINUUID
@@ -474,45 +480,142 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
   const lm = Math.min(2000, Math.max(1, parseInt(limit)));
 
-  const periodoFiltro = {};
-  if (ejercicio)         periodoFiltro.ejercicio         = parseInt(ejercicio);
-  if (periodo)           periodoFiltro.periodo           = parseInt(periodo);
-  if (tipoDeComprobante) periodoFiltro.tipoDeComprobante = tipoDeComprobante;
+  const matchPeriodo = {};
+  if (ejercicio)         matchPeriodo.ejercicio         = parseInt(ejercicio);
+  if (periodo)           matchPeriodo.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) matchPeriodo.tipoDeComprobante = tipoDeComprobante;
 
-  const filter = {
-    $or: [
-      { criticalCount: { $gt: 0 } },
-      { status: { $in: ['not_in_erp', 'not_in_sat', 'cancelled'] } },
-    ],
-    ...periodoFiltro,
-  };
+  // Obtener la comparación MÁS RECIENTE por UUID, luego filtrar las problemáticas.
+  // Así, si un CFDI fue re-comparado individualmente y quedó en 'match', ya no aparece.
+  const erpProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, erpStatus: 1, satStatus: 1 };
+  const satProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, satStatus: 1 };
 
-  const [comparaciones, total] = await Promise.all([
-    Comparison.find(filter)
-      .select('uuid status differences criticalCount warningCount tipoDeComprobante ejercicio periodo comparedAt erpCfdiId satCfdiId')
-      .populate({ path: 'erpCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus' })
-      .populate({ path: 'satCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total tipoDeComprobante emisor receptor satStatus' })
-      .sort({ criticalCount: -1, comparedAt: -1 })
-      .limit(lm)
-      .lean(),
-    Comparison.countDocuments(filter),
-  ]);
+  const pipeline = [
+    ...(Object.keys(matchPeriodo).length ? [{ $match: matchPeriodo }] : []),
+    { $sort: { comparedAt: -1 } },
+    // Conservar solo la comparación más reciente por UUID
+    { $group: { _id: '$uuid', doc: { $first: '$$ROOT' } } },
+    { $replaceRoot: { newRoot: '$doc' } },
+    // Ahora filtrar solo las que siguen siendo problemáticas
+    {
+      $match: {
+        $or: [
+          { criticalCount: { $gt: 0 } },
+          { status: { $in: ['not_in_erp', 'not_in_sat', 'cancelled'] } },
+        ],
+      },
+    },
+    { $sort: { criticalCount: -1, comparedAt: -1 } },
+    { $limit: lm },
+    {
+      $lookup: {
+        from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id',
+        as: 'erpCfdiId', pipeline: [{ $project: erpProjection }],
+      },
+    },
+    { $unwind: { path: '$erpCfdiId', preserveNullAndEmptyArrays: true } },
+    {
+      $lookup: {
+        from: 'cfdis', localField: 'satCfdiId', foreignField: '_id',
+        as: 'satCfdiId', pipeline: [{ $project: satProjection }],
+      },
+    },
+    { $unwind: { path: '$satCfdiId', preserveNullAndEmptyArrays: true } },
+  ];
 
-  // Deduplicar por UUID — conservar la más reciente (primero tras el sort)
-  const seen = new Set();
-  const items = comparaciones.filter(c => {
-    if (seen.has(c.uuid)) return false;
-    seen.add(c.uuid);
-    return true;
-  });
+  const items = await Comparison.aggregate(pipeline);
 
-  // Conteo por status para el resumen del dashboard
   const porStatus = items.reduce((acc, c) => {
     acc[c.status] = (acc[c.status] || 0) + 1;
     return acc;
   }, {});
 
-  res.json({ items, total, porStatus });
+  res.json({ items, total: items.length, porStatus });
 });
 
-module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas };
+/**
+ * GET /api/reports/not-in-erp
+ * CFDIs que están en SAT/MANUAL pero NO en ERP para el periodo dado.
+ * Consulta directo la colección CFDI por lastComparisonStatus para evitar
+ * registros históricos de la colección Comparison.
+ */
+const notInErp = asyncHandler(async (req, res) => {
+  const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
+  const lm = Math.min(2000, Math.max(1, parseInt(limit)));
+
+  const periodoBase = {};
+  if (ejercicio)         periodoBase.ejercicio         = parseInt(ejercicio);
+  if (periodo)           periodoBase.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) periodoBase.tipoDeComprobante = tipoDeComprobante;
+
+  const selectFields = 'uuid serie folio fecha tipoDeComprobante total moneda emisor receptor satStatus lastComparisonStatus ejercicio periodo source';
+
+  // Paso 1: ERP del periodo seleccionado
+  const erpDelPeriodo = await CFDI.find({ isActive: { $ne: false }, source: 'ERP', ...periodoBase }, 'uuid ejercicio periodo').lean();
+  const erpUuidsPeriodo = new Set(erpDelPeriodo.map(d => d.uuid?.toUpperCase()).filter(Boolean));
+
+  // Paso 2: SAT/MANUAL del periodo seleccionado (sin filtro de tipo)
+  const satFiltroBase = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] } };
+  if (periodoBase.ejercicio) satFiltroBase.ejercicio = periodoBase.ejercicio;
+  if (periodoBase.periodo)   satFiltroBase.periodo   = periodoBase.periodo;
+
+  const satDocs = await CFDI.find(satFiltroBase)
+    .select(selectFields)
+    .sort({ fecha: -1 })
+    .lean();
+
+  // Paso 3a: SAT sin contraparte ERP en este mismo periodo
+  const sinContraparteErp = satDocs.filter(d => !erpUuidsPeriodo.has(d.uuid?.toUpperCase()));
+
+  // Paso 3b: duplicados SAT — mismo UUID más de una vez en SAT para el periodo
+  const uuidCount = {};
+  for (const d of satDocs) {
+    const u = d.uuid?.toUpperCase();
+    if (u) uuidCount[u] = (uuidCount[u] || 0) + 1;
+  }
+  const duplicadosSAT = satDocs.filter(d => uuidCount[d.uuid?.toUpperCase()] > 1);
+
+  // Paso 3c: SAT con match pero ERP en otro periodo
+  // → SAT está en el periodo seleccionado, tiene UUID en ERP pero ese ERP está en distinto periodo
+  let matchOtroPeriodo = [];
+  if (sinContraparteErp.length > 0 || (periodoBase.ejercicio || periodoBase.periodo)) {
+    // UUIDs SAT de este periodo que NO están en ERP de este periodo
+    const uuidsSinPeriodo = sinContraparteErp.map(d => d.uuid?.toUpperCase()).filter(Boolean);
+    if (uuidsSinPeriodo.length > 0) {
+      // Buscar si esos UUIDs sí existen en ERP pero en OTRO periodo
+      const erpOtroPeriodo = await CFDI.find({
+        isActive: { $ne: false },
+        source: 'ERP',
+        uuid: { $in: uuidsSinPeriodo },
+      }, 'uuid ejercicio periodo').lean();
+
+      const erpOtroMap = {};
+      for (const e of erpOtroPeriodo) erpOtroMap[e.uuid?.toUpperCase()] = e;
+
+      matchOtroPeriodo = sinContraparteErp
+        .filter(d => erpOtroMap[d.uuid?.toUpperCase()])
+        .map(d => ({
+          ...d,
+          erpEjercicio: erpOtroMap[d.uuid?.toUpperCase()]?.ejercicio,
+          erpPeriodo:   erpOtroMap[d.uuid?.toUpperCase()]?.periodo,
+        }));
+    }
+  }
+
+  // Los que realmente no existen en ERP en ningún periodo
+  const matchOtroPeriodoUuids = new Set(matchOtroPeriodo.map(d => d.uuid?.toUpperCase()));
+  const realmenterNotInErp = sinContraparteErp.filter(d => !matchOtroPeriodoUuids.has(d.uuid?.toUpperCase()));
+
+  res.json({
+    sinContraparteErp: realmenterNotInErp,
+    totalSinContraparte: realmenterNotInErp.length,
+    duplicadosSAT,
+    totalDuplicados: duplicadosSAT.length,
+    matchOtroPeriodo,
+    totalMatchOtroPeriodo: matchOtroPeriodo.length,
+    items: realmenterNotInErp,
+    total: realmenterNotInErp.length,
+  });
+});
+
+module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp };

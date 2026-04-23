@@ -805,7 +805,7 @@ async function exportMovements(filters) {
       erpIds:             (m.erpIds || []).join(', ') || null,
       saldoErp:           m.saldoErp ?? null,
       numeroAutorizacion: m.numeroAutorizacion ?? null,
-      identificadoPor:    m.identificadoPor?.nombre ?? null,
+      identificadoPor:    [...new Set((m.identificadoPor || []).map(e => e.nombre || e.userId || '?'))].join(', ') || null,
     });
   }
 

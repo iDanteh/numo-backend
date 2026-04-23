@@ -230,7 +230,7 @@ const cfdiSchema = new mongoose.Schema({
   periodo:   { type: Number, min: 1, max: 12, index: true },
 
   // Auditoría
-  uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  uploadedBy: { type: String }, // Auth0 sub del usuario que cargó el documento
   isActive: { type: Boolean, default: true },
 }, {
   timestamps: true,

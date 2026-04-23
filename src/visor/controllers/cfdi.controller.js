@@ -836,8 +836,11 @@ const exportExcel = asyncHandler(async (req, res) => {
     search, ejercicio, periodo,
   } = req.query;
 
-  const filter = { isActive: true };
-  if (source)            filter.source             = source.toUpperCase();
+  const filter = { isActive: { $ne: false } };
+  if (source) {
+    const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);
+    filter.source = sources.length === 1 ? sources[0] : { $in: sources };
+  }
   if (tipoDeComprobante) filter.tipoDeComprobante  = tipoDeComprobante;
   if (rfcEmisor)         filter['emisor.rfc']       = rfcEmisor.toUpperCase();
   if (rfcReceptor)       filter['receptor.rfc']     = rfcReceptor.toUpperCase();

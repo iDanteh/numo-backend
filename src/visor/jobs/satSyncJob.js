@@ -31,14 +31,17 @@ const CRON_HORA = config.sat.cronHora;
 const ejecutarDescargaMasiva = async () => {
   logger.info('[SatSyncJob] Iniciando descarga masiva nocturna...');
 
-  // Rango: día anterior completo
-  const ayer = new Date();
-  ayer.setDate(ayer.getDate() - 1);
-  const fechaInicio = `${ayer.toISOString().slice(0, 10)}T00:00:00`;
-  const fechaFin    = `${ayer.toISOString().slice(0, 10)}T23:59:59`;
-
-  // Periodo fiscal: se deriva de la fecha procesada y se valida contra BD.
-  const { ejercicio, periodo } = derivarPeriodoDesdeFecha(ayer);
+  // Rango: día anterior completo en hora de México (el SAT usa CDMX como referencia)
+  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const hoyMXStr  = fmtMX.format(new Date());                          // 'YYYY-MM-DD' de hoy en CDMX
+  const ayerDate  = new Date(`${hoyMXStr}T12:00:00`);                  // mediodía para evitar DST
+  ayerDate.setDate(ayerDate.getDate() - 1);
+  const ayerMXStr = fmtMX.format(ayerDate);                            // 'YYYY-MM-DD' de ayer en CDMX
+  const [anoStr, mesStr] = ayerMXStr.split('-');
+  const ejercicio  = parseInt(anoStr, 10);
+  const periodo    = parseInt(mesStr, 10);
+  const fechaInicio = `${ayerMXStr}T00:00:00`;
+  const fechaFin    = `${ayerMXStr}T23:59:59`;
   try {
     await resolverPeriodo(ejercicio, periodo);
   } catch {
@@ -85,25 +88,34 @@ const ejecutarDescargaMasiva = async () => {
       if (entidad.syncConfig?.syncRecibidos) tipos.push('Recibidos');
       if (tipos.length === 0) tipos.push('Emitidos');
 
+      // Tipos del diario: solo Ingresos, Egresos y Pagos (sin Nómina ni Traslados)
+      const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos'];
+
       for (const tipoComprobante of tipos) {
-        const limitCheck = await puedeIniciar(rfc);
+        // El diario descarga Emitidos en 3 sub-solicitudes SAT; Recibidos es 1
+        const solicitudesNecesarias = tipoComprobante === 'Emitidos' ? TIPOS_DIARIO.length : 1;
+        const limitCheck = await puedeIniciar(rfc, solicitudesNecesarias);
         if (!limitCheck.puede) {
           logger.warn(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): descarga nocturna bloqueada — ${limitCheck.razon}`);
           continue;
         }
-        await registrarInicio(rfc);
+        let iniciado = false;
         try {
-          await procesarDescarga({ rfc, fechaInicio, fechaFin, tipoComprobante, creds, ayer, ejercicio, periodo });
+          await registrarInicio(rfc, solicitudesNecesarias);
+          iniciado = true;
+          await procesarDescarga({
+            rfc, fechaInicio, fechaFin, tipoComprobante, creds,
+            ejercicio, periodo,
+            // El job diario solo descarga estos 3 tipos de emitidos
+            tiposEmitidosSplit: tipoComprobante === 'Emitidos' ? TIPOS_DIARIO : undefined,
+          });
         } catch (descErr) {
-          // Marcar checkpoint con error para diagnóstico
-          const fecha = fechaInicio.slice(0, 10);
-          await SatJobCheckpoint.findOneAndUpdate(
-            { rfc: rfc.toUpperCase(), fecha, tipoComprobante },
-            { $set: { status: 'error', error: descErr.message, updatedAt: new Date() } },
-          ).catch(() => {});
+          // Los checkpoints de sub-tipos ya se actualizan dentro de descargarPorSubtipo.
+          // Solo logueamos el error; no creamos un checkpoint fantasma para 'Emitidos'.
+          logger.error(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): ${descErr.message}`);
           throw descErr;
         } finally {
-          registrarFin(rfc);
+          if (iniciado) registrarFin(rfc);
         }
       }
 
@@ -272,7 +284,14 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
           await new Promise(r => setTimeout(r, ESPERA_RECHAZADA_MS));
           continue;
         }
-        throw rechazadaErr; // sin más reintentos o error distinto a Rechazada
+        // Reintentos agotados o error distinto a Rechazada.
+        // Marcar checkpoint como 'error' para que el siguiente run del job
+        // no intente re-verificar este idSolicitud (que ya está rechazado).
+        await SatJobCheckpoint.updateOne(
+          { _id: checkpoint._id },
+          { $set: { status: 'error', error: rechazadaErr.message, updatedAt: new Date() } }
+        ).catch(() => {});
+        throw rechazadaErr;
       }
     }
 
@@ -327,10 +346,10 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
   }
   // ── Re-verificar si hay más paquetes disponibles ─────────────────────────
   // El SAT a veces retorna estado=3 (Terminada) con paquetes parciales y agrega
-  // los restantes poco después. Si la descarga está incompleta y no hubo paquetes
-  // fallidos, se re-verifica la solicitud hasta 2 veces esperando 60s entre intentos.
-  const MAX_REVERIF = 2;
-  if (!esMetadata && paquetesFallidos === 0 && totalReportadoSAT > 0 && rows.length < totalReportadoSAT * 0.95) {
+  // los restantes poco después. Para datasets grandes el SAT puede tardar 20-30 min
+  // en generar todos los paquetes — MAX_REVERIF escala según NumeroCFDIs reportados.
+  const MAX_REVERIF = totalReportadoSAT > 5000 ? 30 : totalReportadoSAT > 1000 ? 15 : 5;
+  if (!esMetadata && totalReportadoSAT > 0 && rows.length < totalReportadoSAT * 0.95) {
     for (let rv = 1; rv <= MAX_REVERIF; rv++) {
       logger.warn(
         `[SatSyncJob] ⚠ DESCARGA INCOMPLETA (${tipoComprobante}): ` +
@@ -345,6 +364,13 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
         logger.warn(`[SatSyncJob] Re-verificación ${rv} fallida: ${reverErr.message} — se detiene la búsqueda de paquetes adicionales.`);
         break;
       }
+
+      // Refetch checkpoint para obtener paquetesProcesados actualizados en esta ejecución.
+      // Sin este refetch, el checkpoint en memoria es el inicial (vacío para nueva solicitud)
+      // y todos los paquetes ya descargados aparecerían como "nuevos", agotando el límite
+      // de 2 descargas por paquete que impone el SAT.
+      const cpFresh = await SatJobCheckpoint.findById(checkpoint._id).lean();
+      if (cpFresh) checkpoint = cpFresh;
 
       const yaProcessados2 = new Set(checkpoint.paquetesProcesados ?? []);
       const nuevos = paquetesActualizados.filter(id => !yaProcessados2.has(id));
@@ -414,7 +440,7 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
  * @param {Function} [onPaso]   — Callback opcional (paso: number) para reportar progreso al frontend.
  *                                Pasos: 1=Autenticando, 3=Verificando, 4=Descargando, 5=Procesando.
  */
-const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica' }) => {
+const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica', tiposEmitidosSplit }) => {
   logger.info(`[SatSyncJob] RFC ${rfc} — solicitando ${tipoComprobante} ${fechaInicio.slice(0, 10)}`);
 
   const fecha = fechaInicio.slice(0, 10); // YYYY-MM-DD
@@ -456,209 +482,235 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
     let totalPaquetes     = 0;
     let totalReportadoSAT = 0;
     let esMetadata        = false;
+    let incompleta        = false;
+    let reclasificacionResultado = null;
 
-    // En modo XML + Emitidos: dividir por tipo para cubrir todos los comprobantes.
-    const TIPOS_SPLIT_EMITIDOS = ['Ingresos', 'Egresos', 'Pagos', 'Nomina', 'Traslados'];
+    // En modo XML + Emitidos: dividir por sub-tipo.
+    // tiposEmitidosSplit permite al caller restringir qué sub-tipos se solicitan
+    // (ej. el job diario solo pide Ingresos, Egresos y Pagos).
+    const TIPOS_SPLIT_EMITIDOS = tiposEmitidosSplit ?? ['Ingresos', 'Egresos', 'Pagos', 'Nomina', 'Traslados'];
     const tiposADescargar = (modoFinal === 'CFDI' && tipoComprobante === 'Emitidos')
       ? TIPOS_SPLIT_EMITIDOS
       : [tipoComprobante];
 
-    onPaso?.(3);
-    const rows = [];
+    // Mapa tipo → letra SAT (usado para filtrar el ERP por tipo dentro del loop)
+    const TIPO_LETRA = {
+      Ingresos: 'I', Egresos: 'E', Traslados: 'T', Nomina: 'N', Pagos: 'P',
+      RecibidosIngresos: 'I', RecibidosEgresos: 'E', RecibidosTraslados: 'T', RecibidosNomina: 'N', RecibidosPagos: 'P',
+    };
+
+    const inicioDelDia = new Date(fechaInicio);
+    const finDelDia    = new Date(fechaFin);
+    const esRecibidos  = tipoComprobante === 'Recibidos' || tipoComprobante.startsWith('Recibidos');
+    const campoRfc     = esRecibidos ? 'receptor.rfc' : 'emisor.rfc';
+
+    // Resultados acumulados de todos los sub-tipos para guardarResultados al final
+    const allCoinc   = [];
+    const allSoloSAT = [];
+    const allSoloERP = [];
+    const allConDiff = [];
     const tiposFallidos = [];
+
+    onPaso?.(3);
+
     for (let ti = 0; ti < tiposADescargar.length; ti++) {
-      const tipo = tiposADescargar[ti];
+      const tipoActual = tiposADescargar[ti];
+
       try {
+        // ── 1. Descargar paquetes (espera completa antes de continuar) ────────
         const { rows: r, paquetes, totalReportado, esMetadata: modoMeta } = await descargarPorSubtipo({
-          rfc, fechaInicio, fechaFin, ejercicio, periodo, tipoComprobante: tipo, creds, tipoSolicitud: modoFinal,
+          rfc, fechaInicio, fechaFin, ejercicio, periodo,
+          tipoComprobante: tipoActual, creds, tipoSolicitud: modoFinal,
         });
-        rows.push(...r);
+
         totalPaquetes     += paquetes;
         totalReportadoSAT += (totalReportado ?? 0);
         esMetadata         = modoMeta;
+
+        // Verificar completitud de este sub-tipo
+        if (!esMetadata && totalReportado > 0 && r.length < totalReportado * 0.95) {
+          incompleta = true;
+          logger.warn(
+            `[SatSyncJob] ⚠ INCOMPLETO (${tipoActual}): SAT reportó ${totalReportado} pero se descargaron ` +
+            `${r.length} (${Math.round((r.length / totalReportado) * 100)}%)`
+          );
+        }
+
+        if (r.length === 0) {
+          logger.info(`[SatSyncJob] RFC ${rfc} (${tipoActual}): sin CFDIs nuevos.`);
+        } else {
+          // ── 2. Normalizar ──────────────────────────────────────────────────
+          const cfdisSATTipo = esMetadata ? r.map(normalizarMetadato) : r.map(normalizarCFDI);
+
+          // ── 3. Comparar con ERP (scoped al tipo actual) ───────────────────
+          const tipoFiltroERP = TIPO_LETRA[tipoActual]
+            ? { tipoDeComprobante: TIPO_LETRA[tipoActual] }
+            : { tipoDeComprobante: { $ne: 'T' } };
+
+          const cfdisERPDocs = await CFDI.find({
+            source: 'ERP', isActive: true,
+            ...tipoFiltroERP,
+            [campoRfc]: rfc.toUpperCase(),
+            fecha: { $gte: inicioDelDia, $lte: finDelDia },
+          }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus').lean();
+
+          const cfdisERPTipo = cfdisERPDocs.map(normalizarCFDI);
+          const { coinciden, soloEnSAT, soloEnERP, conDiferencia } = compararArrays(cfdisSATTipo, cfdisERPTipo);
+
+          logger.info(
+            `[SatSyncJob] RFC ${rfc} (${tipoActual}): ` +
+            `coinciden=${coinciden.length}, soloSAT=${soloEnSAT.length}, soloERP=${soloEnERP.length}, diffs=${conDiferencia.length}`
+          );
+
+          // ── 4. Guardar CFDIs nuevos INMEDIATAMENTE en MongoDB ─────────────
+          // Se guarda aquí (no al final) para que si el siguiente tipo falla,
+          // los CFDIs de este tipo ya estén persistidos y no se pierdan.
+          onPaso?.(4);
+          if (soloEnSAT.length > 0) {
+            const soloEnSATUuids = new Set(soloEnSAT.map(c => c.uuid.toUpperCase()));
+
+            if (esMetadata) {
+              const registrosMeta = r.filter(row => soloEnSATUuids.has((row.uuid || '').toUpperCase()));
+              if (registrosMeta.length > 0) {
+                await CFDI.bulkWrite(registrosMeta.map(row => ({
+                  updateOne: {
+                    filter: { uuid: row.uuid.toUpperCase(), source: 'SAT' },
+                    update: { $set: {
+                      uuid:                 row.uuid.toUpperCase(),
+                      source:               'SAT',
+                      ejercicio,
+                      periodo,
+                      satStatus:            row.estado === 'Cancelado' ? 'Cancelado' : 'Vigente',
+                      isActive:             true,
+                      version:              '4.0',
+                      fecha:                new Date(row.fecha || ''),
+                      total:                parseFloat(row.total || '0') || 0,
+                      subTotal:             0,
+                      moneda:               'MXN',
+                      tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
+                      emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
+                      receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '' },
+                      lastComparisonStatus: 'not_in_erp',
+                      lastComparisonAt:     new Date(),
+                    }},
+                    upsert: true,
+                  },
+                })));
+                logger.info(`[SatSyncJob] ✓ Tipo ${tipoActual}: ${registrosMeta.length} registros metadata guardados en MongoDB.`);
+              }
+            } else {
+              const cfdisNuevos = r.filter(c => soloEnSATUuids.has((c.uuid || '').toUpperCase()));
+              if (cfdisNuevos.length > 0) {
+                await CFDI.bulkWrite(cfdisNuevos.map(c => ({
+                  updateOne: {
+                    filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
+                    update: { $set: {
+                      uuid:                 c.uuid.toUpperCase(),
+                      source:               'SAT',
+                      ejercicio,
+                      periodo,
+                      satStatus:            'Vigente',
+                      isActive:             true,
+                      version:              c.version,
+                      serie:                c.serie,
+                      folio:                c.folio,
+                      fecha:                c.fecha,
+                      subTotal:             c.subTotal,
+                      total:                c.total,
+                      moneda:               c.moneda,
+                      tipoDeComprobante:    c.tipoDeComprobante,
+                      emisor:               c.emisor,
+                      receptor:             c.receptor,
+                      conceptos:            c.conceptos,
+                      impuestos:            c.impuestos,
+                      xmlContent:           c.xmlContent,
+                      xmlHash:              c.xmlHash,
+                      timbreFiscalDigital:  c.timbreFiscalDigital,
+                      complementoPago:      c.complementoPago,
+                      lastComparisonStatus: 'not_in_erp',
+                      lastComparisonAt:     new Date(),
+                    }},
+                    upsert: true,
+                  },
+                })));
+                logger.info(`[SatSyncJob] ✓ Tipo ${tipoActual}: ${cfdisNuevos.length} CFDIs XML guardados en MongoDB.`);
+
+                // Reclasificación inmediata por tipo (solo XML — tiene InformacionGlobal)
+                try {
+                  const rec = await aplicarReclasificacion({ rfc, ejercicio, source: 'SAT' });
+                  if (rec.totalModificados > 0) {
+                    logger.info(`[SatSyncJob] Reclasificación (${tipoActual}): ${rec.totalModificados} CFDI(s) corregidos para RFC ${rfc}`);
+                  }
+                  reclasificacionResultado = rec;
+                } catch (reclassErr) {
+                  logger.warn(`[SatSyncJob] Reclasificación (${tipoActual}) falló (no crítico): ${reclassErr.message}`);
+                }
+              }
+            }
+          }
+
+          // ── 5. Acumular resultados para guardarResultados al final ─────────
+          allCoinc.push(...coinciden);
+          allSoloSAT.push(...soloEnSAT);
+          allSoloERP.push(...soloEnERP);
+          allConDiff.push(...conDiferencia);
+        }
+
       } catch (tipoErr) {
-        // Un tipo fallido NO aborta los demás — se acumula el error y se continúa.
-        // Los CFDIs de los tipos exitosos se guardarán igualmente al final.
-        tiposFallidos.push({ tipo, error: tipoErr.message });
-        logger.error(`[SatSyncJob] ⚠ Tipo ${tipo} falló (se omite y continúa): ${tipoErr.message}`);
+        // Un tipo fallido NO aborta los demás — sus datos ya están guardados si llegaron.
+        // Los tipos anteriores ya fueron persistidos en MongoDB en el paso 4.
+        tiposFallidos.push({ tipo: tipoActual, error: tipoErr.message });
+        logger.error(`[SatSyncJob] ⚠ Tipo ${tipoActual} falló (se omite y continúa): ${tipoErr.message}`);
       }
 
-      // Cooldown entre tipos: el SAT puede rechazar la siguiente solicitud si la anterior
-      // aún no está "cerrada" en su backend. 30 s es suficiente en la mayoría de casos;
-      // si la solicitud llega a ser rechazada de todos modos, descargarPorSubtipo reintenta.
+      // ── Cooldown: esperar a que el SAT cierre la solicitud actual ──────────
+      // Solo se aplica cuando hay un siguiente tipo; el tipo actual ya completó
+      // su ciclo completo (solicitud → verificación → descarga → guardado)
+      // antes de que empiece el cooldown.
+      // 60s mínimo — el SAT necesita ese tiempo para "cerrar" la solicitud
+      // anterior antes de aceptar una nueva del mismo RFC.
       if (ti < tiposADescargar.length - 1) {
-        logger.info(`[SatSyncJob] Cooldown 30s antes de solicitar el siguiente tipo (${tiposADescargar[ti + 1]})...`);
-        await new Promise(r => setTimeout(r, 30_000));
+        const siguiente = tiposADescargar[ti + 1];
+        logger.info(`[SatSyncJob] Tipo ${tipoActual} completado. Cooldown 60s antes de solicitar ${siguiente}...`);
+        await new Promise(r => setTimeout(r, 60_000));
       }
     }
 
+    // ── Post-loop: validación y resultado ────────────────────────────────────
     if (tiposFallidos.length > 0) {
       const msgFallidos =
         `[SatSyncJob] ⚠ ${tiposFallidos.length} tipo(s) fallaron: ` +
         tiposFallidos.map(t => `${t.tipo} (${t.error})`).join(', ');
 
-      if (rows.length === 0 && totalPaquetes === 0) {
-        // Todos los tipos fallaron — no hay nada que guardar, propagar como error.
+      if (totalPaquetes === 0 && allCoinc.length === 0 && allSoloSAT.length === 0 && allSoloERP.length === 0) {
         throw new Error(
           `Todos los tipos de comprobante fallaron. ` +
           tiposFallidos.map(t => `${t.tipo}: ${t.error}`).join(' | ')
         );
       }
-      logger.warn(msgFallidos + `. Los CFDIs de los tipos exitosos sí se guardarán.`);
+      logger.warn(msgFallidos + '. Los CFDIs de los tipos exitosos ya fueron guardados en MongoDB.');
     }
 
-    onPaso?.(4);
-
-    if (rows.length === 0 && totalPaquetes === 0) {
+    if (totalPaquetes === 0 && allCoinc.length === 0 && allSoloSAT.length === 0) {
       logger.info(`[SatSyncJob] RFC ${rfc}: no hay paquetes que descargar.`);
       await actualizarLog({ estado: 'completado', fin: new Date(), totalSAT: 0, totalERP: 0, coinciden: 0, soloSAT: 0, soloERP: 0, diferencias: 0, paquetes: 0, totalReportadoSAT: 0, incompleta: false });
       return { totalSAT: 0, totalERP: 0, coinciden: 0, soloEnSAT: 0, soloEnERP: 0, conDiferencia: 0, paquetes: 0, totalReportadoSAT: 0, incompleta: false };
     }
 
-    // En modo XML (CFDI), verificar si la descarga fue incompleta
-    const incompleta = !esMetadata && totalReportadoSAT > 0 && rows.length < totalReportadoSAT * 0.95;
-    if (incompleta) {
-      logger.warn(
-        `[SatSyncJob] ⚠ DESCARGA INCOMPLETA RFC ${rfc}: SAT reportó ${totalReportadoSAT} CFDIs ` +
-        `pero se descargaron ${rows.length} (${Math.round((rows.length / totalReportadoSAT) * 100)}%). ` +
-        `Usa modo Metadata para rangos >5 días.`
-      );
-    }
-
-    logger.info(`[SatSyncJob] RFC ${rfc}: ${rows.length} registros del SAT (modo=${modoFinal}, ${totalPaquetes} paquete(s), reportados=${totalReportadoSAT})`);
-
-    // Normalizar según modo: metadata usa normalizarMetadato, XML usa normalizarCFDI
-    const cfdisSAT = esMetadata ? rows.map(normalizarMetadato) : rows.map(normalizarCFDI);
-
-    const inicioDelDia = new Date(fechaInicio);
-    const finDelDia    = new Date(fechaFin);
-
-    // Subtipos de recibidos usan receptor.rfc para buscar en el ERP
-    const esRecibidos = tipoComprobante === 'Recibidos' || tipoComprobante.startsWith('Recibidos');
-    const campoRfc = esRecibidos ? 'receptor.rfc' : 'emisor.rfc';
-
-    // Mapa de tipo de comprobante (seleccionado en UI) a letra SAT — incluye subtipos de recibidos
-    const TIPO_LETRA = {
-      Ingresos: 'I', Egresos: 'E', Traslados: 'T', Nomina: 'N', Pagos: 'P',
-      RecibidosIngresos: 'I', RecibidosEgresos: 'E', RecibidosTraslados: 'T', RecibidosNomina: 'N', RecibidosPagos: 'P',
-    };
-    // Si se descargó un tipo específico, filtrar el ERP por ese tipo para no comparar
-    // CFDIs de otros tipos que no están en la descarga SAT (evita falsos soloEnERP).
-    // Para 'Emitidos' / 'Recibidos' (todos los tipos) se excluyen solo traslados (sin impacto fiscal).
-    const tipoFiltroERP = TIPO_LETRA[tipoComprobante]
-      ? { tipoDeComprobante: TIPO_LETRA[tipoComprobante] }
-      : { tipoDeComprobante: { $ne: 'T' } };
-
-    const cfdisERPDocs = await CFDI.find({
-      source: 'ERP',
-      isActive: true,
-      ...tipoFiltroERP,
-      [campoRfc]: rfc.toUpperCase(),
-      fecha: { $gte: inicioDelDia, $lte: finDelDia },
-    }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus').lean();
-
-    const cfdisERP = cfdisERPDocs.map(normalizarCFDI);
-
-    const { coinciden, soloEnSAT, soloEnERP, conDiferencia } = compararArrays(cfdisSAT, cfdisERP);
-
-    logger.info(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): coinciden=${coinciden.length}, soloSAT=${soloEnSAT.length}, soloERP=${soloEnERP.length}, diffs=${conDiferencia.length}`);
-
+    // ── Guardar resultados de comparación en Comparison/Discrepancy/CFDI status
     onPaso?.(5);
-    let reclasificacionResultado = null;
-    if (soloEnSAT.length > 0) {
-      const soloEnSATUuids = new Set(soloEnSAT.map(c => c.uuid.toUpperCase()));
+    await guardarResultados({ rfc, tipoComprobante, coinciden: allCoinc, soloEnSAT: allSoloSAT, soloEnERP: allSoloERP, conDiferencia: allConDiff, ejercicio, periodo });
 
-      if (esMetadata) {
-        // Modo metadata: guardar con campos básicos (sin xmlContent)
-        const registrosMeta = rows.filter(r => soloEnSATUuids.has((r.uuid || '').toUpperCase()));
-        if (registrosMeta.length > 0) {
-          await CFDI.bulkWrite(registrosMeta.map(r => ({
-            updateOne: {
-              filter: { uuid: r.uuid.toUpperCase(), source: 'SAT' },
-              update: { $set: {
-                uuid:                 r.uuid.toUpperCase(),
-                source:               'SAT',
-                ejercicio,
-                periodo,
-                satStatus:            r.estado === 'Cancelado' ? 'Cancelado' : 'Vigente',
-                isActive:             true,
-                version:              '4.0',
-                fecha:                new Date(r.fecha || ''),
-                total:                parseFloat(r.total || '0') || 0,
-                subTotal:             0,
-                moneda:               'MXN',
-                tipoDeComprobante:    EFECTO_MAP[r.efecto] || r.efecto || '',
-                emisor:               { rfc: (r.rfcEmisor || '').toUpperCase(), nombre: r.nombreEmisor || '' },
-                receptor:             { rfc: (r.rfcReceptor || '').toUpperCase(), nombre: r.nombreReceptor || '' },
-                lastComparisonStatus: 'not_in_erp',
-                lastComparisonAt:     new Date(),
-              }},
-              upsert: true,
-            },
-          })));
-          logger.info(`[SatSyncJob] RFC ${rfc}: ${registrosMeta.length} registros SAT (metadata) guardados`);
-        }
-      } else {
-        // Modo XML: guardar con xmlContent completo
-        const cfdisNuevos = rows.filter(c => soloEnSATUuids.has((c.uuid || '').toUpperCase()));
-        if (cfdisNuevos.length > 0) {
-          await CFDI.bulkWrite(cfdisNuevos.map(c => ({
-            updateOne: {
-              filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
-              update: { $set: {
-                uuid:                 c.uuid.toUpperCase(),
-                source:               'SAT',
-                ejercicio,
-                periodo,
-                satStatus:            'Vigente',
-                isActive:             true,
-                version:              c.version,
-                serie:                c.serie,
-                folio:                c.folio,
-                fecha:                c.fecha,
-                subTotal:             c.subTotal,
-                total:                c.total,
-                moneda:               c.moneda,
-                tipoDeComprobante:    c.tipoDeComprobante,
-                emisor:               c.emisor,
-                receptor:             c.receptor,
-                conceptos:            c.conceptos,
-                impuestos:            c.impuestos,
-                xmlContent:           c.xmlContent,
-                xmlHash:              c.xmlHash,
-                timbreFiscalDigital:  c.timbreFiscalDigital,
-                complementoPago:      c.complementoPago,
-                lastComparisonStatus: 'not_in_erp',
-                lastComparisonAt:     new Date(),
-              }},
-              upsert: true,
-            },
-          })));
-          logger.info(`[SatSyncJob] RFC ${rfc}: ${cfdisNuevos.length} CFDIs SAT (XML) guardados`);
-
-          // Reclasificar facturas globales: corrige periodo/ejercicio según fecha de emisión,
-          // no fecha de timbrado. Solo aplica a CFDIs con cfdi:InformacionGlobal.
-          try {
-            reclasificacionResultado = await aplicarReclasificacion({ rfc, ejercicio, source: 'SAT' });
-            if (reclasificacionResultado.totalModificados > 0) {
-              logger.info(`[SatSyncJob] Reclasificación global SAT: ${reclasificacionResultado.totalModificados} CFDI(s) corregidos para RFC ${rfc}`);
-            }
-          } catch (reclassErr) {
-            logger.warn(`[SatSyncJob] Reclasificación global SAT falló (no crítico): ${reclassErr.message}`);
-          }
-        }
-      }
-    }
-
-    await guardarResultados({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, ejercicio, periodo });
+    const totalSAT = allCoinc.length + allSoloSAT.length + allConDiff.length;
+    const totalERP = allCoinc.length + allSoloERP.length + allConDiff.length;
 
     const resultado = {
-      totalSAT:          cfdisSAT.length,
-      totalERP:          cfdisERP.length,
-      coinciden:         coinciden.length,
-      soloEnSAT:         soloEnSAT.length,
-      soloEnERP:         soloEnERP.length,
-      conDiferencia:     conDiferencia.length,
+      totalSAT,
+      totalERP,
+      coinciden:         allCoinc.length,
+      soloEnSAT:         allSoloSAT.length,
+      soloEnERP:         allSoloERP.length,
+      conDiferencia:     allConDiff.length,
       paquetes:          totalPaquetes,
       totalReportadoSAT,
       incompleta,
@@ -712,9 +764,18 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
         upsert: true,
       },
     })));
+    // ERP: solo actualizar lastComparisonStatus — NO sobreescribir ejercicio/periodo porque
+    // el ERP puede tener un periodo reclasificado distinto al rango de la descarga SAT.
     await CFDI.bulkWrite(coinciden.map(cfdi => ({
       updateOne: {
-        filter: { uuid: cfdi.uuid },
+        filter: { uuid: cfdi.uuid, source: 'ERP' },
+        update: { $set: { lastComparisonStatus: 'match', lastComparisonAt: ahora } },
+      },
+    })));
+    // SAT/MANUAL: sí sincronizar ejercicio/periodo con el de la descarga
+    await CFDI.bulkWrite(coinciden.map(cfdi => ({
+      updateOne: {
+        filter: { uuid: cfdi.uuid, source: { $in: ['SAT', 'MANUAL'] } },
         update: { $set: { lastComparisonStatus: 'match', lastComparisonAt: ahora, ...fp } },
       },
     })));
@@ -763,8 +824,9 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
     })));
     await CFDI.bulkWrite(soloEnERP.map(cfdi => ({
       updateOne: {
-        filter: { uuid: cfdi.uuid },
-        update: { $set: { lastComparisonStatus: 'not_in_sat', lastComparisonAt: ahora, ...fp } },
+        // Solo actualizar status — no tocar ejercicio/periodo del ERP
+        filter: { uuid: cfdi.uuid, source: 'ERP' },
+        update: { $set: { lastComparisonStatus: 'not_in_sat', lastComparisonAt: ahora } },
       },
     })));
   }
@@ -803,9 +865,10 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
       ...fp,
     })));
 
+    // ERP: solo status, no tocar ejercicio/periodo reclasificado
     await CFDI.findOneAndUpdate(
-      { uuid: sat.uuid },
-      { $set: { lastComparisonStatus: 'discrepancy', lastComparisonAt: ahora, ...fp } },
+      { uuid: sat.uuid, source: 'ERP' },
+      { $set: { lastComparisonStatus: 'discrepancy', lastComparisonAt: ahora } },
     );
   }
 };

@@ -12,8 +12,14 @@
  *   reemplaza el placeholder con el sub real.
  *
  * Variables de entorno:
- *   SEED_ADMIN_EMAIL  — email del admin a pre-registrar
- *   SEED_ADMIN_NOMBRE — nombre del admin (opcional)
+ *   SEED_ADMIN_EMAIL   — email del admin a pre-registrar
+ *   SEED_ADMIN_NOMBRE  — nombre del admin (opcional)
+ *   SEED_USER2_EMAIL   — email del segundo usuario a pre-registrar (opcional)
+ *   SEED_USER2_NOMBRE  — nombre del segundo usuario (opcional)
+ *   SEED_USER2_ROLE    — rol del segundo usuario (default: 'tienda')
+ *   SEED_USER3_EMAIL   — email del tercer usuario a pre-registrar (opcional)
+ *   SEED_USER3_NOMBRE  — nombre del tercer usuario (opcional)
+ *   SEED_USER3_ROLE    — rol del tercer usuario (default: 'tienda')
  */
 
 require('dotenv').config();
@@ -66,6 +72,23 @@ async function seedRbac() {
   }
 }
 
+async function seedUser({ email, nombre, role }) {
+  const existing = await User.findOne({ where: { email } });
+  if (existing) {
+    console.log(`[seed] Usuario ya existe (${email}). Sin cambios.`);
+    return;
+  }
+  await User.create({
+    auth0Sub: `seed:${email}`,
+    nombre:   nombre ?? '',
+    email,
+    role,
+    isActive: true,
+  });
+  console.log(`[seed] Usuario creado → ${email} (${role})`);
+  console.log(`[seed] Cuando ese email inicie sesión con Auth0, quedará vinculado automáticamente.`);
+}
+
 async function seed() {
   const adminEmail  = process.env.SEED_ADMIN_EMAIL;
   const adminNombre = process.env.SEED_ADMIN_NOMBRE;
@@ -77,26 +100,25 @@ async function seed() {
   if (!adminEmail) {
     console.log('[seed] SEED_ADMIN_EMAIL no definido — omitiendo creación de admin.');
     console.log('[seed] El primer usuario que inicie sesión con Auth0 obtendrá rol "tienda".');
-    return;
+  } else {
+    const existingAdmin = await User.findOne({ where: { role: 'admin' } });
+    if (existingAdmin) {
+      console.log(`[seed] Admin ya existe (${existingAdmin.email || existingAdmin.auth0Sub}). Sin cambios.`);
+    } else {
+      await seedUser({ email: adminEmail, nombre: adminNombre, role: 'admin' });
+    }
   }
 
-  const existing = await User.findOne({ where: { role: 'admin' } });
+  // Usuarios adicionales — opcionales, idempotentes por email.
+  const extraUsers = [
+    { email: process.env.SEED_USER2_EMAIL, nombre: process.env.SEED_USER2_NOMBRE, role: process.env.SEED_USER2_ROLE || 'tienda' },
+    { email: process.env.SEED_USER3_EMAIL, nombre: process.env.SEED_USER3_NOMBRE, role: process.env.SEED_USER3_ROLE || 'tienda' },
+  ];
 
-  if (existing) {
-    console.log(`[seed] Admin ya existe (${existing.email || existing.auth0Sub}). Sin cambios.`);
-    return;
+  for (const user of extraUsers) {
+    if (!user.email) continue;
+    await seedUser(user);
   }
-
-  await User.create({
-    auth0Sub: `seed:${adminEmail}`,
-    nombre:   adminNombre ?? '',
-    email:    adminEmail,
-    role:     'admin',
-    isActive: true,
-  });
-
-  console.log(`[seed] Usuario admin creado → ${adminEmail}`);
-  console.log(`[seed] Cuando ese email inicie sesión con Auth0, quedará vinculado automáticamente.`);
 }
 
 // ── Ejecución directa: node src/banks/scripts/seed.js ────────────────────────

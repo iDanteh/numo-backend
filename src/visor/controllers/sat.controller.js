@@ -108,7 +108,7 @@ const verify = asyncHandler(async (req, res) => {
   const { uuid, rfcEmisor, rfcReceptor, total, sello = '', version = '4.0' } = req.body;
   const result = await verifyCFDIWithSAT(uuid, rfcEmisor, rfcReceptor, parseFloat(total), sello, version);
 
-  await CFDI.findOneAndUpdate(
+  await CFDI.updateMany(
     { uuid: uuid.toUpperCase() },
     { $set: { satStatus: result.state, satLastCheck: new Date() } },
   );
@@ -143,7 +143,7 @@ const verifyBatch = asyncHandler(async (req, res) => {
       try {
         const sello = cfdi.timbreFiscalDigital?.selloCFD || cfdi.sello || '';
         const result = await verifyCFDIWithSAT(cfdi.uuid, cfdi.emisor.rfc, cfdi.receptor.rfc, cfdi.total, sello, cfdi.version || '4.0', cfdi.tipoDeComprobante);
-        await CFDI.findOneAndUpdate({ uuid: cfdi.uuid }, { $set: { satStatus: result.state, satLastCheck: new Date() } });
+        await CFDI.updateMany({ uuid: cfdi.uuid }, { $set: { satStatus: result.state, satLastCheck: new Date() } });
         await new Promise(r => setTimeout(r, 500));
       } catch (err) {
         logger.error(`Error verificando ${uuid}:`, err.message);

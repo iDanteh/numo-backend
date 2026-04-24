@@ -112,11 +112,11 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: montosFilter },
       { $addFields: {
         sourceGroup: { $cond: { if: { $in: ['$source', ['SAT', 'MANUAL']] }, then: 'SAT', else: '$source' } },
-        // ERP: solo suma Timbrado o Habilitado; SAT/MANUAL: excluir Cancelado/Deshabilitado
+        // ERP: solo Timbrado; SAT/MANUAL: solo Vigente
         excluir: { $cond: {
           if:   { $eq: ['$source', 'ERP'] },
-          then: { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
-          else: { $in: ['$satStatus', ['Cancelado', 'Deshabilitado']] },
+          then: { $ne: ['$erpStatus', 'Timbrado'] },
+          else: { $ne: ['$satStatus', 'Vigente'] },
         }},
       }},
       { $group: {
@@ -162,7 +162,7 @@ const dashboard = asyncHandler(async (req, res) => {
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
-        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } },
+        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: 'Timbrado' },
         { source: { $in: ['SAT', 'MANUAL'] }, satStatus: 'Vigente' },
       ]}},
       {
@@ -181,7 +181,7 @@ const dashboard = asyncHandler(async (req, res) => {
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
-        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } },
+        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: 'Timbrado' },
         { source: { $in: ['SAT', 'MANUAL'] }, satStatus: 'Vigente' },
       ]}},
       {

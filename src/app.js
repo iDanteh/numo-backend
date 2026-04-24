@@ -32,6 +32,7 @@ const entityRoutes           = require('./visor/routes/entities');
 const driveRoutes            = require('./visor/routes/drive');
 const periodosFiscalesRoutes = require('./visor/routes/periodos-fiscales');
 const visorErpRoutes         = require('./visor/routes/erp');
+const scheduleRoutes         = require('./visor/routes/schedule');
 
 const app = express();
 
@@ -102,6 +103,7 @@ app.use('/api/entities',         entityRoutes);
 app.use('/api/drive',            driveRoutes);
 app.use('/api/periodos-fiscales', periodosFiscalesRoutes);
 app.use('/api/erp',              visorErpRoutes);
+app.use('/api/schedule',         scheduleRoutes);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => {

@@ -3,6 +3,8 @@ const config = require('../../config/env');
 const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
+const ComparisonSession = require('../models/ComparisonSession');
+const { batchCompareCFDIs, formatSessionName } = require('../services/comparisonEngine');
 const entityRepo = require('../repositories/entity.repository');
 const SatJobCheckpoint = require('../models/SatJobCheckpoint');
 const { compareCFDI } = require('../services/comparisonEngine');
@@ -15,8 +17,170 @@ const { derivarPeriodoDesdeFecha, resolverPeriodo } = require('../services/perio
 const { logger } = require('../../shared/utils/logger');
 const SatDescargaLog = require('../models/SatDescargaLog');
 const { aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
+const { fetchTodasLasFacturas } = require('../services/erp.service');
+const { transformarTolerante } = require('../services/erp-transformer.service');
+const { upsertFromERP } = require('../repositories/cfdi.repository');
 
 const CRON_HORA = config.sat.cronHora;
+
+// ── Helper: derivar fechas de inicio/fin de un periodo ────────────────────────
+const derivarFechasERP = (ejercicio, periodo) => {
+  const mes       = String(periodo).padStart(2, '0');
+  const ultimoDia = new Date(Date.UTC(ejercicio, periodo, 0)).getUTCDate();
+  return {
+    fechaInicio: `${ejercicio}-${mes}-01T06:00:00Z`,
+    fechaFin:    `${ejercicio}-${mes}-${String(ultimoDia).padStart(2, '0')}T06:00:00Z`,
+  };
+};
+
+/**
+ * Job nocturno de Descarga ERP.
+ * Descarga automáticamente las facturas del ERP para el mes actual
+ * y las persiste en MongoDB (mismo proceso que POST /api/erp/cargar).
+ */
+const ejecutarDescargaERP = async () => {
+  logger.info('[ERPSyncJob] Iniciando descarga automática ERP...');
+
+  // Periodo actual en hora de México
+  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const hoyMX = fmtMX.format(new Date());
+  const [anoStr, mesStr] = hoyMX.split('-');
+  const ejercicio = parseInt(anoStr, 10);
+  const periodo   = parseInt(mesStr, 10);
+
+  // Verificar que el periodo fiscal exista
+  try {
+    await resolverPeriodo(ejercicio, periodo);
+  } catch {
+    logger.error(`[ERPSyncJob] Periodo ${periodo}/${ejercicio} no existe en PeriodoFiscal. Créalo antes de que corra el job. Descarga cancelada.`);
+    return;
+  }
+
+  const { fechaInicio, fechaFin } = derivarFechasERP(ejercicio, periodo);
+  logger.info(`[ERPSyncJob] Periodo: ${ejercicio}/${periodo} | ${fechaInicio} → ${fechaFin}`);
+
+  // Descargar facturas del ERP
+  let facturas;
+  try {
+    facturas = await fetchTodasLasFacturas({ fechaInicio, fechaFin });
+  } catch (err) {
+    logger.error(`[ERPSyncJob] Error conectando con ERP: ${err.message}`);
+    return;
+  }
+
+  if (facturas.length === 0) {
+    logger.info(`[ERPSyncJob] ERP no devolvió registros para ${ejercicio}/${periodo}`);
+    return;
+  }
+
+  logger.info(`[ERPSyncJob] ${facturas.length} factura(s) recibidas del ERP. Procesando...`);
+
+  let guardadas = 0, duplicadas = 0, omitidas = 0, conErrores = 0;
+
+  for (let i = 0; i < facturas.length; i++) {
+    const factura = facturas[i];
+    let doc, erroresTransform = [];
+    try {
+      ({ doc, errores: erroresTransform } = transformarTolerante(factura, { ejercicio, periodo, uploadedBy: 'system' }));
+    } catch (err) {
+      logger.error(`[ERPSyncJob] Error transformando factura [${i + 1}]: ${err.message}`);
+      conErrores++;
+      continue;
+    }
+
+    if (doc.tipoDeComprobante === 'T') { omitidas++; continue; }
+
+    try {
+      const { isNew, isDuplicate } = await upsertFromERP(doc);
+      if (isDuplicate) { duplicadas++; }
+      else { isNew ? guardadas++ : duplicadas++; }
+      if (erroresTransform.length > 0) conErrores++;
+    } catch (err) {
+      logger.error(`[ERPSyncJob] Error guardando UUID ${doc.uuid}: ${err.message}`);
+      conErrores++;
+    }
+  }
+
+  // Reclasificación automática de facturas globales
+  if (guardadas > 0) {
+    try {
+      const reclass = await aplicarReclasificacion({ ejercicio, periodo, source: 'ERP' });
+      if (reclass.totalModificados > 0) {
+        logger.info(`[ERPSyncJob] Reclasificación: ${reclass.totalModificados} CFDI(s) corregidos`);
+      }
+    } catch (reclassErr) {
+      logger.warn(`[ERPSyncJob] Reclasificación falló (no crítico): ${reclassErr.message}`);
+    }
+  }
+
+  logger.info(
+    `[ERPSyncJob] Completado | recibidas=${facturas.length} guardadas=${guardadas} ` +
+    `duplicadas=${duplicadas} omitidas=${omitidas} conErrores=${conErrores}`
+  );
+};
+
+/**
+ * Job nocturno de Comparación automática ERP vs SAT.
+ * Compara todos los CFDIs ERP + SAT del periodo actual.
+ */
+const ejecutarComparacionAuto = async () => {
+  logger.info('[CompJobAuto] Iniciando comparación automática ERP vs SAT...');
+
+  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const hoyMX = fmtMX.format(new Date());
+  const [anoStr, mesStr] = hoyMX.split('-');
+  const ejercicio = parseInt(anoStr, 10);
+  const periodo   = parseInt(mesStr, 10);
+
+  try {
+    await resolverPeriodo(ejercicio, periodo);
+  } catch {
+    logger.error(`[CompJobAuto] Periodo ${periodo}/${ejercicio} no existe. Comparación cancelada.`);
+    return;
+  }
+
+  const baseFilter = { isActive: true, ejercicio, periodo, tipoDeComprobante: { $ne: 'T' } };
+
+  const [erpCfdis, satCfdis, allErpUuids] = await Promise.all([
+    CFDI.find({ ...baseFilter, source: 'ERP' }, '_id uuid').lean(),
+    CFDI.find({ ...baseFilter, source: { $in: ['SAT', 'MANUAL'] } }, '_id uuid').lean(),
+    CFDI.find({ ...baseFilter, source: 'ERP' }, 'uuid').lean(),
+  ]);
+
+  const erpUuidSet   = new Set(allErpUuids.map(c => c.uuid.toUpperCase()));
+  const satOnlyCfdis = satCfdis.filter(c => !erpUuidSet.has(c.uuid.toUpperCase()));
+
+  const totalCFDIs = erpCfdis.length + satOnlyCfdis.length;
+  if (totalCFDIs === 0) {
+    logger.info('[CompJobAuto] Sin CFDIs para comparar en este periodo.');
+    return;
+  }
+
+  logger.info(`[CompJobAuto] ${erpCfdis.length} ERP + ${satOnlyCfdis.length} solo-SAT = ${totalCFDIs} CFDIs`);
+
+  const session = await ComparisonSession.create({
+    name:        formatSessionName(new Date()) + ' (auto)',
+    triggeredBy: null,
+    totalCFDIs,
+    status:      'running',
+    filters:     { ejercicio, periodo, auto: true },
+  });
+
+  try {
+    await batchCompareCFDIs(
+      erpCfdis.map(c => c._id.toString()),
+      {
+        concurrency: 5,
+        triggeredBy: null,
+        sessionId:   session._id,
+        satOnlyIds:  satOnlyCfdis.map(c => c._id.toString()),
+      },
+    );
+    logger.info(`[CompJobAuto] Comparación completada. Sesión: ${session._id}`);
+  } catch (err) {
+    logger.error(`[CompJobAuto] Error en comparación: ${err.message}`);
+  }
+};
 
 /**
  * Job nocturno de Descarga Masiva SAT.
@@ -880,11 +1044,9 @@ const mapCampoToType = (campo) => {
   return 'OTHER';
 };
 
-// ── Job anterior: verificación de estado SAT para CFDIs del ERP ──────────────
-// Se mantiene con su horario original (2 AM) para no romper funcionalidad existente.
-cron.schedule('0 2 * * *', async () => {
+// ── Tareas de verificación y descarga masiva (reprogramables dinámicamente) ───
+const jobVerificacionSAT = async () => {
   logger.info('[SatSyncJob] Iniciando verificación de estado SAT...');
-
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const cfdis = await CFDI.find({
     source: 'ERP',
@@ -895,9 +1057,7 @@ cron.schedule('0 2 * * *', async () => {
       { satStatus: 'Pendiente' },
     ],
   }, '_id').limit(500).lean();
-
   logger.info(`[SatSyncJob] ${cfdis.length} CFDIs por verificar`);
-
   let success = 0, failed = 0;
   for (const cfdi of cfdis) {
     try {
@@ -909,23 +1069,77 @@ cron.schedule('0 2 * * *', async () => {
       logger.error(`[SatSyncJob] Error CFDI ${cfdi._id}:`, err.message);
     }
   }
+  logger.info(`[SatSyncJob] Verificación completada: ${success} exitosos, ${failed} fallidos`);
+};
 
-  logger.info(`[SatSyncJob] Completado: ${success} exitosos, ${failed} fallidos`);
-}, {
-  timezone: 'America/Mexico_City',
-});
-
-// ── Job de Descarga Masiva: 1:00 AM hora de México ───────────────────────────
-cron.schedule(CRON_HORA, async () => {
+const jobDescargaMasiva = async () => {
   try {
     await ejecutarDescargaMasiva();
   } catch (err) {
     logger.error(`[SatSyncJob] Error fatal en descarga masiva: ${err.message}`);
   }
-}, {
-  timezone: 'America/Mexico_City',
-});
+};
 
-logger.info(`[SatSyncJob] Jobs registrados: verificación SAT 2AM, descarga masiva ${CRON_HORA} (America/Mexico_City)`);
+/**
+ * Convierte "HH:MM" → expresión cron "MM HH * * *"
+ */
+const horaACron = (hora) => {
+  const [hh, mm] = hora.split(':');
+  return `${parseInt(mm, 10)} ${parseInt(hh, 10)} * * *`;
+};
 
-module.exports = { ejecutarDescargaMasiva, procesarDescarga };
+// Instancias actuales de los jobs (para poder destruirlas y recrearlas)
+let _jobVerif       = null;
+let _jobDescarga    = null;
+let _jobERP         = null;
+let _jobComparacion = null;
+
+const jobDescargaERP = async () => {
+  try { await ejecutarDescargaERP(); }
+  catch (err) { logger.error(`[ERPSyncJob] Error fatal en descarga ERP: ${err.message}`); }
+};
+
+const jobComparacionAuto = async () => {
+  try { await ejecutarComparacionAuto(); }
+  catch (err) { logger.error(`[CompJobAuto] Error fatal en comparación: ${err.message}`); }
+};
+
+/**
+ * (Re)programa los cuatro jobs con los horarios indicados.
+ * Llamado al arrancar la app y cuando el usuario cambia el horario via API.
+ */
+const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVerificacion = '02:00', comparacion = '04:00' } = {}) => {
+  if (_jobVerif)       { _jobVerif.stop();       _jobVerif       = null; }
+  if (_jobDescarga)    { _jobDescarga.stop();    _jobDescarga    = null; }
+  if (_jobERP)         { _jobERP.stop();         _jobERP         = null; }
+  if (_jobComparacion) { _jobComparacion.stop(); _jobComparacion = null; }
+
+  _jobDescarga    = cron.schedule(horaACron(satDescarga),     jobDescargaMasiva,   { timezone: 'America/Mexico_City' });
+  _jobERP         = cron.schedule(horaACron(erpDescarga),     jobDescargaERP,      { timezone: 'America/Mexico_City' });
+  _jobVerif       = cron.schedule(horaACron(erpVerificacion), jobVerificacionSAT,  { timezone: 'America/Mexico_City' });
+  _jobComparacion = cron.schedule(horaACron(comparacion),     jobComparacionAuto,  { timezone: 'America/Mexico_City' });
+
+  logger.info(
+    `[SatSyncJob] Jobs programados — Descarga SAT: ${satDescarga} | Descarga ERP: ${erpDescarga} | ` +
+    `Verificación: ${erpVerificacion} | Comparación: ${comparacion} (America/Mexico_City)`
+  );
+};
+
+// ── Arranque inicial: leer horario guardado en BD o usar defaults ─────────────
+(async () => {
+  try {
+    const AppConfig = require('../models/AppConfig');
+    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'erpDescarga', 'erpVerificacion', 'comparacion'] } }).lean();
+    const map       = Object.fromEntries(configs.map(c => [c.key, c.value]));
+    reprogramarJobs({
+      satDescarga:     map.satDescarga     ?? '01:00',
+      erpDescarga:     map.erpDescarga     ?? '03:00',
+      erpVerificacion: map.erpVerificacion ?? '02:00',
+      comparacion:     map.comparacion     ?? '04:00',
+    });
+  } catch {
+    reprogramarJobs();
+  }
+})();
+
+module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, procesarDescarga, reprogramarJobs };

@@ -1075,7 +1075,6 @@ const migrarPeriodoBulk = asyncHandler(async (req, res) => {
     );
   }
 
-  const logger = require('../utils/logger').logger;
   logger.info(
     `[MigrarPeriodoBulk] ${migrados.length} CFDI(s) migrados → ${ej}/${pe} por usuario ${req.user._id}`
   );
@@ -1166,7 +1165,6 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
     { $set: { periodo: pe, ejercicio: ej } },
   );
 
-  const logger = require('../utils/logger').logger;
   logger.info(
     `[MigrarPeriodo] UUID ${cfdi.uuid} migrado de ${ejercicioAnterior}/${periodoAnterior} ` +
     `→ ${ej}/${pe} por usuario ${req.user._id}`,

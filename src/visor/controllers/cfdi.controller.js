@@ -133,36 +133,39 @@ const list = asyncHandler(async (req, res) => {
       ).lean();
 
       // 2. Buscar contrapartes ERP por UUID SIN filtro de periodo/ejercicio.
-      //    Así detectamos cross-period aunque el usuario no tenga un periodo seleccionado,
-      //    comparando directamente los campos ejercicio/periodo de cada par SAT↔ERP.
+      //    Solo se incluyen CFDIs cuyo SAT o ERP sea factura global (informacionGlobal).
+      //    Regla de negocio: únicamente facturas globales pueden migrar de periodo.
       let crossPeriodIds = [];
       if (candidateSatCfdis.length > 0) {
-        const uuids = candidateSatCfdis.map(c => c.uuid);
-        const erpCounterparts = await CFDI.find(
-          { source: 'ERP', uuid: { $in: uuids }, isActive: true },
-          'uuid ejercicio periodo'
-        ).lean();
+        // Excluir los que ya tienen informacionGlobal en SAT (los cubre el primer $or)
+        const sinIG = candidateSatCfdis.filter(c => !c.informacionGlobal?.mes);
+        if (sinIG.length > 0) {
+          const uuids = sinIG.map(c => c.uuid);
+          const erpCounterparts = await CFDI.find(
+            { source: 'ERP', uuid: { $in: uuids }, isActive: true },
+            'uuid ejercicio periodo informacionGlobal'
+          ).lean();
 
-        // Mapa uuid → { ejercicio, periodo } del ERP
-        const erpMap = new Map();
-        for (const erp of erpCounterparts) {
-          erpMap.set(erp.uuid.toUpperCase(), erp);
+          // Mapa uuid → ERP con ejercicio/periodo/informacionGlobal
+          const erpMap = new Map();
+          for (const erp of erpCounterparts) {
+            erpMap.set(erp.uuid.toUpperCase(), erp);
+          }
+
+          crossPeriodIds = sinIG
+            .filter(sat => {
+              const erp = erpMap.get(sat.uuid.toUpperCase());
+              if (!erp) return false; // Sin contraparte ERP → no migrar
+              const erpDistintoPeriodo = erp.ejercicio !== sat.ejercicio || erp.periodo !== sat.periodo;
+              const erpEsGlobal = !!(erp.informacionGlobal?.mes);
+              // Solo incluir si el ERP está en otro periodo Y el ERP es factura global
+              return erpDistintoPeriodo && erpEsGlobal;
+            })
+            .map(c => c._id);
         }
-
-        crossPeriodIds = candidateSatCfdis
-          .filter(sat => {
-            const erp = erpMap.get(sat.uuid.toUpperCase());
-            if (!erp) return sat.lastComparisonStatus === 'match'; // Sin contraparte ERP (status 'match' obsoleto)
-            return erp.ejercicio !== sat.ejercicio || erp.periodo !== sat.periodo;
-          })
-          .map(c => c._id);
       }
 
-      // 3. $or: factura global SAT not_in_erp ó match/not_in_erp cross-period
-      // Para not_in_erp sin InformacionGlobal también incluimos los que tienen
-      // contraparte ERP en otro periodo (subidos al mes equivocado).
-      // Para match con InformacionGlobal también incluimos: factura global conciliada
-      // en el mes de emisión pero que debe moverse al mes que cubre (informacionGlobal.mes).
+      // 3. $or: SAT global (con informacionGlobal.mes) ó cross-period donde ERP es global
       filter.source = { $in: ['SAT', 'MANUAL'] };
       filter.$or = [
         {
@@ -1134,20 +1137,16 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
 
     if (erpMatch) {
       const erpDistintoPeriodo = erpMatch.ejercicio !== cfdi.ejercicio || erpMatch.periodo !== cfdi.periodo;
-      if (cfdi.lastComparisonStatus === 'match') {
-        // Caso 2: match cross-period donde el ERP es factura global
-        const erpTieneIG = erpMatch.informacionGlobal?.mes ||
-          (erpMatch.xmlContent && /InformacionGlobal/i.test(erpMatch.xmlContent));
-        erpEnOtroPeriodo = erpDistintoPeriodo && erpTieneIG;
-      } else {
-        // Caso 3: not_in_erp pero hay contraparte ERP en otro periodo (mes equivocado al subir)
-        erpEnOtroPeriodo = erpDistintoPeriodo;
-      }
+      const erpTieneIG = erpMatch.informacionGlobal?.mes ||
+        (erpMatch.xmlContent && /InformacionGlobal/i.test(erpMatch.xmlContent));
+      // En ambos casos (match y not_in_erp) el ERP debe ser factura global y estar en otro periodo.
+      // Regla de negocio: solo facturas globales pueden migrar de periodo.
+      erpEnOtroPeriodo = erpDistintoPeriodo && erpTieneIG;
     }
   }
 
   if (!tieneInfoGlobal && !erpEnOtroPeriodo) {
-    return res.status(400).json({ error: 'El CFDI no es una factura global ni tiene contraparte ERP en otro periodo.' });
+    return res.status(400).json({ error: 'Solo se pueden migrar facturas globales.' });
   }
 
   const periodoAnterior  = cfdi.periodo;

@@ -311,6 +311,37 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
   ).lean();
   const hashesExistentes = new Set(existentes.map(e => e.hash));
 
+  // ── 1b. Banamex: deduplicar por numeroAutorizacion ─────────────────────────
+  // Si un movimiento Banamex con el mismo número de autorización ya existe,
+  // solo se actualiza su fecha (el número de autorización es el identificador
+  // canónico en los estados de cuenta, incluyendo los de fin de semana).
+  const fechaUpdates = [];   // { _id, fecha }
+  const banamexAuthMovs = movements.filter(
+    m => m.banco === 'Banamex' && m.numeroAutorizacion,
+  );
+  if (banamexAuthMovs.length > 0) {
+    const authNums = banamexAuthMovs.map(m => m.numeroAutorizacion);
+    const existByAuth = await BankMovement.find(
+      { banco: 'Banamex', numeroAutorizacion: { $in: authNums } },
+      '_id numeroAutorizacion fecha',
+    ).lean();
+
+    for (const existing of existByAuth) {
+      const incoming = banamexAuthMovs.find(
+        m => m.numeroAutorizacion === existing.numeroAutorizacion,
+      );
+      if (!incoming) continue;
+      // Programar actualización de fecha si cambió
+      const existingFecha = new Date(existing.fecha).getTime();
+      const incomingFecha = new Date(incoming.fecha).getTime();
+      if (existingFecha !== incomingFecha) {
+        fechaUpdates.push({ _id: existing._id, fecha: incoming.fecha });
+      }
+      // Marcar como ya existente para que no se re-inserte
+      hashesExistentes.add(incoming.hash);
+    }
+  }
+
   const nuevos     = movements.filter(m => !hashesExistentes.has(m.hash));
   const duplicados = movements.length - nuevos.length;
 
@@ -357,6 +388,14 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
       importados: insertados,
       duplicados,
     });
+  }
+
+  // ── 3b. Actualizar fecha de movimientos Banamex deduplicados por auth ──────
+  if (fechaUpdates.length > 0) {
+    const fechaOps = fechaUpdates.map(({ _id, fecha }) => ({
+      updateOne: { filter: { _id }, update: { $set: { fecha } } },
+    }));
+    await BankMovement.bulkWrite(fechaOps, { ordered: false });
   }
 
     // ── 4. Aplicar reglas a los movimientos recién insertados ─────────────────

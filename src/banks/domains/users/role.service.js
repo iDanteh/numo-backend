@@ -2,6 +2,7 @@
 
 const { NotFoundError, ConflictError, BadRequestError } = require('../../../shared/errors/AppError');
 const { invalidate } = require('../../../shared/services/rbac-store');
+const { getIo }      = require('../../shared/socket');
 
 // Importación deferida para evitar dependencia circular durante el bootstrap
 function db() {
@@ -35,13 +36,33 @@ async function createRole({ value, label, permissions }) {
 }
 
 async function updateRole(value, updates) {
-  const { Role } = db();
+  const { Role, User } = db();
   const role = await Role.findByPk(value);
   if (!role) throw new NotFoundError(`Rol '${value}' no encontrado.`);
   if (updates.label       !== undefined) role.label       = updates.label;
   if (updates.permissions !== undefined) role.permissions = updates.permissions;
   await role.save();
   invalidate();
+
+  // When permissions change, notify all users with this role in real time
+  if (updates.permissions !== undefined) {
+    const io = getIo();
+    if (io) {
+      const affected = await User.findAll({
+        where: { role: value },
+        attributes: ['auth0Sub'],
+        raw: true,
+      });
+      for (const u of affected) {
+        // Sequelize returns camelCase when using named attributes even with raw:true + underscored
+        const sub = u.auth0Sub ?? u.auth0_sub;
+        if (sub) {
+          io.to(`user:${sub}`).emit('role:updated', { role: value, permissions: role.permissions });
+        }
+      }
+    }
+  }
+
   return role;
 }
 

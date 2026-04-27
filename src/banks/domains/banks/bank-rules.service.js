@@ -100,26 +100,43 @@ function matchRegla(mov, regla) {
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Maps a Sequelize BankRule instance to the JSON shape expected by the frontend.
+ * Adds `_id` as a string alias for `id` to maintain backward compatibility with
+ * the frontend interface (originally designed for MongoDB where `_id` was the PK).
+ */
+function toRuleJSON(rule) {
+  const json = rule.toJSON ? rule.toJSON() : rule;
+  return { ...json, _id: String(json.id) };
+}
+
+/** Parses and validates a rule ID. Throws BadRequestError for non-integer values. */
+function parseRuleId(id) {
+  const n = parseInt(id, 10);
+  if (isNaN(n)) throw new BadRequestError(`ID de regla inválido: "${id}"`);
+  return n;
+}
+
 async function listRules(banco) {
   const rules = await bankRuleRepo.listByBanco(banco);
-  return rules.map(r => r.toJSON());
+  return rules.map(toRuleJSON);
 }
 
 async function createRule(banco, data) {
   validarRegla(data);
   const rule = await bankRuleRepo.create(banco, data);
-  return rule.toJSON();
+  return toRuleJSON(rule);
 }
 
 async function updateRule(id, data) {
   validarRegla(data);
-  const rule = await bankRuleRepo.update(id, data);
+  const rule = await bankRuleRepo.update(parseRuleId(id), data);
   if (!rule) throw new NotFoundError('Regla');
-  return rule.toJSON();
+  return toRuleJSON(rule);
 }
 
 async function deleteRule(id) {
-  const result = await bankRuleRepo.remove(id);
+  const result = await bankRuleRepo.remove(parseRuleId(id));
   if (!result) throw new NotFoundError('Regla');
   return result;
 }

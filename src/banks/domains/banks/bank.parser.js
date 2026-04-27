@@ -195,12 +195,14 @@ function cellText(val) {
 
 /**
  * Banamex
- * Estructura de columnas (ExcelJS 1-based):
+ * Estructura de columnas (ExcelJS 1-based) — hasta 7 columnas:
  *   vals[1] = Fecha (Date para filas principales, null para sub-filas)
  *   vals[2] = Concepto / texto de sub-fila
  *   vals[3] = Depósitos (número o '-')
  *   vals[4] = Retiros   (número o '-')
  *   vals[5] = Saldo
+ *   vals[6] = Extra / No. Autorización (solo en estados fin de semana)
+ *   vals[7] = Extra (solo en estados fin de semana)
  *
  * Cada movimiento puede tener sub-filas con:
  *   "Referencia numérica: DEPOS XXXXXXX"
@@ -259,6 +261,24 @@ function parseBanamex(sheet) {
         numAutorizacion: null,
         refNumerica:     null,
       };
+
+      // Columnas 6-7: presentes en estados de cuenta de fin de semana.
+      // Pueden contener No. de Autorización, referencia, o texto libre.
+      for (let colIdx = 6; colIdx <= 7; colIdx++) {
+        const text = cellText(v[colIdx]);
+        if (!text) continue;
+
+        const authMatch = text.match(/no\.\s*de\s*autorizaci[oó]n[\s:]+(.+)/i);
+        if (authMatch) {
+          current.numAutorizacion = authMatch[1].trim();
+          continue;
+        }
+        const refMatch = text.match(/referencia\s+num[eé]rica[\s:]+(.+)/i);
+        if (refMatch) {
+          current.refNumerica = refMatch[1].trim();
+        }
+        current.lineasExtra.push(text);
+      }
     } else if (isSubRow && current) {
       // Sub-fila: acumular información adicional
       const text = cellText(col2);

@@ -56,7 +56,7 @@ const BankRule = sequelize.define('BankRule', {
     type:         DataTypes.STRING(30),
     allowNull:    false,
     defaultValue: 'categorizar',
-    validate:     { isIn: [['categorizar', 'bloquear_identificacion']] },
+    validate:     { isIn: [['categorizar', 'bloquear_identificacion', 'ocultar']] },
   },
 
   // Mensaje mostrado al usuario cuando una regla bloquea la identificación.

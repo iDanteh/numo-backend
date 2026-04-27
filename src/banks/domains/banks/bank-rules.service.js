@@ -15,7 +15,7 @@ const OPERADORES_VALIDOS = [
   'mayor_que', 'menor_que', 'mayor_igual', 'menor_igual',
 ];
 const OPERADORES_NUMERICOS = ['mayor_que', 'menor_que', 'mayor_igual', 'menor_igual'];
-const ACCIONES_VALIDAS     = ['categorizar', 'bloquear_identificacion'];
+const ACCIONES_VALIDAS     = ['categorizar', 'bloquear_identificacion', 'ocultar'];
 
 // ── Validación ────────────────────────────────────────────────────────────────
 
@@ -132,12 +132,14 @@ async function reorderRules(ids) {
 // ── Aplicar reglas a movimientos ──────────────────────────────────────────────
 
 /**
- * Recorre todos los movimientos de un banco y aplica las reglas con
- * accion='categorizar'. Las reglas de bloqueo no participan en este proceso.
+ * Recorre todos los movimientos de un banco y aplica reglas de tipo
+ * 'categorizar' y 'ocultar'. Las reglas de bloqueo aplican al identificar.
  */
 async function applyRules(banco, soloSinCategoria = false) {
-  // Solo reglas de categorización — el bloqueo aplica al momento de identificar
-  const rules = await bankRuleRepo.listByBanco(banco, { accion: 'categorizar' });
+  const [catRules, ocultarRules] = await Promise.all([
+    bankRuleRepo.listByBanco(banco, { accion: 'categorizar' }),
+    bankRuleRepo.listByBanco(banco, { accion: 'ocultar' }),
+  ]);
 
   const matchFilter = { banco, isActive: true };
   if (soloSinCategoria) {
@@ -155,18 +157,31 @@ async function applyRules(banco, soloSinCategoria = false) {
 
     const ops = [];
     for (const mov of docs) {
-      let matched = null;
-      for (const rule of rules) {
-        if (matchRegla(mov, rule)) { matched = rule.nombre; break; }
+      // Categorizar: primera regla que aplica gana
+      let matchedCat = null;
+      for (const rule of catRules) {
+        if (matchRegla(mov, rule)) { matchedCat = rule.nombre; break; }
       }
-      const newCat = matched ?? null;
-      const oldCat = mov.categoria ?? null;
+      // Ocultar: basta con que una regla aplique
+      let shouldOcultar = false;
+      for (const rule of ocultarRules) {
+        if (matchRegla(mov, rule)) { shouldOcultar = true; break; }
+      }
 
-      if (newCat !== oldCat) {
+      const newCat      = matchedCat ?? null;
+      const oldCat      = mov.categoria ?? null;
+      const oldOculto   = mov.oculto    ?? false;
+      const catChanged    = newCat !== oldCat;
+      const ocultoChanged = shouldOcultar !== oldOculto;
+
+      if (catChanged || ocultoChanged) {
+        const $set = {};
+        if (catChanged)    $set.categoria = newCat;
+        if (ocultoChanged) $set.oculto    = shouldOcultar;
         ops.push({
           updateOne: {
             filter: { _id: mov._id },
-            update: { $set: { categoria: newCat } },
+            update: { $set },
           },
         });
         actualizados++;

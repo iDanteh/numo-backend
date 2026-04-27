@@ -85,6 +85,9 @@ const bankMovementSchema = new mongoose.Schema({
     default: [],
   },
 
+  // Oculto por regla — el movimiento existe pero no aparece en vistas normales
+  oculto: { type: Boolean, default: false, index: true },
+
   // Auditoría
   uploadedBy: { type: String, default: null },
   isActive:   { type: Boolean, default: true, index: true },

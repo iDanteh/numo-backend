@@ -137,7 +137,7 @@ async function listMovements(filters) {
     movId,
   } = filters;
 
-  const filter = { isActive: true };
+  const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
   // Filtro por ID exacto (usado desde OCR para saltar a un movimiento específico)
@@ -364,9 +364,12 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
     let sinReglasAviso = false;
 
     if (insertados > 0 && bancoValidado) {
-      const rules = await bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' });
+      const [catRules, ocultarRules] = await Promise.all([
+        bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
+        bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+      ]);
 
-      if (rules.length === 0) {
+      if (catRules.length === 0 && ocultarRules.length === 0) {
         sinReglasAviso = true;
       } else {
         const foliosNuevos   = nuevos.map(m => m.folio);
@@ -376,17 +379,16 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
 
         const ops = [];
         for (const mov of docsInsertados) {
-          for (const rule of rules) {
-            if (matchRegla(mov, rule)) {
-              ops.push({
-                updateOne: {
-                  filter: { _id: mov._id },
-                  update: { $set: { categoria: rule.nombre } },
-                },
-              });
-              categorizados++;
-              break; // Primera regla que aplica gana
-            }
+          const $set = {};
+          for (const rule of catRules) {
+            if (matchRegla(mov, rule)) { $set.categoria = rule.nombre; break; }
+          }
+          if ($set.categoria) categorizados++;
+          for (const rule of ocultarRules) {
+            if (matchRegla(mov, rule)) { $set.oculto = true; break; }
+          }
+          if (Object.keys($set).length > 0) {
+            ops.push({ updateOne: { filter: { _id: mov._id }, update: { $set } } });
           }
         }
 
@@ -448,16 +450,22 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
   let categorizado = false;
 
   if (bancoValidado) {
-    const rules = await bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' });
+    const [catRules, ocultarRules] = await Promise.all([
+      bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
+      bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+    ]);
 
-    for (const rule of rules) {
+    for (const rule of catRules) {
       if (matchRegla(nuevo, rule)) {
         nuevo.categoria = rule.nombre;
-        await nuevo.save();
         categorizado = true;
         break;
       }
     }
+    for (const rule of ocultarRules) {
+      if (matchRegla(nuevo, rule)) { nuevo.oculto = true; break; }
+    }
+    if (categorizado || nuevo.oculto) await nuevo.save();
   }
 
   // ── 7. Emitir evento ───────────────────────────────────────────────
@@ -690,7 +698,7 @@ async function exportMovements(filters) {
     status, categorias,
   } = filters;
 
-  const filter = { isActive: true };
+  const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
 

@@ -309,21 +309,38 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     ...comparisonFiltro,
   };
 
-  const [comparaciones, total] = await Promise.all([
+  const cfdiPeriodoFiltro = {};
+  if (ejercicio)         cfdiPeriodoFiltro.ejercicio         = parseInt(ejercicio);
+  if (periodo)           cfdiPeriodoFiltro.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) cfdiPeriodoFiltro.tipoDeComprobante = tipoDeComprobante;
+
+  const cfdiSelect = 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda';
+
+  const [comparaciones, total, notInSatCfdis, notInErpCfdis, satCanceladoCfdis] = await Promise.all([
     Comparison.find(filter)
       .select('uuid status differences criticalCount warningCount tipoDeComprobante ejercicio periodo comparedAt erpCfdiId satCfdiId')
-      .populate({ path: 'erpCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda' })
-      .populate({ path: 'satCfdiId', model: 'CFDI', select: 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor satStatus moneda' })
+      .populate({ path: 'erpCfdiId', model: 'CFDI', select: cfdiSelect })
+      .populate({ path: 'satCfdiId', model: 'CFDI', select: cfdiSelect })
       .sort({ comparedAt: -1, criticalCount: -1 })
       .skip((pg - 1) * lm)
       .limit(lm)
       .lean(),
     Comparison.countDocuments(filter),
+
+    // ERP en el periodo que no tienen contraparte en SAT
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, lastComparisonStatus: 'not_in_sat', ...cfdiPeriodoFiltro })
+      .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
+
+    // SAT/MANUAL en el periodo que no tienen contraparte en ERP
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...cfdiPeriodoFiltro })
+      .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
+
+    // ERP activo pero SAT cancelado (cruce de estatus fiscal)
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, ...cfdiPeriodoFiltro })
+      .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
   ]);
 
   // Deduplicar por UUID — puede haber múltiples Comparison para el mismo CFDI
-  // si la comparación se ha corrido varias veces. Se conserva el más reciente
-  // (el primero tras ordenar por criticalCount desc, comparedAt desc).
   const seen = new Set();
   const items = comparaciones
     .filter(c => {
@@ -336,7 +353,12 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
       differences: (c.differences ?? []).filter(d => camposFiltro.includes(d.field)),
     }));
 
-  res.json({ items, total, page: pg, limit: lm, pages: Math.ceil(total / lm) });
+  res.json({
+    items, total, page: pg, limit: lm, pages: Math.ceil(total / lm),
+    notInSat:     notInSatCfdis,
+    notInErp:     notInErpCfdis,
+    satCancelados: satCanceladoCfdis,
+  });
 });
 
 /**
@@ -492,45 +514,107 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   if (periodo)           matchPeriodo.periodo           = parseInt(periodo);
   if (tipoDeComprobante) matchPeriodo.tipoDeComprobante = tipoDeComprobante;
 
-  // Obtener la comparación MÁS RECIENTE por UUID, luego filtrar las problemáticas.
-  // Así, si un CFDI fue re-comparado individualmente y quedó en 'match', ya no aparece.
+  // Filtro para CFDIs (colección CFDI tiene ejercicio/periodo confiable)
+  const cfdiPeriodoFiltro = {};
+  if (ejercicio)         cfdiPeriodoFiltro.ejercicio         = parseInt(ejercicio);
+  if (periodo)           cfdiPeriodoFiltro.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) cfdiPeriodoFiltro.tipoDeComprobante = tipoDeComprobante;
+
   const erpProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, erpStatus: 1, satStatus: 1 };
   const satProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, satStatus: 1 };
 
+  // ── 1. Pipeline principal: discrepancias con ERP como base ─────────────────
+  // (not_in_sat, cancelled, criticalCount>0 — todos tienen ejercicio/periodo en Comparison)
   const pipeline = [
     ...(Object.keys(matchPeriodo).length ? [{ $match: matchPeriodo }] : []),
     { $sort: { comparedAt: -1 } },
-    // Conservar solo la comparación más reciente por UUID
     { $group: { _id: '$uuid', doc: { $first: '$$ROOT' } } },
     { $replaceRoot: { newRoot: '$doc' } },
-    // Ahora filtrar solo las que siguen siendo problemáticas
     {
       $match: {
         $or: [
           { criticalCount: { $gt: 0 } },
-          { status: { $in: ['not_in_erp', 'not_in_sat', 'cancelled'] } },
+          { status: { $in: ['not_in_sat', 'cancelled'] } },
         ],
       },
     },
     { $sort: { criticalCount: -1, comparedAt: -1 } },
     { $limit: lm },
-    {
-      $lookup: {
-        from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id',
-        as: 'erpCfdiId', pipeline: [{ $project: erpProjection }],
-      },
-    },
+    { $lookup: { from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id', as: 'erpCfdiId', pipeline: [{ $project: erpProjection }] } },
     { $unwind: { path: '$erpCfdiId', preserveNullAndEmptyArrays: true } },
-    {
-      $lookup: {
-        from: 'cfdis', localField: 'satCfdiId', foreignField: '_id',
-        as: 'satCfdiId', pipeline: [{ $project: satProjection }],
-      },
-    },
+    { $lookup: { from: 'cfdis', localField: 'satCfdiId', foreignField: '_id', as: 'satCfdiId', pipeline: [{ $project: satProjection }] } },
     { $unwind: { path: '$satCfdiId', preserveNullAndEmptyArrays: true } },
   ];
 
-  const items = await Comparison.aggregate(pipeline);
+  // ── 2. not_in_erp: se filtra directo en la colección CFDI (Comparison puede no tener periodo) ──
+  // ── 3. ERP activo pero satStatus=Cancelado (status='cancelled' viene del comparison engine) ───
+  // ── 4. ERP timbrado pero no en SAT ────────────────────────────────────────────────────────────
+  const [compItems, notInErpCfdis, satCanceladoErpActivo, erpNotInSat] = await Promise.all([
+    Comparison.aggregate(pipeline),
+
+    // SAT/MANUAL con lastComparisonStatus not_in_erp, filtrado por periodo del propio CFDI
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...cfdiPeriodoFiltro })
+      .select('uuid serie folio fecha total tipoDeComprobante emisor receptor satStatus ejercicio periodo')
+      .sort({ total: -1 }).limit(lm).lean(),
+
+    // ERP con satStatus=Cancelado pero erpStatus activo (cruce de estatus)
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, ...cfdiPeriodoFiltro })
+      .select('uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus')
+      .sort({ total: -1 }).limit(lm).lean(),
+
+    // ERP con lastComparisonStatus not_in_sat (está en ERP pero no en SAT)
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, lastComparisonStatus: 'not_in_sat', ...cfdiPeriodoFiltro })
+      .select('uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus')
+      .sort({ total: -1 }).limit(lm).lean(),
+  ]);
+
+  // Excluir de compItems los UUIDs ya cubiertos por erpNotInSat y satCanceladoErpActivo
+  // (el pipeline Comparison puede devolver duplicados si el status coincide)
+  const satCancelUuids = new Set(satCanceladoErpActivo.map(c => c.uuid?.toUpperCase()));
+  const notInSatUuids  = new Set(erpNotInSat.map(c => c.uuid?.toUpperCase()));
+  const filteredComp   = compItems.filter(c => {
+    const u = (c.uuid || '').toUpperCase();
+    if (c.status === 'cancelled' && satCancelUuids.has(u)) return false;
+    if (c.status === 'not_in_sat' && notInSatUuids.has(u)) return false;
+    return true;
+  });
+
+  // Formatear not_in_erp como objetos similares a Comparison para que el frontend los maneje igual
+  const notInErpItems = notInErpCfdis.map(c => ({
+    uuid: c.uuid,
+    status: 'not_in_erp',
+    tipoDeComprobante: c.tipoDeComprobante,
+    criticalCount: 0,
+    differences: [],
+    erpCfdiId: null,
+    satCfdiId: { uuid: c.uuid, serie: c.serie, folio: c.folio, fecha: c.fecha, total: c.total, tipoDeComprobante: c.tipoDeComprobante, emisor: c.emisor, receptor: c.receptor, satStatus: c.satStatus },
+  }));
+
+  // Formatear satCanceladoErpActivo como status 'sat_cancelado'
+  const satCanceladoItems = satCanceladoErpActivo.map(c => ({
+    uuid: c.uuid,
+    status: 'sat_cancelado',
+    tipoDeComprobante: c.tipoDeComprobante,
+    criticalCount: 1,
+    differences: [],
+    satCfdiId: null,
+    erpCfdiId: { uuid: c.uuid, serie: c.serie, folio: c.folio, fecha: c.fecha, total: c.total, tipoDeComprobante: c.tipoDeComprobante, emisor: c.emisor, receptor: c.receptor, erpStatus: c.erpStatus, satStatus: c.satStatus },
+  }));
+
+  // Formatear erpNotInSat como status 'not_in_sat' (complementa lo del pipeline)
+  const notInSatItems = erpNotInSat
+    .filter(c => !filteredComp.some(fc => fc.uuid === c.uuid && fc.status === 'not_in_sat'))
+    .map(c => ({
+      uuid: c.uuid,
+      status: 'not_in_sat',
+      tipoDeComprobante: c.tipoDeComprobante,
+      criticalCount: 0,
+      differences: [],
+      satCfdiId: null,
+      erpCfdiId: { uuid: c.uuid, serie: c.serie, folio: c.folio, fecha: c.fecha, total: c.total, tipoDeComprobante: c.tipoDeComprobante, emisor: c.emisor, receptor: c.receptor, erpStatus: c.erpStatus, satStatus: c.satStatus },
+    }));
+
+  const items = [...filteredComp, ...notInErpItems, ...satCanceladoItems, ...notInSatItems];
 
   const porStatus = items.reduce((acc, c) => {
     acc[c.status] = (acc[c.status] || 0) + 1;

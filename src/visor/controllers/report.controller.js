@@ -732,8 +732,9 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     ]),
 
     // Totales SAT directamente desde la colección CFDI (fuente confiable)
+    // Sin filtrar por satStatus para incluir CFDIs aún no confirmados como Vigente
     CFDI.aggregate([
-      { $match: { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, satStatus: 'Vigente', ...periodoFilter } },
+      { $match: { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, satStatus: { $nin: ['Cancelado'] }, ...periodoFilter } },
       { $group: {
         _id:                '$tipoDeComprobante',
         totalMonto:         { $sum: MONTO_EFECTIVO_EXPR },
@@ -743,16 +744,19 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       }},
     ]),
 
-    // CFDIs migrados: en el periodo actual pero con InformacionGlobal que apunta a otro periodo
+    // CFDIs migrados: CFDIs globales cuyo InformacionGlobal apunta a un periodo distinto
+    // al que tiene registrado (fueron movidos manualmente a este periodo).
+    // Se incluyen SAT/MANUAL/ERP con informacionGlobal.mes para cubrir ambos lados del match.
     CFDI.find({
-      source: { $in: ['SAT', 'MANUAL'] },
       isActive: { $ne: false },
-      'informacionGlobal.mes':  { $exists: true },
+      'informacionGlobal.mes': { $exists: true, $nin: [null, ''] },
       ...periodoFilter,
-      $or: [
-        { $expr: { $ne: [ { $toInt: '$informacionGlobal.mes' },  periodoFilter.periodo   || 0 ] } },
-        { $expr: { $ne: [ { $toInt: '$informacionGlobal.anio' }, periodoFilter.ejercicio || 0 ] } },
-      ],
+      ...(periodoFilter.ejercicio || periodoFilter.periodo ? {
+        $or: [
+          ...(periodoFilter.periodo   ? [{ $expr: { $ne: [ { $toInt: '$informacionGlobal.mes'  }, periodoFilter.periodo   ] } }] : []),
+          ...(periodoFilter.ejercicio ? [{ $expr: { $ne: [ { $toInt: '$informacionGlobal.anio' }, periodoFilter.ejercicio ] } }] : []),
+        ],
+      } : {}),
     })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus erpStatus lastComparisonStatus ejercicio periodo informacionGlobal source')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
@@ -1012,6 +1016,13 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       // Color discrepancias
       if (discs.some(d => d.severity === 'critical' || d.severity === 'high')) row.getCell('tiposDisc').fill = FG_DANGER;
       else if (discs.length > 0) row.getCell('tiposDisc').fill = FG_WARN;
+
+      // Resaltar filas canceladas en ERP o en SAT
+      if (cfdi.erpStatus === 'Cancelado' || cfdi.erpStatus === 'Cancelacion Pendiente') {
+        row.eachCell(cell => { cell.fill = FG_DANGER; });
+      } else if (cfdi.satStatus === 'Cancelado') {
+        row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_DANGER; });
+      }
 
       sumSubERP    += subERP;     sumIvaTraERP += ivaTraERP;  sumIvaRetERP += ivaRetERP; sumTotERP += totERP;
       sumSubSAT    += subSAT    || 0;

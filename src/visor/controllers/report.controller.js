@@ -562,7 +562,9 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   // UUIDs ya cubiertos por el pipeline para no duplicar
   const compUuids = new Set(compItems.map(c => (c.uuid || '').toUpperCase()));
 
-  const notInErpItems = notInErpCfdis.map(c => ({
+  const notInErpItems = notInErpCfdis
+    .filter(c => !compUuids.has((c.uuid || '').toUpperCase()))
+    .map(c => ({
     uuid: c.uuid, status: 'not_in_erp', tipoDeComprobante: c.tipoDeComprobante,
     criticalCount: 0, differences: [], erpCfdiId: null,
     satCfdiId: { uuid: c.uuid, serie: c.serie, folio: c.folio, fecha: c.fecha, total: c.total, tipoDeComprobante: c.tipoDeComprobante, emisor: c.emisor, receptor: c.receptor, satStatus: c.satStatus },

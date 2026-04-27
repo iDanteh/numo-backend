@@ -534,7 +534,8 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
       $match: {
         $or: [
           { criticalCount: { $gt: 0 } },
-          { status: { $in: ['not_in_sat', 'cancelled'] } },
+          { warningCount:  { $gt: 0 } },
+          { status: { $in: ['discrepancy', 'warning', 'not_in_sat', 'cancelled'] } },
         ],
       },
     },

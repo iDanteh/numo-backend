@@ -675,4 +675,469 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados };
+/**
+ * GET /api/reports/conciliacion-excel
+ * Reporte completo de conciliación CFDI.
+ * Genera una hoja de Resumen General + una hoja por cada tipo de comprobante
+ * que exista en el periodo (I=Ingreso, E=Egreso, P=Pago…) + una hoja "Solo en SAT".
+ *
+ * Cada hoja de tipo incluye:
+ *   - KPI: Total ERP vs Total SAT vs Diferencia
+ *   - Tabla: todos los CFDIs ERP del tipo con sus contrapartes SAT,
+ *     IVA, diferencia de monto y detalle campo a campo de por qué difieren.
+ */
+const conciliacionExcel = asyncHandler(async (req, res) => {
+  const { ejercicio, periodo } = req.query;
+  const periodoFilter = {};
+  if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
+  if (periodo)   periodoFilter.periodo   = parseInt(periodo);
+
+  const TIPO_LABEL    = { I: 'Ingreso', E: 'Egreso', P: 'Pago', T: 'Traslado', N: 'Nómina' };
+  const SEV_LABEL     = { critical: 'Crítica', high: 'Alta', warning: 'Advertencia', medium: 'Media', low: 'Baja' };
+  const COMP_LABEL    = { match: 'Conciliado', discrepancy: 'Discrepancia', warning: 'Advertencia', not_in_sat: 'No en SAT', not_in_erp: 'No en ERP', cancelled: 'Cancelado', pending: 'Pendiente', error: 'Error' };
+  const CAMPO_LABEL   = { 'total': 'Total', 'subTotal': 'Subtotal', 'impuestos.totalImpuestosTrasladados': 'IVA Trasladado', 'impuestos.totalImpuestosRetenidos': 'IVA Retenido', 'emisor.rfc': 'RFC Emisor', 'receptor.rfc': 'RFC Receptor', 'fecha': 'Fecha', 'tipoDeComprobante': 'Tipo', 'moneda': 'Moneda', 'tipoCambio': 'Tipo Cambio' };
+  const MESES         = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+  const periodoLabel  = ejercicio ? (periodo ? `${MESES[parseInt(periodo)-1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
+
+  // ── FASE 1: Datos que no dependen de los UUIDs ERP ───────────────────────
+  const [allErpCfdis, soloSat, resumenTipos, resumenSAT, cfdisMigrados] = await Promise.all([
+
+    // Todos los CFDIs ERP del periodo
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, ...periodoFilter })
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
+      .sort({ tipoDeComprobante: 1, lastComparisonStatus: 1, fecha: -1 })
+      .lean(),
+
+    // CFDIs SAT/MANUAL sin contraparte ERP
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...periodoFilter })
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus ejercicio periodo source')
+      .sort({ tipoDeComprobante: 1, total: -1 })
+      .lean(),
+
+    // Resumen KPI ERP por tipo
+    CFDI.aggregate([
+      { $match: { source: 'ERP', isActive: { $ne: false }, erpStatus: { $nin: ['Cancelado','Deshabilitado','Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter } },
+      { $group: {
+        _id:             '$tipoDeComprobante',
+        count:           { $sum: 1 },
+        totalMonto:      { $sum: MONTO_EFECTIVO_EXPR },
+        ivaTrasladadoTotal: { $sum: { $ifNull: ['$impuestos.totalImpuestosTrasladados', 0] } },
+        ivaRetenidoTotal:   { $sum: { $ifNull: ['$impuestos.totalImpuestosRetenidos',   0] } },
+        conciliados:     { $sum: { $cond: [{ $eq: ['$lastComparisonStatus', 'match'] }, 1, 0] } },
+        conDiscrepancia: { $sum: { $cond: [{ $in: ['$lastComparisonStatus', ['discrepancy','warning']] }, 1, 0] } },
+        notInSat:        { $sum: { $cond: [{ $eq: ['$lastComparisonStatus', 'not_in_sat'] }, 1, 0] } },
+        sinConciliar:    { $sum: { $cond: [{ $in: ['$lastComparisonStatus', [null,'error','pending']] }, 1, 0] } },
+      }},
+      { $sort: { _id: 1 } },
+    ]),
+
+    // Totales SAT directamente desde la colección CFDI (fuente confiable)
+    CFDI.aggregate([
+      { $match: { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, satStatus: 'Vigente', ...periodoFilter } },
+      { $group: {
+        _id:                '$tipoDeComprobante',
+        totalMonto:         { $sum: MONTO_EFECTIVO_EXPR },
+        ivaTrasladadoTotal: { $sum: { $ifNull: ['$impuestos.totalImpuestosTrasladados', 0] } },
+        ivaRetenidoTotal:   { $sum: { $ifNull: ['$impuestos.totalImpuestosRetenidos',   0] } },
+        count:              { $sum: 1 },
+      }},
+    ]),
+
+    // CFDIs migrados: en el periodo actual pero con InformacionGlobal que apunta a otro periodo
+    CFDI.find({
+      source: { $in: ['SAT', 'MANUAL'] },
+      isActive: { $ne: false },
+      'informacionGlobal.mes':  { $exists: true },
+      ...periodoFilter,
+      $or: [
+        { $expr: { $ne: [ { $toInt: '$informacionGlobal.mes' },  periodoFilter.periodo   || 0 ] } },
+        { $expr: { $ne: [ { $toInt: '$informacionGlobal.anio' }, periodoFilter.ejercicio || 0 ] } },
+      ],
+    })
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus erpStatus lastComparisonStatus ejercicio periodo informacionGlobal source')
+      .sort({ tipoDeComprobante: 1, fecha: -1 })
+      .lean(),
+  ]);
+
+  // ── FASE 2: Queries que usan los UUIDs de los CFDIs ERP del periodo ────────
+  const erpUuids = allErpCfdis.map(c => c.uuid).filter(Boolean);
+
+  const [comparisonsRaw, allDiscrepancias] = await Promise.all([
+    // Traer comparaciones más recientes por UUID con differences completo
+    // Se usa find+sort+dedup en lugar de aggregate para que $first no pierda el array differences
+    Comparison.find({ uuid: { $in: erpUuids } })
+      .select('uuid satCfdiId differences comparedAt')
+      .sort({ comparedAt: -1 })
+      .lean(),
+
+    // Discrepancias activas filtradas por UUID del ERP del periodo
+    Discrepancy.find({ uuid: { $in: erpUuids }, status: { $nin: ['resolved', 'ignored'] } })
+      .select('uuid type severity description erpValue satValue')
+      .lean(),
+  ]);
+
+  // ── Construir mapa de contrapartes SAT (más reciente por UUID) ─────────────
+  const compByUuid = {};
+  for (const c of comparisonsRaw) {
+    if (!compByUuid[c.uuid]) compByUuid[c.uuid] = c; // ya ordenado desc por comparedAt
+  }
+
+  const satIds = Object.values(compByUuid).filter(c => c.satCfdiId).map(c => c.satCfdiId);
+  const satCfdiDocs = satIds.length
+    ? await CFDI.find({ _id: { $in: satIds } }).select('uuid total subTotal impuestos tipoDeComprobante satStatus').lean()
+    : [];
+  const satById = {};
+  for (const s of satCfdiDocs) satById[s._id.toString()] = s;
+
+  // Mapa de totales SAT por tipo
+  const satTotalByTipo = {};
+  for (const r of resumenSAT) {
+    satTotalByTipo[r._id] = { totalMonto: r.totalMonto || 0, ivaTrasladadoTotal: r.ivaTrasladadoTotal || 0, ivaRetenidoTotal: r.ivaRetenidoTotal || 0, count: r.count || 0 };
+  }
+
+  // ── Mapas auxiliares ───────────────────────────────────────────────────────
+  const discByUuid = {};
+  for (const d of allDiscrepancias) {
+    if (!discByUuid[d.uuid]) discByUuid[d.uuid] = [];
+    discByUuid[d.uuid].push(d);
+  }
+
+  const cfdisByTipo = {};
+  for (const c of allErpCfdis) {
+    const t = c.tipoDeComprobante || 'Otro';
+    if (!cfdisByTipo[t]) cfdisByTipo[t] = [];
+    cfdisByTipo[t].push(c);
+  }
+
+  // ── Estilos ────────────────────────────────────────────────────────────────
+  const FG_HDR    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F3A5F' } };
+  const FG_TOTAL  = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F0FE' } };
+  const FG_KPI    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0F4FF' } };
+  const FG_WARN   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3CD' } };
+  const FG_DANGER = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8D7DA' } };
+  const FG_OK     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
+  const FG_SAT    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF8F0' } };
+  const FONT_HDR  = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+  const FONT_BOLD = { bold: true, size: 10 };
+  const MXN       = '"$"#,##0.00';
+  const colLetter = (n) => n <= 26 ? String.fromCharCode(64 + n) : 'Z';
+
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'NUMO'; workbook.created = new Date();
+
+  const addTitle = (sheet, title, ncols) => {
+    const lc = colLetter(ncols);
+    sheet.mergeCells(`A1:${lc}1`);
+    const t = sheet.getCell('A1');
+    t.value = title; t.font = { bold: true, size: 13, color: { argb: 'FF1F3A5F' } }; t.alignment = { horizontal: 'center', vertical: 'middle' };
+    sheet.getRow(1).height = 26;
+    sheet.mergeCells(`A2:${lc}2`);
+    const s = sheet.getCell('A2');
+    s.value = `Generado el ${new Date().toLocaleString('es-MX')} — ${periodoLabel}`; s.font = { italic: true, size: 9, color: { argb: 'FF64748B' } }; s.alignment = { horizontal: 'center' };
+    sheet.getRow(2).height = 15;
+  };
+
+  const fmtNum = (v) => v != null ? Math.round(v * 100) / 100 : null;
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJA 1 — Resumen General
+  // ══════════════════════════════════════════════════════════════════════════
+  const s1 = workbook.addWorksheet('1. Resumen General');
+  s1.views = [{ state: 'frozen', ySplit: 3 }];
+  addTitle(s1, `Reporte de Conciliación CFDI — ${periodoLabel}`, 11);
+
+  s1.columns = [
+    { key: 'tipo',        width: 8  },
+    { key: 'desc',        width: 12 },
+    { key: 'count',       width: 10 },
+    { key: 'totalERP',    width: 20 },
+    { key: 'ivaTraERP',   width: 20 },
+    { key: 'ivaRetERP',   width: 20 },
+    { key: 'totalSAT',    width: 20 },
+    { key: 'diferencia',  width: 20 },
+    { key: 'conciliados', width: 13 },
+    { key: 'discrepancia',width: 18 },
+    { key: 'notInSat',    width: 13 },
+  ];
+  const h1 = s1.getRow(3);
+  h1.values = ['Tipo','Descripción','CFDIs ERP','Total ERP','IVA Trasladado ERP','IVA Retenido ERP','Total SAT','Diferencia','Conciliados','Con Discrepancia','No en SAT'];
+  h1.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle' }; }); h1.height = 22;
+
+  const gt = { count: 0, totalERP: 0, ivaTraERP: 0, ivaRetERP: 0, totalSAT: 0, conciliados: 0, discrepancia: 0, notInSat: 0 };
+  for (const t of resumenTipos) {
+    const satT = satTotalByTipo[t._id]?.totalMonto || 0;
+    const dif  = fmtNum((t.totalMonto || 0) - satT);
+    const row  = s1.addRow({ tipo: t._id || '?', desc: TIPO_LABEL[t._id] || t._id || 'Otro', count: t.count, totalERP: fmtNum(t.totalMonto), ivaTraERP: fmtNum(t.ivaTrasladadoTotal), ivaRetERP: fmtNum(t.ivaRetenidoTotal), totalSAT: fmtNum(satT), diferencia: dif, conciliados: t.conciliados, discrepancia: t.conDiscrepancia, notInSat: t.notInSat });
+    ['totalERP','ivaTraERP','ivaRetERP','totalSAT','diferencia'].forEach(k => { row.getCell(k).numFmt = MXN; });
+    if (Math.abs(dif) > 0.01) row.getCell('diferencia').fill = FG_DANGER;
+    else                      row.getCell('diferencia').fill = FG_OK;
+    if (t.conDiscrepancia > 0) row.getCell('discrepancia').fill = FG_WARN;
+    if (t.notInSat > 0)        row.getCell('notInSat').fill     = FG_DANGER;
+    if (t.conciliados === t.count && t.count > 0) row.getCell('conciliados').fill = FG_OK;
+    gt.count += t.count; gt.totalERP += t.totalMonto || 0; gt.ivaTraERP += t.ivaTrasladadoTotal || 0; gt.ivaRetERP += t.ivaRetenidoTotal || 0; gt.totalSAT += satT; gt.conciliados += t.conciliados; gt.discrepancia += t.conDiscrepancia; gt.notInSat += t.notInSat;
+  }
+  const tr1 = s1.addRow({ tipo: 'TOTAL', desc: '', count: gt.count, totalERP: fmtNum(gt.totalERP), ivaTraERP: fmtNum(gt.ivaTraERP), ivaRetERP: fmtNum(gt.ivaRetERP), totalSAT: fmtNum(gt.totalSAT), diferencia: fmtNum(gt.totalERP - gt.totalSAT), conciliados: gt.conciliados, discrepancia: gt.discrepancia, notInSat: gt.notInSat });
+  tr1.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+  ['totalERP','ivaTraERP','ivaRetERP','totalSAT','diferencia'].forEach(k => { tr1.getCell(k).numFmt = MXN; });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJAS POR TIPO — una hoja por cada tipo de comprobante con CFDIs
+  // ══════════════════════════════════════════════════════════════════════════
+  const DETAIL_COLS = [
+    { key: 'uuid',         header: 'UUID',                width: 38 },
+    { key: 'serie',        header: 'Serie',               width: 8  },
+    { key: 'folio',        header: 'Folio',               width: 10 },
+    { key: 'fecha',        header: 'Fecha',               width: 12 },
+    { key: 'rfcEmisor',    header: 'RFC Emisor',          width: 15 },
+    { key: 'nomEmisor',    header: 'Nombre Emisor',       width: 30 },
+    { key: 'rfcReceptor',  header: 'RFC Receptor',        width: 15 },
+    { key: 'nomReceptor',  header: 'Nombre Receptor',     width: 30 },
+    { key: 'subERP',       header: 'Subtotal ERP',        width: 16 },
+    { key: 'ivaTraERP',    header: 'IVA Trasladado ERP',  width: 18 },
+    { key: 'ivaRetERP',    header: 'IVA Retenido ERP',    width: 18 },
+    { key: 'totalERP',     header: 'Total ERP',           width: 16 },
+    { key: 'subSAT',       header: 'Subtotal SAT',        width: 16 },
+    { key: 'ivaTraSAT',    header: 'IVA Trasladado SAT',  width: 18 },
+    { key: 'totalSAT',     header: 'Total SAT',           width: 16 },
+    { key: 'diferencia',   header: 'Diferencia',          width: 16 },
+    { key: 'estadoERP',    header: 'Estado ERP',          width: 18 },
+    { key: 'estadoSAT',    header: 'Estado SAT',          width: 14 },
+    { key: 'conciliacion', header: 'Conciliación',        width: 18 },
+    { key: 'tiposDisc',    header: 'Tipos Discrepancia',  width: 35 },
+    { key: 'detalleDisc',  header: 'Detalle Diferencias', width: 80 },
+  ];
+  const MONEY_KEYS = ['subERP','ivaTraERP','ivaRetERP','totalERP','subSAT','ivaTraSAT','totalSAT','diferencia'];
+
+  const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))].sort();
+
+  for (const tipo of tiposEnUso) {
+    const cfdis = cfdisByTipo[tipo] || [];
+    const label  = TIPO_LABEL[tipo] || tipo;
+    const sheetN = workbook.worksheets.length + 1;
+    const sheet  = workbook.addWorksheet(`${sheetN}. ${label} (${tipo})`);
+    sheet.views  = [{ state: 'frozen', ySplit: 5 }];
+    addTitle(sheet, `${label} (Tipo ${tipo}) — ${periodoLabel}`, DETAIL_COLS.length);
+
+    // ── KPI row (fila 3) ──
+    const resT   = resumenTipos.find(r => r._id === tipo) || {};
+    const satTot = satTotalByTipo[tipo]?.totalMonto || 0;
+    const difTot = fmtNum((resT.totalMonto || 0) - satTot);
+    const NC     = DETAIL_COLS.length;
+    const kpiTxt = [
+      `CFDIs ERP: ${cfdis.length}`,
+      `Total ERP: $${(resT.totalMonto || 0).toLocaleString('es-MX', { minimumFractionDigits: 2 })}`,
+      `Total SAT: $${satTot.toLocaleString('es-MX', { minimumFractionDigits: 2 })}`,
+      `Diferencia: $${difTot.toLocaleString('es-MX', { minimumFractionDigits: 2 })}`,
+      `Conciliados: ${resT.conciliados || 0}  |  Con discrepancia: ${resT.conDiscrepancia || 0}  |  No en SAT: ${resT.notInSat || 0}`,
+    ].join('     ');
+
+    sheet.mergeCells(`A3:${colLetter(NC)}3`);
+    const kpiCell = sheet.getCell('A3');
+    kpiCell.value = kpiTxt;
+    kpiCell.font  = FONT_BOLD;
+    kpiCell.fill  = FG_KPI;
+    kpiCell.alignment = { horizontal: 'left', vertical: 'middle' };
+    sheet.getRow(3).height = 20;
+
+    sheet.mergeCells(`A4:${colLetter(NC)}4`);
+    sheet.getRow(4).height = 6;
+
+    // ── Cabecera de tabla (fila 5) ──
+    sheet.columns = DETAIL_COLS;
+    const hdrRow  = sheet.getRow(5);
+    hdrRow.values = DETAIL_COLS.map(c => c.header);
+    hdrRow.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
+    hdrRow.height = 30;
+
+    let sumSubERP = 0, sumIvaTraERP = 0, sumIvaRetERP = 0, sumTotERP = 0;
+    let sumSubSAT = 0, sumIvaTraSAT = 0, sumTotSAT = 0, sumDif = 0;
+
+    for (const cfdi of cfdis) {
+      const comp    = compByUuid[cfdi.uuid];
+      const satCfdi = comp?.satCfdiId ? satById[comp.satCfdiId.toString()] : null;
+      const discs   = discByUuid[cfdi.uuid] || [];
+
+      const subERP    = cfdi.subTotal || 0;
+      const ivaTraERP = cfdi.impuestos?.totalImpuestosTrasladados || 0;
+      const ivaRetERP = cfdi.impuestos?.totalImpuestosRetenidos   || 0;
+      const totERP    = cfdi.total || 0;
+      const subSAT    = satCfdi ? (satCfdi.subTotal || 0) : null;
+      const ivaTraSAT = satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null;
+      const totSAT    = satCfdi ? (satCfdi.total || 0) : null;
+      const dif       = totSAT !== null ? fmtNum(totERP - totSAT) : null;
+
+      // Tipos de discrepancia
+      const tiposDisc = [...new Set(discs.map(d => d.type))].join(', ');
+
+      // Detalle campo a campo: primero desde Comparison.differences, sino desde Discrepancy
+      let detalleDisc = '';
+      if (comp?.differences?.length) {
+        detalleDisc = comp.differences.map(d => {
+          const campo = CAMPO_LABEL[d.field] || d.field;
+          const sev   = SEV_LABEL[d.severity] || '';
+          const erp   = d.erpValue != null ? d.erpValue : '—';
+          const sat   = d.satValue != null ? d.satValue : '—';
+          return `${campo} [${sev}]: ERP=${erp} → SAT=${sat}`;
+        }).join(' | ');
+      } else if (discs.length) {
+        detalleDisc = discs.map(d => `${d.type} (${SEV_LABEL[d.severity] || d.severity}): ${d.description}`).join(' | ');
+      }
+
+      const row = sheet.addRow({
+        uuid: cfdi.uuid, serie: cfdi.serie || '', folio: cfdi.folio || '',
+        fecha: cfdi.fecha ? new Date(cfdi.fecha).toLocaleDateString('es-MX') : '',
+        rfcEmisor: cfdi.emisor?.rfc || '', nomEmisor: cfdi.emisor?.nombre || '',
+        rfcReceptor: cfdi.receptor?.rfc || '', nomReceptor: cfdi.receptor?.nombre || '',
+        subERP, ivaTraERP, ivaRetERP, totalERP: totERP,
+        subSAT, ivaTraSAT, totalSAT: totSAT,
+        diferencia: dif,
+        estadoERP:    cfdi.erpStatus || '—',
+        estadoSAT:    cfdi.satStatus || '—',
+        conciliacion: COMP_LABEL[cfdi.lastComparisonStatus] || cfdi.lastComparisonStatus || 'Sin comparar',
+        tiposDisc,
+        detalleDisc,
+      });
+
+      MONEY_KEYS.forEach(k => { if (row.getCell(k).value != null) row.getCell(k).numFmt = MXN; });
+
+      // Color estado conciliación
+      const cs = cfdi.lastComparisonStatus;
+      if (cs === 'match') row.getCell('conciliacion').fill = FG_OK;
+      else if (cs === 'discrepancy' || cs === 'warning') row.getCell('conciliacion').fill = FG_WARN;
+      else if (cs === 'not_in_sat' || cs === 'cancelled') row.getCell('conciliacion').fill = FG_DANGER;
+
+      // Color diferencia
+      if (dif !== null && Math.abs(dif) > 0.01) row.getCell('diferencia').fill = FG_DANGER;
+
+      // Color discrepancias
+      if (discs.some(d => d.severity === 'critical' || d.severity === 'high')) row.getCell('tiposDisc').fill = FG_DANGER;
+      else if (discs.length > 0) row.getCell('tiposDisc').fill = FG_WARN;
+
+      sumSubERP    += subERP;     sumIvaTraERP += ivaTraERP;  sumIvaRetERP += ivaRetERP; sumTotERP += totERP;
+      sumSubSAT    += subSAT    || 0;
+      sumIvaTraSAT += ivaTraSAT || 0;
+      sumTotSAT    += totSAT    || 0;
+      sumDif       += dif       || 0;
+    }
+
+    // Fila totales
+    const tr = sheet.addRow({ uuid: `TOTAL (${cfdis.length} CFDIs)`, subERP: fmtNum(sumSubERP), ivaTraERP: fmtNum(sumIvaTraERP), ivaRetERP: fmtNum(sumIvaRetERP), totalERP: fmtNum(sumTotERP), subSAT: fmtNum(sumSubSAT), ivaTraSAT: fmtNum(sumIvaTraSAT), totalSAT: fmtNum(sumTotSAT), diferencia: fmtNum(sumDif) });
+    tr.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+    MONEY_KEYS.forEach(k => { tr.getCell(k).numFmt = MXN; });
+    if (Math.abs(sumDif) > 0.01) tr.getCell('diferencia').fill = FG_DANGER;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJA — Facturas Migradas
+  // CFDIs cuya InformacionGlobal apunta a un periodo distinto al actual
+  // (fueron reclasificados manualmente a este periodo)
+  // ══════════════════════════════════════════════════════════════════════════
+  if (cfdisMigrados.length > 0) {
+    const sMig  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Facturas Migradas`);
+    sMig.views  = [{ state: 'frozen', ySplit: 3 }];
+    const MIG_COLS = [
+      { key: 'tipo',       header: 'Tipo',             width: 7  },
+      { key: 'desc',       header: 'Descripción',      width: 11 },
+      { key: 'source',     header: 'Origen',           width: 9  },
+      { key: 'uuid',       header: 'UUID',             width: 38 },
+      { key: 'serie',      header: 'Serie',            width: 8  },
+      { key: 'folio',      header: 'Folio',            width: 10 },
+      { key: 'fecha',      header: 'Fecha',            width: 12 },
+      { key: 'rfcEmisor',  header: 'RFC Emisor',       width: 15 },
+      { key: 'nomEmisor',  header: 'Nombre Emisor',    width: 30 },
+      { key: 'rfcRec',     header: 'RFC Receptor',     width: 15 },
+      { key: 'nomRec',     header: 'Nombre Receptor',  width: 30 },
+      { key: 'subTotal',   header: 'Subtotal',         width: 16 },
+      { key: 'ivaTrasl',   header: 'IVA Trasladado',   width: 18 },
+      { key: 'total',      header: 'Total',            width: 16 },
+      { key: 'periodoCurrent', header: 'Periodo Actual (ERP)', width: 20 },
+      { key: 'periodoIG',  header: 'Periodo InfGlobal',width: 20 },
+      { key: 'estadoSAT',  header: 'Estado SAT',       width: 13 },
+      { key: 'concil',     header: 'Conciliación',     width: 18 },
+    ];
+    addTitle(sMig, `Facturas Migradas al Periodo — ${periodoLabel}`, MIG_COLS.length);
+    sMig.columns = MIG_COLS;
+    const hdrMig = sMig.getRow(3);
+    hdrMig.values = MIG_COLS.map(c => c.header);
+    hdrMig.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
+    hdrMig.height = 28;
+
+    const FG_MIG = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEDE9FE' } };
+    for (const c of cfdisMigrados) {
+      const periodoActual = `${c.ejercicio || '?'}/${String(c.periodo || '?').padStart(2,'0')}`;
+      const periodoIG     = `${c.informacionGlobal?.anio || '?'}/${String(c.informacionGlobal?.mes || '?').padStart(2,'0')}`;
+      const row = sMig.addRow({
+        tipo:         c.tipoDeComprobante || '',
+        desc:         TIPO_LABEL[c.tipoDeComprobante] || '',
+        source:       c.source,
+        uuid:         c.uuid,
+        serie:        c.serie  || '',
+        folio:        c.folio  || '',
+        fecha:        c.fecha  ? new Date(c.fecha).toLocaleDateString('es-MX') : '',
+        rfcEmisor:    c.emisor?.rfc    || '',
+        nomEmisor:    c.emisor?.nombre || '',
+        rfcRec:       c.receptor?.rfc    || '',
+        nomRec:       c.receptor?.nombre || '',
+        subTotal:     c.subTotal || 0,
+        ivaTrasl:     c.impuestos?.totalImpuestosTrasladados || 0,
+        total:        c.total || 0,
+        periodoCurrent: periodoActual,
+        periodoIG,
+        estadoSAT:    c.satStatus || '—',
+        concil:       COMP_LABEL[c.lastComparisonStatus] || c.lastComparisonStatus || 'Sin comparar',
+      });
+      ['subTotal','ivaTrasl','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
+      row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_MIG; });
+      if (periodoActual !== periodoIG) {
+        row.getCell('periodoCurrent').fill = FG_WARN;
+        row.getCell('periodoIG').fill      = FG_WARN;
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJA FINAL — Solo en SAT (no en ERP)
+  // ══════════════════════════════════════════════════════════════════════════
+  const sN   = workbook.worksheets.length + 1;
+  const sLast = workbook.addWorksheet(`${sN}. Solo en SAT`);
+  sLast.views = [{ state: 'frozen', ySplit: 3 }];
+  const SAT_COLS = [
+    { key: 'tipo',       header: 'Tipo',            width: 7  },
+    { key: 'desc',       header: 'Descripción',     width: 11 },
+    { key: 'source',     header: 'Origen',          width: 9  },
+    { key: 'uuid',       header: 'UUID',            width: 38 },
+    { key: 'serie',      header: 'Serie',           width: 8  },
+    { key: 'folio',      header: 'Folio',           width: 10 },
+    { key: 'fecha',      header: 'Fecha',           width: 12 },
+    { key: 'rfcEmisor',  header: 'RFC Emisor',      width: 15 },
+    { key: 'nomEmisor',  header: 'Nombre Emisor',   width: 30 },
+    { key: 'rfcRec',     header: 'RFC Receptor',    width: 15 },
+    { key: 'nomRec',     header: 'Nombre Receptor', width: 30 },
+    { key: 'subTotal',   header: 'Subtotal',        width: 16 },
+    { key: 'ivaTrasl',   header: 'IVA Trasladado',  width: 18 },
+    { key: 'ivaRet',     header: 'IVA Retenido',    width: 18 },
+    { key: 'total',      header: 'Total',           width: 16 },
+    { key: 'estadoSAT',  header: 'Estado SAT',      width: 13 },
+  ];
+  addTitle(sLast, `CFDIs en SAT sin contraparte en ERP — ${periodoLabel}`, SAT_COLS.length);
+  sLast.columns = SAT_COLS;
+  const hdrLast = sLast.getRow(3);
+  hdrLast.values = SAT_COLS.map(c => c.header);
+  hdrLast.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
+  hdrLast.height = 28;
+
+  for (const c of soloSat) {
+    const row = sLast.addRow({ tipo: c.tipoDeComprobante || '', desc: TIPO_LABEL[c.tipoDeComprobante] || '', source: c.source, uuid: c.uuid, serie: c.serie || '', folio: c.folio || '', fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '', rfcEmisor: c.emisor?.rfc || '', nomEmisor: c.emisor?.nombre || '', rfcRec: c.receptor?.rfc || '', nomRec: c.receptor?.nombre || '', subTotal: c.subTotal || 0, ivaTrasl: c.impuestos?.totalImpuestosTrasladados || 0, ivaRet: c.impuestos?.totalImpuestosRetenidos || 0, total: c.total || 0, estadoSAT: c.satStatus || '—' });
+    ['subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
+    row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_SAT; });
+  }
+
+  // ── Respuesta ──────────────────────────────────────────────────────────────
+  const filename = `conciliacion_${ejercicio || 'all'}_${periodo || 'all'}_${Date.now()}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  await workbook.xlsx.write(res);
+  res.end();
+});
+
+module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel };

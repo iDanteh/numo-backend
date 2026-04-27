@@ -122,17 +122,12 @@ const _analizarCFDI = (cfdi, infoGlobal) => {
 
 // ── Construcción del query de filtro ─────────────────────────────────────────
 
-const _buildFiltro = ({ ejercicio, periodo, rfc, source, mesIG } = {}) => {
+const _buildFiltro = ({ ejercicio, periodo, rfc, source } = {}) => {
   const filtro = { isActive: true };
   if (ejercicio) filtro.ejercicio = Number(ejercicio);
   if (periodo)   filtro.periodo   = Number(periodo);
   if (rfc)       filtro['emisor.rfc'] = rfc.toUpperCase().trim();
   if (source)    filtro.source    = source.toUpperCase();
-  // mesIG filtra por InformacionGlobal.Mes directamente (con y sin cero inicial)
-  if (mesIG) {
-    const n = Number(mesIG);
-    filtro['informacionGlobal.mes'] = { $in: [String(n), String(n).padStart(2, '0')] };
-  }
   return filtro;
 };
 
@@ -156,13 +151,19 @@ const generarPlan = async (filtros = {}) => {
   const filtroBase = _buildFiltro(filtros);
 
   // ── Consulta 1: CFDIs que ya tienen informacionGlobal en MongoDB
+  const mesIGVals = filtros.mesIG
+    ? [String(Number(filtros.mesIG)), String(Number(filtros.mesIG)).padStart(2, '0')]
+    : null;
   const conCampo = await CFDI.find({
     ...filtroBase,
-    'informacionGlobal.mes': { $exists: true, $ne: null },
+    'informacionGlobal.mes': mesIGVals
+      ? { $in: mesIGVals }
+      : { $exists: true, $ne: null },
   }, 'uuid source fecha periodo ejercicio informacionGlobal').lean();
 
   // ── Consulta 2: CFDIs SAT sin el campo pero con xmlContent que contenga InformacionGlobal
   //    (datos existentes antes de esta actualización)
+  //    No se puede filtrar por informacionGlobal.mes aquí ($exists: false), se filtra post-extracción
   const sinCampo = filtros.source === 'ERP' ? [] : await CFDI.find({
     ...filtroBase,
     'informacionGlobal.mes': { $exists: false },
@@ -199,7 +200,10 @@ const generarPlan = async (filtros = {}) => {
 
   for (const cfdi of sinCampoFiltrado) {
     const ig = _extraerDeXML(cfdi.xmlContent);
-    if (ig) analizar(cfdi, ig);
+    if (!ig) continue;
+    // Si se filtró por mes, verificar que el mes extraído del XML coincida
+    if (mesIGVals && !mesIGVals.includes(ig.mes)) continue;
+    analizar(cfdi, ig);
   }
 
   // ── Ejemplos de inconsistencias (primeras 5) ─────────────────────────────

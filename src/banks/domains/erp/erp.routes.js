@@ -24,13 +24,14 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     return res.status(503).json({ error: 'ERP no configurado (ERP_CAJA_BASE_URL ausente)' });
   }
 
-  const { fechaDesde, fechaHasta, estadoCobro, page, search } = req.query;
+  const { fechaDesde, fechaHasta, estadoCobro, page, serieExterna, folioExterno } = req.query;
   const pageNum = Math.max(1, parseInt(page ?? '1', 10));
-  const searchQ = search ? String(search).toLowerCase().trim() : '';
 
   // Fetch ALL records from ERP (no page param — we paginate locally)
   const params = { fechaDesde, fechaHasta };
-  if (estadoCobro) params.estadoCobro = estadoCobro;
+  if (estadoCobro)   params.estadoCobro   = estadoCobro;
+  if (serieExterna)  params.serieExterna  = String(serieExterna).trim();
+  if (folioExterno)  params.folioExterno  = String(folioExterno).trim();
 
   const response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
     params,
@@ -94,24 +95,12 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     fechaVencimiento: c.fechaVencimiento ?? null,
   }));
 
-  // Local search filter (applied before pagination so it covers all records)
-  const filtered = searchQ
-    ? allCuentas.filter(c =>
-        String(c.id    ?? '').toLowerCase().includes(searchQ) ||
-        String(c.serie ?? '').toLowerCase().includes(searchQ) ||
-        String(c.folio ?? '').toLowerCase().includes(searchQ) ||
-        `${c.serie}-${c.folio}`.toLowerCase().includes(searchQ) ||
-        String(c.total      ?? '').includes(searchQ) ||
-        String(c.saldoActual ?? '').includes(searchQ)
-      )
-    : allCuentas;
-
-  // Local pagination
-  const total        = filtered.length;
+  // Local pagination (filtering is now handled server-side by the ERP via serieExterna/folioExterno)
+  const total        = allCuentas.length;
   const totalPaginas = Math.max(1, Math.ceil(total / ERP_PAGE_SIZE));
   const safePage     = Math.min(pageNum, totalPaginas);
   const start        = (safePage - 1) * ERP_PAGE_SIZE;
-  const cuentas      = filtered.slice(start, start + ERP_PAGE_SIZE);
+  const cuentas      = allCuentas.slice(start, start + ERP_PAGE_SIZE);
 
   res.json({
     data: cuentas,

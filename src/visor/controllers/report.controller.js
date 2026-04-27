@@ -550,12 +550,13 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   ];
 
   // Casos adicionales leídos directo de CFDI (no dependen de Comparison.ejercicio/periodo)
-  const [compItems, notInErpCfdis, satCanceladoErpActivo, erpNotInSat, erpDeshabilitadosCfdis] = await Promise.all([
+  const [compItems, notInErpCfdis, satCanceladoErpActivo, erpNotInSat, erpDeshabilitadosCfdis, erpCanceladosCfdis] = await Promise.all([
     Comparison.aggregate(pipeline),
     CFDI.find({ ...cfdiSat, lastComparisonStatus: 'not_in_erp' }).select(cfdiSelSat).sort({ total: -1 }).limit(lm).lean(),
     CFDI.find({ ...cfdiErp, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } }).select(cfdiSel).sort({ total: -1 }).limit(lm).lean(),
     CFDI.find({ ...cfdiErp, erpStatus: { $nin: ['Cancelado', 'Cancelacion Pendiente', 'Deshabilitado'] }, lastComparisonStatus: 'not_in_sat' }).select(cfdiSel).sort({ total: -1 }).limit(lm).lean(),
     CFDI.find({ ...cfdiErp, erpStatus: 'Deshabilitado' }).select(cfdiSel).sort({ tipoDeComprobante: 1, total: -1 }).limit(lm).lean(),
+    CFDI.find({ ...cfdiErp, erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente'] } }).select(cfdiSel).sort({ tipoDeComprobante: 1, total: -1 }).limit(lm).lean(),
   ]);
 
   // UUIDs ya cubiertos por el pipeline para no duplicar
@@ -593,8 +594,17 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
 
   const allItems = [...compItems, ...notInErpItems, ...satCanceladoItems, ...notInSatItems];
 
+  // CFDIs ERP cancelados (Cancelado + Cancelacion Pendiente) para el tab "Cancelados" del modal
+  const canceladosItems = erpCanceladosCfdis
+    .filter(c => !compUuids.has((c.uuid || '').toUpperCase()))
+    .map(c => ({
+      uuid: c.uuid, status: 'cancelado_erp', tipoDeComprobante: c.tipoDeComprobante,
+      criticalCount: 0, differences: [], satCfdiId: null,
+      erpCfdiId: { uuid: c.uuid, serie: c.serie, folio: c.folio, fecha: c.fecha, total: c.total, tipoDeComprobante: c.tipoDeComprobante, emisor: c.emisor, receptor: c.receptor, erpStatus: c.erpStatus, satStatus: c.satStatus },
+    }));
+
   // Separar cancelados y deshabilitados del flujo principal de vigentes con discrepancia
-  const cancelados      = allItems.filter(i => i.status === 'cancelled');
+  const cancelados      = canceladosItems;
   const items           = allItems.filter(i => i.status !== 'cancelled');
   const deshabilitados  = deshabilitadosItems;
 

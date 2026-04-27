@@ -14,18 +14,23 @@ const ERP_CAJA_BASE_URL = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '
 const ERP_FACT_BASE_URL = (process.env.ERP_FACT_BASE_URL || '').replace(/\/$/, '');
 const ERP_TOKEN    = process.env.ERP_TOKEN || '';
 
+const ERP_PAGE_SIZE = 50;
+
 // GET /api/erp/cuentas-pendientes
-// Parámetros: fechaDesde, fechaHasta, estadoCobro (opcional; 'pendiente' para solo pendientes)
+// Parámetros: fechaDesde, fechaHasta, estadoCobro (opcional; 'pendiente' para solo pendientes), page
+// La paginación se aplica localmente sobre la respuesta completa del ERP.
 router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) => {
   if (!ERP_CAJA_BASE_URL) {
     return res.status(503).json({ error: 'ERP no configurado (ERP_CAJA_BASE_URL ausente)' });
   }
 
-  const { fechaDesde, fechaHasta, estadoCobro, page } = req.query;
+  const { fechaDesde, fechaHasta, estadoCobro, page, search } = req.query;
+  const pageNum = Math.max(1, parseInt(page ?? '1', 10));
+  const searchQ = search ? String(search).toLowerCase().trim() : '';
 
+  // Fetch ALL records from ERP (no page param — we paginate locally)
   const params = { fechaDesde, fechaHasta };
   if (estadoCobro) params.estadoCobro = estadoCobro;
-  if (page)        params.page        = page;
 
   const response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
     params,
@@ -76,7 +81,7 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     )));
   }
 
-  const cuentas = raw.map(c => ({
+  const allCuentas = raw.map(c => ({
     id:               c.id,
     serie:            c.serie,
     folio:            c.folio,
@@ -87,15 +92,30 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     total:            c.total,
     saldoActual:      c.saldoActual,
     fechaVencimiento: c.fechaVencimiento ?? null,
-    folioFiscal:      c.folioFiscal ?? null,
   }));
+
+  // Local search filter (applied before pagination so it covers all records)
+  const filtered = searchQ
+    ? allCuentas.filter(c =>
+        String(c.id    ?? '').toLowerCase().includes(searchQ) ||
+        String(c.serie ?? '').toLowerCase().includes(searchQ) ||
+        String(c.folio ?? '').toLowerCase().includes(searchQ) ||
+        `${c.serie}-${c.folio}`.toLowerCase().includes(searchQ) ||
+        String(c.total      ?? '').includes(searchQ) ||
+        String(c.saldoActual ?? '').includes(searchQ)
+      )
+    : allCuentas;
+
+  // Local pagination
+  const total        = filtered.length;
+  const totalPaginas = Math.max(1, Math.ceil(total / ERP_PAGE_SIZE));
+  const safePage     = Math.min(pageNum, totalPaginas);
+  const start        = (safePage - 1) * ERP_PAGE_SIZE;
+  const cuentas      = filtered.slice(start, start + ERP_PAGE_SIZE);
 
   res.json({
     data: cuentas,
-    pagination: {
-      page:        dataPayload.paginaActual  ?? Number(page ?? 1),
-      totalPaginas: dataPayload.totalPaginas ?? null,
-    },
+    pagination: { page: safePage, totalPaginas, total },
   });
 }));
 

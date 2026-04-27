@@ -48,4 +48,10 @@ function invalidate() {
   _expiry = 0;
 }
 
-module.exports = { hasPermission, hasAllPermissions, invalidate };
+/** Returns the permission array for a role from DB cache. */
+async function getPermissions(role) {
+  const map = await _get();
+  return map.get(role)?.permissions ?? [];
+}
+
+module.exports = { hasPermission, hasAllPermissions, invalidate, getPermissions };

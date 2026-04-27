@@ -786,12 +786,13 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     if (!compByUuid[c.uuid]) compByUuid[c.uuid] = c; // ya ordenado desc por comparedAt
   }
 
-  const satIds = Object.values(compByUuid).filter(c => c.satCfdiId).map(c => c.satCfdiId);
-  const satCfdiDocs = satIds.length
-    ? await CFDI.find({ _id: { $in: satIds } }).select('uuid total subTotal impuestos tipoDeComprobante satStatus').lean()
+  // Buscar contrapartes SAT directamente por UUID (más confiable que satCfdiId de Comparison)
+  const satCfdiDocs = erpUuids.length
+    ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: erpUuids }, isActive: { $ne: false } })
+        .select('uuid total subTotal impuestos satStatus').lean()
     : [];
-  const satById = {};
-  for (const s of satCfdiDocs) satById[s._id.toString()] = s;
+  const satByUuid = {};
+  for (const s of satCfdiDocs) satByUuid[(s.uuid || '').toUpperCase()] = s;
 
   // Mapa de totales SAT por tipo
   const satTotalByTipo = {};
@@ -958,7 +959,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
     for (const cfdi of cfdis) {
       const comp    = compByUuid[cfdi.uuid];
-      const satCfdi = comp?.satCfdiId ? satById[comp.satCfdiId.toString()] : null;
+      const satCfdi = satByUuid[(cfdi.uuid || '').toUpperCase()] || null;
       const discs   = discByUuid[cfdi.uuid] || [];
 
       const subERP    = cfdi.subTotal || 0;
@@ -1019,9 +1020,9 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
       // Resaltar filas canceladas en ERP o en SAT
       if (cfdi.erpStatus === 'Cancelado' || cfdi.erpStatus === 'Cancelacion Pendiente') {
-        row.eachCell(cell => { cell.fill = FG_DANGER; });
+        row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_DANGER; });
       } else if (cfdi.satStatus === 'Cancelado') {
-        row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_DANGER; });
+        row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_DANGER; });
       }
 
       sumSubERP    += subERP;     sumIvaTraERP += ivaTraERP;  sumIvaRetERP += ivaRetERP; sumTotERP += totERP;

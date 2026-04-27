@@ -8,7 +8,7 @@ const {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
-  getLimitesEstado, getHistory,
+  getLimitesEstado, getHistory, getUltimoErp,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -69,5 +69,6 @@ router.get('/descarga-manual/status/:jobId', authenticate, getDownloadStatus);
 router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
 router.get('/historial',                     authenticate, getHistory);
 router.get('/historial/:rfc',                authenticate, getHistory);
+router.get('/ultimo-erp',                    authenticate, getUltimoErp);
 
 module.exports = router;

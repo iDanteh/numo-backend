@@ -509,12 +509,11 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
   const lm = Math.min(2000, Math.max(1, parseInt(limit)));
 
-  // matchPeriodo sobre Comparison (funciona para discrepancy/warning/not_in_sat/cancelled
-  // porque esos registros sí tienen ejercicio/periodo del CFDI ERP de referencia)
+  // matchPeriodo sobre Comparison — solo ejercicio/periodo, NO tipoDeComprobante
+  // (tipoDeComprobante puede ser null en Comparisons antiguos, lo filtramos post-lookup)
   const matchPeriodo = {};
-  if (ejercicio)         matchPeriodo.ejercicio         = parseInt(ejercicio);
-  if (periodo)           matchPeriodo.periodo           = parseInt(periodo);
-  if (tipoDeComprobante) matchPeriodo.tipoDeComprobante = tipoDeComprobante;
+  if (ejercicio) matchPeriodo.ejercicio = parseInt(ejercicio);
+  if (periodo)   matchPeriodo.periodo   = parseInt(periodo);
 
   // Filtro CFDI para los casos que se leen directamente de la colección CFDI
   const cfdiErp = { source: 'ERP', isActive: { $ne: false } };
@@ -544,6 +543,11 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
     { $limit: lm },
     { $lookup: { from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id', as: 'erpCfdiId', pipeline: [{ $project: erpProjection }] } },
     { $unwind: { path: '$erpCfdiId', preserveNullAndEmptyArrays: true } },
+    // Filtrar por tipo DESPUÉS del lookup (Comparison.tipoDeComprobante puede ser null)
+    ...(tipoDeComprobante ? [{ $match: { $or: [
+      { 'erpCfdiId.tipoDeComprobante': tipoDeComprobante },
+      { tipoDeComprobante },
+    ]}}] : []),
     { $lookup: { from: 'cfdis', localField: 'satCfdiId', foreignField: '_id', as: 'satCfdiId', pipeline: [{ $project: satProjection }] } },
     { $unwind: { path: '$satCfdiId', preserveNullAndEmptyArrays: true } },
   ];

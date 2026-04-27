@@ -21,10 +21,11 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     return res.status(503).json({ error: 'ERP no configurado (ERP_CAJA_BASE_URL ausente)' });
   }
 
-  const { fechaDesde, fechaHasta, estadoCobro } = req.query;
+  const { fechaDesde, fechaHasta, estadoCobro, page } = req.query;
 
   const params = { fechaDesde, fechaHasta };
   if (estadoCobro) params.estadoCobro = estadoCobro;
+  if (page)        params.page        = page;
 
   const response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
     params,
@@ -32,7 +33,8 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     timeout: 15000,
   });
 
-  const raw = response.data?.Data?.cuentas || [];
+  const dataPayload = response.data?.Data ?? {};
+  const raw         = dataPayload.cuentas || [];
   const now = new Date();
 
   // Upsert idempotente: cada cuenta se identifica por su id del ERP
@@ -88,7 +90,13 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     folioFiscal:      c.folioFiscal ?? null,
   }));
 
-  res.json(cuentas);
+  res.json({
+    data: cuentas,
+    pagination: {
+      page:        dataPayload.paginaActual  ?? Number(page ?? 1),
+      totalPaginas: dataPayload.totalPaginas ?? null,
+    },
+  });
 }));
 
 // GET /api/erp/facturas/reporte

@@ -14,8 +14,9 @@
 
 const userRepo  = require('./repositories/user.repository');
 const { NotFoundError, BadRequestError } = require('../../../shared/errors/AppError');
-const { getIo }  = require('../../shared/socket');
-const { ROLES }  = require('../../../shared/config/rbac');
+const { getIo }    = require('../../shared/socket');
+const { ROLES }    = require('../../../shared/config/rbac');
+const rbacStore    = require('../../../shared/services/rbac-store');
 
 /**
  * Resuelve (o crea) el usuario a partir de los claims del JWT de Auth0.
@@ -55,7 +56,8 @@ async function updateRole(id, role) {
   // para evitar un round-trip HTTP adicional en el cliente.
   const io = getIo();
   if (io && user.auth0Sub) {
-    const permissions = ROLES[user.role]?.permissions ?? [];
+    // Use DB permissions (rbac-store) so custom role edits are reflected correctly
+    const permissions = await rbacStore.getPermissions(user.role);
     io.to(`user:${user.auth0Sub}`).emit('role:updated', { role: user.role, permissions });
   }
 

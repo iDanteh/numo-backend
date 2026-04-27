@@ -282,7 +282,10 @@ const startDownload = asyncHandler(async (req, res) => {
   // ── Solicitudes SAT necesarias ────────────────────────────────────────────
   // Modo CFDI + Emitidos: se divide en 5 solicitudes (Ingresos, Egresos, Pagos, Nomina, Traslados).
   // Modo Metadata o tipos específicos: 1 solicitud.
-  const solicitudesNecesarias = (modoSolicitud === 'CFDI' && tipoComprobante === 'Emitidos') ? 5 : 1;
+  // Para modo auto (null): si el rango es ≤5 días se usará CFDI, si no Metadata.
+  const diffDiasCheck = Math.round((new Date(`${normalizarFecha(fechaFin, 'fechaFin')}T23:59:59`) - new Date(`${normalizarFecha(fechaInicio, 'fechaInicio')}T00:00:00`)) / (1000 * 60 * 60 * 24));
+  const modoEfectivo = modoSolicitud ?? (diffDiasCheck > 5 ? 'Metadata' : 'CFDI');
+  const solicitudesNecesarias = (modoEfectivo === 'CFDI' && tipoComprobante === 'Emitidos') ? 5 : 1;
   // ──────────────────────────────────────────────────────────────────────────
 
   // ── Validar límites SAT antes de iniciar el job ────────────────────────────

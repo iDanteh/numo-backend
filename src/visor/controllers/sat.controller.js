@@ -419,9 +419,20 @@ const getHistory = asyncHandler(async (req, res) => {
   res.json({ rfc: rfc || null, historial: logs });
 });
 
+/**
+ * GET /api/sat/ultimo-erp
+ * Retorna el último log de descarga automática ERP.
+ */
+const getUltimoErp = asyncHandler(async (req, res) => {
+  const log = await SatDescargaLog.findOne({ tipo: 'erp_automatica' })
+    .sort({ inicio: -1 })
+    .lean();
+  res.json({ log: log || null });
+});
+
 module.exports = {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
-  getLimitesEstado, getHistory,
+  getLimitesEstado, getHistory, getUltimoErp,
 };

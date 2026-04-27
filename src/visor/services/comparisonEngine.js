@@ -26,8 +26,15 @@ const r2 = (v) => Math.round((v ?? 0) * 100) / 100;
  * si existe una copia local con source='SAT'.
  */
 const compareCFDI = async (erpCfdiId, options = {}) => {
-  const erpCfdi = await CFDI.findById(erpCfdiId);
-  if (!erpCfdi) throw new Error(`CFDI ERP no encontrado: ${erpCfdiId}`);
+  let erpCfdi = await CFDI.findById(erpCfdiId);
+  if (!erpCfdi) throw new Error(`CFDI no encontrado: ${erpCfdiId}`);
+
+  // Si se pasa un CFDI SAT/MANUAL, buscar su contraparte ERP por UUID
+  if (erpCfdi.source !== 'ERP') {
+    const uuid = erpCfdi.uuid;
+    erpCfdi = await CFDI.findOne({ uuid, source: 'ERP', isActive: true });
+    if (!erpCfdi) throw new Error(`No se encontró CFDI ERP para UUID: ${uuid}`);
+  }
 
   const triggeredBy = options.triggeredBy;
   const sessionId   = options.sessionId ?? null;
@@ -194,6 +201,17 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
     lastComparisonStatus: status,
     lastComparisonAt: new Date(),
   });
+
+  // Si se encontró copia SAT local, también actualizar su status para que la
+  // pestaña SAT refleje el mismo resultado que la pestaña ERP.
+  // Sin esto, el SAT queda con el status anterior (ej. 'not_in_erp') aunque
+  // el ERP ya lo encontró y lo marcó como 'match'/'discrepancy'/'warning'.
+  if (satCfdi) {
+    await CFDI.findByIdAndUpdate(satCfdi._id, {
+      lastComparisonStatus: status,
+      lastComparisonAt: new Date(),
+    });
+  }
 
   const comp = await saveComparison({
     uuid: erpCfdi.uuid,
@@ -567,6 +585,27 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
     lastComparisonStatus: 'not_in_erp',
     lastComparisonAt: new Date(),
   });
+
+  // Si existe un ERP con el mismo UUID en un periodo DIFERENTE al del SAT y aún
+  // muestra 'match' (status obsoleto de una comparación anterior), actualizarlo a
+  // 'not_in_sat' porque su contraparte SAT ya no está en el mismo periodo.
+  await CFDI.updateMany(
+    {
+      uuid: satCfdi.uuid,
+      source: 'ERP',
+      lastComparisonStatus: 'match',
+      $or: [
+        { ejercicio: { $ne: ejercicio } },
+        { periodo:   { $ne: periodo   } },
+      ],
+    },
+    {
+      $set: {
+        lastComparisonStatus: 'not_in_sat',
+        lastComparisonAt: new Date(),
+      },
+    }
+  );
 
   // Eliminar discrepancias abiertas previas del mismo UUID para evitar duplicados
   await Discrepancy.deleteMany({

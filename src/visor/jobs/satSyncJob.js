@@ -48,11 +48,32 @@ const ejecutarDescargaERP = async () => {
   const ejercicio = parseInt(anoStr, 10);
   const periodo   = parseInt(mesStr, 10);
 
+  // Crear log de inicio
+  let logEntry = null;
+  try {
+    logEntry = await SatDescargaLog.create({
+      rfc: 'SISTEMA',
+      tipo: 'erp_automatica',
+      ejercicio,
+      periodo,
+      estado: 'en_proceso',
+      inicio: new Date(),
+    });
+  } catch (logErr) {
+    logger.warn(`[ERPSyncJob] No se pudo crear log de descarga: ${logErr.message}`);
+  }
+
+  const actualizarLog = async (campos) => {
+    if (!logEntry) return;
+    await SatDescargaLog.updateOne({ _id: logEntry._id }, { $set: campos }).catch(() => {});
+  };
+
   // Verificar que el periodo fiscal exista
   try {
     await resolverPeriodo(ejercicio, periodo);
   } catch {
     logger.error(`[ERPSyncJob] Periodo ${periodo}/${ejercicio} no existe en PeriodoFiscal. Créalo antes de que corra el job. Descarga cancelada.`);
+    await actualizarLog({ estado: 'error', error: `Periodo ${periodo}/${ejercicio} no existe`, fin: new Date() });
     return;
   }
 
@@ -65,11 +86,13 @@ const ejecutarDescargaERP = async () => {
     facturas = await fetchTodasLasFacturas({ fechaInicio, fechaFin });
   } catch (err) {
     logger.error(`[ERPSyncJob] Error conectando con ERP: ${err.message}`);
+    await actualizarLog({ estado: 'error', error: err.message, fin: new Date() });
     return;
   }
 
   if (facturas.length === 0) {
     logger.info(`[ERPSyncJob] ERP no devolvió registros para ${ejercicio}/${periodo}`);
+    await actualizarLog({ estado: 'completado', totalSAT: 0, fin: new Date() });
     return;
   }
 
@@ -117,6 +140,12 @@ const ejecutarDescargaERP = async () => {
     `[ERPSyncJob] Completado | recibidas=${facturas.length} guardadas=${guardadas} ` +
     `duplicadas=${duplicadas} omitidas=${omitidas} conErrores=${conErrores}`
   );
+
+  await actualizarLog({
+    estado: 'completado',
+    totalSAT: guardadas + duplicadas,
+    fin: new Date(),
+  });
 };
 
 /**

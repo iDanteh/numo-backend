@@ -7,8 +7,8 @@ const mongoose = require('mongoose');
  * Se crea una entrada por cada ejecución de procesarDescarga.
  */
 const satDescargaLogSchema = new mongoose.Schema({
-  rfc:             { type: String, required: true, uppercase: true, index: true },
-  tipo:            { type: String, enum: ['automatica', 'manual'], required: true },
+  rfc:             { type: String, required: false, uppercase: true, index: true, default: 'SISTEMA' },
+  tipo:            { type: String, enum: ['automatica', 'manual', 'erp_automatica'], required: true },
   tipoComprobante: { type: String, default: 'Emitidos' },
   fechaInicio:     { type: String },   // YYYY-MM-DD del rango solicitado al SAT
   fechaFin:        { type: String },   // YYYY-MM-DD del rango solicitado al SAT

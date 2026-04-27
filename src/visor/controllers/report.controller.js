@@ -295,11 +295,18 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     ...periodoFiltro,
   }).select('_id').lean().then(docs => docs.map(d => d._id));
 
+  // No se propaga tipoDeComprobante al filtro de Comparison porque los registros
+  // de Comparison pueden tenerlo null (comparaciones anteriores a ese campo).
+  // El tipo ya está implícito via erpCfdiId que solo contiene IDs del tipo seleccionado.
+  const comparisonFiltro = {};
+  if (ejercicio) comparisonFiltro.ejercicio = parseInt(ejercicio);
+  if (periodo)   comparisonFiltro.periodo   = parseInt(periodo);
+
   const filter = {
     'differences.field': { $in: camposFiltro },
     status: { $ne: 'cancelled' },
     erpCfdiId: { $in: erpConDiscrepanciaIds },
-    ...periodoFiltro,
+    ...comparisonFiltro,
   };
 
   const [comparaciones, total] = await Promise.all([
@@ -618,4 +625,54 @@ const notInErp = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp };
+/**
+ * GET /api/reports/pagos-relacionados
+ * Para CFDIs tipo P del periodo, cuenta los documentos relacionados
+ * (doctoRelacionado.idDocumento) y cruza cuántos UUID existen en el sistema.
+ * Solo tiene sentido cuando se filtra por tipoDeComprobante=P.
+ */
+const pagosRelacionados = asyncHandler(async (req, res) => {
+  const { ejercicio, periodo } = req.query;
+
+  const matchFilter = { tipoDeComprobante: 'P', isActive: { $ne: false } };
+  if (ejercicio) matchFilter.ejercicio = parseInt(ejercicio);
+  if (periodo)   matchFilter.periodo   = parseInt(periodo);
+
+  const [agg, totalPagos] = await Promise.all([
+    CFDI.aggregate([
+      { $match: matchFilter },
+      { $unwind: { path: '$complementoPago.pagos', preserveNullAndEmptyArrays: false } },
+      { $unwind: { path: '$complementoPago.pagos.doctosRelacionados', preserveNullAndEmptyArrays: false } },
+      {
+        $group: {
+          _id:         null,
+          cfdiIds:     { $addToSet: '$_id' },
+          doctosIds:   { $addToSet: { $toUpper: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } } },
+        },
+      },
+    ]),
+    CFDI.countDocuments(matchFilter),
+  ]);
+
+  if (!agg.length || !agg[0].doctosIds?.length) {
+    return res.json({ totalPagos, totalDoctos: 0, existenEnSistema: 0, noExistenEnSistema: 0, porcentajeCobertura: 100 });
+  }
+
+  const doctosIds = agg[0].doctosIds.filter(id => id && id.length > 0);
+  const totalDoctos = doctosIds.length;
+
+  const existenEnSistema = await CFDI.countDocuments({
+    uuid: { $in: doctosIds },
+    isActive: { $ne: false },
+  });
+
+  res.json({
+    totalPagos,
+    totalDoctos,
+    existenEnSistema,
+    noExistenEnSistema: totalDoctos - existenEnSistema,
+    porcentajeCobertura: totalDoctos > 0 ? Math.round((existenEnSistema / totalDoctos) * 100) : 100,
+  });
+});
+
+module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados };

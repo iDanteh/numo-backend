@@ -51,10 +51,12 @@ async function updateRole(id, role) {
   const user = await userRepo.updateRole(id, role);
   if (!user) throw new NotFoundError('Usuario');
 
-  // Notificar al usuario por socket si está conectado
+  // Notificar al usuario por socket con el nuevo rol Y sus permisos,
+  // para evitar un round-trip HTTP adicional en el cliente.
   const io = getIo();
   if (io && user.auth0Sub) {
-    io.to(`user:${user.auth0Sub}`).emit('role:updated', { role: user.role });
+    const permissions = ROLES[user.role]?.permissions ?? [];
+    io.to(`user:${user.auth0Sub}`).emit('role:updated', { role: user.role, permissions });
   }
 
   return user;

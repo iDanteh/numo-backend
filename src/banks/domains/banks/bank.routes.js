@@ -45,10 +45,11 @@ router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
   const query = { ...req.query };
-  // cobranza no puede exportar movimientos identificados
+  // cobranza solo ve depósitos no identificados
   if (req.user.role === 'cobranza') {
     if (query.status === 'identificado') query.status = undefined;
     if (!query.status) query.status = 'no_identificado';
+    query.tipo = 'deposito';
   }
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -61,12 +62,13 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   const query = { ...req.query };
-  // cobranza no puede ver movimientos identificados
+  // cobranza solo ve depósitos no identificados
   if (req.user.role === 'cobranza') {
     if (query.status === 'identificado') {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
     }
     if (!query.status) query.status = 'no_identificado';
+    query.tipo = 'deposito';
   }
   res.json(await service.listMovements(query));
 }));

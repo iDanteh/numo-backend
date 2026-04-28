@@ -102,8 +102,10 @@ const _querySAT = async (uuid, rfcEmisor, rfcReceptor, total, sello, version) =>
  */
 const buildExpresionImpresa = (uuid, rfcEmisor, rfcReceptor, total, sello = '', version = '4.0') => {
   const uuidClean   = (uuid       || '').toUpperCase().trim();
-  const rfcEm       = (rfcEmisor  || '').toUpperCase().trim();
-  const rfcRe       = (rfcReceptor|| '').toUpperCase().trim();
+  // RFC puede contener '&' (ej. AV&060117UX0) — debe ir URL-encoded como %26
+  // para no romper el query string. El fe NO se encoda: el SAT espera base64 literal.
+  const rfcEm       = encodeURIComponent((rfcEmisor  || '').toUpperCase().trim());
+  const rfcRe       = encodeURIComponent((rfcReceptor|| '').toUpperCase().trim());
   const fe          = sello ? sello.replace(/\s/g, '').slice(-8) : '';
   const totalNum    = parseFloat(total);
 

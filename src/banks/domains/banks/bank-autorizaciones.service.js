@@ -26,19 +26,40 @@ function normalizarAuth(val) {
 
 // ── Normalización de nombre de banco ─────────────────────────────────────────
 const BANCO_MAP = {
-  bancomer:  'BBVA',
-  bbva:      'BBVA',
-  banamex:   'Banamex',
-  bnamex:    'Banamex',
-  santander: 'Santander',
-  azteca:    'Azteca',
-  banorte:   'Banorte',
-  hsbc:      'HSBC',
+  bancomer:        'BBVA',
+  bbva:            'BBVA',
+  'bbva bancomer': 'BBVA',
+  'bbva mexico':   'BBVA',
+  'bbva méxico':   'BBVA',
+  banamex:         'Banamex',
+  bnamex:          'Banamex',
+  citibanamex:     'Banamex',
+  citi:            'Banamex',
+  santander:       'Santander',
+  'banco santander': 'Santander',
+  azteca:          'Azteca',
+  'banco azteca':  'Azteca',
+  banorte:         'Banorte',
+  'banco banorte': 'Banorte',
+  hsbc:            'HSBC',
+  inbursa:         'Inbursa',
+  scotiabank:      'Scotiabank',
+  banbajio:        'BanBajío',
+  'banbajío':      'BanBajío',
 };
 
 function normalizarBanco(nombre) {
   if (!nombre) return null;
-  return BANCO_MAP[String(nombre).trim().toLowerCase()] ?? String(nombre).trim();
+  const s = String(nombre).trim()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quitar acentos para comparar
+    .toLowerCase();
+  // Búsqueda exacta
+  if (BANCO_MAP[s]) return BANCO_MAP[s];
+  // Búsqueda por subcadena: "banco azteca" → "azteca" está en el mapa
+  for (const [key, val] of Object.entries(BANCO_MAP)) {
+    if (s.includes(key) || key.includes(s)) return val;
+  }
+  return String(nombre).trim();
 }
 
 // ── Validación de importe ─────────────────────────────────────────────────────
@@ -56,14 +77,29 @@ function conceptoContainsAuth(concepto, authNorm) {
 }
 
 // ── Búsqueda en índice respetando movimientos ya usados ───────────────────────
-// Prefiere candidatos cuyo importe coincida; si ninguno coincide en importe,
-// toma el primero disponible (auth exacta es suficiente evidencia).
-function findInIndex(index, autNorm, monto, usedMovIds) {
-  const candidatos = index.get(autNorm);
-  if (!candidatos?.length) return null;
-  const preferred = candidatos.find(m => !usedMovIds.has(m._id.toString()) && importeOk(m, monto));
-  if (preferred) return preferred;
-  return candidatos.find(m => !usedMovIds.has(m._id.toString())) ?? null;
+// Orden de preferencia:
+//   1. no_identificado + importe correcto + banco correcto
+//   2. no_identificado + importe correcto (cualquier banco)
+//   3. no_identificado (banco correcto)
+//   4. no_identificado (cualquier banco)
+//   5. cualquier status + importe correcto
+//   6. cualquier candidato disponible
+// El argumento `banco` es opcional: si se pasa, se prioriza (no se fuerza).
+function findInIndex(index, autNorm, monto, usedMovIds, banco) {
+  const all = index.get(autNorm);
+  if (!all?.length) return null;
+  const pool = all.filter(m => !usedMovIds.has(m._id.toString()));
+  if (!pool.length) return null;
+
+  const noId   = pool.filter(m => m.status === 'no_identificado');
+  const source = noId.length ? noId : pool;
+
+  return (
+    source.find(m => banco && m.banco === banco && importeOk(m, monto)) ??
+    source.find(m => importeOk(m, monto)) ??
+    source.find(m => banco && m.banco === banco) ??
+    source[0]
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -278,14 +314,9 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
 // MATCH DESDE EXCEL (compatibilidad — solo actualiza status, sin erpLinks)
 // ══════════════════════════════════════════════════════════════════════════════
 
-function buscarEnIndice(indice, autNorm, importe) {
-  const candidatos = indice.get(autNorm);
-  if (!candidatos?.length) return null;
-  if (importe) {
-    const conImporte = candidatos.find(m => importeOk(m, importe));
-    if (conImporte) return conImporte;
-  }
-  return candidatos[0];
+// Igual que findInIndex pero sin argumento usedMovIds separado; recibe el Set directamente.
+function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds) {
+  return findInIndex(indice, autNorm, importe, usedMovIds, banco);
 }
 
 async function ejecutarMatch(rows) {
@@ -293,12 +324,22 @@ async function ejecutarMatch(rows) {
     return { total: 0, matcheados: 0, identificados: 0, sinMatch: 0, noMatcheados: [] };
   }
 
-  const bancosRequeridos = [...new Set(rows.map(r => r.banco).filter(Boolean))];
+  // ── Filtro de banco ────────────────────────────────────────────────────────
+  // Si alguna fila no tiene banco, no restringimos la query: un auth sin banco
+  // debe poder encontrar movimientos de cualquier banco.
+  // Si TODAS las filas tienen banco, restringimos para limitar el scan.
+  const bancosEspecificados = [...new Set(rows.map(r => r.banco).filter(Boolean))];
+  const hayFilasSinBanco    = rows.some(r => !r.banco);
+  const bancoFilter = (!hayFilasSinBanco && bancosEspecificados.length)
+    ? { banco: { $in: bancosEspecificados } }
+    : {};
+
   const movimientos = await BankMovement.find({
     isActive: true,
-    ...(bancosRequeridos.length ? { banco: { $in: bancosRequeridos } } : {}),
+    ...bancoFilter,
   }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco').lean();
 
+  // ── Índices de búsqueda ───────────────────────────────────────────────────
   const byAuthNorm          = new Map();
   const byRefNorm           = new Map();
   const porConceptoPorBanco = new Map();
@@ -323,21 +364,33 @@ async function ejecutarMatch(rows) {
     }
   }
 
+  // ── Motor de match ────────────────────────────────────────────────────────
+  const usedMovIds       = new Set(); // evita que dos filas consuman el mismo movimiento
   const idsAIdentificar  = new Set();
-  const movIdsMatcheados = new Set();
   const noMatcheados     = [];
   let matcheados = 0;
 
   for (const row of rows) {
     let mov = null;
 
-    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe);
-    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe);
+    // 1a: por numeroAutorizacion (respeta banco y usedMovIds)
+    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds);
+
+    // 1b: por referenciaNumerica
+    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds);
+
+    // 2: auth dentro del concepto
     if (!mov) {
       const candidatos = row.banco
         ? (porConceptoPorBanco.get(row.banco) ?? [])
         : porConceptoTodos;
-      for (const m of candidatos) {
+      // Preferir no_identificado primero
+      const ordenados = [
+        ...candidatos.filter(m => m.status === 'no_identificado'),
+        ...candidatos.filter(m => m.status !== 'no_identificado'),
+      ];
+      for (const m of ordenados) {
+        if (usedMovIds.has(m._id.toString())) continue;
         if (!conceptoContainsAuth(m.concepto, row.autNorm)) continue;
         if (row.importe && !importeOk(m, row.importe)) continue;
         mov = m;
@@ -347,7 +400,7 @@ async function ejecutarMatch(rows) {
 
     if (mov) {
       matcheados++;
-      movIdsMatcheados.add(mov._id.toString());
+      usedMovIds.add(mov._id.toString());
       if (mov.status !== 'identificado') idsAIdentificar.add(mov._id.toString());
     } else {
       noMatcheados.push({ autorizacion: row.autNorm, importe: row.importe ?? null, banco: row.banco ?? null });
@@ -370,17 +423,54 @@ async function ejecutarMatch(rows) {
   return { total: rows.length, matcheados, identificados, sinMatch: noMatcheados.length, noMatcheados };
 }
 
+// Normaliza texto de encabezado para comparación: minúsculas sin acentos.
+function normHeader(val) {
+  return String(val ?? '').trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+// Columnas soportadas y sus alias en el encabezado.
+// El primer alias que coincida gana.
+const HEADER_ALIASES = {
+  monto:          ['monto', 'importe', 'amount'],
+  banco:          ['banco', 'bank', 'institucion', 'institución'],
+  autorizacion:   ['autorizacion', 'autorización', 'no. autorizacion', 'no. autorización',
+                   'num autorizacion', 'num. autorizacion', 'numero autorizacion',
+                   'número de autorización', 'auth', 'authorization'],
+};
+
 async function parseAutorizaciones(buffer) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   const ws = wb.worksheets[0];
   if (!ws) throw new Error('El archivo no contiene hojas válidas');
+
+  // ── Detectar columnas por encabezado ──────────────────────────────────────
+  // Fallback a los índices originales si no se encuentran encabezados conocidos.
+  let colMonto = 3, colBanco = 4, colAuth = 6;
+
+  const headerRow = ws.getRow(1);
+  const found     = {};
+  headerRow.eachCell((cell, colNum) => {
+    const h = normHeader(cell.value);
+    for (const [campo, aliases] of Object.entries(HEADER_ALIASES)) {
+      if (!found[campo] && aliases.includes(h)) {
+        found[campo] = colNum;
+      }
+    }
+  });
+
+  if (found.monto)        colMonto = found.monto;
+  if (found.banco)        colBanco = found.banco;
+  if (found.autorizacion) colAuth  = found.autorizacion;
+
+  // ── Parsear filas de datos ────────────────────────────────────────────────
   const rows = [];
   ws.eachRow({ includeEmpty: false }, (row, idx) => {
-    if (idx === 1) return;
-    const autNorm = normalizarAuth(row.getCell(6).value);
-    const impRaw  = row.getCell(3).value;
-    const banco   = normalizarBanco(row.getCell(4).value);
+    if (idx === 1) return; // saltar encabezado
+    const autNorm = normalizarAuth(row.getCell(colAuth).value);
+    const impRaw  = row.getCell(colMonto).value;
+    const banco   = normalizarBanco(row.getCell(colBanco).value);
     const importe = impRaw != null ? Number(impRaw) : null;
     if (!autNorm || importe == null || isNaN(importe)) return;
     rows.push({ autNorm, importe, banco });

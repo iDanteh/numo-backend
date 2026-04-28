@@ -13,7 +13,7 @@ const { parseCFDI, normalizarCFDI } = require('../services/cfdiParser');
 const { solicitar, verificar, descargarPaquete, descargarPaqueteMetadata } = require('../sat/download');
 const { obtener, eliminar, tieneCredenciales } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin } = require('../sat/rateLimiter');
-const { derivarPeriodoDesdeFecha, resolverPeriodo } = require('../services/periodoFiscal.service');
+const { derivarPeriodoDesdeFecha, resolverPeriodo, resolverOCrearPeriodo } = require('../services/periodoFiscal.service');
 const { logger } = require('../../shared/utils/logger');
 const SatDescargaLog = require('../models/SatDescargaLog');
 const { aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
@@ -68,12 +68,13 @@ const ejecutarDescargaERP = async () => {
     await SatDescargaLog.updateOne({ _id: logEntry._id }, { $set: campos }).catch(() => {});
   };
 
-  // Verificar que el periodo fiscal exista
+  // Verificar que el periodo fiscal exista, o crearlo automáticamente
   try {
-    await resolverPeriodo(ejercicio, periodo);
-  } catch {
-    logger.error(`[ERPSyncJob] Periodo ${periodo}/${ejercicio} no existe en PeriodoFiscal. Créalo antes de que corra el job. Descarga cancelada.`);
-    await actualizarLog({ estado: 'error', error: `Periodo ${periodo}/${ejercicio} no existe`, fin: new Date() });
+    const { creado } = await resolverOCrearPeriodo(ejercicio, periodo);
+    if (creado) logger.info(`[ERPSyncJob] Periodo ${periodo}/${ejercicio} creado automáticamente.`);
+  } catch (err) {
+    logger.error(`[ERPSyncJob] No se pudo resolver el periodo ${periodo}/${ejercicio}: ${err.message}. Descarga cancelada.`);
+    await actualizarLog({ estado: 'error', error: err.message, fin: new Date() });
     return;
   }
 
@@ -162,9 +163,10 @@ const ejecutarComparacionAuto = async () => {
   const periodo   = parseInt(mesStr, 10);
 
   try {
-    await resolverPeriodo(ejercicio, periodo);
-  } catch {
-    logger.error(`[CompJobAuto] Periodo ${periodo}/${ejercicio} no existe. Comparación cancelada.`);
+    const { creado } = await resolverOCrearPeriodo(ejercicio, periodo);
+    if (creado) logger.info(`[CompJobAuto] Periodo ${periodo}/${ejercicio} creado automáticamente.`);
+  } catch (err) {
+    logger.error(`[CompJobAuto] No se pudo resolver el periodo ${periodo}/${ejercicio}: ${err.message}. Comparación cancelada.`);
     return;
   }
 
@@ -236,12 +238,10 @@ const ejecutarDescargaMasiva = async () => {
   const fechaInicio = `${ayerMXStr}T00:00:00`;
   const fechaFin    = `${ayerMXStr}T23:59:59`;
   try {
-    await resolverPeriodo(ejercicio, periodo);
-  } catch {
-    logger.error(
-      `[SatSyncJob] El periodo ${periodo}/${ejercicio} no existe en PeriodoFiscal. ` +
-      `Créalo en la sección Ejercicios antes de que corra el job nocturno. Descarga cancelada.`,
-    );
+    const { creado } = await resolverOCrearPeriodo(ejercicio, periodo);
+    if (creado) logger.info(`[SatSyncJob] Periodo ${periodo}/${ejercicio} creado automáticamente.`);
+  } catch (err) {
+    logger.error(`[SatSyncJob] No se pudo resolver el periodo ${periodo}/${ejercicio}: ${err.message}. Descarga cancelada.`);
     return;
   }
   logger.info(`[SatSyncJob] Periodo fiscal validado: ${ejercicio}/${periodo}`);

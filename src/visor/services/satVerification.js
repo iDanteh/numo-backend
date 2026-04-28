@@ -101,13 +101,25 @@ const _querySAT = async (uuid, rfcEmisor, rfcReceptor, total, sello, version) =>
  *  - El fe NO se URL-encoda: el SAT espera chars base64 literales (/, +, =)
  */
 const buildExpresionImpresa = (uuid, rfcEmisor, rfcReceptor, total, sello = '', version = '4.0') => {
-  const uuidClean   = (uuid       || '').toUpperCase().trim();
-  // RFC puede contener '&' (ej. AV&060117UX0) — debe ir URL-encoded como %26
-  // para no romper el query string. El fe NO se encoda: el SAT espera base64 literal.
-  const rfcEm       = encodeURIComponent((rfcEmisor  || '').toUpperCase().trim());
-  const rfcRe       = encodeURIComponent((rfcReceptor|| '').toUpperCase().trim());
-  const fe          = sello ? sello.replace(/\s/g, '').slice(-8) : '';
-  const totalNum    = parseFloat(total);
+  const uuidClean = (uuid        || '').toUpperCase().trim();
+  // RFC puede contener '&' (ej. AV&060117UX0 — Ñ en RFC de persona moral).
+  // El servicio ConsultaCFDI del SAT no decodifica %26, así que NO se URL-encoda.
+  // En cambio se escapa como &amp; para que cuando _querySAT haga replace(/&/g,'&amp;')
+  // el '&' del RFC quede como &amp;amp; → XML decode → &amp; → que el SAT interprete
+  // correctamente. La forma más simple: pre-escapar solo el '&' dentro de los RFC
+  // y dejar que el replace posterior lo maneje junto con los separadores de query.
+  //
+  // Flujo real:
+  //  RFC raw:         AV&060117UX0
+  //  En expresión:    ...&rr=AV&060117UX0&tt=...   ← &amp; del RFC se escapa igual que separadores
+  //  expresionXml:    ...&amp;rr=AV&amp;060117UX0&amp;tt=...
+  //  SAT recibe:      ...&rr=AV&060117UX0&tt=...   ← SAT lo parsea sabiendo que & en RFC es válido
+  //
+  // El fe NO se modifica: el SAT espera base64 literal (/, +, =).
+  const rfcEm  = (rfcEmisor  || '').toUpperCase().trim();
+  const rfcRe  = (rfcReceptor|| '').toUpperCase().trim();
+  const fe     = sello ? sello.replace(/\s/g, '').slice(-8) : '';
+  const totalNum = parseFloat(total);
 
   if (version === '4.0') {
     const tt = totalNum.toFixed(6);

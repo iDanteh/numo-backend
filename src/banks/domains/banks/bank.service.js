@@ -311,25 +311,50 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
   ).lean();
   const hashesExistentes = new Set(existentes.map(e => e.hash));
 
-  // ── 1b. Banamex: deduplicar por numeroAutorizacion ─────────────────────────
-  // Si un movimiento Banamex con el mismo número de autorización ya existe,
-  // solo se actualiza su fecha (el número de autorización es el identificador
-  // canónico en los estados de cuenta, incluyendo los de fin de semana).
+  // ── 1b. Deduplicar por numeroAutorizacion (todos los bancos) ─────────────
+  // Si un movimiento con el mismo número de autorización ya existe en el mismo
+  // banco, se considera duplicado aunque el hash difiera (ej. fecha cambiada).
+  // Aplica a Banamex (sub-fila "No. de Autorización"), BBVA (token tras '/'),
+  // Santander (col 8) y Azteca (col 7).
+  //
+  // Manejo de ceros iniciales: Banamex puede exportar "199480" (fin de semana)
+  // y "00199480" (estado del martes) para el mismo movimiento. Se normalizan
+  // al parsear, pero registros históricos en DB pueden tener la forma sin
+  // normalizar. La query incluye variantes con padding de ceros y la
+  // comparación final es numérica (parseInt) + coincidencia de importe.
   const fechaUpdates = [];   // { _id, fecha }
-  const banamexAuthMovs = movements.filter(
-    m => m.banco === 'Banamex' && m.numeroAutorizacion,
-  );
-  if (banamexAuthMovs.length > 0) {
-    const authNums = banamexAuthMovs.map(m => m.numeroAutorizacion);
+  const authMovs = movements.filter(m => m.numeroAutorizacion);
+
+  if (authMovs.length > 0) {
+    // Para auth numbers puramente numéricos usar regex ^0*{n}$ que detecta
+    // variantes con cualquier número de ceros iniciales ("67446012" ↔ "0067446012").
+    // Para auth numbers alfanuméricos usar match exacto (la regex no aplica
+    // y podría generar expresiones inválidas si contienen chars especiales).
+    const uniqueAuthNums = [...new Set(authMovs.map(m => m.numeroAutorizacion))];
+    const authConditions  = uniqueAuthNums.map(n =>
+      /^\d+$/.test(n)
+        ? { numeroAutorizacion: { $regex: `^0*${n}$` } }
+        : { numeroAutorizacion: n },
+    );
+    const bancosAuth = [...new Set(authMovs.map(m => m.banco))];
+
     const existByAuth = await BankMovement.find(
-      { banco: 'Banamex', numeroAutorizacion: { $in: authNums } },
-      '_id numeroAutorizacion fecha',
+      { banco: { $in: bancosAuth }, $or: authConditions },
+      '_id banco numeroAutorizacion fecha deposito retiro',
     ).lean();
 
     for (const existing of existByAuth) {
-      const incoming = banamexAuthMovs.find(
-        m => m.numeroAutorizacion === existing.numeroAutorizacion,
-      );
+      const existingAuthInt = parseInt(existing.numeroAutorizacion, 10);
+      // Comparar numéricamente para ignorar diferencias de ceros iniciales.
+      // Verificar además que el importe coincida como salvaguarda extra.
+      const incoming = authMovs.find((m) => {
+        if (m.banco !== existing.banco) return false;
+        if (parseInt(m.numeroAutorizacion, 10) !== existingAuthInt) return false;
+        const montoOk =
+          (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
+          (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
+        return montoOk;
+      });
       if (!incoming) continue;
       // Programar actualización de fecha si cambió
       const existingFecha = new Date(existing.fecha).getTime();

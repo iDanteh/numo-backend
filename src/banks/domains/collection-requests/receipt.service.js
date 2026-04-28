@@ -104,11 +104,14 @@ const MESES_ES = {
  * el servidor esté corriendo. Tesseract.js encola internamente las llamadas
  * concurrentes a recognize(), por lo que es seguro reutilizarlos.
  *
- * _workerFullPromise  — spa+eng, PSM 4 (SINGLE_COLUMN): texto completo de recibos.
+ * _workerFullPromise  — spa+eng, PSM 4 (SINGLE_COLUMN): recibos verticales (apps bancarias).
+ * _workerBlockPromise — spa+eng, PSM 6 (SINGLE_BLOCK):  recibos con pares label:valor en fila,
+ *                       PDFs y capturas de pantalla con layout más amplio.
  * _workerNumsPromise  — eng,     PSM 11 (SPARSE_TEXT):  barrido numérico de montos.
  */
-let _workerFullPromise = null;
-let _workerNumsPromise = null;
+let _workerFullPromise  = null;
+let _workerBlockPromise = null;
+let _workerNumsPromise  = null;
 
 function getFullWorker() {
   if (!_workerFullPromise) {
@@ -124,6 +127,24 @@ function getFullWorker() {
     })();
   }
   return _workerFullPromise;
+}
+
+function getBlockWorker() {
+  if (!_workerBlockPromise) {
+    _workerBlockPromise = (async () => {
+      const w = await Tesseract.createWorker(['spa', 'eng'], 1, { logger: () => {} });
+      await w.setParameters({
+        // PSM 6 (SINGLE_BLOCK): trata la imagen como un bloque uniforme de texto.
+        // Captura mejor los recibos con layout horizontal (label izquierda, valor derecha),
+        // PDFs con múltiples columnas y screenshots de apps con secciones anchas.
+        tessedit_pageseg_mode:   Tesseract.PSM.SINGLE_BLOCK,
+        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
+        preserve_interword_spaces: '1',
+      });
+      return w;
+    })();
+  }
+  return _workerBlockPromise;
 }
 
 function getNumsWorker() {
@@ -146,6 +167,14 @@ function getNumsWorker() {
 async function runOCR(imageBuffer, mimeType = 'image/jpeg') {
   // PSM 4 = columna única — layout real de recibos bancarios.
   const worker  = await getFullWorker();
+  const dataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
+  const { data: { text, confidence } } = await worker.recognize(dataUrl);
+  return { text, confidence };
+}
+
+async function runOCRBlock(imageBuffer, mimeType = 'image/jpeg') {
+  // PSM 6 = bloque uniforme — layouts horizontales, PDFs y capturas de pantalla anchas.
+  const worker  = await getBlockWorker();
   const dataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
   const { data: { text, confidence } } = await worker.recognize(dataUrl);
   return { text, confidence };
@@ -608,32 +637,22 @@ function calcConfianza(fields) {
   return Math.min(c, 100);
 }
 
-async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg') {
-  // Preprocesar: grayscale, gamma, sharpen, normalize, binarización → PNG lossless.
-  // Tesseract es especialmente sensible a imágenes pequeñas o con bajo contraste.
-  const processedBuffer = await preprocessImage(imageBuffer);
-
-  // Pasada principal — texto completo con PSM 4 (columna única).
-  // preprocessImage devuelve PNG; se pasa el mimeType correcto al worker.
-  const { text: raw, confidence: ocrConfidence } = await runOCR(processedBuffer, 'image/png');
-  const clean = normalizeOcrText(raw);
-
-  // Pasada numérica — PSM 11 + whitelist dígitos para extraer montos sin ambigüedad O↔0.
-  const rawAmounts   = await runOCRAmounts(processedBuffer, 'image/png');
-  const cleanAmounts = normalizeOcrText(rawAmounts);
-
+/**
+ * Extrae todos los campos de un texto OCR ya normalizado.
+ * Se usa independientemente del PSM que generó el texto, permitiendo
+ * reutilizar la misma lógica para PSM 4 y PSM 6.
+ */
+function extractAllFields(clean) {
   const lines = clean.split('\n');
   const half  = Math.floor(lines.length / 2);
-
-  const fields = {
-    // Intentar monto primero con texto completo; si falla, usar la pasada numérica.
-    monto:                extractMonto(clean) ?? extractMonto(cleanAmounts),
-    fecha:                extractFecha(clean),
-    hora:                 extractHora(clean),
-    claveRastreo:         extractClaveRastreo(clean),
-    referencia:           extractReferencia(clean),
-    numeroAutorizacion:   extractNumeroAutorizacion(clean),
-    clabe:                extractClabe(clean),
+  return {
+    monto:                 extractMonto(clean),
+    fecha:                 extractFecha(clean),
+    hora:                  extractHora(clean),
+    claveRastreo:          extractClaveRastreo(clean),
+    referencia:            extractReferencia(clean),
+    numeroAutorizacion:    extractNumeroAutorizacion(clean),
+    clabe:                 extractClabe(clean),
     ...extractBancos(clean),
     cuentaOrigenUltimos4:  extractUltimos4(lines.slice(0, half).join('\n')),
     cuentaDestinoUltimos4: extractUltimos4(lines.slice(half).join('\n')),
@@ -641,10 +660,87 @@ async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg')
     titularDestino:        extractTitular(clean, 'destino'),
     concepto:              extractConcepto(clean),
   };
+}
+
+/**
+ * Fusiona los campos extraídos por PSM 4 y PSM 6.
+ *
+ * Reglas de fusión:
+ *  - Si solo uno tiene el campo → se usa ese.
+ *  - monto: ambas pasadas suelen coincidir; si difieren, se prefiere PSM 4
+ *    (validado y estable para recibos verticales).
+ *  - Strings: se prefiere el valor más largo, ya que implica más información
+ *    capturada (ej. titular completo vs truncado, clave de rastreo completa).
+ *  - Campos de 4/8 dígitos (cuentaOrigenUltimos4, etc.): longitud fija → PSM 4.
+ */
+function mergeOcrFields(f4, f6) {
+  const CAMPOS = [
+    'monto', 'fecha', 'hora', 'claveRastreo', 'referencia',
+    'numeroAutorizacion', 'clabe', 'bancoOrigen', 'bancoDestino',
+    'cuentaOrigenUltimos4', 'cuentaDestinoUltimos4',
+    'titularOrigen', 'titularDestino', 'concepto',
+  ];
+  const LONGITUD_FIJA = new Set(['cuentaOrigenUltimos4', 'cuentaDestinoUltimos4', 'fecha', 'hora']);
+
+  const merged = {};
+  for (const campo of CAMPOS) {
+    const v4 = f4[campo] ?? null;
+    const v6 = f6[campo] ?? null;
+
+    if (v4 !== null && v6 === null)  { merged[campo] = v4; continue; }
+    if (v4 === null && v6 !== null)  { merged[campo] = v6; continue; }
+    if (v4 === null && v6 === null)  { merged[campo] = null; continue; }
+
+    // Ambas pasadas tienen valor
+    if (campo === 'monto' || LONGITUD_FIJA.has(campo)) {
+      merged[campo] = v4; // PSM 4 prioridad para numérico y longitud fija
+    } else {
+      // Preferir el string más largo (más información capturada)
+      merged[campo] = String(v4).length >= String(v6).length ? v4 : v6;
+    }
+  }
+  return merged;
+}
+
+async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg') {
+  // Preprocesar una sola vez — las tres pasadas comparten el mismo buffer PNG.
+  const processedBuffer = await preprocessImage(imageBuffer);
+
+  // ── Tres pasadas OCR en paralelo ──────────────────────────────────────────
+  // PSM 4, PSM 6 y PSM 11 usan workers independientes (procesos separados),
+  // por lo que Promise.all no añade latencia frente a una pasada secuencial.
+  //
+  //  PSM 4  (SINGLE_COLUMN) — recibos bancarios verticales (apps móviles).
+  //  PSM 6  (SINGLE_BLOCK)  — layouts horizontales, PDFs, capturas de pantalla amplias.
+  //  PSM 11 (SPARSE_TEXT)   — barrido numérico puro para montos difíciles.
+  const [
+    { text: raw4, confidence: conf4 },
+    { text: raw6, confidence: conf6 },
+    rawAmounts,
+  ] = await Promise.all([
+    runOCR(processedBuffer, 'image/png'),
+    runOCRBlock(processedBuffer, 'image/png'),
+    runOCRAmounts(processedBuffer, 'image/png'),
+  ]);
+
+  const clean4      = normalizeOcrText(raw4);
+  const clean6      = normalizeOcrText(raw6);
+  const cleanAmounts = normalizeOcrText(rawAmounts);
+
+  // Extraer campos de cada pasada y fusionarlos
+  const fields4  = extractAllFields(clean4);
+  const fields6  = extractAllFields(clean6);
+  const fields   = mergeOcrFields(fields4, fields6);
+
+  // Monto: fusionado ?? pasada numérica PSM 11 como último recurso
+  fields.monto = fields.monto ?? extractMonto(cleanAmounts);
+
+  // Confianza: usar el máximo entre PSM 4 y PSM 6
+  const ocrConfidence = Math.max(conf4, conf6);
 
   const baseConfianza = calcConfianza(fields);
   const adjustedConfianza = ocrConfidence < 60
-    ? Math.round(baseConfianza * 0.8)   // OCR poco seguro → penalizar
+    ? Math.round(baseConfianza * 0.8)
     : baseConfianza;
 
   return {
@@ -652,7 +748,8 @@ async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg')
     confianza:      adjustedConfianza,
     _engine:        'tesseract',
     _ocrConfidence: ocrConfidence,
-    _ocrText:       process.env.NODE_ENV !== 'production' ? clean       : undefined,
+    _ocrText:       process.env.NODE_ENV !== 'production' ? clean4       : undefined,
+    _ocrText6:      process.env.NODE_ENV !== 'production' ? clean6       : undefined,
     _ocrAmounts:    process.env.NODE_ENV !== 'production' ? cleanAmounts : undefined,
   };
 }

@@ -115,6 +115,18 @@ function clasificar(concepto) {
   return null;
 }
 
+// ── Normalización de número de autorización ───────────────────────────────────
+// Elimina ceros a la izquierda para que "00199480" y "199480" sean equivalentes.
+// Se aplica en todos los parsers al asignar numeroAutorizacion.
+function normalizeAuthNum(val) {
+  if (!val) return null;
+  // Strip apóstrofes iniciales (prefijo de texto de Excel: "'000000337041" → "000000337041")
+  const s = String(val).trim().replace(/^'+/, '');
+  if (!s) return null;
+  // Strip ceros iniciales: "00199480" → "199480"
+  return s.replace(/^0+(?=\d)/, '') || s;
+}
+
 // ── Helpers de conversión ─────────────────────────────────────────────────────
 
 /**
@@ -126,6 +138,10 @@ function clasificar(concepto) {
  * la muestre con la fecha correcta.
  */
 function normalizeExcelDate(d) {
+  // Celda fórmula (tipo 6): ExcelJS entrega { formula: '=A1', result: Date|number }
+  if (d !== null && typeof d === 'object' && !(d instanceof Date) && d.result !== undefined) {
+    d = d.result;
+  }
   // ExcelJS a veces entrega seriales numéricos en lugar de objetos Date
   if (typeof d === 'number' && d > 25000) {
     d = new Date((d - 25569) * 86400000);
@@ -152,6 +168,10 @@ function toNumber(val) {
  */
 function toDate(val) {
   if (!val) return null;
+  // Celda fórmula (tipo 6): ExcelJS entrega { formula: '=A1', result: Date|string|number }
+  if (typeof val === 'object' && !(val instanceof Date) && val.result !== undefined) {
+    return toDate(val.result);
+  }
   if (val instanceof Date) return isNaN(val.getTime()) ? null : val;
 
   // ExcelJS puede devolver el serial numérico de Excel en lugar de un objeto Date
@@ -232,10 +252,16 @@ function parseBanamex(sheet) {
     const col4 = v[4]; // Retiros
     const col5 = v[5]; // Saldo
 
-    // Saltar header
+    // Saltar header solo si la primera fila es texto (encabezado real).
+    // Los archivos "Extendido" de Banamex comienzan directamente con movimientos
+    // en fila 1 (sin fila de encabezado). Si col1 ya tiene tipo Date o serial
+    // numérico de fecha, es un movimiento → procesarlo normalmente.
     if (!headerSkipped) {
       headerSkipped = true;
-      return;
+      const isDateRow = cell1Type === DATE_TYPE ||
+        (cell1Type === NUMBER_TYPE && typeof v[1] === 'number' && v[1] > 25000);
+      if (!isDateRow) return; // encabezado de texto → saltar
+      // Es un movimiento en fila 1 → no hacer return, continuar al bloque isMainRow
     }
 
     // Una fila principal tiene tipo Date (4) en col1.
@@ -341,8 +367,8 @@ function buildBanamex(c, otros = false) {
     deposito,
     retiro,
     saldo:              c.saldo,
-    numeroAutorizacion: c.numAutorizacion,
-    referenciaNumerica: c.refNumerica,
+    numeroAutorizacion: normalizeAuthNum(c.numAutorizacion),
+    referenciaNumerica: normalizeAuthNum(c.refNumerica),
     status:             otros ? 'otros' : 'no_identificado',
     categoria:          clasificar(conceptoCompleto),
   };
@@ -407,7 +433,7 @@ function parseBBVA(sheet) {
       // BBVA exporta cargos como negativos; se guarda el valor absoluto
       retiro:             cargoRaw !== null ? Math.abs(cargoRaw) : null,
       saldo:              toNumber(col5),
-      numeroAutorizacion,
+      numeroAutorizacion: normalizeAuthNum(numeroAutorizacion),
       referenciaNumerica: null,
       status:             isOtros(concepto, BBVA_OTROS) ? 'otros' : 'no_identificado',
       categoria:          clasificar(concepto),
@@ -469,7 +495,7 @@ function parseSantander(sheet) {
       deposito:           signo === '+' ? monto : null,
       retiro:             signo === '-' ? monto : null,
       saldo:              toNumber(col7),
-      numeroAutorizacion: (col8 !== null && col8 !== undefined && String(col8).trim() !== '') ? String(col8).trim() : null,
+      numeroAutorizacion: normalizeAuthNum(col8 !== null && col8 !== undefined ? String(col8).trim() : null),
       referenciaNumerica: null,
       status:             'no_identificado',
       categoria:          clasificar(concepto),
@@ -509,7 +535,14 @@ function parseAzteca(sheet) {
 
     if (!headerSkipped) {
       headerSkipped = true;
-      return;
+      // Azteca no tiene fila de encabezado: los archivos descargados de su portal
+      // comienzan directamente con movimientos (tipo Date). Si col1 ya es fecha,
+      // es un movimiento → no saltar. Si es texto, es encabezado → saltar.
+      const cell1Type = row.getCell(1).type;
+      const isDateRow = cell1Type === 4 ||
+        (cell1Type === 2 && typeof col1 === 'number' && col1 > 25000);
+      if (!isDateRow) return; // encabezado de texto → saltar
+      // Es un movimiento en fila 1 → continuar
     }
 
     const fecha = normalizeExcelDate(col1 instanceof Date ? col1 : toDate(col1));
@@ -529,7 +562,7 @@ function parseAzteca(sheet) {
       deposito,
       retiro,
       saldo:              toNumber(col6),
-      numeroAutorizacion: col7 !== null && col7 !== undefined ? String(col7).trim() : null,
+      numeroAutorizacion: normalizeAuthNum(col7 !== null && col7 !== undefined ? String(col7).trim() : null),
       referenciaNumerica: null,
       status:             'no_identificado',
       categoria:          clasificar(conceptoAzt),

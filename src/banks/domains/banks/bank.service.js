@@ -137,7 +137,7 @@ async function listMovements(filters) {
     movId,
   } = filters;
 
-  const filter = { isActive: true };
+  const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
   // Filtro por ID exacto (usado desde OCR para saltar a un movimiento específico)
@@ -311,6 +311,37 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
   ).lean();
   const hashesExistentes = new Set(existentes.map(e => e.hash));
 
+  // ── 1b. Banamex: deduplicar por numeroAutorizacion ─────────────────────────
+  // Si un movimiento Banamex con el mismo número de autorización ya existe,
+  // solo se actualiza su fecha (el número de autorización es el identificador
+  // canónico en los estados de cuenta, incluyendo los de fin de semana).
+  const fechaUpdates = [];   // { _id, fecha }
+  const banamexAuthMovs = movements.filter(
+    m => m.banco === 'Banamex' && m.numeroAutorizacion,
+  );
+  if (banamexAuthMovs.length > 0) {
+    const authNums = banamexAuthMovs.map(m => m.numeroAutorizacion);
+    const existByAuth = await BankMovement.find(
+      { banco: 'Banamex', numeroAutorizacion: { $in: authNums } },
+      '_id numeroAutorizacion fecha',
+    ).lean();
+
+    for (const existing of existByAuth) {
+      const incoming = banamexAuthMovs.find(
+        m => m.numeroAutorizacion === existing.numeroAutorizacion,
+      );
+      if (!incoming) continue;
+      // Programar actualización de fecha si cambió
+      const existingFecha = new Date(existing.fecha).getTime();
+      const incomingFecha = new Date(incoming.fecha).getTime();
+      if (existingFecha !== incomingFecha) {
+        fechaUpdates.push({ _id: existing._id, fecha: incoming.fecha });
+      }
+      // Marcar como ya existente para que no se re-inserte
+      hashesExistentes.add(incoming.hash);
+    }
+  }
+
   const nuevos     = movements.filter(m => !hashesExistentes.has(m.hash));
   const duplicados = movements.length - nuevos.length;
 
@@ -359,14 +390,25 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
     });
   }
 
+  // ── 3b. Actualizar fecha de movimientos Banamex deduplicados por auth ──────
+  if (fechaUpdates.length > 0) {
+    const fechaOps = fechaUpdates.map(({ _id, fecha }) => ({
+      updateOne: { filter: { _id }, update: { $set: { fecha } } },
+    }));
+    await BankMovement.bulkWrite(fechaOps, { ordered: false });
+  }
+
     // ── 4. Aplicar reglas a los movimientos recién insertados ─────────────────
     let categorizados  = 0;
     let sinReglasAviso = false;
 
     if (insertados > 0 && bancoValidado) {
-      const rules = await bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' });
+      const [catRules, ocultarRules] = await Promise.all([
+        bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
+        bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+      ]);
 
-      if (rules.length === 0) {
+      if (catRules.length === 0 && ocultarRules.length === 0) {
         sinReglasAviso = true;
       } else {
         const foliosNuevos   = nuevos.map(m => m.folio);
@@ -376,17 +418,16 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
 
         const ops = [];
         for (const mov of docsInsertados) {
-          for (const rule of rules) {
-            if (matchRegla(mov, rule)) {
-              ops.push({
-                updateOne: {
-                  filter: { _id: mov._id },
-                  update: { $set: { categoria: rule.nombre } },
-                },
-              });
-              categorizados++;
-              break; // Primera regla que aplica gana
-            }
+          const $set = {};
+          for (const rule of catRules) {
+            if (matchRegla(mov, rule)) { $set.categoria = rule.nombre; break; }
+          }
+          if ($set.categoria) categorizados++;
+          for (const rule of ocultarRules) {
+            if (matchRegla(mov, rule)) { $set.oculto = true; break; }
+          }
+          if (Object.keys($set).length > 0) {
+            ops.push({ updateOne: { filter: { _id: mov._id }, update: { $set } } });
           }
         }
 
@@ -448,16 +489,22 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
   let categorizado = false;
 
   if (bancoValidado) {
-    const rules = await bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' });
+    const [catRules, ocultarRules] = await Promise.all([
+      bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
+      bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+    ]);
 
-    for (const rule of rules) {
+    for (const rule of catRules) {
       if (matchRegla(nuevo, rule)) {
         nuevo.categoria = rule.nombre;
-        await nuevo.save();
         categorizado = true;
         break;
       }
     }
+    for (const rule of ocultarRules) {
+      if (matchRegla(nuevo, rule)) { nuevo.oculto = true; break; }
+    }
+    if (categorizado || nuevo.oculto) await nuevo.save();
   }
 
   // ── 7. Emitir evento ───────────────────────────────────────────────
@@ -690,7 +737,7 @@ async function exportMovements(filters) {
     status, categorias,
   } = filters;
 
-  const filter = { isActive: true };
+  const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
 

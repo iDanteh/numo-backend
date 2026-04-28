@@ -316,7 +316,21 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
 
   const cfdiSelect = 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda';
 
-  const [comparaciones, total, notInSatCfdis, notInErpCfdis, satCanceladoCfdis] = await Promise.all([
+  // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito
+  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } };
+  if (tipoDeComprobante) pendienteFiltro.tipoDeComprobante = tipoDeComprobante;
+  if (ejercicio && periodo) {
+    const ej = parseInt(ejercicio), pe = parseInt(periodo);
+    const fechaIni = new Date(ej, pe - 1, 1);
+    const fechaFin = new Date(ej, pe, 1);
+    pendienteFiltro.$or = [
+      { ejercicio: ej, periodo: pe },
+      { ejercicio: { $exists: false }, fecha: { $gte: fechaIni, $lt: fechaFin } },
+      { ejercicio: null,              fecha: { $gte: fechaIni, $lt: fechaFin } },
+    ];
+  }
+
+  const [comparaciones, total, notInSatCfdis, notInErpCfdis, satCanceladoCfdis, pendientesCfdis] = await Promise.all([
     Comparison.find(filter)
       .select('uuid status differences criticalCount warningCount tipoDeComprobante ejercicio periodo comparedAt erpCfdiId satCfdiId')
       .populate({ path: 'erpCfdiId', model: 'CFDI', select: cfdiSelect })
@@ -338,6 +352,9 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     // ERP activo pero SAT cancelado (cruce de estatus fiscal)
     CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
+
+    // ERP con RFC con & — verificación SAT pendiente (SOAP no soporta %26)
+    CFDI.find(pendienteFiltro).select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
   ]);
 
   // Deduplicar por UUID — puede haber múltiples Comparison para el mismo CFDI
@@ -355,9 +372,10 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
 
   res.json({
     items, total, page: pg, limit: lm, pages: Math.ceil(total / lm),
-    notInSat:     notInSatCfdis,
-    notInErp:     notInErpCfdis,
+    notInSat:      notInSatCfdis,
+    notInErp:      notInErpCfdis,
     satCancelados: satCanceladoCfdis,
+    pendientes:    pendientesCfdis,
   });
 });
 

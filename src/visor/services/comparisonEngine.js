@@ -69,8 +69,21 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   const sello = erpCfdi.timbreFiscalDigital?.selloCFD || erpCfdi.sello
     || satCfdi?.timbreFiscalDigital?.selloCFD || satCfdi?.sello || '';
 
+  // El servicio SOAP ConsultaCFDI no decodifica URL: si el RFC contiene '&'
+  // (persona moral con Ñ), enviar %26 no funciona porque el servicio lo recibe literal.
+  // El portal web sí funciona (browser decodifica). Se omite el live check SOAP
+  // para estos RFCs y se depende de la copia local SAT.
+  const rfcConAmpersand = erpCfdi.emisor.rfc.includes('&') || erpCfdi.receptor.rfc.includes('&');
+
   if (!rfcEmisorValido) {
     logger.warn(`[Engine] RFC emisor inválido ("${erpCfdi.emisor.rfc}") para ${erpCfdi.uuid} — live check SAT omitido.`);
+  } else if (rfcConAmpersand) {
+    // ConsultaCFDI SOAP no decodifica %26 → live check omitido para RFCs con &.
+    logger.warn(`[Engine] ${erpCfdi.uuid} — RFC con & (${erpCfdi.emisor.rfc}/${erpCfdi.receptor.rfc}): SOAP omitido. satStatus → Pendiente.`);
+    await updateSATStatus(erpCfdi, 'Pendiente');
+    if (satCfdi) {
+      await CFDI.findByIdAndUpdate(satCfdi._id, { satStatus: 'Pendiente', satLastCheck: new Date() });
+    }
   } else if (!sello) {
     // Sin sello no hay fe= y el SAT siempre devuelve N-601 — no contaminar satStatus
     logger.warn(`[Engine] ${erpCfdi.uuid} — sin sello (ERP sin XML, sin copia SAT local). Live check omitido.`);
@@ -98,6 +111,18 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   const differences = [];
 
   // ── 3. Discrepancias de estado SAT ──
+
+  // RFC con & — SAT no verificable vía SOAP
+  if (rfcConAmpersand) {
+    differences.push({
+      field: 'sat.verificacion',
+      erpValue: String(erpCfdi.total ?? 0),
+      satValue: 'Pendiente — RFC con & no verificable vía SOAP',
+      severity: 'critical',
+      type: 'AMOUNT_MISMATCH',
+    });
+  }
+
   if (satResponse) {
     if (satResponse.state === 'No Encontrado') {
       differences.push({
@@ -179,7 +204,10 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   //  satCfdi existe, differences.length>0     → discrepancy (existe en ambos, campos distintos)
 
   let status;
-  if (!satCfdi && !satResponse) {
+  if (rfcConAmpersand) {
+    // SAT no verificable — mostrar siempre como discrepancia en el dashboard
+    status = criticalCount > 0 ? 'discrepancy' : 'warning';
+  } else if (!satCfdi && !satResponse) {
     // Sin ninguna fuente SAT disponible
     status = 'error';
   } else if (satResponse?.state === 'Expresión Inválida') {
@@ -521,10 +549,11 @@ const compareGeneralFields = (erp, sat) => {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const updateSATStatus = async (cfdi, state) => {
-  cfdi.satStatus = ['Vigente', 'Cancelado', 'No Encontrado', 'Pendiente', 'Error', 'Expresión Inválida', 'Desconocido'].includes(state)
+  const newStatus = ['Vigente', 'Cancelado', 'No Encontrado', 'Pendiente', 'Error', 'Expresión Inválida', 'Desconocido'].includes(state)
     ? state : 'Error';
+  cfdi.satStatus = newStatus;
   cfdi.satLastCheck = new Date();
-  await cfdi.save();
+  await CFDI.findByIdAndUpdate(cfdi._id, { satStatus: newStatus, satLastCheck: cfdi.satLastCheck });
 };
 
 const saveComparison = async (data) => {

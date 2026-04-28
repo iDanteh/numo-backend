@@ -100,7 +100,6 @@ const ROLES = Object.freeze({
   tienda: {
     label: 'Tienda',
     permissions: [
-      PERMISSIONS.BANKS_READ,
       PERMISSIONS.ACCOUNT_PLAN_READ,
       PERMISSIONS.VISOR_READ,
       PERMISSIONS.COLLECTIONS_READ,

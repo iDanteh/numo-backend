@@ -37,6 +37,31 @@ const resolverPeriodo = async (ejercicio, periodo) => {
 };
 
 /**
+ * Busca el PeriodoFiscal en BD y lo crea automáticamente si no existe.
+ * Usado exclusivamente por los jobs automáticos nocturnos.
+ *
+ * @param {number} ejercicio
+ * @param {number} periodo   — mes (1–12)
+ * @returns {Promise<{ doc: PeriodoFiscal, creado: boolean }>}
+ */
+const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+
+const resolverOCrearPeriodo = async (ejercicio, periodo) => {
+  if (!Number.isInteger(ejercicio) || !Number.isInteger(periodo)) {
+    const err = new Error('ejercicio y periodo deben ser números enteros.');
+    err.status = 400;
+    throw err;
+  }
+
+  let doc = await periodoRepo.findByEjercicioPeriodo(ejercicio, periodo);
+  if (doc) return { doc, creado: false };
+
+  const label = `${MESES[periodo - 1]} ${ejercicio}`;
+  doc = await periodoRepo.create({ ejercicio, periodo, label, createdBy: null });
+  return { doc, creado: true };
+};
+
+/**
  * Deriva ejercicio y periodo de una fecha sin consultar la BD.
  * Usado por los jobs automáticos donde el periodo viene de la fecha del día.
  *
@@ -48,4 +73,4 @@ const derivarPeriodoDesdeFecha = (date) => ({
   periodo:   date.getMonth() + 1,
 });
 
-module.exports = { resolverPeriodo, derivarPeriodoDesdeFecha };
+module.exports = { resolverPeriodo, resolverOCrearPeriodo, derivarPeriodoDesdeFecha };

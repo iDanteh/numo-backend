@@ -118,6 +118,14 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
           type: 'CANCELLED_IN_SAT',
         });
       }
+    } else if (satResponse.state === 'Expresión Inválida') {
+      differences.push({
+        field: 'sat.expresion',
+        erpValue: 'Expresión válida en ERP',
+        satValue: 'Expresión Inválida',
+        severity: 'critical',
+        type: 'INVALID_EXPRESSION',
+      });
     }
   }
 
@@ -163,6 +171,7 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   // Tabla de decisión:
   //  satResponse=null, satCfdi=null            → error (no hay datos SAT)
   //  satResponse=unreachable, satCfdi=null     → error (SAT inalcanzable, sin local)
+  //  satResponse.state='Expresión Inválida'    → discrepancy (siempre, con o sin copia local)
   //  satResponse.isCancelled=true              → cancelled (SAT confirmó cancelación)
   //  satResponse.state='No Encontrado'         → not_in_sat (SAT confirmó que no existe)
   //  satCfdi=null  (sin copia local SAT)       → not_in_sat (solo existe en ERP)
@@ -173,6 +182,9 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   if (!satCfdi && !satResponse) {
     // Sin ninguna fuente SAT disponible
     status = 'error';
+  } else if (satResponse?.state === 'Expresión Inválida') {
+    // El SAT rechazó la expresión del CFDI — siempre es discrepancia crítica
+    status = 'discrepancy';
   } else if (satIsUnreachable && !satCfdi) {
     // SAT devolvió estado inesperado y no hay copia local
     status = 'error';
@@ -536,6 +548,7 @@ const saveComparison = async (data) => {
 const saveDiscrepancy = async (data) => Discrepancy.create(data);
 
 const mapDiffToType = (field) => {
+  if (field === 'sat.expresion')         return 'INVALID_EXPRESSION';
   if (field.includes('rfc'))             return 'RFC_MISMATCH';
   if (field === 'total' || field === 'subTotal' || field === 'descuento') return 'AMOUNT_MISMATCH';
   if (field.includes('impuesto'))        return 'TAX_CALCULATION_ERROR';

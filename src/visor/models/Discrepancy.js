@@ -28,6 +28,7 @@ const discrepancySchema = new mongoose.Schema({
       'SIGNATURE_INVALID',        // Sello/certificado inválido
       'COMPLEMENT_MISSING',       // Complemento ausente o inválido
       'REGIME_MISMATCH',          // Régimen fiscal no coincide
+      'INVALID_EXPRESSION',       // Expresión impresa inválida según SAT
       'OTHER',
     ],
     required: true,

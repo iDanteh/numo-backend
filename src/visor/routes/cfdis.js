@@ -8,7 +8,7 @@ const {
   list, getById, getXml,
   upload, importExcel, importFromErpApi,
   create, compare, remove, exportExcel,
-  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
 } = require('../controllers/cfdi.controller');
 
 const router = express.Router();
@@ -74,9 +74,10 @@ router.post('/',
 );
 
 // ── Rutas con parámetro :id — al final para no capturar rutas estáticas ──────
-router.get('/:id/xml',          authenticate, getXml);
-router.get('/:id',              authenticate, getById);
-router.patch('/:id/migrar-periodo', authenticate, permit('admin', 'contador'), migrarPeriodo);
+router.get('/:id/xml',               authenticate, getXml);
+router.get('/:id/erp-contraparte',   authenticate, erpContraparte);
+router.get('/:id',                   authenticate, getById);
+router.patch('/:id/migrar-periodo',  authenticate, permit('admin', 'contador'), migrarPeriodo);
 router.post('/:id/compare',     authenticate, permit('visor:write'), compare);
 router.delete('/:id',           authenticate, permit('users:manage'), remove);
 

@@ -79,9 +79,12 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
     logger.warn(`[Engine] RFC emisor inválido ("${erpCfdi.emisor.rfc}") para ${erpCfdi.uuid} — live check SAT omitido.`);
   } else if (rfcConAmpersand) {
     // ConsultaCFDI SOAP no decodifica %26 → live check omitido para RFCs con &.
-    // Si hay copia local SAT, usar su estado; si no, marcar Pendiente.
-    const statusLocal = satCfdi?.satStatus;
-    const estadoEfectivo = (statusLocal && statusLocal !== 'Pendiente') ? statusLocal : 'Pendiente';
+    // Si existe copia SAT local: el job ya marcó Cancelado si aplica, cualquier otro
+    // valor (incluso Pendiente sobreescrito) significa que está en SAT → Vigente.
+    let estadoEfectivo = 'Pendiente';
+    if (satCfdi?.source === 'SAT') {
+      estadoEfectivo = satCfdi.satStatus === 'Cancelado' ? 'Cancelado' : 'Vigente';
+    }
     logger.warn(`[Engine] ${erpCfdi.uuid} — RFC con & (${erpCfdi.emisor.rfc}/${erpCfdi.receptor.rfc}): SOAP omitido. satStatus → ${estadoEfectivo} (local).`);
     await updateSATStatus(erpCfdi, estadoEfectivo);
     if (satCfdi) {

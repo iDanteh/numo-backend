@@ -53,6 +53,7 @@ WORKDIR /app
 # libvips es necesaria en runtime para que sharp funcione.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips42 \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiamos node_modules ya instalados desde el stage anterior.
@@ -92,4 +93,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 #   • npm añade un proceso intermediario que intercepta señales (SIGTERM)
 #   • Con 'node' directo, Docker puede enviar SIGTERM directamente al proceso
 #     para un graceful shutdown correcto.
-CMD ["node", "src/app.js"]
+CMD ["node", "--openssl-legacy-provider", "src/app.js"]

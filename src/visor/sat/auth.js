@@ -12,8 +12,9 @@
  *  - El token no se persiste en base de datos.
  */
 
-const forge = require('node-forge');
-const axios = require('axios');
+const forge  = require('node-forge');
+const crypto = require('crypto');
+const axios  = require('axios');
 const { logger } = require('../../shared/utils/logger');
 
 const AUTENTICACION_URL = (
@@ -68,15 +69,29 @@ const parseCer = (cerBuf) => {
  * @returns {object} privateKey de node-forge
  */
 const parseKey = (keyBuf, password) => {
+  const bin = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf, 'base64');
+
+  // Intento 1: node-forge (soporta 3DES-SHA1)
   try {
-    const bin      = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf, 'base64');
     const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
     const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
     const keyInfo  = forge.pki.decryptPrivateKeyInfo(asn1, password);
     if (!keyInfo) throw new Error('Contraseña incorrecta');
     return forge.pki.privateKeyFromAsn1(keyInfo);
-  } catch (e) {
-    throw new Error('No se pudo parsear la llave privada: ' + e.message);
+  } catch (e1) {
+    // Intento 2: crypto nativo (OpenSSL) — soporta RC2-40 y otros algoritmos del SAT
+    try {
+      const nativeKey = crypto.createPrivateKey({
+        key:        bin,
+        format:     'der',
+        type:       'pkcs8',
+        passphrase: password,
+      });
+      const pem = nativeKey.export({ type: 'pkcs1', format: 'pem' });
+      return forge.pki.privateKeyFromPem(pem);
+    } catch (e2) {
+      throw new Error('No se pudo parsear la llave privada: ' + e1.message);
+    }
   }
 };
 

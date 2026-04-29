@@ -79,7 +79,7 @@ const parseKey = (keyBuf, password) => {
     if (!keyInfo) throw new Error('Contraseña incorrecta');
     return forge.pki.privateKeyFromAsn1(keyInfo);
   } catch (e1) {
-    // Intento 2: crypto nativo (OpenSSL) — soporta RC2-40 y otros algoritmos del SAT
+    // Intento 2: crypto nativo vía OpenSSL (soporta RC2-40 y otros algoritmos del SAT)
     try {
       const nativeKey = crypto.createPrivateKey({
         key:        bin,

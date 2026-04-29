@@ -1085,7 +1085,7 @@ const jobVerificacionSAT = async () => {
       { satLastCheck: { $lt: yesterday } },
       { satStatus: 'Pendiente' },
     ],
-  }, '_id').limit(500).lean();
+  }, '_id').limit(2000).lean();
   logger.info(`[SatSyncJob] ${cfdis.length} CFDIs por verificar`);
   let success = 0, failed = 0;
   for (const cfdi of cfdis) {

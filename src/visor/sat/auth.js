@@ -90,6 +90,7 @@ const parseKey = (keyBuf, password) => {
       const pem = nativeKey.export({ type: 'pkcs1', format: 'pem' });
       return forge.pki.privateKeyFromPem(pem);
     } catch (e2) {
+      logger.error(`[parseKey] forge falló: ${e1.message} | native crypto falló: ${e2.message}`);
       throw new Error('No se pudo parsear la llave privada: ' + e1.message);
     }
   }

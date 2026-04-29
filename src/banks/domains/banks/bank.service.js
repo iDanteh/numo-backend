@@ -72,7 +72,7 @@ async function getCards() {
             $sum: {
               $cond: [
                 { $in: ['$status', ['no_identificado', null]] },
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                { $ifNull: ['$deposito', 0] },
                 0,
               ],
             },

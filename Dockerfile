@@ -53,6 +53,7 @@ WORKDIR /app
 # libvips es necesaria en runtime para que sharp funcione.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libvips42 \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiamos node_modules ya instalados desde el stage anterior.

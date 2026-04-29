@@ -91,15 +91,19 @@ const parseKey = (keyBuf, password) => {
       const pem = nativeKey.export({ type: 'pkcs1', format: 'pem' });
       return forge.pki.privateKeyFromPem(pem);
     } catch (e2) {
-      // Intento 3: openssl pkey CLI (soporta todos los formatos: PKCS#8, PKCS#1 tradicional, RC2-40)
-      // Se usa 'pkey' en vez de 'pkcs8' porque es más genérico y no asume el formato exacto.
+      // Intento 3: openssl pkey CLI — cubre RC2-40 y formatos no-PKCS#8 de e.firma SAT.
+      // Se prueban dos variantes: con y sin -provider (OpenSSL 3 vs 1.1.x).
       const hex4 = bin.slice(0, 4).toString('hex');
-      logger.info(`[parseKey] Primeros 4 bytes DER: ${hex4} — intentando openssl pkey`);
-      let e3msg = '';
-      for (const passinArg of [`env:SAT_KEY_PASS`, `pass:${password}`]) {
+      logger.info(`[parseKey] DER primeros 4 bytes: ${hex4} — intentando openssl pkey`);
+      const opensslVariants = [
+        // OpenSSL 3.x con legacy provider (habilita RC2-40)
+        ['pkey', '-inform', 'DER', '-passin', 'env:SAT_KEY_PASS', '-provider', 'legacy', '-provider', 'default'],
+        // OpenSSL 1.1.x — RC2-40 incluido de fábrica, sin flag -provider
+        ['pkey', '-inform', 'DER', '-passin', 'env:SAT_KEY_PASS'],
+      ];
+      let lastOpenSslErr = '';
+      for (const args of opensslVariants) {
         try {
-          const args = ['pkey', '-inform', 'DER', '-passin', passinArg,
-                        '-provider', 'legacy', '-provider', 'default'];
           const pemOut = execFileSync('openssl', args, {
             input: bin,
             env: { ...process.env, SAT_KEY_PASS: password },
@@ -107,13 +111,13 @@ const parseKey = (keyBuf, password) => {
           });
           return forge.pki.privateKeyFromPem(pemOut.toString('utf-8'));
         } catch (e3) {
-          e3msg = e3.stderr ? e3.stderr.toString().trim() : e3.message;
+          lastOpenSslErr = e3.stderr ? e3.stderr.toString().trim() : e3.message;
         }
       }
       logger.error(
         `[parseKey] forge falló: ${e1.message} | ` +
         `native crypto falló: ${e2.message} | ` +
-        `openssl falló: ${e3msg}`,
+        `openssl falló: ${lastOpenSslErr}`,
       );
       throw new Error('No se pudo parsear la llave privada: ' + e1.message);
     }

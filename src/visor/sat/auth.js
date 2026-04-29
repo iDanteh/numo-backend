@@ -12,9 +12,10 @@
  *  - El token no se persiste en base de datos.
  */
 
-const forge  = require('node-forge');
-const crypto = require('crypto');
-const axios  = require('axios');
+const forge          = require('node-forge');
+const crypto         = require('crypto');
+const { execFileSync } = require('child_process');
+const axios          = require('axios');
 const { logger } = require('../../shared/utils/logger');
 
 const AUTENTICACION_URL = (
@@ -90,7 +91,30 @@ const parseKey = (keyBuf, password) => {
       const pem = nativeKey.export({ type: 'pkcs1', format: 'pem' });
       return forge.pki.privateKeyFromPem(pem);
     } catch (e2) {
-      logger.error(`[parseKey] forge falló: ${e1.message} | native crypto falló: ${e2.message}`);
+      // Intento 3: openssl pkey CLI (soporta todos los formatos: PKCS#8, PKCS#1 tradicional, RC2-40)
+      // Se usa 'pkey' en vez de 'pkcs8' porque es más genérico y no asume el formato exacto.
+      const hex4 = bin.slice(0, 4).toString('hex');
+      logger.info(`[parseKey] Primeros 4 bytes DER: ${hex4} — intentando openssl pkey`);
+      let e3msg = '';
+      for (const passinArg of [`env:SAT_KEY_PASS`, `pass:${password}`]) {
+        try {
+          const args = ['pkey', '-inform', 'DER', '-passin', passinArg,
+                        '-provider', 'legacy', '-provider', 'default'];
+          const pemOut = execFileSync('openssl', args, {
+            input: bin,
+            env: { ...process.env, SAT_KEY_PASS: password },
+            timeout: 10000,
+          });
+          return forge.pki.privateKeyFromPem(pemOut.toString('utf-8'));
+        } catch (e3) {
+          e3msg = e3.stderr ? e3.stderr.toString().trim() : e3.message;
+        }
+      }
+      logger.error(
+        `[parseKey] forge falló: ${e1.message} | ` +
+        `native crypto falló: ${e2.message} | ` +
+        `openssl falló: ${e3msg}`,
+      );
       throw new Error('No se pudo parsear la llave privada: ' + e1.message);
     }
   }

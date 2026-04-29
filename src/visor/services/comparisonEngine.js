@@ -79,10 +79,16 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
     logger.warn(`[Engine] RFC emisor inválido ("${erpCfdi.emisor.rfc}") para ${erpCfdi.uuid} — live check SAT omitido.`);
   } else if (rfcConAmpersand) {
     // ConsultaCFDI SOAP no decodifica %26 → live check omitido para RFCs con &.
-    logger.warn(`[Engine] ${erpCfdi.uuid} — RFC con & (${erpCfdi.emisor.rfc}/${erpCfdi.receptor.rfc}): SOAP omitido. satStatus → Pendiente.`);
-    await updateSATStatus(erpCfdi, 'Pendiente');
+    // Si existe copia SAT local: el job ya marcó Cancelado si aplica, cualquier otro
+    // valor (incluso Pendiente sobreescrito) significa que está en SAT → Vigente.
+    let estadoEfectivo = 'Pendiente';
+    if (satCfdi?.source === 'SAT') {
+      estadoEfectivo = satCfdi.satStatus === 'Cancelado' ? 'Cancelado' : 'Vigente';
+    }
+    logger.warn(`[Engine] ${erpCfdi.uuid} — RFC con & (${erpCfdi.emisor.rfc}/${erpCfdi.receptor.rfc}): SOAP omitido. satStatus → ${estadoEfectivo} (local).`);
+    await updateSATStatus(erpCfdi, estadoEfectivo);
     if (satCfdi) {
-      await CFDI.findByIdAndUpdate(satCfdi._id, { satStatus: 'Pendiente', satLastCheck: new Date() });
+      await CFDI.findByIdAndUpdate(satCfdi._id, { satStatus: estadoEfectivo, satLastCheck: new Date() });
     }
   } else if (!sello) {
     // Sin sello no hay fe= y el SAT siempre devuelve N-601 — no contaminar satStatus
@@ -114,12 +120,15 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
 
   // RFC con & — SAT no verificable vía SOAP
   if (rfcConAmpersand) {
+    const tieneLocal = !!(satCfdi?.satStatus && satCfdi.satStatus !== 'Pendiente');
     differences.push({
       field: 'sat.verificacion',
-      erpValue: String(erpCfdi.total ?? 0),
-      satValue: 'Pendiente — RFC con & no verificable vía SOAP',
-      severity: 'critical',
-      type: 'AMOUNT_MISMATCH',
+      erpValue: tieneLocal ? satCfdi.satStatus : 'Pendiente',
+      satValue: tieneLocal
+        ? `Validado localmente (RFC con & no consultable en línea)`
+        : 'No verificable — RFC con & y sin copia local SAT',
+      severity: tieneLocal ? 'warning' : 'warning',
+      type: 'RFC_AMPERSAND',
     });
   }
 

@@ -1091,6 +1091,42 @@ const migrarPeriodoBulk = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/cfdis/:id/erp-contraparte
+ * Busca la contraparte ERP de un CFDI SAT/MANUAL con el mismo UUID.
+ * Devuelve si existe, si es global y en qué periodo está.
+ * Usado por el frontend para sugerir el periodo destino antes de migrar.
+ */
+const erpContraparte = asyncHandler(async (req, res) => {
+  const cfdi = await CFDI.findById(req.params.id).select('uuid source ejercicio periodo');
+  if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado.' });
+  if (!['SAT', 'MANUAL'].includes(cfdi.source)) {
+    return res.status(400).json({ error: 'Solo aplica a CFDIs SAT o MANUAL.' });
+  }
+
+  const erp = await CFDI.findOne(
+    { uuid: cfdi.uuid, source: 'ERP', isActive: true },
+    'ejercicio periodo informacionGlobal xmlContent'
+  ).select('+xmlContent');
+
+  if (!erp) {
+    return res.json({ encontrado: false });
+  }
+
+  const esGlobal = !!(erp.informacionGlobal?.mes ||
+    (erp.xmlContent && /InformacionGlobal/i.test(erp.xmlContent)));
+  const periodoDistinto = erp.ejercicio !== cfdi.ejercicio || erp.periodo !== cfdi.periodo;
+
+  return res.json({
+    encontrado: true,
+    esGlobal,
+    periodoDistinto,
+    ejercicio: erp.ejercicio,
+    periodo:   erp.periodo,
+    informacionGlobal: erp.informacionGlobal ?? null,
+  });
+});
+
+/**
  * PATCH /api/cfdis/:id/migrar-periodo
  * Mueve una factura global SAT/MANUAL a un periodo/ejercicio diferente.
  * Solo aplica a CFDIs con source SAT o MANUAL que tengan InformacionGlobal.
@@ -1181,5 +1217,5 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
 
 module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
-  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk,
+  planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
 };

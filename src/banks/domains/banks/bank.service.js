@@ -60,7 +60,18 @@ async function getCards() {
         $group: {
           _id:            '$banco',
           movimientos:    { $sum: 1 },
-          movimientoNoIdentificado: { $sum: 1 && { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
+          movimientoNoIdentificado: {
+            $sum: {
+              $cond: [
+                { $and: [
+                  { $in: ['$status', ['no_identificado', null]] },
+                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] },
+                ]},
+                1,
+                0,
+              ],
+            },
+          },
           totalDepositos: { $sum: { $ifNull: ['$deposito', 0] } },
           totalRetiros:   { $sum: { $ifNull: ['$retiro',   0] } },
           ultimaFecha:    { $max: '$fecha' },
@@ -104,6 +115,39 @@ async function getCards() {
     bankConfigRepo.findAllAsMap(),
   ]);
 
+  // ── Saldo actualizado por banco ────────────────────────────────────────────
+  // Para cada banco que tiene saldo inicial definido, acumulamos el delta de
+  // movimientos importados DESPUÉS del corte (createdAt > saldoInicialFechaCorte).
+  // Se ejecutan en paralelo — el número de bancos con saldo inicial es pequeño.
+  const banksWithSaldo = [...configMap.entries()].filter(
+    ([, cfg]) => cfg.saldoInicial != null && cfg.saldoInicialFechaCorte != null,
+  );
+
+  const saldoActualizadoMap = {};
+  if (banksWithSaldo.length > 0) {
+    const deltaResults = await Promise.all(
+      banksWithSaldo.map(async ([banco, cfg]) => {
+        const [res] = await BankMovement.aggregate([
+          { $match: { banco, isActive: true, createdAt: { $gt: cfg.saldoInicialFechaCorte } } },
+          {
+            $group: {
+              _id:   null,
+              delta: {
+                $sum: {
+                  $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }],
+                },
+              },
+            },
+          },
+        ]);
+        return [banco, Number(cfg.saldoInicial) + (res?.delta ?? 0)];
+      }),
+    );
+    for (const [banco, saldo] of deltaResults) {
+      saldoActualizadoMap[banco] = saldo;
+    }
+  }
+
   return agg.map((b) => {
     const cfg = configMap.get(b._id);
     return {
@@ -117,9 +161,12 @@ async function getCards() {
       ultimaImport:   b.ultimaImport,
       cuentaContable: cfg?.cuentaContable ?? null,
       numeroCuenta:   cfg?.numeroCuenta   ?? null,
+      saldoInicial:            cfg?.saldoInicial            != null ? Number(cfg.saldoInicial) : null,
+      saldoInicialFechaCorte:  cfg?.saldoInicialFechaCorte  ?? null,
       saldoPendiente:    b.saldoPendiente    ?? 0,
       saldoIdentificado: b.saldoIdentificado ?? 0,
       saldoOtros:        b.saldoOtros        ?? 0,
+      saldoActualizado:  saldoActualizadoMap[b._id] ?? null,
       porStatus: {
         no_identificado: b.no_identificado,
         identificado:    b.identificado,
@@ -256,8 +303,30 @@ async function listMovements(filters) {
     });
   }
 
+  // ── Saldo calculado ────────────────────────────────────────────────────────
+  // Solo aplica cuando el banco está filtrado y tiene saldo inicial registrado.
+  const saldoMap = {};
+  if (banco) {
+    const cfg = await bankConfigRepo.findByBanco(banco);
+    if (cfg?.saldoInicial != null && cfg?.saldoInicialFechaCorte) {
+      // Traer todos los movimientos posteriores al corte, en orden cronológico.
+      // Solo se usan deposito/retiro para el cálculo acumulado.
+      const allMovs = await BankMovement.find(
+        { banco, isActive: true, createdAt: { $gt: cfg.saldoInicialFechaCorte } },
+        { deposito: 1, retiro: 1 },
+      ).sort({ fecha: 1, _id: 1 }).lean();
+
+      let saldo = Number(cfg.saldoInicial);
+      for (const m of allMovs) {
+        saldo += (m.deposito ?? 0) - (m.retiro ?? 0);
+        saldoMap[m._id.toString()] = saldo;
+      }
+    }
+  }
+
   const data = movements.map(m => ({
     ...m,
+    saldoCalculado: saldoMap[m._id.toString()] ?? null,
     solicitudesConfirmadas: solicitudesPorMov[m._id.toString()] ?? [],
   }));
 
@@ -749,6 +818,12 @@ async function saveConfig(banco, data) {
   return bankConfigRepo.upsert(banco, fields);
 }
 
+async function setSaldoInicial(banco, monto) {
+  if (!BANCOS_VALIDOS.includes(banco)) throw new BadRequestError('Banco inválido');
+  if (isNaN(monto) || monto < 0) throw new BadRequestError('Monto inválido');
+  return bankConfigRepo.setSaldoInicial(banco, monto);
+}
+
 async function listIdentificadores(banco) {
   // $unwind primero para descomponer el array identificadoPor por elemento,
   // luego $group por userId individual. Sin $unwind, MongoDB agrupa por el
@@ -915,6 +990,6 @@ async function exportMovements(filters) {
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds,
-  getConfig, saveConfig, listCategories, listIdentificadores, importIndividual,
+  getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements,
 };

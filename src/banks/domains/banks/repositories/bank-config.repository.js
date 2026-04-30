@@ -39,4 +39,23 @@ async function findAllAsMap() {
   return new Map(configs.map((c) => [c.banco, c]));
 }
 
-module.exports = { findByBanco, upsert, findAllAsMap };
+/**
+ * Registra el saldo inicial de un banco una única vez.
+ * Lanza un error 409 si ya fue definido previamente.
+ * @returns {BankConfig}
+ */
+async function setSaldoInicial(banco, monto) {
+  const existing = await BankConfig.findOne({ where: { banco } });
+  if (existing?.saldoInicial != null) {
+    const err = new Error('El saldo inicial ya fue registrado y no puede modificarse.');
+    err.status = 409;
+    throw err;
+  }
+  const [record] = await BankConfig.upsert(
+    { banco, saldoInicial: monto, saldoInicialFechaCorte: new Date() },
+    { returning: true },
+  );
+  return record;
+}
+
+module.exports = { findByBanco, upsert, findAllAsMap, setSaldoInicial };

@@ -226,16 +226,16 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
     // SAT devolvió estado inesperado y no hay copia local
     status = 'error';
   } else if (satResponse?.isCancelled) {
-    // Si ERP también lo tiene como Cancelado → conciliados (ambos coinciden)
-    status = erpCfdi.satStatus === 'Cancelado' ? 'match' : 'cancelled';
-  } else if (satResponse?.state === 'No Encontrado') {
-    // SAT confirmó que el UUID no existe
-    status = 'not_in_sat';
-  } else if (!satCfdi) {
-    // No hay copia local SAT: el CFDI solo existe en ERP.
-    // Aunque SAT live diga 'Vigente', sin copia local no se puede verificar
-    // campos (total, RFC, etc.) → se trata como not_in_sat.
-    status = 'not_in_sat';
+    // Si ERP también lo tiene como Cancelado → ambos concilian cancelación
+    status = erpCfdi.satStatus === 'Cancelado' ? 'match_cancelled' : 'cancelled';
+  } else if (satResponse?.state === 'No Encontrado' || !satCfdi) {
+    // SAT no tiene el XML (no encontrado o sin copia local).
+    // Si ambos lados confirman cancelación → match_cancelled (no es discrepancia).
+    if (erpCfdi.satStatus === 'Cancelado' && erpCfdi.erpStatus === 'Cancelado') {
+      status = 'match_cancelled';
+    } else {
+      status = 'not_in_sat';
+    }
   } else if (differences.length === 0) {
     // Existe en ambos lados y todos los campos coinciden
     status = 'match';

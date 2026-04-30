@@ -32,6 +32,16 @@ const BankConfig = sequelize.define('BankConfig', {
     type:      DataTypes.STRING(100),
     allowNull: true,
   },
+  saldoInicial: {
+    type:      DataTypes.DECIMAL(18, 2),
+    allowNull: true,
+    defaultValue: null,
+  },
+  saldoInicialFechaCorte: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    defaultValue: null,
+  },
 }, {
   tableName:   'bank_configs',
   underscored: true,

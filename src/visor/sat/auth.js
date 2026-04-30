@@ -76,6 +76,10 @@ const parseKey = (keyBuf, password) => {
   try {
     const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
     const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
+    logger.info(`[parseKey] ASN.1 top: type=${asn1.type} children=${asn1.value?.length} | hex[:8]=${bin.slice(0,8).toString('hex')}`);
+    logger.info(`[parseKey] [0]: type=${asn1.value?.[0]?.type} children=${asn1.value?.[0]?.value?.length}`);
+    logger.info(`[parseKey] [0][0]: type=${asn1.value?.[0]?.value?.[0]?.type}`);
+    logger.info(`[parseKey] [0][1]: type=${asn1.value?.[0]?.value?.[1]?.type} children=${asn1.value?.[0]?.value?.[1]?.value?.length}`);
     const oid      = forge.asn1.derToOid(asn1.value[0].value[0].value);
     const params   = asn1.value[0].value[1];
     const encData  = asn1.value[1].value;

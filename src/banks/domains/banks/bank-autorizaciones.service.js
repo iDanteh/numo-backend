@@ -122,7 +122,7 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
 
   // ── 1. Datos del ERP ───────────────────────────────────────────────────────
   const cxcs = await ErpCuentaPendiente.find({})
-    .select('erpId total folioFiscal movimientos')
+    .select('erpId total folioFiscal serie folioExterno movimientos')
     .lean();
 
   if (!cxcs.length) {
@@ -210,10 +210,12 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
     usedMovIds.add(mov._id.toString());
     matcheados++;
     const link = {
-      erpId:       cxc.erpId,
-      saldoActual: montoLink ?? cxc.total ?? null,
-      folioFiscal: cxc.folioFiscal ?? null,
-      total:       cxc.total ?? null,
+      erpId:        cxc.erpId,
+      saldoActual:  montoLink ?? cxc.total ?? null,
+      folioFiscal:  cxc.folioFiscal  ?? null,
+      total:        cxc.total        ?? null,
+      serie:        cxc.serie        ?? null,
+      folioExterno: cxc.folioExterno ?? null,
     };
     const newLinks = [...(mov.erpLinks || []), link];
     const newIds   = [...(mov.erpIds   || []), cxc.erpId];

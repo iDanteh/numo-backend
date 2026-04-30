@@ -247,6 +247,22 @@ router.patch('/config/:banco',
   }),
 );
 
+// POST /api/banks/config/:banco/saldo-inicial  — registro único, solo admin
+router.post('/config/:banco/saldo-inicial',
+  authenticate,
+  permit('admin'),
+  asyncHandler(async (req, res) => {
+    const monto = Number(req.body.monto);
+    if (isNaN(monto)) return res.status(400).json({ error: 'monto debe ser un número' });
+    const cfg = await service.setSaldoInicial(req.params.banco, monto);
+    res.json({
+      banco:                 req.params.banco,
+      saldoInicial:          Number(cfg.saldoInicial),
+      saldoInicialFechaCorte: cfg.saldoInicialFechaCorte,
+    });
+  }),
+);
+
 // POST /api/banks/autorizaciones/match  — match por número de autorización (vía Excel)
 router.post('/autorizaciones/match',
   authenticate,

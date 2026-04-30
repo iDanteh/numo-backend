@@ -12,10 +12,9 @@
  *  - El token no se persiste en base de datos.
  */
 
-const forge          = require('node-forge');
-const crypto         = require('crypto');
-const { execFileSync } = require('child_process');
-const axios          = require('axios');
+const forge  = require('node-forge');
+const crypto = require('crypto');
+const axios  = require('axios');
 const { logger } = require('../../shared/utils/logger');
 
 const AUTENTICACION_URL = (
@@ -62,8 +61,7 @@ const parseCer = (cerBuf) => {
 };
 
 /**
- * Parsea y descifra un buffer DER de llave privada .key.
- * Intenta dos estrategias: DER estándar y DER con strict: false.
+ * Parsea y descifra un buffer DER de llave privada .key del SAT.
  *
  * @param {Buffer} keyBuf
  * @param {string} password
@@ -72,54 +70,43 @@ const parseCer = (cerBuf) => {
 const parseKey = (keyBuf, password) => {
   const bin = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf, 'base64');
 
-  // Intento 1: node-forge (soporta 3DES-SHA1)
+  // Intento 1: PKCS#12 PBE manual — compatible con llaves .key reales del SAT
+  // (OID 1.2.840.113549.1.12.1.3 = pbeWithSHAAnd3-KeyTripleDES-CBC)
+  // Bypasa el validador estricto de forge.pki.decryptPrivateKeyInfo
   try {
     const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
     const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
-    const keyInfo  = forge.pki.decryptPrivateKeyInfo(asn1, password);
-    if (!keyInfo) throw new Error('Contraseña incorrecta');
-    return forge.pki.privateKeyFromAsn1(keyInfo);
+    logger.info(`[parseKey] ASN.1 top: type=${asn1.type} children=${asn1.value?.length} | hex[:8]=${bin.slice(0,8).toString('hex')}`);
+    logger.info(`[parseKey] [0]: type=${asn1.value?.[0]?.type} children=${asn1.value?.[0]?.value?.length}`);
+    logger.info(`[parseKey] [0][0]: type=${asn1.value?.[0]?.value?.[0]?.type}`);
+    logger.info(`[parseKey] [0][1]: type=${asn1.value?.[0]?.value?.[1]?.type} children=${asn1.value?.[0]?.value?.[1]?.value?.length}`);
+    const oid      = forge.asn1.derToOid(asn1.value[0].value[0].value);
+    const params   = asn1.value[0].value[1];
+    const encData  = asn1.value[1].value;
+    const cipher   = forge.pbe.getCipherForPKCS12PBE(oid, params, password);
+    cipher.update(forge.util.createBuffer(encData));
+    if (!cipher.finish()) throw new Error('Contraseña incorrecta');
+    const keyAsn1  = forge.asn1.fromDer(cipher.output);
+    return forge.pki.privateKeyFromAsn1(keyAsn1);
   } catch (e1) {
-    // Intento 2: crypto nativo vía OpenSSL (soporta RC2-40 y otros algoritmos del SAT)
+    // Intento 2: decryptPrivateKeyInfo (PKCS#8 estándar — fallback)
     try {
-      const nativeKey = crypto.createPrivateKey({
-        key:        bin,
-        format:     'der',
-        type:       'pkcs8',
-        passphrase: password,
-      });
-      const pem = nativeKey.export({ type: 'pkcs1', format: 'pem' });
-      return forge.pki.privateKeyFromPem(pem);
+      const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
+      const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
+      const keyInfo  = forge.pki.decryptPrivateKeyInfo(asn1, password);
+      if (!keyInfo) throw new Error('Contraseña incorrecta');
+      return forge.pki.privateKeyFromAsn1(keyInfo);
     } catch (e2) {
-      // Intento 3: openssl pkey CLI — cubre RC2-40 y formatos no-PKCS#8 de e.firma SAT.
-      // Se prueban dos variantes: con y sin -provider (OpenSSL 3 vs 1.1.x).
-      const hex4 = bin.slice(0, 4).toString('hex');
-      logger.info(`[parseKey] DER primeros 4 bytes: ${hex4} — intentando openssl pkey`);
-      const opensslVariants = [
-        // OpenSSL 3.x con legacy provider (habilita RC2-40)
-        ['pkey', '-inform', 'DER', '-passin', 'env:SAT_KEY_PASS', '-provider', 'legacy', '-provider', 'default'],
-        // OpenSSL 1.1.x — RC2-40 incluido de fábrica, sin flag -provider
-        ['pkey', '-inform', 'DER', '-passin', 'env:SAT_KEY_PASS'],
-      ];
-      let lastOpenSslErr = '';
-      for (const args of opensslVariants) {
-        try {
-          const pemOut = execFileSync('openssl', args, {
-            input: bin,
-            env: { ...process.env, SAT_KEY_PASS: password },
-            timeout: 10000,
-          });
-          return forge.pki.privateKeyFromPem(pemOut.toString('utf-8'));
-        } catch (e3) {
-          lastOpenSslErr = e3.stderr ? e3.stderr.toString().trim() : e3.message;
-        }
+      // Intento 3: crypto nativo vía OpenSSL
+      try {
+        const nativeKey = crypto.createPrivateKey({
+          key: bin, format: 'der', type: 'pkcs8', passphrase: password,
+        });
+        return forge.pki.privateKeyFromPem(nativeKey.export({ type: 'pkcs1', format: 'pem' }));
+      } catch (e3) {
+        logger.error(`[parseKey] PKCS#12 manual: ${e1.message} | PKCS#8 forge: ${e2.message} | native: ${e3.message}`);
+        throw new Error('No se pudo parsear la llave privada: ' + e1.message);
       }
-      logger.error(
-        `[parseKey] forge falló: ${e1.message} | ` +
-        `native crypto falló: ${e2.message} | ` +
-        `openssl falló: ${lastOpenSslErr}`,
-      );
-      throw new Error('No se pudo parsear la llave privada: ' + e1.message);
     }
   }
 };

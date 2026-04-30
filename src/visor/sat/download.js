@@ -227,6 +227,7 @@ const solicitar = async (params) => {
 
   // Construir firma del body — el SAT requiere Signature dentro de <des:solicitud>
   const buildEnvelope = async (rfcFirmaUsado) => {
+    const esRecibidosReq = rfcAttrKey === 'RfcReceptor';
     const solicitudAttrs = {
       FechaFinal:     fechaFin,
       FechaInicial:   fechaInicio,
@@ -235,6 +236,9 @@ const solicitar = async (params) => {
       TipoSolicitud:  tipoSolicitud,
     };
     if (tipoDeComprobante) solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
+    // El SAT no permite descargar XMLs cancelados en solicitudes de Recibidos (error 301).
+    // Se limita a vigentes para evitar el rechazo.
+    if (esRecibidosReq) solicitudAttrs.EstadoComprobante = '1';
 
     const canonical = canonizarSolicitud(solicitudAttrs, ns);
     logger.info(`[SatDownload] solicitar() — canonical solicitud: ${canonical}`);
@@ -244,14 +248,15 @@ const solicitar = async (params) => {
     const pwdCopy = Buffer.from(creds.passwordBuffer);
     const firma   = await crearFirmaSolicitud(cerCopy, keyCopy, pwdCopy, canonical);
 
-    const tipoAttr = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
+    const tipoAttr   = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
+    const estadoAttr = esRecibidosReq ? ' EstadoComprobante="1"' : '';
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${ns}">
   <s:Header/>
   <s:Body>
     <des:${operacion}>
-      <des:solicitud RfcSolicitante="${rfcFirmaUsado}" ${rfcAttrKey}="${rfcSolicitante}" FechaInicial="${fechaInicio}" FechaFinal="${fechaFin}" TipoSolicitud="${tipoSolicitud}"${tipoAttr}>
+      <des:solicitud RfcSolicitante="${rfcFirmaUsado}" ${rfcAttrKey}="${rfcSolicitante}" FechaInicial="${fechaInicio}" FechaFinal="${fechaFin}" TipoSolicitud="${tipoSolicitud}"${tipoAttr}${estadoAttr}>
         ${firma}
       </des:solicitud>
     </des:${operacion}>

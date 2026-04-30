@@ -236,11 +236,13 @@ const upload = asyncHandler(async (req, res) => {
         if (['SAT', 'MANUAL'].includes(source) && !cfdiData.satStatus) {
           cfdiData.satStatus = 'Vigente';
         }
-        if (ejercicio) cfdiData.ejercicio = ejercicio;
-        if (periodo)   cfdiData.periodo   = periodo;
         const prev = await CFDI.findOneAndUpdate(
           { uuid: cfdiData.uuid, source },
-          { ...cfdiData, source, uploadedBy: req.user._id },
+          {
+            // ejercicio/periodo en $setOnInsert para preservar reclasificaciones previas
+            $set:         { ...cfdiData, source, uploadedBy: req.user._id },
+            $setOnInsert: { ejercicio: ejercicio ?? null, periodo: periodo ?? null },
+          },
           { upsert: true, new: false, setDefaultsOnInsert: true },
         );
         prev === null ? nuevos++ : actualizados++;
@@ -578,9 +580,14 @@ const importExcel = asyncHandler(async (req, res) => {
         }),
       };
 
+      // ejercicio/periodo solo en $setOnInsert para preservar reclasificaciones previas
+      const { ejercicio: _ej, periodo: _pe, ...cfdiSetData } = cfdiData;
       const prev = await CFDI.findOneAndUpdate(
         { uuid: cfdiData.uuid, source },
-        { ...cfdiData, uploadedBy: req.user._id },
+        {
+          $set:         { ...cfdiSetData, uploadedBy: req.user._id },
+          $setOnInsert: { ejercicio: _ej, periodo: _pe },
+        },
         { upsert: true, new: false, setDefaultsOnInsert: true },
       );
 
@@ -627,7 +634,7 @@ const create = asyncHandler(async (req, res) => {
 
   const cfdi = await CFDI.findOneAndUpdate(
     { uuid: req.body.uuid.toUpperCase(), source: 'ERP' },
-    { ...req.body, source: 'ERP', uploadedBy: req.user._id },
+    { $set: { ...req.body, source: 'ERP', uploadedBy: req.user._id } },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 

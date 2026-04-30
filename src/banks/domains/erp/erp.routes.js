@@ -84,10 +84,12 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
 
   const allCuentas = raw.map(c => ({
     id:               c.id,
-    serie:            c.serie,
-    folio:            c.folio,
-    folioFiscal:      c.folioFiscal ?? null,
-    tipoPago:         c.tipoPago   ?? null,
+    serie:            c.serie            ?? null,
+    folio:            c.folio            ?? null,
+    serieExterna:     c.serieExterna     ?? null,
+    folioExterno:     c.folioExterno     ?? null,
+    folioFiscal:      c.folioFiscal      ?? null,
+    tipoPago:         c.tipoPago         ?? null,
     subtotal:         c.subtotal,
     impuesto:         c.impuesto,
     total:            c.total,

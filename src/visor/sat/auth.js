@@ -70,23 +70,39 @@ const parseCer = (cerBuf) => {
 const parseKey = (keyBuf, password) => {
   const bin = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf, 'base64');
 
-  // Intento 1: node-forge (soporta 3DES-SHA1)
+  // Intento 1: PKCS#12 PBE manual — compatible con llaves .key reales del SAT
+  // (OID 1.2.840.113549.1.12.1.3 = pbeWithSHAAnd3-KeyTripleDES-CBC)
+  // Bypasa el validador estricto de forge.pki.decryptPrivateKeyInfo
   try {
     const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
     const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
-    const keyInfo  = forge.pki.decryptPrivateKeyInfo(asn1, password);
-    if (!keyInfo) throw new Error('Contraseña incorrecta');
-    return forge.pki.privateKeyFromAsn1(keyInfo);
+    const oid      = forge.asn1.derToOid(asn1.value[0].value[0].value);
+    const params   = asn1.value[0].value[1];
+    const encData  = asn1.value[1].value;
+    const cipher   = forge.pbe.getCipherForPKCS12PBE(oid, params, password);
+    cipher.update(forge.util.createBuffer(encData));
+    if (!cipher.finish()) throw new Error('Contraseña incorrecta');
+    const keyAsn1  = forge.asn1.fromDer(cipher.output);
+    return forge.pki.privateKeyFromAsn1(keyAsn1);
   } catch (e1) {
-    // Intento 2: crypto nativo vía OpenSSL
+    // Intento 2: decryptPrivateKeyInfo (PKCS#8 estándar — fallback)
     try {
-      const nativeKey = crypto.createPrivateKey({
-        key: bin, format: 'der', type: 'pkcs8', passphrase: password,
-      });
-      return forge.pki.privateKeyFromPem(nativeKey.export({ type: 'pkcs1', format: 'pem' }));
+      const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
+      const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
+      const keyInfo  = forge.pki.decryptPrivateKeyInfo(asn1, password);
+      if (!keyInfo) throw new Error('Contraseña incorrecta');
+      return forge.pki.privateKeyFromAsn1(keyInfo);
     } catch (e2) {
-      logger.error(`[parseKey] forge falló: ${e1.message} | native crypto falló: ${e2.message}`);
-      throw new Error('No se pudo parsear la llave privada: ' + e1.message);
+      // Intento 3: crypto nativo vía OpenSSL
+      try {
+        const nativeKey = crypto.createPrivateKey({
+          key: bin, format: 'der', type: 'pkcs8', passphrase: password,
+        });
+        return forge.pki.privateKeyFromPem(nativeKey.export({ type: 'pkcs1', format: 'pem' }));
+      } catch (e3) {
+        logger.error(`[parseKey] PKCS#12 manual: ${e1.message} | PKCS#8 forge: ${e2.message} | native: ${e3.message}`);
+        throw new Error('No se pudo parsear la llave privada: ' + e1.message);
+      }
     }
   }
 };

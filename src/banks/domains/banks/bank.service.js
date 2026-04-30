@@ -60,6 +60,7 @@ async function getCards() {
         $group: {
           _id:            '$banco',
           movimientos:    { $sum: 1 },
+          movimientoNoIdentificado: { $sum: 1 && { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
           totalDepositos: { $sum: { $ifNull: ['$deposito', 0] } },
           totalRetiros:   { $sum: { $ifNull: ['$retiro',   0] } },
           ultimaFecha:    { $max: '$fecha' },
@@ -108,6 +109,7 @@ async function getCards() {
     return {
       banco:          b._id,
       movimientos:    b.movimientos,
+      movimientoNoIdentificado: b.movimientoNoIdentificado,
       totalDepositos: b.totalDepositos,
       totalRetiros:   b.totalRetiros,
       saldoFinal:     b.saldoFinal ?? null,
@@ -557,6 +559,11 @@ const ERP_TOLERANCE = 1.00; // $1 MXN de tolerancia para cuadre
 //   - Si saldoActual es null o 0 → usar total del comprobante
 //     (ERP marcó la CxC como cobrada o no devolvió saldo; se compara contra
 //      el importe original para permitir la identificación manual o automática)
+//
+// Regla de identificación automática:
+//   saldoErp >= bankAmount - ERP_TOLERANCE
+//   Es decir: la CxC cubre o excede el depósito → identificado.
+//   Si la CxC es MENOR que el depósito → no_identificado (pago insuficiente).
 function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
@@ -569,7 +576,7 @@ function aplicarLogicaErp(mov) {
     : null;
   const uuidXML    = links.find(l => l.folioFiscal)?.folioFiscal?.toUpperCase() ?? null;
   const bankAmount = Math.abs(mov.deposito ?? mov.retiro ?? 0);
-  const status     = (saldoErp !== null && Math.abs(bankAmount - saldoErp) <= ERP_TOLERANCE)
+  const status     = (saldoErp !== null && saldoErp >= bankAmount - ERP_TOLERANCE)
     ? 'identificado'
     : 'no_identificado';
   return { saldoErp, uuidXML, status };
@@ -582,9 +589,10 @@ async function updateStatus(id, status, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
   const isAdmin = user?.role === 'admin';
-  // Bloquear si el cuadre ERP determinó automáticamente el status (admin puede forzar)
-  const bankAmount = (mov.deposito ?? mov.retiro ?? 0);
-  if (!isAdmin && mov.saldoErp !== null && Math.abs(bankAmount - mov.saldoErp) <= ERP_TOLERANCE) {
+  // Bloquear si el cuadre ERP determinó automáticamente el status (admin puede forzar).
+  // La CxC cubre el depósito (saldoErp >= bankAmount - tolerancia) → bloqueado para no-admin.
+  const bankAmount = Math.abs(mov.deposito ?? mov.retiro ?? 0);
+  if (!isAdmin && mov.saldoErp !== null && mov.saldoErp >= bankAmount - ERP_TOLERANCE) {
     throw new ConflictError('Movimiento bloqueado: el saldo ERP cuadra con el monto bancario');
   }
   // Bloquear si el movimiento fue identificado por otro usuario (admin puede forzar)
@@ -596,6 +604,10 @@ async function updateStatus(id, status, user) {
     !idPorEntries.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
+  }
+  // Solo admin puede transicionar de 'no_identificado' a 'otros'
+  if (status === 'otros' && mov.status === 'no_identificado' && !isAdmin) {
+    throw new ForbiddenError('Solo un administrador puede marcar este movimiento como "otros"');
   }
   // Para marcar como identificado siempre se requiere al menos un ID ERP asociado
   if (status === 'identificado' && (!mov.erpIds || mov.erpIds.length === 0)) {
@@ -671,10 +683,12 @@ async function setErpIds(id, erpLinks, user) {
 
   const cleanLinks = erpLinks
     .map(l => ({
-      erpId:       String(l.erpId || '').trim(),
-      saldoActual: l.saldoActual != null ? Number(l.saldoActual) : null,
-      folioFiscal: l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
-      total:       l.total != null ? Number(l.total) : null,
+      erpId:        String(l.erpId || '').trim(),
+      saldoActual:  l.saldoActual != null ? Number(l.saldoActual) : null,
+      folioFiscal:  l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
+      total:        l.total != null ? Number(l.total) : null,
+      serie:        l.serie ? String(l.serie).trim() : null,
+      folioExterno: l.folioExterno ? String(l.folioExterno).trim() : null,
     }))
     .filter(l => l.erpId);
 
@@ -736,8 +750,14 @@ async function saveConfig(banco, data) {
 }
 
 async function listIdentificadores(banco) {
+  // $unwind primero para descomponer el array identificadoPor por elemento,
+  // luego $group por userId individual. Sin $unwind, MongoDB agrupa por el
+  // array completo y genera una entrada por combinación distinta de usuarios,
+  // causando duplicados del mismo nombre.
   const docs = await BankMovement.aggregate([
-    { $match: { banco, isActive: true, 'identificadoPor.userId': { $ne: null } } },
+    { $match: { banco, isActive: true, 'identificadoPor.0': { $exists: true } } },
+    { $unwind: '$identificadoPor' },
+    { $match: { 'identificadoPor.userId': { $ne: null } } },
     { $group: { _id: '$identificadoPor.userId', nombre: { $first: '$identificadoPor.nombre' } } },
     { $sort: { nombre: 1 } },
   ]);

@@ -387,11 +387,11 @@ const cargar = asyncHandler(async (req, res) => {
 
   // ── 8. Respuesta ───────────────────────────────────────────────────────────
   return res.json({
-    procesadas:   facturas.length,
-    guardadas,
-    duplicadas,
+    totalRecibidos:   facturas.length,
+    nuevosInsertados: guardadas,
+    duplicados:       duplicadas,
     omitidas,
-    conErrores,
+    errores:          conErrores,
     detalleErrores,
     reclasificacion,
     message:

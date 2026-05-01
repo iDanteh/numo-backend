@@ -137,8 +137,26 @@ const create = asyncHandler(async (req, res) => {
  * DELETE /api/periodos-fiscales/:id
  */
 const remove = asyncHandler(async (req, res) => {
-  const doc = await periodoRepo.remove(req.params.id);
+  const doc = await periodoRepo.findById(req.params.id);
   if (!doc) return res.status(404).json({ error: 'Periodo no encontrado' });
+
+  // Verificar que no haya CFDIs activos asociados antes de eliminar
+  if (doc.periodo != null) {
+    const cfdiCount = await CFDI.countDocuments({
+      ejercicio: doc.ejercicio,
+      periodo:   doc.periodo,
+      isActive:  true,
+    });
+    if (cfdiCount > 0) {
+      return res.status(409).json({
+        error: `No se puede eliminar: este periodo tiene ${cfdiCount} CFDIs asociados. Elimínalos primero.`,
+        code:  'PERIODO_CON_CFDIS',
+        cfdiCount,
+      });
+    }
+  }
+
+  await periodoRepo.remove(req.params.id);
   res.json({ message: 'Eliminado' });
 });
 

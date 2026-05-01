@@ -14,6 +14,22 @@ const SatDescargaLog = require('../models/SatDescargaLog');
 /** Estado en memoria de jobs de descarga manual (jobId → estado). */
 const jobsManales = new Map();
 
+/**
+ * Elimina credenciales de todos los jobs activos en memoria.
+ * Se llama desde el graceful shutdown (SIGTERM) para garantizar que las
+ * credenciales e.firma no queden en MongoDB si el proceso termina abruptamente.
+ */
+const cleanupActiveJobs = async () => {
+  const rfcsActivos = new Set(
+    [...jobsManales.values()]
+      .filter(j => j.estado === 'en_proceso')
+      .map(j => j.rfc),
+  );
+  if (rfcsActivos.size === 0) return;
+  logger.warn(`[Shutdown] Limpiando credenciales de ${rfcsActivos.size} job(s) activo(s)...`);
+  await Promise.allSettled([...rfcsActivos].map(rfc => eliminar(rfc)));
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers de fechas
 // ─────────────────────────────────────────────────────────────────────────────
@@ -80,15 +96,20 @@ const normalizarFecha = (valor, nombre) => {
 const validarRango = (fi, ff) => {
   const inicio     = new Date(fi);
   const fin        = new Date(ff);
-  const hoy        = new Date();
   const UN_ANIO_MS = 365 * 24 * 60 * 60 * 1000;
 
   if (fin < inicio) {
     throw new Error('fechaFin debe ser mayor o igual a fechaInicio.');
   }
-  if (fin > hoy) {
+
+  // Comparar solo la parte de fecha (YYYY-MM-DD) para evitar falsos positivos
+  // cuando fechaFin es el día de hoy pero la hora del request es antes de 23:59:59.
+  const hoyStr = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+  const finStr  = ff.slice(0, 10); // YYYY-MM-DD
+  if (finStr > hoyStr) {
     throw new Error('fechaFin no puede ser una fecha futura.');
   }
+
   if (fin - inicio > UN_ANIO_MS) {
     throw new Error('El rango máximo permitido por el SAT es de 1 año por solicitud.');
   }
@@ -407,9 +428,21 @@ const getLimitesEstado = asyncHandler(async (req, res) => {
 /**
  * GET /api/sat/historial/:rfc
  * GET /api/sat/historial
+ *
+ * - Admin: puede ver historial de cualquier RFC o de todos.
+ * - Otros roles: solo pueden ver el historial si especifican un RFC concreto.
  */
 const getHistory = asyncHandler(async (req, res) => {
-  const rfc = req.params.rfc?.toUpperCase().trim();
+  const rfc    = req.params.rfc?.toUpperCase().trim();
+  const isAdmin = req.user?.role === 'admin' || req.user?.roles?.includes('admin');
+
+  // Sin RFC y sin permisos de admin → denegar para evitar fuga de información
+  if (!rfc && !isAdmin) {
+    return res.status(403).json({
+      error: 'Se requiere un RFC para consultar el historial.',
+      code:  'RFC_REQUERIDO',
+    });
+  }
 
   const filter = {};
   if (rfc) filter.rfc = rfc;
@@ -438,4 +471,5 @@ module.exports = {
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp,
+  cleanupActiveJobs,
 };

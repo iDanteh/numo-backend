@@ -15,11 +15,48 @@
 const forge  = require('node-forge');
 const crypto = require('crypto');
 const axios  = require('axios');
-const { spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
 const { logger } = require('../../shared/utils/logger');
+
+/**
+ * Ejecuta openssl de forma asíncrona sin bloquear el event loop.
+ * spawnSync bloquea hasta 10 s — inaceptable en un servidor HTTP concurrente.
+ */
+const opensslAsync = (args, timeout = 10_000) =>
+  new Promise((resolve) => {
+    const chunks = { stdout: [], stderr: [] };
+    let proc;
+    try {
+      proc = spawn('openssl', args);
+    } catch (spawnErr) {
+      // openssl no disponible en PATH
+      resolve({ status: -1, stdout: Buffer.alloc(0), stderr: Buffer.from(spawnErr.message) });
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      proc.kill();
+      resolve({ status: -1, stdout: Buffer.alloc(0), stderr: Buffer.from('timeout') });
+    }, timeout);
+
+    proc.stdout.on('data', (d) => chunks.stdout.push(d));
+    proc.stderr.on('data', (d) => chunks.stderr.push(d));
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        status:  code ?? -1,
+        stdout:  Buffer.concat(chunks.stdout),
+        stderr:  Buffer.concat(chunks.stderr),
+      });
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ status: -1, stdout: Buffer.alloc(0), stderr: Buffer.from(err.message) });
+    });
+  });
 
 const AUTENTICACION_URL = (
   process.env.SAT_DESCARGA_MASIVA_AUTENTICACION ||
@@ -71,23 +108,47 @@ const parseCer = (cerBuf) => {
  * @param {string} password
  * @returns {object} privateKey de node-forge
  */
-const parseKey = (keyBuf, password) => {
+const parseKey = async (keyBuf, password) => {
   const bin = Buffer.isBuffer(keyBuf) ? keyBuf : Buffer.from(keyBuf, 'base64');
+
+  // ── Diagnóstico de formato ──────────────────────────────────────────────────
+  const firstBytes = bin.slice(0, 4).toString('hex');
+  logger.info(`[parseKey] Primeros 4 bytes: ${firstBytes} | tamaño: ${bin.length} bytes`);
+
+  // ── Detección PEM ──────────────────────────────────────────────────────────
+  // Si el archivo fue subido como PEM (comienza con -----BEGIN) en lugar de DER
+  const preview = bin.toString('ascii', 0, 27).trim();
+  if (preview.startsWith('-----BEGIN')) {
+    logger.info('[parseKey] Detectado formato PEM — intentando parseo directo');
+    try {
+      // PEM no cifrado
+      return forge.pki.privateKeyFromPem(bin.toString('ascii'));
+    } catch (_) { /* puede ser PEM cifrado, continúa con openssl */ }
+  }
 
   // Intento 1: openssl pkcs8 vía temp file — soporta BER (longitud indefinida)
   // que usan las llaves .key reales del SAT (hex inicia con 30 80).
   // openssl es más tolerante que forge/node-crypto con encodings no-estándar.
+  // Se intenta primero sin -legacy y luego con -legacy (necesario en OpenSSL 3.x
+  // para esquemas PBES1 como pbeWithMD5AndDES-CBC o pbeWithSHAAndRC2-CBC).
+  // opensslAsync() es NO bloqueante — no congela el event loop de Node.js.
   const tmpFile = path.join(os.tmpdir(), `sat_key_${Date.now()}_${Math.random().toString(36).slice(2)}.der`);
   try {
     fs.writeFileSync(tmpFile, bin, { mode: 0o600 });
-    const result = spawnSync('openssl', [
-      'pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt',
-    ], { timeout: 10000, encoding: 'buffer' });
-    if (result.status === 0 && result.stdout?.length > 0) {
-      logger.info('[parseKey] openssl pkcs8: OK');
-      return forge.pki.privateKeyFromPem(result.stdout.toString());
+
+    const opensslVariants = [
+      ['pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt'],
+      ['pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt', '-legacy'],
+    ];
+    for (const args of opensslVariants) {
+      const isLegacy = args.includes('-legacy');
+      const result = await opensslAsync(args);
+      if (result.status === 0 && result.stdout?.length > 0) {
+        logger.info(`[parseKey] openssl ${isLegacy ? 'pkcs8 -legacy' : 'pkcs8'}: OK`);
+        return forge.pki.privateKeyFromPem(result.stdout.toString());
+      }
+      logger.warn(`[parseKey] openssl ${isLegacy ? 'pkcs8 -legacy' : 'pkcs8'} falló: ${result.stderr?.toString()?.trim()?.slice(0, 120)}`);
     }
-    logger.warn(`[parseKey] openssl pkcs8 falló: ${result.stderr?.toString()?.trim()?.slice(0, 120)}`);
   } catch (e1) {
     logger.warn(`[parseKey] openssl pkcs8: ${e1.message?.slice(0, 120)}`);
   } finally {
@@ -114,8 +175,53 @@ const parseKey = (keyBuf, password) => {
     logger.info('[parseKey] native crypto: OK');
     return forge.pki.privateKeyFromPem(nativeKey.export({ type: 'pkcs1', format: 'pem' }));
   } catch (e3) {
-    logger.error(`[parseKey] todos los intentos fallaron: ${e3.message}`);
-    throw new Error('No se pudo parsear la llave privada: ' + e3.message);
+    logger.warn(`[parseKey] native crypto: ${e3.message?.slice(0, 120)}`);
+  }
+
+  // Intento 4: descifrado manual PBES2/PBKDF2/3DES-CBC
+  // El SAT cifra RSAPrivateKey (PKCS#1) dentro del wrapper EncryptedPrivateKeyInfo
+  // en lugar del PrivateKeyInfo (PKCS#8) estándar. Esto hace que openssl y native
+  // crypto fallen con "wrong tag" aunque la contraseña sea correcta.
+  try {
+    const outer     = forge.asn1.fromDer(forge.util.createBuffer(bin.toString('binary')), { strict: false });
+    const pbes2     = outer.value[0].value[1];
+    const pbkdf2Par = pbes2.value[0].value[1];
+    const encScheme = pbes2.value[1];
+
+    const salt    = Buffer.from(pbkdf2Par.value[0].value, 'binary');
+    const iterStr = pbkdf2Par.value[1].value;
+    let iters = 0;
+    for (let i = 0; i < iterStr.length; i++) iters = (iters << 8) | (iterStr.charCodeAt(i) & 0xff);
+
+    const iv      = Buffer.from(encScheme.value[1].value, 'binary');
+    const encData = Buffer.from(outer.value[1].value, 'binary');
+
+    // Derivar llave 3DES (24 bytes) con PBKDF2-HMAC-SHA1
+    const dk = crypto.pbkdf2Sync(password, salt, iters, 24, 'sha1');
+
+    // Descifrar 3DES-CBC (lanza si contraseña incorrecta — padding inválido)
+    const decipher  = crypto.createDecipheriv('des-ede3-cbc', dk, iv);
+    const decrypted = Buffer.concat([decipher.update(encData), decipher.final()]);
+
+    const innerAsn1 = forge.asn1.fromDer(forge.util.createBuffer(decrypted.toString('binary')), { strict: false });
+
+    // Intentar PKCS#1 RSAPrivateKey — formato no-estándar que usa el SAT
+    try {
+      const key = forge.pki.privateKeyFromAsn1(innerAsn1);
+      logger.info('[parseKey] Manual PBES2/PBKDF2/3DES → PKCS#1: OK');
+      return key;
+    } catch (_) { /* no es PKCS#1, intentar PKCS#8 */ }
+
+    // Intentar PKCS#8 PrivateKeyInfo — extraer la llave interna
+    const pkcs8Inner = forge.asn1.fromDer(
+      forge.util.createBuffer(innerAsn1.value[2].value), { strict: false },
+    );
+    const key = forge.pki.privateKeyFromAsn1(pkcs8Inner);
+    logger.info('[parseKey] Manual PBES2/PBKDF2/3DES → PKCS#8 inner: OK');
+    return key;
+  } catch (e4) {
+    logger.error(`[parseKey] todos los intentos fallaron: ${e4.message?.slice(0, 200)}`);
+    throw new Error('No se pudo parsear la llave privada: ' + e4.message);
   }
 };
 
@@ -137,7 +243,7 @@ const autenticar = async (cerBuffer, keyBuffer, passwordBuffer) => {
 
     // ── 1. Parsear .cer y .key ────────────────────────────────────────────
     const { cert, b64: certB64 } = parseCer(cerBuffer);
-    privateKey = parseKey(keyBuffer, password);
+    privateKey = await parseKey(keyBuffer, password);
 
     // Número de certificado (serie en decimal, 20 dígitos)
     // Si no se pudo parsear el cert, usamos un serial genérico
@@ -393,7 +499,7 @@ const crearFirmaSolicitud = async (cerBuffer, keyBuffer, passwordBuffer, canonic
   try {
     const password = passwordBuffer.toString('utf-8');
     const { cert, b64: certB64 } = parseCer(cerBuffer);
-    privateKey = parseKey(keyBuffer, password);
+    privateKey = await parseKey(keyBuffer, password);
 
     // Digest SHA1 del elemento solicitud en forma canónica (sin firma)
     const md = forge.md.sha1.create();

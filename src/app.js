@@ -9,7 +9,9 @@ const compression = require('compression');
 const rateLimit   = require('express-rate-limit');
 const socketMgr   = require('./banks/shared/socket');
 
-const { connectDB }    = require('./config/database');
+const mongoose         = require('mongoose');
+const { sequelize }    = require('./config/database.postgres');
+const { connectDB, disconnectDB } = require('./config/database');
 const seed             = require('./banks/scripts/seed');
 const { logger }   = require('./shared/utils/logger');
 const errorHandler = require('./shared/middleware/error-handler');
@@ -75,12 +77,30 @@ app.use(morgan('combined', {
 }));
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => {
-  res.json({
-    status:    'ok',
+// Verifica el estado real de las conexiones a MongoDB y PostgreSQL.
+// Docker usa este endpoint para marcar el contenedor como healthy/unhealthy.
+app.get('/health', async (_req, res) => {
+  const mongoOk = mongoose.connection.readyState === 1; // 1 = connected
+
+  let pgOk = false;
+  try {
+    await sequelize.authenticate();
+    pgOk = true;
+  } catch {
+    pgOk = false;
+  }
+
+  const allOk  = mongoOk && pgOk;
+  const status = allOk ? 'ok' : 'degraded';
+
+  res.status(allOk ? 200 : 503).json({
+    status,
     timestamp: new Date().toISOString(),
     version:   '3.0.0',
-    databases: { mongo: 'connected', postgres: 'connected' },
+    databases: {
+      mongo:    mongoOk ? 'connected' : 'disconnected',
+      postgres: pgOk    ? 'connected' : 'disconnected',
+    },
   });
 });
 
@@ -128,6 +148,61 @@ const startServer = async () => {
   socketMgr.init(server);
   server.listen(PORT, () => {
     logger.info(`Servidor corriendo en puerto ${PORT} [${process.env.NODE_ENV || 'development'}]`);
+  });
+
+  // ── Graceful shutdown ────────────────────────────────────────────────────────
+  // Docker envía SIGTERM antes de matar el contenedor. Tenemos ~10 s para:
+  //  1. Dejar de aceptar conexiones nuevas.
+  //  2. Eliminar credenciales e.firma de jobs SAT activos (seguridad).
+  //  3. Cerrar conexiones a BD para evitar conexiones huérfanas.
+  // Si no terminamos en SHUTDOWN_TIMEOUT_MS, process.exit(1) fuerza el cierre.
+  const SHUTDOWN_TIMEOUT_MS = 9_000;
+
+  const shutdown = async (signal) => {
+    logger.warn(`[Shutdown] ${signal} recibido — iniciando graceful shutdown...`);
+
+    // Timeout de seguridad: si algo se cuelga, matar igual
+    const forceExit = setTimeout(() => {
+      logger.error('[Shutdown] Timeout — forzando process.exit(1)');
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref(); // no impedir que el event loop cierre si termina antes
+
+    // 1. Dejar de aceptar nuevas conexiones HTTP
+    server.close();
+
+    // 2. Limpiar credenciales SAT de jobs activos en memoria
+    try {
+      const { cleanupActiveJobs } = require('./visor/controllers/sat.controller');
+      await cleanupActiveJobs();
+      logger.info('[Shutdown] Credenciales SAT activas eliminadas');
+    } catch (cleanErr) {
+      logger.error(`[Shutdown] Error limpiando credenciales SAT: ${cleanErr.message}`);
+    }
+
+    // 3. Cerrar conexiones a bases de datos
+    try {
+      await disconnectDB();
+      logger.info('[Shutdown] Bases de datos desconectadas');
+    } catch (dbErr) {
+      logger.error(`[Shutdown] Error cerrando DBs: ${dbErr.message}`);
+    }
+
+    clearTimeout(forceExit);
+    logger.info('[Shutdown] Completado — saliendo con código 0');
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+
+  // Capturar excepciones no manejadas para logearlas antes de morir
+  process.on('uncaughtException', (err) => {
+    logger.error(`[uncaughtException] ${err.message}`, err);
+    shutdown('uncaughtException');
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error(`[unhandledRejection] ${reason}`);
   });
 };
 

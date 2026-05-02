@@ -609,20 +609,25 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
   const ejercicio = satCfdi.ejercicio ?? cfdiDate.getFullYear();
   const periodo   = satCfdi.periodo   ?? (cfdiDate.getMonth() + 1);
 
-  const diff = {
+  // Si el CFDI SAT está cancelado y no existe en ERP → no es discrepancia fiscal,
+  // se registra como "coincide cancelado" (morado) sin generar discrepancia.
+  const esCanceladoSinERP = satCfdi.satStatus === 'Cancelado';
+  const statusSATOnly = esCanceladoSinERP ? 'cancelled_not_in_erp' : 'not_in_erp';
+
+  const differences = esCanceladoSinERP ? [] : [{
     field: 'erp.uuid',
     erpValue: 'No registrado en ERP',
     satValue: satCfdi.uuid,
     severity: 'critical',
     type: 'MISSING_IN_ERP',
-  };
+  }];
 
   const comp = await saveComparison({
     uuid:           satCfdi.uuid,
     satCfdiId:      satCfdi._id,
-    status:         'not_in_erp',
-    differences:    [diff],
-    criticalCount:  1,
+    status:         statusSATOnly,
+    differences,
+    criticalCount:  esCanceladoSinERP ? 0 : 1,
     warningCount:   0,
     triggeredBy:    options.triggeredBy,
     sessionId:      options.sessionId ?? null,
@@ -633,7 +638,7 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
 
   // Actualizar el documento CFDI SAT para que los filtros por lastComparisonStatus funcionen
   await CFDI.findByIdAndUpdate(satCfdiId, {
-    lastComparisonStatus: 'not_in_erp',
+    lastComparisonStatus: statusSATOnly,
     lastComparisonAt: new Date(),
   });
 
@@ -665,19 +670,22 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
     status: { $nin: ['resolved', 'ignored', 'accepted'] },
   });
 
-  await saveDiscrepancy({
-    comparisonId: comp._id,
-    uuid:         satCfdi.uuid,
-    type:         'MISSING_IN_ERP',
-    severity:     'critical',
-    description:  'CFDI existe en SAT/MANUAL pero no fue encontrado en ERP',
-    erpValue:     'No registrado',
-    satValue:     satCfdi.uuid,
-    rfcEmisor:    satCfdi.emisor?.rfc ?? '',
-    rfcReceptor:  satCfdi.receptor?.rfc ?? '',
-    ejercicio,
-    periodo,
-  });
+  // Solo guardar discrepancia si no está cancelado (cancelado sin ERP no es problema fiscal)
+  if (!esCanceladoSinERP) {
+    await saveDiscrepancy({
+      comparisonId: comp._id,
+      uuid:         satCfdi.uuid,
+      type:         'MISSING_IN_ERP',
+      severity:     'critical',
+      description:  'CFDI existe en SAT/MANUAL pero no fue encontrado en ERP',
+      erpValue:     'No registrado',
+      satValue:     satCfdi.uuid,
+      rfcEmisor:    satCfdi.emisor?.rfc ?? '',
+      rfcReceptor:  satCfdi.receptor?.rfc ?? '',
+      ejercicio,
+      periodo,
+    });
+  }
 
   return comp;
 };
@@ -698,7 +706,7 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
   logger.info(`[Batch] Iniciando sesión ${sessionId} con ${erpCfdiIds.length} ERP + ${satOnlyIds.length} solo-SAT`);
 
   const results = { success: 0, failed: 0, discrepancies: 0, errors: [], sessionId };
-  const statusCounts = { match: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled: 0, error: 0 };
+  const statusCounts = { match: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, error: 0 };
   const concurrency = options.concurrency || 5;
 
   // ── 1. Comparar CFDIs ERP ──────────────────────────────────────────────────
@@ -726,10 +734,14 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
     const chunk = satOnlyIds.slice(i, i + concurrency);
     await Promise.all(chunk.map(id =>
       compareSATOnlyCFDI(id, { ...options, sessionId })
-        .then(() => {
+        .then((comp) => {
           results.success++;
-          statusCounts.not_in_erp++;
-          results.discrepancies++;
+          if (comp.status === 'cancelled_not_in_erp') {
+            statusCounts.cancelled_not_in_erp++;
+          } else {
+            statusCounts.not_in_erp++;
+            results.discrepancies++;
+          }
         })
         .catch(err => {
           results.failed++;

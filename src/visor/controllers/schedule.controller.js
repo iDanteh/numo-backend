@@ -1,6 +1,7 @@
 'use strict';
 
 const AppConfig           = require('../models/AppConfig');
+const ScheduledJob        = require('../models/ScheduledJob');
 const { asyncHandler }    = require('../../shared/middleware/error-handler');
 const { logger }          = require('../../shared/utils/logger');
 const {
@@ -13,8 +14,8 @@ const {
 // Locks simples para evitar ejecuciones concurrentes del mismo job/periodo
 const _locks = new Set();
 
-// Programaciones pendientes: Map<id, { id, ejercicio, periodo, hora, ejecutaEn, estado, timeoutId }>
-const _programados = new Map();
+// Map en memoria solo para guardar el timeoutId (no persiste, se recrea al arrancar)
+const _timeouts = new Map();
 
 const KEYS     = ['satDescarga', 'erpDescarga', 'erpVerificacion', 'comparacion'];
 const DEFAULTS = {
@@ -25,9 +26,51 @@ const DEFAULTS = {
 };
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
-/**
- * GET /api/schedule
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: ejecutar secuencia y actualizar DB
+// ─────────────────────────────────────────────────────────────────────────────
+const _ejecutarSecuencia = async (docId, ejercicio, periodo) => {
+  await ScheduledJob.findByIdAndUpdate(docId, { estado: 'en_proceso' });
+  logger.info(`[ProgramarMes] Iniciando secuencia ${ejercicio}/${periodo}...`);
+  try {
+    await ejecutarDescargaERP({ ejercicioParam: ejercicio, periodoParam: periodo });
+    await ejecutarVerificacionPeriodo(ejercicio, periodo);
+    await ejecutarComparacionAuto({ ejercicioParam: ejercicio, periodoParam: periodo });
+    logger.info(`[ProgramarMes] Secuencia ${ejercicio}/${periodo} completada.`);
+    await ScheduledJob.findByIdAndUpdate(docId, { estado: 'completado', fin: new Date() });
+  } catch (err) {
+    logger.error(`[ProgramarMes] ${ejercicio}/${periodo}: ${err.message}`);
+    await ScheduledJob.findByIdAndUpdate(docId, { estado: 'error', error: err.message, fin: new Date() });
+  } finally {
+    _timeouts.delete(String(docId));
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Restaurar programaciones pendientes al arrancar el servidor
+// ─────────────────────────────────────────────────────────────────────────────
+const restaurarProgramados = async () => {
+  const pendientes = await ScheduledJob.find({ estado: 'pendiente' }).lean();
+  const ahora = Date.now();
+
+  for (const job of pendientes) {
+    const ejecutaEn = new Date(job.ejecutaEn).getTime();
+    const delayMs   = Math.max(0, ejecutaEn - ahora);
+
+    // Si ya pasó la hora programada (reinicio tardío) → ejecutar de inmediato
+    const tid = setTimeout(
+      () => _ejecutarSecuencia(job._id, job.ejercicio, job.periodo),
+      delayMs,
+    );
+    _timeouts.set(String(job._id), tid);
+    logger.info(`[Restore] Programación restaurada: ${job.ejercicio}/${job.periodo} a las ${job.hora} (en ${Math.round(delayMs / 60000)} min)`);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schedule config (horarios nocturnos)
+// ─────────────────────────────────────────────────────────────────────────────
+
 const getSchedule = asyncHandler(async (_req, res) => {
   const configs = await AppConfig.find({ key: { $in: KEYS } }).lean();
   const map     = Object.fromEntries(configs.map(c => [c.key, c.value]));
@@ -39,10 +82,6 @@ const getSchedule = asyncHandler(async (_req, res) => {
   });
 });
 
-/**
- * PUT /api/schedule
- * Body: { satDescarga?, erpDescarga?, erpVerificacion?, comparacion? }
- */
 const updateSchedule = asyncHandler(async (req, res) => {
   const campos = ['satDescarga', 'erpDescarga', 'erpVerificacion', 'comparacion'];
 
@@ -88,10 +127,6 @@ const _validarPeriodo = (req, res) => {
   return { ejercicio, periodo };
 };
 
-/**
- * POST /api/schedule/run/erp
- * Ejecuta la descarga ERP para el ejercicio/periodo indicado.
- */
 const runErp = asyncHandler(async (req, res) => {
   const parsed = _validarPeriodo(req, res);
   if (!parsed) return;
@@ -115,10 +150,6 @@ const runErp = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * POST /api/schedule/run/verificacion
- * Verifica el estado SAT de todos los CFDIs ERP del periodo indicado.
- */
 const runVerificacion = asyncHandler(async (req, res) => {
   const parsed = _validarPeriodo(req, res);
   if (!parsed) return;
@@ -142,10 +173,6 @@ const runVerificacion = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * POST /api/schedule/run/comparacion
- * Ejecuta la comparación ERP vs SAT para el periodo indicado.
- */
 const runComparacion = asyncHandler(async (req, res) => {
   const parsed = _validarPeriodo(req, res);
   if (!parsed) return;
@@ -169,22 +196,14 @@ const runComparacion = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * GET /api/schedule/locks
- * Retorna los jobs actualmente en ejecución (para que el frontend sepa el estado).
- */
 const getLocks = asyncHandler(async (_req, res) => {
   res.json({ activos: [..._locks] });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Programación de un mes completo (ERP → Verificación → Comparación en secuencia)
+// Programación de un mes completo — persiste en MongoDB
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * POST /api/schedule/programar-mes
- * Programa la ejecución secuencial de los 3 jobs para un periodo a una hora dada.
- */
 const programarMes = asyncHandler(async (req, res) => {
   const parsed = _validarPeriodo(req, res);
   if (!parsed) return;
@@ -194,70 +213,61 @@ const programarMes = asyncHandler(async (req, res) => {
   if (!TIME_RE.test(hora))
     return res.status(400).json({ error: 'hora debe tener formato HH:MM (ej. 22:00)' });
 
-  // Calcular delay en hora de México (correcto para servidores UTC/Docker)
-  // Truco: comparar Date.now() con la misma hora interpretada como "local del server"
-  // para obtener el offset MX→UTC y aplicarlo al objetivo.
-  const ahoraMs     = Date.now();
-  const hoyMX       = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
-  const fakeMXNow   = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Mexico_City' }));
-  const mxOffsetMs  = ahoraMs - fakeMXNow.getTime(); // diferencia UTC - horaLocal(MX) en ms
-  const targetFake  = new Date(`${hoyMX}T${hora}:00`); // hora MX tratada como local del servidor
-  const objetivo    = new Date(targetFake.getTime() + mxOffsetMs); // corregida a UTC real
-  if (objetivo.getTime() <= ahoraMs) {
-    // Si ya pasó hoy en México, programar para mañana
-    objetivo.setDate(objetivo.getDate() + 1);
-  }
+  const ahoraMs    = Date.now();
+  const hoyMX      = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+  const fakeMXNow  = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Mexico_City' }));
+  const mxOffsetMs = ahoraMs - fakeMXNow.getTime();
+  const targetFake = new Date(`${hoyMX}T${hora}:00`);
+  const objetivo   = new Date(targetFake.getTime() + mxOffsetMs);
+  if (objetivo.getTime() <= ahoraMs) objetivo.setDate(objetivo.getDate() + 1);
   const delayMs = objetivo.getTime() - ahoraMs;
 
-  const id = `prog-${ejercicio}-${periodo}-${Date.now()}`;
+  const doc = await ScheduledJob.create({ ejercicio, periodo, hora, ejecutaEn: objetivo });
 
-  const timeoutId = setTimeout(async () => {
-    const prog = _programados.get(id);
-    if (prog) _programados.set(id, { ...prog, estado: 'en_proceso' });
-    logger.info(`[ProgramarMes] Iniciando secuencia ${ejercicio}/${periodo}...`);
-    try {
-      await ejecutarDescargaERP({ ejercicioParam: ejercicio, periodoParam: periodo });
-      await ejecutarVerificacionPeriodo(ejercicio, periodo);
-      await ejecutarComparacionAuto({ ejercicioParam: ejercicio, periodoParam: periodo });
-      logger.info(`[ProgramarMes] Secuencia ${ejercicio}/${periodo} completada.`);
-      if (_programados.has(id))
-        _programados.set(id, { ..._programados.get(id), estado: 'completado', fin: new Date().toISOString() });
-    } catch (err) {
-      logger.error(`[ProgramarMes] ${ejercicio}/${periodo}: ${err.message}`);
-      if (_programados.has(id))
-        _programados.set(id, { ..._programados.get(id), estado: 'error', error: err.message, fin: new Date().toISOString() });
-    }
-  }, delayMs);
+  const tid = setTimeout(() => _ejecutarSecuencia(doc._id, ejercicio, periodo), delayMs);
+  _timeouts.set(String(doc._id), tid);
 
-  _programados.set(id, {
-    id, ejercicio, periodo, hora,
+  res.status(201).json({
+    id:        String(doc._id),
+    ejercicio, periodo, hora,
     ejecutaEn: objetivo.toISOString(),
     estado:    'pendiente',
-    timeoutId,
   });
-
-  res.status(201).json({ id, ejercicio, periodo, hora, ejecutaEn: objetivo.toISOString() });
 });
 
-/**
- * GET /api/schedule/programados
- */
 const getProgramados = asyncHandler(async (_req, res) => {
-  const lista = [..._programados.values()].map(({ timeoutId, ...rest }) => rest);
-  res.json({ programados: lista });
+  const lista = await ScheduledJob.find().sort({ ejecutaEn: 1 }).lean();
+  res.json({
+    programados: lista.map(d => ({
+      id:        String(d._id),
+      ejercicio: d.ejercicio,
+      periodo:   d.periodo,
+      hora:      d.hora,
+      ejecutaEn: d.ejecutaEn,
+      estado:    d.estado,
+      fin:       d.fin,
+      error:     d.error,
+    })),
+  });
 });
 
-/**
- * DELETE /api/schedule/programados/:id
- */
 const cancelarProgramado = asyncHandler(async (req, res) => {
-  const prog = _programados.get(req.params.id);
-  if (!prog) return res.status(404).json({ error: 'Programación no encontrada' });
-  if (prog.estado !== 'pendiente')
+  const doc = await ScheduledJob.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'Programación no encontrada' });
+  if (doc.estado !== 'pendiente')
     return res.status(409).json({ error: 'Solo se pueden cancelar programaciones pendientes' });
-  clearTimeout(prog.timeoutId);
-  _programados.delete(req.params.id);
+
+  const tid = _timeouts.get(req.params.id);
+  if (tid) clearTimeout(tid);
+  _timeouts.delete(req.params.id);
+
+  await ScheduledJob.findByIdAndDelete(req.params.id);
   res.json({ message: 'Programación cancelada' });
 });
 
-module.exports = { getSchedule, updateSchedule, runErp, runVerificacion, runComparacion, getLocks, programarMes, getProgramados, cancelarProgramado };
+module.exports = {
+  getSchedule, updateSchedule,
+  runErp, runVerificacion, runComparacion, getLocks,
+  programarMes, getProgramados, cancelarProgramado,
+  restaurarProgramados,
+};

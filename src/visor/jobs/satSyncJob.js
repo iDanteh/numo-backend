@@ -1251,6 +1251,14 @@ const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVeri
   } catch {
     reprogramarJobs();
   }
+
+  // Restaurar programaciones de meses anteriores pendientes en BD
+  try {
+    const { restaurarProgramados } = require('../controllers/schedule.controller');
+    await restaurarProgramados();
+  } catch (err) {
+    logger.warn(`[Restore] No se pudieron restaurar programaciones: ${err.message}`);
+  }
 })();
 
 module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, procesarDescarga, reprogramarJobs };

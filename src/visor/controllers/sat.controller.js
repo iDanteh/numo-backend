@@ -521,5 +521,5 @@ module.exports = {
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp,
-  cleanupActiveJobs, testKey,
+  cleanupActiveJobs, testKey, patchKey,
 };

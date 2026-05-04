@@ -2,6 +2,17 @@
  * bankParser.js
  * Normaliza estados de cuenta bancarios desde un archivo Excel multi-hoja.
  *
+ * Estrategia de detección de columnas (por parser):
+ *  1. Si la primera fila contiene texto en col1 se intenta detectar columnas
+ *     por encabezado (aliases definidos por banco). Si todos los campos
+ *     requeridos se encuentran → modo encabezado (colMap).
+ *  2. Si la primera fila ya contiene datos (tipo Date/número de fecha) o si
+ *     el encabezado no pudo mapearse completamente → modo posicional (índices
+ *     fijos, comportamiento original).
+ *  3. Fecha ausente en un movimiento: se asigna la fecha de carga del archivo
+ *     (uploadDate), siempre que la fila tenga al menos concepto o saldo.
+ *     Las filas completamente vacías se descartan.
+ *
  * Lógica de discriminación:
  *  - BBVA:    ignora movimientos cuyo concepto contenga 'SQ', 'Traspaso entre cuentas propias' u 'openmx'
  *  - Banamex: ignora movimientos cuyo concepto contenga 'Evopaymx'
@@ -10,13 +21,23 @@
  * No. de Autorización:
  *  - BBVA:      primer token después del '/' en el concepto
  *  - Banamex:   sub-fila "No. de Autorización: XXXXX"
- *  - Santander: columna ID inmediatamente después de Saldo (vals[8])
- *  - Azteca:    columna ID inmediatamente después de Saldo (vals[7])
+ *  - Santander: columna ID inmediatamente después de Saldo (vals[8] en posicional)
+ *  - Azteca:    columna ID inmediatamente después de Saldo (vals[7] en posicional)
  */
 
 const ExcelJS = require('exceljs');
 const crypto  = require('crypto');
 
+// ── Tipos de celda ExcelJS (ValueType) ────────────────────────────────────────
+const CELL_TYPE = {
+  NULL:   0,
+  MERGE:  1,
+  NUMBER: 2,
+  STRING: 3,
+  DATE:   4,
+};
+
+// ── Hash de movimiento ────────────────────────────────────────────────────────
 function makeHash(m) {
   const key = [
     m.banco,
@@ -211,11 +232,122 @@ function cellText(val) {
   return String(val).trim();
 }
 
+// ── Detección de encabezados ──────────────────────────────────────────────────
+
+/**
+ * Determina si la primera fila de un sheet es un encabezado (texto) o
+ * directamente un movimiento (fecha / serial numérico de Excel en col1).
+ *
+ * Retorna true  → es encabezado: intentar detectar columnas por nombre.
+ * Retorna false → es dato: usar índices posicionales (no hay encabezado).
+ */
+function isLikelyHeaderRow(row) {
+  const cell1 = row.getCell(1);
+  // Tipo Date en col1 → fila de movimiento, no encabezado
+  if (cell1.type === CELL_TYPE.DATE) return false;
+  // Tipo Number con valor de serial de fecha Excel → fila de movimiento
+  if (cell1.type === CELL_TYPE.NUMBER) {
+    const v1 = row.values[1];
+    if (typeof v1 === 'number' && v1 > 25000) return false;
+  }
+  // Tipo String: puede ser una fecha textual (ej. Santander "'02032026'").
+  // Si el valor se parsea como fecha válida → fila de movimiento, no encabezado.
+  if (cell1.type === CELL_TYPE.STRING) {
+    if (toDate(row.values[1]) !== null) return false;
+  }
+  // Texto de encabezado, null, merge → probable encabezado
+  return true;
+}
+
+/**
+ * Detecta el mapeo de columnas semánticas a índices (1-based) desde una fila
+ * de encabezado buscando aliases por coincidencia de subcadena (case-insensitive).
+ *
+ * @param {ExcelJS.Row}              headerRow      - Fila con los encabezados
+ * @param {Object<string,string[]>}  aliases        - { campo: ['alias1', 'alias2', ...] }
+ * @param {string[]}                 requiredFields - Campos que deben encontrarse para
+ *                                                    considerar la detección exitosa
+ * @returns {{ colMap: Object<string,number>, allFound: boolean }}
+ *   colMap:   { campo → índice 1-based }
+ *   allFound: true si todos los campos requeridos fueron mapeados
+ */
+function detectHeaderColumns(headerRow, aliases, requiredFields) {
+  const colMap = {};
+
+  headerRow.eachCell((cell, colIdx) => {
+    const text = cellText(cell.value).toLowerCase().trim();
+    if (!text) return;
+    for (const [field, names] of Object.entries(aliases)) {
+      if (colMap[field] !== undefined) continue; // ya mapeado
+      if (names.some((name) => text.includes(name))) {
+        colMap[field] = colIdx;
+      }
+    }
+  });
+
+  const allFound = requiredFields.every((f) => colMap[f] !== undefined);
+  return { colMap, allFound };
+}
+
+// ── Aliases de columnas por banco ─────────────────────────────────────────────
+//
+// Cada banco define los nombres de columna que puede usar en su encabezado.
+// Los aliases son subcadenas (match parcial, case-insensitive), de más
+// específico a más genérico. El primer alias que coincida en una celda gana.
+// Los campos en REQUIRED deben estar todos presentes para activar el modo
+// encabezado; si falta alguno se usa el modo posicional como fallback.
+
+const BANAMEX_ALIASES = {
+  fecha:    ['fecha', 'date', 'f.operaci', 'f.valor'],
+  concepto: ['concepto', 'descripci', 'movimiento', 'detalle'],
+  deposito: ['depósito', 'deposito', 'abono', 'crédito', 'credito', 'haber'],
+  retiro:   ['retiro', 'cargo', 'débito', 'debito', 'debe', 'egreso'],
+  saldo:    ['saldo', 'balance'],
+};
+const BANAMEX_REQUIRED = ['fecha', 'concepto', 'saldo'];
+
+const BBVA_ALIASES = {
+  fecha:    ['fecha', 'f.valor', 'f. valor', 'date', 'f.operaci'],
+  concepto: ['concepto', 'descripci', 'referencia', 'movimiento', 'detalle'],
+  cargo:    ['cargo', 'retiro', 'débito', 'debito', 'egreso', 'disposici'],
+  abono:    ['abono', 'depósito', 'deposito', 'crédito', 'credito', 'ingreso', 'haber'],
+  saldo:    ['saldo', 'balance'],
+};
+const BBVA_REQUIRED = ['fecha', 'concepto', 'saldo'];
+
+const SANTANDER_ALIASES = {
+  fecha:        ['fecha', 'date', 'f.operaci', 'f.valor'],
+  // 'descripci' captura "Descripcion" (col4); 'concepto' captura "Concepto" (col9) solo si
+  // no hay "Descripcion" primero — en ese caso col9 cae en `extra` (ver abajo).
+  concepto:     ['concepto', 'descripci', 'movimiento', 'operaci', 'detalle'],
+  // El portal de Santander usa "Cargo/Abono" como cabecera del signo +/-
+  signo:        ['cargo/abono', 'signo', '+/-', 'd/c', 'd/h', 'tipo mov', 'tipo de mov'],
+  monto:        ['monto', 'importe', 'cantidad', 'valor'],
+  saldo:        ['saldo', 'balance'],
+  // "Referencia" en el estado de cuenta de Santander equivale al número de autorización
+  autorizacion: ['referencia', 'autoriza', 'folio', 'id aut', 'num. aut', 'id mov', 'clave'],
+  // 'concepto' aquí captura la col "Concepto" (col9) cuando "Descripcion" ya ocupó el
+  // campo `concepto` arriba.  'nombre ben' evita capturar "Clabe Beneficiario" (CLABE).
+  extra:        ['concepto', 'banco origen', 'banco destino', 'referencia adic', 'nombre ben', 'nombre ord'],
+};
+const SANTANDER_REQUIRED = ['fecha', 'monto', 'saldo'];
+
+const AZTECA_ALIASES = {
+  fecha:        ['fecha', 'date', 'f.operaci', 'f.valor'],
+  concepto:     ['concepto', 'descripci', 'movimiento', 'detalle'],
+  deposito:     ['depósito', 'deposito', 'abono', 'crédito', 'credito', 'ingreso', 'haber'],
+  retiro:       ['retiro', 'cargo', 'débito', 'debito', 'egreso', 'debe'],
+  saldo:        ['saldo', 'balance'],
+  autorizacion: ['autoriza', 'folio', 'id aut', 'num. aut', 'referencia', 'clave'],
+};
+const AZTECA_REQUIRED = ['fecha', 'concepto', 'saldo'];
+
 // ── Parsers por banco ─────────────────────────────────────────────────────────
 
 /**
  * Banamex
- * Estructura de columnas (ExcelJS 1-based) — hasta 7 columnas:
+ *
+ * Estructura posicional de columnas (ExcelJS 1-based) — hasta 7 columnas:
  *   vals[1] = Fecha (Date para filas principales, null para sub-filas)
  *   vals[2] = Concepto / texto de sub-fila
  *   vals[3] = Depósitos (número o '-')
@@ -228,68 +360,78 @@ function cellText(val) {
  *   "Referencia numérica: DEPOS XXXXXXX"
  *   "No. de Autorización: XXXXXXX"
  *   "Concepto del Pago: XXXXXXX"
+ *
+ * Las columnas 6-7 siempre se leen de forma posicional ya que son extras
+ * opcionales que no tienen encabezado propio.
+ *
+ * @param {ExcelJS.Worksheet} sheet
+ * @param {Date}              uploadDate  Fecha de carga; fallback para movimientos sin fecha.
  */
-function parseBanamex(sheet) {
+function parseBanamex(sheet, uploadDate) {
   const movements = [];
-  let current = null;
-  let headerSkipped = false;
-
-  // ExcelJS ValueType: 0=Null, 1=Merge, 2=Number, 3=String, 4=Date
-  // Las filas principales de Banamex tienen tipo Date (4) en col1.
-  // Algunos exports devuelven tipo Number (2) con un serial numérico de Excel.
-  // Las sub-filas pueden tener tipo Merge (1) O Null (0); ambos casos
-  // ocurren dependiendo de cómo Banamex exportó las celdas combinadas.
-  const DATE_TYPE   = 4;
-  const NUMBER_TYPE = 2;
-  const MERGE_TYPE  = 1;
-  const NULL_TYPE   = 0;
+  let current  = null;
+  let firstRow = true;
+  let colMap   = null; // null = modo posicional
 
   sheet.eachRow((row) => {
     const cell1Type = row.getCell(1).type;
     const v = row.values;
-    const col2 = v[2]; // Concepto o texto sub-fila
-    const col3 = v[3]; // Depósitos
-    const col4 = v[4]; // Retiros
-    const col5 = v[5]; // Saldo
 
-    // Saltar header solo si la primera fila es texto (encabezado real).
-    // Los archivos "Extendido" de Banamex comienzan directamente con movimientos
-    // en fila 1 (sin fila de encabezado). Si col1 ya tiene tipo Date o serial
-    // numérico de fecha, es un movimiento → procesarlo normalmente.
-    if (!headerSkipped) {
-      headerSkipped = true;
-      const isDateRow = cell1Type === DATE_TYPE ||
-        (cell1Type === NUMBER_TYPE && typeof v[1] === 'number' && v[1] > 25000);
-      if (!isDateRow) return; // encabezado de texto → saltar
-      // Es un movimiento en fila 1 → no hacer return, continuar al bloque isMainRow
+    // ── Primera fila: determinar modo ──────────────────────────────────────
+    if (firstRow) {
+      firstRow = false;
+      if (isLikelyHeaderRow(row)) {
+        const { colMap: detected, allFound } = detectHeaderColumns(
+          row, BANAMEX_ALIASES, BANAMEX_REQUIRED,
+        );
+        colMap = allFound ? detected : null;
+        return; // saltar fila de encabezado independientemente del resultado
+      }
+      // Primera fila es un dato (sin encabezado) → colMap queda null (posicional)
+      // No hacer return: continuar procesando esta fila como movimiento principal
     }
 
-    // Una fila principal tiene tipo Date (4) en col1.
-    // Si ExcelJS devuelve un serial numérico (tipo 2) que sea válido como fecha, también es fila principal.
-    // Las sub-filas tienen tipo Merge (1) o Null (0) — ambos deben procesarse.
-    const isMainRow = cell1Type === DATE_TYPE ||
-      (cell1Type === NUMBER_TYPE && typeof v[1] === 'number' && v[1] > 25000);
-    const isSubRow  = (cell1Type === MERGE_TYPE || cell1Type === NULL_TYPE) && current !== null;
+    // ── Clasificar tipo de fila ────────────────────────────────────────────
+    // Fila principal: col1 tiene tipo Date o serial numérico de fecha
+    const isMainRow = cell1Type === CELL_TYPE.DATE ||
+      (cell1Type === CELL_TYPE.NUMBER && typeof v[1] === 'number' && v[1] > 25000);
+    // Sub-fila: col1 tiene tipo Merge o Null y existe un movimiento en curso.
+    // Ambos tipos ocurren dependiendo de cómo Banamex exportó las celdas combinadas.
+    const isSubRow = (cell1Type === CELL_TYPE.MERGE || cell1Type === CELL_TYPE.NULL)
+      && current !== null;
 
     if (isMainRow) {
-      // Guardar movimiento anterior si existe
+      // Guardar movimiento anterior
       if (current) {
-        movements.push(buildBanamex(current, isOtros(current.conceptoBase, BANAMEX_OTROS)));
+        movements.push(buildBanamex(current, isOtros(current.conceptoBase, BANAMEX_OTROS), uploadDate));
       }
 
+      // Resolver índices según modo
+      const iConcepto = colMap ? colMap.concepto : 2;
+      const iDeposito = colMap ? colMap.deposito : 3;
+      const iRetiro   = colMap ? colMap.retiro   : 4;
+      const iSaldo    = colMap ? colMap.saldo    : 5;
+      // La fecha siempre se lee del índice detectado o de v[1];
+      // normalizeExcelDate maneja Date, serial numérico y fórmulas.
+      // Se guarda como null si no se puede determinar: buildBanamex aplicará
+      // el fallback uploadDate DESPUÉS de calcular el hash, para que el hash
+      // sea idéntico en cualquier reimportación del mismo archivo.
+      const fechaRaw  = colMap ? v[colMap.fecha] : v[1];
+
       current = {
-        fecha:           normalizeExcelDate(v[1]) ?? new Date(),
-        conceptoBase:    cellText(col2),
+        fecha:           normalizeExcelDate(fechaRaw),   // puede ser null
+        conceptoBase:    cellText(v[iConcepto]),
         lineasExtra:     [],
-        deposito:        toNumber(col3),
-        retiro:          toNumber(col4),
-        saldo:           toNumber(col5),
+        deposito:        toNumber(v[iDeposito]),
+        retiro:          toNumber(v[iRetiro]),
+        saldo:           toNumber(v[iSaldo]),
         numAutorizacion: null,
         refNumerica:     null,
       };
 
-      // Columnas 6-7: presentes en estados de cuenta de fin de semana.
-      // Pueden contener No. de Autorización, referencia, o texto libre.
+      // Columnas 6-7: presentes solo en estados de fin de semana.
+      // Se leen siempre de forma posicional porque son columnas adicionales
+      // que no aparecen en el encabezado estándar de Banamex.
       for (let colIdx = 6; colIdx <= 7; colIdx++) {
         const text = cellText(v[colIdx]);
         if (!text) continue;
@@ -305,9 +447,13 @@ function parseBanamex(sheet) {
         }
         current.lineasExtra.push(text);
       }
-    } else if (isSubRow && current) {
-      // Sub-fila: acumular información adicional
-      const text = cellText(col2);
+
+    } else if (isSubRow) {
+      // Sub-filas de Banamex: el texto siempre cae en la columna de concepto.
+      // En modo posicional es col2; en modo encabezado usamos colMap.concepto
+      // si fue detectado, con fallback a 2 por si acaso.
+      const iConcepto = colMap ? (colMap.concepto ?? 2) : 2;
+      const text = cellText(v[iConcepto]);
       if (!text) return;
 
       const authMatch = text.match(/no\.\s*de\s*autorizaci[oó]n[\s:]+(.+)/i);
@@ -326,9 +472,9 @@ function parseBanamex(sheet) {
     }
   });
 
-  // Último movimiento
+  // Último movimiento pendiente
   if (current) {
-    movements.push(buildBanamex(current, isOtros(current.conceptoBase, BANAMEX_OTROS)));
+    movements.push(buildBanamex(current, isOtros(current.conceptoBase, BANAMEX_OTROS), uploadDate));
   }
 
   return movements;
@@ -337,7 +483,7 @@ function parseBanamex(sheet) {
 // Extrae el primer monto con formato monetario de un texto (ej. "DEP EN EFECTIVO 5,000.00")
 const MONTO_RE = /(\d{1,3}(?:,\d{3})*\.\d{2})/;
 
-function buildBanamex(c, otros = false) {
+function buildBanamex(c, otros = false, uploadDate) {
   const extras = c.lineasExtra.filter(Boolean);
   const conceptoCompleto = extras.length
     ? `${c.conceptoBase} | ${extras.join(' | ')}`
@@ -360,9 +506,12 @@ function buildBanamex(c, otros = false) {
     }
   }
 
+  // c.fecha es null cuando el archivo no trae fecha en ese movimiento.
+  // El hash se calcula con fecha = null para que sea idéntico en cualquier
+  // reimportación. Después se asigna la fecha real con el fallback de uploadDate.
   const m = {
     banco:              'Banamex',
-    fecha:              c.fecha,
+    fecha:              c.fecha,           // null si no vino en el archivo
     concepto:           conceptoCompleto,
     deposito,
     retiro,
@@ -372,42 +521,60 @@ function buildBanamex(c, otros = false) {
     status:             otros ? 'otros' : 'no_identificado',
     categoria:          clasificar(conceptoCompleto),
   };
-  m.hash = makeHash(m);
+  m.hash  = makeHash(m);
+  m.fecha = c.fecha ?? uploadDate;
   return m;
 }
 
 /**
  * BBVA
- * Estructura de columnas (ExcelJS 1-based):
+ *
+ * Estructura posicional de columnas (ExcelJS 1-based):
  *   vals[1] = Fecha (Date)
  *   vals[2] = Concepto / Referencia
- *   vals[3] = Cargo  (retiro)
+ *   vals[3] = Cargo  (retiro, exportado como negativo)
  *   vals[4] = Abono  (depósito)
  *   vals[5] = Saldo
  *
- * Autorización: primer token después del '/' en el concepto.
+ * Autorización: primer token numérico después del '/' en el concepto.
+ *
+ * @param {ExcelJS.Worksheet} sheet
+ * @param {Date}              uploadDate  Fecha de carga; fallback para movimientos sin fecha.
  */
-function parseBBVA(sheet) {
+function parseBBVA(sheet, uploadDate) {
   const movements = [];
-  let headerSkipped = false;
+  let firstRow = true;
+  let colMap   = null; // null = modo posicional
 
   sheet.eachRow((row) => {
     const v = row.values;
-    const col1 = v[1]; // Fecha
-    const col2 = v[2]; // Concepto
-    const col3 = v[3]; // Cargo (retiro)
-    const col4 = v[4]; // Abono (depósito)
-    const col5 = v[5]; // Saldo
 
-    if (!headerSkipped) {
-      headerSkipped = true;
-      return;
+    // ── Primera fila: determinar modo ──────────────────────────────────────
+    if (firstRow) {
+      firstRow = false;
+      if (isLikelyHeaderRow(row)) {
+        const { colMap: detected, allFound } = detectHeaderColumns(
+          row, BBVA_ALIASES, BBVA_REQUIRED,
+        );
+        colMap = allFound ? detected : null;
+        return; // saltar fila de encabezado independientemente del resultado
+      }
+      // Primera fila es un dato (sin encabezado) → colMap queda null (posicional)
+      // No hacer return: continuar procesando esta fila como movimiento
     }
 
-    const fecha = normalizeExcelDate(col1 instanceof Date ? col1 : toDate(col1));
-    if (!fecha) return;
+    // Resolver columnas
+    const col1 = v[colMap ? colMap.fecha    : 1]; // Fecha
+    const col2 = v[colMap ? colMap.concepto : 2]; // Concepto
+    const col3 = v[colMap ? colMap.cargo    : 3]; // Cargo (retiro)
+    const col4 = v[colMap ? colMap.abono    : 4]; // Abono (depósito)
+    const col5 = v[colMap ? colMap.saldo    : 5]; // Saldo
 
-    const concepto = cellText(col2);
+    const concepto  = cellText(col2);
+    const fechaDate = normalizeExcelDate(col1 instanceof Date ? col1 : toDate(col1));
+
+    // Descartar filas completamente vacías (sin fecha ni concepto ni saldo)
+    if (!fechaDate && !concepto && toNumber(col5) === null) return;
 
     // Extraer autorización: primer bloque numérico después del '/'
     // Se toma solo la parte numérica inicial del token para evitar que
@@ -425,9 +592,13 @@ function parseBBVA(sheet) {
     }
 
     const cargoRaw = toNumber(col3);
+    // El hash se calcula con fechaDate (null si el archivo no trae fecha).
+    // Esto garantiza que el hash sea idéntico en cualquier reimportación del
+    // mismo archivo, independientemente de cuándo se ejecute.
+    // Después del hash se asigna la fecha real con el fallback de uploadDate.
     const mBBVA = {
       banco:              'BBVA',
-      fecha,
+      fecha:              fechaDate,
       concepto,
       deposito:           toNumber(col4),
       // BBVA exporta cargos como negativos; se guarda el valor absoluto
@@ -438,7 +609,8 @@ function parseBBVA(sheet) {
       status:             isOtros(concepto, BBVA_OTROS) ? 'otros' : 'no_identificado',
       categoria:          clasificar(concepto),
     };
-    mBBVA.hash = makeHash(mBBVA);
+    mBBVA.hash  = makeHash(mBBVA);
+    mBBVA.fecha = fechaDate ?? uploadDate;
     movements.push(mBBVA);
   });
 
@@ -447,8 +619,9 @@ function parseBBVA(sheet) {
 
 /**
  * Santander
- * Estructura de columnas (ExcelJS 1-based):
- *   vals[1]  = Fecha (string "'DDMMYYYY'")
+ *
+ * Estructura posicional de columnas (ExcelJS 1-based):
+ *   vals[1]  = Fecha (string "'DDMMYYYY'" con apóstrofe de Excel)
  *   vals[2]  = Hora
  *   vals[3]  = Sucursal
  *   vals[4]  = Concepto principal
@@ -458,39 +631,63 @@ function parseBBVA(sheet) {
  *   vals[8]  = ID Autorización
  *   vals[9]  = Referencia adicional / Banco origen
  *
+ * Nota: en modo encabezado, hora y sucursal se ignoran (no se mapean a ningún
+ * campo del movimiento). El concepto final se construye concatenando concepto
+ * y referencia extra si esta existe.
+ *
  * Sin discriminación.
+ *
+ * @param {ExcelJS.Worksheet} sheet
+ * @param {Date}              uploadDate  Fecha de carga; fallback para movimientos sin fecha.
  */
-function parseSantander(sheet) {
+function parseSantander(sheet, uploadDate) {
   const movements = [];
-  let headerSkipped = false;
+  let firstRow = true;
+  let colMap   = null; // null = modo posicional
 
   sheet.eachRow((row) => {
     const v = row.values;
-    const col1 = v[1];  // Fecha
-    const col4 = v[4];  // Concepto
-    const col5 = v[5];  // Signo +/-
-    const col6 = v[6];  // Monto
-    const col7 = v[7];  // Saldo
-    const col8 = v[8];  // ID Autorización
-    const col9 = v[9];  // Referencia adicional
 
-    if (!headerSkipped) {
-      headerSkipped = true;
-      return;
+    // ── Primera fila: determinar modo ──────────────────────────────────────
+    if (firstRow) {
+      firstRow = false;
+      if (isLikelyHeaderRow(row)) {
+        const { colMap: detected, allFound } = detectHeaderColumns(
+          row, SANTANDER_ALIASES, SANTANDER_REQUIRED,
+        );
+        colMap = allFound ? detected : null;
+        return; // saltar fila de encabezado independientemente del resultado
+      }
+      // Primera fila es un dato (sin encabezado) → colMap queda null (posicional)
+      // No hacer return: continuar procesando esta fila como movimiento
     }
 
-    const fecha = toDate(col1);
-    if (!fecha) return;
+    // Resolver columnas
+    // Hora (col2) y Sucursal (col3) no se usan en el movimiento; se omiten.
+    const col1 = v[colMap ? colMap.fecha        : 1]; // Fecha
+    const col4 = v[colMap ? colMap.concepto     : 4]; // Concepto principal
+    const col5 = v[colMap ? colMap.signo        : 5]; // Signo +/-
+    const col6 = v[colMap ? colMap.monto        : 6]; // Monto
+    const col7 = v[colMap ? colMap.saldo        : 7]; // Saldo
+    const col8 = v[colMap ? colMap.autorizacion : 8]; // ID Autorización
+    const col9 = v[colMap ? colMap.extra        : 9]; // Referencia adicional
 
-    const signo      = cellText(col5);
-    const monto      = toNumber(col6);
-    const concepto1  = cellText(col4);
-    const refExtra   = cellText(col9);
-    const concepto   = refExtra ? `${concepto1} | ${refExtra}` : concepto1;
+    const concepto1 = cellText(col4);
+    const fechaDate = toDate(col1);
 
+    // Descartar filas completamente vacías (sin fecha ni concepto ni saldo)
+    if (!fechaDate && !concepto1 && toNumber(col7) === null) return;
+
+    const signo    = cellText(col5);
+    const monto    = toNumber(col6);
+    const refExtra = cellText(col9);
+    const concepto = refExtra ? `${concepto1} | ${refExtra}` : concepto1;
+
+    // Hash con fechaDate (null si el archivo no trae fecha) → estable entre reimportaciones.
+    // La fecha almacenada se asigna después del hash con el fallback de uploadDate.
     const mSant = {
       banco:              'Santander',
-      fecha,
+      fecha:              fechaDate,
       concepto,
       deposito:           signo === '+' ? monto : null,
       retiro:             signo === '-' ? monto : null,
@@ -500,7 +697,8 @@ function parseSantander(sheet) {
       status:             'no_identificado',
       categoria:          clasificar(concepto),
     };
-    mSant.hash = makeHash(mSant);
+    mSant.hash  = makeHash(mSant);
+    mSant.fecha = fechaDate ?? uploadDate;
     movements.push(mSant);
   });
 
@@ -509,65 +707,85 @@ function parseSantander(sheet) {
 
 /**
  * Azteca
- * Estructura de columnas (ExcelJS 1-based):
+ *
+ * Estructura posicional de columnas (ExcelJS 1-based):
  *   vals[1]  = Fecha (Date)
- *   vals[2]  = Fecha duplicada
+ *   vals[2]  = Fecha duplicada (ignorada en modo encabezado)
  *   vals[3]  = Concepto
  *   vals[4]  = Depósito (número o null)
  *   vals[5]  = Retiro   (número negativo o null)
  *   vals[6]  = Saldo
  *   vals[7]  = ID Autorización
  *
+ * Los archivos descargados del portal de Azteca pueden comenzar directamente
+ * con movimientos (sin fila de encabezado). La lógica de isLikelyHeaderRow
+ * cubre ambos casos.
+ *
  * Sin discriminación.
+ *
+ * @param {ExcelJS.Worksheet} sheet
+ * @param {Date}              uploadDate  Fecha de carga; fallback para movimientos sin fecha.
  */
-function parseAzteca(sheet) {
+function parseAzteca(sheet, uploadDate) {
   const movements = [];
-  let headerSkipped = false;
+  let firstRow = true;
+  let colMap   = null; // null = modo posicional
 
   sheet.eachRow((row) => {
     const v = row.values;
-    const col1 = v[1]; // Fecha
-    const col3 = v[3]; // Concepto
-    const col4 = v[4]; // Depósito
-    const col5 = v[5]; // Retiro (puede ser negativo)
-    const col6 = v[6]; // Saldo
-    const col7 = v[7]; // ID Autorización
 
-    if (!headerSkipped) {
-      headerSkipped = true;
-      // Azteca no tiene fila de encabezado: los archivos descargados de su portal
-      // comienzan directamente con movimientos (tipo Date). Si col1 ya es fecha,
-      // es un movimiento → no saltar. Si es texto, es encabezado → saltar.
-      const cell1Type = row.getCell(1).type;
-      const isDateRow = cell1Type === 4 ||
-        (cell1Type === 2 && typeof col1 === 'number' && col1 > 25000);
-      if (!isDateRow) return; // encabezado de texto → saltar
-      // Es un movimiento en fila 1 → continuar
+    // ── Primera fila: determinar modo ──────────────────────────────────────
+    if (firstRow) {
+      firstRow = false;
+      if (isLikelyHeaderRow(row)) {
+        const { colMap: detected, allFound } = detectHeaderColumns(
+          row, AZTECA_ALIASES, AZTECA_REQUIRED,
+        );
+        colMap = allFound ? detected : null;
+        return; // saltar fila de encabezado independientemente del resultado
+      }
+      // Primera fila es un dato (sin encabezado) → colMap queda null (posicional)
+      // No hacer return: continuar procesando esta fila como movimiento
     }
 
-    const fecha = normalizeExcelDate(col1 instanceof Date ? col1 : toDate(col1));
-    if (!fecha) return;
+    // Resolver columnas
+    // col2 (fecha duplicada) solo existe en modo posicional; en modo encabezado
+    // si el banco la incluye se ignorará porque no hay alias mapeado para ella.
+    const col1 = v[colMap ? colMap.fecha        : 1]; // Fecha
+    const col3 = v[colMap ? colMap.concepto     : 3]; // Concepto
+    const col4 = v[colMap ? colMap.deposito     : 4]; // Depósito
+    const col5 = v[colMap ? colMap.retiro       : 5]; // Retiro (puede ser negativo)
+    const col6 = v[colMap ? colMap.saldo        : 6]; // Saldo
+    const col7 = v[colMap ? colMap.autorizacion : 7]; // ID Autorización
+
+    const conceptoText = cellText(col3);
+    const fechaDate    = normalizeExcelDate(col1 instanceof Date ? col1 : toDate(col1));
+
+    // Descartar filas completamente vacías (sin fecha ni concepto ni saldo)
+    if (!fechaDate && !conceptoText && toNumber(col6) === null) return;
 
     const depositoRaw = toNumber(col4);
     const retiroRaw   = toNumber(col5);
 
-    const deposito = depositoRaw !== null && depositoRaw > 0 ? depositoRaw : null;
+    const deposito = depositoRaw !== null && depositoRaw > 0 ? depositoRaw        : null;
     const retiro   = retiroRaw   !== null && retiroRaw   < 0 ? Math.abs(retiroRaw) : null;
 
-    const conceptoAzt = cellText(col3);
+    // Hash con fechaDate (null si el archivo no trae fecha) → estable entre reimportaciones.
+    // La fecha almacenada se asigna después del hash con el fallback de uploadDate.
     const mAzt = {
       banco:              'Azteca',
-      fecha,
-      concepto:           conceptoAzt,
+      fecha:              fechaDate,
+      concepto:           conceptoText,
       deposito,
       retiro,
       saldo:              toNumber(col6),
       numeroAutorizacion: normalizeAuthNum(col7 !== null && col7 !== undefined ? String(col7).trim() : null),
       referenciaNumerica: null,
       status:             'no_identificado',
-      categoria:          clasificar(conceptoAzt),
+      categoria:          clasificar(conceptoText),
     };
-    mAzt.hash = makeHash(mAzt);
+    mAzt.hash  = makeHash(mAzt);
+    mAzt.fecha = fechaDate ?? uploadDate;
     movements.push(mAzt);
   });
 
@@ -591,11 +809,17 @@ async function parseBankFile(buffer, banco) {
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.load(buffer);
 
+  // Fecha de carga del archivo. Se usa como valor de fecha cuando un movimiento
+  // no trae fecha en el Excel (campo vacío o no reconocible).
+  // Se fija una sola vez para que todos los movimientos del mismo archivo
+  // compartan el mismo valor de fallback.
+  const uploadDate = new Date();
+
   const sheetParsers = {
-    Banamex:   parseBanamex,
-    BBVA:      parseBBVA,
-    Santander: parseSantander,
-    Azteca:    parseAzteca,
+    Banamex:   (sheet) => parseBanamex(sheet, uploadDate),
+    BBVA:      (sheet) => parseBBVA(sheet, uploadDate),
+    Santander: (sheet) => parseSantander(sheet, uploadDate),
+    Azteca:    (sheet) => parseAzteca(sheet, uploadDate),
   };
 
   const allMovements = [];

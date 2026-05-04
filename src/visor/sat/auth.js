@@ -319,20 +319,58 @@ const parseKey = async (keyBuf, password) => {
             // data: [0] { OCTET STRING { keyBytes } }
             // El OCTET STRING puede ser:
             //   0x04 — primitivo: el valor ES la llave directamente
-            //   0x24 — construido BER: concatenar los OCTET STRINGs internos
+            //   0x24 — construido BER: puede contener MÚLTIPLES estructuras concatenadas
+            //          (ej. CSR + EncryptedPrivateKeyInfo). Probar cada parte individual.
             const wrapEl = contentEl.tag === 0xa0 ? readBerItem(contentEl.value, 0) : contentEl;
             logger.info(`[parseKey] BER PKCS#7 wrapEl: tag=0x${(wrapEl?.tag ?? 0).toString(16)} len=${wrapEl?.value?.length}`);
             if (wrapEl && wrapEl.tag === 0x04) {
               innerKeyBuf = wrapEl.value;
             } else if (wrapEl && wrapEl.tag === 0x24) {
-              // Construido BER: concatenar los OCTET STRINGs internos
+              // Construido BER: recopilar partes individuales (no concatenar)
               const parts = readBerChildren(wrapEl.value);
               const octetParts = parts.filter(p => p.tag === 0x04 || p.tag === 0x24);
-              innerKeyBuf = octetParts.length
-                ? Buffer.concat(octetParts.map(p => p.value))
-                : wrapEl.value;
+              logger.info(`[parseKey] BER PKCS#7 octetParts: ${octetParts.length} partes sizes=[${octetParts.map(p => p.value.length).join(',')}]`);
+              if (octetParts.length === 1) {
+                // Una sola parte: puede tener múltiples estructuras DER concatenadas
+                innerKeyBuf = octetParts[0].value;
+              } else if (octetParts.length > 1) {
+                // Múltiples partes: la llave cifrada probablemente es la última o segunda
+                // Guardar todas como candidatos; se probarán en el bloque de descifrado
+                innerKeyBuf = Buffer.concat(octetParts.map(p => p.value)); // fallback concat
+                // Sobrescribir con cada parte hasta encontrar la que se puede descifrar:
+                for (const part of octetParts) {
+                  const firstItem = readBerItem(part.value, 0);
+                  // Si empieza con SEQUENCE que tiene SEQUENCE como primer hijo → PKCS#8 EncryptedPKI
+                  if (firstItem && (firstItem.tag & 0x1f) === 0x10) {
+                    const subCh = readBerChildren(firstItem.value);
+                    if (subCh.length >= 2 && (subCh[0].tag === 0x30 || subCh[0].tag === 0x06)) {
+                      innerKeyBuf = part.value;
+                      break;
+                    }
+                  }
+                }
+              } else {
+                innerKeyBuf = wrapEl.value;
+              }
             } else {
               innerKeyBuf = wrapEl ? wrapEl.value : contentEl.value;
+            }
+            // Si innerKeyBuf tiene múltiples estructuras DER concatenadas, extraer la 2ª+
+            if (innerKeyBuf) {
+              const firstStruct = readBerItem(innerKeyBuf, 0);
+              if (firstStruct && firstStruct.totalEnd < innerKeyBuf.length) {
+                const remainder = innerKeyBuf.slice(firstStruct.totalEnd);
+                logger.info(`[parseKey] BER PKCS#7 remainder: ${remainder.length}B primeros4=${remainder.slice(0,4).toString('hex')}`);
+                // Preferir el remainder si parece PKCS#8 EncryptedPrivateKeyInfo
+                const remFirst = readBerItem(remainder, 0);
+                if (remFirst && (remFirst.tag & 0x1f) === 0x10) {
+                  const remCh = readBerChildren(remFirst.value);
+                  if (remCh.length >= 2 && (remCh[0].tag === 0x30 || remCh[0].tag === 0x06)) {
+                    innerKeyBuf = remainder;
+                    logger.info('[parseKey] BER PKCS#7 usando remainder como candidato a llave');
+                  }
+                }
+              }
             }
           } else {
             // encryptedData u otro: extraer el valor del [0] tal cual

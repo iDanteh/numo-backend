@@ -377,6 +377,80 @@ const parseKey = async (keyBuf, password) => {
           logger.warn(`[parseKey] PKCS#7 inner forge: ${eInner.message?.slice(0, 120)}`);
         }
 
+        // Parser manual PBES1/PKCS12 sobre el inner (forge no soporta PKCS#12-PBE)
+        try {
+          const iOuter = readBerItem(innerKeyBuf, 0);
+          if (!iOuter || (iOuter.tag & 0x1f) !== 0x10) throw new Error('inner no es SEQUENCE');
+          const iCh = readBerChildren(iOuter.value);
+          if (iCh.length < 2) throw new Error('inner SEQUENCE con < 2 hijos');
+
+          let iAlgOid, iSalt, iIters, iEncData;
+          if (iCh[0].tag === 0x30) {
+            // PKCS#8 EncryptedPrivateKeyInfo: SEQUENCE { AlgorithmIdentifier, OCTET STRING }
+            const ai = readBerChildren(iCh[0].value);
+            iAlgOid = forge.asn1.derToOid(ai[0].value.toString('binary'));
+            const prm = readBerChildren(ai[1].value);
+            iSalt = prm[0].value; iIters = 0;
+            for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
+            iEncData = iCh[1].value;
+          } else if (iCh[0].tag === 0x06) {
+            // OID directo en SEQUENCE exterior (variante SAT)
+            iAlgOid = forge.asn1.derToOid(iCh[0].value.toString('binary'));
+            const prm = readBerChildren(iCh[1].value);
+            iSalt = prm[0].value; iIters = 0;
+            for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
+            iEncData = iCh[2]?.value;
+          } else {
+            throw new Error(`inner primer hijo tag inesperado: 0x${iCh[0].tag.toString(16)}`);
+          }
+
+          logger.info(`[parseKey] inner manual: OID=${iAlgOid} iters=${iIters} encData=${iEncData?.length}B`);
+
+          const PBES1_M = {
+            '1.2.840.113549.1.5.3':  { hash: 'md5',  cipher: 'des-cbc', kLen: 8 },
+            '1.2.840.113549.1.5.6':  { hash: 'md5',  cipher: 'rc2-cbc', kLen: 5 },
+            '1.2.840.113549.1.5.10': { hash: 'sha1', cipher: 'des-cbc', kLen: 8 },
+            '1.2.840.113549.1.5.11': { hash: 'sha1', cipher: 'rc2-cbc', kLen: 5 },
+          };
+          const PKCS12_M = {
+            '1.2.840.113549.1.12.1.3': { cipher: 'des-ede3-cbc', kLen: 24, ivLen: 8 },
+            '1.2.840.113549.1.12.1.4': { cipher: 'des-ede-cbc',  kLen: 16, ivLen: 8 },
+          };
+
+          let iDecrypted;
+          if (PBES1_M[iAlgOid]) {
+            const { hash, cipher, kLen } = PBES1_M[iAlgOid];
+            let dk = Buffer.concat([Buffer.from(password, 'utf8'), iSalt]);
+            for (let i = 0; i < iIters; i++) dk = crypto.createHash(hash).update(dk).digest();
+            const dec = crypto.createDecipheriv(cipher, dk.slice(0, kLen), dk.slice(kLen, kLen + 8));
+            iDecrypted = Buffer.concat([dec.update(iEncData), dec.final()]);
+            logger.info(`[parseKey] inner PBES1/${hash}/${cipher}: OK`);
+          } else if (PKCS12_M[iAlgOid]) {
+            const { cipher, kLen, ivLen } = PKCS12_M[iAlgOid];
+            const saltBin = iSalt.toString('binary');
+            const kBuf  = Buffer.from(forge.pkcs12.generateKey(password, saltBin, 1, iIters, kLen,  forge.md.sha1.create()).getBytes(), 'binary');
+            const ivBuf = Buffer.from(forge.pkcs12.generateKey(password, saltBin, 2, iIters, ivLen, forge.md.sha1.create()).getBytes(), 'binary');
+            const dec = crypto.createDecipheriv(cipher, kBuf, ivBuf);
+            iDecrypted = Buffer.concat([dec.update(iEncData), dec.final()]);
+            logger.info(`[parseKey] inner PKCS12-PBE/${cipher}: OK`);
+          } else {
+            throw new Error(`inner OID no soportado: ${iAlgOid}`);
+          }
+
+          const iAsn1 = forge.asn1.fromDer(forge.util.createBuffer(iDecrypted.toString('binary')), { strict: false });
+          try {
+            const key = forge.pki.privateKeyFromAsn1(iAsn1);
+            logger.info('[parseKey] inner manual → PKCS#1: OK');
+            return key;
+          } catch (_) {}
+          const iPkcs8 = forge.asn1.fromDer(forge.util.createBuffer(iAsn1.value[2].value), { strict: false });
+          const key = forge.pki.privateKeyFromAsn1(iPkcs8);
+          logger.info('[parseKey] inner manual → PKCS#8: OK');
+          return key;
+        } catch (eManual) {
+          logger.warn(`[parseKey] inner manual: ${eManual.message?.slice(0, 120)}`);
+        }
+
         throw new Error('BER PKCS#7: no se pudo descifrar el inner key con ningún método');
 
       } else {

@@ -301,6 +301,17 @@ const parseKey = async (keyBuf, password) => {
 
         const sdCh = readBerChildren(sdItem.value);
         logger.info(`[parseKey] BER PKCS#7 SignedData hijos=${sdCh.length} tags=[${sdCh.map(c => '0x' + c.tag.toString(16)).join(',')}]`);
+        sdCh.forEach((c, i) => logger.info(`[parseKey] sdCh[${i}] tag=0x${c.tag.toString(16)} size=${c.value.length}B first8=${c.value.slice(0,8).toString('hex')}`));
+
+        // Explorar sdCh[3] = [0] IMPLICIT (certificates en PKCS#7 estándar, pero SAT podría
+        // meter la llave cifrada aquí en vez de en el contentInfo)
+        const sdA0 = sdCh.find(c => c.tag === 0xa0);
+        if (sdA0) {
+          logger.info(`[parseKey] sdCh[0] (tag=0xa0): ${sdA0.value.length}B first8=${sdA0.value.slice(0,8).toString('hex')}`);
+          const a0Ch = readBerChildren(sdA0.value);
+          logger.info(`[parseKey] sdCh[0] hijos=${a0Ch.length} tags=[${a0Ch.map(c => '0x' + c.tag.toString(16)).join(',')}] sizes=[${a0Ch.map(c => c.value.length).join(',')}]`);
+          a0Ch.forEach((c, i) => logger.info(`[parseKey] sdCh[0][${i}] first16=${c.value.slice(0,16).toString('hex')}`));
+        }
 
         // Buscar ContentInfo: primer SEQUENCE cuyo primer hijo sea un OID
         let innerKeyBuf = null;
@@ -337,12 +348,42 @@ const parseKey = async (keyBuf, password) => {
           if (innerKeyBuf) break;
         }
 
-        // Log diagnóstico de sdCh[3] ([0] certificates) y sdCh[4] (signerInfos)
-        // La llave cifrada puede estar ahí si el contentInfo solo contiene el CSR
-        const sd3 = sdCh.find(c => c.tag === 0xa0);
-        const sd4 = sdCh.find(c => c.tag === 0x31 && sdCh.indexOf(c) > 1); // segundo SET (signerInfos)
-        if (sd3) logger.info(`[parseKey] BER PKCS#7 sdCh[a0 certs]: ${sd3.value.length}B primeros8=${sd3.value.slice(0,8).toString('hex')}`);
-        if (sd4) logger.info(`[parseKey] BER PKCS#7 sdCh[31 signers]: ${sd4.value.length}B primeros8=${sd4.value.slice(0,8).toString('hex')}`);
+        // ── Buscar llave en SignerInfo.unauthenticatedAttributes [1] ─────────────
+        // El contentInfo solo tiene el CSR. La llave cifrada puede estar en el
+        // campo unauthenticatedAttributes (tag=0xa1) dentro del primer SignerInfo.
+        const sd4 = sdCh.find((c, i) => c.tag === 0x31 && i > 1);
+        if (sd4) {
+          const siItem = readBerItem(sd4.value, 0);
+          if (siItem && (siItem.tag & 0x1f) === 0x10) {
+            const siCh = readBerChildren(siItem.value);
+            logger.info(`[parseKey] SignerInfo hijos: ${siCh.length} tags=[${siCh.map(c => '0x' + c.tag.toString(16)).join(',')}] sizes=[${siCh.map(c => c.value.length).join(',')}]`);
+            // unauthenticatedAttributes [1] = tag 0xa1
+            const unauth = siCh.find(c => c.tag === 0xa1);
+            if (unauth) {
+              logger.info(`[parseKey] SignerInfo unauthAttr: ${unauth.value.length}B primeros8=${unauth.value.slice(0,8).toString('hex')}`);
+              // Los atributos son SEQUENCE { OID, SET { value } }
+              const attrs = readBerChildren(unauth.value);
+              for (const attr of attrs) {
+                const attrCh = readBerChildren(attr.value);
+                const oid = attrCh[0]?.tag === 0x06
+                  ? forge.asn1.derToOid(attrCh[0].value.toString('binary')) : null;
+                const valEl = attrCh[1]; // SET
+                const innerEl = valEl ? readBerItem(valEl.value, 0) : null;
+                logger.info(`[parseKey] SignerInfo attr OID=${oid} valTag=0x${(innerEl?.tag ?? 0).toString(16)} valLen=${innerEl?.value?.length} val8=${innerEl?.value?.slice(0,8)?.toString('hex')}`);
+                if (innerEl?.value?.length > 100) {
+                  // Candidato a llave cifrada — intentar descifrar
+                  innerKeyBuf = innerEl.value;
+                  logger.info('[parseKey] usando unauthAttr value como candidato a llave');
+                }
+              }
+            }
+            // También examinar encryptedDigest (OCTET STRING, penúltimo elemento)
+            const encDigest = siCh.find(c => c.tag === 0x04);
+            if (encDigest) {
+              logger.info(`[parseKey] SignerInfo encryptedDigest: ${encDigest.value.length}B primeros8=${encDigest.value.slice(0,8).toString('hex')}`);
+            }
+          }
+        }
 
         if (!innerKeyBuf) throw new Error('BER PKCS#7: no se pudo extraer inner content del SignedData');
         logger.info(`[parseKey] BER PKCS#7 inner: ${innerKeyBuf.length}B primeros4=${innerKeyBuf.slice(0, 4).toString('hex')}`);

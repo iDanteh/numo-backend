@@ -245,6 +245,8 @@ const testKey = asyncHandler(async (req, res) => {
   }
 
   const { autenticar } = require('../sat/auth');
+  logger.info(`[testKey] cerBuffer: ${creds.cerBuffer.length}B first8=${creds.cerBuffer.slice(0,8).toString('hex')}`);
+  logger.info(`[testKey] keyBuffer: ${creds.keyBuffer.length}B first8=${creds.keyBuffer.slice(0,8).toString('hex')}`);
   try {
     const { token, rfcCertificado } = await autenticar(
       creds.cerBuffer,

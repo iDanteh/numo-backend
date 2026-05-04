@@ -8,7 +8,7 @@ const {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
-  getLimitesEstado, getHistory, getUltimoErp,
+  getLimitesEstado, getHistory, getUltimoErp, testKey,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -70,5 +70,8 @@ router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
 router.get('/historial',                     authenticate, getHistory);
 router.get('/historial/:rfc',                authenticate, getHistory);
 router.get('/ultimo-erp',                    authenticate, getUltimoErp);
+
+// ── Prueba de credenciales (no elimina las credenciales al finalizar) ─────────
+router.post('/test-key/:rfc', authenticate, permit('visor:sat'), testKey);
 
 module.exports = router;

@@ -233,6 +233,34 @@ const registerCredentials = asyncHandler(async (req, res) => {
 });
 
 /**
+ * POST /api/sat/test-key/:rfc
+ * Prueba parseKey + autenticación SAT SIN eliminar las credenciales al final.
+ * Solo para uso interno/pruebas. No usar en producción con flujos reales.
+ */
+const testKey = asyncHandler(async (req, res) => {
+  const rfc = req.params.rfc.toUpperCase().trim();
+  const creds = await obtener(rfc);
+  if (!creds) {
+    return res.status(404).json({ ok: false, error: 'No hay credenciales para este RFC' });
+  }
+
+  const { autenticar } = require('../sat/auth');
+  try {
+    const { token, rfcCertificado } = await autenticar(
+      creds.cerBuffer,
+      creds.keyBuffer,
+      creds.passwordBuffer,
+    );
+    // Credenciales NO se eliminan — solo se limpian los buffers en memoria
+    limpiarBuffers(creds);
+    res.json({ ok: true, rfcCertificado, tokenPreview: token.slice(0, 40) + '...' });
+  } catch (err) {
+    limpiarBuffers(creds);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+/**
  * GET /api/sat/credenciales/estado/:rfc
  */
 const getCredentialStatus = asyncHandler(async (req, res) => {
@@ -471,5 +499,5 @@ module.exports = {
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp,
-  cleanupActiveJobs,
+  cleanupActiveJobs, testKey,
 };

@@ -38,6 +38,10 @@ const scheduleRoutes         = require('./visor/routes/schedule');
 
 const app = express();
 
+// Confiar en el proxy inverso (nginx) para leer X-Forwarded-For correctamente.
+// Sin esto, express-rate-limit lanza ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set('trust proxy', 1);
+
 // ── Security ──────────────────────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({

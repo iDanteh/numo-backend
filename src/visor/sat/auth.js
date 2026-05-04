@@ -317,9 +317,23 @@ const parseKey = async (keyBuf, password) => {
 
           if (ciOid === '1.2.840.113549.1.7.1') {
             // data: [0] { OCTET STRING { keyBytes } }
-            const rawEl = contentEl.tag === 0xa0 ? readBerItem(contentEl.value, 0) : contentEl;
-            innerKeyBuf = (rawEl && rawEl.tag === 0x04) ? rawEl.value
-              : (contentEl.tag === 0xa0 ? contentEl.value : contentEl.value);
+            // El OCTET STRING puede ser:
+            //   0x04 — primitivo: el valor ES la llave directamente
+            //   0x24 — construido BER: concatenar los OCTET STRINGs internos
+            const wrapEl = contentEl.tag === 0xa0 ? readBerItem(contentEl.value, 0) : contentEl;
+            logger.info(`[parseKey] BER PKCS#7 wrapEl: tag=0x${(wrapEl?.tag ?? 0).toString(16)} len=${wrapEl?.value?.length}`);
+            if (wrapEl && wrapEl.tag === 0x04) {
+              innerKeyBuf = wrapEl.value;
+            } else if (wrapEl && wrapEl.tag === 0x24) {
+              // Construido BER: concatenar los OCTET STRINGs internos
+              const parts = readBerChildren(wrapEl.value);
+              const octetParts = parts.filter(p => p.tag === 0x04 || p.tag === 0x24);
+              innerKeyBuf = octetParts.length
+                ? Buffer.concat(octetParts.map(p => p.value))
+                : wrapEl.value;
+            } else {
+              innerKeyBuf = wrapEl ? wrapEl.value : contentEl.value;
+            }
           } else {
             // encryptedData u otro: extraer el valor del [0] tal cual
             innerKeyBuf = contentEl.tag === 0xa0 ? contentEl.value : contentEl.value;

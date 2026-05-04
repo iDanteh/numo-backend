@@ -317,67 +317,32 @@ const parseKey = async (keyBuf, password) => {
 
           if (ciOid === '1.2.840.113549.1.7.1') {
             // data: [0] { OCTET STRING { keyBytes } }
-            // El OCTET STRING puede ser:
-            //   0x04 — primitivo: el valor ES la llave directamente
-            //   0x24 — construido BER: puede contener MÚLTIPLES estructuras concatenadas
-            //          (ej. CSR + EncryptedPrivateKeyInfo). Probar cada parte individual.
+            // El OCTET STRING puede ser primitivo (0x04) o construido BER (0x24)
             const wrapEl = contentEl.tag === 0xa0 ? readBerItem(contentEl.value, 0) : contentEl;
             logger.info(`[parseKey] BER PKCS#7 wrapEl: tag=0x${(wrapEl?.tag ?? 0).toString(16)} len=${wrapEl?.value?.length}`);
             if (wrapEl && wrapEl.tag === 0x04) {
               innerKeyBuf = wrapEl.value;
             } else if (wrapEl && wrapEl.tag === 0x24) {
-              // Construido BER: recopilar partes individuales (no concatenar)
               const parts = readBerChildren(wrapEl.value);
               const octetParts = parts.filter(p => p.tag === 0x04 || p.tag === 0x24);
-              logger.info(`[parseKey] BER PKCS#7 octetParts: ${octetParts.length} partes sizes=[${octetParts.map(p => p.value.length).join(',')}]`);
-              if (octetParts.length === 1) {
-                // Una sola parte: puede tener múltiples estructuras DER concatenadas
-                innerKeyBuf = octetParts[0].value;
-              } else if (octetParts.length > 1) {
-                // Múltiples partes: la llave cifrada probablemente es la última o segunda
-                // Guardar todas como candidatos; se probarán en el bloque de descifrado
-                innerKeyBuf = Buffer.concat(octetParts.map(p => p.value)); // fallback concat
-                // Sobrescribir con cada parte hasta encontrar la que se puede descifrar:
-                for (const part of octetParts) {
-                  const firstItem = readBerItem(part.value, 0);
-                  // Si empieza con SEQUENCE que tiene SEQUENCE como primer hijo → PKCS#8 EncryptedPKI
-                  if (firstItem && (firstItem.tag & 0x1f) === 0x10) {
-                    const subCh = readBerChildren(firstItem.value);
-                    if (subCh.length >= 2 && (subCh[0].tag === 0x30 || subCh[0].tag === 0x06)) {
-                      innerKeyBuf = part.value;
-                      break;
-                    }
-                  }
-                }
-              } else {
-                innerKeyBuf = wrapEl.value;
-              }
+              innerKeyBuf = octetParts.length
+                ? Buffer.concat(octetParts.map(p => p.value))
+                : wrapEl.value;
             } else {
               innerKeyBuf = wrapEl ? wrapEl.value : contentEl.value;
             }
-            // Si innerKeyBuf tiene múltiples estructuras DER concatenadas, extraer la 2ª+
-            if (innerKeyBuf) {
-              const firstStruct = readBerItem(innerKeyBuf, 0);
-              if (firstStruct && firstStruct.totalEnd < innerKeyBuf.length) {
-                const remainder = innerKeyBuf.slice(firstStruct.totalEnd);
-                logger.info(`[parseKey] BER PKCS#7 remainder: ${remainder.length}B primeros4=${remainder.slice(0,4).toString('hex')}`);
-                // Preferir el remainder si parece PKCS#8 EncryptedPrivateKeyInfo
-                const remFirst = readBerItem(remainder, 0);
-                if (remFirst && (remFirst.tag & 0x1f) === 0x10) {
-                  const remCh = readBerChildren(remFirst.value);
-                  if (remCh.length >= 2 && (remCh[0].tag === 0x30 || remCh[0].tag === 0x06)) {
-                    innerKeyBuf = remainder;
-                    logger.info('[parseKey] BER PKCS#7 usando remainder como candidato a llave');
-                  }
-                }
-              }
-            }
           } else {
-            // encryptedData u otro: extraer el valor del [0] tal cual
             innerKeyBuf = contentEl.tag === 0xa0 ? contentEl.value : contentEl.value;
           }
           if (innerKeyBuf) break;
         }
+
+        // Log diagnóstico de sdCh[3] ([0] certificates) y sdCh[4] (signerInfos)
+        // La llave cifrada puede estar ahí si el contentInfo solo contiene el CSR
+        const sd3 = sdCh.find(c => c.tag === 0xa0);
+        const sd4 = sdCh.find(c => c.tag === 0x31 && sdCh.indexOf(c) > 1); // segundo SET (signerInfos)
+        if (sd3) logger.info(`[parseKey] BER PKCS#7 sdCh[a0 certs]: ${sd3.value.length}B primeros8=${sd3.value.slice(0,8).toString('hex')}`);
+        if (sd4) logger.info(`[parseKey] BER PKCS#7 sdCh[31 signers]: ${sd4.value.length}B primeros8=${sd4.value.slice(0,8).toString('hex')}`);
 
         if (!innerKeyBuf) throw new Error('BER PKCS#7: no se pudo extraer inner content del SignedData');
         logger.info(`[parseKey] BER PKCS#7 inner: ${innerKeyBuf.length}B primeros4=${innerKeyBuf.slice(0, 4).toString('hex')}`);
@@ -415,22 +380,43 @@ const parseKey = async (keyBuf, password) => {
           logger.warn(`[parseKey] PKCS#7 inner forge: ${eInner.message?.slice(0, 120)}`);
         }
 
-        // Intentar parsear innerKeyBuf directamente como llave no cifrada
+        // ── Intentos directos como llave sin cifrar ──────────────────────────────
+        // El innerKeyBuf puede ser PKCS#8 PrivateKeyInfo o PKCS#1 RSAPrivateKey sin cifrado.
+        // Probar con crypto.createPrivateKey (más robusto que forge para DER no estándar).
+        const directCandidates = [
+          { buf: innerKeyBuf, type: 'pkcs8',  label: 'inner pkcs8 sin cifrar' },
+          { buf: innerKeyBuf, type: 'pkcs1',  label: 'inner pkcs1 sin cifrar' },
+        ];
+        for (const { buf, type, label } of directCandidates) {
+          try {
+            const nk = crypto.createPrivateKey({ key: buf, format: 'der', type });
+            logger.info(`[parseKey] ${label}: OK`);
+            return forge.pki.privateKeyFromPem(nk.export({ type: 'pkcs1', format: 'pem' }));
+          } catch (eDirect) {
+            logger.info(`[parseKey] ${label}: ${eDirect.message?.slice(0, 80)}`);
+          }
+        }
+
+        // Intentar con forge (parse ASN.1 completo)
         try {
           const iAsn1Nc = forge.asn1.fromDer(forge.util.createBuffer(innerKeyBuf.toString('binary')), { strict: false });
           try {
             const key = forge.pki.privateKeyFromAsn1(iAsn1Nc);
-            logger.info('[parseKey] inner sin cifrar → PKCS#1: OK');
+            logger.info('[parseKey] inner forge PKCS#1: OK');
             return key;
           } catch (_) {}
-          if (iAsn1Nc.value?.[2]?.value) {
-            const rsa = forge.asn1.fromDer(forge.util.createBuffer(iAsn1Nc.value[2].value), { strict: false });
-            const key = forge.pki.privateKeyFromAsn1(rsa);
-            logger.info('[parseKey] inner sin cifrar → PKCS#8: OK');
-            return key;
+          // PKCS#8 PrivateKeyInfo: llave RSA dentro del OCTET STRING (índice 2)
+          for (let idx = 2; idx <= 3; idx++) {
+            if (!iAsn1Nc.value?.[idx]?.value) continue;
+            try {
+              const rsa = forge.asn1.fromDer(forge.util.createBuffer(iAsn1Nc.value[idx].value), { strict: false });
+              const key = forge.pki.privateKeyFromAsn1(rsa);
+              logger.info(`[parseKey] inner forge PKCS#8 [${idx}]: OK`);
+              return key;
+            } catch (_) {}
           }
         } catch (eNc) {
-          logger.info(`[parseKey] inner sin cifrar: ${eNc.message?.slice(0, 80)}`);
+          logger.info(`[parseKey] inner forge: ${eNc.message?.slice(0, 80)}`);
         }
 
         // Parser manual PBES1/PKCS12 sobre el inner (forge no soporta PKCS#12-PBE)
@@ -438,7 +424,24 @@ const parseKey = async (keyBuf, password) => {
           const iOuter = readBerItem(innerKeyBuf, 0);
           if (!iOuter || (iOuter.tag & 0x1f) !== 0x10) throw new Error('inner no es SEQUENCE');
           const iCh = readBerChildren(iOuter.value);
-          logger.info(`[parseKey] inner iCh: ${iCh.length} hijos tags=[${iCh.map(c => '0x' + c.tag.toString(16)).join(',')}] iCh0len=${iCh[0]?.value?.length} iCh0val=${iCh[0]?.value?.slice(0,8)?.toString('hex')}`);
+          logger.info(`[parseKey] inner iCh: ${iCh.length} hijos tags=[${iCh.map(c => '0x' + c.tag.toString(16)).join(',')}] sizes=[${iCh.map(c => c.value.length).join(',')}] iCh0val=${iCh[0]?.value?.slice(0,8)?.toString('hex')}`);
+
+          // Probar cada hijo como llave PKCS#1/PKCS#8 directamente
+          for (let ci = 0; ci < iCh.length; ci++) {
+            if ((iCh[ci].tag & 0x1f) !== 0x10 && iCh[ci].tag !== 0x03) continue;
+            const childBuf = iCh[ci].tag === 0x03
+              ? iCh[ci].value.slice(1)   // BIT STRING: saltar byte de bits-no-usados
+              : iCh[ci].value;
+            logger.info(`[parseKey] inner iCh[${ci}] val16=${childBuf.slice(0,16).toString('hex')}`);
+            for (const t of ['pkcs1', 'pkcs8']) {
+              try {
+                const nk = crypto.createPrivateKey({ key: childBuf, format: 'der', type: t });
+                logger.info(`[parseKey] inner iCh[${ci}] como ${t}: OK`);
+                return forge.pki.privateKeyFromPem(nk.export({ type: 'pkcs1', format: 'pem' }));
+              } catch (_) {}
+            }
+          }
+
           if (iCh.length < 2) throw new Error('inner SEQUENCE con < 2 hijos');
 
           let iAlgOid, iSalt, iIters, iEncData;

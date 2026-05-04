@@ -25,7 +25,7 @@ const SatRateLimit = require('../models/SatRateLimit');
  *    anteriores ya terminaron o se reanudaron.
  */
 
-const MAX_DIARIO  = 10; // Límite empírico conservador; la documentación oficial no especifica límite diario para WS
+const MAX_DIARIO  = 20; // Límite empírico conservador; la documentación oficial no especifica límite diario para WS
 const MAX_ACTIVOS = 3;
 
 // Map<rfc, { activas: number }> — solo activas en memoria (por instancia)

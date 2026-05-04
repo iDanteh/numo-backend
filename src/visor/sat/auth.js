@@ -377,17 +377,38 @@ const parseKey = async (keyBuf, password) => {
           logger.warn(`[parseKey] PKCS#7 inner forge: ${eInner.message?.slice(0, 120)}`);
         }
 
+        // Intentar parsear innerKeyBuf directamente como llave no cifrada
+        try {
+          const iAsn1Nc = forge.asn1.fromDer(forge.util.createBuffer(innerKeyBuf.toString('binary')), { strict: false });
+          try {
+            const key = forge.pki.privateKeyFromAsn1(iAsn1Nc);
+            logger.info('[parseKey] inner sin cifrar → PKCS#1: OK');
+            return key;
+          } catch (_) {}
+          if (iAsn1Nc.value?.[2]?.value) {
+            const rsa = forge.asn1.fromDer(forge.util.createBuffer(iAsn1Nc.value[2].value), { strict: false });
+            const key = forge.pki.privateKeyFromAsn1(rsa);
+            logger.info('[parseKey] inner sin cifrar → PKCS#8: OK');
+            return key;
+          }
+        } catch (eNc) {
+          logger.info(`[parseKey] inner sin cifrar: ${eNc.message?.slice(0, 80)}`);
+        }
+
         // Parser manual PBES1/PKCS12 sobre el inner (forge no soporta PKCS#12-PBE)
         try {
           const iOuter = readBerItem(innerKeyBuf, 0);
           if (!iOuter || (iOuter.tag & 0x1f) !== 0x10) throw new Error('inner no es SEQUENCE');
           const iCh = readBerChildren(iOuter.value);
+          logger.info(`[parseKey] inner iCh: ${iCh.length} hijos tags=[${iCh.map(c => '0x' + c.tag.toString(16)).join(',')}] iCh0len=${iCh[0]?.value?.length} iCh0val=${iCh[0]?.value?.slice(0,8)?.toString('hex')}`);
           if (iCh.length < 2) throw new Error('inner SEQUENCE con < 2 hijos');
 
           let iAlgOid, iSalt, iIters, iEncData;
           if (iCh[0].tag === 0x30) {
             // PKCS#8 EncryptedPrivateKeyInfo: SEQUENCE { AlgorithmIdentifier, OCTET STRING }
             const ai = readBerChildren(iCh[0].value);
+            logger.info(`[parseKey] inner ai: ${ai.length} tags=[${ai.map(c => '0x' + c.tag.toString(16)).join(',')}] ai0val=${ai[0]?.value?.slice(0,10)?.toString('hex')}`);
+            if (!ai.length || ai[0].tag !== 0x06) throw new Error(`inner AlgId inesperado: ai[0].tag=0x${(ai[0]?.tag ?? 0).toString(16)}`);
             iAlgOid = forge.asn1.derToOid(ai[0].value.toString('binary'));
             const prm = readBerChildren(ai[1].value);
             iSalt = prm[0].value; iIters = 0;

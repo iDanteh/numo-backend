@@ -305,17 +305,21 @@ const parseKey = async (keyBuf, password) => {
       // ── Formato SAT no-estándar ───────────────────────────────────────────
       // El OID de cifrado aparece directamente en el SEQUENCE exterior.
       algOid = forge.asn1.derToOid(first.value.toString('binary'));
+      logger.info(`[parseKey] BER hijo1: tag=0x06 OID=${algOid} pos=${pos}`);
 
       const second = readNextInOuter(); // params SEQUENCE: { salt, iterationCount }
       if (!second) throw new Error('BER: falta SEQUENCE de parámetros');
+      logger.info(`[parseKey] BER hijo2: tag=0x${second.tag.toString(16)} len=${second.value.length} val=${second.value.slice(0,20).toString('hex')} pos=${pos}`);
       const params = parseTLVsFromBuf(second.value);
       // params[0] = OCTET STRING (salt), params[1] = INTEGER (iterationCount)
       salt  = params[0].value;
       iters = 0;
       for (let i = 0; i < params[1].value.length; i++) iters = (iters << 8) | params[1].value[i];
 
+      logger.info(`[parseKey] BER pos antes de hijo3=${pos} bytes=${bin.slice(pos,pos+4).toString('hex')}`);
       const third = readNextInOuter(); // OCTET STRING con datos cifrados
       if (!third) throw new Error('BER: falta OCTET STRING de datos cifrados');
+      logger.info(`[parseKey] BER hijo3: tag=0x${third.tag.toString(16)} len=${third.value.length}`);
       encData = third.value;
 
     } else if (first.tag === 0x30) {

@@ -2,7 +2,7 @@ const { validationResult } = require('express-validator');
 const { verifyCFDIWithSAT } = require('../services/satVerification');
 const { procesarDescarga } = require('../jobs/satSyncJob');
 const { resolverPeriodo } = require('../services/periodoFiscal.service');
-const { guardar, tieneCredenciales, obtener, eliminar, limpiarBuffers } = require('../sat/credenciales');
+const { guardar, tieneCredenciales, obtener, eliminar, limpiarBuffers, actualizarKey } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin, getEstado } = require('../sat/rateLimiter');
 const Comparison = require('../models/Comparison');
 const CFDI = require('../models/CFDI');
@@ -230,6 +230,26 @@ const registerCredentials = asyncHandler(async (req, res) => {
     expiraEn:  new Date(Date.now() + ttlSegundos * 1000).toISOString(),
     aviso:     'Los archivos nunca se almacenan en el servidor. Solo se guarda la versión cifrada.',
   });
+});
+
+/**
+ * PATCH /api/sat/credenciales/key/:rfc
+ * Reemplaza solo el archivo .key sin tocar el .cer ni la contraseña existentes.
+ */
+const patchKey = asyncHandler(async (req, res) => {
+  const rfc     = req.params.rfc.toUpperCase().trim();
+  const keyFile = req.files?.key?.[0];
+
+  if (!keyFile) return res.status(400).json({ error: 'Archivo .key requerido' });
+
+  if (!RFC_REGEX.test(rfc))
+    return res.status(400).json({ error: 'Formato de RFC inválido' });
+
+  await actualizarKey(rfc, keyFile.buffer.toString('base64'));
+  keyFile.buffer.fill(0);
+
+  logger.info(`[SAT] Llave privada actualizada para RFC ${rfc}`);
+  res.json({ message: 'Llave actualizada correctamente', rfc });
 });
 
 /**

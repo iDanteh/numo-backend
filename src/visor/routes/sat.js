@@ -6,7 +6,7 @@ const { body } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   verify, verifyBatch, getStatus,
-  registerCredentials, getCredentialStatus,
+  registerCredentials, getCredentialStatus, patchKey,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, testKey,
 } = require('../controllers/sat.controller');
@@ -46,7 +46,13 @@ router.post('/credenciales',
   registerCredentials,
 );
 
-router.get('/credenciales/estado/:rfc', authenticate, getCredentialStatus);
+router.get('/credenciales/estado/:rfc',   authenticate, getCredentialStatus);
+router.patch('/credenciales/key/:rfc',
+  authenticate,
+  permit('visor:sat'),
+  credUpload.fields([{ name: 'key', maxCount: 1 }]),
+  patchKey,
+);
 
 // ── Descarga masiva ───────────────────────────────────────────────────────────
 router.post('/descarga-manual',

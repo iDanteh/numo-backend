@@ -26,14 +26,16 @@ const comparisonSchema = new mongoose.Schema({
   status: {
     type: String,
     enum: [
-      'match',        // Sin diferencias
-      'discrepancy',  // Diferencias críticas encontradas
-      'warning',      // Solo advertencias (sin diferencias críticas)
-      'not_in_sat',   // UUID no encontrado en SAT
-      'not_in_erp',   // En SAT pero no en ERP
-      'cancelled',    // Cancelado en SAT
-      'pending',      // Pendiente de verificar
-      'error',        // Error al consultar SAT
+      'match',                // Sin diferencias
+      'match_cancelled',      // Coincide en ambos lados y SAT confirma cancelación
+      'discrepancy',          // Diferencias críticas encontradas
+      'warning',              // Solo advertencias (sin diferencias críticas)
+      'not_in_sat',           // UUID no encontrado en SAT
+      'not_in_erp',           // En SAT pero no en ERP
+      'cancelled',            // Cancelado en SAT (sin copia ERP activa)
+      'cancelled_not_in_erp', // Cancelado en SAT y no existe en ERP
+      'pending',              // Pendiente de verificar
+      'error',                // Error al consultar SAT
     ],
     required: true,
     index: true,

@@ -218,40 +218,128 @@ const parseKey = async (keyBuf, password) => {
     logger.warn(`[parseKey] native crypto (BER→DER): ${e3b.message?.slice(0, 120)}`);
   }
 
-  // Intento 4: descifrado manual PBES1 / PKCS#12-PBE / PBES2
+  // Intento 4: descifrado manual con parser BER nativo.
   //
-  // Las llaves SAT usan un formato no-estándar donde el OID de cifrado aparece
-  // directamente en el SEQUENCE exterior (sin el wrapper AlgorithmIdentifier).
-  // Estructura SAT:   SEQUENCE { OID, params_SEQUENCE, OCTET_STRING(datos cifrados) }
-  // Estructura std:   SEQUENCE { SEQUENCE { OID, params }, OCTET_STRING }
+  // forge.asn1.fromDer(strict:false) NO soporta longitud indefinida BER (30 80)
+  // que usan las llaves .key del SAT. Este parser lee el Buffer byte a byte.
+  //
+  // Estructura SAT no-estándar:  SEQUENCE { OID, params_SEQUENCE, OCTET_STRING }
+  // Estructura std (PKCS#8):     SEQUENCE { SEQUENCE { OID, params }, OCTET_STRING }
   //
   // Se soportan:
   //   PBES1  — pbeWithMD5AndDES-CBC, pbeWithSHA1AndDES-CBC  (PKCS#5 §6.1)
   //   PKCS12 — pbeWithSHAAnd3-KeyTripleDES-CBC, pbeWithSHAAnd2-KeyTripleDES-CBC
-  //   PBES2  — PBKDF2 + 3DES-CBC  (fallback para llaves modernas)
   try {
-    const outer = forge.asn1.fromDer(forge.util.createBuffer(bin.toString('binary')), { strict: false });
+    // ── Parser BER TLV ────────────────────────────────────────────────────────
+    let pos = 0;
 
-    // Detectar si el primer elemento del SEQUENCE exterior es OID (formato SAT no-std)
-    // o SEQUENCE (formato estándar EncryptedPrivateKeyInfo)
-    let algOid, algParams, encData;
-    if (outer.value[0].type === forge.asn1.Type.OID) {
-      // Formato SAT no-estándar: OID directo en el SEQUENCE exterior
-      algOid    = forge.asn1.derToOid(outer.value[0].value);
-      algParams = outer.value[1];
-      encData   = Buffer.from(outer.value[2].value, 'binary');
+    const readLen = () => {
+      const b = bin[pos++];
+      if (b === 0x80) return -1;                      // BER indefinite
+      if (b & 0x80) {
+        let l = 0, n = b & 0x7f;
+        while (n--) l = (l << 8) | bin[pos++];
+        return l;
+      }
+      return b;
+    };
+
+    // Lee un TLV del buffer principal.
+    // Longitud indefinida: escanea hasta el terminador EOC (00 00).
+    const readTLV = () => {
+      const tag = bin[pos++];
+      const len = readLen();
+      if (len === -1) {
+        const start = pos;
+        while (pos < bin.length - 1 && !(bin[pos] === 0x00 && bin[pos + 1] === 0x00)) pos++;
+        const value = bin.slice(start, pos);
+        pos += 2; // saltar 00 00 EOC
+        return { tag, value };
+      }
+      const value = bin.slice(pos, pos + len);
+      pos += len;
+      return { tag, value };
+    };
+
+    // Parsea todos los TLVs de un Buffer local (para sub-SEQUENCEs con longitud definida)
+    const parseTLVsFromBuf = (buf) => {
+      let p = 0;
+      const items = [];
+      while (p < buf.length) {
+        const tag = buf[p++];
+        const lb  = buf[p++];
+        let len;
+        if (lb & 0x80) {
+          len = 0;
+          let n = lb & 0x7f;
+          while (n--) len = (len << 8) | buf[p++];
+        } else {
+          len = lb;
+        }
+        items.push({ tag, value: buf.slice(p, p + len) });
+        p += len;
+      }
+      return items;
+    };
+
+    // Leer el SEQUENCE exterior (puede ser 30 80 BER o 30 xx DER)
+    const outerSeqTag = bin[pos++];
+    if ((outerSeqTag & 0x1f) !== 0x10) {
+      throw new Error(`BER: se esperaba SEQUENCE (0x30), recibido 0x${outerSeqTag.toString(16)}`);
+    }
+    const outerLen = readLen();
+    const outerEnd = outerLen === -1 ? -1 : pos + outerLen;
+
+    const readNextInOuter = () => {
+      if (outerEnd !== -1 && pos >= outerEnd) return null;
+      if (outerEnd === -1 && bin[pos] === 0x00 && bin[pos + 1] === 0x00) { pos += 2; return null; }
+      return readTLV();
+    };
+
+    const first = readNextInOuter();
+    if (!first) throw new Error('BER: SEQUENCE exterior vacío');
+
+    let algOid, salt, iters, encData;
+
+    if (first.tag === 0x06) {
+      // ── Formato SAT no-estándar ───────────────────────────────────────────
+      // El OID de cifrado aparece directamente en el SEQUENCE exterior.
+      algOid = forge.asn1.derToOid(first.value.toString('binary'));
+
+      const second = readNextInOuter(); // params SEQUENCE: { salt, iterationCount }
+      if (!second) throw new Error('BER: falta SEQUENCE de parámetros');
+      const params = parseTLVsFromBuf(second.value);
+      // params[0] = OCTET STRING (salt), params[1] = INTEGER (iterationCount)
+      salt  = params[0].value;
+      iters = 0;
+      for (let i = 0; i < params[1].value.length; i++) iters = (iters << 8) | params[1].value[i];
+
+      const third = readNextInOuter(); // OCTET STRING con datos cifrados
+      if (!third) throw new Error('BER: falta OCTET STRING de datos cifrados');
+      encData = third.value;
+
+    } else if (first.tag === 0x30) {
+      // ── Formato estándar EncryptedPrivateKeyInfo ──────────────────────────
+      // first.value = AlgorithmIdentifier SEQUENCE { OID, params }
+      const ai = parseTLVsFromBuf(first.value);
+      algOid = forge.asn1.derToOid(ai[0].value.toString('binary'));
+      const params = parseTLVsFromBuf(ai[1].value);
+      salt  = params[0].value;
+      iters = 0;
+      for (let i = 0; i < params[1].value.length; i++) iters = (iters << 8) | params[1].value[i];
+
+      const second = readNextInOuter(); // OCTET STRING con datos cifrados
+      if (!second) throw new Error('BER: falta OCTET STRING de datos cifrados (std)');
+      encData = second.value;
+
     } else {
-      // Formato estándar: AlgorithmIdentifier SEQUENCE como primer elemento
-      algOid    = forge.asn1.derToOid(outer.value[0].value[0].value);
-      algParams = outer.value[0].value[1];
-      encData   = Buffer.from(outer.value[1].value, 'binary');
+      throw new Error(`BER: elemento inesperado en SEQUENCE exterior: tag=0x${first.tag.toString(16)}`);
     }
 
-    logger.info(`[parseKey] Manual: OID=${algOid}`);
+    logger.info(`[parseKey] Manual BER: OID=${algOid} salt=${salt.toString('hex')} iters=${iters} encData=${encData.length}B`);
 
-    // ── Mapa PBES1 (PKCS#5 §6.1) ────────────────────────────────────────────
-    // Derivación PBKDF1: T1 = H(pwd_utf8 || salt), Ti = H(T_{i-1})
-    // key = dk[0:kLen], iv = dk[kLen:kLen+8]
+    // ── Mapa PBES1 (PKCS#5 §6.1) ─────────────────────────────────────────────
+    // PBKDF1: dk = H^n(password_utf8 || salt),  key=dk[0:kLen], iv=dk[kLen:kLen+8]
     const PBES1 = {
       '1.2.840.113549.1.5.3':  { hash: 'md5',  cipher: 'des-cbc', kLen: 8 },
       '1.2.840.113549.1.5.6':  { hash: 'md5',  cipher: 'rc2-cbc', kLen: 5 },
@@ -259,72 +347,56 @@ const parseKey = async (keyBuf, password) => {
       '1.2.840.113549.1.5.11': { hash: 'sha1', cipher: 'rc2-cbc', kLen: 5 },
     };
 
-    // ── Mapa PKCS#12 PBE (RFC 7292 Apéndice B, derivación SHA1) ─────────────
+    // ── Mapa PKCS#12 PBE (RFC 7292 Apéndice B, derivación SHA1) ──────────────
     const PKCS12 = {
       '1.2.840.113549.1.12.1.3': { cipher: 'des-ede3-cbc', kLen: 24, ivLen: 8 },
       '1.2.840.113549.1.12.1.4': { cipher: 'des-ede-cbc',  kLen: 16, ivLen: 8 },
     };
 
-    const salt    = Buffer.from(algParams.value[0].value, 'binary');
-    const iterBuf = algParams.value[1].value;
-    let iters = 0;
-    for (let i = 0; i < iterBuf.length; i++) iters = (iters << 8) | (iterBuf.charCodeAt(i) & 0xff);
-
     let decrypted;
 
     if (PBES1[algOid]) {
       const { hash, cipher, kLen } = PBES1[algOid];
-      // PBKDF1
+      if (iters < 1) throw new Error(`PBES1: iters inválido (${iters})`);
+      if (salt.length < 1) throw new Error('PBES1: salt vacío');
       let dk = Buffer.concat([Buffer.from(password, 'utf8'), salt]);
       for (let i = 0; i < iters; i++) dk = crypto.createHash(hash).update(dk).digest();
       const decipher = crypto.createDecipheriv(cipher, dk.slice(0, kLen), dk.slice(kLen, kLen + 8));
       decrypted = Buffer.concat([decipher.update(encData), decipher.final()]);
-      logger.info(`[parseKey] Manual PBES1/${hash}/${cipher}: OK`);
+      logger.info(`[parseKey] Manual BER PBES1/${hash}/${cipher}: OK — decrypt[0:10]=${decrypted.slice(0, 10).toString('hex')}`);
 
     } else if (PKCS12[algOid]) {
       const { cipher, kLen, ivLen } = PKCS12[algOid];
-      const saltBin = salt.toString('binary');
+      const saltBin    = salt.toString('binary');
       const kForgeBuf  = forge.pkcs12.generateKey(password, saltBin, 1, iters, kLen,  forge.md.sha1.create());
       const ivForgeBuf = forge.pkcs12.generateKey(password, saltBin, 2, iters, ivLen, forge.md.sha1.create());
-      const kBuf  = Buffer.from(kForgeBuf.getBytes(),  'binary');
+      const kBuf  = Buffer.from(kForgeBuf.getBytes(), 'binary');
       const ivBuf = Buffer.from(ivForgeBuf.getBytes(), 'binary');
       const decipher = crypto.createDecipheriv(cipher, kBuf, ivBuf);
       decrypted = Buffer.concat([decipher.update(encData), decipher.final()]);
-      logger.info(`[parseKey] Manual PKCS12-PBE/${cipher}: OK`);
-
-    } else if (algOid === '1.2.840.113549.1.5.13') {
-      // PBES2 — re-navega la estructura correcta (algParams ya es PBES2-params)
-      const pbkdf2Par = algParams.value[0].value[1];
-      const encScheme = algParams.value[1];
-      const saltP2    = Buffer.from(pbkdf2Par.value[0].value, 'binary');
-      const iterBufP2 = pbkdf2Par.value[1].value;
-      let itersP2 = 0;
-      for (let i = 0; i < iterBufP2.length; i++) itersP2 = (itersP2 << 8) | (iterBufP2.charCodeAt(i) & 0xff);
-      const iv  = Buffer.from(encScheme.value[1].value, 'binary');
-      const dk  = crypto.pbkdf2Sync(password, saltP2, itersP2, 24, 'sha1');
-      const dec = crypto.createDecipheriv('des-ede3-cbc', dk, iv);
-      decrypted = Buffer.concat([dec.update(encData), dec.final()]);
-      logger.info('[parseKey] Manual PBES2/PBKDF2/3DES: OK');
+      logger.info(`[parseKey] Manual BER PKCS12-PBE/${cipher}: OK`);
 
     } else {
       throw new Error(`OID de cifrado no soportado en fallback manual: ${algOid}`);
     }
 
-    const innerAsn1 = forge.asn1.fromDer(forge.util.createBuffer(decrypted.toString('binary')), { strict: false });
+    const innerAsn1 = forge.asn1.fromDer(
+      forge.util.createBuffer(decrypted.toString('binary')), { strict: false },
+    );
 
-    // Intentar PKCS#1 RSAPrivateKey
+    // Intentar PKCS#1 RSAPrivateKey directamente
     try {
       const key = forge.pki.privateKeyFromAsn1(innerAsn1);
-      logger.info('[parseKey] Manual → PKCS#1: OK');
+      logger.info('[parseKey] Manual BER → PKCS#1: OK');
       return key;
-    } catch (_) { /* no es PKCS#1, intentar PKCS#8 PrivateKeyInfo */ }
+    } catch (_) { /* no es PKCS#1, intentar como PKCS#8 PrivateKeyInfo */ }
 
-    // PKCS#8 PrivateKeyInfo: extraer la llave del campo bitString interno
+    // PKCS#8 PrivateKeyInfo: la llave RSA está dentro del OCTET STRING (índice 2)
     const pkcs8Inner = forge.asn1.fromDer(
       forge.util.createBuffer(innerAsn1.value[2].value), { strict: false },
     );
     const key = forge.pki.privateKeyFromAsn1(pkcs8Inner);
-    logger.info('[parseKey] Manual → PKCS#8 inner: OK');
+    logger.info('[parseKey] Manual BER → PKCS#8 inner: OK');
     return key;
 
   } catch (e4) {

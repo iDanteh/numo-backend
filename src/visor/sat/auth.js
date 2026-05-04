@@ -102,6 +102,23 @@ const parseCer = (cerBuf) => {
 };
 
 /**
+ * Normaliza BER (longitudes indefinidas `30 80`) a DER re-serializando con forge.
+ * crypto.createPrivateKey y otras APIs requieren DER estricto y rechazan BER con
+ * "wrong tag". forge.asn1.fromDer(strict:false) tolera BER; toDer produce DER limpio.
+ *
+ * @param {Buffer} bin
+ * @returns {Buffer|null}
+ */
+const berToDer = (bin) => {
+  try {
+    const a = forge.asn1.fromDer(forge.util.createBuffer(bin.toString('binary')), { strict: false });
+    return Buffer.from(forge.asn1.toDer(a).getBytes(), 'binary');
+  } catch (_) {
+    return null;
+  }
+};
+
+/**
  * Parsea y descifra un buffer DER de llave privada .key del SAT.
  *
  * @param {Buffer} keyBuf
@@ -137,17 +154,22 @@ const parseKey = async (keyBuf, password) => {
     fs.writeFileSync(tmpFile, bin, { mode: 0o600 });
 
     const opensslVariants = [
+      // Sin proveedor: funciona en OpenSSL 1.x y 3.x para PBES2
       ['pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt'],
-      ['pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt', '-legacy'],
+      // OpenSSL 3.x: -legacy NO es un flag de pkcs8; el proveedor legacy se carga así
+      // Necesario para PBES1 (pbeWithMD5AndDES-CBC, pbeWithSHA1And3DES, etc.) que usa el SAT
+      ['pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt', '-provider', 'legacy', '-provider', 'default'],
+      // pkey es más general que pkcs8 y acepta los mismos proveedores
+      ['pkey', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-provider', 'legacy', '-provider', 'default'],
     ];
     for (const args of opensslVariants) {
-      const isLegacy = args.includes('-legacy');
+      const label = args.filter(a => !a.startsWith('-') || a === args[0]).slice(0, 2).join(' ');
       const result = await opensslAsync(args);
       if (result.status === 0 && result.stdout?.length > 0) {
-        logger.info(`[parseKey] openssl ${isLegacy ? 'pkcs8 -legacy' : 'pkcs8'}: OK`);
+        logger.info(`[parseKey] openssl ${label}: OK`);
         return forge.pki.privateKeyFromPem(result.stdout.toString());
       }
-      logger.warn(`[parseKey] openssl ${isLegacy ? 'pkcs8 -legacy' : 'pkcs8'} falló: ${result.stderr?.toString()?.trim()?.slice(0, 120)}`);
+      logger.warn(`[parseKey] openssl ${label} falló: ${result.stderr?.toString()?.trim()?.slice(0, 120)}`);
     }
   } catch (e1) {
     logger.warn(`[parseKey] openssl pkcs8: ${e1.message?.slice(0, 120)}`);
@@ -155,9 +177,12 @@ const parseKey = async (keyBuf, password) => {
     try { fs.unlinkSync(tmpFile); } catch { /* ya fue borrado o nunca se creó */ }
   }
 
-  // Intento 2: decryptPrivateKeyInfo (PKCS#8 estándar — fallback)
+  // Intento 2: forge decryptPrivateKeyInfo con BER → DER normalizado.
+  // forge.asn1.fromDer(strict:false) acepta BER pero decryptPrivateKeyInfo necesita
+  // DER bien formado; re-serializamos para obtener longitudes definidas.
   try {
-    const forgeBuf = forge.util.createBuffer(bin.toString('binary'));
+    const derBin   = berToDer(bin) ?? bin;
+    const forgeBuf = forge.util.createBuffer(derBin.toString('binary'));
     const asn1     = forge.asn1.fromDer(forgeBuf, { strict: false });
     const keyInfo  = forge.pki.decryptPrivateKeyInfo(asn1, password);
     if (!keyInfo) throw new Error('Contraseña incorrecta');
@@ -167,7 +192,7 @@ const parseKey = async (keyBuf, password) => {
     logger.warn(`[parseKey] PKCS#8 forge: ${e2.message?.slice(0, 120)}`);
   }
 
-  // Intento 3: crypto nativo vía OpenSSL
+  // Intento 3: crypto nativo vía OpenSSL (raw — falla en BER)
   try {
     const nativeKey = crypto.createPrivateKey({
       key: bin, format: 'der', type: 'pkcs8', passphrase: password,
@@ -178,47 +203,130 @@ const parseKey = async (keyBuf, password) => {
     logger.warn(`[parseKey] native crypto: ${e3.message?.slice(0, 120)}`);
   }
 
-  // Intento 4: descifrado manual PBES2/PBKDF2/3DES-CBC
-  // El SAT cifra RSAPrivateKey (PKCS#1) dentro del wrapper EncryptedPrivateKeyInfo
-  // en lugar del PrivateKeyInfo (PKCS#8) estándar. Esto hace que openssl y native
-  // crypto fallen con "wrong tag" aunque la contraseña sea correcta.
+  // Intento 3b: native crypto con BER → DER normalizado.
+  // Node arranca con --openssl-legacy-provider → crypto.createPrivateKey soporta PBES1.
+  // El único motivo por el que fallaba antes era el BER indefinido ("wrong tag").
   try {
-    const outer     = forge.asn1.fromDer(forge.util.createBuffer(bin.toString('binary')), { strict: false });
-    const pbes2     = outer.value[0].value[1];
-    const pbkdf2Par = pbes2.value[0].value[1];
-    const encScheme = pbes2.value[1];
+    const derBin = berToDer(bin);
+    if (!derBin) throw new Error('berToDer falló');
+    const nativeKey = crypto.createPrivateKey({
+      key: derBin, format: 'der', type: 'pkcs8', passphrase: password,
+    });
+    logger.info('[parseKey] native crypto (BER→DER): OK');
+    return forge.pki.privateKeyFromPem(nativeKey.export({ type: 'pkcs1', format: 'pem' }));
+  } catch (e3b) {
+    logger.warn(`[parseKey] native crypto (BER→DER): ${e3b.message?.slice(0, 120)}`);
+  }
 
-    const salt    = Buffer.from(pbkdf2Par.value[0].value, 'binary');
-    const iterStr = pbkdf2Par.value[1].value;
+  // Intento 4: descifrado manual PBES1 / PKCS#12-PBE / PBES2
+  //
+  // Las llaves SAT usan un formato no-estándar donde el OID de cifrado aparece
+  // directamente en el SEQUENCE exterior (sin el wrapper AlgorithmIdentifier).
+  // Estructura SAT:   SEQUENCE { OID, params_SEQUENCE, OCTET_STRING(datos cifrados) }
+  // Estructura std:   SEQUENCE { SEQUENCE { OID, params }, OCTET_STRING }
+  //
+  // Se soportan:
+  //   PBES1  — pbeWithMD5AndDES-CBC, pbeWithSHA1AndDES-CBC  (PKCS#5 §6.1)
+  //   PKCS12 — pbeWithSHAAnd3-KeyTripleDES-CBC, pbeWithSHAAnd2-KeyTripleDES-CBC
+  //   PBES2  — PBKDF2 + 3DES-CBC  (fallback para llaves modernas)
+  try {
+    const outer = forge.asn1.fromDer(forge.util.createBuffer(bin.toString('binary')), { strict: false });
+
+    // Detectar si el primer elemento del SEQUENCE exterior es OID (formato SAT no-std)
+    // o SEQUENCE (formato estándar EncryptedPrivateKeyInfo)
+    let algOid, algParams, encData;
+    if (outer.value[0].type === forge.asn1.Type.OID) {
+      // Formato SAT no-estándar: OID directo en el SEQUENCE exterior
+      algOid    = forge.asn1.derToOid(outer.value[0].value);
+      algParams = outer.value[1];
+      encData   = Buffer.from(outer.value[2].value, 'binary');
+    } else {
+      // Formato estándar: AlgorithmIdentifier SEQUENCE como primer elemento
+      algOid    = forge.asn1.derToOid(outer.value[0].value[0].value);
+      algParams = outer.value[0].value[1];
+      encData   = Buffer.from(outer.value[1].value, 'binary');
+    }
+
+    logger.info(`[parseKey] Manual: OID=${algOid}`);
+
+    // ── Mapa PBES1 (PKCS#5 §6.1) ────────────────────────────────────────────
+    // Derivación PBKDF1: T1 = H(pwd_utf8 || salt), Ti = H(T_{i-1})
+    // key = dk[0:kLen], iv = dk[kLen:kLen+8]
+    const PBES1 = {
+      '1.2.840.113549.1.5.3':  { hash: 'md5',  cipher: 'des-cbc', kLen: 8 },
+      '1.2.840.113549.1.5.6':  { hash: 'md5',  cipher: 'rc2-cbc', kLen: 5 },
+      '1.2.840.113549.1.5.10': { hash: 'sha1', cipher: 'des-cbc', kLen: 8 },
+      '1.2.840.113549.1.5.11': { hash: 'sha1', cipher: 'rc2-cbc', kLen: 5 },
+    };
+
+    // ── Mapa PKCS#12 PBE (RFC 7292 Apéndice B, derivación SHA1) ─────────────
+    const PKCS12 = {
+      '1.2.840.113549.1.12.1.3': { cipher: 'des-ede3-cbc', kLen: 24, ivLen: 8 },
+      '1.2.840.113549.1.12.1.4': { cipher: 'des-ede-cbc',  kLen: 16, ivLen: 8 },
+    };
+
+    const salt    = Buffer.from(algParams.value[0].value, 'binary');
+    const iterBuf = algParams.value[1].value;
     let iters = 0;
-    for (let i = 0; i < iterStr.length; i++) iters = (iters << 8) | (iterStr.charCodeAt(i) & 0xff);
+    for (let i = 0; i < iterBuf.length; i++) iters = (iters << 8) | (iterBuf.charCodeAt(i) & 0xff);
 
-    const iv      = Buffer.from(encScheme.value[1].value, 'binary');
-    const encData = Buffer.from(outer.value[1].value, 'binary');
+    let decrypted;
 
-    // Derivar llave 3DES (24 bytes) con PBKDF2-HMAC-SHA1
-    const dk = crypto.pbkdf2Sync(password, salt, iters, 24, 'sha1');
+    if (PBES1[algOid]) {
+      const { hash, cipher, kLen } = PBES1[algOid];
+      // PBKDF1
+      let dk = Buffer.concat([Buffer.from(password, 'utf8'), salt]);
+      for (let i = 0; i < iters; i++) dk = crypto.createHash(hash).update(dk).digest();
+      const decipher = crypto.createDecipheriv(cipher, dk.slice(0, kLen), dk.slice(kLen, kLen + 8));
+      decrypted = Buffer.concat([decipher.update(encData), decipher.final()]);
+      logger.info(`[parseKey] Manual PBES1/${hash}/${cipher}: OK`);
 
-    // Descifrar 3DES-CBC (lanza si contraseña incorrecta — padding inválido)
-    const decipher  = crypto.createDecipheriv('des-ede3-cbc', dk, iv);
-    const decrypted = Buffer.concat([decipher.update(encData), decipher.final()]);
+    } else if (PKCS12[algOid]) {
+      const { cipher, kLen, ivLen } = PKCS12[algOid];
+      const saltBin = salt.toString('binary');
+      const kForgeBuf  = forge.pkcs12.generateKey(password, saltBin, 1, iters, kLen,  forge.md.sha1.create());
+      const ivForgeBuf = forge.pkcs12.generateKey(password, saltBin, 2, iters, ivLen, forge.md.sha1.create());
+      const kBuf  = Buffer.from(kForgeBuf.getBytes(),  'binary');
+      const ivBuf = Buffer.from(ivForgeBuf.getBytes(), 'binary');
+      const decipher = crypto.createDecipheriv(cipher, kBuf, ivBuf);
+      decrypted = Buffer.concat([decipher.update(encData), decipher.final()]);
+      logger.info(`[parseKey] Manual PKCS12-PBE/${cipher}: OK`);
+
+    } else if (algOid === '1.2.840.113549.1.5.13') {
+      // PBES2 — re-navega la estructura correcta (algParams ya es PBES2-params)
+      const pbkdf2Par = algParams.value[0].value[1];
+      const encScheme = algParams.value[1];
+      const saltP2    = Buffer.from(pbkdf2Par.value[0].value, 'binary');
+      const iterBufP2 = pbkdf2Par.value[1].value;
+      let itersP2 = 0;
+      for (let i = 0; i < iterBufP2.length; i++) itersP2 = (itersP2 << 8) | (iterBufP2.charCodeAt(i) & 0xff);
+      const iv  = Buffer.from(encScheme.value[1].value, 'binary');
+      const dk  = crypto.pbkdf2Sync(password, saltP2, itersP2, 24, 'sha1');
+      const dec = crypto.createDecipheriv('des-ede3-cbc', dk, iv);
+      decrypted = Buffer.concat([dec.update(encData), dec.final()]);
+      logger.info('[parseKey] Manual PBES2/PBKDF2/3DES: OK');
+
+    } else {
+      throw new Error(`OID de cifrado no soportado en fallback manual: ${algOid}`);
+    }
 
     const innerAsn1 = forge.asn1.fromDer(forge.util.createBuffer(decrypted.toString('binary')), { strict: false });
 
-    // Intentar PKCS#1 RSAPrivateKey — formato no-estándar que usa el SAT
+    // Intentar PKCS#1 RSAPrivateKey
     try {
       const key = forge.pki.privateKeyFromAsn1(innerAsn1);
-      logger.info('[parseKey] Manual PBES2/PBKDF2/3DES → PKCS#1: OK');
+      logger.info('[parseKey] Manual → PKCS#1: OK');
       return key;
-    } catch (_) { /* no es PKCS#1, intentar PKCS#8 */ }
+    } catch (_) { /* no es PKCS#1, intentar PKCS#8 PrivateKeyInfo */ }
 
-    // Intentar PKCS#8 PrivateKeyInfo — extraer la llave interna
+    // PKCS#8 PrivateKeyInfo: extraer la llave del campo bitString interno
     const pkcs8Inner = forge.asn1.fromDer(
       forge.util.createBuffer(innerAsn1.value[2].value), { strict: false },
     );
     const key = forge.pki.privateKeyFromAsn1(pkcs8Inner);
-    logger.info('[parseKey] Manual PBES2/PBKDF2/3DES → PKCS#8 inner: OK');
+    logger.info('[parseKey] Manual → PKCS#8 inner: OK');
     return key;
+
   } catch (e4) {
     logger.error(`[parseKey] todos los intentos fallaron: ${e4.message?.slice(0, 200)}`);
     throw new Error('No se pudo parsear la llave privada: ' + e4.message);

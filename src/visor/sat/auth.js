@@ -153,6 +153,10 @@ const parseKey = async (keyBuf, password) => {
   try {
     fs.writeFileSync(tmpFile, bin, { mode: 0o600 });
 
+    // ── Diagnóstico: dump ASN.1 completo del buffer real almacenado ───────────
+    const asn1Dump = await opensslAsync(['asn1parse', '-inform', 'DER', '-in', tmpFile]);
+    logger.info(`[parseKey] asn1parse (${bin.length}B):\n${(asn1Dump.stdout?.toString() || asn1Dump.stderr?.toString() || 'sin output').slice(0, 800)}`);
+
     const opensslVariants = [
       // Sin proveedor: funciona en OpenSSL 1.x y 3.x para PBES2
       ['pkcs8', '-inform', 'DER', '-in', tmpFile, '-passin', `pass:${password}`, '-nocrypt'],

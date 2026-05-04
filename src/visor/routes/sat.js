@@ -6,9 +6,9 @@ const { body } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   verify, verifyBatch, getStatus,
-  registerCredentials, getCredentialStatus,
+  registerCredentials, getCredentialStatus, patchKey,
   startDownload, getDownloadStatus,
-  getLimitesEstado, getHistory, getUltimoErp,
+  getLimitesEstado, getHistory, getUltimoErp, testKey,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -46,7 +46,13 @@ router.post('/credenciales',
   registerCredentials,
 );
 
-router.get('/credenciales/estado/:rfc', authenticate, getCredentialStatus);
+router.get('/credenciales/estado/:rfc',   authenticate, getCredentialStatus);
+router.patch('/credenciales/key/:rfc',
+  authenticate,
+  permit('visor:sat'),
+  credUpload.fields([{ name: 'key', maxCount: 1 }]),
+  patchKey,
+);
 
 // ── Descarga masiva ───────────────────────────────────────────────────────────
 router.post('/descarga-manual',
@@ -70,5 +76,8 @@ router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
 router.get('/historial',                     authenticate, getHistory);
 router.get('/historial/:rfc',                authenticate, getHistory);
 router.get('/ultimo-erp',                    authenticate, getUltimoErp);
+
+// ── Prueba de credenciales (no elimina las credenciales al finalizar) ─────────
+router.post('/test-key/:rfc', authenticate, permit('visor:sat'), testKey);
 
 module.exports = router;

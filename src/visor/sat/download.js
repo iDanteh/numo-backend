@@ -569,7 +569,8 @@ const parsearMetadataTxt = (contenido) => {
   if (lineas.length < 2) return [];
 
   const sep     = lineas[0].includes('|') ? '|' : lineas[0].includes('~') ? '~' : '\t';
-  const limpiar = str => str.replace(/^"|"$/g, '').trim();
+  const limpiar     = str => str.replace(/^"|"$/g, '').trim();
+  const parseMonto  = str => { const s = (str || '').replace(/,/g, '').trim(); return parseFloat(s) || 0; };
 
   const normalizarClave = (nombre) => {
     const n = nombre.toLowerCase()
@@ -585,20 +586,26 @@ const parsearMetadataTxt = (contenido) => {
     if (n.includes('fecha') && n.includes('emision'))            return 'fecha';
     if (n.includes('fecha') && n.includes('certific'))           return 'fechaCert';
     if (n.includes('pac'))                                       return 'rfcPac';
-    if (n === 'total')                                           return 'total';
+    if (n === 'total' || n === 'monto' || n === 'monto total' ||
+        n === 'total del cfdi' || n.startsWith('monto') || n.startsWith('total'))
+                                                                 return 'total';
     if (n.includes('efecto'))                                    return 'efecto';
     if (n.includes('estado'))                                    return 'estado';
     if (n.includes('fecha') && n.includes('cancel'))             return 'fechaCancelacion';
     return n.replace(/\s+/g, '_');
   };
 
-  const claves = lineas[0].split(sep).map(h => normalizarClave(limpiar(h)));
+  const clavesRaw = lineas[0].split(sep).map(h => limpiar(h));
+  const claves    = clavesRaw.map(normalizarClave);
+  logger.info(`[parsearMetadataTxt] headers raw: ${JSON.stringify(clavesRaw)}`);
+  logger.info(`[parsearMetadataTxt] headers norm: ${JSON.stringify(claves)}`);
 
   const registros = [];
   for (let i = 1; i < lineas.length; i++) {
     const campos = lineas[i].split(sep).map(limpiar);
     const obj    = {};
     claves.forEach((clave, idx) => { obj[clave] = campos[idx] ?? ''; });
+    if (obj.total !== undefined) obj.total = parseMonto(obj.total);
     if (obj.uuid) registros.push(obj);
   }
   return registros;

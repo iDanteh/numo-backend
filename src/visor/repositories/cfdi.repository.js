@@ -24,6 +24,9 @@ const prepararSetData = (cfdiData) => {
   if (setData.fileHash == null) {
     delete setData.fileHash; // campo ausente = no indexado por el índice parcial
   }
+  // ejercicio/periodo se manejan en $setOnInsert para no sobreescribir reclasificaciones
+  delete setData.ejercicio;
+  delete setData.periodo;
   return setData;
 };
 
@@ -32,8 +35,9 @@ const prepararSetData = (cfdiData) => {
  *
  * Clave única: { uuid, source: 'ERP' } — índice compuesto en el schema.
  *
- * Usa $set (NO reemplazo) para preservar campos como isActive que no vienen
- * del ERP. $setOnInsert garantiza isActive:true en documentos nuevos.
+ * Usa $set (NO reemplazo) para preservar campos como isActive, lastComparisonStatus
+ * y reclasificaciones (ejercicio/periodo) que no deben sobreescribirse en re-cargas.
+ * $setOnInsert aplica ejercicio/periodo y isActive solo en documentos nuevos.
  *
  * @param {object} cfdiData  — Documento transformado por erp-transformer
  * @returns {Promise<{ isNew: boolean, isDuplicate: boolean }>}
@@ -46,7 +50,7 @@ const upsertFromERP = async (cfdiData) => {
       { uuid: cfdiData.uuid, source: 'ERP' },
       {
         $set:         setData,
-        $setOnInsert: { isActive: true },
+        $setOnInsert: { isActive: true, ejercicio: cfdiData.ejercicio, periodo: cfdiData.periodo },
       },
       { upsert: true, new: false },
     );

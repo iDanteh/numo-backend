@@ -222,4 +222,21 @@ const tieneCredenciales = async (rfc) => {
   return { tiene: ttlSegundos > 0, ttlSegundos };
 };
 
-module.exports = { guardar, obtener, eliminar, limpiarBuffers, tieneCredenciales };
+/**
+ * Reemplaza solo la llave privada (.key) sin tocar el .cer ni la contraseña.
+ * @param {string} rfc
+ * @param {string} keyB64  — contenido del .key en base64
+ */
+const actualizarKey = async (rfc, keyB64) => {
+  const rfcNorm = rfc.toUpperCase().trim();
+  const doc = await SATCredencial.findOne({ rfc: rfcNorm });
+  if (!doc) throw new Error(`No hay credenciales para RFC ${rfcNorm}`);
+  const keyCifrado = cifrar(keyB64);
+  await SATCredencial.findOneAndUpdate(
+    { rfc: rfcNorm },
+    { keyCifrado },
+  );
+  logger.info(`[Credenciales] Llave actualizada para RFC: ${rfcNorm}`);
+};
+
+module.exports = { guardar, obtener, eliminar, limpiarBuffers, tieneCredenciales, actualizarKey };

@@ -26,7 +26,7 @@ const listLimiter = rateLimit({
   }),
 });
 
-const xmlUpload   = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+const xmlUpload   = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
 const excelUpload = multer({
   storage:    multer.memoryStorage(),
   limits:     { fileSize: 20 * 1024 * 1024 },

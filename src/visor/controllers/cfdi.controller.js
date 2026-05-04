@@ -91,11 +91,18 @@ const list = asyncHandler(async (req, res) => {
   const lm = parseInt(limit);
 
   const filter = { isActive: true };
+  if (uuids && uuid) {
+    return res.status(400).json({
+      error: 'Los parámetros "uuids" y "uuid" son mutuamente excluyentes.',
+      code:  'INVALID_PARAMS',
+    });
+  }
   if (uuids) {
     const uuidList = uuids.split(',').map(u => u.trim().toUpperCase()).filter(Boolean);
     if (uuidList.length) filter.uuid = { $in: uuidList };
+  } else if (uuid) {
+    filter.uuid = { $regex: uuid.trim(), $options: 'i' };
   }
-  if (uuid) filter.uuid = { $regex: uuid.trim(), $options: 'i' };
   if (source) {
     const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };
@@ -222,7 +229,7 @@ const upload = asyncHandler(async (req, res) => {
   const ejercicio = req.body.ejercicio ? parseInt(req.body.ejercicio) : undefined;
   const periodo   = req.body.periodo   ? parseInt(req.body.periodo)   : undefined;
   let nuevos = 0, actualizados = 0;
-  const success = [], failed = [], duplicados = [];
+  const success = [], failed = [], duplicados = [], periodoIgnorado = [];
 
   for (const file of req.files) {
     for (const entry of extractEntries(file)) {
@@ -236,15 +243,31 @@ const upload = asyncHandler(async (req, res) => {
         if (['SAT', 'MANUAL'].includes(source) && !cfdiData.satStatus) {
           cfdiData.satStatus = 'Vigente';
         }
-        if (ejercicio) cfdiData.ejercicio = ejercicio;
-        if (periodo)   cfdiData.periodo   = periodo;
         const prev = await CFDI.findOneAndUpdate(
           { uuid: cfdiData.uuid, source },
-          { ...cfdiData, source, uploadedBy: req.user._id },
+          {
+            // ejercicio/periodo en $setOnInsert para preservar reclasificaciones previas
+            $set:         { ...cfdiData, source, uploadedBy: req.user._id },
+            $setOnInsert: { ejercicio: ejercicio ?? null, periodo: periodo ?? null },
+          },
           { upsert: true, new: false, setDefaultsOnInsert: true },
         );
         prev === null ? nuevos++ : actualizados++;
-        if (prev !== null) duplicados.push({ uuid: cfdiData.uuid, filename: entry.name });
+        if (prev !== null) {
+          duplicados.push({ uuid: cfdiData.uuid, filename: entry.name });
+          // Avisar si el usuario subió con un periodo diferente al almacenado
+          if (
+            ejercicio != null && periodo != null &&
+            (prev.ejercicio !== ejercicio || prev.periodo !== periodo)
+          ) {
+            periodoIgnorado.push({
+              uuid:             cfdiData.uuid,
+              filename:         entry.name,
+              periodoAlmacenado: { ejercicio: prev.ejercicio, periodo: prev.periodo },
+              periodoSolicitado: { ejercicio, periodo },
+            });
+          }
+        }
         success.push({
           uuid: cfdiData.uuid,
           filename: entry.name,
@@ -264,7 +287,8 @@ const upload = asyncHandler(async (req, res) => {
   res.status(207).json({
     message: `${procesados} CFDIs procesados (${nuevos} nuevos, ${actualizados} duplicados), ${failed.length} con error`,
     procesados, nuevos, actualizados, duplicados,
-    errores: failed, success, failed,
+    errores: failed, success,
+    ...(periodoIgnorado.length > 0 && { periodoIgnorado }),
   });
 
   // Reclasificación automática en background para facturas globales SAT/MANUAL
@@ -578,9 +602,14 @@ const importExcel = asyncHandler(async (req, res) => {
         }),
       };
 
+      // ejercicio/periodo solo en $setOnInsert para preservar reclasificaciones previas
+      const { ejercicio: _ej, periodo: _pe, ...cfdiSetData } = cfdiData;
       const prev = await CFDI.findOneAndUpdate(
         { uuid: cfdiData.uuid, source },
-        { ...cfdiData, uploadedBy: req.user._id },
+        {
+          $set:         { ...cfdiSetData, uploadedBy: req.user._id },
+          $setOnInsert: { ejercicio: _ej, periodo: _pe },
+        },
         { upsert: true, new: false, setDefaultsOnInsert: true },
       );
 
@@ -627,7 +656,7 @@ const create = asyncHandler(async (req, res) => {
 
   const cfdi = await CFDI.findOneAndUpdate(
     { uuid: req.body.uuid.toUpperCase(), source: 'ERP' },
-    { ...req.body, source: 'ERP', uploadedBy: req.user._id },
+    { $set: { ...req.body, source: 'ERP', uploadedBy: req.user._id } },
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
@@ -877,7 +906,8 @@ const exportExcel = asyncHandler(async (req, res) => {
   if (lastComparisonStatus) filter.lastComparisonStatus = lastComparisonStatus;
   if (search) filter.$text = { $search: search };
 
-  const cfdis = await CFDI.find(filter, { xmlContent: 0 }).sort({ fecha: -1 }).lean();
+  const MAX_EXPORT = 50_000;
+  const cfdis = await CFDI.find(filter, { xmlContent: 0 }).sort({ fecha: -1 }).limit(MAX_EXPORT).lean();
 
   const workbook = new ExcelJS.Workbook();
   const sheet    = workbook.addWorksheet('CFDIs');
@@ -950,6 +980,10 @@ const exportExcel = asyncHandler(async (req, res) => {
 
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', 'attachment; filename="cfdis.xlsx"');
+  if (cfdis.length === MAX_EXPORT) {
+    res.setHeader('X-Export-Truncated', 'true');
+    res.setHeader('X-Export-Limit', String(MAX_EXPORT));
+  }
   await workbook.xlsx.write(res);
   res.end();
 });
@@ -1074,7 +1108,7 @@ const migrarPeriodoBulk = asyncHandler(async (req, res) => {
   // 4. Actualizar en bulk (2 queries, sin N+1)
   if (uuidsMigrar.length > 0) {
     await CFDI.updateMany(
-      { uuid: { $in: uuidsMigrar } },
+      { uuid: { $in: uuidsMigrar }, isActive: true },
       { $set: { periodo: pe, ejercicio: ej } }
     );
     await Comparison.updateMany(
@@ -1195,7 +1229,7 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
 
   // Actualizar CFDI (ambos documentos SAT y ERP con mismo UUID si existen)
   await CFDI.updateMany(
-    { uuid: cfdi.uuid },
+    { uuid: cfdi.uuid, isActive: true },
     { $set: { periodo: pe, ejercicio: ej } },
   );
 

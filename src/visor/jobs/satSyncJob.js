@@ -17,6 +17,7 @@ const { derivarPeriodoDesdeFecha, resolverPeriodo, resolverOCrearPeriodo } = req
 const { logger } = require('../../shared/utils/logger');
 const SatDescargaLog = require('../models/SatDescargaLog');
 const { aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
+const { verifyCFDIWithSAT }      = require('../services/satVerification');
 const { fetchTodasLasFacturas } = require('../services/erp.service');
 const { transformarTolerante } = require('../services/erp-transformer.service');
 const { upsertFromERP } = require('../repositories/cfdi.repository');
@@ -35,18 +36,28 @@ const derivarFechasERP = (ejercicio, periodo) => {
 
 /**
  * Job nocturno de Descarga ERP.
- * Descarga automáticamente las facturas del ERP para el mes actual
- * y las persiste en MongoDB (mismo proceso que POST /api/erp/cargar).
+ * Descarga automáticamente las facturas del ERP para el mes indicado
+ * (o el mes actual si no se especifica) y las persiste en MongoDB.
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.ejercicioParam]  — Año fiscal; si se omite usa el mes actual CDMX.
+ * @param {number} [opts.periodoParam]    — Mes (1-12); si se omite usa el mes actual CDMX.
  */
-const ejecutarDescargaERP = async () => {
+const ejecutarDescargaERP = async ({ ejercicioParam, periodoParam } = {}) => {
   logger.info('[ERPSyncJob] Iniciando descarga automática ERP...');
 
-  // Periodo actual en hora de México
-  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
-  const hoyMX = fmtMX.format(new Date());
-  const [anoStr, mesStr] = hoyMX.split('-');
-  const ejercicio = parseInt(anoStr, 10);
-  const periodo   = parseInt(mesStr, 10);
+  let ejercicio, periodo;
+  if (ejercicioParam && periodoParam) {
+    ejercicio = ejercicioParam;
+    periodo   = periodoParam;
+  } else {
+    // Periodo actual en hora de México
+    const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const hoyMX = fmtMX.format(new Date());
+    const [anoStr, mesStr] = hoyMX.split('-');
+    ejercicio = parseInt(anoStr, 10);
+    periodo   = parseInt(mesStr, 10);
+  }
 
   // Crear log de inicio
   let logEntry = null;
@@ -151,16 +162,27 @@ const ejecutarDescargaERP = async () => {
 
 /**
  * Job nocturno de Comparación automática ERP vs SAT.
- * Compara todos los CFDIs ERP + SAT del periodo actual.
+ * Compara todos los CFDIs ERP + SAT del periodo indicado
+ * (o el mes actual si no se especifica).
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.ejercicioParam]  — Año fiscal; si se omite usa el mes actual CDMX.
+ * @param {number} [opts.periodoParam]    — Mes (1-12); si se omite usa el mes actual CDMX.
  */
-const ejecutarComparacionAuto = async () => {
+const ejecutarComparacionAuto = async ({ ejercicioParam, periodoParam } = {}) => {
   logger.info('[CompJobAuto] Iniciando comparación automática ERP vs SAT...');
 
-  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
-  const hoyMX = fmtMX.format(new Date());
-  const [anoStr, mesStr] = hoyMX.split('-');
-  const ejercicio = parseInt(anoStr, 10);
-  const periodo   = parseInt(mesStr, 10);
+  let ejercicio, periodo;
+  if (ejercicioParam && periodoParam) {
+    ejercicio = ejercicioParam;
+    periodo   = periodoParam;
+  } else {
+    const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const hoyMX = fmtMX.format(new Date());
+    const [anoStr, mesStr] = hoyMX.split('-');
+    ejercicio = parseInt(anoStr, 10);
+    periodo   = parseInt(mesStr, 10);
+  }
 
   try {
     const { creado } = await resolverOCrearPeriodo(ejercicio, periodo);
@@ -768,24 +790,26 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                 await CFDI.bulkWrite(registrosMeta.map(row => ({
                   updateOne: {
                     filter: { uuid: row.uuid.toUpperCase(), source: 'SAT' },
-                    update: { $set: {
-                      uuid:                 row.uuid.toUpperCase(),
-                      source:               'SAT',
-                      ejercicio,
-                      periodo,
-                      satStatus:            row.estado === 'Cancelado' ? 'Cancelado' : 'Vigente',
-                      isActive:             true,
-                      version:              '4.0',
-                      fecha:                new Date(row.fecha || ''),
-                      total:                parseFloat(row.total || '0') || 0,
-                      subTotal:             0,
-                      moneda:               'MXN',
-                      tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
-                      emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
-                      receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '' },
-                      lastComparisonStatus: 'not_in_erp',
-                      lastComparisonAt:     new Date(),
-                    }},
+                    update: {
+                      $set: {
+                        uuid:                 row.uuid.toUpperCase(),
+                        source:               'SAT',
+                        satStatus:            row.estado === 'Cancelado' ? 'Cancelado' : 'Vigente',
+                        isActive:             true,
+                        version:              '4.0',
+                        fecha:                new Date(row.fecha || ''),
+                        total:                parseFloat(row.total || '0') || 0,
+                        subTotal:             0,
+                        moneda:               'MXN',
+                        tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
+                        emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
+                        receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '' },
+                        lastComparisonStatus: 'not_in_erp',
+                        lastComparisonAt:     new Date(),
+                      },
+                      // ejercicio/periodo solo en inserción — preserva reclasificaciones previas
+                      $setOnInsert: { ejercicio, periodo },
+                    },
                     upsert: true,
                   },
                 })));
@@ -797,32 +821,34 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                 await CFDI.bulkWrite(cfdisNuevos.map(c => ({
                   updateOne: {
                     filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
-                    update: { $set: {
-                      uuid:                 c.uuid.toUpperCase(),
-                      source:               'SAT',
-                      ejercicio,
-                      periodo,
-                      satStatus:            'Vigente',
-                      isActive:             true,
-                      version:              c.version,
-                      serie:                c.serie,
-                      folio:                c.folio,
-                      fecha:                c.fecha,
-                      subTotal:             c.subTotal,
-                      total:                c.total,
-                      moneda:               c.moneda,
-                      tipoDeComprobante:    c.tipoDeComprobante,
-                      emisor:               c.emisor,
-                      receptor:             c.receptor,
-                      conceptos:            c.conceptos,
-                      impuestos:            c.impuestos,
-                      xmlContent:           c.xmlContent,
-                      xmlHash:              c.xmlHash,
-                      timbreFiscalDigital:  c.timbreFiscalDigital,
-                      complementoPago:      c.complementoPago,
-                      lastComparisonStatus: 'not_in_erp',
-                      lastComparisonAt:     new Date(),
-                    }},
+                    update: {
+                      $set: {
+                        uuid:                 c.uuid.toUpperCase(),
+                        source:               'SAT',
+                        satStatus:            'Vigente',
+                        isActive:             true,
+                        version:              c.version,
+                        serie:                c.serie,
+                        folio:                c.folio,
+                        fecha:                c.fecha,
+                        subTotal:             c.subTotal,
+                        total:                c.total,
+                        moneda:               c.moneda,
+                        tipoDeComprobante:    c.tipoDeComprobante,
+                        emisor:               c.emisor,
+                        receptor:             c.receptor,
+                        conceptos:            c.conceptos,
+                        impuestos:            c.impuestos,
+                        xmlContent:           c.xmlContent,
+                        xmlHash:              c.xmlHash,
+                        timbreFiscalDigital:  c.timbreFiscalDigital,
+                        complementoPago:      c.complementoPago,
+                        lastComparisonStatus: 'not_in_erp',
+                        lastComparisonAt:     new Date(),
+                      },
+                      // ejercicio/periodo solo en inserción — preserva reclasificaciones previas
+                      $setOnInsert: { ejercicio, periodo },
+                    },
                     upsert: true,
                   },
                 })));
@@ -965,11 +991,12 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
         update: { $set: { lastComparisonStatus: 'match', lastComparisonAt: ahora } },
       },
     })));
-    // SAT/MANUAL: sí sincronizar ejercicio/periodo con el de la descarga
+    // SAT/MANUAL: solo status — NO sobreescribir ejercicio/periodo porque
+    // aplicarReclasificacion ya corrigió el periodo de facturas globales antes de guardarResultados.
     await CFDI.bulkWrite(coinciden.map(cfdi => ({
       updateOne: {
         filter: { uuid: cfdi.uuid, source: { $in: ['SAT', 'MANUAL'] } },
-        update: { $set: { lastComparisonStatus: 'match', lastComparisonAt: ahora, ...fp } },
+        update: { $set: { lastComparisonStatus: 'match', lastComparisonAt: ahora } },
       },
     })));
   }
@@ -991,10 +1018,11 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
         upsert: true,
       },
     })));
+    // SAT/MANUAL: solo status — NO sobreescribir ejercicio/periodo (preservar reclasificaciones)
     await CFDI.bulkWrite(soloEnSAT.map(cfdi => ({
       updateOne: {
         filter: { uuid: cfdi.uuid, source: { $in: ['SAT', 'MANUAL'] } },
-        update: { $set: { lastComparisonStatus: 'not_in_erp', lastComparisonAt: ahora, ...fp } },
+        update: { $set: { lastComparisonStatus: 'not_in_erp', lastComparisonAt: ahora } },
       },
     })));
   }
@@ -1074,6 +1102,49 @@ const mapCampoToType = (campo) => {
 };
 
 // ── Tareas de verificación y descarga masiva (reprogramables dinámicamente) ───
+
+/**
+ * Verifica el estado SAT (Vigente/Cancelado) de los CFDIs ERP de un periodo concreto.
+ * Útil para meses anteriores donde el estado puede haber cambiado.
+ *
+ * @param {number} ejercicio
+ * @param {number} periodo
+ * @returns {Promise<{ verificados: number, errores: number }>}
+ */
+const ejecutarVerificacionPeriodo = async (ejercicio, periodo) => {
+  logger.info(`[VerifJob] Verificando estado SAT para ${ejercicio}/${periodo}...`);
+
+  const cfdis = await CFDI.find({
+    source: 'ERP', isActive: true, ejercicio, periodo,
+  }, '_id uuid emisor receptor total version sello timbreFiscalDigital tipoDeComprobante').lean();
+
+  logger.info(`[VerifJob] ${cfdis.length} CFDIs ERP para verificar en ${ejercicio}/${periodo}`);
+
+  let verificados = 0, errores = 0;
+  for (const cfdi of cfdis) {
+    try {
+      if (!cfdi.emisor?.rfc || !cfdi.receptor?.rfc) {
+        logger.warn(`[VerifJob] CFDI ${cfdi.uuid} sin emisor/receptor — omitido`);
+        errores++;
+        continue;
+      }
+      const sello  = cfdi.timbreFiscalDigital?.selloCFD || cfdi.sello || '';
+      const result = await verifyCFDIWithSAT(
+        cfdi.uuid, cfdi.emisor.rfc, cfdi.receptor.rfc,
+        cfdi.total, sello, cfdi.version || '4.0', cfdi.tipoDeComprobante,
+      );
+      await CFDI.updateMany({ uuid: cfdi.uuid }, { $set: { satStatus: result.state, satLastCheck: new Date() } });
+      verificados++;
+      await new Promise(r => setTimeout(r, 500)); // respetar rate SAT
+    } catch (err) {
+      errores++;
+      logger.error(`[VerifJob] Error verificando ${cfdi.uuid}: ${err.message}`);
+    }
+  }
+  logger.info(`[VerifJob] Completado: ${verificados} verificados, ${errores} errores`);
+  return { verificados, errores, total: cfdis.length };
+};
+
 const jobVerificacionSAT = async () => {
   logger.info('[SatSyncJob] Iniciando verificación de estado SAT...');
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -1111,10 +1182,21 @@ const jobDescargaMasiva = async () => {
 
 /**
  * Convierte "HH:MM" → expresión cron "MM HH * * *"
+ * Si el formato es inválido, usa 01:00 como fallback y loguea un error.
  */
 const horaACron = (hora) => {
-  const [hh, mm] = hora.split(':');
-  return `${parseInt(mm, 10)} ${parseInt(hh, 10)} * * *`;
+  const match = (hora ?? '').match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) {
+    logger.error(`[SatSyncJob] Formato de hora inválido: "${hora}" — usando 01:00 como fallback`);
+    return '0 1 * * *';
+  }
+  const hh = parseInt(match[1], 10);
+  const mm = parseInt(match[2], 10);
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+    logger.error(`[SatSyncJob] Hora fuera de rango: "${hora}" — usando 01:00 como fallback`);
+    return '0 1 * * *';
+  }
+  return `${mm} ${hh} * * *`;
 };
 
 // Instancias actuales de los jobs (para poder destruirlas y recrearlas)
@@ -1169,6 +1251,14 @@ const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVeri
   } catch {
     reprogramarJobs();
   }
+
+  // Restaurar programaciones de meses anteriores pendientes en BD
+  try {
+    const { restaurarProgramados } = require('../controllers/schedule.controller');
+    await restaurarProgramados();
+  } catch (err) {
+    logger.warn(`[Restore] No se pudieron restaurar programaciones: ${err.message}`);
+  }
 })();
 
-module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, procesarDescarga, reprogramarJobs };
+module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, procesarDescarga, reprogramarJobs };

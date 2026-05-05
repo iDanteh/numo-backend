@@ -799,10 +799,10 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   const periodoLabel  = ejercicio ? (periodo ? `${MESES[parseInt(periodo)-1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
 
   // ── FASE 1: Datos que no dependen de los UUIDs ERP ───────────────────────
-  const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, soloSat, resumenTipos, resumenSAT, cfdisMigrados] = await Promise.all([
+  const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, allSatForPeriod, resumenTipos, resumenSAT, cfdisMigrados] = await Promise.all([
 
-    // CFDIs ERP Timbrados — igual que montosAggregate del dashboard
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: 'Timbrado', ...periodoFilter })
+    // CFDIs ERP Timbrados/Habilitados — igual que montosAggregate del dashboard
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, lastComparisonStatus: 1, fecha: -1 })
       .lean(),
@@ -825,8 +825,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
-    // CFDIs SAT/MANUAL sin contraparte ERP
-    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...periodoFilter })
+    // Todos los CFDIs SAT/MANUAL del periodo — se filtrará por UUID contra ERP en fase 2
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus ejercicio periodo source')
       .sort({ tipoDeComprobante: 1, total: -1 })
       .lean(),
@@ -881,6 +881,14 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
   // ── FASE 2: Queries que usan los UUIDs de los CFDIs ERP del periodo ────────
   const erpUuids = allErpCfdis.map(c => c.uuid).filter(Boolean);
+
+  // CFDIs SAT/MANUAL sin contraparte ERP (por UUID) — no depende de lastComparisonStatus
+  const erpUuidSet = new Set(erpUuids.map(u => (u || '').toUpperCase()));
+  const soloSat = allSatForPeriod.filter(c => !erpUuidSet.has((c.uuid || '').toUpperCase()));
+
+  // Status mismatches: ERP activo pero SAT Cancelado / ERP cancelado pero SAT Vigente
+  const satCanceladoErpActivo = allErpCfdis.filter(c => c.satStatus === 'Cancelado');
+  const erpCanceladoSatVigente = erpInactivoSatVigente; // alias semántico
 
   const [comparisonsRaw, allDiscrepancias] = await Promise.all([
     // Traer comparaciones más recientes por UUID con differences completo
@@ -1409,6 +1417,61 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const satByUuidDesh = {};
     for (const s of satDeshDocs) satByUuidDesh[(s.uuid || '').toUpperCase()] = s;
     await addInactiveSheet(erpDeshabilitados, 'Deshabilitados', 'CFDIs Deshabilitados en ERP', FG_DESH, satByUuidDesh);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJA — Discrepancias de Estado (SAT Cancelado/ERP Activo y viceversa)
+  // ══════════════════════════════════════════════════════════════════════════
+  const totalMismatch = satCanceladoErpActivo.length + erpCanceladoSatVigente.length;
+  if (totalMismatch > 0) {
+    const sMis = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Mismatch Estado`);
+    sMis.views = [{ state: 'frozen', ySplit: 3 }];
+    const MIS_COLS = [
+      { key: 'tipo',       header: 'Tipo',           width: 7  },
+      { key: 'uuid',       header: 'UUID',           width: 38 },
+      { key: 'serie',      header: 'Serie',          width: 8  },
+      { key: 'folio',      header: 'Folio',          width: 10 },
+      { key: 'fecha',      header: 'Fecha',          width: 12 },
+      { key: 'rfcEmisor',  header: 'RFC Emisor',     width: 15 },
+      { key: 'rfcRec',     header: 'RFC Receptor',   width: 15 },
+      { key: 'total',      header: 'Total',          width: 16 },
+      { key: 'estadoERP',  header: 'Estado ERP',     width: 18 },
+      { key: 'estadoSAT',  header: 'Estado SAT',     width: 14 },
+      { key: 'discrepancia', header: 'Discrepancia', width: 30 },
+    ];
+    addTitle(sMis, `Discrepancias de Estado — ${periodoLabel}`, MIS_COLS.length);
+    sMis.columns = MIS_COLS;
+    const hdrMis = sMis.getRow(3);
+    hdrMis.values = MIS_COLS.map(c => c.header);
+    hdrMis.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
+    hdrMis.height = 28;
+
+    const FG_MIS_A = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDE8E8' } }; // rojo claro: SAT cancelado / ERP activo
+    const FG_MIS_B = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3CD' } }; // amarillo: ERP cancelado / SAT vigente
+
+    for (const c of satCanceladoErpActivo) {
+      const row = sMis.addRow({
+        tipo: c.tipoDeComprobante || '', uuid: c.uuid, serie: c.serie || '', folio: c.folio || '',
+        fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '',
+        rfcEmisor: c.emisor?.rfc || '', rfcRec: c.receptor?.rfc || '',
+        total: c.total || 0, estadoERP: c.erpStatus || '—', estadoSAT: c.satStatus || '—',
+        discrepancia: 'SAT Cancelado — ERP Activo',
+      });
+      row.getCell('total').numFmt = MXN;
+      row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_MIS_A; });
+    }
+
+    for (const c of erpCanceladoSatVigente) {
+      const row = sMis.addRow({
+        tipo: c.tipoDeComprobante || '', uuid: c.uuid, serie: c.serie || '', folio: c.folio || '',
+        fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '',
+        rfcEmisor: c.emisor?.rfc || '', rfcRec: c.receptor?.rfc || '',
+        total: c.total || 0, estadoERP: c.erpStatus || '—', estadoSAT: c.satStatus || '—',
+        discrepancia: `ERP ${c.erpStatus || 'Inactivo'} — SAT Vigente`,
+      });
+      row.getCell('total').numFmt = MXN;
+      row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_MIS_B; });
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════

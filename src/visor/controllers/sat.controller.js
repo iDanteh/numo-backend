@@ -10,6 +10,7 @@ const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { RFC_REGEX } = require('../utils/validators');
 const { logger } = require('../../shared/utils/logger');
 const SatDescargaLog = require('../models/SatDescargaLog');
+const AdmZip = require('adm-zip');
 
 /** Estado en memoria de jobs de descarga manual (jobId → estado). */
 const jobsManales = new Map();
@@ -516,10 +517,62 @@ const getUltimoErp = asyncHandler(async (req, res) => {
   res.json({ log: log || null });
 });
 
+/**
+ * GET /api/sat/export-xml?rfc=&ejercicio=&periodo=
+ * Descarga un ZIP con todos los XMLs SAT del mes indicado para el RFC.
+ */
+const exportXml = asyncHandler(async (req, res) => {
+  const { rfc, ejercicio, periodo } = req.query;
+  if (!rfc || !ejercicio || !periodo) {
+    return res.status(400).json({ error: 'rfc, ejercicio y periodo son requeridos' });
+  }
+  const rfcUpper = rfc.toUpperCase().trim();
+  const ej = parseInt(ejercicio, 10);
+  const pe = parseInt(periodo, 10);
+  if (isNaN(ej) || isNaN(pe) || pe < 1 || pe > 12) {
+    return res.status(400).json({ error: 'ejercicio o periodo inválido' });
+  }
+
+  const cfdis = await CFDI.find({
+    source: 'SAT',
+    ejercicio: ej,
+    periodo: pe,
+    'emisor.rfc': rfcUpper,
+    isActive: true,
+  }).select('+xmlContent').lean();
+
+  if (cfdis.length === 0) {
+    return res.status(404).json({ error: 'No hay CFDIs SAT para ese RFC y periodo' });
+  }
+
+  const zip = new AdmZip();
+  let count = 0;
+  for (const cfdi of cfdis) {
+    if (!cfdi.xmlContent) continue;
+    zip.addFile(`${cfdi.uuid}.xml`, Buffer.from(cfdi.xmlContent, 'utf-8'));
+    count++;
+  }
+
+  if (count === 0) {
+    return res.status(404).json({ error: 'Los CFDIs encontrados no tienen XML almacenado' });
+  }
+
+  const meses = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+  const mesLabel = meses[pe - 1] ?? `Mes${pe}`;
+  const zipName = `CFDIs_SAT_${rfcUpper}_${mesLabel}${ej}.zip`;
+  const buffer = zip.toBuffer();
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+  res.setHeader('Content-Length', buffer.length);
+  logger.info(`[exportXml] ZIP generado: ${zipName} (${count} XMLs, ${buffer.length}B)`);
+  res.send(buffer);
+});
+
 module.exports = {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp,
-  cleanupActiveJobs, testKey, patchKey,
+  cleanupActiveJobs, testKey, patchKey, exportXml,
 };

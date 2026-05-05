@@ -424,19 +424,44 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
     checkpoint.updatedAt &&
     (Date.now() - new Date(checkpoint.updatedAt).getTime()) < CHECKPOINT_MAX_AGE_MS;
 
+  // Flag: el checkpoint estaba en 'verificando' pero el SAT rechazó esa solicitud;
+  // hay que hacer una nueva solicitud pasando al bloque de nueva-solicitud con retry.
+  let rechazadaCheckpointVerif = false;
+
   if (checkpointVerificando) {
     logger.warn(`[SatSyncJob] Checkpoint ${tipoComprobante} quedó en 'verificando' — reanudando verificación de solicitud ${checkpoint.idSolicitud}`);
     let totalReportadoSAT = 0;
-    ({ idsPaquetes, totalCfdis: totalReportadoSAT } = await verificar(checkpoint.idSolicitud, rfc, creds));
-    logger.info(`[SatSyncJob] ${tipoComprobante}: ${idsPaquetes.length} paquete(s), ${totalReportadoSAT} CFDIs reportados por SAT`);
-    if (idsPaquetes.length === 0) {
-      await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', updatedAt: new Date() } });
-      return { rows: [], paquetes: 0, totalReportado: totalReportadoSAT, esMetadata };
+    try {
+      ({ idsPaquetes, totalCfdis: totalReportadoSAT } = await verificar(checkpoint.idSolicitud, rfc, creds));
+      logger.info(`[SatSyncJob] ${tipoComprobante}: ${idsPaquetes.length} paquete(s), ${totalReportadoSAT} CFDIs reportados por SAT`);
+      if (idsPaquetes.length === 0) {
+        await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', updatedAt: new Date() } });
+        return { rows: [], paquetes: 0, totalReportado: totalReportadoSAT, esMetadata };
+      }
+      await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idsPaquetes, totalReportadoSAT, status: 'descargando', updatedAt: new Date() } });
+      checkpoint.totalReportadoSAT = totalReportadoSAT;
+      idSolicitud = checkpoint.idSolicitud;
+    } catch (rechazadaErr) {
+      if (rechazadaErr.message.startsWith('SAT_RECHAZADA')) {
+        // La solicitud previa (guardada en el checkpoint) ya fue rechazada por el SAT.
+        // No tiene sentido re-verificarla — hay que hacer una solicitud nueva.
+        logger.warn(
+          `[SatSyncJob] Solicitud previa ${checkpoint.idSolicitud} (${tipoComprobante}) rechazada por SAT — ` +
+          `marcando checkpoint como error y solicitando de nuevo...`
+        );
+        await SatJobCheckpoint.updateOne(
+          { _id: checkpoint._id },
+          { $set: { status: 'error', idSolicitud: null, error: rechazadaErr.message, updatedAt: new Date() } }
+        ).catch(() => {});
+        rechazadaCheckpointVerif = true;
+      } else {
+        throw rechazadaErr;
+      }
     }
-    await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idsPaquetes, totalReportadoSAT, status: 'descargando', updatedAt: new Date() } });
-    checkpoint.totalReportadoSAT = totalReportadoSAT;
-    idSolicitud = checkpoint.idSolicitud;
-  } else if (checkpointVigente) {
+  }
+
+  if (!checkpointVerificando || rechazadaCheckpointVerif) {
+    if (checkpointVigente && !rechazadaCheckpointVerif) {
     idSolicitud = checkpoint.idSolicitud;
     // ── Re-verificar con el SAT para asegurar que tenemos TODOS los IDs de paquetes.
     // Protege contra checkpoints guardados con código anterior que extraía IDs incompletos,
@@ -518,6 +543,7 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
     }
     await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idsPaquetes, totalReportadoSAT: totalReportadoSATLocal, status: 'descargando', updatedAt: new Date() } });
     checkpoint.totalReportadoSAT = totalReportadoSATLocal;
+    }
   }
 
   // Recuperar totalReportadoSAT del checkpoint (ya actualizado arriba si es nueva solicitud)
@@ -890,8 +916,8 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
       // anterior antes de aceptar una nueva del mismo RFC.
       if (ti < tiposADescargar.length - 1) {
         const siguiente = tiposADescargar[ti + 1];
-        logger.info(`[SatSyncJob] Tipo ${tipoActual} completado. Cooldown 60s antes de solicitar ${siguiente}...`);
-        await new Promise(r => setTimeout(r, 60_000));
+        logger.info(`[SatSyncJob] Tipo ${tipoActual} completado. Cooldown 3min antes de solicitar ${siguiente}...`);
+        await new Promise(r => setTimeout(r, 3 * 60_000));
       }
     }
 
@@ -1248,7 +1274,8 @@ const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVeri
       erpVerificacion: map.erpVerificacion ?? '02:00',
       comparacion:     map.comparacion     ?? '04:00',
     });
-  } catch {
+  } catch (err) {
+    logger.error(`[SatSyncJob] No se pudo leer horario de BD al arrancar — usando defaults (01:00/03:00/02:00/04:00). Error: ${err.message}`);
     reprogramarJobs();
   }
 

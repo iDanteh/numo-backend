@@ -265,9 +265,41 @@ const cancelarProgramado = asyncHandler(async (req, res) => {
   res.json({ message: 'Programación cancelada' });
 });
 
+const actualizarProgramado = asyncHandler(async (req, res) => {
+  const doc = await ScheduledJob.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'Programación no encontrada' });
+  if (doc.estado !== 'pendiente')
+    return res.status(409).json({ error: 'Solo se puede editar una programación pendiente' });
+
+  const { hora } = req.body;
+  if (!TIME_RE.test(hora))
+    return res.status(400).json({ error: 'hora debe tener formato HH:MM (ej. 22:00)' });
+
+  // Cancelar el timeout anterior
+  const tidAnterior = _timeouts.get(req.params.id);
+  if (tidAnterior) clearTimeout(tidAnterior);
+
+  // Recalcular ejecutaEn con la nueva hora
+  const ahoraMs    = Date.now();
+  const hoyMX      = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+  const fakeMXNow  = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Mexico_City' }));
+  const mxOffsetMs = ahoraMs - fakeMXNow.getTime();
+  const targetFake = new Date(`${hoyMX}T${hora}:00`);
+  const objetivo   = new Date(targetFake.getTime() + mxOffsetMs);
+  if (objetivo.getTime() <= ahoraMs) objetivo.setDate(objetivo.getDate() + 1);
+  const delayMs = objetivo.getTime() - ahoraMs;
+
+  await ScheduledJob.findByIdAndUpdate(req.params.id, { hora, ejecutaEn: objetivo });
+
+  const tid = setTimeout(() => _ejecutarSecuencia(doc._id, doc.ejercicio, doc.periodo), delayMs);
+  _timeouts.set(req.params.id, tid);
+
+  res.json({ id: req.params.id, hora, ejecutaEn: objetivo.toISOString(), estado: 'pendiente' });
+});
+
 module.exports = {
   getSchedule, updateSchedule,
   runErp, runVerificacion, runComparacion, getLocks,
-  programarMes, getProgramados, cancelarProgramado,
+  programarMes, getProgramados, cancelarProgramado, actualizarProgramado,
   restaurarProgramados,
 };

@@ -8,7 +8,7 @@ const {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus, patchKey,
   startDownload, getDownloadStatus,
-  getLimitesEstado, getHistory, getUltimoErp, testKey,
+  getLimitesEstado, getHistory, getUltimoErp, testKey, exportXml,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -76,6 +76,9 @@ router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
 router.get('/historial',                     authenticate, getHistory);
 router.get('/historial/:rfc',                authenticate, getHistory);
 router.get('/ultimo-erp',                    authenticate, getUltimoErp);
+
+// ── Exportar XMLs SAT como ZIP ────────────────────────────────────────────────
+router.get('/export-xml', authenticate, permit('visor:sat'), exportXml);
 
 // ── Prueba de credenciales (no elimina las credenciales al finalizar) ─────────
 router.post('/test-key/:rfc', authenticate, permit('visor:sat'), testKey);

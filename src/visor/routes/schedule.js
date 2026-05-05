@@ -3,7 +3,7 @@
 const express = require('express');
 const { body } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
-const { getSchedule, updateSchedule, runErp, runVerificacion, runComparacion, getLocks, programarMes, getProgramados, cancelarProgramado } = require('../controllers/schedule.controller');
+const { getSchedule, updateSchedule, runErp, runVerificacion, runComparacion, getLocks, programarMes, getProgramados, cancelarProgramado, actualizarProgramado } = require('../controllers/schedule.controller');
 
 const router = express.Router();
 
@@ -28,5 +28,9 @@ router.post('/programar-mes',                 authenticate, permit('entities:wri
   programarMes,
 );
 router.delete('/programados/:id',             authenticate, permit('entities:write'), cancelarProgramado);
+router.patch('/programados/:id',              authenticate, permit('entities:write'),
+  body('hora').matches(/^([01]\d|2[0-3]):([0-5]\d)$/).withMessage('hora inválida (HH:MM)'),
+  actualizarProgramado,
+);
 
 module.exports = router;

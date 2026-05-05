@@ -112,10 +112,13 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: montosFilter },
       { $addFields: {
         sourceGroup: { $cond: { if: { $in: ['$source', ['SAT', 'MANUAL']] }, then: 'SAT', else: '$source' } },
-        // ERP: solo Timbrado; SAT/MANUAL: solo Vigente
+        // ERP: solo Timbrado o Habilitado con UUID real; SAT/MANUAL: solo Vigente
         excluir: { $cond: {
           if:   { $eq: ['$source', 'ERP'] },
-          then: { $ne: ['$erpStatus', 'Timbrado'] },
+          then: { $or: [
+            { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
+            { $regexMatch: { input: { $ifNull: ['$uuid', ''] }, regex: '^SINUUID', options: 'i' } },
+          ] },
           else: { $ne: ['$satStatus', 'Vigente'] },
         }},
       }},
@@ -162,7 +165,7 @@ const dashboard = asyncHandler(async (req, res) => {
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
-        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: 'Timbrado' },
+        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: { $in: ['Timbrado', 'Habilitado'] } },
         { source: { $in: ['SAT', 'MANUAL'] }, satStatus: 'Vigente' },
       ]}},
       {
@@ -181,7 +184,7 @@ const dashboard = asyncHandler(async (req, res) => {
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
-        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: 'Timbrado' },
+        { source: 'ERP',                      uuid: { $not: /^SINUUID/ }, erpStatus: { $in: ['Timbrado', 'Habilitado'] } },
         { source: { $in: ['SAT', 'MANUAL'] }, satStatus: 'Vigente' },
       ]}},
       {
@@ -830,7 +833,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
     // Resumen KPI ERP por tipo
     CFDI.aggregate([
-      { $match: { source: 'ERP', isActive: { $ne: false }, erpStatus: 'Timbrado', uuid: { $not: /^SINUUID/ }, ...periodoFilter } },
+      { $match: { source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter } },
       { $group: {
         _id:             '$tipoDeComprobante',
         count:           { $sum: 1 },

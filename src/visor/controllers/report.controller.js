@@ -825,8 +825,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
-    // Todos los CFDIs SAT/MANUAL del periodo — se filtrará por UUID contra ERP en fase 2
-    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, ...periodoFilter })
+    // CFDIs SAT/MANUAL sin contraparte ERP (por lastComparisonStatus)
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus ejercicio periodo source')
       .sort({ tipoDeComprobante: 1, total: -1 })
       .lean(),
@@ -882,9 +882,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // ── FASE 2: Queries que usan los UUIDs de los CFDIs ERP del periodo ────────
   const erpUuids = allErpCfdis.map(c => c.uuid).filter(Boolean);
 
-  // CFDIs SAT/MANUAL sin contraparte ERP (por UUID) — no depende de lastComparisonStatus
-  const erpUuidSet = new Set(erpUuids.map(u => (u || '').toUpperCase()));
-  const soloSat = allSatForPeriod.filter(c => !erpUuidSet.has((c.uuid || '').toUpperCase()));
+  // soloSat ya viene filtrado por lastComparisonStatus desde la query
+  const soloSat = allSatForPeriod;
 
   // Status mismatches: ERP activo pero SAT Cancelado / ERP cancelado pero SAT Vigente
   const satCanceladoErpActivo = allErpCfdis.filter(c => c.satStatus === 'Cancelado');
@@ -1046,6 +1045,15 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   const MONEY_KEYS = ['subERP','ivaTraERP','ivaRetERP','totalERP','subSAT','ivaTraSAT','totalSAT','diferencia'];
 
   const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))].sort();
+  const tiposEnUsoSet = new Set(tiposEnUso);
+
+  // Agrupar soloSat por tipo para insertarlos al final de cada hoja de tipo
+  const soloSatByTipo = {};
+  for (const c of soloSat) {
+    const t = c.tipoDeComprobante || 'Otro';
+    if (!soloSatByTipo[t]) soloSatByTipo[t] = [];
+    soloSatByTipo[t].push(c);
+  }
 
   for (const tipo of tiposEnUso) {
     const cfdis = cfdisByTipo[tipo] || [];
@@ -1252,6 +1260,43 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           dr.getCell(8).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDC2626' } };
           dr.getCell(9).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDC2626' } };
         }
+      }
+    }
+
+    // ── Solo en SAT para este tipo ───────────────────────────────────────────
+    const satOnlyTipo = soloSatByTipo[tipo] || [];
+    if (satOnlyTipo.length > 0) {
+      sheet.addRow({});
+      const sepSAT = sheet.addRow({ uuid: `⛔ Solo en SAT — No encontrados en ERP (${satOnlyTipo.length})` });
+      sheet.mergeCells(`A${sepSAT.number}:${colLetter(NC)}${sepSAT.number}`);
+      sepSAT.getCell('uuid').font = { bold: true, size: 10, color: { argb: 'FFFFFFFF' } };
+      sepSAT.getCell('uuid').fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDC2626' } };
+      sepSAT.getCell('uuid').alignment = { horizontal: 'left', vertical: 'middle' };
+      sepSAT.height = 20;
+
+      for (const c of satOnlyTipo) {
+        const dr = sheet.addRow({
+          uuid:        c.uuid,
+          serie:       c.serie    || '',
+          folio:       c.folio    || '',
+          fecha:       c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '',
+          rfcEmisor:   c.emisor?.rfc    || '',
+          nomEmisor:   c.emisor?.nombre || '',
+          rfcReceptor: c.receptor?.rfc    || '',
+          nomReceptor: c.receptor?.nombre || '',
+          subERP: null, ivaTraERP: null, ivaRetERP: null, totalERP: null,
+          subSAT:    c.subTotal || 0,
+          ivaTraSAT: c.impuestos?.totalImpuestosTrasladados || 0,
+          totalSAT:  c.total    || 0,
+          diferencia:   null,
+          estadoERP:    '— No en ERP —',
+          estadoSAT:    c.satStatus || '—',
+          conciliacion: 'Solo en SAT',
+          tiposDisc:    'MISSING_IN_ERP',
+          detalleDisc:  '',
+        });
+        ['subSAT', 'ivaTraSAT', 'totalSAT'].forEach(k => { if (dr.getCell(k).value != null) dr.getCell(k).numFmt = MXN; });
+        dr.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_DANGER; });
       }
     }
   }
@@ -1475,8 +1520,10 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  // HOJA FINAL — Solo en SAT (no en ERP)
+  // HOJA FINAL — Solo en SAT con tipo no representado en ERP
   // ══════════════════════════════════════════════════════════════════════════
+  // Los que SÍ tienen tipo en ERP ya se agregaron al final de su hoja de tipo
+  const soloSatSinTipo = soloSat.filter(c => !tiposEnUsoSet.has(c.tipoDeComprobante));
   const sN   = workbook.worksheets.length + 1;
   const sLast = workbook.addWorksheet(`${sN}. Solo en SAT`);
   sLast.views = [{ state: 'frozen', ySplit: 3 }];
@@ -1505,10 +1552,10 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   hdrLast.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
   hdrLast.height = 28;
 
-  for (const c of soloSat) {
+  for (const c of soloSatSinTipo) {
     const row = sLast.addRow({ tipo: c.tipoDeComprobante || '', desc: TIPO_LABEL[c.tipoDeComprobante] || '', source: c.source, uuid: c.uuid, serie: c.serie || '', folio: c.folio || '', fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '', rfcEmisor: c.emisor?.rfc || '', nomEmisor: c.emisor?.nombre || '', rfcRec: c.receptor?.rfc || '', nomRec: c.receptor?.nombre || '', subTotal: c.subTotal || 0, ivaTrasl: c.impuestos?.totalImpuestosTrasladados || 0, ivaRet: c.impuestos?.totalImpuestosRetenidos || 0, total: c.total || 0, estadoSAT: c.satStatus || '—' });
     ['subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
-    row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_SAT; });
+    row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_DANGER; });
   }
 
   // ── Respuesta ──────────────────────────────────────────────────────────────

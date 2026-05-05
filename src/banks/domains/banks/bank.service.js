@@ -60,6 +60,18 @@ async function getCards() {
         $group: {
           _id:            '$banco',
           movimientos:    { $sum: 1 },
+          movimientoNoIdentificado: {
+            $sum: {
+              $cond: [
+                { $and: [
+                  { $in: ['$status', ['no_identificado', null]] },
+                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] },
+                ]},
+                1,
+                0,
+              ],
+            },
+          },
           totalDepositos: { $sum: { $ifNull: ['$deposito', 0] } },
           totalRetiros:   { $sum: { $ifNull: ['$retiro',   0] } },
           ultimaFecha:    { $max: '$fecha' },
@@ -72,7 +84,7 @@ async function getCards() {
             $sum: {
               $cond: [
                 { $in: ['$status', ['no_identificado', null]] },
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                { $ifNull: ['$deposito', 0] },
                 0,
               ],
             },
@@ -103,11 +115,45 @@ async function getCards() {
     bankConfigRepo.findAllAsMap(),
   ]);
 
+  // ── Saldo actualizado por banco ────────────────────────────────────────────
+  // Para cada banco que tiene saldo inicial definido, acumulamos el delta de
+  // movimientos importados DESPUÉS del corte (createdAt > saldoInicialFechaCorte).
+  // Se ejecutan en paralelo — el número de bancos con saldo inicial es pequeño.
+  const banksWithSaldo = [...configMap.entries()].filter(
+    ([, cfg]) => cfg.saldoInicial != null && cfg.saldoInicialFechaCorte != null,
+  );
+
+  const saldoActualizadoMap = {};
+  if (banksWithSaldo.length > 0) {
+    const deltaResults = await Promise.all(
+      banksWithSaldo.map(async ([banco, cfg]) => {
+        const [res] = await BankMovement.aggregate([
+          { $match: { banco, isActive: true, createdAt: { $gt: cfg.saldoInicialFechaCorte } } },
+          {
+            $group: {
+              _id:   null,
+              delta: {
+                $sum: {
+                  $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }],
+                },
+              },
+            },
+          },
+        ]);
+        return [banco, Number(cfg.saldoInicial) + (res?.delta ?? 0)];
+      }),
+    );
+    for (const [banco, saldo] of deltaResults) {
+      saldoActualizadoMap[banco] = saldo;
+    }
+  }
+
   return agg.map((b) => {
     const cfg = configMap.get(b._id);
     return {
       banco:          b._id,
       movimientos:    b.movimientos,
+      movimientoNoIdentificado: b.movimientoNoIdentificado,
       totalDepositos: b.totalDepositos,
       totalRetiros:   b.totalRetiros,
       saldoFinal:     b.saldoFinal ?? null,
@@ -115,9 +161,12 @@ async function getCards() {
       ultimaImport:   b.ultimaImport,
       cuentaContable: cfg?.cuentaContable ?? null,
       numeroCuenta:   cfg?.numeroCuenta   ?? null,
+      saldoInicial:            cfg?.saldoInicial            != null ? Number(cfg.saldoInicial) : null,
+      saldoInicialFechaCorte:  cfg?.saldoInicialFechaCorte  ?? null,
       saldoPendiente:    b.saldoPendiente    ?? 0,
       saldoIdentificado: b.saldoIdentificado ?? 0,
       saldoOtros:        b.saldoOtros        ?? 0,
+      saldoActualizado:  saldoActualizadoMap[b._id] ?? null,
       porStatus: {
         no_identificado: b.no_identificado,
         identificado:    b.identificado,
@@ -254,8 +303,30 @@ async function listMovements(filters) {
     });
   }
 
+  // ── Saldo calculado ────────────────────────────────────────────────────────
+  // Solo aplica cuando el banco está filtrado y tiene saldo inicial registrado.
+  const saldoMap = {};
+  if (banco) {
+    const cfg = await bankConfigRepo.findByBanco(banco);
+    if (cfg?.saldoInicial != null && cfg?.saldoInicialFechaCorte) {
+      // Traer todos los movimientos posteriores al corte, en orden cronológico.
+      // Solo se usan deposito/retiro para el cálculo acumulado.
+      const allMovs = await BankMovement.find(
+        { banco, isActive: true, createdAt: { $gt: cfg.saldoInicialFechaCorte } },
+        { deposito: 1, retiro: 1 },
+      ).sort({ fecha: 1, _id: 1 }).lean();
+
+      let saldo = Number(cfg.saldoInicial);
+      for (const m of allMovs) {
+        saldo += (m.deposito ?? 0) - (m.retiro ?? 0);
+        saldoMap[m._id.toString()] = saldo;
+      }
+    }
+  }
+
   const data = movements.map(m => ({
     ...m,
+    saldoCalculado: saldoMap[m._id.toString()] ?? null,
     solicitudesConfirmadas: solicitudesPorMov[m._id.toString()] ?? [],
   }));
 
@@ -557,6 +628,11 @@ const ERP_TOLERANCE = 1.00; // $1 MXN de tolerancia para cuadre
 //   - Si saldoActual es null o 0 → usar total del comprobante
 //     (ERP marcó la CxC como cobrada o no devolvió saldo; se compara contra
 //      el importe original para permitir la identificación manual o automática)
+//
+// Regla de identificación automática:
+//   saldoErp >= bankAmount - ERP_TOLERANCE
+//   Es decir: la CxC cubre o excede el depósito → identificado.
+//   Si la CxC es MENOR que el depósito → no_identificado (pago insuficiente).
 function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
@@ -569,7 +645,7 @@ function aplicarLogicaErp(mov) {
     : null;
   const uuidXML    = links.find(l => l.folioFiscal)?.folioFiscal?.toUpperCase() ?? null;
   const bankAmount = Math.abs(mov.deposito ?? mov.retiro ?? 0);
-  const status     = (saldoErp !== null && Math.abs(bankAmount - saldoErp) <= ERP_TOLERANCE)
+  const status     = (saldoErp !== null && saldoErp >= bankAmount - ERP_TOLERANCE)
     ? 'identificado'
     : 'no_identificado';
   return { saldoErp, uuidXML, status };
@@ -582,9 +658,10 @@ async function updateStatus(id, status, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
   const isAdmin = user?.role === 'admin';
-  // Bloquear si el cuadre ERP determinó automáticamente el status (admin puede forzar)
-  const bankAmount = (mov.deposito ?? mov.retiro ?? 0);
-  if (!isAdmin && mov.saldoErp !== null && Math.abs(bankAmount - mov.saldoErp) <= ERP_TOLERANCE) {
+  // Bloquear si el cuadre ERP determinó automáticamente el status (admin puede forzar).
+  // La CxC cubre el depósito (saldoErp >= bankAmount - tolerancia) → bloqueado para no-admin.
+  const bankAmount = Math.abs(mov.deposito ?? mov.retiro ?? 0);
+  if (!isAdmin && mov.saldoErp !== null && mov.saldoErp >= bankAmount - ERP_TOLERANCE) {
     throw new ConflictError('Movimiento bloqueado: el saldo ERP cuadra con el monto bancario');
   }
   // Bloquear si el movimiento fue identificado por otro usuario (admin puede forzar)
@@ -596,6 +673,10 @@ async function updateStatus(id, status, user) {
     !idPorEntries.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
+  }
+  // Solo admin puede transicionar de 'no_identificado' a 'otros'
+  if (status === 'otros' && mov.status === 'no_identificado' && !isAdmin) {
+    throw new ForbiddenError('Solo un administrador puede marcar este movimiento como "otros"');
   }
   // Para marcar como identificado siempre se requiere al menos un ID ERP asociado
   if (status === 'identificado' && (!mov.erpIds || mov.erpIds.length === 0)) {
@@ -671,10 +752,12 @@ async function setErpIds(id, erpLinks, user) {
 
   const cleanLinks = erpLinks
     .map(l => ({
-      erpId:       String(l.erpId || '').trim(),
-      saldoActual: l.saldoActual != null ? Number(l.saldoActual) : null,
-      folioFiscal: l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
-      total:       l.total != null ? Number(l.total) : null,
+      erpId:        String(l.erpId || '').trim(),
+      saldoActual:  l.saldoActual != null ? Number(l.saldoActual) : null,
+      folioFiscal:  l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
+      total:        l.total != null ? Number(l.total) : null,
+      serie:        l.serie ? String(l.serie).trim() : null,
+      folioExterno: l.folioExterno ? String(l.folioExterno).trim() : null,
     }))
     .filter(l => l.erpId);
 
@@ -735,9 +818,21 @@ async function saveConfig(banco, data) {
   return bankConfigRepo.upsert(banco, fields);
 }
 
+async function setSaldoInicial(banco, monto) {
+  if (!BANCOS_VALIDOS.includes(banco)) throw new BadRequestError('Banco inválido');
+  if (isNaN(monto) || monto < 0) throw new BadRequestError('Monto inválido');
+  return bankConfigRepo.setSaldoInicial(banco, monto);
+}
+
 async function listIdentificadores(banco) {
+  // $unwind primero para descomponer el array identificadoPor por elemento,
+  // luego $group por userId individual. Sin $unwind, MongoDB agrupa por el
+  // array completo y genera una entrada por combinación distinta de usuarios,
+  // causando duplicados del mismo nombre.
   const docs = await BankMovement.aggregate([
-    { $match: { banco, isActive: true, 'identificadoPor.userId': { $ne: null } } },
+    { $match: { banco, isActive: true, 'identificadoPor.0': { $exists: true } } },
+    { $unwind: '$identificadoPor' },
+    { $match: { 'identificadoPor.userId': { $ne: null } } },
     { $group: { _id: '$identificadoPor.userId', nombre: { $first: '$identificadoPor.nombre' } } },
     { $sort: { nombre: 1 } },
   ]);
@@ -895,6 +990,6 @@ async function exportMovements(filters) {
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds,
-  getConfig, saveConfig, listCategories, listIdentificadores, importIndividual,
+  getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements,
 };

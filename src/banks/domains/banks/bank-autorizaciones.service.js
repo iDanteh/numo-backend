@@ -122,7 +122,7 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
 
   // ── 1. Datos del ERP ───────────────────────────────────────────────────────
   const cxcs = await ErpCuentaPendiente.find({})
-    .select('erpId total folioFiscal movimientos')
+    .select('erpId total folioFiscal serie folioExterno movimientos')
     .lean();
 
   if (!cxcs.length) {
@@ -210,10 +210,12 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
     usedMovIds.add(mov._id.toString());
     matcheados++;
     const link = {
-      erpId:       cxc.erpId,
-      saldoActual: montoLink ?? cxc.total ?? null,
-      folioFiscal: cxc.folioFiscal ?? null,
-      total:       cxc.total ?? null,
+      erpId:        cxc.erpId,
+      saldoActual:  montoLink ?? cxc.total ?? null,
+      folioFiscal:  cxc.folioFiscal  ?? null,
+      total:        cxc.total        ?? null,
+      serie:        cxc.serie        ?? null,
+      folioExterno: cxc.folioExterno ?? null,
     };
     const newLinks = [...(mov.erpLinks || []), link];
     const newIds   = [...(mov.erpIds   || []), cxc.erpId];
@@ -301,12 +303,26 @@ async function matchAutorizacionesDesdeErp({ banco } = {}) {
     identificados = result.modifiedCount;
   }
 
+  // ── 7. Filtrar noMatcheados que ya estaban vinculados ──────────────────────
+  // Un CxC puede aparecer como "sin match" porque el movimiento ya fue
+  // identificado en una corrida anterior (excluido por status/erpIds en paso 2).
+  // Verificar en bulk antes de reportarlos como sin match real.
+  let trueSinMatch = noMatcheados;
+  if (noMatcheados.length > 0) {
+    const pendingErpIds = noMatcheados.map(nm => nm.erpId).filter(Boolean);
+    const yaVinculados  = pendingErpIds.length
+      ? await BankMovement.distinct('erpIds', { isActive: true, erpIds: { $in: pendingErpIds } })
+      : [];
+    const yaVinculadosSet = new Set(yaVinculados.map(String));
+    trueSinMatch = noMatcheados.filter(nm => !yaVinculadosSet.has(String(nm.erpId)));
+  }
+
   return {
     total:        rowsConAuth.length + cxcsSinAuth.length,
     matcheados,
     identificados,
-    sinMatch:     noMatcheados.length,
-    noMatcheados,
+    sinMatch:     trueSinMatch.length,
+    noMatcheados: trueSinMatch,
   };
 }
 
@@ -321,22 +337,16 @@ function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds) {
 
 async function ejecutarMatch(rows) {
   if (!rows.length) {
-    return { total: 0, matcheados: 0, identificados: 0, sinMatch: 0, noMatcheados: [] };
+    return { total: 0, matcheados: 0, identificados: 0, yaIdentificados: 0, sinMatch: 0, noMatcheados: [] };
   }
 
-  // ── Filtro de banco ────────────────────────────────────────────────────────
-  // Si alguna fila no tiene banco, no restringimos la query: un auth sin banco
-  // debe poder encontrar movimientos de cualquier banco.
-  // Si TODAS las filas tienen banco, restringimos para limitar el scan.
-  const bancosEspecificados = [...new Set(rows.map(r => r.banco).filter(Boolean))];
-  const hayFilasSinBanco    = rows.some(r => !r.banco);
-  const bancoFilter = (!hayFilasSinBanco && bancosEspecificados.length)
-    ? { banco: { $in: bancosEspecificados } }
-    : {};
-
+  // ── Carga de movimientos ──────────────────────────────────────────────────
+  // Se cargan todos los movimientos activos sin restricción de banco porque un
+  // número de autorización puede estar registrado bajo un banco diferente al que
+  // indica el Excel (e.g. BBVA en Excel → Banamex en DB). El banco del Excel se
+  // usa como criterio de preferencia (no de exclusión) dentro de findInIndex.
   const movimientos = await BankMovement.find({
     isActive: true,
-    ...bancoFilter,
   }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco').lean();
 
   // ── Índices de búsqueda ───────────────────────────────────────────────────
@@ -344,6 +354,12 @@ async function ejecutarMatch(rows) {
   const byRefNorm           = new Map();
   const porConceptoPorBanco = new Map();
   const porConceptoTodos    = [];
+
+  // Fase 4: identificados sin auth registrada, buscables por banco+monto y solo monto.
+  // Cubre el caso típico de BBVA "DEPOSITO EN EFECTIVO" (sin "/" en concepto →
+  // numeroAutorizacion = null en DB) que fue identificado vía ERP o manual.
+  const idPorBancoMonto = new Map(); // `${banco}|${centavos}` → [mov]
+  const idPorMonto      = new Map(); // `${centavos}`          → [mov]
 
   for (const m of movimientos) {
     const na = normalizarAuth(m.numeroAutorizacion);
@@ -362,12 +378,24 @@ async function ejecutarMatch(rows) {
       porConceptoPorBanco.get(b).push(m);
       porConceptoTodos.push(m);
     }
+    if (m.status === 'identificado') {
+      const centavos = Math.round((m.deposito ?? m.retiro ?? 0) * 100);
+      const kbm = `${m.banco ?? ''}|${centavos}`;
+      const km  = String(centavos);
+      if (!idPorBancoMonto.has(kbm)) idPorBancoMonto.set(kbm, []);
+      idPorBancoMonto.get(kbm).push(m);
+      if (!idPorMonto.has(km)) idPorMonto.set(km, []);
+      idPorMonto.get(km).push(m);
+    }
   }
 
   // ── Motor de match ────────────────────────────────────────────────────────
-  const usedMovIds       = new Set(); // evita que dos filas consuman el mismo movimiento
-  const idsAIdentificar  = new Set();
-  const noMatcheados     = [];
+  const usedMovIds         = new Set(); // evita que dos filas consuman el mismo movimiento
+  const idsAIdentificar    = new Set();
+  // movId → autNorm: movimientos donde faltaba auth en DB y ahora podemos completarlo
+  const idsActualizarAuth  = new Map();
+  const noMatcheados       = [];
+  const yaIdentificadosArr = [];
   let matcheados = 0;
 
   for (const row of rows) {
@@ -401,26 +429,88 @@ async function ejecutarMatch(rows) {
     if (mov) {
       matcheados++;
       usedMovIds.add(mov._id.toString());
+      // Si el movimiento no tiene auth registrado, aprovechamos para guardarlo
+      if (!mov.numeroAutorizacion && row.autNorm) {
+        idsActualizarAuth.set(mov._id.toString(), row.autNorm);
+      }
       if (mov.status !== 'identificado') idsAIdentificar.add(mov._id.toString());
     } else {
-      noMatcheados.push({ autorizacion: row.autNorm, importe: row.importe ?? null, banco: row.banco ?? null });
+      // ── Fase 4: fallback por importe + banco entre ya identificados ─────────
+      // Ocurre cuando el movimiento fue identificado (ERP/manual) pero su
+      // numeroAutorizacion es null en DB (ej. BBVA "DEPOSITO EN EFECTIVO").
+      // Se reporta como "ya identificado", no como "sin match".
+      let yaIdMov = null;
+      if (row.importe) {
+        const centavos = Math.round(row.importe * 100);
+        // Preferencia: banco + monto; fallback: solo monto
+        const candidatosBM = row.banco
+          ? (idPorBancoMonto.get(`${row.banco}|${centavos}`) ?? [])
+          : [];
+        const candidatosM  = idPorMonto.get(String(centavos)) ?? [];
+        const pool = candidatosBM.length ? candidatosBM : candidatosM;
+
+        for (const m of pool) {
+          if (usedMovIds.has(m._id.toString())) continue;
+          if (!importeOk(m, row.importe)) continue;
+          yaIdMov = m;
+          break;
+        }
+      }
+
+      if (yaIdMov) {
+        usedMovIds.add(yaIdMov._id.toString());
+        yaIdentificadosArr.push({ autorizacion: row.autNorm, importe: row.importe ?? null, banco: row.banco ?? null });
+        // Completar el auth faltante en DB para que futuras ejecuciones lo encuentren en fase 1
+        if (!yaIdMov.numeroAutorizacion && row.autNorm) {
+          idsActualizarAuth.set(yaIdMov._id.toString(), row.autNorm);
+        }
+      } else {
+        noMatcheados.push({ autorizacion: row.autNorm, importe: row.importe ?? null, banco: row.banco ?? null });
+      }
     }
   }
 
+  // ── Escritura en bulk ─────────────────────────────────────────────────────
   let identificados = 0;
   if (idsAIdentificar.size > 0) {
     const ahora = new Date();
-    const ops = [...idsAIdentificar].map(id => ({
-      updateOne: {
-        filter: { _id: id },
-        update: { $set: { status: 'identificado', identificadoPor: [{ userId: 'aut-match', nombre: 'Motor ERP', fechaId: ahora }] } },
-      },
-    }));
+    const ops = [...idsAIdentificar].map(id => {
+      const upd = {
+        $set: {
+          status:          'identificado',
+          identificadoPor: [{ userId: 'aut-match', nombre: 'Motor ERP', fechaId: ahora }],
+        },
+      };
+      // Incluir auth si lo tenemos y no estaba en DB — queda vinculado desde esta corrida
+      if (idsActualizarAuth.has(id)) {
+        upd.$set.numeroAutorizacion = idsActualizarAuth.get(id);
+        idsActualizarAuth.delete(id); // evitar doble escritura
+      }
+      return { updateOne: { filter: { _id: id }, update: upd } };
+    });
     const result = await BankMovement.bulkWrite(ops, { ordered: false });
     identificados = result.modifiedCount;
   }
 
-  return { total: rows.length, matcheados, identificados, sinMatch: noMatcheados.length, noMatcheados };
+  // Actualizar auth en movimientos ya identificados donde faltaba (fase 4)
+  if (idsActualizarAuth.size > 0) {
+    const authOps = [...idsActualizarAuth.entries()].map(([id, autNorm]) => ({
+      updateOne: {
+        filter: { _id: id },
+        update: { $set: { numeroAutorizacion: autNorm } },
+      },
+    }));
+    await BankMovement.bulkWrite(authOps, { ordered: false });
+  }
+
+  return {
+    total:           rows.length,
+    matcheados,
+    identificados,
+    yaIdentificados: yaIdentificadosArr.length,
+    sinMatch:        noMatcheados.length,
+    noMatcheados,
+  };
 }
 
 // Normaliza texto de encabezado para comparación: minúsculas sin acentos.

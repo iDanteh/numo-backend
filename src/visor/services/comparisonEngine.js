@@ -782,7 +782,11 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
  */
 const compararArrays = (cfdisSAT, cfdisERP) => {
   const mapSAT = new Map(cfdisSAT.map(c => [c.uuid.toUpperCase(), c]));
-  const mapERP = new Map(cfdisERP.map(c => [c.uuid.toUpperCase(), c]));
+
+  // Separar SINUUID antes de comparar — no tienen timbre real y nunca estarán en SAT
+  const sinUuid = cfdisERP.filter(c => c.uuid.toUpperCase().startsWith('SINUUID'));
+  const erpComparables = cfdisERP.filter(c => !c.uuid.toUpperCase().startsWith('SINUUID'));
+  const mapERP = new Map(erpComparables.map(c => [c.uuid.toUpperCase(), c]));
 
   const coinciden = [];
   const soloEnSAT = [];
@@ -813,7 +817,7 @@ const compararArrays = (cfdisSAT, cfdisERP) => {
     }
   }
 
-  return { coinciden, soloEnSAT, soloEnERP, conDiferencia };
+  return { coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid };
 };
 
 /**

@@ -752,10 +752,11 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
     const campoRfc     = esRecibidos ? 'receptor.rfc' : 'emisor.rfc';
 
     // Resultados acumulados de todos los sub-tipos para guardarResultados al final
-    const allCoinc   = [];
-    const allSoloSAT = [];
-    const allSoloERP = [];
-    const allConDiff = [];
+    const allCoinc    = [];
+    const allSoloSAT  = [];
+    const allSoloERP  = [];
+    const allConDiff  = [];
+    const allSinUuid  = [];
     const tiposFallidos = [];
 
     onPaso?.(3);
@@ -802,7 +803,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
           }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus').lean();
 
           const cfdisERPTipo = cfdisERPDocs.map(normalizarCFDI);
-          const { coinciden, soloEnSAT, soloEnERP, conDiferencia } = compararArrays(cfdisSATTipo, cfdisERPTipo);
+          const { coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid } = compararArrays(cfdisSATTipo, cfdisERPTipo);
 
           logger.info(
             `[SatSyncJob] RFC ${rfc} (${tipoActual}): ` +
@@ -905,6 +906,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
           allSoloSAT.push(...soloEnSAT);
           allSoloERP.push(...soloEnERP);
           allConDiff.push(...conDiferencia);
+          allSinUuid.push(...(sinUuid ?? []));
         }
 
       } catch (tipoErr) {
@@ -950,7 +952,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
 
     // ── Guardar resultados de comparación en Comparison/Discrepancy/CFDI status
     onPaso?.(5);
-    await guardarResultados({ rfc, tipoComprobante, coinciden: allCoinc, soloEnSAT: allSoloSAT, soloEnERP: allSoloERP, conDiferencia: allConDiff, ejercicio, periodo });
+    await guardarResultados({ rfc, tipoComprobante, coinciden: allCoinc, soloEnSAT: allSoloSAT, soloEnERP: allSoloERP, conDiferencia: allConDiff, sinUuid: allSinUuid, ejercicio, periodo });
 
     const totalSAT = allCoinc.length + allSoloSAT.length + allConDiff.length;
     const totalERP = allCoinc.length + allSoloERP.length + allConDiff.length;
@@ -1002,7 +1004,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
  * registros queden vinculados al periodo fiscal correcto (seleccionado por el
  * usuario o derivado de la fecha del job automático).
  */
-const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, ejercicio, periodo }) => {
+const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid = [], ejercicio, periodo }) => {
   const ahora = new Date();
   const fp    = { ejercicio, periodo };
 
@@ -1080,6 +1082,23 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
         // Solo actualizar status — no tocar ejercicio/periodo del ERP
         filter: { uuid: cfdi.uuid, source: 'ERP' },
         update: { $set: { lastComparisonStatus: 'not_in_sat', lastComparisonAt: ahora } },
+      },
+    })));
+  }
+
+  // ── Sin UUID — ERP sin timbre real, no generan discrepancia ──────────────
+  if (sinUuid.length > 0) {
+    await CFDI.bulkWrite(sinUuid.map(cfdi => ({
+      updateOne: {
+        filter: { uuid: cfdi.uuid, source: 'ERP' },
+        update: { $set: { lastComparisonStatus: 'sin_uuid', lastComparisonAt: ahora } },
+      },
+    })));
+    await Comparison.bulkWrite(sinUuid.map(cfdi => ({
+      updateOne: {
+        filter: { uuid: cfdi.uuid },
+        update: { $set: { uuid: cfdi.uuid, status: 'sin_uuid', differences: [], totalDifferences: 0, criticalCount: 0, warningCount: 0, comparedAt: ahora, comparedBy: 'scheduled', hasLocalSATCopy: false, ...fp } },
+        upsert: true,
       },
     })));
   }

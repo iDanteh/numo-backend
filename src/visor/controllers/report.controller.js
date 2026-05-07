@@ -1033,6 +1033,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     { key: 'ivaTraERP',    header: 'IVA Trasladado ERP',  width: 18 },
     { key: 'ivaRetERP',    header: 'IVA Retenido ERP',    width: 18 },
     { key: 'totalERP',     header: 'Total ERP',           width: 16 },
+    { key: 'descuentoSAT', header: 'Descuento SAT',       width: 16 },
     { key: 'subSAT',       header: 'Subtotal SAT',        width: 16 },
     { key: 'ivaTraSAT',    header: 'IVA Trasladado SAT',  width: 18 },
     { key: 'totalSAT',     header: 'Total SAT',           width: 16 },
@@ -1043,7 +1044,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     { key: 'tiposDisc',    header: 'Tipos Discrepancia',  width: 35 },
     { key: 'detalleDisc',  header: 'Detalle Diferencias', width: 80 },
   ];
-  const MONEY_KEYS = ['descuento','subERP','ivaTraERP','ivaRetERP','totalERP','subSAT','ivaTraSAT','totalSAT','diferencia'];
+  const MONEY_KEYS = ['descuento','subERP','ivaTraERP','ivaRetERP','totalERP','descuentoSAT','subSAT','ivaTraSAT','totalSAT','diferencia'];
 
   const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))].sort();
   const tiposEnUsoSet = new Set(tiposEnUso);
@@ -1096,7 +1097,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     hdrRow.height = 30;
 
     let sumDescuento = 0, sumSubERP = 0, sumIvaTraERP = 0, sumIvaRetERP = 0, sumTotERP = 0;
-    let sumSubSAT = 0, sumIvaTraSAT = 0, sumTotSAT = 0, sumDif = 0;
+    let sumDescuentoSAT = 0, sumSubSAT = 0, sumIvaTraSAT = 0, sumTotSAT = 0, sumDif = 0;
     const cfdisDiferencia = []; // CFDIs que hacen la diferencia
 
     for (const cfdi of cfdis) {
@@ -1109,6 +1110,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       const ivaTraERP = cfdi.impuestos?.totalImpuestosTrasladados || 0;
       const ivaRetERP = cfdi.impuestos?.totalImpuestosRetenidos   || 0;
       const totERP    = cfdi.total || 0;
+      const descuentoSAT = satCfdi ? (satCfdi.descuento || 0) : null;
       const subSAT    = satCfdi ? (satCfdi.subTotal || 0) - (satCfdi.descuento || 0) : null;
       const ivaTraSAT = satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null;
       const totSAT    = satCfdi ? (satCfdi.total || 0) : null;
@@ -1137,7 +1139,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
         rfcEmisor: cfdi.emisor?.rfc || '', nomEmisor: cfdi.emisor?.nombre || '',
         rfcReceptor: cfdi.receptor?.rfc || '', nomReceptor: cfdi.receptor?.nombre || '',
         descuento: descuentoERP, subERP, ivaTraERP, ivaRetERP, totalERP: totERP,
-        subSAT, ivaTraSAT, totalSAT: totSAT,
+        descuentoSAT, subSAT, ivaTraSAT, totalSAT: totSAT,
         diferencia: dif,
         estadoERP:    cfdi.erpStatus || '—',
         estadoSAT:    cfdi.satStatus || '—',
@@ -1186,6 +1188,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       }
 
       sumDescuento += descuentoERP; sumSubERP += subERP; sumIvaTraERP += ivaTraERP; sumIvaRetERP += ivaRetERP; sumTotERP += totERP;
+      sumDescuentoSAT += descuentoSAT || 0;
       sumSubSAT    += subSAT    || 0;
       sumIvaTraSAT += ivaTraSAT || 0;
       sumTotSAT    += totSAT    || 0;
@@ -1203,7 +1206,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     }
 
     // Fila totales
-    const tr = sheet.addRow({ uuid: `TOTAL (${cfdis.length} CFDIs)`, descuento: fmtNum(sumDescuento), subERP: fmtNum(sumSubERP), ivaTraERP: fmtNum(sumIvaTraERP), ivaRetERP: fmtNum(sumIvaRetERP), totalERP: fmtNum(sumTotERP), subSAT: fmtNum(sumSubSAT), ivaTraSAT: fmtNum(sumIvaTraSAT), totalSAT: fmtNum(sumTotSAT), diferencia: fmtNum(sumDif) });
+    const tr = sheet.addRow({ uuid: `TOTAL (${cfdis.length} CFDIs)`, descuento: fmtNum(sumDescuento), subERP: fmtNum(sumSubERP), ivaTraERP: fmtNum(sumIvaTraERP), ivaRetERP: fmtNum(sumIvaRetERP), totalERP: fmtNum(sumTotERP), descuentoSAT: fmtNum(sumDescuentoSAT), subSAT: fmtNum(sumSubSAT), ivaTraSAT: fmtNum(sumIvaTraSAT), totalSAT: fmtNum(sumTotSAT), diferencia: fmtNum(sumDif) });
     tr.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
     MONEY_KEYS.forEach(k => { tr.getCell(k).numFmt = MXN; });
     if (Math.abs(sumDif) > 0.01) tr.getCell('diferencia').fill = FG_DANGER;
@@ -1286,8 +1289,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           nomEmisor:   c.emisor?.nombre || '',
           rfcReceptor: c.receptor?.rfc    || '',
           nomReceptor: c.receptor?.nombre || '',
-          descuento: c.descuento || 0, subERP: null, ivaTraERP: null, ivaRetERP: null, totalERP: null,
-          subSAT:    (c.subTotal || 0) - (c.descuento || 0),
+          descuento: null, subERP: null, ivaTraERP: null, ivaRetERP: null, totalERP: null,
+          descuentoSAT: c.descuento || 0, subSAT: (c.subTotal || 0) - (c.descuento || 0),
           ivaTraSAT: c.impuestos?.totalImpuestosTrasladados || 0,
           totalSAT:  c.total    || 0,
           diferencia:   null,
@@ -1423,6 +1426,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           ivaTraERP: cfdi.impuestos?.totalImpuestosTrasladados || 0,
           ivaRetERP: cfdi.impuestos?.totalImpuestosRetenidos   || 0,
           totalERP: totERP,
+          descuentoSAT: satCfdi ? (satCfdi.descuento || 0) : null,
           subSAT: satCfdi ? (satCfdi.subTotal || 0) - (satCfdi.descuento || 0) : null,
           ivaTraSAT: satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null,
           totalSAT: totSAT,

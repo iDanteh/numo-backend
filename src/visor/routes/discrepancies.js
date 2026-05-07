@@ -3,7 +3,7 @@
 const express    = require('express');
 const rateLimit  = require('express-rate-limit');
 const { authenticate, permit } = require('../../shared/middleware/auth');
-const { list, summary, getById, updateStatus } = require('../controllers/discrepancy.controller');
+const { list, summary, getById, updateStatus, addComentario, addComentarioPorUUID } = require('../controllers/discrepancy.controller');
 
 const router = express.Router();
 
@@ -23,6 +23,8 @@ const listLimiter = rateLimit({
 router.get('/summary', authenticate, listLimiter, summary);
 router.get('/',        authenticate, listLimiter, list);
 router.get('/:id',     authenticate, getById);
-router.patch('/:id/status', authenticate, permit('visor:write'), updateStatus);
+router.patch('/:id/status',            authenticate, permit('visor:write'), updateStatus);
+router.post('/comentario-por-uuid',    authenticate, addComentarioPorUUID);
+router.post('/:id/comentarios',        authenticate, addComentario);
 
 module.exports = router;

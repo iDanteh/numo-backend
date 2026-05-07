@@ -125,4 +125,42 @@ const updateStatus = asyncHandler(async (req, res) => {
   res.json(d);
 });
 
-module.exports = { list, summary, getById, updateStatus };
+/**
+ * POST /api/discrepancies/comentario-por-uuid
+ * Añade comentario buscando por uuid (y opcionalmente tipo).
+ * Útil cuando solo se tiene el UUID, no el _id de la discrepancia.
+ */
+const addComentarioPorUUID = asyncHandler(async (req, res) => {
+  const { uuid, tipo, motivo, descripcion = '' } = req.body;
+  if (!uuid)         return res.status(400).json({ error: 'uuid es requerido.' });
+  if (!motivo?.trim()) return res.status(400).json({ error: 'motivo es requerido.' });
+
+  const filter = { uuid: uuid.toUpperCase() };
+  if (tipo) filter.type = tipo;
+
+  const d = await Discrepancy.findOneAndUpdate(
+    filter,
+    { $push: { comentarios: { motivo: motivo.trim(), descripcion: descripcion.trim(), creadoPor: req.user?.nombre || req.user?.email || '' } } },
+    { new: true, sort: { createdAt: -1 } },
+  );
+  if (!d) return res.status(404).json({ error: 'No existe un registro de discrepancia para este UUID. Verifica que se haya ejecutado una comparación para este CFDI.' });
+  res.json({ success: true, discrepancyId: d._id, comentarios: d.comentarios });
+});
+
+/**
+ * POST /api/discrepancies/:id/comentarios
+ */
+const addComentario = asyncHandler(async (req, res) => {
+  const { motivo, descripcion = '' } = req.body;
+  if (!motivo?.trim()) return res.status(400).json({ error: 'El campo motivo es requerido.' });
+
+  const d = await Discrepancy.findByIdAndUpdate(
+    req.params.id,
+    { $push: { comentarios: { motivo: motivo.trim(), descripcion: descripcion.trim(), creadoPor: req.user?.nombre || req.user?.email || '' } } },
+    { new: true },
+  );
+  if (!d) return res.status(404).json({ error: 'Discrepancia no encontrada.' });
+  res.json({ success: true, comentarios: d.comentarios });
+});
+
+module.exports = { list, summary, getById, updateStatus, addComentario, addComentarioPorUUID };

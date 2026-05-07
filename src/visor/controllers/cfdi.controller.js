@@ -206,16 +206,20 @@ const list = asyncHandler(async (req, res) => {
     CFDI.countDocuments(filter),
     CFDI.aggregate([
       { $match: filter },
-      { $group: { _id: '$tipoDeComprobante', suma: { $sum: MONTO_EFECTIVO_EXPR }, count: { $sum: 1 } } },
+      { $group: { _id: '$tipoDeComprobante', suma: { $sum: MONTO_EFECTIVO_EXPR }, sumaSubTotal: { $sum: { $subtract: ['$subTotal', { $ifNull: ['$descuento', 0] }] } }, sumaTotal: { $sum: '$total' }, count: { $sum: 1 } } },
     ]),
   ]);
 
-  const totales = { suma: 0, porTipo: {} };
+  const totales = { suma: 0, sumaSubTotal: 0, sumaTotal: 0, porTipo: {} };
   for (const t of totalesAgg) {
-    totales.suma += t.suma || 0;
-    totales.porTipo[t._id || '?'] = { suma: t.suma || 0, count: t.count };
+    totales.suma       += t.suma       || 0;
+    totales.sumaSubTotal += t.sumaSubTotal || 0;
+    totales.sumaTotal  += t.sumaTotal  || 0;
+    totales.porTipo[t._id || '?'] = { suma: t.suma || 0, sumaSubTotal: t.sumaSubTotal || 0, sumaTotal: t.sumaTotal || 0, count: t.count };
   }
-  totales.suma = Math.round(totales.suma * 100) / 100;
+  totales.suma         = Math.round(totales.suma         * 100) / 100;
+  totales.sumaSubTotal = Math.round(totales.sumaSubTotal * 100) / 100;
+  totales.sumaTotal    = Math.round(totales.sumaTotal    * 100) / 100;
 
   res.json({ ...paginate(cfdis, total, pg, lm), totales });
 });
@@ -709,7 +713,7 @@ const remove = asyncHandler(async (req, res) => {
  *
  * Campos esperados del ERP:
  *   ID, UUID, TipoComprobante, FechaGeneracion, Serie, Folio, UUIDRelacion,
- *   RFCEmisor, RFCReceptor, NombreReceptor, UsoCfdi, Subtotal, TotalIVA,
+ *   RFCEmisor, RFCReceptor, NombreReceptor, UsoCfdi, Subtotal, Descuento, TotalIVA,
  *   TotalRetenciones, Importe, Moneda, TipoCambio, FormaPago, MetodoPago,
  *   FechaPago, SelloCFD, SelloSAT, NoCertificado, NoCertificadoSAT,
  *   FechaTimbrado, RfcProvCertif, Estatus, EstatusSAT, FechaCancelacion,
@@ -815,6 +819,7 @@ const importFromErpApi = asyncHandler(async (req, res) => {
         moneda:     row.Moneda     || row.moneda     || 'MXN',
         tipoCambio: parseNum(row.TipoCambio || row.tipoCambio) ?? undefined,
         subTotal:   parseNum(row.Subtotal   || row.subtotal)   ?? importe,
+        descuento:  parseNum(row.Descuento  || row.descuento)  ?? 0,
         total:      importe,
         emisor:   { rfc: rfcEmisor },
         receptor: {

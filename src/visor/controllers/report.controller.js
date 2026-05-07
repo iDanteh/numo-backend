@@ -912,7 +912,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // Buscar contrapartes SAT directamente por UUID (más confiable que satCfdiId de Comparison)
   const satCfdiDocs = erpUuids.length
     ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: erpUuids }, isActive: { $ne: false }, satStatus: 'Vigente' })
-        .select('uuid total subTotal impuestos satStatus').lean()
+        .select('uuid total subTotal descuento impuestos satStatus').lean()
     : [];
   const satByUuid = {};
   for (const s of satCfdiDocs) satByUuid[(s.uuid || '').toUpperCase()] = s;
@@ -1109,7 +1109,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       const ivaTraERP = cfdi.impuestos?.totalImpuestosTrasladados || 0;
       const ivaRetERP = cfdi.impuestos?.totalImpuestosRetenidos   || 0;
       const totERP    = cfdi.total || 0;
-      const subSAT    = satCfdi ? (satCfdi.subTotal || 0) : null;
+      const subSAT    = satCfdi ? (satCfdi.subTotal || 0) - (satCfdi.descuento || 0) : null;
       const ivaTraSAT = satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null;
       const totSAT    = satCfdi ? (satCfdi.total || 0) : null;
       const dif       = totSAT !== null ? fmtNum(totERP - totSAT) : null;
@@ -1286,8 +1286,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           nomEmisor:   c.emisor?.nombre || '',
           rfcReceptor: c.receptor?.rfc    || '',
           nomReceptor: c.receptor?.nombre || '',
-          subERP: null, ivaTraERP: null, ivaRetERP: null, totalERP: null,
-          subSAT:    c.subTotal || 0,
+          descuento: c.descuento || 0, subERP: null, ivaTraERP: null, ivaRetERP: null, totalERP: null,
+          subSAT:    (c.subTotal || 0) - (c.descuento || 0),
           ivaTraSAT: c.impuestos?.totalImpuestosTrasladados || 0,
           totalSAT:  c.total    || 0,
           diferencia:   null,
@@ -1423,7 +1423,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           ivaTraERP: cfdi.impuestos?.totalImpuestosTrasladados || 0,
           ivaRetERP: cfdi.impuestos?.totalImpuestosRetenidos   || 0,
           totalERP: totERP,
-          subSAT: satCfdi ? (satCfdi.subTotal || 0) : null,
+          subSAT: satCfdi ? (satCfdi.subTotal || 0) - (satCfdi.descuento || 0) : null,
           ivaTraSAT: satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null,
           totalSAT: totSAT,
           diferencia: dif,
@@ -1445,7 +1445,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const satCancelUuids = erpCancelados.map(c => c.uuid).filter(Boolean);
     const satCancelDocs  = satCancelUuids.length
       ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: satCancelUuids }, isActive: { $ne: false } })
-          .select('uuid total subTotal impuestos satStatus').lean()
+          .select('uuid total subTotal descuento impuestos satStatus').lean()
       : [];
     const satByUuidCan = {};
     for (const s of satCancelDocs) satByUuidCan[(s.uuid || '').toUpperCase()] = s;
@@ -1460,7 +1460,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const satDeshUuids = erpDeshabilitados.map(c => c.uuid).filter(Boolean);
     const satDeshDocs  = satDeshUuids.length
       ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: satDeshUuids }, isActive: { $ne: false } })
-          .select('uuid total subTotal impuestos satStatus').lean()
+          .select('uuid total subTotal descuento impuestos satStatus').lean()
       : [];
     const satByUuidDesh = {};
     for (const s of satDeshDocs) satByUuidDesh[(s.uuid || '').toUpperCase()] = s;
@@ -1542,6 +1542,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     { key: 'nomEmisor',  header: 'Nombre Emisor',   width: 30 },
     { key: 'rfcRec',     header: 'RFC Receptor',    width: 15 },
     { key: 'nomRec',     header: 'Nombre Receptor', width: 30 },
+    { key: 'descuento',  header: 'Descuento',       width: 16 },
     { key: 'subTotal',   header: 'Subtotal',        width: 16 },
     { key: 'ivaTrasl',   header: 'IVA Trasladado',  width: 18 },
     { key: 'ivaRet',     header: 'IVA Retenido',    width: 18 },
@@ -1556,8 +1557,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   hdrLast.height = 28;
 
   for (const c of soloSatSinTipo) {
-    const row = sLast.addRow({ tipo: c.tipoDeComprobante || '', desc: TIPO_LABEL[c.tipoDeComprobante] || '', source: c.source, uuid: c.uuid, serie: c.serie || '', folio: c.folio || '', fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '', rfcEmisor: c.emisor?.rfc || '', nomEmisor: c.emisor?.nombre || '', rfcRec: c.receptor?.rfc || '', nomRec: c.receptor?.nombre || '', subTotal: c.subTotal || 0, ivaTrasl: c.impuestos?.totalImpuestosTrasladados || 0, ivaRet: c.impuestos?.totalImpuestosRetenidos || 0, total: c.total || 0, estadoSAT: c.satStatus || '—' });
-    ['subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
+    const row = sLast.addRow({ tipo: c.tipoDeComprobante || '', desc: TIPO_LABEL[c.tipoDeComprobante] || '', source: c.source, uuid: c.uuid, serie: c.serie || '', folio: c.folio || '', fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '', rfcEmisor: c.emisor?.rfc || '', nomEmisor: c.emisor?.nombre || '', rfcRec: c.receptor?.rfc || '', nomRec: c.receptor?.nombre || '', descuento: c.descuento || 0, subTotal: (c.subTotal || 0) - (c.descuento || 0), ivaTrasl: c.impuestos?.totalImpuestosTrasladados || 0, ivaRet: c.impuestos?.totalImpuestosRetenidos || 0, total: c.total || 0, estadoSAT: c.satStatus || '—' });
+    ['descuento','subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
     row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_DANGER; });
   }
 

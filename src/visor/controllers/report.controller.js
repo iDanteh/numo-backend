@@ -803,25 +803,25 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
     // CFDIs ERP Timbrados/Habilitados — igual que montosAggregate del dashboard
     CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, ...periodoFilter })
-      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, lastComparisonStatus: 1, fecha: -1 })
       .lean(),
 
     // CFDIs ERP cancelados del periodo (hoja separada)
     CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente'] }, ...periodoFilter })
-      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
     // CFDIs ERP deshabilitados del periodo (hoja separada)
     CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: 'Deshabilitado', ...periodoFilter })
-      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
     // ERP inactivo (Cancelado/Cancelacion Pendiente/Deshabilitado) pero SAT aún Vigente — hacen diferencia
     CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Vigente', erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente', 'Deshabilitado'] }, ...periodoFilter })
-      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
@@ -1028,6 +1028,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     { key: 'nomEmisor',    header: 'Nombre Emisor',       width: 30 },
     { key: 'rfcReceptor',  header: 'RFC Receptor',        width: 15 },
     { key: 'nomReceptor',  header: 'Nombre Receptor',     width: 30 },
+    { key: 'descuento',    header: 'Descuento ERP',       width: 16 },
     { key: 'subERP',       header: 'Subtotal ERP',        width: 16 },
     { key: 'ivaTraERP',    header: 'IVA Trasladado ERP',  width: 18 },
     { key: 'ivaRetERP',    header: 'IVA Retenido ERP',    width: 18 },
@@ -1042,7 +1043,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     { key: 'tiposDisc',    header: 'Tipos Discrepancia',  width: 35 },
     { key: 'detalleDisc',  header: 'Detalle Diferencias', width: 80 },
   ];
-  const MONEY_KEYS = ['subERP','ivaTraERP','ivaRetERP','totalERP','subSAT','ivaTraSAT','totalSAT','diferencia'];
+  const MONEY_KEYS = ['descuento','subERP','ivaTraERP','ivaRetERP','totalERP','subSAT','ivaTraSAT','totalSAT','diferencia'];
 
   const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))].sort();
   const tiposEnUsoSet = new Set(tiposEnUso);
@@ -1094,7 +1095,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     hdrRow.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
     hdrRow.height = 30;
 
-    let sumSubERP = 0, sumIvaTraERP = 0, sumIvaRetERP = 0, sumTotERP = 0;
+    let sumDescuento = 0, sumSubERP = 0, sumIvaTraERP = 0, sumIvaRetERP = 0, sumTotERP = 0;
     let sumSubSAT = 0, sumIvaTraSAT = 0, sumTotSAT = 0, sumDif = 0;
     const cfdisDiferencia = []; // CFDIs que hacen la diferencia
 
@@ -1103,7 +1104,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       const satCfdi = satByUuid[(cfdi.uuid || '').toUpperCase()] || null;
       const discs   = discByUuid[cfdi.uuid] || [];
 
-      const subERP    = cfdi.subTotal || 0;
+      const descuentoERP = cfdi.descuento || 0;
+      const subERP    = (cfdi.subTotal || 0) - descuentoERP;
       const ivaTraERP = cfdi.impuestos?.totalImpuestosTrasladados || 0;
       const ivaRetERP = cfdi.impuestos?.totalImpuestosRetenidos   || 0;
       const totERP    = cfdi.total || 0;
@@ -1134,7 +1136,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
         fecha: cfdi.fecha ? new Date(cfdi.fecha).toLocaleDateString('es-MX') : '',
         rfcEmisor: cfdi.emisor?.rfc || '', nomEmisor: cfdi.emisor?.nombre || '',
         rfcReceptor: cfdi.receptor?.rfc || '', nomReceptor: cfdi.receptor?.nombre || '',
-        subERP, ivaTraERP, ivaRetERP, totalERP: totERP,
+        descuento: descuentoERP, subERP, ivaTraERP, ivaRetERP, totalERP: totERP,
         subSAT, ivaTraSAT, totalSAT: totSAT,
         diferencia: dif,
         estadoERP:    cfdi.erpStatus || '—',
@@ -1183,7 +1185,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
         row.getCell('diferencia').fill = FG_DIFF;
       }
 
-      sumSubERP    += subERP;     sumIvaTraERP += ivaTraERP;  sumIvaRetERP += ivaRetERP; sumTotERP += totERP;
+      sumDescuento += descuentoERP; sumSubERP += subERP; sumIvaTraERP += ivaTraERP; sumIvaRetERP += ivaRetERP; sumTotERP += totERP;
       sumSubSAT    += subSAT    || 0;
       sumIvaTraSAT += ivaTraSAT || 0;
       sumTotSAT    += totSAT    || 0;
@@ -1201,7 +1203,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     }
 
     // Fila totales
-    const tr = sheet.addRow({ uuid: `TOTAL (${cfdis.length} CFDIs)`, subERP: fmtNum(sumSubERP), ivaTraERP: fmtNum(sumIvaTraERP), ivaRetERP: fmtNum(sumIvaRetERP), totalERP: fmtNum(sumTotERP), subSAT: fmtNum(sumSubSAT), ivaTraSAT: fmtNum(sumIvaTraSAT), totalSAT: fmtNum(sumTotSAT), diferencia: fmtNum(sumDif) });
+    const tr = sheet.addRow({ uuid: `TOTAL (${cfdis.length} CFDIs)`, descuento: fmtNum(sumDescuento), subERP: fmtNum(sumSubERP), ivaTraERP: fmtNum(sumIvaTraERP), ivaRetERP: fmtNum(sumIvaRetERP), totalERP: fmtNum(sumTotERP), subSAT: fmtNum(sumSubSAT), ivaTraSAT: fmtNum(sumIvaTraSAT), totalSAT: fmtNum(sumTotSAT), diferencia: fmtNum(sumDif) });
     tr.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
     MONEY_KEYS.forEach(k => { tr.getCell(k).numFmt = MXN; });
     if (Math.abs(sumDif) > 0.01) tr.getCell('diferencia').fill = FG_DANGER;
@@ -1416,7 +1418,8 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           fecha: cfdi.fecha ? new Date(cfdi.fecha).toLocaleDateString('es-MX') : '',
           rfcEmisor: cfdi.emisor?.rfc || '', nomEmisor: cfdi.emisor?.nombre || '',
           rfcReceptor: cfdi.receptor?.rfc || '', nomReceptor: cfdi.receptor?.nombre || '',
-          subERP: cfdi.subTotal || 0,
+          descuento: cfdi.descuento || 0,
+          subERP: (cfdi.subTotal || 0) - (cfdi.descuento || 0),
           ivaTraERP: cfdi.impuestos?.totalImpuestosTrasladados || 0,
           ivaRetERP: cfdi.impuestos?.totalImpuestosRetenidos   || 0,
           totalERP: totERP,

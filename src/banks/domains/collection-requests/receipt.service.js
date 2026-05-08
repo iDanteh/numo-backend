@@ -823,86 +823,327 @@ async function extractReceiptDataGemini(imageBuffer, mimeType) {
 // MOTOR 2 — GOOGLE CLOUD VISION API
 // ════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+// HELPERS DE PREPROCESAMIENTO
+// ════════════════════════════════════════════════════════════════════════════
+
 /**
- * Preprocesa la imagen para maximizar la precisión del OCR.
+ * Clasifica la imagen como screenshot digital o fotografía física.
  *
- * Pipeline:
- *  1. Upscale — si ancho o alto < 1200 px (verifica ambas dimensiones para screenshots
- *     angostos como recibos BBVA o screenshots verticales de SPEI).
- *  2. Escala de grises — elimina varianza de color que introduce ruido en Tesseract.
- *  3. Corrección gamma — aclara imágenes oscuras (fotos nocturnas, WhatsApp con poca luz).
- *     sharp.gamma(n) aplica pixel^(1/n): mayor n = más aclarado.
- *  4. Sharpen — compensa el blur de compresión JPEG/WhatsApp.
- *  5. Normalize — estira el histograma al rango completo 0–255.
- *  6. Binarización adaptativa al fondo:
- *       · Fondo claro (texto oscuro): threshold(145) → texto negro, fondo blanco.
- *       · Fondo oscuro (texto claro): negate() + threshold(145) → mismo resultado.
- *       · Brillo intermedio (80–140): se omite para no destruir detalles de fotos.
- *     Umbral 145 en lugar de 128 para preservar trazos delgados en fuentes ligeras.
- *  7. Salida PNG (lossless) — JPEG introduciría artefactos de bloque en imágenes binarizadas.
+ * Heurística: los screenshots bancarios tienen fondos casi puros (blanco, negro
+ * o un color corporativo sólido). Se mide la proporción de píxeles extremos
+ * (>242 ó <13 en escala de grises) sobre un muestreo de 150×150 px.
+ * Screenshots suelen superar el 35 % de píxeles "puros"; las fotos, no.
  *
- * Si sharp no está disponible o falla en cualquier paso, devuelve el buffer original.
+ * El resultado determina el agresividad del pipeline:
+ *   screenshot → conservador (no destruir píxeles perfectos)
+ *   foto       → agresivo   (compensar ruido, blur, inclinación)
+ */
+async function detectIsScreenshot(buffer) {
+  try {
+    const sharp = require('sharp');
+    const { data } = await sharp(buffer)
+      .grayscale()
+      .resize({ width: 150, height: 150, fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    let pureWhite = 0, pureBlack = 0;
+    for (const px of data) {
+      if (px > 242) pureWhite++;
+      else if (px < 13) pureBlack++;
+    }
+    return (pureWhite + pureBlack) / data.length > 0.35;
+  } catch {
+    return false; // asumir foto en caso de error
+  }
+}
+
+/**
+ * Upscaling diferenciado según tipo de imagen.
+ *
+ * Screenshots → target 1 400 px en la dimensión menor (ya son nítidos,
+ *               solo necesitan resolución suficiente para el LSTM).
+ * Fotos       → target 1 800 px (compensar blur de cámara, compresión
+ *               JPEG/WhatsApp y pérdida de detalle por distancia).
+ * Máximo 3× para no introducir artefactos de escalado excesivo.
+ * Kernel Lanczos3: mayor fidelidad que bilineal o bicúbico al escalar.
+ */
+async function smartUpscale(buffer, isScreenshot) {
+  try {
+    const sharp = require('sharp');
+    const { width: w, height: h } = await sharp(buffer).metadata();
+    if (!w || !h) return buffer;
+
+    const minDim    = Math.min(w, h);
+    const targetMin = isScreenshot ? 1400 : 1800;
+    if (minDim >= targetMin) return buffer;
+
+    const scale = Math.min(3, targetMin / minDim);
+    return sharp(buffer)
+      .resize(Math.round(w * scale), Math.round(h * scale), {
+        kernel:             'lanczos3',
+        withoutEnlargement: false,
+      })
+      .toBuffer();
+  } catch {
+    return buffer;
+  }
+}
+
+/**
+ * Detecta el ángulo de inclinación fino del texto (rango ±10°) usando el
+ * método de varianza de proyecciones horizontales.
+ *
+ * Principio: cuando las líneas de texto están perfectamente horizontales,
+ * las sumas de píxeles por fila muestran alta varianza (filas densas de
+ * texto alternan con filas vacías de espacio). Al rotar la imagen en el
+ * ángulo correcto, esa varianza se maximiza.
+ *
+ * Se trabaja sobre una copia reducida (≤ 400 px de ancho) para eficiencia.
+ * Resolución angular: 0.5° — suficiente para OCR con LSTM.
+ *
+ * @returns {number} ángulo de corrección en grados (0 si la inclinación < 0.5°)
+ */
+async function detectSkewAngle(grayBuffer) {
+  try {
+    const sharp = require('sharp');
+    const { data, info } = await sharp(grayBuffer)
+      .resize({ width: 400, withoutEnlargement: true })
+      .threshold(128)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const { width, height } = info;
+    const cx = width  / 2;
+    const cy = height / 2;
+
+    let bestAngle    = 0;
+    let bestVariance = -1;
+
+    for (let deg = -10; deg <= 10; deg += 0.5) {
+      const rad     = deg * Math.PI / 180;
+      const cosA    = Math.cos(rad);
+      const sinA    = Math.sin(rad);
+      const rowSums = new Int32Array(height);
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          // Rotación inversa: encontrar el píxel fuente para la posición rotada
+          const sx = Math.round(cosA * (x - cx) + sinA * (y - cy) + cx);
+          const sy = Math.round(-sinA * (x - cx) + cosA * (y - cy) + cy);
+          if (sx >= 0 && sx < width && sy >= 0 && sy < height) {
+            if (data[sy * width + sx] < 128) rowSums[y]++; // píxel oscuro = texto
+          }
+        }
+      }
+
+      let sum = 0;
+      for (let i = 0; i < height; i++) sum += rowSums[i];
+      const mean = sum / height;
+      let variance = 0;
+      for (let i = 0; i < height; i++) variance += (rowSums[i] - mean) ** 2;
+      variance /= height;
+
+      if (variance > bestVariance) {
+        bestVariance = variance;
+        bestAngle    = deg;
+      }
+    }
+
+    return Math.abs(bestAngle) >= 0.5 ? bestAngle : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Binarización adaptativa Bradley-Roth con imagen integral — O(n).
+ *
+ * Ventaja sobre threshold global: calcula un umbral diferente para cada
+ * píxel basado en el promedio local de sus vecinos en una ventana
+ * windowSize×windowSize. Esto preserva texto fino en zonas con:
+ *   • Fondos con gradiente (BBVA azul, Nu morado, Santander rojo)
+ *   • Iluminación no uniforme (foto de papel bajo luz lateral)
+ *   • Texto de múltiples tamaños en la misma imagen
+ *
+ * Fórmula: texto si pixel < mean_local × (1 – k)
+ *   k menor (0.10–0.15) → conserva más texto; puede capturar algo de ruido.
+ *   k mayor (0.18–0.25) → imagen más limpia; puede perder trazos muy finos.
+ *
+ * La imagen integral permite calcular la suma de cualquier rectángulo
+ * en O(1) con 4 accesos, llevando la complejidad total a O(n).
+ *
+ * @param {Buffer} grayBuffer  PNG en escala de grises (fondo claro asumido)
+ * @param {number} windowSize  Tamaño de ventana local en px (impar, default 29)
+ * @param {number} k           Factor de offset del umbral (default 0.15)
+ */
+async function adaptiveThreshold(grayBuffer, windowSize = 29, k = 0.15) {
+  const sharp = require('sharp');
+
+  const { data, info } = await sharp(grayBuffer)
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height } = info;
+  const half = Math.floor(windowSize / 2);
+
+  // Imagen integral: integral[y*w+x] = suma de todos los px en rect (0,0)→(x,y)
+  const integral = new Float64Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i        = y * width + x;
+      const above    = y > 0             ? integral[(y - 1) * width + x]          : 0;
+      const left     = x > 0             ? integral[y * width + (x - 1)]          : 0;
+      const aboveLft = (y > 0 && x > 0) ? integral[(y - 1) * width + (x - 1)]    : 0;
+      integral[i]    = data[i] + above + left - aboveLft;
+    }
+  }
+
+  const output = Buffer.alloc(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const x1 = Math.max(0, x - half);
+      const y1 = Math.max(0, y - half);
+      const x2 = Math.min(width  - 1, x + half);
+      const y2 = Math.min(height - 1, y + half);
+
+      const count     = (x2 - x1 + 1) * (y2 - y1 + 1);
+      const sum       = integral[y2 * width + x2]
+        - (x1 > 0            ? integral[y2 * width + (x1 - 1)]          : 0)
+        - (y1 > 0            ? integral[(y1 - 1) * width + x2]          : 0)
+        + (x1 > 0 && y1 > 0 ? integral[(y1 - 1) * width + (x1 - 1)]    : 0);
+
+      const localMean = sum / count;
+      // Texto (oscuro) si cae por debajo del umbral local adaptativo
+      output[y * width + x] = data[y * width + x] < localMean * (1 - k) ? 0 : 255;
+    }
+  }
+
+  return sharp(output, { raw: { width, height, channels: 1 } }).png().toBuffer();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PREPROCESADOR PRINCIPAL
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Preprocesa una imagen de comprobante para maximizar la precisión del OCR.
+ *
+ * Pipeline de 8 pasos — cada uno mejora una dimensión distinta:
+ *
+ *  0. Auto-rotación EXIF        Corrige fotos tomadas con el teléfono girado
+ *                               (sharp.rotate() sin args aplica el metadato EXIF).
+ *  1. Clasificación de imagen   screenshot vs fotografía física → determina
+ *                               la agresividad de todos los pasos siguientes.
+ *  2. Upscaling inteligente     screenshot ≥1 400 px / foto ≥1 800 px (min-dim).
+ *                               Lanczos3 para máxima fidelidad. Máximo 3×.
+ *  3. Escala de grises + stats  Base para decisiones adaptativas posteriores:
+ *                               avgBrightness (gamma) y stdDev (binarización).
+ *  4. Deskew fino (solo fotos)  Detecta inclinaciones de ±0.5–10° y las
+ *                               corrige antes del OCR. El LSTM de Tesseract no
+ *                               compensa inclinaciones > 2–3° por sí solo.
+ *  5. Corrección gamma          Aclara imágenes oscuras (fotos nocturnas,
+ *                               WhatsApp con poca luz). Adaptativa al brillo.
+ *  6. Sharpen diferenciado      Fotos: agresivo (compensa blur de cámara).
+ *                               Screenshots: suave (ya son nítidos).
+ *  7. CLAHE                     Ecualización de histograma adaptativa local en
+ *                               tiles de 64×64 px. Preserva contraste local en
+ *                               fondos de gradiente e iluminación no uniforme.
+ *                               Muy superior a .normalize() global para fondos
+ *                               de color (BBVA azul, Nu morado, Santander rojo).
+ *  8. Binarización adaptativa   Bradley-Roth (imagen integral, O(n)): umbral
+ *                               local por píxel. Funciona en gradientes, texto
+ *                               pequeño y fondos con marca de agua donde el
+ *                               threshold global falla por completo.
+ *
+ * Si cualquier paso falla, devuelve el buffer original sin modificar.
  */
 async function preprocessImage(imageBuffer) {
   try {
     const sharp = require('sharp');
-    const meta  = await sharp(imageBuffer).metadata();
-    const w     = meta.width  || 0;
-    const h     = meta.height || 0;
 
-    // Medir brillo promedio tras convertir a grises (instancia separada, no modifica pipeline)
-    const stats         = await sharp(imageBuffer).grayscale().stats();
-    const avgBrightness = stats.channels[0].mean; // 0–255
+    // ── 0. Auto-rotación EXIF ──────────────────────────────────────────────
+    // sharp.rotate() sin argumento lee el campo Orientation del EXIF y aplica
+    // la rotación correspondiente. Resuelve el 90 % de los casos de fotos
+    // tomadas con el teléfono en posición no estándar sin coste adicional.
+    let buf = await sharp(imageBuffer, { failOn: 'none' }).rotate().toBuffer();
 
-    let pipeline = sharp(imageBuffer, { failOn: 'none' });
+    // ── 1. Clasificar tipo de imagen ───────────────────────────────────────
+    const isScreenshot = await detectIsScreenshot(buf);
 
-    // 1. Upscale — verifica la dimensión mínima para capturar screenshots angostos
-    const minDim = Math.min(w || Infinity, h || Infinity);
-    if (minDim < 1200 && minDim > 0) {
-      const scale = Math.min(2, 1800 / minDim);
-      pipeline = pipeline.resize({
-        width:              Math.round(w * scale),
-        withoutEnlargement: false,
-        kernel:             'lanczos3',
-      });
-    } else if (w > 0 && w < 1400) {
-      pipeline = pipeline.resize({
-        width:              Math.max(w * 2, 1800),
-        withoutEnlargement: false,
-        kernel:             'lanczos3',
-      });
+    // ── 2. Upscaling inteligente ───────────────────────────────────────────
+    buf = await smartUpscale(buf, isScreenshot);
+
+    // ── 3. Escala de grises y estadísticas de brillo ───────────────────────
+    const grayBuf       = await sharp(buf).grayscale().png().toBuffer();
+    const stats         = await sharp(grayBuf).stats();
+    const avgBrightness = stats.channels[0].mean;   // 0–255
+    const stdDev        = stats.channels[0].stdev;  // variación de iluminación
+
+    // ── 4. Corrección de inclinación (solo fotografías) ────────────────────
+    // Los screenshots siempre están perfectamente alineados (el SO lo garantiza).
+    // Las fotos de papel o de pantalla pueden tener inclinaciones de 2–10° que
+    // el LSTM de Tesseract no puede compensar y que reducen la precisión
+    // al confundir el detector de líneas de texto.
+    let correctedBuf = grayBuf;
+    if (!isScreenshot) {
+      const skewAngle = await detectSkewAngle(grayBuf);
+      if (Math.abs(skewAngle) >= 0.5) {
+        correctedBuf = await sharp(grayBuf)
+          .rotate(-skewAngle, { background: { r: 255, g: 255, b: 255, alpha: 1 } })
+          .png()
+          .toBuffer();
+      }
     }
 
-    // 2. Escala de grises
-    pipeline = pipeline.grayscale();
+    // ── 5. Corrección gamma ────────────────────────────────────────────────
+    let pipeline = sharp(correctedBuf, { failOn: 'none' });
+    if      (avgBrightness < 50)  pipeline = pipeline.gamma(3.0); // muy oscura
+    else if (avgBrightness < 100) pipeline = pipeline.gamma(2.2); // moderadamente oscura
 
-    // 3. Corrección gamma para imágenes oscuras
-    if (avgBrightness < 50) {
-      pipeline = pipeline.gamma(3.0);   // muy oscura — aclarar agresivamente
-    } else if (avgBrightness < 100) {
-      pipeline = pipeline.gamma(2.2);   // moderadamente oscura — corrección estándar sRGB
+    // ── 6. Sharpen diferenciado ────────────────────────────────────────────
+    pipeline = isScreenshot
+      ? pipeline.sharpen({ sigma: 0.8, m1: 1.0, m2: 0.3 })  // suave: ya es nítido
+      : pipeline.sharpen({ sigma: 1.5, m1: 2.0, m2: 0.7 }); // agresivo: compensar blur
+
+    // ── 7. CLAHE — ecualización de histograma adaptativa local ─────────────
+    // A diferencia de .normalize() que estira el histograma globalmente,
+    // CLAHE ajusta el contraste de forma independiente en tiles de 64×64 px.
+    // Resultado: texto en zonas claras y oscuras de la misma imagen queda
+    // igualmente definido. maxSlope:4 limita la amplificación de ruido
+    // en zonas homogéneas (fondos lisos sin texto).
+    pipeline = pipeline.clahe({ width: 64, height: 64, maxSlope: 4 });
+
+    // Invertir fondos oscuros ANTES de la binarización adaptativa para
+    // garantizar que la salida siempre sea texto oscuro sobre fondo claro
+    // (convención que Tesseract LSTM espera).
+    if (avgBrightness < 80) pipeline = pipeline.negate();
+
+    const enhancedBuf = await pipeline.png().toBuffer();
+
+    // ── 8. Binarización adaptativa Bradley-Roth ────────────────────────────
+    // Se aplica cuando hay variación de iluminación (stdDev > 35) o cuando
+    // es un screenshot con fondo de color (donde el threshold global destruye
+    // texto en la zona del header de color corporativo).
+    // Para imágenes uniformes y muy claras, threshold global es más rápido.
+    const useAdaptive = isScreenshot || stdDev > 35;
+
+    if (useAdaptive) {
+      // Screenshots: ventana pequeña — el texto es uniforme y el fondo también.
+      // Fotos:       ventana grande  — compensa iluminación no uniforme por zona.
+      // k menor → preserva más trazos finos (riesgo: algo de ruido de fondo).
+      // k mayor → imagen más limpia  (riesgo: trazos muy finos desaparecen).
+      const windowSize = isScreenshot ? 25 : 45;
+      const k          = isScreenshot ? 0.12 : 0.20;
+      return await adaptiveThreshold(enhancedBuf, windowSize, k);
     }
 
-    // 4. Sharpen
-    pipeline = pipeline.sharpen({ sigma: 1.3, m1: 1.5, m2: 0.5 });
+    // Imagen de alto contraste uniforme → threshold global más rápido
+    return await sharp(enhancedBuf).threshold(140).png().toBuffer();
 
-    // 5. Normalize
-    pipeline = pipeline.normalize();
-
-    // 6. Binarización adaptativa según el tipo de fondo
-    if (avgBrightness > 140) {
-      // Fondo claro (screenshots de apps bancarias, mayoría de los casos)
-      pipeline = pipeline.threshold(145);
-    } else if (avgBrightness < 80) {
-      // Fondo oscuro (BBVA modo oscuro, pantallas con fondo negro)
-      pipeline = pipeline.negate().threshold(145);
-    }
-    // 80–140: foto de papel o imagen con iluminación variable — normalize es suficiente
-
-    // 7. PNG lossless
-    return await pipeline.png().toBuffer();
   } catch {
-    return imageBuffer; // si falla el preproceso, continúa con el original
+    return imageBuffer; // fallback: buffer original si falla cualquier paso
   }
 }
 

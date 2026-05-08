@@ -943,7 +943,7 @@ async function exportMovements(filters) {
     { header: 'Saldo',            key: 'saldo',              width: 16 },
     { header: 'Categoría',        key: 'categoria',          width: 20 },
     { header: 'Estado',           key: 'status',             width: 16 },
-    { header: 'IDs ERP',          key: 'erpIds',             width: 30 },
+    { header: 'Serie-Folio ERP',  key: 'erpIds',             width: 30 },
     { header: 'Saldo ERP',        key: 'saldoErp',           width: 16 },
     { header: 'N° Autorización',  key: 'numeroAutorizacion', width: 20 },
     { header: 'Identificado por', key: 'identificadoPor',    width: 24 },
@@ -969,7 +969,9 @@ async function exportMovements(filters) {
       saldo:              m.saldo    ?? null,
       categoria:          m.categoria ?? null,
       status:             STATUS_LABELS[m.status] ?? m.status,
-      erpIds:             (m.erpIds || []).join(', ') || null,
+      erpIds:             (m.erpLinks || [])
+                            .map(l => (l.serie && l.folioExterno) ? `${l.serie}-${l.folioExterno}` : (l.folioExterno || l.erpId))
+                            .join(', ') || null,
       saldoErp:           m.saldoErp ?? null,
       numeroAutorizacion: m.numeroAutorizacion ?? null,
       identificadoPor:    [...new Set((m.identificadoPor || []).map(e => e.nombre || e.userId || '?'))].join(', ') || null,
@@ -987,9 +989,15 @@ async function exportMovements(filters) {
   return workbook.xlsx.writeBuffer();
 }
 
+async function deleteMovements(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) throw new BadRequestError('Se requiere al menos un ID');
+  const result = await BankMovement.deleteMany({ _id: { $in: ids } });
+  return { deleted: result.deletedCount };
+}
+
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
-  exportMovements,
+  exportMovements, deleteMovements,
 };

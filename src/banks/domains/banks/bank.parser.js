@@ -334,11 +334,17 @@ const SANTANDER_REQUIRED = ['fecha', 'monto', 'saldo'];
 
 const AZTECA_ALIASES = {
   fecha:        ['fecha', 'date', 'f.operaci', 'f.valor'],
-  concepto:     ['concepto', 'descripci', 'movimiento', 'detalle'],
+  // 'movimiento' se elimina de concepto para evitar conflicto con la columna
+  // "MOVIMIENTO" que el nuevo formato de Azteca usa como número de autorización.
+  concepto:     ['concepto', 'descripci', 'detalle'],
   deposito:     ['depósito', 'deposito', 'abono', 'crédito', 'credito', 'ingreso', 'haber'],
   retiro:       ['retiro', 'cargo', 'débito', 'debito', 'egreso', 'debe'],
+  // El nuevo formato de Azteca (2026) consolida depósito y retiro en una sola
+  // columna "IMPORTE" con signo (+depósito / -retiro).
+  importe:      ['importe'],
   saldo:        ['saldo', 'balance'],
-  autorizacion: ['autoriza', 'folio', 'id aut', 'num. aut', 'referencia', 'clave'],
+  // "MOVIMIENTO" es el ID de operación en el nuevo formato de Azteca.
+  autorizacion: ['autoriza', 'folio', 'id aut', 'num. aut', 'referencia', 'clave', 'movimiento'],
 };
 const AZTECA_REQUIRED = ['fecha', 'concepto', 'saldo'];
 
@@ -753,8 +759,6 @@ function parseAzteca(sheet, uploadDate) {
     // si el banco la incluye se ignorará porque no hay alias mapeado para ella.
     const col1 = v[colMap ? colMap.fecha        : 1]; // Fecha
     const col3 = v[colMap ? colMap.concepto     : 3]; // Concepto
-    const col4 = v[colMap ? colMap.deposito     : 4]; // Depósito
-    const col5 = v[colMap ? colMap.retiro       : 5]; // Retiro (puede ser negativo)
     const col6 = v[colMap ? colMap.saldo        : 6]; // Saldo
     const col7 = v[colMap ? colMap.autorizacion : 7]; // ID Autorización
 
@@ -764,8 +768,20 @@ function parseAzteca(sheet, uploadDate) {
     // Descartar filas completamente vacías (sin fecha ni concepto ni saldo)
     if (!fechaDate && !conceptoText && toNumber(col6) === null) return;
 
-    const depositoRaw = toNumber(col4);
-    const retiroRaw   = toNumber(col5);
+    // El nuevo formato de Azteca (2026) usa una sola columna "IMPORTE" con signo
+    // (positivo = depósito, negativo = retiro) en lugar de dos columnas separadas.
+    // Si colMap.importe está disponible se usa ese campo; de lo contrario se
+    // mantiene la lógica con columnas deposito/retiro (formato anterior o modo
+    // posicional como fallback).
+    let depositoRaw, retiroRaw;
+    if (colMap && colMap.importe !== undefined) {
+      const importeVal = toNumber(v[colMap.importe]);
+      depositoRaw = importeVal !== null && importeVal > 0 ? importeVal : null;
+      retiroRaw   = importeVal !== null && importeVal < 0 ? importeVal : null;
+    } else {
+      depositoRaw = toNumber(v[colMap ? colMap.deposito : 4]);
+      retiroRaw   = toNumber(v[colMap ? colMap.retiro   : 5]);
+    }
 
     const deposito = depositoRaw !== null && depositoRaw > 0 ? depositoRaw        : null;
     const retiro   = retiroRaw   !== null && retiroRaw   < 0 ? Math.abs(retiroRaw) : null;

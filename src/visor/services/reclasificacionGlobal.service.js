@@ -103,6 +103,8 @@ const _analizarCFDI = (cfdi, infoGlobal) => {
     _id:                    cfdi._id,
     uuid:                   cfdi.uuid,
     source:                 cfdi.source,
+    subTotal:               cfdi.subTotal ?? null,
+    total:                  cfdi.total ?? null,
     mesInformacionGlobal:   infoGlobal.mes  ?? null,
     anioInformacionGlobal:  infoGlobal.anio ?? null,
     mesCorrecto,
@@ -159,7 +161,7 @@ const generarPlan = async (filtros = {}) => {
     'informacionGlobal.mes': mesIGVals
       ? { $in: mesIGVals }
       : { $exists: true, $ne: null },
-  }, 'uuid source fecha periodo ejercicio informacionGlobal').lean();
+  }, 'uuid source fecha periodo ejercicio informacionGlobal subTotal total').lean();
 
   // ── Consulta 2: CFDIs SAT sin el campo pero con xmlContent que contenga InformacionGlobal
   //    (datos existentes antes de esta actualización)
@@ -168,7 +170,7 @@ const generarPlan = async (filtros = {}) => {
     ...filtroBase,
     'informacionGlobal.mes': { $exists: false },
     xmlContent:              { $regex: 'InformacionGlobal' },
-  }).select('uuid source fecha periodo ejercicio +xmlContent').lean();
+  }).select('uuid source fecha periodo ejercicio subTotal total +xmlContent').lean();
 
   const uuidsYaIncluidos = new Set(conCampo.map(c => c.uuid));
   const sinCampoFiltrado = sinCampo.filter(c => !uuidsYaIncluidos.has(c.uuid));

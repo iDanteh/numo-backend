@@ -75,6 +75,14 @@ const discrepancySchema = new mongoose.Schema({
   },
   notes: [{ type: String }],
 
+  comentarios: [{
+    motivo:      { type: String, required: true },
+    descripcion: { type: String, default: '' },
+    creadoPor:   { type: String, default: '' },   // nombre o email del usuario
+    creadoEn:    { type: Date,   default: Date.now },
+    _id: false,
+  }],
+
   // Ejercicio fiscal y periodo derivados de la fecha del CFDI ERP
   ejercicio:         { type: Number, index: true },
   periodo:           { type: Number, min: 1, max: 12, index: true },

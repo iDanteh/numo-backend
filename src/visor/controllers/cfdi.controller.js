@@ -13,6 +13,16 @@ const { generarPlan, aplicarReclasificacion } = require('../services/reclasifica
 const Comparison = require('../models/Comparison');
 const { logger } = require('../../shared/utils/logger');
 
+const MONTO_EFECTIVO_EXPR = {
+  $round: [{
+    $cond: {
+      if:   { $and: [{ $eq: ['$tipoDeComprobante', 'P'] }, { $eq: ['$total', 0] }] },
+      then: { $ifNull: ['$complementoPago.totales.montoTotalPagos', { $ifNull: ['$complementoPago.pagos.0.monto', 0] }] },
+      else: '$total',
+    },
+  }, 2],
+};
+
 const TIPOS_COMPROBANTE = {
   ingreso: 'I', egreso: 'E', traslado: 'T',
   nómina: 'N', nomina: 'N', pago: 'P',
@@ -187,16 +197,31 @@ const list = asyncHandler(async (req, res) => {
   }
   if (search) filter.$text = { $search: search };
 
-  const [cfdis, total] = await Promise.all([
+  const [cfdis, total, totalesAgg] = await Promise.all([
     CFDI.find(filter, { xmlContent: 0 })
       .sort({ fecha: -1 })
       .skip(skip(pg, lm))
       .limit(lm)
       .lean(),
     CFDI.countDocuments(filter),
+    CFDI.aggregate([
+      { $match: filter },
+      { $group: { _id: '$tipoDeComprobante', suma: { $sum: MONTO_EFECTIVO_EXPR }, sumaSubTotal: { $sum: { $subtract: ['$subTotal', { $ifNull: ['$descuento', 0] }] } }, sumaTotal: { $sum: '$total' }, count: { $sum: 1 } } },
+    ]),
   ]);
 
-  res.json(paginate(cfdis, total, pg, lm));
+  const totales = { suma: 0, sumaSubTotal: 0, sumaTotal: 0, porTipo: {} };
+  for (const t of totalesAgg) {
+    totales.suma       += t.suma       || 0;
+    totales.sumaSubTotal += t.sumaSubTotal || 0;
+    totales.sumaTotal  += t.sumaTotal  || 0;
+    totales.porTipo[t._id || '?'] = { suma: t.suma || 0, sumaSubTotal: t.sumaSubTotal || 0, sumaTotal: t.sumaTotal || 0, count: t.count };
+  }
+  totales.suma         = Math.round(totales.suma         * 100) / 100;
+  totales.sumaSubTotal = Math.round(totales.sumaSubTotal * 100) / 100;
+  totales.sumaTotal    = Math.round(totales.sumaTotal    * 100) / 100;
+
+  res.json({ ...paginate(cfdis, total, pg, lm), totales });
 });
 
 /**
@@ -688,7 +713,7 @@ const remove = asyncHandler(async (req, res) => {
  *
  * Campos esperados del ERP:
  *   ID, UUID, TipoComprobante, FechaGeneracion, Serie, Folio, UUIDRelacion,
- *   RFCEmisor, RFCReceptor, NombreReceptor, UsoCfdi, Subtotal, TotalIVA,
+ *   RFCEmisor, RFCReceptor, NombreReceptor, UsoCfdi, Subtotal, Descuento, TotalIVA,
  *   TotalRetenciones, Importe, Moneda, TipoCambio, FormaPago, MetodoPago,
  *   FechaPago, SelloCFD, SelloSAT, NoCertificado, NoCertificadoSAT,
  *   FechaTimbrado, RfcProvCertif, Estatus, EstatusSAT, FechaCancelacion,
@@ -794,6 +819,7 @@ const importFromErpApi = asyncHandler(async (req, res) => {
         moneda:     row.Moneda     || row.moneda     || 'MXN',
         tipoCambio: parseNum(row.TipoCambio || row.tipoCambio) ?? undefined,
         subTotal:   parseNum(row.Subtotal   || row.subtotal)   ?? importe,
+        descuento:  parseNum(row.Descuento  || row.descuento)  ?? 0,
         total:      importe,
         emisor:   { rfc: rfcEmisor },
         receptor: {
@@ -996,7 +1022,7 @@ const exportExcel = asyncHandler(async (req, res) => {
  * Query params: ejercicio, periodo, rfc, source
  */
 const planReclasificacionGlobal = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, rfc, source, mesIG } = req.query;
+  const { ejercicio, periodo, rfc, source, mesIG, page, limit } = req.query;
   const plan = await generarPlan({
     ejercicio: ejercicio ? Number(ejercicio) : undefined,
     periodo:   periodo   ? Number(periodo)   : undefined,
@@ -1004,7 +1030,20 @@ const planReclasificacionGlobal = asyncHandler(async (req, res) => {
     source:    source    || undefined,
     mesIG:     mesIG     ? Number(mesIG)     : undefined,
   });
-  res.json({ success: true, data: plan });
+
+  const pg = Math.max(1, Number(page)  || 1);
+  const lm = Math.min(200, Math.max(1, Number(limit) || 20));
+  const allDetalle = plan.detalle ?? [];
+  const total  = allDetalle.length;
+  const pages  = Math.max(1, Math.ceil(total / lm));
+  const start  = (pg - 1) * lm;
+  plan.detalle = allDetalle.slice(start, start + lm);
+
+  res.json({
+    success: true,
+    data: plan,
+    pagination: { total, page: pg, limit: lm, pages },
+  });
 });
 
 /**

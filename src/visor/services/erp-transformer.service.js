@@ -305,6 +305,7 @@ const transformar = (factura, { ejercicio, periodo, uploadedBy }) => {
   // ── Campos opcionales ──────────────────────────────────────────────────────
   const rfcEmisor  = (factura.RFCEmisor ?? factura.RfcEmisor ?? 'DESCONOCIDO').toString().trim().toUpperCase();
   const subTotal   = parseNum(factura.SubTotal ?? factura.Subtotal) ?? total;
+  const descuento  = parseNum(factura.Descuento) ?? 0;
   const tipoCambio = parseNum(factura.TipoCambio) ?? 1;
 
   const totalIVA         = parseNum(factura.TotalIVA ?? factura.TotalImpuestosTrasladados) ?? 0;
@@ -352,6 +353,7 @@ const transformar = (factura, { ejercicio, periodo, uploadedBy }) => {
     tipoDeComprobante: tipo,
     total,
     subTotal,
+    descuento,
     moneda:    factura.Moneda || 'MXN',
     tipoCambio,
     emisor:    { rfc: rfcEmisor, nombre: factura.NombreEmisor || undefined },
@@ -460,6 +462,7 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
 
   // ── Campos opcionales ──────────────────────────────────────────────────────
   const subTotal         = parseNum(factura?.SubTotal ?? factura?.Subtotal) ?? total;
+  const descuento        = parseNum(factura?.Descuento) ?? 0;
   const tipoCambio       = parseNum(factura?.TipoCambio) ?? 1;
   const totalIVA         = parseNum(factura?.TotalIVA ?? factura?.TotalImpuestosTrasladados) ?? 0;
   const totalRetenciones = 0; // TotalRetenciones del ERP duplica TotalIVA, no es retención real
@@ -511,6 +514,7 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
     tipoDeComprobante: tipo ?? null,
     total,
     subTotal,
+    descuento,
     moneda:    factura?.Moneda || 'MXN',
     tipoCambio,
     emisor:   { rfc: rfcEmisor, nombre: factura?.NombreEmisor || undefined },

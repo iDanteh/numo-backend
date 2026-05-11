@@ -13,6 +13,25 @@
  *     (uploadDate), siempre que la fila tenga al menos concepto o saldo.
  *     Las filas completamente vacías se descartan.
  *
+ * Formatos soportados por banco (ambos detectados automáticamente):
+ *  - BBVA:      encabezado o posicional (Fecha|Concepto|Cargo|Abono|Saldo)
+ *  - Banamex:   encabezado o posicional (Fecha|Concepto|Depósito|Retiro|Saldo)
+ *  - Santander: dos formatos:
+ *      · Formato A (clásico, sin encabezado):
+ *          col1=Fecha(string DDMMYYYY) | col2=Hora | col3=Sucursal |
+ *          col4=Concepto | col5=Signo(+/-) | col6=Monto | col7=Saldo |
+ *          col8=ID Autorización | col9=Referencia adicional
+ *      · Formato B (nuevo, con encabezado, 21 columnas):
+ *          Cuenta | Fecha | Hora | Sucursal | Descripcion | Cargo/Abono |
+ *          Importe | Saldo | Referencia | Concepto | Banco Participante | ...
+ *  - Azteca:    dos formatos:
+ *      · Formato A (clásico, sin encabezado):
+ *          col1=Fecha(Date) | col2=Fecha duplicada | col3=Concepto |
+ *          col4=Depósito | col5=Retiro(negativo) | col6=Saldo | col7=ID
+ *      · Formato B (nuevo, con encabezado):
+ *          NUMERO DE CUENTA | FECHA DE OPERACION | FECHA DE APLICACION |
+ *          CONCEPTO | IMPORTE(signo +/-) | SALDO | MOVIMIENTO(ID)
+ *
  * Lógica de discriminación:
  *  - BBVA:    ignora movimientos cuyo concepto contenga 'SQ', 'Traspaso entre cuentas propias' u 'openmx'
  *  - Banamex: ignora movimientos cuyo concepto contenga 'Evopaymx'
@@ -21,8 +40,13 @@
  * No. de Autorización:
  *  - BBVA:      primer token después del '/' en el concepto
  *  - Banamex:   sub-fila "No. de Autorización: XXXXX"
- *  - Santander: columna ID inmediatamente después de Saldo (vals[8] en posicional)
- *  - Azteca:    columna ID inmediatamente después de Saldo (vals[7] en posicional)
+ *  - Santander: columna Referencia (posicional col8, encabezado "Referencia")
+ *  - Azteca:    columna MOVIMIENTO (posicional col7, encabezado "MOVIMIENTO")
+ *
+ * Auto-detección de banco (fallback cuando el nombre de hoja no coincide):
+ *  Se usa scoring de calidad: cuenta movimientos que tienen fecha Y al menos
+ *  depósito o retiro asignado. Esto evita elegir un parser que produce
+ *  movimientos vacíos (sin montos) aunque su conteo total sea igual.
  */
 
 const ExcelJS = require('exceljs');
@@ -334,11 +358,17 @@ const SANTANDER_REQUIRED = ['fecha', 'monto', 'saldo'];
 
 const AZTECA_ALIASES = {
   fecha:        ['fecha', 'date', 'f.operaci', 'f.valor'],
-  concepto:     ['concepto', 'descripci', 'movimiento', 'detalle'],
+  // 'movimiento' se elimina de concepto para evitar conflicto con la columna
+  // "MOVIMIENTO" que el nuevo formato de Azteca usa como número de autorización.
+  concepto:     ['concepto', 'descripci', 'detalle'],
   deposito:     ['depósito', 'deposito', 'abono', 'crédito', 'credito', 'ingreso', 'haber'],
   retiro:       ['retiro', 'cargo', 'débito', 'debito', 'egreso', 'debe'],
+  // El nuevo formato de Azteca (2026) consolida depósito y retiro en una sola
+  // columna "IMPORTE" con signo (+depósito / -retiro).
+  importe:      ['importe'],
   saldo:        ['saldo', 'balance'],
-  autorizacion: ['autoriza', 'folio', 'id aut', 'num. aut', 'referencia', 'clave'],
+  // "MOVIMIENTO" es el ID de operación en el nuevo formato de Azteca.
+  autorizacion: ['autoriza', 'folio', 'id aut', 'num. aut', 'referencia', 'clave', 'movimiento'],
 };
 const AZTECA_REQUIRED = ['fecha', 'concepto', 'saldo'];
 
@@ -620,7 +650,9 @@ function parseBBVA(sheet, uploadDate) {
 /**
  * Santander
  *
- * Estructura posicional de columnas (ExcelJS 1-based):
+ * Soporta dos formatos detectados automáticamente via isLikelyHeaderRow:
+ *
+ * Formato A — Clásico (sin encabezado, primera celda = fecha como string):
  *   vals[1]  = Fecha (string "'DDMMYYYY'" con apóstrofe de Excel)
  *   vals[2]  = Hora
  *   vals[3]  = Sucursal
@@ -631,9 +663,22 @@ function parseBBVA(sheet, uploadDate) {
  *   vals[8]  = ID Autorización
  *   vals[9]  = Referencia adicional / Banco origen
  *
- * Nota: en modo encabezado, hora y sucursal se ignoran (no se mapean a ningún
- * campo del movimiento). El concepto final se construye concatenando concepto
- * y referencia extra si esta existe.
+ * Formato B — Nuevo (con encabezado de 21 columnas, primera celda = "Cuenta"):
+ *   col1  = Cuenta           (número de cuenta, ignorado)
+ *   col2  = Fecha            (string "'DDMMYYYY'")
+ *   col3  = Hora             (ignorada)
+ *   col4  = Sucursal         (ignorada)
+ *   col5  = Descripcion      → concepto principal
+ *   col6  = Cargo/Abono      → signo '+' o '-'
+ *   col7  = Importe          → monto
+ *   col8  = Saldo
+ *   col9  = Referencia       → ID Autorización
+ *   col10 = Concepto         → referencia adicional / extra
+ *   col11+ = Banco Participante, Clabe Beneficiario, Nombre Beneficiario, etc. (ignorados)
+ *
+ * En modo encabezado (Formato B), hora, sucursal y columnas adicionales se
+ * ignoran (no están en los aliases). El concepto final concatena Descripcion
+ * + Concepto cuando este último no está vacío.
  *
  * Sin discriminación.
  *
@@ -708,18 +753,25 @@ function parseSantander(sheet, uploadDate) {
 /**
  * Azteca
  *
- * Estructura posicional de columnas (ExcelJS 1-based):
+ * Soporta dos formatos detectados automáticamente via isLikelyHeaderRow:
+ *
+ * Formato A — Clásico (sin encabezado, primera celda = Date):
  *   vals[1]  = Fecha (Date)
- *   vals[2]  = Fecha duplicada (ignorada en modo encabezado)
+ *   vals[2]  = Fecha duplicada (ignorada)
  *   vals[3]  = Concepto
  *   vals[4]  = Depósito (número o null)
  *   vals[5]  = Retiro   (número negativo o null)
  *   vals[6]  = Saldo
  *   vals[7]  = ID Autorización
  *
- * Los archivos descargados del portal de Azteca pueden comenzar directamente
- * con movimientos (sin fila de encabezado). La lógica de isLikelyHeaderRow
- * cubre ambos casos.
+ * Formato B — Nuevo (con encabezado, primera celda = "NUMERO DE CUENTA"):
+ *   col1 = NUMERO DE CUENTA    (ignorado)
+ *   col2 = FECHA DE OPERACION  (string "YYYY-MM-DD")
+ *   col3 = FECHA DE APLICACION (ignorada)
+ *   col4 = CONCEPTO
+ *   col5 = IMPORTE             (positivo=depósito, negativo=retiro)
+ *   col6 = SALDO
+ *   col7 = MOVIMIENTO          → ID Autorización
  *
  * Sin discriminación.
  *
@@ -753,8 +805,6 @@ function parseAzteca(sheet, uploadDate) {
     // si el banco la incluye se ignorará porque no hay alias mapeado para ella.
     const col1 = v[colMap ? colMap.fecha        : 1]; // Fecha
     const col3 = v[colMap ? colMap.concepto     : 3]; // Concepto
-    const col4 = v[colMap ? colMap.deposito     : 4]; // Depósito
-    const col5 = v[colMap ? colMap.retiro       : 5]; // Retiro (puede ser negativo)
     const col6 = v[colMap ? colMap.saldo        : 6]; // Saldo
     const col7 = v[colMap ? colMap.autorizacion : 7]; // ID Autorización
 
@@ -764,8 +814,20 @@ function parseAzteca(sheet, uploadDate) {
     // Descartar filas completamente vacías (sin fecha ni concepto ni saldo)
     if (!fechaDate && !conceptoText && toNumber(col6) === null) return;
 
-    const depositoRaw = toNumber(col4);
-    const retiroRaw   = toNumber(col5);
+    // El nuevo formato de Azteca (2026) usa una sola columna "IMPORTE" con signo
+    // (positivo = depósito, negativo = retiro) en lugar de dos columnas separadas.
+    // Si colMap.importe está disponible se usa ese campo; de lo contrario se
+    // mantiene la lógica con columnas deposito/retiro (formato anterior o modo
+    // posicional como fallback).
+    let depositoRaw, retiroRaw;
+    if (colMap && colMap.importe !== undefined) {
+      const importeVal = toNumber(v[colMap.importe]);
+      depositoRaw = importeVal !== null && importeVal > 0 ? importeVal : null;
+      retiroRaw   = importeVal !== null && importeVal < 0 ? importeVal : null;
+    } else {
+      depositoRaw = toNumber(v[colMap ? colMap.deposito : 4]);
+      retiroRaw   = toNumber(v[colMap ? colMap.retiro   : 5]);
+    }
 
     const deposito = depositoRaw !== null && depositoRaw > 0 ? depositoRaw        : null;
     const retiro   = retiroRaw   !== null && retiroRaw   < 0 ? Math.abs(retiroRaw) : null;
@@ -891,13 +953,25 @@ async function parseBankFile(buffer, banco) {
 
       let bestMovements = [];
       let bestBanco     = null;
+      // Scoring de calidad: preferir el parser que produce más movimientos con
+      // fecha Y monto (depósito o retiro) asignados. Esto evita que un parser
+      // "equivocado" gane por volumen cuando los montos quedan en null.
+      // Ejemplo: Santander nuevo (Sheet1) vs BBVA → ambos producen el mismo
+      // número de filas, pero solo Santander asigna depósito/retiro correctamente.
+      let bestScore = -1;
 
       for (const [bancoLabel, parser] of Object.entries(sheetParsers)) {
         try {
           const result = parser(sheet);
-          if (result.length > bestMovements.length) {
+          const qualityScore = result.filter(
+            (m) => m.fecha && (m.deposito !== null || m.retiro !== null),
+          ).length;
+          // Gana el mayor quality score; en empate, el mayor conteo total.
+          if (qualityScore > bestScore ||
+              (qualityScore === bestScore && result.length > bestMovements.length)) {
             bestMovements = result;
             bestBanco     = bancoLabel;
+            bestScore     = qualityScore;
           }
         } catch (_) { /* ignorar fallo de parser */ }
       }

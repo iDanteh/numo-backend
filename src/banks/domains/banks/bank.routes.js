@@ -286,4 +286,17 @@ router.post('/autorizaciones/match-erp',
   }),
 );
 
+// DELETE /api/banks/movements  — eliminación masiva, solo admin
+router.delete('/movements',
+  authenticate,
+  permit('admin'),
+  asyncHandler(async (req, res) => {
+    const ids = req.body.ids;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'Se requiere un array de IDs en body.ids' });
+    }
+    res.json(await service.deleteMovements(ids));
+  }),
+);
+
 module.exports = router;

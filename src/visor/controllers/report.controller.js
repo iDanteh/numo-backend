@@ -557,8 +557,7 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
     { $replaceRoot: { newRoot: '$doc' } },
     { $match: { $or: [
       { criticalCount: { $gt: 0 } },
-      { warningCount:  { $gt: 0 } },
-      { status: { $in: ['discrepancy', 'warning', 'not_in_sat', 'cancelled'] } },
+      { status: { $in: ['discrepancy', 'not_in_sat', 'cancelled'] } },
     ]}},
     { $sort:  { criticalCount: -1, comparedAt: -1 } },
     { $lookup: { from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id', as: 'erpCfdiId', pipeline: [{ $project: erpProjection }] } },

@@ -155,7 +155,7 @@ const ejecutarDescargaERP = async ({ ejercicioParam, periodoParam } = {}) => {
 
   await actualizarLog({
     estado: 'completado',
-    totalSAT: guardadas + duplicadas,
+    totalERP: guardadas + duplicadas,
     fin: new Date(),
   });
 };

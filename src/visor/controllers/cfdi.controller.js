@@ -95,6 +95,7 @@ const list = asyncHandler(async (req, res) => {
     rfcEmisor, rfcReceptor, satStatus, erpStatus, lastComparisonStatus,
     fechaInicio, fechaFin, search, uuids, uuid,
     ejercicio, periodo,
+    subTotalMin, subTotalMax, totalMin, totalMax,
   } = req.query;
 
   const pg = parseInt(page);
@@ -139,6 +140,16 @@ const list = asyncHandler(async (req, res) => {
   const pe = periodo   ? parseInt(periodo)   : null;
   if (ej) filter.ejercicio = ej;
   if (pe) filter.periodo   = pe;
+  if (subTotalMin || subTotalMax) {
+    filter.subTotal = {};
+    if (subTotalMin) filter.subTotal.$gte = parseFloat(subTotalMin);
+    if (subTotalMax) filter.subTotal.$lte = parseFloat(subTotalMax);
+  }
+  if (totalMin || totalMax) {
+    filter.total = {};
+    if (totalMin) filter.total.$gte = parseFloat(totalMin);
+    if (totalMax) filter.total.$lte = parseFloat(totalMax);
+  }
 
   if (lastComparisonStatus) {
     if (lastComparisonStatus === 'migrar') {
@@ -1022,7 +1033,7 @@ const exportExcel = asyncHandler(async (req, res) => {
  * Query params: ejercicio, periodo, rfc, source
  */
 const planReclasificacionGlobal = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, rfc, source, mesIG, page, limit } = req.query;
+  const { ejercicio, periodo, rfc, source, mesIG, uuid, anioIG, page, limit } = req.query;
   const plan = await generarPlan({
     ejercicio: ejercicio ? Number(ejercicio) : undefined,
     periodo:   periodo   ? Number(periodo)   : undefined,
@@ -1033,7 +1044,9 @@ const planReclasificacionGlobal = asyncHandler(async (req, res) => {
 
   const pg = Math.max(1, Number(page)  || 1);
   const lm = Math.min(200, Math.max(1, Number(limit) || 20));
-  const allDetalle = plan.detalle ?? [];
+  let allDetalle = plan.detalle ?? [];
+  if (uuid)   allDetalle = allDetalle.filter(d => d.uuid?.toUpperCase().includes(uuid.toUpperCase().trim()));
+  if (anioIG) allDetalle = allDetalle.filter(d => d.anioInformacionGlobal === Number(anioIG));
   const total  = allDetalle.length;
   const pages  = Math.max(1, Math.ceil(total / lm));
   const start  = (pg - 1) * lm;

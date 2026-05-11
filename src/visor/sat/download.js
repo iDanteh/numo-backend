@@ -256,7 +256,7 @@ const solicitar = async (params) => {
   <s:Header/>
   <s:Body>
     <des:${operacion}>
-      <des:solicitud RfcSolicitante="${rfcFirmaUsado}" ${rfcAttrKey}="${rfcSolicitante}" FechaInicial="${fechaInicio}" FechaFinal="${fechaFin}" TipoSolicitud="${tipoSolicitud}"${tipoAttr}${estadoAttr}>
+      <des:solicitud${estadoAttr} FechaFinal="${fechaFin}" FechaInicial="${fechaInicio}" ${rfcAttrKey}="${rfcSolicitante}" RfcSolicitante="${rfcFirmaUsado}"${tipoAttr} TipoSolicitud="${tipoSolicitud}">
         ${firma}
       </des:solicitud>
     </des:${operacion}>

@@ -25,9 +25,10 @@ const ExcelJS  = require('exceljs');
 const repo     = require('./repositories/account-plan.repository');
 
 // Alias de encabezado aceptados por columna
+// Incluye formatos CONTPAQi donde los encabezados tienen espacios entre letras
 const HEADER_ALIASES = {
-  codigo:   ['codigo', 'código', 'clave', 'cuenta', 'num_cuenta', 'num cuenta', 'no_cuenta'],
-  nombre:   ['nombre', 'name', 'descripcion', 'descripción', 'desc'],
+  codigo:   ['codigo', 'código', 'clave', 'cuenta', 'num_cuenta', 'num cuenta', 'no_cuenta', 'c o d i g o', 'c o d i g o'],
+  nombre:   ['nombre', 'name', 'descripcion', 'descripción', 'desc', 'n o m b r e'],
   ctaMayor: ['ctamayor', 'cta_mayor', 'cta mayor', 'mayor', 'cuenta_mayor', 'agrupador'],
 };
 
@@ -49,6 +50,17 @@ function toStr(val) {
     return val.richText.map(r => r.text).join('').trim();
   }
   return String(val).trim();
+}
+
+/**
+ * Convierte código CONTPAQi con guiones al formato SAT de 10 dígitos.
+ * Ejemplo: "1-1-01-01-0001" → "1101010001"
+ * Si el código no tiene guiones o no resulta en 10 dígitos, lo devuelve tal cual.
+ */
+function normalizeContpaqiCode(codigo) {
+  if (!codigo || !codigo.includes('-')) return codigo;
+  const clean = codigo.replace(/-/g, '');
+  return /^\d{10}$/.test(clean) ? clean : codigo;
 }
 
 function inferTipoNat(codigo) {
@@ -130,7 +142,7 @@ async function parseAccountPlanFile(buffer, opts = {}) {
 
     const v = row.values; // 1-indexed
 
-    const codigoRaw = toStr(v[colMap.codigo]);
+    const codigoRaw = normalizeContpaqiCode(toStr(v[colMap.codigo]));
     const nombreRaw = toStr(v[colMap.nombre]);
     // El valor de la columna CtaMayor del SAT es un indicador de nivel (2,3,4…),
     // NO el código del padre → se ignora para construir la jerarquía.

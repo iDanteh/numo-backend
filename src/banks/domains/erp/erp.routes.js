@@ -24,14 +24,15 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     return res.status(503).json({ error: 'ERP no configurado (ERP_CAJA_BASE_URL ausente)' });
   }
 
-  const { fechaDesde, fechaHasta, estadoCobro, page, serieExterna, folioExterno } = req.query;
+  const { fechaDesde, fechaHasta, estadoCobro, page, serieExterna, folioExterno, nombrePersona } = req.query;
   const pageNum = Math.max(1, parseInt(page ?? '1', 10));
 
   // Fetch ALL records from ERP (no page param — we paginate locally)
   const params = { fechaDesde, fechaHasta };
-  if (estadoCobro)   params.estadoCobro   = estadoCobro;
-  if (serieExterna)  params.serieExterna  = String(serieExterna).trim();
-  if (folioExterno)  params.folioExterno  = String(folioExterno).trim();
+  if (estadoCobro)    params.estadoCobro   = estadoCobro;
+  if (serieExterna)   params.serieExterna  = String(serieExterna).trim();
+  if (folioExterno)   params.folioExterno  = String(folioExterno).trim();
+  if (nombrePersona)  params.nombrePersona = String(nombrePersona).trim();
 
   const response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
     params,
@@ -95,6 +96,7 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     total:            c.total,
     saldoActual:      c.saldoActual,
     fechaVencimiento: c.fechaVencimiento ?? null,
+    nombrePersona:    c.nombrePersona    ?? null,
   }));
 
   // Local pagination (filtering is now handled server-side by the ERP via serieExterna/folioExterno)

@@ -45,9 +45,12 @@ router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
   const query = { ...req.query };
-  // cobranza solo ve depósitos no identificados
   if (req.user.role === 'cobranza') {
-    if (query.status === 'identificado') query.status = undefined;
+    if (query.status === 'otros') query.status = undefined;
+    if (query.status === 'identificado') {
+      // Solo sus propios movimientos identificados
+      query.identificadoPorUsuario = req.user._id;
+    }
     if (!query.status) query.status = 'no_identificado';
     query.tipo = 'deposito';
   }
@@ -62,10 +65,13 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   const query = { ...req.query };
-  // cobranza solo ve depósitos no identificados
   if (req.user.role === 'cobranza') {
-    if (query.status === 'identificado') {
+    if (query.status === 'otros') {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
+    }
+    if (query.status === 'identificado') {
+      // Solo los movimientos que el propio usuario de cobranza identificó
+      query.identificadoPorUsuario = req.user._id;
     }
     if (!query.status) query.status = 'no_identificado';
     query.tipo = 'deposito';
@@ -86,7 +92,7 @@ router.post('/upload',
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
-    const result = await service.importFile(req.file.buffer, req.body.banco, req.user._id, { auth0Sub: req.user._id });
+    const result = await service.importFile(req.file.buffer, req.body.banco, req.user._id, { auth0Sub: req.user._id, nombre: req.user.nombre });
     res.status(207).json(result);
   }),
 );
@@ -112,6 +118,24 @@ router.post(
 
     res.status(201).json(result);
   })
+);
+
+// PATCH /api/banks/movements/:id/ficha  — solo contabilidad/admin (validado en service)
+router.patch('/movements/:id/ficha',
+  authenticate,
+  permit('banks:update'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.setFicha(req.params.id, req.body.ficha, req.user));
+  }),
+);
+
+// DELETE /api/banks/movements/:id/ficha  — autor o admin (validado en service)
+router.delete('/movements/:id/ficha',
+  authenticate,
+  permit('banks:update'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.deleteFicha(req.params.id, req.user));
+  }),
 );
 
 // PATCH /api/banks/movements/:id/status

@@ -167,6 +167,8 @@ async function getCards() {
       saldoIdentificado: b.saldoIdentificado ?? 0,
       saldoOtros:        b.saldoOtros        ?? 0,
       saldoActualizado:  saldoActualizadoMap[b._id] ?? null,
+      lastImportBy:      cfg?.lastImportBy  ?? null,
+      lastImportAt:      cfg?.lastImportAt  ?? null,
       porStatus: {
         no_identificado: b.no_identificado,
         identificado:    b.identificado,
@@ -183,6 +185,7 @@ async function listMovements(filters) {
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
+    identificadoPorUsuario,
     movId,
   } = filters;
 
@@ -209,6 +212,12 @@ async function listMovements(filters) {
     const ids = identificadoPor.split(',').map(s => s.trim()).filter(Boolean);
     filter.$and = filter.$and ?? [];
     filter.$and.push({ 'identificadoPor.userId': { $in: ids } });
+  }
+
+  // Restricción de cobranza: solo sus propios movimientos identificados
+  if (identificadoPorUsuario) {
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ 'identificadoPor.userId': identificadoPorUsuario });
   }
 
   if (fechaInicio || fechaFin) {
@@ -363,7 +372,7 @@ async function getSummary(fechaInicio, fechaFin) {
   ]);
 }
 
-async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
+async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   const bancoValidado = BANCOS_VALIDOS.includes(banco) ? banco : null;
   const { movements, summary, errors } = await parseBankFile(buffer, bancoValidado);
 
@@ -533,6 +542,17 @@ async function importFile(buffer, banco, userId, { auth0Sub } = {}) {
       }
     }
 
+  // ── 5. Registrar última carga por banco ─────────────────────────────────
+  if (insertados > 0 && nombre) {
+    const bancosAfectados = [...new Set(nuevos.map(m => m.banco).filter(Boolean))];
+    const ahora = new Date();
+    await Promise.all(
+      bancosAfectados.map(b =>
+        bankConfigRepo.upsert(b, { lastImportBy: nombre, lastImportAt: ahora }),
+      ),
+    );
+  }
+
     return {
       message:      `${insertados} movimientos importados, ${duplicados} ya existían`,
       importados:   insertados,
@@ -645,9 +665,13 @@ function aplicarLogicaErp(mov) {
     : null;
   const uuidXML    = links.find(l => l.folioFiscal)?.folioFiscal?.toUpperCase() ?? null;
   const bankAmount = Math.abs(mov.deposito ?? mov.retiro ?? 0);
-  const status     = (saldoErp !== null && saldoErp >= bankAmount - ERP_TOLERANCE)
+  let status       = (saldoErp !== null && saldoErp >= bankAmount - ERP_TOLERANCE)
     ? 'identificado'
     : 'no_identificado';
+  // Si el movimiento ya tiene ficha registrada, siempre queda identificado
+  if (mov.ficha && status === 'no_identificado') {
+    status = 'identificado';
+  }
   return { saldoErp, uuidXML, status };
 }
 
@@ -855,11 +879,17 @@ async function exportMovements(filters) {
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias,
+    identificadoPorUsuario,
   } = filters;
 
   const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
+
+  if (identificadoPorUsuario) {
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ 'identificadoPor.userId': identificadoPorUsuario });
+  }
 
   if (categorias) {
     const vals = categorias.split(',').map(v => v === '__null__' ? null : v);
@@ -995,9 +1025,102 @@ async function deleteMovements(ids) {
   return { deleted: result.deletedCount };
 }
 
+async function setFicha(id, ficha, user) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  // Solo contabilidad y admin pueden registrar fichas
+  if (user?.role !== 'contabilidad' && user?.role !== 'admin') {
+    throw new ForbiddenError('Solo usuarios con rol contabilidad pueden registrar fichas');
+  }
+
+  // Solo una ficha por movimiento
+  if (mov.ficha != null) {
+    throw new ConflictError('Este movimiento ya tiene una ficha registrada');
+  }
+
+  const fichaLimpia = (ficha ?? '').toString().trim();
+  if (!fichaLimpia) throw new BadRequestError('El número de ficha no puede estar vacío');
+
+  mov.ficha       = fichaLimpia;
+  mov.fichaBy     = user._id ?? user.auth0Sub ?? null;
+  mov.fichaNombre = user.nombre ?? null;
+  mov.fichaAt     = new Date();
+  mov.status      = 'identificado';
+
+  const updated = await mov.save();
+
+  emitToBanco(mov.banco, 'bank:movement:updated', {
+    _id:        updated._id,
+    status:     updated.status,
+    ficha:      updated.ficha,
+    fichaBy:    updated.fichaBy,
+    fichaNombre: updated.fichaNombre,
+    fichaAt:    updated.fichaAt,
+  });
+
+  return {
+    _id:        updated._id,
+    status:     updated.status,
+    ficha:      updated.ficha,
+    fichaBy:    updated.fichaBy,
+    fichaNombre: updated.fichaNombre,
+    fichaAt:    updated.fichaAt,
+  };
+}
+
+async function deleteFicha(id, user) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  if (!mov.ficha) throw new BadRequestError('Este movimiento no tiene ficha registrada');
+
+  // Admin puede borrar cualquier ficha; el autor puede borrar la suya; el resto no
+  const userId = user._id ?? user.auth0Sub ?? null;
+  const esAdmin = user?.role === 'admin';
+  const esAutor = mov.fichaBy && userId && mov.fichaBy === userId;
+
+  if (!esAdmin && !esAutor) {
+    throw new ForbiddenError('Solo el usuario que registró la ficha o un administrador puede eliminarla');
+  }
+
+  mov.ficha       = null;
+  mov.fichaBy     = null;
+  mov.fichaNombre = null;
+  mov.fichaAt     = null;
+
+  // Recalcular status sin la ficha
+  const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
+  mov.saldoErp = saldoErp;
+  mov.uuidXML  = uuidXML;
+  mov.status   = status;
+
+  const updated = await mov.save();
+
+  emitToBanco(mov.banco, 'bank:movement:updated', {
+    _id:         updated._id,
+    status:      updated.status,
+    saldoErp:    updated.saldoErp,
+    uuidXML:     updated.uuidXML,
+    ficha:       null,
+    fichaBy:     null,
+    fichaNombre: null,
+    fichaAt:     null,
+  });
+
+  return {
+    _id:         updated._id,
+    status:      updated.status,
+    ficha:       null,
+    fichaBy:     null,
+    fichaNombre: null,
+    fichaAt:     null,
+  };
+}
+
 module.exports = {
   getCards, listMovements, getSummary,
-  importFile, updateStatus, updateErpIds, setErpIds,
+  importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements,
 };

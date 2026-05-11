@@ -42,6 +42,16 @@ const BankConfig = sequelize.define('BankConfig', {
     allowNull: true,
     defaultValue: null,
   },
+  lastImportBy: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+    defaultValue: null,
+  },
+  lastImportAt: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    defaultValue: null,
+  },
 }, {
   tableName:   'bank_configs',
   underscored: true,

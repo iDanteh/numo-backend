@@ -87,6 +87,12 @@ const bankMovementSchema = new mongoose.Schema({
     default: [],
   },
 
+  // Ficha física (ticket de depósito): folio del comprobante físico
+  ficha:       { type: String, default: null },
+  fichaBy:     { type: String, default: null },   // userId que registró la ficha
+  fichaNombre: { type: String, default: null },   // nombre display del usuario
+  fichaAt:     { type: Date,   default: null },
+
   // Oculto por regla — el movimiento existe pero no aparece en vistas normales
   oculto: { type: Boolean, default: false, index: true },
 

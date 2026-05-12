@@ -65,7 +65,9 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   const query = { ...req.query };
-  if (req.user.role === 'cobranza') {
+  // Cuando viene movId (navegación desde OCR) cobranza puede ver ese movimiento
+  // sin restricciones de status/tipo para que la navegación funcione correctamente.
+  if (req.user.role === 'cobranza' && !query.movId) {
     if (query.status === 'otros') {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
     }
@@ -310,6 +312,15 @@ router.post('/autorizaciones/match-erp',
   }),
 );
 
+// PATCH /api/banks/movements/:id  — edición de campos del movimiento
+router.patch('/movements/:id',
+  authenticate,
+  permit('banks:update'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.updateMovement(req.params.id, req.body, req.user));
+  }),
+);
+
 // DELETE /api/banks/movements  — eliminación masiva, solo admin
 router.delete('/movements',
   authenticate,
@@ -322,5 +333,14 @@ router.delete('/movements',
     res.json(await service.deleteMovements(ids));
   }),
 );
+
+// GET /api/banks/template  — descarga la plantilla Excel oficial
+router.get('/template', authenticate, asyncHandler(async (_req, res) => {
+  const buffer = await service.generateTemplate();
+  const fecha  = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="plantilla-bancos-${fecha}.xlsx"`);
+  res.send(Buffer.from(buffer));
+}));
 
 module.exports = router;

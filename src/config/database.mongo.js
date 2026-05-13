@@ -19,9 +19,10 @@ const connectMongo = async () => {
   mongoose.connection.on('disconnected', () => logger.warn('MongoDB desconectado'));
 
   await mongoose.connect(uri, {
-    maxPoolSize:              10,
+    maxPoolSize:              20,       // más conexiones disponibles para ops paralelas
     serverSelectionTimeoutMS: 5000,
-    socketTimeoutMS:          45000,
+    socketTimeoutMS:          120000,  // operaciones pesadas (match-erp) pueden tomar >45s
+    bufferTimeoutMS:          60000,   // alinear con socketTimeoutMS para no cortar antes
   });
 };
 

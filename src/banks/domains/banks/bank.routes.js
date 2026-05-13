@@ -13,6 +13,7 @@ const {
 } = require('./bank-auxiliary.parser');
 const rulesService          = require('./bank-rules.service');
 const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
+const { emitToUser } = require('../../shared/socket');
 
 const router = express.Router();
 
@@ -51,16 +52,14 @@ router.get('/cards', authenticate, asyncHandler(async (req, res) => {
   res.json(await service.getCards());
 }));
 
-// GET /api/banks/categories?banco=BBVA
+// GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)
 router.get('/categories', authenticate, asyncHandler(async (req, res) => {
-  if (!req.query.banco) return res.status(400).json({ error: 'banco requerido' });
-  res.json(await service.listCategories(req.query.banco));
+  res.json(await service.listCategories(req.query.banco ?? null));
 }));
 
-// GET /api/banks/identificadores?banco=BBVA
+// GET /api/banks/identificadores?banco=BBVA  (banco opcional; sin banco → todos)
 router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
-  if (!req.query.banco) return res.status(400).json({ error: 'banco requerido' });
-  res.json(await service.listIdentificadores(req.query.banco));
+  res.json(await service.listIdentificadores(req.query.banco ?? null));
 }));
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
@@ -312,20 +311,54 @@ router.post('/autorizaciones/match',
   }),
 );
 
-// POST /api/banks/autorizaciones/match-erp  — match desde CxCs del ERP (sin Excel)
+// ── Job store en memoria para match-erp ───────────────────────────────────────
+// Guarda estado de cada corrida. Los resultados expiran en 15 min para no
+// acumular memoria en procesos de larga ejecución.
+const erpMatchJobs = new Map(); // jobId → { status, result?, error? }
+const ERP_JOB_TTL_MS = 15 * 60 * 1000;
+
+// POST /api/banks/autorizaciones/match-erp  — inicia job en background, devuelve jobId
 // Body opcional: { banco: 'BBVA', fechaDesde: '2026-01-01' }
-//   banco     → si se omite, busca en todos los bancos.
-//   fechaDesde → filtra CxCs cuya fechaAfectacion/fechaRealPago >= esta fecha.
-//                Recomendado para evitar procesar histórico muy antiguo.
 router.post('/autorizaciones/match-erp',
   authenticate,
   permit('banks:import'),
   asyncHandler(async (req, res) => {
-    const result = await matchAutorizacionesDesdeErp({
-      banco:      req.body.banco,
-      fechaDesde: req.body.fechaDesde,
-    });
-    res.json(result);
+    const jobId    = `erp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const auth0Sub = req.user._id;
+
+    erpMatchJobs.set(jobId, { status: 'running' });
+    res.status(202).json({ jobId });
+
+    // Corre en background: no await, respuesta ya enviada al cliente.
+    matchAutorizacionesDesdeErp(
+      { banco: req.body.banco, fechaDesde: req.body.fechaDesde },
+      {
+        onProgress: (progress) => {
+          emitToUser(auth0Sub, 'bank:erp:match:progress', { jobId, ...progress });
+        },
+      },
+    )
+      .then(result => {
+        erpMatchJobs.set(jobId, { status: 'done', result });
+        emitToUser(auth0Sub, 'bank:erp:match:done', { jobId, ...result });
+        setTimeout(() => erpMatchJobs.delete(jobId), ERP_JOB_TTL_MS);
+      })
+      .catch(err => {
+        const error = err?.message || 'Error desconocido en el motor ERP';
+        erpMatchJobs.set(jobId, { status: 'error', error });
+        emitToUser(auth0Sub, 'bank:erp:match:error', { jobId, error });
+        setTimeout(() => erpMatchJobs.delete(jobId), ERP_JOB_TTL_MS);
+      });
+  }),
+);
+
+// GET /api/banks/autorizaciones/match-erp/job/:jobId  — polling de estado (fallback socket)
+router.get('/autorizaciones/match-erp/job/:jobId',
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const job = erpMatchJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job no encontrado o expirado' });
+    res.json(job);
   }),
 );
 

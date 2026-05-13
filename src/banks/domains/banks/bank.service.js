@@ -212,7 +212,12 @@ async function listMovements(filters) {
   if (identificadoPor) {
     const ids = identificadoPor.split(',').map(s => s.trim()).filter(Boolean);
     filter.$and = filter.$and ?? [];
-    filter.$and.push({ 'identificadoPor.userId': { $in: ids } });
+    // Un movimiento puede haber sido identificado via CxC (identificadoPor[].userId)
+    // o via ficha bancaria (fichaBy). Ambos caminos se incluyen en el filtro.
+    filter.$and.push({ $or: [
+      { 'identificadoPor.userId': { $in: ids } },
+      { fichaBy: { $in: ids } },
+    ]});
   }
 
   // Restricción de cobranza: solo sus propios movimientos identificados
@@ -938,14 +943,19 @@ async function setErpIds(id, erpLinks, user) {
   mov.erpLinks = cleanLinks;
   mov.erpIds   = cleanLinks.map(l => l.erpId);
 
-  // Actualizar identificadoPor: añadir entradas para CxCs nuevas, quitar las eliminadas
+  // Actualizar identificadoPor: añadir entradas para CxCs nuevas, quitar las eliminadas.
+  // También eliminar entradas de 'erp-auto' (sin erpId): cuando un humano toma posesión
+  // manual de los links, el motor ya no es dueño del registro — si quedara la entrada de
+  // erp-auto, el Revertir ERP podría borrar los links del humano.
   const prevIds       = new Set((mov.identificadoPor || []).map(e => e.erpId));
   const newIds        = new Set(cleanLinks.map(l => l.erpId));
   const displayName   = user?.nombre || user?.email || null;
   const addedErpIds   = cleanLinks.filter(l => !prevIds.has(l.erpId)).map(l => l.erpId);
   const removedErpIds = [...prevIds].filter(id => !newIds.has(id));
 
-  let updatedIdPor = (mov.identificadoPor || []).filter(e => !removedErpIds.includes(e.erpId));
+  let updatedIdPor = (mov.identificadoPor || [])
+    .filter(e => e.userId !== 'erp-auto')          // ← ceder ownership al humano
+    .filter(e => !removedErpIds.includes(e.erpId));
   for (const erpId of addedErpIds) {
     updatedIdPor.push({ userId: user?._id ?? null, nombre: displayName, fechaId: new Date(), erpId });
   }
@@ -987,18 +997,32 @@ async function setSaldoInicial(banco, monto) {
 }
 
 async function listIdentificadores(banco) {
-  // $unwind primero para descomponer el array identificadoPor por elemento,
-  // luego $group por userId individual. Sin $unwind, MongoDB agrupa por el
-  // array completo y genera una entrada por combinación distinta de usuarios,
-  // causando duplicados del mismo nombre.
-  const docs = await BankMovement.aggregate([
-    { $match: { banco, isActive: true, 'identificadoPor.0': { $exists: true } } },
-    { $unwind: '$identificadoPor' },
-    { $match: { 'identificadoPor.userId': { $ne: null } } },
-    { $group: { _id: '$identificadoPor.userId', nombre: { $first: '$identificadoPor.nombre' } } },
-    { $sort: { nombre: 1 } },
+  // Dos fuentes de identificación:
+  //   1. Vía CxC/ERP  → array identificadoPor[].userId / .nombre
+  //   2. Vía ficha bancaria → campos fichaBy / fichaNombre
+  // Ambas se consolidan y deduplicadas por userId antes de devolver.
+  const [porErp, porFicha] = await Promise.all([
+    BankMovement.aggregate([
+      { $match: { banco, isActive: true, 'identificadoPor.0': { $exists: true } } },
+      { $unwind: '$identificadoPor' },
+      { $match: { 'identificadoPor.userId': { $ne: null } } },
+      { $group: { _id: '$identificadoPor.userId', nombre: { $first: '$identificadoPor.nombre' } } },
+    ]),
+    BankMovement.aggregate([
+      { $match: { banco, isActive: true, fichaBy: { $ne: null } } },
+      { $group: { _id: '$fichaBy', nombre: { $first: '$fichaNombre' } } },
+    ]),
   ]);
-  return docs.map(d => ({ userId: d._id, nombre: d.nombre || d._id }));
+
+  // Fusionar deduplicando por userId (la primera fuente encontrada gana el nombre)
+  const map = new Map();
+  for (const d of [...porErp, ...porFicha]) {
+    if (d._id && !map.has(d._id)) map.set(d._id, d.nombre);
+  }
+
+  return [...map.entries()]
+    .map(([userId, nombre]) => ({ userId, nombre: nombre || userId }))
+    .sort((a, b) => (a.nombre || '').localeCompare(b.nombre || ''));
 }
 
 async function listCategories(banco) {
@@ -1119,18 +1143,19 @@ async function exportMovements(filters) {
 
   sheet.columns = [
     { header: 'Folio',            key: 'folio',              width: 10 },
+    { header: 'Banco',            key: 'banco',              width: 14 },
     { header: 'Fecha',            key: 'fecha',              width: 14 },
     { header: 'Concepto',         key: 'concepto',           width: 50 },
     { header: 'Depósito',         key: 'deposito',           width: 16 },
     { header: 'Retiro',           key: 'retiro',             width: 16 },
     { header: 'Categoría',        key: 'categoria',          width: 20 },
     { header: 'Estado',           key: 'status',             width: 16 },
+    { header: 'Fecha aplicación', key: 'fechaAplicacion',    width: 18 },
     { header: 'Serie-Folio ERP',  key: 'erpIds',             width: 30 },
     { header: 'Saldo ERP',        key: 'saldoErp',           width: 16 },
     { header: 'Diferencia',       key: 'diferencia',         width: 16 },
     { header: 'N° Autorización',  key: 'numeroAutorizacion', width: 20 },
     { header: 'Identificado por', key: 'identificadoPor',    width: 24 },
-    { header: 'Fecha aplicación', key: 'fechaAplicacion',    width: 18 },
   ];
 
   const STATUS_LABELS = {
@@ -1147,7 +1172,7 @@ async function exportMovements(filters) {
 
   for (const m of movements) {
     const bankAmount  = (m.deposito ?? 0) + (m.retiro ?? 0);
-    const diferencia  = m.saldoErp != null ? bankAmount - m.saldoErp : null;
+    const diferencia  = m.saldoErp != null ? Math.abs(bankAmount - m.saldoErp) : null;
 
     const fechasAplicacion = [
       ...(m.identificadoPor || []).map(e => e.fechaId ? new Date(e.fechaId).getTime() : null),
@@ -1159,6 +1184,7 @@ async function exportMovements(filters) {
 
     sheet.addRow({
       folio:              m.status === 'identificado' ? (m.folio ?? null) : null,
+      banco:              m.banco ?? null,
       fecha:              formatUTCDate(m.fecha),
       concepto:           m.concepto ?? null,
       deposito:           m.deposito ?? null,
@@ -1171,7 +1197,10 @@ async function exportMovements(filters) {
       saldoErp:           m.saldoErp ?? null,
       diferencia,
       numeroAutorizacion: m.numeroAutorizacion ?? null,
-      identificadoPor:    [...new Set((m.identificadoPor || []).map(e => e.nombre || e.userId || '?'))].join(', ') || null,
+      identificadoPor:    [...new Set([
+                            ...(m.identificadoPor || []).map(e => e.nombre || e.userId || '?'),
+                            ...(m.fichaNombre ? [m.fichaNombre] : m.fichaBy ? [m.fichaBy] : []),
+                          ])].join(', ') || null,
       fechaAplicacion,
     });
   }
@@ -1197,11 +1226,7 @@ async function setFicha(id, ficha, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
 
-  // Solo contabilidad y admin pueden registrar fichas
-  if (user?.role !== 'contabilidad' && user?.role !== 'admin') {
-    throw new ForbiddenError('Solo usuarios con rol contabilidad pueden registrar fichas');
-  }
-
+  // El permiso banks:ficha ya fue validado en la ruta — solo accede quien corresponde.
   // Solo una ficha por movimiento
   if (mov.ficha != null) {
     throw new ConflictError('Este movimiento ya tiene una ficha registrada');

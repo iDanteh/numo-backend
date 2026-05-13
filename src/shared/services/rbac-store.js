@@ -54,4 +54,10 @@ async function getPermissions(role) {
   return map.get(role)?.permissions ?? [];
 }
 
-module.exports = { hasPermission, hasAllPermissions, invalidate, getPermissions };
+/** Returns true if the role exists in the DB (including custom roles). */
+async function roleExists(role) {
+  const map = await _get();
+  return map.has(role);
+}
+
+module.exports = { hasPermission, hasAllPermissions, invalidate, getPermissions, roleExists };

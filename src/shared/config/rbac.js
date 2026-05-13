@@ -54,6 +54,12 @@ const PERMISSIONS = Object.freeze({
 
   // Administración de usuarios
   USERS_MANAGE:        'users:manage',
+
+  // Operaciones exclusivas de administrador en bancos
+  BANKS_ADMIN:         'banks:admin',
+
+  // Registro y eliminación de fichas bancarias (solo contabilidad y admin)
+  BANKS_FICHA:         'banks:ficha',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────
@@ -61,7 +67,7 @@ const PERMISSIONS = Object.freeze({
 const ROLES = Object.freeze({
   admin: {
     label:       'Administrador',
-    permissions: ['*'],                // acceso total
+    permissions: ['*'],                // acceso total (incluye banks:admin y cualquier otro permiso)
   },
 
   contabilidad: {
@@ -72,6 +78,7 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_UPDATE,
       PERMISSIONS.BANKS_CONFIG,
       PERMISSIONS.BANKS_RULES,
+      PERMISSIONS.BANKS_FICHA,
       PERMISSIONS.ACCOUNT_PLAN_READ,
       PERMISSIONS.ACCOUNT_PLAN_WRITE,
       PERMISSIONS.COLLECTIONS_READ,

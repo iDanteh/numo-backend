@@ -15,7 +15,6 @@
 const userRepo  = require('./repositories/user.repository');
 const { NotFoundError, BadRequestError } = require('../../../shared/errors/AppError');
 const { getIo }    = require('../../shared/socket');
-const { ROLES }    = require('../../../shared/config/rbac');
 const rbacStore    = require('../../../shared/services/rbac-store');
 
 /**
@@ -46,8 +45,8 @@ async function listUsers() {
 }
 
 async function updateRole(id, role) {
-  if (!ROLES[role]) {
-    throw new BadRequestError(`Rol inválido. Opciones: ${Object.keys(ROLES).join(', ')}`);
+  if (!(await rbacStore.roleExists(role))) {
+    throw new BadRequestError(`Rol inválido: '${role}'`);
   }
   const user = await userRepo.updateRole(id, role);
   if (!user) throw new NotFoundError('Usuario');

@@ -13,9 +13,10 @@ const ERP_TOLERANCE   = 1.00; // $1 MXN — misma tolerancia que el resto del si
 // Horas máximas sin actualizar el caché ERP antes de emitir aviso de frescura.
 const ERP_CACHE_MAX_AGE_HOURS = Number(process.env.ERP_CACHE_MAX_AGE_HOURS ?? 24);
 
-// Ventana (ms) para Fase 2 sin auth: ±N días entre la fecha del depósito
-// bancario y la fechaRealPago / fechaAfectacion de la CxC.
-const PHASE2_DATE_WINDOW_MS = Number(process.env.PHASE2_DATE_WINDOW_DAYS ?? 30) * 24 * 60 * 60 * 1000;
+// Ventana de fecha para match ERP: el depósito bancario debe estar dentro de
+// ±N días de la fechaRealPago / fechaAfectacion de la CxC.
+// Se usa solo como criterio de preferencia, no de exclusión total.
+const DATE_MATCH_WINDOW_MS = Number(process.env.ERP_DATE_WINDOW_DAYS ?? 30) * 24 * 60 * 60 * 1000;
 
 // ── Normalización de número de autorización ───────────────────────────────────
 // Extrae el PRIMER bloque numérico y elimina ceros iniciales.
@@ -103,15 +104,19 @@ function conceptoContainsAuth(concepto, authNorm) {
 }
 
 // ── Búsqueda en índice respetando movimientos ya usados ───────────────────────
-// Orden de preferencia:
-//   1. no_identificado + importe correcto + banco correcto
-//   2. no_identificado + importe correcto (cualquier banco)
-//   3. no_identificado (banco correcto)
-//   4. no_identificado (cualquier banco)
-//   5. cualquier status + importe correcto
-//   6. cualquier candidato disponible
-// El argumento `banco` es opcional: si se pasa, se prioriza (no se fuerza).
-function findInIndex(index, autNorm, monto, usedMovIds, banco) {
+// Parámetros opcionales:
+//   banco  — banco preferido (no excluyente)
+//   fecha  — fecha de referencia de la CxC para filtro de proximidad temporal
+//   strict — true: no retorna candidato sin validar importe cuando monto > 0
+//            false (default): comportamiento anterior — útil para match Excel
+//
+// Orden de preferencia (cuando strict=true y hay fecha):
+//   1. dentro de ventana de fecha + importe correcto + banco correcto
+//   2. dentro de ventana de fecha + importe correcto
+//   3. importe correcto (fuera de ventana, pero amount sí matchea)
+//   4. dentro de ventana de fecha + banco correcto
+//   5. (solo si monto=0 o strict=false) cualquier candidato disponible
+function findInIndex(index, autNorm, monto, usedMovIds, banco, fecha, strict = false) {
   const all = index.get(autNorm);
   if (!all?.length) return null;
   const pool = all.filter(m => !usedMovIds.has(m._id.toString()));
@@ -120,19 +125,39 @@ function findInIndex(index, autNorm, monto, usedMovIds, banco) {
   const noId   = pool.filter(m => m.status === 'no_identificado');
   const source = noId.length ? noId : pool;
 
+  // Retorna true si el movimiento cae dentro de la ventana temporal de la CxC.
+  // Cuando no hay fecha de referencia o el movimiento no tiene fecha, siempre pasa.
+  const enVentana = (m) => {
+    if (!fecha || !m.fecha) return true;
+    return Math.abs(new Date(m.fecha).getTime() - new Date(fecha).getTime()) <= DATE_MATCH_WINDOW_MS;
+  };
+
   return (
-    source.find(m => banco && m.banco === banco && importeOk(m, monto)) ??
-    source.find(m => importeOk(m, monto)) ??
-    source.find(m => banco && m.banco === banco) ??
-    source[0]
+    source.find(m => enVentana(m) && banco && m.banco === banco && importeOk(m, monto)) ??
+    source.find(m => enVentana(m) && importeOk(m, monto)) ??
+    source.find(m => importeOk(m, monto)) ??                          // importe ok sin restricción de fecha
+    source.find(m => enVentana(m) && banco && m.banco === banco) ??   // banco ok dentro de ventana
+    (strict && monto > 0 ? null : source.find(m => enVentana(m))) ?? // fallback sin amount solo si !strict
+    (strict && monto > 0 ? null : source[0])                         // último recurso solo si !strict
   );
 }
 
 // ── Bulk write con transacción (con fallback a standalone) ────────────────────
-// Intenta ejecutar en una transacción MongoDB para garantizar atomicidad.
-// Si el entorno no soporta transacciones (standalone / dev), cae sin sesión.
-// En producción se recomienda replica set para ACID completo.
+// Detecta el tipo de topología ANTES de intentar startSession() para evitar
+// que la sesión quede bufferizada y provoque un timeout de 10s en standalone.
+// En producción con replica set se usa transacción para ACID completo.
 async function ejecutarBulkConTransaccion(ops) {
+  // Detectar topología sin abrir sesión: si es 'Single' (standalone) o desconocida
+  // → ir directo al bulkWrite sin transacción.
+  const topologyType = mongoose.connection.client?.topology?.description?.type;
+  const esReplicaSet = topologyType === 'ReplicaSetWithPrimary'
+    || topologyType === 'ReplicaSetNoPrimary'
+    || topologyType === 'Sharded';
+
+  if (!esReplicaSet) {
+    return BankMovement.bulkWrite(ops, { ordered: false });
+  }
+
   let session = null;
   try {
     session = await mongoose.connection.startSession();
@@ -144,8 +169,7 @@ async function ejecutarBulkConTransaccion(ops) {
     if (session?.inTransaction?.()) {
       try { await session.abortTransaction(); } catch (_) { /* ignorar */ }
     }
-    // Código 20 (IllegalOperation) o mensajes de replica set indican entorno sin
-    // soporte de transacciones multi-documento → ejecutar sin sesión.
+    // Fallback por si la detección de topología no fue suficiente
     const sinSoporte = err.code === 20
       || /transaction numbers are only allowed/i.test(err.message)
       || /replica/i.test(err.message);
@@ -175,9 +199,10 @@ async function ejecutarBulkConTransaccion(ops) {
 //  · Auth es autoritativa: el importe es preferido pero no bloqueante en 1a/1b.
 //  · Fase 2 conserva la estrategia inversa por monto para CxCs sin formasPago.
 // ══════════════════════════════════════════════════════════════════════════════
-async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
+async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgress } = {}) {
   const bancoNorm = banco ? normalizarBanco(banco) : null;
 
+  onProgress?.({ phase: 'sync-cache', pct: 5, msg: 'Verificando caché ERP...' });
   // ── 0. Auto-sync del caché ERP ─────────────────────────────────────────────
   // Si el caché supera ERP_CACHE_MAX_AGE_HOURS o está vacío, descarga los datos
   // frescos del ERP antes de matchear. Esto garantiza que todas las CxC del
@@ -195,6 +220,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
     }
   }
 
+  onProgress?.({ phase: 'loading-cxc', pct: 10, msg: 'Cargando cuentas por cobrar del ERP...' });
   // ── 1. Datos del ERP ───────────────────────────────────────────────────────
   // fechaDesde (opcional): filtra CxCs cuya fechaAfectacion o fechaRealPago sea
   // mayor o igual a la fecha indicada, evitando procesar histórico antiguo.
@@ -232,18 +258,22 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
     }
   }
 
+  onProgress?.({ phase: 'loading-mov', pct: 25, msg: `${cxcs.length} CxC del ERP · cargando movimientos bancarios...` });
   // ── 2. Movimientos bancarios elegibles ─────────────────────────────────────
   // Dos casos:
   //   a) Movimiento limpio: nunca tocado por ERP (erpIds vacío).
   //   b) Movimiento parcial: vinculado en corrida anterior por erp-auto pero
   //      status sigue 'no_identificado' porque el saldoErp no cubrió el depósito
   //      (caché incompleto). Puede recibir CxC adicionales en esta corrida.
+  // Nota: $size:0 no puede usar índices. Se reemplaza por $eq:[] (mismo resultado,
+  // permite que MongoDB use el índice { isActive:1, status:1, deposito:1 }).
   const movimientos = await BankMovement.find({
     isActive: true,
+    status:   'no_identificado',
     deposito: { $gt: 0 },
     $or: [
-      { status: 'no_identificado', erpIds: { $size: 0 } },
-      { status: 'no_identificado', 'identificadoPor.userId': 'erp-auto' },
+      { erpIds: { $eq: [] } },
+      { 'identificadoPor.userId': 'erp-auto' },
     ],
     ...(bancoNorm ? { banco: bancoNorm } : {}),
   }).select('_id numeroAutorizacion referenciaNumerica concepto deposito erpIds erpLinks banco fecha').lean();
@@ -252,28 +282,19 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
     return { total: cxcs.length, matcheados: 0, identificados: 0, sinMatch: cxcs.length, noMatcheados: [], cacheWarning };
   }
 
+  onProgress?.({ phase: 'indexing', pct: 40, msg: `${movimientos.length} movimientos · construyendo índices de búsqueda...` });
   // ── 3. Índices de búsqueda ─────────────────────────────────────────────────
   const byAuthNorm          = new Map(); // numeroAutorizacion (primer bloque) → movs
   const byAuthNormAlt       = new Map(); // numeroAutorizacion (bloques 2..N) → movs  ← 1c
   const byRefNorm           = new Map(); // referenciaNumerica norm → movs
   const porConceptoPorBanco = new Map(); // banco → movs con concepto
   const porConceptoTodos    = [];        // todos los anteriores (para banco=null)
-  const conAuthPorMonto     = new Map(); // centavos → movs CON auth (fase 2)
 
   for (const m of movimientos) {
     const na = normalizarAuth(m.numeroAutorizacion);
     if (na) {
       if (!byAuthNorm.has(na)) byAuthNorm.set(na, []);
       byAuthNorm.get(na).push(m);
-
-      // Índice fase 2: movimientos CON auth Y sin vínculos ERP previos.
-      // Excluir parcialmente vinculados evita asignarles una CxC sin auth
-      // que en realidad pertenece a otro depósito.
-      if (!m.erpIds?.length) {
-        const key = Math.round((m.deposito || 0) * 100);
-        if (!conAuthPorMonto.has(key)) conAuthPorMonto.set(key, []);
-        conAuthPorMonto.get(key).push(m);
-      }
     }
     // Índice alternativo con bloques secundarios del token del banco.
     // Cubre "04711358/7607235" → también indexado como "7607235".
@@ -294,15 +315,14 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
     }
   }
 
-  // ── 4. Extraer filas del ERP y separar CxCs sin auth ──────────────────────
+  // ── 4. Extraer filas del ERP — solo CxCs con auth en formasPago ──────────
   // Una fila = un par único (erpId, autNorm). El mismo auth no se procesa dos
   // veces para la misma CxC (dedup) pero sí puede aparecer en distintas CxCs.
+  // CxCs sin ningún auth en formasPago se ignoran (Fase 1B eliminada).
   const rowsConAuth = []; // { autNorm, movTotal, cxc }
-  const cxcsSinAuth = []; // CxCs que no tienen ningún auth en formasPago
 
   const seenPairs = new Set();
   for (const cxc of cxcs) {
-    let hasAuth = false;
     for (const mov of (cxc.movimientos || [])) {
       if (!SERIES_CON_AUTH.includes(mov.serie)) continue;
       for (const fp of (mov.formasPago || [])) {
@@ -311,14 +331,12 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
         const pairKey = `${cxc.erpId}:${autNorm}`;
         if (seenPairs.has(pairKey)) continue;
         seenPairs.add(pairKey);
-        hasAuth = true;
-        // movTotal = importe del movimiento ABO/CBT/CPF/CFC que esta CxC aporta al pago.
-        // Es el valor que sumamos entre todas las CxC del mismo número de auth para
-        // calcular cuánto cubre el depósito bancario.
-        rowsConAuth.push({ autNorm, movTotal: Math.abs(mov.total ?? 0), cxc });
+        // movTotal: usamos fp.monto (importe específico de esta formasPago) cuando está
+        // disponible, porque es más preciso que mov.total en CxC con pagos mixtos.
+        // Fallback a mov.total y luego a 0 si ninguno está presente.
+        rowsConAuth.push({ autNorm, movTotal: Math.abs(fp.monto ?? mov.total ?? 0), cxc });
       }
     }
-    if (!hasAuth) cxcsSinAuth.push(cxc);
   }
 
   // ── 5. Motor de match ──────────────────────────────────────────────────────
@@ -326,6 +344,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
   const ops          = [];
   const noMatcheados = [];
   let matcheados     = 0;
+  let identificados  = 0;
 
   // Registra la operación de vinculación para un movimiento bancario.
   // Recibe un grupo de CxC que comparten el mismo número de autorización y
@@ -370,6 +389,8 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
       ? 'identificado'
       : 'no_identificado';
 
+    if (newStatus === 'identificado') identificados++;
+
     ops.push({
       updateOne: {
         // Acepta tanto movimientos limpios (sin vínculos) como los parcialmente
@@ -396,6 +417,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
     });
   }
 
+  onProgress?.({ phase: 'matching', pct: 55, msg: `Cruzando ${rowsConAuth.length} autorizaciones ERP (fase 1)...` });
   // ── Fase 1: CxCs con auth — agrupar por número de autorización (N CxC → 1 movimiento)
   // Todas las CxC que comparten el mismo autNorm deben vincularse al mismo depósito.
   // El importe de validación es la suma de movTotals del grupo.
@@ -406,20 +428,30 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
   }
 
   for (const [autNorm, grupo] of groupsByAuth) {
-    // Suma de los totales ABO/CBT/CPF/CFC de todas las CxC del grupo
+    // Suma de los importes de cada formasPago del grupo (N CxC vinculadas al mismo auth)
     const grupoTotal = grupo.reduce((s, r) => s + r.movTotal, 0);
+
+    // Fecha representativa del grupo: la más temprana entre fechaRealPago y fechaAfectacion.
+    // Se usa para priorizar movimientos bancarios temporalmente cercanos al pago del ERP.
+    const grupoFecha = grupo.reduce((earliest, { cxc }) => {
+      const d = cxc.fechaRealPago ?? cxc.fechaAfectacion ?? null;
+      if (!d) return earliest;
+      if (!earliest) return d;
+      return new Date(d) < new Date(earliest) ? d : earliest;
+    }, null);
+
     let foundMov = null;
 
-    // 1a: match exacto por numeroAutorizacion (primer bloque)
-    foundMov = findInIndex(byAuthNorm, autNorm, grupoTotal, usedMovIds);
+    // 1a: match exacto por numeroAutorizacion (primer bloque) — con fecha y modo estricto
+    foundMov = findInIndex(byAuthNorm, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
 
-    // 1b: match exacto por referenciaNumerica
-    if (!foundMov) foundMov = findInIndex(byRefNorm, autNorm, grupoTotal, usedMovIds);
+    // 1b: match exacto por referenciaNumerica — con fecha y modo estricto
+    if (!foundMov) foundMov = findInIndex(byRefNorm, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
 
-    // 1c: fallback usando bloques secundarios del token del banco (ej. BBVA "xxx/yyy")
-    if (!foundMov) foundMov = findInIndex(byAuthNormAlt, autNorm, grupoTotal, usedMovIds);
+    // 1c: fallback con bloques secundarios del token (ej. BBVA "xxx/yyy") — con fecha y modo estricto
+    if (!foundMov) foundMov = findInIndex(byAuthNormAlt, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
 
-    // 2: auth dentro del texto del concepto (con check de importe del grupo completo)
+    // 2: auth dentro del texto del concepto — exige importe correcto (modo estricto en línea)
     if (!foundMov) {
       const candidatos = bancoNorm
         ? (porConceptoPorBanco.get(bancoNorm) ?? [])
@@ -427,7 +459,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
       for (const m of candidatos) {
         if (usedMovIds.has(m._id.toString())) continue;
         if (!conceptoContainsAuth(m.concepto, autNorm)) continue;
-        if (grupoTotal && !importeOk(m, grupoTotal)) continue;
+        if (grupoTotal && !importeOk(m, grupoTotal)) continue; // importe siempre requerido aquí
         foundMov = m;
         break;
       }
@@ -442,39 +474,10 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
     }
   }
 
-  // ── Fase 2: CxCs sin auth — estrategia 3 (inversa por monto + fecha) ────────
-  // Para CxCs que no tienen formasPago con autorizacion, buscamos movimientos
-  // bancarios que YA TIENEN auth (evidencia de pago con terminal) y cuyo
-  // deposito coincida con el total de la CxC. Se corre después de la fase 1
-  // para no desplazar movimientos que una CxC con auth podría reclamar.
-  // Restricción de fecha (±PHASE2_DATE_WINDOW_DAYS): reduce falsos positivos por
-  // importes repetidos en períodos distintos. Si la CxC no tiene fecha de
-  // referencia, se permite el match sin restricción de fecha.
-  for (const cxc of cxcsSinAuth) {
-    if (!cxc.total) continue;
-    const key        = Math.round(cxc.total * 100);
-    const candidatos = conAuthPorMonto.get(key) ?? [];
-    const cxcFecha   = cxc.fechaRealPago ?? cxc.fechaAfectacion ?? null;
-    let foundMov     = null;
-    for (const m of candidatos) {
-      if (usedMovIds.has(m._id.toString())) continue;
-      if (Math.abs((m.deposito ?? 0) - cxc.total) > ERP_TOLERANCE) continue;
-      // Validación de proximidad temporal cuando ambas fechas están disponibles.
-      if (cxcFecha && m.fecha) {
-        const diff = Math.abs(new Date(m.fecha).getTime() - new Date(cxcFecha).getTime());
-        if (diff > PHASE2_DATE_WINDOW_MS) continue;
-      }
-      foundMov = m;
-      break;
-    }
-    if (foundMov) pushGroupOp(foundMov, [{ movTotal: cxc.total, cxc }]);
-  }
-
+  onProgress?.({ phase: 'writing', pct: 85, msg: `Guardando ${ops.length} asociación(es) en la base de datos...` });
   // ── 6. Escritura en bulk (con transacción si el entorno lo soporta) ─────────
-  let identificados = 0;
   if (ops.length > 0) {
-    const result = await ejecutarBulkConTransaccion(ops);
-    identificados = result.modifiedCount;
+    await ejecutarBulkConTransaccion(ops);
   }
 
   // ── 7. Filtrar noMatcheados que ya estaban vinculados ──────────────────────
@@ -492,7 +495,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}) {
   }
 
   return {
-    total:        rowsConAuth.length + cxcsSinAuth.length,
+    total:        rowsConAuth.length,
     matcheados,
     identificados,
     sinMatch:     trueSinMatch.length,

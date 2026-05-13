@@ -16,6 +16,27 @@ const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-aut
 
 const router = express.Router();
 
+/**
+ * Aplica las restricciones de visibilidad para el rol cobranza.
+ * Solo depósitos no identificados (o los que ese mismo usuario identificó).
+ *
+ * @param {object}  query     - query params originales
+ * @param {string}  userId    - auth0 sub del usuario
+ * @param {boolean} forExport - en exportación no se devuelve vacío; 'otros' → 'no_identificado'
+ * @returns {{ query: object, empty: boolean }}
+ */
+function applyCobranzaRestrictions(query, userId, forExport = false) {
+  const q = { ...query };
+  if (q.status === 'otros') {
+    if (!forExport) return { query: q, empty: true };
+    q.status = undefined; // en export: quita el filtro de status → luego cae en el default
+  }
+  if (q.status === 'identificado') q.identificadoPorUsuario = userId;
+  if (!q.status) q.status = 'no_identificado';
+  q.tipo = 'deposito';
+  return { query: q, empty: false };
+}
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 50 * 1024 * 1024 },
@@ -44,15 +65,9 @@ router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
-  const query = { ...req.query };
+  let query = { ...req.query };
   if (req.user.role === 'cobranza') {
-    if (query.status === 'otros') query.status = undefined;
-    if (query.status === 'identificado') {
-      // Solo sus propios movimientos identificados
-      query.identificadoPorUsuario = req.user._id;
-    }
-    if (!query.status) query.status = 'no_identificado';
-    query.tipo = 'deposito';
+    ({ query } = applyCobranzaRestrictions(query, req.user._id, true));
   }
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -64,17 +79,15 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
-  const query = { ...req.query };
-  if (req.user.role === 'cobranza') {
-    if (query.status === 'otros') {
+  // Cuando viene movId (navegación desde OCR) cobranza puede ver ese movimiento
+  // sin restricciones de status/tipo para que la navegación funcione correctamente.
+  let query = { ...req.query };
+  if (req.user.role === 'cobranza' && !query.movId) {
+    const { query: restricted, empty } = applyCobranzaRestrictions(query, req.user._id);
+    if (empty) {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
     }
-    if (query.status === 'identificado') {
-      // Solo los movimientos que el propio usuario de cobranza identificó
-      query.identificadoPorUsuario = req.user._id;
-    }
-    if (!query.status) query.status = 'no_identificado';
-    query.tipo = 'deposito';
+    query = restricted;
   }
   res.json(await service.listMovements(query));
 }));
@@ -120,19 +133,19 @@ router.post(
   })
 );
 
-// PATCH /api/banks/movements/:id/ficha  — solo contabilidad/admin (validado en service)
+// PATCH /api/banks/movements/:id/ficha  — requiere permiso banks:ficha (contabilidad y admin)
 router.patch('/movements/:id/ficha',
   authenticate,
-  permit('banks:update'),
+  permit('banks:ficha'),
   asyncHandler(async (req, res) => {
     res.json(await service.setFicha(req.params.id, req.body.ficha, req.user));
   }),
 );
 
-// DELETE /api/banks/movements/:id/ficha  — autor o admin (validado en service)
+// DELETE /api/banks/movements/:id/ficha  — requiere permiso banks:ficha; el service valida autoría
 router.delete('/movements/:id/ficha',
   authenticate,
-  permit('banks:update'),
+  permit('banks:ficha'),
   asyncHandler(async (req, res) => {
     res.json(await service.deleteFicha(req.params.id, req.user));
   }),
@@ -274,7 +287,7 @@ router.patch('/config/:banco',
 // POST /api/banks/config/:banco/saldo-inicial  — registro único, solo admin
 router.post('/config/:banco/saldo-inicial',
   authenticate,
-  permit('admin'),
+  permit('banks:admin'),
   asyncHandler(async (req, res) => {
     const monto = Number(req.body.monto);
     if (isNaN(monto)) return res.status(400).json({ error: 'monto debe ser un número' });
@@ -300,20 +313,35 @@ router.post('/autorizaciones/match',
 );
 
 // POST /api/banks/autorizaciones/match-erp  — match desde CxCs del ERP (sin Excel)
-// Body opcional: { banco: 'BBVA' }  — si se omite, busca en todos los bancos.
+// Body opcional: { banco: 'BBVA', fechaDesde: '2026-01-01' }
+//   banco     → si se omite, busca en todos los bancos.
+//   fechaDesde → filtra CxCs cuya fechaAfectacion/fechaRealPago >= esta fecha.
+//                Recomendado para evitar procesar histórico muy antiguo.
 router.post('/autorizaciones/match-erp',
   authenticate,
   permit('banks:import'),
   asyncHandler(async (req, res) => {
-    const result = await matchAutorizacionesDesdeErp({ banco: req.body.banco });
+    const result = await matchAutorizacionesDesdeErp({
+      banco:      req.body.banco,
+      fechaDesde: req.body.fechaDesde,
+    });
     res.json(result);
+  }),
+);
+
+// PATCH /api/banks/movements/:id  — edición de campos del movimiento
+router.patch('/movements/:id',
+  authenticate,
+  permit('banks:update'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.updateMovement(req.params.id, req.body, req.user));
   }),
 );
 
 // DELETE /api/banks/movements  — eliminación masiva, solo admin
 router.delete('/movements',
   authenticate,
-  permit('admin'),
+  permit('banks:admin'),
   asyncHandler(async (req, res) => {
     const ids = req.body.ids;
     if (!Array.isArray(ids) || ids.length === 0) {
@@ -322,5 +350,14 @@ router.delete('/movements',
     res.json(await service.deleteMovements(ids));
   }),
 );
+
+// GET /api/banks/template  — descarga la plantilla Excel oficial
+router.get('/template', authenticate, asyncHandler(async (_req, res) => {
+  const buffer = await service.generateTemplate();
+  const fecha  = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="plantilla-bancos-${fecha}.xlsx"`);
+  res.send(Buffer.from(buffer));
+}));
 
 module.exports = router;

@@ -997,19 +997,27 @@ async function setSaldoInicial(banco, monto) {
 }
 
 async function listIdentificadores(banco) {
+  // banco: string opcional con uno o varios bancos separados por coma.
+  // Sin banco → consulta en todos los bancos activos.
+  const baseMatch = { isActive: true };
+  if (banco) {
+    const vals = banco.split(',').map(v => v.trim()).filter(Boolean);
+    baseMatch.banco = vals.length === 1 ? vals[0] : { $in: vals };
+  }
+
   // Dos fuentes de identificación:
   //   1. Vía CxC/ERP  → array identificadoPor[].userId / .nombre
   //   2. Vía ficha bancaria → campos fichaBy / fichaNombre
   // Ambas se consolidan y deduplicadas por userId antes de devolver.
   const [porErp, porFicha] = await Promise.all([
     BankMovement.aggregate([
-      { $match: { banco, isActive: true, 'identificadoPor.0': { $exists: true } } },
+      { $match: { ...baseMatch, 'identificadoPor.0': { $exists: true } } },
       { $unwind: '$identificadoPor' },
       { $match: { 'identificadoPor.userId': { $ne: null } } },
       { $group: { _id: '$identificadoPor.userId', nombre: { $first: '$identificadoPor.nombre' } } },
     ]),
     BankMovement.aggregate([
-      { $match: { banco, isActive: true, fichaBy: { $ne: null } } },
+      { $match: { ...baseMatch, fichaBy: { $ne: null } } },
       { $group: { _id: '$fichaBy', nombre: { $first: '$fichaNombre' } } },
     ]),
   ]);
@@ -1026,7 +1034,13 @@ async function listIdentificadores(banco) {
 }
 
 async function listCategories(banco) {
-  const values = await BankMovement.distinct('categoria', { banco, isActive: true });
+  // banco: string opcional con uno o varios bancos separados por coma.
+  const q = { isActive: true };
+  if (banco) {
+    const vals = banco.split(',').map(v => v.trim()).filter(Boolean);
+    q.banco = vals.length === 1 ? vals[0] : { $in: vals };
+  }
+  const values = await BankMovement.distinct('categoria', q);
   // Sort: non-null first alphabetically, then null last
   return values.sort((a, b) => {
     if (a === null) return 1;
@@ -1038,10 +1052,11 @@ async function listCategories(banco) {
 async function exportMovements(filters) {
   const {
     banco, fechaInicio, fechaFin,
+    fechaAplicacionInicio, fechaAplicacionFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias,
-    identificadoPorUsuario,
+    identificadoPor,        // comma-separated userIds (nombre correcto enviado por el frontend)
   } = filters;
 
   const filter = { isActive: true, oculto: { $ne: true } };
@@ -1056,9 +1071,17 @@ async function exportMovements(filters) {
     else if (statusVals.length > 1) filter.status = { $in: statusVals };
   }
 
-  if (identificadoPorUsuario) {
-    filter.$and = filter.$and ?? [];
-    filter.$and.push({ 'identificadoPor.userId': identificadoPorUsuario });
+  // Filtro por identificador: cubre identificadoPor[].userId Y fichaBy
+  // (ambas fuentes son las que usa listIdentificadores para poblar las opciones).
+  if (identificadoPor) {
+    const userIds = identificadoPor.split(',').map(v => v.trim()).filter(Boolean);
+    if (userIds.length > 0) {
+      const match = userIds.length === 1
+        ? { $or: [{ 'identificadoPor.userId': userIds[0] }, { fichaBy: userIds[0] }] }
+        : { $or: [{ 'identificadoPor.userId': { $in: userIds } }, { fichaBy: { $in: userIds } }] };
+      filter.$and = filter.$and ?? [];
+      filter.$and.push(match);
+    }
   }
 
   if (categorias) {
@@ -1084,6 +1107,20 @@ async function exportMovements(filters) {
     filter.fecha = {};
     if (fechaInicio) filter.fecha.$gte = new Date(fechaInicio);
     if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
+  }
+
+  // Filtro por fecha de aplicación: max(identificadoPor[].fechaId, fichaAt) en el rango.
+  // Como es un campo calculado, se filtra buscando documentos donde ALGUNO de sus
+  // campos de fecha de identificación caiga dentro del rango solicitado.
+  if (fechaAplicacionInicio || fechaAplicacionFin) {
+    const df = {};
+    if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
+    if (fechaAplicacionFin)    df.$lte = new Date(`${fechaAplicacionFin}T23:59:59.999Z`);
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [
+      { 'identificadoPor.fechaId': df },
+      { fichaAt: df },
+    ]});
   }
 
   if (search) {
@@ -1142,18 +1179,18 @@ async function exportMovements(filters) {
   const sheet = workbook.addWorksheet('Movimientos');
 
   sheet.columns = [
+    { header: 'Fecha',            key: 'fecha',              width: 14 },
     { header: 'Folio',            key: 'folio',              width: 10 },
     { header: 'Banco',            key: 'banco',              width: 14 },
-    { header: 'Fecha',            key: 'fecha',              width: 14 },
     { header: 'Concepto',         key: 'concepto',           width: 50 },
+    { header: 'Fecha aplicación', key: 'fechaAplicacion',    width: 18 },
     { header: 'Depósito',         key: 'deposito',           width: 16 },
     { header: 'Retiro',           key: 'retiro',             width: 16 },
-    { header: 'Categoría',        key: 'categoria',          width: 20 },
-    { header: 'Estado',           key: 'status',             width: 16 },
-    { header: 'Fecha aplicación', key: 'fechaAplicacion',    width: 18 },
-    { header: 'Serie-Folio ERP',  key: 'erpIds',             width: 30 },
+    { header: 'Serie-Folio / Ficha', key: 'erpIds',           width: 32 },
     { header: 'Saldo ERP',        key: 'saldoErp',           width: 16 },
     { header: 'Diferencia',       key: 'diferencia',         width: 16 },
+    { header: 'Categoría',        key: 'categoria',          width: 20 },
+    { header: 'Estado',           key: 'status',             width: 16 },
     { header: 'N° Autorización',  key: 'numeroAutorizacion', width: 20 },
     { header: 'Identificado por', key: 'identificadoPor',    width: 24 },
   ];
@@ -1191,9 +1228,13 @@ async function exportMovements(filters) {
       retiro:             m.retiro   ?? null,
       categoria:          m.categoria ?? null,
       status:             STATUS_LABELS[m.status] ?? m.status,
-      erpIds:             (m.erpLinks || [])
-                            .map(l => (l.serie && l.folioExterno) ? `${l.serie}-${l.folioExterno}` : (l.folioExterno || l.erpId))
-                            .join(', ') || null,
+      erpIds:             (() => {
+                            const erp   = (m.erpLinks || [])
+                              .map(l => (l.serie && l.folioExterno) ? `${l.serie}-${l.folioExterno}` : (l.folioExterno || l.erpId))
+                              .join(', ');
+                            const parts = [erp, m.ficha ?? null].filter(Boolean);
+                            return parts.join(' · ') || null;
+                          })(),
       saldoErp:           m.saldoErp ?? null,
       diferencia,
       numeroAutorizacion: m.numeroAutorizacion ?? null,

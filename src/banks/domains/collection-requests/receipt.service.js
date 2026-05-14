@@ -93,6 +93,11 @@ const MESES_ES = {
   enero:1, febrero:2, marzo:3, abril:4, mayo:5, junio:6,
   julio:7, agosto:8, septiembre:9, octubre:10, noviembre:11, diciembre:12,
 };
+// Abreviaturas de 3 letras — usadas en comprobantes Banamex ("13 may 2026")
+const MESES_ABBR = {
+  ene:1, feb:2, mar:3, abr:4, may:5, jun:6,
+  jul:7, ago:8, sep:9, oct:10, nov:11, dic:12,
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // MOTOR 1 — TESSERACT  (workers singleton — se inicializan una vez y se reusan)
@@ -119,9 +124,10 @@ function getFullWorker() {
       // OEM 1 = LSTM_ONLY: motor neuronal puro, más preciso que el motor clásico (OEM 0)
       const w = await Tesseract.createWorker(['spa', 'eng'], 1, { logger: () => {} });
       await w.setParameters({
-        tessedit_pageseg_mode:   Tesseract.PSM.SINGLE_COLUMN,  // PSM 4 — columna única
-        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
+        tessedit_pageseg_mode:     Tesseract.PSM.SINGLE_COLUMN,  // PSM 4 — columna única
+        tessedit_char_whitelist:   '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
         preserve_interword_spaces: '1',
+        user_defined_dpi:          '300', // evita "Invalid resolution XX dpi" en imágenes sin metadata DPI
       });
       return w;
     })();
@@ -137,9 +143,10 @@ function getBlockWorker() {
         // PSM 6 (SINGLE_BLOCK): trata la imagen como un bloque uniforme de texto.
         // Captura mejor los recibos con layout horizontal (label izquierda, valor derecha),
         // PDFs con múltiples columnas y screenshots de apps con secciones anchas.
-        tessedit_pageseg_mode:   Tesseract.PSM.SINGLE_BLOCK,
-        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
+        tessedit_pageseg_mode:     Tesseract.PSM.SINGLE_BLOCK,
+        tessedit_char_whitelist:   '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
         preserve_interword_spaces: '1',
+        user_defined_dpi:          '300',
       });
       return w;
     })();
@@ -154,9 +161,10 @@ function getNumsWorker() {
       await w.setParameters({
         // PSM 11 (SPARSE_TEXT): busca texto disperso sin asumir layout uniforme.
         // Más adecuado que PSM 6 (SINGLE_BLOCK) para encontrar montos sueltos en recibos.
-        tessedit_pageseg_mode:   Tesseract.PSM.SPARSE_TEXT,
-        tessedit_char_whitelist: '0123456789$.,: ',
+        tessedit_pageseg_mode:     Tesseract.PSM.SPARSE_TEXT,
+        tessedit_char_whitelist:   '0123456789$.,: ',
         preserve_interword_spaces: '1',
+        user_defined_dpi:          '300',
       });
       return w;
     })();
@@ -287,8 +295,9 @@ function extractMonto(text) {
   m = text.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d{1,9}(?:\.\d{1,2})?)\b/);
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
-  // E3: prefijo MXN / MX$ / USD
-  m = text.match(/(?:MXN|MX\$|USD)\s*([\d,]+(?:\.\d{1,2})?)\b/i);
+  // E3: prefijo MXN / MX$ / USD — solo en la misma línea (no cruzar \n)
+  // Bug conocido: "8,165.99 MXN\n08 de mayo" matcheaba "MXN\n08" → monto=8
+  m = text.match(/(?:MXN|MX\$|USD)[^\S\n]*([\d,]+(?:\.\d{1,2})?)\b/i);
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
   // E4: número con coma como separador de miles: 15,000.00
@@ -382,15 +391,15 @@ function extractFieldsFromLines(lines) {
     },
     {
       field: 'titularDestino',
-      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|para)\s*[:\-]?$/i,
+      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|nombre|para)\s*[:\-]?$/i,
     },
     {
       field: 'claveRastreo',
-      re: /^(clave\s+(de\s+)?rastreo|rastreo\s+spei|tracking\s*(key|id)?)\s*[:\-]?$/i,
+      re: /^(clave\s+(de\s+)?rastreo|rastreo\s+spei|tracking\s*(key|id)?|folio\s+[úu]nico)\s*[:\-]?$/i,
     },
     {
       field: 'referencia',
-      re: /^(referencia|folio|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n)\s*[:\-]?$/i,
+      re: /^(referencia|folio(?:\s+de\s+operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
     },
     {
       field: 'numeroAutorizacion',
@@ -491,10 +500,18 @@ function extractFecha(text) {
   m = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
   if (m) return m[0];
 
-  m = text.match(/(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?(20\d{2})/i);
+  // Formato completo con o sin "de": "03 de marzo de 2026" / "03 marzo 2026"
+  m = text.match(/(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?(20\d{2})/i);
   if (m) {
     const mes = MESES_ES[m[2].toLowerCase()];
-    return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+    if (mes) return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  }
+
+  // Meses abreviados (3 letras): "13 may 2026", "13 ene 2026" — frecuente en Banamex y Banorte
+  m = text.match(/(\d{1,2})\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b\w*\s+(?:de\s+)?(20\d{2})/i);
+  if (m) {
+    const mes = MESES_ABBR[m[2].toLowerCase().slice(0, 3)];
+    if (mes) return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
   }
 
   m = text.match(/\b(\d{2})\/(\d{2})\/(\d{2})\b/);
@@ -512,21 +529,27 @@ function extractHora(text) {
 }
 
 function extractClaveRastreo(text) {
-  let m = text.match(/(?:clave\s+(?:de\s+)?rastreo|rastreo\s*(?:spei)?|tracking\s*(?:key|id)?)[:\s#]*([A-Z0-9]{8,35})/i);
+  // P1: etiqueta explícita (incluye "folio único" de BBVA mismo banco)
+  let m = text.match(/(?:clave\s+(?:de\s+)?rastreo|rastreo\s*(?:spei)?|tracking\s*(?:key|id)?|folio\s+[úu]nico)[:\s#]*([A-Z0-9]{8,35})/i);
   if (m) return m[1].toUpperCase().replace(/\s/g, '');
 
+  // P2: prefijo bancario SPEI (BBVAMEX..., BNAM..., HDNX...) + dígitos
   m = text.match(/\b([A-Z]{2,8}\d{8,22})\b/);
   if (m) return m[1];
 
-  m = text.match(/\b([A-Z0-9]{18,30})\b/);
+  // P3: secuencia alfanumérica 18–35 chars con letras Y dígitos mezclados
+  //     (cubre folios hex de 32 chars como los de BBVA mismo banco)
+  m = text.match(/\b([A-Z0-9]{18,35})\b/);
   if (m && /[A-Z]/.test(m[1]) && /\d/.test(m[1])) return m[1];
 
   return null;
 }
 
 function extractReferencia(text) {
+  // "folio(?:\s+de\s+operación)?" cubre tanto "Folio: X" como "Folio de operación\nX"
+  // "[:\s#\n]*" usa \n explícito para cruzar línea cuando el valor está en la siguiente
   const m = text.match(
-    /(?:referencia|folio|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n)[:\s#]*(\d{4,20})/i
+    /(?:referencia|folio(?:\s+de\s+operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
   );
   return m ? m[1] : null;
 }
@@ -595,7 +618,19 @@ function extractBancos(text) {
 }
 
 function extractUltimos4(text) {
-  let m = text.match(/[*Xx\.]{3,4}[\s-]?(\d{4})\b/);
+  let m;
+
+  // Bullet "•" / "·" — formato BBVA: "CUENTA • 14588", "•4352"
+  // Toma los últimos 4 dígitos si el grupo capturado tiene 3–5 dígitos
+  m = text.match(/[•·\u2022\u00b7]\s*(\d{3,5})\b/);
+  if (m) return m[1].slice(-4);
+
+  // Asteriscos dobles — formato Banamex: "Priority **546", "**120/971"
+  m = text.match(/\*{2,4}\s*(\d{3,4})(?:\/\d+)?\b/);
+  if (m) return m[1].slice(-4);
+
+  // Asteriscos/X/puntos — formato estándar: "****1234", "XX1234"
+  m = text.match(/[*Xx\.]{3,4}[\s-]?(\d{4})\b/);
   if (m) return m[1];
 
   m = text.match(/(?:termina(?:ndo)?|ending|últ(?:imos)?\.?)\s+(?:en\s+)?(\d{4})\b/i);
@@ -610,7 +645,8 @@ function extractUltimos4(text) {
 function extractTitular(text, role) {
   const labels = role === 'origen'
     ? ['ordenante','remitente','emisor','nombre del emisor','nombre de origen','nombre del ordenante']
-    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','para'];
+    // "nombre" solo aplica a destino: en BBVA mismo banco, "Nombre: X" es el beneficiario
+    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','nombre','para'];
 
   const re = new RegExp(
     `(?:${labels.join('|')})[:\\s]+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\\s\\.]{3,60})`, 'i'
@@ -619,11 +655,18 @@ function extractTitular(text, role) {
   return m ? m[1].split('\n')[0].trim().toUpperCase().slice(0, 60) : null;
 }
 
+// Etiquetas que NO deben tomarse como valor de concepto (evitar capturar la siguiente etiqueta)
+const CONCEPTO_LABEL_BLACKLIST = /^(?:importe|monto|total|fecha|hora|titular|cuenta|banco|clave\s+rastreo|folio|rastreo|referencia|contrato|n[úu]mero|autorizaci[oó]n|tipo)\s*:?$/i;
+
 function extractConcepto(text) {
-  const m = text.match(
-    /(?:concepto|descripci[oó]n|motivo|referencia\s+de\s+pago|leyenda)[:\s]+([^\n]{3,100})/i
-  );
-  return m ? m[1].trim().slice(0, 120) : null;
+  // Iterar todos los matches para saltar etiquetas falsas (ej. "Concepto:\nImporte:")
+  const re = /(?:concepto|descripci[oó]n|motivo|referencia\s+de\s+pago|leyenda)[:\s]+([^\n]{3,100})/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const val = m[1].trim();
+    if (!CONCEPTO_LABEL_BLACKLIST.test(val)) return val.slice(0, 120);
+  }
+  return null;
 }
 
 function calcConfianza(fields) {
@@ -812,10 +855,18 @@ async function extractReceiptDataGemini(imageBuffer, mimeType) {
     concepto:              data.concepto              || null,
   };
 
+  const confianza = calcConfianza(fields);
+  // Si Gemini no extrajo ningún campo útil (ej. imagen ilegible o fuera de contexto),
+  // lanzar error para que el dispatcher pruebe el siguiente motor en lugar de
+  // retornar un resultado vacío que bloquea la cadena de fallback.
+  if (confianza === 0) {
+    throw new Error('Gemini no extrajo datos útiles del comprobante (todos los campos null)');
+  }
+
   return {
     ...fields,
-    confianza: calcConfianza(fields),
-    _engine:   'gemini-2.0-flash',
+    confianza,
+    _engine: 'gemini-2.0-flash',
   };
 }
 
@@ -1130,10 +1181,27 @@ async function preprocessImage(imageBuffer) {
     const useAdaptive = isScreenshot || stdDev > 35;
 
     if (useAdaptive) {
-      // Screenshots: ventana pequeña — el texto es uniforme y el fondo también.
-      // Fotos:       ventana grande  — compensa iluminación no uniforme por zona.
-      // k menor → preserva más trazos finos (riesgo: algo de ruido de fondo).
-      // k mayor → imagen más limpia  (riesgo: trazos muy finos desaparecen).
+      if (isScreenshot) {
+        // Detectar si la parte superior del screenshot tiene header oscuro (BBVA verde,
+        // Nu morado, Santander rojo). En ese caso, Bradley-Roth falla porque marca el fondo
+        // oscuro como "texto" y el texto blanco como "fondo" — el resultado es texto blanco
+        // sobre fondo blanco: invisible para Tesseract.
+        // Solución: devolver la imagen CLAHE-enhanced sin binarizar — Tesseract LSTM maneja
+        // grayscale directamente y no necesita binarización cuando hay zonas mixtas.
+        const { data: topData, info: topInfo } = await sharp(enhancedBuf)
+          .extract({ left: 0, top: 0, width: (await sharp(enhancedBuf).metadata()).width, height: Math.max(1, Math.floor((await sharp(enhancedBuf).metadata()).height * 0.30)) })
+          .grayscale()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        const topBrightness = topData.reduce((s, v) => s + v, 0) / topData.length;
+
+        if (topBrightness < 120) {
+          // Header oscuro detectado — saltar binarización para conservar texto blanco
+          return enhancedBuf;
+        }
+      }
+
+      // Screenshots sin header oscuro y fotos con variación de iluminación
       const windowSize = isScreenshot ? 25 : 45;
       const k          = isScreenshot ? 0.12 : 0.20;
       return await adaptiveThreshold(enhancedBuf, windowSize, k);
@@ -1142,8 +1210,11 @@ async function preprocessImage(imageBuffer) {
     // Imagen de alto contraste uniforme → threshold global más rápido
     return await sharp(enhancedBuf).threshold(140).png().toBuffer();
 
-  } catch {
-    return imageBuffer; // fallback: buffer original si falla cualquier paso
+  } catch (prepErr) {
+    // Loguear el paso que falló para facilitar diagnóstico (ej. GIF animado, buffer corrupto)
+    const logger = require('../../../shared/utils/logger');
+    logger.warn('[preprocessImage] Pipeline de preprocesamiento falló, usando buffer original:', prepErr.message);
+    return imageBuffer;
   }
 }
 
@@ -1156,6 +1227,90 @@ async function extractTextFromPdf(pdfBuffer) {
   const pdfParse = require('pdf-parse');
   const data     = await pdfParse(pdfBuffer);
   return (data.text || '').trim();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PDF ESCANEADO → IMAGEN  (pdfjs-dist v3 + canvas)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Renderiza las primeras N páginas de un PDF a buffers PNG de alta resolución.
+ *
+ * Usa pdfjs-dist (Motor JavaScript puro, sin Ghostscript ni ImageMagick) +
+ * el módulo `canvas` que ya se encuentra disponible como dependencia transitiva.
+ *
+ * Scale 2.5 ≈ 187 DPI sobre un PDF de 72 DPI base → suficiente para Tesseract LSTM.
+ * Para PDFs de tamaño carta (8.5×11 in) produce ≈ 1590×2063 px, óptimo para OCR.
+ */
+async function renderPdfToImages(pdfBuffer, maxPages = 2) {
+  // Requiere lazy para no romper el arranque si pdfjs-dist no está instalado
+  let pdfjsLib;
+  try {
+    pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+  } catch {
+    throw new Error('pdfjs-dist no está instalado — ejecuta: npm install pdfjs-dist@3.11.174');
+  }
+
+  let createCanvas;
+  try {
+    ({ createCanvas } = require('canvas'));
+  } catch {
+    throw new Error('El módulo canvas no está disponible — ejecuta: npm install canvas');
+  }
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    require.resolve('pdfjs-dist/legacy/build/pdf.worker.js');
+
+  const data = new Uint8Array(pdfBuffer);
+  const pdf  = await pdfjsLib.getDocument({ data, verbosity: 0 }).promise;
+  const pagesToRender = Math.min(pdf.numPages, maxPages);
+
+  const images = [];
+  for (let i = 1; i <= pagesToRender; i++) {
+    const page   = await pdf.getPage(i);
+    const vp     = page.getViewport({ scale: 2.5 });
+    const canvas = createCanvas(Math.ceil(vp.width), Math.ceil(vp.height));
+    const ctx    = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    images.push(canvas.toBuffer('image/png'));
+  }
+  return images;
+}
+
+/**
+ * Motor para PDFs escaneados (sin texto embebido).
+ *
+ * Flujo: renderizar cada página a PNG → preprocessImage → Tesseract (3 PSMs).
+ * Si la primera página produce confianza baja (< 40), intenta la segunda.
+ * Retorna el resultado de mayor confianza.
+ */
+async function extractReceiptDataPdfAsImage(pdfBuffer) {
+  const logger  = require('../../../shared/utils/logger');
+  const pages   = await renderPdfToImages(pdfBuffer, 2);
+
+  if (!pages.length) {
+    throw new Error('renderPdfToImages no devolvió ninguna página');
+  }
+
+  const results = [];
+  for (const pagePng of pages) {
+    try {
+      const r = await extractReceiptDataTesseract(pagePng, 'image/png');
+      results.push(r);
+      // Si ya tenemos buena confianza en la primera página, no renderizar más
+      if (r.confianza >= 40) break;
+    } catch (pageErr) {
+      logger.warn('[extractReceiptDataPdfAsImage] Error procesando página PDF→imagen:', pageErr.message);
+    }
+  }
+
+  if (!results.length) {
+    throw new Error('Tesseract no pudo extraer datos de ninguna página del PDF renderizado');
+  }
+
+  // Elegir la página con mayor confianza
+  const best = results.reduce((a, b) => (b.confianza > a.confianza ? b : a));
+  return { ...best, _engine: 'tesseract-pdf-render' };
 }
 
 /**
@@ -1247,10 +1402,15 @@ async function extractReceiptDataVision(imageBuffer, mimeType = 'image/jpeg') {
 /**
  * Extrae datos de un comprobante de pago.
  *
- * Cadena de motores:
- *   1. Gemini 2.0 Flash  — mejor precisión, entiende PDF e imagen
- *   2. Google Vision API — OCR clásico de alta calidad
- *   3. Tesseract.js      — fallback local (solo imágenes)
+ * Cadena de motores (imágenes):
+ *   1. Gemini 2.0 Flash  — mejor precisión, entiende PDF e imagen de forma nativa
+ *   2. Google Vision API — DOCUMENT_TEXT_DETECTION + preprocessImage
+ *   3. Tesseract.js      — fallback local completo (3 PSMs en paralelo)
+ *
+ * Cadena de motores (PDF):
+ *   1. Gemini           — acepta PDF base64 de forma nativa
+ *   2. Vision + pdf-parse — para PDFs con texto embebido (vectorial/digital)
+ *   3. pdfjs + Tesseract — renderiza páginas a PNG y aplica OCR (PDFs escaneados)
  */
 async function extractReceiptData(imageBuffer, mimeType) {
   if (!SUPPORTED_MIME.includes(mimeType))
@@ -1272,14 +1432,22 @@ async function extractReceiptData(imageBuffer, mimeType) {
     console.warn('[receiptService] Vision falló:', visionErr.message);
 
     if (isPdf) {
-      throw new Error(
-        'No se pudo procesar el PDF con ningún motor. ' +
-        visionErr.message
-      );
+      // Motor 3-PDF: renderizar cada página del PDF a imagen PNG y aplicar Tesseract.
+      // Cubre PDFs escaneados (imagen dentro de PDF) que pdf-parse no puede extraer.
+      console.warn('[receiptService] PDF sin texto embebido — intentando render PDF→imagen con Tesseract.');
+      try {
+        return await extractReceiptDataPdfAsImage(imageBuffer);
+      } catch (pdfRenderErr) {
+        console.warn('[receiptService] Render PDF→imagen falló:', pdfRenderErr.message);
+        throw new Error(
+          'No se pudo procesar el PDF con ningún motor disponible. ' +
+          `Vision: ${visionErr.message} | Render: ${pdfRenderErr.message}`
+        );
+      }
     }
   }
 
-  // ── Motor 3: Tesseract (solo imágenes) ────────────────────────
+  // ── Motor 3: Tesseract (imágenes) ─────────────────────────────
   console.warn('[receiptService] Usando Tesseract como último fallback.');
   return {
     ...(await extractReceiptDataTesseract(imageBuffer, mimeType)),

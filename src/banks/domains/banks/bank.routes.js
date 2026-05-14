@@ -13,8 +13,30 @@ const {
 } = require('./bank-auxiliary.parser');
 const rulesService          = require('./bank-rules.service');
 const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
+const { emitToUser } = require('../../shared/socket');
 
 const router = express.Router();
+
+/**
+ * Aplica las restricciones de visibilidad para el rol cobranza.
+ * Solo depósitos no identificados (o los que ese mismo usuario identificó).
+ *
+ * @param {object}  query     - query params originales
+ * @param {string}  userId    - auth0 sub del usuario
+ * @param {boolean} forExport - en exportación no se devuelve vacío; 'otros' → 'no_identificado'
+ * @returns {{ query: object, empty: boolean }}
+ */
+function applyCobranzaRestrictions(query, userId, forExport = false) {
+  const q = { ...query };
+  if (q.status === 'otros') {
+    if (!forExport) return { query: q, empty: true };
+    q.status = undefined; // en export: quita el filtro de status → luego cae en el default
+  }
+  if (q.status === 'identificado') q.identificadoPorUsuario = userId;
+  if (!q.status) q.status = 'no_identificado';
+  q.tipo = 'deposito';
+  return { query: q, empty: false };
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -30,29 +52,21 @@ router.get('/cards', authenticate, asyncHandler(async (req, res) => {
   res.json(await service.getCards());
 }));
 
-// GET /api/banks/categories?banco=BBVA
+// GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)
 router.get('/categories', authenticate, asyncHandler(async (req, res) => {
-  if (!req.query.banco) return res.status(400).json({ error: 'banco requerido' });
-  res.json(await service.listCategories(req.query.banco));
+  res.json(await service.listCategories(req.query.banco ?? null));
 }));
 
-// GET /api/banks/identificadores?banco=BBVA
+// GET /api/banks/identificadores?banco=BBVA  (banco opcional; sin banco → todos)
 router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
-  if (!req.query.banco) return res.status(400).json({ error: 'banco requerido' });
-  res.json(await service.listIdentificadores(req.query.banco));
+  res.json(await service.listIdentificadores(req.query.banco ?? null));
 }));
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
-  const query = { ...req.query };
+  let query = { ...req.query };
   if (req.user.role === 'cobranza') {
-    if (query.status === 'otros') query.status = undefined;
-    if (query.status === 'identificado') {
-      // Solo sus propios movimientos identificados
-      query.identificadoPorUsuario = req.user._id;
-    }
-    if (!query.status) query.status = 'no_identificado';
-    query.tipo = 'deposito';
+    ({ query } = applyCobranzaRestrictions(query, req.user._id, true));
   }
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -64,17 +78,15 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
-  const query = { ...req.query };
-  if (req.user.role === 'cobranza') {
-    if (query.status === 'otros') {
+  // Cuando viene movId (navegación desde OCR) cobranza puede ver ese movimiento
+  // sin restricciones de status/tipo para que la navegación funcione correctamente.
+  let query = { ...req.query };
+  if (req.user.role === 'cobranza' && !query.movId) {
+    const { query: restricted, empty } = applyCobranzaRestrictions(query, req.user._id);
+    if (empty) {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
     }
-    if (query.status === 'identificado') {
-      // Solo los movimientos que el propio usuario de cobranza identificó
-      query.identificadoPorUsuario = req.user._id;
-    }
-    if (!query.status) query.status = 'no_identificado';
-    query.tipo = 'deposito';
+    query = restricted;
   }
   res.json(await service.listMovements(query));
 }));
@@ -120,19 +132,19 @@ router.post(
   })
 );
 
-// PATCH /api/banks/movements/:id/ficha  — solo contabilidad/admin (validado en service)
+// PATCH /api/banks/movements/:id/ficha  — requiere permiso banks:ficha (contabilidad y admin)
 router.patch('/movements/:id/ficha',
   authenticate,
-  permit('banks:update'),
+  permit('banks:ficha'),
   asyncHandler(async (req, res) => {
     res.json(await service.setFicha(req.params.id, req.body.ficha, req.user));
   }),
 );
 
-// DELETE /api/banks/movements/:id/ficha  — autor o admin (validado en service)
+// DELETE /api/banks/movements/:id/ficha  — requiere permiso banks:ficha; el service valida autoría
 router.delete('/movements/:id/ficha',
   authenticate,
-  permit('banks:update'),
+  permit('banks:ficha'),
   asyncHandler(async (req, res) => {
     res.json(await service.deleteFicha(req.params.id, req.user));
   }),
@@ -274,7 +286,7 @@ router.patch('/config/:banco',
 // POST /api/banks/config/:banco/saldo-inicial  — registro único, solo admin
 router.post('/config/:banco/saldo-inicial',
   authenticate,
-  permit('admin'),
+  permit('banks:admin'),
   asyncHandler(async (req, res) => {
     const monto = Number(req.body.monto);
     if (isNaN(monto)) return res.status(400).json({ error: 'monto debe ser un número' });
@@ -299,21 +311,70 @@ router.post('/autorizaciones/match',
   }),
 );
 
-// POST /api/banks/autorizaciones/match-erp  — match desde CxCs del ERP (sin Excel)
-// Body opcional: { banco: 'BBVA' }  — si se omite, busca en todos los bancos.
+// ── Job store en memoria para match-erp ───────────────────────────────────────
+// Guarda estado de cada corrida. Los resultados expiran en 15 min para no
+// acumular memoria en procesos de larga ejecución.
+const erpMatchJobs = new Map(); // jobId → { status, result?, error? }
+const ERP_JOB_TTL_MS = 15 * 60 * 1000;
+
+// POST /api/banks/autorizaciones/match-erp  — inicia job en background, devuelve jobId
+// Body opcional: { banco: 'BBVA', fechaDesde: '2026-01-01' }
 router.post('/autorizaciones/match-erp',
   authenticate,
   permit('banks:import'),
   asyncHandler(async (req, res) => {
-    const result = await matchAutorizacionesDesdeErp({ banco: req.body.banco });
-    res.json(result);
+    const jobId    = `erp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const auth0Sub = req.user._id;
+
+    erpMatchJobs.set(jobId, { status: 'running' });
+    res.status(202).json({ jobId });
+
+    // Corre en background: no await, respuesta ya enviada al cliente.
+    matchAutorizacionesDesdeErp(
+      { banco: req.body.banco, fechaDesde: req.body.fechaDesde },
+      {
+        onProgress: (progress) => {
+          emitToUser(auth0Sub, 'bank:erp:match:progress', { jobId, ...progress });
+        },
+      },
+    )
+      .then(result => {
+        erpMatchJobs.set(jobId, { status: 'done', result });
+        emitToUser(auth0Sub, 'bank:erp:match:done', { jobId, ...result });
+        setTimeout(() => erpMatchJobs.delete(jobId), ERP_JOB_TTL_MS);
+      })
+      .catch(err => {
+        const error = err?.message || 'Error desconocido en el motor ERP';
+        erpMatchJobs.set(jobId, { status: 'error', error });
+        emitToUser(auth0Sub, 'bank:erp:match:error', { jobId, error });
+        setTimeout(() => erpMatchJobs.delete(jobId), ERP_JOB_TTL_MS);
+      });
+  }),
+);
+
+// GET /api/banks/autorizaciones/match-erp/job/:jobId  — polling de estado (fallback socket)
+router.get('/autorizaciones/match-erp/job/:jobId',
+  authenticate,
+  asyncHandler(async (req, res) => {
+    const job = erpMatchJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job no encontrado o expirado' });
+    res.json(job);
+  }),
+);
+
+// PATCH /api/banks/movements/:id  — edición de campos del movimiento
+router.patch('/movements/:id',
+  authenticate,
+  permit('banks:update'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.updateMovement(req.params.id, req.body, req.user));
   }),
 );
 
 // DELETE /api/banks/movements  — eliminación masiva, solo admin
 router.delete('/movements',
   authenticate,
-  permit('admin'),
+  permit('banks:admin'),
   asyncHandler(async (req, res) => {
     const ids = req.body.ids;
     if (!Array.isArray(ids) || ids.length === 0) {
@@ -322,5 +383,14 @@ router.delete('/movements',
     res.json(await service.deleteMovements(ids));
   }),
 );
+
+// GET /api/banks/template  — descarga la plantilla Excel oficial
+router.get('/template', authenticate, asyncHandler(async (_req, res) => {
+  const buffer = await service.generateTemplate();
+  const fecha  = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="plantilla-bancos-${fecha}.xlsx"`);
+  res.send(Buffer.from(buffer));
+}));
 
 module.exports = router;

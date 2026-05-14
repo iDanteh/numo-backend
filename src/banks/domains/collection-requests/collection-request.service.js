@@ -4,6 +4,7 @@ const CollectionRequest = require('./CollectionRequest.model');
 const BankMovement      = require('../banks/BankMovement.model');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
+const { emitToBanco } = require('../../shared/socket');
 
 async function analyzeReceipt(fileBuffer, mimetype) {
   const extracted  = await extractReceiptData(fileBuffer, mimetype);
@@ -105,10 +106,16 @@ async function confirm(id, data, userId) {
   // Marcar el movimiento bancario como identificado.
   // Solo se actualiza si aún no tiene uuidXML (que bloquea el status).
   if (cr.bankMovementId) {
-    await BankMovement.findOneAndUpdate(
+    const mov = await BankMovement.findOneAndUpdate(
       { _id: cr.bankMovementId, uuidXML: null },
       { status: 'identificado' },
+      { new: true },
     );
+    if (mov) {
+      emitToBanco(mov.banco, 'bank:movement:updated', {
+        _id: mov._id, banco: mov.banco, status: mov.status,
+      });
+    }
   }
 
   return cr;
@@ -121,6 +128,17 @@ async function reject(id, notas) {
     { new: true },
   );
   if (!cr) throw new NotFoundError('Solicitud no encontrada o ya confirmada');
+
+  // Si tenía un movimiento vinculado, notificar en tiempo real (el status puede haber cambiado)
+  if (cr.bankMovementId) {
+    const mov = await BankMovement.findById(cr.bankMovementId).lean();
+    if (mov) {
+      emitToBanco(mov.banco, 'bank:movement:updated', {
+        _id: mov._id, banco: mov.banco, status: mov.status,
+      });
+    }
+  }
+
   return cr;
 }
 

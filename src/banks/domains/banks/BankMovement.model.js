@@ -114,6 +114,9 @@ bankMovementSchema.index({ fecha: -1, banco: 1 });
 bankMovementSchema.index({ numeroAutorizacion: 1, banco: 1 });
 bankMovementSchema.index({ banco: 1, status: 1 });
 bankMovementSchema.index({ banco: 1, categoria: 1 });
+// Índices para el motor Match ERP
+bankMovementSchema.index({ isActive: 1, status: 1, deposito: 1 });
+bankMovementSchema.index({ 'identificadoPor.userId': 1 });
 
 // Índice de texto para el buscador
 bankMovementSchema.index({

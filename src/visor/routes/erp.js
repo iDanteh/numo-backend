@@ -3,7 +3,7 @@
 const express = require('express');
 const { body, query } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
-const { cargar, previsualizar, enriquecerPagos } = require('../controllers/erp.controller');
+const { cargar, previsualizar, enriquecerPagos, estadoCfdi } = require('../controllers/erp.controller');
 
 const router = express.Router();
 
@@ -33,6 +33,12 @@ router.post('/enriquecer-pagos',
   authenticate,
   permit('erp:manage'),
   enriquecerPagos,
+);
+
+router.get('/estado-cfdi/:cfdiId',
+  authenticate,
+  permit('erp:manage'),
+  estadoCfdi,
 );
 
 module.exports = router;

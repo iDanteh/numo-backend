@@ -22,6 +22,8 @@ const accountPlanRoutes       = require('./banks/domains/account-plan/account-pl
 const collectionRequestRoutes = require('./banks/domains/collection-requests/collection-request.routes');
 const bankErpRoutes           = require('./banks/domains/erp/erp.routes');
 const userRoutes              = require('./banks/domains/users/user.routes');
+const polizaRoutes            = require('./banks/domains/polizas/poliza.routes');
+const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mapping.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -115,6 +117,8 @@ app.use('/api/account-plan',         accountPlanRoutes);
 app.use('/api/collection-requests',  collectionRequestRoutes);
 app.use('/api/erp',                  bankErpRoutes);
 app.use('/api/users',                userRoutes);
+app.use('/api/polizas',             polizaRoutes);
+app.use('/api/cfdi-mapping',        cfdiMappingRoutes);
 
 // Visor module
 app.use('/api/auth',             authRoutes);
@@ -142,6 +146,23 @@ const PORT = process.env.PORT || 3000;
 
 const startServer = async () => {
   await connectDB();
+
+  // Limpiar sesiones de comparación que quedaron en 'running' por un reinicio anterior.
+  // Si el proceso fue interrumpido (deploy, OOM, SIGKILL) mientras corría un batch,
+  // la sesión nunca llegó a marcarse 'completed' o 'failed' → queda en 'running' para siempre.
+  try {
+    const ComparisonSession = require('./visor/models/ComparisonSession');
+    const { modifiedCount } = await ComparisonSession.updateMany(
+      { status: 'running' },
+      { $set: { status: 'failed', completedAt: new Date(), failureReason: 'Servidor reiniciado mientras el proceso estaba en curso' } },
+    );
+    if (modifiedCount > 0) {
+      logger.warn(`[startup] ${modifiedCount} sesión(es) de comparación quedaron en 'running' — marcadas como 'failed'`);
+    }
+  } catch (err) {
+    logger.error('[startup] No se pudieron limpiar sesiones zombie:', err.message);
+  }
+
   require('./visor/jobs/satSyncJob');
   try {
     await seed();

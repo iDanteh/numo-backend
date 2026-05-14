@@ -183,10 +183,21 @@ const cfdiSchema = new mongoose.Schema({
   // Resultado de la última comparación ejecutada
   lastComparisonStatus: {
     type: String,
-    enum: ['match', 'discrepancy', 'warning', 'not_in_sat', 'not_in_erp', 'cancelled', 'pending', 'error', null],
+    enum: ['match', 'discrepancy', 'warning', 'not_in_sat', 'not_in_erp', 'cancelled', 'pending', 'error', 'conciliado', null],
     default: null,
   },
   lastComparisonAt: { type: Date },
+
+  // Datos de conciliación manual (cuando lastComparisonStatus === 'conciliado')
+  conciliadoPor:      { type: String },
+  conciliadoEn:       { type: Date },
+  conciliacionCausa:  {
+    type: String,
+    enum: ['proveedor_sin_registro', 'cancelada_antes_de_registro', 'periodo_anterior',
+           'factura_global_sat', 'error_descarga_sat', 'tercero_sin_impacto', 'otra', null],
+    default: null,
+  },
+  conciliacionNotas:  { type: String },
 
   // Estado en SAT
   satStatus: {

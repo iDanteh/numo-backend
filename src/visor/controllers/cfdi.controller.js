@@ -112,7 +112,13 @@ const list = asyncHandler(async (req, res) => {
     const uuidList = uuids.split(',').map(u => u.trim().toUpperCase()).filter(Boolean);
     if (uuidList.length) filter.uuid = { $in: uuidList };
   } else if (uuid) {
-    filter.uuid = { $regex: uuid.trim(), $options: 'i' };
+    const term = uuid.trim();
+    const termUpper = term.toUpperCase();
+    filter.$or = [
+      { uuid: { $regex: term, $options: 'i' } },
+      { 'emisor.rfc': termUpper },
+      { 'receptor.rfc': termUpper },
+    ];
   }
   if (source) {
     const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);

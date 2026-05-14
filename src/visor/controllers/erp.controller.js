@@ -12,7 +12,7 @@
 
 const { validationResult } = require('express-validator');
 const { resolverPeriodo }      = require('../services/periodoFiscal.service');
-const { fetchTodasLasFacturas } = require('../services/erp.service');
+const { fetchTodasLasFacturas, fetchEstadoCfdi } = require('../services/erp.service');
 const { transformarTolerante }  = require('../services/erp-transformer.service');
 const { upsertFromERP }         = require('../repositories/cfdi.repository');
 const { asyncHandler }          = require('../../shared/middleware/error-handler');
@@ -619,4 +619,29 @@ const enriquecerPagos = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { cargar, previsualizar, enriquecerPagos };
+/**
+ * GET /api/erp/estado-cfdi/:cfdiId
+ * Consulta el Estatus actual de un CFDI directamente en el ERP y actualiza MongoDB si cambió.
+ */
+const estadoCfdi = asyncHandler(async (req, res) => {
+  const cfdi = await CFDI.findById(req.params.cfdiId, 'uuid fecha erpStatus source').lean();
+  if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado' });
+  if (cfdi.source !== 'ERP') return res.status(400).json({ error: 'Solo aplica a CFDIs de origen ERP' });
+  if (!cfdi.fecha) return res.status(400).json({ error: 'El CFDI no tiene fecha registrada' });
+
+  const { erpStatus, encontrado } = await fetchEstadoCfdi(cfdi.uuid, cfdi.fecha);
+
+  if (!encontrado) {
+    return res.json({ encontrado: false, uuid: cfdi.uuid, erpStatusActual: cfdi.erpStatus, mensaje: 'UUID no encontrado en el ERP para la fecha del CFDI' });
+  }
+
+  const actualizado = erpStatus !== cfdi.erpStatus;
+  if (actualizado) {
+    await CFDI.updateMany({ uuid: cfdi.uuid, source: 'ERP' }, { $set: { erpStatus } });
+    logger.info(`[ERPController] estadoCfdi: UUID ${cfdi.uuid} erpStatus ${cfdi.erpStatus} → ${erpStatus}`);
+  }
+
+  res.json({ encontrado: true, uuid: cfdi.uuid, erpStatus, erpStatusAnterior: cfdi.erpStatus, actualizado });
+});
+
+module.exports = { cargar, previsualizar, enriquecerPagos, estadoCfdi };

@@ -2,9 +2,11 @@ const { validationResult } = require('express-validator');
 const Comparison = require('../models/Comparison');
 const ComparisonSession = require('../models/ComparisonSession');
 const CFDI = require('../models/CFDI');
+const Discrepancy = require('../models/Discrepancy');
 const { batchCompareCFDIs, formatSessionName } = require('../services/comparisonEngine');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { paginate, skip } = require('../utils/pagination');
+const { clearDashboardCache } = require('./report.controller');
 
 /**
  * GET /api/comparisons/ejercicios/resumen
@@ -16,11 +18,13 @@ const ejerciciosResumen = asyncHandler(async (req, res) => {
       $group: {
         _id: { ejercicio: '$ejercicio', periodo: '$periodo' },
         total:            { $sum: 1 },
-        match:            { $sum: { $cond: [{ $eq: ['$status', 'match'] },       1, 0] } },
-        discrepancy:      { $sum: { $cond: [{ $eq: ['$status', 'discrepancy'] }, 1, 0] } },
-        not_in_sat:       { $sum: { $cond: [{ $eq: ['$status', 'not_in_sat'] },  1, 0] } },
-        cancelled:        { $sum: { $cond: [{ $eq: ['$status', 'cancelled'] },   1, 0] } },
-        error:            { $sum: { $cond: [{ $eq: ['$status', 'error'] },       1, 0] } },
+        match:            { $sum: { $cond: [{ $eq: ['$status', 'match'] },              1, 0] } },
+        discrepancy:      { $sum: { $cond: [{ $eq: ['$status', 'discrepancy'] },        1, 0] } },
+        not_in_sat:       { $sum: { $cond: [{ $eq: ['$status', 'not_in_sat'] },         1, 0] } },
+        not_in_erp:       { $sum: { $cond: [{ $eq: ['$status', 'not_in_erp'] },         1, 0] } },
+        warning:          { $sum: { $cond: [{ $eq: ['$status', 'warning'] },            1, 0] } },
+        cancelled:        { $sum: { $cond: [{ $eq: ['$status', 'cancelled'] },          1, 0] } },
+        error:            { $sum: { $cond: [{ $eq: ['$status', 'error'] },              1, 0] } },
         totalDifferences: { $sum: '$totalDifferences' },
       },
     },
@@ -30,6 +34,7 @@ const ejerciciosResumen = asyncHandler(async (req, res) => {
         _id: 0,
         ejercicio: '$_id.ejercicio', periodo: '$_id.periodo',
         total: 1, match: 1, discrepancy: 1, not_in_sat: 1,
+        not_in_erp: 1, warning: 1,
         cancelled: 1, error: 1, totalDifferences: 1,
       },
     },
@@ -40,7 +45,8 @@ const ejerciciosResumen = asyncHandler(async (req, res) => {
     if (!map[r.ejercicio]) {
       map[r.ejercicio] = {
         ejercicio: r.ejercicio, total: 0, match: 0, discrepancy: 0,
-        not_in_sat: 0, cancelled: 0, error: 0, totalDifferences: 0, periodos: [],
+        not_in_sat: 0, not_in_erp: 0, warning: 0,
+        cancelled: 0, error: 0, totalDifferences: 0, periodos: [],
       };
     }
     const ej = map[r.ejercicio];
@@ -48,6 +54,8 @@ const ejerciciosResumen = asyncHandler(async (req, res) => {
     ej.match           += r.match;
     ej.discrepancy     += r.discrepancy;
     ej.not_in_sat      += r.not_in_sat;
+    ej.not_in_erp      += r.not_in_erp;
+    ej.warning         += r.warning;
     ej.cancelled       += r.cancelled;
     ej.error           += r.error;
     ej.totalDifferences += r.totalDifferences;
@@ -263,6 +271,7 @@ const batch = asyncHandler(async (req, res) => {
   });
 
   batchCompareCFDIs(ids, { concurrency, triggeredBy: req.user._id, sessionId: session._id, satOnlyIds })
+    .then(() => { clearDashboardCache(); })
     .catch(err => {
       ComparisonSession.findByIdAndUpdate(session._id, { status: 'failed', completedAt: new Date() }).exec();
       console.error('Error en batch:', err);
@@ -290,7 +299,73 @@ const resolve = asyncHandler(async (req, res) => {
   res.json(comparison);
 });
 
+/**
+ * POST /api/comparisons/conciliar-not-in-erp
+ * Concilia manualmente un CFDI que está en SAT pero no en ERP.
+ * Registra la causa seleccionada, notas opcionales y el usuario que concilió.
+ */
+const conciliarNotInErp = asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { cfdiId, causa, notas } = req.body;
+
+  const cfdi = await CFDI.findById(cfdiId, 'uuid lastComparisonStatus source').lean();
+  if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado' });
+  if (cfdi.source !== 'SAT' && cfdi.source !== 'MANUAL')
+    return res.status(400).json({ error: 'Solo aplica a CFDIs de origen SAT/MANUAL' });
+  if (cfdi.lastComparisonStatus !== 'not_in_erp')
+    return res.status(400).json({ error: 'El CFDI no tiene estatus not_in_erp' });
+
+  const ahora        = new Date();
+  const usuarioId    = req.user._id;
+  const usuarioNombre = req.user.nombre || req.user.email || req.user._id;
+
+  // Marcar la comparación como resuelta con la causa
+  const comparison = await Comparison.findOneAndUpdate(
+    { uuid: cfdi.uuid, status: 'not_in_erp' },
+    {
+      $set: {
+        resolved:           true,
+        resolvedAt:         ahora,
+        resolvedBy:         usuarioNombre,
+        resolutionNotes:    notas || null,
+        conciliacionCausa:  causa,
+      },
+    },
+    { new: true, sort: { comparedAt: -1 } },
+  );
+
+  // Actualizar el CFDI para que salga del conteo de not_in_erp en el dashboard
+  await CFDI.findByIdAndUpdate(cfdiId, {
+    $set: {
+      lastComparisonStatus: 'conciliado',
+      lastComparisonAt:     ahora,
+      conciliadoPor:        usuarioNombre,
+      conciliadoEn:         ahora,
+      conciliacionCausa:    causa,
+      conciliacionNotas:    notas || null,
+    },
+  });
+
+  // Resolver la discrepancia MISSING_IN_ERP abierta para este UUID
+  await Discrepancy.updateMany(
+    { uuid: cfdi.uuid, type: 'MISSING_IN_ERP', status: 'open' },
+    {
+      $set: {
+        status:          'resolved',
+        resolvedAt:      ahora,
+        resolvedBy:      usuarioNombre,
+        resolutionType:  causa,
+        notes:           notas || null,
+      },
+    },
+  );
+
+  res.json({ success: true, uuid: cfdi.uuid, comparison });
+});
+
 module.exports = {
   ejerciciosResumen, periodos, list, stats,
-  listSessions, getSession, getById, batch, resolve,
+  listSessions, getSession, getById, batch, resolve, conciliarNotInErp,
 };

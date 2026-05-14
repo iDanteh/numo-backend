@@ -40,6 +40,47 @@ const BANK_PREFIX = {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// BBVA exporta ciertos movimientos SPEI con el primer token tras '/' siendo una
+// palabra clave de trazabilidad (BNET, REFBNTC) en lugar de un número real.
+// Estos valores NO son números de autorización bancaria válidos y usarlos en
+// dedup generaría falsos positivos entre movimientos distintos del mismo banco.
+const BBVA_PSEUDO_AUTH_RE = /^(BNET|REFBNTC)$/i;
+
+function isBBVAPseudoAuth(banco, auth) {
+  return banco === 'BBVA' && !!auth && BBVA_PSEUDO_AUTH_RE.test(auth.trim());
+}
+
+// Compara dos números de autorización ignorando ceros iniciales en los numéricos
+// y usando coincidencia exacta para los alfanuméricos.
+// Evita el bug de parseInt("ALPHA", 10) === NaN donde NaN !== NaN es siempre true,
+// lo que haría que auth alfanuméricos nunca matchearan en Capa 2.
+function authMatch(a, b) {
+  if (!a || !b) return false;
+  const aIsNum = /^\d+$/.test(a);
+  const bIsNum = /^\d+$/.test(b);
+  if (aIsNum && bIsNum) return parseInt(a, 10) === parseInt(b, 10);
+  return a === b; // alfanumérico: comparar como string (ya normalizados por normalizeAuthNum)
+}
+
+// Construye el objeto $set de enriquecimiento para un soft-dup:
+// solo propaga campos que el existente (cand) no tiene y el entrante (inc) sí.
+// No sobreescribe valores ya presentes — evita regresiones accidentales.
+function buildSoftEnrich(inc, cand) {
+  const enrich = {};
+  const existingAuthIsPseudo = isBBVAPseudoAuth(cand.banco, cand.numeroAutorizacion);
+  if (
+    inc.numeroAutorizacion &&
+    !isBBVAPseudoAuth(inc.banco, inc.numeroAutorizacion) &&
+    (!cand.numeroAutorizacion || existingAuthIsPseudo)
+  ) {
+    enrich.numeroAutorizacion = inc.numeroAutorizacion;
+  }
+  if (inc.referenciaNumerica && !cand.referenciaNumerica) {
+    enrich.referenciaNumerica = inc.referenciaNumerica;
+  }
+  return Object.keys(enrich).length > 0 ? enrich : null;
+}
+
 function generarFolio(seq) {
   const longitudBase = 6;
   const longitudSeq = seq.toString().length;
@@ -240,27 +281,17 @@ async function listMovements(filters) {
       { referenciaNumerica: re }, { folio: re }, { uuidXML: re },
     ];
 
-    // Búsqueda por monto
+    // Búsqueda por monto — tolerancia basada en los decimales ingresados:
+    // sin decimales → rango de 1 peso completo; 1 decimal → ±0.05; 2 decimales → ±0.005
     const cleanNum = search.replace(/[$,\s]/g, '');
     const num = parseFloat(cleanNum);
     if (!isNaN(num) && num > 0) {
-      orClauses.push({ deposito: { $gte: num - 0.005, $lte: num + 0.005 } });
-      orClauses.push({ retiro:   { $gte: num - 0.005, $lte: num + 0.005 } });
-    }
-
-    // Búsqueda por fecha
-    const dmyMatch = search.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
-    const ymdMatch = search.match(/^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$/);
-    let searchDate = null;
-    if (dmyMatch) {
-      searchDate = new Date(parseInt(dmyMatch[3]), parseInt(dmyMatch[2]) - 1, parseInt(dmyMatch[1]));
-    } else if (ymdMatch) {
-      searchDate = new Date(parseInt(ymdMatch[1]), parseInt(ymdMatch[2]) - 1, parseInt(ymdMatch[3]));
-    }
-    if (searchDate && !isNaN(searchDate.getTime())) {
-      const nextDay = new Date(searchDate);
-      nextDay.setDate(nextDay.getDate() + 1);
-      orClauses.push({ fecha: { $gte: searchDate, $lt: nextDay } });
+      const decimalPlaces = (cleanNum.split('.')[1] || '').length;
+      const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
+      const lo = decimalPlaces === 0 ? num : num - tolerance;
+      const hi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
+      orClauses.push({ deposito: { $gte: lo, $lt: hi } });
+      orClauses.push({ retiro:   { $gte: lo, $lt: hi } });
     }
 
     filter.$or = orClauses;
@@ -394,15 +425,49 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   const hashes = movements.map(m => m.hash);
   const existentes = await BankMovement.find(
     { hash: { $in: hashes } },
-    'hash',
+    '_id hash banco numeroAutorizacion referenciaNumerica',
   ).lean();
-  const hashesExistentes = new Set(existentes.map(e => e.hash));
+
+  const hashesExistentes = new Set();
+  // enrichmentUpdates: movimientos ya en DB que se pueden enriquecer con datos
+  // que trae el reimport (ej. numeroAutorizacion que antes era null).
+  // Se aplican después de la inserción de nuevos, con $set selectivo.
+  const enrichmentUpdates = []; // [{ _id, $set: {...} }]
+
+  const incomingByHash = new Map(movements.map(m => [m.hash, m]));
+  for (const ex of existentes) {
+    hashesExistentes.add(ex.hash);
+    const inc = incomingByHash.get(ex.hash);
+    if (!inc) continue;
+
+    const enrich = {};
+    // Enriquecer numeroAutorizacion si el existente no la tiene (o tiene pseudo-auth)
+    // y el reimport trae un valor real (no pseudo-auth BBVA).
+    const existingAuthIsPseudo = isBBVAPseudoAuth(ex.banco, ex.numeroAutorizacion);
+    if (
+      inc.numeroAutorizacion &&
+      !isBBVAPseudoAuth(inc.banco, inc.numeroAutorizacion) &&
+      (!ex.numeroAutorizacion || existingAuthIsPseudo)
+    ) {
+      enrich.numeroAutorizacion = inc.numeroAutorizacion;
+    }
+    if (inc.referenciaNumerica && !ex.referenciaNumerica) {
+      enrich.referenciaNumerica = inc.referenciaNumerica;
+    }
+    if (Object.keys(enrich).length > 0) {
+      enrichmentUpdates.push({ _id: ex._id, $set: enrich });
+    }
+  }
 
   // ── 1b. Deduplicar por numeroAutorizacion (todos los bancos) ─────────────
   // Si un movimiento con el mismo número de autorización ya existe en el mismo
   // banco, se considera duplicado aunque el hash difiera (ej. fecha cambiada).
-  // Aplica a Banamex (sub-fila "No. de Autorización"), BBVA (token tras '/'),
+  // Aplica a Banamex (sub-fila "No. de Autorización"), BBVA (token numérico tras '/'),
   // Santander (col 8) y Azteca (col 7).
+  //
+  // BBVA excepción: si numeroAutorizacion es un pseudo-valor (BNET, REFBNTC),
+  // se excluye de esta capa — no es un identificador estable y generaría falsos
+  // positivos entre movimientos distintos con el mismo token.
   //
   // Manejo de ceros iniciales: Banamex puede exportar "199480" (fin de semana)
   // y "00199480" (estado del martes) para el mismo movimiento. Se normalizan
@@ -410,7 +475,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   // normalizar. La query incluye variantes con padding de ceros y la
   // comparación final es numérica (parseInt) + coincidencia de importe.
   const fechaUpdates = [];   // { _id, fecha }
-  const authMovs = movements.filter(m => m.numeroAutorizacion);
+  const authMovs = movements.filter(
+    m => m.numeroAutorizacion && !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion),
+  );
 
   if (authMovs.length > 0) {
     // Para auth numbers puramente numéricos usar regex ^0*{n}$ que detecta
@@ -427,16 +494,15 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
 
     const existByAuth = await BankMovement.find(
       { banco: { $in: bancosAuth }, $or: authConditions },
-      '_id banco numeroAutorizacion fecha deposito retiro',
+      '_id banco numeroAutorizacion referenciaNumerica fecha deposito retiro',
     ).lean();
 
     for (const existing of existByAuth) {
-      const existingAuthInt = parseInt(existing.numeroAutorizacion, 10);
-      // Comparar numéricamente para ignorar diferencias de ceros iniciales.
-      // Verificar además que el importe coincida como salvaguarda extra.
+      // authMatch compara numérico (entero, ignora ceros iniciales) o alfanumérico
+      // (string exacto). parseInt fallback generaba NaN !== NaN → match imposible.
       const incoming = authMovs.find((m) => {
         if (m.banco !== existing.banco) return false;
-        if (parseInt(m.numeroAutorizacion, 10) !== existingAuthInt) return false;
+        if (!authMatch(m.numeroAutorizacion, existing.numeroAutorizacion)) return false;
         const montoOk =
           (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
           (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
@@ -448,6 +514,10 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       const incomingFecha = new Date(incoming.fecha).getTime();
       if (existingFecha !== incomingFecha) {
         fechaUpdates.push({ _id: existing._id, fecha: incoming.fecha });
+      }
+      // Enriquecer referenciaNumerica si el reimport la trae y el existente no la tiene
+      if (incoming.referenciaNumerica && !existing.referenciaNumerica) {
+        enrichmentUpdates.push({ _id: existing._id, $set: { referenciaNumerica: incoming.referenciaNumerica } });
       }
       // Marcar como ya existente para que no se re-inserte
       hashesExistentes.add(incoming.hash);
@@ -473,21 +543,29 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
 
     const existByRef = await BankMovement.find(
       { banco: { $in: bancosRef }, $or: refConditions },
-      '_id banco referenciaNumerica deposito retiro',
+      '_id banco referenciaNumerica numeroAutorizacion deposito retiro',
     ).lean();
 
     for (const existing of existByRef) {
       if (!existing.referenciaNumerica) continue;
-      const existingRefInt = parseInt(existing.referenciaNumerica, 10);
       const incoming = refNumMovs.find((m) => {
         if (m.banco !== existing.banco) return false;
-        if (parseInt(m.referenciaNumerica, 10) !== existingRefInt) return false;
+        if (!authMatch(m.referenciaNumerica, existing.referenciaNumerica)) return false;
         const montoOk =
           (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
           (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
         return montoOk;
       });
       if (!incoming) continue;
+      // Enriquecer numeroAutorizacion si el reimport la trae y el existente no la tiene
+      const existingAuthIsPseudo = isBBVAPseudoAuth(existing.banco, existing.numeroAutorizacion);
+      if (
+        incoming.numeroAutorizacion &&
+        !isBBVAPseudoAuth(incoming.banco, incoming.numeroAutorizacion) &&
+        (!existing.numeroAutorizacion || existingAuthIsPseudo)
+      ) {
+        enrichmentUpdates.push({ _id: existing._id, $set: { numeroAutorizacion: incoming.numeroAutorizacion } });
+      }
       hashesExistentes.add(incoming.hash);
     }
   }
@@ -519,7 +597,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       }));
       const dbCands = await BankMovement.find(
         { $or: orConds },
-        'banco fecha deposito retiro saldo concepto',
+        '_id banco fecha deposito retiro saldo concepto numeroAutorizacion referenciaNumerica',
       ).lean();
 
       // Group DB candidates by banco+fecha key
@@ -555,6 +633,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
             if (bnetInc && bnetCnd && bnetInc === bnetCnd) {
               hashesExistentes.add(m.hash);
               softDuplicados++;
+              // Enriquecer si el reimport trae datos que el existente no tiene
+              const enrichBnet = buildSoftEnrich(m, cand);
+              if (enrichBnet) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnet });
               break;
             }
             // Si ninguno tiene número BNET, seguir con el check de saldo+concepto.
@@ -576,6 +657,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
           if (minL >= 20 && cA.substring(0, minL) === cB.substring(0, minL)) {
             hashesExistentes.add(m.hash);
             softDuplicados++;
+            // Enriquecer si el reimport trae datos que el existente no tiene
+            const enrichSoft = buildSoftEnrich(m, cand);
+            if (enrichSoft) enrichmentUpdates.push({ _id: cand._id, $set: enrichSoft });
             break;
           }
         }
@@ -639,6 +723,41 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     await BankMovement.bulkWrite(fechaOps, { ordered: false });
   }
 
+  // ── 3c. Enriquecer movimientos existentes con datos del reimport ──────────
+  // Aplica $set selectivo (solo campos que el existente no tenía) sobre los
+  // movimientos detectados como duplicados pero que ahora traen información
+  // adicional: principalmente numeroAutorizacion y referenciaNumerica.
+  // La salvaguarda de no-sobreescritura está en buildSoftEnrich / Capa 1:
+  // solo se enriquece si el campo destino está vacío o era un pseudo-valor.
+  let enriquecidos = 0;
+  if (enrichmentUpdates.length > 0) {
+    // Consolidar por _id: un mismo documento puede haber sido detectado en varias
+    // capas (ej. Capa 1 por hash y Capa 2 por auth) generando entradas redundantes.
+    // Fusionar los $set evita operaciones duplicadas y mantiene el conteo preciso.
+    const enrichById = new Map();
+    for (const { _id, $set } of enrichmentUpdates) {
+      const key = String(_id);
+      if (!enrichById.has(key)) {
+        enrichById.set(key, { _id, $set: { ...$set } });
+      } else {
+        Object.assign(enrichById.get(key).$set, $set);
+      }
+    }
+    const enrichOps = [...enrichById.values()].map(({ _id, $set }) => ({
+      updateOne: { filter: { _id }, update: { $set } },
+    }));
+    try {
+      const result = await BankMovement.bulkWrite(enrichOps, { ordered: false });
+      enriquecidos = result.modifiedCount;
+    } catch (err) {
+      if (err.result) {
+        enriquecidos = err.result.nModified ?? 0;
+      } else {
+        throw err;
+      }
+    }
+  }
+
     // ── 4. Aplicar reglas a los movimientos recién insertados ─────────────────
     let categorizados  = 0;
     let sinReglasAviso = false;
@@ -690,9 +809,10 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   }
 
     return {
-      message:      `${insertados} movimientos importados, ${duplicados} ya existían`,
+      message:      `${insertados} movimientos importados, ${duplicados} ya existían, ${enriquecidos} enriquecidos`,
       importados:   insertados,
       duplicados,
+      enriquecidos,
       softDuplicados,
       categorizados,
       sinReglas:    sinReglasAviso,
@@ -1130,24 +1250,17 @@ async function exportMovements(filters) {
       { concepto: re }, { numeroAutorizacion: re },
       { referenciaNumerica: re }, { folio: re }, { uuidXML: re },
     ];
+    // Búsqueda por monto — tolerancia basada en los decimales ingresados:
+    // sin decimales → rango de 1 peso completo; 1 decimal → ±0.05; 2 decimales → ±0.005
     const cleanNum = search.replace(/[$,\s]/g, '');
     const num = parseFloat(cleanNum);
     if (!isNaN(num) && num > 0) {
-      orClauses.push({ deposito: { $gte: num - 0.005, $lte: num + 0.005 } });
-      orClauses.push({ retiro:   { $gte: num - 0.005, $lte: num + 0.005 } });
-    }
-    const dmyMatch = search.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})$/);
-    const ymdMatch = search.match(/^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})$/);
-    let searchDate = null;
-    if (dmyMatch) {
-      searchDate = new Date(parseInt(dmyMatch[3]), parseInt(dmyMatch[2]) - 1, parseInt(dmyMatch[1]));
-    } else if (ymdMatch) {
-      searchDate = new Date(parseInt(ymdMatch[1]), parseInt(ymdMatch[2]) - 1, parseInt(ymdMatch[3]));
-    }
-    if (searchDate && !isNaN(searchDate.getTime())) {
-      const nextDay = new Date(searchDate);
-      nextDay.setDate(nextDay.getDate() + 1);
-      orClauses.push({ fecha: { $gte: searchDate, $lt: nextDay } });
+      const decimalPlaces = (cleanNum.split('.')[1] || '').length;
+      const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
+      const lo = decimalPlaces === 0 ? num : num - tolerance;
+      const hi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
+      orClauses.push({ deposito: { $gte: lo, $lt: hi } });
+      orClauses.push({ retiro:   { $gte: lo, $lt: hi } });
     }
     filter.$or = orClauses;
   }

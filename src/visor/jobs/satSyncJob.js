@@ -1261,6 +1261,105 @@ const jobComparacionAuto = async () => {
 };
 
 /**
+ * Job horario: re-consulta el estado SAT de CFDIs que en el ERP aparecen como
+ * "Cancelacion Pendiente", "Cancelado" o "Deshabilitado" pero cuyo satStatus
+ * sigue siendo "Vigente".
+ *
+ * Escenario típico: el cliente cancela la factura en el ERP pero el SAT aún
+ * no ha procesado la solicitud (o el campo satStatus nunca se actualizó).
+ * Este job garantiza que el satStatus refleje la realidad del SAT.
+ */
+const ejecutarVerificacionEstadosCriticos = async () => {
+  logger.info('[VerifCriticos] Iniciando verificación horaria de estados críticos...');
+
+  const cfdis = await CFDI.find(
+    {
+      source:    'ERP',
+      isActive:  true,
+      erpStatus: { $in: ['Cancelacion Pendiente', 'Cancelado', 'Deshabilitado'] },
+      satStatus: 'Vigente',
+    },
+    '_id uuid emisor receptor total version sello timbreFiscalDigital tipoDeComprobante erpStatus',
+  ).lean();
+
+  if (cfdis.length === 0) {
+    logger.info('[VerifCriticos] Sin CFDIs con estado crítico pendiente de verificar.');
+    return;
+  }
+
+  logger.info(`[VerifCriticos] ${cfdis.length} CFDI(s) a verificar contra SAT.`);
+
+  let actualizados = 0, sinCambio = 0, omitidos = 0, errores = 0;
+
+  for (const cfdi of cfdis) {
+    // RFCs con & no son consultables vía SOAP (el servicio no decodifica %26)
+    const rfcConAmpersand = (cfdi.emisor?.rfc || '').includes('&') || (cfdi.receptor?.rfc || '').includes('&');
+    if (rfcConAmpersand) {
+      omitidos++;
+      continue;
+    }
+
+    if (!cfdi.emisor?.rfc || !cfdi.receptor?.rfc) {
+      logger.warn(`[VerifCriticos] CFDI ${cfdi.uuid} sin emisor/receptor — omitido`);
+      omitidos++;
+      continue;
+    }
+
+    try {
+      const sello  = cfdi.timbreFiscalDigital?.selloCFD || cfdi.sello || '';
+      const result = await verifyCFDIWithSAT(
+        cfdi.uuid,
+        cfdi.emisor.rfc,
+        cfdi.receptor.rfc,
+        cfdi.total,
+        sello,
+        cfdi.version || '4.0',
+        cfdi.tipoDeComprobante,
+      );
+
+      const nuevoEstado = result.state; // 'Vigente' | 'Cancelado' | 'No Encontrado' | ...
+
+      if (nuevoEstado !== 'Vigente') {
+        // El SAT ya no lo reporta como Vigente — actualizar ambos documentos (ERP y SAT)
+        await CFDI.updateMany(
+          { uuid: cfdi.uuid },
+          { $set: { satStatus: nuevoEstado, satLastCheck: new Date() } },
+        );
+        logger.info(
+          `[VerifCriticos] ${cfdi.uuid} (ERP: ${cfdi.erpStatus}) → SAT: ${nuevoEstado} ` +
+          `(antes: Vigente) — actualizado`,
+        );
+        actualizados++;
+      } else {
+        // El SAT sigue reportando Vigente; solo actualizar la fecha de chequeo
+        await CFDI.updateMany(
+          { uuid: cfdi.uuid },
+          { $set: { satLastCheck: new Date() } },
+        );
+        sinCambio++;
+      }
+
+      await new Promise(r => setTimeout(r, 500)); // respetar rate del SAT
+    } catch (err) {
+      errores++;
+      logger.error(`[VerifCriticos] Error verificando ${cfdi.uuid}: ${err.message}`);
+    }
+  }
+
+  logger.info(
+    `[VerifCriticos] Completado — actualizados: ${actualizados}, sin cambio: ${sinCambio}, ` +
+    `omitidos: ${omitidos}, errores: ${errores}`,
+  );
+};
+
+// Job horario fijo — no configurable por el usuario (se programa independientemente
+// de reprogramarJobs para que no sea destruido al cambiar los horarios nocturnos).
+cron.schedule('0 * * * *', async () => {
+  try { await ejecutarVerificacionEstadosCriticos(); }
+  catch (err) { logger.error(`[VerifCriticos] Error fatal: ${err.message}`); }
+}, { timezone: 'America/Mexico_City' });
+
+/**
  * (Re)programa los cuatro jobs con los horarios indicados.
  * Llamado al arrancar la app y cuando el usuario cambia el horario via API.
  */
@@ -1307,4 +1406,4 @@ const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVeri
   }
 })();
 
-module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, procesarDescarga, reprogramarJobs };
+module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs };

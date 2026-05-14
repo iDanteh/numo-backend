@@ -68,10 +68,12 @@ const discrepancySchema = new mongoose.Schema({
   // Gestión
   assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   resolvedAt: { type: Date },
-  resolvedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  resolvedBy: { type: String },   // Auth0 sub del usuario que resolvió
   resolutionType: {
     type: String,
-    enum: ['corrected', 'accepted', 'erp_error', 'sat_error', 'false_positive'],
+    enum: ['corrected', 'accepted', 'erp_error', 'sat_error', 'false_positive',
+           'proveedor_sin_registro', 'cancelada_antes_de_registro', 'periodo_anterior',
+           'factura_global_sat', 'error_descarga_sat', 'tercero_sin_impacto', 'otra'],
   },
   notes: [{ type: String }],
 

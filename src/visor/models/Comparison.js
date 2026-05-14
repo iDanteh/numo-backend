@@ -64,6 +64,20 @@ const comparisonSchema = new mongoose.Schema({
   resolvedBy: { type: String },    // Auth0 sub del usuario que resolvió
   resolutionNotes: { type: String },
 
+  // Conciliación manual de "no en ERP" — registra la causa seleccionada por el usuario
+  conciliacionCausa: {
+    type: String,
+    enum: [
+      'proveedor_sin_registro',       // Factura de proveedor registrada fuera del ERP
+      'cancelada_antes_de_registro',  // Cancelada antes de registrarse en ERP
+      'periodo_anterior',             // Factura de período anterior no migrada
+      'factura_global_sat',           // Factura global / ticket de caja del SAT
+      'error_descarga_sat',           // Error en descarga SAT (duplicado o registro incorrecto)
+      'tercero_sin_impacto',          // Factura de tercero sin impacto contable en ERP
+      'otra',                         // Otra razón
+    ],
+  },
+
   // Ejercicio fiscal y periodo derivados de la fecha del CFDI ERP
   ejercicio:          { type: Number, index: true },              // año  (ej. 2024)
   periodo:            { type: Number, min: 1, max: 12, index: true }, // mes 1-12
@@ -85,5 +99,7 @@ const comparisonSchema = new mongoose.Schema({
 comparisonSchema.index({ status: 1, comparedAt: -1 });
 comparisonSchema.index({ resolved: 1, status: 1 });
 comparisonSchema.index({ ejercicio: 1, periodo: 1, status: 1 });
+// Cubre el pipeline de discrepanciasCriticas: sort por comparedAt + group por uuid
+comparisonSchema.index({ uuid: 1, comparedAt: -1 });
 
 module.exports = mongoose.model('Comparison', comparisonSchema);

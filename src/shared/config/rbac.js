@@ -31,6 +31,11 @@ const PERMISSIONS = Object.freeze({
   ACCOUNT_PLAN_READ:   'account-plan:read',
   ACCOUNT_PLAN_WRITE:  'account-plan:write',
 
+  // Pólizas contables
+  POLIZAS_READ:        'polizas:read',
+  POLIZAS_WRITE:       'polizas:write',
+  POLIZAS_ADMIN:       'polizas:admin',
+
   // Solicitudes de cobranza
   COLLECTIONS_READ:    'collections:read',
   COLLECTIONS_WRITE:   'collections:write',
@@ -74,6 +79,8 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_RULES,
       PERMISSIONS.ACCOUNT_PLAN_READ,
       PERMISSIONS.ACCOUNT_PLAN_WRITE,
+      PERMISSIONS.POLIZAS_READ,
+      PERMISSIONS.POLIZAS_WRITE,
       PERMISSIONS.COLLECTIONS_READ,
       PERMISSIONS.COLLECTIONS_WRITE,
       PERMISSIONS.ERP_MANAGE,

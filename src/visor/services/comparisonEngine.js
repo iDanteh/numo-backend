@@ -299,14 +299,12 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
     });
   }
 
-  // Eliminar discrepancias abiertas previas del mismo UUID para evitar duplicados entre sesiones
-  await Discrepancy.deleteMany({
-    uuid: erpCfdi.uuid,
-    status: { $nin: ['resolved', 'ignored', 'accepted'] },
-  });
-
+  // Crear nuevas discrepancias ANTES de borrar las anteriores para cerrar la ventana
+  // de inconsistencia: si el proceso muere entre ambas operaciones quedan duplicados
+  // temporales (inofensivos) en lugar de cero discrepancias (falso estado limpio).
+  let newDiscrepancyIds = [];
   if (differences.length > 0) {
-    await Promise.all(differences.map(diff => {
+    const newDocs = await Promise.all(differences.map(diff => {
       const type = diff.type || mapDiffToType(diff.field);
       const erpVal = String(diff.erpValue ?? '');
       const satVal = String(diff.satValue ?? '');
@@ -338,7 +336,16 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
         }),
       });
     }));
+    newDiscrepancyIds = newDocs.map(d => d._id);
   }
+
+  // Eliminar discrepancias abiertas previas DESPUÉS de insertar las nuevas.
+  // Excluir los recién creados para no auto-borrarse.
+  await Discrepancy.deleteMany({
+    uuid: erpCfdi.uuid,
+    status: { $nin: ['resolved', 'ignored', 'accepted'] },
+    ...(newDiscrepancyIds.length > 0 && { _id: { $nin: newDiscrepancyIds } }),
+  });
 
   return comp;
 };
@@ -451,13 +458,16 @@ const compareParties = (erp, sat) => {
   return diffs;
 };
 
-// Extrae YYYY-MM-DD usando hora local (evita desfase UTC en zonas horarias negativas)
+// Extrae YYYY-MM-DD en zona horaria de México (America/Mexico_City).
+// Usar hora local del servidor causaba desfase: facturas emitidas entre
+// las 18:00 y 23:59 CDMX aparecían con fecha del día siguiente en servidores UTC.
 const toLocalYMD = (d) => {
-  const dt = new Date(d);
-  const y  = dt.getFullYear();
-  const m  = String(dt.getMonth() + 1).padStart(2, '0');
-  const day = String(dt.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Mexico_City',
+    year:     'numeric',
+    month:    '2-digit',
+    day:      '2-digit',
+  }).format(new Date(d));  // en-CA produce YYYY-MM-DD directamente
 };
 
 const compareDates = (erp, sat) => {

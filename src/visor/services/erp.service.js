@@ -197,4 +197,49 @@ const fetchTodasLasFacturas = async ({ fechaInicio, fechaFin }) => {
   return todas;
 };
 
-module.exports = { fetchTodasLasFacturas };
+/**
+ * Consulta el estado actual (Estatus) de un CFDI específico en el ERP.
+ *
+ * Estrategia: el ERP solo expone búsqueda por rango de fechas, no por UUID.
+ * Se usa la fecha del CFDI para construir un rango del mismo día (hora CDMX)
+ * y se busca el UUID dentro de los resultados.
+ *
+ * @param {string} uuid       — UUID del CFDI a buscar
+ * @param {Date}   fecha      — Fecha del CFDI (para acotar el rango de búsqueda)
+ * @returns {Promise<{ erpStatus: string|null, encontrado: boolean }>}
+ */
+const fetchEstadoCfdi = async (uuid, fecha) => {
+  // Rango del día completo en hora CDMX (UTC-6/UTC-5 según DST)
+  // Se añade ±1 día de margen para absorber desfase de zona horaria
+  const d = new Date(fecha);
+  const inicio = new Date(d);
+  inicio.setUTCDate(inicio.getUTCDate() - 1);
+  inicio.setUTCHours(0, 0, 0, 0);
+  const fin = new Date(d);
+  fin.setUTCDate(fin.getUTCDate() + 1);
+  fin.setUTCHours(23, 59, 59, 999);
+
+  const fechaInicio = inicio.toISOString();
+  const fechaFin    = fin.toISOString();
+
+  logger.info(`[ERPService] Consultando estado de UUID ${uuid} | rango: ${fechaInicio} → ${fechaFin}`);
+
+  const facturas = await fetchTodasLasFacturas({ fechaInicio, fechaFin });
+
+  const uuidNorm = uuid.toUpperCase().trim();
+  const factura  = facturas.find(f => {
+    const u = (f?.UUID ?? f?.uuid ?? f?.TimbreFiscalDigital?.UUID ?? '').toString().trim().toUpperCase();
+    return u === uuidNorm;
+  });
+
+  if (!factura) {
+    logger.warn(`[ERPService] UUID ${uuid} no encontrado en el ERP para el rango ${fechaInicio} → ${fechaFin}`);
+    return { erpStatus: null, encontrado: false };
+  }
+
+  const erpStatus = factura.Estatus ?? null;
+  logger.info(`[ERPService] UUID ${uuid} encontrado en ERP — Estatus: ${erpStatus}`);
+  return { erpStatus, encontrado: true };
+};
+
+module.exports = { fetchTodasLasFacturas, fetchEstadoCfdi };

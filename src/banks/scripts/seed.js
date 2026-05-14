@@ -33,6 +33,8 @@ const PERM_META = {
   'banks:update':       { label: 'Editar movimientos',              module: 'Bancos' },
   'banks:config':       { label: 'Configurar bancos',               module: 'Bancos' },
   'banks:rules':        { label: 'Reglas de clasificación',         module: 'Bancos' },
+  'banks:ficha':        { label: 'Registrar/eliminar fichas',       module: 'Bancos' },
+  'banks:admin':        { label: 'Operaciones admin de bancos',     module: 'Bancos' },
   'account-plan:read':  { label: 'Ver catálogo contable',           module: 'Contabilidad' },
   'account-plan:write': { label: 'Editar catálogo contable',        module: 'Contabilidad' },
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },
@@ -54,25 +56,31 @@ const PERM_META = {
 
 async function seedRbac() {
   const { Role, Permission } = require('../../shared/models/postgres');
-  const [permCount, roleCount] = await Promise.all([Permission.count(), Role.count()]);
 
-  if (permCount === 0) {
-    const perms = Object.values(PERMISSIONS).map(key => ({
-      key,
-      label:  PERM_META[key]?.label  ?? key,
-      module: PERM_META[key]?.module ?? 'General',
-    }));
-    await Permission.bulkCreate(perms, { ignoreDuplicates: true });
-    console.log(`[seed] ${perms.length} permisos sembrados.`);
+  // ── Permisos: agregar los nuevos, los existentes no se modifican ──────────
+  // ignoreDuplicates usa ON CONFLICT DO NOTHING → idempotente en cada reinicio.
+  const perms = Object.values(PERMISSIONS).map(key => ({
+    key,
+    label:  PERM_META[key]?.label  ?? key,
+    module: PERM_META[key]?.module ?? 'General',
+  }));
+  const permsBefore = await Permission.count();
+  await Permission.bulkCreate(perms, { ignoreDuplicates: true });
+  const permsAfter = await Permission.count();
+  const nuevosPerms = permsAfter - permsBefore;
+  if (nuevosPerms > 0) {
+    console.log(`[seed] ${nuevosPerms} permiso(s) nuevo(s) registrado(s) (total: ${permsAfter}).`);
+  } else {
+    console.log(`[seed] Catálogo de permisos: ${permsAfter} permisos (sin cambios).`);
   }
 
-  if (roleCount === 0) {
-    const roles = Object.entries(ROLES).map(([value, { label, permissions }]) => ({
-      value, label, permissions, isSystem: true,
-    }));
-    await Role.bulkCreate(roles, { ignoreDuplicates: true });
-    console.log(`[seed] ${roles.length} roles sembrados.`);
+  // ── Roles del sistema: upsert desde rbac.js ───────────────────────────────
+  // Los roles del sistema siempre se sincronizan con el código fuente (rbac.js).
+  // Los roles personalizados creados por el admin en la UI no se tocan.
+  for (const [value, { label, permissions }] of Object.entries(ROLES)) {
+    await Role.upsert({ value, label, permissions, isSystem: true });
   }
+  console.log(`[seed] ${Object.keys(ROLES).length} rol(es) del sistema sincronizados.`);
 }
 
 async function seedUser({ email, nombre, role }) {

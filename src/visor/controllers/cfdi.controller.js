@@ -245,7 +245,7 @@ const list = asyncHandler(async (req, res) => {
  * GET /api/cfdis/:id
  */
 const getById = asyncHandler(async (req, res) => {
-  const cfdi = await CFDI.findById(req.params.id, { xmlContent: 0 });
+  const cfdi = await CFDI.findById(req.params.id, { xmlContent: 0 }).lean();
   if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado' });
   res.json(cfdi);
 });

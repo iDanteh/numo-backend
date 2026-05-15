@@ -55,7 +55,7 @@ router.post('/conciliar-not-in-erp',
       'proveedor_sin_registro', 'cancelada_antes_de_registro', 'periodo_anterior',
       'factura_global_sat', 'error_descarga_sat', 'tercero_sin_impacto', 'otra',
     ]).withMessage('causa inválida'),
-    body('notas').optional().isString().isLength({ max: 500 }),
+    body('notas').isString().trim().notEmpty().withMessage('notas requeridas').isLength({ max: 500 }),
   ],
   conciliarNotInErp,
 );

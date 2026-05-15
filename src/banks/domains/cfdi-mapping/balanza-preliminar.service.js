@@ -156,9 +156,10 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
     .sort((a, b) => a.codigo.localeCompare(b.codigo, undefined, { numeric: true }));
 
   const totales = {
-    debe:         Math.round(cuentas.reduce((s, c) => s + c.debe,          0) * 100) / 100,
-    haber:        Math.round(cuentas.reduce((s, c) => s + c.haber,         0) * 100) / 100,
-    saldoInicial: Math.round(cuentas.reduce((s, c) => s + c.saldoInicial,  0) * 100) / 100,
+    debe:         Math.round(cuentas.reduce((s, c) => s + c.debe,         0) * 100) / 100,
+    haber:        Math.round(cuentas.reduce((s, c) => s + c.haber,        0) * 100) / 100,
+    saldoInicial: Math.round(cuentas.reduce((s, c) => s + c.saldoInicial, 0) * 100) / 100,
+    saldoFinal:   Math.round(cuentas.reduce((s, c) => s + c.saldo,        0) * 100) / 100,
   };
 
   return {

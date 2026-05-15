@@ -29,12 +29,15 @@ async function findAll(filters = {}) {
   const limit = Math.min(100, Number(filters.limit) || 50);
   const offset = (page - 1) * limit;
 
-  const { count, rows } = await Poliza.findAndCountAll({
-    where,
-    order:  [['fecha', 'DESC'], ['tipo', 'ASC'], ['numero', 'DESC']],
-    limit,
-    offset,
-  });
+  const [count, rows] = await Promise.all([
+    Poliza.count({ where }),
+    Poliza.findAll({
+      where,
+      order:  [['fecha', 'DESC'], ['tipo', 'ASC'], ['numero', 'DESC']],
+      limit,
+      offset,
+    }),
+  ]);
 
   // ── Enriquecer con estado de CFDIs vinculados (cross PostgreSQL → MongoDB) ──
   if (rows.length > 0) {
@@ -58,9 +61,10 @@ async function findAll(filters = {}) {
 
       // Limitar $in a 400 UUIDs para no saturar MongoDB en cada carga de lista
       const MAX_CHECK = 400;
-      const allUuids  = [...new Set(movCfdis.map(m => m.cfdiUuid))];
+      const allUuids   = [...new Set(movCfdis.map(m => m.cfdiUuid))];
       const uuidsCheck = allUuids.length <= MAX_CHECK ? allUuids : allUuids.slice(0, MAX_CHECK);
 
+      // Lanzar la query de Mongo tan pronto como tenemos los UUIDs
       const cfdis = await CFDI.find(
         { uuid: { $in: uuidsCheck } },
         { uuid: 1, satStatus: 1, source: 1, _id: 0 },
@@ -96,6 +100,13 @@ async function findAll(filters = {}) {
   }
 
   return { total: count, page, limit, pages: Math.ceil(count / limit), polizas: rows };
+}
+
+/** Trae la póliza con movimientos sin la consulta cruzada a MongoDB.
+ *  Usar en operaciones de estado (contabilizar/cancelar/revertir) donde
+ *  el cfdiAlertMap no es necesario y la consulta Mongo sería muy costosa. */
+async function findByIdLight(id) {
+  return Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE] });
 }
 
 async function findById(id) {
@@ -212,7 +223,7 @@ async function setEstado(id, estado, auditFields = {}) {
     const poliza = await Poliza.findByPk(id, { transaction: t, lock: Transaction.LOCK.UPDATE });
     if (!poliza) return null;
     await poliza.update({ estado, ...auditFields }, { transaction: t });
-    return findById(id);
+    return findByIdLight(id);
   });
 }
 
@@ -234,4 +245,4 @@ async function findAllContabilizadas({ rfc, ejercicio, periodo }) {
   });
 }
 
-module.exports = { findAll, findById, create, update, cancel, setEstado, destroy, findAllContabilizadas };
+module.exports = { findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas };

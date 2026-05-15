@@ -90,7 +90,7 @@ async function update(id, data, user) {
 }
 
 async function cancel(id, user, motivo) {
-  const poliza = await repo.findById(id);
+  const poliza = await repo.findByIdLight(id);
   if (!poliza)                        throw new NotFoundError('Póliza');
   if (poliza.estado === 'cancelada')  throw new ValidationError('La póliza ya está cancelada');
   if (poliza.estado === 'contabilizada' && user?.role !== 'admin') {
@@ -107,7 +107,8 @@ async function cancel(id, user, motivo) {
 }
 
 async function contabilizar(id, user) {
-  const poliza = await repo.findById(id);
+  // findByIdLight: sólo PostgreSQL, sin consulta cruzada a MongoDB
+  const poliza = await repo.findByIdLight(id);
   if (!poliza)                      throw new NotFoundError('Póliza');
   if (poliza.estado !== 'borrador') throw new ValidationError('Solo se pueden contabilizar pólizas en borrador');
   if (!poliza.movimientos?.length)  throw new ValidationError('La póliza no tiene movimientos');
@@ -122,7 +123,7 @@ async function contabilizar(id, user) {
 }
 
 async function revertir(id, user, motivo) {
-  const poliza = await repo.findById(id);
+  const poliza = await repo.findByIdLight(id);
   if (!poliza)                           throw new NotFoundError('Póliza');
   if (poliza.estado !== 'contabilizada') throw new ValidationError('Solo se pueden revertir pólizas contabilizadas');
 

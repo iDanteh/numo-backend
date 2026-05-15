@@ -336,8 +336,8 @@ const conciliarNotInErp = asyncHandler(async (req, res) => {
     { new: true, sort: { comparedAt: -1 } },
   );
 
-  // Actualizar el CFDI para que salga del conteo de not_in_erp en el dashboard
-  await CFDI.findByIdAndUpdate(cfdiId, {
+  // Actualizar el CFDI y obtener el documento resultante
+  const cfdiActualizado = await CFDI.findByIdAndUpdate(cfdiId, {
     $set: {
       lastComparisonStatus: 'conciliado',
       lastComparisonAt:     ahora,
@@ -346,7 +346,7 @@ const conciliarNotInErp = asyncHandler(async (req, res) => {
       conciliacionCausa:    causa,
       conciliacionNotas:    notas || null,
     },
-  });
+  }, { new: true, projection: { xmlContent: 0 } }).lean();
 
   // Resolver la discrepancia MISSING_IN_ERP abierta para este UUID
   await Discrepancy.updateMany(
@@ -362,7 +362,7 @@ const conciliarNotInErp = asyncHandler(async (req, res) => {
     },
   );
 
-  res.json({ success: true, uuid: cfdi.uuid, comparison });
+  res.json({ success: true, uuid: cfdi.uuid, comparison, cfdi: cfdiActualizado });
 });
 
 module.exports = {

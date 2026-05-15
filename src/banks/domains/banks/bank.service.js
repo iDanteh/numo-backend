@@ -648,13 +648,22 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
           const saldoOk = m.saldo != null && cand.saldo != null && Math.abs(m.saldo - cand.saldo) < 0.01;
           if (!saldoOk) continue;
 
-          // 3. El concepto debe compartir un prefijo común de al menos 20 chars.
-          // Cubre el caso donde un import trae el número de autorización incrustado
-          // en el concepto y el otro no (ej. Banamex con/sin sub-filas).
+          // 3. El concepto debe compartir texto significativo (mín. 20 chars).
+          // Dos variantes cubiertas:
+          //   a) Prefijo común: un import trae el número de autorización incrustado
+          //      y el otro no (ej. Banamex con/sin sub-filas).
+          //   b) Sufijo común: BBVA exporta el mismo movimiento en formato largo
+          //      "DEPOSITO EFECTIVO PRACTIC / ******1014 …" y formato corto
+          //      "******1014 …". El corto es exactamente el sufijo del largo tras
+          //      el separador " / ", por lo que no comparten prefijo pero sí sufijo.
           const cA = (m.concepto   || '').replace(/\s+/g, ' ').trim().toLowerCase();
           const cB = (cand.concepto || '').replace(/\s+/g, ' ').trim().toLowerCase();
           const minL = Math.min(cA.length, cB.length);
-          if (minL >= 20 && cA.substring(0, minL) === cB.substring(0, minL)) {
+          const conceptMatch = minL >= 20 && (
+            cA.substring(0, minL) === cB.substring(0, minL) ||  // (a) prefijo
+            cA.endsWith(cB) || cB.endsWith(cA)                   // (b) sufijo
+          );
+          if (conceptMatch) {
             hashesExistentes.add(m.hash);
             softDuplicados++;
             // Enriquecer si el reimport trae datos que el existente no tiene

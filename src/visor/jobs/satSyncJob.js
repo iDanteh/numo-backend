@@ -11,7 +11,7 @@ const { compareCFDI } = require('../services/comparisonEngine');
 const { compararArrays } = require('../services/comparisonEngine');
 const { parseCFDI, normalizarCFDI } = require('../services/cfdiParser');
 const { solicitar, verificar, descargarPaquete, descargarPaqueteMetadata } = require('../sat/download');
-const { obtener, eliminar, tieneCredenciales } = require('../sat/credenciales');
+const { obtener, tieneCredenciales } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin } = require('../sat/rateLimiter');
 const { derivarPeriodoDesdeFecha, resolverPeriodo, resolverOCrearPeriodo } = require('../services/periodoFiscal.service');
 const { logger } = require('../../shared/utils/logger');
@@ -341,14 +341,8 @@ const ejecutarDescargaMasiva = async () => {
 
     } catch (err) {
       logger.error(`[SatSyncJob] Error procesando RFC ${rfc}: ${err.message}`);
-    } finally {
-      // ── 5. Eliminar credenciales siempre ──────────────────────────────
-      try {
-        await eliminar(rfc);
-      } catch (delErr) {
-        logger.error(`[SatSyncJob] Error eliminando credenciales de ${rfc}: ${delErr.message}`);
-      }
     }
+    // Las credenciales expiran automáticamente a las 8 horas via TTL de MongoDB.
   }
 
   logger.info('[SatSyncJob] Descarga masiva nocturna completada.');

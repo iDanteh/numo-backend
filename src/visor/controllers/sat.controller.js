@@ -443,12 +443,7 @@ const startDownload = asyncHandler(async (req, res) => {
       // Limpiar Buffers en memoria
       limpiarBuffers(creds);
 
-      // Eliminar credenciales de MongoDB siempre (éxito o fallo)
-      try {
-        await eliminar(rfcNorm);
-      } catch (delErr) {
-        logger.error(`[SAT] Error eliminando credenciales de ${rfcNorm}: ${delErr.message}`);
-      }
+      // Las credenciales expiran automáticamente a las 8 horas via TTL de MongoDB.
 
       // Limpiar entry del Map después de 30 min — el frontend tiene tiempo de leer
       // el estado final, pero el Map no crece indefinidamente

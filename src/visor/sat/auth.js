@@ -579,8 +579,65 @@ const parseKey = async (keyBuf, password) => {
 
     } else if (first.tag === 0x30) {
       // ── Caso C: PKCS#8 EncryptedPrivateKeyInfo estándar ───────────────────
-      const ai     = readBerChildren(first.value);
-      algOid       = forge.asn1.derToOid(ai[0].value.toString('binary'));
+      const ai = readBerChildren(first.value);
+      algOid   = forge.asn1.derToOid(ai[0].value.toString('binary'));
+
+      // ── PBES2 (PKCS#5 §6.2 / RFC 8018): PBKDF2 + AES-CBC ─────────────────
+      if (algOid === '1.2.840.113549.1.5.13') {
+        const secondNode = outerCh[1];
+        if (!secondNode) throw new Error('BER: falta OCTET STRING de datos cifrados (PBES2)');
+        const p2EncData = secondNode.value;
+
+        // PBES2-params: SEQUENCE { keyDerivationFunc, encryptionScheme }
+        const pbes2Ch   = readBerChildren(ai[1].value);
+        // keyDerivationFunc: SEQUENCE { OID-PBKDF2, PBKDF2-params }
+        const kdfCh     = readBerChildren(pbes2Ch[0].value);
+        const kdfParams = readBerChildren(kdfCh[1].value);
+        const p2Salt    = kdfParams[0].value;
+        let   p2Iters   = 0;
+        for (let i = 0; i < kdfParams[1].value.length; i++) p2Iters = (p2Iters << 8) | kdfParams[1].value[i];
+        let p2KeyLen = 0;
+        let p2Hash   = 'sha1';
+        let p2i = 2;
+        if (p2i < kdfParams.length && kdfParams[p2i].tag === 0x02) {
+          for (let i = 0; i < kdfParams[p2i].value.length; i++) p2KeyLen = (p2KeyLen << 8) | kdfParams[p2i].value[i];
+          p2i++;
+        }
+        if (p2i < kdfParams.length && kdfParams[p2i].tag === 0x30) {
+          const prfCh  = readBerChildren(kdfParams[p2i].value);
+          const prfOid = forge.asn1.derToOid(prfCh[0].value.toString('binary'));
+          const PRF_HASH = { '1.2.840.113549.2.7': 'sha1', '1.2.840.113549.2.9': 'sha256', '1.2.840.113549.2.11': 'sha384', '1.2.840.113549.2.12': 'sha512' };
+          p2Hash = PRF_HASH[prfOid] || 'sha1';
+        }
+        // encryptionScheme: SEQUENCE { OID-encAlg, IV }
+        const encCh  = readBerChildren(pbes2Ch[1].value);
+        const encOid = forge.asn1.derToOid(encCh[0].value.toString('binary'));
+        const PBES2_ENC = {
+          '2.16.840.1.101.3.4.1.2':  { cipher: 'aes-128-cbc', kLen: 16 },
+          '2.16.840.1.101.3.4.1.22': { cipher: 'aes-192-cbc', kLen: 24 },
+          '2.16.840.1.101.3.4.1.42': { cipher: 'aes-256-cbc', kLen: 32 },
+        };
+        const encSpec  = PBES2_ENC[encOid];
+        if (!encSpec) throw new Error(`PBES2: cifrado de encriptación no soportado: ${encOid}`);
+        const p2IV     = encCh[1].value;
+        const p2keyLen = p2KeyLen || encSpec.kLen;
+        const dk = crypto.pbkdf2Sync(Buffer.from(password, 'utf8'), p2Salt, p2Iters, p2keyLen, p2Hash);
+        const dec = crypto.createDecipheriv(encSpec.cipher, dk, p2IV);
+        const p2Decrypted = Buffer.concat([dec.update(p2EncData), dec.final()]);
+        logger.info(`[parseKey] Manual BER PBES2/PBKDF2-${p2Hash}/${encSpec.cipher} iters=${p2Iters}: OK`);
+
+        const p2Asn1 = forge.asn1.fromDer(forge.util.createBuffer(p2Decrypted.toString('binary')), { strict: false });
+        try {
+          const key = forge.pki.privateKeyFromAsn1(p2Asn1);
+          logger.info('[parseKey] Manual BER PBES2 → PKCS#1: OK');
+          return key;
+        } catch (_) {}
+        const p2Inner = forge.asn1.fromDer(forge.util.createBuffer(p2Asn1.value[2].value), { strict: false });
+        const key = forge.pki.privateKeyFromAsn1(p2Inner);
+        logger.info('[parseKey] Manual BER PBES2 → PKCS#8 inner: OK');
+        return key;
+      }
+
       const params = readBerChildren(ai[1].value);
       salt  = params[0].value;
       iters = 0;

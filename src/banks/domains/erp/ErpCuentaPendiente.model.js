@@ -57,6 +57,18 @@ const erpCuentaPendienteSchema = new mongoose.Schema({
   // Última vez que el ERP devolvió este registro
   lastSeenAt: { type: Date, default: null },
 
+  // Autorizaciones normalizadas pre-computadas al momento del sync.
+  // Permite la query inversa del motor Match ERP (Option B):
+  //   authNormSet (de movimientos bancarios) → { _autsNorm: { $in: [...] } }
+  // Se llena con extraerAutsNorm(movimientos) en erp-sync.service.js.
+  _autsNorm: { type: [String], default: [] },
+
 }, { timestamps: true, collection: 'erp_cuentas_pendientes' });
+
+// Índices para el motor Match ERP
+erpCuentaPendienteSchema.index({ lastSeenAt: -1 });        // auto-sync: findOne + sort para verificar frescura del caché
+erpCuentaPendienteSchema.index({ fechaRealPago:    1 });   // filtro fechaDesde en la carga de CxC
+erpCuentaPendienteSchema.index({ fechaAfectacion:  1 });   // filtro fechaDesde en la carga de CxC
+erpCuentaPendienteSchema.index({ _autsNorm: 1 });          // Option B: query inversa movements → CxC por auth
 
 module.exports = mongoose.model('ErpCuentaPendiente', erpCuentaPendienteSchema);

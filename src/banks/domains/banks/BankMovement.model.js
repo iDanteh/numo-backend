@@ -54,12 +54,13 @@ const bankMovementSchema = new mongoose.Schema({
   // Snapshot por cada CxC vinculada: saldoActual, folioFiscal, serie y folioExterno al momento de la vinculación
   erpLinks: {
     type: [{
-      erpId:        { type: String, required: true },
-      saldoActual:  { type: Number, default: 0 },
-      folioFiscal:  { type: String, default: null },
-      total:        { type: Number, default: null },
-      serie:        { type: String, default: null },
-      folioExterno: { type: String, default: null },
+      erpId:          { type: String, required: true },
+      saldoActual:    { type: Number, default: 0 },
+      folioFiscal:    { type: String, default: null },
+      total:          { type: Number, default: null },
+      serie:          { type: String, default: null },
+      folioExterno:   { type: String, default: null },
+      tieneRetencion: { type: Boolean, default: false },
     }],
     default: [],
   },

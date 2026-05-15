@@ -142,16 +142,19 @@ router.get('/reporte', authenticate, asyncHandler(async (req, res) => {
 }));
 
 // POST /api/erp/match/revert
-// Deshace todas las asociaciones realizadas por el motor automático (userId: 'erp-auto').
-// Restaura erpIds, erpLinks, saldoErp, uuidXML y status a su estado original.
+// Deshace todas las asociaciones realizadas por el motor automático.
+// Cubre DOS userIds del motor:
+//   'erp-auto'  — Motor Match ERP (bank-autorizaciones.service.js → matchAutorizacionesDesdeErp)
+//   'aut-match' — Motor Match Excel (bank-autorizaciones.service.js → ejecutarMatch)
+// Protege el trabajo de usuarios humanos (cualquier userId distinto de los dos anteriores):
+// · Limpia erpIds, erpLinks, saldoErp, uuidXML en todos los casos.
+// · Elimina SOLO las entradas del motor de identificadoPor (preserva las humanas).
+// · Resetea status a 'no_identificado' únicamente cuando no quedan entradas humanas.
+const MOTOR_USER_IDS = ['erp-auto', 'aut-match'];
+
 router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(async (_req, res) => {
-  // Pipeline de agregación para proteger el trabajo de usuarios humanos:
-  // · Siempre limpia los datos ERP (erpIds, erpLinks, saldoErp, uuidXML).
-  // · Elimina SOLO la entrada 'erp-auto' de identificadoPor (preserva las humanas).
-  // · Resetea status a 'no_identificado' únicamente cuando no quedan entradas humanas
-  //   en identificadoPor; si un usuario ya confirmó el movimiento, respeta su status.
   const result = await BankMovement.updateMany(
-    { 'identificadoPor.userId': 'erp-auto' },
+    { 'identificadoPor.userId': { $in: MOTOR_USER_IDS } },
     [
       {
         $set: {
@@ -159,13 +162,15 @@ router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(as
           erpLinks: [],
           saldoErp: null,
           uuidXML:  null,
+          // Eliminar entradas de ambos motores; conservar las de usuarios humanos
           identificadoPor: {
             $filter: {
               input: '$identificadoPor',
               as:    'entry',
-              cond:  { $ne: ['$$entry.userId', 'erp-auto'] },
+              cond:  { $not: { $in: ['$$entry.userId', MOTOR_USER_IDS] } },
             },
           },
+          // Resetear status solo si ya no quedan entradas humanas
           status: {
             $cond: {
               if: {
@@ -175,7 +180,7 @@ router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(as
                       $filter: {
                         input: '$identificadoPor',
                         as:    'e',
-                        cond:  { $ne: ['$$e.userId', 'erp-auto'] },
+                        cond:  { $not: { $in: ['$$e.userId', MOTOR_USER_IDS] } },
                       },
                     },
                   },

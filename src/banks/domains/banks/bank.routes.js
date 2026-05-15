@@ -314,8 +314,10 @@ router.post('/autorizaciones/match',
 // ── Job store en memoria para match-erp ───────────────────────────────────────
 // Guarda estado de cada corrida. Los resultados expiran en 15 min para no
 // acumular memoria en procesos de larga ejecución.
-const erpMatchJobs = new Map(); // jobId → { status, result?, error? }
+const erpMatchJobs   = new Map(); // jobId → { status, auth0Sub, result?, error? }
 const ERP_JOB_TTL_MS = 15 * 60 * 1000;
+// Mutex: impide que dos corridas corran en paralelo y generen escrituras duplicadas.
+let erpMatchRunning  = false;
 
 // POST /api/banks/autorizaciones/match-erp  — inicia job en background, devuelve jobId
 // Body opcional: { banco: 'BBVA', fechaDesde: '2026-01-01' }
@@ -323,15 +325,25 @@ router.post('/autorizaciones/match-erp',
   authenticate,
   permit('banks:import'),
   asyncHandler(async (req, res) => {
+    if (erpMatchRunning) {
+      return res.status(409).json({ error: 'Ya hay un match ERP en progreso. Espera a que termine antes de iniciar otro.' });
+    }
+
+    const { banco, fechaDesde } = req.body;
+    if (fechaDesde != null && fechaDesde !== '' && isNaN(Date.parse(fechaDesde))) {
+      return res.status(400).json({ error: 'fechaDesde debe ser una fecha válida (ISO 8601, ej. 2026-01-01)' });
+    }
+
     const jobId    = `erp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const auth0Sub = req.user._id;
 
-    erpMatchJobs.set(jobId, { status: 'running' });
+    erpMatchRunning = true;
+    erpMatchJobs.set(jobId, { status: 'running', auth0Sub });
     res.status(202).json({ jobId });
 
     // Corre en background: no await, respuesta ya enviada al cliente.
     matchAutorizacionesDesdeErp(
-      { banco: req.body.banco, fechaDesde: req.body.fechaDesde },
+      { banco, fechaDesde },
       {
         onProgress: (progress) => {
           emitToUser(auth0Sub, 'bank:erp:match:progress', { jobId, ...progress });
@@ -339,16 +351,17 @@ router.post('/autorizaciones/match-erp',
       },
     )
       .then(result => {
-        erpMatchJobs.set(jobId, { status: 'done', result });
+        erpMatchJobs.set(jobId, { status: 'done', auth0Sub, result });
         emitToUser(auth0Sub, 'bank:erp:match:done', { jobId, ...result });
         setTimeout(() => erpMatchJobs.delete(jobId), ERP_JOB_TTL_MS);
       })
       .catch(err => {
         const error = err?.message || 'Error desconocido en el motor ERP';
-        erpMatchJobs.set(jobId, { status: 'error', error });
+        erpMatchJobs.set(jobId, { status: 'error', auth0Sub, error });
         emitToUser(auth0Sub, 'bank:erp:match:error', { jobId, error });
         setTimeout(() => erpMatchJobs.delete(jobId), ERP_JOB_TTL_MS);
-      });
+      })
+      .finally(() => { erpMatchRunning = false; });
   }),
 );
 
@@ -358,7 +371,9 @@ router.get('/autorizaciones/match-erp/job/:jobId',
   asyncHandler(async (req, res) => {
     const job = erpMatchJobs.get(req.params.jobId);
     if (!job) return res.status(404).json({ error: 'Job no encontrado o expirado' });
-    res.json(job);
+    if (job.auth0Sub !== req.user._id) return res.status(403).json({ error: 'No autorizado' });
+    const { auth0Sub: _, ...jobResponse } = job;
+    res.json(jobResponse);
   }),
 );
 

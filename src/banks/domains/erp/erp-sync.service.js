@@ -1,7 +1,8 @@
 'use strict';
 
-const axios              = require('axios');
-const ErpCuentaPendiente = require('./ErpCuentaPendiente.model');
+const axios                        = require('axios');
+const ErpCuentaPendiente           = require('./ErpCuentaPendiente.model');
+const { extraerAutsNorm }          = require('./erp-auth.utils');
 
 const ERP_CAJA_BASE_URL = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
 const ERP_TOKEN         = process.env.ERP_TOKEN || '';
@@ -73,6 +74,9 @@ async function sincronizarCuentasPendientes(params = {}) {
                 tipoMovimiento:   c.tipoMovimiento   ?? null,
                 movimientos:      c.movimientos      ?? [],
                 lastSeenAt:       now,
+                // Pre-computado para la query inversa del motor Match ERP (Option B).
+                // Actualizar en cada sync garantiza que _autsNorm refleje el estado actual.
+                _autsNorm:        extraerAutsNorm(c.movimientos ?? []),
               },
             },
             upsert: true,

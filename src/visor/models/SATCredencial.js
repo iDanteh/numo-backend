@@ -19,11 +19,11 @@ const satCredencialSchema = new mongoose.Schema({
   keyCifrado: { type: String, required: true },
   passwordCifrado: { type: String, required: true },
 
-  // TTL: MongoDB elimina el documento 8 horas después de createdAt
+  // TTL: MongoDB elimina el documento 12 horas después de createdAt
   createdAt: {
     type: Date,
     default: Date.now,
-    expires: 8 * 60 * 60, // 28800 segundos
+    expires: 12 * 60 * 60, // 43200 segundos
   },
 });
 

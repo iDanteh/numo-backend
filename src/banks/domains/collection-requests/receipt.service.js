@@ -93,6 +93,11 @@ const MESES_ES = {
   enero:1, febrero:2, marzo:3, abril:4, mayo:5, junio:6,
   julio:7, agosto:8, septiembre:9, octubre:10, noviembre:11, diciembre:12,
 };
+// Abreviaturas de 3 letras — usadas en comprobantes Banamex ("13 may 2026")
+const MESES_ABBR = {
+  ene:1, feb:2, mar:3, abr:4, may:5, jun:6,
+  jul:7, ago:8, sep:9, oct:10, nov:11, dic:12,
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // MOTOR 1 — TESSERACT  (workers singleton — se inicializan una vez y se reusan)
@@ -119,9 +124,10 @@ function getFullWorker() {
       // OEM 1 = LSTM_ONLY: motor neuronal puro, más preciso que el motor clásico (OEM 0)
       const w = await Tesseract.createWorker(['spa', 'eng'], 1, { logger: () => {} });
       await w.setParameters({
-        tessedit_pageseg_mode:   Tesseract.PSM.SINGLE_COLUMN,  // PSM 4 — columna única
-        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
+        tessedit_pageseg_mode:     Tesseract.PSM.SINGLE_COLUMN,  // PSM 4 — columna única
+        tessedit_char_whitelist:   '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
         preserve_interword_spaces: '1',
+        user_defined_dpi:          '300', // evita "Invalid resolution XX dpi" en imágenes sin metadata DPI
       });
       return w;
     })();
@@ -137,9 +143,10 @@ function getBlockWorker() {
         // PSM 6 (SINGLE_BLOCK): trata la imagen como un bloque uniforme de texto.
         // Captura mejor los recibos con layout horizontal (label izquierda, valor derecha),
         // PDFs con múltiples columnas y screenshots de apps con secciones anchas.
-        tessedit_pageseg_mode:   Tesseract.PSM.SINGLE_BLOCK,
-        tessedit_char_whitelist: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
+        tessedit_pageseg_mode:     Tesseract.PSM.SINGLE_BLOCK,
+        tessedit_char_whitelist:   '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ$.,/:- ',
         preserve_interword_spaces: '1',
+        user_defined_dpi:          '300',
       });
       return w;
     })();
@@ -154,9 +161,10 @@ function getNumsWorker() {
       await w.setParameters({
         // PSM 11 (SPARSE_TEXT): busca texto disperso sin asumir layout uniforme.
         // Más adecuado que PSM 6 (SINGLE_BLOCK) para encontrar montos sueltos en recibos.
-        tessedit_pageseg_mode:   Tesseract.PSM.SPARSE_TEXT,
-        tessedit_char_whitelist: '0123456789$.,: ',
+        tessedit_pageseg_mode:     Tesseract.PSM.SPARSE_TEXT,
+        tessedit_char_whitelist:   '0123456789$.,: ',
         preserve_interword_spaces: '1',
+        user_defined_dpi:          '300',
       });
       return w;
     })();
@@ -287,8 +295,9 @@ function extractMonto(text) {
   m = text.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d{1,9}(?:\.\d{1,2})?)\b/);
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
-  // E3: prefijo MXN / MX$ / USD
-  m = text.match(/(?:MXN|MX\$|USD)\s*([\d,]+(?:\.\d{1,2})?)\b/i);
+  // E3: prefijo MXN / MX$ / USD — solo en la misma línea (no cruzar \n)
+  // Bug conocido: "8,165.99 MXN\n08 de mayo" matcheaba "MXN\n08" → monto=8
+  m = text.match(/(?:MXN|MX\$|USD)[^\S\n]*([\d,]+(?:\.\d{1,2})?)\b/i);
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
   // E4: número con coma como separador de miles: 15,000.00
@@ -382,15 +391,15 @@ function extractFieldsFromLines(lines) {
     },
     {
       field: 'titularDestino',
-      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|para)\s*[:\-]?$/i,
+      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|nombre|para)\s*[:\-]?$/i,
     },
     {
       field: 'claveRastreo',
-      re: /^(clave\s+(de\s+)?rastreo|rastreo\s+spei|tracking\s*(key|id)?)\s*[:\-]?$/i,
+      re: /^(clave\s+(de\s+)?rastreo|rastreo\s+spei|tracking\s*(key|id)?|folio\s+[úu]nico)\s*[:\-]?$/i,
     },
     {
       field: 'referencia',
-      re: /^(referencia|folio|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n)\s*[:\-]?$/i,
+      re: /^(referencia|folio(?:\s+de\s+operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
     },
     {
       field: 'numeroAutorizacion',
@@ -491,10 +500,18 @@ function extractFecha(text) {
   m = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
   if (m) return m[0];
 
-  m = text.match(/(\d{1,2})\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?(20\d{2})/i);
+  // Formato completo con o sin "de": "03 de marzo de 2026" / "03 marzo 2026"
+  m = text.match(/(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?(20\d{2})/i);
   if (m) {
     const mes = MESES_ES[m[2].toLowerCase()];
-    return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+    if (mes) return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  }
+
+  // Meses abreviados (3 letras): "13 may 2026", "13 ene 2026" — frecuente en Banamex y Banorte
+  m = text.match(/(\d{1,2})\s+(ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic)\b\w*\s+(?:de\s+)?(20\d{2})/i);
+  if (m) {
+    const mes = MESES_ABBR[m[2].toLowerCase().slice(0, 3)];
+    if (mes) return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
   }
 
   m = text.match(/\b(\d{2})\/(\d{2})\/(\d{2})\b/);
@@ -512,21 +529,27 @@ function extractHora(text) {
 }
 
 function extractClaveRastreo(text) {
-  let m = text.match(/(?:clave\s+(?:de\s+)?rastreo|rastreo\s*(?:spei)?|tracking\s*(?:key|id)?)[:\s#]*([A-Z0-9]{8,35})/i);
+  // P1: etiqueta explícita (incluye "folio único" de BBVA mismo banco)
+  let m = text.match(/(?:clave\s+(?:de\s+)?rastreo|rastreo\s*(?:spei)?|tracking\s*(?:key|id)?|folio\s+[úu]nico)[:\s#]*([A-Z0-9]{8,35})/i);
   if (m) return m[1].toUpperCase().replace(/\s/g, '');
 
+  // P2: prefijo bancario SPEI (BBVAMEX..., BNAM..., HDNX...) + dígitos
   m = text.match(/\b([A-Z]{2,8}\d{8,22})\b/);
   if (m) return m[1];
 
-  m = text.match(/\b([A-Z0-9]{18,30})\b/);
+  // P3: secuencia alfanumérica 18–35 chars con letras Y dígitos mezclados
+  //     (cubre folios hex de 32 chars como los de BBVA mismo banco)
+  m = text.match(/\b([A-Z0-9]{18,35})\b/);
   if (m && /[A-Z]/.test(m[1]) && /\d/.test(m[1])) return m[1];
 
   return null;
 }
 
 function extractReferencia(text) {
+  // "folio(?:\s+de\s+operación)?" cubre tanto "Folio: X" como "Folio de operación\nX"
+  // "[:\s#\n]*" usa \n explícito para cruzar línea cuando el valor está en la siguiente
   const m = text.match(
-    /(?:referencia|folio|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n)[:\s#]*(\d{4,20})/i
+    /(?:referencia|folio(?:\s+de\s+operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
   );
   return m ? m[1] : null;
 }
@@ -595,7 +618,19 @@ function extractBancos(text) {
 }
 
 function extractUltimos4(text) {
-  let m = text.match(/[*Xx\.]{3,4}[\s-]?(\d{4})\b/);
+  let m;
+
+  // Bullet "•" / "·" — formato BBVA: "CUENTA • 14588", "•4352"
+  // Toma los últimos 4 dígitos si el grupo capturado tiene 3–5 dígitos
+  m = text.match(/[•·\u2022\u00b7]\s*(\d{3,5})\b/);
+  if (m) return m[1].slice(-4);
+
+  // Asteriscos dobles — formato Banamex: "Priority **546", "**120/971"
+  m = text.match(/\*{2,4}\s*(\d{3,4})(?:\/\d+)?\b/);
+  if (m) return m[1].slice(-4);
+
+  // Asteriscos/X/puntos — formato estándar: "****1234", "XX1234"
+  m = text.match(/[*Xx\.]{3,4}[\s-]?(\d{4})\b/);
   if (m) return m[1];
 
   m = text.match(/(?:termina(?:ndo)?|ending|últ(?:imos)?\.?)\s+(?:en\s+)?(\d{4})\b/i);
@@ -610,7 +645,8 @@ function extractUltimos4(text) {
 function extractTitular(text, role) {
   const labels = role === 'origen'
     ? ['ordenante','remitente','emisor','nombre del emisor','nombre de origen','nombre del ordenante']
-    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','para'];
+    // "nombre" solo aplica a destino: en BBVA mismo banco, "Nombre: X" es el beneficiario
+    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','nombre','para'];
 
   const re = new RegExp(
     `(?:${labels.join('|')})[:\\s]+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\\s\\.]{3,60})`, 'i'
@@ -619,11 +655,18 @@ function extractTitular(text, role) {
   return m ? m[1].split('\n')[0].trim().toUpperCase().slice(0, 60) : null;
 }
 
+// Etiquetas que NO deben tomarse como valor de concepto (evitar capturar la siguiente etiqueta)
+const CONCEPTO_LABEL_BLACKLIST = /^(?:importe|monto|total|fecha|hora|titular|cuenta|banco|clave\s+rastreo|folio|rastreo|referencia|contrato|n[úu]mero|autorizaci[oó]n|tipo)\s*:?$/i;
+
 function extractConcepto(text) {
-  const m = text.match(
-    /(?:concepto|descripci[oó]n|motivo|referencia\s+de\s+pago|leyenda)[:\s]+([^\n]{3,100})/i
-  );
-  return m ? m[1].trim().slice(0, 120) : null;
+  // Iterar todos los matches para saltar etiquetas falsas (ej. "Concepto:\nImporte:")
+  const re = /(?:concepto|descripci[oó]n|motivo|referencia\s+de\s+pago|leyenda)[:\s]+([^\n]{3,100})/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const val = m[1].trim();
+    if (!CONCEPTO_LABEL_BLACKLIST.test(val)) return val.slice(0, 120);
+  }
+  return null;
 }
 
 function calcConfianza(fields) {
@@ -812,10 +855,18 @@ async function extractReceiptDataGemini(imageBuffer, mimeType) {
     concepto:              data.concepto              || null,
   };
 
+  const confianza = calcConfianza(fields);
+  // Si Gemini no extrajo ningún campo útil (ej. imagen ilegible o fuera de contexto),
+  // lanzar error para que el dispatcher pruebe el siguiente motor en lugar de
+  // retornar un resultado vacío que bloquea la cadena de fallback.
+  if (confianza === 0) {
+    throw new Error('Gemini no extrajo datos útiles del comprobante (todos los campos null)');
+  }
+
   return {
     ...fields,
-    confianza: calcConfianza(fields),
-    _engine:   'gemini-2.0-flash',
+    confianza,
+    _engine: 'gemini-2.0-flash',
   };
 }
 
@@ -823,86 +874,347 @@ async function extractReceiptDataGemini(imageBuffer, mimeType) {
 // MOTOR 2 — GOOGLE CLOUD VISION API
 // ════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+// HELPERS DE PREPROCESAMIENTO
+// ════════════════════════════════════════════════════════════════════════════
+
 /**
- * Preprocesa la imagen para maximizar la precisión del OCR.
+ * Clasifica la imagen como screenshot digital o fotografía física.
  *
- * Pipeline:
- *  1. Upscale — si ancho o alto < 1200 px (verifica ambas dimensiones para screenshots
- *     angostos como recibos BBVA o screenshots verticales de SPEI).
- *  2. Escala de grises — elimina varianza de color que introduce ruido en Tesseract.
- *  3. Corrección gamma — aclara imágenes oscuras (fotos nocturnas, WhatsApp con poca luz).
- *     sharp.gamma(n) aplica pixel^(1/n): mayor n = más aclarado.
- *  4. Sharpen — compensa el blur de compresión JPEG/WhatsApp.
- *  5. Normalize — estira el histograma al rango completo 0–255.
- *  6. Binarización adaptativa al fondo:
- *       · Fondo claro (texto oscuro): threshold(145) → texto negro, fondo blanco.
- *       · Fondo oscuro (texto claro): negate() + threshold(145) → mismo resultado.
- *       · Brillo intermedio (80–140): se omite para no destruir detalles de fotos.
- *     Umbral 145 en lugar de 128 para preservar trazos delgados en fuentes ligeras.
- *  7. Salida PNG (lossless) — JPEG introduciría artefactos de bloque en imágenes binarizadas.
+ * Heurística: los screenshots bancarios tienen fondos casi puros (blanco, negro
+ * o un color corporativo sólido). Se mide la proporción de píxeles extremos
+ * (>242 ó <13 en escala de grises) sobre un muestreo de 150×150 px.
+ * Screenshots suelen superar el 35 % de píxeles "puros"; las fotos, no.
  *
- * Si sharp no está disponible o falla en cualquier paso, devuelve el buffer original.
+ * El resultado determina el agresividad del pipeline:
+ *   screenshot → conservador (no destruir píxeles perfectos)
+ *   foto       → agresivo   (compensar ruido, blur, inclinación)
+ */
+async function detectIsScreenshot(buffer) {
+  try {
+    const sharp = require('sharp');
+    const { data } = await sharp(buffer)
+      .grayscale()
+      .resize({ width: 150, height: 150, fit: 'fill' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    let pureWhite = 0, pureBlack = 0;
+    for (const px of data) {
+      if (px > 242) pureWhite++;
+      else if (px < 13) pureBlack++;
+    }
+    return (pureWhite + pureBlack) / data.length > 0.35;
+  } catch {
+    return false; // asumir foto en caso de error
+  }
+}
+
+/**
+ * Upscaling diferenciado según tipo de imagen.
+ *
+ * Screenshots → target 1 400 px en la dimensión menor (ya son nítidos,
+ *               solo necesitan resolución suficiente para el LSTM).
+ * Fotos       → target 1 800 px (compensar blur de cámara, compresión
+ *               JPEG/WhatsApp y pérdida de detalle por distancia).
+ * Máximo 3× para no introducir artefactos de escalado excesivo.
+ * Kernel Lanczos3: mayor fidelidad que bilineal o bicúbico al escalar.
+ */
+async function smartUpscale(buffer, isScreenshot) {
+  try {
+    const sharp = require('sharp');
+    const { width: w, height: h } = await sharp(buffer).metadata();
+    if (!w || !h) return buffer;
+
+    const minDim    = Math.min(w, h);
+    const targetMin = isScreenshot ? 1400 : 1800;
+    if (minDim >= targetMin) return buffer;
+
+    const scale = Math.min(3, targetMin / minDim);
+    return sharp(buffer)
+      .resize(Math.round(w * scale), Math.round(h * scale), {
+        kernel:             'lanczos3',
+        withoutEnlargement: false,
+      })
+      .toBuffer();
+  } catch {
+    return buffer;
+  }
+}
+
+/**
+ * Detecta el ángulo de inclinación fino del texto (rango ±10°) usando el
+ * método de varianza de proyecciones horizontales.
+ *
+ * Principio: cuando las líneas de texto están perfectamente horizontales,
+ * las sumas de píxeles por fila muestran alta varianza (filas densas de
+ * texto alternan con filas vacías de espacio). Al rotar la imagen en el
+ * ángulo correcto, esa varianza se maximiza.
+ *
+ * Se trabaja sobre una copia reducida (≤ 400 px de ancho) para eficiencia.
+ * Resolución angular: 0.5° — suficiente para OCR con LSTM.
+ *
+ * @returns {number} ángulo de corrección en grados (0 si la inclinación < 0.5°)
+ */
+async function detectSkewAngle(grayBuffer) {
+  try {
+    const sharp = require('sharp');
+    const { data, info } = await sharp(grayBuffer)
+      .resize({ width: 400, withoutEnlargement: true })
+      .threshold(128)
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const { width, height } = info;
+    const cx = width  / 2;
+    const cy = height / 2;
+
+    let bestAngle    = 0;
+    let bestVariance = -1;
+
+    for (let deg = -10; deg <= 10; deg += 0.5) {
+      const rad     = deg * Math.PI / 180;
+      const cosA    = Math.cos(rad);
+      const sinA    = Math.sin(rad);
+      const rowSums = new Int32Array(height);
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          // Rotación inversa: encontrar el píxel fuente para la posición rotada
+          const sx = Math.round(cosA * (x - cx) + sinA * (y - cy) + cx);
+          const sy = Math.round(-sinA * (x - cx) + cosA * (y - cy) + cy);
+          if (sx >= 0 && sx < width && sy >= 0 && sy < height) {
+            if (data[sy * width + sx] < 128) rowSums[y]++; // píxel oscuro = texto
+          }
+        }
+      }
+
+      let sum = 0;
+      for (let i = 0; i < height; i++) sum += rowSums[i];
+      const mean = sum / height;
+      let variance = 0;
+      for (let i = 0; i < height; i++) variance += (rowSums[i] - mean) ** 2;
+      variance /= height;
+
+      if (variance > bestVariance) {
+        bestVariance = variance;
+        bestAngle    = deg;
+      }
+    }
+
+    return Math.abs(bestAngle) >= 0.5 ? bestAngle : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Binarización adaptativa Bradley-Roth con imagen integral — O(n).
+ *
+ * Ventaja sobre threshold global: calcula un umbral diferente para cada
+ * píxel basado en el promedio local de sus vecinos en una ventana
+ * windowSize×windowSize. Esto preserva texto fino en zonas con:
+ *   • Fondos con gradiente (BBVA azul, Nu morado, Santander rojo)
+ *   • Iluminación no uniforme (foto de papel bajo luz lateral)
+ *   • Texto de múltiples tamaños en la misma imagen
+ *
+ * Fórmula: texto si pixel < mean_local × (1 – k)
+ *   k menor (0.10–0.15) → conserva más texto; puede capturar algo de ruido.
+ *   k mayor (0.18–0.25) → imagen más limpia; puede perder trazos muy finos.
+ *
+ * La imagen integral permite calcular la suma de cualquier rectángulo
+ * en O(1) con 4 accesos, llevando la complejidad total a O(n).
+ *
+ * @param {Buffer} grayBuffer  PNG en escala de grises (fondo claro asumido)
+ * @param {number} windowSize  Tamaño de ventana local en px (impar, default 29)
+ * @param {number} k           Factor de offset del umbral (default 0.15)
+ */
+async function adaptiveThreshold(grayBuffer, windowSize = 29, k = 0.15) {
+  const sharp = require('sharp');
+
+  const { data, info } = await sharp(grayBuffer)
+    .grayscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const { width, height } = info;
+  const half = Math.floor(windowSize / 2);
+
+  // Imagen integral: integral[y*w+x] = suma de todos los px en rect (0,0)→(x,y)
+  const integral = new Float64Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i        = y * width + x;
+      const above    = y > 0             ? integral[(y - 1) * width + x]          : 0;
+      const left     = x > 0             ? integral[y * width + (x - 1)]          : 0;
+      const aboveLft = (y > 0 && x > 0) ? integral[(y - 1) * width + (x - 1)]    : 0;
+      integral[i]    = data[i] + above + left - aboveLft;
+    }
+  }
+
+  const output = Buffer.alloc(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const x1 = Math.max(0, x - half);
+      const y1 = Math.max(0, y - half);
+      const x2 = Math.min(width  - 1, x + half);
+      const y2 = Math.min(height - 1, y + half);
+
+      const count     = (x2 - x1 + 1) * (y2 - y1 + 1);
+      const sum       = integral[y2 * width + x2]
+        - (x1 > 0            ? integral[y2 * width + (x1 - 1)]          : 0)
+        - (y1 > 0            ? integral[(y1 - 1) * width + x2]          : 0)
+        + (x1 > 0 && y1 > 0 ? integral[(y1 - 1) * width + (x1 - 1)]    : 0);
+
+      const localMean = sum / count;
+      // Texto (oscuro) si cae por debajo del umbral local adaptativo
+      output[y * width + x] = data[y * width + x] < localMean * (1 - k) ? 0 : 255;
+    }
+  }
+
+  return sharp(output, { raw: { width, height, channels: 1 } }).png().toBuffer();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PREPROCESADOR PRINCIPAL
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Preprocesa una imagen de comprobante para maximizar la precisión del OCR.
+ *
+ * Pipeline de 8 pasos — cada uno mejora una dimensión distinta:
+ *
+ *  0. Auto-rotación EXIF        Corrige fotos tomadas con el teléfono girado
+ *                               (sharp.rotate() sin args aplica el metadato EXIF).
+ *  1. Clasificación de imagen   screenshot vs fotografía física → determina
+ *                               la agresividad de todos los pasos siguientes.
+ *  2. Upscaling inteligente     screenshot ≥1 400 px / foto ≥1 800 px (min-dim).
+ *                               Lanczos3 para máxima fidelidad. Máximo 3×.
+ *  3. Escala de grises + stats  Base para decisiones adaptativas posteriores:
+ *                               avgBrightness (gamma) y stdDev (binarización).
+ *  4. Deskew fino (solo fotos)  Detecta inclinaciones de ±0.5–10° y las
+ *                               corrige antes del OCR. El LSTM de Tesseract no
+ *                               compensa inclinaciones > 2–3° por sí solo.
+ *  5. Corrección gamma          Aclara imágenes oscuras (fotos nocturnas,
+ *                               WhatsApp con poca luz). Adaptativa al brillo.
+ *  6. Sharpen diferenciado      Fotos: agresivo (compensa blur de cámara).
+ *                               Screenshots: suave (ya son nítidos).
+ *  7. CLAHE                     Ecualización de histograma adaptativa local en
+ *                               tiles de 64×64 px. Preserva contraste local en
+ *                               fondos de gradiente e iluminación no uniforme.
+ *                               Muy superior a .normalize() global para fondos
+ *                               de color (BBVA azul, Nu morado, Santander rojo).
+ *  8. Binarización adaptativa   Bradley-Roth (imagen integral, O(n)): umbral
+ *                               local por píxel. Funciona en gradientes, texto
+ *                               pequeño y fondos con marca de agua donde el
+ *                               threshold global falla por completo.
+ *
+ * Si cualquier paso falla, devuelve el buffer original sin modificar.
  */
 async function preprocessImage(imageBuffer) {
   try {
     const sharp = require('sharp');
-    const meta  = await sharp(imageBuffer).metadata();
-    const w     = meta.width  || 0;
-    const h     = meta.height || 0;
 
-    // Medir brillo promedio tras convertir a grises (instancia separada, no modifica pipeline)
-    const stats         = await sharp(imageBuffer).grayscale().stats();
-    const avgBrightness = stats.channels[0].mean; // 0–255
+    // ── 0. Auto-rotación EXIF ──────────────────────────────────────────────
+    // sharp.rotate() sin argumento lee el campo Orientation del EXIF y aplica
+    // la rotación correspondiente. Resuelve el 90 % de los casos de fotos
+    // tomadas con el teléfono en posición no estándar sin coste adicional.
+    let buf = await sharp(imageBuffer, { failOn: 'none' }).rotate().toBuffer();
 
-    let pipeline = sharp(imageBuffer, { failOn: 'none' });
+    // ── 1. Clasificar tipo de imagen ───────────────────────────────────────
+    const isScreenshot = await detectIsScreenshot(buf);
 
-    // 1. Upscale — verifica la dimensión mínima para capturar screenshots angostos
-    const minDim = Math.min(w || Infinity, h || Infinity);
-    if (minDim < 1200 && minDim > 0) {
-      const scale = Math.min(2, 1800 / minDim);
-      pipeline = pipeline.resize({
-        width:              Math.round(w * scale),
-        withoutEnlargement: false,
-        kernel:             'lanczos3',
-      });
-    } else if (w > 0 && w < 1400) {
-      pipeline = pipeline.resize({
-        width:              Math.max(w * 2, 1800),
-        withoutEnlargement: false,
-        kernel:             'lanczos3',
-      });
+    // ── 2. Upscaling inteligente ───────────────────────────────────────────
+    buf = await smartUpscale(buf, isScreenshot);
+
+    // ── 3. Escala de grises y estadísticas de brillo ───────────────────────
+    const grayBuf       = await sharp(buf).grayscale().png().toBuffer();
+    const stats         = await sharp(grayBuf).stats();
+    const avgBrightness = stats.channels[0].mean;   // 0–255
+    const stdDev        = stats.channels[0].stdev;  // variación de iluminación
+
+    // ── 4. Corrección de inclinación (solo fotografías) ────────────────────
+    // Los screenshots siempre están perfectamente alineados (el SO lo garantiza).
+    // Las fotos de papel o de pantalla pueden tener inclinaciones de 2–10° que
+    // el LSTM de Tesseract no puede compensar y que reducen la precisión
+    // al confundir el detector de líneas de texto.
+    let correctedBuf = grayBuf;
+    if (!isScreenshot) {
+      const skewAngle = await detectSkewAngle(grayBuf);
+      if (Math.abs(skewAngle) >= 0.5) {
+        correctedBuf = await sharp(grayBuf)
+          .rotate(-skewAngle, { background: { r: 255, g: 255, b: 255, alpha: 1 } })
+          .png()
+          .toBuffer();
+      }
     }
 
-    // 2. Escala de grises
-    pipeline = pipeline.grayscale();
+    // ── 5. Corrección gamma ────────────────────────────────────────────────
+    let pipeline = sharp(correctedBuf, { failOn: 'none' });
+    if      (avgBrightness < 50)  pipeline = pipeline.gamma(3.0); // muy oscura
+    else if (avgBrightness < 100) pipeline = pipeline.gamma(2.2); // moderadamente oscura
 
-    // 3. Corrección gamma para imágenes oscuras
-    if (avgBrightness < 50) {
-      pipeline = pipeline.gamma(3.0);   // muy oscura — aclarar agresivamente
-    } else if (avgBrightness < 100) {
-      pipeline = pipeline.gamma(2.2);   // moderadamente oscura — corrección estándar sRGB
+    // ── 6. Sharpen diferenciado ────────────────────────────────────────────
+    pipeline = isScreenshot
+      ? pipeline.sharpen({ sigma: 0.8, m1: 1.0, m2: 0.3 })  // suave: ya es nítido
+      : pipeline.sharpen({ sigma: 1.5, m1: 2.0, m2: 0.7 }); // agresivo: compensar blur
+
+    // ── 7. CLAHE — ecualización de histograma adaptativa local ─────────────
+    // A diferencia de .normalize() que estira el histograma globalmente,
+    // CLAHE ajusta el contraste de forma independiente en tiles de 64×64 px.
+    // Resultado: texto en zonas claras y oscuras de la misma imagen queda
+    // igualmente definido. maxSlope:4 limita la amplificación de ruido
+    // en zonas homogéneas (fondos lisos sin texto).
+    pipeline = pipeline.clahe({ width: 64, height: 64, maxSlope: 4 });
+
+    // Invertir fondos oscuros ANTES de la binarización adaptativa para
+    // garantizar que la salida siempre sea texto oscuro sobre fondo claro
+    // (convención que Tesseract LSTM espera).
+    if (avgBrightness < 80) pipeline = pipeline.negate();
+
+    const enhancedBuf = await pipeline.png().toBuffer();
+
+    // ── 8. Binarización adaptativa Bradley-Roth ────────────────────────────
+    // Se aplica cuando hay variación de iluminación (stdDev > 35) o cuando
+    // es un screenshot con fondo de color (donde el threshold global destruye
+    // texto en la zona del header de color corporativo).
+    // Para imágenes uniformes y muy claras, threshold global es más rápido.
+    const useAdaptive = isScreenshot || stdDev > 35;
+
+    if (useAdaptive) {
+      if (isScreenshot) {
+        // Detectar si la parte superior del screenshot tiene header oscuro (BBVA verde,
+        // Nu morado, Santander rojo). En ese caso, Bradley-Roth falla porque marca el fondo
+        // oscuro como "texto" y el texto blanco como "fondo" — el resultado es texto blanco
+        // sobre fondo blanco: invisible para Tesseract.
+        // Solución: devolver la imagen CLAHE-enhanced sin binarizar — Tesseract LSTM maneja
+        // grayscale directamente y no necesita binarización cuando hay zonas mixtas.
+        const { data: topData, info: topInfo } = await sharp(enhancedBuf)
+          .extract({ left: 0, top: 0, width: (await sharp(enhancedBuf).metadata()).width, height: Math.max(1, Math.floor((await sharp(enhancedBuf).metadata()).height * 0.30)) })
+          .grayscale()
+          .raw()
+          .toBuffer({ resolveWithObject: true });
+        const topBrightness = topData.reduce((s, v) => s + v, 0) / topData.length;
+
+        if (topBrightness < 120) {
+          // Header oscuro detectado — saltar binarización para conservar texto blanco
+          return enhancedBuf;
+        }
+      }
+
+      // Screenshots sin header oscuro y fotos con variación de iluminación
+      const windowSize = isScreenshot ? 25 : 45;
+      const k          = isScreenshot ? 0.12 : 0.20;
+      return await adaptiveThreshold(enhancedBuf, windowSize, k);
     }
 
-    // 4. Sharpen
-    pipeline = pipeline.sharpen({ sigma: 1.3, m1: 1.5, m2: 0.5 });
+    // Imagen de alto contraste uniforme → threshold global más rápido
+    return await sharp(enhancedBuf).threshold(140).png().toBuffer();
 
-    // 5. Normalize
-    pipeline = pipeline.normalize();
-
-    // 6. Binarización adaptativa según el tipo de fondo
-    if (avgBrightness > 140) {
-      // Fondo claro (screenshots de apps bancarias, mayoría de los casos)
-      pipeline = pipeline.threshold(145);
-    } else if (avgBrightness < 80) {
-      // Fondo oscuro (BBVA modo oscuro, pantallas con fondo negro)
-      pipeline = pipeline.negate().threshold(145);
-    }
-    // 80–140: foto de papel o imagen con iluminación variable — normalize es suficiente
-
-    // 7. PNG lossless
-    return await pipeline.png().toBuffer();
-  } catch {
-    return imageBuffer; // si falla el preproceso, continúa con el original
+  } catch (prepErr) {
+    // Loguear el paso que falló para facilitar diagnóstico (ej. GIF animado, buffer corrupto)
+    const logger = require('../../../shared/utils/logger');
+    logger.warn('[preprocessImage] Pipeline de preprocesamiento falló, usando buffer original:', prepErr.message);
+    return imageBuffer;
   }
 }
 
@@ -915,6 +1227,90 @@ async function extractTextFromPdf(pdfBuffer) {
   const pdfParse = require('pdf-parse');
   const data     = await pdfParse(pdfBuffer);
   return (data.text || '').trim();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// PDF ESCANEADO → IMAGEN  (pdfjs-dist v3 + canvas)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Renderiza las primeras N páginas de un PDF a buffers PNG de alta resolución.
+ *
+ * Usa pdfjs-dist (Motor JavaScript puro, sin Ghostscript ni ImageMagick) +
+ * el módulo `canvas` que ya se encuentra disponible como dependencia transitiva.
+ *
+ * Scale 2.5 ≈ 187 DPI sobre un PDF de 72 DPI base → suficiente para Tesseract LSTM.
+ * Para PDFs de tamaño carta (8.5×11 in) produce ≈ 1590×2063 px, óptimo para OCR.
+ */
+async function renderPdfToImages(pdfBuffer, maxPages = 2) {
+  // Requiere lazy para no romper el arranque si pdfjs-dist no está instalado
+  let pdfjsLib;
+  try {
+    pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
+  } catch {
+    throw new Error('pdfjs-dist no está instalado — ejecuta: npm install pdfjs-dist@3.11.174');
+  }
+
+  let createCanvas;
+  try {
+    ({ createCanvas } = require('canvas'));
+  } catch {
+    throw new Error('El módulo canvas no está disponible — ejecuta: npm install canvas');
+  }
+
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    require.resolve('pdfjs-dist/legacy/build/pdf.worker.js');
+
+  const data = new Uint8Array(pdfBuffer);
+  const pdf  = await pdfjsLib.getDocument({ data, verbosity: 0 }).promise;
+  const pagesToRender = Math.min(pdf.numPages, maxPages);
+
+  const images = [];
+  for (let i = 1; i <= pagesToRender; i++) {
+    const page   = await pdf.getPage(i);
+    const vp     = page.getViewport({ scale: 2.5 });
+    const canvas = createCanvas(Math.ceil(vp.width), Math.ceil(vp.height));
+    const ctx    = canvas.getContext('2d');
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    images.push(canvas.toBuffer('image/png'));
+  }
+  return images;
+}
+
+/**
+ * Motor para PDFs escaneados (sin texto embebido).
+ *
+ * Flujo: renderizar cada página a PNG → preprocessImage → Tesseract (3 PSMs).
+ * Si la primera página produce confianza baja (< 40), intenta la segunda.
+ * Retorna el resultado de mayor confianza.
+ */
+async function extractReceiptDataPdfAsImage(pdfBuffer) {
+  const logger  = require('../../../shared/utils/logger');
+  const pages   = await renderPdfToImages(pdfBuffer, 2);
+
+  if (!pages.length) {
+    throw new Error('renderPdfToImages no devolvió ninguna página');
+  }
+
+  const results = [];
+  for (const pagePng of pages) {
+    try {
+      const r = await extractReceiptDataTesseract(pagePng, 'image/png');
+      results.push(r);
+      // Si ya tenemos buena confianza en la primera página, no renderizar más
+      if (r.confianza >= 40) break;
+    } catch (pageErr) {
+      logger.warn('[extractReceiptDataPdfAsImage] Error procesando página PDF→imagen:', pageErr.message);
+    }
+  }
+
+  if (!results.length) {
+    throw new Error('Tesseract no pudo extraer datos de ninguna página del PDF renderizado');
+  }
+
+  // Elegir la página con mayor confianza
+  const best = results.reduce((a, b) => (b.confianza > a.confianza ? b : a));
+  return { ...best, _engine: 'tesseract-pdf-render' };
 }
 
 /**
@@ -1006,10 +1402,15 @@ async function extractReceiptDataVision(imageBuffer, mimeType = 'image/jpeg') {
 /**
  * Extrae datos de un comprobante de pago.
  *
- * Cadena de motores:
- *   1. Gemini 2.0 Flash  — mejor precisión, entiende PDF e imagen
- *   2. Google Vision API — OCR clásico de alta calidad
- *   3. Tesseract.js      — fallback local (solo imágenes)
+ * Cadena de motores (imágenes):
+ *   1. Gemini 2.0 Flash  — mejor precisión, entiende PDF e imagen de forma nativa
+ *   2. Google Vision API — DOCUMENT_TEXT_DETECTION + preprocessImage
+ *   3. Tesseract.js      — fallback local completo (3 PSMs en paralelo)
+ *
+ * Cadena de motores (PDF):
+ *   1. Gemini           — acepta PDF base64 de forma nativa
+ *   2. Vision + pdf-parse — para PDFs con texto embebido (vectorial/digital)
+ *   3. pdfjs + Tesseract — renderiza páginas a PNG y aplica OCR (PDFs escaneados)
  */
 async function extractReceiptData(imageBuffer, mimeType) {
   if (!SUPPORTED_MIME.includes(mimeType))
@@ -1031,14 +1432,22 @@ async function extractReceiptData(imageBuffer, mimeType) {
     console.warn('[receiptService] Vision falló:', visionErr.message);
 
     if (isPdf) {
-      throw new Error(
-        'No se pudo procesar el PDF con ningún motor. ' +
-        visionErr.message
-      );
+      // Motor 3-PDF: renderizar cada página del PDF a imagen PNG y aplicar Tesseract.
+      // Cubre PDFs escaneados (imagen dentro de PDF) que pdf-parse no puede extraer.
+      console.warn('[receiptService] PDF sin texto embebido — intentando render PDF→imagen con Tesseract.');
+      try {
+        return await extractReceiptDataPdfAsImage(imageBuffer);
+      } catch (pdfRenderErr) {
+        console.warn('[receiptService] Render PDF→imagen falló:', pdfRenderErr.message);
+        throw new Error(
+          'No se pudo procesar el PDF con ningún motor disponible. ' +
+          `Vision: ${visionErr.message} | Render: ${pdfRenderErr.message}`
+        );
+      }
     }
   }
 
-  // ── Motor 3: Tesseract (solo imágenes) ────────────────────────
+  // ── Motor 3: Tesseract (imágenes) ─────────────────────────────
   console.warn('[receiptService] Usando Tesseract como último fallback.');
   return {
     ...(await extractReceiptDataTesseract(imageBuffer, mimeType)),

@@ -300,14 +300,20 @@ const ejecutarDescargaMasiva = async () => {
       // ── 2. Descargar emitidos y/o recibidos ─────────────────────────────
       const tipos = [];
       if (entidad.syncConfig?.syncEmitidos !== false) tipos.push('Emitidos');
-      if (entidad.syncConfig?.syncRecibidos) tipos.push('Recibidos');
+      tipos.push('Recibidos');
       if (tipos.length === 0) tipos.push('Emitidos');
 
-      // Tipos del diario: solo Ingresos, Egresos y Pagos (sin Nómina ni Traslados)
-      const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos'];
+      // Tipos del diario: Ingresos, Egresos, Pagos y Nómina
+      const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
 
-      for (const tipoComprobante of tipos) {
-        // El diario descarga Emitidos en 3 sub-solicitudes SAT; Recibidos es 1
+      for (let _ti = 0; _ti < tipos.length; _ti++) {
+        const tipoComprobante = tipos[_ti];
+        // Esperar 2 horas entre Emitidos y Recibidos para liberar cupo SAT
+        if (_ti > 0 && tipoComprobante === 'Recibidos') {
+          logger.info(`[SatSyncJob] RFC ${rfc}: esperando 45min antes de descargar Recibidos...`);
+          await new Promise(r => setTimeout(r, 45 * 60 * 1000));
+        }
+        // El diario descarga Emitidos en 4 sub-solicitudes SAT; Recibidos es 1
         const solicitudesNecesarias = tipoComprobante === 'Emitidos' ? TIPOS_DIARIO.length : 1;
         const limitCheck = await puedeIniciar(rfc, solicitudesNecesarias);
         if (!limitCheck.puede) {
@@ -723,7 +729,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
     // En modo XML + Emitidos: dividir por sub-tipo.
     // tiposEmitidosSplit permite al caller restringir qué sub-tipos se solicitan
     // (ej. el job diario solo pide Ingresos, Egresos y Pagos).
-    const TIPOS_SPLIT_EMITIDOS = tiposEmitidosSplit ?? ['Ingresos', 'Egresos', 'Pagos', 'Nomina', 'Traslados'];
+    const TIPOS_SPLIT_EMITIDOS = tiposEmitidosSplit ?? ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
     const tiposADescargar = (modoFinal === 'CFDI' && tipoComprobante === 'Emitidos')
       ? TIPOS_SPLIT_EMITIDOS
       : [tipoComprobante];

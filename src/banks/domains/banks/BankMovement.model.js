@@ -87,6 +87,12 @@ const bankMovementSchema = new mongoose.Schema({
     default: [],
   },
 
+  // Ficha física (ticket de depósito): folio del comprobante físico
+  ficha:       { type: String, default: null },
+  fichaBy:     { type: String, default: null },   // userId que registró la ficha
+  fichaNombre: { type: String, default: null },   // nombre display del usuario
+  fichaAt:     { type: Date,   default: null },
+
   // Oculto por regla — el movimiento existe pero no aparece en vistas normales
   oculto: { type: Boolean, default: false, index: true },
 
@@ -108,6 +114,10 @@ bankMovementSchema.index({ fecha: -1, banco: 1 });
 bankMovementSchema.index({ numeroAutorizacion: 1, banco: 1 });
 bankMovementSchema.index({ banco: 1, status: 1 });
 bankMovementSchema.index({ banco: 1, categoria: 1 });
+// Índices para el motor Match ERP
+bankMovementSchema.index({ isActive: 1, status: 1, deposito: 1 });
+bankMovementSchema.index({ 'identificadoPor.userId': 1 });
+bankMovementSchema.index({ erpIds: 1, isActive: 1 });
 
 // Índice de texto para el buscador
 bankMovementSchema.index({

@@ -489,23 +489,31 @@ const parseKey = async (keyBuf, password) => {
 
           if (iCh.length < 2) throw new Error('inner SEQUENCE con < 2 hijos');
 
-          let iAlgOid, iSalt, iIters, iEncData;
+          let iAlgOid, iSalt, iIters, iEncData, iPbes2AlgId;
           if (iCh[0].tag === 0x30) {
             // PKCS#8 EncryptedPrivateKeyInfo: SEQUENCE { AlgorithmIdentifier, OCTET STRING }
             const ai = readBerChildren(iCh[0].value);
             logger.info(`[parseKey] inner ai: ${ai.length} tags=[${ai.map(c => '0x' + c.tag.toString(16)).join(',')}] ai0val=${ai[0]?.value?.slice(0,10)?.toString('hex')}`);
             if (!ai.length || ai[0].tag !== 0x06) throw new Error(`inner AlgId inesperado: ai[0].tag=0x${(ai[0]?.tag ?? 0).toString(16)}`);
             iAlgOid = forge.asn1.derToOid(ai[0].value.toString('binary'));
-            const prm = readBerChildren(ai[1].value);
-            iSalt = prm[0].value; iIters = 0;
-            for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
+            if (iAlgOid === '1.2.840.113549.1.5.13') {
+              iPbes2AlgId = ai[1].value; // PBES2-params raw para parseo posterior
+            } else {
+              const prm = readBerChildren(ai[1].value);
+              iSalt = prm[0].value; iIters = 0;
+              for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
+            }
             iEncData = iCh[1].value;
           } else if (iCh[0].tag === 0x06) {
             // OID directo en SEQUENCE exterior (variante SAT)
             iAlgOid = forge.asn1.derToOid(iCh[0].value.toString('binary'));
-            const prm = readBerChildren(iCh[1].value);
-            iSalt = prm[0].value; iIters = 0;
-            for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
+            if (iAlgOid === '1.2.840.113549.1.5.13') {
+              iPbes2AlgId = iCh[1].value;
+            } else {
+              const prm = readBerChildren(iCh[1].value);
+              iSalt = prm[0].value; iIters = 0;
+              for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
+            }
             iEncData = iCh[2]?.value;
           } else {
             throw new Error(`inner primer hijo tag inesperado: 0x${iCh[0].tag.toString(16)}`);
@@ -525,7 +533,43 @@ const parseKey = async (keyBuf, password) => {
           };
 
           let iDecrypted;
-          if (PBES1_M[iAlgOid]) {
+          if (iAlgOid === '1.2.840.113549.1.5.13' && iPbes2AlgId) {
+            // ── PBES2 inner (PKCS#5 §6.2 / RFC 8018): PBKDF2 + AES-CBC ──────────
+            const pbes2Ch   = readBerChildren(iPbes2AlgId);
+            const kdfCh     = readBerChildren(pbes2Ch[0].value);
+            const kdfParams = readBerChildren(kdfCh[1].value);
+            const p2Salt    = kdfParams[0].value;
+            let   p2Iters   = 0;
+            for (let i = 0; i < kdfParams[1].value.length; i++) p2Iters = (p2Iters << 8) | kdfParams[1].value[i];
+            let p2KeyLen = 0;
+            let p2Hash   = 'sha1';
+            let p2i = 2;
+            if (p2i < kdfParams.length && kdfParams[p2i].tag === 0x02) {
+              for (let i = 0; i < kdfParams[p2i].value.length; i++) p2KeyLen = (p2KeyLen << 8) | kdfParams[p2i].value[i];
+              p2i++;
+            }
+            if (p2i < kdfParams.length && kdfParams[p2i].tag === 0x30) {
+              const prfCh  = readBerChildren(kdfParams[p2i].value);
+              const prfOid = forge.asn1.derToOid(prfCh[0].value.toString('binary'));
+              const PRF_HASH = { '1.2.840.113549.2.7': 'sha1', '1.2.840.113549.2.9': 'sha256', '1.2.840.113549.2.11': 'sha384', '1.2.840.113549.2.12': 'sha512' };
+              p2Hash = PRF_HASH[prfOid] || 'sha1';
+            }
+            const encCh  = readBerChildren(pbes2Ch[1].value);
+            const encOid = forge.asn1.derToOid(encCh[0].value.toString('binary'));
+            const PBES2_ENC = {
+              '2.16.840.1.101.3.4.1.2':  { cipher: 'aes-128-cbc', kLen: 16 },
+              '2.16.840.1.101.3.4.1.22': { cipher: 'aes-192-cbc', kLen: 24 },
+              '2.16.840.1.101.3.4.1.42': { cipher: 'aes-256-cbc', kLen: 32 },
+            };
+            const encSpec  = PBES2_ENC[encOid];
+            if (!encSpec) throw new Error(`inner PBES2: cifrado no soportado: ${encOid}`);
+            const p2IV     = encCh[1].value;
+            const p2keyLen = p2KeyLen || encSpec.kLen;
+            const dk = crypto.pbkdf2Sync(Buffer.from(password, 'utf8'), p2Salt, p2Iters, p2keyLen, p2Hash);
+            const dec = crypto.createDecipheriv(encSpec.cipher, dk, p2IV);
+            iDecrypted = Buffer.concat([dec.update(iEncData), dec.final()]);
+            logger.info(`[parseKey] inner PBES2/PBKDF2-${p2Hash}/${encSpec.cipher} iters=${p2Iters}: OK`);
+          } else if (PBES1_M[iAlgOid]) {
             const { hash, cipher, kLen } = PBES1_M[iAlgOid];
             let dk = Buffer.concat([Buffer.from(password, 'utf8'), iSalt]);
             for (let i = 0; i < iIters; i++) dk = crypto.createHash(hash).update(dk).digest();

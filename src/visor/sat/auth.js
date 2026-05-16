@@ -493,10 +493,11 @@ const parseKey = async (keyBuf, password) => {
           if (iCh[0].tag === 0x30) {
             // PKCS#8 EncryptedPrivateKeyInfo: SEQUENCE { [version], AlgorithmIdentifier, OCTET STRING }
             const ai = readBerChildren(iCh[0].value);
-            logger.info(`[parseKey] inner ai: ${ai.length} tags=[${ai.map(c => '0x' + c.tag.toString(16)).join(',')}] ai0val=${ai[0]?.value?.slice(0,10)?.toString('hex')}`);
+            logger.info(`[parseKey] inner ai: len=${ai.length} tags=[${ai.map(c => '0x' + c.tag.toString(16)).join(',')}] sizes=[${ai.map(c => c.value.length).join(',')}]`);
             // Algunas claves incluyen version (INTEGER 0x02) antes del AlgorithmIdentifier
             const hasVersion = ai[0]?.tag === 0x02;
             const algIdNode  = hasVersion ? ai[1] : ai[0];
+            logger.info(`[parseKey] inner hasVersion=${hasVersion} algIdNode.tag=0x${(algIdNode?.tag ?? 0).toString(16)}`);
             // AlgId puede ser SEQUENCE { OID, params } o directamente OID
             let algIdChildren;
             if (algIdNode?.tag === 0x30) {

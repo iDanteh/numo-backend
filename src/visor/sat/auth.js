@@ -491,19 +491,34 @@ const parseKey = async (keyBuf, password) => {
 
           let iAlgOid, iSalt, iIters, iEncData, iPbes2AlgId;
           if (iCh[0].tag === 0x30) {
-            // PKCS#8 EncryptedPrivateKeyInfo: SEQUENCE { AlgorithmIdentifier, OCTET STRING }
+            // PKCS#8 EncryptedPrivateKeyInfo: SEQUENCE { [version], AlgorithmIdentifier, OCTET STRING }
             const ai = readBerChildren(iCh[0].value);
             logger.info(`[parseKey] inner ai: ${ai.length} tags=[${ai.map(c => '0x' + c.tag.toString(16)).join(',')}] ai0val=${ai[0]?.value?.slice(0,10)?.toString('hex')}`);
-            if (!ai.length || ai[0].tag !== 0x06) throw new Error(`inner AlgId inesperado: ai[0].tag=0x${(ai[0]?.tag ?? 0).toString(16)}`);
-            iAlgOid = forge.asn1.derToOid(ai[0].value.toString('binary'));
-            if (iAlgOid === '1.2.840.113549.1.5.13') {
-              iPbes2AlgId = ai[1].value; // PBES2-params raw para parseo posterior
+            // Algunas claves incluyen version (INTEGER 0x02) antes del AlgorithmIdentifier
+            const hasVersion = ai[0]?.tag === 0x02;
+            const algIdNode  = hasVersion ? ai[1] : ai[0];
+            // AlgId puede ser SEQUENCE { OID, params } o directamente OID
+            let algIdChildren;
+            if (algIdNode?.tag === 0x30) {
+              algIdChildren = readBerChildren(algIdNode.value);
+              iAlgOid = forge.asn1.derToOid(algIdChildren[0].value.toString('binary'));
+            } else if (algIdNode?.tag === 0x06) {
+              iAlgOid = forge.asn1.derToOid(algIdNode.value.toString('binary'));
+              algIdChildren = [algIdNode, hasVersion ? ai[2] : ai[1]].filter(Boolean);
             } else {
-              const prm = readBerChildren(ai[1].value);
+              throw new Error(`inner AlgId inesperado: tag=0x${(algIdNode?.tag ?? 0).toString(16)}`);
+            }
+            if (iAlgOid === '1.2.840.113549.1.5.13') {
+              iPbes2AlgId = algIdChildren[1].value; // PBES2-params raw
+            } else {
+              const prm = readBerChildren(algIdChildren[1].value);
               iSalt = prm[0].value; iIters = 0;
               for (let i = 0; i < prm[1].value.length; i++) iIters = (iIters << 8) | prm[1].value[i];
             }
-            iEncData = iCh[1].value;
+            // encData: dentro de iCh[0] si hay version, si no en iCh[1]
+            iEncData = hasVersion ? ai[hasVersion ? 2 : 1]?.value : iCh[1]?.value;
+            if (!iEncData && hasVersion) iEncData = ai[2]?.value;
+            if (!iEncData) iEncData = iCh[1]?.value;
           } else if (iCh[0].tag === 0x06) {
             // OID directo en SEQUENCE exterior (variante SAT)
             iAlgOid = forge.asn1.derToOid(iCh[0].value.toString('binary'));

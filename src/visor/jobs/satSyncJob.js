@@ -442,21 +442,17 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
       checkpoint.totalReportadoSAT = totalReportadoSAT;
       idSolicitud = checkpoint.idSolicitud;
     } catch (rechazadaErr) {
-      if (rechazadaErr.message.startsWith('SAT_RECHAZADA')) {
-        // La solicitud previa (guardada en el checkpoint) ya fue rechazada por el SAT.
-        // No tiene sentido re-verificarla — hay que hacer una solicitud nueva.
-        logger.warn(
-          `[SatSyncJob] Solicitud previa ${checkpoint.idSolicitud} (${tipoComprobante}) rechazada por SAT — ` +
-          `marcando checkpoint como error y solicitando de nuevo...`
-        );
-        await SatJobCheckpoint.updateOne(
-          { _id: checkpoint._id },
-          { $set: { status: 'error', idSolicitud: null, error: rechazadaErr.message, updatedAt: new Date() } }
-        ).catch(() => {});
-        rechazadaCheckpointVerif = true;
-      } else {
-        throw rechazadaErr;
-      }
+      // Cualquier error al re-verificar la solicitud previa (SAT_RECHAZADA, 5004, red, etc.)
+      // implica que esa solicitud ya no es recuperable — limpiar checkpoint y reintentar con solicitud nueva.
+      logger.warn(
+        `[SatSyncJob] Solicitud previa ${checkpoint.idSolicitud} (${tipoComprobante}) no recuperable: ${rechazadaErr.message} — ` +
+        `descartando checkpoint y solicitando de nuevo...`
+      );
+      await SatJobCheckpoint.updateOne(
+        { _id: checkpoint._id },
+        { $set: { status: 'error', idSolicitud: null, error: rechazadaErr.message, updatedAt: new Date() } }
+      ).catch(() => {});
+      rechazadaCheckpointVerif = true;
     }
   }
 

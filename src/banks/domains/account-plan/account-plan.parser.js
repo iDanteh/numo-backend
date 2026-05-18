@@ -118,24 +118,42 @@ async function parseAccountPlanFile(buffer, opts = {}) {
   if (!sheet) throw new Error('No se encontró la hoja de trabajo en el archivo');
 
   // ── Detectar columnas por encabezado ─────────────────────────────────────
+  // Escanea hasta la fila 20 para encontrar la fila con más coincidencias
+  // (necesario para archivos CONTPAQi que tienen títulos antes de los encabezados)
   let colMap = { ...DEFAULT_COL_MAP };
+  let headerRowNum = 1;
 
   if (hasHeader) {
-    const headerRow = sheet.getRow(1);
-    headerRow.eachCell((cell, colNumber) => {
-      const header = normalize(cell.value);
-      for (const [field, aliases] of Object.entries(HEADER_ALIASES)) {
-        if (aliases.includes(header) && colMap[field] === DEFAULT_COL_MAP[field]) {
-          colMap[field] = colNumber;
-          break;
+    let bestMatchCount = 0;
+    const scanLimit = Math.min(20, sheet.rowCount);
+
+    for (let r = 1; r <= scanLimit; r++) {
+      const row = sheet.getRow(r);
+      let matchCount = 0;
+      const tempMap = { ...DEFAULT_COL_MAP };
+
+      row.eachCell((cell, colNumber) => {
+        const header = normalize(cell.value);
+        for (const [field, aliases] of Object.entries(HEADER_ALIASES)) {
+          if (aliases.includes(header)) {
+            tempMap[field] = colNumber;
+            matchCount++;
+            break;
+          }
         }
+      });
+
+      if (matchCount > bestMatchCount) {
+        bestMatchCount = matchCount;
+        headerRowNum = r;
+        colMap = tempMap;
       }
-    });
+    }
   }
 
   // ── Leer filas ────────────────────────────────────────────────────────────
   const rawRows = [];
-  const startRow = hasHeader ? 2 : 1;
+  const startRow = hasHeader ? headerRowNum + 1 : 1;
 
   sheet.eachRow((row, rowNumber) => {
     if (rowNumber < startRow) return;

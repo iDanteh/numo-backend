@@ -350,8 +350,12 @@ const ESTADO_VENCIDA   = '6';
  */
 const MAX_POLLING_INTENTOS = 60; // máximo 60 minutos de espera
 
+const INITIAL_POLLING_DELAY_MS = 15_000; // 15s — el SAT tarda en propagar la solicitud
+
 const verificar = async (idSolicitud, rfcSolicitante, creds) => {
   logger.info(`[SatDownload] Iniciando polling para solicitud ${idSolicitud}...`);
+  logger.info(`[SatDownload] Esperando ${INITIAL_POLLING_DELAY_MS / 1000}s antes del primer intento (propagación SAT)...`);
+  await new Promise(r => setTimeout(r, INITIAL_POLLING_DELAY_MS));
 
   const esperar = () => new Promise(r => setTimeout(r, POLLING_INTERVAL_MS));
   let intentos = 0;
@@ -476,7 +480,12 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
 
     // Errores de verificación aunque el HTTP haya sido exitoso
     if (codEstatus === '5004') {
-      throw new Error(`SAT [5004]: No se encontró la información de la solicitud ${idSolicitud}. Puede que haya expirado o nunca existió.`);
+      // En los primeros 3 intentos el SAT puede aún no haber propagado la solicitud — es transitorio.
+      if (intentos <= 3) {
+        logger.warn(`[SatDownload] SAT 5004 en intento ${intentos} — solicitud no propagada aún. Reintentando en 60s...`);
+      } else {
+        throw new Error(`SAT [5004]: No se encontró la información de la solicitud ${idSolicitud}. Puede que haya expirado o nunca existió.`);
+      }
     }
     if (codEstatus === '5011') {
       throw new Error(`SAT [5011]: Límite de descargas por folio por día alcanzado. Intenta mañana.`);

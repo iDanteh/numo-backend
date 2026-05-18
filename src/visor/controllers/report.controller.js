@@ -4,6 +4,28 @@ const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 
+// Cache in-memory para el dashboard — evita lanzar 15 queries MongoDB
+// en cada carga de pantalla cuando múltiples usuarios consultan al mismo tiempo.
+// TTL de 30 s: suficiente para agrupar clicks rápidos, sin ocultar cambios recientes.
+const DASHBOARD_CACHE_TTL_MS = 30_000;
+const dashboardCache = new Map(); // key → { data, expiresAt }
+
+const getCacheKey = (query) => JSON.stringify(query);
+
+const getFromCache = (key) => {
+  const entry = dashboardCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { dashboardCache.delete(key); return null; }
+  return entry.data;
+};
+
+const setCache = (key, data) => {
+  dashboardCache.set(key, { data, expiresAt: Date.now() + DASHBOARD_CACHE_TTL_MS });
+};
+
+/** Limpia todo el caché del dashboard — llamar tras una comparación batch. */
+const clearDashboardCache = () => dashboardCache.clear();
+
 /**
  * MONTO_EFECTIVO_EXPR — expresión MongoDB para obtener el monto real de un CFDI.
  * Para tipo P (Complemento de Pago) el campo `total` es 0 por spec del SAT;
@@ -28,6 +50,10 @@ const MONTO_EFECTIVO_EXPR = {
  * GET /api/reports/dashboard
  */
 const dashboard = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey(req.query);
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
   const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
 
   const dateFilter = {};
@@ -88,6 +114,7 @@ const dashboard = asyncHandler(async (req, res) => {
 
   const [
     totalCFDIs, conciliados, conDiscrepancia, sinConciliar, notInErp, erpCanceladosCount,
+    notInSat, cancelledMatch,
     vigenteErpSatCount,
     montosAggregate, cfdisBySatStatus, comparisonStats,
     discrepancyStats, topDiscrepancyTypes, recentDiscrepancies,
@@ -95,11 +122,15 @@ const dashboard = asyncHandler(async (req, res) => {
   ] = await Promise.all([
     // Total: solo ERP activos válidos + SAT/MANUAL activos válidos (sin deshabilitados ni SINUUID)
     CFDI.countDocuments({ isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, uuid: { $not: /^SINUUID/ }, satStatus: { $nin: ['Deshabilitado'] }, erpStatus: { $nin: ['Deshabilitado'] }, ...periodoFilter, ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }), ...(Object.keys(dateFilter).length && { fecha: dateFilter }) }),
-    CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: 'match' }),
-    CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['discrepancy', 'warning', 'not_in_sat', 'cancelled'] } }),
+    CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['match', 'conciliado'] } }),
+    CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['discrepancy', 'warning'] } }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: [null, 'error', 'pending'] } }),
     CFDI.countDocuments(satSoloFilter),
     CFDI.countDocuments(canceladosFilter),
+    // ERP CFDIs not found in SAT (distinct from SAT-only)
+    CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: 'not_in_sat' }),
+    // ERP CFDIs marked cancelled/coincide (cancelled in ERP but found in SAT)
+    CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: 'cancelled' }),
     CFDI.aggregate([
       { $match: vigenteErpSatFilter },
       { $group: { _id: null, count: { $sum: 1 }, total: { $sum: '$total' } } },
@@ -112,7 +143,9 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: montosFilter },
       { $addFields: {
         sourceGroup: { $cond: { if: { $in: ['$source', ['SAT', 'MANUAL']] }, then: 'SAT', else: '$source' } },
-        // ERP: solo Timbrado o Habilitado con UUID real; SAT/MANUAL: solo Vigente
+        // ERP: (Timbrado o Habilitado) + UUID válido → suma en ERP aunque SAT diga Cancelado
+        // SAT/MANUAL: solo Vigente
+        // La discrepancia ERP-Timbrado/Habilitado vs SAT-Cancelado la registra el comparador
         excluir: { $cond: {
           if:   { $eq: ['$source', 'ERP'] },
           then: { $or: [
@@ -139,8 +172,10 @@ const dashboard = asyncHandler(async (req, res) => {
     // La colección Comparison acumula registros históricos de sesiones batch y no
     // es confiable para contar el estado actual — un CFDI puede tener múltiples
     // registros Comparison de distintas sesiones con estados contradictorios.
+    // IMPORTANTE: filtrar source='ERP' para evitar contar doble — el engine escribe
+    // lastComparisonStatus en AMBOS documentos (ERP y SAT) del mismo UUID.
     CFDI.aggregate([
-      { $match: { isActive: { $ne: false }, uuid: { $not: /^SINUUID/ }, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }), ...(periodoFilter.tipoDeComprobante && { tipoDeComprobante: periodoFilter.tipoDeComprobante }) } },
+      { $match: { source: 'ERP', isActive: { $ne: false }, uuid: { $not: /^SINUUID/ }, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }), ...(periodoFilter.tipoDeComprobante && { tipoDeComprobante: periodoFilter.tipoDeComprobante }) } },
       { $group: { _id: '$lastComparisonStatus', count: { $sum: 1 } } },
     ]),
     Discrepancy.aggregate([
@@ -250,9 +285,10 @@ const dashboard = asyncHandler(async (req, res) => {
     byTipo,
   };
 
-  res.json({
+  const responseData = {
     kpis: {
       totalCFDIs, conciliados, conDiscrepancia, sinConciliar, notInErp, erpCanceladosCount,
+      notInSat, cancelledMatch,
       vigenteErpSat: { count: vigenteErpSatRow.count, total: vigenteErpSatRow.total },
       totalERP, totalSAT, diferencia: totalERP - totalSAT,
       countERP, countSAT,
@@ -264,7 +300,10 @@ const dashboard = asyncHandler(async (req, res) => {
     },
     topDiscrepancyTypes,
     recentDiscrepancies,
-  });
+  };
+
+  setCache(cacheKey, responseData);
+  res.json(responseData);
 });
 
 /**
@@ -382,28 +421,6 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * GET /api/reports/debug-discrepancias-montos — temporal, solo para diagnóstico
- */
-const debugDiscrepanciasMontos = asyncHandler(async (req, res) => {
-  const [porStatus, total, muestra] = await Promise.all([
-    Comparison.aggregate([
-      { $match: { 'differences.field': { $in: CAMPOS_MONTO } } },
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]),
-    Comparison.countDocuments({ 'differences.field': { $in: CAMPOS_MONTO } }),
-    Comparison.find({ 'differences.field': { $in: CAMPOS_MONTO } })
-      .select('uuid status differences criticalCount')
-      .limit(3).lean()
-      .then(docs => docs.map(d => ({
-        uuid: d.uuid,
-        status: d.status,
-        criticalCount: d.criticalCount,
-        camposMontoEncontrados: (d.differences ?? []).filter(x => CAMPOS_MONTO.includes(x.field)).map(x => x.field),
-      }))),
-  ]);
-  res.json({ total, porStatus, muestra });
-});
 
 /**
  * GET /api/reports/export/excel
@@ -467,32 +484,6 @@ const exportExcel = asyncHandler(async (req, res) => {
   res.end();
 });
 
-/**
- * GET /api/reports/debug-montos  — temporal, solo para diagnóstico
- */
-const debugMontos = asyncHandler(async (req, res) => {
-  const [bySource, sample] = await Promise.all([
-    // Conteo y suma por source, sin ningún filtro extra
-    CFDI.aggregate([
-      { $group: {
-        _id: '$source',
-        count: { $sum: 1 },
-        totalSum: { $sum: '$total' },
-        totalSumConverted: { $sum: { $convert: { input: '$total', to: 'double', onError: 0, onNull: 0 } } },
-        activeCount:   { $sum: { $cond: [{ $eq: ['$isActive', true]  }, 1, 0] } },
-        inactiveCount: { $sum: { $cond: [{ $eq: ['$isActive', false] }, 1, 0] } },
-        nullCount:     { $sum: { $cond: [{ $eq: ['$isActive', null]  }, 1, 0] } },
-        totalZeroCount: { $sum: { $cond: [{ $lte: ['$total', 0] }, 1, 0] } },
-      }},
-    ]),
-    // Muestra los primeros 5 documentos no-ERP con sus campos relevantes
-    CFDI.find(
-      { source: { $ne: 'ERP' } },
-      { uuid: 1, source: 1, total: 1, isActive: 1, tipoDeComprobante: 1, fecha: 1 }
-    ).limit(5).lean(),
-  ]);
-  res.json({ bySource, sample });
-});
 
 /**
  * GET /api/reports/sat-vigente-erp-inactivo
@@ -792,7 +783,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
   const TIPO_LABEL    = { I: 'Ingreso', E: 'Egreso', P: 'Pago', T: 'Traslado', N: 'Nómina' };
   const SEV_LABEL     = { critical: 'Crítica', high: 'Alta', warning: 'Advertencia', medium: 'Media', low: 'Baja' };
-  const COMP_LABEL    = { match: 'Conciliado', discrepancy: 'Discrepancia', warning: 'Advertencia', not_in_sat: 'No en SAT', not_in_erp: 'No en ERP', cancelled: 'Cancelado', pending: 'Pendiente', error: 'Error' };
+  const COMP_LABEL    = { match: 'Conciliado', conciliado: 'Conciliado manualmente', discrepancy: 'Discrepancia', warning: 'Advertencia', not_in_sat: 'No en SAT', not_in_erp: 'No en ERP', cancelled: 'Cancelado', pending: 'Pendiente', error: 'Error' };
   const CAMPO_LABEL   = { 'total': 'Total', 'subTotal': 'Subtotal', 'impuestos.totalImpuestosTrasladados': 'IVA Trasladado', 'impuestos.totalImpuestosRetenidos': 'IVA Retenido', 'emisor.rfc': 'RFC Emisor', 'receptor.rfc': 'RFC Receptor', 'fecha': 'Fecha', 'tipoDeComprobante': 'Tipo', 'moneda': 'Moneda', 'tipoCambio': 'Tipo Cambio' };
   const MESES         = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
   const periodoLabel  = ejercicio ? (periodo ? `${MESES[parseInt(periodo)-1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
@@ -839,7 +830,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
         totalMonto:      { $sum: MONTO_EFECTIVO_EXPR },
         ivaTrasladadoTotal: { $sum: { $ifNull: ['$impuestos.totalImpuestosTrasladados', 0] } },
         ivaRetenidoTotal:   { $sum: { $ifNull: ['$impuestos.totalImpuestosRetenidos',   0] } },
-        conciliados:     { $sum: { $cond: [{ $eq: ['$lastComparisonStatus', 'match'] }, 1, 0] } },
+        conciliados:     { $sum: { $cond: [{ $in: ['$lastComparisonStatus', ['match', 'conciliado']] }, 1, 0] } },
         conDiscrepancia: { $sum: { $cond: [{ $in: ['$lastComparisonStatus', ['discrepancy','warning']] }, 1, 0] } },
         notInSat:        { $sum: { $cond: [{ $eq: ['$lastComparisonStatus', 'not_in_sat'] }, 1, 0] } },
         sinConciliar:    { $sum: { $cond: [{ $in: ['$lastComparisonStatus', [null,'error','pending']] }, 1, 0] } },
@@ -1168,7 +1159,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       } else if (cs === 'discrepancy' || cs === 'warning' || discs.length > 0) {
         // Discrepancia de campo sin diferencia de monto → amarillo
         row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_WARN; });
-      } else if (cs === 'match') {
+      } else if (cs === 'match' || cs === 'conciliado') {
         // Conciliado → solo celda de estado en verde
         row.getCell('conciliacion').fill = FG_OK;
       }
@@ -1573,4 +1564,4 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, exportExcel, debugMontos, discrepanciasMontos, debugDiscrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel };
+module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache };

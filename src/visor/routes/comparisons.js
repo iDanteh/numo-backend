@@ -6,7 +6,7 @@ const rateLimit  = require('express-rate-limit');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   ejerciciosResumen, periodos, list, stats,
-  listSessions, getSession, getById, batch, resolve,
+  listSessions, getSession, getById, batch, resolve, conciliarNotInErp,
 } = require('../controllers/comparison.controller');
 
 const router = express.Router();
@@ -44,6 +44,20 @@ router.patch('/:id/resolve',
   permit('visor:write'),
   [body('resolutionNotes').optional().isString()],
   resolve,
+);
+
+router.post('/conciliar-not-in-erp',
+  authenticate,
+  permit('visor:write'),
+  [
+    body('cfdiId').isMongoId().withMessage('cfdiId inválido'),
+    body('causa').isIn([
+      'proveedor_sin_registro', 'cancelada_antes_de_registro', 'periodo_anterior',
+      'factura_global_sat', 'error_descarga_sat', 'tercero_sin_impacto', 'otra',
+    ]).withMessage('causa inválida'),
+    body('notas').isString().trim().notEmpty().withMessage('notas requeridas').isLength({ max: 500 }),
+  ],
+  conciliarNotInErp,
 );
 
 module.exports = router;

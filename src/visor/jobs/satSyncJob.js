@@ -11,7 +11,7 @@ const { compareCFDI } = require('../services/comparisonEngine');
 const { compararArrays } = require('../services/comparisonEngine');
 const { parseCFDI, normalizarCFDI } = require('../services/cfdiParser');
 const { solicitar, verificar, descargarPaquete, descargarPaqueteMetadata } = require('../sat/download');
-const { obtener, eliminar, tieneCredenciales } = require('../sat/credenciales');
+const { obtener, tieneCredenciales } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin } = require('../sat/rateLimiter');
 const { derivarPeriodoDesdeFecha, resolverPeriodo, resolverOCrearPeriodo } = require('../services/periodoFiscal.service');
 const { logger } = require('../../shared/utils/logger');
@@ -300,14 +300,20 @@ const ejecutarDescargaMasiva = async () => {
       // ── 2. Descargar emitidos y/o recibidos ─────────────────────────────
       const tipos = [];
       if (entidad.syncConfig?.syncEmitidos !== false) tipos.push('Emitidos');
-      if (entidad.syncConfig?.syncRecibidos) tipos.push('Recibidos');
+      tipos.push('Recibidos');
       if (tipos.length === 0) tipos.push('Emitidos');
 
-      // Tipos del diario: solo Ingresos, Egresos y Pagos (sin Nómina ni Traslados)
-      const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos'];
+      // Tipos del diario: Ingresos, Egresos, Pagos y Nómina
+      const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
 
-      for (const tipoComprobante of tipos) {
-        // El diario descarga Emitidos en 3 sub-solicitudes SAT; Recibidos es 1
+      for (let _ti = 0; _ti < tipos.length; _ti++) {
+        const tipoComprobante = tipos[_ti];
+        // Esperar 2 horas entre Emitidos y Recibidos para liberar cupo SAT
+        if (_ti > 0 && tipoComprobante === 'Recibidos') {
+          logger.info(`[SatSyncJob] RFC ${rfc}: esperando 45min antes de descargar Recibidos...`);
+          await new Promise(r => setTimeout(r, 45 * 60 * 1000));
+        }
+        // El diario descarga Emitidos en 4 sub-solicitudes SAT; Recibidos es 1
         const solicitudesNecesarias = tipoComprobante === 'Emitidos' ? TIPOS_DIARIO.length : 1;
         const limitCheck = await puedeIniciar(rfc, solicitudesNecesarias);
         if (!limitCheck.puede) {
@@ -341,14 +347,8 @@ const ejecutarDescargaMasiva = async () => {
 
     } catch (err) {
       logger.error(`[SatSyncJob] Error procesando RFC ${rfc}: ${err.message}`);
-    } finally {
-      // ── 5. Eliminar credenciales siempre ──────────────────────────────
-      try {
-        await eliminar(rfc);
-      } catch (delErr) {
-        logger.error(`[SatSyncJob] Error eliminando credenciales de ${rfc}: ${delErr.message}`);
-      }
     }
+    // Las credenciales expiran automáticamente a las 8 horas via TTL de MongoDB.
   }
 
   logger.info('[SatSyncJob] Descarga masiva nocturna completada.');
@@ -442,21 +442,17 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
       checkpoint.totalReportadoSAT = totalReportadoSAT;
       idSolicitud = checkpoint.idSolicitud;
     } catch (rechazadaErr) {
-      if (rechazadaErr.message.startsWith('SAT_RECHAZADA')) {
-        // La solicitud previa (guardada en el checkpoint) ya fue rechazada por el SAT.
-        // No tiene sentido re-verificarla — hay que hacer una solicitud nueva.
-        logger.warn(
-          `[SatSyncJob] Solicitud previa ${checkpoint.idSolicitud} (${tipoComprobante}) rechazada por SAT — ` +
-          `marcando checkpoint como error y solicitando de nuevo...`
-        );
-        await SatJobCheckpoint.updateOne(
-          { _id: checkpoint._id },
-          { $set: { status: 'error', idSolicitud: null, error: rechazadaErr.message, updatedAt: new Date() } }
-        ).catch(() => {});
-        rechazadaCheckpointVerif = true;
-      } else {
-        throw rechazadaErr;
-      }
+      // Cualquier error al re-verificar la solicitud previa (SAT_RECHAZADA, 5004, red, etc.)
+      // implica que esa solicitud ya no es recuperable — limpiar checkpoint y reintentar con solicitud nueva.
+      logger.warn(
+        `[SatSyncJob] Solicitud previa ${checkpoint.idSolicitud} (${tipoComprobante}) no recuperable: ${rechazadaErr.message} — ` +
+        `descartando checkpoint y solicitando de nuevo...`
+      );
+      await SatJobCheckpoint.updateOne(
+        { _id: checkpoint._id },
+        { $set: { status: 'error', idSolicitud: null, error: rechazadaErr.message, updatedAt: new Date() } }
+      ).catch(() => {});
+      rechazadaCheckpointVerif = true;
     }
   }
 
@@ -729,7 +725,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
     // En modo XML + Emitidos: dividir por sub-tipo.
     // tiposEmitidosSplit permite al caller restringir qué sub-tipos se solicitan
     // (ej. el job diario solo pide Ingresos, Egresos y Pagos).
-    const TIPOS_SPLIT_EMITIDOS = tiposEmitidosSplit ?? ['Ingresos', 'Egresos', 'Pagos', 'Nomina', 'Traslados'];
+    const TIPOS_SPLIT_EMITIDOS = tiposEmitidosSplit ?? ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
     const tiposADescargar = (modoFinal === 'CFDI' && tipoComprobante === 'Emitidos')
       ? TIPOS_SPLIT_EMITIDOS
       : [tipoComprobante];
@@ -1261,6 +1257,105 @@ const jobComparacionAuto = async () => {
 };
 
 /**
+ * Job horario: re-consulta el estado SAT de CFDIs que en el ERP aparecen como
+ * "Cancelacion Pendiente", "Cancelado" o "Deshabilitado" pero cuyo satStatus
+ * sigue siendo "Vigente".
+ *
+ * Escenario típico: el cliente cancela la factura en el ERP pero el SAT aún
+ * no ha procesado la solicitud (o el campo satStatus nunca se actualizó).
+ * Este job garantiza que el satStatus refleje la realidad del SAT.
+ */
+const ejecutarVerificacionEstadosCriticos = async () => {
+  logger.info('[VerifCriticos] Iniciando verificación horaria de estados críticos...');
+
+  const cfdis = await CFDI.find(
+    {
+      source:    'ERP',
+      isActive:  true,
+      erpStatus: { $in: ['Cancelacion Pendiente', 'Cancelado', 'Deshabilitado'] },
+      satStatus: 'Vigente',
+    },
+    '_id uuid emisor receptor total version sello timbreFiscalDigital tipoDeComprobante erpStatus',
+  ).lean();
+
+  if (cfdis.length === 0) {
+    logger.info('[VerifCriticos] Sin CFDIs con estado crítico pendiente de verificar.');
+    return;
+  }
+
+  logger.info(`[VerifCriticos] ${cfdis.length} CFDI(s) a verificar contra SAT.`);
+
+  let actualizados = 0, sinCambio = 0, omitidos = 0, errores = 0;
+
+  for (const cfdi of cfdis) {
+    // RFCs con & no son consultables vía SOAP (el servicio no decodifica %26)
+    const rfcConAmpersand = (cfdi.emisor?.rfc || '').includes('&') || (cfdi.receptor?.rfc || '').includes('&');
+    if (rfcConAmpersand) {
+      omitidos++;
+      continue;
+    }
+
+    if (!cfdi.emisor?.rfc || !cfdi.receptor?.rfc) {
+      logger.warn(`[VerifCriticos] CFDI ${cfdi.uuid} sin emisor/receptor — omitido`);
+      omitidos++;
+      continue;
+    }
+
+    try {
+      const sello  = cfdi.timbreFiscalDigital?.selloCFD || cfdi.sello || '';
+      const result = await verifyCFDIWithSAT(
+        cfdi.uuid,
+        cfdi.emisor.rfc,
+        cfdi.receptor.rfc,
+        cfdi.total,
+        sello,
+        cfdi.version || '4.0',
+        cfdi.tipoDeComprobante,
+      );
+
+      const nuevoEstado = result.state; // 'Vigente' | 'Cancelado' | 'No Encontrado' | ...
+
+      if (nuevoEstado !== 'Vigente') {
+        // El SAT ya no lo reporta como Vigente — actualizar ambos documentos (ERP y SAT)
+        await CFDI.updateMany(
+          { uuid: cfdi.uuid },
+          { $set: { satStatus: nuevoEstado, satLastCheck: new Date() } },
+        );
+        logger.info(
+          `[VerifCriticos] ${cfdi.uuid} (ERP: ${cfdi.erpStatus}) → SAT: ${nuevoEstado} ` +
+          `(antes: Vigente) — actualizado`,
+        );
+        actualizados++;
+      } else {
+        // El SAT sigue reportando Vigente; solo actualizar la fecha de chequeo
+        await CFDI.updateMany(
+          { uuid: cfdi.uuid },
+          { $set: { satLastCheck: new Date() } },
+        );
+        sinCambio++;
+      }
+
+      await new Promise(r => setTimeout(r, 500)); // respetar rate del SAT
+    } catch (err) {
+      errores++;
+      logger.error(`[VerifCriticos] Error verificando ${cfdi.uuid}: ${err.message}`);
+    }
+  }
+
+  logger.info(
+    `[VerifCriticos] Completado — actualizados: ${actualizados}, sin cambio: ${sinCambio}, ` +
+    `omitidos: ${omitidos}, errores: ${errores}`,
+  );
+};
+
+// Job horario fijo — no configurable por el usuario (se programa independientemente
+// de reprogramarJobs para que no sea destruido al cambiar los horarios nocturnos).
+cron.schedule('0 * * * *', async () => {
+  try { await ejecutarVerificacionEstadosCriticos(); }
+  catch (err) { logger.error(`[VerifCriticos] Error fatal: ${err.message}`); }
+}, { timezone: 'America/Mexico_City' });
+
+/**
  * (Re)programa los cuatro jobs con los horarios indicados.
  * Llamado al arrancar la app y cuando el usuario cambia el horario via API.
  */
@@ -1307,4 +1402,4 @@ const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVeri
   }
 })();
 
-module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, procesarDescarga, reprogramarJobs };
+module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs };

@@ -5,7 +5,7 @@
  *  - Cifrado: AES-256-GCM con IV aleatorio de 12 bytes por cada operación.
  *  - Clave maestra: CREDS_MASTER_KEY (32 bytes en hex) desde variables de entorno.
  *  - Formato almacenado: iv:authTag:datosCifrados (todo en hex).
- *  - TTL: 8 horas, expiración automática via índice MongoDB.
+ *  - TTL: 3 días, expiración automática via índice MongoDB.
  *  - Las credenciales se eliminan al terminar cualquier job (éxito o fallo).
  *  - Nunca se loggea contenido de credenciales.
  *  - Los Buffers en memoria se limpian (fill 0) tras su uso.
@@ -215,7 +215,7 @@ const tieneCredenciales = async (rfc) => {
   const doc = await SATCredencial.findOne({ rfc: rfcNorm }, 'createdAt');
   if (!doc) return { tiene: false, ttlSegundos: null };
 
-  const TTL_MS      = 8 * 60 * 60 * 1000;
+  const TTL_MS      = 3 * 24 * 60 * 60 * 1000;
   const expiraEn    = doc.createdAt.getTime() + TTL_MS;
   const ttlSegundos = Math.max(0, Math.floor((expiraEn - Date.now()) / 1000));
 

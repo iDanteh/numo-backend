@@ -1,13 +1,24 @@
 'use strict';
 
 const express = require('express');
+const multer  = require('multer');
 const axios   = require('axios');
 const { authenticate, permit }           = require('../../shared/middleware/auth.real');
 const { asyncHandler }                   = require('../../shared/middleware/error-handler');
 const { sincronizarCuentasPendientes }   = require('./erp-sync.service');
+const { procesarRefacturacionesCyc }     = require('./refacturaciones-cyc.service');
 const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const ErpCuentaPendiente                 = require('./ErpCuentaPendiente.model');
 const BankMovement                       = require('../banks/BankMovement.model');
+
+const uploadCyc = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /\.(xlsx|xls)$/i.test(file.originalname);
+    cb(ok ? null : new Error('Solo se aceptan archivos Excel (.xlsx, .xls)'), ok);
+  },
+});
 
 const router = express.Router();
 
@@ -201,5 +212,30 @@ router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(as
     message:  `${result.modifiedCount} asociación(es) revertida(s)`,
   });
 }));
+
+// ── POST /api/erp/refacturaciones-cyc/upload ─────────────────────────────────
+// Procesa el Excel "REFACTURACIONES CYC":
+//   • Columna 1 CONCEPTO    → tokens numéricos para encontrar el BankMovement
+//   • Columna 2 IMPORTE     → validación de monto (tolerancia ±$1 MXN)
+//   • Columna 3 BANCO       → preferencia de banco en la búsqueda
+//   • Columna 4 SERIE/FOLIO → lookup exacto de ErpCuentaPendiente (determinístico)
+//
+// Responde con { total, auto, review, escritos, errors, detalleNoMatcheados }
+// Los "auto"   se vinculan en DB inmediatamente (Tier 1: auth + importe).
+// Los "review" NO se escriben en DB; se retornan para revisión manual.
+router.post('/refacturaciones-cyc/upload',
+  authenticate,
+  permit('banks:import'),
+  uploadCyc.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+    const result = await procesarRefacturacionesCyc(
+      req.file.buffer,
+      req.user._id,
+      req.user.nombre,
+    );
+    res.json(result);
+  }),
+);
 
 module.exports = router;

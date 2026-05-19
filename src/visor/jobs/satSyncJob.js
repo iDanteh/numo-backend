@@ -248,17 +248,49 @@ const ejecutarComparacionAuto = async ({ ejercicioParam, periodoParam } = {}) =>
 const ejecutarDescargaMasiva = async () => {
   logger.info('[SatSyncJob] Iniciando descarga masiva nocturna...');
 
-  // Rango: día anterior completo en hora de México (el SAT usa CDMX como referencia)
+  // Fechas en hora de México (el SAT usa CDMX como referencia)
   const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
-  const hoyMXStr  = fmtMX.format(new Date());                          // 'YYYY-MM-DD' de hoy en CDMX
-  const ayerDate  = new Date(`${hoyMXStr}T12:00:00`);                  // mediodía para evitar DST
+  const hoyMXStr = fmtMX.format(new Date());
+  const [anoHoy, mesHoy, diaHoy] = hoyMXStr.split('-').map(Number);
+
+  // Ayer
+  const ayerDate = new Date(`${hoyMXStr}T12:00:00`);
   ayerDate.setDate(ayerDate.getDate() - 1);
-  const ayerMXStr = fmtMX.format(ayerDate);                            // 'YYYY-MM-DD' de ayer en CDMX
-  const [anoStr, mesStr] = ayerMXStr.split('-');
-  const ejercicio  = parseInt(anoStr, 10);
-  const periodo    = parseInt(mesStr, 10);
-  const fechaInicio = `${ayerMXStr}T00:00:00`;
-  const fechaFin    = `${ayerMXStr}T23:59:59`;
+  const ayerMXStr = fmtMX.format(ayerDate);
+
+  // Hace 3 días
+  const tresDate = new Date(`${hoyMXStr}T12:00:00`);
+  tresDate.setDate(tresDate.getDate() - 3);
+  const tresMXStr = fmtMX.format(tresDate);
+
+  // ejercicio/periodo derivados de ayer (mes del fin del rango diario)
+  const ejercicio = parseInt(ayerMXStr.split('-')[0], 10);
+  const periodo   = parseInt(ayerMXStr.split('-')[1], 10);
+
+  // ── Rangos de descarga ───────────────────────────────────────────────────────
+  // Siempre: últimos 3 días, XMLs completos (tipoSolicitud forzado a 'CFDI')
+  const rangos = [
+    {
+      fechaInicio:    `${tresMXStr}T00:00:00`,
+      fechaFin:       `${ayerMXStr}T23:59:59`,
+      tipoSolicitud:  'CFDI',
+      label: `últimos 3 días (${tresMXStr} → ${ayerMXStr})`,
+    },
+  ];
+
+  // Del día 15 al último día del mes: repaso completo desde el 1ro, XMLs completos
+  if (diaHoy >= 15) {
+    const mesStrPad = String(mesHoy).padStart(2, '0');
+    const primero   = `${anoHoy}-${mesStrPad}-01`;
+    rangos.push({
+      fechaInicio:   `${primero}T00:00:00`,
+      fechaFin:      `${ayerMXStr}T23:59:59`,
+      tipoSolicitud: 'CFDI',
+      label: `repaso mensual (${primero} → ${ayerMXStr})`,
+    });
+    logger.info(`[SatSyncJob] Día ${diaHoy}: se agrega repaso mensual desde ${primero}.`);
+  }
+
   try {
     const { creado } = await resolverOCrearPeriodo(ejercicio, periodo);
     if (creado) logger.info(`[SatSyncJob] Periodo ${periodo}/${ejercicio} creado automáticamente.`);
@@ -266,7 +298,7 @@ const ejecutarDescargaMasiva = async () => {
     logger.error(`[SatSyncJob] No se pudo resolver el periodo ${periodo}/${ejercicio}: ${err.message}. Descarga cancelada.`);
     return;
   }
-  logger.info(`[SatSyncJob] Periodo fiscal validado: ${ejercicio}/${periodo}`);
+  logger.info(`[SatSyncJob] Periodo fiscal validado: ${ejercicio}/${periodo} | ${rangos.length} rango(s) programado(s).`);
 
   // Entidades con descarga nocturna habilitada (PostgreSQL)
   const entidades = await entityRepo.findWithAutoSync();
@@ -277,6 +309,9 @@ const ejecutarDescargaMasiva = async () => {
   }
 
   logger.info(`[SatSyncJob] Procesando ${entidades.length} entidad(es)...`);
+
+  // Tipos del diario: Ingresos, Egresos, Pagos y Nómina
+  const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
 
   for (const entidad of entidades) {
     const rfc = entidad.rfc;
@@ -297,46 +332,44 @@ const ejecutarDescargaMasiva = async () => {
         continue;
       }
 
-      // ── 2. Descargar emitidos y/o recibidos ─────────────────────────────
-      const tipos = [];
-      if (entidad.syncConfig?.syncEmitidos !== false) tipos.push('Emitidos');
-      tipos.push('Recibidos');
-      if (tipos.length === 0) tipos.push('Emitidos');
+      // ── 2. Procesar cada rango de fechas ─────────────────────────────────
+      for (const rango of rangos) {
+        logger.info(`[SatSyncJob] RFC ${rfc}: procesando rango "${rango.label}"`);
 
-      // Tipos del diario: Ingresos, Egresos, Pagos y Nómina
-      const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
+        // Solo Emitidos (Recibidos desactivado — error 301 del SAT)
+        const tipos = [];
+        if (entidad.syncConfig?.syncEmitidos !== false) tipos.push('Emitidos');
+        if (tipos.length === 0) tipos.push('Emitidos');
 
-      for (let _ti = 0; _ti < tipos.length; _ti++) {
-        const tipoComprobante = tipos[_ti];
-        // Esperar 2 horas entre Emitidos y Recibidos para liberar cupo SAT
-        if (_ti > 0 && tipoComprobante === 'Recibidos') {
-          logger.info(`[SatSyncJob] RFC ${rfc}: esperando 45min antes de descargar Recibidos...`);
-          await new Promise(r => setTimeout(r, 45 * 60 * 1000));
-        }
-        // El diario descarga Emitidos en 4 sub-solicitudes SAT; Recibidos es 1
-        const solicitudesNecesarias = tipoComprobante === 'Emitidos' ? TIPOS_DIARIO.length : 1;
-        const limitCheck = await puedeIniciar(rfc, solicitudesNecesarias);
-        if (!limitCheck.puede) {
-          logger.warn(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): descarga nocturna bloqueada — ${limitCheck.razon}`);
-          continue;
-        }
-        let iniciado = false;
-        try {
-          await registrarInicio(rfc, solicitudesNecesarias);
-          iniciado = true;
-          await procesarDescarga({
-            rfc, fechaInicio, fechaFin, tipoComprobante, creds,
-            ejercicio, periodo,
-            // El job diario solo descarga estos 3 tipos de emitidos
-            tiposEmitidosSplit: tipoComprobante === 'Emitidos' ? TIPOS_DIARIO : undefined,
-          });
-        } catch (descErr) {
-          // Los checkpoints de sub-tipos ya se actualizan dentro de descargarPorSubtipo.
-          // Solo logueamos el error; no creamos un checkpoint fantasma para 'Emitidos'.
-          logger.error(`[SatSyncJob] RFC ${rfc} (${tipoComprobante}): ${descErr.message}`);
-          throw descErr;
-        } finally {
-          if (iniciado) registrarFin(rfc);
+        for (const tipoComprobante of tipos) {
+          // Cada Emitidos se divide en 4 sub-solicitudes SAT
+          const solicitudesNecesarias = tipoComprobante === 'Emitidos' ? TIPOS_DIARIO.length : 1;
+          const limitCheck = await puedeIniciar(rfc, solicitudesNecesarias);
+          if (!limitCheck.puede) {
+            logger.warn(`[SatSyncJob] RFC ${rfc} (${tipoComprobante} / ${rango.label}): bloqueado — ${limitCheck.razon}`);
+            continue;
+          }
+          let iniciado = false;
+          try {
+            await registrarInicio(rfc, solicitudesNecesarias);
+            iniciado = true;
+            await procesarDescarga({
+              rfc,
+              fechaInicio:   rango.fechaInicio,
+              fechaFin:      rango.fechaFin,
+              tipoSolicitud: rango.tipoSolicitud,
+              tipoComprobante,
+              creds,
+              ejercicio,
+              periodo,
+              tiposEmitidosSplit: tipoComprobante === 'Emitidos' ? TIPOS_DIARIO : undefined,
+            });
+          } catch (descErr) {
+            logger.error(`[SatSyncJob] RFC ${rfc} (${tipoComprobante} / ${rango.label}): ${descErr.message}`);
+            throw descErr;
+          } finally {
+            if (iniciado) registrarFin(rfc);
+          }
         }
       }
 
@@ -397,7 +430,7 @@ const normalizarMetadato = (row) => {
  * @param {string} [tipoSolicitud='CFDI']  — 'CFDI' para XMLs completos, 'Metadata' para metadatos TXT.
  * Retorna { rows: [], paquetes: number, totalReportado: number, esMetadata: boolean }
  */
-const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, periodo, tipoComprobante, creds, tipoSolicitud = 'CFDI' }) => {
+const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, periodo, tipoComprobante, creds, tipoSolicitud = 'CFDI', folioFiscalUUID }) => {
   const esMetadata  = tipoSolicitud === 'Metadata';
   // Incluir modo en la clave del checkpoint para no mezclar XML con metadata
   const cpTipo = esMetadata ? `${tipoComprobante}_Metadata` : tipoComprobante;
@@ -505,7 +538,7 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
         { $set: { ejercicio, periodo, status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], error: null, updatedAt: new Date() } },
         { upsert: true, new: true },
       );
-      idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds });
+      idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, folioFiscalUUID });
       await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
 
       try {
@@ -677,7 +710,7 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
  * @param {Function} [onPaso]   — Callback opcional (paso: number) para reportar progreso al frontend.
  *                                Pasos: 1=Autenticando, 3=Verificando, 4=Descargando, 5=Procesando.
  */
-const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica', tiposEmitidosSplit }) => {
+const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica', tiposEmitidosSplit, folioFiscalUUID }) => {
   logger.info(`[SatSyncJob] RFC ${rfc} — solicitando ${tipoComprobante} ${fechaInicio.slice(0, 10)}`);
 
   const fecha = fechaInicio.slice(0, 10); // YYYY-MM-DD
@@ -759,6 +792,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
         const { rows: r, paquetes, totalReportado, esMetadata: modoMeta } = await descargarPorSubtipo({
           rfc, fechaInicio, fechaFin, ejercicio, periodo,
           tipoComprobante: tipoActual, creds, tipoSolicitud: modoFinal,
+          folioFiscalUUID,
         });
 
         totalPaquetes     += paquetes;
@@ -790,7 +824,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
             ...tipoFiltroERP,
             [campoRfc]: rfc.toUpperCase(),
             fecha: { $gte: inicioDelDia, $lte: finDelDia },
-          }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus').lean();
+          }, 'uuid serie folio fecha emisor receptor subTotal total moneda tipoDeComprobante satStatus impuestos complementoPago').lean();
 
           const cfdisERPTipo = cfdisERPDocs.map(normalizarCFDI);
           const { coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid } = compararArrays(cfdisSATTipo, cfdisERPTipo);

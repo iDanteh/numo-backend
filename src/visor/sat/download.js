@@ -214,7 +214,7 @@ const TIPO_MAP = {
 };
 
 const solicitar = async (params) => {
-  const { rfcSolicitante, fechaInicio, fechaFin, tipoSolicitud = 'CFDI', tipoComprobante = 'Emitidos', creds } = params;
+  const { rfcSolicitante, fechaInicio, fechaFin, tipoSolicitud = 'CFDI', tipoComprobante = 'Emitidos', creds, folioFiscalUUID } = params;
 
   const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
   const rfcFirma = rfcCertificado ?? rfcSolicitante;
@@ -235,10 +235,9 @@ const solicitar = async (params) => {
       RfcSolicitante: rfcFirmaUsado,
       TipoSolicitud:  tipoSolicitud,
     };
-    if (tipoDeComprobante) solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
-    // El SAT no permite descargar XMLs cancelados en solicitudes de Recibidos (error 301).
-    // Se limita a vigentes para evitar el rechazo.
-    if (esRecibidosReq) solicitudAttrs.EstadoComprobante = '1';
+    if (tipoDeComprobante)  solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
+    if (esRecibidosReq)     solicitudAttrs.EstadoComprobante = '1';
+    if (folioFiscalUUID)    solicitudAttrs.FolioFiscalUUID   = folioFiscalUUID.toUpperCase();
 
     const canonical = canonizarSolicitud(solicitudAttrs, ns);
     logger.info(`[SatDownload] solicitar() — canonical solicitud: ${canonical}`);
@@ -250,13 +249,14 @@ const solicitar = async (params) => {
 
     const tipoAttr   = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
     const estadoAttr = esRecibidosReq ? ' EstadoComprobante="1"' : '';
+    const uuidAttr   = folioFiscalUUID ? ` FolioFiscalUUID="${folioFiscalUUID.toUpperCase()}"` : '';
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${ns}">
   <s:Header/>
   <s:Body>
     <des:${operacion}>
-      <des:solicitud${estadoAttr} FechaFinal="${fechaFin}" FechaInicial="${fechaInicio}" ${rfcAttrKey}="${rfcSolicitante}" RfcSolicitante="${rfcFirmaUsado}"${tipoAttr} TipoSolicitud="${tipoSolicitud}">
+      <des:solicitud${estadoAttr}${uuidAttr} FechaFinal="${fechaFin}" FechaInicial="${fechaInicio}" ${rfcAttrKey}="${rfcSolicitante}" RfcSolicitante="${rfcFirmaUsado}"${tipoAttr} TipoSolicitud="${tipoSolicitud}">
         ${firma}
       </des:solicitud>
     </des:${operacion}>

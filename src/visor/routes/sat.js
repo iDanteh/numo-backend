@@ -9,6 +9,7 @@ const {
   registerCredentials, getCredentialStatus, patchKey,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, testKey, exportXml,
+  downloadByUUID,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -79,6 +80,17 @@ router.get('/ultimo-erp',                    authenticate, getUltimoErp);
 
 // ── Exportar XMLs SAT como ZIP ────────────────────────────────────────────────
 router.get('/export-xml', authenticate, permit('visor:sat'), exportXml);
+
+// ── Descarga individual por UUID ──────────────────────────────────────────────
+router.post('/descarga-uuid',
+  authenticate,
+  permit('visor:sat'),
+  [
+    body('rfc').notEmpty().withMessage('RFC requerido'),
+    body('uuid').isUUID().withMessage('UUID inválido'),
+  ],
+  downloadByUUID,
+);
 
 // ── Prueba de credenciales (no elimina las credenciales al finalizar) ─────────
 router.post('/test-key/:rfc', authenticate, permit('visor:sat'), testKey);

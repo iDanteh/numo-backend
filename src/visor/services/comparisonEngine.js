@@ -256,10 +256,17 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   // Sin esto, el SAT queda con el status anterior (ej. 'not_in_erp') aunque
   // el ERP ya lo encontró y lo marcó como 'match'/'discrepancy'/'warning'.
   if (satCfdi) {
-    await CFDI.findByIdAndUpdate(satCfdi._id, {
+    const satUpdate = {
       lastComparisonStatus: status,
       lastComparisonAt: new Date(),
-    });
+    };
+    // Propagar satStatus desde el live check al documento SAT local:
+    // sin esto, el documento SAT nunca sabe que fue cancelado/vigente según el SOAP.
+    if (satResponse?.state && ['Vigente', 'Cancelado', 'No Encontrado'].includes(satResponse.state)) {
+      satUpdate.satStatus    = satResponse.isCancelled ? 'Cancelado' : satResponse.state;
+      satUpdate.satLastCheck = new Date();
+    }
+    await CFDI.findByIdAndUpdate(satCfdi._id, satUpdate);
   }
 
   const comp = await saveComparison({
@@ -440,7 +447,7 @@ const compareParties = (erp, sat) => {
   if (erp.receptor.rfc !== sat.receptor.rfc)
     diffs.push({ field: 'receptor.rfc', erpValue: erp.receptor.rfc, satValue: sat.receptor.rfc, severity: 'critical' });
   // Régimen fiscal (advertencia)
-  if ((erp.emisor.regimenFiscal || '') !== (sat.emisor.regimenFiscal || ''))
+  if (erp.emisor.regimenFiscal && (erp.emisor.regimenFiscal || '') !== (sat.emisor.regimenFiscal || ''))
     diffs.push({ field: 'emisor.regimenFiscal', erpValue: erp.emisor.regimenFiscal, satValue: sat.emisor.regimenFiscal, severity: 'warning' });
   // Nombres (advertencia — pueden diferir por abreviaturas)
   if ((erp.emisor.nombre || '').toUpperCase().trim() !== (sat.emisor.nombre || '').toUpperCase().trim() &&
@@ -716,7 +723,7 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
   logger.info(`[Batch] Iniciando sesión ${sessionId} con ${erpCfdiIds.length} ERP + ${satOnlyIds.length} solo-SAT`);
 
   const results = { success: 0, failed: 0, discrepancies: 0, errors: [], sessionId };
-  const statusCounts = { match: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, error: 0 };
+  const statusCounts = { match: 0, match_cancelled: 0, warning: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, error: 0 };
   const concurrency = options.concurrency || 5;
 
   // ── 1. Comparar CFDIs ERP ──────────────────────────────────────────────────

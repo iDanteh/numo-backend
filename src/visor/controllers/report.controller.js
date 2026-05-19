@@ -91,8 +91,6 @@ const dashboard = asyncHandler(async (req, res) => {
   // o isActive=1 no serían encontrados con la comparación estricta boolean.
   // MANUAL se agrupa junto con SAT (igual que en comparisonEngine) para que el
   // total SAT del dashboard refleje todos los documentos del lado SAT.
-  // Sin filtro SINUUID: registros ERP sin UUID son válidos y tienen montos reales.
-  // El filtro SINUUID se mantiene solo en cfdiFilter (conciliación) donde se requiere UUID real.
   const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter };
   if (rfcEmisor) montosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
   if (Object.keys(dateFilter).length) montosFilter.fecha = dateFilter;
@@ -143,24 +141,25 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: montosFilter },
       { $addFields: {
         sourceGroup: { $cond: { if: { $in: ['$source', ['SAT', 'MANUAL']] }, then: 'SAT', else: '$source' } },
-        // ERP: (Timbrado o Habilitado) + UUID válido → suma en ERP aunque SAT diga Cancelado
-        // SAT/MANUAL: solo Vigente
-        // La discrepancia ERP-Timbrado/Habilitado vs SAT-Cancelado la registra el comparador
+        esSinUuid: { $regexMatch: { input: { $ifNull: ['$uuid', ''] }, regex: '^SINUUID', options: 'i' } },
+        // ERP: (Timbrado o Habilitado) → activo; SAT/MANUAL: solo Vigente
         excluir: { $cond: {
           if:   { $eq: ['$source', 'ERP'] },
-          then: { $or: [
-            { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
-            { $regexMatch: { input: { $ifNull: ['$uuid', ''] }, regex: '^SINUUID', options: 'i' } },
-          ] },
+          then: { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
           else: { $ne: ['$satStatus', 'Vigente'] },
         }},
       }},
       { $group: {
         _id:             '$sourceGroup',
-        total:           { $sum: { $cond: ['$excluir', 0, MONTO_EFECTIVO_EXPR] } },
-        count:           { $sum: { $cond: ['$excluir', 0, 1] } },
-        totalCancelados: { $sum: { $cond: ['$excluir', MONTO_EFECTIVO_EXPR, 0] } },
-        countCancelados: { $sum: { $cond: ['$excluir', 1, 0] } },
+        // Activos: Timbrado/Habilitado y con UUID real
+        total:           { $sum: { $cond: [{ $or: ['$excluir', '$esSinUuid'] }, 0, MONTO_EFECTIVO_EXPR] } },
+        count:           { $sum: { $cond: [{ $or: ['$excluir', '$esSinUuid'] }, 0, 1] } },
+        // Cancelados/no-vigentes: excluidos pero con UUID real
+        totalCancelados: { $sum: { $cond: [{ $and: ['$excluir', { $not: ['$esSinUuid'] }] }, MONTO_EFECTIVO_EXPR, 0] } },
+        countCancelados: { $sum: { $cond: [{ $and: ['$excluir', { $not: ['$esSinUuid'] }] }, 1, 0] } },
+        // Sin UUID real (SINUUID): bucket propio, no afecta totales de conciliación
+        totalSinUuid:    { $sum: { $cond: ['$esSinUuid', MONTO_EFECTIVO_EXPR, 0] } },
+        countSinUuid:    { $sum: { $cond: ['$esSinUuid', 1, 0] } },
       }},
     ]),
 
@@ -295,6 +294,8 @@ const dashboard = asyncHandler(async (req, res) => {
       // Cancelados y deshabilitados separados del total principal
       erpCancelados: { total: erpRow.totalCancelados, count: erpRow.countCancelados },
       satCancelados: { total: satRow.totalCancelados, count: satRow.countCancelados },
+      // CFDIs ERP sin UUID real (SINUUID-…): excluidos de conciliación y de cancelados
+      erpSinUuid: { total: erpRow.totalSinUuid ?? 0, count: erpRow.countSinUuid ?? 0 },
       cfdisBySatStatus, comparisonStats, discrepancyStats,
       ivaStats,
     },

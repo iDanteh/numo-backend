@@ -96,10 +96,16 @@ const parseCFDI = async (xmlString) => {
   if (complementoPago) {
     cfdiData.complementoPago = complementoPago;
 
-    // Para CFDIs de Pago (tipo 'P'), el IVA no está en cfdi:Impuestos raíz
-    // sino en pago20:Totales. Lo mapeamos al campo impuestos estándar.
+    // Para CFDIs de Pago (tipo 'P'), los montos reales están en pago20:Totales,
+    // no en los atributos raíz del comprobante (que siempre vienen en 0).
     if (attrs.TipoDeComprobante === 'P' && complementoPago.totales) {
       const t = complementoPago.totales;
+
+      // SubTotal = base gravable IVA 16%; Total = monto total de pagos
+      cfdiData.subTotal = t.totalTrasladosBaseIVA16 || 0;
+      cfdiData.total    = t.montoTotalPagos          || 0;
+
+      // IVA trasladado y retenido
       const ivaTrasladadoPago =
         (t.totalTrasladosImpuestoIVA16 || 0) +
         (t.totalTrasladosImpuestoIVA8  || 0);

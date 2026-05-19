@@ -564,10 +564,83 @@ const exportXml = asyncHandler(async (req, res) => {
   res.send(buffer);
 });
 
+/**
+ * POST /api/sat/descarga-uuid
+ * Descarga un CFDI específico del SAT usando FolioFiscalUUID y lo compara con el ERP.
+ */
+const TIPO_MAP_LETRA = { I: 'Ingresos', E: 'Egresos', P: 'Pagos', N: 'Nomina', T: 'Traslados' };
+
+const downloadByUUID = asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+  const { rfc, uuid } = req.body;
+  const rfcUpper = rfc.toUpperCase().trim();
+  const uuidUpper = uuid.toUpperCase().trim();
+
+  // Buscar CFDI en ERP para obtener fecha y tipo
+  const cfdiErp = await CFDI.findOne({ uuid: uuidUpper, source: 'ERP' }).lean();
+  if (!cfdiErp) {
+    return res.status(404).json({ error: `CFDI ${uuidUpper} no encontrado en ERP` });
+  }
+
+  const creds = await obtener(rfcUpper);
+  if (!creds) return res.status(400).json({ error: `Sin credenciales e.firma para RFC ${rfcUpper}` });
+
+  const limitCheck = await puedeIniciar(rfcUpper, 1);
+  if (!limitCheck.puede) return res.status(429).json({ error: limitCheck.razon });
+
+  // Rango ±1 día alrededor de la fecha del CFDI para cubrir diferencias de timezone
+  const fechaCFDI = new Date(cfdiErp.fecha);
+  const dAntes    = new Date(fechaCFDI); dAntes.setUTCDate(dAntes.getUTCDate() - 1);
+  const dDespues  = new Date(fechaCFDI); dDespues.setUTCDate(dDespues.getUTCDate() + 1);
+  const fmt       = d => d.toISOString().slice(0, 10);
+  const fechaInicio = `${fmt(dAntes)}T00:00:00`;
+  const fechaFin    = `${fmt(dDespues)}T23:59:59`;
+
+  const ejercicio      = cfdiErp.ejercicio || fechaCFDI.getUTCFullYear();
+  const periodo        = cfdiErp.periodo   || (fechaCFDI.getUTCMonth() + 1);
+  const tipoComprobante = TIPO_MAP_LETRA[cfdiErp.tipoDeComprobante] || 'Ingresos';
+
+  const jobId = `uuid-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  jobsManales.set(jobId, { estado: 'en_proceso', rfc: rfcUpper, uuid: uuidUpper, inicio: new Date() });
+
+  res.json({ jobId, estado: 'en_proceso', uuid: uuidUpper, rango: `${fmt(dAntes)} → ${fmt(dDespues)}` });
+
+  // Ejecutar en background
+  (async () => {
+    let iniciado = false;
+    try {
+      await registrarInicio(rfcUpper, 1);
+      iniciado = true;
+      await procesarDescarga({
+        rfc: rfcUpper,
+        fechaInicio,
+        fechaFin,
+        tipoComprobante,
+        tipoSolicitud: 'CFDI',
+        tiposEmitidosSplit: [tipoComprobante],
+        creds,
+        ejercicio,
+        periodo,
+        folioFiscalUUID: uuidUpper,
+        tipo: 'uuid_manual',
+      });
+      jobsManales.set(jobId, { estado: 'completado', rfc: rfcUpper, uuid: uuidUpper, fin: new Date() });
+    } catch (err) {
+      logger.error(`[downloadByUUID] RFC ${rfcUpper} UUID ${uuidUpper}: ${err.message}`);
+      jobsManales.set(jobId, { estado: 'error', error: err.message, rfc: rfcUpper, uuid: uuidUpper, fin: new Date() });
+    } finally {
+      if (iniciado) registrarFin(rfcUpper);
+    }
+  })();
+});
+
 module.exports = {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp,
   cleanupActiveJobs, testKey, patchKey, exportXml,
+  downloadByUUID,
 };

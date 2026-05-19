@@ -93,6 +93,7 @@ const Poliza = sequelize.define('Poliza', {
   underscored: true,
   indexes: [
     { fields: ['rfc', 'ejercicio', 'periodo'] },
+    { fields: ['rfc', 'ejercicio', 'periodo', 'fecha'] }, // cubre ORDER BY fecha DESC
     { fields: ['tipo', 'numero', 'rfc', 'ejercicio', 'periodo'], unique: true },
   ],
 });

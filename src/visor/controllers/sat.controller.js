@@ -590,11 +590,14 @@ const downloadByUUID = asyncHandler(async (req, res) => {
   const limitCheck = await puedeIniciar(rfcUpper, 1);
   if (!limitCheck.puede) return res.status(429).json({ error: limitCheck.razon });
 
-  // Rango ±1 día alrededor de la fecha del CFDI para cubrir diferencias de timezone
+  // Rango ±1 día alrededor de la fecha del CFDI para cubrir diferencias de timezone.
+  // dDespues se limita a ayer (México) porque el SAT rechaza FechaFinal = hoy o futuro.
   const fechaCFDI = new Date(cfdiErp.fecha);
   const dAntes    = new Date(fechaCFDI); dAntes.setUTCDate(dAntes.getUTCDate() - 1);
   const dDespues  = new Date(fechaCFDI); dDespues.setUTCDate(dDespues.getUTCDate() + 1);
   const fmt       = d => d.toISOString().slice(0, 10);
+  const ayerMX    = new Date(new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' }));
+  if (dDespues >= ayerMX) dDespues.setTime(ayerMX.getTime());
   const fechaInicio = `${fmt(dAntes)}T00:00:00`;
   const fechaFin    = `${fmt(dDespues)}T23:59:59`;
 

@@ -254,13 +254,15 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
   }
 
   // ── 4. Motor de match ───────────────────────────────────────────────────────
-  const usedMovIds         = new Set();
-  const ops                = [];
+  const usedMovIds          = new Set();
+  const ops                 = [];
+  const advertencias        = []; // filas AUTO con folios parcialmente faltantes en DB
   const detalleNoMatcheados = [];
   let autoCount   = 0;
   let reviewCount = 0;
   let folioNoEncontrado = 0;
   let sinMovBancario    = 0;
+  let yaIdentificado    = 0;
 
   for (const row of excelRows) {
     // 4a. Resolver CxC para los folios de esta fila ─────────────────────────
@@ -346,9 +348,12 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
     // 4c. Clasificar resultado ─────────────────────────────────────────────
     if (!foundMov) {
       sinMovBancario++;
+      const foliosAviso  = foliosFaltantes.length
+        ? ` (folios no encontrados en DB: ${foliosFaltantes.join(', ')})`
+        : '';
       const razonDetalle = tokens.length
-        ? `Token(s) [${tokens.slice(0, 3).join(', ')}] no encontrados en movimientos bancarios`
-        : `Sin tokens numéricos en el concepto; ningún movimiento con importe $${row.importe.toLocaleString('es-MX', { minimumFractionDigits: 2 })} en banco ${row.banco ?? 'desconocido'}`;
+        ? `Token(s) [${tokens.slice(0, 3).join(', ')}] no encontrados en movimientos bancarios${foliosAviso}`
+        : `Sin tokens numéricos en el concepto; ningún movimiento con importe $${row.importe.toLocaleString('es-MX', { minimumFractionDigits: 2 })} en banco ${row.banco ?? 'desconocido'}${foliosAviso}`;
       detalleNoMatcheados.push({
         fila:      row.fila,
         concepto:  row.concepto,
@@ -373,7 +378,7 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
         banco:    row.banco,
         folios:   row.folios.map(f => `${f.serie}-${f.folio}`),
         razon:    'requiere_revision',
-        detalle:  `Candidato encontrado solo por importe — sin auth en concepto. Verifica manualmente.`,
+        detalle:  `Candidato encontrado solo por importe — sin auth en concepto. Verifica manualmente.${foliosFaltantes.length ? ` Folios no encontrados en DB: ${foliosFaltantes.join(', ')}.` : ''}`,
         candidato: {
           movId:    foundMov._id.toString(),
           concepto: foundMov.concepto  ?? null,
@@ -386,8 +391,38 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
     }
 
     // Tier 1 → vincular en DB
+
+    // Bug fix #1: no tocar movimientos con identificación humana previa.
+    // El motor solo procesa movimientos limpios o previamente procesados por motores.
+    // Si un humano ya lo identificó, se reporta para que el usuario lo revise.
+    if (tieneIdentificacionHumana(foundMov)) {
+      yaIdentificado++;
+      detalleNoMatcheados.push({
+        fila:     row.fila,
+        concepto: row.concepto,
+        importe:  row.importe,
+        banco:    row.banco,
+        folios:   row.folios.map(f => `${f.serie}-${f.folio}`),
+        razon:    'ya_identificado',
+        detalle:  'El movimiento bancario correspondiente ya fue identificado manualmente por otro usuario.',
+        candidato: {
+          movId:    foundMov._id.toString(),
+          concepto: foundMov.concepto ?? null,
+          deposito: foundMov.deposito ?? null,
+          banco:    foundMov.banco    ?? null,
+          status:   foundMov.status   ?? null,
+        },
+      });
+      continue;
+    }
+
     autoCount++;
     usedMovIds.add(foundMov._id.toString());
+
+    // Advertencia: algunos folios de esta fila no se encontraron en DB
+    if (foliosFaltantes.length > 0) {
+      advertencias.push({ fila: row.fila, foliosFaltantes });
+    }
 
     // Construir erpLinks fusionando con los existentes (evita duplicados)
     const existingIds = new Set(foundMov.erpIds ?? []);
@@ -398,10 +433,11 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
       if (existingIds.has(cxc.erpId)) continue;
       newLinks.push({
         erpId:          cxc.erpId,
-        // calcularMontoPago usa el total del movimiento ABO/CBT/CPF/CFC,
-        // que es el monto realmente depositado — no el saldo pendiente ni
-        // el total de factura (ambos pueden ser incorrectos en CxC ya liquidadas).
-        saldoActual:    calcularMontoPago(cxc),
+        // Bug fix #2: guardar el saldo pendiente de la CxC (no el monto de pago del ABO/CBT).
+        // Usar saldoActual raw es consistente con el linking manual (setErpIds en bank.service.js).
+        // El cálculo final de saldoErp (abajo) aplica la misma lógica que aplicarLogicaErp:
+        //   si saldoActual > 0 → usarlo; si no (CxC ya liquidada) → usar total de la factura.
+        saldoActual:    cxc.saldoActual ?? null,
         folioFiscal:    cxc.folioFiscal  ?? null,
         total:          cxc.total        ?? null,
         serie:          cxc.serie        ?? null,
@@ -411,43 +447,38 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
       newIds.push(cxc.erpId);
     }
 
-    const saldoErp = newLinks.reduce((s, l) => s + (l.saldoActual ?? 0), 0);
-    // Marcar como identificado cuando la suma de CxC cubre O supera el depósito
-    // (saldoErp >= deposito - $1). Cubre tres casos:
-    //   · Cuadre exacto: saldoErp ≈ deposito (dentro de la tolerancia)
-    //   · CxC mayor: saldoErp > deposito (diferencia positiva, pago por encima)
-    //   · Descuento / retención: saldoErp < deposito por hasta $1 de tolerancia
+    // Bug fix #2: misma lógica que aplicarLogicaErp en bank.service.js.
+    // saldoActual > 0 → pago parcial pendiente (usar ese valor).
+    // saldoActual null/0 → CxC ya liquidada o sin dato; usar total de la factura como referencia.
+    const saldoErp = newLinks.reduce((s, l) => {
+      const ref = (l.saldoActual != null && l.saldoActual > 0)
+        ? l.saldoActual
+        : (l.total ?? 0);
+      return s + ref;
+    }, 0);
+    const uuidXML  = newLinks.find(l => l.folioFiscal)?.folioFiscal?.toUpperCase() ?? null;
     const newStatus = saldoErp >= (foundMov.deposito ?? 0) - TOLERANCIA_MXN
       ? 'identificado'
       : 'no_identificado';
 
-    // Conservar identificaciones humanas previas; solo reemplazar las del motor
-    const identificadoPorHumanos = (foundMov.identificadoPor ?? [])
-      .filter(e => !MOTOR_USER_IDS.has(e.userId));
-
     ops.push({
       updateOne: {
-        // Protección ACID: no sobreescribir si el estado en DB cambió mientras
-        // procesábamos el batch (race condition con otros usuarios).
+        // Protección ACID: solo escribir si no existe identificación humana en DB
+        // en el momento de la escritura (cubre race conditions: alguien podría haber
+        // identificado el movimiento manualmente entre el paso 3 y el paso 5).
         filter: {
           _id:      foundMov._id,
           isActive: true,
-          // Bloqueamos escritura si ya fue identificado manualmente después de
-          // cargar los movimientos en el step 3. Solo se aplica si no tenía
-          // identificación humana cuando lo cargamos.
-          ...(!tieneIdentificacionHumana(foundMov)
-            ? { 'identificadoPor.userId': { $nin: [...MOTOR_USER_IDS]
-                  .filter(id => id !== MOTOR_ID) } }
-            : {}),
+          $nor: [{ identificadoPor: { $elemMatch: { userId: { $nin: [...MOTOR_USER_IDS] } } } }],
         },
         update: {
           $set: {
             erpIds:   newIds,
             erpLinks: newLinks,
             saldoErp,
+            uuidXML,
             status:   newStatus,
             identificadoPor: [
-              ...identificadoPorHumanos,
               {
                 userId:  usuarioId   ?? MOTOR_ID,
                 nombre:  usuarioNombre ?? MOTOR_NOMBRE,
@@ -509,8 +540,10 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
     errors: {
       folioNoEncontrado,
       sinMovBancario,
+      yaIdentificado,
     },
     detalleNoMatcheados,
+    advertencias,
   };
 }
 

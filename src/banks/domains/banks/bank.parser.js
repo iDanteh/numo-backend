@@ -518,23 +518,29 @@ function parseBanamex(sheet) {
   }
 
   // ── Post-proceso: dedup intra-lote de filas hermanas ──────────────────────
-  // Banamex exporta ciertos depósitos en efectivo como DOS filas main-row
-  // con la misma fecha y el mismo saldo:
-  //   Fila A: "DEP EN EFECTIVO"    — sin importe en columna, monto en sub-fila
-  //   Fila B: "Abono por cobranza" — con importe real en columna deposito
-  // Ambas comparten numeroAutorizacion y saldo; representan un único hecho
-  // contable.  Después del fix de Referencia alfanumérica ambas tendrán el
-  // mismo deposito, pero el hash difiere porque el concepto es distinto.
-  // Eliminamos la fila sin importe (o con importe extraído de alfanumérica)
-  // cuando ya existe otra fila en el mismo lote con mismo auth + saldo + importe.
+  // Banamex exporta ciertos depósitos complejos como DOS filas main-row con
+  // fecha en col A, representando el mismo hecho contable:
+  //   Fila A: "DEP CHEQUE BNM"          — puede carecer de sub-fila de auth
+  //   Fila B: "Dep mixto Efec/Doctos BNM" — tiene sub-fila "No. de Autorización"
+  // Ambas comparten saldo resultante y monto; el hash difiere porque el concepto
+  // es distinto.
   //
-  // Condición de seguridad: solo aplica cuando numeroAutorizacion es un valor
-  // real (no null, no '0'), que es el identificador estable de la transacción.
-  const authSaldoSeen = new Map(); // key → index in result
+  // Estrategia de dos capas:
+  //   Capa A (auth+saldo): cuando AMBAS filas tienen auth real, la segunda se
+  //     descarta; se preserva la que tenga importe (comportamiento original).
+  //   Capa B (monto+saldo): fallback para cuando UNA fila no tiene auth capturada.
+  //     El saldo acumulado en cuenta es único por transacción — si dos filas del
+  //     mismo lote producen exactamente el mismo saldo con el mismo monto,
+  //     representan la misma transacción.  Se conserva la que tiene auth.
+  const authSaldoSeen  = new Map(); // `${auth}|${saldo}` → índice en deduped
+  const montoSaldoSeen = new Map(); // `${deposito}|${retiro}|${saldo}` → índice en deduped
   const deduped = [];
 
   for (const m of movements) {
     const auth = m.numeroAutorizacion;
+    let isDup = false;
+
+    // ── Capa A: dedup por auth + saldo ──────────────────────────────────────
     if (auth && auth !== '0' && m.saldo != null) {
       const key = `${auth}|${m.saldo}`;
       if (authSaldoSeen.has(key)) {
@@ -543,11 +549,38 @@ function parseBanamex(sheet) {
         // Si el previo no tiene importe y el actual sí → reemplazar
         if (!prev.deposito && !prev.retiro && (m.deposito || m.retiro)) {
           deduped[prevIdx] = m;
+          // Sincronizar mapa de monto+saldo con el índice del reemplazo
+          if (m.saldo != null && (m.deposito != null || m.retiro != null)) {
+            montoSaldoSeen.set(`${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`, prevIdx);
+          }
         }
-        // En cualquier caso no agregar el actual: ya está representado
-        continue;
+        isDup = true;
       }
-      authSaldoSeen.set(key, deduped.length);
+    }
+
+    // ── Capa B: dedup por monto + saldo (fallback para auth=null) ───────────
+    if (!isDup && m.saldo != null && (m.deposito != null || m.retiro != null)) {
+      const mk = `${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`;
+      if (montoSaldoSeen.has(mk)) {
+        const prevIdx = montoSaldoSeen.get(mk);
+        const prev    = deduped[prevIdx];
+        // Si el previo no tiene auth y el actual sí → reemplazar para conservar la info
+        if (!prev.numeroAutorizacion && m.numeroAutorizacion) {
+          deduped[prevIdx] = m;
+          if (auth && auth !== '0') authSaldoSeen.set(`${auth}|${m.saldo}`, prevIdx);
+        }
+        isDup = true;
+      }
+    }
+
+    if (isDup) continue;
+
+    // Registrar en ambos mapas antes de agregar
+    if (auth && auth !== '0' && m.saldo != null) {
+      authSaldoSeen.set(`${auth}|${m.saldo}`, deduped.length);
+    }
+    if (m.saldo != null && (m.deposito != null || m.retiro != null)) {
+      montoSaldoSeen.set(`${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`, deduped.length);
     }
     deduped.push(m);
   }
@@ -629,7 +662,11 @@ function buildBanamex(c, otros = false) {
     retiro,
     saldo:              c.saldo,
     numeroAutorizacion: normalizeAuthNum(c.numAutorizacion),
-    referenciaNumerica: normalizeAuthNum(c.refNumerica),
+    // "0000000000" (y variantes de solo-ceros) es el placeholder de Banamex para
+    // depósitos en efectivo sin referencia real; normalizeAuthNum lo reduce a "0".
+    // Almacenarlo como "0" causaría falsos positivos en Capa 1c del dedup del servicio
+    // (múltiples transacciones distintas con el mismo monto compartirían la clave).
+    referenciaNumerica: (() => { const n = normalizeAuthNum(c.refNumerica); return n === '0' ? null : n; })(),
     status:             otros ? 'otros' : 'no_identificado',
     categoria:          clasificar(conceptoCompleto),
   };

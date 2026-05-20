@@ -225,7 +225,7 @@ router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(as
 // Los "review" NO se escriben en DB; se retornan para revisión manual.
 router.post('/refacturaciones-cyc/upload',
   authenticate,
-  permit('banks:import'),
+  permit('banks:admin'),
   uploadCyc.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });

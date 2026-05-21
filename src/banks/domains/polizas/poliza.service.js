@@ -135,6 +135,11 @@ async function revertir(id, user, motivo) {
   return updated;
 }
 
+async function reporteDescuadradas(filters) {
+  if (!filters.rfc) throw new ValidationError('RFC requerido');
+  return repo.findDescuadradas(filters);
+}
+
 /**
  * Genera el XML de Pólizas para el SAT (PolizasPeriodo_v1_3.xsd).
  * Solo incluye pólizas con estado 'contabilizada'.
@@ -187,4 +192,4 @@ async function generarXmlSat({ rfc, ejercicio, periodo, tipoSolicitud = 'AF', nu
   return `<?xml version="1.0" encoding="UTF-8"?>\n<BCE:Polizas ${attrs}>\n${polizasXml}\n</BCE:Polizas>`;
 }
 
-module.exports = { list, getById, create, update, cancel, contabilizar, revertir, generarXmlSat };
+module.exports = { list, getById, create, update, cancel, contabilizar, revertir, generarXmlSat, reporteDescuadradas };

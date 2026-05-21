@@ -42,6 +42,16 @@ const CfdiMappingRule = sequelize.define('CfdiMappingRule', {
     allowNull: true,
     comment:   'Forma de pago SAT (01=Efectivo, 02=Cheque, 03=Transferencia, etc.). null = cualquiera',
   },
+  claveProdServ: {
+    type:      DataTypes.STRING(8),
+    allowNull: true,
+    comment:   'ClaveProdServ SAT del primer concepto del CFDI. null = cualquiera',
+  },
+  tipoRelacion: {
+    type:      DataTypes.STRING(2),
+    allowNull: true,
+    comment:   'TipoRelacion del nodo CfdiRelacionados. null = cualquiera',
+  },
   // Cuentas contables (código SAT, ej. "501.01")
   cuentaCargo: {
     type:      DataTypes.STRING(20),

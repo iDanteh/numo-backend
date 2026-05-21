@@ -60,7 +60,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   }
 
   const cfdis = await CFDI.find(filtroBase)
-    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total impuestos complementoPago conceptos lastComparisonStatus')
+    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus')
     .lean();
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));

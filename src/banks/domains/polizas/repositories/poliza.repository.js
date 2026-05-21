@@ -246,6 +246,59 @@ async function destroy(id) {
   return count > 0;
 }
 
+/** Devuelve los asientos (agrupados por cfdi_uuid + poliza) donde debe ≠ haber,
+ *  enriquecidos con los datos del CFDI desde MongoDB. */
+async function findDescuadradas({ rfc, ejercicio, periodo, estado, polizaId }) {
+  const conditions   = ['pm.cfdi_uuid IS NOT NULL', 'p.rfc = :rfc'];
+  const replacements = { rfc };
+  if (polizaId)  { conditions.push('p.id        = :polizaId'); replacements.polizaId  = Number(polizaId); }
+  if (ejercicio) { conditions.push('p.ejercicio = :ejercicio'); replacements.ejercicio = Number(ejercicio); }
+  if (periodo)   { conditions.push('p.periodo   = :periodo');   replacements.periodo   = Number(periodo); }
+  if (estado)    { conditions.push('p.estado    = :estado');    replacements.estado    = estado; }
+
+  const rows = await sequelize.query(`
+    SELECT
+      pm.cfdi_uuid                                               AS "cfdiUuid",
+      pm.poliza_id                                               AS "polizaId",
+      p.tipo,
+      p.numero,
+      p.fecha::text                                              AS fecha,
+      p.estado,
+      ROUND(SUM(pm.debe)::numeric,  2)                          AS "totalDebe",
+      ROUND(SUM(pm.haber)::numeric, 2)                          AS "totalHaber",
+      ROUND(ABS(SUM(pm.debe) - SUM(pm.haber))::numeric, 2)      AS diferencia
+    FROM poliza_movimientos pm
+    JOIN polizas p ON p.id = pm.poliza_id
+    WHERE ${conditions.join(' AND ')}
+    GROUP BY pm.cfdi_uuid, pm.poliza_id, p.tipo, p.numero, p.fecha, p.estado
+    HAVING ABS(SUM(pm.debe) - SUM(pm.haber)) > 0.01
+    ORDER BY diferencia DESC
+  `, { replacements, type: QueryTypes.SELECT });
+
+  if (rows.length === 0) return [];
+
+  const uuids = [...new Set(rows.map(r => r.cfdiUuid))];
+  const cfdis = await CFDI.find(
+    { uuid: { $in: uuids } },
+    { uuid: 1, tipoDeComprobante: 1, metodoPago: 1, formaPago: 1,
+      total: 1, subTotal: 1, fecha: 1, folio: 1, serie: 1,
+      moneda: 1, exportacion: 1, lugarExpedicion: 1,
+      'emisor.rfc': 1, 'emisor.nombre': 1, 'emisor.regimenFiscal': 1,
+      'receptor.rfc': 1, 'receptor.nombre': 1, 'receptor.usoCfdi': 1,
+      'impuestos.totalImpuestosTrasladados': 1,
+      satStatus: 1, erpStatus: 1, source: 1, _id: 0 },
+  ).lean();
+
+  const cfdiMap = {};
+  for (const c of cfdis) {
+    if (!cfdiMap[c.uuid]) cfdiMap[c.uuid] = { ...c, sources: [] };
+    if (!cfdiMap[c.uuid].sources.includes(c.source)) cfdiMap[c.uuid].sources.push(c.source);
+    if (c.source === 'SAT') cfdiMap[c.uuid].satStatus = c.satStatus;
+  }
+
+  return rows.map(r => ({ ...r, cfdi: cfdiMap[r.cfdiUuid] ?? null }));
+}
+
 /** Trae todas las pólizas contabilizadas de un periodo con sus movimientos y cuenta. */
 async function findAllContabilizadas({ rfc, ejercicio, periodo }) {
   return Poliza.findAll({
@@ -255,4 +308,4 @@ async function findAllContabilizadas({ rfc, ejercicio, periodo }) {
   });
 }
 
-module.exports = { findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas };
+module.exports = { findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas, findDescuadradas };

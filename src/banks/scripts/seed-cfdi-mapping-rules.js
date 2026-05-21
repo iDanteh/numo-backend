@@ -36,6 +36,22 @@ const CfdiMappingRule    = require('../../shared/models/postgres/CfdiMappingRule
 
 const reglas = [
 
+  // ── 0. ANTICIPOS (Regla 22) ────────────────────────────────────────────────
+  // Prioridad 9 — antes que 1A–1E para que el claveProdServ gane.
+  // El CFDI de anticipo usa ClaveProdServ=84111506 (Servicios de subcontratación
+  // de anticipos / "Anticipo" en el catálogo SAT).
+  // Asiento: Dr Bancos (total) | Cr Anticipos de Clientes (subtotal) + Cr IVA
+  {
+    nombre:          'Reg 22 — Recepción de Anticipo (ClaveProdServ 84111506)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    claveProdServ:   '84111506',
+    cuentaCargo:     '1102011005',   // Bancos (dinero recibido)
+    cuentaAbono:     '2103010001',   // Anticipos de Clientes General
+    cuentaIva:       '2104010001',   // IVA Trasladado
+    prioridad:       9,
+  },
+
   // ── 1. INGRESOS PUE 16% (Reglas 1A–1E) ────────────────────────────────────
   // Prioridades 10–14. Venta de contado, IVA causado al momento de emitir.
   {
@@ -63,6 +79,16 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '04',
+    cuentaCargo:     '1102011005',
+    cuentaAbono:     '4100010001',
+    cuentaIva:       '2104010001',
+    prioridad:       12,
+  },
+  {
+    nombre:          'Reg 1F — Venta PUE Cheque Nominativo 16%',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '02',
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
@@ -162,7 +188,36 @@ const reglas = [
     prioridad:       19,
   },
 
-  // ── 7. INGRESOS PPD 16% — Factura a Crédito (Regla 6) ────────────────────
+  // ── 7. FACTURA FINAL ANTICIPO PUE (Regla 22C) ────────────────────────────
+  // Prioridad 20. PUE + formaPago=30: la factura queda liquidada íntegramente
+  // con el anticipo ya recibido. No entra dinero; se cancela el pasivo de anticipos.
+  {
+    nombre:          'Reg 22C — Factura Final Anticipo PUE (formaPago 30)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '30',
+    cuentaCargo:     '2103010001',   // Anticipos de Clientes General
+    cuentaAbono:     '4100010001',   // Ingresos Contado 16%
+    cuentaIva:       '2104010001',   // IVA Trasladado
+    prioridad:       12,
+  },
+
+  // ── 7B. FACTURA FINAL ANTICIPO PPD (Regla 22B) ───────────────────────────
+  // Prioridad 21. I + PPD + TipoRelacion=07 (relaciona con CFDI de anticipo).
+  // Genera CxC y difiere el IVA igual que una venta a crédito normal,
+  // pero discriminada por TipoRelacion para separar el ciclo de anticipos.
+  {
+    nombre:          'Reg 22B — Factura Final Anticipo PPD (TipoRelacion 07)',
+    tipoComprobante: 'I',
+    metodoPago:      'PPD',
+    tipoRelacion:    '07',
+    cuentaCargo:     '1103010001',   // Clientes Nac Gral 16%
+    cuentaAbono:     '4100020001',   // Ingresos Crédito 16%
+    cuentaIvaPPD:    '2105010001',   // IVA Por Trasladar PPD (diferido)
+    prioridad:       21,
+  },
+
+  // ── 8. INGRESOS PPD 16% — Factura a Crédito (Regla 6) ────────────────────
   // Prioridad 60. IVA diferido (cuenta puente). El cobro llega con tipo P.
   {
     nombre:          'Reg 6 — Venta PPD 16% (Factura a Crédito)',
@@ -235,6 +290,16 @@ const reglas = [
     prioridad:       72,
   },
   {
+    nombre:          'Reg 7F — Cobro PPD Cheque Nominativo',
+    tipoComprobante: 'P',
+    formaPago:       '02',
+    cuentaCargo:     '1102011005',
+    cuentaAbono:     '1103010001',
+    cuentaIva:       '2104010001',
+    cuentaIvaPPD:    '2105010001',
+    prioridad:       72,
+  },
+  {
     nombre:          'Reg 7D — Cobro PPD Tarjeta Débito',
     tipoComprobante: 'P',
     formaPago:       '28',
@@ -283,6 +348,16 @@ const reglas = [
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '04',
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1102011005',
+    cuentaIva:       '2104010001',
+    prioridad:       82,
+  },
+  {
+    nombre:          'Reg 8F — NC PUE Devolución Cheque Nominativo',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '02',
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',

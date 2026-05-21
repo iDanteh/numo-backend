@@ -60,15 +60,20 @@ async function findRuleForCfdi(cfdi) {
  * en empate, la más específica (más filtros con valor).
  */
 function findRuleInList(cfdi, rules) {
+  const cfdiClaveProdServ = cfdi.conceptos?.[0]?.claveProdServ ?? null;
+  const cfdiTipoRelacion  = cfdi.cfdiRelacionados?.[0]?.tipoRelacion ?? null;
+
   const matching = rules.filter(r =>
     (!r.tipoComprobante || r.tipoComprobante === cfdi.tipoDeComprobante) &&
     (!r.rfcEmisor       || r.rfcEmisor       === cfdi.emisor?.rfc) &&
     (!r.metodoPago      || r.metodoPago      === cfdi.metodoPago) &&
-    (!r.formaPago       || r.formaPago       === cfdi.formaPago),
+    (!r.formaPago       || r.formaPago       === cfdi.formaPago) &&
+    (!r.claveProdServ   || r.claveProdServ   === cfdiClaveProdServ) &&
+    (!r.tipoRelacion    || r.tipoRelacion    === cfdiTipoRelacion),
   );
   if (!matching.length) return null;
 
-  const spec = r => [r.tipoComprobante, r.rfcEmisor, r.metodoPago, r.formaPago].filter(Boolean).length;
+  const spec = r => [r.tipoComprobante, r.rfcEmisor, r.metodoPago, r.formaPago, r.claveProdServ, r.tipoRelacion].filter(Boolean).length;
   return matching.sort((a, b) => {
     if (a.prioridad !== b.prioridad) return a.prioridad - b.prioridad;
     return spec(b) - spec(a);

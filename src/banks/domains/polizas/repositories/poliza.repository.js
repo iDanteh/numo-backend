@@ -1,6 +1,6 @@
 'use strict';
 
-const { Op, Transaction, QueryTypes } = require('sequelize');
+const { Transaction, QueryTypes } = require('sequelize');
 const { sequelize }        = require('../../../../config/database.postgres');
 const { Poliza, PolizaMovimiento, AccountPlan } = require('../../../../shared/models/postgres');
 const CFDI = require('../../../../visor/models/CFDI');
@@ -120,25 +120,32 @@ async function findById(id) {
   if (uuids.length > 0) {
     const cfdis = await CFDI.find(
       { uuid: { $in: uuids } },
-      { uuid: 1, satStatus: 1, erpStatus: 1, source: 1, _id: 0 },
+      { uuid: 1, satStatus: 1, erpStatus: 1, source: 1, metodoPago: 1, formaPago: 1, _id: 0 },
     ).lean();
 
     // Consolidar por uuid — un UUID puede tener registro SAT y ERP por separado
     const byUuid = {};
     for (const c of cfdis) {
-      if (!byUuid[c.uuid]) byUuid[c.uuid] = { satStatus: null, erpStatus: null, sources: new Set() };
+      if (!byUuid[c.uuid]) byUuid[c.uuid] = { satStatus: null, erpStatus: null, sources: new Set(), metodoPago: null, formaPago: null };
       byUuid[c.uuid].sources.add(c.source);
-      if (c.source === 'SAT' && c.satStatus) byUuid[c.uuid].satStatus = c.satStatus;
-      if (c.source === 'ERP' && c.erpStatus) byUuid[c.uuid].erpStatus = c.erpStatus;
+      if (c.source === 'SAT' && c.satStatus)    byUuid[c.uuid].satStatus  = c.satStatus;
+      if (c.source === 'ERP' && c.erpStatus)    byUuid[c.uuid].erpStatus  = c.erpStatus;
+      if (c.metodoPago && !byUuid[c.uuid].metodoPago) byUuid[c.uuid].metodoPago = c.metodoPago;
+      if (c.formaPago  && !byUuid[c.uuid].formaPago)  byUuid[c.uuid].formaPago  = c.formaPago;
     }
 
     const cfdiAlertMap = {};
+    const cfdiMetaMap  = {};
     for (const uuid of uuids) {
       const info = byUuid[uuid];
       if (!info) {
         cfdiAlertMap[uuid] = { alerts: ['no_encontrado'] };
         continue;
       }
+
+      // Meta (metodoPago / formaPago) — siempre disponible
+      cfdiMetaMap[uuid] = { metodoPago: info.metodoPago, formaPago: info.formaPago };
+
       const alerts = [];
       const hasSat = info.sources.has('SAT');
       const hasErp = info.sources.has('ERP');
@@ -156,6 +163,9 @@ async function findById(id) {
 
     if (Object.keys(cfdiAlertMap).length > 0) {
       poliza.dataValues.cfdiAlertMap = cfdiAlertMap;
+    }
+    if (Object.keys(cfdiMetaMap).length > 0) {
+      poliza.dataValues.cfdiMetaMap = cfdiMetaMap;
     }
   }
 

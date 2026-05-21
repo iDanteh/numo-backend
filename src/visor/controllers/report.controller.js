@@ -538,7 +538,7 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   const cfdiSel    = 'uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus';
   const cfdiSelSat = 'uuid serie folio fecha total tipoDeComprobante emisor receptor satStatus';
 
-  const erpProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, erpStatus: 1, satStatus: 1 };
+  const erpProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, erpStatus: 1, satStatus: 1, periodo: 1 };
   const satProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, satStatus: 1 };
 
   // Pipeline ORIGINAL que funcionaba — filtra Comparison por matchPeriodo
@@ -554,6 +554,12 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
     { $sort:  { criticalCount: -1, comparedAt: -1 } },
     { $lookup: { from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id', as: 'erpCfdiId', pipeline: [{ $project: erpProjection }] } },
     { $unwind: { path: '$erpCfdiId', preserveNullAndEmptyArrays: true } },
+    // Excluir CFDIs cuyo periodo real en MongoDB no coincida con el periodo solicitado.
+    // Caso típico: ERP marca CFDI como "global" (pertenece al siguiente periodo contable)
+    // y la comparación se registró con ese periodo nuevo, pero el documento ERP en MongoDB
+    // tiene el periodo original → aparecería en el periodo incorrecto.
+    // Si el CFDI tiene periodo incorrecto en MongoDB, seguirá visible en su propio mes.
+    ...(periodo ? [{ $match: { $or: [{ erpCfdiId: null }, { 'erpCfdiId.periodo': parseInt(periodo) }] } }] : []),
     // Filtrar por tipo DESPUÉS del lookup (Comparison.tipoDeComprobante puede ser null)
     ...(tipoDeComprobante ? [{ $match: { 'erpCfdiId.tipoDeComprobante': tipoDeComprobante } }] : []),
     { $lookup: { from: 'cfdis', localField: 'satCfdiId', foreignField: '_id', as: 'satCfdiId', pipeline: [{ $project: satProjection }] } },
@@ -790,10 +796,10 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   const periodoLabel  = ejercicio ? (periodo ? `${MESES[parseInt(periodo)-1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
 
   // ── FASE 1: Datos que no dependen de los UUIDs ERP ───────────────────────
-  const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, allSatForPeriod, resumenTipos, resumenSAT, cfdisMigrados] = await Promise.all([
+  const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, allSatForPeriod, resumenTipos, resumenSAT, cfdisMigrados, sinUuidCfdis] = await Promise.all([
 
     // CFDIs ERP Timbrados/Habilitados — igual que montosAggregate del dashboard
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, lastComparisonStatus: 1, fecha: -1 })
       .lean(),
@@ -866,6 +872,12 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       } : {}),
     })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus erpStatus lastComparisonStatus ejercicio periodo informacionGlobal source')
+      .sort({ tipoDeComprobante: 1, fecha: -1 })
+      .lean(),
+
+    // CFDIs ERP sin timbrar (uuid SINUUID-*): existen en ERP pero sin UUID fiscal real
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: /^SINUUID/, ...periodoFilter })
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
   ]);
@@ -1555,6 +1567,76 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const row = sLast.addRow({ tipo: c.tipoDeComprobante || '', desc: TIPO_LABEL[c.tipoDeComprobante] || '', source: c.source, uuid: c.uuid, serie: c.serie || '', folio: c.folio || '', fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '', rfcEmisor: c.emisor?.rfc || '', nomEmisor: c.emisor?.nombre || '', rfcRec: c.receptor?.rfc || '', nomRec: c.receptor?.nombre || '', descuento: c.descuento || 0, subTotal: (c.subTotal || 0) - (c.descuento || 0), ivaTrasl: c.impuestos?.totalImpuestosTrasladados || 0, ivaRet: c.impuestos?.totalImpuestosRetenidos || 0, total: c.total || 0, estadoSAT: c.satStatus || '—' });
     ['descuento','subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
     row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_DANGER; });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJA — Pendientes de Timbrado (CFDIs sin UUID fiscal — SINUUID-*)
+  // Excluidos de totales y conciliación; se muestran aquí para revisión
+  // ══════════════════════════════════════════════════════════════════════════
+  if (sinUuidCfdis.length > 0) {
+    const FG_SIN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF8E1' } }; // amarillo suave
+    const sSin  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Pendientes Timbrado`);
+    sSin.views  = [{ state: 'frozen', ySplit: 4 }];
+    const SIN_COLS = [
+      { key: 'tipo',       header: 'Tipo',            width: 7  },
+      { key: 'desc',       header: 'Descripción',     width: 11 },
+      { key: 'serie',      header: 'Serie',           width: 8  },
+      { key: 'folio',      header: 'Folio',           width: 10 },
+      { key: 'fecha',      header: 'Fecha',           width: 12 },
+      { key: 'rfcEmisor',  header: 'RFC Emisor',      width: 15 },
+      { key: 'nomEmisor',  header: 'Nombre Emisor',   width: 30 },
+      { key: 'rfcRec',     header: 'RFC Receptor',    width: 15 },
+      { key: 'nomRec',     header: 'Nombre Receptor', width: 30 },
+      { key: 'subTotal',   header: 'Subtotal',        width: 16 },
+      { key: 'ivaTrasl',   header: 'IVA Trasladado',  width: 18 },
+      { key: 'ivaRet',     header: 'IVA Retenido',    width: 18 },
+      { key: 'total',      header: 'Total',           width: 16 },
+      { key: 'estadoERP',  header: 'Estado ERP',      width: 16 },
+      { key: 'nota',       header: 'Nota',            width: 35 },
+    ];
+    addTitle(sSin, `CFDIs Pendientes de Timbrado (Sin UUID Fiscal) — ${periodoLabel}`, SIN_COLS.length);
+
+    sSin.mergeCells(`A3:${colLetter(SIN_COLS.length)}3`);
+    const kpiSin = sSin.getCell('A3');
+    kpiSin.value = `Total: ${sinUuidCfdis.length} CFDIs sin timbrar — NO incluidos en totales de conciliación`;
+    kpiSin.font  = FONT_BOLD; kpiSin.fill = FG_SIN;
+    kpiSin.alignment = { horizontal: 'left', vertical: 'middle' };
+    sSin.getRow(3).height = 20;
+
+    sSin.columns = SIN_COLS;
+    const hdrSin = sSin.getRow(4);
+    hdrSin.values = SIN_COLS.map(c => c.header);
+    hdrSin.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
+    hdrSin.height = 28;
+
+    let sumSinTotal = 0;
+    for (const c of sinUuidCfdis) {
+      const row = sSin.addRow({
+        tipo:      c.tipoDeComprobante || '',
+        desc:      TIPO_LABEL[c.tipoDeComprobante] || '',
+        serie:     c.serie  || '',
+        folio:     c.folio  || '',
+        fecha:     c.fecha  ? new Date(c.fecha).toLocaleDateString('es-MX') : '',
+        rfcEmisor: c.emisor?.rfc    || '',
+        nomEmisor: c.emisor?.nombre || '',
+        rfcRec:    c.receptor?.rfc    || '',
+        nomRec:    c.receptor?.nombre || '',
+        subTotal:  (c.subTotal || 0) - (c.descuento || 0),
+        ivaTrasl:  c.impuestos?.totalImpuestosTrasladados || 0,
+        ivaRet:    c.impuestos?.totalImpuestosRetenidos   || 0,
+        total:     c.total || 0,
+        estadoERP: c.erpStatus || '—',
+        nota:      'Pendiente de timbrado — sin UUID fiscal asignado',
+      });
+      ['subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
+      row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_SIN; });
+      sumSinTotal += c.total || 0;
+    }
+
+    // Fila totales
+    const trSin = sSin.addRow({ tipo: `TOTAL (${sinUuidCfdis.length})`, total: fmtNum(sumSinTotal) });
+    trSin.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+    trSin.getCell('total').numFmt = MXN;
   }
 
   // ── Respuesta ──────────────────────────────────────────────────────────────

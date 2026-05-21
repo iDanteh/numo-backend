@@ -590,11 +590,13 @@ const downloadByUUID = asyncHandler(async (req, res) => {
   const limitCheck = await puedeIniciar(rfcUpper, 1);
   if (!limitCheck.puede) return res.status(429).json({ error: limitCheck.razon });
 
-  // Rango ±1 día alrededor de la fecha del CFDI para cubrir diferencias de timezone.
+  // El SAT indexa en Descarga Masiva por fechaTimbrado, no por fecha del documento.
+  // Usamos fechaTimbrado cuando existe (más preciso), sino fecha del CFDI.
+  // Rango ±2 días para cubrir gaps entre fecha y timbrado (pueden ser hasta 24h+).
   // dDespues se limita a ayer (México) porque el SAT rechaza FechaFinal = hoy o futuro.
-  const fechaCFDI = new Date(cfdiErp.fecha);
-  const dAntes    = new Date(fechaCFDI); dAntes.setUTCDate(dAntes.getUTCDate() - 1);
-  const dDespues  = new Date(fechaCFDI); dDespues.setUTCDate(dDespues.getUTCDate() + 1);
+  const fechaBase = new Date(cfdiErp.timbreFiscalDigital?.fechaTimbrado ?? cfdiErp.fecha);
+  const dAntes    = new Date(fechaBase); dAntes.setUTCDate(dAntes.getUTCDate() - 2);
+  const dDespues  = new Date(fechaBase); dDespues.setUTCDate(dDespues.getUTCDate() + 2);
   const fmt       = d => d.toISOString().slice(0, 10);
   const ayerMX    = new Date(new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' }));
   if (dDespues >= ayerMX) dDespues.setTime(ayerMX.getTime());

@@ -35,7 +35,7 @@ async function getById(id) {
 }
 
 async function create(data, user) {
-  if (!data.tipo)      throw new ValidationError('El tipo de póliza es requerido (A, I, E, D, N, C)');
+  if (!data.tipo)      throw new ValidationError('El tipo de póliza es requerido (A, I, E, D, N, C, P)');
   if (!data.fecha)     throw new ValidationError('La fecha es requerida');
   if (!data.concepto)  throw new ValidationError('El concepto es requerido');
   if (!data.ejercicio) throw new ValidationError('El ejercicio es requerido');

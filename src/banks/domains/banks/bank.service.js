@@ -618,7 +618,17 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   //   (ej. "8846APR1202605085280762645").  El mismo movimiento puede aparecer con
   //   distinto whitespace en el concepto → hash diferente; la clave de rastreo es
   //   siempre idéntica y permite deduplicar con banco + referenciaNumerica + importe.
-  const refNumMovs = movements.filter(m => m.referenciaNumerica && !hashesExistentes.has(m.hash));
+  //
+  // Se excluye referenciaNumerica = "0": es el placeholder de Banamex para depósitos
+  // en efectivo sin referencia real (Banamex exporta "0000000000" → normalizado a "0").
+  // Usarlo como clave generaría falsos positivos entre transacciones distintas con
+  // el mismo monto (el parser ya lo normaliza a null, pero se filtra aquí también
+  // por si existen registros históricos con este valor).
+  const refNumMovs = movements.filter(m =>
+    m.referenciaNumerica &&
+    m.referenciaNumerica !== '0' &&
+    !hashesExistentes.has(m.hash)
+  );
 
   if (refNumMovs.length > 0) {
     const uniqueRefNums   = [...new Set(refNumMovs.map(m => m.referenciaNumerica))];

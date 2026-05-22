@@ -734,32 +734,65 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
   if (ejercicio) matchFilter.ejercicio = parseInt(ejercicio);
   if (periodo)   matchFilter.periodo   = parseInt(periodo);
 
-  const [agg, totalPagos] = await Promise.all([
+  const [detalleAgg, totalPagos] = await Promise.all([
     CFDI.aggregate([
       { $match: matchFilter },
       { $unwind: { path: '$complementoPago.pagos', preserveNullAndEmptyArrays: false } },
       { $unwind: { path: '$complementoPago.pagos.doctosRelacionados', preserveNullAndEmptyArrays: false } },
       {
-        $group: {
-          _id:         null,
-          cfdiIds:     { $addToSet: '$_id' },
-          doctosIds:   { $addToSet: { $toUpper: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } } },
+        $project: {
+          _id:           0,
+          uuidPago:      { $toUpper: { $ifNull: ['$uuid', ''] } },
+          seriePago:     '$serie',
+          folioPago:     '$folio',
+          fechaPago:     '$complementoPago.pagos.fechaPago',
+          metodoPago:    '$complementoPago.pagos.formaDePagoP',
+          numOperacion:  '$complementoPago.pagos.numOperacion',
+          montoPago:     '$complementoPago.pagos.monto',
+          idDocumento:   { $toUpper: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+          serieOrigen:   '$complementoPago.pagos.doctosRelacionados.serie',
+          folioOrigen:   '$complementoPago.pagos.doctosRelacionados.folio',
+          importePagado: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
         },
       },
     ]),
     CFDI.countDocuments(matchFilter),
   ]);
 
-  if (!agg.length || !agg[0].doctosIds?.length) {
-    return res.json({ totalPagos, totalDoctos: 0, existenEnSistema: 0, noExistenEnSistema: 0, porcentajeCobertura: 100 });
+  if (!detalleAgg.length) {
+    return res.json({ totalPagos, totalDoctos: 0, existenEnSistema: 0, noExistenEnSistema: 0, porcentajeCobertura: 100, pagos: [] });
   }
 
-  const doctosIds = agg[0].doctosIds.filter(id => id && id.length > 0);
+  // Verificar cuáles documentos origen existen en el sistema
+  const doctosIds = [...new Set(detalleAgg.map(r => r.idDocumento).filter(id => id && id.length > 0))];
   const totalDoctos = doctosIds.length;
 
-  const existenEnSistema = await CFDI.countDocuments({
-    uuid: { $in: doctosIds },
-    isActive: { $ne: false },
+  const cfdiOrigen = await CFDI.find(
+    { uuid: { $in: doctosIds }, isActive: { $ne: false } },
+    { uuid: 1, serie: 1, folio: 1, total: 1, satStatus: 1, _id: 0 },
+  ).lean();
+
+  const cfdiOrigenMap = Object.fromEntries(cfdiOrigen.map(c => [c.uuid?.toUpperCase(), c]));
+  const existenEnSistema = cfdiOrigen.length;
+
+  // Enriquecer cada fila con datos del CFDI origen si existe
+  const pagos = detalleAgg.map(r => {
+    const origen = cfdiOrigenMap[r.idDocumento] ?? null;
+    return {
+      uuidPago:       r.uuidPago      || null,
+      seriePago:      r.seriePago     || null,
+      folioPago:      r.folioPago     || null,
+      fechaPago:      r.fechaPago     || null,
+      metodoPago:     r.metodoPago    || null,
+      numOperacion:   r.numOperacion  || null,
+      montoPago:      r.montoPago     != null ? Number(r.montoPago)     : null,
+      idDocumento:    r.idDocumento   || null,
+      serieOrigen:    r.serieOrigen   || origen?.serie  || null,
+      folioOrigen:    r.folioOrigen   || origen?.folio  || null,
+      importePagado:  r.importePagado != null ? Number(r.importePagado) : null,
+      enSistema:      origen != null,
+      satStatusOrigen: origen?.satStatus ?? null,
+    };
   });
 
   res.json({
@@ -768,6 +801,7 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
     existenEnSistema,
     noExistenEnSistema: totalDoctos - existenEnSistema,
     porcentajeCobertura: totalDoctos > 0 ? Math.round((existenEnSistema / totalDoctos) * 100) : 100,
+    pagos,
   });
 });
 

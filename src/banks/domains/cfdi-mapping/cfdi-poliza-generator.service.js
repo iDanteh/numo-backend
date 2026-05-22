@@ -2,6 +2,7 @@
 
 const CFDI                 = require('../../../visor/models/CFDI');
 const { PolizaMovimiento, AccountPlan, CfdiMappingRule, Poliza } = require('../../../shared/models/postgres');
+const centrosSvc = require('../centros-costo/centros-costo.service');
 const { Op, QueryTypes }   = require('sequelize');
 const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
@@ -128,7 +129,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   )];
   const relCfdiMapProp = relUuidsProp.length
     ? Object.fromEntries(
-        (await CFDI.find({ uuid: { $in: relUuidsProp } }).select('uuid total').lean())
+        (await CFDI.find({ uuid: { $in: relUuidsProp } }).select('uuid total impuestos.totalImpuestosTrasladados').lean())
           .map(c => [c.uuid, c]),
       )
     : {};
@@ -147,6 +148,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   }
 
   // 6. Generar movimientos usando cuentaMap pre-cargado
+  // Centro de costo por serie de facturación del CFDI (asignación automática)
+  const ccBySerieMapProp = await centrosSvc.resolveBySerieMap();
+
   const movimientosResult = [];
   let sinRegla = 0;
 
@@ -158,6 +162,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       if (foundProp) {
         context.totalRelacionado = uuidsProp
           .reduce((s, u) => s + Number(relCfdiMapProp[u]?.total || 0), 0);
+        context.ivaRelacionado = uuidsProp
+          .reduce((s, u) => s + Number(relCfdiMapProp[u]?.impuestos?.totalImpuestosTrasladados || 0), 0);
       }
       // Si no se encontró el CFDI relacionado en MongoDB, omitir delta (sin context.totalRelacionado)
     }
@@ -172,9 +178,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       saldoRestanteProp = Math.max(0, saldoRestanteProp - usado);
     }
 
+    const ccProp = cfdi.serie ? (ccBySerieMapProp[cfdi.serie] ?? null) : null;
+
     for (const m of movs) {
       movimientosResult.push({
         ...m,
+        centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
+        centroCostoId: ccProp?.id      ?? null,
         _cfdiInfo: {
           uuid:              cfdi.uuid,
           tipo:              cfdi.tipoDeComprobante,
@@ -320,7 +330,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   )];
   const relCfdiMapGuard = relUuidsGuard.length
     ? Object.fromEntries(
-        (await CFDI.find({ uuid: { $in: relUuidsGuard } }).select('uuid total').lean())
+        (await CFDI.find({ uuid: { $in: relUuidsGuard } }).select('uuid total impuestos.totalImpuestosTrasladados').lean())
           .map(c => [c.uuid, c]),
       )
     : {};
@@ -339,6 +349,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   // 6. Generar movimientos en memoria
+  // Centro de costo por serie de facturación del CFDI (asignación automática)
+  const ccBySerieMap = await centrosSvc.resolveBySerieMap();
+
   const todosLosMovimientos = [];
   let sinRegla = 0;
   const advertencias = [];
@@ -367,6 +380,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       if (foundGuard) {
         context.totalRelacionado = uuidsGuard
           .reduce((s, u) => s + Number(relCfdiMapGuard[u]?.total || 0), 0);
+        context.ivaRelacionado = uuidsGuard
+          .reduce((s, u) => s + Number(relCfdiMapGuard[u]?.impuestos?.totalImpuestosTrasladados || 0), 0);
       }
       // Si no se encontró el CFDI relacionado en MongoDB, omitir delta (sin context.totalRelacionado)
     }
@@ -387,14 +402,21 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (tieneFaltante) {
       advertencias.push(`CFDI ${cfdi.uuid?.slice(0, 8)} — una o más cuentas no encontradas en catálogo (regla: ${rule.nombre})`);
     }
+    const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
+
     for (const m of movs) {
       // eslint-disable-next-line no-unused-vars
       const { _saldoUsado, ...cleanM } = m;
-      todosLosMovimientos.push({ ...cleanM, cuentaFaltante: cleanM.cuentaId == null });
+      todosLosMovimientos.push({
+        ...cleanM,
+        cuentaFaltante: cleanM.cuentaId == null,
+        centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
+        centroCostoId:  cc?.id    ?? null,
+      });
     }
   }
 
-  // 6. Guardar póliza + movimientos en una transacción con advisory lock
+  // 7. Guardar póliza + movimientos en una transacción con advisory lock
   const fecha    = new Date();
   const mesStr   = String(periodo).padStart(2, '0');
   const concepto = `CFDIs ${mesStr}/${ejercicio} — ${cfdisSinPoliza.length} comprobante(s)`;

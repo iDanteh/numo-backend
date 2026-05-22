@@ -3,7 +3,7 @@
 /**
  * seed-cfdi-mapping-rules.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Carga masiva de las 38 reglas de mapeo CFDI → cuentas contables.
+ * Carga masiva de las 40 reglas de mapeo CFDI → cuentas contables.
  * (Reglas 2A–2E y 6-IC de intercompañía requieren campo rfcReceptor en el
  *  modelo — no se incluyen aquí.)
  * (Reglas 24B, 24C, 25B, 25C de aplicación de saldo requieren lógica
@@ -150,7 +150,7 @@ const reglas = [
     // tasaIva: null — captura 16%, null y mixto; Reg 10B cubre el 0% con más spec
     cuentaCargo:     '2103090002',  // Anticipos Otros Club Tuberos (consume saldo monedero)
     cuentaAbono:     '4100010001',  // Ingresos Contado 16%
-    cuentaIva:       '2104010002',  // IVA Trasladado Anticipos (HABER)
+    cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE: IVA causado al momento de la venta)
     prioridad:       10,
   },
   {
@@ -343,41 +343,77 @@ const reglas = [
   },
 
   // ── 8. INGRESOS PPD 16% — Factura a Crédito (Regla 6) ────────────────────
-  // Prioridad 60. tasaIva='16' discrimina de Reg 11 (0%) y Reg 13 (mixto).
+  // Prioridad 60. tasaIva='16' + tieneDescuento=false: excluye facturas con descuento (→ Reg 6B).
   {
     nombre:          'Reg 6 — Venta PPD 16% (Factura a Crédito)',
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     formaPago:       '99',
     tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1103010001',  // Clientes Nac Gral 16%
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (diferido)
     prioridad:       60,
   },
 
+  // ── 8B. DESCUENTOS PPD 16% (Regla 6B) ────────────────────────────────────
+  // Prioridad 59 (gana sobre Reg 6). Motor agrega línea Descuentos s/Ventas 16%.
+  {
+    nombre:          'Reg 6B — Venta con Descuento PPD 16%',
+    tipoComprobante: 'I',
+    metodoPago:      'PPD',
+    formaPago:       '99',
+    tasaIva:         '16',
+    tieneDescuento:  true,
+    cuentaCargo:     '1103010001',   // Clientes Nac Gral 16%
+    cuentaAbono:     '4100020001',   // Ingresos Crédito 16%
+    cuentaIvaPPD:    '2105010001',   // IVA Por Trasladar PPD (diferido)
+    cuentaDescuento: '4200020001',   // Descuentos s/Ventas 16%
+    prioridad:       59,
+  },
+
   // ── 8. IVA TASA 0% — PPD (Regla 11) ──────────────────────────────────────
-  // Prioridad 65. tasaIva='0' hace que el motor distinga de Reg 6.
+  // Prioridad 65. tasaIva='0' + tieneDescuento=false: excluye facturas con descuento (→ Reg 6C).
   {
     nombre:          'Reg 11 — Venta PPD Tasa 0%',
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     formaPago:       '99',
     tasaIva:         '0',
+    tieneDescuento:  false,
     cuentaCargo:     '1103010002',  // Clientes Nac Gral 0%
     cuentaAbono:     '4100010002',  // Ingresos Contado 0%
     cuentaIvaPPD:    null,
     prioridad:       65,
   },
 
+  // ── 8C. DESCUENTOS PPD 0% (Regla 6C) ─────────────────────────────────────
+  // Prioridad 64 (gana sobre Reg 11). Motor agrega línea Descuentos s/Ventas 0%.
+  {
+    nombre:          'Reg 6C — Venta con Descuento PPD 0%',
+    tipoComprobante: 'I',
+    metodoPago:      'PPD',
+    formaPago:       '99',
+    tasaIva:         '0',
+    tieneDescuento:  true,
+    cuentaCargo:     '1103010002',   // Clientes Nac Gral 0%
+    cuentaAbono:     '4100010002',   // Ingresos Contado 0%
+    cuentaIvaPPD:    null,
+    cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    prioridad:       64,
+  },
+
   // ── 9. CFDI MIXTO PPD (Regla 13) ─────────────────────────────────────────
   // Prioridad 66. Solo el IVA 16% se difiere; la porción 0% no genera IVA.
+  // tieneDescuento=false: CFDIs mixtos con descuento deben manejarse manualmente.
   {
     nombre:          'Reg 13 — Venta Mixta PPD (0%+16%)',
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     formaPago:       '99',
     tasaIva:         'mixto',
+    tieneDescuento:  false,
     cuentaCargo:     '1103010001',  // Clientes 16%
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaAbono2:    '4100010002',  // Ingresos 0% (motor)
@@ -554,6 +590,7 @@ const reglas = [
     tipoComprobante: 'E',
     tipoRelacion:    '01',
     tasaIva:         '0',
+    tieneDescuento:  false,         // NCs 0% con descuento → Reg 19B
     cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       null,
@@ -580,6 +617,22 @@ const reglas = [
     cuentaAbono:     '4200020001',  // Descuentos s/Ventas 16% (cancela el exceso de descuento)
     cuentaIva:       '2104010001',  // IVA Trasladado (IVA ahora causado)
     prioridad:       87,
+  },
+  {
+    // NC tasa 0% con descuento: revierte la venta bruta, cancela el descuento original,
+    // devuelve al cliente el importe neto (sin IVA porque tasa=0%).
+    // Asiento: DEBE Devoluciones 0% = subtotal; HABER Descuentos 0% = descuento (motor);
+    //          HABER Bancos = total (= subtotal - descuento). Cuadra ✓
+    nombre:          'Reg 19B — NC Devolución Tasa 0% con Descuento',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '0',
+    tieneDescuento:  true,
+    cuentaCargo:     '4200010002',   // Devoluciones s/Ventas 0%
+    cuentaAbono:     '1102011005',   // Bancos (devolución al cliente)
+    cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0% (HABER — cancela el descuento original)
+    cuentaIva:       null,
+    prioridad:       86,
   },
 
   // ── 13. BONIFICACIONES NC RETROACTIVAS (Reglas 20–21) ────────────────────

@@ -23,6 +23,7 @@ const Role              = require('./Role');
 const Poliza            = require('./Poliza');
 const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
+const CentroCosto       = require('./CentroCosto');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -39,6 +40,10 @@ Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimien
 PolizaMovimiento.belongsTo(Poliza,       { foreignKey: 'polizaId', as: 'poliza' });
 PolizaMovimiento.belongsTo(AccountPlan,  { foreignKey: 'cuentaId', as: 'cuenta' });
 AccountPlan.hasMany   (PolizaMovimiento, { foreignKey: 'cuentaId', as: 'movimientos' });
+
+/** Centros de costo */
+PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
+CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movimientos' });
 
 // ── Sincronización ────────────────────────────────────────────────────────────
 
@@ -61,6 +66,16 @@ async function syncModels() {
     Permission.sync({ alter: !isProd }),
     Role.sync({ alter: !isProd }),
   ]);
+
+  // Columna intercompañía en entidades (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE entities
+      ADD COLUMN IF NOT EXISTS es_intercompania BOOLEAN NOT NULL DEFAULT FALSE
+  `).catch(e => console.warn('[syncModels] ADD COLUMN es_intercompania:', e.message));
+
+  // CentroCosto: force:false para evitar conflictos con alter en primera ejecución.
+  // La columna centro_costo_id en poliza_movimientos se agrega vía raw SQL más abajo.
+  await CentroCosto.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await AccountPlan.sync({ alter: !isProd });
@@ -91,6 +106,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS rfc_tercero VARCHAR(13)
   `).catch(() => {});
 
+  // Centro de costo FK en movimientos (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS centro_costo_id INTEGER REFERENCES centros_costo(id)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN centro_costo_id:', e.message));
+
   // Permitir cuentaId nulo (movimientos con cuenta faltante en catálogo)
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ALTER COLUMN cuenta_id DROP NOT NULL`
@@ -99,6 +120,17 @@ async function syncModels() {
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ADD COLUMN IF NOT EXISTS cuenta_faltante BOOLEAN NOT NULL DEFAULT FALSE`
   ).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_faltante:', e.message));
+
+  // Campos SAT del CFDI en movimientos (tipoComprobante, metodoPago, formaPago, folio, rfcEmisor, rfcReceptor)
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS tipo_comprobante VARCHAR(1),
+      ADD COLUMN IF NOT EXISTS metodo_pago      VARCHAR(3),
+      ADD COLUMN IF NOT EXISTS forma_pago       VARCHAR(3),
+      ADD COLUMN IF NOT EXISTS folio            VARCHAR(40),
+      ADD COLUMN IF NOT EXISTS rfc_emisor       VARCHAR(13),
+      ADD COLUMN IF NOT EXISTS rfc_receptor     VARCHAR(13)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN SAT fields:', e.message));
 
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`
@@ -122,4 +154,4 @@ async function syncModels() {
   `).catch(() => {});
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, syncModels };

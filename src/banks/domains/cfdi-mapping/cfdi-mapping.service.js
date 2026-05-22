@@ -101,7 +101,21 @@ function findRuleInList(cfdi, rules) {
  *  Tipo P (complemento de pago) siempre devuelve null — no tiene conceptos con tasa.
  *  Fallback: si los conceptos no tienen desglose de tasa, lee del header (cfdi.impuestos). */
 function _detectTasaIva(cfdi) {
-  if (cfdi.tipoDeComprobante === 'P') return null;
+  if (cfdi.tipoDeComprobante === 'P') {
+    // El complemento de pago no tiene conceptos propios; detectar tasa desde los
+    // totales SAT 4.0 del complemento. Si hay IVA16 o IVA8 (fronterizo) → '16'.
+    // Si hay monto pagado pero cero IVA → '0' (exento o tasa cero).
+    // Si no hay totales (CFDI incompleto) → null (fallback a reglas sin tasaIva).
+    const totales = cfdi.complementoPago?.totales;
+    if (totales) {
+      const iva16 = Number(totales.totalTrasladosImpuestoIVA16 || 0);
+      const iva8  = Number(totales.totalTrasladosImpuestoIVA8  || 0);
+      if (iva16 > 0 || iva8 > 0) return '16';
+      const montoTotal = Number(totales.montoTotalPagos || 0);
+      if (montoTotal > 0) return '0';
+    }
+    return null;
+  }
   let tiene16 = false;
   let tiene0  = false;
   for (const c of (cfdi.conceptos || [])) {
@@ -110,8 +124,8 @@ function _detectTasaIva(cfdi) {
       const impuesto = t.impuesto || t.Impuesto || '';
       if (impuesto !== '002') continue;
       const tasa = Number(t.tasaOCuota ?? t.TasaOCuota ?? 0);
-      if (tasa >= 0.1) tiene16 = true;
-      else             tiene0  = true;
+      if (tasa > 0)  tiene16 = true;
+      else           tiene0  = true;
     }
   }
   // Fallback 1: IVA a nivel header (cfdi.impuestos.traslados)
@@ -120,8 +134,8 @@ function _detectTasaIva(cfdi) {
       const impuesto = t.impuesto || t.Impuesto || '';
       if (impuesto !== '002') continue;
       const tasa = Number(t.tasaOCuota ?? t.TasaOCuota ?? 0);
-      if (tasa >= 0.1) tiene16 = true;
-      else             tiene0  = true;
+      if (tasa > 0)  tiene16 = true;
+      else           tiene0  = true;
     }
   }
   // Fallback 2: traslados vacío pero totalImpuestosTrasladados disponible
@@ -159,7 +173,7 @@ function _calcCfdiMontos(cfdi) {
     const traslados = c.impuestos?.traslados || [];
     const esTasa16  = traslados.some(t => {
       const imp = t.impuesto || t.Impuesto || '';
-      return imp === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) >= 0.1;
+      return imp === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0;
     });
     if (esTasa16) { subTotal16 += importe; desc16 += descuento; }
     else          { subTotal0  += importe; desc0  += descuento; }
@@ -199,16 +213,23 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ? Number(cfdi.complementoPago?.totales?.totalRetencionesIVA || 0)
     : Number(cfdi.impuestos?.totalImpuestosRetenidos || 0);
 
-  // ISR retenido viene de retenciones individuales con impuesto='001'
-  const isrRet = Number(
-    (cfdi.impuestos?.retenciones ?? [])
-      .filter(r => r.impuesto === '001')
-      .reduce((s, r) => s + Number(r.importe || 0), 0),
-  );
+  // ISR retenido: tipo P lo reporta en complementoPago.totales; tipo I/E en retenciones del header.
+  // cfdi.impuestos está vacío para tipo P por especificación SAT CFDI 4.0.
+  const isrRet = esPago
+    ? Number(cfdi.complementoPago?.totales?.totalRetencionesISR || 0)
+    : Number(
+        (cfdi.impuestos?.retenciones ?? [])
+          .filter(r => r.impuesto === '001')
+          .reduce((s, r) => s + Number(r.importe || 0), 0),
+      );
 
+  // Para CFDIs emitidos (I=ingreso, E=nota crédito, P=cobro) la empresa es siempre
+  // el emisor → el tercero para DIOT es el receptor (cliente).
+  // Para CFDIs recibidos (gastos) la empresa es el receptor → el tercero es el emisor.
+  const esEmitido = ['I', 'E', 'P'].includes(tipo);
   const rfcTercero = cfdi.emisor?.rfc === cfdi.receptor?.rfc
     ? null
-    : esIngreso
+    : esEmitido
       ? cfdi.receptor?.rfc
       : cfdi.emisor?.rfc;
 
@@ -269,12 +290,20 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const esIvaHaber        = !!(rule.ivaHaber === true && tipo === 'E');
   const esAplicacionSaldo = !!(rule.esAplicacionSaldo && context.saldoDisponible != null);
 
+  // H1: para Reg 22C cuando factura final > anticipo, el cargo debe cancelar SOLO el pasivo del
+  // anticipo (no el subtotal completo de la factura). El IVA diferido a cancelar también es solo
+  // el del anticipo. El exceso va a Bancos via el bloque delta.
+  // context.ivaRelacionado y context.totalRelacionado son pre-fetched por el generator.
+  // Si no están disponibles (balanza, o anticipo 1:1), cae al comportamiento original.
+  const ivaCancelado     = (esAnticipo && context.ivaRelacionado     != null) ? context.ivaRelacionado                          : iva;
+  const subtotalAnticipo = (esAnticipo && context.totalRelacionado   != null) ? context.totalRelacionado - ivaCancelado          : subtotal;
+
   // Línea principal cargo
-  // esAnticipo + tipo I/E: cargo cancela el pasivo (sin IVA) → subtotal
+  // esAnticipo + tipo I/E: cargo cancela el pasivo del anticipo → subtotalAnticipo
   // esAnticipo + tipo P: cargo aplica el saldo completo del monedero → total
   // esAplicacionSaldo: cargo = min(saldoDisponible, total) — el resto en cuentaCargo2
   let montoCargo;
-  if (esAnticipo)        montoCargo = esPago ? total : subtotal;
+  if (esAnticipo)        montoCargo = esPago ? total : subtotalAnticipo;
   else if (esIvaHaber)   montoCargo = total;
   else                   montoCargo = (esIngreso || esPago) ? total : subtotal;
 
@@ -367,16 +396,18 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // DEBE cuentaIvaAnticipo (2104010002) cancela el IVA diferido del anticipo.
   // HABER cuentaIva (2104010001) reconoce el IVA causado definitivo.
   if (esAnticipo) {
+    // DEBE: cancela el IVA diferido del anticipo (solo su monto, no el de la factura completa)
     movs.push({
       cuentaId:    cuentaMap[rule.cuentaIvaAnticipo] ?? null,
       concepto:    `IVA ant. - ${concepto}`,
       centroCosto, ventaFecha, serie: serieCfdi,
-      debe:        iva,
+      debe:        ivaCancelado,
       haber:       0,
       cfdiUuid:    cfdi.uuid,
       rfcTercero,
     });
     if (rule.cuentaIva) {
+      // HABER: reconoce el IVA definitivo completo de la factura final
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaIva] ?? null,
         concepto:    `IVA ant. - ${concepto}`,
@@ -439,14 +470,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
 
   // Línea principal abono
   // esAnticipo (Reg 22C/23): abono = subtotal (monto sin IVA — el IVA ya está en bloque anticipo)
-  // esIvaHaber (Reg 19):     abono = subtotal (el IVA ya está en HABER por la línea de IVA)
+  // esIvaHaber (Reg 19):     abono = subtotal - descuento (IVA ya en HABER; descuento reduce base)
   // Ingreso normal:          HABER = subtotal
   // Egreso/Pago normal:      HABER = total neto (descontando retenciones)
   // esAnticipo + tipo P: abono cierra la CxC por el total pagado
-  // esAnticipo + tipo I/E / esIvaHaber: abono = subtotal (IVA ya manejado aparte)
+  // esAnticipo + tipo I/E / esIvaHaber: abono = subtotal - descuento (IVA ya manejado aparte)
   let montoAbono;
   if (esAnticipo)      montoAbono = esPago ? (total - ivaRet - isrRet) : subtotal;
-  else if (esIvaHaber) montoAbono = subtotal;
+  else if (esIvaHaber) montoAbono = subtotal - Number(cfdi.descuento || 0);
   else                 montoAbono = esIngreso ? subtotal : total - ivaRet - isrRet;
 
   // ── Motor extendido: reglas MIXTAS (tasaIva=mixto, cuentaAbono2) ──────────
@@ -534,7 +565,81 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     return ao - bo;
   });
 
-  return movs;
+  // Enriquecer cada movimiento con los campos SAT del CFDI origen
+  const satMeta = {
+    tipoComprobante: cfdi.tipoDeComprobante ?? null,
+    metodoPago:      cfdi.metodoPago        ?? null,
+    formaPago:       cfdi.formaPago         ?? null,
+    folio:           cfdi.folio             ?? null,
+    rfcEmisor:       cfdi.emisor?.rfc       ?? null,
+    rfcReceptor:     cfdi.receptor?.rfc     ?? null,
+  };
+
+  return movs.map(m => ({ ...m, ...satMeta }));
+}
+
+/**
+ * Aplica la migración de descuentos PPD directamente en la BD:
+ *   - Reg 6, 11, 13 → tieneDescuento=false
+ *   - Inserta Reg 6B (PPD 16% con descuento) y Reg 6C (PPD 0% con descuento)
+ * Es idempotente.
+ */
+async function migrarPpdDescuento() {
+  const resultado = { actualizadas: [], insertadas: [], yaExistian: [] };
+
+  // 1. Actualizar Reg 6, 11, 13
+  const nombresActualizar = [
+    'Reg 6 — Venta PPD 16% (Factura a Crédito)',
+    'Reg 11 — Venta PPD Tasa 0%',
+    'Reg 13 — Venta Mixta PPD (0%+16%)',
+  ];
+  for (const nombre of nombresActualizar) {
+    const regla = await CfdiMappingRule.findOne({ where: { nombre } });
+    if (!regla) continue;
+    if (regla.tieneDescuento === false) { resultado.yaExistian.push(nombre); continue; }
+    await regla.update({ tieneDescuento: false });
+    resultado.actualizadas.push(nombre);
+  }
+
+  // 2. Insertar Reg 6B
+  const nuevas = [
+    {
+      nombre:          'Reg 6B — Venta con Descuento PPD 16%',
+      tipoComprobante: 'I',
+      metodoPago:      'PPD',
+      formaPago:       '99',
+      tasaIva:         '16',
+      tieneDescuento:  true,
+      cuentaCargo:     '1103010001',
+      cuentaAbono:     '4100020001',
+      cuentaIvaPPD:    '2105010001',
+      cuentaDescuento: '4200020001',
+      prioridad:       59,
+      isActive:        true,
+    },
+    {
+      nombre:          'Reg 6C — Venta con Descuento PPD 0%',
+      tipoComprobante: 'I',
+      metodoPago:      'PPD',
+      formaPago:       '99',
+      tasaIva:         '0',
+      tieneDescuento:  true,
+      cuentaCargo:     '1103010002',
+      cuentaAbono:     '4100010002',
+      cuentaIvaPPD:    null,
+      cuentaDescuento: '4200020002',
+      prioridad:       64,
+      isActive:        true,
+    },
+  ];
+  for (const datos of nuevas) {
+    const existe = await CfdiMappingRule.findOne({ where: { nombre: datos.nombre } });
+    if (existe) { resultado.yaExistian.push(datos.nombre); continue; }
+    await CfdiMappingRule.create(datos);
+    resultado.insertadas.push(datos.nombre);
+  }
+
+  return resultado;
 }
 
 // ── Privado ───────────────────────────────────────────────────────────────────
@@ -545,4 +650,4 @@ function _validate(data) {
   if (!data.cuentaAbono?.trim()) throw new BadRequestError('La cuenta de abono es requerida');
 }
 
-module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos };
+module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento };

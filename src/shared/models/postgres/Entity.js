@@ -74,6 +74,11 @@ const Entity = sequelize.define('Entity', {
     type:         DataTypes.BOOLEAN,
     defaultValue: true,
   },
+  esIntercompania: {
+    type:         DataTypes.BOOLEAN,
+    defaultValue: false,
+    comment:      'true = este RFC pertenece al grupo corporativo (intercompañía)',
+  },
   notes: {
     type:      DataTypes.TEXT,
     allowNull: true,

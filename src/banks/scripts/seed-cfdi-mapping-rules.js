@@ -3,9 +3,11 @@
 /**
  * seed-cfdi-mapping-rules.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Carga masiva de las 24 reglas de mapeo CFDI → cuentas contables.
+ * Carga masiva de las 38 reglas de mapeo CFDI → cuentas contables.
  * (Reglas 2A–2E y 6-IC de intercompañía requieren campo rfcReceptor en el
  *  modelo — no se incluyen aquí.)
+ * (Reglas 24B, 24C, 25B, 25C de aplicación de saldo requieren lógica
+ *  multi-paso en el motor — no tienen discriminador CFDI propio.)
  *
  * Uso local:
  *   node src/banks/scripts/seed-cfdi-mapping-rules.js
@@ -25,12 +27,17 @@ const CfdiMappingRule    = require('../../shared/models/postgres/CfdiMappingRule
 // 1102011005  Bancos por identificar
 // 1103010001  Clientes Nac Gral 16%
 // 1103010002  Clientes Nac Gral 0%
+// 2103010001  Anticipos De Clientes General
+// 2103090001  Anticipos Otros (saldo a favor pendientes de aplicar)
+// 2103090002  Anticipos Otros Clientes Club Tuberos (monedero electrónico)
 // 2104010001  IVA Trasladado (causado definitivo)
-// 2105010001  IVA Por Trasladar PPD (cuenta puente)
+// 2104010002  IVA Trasladado – Anticipos (diferido al recibir el anticipo/monedero)
+// 2105010001  IVA Por Trasladar PPD (cuenta puente crédito)
 // 4100010001  Ingresos Por Ventas Contado 16%
 // 4100010002  Ingresos Por Ventas Contado 0%
 // 4100020001  Ingresos Por Ventas Crédito 16%
 // 4200010001  Devoluciones s/Ventas 16%
+// 4200010002  Devoluciones s/Ventas 0%
 // 4200020001  Descuentos s/Ventas 16%
 // 4200020002  Descuentos s/Ventas 0%
 
@@ -38,9 +45,6 @@ const reglas = [
 
   // ── 0. ANTICIPOS (Regla 22) ────────────────────────────────────────────────
   // Prioridad 9 — antes que 1A–1E para que el claveProdServ gane.
-  // El CFDI de anticipo usa ClaveProdServ=84111506 (Servicios de subcontratación
-  // de anticipos / "Anticipo" en el catálogo SAT).
-  // Asiento: Dr Bancos (total) | Cr Anticipos de Clientes (subtotal) + Cr IVA
   {
     nombre:          'Reg 22 — Recepción de Anticipo (ClaveProdServ 84111506)',
     tipoComprobante: 'I',
@@ -48,17 +52,21 @@ const reglas = [
     claveProdServ:   '84111506',
     cuentaCargo:     '1102011005',   // Bancos (dinero recibido)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
-    cuentaIva:       '2104010001',   // IVA Trasladado
+    cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos
     prioridad:       9,
   },
 
-  // ── 1. INGRESOS PUE 16% (Reglas 1A–1E) ────────────────────────────────────
+  // ── 1. INGRESOS PUE 16% (Reglas 1A–1F) ────────────────────────────────────
   // Prioridades 10–14. Venta de contado, IVA causado al momento de emitir.
+  // tasaIva='16' + tieneDescuento=false: excluyen facturas con descuento (→ Reg 14)
+  // y facturas 0%/mixtas (→ Reg 10/12).
   {
     nombre:          'Reg 1A — Venta PUE Efectivo 16%',
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1101010003',   // Caja
     cuentaAbono:     '4100010001',   // Ingresos Contado 16%
     cuentaIva:       '2104010001',   // IVA Trasladado
@@ -69,6 +77,8 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1102011005',   // Bancos
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
@@ -79,6 +89,8 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '04',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
@@ -89,6 +101,8 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '02',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
@@ -99,6 +113,8 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '28',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
@@ -109,55 +125,90 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       '29',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
     prioridad:       14,
   },
 
+  // ── 1B. MONEDERO ELECTRÓNICO CLUB TUBEROS (Reglas 1G, 10B) ───────────────
+  // formaPago=05 (monedero electrónico). El saldo del monedero vive en 2103090002.
+  // Asiento estándar de ingreso PUE: cargo consume el saldo del monedero (total),
+  // IVA va al HABER de 2104010002 (IVA Trasladado Anticipos), abono a Ingresos.
+  // Reg 1G: sin tasaIva porque los CFDIs de monedero pueden no tener IVA
+  // desglosado por concepto en MongoDB (solo viene en el header).
+  // _detectTasaIva devuelve null en ese caso y tasaIva='16' no matchearía.
+  // Reg 10B tiene tasaIva='0' (más específica) → gana en empate por spec cuando
+  // el CFDI sí tiene conceptos con tasa 0%.
+  {
+    nombre:          'Reg 1G — Venta PUE Monedero Electrónico (Club Tuberos)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '05',
+    // tasaIva: null — captura 16%, null y mixto; Reg 10B cubre el 0% con más spec
+    cuentaCargo:     '2103090002',  // Anticipos Otros Club Tuberos (consume saldo monedero)
+    cuentaAbono:     '4100010001',  // Ingresos Contado 16%
+    cuentaIva:       '2104010002',  // IVA Trasladado Anticipos (HABER)
+    prioridad:       10,
+  },
+  {
+    nombre:          'Reg 10B — Venta PUE Monedero Electrónico Tasa 0% (Club Tuberos)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '05',
+    tasaIva:         '0',           // más específica que Reg 1G → gana en empate de prioridad
+    cuentaCargo:     '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaAbono:     '4100010002',  // Ingresos Contado 0%
+    cuentaIva:       null,          // sin IVA (tasa 0%)
+    prioridad:       10,            // mismo número que 1G; spec mayor gana (tiene tasaIva)
+  },
+
   // ── 2. IVA TASA 0% — PUE (Regla 10) ──────────────────────────────────────
   // Prioridad 15. Exportaciones, alimentos, medicamentos. Sin IVA.
-  // formaPago=null → aplica a cualquier forma de pago; el motor usa la misma
-  // cuenta de cobro que 1A–1E según la forma de pago real.
   {
     nombre:          'Reg 10 — Venta PUE Tasa 0%',
     tipoComprobante: 'I',
     metodoPago:      'PUE',
-    formaPago:       null,               // cualquier forma de pago
-    cuentaCargo:     '1102011005',  // Bancos (default; motor ajusta a Caja si FP=01)
+    formaPago:       null,
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010002',  // Ingresos Contado 0%
-    cuentaIva:       null,               // sin IVA
+    cuentaIva:       null,
     prioridad:       15,
   },
 
-  // ── 3. CFDI MIXTO PUE (0% + 16%) — Regla 12 ──────────────────────────────
-  // Prioridad 16. Contiene conceptos gravados 16% Y conceptos 0% en la misma factura.
-  // cuentaAbono apunta al ingreso 16%; el motor debe agregar partida adicional
-  // con Ingresos 0% (4-1-00-01-0002) por el subtotal exento.
+  // ── 3. CFDI MIXTO PUE (0%+16%) — Regla 12 ──────────────────────────────
+  // Prioridad 16. Motor agrega partida Ingresos 0% (cuentaAbono2) por subtotal exento.
   {
     nombre:          'Reg 12 — Venta Mixta PUE (0%+16%)',
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       null,
+    tasaIva:         'mixto',
+    tieneDescuento:  false,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',  // Ingresos 16% (partida principal)
+    cuentaAbono2:    '4100010002',  // Ingresos 0% (partida adicional — motor)
     cuentaIva:       '2104010001',
-    // partida adicional (0%): 4-1-00-01-0002 — el motor la añade al detectar dos tasas
     prioridad:       16,
   },
 
   // ── 4. DESCUENTOS PUE 16% (Regla 14) ─────────────────────────────────────
-  // Prioridad 17. Igual que 1A–1E pero el XML lleva campo Descuento > 0.
-  // El motor agrega partida de Descuentos s/Ventas 16% (4-2-00-02-0001).
+  // Prioridad 17. Motor agrega línea Descuentos s/Ventas 16% (cuentaDescuento).
   {
     nombre:          'Reg 14 — Venta con Descuento PUE 16%',
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       null,
+    tasaIva:         '16',
+    tieneDescuento:  true,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
-    // descuento: 4-2-00-02-0001 — el motor lo agrega al detectar descuento > 0
+    cuentaDescuento: '4200020001',  // Descuentos s/Ventas 16%
     prioridad:       17,
   },
 
@@ -167,10 +218,12 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       null,
+    tasaIva:         '0',
+    tieneDescuento:  true,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010002',  // Ingresos 0%
     cuentaIva:       null,
-    // descuento: 4-2-00-02-0002 — el motor lo agrega
+    cuentaDescuento: '4200020002',  // Descuentos s/Ventas 0%
     prioridad:       18,
   },
 
@@ -181,49 +234,122 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PUE',
     formaPago:       null,
+    tasaIva:         'mixto',
+    tieneDescuento:  true,
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
+    cuentaAbono2:    '4100010002',  // Ingresos 0% (motor)
     cuentaIva:       '2104010001',
-    // descuentos 16%: 4-2-00-02-0001 / descuentos 0%: 4-2-00-02-0002
+    cuentaDescuento:  '4200020001',  // Descuentos s/Ventas 16%
+    cuentaDescuento0: '4200020002',  // Descuentos s/Ventas 0%
     prioridad:       19,
   },
 
   // ── 7. FACTURA FINAL ANTICIPO PUE (Regla 22C) ────────────────────────────
-  // Prioridad 20. PUE + formaPago=30: la factura queda liquidada íntegramente
-  // con el anticipo ya recibido. No entra dinero; se cancela el pasivo de anticipos.
   {
-    nombre:          'Reg 22C — Factura Final Anticipo PUE (formaPago 30)',
-    tipoComprobante: 'I',
-    metodoPago:      'PUE',
-    formaPago:       '30',
-    cuentaCargo:     '2103010001',   // Anticipos de Clientes General
-    cuentaAbono:     '4100010001',   // Ingresos Contado 16%
-    cuentaIva:       '2104010001',   // IVA Trasladado
-    prioridad:       12,
+    nombre:              'Reg 22C — Factura Final Anticipo PUE (formaPago 30)',
+    tipoComprobante:     'I',
+    metodoPago:          'PUE',
+    formaPago:           '30',
+    cuentaCargo:         '2103010001',  // Anticipos de Clientes General (subtotal — cancela pasivo)
+    cuentaAbono:         '4100010001',  // Ingresos Contado 16%
+    cuentaIva:           '2104010001',  // IVA Trasladado definitivo (HABER)
+    cuentaIvaAnticipo:   '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
+    cuentaDeltaAnticipo: '1102011005',  // Bancos (5° mov: cash por saldo > anticipo, si aplica)
+    prioridad:           12,
   },
 
   // ── 7B. FACTURA FINAL ANTICIPO PPD (Regla 22B) ───────────────────────────
-  // Prioridad 21. I + PPD + TipoRelacion=07 (relaciona con CFDI de anticipo).
-  // Genera CxC y difiere el IVA igual que una venta a crédito normal,
-  // pero discriminada por TipoRelacion para separar el ciclo de anticipos.
+  // relacionadoTipo='I': el CFDI relacionado es el anticipo (tipo I, claveProdServ=84111506).
+  // Distingue de Reg 24C donde el relacionado es una NC (tipo E).
   {
     nombre:          'Reg 22B — Factura Final Anticipo PPD (TipoRelacion 07)',
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     tipoRelacion:    '07',
+    relacionadoTipo: 'I',            // CFDI relacionado = anticipo (tipo Ingreso)
     cuentaCargo:     '1103010001',   // Clientes Nac Gral 16%
     cuentaAbono:     '4100020001',   // Ingresos Crédito 16%
     cuentaIvaPPD:    '2105010001',   // IVA Por Trasladar PPD (diferido)
     prioridad:       21,
   },
 
+  // ── 7D. APLICACIÓN DE SALDO A FAVOR PPD (Reglas 24C, 25C) ────────────────
+  // relacionadoTipo='E': el CFDI relacionado es la NC de saldo a favor (tipo E).
+  // Motor esAplicacionSaldo: divide cargo entre saldo (2103090001) y CxC (1103010001).
+  {
+    nombre:            'Reg 24C — Aplicación Saldo a Favor 16% PPD',
+    tipoComprobante:   'I',
+    metodoPago:        'PPD',
+    tipoRelacion:      '07',
+    relacionadoTipo:   'E',          // CFDI relacionado = NC saldo a favor (tipo Egreso)
+    tasaIva:           '16',
+    esAplicacionSaldo: true,
+    cuentaCargo:       '2103090001',  // Anticipos Otros (saldo a favor)
+    cuentaCargo2:      '1103010001',  // Clientes (CxC residual)
+    cuentaAbono:       '4100020001',  // Ingresos Crédito 16%
+    cuentaIvaPPD:      '2105010001',  // IVA Por Trasladar PPD
+    prioridad:         22,
+  },
+  {
+    nombre:            'Reg 25C — Aplicación Saldo a Favor Tasa 0% PPD',
+    tipoComprobante:   'I',
+    metodoPago:        'PPD',
+    tipoRelacion:      '07',
+    relacionadoTipo:   'E',
+    tasaIva:           '0',
+    esAplicacionSaldo: true,
+    cuentaCargo:       '2103090001',
+    cuentaCargo2:      '1103010001',
+    cuentaAbono:       '4100010002',  // Ingresos Contado 0%
+    cuentaIvaPPD:      null,
+    prioridad:         22,
+  },
+
+  // ── 7C. APLICACIÓN DE SALDO A FAVOR PUE (Reglas 24B, 25B) ───────────────
+  // Cuando el cliente tiene saldo a favor (2103090001) y lo aplica contra una nueva
+  // factura PUE con tipoRelacion=07. El motor divide el cargo:
+  //   DEBE 2103090001 = min(saldo, total)   — consume el saldo a favor
+  //   DEBE 1102011005 = total - saldo       — cash residual (si hay)
+  //   IVA / Ingresos = igual que PUE normal.
+  // Reg 22C (prio 12) gana cuando formaPago=30; estas reglas (prio 20) capturan
+  // el resto (formaPago=01/03/28/29…) con tipoRelacion=07.
+  // Reg 24C/25C (PPD) se omiten: tipoRelacion=07+PPD ya lo maneja Reg 22B (prio 21).
+  {
+    nombre:            'Reg 24B — Aplicación Saldo a Favor 16% PUE',
+    tipoComprobante:   'I',
+    metodoPago:        'PUE',
+    tipoRelacion:      '07',
+    tasaIva:           '16',
+    esAplicacionSaldo: true,
+    cuentaCargo:       '2103090001',  // Anticipos Otros (saldo a favor — DEBE saldo aplicado)
+    cuentaCargo2:      '1102011005',  // Bancos (DEBE cash residual)
+    cuentaAbono:       '4100010001',  // Ingresos Contado 16%
+    cuentaIva:         '2104010001',  // IVA Trasladado
+    prioridad:         20,
+  },
+  {
+    nombre:            'Reg 25B — Aplicación Saldo a Favor Tasa 0% PUE',
+    tipoComprobante:   'I',
+    metodoPago:        'PUE',
+    tipoRelacion:      '07',
+    tasaIva:           '0',
+    esAplicacionSaldo: true,
+    cuentaCargo:       '2103090001',  // Anticipos Otros (saldo a favor)
+    cuentaCargo2:      '1102011005',  // Bancos (cash residual)
+    cuentaAbono:       '4100010002',  // Ingresos Contado 0%
+    cuentaIva:         null,
+    prioridad:         20,
+  },
+
   // ── 8. INGRESOS PPD 16% — Factura a Crédito (Regla 6) ────────────────────
-  // Prioridad 60. IVA diferido (cuenta puente). El cobro llega con tipo P.
+  // Prioridad 60. tasaIva='16' discrimina de Reg 11 (0%) y Reg 13 (mixto).
   {
     nombre:          'Reg 6 — Venta PPD 16% (Factura a Crédito)',
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     formaPago:       '99',
+    tasaIva:         '16',
     cuentaCargo:     '1103010001',  // Clientes Nac Gral 16%
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (diferido)
@@ -231,15 +357,16 @@ const reglas = [
   },
 
   // ── 8. IVA TASA 0% — PPD (Regla 11) ──────────────────────────────────────
-  // Prioridad 65. CxC sin IVA diferido. El cobro solo mueve Bancos vs Clientes.
+  // Prioridad 65. tasaIva='0' hace que el motor distinga de Reg 6.
   {
     nombre:          'Reg 11 — Venta PPD Tasa 0%',
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     formaPago:       '99',
+    tasaIva:         '0',
     cuentaCargo:     '1103010002',  // Clientes Nac Gral 0%
     cuentaAbono:     '4100010002',  // Ingresos Contado 0%
-    cuentaIvaPPD:    null,               // sin IVA diferido
+    cuentaIvaPPD:    null,
     prioridad:       65,
   },
 
@@ -250,14 +377,15 @@ const reglas = [
     tipoComprobante: 'I',
     metodoPago:      'PPD',
     formaPago:       '99',
+    tasaIva:         'mixto',
     cuentaCargo:     '1103010001',  // Clientes 16%
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
+    cuentaAbono2:    '4100010002',  // Ingresos 0% (motor)
     cuentaIvaPPD:    '2105010001',
-    // partida adicional 0%: 4-1-00-01-0002 — motor la agrega
     prioridad:       66,
   },
 
-  // ── 10. COBROS PPD — COMPLEMENTO DE PAGO (Reglas 7A–7E) ──────────────────
+  // ── 10. COBROS PPD — COMPLEMENTO DE PAGO (Reglas 7A–7F) ──────────────────
   // tipoComprobante = P. Reconoce IVA definitivo y liquida la CxC.
   {
     nombre:          'Reg 7A — Cobro PPD Efectivo',
@@ -320,14 +448,33 @@ const reglas = [
     prioridad:       74,
   },
 
-  // ── 11. NOTAS DE CRÉDITO PUE (Reglas 8A–8E) ──────────────────────────────
-  // tipoComprobante = E. Tratamiento inverso: revierte ingreso y cancela IVA.
-  // cuentaCargo = Devoluciones; cuentaIva = IVA a cancelar (cargo); cuentaAbono = Caja/Bancos.
+  // ── 10B. COBRO PPD VÍA MONEDERO CLUB TUBEROS (Regla 7G) ──────────────────
+  // Tipo P, formaPago=05. Idéntico a Reg 7A–7F pero usando el saldo del monedero
+  // (2103090002) en lugar de Bancos/Caja. Motor estándar tipo P:
+  //   DEBE 2103090002 (aplica saldo), HABER 1103010001 (liquida CxC),
+  //   DEBE 2105010001 (cancela IVA diferido), HABER 2104010001 (IVA definitivo).
+  {
+    nombre:       'Reg 7G — Cobro PPD Monedero Electrónico (Club Tuberos)',
+    tipoComprobante: 'P',
+    formaPago:    '05',
+    cuentaCargo:  '2103090002',  // Anticipos Otros Club Tuberos (aplica saldo monedero)
+    cuentaAbono:  '1103010001',  // Clientes (liquida CxC)
+    cuentaIva:    '2104010001',  // IVA Trasladado definitivo (HABER)
+    cuentaIvaPPD: '2105010001',  // IVA Por Trasladar PPD (DEBE — cancela diferido)
+    prioridad:    70,
+  },
+
+  // ── 11. NOTAS DE CRÉDITO PUE (Reglas 8A–8F) ──────────────────────────────
+  // tipoComprobante = E + tipoRelacion=01 + formaPago específica.
+  // tasaIva='16' + tieneDescuento=false: no compiten con Reg 17-19 (tasa 0%/mixto/descuento).
   {
     nombre:          'Reg 8A — NC PUE Devolución Efectivo',
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '01',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
     cuentaAbono:     '1101010003',  // Caja (salida de dinero)
     cuentaIva:       '2104010001',  // IVA a cancelar
@@ -338,6 +485,9 @@ const reglas = [
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '03',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
@@ -348,6 +498,9 @@ const reglas = [
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '04',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
@@ -358,6 +511,9 @@ const reglas = [
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '02',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
@@ -368,6 +524,9 @@ const reglas = [
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '28',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
@@ -378,23 +537,120 @@ const reglas = [
     tipoComprobante: 'E',
     metodoPago:      'PUE',
     formaPago:       '29',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
     prioridad:       84,
   },
 
-  // ── 12. COMODÍN — Sin coincidencia (Regla 9) ──────────────────────────────
-  // Prioridad 99 (último recurso). Forma de pago no parametrizada (ej. 05, 06, 08, 13…).
-  // Genera póliza con cuentas genéricas y queda marcada para revisión manual.
-  // cuentaIva cubre PUE; cuentaIvaPPD cubre PPD — ambas deben estar presentes.
+  // ── 12. DEVOLUCIONES NC POR TASA (Reglas 17–19) ───────────────────────────
+  // Fallback para E+tipoRelacion=01 sin formaPago conocida.
+  // tasaIva discrimina la ruta: 0% → Reg 17, mixto → Reg 18, descuento → Reg 19.
+  {
+    nombre:          'Reg 17 — NC Devolución Tasa 0%',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '0',
+    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       null,
+    prioridad:       85,
+  },
+  {
+    nombre:          'Reg 18 — NC Devolución Mixta (0%+16%)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         'mixto',
+    cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16% (partida principal)
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaAbono2:    '4200010002',  // Devoluciones s/Ventas 0% (motor)
+    cuentaIva:       '2104010001',  // IVA 16% a cancelar
+    prioridad:       86,
+  },
+  {
+    nombre:          'Reg 19 — NC Devolución sobre Descuento',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tieneDescuento:  true,
+    ivaHaber:        true,           // IVA va al HABER: la empresa cobra IVA que faltó cobrar
+    cuentaCargo:     '1103010001',  // Clientes (cobra la diferencia al cliente)
+    cuentaAbono:     '4200020001',  // Descuentos s/Ventas 16% (cancela el exceso de descuento)
+    cuentaIva:       '2104010001',  // IVA Trasladado (IVA ahora causado)
+    prioridad:       87,
+  },
+
+  // ── 13. BONIFICACIONES NC RETROACTIVAS (Reglas 20–21) ────────────────────
+  // Rappel anual / descuento retroactivo. Cargo a Ingresos, no a Devoluciones.
+  {
+    nombre:          'Reg 20 — Bonificación s/Ventas 16% (NC retroactiva)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    cuentaCargo:     '4100010001',  // Ingresos Por Ventas Contado 16%
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       '2104010001',
+    prioridad:       88,
+  },
+  {
+    nombre:          'Reg 21 — Bonificación s/Ventas Tasa 0% (NC retroactiva)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '0',
+    cuentaCargo:     '4100010002',  // Ingresos Por Ventas Contado 0%
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       null,
+    prioridad:       89,
+  },
+
+  // ── 14. NC APLICACIÓN DE ANTICIPO (Regla 23) ─────────────────────────────
+  // E + tipoRelacion=07. Liquida pasivo anticipos y reconoce IVA definitivo.
+  {
+    nombre:            'Reg 23 — NC Aplicación de Anticipo (TipoRelacion 07)',
+    tipoComprobante:   'E',
+    tipoRelacion:      '07',
+    cuentaCargo:       '2103010001',  // Anticipos De Clientes General (subtotal — cancela pasivo)
+    cuentaAbono:       '1103010001',  // Clientes Nac Gral 16% (reduce CxC de factura final)
+    cuentaIva:         '2104010001',  // IVA Trasladado definitivo (HABER)
+    cuentaIvaAnticipo: '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
+    prioridad:         90,
+  },
+
+  // ── 15. SALDO A FAVOR DEL CLIENTE (Reglas 25A, 24A) ─────────────────────
+  // NC sin reembolso — importe queda como saldo en Anticipos Otros (2103090001).
+  // 25A (prio 91) = tasa 0%; 24A (prio 92) = tasa 16%.
+  {
+    nombre:          'Reg 25A — Generación Saldo a Favor Tasa 0% (sin reembolso)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '0',
+    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:     '2103090001',  // Anticipos Otros
+    cuentaIva:       null,
+    prioridad:       91,
+  },
+  {
+    nombre:          'Reg 24A — Generación Saldo a Favor 16% (sin reembolso)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaAbono:     '2103090001',  // Anticipos Otros
+    cuentaIva:       '2104010001',  // IVA Trasladado
+    prioridad:       92,
+  },
+
+  // ── 16. COMODÍN — Sin coincidencia (Regla 9) ──────────────────────────────
+  // Prioridad 99 (último recurso). Genera póliza con cuentas genéricas para revisión.
   {
     nombre:          'Reg 9 — Comodín General (Sin coincidencia)',
-    tipoComprobante: null,               // cualquier tipo
+    tipoComprobante: null,
     metodoPago:      null,
     formaPago:       null,
-    cuentaCargo:     '1102011005',  // Bancos (default conservador)
-    cuentaAbono:     '4100020001',  // Ingresos Crédito 16% (conservador)
+    cuentaCargo:     '1102011005',  // Bancos
+    cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaIva:       '2104010001',  // IVA Trasladado (PUE)
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (PPD)
     prioridad:       99,
@@ -425,9 +681,16 @@ async function run() {
   await CfdiMappingRule.bulkCreate(reglas);
   console.log(`✓ ${reglas.length} reglas insertadas correctamente.`);
   console.log('');
-  console.log('NOTA: Las reglas intercompañía (2A–2E, 6-IC, prios 5–9 y 61)');
-  console.log('      requieren el campo rfcReceptor en el modelo.');
-  console.log('      Se deben insertar manualmente una vez agregado ese campo.');
+  console.log('IMPLEMENTADO:');
+  console.log('  ✓ rfcReceptor — modelo + matching (listo para definir Reg 2A–2E/6-IC con las cuentas intercompañía).');
+  console.log('  ✓ cuentaDeltaAnticipo — Reg 22C genera 5° mov (Bancos) cuando total_factura > total_anticipo.');
+  console.log('  ✓ esAplicacionSaldo + cuentaCargo2 — Reg 24B/25B dividen cargo saldo/cash automáticamente.');
+  console.log('');
+  console.log('PENDIENTES — requieren trabajo adicional:');
+  console.log('  • Reg 2A–2E, 6-IC (intercompañía): definir cuentas y agregar reglas al seed con rfcReceptor.');
+  console.log('  ✓ Reg 24C, 25C (saldo PPD): implementadas con relacionadoTipo=E para distinguir de Reg 22B (relacionadoTipo=I).');
+  console.log('  • Reg 24A, 25A (saldo a favor): verificar que exista cuenta 2103090001 en el catálogo.');
+  console.log('  • Las columnas nuevas (rfc_receptor, cuenta_delta_anticipo, etc.) se agregan automáticamente al reiniciar el servidor (sync alter).');
 
   await sequelize.close();
   process.exit(0);

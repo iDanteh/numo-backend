@@ -33,8 +33,10 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
   // 2. Precalcular cuentaMap para todos los códigos de todas las reglas activas
   const codigosTodos = [...new Set(
     rules.flatMap(r => [
-      r.cuentaCargo, r.cuentaAbono, r.cuentaIva,
-      r.cuentaIvaPPD, r.cuentaIvaRetenido, r.cuentaIsrRetenido,
+      r.cuentaCargo,        r.cuentaAbono,        r.cuentaAbono2,
+      r.cuentaIva,          r.cuentaIvaPPD,       r.cuentaIvaRetenido,
+      r.cuentaIsrRetenido,  r.cuentaIvaAnticipo,  r.cuentaDeltaAnticipo,
+      r.cuentaCargo2,       r.cuentaDescuento,    r.cuentaDescuento0,
     ].filter(Boolean)),
   )];
 
@@ -64,7 +66,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
       satStatus:         'Vigente',
       isActive:          true,
     })
-      .select('tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total impuestos complementoPago.totales')
+      .select('tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos complementoPago.totales cfdiRelacionados.tipoRelacion')
       .maxTimeMS(60_000)
       .lean();
 

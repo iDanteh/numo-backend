@@ -2,18 +2,26 @@
 
 const { Transaction, QueryTypes } = require('sequelize');
 const { sequelize }        = require('../../../../config/database.postgres');
-const { Poliza, PolizaMovimiento, AccountPlan } = require('../../../../shared/models/postgres');
+const { Poliza, PolizaMovimiento, AccountPlan, CentroCosto } = require('../../../../shared/models/postgres');
 const CFDI = require('../../../../visor/models/CFDI');
 
-// ── Inclusión estándar de movimientos con cuenta ──────────────────────────────
+// ── Inclusión estándar de movimientos con cuenta y centro de costo ───────────
 const MOVIMIENTOS_INCLUDE = {
   model:      PolizaMovimiento,
   as:         'movimientos',
-  include: [{
-    model:      AccountPlan,
-    as:         'cuenta',
-    attributes: ['id', 'codigo', 'nombre', 'tipo', 'naturaleza'],
-  }],
+  include: [
+    {
+      model:      AccountPlan,
+      as:         'cuenta',
+      attributes: ['id', 'codigo', 'nombre', 'tipo', 'naturaleza'],
+    },
+    {
+      model:      CentroCosto,
+      as:         'centroCostoObj',
+      attributes: ['id', 'clave', 'sucursal', 'serieFacturacion'],
+      required:   false,
+    },
+  ],
   order: [['orden', 'ASC']],
 };
 

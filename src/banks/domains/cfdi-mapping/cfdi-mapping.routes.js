@@ -47,6 +47,14 @@ router.delete('/rules/:id',
   asyncHandler(async (req, res) => { await svc.remove(req.params.id); res.status(204).end(); }),
 );
 
+// POST /api/cfdi-mapping/rules/migrar-ppd-descuento
+// Aplica en BD la corrección de reglas PPD con descuento (idempotente).
+router.post('/rules/migrar-ppd-descuento',
+  authenticate,
+  permit('polizas:admin'),
+  asyncHandler(async (_req, res) => res.json(await svc.migrarPpdDescuento())),
+);
+
 // ── Generador de propuesta ────────────────────────────────────────────────────
 
 // POST /api/cfdi-mapping/generar-propuesta

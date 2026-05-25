@@ -131,7 +131,7 @@ const soapCall = async (url, soapAction, body, token) => {
 
 // Patrón SAT oficial: Authorization: WRAP access_token="Token" (Solicitud, Verifica, Descarga)
 // Ref: Documentación SAT "Servicio de Verificación de Descarga Masiva 2023" §4 y §5
-const soapCallBearer = async (url, soapAction, envelope, token) => {
+const soapCallBearer = async (url, soapAction, envelope, token, timeoutMs = 60000) => {
   const quotedAction = `"${soapAction}"`;
   try {
     const response = await axios.post(url, envelope, {
@@ -140,7 +140,7 @@ const soapCallBearer = async (url, soapAction, envelope, token) => {
         'SOAPAction': quotedAction,
         'Authorization': `WRAP access_token="${token}"`,
       },
-      timeout: 60000,
+      timeout: timeoutMs,
     });
     return response.data;
   } catch (axiosErr) {
@@ -542,11 +542,26 @@ const _descargarZipBuffer = async (idPaquete, rfcSolicitante, creds) => {
         'http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar',
         envelope,
         token,
+        120000, // 2 min — paquetes grandes pueden superar 15 MB
       );
 
       const paqueteMatch = xmlResp.match(/<[^:]*:?Paquete[^>]*>([\s\S]+?)<\/[^:]*:?Paquete>/);
       if (!paqueteMatch || !paqueteMatch[1]) {
-        throw new Error(`No se encontró el paquete en la respuesta del SAT para IdPaquete: ${idPaquete}`);
+        const codEstatusDesc =
+          extraerAtributo(xmlResp, 'RespuestaDescargaMasivaTercerosSalida', 'CodEstatus') ||
+          extraerAtributo(xmlResp, 'PeticionDescargaMasivaTercerosRespuesta', 'CodEstatus') ||
+          extraerValor(xmlResp, 'CodEstatus');
+        if (codEstatusDesc === '5008') {
+          throw new Error(`SAT [5008]: Límite de 2 descargas por paquete excedido para ${idPaquete}. No reintentar.`);
+        }
+        if (codEstatusDesc === '5004') {
+          throw new Error(`SAT [5004]: Paquete ${idPaquete} no encontrado en el SAT.`);
+        }
+        logger.warn(`[SatDownload] Sin <Paquete>: CodEstatus=${codEstatusDesc}, resp: ${xmlResp.slice(0, 500)}`);
+        throw new Error(
+          `No se encontró el paquete en la respuesta del SAT para IdPaquete: ${idPaquete}` +
+          (codEstatusDesc ? ` (CodEstatus=${codEstatusDesc})` : ''),
+        );
       }
 
       let zipBase64   = paqueteMatch[1].trim();
@@ -557,6 +572,8 @@ const _descargarZipBuffer = async (idPaquete, rfcSolicitante, creds) => {
     } catch (err) {
       ultimoError = err;
       logger.warn(`[SatDownload] _descargarZipBuffer intento ${intento}/${MAX_INTENTOS} fallido para ${idPaquete}: ${err.message}`);
+      // Errores definitivos del SAT — no tiene sentido reintentar
+      if (err.message.includes('SAT [5008]') || err.message.includes('SAT [5004]')) break;
       if (intento < MAX_INTENTOS) {
         const espera = ESPERA_BASE_MS * intento;
         logger.info(`[SatDownload] Reintentando en ${espera / 1000} s...`);

@@ -612,6 +612,11 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
       paquetesFallidos++;
       logger.error(`[SatSyncJob] ⚠ Paquete ${idPaquete} falló (se omite): ${pkgErr.message}`);
       logger.error(`[SatSyncJob]   → El SAT permite máx 2 descargas por paquete. Si ambos intentos fallaron, elimina el checkpoint para hacer una nueva solicitud.`);
+      // Marcar como fallido permanente para no volver a intentarlo en las re-verificaciones
+      await SatJobCheckpoint.updateOne(
+        { _id: checkpoint._id },
+        { $addToSet: { paquetesFallidos: idPaquete }, $set: { updatedAt: new Date() } },
+      ).catch(() => {});
     }
   }
   // ── Re-verificar si hay más paquetes disponibles ─────────────────────────
@@ -642,7 +647,11 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
       const cpFresh = await SatJobCheckpoint.findById(checkpoint._id).lean();
       if (cpFresh) checkpoint = cpFresh;
 
-      const yaProcessados2 = new Set(checkpoint.paquetesProcesados ?? []);
+      // Excluir tanto los exitosos como los permanentemente fallidos (límite 2 del SAT)
+      const yaProcessados2 = new Set([
+        ...(checkpoint.paquetesProcesados ?? []),
+        ...(checkpoint.paquetesFallidos   ?? []),
+      ]);
       const nuevos = paquetesActualizados.filter(id => !yaProcessados2.has(id));
 
       if (nuevos.length === 0) {
@@ -666,6 +675,10 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
           logger.info(`[SatSyncJob] Paquete adicional ${idPaquete} procesado (XML).`);
         } catch (pkgErr) {
           logger.error(`[SatSyncJob] ⚠ Paquete adicional ${idPaquete} falló: ${pkgErr.message}`);
+          await SatJobCheckpoint.updateOne(
+            { _id: checkpoint._id },
+            { $addToSet: { paquetesFallidos: idPaquete }, $set: { updatedAt: new Date() } },
+          ).catch(() => {});
         }
       }
 

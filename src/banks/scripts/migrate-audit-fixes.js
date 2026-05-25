@@ -166,6 +166,41 @@ async function run() {
     }
   }
 
+  // ── Fallback por formaPago (tasaIva desconocida) ────────────────────────────
+  // CFDIs del SAT descargados solo como metadata no tienen XML completo,
+  // por lo que _detectTasaIva() devuelve null y los filtros tasaIva='16'/'0'
+  // no aplican. Estas reglas capturan ese caso con prioridad 50 (antes del
+  // comodín Reg 9 a prioridad 99, después de las específicas tasaIva a 10-15).
+  const fallbacksFormaPago = [
+    { nombre: 'Reg 1A-X — Venta Efectivo (tasa desconocida)',          formaPago: '01', cuentaCargo: '1101010003' },
+    { nombre: 'Reg 1B-X — Venta Transferencia (tasa desconocida)',     formaPago: '03', cuentaCargo: '1102011005' },
+    { nombre: 'Reg 1C-X — Venta Cheque (tasa desconocida)',            formaPago: '04', cuentaCargo: '1102011005' },
+    { nombre: 'Reg 1F-X — Venta Cheque Nominativo (tasa desconocida)', formaPago: '02', cuentaCargo: '1102011005' },
+    { nombre: 'Reg 1D-X — Venta Tarjeta Débito (tasa desconocida)',    formaPago: '28', cuentaCargo: '1102011005' },
+    { nombre: 'Reg 1E-X — Venta Tarjeta Crédito (tasa desconocida)',   formaPago: '29', cuentaCargo: '1102011005' },
+    { nombre: 'Reg 1G-X — Venta Monedero (tasa desconocida)',          formaPago: '05', cuentaCargo: '2103090002' },
+  ];
+  for (const { nombre, formaPago, cuentaCargo } of fallbacksFormaPago) {
+    const existe = await CfdiMappingRule.findOne({ where: { nombre } });
+    if (existe) {
+      console.log(`  OK (ya existía): "${nombre}"`);
+    } else {
+      await CfdiMappingRule.create({
+        nombre,
+        tipoComprobante: 'I',
+        formaPago,
+        tasaIva:         null,          // captura cuando _detectTasaIva devuelve null
+        tieneDescuento:  null,          // aplica con o sin descuento
+        cuentaCargo,
+        cuentaAbono:     '4100010001',  // Ingresos Contado 16% (default)
+        cuentaIva:       '2104010001',
+        prioridad:       50,
+        isActive:        true,
+      });
+      console.log(`  Insertada: "${nombre}" (formaPago=${formaPago}, prio=50)`);
+    }
+  }
+
   console.log('\nMigracion de auditoría completada.');
   await sequelize.close();
   process.exit(0);

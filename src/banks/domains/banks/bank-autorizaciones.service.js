@@ -69,6 +69,24 @@ function conceptoContainsAuth(concepto, authNorm) {
   return bloques.some(b => normalizarAuth(b) === authNorm);
 }
 
+// IDs de usuario que corresponden a motores automáticos (nunca a humanos).
+// Cualquier userId fuera de esta lista en identificadoPor indica intervención humana.
+const MOTOR_USERIDS = ['erp-auto', 'aut-match'];
+
+// Extrae todos los bloques numéricos de ≥5 dígitos del concepto de un movimiento.
+// Se usa como fallback cuando numeroAutorizacion y referenciaNumerica son null,
+// cubriendo el caso en que el parser del estado de cuenta no separó el campo.
+// Mínimo 5 dígitos: evita cantidades, años (2024) y otros números cortos.
+function extraerTokensConcepto(concepto) {
+  if (!concepto) return [];
+  const bloques = String(concepto).match(/\d{5,}/g);
+  if (!bloques) return [];
+  return [...new Set(
+    bloques.map(b => { const n = parseInt(b, 10); return isNaN(n) ? null : String(n); })
+           .filter(Boolean),
+  )];
+}
+
 // ── Búsqueda en índice respetando movimientos ya usados ───────────────────────
 // Parámetros opcionales:
 //   banco  — banco preferido (no excluyente)
@@ -151,24 +169,26 @@ async function ejecutarBulkConTransaccion(ops) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// MATCH DESDE ERP — flujo invertido two-phase
+// MATCH DESDE ERP — flujo directo por autorización explícita
 // ──────────────────────────────────────────────────────────────────────────────
 // Opera exclusivamente sobre los datos en erp_cuentas_pendientes (sin sync).
+// Solo vincula CxC que tengan una autorización registrada en formasPago que
+// coincida exactamente con el numeroAutorizacion o referenciaNumerica del
+// movimiento bancario. Sin tokens de concepto, sin coincidencias por texto libre.
 //
 // Flujo:
 //  1. Cargar movimientos bancarios elegibles (no_identificado + deposito > 0).
 //  2. Extraer authsConcretas: solo campos estructurados (numeroAutorizacion,
 //     referenciaNumerica, bloques BBVA "xxx/yyy"). ≤ ~500 elementos.
-//  3A. Query CxC Fase A: { _autsNorm: { $in: [...authsConcretas] } } — usa índice.
-//  3B. Query CxC Fase B (lazy): tokens ≥5 dígitos del concepto, extraídos SOLO
-//      de los movimientos que no resolvieron en Fase A. ≤ ~500 elementos.
+//  3. Query CxC: { _autsNorm: { $in: [...authsConcretas] } } — usa índice.
 //  4. Indexar movimientos en Maps para O(1) lookup por auth.
-//  5. Motor de match (cuatro rutas: auth, referencia, bloque alt, concepto).
-//     setImmediate cada 100 iter — event loop no bloqueado.
+//  5. Motor de match (tres rutas: auth, referencia, bloque alt).
+//     setImmediate cada 500 iter — event loop no bloqueado.
 //  6. Escritura bulk con transacción ACID en replica set.
 //
 // Características:
 //  · La query CxC escala O(log N) gracias al índice _autsNorm.
+//  · CxC sin autorización en formasPago son ignoradas completamente.
 //  · Cada formasPago se procesa individualmente → una CxC puede vincularse
 //    a múltiples movimientos bancarios (pagos parciales).
 //  · Modo estricto en rutas 1a/1b/1c: importe requerido cuando grupoTotal > 0.
@@ -178,21 +198,18 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 
   onProgress?.({ phase: 'loading-mov', pct: 5, msg: 'Cargando movimientos bancarios...' });
   // ── 1. Movimientos bancarios elegibles ─────────────────────────────────────
-  // Dos casos:
-  //   a) Movimiento limpio: nunca tocado por ERP (erpIds vacío).
-  //   b) Movimiento parcial: vinculado en corrida anterior por erp-auto pero
-  //      status sigue 'no_identificado' porque el saldoErp no cubrió el depósito
-  //      (caché incompleto). Puede recibir CxC adicionales en esta corrida.
-  // Nota: $size:0 no puede usar índices. Se reemplaza por $eq:[] (mismo resultado,
-  // permite que MongoDB use el índice { isActive:1, status:1, deposito:1 }).
+  // Criterios de inclusión:
+  //   · status 'no_identificado' + deposito > 0 — solo depósitos pendientes.
+  //   · Sin intervención humana: ninguna entrada en identificadoPor tiene userId
+  //     fuera de los motores conocidos. $not+$elemMatch es la única forma MongoDB
+  //     de garantizar "ningún elemento del array cumple la condición".
+  //     Esto excluye movimientos que un usuario tocó aunque status siga pendiente.
   const movimientos = await BankMovement.find({
     isActive: true,
     status:   'no_identificado',
     deposito: { $gt: 0 },
-    $or: [
-      { erpIds: { $eq: [] } },
-      { 'identificadoPor.userId': 'erp-auto' },
-    ],
+    // Protección: ningún humano ha intervenido en este movimiento
+    identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
     ...(bancoNorm ? { banco: bancoNorm } : {}),
   }).select('_id numeroAutorizacion referenciaNumerica concepto deposito erpIds erpLinks banco fecha').lean();
 
@@ -200,14 +217,19 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     return { total: 0, matcheados: 0, identificados: 0, sinMatch: 0, noMatcheados: [] };
   }
 
-  // ── 2. Construir authsConcretas — solo campos explícitos (sin tokens de concepto) ──
-  // El authNormSet original mezclaba auths estructuradas con tokens del concepto
-  // (texto libre), produciendo arrays $in de hasta 15 000 elementos que degradan
-  // el índice _autsNorm a CollScan.
-  // La separación en dos fases resuelve esto:
-  //   Fase A: authsConcretas ≤ ~500 → $in pequeño, índice B-tree eficiente O(log N)
-  //   Fase B: tokens de concepto extraídos lazy SOLO de movimientos sin match en A
-  //           → $in ~200-500 elementos, no de todos los movimientos
+  // ── Pre-computar _idStr y fechaMs — elimina conversiones repetidas en el hot path ──
+  // ObjectId.toString() y new Date() son costosos cuando se llaman N veces por cada
+  // candidato dentro del loop de matching. Se calculan una sola vez aquí.
+  for (const m of movimientos) {
+    m._idStr  = m._id.toString();
+    m.fechaMs = m.fecha ? new Date(m.fecha).getTime() : null;
+  }
+
+  // ── 2. Construir authsConcretas — SOLO campos estructurados ──────────────────
+  // Incluye únicamente valores de numeroAutorizacion, referenciaNumerica y bloques
+  // secundarios (ej. BBVA "xxx/yyy"). Garantiza un $in ≤ ~500 elementos → el índice
+  // _autsNorm opera en O(log N). Agregar tokens del concepto aquí inflaría el $in a
+  // miles de elementos y degradaría la query a CollScan — se manejan en Fase B lazy.
   const authsConcretas = new Set();
   for (const m of movimientos) {
     const na = normalizarAuth(m.numeroAutorizacion);
@@ -258,21 +280,19 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     },
   };
 
-  onProgress?.({ phase: 'loading-cxc', pct: 20, msg: `${movimientos.length} movimientos · cargando CxC Fase A (${authsConcretas.size} auths explícitas)...` });
-  // ── 3A. Query ERP Fase A — $in pequeño, usa índice _autsNorm ────────────────
+  onProgress?.({ phase: 'loading-cxc', pct: 20, msg: `${movimientos.length} movimientos · cargando CxC (${authsConcretas.size} auths explícitas)...` });
+  // ── 3. Query ERP — $in pequeño, usa índice _autsNorm ────────────────────────
   // El match opera exclusivamente sobre los datos almacenados en erp_cuentas_pendientes.
-  // No hay dependencia de frescura del caché: se usa lo que esté en la colección.
+  // Solo se cargan CxC que tengan al menos una auth en _autsNorm que coincida.
   const cxcsA = authsConcretas.size > 0
     ? await ErpCuentaPendiente.aggregate([{ $match: buildCxcMatchFilter(authsConcretas) }, stageProyeccion])
     : [];
 
-  onProgress?.({ phase: 'indexing', pct: 40, msg: `${cxcsA.length} CxC (fase A) / ${movimientos.length} movimientos · construyendo índices de búsqueda...` });
-  // ── Índices de búsqueda — construidos una sola vez, compartidos entre fases ──
-  const byAuthNorm          = new Map(); // numeroAutorizacion (primer bloque) → movs
-  const byAuthNormAlt       = new Map(); // numeroAutorizacion (bloques 2..N) → movs  ← 1c
-  const byRefNorm           = new Map(); // referenciaNumerica norm → movs
-  const porConceptoPorBanco = new Map(); // banco → movs con concepto
-  const porConceptoTodos    = [];        // todos los anteriores (para banco=null)
+  onProgress?.({ phase: 'indexing', pct: 40, msg: `${cxcsA.length} CxC / ${movimientos.length} movimientos · construyendo índices de búsqueda...` });
+  // ── Índices de búsqueda — O(1) lookup por auth ───────────────────────────────
+  const byAuthNorm    = new Map(); // numeroAutorizacion (primer bloque) → movs
+  const byAuthNormAlt = new Map(); // numeroAutorizacion (bloques 2..N) → movs  ← 1c
+  const byRefNorm     = new Map(); // referenciaNumerica norm → movs
 
   for (const m of movimientos) {
     const na = normalizarAuth(m.numeroAutorizacion);
@@ -290,15 +310,11 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       if (!byRefNorm.has(nr)) byRefNorm.set(nr, []);
       byRefNorm.get(nr).push(m);
     }
-    if (m.concepto) {
-      const b = m.banco;
-      if (!porConceptoPorBanco.has(b)) porConceptoPorBanco.set(b, []);
-      porConceptoPorBanco.get(b).push(m);
-      porConceptoTodos.push(m);
-    }
+    // Los tokens de concepto se indexan en Fase B (lazy) — no aquí.
+    // Indexarlos todos en Fase A haría crecer byAuthNorm innecesariamente.
   }
 
-  // ── Estado compartido entre ambas fases ────────────────────────────────────
+  // ── Estado del motor ─────────────────────────────────────────────────────────
   const usedMovIds   = new Set();
   const ops          = [];
   const noMatcheados = [];
@@ -318,7 +334,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     const grupoNuevo  = grupo.filter(({ cxc }) => !existingIds.has(cxc.erpId));
     if (!grupoNuevo.length) return; // todas las CxC del grupo ya vinculadas
 
-    usedMovIds.add(mov._id.toString());
+    usedMovIds.add(mov._idStr);
     matcheados += grupoNuevo.length;
 
     const newLinks = [...(mov.erpLinks || [])];
@@ -348,16 +364,13 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 
     ops.push({
       updateOne: {
-        // Acepta tanto movimientos limpios (sin vínculos) como los parcialmente
-        // vinculados por erp-auto en corridas anteriores.
-        // Excluye movimientos identificados por usuarios humanos (protección ACID).
+        // Protección ACID: replica la misma condición de la query inicial.
+        // Si entre la lectura y esta escritura un humano intervino en el movimiento,
+        // el filtro no matchea y MongoDB descarta la operación silenciosamente.
         filter: {
-          _id:    mov._id,
-          status: 'no_identificado',
-          $or: [
-            { erpIds: { $eq: [] } },
-            { 'identificadoPor.userId': 'erp-auto' },
-          ],
+          _id:             mov._id,
+          status:          'no_identificado',
+          identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
         },
         update: {
           $set: {
@@ -373,9 +386,9 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
   }
 
   // ── Helper: extrae filas (autNorm, movTotal, cxc) de un array de CxC ────────
-  // seenPairs es compartido entre fases para no reenviar el mismo (erpId, autNorm)
-  // dos veces aunque la misma CxC sea cargada en ambas fases.
-  // erpIdsIgnorar: Set de erpIds cuyas CxC ya fueron procesadas exitosamente.
+  // Solo genera filas para CxC que tengan autorización en formasPago.
+  // CxC sin auth en ningún formasPago son descartadas silenciosamente.
+  // erpIdsIgnorar: Set de erpIds a omitir (evita duplicados en llamadas sucesivas).
   const seenPairs = new Set();
   function extraerRows(cxcs, erpIdsIgnorar) {
     const rows = [];
@@ -406,12 +419,31 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     return rows;
   }
 
+  // ── Búsqueda de movimiento bancario candidato ─────────────────────────────
+  // Versión especializada para el motor ERP. Diferencias clave vs findInIndex:
+  //   · Sin allocaciones de array intermedio — itera directamente sobre candidates.
+  //   · Usa _idStr y fechaMs pre-computados (sin toString() ni new Date() en hot path).
+  //   · Exige AMBOS fecha (ventana) y importe — no existe fallback "importe sin fecha".
+  //     Si una auth coincide pero el depósito está fuera de la ventana temporal,
+  //     se descarta para evitar falsos positivos en auths que se repiten en el tiempo.
+  //   · Sin split noId/source: la query inicial ya garantiza status='no_identificado'.
+  function hallarMov(index, autNorm, grupoTotal, grupoFechaMs) {
+    const candidates = index.get(autNorm);
+    if (!candidates?.length) return null;
+    for (const m of candidates) {
+      if (usedMovIds.has(m._idStr)) continue;
+      if (!importeOk(m, grupoTotal)) continue;
+      if (grupoFechaMs !== null && m.fechaMs !== null &&
+          Math.abs(m.fechaMs - grupoFechaMs) > DATE_MATCH_WINDOW_MS) continue;
+      return m;
+    }
+    return null;
+  }
+
   // ── Motor de match — ejecuta el loop sobre un conjunto de filas CxC ─────────
-  // Diseño single-thread con setImmediate: cede el event loop cada 100 iteraciones
-  // para garantizar que los eventos de socket (progress) sean emitidos en tiempo
-  // real sin necesidad de Worker Threads.
-  // Worker Threads serían overhead en este caso — el bottleneck es I/O (MongoDB),
-  // no CPU. El loop de matching corre en < 50 ms para volúmenes típicos (~5K grupos).
+  // Diseño single-thread con setImmediate: cede el event loop cada 500 iteraciones.
+  // Worker Threads serían overhead — el bottleneck es I/O (MongoDB), no CPU.
+  // El loop de matching corre en < 50 ms para volúmenes típicos (~5K grupos).
   async function ejecutarFaseDeMatch(rows, pctStart, pctEnd, phaseLabel) {
     if (!rows.length) return;
     totalRows += rows.length;
@@ -431,36 +463,23 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       // Suma de los importes de cada formasPago del grupo
       const grupoTotal = grupo.reduce((s, r) => s + r.movTotal, 0);
 
-      // Fecha representativa: la más temprana entre fechaRealPago y fechaAfectacion
-      const grupoFecha = grupo.reduce((earliest, { cxc }) => {
+      // Timestamp representativo: el más temprano entre fechaRealPago y fechaAfectacion.
+      // Entero (ms) — evita new Date() por cada movimiento candidato en hallarMov.
+      const grupoFechaMs = grupo.reduce((earliest, { cxc }) => {
         const d = cxc.fechaRealPago ?? cxc.fechaAfectacion ?? null;
         if (!d) return earliest;
-        if (!earliest) return d;
-        return new Date(d) < new Date(earliest) ? d : earliest;
+        const ms = new Date(d).getTime();
+        return earliest === null || ms < earliest ? ms : earliest;
       }, null);
 
       let foundMov = null;
 
-      // 1a: match por numeroAutorizacion (primer bloque) — con fecha, modo estricto
-      foundMov = findInIndex(byAuthNorm, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
-      // 1b: match por referenciaNumerica — con fecha, modo estricto
-      if (!foundMov) foundMov = findInIndex(byRefNorm, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
-      // 1c: bloques secundarios del token (ej. BBVA "xxx/yyy") — con fecha, modo estricto
-      if (!foundMov) foundMov = findInIndex(byAuthNormAlt, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
-
-      // 2: auth dentro del texto del concepto — exige importe correcto
-      if (!foundMov) {
-        const candidatos = bancoNorm
-          ? (porConceptoPorBanco.get(bancoNorm) ?? [])
-          : porConceptoTodos;
-        for (const m of candidatos) {
-          if (usedMovIds.has(m._id.toString())) continue;
-          if (!conceptoContainsAuth(m.concepto, autNorm)) continue;
-          if (grupoTotal && !importeOk(m, grupoTotal)) continue;
-          foundMov = m;
-          break;
-        }
-      }
+      // 1a: numeroAutorizacion (primer bloque) — fecha + importe estrictos
+      foundMov = hallarMov(byAuthNorm, autNorm, grupoTotal, grupoFechaMs);
+      // 1b: referenciaNumerica — fecha + importe estrictos
+      if (!foundMov) foundMov = hallarMov(byRefNorm, autNorm, grupoTotal, grupoFechaMs);
+      // 1c: bloques secundarios (ej. BBVA "xxx/yyy") — fecha + importe estrictos
+      if (!foundMov) foundMov = hallarMov(byAuthNormAlt, autNorm, grupoTotal, grupoFechaMs);
 
       if (foundMov) {
         pushGroupOp(foundMov, grupo);
@@ -488,51 +507,66 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
         }
       }
 
-      // Ceder el event loop cada 100 iteraciones — permite emitir eventos de socket
-      // (progress) sin bloquear el procesamiento ni requerir Worker Threads.
-      if (procesados % 100 === 0) {
+      // Ceder el event loop cada 500 iteraciones — el loop es más liviano que antes
+      // (sin búsqueda de texto libre), así que podemos yieldar con menor frecuencia.
+      if (procesados % 500 === 0) {
         await new Promise(r => setImmediate(r));
       }
     }
   }
 
-  onProgress?.({ phase: 'matching', pct: 55, msg: `Fase A: cruzando ${cxcsA.length} CxC (auths explícitas)...` });
-  // ── Fase A: matching sobre CxC cargadas con auths concretas ────────────────
+  onProgress?.({ phase: 'matching', pct: 55, msg: `Cruzando ${cxcsA.length} CxC contra ${movimientos.length} movimientos...` });
   await ejecutarFaseDeMatch(extraerRows(cxcsA, null), 55, 70, 'Fase A (auths explícitas)');
 
-  // ── Fase B: fallback por concepto — lazy, solo para movimientos sin match ───
-  // Los tokens del concepto se extraen ÚNICAMENTE de los movimientos que no
-  // resolvieron en Fase A — no de todos los movimientos. Esto mantiene el $in
-  // en ~200-500 elementos en lugar de los 10K-15K del enfoque original.
-  const movSinMatchA = movimientos.filter(m => !usedMovIds.has(m._id.toString()) && m.concepto);
+  // ── Fase B: concepto como fallback — lazy, solo para movimientos sin auth estructurada ──
+  // Condición de inclusión: movimiento (a) no matcheó en Fase A, Y (b) no tiene
+  // ningún campo estructurado de auth. Si tiene numeroAutorizacion pero no matcheó,
+  // agregar tokens de concepto no aportaría nada útil.
+  // Los tokens deben existir EXACTAMENTE en _autsNorm de la CxC — sin texto libre.
+  // La precisión es idéntica a Fase A: fecha ±N días + importe ±$1 obligatorios.
+  const movSinMatchSinAuth = movimientos.filter(m =>
+    !usedMovIds.has(m._idStr) &&
+    !normalizarAuth(m.numeroAutorizacion) &&
+    !normalizarAuth(m.referenciaNumerica) &&
+    m.concepto,
+  );
 
-  if (movSinMatchA.length > 0) {
-    const authsConcepto = new Set();
-    for (const m of movSinMatchA) {
-      for (const b of (m.concepto.match(/\d+/g) || [])) {
-        const n = parseInt(b, 10);
-        const s = isNaN(n) ? null : String(n);
-        if (s && s.length >= 5) authsConcepto.add(s);
-      }
+  if (movSinMatchSinAuth.length > 0) {
+    // Pre-computar tokens una sola vez por movimiento — se reutilizan al indexar.
+    for (const m of movSinMatchSinAuth) {
+      m._conceptoTokens = extraerTokensConcepto(m.concepto);
     }
-    // Eliminar auths ya consultadas en Fase A para no recargar las mismas CxC
+
+    const authsConcepto = new Set();
+    for (const m of movSinMatchSinAuth) {
+      for (const t of m._conceptoTokens) authsConcepto.add(t);
+    }
+    // Excluir auths ya consultadas en Fase A para no recargar las mismas CxC.
     for (const a of authsConcretas) authsConcepto.delete(a);
 
     if (authsConcepto.size > 0) {
-      onProgress?.({ phase: 'loading-cxc-b', pct: 65, msg: `Fase B: consultando ERP (${authsConcepto.size} tokens · ${movSinMatchA.length} movimientos pendientes)...` });
-
+      onProgress?.({ phase: 'loading-cxc-b', pct: 72, msg: `Fase B: ${authsConcepto.size} tokens · ${movSinMatchSinAuth.length} movimientos sin auth estructurada...` });
       const cxcsB = await ErpCuentaPendiente.aggregate([
         { $match: buildCxcMatchFilter(authsConcepto) },
         stageProyeccion,
       ]);
 
-      // Omitir CxC ya procesadas en Fase A para evitar duplicar filas y ops
-      const erpIdsA = new Set(cxcsA.map(c => c.erpId));
-      const rowsB   = extraerRows(cxcsB, erpIdsA);
+      if (cxcsB.length > 0) {
+        // Incorporar estos movimientos al índice byAuthNorm con sus tokens de concepto.
+        // hallarMov los encontrará sin ninguna lógica adicional.
+        for (const m of movSinMatchSinAuth) {
+          for (const t of m._conceptoTokens) {
+            if (!byAuthNorm.has(t)) byAuthNorm.set(t, []);
+            byAuthNorm.get(t).push(m);
+          }
+        }
 
-      if (rowsB.length > 0) {
-        onProgress?.({ phase: 'matching', pct: 70, msg: `Fase B: cruzando ${rowsB.length} filas (concepto)...` });
-        await ejecutarFaseDeMatch(rowsB, 70, 80, 'Fase B (concepto)');
+        const erpIdsA = new Set(cxcsA.map(c => c.erpId));
+        const rowsB   = extraerRows(cxcsB, erpIdsA);
+        if (rowsB.length > 0) {
+          onProgress?.({ phase: 'matching', pct: 75, msg: `Fase B: cruzando ${rowsB.length} filas (concepto)...` });
+          await ejecutarFaseDeMatch(rowsB, 75, 85, 'Fase B (concepto)');
+        }
       }
     }
   }

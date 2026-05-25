@@ -386,6 +386,18 @@ router.patch('/movements/:id',
   }),
 );
 
+// GET /api/banks/duplicates  — análisis de movimientos potencialmente duplicados (solo admin)
+// Detecta grupos de movimientos que comparten importe+saldo+fecha o número de
+// autorización, lo que sugiere que la misma transacción fue importada más de una
+// vez con conceptos ligeramente diferentes (distinto hash → pasaron la dedup).
+router.get('/duplicates',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (_req, res) => {
+    res.json(await service.findPotentialDuplicates());
+  }),
+);
+
 // DELETE /api/banks/movements  — eliminación masiva, solo admin
 router.delete('/movements',
   authenticate,

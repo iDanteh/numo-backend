@@ -226,6 +226,7 @@ async function listMovements(filters) {
   const {
     page = 1, limit = 50,
     banco, fechaInicio, fechaFin,
+    fechaAplicacionInicio, fechaAplicacionFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
@@ -236,8 +237,12 @@ async function listMovements(filters) {
   const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
-  // Filtro por ID exacto (usado desde OCR para saltar a un movimiento específico)
-  if (movId)  filter._id   = movId;
+  // Filtro por ID: acepta un ID exacto (OCR) o varios separados por coma (duplicados).
+  // Cuando se pasan múltiples IDs se omiten los demás filtros de fecha/concepto/etc.
+  if (movId) {
+    const ids = movId.split(',').map(s => s.trim()).filter(Boolean);
+    filter._id = ids.length === 1 ? ids[0] : { $in: ids };
+  }
 
   if (categorias) {
     // Comma-separated list; __null__ represents null (sin categoría)
@@ -273,6 +278,17 @@ async function listMovements(filters) {
     filter.fecha = {};
     if (fechaInicio) filter.fecha.$gte = new Date(fechaInicio);
     if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
+  }
+
+  if (fechaAplicacionInicio || fechaAplicacionFin) {
+    const df = {};
+    if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
+    if (fechaAplicacionFin)    df.$lte = new Date(`${fechaAplicacionFin}T23:59:59.999Z`);
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [
+      { fichaAt: df },
+      { identificadoPor: { $elemMatch: { fechaId: df } } },
+    ]});
   }
 
   // Variables de búsqueda — se populan si search está activo y se reutilizan
@@ -1341,17 +1357,16 @@ async function exportMovements(filters) {
     if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
   }
 
-  // Filtro por fecha de aplicación: max(identificadoPor[].fechaId, fichaAt) en el rango.
-  // Como es un campo calculado, se filtra buscando documentos donde ALGUNO de sus
-  // campos de fecha de identificación caiga dentro del rango solicitado.
+  // Filtro por fecha de aplicación usando $elemMatch (compatible con todas las versiones de MongoDB).
+  // Usa $or: fichaAt en rango OR algún elemento de identificadoPor con fechaId en rango (mismo elemento).
   if (fechaAplicacionInicio || fechaAplicacionFin) {
     const df = {};
     if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
     if (fechaAplicacionFin)    df.$lte = new Date(`${fechaAplicacionFin}T23:59:59.999Z`);
     filter.$and = filter.$and ?? [];
     filter.$and.push({ $or: [
-      { 'identificadoPor.fechaId': df },
       { fichaAt: df },
+      { identificadoPor: { $elemMatch: { fechaId: df } } },
     ]});
   }
 
@@ -1709,9 +1724,93 @@ async function generateTemplate() {
   return wb.xlsx.writeBuffer();
 }
 
+// ── findPotentialDuplicates ───────────────────────────────────────────────────
+// Detecta movimientos que, aunque tienen hashes distintos (es decir, pasaron la
+// dedup por hash), comparten los campos clave que los hacen sospechosamente
+// iguales: misma fecha, banco, importe (depósito o retiro) y saldo; o bien,
+// misma fecha, banco y número de autorización.
+//
+// Causas típicas:
+//  • Concepto ligeramente diferente entre importaciones → hash distinto → 2 docs
+//  • Reexportación del banco con autorizaciones en formato distinto
+//  • Carga manual doble con pequeña variación en el concepto
+async function findPotentialDuplicates() {
+  // ── Estrategia 1: mismo banco + día + deposito + retiro + saldo ────────────
+  // Si el importe y saldo coinciden exactamente pero el concepto varía,
+  // el hash difiere y ambos documentos existen en la colección.
+  const byImporte = await BankMovement.aggregate([
+    { $match: { isActive: true } },
+    {
+      $group: {
+        _id: {
+          banco:    '$banco',
+          dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+          deposito: '$deposito',
+          retiro:   '$retiro',
+          saldo:    '$saldo',
+        },
+        count: { $sum: 1 },
+        ids:   { $push: '$_id' },
+      },
+    },
+    { $match: { count: { $gte: 2 } } },
+    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    { $limit: 500 },
+  ]);
+
+  // ── Construir mapa de grupos ──────────────────────────────────────────────
+  const seen = new Map();
+  for (const g of byImporte) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (!seen.has(key)) {
+      seen.set(key, { ids: g.ids, criterio: 'importe_saldo_fecha', meta: g._id, count: g.count });
+    }
+  }
+
+  if (seen.size === 0) return { total: 0, grupos: [] };
+
+  // ── Recuperar documentos completos en una sola consulta ───────────────────
+  const allIds = [...seen.values()].flatMap(g => g.ids);
+  const docs   = await BankMovement.find(
+    { _id: { $in: allIds } },
+    { hash: 0 }, // nunca exponer el hash al cliente
+  ).lean();
+
+  const byId = new Map(docs.map(d => [d._id.toString(), d]));
+
+  // ── Construir y ordenar la respuesta ──────────────────────────────────────
+  const grupos = [];
+  for (const [, group] of seen) {
+    const movimientos = group.ids
+      .map(id => byId.get(id.toString()))
+      .filter(Boolean);
+
+    if (movimientos.length >= 2) {
+      grupos.push({
+        criterio:    group.criterio,
+        meta:        group.meta,
+        count:       movimientos.length,
+        movimientos,
+      });
+    }
+  }
+
+  // Fecha descendente primero
+  grupos.sort((a, b) => {
+    const da = a.meta.dia || '';
+    const db = b.meta.dia || '';
+    if (da > db) return -1;
+    if (da < db) return  1;
+    return (a.meta.banco || '').localeCompare(b.meta.banco || '');
+  });
+
+  return { total: grupos.length, grupos };
+}
+
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, updateMovement, generateTemplate,
+  findPotentialDuplicates,
 };

@@ -299,15 +299,30 @@ router.post('/config/:banco/saldo-inicial',
   }),
 );
 
+// Mutex: impide que dos cargas de Excel corran en paralelo y generen escrituras
+// duplicadas sobre los mismos movimientos. Comportamiento idéntico al del motor ERP.
+let autMatchRunning = false;
+
 // POST /api/banks/autorizaciones/match  — match por número de autorización (vía Excel)
 router.post('/autorizaciones/match',
   authenticate,
   permit('banks:import'),
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
+    if (autMatchRunning) {
+      return res.status(409).json({ error: 'Ya hay un match de autorizaciones en progreso. Espera a que termine antes de cargar otro archivo.' });
+    }
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
-    const result = await matchAutorizaciones(req.file.buffer);
-    res.json(result);
+    autMatchRunning = true;
+    try {
+      const result = await matchAutorizaciones(req.file.buffer, {
+        userId: req.user._id,
+        nombre: req.user.nombre,
+      });
+      res.json(result);
+    } finally {
+      autMatchRunning = false;
+    }
   }),
 );
 

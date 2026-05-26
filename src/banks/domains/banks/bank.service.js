@@ -790,6 +790,78 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     }
   }
 
+  // ── 1e. Cross-date dedup: banco + saldo + importe (sin restricción de fecha) ─
+  // BBVA asigna fechas distintas al mismo depósito según el extracto descargado:
+  //   · Fecha de operación (cuando se depositó en sucursal)
+  //   · Fecha de valor     (cuando acreditó en cuenta)
+  // El hash difiere porque la fecha forma parte de la clave, y Capa 1d no los
+  // detecta porque su ventana de búsqueda es el mismo día exacto.
+  // El saldo resultante en cuenta es idéntico en ambas versiones y, combinado
+  // con el importe y el concepto, identifica el movimiento de forma unívoca.
+  //
+  // Solo aplica a movimientos sin numeroAutorizacion ni referenciaNumerica
+  // (los que tienen identificador ya quedan cubiertos por Capas 1b/1c).
+  const sinIdentificador = movements.filter(m =>
+    !hashesExistentes.has(m.hash) &&
+    !m.numeroAutorizacion        &&
+    !m.referenciaNumerica        &&
+    m.saldo != null              &&
+    (m.deposito != null || m.retiro != null),
+  );
+
+  if (sinIdentificador.length > 0) {
+    // Una condición por movimiento: banco + saldo ±0.01 + importe ±0.01
+    const saldoConds = sinIdentificador.map(m => ({
+      banco: m.banco,
+      saldo: { $gte: m.saldo - 0.01, $lte: m.saldo + 0.01 },
+      ...(m.deposito != null
+        ? { deposito: { $gte: m.deposito - 0.01, $lte: m.deposito + 0.01 } }
+        : { retiro:   { $gte: m.retiro   - 0.01, $lte: m.retiro   + 0.01 } }),
+    }));
+
+    const existBySaldo = await BankMovement.find(
+      { $or: saldoConds },
+      '_id banco saldo deposito retiro concepto numeroAutorizacion referenciaNumerica fecha',
+    ).lean();
+
+    for (const existing of existBySaldo) {
+      const incoming = sinIdentificador.find(m => {
+        if (m.banco !== existing.banco) return false;
+        if (hashesExistentes.has(m.hash)) return false; // ya marcado en iteración previa
+        const saldoMatch =
+          Math.abs(m.saldo - existing.saldo) < 0.01;
+        const montoMatch =
+          (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
+          (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
+        if (!saldoMatch || !montoMatch) return false;
+        // Concepto: prefijo o sufijo común (mín. 10 chars).
+        // Umbral menor que Capa 1d (20) para cubrir conceptos cortos pero
+        // descriptivos como "DEPOSITO EN EFECTIVO" (20 chars exactos).
+        const cA = (m.concepto        || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const cB = (existing.concepto || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const minL = Math.min(cA.length, cB.length);
+        return minL >= 10 && (
+          cA.substring(0, minL) === cB.substring(0, minL) ||
+          cA.endsWith(cB) || cB.endsWith(cA)
+        );
+      });
+      if (!incoming) continue;
+
+      // Conservar la fecha de valor (la más reciente) como fecha definitiva
+      const fechaExisting = new Date(existing.fecha).getTime();
+      const fechaIncoming = new Date(incoming.fecha).getTime();
+      if (fechaExisting !== fechaIncoming) {
+        const fechaCorrecta = fechaIncoming > fechaExisting ? incoming.fecha : existing.fecha;
+        fechaUpdates.push({ _id: existing._id, fecha: fechaCorrecta });
+      }
+
+      const enrichCross = buildSoftEnrich(incoming, existing);
+      if (enrichCross) enrichmentUpdates.push({ _id: existing._id, $set: enrichCross });
+      hashesExistentes.add(incoming.hash);
+      softDuplicados++;
+    }
+  }
+
   const nuevos     = movements.filter(m => !hashesExistentes.has(m.hash));
   const duplicados = movements.length - nuevos.length;
 
@@ -1758,12 +1830,40 @@ async function findPotentialDuplicates() {
     { $limit: 500 },
   ]);
 
-  // ── Construir mapa de grupos ──────────────────────────────────────────────
+  // ── Estrategia 2: mismo banco + día + numeroAutorizacion ──────────────────
+  // Detecta transacciones que el banco identifica con el mismo número de
+  // autorización pero que llegaron con concepto o saldo diferente (p.ej. dos
+  // renglones del mismo cargo importados en archivos distintos).
+  const byAuthNum = await BankMovement.aggregate([
+    { $match: { isActive: true, numeroAutorizacion: { $nin: [null, ''] } } },
+    {
+      $group: {
+        _id: {
+          banco:              '$banco',
+          dia:                { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+          numeroAutorizacion: '$numeroAutorizacion',
+        },
+        count: { $sum: 1 },
+        ids:   { $push: '$_id' },
+      },
+    },
+    { $match: { count: { $gte: 2 } } },
+    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    { $limit: 500 },
+  ]);
+
+  // ── Construir mapa de grupos (deduplicando por conjunto de IDs) ───────────
   const seen = new Map();
   for (const g of byImporte) {
     const key = g.ids.map(id => id.toString()).sort().join('|');
     if (!seen.has(key)) {
       seen.set(key, { ids: g.ids, criterio: 'importe_saldo_fecha', meta: g._id, count: g.count });
+    }
+  }
+  for (const g of byAuthNum) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (!seen.has(key)) {
+      seen.set(key, { ids: g.ids, criterio: 'numero_autorizacion', meta: g._id, count: g.count });
     }
   }
 

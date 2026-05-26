@@ -95,8 +95,32 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       : cfdi;
   });
 
+  // Enriquecer CFDIs SAT sin formaPago/metodoPago con datos del homólogo ERP
+  // (los descargados como solo-metadata del SAT no traen estos campos)
+  const uuidsSinMeta = cfdisSinPolizaEnriquecidos
+    .filter(c => !c.formaPago || !c.metodoPago)
+    .map(c => c.uuid);
+  let erpMetaMap = {};
+  if (uuidsSinMeta.length) {
+    const erpCfdis = await CFDI.find({
+      uuid:      { $in: uuidsSinMeta },
+      source:    'ERP',
+      formaPago: { $exists: true, $ne: null },
+    }).select('uuid formaPago metodoPago').lean();
+    erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
+  }
+  const cfdisSinPolizaFinal = cfdisSinPolizaEnriquecidos.map(cfdi => {
+    const erp = erpMetaMap[cfdi.uuid];
+    if (!erp) return cfdi;
+    return {
+      ...cfdi,
+      formaPago:  cfdi.formaPago  || erp.formaPago,
+      metodoPago: cfdi.metodoPago || erp.metodoPago,
+    };
+  });
+
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
-  const cfdiConRegla = cfdisSinPolizaEnriquecidos.map(cfdi => ({
+  const cfdiConRegla = cfdisSinPolizaFinal.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
@@ -296,8 +320,31 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       : cfdi;
   });
 
+  // Enriquecer CFDIs SAT sin formaPago/metodoPago con datos del homólogo ERP
+  const uuidsSinMetaGuard = cfdisSinPolizaEnriquecidosGuard
+    .filter(c => !c.formaPago || !c.metodoPago)
+    .map(c => c.uuid);
+  let erpMetaMapGuard = {};
+  if (uuidsSinMetaGuard.length) {
+    const erpCfdisGuard = await CFDI.find({
+      uuid:      { $in: uuidsSinMetaGuard },
+      source:    'ERP',
+      formaPago: { $exists: true, $ne: null },
+    }).select('uuid formaPago metodoPago').lean();
+    erpMetaMapGuard = Object.fromEntries(erpCfdisGuard.map(c => [c.uuid, c]));
+  }
+  const cfdisSinPolizaFinalGuard = cfdisSinPolizaEnriquecidosGuard.map(cfdi => {
+    const erp = erpMetaMapGuard[cfdi.uuid];
+    if (!erp) return cfdi;
+    return {
+      ...cfdi,
+      formaPago:  cfdi.formaPago  || erp.formaPago,
+      metodoPago: cfdi.metodoPago || erp.metodoPago,
+    };
+  });
+
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
-  const cfdiConRegla = cfdisSinPolizaEnriquecidosGuard.map(cfdi => ({
+  const cfdiConRegla = cfdisSinPolizaFinalGuard.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));

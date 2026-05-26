@@ -437,6 +437,13 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
   const fecha  = fechaInicio.slice(0, 10);
   let checkpoint = await SatJobCheckpoint.findOne({ rfc: rfc.toUpperCase(), fecha, tipoComprobante: cpTipo });
 
+  // Si ya hay una solicitud en vuelo (no completada ni con error), no duplicar
+  const enVuelo = checkpoint?.status === 'solicitando' || checkpoint?.status === 'verificando';
+  if (enVuelo && (Date.now() - new Date(checkpoint.updatedAt).getTime()) < CHECKPOINT_MAX_AGE_MS) {
+    logger.warn(`[SatSyncJob] ${tipoComprobante} ${fecha} ya tiene solicitud activa (${checkpoint.status}) — omitiendo para evitar rechazo SAT.`);
+    return { rows: [], paquetes: 0, totalReportado: 0, esMetadata };
+  }
+
   let idSolicitud, idsPaquetes;
 
   // Los paquetes SAT caducan a las 72 horas. Si el checkpoint tiene más de 72 horas,
@@ -545,9 +552,11 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
         ({ idsPaquetes, totalCfdis: totalReportadoSATLocal } = await verificar(idSolicitud, rfc, creds));
         break; // solicitud aceptada y terminada — salir del loop de reintentos
       } catch (rechazadaErr) {
-        if (rechazadaErr.message.startsWith('SAT_RECHAZADA') && intento < MAX_REINTENTOS_RECHAZADA) {
+        const esRechazada     = rechazadaErr.message.startsWith('SAT_RECHAZADA');
+        const esErrorInterno  = rechazadaErr.message.includes('SAT [5006]');
+        if ((esRechazada || esErrorInterno) && intento < MAX_REINTENTOS_RECHAZADA) {
           logger.warn(
-            `[SatSyncJob] ${tipoComprobante} rechazada por SAT (intento ${intento}/${MAX_REINTENTOS_RECHAZADA}) — ` +
+            `[SatSyncJob] ${tipoComprobante} ${esErrorInterno ? 'error interno SAT [5006]' : 'rechazada'} (intento ${intento}/${MAX_REINTENTOS_RECHAZADA}) — ` +
             `esperando ${ESPERA_RECHAZADA_MS / 60000} min antes de reintentar...`
           );
           await new Promise(r => setTimeout(r, ESPERA_RECHAZADA_MS));

@@ -565,6 +565,23 @@ const compareGeneralFields = (erp, sat) => {
       diffs.push({ field: 'metodoPago', erpValue: erp.metodoPago, satValue: sat.metodoPago, severity: 'warning' });
   }
 
+  // Validación fiscal: formaPago='99' (Por Definir) es incompatible con metodoPago='PUE'.
+  // El SAT solo permite formaPago='99' cuando metodoPago='PPD' (pago diferido).
+  // Un CFDI PUE debe tener la forma de pago real (01-30), nunca '99'.
+  if (!esPago) {
+    const erpFP = normCodigo(erp.formaPago);
+    const erpMP = normCodigo(erp.metodoPago);
+    if (erpFP === '99' && erpMP === 'PUE') {
+      diffs.push({
+        field: 'formaPago+metodoPago',
+        erpValue: `formaPago=99 + metodoPago=PUE`,
+        satValue: 'Combinación inválida — formaPago=99 solo aplica con PPD',
+        severity: 'critical',
+        type: 'FORMA_METODO_PAGO_INVALIDO',
+      });
+    }
+  }
+
   // Versión CFDI (advertencia)
   if ((erp.version || '4.0') !== (sat.version || '4.0'))
     diffs.push({ field: 'version', erpValue: erp.version, satValue: sat.version, severity: 'warning' });
@@ -608,7 +625,8 @@ const mapDiffToType = (field) => {
   if (field === 'total' || field === 'subTotal' || field === 'descuento') return 'AMOUNT_MISMATCH';
   if (field.includes('impuesto'))        return 'TAX_CALCULATION_ERROR';
   if (field === 'fecha')                 return 'DATE_MISMATCH';
-  if (field === 'tipoDeComprobante')     return 'OTHER';
+  if (field === 'tipoDeComprobante')           return 'OTHER';
+  if (field === 'formaPago+metodoPago')        return 'FORMA_METODO_PAGO_INVALIDO';
   if (field === 'moneda' || field === 'tipoCambio') return 'AMOUNT_MISMATCH';
   if (field === 'version')               return 'CFDI_VERSION_MISMATCH';
   if (field.includes('regimenFiscal'))   return 'REGIME_MISMATCH';

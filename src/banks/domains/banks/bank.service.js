@@ -755,6 +755,31 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
             // Si ninguno tiene número BNET, seguir con el check de saldo+concepto.
           }
 
+          // 2b-bis. Banamex + saldo=null: deduplicar por auth+monto cuando el entrante
+          // no trae saldo (archivos de terceros o re-exportaciones sin columna de saldo).
+          // Ocurre cuando la tercera variante de un DEP MIXTO se importa con auth real
+          // pero sin balance de cuenta → Capa 1b la atrapa si el existente ya tiene auth;
+          // si el existente aún tiene auth=null, cae aquí para deduplicar por auth del
+          // entrante contra el mismo candidato con auth no nulo.
+          if (m.banco === 'Banamex' && m.saldo == null) {
+            if (
+              m.numeroAutorizacion &&
+              !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion) &&
+              cand.numeroAutorizacion &&
+              authMatch(m.numeroAutorizacion, cand.numeroAutorizacion)
+            ) {
+              hashesExistentes.add(m.hash);
+              softDuplicados++;
+              const enrichBnmx = buildSoftEnrich(m, cand);
+              if (enrichBnmx) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnmx });
+              break;
+            }
+            // saldo=null sin auth coincidente → no es posible determinar duplicado
+            // por saldo; saltar al siguiente candidato sin ejecutar la comprobación
+            // de saldo que siempre fallará (evita conceptMatch falso con null-saldo).
+            continue;
+          }
+
           // 2b. El saldo debe coincidir exactamente (±0.01).
           // El saldo es el balance acumulado de la cuenta: dos movimientos distintos
           // en la misma cuenta nunca comparten el mismo saldo, por lo que este
@@ -1852,6 +1877,35 @@ async function findPotentialDuplicates() {
     { $limit: 500 },
   ]);
 
+  // ── Estrategia 3: mismo banco + día + monto (sin saldo) con auth compartido ─
+  // Detecta el patrón "Abono por cobranza" + "DEP EN EFECTIVO" de Banamex:
+  // ambas filas representan el mismo depósito mixto, comparten auth y monto pero
+  // tienen saldos distintos (balances intermedios) → Estrategia 1 los pierde.
+  // También captura variantes con saldo=null (re-exportaciones sin columna saldo).
+  //
+  // Condición de validez: al menos dos documentos del grupo comparten el mismo
+  // numeroAutorizacion no nulo, lo que elimina falsos positivos por coincidencia
+  // de monto (p.ej. dos depósitos legítimos de $5,000 en el mismo día).
+  const byMontoSinSaldo = await BankMovement.aggregate([
+    { $match: { isActive: true } },
+    {
+      $group: {
+        _id: {
+          banco:    '$banco',
+          dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+          deposito: '$deposito',
+          retiro:   '$retiro',
+        },
+        count: { $sum: 1 },
+        ids:   { $push: '$_id' },
+        auths: { $push: '$numeroAutorizacion' },
+      },
+    },
+    { $match: { count: { $gte: 2 } } },
+    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    { $limit: 500 },
+  ]);
+
   // ── Construir mapa de grupos (deduplicando por conjunto de IDs) ───────────
   const seen = new Map();
   for (const g of byImporte) {
@@ -1865,6 +1919,22 @@ async function findPotentialDuplicates() {
     if (!seen.has(key)) {
       seen.set(key, { ids: g.ids, criterio: 'numero_autorizacion', meta: g._id, count: g.count });
     }
+  }
+  for (const g of byMontoSinSaldo) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (seen.has(key)) continue;
+    // Validar que al menos un auth no-nulo aparezca en dos o más documentos del grupo.
+    // Esto filtra coincidencias accidentales de monto sin relación entre documentos.
+    const authCounts = new Map();
+    for (const a of g.auths) {
+      if (!a || a === '' || a === '0') continue;
+      // Normalizar ceros iniciales para equiparar "199480" con "00199480"
+      const norm = /^\d+$/.test(a) ? String(parseInt(a, 10)) : a;
+      authCounts.set(norm, (authCounts.get(norm) || 0) + 1);
+    }
+    const authCompartido = [...authCounts.values()].some(c => c >= 2);
+    if (!authCompartido) continue;
+    seen.set(key, { ids: g.ids, criterio: 'auth_monto_sin_saldo', meta: g._id, count: g.count });
   }
 
   if (seen.size === 0) return { total: 0, grupos: [] };

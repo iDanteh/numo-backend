@@ -517,6 +517,33 @@ function parseBanamex(sheet) {
     movements.push(buildBanamex(current, isOtros(current.conceptoBase, BANAMEX_OTROS)));
   }
 
+  // ── Pre-dedup: propagar auth entre movimientos adyacentes con mismo monto ──
+  // Banamex asigna el mismo número de autorización a las dos filas de un DEP MIXTO
+  // ("Abono por cobranza" + "DEP EN EFECTIVO"), pero solo la fila que precede
+  // físicamente a la sub-fila "No. de Autorización" captura el auth — la otra queda
+  // con auth=null porque el parser ya cerró `current` al encontrar la siguiente
+  // fila principal.  La fila con auth=null + saldo distinto escapa Capa A y Capa B.
+  //
+  // Condición de propagación: exactamente uno de los dos movimientos adyacentes tiene
+  // auth real (≠ null, ≠ '0') y el otro no, y ambos tienen el mismo monto (±0.01).
+  // El hash NO se recalcula: makeHash no incluye numeroAutorizacion, así que el hash
+  // sigue siendo estable entre reimportaciones del mismo archivo.
+  for (let i = 0; i < movements.length - 1; i++) {
+    const cur  = movements[i];
+    const next = movements[i + 1];
+    const curHasAuth  = cur.numeroAutorizacion  && cur.numeroAutorizacion  !== '0';
+    const nextHasAuth = next.numeroAutorizacion && next.numeroAutorizacion !== '0';
+    if (curHasAuth === nextHasAuth) continue; // ambas tienen auth o ambas no → saltar
+    const donor    = curHasAuth ? cur  : next;
+    const acceptor = curHasAuth ? next : cur;
+    const mismoMonto =
+      (donor.deposito != null && acceptor.deposito != null && Math.abs(donor.deposito - acceptor.deposito) < 0.01) ||
+      (donor.retiro   != null && acceptor.retiro   != null && Math.abs(donor.retiro   - acceptor.retiro  ) < 0.01);
+    if (mismoMonto) {
+      acceptor.numeroAutorizacion = donor.numeroAutorizacion;
+    }
+  }
+
   // ── Post-proceso: dedup intra-lote de filas hermanas ──────────────────────
   // Banamex exporta ciertos depósitos complejos como DOS filas main-row con
   // fecha en col A, representando el mismo hecho contable:

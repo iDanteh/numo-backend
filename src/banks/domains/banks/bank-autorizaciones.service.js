@@ -61,6 +61,34 @@ function importeOk(mov, importe) {
   return Math.abs(Math.abs(movMonto) - Math.abs(importe)) <= ERP_TOLERANCE;
 }
 
+// ── Fuzzy match de autorización (Levenshtein) ────────────────────────────────
+// Calcula la distancia de edición mínima entre dos strings (inserciones,
+// borrados y sustituciones). Implementación iterativa O(m·n) tiempo, O(n) espacio.
+// Para strings de autorización típicos (6–12 dígitos) el costo es despreciable.
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 0; i < a.length; i++) {
+    const curr = [i + 1];
+    for (let j = 0; j < b.length; j++) {
+      curr[j + 1] = a[i] === b[j]
+        ? prev[j]
+        : 1 + Math.min(prev[j], prev[j + 1], curr[j]);
+    }
+    prev.splice(0, prev.length, ...curr);
+  }
+  return prev[b.length];
+}
+
+// Distancia máxima permitida según la longitud de la autorización más larga.
+// ≤9 dígitos → 1 (ej. "1864626" vs "18646261"); ≥10 dígitos → 2.
+// Esto equivale aproximadamente al "95% de coincidencia" para estos rangos.
+function fuzzyAuthMaxDist(maxLen) {
+  return maxLen >= 10 ? 2 : 1;
+}
+
 // ── Búsqueda de auth dentro del concepto ─────────────────────────────────────
 function conceptoContainsAuth(concepto, authNorm) {
   if (!concepto || !authNorm) return false;
@@ -603,12 +631,16 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 // MATCH DESDE EXCEL (compatibilidad — solo actualiza status, sin erpLinks)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Igual que findInIndex pero sin argumento usedMovIds separado; recibe el Set directamente.
-function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds) {
-  return findInIndex(indice, autNorm, importe, usedMovIds, banco);
+// Igual que findInIndex pero con firma adaptada al motor Excel.
+// fecha es el valor de la columna Fecha del Excel: se usa como preferencia de proximidad
+// temporal dentro de findInIndex (sin ser criterio de exclusión — strict=false).
+function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds, fecha) {
+  return findInIndex(indice, autNorm, importe, usedMovIds, banco, fecha);
 }
 
-async function ejecutarMatch(rows) {
+// user: { userId, nombre } — identifica quién ejecutó la carga del Excel.
+// userId suele ser el Auth0 sub; nombre es el nombre del usuario en la DB.
+async function ejecutarMatch(rows, user) {
   if (!rows.length) {
     return { total: 0, matcheados: 0, identificados: 0, yaIdentificados: 0, sinMatch: 0, noMatcheados: [] };
   }
@@ -620,7 +652,7 @@ async function ejecutarMatch(rows) {
   // usa como criterio de preferencia (no de exclusión) dentro de findInIndex.
   const movimientos = await BankMovement.find({
     isActive: true,
-  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco').lean();
+  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco fecha').lean();
 
   // ── Índices de búsqueda ───────────────────────────────────────────────────
   const byAuthNorm          = new Map();
@@ -662,6 +694,15 @@ async function ejecutarMatch(rows) {
     }
   }
 
+  // Pre-filtro para la Fase 3F (fuzzy): solo movimientos con auth estructurada
+  // y status no_identificado. Se construye una sola vez y se itera en el fallback.
+  // El filtro por importe dentro del loop de 3F es muy selectivo → la iteración
+  // es rápida incluso con miles de movimientos con auth.
+  const movConAuth = movimientos.filter(m =>
+    m.status === 'no_identificado' &&
+    (normalizarAuth(m.numeroAutorizacion) || normalizarAuth(m.referenciaNumerica)),
+  );
+
   // ── Motor de match ────────────────────────────────────────────────────────
   const usedMovIds         = new Set(); // evita que dos filas consuman el mismo movimiento
   const idsAIdentificar    = new Set();
@@ -669,16 +710,19 @@ async function ejecutarMatch(rows) {
   const idsActualizarAuth  = new Map();
   const noMatcheados       = [];
   const yaIdentificadosArr = [];
+  // Lista completa de matcheados con detalle para el Excel de resultado.
+  // Incluye fase 1/2/3 (auth) y fase 4 (banco+monto), con estado diferenciado.
+  const matcheadosList     = [];
   let matcheados = 0;
 
   for (const row of rows) {
     let mov = null;
 
-    // 1a: por numeroAutorizacion (respeta banco y usedMovIds)
-    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds);
+    // 1a: por numeroAutorizacion (respeta banco, usedMovIds y fecha como preferencia)
+    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha);
 
     // 1b: por referenciaNumerica
-    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds);
+    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha);
 
     // 2: auth dentro del concepto
     if (!mov) {
@@ -699,6 +743,40 @@ async function ejecutarMatch(rows) {
       }
     }
 
+    // ── Fase 3F: fuzzy match por autorización ────────────────────────────────
+    // Se activa solo cuando las fases exactas fallaron y la fila tiene fecha e
+    // importe disponibles (guardianes obligatorios para evitar falsos positivos).
+    // Compara usando Levenshtein ≤ 1 (auths <10 dígitos) ó ≤ 2 (≥10 dígitos).
+    // Guarda el movimiento identificado en matcheadosList con estado diferenciado.
+    if (!mov && row.fecha && row.importe) {
+      const refMs = row.fecha.getTime();
+      for (const m of movConAuth) {
+        if (usedMovIds.has(m._id.toString())) continue;
+        // Importe exacto — filtro muy selectivo, hace la iteración eficiente
+        if (!importeOk(m, row.importe)) continue;
+        // Fecha dentro de la ventana — obligatorio para evitar homonimia temporal
+        if (m.fecha && Math.abs(new Date(m.fecha).getTime() - refMs) > DATE_MATCH_WINDOW_MS) continue;
+        // Banco — si ambos están disponibles deben coincidir
+        if (row.banco && m.banco && row.banco !== m.banco) continue;
+
+        const authsMovimiento = [
+          normalizarAuth(m.numeroAutorizacion),
+          normalizarAuth(m.referenciaNumerica),
+        ].filter(Boolean);
+
+        const maxLen  = Math.max(row.autNorm.length, ...authsMovimiento.map(a => a.length));
+        const maxDist = fuzzyAuthMaxDist(maxLen);
+        const esFuzzy = authsMovimiento.some(a => levenshtein(row.autNorm, a) <= maxDist);
+        if (!esFuzzy) continue;
+
+        // Marcar el movimiento como encontrado vía fuzzy para distinguirlo
+        // en matcheadosList. El objeto viene de .lean() — podemos añadir props.
+        m._fuzzyMatch = true;
+        mov = m;
+        break;
+      }
+    }
+
     if (mov) {
       matcheados++;
       usedMovIds.add(mov._id.toString());
@@ -706,12 +784,23 @@ async function ejecutarMatch(rows) {
       if (!mov.numeroAutorizacion && row.autNorm) {
         idsActualizarAuth.set(mov._id.toString(), row.autNorm);
       }
-      if (mov.status !== 'identificado') idsAIdentificar.add(mov._id.toString());
+      const esNuevo = mov.status !== 'identificado';
+      if (esNuevo) idsAIdentificar.add(mov._id.toString());
+      matcheadosList.push({
+        autorizacion: row.autNorm,
+        importe:      row.importe ?? null,
+        banco:        row.banco   ?? null,
+        estado:       esNuevo
+          ? (mov._fuzzyMatch ? 'Nuevo identificado (fuzzy)' : 'Nuevo identificado')
+          : 'Ya identificado',
+      });
     } else {
       // ── Fase 4: fallback por importe + banco entre ya identificados ─────────
       // Ocurre cuando el movimiento fue identificado (ERP/manual) pero su
       // numeroAutorizacion es null en DB (ej. BBVA "DEPOSITO EN EFECTIVO").
       // Se reporta como "ya identificado", no como "sin match".
+      // Cuando hay varios candidatos con el mismo monto, se prioriza el más próximo
+      // temporalmente a la fecha del Excel (si está disponible).
       let yaIdMov = null;
       if (row.importe) {
         const centavos = Math.round(row.importe * 100);
@@ -722,17 +811,28 @@ async function ejecutarMatch(rows) {
         const candidatosM  = idPorMonto.get(String(centavos)) ?? [];
         const pool = candidatosBM.length ? candidatosBM : candidatosM;
 
-        for (const m of pool) {
-          if (usedMovIds.has(m._id.toString())) continue;
-          if (!importeOk(m, row.importe)) continue;
-          yaIdMov = m;
-          break;
+        // Filtrar primero, luego ordenar por proximidad temporal si hay fecha
+        const validos = pool.filter(m => !usedMovIds.has(m._id.toString()) && importeOk(m, row.importe));
+        if (validos.length > 1 && row.fecha) {
+          const refMs = row.fecha.getTime();
+          validos.sort((a, b) => {
+            const da = a.fecha ? Math.abs(new Date(a.fecha).getTime() - refMs) : Infinity;
+            const db = b.fecha ? Math.abs(new Date(b.fecha).getTime() - refMs) : Infinity;
+            return da - db;
+          });
         }
+        yaIdMov = validos[0] ?? null;
       }
 
       if (yaIdMov) {
         usedMovIds.add(yaIdMov._id.toString());
         yaIdentificadosArr.push({ autorizacion: row.autNorm, importe: row.importe ?? null, banco: row.banco ?? null });
+        matcheadosList.push({
+          autorizacion: row.autNorm,
+          importe:      row.importe ?? null,
+          banco:        row.banco   ?? null,
+          estado:       'Ya identificado (sin auth)',
+        });
         // Completar el auth faltante en DB para que futuras ejecuciones lo encuentren en fase 1
         if (!yaIdMov.numeroAutorizacion && row.autNorm) {
           idsActualizarAuth.set(yaIdMov._id.toString(), row.autNorm);
@@ -751,7 +851,8 @@ async function ejecutarMatch(rows) {
       const upd = {
         $set: {
           status:          'identificado',
-          identificadoPor: [{ userId: 'aut-match', nombre: 'Motor ERP', fechaId: ahora }],
+          // Registrar al usuario real que cargó el Excel, no un motor genérico.
+          identificadoPor: [{ userId: user.userId, nombre: user.nombre, fechaId: ahora }],
         },
       };
       // Incluir auth si lo tenemos y no estaba en DB — queda vinculado desde esta corrida
@@ -759,17 +860,37 @@ async function ejecutarMatch(rows) {
         upd.$set.numeroAutorizacion = idsActualizarAuth.get(id);
         idsActualizarAuth.delete(id); // evitar doble escritura
       }
-      return { updateOne: { filter: { _id: id }, update: upd } };
+      return {
+        updateOne: {
+          // Protección ACID: solo actualizar si el movimiento sigue sin identificar
+          // y ningún humano lo ha tocado entre la lectura y esta escritura.
+          // Espeja la misma condición del motor ERP para consistencia.
+          filter: {
+            _id:             id,
+            status:          'no_identificado',
+            identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
+          },
+          update: upd,
+        },
+      };
     });
     const result = await BankMovement.bulkWrite(ops, { ordered: false });
     identificados = result.modifiedCount;
   }
 
-  // Actualizar auth en movimientos ya identificados donde faltaba (fase 4)
+  // Actualizar auth en movimientos ya identificados donde faltaba (fase 4).
+  // Solo se tocan movimientos identificados por motores automáticos: si un humano
+  // fue quien identificó el movimiento, no se sobreescribe su registro.
+  // El filtro adicional `numeroAutorizacion: null` garantiza idempotencia: si
+  // en una corrida anterior ya se grabó el auth, esta op no hace nada.
   if (idsActualizarAuth.size > 0) {
     const authOps = [...idsActualizarAuth.entries()].map(([id, autNorm]) => ({
       updateOne: {
-        filter: { _id: id },
+        filter: {
+          _id:                id,
+          numeroAutorizacion: null,
+          identificadoPor:    { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
+        },
         update: { $set: { numeroAutorizacion: autNorm } },
       },
     }));
@@ -783,6 +904,7 @@ async function ejecutarMatch(rows) {
     yaIdentificados: yaIdentificadosArr.length,
     sinMatch:        noMatcheados.length,
     noMatcheados,
+    matcheadosList,
   };
 }
 
@@ -795,6 +917,7 @@ function normHeader(val) {
 // Columnas soportadas y sus alias en el encabezado.
 // El primer alias que coincida gana.
 const HEADER_ALIASES = {
+  fecha:          ['fecha', 'date'],
   monto:          ['monto', 'importe', 'amount'],
   banco:          ['banco', 'bank', 'institucion', 'institución'],
   autorizacion:   ['autorizacion', 'autorización', 'no. autorizacion', 'no. autorización',
@@ -810,7 +933,8 @@ async function parseAutorizaciones(buffer) {
 
   // ── Detectar columnas por encabezado ──────────────────────────────────────
   // Fallback a los índices originales si no se encuentran encabezados conocidos.
-  let colMonto = 3, colBanco = 4, colAuth = 6;
+  // colFecha comienza en null: si no se detecta no se enviará fecha al motor.
+  let colFecha = null, colMonto = 3, colBanco = 4, colAuth = 6;
 
   const headerRow = ws.getRow(1);
   const found     = {};
@@ -823,6 +947,7 @@ async function parseAutorizaciones(buffer) {
     }
   });
 
+  if (found.fecha)        colFecha = found.fecha;
   if (found.monto)        colMonto = found.monto;
   if (found.banco)        colBanco = found.banco;
   if (found.autorizacion) colAuth  = found.autorizacion;
@@ -836,13 +961,23 @@ async function parseAutorizaciones(buffer) {
     const banco   = normalizarBanco(row.getCell(colBanco).value);
     const importe = impRaw != null ? Number(impRaw) : null;
     if (!autNorm || importe == null || isNaN(importe)) return;
-    rows.push({ autNorm, importe, banco });
+
+    // Fecha de la fila: se usa como criterio de preferencia en el matching.
+    // ExcelJS puede devolver Date o string según cómo esté guardada la celda.
+    let fecha = null;
+    if (colFecha != null) {
+      const raw = row.getCell(colFecha).value;
+      const d   = raw instanceof Date ? raw : (raw != null ? new Date(raw) : null);
+      if (d && !isNaN(d.getTime())) fecha = d;
+    }
+
+    rows.push({ autNorm, importe, banco, fecha });
   });
   return rows;
 }
 
-async function matchAutorizaciones(buffer) {
-  return ejecutarMatch(await parseAutorizaciones(buffer));
+async function matchAutorizaciones(buffer, user) {
+  return ejecutarMatch(await parseAutorizaciones(buffer), user);
 }
 
 module.exports = { matchAutorizacionesDesdeErp, matchAutorizaciones };

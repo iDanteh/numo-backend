@@ -30,6 +30,7 @@ const discrepancySchema = new mongoose.Schema({
       'REGIME_MISMATCH',          // Régimen fiscal no coincide
       'INVALID_EXPRESSION',       // Expresión impresa inválida según SAT
       'RFC_AMPERSAND',            // RFC con & — no verificable vía SOAP, validado localmente
+      'FORMA_METODO_PAGO_INVALIDO', // formaPago=99 con metodoPago=PUE (combinación inválida SAT)
       'OTHER',
     ],
     required: true,

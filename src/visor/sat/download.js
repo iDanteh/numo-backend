@@ -293,12 +293,11 @@ const solicitar = async (params) => {
     invalidarToken(rfcSolicitante);
 
     // Códigos especiales documentados por el SAT
-    if (codEstatus === '5005') {
-      throw new Error(
-        `SAT [5005]: Solicitud duplicada — ya existe una solicitud activa con los mismos parámetros ` +
-        `(mismo RFC, fechas y tipo). Espera a que termine o usa el checkpoint existente.`
-      );
-    }
+    if (codEstatus === '301') throw new Error(`SAT [301]: XML de la solicitud mal formado. Revisar la firma generada.`);
+    if (codEstatus === '302') throw new Error(`SAT [302]: Sello de la solicitud mal formado. Revisar crearFirmaSolicitud().`);
+    if (codEstatus === '303') throw new Error(`SAT [303]: El sello no corresponde con el RfcSolicitante. El RFC del certificado no coincide con el RFC de la solicitud.`);
+    if (codEstatus === '304') throw new Error(`SAT [304]: Certificado revocado o caducado. La e.firma del RFC está vencida o fue revocada por el SAT.`);
+    if (codEstatus === '305') throw new Error(`SAT [305]: Certificado inválido. Verifica que el archivo .cer corresponda al RFC solicitante.`);
     if (codEstatus === '5002') {
       throw new Error(
         `SAT [5002]: Se agotó el límite de solicitudes de por vida para este RFC y rango de fechas. ` +
@@ -309,6 +308,17 @@ const solicitar = async (params) => {
       throw new Error(
         `SAT [5003]: El rango solicitado supera el tope máximo de CFDIs por solicitud. ` +
         `Reduce el rango de fechas a períodos más cortos.`
+      );
+    }
+    if (codEstatus === '5005') {
+      throw new Error(
+        `SAT [5005]: Solicitud duplicada — ya existe una solicitud activa con los mismos parámetros ` +
+        `(mismo RFC, fechas y tipo). Espera a que termine o usa el checkpoint existente.`
+      );
+    }
+    if (codEstatus === '5006') {
+      throw new Error(
+        `SAT [5006]: Error interno en el proceso del SAT. Es transitorio — reintenta en unos minutos.`
       );
     }
     if (codEstatus === '404') {

@@ -373,6 +373,25 @@ const startDownload = asyncHandler(async (req, res) => {
   }
   // ──────────────────────────────────────────────────────────────────────────
 
+  // ── Verificar que no haya solicitudes activas en el SAT para este RFC ──────
+  const SatJobCheckpoint = require('../models/SatJobCheckpoint');
+  const checkpointActivo = await SatJobCheckpoint.findOne({
+    rfc:    rfcNorm,
+    status: { $in: ['solicitando', 'verificando', 'descargando'] },
+  }).lean();
+  if (checkpointActivo) {
+    return res.status(409).json({
+      error:  `Ya hay una solicitud en proceso con el SAT para el RFC ${rfcNorm} (tipo: ${checkpointActivo.tipoComprobante}, fecha: ${checkpointActivo.fecha}, estado: ${checkpointActivo.status}). Espera a que termine antes de iniciar otra descarga.`,
+      codigo: 'SOLICITUD_EN_PROCESO',
+      detalle: {
+        tipoComprobante: checkpointActivo.tipoComprobante,
+        fecha:           checkpointActivo.fecha,
+        status:          checkpointActivo.status,
+      },
+    });
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   const jobId = `manual-${rfcNorm}-${Date.now()}`;
   jobsManales.set(jobId, {
     jobId, rfc: rfcNorm, estado: 'en_proceso',

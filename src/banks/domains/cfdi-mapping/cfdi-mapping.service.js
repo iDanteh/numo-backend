@@ -113,6 +113,13 @@ function _detectTasaIva(cfdi) {
       if (iva16 > 0 || iva8 > 0) return '16';
       const montoTotal = Number(totales.montoTotalPagos || 0);
       if (montoTotal > 0) return '0';
+    } else {
+      // CP 1.0 (CFDI 3.3) o Metadata (sin complementoPago): sin desglose de tasa IVA.
+      const pagos = cfdi.complementoPago?.pagos ?? [];
+      const montoTotal = pagos.length > 0
+        ? pagos.reduce((s, p) => s + Number(p.monto || 0), 0)
+        : Number(cfdi.total || 0);    // Metadata: usar cfdi.total
+      if (montoTotal > 0) return '0'; // no se puede determinar tasa → tratar como 0%
     }
     return null;
   }
@@ -193,30 +200,47 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
 
   // Para CFDI tipo P, total y subTotal son siempre 0 por diseño SAT.
   // Los montos reales viven en el complemento de pago.
-  const subtotal = esPago
-    ? Number(cfdi.complementoPago?.totales?.totalTrasladosBaseIVA16 || 0) +
-      Number(cfdi.complementoPago?.totales?.totalTrasladosBaseIVA8  || 0)
-    : Number(cfdi.subTotal || 0);
+  //
+  // Complemento de Pago 2.0 (CFDI 4.0): usa el nodo <Totales> con MontoTotalPagos.
+  // Complemento de Pago 1.0 (CFDI 3.3): no tiene <Totales> → suma pagos[].monto.
+  // Descarga Metadata (>5 días): no tiene complementoPago → usar cfdi.total (viene del SAT metadata).
+  const cpTotales = cfdi.complementoPago?.totales;
+  const cpPagos   = cfdi.complementoPago?.pagos ?? [];
 
-  const total = esPago
-    ? Number(cfdi.complementoPago?.totales?.montoTotalPagos || 0)
+  const _cpTotal = esPago
+    ? (cpTotales
+        ? Number(cpTotales.montoTotalPagos || 0)
+        : cpPagos.length > 0
+          ? cpPagos.reduce((s, p) => s + Number(p.monto || 0), 0)
+          : Number(cfdi.total || 0))   // fallback: total del SAT Metadata
     : Number(cfdi.total || 0);
 
+  const subtotal = esPago
+    ? (cpTotales
+        ? Number(cpTotales.totalTrasladosBaseIVA16 || 0) +
+          Number(cpTotales.totalTrasladosBaseIVA8  || 0)
+        : _cpTotal)   // sin desglose de base: usar monto completo
+    : Number(cfdi.subTotal || 0);
+
+  const total = _cpTotal;
+
   // Para tipo P el SAT exige Total=0 y SubTotal=0 en el header; los importes reales
-  // están en complementoPago.totales (Complemento de Pago 2.0).
+  // están en complementoPago.totales (CP 2.0), pagos[].monto (CP 1.0), o cfdi.total (Metadata).
   const iva = esPago
-    ? Number(cfdi.complementoPago?.totales?.totalTrasladosImpuestoIVA16 || 0) +
-      Number(cfdi.complementoPago?.totales?.totalTrasladosImpuestoIVA8  || 0)
+    ? (cpTotales
+        ? Number(cpTotales.totalTrasladosImpuestoIVA16 || 0) +
+          Number(cpTotales.totalTrasladosImpuestoIVA8  || 0)
+        : 0)   // CP 1.0 / Metadata no desglosan IVA
     : Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
 
   const ivaRet = esPago
-    ? Number(cfdi.complementoPago?.totales?.totalRetencionesIVA || 0)
+    ? Number(cpTotales?.totalRetencionesImpuestoIVA || 0)
     : Number(cfdi.impuestos?.totalImpuestosRetenidos || 0);
 
   // ISR retenido: tipo P lo reporta en complementoPago.totales; tipo I/E en retenciones del header.
   // cfdi.impuestos está vacío para tipo P por especificación SAT CFDI 4.0.
   const isrRet = esPago
-    ? Number(cfdi.complementoPago?.totales?.totalRetencionesISR || 0)
+    ? Number(cpTotales?.totalRetencionesImpuestoISR || 0)
     : Number(
         (cfdi.impuestos?.retenciones ?? [])
           .filter(r => r.impuesto === '001')

@@ -61,12 +61,58 @@ function importeOk(mov, importe) {
   return Math.abs(Math.abs(movMonto) - Math.abs(importe)) <= ERP_TOLERANCE;
 }
 
+// ── Fuzzy match de autorización (Levenshtein) ────────────────────────────────
+// Calcula la distancia de edición mínima entre dos strings (inserciones,
+// borrados y sustituciones). Implementación iterativa O(m·n) tiempo, O(n) espacio.
+// Para strings de autorización típicos (6–12 dígitos) el costo es despreciable.
+function levenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 0; i < a.length; i++) {
+    const curr = [i + 1];
+    for (let j = 0; j < b.length; j++) {
+      curr[j + 1] = a[i] === b[j]
+        ? prev[j]
+        : 1 + Math.min(prev[j], prev[j + 1], curr[j]);
+    }
+    prev.splice(0, prev.length, ...curr);
+  }
+  return prev[b.length];
+}
+
+// Distancia máxima permitida según la longitud de la autorización más larga.
+// ≤9 dígitos → 1 (ej. "1864626" vs "18646261"); ≥10 dígitos → 2.
+// Esto equivale aproximadamente al "95% de coincidencia" para estos rangos.
+function fuzzyAuthMaxDist(maxLen) {
+  return maxLen >= 10 ? 2 : 1;
+}
+
 // ── Búsqueda de auth dentro del concepto ─────────────────────────────────────
 function conceptoContainsAuth(concepto, authNorm) {
   if (!concepto || !authNorm) return false;
   const bloques = concepto.match(/\d+/g);
   if (!bloques) return false;
   return bloques.some(b => normalizarAuth(b) === authNorm);
+}
+
+// IDs de usuario que corresponden a motores automáticos (nunca a humanos).
+// Cualquier userId fuera de esta lista en identificadoPor indica intervención humana.
+const MOTOR_USERIDS = ['erp-auto', 'aut-match'];
+
+// Extrae todos los bloques numéricos de ≥5 dígitos del concepto de un movimiento.
+// Se usa como fallback cuando numeroAutorizacion y referenciaNumerica son null,
+// cubriendo el caso en que el parser del estado de cuenta no separó el campo.
+// Mínimo 5 dígitos: evita cantidades, años (2024) y otros números cortos.
+function extraerTokensConcepto(concepto) {
+  if (!concepto) return [];
+  const bloques = String(concepto).match(/\d{5,}/g);
+  if (!bloques) return [];
+  return [...new Set(
+    bloques.map(b => { const n = parseInt(b, 10); return isNaN(n) ? null : String(n); })
+           .filter(Boolean),
+  )];
 }
 
 // ── Búsqueda en índice respetando movimientos ya usados ───────────────────────
@@ -151,24 +197,26 @@ async function ejecutarBulkConTransaccion(ops) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// MATCH DESDE ERP — flujo invertido two-phase
+// MATCH DESDE ERP — flujo directo por autorización explícita
 // ──────────────────────────────────────────────────────────────────────────────
 // Opera exclusivamente sobre los datos en erp_cuentas_pendientes (sin sync).
+// Solo vincula CxC que tengan una autorización registrada en formasPago que
+// coincida exactamente con el numeroAutorizacion o referenciaNumerica del
+// movimiento bancario. Sin tokens de concepto, sin coincidencias por texto libre.
 //
 // Flujo:
 //  1. Cargar movimientos bancarios elegibles (no_identificado + deposito > 0).
 //  2. Extraer authsConcretas: solo campos estructurados (numeroAutorizacion,
 //     referenciaNumerica, bloques BBVA "xxx/yyy"). ≤ ~500 elementos.
-//  3A. Query CxC Fase A: { _autsNorm: { $in: [...authsConcretas] } } — usa índice.
-//  3B. Query CxC Fase B (lazy): tokens ≥5 dígitos del concepto, extraídos SOLO
-//      de los movimientos que no resolvieron en Fase A. ≤ ~500 elementos.
+//  3. Query CxC: { _autsNorm: { $in: [...authsConcretas] } } — usa índice.
 //  4. Indexar movimientos en Maps para O(1) lookup por auth.
-//  5. Motor de match (cuatro rutas: auth, referencia, bloque alt, concepto).
-//     setImmediate cada 100 iter — event loop no bloqueado.
+//  5. Motor de match (tres rutas: auth, referencia, bloque alt).
+//     setImmediate cada 500 iter — event loop no bloqueado.
 //  6. Escritura bulk con transacción ACID en replica set.
 //
 // Características:
 //  · La query CxC escala O(log N) gracias al índice _autsNorm.
+//  · CxC sin autorización en formasPago son ignoradas completamente.
 //  · Cada formasPago se procesa individualmente → una CxC puede vincularse
 //    a múltiples movimientos bancarios (pagos parciales).
 //  · Modo estricto en rutas 1a/1b/1c: importe requerido cuando grupoTotal > 0.
@@ -178,21 +226,18 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 
   onProgress?.({ phase: 'loading-mov', pct: 5, msg: 'Cargando movimientos bancarios...' });
   // ── 1. Movimientos bancarios elegibles ─────────────────────────────────────
-  // Dos casos:
-  //   a) Movimiento limpio: nunca tocado por ERP (erpIds vacío).
-  //   b) Movimiento parcial: vinculado en corrida anterior por erp-auto pero
-  //      status sigue 'no_identificado' porque el saldoErp no cubrió el depósito
-  //      (caché incompleto). Puede recibir CxC adicionales en esta corrida.
-  // Nota: $size:0 no puede usar índices. Se reemplaza por $eq:[] (mismo resultado,
-  // permite que MongoDB use el índice { isActive:1, status:1, deposito:1 }).
+  // Criterios de inclusión:
+  //   · status 'no_identificado' + deposito > 0 — solo depósitos pendientes.
+  //   · Sin intervención humana: ninguna entrada en identificadoPor tiene userId
+  //     fuera de los motores conocidos. $not+$elemMatch es la única forma MongoDB
+  //     de garantizar "ningún elemento del array cumple la condición".
+  //     Esto excluye movimientos que un usuario tocó aunque status siga pendiente.
   const movimientos = await BankMovement.find({
     isActive: true,
     status:   'no_identificado',
     deposito: { $gt: 0 },
-    $or: [
-      { erpIds: { $eq: [] } },
-      { 'identificadoPor.userId': 'erp-auto' },
-    ],
+    // Protección: ningún humano ha intervenido en este movimiento
+    identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
     ...(bancoNorm ? { banco: bancoNorm } : {}),
   }).select('_id numeroAutorizacion referenciaNumerica concepto deposito erpIds erpLinks banco fecha').lean();
 
@@ -200,14 +245,19 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     return { total: 0, matcheados: 0, identificados: 0, sinMatch: 0, noMatcheados: [] };
   }
 
-  // ── 2. Construir authsConcretas — solo campos explícitos (sin tokens de concepto) ──
-  // El authNormSet original mezclaba auths estructuradas con tokens del concepto
-  // (texto libre), produciendo arrays $in de hasta 15 000 elementos que degradan
-  // el índice _autsNorm a CollScan.
-  // La separación en dos fases resuelve esto:
-  //   Fase A: authsConcretas ≤ ~500 → $in pequeño, índice B-tree eficiente O(log N)
-  //   Fase B: tokens de concepto extraídos lazy SOLO de movimientos sin match en A
-  //           → $in ~200-500 elementos, no de todos los movimientos
+  // ── Pre-computar _idStr y fechaMs — elimina conversiones repetidas en el hot path ──
+  // ObjectId.toString() y new Date() son costosos cuando se llaman N veces por cada
+  // candidato dentro del loop de matching. Se calculan una sola vez aquí.
+  for (const m of movimientos) {
+    m._idStr  = m._id.toString();
+    m.fechaMs = m.fecha ? new Date(m.fecha).getTime() : null;
+  }
+
+  // ── 2. Construir authsConcretas — SOLO campos estructurados ──────────────────
+  // Incluye únicamente valores de numeroAutorizacion, referenciaNumerica y bloques
+  // secundarios (ej. BBVA "xxx/yyy"). Garantiza un $in ≤ ~500 elementos → el índice
+  // _autsNorm opera en O(log N). Agregar tokens del concepto aquí inflaría el $in a
+  // miles de elementos y degradaría la query a CollScan — se manejan en Fase B lazy.
   const authsConcretas = new Set();
   for (const m of movimientos) {
     const na = normalizarAuth(m.numeroAutorizacion);
@@ -258,21 +308,19 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     },
   };
 
-  onProgress?.({ phase: 'loading-cxc', pct: 20, msg: `${movimientos.length} movimientos · cargando CxC Fase A (${authsConcretas.size} auths explícitas)...` });
-  // ── 3A. Query ERP Fase A — $in pequeño, usa índice _autsNorm ────────────────
+  onProgress?.({ phase: 'loading-cxc', pct: 20, msg: `${movimientos.length} movimientos · cargando CxC (${authsConcretas.size} auths explícitas)...` });
+  // ── 3. Query ERP — $in pequeño, usa índice _autsNorm ────────────────────────
   // El match opera exclusivamente sobre los datos almacenados en erp_cuentas_pendientes.
-  // No hay dependencia de frescura del caché: se usa lo que esté en la colección.
+  // Solo se cargan CxC que tengan al menos una auth en _autsNorm que coincida.
   const cxcsA = authsConcretas.size > 0
     ? await ErpCuentaPendiente.aggregate([{ $match: buildCxcMatchFilter(authsConcretas) }, stageProyeccion])
     : [];
 
-  onProgress?.({ phase: 'indexing', pct: 40, msg: `${cxcsA.length} CxC (fase A) / ${movimientos.length} movimientos · construyendo índices de búsqueda...` });
-  // ── Índices de búsqueda — construidos una sola vez, compartidos entre fases ──
-  const byAuthNorm          = new Map(); // numeroAutorizacion (primer bloque) → movs
-  const byAuthNormAlt       = new Map(); // numeroAutorizacion (bloques 2..N) → movs  ← 1c
-  const byRefNorm           = new Map(); // referenciaNumerica norm → movs
-  const porConceptoPorBanco = new Map(); // banco → movs con concepto
-  const porConceptoTodos    = [];        // todos los anteriores (para banco=null)
+  onProgress?.({ phase: 'indexing', pct: 40, msg: `${cxcsA.length} CxC / ${movimientos.length} movimientos · construyendo índices de búsqueda...` });
+  // ── Índices de búsqueda — O(1) lookup por auth ───────────────────────────────
+  const byAuthNorm    = new Map(); // numeroAutorizacion (primer bloque) → movs
+  const byAuthNormAlt = new Map(); // numeroAutorizacion (bloques 2..N) → movs  ← 1c
+  const byRefNorm     = new Map(); // referenciaNumerica norm → movs
 
   for (const m of movimientos) {
     const na = normalizarAuth(m.numeroAutorizacion);
@@ -290,15 +338,11 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       if (!byRefNorm.has(nr)) byRefNorm.set(nr, []);
       byRefNorm.get(nr).push(m);
     }
-    if (m.concepto) {
-      const b = m.banco;
-      if (!porConceptoPorBanco.has(b)) porConceptoPorBanco.set(b, []);
-      porConceptoPorBanco.get(b).push(m);
-      porConceptoTodos.push(m);
-    }
+    // Los tokens de concepto se indexan en Fase B (lazy) — no aquí.
+    // Indexarlos todos en Fase A haría crecer byAuthNorm innecesariamente.
   }
 
-  // ── Estado compartido entre ambas fases ────────────────────────────────────
+  // ── Estado del motor ─────────────────────────────────────────────────────────
   const usedMovIds   = new Set();
   const ops          = [];
   const noMatcheados = [];
@@ -318,7 +362,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     const grupoNuevo  = grupo.filter(({ cxc }) => !existingIds.has(cxc.erpId));
     if (!grupoNuevo.length) return; // todas las CxC del grupo ya vinculadas
 
-    usedMovIds.add(mov._id.toString());
+    usedMovIds.add(mov._idStr);
     matcheados += grupoNuevo.length;
 
     const newLinks = [...(mov.erpLinks || [])];
@@ -348,16 +392,13 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 
     ops.push({
       updateOne: {
-        // Acepta tanto movimientos limpios (sin vínculos) como los parcialmente
-        // vinculados por erp-auto en corridas anteriores.
-        // Excluye movimientos identificados por usuarios humanos (protección ACID).
+        // Protección ACID: replica la misma condición de la query inicial.
+        // Si entre la lectura y esta escritura un humano intervino en el movimiento,
+        // el filtro no matchea y MongoDB descarta la operación silenciosamente.
         filter: {
-          _id:    mov._id,
-          status: 'no_identificado',
-          $or: [
-            { erpIds: { $eq: [] } },
-            { 'identificadoPor.userId': 'erp-auto' },
-          ],
+          _id:             mov._id,
+          status:          'no_identificado',
+          identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
         },
         update: {
           $set: {
@@ -373,9 +414,9 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
   }
 
   // ── Helper: extrae filas (autNorm, movTotal, cxc) de un array de CxC ────────
-  // seenPairs es compartido entre fases para no reenviar el mismo (erpId, autNorm)
-  // dos veces aunque la misma CxC sea cargada en ambas fases.
-  // erpIdsIgnorar: Set de erpIds cuyas CxC ya fueron procesadas exitosamente.
+  // Solo genera filas para CxC que tengan autorización en formasPago.
+  // CxC sin auth en ningún formasPago son descartadas silenciosamente.
+  // erpIdsIgnorar: Set de erpIds a omitir (evita duplicados en llamadas sucesivas).
   const seenPairs = new Set();
   function extraerRows(cxcs, erpIdsIgnorar) {
     const rows = [];
@@ -406,12 +447,31 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     return rows;
   }
 
+  // ── Búsqueda de movimiento bancario candidato ─────────────────────────────
+  // Versión especializada para el motor ERP. Diferencias clave vs findInIndex:
+  //   · Sin allocaciones de array intermedio — itera directamente sobre candidates.
+  //   · Usa _idStr y fechaMs pre-computados (sin toString() ni new Date() en hot path).
+  //   · Exige AMBOS fecha (ventana) y importe — no existe fallback "importe sin fecha".
+  //     Si una auth coincide pero el depósito está fuera de la ventana temporal,
+  //     se descarta para evitar falsos positivos en auths que se repiten en el tiempo.
+  //   · Sin split noId/source: la query inicial ya garantiza status='no_identificado'.
+  function hallarMov(index, autNorm, grupoTotal, grupoFechaMs) {
+    const candidates = index.get(autNorm);
+    if (!candidates?.length) return null;
+    for (const m of candidates) {
+      if (usedMovIds.has(m._idStr)) continue;
+      if (!importeOk(m, grupoTotal)) continue;
+      if (grupoFechaMs !== null && m.fechaMs !== null &&
+          Math.abs(m.fechaMs - grupoFechaMs) > DATE_MATCH_WINDOW_MS) continue;
+      return m;
+    }
+    return null;
+  }
+
   // ── Motor de match — ejecuta el loop sobre un conjunto de filas CxC ─────────
-  // Diseño single-thread con setImmediate: cede el event loop cada 100 iteraciones
-  // para garantizar que los eventos de socket (progress) sean emitidos en tiempo
-  // real sin necesidad de Worker Threads.
-  // Worker Threads serían overhead en este caso — el bottleneck es I/O (MongoDB),
-  // no CPU. El loop de matching corre en < 50 ms para volúmenes típicos (~5K grupos).
+  // Diseño single-thread con setImmediate: cede el event loop cada 500 iteraciones.
+  // Worker Threads serían overhead — el bottleneck es I/O (MongoDB), no CPU.
+  // El loop de matching corre en < 50 ms para volúmenes típicos (~5K grupos).
   async function ejecutarFaseDeMatch(rows, pctStart, pctEnd, phaseLabel) {
     if (!rows.length) return;
     totalRows += rows.length;
@@ -431,36 +491,23 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       // Suma de los importes de cada formasPago del grupo
       const grupoTotal = grupo.reduce((s, r) => s + r.movTotal, 0);
 
-      // Fecha representativa: la más temprana entre fechaRealPago y fechaAfectacion
-      const grupoFecha = grupo.reduce((earliest, { cxc }) => {
+      // Timestamp representativo: el más temprano entre fechaRealPago y fechaAfectacion.
+      // Entero (ms) — evita new Date() por cada movimiento candidato en hallarMov.
+      const grupoFechaMs = grupo.reduce((earliest, { cxc }) => {
         const d = cxc.fechaRealPago ?? cxc.fechaAfectacion ?? null;
         if (!d) return earliest;
-        if (!earliest) return d;
-        return new Date(d) < new Date(earliest) ? d : earliest;
+        const ms = new Date(d).getTime();
+        return earliest === null || ms < earliest ? ms : earliest;
       }, null);
 
       let foundMov = null;
 
-      // 1a: match por numeroAutorizacion (primer bloque) — con fecha, modo estricto
-      foundMov = findInIndex(byAuthNorm, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
-      // 1b: match por referenciaNumerica — con fecha, modo estricto
-      if (!foundMov) foundMov = findInIndex(byRefNorm, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
-      // 1c: bloques secundarios del token (ej. BBVA "xxx/yyy") — con fecha, modo estricto
-      if (!foundMov) foundMov = findInIndex(byAuthNormAlt, autNorm, grupoTotal, usedMovIds, undefined, grupoFecha, true);
-
-      // 2: auth dentro del texto del concepto — exige importe correcto
-      if (!foundMov) {
-        const candidatos = bancoNorm
-          ? (porConceptoPorBanco.get(bancoNorm) ?? [])
-          : porConceptoTodos;
-        for (const m of candidatos) {
-          if (usedMovIds.has(m._id.toString())) continue;
-          if (!conceptoContainsAuth(m.concepto, autNorm)) continue;
-          if (grupoTotal && !importeOk(m, grupoTotal)) continue;
-          foundMov = m;
-          break;
-        }
-      }
+      // 1a: numeroAutorizacion (primer bloque) — fecha + importe estrictos
+      foundMov = hallarMov(byAuthNorm, autNorm, grupoTotal, grupoFechaMs);
+      // 1b: referenciaNumerica — fecha + importe estrictos
+      if (!foundMov) foundMov = hallarMov(byRefNorm, autNorm, grupoTotal, grupoFechaMs);
+      // 1c: bloques secundarios (ej. BBVA "xxx/yyy") — fecha + importe estrictos
+      if (!foundMov) foundMov = hallarMov(byAuthNormAlt, autNorm, grupoTotal, grupoFechaMs);
 
       if (foundMov) {
         pushGroupOp(foundMov, grupo);
@@ -488,51 +535,66 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
         }
       }
 
-      // Ceder el event loop cada 100 iteraciones — permite emitir eventos de socket
-      // (progress) sin bloquear el procesamiento ni requerir Worker Threads.
-      if (procesados % 100 === 0) {
+      // Ceder el event loop cada 500 iteraciones — el loop es más liviano que antes
+      // (sin búsqueda de texto libre), así que podemos yieldar con menor frecuencia.
+      if (procesados % 500 === 0) {
         await new Promise(r => setImmediate(r));
       }
     }
   }
 
-  onProgress?.({ phase: 'matching', pct: 55, msg: `Fase A: cruzando ${cxcsA.length} CxC (auths explícitas)...` });
-  // ── Fase A: matching sobre CxC cargadas con auths concretas ────────────────
+  onProgress?.({ phase: 'matching', pct: 55, msg: `Cruzando ${cxcsA.length} CxC contra ${movimientos.length} movimientos...` });
   await ejecutarFaseDeMatch(extraerRows(cxcsA, null), 55, 70, 'Fase A (auths explícitas)');
 
-  // ── Fase B: fallback por concepto — lazy, solo para movimientos sin match ───
-  // Los tokens del concepto se extraen ÚNICAMENTE de los movimientos que no
-  // resolvieron en Fase A — no de todos los movimientos. Esto mantiene el $in
-  // en ~200-500 elementos en lugar de los 10K-15K del enfoque original.
-  const movSinMatchA = movimientos.filter(m => !usedMovIds.has(m._id.toString()) && m.concepto);
+  // ── Fase B: concepto como fallback — lazy, solo para movimientos sin auth estructurada ──
+  // Condición de inclusión: movimiento (a) no matcheó en Fase A, Y (b) no tiene
+  // ningún campo estructurado de auth. Si tiene numeroAutorizacion pero no matcheó,
+  // agregar tokens de concepto no aportaría nada útil.
+  // Los tokens deben existir EXACTAMENTE en _autsNorm de la CxC — sin texto libre.
+  // La precisión es idéntica a Fase A: fecha ±N días + importe ±$1 obligatorios.
+  const movSinMatchSinAuth = movimientos.filter(m =>
+    !usedMovIds.has(m._idStr) &&
+    !normalizarAuth(m.numeroAutorizacion) &&
+    !normalizarAuth(m.referenciaNumerica) &&
+    m.concepto,
+  );
 
-  if (movSinMatchA.length > 0) {
-    const authsConcepto = new Set();
-    for (const m of movSinMatchA) {
-      for (const b of (m.concepto.match(/\d+/g) || [])) {
-        const n = parseInt(b, 10);
-        const s = isNaN(n) ? null : String(n);
-        if (s && s.length >= 5) authsConcepto.add(s);
-      }
+  if (movSinMatchSinAuth.length > 0) {
+    // Pre-computar tokens una sola vez por movimiento — se reutilizan al indexar.
+    for (const m of movSinMatchSinAuth) {
+      m._conceptoTokens = extraerTokensConcepto(m.concepto);
     }
-    // Eliminar auths ya consultadas en Fase A para no recargar las mismas CxC
+
+    const authsConcepto = new Set();
+    for (const m of movSinMatchSinAuth) {
+      for (const t of m._conceptoTokens) authsConcepto.add(t);
+    }
+    // Excluir auths ya consultadas en Fase A para no recargar las mismas CxC.
     for (const a of authsConcretas) authsConcepto.delete(a);
 
     if (authsConcepto.size > 0) {
-      onProgress?.({ phase: 'loading-cxc-b', pct: 65, msg: `Fase B: consultando ERP (${authsConcepto.size} tokens · ${movSinMatchA.length} movimientos pendientes)...` });
-
+      onProgress?.({ phase: 'loading-cxc-b', pct: 72, msg: `Fase B: ${authsConcepto.size} tokens · ${movSinMatchSinAuth.length} movimientos sin auth estructurada...` });
       const cxcsB = await ErpCuentaPendiente.aggregate([
         { $match: buildCxcMatchFilter(authsConcepto) },
         stageProyeccion,
       ]);
 
-      // Omitir CxC ya procesadas en Fase A para evitar duplicar filas y ops
-      const erpIdsA = new Set(cxcsA.map(c => c.erpId));
-      const rowsB   = extraerRows(cxcsB, erpIdsA);
+      if (cxcsB.length > 0) {
+        // Incorporar estos movimientos al índice byAuthNorm con sus tokens de concepto.
+        // hallarMov los encontrará sin ninguna lógica adicional.
+        for (const m of movSinMatchSinAuth) {
+          for (const t of m._conceptoTokens) {
+            if (!byAuthNorm.has(t)) byAuthNorm.set(t, []);
+            byAuthNorm.get(t).push(m);
+          }
+        }
 
-      if (rowsB.length > 0) {
-        onProgress?.({ phase: 'matching', pct: 70, msg: `Fase B: cruzando ${rowsB.length} filas (concepto)...` });
-        await ejecutarFaseDeMatch(rowsB, 70, 80, 'Fase B (concepto)');
+        const erpIdsA = new Set(cxcsA.map(c => c.erpId));
+        const rowsB   = extraerRows(cxcsB, erpIdsA);
+        if (rowsB.length > 0) {
+          onProgress?.({ phase: 'matching', pct: 75, msg: `Fase B: cruzando ${rowsB.length} filas (concepto)...` });
+          await ejecutarFaseDeMatch(rowsB, 75, 85, 'Fase B (concepto)');
+        }
       }
     }
   }
@@ -569,12 +631,16 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 // MATCH DESDE EXCEL (compatibilidad — solo actualiza status, sin erpLinks)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Igual que findInIndex pero sin argumento usedMovIds separado; recibe el Set directamente.
-function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds) {
-  return findInIndex(indice, autNorm, importe, usedMovIds, banco);
+// Igual que findInIndex pero con firma adaptada al motor Excel.
+// fecha es el valor de la columna Fecha del Excel: se usa como preferencia de proximidad
+// temporal dentro de findInIndex (sin ser criterio de exclusión — strict=false).
+function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds, fecha) {
+  return findInIndex(indice, autNorm, importe, usedMovIds, banco, fecha);
 }
 
-async function ejecutarMatch(rows) {
+// user: { userId, nombre } — identifica quién ejecutó la carga del Excel.
+// userId suele ser el Auth0 sub; nombre es el nombre del usuario en la DB.
+async function ejecutarMatch(rows, user) {
   if (!rows.length) {
     return { total: 0, matcheados: 0, identificados: 0, yaIdentificados: 0, sinMatch: 0, noMatcheados: [] };
   }
@@ -586,7 +652,7 @@ async function ejecutarMatch(rows) {
   // usa como criterio de preferencia (no de exclusión) dentro de findInIndex.
   const movimientos = await BankMovement.find({
     isActive: true,
-  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco').lean();
+  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco fecha').lean();
 
   // ── Índices de búsqueda ───────────────────────────────────────────────────
   const byAuthNorm          = new Map();
@@ -628,6 +694,15 @@ async function ejecutarMatch(rows) {
     }
   }
 
+  // Pre-filtro para la Fase 3F (fuzzy): solo movimientos con auth estructurada
+  // y status no_identificado. Se construye una sola vez y se itera en el fallback.
+  // El filtro por importe dentro del loop de 3F es muy selectivo → la iteración
+  // es rápida incluso con miles de movimientos con auth.
+  const movConAuth = movimientos.filter(m =>
+    m.status === 'no_identificado' &&
+    (normalizarAuth(m.numeroAutorizacion) || normalizarAuth(m.referenciaNumerica)),
+  );
+
   // ── Motor de match ────────────────────────────────────────────────────────
   const usedMovIds         = new Set(); // evita que dos filas consuman el mismo movimiento
   const idsAIdentificar    = new Set();
@@ -635,16 +710,19 @@ async function ejecutarMatch(rows) {
   const idsActualizarAuth  = new Map();
   const noMatcheados       = [];
   const yaIdentificadosArr = [];
+  // Lista completa de matcheados con detalle para el Excel de resultado.
+  // Incluye fase 1/2/3 (auth) y fase 4 (banco+monto), con estado diferenciado.
+  const matcheadosList     = [];
   let matcheados = 0;
 
   for (const row of rows) {
     let mov = null;
 
-    // 1a: por numeroAutorizacion (respeta banco y usedMovIds)
-    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds);
+    // 1a: por numeroAutorizacion (respeta banco, usedMovIds y fecha como preferencia)
+    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha);
 
     // 1b: por referenciaNumerica
-    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds);
+    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha);
 
     // 2: auth dentro del concepto
     if (!mov) {
@@ -665,6 +743,40 @@ async function ejecutarMatch(rows) {
       }
     }
 
+    // ── Fase 3F: fuzzy match por autorización ────────────────────────────────
+    // Se activa solo cuando las fases exactas fallaron y la fila tiene fecha e
+    // importe disponibles (guardianes obligatorios para evitar falsos positivos).
+    // Compara usando Levenshtein ≤ 1 (auths <10 dígitos) ó ≤ 2 (≥10 dígitos).
+    // Guarda el movimiento identificado en matcheadosList con estado diferenciado.
+    if (!mov && row.fecha && row.importe) {
+      const refMs = row.fecha.getTime();
+      for (const m of movConAuth) {
+        if (usedMovIds.has(m._id.toString())) continue;
+        // Importe exacto — filtro muy selectivo, hace la iteración eficiente
+        if (!importeOk(m, row.importe)) continue;
+        // Fecha dentro de la ventana — obligatorio para evitar homonimia temporal
+        if (m.fecha && Math.abs(new Date(m.fecha).getTime() - refMs) > DATE_MATCH_WINDOW_MS) continue;
+        // Banco — si ambos están disponibles deben coincidir
+        if (row.banco && m.banco && row.banco !== m.banco) continue;
+
+        const authsMovimiento = [
+          normalizarAuth(m.numeroAutorizacion),
+          normalizarAuth(m.referenciaNumerica),
+        ].filter(Boolean);
+
+        const maxLen  = Math.max(row.autNorm.length, ...authsMovimiento.map(a => a.length));
+        const maxDist = fuzzyAuthMaxDist(maxLen);
+        const esFuzzy = authsMovimiento.some(a => levenshtein(row.autNorm, a) <= maxDist);
+        if (!esFuzzy) continue;
+
+        // Marcar el movimiento como encontrado vía fuzzy para distinguirlo
+        // en matcheadosList. El objeto viene de .lean() — podemos añadir props.
+        m._fuzzyMatch = true;
+        mov = m;
+        break;
+      }
+    }
+
     if (mov) {
       matcheados++;
       usedMovIds.add(mov._id.toString());
@@ -672,12 +784,23 @@ async function ejecutarMatch(rows) {
       if (!mov.numeroAutorizacion && row.autNorm) {
         idsActualizarAuth.set(mov._id.toString(), row.autNorm);
       }
-      if (mov.status !== 'identificado') idsAIdentificar.add(mov._id.toString());
+      const esNuevo = mov.status !== 'identificado';
+      if (esNuevo) idsAIdentificar.add(mov._id.toString());
+      matcheadosList.push({
+        autorizacion: row.autNorm,
+        importe:      row.importe ?? null,
+        banco:        row.banco   ?? null,
+        estado:       esNuevo
+          ? (mov._fuzzyMatch ? 'Nuevo identificado (fuzzy)' : 'Nuevo identificado')
+          : 'Ya identificado',
+      });
     } else {
       // ── Fase 4: fallback por importe + banco entre ya identificados ─────────
       // Ocurre cuando el movimiento fue identificado (ERP/manual) pero su
       // numeroAutorizacion es null en DB (ej. BBVA "DEPOSITO EN EFECTIVO").
       // Se reporta como "ya identificado", no como "sin match".
+      // Cuando hay varios candidatos con el mismo monto, se prioriza el más próximo
+      // temporalmente a la fecha del Excel (si está disponible).
       let yaIdMov = null;
       if (row.importe) {
         const centavos = Math.round(row.importe * 100);
@@ -688,17 +811,28 @@ async function ejecutarMatch(rows) {
         const candidatosM  = idPorMonto.get(String(centavos)) ?? [];
         const pool = candidatosBM.length ? candidatosBM : candidatosM;
 
-        for (const m of pool) {
-          if (usedMovIds.has(m._id.toString())) continue;
-          if (!importeOk(m, row.importe)) continue;
-          yaIdMov = m;
-          break;
+        // Filtrar primero, luego ordenar por proximidad temporal si hay fecha
+        const validos = pool.filter(m => !usedMovIds.has(m._id.toString()) && importeOk(m, row.importe));
+        if (validos.length > 1 && row.fecha) {
+          const refMs = row.fecha.getTime();
+          validos.sort((a, b) => {
+            const da = a.fecha ? Math.abs(new Date(a.fecha).getTime() - refMs) : Infinity;
+            const db = b.fecha ? Math.abs(new Date(b.fecha).getTime() - refMs) : Infinity;
+            return da - db;
+          });
         }
+        yaIdMov = validos[0] ?? null;
       }
 
       if (yaIdMov) {
         usedMovIds.add(yaIdMov._id.toString());
         yaIdentificadosArr.push({ autorizacion: row.autNorm, importe: row.importe ?? null, banco: row.banco ?? null });
+        matcheadosList.push({
+          autorizacion: row.autNorm,
+          importe:      row.importe ?? null,
+          banco:        row.banco   ?? null,
+          estado:       'Ya identificado (sin auth)',
+        });
         // Completar el auth faltante en DB para que futuras ejecuciones lo encuentren en fase 1
         if (!yaIdMov.numeroAutorizacion && row.autNorm) {
           idsActualizarAuth.set(yaIdMov._id.toString(), row.autNorm);
@@ -717,7 +851,8 @@ async function ejecutarMatch(rows) {
       const upd = {
         $set: {
           status:          'identificado',
-          identificadoPor: [{ userId: 'aut-match', nombre: 'Motor ERP', fechaId: ahora }],
+          // Registrar al usuario real que cargó el Excel, no un motor genérico.
+          identificadoPor: [{ userId: user.userId, nombre: user.nombre, fechaId: ahora }],
         },
       };
       // Incluir auth si lo tenemos y no estaba en DB — queda vinculado desde esta corrida
@@ -725,17 +860,37 @@ async function ejecutarMatch(rows) {
         upd.$set.numeroAutorizacion = idsActualizarAuth.get(id);
         idsActualizarAuth.delete(id); // evitar doble escritura
       }
-      return { updateOne: { filter: { _id: id }, update: upd } };
+      return {
+        updateOne: {
+          // Protección ACID: solo actualizar si el movimiento sigue sin identificar
+          // y ningún humano lo ha tocado entre la lectura y esta escritura.
+          // Espeja la misma condición del motor ERP para consistencia.
+          filter: {
+            _id:             id,
+            status:          'no_identificado',
+            identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
+          },
+          update: upd,
+        },
+      };
     });
     const result = await BankMovement.bulkWrite(ops, { ordered: false });
     identificados = result.modifiedCount;
   }
 
-  // Actualizar auth en movimientos ya identificados donde faltaba (fase 4)
+  // Actualizar auth en movimientos ya identificados donde faltaba (fase 4).
+  // Solo se tocan movimientos identificados por motores automáticos: si un humano
+  // fue quien identificó el movimiento, no se sobreescribe su registro.
+  // El filtro adicional `numeroAutorizacion: null` garantiza idempotencia: si
+  // en una corrida anterior ya se grabó el auth, esta op no hace nada.
   if (idsActualizarAuth.size > 0) {
     const authOps = [...idsActualizarAuth.entries()].map(([id, autNorm]) => ({
       updateOne: {
-        filter: { _id: id },
+        filter: {
+          _id:                id,
+          numeroAutorizacion: null,
+          identificadoPor:    { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
+        },
         update: { $set: { numeroAutorizacion: autNorm } },
       },
     }));
@@ -749,6 +904,7 @@ async function ejecutarMatch(rows) {
     yaIdentificados: yaIdentificadosArr.length,
     sinMatch:        noMatcheados.length,
     noMatcheados,
+    matcheadosList,
   };
 }
 
@@ -761,6 +917,7 @@ function normHeader(val) {
 // Columnas soportadas y sus alias en el encabezado.
 // El primer alias que coincida gana.
 const HEADER_ALIASES = {
+  fecha:          ['fecha', 'date'],
   monto:          ['monto', 'importe', 'amount'],
   banco:          ['banco', 'bank', 'institucion', 'institución'],
   autorizacion:   ['autorizacion', 'autorización', 'no. autorizacion', 'no. autorización',
@@ -776,7 +933,8 @@ async function parseAutorizaciones(buffer) {
 
   // ── Detectar columnas por encabezado ──────────────────────────────────────
   // Fallback a los índices originales si no se encuentran encabezados conocidos.
-  let colMonto = 3, colBanco = 4, colAuth = 6;
+  // colFecha comienza en null: si no se detecta no se enviará fecha al motor.
+  let colFecha = null, colMonto = 3, colBanco = 4, colAuth = 6;
 
   const headerRow = ws.getRow(1);
   const found     = {};
@@ -789,6 +947,7 @@ async function parseAutorizaciones(buffer) {
     }
   });
 
+  if (found.fecha)        colFecha = found.fecha;
   if (found.monto)        colMonto = found.monto;
   if (found.banco)        colBanco = found.banco;
   if (found.autorizacion) colAuth  = found.autorizacion;
@@ -802,13 +961,23 @@ async function parseAutorizaciones(buffer) {
     const banco   = normalizarBanco(row.getCell(colBanco).value);
     const importe = impRaw != null ? Number(impRaw) : null;
     if (!autNorm || importe == null || isNaN(importe)) return;
-    rows.push({ autNorm, importe, banco });
+
+    // Fecha de la fila: se usa como criterio de preferencia en el matching.
+    // ExcelJS puede devolver Date o string según cómo esté guardada la celda.
+    let fecha = null;
+    if (colFecha != null) {
+      const raw = row.getCell(colFecha).value;
+      const d   = raw instanceof Date ? raw : (raw != null ? new Date(raw) : null);
+      if (d && !isNaN(d.getTime())) fecha = d;
+    }
+
+    rows.push({ autNorm, importe, banco, fecha });
   });
   return rows;
 }
 
-async function matchAutorizaciones(buffer) {
-  return ejecutarMatch(await parseAutorizaciones(buffer));
+async function matchAutorizaciones(buffer, user) {
+  return ejecutarMatch(await parseAutorizaciones(buffer), user);
 }
 
 module.exports = { matchAutorizacionesDesdeErp, matchAutorizaciones };

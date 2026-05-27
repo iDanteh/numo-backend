@@ -124,13 +124,23 @@ async function getCards() {
           no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
           identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
-          saldoPendiente:  {
+          saldoPendiente: {
+            // Σ depósitos no_identificados − Σ depósitos identificados.
+            // Retiros y status 'otros' no participan en este cálculo.
             $sum: {
-              $cond: [
-                { $in: ['$status', ['no_identificado', null]] },
-                { $ifNull: ['$deposito', 0] },
-                0,
-              ],
+              $switch: {
+                branches: [
+                  {
+                    case: { $in: ['$status', ['no_identificado', null]] },
+                    then: { $ifNull: ['$deposito', 0] },
+                  },
+                  {
+                    case: { $eq: ['$status', 'identificado'] },
+                    then: { $multiply: [{ $ifNull: ['$deposito', 0] }, -1] },
+                  },
+                ],
+                default: 0,
+              },
             },
           },
           saldoIdentificado: {

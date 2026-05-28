@@ -95,18 +95,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       : cfdi;
   });
 
-  // Enriquecer CFDIs SAT sin formaPago/metodoPago con datos del homólogo ERP
-  // (los descargados como solo-metadata del SAT no traen estos campos)
+  // Enriquecer CFDIs SAT sin formaPago/metodoPago o sin conceptos con datos del homólogo ERP.
+  // Los descargados como Metadata del SAT no traen estos campos ni el desglose de conceptos.
+  // Al inyectar los conceptos del ERP, _detectTasaIva y _calcCfdiMontos usan TasaOCuota real
+  // en lugar de estimarla desde totalImpuestosTrasladados.
   const uuidsSinMeta = cfdisSinPolizaEnriquecidos
-    .filter(c => !c.formaPago || !c.metodoPago)
+    .filter(c => !c.formaPago || !c.metodoPago || !c.conceptos?.length)
     .map(c => c.uuid);
   let erpMetaMap = {};
   if (uuidsSinMeta.length) {
     const erpCfdis = await CFDI.find({
-      uuid:      { $in: uuidsSinMeta },
-      source:    'ERP',
-      formaPago: { $exists: true, $ne: null },
-    }).select('uuid formaPago metodoPago').lean();
+      uuid:   { $in: uuidsSinMeta },
+      source: 'ERP',
+    }).select('uuid formaPago metodoPago conceptos impuestos').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinal = cfdisSinPolizaEnriquecidos.map(cfdi => {
@@ -116,6 +117,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       ...cfdi,
       formaPago:  cfdi.formaPago  || erp.formaPago,
       metodoPago: cfdi.metodoPago || erp.metodoPago,
+      // Inyectar conceptos del ERP solo cuando el SAT no los trajo (Metadata)
+      conceptos:  cfdi.conceptos?.length ? cfdi.conceptos : (erp.conceptos ?? []),
+      impuestos:  cfdi.conceptos?.length ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
     };
   });
 
@@ -320,17 +324,16 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       : cfdi;
   });
 
-  // Enriquecer CFDIs SAT sin formaPago/metodoPago con datos del homólogo ERP
+  // Enriquecer CFDIs SAT sin formaPago/metodoPago o sin conceptos con datos del homólogo ERP.
   const uuidsSinMetaGuard = cfdisSinPolizaEnriquecidosGuard
-    .filter(c => !c.formaPago || !c.metodoPago)
+    .filter(c => !c.formaPago || !c.metodoPago || !c.conceptos?.length)
     .map(c => c.uuid);
   let erpMetaMapGuard = {};
   if (uuidsSinMetaGuard.length) {
     const erpCfdisGuard = await CFDI.find({
-      uuid:      { $in: uuidsSinMetaGuard },
-      source:    'ERP',
-      formaPago: { $exists: true, $ne: null },
-    }).select('uuid formaPago metodoPago').lean();
+      uuid:   { $in: uuidsSinMetaGuard },
+      source: 'ERP',
+    }).select('uuid formaPago metodoPago conceptos impuestos').lean();
     erpMetaMapGuard = Object.fromEntries(erpCfdisGuard.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinalGuard = cfdisSinPolizaEnriquecidosGuard.map(cfdi => {
@@ -340,6 +343,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       ...cfdi,
       formaPago:  cfdi.formaPago  || erp.formaPago,
       metodoPago: cfdi.metodoPago || erp.metodoPago,
+      conceptos:  cfdi.conceptos?.length ? cfdi.conceptos : (erp.conceptos ?? []),
+      impuestos:  cfdi.conceptos?.length ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
     };
   });
 

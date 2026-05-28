@@ -36,6 +36,7 @@ const CfdiMappingRule    = require('../../shared/models/postgres/CfdiMappingRule
 // 4100010001  Ingresos Por Ventas Contado 16%
 // 4100010002  Ingresos Por Ventas Contado 0%
 // 4100020001  Ingresos Por Ventas Crédito 16%
+// 4100020002  Ingresos Por Ventas Crédito Tasa 0%
 // 4200010001  Devoluciones s/Ventas 16%
 // 4200010002  Devoluciones s/Ventas 0%
 // 4200020001  Descuentos s/Ventas 16%
@@ -43,8 +44,20 @@ const CfdiMappingRule    = require('../../shared/models/postgres/CfdiMappingRule
 
 const reglas = [
 
-  // ── 0. ANTICIPOS (Regla 22) ────────────────────────────────────────────────
+  // ── 0. ANTICIPOS (Reglas 22A + 22) ───────────────────────────────────────
   // Prioridad 9 — antes que 1A–1E para que el claveProdServ gane.
+  // Reg 22A (formaPago=01) gana por spec sobre Reg 22 (formaPago=null) al desempatar.
+  {
+    nombre:          'Reg 22A — Recepción de Anticipo Efectivo (ClaveProdServ 84111506)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    claveProdServ:   '84111506',
+    cuentaCargo:     '1101010003',   // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '2103010001',   // Anticipos de Clientes General
+    cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos
+    prioridad:       9,
+  },
   {
     nombre:          'Reg 22 — Recepción de Anticipo (ClaveProdServ 84111506)',
     tipoComprobante: 'I',
@@ -132,6 +145,21 @@ const reglas = [
     cuentaIva:       '2104010001',
     prioridad:       14,
   },
+  {
+    // Fallback para formas de pago no cubiertas por 1A–1E (ej. 06=Dinero electrónico,
+    // 17=Compensación, etc.). formaPago=null: gana por prioridad solo cuando ninguna
+    // regla más específica aplica. Spec-count: 1A–1E tienen formaPago → ganan sobre esta.
+    nombre:          'Reg 1X — Venta PUE 16% (Forma de Pago No Especificada)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       null,
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '1102011005',   // Bancos (forma de pago desconocida → cuenta genérica)
+    cuentaAbono:     '4100010001',   // Ingresos Contado 16%
+    cuentaIva:       '2104010001',   // IVA Trasladado
+    prioridad:       14,
+  },
 
   // ── 1B. MONEDERO ELECTRÓNICO CLUB TUBEROS (Reglas 1G, 10B) ───────────────
   // formaPago=05 (monedero electrónico). El saldo del monedero vive en 2103090002.
@@ -165,8 +193,21 @@ const reglas = [
     prioridad:       10,            // mismo número que 1G; spec mayor gana (tiene tasaIva)
   },
 
-  // ── 2. IVA TASA 0% — PUE (Regla 10) ──────────────────────────────────────
+  // ── 2. IVA TASA 0% — PUE (Reglas 10A + 10) ───────────────────────────────
   // Prioridad 15. Exportaciones, alimentos, medicamentos. Sin IVA.
+  // Reg 10A (formaPago=01) gana por spec sobre Reg 10 (formaPago=null) al desempatar.
+  {
+    nombre:          'Reg 10A — Venta PUE Efectivo Tasa 0%',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '4100010002',  // Ingresos Contado 0%
+    cuentaIva:       null,
+    prioridad:       15,
+  },
   {
     nombre:          'Reg 10 — Venta PUE Tasa 0%',
     tipoComprobante: 'I',
@@ -180,8 +221,53 @@ const reglas = [
     prioridad:       15,
   },
 
-  // ── 3. CFDI MIXTO PUE (0%+16%) — Regla 12 ──────────────────────────────
+  // ── 2B. SIN TASA IVA / EXENTO — PUE (Reglas 1NA + 1NX) ──────────────────
+  // Prioridad 16 (mismo que Reg 12 mixto — en empate de prio, spec mayor gana).
+  // Captura CFDIs exentos (alimentos, medicamentos, exportaciones) donde
+  // _detectTasaIva devuelve null por ausencia de nodo traslados.
+  // Reg 10/10A (tasaIva='0', prio 15) tienen más spec → ganan para 0% reales.
+  // Reg 12/12A (tasaIva='mixto') tienen más spec → ganan para mixtos.
+  {
+    nombre:          'Reg 1NA — Venta PUE Efectivo Exento (Sin Tasa IVA)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         null,
+    tieneDescuento:  false,
+    cuentaCargo:     '1101010003',   // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '4100010002',   // Ingresos Contado 0% (exento = sin IVA)
+    cuentaIva:       null,
+    prioridad:       16,
+  },
+  {
+    nombre:          'Reg 1NX — Venta PUE Exento Fallback (Sin Tasa IVA)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       null,
+    tasaIva:         null,
+    tieneDescuento:  false,
+    cuentaCargo:     '1102011005',   // Bancos
+    cuentaAbono:     '4100010002',   // Ingresos Contado 0%
+    cuentaIva:       null,
+    prioridad:       16,
+  },
+
+  // ── 3. CFDI MIXTO PUE (0%+16%) — Reglas 12A + 12 ────────────────────────
   // Prioridad 16. Motor agrega partida Ingresos 0% (cuentaAbono2) por subtotal exento.
+  // Reg 12A (formaPago=01) gana por spec sobre Reg 12 (formaPago=null) al desempatar.
+  {
+    nombre:          'Reg 12A — Venta Mixta PUE Efectivo (0%+16%)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         'mixto',
+    tieneDescuento:  false,
+    cuentaCargo:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '4100010001',  // Ingresos 16% (partida principal)
+    cuentaAbono2:    '4100010002',  // Ingresos 0% (partida adicional — motor)
+    cuentaIva:       '2104010001',
+    prioridad:       16,
+  },
   {
     nombre:          'Reg 12 — Venta Mixta PUE (0%+16%)',
     tipoComprobante: 'I',
@@ -196,8 +282,22 @@ const reglas = [
     prioridad:       16,
   },
 
-  // ── 4. DESCUENTOS PUE 16% (Regla 14) ─────────────────────────────────────
+  // ── 4. DESCUENTOS PUE 16% (Regla 14 + 14A) ───────────────────────────────
   // Prioridad 17. Motor agrega línea Descuentos s/Ventas 16% (cuentaDescuento).
+  // Reg 14A (formaPago=01) gana por spec sobre Reg 14 (formaPago=null) al desempatar.
+  {
+    nombre:          'Reg 14A — Venta con Descuento PUE Efectivo 16%',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         '16',
+    tieneDescuento:  true,
+    cuentaCargo:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '4100010001',
+    cuentaIva:       '2104010001',
+    cuentaDescuento: '4200020001',  // Descuentos s/Ventas 16%
+    prioridad:       17,
+  },
   {
     nombre:          'Reg 14 — Venta con Descuento PUE 16%',
     tipoComprobante: 'I',
@@ -212,7 +312,21 @@ const reglas = [
     prioridad:       17,
   },
 
-  // ── 5. DESCUENTOS PUE 0% (Regla 15) ──────────────────────────────────────
+  // ── 5. DESCUENTOS PUE 0% (Reglas 15A + 15) ───────────────────────────────
+  // Reg 15A (formaPago=01) gana por spec sobre Reg 15 (formaPago=null) al desempatar.
+  {
+    nombre:          'Reg 15A — Venta con Descuento PUE Efectivo Tasa 0%',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         '0',
+    tieneDescuento:  true,
+    cuentaCargo:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '4100010002',  // Ingresos 0%
+    cuentaIva:       null,
+    cuentaDescuento: '4200020002',  // Descuentos s/Ventas 0%
+    prioridad:       18,
+  },
   {
     nombre:          'Reg 15 — Venta con Descuento PUE Tasa 0%',
     tipoComprobante: 'I',
@@ -227,8 +341,54 @@ const reglas = [
     prioridad:       18,
   },
 
-  // ── 6. DESCUENTOS MIXTO (Regla 16) ───────────────────────────────────────
+  // ── 5B. DESCUENTO PUE EXENTO (Reglas 15NA + 15NX) ────────────────────────
+  // Prioridad 19 (mismo que Reg 16/16A mixto-descuento — spec mayor gana en empate).
+  // Reg 15/15A (tasaIva='0') y Reg 16/16A (tasaIva='mixto') tienen más spec → ganan.
+  {
+    nombre:          'Reg 15NA — Venta con Descuento PUE Efectivo Exento (Sin Tasa IVA)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         null,
+    tieneDescuento:  true,
+    cuentaCargo:     '1101010003',   // Caja
+    cuentaAbono:     '4100010002',   // Ingresos Contado 0%
+    cuentaIva:       null,
+    cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    prioridad:       19,
+  },
+  {
+    nombre:          'Reg 15NX — Venta con Descuento PUE Exento Fallback (Sin Tasa IVA)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       null,
+    tasaIva:         null,
+    tieneDescuento:  true,
+    cuentaCargo:     '1102011005',   // Bancos
+    cuentaAbono:     '4100010002',   // Ingresos Contado 0%
+    cuentaIva:       null,
+    cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    prioridad:       19,
+  },
+
+  // ── 6. DESCUENTOS MIXTO (Reglas 16A + 16) ────────────────────────────────
   // Prioridad 19. Mixto con descuentos en ambas tasas.
+  // Reg 16A (formaPago=01) gana por spec sobre Reg 16 (formaPago=null) al desempatar.
+  {
+    nombre:          'Reg 16A — Venta con Descuento Mixto PUE Efectivo (0%+16%)',
+    tipoComprobante: 'I',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tasaIva:         'mixto',
+    tieneDescuento:  true,
+    cuentaCargo:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaAbono:     '4100010001',
+    cuentaAbono2:    '4100010002',  // Ingresos 0% (motor)
+    cuentaIva:       '2104010001',
+    cuentaDescuento:  '4200020001',  // Descuentos s/Ventas 16%
+    cuentaDescuento0: '4200020002',  // Descuentos s/Ventas 0%
+    prioridad:       19,
+  },
   {
     nombre:          'Reg 16 — Venta con Descuento Mixto PUE (0%+16%)',
     tipoComprobante: 'I',
@@ -300,8 +460,8 @@ const reglas = [
     tasaIva:           '0',
     esAplicacionSaldo: true,
     cuentaCargo:       '2103090001',
-    cuentaCargo2:      '1103010001',
-    cuentaAbono:       '4100010002',  // Ingresos Contado 0%
+    cuentaCargo2:      '1103010002',  // Clientes Nac Gral 0%
+    cuentaAbono:       '4100020002',  // Ingresos Por Ventas Crédito Tasa 0% (PPD → crédito, no contado)
     cuentaIvaPPD:      null,
     prioridad:         22,
   },
@@ -357,6 +517,23 @@ const reglas = [
     prioridad:       60,
   },
 
+  // ── 8A. SIN TASA IVA / EXENTO — PPD (Regla 11N) ──────────────────────────
+  // Prioridad 66 (mismo que Reg 13 mixto PPD — spec mayor gana en empate).
+  // Captura CFDIs PPD exentos donde _detectTasaIva devuelve null.
+  // Reg 11 (tasaIva='0', prio 65) y Reg 13 (tasaIva='mixto', prio 66) tienen más spec.
+  {
+    nombre:          'Reg 11N — Venta PPD Exento (Sin Tasa IVA)',
+    tipoComprobante: 'I',
+    metodoPago:      'PPD',
+    formaPago:       '99',
+    tasaIva:         null,
+    tieneDescuento:  false,
+    cuentaCargo:     '1103010002',   // Clientes Nac Gral 0%
+    cuentaAbono:     '4100020002',   // Ingresos Crédito 0%
+    cuentaIvaPPD:    null,
+    prioridad:       66,
+  },
+
   // ── 8B. DESCUENTOS PPD 16% (Regla 6B) ────────────────────────────────────
   // Prioridad 59 (gana sobre Reg 6). Motor agrega línea Descuentos s/Ventas 16%.
   {
@@ -383,7 +560,7 @@ const reglas = [
     tasaIva:         '0',
     tieneDescuento:  false,
     cuentaCargo:     '1103010002',  // Clientes Nac Gral 0%
-    cuentaAbono:     '4100010002',  // Ingresos Contado 0%
+    cuentaAbono:     '4100020002',  // Ingresos Por Ventas Crédito Tasa 0%
     cuentaIvaPPD:    null,
     prioridad:       65,
   },
@@ -398,10 +575,26 @@ const reglas = [
     tasaIva:         '0',
     tieneDescuento:  true,
     cuentaCargo:     '1103010002',   // Clientes Nac Gral 0%
-    cuentaAbono:     '4100010002',   // Ingresos Contado 0%
+    cuentaAbono:     '4100020002',   // Ingresos Por Ventas Crédito Tasa 0%
     cuentaIvaPPD:    null,
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
     prioridad:       64,
+  },
+
+  // ── 8D. DESCUENTO PPD EXENTO (Regla 6D) ──────────────────────────────────
+  // Prioridad 66. Exento con descuento PPD donde _detectTasaIva devuelve null.
+  {
+    nombre:          'Reg 6D — Venta con Descuento PPD Exento (Sin Tasa IVA)',
+    tipoComprobante: 'I',
+    metodoPago:      'PPD',
+    formaPago:       '99',
+    tasaIva:         null,
+    tieneDescuento:  true,
+    cuentaCargo:     '1103010002',   // Clientes Nac Gral 0%
+    cuentaAbono:     '4100020002',   // Ingresos Crédito 0%
+    cuentaIvaPPD:    null,
+    cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    prioridad:       66,
   },
 
   // ── 9. CFDI MIXTO PPD (Regla 13) ─────────────────────────────────────────
@@ -416,7 +609,7 @@ const reglas = [
     tieneDescuento:  false,
     cuentaCargo:     '1103010001',  // Clientes 16%
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
-    cuentaAbono2:    '4100010002',  // Ingresos 0% (motor)
+    cuentaAbono2:    '4100020002',  // Ingresos Crédito 0% (PPD → crédito, no contado)
     cuentaIvaPPD:    '2105010001',
     prioridad:       66,
   },
@@ -484,6 +677,77 @@ const reglas = [
     prioridad:       74,
   },
 
+  // ── 10A. COBROS PPD TASA 0% (Reglas 7A-0% – 7G-0%) ──────────────────────
+  // Prioridad igual que sus equivalentes 16% — ganan por spec (tasaIva='0' definido).
+  // Abonan a 1103010002 (Clientes 0%) en lugar de 1103010001 (Clientes 16%).
+  // _detectTasaIva tipo P: si totalTrasladosImpuestoIVA16 = 0 y hay monto → devuelve '0'.
+  {
+    nombre:       'Reg 7A-0% — Cobro PPD Efectivo Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '01',
+    tasaIva:      '0',
+    cuentaCargo:  '1101010003',  // Caja
+    cuentaAbono:  '1103010002',  // Clientes 0% (liquida CxC 0%)
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
+    prioridad:    70,
+  },
+  {
+    nombre:       'Reg 7B-0% — Cobro PPD Transferencia Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '03',
+    tasaIva:      '0',
+    cuentaCargo:  '1102011005',
+    cuentaAbono:  '1103010002',
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
+    prioridad:    71,
+  },
+  {
+    nombre:       'Reg 7C-0% — Cobro PPD Cheque Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '04',
+    tasaIva:      '0',
+    cuentaCargo:  '1102011005',
+    cuentaAbono:  '1103010002',
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
+    prioridad:    72,
+  },
+  {
+    nombre:       'Reg 7F-0% — Cobro PPD Cheque Nominativo Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '02',
+    tasaIva:      '0',
+    cuentaCargo:  '1102011005',
+    cuentaAbono:  '1103010002',
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
+    prioridad:    72,
+  },
+  {
+    nombre:       'Reg 7D-0% — Cobro PPD Tarjeta Débito Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '28',
+    tasaIva:      '0',
+    cuentaCargo:  '1102011005',
+    cuentaAbono:  '1103010002',
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
+    prioridad:    73,
+  },
+  {
+    nombre:       'Reg 7E-0% — Cobro PPD Tarjeta Crédito Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '29',
+    tasaIva:      '0',
+    cuentaCargo:  '1102011005',
+    cuentaAbono:  '1103010002',
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
+    prioridad:    74,
+  },
+
   // ── 10B. COBRO PPD VÍA MONEDERO CLUB TUBEROS (Regla 7G) ──────────────────
   // Tipo P, formaPago=05. Idéntico a Reg 7A–7F pero usando el saldo del monedero
   // (2103090002) en lugar de Bancos/Caja. Motor estándar tipo P:
@@ -497,6 +761,18 @@ const reglas = [
     cuentaAbono:  '1103010001',  // Clientes (liquida CxC)
     cuentaIva:    '2104010001',  // IVA Trasladado definitivo (HABER)
     cuentaIvaPPD: '2105010001',  // IVA Por Trasladar PPD (DEBE — cancela diferido)
+    prioridad:    70,
+  },
+
+  {
+    nombre:       'Reg 7G-0% — Cobro PPD Monedero Club Tuberos Tasa 0%',
+    tipoComprobante: 'P',
+    formaPago:    '05',
+    tasaIva:      '0',
+    cuentaCargo:  '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaAbono:  '1103010002',  // Clientes 0%
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
     prioridad:    70,
   },
 
@@ -583,18 +859,42 @@ const reglas = [
   },
 
   // ── 12. DEVOLUCIONES NC POR TASA (Reglas 17–19) ───────────────────────────
-  // Fallback para E+tipoRelacion=01 sin formaPago conocida.
+  // Fallback para E+tipoRelacion=01. Variantes *A (formaPago=01) ganan por spec.
   // tasaIva discrimina la ruta: 0% → Reg 17, mixto → Reg 18, descuento → Reg 19.
+  {
+    nombre:          'Reg 17A — NC Devolución Tasa 0% Efectivo',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:       null,
+    prioridad:       85,
+  },
   {
     nombre:          'Reg 17 — NC Devolución Tasa 0%',
     tipoComprobante: 'E',
     tipoRelacion:    '01',
     tasaIva:         '0',
-    tieneDescuento:  false,         // NCs 0% con descuento → Reg 19B
+    tieneDescuento:  false,         // NCs 0% con descuento → Reg 19B/19C
     cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       null,
     prioridad:       85,
+  },
+  {
+    nombre:          'Reg 18A — NC Devolución Mixta Efectivo (0%+16%)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         'mixto',
+    cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16% (partida principal)
+    cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaAbono2:    '4200010002',  // Devoluciones s/Ventas 0% (motor)
+    cuentaIva:       '2104010001',  // IVA 16% a cancelar
+    prioridad:       86,
   },
   {
     nombre:          'Reg 18 — NC Devolución Mixta (0%+16%)',
@@ -619,6 +919,20 @@ const reglas = [
     prioridad:       87,
   },
   {
+    // NC tasa 0% con descuento, efectivo: igual que 19B pero abono=Caja.
+    nombre:          'Reg 19C — NC Devolución Tasa 0% con Descuento Efectivo',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         '0',
+    tieneDescuento:  true,
+    cuentaCargo:     '4200010002',   // Devoluciones s/Ventas 0%
+    cuentaAbono:     '1101010003',   // Caja (formaPago=01 → efectivo)
+    cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0% (HABER — cancela el descuento original)
+    cuentaIva:       null,
+    prioridad:       86,
+  },
+  {
     // NC tasa 0% con descuento: revierte la venta bruta, cancela el descuento original,
     // devuelve al cliente el importe neto (sin IVA porque tasa=0%).
     // Asiento: DEBE Devoluciones 0% = subtotal; HABER Descuentos 0% = descuento (motor);
@@ -637,6 +951,18 @@ const reglas = [
 
   // ── 13. BONIFICACIONES NC RETROACTIVAS (Reglas 20–21) ────────────────────
   // Rappel anual / descuento retroactivo. Cargo a Ingresos, no a Devoluciones.
+  // Variantes *A (formaPago=01) ganan por spec sobre fallback (formaPago=null).
+  {
+    nombre:          'Reg 20A — Bonificación s/Ventas 16% Efectivo (NC retroactiva)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         '16',
+    cuentaCargo:     '4100010001',  // Ingresos Por Ventas Contado 16%
+    cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:       '2104010001',
+    prioridad:       88,
+  },
   {
     nombre:          'Reg 20 — Bonificación s/Ventas 16% (NC retroactiva)',
     tipoComprobante: 'E',
@@ -646,6 +972,17 @@ const reglas = [
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       '2104010001',
     prioridad:       88,
+  },
+  {
+    nombre:          'Reg 21A — Bonificación s/Ventas Tasa 0% Efectivo (NC retroactiva)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         '0',
+    cuentaCargo:     '4100010002',  // Ingresos Por Ventas Contado 0%
+    cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:       null,
+    prioridad:       89,
   },
   {
     nombre:          'Reg 21 — Bonificación s/Ventas Tasa 0% (NC retroactiva)',

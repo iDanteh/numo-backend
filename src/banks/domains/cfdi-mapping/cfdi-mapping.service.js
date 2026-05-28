@@ -146,17 +146,28 @@ function _detectTasaIva(cfdi) {
     }
   }
   // Fallback 2: traslados vacío pero totalImpuestosTrasladados disponible
-  // (CFDIs importados sin desglose de tasa pero con importe de IVA en el header)
+  // (CFDIs Metadata — sin XML completo pero con totales SAT en el header)
   if (!tiene16 && !tiene0) {
     const rawTotal = cfdi.impuestos?.totalImpuestosTrasladados;
     // Solo actuar si el campo está EXPLÍCITAMENTE presente en el documento.
     // Si es undefined/null no sabemos la tasa → devolvemos null (no inferir 0%).
     if (rawTotal != null) {
       const totalImptos = Number(rawTotal);
-      // Cualquier IVA > 0 → tasa no-cero (captura 16%, 8% fronterizo, etc.)
-      // Solo se marca tasa 0% cuando el campo está presente Y es exactamente 0.
-      if (totalImptos > 0) tiene16 = true;
-      else                 tiene0  = true;
+      if (totalImptos <= 0) {
+        tiene0 = true;
+      } else {
+        // Determinar si es puro 16% o mixto (parte 16% + parte exenta/0%).
+        // Si el IVA real difiere del esperado a 16% en más de $0.50, FORZOSAMENTE
+        // hay productos con tasa diferente (0% o exento) → MIXTO.
+        // Tolerancia de $0.50 absorbe redondeos por concepto sin falsos positivos.
+        const base = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
+        if (base > 0 && Math.abs(totalImptos - base * 0.16) > 0.50) {
+          tiene16 = true;
+          tiene0  = true;   // mixto: IVA real ≠ base×16% → hay porción 0%/exenta
+        } else {
+          tiene16 = true;   // puro 16% (diferencia ≤ $0.50 → solo redondeo)
+        }
+      }
     }
   }
   if (tiene16 && tiene0) return 'mixto';
@@ -184,6 +195,21 @@ function _calcCfdiMontos(cfdi) {
     });
     if (esTasa16) { subTotal16 += importe; desc16 += descuento; }
     else          { subTotal0  += importe; desc0  += descuento; }
+  }
+  // Fallback Metadata: conceptos vacíos → estimar split desde el encabezado.
+  // subTotal16 = base del IVA 16% (ivaHeader / 0.16); subTotal0 = base restante.
+  if (subTotal16 + subTotal0 === 0) {
+    const ivaHeader = Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
+    const base      = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
+    if (ivaHeader > 0 && base > 0) {
+      subTotal16 = parseFloat((ivaHeader / 0.16).toFixed(6));
+      subTotal0  = parseFloat(Math.max(0, base - subTotal16).toFixed(6));
+      const totalDesc = Number(cfdi.descuento || 0);
+      if (totalDesc > 0 && (subTotal16 + subTotal0) > 0) {
+        desc16 = parseFloat((totalDesc * subTotal16 / (subTotal16 + subTotal0)).toFixed(6));
+        desc0  = parseFloat(Math.max(0, totalDesc - desc16).toFixed(6));
+      }
+    }
   }
   return { subTotal16, subTotal0, desc16, desc0 };
 }

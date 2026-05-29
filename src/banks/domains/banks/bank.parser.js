@@ -75,13 +75,16 @@ function makeHash(m) {
     String(m.saldo   ?? ''),
     String(m.deposito ?? ''),
     String(m.retiro   ?? ''),
-    (m.concepto || '').substring(0, 120),
+    (m.concepto || '').replace(/\s+/g, ' ').trim().substring(0, 120),
   ].join('|');
   // SHA-256 completo (64 hex). No se trunca: el truncado anterior a 40 chars
   // reducía la resistencia a colisiones de 2^256 a 2^160 innecesariamente.
-  // NOTA: movimientos ya importados conservan el hash de 40 chars; re-importar
+  // NOTA 1: movimientos ya importados conservan el hash de 40 chars; re-importar
   // un archivo histórico generará hashes de 64 chars que no colisionarán con
   // los existentes — esto es intencional y preferible a mantener la debilidad.
+  // NOTA 2: el concepto se normaliza (colapso de whitespace) antes de hashear
+  // para que distintas exportaciones del mismo movimiento con espaciado diferente
+  // generen el mismo hash.
   return crypto.createHash('sha256').update(key).digest('hex');
 }
 
@@ -491,13 +494,15 @@ function parseBanamex(sheet) {
       const text = cellText(v[iConcepto]);
       if (!text) return;
 
-      const authMatch = text.match(/no\.\s*de\s*autorizaci[oó]n[\s:]+(.+)/i);
+      // Acepta "No. de Autorización: X" (formato clásico) y "Autorización: X"
+      // (formato flat que algunos extractos embeben en sub-filas).
+      const authMatch = text.match(/(?:no\.\s*de\s*)?autorizaci[oó]n[\s:]+(.+)/i);
       if (authMatch) {
         current.numAutorizacion = authMatch[1].trim();
         return;
       }
 
-      const refMatch = text.match(/referencia\s+num[eé]rica[\s:]+(.+)/i);
+      const refMatch = text.match(/referencia\s+n[uú]m[eé]rica[\s:]+(.+)/i);
       if (refMatch) {
         current.refNumerica = refMatch[1].trim();
         // no hacemos return para que también se agregue a lineasExtra
@@ -512,7 +517,106 @@ function parseBanamex(sheet) {
     movements.push(buildBanamex(current, isOtros(current.conceptoBase, BANAMEX_OTROS)));
   }
 
-  return movements;
+  // ── Pre-dedup: propagar auth entre movimientos adyacentes con mismo monto ──
+  // Banamex asigna el mismo número de autorización a las dos filas de un DEP MIXTO
+  // ("Abono por cobranza" + "DEP EN EFECTIVO"), pero solo la fila que precede
+  // físicamente a la sub-fila "No. de Autorización" captura el auth — la otra queda
+  // con auth=null porque el parser ya cerró `current` al encontrar la siguiente
+  // fila principal.  La fila con auth=null + saldo distinto escapa Capa A y Capa B.
+  //
+  // Condición de propagación: exactamente uno de los dos movimientos adyacentes tiene
+  // auth real (≠ null, ≠ '0') y el otro no, y ambos tienen el mismo monto (±0.01).
+  // El hash NO se recalcula: makeHash no incluye numeroAutorizacion, así que el hash
+  // sigue siendo estable entre reimportaciones del mismo archivo.
+  for (let i = 0; i < movements.length - 1; i++) {
+    const cur  = movements[i];
+    const next = movements[i + 1];
+    const curHasAuth  = cur.numeroAutorizacion  && cur.numeroAutorizacion  !== '0';
+    const nextHasAuth = next.numeroAutorizacion && next.numeroAutorizacion !== '0';
+    if (curHasAuth === nextHasAuth) continue; // ambas tienen auth o ambas no → saltar
+    const donor    = curHasAuth ? cur  : next;
+    const acceptor = curHasAuth ? next : cur;
+    const mismoMonto =
+      (donor.deposito != null && acceptor.deposito != null && Math.abs(donor.deposito - acceptor.deposito) < 0.01) ||
+      (donor.retiro   != null && acceptor.retiro   != null && Math.abs(donor.retiro   - acceptor.retiro  ) < 0.01);
+    if (mismoMonto) {
+      acceptor.numeroAutorizacion = donor.numeroAutorizacion;
+    }
+  }
+
+  // ── Post-proceso: dedup intra-lote de filas hermanas ──────────────────────
+  // Banamex exporta ciertos depósitos complejos como DOS filas main-row con
+  // fecha en col A, representando el mismo hecho contable:
+  //   Fila A: "DEP CHEQUE BNM"          — puede carecer de sub-fila de auth
+  //   Fila B: "Dep mixto Efec/Doctos BNM" — tiene sub-fila "No. de Autorización"
+  // Ambas comparten auth y monto; el hash difiere porque el concepto es distinto.
+  //
+  // Estrategia de dos capas:
+  //   Capa A (auth+monto): cuando AMBAS filas tienen auth real, la segunda se
+  //     descarta; se preserva la que tenga importe (comportamiento original).
+  //     NOTA: la clave usa monto (no saldo) porque Banamex exporta depósitos
+  //     mixtos con saldos progresivos distintos por sub-componente — incluir
+  //     el saldo causaba miss cuando las filas hermanas tenían saldos diferentes.
+  //   Capa B (monto+saldo): fallback para cuando UNA fila no tiene auth capturada.
+  //     El saldo acumulado en cuenta es único por transacción — si dos filas del
+  //     mismo lote producen exactamente el mismo saldo con el mismo monto,
+  //     representan la misma transacción.  Se conserva la que tiene auth.
+  const authSaldoSeen  = new Map(); // `${auth}|${deposito}|${retiro}` → índice en deduped
+  const montoSaldoSeen = new Map(); // `${deposito}|${retiro}|${saldo}` → índice en deduped
+  const deduped = [];
+
+  for (const m of movements) {
+    const auth = m.numeroAutorizacion;
+    let isDup = false;
+
+    // ── Capa A: dedup por auth + monto ──────────────────────────────────────
+    if (auth && auth !== '0') {
+      const key = `${auth}|${m.deposito ?? ''}|${m.retiro ?? ''}`;
+      if (authSaldoSeen.has(key)) {
+        const prevIdx = authSaldoSeen.get(key);
+        const prev    = deduped[prevIdx];
+        // Si el previo no tiene importe y el actual sí → reemplazar
+        if (!prev.deposito && !prev.retiro && (m.deposito || m.retiro)) {
+          deduped[prevIdx] = m;
+          // Sincronizar mapa de monto+saldo con el índice del reemplazo
+          if (m.saldo != null && (m.deposito != null || m.retiro != null)) {
+            montoSaldoSeen.set(`${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`, prevIdx);
+          }
+        }
+        isDup = true;
+      }
+    }
+
+    // ── Capa B: dedup por monto + saldo (fallback para auth=null) ───────────
+    if (!isDup && m.saldo != null && (m.deposito != null || m.retiro != null)) {
+      const mk = `${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`;
+      if (montoSaldoSeen.has(mk)) {
+        const prevIdx = montoSaldoSeen.get(mk);
+        const prev    = deduped[prevIdx];
+        // Si el previo no tiene auth y el actual sí → reemplazar para conservar la info
+        if (!prev.numeroAutorizacion && m.numeroAutorizacion) {
+          deduped[prevIdx] = m;
+          if (auth && auth !== '0') {
+            authSaldoSeen.set(`${auth}|${m.deposito ?? ''}|${m.retiro ?? ''}`, prevIdx);
+          }
+        }
+        isDup = true;
+      }
+    }
+
+    if (isDup) continue;
+
+    // Registrar en ambos mapas antes de agregar
+    if (auth && auth !== '0') {
+      authSaldoSeen.set(`${auth}|${m.deposito ?? ''}|${m.retiro ?? ''}`, deduped.length);
+    }
+    if (m.saldo != null && (m.deposito != null || m.retiro != null)) {
+      montoSaldoSeen.set(`${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`, deduped.length);
+    }
+    deduped.push(m);
+  }
+
+  return deduped;
 }
 
 // Extrae el primer monto con formato monetario de un texto (ej. "DEP EN EFECTIVO 5,000.00")
@@ -528,17 +632,54 @@ function buildBanamex(c, otros = false) {
   let retiro   = c.retiro   && c.retiro   > 0 ? c.retiro   : null;
 
   // Banamex exporta ciertos depósitos en efectivo con 0 en la columna de monto
-  // y el importe real dentro del texto del concepto (ej. "DEP EN EFECTIVO 5,000.00").
+  // y el importe real dentro del texto del concepto o de una sub-fila.
+  // Se busca en dos lugares, en orden de preferencia:
+  //   1. Monto embebido en conceptoBase (ej. "DEP EN EFECTIVO 5,000.00").
+  //   2. Sub-fila "Referencia alfanumérica: X" — Banamex usa este campo para
+  //      indicar el importe real en filas DEP EN EFECTIVO sin columna de abono.
   if (deposito === null && retiro === null) {
-    const match = c.conceptoBase.match(MONTO_RE);
-    if (match) {
-      const importe = parseFloat(match[1].replace(/,/g, ''));
-      if (/\b(dep|abono|deposito|cheque\s+bnm)\b/i.test(c.conceptoBase)) {
-        deposito = importe;
-      } else if (/\b(pago|retiro|cargo|cobro|comis)\b/i.test(c.conceptoBase)) {
-        retiro = importe;
+    const DEP_RE = /\b(dep|abono|deposito|cheque\s+bnm)\b/i;
+    const RET_RE = /\b(pago|retiro|cargo|cobro|comis)\b/i;
+
+    const matchBase = c.conceptoBase.match(MONTO_RE);
+    if (matchBase) {
+      const importe = parseFloat(matchBase[1].replace(/,/g, ''));
+      if (DEP_RE.test(c.conceptoBase))      deposito = importe;
+      else if (RET_RE.test(c.conceptoBase)) retiro   = importe;
+    }
+
+    // Buscar en sub-filas si todavía no hay monto
+    if (deposito === null && retiro === null) {
+      const ALFA_RE = /referencia\s+alfanum[eé]rica[\s:]+(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})/i;
+      for (const line of c.lineasExtra) {
+        const matchAlfa = line.match(ALFA_RE);
+        if (matchAlfa) {
+          const importe = parseFloat(matchAlfa[1].replace(/,/g, ''));
+          if (importe > 0) {
+            if (DEP_RE.test(c.conceptoBase))      deposito = importe;
+            else if (RET_RE.test(c.conceptoBase)) retiro   = importe;
+          }
+          break;
+        }
       }
     }
+  }
+
+  // ── Formato "flat" de Banamex (todo en una sola celda) ───────────────────
+  // Ciertos extractos concatenan autorización y referencia en el concepto sin
+  // usar sub-filas, con un prefijo distinto al que detecta parseBanamex:
+  //   "Abono Interbancario … Referencia Númerica: 2026050 … Autorización: 528134"
+  // parseBanamex no procesa esta celda como sub-fila, por lo que numAutorizacion
+  // y refNumerica quedan en null. Los extraemos aquí como fallback.
+  // Nota: el patrón de sub-fila exige "No. de Autorización:"; el formato flat
+  // usa solo "Autorización:", de ahí que no se detecte en el handler estándar.
+  if (!c.numAutorizacion) {
+    const flatAuth = conceptoCompleto.match(/\bAutorizaci[oó]n[\s:]+(\d+)/i);
+    if (flatAuth) c.numAutorizacion = flatAuth[1];
+  }
+  if (!c.refNumerica) {
+    const flatRef = conceptoCompleto.match(/\bReferencia\s+N[uú]m[eé]rica[\s:]+(\S+)/i);
+    if (flatRef) c.refNumerica = flatRef[1];
   }
 
   // c.fecha es null cuando el archivo no trae fecha en ese movimiento.
@@ -552,7 +693,11 @@ function buildBanamex(c, otros = false) {
     retiro,
     saldo:              c.saldo,
     numeroAutorizacion: normalizeAuthNum(c.numAutorizacion),
-    referenciaNumerica: normalizeAuthNum(c.refNumerica),
+    // "0000000000" (y variantes de solo-ceros) es el placeholder de Banamex para
+    // depósitos en efectivo sin referencia real; normalizeAuthNum lo reduce a "0".
+    // Almacenarlo como "0" causaría falsos positivos en Capa 1c del dedup del servicio
+    // (múltiples transacciones distintas con el mismo monto compartirían la clave).
+    referenciaNumerica: (() => { const n = normalizeAuthNum(c.refNumerica); return n === '0' ? null : n; })(),
     status:             otros ? 'otros' : 'no_identificado',
     categoria:          clasificar(conceptoCompleto),
   };
@@ -625,6 +770,17 @@ function parseBBVA(sheet) {
       }
     }
 
+    // Extraer clave de rastreo SPEI para MORA SPEI NORMABANXICO.
+    // BBVA incrusta el ID único de la transacción tras "COMPENSACION DE ":
+    //   "MORA SPEI NORMABANXICO / COMPENSACION DE 8846APR1202605085280762645"
+    // Ese token (alfanumérico, ≥10 chars) es estable entre exportaciones y
+    // permite deduplicar en Layer 1c aunque el hash difiera por whitespace.
+    let referenciaNumerica = null;
+    const moraSpeiMatch = concepto.match(/\bCOMPENSACION\s+DE\s+([A-Z0-9]{10,})/i);
+    if (moraSpeiMatch) {
+      referenciaNumerica = moraSpeiMatch[1];
+    }
+
     const cargoRaw = toNumber(col3);
     // El hash se calcula con fechaDate (null si el archivo no trae fecha).
     // Esto garantiza que el hash sea idéntico en cualquier reimportación del
@@ -639,7 +795,7 @@ function parseBBVA(sheet) {
       retiro:             cargoRaw !== null ? Math.abs(cargoRaw) : null,
       saldo:              toNumber(col5),
       numeroAutorizacion: normalizeAuthNum(numeroAutorizacion),
-      referenciaNumerica: null,
+      referenciaNumerica,
       status:             isOtros(concepto, BBVA_OTROS) ? 'otros' : 'no_identificado',
       categoria:          clasificar(concepto),
     };
@@ -999,17 +1155,20 @@ async function parseBankFile(buffer, banco) {
     }
   }
 
-  // Separate movements with and without fecha
-  const sinFechaMovs = allMovements.filter(m => !m.fecha);
-  const conFechaMovs = allMovements.filter(m => !!m.fecha);
+  // Un movimiento es inválido si le falta fecha O si su importe es cero/nulo en
+  // ambos campos (deposito y retiro). Ambas condiciones se reportan por separado
+  // para que el usuario sepa exactamente qué filas se omitieron y por qué.
+  const sinFechaMovs    = allMovements.filter(m => !m.fecha);
+  const sinImporteMovs  = allMovements.filter(m => !!m.fecha && !m.deposito && !m.retiro);
+  const validMovs       = allMovements.filter(m => !!m.fecha && (m.deposito || m.retiro));
 
-  // Rebuild summary counting only movements with fecha
+  // Rebuild summary counting only valid movements
   const summaryConFecha = {};
-  for (const m of conFechaMovs) {
+  for (const m of validMovs) {
     summaryConFecha[m.banco] = (summaryConFecha[m.banco] || 0) + 1;
   }
 
-  return { movements: conFechaMovs, sinFecha: sinFechaMovs, summary: summaryConFecha, errors };
+  return { movements: validMovs, sinFecha: sinFechaMovs, sinImporte: sinImporteMovs, summary: summaryConFecha, errors };
 }
 
 module.exports = { parseBankFile, CATEGORIAS, clasificar, makeHash, TEMPLATE_SIGNATURE_SHEET, TEMPLATE_SIGNATURE_VALUE };

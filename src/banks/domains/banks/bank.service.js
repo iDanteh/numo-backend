@@ -41,10 +41,12 @@ const BANK_PREFIX = {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // BBVA exporta ciertos movimientos SPEI con el primer token tras '/' siendo una
-// palabra clave de trazabilidad (BNET, REFBNTC) en lugar de un número real.
-// Estos valores NO son números de autorización bancaria válidos y usarlos en
-// dedup generaría falsos positivos entre movimientos distintos del mismo banco.
-const BBVA_PSEUDO_AUTH_RE = /^(BNET|REFBNTC)$/i;
+// palabra clave genérica (BNET, REFBNTC, COMPENSACION) en lugar de un número
+// real de autorización.  Estos valores NO son identificadores únicos y usarlos
+// en dedup generaría falsos positivos entre movimientos distintos del mismo banco.
+// COMPENSACION: aparece en MORA SPEI NORMABANXICO — múltiples transacciones
+// distintas comparten este label; la dedup real la hace Layer 1d (saldo+concepto).
+const BBVA_PSEUDO_AUTH_RE = /^(BNET|REFBNTC|COMPENSACION)$/i;
 
 function isBBVAPseudoAuth(banco, auth) {
   return banco === 'BBVA' && !!auth && BBVA_PSEUDO_AUTH_RE.test(auth.trim());
@@ -122,13 +124,23 @@ async function getCards() {
           no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
           identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
-          saldoPendiente:  {
+          saldoPendiente: {
+            // Σ depósitos no_identificados − Σ depósitos identificados.
+            // Retiros y status 'otros' no participan en este cálculo.
             $sum: {
-              $cond: [
-                { $in: ['$status', ['no_identificado', null]] },
-                { $ifNull: ['$deposito', 0] },
-                0,
-              ],
+              $switch: {
+                branches: [
+                  {
+                    case: { $in: ['$status', ['no_identificado', null]] },
+                    then: { $ifNull: ['$deposito', 0] },
+                  },
+                  {
+                    case: { $eq: ['$status', 'identificado'] },
+                    then: { $multiply: [{ $ifNull: ['$deposito', 0] }, -1] },
+                  },
+                ],
+                default: 0,
+              },
             },
           },
           saldoIdentificado: {
@@ -224,6 +236,7 @@ async function listMovements(filters) {
   const {
     page = 1, limit = 50,
     banco, fechaInicio, fechaFin,
+    fechaAplicacionInicio, fechaAplicacionFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
@@ -234,8 +247,12 @@ async function listMovements(filters) {
   const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
   if (status) filter.status = status;
-  // Filtro por ID exacto (usado desde OCR para saltar a un movimiento específico)
-  if (movId)  filter._id   = movId;
+  // Filtro por ID: acepta un ID exacto (OCR) o varios separados por coma (duplicados).
+  // Cuando se pasan múltiples IDs se omiten los demás filtros de fecha/concepto/etc.
+  if (movId) {
+    const ids = movId.split(',').map(s => s.trim()).filter(Boolean);
+    filter._id = ids.length === 1 ? ids[0] : { $in: ids };
+  }
 
   if (categorias) {
     // Comma-separated list; __null__ represents null (sin categoría)
@@ -273,9 +290,26 @@ async function listMovements(filters) {
     if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
   }
 
+  if (fechaAplicacionInicio || fechaAplicacionFin) {
+    const df = {};
+    if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
+    if (fechaAplicacionFin)    df.$lte = new Date(`${fechaAplicacionFin}T23:59:59.999Z`);
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [
+      { fichaAt: df },
+      { identificadoPor: { $elemMatch: { fechaId: df } } },
+    ]});
+  }
+
+  // Variables de búsqueda — se populan si search está activo y se reutilizan
+  // tanto en el $match (filter.$or) como en el $addFields de scoring.
+  let _searchEscaped = null;
+  let _amountLo      = null;
+  let _amountHi      = null;
+
   if (search) {
-    const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re       = new RegExp(escaped, 'i');
+    _searchEscaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re        = new RegExp(_searchEscaped, 'i');
     const orClauses = [
       { concepto: re }, { numeroAutorizacion: re },
       { referenciaNumerica: re }, { folio: re }, { uuidXML: re },
@@ -284,38 +318,102 @@ async function listMovements(filters) {
     // Búsqueda por monto — tolerancia basada en los decimales ingresados:
     // sin decimales → rango de 1 peso completo; 1 decimal → ±0.05; 2 decimales → ±0.005
     const cleanNum = search.replace(/[$,\s]/g, '');
-    const num = parseFloat(cleanNum);
+    const num      = parseFloat(cleanNum);
     if (!isNaN(num) && num > 0) {
       const decimalPlaces = (cleanNum.split('.')[1] || '').length;
       const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
-      const lo = decimalPlaces === 0 ? num : num - tolerance;
-      const hi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
-      orClauses.push({ deposito: { $gte: lo, $lt: hi } });
-      orClauses.push({ retiro:   { $gte: lo, $lt: hi } });
+      _amountLo = decimalPlaces === 0 ? num             : num - tolerance;
+      _amountHi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
+      orClauses.push({ deposito: { $gte: _amountLo, $lt: _amountHi } });
+      orClauses.push({ retiro:   { $gte: _amountLo, $lt: _amountHi } });
     }
 
     filter.$or = orClauses;
   }
 
-  const SORTABLE   = ['fecha', 'banco', 'deposito', 'retiro', 'saldo', 'saldo-erp', 'diferencia'];
-  const rawSortBy  = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
-  const FIELD_MAP  = { 'saldo-erp': 'saldoErp' };
-  const sortField  = FIELD_MAP[rawSortBy] ?? rawSortBy;
-  const sortOrder  = sortDir === 'asc' ? 1 : -1;
-  const skip       = (parseInt(page) - 1) * parseInt(limit);
+  const SORTABLE  = ['fecha', 'banco', 'deposito', 'retiro', 'saldo', 'saldo-erp', 'diferencia'];
+  const rawSortBy = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
+  const FIELD_MAP = { 'saldo-erp': 'saldoErp' };
+  const sortField = FIELD_MAP[rawSortBy] ?? rawSortBy;
+  const sortOrder = sortDir === 'asc' ? 1 : -1;
+  const skip      = (parseInt(page) - 1) * parseInt(limit);
+
+  // ── Construcción del query ──────────────────────────────────────────────────
+  // Usamos aggregation cuando:
+  //   a) El usuario ordenó por "diferencia" (requiere campo calculado), O
+  //   b) Hay búsqueda activa → añadimos _score para priorizar montos sobre concepto.
+  //
+  // Orden de prioridad de _score:
+  //   3 → deposito / retiro  (monto exacto — mayor relevancia)
+  //   2 → numeroAutorizacion / referenciaNumerica
+  //   1 → folio / uuidXML / auxNombre
+  //   0 → concepto (texto libre — menor relevancia)
+  const useAggregation = rawSortBy === 'diferencia' || !!search;
 
   let movementsQuery;
-  if (rawSortBy === 'diferencia') {
-    movementsQuery = BankMovement.aggregate([
-      { $match: filter },
-      { $addFields: { _diferencia: { $subtract: [
+  if (useAggregation) {
+    const pipeline = [{ $match: filter }];
+
+    // ── Scoring de relevancia (solo cuando hay búsqueda activa) ─────────────
+    if (search) {
+      const scoreBranches = [];
+
+      // Score 3: match por monto (solo si el término es numérico)
+      if (_amountLo !== null) {
+        scoreBranches.push({
+          case: { $or: [
+            { $and: [{ $gte: ['$deposito', _amountLo] }, { $lt: ['$deposito', _amountHi] }] },
+            { $and: [{ $gte: ['$retiro',   _amountLo] }, { $lt: ['$retiro',   _amountHi] }] },
+          ]},
+          then: 3,
+        });
+      }
+
+      // Score 2: número de autorización o referencia numérica
+      scoreBranches.push({
+        case: { $or: [
+          { $regexMatch: { input: { $ifNull: ['$numeroAutorizacion', ''] }, regex: _searchEscaped, options: 'i' } },
+          { $regexMatch: { input: { $ifNull: ['$referenciaNumerica',  ''] }, regex: _searchEscaped, options: 'i' } },
+        ]},
+        then: 2,
+      });
+
+      // Score 1: folio interno, UUID CFDI, nombre auxiliar
+      scoreBranches.push({
+        case: { $or: [
+          { $regexMatch: { input: { $ifNull: ['$folio',     ''] }, regex: _searchEscaped, options: 'i' } },
+          { $regexMatch: { input: { $ifNull: ['$uuidXML',   ''] }, regex: _searchEscaped, options: 'i' } },
+          { $regexMatch: { input: { $ifNull: ['$auxNombre', ''] }, regex: _searchEscaped, options: 'i' } },
+        ]},
+        then: 1,
+      });
+
+      // Default 0: solo matcheó el concepto (texto libre, menor prioridad)
+      pipeline.push({
+        $addFields: { _score: { $switch: { branches: scoreBranches, default: 0 } } },
+      });
+    }
+
+    // ── Campo calculado para ordenar por diferencia ──────────────────────────
+    if (rawSortBy === 'diferencia') {
+      pipeline.push({ $addFields: { _diferencia: { $subtract: [
         { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
         { $ifNull: ['$saldoErp', 0] },
-      ] } } },
-      { $sort: { _diferencia: sortOrder, _id: 1 } },
-      { $skip: skip },
-      { $limit: parseInt(limit) },
-    ]);
+      ] } } });
+    }
+
+    // ── Sort: primero por score (si hay búsqueda), luego por campo del usuario ─
+    const sortStage = {};
+    if (search)                        sortStage._score      = -1;
+    if (rawSortBy === 'diferencia')    sortStage._diferencia = sortOrder;
+    else                               sortStage[sortField]  = sortOrder;
+    sortStage._id = 1;
+
+    pipeline.push({ $sort: sortStage });
+    pipeline.push({ $skip: skip });
+    pipeline.push({ $limit: parseInt(limit) });
+
+    movementsQuery = BankMovement.aggregate(pipeline);
   } else {
     movementsQuery = BankMovement.find(filter)
       .sort({ [sortField]: sortOrder, _id: 1 })
@@ -411,8 +509,9 @@ async function getSummary(fechaInicio, fechaFin) {
 
 async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   const bancoValidado = BANCOS_VALIDOS.includes(banco) ? banco : null;
-  const { movements, sinFecha, summary, errors } = await parseBankFile(buffer, bancoValidado);
-  const sinFechaMovs = sinFecha || [];
+  const { movements, sinFecha, sinImporte, summary, errors } = await parseBankFile(buffer, bancoValidado);
+  const sinFechaMovs   = sinFecha   || [];
+  const sinImporteMovs = sinImporte || [];
 
   if (!movements.length && errors.length) {
     const err = new Error('No se pudo procesar ninguna hoja del archivo');
@@ -505,7 +604,12 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         if (!authMatch(m.numeroAutorizacion, existing.numeroAutorizacion)) return false;
         const montoOk =
           (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
-          (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
+          (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01) ||
+          // El registro existente no tiene importe (bug de parseo de DEP EN EFECTIVO de
+          // Banamex: el monto estaba en sub-fila "Referencia alfanumérica" y no se extraía).
+          // Con el auth coincidente y el existing sin monto, se acepta el match y se
+          // enriquece el registro con el importe que trae el reimport.
+          (existing.deposito == null && existing.retiro == null && (m.deposito != null || m.retiro != null));
         return montoOk;
       });
       if (!incoming) continue;
@@ -519,18 +623,38 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       if (incoming.referenciaNumerica && !existing.referenciaNumerica) {
         enrichmentUpdates.push({ _id: existing._id, $set: { referenciaNumerica: incoming.referenciaNumerica } });
       }
+      // Enriquecer deposito/retiro si el existente no tiene importe (legacy del bug
+      // de "Referencia alfanumérica") y el reimport ya lo trae correctamente parseado.
+      if (existing.deposito == null && existing.retiro == null) {
+        const enrich = {};
+        if (incoming.deposito != null) enrich.deposito = incoming.deposito;
+        if (incoming.retiro   != null) enrich.retiro   = incoming.retiro;
+        if (Object.keys(enrich).length > 0) {
+          enrichmentUpdates.push({ _id: existing._id, $set: enrich });
+        }
+      }
       // Marcar como ya existente para que no se re-inserte
       hashesExistentes.add(incoming.hash);
     }
   }
 
-  // ── 1c. Deduplicar por referenciaNumerica (Banamex principalmente) ───────────
-  // La referencia numérica es el identificador de operación que Banamex asigna
-  // a cada transacción. Dos exports distintos del mismo movimiento pueden traer
-  // distinto saldo corriente (o autorización vacía vs. con valor), generando
-  // hashes y auth-numbers diferentes, pero la referencia numérica es siempre
-  // la misma. Si coinciden banco + referenciaNumerica + importe → duplicado.
-  const refNumMovs = movements.filter(m => m.referenciaNumerica && !hashesExistentes.has(m.hash));
+  // ── 1c. Deduplicar por referenciaNumerica (Banamex y BBVA MORA SPEI) ─────────
+  // Banamex: identificador de operación estable entre exportaciones.
+  // BBVA MORA SPEI: clave de rastreo extraída del concepto tras "COMPENSACION DE"
+  //   (ej. "8846APR1202605085280762645").  El mismo movimiento puede aparecer con
+  //   distinto whitespace en el concepto → hash diferente; la clave de rastreo es
+  //   siempre idéntica y permite deduplicar con banco + referenciaNumerica + importe.
+  //
+  // Se excluye referenciaNumerica = "0": es el placeholder de Banamex para depósitos
+  // en efectivo sin referencia real (Banamex exporta "0000000000" → normalizado a "0").
+  // Usarlo como clave generaría falsos positivos entre transacciones distintas con
+  // el mismo monto (el parser ya lo normaliza a null, pero se filtra aquí también
+  // por si existen registros históricos con este valor).
+  const refNumMovs = movements.filter(m =>
+    m.referenciaNumerica &&
+    m.referenciaNumerica !== '0' &&
+    !hashesExistentes.has(m.hash)
+  );
 
   if (refNumMovs.length > 0) {
     const uniqueRefNums   = [...new Set(refNumMovs.map(m => m.referenciaNumerica))];
@@ -641,6 +765,31 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
             // Si ninguno tiene número BNET, seguir con el check de saldo+concepto.
           }
 
+          // 2b-bis. Banamex + saldo=null: deduplicar por auth+monto cuando el entrante
+          // no trae saldo (archivos de terceros o re-exportaciones sin columna de saldo).
+          // Ocurre cuando la tercera variante de un DEP MIXTO se importa con auth real
+          // pero sin balance de cuenta → Capa 1b la atrapa si el existente ya tiene auth;
+          // si el existente aún tiene auth=null, cae aquí para deduplicar por auth del
+          // entrante contra el mismo candidato con auth no nulo.
+          if (m.banco === 'Banamex' && m.saldo == null) {
+            if (
+              m.numeroAutorizacion &&
+              !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion) &&
+              cand.numeroAutorizacion &&
+              authMatch(m.numeroAutorizacion, cand.numeroAutorizacion)
+            ) {
+              hashesExistentes.add(m.hash);
+              softDuplicados++;
+              const enrichBnmx = buildSoftEnrich(m, cand);
+              if (enrichBnmx) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnmx });
+              break;
+            }
+            // saldo=null sin auth coincidente → no es posible determinar duplicado
+            // por saldo; saltar al siguiente candidato sin ejecutar la comprobación
+            // de saldo que siempre fallará (evita conceptMatch falso con null-saldo).
+            continue;
+          }
+
           // 2b. El saldo debe coincidir exactamente (±0.01).
           // El saldo es el balance acumulado de la cuenta: dos movimientos distintos
           // en la misma cuenta nunca comparten el mismo saldo, por lo que este
@@ -676,7 +825,128 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     }
   }
 
-  const nuevos     = movements.filter(m => !hashesExistentes.has(m.hash));
+  // ── 1e. Cross-date dedup: banco + saldo + importe (sin restricción de fecha) ─
+  // BBVA asigna fechas distintas al mismo depósito según el extracto descargado:
+  //   · Fecha de operación (cuando se depositó en sucursal)
+  //   · Fecha de valor     (cuando acreditó en cuenta)
+  // El hash difiere porque la fecha forma parte de la clave, y Capa 1d no los
+  // detecta porque su ventana de búsqueda es el mismo día exacto.
+  // El saldo resultante en cuenta es idéntico en ambas versiones y, combinado
+  // con el importe y el concepto, identifica el movimiento de forma unívoca.
+  //
+  // Solo aplica a movimientos sin numeroAutorizacion ni referenciaNumerica
+  // (los que tienen identificador ya quedan cubiertos por Capas 1b/1c).
+  const sinIdentificador = movements.filter(m =>
+    !hashesExistentes.has(m.hash) &&
+    !m.numeroAutorizacion        &&
+    !m.referenciaNumerica        &&
+    m.saldo != null              &&
+    (m.deposito != null || m.retiro != null),
+  );
+
+  if (sinIdentificador.length > 0) {
+    // Una condición por movimiento: banco + saldo ±0.01 + importe ±0.01
+    const saldoConds = sinIdentificador.map(m => ({
+      banco: m.banco,
+      saldo: { $gte: m.saldo - 0.01, $lte: m.saldo + 0.01 },
+      ...(m.deposito != null
+        ? { deposito: { $gte: m.deposito - 0.01, $lte: m.deposito + 0.01 } }
+        : { retiro:   { $gte: m.retiro   - 0.01, $lte: m.retiro   + 0.01 } }),
+    }));
+
+    const existBySaldo = await BankMovement.find(
+      { $or: saldoConds },
+      '_id banco saldo deposito retiro concepto numeroAutorizacion referenciaNumerica fecha',
+    ).lean();
+
+    for (const existing of existBySaldo) {
+      const incoming = sinIdentificador.find(m => {
+        if (m.banco !== existing.banco) return false;
+        if (hashesExistentes.has(m.hash)) return false; // ya marcado en iteración previa
+        const saldoMatch =
+          Math.abs(m.saldo - existing.saldo) < 0.01;
+        const montoMatch =
+          (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
+          (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
+        if (!saldoMatch || !montoMatch) return false;
+        // Concepto: prefijo o sufijo común (mín. 10 chars).
+        // Umbral menor que Capa 1d (20) para cubrir conceptos cortos pero
+        // descriptivos como "DEPOSITO EN EFECTIVO" (20 chars exactos).
+        const cA = (m.concepto        || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const cB = (existing.concepto || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const minL = Math.min(cA.length, cB.length);
+        return minL >= 10 && (
+          cA.substring(0, minL) === cB.substring(0, minL) ||
+          cA.endsWith(cB) || cB.endsWith(cA)
+        );
+      });
+      if (!incoming) continue;
+
+      // Conservar la fecha de valor (la más reciente) como fecha definitiva
+      const fechaExisting = new Date(existing.fecha).getTime();
+      const fechaIncoming = new Date(incoming.fecha).getTime();
+      if (fechaExisting !== fechaIncoming) {
+        const fechaCorrecta = fechaIncoming > fechaExisting ? incoming.fecha : existing.fecha;
+        fechaUpdates.push({ _id: existing._id, fecha: fechaCorrecta });
+      }
+
+      const enrichCross = buildSoftEnrich(incoming, existing);
+      if (enrichCross) enrichmentUpdates.push({ _id: existing._id, $set: enrichCross });
+      hashesExistentes.add(incoming.hash);
+      softDuplicados++;
+    }
+  }
+
+  let nuevos = movements.filter(m => !hashesExistentes.has(m.hash));
+
+  // ── 1f. Intra-lote: deduplicar nuevos contra otros nuevos del mismo batch ─
+  // Capas 1a-1e solo comparan contra BD. Si un archivo contiene dos filas del
+  // mismo movimiento (concepto distinto, saldo distinto, ninguna en BD todavía),
+  // ambas pasan todas las capas y se insertan como documentos separados.
+  // Esta capa aplica los mismos criterios del parser intra-lote (auth+monto y
+  // monto+saldo) al subconjunto que sería insertado como nuevo.
+  // En caso de colisión, se conserva el primer movimiento del lote y se descarta
+  // el segundo — igual que el comportamiento del parser de Banamex.
+  if (nuevos.length > 1) {
+    const intraAuthSeen  = new Map(); // `banco|normAuth|dep|ret` → true
+    const intraSaldoSeen = new Map(); // `banco|dep|ret|saldo`    → true
+    const intraDupHashes = new Set();
+
+    for (const m of nuevos) {
+      const auth = m.numeroAutorizacion;
+      let isDup  = false;
+
+      // Auth + monto (idéntico a Capa A del parser, bank-agnostic)
+      if (auth && auth !== '0' && !isBBVAPseudoAuth(m.banco, auth)) {
+        const normAuth = /^\d+$/.test(auth) ? String(parseInt(auth, 10)) : auth;
+        const k = `${m.banco}|${normAuth}|${m.deposito ?? ''}|${m.retiro ?? ''}`;
+        if (intraAuthSeen.has(k)) {
+          isDup = true;
+          softDuplicados++;
+        } else {
+          intraAuthSeen.set(k, true);
+        }
+      }
+
+      // Monto + saldo (idéntico a Capa B del parser, bank-agnostic)
+      if (!isDup && m.saldo != null && (m.deposito != null || m.retiro != null)) {
+        const k = `${m.banco}|${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`;
+        if (intraSaldoSeen.has(k)) {
+          isDup = true;
+          softDuplicados++;
+        } else {
+          intraSaldoSeen.set(k, true);
+        }
+      }
+
+      if (isDup) intraDupHashes.add(m.hash);
+    }
+
+    if (intraDupHashes.size > 0) {
+      nuevos = nuevos.filter(m => !intraDupHashes.has(m.hash));
+    }
+  }
+
   const duplicados = movements.length - nuevos.length;
 
   // ── 2. Reservar secuenciales solo para los movimientos nuevos ─────────────
@@ -827,11 +1097,16 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       sinReglas:    sinReglasAviso,
       resumen:      summary,
       erroresHojas: errors,
-      sinFecha:     sinFechaMovs.map(m => ({
+      sinFecha:    sinFechaMovs.map(m => ({
         banco:    m.banco,
         concepto: (m.concepto || '').substring(0, 100),
         deposito: m.deposito,
         retiro:   m.retiro,
+      })),
+      sinImporte:  sinImporteMovs.map(m => ({
+        banco:    m.banco,
+        concepto: (m.concepto || '').substring(0, 100),
+        fecha:    m.fecha,
       })),
     };
 }
@@ -1238,17 +1513,16 @@ async function exportMovements(filters) {
     if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
   }
 
-  // Filtro por fecha de aplicación: max(identificadoPor[].fechaId, fichaAt) en el rango.
-  // Como es un campo calculado, se filtra buscando documentos donde ALGUNO de sus
-  // campos de fecha de identificación caiga dentro del rango solicitado.
+  // Filtro por fecha de aplicación usando $elemMatch (compatible con todas las versiones de MongoDB).
+  // Usa $or: fichaAt en rango OR algún elemento de identificadoPor con fechaId en rango (mismo elemento).
   if (fechaAplicacionInicio || fechaAplicacionFin) {
     const df = {};
     if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
     if (fechaAplicacionFin)    df.$lte = new Date(`${fechaAplicacionFin}T23:59:59.999Z`);
     filter.$and = filter.$and ?? [];
     filter.$and.push({ $or: [
-      { 'identificadoPor.fechaId': df },
       { fichaAt: df },
+      { identificadoPor: { $elemMatch: { fechaId: df } } },
     ]});
   }
 
@@ -1606,9 +1880,196 @@ async function generateTemplate() {
   return wb.xlsx.writeBuffer();
 }
 
+// ── findPotentialDuplicates ───────────────────────────────────────────────────
+// Detecta movimientos que, aunque tienen hashes distintos (es decir, pasaron la
+// dedup por hash), comparten los campos clave que los hacen sospechosamente
+// iguales: misma fecha, banco, importe (depósito o retiro) y saldo; o bien,
+// misma fecha, banco y número de autorización.
+//
+// Causas típicas:
+//  • Concepto ligeramente diferente entre importaciones → hash distinto → 2 docs
+//  • Reexportación del banco con autorizaciones en formato distinto
+//  • Carga manual doble con pequeña variación en el concepto
+async function findPotentialDuplicates() {
+  // ── Estrategia 1: mismo banco + día + deposito + retiro + saldo ────────────
+  // Si el importe y saldo coinciden exactamente pero el concepto varía,
+  // el hash difiere y ambos documentos existen en la colección.
+  const byImporte = await BankMovement.aggregate([
+    { $match: { isActive: true } },
+    {
+      $group: {
+        _id: {
+          banco:    '$banco',
+          dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+          deposito: '$deposito',
+          retiro:   '$retiro',
+          saldo:    '$saldo',
+        },
+        count: { $sum: 1 },
+        ids:   { $push: '$_id' },
+      },
+    },
+    { $match: { count: { $gte: 2 } } },
+    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    { $limit: 500 },
+  ]);
+
+  // ── Estrategia 2: mismo banco + día + numeroAutorizacion ──────────────────
+  // Detecta transacciones que el banco identifica con el mismo número de
+  // autorización pero que llegaron con concepto o saldo diferente (p.ej. dos
+  // renglones del mismo cargo importados en archivos distintos).
+  //
+  // Normalización de ceros iniciales: registros históricos podían almacenar
+  // "00199480" antes del fix de normalizeAuthNum; registros nuevos guardan
+  // "199480".  $toLong convierte el string a entero cuando es puramente numérico
+  // para que "00199480" y "199480" caigan en el mismo bucket.  Si no es
+  // numérico ($toLong devuelve null), se usa el string tal cual.
+  const byAuthNum = await BankMovement.aggregate([
+    { $match: { isActive: true, numeroAutorizacion: { $nin: [null, ''] } } },
+    {
+      $addFields: {
+        _authNorm: {
+          $cond: {
+            if:   { $regexMatch: { input: '$numeroAutorizacion', regex: /^\d+$/ } },
+            then: { $toString: { $toLong: '$numeroAutorizacion' } },
+            else: '$numeroAutorizacion',
+          },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: {
+          banco:   '$banco',
+          dia:     { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+          authKey: '$_authNorm',
+        },
+        count: { $sum: 1 },
+        ids:   { $push: '$_id' },
+      },
+    },
+    { $match: { count: { $gte: 2 } } },
+    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    { $limit: 500 },
+  ]);
+
+  // ── Estrategia 3: mismo banco + día + monto (sin saldo) con auth compartido ─
+  // Detecta el patrón "Abono por cobranza" + "DEP EN EFECTIVO" de Banamex:
+  // ambas filas representan el mismo depósito mixto, comparten auth y monto pero
+  // tienen saldos distintos (balances intermedios) → Estrategia 1 los pierde.
+  // También captura variantes con saldo=null (re-exportaciones sin columna saldo).
+  //
+  // Condición de validez: al menos dos documentos del grupo comparten el mismo
+  // numeroAutorizacion no nulo, lo que elimina falsos positivos por coincidencia
+  // de monto (p.ej. dos depósitos legítimos de $5,000 en el mismo día).
+  const byMontoSinSaldo = await BankMovement.aggregate([
+    { $match: { isActive: true } },
+    {
+      $group: {
+        _id: {
+          banco:    '$banco',
+          dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+          deposito: '$deposito',
+          retiro:   '$retiro',
+        },
+        count: { $sum: 1 },
+        ids:   { $push: '$_id' },
+        auths: { $push: '$numeroAutorizacion' },
+      },
+    },
+    { $match: { count: { $gte: 2 } } },
+    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    { $limit: 500 },
+  ]);
+
+  // ── Construir mapa de grupos (deduplicando por conjunto de IDs) ───────────
+  const seen = new Map();
+  for (const g of byImporte) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (!seen.has(key)) {
+      seen.set(key, { ids: g.ids, criterio: 'importe_saldo_fecha', meta: g._id, count: g.count });
+    }
+  }
+  for (const g of byAuthNum) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (!seen.has(key)) {
+      seen.set(key, { ids: g.ids, criterio: 'numero_autorizacion', meta: g._id, count: g.count });
+    }
+  }
+  for (const g of byMontoSinSaldo) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (seen.has(key)) continue;
+    // Validar que el grupo corresponda a una transacción real y no a una
+    // coincidencia accidental de monto.  Dos patrones aceptables:
+    //
+    //   a) authCompartido: el mismo auth aparece en 2+ documentos del grupo.
+    //      Ocurre cuando el mismo movimiento se importó dos veces desde archivos
+    //      distintos y ambas filas capturaron la sub-fila de autorización.
+    //
+    //   b) authMixto: al menos un documento tiene auth y al menos uno no.
+    //      Patrón DEP MIXTO Banamex: la fila A captura el número de autorización
+    //      (tiene sub-fila "No. de Autorización") y la fila B no la tiene.
+    //      Ningún auth se repite exactamente, pero la combinación misma-fecha+
+    //      mismo-monto + uno-con-auth / uno-sin-auth es señal fiable de duplicado.
+    const authCounts = new Map();
+    let docsConAuth = 0;
+    for (const a of g.auths) {
+      if (!a || a === '' || a === '0') continue;
+      docsConAuth++;
+      // Normalizar ceros iniciales para equiparar "199480" con "00199480"
+      const norm = /^\d+$/.test(a) ? String(parseInt(a, 10)) : a;
+      authCounts.set(norm, (authCounts.get(norm) || 0) + 1);
+    }
+    const authCompartido = [...authCounts.values()].some(c => c >= 2);
+    const authMixto      = docsConAuth >= 1 && docsConAuth < g.count;
+    if (!authCompartido && !authMixto) continue;
+    seen.set(key, { ids: g.ids, criterio: 'auth_monto_sin_saldo', meta: g._id, count: g.count });
+  }
+
+  if (seen.size === 0) return { total: 0, grupos: [] };
+
+  // ── Recuperar documentos completos en una sola consulta ───────────────────
+  const allIds = [...seen.values()].flatMap(g => g.ids);
+  const docs   = await BankMovement.find(
+    { _id: { $in: allIds } },
+    { hash: 0 }, // nunca exponer el hash al cliente
+  ).lean();
+
+  const byId = new Map(docs.map(d => [d._id.toString(), d]));
+
+  // ── Construir y ordenar la respuesta ──────────────────────────────────────
+  const grupos = [];
+  for (const [, group] of seen) {
+    const movimientos = group.ids
+      .map(id => byId.get(id.toString()))
+      .filter(Boolean);
+
+    if (movimientos.length >= 2) {
+      grupos.push({
+        criterio:    group.criterio,
+        meta:        group.meta,
+        count:       movimientos.length,
+        movimientos,
+      });
+    }
+  }
+
+  // Fecha descendente primero
+  grupos.sort((a, b) => {
+    const da = a.meta.dia || '';
+    const db = b.meta.dia || '';
+    if (da > db) return -1;
+    if (da < db) return  1;
+    return (a.meta.banco || '').localeCompare(b.meta.banco || '');
+  });
+
+  return { total: grupos.length, grupos };
+}
+
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, updateMovement, generateTemplate,
+  findPotentialDuplicates,
 };

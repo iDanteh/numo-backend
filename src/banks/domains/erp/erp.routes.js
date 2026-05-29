@@ -1,13 +1,26 @@
 'use strict';
 
 const express = require('express');
+const multer  = require('multer');
 const axios   = require('axios');
 const { authenticate, permit }           = require('../../shared/middleware/auth.real');
 const { asyncHandler }                   = require('../../shared/middleware/error-handler');
 const { sincronizarCuentasPendientes }   = require('./erp-sync.service');
+const { procesarRefacturacionesCyc }     = require('./refacturaciones-cyc.service');
+const { procesarMostradorCyc,
+        generarExcelMostradorCyc }       = require('./mostrador-cyc.service');
 const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const ErpCuentaPendiente                 = require('./ErpCuentaPendiente.model');
 const BankMovement                       = require('../banks/BankMovement.model');
+
+const uploadCyc = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /\.(xlsx|xls)$/i.test(file.originalname);
+    cb(ok ? null : new Error('Solo se aceptan archivos Excel (.xlsx, .xls)'), ok);
+  },
+});
 
 const router = express.Router();
 
@@ -201,5 +214,84 @@ router.post('/match/revert', authenticate, permit('erp:manage'), asyncHandler(as
     message:  `${result.modifiedCount} asociación(es) revertida(s)`,
   });
 }));
+
+// ── POST /api/erp/refacturaciones-cyc/upload ─────────────────────────────────
+// Procesa el Excel "REFACTURACIONES CYC":
+//   • Columna 1 CONCEPTO    → tokens numéricos para encontrar el BankMovement
+//   • Columna 2 IMPORTE     → validación de monto (tolerancia ±$1 MXN)
+//   • Columna 3 BANCO       → preferencia de banco en la búsqueda
+//   • Columna 4 SERIE/FOLIO → lookup exacto de ErpCuentaPendiente (determinístico)
+//
+// Responde con { total, auto, review, escritos, errors, detalleNoMatcheados }
+// Los "auto"   se vinculan en DB inmediatamente (Tier 1: auth + importe).
+// Los "review" NO se escriben en DB; se retornan para revisión manual.
+router.post('/refacturaciones-cyc/upload',
+  authenticate,
+  permit('banks:admin'),
+  uploadCyc.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+    const result = await procesarRefacturacionesCyc(
+      req.file.buffer,
+      req.user._id,
+      req.user.nombre,
+    );
+    res.json(result);
+  }),
+);
+
+// ── POST /api/erp/mostrador-cyc/upload ───────────────────────────────────────
+// Procesa el Excel "MOSTRADOR CYC":
+//   • Col 1 FECHA        → informativo
+//   • Col 2 DESCRIPCIÓN  → match exacto contra BankMovement.concepto
+//   • Col 3 IMPORTE      → match exacto contra BankMovement.deposito
+//   • Col 4 BANCO        → informativo
+//   • Col 5 VENTAS       → folio(s) de ErpCuentaPendiente (serie-folio)
+//   • Col 6 CLIENTE      → informativo
+//
+// Reglas:
+//   · Filas sin VENTAS o importe inválido → ignoradas (se reportan)
+//   · Match: BankMovement donde concepto===DESCRIPCIÓN Y deposito===IMPORTE
+//   · No sobreescribe movimientos con status='identificado' o erpLinks existentes
+//   · Marca el movimiento como 'identificado' al vincular
+router.post('/mostrador-cyc/upload',
+  authenticate,
+  permit('banks:admin'),
+  uploadCyc.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+    const result = await procesarMostradorCyc(
+      req.file.buffer,
+      req.user._id,
+      req.user.nombre,
+    );
+    res.json(result);
+  }),
+);
+
+// ── POST /api/erp/mostrador-cyc/export ───────────────────────────────────────
+// Genera un Excel con 3 hojas a partir del resultado del upload:
+//   · Hoja "Relacionados"    — movimientos vinculados exitosamente
+//   · Hoja "No Relacionados" — con razón y detalle del fallo
+//   · Hoja "Ignorados"       — registros sin columna VENTAS
+router.post('/mostrador-cyc/export',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const resultado = req.body;
+    if (!resultado || typeof resultado !== 'object') {
+      return res.status(400).json({ error: 'Se requiere el resultado del procesamiento en el cuerpo' });
+    }
+
+    const buffer = await generarExcelMostradorCyc(resultado);
+
+    const fecha = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="mostrador-cyc-${fecha}.xlsx"`);
+    res.send(buffer);
+  }),
+);
 
 module.exports = router;

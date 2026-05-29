@@ -125,22 +125,14 @@ async function getCards() {
           identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
           saldoPendiente: {
-            // Σ depósitos no_identificados − Σ depósitos identificados.
-            // Retiros y status 'otros' no participan en este cálculo.
+            // Σ depósitos con status 'no_identificado'.
+            // Retiros, 'identificado' y 'otros' no participan en este cálculo.
             $sum: {
-              $switch: {
-                branches: [
-                  {
-                    case: { $in: ['$status', ['no_identificado', null]] },
-                    then: { $ifNull: ['$deposito', 0] },
-                  },
-                  {
-                    case: { $eq: ['$status', 'identificado'] },
-                    then: { $multiply: [{ $ifNull: ['$deposito', 0] }, -1] },
-                  },
-                ],
-                default: 0,
-              },
+              $cond: [
+                { $in: ['$status', ['no_identificado', null]] },
+                { $ifNull: ['$deposito', 0] },
+                0,
+              ],
             },
           },
           saldoIdentificado: {
@@ -2066,10 +2058,122 @@ async function findPotentialDuplicates() {
   return { total: grupos.length, grupos };
 }
 
+// ── identificarAnterioresAMayo ────────────────────────────────────────────────
+// Marca como 'identificado' TODOS los movimientos activos con status
+// 'no_identificado' y fecha anterior al 1 de mayo.
+// • No toca movimientos con status 'identificado' u 'otros'.
+// • Registra la autoría en identificadoPor con userId = MOTOR_ID_HISTORICO
+//   para que el revert sea selectivo y preciso.
+// • La operación es atómica por documento (MongoDB updateMany con pipeline).
+const MOTOR_ID_HISTORICO     = 'admin-bulk-anterior';
+const MOTOR_NOMBRE_HISTORICO = 'Identificación masiva pre-mayo';
+const CORTE_MAYO             = new Date('2026-05-01T00:00:00.000Z');
+
+// Todos los userIds de motores conocidos — para distinguir identificaciones
+// automáticas de las hechas manualmente por un usuario humano en el revert.
+const TODOS_MOTORES_HISTORICO = [
+  'erp-auto', 'aut-match', 'refact-cyc', 'mostrador-cyc', 'pagos-cyc',
+  MOTOR_ID_HISTORICO,
+];
+
+async function identificarAnterioresAMayo() {
+  const resultado = await BankMovement.updateMany(
+    {
+      isActive: true,
+      status:   'no_identificado',
+      fecha:    { $lt: CORTE_MAYO },
+    },
+    [
+      {
+        $set: {
+          status: 'identificado',
+          identificadoPor: {
+            $concatArrays: [
+              { $ifNull: ['$identificadoPor', []] },
+              [{
+                userId:  MOTOR_ID_HISTORICO,
+                nombre:  MOTOR_NOMBRE_HISTORICO,
+                fechaId: '$$NOW',
+                erpId:   null,
+              }],
+            ],
+          },
+        },
+      },
+    ],
+  );
+  return {
+    marcados: resultado.modifiedCount,
+    message:  `${resultado.modifiedCount} movimientos anteriores al 1 de mayo marcados como identificados`,
+  };
+}
+
+// ── revertirAnterioresAMayo ───────────────────────────────────────────────────
+// Deshace exclusivamente lo que hizo identificarAnterioresAMayo:
+// • Solo actúa sobre movimientos que aún están en status 'identificado'
+//   y tienen la entrada admin-bulk-anterior en identificadoPor.
+//   Si un humano cambió el status manualmente, no se toca.
+// • Elimina la entrada admin-bulk-anterior de identificadoPor.
+// • Resetea status a 'no_identificado' ÚNICAMENTE si no quedan entradas de
+//   usuarios humanos (userId que no sea de ningún motor).
+//   Si un humano también identificó el mismo movimiento, se conserva 'identificado'.
+async function revertirAnterioresAMayo() {
+  const resultado = await BankMovement.updateMany(
+    {
+      'identificadoPor.userId': MOTOR_ID_HISTORICO,
+      status: 'identificado',
+    },
+    [
+      {
+        $set: {
+          // Quitar solo la entrada del motor de identificación masiva
+          identificadoPor: {
+            $filter: {
+              input: { $ifNull: ['$identificadoPor', []] },
+              as:    'entry',
+              cond:  { $ne: ['$$entry.userId', MOTOR_ID_HISTORICO] },
+            },
+          },
+          // Resetear status solo si en el array ORIGINAL no hay entradas humanas.
+          // (Las expresiones en un mismo $set usan el documento de entrada, no el
+          //  estado parcialmente mutado — evaluar sobre '$identificadoPor' original
+          //  da el mismo resultado que sobre el array ya filtrado porque estamos
+          //  preguntando "¿hay humanos?" antes o después de quitar el motor.)
+          status: {
+            $cond: {
+              if: {
+                $eq: [
+                  {
+                    $size: {
+                      $filter: {
+                        input: { $ifNull: ['$identificadoPor', []] },
+                        as:    'e',
+                        cond:  { $not: { $in: ['$$e.userId', TODOS_MOTORES_HISTORICO] } },
+                      },
+                    },
+                  },
+                  0,
+                ],
+              },
+              then: 'no_identificado',
+              else: '$status',
+            },
+          },
+        },
+      },
+    ],
+  );
+  return {
+    revertidos: resultado.modifiedCount,
+    message:    `${resultado.modifiedCount} movimientos revertidos a "no identificado"`,
+  };
+}
+
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, updateMovement, generateTemplate,
   findPotentialDuplicates,
+  identificarAnterioresAMayo, revertirAnterioresAMayo,
 };

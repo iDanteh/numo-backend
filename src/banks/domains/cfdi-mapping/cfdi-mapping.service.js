@@ -1,6 +1,6 @@
 'use strict';
 
-const { CfdiMappingRule, AccountPlan } = require('../../../shared/models/postgres');
+const { CfdiMappingRule, AccountPlan, PolizaMovimiento } = require('../../../shared/models/postgres');
 const { Op }            = require('sequelize');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 
@@ -27,12 +27,32 @@ async function update(id, data) {
   const rule = await CfdiMappingRule.findByPk(id);
   if (!rule) throw new NotFoundError('Regla de mapeo');
   _validate({ ...rule.toJSON(), ...data });
-  return rule.update(data);
+
+  const usada = await PolizaMovimiento.count({ where: { reglaId: id } });
+  const snapshotAntes = usada > 0 ? rule.toJSON() : null;
+
+  await rule.update(data);
+
+  const result = rule.toJSON();
+  if (snapshotAntes) {
+    result._advertencia = `Esta regla ya fue usada en ${usada} movimiento(s). Las pólizas anteriores no se modifican — cada movimiento guarda el nombre de la regla que se usó al generarlo.`;
+    result._reglaAlMomentoDeUso = snapshotAntes;
+  }
+  return result;
 }
 
 async function remove(id) {
   const rule = await CfdiMappingRule.findByPk(id);
   if (!rule) throw new NotFoundError('Regla de mapeo');
+
+  const usada = await PolizaMovimiento.count({ where: { reglaId: id } });
+  if (usada > 0) {
+    throw new BadRequestError(
+      `No se puede eliminar la regla "${rule.nombre}" porque ya fue usada en ${usada} movimiento(s). ` +
+      `Puedes deshabilitarla (isActive=false) o actualizarla sin afectar las pólizas anteriores.`,
+    );
+  }
+
   await rule.destroy();
 }
 
@@ -196,13 +216,16 @@ function _calcCfdiMontos(cfdi) {
     if (esTasa16) { subTotal16 += importe; desc16 += descuento; }
     else          { subTotal0  += importe; desc0  += descuento; }
   }
-  // Fallback Metadata: conceptos vacíos → estimar split desde el encabezado.
-  // subTotal16 = base del IVA 16% (ivaHeader / 0.16); subTotal0 = base restante.
-  if (subTotal16 + subTotal0 === 0) {
-    const ivaHeader = Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
-    const base      = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
-    if (ivaHeader > 0 && base > 0) {
-      subTotal16 = parseFloat((ivaHeader / 0.16).toFixed(6));
+  // Fallback Metadata: no hay traslados en conceptos → estimar split desde el encabezado.
+  // Se activa en dos casos:
+  //   a) conceptos vacíos (subTotal16 + subTotal0 === 0)
+  //   b) conceptos presentes pero SIN traslados → todos los importes cayeron en subTotal0
+  //      aunque el header indique IVA > 0 (SAT Metadata o CFDIs sin desglose por concepto).
+  const ivaHeader0 = Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
+  if (subTotal16 === 0 && ivaHeader0 > 0) {
+    const base = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
+    if (base > 0) {
+      subTotal16 = parseFloat((ivaHeader0 / 0.16).toFixed(6));
       subTotal0  = parseFloat(Math.max(0, base - subTotal16).toFixed(6));
       const totalDesc = Number(cfdi.descuento || 0);
       if (totalDesc > 0 && (subTotal16 + subTotal0) > 0) {
@@ -399,14 +422,20 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const cuentaIvaAplicable = (esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva;
     if (cuentaIvaAplicable) {
       const ivaEsHaber = esIngreso || esIvaHaber;
+      // Derivar IVA de total−subtotal (ambos valores SAT con 2 decimales) para evitar
+      // artefactos IEEE-754 del totalImpuestosTrasladados crudo almacenado en MongoDB.
+      // Solo aplica cuando no hay retenciones; si las hay, se usa el campo crudo.
+      const ivaR = (ivaRet === 0 && isrRet === 0)
+        ? parseFloat((total - subtotal).toFixed(2))
+        : iva;
       movs.push({
         cuentaId:    cuentaMap[cuentaIvaAplicable] ?? null,
         concepto:    `IVA - ${concepto}`,
         centroCosto,
         ventaFecha,
         serie:       serieCfdi,
-        debe:        ivaEsHaber ? 0   : iva,
-        haber:       ivaEsHaber ? iva : 0,
+        debe:        ivaEsHaber ? 0    : ivaR,
+        haber:       ivaEsHaber ? ivaR : 0,
         cfdiUuid:    cfdi.uuid,
         rfcTercero,
       });
@@ -528,7 +557,16 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   let montoAbono;
   if (esAnticipo)      montoAbono = esPago ? (total - ivaRet - isrRet) : subtotal;
   else if (esIvaHaber) montoAbono = subtotal - Number(cfdi.descuento || 0);
-  else                 montoAbono = esIngreso ? subtotal : total - ivaRet - isrRet;
+  else if (esIngreso) {
+    // El movimiento de IVA usa ivaR = total−subtotal (ambos SAT 2-decimales), por lo que
+    // el complemento exacto es subtotal. Garantiza DEBE = HABER sin depender de rounding JS/DB.
+    // Para CFDIs con retenciones se usa total−iva (rama else de ivaR arriba) — caso separado.
+    montoAbono = (ivaRet === 0 && isrRet === 0)
+      ? subtotal
+      : parseFloat((total - iva).toFixed(2));
+  } else {
+    montoAbono = total - ivaRet - isrRet;
+  }
 
   // ── Motor extendido: reglas MIXTAS (tasaIva=mixto, cuentaAbono2) ──────────
   // Divide el abono/cargo entre porción 16% y porción 0%.
@@ -538,26 +576,38 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const { subTotal16, subTotal0 } = _calcCfdiMontos(cfdi);
     if (subTotal16 + subTotal0 > 0) {
       if (esIngreso) {
-        montoAbono = subTotal16;                    // cuentaAbono cubre solo 16%
-        if (subTotal0 > 0) {
+        const netoTotal   = parseFloat((total - iva).toFixed(2));
+        const subTotal0R  = parseFloat(subTotal0.toFixed(2));   // redondear antes de usar
+        montoAbono = parseFloat((netoTotal - subTotal0R).toFixed(2)); // cuentaAbono cubre solo 16%
+        if (subTotal0R > 0) {
           movs.push({
             cuentaId:    cuentaMap[rule.cuentaAbono2] ?? null,
             concepto:    `${concepto} (0%)`,
             centroCosto, ventaFecha, serie: serieCfdi,
-            debe: 0, haber: subTotal0,
+            debe: 0, haber: subTotal0R,
             cfdiUuid: cfdi.uuid, rfcTercero,
           });
         }
       } else {
-        // Tipo E (NC mixta): cargo principal = subTotal16, cargo secundario = subTotal0
+        // Tipo E (NC mixta): cargo principal = subTotal16, cargo secundario = subTotal0.
+        // Pre-redondear a 2 decimales antes de usar: el fallback (_calcCfdiMontos) puede
+        // devolver valores con 4 decimales (iva/0.16). PostgreSQL los redondea al insertar
+        // en DECIMAL(15,2), creando un descuadre de $0.01. Al redondear aquí primero y
+        // calcular ivaR desde los valores ya redondeados se garantiza balance exacto.
+        const s16R = parseFloat(subTotal16.toFixed(2));
+        const s0R  = parseFloat(subTotal0.toFixed(2));
         const cargoLine = movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
-        if (cargoLine) cargoLine.debe = subTotal16;
-        if (subTotal0 > 0) {
+        if (cargoLine) cargoLine.debe = s16R;
+        const ivaLineMixto = movs.find(m => m.concepto?.startsWith('IVA - ') && m.debe > 0);
+        if (ivaLineMixto) {
+          ivaLineMixto.debe = parseFloat((total - s16R - s0R).toFixed(2));
+        }
+        if (s0R > 0) {
           movs.push({
             cuentaId:    cuentaMap[rule.cuentaAbono2] ?? null,
             concepto:    `${concepto} (0%)`,
             centroCosto, ventaFecha, serie: serieCfdi,
-            debe: subTotal0, haber: 0,
+            debe: s0R, haber: 0,
             cfdiUuid: cfdi.uuid, rfcTercero,
           });
         }
@@ -615,7 +665,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     return ao - bo;
   });
 
-  // Enriquecer cada movimiento con los campos SAT del CFDI origen
+  // Enriquecer cada movimiento con los campos SAT del CFDI origen y la regla usada
   const satMeta = {
     tipoComprobante: cfdi.tipoDeComprobante ?? null,
     metodoPago:      cfdi.metodoPago        ?? null,
@@ -623,6 +673,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     folio:           cfdi.folio             ?? null,
     rfcEmisor:       cfdi.emisor?.rfc       ?? null,
     rfcReceptor:     cfdi.receptor?.rfc     ?? null,
+    reglaId:         rule?.id               ?? null,
+    reglaNombre:     rule?.nombre           ?? null,
   };
 
   return movs.map(m => ({ ...m, ...satMeta }));

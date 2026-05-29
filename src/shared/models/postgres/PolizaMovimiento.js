@@ -101,6 +101,19 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
     allowNull: true,
     comment:   'RFC del receptor del CFDI',
   },
+  // ── Trazabilidad de la regla de mapeo usada ──────────────────────────────
+  reglaId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'cfdi_mapping_rules', key: 'id' },
+    onDelete:   'SET NULL',
+    comment:    'FK a la regla de mapeo usada al generar este movimiento',
+  },
+  reglaNombre: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+    comment:   'Nombre de la regla al momento de generar (snapshot histórico)',
+  },
 }, {
   tableName:   'poliza_movimientos',
   underscored: true,

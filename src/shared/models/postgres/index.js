@@ -45,6 +45,10 @@ AccountPlan.hasMany   (PolizaMovimiento, { foreignKey: 'cuentaId', as: 'movimien
 PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
 CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movimientos' });
 
+/** Regla de mapeo CFDI usada al generar el movimiento */
+PolizaMovimiento.belongsTo(CfdiMappingRule, { foreignKey: 'reglaId', as: 'regla' });
+CfdiMappingRule.hasMany(PolizaMovimiento,   { foreignKey: 'reglaId', as: 'movimientosGenerados' });
+
 // ── Sincronización ────────────────────────────────────────────────────────────
 
 /**
@@ -120,6 +124,13 @@ async function syncModels() {
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ADD COLUMN IF NOT EXISTS cuenta_faltante BOOLEAN NOT NULL DEFAULT FALSE`
   ).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_faltante:', e.message));
+
+  // Trazabilidad de regla de mapeo en movimientos
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS regla_id     INTEGER REFERENCES cfdi_mapping_rules(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS regla_nombre VARCHAR(200)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN regla_id/regla_nombre:', e.message));
 
   // Campos SAT del CFDI en movimientos (tipoComprobante, metodoPago, formaPago, folio, rfcEmisor, rfcReceptor)
   await Poliza.sequelize.query(`

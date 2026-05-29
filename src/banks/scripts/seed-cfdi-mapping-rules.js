@@ -858,6 +858,52 @@ const reglas = [
     prioridad:       84,
   },
 
+  // ── 11B. CONDONACIÓN formaPago=15 (Reglas 8A-15, 8X-15, 17-15) ──────────────
+  // formaPago='15' = "Condonación" en catálogo SAT. El vendedor perdona la deuda
+  // sin movimiento de efectivo → cuentaAbono = Clientes (no Bancos).
+  // Compiten con Reg 8A-8F (mismo prioridad) pero formaPago='15' no está cubierto
+  // por ninguna de ellas → estas reglas son las únicas que matchean.
+  // IVA: PUE → cuentaIva (2104010001 definitivo); PPD → cuentaIvaPPD (2105010001 diferido).
+  {
+    nombre:          'Reg 8A-15 — NC PUE Condonación Efectivo 16%',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '15',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (pérdida por condonar)
+    cuentaAbono:     '1103010001',  // Clientes 16% (cancela CxC — sin efectivo)
+    cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE)
+    cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (PPD)
+    prioridad:       80,
+  },
+  {
+    // Fallback para tipoRelacion distinto de '01' (ej. '03', '04') con formaPago=15
+    nombre:          'Reg 8X-15 — NC PUE Condonación 16% (Fallback tipoRelacion)',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '15',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200020001',
+    cuentaAbono:     '1103010001',
+    cuentaIva:       '2104010001',
+    cuentaIvaPPD:    '2105010001',
+    prioridad:       85,
+  },
+  {
+    nombre:          'Reg 17-15 — NC Condonación Tasa 0%',
+    tipoComprobante: 'E',
+    formaPago:       '15',
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:     '1103010002',  // Clientes 0%
+    cuentaIva:       null,
+    prioridad:       85,
+  },
+
   // ── 12. DEVOLUCIONES NC POR TASA (Reglas 17–19) ───────────────────────────
   // Fallback para E+tipoRelacion=01. Variantes *A (formaPago=01) ganan por spec.
   // tasaIva discrimina la ruta: 0% → Reg 17, mixto → Reg 18, descuento → Reg 19.
@@ -949,6 +995,200 @@ const reglas = [
     prioridad:       86,
   },
 
+  // ── 12B. DEVOLUCIONES MERCANCÍA tipoRelacion=03 (Reglas 8A-3 … 8X-3) ──────
+  // tipoRelacion='03' = "Devolución de mercancía sobre facturas o traslados previos".
+  // Mismo tratamiento contable que tipoRelacion='01' (devolución normal):
+  //   DEBE Devoluciones, HABER Bancos/Caja, HABER IVA.
+  // Prioridades idénticas a sus equivalentes '01' para no alterar el ranking.
+  {
+    nombre:          'Reg 8A-3 — NC PUE Devolución Mercancía Efectivo 16%',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tipoRelacion:    '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:       '2104010001',
+    prioridad:       80,
+  },
+  {
+    nombre:          'Reg 8B-3 — NC PUE Devolución Mercancía Transferencia 16%',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '03',
+    tipoRelacion:    '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       '2104010001',
+    prioridad:       81,
+  },
+  {
+    nombre:          'Reg 8C-3 — NC PUE Devolución Mercancía Cheque 16%',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '04',
+    tipoRelacion:    '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1102011005',
+    cuentaIva:       '2104010001',
+    prioridad:       82,
+  },
+  {
+    nombre:          'Reg 8D-3 — NC PUE Devolución Mercancía Tarjeta Débito 16%',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '28',
+    tipoRelacion:    '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1102011005',
+    cuentaIva:       '2104010001',
+    prioridad:       83,
+  },
+  {
+    // Fallback 16% para formaPago no especificado (incluye '99', '30', etc.)
+    nombre:          'Reg 8X-3 — NC PUE Devolución Mercancía 16% (Fallback)',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       null,
+    tipoRelacion:    '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1102011005',
+    cuentaIva:       '2104010001',
+    prioridad:       85,
+  },
+  {
+    nombre:          'Reg 17-3 — NC Devolución Mercancía Tasa 0%',
+    tipoComprobante: 'E',
+    tipoRelacion:    '03',
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:     '1102011005',
+    cuentaIva:       null,
+    prioridad:       85,
+  },
+
+  // ── 11C. CONDONACIÓN formaPago=15 + tipoRelacion=03/04 ───────────────────────
+  // Estos CFDIs tienen tipoRelacion='03' (devolución mercancía) o '04' (sustitución)
+  // Y formaPago='15' (condonación — sin efectivo). Sin estas reglas, Reg 8X-3/17-3
+  // los capturan antes (formaPago=null) y los mandan a Bancos HABER en vez de Clientes.
+  // Prioridad=80 + formaPago especificado → más específicas que Reg 8X-3 (formaPago=null, prio=85).
+  {
+    nombre:          'Reg 8X-15-3 — Condonación Mercancía 16% (tipoRelacion=03, formaPago=15)',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '15',
+    tipoRelacion:    '03',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:     '1103010001',  // Clientes (sin efectivo)
+    cuentaIva:       '2104010001',
+    cuentaIvaPPD:    '2105010001',
+    prioridad:       80,
+  },
+  {
+    nombre:          'Reg 17-15-3 — Condonación Mercancía 0% (tipoRelacion=03, formaPago=15)',
+    tipoComprobante: 'E',
+    formaPago:       '15',
+    tipoRelacion:    '03',
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:     '1103010002',  // Clientes 0%
+    cuentaIva:       null,
+    prioridad:       85,
+  },
+  {
+    nombre:          'Reg 8X-15-4 — Condonación Sustitución 16% (tipoRelacion=04, formaPago=15)',
+    tipoComprobante: 'E',
+    formaPago:       '15',
+    tipoRelacion:    '04',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200020001',
+    cuentaAbono:     '1103010001',
+    cuentaIva:       '2104010001',
+    cuentaIvaPPD:    '2105010001',
+    prioridad:       80,
+  },
+
+  // ── 12C. SUSTITUCIÓN DE CFDI tipoRelacion=04 (Reglas 8A-4 … 8X-4) ─────────
+  // tipoRelacion='04' = "Sustitución de los CFDI previos".
+  // Contablemente idéntico a devolución: cancela el CFDI anterior.
+  {
+    nombre:          'Reg 8A-4 — NC PUE Sustitución CFDI Efectivo 16%',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tipoRelacion:    '04',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1101010003',  // Caja
+    cuentaIva:       '2104010001',
+    prioridad:       80,
+  },
+  {
+    // Fallback 16% para el resto de formas de pago (formaPago=15, etc.)
+    nombre:          'Reg 8X-4 — NC PUE Sustitución CFDI 16% (Fallback)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '04',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1102011005',
+    cuentaIva:       '2104010001',
+    prioridad:       85,
+  },
+
+  // ── 12D. CONDONACIÓN tipoRelacion=15 (Reglas 15A + 15B) ──────────────────
+  // tipoRelacion='15' = "Condonación". El vendedor perdona una deuda PPD no cobrada.
+  // No hay movimiento de efectivo → cuentaAbono es Clientes (reduce CxC), NO Bancos.
+  // El IVA que se cancela es el DIFERIDO (2105010001 = IVA Por Trasladar PPD),
+  // porque el CFDI original era PPD y nunca se cobró → nunca se causó el definitivo.
+  // Asiento E condonación:
+  //   DEBE  Descuentos s/Ventas (subtotal condonado)
+  //   HABER IVA Por Trasladar PPD (IVA diferido que se extingue)
+  //   HABER Clientes (total condonado — liquida la CxC)
+  {
+    // Condonación PUE: IVA ya causado vive en 2104010001 (definitivo).
+    // Condonación PPD: IVA diferido vive en 2105010001 — motor elige según cfdi.metodoPago.
+    // cuentaAbono = Clientes (no Bancos) porque no hay movimiento de efectivo.
+    // Asiento: DEBE Descuentos (subtotal) + DEBE IVA (2104010001 PUE / 2105010001 PPD)
+    //          HABER Clientes (total)  → cuadra exacto: subtotal + IVA = total ✓
+    nombre:          'Reg 15A — Condonación Tasa 16%',
+    tipoComprobante: 'E',
+    tipoRelacion:    '15',
+    tasaIva:         '16',
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (pérdida por condonación)
+    cuentaAbono:     '1103010001',  // Clientes 16% (extingue CxC — sin efectivo)
+    cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE → cancela causado)
+    cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (PPD → cancela diferido)
+    prioridad:       87,
+  },
+  {
+    nombre:          'Reg 15B — Condonación Tasa 0%',
+    tipoComprobante: 'E',
+    tipoRelacion:    '15',
+    tasaIva:         '0',
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:     '1103010002',  // Clientes 0%
+    cuentaIva:       null,
+    cuentaIvaPPD:    null,
+    prioridad:       87,
+  },
+
   // ── 13. BONIFICACIONES NC RETROACTIVAS (Reglas 20–21) ────────────────────
   // Rappel anual / descuento retroactivo. Cargo a Ingresos, no a Devoluciones.
   // Variantes *A (formaPago=01) ganan por spec sobre fallback (formaPago=null).
@@ -1030,6 +1270,134 @@ const reglas = [
     cuentaAbono:     '2103090001',  // Anticipos Otros
     cuentaIva:       '2104010001',  // IVA Trasladado
     prioridad:       92,
+  },
+
+  // ── IC. INTERCOMPAÑÍAS (Reg IC-I-PUE, IC-I-PPD, IC-E) ───────────────────────
+  // Prioridad 5 — antes que todas las reglas genéricas.
+  // rfcReceptor filtra exactamente los 7 RFC del grupo.
+  // Cuentas destino:
+  //   4100030001  Ingresos Intercompañías 16%
+  //   4200030001  Devoluciones s/Ventas Intercompañías 16%
+  //   1103010001  Clientes Nac Gral 16% (CxC para PPD — usar cuenta IC si existe)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // GAAA5403026G2 — Alberto Neftali Garcia Arango (Física)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (GAAA5403026G2)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'GAAA5403026G2',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (GAAA5403026G2)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'GAAA5403026G2',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (GAAA5403026G2)',
+    tipoComprobante: 'E', rfcReceptor: 'GAAA5403026G2',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
+  },
+
+  // GAFA850630542 — Alberto Neftali Garcia Fernandez del Campo (Física)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (GAFA850630542)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'GAFA850630542',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (GAFA850630542)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'GAFA850630542',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (GAFA850630542)',
+    tipoComprobante: 'E', rfcReceptor: 'GAFA850630542',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
+  },
+
+  // AVA1002023N7 — Arrendadora de Vehiculos SA de CV (Moral)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (AVA1002023N7)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'AVA1002023N7',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (AVA1002023N7)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'AVA1002023N7',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (AVA1002023N7)',
+    tipoComprobante: 'E', rfcReceptor: 'AVA1002023N7',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
+  },
+
+  // GIN121109RX4 — Gane Inmobiliaria SA de CV (Moral)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (GIN121109RX4)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'GIN121109RX4',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (GIN121109RX4)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'GIN121109RX4',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (GIN121109RX4)',
+    tipoComprobante: 'E', rfcReceptor: 'GIN121109RX4',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
+  },
+
+  // KTE180215FE1 — Kore Tecnologia SA de CV (Moral)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (KTE180215FE1)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'KTE180215FE1',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (KTE180215FE1)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'KTE180215FE1',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (KTE180215FE1)',
+    tipoComprobante: 'E', rfcReceptor: 'KTE180215FE1',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
+  },
+
+  // FEUL5811155D9 — Luz Maria Fernandez del Campo Urzua (Física)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (FEUL5811155D9)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'FEUL5811155D9',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (FEUL5811155D9)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'FEUL5811155D9',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (FEUL5811155D9)',
+    tipoComprobante: 'E', rfcReceptor: 'FEUL5811155D9',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
+  },
+
+  // RSI051018GL6 — Red de Servicios a Inmuebles SA (Moral)
+  {
+    nombre:          'Reg IC-I-PUE — Ingreso Intercompañía PUE (RSI051018GL6)',
+    tipoComprobante: 'I', metodoPago: 'PUE', rfcReceptor: 'RSI051018GL6',
+    cuentaCargo: '1102011005', cuentaAbono: '4100030001', cuentaIva: '2104010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (RSI051018GL6)',
+    tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'RSI051018GL6',
+    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E — NC Devolución Intercompañía (RSI051018GL6)',
+    tipoComprobante: 'E', rfcReceptor: 'RSI051018GL6',
+    cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
   },
 
   // ── 16. COMODÍN — Sin coincidencia (Regla 9) ──────────────────────────────

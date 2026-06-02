@@ -2103,6 +2103,7 @@ async function identificarAnterioresAMayo() {
       isActive: true,
       status:   'no_identificado',
       fecha:    { $lt: CORTE_MAYO },
+      deposito: { $gt: 0 },
     },
     [
       {

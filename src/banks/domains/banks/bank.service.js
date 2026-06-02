@@ -789,6 +789,24 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
           const saldoOk = m.saldo != null && cand.saldo != null && Math.abs(m.saldo - cand.saldo) < 0.01;
           if (!saldoOk) continue;
 
+          // BBVA: banco+fecha+monto+saldo iguales → mismo movimiento, sin verificar
+          // concepto.  BBVA exporta la misma transacción con textos completamente
+          // distintos según el tipo de estado de cuenta descargado:
+          //   "DEPOSITO CHEQUE BBVA"       ↔  "BBV0002829120109031014"
+          //   "MORA SPEI NORMABANXICO / …" ↔  "COMP SPEI / …"   (red de seguridad;
+          //                                      Capa 1c es la vía primaria)
+          // El saldo acumulado es único dentro de una misma cuenta → el triplete
+          // banco+fecha+saldo no puede coincidir por azar en transacciones distintas
+          // de la misma cuenta.  Riesgo teórico: dos cuentas BBVA distintas con el
+          // mismo saldo y el mismo monto en la misma fecha (prácticamente imposible).
+          if (m.banco === 'BBVA') {
+            hashesExistentes.add(m.hash);
+            softDuplicados++;
+            const enrichSoft = buildSoftEnrich(m, cand);
+            if (enrichSoft) enrichmentUpdates.push({ _id: cand._id, $set: enrichSoft });
+            break;
+          }
+
           // 3. El concepto debe compartir texto significativo (mín. 20 chars).
           // Dos variantes cubiertas:
           //   a) Prefijo común: un import trae el número de autorización incrustado
@@ -867,6 +885,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         const cA = (m.concepto        || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const cB = (existing.concepto || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const minL = Math.min(cA.length, cB.length);
+        // BBVA cross-date: saldo+monto suficiente sin verificar concepto
+        // (misma lógica que Capa 1d — BBVA usa formatos de texto incompatibles).
+        if (m.banco === 'BBVA') return true;
         return minL >= 10 && (
           cA.substring(0, minL) === cB.substring(0, minL) ||
           cA.endsWith(cB) || cB.endsWith(cA)
@@ -2120,6 +2141,7 @@ async function identificarAnterioresAMayo() {
 async function revertirAnterioresAMayo() {
   const resultado = await BankMovement.updateMany(
     {
+      isActive: true,                              // espejo del filtro de identificarAnterioresAMayo
       'identificadoPor.userId': MOTOR_ID_HISTORICO,
       status: 'identificado',
     },

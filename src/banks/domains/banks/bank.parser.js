@@ -770,6 +770,16 @@ function parseBBVA(sheet) {
       }
     }
 
+    // Fallback: "CH-{número}" → cheques pagados en extracto resumido BBVA.
+    // "CH-0003264 0109031014" no contiene '/' por lo que el bloque anterior
+    // no extrae nada.  Extraer el número del prefijo "CH-" produce auth "3264",
+    // que coincide con el auth "3264" de "CHEQUE PAGADO NO. . / 0003264 ..."
+    // y permite que Capa 1b los deduplique correctamente.
+    if (!numeroAutorizacion) {
+      const chMatch = concepto.match(/\bCH-0*(\d+)/i);
+      if (chMatch) numeroAutorizacion = chMatch[1];
+    }
+
     // Extraer clave de rastreo SPEI para MORA SPEI NORMABANXICO.
     // BBVA incrusta el ID único de la transacción tras "COMPENSACION DE ":
     //   "MORA SPEI NORMABANXICO / COMPENSACION DE 8846APR1202605085280762645"

@@ -401,6 +401,29 @@ router.patch('/movements/:id',
   }),
 );
 
+// POST /api/banks/admin/identificar-anteriores
+// Marca como 'identificado' todos los movimientos con status 'no_identificado'
+// y fecha anterior al 1 de mayo. Solo admin. Idempotente: no toca 'otros' ni
+// movimientos ya identificados.
+router.post('/admin/identificar-anteriores',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (_req, res) => {
+    res.json(await service.identificarAnterioresAMayo());
+  }),
+);
+
+// POST /api/banks/admin/revertir-anteriores
+// Deshace exclusivamente lo aplicado por identificar-anteriores.
+// Preserva identificaciones manuales de usuarios humanos.
+router.post('/admin/revertir-anteriores',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (_req, res) => {
+    res.json(await service.revertirAnterioresAMayo());
+  }),
+);
+
 // GET /api/banks/duplicates  — análisis de movimientos potencialmente duplicados (solo admin)
 // Detecta grupos de movimientos que comparten importe+saldo+fecha o número de
 // autorización, lo que sugiere que la misma transacción fue importada más de una

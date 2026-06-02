@@ -9,6 +9,8 @@ const { sincronizarCuentasPendientes }   = require('./erp-sync.service');
 const { procesarRefacturacionesCyc }     = require('./refacturaciones-cyc.service');
 const { procesarMostradorCyc,
         generarExcelMostradorCyc }       = require('./mostrador-cyc.service');
+const { procesarPagosCyc,
+        generarExcelPagosCyc }           = require('./pagos-cyc.service');
 const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const ErpCuentaPendiente                 = require('./ErpCuentaPendiente.model');
 const BankMovement                       = require('../banks/BankMovement.model');
@@ -290,6 +292,60 @@ router.post('/mostrador-cyc/export',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition',
       `attachment; filename="mostrador-cyc-${fecha}.xlsx"`);
+    res.send(buffer);
+  }),
+);
+
+// ── POST /api/erp/pagos-cyc/upload ───────────────────────────────────────────
+// Procesa el Excel "PAGOS CYC":
+//   • Col 1 FECHA        → informativo / Tier 3 de matching
+//   • Col 2 DESCRIPCIÓN  → match contra BankMovement.concepto (normalizado)
+//   • Col 3 MONTO        → match exacto contra BankMovement.deposito
+//   • Col 4 BANCO        → preferencia de banco (con canonicalización Bancomer↔BBVA)
+//   • Col 5 VENTAS       → folio(s) de ErpCuentaPendiente (serie-folio)
+//
+// Reglas:
+//   · Filas sin VENTAS o monto inválido → ignoradas (se reportan)
+//   · Matching 4 tiers: auth+concepto → auth solo → fecha → fallback
+//   · NO sobreescribe movimientos con status='identificado' o erpLinks existentes
+//   · Guard ACID en bulkWrite: protege explícitamente contra race conditions con
+//     trabajo humano ($nor identificadoPor + erpLinks.0 $exists false)
+router.post('/pagos-cyc/upload',
+  authenticate,
+  permit('banks:admin'),
+  uploadCyc.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+    const result = await procesarPagosCyc(
+      req.file.buffer,
+      req.user._id,
+      req.user.nombre,
+    );
+    res.json(result);
+  }),
+);
+
+// ── POST /api/erp/pagos-cyc/export ───────────────────────────────────────────
+// Genera un Excel con 3 hojas a partir del resultado del upload:
+//   · Hoja "Relacionados"    — movimientos vinculados exitosamente (verde)
+//   · Hoja "No Relacionados" — con razón y detalle del fallo (rojo/amarillo)
+//   · Hoja "Ignorados"       — registros sin columna VENTAS válida (gris)
+router.post('/pagos-cyc/export',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const resultado = req.body;
+    if (!resultado || typeof resultado !== 'object') {
+      return res.status(400).json({ error: 'Se requiere el resultado del procesamiento en el cuerpo' });
+    }
+
+    const buffer = await generarExcelPagosCyc(resultado);
+
+    const fecha = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="pagos-cyc-${fecha}.xlsx"`);
     res.send(buffer);
   }),
 );

@@ -660,11 +660,154 @@ const downloadByUUID = asyncHandler(async (req, res) => {
   })();
 });
 
+/**
+ * DELETE /api/sat/checkpoint/:rfc
+ * Resetea checkpoints atorados (solicitando/verificando/descargando) a status=error.
+ * Query opcional: ?fecha=YYYY-MM-DD&tipo=Egresos para apuntar a uno específico.
+ */
+/**
+ * GET /api/sat/checkpoints/salud
+ * Resumen de salud de la descarga SAT: incompletos, errores agrupados por código,
+ * en-proceso y cuota del día por RFC.
+ * Query params opcionales: rfc, dias (default 45)
+ */
+const getCheckpointsSalud = asyncHandler(async (req, res) => {
+  const SatJobCheckpoint = require('../models/SatJobCheckpoint');
+
+  const rfcFiltro = req.query.rfc ? req.query.rfc.toUpperCase().trim() : null;
+  const dias      = Math.min(parseInt(req.query.dias || '45', 10), 365);
+
+  // Calcular fecha mínima en CDMX
+  const fmtMX   = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const hoyMX   = fmtMX.format(new Date());
+  const desdeDate = new Date(`${hoyMX}T12:00:00`);
+  desdeDate.setDate(desdeDate.getDate() - dias);
+  const desdeStr  = fmtMX.format(desdeDate);
+
+  const filtroBase = { fecha: { $gte: desdeStr } };
+  if (rfcFiltro) filtroBase.rfc = rfcFiltro;
+
+  const checkpoints = await SatJobCheckpoint.find(filtroBase)
+    .select('rfc fecha fechaFin tipoComprobante status error cfdisDescargados totalReportadoSAT reintentos updatedAt startedAt')
+    .sort({ fecha: -1 })
+    .lean();
+
+  // Extraer código SAT del mensaje de error (ej. "SAT [5002]:" → "SAT [5002]")
+  const extraerCodigo = (msg) => {
+    if (!msg) return 'desconocido';
+    const m = msg.match(/SAT[_\s]\[?(\w+)\]?/i);
+    if (m) return `SAT [${m[1]}]`;
+    if (msg.startsWith('SAT_RECHAZADA')) return 'SAT_RECHAZADA';
+    if (msg.toLowerCase().includes('timeout')) return 'TIMEOUT';
+    if (msg.toLowerCase().includes('reseteado manualmente')) return 'RESET_MANUAL';
+    return 'otro';
+  };
+
+  const resumen    = { total: 0, completados: 0, incompletos: 0, errores: 0, enProceso: 0 };
+  const incompletos   = [];
+  const erroresPorCodigo = {};
+  const enProceso     = [];
+
+  for (const cp of checkpoints) {
+    resumen.total++;
+    switch (cp.status) {
+      case 'completado':
+        resumen.completados++;
+        break;
+      case 'incompleto': {
+        resumen.incompletos++;
+        const pct = cp.totalReportadoSAT > 0
+          ? Math.round((cp.cfdisDescargados / cp.totalReportadoSAT) * 100)
+          : null;
+        incompletos.push({
+          rfc:              cp.rfc,
+          fecha:            cp.fecha,
+          fechaFin:         cp.fechaFin,
+          tipoComprobante:  cp.tipoComprobante,
+          cfdisDescargados: cp.cfdisDescargados,
+          totalReportadoSAT: cp.totalReportadoSAT,
+          porcentaje:       pct,
+          reintentos:       cp.reintentos,
+          updatedAt:        cp.updatedAt,
+        });
+        break;
+      }
+      case 'error': {
+        resumen.errores++;
+        const codigo = extraerCodigo(cp.error);
+        if (!erroresPorCodigo[codigo]) erroresPorCodigo[codigo] = [];
+        erroresPorCodigo[codigo].push({
+          rfc:             cp.rfc,
+          fecha:           cp.fecha,
+          fechaFin:        cp.fechaFin,
+          tipoComprobante: cp.tipoComprobante,
+          error:           cp.error,
+          reintentos:      cp.reintentos,
+          updatedAt:       cp.updatedAt,
+        });
+        break;
+      }
+      case 'solicitando':
+      case 'verificando':
+      case 'descargando':
+        resumen.enProceso++;
+        enProceso.push({
+          rfc:             cp.rfc,
+          fecha:           cp.fecha,
+          tipoComprobante: cp.tipoComprobante,
+          status:          cp.status,
+          updatedAt:       cp.updatedAt,
+        });
+        break;
+    }
+  }
+
+  // Cuota del día por cada RFC único en los checkpoints
+  const rfcs = [...new Set(checkpoints.map(c => c.rfc))];
+  const cuotaDia = {};
+  await Promise.all(rfcs.map(async (rfc) => {
+    cuotaDia[rfc] = await getEstado(rfc);
+  }));
+
+  res.json({
+    resumen,
+    incompletos,
+    erroresPorCodigo,
+    enProceso,
+    cuotaDia,
+    meta: { desde: desdeStr, hasta: hoyMX, dias },
+  });
+});
+
+const resetCheckpoint = asyncHandler(async (req, res) => {
+  const SatJobCheckpoint = require('../models/SatJobCheckpoint');
+  const rfc  = (req.params.rfc || '').toUpperCase().trim();
+  const { fecha, tipo } = req.query;
+
+  if (!rfc) return res.status(400).json({ error: 'RFC requerido' });
+
+  const filtro = { rfc, status: { $in: ['solicitando', 'verificando', 'descargando'] } };
+  if (fecha) filtro.fecha           = fecha;
+  if (tipo)  filtro.tipoComprobante = tipo;
+
+  const result = await SatJobCheckpoint.updateMany(filtro, {
+    $set: { status: 'error', error: 'Reseteado manualmente por el administrador', updatedAt: new Date() },
+  });
+
+  res.json({
+    ok:          true,
+    modificados: result.modifiedCount,
+    mensaje:     result.modifiedCount > 0
+      ? `${result.modifiedCount} checkpoint(s) reseteados a "error". Ya puedes iniciar una nueva descarga.`
+      : 'No se encontraron checkpoints activos para ese RFC/fecha/tipo.',
+  });
+});
+
 module.exports = {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp,
   cleanupActiveJobs, testKey, patchKey, exportXml,
-  downloadByUUID,
+  downloadByUUID, resetCheckpoint, getCheckpointsSalud,
 };

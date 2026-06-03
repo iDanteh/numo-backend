@@ -584,8 +584,35 @@ const importExcel = asyncHandler(async (req, res) => {
       const ish     = parseNum(getCell(row, 'ISH'))                          ?? 0;
       const totalRetenidos = retIVA + retISR + ivaRet6 + ish;
 
+      // Desglose individual de traslados (para impuestos.traslados[])
+      const trasladosList = [];
+      if (iva16   > 0) trasladosList.push({ impuesto: '002', tipoFactor: 'Tasa', tasaOCuota: 0.16,  importe: iva16   });
+      if (iva8    > 0) trasladosList.push({ impuesto: '002', tipoFactor: 'Tasa', tasaOCuota: 0.08,  importe: iva8    });
+      if (ieps    > 0) trasladosList.push({ impuesto: '003', tipoFactor: 'Tasa',                    importe: ieps    });
+      if (ieps304 > 0) trasladosList.push({ impuesto: '003', tipoFactor: 'Tasa', tasaOCuota: 0.304, importe: ieps304 });
+
+      // Desglose individual de retenciones
+      const retencionesList = [];
+      if (retIVA  > 0) retencionesList.push({ impuesto: '002', importe: retIVA  });
+      if (retISR  > 0) retencionesList.push({ impuesto: '001', importe: retISR  });
+      if (ivaRet6 > 0) retencionesList.push({ impuesto: '002', importe: ivaRet6 });
+      if (ish     > 0) retencionesList.push({ impuesto: 'ISH', importe: ish     });
+
       // ── Descuento ────────────────────────────────────────────────────────
       const descuento = parseNum(getCell(row, 'Descuento')) ?? 0;
+
+      // ── Conceptos (descripción del reporte SAT) ─────────────────────────────
+      const conceptosRaw = getCell(row, 'Conceptos');
+      const conceptosList = conceptosRaw
+        ? [{ descripcion: conceptosRaw.toString().trim().slice(0, 500) }]
+        : [];
+
+      // ── Campos adicionales del reporte SAT ─────────────────────────────
+      const numCtaPago     = getCell(row, 'NumCtaPago',  'Num Cta Pago')  || undefined;
+      const estadoPago     = getCell(row, 'EstadoPago',  'Estado Pago')   || undefined;
+      const fechaPagoRaw   = getCell(row, 'FechaPago',   'Fecha Pago');
+      const fechaPago      = parseDate(fechaPagoRaw) || undefined;
+      const complementoTipo = getCell(row, 'Complemento') || undefined;
 
       // ── UUID relacionado — 'UUIDRel' es el nombre en Complementos de Pago ─
       const uuidRelacionRaw = getCell(row, 'UUID Relacion', 'UUIDRelacion', 'UUID Relación', 'UUIDRel');
@@ -618,9 +645,15 @@ const importExcel = asyncHandler(async (req, res) => {
         ...(version && { version }),
         ...(satStatus && { satStatus }),
         ...(source === 'ERP' && { erpStatus: getCell(row, 'Estatus', 'EstatusERP', 'Estatus ERP') || 'Timbrado' }),
+        numCtaPago,
+        estadoPago,
+        ...(fechaPago    && { fechaPago }),
+        ...(complementoTipo && { complementoTipo }),
         emisor: {
-          rfc:    rfcEmisor,
-          nombre: getCell(row, 'Nombre Emisor', 'NombreEmisor') || undefined,
+          rfc:       rfcEmisor,
+          nombre:    getCell(row, 'Nombre Emisor', 'NombreEmisor')         || undefined,
+          direccion: getCell(row, 'Direccion Emisor', 'DireccionEmisor')   || undefined,
+          localidad: getCell(row, 'Localidad Emisor', 'LocalidadEmisor')   || undefined,
         },
         receptor: {
           rfc:                      rfcReceptor,
@@ -630,10 +663,15 @@ const importExcel = asyncHandler(async (req, res) => {
           numRegIdTrib:             getCell(row, 'NumRegIdTrib', 'Num Reg Id Trib')    || undefined,
           regimenFiscal:            regimenFiscalReceptor,
           domicilioFiscalReceptor:  domicilioFiscalReceptor,
+          direccion: getCell(row, 'Direccion Receptor', 'DireccionReceptor') || undefined,
+          localidad: getCell(row, 'Localidad Receptor', 'LocalidadReceptor') || undefined,
         },
+        conceptos: conceptosList,
         impuestos: {
           totalImpuestosTrasladados: totalTrasladados,
           totalImpuestosRetenidos:   totalRetenidos,
+          traslados:   trasladosList,
+          retenciones: retencionesList,
         },
         ...(fechaTimbrado && {
           timbreFiscalDigital: { fechaTimbrado },

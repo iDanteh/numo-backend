@@ -66,14 +66,50 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
       satStatus:         'Vigente',
       isActive:          true,
     })
-      .select('tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos complementoPago.totales cfdiRelacionados.tipoRelacion')
+      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales cfdiRelacionados.tipoRelacion')
       .maxTimeMS(60_000)
       .lean();
 
     totalCfdis += cfdis.length;
 
+    // Enriquecer CFDIs SAT Metadata con conceptos del homólogo ERP —
+    // igual que el generator (líneas 98-123). Los CFDIs Metadata no traen
+    // traslados por concepto, por lo que _detectTasaIva usa el fallback del
+    // header y puede clasificar como '16' facturas que son mixtas o 0%.
+    // Al inyectar los conceptos ERP se obtiene la tasa real por concepto.
+    const uuidsSinConceptos = cfdis
+      .filter(c => c.uuid && (
+        !c.formaPago ||
+        !c.metodoPago ||
+        !c.conceptos?.length ||
+        c.conceptos.every(con => !(con.impuestos?.traslados?.length))
+      ))
+      .map(c => c.uuid);
+
+    let erpMetaMap = {};
+    if (uuidsSinConceptos.length) {
+      const erpCfdis = await CFDI.find({
+        uuid:   { $in: uuidsSinConceptos },
+        source: 'ERP',
+      }).select('uuid formaPago metodoPago conceptos impuestos').lean();
+      erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
+    }
+
+    const cfdisEnriquecidos = cfdis.map(cfdi => {
+      const erp = erpMetaMap[cfdi.uuid];
+      if (!erp) return cfdi;
+      const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+      return {
+        ...cfdi,
+        formaPago:  cfdi.formaPago  || erp.formaPago,
+        metodoPago: cfdi.metodoPago || erp.metodoPago,
+        conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+        impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      };
+    });
+
     const resultados = await Promise.all(
-      cfdis.map(async (cfdi) => {
+      cfdisEnriquecidos.map(async (cfdi) => {
         const rule = mappingSvc.findRuleInList(cfdi, rules);
         if (!rule) return { sinRegla: 1, movs: [] };
         const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMapByCod);
@@ -146,6 +182,62 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
     }
   }
 
+  // 5.5. Rollup jerárquico: propagar saldos de cuentas hoja a cuentas padre.
+  // Carga TODAS las cuentas activas para obtener la cadena parentId.
+  // Las cuentas padre aparecerán en el resultado con el acumulado de sus hijos.
+  const todasCuentas = await AccountPlan.findAll({
+    where:      { isActive: true },
+    attributes: ['id', 'codigo', 'nombre', 'tipo', 'nivel', 'parentId'],
+    raw:        true,
+  });
+  const cuentaById  = Object.fromEntries(todasCuentas.map(c => [c.id,     c]));
+  const cuentaByCod = Object.fromEntries(todasCuentas.map(c => [c.codigo, c]));
+
+  for (const [codigo, acc] of Object.entries(byAccount)) {
+    const hoja = cuentaByCod[codigo];
+    if (!hoja?.parentId) continue;
+
+    // Pre-redondear para que la suma de hijos coincida exactamente con el padre
+    const dR = Math.round(acc.debe  * 100) / 100;
+    const hR = Math.round(acc.haber * 100) / 100;
+    const sR = Math.round((saldoInicialMap[codigo] ?? 0) * 100) / 100;
+
+    let parentId = hoja.parentId;
+    while (parentId != null) {
+      const padre = cuentaById[parentId];
+      if (!padre) break;
+
+      if (!byAccount[padre.codigo]) {
+        byAccount[padre.codigo] = {
+          codigo:       padre.codigo,
+          nombre:       padre.nombre,
+          tipo:         padre.tipo,
+          nivel:        padre.nivel,
+          esAgrupadora: true,   // excluir de sumas iguales — ya agrupa sus hijos
+          debe:         0,
+          haber:        0,
+          movCount:     0,
+        };
+        saldoInicialMap[padre.codigo] = 0;
+      }
+
+      byAccount[padre.codigo].debe     += dR;
+      byAccount[padre.codigo].haber    += hR;
+      byAccount[padre.codigo].movCount += acc.movCount;
+      saldoInicialMap[padre.codigo]    += sR;
+
+      parentId = padre.parentId;
+    }
+  }
+
+  // Agregar nivel a las cuentas hoja que ya estaban en byAccount
+  for (const [codigo, acc] of Object.entries(byAccount)) {
+    if (acc.nivel == null) {
+      const c = cuentaByCod[codigo];
+      if (c?.nivel != null) acc.nivel = c.nivel;
+    }
+  }
+
   // 6. Calcular saldo y ordenar por código
   const cuentas = Object.values(byAccount)
     .map(c => ({
@@ -157,11 +249,14 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
     }))
     .sort((a, b) => a.codigo.localeCompare(b.codigo, undefined, { numeric: true }));
 
+  // Las sumas iguales usan solo cuentas hoja (no agrupadora) para evitar
+  // doble conteo: cada cuenta agrupadora ya incluye el saldo de sus hijos.
+  const hoja = cuentas.filter(c => !c.esAgrupadora);
   const totales = {
-    debe:         Math.round(cuentas.reduce((s, c) => s + c.debe,         0) * 100) / 100,
-    haber:        Math.round(cuentas.reduce((s, c) => s + c.haber,        0) * 100) / 100,
-    saldoInicial: Math.round(cuentas.reduce((s, c) => s + c.saldoInicial, 0) * 100) / 100,
-    saldoFinal:   Math.round(cuentas.reduce((s, c) => s + c.saldo,        0) * 100) / 100,
+    debe:         Math.round(hoja.reduce((s, c) => s + c.debe,         0) * 100) / 100,
+    haber:        Math.round(hoja.reduce((s, c) => s + c.haber,        0) * 100) / 100,
+    saldoInicial: Math.round(hoja.reduce((s, c) => s + c.saldoInicial, 0) * 100) / 100,
+    saldoFinal:   Math.round(hoja.reduce((s, c) => s + c.saldo,        0) * 100) / 100,
   };
 
   return {

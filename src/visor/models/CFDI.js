@@ -49,6 +49,8 @@ const contribuyenteSchema = new mongoose.Schema({
   residenciaFiscal: { type: String },
   numRegIdTrib: { type: String },
   usoCFDI: { type: String },
+  direccion: { type: String },
+  localidad: { type: String },
 }, { _id: false });
 
 // Sub-schema para Conceptos
@@ -143,6 +145,10 @@ const cfdiSchema = new mongoose.Schema({
   },
   exportacion: { type: String },
   metodoPago: { type: String },
+  numCtaPago:  { type: String },
+  estadoPago:  { type: String },
+  fechaPago:   { type: Date },
+  complementoTipo: { type: String },
   lugarExpedicion: { type: String },
 
   // Partes

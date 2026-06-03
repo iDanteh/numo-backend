@@ -72,6 +72,11 @@ const CfdiMappingRule = sequelize.define('CfdiMappingRule', {
     allowNull: true,
     comment:   'true=solo CFDIs con descuento>0, false=excluye CFDIs con descuento, null=cualquiera',
   },
+  conceptoContiene: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+    comment:   'Texto que debe contener la descripción del primer concepto (case-insensitive). null=cualquiera',
+  },
   // Cuentas contables (código SAT, ej. "501.01")
   cuentaCargo: {
     type:      DataTypes.STRING(20),

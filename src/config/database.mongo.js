@@ -20,7 +20,9 @@ const connectMongo = async () => {
 
   await mongoose.connect(uri, {
     maxPoolSize:              20,       // más conexiones disponibles para ops paralelas
-    serverSelectionTimeoutMS: 5000,
+    minPoolSize:              2,        // mantiene conexiones calientes → evita SSL alert 80
+    serverSelectionTimeoutMS: 30000,   // más tiempo para reconectar tras idle de Atlas
+    heartbeatFrequencyMS:     10000,   // heartbeat cada 10s evita que Atlas cierre la conexión
     socketTimeoutMS:          120000,  // operaciones pesadas (match-erp) pueden tomar >45s
     bufferTimeoutMS:          60000,   // alinear con socketTimeoutMS para no cortar antes
   });

@@ -56,6 +56,7 @@ const reglas = [
     cuentaCargo:     '1101010003',   // Caja (formaPago=01 → efectivo)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
     cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos
+    conceptoContiene: null,
     prioridad:       9,
   },
   {
@@ -66,6 +67,7 @@ const reglas = [
     cuentaCargo:     '1102011005',   // Bancos (dinero recibido)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
     cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos
+    conceptoContiene: null,
     prioridad:       9,
   },
 
@@ -83,6 +85,7 @@ const reglas = [
     cuentaCargo:     '1101010003',   // Caja
     cuentaAbono:     '4100010001',   // Ingresos Contado 16%
     cuentaIva:       '2104010001',   // IVA Trasladado
+    conceptoContiene: null,
     prioridad:       10,
   },
   {
@@ -95,6 +98,7 @@ const reglas = [
     cuentaCargo:     '1102011005',   // Bancos
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       11,
   },
   {
@@ -107,6 +111,7 @@ const reglas = [
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       12,
   },
   {
@@ -119,6 +124,7 @@ const reglas = [
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       12,
   },
   {
@@ -131,6 +137,7 @@ const reglas = [
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       13,
   },
   {
@@ -143,6 +150,7 @@ const reglas = [
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       14,
   },
   {
@@ -158,6 +166,7 @@ const reglas = [
     cuentaCargo:     '1102011005',   // Bancos (forma de pago desconocida → cuenta genérica)
     cuentaAbono:     '4100010001',   // Ingresos Contado 16%
     cuentaIva:       '2104010001',   // IVA Trasladado
+    conceptoContiene: null,
     prioridad:       14,
   },
 
@@ -179,6 +188,7 @@ const reglas = [
     cuentaCargo:     '2103090002',  // Anticipos Otros Club Tuberos (consume saldo monedero)
     cuentaAbono:     '4100010001',  // Ingresos Contado 16%
     cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE: IVA causado al momento de la venta)
+    conceptoContiene: null,
     prioridad:       10,
   },
   {
@@ -190,6 +200,7 @@ const reglas = [
     cuentaCargo:     '2103090002',  // Anticipos Otros Club Tuberos
     cuentaAbono:     '4100010002',  // Ingresos Contado 0%
     cuentaIva:       null,          // sin IVA (tasa 0%)
+    conceptoContiene: null,
     prioridad:       10,            // mismo número que 1G; spec mayor gana (tiene tasaIva)
   },
 
@@ -206,6 +217,7 @@ const reglas = [
     cuentaCargo:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaAbono:     '4100010002',  // Ingresos Contado 0%
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       15,
   },
   {
@@ -218,6 +230,7 @@ const reglas = [
     cuentaCargo:     '1102011005',
     cuentaAbono:     '4100010002',  // Ingresos Contado 0%
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       15,
   },
 
@@ -237,6 +250,7 @@ const reglas = [
     cuentaCargo:     '1101010003',   // Caja (formaPago=01 → efectivo)
     cuentaAbono:     '4100010002',   // Ingresos Contado 0% (exento = sin IVA)
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       16,
   },
   {
@@ -249,6 +263,7 @@ const reglas = [
     cuentaCargo:     '1102011005',   // Bancos
     cuentaAbono:     '4100010002',   // Ingresos Contado 0%
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       16,
   },
 
@@ -266,6 +281,7 @@ const reglas = [
     cuentaAbono:     '4100010001',  // Ingresos 16% (partida principal)
     cuentaAbono2:    '4100010002',  // Ingresos 0% (partida adicional — motor)
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       16,
   },
   {
@@ -279,6 +295,7 @@ const reglas = [
     cuentaAbono:     '4100010001',  // Ingresos 16% (partida principal)
     cuentaAbono2:    '4100010002',  // Ingresos 0% (partida adicional — motor)
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       16,
   },
 
@@ -296,6 +313,7 @@ const reglas = [
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
     cuentaDescuento: '4200020001',  // Descuentos s/Ventas 16%
+    conceptoContiene: null,
     prioridad:       17,
   },
   {
@@ -309,6 +327,7 @@ const reglas = [
     cuentaAbono:     '4100010001',
     cuentaIva:       '2104010001',
     cuentaDescuento: '4200020001',  // Descuentos s/Ventas 16%
+    conceptoContiene: null,
     prioridad:       17,
   },
 
@@ -325,6 +344,7 @@ const reglas = [
     cuentaAbono:     '4100010002',  // Ingresos 0%
     cuentaIva:       null,
     cuentaDescuento: '4200020002',  // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       18,
   },
   {
@@ -338,6 +358,7 @@ const reglas = [
     cuentaAbono:     '4100010002',  // Ingresos 0%
     cuentaIva:       null,
     cuentaDescuento: '4200020002',  // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       18,
   },
 
@@ -355,6 +376,7 @@ const reglas = [
     cuentaAbono:     '4100010002',   // Ingresos Contado 0%
     cuentaIva:       null,
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       19,
   },
   {
@@ -368,6 +390,7 @@ const reglas = [
     cuentaAbono:     '4100010002',   // Ingresos Contado 0%
     cuentaIva:       null,
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       19,
   },
 
@@ -387,6 +410,7 @@ const reglas = [
     cuentaIva:       '2104010001',
     cuentaDescuento:  '4200020001',  // Descuentos s/Ventas 16%
     cuentaDescuento0: '4200020002',  // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       19,
   },
   {
@@ -402,6 +426,7 @@ const reglas = [
     cuentaIva:       '2104010001',
     cuentaDescuento:  '4200020001',  // Descuentos s/Ventas 16%
     cuentaDescuento0: '4200020002',  // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       19,
   },
 
@@ -416,6 +441,7 @@ const reglas = [
     cuentaIva:           '2104010001',  // IVA Trasladado definitivo (HABER)
     cuentaIvaAnticipo:   '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
     cuentaDeltaAnticipo: '1102011005',  // Bancos (5° mov: cash por saldo > anticipo, si aplica)
+    conceptoContiene: null,
     prioridad:           12,
   },
 
@@ -431,6 +457,7 @@ const reglas = [
     cuentaCargo:     '1103010001',   // Clientes Nac Gral 16%
     cuentaAbono:     '4100020001',   // Ingresos Crédito 16%
     cuentaIvaPPD:    '2105010001',   // IVA Por Trasladar PPD (diferido)
+    conceptoContiene: null,
     prioridad:       21,
   },
 
@@ -449,6 +476,7 @@ const reglas = [
     cuentaCargo2:      '1103010001',  // Clientes (CxC residual)
     cuentaAbono:       '4100020001',  // Ingresos Crédito 16%
     cuentaIvaPPD:      '2105010001',  // IVA Por Trasladar PPD
+    conceptoContiene: null,
     prioridad:         22,
   },
   {
@@ -463,6 +491,7 @@ const reglas = [
     cuentaCargo2:      '1103010002',  // Clientes Nac Gral 0%
     cuentaAbono:       '4100020002',  // Ingresos Por Ventas Crédito Tasa 0% (PPD → crédito, no contado)
     cuentaIvaPPD:      null,
+    conceptoContiene: null,
     prioridad:         22,
   },
 
@@ -486,6 +515,7 @@ const reglas = [
     cuentaCargo2:      '1102011005',  // Bancos (DEBE cash residual)
     cuentaAbono:       '4100010001',  // Ingresos Contado 16%
     cuentaIva:         '2104010001',  // IVA Trasladado
+    conceptoContiene: null,
     prioridad:         20,
   },
   {
@@ -499,6 +529,7 @@ const reglas = [
     cuentaCargo2:      '1102011005',  // Bancos (cash residual)
     cuentaAbono:       '4100010002',  // Ingresos Contado 0%
     cuentaIva:         null,
+    conceptoContiene: null,
     prioridad:         20,
   },
 
@@ -514,6 +545,7 @@ const reglas = [
     cuentaCargo:     '1103010001',  // Clientes Nac Gral 16%
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (diferido)
+    conceptoContiene: null,
     prioridad:       60,
   },
 
@@ -531,6 +563,7 @@ const reglas = [
     cuentaCargo:     '1103010002',   // Clientes Nac Gral 0%
     cuentaAbono:     '4100020002',   // Ingresos Crédito 0%
     cuentaIvaPPD:    null,
+    conceptoContiene: null,
     prioridad:       66,
   },
 
@@ -547,6 +580,7 @@ const reglas = [
     cuentaAbono:     '4100020001',   // Ingresos Crédito 16%
     cuentaIvaPPD:    '2105010001',   // IVA Por Trasladar PPD (diferido)
     cuentaDescuento: '4200020001',   // Descuentos s/Ventas 16%
+    conceptoContiene: null,
     prioridad:       59,
   },
 
@@ -562,6 +596,7 @@ const reglas = [
     cuentaCargo:     '1103010002',  // Clientes Nac Gral 0%
     cuentaAbono:     '4100020002',  // Ingresos Por Ventas Crédito Tasa 0%
     cuentaIvaPPD:    null,
+    conceptoContiene: null,
     prioridad:       65,
   },
 
@@ -578,6 +613,7 @@ const reglas = [
     cuentaAbono:     '4100020002',   // Ingresos Por Ventas Crédito Tasa 0%
     cuentaIvaPPD:    null,
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       64,
   },
 
@@ -594,6 +630,7 @@ const reglas = [
     cuentaAbono:     '4100020002',   // Ingresos Crédito 0%
     cuentaIvaPPD:    null,
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0%
+    conceptoContiene: null,
     prioridad:       66,
   },
 
@@ -611,6 +648,7 @@ const reglas = [
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaAbono2:    '4100020002',  // Ingresos Crédito 0% (PPD → crédito, no contado)
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       66,
   },
 
@@ -624,6 +662,7 @@ const reglas = [
     cuentaAbono:     '1103010001',  // Clientes (liquida CxC)
     cuentaIva:       '2104010001',  // IVA causado definitivo
     cuentaIvaPPD:    '2105010001',  // cancela cuenta puente
+    conceptoContiene: null,
     prioridad:       70,
   },
   {
@@ -634,6 +673,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       71,
   },
   {
@@ -644,6 +684,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       72,
   },
   {
@@ -654,6 +695,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       72,
   },
   {
@@ -664,6 +706,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       73,
   },
   {
@@ -674,6 +717,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       74,
   },
 
@@ -690,6 +734,7 @@ const reglas = [
     cuentaAbono:  '1103010002',  // Clientes 0% (liquida CxC 0%)
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    70,
   },
   {
@@ -701,6 +746,7 @@ const reglas = [
     cuentaAbono:  '1103010002',
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    71,
   },
   {
@@ -712,6 +758,7 @@ const reglas = [
     cuentaAbono:  '1103010002',
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    72,
   },
   {
@@ -723,6 +770,7 @@ const reglas = [
     cuentaAbono:  '1103010002',
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    72,
   },
   {
@@ -734,6 +782,7 @@ const reglas = [
     cuentaAbono:  '1103010002',
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    73,
   },
   {
@@ -745,6 +794,7 @@ const reglas = [
     cuentaAbono:  '1103010002',
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    74,
   },
 
@@ -761,6 +811,7 @@ const reglas = [
     cuentaAbono:  '1103010001',  // Clientes (liquida CxC)
     cuentaIva:    '2104010001',  // IVA Trasladado definitivo (HABER)
     cuentaIvaPPD: '2105010001',  // IVA Por Trasladar PPD (DEBE — cancela diferido)
+    conceptoContiene: null,
     prioridad:    70,
   },
 
@@ -773,7 +824,327 @@ const reglas = [
     cuentaAbono:  '1103010002',  // Clientes 0%
     cuentaIva:    '2104010001',
     cuentaIvaPPD: '2105010001',
+    conceptoContiene: null,
     prioridad:    70,
+  },
+
+  // ── 10C. COBRO GENÉRICO TIPO P — FALLBACK CP 1.0 (Reg 7Z) ───────────────
+  // Sin filtro de formaPago ni tasaIva: captura CFDIs tipo P cuya tasa no pudo
+  // determinarse (CP 1.0 / CFDI 3.3 sin nodo <Totales>) o cuya formaPago no está
+  // cubierta por Reg 7A–7G. Prioridad 99 → siempre gana la regla específica
+  // cuando exista; este es el último recurso.
+  {
+    nombre:          'Reg 7Z — Cobro Genérico (CP 1.0 / forma de pago no clasificada)',
+    tipoComprobante: 'P',
+    formaPago:       null,
+    tasaIva:         null,
+    cuentaCargo:     '1101010003',  // Caja por identificar
+    cuentaAbono:     '1103010001',  // Clientes Nac Gral 16% (default)
+    cuentaIva:       '2104010001',
+    cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
+    prioridad:       99,
+  },
+
+  // ── CC. REGLAS POR CONCEPTO (conceptoContiene) ────────────────────────────
+  // Prioridades 74–78 — se disparan ANTES que las reglas genéricas tipo E (80+).
+  // Sub-clasifican NCs según la descripción del primer concepto del CFDI.
+  //
+  // JERARQUÍA:
+  //   74 — Club Tuberos (más específico: gana sobre 'bonificaci' genérico)
+  //   75 — Bonificación genérica
+  //   76 — Devolución de Cliente
+  //   77 — Cancelación de Cliente
+  //   78 — Aplicación de Anticipo (Reg 23 prio 90 gana por spec si tipoRelacion=07)
+  //
+  // POR QUÉ SE NECESITAN:
+  //   Sin estas reglas, una NC E+tipoRelacion=01+tasaIva=16 con descripción
+  //   "BONIFICACIÓN" cae en Reg 8A (prio 80 → Devoluciones 4200010001) en lugar de
+  //   Reg 20 (prio 88 → Descuentos 4200020001). La prioridad numérica gana siempre.
+  //   Las CC-rules a prio 74-78 fuerzan la ruta correcta antes de que lleguen las 8A+.
+  //
+  // KEYWORD 'bonificaci':
+  //   Es substring de 'bonificación'.toLowerCase() Y de 'bonificacion'.toLowerCase()
+  //   → captura ambas ortografías (con y sin acento) con una sola cadena.
+
+  // ── CC1. BONIFICACIÓN CLUB TUBEROS (prio 74) ──────────────────────────────
+  // 'club tuberos' es substring de 'bonificacion club tuberos'.
+  // Reg CC-CLT gana sobre Reg CC-BON (prio 75) porque 74 < 75.
+  // cuentaAbono = 2103090002 (Monedero Club Tuberos): la bonificación acredita el saldo
+  // del cliente en el monedero electrónico sin movimiento de efectivo.
+  // ⚠️ CONFIRMAR: si la bonificación se paga en efectivo/transferencia, cambiar
+  //    cuentaAbono a 1101010003 (Caja) o 1102011005 (Bancos) según el caso.
+  {
+    nombre:           'Reg CC-CLT-16 — NC Bonificación Club Tuberos 16%',
+    tipoComprobante:  'E',
+    tasaIva:          '16',
+    conceptoContiene: 'club tuberos',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '2103090002',  // Anticipos Otros Club Tuberos (acredita monedero)
+    cuentaIva:        '2104010001',  // IVA Trasladado
+    prioridad:        74,
+  },
+  {
+    nombre:           'Reg CC-CLT-0 — NC Bonificación Club Tuberos 0%',
+    tipoComprobante:  'E',
+    tasaIva:          '0',
+    conceptoContiene: 'club tuberos',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaIva:        null,
+    prioridad:        74,
+  },
+
+  // ── CC2. BONIFICACIÓN GENÉRICA (prio 75) ─────────────────────────────────
+  // Captura 'BONIFICACIÓN' y 'Bonificacion' (con/sin acento).
+  // formaPago=01 gana por spec sobre formaPago=null en empate de prioridad.
+  {
+    nombre:           'Reg CC-BON-16-EF — NC Bonificación 16% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '16',
+    conceptoContiene: 'bonificaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-BON-16 — NC Bonificación 16%',
+    tipoComprobante:  'E',
+    tasaIva:          '16',
+    conceptoContiene: 'bonificaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-BON-0-EF — NC Bonificación 0% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '0',
+    conceptoContiene: 'bonificaci',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        null,
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-BON-0 — NC Bonificación 0%',
+    tipoComprobante:  'E',
+    tasaIva:          '0',
+    conceptoContiene: 'bonificaci',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        null,
+    prioridad:        75,
+  },
+
+  // ── CC2A. BONIFICACIÓN MIXTA (prio 75) ────────────────────────────────────
+  // Bonificaciones con IVA mixto (0%+16%) en el mismo CFDI.
+  {
+    nombre:           'Reg CC-BON-M-EF — NC Bonificación Mixta Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          'mixto',
+    conceptoContiene: 'bonificaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-BON-M — NC Bonificación Mixta',
+    tipoComprobante:  'E',
+    tasaIva:          'mixto',
+    conceptoContiene: 'bonificaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+
+  // ── CC2B. DESCUENTO / DTO (prio 75) ──────────────────────────────────────
+  // Captura 'DTO', 'Dto', 'dto' — abreviatura de descuento en CFDIs.
+  // Substring 'dto' no colisiona con palabras comunes del español.
+  // formaPago=01 gana por spec sobre formaPago=null en empate de prioridad.
+  {
+    nombre:           'Reg CC-DTO-16-EF — NC Descuento 16% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '16',
+    conceptoContiene: 'dto',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-DTO-16 — NC Descuento 16%',
+    tipoComprobante:  'E',
+    tasaIva:          '16',
+    conceptoContiene: 'dto',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-DTO-0-EF — NC Descuento 0% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '0',
+    conceptoContiene: 'dto',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        null,
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-DTO-0 — NC Descuento 0%',
+    tipoComprobante:  'E',
+    tasaIva:          '0',
+    conceptoContiene: 'dto',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        null,
+    prioridad:        75,
+  },
+
+  // ── CC2C. DESCUENTO DTO MIXTO (prio 75) ──────────────────────────────────
+  // DTO en CFDIs con IVA mixto (0%+16%).
+  {
+    nombre:           'Reg CC-DTO-M-EF — NC Descuento DTO Mixto Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          'mixto',
+    conceptoContiene: 'dto',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-DTO-M — NC Descuento DTO Mixto',
+    tipoComprobante:  'E',
+    tasaIva:          'mixto',
+    conceptoContiene: 'dto',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+
+  // ── CC3. DEVOLUCIÓN DE CLIENTE (prio 76) ──────────────────────────────────
+  // DEBE Devoluciones s/Ventas, HABER Bancos/Caja (reembolso al cliente).
+  // Si la devolución no genera reembolso (queda como saldo a favor),
+  // cambiar cuentaAbono a 2103090001 (Anticipos Otros).
+  {
+    nombre:           'Reg CC-DEV-16-EF — NC Devolución de Cliente 16% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '16',
+    conceptoContiene: 'devolucion',
+    cuentaCargo:      '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja (formaPago=01 → efectivo)
+    cuentaIva:        '2104010001',
+    prioridad:        76,
+  },
+  {
+    nombre:           'Reg CC-DEV-16 — NC Devolución de Cliente 16%',
+    tipoComprobante:  'E',
+    tasaIva:          '16',
+    conceptoContiene: 'devolucion',
+    cuentaCargo:      '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        76,
+  },
+  {
+    nombre:           'Reg CC-DEV-0-EF — NC Devolución de Cliente 0% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '0',
+    conceptoContiene: 'devolucion',
+    cuentaCargo:      '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        null,
+    prioridad:        76,
+  },
+  {
+    nombre:           'Reg CC-DEV-0 — NC Devolución de Cliente 0%',
+    tipoComprobante:  'E',
+    tasaIva:          '0',
+    conceptoContiene: 'devolucion',
+    cuentaCargo:      '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        null,
+    prioridad:        76,
+  },
+
+  // ── CC4. CANCELACIÓN DE CLIENTE (prio 77) ─────────────────────────────────
+  // Tratamiento contable idéntico a Devolución: DEBE Devoluciones, HABER Bancos/Caja.
+  // ⚠️ CONFIRMAR: si la cancelación no genera reembolso en efectivo (queda como
+  //    saldo a favor del cliente), cambiar cuentaAbono a 2103090001 (Anticipos Otros).
+  {
+    nombre:           'Reg CC-CAN-16-EF — NC Cancelación de Cliente 16% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '16',
+    conceptoContiene: 'cancelacion',
+    cuentaCargo:      '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        '2104010001',
+    prioridad:        77,
+  },
+  {
+    nombre:           'Reg CC-CAN-16 — NC Cancelación de Cliente 16%',
+    tipoComprobante:  'E',
+    tasaIva:          '16',
+    conceptoContiene: 'cancelacion',
+    cuentaCargo:      '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        77,
+  },
+  {
+    nombre:           'Reg CC-CAN-0-EF — NC Cancelación de Cliente 0% Efectivo',
+    tipoComprobante:  'E',
+    formaPago:        '01',
+    tasaIva:          '0',
+    conceptoContiene: 'cancelacion',
+    cuentaCargo:      '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        null,
+    prioridad:        77,
+  },
+  {
+    nombre:           'Reg CC-CAN-0 — NC Cancelación de Cliente 0%',
+    tipoComprobante:  'E',
+    tasaIva:          '0',
+    conceptoContiene: 'cancelacion',
+    cuentaCargo:      '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        null,
+    prioridad:        77,
+  },
+
+  // ── CC5. APLICACIÓN DE ANTICIPO (prio 78) ─────────────────────────────────
+  // Fallback para NCs con 'anticipo' en descripción que NO tengan tipoRelacion=07.
+  // Cuando tipoRelacion=07 está presente, Reg 23 (prio 90) también matchea, pero
+  // CC-ANT tiene prioridad=78 < 90 → CC-ANT gana. Las cuentas son idénticas
+  // a Reg 23 → mismo asiento contable, sin impacto.
+  // Motor: cuentaIvaAnticipo activa la lógica de swap IVA-diferido → IVA-definitivo.
+  {
+    nombre:            'Reg CC-ANT — NC Aplicación de Anticipo (por descripción)',
+    tipoComprobante:   'E',
+    conceptoContiene:  'anticipo',
+    cuentaCargo:       '2103010001',  // Anticipos De Clientes General (cancela pasivo)
+    cuentaAbono:       '1103010001',  // Clientes Nac Gral 16% (reduce CxC)
+    cuentaIva:         '2104010001',  // IVA Trasladado definitivo (HABER)
+    cuentaIvaAnticipo: '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
+    prioridad:         78,
   },
 
   // ── 11. NOTAS DE CRÉDITO PUE (Reglas 8A–8F) ──────────────────────────────
@@ -790,6 +1161,7 @@ const reglas = [
     cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
     cuentaAbono:     '1101010003',  // Caja (salida de dinero)
     cuentaIva:       '2104010001',  // IVA a cancelar
+    conceptoContiene: null,
     prioridad:       80,
   },
   {
@@ -803,6 +1175,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       81,
   },
   {
@@ -816,6 +1189,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       82,
   },
   {
@@ -829,6 +1203,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       82,
   },
   {
@@ -842,6 +1217,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       83,
   },
   {
@@ -855,6 +1231,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       84,
   },
 
@@ -876,6 +1253,7 @@ const reglas = [
     cuentaAbono:     '1103010001',  // Clientes 16% (cancela CxC — sin efectivo)
     cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE)
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (PPD)
+    conceptoContiene: null,
     prioridad:       80,
   },
   {
@@ -890,6 +1268,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       85,
   },
   {
@@ -901,6 +1280,7 @@ const reglas = [
     cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
     cuentaAbono:     '1103010002',  // Clientes 0%
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       85,
   },
 
@@ -914,9 +1294,10 @@ const reglas = [
     formaPago:       '01',
     tasaIva:         '0',
     tieneDescuento:  false,
-    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
     cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       85,
   },
   {
@@ -925,9 +1306,10 @@ const reglas = [
     tipoRelacion:    '01',
     tasaIva:         '0',
     tieneDescuento:  false,         // NCs 0% con descuento → Reg 19B/19C
-    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       85,
   },
   {
@@ -940,6 +1322,7 @@ const reglas = [
     cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaAbono2:    '4200010002',  // Devoluciones s/Ventas 0% (motor)
     cuentaIva:       '2104010001',  // IVA 16% a cancelar
+    conceptoContiene: null,
     prioridad:       86,
   },
   {
@@ -951,6 +1334,7 @@ const reglas = [
     cuentaAbono:     '1102011005',  // Bancos
     cuentaAbono2:    '4200010002',  // Devoluciones s/Ventas 0% (motor)
     cuentaIva:       '2104010001',  // IVA 16% a cancelar
+    conceptoContiene: null,
     prioridad:       86,
   },
   {
@@ -962,6 +1346,7 @@ const reglas = [
     cuentaCargo:     '1103010001',  // Clientes (cobra la diferencia al cliente)
     cuentaAbono:     '4200020001',  // Descuentos s/Ventas 16% (cancela el exceso de descuento)
     cuentaIva:       '2104010001',  // IVA Trasladado (IVA ahora causado)
+    conceptoContiene: null,
     prioridad:       87,
   },
   {
@@ -976,6 +1361,7 @@ const reglas = [
     cuentaAbono:     '1101010003',   // Caja (formaPago=01 → efectivo)
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0% (HABER — cancela el descuento original)
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       86,
   },
   {
@@ -992,6 +1378,7 @@ const reglas = [
     cuentaAbono:     '1102011005',   // Bancos (devolución al cliente)
     cuentaDescuento: '4200020002',   // Descuentos s/Ventas 0% (HABER — cancela el descuento original)
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       86,
   },
 
@@ -1011,6 +1398,7 @@ const reglas = [
     cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
     cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       80,
   },
   {
@@ -1024,6 +1412,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       81,
   },
   {
@@ -1037,6 +1426,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       82,
   },
   {
@@ -1050,6 +1440,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       83,
   },
   {
@@ -1064,6 +1455,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       85,
   },
   {
@@ -1075,6 +1467,7 @@ const reglas = [
     cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
     cuentaAbono:     '1102011005',
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       85,
   },
 
@@ -1095,6 +1488,7 @@ const reglas = [
     cuentaAbono:     '1103010001',  // Clientes (sin efectivo)
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       80,
   },
   {
@@ -1107,6 +1501,7 @@ const reglas = [
     cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
     cuentaAbono:     '1103010002',  // Clientes 0%
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       85,
   },
   {
@@ -1120,6 +1515,7 @@ const reglas = [
     cuentaAbono:     '1103010001',
     cuentaIva:       '2104010001',
     cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
     prioridad:       80,
   },
 
@@ -1137,6 +1533,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1101010003',  // Caja
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       80,
   },
   {
@@ -1149,6 +1546,7 @@ const reglas = [
     cuentaCargo:     '4200010001',
     cuentaAbono:     '1102011005',
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       85,
   },
 
@@ -1175,6 +1573,7 @@ const reglas = [
     cuentaAbono:     '1103010001',  // Clientes 16% (extingue CxC — sin efectivo)
     cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE → cancela causado)
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (PPD → cancela diferido)
+    conceptoContiene: null,
     prioridad:       87,
   },
   {
@@ -1186,11 +1585,12 @@ const reglas = [
     cuentaAbono:     '1103010002',  // Clientes 0%
     cuentaIva:       null,
     cuentaIvaPPD:    null,
+    conceptoContiene: null,
     prioridad:       87,
   },
 
   // ── 13. BONIFICACIONES NC RETROACTIVAS (Reglas 20–21) ────────────────────
-  // Rappel anual / descuento retroactivo. Cargo a Ingresos, no a Devoluciones.
+  // Rappel anual / descuento retroactivo. Cargo a Descuentos sobre Ventas.
   // Variantes *A (formaPago=01) ganan por spec sobre fallback (formaPago=null).
   {
     nombre:          'Reg 20A — Bonificación s/Ventas 16% Efectivo (NC retroactiva)',
@@ -1198,9 +1598,10 @@ const reglas = [
     tipoRelacion:    '01',
     formaPago:       '01',
     tasaIva:         '16',
-    cuentaCargo:     '4100010001',  // Ingresos Por Ventas Contado 16%
+    cuentaCargo:     '4200020001',  // Descuentos sobre Ventas 16%
     cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       88,
   },
   {
@@ -1208,9 +1609,10 @@ const reglas = [
     tipoComprobante: 'E',
     tipoRelacion:    '01',
     tasaIva:         '16',
-    cuentaCargo:     '4100010001',  // Ingresos Por Ventas Contado 16%
+    cuentaCargo:     '4200020001',  // Descuentos sobre Ventas 16%
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       '2104010001',
+    conceptoContiene: null,
     prioridad:       88,
   },
   {
@@ -1219,9 +1621,10 @@ const reglas = [
     tipoRelacion:    '01',
     formaPago:       '01',
     tasaIva:         '0',
-    cuentaCargo:     '4100010002',  // Ingresos Por Ventas Contado 0%
+    cuentaCargo:     '4200020002',  // Descuentos sobre Ventas 0%
     cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       89,
   },
   {
@@ -1229,9 +1632,10 @@ const reglas = [
     tipoComprobante: 'E',
     tipoRelacion:    '01',
     tasaIva:         '0',
-    cuentaCargo:     '4100010002',  // Ingresos Por Ventas Contado 0%
+    cuentaCargo:     '4200020002',  // Descuentos sobre Ventas 0%
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       89,
   },
 
@@ -1245,6 +1649,7 @@ const reglas = [
     cuentaAbono:       '1103010001',  // Clientes Nac Gral 16% (reduce CxC de factura final)
     cuentaIva:         '2104010001',  // IVA Trasladado definitivo (HABER)
     cuentaIvaAnticipo: '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
+    conceptoContiene: null,
     prioridad:         90,
   },
 
@@ -1259,6 +1664,7 @@ const reglas = [
     cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
     cuentaAbono:     '2103090001',  // Anticipos Otros
     cuentaIva:       null,
+    conceptoContiene: null,
     prioridad:       91,
   },
   {
@@ -1269,6 +1675,7 @@ const reglas = [
     cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
     cuentaAbono:     '2103090001',  // Anticipos Otros
     cuentaIva:       '2104010001',  // IVA Trasladado
+    conceptoContiene: null,
     prioridad:       92,
   },
 
@@ -1411,6 +1818,7 @@ const reglas = [
     cuentaAbono:     '4100020001',  // Ingresos Crédito 16%
     cuentaIva:       '2104010001',  // IVA Trasladado (PUE)
     cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (PPD)
+    conceptoContiene: null,
     prioridad:       99,
   },
 ];

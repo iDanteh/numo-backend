@@ -245,6 +245,90 @@ const ejecutarComparacionAuto = async ({ ejercicioParam, periodoParam } = {}) =>
  *  4. Guarda resultados en Comparison y Discrepancy.
  *  5. Elimina las credenciales al terminar (éxito o fallo).
  */
+/**
+ * Reintenta checkpoints marcados como 'incompleto' de los últimos 45 días.
+ * Se llama al inicio de cada descarga masiva nocturna.
+ */
+const reintentarIncompletos = async () => {
+  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const hoyMXStr = fmtMX.format(new Date());
+  const hace45 = new Date(`${hoyMXStr}T12:00:00`);
+  hace45.setDate(hace45.getDate() - 45);
+  const hace45Str = fmtMX.format(hace45);
+
+  const incompletos = await SatJobCheckpoint.find({
+    status: 'incompleto',
+    fecha:  { $gte: hace45Str },
+  }).lean();
+
+  if (incompletos.length === 0) {
+    logger.info('[SatSyncJob] reintentarIncompletos: no hay checkpoints incompletos pendientes.');
+    return;
+  }
+
+  logger.info(`[SatSyncJob] reintentarIncompletos: ${incompletos.length} checkpoint(s) incompleto(s) encontrado(s) — reintentando...`);
+
+  for (const cp of incompletos) {
+    const { rfc, fecha, tipoComprobante, ejercicio, periodo, reintentos = 0 } = cp;
+
+    // Máximo 3 reintentos para no desperdiciar solicitudes SAT en días sin CFDIs
+    if (reintentos >= 3) {
+      logger.warn(`[SatSyncJob] reintentarIncompletos: RFC ${rfc} ${tipoComprobante} ${fecha} ya tiene ${reintentos} reintentos — se omite.`);
+      continue;
+    }
+
+    const limitCheck = await puedeIniciar(rfc, 1);
+    if (!limitCheck.puede) {
+      logger.warn(`[SatSyncJob] reintentarIncompletos: RFC ${rfc} bloqueado — ${limitCheck.razon}`);
+      break; // si no hay cupo, dejar de intentar más
+    }
+
+    let creds = null;
+    try {
+      creds = await obtener(rfc);
+    } catch {
+      logger.warn(`[SatSyncJob] reintentarIncompletos: sin credenciales para RFC ${rfc} — omitiendo.`);
+      continue;
+    }
+    if (!creds) {
+      logger.warn(`[SatSyncJob] reintentarIncompletos: credenciales nulas para RFC ${rfc} — omitiendo.`);
+      continue;
+    }
+
+    // Incrementar contador de reintentos ANTES de la descarga (sin cambiar status —
+    // descargarPorSubtipo necesita ver 'incompleto' para hacer una nueva solicitud SAT).
+    await SatJobCheckpoint.updateOne(
+      { _id: cp._id },
+      { $inc: { reintentos: 1 }, $set: { updatedAt: new Date() } },
+    ).catch(() => {});
+
+    let iniciado = false;
+    try {
+      await registrarInicio(rfc, 1);
+      iniciado = true;
+
+      const fechaFin = cp.fechaFin ?? fecha; // si no tiene fechaFin asumir día único
+      logger.info(`[SatSyncJob] reintentarIncompletos: reintentando RFC ${rfc} ${tipoComprobante} ${fecha} (intento ${reintentos + 1}/3)`);
+
+      await procesarDescarga({
+        rfc,
+        fechaInicio:     `${fecha}T00:00:00`,
+        fechaFin:        `${fechaFin}T23:59:59`,
+        tipoSolicitud:   'CFDI',
+        tipoComprobante,
+        creds,
+        ejercicio,
+        periodo,
+        tipo:            'reintento_incompleto',
+      });
+    } catch (err) {
+      logger.error(`[SatSyncJob] reintentarIncompletos: error en RFC ${rfc} ${tipoComprobante} ${fecha}: ${err.message}`);
+    } finally {
+      if (iniciado) registrarFin(rfc);
+    }
+  }
+};
+
 const ejecutarDescargaMasiva = async () => {
   logger.info('[SatSyncJob] Iniciando descarga masiva nocturna...');
 
@@ -311,7 +395,7 @@ const ejecutarDescargaMasiva = async () => {
   logger.info(`[SatSyncJob] Procesando ${entidades.length} entidad(es)...`);
 
   // Tipos del diario: Ingresos, Egresos, Pagos y Nómina
-  const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
+  const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos' /*, 'Nomina' */];
 
   for (const entidad of entidades) {
     const rfc = entidad.rfc;
@@ -383,6 +467,12 @@ const ejecutarDescargaMasiva = async () => {
     }
     // Las credenciales expiran automáticamente a las 8 horas via TTL de MongoDB.
   }
+
+  // Reintentar checkpoints incompletos de días anteriores — se hace AL FINAL
+  // para no comprometer la cuota SAT del día actual.
+  await reintentarIncompletos().catch(err =>
+    logger.error(`[SatSyncJob] reintentarIncompletos falló: ${err.message}`)
+  );
 
   logger.info('[SatSyncJob] Descarga masiva nocturna completada.');
 };
@@ -542,7 +632,7 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
     for (let intento = 1; intento <= MAX_REINTENTOS_RECHAZADA; intento++) {
       checkpoint = await SatJobCheckpoint.findOneAndUpdate(
         { rfc: rfc.toUpperCase(), fecha, tipoComprobante: cpTipo },
-        { $set: { ejercicio, periodo, status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], error: null, updatedAt: new Date() } },
+        { $set: { ejercicio, periodo, fechaFin: fechaFin.slice(0, 10), status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0, error: null, updatedAt: new Date() } },
         { upsert: true, new: true },
       );
       idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, folioFiscalUUID });
@@ -632,8 +722,12 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
   // El SAT a veces retorna estado=3 (Terminada) con paquetes parciales y agrega
   // los restantes poco después. Para datasets grandes el SAT puede tardar 20-30 min
   // en generar todos los paquetes — MAX_REVERIF escala según NumeroCFDIs reportados.
-  const MAX_REVERIF = totalReportadoSAT > 5000 ? 30 : totalReportadoSAT > 1000 ? 15 : 5;
+  const MAX_REVERIF = totalReportadoSAT > 5000 ? 30 : totalReportadoSAT > 1000 ? 15 : 10;
+  // Número de re-verificaciones vacías consecutivas antes de rendirse.
+  // El SAT puede tardar varios minutos en generar paquetes adicionales — no romper al primer vacío.
+  const MAX_VACIOS_CONSECUTIVOS = totalReportadoSAT > 1000 ? 5 : 3;
   if (!esMetadata && totalReportadoSAT > 0 && rows.length < totalReportadoSAT * 0.95) {
+    let vaciosConsecutivos = 0;
     for (let rv = 1; rv <= MAX_REVERIF; rv++) {
       logger.warn(
         `[SatSyncJob] ⚠ DESCARGA INCOMPLETA (${tipoComprobante}): ` +
@@ -664,9 +758,12 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
       const nuevos = paquetesActualizados.filter(id => !yaProcessados2.has(id));
 
       if (nuevos.length === 0) {
-        logger.info(`[SatSyncJob] Re-verificación ${rv}: el SAT no reportó paquetes adicionales.`);
-        break;
+        vaciosConsecutivos++;
+        logger.info(`[SatSyncJob] Re-verificación ${rv}: el SAT no reportó paquetes adicionales (vacío ${vaciosConsecutivos}/${MAX_VACIOS_CONSECUTIVOS}).`);
+        if (vaciosConsecutivos >= MAX_VACIOS_CONSECUTIVOS) break;
+        continue;
       }
+      vaciosConsecutivos = 0;
 
       logger.info(`[SatSyncJob] Re-verificación ${rv}: ${nuevos.length} paquete(s) nuevo(s) encontrado(s) — descargando...`);
       for (const idPaquete of nuevos) {
@@ -699,12 +796,15 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
   }
 
   // Marcar checkpoint según resultado final
+  const esIncompleto = !esMetadata && totalReportadoSAT > 0 && rows.length < totalReportadoSAT * 0.95;
   if (paquetesFallidos > 0) {
     logger.warn(`[SatSyncJob] ${paquetesFallidos} de ${pendientes.length} paquetes fallaron — la descarga puede estar incompleta.`);
-    await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'descargando', updatedAt: new Date() } });
-  } else {
-    await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', updatedAt: new Date() } });
   }
+  const nuevoStatus = esIncompleto ? 'incompleto' : 'completado';
+  await SatJobCheckpoint.updateOne(
+    { _id: checkpoint._id },
+    { $set: { status: nuevoStatus, cfdisDescargados: rows.length, updatedAt: new Date() } },
+  );
 
   // Aviso final de completitud
   if (!esMetadata && totalReportadoSAT > 0 && rows.length < totalReportadoSAT * 0.95) {

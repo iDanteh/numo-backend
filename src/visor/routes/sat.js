@@ -9,7 +9,7 @@ const {
   registerCredentials, getCredentialStatus, patchKey,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, testKey, exportXml,
-  downloadByUUID,
+  downloadByUUID, resetCheckpoint, getCheckpointsSalud,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -77,6 +77,12 @@ router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
 router.get('/historial',                     authenticate, getHistory);
 router.get('/historial/:rfc',                authenticate, getHistory);
 router.get('/ultimo-erp',                    authenticate, getUltimoErp);
+
+// ── Salud de checkpoints (errores, incompletos, cuota del día) ────────────────
+router.get('/checkpoints/salud', authenticate, permit('visor:sat'), getCheckpointsSalud);
+
+// ── Reset de checkpoint atorado ───────────────────────────────────────────────
+router.delete('/checkpoint/:rfc', authenticate, permit('visor:sat'), resetCheckpoint);
 
 // ── Exportar XMLs SAT como ZIP ────────────────────────────────────────────────
 router.get('/export-xml', authenticate, permit('visor:sat'), exportXml);

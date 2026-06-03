@@ -89,6 +89,8 @@ function findRuleInList(cfdi, rules) {
   // Contiene el tipoDeComprobante del primer CFDI relacionado (pre-fetched de MongoDB).
   const cfdiRelacionadoTipo = cfdi._relacionadoTipo ?? null;
 
+  const cfdiDescripcion = (cfdi.conceptos?.[0]?.descripcion ?? '').toLowerCase();
+
   const matching = rules.filter(r =>
     (!r.tipoComprobante    || r.tipoComprobante  === cfdi.tipoDeComprobante) &&
     (!r.rfcEmisor          || r.rfcEmisor        === cfdi.emisor?.rfc) &&
@@ -98,6 +100,7 @@ function findRuleInList(cfdi, rules) {
     (!r.claveProdServ      || r.claveProdServ     === cfdiClaveProdServ) &&
     (!r.tipoRelacion       || r.tipoRelacion      === cfdiTipoRelacion) &&
     (!r.relacionadoTipo    || r.relacionadoTipo   === cfdiRelacionadoTipo) &&
+    (!r.conceptoContiene   || cfdiDescripcion.includes(r.conceptoContiene.toLowerCase())) &&
     (r.tasaIva        == null || r.tasaIva        === cfdiTasaIva) &&
     (r.tieneDescuento == null || r.tieneDescuento === cfdiTieneDescuento),
   );
@@ -106,7 +109,8 @@ function findRuleInList(cfdi, rules) {
   const spec = r => [
     r.tipoComprobante, r.rfcEmisor, r.rfcReceptor, r.metodoPago, r.formaPago,
     r.claveProdServ, r.tipoRelacion, r.relacionadoTipo, r.tasaIva,
-    r.tieneDescuento != null ? String(r.tieneDescuento) : null,
+    r.tieneDescuento  != null ? String(r.tieneDescuento)  : null,
+    r.conceptoContiene != null ? r.conceptoContiene        : null,
   ].filter(v => v != null).length;
 
   return matching.sort((a, b) => {
@@ -134,12 +138,9 @@ function _detectTasaIva(cfdi) {
       const montoTotal = Number(totales.montoTotalPagos || 0);
       if (montoTotal > 0) return '0';
     } else {
-      // CP 1.0 (CFDI 3.3) o Metadata (sin complementoPago): sin desglose de tasa IVA.
-      const pagos = cfdi.complementoPago?.pagos ?? [];
-      const montoTotal = pagos.length > 0
-        ? pagos.reduce((s, p) => s + Number(p.monto || 0), 0)
-        : Number(cfdi.total || 0);    // Metadata: usar cfdi.total
-      if (montoTotal > 0) return '0'; // no se puede determinar tasa → tratar como 0%
+      // CP 1.0 (CFDI 3.3) o Metadata: sin desglose de IVA por tasa.
+      // No se puede determinar si el pago es para facturas 16% o 0% → null
+      // para que el matching use la regla genérica de tipo P (tasaIva=null).
     }
     return null;
   }
@@ -182,8 +183,14 @@ function _detectTasaIva(cfdi) {
         // Tolerancia de $0.50 absorbe redondeos por concepto sin falsos positivos.
         const base = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
         if (base > 0 && Math.abs(totalImptos - base * 0.16) > 0.50) {
+          // Antes de marcar mixto: descartar artefacto SAT metadata donde
+          // totalImpuestosRetenidos ≈ ivaTras y retenciones:[] — en ese caso la
+          // porción aparente 0% es un descuento implícito, no producto a tasa 0%.
+          const ivaRetChk = Number(cfdi.impuestos?.totalImpuestosRetenidos || 0);
+          const esArtRet  = (cfdi.impuestos?.retenciones || []).length === 0 &&
+                            ivaRetChk > 0 && Math.abs(ivaRetChk - totalImptos) < 1.0;
           tiene16 = true;
-          tiene0  = true;   // mixto: IVA real ≠ base×16% → hay porción 0%/exenta
+          if (!esArtRet) tiene0 = true; // mixto real; artefacto → solo 16%
         } else {
           tiene16 = true;   // puro 16% (diferencia ≤ $0.50 → solo redondeo)
         }
@@ -199,7 +206,14 @@ function _detectTasaIva(cfdi) {
 /** Detecta si el CFDI tiene descuento > 0 (header o en algún concepto). */
 function _detectTieneDescuento(cfdi) {
   if (Number(cfdi.descuento || 0) > 0) return true;
-  return (cfdi.conceptos || []).some(c => Number(c.descuento || c.Descuento || 0) > 0);
+  if ((cfdi.conceptos || []).some(c => Number(c.descuento || c.Descuento || 0) > 0)) return true;
+  // Metadata SAT: ivaRet ≈ ivaTras y retenciones:[] → hay descuento implícito en conceptos.
+  const iva0    = Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
+  const ivaRet0 = Number(cfdi.impuestos?.totalImpuestosRetenidos  || 0);
+  return (cfdi.conceptos || []).length === 0 &&
+    (cfdi.impuestos?.retenciones || []).length === 0 &&
+    ivaRet0 > 0 && Math.abs(ivaRet0 - iva0) < 1.0 &&
+    (Number(cfdi.subTotal || 0) + iva0 - Number(cfdi.total || 0)) > 0.5;
 }
 
 /** Desglosa importes por tasa (para reglas mixtas y con descuento). */
@@ -226,11 +240,23 @@ function _calcCfdiMontos(cfdi) {
     const base = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
     if (base > 0) {
       subTotal16 = parseFloat((ivaHeader0 / 0.16).toFixed(6));
-      subTotal0  = parseFloat(Math.max(0, base - subTotal16).toFixed(6));
-      const totalDesc = Number(cfdi.descuento || 0);
-      if (totalDesc > 0 && (subTotal16 + subTotal0) > 0) {
-        desc16 = parseFloat((totalDesc * subTotal16 / (subTotal16 + subTotal0)).toFixed(6));
-        desc0  = parseFloat(Math.max(0, totalDesc - desc16).toFixed(6));
+      const rawSub0 = parseFloat(Math.max(0, base - subTotal16).toFixed(6));
+      // Artefacto metadata: retenciones:[] con ivaRet ≈ ivaTras → rawSub0 es descuento implícito
+      const ivaRetC = Number(cfdi.impuestos?.totalImpuestosRetenidos || 0);
+      const esArtC  = (cfdi.conceptos || []).length === 0 &&
+                      (cfdi.impuestos?.retenciones || []).length === 0 &&
+                      ivaRetC > 0 && Math.abs(ivaRetC - ivaHeader0) < 1.0 &&
+                      rawSub0 > 0.5;
+      if (esArtC) {
+        desc16    = rawSub0;  // descuento implícito inferido de los importes del CFDI
+        subTotal0 = 0;
+      } else {
+        subTotal0 = rawSub0;
+        const totalDesc = Number(cfdi.descuento || 0);
+        if (totalDesc > 0 && (subTotal16 + subTotal0) > 0) {
+          desc16 = parseFloat((totalDesc * subTotal16 / (subTotal16 + subTotal0)).toFixed(6));
+          desc0  = parseFloat(Math.max(0, totalDesc - desc16).toFixed(6));
+        }
       }
     }
   }
@@ -285,6 +311,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const ivaRet = esPago
     ? Number(cpTotales?.totalRetencionesImpuestoIVA || 0)
     : Number(cfdi.impuestos?.totalImpuestosRetenidos || 0);
+
+  // Artefacto metadata SAT: ivaRet ≈ ivaTras pero retenciones:[] → no hay retención real.
+  // El gap (subTotal + iva − total) es un descuento implícito de conceptos que NUMO
+  // infiere sin necesidad del XML. Permite generar el asiento bruto igual que el ERP.
+  const esMetadataConDescuento = !esPago &&
+    (cfdi.conceptos || []).length === 0 &&
+    (cfdi.impuestos?.retenciones || []).length === 0 &&
+    ivaRet > 0 && Math.abs(ivaRet - iva) < 1.0 &&
+    (subtotal + iva - total) > 0.5;
 
   // ISR retenido: tipo P lo reporta en complementoPago.totales; tipo I/E en retenciones del header.
   // cfdi.impuestos está vacío para tipo P por especificación SAT CFDI 4.0.
@@ -561,7 +596,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // El movimiento de IVA usa ivaR = total−subtotal (ambos SAT 2-decimales), por lo que
     // el complemento exacto es subtotal. Garantiza DEBE = HABER sin depender de rounding JS/DB.
     // Para CFDIs con retenciones se usa total−iva (rama else de ivaR arriba) — caso separado.
-    montoAbono = (ivaRet === 0 && isrRet === 0)
+    montoAbono = (ivaRet === 0 && isrRet === 0) || esMetadataConDescuento
       ? subtotal
       : parseFloat((total - iva).toFixed(2));
   } else {
@@ -752,4 +787,4 @@ function _validate(data) {
   if (!data.cuentaAbono?.trim()) throw new BadRequestError('La cuenta de abono es requerida');
 }
 
-module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento };
+module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva };

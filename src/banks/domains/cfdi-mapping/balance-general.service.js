@@ -26,6 +26,7 @@ async function generarBalanceGeneral({ rfc, ejercicio, periodo }) {
   // COSTO se trata igual que GASTO (naturaleza deudora, afecta Estado de Resultados)
   const grupos = { ACTIVO: [], PASIVO: [], CAPITAL: [], INGRESO: [], GASTO: [], COSTO: [] };
   for (const c of balanza.cuentas) {
+    if (c.esAgrupadora) continue; // solo cuentas hoja — las agrupadoras ya suman sus hijos
     const tipo = (c.tipo || '').toUpperCase();
     if (grupos[tipo]) grupos[tipo].push(c);
     // cuentas con tipo desconocido se omiten (no rompen el cálculo)

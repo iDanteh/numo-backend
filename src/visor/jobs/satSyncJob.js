@@ -302,25 +302,74 @@ const reintentarIncompletos = async () => {
       { $inc: { reintentos: 1 }, $set: { updatedAt: new Date() } },
     ).catch(() => {});
 
+    // Determinar si el checkpoint es una mitad (_M1/_M2) o el día completo
+    const yaTieneMitad   = /_M[12]$/.test(tipoComprobante);
+    const tipoBase       = tipoComprobante.replace(/_M[12]$/, '');
+    const cpSufijoActual = yaTieneMitad ? tipoComprobante.slice(tipoBase.length) : '';
+    const horaIni        = tipoComprobante.endsWith('_M2') ? '12:00:00' : '00:00:00';
+    const horaFin        = tipoComprobante.endsWith('_M1') ? '11:59:59' : '23:59:59';
+    const fechaFin       = cp.fechaFin ?? fecha;
+
+    logger.info(`[SatSyncJob] reintentarIncompletos: reintentando RFC ${rfc} ${tipoComprobante} ${fecha} (intento ${reintentos + 1}/3)`);
+
     let iniciado = false;
     try {
       await registrarInicio(rfc, 1);
       iniciado = true;
 
-      const fechaFin = cp.fechaFin ?? fecha; // si no tiene fechaFin asumir día único
-      logger.info(`[SatSyncJob] reintentarIncompletos: reintentando RFC ${rfc} ${tipoComprobante} ${fecha} (intento ${reintentos + 1}/3)`);
+      if (reintentos >= 1 && !yaTieneMitad) {
+        // Segunda+ retry de un checkpoint de día completo: dividir en 2 mitades
+        logger.info(
+          `[SatSyncJob] reintentarIncompletos: RFC ${rfc} ${tipoBase} ${fecha} — ` +
+          `dividiendo día en 2 mitades (00:00-11:59 y 12:00-23:59)...`
+        );
 
-      await procesarDescarga({
-        rfc,
-        fechaInicio:     `${fecha}T00:00:00`,
-        fechaFin:        `${fechaFin}T23:59:59`,
-        tipoSolicitud:   'CFDI',
-        tipoComprobante,
-        creds,
-        ejercicio,
-        periodo,
-        tipo:            'reintento_incompleto',
-      });
+        // Mitad 1 (usa el slot ya registrado)
+        await procesarDescarga({
+          rfc, tipoSolicitud: 'CFDI', tipoComprobante: tipoBase, creds, ejercicio, periodo,
+          fechaInicio: `${fecha}T00:00:00`,
+          fechaFin:    `${fecha}T11:59:59`,
+          tipo: 'reintento_incompleto', cpSufijo: '_M1',
+        });
+        registrarFin(rfc);
+        iniciado = false;
+
+        // Mitad 2 (verificar cuota antes de iniciar)
+        const limitM2 = await puedeIniciar(rfc, 1);
+        if (limitM2.puede) {
+          await registrarInicio(rfc, 1);
+          iniciado = true;
+          await procesarDescarga({
+            rfc, tipoSolicitud: 'CFDI', tipoComprobante: tipoBase, creds, ejercicio, periodo,
+            fechaInicio: `${fecha}T12:00:00`,
+            fechaFin:    `${fecha}T23:59:59`,
+            tipo: 'reintento_incompleto', cpSufijo: '_M2',
+          });
+        } else {
+          logger.warn(`[SatSyncJob] reintentarIncompletos M2: RFC ${rfc} sin cuota para segunda mitad — ${limitM2.razon}`);
+        }
+
+        // El checkpoint original ya fue reemplazado por M1/M2 — marcarlo completado
+        await SatJobCheckpoint.updateOne(
+          { _id: cp._id },
+          { $set: { status: 'completado', updatedAt: new Date() } }
+        ).catch(() => {});
+
+      } else {
+        // Primer reintento (día completo) o reintento de una mitad ya existente
+        await procesarDescarga({
+          rfc,
+          fechaInicio:     `${fecha}T${horaIni}`,
+          fechaFin:        `${fechaFin}T${horaFin}`,
+          tipoSolicitud:   'CFDI',
+          tipoComprobante: tipoBase,
+          cpSufijo:        cpSufijoActual,
+          creds,
+          ejercicio,
+          periodo,
+          tipo:            'reintento_incompleto',
+        });
+      }
     } catch (err) {
       logger.error(`[SatSyncJob] reintentarIncompletos: error en RFC ${rfc} ${tipoComprobante} ${fecha}: ${err.message}`);
     } finally {
@@ -486,25 +535,27 @@ const EFECTO_MAP = { I: 'I', Ingreso: 'I', E: 'E', Egreso: 'E', T: 'T', Traslado
  */
 const normalizarMetadato = (row) => {
   const tipo = EFECTO_MAP[row.efecto] || row.efecto || '';
+  const subTotalVal = parseFloat(row.subTotal || '0') || 0;
+  const monedaVal   = row.moneda || 'MXN';
   return {
     uuid:              (row.uuid || '').toUpperCase().trim(),
     rfcEmisor:         (row.rfcEmisor || '').toUpperCase().trim(),
     rfcReceptor:       (row.rfcReceptor || '').toUpperCase().trim(),
     total:             parseFloat(row.total || '0') || 0,
-    subtotal:          0, // metadata no incluye subtotal — campo en minúsculas para detectarDiferencias
+    subtotal:          subTotalVal, // campo en minúsculas para detectarDiferencias
     fecha:             new Date(row.fecha || ''),
     tipoDeComprobante: tipo,
     tipoComprobante:   tipo, // alias en minúsculas requerido por detectarDiferencias / normalizarCFDI
-    moneda:            'MXN',
+    moneda:            monedaVal,
     satStatus:         row.estado || 'Vigente',
     estatus:           row.estado || 'Vigente',
     // Campos usados al guardar en MongoDB
     emisor:            { rfc: (row.rfcEmisor || '').toUpperCase().trim(), nombre: row.nombreEmisor || '' },
     receptor:          { rfc: (row.rfcReceptor || '').toUpperCase().trim(), nombre: row.nombreReceptor || '' },
-    subTotal:          0,
+    subTotal:          subTotalVal,
     serie:             '',
     folio:             '',
-    version:           '4.0',
+    version:           row.version || '4.0',
     xmlContent:        null,
     xmlHash:           null,
     conceptos:         [],
@@ -520,10 +571,10 @@ const normalizarMetadato = (row) => {
  * @param {string} [tipoSolicitud='CFDI']  — 'CFDI' para XMLs completos, 'Metadata' para metadatos TXT.
  * Retorna { rows: [], paquetes: number, totalReportado: number, esMetadata: boolean }
  */
-const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, periodo, tipoComprobante, creds, tipoSolicitud = 'CFDI', folioFiscalUUID }) => {
+const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, periodo, tipoComprobante, creds, tipoSolicitud = 'CFDI', folioFiscalUUID, cpSufijo = '' }) => {
   const esMetadata  = tipoSolicitud === 'Metadata';
-  // Incluir modo en la clave del checkpoint para no mezclar XML con metadata
-  const cpTipo = esMetadata ? `${tipoComprobante}_Metadata` : tipoComprobante;
+  // Incluir modo y sufijo en la clave del checkpoint para no mezclar XML con metadata ni mitades
+  const cpTipo = (esMetadata ? `${tipoComprobante}_Metadata` : tipoComprobante) + cpSufijo;
   const fecha  = fechaInicio.slice(0, 10);
   let checkpoint = await SatJobCheckpoint.findOne({ rfc: rfc.toUpperCase(), fecha, tipoComprobante: cpTipo });
 
@@ -832,7 +883,7 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
  * @param {Function} [onPaso]   — Callback opcional (paso: number) para reportar progreso al frontend.
  *                                Pasos: 1=Autenticando, 3=Verificando, 4=Descargando, 5=Procesando.
  */
-const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica', tiposEmitidosSplit, folioFiscalUUID }) => {
+const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, ayer, ejercicio, periodo, onPaso, tipo = 'automatica', tiposEmitidosSplit, folioFiscalUUID, cpSufijo = '' }) => {
   logger.info(`[SatSyncJob] RFC ${rfc} — solicitando ${tipoComprobante} ${fechaInicio.slice(0, 10)}`);
 
   const fecha = fechaInicio.slice(0, 10); // YYYY-MM-DD
@@ -914,7 +965,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
         const { rows: r, paquetes, totalReportado, esMetadata: modoMeta } = await descargarPorSubtipo({
           rfc, fechaInicio, fechaFin, ejercicio, periodo,
           tipoComprobante: tipoActual, creds, tipoSolicitud: modoFinal,
-          folioFiscalUUID,
+          folioFiscalUUID, cpSufijo,
         });
 
         totalPaquetes     += paquetes;
@@ -973,16 +1024,21 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                       $set: {
                         uuid:                 row.uuid.toUpperCase(),
                         source:               'SAT',
+                        origenDescarga:       'metadata',
                         satStatus:            row.estado === 'Cancelado' ? 'Cancelado' : 'Vigente',
                         isActive:             true,
-                        version:              '4.0',
+                        version:              row.version || '4.0',
                         fecha:                new Date(row.fecha || ''),
-                        total:                parseFloat(row.total || '0') || 0,
-                        subTotal:             0,
-                        moneda:               'MXN',
+                        total:                parseFloat(row.total    || '0') || 0,
+                        subTotal:             parseFloat(row.subTotal || '0') || 0,
+                        descuento:            parseFloat(row.descuento || '0') || 0,
+                        moneda:               row.moneda    || 'MXN',
+                        tipoCambio:           parseFloat(row.tipoCambio || '1') || 1,
+                        metodoPago:           row.metodoPago || undefined,
+                        formaPago:            row.formaPago  || undefined,
                         tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
                         emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
-                        receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '' },
+                        receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '', usoCFDI: row.usoCFDI || '' },
                         lastComparisonStatus: 'not_in_erp',
                         lastComparisonAt:     new Date(),
                       },
@@ -1004,6 +1060,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                       $set: {
                         uuid:                 c.uuid.toUpperCase(),
                         source:               'SAT',
+                        origenDescarga:       'xml',
                         satStatus:            'Vigente',
                         isActive:             true,
                         version:              c.version,
@@ -1053,6 +1110,123 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
           allSoloERP.push(...soloEnERP);
           allConDiff.push(...conDiferencia);
           allSinUuid.push(...(sinUuid ?? []));
+        }
+
+        // ── 6. Fallback automático a Metadata si XML quedó incompleto ─────────
+        // El SAT a veces genera solo una fracción de los paquetes XML pero sí
+        // entrega el 100% en modo Metadata (mucho más ligero).  Usamos el fallback
+        // para recuperar al menos UUID + RFC + total + fecha de los CFDIs faltantes.
+        const xmlIncompleto = !modoMeta && totalReportado > 0 && r.length < totalReportado * 0.95;
+        if (xmlIncompleto) {
+          const limitMeta = await puedeIniciar(rfc, 1);
+          if (!limitMeta.puede) {
+            logger.warn(`[SatSyncJob] Fallback Metadata (${tipoActual}): sin cuota SAT disponible (${limitMeta.razon}) — omitido.`);
+          } else {
+            let metaIniciado = false;
+            try {
+              logger.info(
+                `[SatSyncJob] XML incompleto (${r.length}/${totalReportado}) — ` +
+                `esperando 2 min antes de fallback a Metadata para ${tipoActual}...`
+              );
+              await new Promise(res => setTimeout(res, 2 * 60_000));
+
+              await registrarInicio(rfc, 1);
+              metaIniciado = true;
+
+              const { rows: rMeta } = await descargarPorSubtipo({
+                rfc, fechaInicio, fechaFin, ejercicio, periodo,
+                tipoComprobante: tipoActual, creds,
+                tipoSolicitud: 'Metadata',
+              });
+
+              if (rMeta.length > 0) {
+                // Solo guardar los UUIDs que NO llegaron como XML completo
+                const yaUuids = new Set(r.map(c => (c.uuid || '').toUpperCase()));
+                const soloMetaRows = rMeta.filter(m => !yaUuids.has((m.uuid || '').toUpperCase()));
+
+                if (soloMetaRows.length > 0) {
+                  // Obtener UUIDs del ERP para clasificar coincidencias
+                  const tipoFiltroMeta = TIPO_LETRA[tipoActual]
+                    ? { tipoDeComprobante: TIPO_LETRA[tipoActual] }
+                    : { tipoDeComprobante: { $ne: 'T' } };
+
+                  const erpMetaDocs = await CFDI.find({
+                    source: 'ERP', isActive: true,
+                    ...tipoFiltroMeta,
+                    [campoRfc]: rfc.toUpperCase(),
+                    fecha: { $gte: inicioDelDia, $lte: finDelDia },
+                  }, 'uuid').lean();
+                  const erpUuids = new Set(erpMetaDocs.map(c => c.uuid.toUpperCase()));
+
+                  // Guardar en MongoDB
+                  await CFDI.bulkWrite(soloMetaRows.map(row => ({
+                    updateOne: {
+                      filter: { uuid: row.uuid.toUpperCase(), source: 'SAT' },
+                      update: {
+                        $set: {
+                          uuid:                 row.uuid.toUpperCase(),
+                          source:               'SAT',
+                          origenDescarga:       'metadata',
+                          satStatus:            row.estado === 'Cancelado' ? 'Cancelado' : 'Vigente',
+                          isActive:             true,
+                          version:              row.version || '4.0',
+                          fecha:                new Date(row.fecha || ''),
+                          total:                parseFloat(row.total    || '0') || 0,
+                          subTotal:             parseFloat(row.subTotal || '0') || 0,
+                          descuento:            parseFloat(row.descuento || '0') || 0,
+                          moneda:               row.moneda    || 'MXN',
+                          tipoCambio:           parseFloat(row.tipoCambio || '1') || 1,
+                          metodoPago:           row.metodoPago || undefined,
+                          formaPago:            row.formaPago  || undefined,
+                          tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
+                          emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
+                          receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '', usoCFDI: row.usoCFDI || '' },
+                          lastComparisonStatus: erpUuids.has((row.uuid || '').toUpperCase()) ? 'match' : 'not_in_erp',
+                          lastComparisonAt:     new Date(),
+                        },
+                        $setOnInsert: { ejercicio, periodo },
+                      },
+                      upsert: true,
+                    },
+                  })));
+
+                  // Acumular en resultados de comparación
+                  const metaCoinc   = soloMetaRows.filter(m =>  erpUuids.has((m.uuid || '').toUpperCase())).map(normalizarMetadato);
+                  const metaSoloSAT = soloMetaRows.filter(m => !erpUuids.has((m.uuid || '').toUpperCase())).map(normalizarMetadato);
+                  // Quitar de soloERP los que ahora encontramos en metadata
+                  const metaCoincUuids = new Set(metaCoinc.map(c => c.uuid.toUpperCase()));
+                  for (let i = allSoloERP.length - 1; i >= 0; i--) {
+                    if (metaCoincUuids.has((allSoloERP[i].uuid || '').toUpperCase())) allSoloERP.splice(i, 1);
+                  }
+                  allCoinc.push(...metaCoinc);
+                  allSoloSAT.push(...metaSoloSAT);
+
+                  logger.info(
+                    `[SatSyncJob] ✓ Fallback Metadata (${tipoActual}): ${soloMetaRows.length} CFDIs recuperados ` +
+                    `(coinciden=${metaCoinc.length}, soloSAT=${metaSoloSAT.length}). ` +
+                    `Total recuperado: ${r.length + soloMetaRows.length}/${totalReportado}.`
+                  );
+                  incompleta = (r.length + soloMetaRows.length) < totalReportado * 0.95;
+                  if (incompleta) {
+                    logger.warn(
+                      `[SatSyncJob] ⚠ Metadata también incompleto (${tipoActual}): ` +
+                      `${r.length + soloMetaRows.length}/${totalReportado} CFDIs recuperados. ` +
+                      `El checkpoint quedará como 'incompleto' y se reintentará mañana dividiendo el día en 2 mitades.`
+                    );
+                  }
+                } else {
+                  logger.info(`[SatSyncJob] Fallback Metadata (${tipoActual}): todos los UUIDs ya estaban descargados como XML.`);
+                  incompleta = false;
+                }
+              } else {
+                logger.warn(`[SatSyncJob] Fallback Metadata (${tipoActual}): el SAT no devolvió registros.`);
+              }
+            } catch (metaErr) {
+              logger.warn(`[SatSyncJob] Fallback Metadata (${tipoActual}) falló (no crítico): ${metaErr.message}`);
+            } finally {
+              if (metaIniciado) registrarFin(rfc);
+            }
+          }
         }
 
       } catch (tipoErr) {

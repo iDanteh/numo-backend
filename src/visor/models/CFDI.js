@@ -186,6 +186,9 @@ const cfdiSchema = new mongoose.Schema({
     version: String,
   },
 
+  // Modo de descarga: 'xml' = CFDI completo, 'metadata' = solo metadatos del SAT (fallback)
+  origenDescarga: { type: String, enum: ['xml', 'metadata', null], default: null },
+
   // Resultado de la última comparación ejecutada
   lastComparisonStatus: {
     type: String,

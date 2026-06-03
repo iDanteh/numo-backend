@@ -613,22 +613,29 @@ const parsearMetadataTxt = (contenido) => {
     const n = nombre.toLowerCase()
       .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quitar acentos
       .trim();
-    if (n.includes('folio fiscal'))                              return 'uuid';
-    if (n === 'rfc emisor' || n.startsWith('rfc emisor'))        return 'rfcEmisor';
-    if (n.includes('emisor') && n.includes('razon'))             return 'nombreEmisor';
-    if (n.includes('emisor') && n.includes('nombre'))            return 'nombreEmisor';
-    if (n === 'rfc receptor' || n.startsWith('rfc receptor'))    return 'rfcReceptor';
-    if (n.includes('receptor') && n.includes('razon'))           return 'nombreReceptor';
-    if (n.includes('receptor') && n.includes('nombre'))          return 'nombreReceptor';
-    if (n.includes('fecha') && n.includes('emision'))            return 'fecha';
-    if (n.includes('fecha') && n.includes('certific'))           return 'fechaCert';
-    if (n.includes('pac'))                                       return 'rfcPac';
+    if (n.includes('folio fiscal'))                                                                return 'uuid';
+    if (n === 'rfc emisor' || n.startsWith('rfc emisor') || n === 'rfcemisor' || (n.includes('rfc') && n.includes('emisor')))        return 'rfcEmisor';
+    if (n.includes('emisor') && (n.includes('razon') || n.includes('nombre')))                 return 'nombreEmisor';
+    if (n === 'rfc receptor' || n.startsWith('rfc receptor') || n === 'rfcreceptor' || (n.includes('rfc') && n.includes('receptor'))) return 'rfcReceptor';
+    if (n.includes('receptor') && (n.includes('razon') || n.includes('nombre')))              return 'nombreReceptor';
+    if (n.includes('fecha') && n.includes('cancel'))                                           return 'fechaCancelacion';
+    if (n.includes('fecha') && n.includes('certific'))                                         return 'fechaCert';
+    if (n.includes('fecha') && n.includes('emision'))                                          return 'fecha';
+    if (n === 'fecha')                                                                          return 'fecha';
+    if (n.includes('subtotal') || n === 'sub total')                                           return 'subTotal';
+    if (n === 'descuento')                                                                      return 'descuento';
     if (n === 'total' || n === 'monto' || n === 'monto total' ||
-        n === 'total del cfdi' || n.startsWith('monto') || n.startsWith('total'))
-                                                                 return 'total';
-    if (n.includes('efecto'))                                    return 'efecto';
-    if (n.includes('estado'))                                    return 'estado';
-    if (n.includes('fecha') && n.includes('cancel'))             return 'fechaCancelacion';
+        n === 'total del cfdi' || n.startsWith('monto') || n.startsWith('total'))              return 'total';
+    if (n === 'moneda')                                                                        return 'moneda';
+    if (n.includes('tipo') && n.includes('cambio'))                                            return 'tipoCambio';
+    if (n.includes('metodo') && n.includes('pago'))                                            return 'metodoPago';
+    if (n.includes('forma') && n.includes('pago'))                                             return 'formaPago';
+    if (n.includes('uso') && n.includes('cfdi'))                                               return 'usoCFDI';
+    if (n === 'version' || n === 'version del cfdi' || n.includes('version cfdi'))             return 'version';
+    if (n === 'concepto' || n.includes('descripcion') && !n.includes('emisor') && !n.includes('receptor')) return 'concepto';
+    if (n.includes('efecto') || (n.includes('tipo') && n.includes('comprobante')))             return 'efecto';
+    if (n.includes('pac'))                                                                     return 'rfcPac';
+    if (n.includes('estado'))                                                                  return 'estado';
     return n.replace(/\s+/g, '_');
   };
 
@@ -642,7 +649,10 @@ const parsearMetadataTxt = (contenido) => {
     const campos = lineas[i].split(sep).map(limpiar);
     const obj    = {};
     claves.forEach((clave, idx) => { obj[clave] = campos[idx] ?? ''; });
-    if (obj.total !== undefined) obj.total = parseMonto(obj.total);
+    if (obj.total    !== undefined) obj.total    = parseMonto(obj.total);
+    if (obj.subTotal !== undefined) obj.subTotal = parseMonto(obj.subTotal);
+    if (obj.descuento !== undefined) obj.descuento = parseMonto(obj.descuento);
+    if (obj.tipoCambio !== undefined) obj.tipoCambio = parseMonto(obj.tipoCambio) || 1;
     if (obj.uuid) registros.push(obj);
   }
   return registros;

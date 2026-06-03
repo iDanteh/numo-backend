@@ -107,6 +107,10 @@ async function seed() {
   // Siempre sembrar roles y permisos — el sistema no funciona sin esto.
   await seedRbac();
 
+  // Siempre sembrar entidades fiscales conocidas — idempotente.
+  const seedEntities = require('./seed-entities');
+  await seedEntities();
+
   // La creación del usuario admin es opcional: solo si se proporcionó el email.
   if (!adminEmail) {
     console.log('[seed] SEED_ADMIN_EMAIL no definido — omitiendo creación de admin.');

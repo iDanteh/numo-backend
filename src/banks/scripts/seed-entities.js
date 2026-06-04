@@ -17,10 +17,20 @@ require('dotenv').config();
 
 const { Entity } = require('../../shared/models/postgres');
 
+const INTERCO_SYNC = {
+  autoSync:      false,
+  syncFrequency: 'daily',
+  lastSync:      null,
+  nextSync:      null,
+  syncEmitidos:  false,
+  syncRecibidos: false,
+};
+
 const ENTITIES = [
+  // ── Empresa principal ────────────────────────────────────────────────────────
   {
     rfc:             'CCO011113663',
-    nombre:          'CAR COMERCIALIZADORA',
+    nombre:          'CAR COMERCIALIZADORA S.A. DE C.V.',
     tipo:            'moral',
     isOwn:           false,
     isActive:        true,
@@ -35,6 +45,85 @@ const ENTITIES = [
       syncEmitidos:  true,
       syncRecibidos: true,
     },
+  },
+
+  // ── Intercompañías ───────────────────────────────────────────────────────────
+  {
+    rfc:             'GAAA5403026G2',
+    nombre:          'ALBERTO NEFTALI GARCIA ARANGO',
+    tipo:            'fisica',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
+  },
+  {
+    rfc:             'GAFA850630542',
+    nombre:          'ALBERTO NEFTALI GARCIA FERNANDEZ DEL CAMPO',
+    tipo:            'fisica',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
+  },
+  {
+    rfc:             'AVA1002023N7',
+    nombre:          'ARRENDADORA DE VEHICULOS SA DE CV',
+    tipo:            'moral',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
+  },
+  {
+    rfc:             'GIN121109RX4',
+    nombre:          'GANE INMOBILIARIA SA DE CV',
+    tipo:            'moral',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
+  },
+  {
+    rfc:             'KTE180215FE1',
+    nombre:          'KORE TECNOLOGIA SA DE CV',
+    tipo:            'moral',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
+  },
+  {
+    rfc:             'FEUL5811155D9',
+    nombre:          'LUZ MARIA FERNANDEZ DEL CAMPO URZUA',
+    tipo:            'fisica',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
+  },
+  {
+    rfc:             'RSI051018GL6',
+    nombre:          'RED DE SERVICIOS A INMUEBLES SA',
+    tipo:            'moral',
+    isOwn:           false,
+    isActive:        true,
+    esIntercompania: true,
+    regimenFiscal:   null,
+    domicilioFiscal: {},
+    syncConfig:      INTERCO_SYNC,
   },
 ];
 

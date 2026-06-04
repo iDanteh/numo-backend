@@ -84,6 +84,8 @@ const bankMovementSchema = new mongoose.Schema({
       nombre:  { type: String, default: null },
       fechaId: { type: Date,   default: null },
       erpId:   { type: String, default: null },  // CxC que este usuario asoció
+      source:  { type: String, default: null },  // 'conciliacion-import' para bulk imports por Excel
+      runId:   { type: String, default: null },  // ID único de la operación bulk (permite revert selectivo)
     }],
     default: [],
   },

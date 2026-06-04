@@ -4,6 +4,8 @@ const express = require('express');
 const multer  = require('multer');
 const { authenticate, permit }     = require('../../shared/middleware/auth.real');
 const { asyncHandler }             = require('../../shared/middleware/error-handler');
+const rbacStore                    = require('../../../shared/services/rbac-store');
+const { PERMISSIONS }              = require('../../../shared/config/rbac');
 const service                      = require('./bank.service');
 const {
   parseAuxiliaryFile,
@@ -18,15 +20,16 @@ const { emitToUser } = require('../../shared/socket');
 const router = express.Router();
 
 /**
- * Aplica las restricciones de visibilidad para el rol cobranza.
- * Solo depósitos no identificados (o los que ese mismo usuario identificó).
+ * Aplica restricciones de visibilidad para usuarios sin acceso completo a movimientos.
+ * Limita a depósitos propios no identificados (o los que ese mismo usuario identificó).
+ * Se activa para cualquier rol que tenga banks:export pero no banks:config.
  *
  * @param {object}  query     - query params originales
  * @param {string}  userId    - auth0 sub del usuario
  * @param {boolean} forExport - en exportación no se devuelve vacío; 'otros' → 'no_identificado'
  * @returns {{ query: object, empty: boolean }}
  */
-function applyCobranzaRestrictions(query, userId, forExport = false) {
+function applyMovementRestrictions(query, userId, forExport = false) {
   const q = { ...query };
   if (q.status === 'otros') {
     if (!forExport) return { query: q, empty: true };
@@ -63,10 +66,11 @@ router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
 }));
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
-router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
+router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), asyncHandler(async (req, res) => {
   let query = { ...req.query };
-  if (req.user.role === 'cobranza') {
-    ({ query } = applyCobranzaRestrictions(query, req.user._id, true));
+  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
+  if (!hasFullAccess) {
+    ({ query } = applyMovementRestrictions(query, req.user._id, true));
   }
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -78,11 +82,12 @@ router.get('/movements/export', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements
 router.get('/movements', authenticate, asyncHandler(async (req, res) => {
-  // Cuando viene movId (navegación desde OCR) cobranza puede ver ese movimiento
+  // Cuando viene movId (navegación desde OCR) el usuario puede ver ese movimiento
   // sin restricciones de status/tipo para que la navegación funcione correctamente.
   let query = { ...req.query };
-  if (req.user.role === 'cobranza' && !query.movId) {
-    const { query: restricted, empty } = applyCobranzaRestrictions(query, req.user._id);
+  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
+  if (!hasFullAccess && !query.movId) {
+    const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id);
     if (empty) {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
     }
@@ -421,6 +426,34 @@ router.post('/admin/revertir-anteriores',
   permit('banks:admin'),
   asyncHandler(async (_req, res) => {
     res.json(await service.revertirAnterioresAMayo());
+  }),
+);
+
+// POST /api/banks/admin/importar-conciliacion
+// Recibe un Excel (fecha_deposito, banco, monto_deposito) y marca como
+// 'identificado' cada movimiento que coincida con status 'no_identificado'.
+// No toca movimientos ya identificados ni manipulados por humanos.
+// Devuelve runId para el revert selectivo.
+router.post('/admin/importar-conciliacion',
+  authenticate,
+  permit('banks:admin'),
+  upload.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'Se requiere un archivo Excel (.xlsx / .xls)' });
+    res.json(await service.importarConciliacion(req.file.buffer, req.user));
+  }),
+);
+
+// POST /api/banks/admin/revertir-conciliacion
+// Deshace exactamente lo aplicado por importar-conciliacion para el runId dado.
+// Preserva identificaciones manuales del mismo usuario y de otros motores.
+router.post('/admin/revertir-conciliacion',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const { runId } = req.body;
+    if (!runId) return res.status(400).json({ error: 'Se requiere el runId de la importación' });
+    res.json(await service.revertirConciliacion(runId, req.user._id));
   }),
 );
 

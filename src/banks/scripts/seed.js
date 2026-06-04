@@ -111,6 +111,10 @@ async function seed() {
   const seedEntities = require('./seed-entities');
   await seedEntities();
 
+  // Siempre sembrar catálogo de cuentas y centros de costo — idempotente.
+  const seedAccountPlan = require('./seed-account-plan');
+  await seedAccountPlan();
+
   // La creación del usuario admin es opcional: solo si se proporcionó el email.
   if (!adminEmail) {
     console.log('[seed] SEED_ADMIN_EMAIL no definido — omitiendo creación de admin.');

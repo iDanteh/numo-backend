@@ -65,6 +65,9 @@ const PERMISSIONS = Object.freeze({
 
   // Registro y eliminación de fichas bancarias (solo contabilidad y admin)
   BANKS_FICHA:         'banks:ficha',
+
+  // Exportar movimientos a Excel (reporte personalizado y vista detalle)
+  BANKS_EXPORT:        'banks:export',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────
@@ -84,6 +87,7 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_CONFIG,
       PERMISSIONS.BANKS_RULES,
       PERMISSIONS.BANKS_FICHA,
+      PERMISSIONS.BANKS_EXPORT,
       PERMISSIONS.ACCOUNT_PLAN_READ,
       PERMISSIONS.ACCOUNT_PLAN_WRITE,
       PERMISSIONS.POLIZAS_READ,
@@ -106,6 +110,7 @@ const ROLES = Object.freeze({
     permissions: [
       PERMISSIONS.BANKS_READ,
       PERMISSIONS.BANKS_UPDATE,        // puede cambiar estado de movimientos
+      PERMISSIONS.BANKS_EXPORT,        // puede exportar Excel (con vista restringida)
       PERMISSIONS.COLLECTIONS_READ,
       PERMISSIONS.COLLECTIONS_WRITE,
     ],

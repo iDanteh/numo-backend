@@ -1,5 +1,6 @@
 'use strict';
 
+const { randomUUID }    = require('crypto');
 const BankMovement      = require('./BankMovement.model');
 const bankConfigRepo    = require('./repositories/bank-config.repository');
 const Counter           = require('../../shared/models/Counter');
@@ -2192,6 +2193,219 @@ async function revertirAnterioresAMayo() {
   };
 }
 
+// ── importarConciliacion ──────────────────────────────────────────────────────
+// Lee un Excel con columnas fecha_deposito, banco, monto_deposito y marca como
+// 'identificado' cada movimiento que coincida con status 'no_identificado'.
+// • No toca movimientos ya identificados, en estado 'otros' ni manipulados.
+// • Registra la autoría con source: SOURCE_CONCILIACION y un runId único por
+//   operación para que el revert sea exactamente selectivo.
+const SOURCE_CONCILIACION = 'conciliacion-import';
+
+async function _parseConciliacionExcel(buffer) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const sheet = workbook.worksheets[0];
+  if (!sheet) throw new Error('El archivo no contiene hojas de cálculo');
+
+  const headerMap = {};
+  sheet.getRow(1).eachCell({ includeEmpty: false }, (cell, col) => {
+    const key = String(cell.value ?? '').trim().toLowerCase().replace(/\s+/g, '_');
+    headerMap[col] = key;
+  });
+
+  const rows = [];
+  sheet.eachRow({ includeEmpty: false }, (_row, rowNum) => {
+    if (rowNum === 1) return;
+    const obj = {};
+    _row.eachCell({ includeEmpty: true }, (cell, col) => {
+      const key = headerMap[col];
+      if (!key) return;
+      const v = cell.value;
+      if (v === null || v === undefined) { obj[key] = null; return; }
+      if (typeof v === 'object') {
+        if ('result'   in v) { obj[key] = v.result; return; }                             // fórmula
+        if ('richText' in v) { obj[key] = v.richText.map(t => t.text ?? '').join(''); return; } // texto enriquecido
+      }
+      obj[key] = v;
+    });
+    rows.push(obj);
+  });
+
+  return rows.map(row => {
+    const rawFecha = row['fecha_deposito'];
+    const rawBanco = row['banco'];
+    const rawMonto = row['monto_deposito'];
+
+    let fecha = null;
+    if (rawFecha instanceof Date && !isNaN(rawFecha.getTime())) {
+      fecha = rawFecha;
+    } else if (typeof rawFecha === 'number' && rawFecha > 25000) {
+      // Serial numérico de Excel cuando la celda no está formateada como fecha
+      // 25569 = días entre 1900-01-00 (Excel epoch) y 1970-01-01 (Unix epoch)
+      const d = new Date((rawFecha - 25569) * 86400000);
+      if (!isNaN(d.getTime())) fecha = d;
+    } else if (typeof rawFecha === 'string' && rawFecha.trim()) {
+      const s = rawFecha.trim();
+      let parsed = new Date(s);
+      if (isNaN(parsed.getTime())) {
+        // Formato DD/MM/YYYY o DD-MM-YYYY (común en México)
+        const parts = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+        if (parts) parsed = new Date(Date.UTC(+parts[3], +parts[2] - 1, +parts[1]));
+      }
+      if (!isNaN(parsed.getTime())) fecha = parsed;
+    }
+
+    const banco = String(rawBanco ?? '').trim();
+    const rawNum = typeof rawMonto === 'number'
+      ? rawMonto
+      : parseFloat(String(rawMonto ?? '0').replace(/,/g, ''));
+    const monto = Math.round(rawNum * 100) / 100;
+
+    if (!fecha || !banco || !monto || monto <= 0) return null;
+    return { fecha, banco, monto };
+  }).filter(Boolean);
+}
+
+async function importarConciliacion(buffer, user) {
+  const runId = randomUUID();
+
+  let rows;
+  try {
+    rows = await _parseConciliacionExcel(buffer);
+  } catch (err) {
+    throw new BadRequestError(`Error al leer el archivo: ${err.message}`);
+  }
+
+  if (rows.length === 0) {
+    throw new BadRequestError(
+      'El archivo no contiene filas válidas (verifica las columnas fecha_deposito, banco, monto_deposito)',
+    );
+  }
+
+  let identificados = 0;
+  const fallidosDetalle = [];
+
+  for (const { fecha, banco, monto } of rows) {
+    // Rango del día completo en UTC para cubrir la fecha sin importar la hora guardada
+    const dayStart = new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth(), fecha.getUTCDate()));
+    const dayEnd   = new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth(), fecha.getUTCDate() + 1));
+
+    const updated = await BankMovement.findOneAndUpdate(
+      {
+        isActive: true,
+        status:   'no_identificado',
+        fecha:    { $gte: dayStart, $lt: dayEnd },
+        banco:    { $regex: new RegExp(`^${banco.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
+        deposito: monto,
+      },
+      {
+        $set:  { status: 'identificado' },
+        $push: {
+          identificadoPor: {
+            userId:  user._id,
+            nombre:  user.nombre ?? user._id,
+            fechaId: new Date(),
+            erpId:   null,
+            source:  SOURCE_CONCILIACION,
+            runId,
+          },
+        },
+      },
+    );
+
+    if (updated) {
+      identificados++;
+    } else {
+      fallidosDetalle.push({ fecha: fecha.toISOString().slice(0, 10), banco, monto });
+    }
+  }
+
+  return { runId, total: rows.length, identificados, fallidos: fallidosDetalle.length, fallidosDetalle };
+}
+
+// ── revertirConciliacion ──────────────────────────────────────────────────────
+// Deshace exactamente lo que aplicó importarConciliacion para un runId concreto:
+// • Solo actúa sobre movimientos con esa combinación userId + SOURCE + runId.
+// • Elimina la entrada del array identificadoPor.
+// • Resetea status a 'no_identificado' solo si no quedan entradas de usuarios
+//   humanos (userId fuera de TODOS_MOTORES_HISTORICO, excluyendo la entrada
+//   que estamos quitando).
+// • No toca identificaciones manuales del mismo usuario en otro contexto.
+async function revertirConciliacion(runId, userId) {
+  const resultado = await BankMovement.updateMany(
+    {
+      isActive: true,
+      status:   'identificado',
+      identificadoPor: {
+        $elemMatch: { userId, source: SOURCE_CONCILIACION, runId },
+      },
+    },
+    [
+      {
+        $set: {
+          identificadoPor: {
+            $filter: {
+              input: { $ifNull: ['$identificadoPor', []] },
+              as:    'entry',
+              cond: {
+                $not: {
+                  $and: [
+                    { $eq: ['$$entry.userId',  userId] },
+                    { $eq: ['$$entry.source', SOURCE_CONCILIACION] },
+                    { $eq: ['$$entry.runId',  runId] },
+                  ],
+                },
+              },
+            },
+          },
+          // Resetear a no_identificado solo si, quitando esa entrada, no quedan
+          // entradas de usuarios humanos. Las expresiones $set del pipeline operan
+          // sobre el doc original, así que excluimos explícitamente la entrada
+          // que vamos a quitar al contar entradas humanas restantes.
+          status: {
+            $cond: {
+              if: {
+                $eq: [
+                  {
+                    $size: {
+                      $filter: {
+                        input: { $ifNull: ['$identificadoPor', []] },
+                        as:    'e',
+                        cond: {
+                          $and: [
+                            { $not: { $in: ['$$e.userId', TODOS_MOTORES_HISTORICO] } },
+                            {
+                              $not: {
+                                $and: [
+                                  { $eq: ['$$e.userId',  userId] },
+                                  { $eq: ['$$e.source', SOURCE_CONCILIACION] },
+                                  { $eq: ['$$e.runId',  runId] },
+                                ],
+                              },
+                            },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                  0,
+                ],
+              },
+              then: 'no_identificado',
+              else: '$status',
+            },
+          },
+        },
+      },
+    ],
+  );
+
+  return {
+    revertidos: resultado.modifiedCount,
+    message:    `${resultado.modifiedCount} movimiento(s) revertido(s) a "no identificado"`,
+  };
+}
+
 module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
@@ -2199,4 +2413,5 @@ module.exports = {
   exportMovements, deleteMovements, updateMovement, generateTemplate,
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
+  importarConciliacion, revertirConciliacion,
 };

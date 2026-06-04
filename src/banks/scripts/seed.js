@@ -35,6 +35,7 @@ const PERM_META = {
   'banks:rules':        { label: 'Reglas de clasificación',         module: 'Bancos' },
   'banks:ficha':        { label: 'Registrar/eliminar fichas',       module: 'Bancos' },
   'banks:admin':        { label: 'Operaciones admin de bancos',     module: 'Bancos' },
+  'banks:export':       { label: 'Exportar movimientos a Excel',    module: 'Bancos' },
   'account-plan:read':  { label: 'Ver catálogo contable',           module: 'Contabilidad' },
   'account-plan:write': { label: 'Editar catálogo contable',        module: 'Contabilidad' },
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },

@@ -90,6 +90,7 @@ function findRuleInList(cfdi, rules) {
   const cfdiRelacionadoTipo = cfdi._relacionadoTipo ?? null;
 
   const cfdiDescripcion = (cfdi.conceptos?.[0]?.descripcion ?? '').toLowerCase();
+  const cfdiTipoOrigen  = cfdi.tipoOrigen ?? _derivarTipoOrigen(cfdi) ?? null;
 
   const matching = rules.filter(r =>
     (!r.tipoComprobante    || r.tipoComprobante  === cfdi.tipoDeComprobante) &&
@@ -101,6 +102,7 @@ function findRuleInList(cfdi, rules) {
     (!r.tipoRelacion       || r.tipoRelacion      === cfdiTipoRelacion) &&
     (!r.relacionadoTipo    || r.relacionadoTipo   === cfdiRelacionadoTipo) &&
     (!r.conceptoContiene   || cfdiDescripcion.includes(r.conceptoContiene.toLowerCase())) &&
+    (!r.tipoOrigen         || r.tipoOrigen        === cfdiTipoOrigen) &&
     (r.tasaIva        == null || r.tasaIva        === cfdiTasaIva) &&
     (r.tieneDescuento == null || r.tieneDescuento === cfdiTieneDescuento),
   );
@@ -110,7 +112,8 @@ function findRuleInList(cfdi, rules) {
     r.tipoComprobante, r.rfcEmisor, r.rfcReceptor, r.metodoPago, r.formaPago,
     r.claveProdServ, r.tipoRelacion, r.relacionadoTipo, r.tasaIva,
     r.tieneDescuento  != null ? String(r.tieneDescuento)  : null,
-    r.conceptoContiene != null ? r.conceptoContiene        : null,
+    r.conceptoContiene != null ? r.conceptoContiene       : null,
+    r.tipoOrigen      != null ? r.tipoOrigen              : null,
   ].filter(v => v != null).length;
 
   return matching.sort((a, b) => {
@@ -201,6 +204,25 @@ function _detectTasaIva(cfdi) {
   if (tiene16)           return '16';
   if (tiene0)            return '0';
   return null; // sin información de tasa
+}
+
+/**
+ * Deriva el TipoOrigen de negocio a partir de los campos del CFDI cuando el ERP
+ * no lo proporcionó. Se usa como fallback para CFDIs SAT sin homólogo ERP.
+ */
+function _derivarTipoOrigen(cfdi) {
+  const tipo = cfdi.tipoDeComprobante;
+  if (tipo === 'I') return 'Venta';
+  if (tipo === 'E') {
+    const rel = cfdi.cfdiRelacionados?.[0]?.tipoRelacion;
+    if (rel === '01') return 'Nota de Crédito';
+    if (rel === '03') return 'Devolución';
+    return 'Bonificación';
+  }
+  if (tipo === 'P') return 'Pago';
+  if (tipo === 'N') return 'Nómina';
+  if (tipo === 'T') return 'Traslado';
+  return null;
 }
 
 /** Detecta si el CFDI tiene descuento > 0 (header o en algún concepto). */
@@ -702,14 +724,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
 
   // Enriquecer cada movimiento con los campos SAT del CFDI origen y la regla usada
   const satMeta = {
-    tipoComprobante: cfdi.tipoDeComprobante ?? null,
-    metodoPago:      cfdi.metodoPago        ?? null,
-    formaPago:       cfdi.formaPago         ?? null,
-    folio:           cfdi.folio             ?? null,
-    rfcEmisor:       cfdi.emisor?.rfc       ?? null,
-    rfcReceptor:     cfdi.receptor?.rfc     ?? null,
-    reglaId:         rule?.id               ?? null,
-    reglaNombre:     rule?.nombre           ?? null,
+    tipoComprobante: cfdi.tipoDeComprobante                      ?? null,
+    metodoPago:      cfdi.metodoPago                            ?? null,
+    formaPago:       cfdi.formaPago                             ?? null,
+    folio:           cfdi.folio                                 ?? null,
+    rfcEmisor:       cfdi.emisor?.rfc                           ?? null,
+    rfcReceptor:     cfdi.receptor?.rfc                         ?? null,
+    reglaId:         rule?.id                                   ?? null,
+    reglaNombre:     rule?.nombre                               ?? null,
+    tipoOrigen:      cfdi.tipoOrigen ?? _derivarTipoOrigen(cfdi) ?? null,
   };
 
   return movs.map(m => ({ ...m, ...satMeta }));
@@ -787,4 +810,4 @@ function _validate(data) {
   if (!data.cuentaAbono?.trim()) throw new BadRequestError('La cuenta de abono es requerida');
 }
 
-module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva };
+module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen };

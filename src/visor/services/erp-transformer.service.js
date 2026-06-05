@@ -365,7 +365,10 @@ const transformar = (factura, { ejercicio, periodo, uploadedBy }) => {
     impuestos: {
       totalImpuestosTrasladados: totalIVA,
       totalImpuestosRetenidos:   totalRetenciones,
+      traslados:   _mapImpuestosERP(factura?.Impuestos, false),
+      retenciones: _mapImpuestosERP(factura?.Impuestos, true),
     },
+    global:    !!(factura?.Global),
     uploadedBy,
   };
 
@@ -386,6 +389,24 @@ const transformar = (factura, { ejercicio, periodo, uploadedBy }) => {
   if (tfd.Version && ['3.3', '4.0'].includes(tfd.Version)) cfdiDoc.version = tfd.Version;
 
   return cfdiDoc;
+};
+
+/**
+ * Convierte el array Impuestos del ERP al formato de traslados/retenciones del schema.
+ * @param {Array}   impuestos  — factura.Impuestos del ERP
+ * @param {boolean} esRetencion — true para retenciones, false para traslados
+ */
+const _mapImpuestosERP = (impuestos, esRetencion) => {
+  if (!Array.isArray(impuestos)) return [];
+  return impuestos
+    .filter(i => !!i.EsRetencion === esRetencion)
+    .map(i => ({
+      impuesto:   String(i.Impuesto   ?? ''),
+      tipoFactor: String(i.TipoFactor ?? ''),
+      tasaOCuota: parseNum(i.TasaOCuota) ?? 0,
+      base:       parseNum(i.Base)       ?? 0,
+      importe:    parseNum(i.Importe)    ?? 0,
+    }));
 };
 
 // ─── Transformador tolerante ──────────────────────────────────────────────────
@@ -526,7 +547,10 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
     impuestos: {
       totalImpuestosTrasladados: totalIVA,
       totalImpuestosRetenidos:   totalRetenciones,
+      traslados:  _mapImpuestosERP(factura?.Impuestos, false),
+      retenciones: _mapImpuestosERP(factura?.Impuestos, true),
     },
+    global:    !!(factura?.Global),
     uploadedBy,
   };
 
@@ -541,6 +565,7 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
   if (factura?.ID)             doc.erpId         = String(factura.ID);
   if (satStatus)               doc.satStatus     = satStatus;
   if (erpStatus)               doc.erpStatus     = erpStatus;
+  if (factura?.TipoOrigen)     doc.tipoOrigen    = String(factura.TipoOrigen).trim();
   if (cfdiRelacionados.length) doc.cfdiRelacionados    = cfdiRelacionados;
   if (Object.keys(timbre).length) doc.timbreFiscalDigital = timbre;
   const complementoPago = extraerComplementoPago(factura);

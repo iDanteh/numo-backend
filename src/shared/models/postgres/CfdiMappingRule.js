@@ -77,6 +77,11 @@ const CfdiMappingRule = sequelize.define('CfdiMappingRule', {
     allowNull: true,
     comment:   'Texto que debe contener la descripción del primer concepto (case-insensitive). null=cualquiera',
   },
+  tipoOrigen: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Clasificación de negocio del ERP (Venta, Bonificación, Devolución, Pago…). null=cualquiera',
+  },
   // Cuentas contables (código SAT, ej. "501.01")
   cuentaCargo: {
     type:      DataTypes.STRING(20),

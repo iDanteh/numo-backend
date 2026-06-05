@@ -226,6 +226,13 @@ const cfdiSchema = new mongoose.Schema({
     index: true,
   },
 
+  // Clasificación de negocio del ERP: "Venta", "Bonificación", "Devolución", "Pago", etc.
+  // Se guarda al importar desde el ERP y se usa para enriquecer CFDIs SAT al generar asientos.
+  tipoOrigen: { type: String, default: null },
+
+  // Indica si es una Factura Global (venta al público en general agrupada)
+  global: { type: Boolean, default: false },
+
   // XML original
   xmlContent: { type: String, select: false },
   xmlHash: { type: String },

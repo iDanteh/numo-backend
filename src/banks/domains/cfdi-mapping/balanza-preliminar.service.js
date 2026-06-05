@@ -91,7 +91,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
       const erpCfdis = await CFDI.find({
         uuid:   { $in: uuidsSinConceptos },
         source: 'ERP',
-      }).select('uuid formaPago metodoPago conceptos impuestos').lean();
+      }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen').lean();
       erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
     }
 
@@ -105,6 +105,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
         metodoPago: cfdi.metodoPago || erp.metodoPago,
         conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
         impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+        tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
       };
     });
 

@@ -101,6 +101,11 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
     allowNull: true,
     comment:   'RFC del receptor del CFDI',
   },
+  tipoOrigen: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Clasificación de negocio del ERP: Venta, Bonificación, Devolución, Pago, etc.',
+  },
   // ── Trazabilidad de la regla de mapeo usada ──────────────────────────────
   reglaId: {
     type:       DataTypes.INTEGER,

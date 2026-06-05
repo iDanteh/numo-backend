@@ -87,12 +87,12 @@ async function syncModels() {
   // PeriodoFiscal depende de users
   await PeriodoFiscal.sync({ alter: !isProd });
 
+  // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
+  await CfdiMappingRule.sync({ alter: !isProd });
+
   // Pólizas: force:false para no tocar ENUMs ni datos existentes.
   await Poliza.sync({ force: false });
   await PolizaMovimiento.sync({ force: false });
-
-  // Reglas de mapeo CFDI (sin ENUMs problemáticos excepto tipoComprobante)
-  await CfdiMappingRule.sync({ alter: !isProd });
 
   // Agregar columnas de auditoría si no existen (seguro correrlo múltiples veces)
   await Poliza.sequelize.query(`
@@ -142,6 +142,17 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS rfc_emisor       VARCHAR(13),
       ADD COLUMN IF NOT EXISTS rfc_receptor     VARCHAR(13)
   `).catch(e => console.warn('[syncModels] ADD COLUMN SAT fields:', e.message));
+
+  // Clasificación de negocio en movimientos y reglas de mapeo
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (movimientos):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (reglas):', e.message));
 
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`

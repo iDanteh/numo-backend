@@ -107,19 +107,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const erpCfdis = await CFDI.find({
       uuid:   { $in: uuidsSinMeta },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinal = cfdisSinPolizaEnriquecidos.map(cfdi => {
     const erp = erpMetaMap[cfdi.uuid];
     if (!erp) return cfdi;
+    const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
     return {
       ...cfdi,
       formaPago:  cfdi.formaPago  || erp.formaPago,
       metodoPago: cfdi.metodoPago || erp.metodoPago,
-      // Inyectar conceptos del ERP solo cuando el SAT no los trajo (Metadata)
-      conceptos:  cfdi.conceptos?.length ? cfdi.conceptos : (erp.conceptos ?? []),
-      impuestos:  cfdi.conceptos?.length ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
     };
   });
 
@@ -333,18 +334,20 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const erpCfdisGuard = await CFDI.find({
       uuid:   { $in: uuidsSinMetaGuard },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen').lean();
     erpMetaMapGuard = Object.fromEntries(erpCfdisGuard.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinalGuard = cfdisSinPolizaEnriquecidosGuard.map(cfdi => {
     const erp = erpMetaMapGuard[cfdi.uuid];
     if (!erp) return cfdi;
+    const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
     return {
       ...cfdi,
       formaPago:  cfdi.formaPago  || erp.formaPago,
       metodoPago: cfdi.metodoPago || erp.metodoPago,
-      conceptos:  cfdi.conceptos?.length ? cfdi.conceptos : (erp.conceptos ?? []),
-      impuestos:  cfdi.conceptos?.length ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
     };
   });
 

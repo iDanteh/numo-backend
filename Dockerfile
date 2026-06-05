@@ -37,12 +37,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pero no package.json, este layer se reutiliza → builds mucho más rápidos.
 COPY package*.json ./
 
-# npm ci vs npm install:
-#   • npm ci lee package-lock.json y garantiza versiones exactas (reproducible)
-#   • --only=production excluye jest, nodemon y supertest (no necesarios en prod)
+# npm install vs npm ci:
+#   • npm install resuelve dependencias aunque el lock file esté desincronizado
+#   • --omit=dev excluye jest, nodemon y supertest (no necesarios en prod)
 #   • --ignore-scripts evita scripts postinstall arbitrarios por seguridad
 #     EXCEPCIÓN: sharp necesita su script install → no usamos --ignore-scripts aquí
-RUN npm ci --only=production
+RUN npm install --omit=dev
 
 
 # ── Stage 2: Imagen de runtime ────────────────────────────────────────────────

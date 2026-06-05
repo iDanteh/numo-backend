@@ -48,6 +48,7 @@ async function updateRole(value, updates) {
   if (updates.permissions !== undefined) {
     const io = getIo();
     if (io) {
+      // 1. Notifica a los usuarios con ese rol para que actualicen sus permisos en sesión
       const affected = await User.findAll({
         where: { role: value },
         attributes: ['auth0Sub'],
@@ -60,6 +61,10 @@ async function updateRole(value, updates) {
           io.to(`user:${sub}`).emit('role:updated', { role: value, permissions: role.permissions });
         }
       }
+
+      // 2. Broadcast global para que la vista de usuarios/roles se refresque en
+      //    todas las sesiones activas (admins viendo la pantalla de gestión de roles).
+      io.emit('role:definition:updated', { role: value });
     }
   }
 

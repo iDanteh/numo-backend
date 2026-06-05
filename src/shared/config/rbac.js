@@ -17,6 +17,21 @@
  * Wildcard '*' en permissions concede acceso total (solo admin).
  */
 
+// ── Alcance de visibilidad de movimientos (para roles restringidos) ───────────
+
+/**
+ * Define cómo ve los movimientos identificados un rol sin banks:config.
+ * OWN  → solo los que él mismo identificó (identificadoPorUsuario = userId)
+ * ALL  → todos los identificados, sin importar quién los identificó
+ *
+ * Asignar en la definición del rol como `movementScope`. Si un rol no declara
+ * este campo, el comportamiento por defecto es OWN (retrocompatibilidad).
+ */
+const MOVEMENT_SCOPE = Object.freeze({
+  OWN: 'own',
+  ALL: 'all',
+});
+
 // ── Catálogo de permisos ──────────────────────────────────────────────────────
 
 const PERMISSIONS = Object.freeze({
@@ -68,6 +83,11 @@ const PERMISSIONS = Object.freeze({
 
   // Exportar movimientos a Excel (reporte personalizado y vista detalle)
   BANKS_EXPORT:        'banks:export',
+
+  // Exportar movimientos de CUALQUIER usuario (sin restricción de identificadoPor).
+  // Roles con este permiso ven todos los depósitos identificados, no solo los propios.
+  // Úsalo para roles tipo "jefe de cobranza" que supervisan a su equipo.
+  BANKS_EXPORT_ALL:    'banks:export:all',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────
@@ -107,6 +127,7 @@ const ROLES = Object.freeze({
 
   cobranza: {
     label: 'Cobranza',
+    movementScope: MOVEMENT_SCOPE.OWN, // cambia a ALL para ver todos los identificados
     permissions: [
       PERMISSIONS.BANKS_READ,
       PERMISSIONS.BANKS_UPDATE,        // puede cambiar estado de movimientos
@@ -172,4 +193,23 @@ function listRolesWithPermissions() {
   }));
 }
 
-module.exports = { PERMISSIONS, ROLES, hasPermission, hasAllPermissions, listRoles, listRolesWithPermissions };
+/**
+ * Devuelve el alcance de visibilidad de movimientos para un rol restringido.
+ * Roles sin `movementScope` definido usan OWN como comportamiento por defecto.
+ * @param {string} role
+ * @returns {'own' | 'all'}
+ */
+function getMovementScope(role) {
+  return ROLES[role]?.movementScope ?? MOVEMENT_SCOPE.OWN;
+}
+
+module.exports = {
+  PERMISSIONS,
+  ROLES,
+  MOVEMENT_SCOPE,
+  hasPermission,
+  hasAllPermissions,
+  listRoles,
+  listRolesWithPermissions,
+  getMovementScope,
+};

@@ -5,7 +5,7 @@ const multer  = require('multer');
 const { authenticate, permit }     = require('../../shared/middleware/auth.real');
 const { asyncHandler }             = require('../../shared/middleware/error-handler');
 const rbacStore                    = require('../../../shared/services/rbac-store');
-const { PERMISSIONS }              = require('../../../shared/config/rbac');
+const { PERMISSIONS, MOVEMENT_SCOPE, getMovementScope } = require('../../../shared/config/rbac');
 const service                      = require('./bank.service');
 const {
   parseAuxiliaryFile,
@@ -21,21 +21,25 @@ const router = express.Router();
 
 /**
  * Aplica restricciones de visibilidad para usuarios sin acceso completo a movimientos.
- * Limita a depósitos propios no identificados (o los que ese mismo usuario identificó).
- * Se activa para cualquier rol que tenga banks:export pero no banks:config.
+ * Limita a depósitos no identificados; el comportamiento sobre los identificados
+ * depende del `scope` declarado en rbac.js para el rol del usuario.
  *
- * @param {object}  query     - query params originales
- * @param {string}  userId    - auth0 sub del usuario
- * @param {boolean} forExport - en exportación no se devuelve vacío; 'otros' → 'no_identificado'
+ * @param {object} query               - query params originales
+ * @param {string} userId              - auth0 sub del usuario
+ * @param {object} [opts]
+ * @param {string} [opts.scope]        - MOVEMENT_SCOPE.OWN | ALL (default: OWN)
+ * @param {boolean} [opts.forExport]   - en export 'otros' → no_identificado en vez de vacío
  * @returns {{ query: object, empty: boolean }}
  */
-function applyMovementRestrictions(query, userId, forExport = false) {
+function applyMovementRestrictions(query, userId, { scope = MOVEMENT_SCOPE.OWN, forExport = false } = {}) {
   const q = { ...query };
   if (q.status === 'otros') {
     if (!forExport) return { query: q, empty: true };
     q.status = undefined; // en export: quita el filtro de status → luego cae en el default
   }
-  if (q.status === 'identificado') q.identificadoPorUsuario = userId;
+  if (q.status === 'identificado' && scope === MOVEMENT_SCOPE.OWN) {
+    q.identificadoPorUsuario = userId;
+  }
   if (!q.status) q.status = 'no_identificado';
   q.tipo = 'deposito';
   return { query: q, empty: false };
@@ -70,7 +74,11 @@ router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), 
   let query = { ...req.query };
   const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
   if (!hasFullAccess) {
-    ({ query } = applyMovementRestrictions(query, req.user._id, true));
+    // banks:export:all → puede exportar depósitos de TODOS los usuarios identificadores,
+    // pero sigue sin acceso a retiros ni a "otros" (no tiene banks:config).
+    const hasExportAll = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_EXPORT_ALL);
+    const scope = hasExportAll ? MOVEMENT_SCOPE.ALL : getMovementScope(req.user.role);
+    ({ query } = applyMovementRestrictions(query, req.user._id, { scope, forExport: true }));
   }
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -87,7 +95,8 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   let query = { ...req.query };
   const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
   if (!hasFullAccess && !query.movId) {
-    const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id);
+    const scope = getMovementScope(req.user.role);
+    const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id, { scope });
     if (empty) {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
     }

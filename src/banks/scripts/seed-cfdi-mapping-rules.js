@@ -55,7 +55,7 @@ const reglas = [
     claveProdServ:   '84111506',
     cuentaCargo:     '1101010003',   // Caja (formaPago=01 → efectivo)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
-    cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos
+    cuentaIva:       '2104010001',   // IVA Trasladado general (fix: evita saldo neg. inter-mes)
     conceptoContiene: null,
     prioridad:       9,
   },
@@ -66,7 +66,7 @@ const reglas = [
     claveProdServ:   '84111506',
     cuentaCargo:     '1102011005',   // Bancos (dinero recibido)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
-    cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos
+    cuentaIva:       '2104010001',   // IVA Trasladado general (fix: evita saldo neg. inter-mes)
     conceptoContiene: null,
     prioridad:       9,
   },
@@ -439,7 +439,7 @@ const reglas = [
     cuentaCargo:         '2103010001',  // Anticipos de Clientes General (subtotal — cancela pasivo)
     cuentaAbono:         '4100010001',  // Ingresos Contado 16%
     cuentaIva:           '2104010001',  // IVA Trasladado definitivo (HABER)
-    cuentaIvaAnticipo:   '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
+    cuentaIvaAnticipo:   '2104010001',  // IVA Trasladado general (DEBE — efecto neto cero, cuadra asiento)
     cuentaDeltaAnticipo: '1102011005',  // Bancos (5° mov: cash por saldo > anticipo, si aplica)
     conceptoContiene: null,
     prioridad:           12,
@@ -1294,7 +1294,7 @@ const reglas = [
     formaPago:       '01',
     tasaIva:         '0',
     tieneDescuento:  false,
-    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0% (fix: devolución ≠ descuento)
     cuentaAbono:     '1101010003',  // Caja (formaPago=01 → efectivo)
     cuentaIva:       null,
     conceptoContiene: null,
@@ -1306,7 +1306,7 @@ const reglas = [
     tipoRelacion:    '01',
     tasaIva:         '0',
     tieneDescuento:  false,         // NCs 0% con descuento → Reg 19B/19C
-    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0% (fix: devolución ≠ descuento)
     cuentaAbono:     '1102011005',  // Bancos
     cuentaIva:       null,
     conceptoContiene: null,

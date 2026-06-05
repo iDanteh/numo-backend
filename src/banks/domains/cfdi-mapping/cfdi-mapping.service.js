@@ -81,7 +81,13 @@ async function findRuleForCfdi(cfdi) {
  */
 function findRuleInList(cfdi, rules) {
   const cfdiClaveProdServ  = cfdi.conceptos?.[0]?.claveProdServ ?? null;
-  const cfdiTipoRelacion   = cfdi.cfdiRelacionados?.[0]?.tipoRelacion ?? null;
+  // Prioridad de tipoRelacion: '04' y '07' son más específicos que '01'.
+  // Si el CFDI tiene múltiples relaciones (ej. SAT concatenó '01' y ERP tiene '04'),
+  // se prefiere '04' (sustitución) > '07' (anticipo) > cualquier otro > primer elemento.
+  const _RELACION_PRIORIDAD = ['04', '07'];
+  const cfdiTipoRelacion = cfdi.cfdiRelacionados?.find(r => _RELACION_PRIORIDAD.includes(r.tipoRelacion))?.tipoRelacion
+    ?? cfdi.cfdiRelacionados?.[0]?.tipoRelacion
+    ?? null;
   const cfdiTasaIva        = _detectTasaIva(cfdi);
   const cfdiTieneDescuento = _detectTieneDescuento(cfdi);
 

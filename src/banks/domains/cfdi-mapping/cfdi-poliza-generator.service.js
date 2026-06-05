@@ -6,6 +6,7 @@ const centrosSvc = require('../centros-costo/centros-costo.service');
 const { Op, QueryTypes }   = require('sequelize');
 const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
+const { _getRulesActive }  = require('./balanza-preliminar.service');
 const { BadRequestError }  = require('../../shared/errors/AppError');
 
 /**
@@ -70,11 +71,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     throw new BadRequestError('Todos los CFDIs vigentes del periodo ya tienen póliza registrada');
   }
 
-  // 3. Cargar reglas una sola vez
-  const rules = await CfdiMappingRule.findAll({
-    where: { isActive: true },
-    order: [['prioridad', 'ASC']],
-  });
+  // 3. Cargar reglas activas (cacheadas 60s)
+  const rules = await _getRulesActive();
 
   // 4. Pre-fetch tipoDeComprobante de CFDIs relacionados para discriminador relacionadoTipo
   const relTipoUuidsProp = [...new Set(
@@ -232,6 +230,28 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const fecha = new Date();
   const mesStr = String(periodo).padStart(2, '0');
 
+  // ── Obs 4: detectar facturas PPD con tipoRelacion='07' que deberían ser PUE ──
+  // Cuando el anticipo cubre el 100%, la factura final debe emitirse como PUE.
+  // Si llega como PPD, el asiento queda incompleto (IVA en Por Trasladar en lugar de Trasladado).
+  const ppd07 = cfdisSinPolizaFinal.filter(c =>
+    c.tipoDeComprobante === 'I' &&
+    c.metodoPago === 'PPD' &&
+    c.cfdiRelacionados?.some(r => r.tipoRelacion === '07')
+  );
+
+  const advertencias = [];
+  if (sinRegla > 0) {
+    advertencias.push(`${sinRegla} CFDI(s) sin regla de mapeo — las cuentas deben asignarse manualmente`);
+  }
+  if (ppd07.length > 0) {
+    advertencias.push(
+      `⚠ ${ppd07.length} factura(s) PPD con tipoRelacion='07' (aplicación de anticipo): ` +
+      `verificar si el anticipo cubre el 100% — en ese caso debió emitirse como PUE. ` +
+      `Folios: ${ppd07.map(c => [c.serie, c.folio].filter(Boolean).join('-')).slice(0, 5).join(', ')}` +
+      (ppd07.length > 5 ? ` y ${ppd07.length - 5} más` : ''),
+    );
+  }
+
   return {
     tipo:       tipoPropuesta,
     fecha:      fecha.toISOString().slice(0, 10),
@@ -243,9 +263,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     _meta: {
       totalCfdis:   cfdisSinPoliza.length,
       sinRegla,
-      advertencias: sinRegla > 0
-        ? [`${sinRegla} CFDI(s) sin regla de mapeo — las cuentas deben asignarse manualmente`]
-        : [],
+      advertencias,
     },
   };
 }
@@ -299,11 +317,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     throw new BadRequestError('Todos los CFDIs vigentes del periodo ya tienen póliza registrada');
   }
 
-  // 3. Cargar reglas activas
-  const rules = await CfdiMappingRule.findAll({
-    where: { isActive: true },
-    order: [['prioridad', 'ASC']],
-  });
+  // 3. Cargar reglas activas (cacheadas 60s)
+  const rules = await _getRulesActive();
 
   // 4. Pre-fetch tipoDeComprobante de CFDIs relacionados para discriminador relacionadoTipo
   const relTipoUuidsGuard = [...new Set(

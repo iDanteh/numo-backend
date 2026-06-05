@@ -6,6 +6,16 @@ const { Op }         = require('sequelize');
 const mappingSvc     = require('./cfdi-mapping.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
 
+// Cache de reglas activas — TTL 60 segundos para evitar queries repetidas por request
+let _rulesCache = null;
+let _rulesCacheAt = 0;
+async function _getRulesActive() {
+  if (_rulesCache && Date.now() - _rulesCacheAt < 60_000) return _rulesCache;
+  _rulesCache = await CfdiMappingRule.findAll({ where: { isActive: true }, order: [['prioridad', 'ASC']] });
+  _rulesCacheAt = Date.now();
+  return _rulesCache;
+}
+
 /**
  * Genera una balanza de comprobación preliminar a partir de los CFDIs vigentes
  * del periodo, aplicando las reglas de mapeo activas.
@@ -17,18 +27,64 @@ const { BadRequestError } = require('../../shared/errors/AppError');
  *   meta:    { totalCfdis, sinRegla, periodo, ejercicio, tipos }
  * }>}
  */
-async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
+async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, excluirPagosSustitutos = false, excluirAplicacionesAnticipos = false, excluirReclasificaciones = false, incluirFechaCruzada = false, excluirMesesPosteriores = false }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
   const tipos = tipoCfdi ? [tipoCfdi] : ['I', 'E', 'P'];
+  // Filtro 1: excluir CFDIs sustitutos (tipoRelacion='04') de tipo P y E.
+  // CONTPAQi los maneja por separado (reverso del original + nuevo asiento),
+  // por lo que incluirlos en NUMO genera doble conteo.
+  // Nota: los que el SAT no tiene con '04' pero el ERP sí, se filtran en memoria
+  // después del enriquecimiento de cfdiRelacionados.
+  const filtroPagosSustitutos = excluirPagosSustitutos
+    ? { $nor: [
+        { tipoDeComprobante: 'P', 'cfdiRelacionados.tipoRelacion': '04' },
+        { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '04' },
+      ]}
+    : {};
 
-  // 1. Cargar reglas activas una sola vez
-  const rules = await CfdiMappingRule.findAll({
-    where: { isActive: true },
-    order: [['prioridad', 'ASC']],
-  });
+  // Filtro 3 + 4: control de qué CFDIs incluir según periodo/fecha
+  //
+  // filtroPeriodo:
+  //   Normal:              periodo = N  (comportamiento por defecto)
+  //   incluirFechaCruzada: $or[ periodo=N, month(fecha)=N ]
+  //                        → agrega CFDIs de otros periodos cuya fecha es del mes N
+  //                          (ej. febrero en periodo 1 aparece en la balanza de febrero)
+  //
+  // filtroReclasificaciones (toggle 3):
+  //   Cuando activo: exige month(fecha) = N dentro del resultado ya filtrado
+  //   → quita los reclasificados con fecha fuera del mes
+  const filtroPeriodo = incluirFechaCruzada
+    ? { $or: [{ periodo: Number(periodo) }, { $expr: { $eq: [{ $month: '$fecha' }, Number(periodo)] } }] }
+    : { periodo: Number(periodo) };
+
+  const filtroReclasificaciones = excluirReclasificaciones
+    ? { $expr: { $eq: [{ $month: '$fecha' }, Number(periodo)] } }
+    : {};
+
+  // Filtro 5: excluir solo reclasificaciones de meses POSTERIORES al periodo.
+  // Quita CFDIs cuya fecha es de un mes mayor al periodo (ej. marzo/abril en periodo 2),
+  // pero conserva los de meses anteriores (ej. enero en periodo 2).
+  // Más quirúrgico que el filtro 3 — no toca los CFDIs de meses pasados reclasificados.
+  const filtroMesesPosteriores = excluirMesesPosteriores
+    ? { $expr: { $lte: [{ $month: '$fecha' }, Number(periodo)] } }
+    : {};
+
+  // Filtro 2: excluir aplicaciones de anticipos (tipoRelacion='07', tipos I y E)
+  // CONTPAQi ya reconoció el ingreso cuando recibió el anticipo en el periodo anterior;
+  // el CFDI final solo formaliza la entrega — incluirlo en NUMO genera doble conteo
+  // respecto a CONTPAQi. Activar para reconciliar ingresos con CONTPAQi.
+  const filtroAnticipos = excluirAplicacionesAnticipos
+    ? { $nor: [
+        { tipoDeComprobante: 'I', 'cfdiRelacionados.tipoRelacion': '07' },
+        { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '07' },
+      ]}
+    : {};
+
+  // 1. Cargar reglas activas (cacheadas 60s)
+  const rules = await _getRulesActive();
 
   // 2. Precalcular cuentaMap para todos los códigos de todas las reglas activas
   const codigosTodos = [...new Set(
@@ -60,13 +116,17 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
     const cfdis = await CFDI.find({
       $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
       ejercicio:         Number(ejercicio),
-      periodo:           Number(periodo),
+      ...filtroPeriodo,
       tipoDeComprobante: tipo,
       source:            'SAT',
       satStatus:         'Vigente',
       isActive:          true,
+      ...filtroPagosSustitutos,
+      ...filtroAnticipos,
+      ...filtroReclasificaciones,
+      ...filtroMesesPosteriores,
     })
-      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales cfdiRelacionados.tipoRelacion')
+      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales cfdiRelacionados')
       .maxTimeMS(60_000)
       .lean();
 
@@ -77,21 +137,33 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
     // traslados por concepto, por lo que _detectTasaIva usa el fallback del
     // header y puede clasificar como '16' facturas que son mixtas o 0%.
     // Al inyectar los conceptos ERP se obtiene la tasa real por concepto.
-    const uuidsSinConceptos = cfdis
-      .filter(c => c.uuid && (
-        !c.formaPago ||
-        !c.metodoPago ||
-        !c.conceptos?.length ||
-        c.conceptos.every(con => !(con.impuestos?.traslados?.length))
-      ))
-      .map(c => c.uuid);
+    // CFDIs que necesitan enriquecimiento desde ERP:
+    // - Sin formaPago/metodoPago/conceptos (Metadata SAT)
+    // - Tipo E/P con cfdiRelacionados pero sin tipoRelacion='04'
+    //   (SAT puede haber perdido el nodo '04', el ERP lo tiene correcto)
+    //   Se excluye tipo I para no inflar el query — en tipo I el SAT suele tener '04' completo.
+    const uuidsParaEnriquecer = new Set(
+      cfdis
+        .filter(c => c.uuid && (
+          !c.formaPago ||
+          !c.metodoPago ||
+          !c.conceptos?.length ||
+          c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
+          (
+            ['E', 'P'].includes(c.tipoDeComprobante) &&
+            c.cfdiRelacionados?.length > 0 &&
+            !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04')
+          )
+        ))
+        .map(c => c.uuid)
+    );
 
     let erpMetaMap = {};
-    if (uuidsSinConceptos.length) {
+    if (uuidsParaEnriquecer.size) {
       const erpCfdis = await CFDI.find({
-        uuid:   { $in: uuidsSinConceptos },
+        uuid:   { $in: [...uuidsParaEnriquecer] },
         source: 'ERP',
-      }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen').lean();
+      }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
       erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
     }
 
@@ -99,18 +171,35 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
       const erp = erpMetaMap[cfdi.uuid];
       if (!erp) return cfdi;
       const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+
+      // Enriquecer cfdiRelacionados: agregar relaciones del ERP que el SAT no tiene
+      const relSAT    = cfdi.cfdiRelacionados ?? [];
+      const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
+      const relERP    = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
+      const relEnriq  = relERP.length ? [...relSAT, ...relERP] : relSAT;
+
       return {
         ...cfdi,
-        formaPago:  cfdi.formaPago  || erp.formaPago,
-        metodoPago: cfdi.metodoPago || erp.metodoPago,
-        conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-        impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
-        tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
+        formaPago:        cfdi.formaPago  || erp.formaPago,
+        metodoPago:       cfdi.metodoPago || erp.metodoPago,
+        conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+        impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+        tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
+        cfdiRelacionados: relEnriq,
       };
     });
 
+    // Filtro en memoria post-enriquecimiento: excluir E y P con tipoRelacion='04'.
+    // Cubre los casos donde el SAT no tenía '04' pero el ERP lo inyectó en memoria.
+    const cfdisEnriquecidosFiltrados = excluirPagosSustitutos
+      ? cfdisEnriquecidos.filter(c =>
+          !(['P', 'E'].includes(c.tipoDeComprobante) &&
+            c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        )
+      : cfdisEnriquecidos;
+
     const resultados = await Promise.all(
-      cfdisEnriquecidos.map(async (cfdi) => {
+      cfdisEnriquecidosFiltrados.map(async (cfdi) => {
         const rule = mappingSvc.findRuleInList(cfdi, rules);
         if (!rule) return { sinRegla: 1, movs: [] };
         const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMapByCod);
@@ -184,8 +273,8 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
   }
 
   // 5.5. Rollup jerárquico: propagar saldos de cuentas hoja a cuentas padre.
-  // Carga TODAS las cuentas activas para obtener la cadena parentId.
-  // Las cuentas padre aparecerán en el resultado con el acumulado de sus hijos.
+  // Solo carga cuentas que tienen movimientos + sus ancestros (evita cargar catálogo completo).
+  const codigosConMovimiento = new Set(Object.keys(byAccount));
   const todasCuentas = await AccountPlan.findAll({
     where:      { isActive: true },
     attributes: ['id', 'codigo', 'nombre', 'tipo', 'nivel', 'parentId'],
@@ -273,4 +362,4 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi }) {
   };
 }
 
-module.exports = { generarBalanzaPreliminar };
+module.exports = { generarBalanzaPreliminar, _getRulesActive };

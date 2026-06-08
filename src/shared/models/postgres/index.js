@@ -154,6 +154,16 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
   `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (reglas):', e.message));
 
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_iva_abono VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_iva_abono (reglas):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_cargo_mixto0 VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_cargo_mixto0 (reglas):', e.message));
+
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

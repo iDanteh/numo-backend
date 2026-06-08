@@ -615,12 +615,17 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // esIvaHaber (Reg 19):     abono = subtotal - descuento (IVA ya en HABER; descuento reduce base)
   // Ingreso normal:          HABER = subtotal
   // Egreso/Pago normal:      HABER = total neto (descontando retenciones)
+  // cuentaIvaAbono (ej. Club Tuberos monedero): abono = subtotal; IVA va a cuenta separada
   // esAnticipo + tipo P: abono cierra la CxC por el total pagado
   // esAnticipo + tipo I/E / esIvaHaber: abono = subtotal - descuento (IVA ya manejado aparte)
   let montoAbono;
+  const tieneIvaAbonoSplit = !esPago && !esAnticipo && !esIvaHaber && rule.cuentaIvaAbono && iva > 0;
   if (esAnticipo)      montoAbono = esPago ? (total - ivaRet - isrRet) : subtotal;
   else if (esIvaHaber) montoAbono = subtotal - Number(cfdi.descuento || 0);
-  else if (esIngreso) {
+  else if (tieneIvaAbonoSplit) {
+    // Split IVA abono: cuentaAbono recibe solo subtotal, cuentaIvaAbono recibe IVA
+    montoAbono = subtotal;
+  } else if (esIngreso) {
     // El movimiento de IVA usa ivaR = total−subtotal (ambos SAT 2-decimales), por lo que
     // el complemento exacto es subtotal. Garantiza DEBE = HABER sin depender de rounding JS/DB.
     // Para CFDIs con retenciones se usa total−iva (rama else de ivaR arriba) — caso separado.
@@ -650,6 +655,23 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
             debe: 0, haber: subTotal0R,
             cfdiUuid: cfdi.uuid, rfcTercero,
           });
+          // Split cargo 0%: cuentaCargo recibe solo (total - subTotal0) = subtotal16 + IVA16
+          // cuentaCargoMixto0 recibe subTotal0 (sin IVA, pues tasa 0% no genera IVA)
+          if (rule.cuentaCargoMixto0) {
+            const cargoLine = movs.find(m =>
+              m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0
+            );
+            if (cargoLine) {
+              cargoLine.debe = parseFloat((cargoLine.debe - subTotal0R).toFixed(2));
+            }
+            movs.push({
+              cuentaId:    cuentaMap[rule.cuentaCargoMixto0] ?? null,
+              concepto:    `${concepto} (0%)`,
+              centroCosto, ventaFecha, serie: serieCfdi,
+              debe: subTotal0R, haber: 0,
+              cfdiUuid: cfdi.uuid, rfcTercero,
+            });
+          }
         }
       } else {
         // Tipo E (NC mixta): cargo principal = subTotal16, cargo secundario = subTotal0.
@@ -720,6 +742,26 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     cfdiUuid:    cfdi.uuid,
     rfcTercero,
   });
+
+  // Split IVA abono: cuando cuentaIvaAbono está definida, el IVA va a cuenta separada
+  // HABER cuentaIvaAbono = IVA (ej. 2104010002 IVA Trasladado Anticipos para Club Tuberos)
+  // Esto espeja el patrón CONTPAQI: HABER Monedero=subtotal + HABER IVAAnticipo=IVA
+  if (tieneIvaAbonoSplit && rule.cuentaIvaAbono) {
+    const ivaR = parseFloat((total - subtotal).toFixed(2));
+    if (ivaR > 0) {
+      movs.push({
+        cuentaId:    cuentaMap[rule.cuentaIvaAbono] ?? null,
+        concepto:    `IVA - ${concepto}`,
+        centroCosto,
+        ventaFecha,
+        serie:       serieCfdi,
+        debe:        0,
+        haber:       ivaR,
+        cfdiUuid:    cfdi.uuid,
+        rfcTercero,
+      });
+    }
+  }
 
   // Dentro del asiento de cada CFDI: cargos (debe > 0) primero, abonos después
   movs.sort((a, b) => {

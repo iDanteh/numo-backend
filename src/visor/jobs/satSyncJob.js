@@ -1686,6 +1686,106 @@ cron.schedule('0 * * * *', async () => {
 }, { timezone: 'America/Mexico_City' });
 
 /**
+ * ejecutarVerificacionTimbradosSATCancelado
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Job que corre cada 5 minutos. Busca CFDIs donde el ERP los sigue marcando
+ * como "Timbrado" (activo) pero el SAT ya los reporta como "Cancelado".
+ *
+ * Para cada CFDI en ese estado consulta el ERP en tiempo real para ver si el
+ * contador/ERP ya procesó la cancelación y actualizó su propio estado.
+ * Si el ERP ahora reporta un estado distinto a "Timbrado", actualiza erpStatus
+ * en MongoDB para que el reporte de conciliación refleje la realidad.
+ *
+ * Procesa máximo LOTE_MAX CFDIs por ejecución (priorizando los que llevan más
+ * tiempo sin checar) para no saturar la API del ERP.
+ */
+const LOTE_MAX_TIMBRADOS = 20;
+
+const ejecutarVerificacionTimbradosSATCancelado = async () => {
+  const { fetchEstadoCfdi } = require('../services/erp.service');
+
+  // Solo ejecutar si la integración ERP está configurada
+  let erpHabilitado = false;
+  try {
+    const AppConfig = require('../models/AppConfig');
+    const cfg = await AppConfig.findOne({ key: 'erpApiUrl' }).lean();
+    erpHabilitado = !!(cfg?.value);
+  } catch { /* si no hay AppConfig, intentamos de todas formas */ erpHabilitado = true; }
+
+  if (!erpHabilitado) return;
+
+  // Buscar CFDIs: ERP=Timbrado pero SAT=Cancelado
+  // Ordenar por satLastCheck ASC para procesar primero los que llevan más tiempo sin revisar
+  const cfdis = await CFDI.find(
+    {
+      source:    'ERP',
+      isActive:  true,
+      erpStatus: 'Timbrado',
+      satStatus: 'Cancelado',
+    },
+    '_id uuid fecha erpStatus satStatus satLastCheck',
+  )
+    .sort({ satLastCheck: 1 }) // los más antiguos primero
+    .limit(LOTE_MAX_TIMBRADOS)
+    .lean();
+
+  if (cfdis.length === 0) return; // nada que hacer, no loguear para no saturar
+
+  logger.info(`[VerifTimbrados] ${cfdis.length} CFDI(s) con ERP=Timbrado / SAT=Cancelado — consultando ERP...`);
+
+  let actualizados = 0, sinCambio = 0, noEncontrados = 0, errores = 0;
+
+  for (const cfdi of cfdis) {
+    if (!cfdi.uuid || !cfdi.fecha) {
+      await CFDI.updateOne({ _id: cfdi._id }, { $set: { satLastCheck: new Date() } });
+      continue;
+    }
+
+    try {
+      const { erpStatus: nuevoEstado, encontrado } = await fetchEstadoCfdi(cfdi.uuid, cfdi.fecha);
+
+      if (!encontrado) {
+        // No encontrado en ERP — puede haberse dado de baja; registrar sin cambio
+        await CFDI.updateOne({ _id: cfdi._id }, { $set: { satLastCheck: new Date() } });
+        noEncontrados++;
+      } else if (nuevoEstado && nuevoEstado !== 'Timbrado') {
+        // El ERP ya cambió su estado (ej: 'Cancelado', 'Cancelacion Pendiente')
+        await CFDI.updateMany(
+          { uuid: cfdi.uuid },
+          { $set: { erpStatus: nuevoEstado, satLastCheck: new Date() } },
+        );
+        logger.info(
+          `[VerifTimbrados] ${cfdi.uuid} — ERP actualizado: Timbrado → ${nuevoEstado}`,
+        );
+        actualizados++;
+      } else {
+        // ERP sigue reportando Timbrado — actualizar fecha de último chequeo
+        await CFDI.updateOne({ _id: cfdi._id }, { $set: { satLastCheck: new Date() } });
+        sinCambio++;
+      }
+
+      await new Promise(r => setTimeout(r, 300)); // respetar rate del ERP
+    } catch (err) {
+      errores++;
+      logger.warn(`[VerifTimbrados] Error consultando ERP para ${cfdi.uuid}: ${err.message}`);
+    }
+  }
+
+  if (actualizados > 0 || errores > 0) {
+    logger.info(
+      `[VerifTimbrados] Completado — actualizados: ${actualizados}, sin cambio: ${sinCambio}, ` +
+      `no encontrados: ${noEncontrados}, errores: ${errores}`,
+    );
+  }
+};
+
+// Job cada 5 minutos — detecta cancelaciones SAT que el ERP aún no ha procesado
+cron.schedule('*/5 * * * *', async () => {
+  try { await ejecutarVerificacionTimbradosSATCancelado(); }
+  catch (err) { logger.error(`[VerifTimbrados] Error fatal: ${err.message}`); }
+}, { timezone: 'America/Mexico_City' });
+
+/**
  * (Re)programa los cuatro jobs con los horarios indicados.
  * Llamado al arrancar la app y cuando el usuario cambia el horario via API.
  */

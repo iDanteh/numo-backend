@@ -21,26 +21,34 @@ const router = express.Router();
 
 /**
  * Aplica restricciones de visibilidad para usuarios sin acceso completo a movimientos.
- * Limita a depósitos no identificados; el comportamiento sobre los identificados
- * depende del `scope` declarado en rbac.js para el rol del usuario.
+ * Limita a depósitos; el comportamiento sobre los identificados depende del `scope`
+ * declarado en rbac.js para el rol del usuario.
+ *
+ * Statuses visibles sin filtro explícito (default): no_identificado + reclasificado.
+ * Statuses bloqueados para roles restringidos: 'otros'.
+ *
+ * NOTA DE ESCALA: al agregar un nuevo status, evalúa si debe aparecer en DEFAULT_STATUSES
+ * y si requiere un bloque explícito aquí (como 'otros' y 'identificado').
  *
  * @param {object} query               - query params originales
  * @param {string} userId              - auth0 sub del usuario
  * @param {object} [opts]
  * @param {string} [opts.scope]        - MOVEMENT_SCOPE.OWN | ALL (default: OWN)
- * @param {boolean} [opts.forExport]   - en export 'otros' → no_identificado en vez de vacío
+ * @param {boolean} [opts.forExport]   - en export 'otros' → cae en default en vez de vacío
  * @returns {{ query: object, empty: boolean }}
  */
+const RESTRICTED_DEFAULT_STATUSES = 'no_identificado,reclasificado';
+
 function applyMovementRestrictions(query, userId, { scope = MOVEMENT_SCOPE.OWN, forExport = false } = {}) {
   const q = { ...query };
   if (q.status === 'otros') {
     if (!forExport) return { query: q, empty: true };
-    q.status = undefined; // en export: quita el filtro de status → luego cae en el default
+    q.status = undefined; // en export: cae en el default a continuación
   }
   if (q.status === 'identificado' && scope === MOVEMENT_SCOPE.OWN) {
     q.identificadoPorUsuario = userId;
   }
-  if (!q.status) q.status = 'no_identificado';
+  if (!q.status) q.status = RESTRICTED_DEFAULT_STATUSES;
   q.tipo = 'deposito';
   return { query: q, empty: false };
 }
@@ -403,6 +411,19 @@ router.get('/autorizaciones/match-erp/job/:jobId',
     if (job.auth0Sub !== req.user._id) return res.status(403).json({ error: 'No autorizado' });
     const { auth0Sub: _, ...jobResponse } = job;
     res.json(jobResponse);
+  }),
+);
+
+// PATCH /api/banks/movements/reclasify — reclasificación manual masiva (admin y contabilidad)
+router.patch('/movements/reclasify',
+  authenticate,
+  permit('banks:config'),
+  asyncHandler(async (req, res) => {
+    const ids = req.body.ids;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'Se requiere un array de IDs en body.ids' });
+    }
+    res.json(await service.reclasifyMovements(ids));
   }),
 );
 

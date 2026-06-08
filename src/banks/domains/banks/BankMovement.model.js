@@ -30,7 +30,7 @@ const bankMovementSchema = new mongoose.Schema({
   // Estado de conciliación del movimiento
   status: {
     type:    String,
-    enum:    ['no_identificado', 'identificado', 'otros'],
+    enum:    ['no_identificado', 'identificado', 'otros', 'reclasificado'],
     default: 'no_identificado',
     index:   true,
   },

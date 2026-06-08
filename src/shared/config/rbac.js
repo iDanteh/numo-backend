@@ -132,6 +132,7 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_READ,
       PERMISSIONS.BANKS_UPDATE,        // puede cambiar estado de movimientos
       PERMISSIONS.BANKS_EXPORT,        // puede exportar Excel (con vista restringida)
+      PERMISSIONS.BANKS_FICHA,         // puede identificar movimientos a partir de una ficha
       PERMISSIONS.COLLECTIONS_READ,
       PERMISSIONS.COLLECTIONS_WRITE,
     ],

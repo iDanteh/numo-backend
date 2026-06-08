@@ -2,6 +2,8 @@
 
 const repo = require('./repositories/poliza.repository');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
+const { AccountPlan, PolizaMovimiento, Poliza } = require('../../../shared/models/postgres');
+const { Op } = require('sequelize');
 
 function userLabel(user) {
   return user?.nombre || user?.email || user?.nombre || String(user?.dbId ?? 'sistema');
@@ -192,4 +194,84 @@ async function generarXmlSat({ rfc, ejercicio, periodo, tipoSolicitud = 'AF', nu
   return `<?xml version="1.0" encoding="UTF-8"?>\n<BCE:Polizas ${attrs}>\n${polizasXml}\n</BCE:Polizas>`;
 }
 
-module.exports = { list, getById, create, update, cancel, contabilizar, revertir, generarXmlSat, reporteDescuadradas };
+/**
+ * Genera y contabiliza la póliza de cierre de IVA Trasladado para el período.
+ * Mueve el saldo acreedor neto de 2104010001 (IVA Trasladado) a 2106020001 (IVA Por Pagar).
+ */
+async function generarCierreIVA({ rfc, ejercicio, periodo, user }) {
+  if (!rfc)       throw new ValidationError('RFC requerido');
+  if (!ejercicio) throw new ValidationError('Ejercicio requerido');
+  if (!periodo)   throw new ValidationError('Periodo requerido');
+
+  const ej = Number(ejercicio);
+  const pe = Number(periodo);
+
+  // Verificar que no exista ya una póliza de cierre IVA para el período
+  const existente = await Poliza.findOne({
+    where: { rfc, ejercicio: ej, periodo: pe, tipo: 'D', concepto: { [Op.like]: '%Cierre IVA%' } },
+  });
+  if (existente) {
+    throw new ValidationError(`Ya existe una póliza de cierre IVA para este período (ID: ${existente.id}). Reviértela antes de generar una nueva.`);
+  }
+
+  // Cuentas contables requeridas
+  const [ctaIVA, ctaPagar] = await Promise.all([
+    AccountPlan.findOne({ where: { codigo: '2104010001' }, attributes: ['id'], raw: true }),
+    AccountPlan.findOne({ where: { codigo: '2106020001' }, attributes: ['id'], raw: true }),
+  ]);
+  if (!ctaIVA)    throw new ValidationError('Cuenta 2104010001 (IVA Trasladado) no encontrada en el catálogo');
+  if (!ctaPagar)  throw new ValidationError('Cuenta 2106020001 (IVA Por Pagar) no encontrada en el catálogo');
+
+  // Sumar movimientos de IVA Trasladado de todas las pólizas contabilizadas del período
+  const polizasPeriodo = await Poliza.findAll({
+    where: { rfc, ejercicio: ej, periodo: pe, estado: 'contabilizada' },
+    attributes: ['id'],
+    raw: true,
+  });
+  if (!polizasPeriodo.length) {
+    throw new ValidationError('No hay pólizas contabilizadas en el período — contabiliza primero los asientos del período');
+  }
+
+  const ids = polizasPeriodo.map(p => p.id);
+  const movs = await PolizaMovimiento.findAll({
+    where:      { polizaId: { [Op.in]: ids }, cuentaId: ctaIVA.id },
+    attributes: ['debe', 'haber'],
+    raw:        true,
+  });
+
+  const totalDebe  = Math.round(movs.reduce((s, m) => s + Number(m.debe  || 0), 0) * 100) / 100;
+  const totalHaber = Math.round(movs.reduce((s, m) => s + Number(m.haber || 0), 0) * 100) / 100;
+  const netIVA     = Math.round((totalHaber - totalDebe) * 100) / 100;
+
+  if (netIVA <= 0.01) {
+    throw new ValidationError(
+      `IVA Trasladado neto = ${netIVA.toFixed(2)} — saldo cero o deudor, no hay cierre que generar. ` +
+      `(Debe: ${totalDebe.toFixed(2)}, Haber: ${totalHaber.toFixed(2)})`
+    );
+  }
+
+  // Último día del período como fecha de la póliza
+  const lastDay = new Date(ej, pe, 0).toISOString().slice(0, 10);
+  const mesStr  = String(pe).padStart(2, '0');
+
+  const poliza = await create({
+    tipo:      'D',
+    fecha:     lastDay,
+    concepto:  `Cierre IVA Trasladado ${ej}-${mesStr}`,
+    ejercicio: ej,
+    periodo:   pe,
+    rfc,
+    movimientos: [
+      { orden: 1, cuentaId: ctaIVA.id,   concepto: `Cierre IVA Trasladado ${ej}-${mesStr}`, debe: netIVA,  haber: 0       },
+      { orden: 2, cuentaId: ctaPagar.id, concepto: `IVA Por Pagar ${ej}-${mesStr}`,         debe: 0,       haber: netIVA  },
+    ],
+  }, user);
+
+  // Contabilizar automáticamente
+  await contabilizar(poliza.id, user);
+  const polizaFinal = await repo.findById(poliza.id);
+
+  return { poliza: polizaFinal, netIVA, totalDebe, totalHaber };
+}
+
+module.exports = { list, getById, create, update, cancel, contabilizar, revertir, generarXmlSat, reporteDescuadradas, generarCierreIVA };

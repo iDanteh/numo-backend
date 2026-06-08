@@ -138,6 +138,16 @@ const CfdiMappingRule = sequelize.define('CfdiMappingRule', {
     allowNull: true,
     comment:   'Cuenta secundaria para porción tasa 0% en reglas mixtas (I→HABER Ingresos0%; E→DEBE Devoluciones0%)',
   },
+  cuentaIvaAbono: {
+    type:      DataTypes.STRING(20),
+    allowNull: true,
+    comment:   'Cuenta IVA del lado HABER para NCs con monedero/anticipos (ej. 2104010002 IVA Trasladado Anticipos). Cuando está presente, el HABER de cuentaAbono usa solo subTotal y este campo recibe el IVA separado.',
+  },
+  cuentaCargoMixto0: {
+    type:      DataTypes.STRING(20),
+    allowNull: true,
+    comment:   'Cuenta CxC tasa 0% en facturas mixtas tipo I PPD (ej. 1103010002 Clientes 0%). Cuando está presente, el cargo principal (cuentaCargo) recibe solo la porción 16%+IVA y este campo recibe el subTotal0% por separado.',
+  },
   cuentaDescuento: {
     type:      DataTypes.STRING(20),
     allowNull: true,

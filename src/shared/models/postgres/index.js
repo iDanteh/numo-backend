@@ -143,6 +143,30 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS rfc_receptor     VARCHAR(13)
   `).catch(e => console.warn('[syncModels] ADD COLUMN SAT fields:', e.message));
 
+<<<<<<< Updated upstream
+=======
+  // Clasificación de negocio en movimientos y reglas de mapeo
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (movimientos):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (reglas):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_iva_abono VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_iva_abono (reglas):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_cargo_mixto0 VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_cargo_mixto0 (reglas):', e.message));
+
+>>>>>>> Stashed changes
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

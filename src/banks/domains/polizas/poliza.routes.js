@@ -96,6 +96,16 @@ router.post('/:id/cancelar',
   }),
 );
 
+// POST /api/polizas/cierre-iva?rfc=&ejercicio=&periodo=
+router.post('/cierre-iva',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, ejercicio, periodo } = req.query;
+    res.status(201).json(await service.generarCierreIVA({ rfc, ejercicio, periodo, user: req.user }));
+  }),
+);
+
 // POST /api/polizas/:id/revertir  (solo admin)
 router.post('/:id/revertir',
   authenticate,

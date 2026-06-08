@@ -414,10 +414,10 @@ router.get('/autorizaciones/match-erp/job/:jobId',
   }),
 );
 
-// PATCH /api/banks/movements/reclasify — reclasificación manual masiva, solo admin
+// PATCH /api/banks/movements/reclasify — reclasificación manual masiva (admin y contabilidad)
 router.patch('/movements/reclasify',
   authenticate,
-  permit('banks:admin'),
+  permit('banks:config'),
   asyncHandler(async (req, res) => {
     const ids = req.body.ids;
     if (!Array.isArray(ids) || ids.length === 0) {

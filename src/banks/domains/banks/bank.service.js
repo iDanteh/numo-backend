@@ -19,7 +19,7 @@ const BANCOS_VALIDOS = [
   'BanBajío', 'Afirme', 'Intercam', 'Nu',
   'Spin', 'Hey Banco', 'Albo',
 ];
-const STATUS_VALIDOS = ['no_identificado', 'identificado', 'otros'];
+const STATUS_VALIDOS = ['no_identificado', 'identificado', 'otros', 'reclasificado'];
 
 const BANK_PREFIX = {
   bbva:       'BBVA',
@@ -239,7 +239,10 @@ async function listMovements(filters) {
 
   const filter = { isActive: true, oculto: { $ne: true } };
   if (banco)  filter.banco  = banco;
-  if (status) filter.status = status;
+  if (status) {
+    const statusVals = status.split(',').map(v => v.trim()).filter(Boolean);
+    filter.status = statusVals.length === 1 ? statusVals[0] : { $in: statusVals };
+  }
   // Filtro por ID: acepta un ID exacto (OCR) o varios separados por coma (duplicados).
   // Cuando se pasan múltiples IDs se omiten los demás filtros de fecha/concepto/etc.
   if (movId) {
@@ -1673,6 +1676,15 @@ async function deleteMovements(ids) {
   return { deleted: result.deletedCount };
 }
 
+async function reclasifyMovements(ids) {
+  if (!Array.isArray(ids) || ids.length === 0) throw new BadRequestError('Se requiere al menos un ID');
+  const result = await BankMovement.updateMany(
+    { _id: { $in: ids } },
+    { $set: { status: 'reclasificado' } }
+  );
+  return { reclasified: result.modifiedCount };
+}
+
 async function setFicha(id, ficha, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
@@ -2410,7 +2422,7 @@ module.exports = {
   getCards, listMovements, getSummary,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
-  exportMovements, deleteMovements, updateMovement, generateTemplate,
+  exportMovements, deleteMovements, reclasifyMovements, updateMovement, generateTemplate,
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,

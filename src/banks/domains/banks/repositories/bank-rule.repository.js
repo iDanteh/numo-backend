@@ -51,6 +51,7 @@ async function create(banco, data) {
     logica:         data.logica         || 'Y',
     accion:         data.accion         || 'categorizar',
     mensajeBloqueo: data.mensajeBloqueo ? String(data.mensajeBloqueo).trim() : null,
+    estadoDestino:  data.estadoDestino  || null,
     orden:          Number(data.orden)  || 0,
   });
 }
@@ -70,6 +71,9 @@ async function update(id, data) {
     mensajeBloqueo: data.mensajeBloqueo !== undefined
       ? (data.mensajeBloqueo ? String(data.mensajeBloqueo).trim() : null)
       : rule.mensajeBloqueo,
+    estadoDestino:  data.estadoDestino !== undefined
+      ? (data.estadoDestino || null)
+      : rule.estadoDestino,
     ...(data.orden !== undefined && { orden: Number(data.orden) }),
   });
   return rule;

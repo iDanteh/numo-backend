@@ -3164,3 +3164,40 @@ const reglas = [
   },
 
 ];
+
+// ── Runner ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const force = process.argv.includes('--force');
+
+  await sequelize.authenticate();
+  await CfdiMappingRule.sync({ force: false });
+
+  let creadas = 0, omitidas = 0, actualizadas = 0;
+
+  for (const datos of reglas) {
+    const [regla, created] = await CfdiMappingRule.findOrCreate({
+      where:    { nombre: datos.nombre },
+      defaults: datos,
+    });
+
+    if (created) {
+      creadas++;
+    } else if (force) {
+      await regla.update(datos);
+      actualizadas++;
+    } else {
+      omitidas++;
+    }
+  }
+
+  console.log(`\nCfdi mapping rules:`);
+  console.log(`  Creadas:      ${creadas}`);
+  console.log(`  Actualizadas: ${actualizadas} (--force)`);
+  console.log(`  Omitidas:     ${omitidas} (ya existían)`);
+  console.log(`  Total:        ${reglas.length} reglas\n`);
+
+  await sequelize.close();
+}
+
+main().catch(err => { console.error(err); process.exit(1); });

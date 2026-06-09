@@ -1059,12 +1059,13 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     let sinReglasAviso = false;
 
     if (insertados > 0 && bancoValidado) {
-      const [catRules, ocultarRules] = await Promise.all([
+      const [catRules, ocultarRules, cambiarEstadoRules] = await Promise.all([
         bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
         bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+        bankRuleRepo.listByBanco(bancoValidado, { accion: 'cambiar_estado' }),
       ]);
 
-      if (catRules.length === 0 && ocultarRules.length === 0) {
+      if (catRules.length === 0 && ocultarRules.length === 0 && cambiarEstadoRules.length === 0) {
         sinReglasAviso = true;
       } else {
         const foliosNuevos   = nuevos.map(m => m.folio);
@@ -1081,6 +1082,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
           if ($set.categoria) categorizados++;
           for (const rule of ocultarRules) {
             if (matchRegla(mov, rule)) { $set.oculto = true; break; }
+          }
+          for (const rule of cambiarEstadoRules) {
+            if (matchRegla(mov, rule)) { $set.status = rule.estadoDestino; break; }
           }
           if (Object.keys($set).length > 0) {
             ops.push({ updateOne: { filter: { _id: mov._id }, update: { $set } } });
@@ -1169,9 +1173,10 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
   let categorizado = false;
 
   if (bancoValidado) {
-    const [catRules, ocultarRules] = await Promise.all([
+    const [catRules, ocultarRules, cambiarEstadoRules] = await Promise.all([
       bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
       bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+      bankRuleRepo.listByBanco(bancoValidado, { accion: 'cambiar_estado' }),
     ]);
 
     for (const rule of catRules) {
@@ -1184,7 +1189,11 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
     for (const rule of ocultarRules) {
       if (matchRegla(nuevo, rule)) { nuevo.oculto = true; break; }
     }
-    if (categorizado || nuevo.oculto) await nuevo.save();
+    let estadoCambiado = false;
+    for (const rule of cambiarEstadoRules) {
+      if (matchRegla(nuevo, rule)) { nuevo.status = rule.estadoDestino; estadoCambiado = true; break; }
+    }
+    if (categorizado || nuevo.oculto || estadoCambiado) await nuevo.save();
   }
 
   // ── 7. Emitir evento ───────────────────────────────────────────────

@@ -15,7 +15,8 @@ const OPERADORES_VALIDOS = [
   'mayor_que', 'menor_que', 'mayor_igual', 'menor_igual',
 ];
 const OPERADORES_NUMERICOS = ['mayor_que', 'menor_que', 'mayor_igual', 'menor_igual'];
-const ACCIONES_VALIDAS     = ['categorizar', 'bloquear_identificacion', 'ocultar'];
+const ACCIONES_VALIDAS       = ['categorizar', 'bloquear_identificacion', 'ocultar', 'cambiar_estado'];
+const ESTADOS_DESTINO_VALIDOS = ['no_identificado', 'otros'];
 
 // ── Validación ────────────────────────────────────────────────────────────────
 
@@ -50,6 +51,12 @@ function validarRegla(data) {
   if (data.accion === 'bloquear_identificacion' && data.mensajeBloqueo) {
     if (String(data.mensajeBloqueo).trim().length > 500) {
       throw new BadRequestError('mensajeBloqueo no puede superar 500 caracteres');
+    }
+  }
+  // estadoDestino es obligatorio y debe ser un valor válido cuando la acción es cambiar_estado
+  if (data.accion === 'cambiar_estado') {
+    if (!data.estadoDestino || !ESTADOS_DESTINO_VALIDOS.includes(data.estadoDestino)) {
+      throw new BadRequestError(`estadoDestino debe ser: ${ESTADOS_DESTINO_VALIDOS.join(', ')}`);
     }
   }
 }
@@ -153,9 +160,10 @@ async function reorderRules(ids) {
  * 'categorizar' y 'ocultar'. Las reglas de bloqueo aplican al identificar.
  */
 async function applyRules(banco, soloSinCategoria = false) {
-  const [catRules, ocultarRules] = await Promise.all([
+  const [catRules, ocultarRules, cambiarEstadoRules] = await Promise.all([
     bankRuleRepo.listByBanco(banco, { accion: 'categorizar' }),
     bankRuleRepo.listByBanco(banco, { accion: 'ocultar' }),
+    bankRuleRepo.listByBanco(banco, { accion: 'cambiar_estado' }),
   ]);
 
   const matchFilter = { banco, isActive: true };
@@ -184,17 +192,24 @@ async function applyRules(banco, soloSinCategoria = false) {
       for (const rule of ocultarRules) {
         if (matchRegla(mov, rule)) { shouldOcultar = true; break; }
       }
+      // Cambiar estado: primera regla que aplica gana; no revierte si no hay match
+      let matchedEstado = null;
+      for (const rule of cambiarEstadoRules) {
+        if (matchRegla(mov, rule)) { matchedEstado = rule.estadoDestino; break; }
+      }
 
       const newCat      = matchedCat ?? null;
       const oldCat      = mov.categoria ?? null;
       const oldOculto   = mov.oculto    ?? false;
       const catChanged    = newCat !== oldCat;
       const ocultoChanged = shouldOcultar !== oldOculto;
+      const statusChanged = matchedEstado !== null && matchedEstado !== mov.status;
 
-      if (catChanged || ocultoChanged) {
+      if (catChanged || ocultoChanged || statusChanged) {
         const $set = {};
         if (catChanged)    $set.categoria = newCat;
         if (ocultoChanged) $set.oculto    = shouldOcultar;
+        if (statusChanged) $set.status    = matchedEstado;
         ops.push({
           updateOne: {
             filter: { _id: mov._id },

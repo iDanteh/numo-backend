@@ -164,6 +164,10 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS cuenta_cargo_mixto0 VARCHAR(20)
   `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_cargo_mixto0 (reglas):', e.message));
 
+  await BankRule.sequelize.query(`
+    ALTER TABLE bank_rules ADD COLUMN IF NOT EXISTS estado_destino VARCHAR(30)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN estado_destino (bank_rules):', e.message));
+
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

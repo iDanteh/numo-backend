@@ -93,6 +93,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       r.cuentaIva,          r.cuentaIvaPPD,       r.cuentaIvaRetenido,
       r.cuentaIsrRetenido,  r.cuentaIvaAnticipo,  r.cuentaDeltaAnticipo,
       r.cuentaCargo2,       r.cuentaDescuento,    r.cuentaDescuento0,
+      r.cuentaCargoMixto0,  r.cuentaIvaAbono,
     ].filter(Boolean)),
   )];
 
@@ -149,6 +150,9 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
           !c.metodoPago ||
           !c.conceptos?.length ||
           c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
+          // Tipo I PPD: cargar ERP para detectar si fue cobrado de contado (ERP=PUE).
+          // Corrige $54.95 de diferencia en 1103010001 vs CONTPAQI.
+          (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
           (
             ['E', 'P'].includes(c.tipoDeComprobante) &&
             c.cfdiRelacionados?.length > 0 &&
@@ -178,10 +182,16 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       const relERP    = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
       const relEnriq  = relERP.length ? [...relSAT, ...relERP] : relSAT;
 
+      // Si SAT dice PPD pero ERP dice PUE → cobro inmediato, usar PUE.
+      // Esto evita generar un cargo a Clientes cuando CONTPAQI lo registró en Bancos.
+      const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
+        ? 'PUE'
+        : (cfdi.metodoPago || erp.metodoPago);
+
       return {
         ...cfdi,
         formaPago:        cfdi.formaPago  || erp.formaPago,
-        metodoPago:       cfdi.metodoPago || erp.metodoPago,
+        metodoPago:       metodoPagoFinal,
         conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
         impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
         tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,

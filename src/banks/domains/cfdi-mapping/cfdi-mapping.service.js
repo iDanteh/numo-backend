@@ -500,11 +500,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const cuentaIvaAplicable = (esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva;
     if (cuentaIvaAplicable) {
       const ivaEsHaber = esIngreso || esIvaHaber;
-      // Derivar IVA de total−subtotal (ambos valores SAT con 2 decimales) para evitar
-      // artefactos IEEE-754 del totalImpuestosTrasladados crudo almacenado en MongoDB.
-      // Solo aplica cuando no hay retenciones; si las hay, se usa el campo crudo.
+      // Derivar IVA de montos SAT (2 decimales) para evitar artefactos IEEE-754.
+      // Formula SAT: total = subtotal − descuento + IVA → IVA = total − subtotal + descuento.
+      // Se suma descuento solo cuando la regla genera movimiento separado (tieneDescuento=true);
+      // si no hay movimiento de descuento, el término es 0 y la fórmula no cambia.
+      const _descuentoEnIva = (rule.tieneDescuento && !esPago) ? Number(cfdi.descuento || 0) : 0;
       const ivaR = (ivaRet === 0 && isrRet === 0)
-        ? parseFloat((total - subtotal).toFixed(2))
+        ? parseFloat((total - subtotal + _descuentoEnIva).toFixed(2))
         : iva;
       movs.push({
         cuentaId:    cuentaMap[cuentaIvaAplicable] ?? null,
@@ -641,8 +643,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // Split IVA abono: cuentaAbono recibe solo subtotal, cuentaIvaAbono recibe IVA
     montoAbono = subtotal;
   } else if (esIngreso) {
-    // El movimiento de IVA usa ivaR = total−subtotal (ambos SAT 2-decimales), por lo que
-    // el complemento exacto es subtotal. Garantiza DEBE = HABER sin depender de rounding JS/DB.
+    // IVA = total − subtotal + descuento (cuando tieneDescuento), por lo que el complemento
+    // exacto de HABER es subtotal (importe bruto pre-descuento del CFDI). D=H garantizado.
     // Para CFDIs con retenciones se usa total−iva (rama else de ivaR arriba) — caso separado.
     montoAbono = (ivaRet === 0 && isrRet === 0) || esMetadataConDescuento
       ? subtotal
@@ -762,7 +764,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // HABER cuentaIvaAbono = IVA (ej. 2104010002 IVA Trasladado Anticipos para Club Tuberos)
   // Esto espeja el patrón CONTPAQI: HABER Monedero=subtotal + HABER IVAAnticipo=IVA
   if (tieneIvaAbonoSplit && rule.cuentaIvaAbono) {
-    const ivaR = parseFloat((total - subtotal).toFixed(2));
+    const _desc2 = rule.tieneDescuento ? Number(cfdi.descuento || 0) : 0;
+    const ivaR = parseFloat((total - subtotal + _desc2).toFixed(2));
     if (ivaR > 0) {
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaIvaAbono] ?? null,

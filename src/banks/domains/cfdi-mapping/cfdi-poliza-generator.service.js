@@ -149,32 +149,47 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       : cfdi;
   });
 
-  // Enriquecer CFDIs SAT sin formaPago/metodoPago o sin conceptos con datos del homólogo ERP.
-  // Los descargados como Metadata del SAT no traen estos campos ni el desglose de conceptos.
-  // Al inyectar los conceptos del ERP, _detectTasaIva y _calcCfdiMontos usan TasaOCuota real
-  // en lugar de estimarla desde totalImpuestosTrasladados.
-  const uuidsSinMeta = cfdisSinPolizaEnriquecidos
-    .filter(c => !c.formaPago || !c.metodoPago || !c.conceptos?.length)
-    .map(c => c.uuid);
+  // Enriquecer CFDIs SAT con datos del homólogo ERP — misma lógica que balanza-preliminar.
+  // Criterios idénticos a generarBalanzaPreliminar para garantizar que el matching de reglas
+  // produzca los mismos movimientos que la balanza de comprobación.
+  const uuidsSinMeta = new Set(
+    cfdisSinPolizaEnriquecidos
+      .filter(c => c.uuid && (
+        !c.formaPago ||
+        !c.metodoPago ||
+        !c.conceptos?.length ||
+        c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
+        (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
+         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      ))
+      .map(c => c.uuid),
+  );
   let erpMetaMap = {};
-  if (uuidsSinMeta.length) {
+  if (uuidsSinMeta.size) {
     const erpCfdis = await CFDI.find({
-      uuid:   { $in: uuidsSinMeta },
+      uuid:   { $in: [...uuidsSinMeta] },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinal = cfdisSinPolizaEnriquecidos.map(cfdi => {
     const erp = erpMetaMap[cfdi.uuid];
     if (!erp) return cfdi;
     const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const relSAT   = cfdi.cfdiRelacionados ?? [];
+    const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
+    const relERP   = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
+    const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
+      ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     return {
       ...cfdi,
-      formaPago:  cfdi.formaPago  || erp.formaPago,
-      metodoPago: cfdi.metodoPago || erp.metodoPago,
-      conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-      impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
-      tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
+      formaPago:        cfdi.formaPago  || erp.formaPago,
+      metodoPago:       metodoPagoFinal,
+      conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
+      cfdiRelacionados: relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
   });
 
@@ -406,29 +421,45 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       : cfdi;
   });
 
-  // Enriquecer CFDIs SAT sin formaPago/metodoPago o sin conceptos con datos del homólogo ERP.
-  const uuidsSinMetaGuard = cfdisSinPolizaEnriquecidosGuard
-    .filter(c => !c.formaPago || !c.metodoPago || !c.conceptos?.length)
-    .map(c => c.uuid);
+  // Enriquecer CFDIs SAT con datos del homólogo ERP — misma lógica que balanza-preliminar.
+  const uuidsSinMetaGuard = new Set(
+    cfdisSinPolizaEnriquecidosGuard
+      .filter(c => c.uuid && (
+        !c.formaPago ||
+        !c.metodoPago ||
+        !c.conceptos?.length ||
+        c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
+        (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
+         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      ))
+      .map(c => c.uuid),
+  );
   let erpMetaMapGuard = {};
-  if (uuidsSinMetaGuard.length) {
+  if (uuidsSinMetaGuard.size) {
     const erpCfdisGuard = await CFDI.find({
-      uuid:   { $in: uuidsSinMetaGuard },
+      uuid:   { $in: [...uuidsSinMetaGuard] },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
     erpMetaMapGuard = Object.fromEntries(erpCfdisGuard.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinalGuard = cfdisSinPolizaEnriquecidosGuard.map(cfdi => {
     const erp = erpMetaMapGuard[cfdi.uuid];
     if (!erp) return cfdi;
     const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const relSAT   = cfdi.cfdiRelacionados ?? [];
+    const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
+    const relERP   = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
+    const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
+      ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     return {
       ...cfdi,
-      formaPago:  cfdi.formaPago  || erp.formaPago,
-      metodoPago: cfdi.metodoPago || erp.metodoPago,
-      conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-      impuestos:  satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
-      tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
+      formaPago:        cfdi.formaPago  || erp.formaPago,
+      metodoPago:       metodoPagoFinal,
+      conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
+      tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
+      cfdiRelacionados: relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
   });
 

@@ -1,6 +1,14 @@
 const mongoose = require('mongoose');
 
 // Sub-schema para Documentos Relacionados del Complemento de Pago
+const trasladoDRSchema = new mongoose.Schema({
+  impuesto:   { type: String },
+  tipoFactor: { type: String },
+  tasaOCuota: { type: Number },
+  base:       { type: Number },
+  importe:    { type: Number },
+}, { _id: false });
+
 const doctoRelacionadoSchema = new mongoose.Schema({
   idDocumento:      { type: String },
   serie:            { type: String },
@@ -12,6 +20,7 @@ const doctoRelacionadoSchema = new mongoose.Schema({
   impSaldoAnt:      { type: Number },
   impPagado:        { type: Number },
   impSaldoInsoluto: { type: Number },
+  trasladosDR:      { type: [trasladoDRSchema], default: undefined },
 }, { _id: false });
 
 // Sub-schema para cada Pago dentro del Complemento
@@ -251,6 +260,11 @@ const cfdiSchema = new mongoose.Schema({
   uuidGenerado: { type: Boolean, default: false },   // true = UUID sintético (ERP no lo envió)
   tieneErrores: { type: Boolean, default: false },   // true = al menos un campo vino inválido
   errores:      [{ type: String }],                  // lista de mensajes descriptivos
+
+  // Tasa IVA inferida para tipo P sin <Totales> (CP 1.0 sin xmlContent).
+  // Poblada por migrate-cp10-traslados-dr.js buscando las facturas relacionadas.
+  // Valores: '16' | '0' | 'mixto' | null
+  tasaIvaInferida: { type: String, default: null },
 
   // Periodo fiscal al que pertenece este CFDI (asignado al subir)
   ejercicio: { type: Number, index: true },

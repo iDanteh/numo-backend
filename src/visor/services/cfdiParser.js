@@ -180,6 +180,29 @@ const getComplementoPago = (comprobante) => {
         .filter(Boolean)
         .map((dr) => {
           const d = dr['$'] ? { ...dr['$'], ...dr } : dr;
+
+          // ImpuestosDR / TrasladosDR — presente en CP 1.0 (CFDI 3.3) por docto relacionado
+          const impDRNode = d['pago20:ImpuestosDR'] || d['pago10:ImpuestosDR'] || d['ImpuestosDR'] || null;
+          let trasladosDR;
+          if (impDRNode) {
+            const tDRNode = impDRNode['pago20:TrasladosDR'] || impDRNode['pago10:TrasladosDR'] || impDRNode['TrasladosDR'];
+            if (tDRNode) {
+              const tDRRaw  = tDRNode['pago20:TrasladoDR'] || tDRNode['pago10:TrasladoDR'] || tDRNode['TrasladoDR'] || [];
+              const tDRList = Array.isArray(tDRRaw) ? tDRRaw : [tDRRaw];
+              const parsed  = tDRList.filter(Boolean).map((t) => {
+                const ta = t['$'] ? { ...t['$'], ...t } : t;
+                return {
+                  impuesto:   ta.ImpuestoDR   || undefined,
+                  tipoFactor: ta.TipoFactorDR || undefined,
+                  tasaOCuota: parseFloat(ta.TasaOCuotaDR) || undefined,
+                  base:       parseFloat(ta.BaseDR)       || undefined,
+                  importe:    parseFloat(ta.ImporteDR)    || undefined,
+                };
+              });
+              if (parsed.length) trasladosDR = parsed;
+            }
+          }
+
           return {
             idDocumento:      d.IdDocumento      || undefined,
             serie:            d.Serie            || undefined,
@@ -191,6 +214,7 @@ const getComplementoPago = (comprobante) => {
             impSaldoAnt:      parseFloat(d.ImpSaldoAnt)      || undefined,
             impPagado:        parseFloat(d.ImpPagado)        || undefined,
             impSaldoInsoluto: parseFloat(d.ImpSaldoInsoluto) || undefined,
+            trasladosDR,
           };
         });
 

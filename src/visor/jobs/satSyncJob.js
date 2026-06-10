@@ -273,7 +273,17 @@ const reintentarIncompletos = async () => {
 
     // Máximo 3 reintentos para no desperdiciar solicitudes SAT en días sin CFDIs
     if (reintentos >= 3) {
-      logger.warn(`[SatSyncJob] reintentarIncompletos: RFC ${rfc} ${tipoComprobante} ${fecha} ya tiene ${reintentos} reintentos — se omite.`);
+      if (!cp.alertaPendiente) {
+        await SatJobCheckpoint.updateOne(
+          { _id: cp._id },
+          { $set: { alertaPendiente: true, updatedAt: new Date() } },
+        ).catch(() => {});
+      }
+      logger.error(
+        `[SatSyncJob] ⛔ ALERTA: RFC ${rfc} | ${tipoComprobante} | ${fecha} ` +
+        `agotó ${reintentos} reintentos sin éxito — CFDIs potencialmente perdidos. ` +
+        `Acción requerida: DELETE /api/sat/checkpoint/${rfc}?fecha=${fecha}&tipo=${tipoComprobante}`
+      );
       continue;
     }
 

@@ -674,8 +674,10 @@ const downloadByUUID = asyncHandler(async (req, res) => {
 const getCheckpointsSalud = asyncHandler(async (req, res) => {
   const SatJobCheckpoint = require('../models/SatJobCheckpoint');
 
-  const rfcFiltro = req.query.rfc ? req.query.rfc.toUpperCase().trim() : null;
-  const dias      = Math.min(parseInt(req.query.dias || '45', 10), 365);
+  const rfcFiltro  = req.query.rfc ? req.query.rfc.toUpperCase().trim() : null;
+  const dias       = Math.min(parseInt(req.query.dias   || '45', 10), 365);
+  const pagina     = Math.max(1,   parseInt(req.query.pagina || '1',  10));
+  const PAGE_SIZE  = 5;
 
   // Calcular fecha mínima en CDMX
   const fmtMX   = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
@@ -688,7 +690,7 @@ const getCheckpointsSalud = asyncHandler(async (req, res) => {
   if (rfcFiltro) filtroBase.rfc = rfcFiltro;
 
   const checkpoints = await SatJobCheckpoint.find(filtroBase)
-    .select('rfc fecha fechaFin tipoComprobante status error cfdisDescargados totalReportadoSAT reintentos updatedAt startedAt')
+    .select('rfc fecha fechaFin tipoComprobante status error cfdisDescargados totalReportadoSAT reintentos alertaPendiente updatedAt startedAt')
     .sort({ fecha: -1 })
     .lean();
 
@@ -703,10 +705,11 @@ const getCheckpointsSalud = asyncHandler(async (req, res) => {
     return 'otro';
   };
 
-  const resumen    = { total: 0, completados: 0, incompletos: 0, errores: 0, enProceso: 0 };
+  const resumen    = { total: 0, completados: 0, incompletos: 0, errores: 0, enProceso: 0, alertas: 0 };
   const incompletos   = [];
   const erroresPorCodigo = {};
   const enProceso     = [];
+  const alertas       = [];
 
   for (const cp of checkpoints) {
     resumen.total++;
@@ -743,8 +746,22 @@ const getCheckpointsSalud = asyncHandler(async (req, res) => {
           tipoComprobante: cp.tipoComprobante,
           error:           cp.error,
           reintentos:      cp.reintentos,
+          alertaPendiente: cp.alertaPendiente ?? false,
           updatedAt:       cp.updatedAt,
         });
+        if (cp.alertaPendiente) {
+          resumen.alertas++;
+          alertas.push({
+            rfc:             cp.rfc,
+            fecha:           cp.fecha,
+            fechaFin:        cp.fechaFin,
+            tipoComprobante: cp.tipoComprobante,
+            reintentos:      cp.reintentos,
+            error:           cp.error,
+            updatedAt:       cp.updatedAt,
+            accion:          `DELETE /api/sat/checkpoint/${cp.rfc}?fecha=${cp.fecha}&tipo=${cp.tipoComprobante}`,
+          });
+        }
         break;
       }
       case 'solicitando':
@@ -769,13 +786,28 @@ const getCheckpointsSalud = asyncHandler(async (req, res) => {
     cuotaDia[rfc] = await getEstado(rfc);
   }));
 
+  // Paginar cada grupo de errores: mostrar PAGE_SIZE por página (más recientes primero)
+  const erroresPaginados = {};
+  for (const [codigo, items] of Object.entries(erroresPorCodigo)) {
+    const total       = items.length;
+    const totalPaginas = Math.ceil(total / PAGE_SIZE);
+    const paginaActual = Math.min(pagina, Math.max(1, totalPaginas));
+    erroresPaginados[codigo] = {
+      items:       items.slice((paginaActual - 1) * PAGE_SIZE, paginaActual * PAGE_SIZE),
+      total,
+      pagina:      paginaActual,
+      totalPaginas,
+    };
+  }
+
   res.json({
     resumen,
+    alertas,
     incompletos,
-    erroresPorCodigo,
+    erroresPorCodigo: erroresPaginados,
     enProceso,
     cuotaDia,
-    meta: { desde: desdeStr, hasta: hoyMX, dias },
+    meta: { desde: desdeStr, hasta: hoyMX, dias, pagina, pageSize: PAGE_SIZE },
   });
 });
 
@@ -786,12 +818,24 @@ const resetCheckpoint = asyncHandler(async (req, res) => {
 
   if (!rfc) return res.status(400).json({ error: 'RFC requerido' });
 
-  const filtro = { rfc, status: { $in: ['solicitando', 'verificando', 'descargando'] } };
+  // Con fecha+tipo explícitos también se permite resetear checkpoints en error/alerta
+  // para que el usuario pueda disparar una nueva descarga manual.
+  const statusPermitidos = (fecha && tipo)
+    ? ['solicitando', 'verificando', 'descargando', 'error', 'incompleto']
+    : ['solicitando', 'verificando', 'descargando'];
+
+  const filtro = { rfc, status: { $in: statusPermitidos } };
   if (fecha) filtro.fecha           = fecha;
   if (tipo)  filtro.tipoComprobante = tipo;
 
   const result = await SatJobCheckpoint.updateMany(filtro, {
-    $set: { status: 'error', error: 'Reseteado manualmente por el administrador', updatedAt: new Date() },
+    $set: {
+      status:          'error',
+      error:           'Reseteado manualmente por el administrador',
+      alertaPendiente: false,
+      reintentos:      0,
+      updatedAt:       new Date(),
+    },
   });
 
   res.json({

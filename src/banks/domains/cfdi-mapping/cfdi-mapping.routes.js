@@ -93,6 +93,27 @@ router.get('/balanza-preliminar',
   }),
 );
 
+// GET /api/cfdi-mapping/balanza-cuenta-cfdis
+// Drill-down: devuelve los CFDIs que generan movimientos en una cuenta específica.
+// Query: mismos params que /balanza-preliminar + cuentaCodigo (requerido)
+router.get('/balanza-cuenta-cfdis',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, ejercicio, periodo, tipoCfdi, cuentaCodigo,
+            excluirPagosSustitutos, excluirAplicacionesAnticipos, excluirReclasificaciones,
+            incluirFechaCruzada, excluirMesesPosteriores } = req.query;
+    res.json(await balanza.generarDetalleCuenta({
+      rfc, ejercicio, periodo, tipoCfdi, cuentaCodigo,
+      excluirPagosSustitutos:       excluirPagosSustitutos      === 'true',
+      excluirAplicacionesAnticipos: excluirAplicacionesAnticipos === 'true',
+      excluirReclasificaciones:     excluirReclasificaciones     === 'true',
+      incluirFechaCruzada:          incluirFechaCruzada          === 'true',
+      excluirMesesPosteriores:      excluirMesesPosteriores      === 'true',
+    }));
+  }),
+);
+
 // GET /api/cfdi-mapping/reporte-sustitutos
 // Devuelve los CFDIs tipo I/E con tipoRelacion='04' (sustitutos) del periodo.
 // Úsalo para identificar cuáles no están capturados en CONTPAQi.

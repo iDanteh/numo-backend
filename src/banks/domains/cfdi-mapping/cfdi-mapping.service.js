@@ -147,9 +147,24 @@ function _detectTasaIva(cfdi) {
       const montoTotal = Number(totales.montoTotalPagos || 0);
       if (montoTotal > 0) return '0';
     } else {
-      // CP 1.0 (CFDI 3.3) o Metadata: sin desglose de IVA por tasa.
-      // No se puede determinar si el pago es para facturas 16% o 0% → null
-      // para que el matching use la regla genérica de tipo P (tasaIva=null).
+      // CP 1.0 (CFDI 3.3): no hay <Totales>, pero cada DoctoRelacionado puede
+      // tener <ImpuestosDR><TrasladosDR> con la tasa por documento.
+      let drTiene16 = false;
+      let drTiene0  = false;
+      for (const pago of (cfdi.complementoPago?.pagos ?? [])) {
+        for (const dr of (pago.doctosRelacionados ?? [])) {
+          for (const t of (dr.trasladosDR ?? [])) {
+            if ((t.impuesto || '') !== '002') continue;
+            if ((t.tasaOCuota || 0) > 0) drTiene16 = true;
+            else drTiene0 = true;
+          }
+        }
+      }
+      if (drTiene16 && drTiene0) return 'mixto';
+      if (drTiene16) return '16';
+      if (drTiene0)  return '0';
+      // Último fallback: tasa pre-computada por migración (CP 1.0 sin xmlContent)
+      if (cfdi.tasaIvaInferida != null) return cfdi.tasaIvaInferida;
     }
     return null;
   }

@@ -22,6 +22,7 @@ const satJobCheckpointSchema = new mongoose.Schema({
   totalReportadoSAT:   { type: Number, default: 0 },     // NumeroCFDIs de verificación
   cfdisDescargados:    { type: Number, default: 0 },     // CFDIs realmente descargados
   reintentos:          { type: Number, default: 0 },     // veces que se reintentó esta descarga
+  alertaPendiente:     { type: Boolean, default: false }, // true cuando se agotaron reintentos sin éxito
 
   status: {
     type: String,

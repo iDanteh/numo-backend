@@ -6,8 +6,64 @@ const centrosSvc = require('../centros-costo/centros-costo.service');
 const { Op, QueryTypes }   = require('sequelize');
 const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
-const { _getRulesActive }  = require('./balanza-preliminar.service');
+const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99 } = require('./balanza-preliminar.service');
+const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const { BadRequestError }  = require('../../shared/errors/AppError');
+
+/**
+ * Enriquece en memoria el campo `tasaIvaInferida` de CFDIs tipo P Metadata
+ * cuyos UUIDs relacionados se encuentran en erp_cuentas_pendientes.
+ * Replica la misma lógica del bloque ERP en balanza-preliminar.service.js.
+ * Muta los objetos del array — NO escribe a MongoDB.
+ */
+async function _enrichTasaIvaErp(cfdis) {
+  const sinTasa = cfdis.filter(c =>
+    c.tasaIvaInferida == null &&
+    !c.complementoPago?.pagos?.length &&
+    c.cfdiRelacionados?.length,
+  );
+  if (!sinTasa.length) return;
+
+  const uuidToIdxs = new Map();
+  for (let i = 0; i < sinTasa.length; i++) {
+    const uuids = (sinTasa[i].cfdiRelacionados ?? [])
+      .flatMap(r => r.uuids ?? [])
+      .flatMap(u => u.split(/\s*\|\s*/))
+      .map(u => u.trim().toUpperCase())
+      .filter(u => u.length >= 32);
+    for (const uuid of uuids) {
+      if (!uuidToIdxs.has(uuid)) uuidToIdxs.set(uuid, []);
+      uuidToIdxs.get(uuid).push(i);
+    }
+  }
+  if (!uuidToIdxs.size) return;
+
+  const erpDocs = await ErpCuentaPendiente.find(
+    { folioFiscal: { $in: [...uuidToIdxs.keys()] } },
+    { folioFiscal: 1, factorImpuesto: 1, impuesto: 1, subtotal: 1 },
+  ).lean();
+  if (!erpDocs.length) return;
+
+  const tasasPorIdx = new Map();
+  for (const erp of erpDocs) {
+    const uuidNorm = (erp.folioFiscal || '').trim().toUpperCase();
+    const tasa = erp.factorImpuesto != null
+      ? (erp.factorImpuesto > 0 ? '16' : '0')
+      : (erp.subtotal > 0 && erp.impuesto != null
+          ? (erp.impuesto > 0 ? '16' : '0') : null);
+    if (!tasa) continue;
+    for (const idx of (uuidToIdxs.get(uuidNorm) ?? [])) {
+      if (!tasasPorIdx.has(idx)) tasasPorIdx.set(idx, []);
+      tasasPorIdx.get(idx).push(tasa);
+    }
+  }
+  for (const [idx, tasas] of tasasPorIdx) {
+    const tiene16 = tasas.some(t => t === '16' || t === 'mixto');
+    const tiene0  = tasas.some(t => t === '0'  || t === 'mixto');
+    sinTasa[idx].tasaIvaInferida =
+      (tiene16 && tiene0) ? 'mixto' : tiene16 ? '16' : tiene0 ? '0' : null;
+  }
+}
 
 /**
  * Genera una PROPUESTA de póliza a partir de los CFDIs vigentes del periodo
@@ -62,7 +118,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   }
 
   const cfdis = await CFDI.find(filtroBase)
-    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus')
+    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
     .lean();
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
@@ -121,6 +177,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
     };
   });
+
+  // Enriquecer tasaIvaInferida en memoria para CFDIs P Metadata.
+  // Paso 1: facturas relacionadas en MongoDB SAT. Paso 2: fallback ERP.
+  if (tipoCfdi === 'P') {
+    await _enrichTasaIvaFromRelatedCfdis(cfdisSinPolizaFinal);
+    await _enrichTasaIvaErp(cfdisSinPolizaFinal);
+  }
+
+  // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
+  _normalizarEgresoPue99(cfdisSinPolizaFinal);
 
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
   const cfdiConRegla = cfdisSinPolizaFinal.map(cfdi => ({
@@ -308,7 +374,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   };
 
   const cfdis = await CFDI.find(filtroBase)
-    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados')
+    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida')
     .lean();
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
@@ -365,6 +431,16 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       tipoOrigen: cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
     };
   });
+
+  // Enriquecer tasaIvaInferida en memoria para CFDIs P Metadata.
+  // Paso 1: facturas relacionadas en MongoDB SAT. Paso 2: fallback ERP.
+  if (tipoCfdi === 'P') {
+    await _enrichTasaIvaFromRelatedCfdis(cfdisSinPolizaFinalGuard);
+    await _enrichTasaIvaErp(cfdisSinPolizaFinalGuard);
+  }
+
+  // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
+  _normalizarEgresoPue99(cfdisSinPolizaFinalGuard);
 
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
   const cfdiConRegla = cfdisSinPolizaFinalGuard.map(cfdi => ({

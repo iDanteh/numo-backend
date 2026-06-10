@@ -477,6 +477,49 @@ const reglas = [
     prioridad:        13,
   },
 
+  // ── 7A-BIS. COBRO ANTICIPO — TIPO P (Reglas P-ANT) ──────────────────────────
+  // CFDI P con tipoRelacion='07': el pago referencia directamente un anticipo.
+  // El ERP no lo contabiliza en Clientes (CxC) sino como ingreso inmediato (Contado),
+  // porque el cliente pagó el anticipo al momento —sin una CxC abierta previa.
+  // Prioridad 14: gana sobre Reg 7A–7Z (prio 70-99); pierde ante IC-P (prio 5-6).
+  // NO se usa cuentaIvaPPD (no hay cuenta puente de IVA para un anticipo).
+  {
+    nombre:          'Reg P-ANT-16 — Cobro Anticipo TipoRelacion 07 tasa 16%',
+    tipoComprobante: 'P',
+    tipoRelacion:    '07',
+    tasaIva:         '16',
+    cuentaCargo:     '1102011005',   // Bancos por identificar (cash del anticipo)
+    cuentaAbono:     '4100010001',   // Ingresos Contado 16% (ingreso inmediato PUE)
+    cuentaIva:       '2104010001',   // IVA Trasladado definitivo
+    cuentaIvaPPD:    null,
+    conceptoContiene: null,
+    prioridad:       14,
+  },
+  {
+    nombre:          'Reg P-ANT-0 — Cobro Anticipo TipoRelacion 07 tasa 0%',
+    tipoComprobante: 'P',
+    tipoRelacion:    '07',
+    tasaIva:         '0',
+    cuentaCargo:     '1102011005',   // Bancos por identificar
+    cuentaAbono:     '4100010002',   // Ingresos Contado 0%
+    cuentaIva:       null,
+    cuentaIvaPPD:    null,
+    conceptoContiene: null,
+    prioridad:       14,
+  },
+  {
+    nombre:          'Reg P-ANT-N — Cobro Anticipo TipoRelacion 07 sin tasa (Metadata)',
+    tipoComprobante: 'P',
+    tipoRelacion:    '07',
+    tasaIva:         null,
+    cuentaCargo:     '1102011005',   // Bancos por identificar
+    cuentaAbono:     '4100010001',   // Ingresos Contado 16% (fallback — tasa no determinada)
+    cuentaIva:       null,
+    cuentaIvaPPD:    null,
+    conceptoContiene: null,
+    prioridad:       15,             // prio 15 (< que P-ANT-16/0 con tasaIva definido)
+  },
+
   // ── 7B. FACTURA FINAL ANTICIPO PPD (Regla 22B) ───────────────────────────
   // relacionadoTipo='I': el CFDI relacionado es el anticipo (tipo I, claveProdServ=84111506).
   // Distingue de Reg 24C donde el relacionado es una NC (tipo E).
@@ -861,11 +904,23 @@ const reglas = [
     prioridad:    70,
   },
 
-  // ── 10C. COBRO GENÉRICO TIPO P — FALLBACK CP 1.0 (Reg 7Z) ───────────────
-  // Sin filtro de formaPago ni tasaIva: captura CFDIs tipo P cuya tasa no pudo
-  // determinarse (CP 1.0 / CFDI 3.3 sin nodo <Totales>) o cuya formaPago no está
-  // cubierta por Reg 7A–7G. Prioridad 99 → siempre gana la regla específica
-  // cuando exista; este es el último recurso.
+  // ── 10C. COBRO GENÉRICO TIPO P — FALLBACK CP 1.0 (Reg 7Z-0 y Reg 7Z) ──────
+  // Reg 7Z-0 (prio 98): tasa '0' confirmada pero sin formaPago conocida.
+  // Captura CFDIs Metadata P cuya tasaIvaInferida='0' y que no tienen formaPago.
+  // Gana sobre Reg 7Z (prio 99) gracias a tasaIva más específico + menor prioridad.
+  {
+    nombre:          'Reg 7Z-0 — Cobro Genérico Tasa 0% (sin formaPago)',
+    tipoComprobante: 'P',
+    formaPago:       null,
+    tasaIva:         '0',
+    cuentaCargo:     '1101010003',  // Caja por identificar
+    cuentaAbono:     '1103010002',  // Clientes Nac Gral 0%
+    cuentaIva:       null,
+    cuentaIvaPPD:    '2105010001',
+    conceptoContiene: null,
+    prioridad:       98,
+  },
+  // Reg 7Z (prio 99): último recurso para tasa no determinada → Clientes 16%.
   {
     nombre:          'Reg 7Z — Cobro Genérico (CP 1.0 / forma de pago no clasificada)',
     tipoComprobante: 'P',
@@ -1840,6 +1895,82 @@ const reglas = [
     tipoComprobante: 'E', rfcReceptor: 'RSI051018GL6',
     cuentaCargo: '4200030001', cuentaAbono: '1102011005', cuentaIva: '2104010001', prioridad: 5,
   },
+
+  // ── IC-P. COBROS INTERCOMPAÑÍAS (tipo P, rfcReceptor = IC) ──────────────────
+  // Se activan cuando TIH u otra entidad del grupo EMITE el CFDI P y el RFC pagador
+  // (receptor) es uno de los 7 RFC intercompañía. Captura cobros PPD a IC.
+  // tasaIva '16' → CP 2.0 con <Totales> detectados.
+  // tasaIva null  → CP 1.0 / Metadata sin <Totales> (fallback).
+
+  // GAAA5403026G2
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (GAAA5403026G2)',
+    tipoComprobante: 'P', rfcReceptor: 'GAAA5403026G2', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (GAAA5403026G2)',
+    tipoComprobante: 'P', rfcReceptor: 'GAAA5403026G2', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
+
+  // GAFA850630542
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (GAFA850630542)',
+    tipoComprobante: 'P', rfcReceptor: 'GAFA850630542', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (GAFA850630542)',
+    tipoComprobante: 'P', rfcReceptor: 'GAFA850630542', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
+
+  // AVA1002023N7
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (AVA1002023N7)',
+    tipoComprobante: 'P', rfcReceptor: 'AVA1002023N7', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (AVA1002023N7)',
+    tipoComprobante: 'P', rfcReceptor: 'AVA1002023N7', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
+
+  // GIN121109RX4
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (GIN121109RX4)',
+    tipoComprobante: 'P', rfcReceptor: 'GIN121109RX4', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (GIN121109RX4)',
+    tipoComprobante: 'P', rfcReceptor: 'GIN121109RX4', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
+
+  // KTE180215FE1
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (KTE180215FE1)',
+    tipoComprobante: 'P', rfcReceptor: 'KTE180215FE1', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (KTE180215FE1)',
+    tipoComprobante: 'P', rfcReceptor: 'KTE180215FE1', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
+
+  // FEUL5811155D9
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (FEUL5811155D9)',
+    tipoComprobante: 'P', rfcReceptor: 'FEUL5811155D9', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (FEUL5811155D9)',
+    tipoComprobante: 'P', rfcReceptor: 'FEUL5811155D9', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
+
+  // RSI051018GL6
+  { nombre: 'Reg IC-P-16 — Cobro IC rfcReceptor (RSI051018GL6)',
+    tipoComprobante: 'P', rfcReceptor: 'RSI051018GL6', tasaIva: '16',
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5 },
+  { nombre: 'Reg IC-P-null — Cobro IC rfcReceptor sin totales (RSI051018GL6)',
+    tipoComprobante: 'P', rfcReceptor: 'RSI051018GL6', tasaIva: null,
+    cuentaCargo: '1102011005', cuentaAbono: '1103020001',
+    cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 6 },
 
   // ── 16. COMODÍN — Sin coincidencia (Regla 9) ──────────────────────────────
   // Prioridad 99 (último recurso). Genera póliza con cuentas genéricas para revisión.

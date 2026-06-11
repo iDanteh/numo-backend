@@ -338,7 +338,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         ? Number(cpTotales.totalTrasladosBaseIVA16 || 0) +
           Number(cpTotales.totalTrasladosBaseIVA8  || 0)
         : _cpTotal)   // sin desglose de base: usar monto completo
-    : Number(cfdi.subTotal || 0);
+    : (() => {
+        const raw = Number(cfdi.subTotal || 0);
+        if (raw > 0) return raw;
+        // Metadata SAT: subTotal no viene en la descarga; derivar de total menos IVA conocido.
+        const ivaKnown = Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
+        return parseFloat((Number(cfdi.total || 0) - ivaKnown).toFixed(2));
+      })();
 
   const total = _cpTotal;
 
@@ -348,7 +354,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ? (cpTotales
         ? Number(cpTotales.totalTrasladosImpuestoIVA16 || 0) +
           Number(cpTotales.totalTrasladosImpuestoIVA8  || 0)
-        : 0)   // CP 1.0 / Metadata no desglosan IVA
+        : cpPagos.reduce((sum, pago) =>              // CP 1.0: IVA por DoctoRelacionado en trasladosDR
+            sum + (pago.doctosRelacionados ?? []).reduce((s2, dr) =>
+              s2 + (dr.trasladosDR ?? [])
+                .filter(t => (t.impuesto || t.Impuesto || '') === '002' &&
+                             Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
+                .reduce((s3, t) => s3 + Number(t.importe || t.importeDR || t.ImporteDR || 0), 0)
+            , 0)
+          , 0))
     : Number(cfdi.impuestos?.totalImpuestosTrasladados || 0);
 
   const ivaRet = esPago

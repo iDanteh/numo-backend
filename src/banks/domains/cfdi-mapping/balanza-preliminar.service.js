@@ -188,6 +188,27 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
   const cuentaMapById   = Object.fromEntries(cuentasRows.map(c => [c.id,     c]));
   const cuentaMapByCod  = Object.fromEntries(cuentasRows.map(c => [c.codigo, c.id]));
 
+  // 3a. Pre-query: UUIDs de facturas PUE (tipo I, formaPago=30) del periodo.
+  // Necesario para omitir la NC tipo E cuando la factura final ya genera el asiento completo.
+  // Se hace antes del loop porque cada iteración solo trae un tipo de CFDI.
+  const uuidsFacturasPueAnticipo = new Set();
+  {
+    const _facturasPue = await CFDI.find({
+      $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+      ejercicio:         Number(ejercicio),
+      ...filtroPeriodo,
+      tipoDeComprobante: 'I',
+      formaPago:         '30',
+      source:            'SAT',
+      satStatus:         'Vigente',
+      isActive:          true,
+      ...filtroMesesPosteriores,
+    }).select('uuid').lean();
+    for (const c of _facturasPue) {
+      if (c.uuid) uuidsFacturasPueAnticipo.add(c.uuid.toUpperCase());
+    }
+  }
+
   // 3. Procesar CFDIs por tipo
   const movimientosTodos = [];
   let totalCfdis = 0;
@@ -207,7 +228,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       ...filtroReclasificaciones,
       ...filtroMesesPosteriores,
     })
-      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
+      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
       .maxTimeMS(60_000)
       .lean();
 
@@ -345,8 +366,21 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
         )
       : cfdisEnriquecidos;
 
+    // ── Fix doble-contabilización anticipo PUE ───────────────────────────────
+    // uuidsFacturasPueAnticipo fue construido antes del loop (pre-query tipo I formaPago=30).
+    // La NC tipo E referencia la factura final via tipoRelacion=07 → si está en el Set → omitir.
+    const cfdisParaBalanza = uuidsFacturasPueAnticipo.size
+      ? cfdisEnriquecidosFiltrados.filter(c => {
+          if (c.tipoDeComprobante !== 'E') return true;
+          if (!c.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) return true;
+          const _rel07 = (c.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
+          const uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
+          return !(uuid07 && uuidsFacturasPueAnticipo.has(uuid07));
+        })
+      : cfdisEnriquecidosFiltrados;
+
     const resultados = await Promise.all(
-      cfdisEnriquecidosFiltrados.map(async (cfdi) => {
+      cfdisParaBalanza.map(async (cfdi) => {
         const rule = mappingSvc.findRuleInList(cfdi, rules);
         if (!rule) return { sinRegla: 1, movs: [] };
         const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMapByCod);
@@ -650,6 +684,19 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
     };
   }
 
+  // Pre-query: UUIDs de facturas PUE (tipo I, formaPago=30) del periodo para el drill-down.
+  const _uuidsFactPueDrill = new Set();
+  {
+    const _fp = await CFDI.find({
+      $or: [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+      ejercicio: Number(ejercicio), ...filtroPeriodo,
+      tipoDeComprobante: 'I', formaPago: '30',
+      source: 'SAT', satStatus: 'Vigente', isActive: true,
+      ...filtroMesesPosteriores,
+    }).select('uuid').lean();
+    for (const c of _fp) { if (c.uuid) _uuidsFactPueDrill.add(c.uuid.toUpperCase()); }
+  }
+
   const resultado = [];
 
   for (const tipo of tipos) {
@@ -659,7 +706,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       tipoDeComprobante: tipo, source: 'SAT', satStatus: 'Vigente', isActive: true,
       ...filtroPagosSustitutos, ...filtroAnticipos, ...filtroReclasificaciones, ...filtroMesesPosteriores,
     })
-      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor.rfc emisor.nombre receptor.rfc receptor.nombre subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
+      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor.rfc emisor.nombre receptor.rfc receptor.nombre subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
       .maxTimeMS(60_000).lean();
 
     const uuidsParaEnriquecer = new Set(
@@ -744,11 +791,23 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
     // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
     _normalizarEgresoPue99(cfdisEnriquecidos);
 
-    const cfdisFinales = excluirPagosSustitutos
+    const _cfdisFinalesBase = excluirPagosSustitutos
       ? cfdisEnriquecidos.filter(c =>
           !(['P', 'E'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
         )
       : cfdisEnriquecidos;
+
+    // ── Fix doble-contabilización anticipo PUE (drill-down) ─────────────────
+    // _uuidsFactPueDrill fue construido antes del loop con pre-query tipo I formaPago=30.
+    const cfdisFinales = _uuidsFactPueDrill.size
+      ? _cfdisFinalesBase.filter(c => {
+          if (c.tipoDeComprobante !== 'E') return true;
+          if (!c.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) return true;
+          const _rel07d = (c.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
+          const uuid07 = (_rel07d?.uuids?.[0] ?? _rel07d?.uuid ?? '').toUpperCase() || undefined;
+          return !(uuid07 && _uuidsFactPueDrill.has(uuid07));
+        })
+      : _cfdisFinalesBase;
 
     for (const cfdi of cfdisFinales) {
       const rule = mappingSvc.findRuleInList(cfdi, rules);

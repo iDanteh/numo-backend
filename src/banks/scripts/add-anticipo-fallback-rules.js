@@ -27,7 +27,7 @@
  *   cuentaAbono  = 2103010001  Anticipos De Clientes General   (HABER — pasivo)
  *   cuentaCargo  = 1101010003  Caja                            (DEBE — efectivo)
  *     ó          = 1102011005  Bancos                          (DEBE — transferencia/cheque)
- *   cuentaIva    = 2104010001  IVA Trasladado general          (HABER)
+ *   cuentaIva    = 2104010002  IVA Trasladado – Anticipos       (HABER — diferido)
  *
  * Es idempotente: verifica existencia por nombre antes de insertar (upsert).
  *
@@ -56,7 +56,7 @@ const NUEVAS_REGLAS = [
     conceptoContiene: 'anticipo',
     cuentaCargo:      '1101010003',  // Caja (formaPago=01 → cobro en efectivo)
     cuentaAbono:      '2103010001',  // Anticipos De Clientes General (pasivo — HABER)
-    cuentaIva:        '2104010001',  // IVA Trasladado general (HABER)
+    cuentaIva:        '2104010002',  // IVA Trasladado – Anticipos (diferido al recibir el anticipo)
     prioridad:        8,
     isActive:         true,
   },
@@ -71,7 +71,7 @@ const NUEVAS_REGLAS = [
     conceptoContiene: 'anticipo',
     cuentaCargo:      '1102011005',  // Bancos (dinero recibido por transferencia)
     cuentaAbono:      '2103010001',  // Anticipos De Clientes General (pasivo — HABER)
-    cuentaIva:        '2104010001',  // IVA Trasladado general (HABER)
+    cuentaIva:        '2104010002',  // IVA Trasladado – Anticipos (diferido al recibir el anticipo)
     prioridad:        8,
     isActive:         true,
   },

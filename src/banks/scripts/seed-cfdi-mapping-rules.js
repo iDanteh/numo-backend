@@ -56,7 +56,7 @@ const reglas = [
     claveProdServ:   '84111506',
     cuentaCargo:     '1101010003',   // Caja (formaPago=01 → efectivo)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
-    cuentaIva:       '2104010001',   // IVA Trasladado general (fix: evita saldo neg. inter-mes)
+    cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos (diferido al recibir el anticipo)
     conceptoContiene: null,
     prioridad:       9,
   },
@@ -67,7 +67,7 @@ const reglas = [
     claveProdServ:   '84111506',
     cuentaCargo:     '1102011005',   // Bancos (dinero recibido)
     cuentaAbono:     '2103010001',   // Anticipos de Clientes General
-    cuentaIva:       '2104010001',   // IVA Trasladado general (fix: evita saldo neg. inter-mes)
+    cuentaIva:       '2104010002',   // IVA Trasladado – Anticipos (diferido al recibir el anticipo)
     conceptoContiene: null,
     prioridad:       9,
   },
@@ -1431,10 +1431,9 @@ const reglas = [
     tipoComprobante: 'E',
     tipoRelacion:    '01',
     tieneDescuento:  true,
-    ivaHaber:        true,           // IVA va al HABER: la empresa cobra IVA que faltó cobrar
-    cuentaCargo:     '1103010001',  // Clientes (cobra la diferencia al cliente)
-    cuentaAbono:     '4200020001',  // Descuentos s/Ventas 16% (cancela el exceso de descuento)
-    cuentaIva:       '2104010001',  // IVA Trasladado (IVA ahora causado)
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (DEBE — registra el descuento adicional)
+    cuentaAbono:     '1103010001',  // Clientes Nac Gral 16% (HABER — reduce la CxC del cliente)
+    cuentaIva:       '2104010001',  // IVA Trasladado (DEBE — reduce el IVA causado)
     conceptoContiene: null,
     prioridad:       87,
   },
@@ -2095,7 +2094,7 @@ const reglas = [
     conceptoContiene: 'anticipo',
     cuentaCargo: '1101010003',
     cuentaAbono: '2103010001',
-    cuentaIva: '2104010001',
+    cuentaIva: '2104010002',  // IVA Trasladado – Anticipos (diferido al recibir el anticipo)
     prioridad: 8,
   },
   {
@@ -2104,7 +2103,7 @@ const reglas = [
     conceptoContiene: 'anticipo',
     cuentaCargo: '1102011005',
     cuentaAbono: '2103010001',
-    cuentaIva: '2104010001',
+    cuentaIva: '2104010002',  // IVA Trasladado – Anticipos (diferido al recibir el anticipo)
     prioridad: 8,
   },
   {
@@ -2729,24 +2728,6 @@ const reglas = [
     prioridad: 66,
   },
   {
-    nombre: 'Reg 7A-0 — Cobro PPD Efectivo Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '01',
-    tasaIva: '0',
-    cuentaCargo: '1101010003',
-    cuentaAbono: '1103010002',
-    prioridad: 70,
-  },
-  {
-    nombre: 'Reg 7G-0 — Cobro PPD Monedero Electrónico Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '05',
-    tasaIva: '0',
-    cuentaCargo: '2103090002',
-    cuentaAbono: '1103010002',
-    prioridad: 70,
-  },
-  {
     nombre: 'TO-BON-0-EF — Traslado y Bonificación club t 0% Efectivo',
     tipoComprobante: 'E',
     formaPago: '01',
@@ -2806,15 +2787,6 @@ const reglas = [
     cuentaAbono: '1102011005',
     cuentaIva: '2104010001',
     prioridad: 70,
-  },
-  {
-    nombre: 'Reg 7B-0 — Cobro PPD Transferencia Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '03',
-    tasaIva: '0',
-    cuentaCargo: '1102011005',
-    cuentaAbono: '1103010002',
-    prioridad: 71,
   },
   {
     nombre: 'TO-BON-0-EF — Bonificación 0% Efectivo',
@@ -3000,24 +2972,6 @@ const reglas = [
     prioridad: 71,
   },
   {
-    nombre: 'Reg 7C-0 — Cobro PPD Cheque Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '04',
-    tasaIva: '0',
-    cuentaCargo: '1102011005',
-    cuentaAbono: '1103010002',
-    prioridad: 72,
-  },
-  {
-    nombre: 'Reg 7F-0 — Cobro PPD Cheque Nominativo Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '02',
-    tasaIva: '0',
-    cuentaCargo: '1102011005',
-    cuentaAbono: '1103010002',
-    prioridad: 72,
-  },
-  {
     nombre: 'TO-DEV-0-EF — Devolución 0% Efectivo',
     tipoComprobante: 'E',
     formaPago: '01',
@@ -3126,15 +3080,6 @@ const reglas = [
     prioridad: 72,
   },
   {
-    nombre: 'Reg 7D-0 — Cobro PPD Tarjeta Débito Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '28',
-    tasaIva: '0',
-    cuentaCargo: '1102011005',
-    cuentaAbono: '1103010002',
-    prioridad: 73,
-  },
-  {
     nombre: 'TO-DEV-0-EF — Cancelacion 0% Efectivo',
     tipoComprobante: 'E',
     formaPago: '01',
@@ -3241,15 +3186,6 @@ const reglas = [
     cuentaAbono: '2103090001',
     cuentaIva: '2104010001',
     prioridad: 73,
-  },
-  {
-    nombre: 'Reg 7E-0 — Cobro PPD Tarjeta Crédito Tasa 0%',
-    tipoComprobante: 'P',
-    formaPago: '29',
-    tasaIva: '0',
-    cuentaCargo: '1102011005',
-    cuentaAbono: '1103010002',
-    prioridad: 74,
   },
   {
     nombre: 'Reg CC-DTO-M-EF — NC Descuento Mixto Efectivo',

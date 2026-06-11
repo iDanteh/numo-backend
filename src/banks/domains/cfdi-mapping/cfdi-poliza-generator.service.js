@@ -258,10 +258,32 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Centro de costo por serie de facturación del CFDI (asignación automática)
   const ccBySerieMapProp = await centrosSvc.resolveBySerieMap();
 
+  // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
+  // Para cada aplicación de anticipo PUE, SAT emite DOS CFDIs en el mismo período:
+  //   (a) Factura final tipo I, formaPago=30, tipoRelacion=07 → Reg 22C → DEBE Anticipos
+  //   (b) NC tipo E, tipoRelacion=07 → Reg 23 → DEBE Anticipos de nuevo (doble!)
+  // Si ambos están en el batch, se genera el DEBE en Anticipos dos veces.
+  // Solución: Reg 22C ya hace la contabilización completa; omitir la NC tipo E.
+  // Se construye el set de UUIDs de anticipos originales cubiertos por una factura
+  // final PUE (formaPago=30) en este mismo batch.
+  const anticosCubiertosPorReg22C = new Set();
+  for (const { cfdi: c } of cfdiConRegla) {
+    if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
+    if (c.uuid) anticosCubiertosPorReg22C.add(c.uuid.toUpperCase());
+  }
+
   const movimientosResult = [];
   let sinRegla = 0;
 
   for (const { cfdi, rule } of cfdiConRegla) {
+    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo original ya fue procesado
+    // por una factura PUE formaPago=30 (Reg 22C) en este mismo batch.
+    if (cfdi.tipoDeComprobante === 'E' &&
+        cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
+      const _rel07 = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
+      const uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
+      if (uuid07 && anticosCubiertosPorReg22C.has(uuid07)) continue;
+    }
     const context = {};
     if (rule?.cuentaDeltaAnticipo && cfdi.cfdiRelacionados?.length) {
       const uuidsProp = cfdi.cfdiRelacionados.map(r => r.uuid).filter(Boolean);
@@ -528,6 +550,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // Centro de costo por serie de facturación del CFDI (asignación automática)
   const ccBySerieMap = await centrosSvc.resolveBySerieMap();
 
+  // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
+  // Misma lógica que en generarPropuesta: si hay una factura PUE formaPago=30
+  // con tipoRelacion=07 en el batch, la NC tipo E del mismo anticipo se omite.
+  const anticosCubiertosPorReg22CGuard = new Set();
+  for (const { cfdi: c } of cfdiConRegla) {
+    if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
+    if (c.uuid) anticosCubiertosPorReg22CGuard.add(c.uuid.toUpperCase());
+  }
+
   const todosLosMovimientos = [];
   let sinRegla = 0;
   const advertencias = [];
@@ -535,6 +566,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const muestrasSinRegla = [];
 
   for (const { cfdi, rule } of cfdiConRegla) {
+    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo ya fue procesado por Reg 22C
+    if (cfdi.tipoDeComprobante === 'E' &&
+        cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
+      const _rel07g = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
+      const uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
+      if (uuid07 && anticosCubiertosPorReg22CGuard.has(uuid07)) continue;
+    }
+
     if (!rule) {
       sinRegla++;
       if (muestrasSinRegla.length < 5) {

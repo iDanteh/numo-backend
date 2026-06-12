@@ -686,23 +686,34 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       if (esIngreso) {
         const subTotal16R = parseFloat(subTotal16.toFixed(2));
         const subTotal0R  = parseFloat(subTotal0.toFixed(2));
-        // Si la regla tiene descuentos separados (tieneDescuento), el cargo por Dto ya se
-        // agregará como DEBE extra → Ingresos16 debe ser el bruto (subTotal16_gross) para
-        // que D=H. Sin descuentos separados, el neto garantiza el balance directamente.
-        montoAbono = rule.tieneDescuento
-          ? subTotal16R
-          : parseFloat(((parseFloat((total - iva).toFixed(2))) - subTotal0R).toFixed(2));
-        if (subTotal0R > 0) {
+        // Con descuentos separados: Ingresos deben ser BRUTO para que D=H.
+        // BRUTO16 = (total+descuento−IVA)×sub16/(sub16+sub0). La proporción sub16/(sub16+sub0)
+        // es idéntica con XML completo (sub=bruto) y con metadata SAT (sub=neto), por lo que
+        // la fórmula garantiza balance en ambos casos sin detectar el origen del CFDI.
+        // Sin descuentos separados, el neto garantiza el balance directamente.
+        let haber16R, haber0R;
+        if (rule.tieneDescuento) {
+          const descTotal  = Number(cfdi.descuento || 0);
+          const grossTotal = parseFloat((total + descTotal - iva).toFixed(2));
+          const sumSub     = subTotal16 + subTotal0;
+          haber16R = parseFloat((grossTotal * subTotal16 / sumSub).toFixed(2));
+          haber0R  = parseFloat((grossTotal - haber16R).toFixed(2));
+        } else {
+          haber16R = parseFloat(((parseFloat((total - iva).toFixed(2))) - subTotal0R).toFixed(2));
+          haber0R  = subTotal0R;
+        }
+        montoAbono = haber16R;
+        if (haber0R > 0) {
           movs.push({
             cuentaId:    cuentaMap[rule.cuentaAbono2] ?? null,
             concepto:    `${concepto} (0%)`,
             centroCosto, ventaFecha, serie: serieCfdi,
-            debe: 0, haber: subTotal0R,
+            debe: 0, haber: haber0R,
             cfdiUuid: cfdi.uuid, rfcTercero,
           });
-          // Split cargo 0%: cuentaCargo recibe solo (total - subTotal0) = subtotal16 + IVA16
-          // cuentaCargoMixto0 recibe subTotal0 (sin IVA, pues tasa 0% no genera IVA)
-          if (rule.cuentaCargoMixto0) {
+          // Split cargo 0%: cuentaCargo recibe la parte 16%+IVA (total−NET0),
+          // cuentaCargoMixto0 recibe NET0 (efectivo cobrado por items 0%, sin IVA).
+          if (rule.cuentaCargoMixto0 && subTotal0R > 0) {
             const cargoLine = movs.find(m =>
               m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0
             );

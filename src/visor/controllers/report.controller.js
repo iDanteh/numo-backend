@@ -91,8 +91,6 @@ const dashboard = asyncHandler(async (req, res) => {
   // o isActive=1 no serían encontrados con la comparación estricta boolean.
   // MANUAL se agrupa junto con SAT (igual que en comparisonEngine) para que el
   // total SAT del dashboard refleje todos los documentos del lado SAT.
-  // Sin filtro SINUUID: registros ERP sin UUID son válidos y tienen montos reales.
-  // El filtro SINUUID se mantiene solo en cfdiFilter (conciliación) donde se requiere UUID real.
   const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter };
   if (rfcEmisor) montosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
   if (Object.keys(dateFilter).length) montosFilter.fecha = dateFilter;
@@ -143,24 +141,25 @@ const dashboard = asyncHandler(async (req, res) => {
       { $match: montosFilter },
       { $addFields: {
         sourceGroup: { $cond: { if: { $in: ['$source', ['SAT', 'MANUAL']] }, then: 'SAT', else: '$source' } },
-        // ERP: (Timbrado o Habilitado) + UUID válido → suma en ERP aunque SAT diga Cancelado
-        // SAT/MANUAL: solo Vigente
-        // La discrepancia ERP-Timbrado/Habilitado vs SAT-Cancelado la registra el comparador
+        esSinUuid: { $regexMatch: { input: { $ifNull: ['$uuid', ''] }, regex: '^SINUUID', options: 'i' } },
+        // ERP: (Timbrado o Habilitado) → activo; SAT/MANUAL: solo Vigente
         excluir: { $cond: {
           if:   { $eq: ['$source', 'ERP'] },
-          then: { $or: [
-            { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
-            { $regexMatch: { input: { $ifNull: ['$uuid', ''] }, regex: '^SINUUID', options: 'i' } },
-          ] },
+          then: { $not: [{ $in: ['$erpStatus', ['Timbrado', 'Habilitado']] }] },
           else: { $ne: ['$satStatus', 'Vigente'] },
         }},
       }},
       { $group: {
         _id:             '$sourceGroup',
-        total:           { $sum: { $cond: ['$excluir', 0, MONTO_EFECTIVO_EXPR] } },
-        count:           { $sum: { $cond: ['$excluir', 0, 1] } },
-        totalCancelados: { $sum: { $cond: ['$excluir', MONTO_EFECTIVO_EXPR, 0] } },
-        countCancelados: { $sum: { $cond: ['$excluir', 1, 0] } },
+        // Activos: Timbrado/Habilitado y con UUID real
+        total:           { $sum: { $cond: [{ $or: ['$excluir', '$esSinUuid'] }, 0, MONTO_EFECTIVO_EXPR] } },
+        count:           { $sum: { $cond: [{ $or: ['$excluir', '$esSinUuid'] }, 0, 1] } },
+        // Cancelados/no-vigentes: excluidos pero con UUID real
+        totalCancelados: { $sum: { $cond: [{ $and: ['$excluir', { $not: ['$esSinUuid'] }] }, MONTO_EFECTIVO_EXPR, 0] } },
+        countCancelados: { $sum: { $cond: [{ $and: ['$excluir', { $not: ['$esSinUuid'] }] }, 1, 0] } },
+        // Sin UUID real (SINUUID): bucket propio, no afecta totales de conciliación
+        totalSinUuid:    { $sum: { $cond: ['$esSinUuid', MONTO_EFECTIVO_EXPR, 0] } },
+        countSinUuid:    { $sum: { $cond: ['$esSinUuid', 1, 0] } },
       }},
     ]),
 
@@ -295,6 +294,8 @@ const dashboard = asyncHandler(async (req, res) => {
       // Cancelados y deshabilitados separados del total principal
       erpCancelados: { total: erpRow.totalCancelados, count: erpRow.countCancelados },
       satCancelados: { total: satRow.totalCancelados, count: satRow.countCancelados },
+      // CFDIs ERP sin UUID real (SINUUID-…): excluidos de conciliación y de cancelados
+      erpSinUuid: { total: erpRow.totalSinUuid ?? 0, count: erpRow.countSinUuid ?? 0 },
       cfdisBySatStatus, comparisonStats, discrepancyStats,
       ivaStats,
     },
@@ -537,7 +538,7 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   const cfdiSel    = 'uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus';
   const cfdiSelSat = 'uuid serie folio fecha total tipoDeComprobante emisor receptor satStatus';
 
-  const erpProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, erpStatus: 1, satStatus: 1 };
+  const erpProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, erpStatus: 1, satStatus: 1, periodo: 1 };
   const satProjection = { uuid: 1, serie: 1, folio: 1, fecha: 1, total: 1, tipoDeComprobante: 1, emisor: 1, receptor: 1, satStatus: 1 };
 
   // Pipeline ORIGINAL que funcionaba — filtra Comparison por matchPeriodo
@@ -553,6 +554,12 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
     { $sort:  { criticalCount: -1, comparedAt: -1 } },
     { $lookup: { from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id', as: 'erpCfdiId', pipeline: [{ $project: erpProjection }] } },
     { $unwind: { path: '$erpCfdiId', preserveNullAndEmptyArrays: true } },
+    // Excluir CFDIs cuyo periodo real en MongoDB no coincida con el periodo solicitado.
+    // Caso típico: ERP marca CFDI como "global" (pertenece al siguiente periodo contable)
+    // y la comparación se registró con ese periodo nuevo, pero el documento ERP en MongoDB
+    // tiene el periodo original → aparecería en el periodo incorrecto.
+    // Si el CFDI tiene periodo incorrecto en MongoDB, seguirá visible en su propio mes.
+    ...(periodo ? [{ $match: { $or: [{ erpCfdiId: null }, { 'erpCfdiId.periodo': parseInt(periodo) }] } }] : []),
     // Filtrar por tipo DESPUÉS del lookup (Comparison.tipoDeComprobante puede ser null)
     ...(tipoDeComprobante ? [{ $match: { 'erpCfdiId.tipoDeComprobante': tipoDeComprobante } }] : []),
     { $lookup: { from: 'cfdis', localField: 'satCfdiId', foreignField: '_id', as: 'satCfdiId', pipeline: [{ $project: satProjection }] } },
@@ -727,32 +734,65 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
   if (ejercicio) matchFilter.ejercicio = parseInt(ejercicio);
   if (periodo)   matchFilter.periodo   = parseInt(periodo);
 
-  const [agg, totalPagos] = await Promise.all([
+  const [detalleAgg, totalPagos] = await Promise.all([
     CFDI.aggregate([
       { $match: matchFilter },
       { $unwind: { path: '$complementoPago.pagos', preserveNullAndEmptyArrays: false } },
       { $unwind: { path: '$complementoPago.pagos.doctosRelacionados', preserveNullAndEmptyArrays: false } },
       {
-        $group: {
-          _id:         null,
-          cfdiIds:     { $addToSet: '$_id' },
-          doctosIds:   { $addToSet: { $toUpper: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } } },
+        $project: {
+          _id:           0,
+          uuidPago:      { $toUpper: { $ifNull: ['$uuid', ''] } },
+          seriePago:     '$serie',
+          folioPago:     '$folio',
+          fechaPago:     '$complementoPago.pagos.fechaPago',
+          metodoPago:    '$complementoPago.pagos.formaDePagoP',
+          numOperacion:  '$complementoPago.pagos.numOperacion',
+          montoPago:     '$complementoPago.pagos.monto',
+          idDocumento:   { $toUpper: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+          serieOrigen:   '$complementoPago.pagos.doctosRelacionados.serie',
+          folioOrigen:   '$complementoPago.pagos.doctosRelacionados.folio',
+          importePagado: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
         },
       },
     ]),
     CFDI.countDocuments(matchFilter),
   ]);
 
-  if (!agg.length || !agg[0].doctosIds?.length) {
-    return res.json({ totalPagos, totalDoctos: 0, existenEnSistema: 0, noExistenEnSistema: 0, porcentajeCobertura: 100 });
+  if (!detalleAgg.length) {
+    return res.json({ totalPagos, totalDoctos: 0, existenEnSistema: 0, noExistenEnSistema: 0, porcentajeCobertura: 100, pagos: [] });
   }
 
-  const doctosIds = agg[0].doctosIds.filter(id => id && id.length > 0);
+  // Verificar cuáles documentos origen existen en el sistema
+  const doctosIds = [...new Set(detalleAgg.map(r => r.idDocumento).filter(id => id && id.length > 0))];
   const totalDoctos = doctosIds.length;
 
-  const existenEnSistema = await CFDI.countDocuments({
-    uuid: { $in: doctosIds },
-    isActive: { $ne: false },
+  const cfdiOrigen = await CFDI.find(
+    { uuid: { $in: doctosIds }, isActive: { $ne: false } },
+    { uuid: 1, serie: 1, folio: 1, total: 1, satStatus: 1, _id: 0 },
+  ).lean();
+
+  const cfdiOrigenMap = Object.fromEntries(cfdiOrigen.map(c => [c.uuid?.toUpperCase(), c]));
+  const existenEnSistema = cfdiOrigen.length;
+
+  // Enriquecer cada fila con datos del CFDI origen si existe
+  const pagos = detalleAgg.map(r => {
+    const origen = cfdiOrigenMap[r.idDocumento] ?? null;
+    return {
+      uuidPago:       r.uuidPago      || null,
+      seriePago:      r.seriePago     || null,
+      folioPago:      r.folioPago     || null,
+      fechaPago:      r.fechaPago     || null,
+      metodoPago:     r.metodoPago    || null,
+      numOperacion:   r.numOperacion  || null,
+      montoPago:      r.montoPago     != null ? Number(r.montoPago)     : null,
+      idDocumento:    r.idDocumento   || null,
+      serieOrigen:    r.serieOrigen   || origen?.serie  || null,
+      folioOrigen:    r.folioOrigen   || origen?.folio  || null,
+      importePagado:  r.importePagado != null ? Number(r.importePagado) : null,
+      enSistema:      origen != null,
+      satStatusOrigen: origen?.satStatus ?? null,
+    };
   });
 
   res.json({
@@ -761,6 +801,7 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
     existenEnSistema,
     noExistenEnSistema: totalDoctos - existenEnSistema,
     porcentajeCobertura: totalDoctos > 0 ? Math.round((existenEnSistema / totalDoctos) * 100) : 100,
+    pagos,
   });
 });
 
@@ -789,10 +830,10 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   const periodoLabel  = ejercicio ? (periodo ? `${MESES[parseInt(periodo)-1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
 
   // ── FASE 1: Datos que no dependen de los UUIDs ERP ───────────────────────
-  const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, allSatForPeriod, resumenTipos, resumenSAT, cfdisMigrados] = await Promise.all([
+  const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, allSatForPeriod, resumenTipos, resumenSAT, cfdisMigrados, sinUuidCfdis] = await Promise.all([
 
     // CFDIs ERP Timbrados/Habilitados — igual que montosAggregate del dashboard
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, lastComparisonStatus: 1, fecha: -1 })
       .lean(),
@@ -867,6 +908,12 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus erpStatus lastComparisonStatus ejercicio periodo informacionGlobal source')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
+
+    // CFDIs ERP sin timbrar (uuid SINUUID-*): existen en ERP pero sin UUID fiscal real
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: /^SINUUID/, ...periodoFilter })
+      .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
+      .sort({ tipoDeComprobante: 1, fecha: -1 })
+      .lean(),
   ]);
 
   // ── FASE 2: Queries que usan los UUIDs de los CFDIs ERP del periodo ────────
@@ -902,7 +949,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // Buscar contrapartes SAT directamente por UUID (más confiable que satCfdiId de Comparison)
   const satCfdiDocs = erpUuids.length
     ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: erpUuids }, isActive: { $ne: false }, satStatus: 'Vigente' })
-        .select('uuid total subTotal descuento impuestos satStatus').lean()
+        .select('uuid total subTotal descuento impuestos satStatus tipoDeComprobante complementoPago.totales.montoTotalPagos complementoPago.totales.totalTrasladosImpuestoIVA16 complementoPago.totales.totalTrasladosImpuestoIVA8 complementoPago.totales.totalRetencionesImpuestoIVA complementoPago.pagos.monto').lean()
     : [];
   const satByUuid = {};
   for (const s of satCfdiDocs) satByUuid[(s.uuid || '').toUpperCase()] = s;
@@ -1095,15 +1142,41 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       const satCfdi = satByUuid[(cfdi.uuid || '').toUpperCase()] || null;
       const discs   = discByUuid[cfdi.uuid] || [];
 
+      const esP = cfdi.tipoDeComprobante === 'P';
+
+      // Monto efectivo de un CFDI tipo P: SAT guarda total=0 por spec, el real está en complementoPago
+      const montoEfectivoCP = (c) =>
+        c?.complementoPago?.totales?.montoTotalPagos
+        ?? (c?.complementoPago?.pagos ?? []).reduce((s, p) => s + (Number(p.monto) || 0), 0)
+        ?? 0;
+
       const descuentoERP = cfdi.descuento || 0;
-      const subERP    = (cfdi.subTotal || 0) - descuentoERP;
+      const totERP    = esP
+        ? (cfdi.total > 0 ? cfdi.total : montoEfectivoCP(cfdi))
+        : cfdi.total || 0;
+      const subERP    = esP ? totERP : (cfdi.subTotal || 0) - descuentoERP;
+      // IVA ERP: para todos los tipos (incluyendo P) está en impuestos.totalImpuestosTrasladados
       const ivaTraERP = cfdi.impuestos?.totalImpuestosTrasladados || 0;
-      const ivaRetERP = cfdi.impuestos?.totalImpuestosRetenidos   || 0;
-      const totERP    = cfdi.total || 0;
+      const ivaRetERP = cfdi.impuestos?.totalImpuestosRetenidos || 0;
+
       const descuentoSAT = satCfdi ? (satCfdi.descuento || 0) : null;
-      const subSAT    = satCfdi ? (satCfdi.subTotal || 0) - (satCfdi.descuento || 0) : null;
-      const ivaTraSAT = satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null;
-      const totSAT    = satCfdi ? (satCfdi.total || 0) : null;
+      const satTotRaw    = satCfdi ? (satCfdi.total || 0) : null;
+      const satMontoP    = satCfdi ? montoEfectivoCP(satCfdi) : 0;
+      const totSAT       = satCfdi
+        ? (esP && satTotRaw === 0 ? satMontoP : satTotRaw)
+        : null;
+      const subSAT       = satCfdi
+        ? (esP ? totSAT : (satCfdi.subTotal || 0) - (satCfdi.descuento || 0))
+        : null;
+      // Para tipo P SAT: el IVA se guarda en impuestos.totalImpuestosTrasladados (mismo que otros tipos)
+      // y también en complementoPago.totales.totalTrasladosImpuestoIVA16 — usamos lo que tenga valor.
+      const ivaTraSAT = satCfdi
+        ? (
+            (satCfdi.impuestos?.totalImpuestosTrasladados ?? 0)
+            || (satCfdi.complementoPago?.totales?.totalTrasladosImpuestoIVA16 ?? 0)
+            + (satCfdi.complementoPago?.totales?.totalTrasladosImpuestoIVA8 ?? 0)
+          )
+        : null;
       const dif       = totSAT !== null ? fmtNum(totERP - totSAT) : null;
 
       // Tipos de discrepancia
@@ -1140,41 +1213,49 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
       MONEY_KEYS.forEach(k => { if (row.getCell(k).value != null) row.getCell(k).numFmt = MXN; });
 
-      const cs          = cfdi.lastComparisonStatus;
-      const hasDif      = dif !== null && Math.abs(dif) > 0.01;
-      const hasCritical = discs.some(d => d.severity === 'critical' || d.severity === 'high');
-      const sinSatVigente = !satCfdi; // no hay contraparte SAT Vigente
-      const FG_REVIEW   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFD6CC' } }; // naranja claro — revisar
+      const cs            = cfdi.lastComparisonStatus;
+      const absDif        = dif !== null ? Math.abs(dif) : 0;
+      const hasDif        = dif !== null && absDif > 0.01;
+      const isCentavos    = hasDif && absDif < 1.00;   // diferencia de centavos → amarillo
+      const hasDifSignif  = hasDif && !isCentavos;     // diferencia significativa (≥ $1) → rojo
+      const hasCritical   = discs.some(d => d.severity === 'critical' || d.severity === 'high');
+      const sinSatVigente = !satCfdi;
+      const FG_REVIEW     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFD6CC' } };
 
       // Color base de la fila completa
       if (cfdi.satStatus === 'Cancelado') {
-        // Timbrado en ERP pero cancelado en SAT → rojo
         row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_DANGER; });
-      } else if (hasDif || hasCritical) {
-        // Diferencia de monto o discrepancia crítica → rojo
+      } else if (hasDifSignif || hasCritical) {
+        // Diferencia ≥ $1 o discrepancia crítica → rojo
         row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_DANGER; });
+      } else if (isCentavos) {
+        // Diferencia de centavos (< $1.00) → amarillo
+        row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_WARN; });
       } else if (sinSatVigente) {
-        // ERP Timbrado sin contraparte SAT Vigente → naranja para revisar
         row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_REVIEW; });
       } else if (cs === 'discrepancy' || cs === 'warning' || discs.length > 0) {
         // Discrepancia de campo sin diferencia de monto → amarillo
         row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_WARN; });
       } else if (cs === 'match' || cs === 'conciliado') {
-        // Conciliado → solo celda de estado en verde
         row.getCell('conciliacion').fill = FG_OK;
       }
 
-      // Resaltar celdas individuales donde hay diferencia de montos (encima del color de fila)
-      const FG_DIFF = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDC2626' } }; // rojo intenso
+      // Resaltar celdas individuales con diferencia (encima del color de fila)
+      // Centavos → naranja suave en celda; diferencia significativa → rojo intenso
+      const FG_DIFF      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDC2626' } };
+      const FG_DIFF_CENT = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFC107' } }; // ámbar para centavos
       if (subSAT !== null && Math.abs(subERP - subSAT) > 0.01) {
-        row.getCell('subERP').fill = FG_DIFF; row.getCell('subSAT').fill = FG_DIFF;
+        const fg = Math.abs(subERP - subSAT) < 1.00 ? FG_DIFF_CENT : FG_DIFF;
+        row.getCell('subERP').fill = fg; row.getCell('subSAT').fill = fg;
       }
       if (ivaTraSAT !== null && Math.abs(ivaTraERP - ivaTraSAT) > 0.01) {
-        row.getCell('ivaTraERP').fill = FG_DIFF; row.getCell('ivaTraSAT').fill = FG_DIFF;
+        const fg = Math.abs(ivaTraERP - ivaTraSAT) < 1.00 ? FG_DIFF_CENT : FG_DIFF;
+        row.getCell('ivaTraERP').fill = fg; row.getCell('ivaTraSAT').fill = fg;
       }
       if (totSAT !== null && Math.abs(totERP - totSAT) > 0.01) {
-        row.getCell('totalERP').fill = FG_DIFF; row.getCell('totalSAT').fill = FG_DIFF;
-        row.getCell('diferencia').fill = FG_DIFF;
+        const fg = Math.abs(totERP - totSAT) < 1.00 ? FG_DIFF_CENT : FG_DIFF;
+        row.getCell('totalERP').fill = fg; row.getCell('totalSAT').fill = fg;
+        row.getCell('diferencia').fill = fg;
       }
 
       sumDescuento += descuentoERP; sumSubERP += subERP; sumIvaTraERP += ivaTraERP; sumIvaRetERP += ivaRetERP; sumTotERP += totERP;
@@ -1402,24 +1483,46 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       sepRow.height = 18;
 
       for (const cfdi of lista) {
-        const satCfdi = satByUuidMap[(cfdi.uuid || '').toUpperCase()] || null;
-        const totERP  = cfdi.total || 0;
-        const totSAT  = satCfdi ? (satCfdi.total || 0) : null;
-        const dif     = totSAT !== null ? fmtNum(totERP - totSAT) : null;
+        const satCfdi   = satByUuidMap[(cfdi.uuid || '').toUpperCase()] || null;
+        const esPInact  = cfdi.tipoDeComprobante === 'P';
+        const montoCP   = (c) =>
+          c?.complementoPago?.totales?.montoTotalPagos
+          ?? (c?.complementoPago?.pagos ?? []).reduce((s, p) => s + (Number(p.monto) || 0), 0)
+          ?? 0;
+        const totERPI   = esPInact
+          ? (cfdi.total > 0 ? cfdi.total : montoCP(cfdi))
+          : cfdi.total || 0;
+        const subERPI   = esPInact ? totERPI : (cfdi.subTotal || 0) - (cfdi.descuento || 0);
+        const ivaTraERPI = cfdi.impuestos?.totalImpuestosTrasladados || 0;
+        const satTotRawI = satCfdi ? (satCfdi.total || 0) : null;
+        const totSATI   = satCfdi
+          ? (esPInact && satTotRawI === 0 ? montoCP(satCfdi) : satTotRawI)
+          : null;
+        const subSATI   = satCfdi
+          ? (esPInact ? totSATI : (satCfdi.subTotal || 0) - (satCfdi.descuento || 0))
+          : null;
+        const ivaTraSATI = satCfdi
+          ? (
+              (satCfdi.impuestos?.totalImpuestosTrasladados ?? 0)
+              || (satCfdi.complementoPago?.totales?.totalTrasladosImpuestoIVA16 ?? 0)
+              + (satCfdi.complementoPago?.totales?.totalTrasladosImpuestoIVA8 ?? 0)
+            )
+          : null;
+        const dif = totSATI !== null ? fmtNum(totERPI - totSATI) : null;
         const row = sheet.addRow({
           uuid: cfdi.uuid, serie: cfdi.serie || '', folio: cfdi.folio || '',
           fecha: cfdi.fecha ? new Date(cfdi.fecha).toLocaleDateString('es-MX') : '',
           rfcEmisor: cfdi.emisor?.rfc || '', nomEmisor: cfdi.emisor?.nombre || '',
           rfcReceptor: cfdi.receptor?.rfc || '', nomReceptor: cfdi.receptor?.nombre || '',
           descuento: cfdi.descuento || 0,
-          subERP: (cfdi.subTotal || 0) - (cfdi.descuento || 0),
-          ivaTraERP: cfdi.impuestos?.totalImpuestosTrasladados || 0,
+          subERP: subERPI,
+          ivaTraERP: ivaTraERPI,
           ivaRetERP: cfdi.impuestos?.totalImpuestosRetenidos   || 0,
-          totalERP: totERP,
+          totalERP: totERPI,
           descuentoSAT: satCfdi ? (satCfdi.descuento || 0) : null,
-          subSAT: satCfdi ? (satCfdi.subTotal || 0) - (satCfdi.descuento || 0) : null,
-          ivaTraSAT: satCfdi ? (satCfdi.impuestos?.totalImpuestosTrasladados || 0) : null,
-          totalSAT: totSAT,
+          subSAT: subSATI,
+          ivaTraSAT: ivaTraSATI,
+          totalSAT: totSATI,
           diferencia: dif,
           estadoERP: cfdi.erpStatus || '—',
           estadoSAT: cfdi.satStatus || '—',
@@ -1427,7 +1530,14 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
           tiposDisc: '', detalleDisc: '',
         });
         MONEY_KEYS.forEach(k => { if (row.getCell(k).value != null) row.getCell(k).numFmt = MXN; });
-        row.eachCell({ includeEmpty: true }, cell => { cell.fill = fgColor; });
+        // Centavos → color base heredado (fgColor) + ámbar en celda diferencia; diff grande → rojo
+        if (dif !== null && Math.abs(dif) > 0.01) {
+          const fg = Math.abs(dif) < 1.00
+            ? { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3CD' } }
+            : { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDC2626' } };
+          row.getCell('diferencia').fill = fg;
+        }
+        row.eachCell({ includeEmpty: true }, cell => { if (!cell.fill?.fgColor) cell.fill = fgColor; });
       }
     }
   };
@@ -1439,7 +1549,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const satCancelUuids = erpCancelados.map(c => c.uuid).filter(Boolean);
     const satCancelDocs  = satCancelUuids.length
       ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: satCancelUuids }, isActive: { $ne: false } })
-          .select('uuid total subTotal descuento impuestos satStatus').lean()
+          .select('uuid total subTotal descuento impuestos satStatus tipoDeComprobante complementoPago.totales.montoTotalPagos complementoPago.totales.totalTrasladosImpuestoIVA16 complementoPago.totales.totalTrasladosImpuestoIVA8 complementoPago.totales.totalRetencionesImpuestoIVA complementoPago.pagos.monto').lean()
       : [];
     const satByUuidCan = {};
     for (const s of satCancelDocs) satByUuidCan[(s.uuid || '').toUpperCase()] = s;
@@ -1454,7 +1564,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const satDeshUuids = erpDeshabilitados.map(c => c.uuid).filter(Boolean);
     const satDeshDocs  = satDeshUuids.length
       ? await CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, uuid: { $in: satDeshUuids }, isActive: { $ne: false } })
-          .select('uuid total subTotal descuento impuestos satStatus').lean()
+          .select('uuid total subTotal descuento impuestos satStatus tipoDeComprobante complementoPago.totales.montoTotalPagos complementoPago.totales.totalTrasladosImpuestoIVA16 complementoPago.totales.totalTrasladosImpuestoIVA8 complementoPago.totales.totalRetencionesImpuestoIVA complementoPago.pagos.monto').lean()
       : [];
     const satByUuidDesh = {};
     for (const s of satDeshDocs) satByUuidDesh[(s.uuid || '').toUpperCase()] = s;
@@ -1554,6 +1664,76 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     const row = sLast.addRow({ tipo: c.tipoDeComprobante || '', desc: TIPO_LABEL[c.tipoDeComprobante] || '', source: c.source, uuid: c.uuid, serie: c.serie || '', folio: c.folio || '', fecha: c.fecha ? new Date(c.fecha).toLocaleDateString('es-MX') : '', rfcEmisor: c.emisor?.rfc || '', nomEmisor: c.emisor?.nombre || '', rfcRec: c.receptor?.rfc || '', nomRec: c.receptor?.nombre || '', descuento: c.descuento || 0, subTotal: (c.subTotal || 0) - (c.descuento || 0), ivaTrasl: c.impuestos?.totalImpuestosTrasladados || 0, ivaRet: c.impuestos?.totalImpuestosRetenidos || 0, total: c.total || 0, estadoSAT: c.satStatus || '—' });
     ['descuento','subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
     row.eachCell(cell => { if (!cell.fill || cell.fill.type === 'none') cell.fill = FG_DANGER; });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // HOJA — Pendientes de Timbrado (CFDIs sin UUID fiscal — SINUUID-*)
+  // Excluidos de totales y conciliación; se muestran aquí para revisión
+  // ══════════════════════════════════════════════════════════════════════════
+  if (sinUuidCfdis.length > 0) {
+    const FG_SIN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF8E1' } }; // amarillo suave
+    const sSin  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Pendientes Timbrado`);
+    sSin.views  = [{ state: 'frozen', ySplit: 4 }];
+    const SIN_COLS = [
+      { key: 'tipo',       header: 'Tipo',            width: 7  },
+      { key: 'desc',       header: 'Descripción',     width: 11 },
+      { key: 'serie',      header: 'Serie',           width: 8  },
+      { key: 'folio',      header: 'Folio',           width: 10 },
+      { key: 'fecha',      header: 'Fecha',           width: 12 },
+      { key: 'rfcEmisor',  header: 'RFC Emisor',      width: 15 },
+      { key: 'nomEmisor',  header: 'Nombre Emisor',   width: 30 },
+      { key: 'rfcRec',     header: 'RFC Receptor',    width: 15 },
+      { key: 'nomRec',     header: 'Nombre Receptor', width: 30 },
+      { key: 'subTotal',   header: 'Subtotal',        width: 16 },
+      { key: 'ivaTrasl',   header: 'IVA Trasladado',  width: 18 },
+      { key: 'ivaRet',     header: 'IVA Retenido',    width: 18 },
+      { key: 'total',      header: 'Total',           width: 16 },
+      { key: 'estadoERP',  header: 'Estado ERP',      width: 16 },
+      { key: 'nota',       header: 'Nota',            width: 35 },
+    ];
+    addTitle(sSin, `CFDIs Pendientes de Timbrado (Sin UUID Fiscal) — ${periodoLabel}`, SIN_COLS.length);
+
+    sSin.mergeCells(`A3:${colLetter(SIN_COLS.length)}3`);
+    const kpiSin = sSin.getCell('A3');
+    kpiSin.value = `Total: ${sinUuidCfdis.length} CFDIs sin timbrar — NO incluidos en totales de conciliación`;
+    kpiSin.font  = FONT_BOLD; kpiSin.fill = FG_SIN;
+    kpiSin.alignment = { horizontal: 'left', vertical: 'middle' };
+    sSin.getRow(3).height = 20;
+
+    sSin.columns = SIN_COLS;
+    const hdrSin = sSin.getRow(4);
+    hdrSin.values = SIN_COLS.map(c => c.header);
+    hdrSin.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
+    hdrSin.height = 28;
+
+    let sumSinTotal = 0;
+    for (const c of sinUuidCfdis) {
+      const row = sSin.addRow({
+        tipo:      c.tipoDeComprobante || '',
+        desc:      TIPO_LABEL[c.tipoDeComprobante] || '',
+        serie:     c.serie  || '',
+        folio:     c.folio  || '',
+        fecha:     c.fecha  ? new Date(c.fecha).toLocaleDateString('es-MX') : '',
+        rfcEmisor: c.emisor?.rfc    || '',
+        nomEmisor: c.emisor?.nombre || '',
+        rfcRec:    c.receptor?.rfc    || '',
+        nomRec:    c.receptor?.nombre || '',
+        subTotal:  (c.subTotal || 0) - (c.descuento || 0),
+        ivaTrasl:  c.impuestos?.totalImpuestosTrasladados || 0,
+        ivaRet:    c.impuestos?.totalImpuestosRetenidos   || 0,
+        total:     c.total || 0,
+        estadoERP: c.erpStatus || '—',
+        nota:      'Pendiente de timbrado — sin UUID fiscal asignado',
+      });
+      ['subTotal','ivaTrasl','ivaRet','total'].forEach(k => { row.getCell(k).numFmt = MXN; });
+      row.eachCell({ includeEmpty: true }, cell => { cell.fill = FG_SIN; });
+      sumSinTotal += c.total || 0;
+    }
+
+    // Fila totales
+    const trSin = sSin.addRow({ tipo: `TOTAL (${sinUuidCfdis.length})`, total: fmtNum(sumSinTotal) });
+    trSin.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+    trSin.getCell('total').numFmt = MXN;
   }
 
   // ── Respuesta ──────────────────────────────────────────────────────────────

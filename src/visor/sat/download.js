@@ -131,7 +131,7 @@ const soapCall = async (url, soapAction, body, token) => {
 
 // Patrón SAT oficial: Authorization: WRAP access_token="Token" (Solicitud, Verifica, Descarga)
 // Ref: Documentación SAT "Servicio de Verificación de Descarga Masiva 2023" §4 y §5
-const soapCallBearer = async (url, soapAction, envelope, token) => {
+const soapCallBearer = async (url, soapAction, envelope, token, timeoutMs = 60000) => {
   const quotedAction = `"${soapAction}"`;
   try {
     const response = await axios.post(url, envelope, {
@@ -140,7 +140,7 @@ const soapCallBearer = async (url, soapAction, envelope, token) => {
         'SOAPAction': quotedAction,
         'Authorization': `WRAP access_token="${token}"`,
       },
-      timeout: 60000,
+      timeout: timeoutMs,
     });
     return response.data;
   } catch (axiosErr) {
@@ -214,7 +214,7 @@ const TIPO_MAP = {
 };
 
 const solicitar = async (params) => {
-  const { rfcSolicitante, fechaInicio, fechaFin, tipoSolicitud = 'CFDI', tipoComprobante = 'Emitidos', creds } = params;
+  const { rfcSolicitante, fechaInicio, fechaFin, tipoSolicitud = 'CFDI', tipoComprobante = 'Emitidos', creds, folioFiscalUUID } = params;
 
   const { token, rfcCertificado } = await getToken(rfcSolicitante, creds);
   const rfcFirma = rfcCertificado ?? rfcSolicitante;
@@ -235,10 +235,9 @@ const solicitar = async (params) => {
       RfcSolicitante: rfcFirmaUsado,
       TipoSolicitud:  tipoSolicitud,
     };
-    if (tipoDeComprobante) solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
-    // El SAT no permite descargar XMLs cancelados en solicitudes de Recibidos (error 301).
-    // Se limita a vigentes para evitar el rechazo.
-    if (esRecibidosReq) solicitudAttrs.EstadoComprobante = '1';
+    if (tipoDeComprobante)  solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
+    if (esRecibidosReq)     solicitudAttrs.EstadoComprobante = '1';
+    if (folioFiscalUUID)    solicitudAttrs.FolioFiscalUUID   = folioFiscalUUID.toUpperCase();
 
     const canonical = canonizarSolicitud(solicitudAttrs, ns);
     logger.info(`[SatDownload] solicitar() — canonical solicitud: ${canonical}`);
@@ -250,13 +249,14 @@ const solicitar = async (params) => {
 
     const tipoAttr   = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
     const estadoAttr = esRecibidosReq ? ' EstadoComprobante="1"' : '';
+    const uuidAttr   = folioFiscalUUID ? ` FolioFiscalUUID="${folioFiscalUUID.toUpperCase()}"` : '';
 
     return `<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" xmlns:des="${ns}">
   <s:Header/>
   <s:Body>
     <des:${operacion}>
-      <des:solicitud${estadoAttr} FechaFinal="${fechaFin}" FechaInicial="${fechaInicio}" ${rfcAttrKey}="${rfcSolicitante}" RfcSolicitante="${rfcFirmaUsado}"${tipoAttr} TipoSolicitud="${tipoSolicitud}">
+      <des:solicitud${estadoAttr}${uuidAttr} FechaFinal="${fechaFin}" FechaInicial="${fechaInicio}" ${rfcAttrKey}="${rfcSolicitante}" RfcSolicitante="${rfcFirmaUsado}"${tipoAttr} TipoSolicitud="${tipoSolicitud}">
         ${firma}
       </des:solicitud>
     </des:${operacion}>
@@ -267,7 +267,7 @@ const solicitar = async (params) => {
   const resultTag = `${operacion}Result`;
 
   let envelope   = await buildEnvelope(rfcFirma);
-  let xmlResp    = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, token);
+  let xmlResp    = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, token, 120000);
 
   let idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') || extraerValor(xmlResp, 'IdSolicitud');
   let codEstatus  = extraerAtributo(xmlResp, resultTag, 'CodEstatus');
@@ -282,7 +282,7 @@ const solicitar = async (params) => {
     logger.info(`[SatDownload] rfcFirma en retry: ${rfcFirmaFresh}`);
 
     envelope    = await buildEnvelope(rfcFirmaFresh);
-    xmlResp     = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, fresh.token);
+    xmlResp     = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, fresh.token, 120000);
     idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') || extraerValor(xmlResp, 'IdSolicitud');
     codEstatus  = extraerAtributo(xmlResp, resultTag, 'CodEstatus');
     mensaje     = extraerAtributo(xmlResp, resultTag, 'Mensaje');
@@ -293,12 +293,11 @@ const solicitar = async (params) => {
     invalidarToken(rfcSolicitante);
 
     // Códigos especiales documentados por el SAT
-    if (codEstatus === '5005') {
-      throw new Error(
-        `SAT [5005]: Solicitud duplicada — ya existe una solicitud activa con los mismos parámetros ` +
-        `(mismo RFC, fechas y tipo). Espera a que termine o usa el checkpoint existente.`
-      );
-    }
+    if (codEstatus === '301') throw new Error(`SAT [301]: XML de la solicitud mal formado. Revisar la firma generada.`);
+    if (codEstatus === '302') throw new Error(`SAT [302]: Sello de la solicitud mal formado. Revisar crearFirmaSolicitud().`);
+    if (codEstatus === '303') throw new Error(`SAT [303]: El sello no corresponde con el RfcSolicitante. El RFC del certificado no coincide con el RFC de la solicitud.`);
+    if (codEstatus === '304') throw new Error(`SAT [304]: Certificado revocado o caducado. La e.firma del RFC está vencida o fue revocada por el SAT.`);
+    if (codEstatus === '305') throw new Error(`SAT [305]: Certificado inválido. Verifica que el archivo .cer corresponda al RFC solicitante.`);
     if (codEstatus === '5002') {
       throw new Error(
         `SAT [5002]: Se agotó el límite de solicitudes de por vida para este RFC y rango de fechas. ` +
@@ -309,6 +308,17 @@ const solicitar = async (params) => {
       throw new Error(
         `SAT [5003]: El rango solicitado supera el tope máximo de CFDIs por solicitud. ` +
         `Reduce el rango de fechas a períodos más cortos.`
+      );
+    }
+    if (codEstatus === '5005') {
+      throw new Error(
+        `SAT [5005]: Solicitud duplicada — ya existe una solicitud activa con los mismos parámetros ` +
+        `(mismo RFC, fechas y tipo). Espera a que termine o usa el checkpoint existente.`
+      );
+    }
+    if (codEstatus === '5006') {
+      throw new Error(
+        `SAT [5006]: Error interno en el proceso del SAT. Es transitorio — reintenta en unos minutos.`
       );
     }
     if (codEstatus === '404') {
@@ -398,7 +408,8 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
       VERIFICA_URL,
       'http://DescargaMasivaTerceros.sat.gob.mx/IVerificaSolicitudDescargaService/VerificaSolicitudDescarga',
       envelope,
-      token
+      token,
+      120000
     );
 
     const estadoSolicitud = extraerAtributo(xmlResp, 'VerificaSolicitudDescargaResult', 'EstadoSolicitud') ||
@@ -542,11 +553,26 @@ const _descargarZipBuffer = async (idPaquete, rfcSolicitante, creds) => {
         'http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar',
         envelope,
         token,
+        120000, // 2 min — paquetes grandes pueden superar 15 MB
       );
 
       const paqueteMatch = xmlResp.match(/<[^:]*:?Paquete[^>]*>([\s\S]+?)<\/[^:]*:?Paquete>/);
       if (!paqueteMatch || !paqueteMatch[1]) {
-        throw new Error(`No se encontró el paquete en la respuesta del SAT para IdPaquete: ${idPaquete}`);
+        const codEstatusDesc =
+          extraerAtributo(xmlResp, 'RespuestaDescargaMasivaTercerosSalida', 'CodEstatus') ||
+          extraerAtributo(xmlResp, 'PeticionDescargaMasivaTercerosRespuesta', 'CodEstatus') ||
+          extraerValor(xmlResp, 'CodEstatus');
+        if (codEstatusDesc === '5008') {
+          throw new Error(`SAT [5008]: Límite de 2 descargas por paquete excedido para ${idPaquete}. No reintentar.`);
+        }
+        if (codEstatusDesc === '5004') {
+          throw new Error(`SAT [5004]: Paquete ${idPaquete} no encontrado en el SAT.`);
+        }
+        logger.warn(`[SatDownload] Sin <Paquete>: CodEstatus=${codEstatusDesc}, resp: ${xmlResp.slice(0, 500)}`);
+        throw new Error(
+          `No se encontró el paquete en la respuesta del SAT para IdPaquete: ${idPaquete}` +
+          (codEstatusDesc ? ` (CodEstatus=${codEstatusDesc})` : ''),
+        );
       }
 
       let zipBase64   = paqueteMatch[1].trim();
@@ -557,6 +583,8 @@ const _descargarZipBuffer = async (idPaquete, rfcSolicitante, creds) => {
     } catch (err) {
       ultimoError = err;
       logger.warn(`[SatDownload] _descargarZipBuffer intento ${intento}/${MAX_INTENTOS} fallido para ${idPaquete}: ${err.message}`);
+      // Errores definitivos del SAT — no tiene sentido reintentar
+      if (err.message.includes('SAT [5008]') || err.message.includes('SAT [5004]')) break;
       if (intento < MAX_INTENTOS) {
         const espera = ESPERA_BASE_MS * intento;
         logger.info(`[SatDownload] Reintentando en ${espera / 1000} s...`);
@@ -585,22 +613,29 @@ const parsearMetadataTxt = (contenido) => {
     const n = nombre.toLowerCase()
       .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // quitar acentos
       .trim();
-    if (n.includes('folio fiscal'))                              return 'uuid';
-    if (n === 'rfc emisor' || n.startsWith('rfc emisor'))        return 'rfcEmisor';
-    if (n.includes('emisor') && n.includes('razon'))             return 'nombreEmisor';
-    if (n.includes('emisor') && n.includes('nombre'))            return 'nombreEmisor';
-    if (n === 'rfc receptor' || n.startsWith('rfc receptor'))    return 'rfcReceptor';
-    if (n.includes('receptor') && n.includes('razon'))           return 'nombreReceptor';
-    if (n.includes('receptor') && n.includes('nombre'))          return 'nombreReceptor';
-    if (n.includes('fecha') && n.includes('emision'))            return 'fecha';
-    if (n.includes('fecha') && n.includes('certific'))           return 'fechaCert';
-    if (n.includes('pac'))                                       return 'rfcPac';
+    if (n.includes('folio fiscal'))                                                                return 'uuid';
+    if (n === 'rfc emisor' || n.startsWith('rfc emisor') || n === 'rfcemisor' || (n.includes('rfc') && n.includes('emisor')))        return 'rfcEmisor';
+    if (n.includes('emisor') && (n.includes('razon') || n.includes('nombre')))                 return 'nombreEmisor';
+    if (n === 'rfc receptor' || n.startsWith('rfc receptor') || n === 'rfcreceptor' || (n.includes('rfc') && n.includes('receptor'))) return 'rfcReceptor';
+    if (n.includes('receptor') && (n.includes('razon') || n.includes('nombre')))              return 'nombreReceptor';
+    if (n.includes('fecha') && n.includes('cancel'))                                           return 'fechaCancelacion';
+    if (n.includes('fecha') && n.includes('certific'))                                         return 'fechaCert';
+    if (n.includes('fecha') && n.includes('emision'))                                          return 'fecha';
+    if (n === 'fecha')                                                                          return 'fecha';
+    if (n.includes('subtotal') || n === 'sub total')                                           return 'subTotal';
+    if (n === 'descuento')                                                                      return 'descuento';
     if (n === 'total' || n === 'monto' || n === 'monto total' ||
-        n === 'total del cfdi' || n.startsWith('monto') || n.startsWith('total'))
-                                                                 return 'total';
-    if (n.includes('efecto'))                                    return 'efecto';
-    if (n.includes('estado'))                                    return 'estado';
-    if (n.includes('fecha') && n.includes('cancel'))             return 'fechaCancelacion';
+        n === 'total del cfdi' || n.startsWith('monto') || n.startsWith('total'))              return 'total';
+    if (n === 'moneda')                                                                        return 'moneda';
+    if (n.includes('tipo') && n.includes('cambio'))                                            return 'tipoCambio';
+    if (n.includes('metodo') && n.includes('pago'))                                            return 'metodoPago';
+    if (n.includes('forma') && n.includes('pago'))                                             return 'formaPago';
+    if (n.includes('uso') && n.includes('cfdi'))                                               return 'usoCFDI';
+    if (n === 'version' || n === 'version del cfdi' || n.includes('version cfdi'))             return 'version';
+    if (n === 'concepto' || n.includes('descripcion') && !n.includes('emisor') && !n.includes('receptor')) return 'concepto';
+    if (n.includes('efecto') || (n.includes('tipo') && n.includes('comprobante')))             return 'efecto';
+    if (n.includes('pac'))                                                                     return 'rfcPac';
+    if (n.includes('estado'))                                                                  return 'estado';
     return n.replace(/\s+/g, '_');
   };
 
@@ -614,7 +649,10 @@ const parsearMetadataTxt = (contenido) => {
     const campos = lineas[i].split(sep).map(limpiar);
     const obj    = {};
     claves.forEach((clave, idx) => { obj[clave] = campos[idx] ?? ''; });
-    if (obj.total !== undefined) obj.total = parseMonto(obj.total);
+    if (obj.total    !== undefined) obj.total    = parseMonto(obj.total);
+    if (obj.subTotal !== undefined) obj.subTotal = parseMonto(obj.subTotal);
+    if (obj.descuento !== undefined) obj.descuento = parseMonto(obj.descuento);
+    if (obj.tipoCambio !== undefined) obj.tipoCambio = parseMonto(obj.tipoCambio) || 1;
     if (obj.uuid) registros.push(obj);
   }
   return registros;

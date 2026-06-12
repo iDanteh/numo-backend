@@ -573,9 +573,10 @@ const parseKey = async (keyBuf, password) => {
             const encCh  = readBerChildren(pbes2Ch[1].value);
             const encOid = forge.asn1.derToOid(encCh[0].value.toString('binary'));
             const PBES2_ENC = {
-              '2.16.840.1.101.3.4.1.2':  { cipher: 'aes-128-cbc', kLen: 16 },
-              '2.16.840.1.101.3.4.1.22': { cipher: 'aes-192-cbc', kLen: 24 },
-              '2.16.840.1.101.3.4.1.42': { cipher: 'aes-256-cbc', kLen: 32 },
+              '2.16.840.1.101.3.4.1.2':  { cipher: 'aes-128-cbc',  kLen: 16 },
+              '2.16.840.1.101.3.4.1.22': { cipher: 'aes-192-cbc',  kLen: 24 },
+              '2.16.840.1.101.3.4.1.42': { cipher: 'aes-256-cbc',  kLen: 32 },
+              '1.2.840.113549.3.7':       { cipher: 'des-ede3-cbc', kLen: 24 },
             };
             const encSpec  = PBES2_ENC[encOid];
             if (!encSpec) throw new Error(`inner PBES2: cifrado no soportado: ${encOid}`);
@@ -673,9 +674,10 @@ const parseKey = async (keyBuf, password) => {
         const encCh  = readBerChildren(pbes2Ch[1].value);
         const encOid = forge.asn1.derToOid(encCh[0].value.toString('binary'));
         const PBES2_ENC = {
-          '2.16.840.1.101.3.4.1.2':  { cipher: 'aes-128-cbc', kLen: 16 },
-          '2.16.840.1.101.3.4.1.22': { cipher: 'aes-192-cbc', kLen: 24 },
-          '2.16.840.1.101.3.4.1.42': { cipher: 'aes-256-cbc', kLen: 32 },
+          '2.16.840.1.101.3.4.1.2':  { cipher: 'aes-128-cbc',  kLen: 16 },
+          '2.16.840.1.101.3.4.1.22': { cipher: 'aes-192-cbc',  kLen: 24 },
+          '2.16.840.1.101.3.4.1.42': { cipher: 'aes-256-cbc',  kLen: 32 },
+          '1.2.840.113549.3.7':       { cipher: 'des-ede3-cbc', kLen: 24 },
         };
         const encSpec  = PBES2_ENC[encOid];
         if (!encSpec) throw new Error(`PBES2: cifrado de encriptación no soportado: ${encOid}`);

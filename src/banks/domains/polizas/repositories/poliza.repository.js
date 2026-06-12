@@ -1,19 +1,35 @@
 'use strict';
 
-const { Op, Transaction, QueryTypes } = require('sequelize');
+const { Transaction, QueryTypes } = require('sequelize');
 const { sequelize }        = require('../../../../config/database.postgres');
-const { Poliza, PolizaMovimiento, AccountPlan } = require('../../../../shared/models/postgres');
+const { Poliza, PolizaMovimiento, AccountPlan, CentroCosto, CfdiMappingRule } = require('../../../../shared/models/postgres');
 const CFDI = require('../../../../visor/models/CFDI');
 
-// ── Inclusión estándar de movimientos con cuenta ──────────────────────────────
+// ── Inclusión estándar de movimientos con cuenta y centro de costo ───────────
 const MOVIMIENTOS_INCLUDE = {
   model:      PolizaMovimiento,
   as:         'movimientos',
-  include: [{
-    model:      AccountPlan,
-    as:         'cuenta',
-    attributes: ['id', 'codigo', 'nombre', 'tipo', 'naturaleza'],
-  }],
+  include: [
+    {
+      model:      AccountPlan,
+      as:         'cuenta',
+      attributes: ['id', 'codigo', 'nombre', 'tipo', 'naturaleza'],
+    },
+    {
+      model:      CentroCosto,
+      as:         'centroCostoObj',
+      attributes: ['id', 'clave', 'sucursal', 'serieFacturacion'],
+      required:   false,
+    },
+    {
+      model:      CfdiMappingRule,
+      as:         'regla',
+      attributes: ['id', 'nombre', 'prioridad', 'tipoComprobante', 'metodoPago', 'formaPago',
+                   'rfcEmisor', 'rfcReceptor', 'tipoRelacion', 'tasaIva', 'tieneDescuento',
+                   'cuentaCargo', 'cuentaAbono', 'cuentaIva', 'isActive'],
+      required:   false,
+    },
+  ],
   order: [['orden', 'ASC']],
 };
 
@@ -120,25 +136,32 @@ async function findById(id) {
   if (uuids.length > 0) {
     const cfdis = await CFDI.find(
       { uuid: { $in: uuids } },
-      { uuid: 1, satStatus: 1, erpStatus: 1, source: 1, _id: 0 },
+      { uuid: 1, satStatus: 1, erpStatus: 1, source: 1, metodoPago: 1, formaPago: 1, _id: 0 },
     ).lean();
 
     // Consolidar por uuid — un UUID puede tener registro SAT y ERP por separado
     const byUuid = {};
     for (const c of cfdis) {
-      if (!byUuid[c.uuid]) byUuid[c.uuid] = { satStatus: null, erpStatus: null, sources: new Set() };
+      if (!byUuid[c.uuid]) byUuid[c.uuid] = { satStatus: null, erpStatus: null, sources: new Set(), metodoPago: null, formaPago: null };
       byUuid[c.uuid].sources.add(c.source);
-      if (c.source === 'SAT' && c.satStatus) byUuid[c.uuid].satStatus = c.satStatus;
-      if (c.source === 'ERP' && c.erpStatus) byUuid[c.uuid].erpStatus = c.erpStatus;
+      if (c.source === 'SAT' && c.satStatus)    byUuid[c.uuid].satStatus  = c.satStatus;
+      if (c.source === 'ERP' && c.erpStatus)    byUuid[c.uuid].erpStatus  = c.erpStatus;
+      if (c.metodoPago && !byUuid[c.uuid].metodoPago) byUuid[c.uuid].metodoPago = c.metodoPago;
+      if (c.formaPago  && !byUuid[c.uuid].formaPago)  byUuid[c.uuid].formaPago  = c.formaPago;
     }
 
     const cfdiAlertMap = {};
+    const cfdiMetaMap  = {};
     for (const uuid of uuids) {
       const info = byUuid[uuid];
       if (!info) {
         cfdiAlertMap[uuid] = { alerts: ['no_encontrado'] };
         continue;
       }
+
+      // Meta (metodoPago / formaPago) — siempre disponible
+      cfdiMetaMap[uuid] = { metodoPago: info.metodoPago, formaPago: info.formaPago };
+
       const alerts = [];
       const hasSat = info.sources.has('SAT');
       const hasErp = info.sources.has('ERP');
@@ -156,6 +179,9 @@ async function findById(id) {
 
     if (Object.keys(cfdiAlertMap).length > 0) {
       poliza.dataValues.cfdiAlertMap = cfdiAlertMap;
+    }
+    if (Object.keys(cfdiMetaMap).length > 0) {
+      poliza.dataValues.cfdiMetaMap = cfdiMetaMap;
     }
   }
 
@@ -236,6 +262,59 @@ async function destroy(id) {
   return count > 0;
 }
 
+/** Devuelve los asientos (agrupados por cfdi_uuid + poliza) donde debe ≠ haber,
+ *  enriquecidos con los datos del CFDI desde MongoDB. */
+async function findDescuadradas({ rfc, ejercicio, periodo, estado, polizaId }) {
+  const conditions   = ['pm.cfdi_uuid IS NOT NULL', 'p.rfc = :rfc'];
+  const replacements = { rfc };
+  if (polizaId)  { conditions.push('p.id        = :polizaId'); replacements.polizaId  = Number(polizaId); }
+  if (ejercicio) { conditions.push('p.ejercicio = :ejercicio'); replacements.ejercicio = Number(ejercicio); }
+  if (periodo)   { conditions.push('p.periodo   = :periodo');   replacements.periodo   = Number(periodo); }
+  if (estado)    { conditions.push('p.estado    = :estado');    replacements.estado    = estado; }
+
+  const rows = await sequelize.query(`
+    SELECT
+      pm.cfdi_uuid                                               AS "cfdiUuid",
+      pm.poliza_id                                               AS "polizaId",
+      p.tipo,
+      p.numero,
+      p.fecha::text                                              AS fecha,
+      p.estado,
+      ROUND(SUM(pm.debe)::numeric,  2)                          AS "totalDebe",
+      ROUND(SUM(pm.haber)::numeric, 2)                          AS "totalHaber",
+      ROUND(ABS(SUM(pm.debe) - SUM(pm.haber))::numeric, 2)      AS diferencia
+    FROM poliza_movimientos pm
+    JOIN polizas p ON p.id = pm.poliza_id
+    WHERE ${conditions.join(' AND ')}
+    GROUP BY pm.cfdi_uuid, pm.poliza_id, p.tipo, p.numero, p.fecha, p.estado
+    HAVING ABS(SUM(pm.debe) - SUM(pm.haber)) > 0.01
+    ORDER BY diferencia DESC
+  `, { replacements, type: QueryTypes.SELECT });
+
+  if (rows.length === 0) return [];
+
+  const uuids = [...new Set(rows.map(r => r.cfdiUuid))];
+  const cfdis = await CFDI.find(
+    { uuid: { $in: uuids } },
+    { uuid: 1, tipoDeComprobante: 1, metodoPago: 1, formaPago: 1,
+      total: 1, subTotal: 1, fecha: 1, folio: 1, serie: 1,
+      moneda: 1, exportacion: 1, lugarExpedicion: 1,
+      'emisor.rfc': 1, 'emisor.nombre': 1, 'emisor.regimenFiscal': 1,
+      'receptor.rfc': 1, 'receptor.nombre': 1, 'receptor.usoCfdi': 1,
+      'impuestos.totalImpuestosTrasladados': 1,
+      satStatus: 1, erpStatus: 1, source: 1, _id: 0 },
+  ).lean();
+
+  const cfdiMap = {};
+  for (const c of cfdis) {
+    if (!cfdiMap[c.uuid]) cfdiMap[c.uuid] = { ...c, sources: [] };
+    if (!cfdiMap[c.uuid].sources.includes(c.source)) cfdiMap[c.uuid].sources.push(c.source);
+    if (c.source === 'SAT') cfdiMap[c.uuid].satStatus = c.satStatus;
+  }
+
+  return rows.map(r => ({ ...r, cfdi: cfdiMap[r.cfdiUuid] ?? null }));
+}
+
 /** Trae todas las pólizas contabilizadas de un periodo con sus movimientos y cuenta. */
 async function findAllContabilizadas({ rfc, ejercicio, periodo }) {
   return Poliza.findAll({
@@ -245,4 +324,4 @@ async function findAllContabilizadas({ rfc, ejercicio, periodo }) {
   });
 }
 
-module.exports = { findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas };
+module.exports = { findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas, findDescuadradas };

@@ -256,10 +256,17 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   // Sin esto, el SAT queda con el status anterior (ej. 'not_in_erp') aunque
   // el ERP ya lo encontró y lo marcó como 'match'/'discrepancy'/'warning'.
   if (satCfdi) {
-    await CFDI.findByIdAndUpdate(satCfdi._id, {
+    const satUpdate = {
       lastComparisonStatus: status,
       lastComparisonAt: new Date(),
-    });
+    };
+    // Propagar satStatus desde el live check al documento SAT local:
+    // sin esto, el documento SAT nunca sabe que fue cancelado/vigente según el SOAP.
+    if (satResponse?.state && ['Vigente', 'Cancelado', 'No Encontrado'].includes(satResponse.state)) {
+      satUpdate.satStatus    = satResponse.isCancelled ? 'Cancelado' : satResponse.state;
+      satUpdate.satLastCheck = new Date();
+    }
+    await CFDI.findByIdAndUpdate(satCfdi._id, satUpdate);
   }
 
   const comp = await saveComparison({
@@ -440,7 +447,7 @@ const compareParties = (erp, sat) => {
   if (erp.receptor.rfc !== sat.receptor.rfc)
     diffs.push({ field: 'receptor.rfc', erpValue: erp.receptor.rfc, satValue: sat.receptor.rfc, severity: 'critical' });
   // Régimen fiscal (advertencia)
-  if ((erp.emisor.regimenFiscal || '') !== (sat.emisor.regimenFiscal || ''))
+  if (erp.emisor.regimenFiscal && (erp.emisor.regimenFiscal || '') !== (sat.emisor.regimenFiscal || ''))
     diffs.push({ field: 'emisor.regimenFiscal', erpValue: erp.emisor.regimenFiscal, satValue: sat.emisor.regimenFiscal, severity: 'warning' });
   // Nombres (advertencia — pueden diferir por abreviaturas)
   if ((erp.emisor.nombre || '').toUpperCase().trim() !== (sat.emisor.nombre || '').toUpperCase().trim() &&
@@ -558,6 +565,23 @@ const compareGeneralFields = (erp, sat) => {
       diffs.push({ field: 'metodoPago', erpValue: erp.metodoPago, satValue: sat.metodoPago, severity: 'warning' });
   }
 
+  // Validación fiscal: formaPago='99' (Por Definir) es incompatible con metodoPago='PUE'.
+  // El SAT solo permite formaPago='99' cuando metodoPago='PPD' (pago diferido).
+  // Un CFDI PUE debe tener la forma de pago real (01-30), nunca '99'.
+  if (!esPago) {
+    const erpFP = normCodigo(erp.formaPago);
+    const erpMP = normCodigo(erp.metodoPago);
+    if (erpFP === '99' && erpMP === 'PUE') {
+      diffs.push({
+        field: 'formaPago+metodoPago',
+        erpValue: `formaPago=99 + metodoPago=PUE`,
+        satValue: 'Combinación inválida — formaPago=99 solo aplica con PPD',
+        severity: 'critical',
+        type: 'FORMA_METODO_PAGO_INVALIDO',
+      });
+    }
+  }
+
   // Versión CFDI (advertencia)
   if ((erp.version || '4.0') !== (sat.version || '4.0'))
     diffs.push({ field: 'version', erpValue: erp.version, satValue: sat.version, severity: 'warning' });
@@ -601,7 +625,8 @@ const mapDiffToType = (field) => {
   if (field === 'total' || field === 'subTotal' || field === 'descuento') return 'AMOUNT_MISMATCH';
   if (field.includes('impuesto'))        return 'TAX_CALCULATION_ERROR';
   if (field === 'fecha')                 return 'DATE_MISMATCH';
-  if (field === 'tipoDeComprobante')     return 'OTHER';
+  if (field === 'tipoDeComprobante')           return 'OTHER';
+  if (field === 'formaPago+metodoPago')        return 'FORMA_METODO_PAGO_INVALIDO';
   if (field === 'moneda' || field === 'tipoCambio') return 'AMOUNT_MISMATCH';
   if (field === 'version')               return 'CFDI_VERSION_MISMATCH';
   if (field.includes('regimenFiscal'))   return 'REGIME_MISMATCH';
@@ -716,7 +741,7 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
   logger.info(`[Batch] Iniciando sesión ${sessionId} con ${erpCfdiIds.length} ERP + ${satOnlyIds.length} solo-SAT`);
 
   const results = { success: 0, failed: 0, discrepancies: 0, errors: [], sessionId };
-  const statusCounts = { match: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, error: 0 };
+  const statusCounts = { match: 0, match_cancelled: 0, warning: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, error: 0 };
   const concurrency = options.concurrency || 5;
 
   // ── 1. Comparar CFDIs ERP ──────────────────────────────────────────────────

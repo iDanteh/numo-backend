@@ -320,8 +320,8 @@ async function listMovements(filters) {
       const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
       _amountLo = decimalPlaces === 0 ? num             : num - tolerance;
       _amountHi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
-      orClauses.push({ deposito: { $gte: _amountLo, $lt: _amountHi } });
-      orClauses.push({ retiro:   { $gte: _amountLo, $lt: _amountHi } });
+      orClauses.push({ deposito: { $gte: _amountLo, $lte: _amountHi } });
+      orClauses.push({ retiro:   { $gte: _amountLo, $lte: _amountHi } });
     }
 
     filter.$or = orClauses;
@@ -674,7 +674,16 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         const montoOk =
           (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
           (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
-        return montoOk;
+        if (!montoOk) return false;
+        // referenciaNumerica puede ser código de sucursal/ruta (no ID de transacción).
+        // Si ambos lados tienen numeroAutorizacion real, debe coincidir; de lo contrario
+        // dos transacciones distintas con misma ref+monto serían tratadas como duplicado.
+        const incomingHasAuth = m.numeroAutorizacion && !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion);
+        const existingHasAuth = existing.numeroAutorizacion && !isBBVAPseudoAuth(existing.banco, existing.numeroAutorizacion);
+        if (incomingHasAuth && existingHasAuth) {
+          return authMatch(m.numeroAutorizacion, existing.numeroAutorizacion);
+        }
+        return true;
       });
       if (!incoming) continue;
       // Enriquecer numeroAutorizacion si el reimport la trae y el existente no la tiene
@@ -718,7 +727,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       const dbCands = await BankMovement.find(
         { $or: orConds },
         '_id banco fecha deposito retiro saldo concepto numeroAutorizacion referenciaNumerica',
-      ).lean();
+      ).limit(5000).lean();
 
       // Group DB candidates by banco+fecha key
       const candsByKey = new Map();
@@ -1059,12 +1068,13 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     let sinReglasAviso = false;
 
     if (insertados > 0 && bancoValidado) {
-      const [catRules, ocultarRules] = await Promise.all([
+      const [catRules, ocultarRules, cambiarEstadoRules] = await Promise.all([
         bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
         bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+        bankRuleRepo.listByBanco(bancoValidado, { accion: 'cambiar_estado' }),
       ]);
 
-      if (catRules.length === 0 && ocultarRules.length === 0) {
+      if (catRules.length === 0 && ocultarRules.length === 0 && cambiarEstadoRules.length === 0) {
         sinReglasAviso = true;
       } else {
         const foliosNuevos   = nuevos.map(m => m.folio);
@@ -1081,6 +1091,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
           if ($set.categoria) categorizados++;
           for (const rule of ocultarRules) {
             if (matchRegla(mov, rule)) { $set.oculto = true; break; }
+          }
+          for (const rule of cambiarEstadoRules) {
+            if (matchRegla(mov, rule)) { $set.status = rule.estadoDestino; break; }
           }
           if (Object.keys($set).length > 0) {
             ops.push({ updateOne: { filter: { _id: mov._id }, update: { $set } } });
@@ -1169,9 +1182,10 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
   let categorizado = false;
 
   if (bancoValidado) {
-    const [catRules, ocultarRules] = await Promise.all([
+    const [catRules, ocultarRules, cambiarEstadoRules] = await Promise.all([
       bankRuleRepo.listByBanco(bancoValidado, { accion: 'categorizar' }),
       bankRuleRepo.listByBanco(bancoValidado, { accion: 'ocultar' }),
+      bankRuleRepo.listByBanco(bancoValidado, { accion: 'cambiar_estado' }),
     ]);
 
     for (const rule of catRules) {
@@ -1184,7 +1198,11 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
     for (const rule of ocultarRules) {
       if (matchRegla(nuevo, rule)) { nuevo.oculto = true; break; }
     }
-    if (categorizado || nuevo.oculto) await nuevo.save();
+    let estadoCambiado = false;
+    for (const rule of cambiarEstadoRules) {
+      if (matchRegla(nuevo, rule)) { nuevo.status = rule.estadoDestino; estadoCambiado = true; break; }
+    }
+    if (categorizado || nuevo.oculto || estadoCambiado) await nuevo.save();
   }
 
   // ── 7. Emitir evento ───────────────────────────────────────────────

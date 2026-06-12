@@ -23,6 +23,7 @@ const Role              = require('./Role');
 const Poliza            = require('./Poliza');
 const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
+const CentroCosto       = require('./CentroCosto');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -39,6 +40,14 @@ Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimien
 PolizaMovimiento.belongsTo(Poliza,       { foreignKey: 'polizaId', as: 'poliza' });
 PolizaMovimiento.belongsTo(AccountPlan,  { foreignKey: 'cuentaId', as: 'cuenta' });
 AccountPlan.hasMany   (PolizaMovimiento, { foreignKey: 'cuentaId', as: 'movimientos' });
+
+/** Centros de costo */
+PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
+CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movimientos' });
+
+/** Regla de mapeo CFDI usada al generar el movimiento */
+PolizaMovimiento.belongsTo(CfdiMappingRule, { foreignKey: 'reglaId', as: 'regla' });
+CfdiMappingRule.hasMany(PolizaMovimiento,   { foreignKey: 'reglaId', as: 'movimientosGenerados' });
 
 // ── Sincronización ────────────────────────────────────────────────────────────
 
@@ -62,18 +71,28 @@ async function syncModels() {
     Role.sync({ alter: !isProd }),
   ]);
 
+  // Columna intercompañía en entidades (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE entities
+      ADD COLUMN IF NOT EXISTS es_intercompania BOOLEAN NOT NULL DEFAULT FALSE
+  `).catch(e => console.warn('[syncModels] ADD COLUMN es_intercompania:', e.message));
+
+  // CentroCosto: force:false para evitar conflictos con alter en primera ejecución.
+  // La columna centro_costo_id en poliza_movimientos se agrega vía raw SQL más abajo.
+  await CentroCosto.sync({ force: false });
+
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await AccountPlan.sync({ alter: !isProd });
 
   // PeriodoFiscal depende de users
   await PeriodoFiscal.sync({ alter: !isProd });
 
+  // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
+  await CfdiMappingRule.sync({ alter: !isProd });
+
   // Pólizas: force:false para no tocar ENUMs ni datos existentes.
   await Poliza.sync({ force: false });
   await PolizaMovimiento.sync({ force: false });
-
-  // Reglas de mapeo CFDI (sin ENUMs problemáticos excepto tipoComprobante)
-  await CfdiMappingRule.sync({ alter: !isProd });
 
   // Agregar columnas de auditoría si no existen (seguro correrlo múltiples veces)
   await Poliza.sequelize.query(`
@@ -91,6 +110,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS rfc_tercero VARCHAR(13)
   `).catch(() => {});
 
+  // Centro de costo FK en movimientos (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS centro_costo_id INTEGER REFERENCES centros_costo(id)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN centro_costo_id:', e.message));
+
   // Permitir cuentaId nulo (movimientos con cuenta faltante en catálogo)
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ALTER COLUMN cuenta_id DROP NOT NULL`
@@ -99,6 +124,49 @@ async function syncModels() {
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ADD COLUMN IF NOT EXISTS cuenta_faltante BOOLEAN NOT NULL DEFAULT FALSE`
   ).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_faltante:', e.message));
+
+  // Trazabilidad de regla de mapeo en movimientos
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS regla_id     INTEGER REFERENCES cfdi_mapping_rules(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS regla_nombre VARCHAR(200)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN regla_id/regla_nombre:', e.message));
+
+  // Campos SAT del CFDI en movimientos (tipoComprobante, metodoPago, formaPago, folio, rfcEmisor, rfcReceptor)
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS tipo_comprobante VARCHAR(1),
+      ADD COLUMN IF NOT EXISTS metodo_pago      VARCHAR(3),
+      ADD COLUMN IF NOT EXISTS forma_pago       VARCHAR(3),
+      ADD COLUMN IF NOT EXISTS folio            VARCHAR(40),
+      ADD COLUMN IF NOT EXISTS rfc_emisor       VARCHAR(13),
+      ADD COLUMN IF NOT EXISTS rfc_receptor     VARCHAR(13)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN SAT fields:', e.message));
+
+  // Clasificación de negocio en movimientos y reglas de mapeo
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (movimientos):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (reglas):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_iva_abono VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_iva_abono (reglas):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_cargo_mixto0 VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_cargo_mixto0 (reglas):', e.message));
+
+  await BankRule.sequelize.query(`
+    ALTER TABLE bank_rules ADD COLUMN IF NOT EXISTS estado_destino VARCHAR(30)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN estado_destino (bank_rules):', e.message));
 
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`
@@ -122,4 +190,4 @@ async function syncModels() {
   `).catch(() => {});
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, syncModels };

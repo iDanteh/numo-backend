@@ -510,6 +510,9 @@ const importExcel = asyncHandler(async (req, res) => {
   let nuevos = 0, actualizados = 0;
   const success = [], failed = [], duplicados = [];
 
+  // Acumula UUIDs relacionados por CFDI P para inferir tasaIvaInferida al final
+  const pagosRelMap = new Map(); // cfdiUuid → Set<uuidRel>
+
   for (const row of dataRows) {
     // UUID — columna clave; si está vacía se omite la fila completa
     const uuidRaw = getCell(row, 'UUID');
@@ -584,13 +587,50 @@ const importExcel = asyncHandler(async (req, res) => {
       const ish     = parseNum(getCell(row, 'ISH'))                          ?? 0;
       const totalRetenidos = retIVA + retISR + ivaRet6 + ish;
 
+      // Desglose individual de traslados (para impuestos.traslados[])
+      const trasladosList = [];
+      if (iva16   > 0) trasladosList.push({ impuesto: '002', tipoFactor: 'Tasa', tasaOCuota: 0.16,  importe: iva16   });
+      if (iva8    > 0) trasladosList.push({ impuesto: '002', tipoFactor: 'Tasa', tasaOCuota: 0.08,  importe: iva8    });
+      if (ieps    > 0) trasladosList.push({ impuesto: '003', tipoFactor: 'Tasa',                    importe: ieps    });
+      if (ieps304 > 0) trasladosList.push({ impuesto: '003', tipoFactor: 'Tasa', tasaOCuota: 0.304, importe: ieps304 });
+
+      // Desglose individual de retenciones
+      const retencionesList = [];
+      if (retIVA  > 0) retencionesList.push({ impuesto: '002', importe: retIVA  });
+      if (retISR  > 0) retencionesList.push({ impuesto: '001', importe: retISR  });
+      if (ivaRet6 > 0) retencionesList.push({ impuesto: '002', importe: ivaRet6 });
+      if (ish     > 0) retencionesList.push({ impuesto: 'ISH', importe: ish     });
+
       // ── Descuento ────────────────────────────────────────────────────────
       const descuento = parseNum(getCell(row, 'Descuento')) ?? 0;
+
+      // ── Conceptos (descripción del reporte SAT) ─────────────────────────────
+      const conceptosRaw = getCell(row, 'Conceptos');
+      const conceptosList = conceptosRaw
+        ? [{ descripcion: conceptosRaw.toString().trim().slice(0, 500) }]
+        : [];
+
+      // ── Campos adicionales del reporte SAT ─────────────────────────────
+      const numCtaPago     = getCell(row, 'NumCtaPago',  'Num Cta Pago')  || undefined;
+      const estadoPago     = getCell(row, 'EstadoPago',  'Estado Pago')   || undefined;
+      const fechaPagoRaw   = getCell(row, 'FechaPago',   'Fecha Pago');
+      const fechaPago      = parseDate(fechaPagoRaw) || undefined;
+      const complementoTipo = getCell(row, 'Complemento') || undefined;
 
       // ── UUID relacionado — 'UUIDRel' es el nombre en Complementos de Pago ─
       const uuidRelacionRaw = getCell(row, 'UUID Relacion', 'UUIDRelacion', 'UUID Relación', 'UUIDRel');
       const uuidRelacion    = uuidRelacionRaw ? uuidRelacionRaw.toString().trim().toUpperCase() : null;
-      const tipoRelacion    = getCell(row, 'TipoRelacion', 'Tipo Relacion', 'Tipo Relación') ?? '04';
+      // Para tipo P el UUIDRel viene del DoctoRelacionado del complemento (facturas cobradas),
+      // no del CfdiRelacionados del header. Solo hay tipoRelacion en el header cuando el CFDI P
+      // sustituye a otro pago cancelado (04) — en ese caso el SAT lo reporta explícitamente.
+      const tipoRelacion    = getCell(row, 'TipoRelacion', 'Tipo Relacion', 'Tipo Relación')
+        ?? (tipo === 'P' ? null : '04');
+
+      // Acumular para tasaIvaInferida (tipo P puede tener N filas, una por factura relacionada)
+      if (tipo === 'P' && uuidRelacion) {
+        if (!pagosRelMap.has(uuid)) pagosRelMap.set(uuid, new Set());
+        pagosRelMap.get(uuid).add(uuidRelacion);
+      }
 
       // ── Datos receptor adicionales ───────────────────────────────────────
       const regimenFiscalReceptor   = getCell(row, 'RegimenFiscalReceptor', 'Regimen Fiscal Receptor') || undefined;
@@ -618,9 +658,15 @@ const importExcel = asyncHandler(async (req, res) => {
         ...(version && { version }),
         ...(satStatus && { satStatus }),
         ...(source === 'ERP' && { erpStatus: getCell(row, 'Estatus', 'EstatusERP', 'Estatus ERP') || 'Timbrado' }),
+        numCtaPago,
+        estadoPago,
+        ...(fechaPago    && { fechaPago }),
+        ...(complementoTipo && { complementoTipo }),
         emisor: {
-          rfc:    rfcEmisor,
-          nombre: getCell(row, 'Nombre Emisor', 'NombreEmisor') || undefined,
+          rfc:       rfcEmisor,
+          nombre:    getCell(row, 'Nombre Emisor', 'NombreEmisor')         || undefined,
+          direccion: getCell(row, 'Direccion Emisor', 'DireccionEmisor')   || undefined,
+          localidad: getCell(row, 'Localidad Emisor', 'LocalidadEmisor')   || undefined,
         },
         receptor: {
           rfc:                      rfcReceptor,
@@ -630,10 +676,15 @@ const importExcel = asyncHandler(async (req, res) => {
           numRegIdTrib:             getCell(row, 'NumRegIdTrib', 'Num Reg Id Trib')    || undefined,
           regimenFiscal:            regimenFiscalReceptor,
           domicilioFiscalReceptor:  domicilioFiscalReceptor,
+          direccion: getCell(row, 'Direccion Receptor', 'DireccionReceptor') || undefined,
+          localidad: getCell(row, 'Localidad Receptor', 'LocalidadReceptor') || undefined,
         },
+        conceptos: conceptosList,
         impuestos: {
           totalImpuestosTrasladados: totalTrasladados,
           totalImpuestosRetenidos:   totalRetenidos,
+          traslados:   trasladosList,
+          retenciones: retencionesList,
         },
         ...(fechaTimbrado && {
           timbreFiscalDigital: { fechaTimbrado },
@@ -670,6 +721,64 @@ const importExcel = asyncHandler(async (req, res) => {
 
     } catch (err) {
       failed.push({ filename: `Fila ${row.number}`, uuid: uuid ?? null, error: err.message });
+    }
+  }
+
+  // ── Inferir tasaIvaInferida para CFDIs tipo P sin <Totales> ─────────────────
+  // Para cada CFDI P con UUIDRel, busca las facturas originales en MongoDB y
+  // calcula la tasa IVA dominante. Se usa como fallback en _detectTasaIva cuando
+  // el complemento de pago no tiene <Totales> (CP 1.0 / Metadata).
+  if (pagosRelMap.size > 0) {
+    try {
+      const allUuidRels = [...new Set([...pagosRelMap.values()].flatMap(s => [...s]))];
+
+      const facturasRel = await CFDI.find(
+        { uuid: { $in: allUuidRels }, tipoDeComprobante: { $in: ['I', 'E'] } },
+        { uuid: 1, conceptos: 1, impuestos: 1 },
+      ).lean();
+
+      const facturasMap = new Map(facturasRel.map(f => [f.uuid, f]));
+
+      const _tasaDeConceptos = (cfdi) => {
+        let t16 = false, t0 = false;
+        for (const c of (cfdi.conceptos || [])) {
+          for (const t of (c.impuestos?.traslados || [])) {
+            if ((t.impuesto || '') !== '002') continue;
+            if ((t.tasaOCuota || 0) > 0) t16 = true; else t0 = true;
+          }
+        }
+        if (!t16 && !t0) {
+          const tot = cfdi.impuestos?.totalImpuestosTrasladados;
+          if (tot != null) { if (tot > 0) t16 = true; else t0 = true; }
+        }
+        if (t16 && t0) return 'mixto';
+        if (t16) return '16';
+        if (t0)  return '0';
+        return null;
+      };
+
+      const tasaBulk = [];
+      for (const [cfdiUuid, uuidRels] of pagosRelMap) {
+        const tasas  = [...uuidRels].map(ur => facturasMap.get(ur)).filter(Boolean).map(_tasaDeConceptos);
+        const validas = tasas.filter(Boolean);
+        if (!validas.length) continue;
+        const t16 = validas.some(t => t === '16' || t === 'mixto');
+        const t0  = validas.some(t => t === '0'  || t === 'mixto');
+        const tasa = (t16 && t0) ? 'mixto' : t16 ? '16' : t0 ? '0' : null;
+        if (tasa) {
+          tasaBulk.push({ updateOne: {
+            filter: { uuid: cfdiUuid, source },
+            update: { $set: { tasaIvaInferida: tasa } },
+          }});
+        }
+      }
+
+      if (tasaBulk.length > 0) {
+        await CFDI.bulkWrite(tasaBulk, { ordered: false });
+        logger.info(`[importExcel] tasaIvaInferida calculada para ${tasaBulk.length} CFDIs tipo P`);
+      }
+    } catch (err) {
+      logger.warn(`[importExcel] Error calculando tasaIvaInferida: ${err.message}`);
     }
   }
 

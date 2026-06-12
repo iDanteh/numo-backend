@@ -56,6 +56,12 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
     type:      DataTypes.STRING(100),
     allowNull: true,
   },
+  centroCostoId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'centros_costo', key: 'id' },
+    comment:    'FK al catálogo de centros de costo (resuelto por clave al generar póliza)',
+  },
   cfdiUuid: {
     type:      DataTypes.STRING(36),
     allowNull: true,
@@ -63,6 +69,55 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
   rfcTercero: {
     type:      DataTypes.STRING(13),
     allowNull: true,
+  },
+  // ── Campos SAT del CFDI origen ───────────────────────────────────────────
+  tipoComprobante: {
+    type:      DataTypes.STRING(1),
+    allowNull: true,
+    comment:   'I=Ingreso E=Egreso P=Pago (del CFDI SAT)',
+  },
+  metodoPago: {
+    type:      DataTypes.STRING(3),
+    allowNull: true,
+    comment:   'PPD o PUE (del CFDI SAT)',
+  },
+  formaPago: {
+    type:      DataTypes.STRING(3),
+    allowNull: true,
+    comment:   'c_FormaPago SAT: 01=Efectivo 03=Trans 04=Cheque etc.',
+  },
+  folio: {
+    type:      DataTypes.STRING(40),
+    allowNull: true,
+    comment:   'Folio del CFDI origen',
+  },
+  rfcEmisor: {
+    type:      DataTypes.STRING(13),
+    allowNull: true,
+    comment:   'RFC del emisor del CFDI',
+  },
+  rfcReceptor: {
+    type:      DataTypes.STRING(13),
+    allowNull: true,
+    comment:   'RFC del receptor del CFDI',
+  },
+  tipoOrigen: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Clasificación de negocio del ERP: Venta, Bonificación, Devolución, Pago, etc.',
+  },
+  // ── Trazabilidad de la regla de mapeo usada ──────────────────────────────
+  reglaId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'cfdi_mapping_rules', key: 'id' },
+    onDelete:   'SET NULL',
+    comment:    'FK a la regla de mapeo usada al generar este movimiento',
+  },
+  reglaNombre: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+    comment:   'Nombre de la regla al momento de generar (snapshot histórico)',
   },
 }, {
   tableName:   'poliza_movimientos',

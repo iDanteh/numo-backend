@@ -21,7 +21,7 @@ const list = asyncHandler(async (_req, res) => {
  * POST /api/entities
  */
 const create = asyncHandler(async (req, res) => {
-  const { rfc, nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, notes } = req.body;
+  const { rfc, nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, esIntercompania, notes } = req.body;
 
   if (!rfc || !nombre || !tipo) {
     return res.status(400).json({ error: 'Los campos rfc, nombre y tipo son obligatorios.' });
@@ -39,6 +39,7 @@ const create = asyncHandler(async (req, res) => {
     ...(domicilioFiscal  !== undefined && { domicilioFiscal }),
     ...(syncConfig       !== undefined && { syncConfig }),
     ...(isOwn            !== undefined && { isOwn }),
+    ...(esIntercompania  !== undefined && { esIntercompania }),
     ...(notes            !== undefined && { notes }),
   });
   res.status(201).json(entity);
@@ -48,7 +49,7 @@ const create = asyncHandler(async (req, res) => {
  * PATCH /api/entities/:id
  */
 const update = asyncHandler(async (req, res) => {
-  const { nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, isActive, notes } = req.body;
+  const { nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, isActive, esIntercompania, notes } = req.body;
 
   if (tipo !== undefined && !['moral', 'fisica'].includes(tipo)) {
     return res.status(400).json({ error: 'El campo tipo debe ser "moral" o "fisica".' });
@@ -56,14 +57,15 @@ const update = asyncHandler(async (req, res) => {
 
   // Whitelist explícito: nunca aceptar `fiel` ni campos de auditoría del body
   const data = {
-    ...(nombre          !== undefined && { nombre }),
-    ...(tipo            !== undefined && { tipo }),
-    ...(regimenFiscal   !== undefined && { regimenFiscal }),
-    ...(domicilioFiscal !== undefined && { domicilioFiscal }),
-    ...(syncConfig      !== undefined && { syncConfig }),
-    ...(isOwn           !== undefined && { isOwn }),
-    ...(isActive        !== undefined && { isActive }),
-    ...(notes           !== undefined && { notes }),
+    ...(nombre           !== undefined && { nombre }),
+    ...(tipo             !== undefined && { tipo }),
+    ...(regimenFiscal    !== undefined && { regimenFiscal }),
+    ...(domicilioFiscal  !== undefined && { domicilioFiscal }),
+    ...(syncConfig       !== undefined && { syncConfig }),
+    ...(isOwn            !== undefined && { isOwn }),
+    ...(isActive         !== undefined && { isActive }),
+    ...(esIntercompania  !== undefined && { esIntercompania }),
+    ...(notes            !== undefined && { notes }),
   };
 
   const entity = await entityRepo.update(req.params.id, data);

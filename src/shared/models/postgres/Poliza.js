@@ -10,9 +10,9 @@ const Poliza = sequelize.define('Poliza', {
     autoIncrement: true,
   },
   tipo: {
-    type:      DataTypes.ENUM('A', 'I', 'E', 'D', 'N', 'C'),
+    type:      DataTypes.ENUM('A', 'I', 'E', 'D', 'N', 'C', 'P'),
     allowNull: false,
-    comment:   'A=Apertura I=Ingreso E=Egreso D=Diario N=Nomina C=Cheque',
+    comment:   'A=Apertura I=Ingreso E=Egreso D=Diario N=Nomina C=Cheque P=Pago',
   },
   numero: {
     type:      DataTypes.INTEGER,
@@ -93,6 +93,7 @@ const Poliza = sequelize.define('Poliza', {
   underscored: true,
   indexes: [
     { fields: ['rfc', 'ejercicio', 'periodo'] },
+    { fields: ['rfc', 'ejercicio', 'periodo', 'fecha'] }, // cubre ORDER BY fecha DESC
     { fields: ['tipo', 'numero', 'rfc', 'ejercicio', 'periodo'], unique: true },
   ],
 });

@@ -6,17 +6,18 @@
 #   Stage 1 (deps)    — instala solo dependencias de producción
 #   Stage 2 (runtime) — imagen final mínima, sin herramientas de build
 #
-# Por qué node:18-slim y NO node:18-alpine:
+# Por qué node:20-slim y NO node:20-alpine:
 #   • 'sharp' (procesamiento de imágenes) usa libvips compilado contra glibc.
 #     Alpine usa musl libc — incompatible sin recompilar. slim es Debian-based
 #     y evita este problema por completo.
 #   • 'tesseract.js' y 'node-forge' también tienen bindings nativos que se
 #     benefician de las librerías estándar de Debian.
+#   • soap@1.8.0, file-type y simple-xml-to-json requieren Node >=20.
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 # ── Stage 1: Instalación de dependencias ──────────────────────────────────────
-FROM node:18-slim AS deps
+FROM node:20-slim AS deps
 
 WORKDIR /app
 
@@ -36,16 +37,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # pero no package.json, este layer se reutiliza → builds mucho más rápidos.
 COPY package*.json ./
 
-# npm ci vs npm install:
-#   • npm ci lee package-lock.json y garantiza versiones exactas (reproducible)
-#   • --only=production excluye jest, nodemon y supertest (no necesarios en prod)
+# npm install vs npm ci:
+#   • npm install resuelve dependencias aunque el lock file esté desincronizado
+#   • --omit=dev excluye jest, nodemon y supertest (no necesarios en prod)
 #   • --ignore-scripts evita scripts postinstall arbitrarios por seguridad
 #     EXCEPCIÓN: sharp necesita su script install → no usamos --ignore-scripts aquí
-RUN npm ci --only=production
+RUN npm install --omit=dev
 
 
 # ── Stage 2: Imagen de runtime ────────────────────────────────────────────────
-FROM node:18-slim AS runtime
+FROM node:20-slim AS runtime
 
 WORKDIR /app
 
@@ -93,4 +94,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
 #   • npm añade un proceso intermediario que intercepta señales (SIGTERM)
 #   • Con 'node' directo, Docker puede enviar SIGTERM directamente al proceso
 #     para un graceful shutdown correcto.
-CMD ["node", "--openssl-legacy-provider", "src/app.js"]
+CMD ["node", "src/app.js"]

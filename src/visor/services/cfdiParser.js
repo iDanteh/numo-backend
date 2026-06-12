@@ -96,10 +96,16 @@ const parseCFDI = async (xmlString) => {
   if (complementoPago) {
     cfdiData.complementoPago = complementoPago;
 
-    // Para CFDIs de Pago (tipo 'P'), el IVA no está en cfdi:Impuestos raíz
-    // sino en pago20:Totales. Lo mapeamos al campo impuestos estándar.
+    // Para CFDIs de Pago (tipo 'P'), los montos reales están en pago20:Totales,
+    // no en los atributos raíz del comprobante (que siempre vienen en 0).
     if (attrs.TipoDeComprobante === 'P' && complementoPago.totales) {
       const t = complementoPago.totales;
+
+      // SubTotal = base gravable IVA 16%; Total = monto total de pagos
+      cfdiData.subTotal = t.totalTrasladosBaseIVA16 || 0;
+      cfdiData.total    = t.montoTotalPagos          || 0;
+
+      // IVA trasladado y retenido
       const ivaTrasladadoPago =
         (t.totalTrasladosImpuestoIVA16 || 0) +
         (t.totalTrasladosImpuestoIVA8  || 0);
@@ -174,6 +180,29 @@ const getComplementoPago = (comprobante) => {
         .filter(Boolean)
         .map((dr) => {
           const d = dr['$'] ? { ...dr['$'], ...dr } : dr;
+
+          // ImpuestosDR / TrasladosDR — presente en CP 1.0 (CFDI 3.3) por docto relacionado
+          const impDRNode = d['pago20:ImpuestosDR'] || d['pago10:ImpuestosDR'] || d['ImpuestosDR'] || null;
+          let trasladosDR;
+          if (impDRNode) {
+            const tDRNode = impDRNode['pago20:TrasladosDR'] || impDRNode['pago10:TrasladosDR'] || impDRNode['TrasladosDR'];
+            if (tDRNode) {
+              const tDRRaw  = tDRNode['pago20:TrasladoDR'] || tDRNode['pago10:TrasladoDR'] || tDRNode['TrasladoDR'] || [];
+              const tDRList = Array.isArray(tDRRaw) ? tDRRaw : [tDRRaw];
+              const parsed  = tDRList.filter(Boolean).map((t) => {
+                const ta = t['$'] ? { ...t['$'], ...t } : t;
+                return {
+                  impuesto:   ta.ImpuestoDR   || undefined,
+                  tipoFactor: ta.TipoFactorDR || undefined,
+                  tasaOCuota: parseFloat(ta.TasaOCuotaDR) || undefined,
+                  base:       parseFloat(ta.BaseDR)       || undefined,
+                  importe:    parseFloat(ta.ImporteDR)    || undefined,
+                };
+              });
+              if (parsed.length) trasladosDR = parsed;
+            }
+          }
+
           return {
             idDocumento:      d.IdDocumento      || undefined,
             serie:            d.Serie            || undefined,
@@ -185,6 +214,7 @@ const getComplementoPago = (comprobante) => {
             impSaldoAnt:      parseFloat(d.ImpSaldoAnt)      || undefined,
             impPagado:        parseFloat(d.ImpPagado)        || undefined,
             impSaldoInsoluto: parseFloat(d.ImpSaldoInsoluto) || undefined,
+            trasladosDR,
           };
         });
 

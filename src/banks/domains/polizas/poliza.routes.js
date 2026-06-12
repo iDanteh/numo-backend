@@ -16,6 +16,27 @@ router.get('/',
   }),
 );
 
+// GET /api/polizas/reporte-descuadradas?rfc=&ejercicio=&periodo=&estado=&format=csv
+router.get('/reporte-descuadradas',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { format, ...filters } = req.query;
+    const rows = await service.reporteDescuadradas(filters);
+
+    if (format === 'csv') {
+      const csv = _toCsv(rows);
+      const mes = filters.periodo  ? String(Number(filters.periodo)).padStart(2, '0') : 'XX';
+      const ej  = filters.ejercicio ?? 'XXXX';
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="DescuadradosCFDI_${ej}_${mes}_${filters.rfc}.csv"`);
+      return res.send('\uFEFF' + csv);  // BOM para Excel
+    }
+
+    res.json({ total: rows.length, rows });
+  }),
+);
+
 // GET /api/polizas/xml-sat?rfc=&ejercicio=&periodo=&tipoSolicitud=AF&numOrden=&numTramite=
 router.get('/xml-sat',
   authenticate,
@@ -75,6 +96,16 @@ router.post('/:id/cancelar',
   }),
 );
 
+// POST /api/polizas/cierre-iva?rfc=&ejercicio=&periodo=
+router.post('/cierre-iva',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, ejercicio, periodo } = req.query;
+    res.status(201).json(await service.generarCierreIVA({ rfc, ejercicio, periodo, user: req.user }));
+  }),
+);
+
 // POST /api/polizas/:id/revertir  (solo admin)
 router.post('/:id/revertir',
   authenticate,
@@ -83,5 +114,44 @@ router.post('/:id/revertir',
     res.json(await service.revertir(req.params.id, req.user, req.body?.motivo));
   }),
 );
+
+function _toCsv(rows) {
+  const headers = [
+    'PolizaId', 'Tipo', 'Numero', 'FechaPoliza', 'EstadoPoliza',
+    'CfdiUuid', 'TipoCfdi', 'Serie', 'Folio', 'FechaCfdi',
+    'EmisorRfc', 'EmisorNombre', 'ReceptorRfc', 'ReceptorNombre',
+    'MetodoPago', 'FormaPago', 'Subtotal', 'Total',
+    'TotalDebe', 'TotalHaber', 'Diferencia', 'SatStatus', 'Fuentes',
+  ];
+  const esc = v => {
+    const s = String(v ?? '');
+    return (s.includes(',') || s.includes('"') || s.includes('\n'))
+      ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [headers.join(',')];
+  for (const r of rows) {
+    const c = r.cfdi;
+    lines.push([
+      r.polizaId, r.tipo, r.numero, r.fecha, r.estado,
+      r.cfdiUuid,
+      c?.tipoDeComprobante ?? '',
+      c?.serie             ?? '',
+      c?.folio             ?? '',
+      c?.fecha ? new Date(c.fecha).toISOString().slice(0, 10) : '',
+      c?.emisor?.rfc       ?? '',
+      c?.emisor?.nombre    ?? '',
+      c?.receptor?.rfc     ?? '',
+      c?.receptor?.nombre  ?? '',
+      c?.metodoPago        ?? '',
+      c?.formaPago         ?? '',
+      c?.subTotal          ?? '',
+      c?.total             ?? '',
+      r.totalDebe, r.totalHaber, r.diferencia,
+      c?.satStatus         ?? '',
+      (c?.sources ?? []).join('|'),
+    ].map(esc).join(','));
+  }
+  return lines.join('\n');
+}
 
 module.exports = router;

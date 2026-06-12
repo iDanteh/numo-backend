@@ -17,12 +17,15 @@ const comparisonSessionSchema = new mongoose.Schema({
   failedCount: { type: Number, default: 0 },
 
   results: {
-    match:       { type: Number, default: 0 },
-    discrepancy: { type: Number, default: 0 },
-    not_in_sat:  { type: Number, default: 0 },
-    not_in_erp:  { type: Number, default: 0 },
-    cancelled:   { type: Number, default: 0 },
-    error:       { type: Number, default: 0 },
+    match:              { type: Number, default: 0 },
+    match_cancelled:    { type: Number, default: 0 },
+    warning:            { type: Number, default: 0 },
+    discrepancy:        { type: Number, default: 0 },
+    not_in_sat:         { type: Number, default: 0 },
+    not_in_erp:         { type: Number, default: 0 },
+    cancelled:          { type: Number, default: 0 },
+    cancelled_not_in_erp: { type: Number, default: 0 },
+    error:              { type: Number, default: 0 },
   },
 
   startedAt:   { type: Date, default: Date.now, index: true },

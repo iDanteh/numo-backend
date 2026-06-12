@@ -674,9 +674,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const { subTotal16, subTotal0 } = _calcCfdiMontos(cfdi);
     if (subTotal16 + subTotal0 > 0) {
       if (esIngreso) {
-        const netoTotal   = parseFloat((total - iva).toFixed(2));
-        const subTotal0R  = parseFloat(subTotal0.toFixed(2));   // redondear antes de usar
-        montoAbono = parseFloat((netoTotal - subTotal0R).toFixed(2)); // cuentaAbono cubre solo 16%
+        const subTotal16R = parseFloat(subTotal16.toFixed(2));
+        const subTotal0R  = parseFloat(subTotal0.toFixed(2));
+        // Si la regla tiene descuentos separados (tieneDescuento), el cargo por Dto ya se
+        // agregará como DEBE extra → Ingresos16 debe ser el bruto (subTotal16_gross) para
+        // que D=H. Sin descuentos separados, el neto garantiza el balance directamente.
+        montoAbono = rule.tieneDescuento
+          ? subTotal16R
+          : parseFloat(((parseFloat((total - iva).toFixed(2))) - subTotal0R).toFixed(2));
         if (subTotal0R > 0) {
           movs.push({
             cuentaId:    cuentaMap[rule.cuentaAbono2] ?? null,
@@ -736,8 +741,9 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   if (!esPago && rule.tieneDescuento) {
     const { desc16, desc0 } = _calcCfdiMontos(cfdi);
     const descHeader = Number(cfdi.descuento || 0);
-    // Para reglas mixtas usamos desc16; para 16% o 0% usamos el total del header
-    const descPrincipal = rule.tasaIva === 'mixto' ? desc16 : (desc16 + desc0 > 0 ? desc16 + desc0 : descHeader);
+    // Para reglas mixtas usamos desc16 (concepto); para 16% o 0% usamos el header para
+    // mantener consistencia con montoAbono = cfdi.subTotal (ambos de la misma fuente SAT).
+    const descPrincipal = rule.tasaIva === 'mixto' ? desc16 : descHeader;
 
     if (rule.cuentaDescuento && descPrincipal > 0) {
       movs.push({

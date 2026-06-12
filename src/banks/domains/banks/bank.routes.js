@@ -119,6 +119,12 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
   res.json(await service.getSummary(fechaInicio, fechaFin));
 }));
 
+// GET /api/banks/stats — conteos globales por estado con filtro de año/mes opcional
+router.get('/stats', authenticate, asyncHandler(async (req, res) => {
+  const { year, month } = req.query;
+  res.json(await service.getStatusStats(year, month));
+}));
+
 // POST /api/banks/upload
 router.post('/upload',
   authenticate,

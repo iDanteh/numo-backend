@@ -320,8 +320,8 @@ async function listMovements(filters) {
       const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
       _amountLo = decimalPlaces === 0 ? num             : num - tolerance;
       _amountHi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
-      orClauses.push({ deposito: { $gte: _amountLo, $lt: _amountHi } });
-      orClauses.push({ retiro:   { $gte: _amountLo, $lt: _amountHi } });
+      orClauses.push({ deposito: { $gte: _amountLo, $lte: _amountHi } });
+      orClauses.push({ retiro:   { $gte: _amountLo, $lte: _amountHi } });
     }
 
     filter.$or = orClauses;
@@ -674,7 +674,16 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         const montoOk =
           (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
           (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
-        return montoOk;
+        if (!montoOk) return false;
+        // referenciaNumerica puede ser código de sucursal/ruta (no ID de transacción).
+        // Si ambos lados tienen numeroAutorizacion real, debe coincidir; de lo contrario
+        // dos transacciones distintas con misma ref+monto serían tratadas como duplicado.
+        const incomingHasAuth = m.numeroAutorizacion && !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion);
+        const existingHasAuth = existing.numeroAutorizacion && !isBBVAPseudoAuth(existing.banco, existing.numeroAutorizacion);
+        if (incomingHasAuth && existingHasAuth) {
+          return authMatch(m.numeroAutorizacion, existing.numeroAutorizacion);
+        }
+        return true;
       });
       if (!incoming) continue;
       // Enriquecer numeroAutorizacion si el reimport la trae y el existente no la tiene
@@ -718,7 +727,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       const dbCands = await BankMovement.find(
         { $or: orConds },
         '_id banco fecha deposito retiro saldo concepto numeroAutorizacion referenciaNumerica',
-      ).lean();
+      ).limit(5000).lean();
 
       // Group DB candidates by banco+fecha key
       const candsByKey = new Map();

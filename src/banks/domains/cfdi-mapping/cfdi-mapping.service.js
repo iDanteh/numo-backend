@@ -273,6 +273,34 @@ function _calcCfdiMontos(cfdi) {
     if (esTasa16) { subTotal16 += importe; desc16 += descuento; }
     else          { subTotal0  += importe; desc0  += descuento; }
   }
+  // Fallback traslados header con 0% explícito (ERP mixto sin conceptos).
+  // Los CFDIs ERP mixtos almacenan base_16 = subTotal completo (incluye porción 0%),
+  // por lo que el fallback matemático (IVA/0.16) devuelve subTotal0 ≈ 0.
+  // En su lugar: leer base_0 directo del traslado 0% del header y derivar subTotal16
+  // como (subTotal - descuento - base_0), que sí es el neto 16% correcto.
+  // Guardia: si base0Ht >= baseTotal el dato ERP está malformado → dejar caer al fallback matemático.
+  if (subTotal16 === 0 && subTotal0 === 0) {
+    const ht = cfdi.impuestos?.traslados || [];
+    const base0Ht = ht
+      .filter(t => (t.impuesto || t.Impuesto || '') === '002' &&
+                   Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) <= 0)
+      .reduce((s, t) => s + Number(t.base ?? t.Base ?? 0), 0);
+    if (base0Ht > 0) {
+      const baseTotal = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
+      if (base0Ht < baseTotal) {
+        subTotal0  = base0Ht;
+        subTotal16 = parseFloat((baseTotal - subTotal0).toFixed(6));
+        // Distribuir descuento header proporcionalmente (igual que el fallback matemático).
+        // Necesario para que reglas tieneDescuento=true generen la línea de descuento correcta.
+        const totalDesc = Number(cfdi.descuento || 0);
+        if (totalDesc > 0) {
+          const sumSub = subTotal16 + subTotal0;
+          desc16 = sumSub > 0 ? parseFloat((totalDesc * subTotal16 / sumSub).toFixed(6)) : 0;
+          desc0  = parseFloat(Math.max(0, totalDesc - desc16).toFixed(6));
+        }
+      }
+    }
+  }
   // Fallback Metadata: no hay traslados en conceptos → estimar split desde el encabezado.
   // Se activa en dos casos:
   //   a) conceptos vacíos (subTotal16 + subTotal0 === 0)

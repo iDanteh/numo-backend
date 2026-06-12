@@ -659,10 +659,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // IVA = total − subtotal + descuento (cuando tieneDescuento), por lo que el complemento
     // exacto de HABER es subtotal (importe bruto pre-descuento del CFDI). D=H garantizado.
     // Para CFDIs con retenciones se usa total−iva (rama else de ivaR arriba) — caso separado.
-    // Excepción: no-mixto con tieneDescuento y tasa 0% — no hay línea de IVA que cierre la
-    // brecha, y el subTotal del header SAT puede ser inconsistente con metadata (total+descuento
-    // ≠ cfdi.subTotal). Forzar montoAbono = total + descuento para garantizar D=H.
-    if (rule.tasaIva !== 'mixto' && rule.tieneDescuento && iva === 0) {
+    // Excepción: no-mixto con tieneDescuento sin línea de IVA efectiva (cuentaIva no configurada
+    // en la regla, o iva=0). En ese caso subTotal SAT puede ser inconsistente con total+descuento
+    // (artefacto de metadata). Forzar montoAbono = total + descuento para garantizar D=H.
+    const _cuentaIvaEfectiva = !esAnticipo && iva > 0
+      ? ((esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva)
+      : null;
+    if (rule.tasaIva !== 'mixto' && rule.tieneDescuento && !_cuentaIvaEfectiva) {
       montoAbono = parseFloat((total + Number(cfdi.descuento || 0)).toFixed(2));
     } else {
       montoAbono = (ivaRet === 0 && isrRet === 0) || esMetadataConDescuento

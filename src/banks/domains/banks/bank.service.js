@@ -125,6 +125,7 @@ async function getCards() {
           no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
           identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
+          reclasificado:   { $sum: { $cond: [{ $eq:  ['$status', 'reclasificado'] }, 1, 0] } },
           saldoPendiente: {
             // Σ depósitos con status 'no_identificado'.
             // Retiros, 'identificado' y 'otros' no participan en este cálculo.
@@ -220,9 +221,60 @@ async function getCards() {
         no_identificado: b.no_identificado,
         identificado:    b.identificado,
         otros:           b.otros,
+        reclasificado:   b.reclasificado,
       },
     };
   });
+}
+
+async function getStatusStats(year, month) {
+  const match = { isActive: true };
+
+  if (year) {
+    const y = parseInt(year, 10);
+    const m = month ? parseInt(month, 10) : null;
+    if (m && m >= 1 && m <= 12) {
+      match.fecha = { $gte: new Date(y, m - 1, 1), $lt: new Date(y, m, 1) };
+    } else {
+      match.fecha = { $gte: new Date(y, 0, 1), $lt: new Date(y + 1, 0, 1) };
+    }
+  }
+
+  const [statsAgg, yearsAgg] = await Promise.all([
+    BankMovement.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id:             null,
+          no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          dep_no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+        },
+      },
+    ]),
+    BankMovement.aggregate([
+      { $match: { isActive: true } },
+      { $group: { _id: { $year: '$fecha' } } },
+      { $sort:  { _id: -1 } },
+    ]),
+  ]);
+
+  return {
+    no_identificado:     statsAgg[0]?.no_identificado     ?? 0,
+    identificado:        statsAgg[0]?.identificado        ?? 0,
+    otros:               statsAgg[0]?.otros               ?? 0,
+    reclasificado:       statsAgg[0]?.reclasificado       ?? 0,
+    dep_no_identificado: statsAgg[0]?.dep_no_identificado ?? 0,
+    dep_identificado:    statsAgg[0]?.dep_identificado    ?? 0,
+    dep_otros:           statsAgg[0]?.dep_otros           ?? 0,
+    dep_reclasificado:   statsAgg[0]?.dep_reclasificado   ?? 0,
+    years: yearsAgg.map(r => r._id).filter(y => y != null && y > 1990),
+  };
 }
 
 async function listMovements(filters) {
@@ -2437,7 +2489,7 @@ async function revertirConciliacion(runId, userId) {
 }
 
 module.exports = {
-  getCards, listMovements, getSummary,
+  getCards, listMovements, getSummary, getStatusStats,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, reclasifyMovements, updateMovement, generateTemplate,

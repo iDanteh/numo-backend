@@ -102,6 +102,21 @@ const bankMovementSchema = new mongoose.Schema({
   // Auditoría
   uploadedBy: { type: String, default: null },
   isActive:   { type: Boolean, default: true, index: true },
+
+  // Registro de cambios automáticos durante importación/enriquecimiento.
+  // Cada entrada es inmutable: documenta qué se modificó, por qué capa y desde qué archivo.
+  _changelog: {
+    type: [{
+      at:         { type: Date,   required: true },
+      via:        { type: String, required: true },  // 'capa1e' | 'enrich-capa1a' | …
+      campo:      { type: String, default: null },   // campo modificado, o null si son varios
+      campos:     { type: [String], default: [] },   // lista de campos (para enriquecimientos)
+      de:         { type: mongoose.Schema.Types.Mixed, default: null },
+      a:          { type: mongoose.Schema.Types.Mixed, default: null },
+      importFile: { type: String, default: null },
+    }],
+    default: [],
+  },
 }, {
   timestamps: true,
   collection: 'bank_movements',

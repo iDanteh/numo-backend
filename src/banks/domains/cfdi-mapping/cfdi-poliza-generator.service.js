@@ -169,26 +169,29 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const erpCfdis = await CFDI.find({
       uuid:   { $in: [...uuidsSinMeta] },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinal = cfdisSinPolizaEnriquecidos.map(cfdi => {
     const erp = erpMetaMap[cfdi.uuid];
     if (!erp) return cfdi;
-    const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const satHasTraslados     = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const satHasBaseTraslados = (cfdi.impuestos?.traslados ?? []).some(t => (t.base ?? 0) > 0);
     const relSAT    = cfdi.cfdiRelacionados ?? [];
     const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
     const relERP    = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
     const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
+    const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
     return {
       ...cfdi,
-      formaPago:        cfdi.formaPago  || erp.formaPago,
-      metodoPago:       metodoPagoFinal,
-      conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-      impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
-      tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
-      cfdiRelacionados: relERP.length ? [...relSAT, ...relERP] : relSAT,
+      formaPago:              cfdi.formaPago  || erp.formaPago,
+      metodoPago:             metodoPagoFinal,
+      conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
+      cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
   });
 
@@ -461,26 +464,29 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const erpCfdisGuard = await CFDI.find({
       uuid:   { $in: [...uuidsSinMetaGuard] },
       source: 'ERP',
-    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
+    }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
     erpMetaMapGuard = Object.fromEntries(erpCfdisGuard.map(c => [c.uuid, c]));
   }
   const cfdisSinPolizaFinalGuard = cfdisSinPolizaEnriquecidosGuard.map(cfdi => {
     const erp = erpMetaMapGuard[cfdi.uuid];
     if (!erp) return cfdi;
-    const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const satHasTraslados     = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const satHasBaseTraslados = (cfdi.impuestos?.traslados ?? []).some(t => (t.base ?? 0) > 0);
     const relSAT    = cfdi.cfdiRelacionados ?? [];
     const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
     const relERP    = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
     const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
+    const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
     return {
       ...cfdi,
-      formaPago:        cfdi.formaPago  || erp.formaPago,
-      metodoPago:       metodoPagoFinal,
-      conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-      impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
-      tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
-      cfdiRelacionados: relERP.length ? [...relSAT, ...relERP] : relSAT,
+      formaPago:              cfdi.formaPago  || erp.formaPago,
+      metodoPago:             metodoPagoFinal,
+      conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
+      cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
   });
 

@@ -301,6 +301,29 @@ function _calcCfdiMontos(cfdi) {
       }
     }
   }
+  // Fallback 1b: leer base_16 y base_0 directamente de traslados header cuando Fallback 1 no disparó.
+  // Cubre CFDIs ERP puro-16% (base_0Ht=0) y puro-0% (ivaHeader=0).
+  // Solo aplica cuando ningún concepto tiene traslados (subTotal16+subTotal0 aún es 0).
+  if (subTotal16 === 0 && subTotal0 === 0) {
+    const ht = cfdi.impuestos?.traslados || [];
+    const base16Ht = ht
+      .filter(t => (t.impuesto || t.Impuesto || '') === '002' &&
+                   Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
+      .reduce((s, t) => s + Number(t.base ?? t.Base ?? 0), 0);
+    const base0Ht2 = ht
+      .filter(t => (t.impuesto || t.Impuesto || '') === '002' &&
+                   Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) <= 0)
+      .reduce((s, t) => s + Number(t.base ?? t.Base ?? 0), 0);
+    if (base16Ht > 0 || base0Ht2 > 0) {
+      subTotal16 = base16Ht;
+      subTotal0  = base0Ht2;
+      const totalDesc = Number(cfdi.descuento || 0);
+      if (totalDesc > 0 && (subTotal16 + subTotal0) > 0) {
+        desc16 = parseFloat((totalDesc * subTotal16 / (subTotal16 + subTotal0)).toFixed(6));
+        desc0  = parseFloat(Math.max(0, totalDesc - desc16).toFixed(6));
+      }
+    }
+  }
   // Fallback Metadata: no hay traslados en conceptos → estimar split desde el encabezado.
   // Se activa en dos casos:
   //   a) conceptos vacíos (subTotal16 + subTotal0 === 0)
@@ -856,6 +879,17 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     return ao - bo;
   });
 
+  // Validar cuadre contable: ∑DEBE debe igualar ∑HABER dentro de $0.02 de tolerancia
+  const _sumDebe  = movs.reduce((s, m) => s + (m.debe  || 0), 0);
+  const _sumHaber = movs.reduce((s, m) => s + (m.haber || 0), 0);
+  if (Math.abs(_sumDebe - _sumHaber) > 0.02) {
+    console.warn(
+      `[cfdiToMovimientos] ASIENTO DESBALANCEADO uuid=${cfdi.uuid} regla="${rule?.nombre}" ` +
+      `debe=${_sumDebe.toFixed(2)} haber=${_sumHaber.toFixed(2)} ` +
+      `diff=${(_sumDebe - _sumHaber).toFixed(2)}`
+    );
+  }
+
   // Enriquecer cada movimiento con los campos SAT del CFDI origen y la regla usada
   const satMeta = {
     tipoComprobante: cfdi.tipoDeComprobante                      ?? null,
@@ -919,7 +953,7 @@ async function migrarPpdDescuento() {
       tasaIva:         '0',
       tieneDescuento:  true,
       cuentaCargo:     '1103010002',
-      cuentaAbono:     '4100010002',
+      cuentaAbono:     '4100020002',   // Ingresos Crédito 0% (PPD = crédito, no contado)
       cuentaIvaPPD:    null,
       cuentaDescuento: '4200020002',
       prioridad:       64,
@@ -944,4 +978,4 @@ function _validate(data) {
   if (!data.cuentaAbono?.trim()) throw new BadRequestError('La cuenta de abono es requerida');
 }
 
-module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen };
+module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos };

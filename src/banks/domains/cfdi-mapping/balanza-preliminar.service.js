@@ -19,11 +19,30 @@ function _tasaDesdeConceptos(cfdi) {
       else tiene0 = true;
     }
   }
+  // Fallback 1: IVA a nivel header (cfdi.impuestos.traslados) — igual que _detectTasaIva
   if (!tiene16 && !tiene0) {
-    const tot = cfdi.impuestos?.totalImpuestosTrasladados;
-    if (tot != null) {
-      if (Number(tot) > 0) tiene16 = true;
+    for (const t of (cfdi.impuestos?.traslados || [])) {
+      if ((t.impuesto || t.Impuesto || '') !== '002') continue;
+      if (Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0) tiene16 = true;
       else tiene0 = true;
+    }
+  }
+  // Fallback 2: totalImpuestosTrasladados — mismo criterio mixto que _detectTasaIva ($0.50)
+  if (!tiene16 && !tiene0) {
+    const rawTot = cfdi.impuestos?.totalImpuestosTrasladados;
+    if (rawTot != null) {
+      const totalImptos = Number(rawTot);
+      if (totalImptos <= 0) {
+        tiene0 = true;
+      } else {
+        const base = Number(cfdi.subTotal || 0) - Number(cfdi.descuento || 0);
+        if (base > 0 && Math.abs(totalImptos - base * 0.16) > 0.50) {
+          tiene16 = true;
+          tiene0  = true; // mixto
+        } else {
+          tiene16 = true;
+        }
+      }
     }
   }
   if (tiene16 && tiene0) return 'mixto';
@@ -268,19 +287,28 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       const erpCfdis = await CFDI.find({
         uuid:   { $in: [...uuidsParaEnriquecer] },
         source: 'ERP',
-      }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
+      }).select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
       erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
     }
 
     const cfdisEnriquecidos = cfdis.map(cfdi => {
       const erp = erpMetaMap[cfdi.uuid];
       if (!erp) return cfdi;
-      const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+      const satHasTraslados     = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+      // SAT Metadata no trae base por tasa en impuestos.traslados; en ese caso usar ERP (que sí la tiene).
+      const satHasBaseTraslados = (cfdi.impuestos?.traslados ?? []).some(t => (t.base ?? 0) > 0);
 
       // Enriquecer cfdiRelacionados: agregar relaciones del ERP que el SAT no tiene
       const relSAT    = cfdi.cfdiRelacionados ?? [];
       const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
-      const relERP    = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
+      const relERP    = (erp.cfdiRelacionados ?? []).filter(r => {
+        if (tiposEnSAT.has(r.tipoRelacion)) return false;
+        // Para tipo E: no inyectar '07' del ERP si el SAT ya tiene cfdiRelacionados.
+        // El SAT marca la NC como '01' (nota de crédito); el ERP a veces tiene '07' (anticipo).
+        // Priorizar el SAT para evitar que NCs normales caigan a Reg 23 (anticipo).
+        if (cfdi.tipoDeComprobante === 'E' && r.tipoRelacion === '07' && relSAT.length > 0) return false;
+        return true;
+      });
       const relEnriq  = relERP.length ? [...relSAT, ...relERP] : relSAT;
 
       // Si SAT dice PPD pero ERP dice PUE → cobro inmediato, usar PUE.
@@ -289,14 +317,16 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
         ? 'PUE'
         : (cfdi.metodoPago || erp.metodoPago);
 
+      const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
       return {
         ...cfdi,
-        formaPago:        cfdi.formaPago  || erp.formaPago,
-        metodoPago:       metodoPagoFinal,
-        conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-        impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos  ?? cfdi.impuestos),
-        tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
-        cfdiRelacionados: relEnriq,
+        formaPago:              cfdi.formaPago  || erp.formaPago,
+        metodoPago:             metodoPagoFinal,
+        conceptos:              satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+        impuestos:              satHasBaseTraslados ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
+        tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+        documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
+        cfdiRelacionados:       relEnriq,
       };
     });
 
@@ -722,27 +752,34 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
     let erpMetaMap = {};
     if (uuidsParaEnriquecer.size) {
       const erpCfdis = await CFDI.find({ uuid: { $in: [...uuidsParaEnriquecer] }, source: 'ERP' })
-        .select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados').lean();
+        .select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
       erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
     }
 
     const cfdisEnriquecidos = cfdis.map(cfdi => {
       const erp = erpMetaMap[cfdi.uuid];
       if (!erp) return cfdi;
-      const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+      const satHasTraslados     = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+      const satHasBaseTraslados = (cfdi.impuestos?.traslados ?? []).some(t => (t.base ?? 0) > 0);
       const relSAT = cfdi.cfdiRelacionados ?? [];
       const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
-      const relERP = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
+      const relERP = (erp.cfdiRelacionados ?? []).filter(r => {
+        if (tiposEnSAT.has(r.tipoRelacion)) return false;
+        if (cfdi.tipoDeComprobante === 'E' && r.tipoRelacion === '07' && relSAT.length > 0) return false;
+        return true;
+      });
       const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
         ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
+      const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
       return {
         ...cfdi,
-        formaPago:        cfdi.formaPago || erp.formaPago,
-        metodoPago:       metodoPagoFinal,
-        conceptos:        satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
-        impuestos:        satHasTraslados ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-        tipoOrigen:       cfdi.tipoOrigen ?? erp.tipoOrigen ?? null,
-        cfdiRelacionados: relERP.length ? [...relSAT, ...relERP] : relSAT,
+        formaPago:              cfdi.formaPago || erp.formaPago,
+        metodoPago:             metodoPagoFinal,
+        conceptos:              satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+        impuestos:              satHasBaseTraslados ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
+        tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+        documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
+        cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
       };
     });
 
@@ -817,6 +854,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       if (!movsEnCuenta.length) continue;
       const _tipoRelCfdi = cfdi.cfdiRelacionados?.find(r => ['04', '07'].includes(r.tipoRelacion))?.tipoRelacion
         ?? cfdi.cfdiRelacionados?.[0]?.tipoRelacion ?? null;
+      const _montos = cfdi.tipoDeComprobante !== 'P' ? mappingSvc._calcCfdiMontosPublic(cfdi) : null;
 
       resultado.push({
         uuid:              cfdi.uuid,
@@ -831,6 +869,12 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
         subTotal:          Number(cfdi.subTotal || 0),
         descuento:         Number(cfdi.descuento || 0),
         total:             Number(cfdi.total    || 0),
+        baseIva16: cfdi.tipoDeComprobante === 'P'
+          ? Math.round(Number(cfdi.complementoPago?.totales?.totalTrasladosBaseIVA16 || 0) * 100) / 100
+          : Math.round((_montos?.subTotal16 ?? 0) * 100) / 100,
+        baseIva0: cfdi.tipoDeComprobante === 'P'
+          ? 0
+          : Math.round((_montos?.subTotal0 ?? 0) * 100) / 100,
         debe:  Math.round(movsEnCuenta.reduce((s, m) => s + (Number(m.debe)  || 0), 0) * 100) / 100,
         haber: Math.round(movsEnCuenta.reduce((s, m) => s + (Number(m.haber) || 0), 0) * 100) / 100,
         reglaNombre:       rule.nombre,

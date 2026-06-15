@@ -132,7 +132,7 @@ router.post('/upload',
   upload.single('excelFile'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
-    const result = await service.importFile(req.file.buffer, req.body.banco, req.user._id, { auth0Sub: req.user._id, nombre: req.user.nombre });
+    const result = await service.importFile(req.file.buffer, req.body.banco, req.user._id, { auth0Sub: req.user._id, nombre: req.user.nombre, filename: req.file.originalname });
     res.status(207).json(result);
   }),
 );

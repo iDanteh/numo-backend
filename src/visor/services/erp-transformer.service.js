@@ -567,6 +567,13 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
   if (erpStatus)               doc.erpStatus     = erpStatus;
   if (factura?.TipoOrigen)     doc.tipoOrigen    = String(factura.TipoOrigen).trim();
   if (cfdiRelacionados.length) doc.cfdiRelacionados    = cfdiRelacionados;
+  const _docRel = Array.isArray(factura?.DocumentosRelacionados) ? factura.DocumentosRelacionados : [];
+  if (_docRel.length) {
+    doc.documentosRelacionados = _docRel.map(d => ({
+      Serie: d.Serie ?? d.serie ?? '',
+      Folio: d.Folio ?? d.folio ?? '',
+    }));
+  }
   if (Object.keys(timbre).length) doc.timbreFiscalDigital = timbre;
   const complementoPago = extraerComplementoPago(factura);
   if (complementoPago) doc.complementoPago = complementoPago;

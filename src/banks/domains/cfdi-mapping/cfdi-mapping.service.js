@@ -143,7 +143,14 @@ function _detectTasaIva(cfdi) {
     if (totales) {
       const iva16 = Number(totales.totalTrasladosImpuestoIVA16 || 0);
       const iva8  = Number(totales.totalTrasladosImpuestoIVA8  || 0);
-      if (iva16 > 0 || iva8 > 0) return '16';
+      if (iva16 > 0 || iva8 > 0) {
+        // Si el monto total pagado excede la suma base16+iva16 (+iva8), hay porción 0%.
+        const base16  = Number(totales.totalTrasladosBaseIVA16 || 0);
+        const monto   = Number(totales.montoTotalPagos || 0);
+        const monto16 = base16 + iva16 + Number(totales.totalTrasladosImpuestoIVA8 || 0);
+        if (monto > monto16 + 0.01) return 'mixto';
+        return '16';
+      }
       const montoTotal = Number(totales.montoTotalPagos || 0);
       if (montoTotal > 0) return '0';
     } else {
@@ -803,6 +810,30 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
             cfdiUuid: cfdi.uuid, rfcTercero,
           });
         }
+      }
+    }
+  }
+
+  // ── Motor extendido: cobros MIXTOS tipo P (tasaIva=mixto, cuentaAbono2) ──────
+  // Divide el abono CxC entre porción 16% (cuentaAbono) y porción 0% (cuentaAbono2).
+  // monto16 = totalTrasladosBaseIVA16 + totalTrasladosImpuestoIVA16 del CP <Totales>.
+  // monto0  = montoTotalPagos - monto16 (facturas 0% pagadas en el mismo complemento).
+  if (esPago && rule.tasaIva === 'mixto' && rule.cuentaAbono2) {
+    const totalesCP = cfdi.complementoPago?.totales;
+    if (totalesCP) {
+      const base16CP = Number(totalesCP.totalTrasladosBaseIVA16 || 0);
+      const iva16CP  = Number(totalesCP.totalTrasladosImpuestoIVA16 || 0);
+      const monto16  = parseFloat((base16CP + iva16CP).toFixed(2));
+      const monto0   = parseFloat((montoAbono - monto16).toFixed(2));
+      if (monto0 > 0.01) {
+        montoAbono = monto16;
+        movs.push({
+          cuentaId:  cuentaMap[rule.cuentaAbono2] ?? null,
+          concepto:  `${concepto} (0%)`,
+          centroCosto, ventaFecha, serie: serieCfdi,
+          debe: 0, haber: monto0,
+          cfdiUuid: cfdi.uuid, rfcTercero,
+        });
       }
     }
   }

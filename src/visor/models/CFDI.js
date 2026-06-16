@@ -172,6 +172,14 @@ const cfdiSchema = new mongoose.Schema({
     uuids: [String],
   }],
 
+  // Documentos relacionados del ERP (Serie + Folio; no UUID SAT).
+  // Guardado desde el campo DocumentosRelacionados del JSON del ERP.
+  // Serie 'BCT' identifica bonificaciones del programa Club Tuberos.
+  documentosRelacionados: [{
+    Serie: { type: String },
+    Folio: { type: String },
+  }],
+
   // Complemento de Pago (solo TipoComprobante === 'P')
   complementoPago: complementoPagoSchema,
 

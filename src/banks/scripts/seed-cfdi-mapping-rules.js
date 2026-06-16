@@ -982,6 +982,59 @@ const reglas = [
     cuentaIva:        null,
     prioridad:        74,
   },
+  {
+    // Captura bonificaciones Club Tuberos donde _detectTasaIva devuelve null
+    // (sin traslados en conceptos ni totalImpuestosTrasladados en header).
+    // Gana sobre CC-BON genérico (prio 75) por tener prio 74.
+    nombre:           'Reg CC-CLT-N — NC Bonificación Club Tuberos Sin Tasa',
+    tipoComprobante:  'E',
+    tasaIva:          null,
+    conceptoContiene: 'club tuberos',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16% (fallback conservador)
+    cuentaAbono:      '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaIva:        null,
+    prioridad:        74,
+  },
+
+  // ── CC1B. BONIFICACIÓN CLUB TUBEROS POR SERIE BCT (prio 74) ─────────────────
+  // Detectadas vía ERP: documentosRelacionados[].Serie === 'BCT'.
+  // El enriquecimiento en balanza-preliminar.service.js establece
+  //   tipoOrigen = 'Bonificación Club Tuberos' para estas NCs.
+  // Se cubren las tres variantes de tasa para no dejar huecos.
+  {
+    nombre:          'Reg CC-BCT-16 — NC Bonificación Club Tuberos BCT 16%',
+    tipoComprobante: 'E',
+    tipoOrigen:      'Bonificación Club Tuberos',
+    tasaIva:         '16',
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:     '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaIva:       '2104010001',  // IVA Trasladado
+    prioridad:       74,
+  },
+  {
+    nombre:          'Reg CC-BCT-0 — NC Bonificación Club Tuberos BCT 0%',
+    tipoComprobante: 'E',
+    tipoOrigen:      'Bonificación Club Tuberos',
+    tasaIva:         '0',
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:     '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaIva:       null,
+    prioridad:       74,
+  },
+  {
+    // Fallback BCT cuando _detectTasaIva no puede determinar la tasa.
+    // tipoOrigen='Bonificación Club Tuberos' es más específico (spec 2) que
+    // CC-BON-16 (spec 3 con tasaIva definido) — solo gana cuando tasaIva=null
+    // porque CC-BCT-16 y CC-BCT-0 requieren tasa explícita.
+    nombre:          'Reg CC-BCT-N — NC Bonificación Club Tuberos BCT Sin Tasa',
+    tipoComprobante: 'E',
+    tipoOrigen:      'Bonificación Club Tuberos',
+    tasaIva:         null,
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (fallback conservador)
+    cuentaAbono:     '2103090002',  // Anticipos Otros Club Tuberos
+    cuentaIva:       null,
+    prioridad:       74,
+  },
 
   // ── CC2. BONIFICACIÓN GENÉRICA (prio 75) ─────────────────────────────────
   // Captura 'BONIFICACIÓN' y 'Bonificacion' (con/sin acento).
@@ -1323,13 +1376,48 @@ const reglas = [
     prioridad:       84,
   },
 
+  // ── 11A-PPD. DEVOLUCIÓN NC PPD (Reglas 8PPD, 17PPD) ─────────────────────────
+  // metodoPago='PPD': la NC cancela una CxC abierta en cartera (factura PPD no cobrada).
+  // NO hay movimiento de efectivo → cuentaAbono = Clientes (extingue CxC), NO Bancos.
+  // IVA PPD: el diferido (2105010001) se cancela al DEBE porque nunca se causó definitivamente.
+  // Asiento NC-PPD 16%: DEBE Devoluciones (subtotal) + DEBE 2105010001 (IVA diferido) = HABER Clientes (total)
+  {
+    nombre:          'Reg 8PPD — NC PPD Devolución 16% (cancela CxC pendiente)',
+    tipoComprobante: 'E',
+    metodoPago:      'PPD',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010001',   // Devoluciones s/Ventas 16%
+    cuentaAbono:     '1103010001',   // Clientes 16% (extingue CxC — sin efectivo)
+    cuentaIva:       '2104010001',   // IVA Trasladado definitivo (PUE fallback)
+    cuentaIvaPPD:    '2105010001',   // IVA Por Trasladar PPD (cancela diferido)
+    conceptoContiene: null,
+    prioridad:       84,
+  },
+  {
+    nombre:          'Reg 17PPD — NC PPD Devolución 0% (cancela CxC pendiente)',
+    tipoComprobante: 'E',
+    metodoPago:      'PPD',
+    tipoRelacion:    '01',
+    tasaIva:         '0',
+    tieneDescuento:  false,
+    cuentaCargo:     '4200010002',   // Devoluciones s/Ventas 0%
+    cuentaAbono:     '1103010002',   // Clientes 0% (extingue CxC — sin efectivo)
+    cuentaIva:       null,
+    cuentaIvaPPD:    null,
+    conceptoContiene: null,
+    prioridad:       85,
+  },
+
   // ── 11B. CONDONACIÓN formaPago=15 (Reglas 8A-15, 8X-15, 17-15) ──────────────
   // formaPago='15' = "Condonación" en catálogo SAT. El vendedor perdona la deuda
   // sin movimiento de efectivo → cuentaAbono = Clientes (no Bancos).
   // Compiten con Reg 8A-8F (mismo prioridad) pero formaPago='15' no está cubierto
   // por ninguna de ellas → estas reglas son las únicas que matchean.
-  // IVA: Condonación = sin movimiento de efectivo → IVA queda diferido (2105010001)
-  // igual que PPD. NO usar 2104010001 (definitivo) porque no hubo cobro real.
+  // IVA PUE (Reg 8A-15): el IVA causó definitivamente al emitir la PUE → cancela 2104010001.
+  // IVA PPD (Reg 8X-15): el IVA nunca se causó (diferido) → cancela 2105010001.
+  // Art. 11 LIVA: IVA PUE se causa en el momento de la enajenación, no al cobro.
   {
     nombre:          'Reg 8A-15 — NC PUE Condonación Efectivo 16%',
     tipoComprobante: 'E',
@@ -1340,8 +1428,8 @@ const reglas = [
     tieneDescuento:  false,
     cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (pérdida por condonar)
     cuentaAbono:     '1103010001',  // Clientes 16% (cancela CxC — sin efectivo)
-    cuentaIva:       '2105010001',  // IVA Por Trasladar (condonación = diferido, como PPD)
-    cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD
+    cuentaIva:       '2104010001',  // IVA Trasladado definitivo (PUE ya causó al emitir)
+    cuentaIvaPPD:    '2105010001',  // IVA Por Trasladar PPD (fallback si esPPD=true)
     conceptoContiene: null,
     prioridad:       80,
   },
@@ -1741,31 +1829,11 @@ const reglas = [
     prioridad:         90,
   },
 
-  // ── 15. SALDO A FAVOR DEL CLIENTE (Reglas 25A, 24A) ─────────────────────
-  // NC sin reembolso — importe queda como saldo en Anticipos Otros (2103090001).
-  // 25A (prio 91) = tasa 0%; 24A (prio 92) = tasa 16%.
-  {
-    nombre:          'Reg 25A — Generación Saldo a Favor Tasa 0% (sin reembolso)',
-    tipoComprobante: 'E',
-    tipoRelacion:    '01',
-    tasaIva:         '0',
-    cuentaCargo:     '4200010002',  // Devoluciones s/Ventas 0%
-    cuentaAbono:     '2103090001',  // Anticipos Otros
-    cuentaIva:       null,
-    conceptoContiene: null,
-    prioridad:       91,
-  },
-  {
-    nombre:          'Reg 24A — Generación Saldo a Favor 16% (sin reembolso)',
-    tipoComprobante: 'E',
-    tipoRelacion:    '01',
-    tasaIva:         '16',
-    cuentaCargo:     '4200010001',  // Devoluciones s/Ventas 16%
-    cuentaAbono:     '2103090001',  // Anticipos Otros
-    cuentaIva:       '2104010001',  // IVA Trasladado
-    conceptoContiene: null,
-    prioridad:       92,
-  },
+  // ── 15. SALDO A FAVOR DEL CLIENTE ────────────────────────────────────────────
+  // Ruta activa: Reg 24A-17 / 25A-17 (empresa-específicas, formaPago='17' compensación).
+  // Reg 24A / 25A eliminadas — eran dead rules: Reg 20 (prio 88) y Reg 21 (prio 89)
+  // tienen los mismos criterios con prioridad menor y siempre ganaban antes.
+  // El ERP debe estampar formaPago='17' en NCs de saldo a favor para activar la ruta correcta.
 
   // ── IC. INTERCOMPAÑÍAS (Reg IC-I-PUE, IC-I-PPD, IC-E) ───────────────────────
   // Prioridad 5 — antes que todas las reglas genéricas.
@@ -1773,7 +1841,7 @@ const reglas = [
   // Cuentas destino:
   //   4100030001  Ingresos Intercompañías 16%
   //   4200030001  Devoluciones s/Ventas Intercompañías 16%
-  //   1103010001  Clientes Nac Gral 16% (CxC para PPD — usar cuenta IC si existe)
+  //   1103020001  Clientes IC (CxC PPD — simétrico con cuentaAbono de IC-P cobros)
   // ─────────────────────────────────────────────────────────────────────────────
 
   // GAAA5403026G2 — Alberto Neftali Garcia Arango (Física)
@@ -1785,7 +1853,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (GAAA5403026G2)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'GAAA5403026G2',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (GAAA5403026G2)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'GAAA5403026G2',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (GAAA5403026G2)',
@@ -1802,7 +1875,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (GAFA850630542)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'GAFA850630542',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (GAFA850630542)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'GAFA850630542',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (GAFA850630542)',
@@ -1819,7 +1897,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (AVA1002023N7)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'AVA1002023N7',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (AVA1002023N7)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'AVA1002023N7',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (AVA1002023N7)',
@@ -1836,7 +1919,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (GIN121109RX4)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'GIN121109RX4',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (GIN121109RX4)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'GIN121109RX4',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (GIN121109RX4)',
@@ -1853,7 +1941,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (KTE180215FE1)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'KTE180215FE1',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (KTE180215FE1)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'KTE180215FE1',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (KTE180215FE1)',
@@ -1870,7 +1963,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (FEUL5811155D9)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'FEUL5811155D9',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (FEUL5811155D9)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'FEUL5811155D9',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (FEUL5811155D9)',
@@ -1887,7 +1985,12 @@ const reglas = [
   {
     nombre:          'Reg IC-I-PPD — Ingreso Intercompañía PPD (RSI051018GL6)',
     tipoComprobante: 'I', metodoPago: 'PPD', rfcReceptor: 'RSI051018GL6',
-    cuentaCargo: '1103010001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+    cuentaCargo: '1103020001', cuentaAbono: '4100030001', cuentaIva: '2104010001', cuentaIvaPPD: '2105010001', prioridad: 5,
+  },
+  {
+    nombre:          'Reg IC-E-PPD — NC Devolución Intercompañía PPD (RSI051018GL6)',
+    tipoComprobante: 'E', metodoPago: 'PPD', rfcReceptor: 'RSI051018GL6',
+    cuentaCargo: '4200030001', cuentaAbono: '1103020001', cuentaIvaPPD: '2105010001', prioridad: 5,
   },
   {
     nombre:          'Reg IC-E — NC Devolución Intercompañía (RSI051018GL6)',

@@ -245,9 +245,13 @@ function _derivarTipoOrigen(cfdi) {
   const tipo = cfdi.tipoDeComprobante;
   if (tipo === 'I') return 'Venta';
   if (tipo === 'E') {
-    const rel = cfdi.cfdiRelacionados?.[0]?.tipoRelacion;
+    const rel        = cfdi.cfdiRelacionados?.[0]?.tipoRelacion;
+    const concepto   = (cfdi.conceptos?.[0]?.descripcion ?? cfdi.conceptos?.[0]?.Descripcion ?? '').toUpperCase();
+    // CANCELAC en el concepto siempre es Cancelación (devolución contable),
+    // sin importar el tipoRelacion — evita que queden en Descuentos.
+    if (concepto.includes('CANCELAC')) return 'Cancelación';
+    if (rel === '03' || concepto.includes('DEVOLUCI')) return 'Devolución';
     if (rel === '01') return 'Nota de Crédito';
-    if (rel === '03') return 'Devolución';
     return 'Bonificación';
   }
   if (tipo === 'P') return 'Pago';

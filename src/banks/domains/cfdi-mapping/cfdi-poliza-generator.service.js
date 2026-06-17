@@ -568,6 +568,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const todosLosMovimientos = [];
   let sinRegla = 0;
   const advertencias = [];
+  const ruleUsageCount = new Map();
   // Diagnóstico: acumular los primeros 5 CFDIs sin regla para dar info útil
   const muestrasSinRegla = [];
 
@@ -611,6 +612,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
 
     if (rule?.esAplicacionSaldo) {
       const usado = movs.find(m => m._saldoUsado != null)?._saldoUsado ?? 0;
@@ -677,6 +679,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
     return polizaHeader;
   });
+
+  // Incrementar contador de uso por regla (fuera de la transacción para no bloquearla)
+  if (ruleUsageCount.size > 0) {
+    await Promise.all(
+      [...ruleUsageCount.entries()].map(([id, count]) =>
+        CfdiMappingRule.increment('vecesUsada', { by: count, where: { id } }),
+      ),
+    );
+  }
 
   const advertenciasFinal = [];
   if (sinRegla > 0) {

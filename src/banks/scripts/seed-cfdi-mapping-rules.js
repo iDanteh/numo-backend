@@ -1418,6 +1418,81 @@ const reglas = [
     prioridad:        75,
   },
 
+  // ── CC2E. CANCELACIÓN COMO DESCUENTO (prio 75, tipoRelacion='01') ──────────
+  // Captura NCs tipo01 cuyo concepto dice "CANCELACION" — créditos de precio,
+  // no devolución física de mercancía.  tipoRelacion='01' es obligatorio para
+  // que las NCs tipo03 con "CANCELACION" (devoluciones reales) sigan yendo a
+  // CC-DEV / Devoluciones s/Ventas.
+  {
+    nombre:           'Reg CC-CAN-D-16-EF — NC Cancelación Descuento 16% Efectivo',
+    tipoComprobante:  'E',
+    tipoRelacion:     '01',
+    formaPago:        '01',
+    tasaIva:          '16',
+    conceptoContiene: 'cancelaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-CAN-D-16 — NC Cancelación Descuento 16%',
+    tipoComprobante:  'E',
+    tipoRelacion:     '01',
+    tasaIva:          '16',
+    conceptoContiene: 'cancelaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-CAN-D-0-EF — NC Cancelación Descuento 0% Efectivo',
+    tipoComprobante:  'E',
+    tipoRelacion:     '01',
+    formaPago:        '01',
+    tasaIva:          '0',
+    conceptoContiene: 'cancelaci',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        null,
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-CAN-D-0 — NC Cancelación Descuento 0%',
+    tipoComprobante:  'E',
+    tipoRelacion:     '01',
+    tasaIva:          '0',
+    conceptoContiene: 'cancelaci',
+    cuentaCargo:      '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        null,
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-CAN-D-M-EF — NC Cancelación Descuento Mixto Efectivo',
+    tipoComprobante:  'E',
+    tipoRelacion:     '01',
+    formaPago:        '01',
+    tasaIva:          'mixto',
+    conceptoContiene: 'cancelaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1101010003',  // Caja
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+  {
+    nombre:           'Reg CC-CAN-D-M — NC Cancelación Descuento Mixto',
+    tipoComprobante:  'E',
+    tipoRelacion:     '01',
+    tasaIva:          'mixto',
+    conceptoContiene: 'cancelaci',
+    cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:      '1102011005',  // Bancos
+    cuentaIva:        '2104010001',
+    prioridad:        75,
+  },
+
   // ── CC3. DEVOLUCIÓN DE CLIENTE (prio 76) ──────────────────────────────────
   // DEBE Devoluciones s/Ventas, HABER Bancos/Caja (reembolso al cliente).
   // Si la devolución no genera reembolso (queda como saldo a favor),

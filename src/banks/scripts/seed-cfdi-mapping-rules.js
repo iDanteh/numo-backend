@@ -1209,6 +1209,69 @@ const reglas = [
     prioridad:       74,
   },
 
+  // ── CC1B. CANCELACIÓN COMO DESCUENTO — ERP sin conceptos (prio 74) ──────────
+  // NCs de ERP con tipoOrigen='Cancelación' y tipoRelacion='01' son ajustes de
+  // precio (no devolución física). El ERP los importa sin conceptos[], por lo que
+  // las reglas keyword (CC-CAN-D) nunca disparan. Se usa tipoOrigen directamente.
+  // tipoRelacion='01' es obligatorio: protege NCs tipo03 con tipoOrigen='Cancelación'
+  // (devoluciones reales) para que sigan cayendo a Devoluciones.
+  {
+    nombre:          'Reg CC-TOR-CAN-16-EF — NC Cancelación Desc 16% ERP Efectivo',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         '16',
+    tipoOrigen:      'Cancelación',
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:     '1101010003',  // Caja
+    cuentaIva:       '2104010001',
+    prioridad:       74,
+  },
+  {
+    nombre:          'Reg CC-TOR-CAN-16 — NC Cancelación Desc 16% ERP',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '16',
+    tipoOrigen:      'Cancelación',
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       '2104010001',
+    prioridad:       74,
+  },
+  {
+    nombre:          'Reg CC-TOR-CAN-0-EF — NC Cancelación Desc 0% ERP Efectivo',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    formaPago:       '01',
+    tasaIva:         '0',
+    tipoOrigen:      'Cancelación',
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:     '1101010003',  // Caja
+    cuentaIva:       null,
+    prioridad:       74,
+  },
+  {
+    nombre:          'Reg CC-TOR-CAN-0 — NC Cancelación Desc 0% ERP',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         '0',
+    tipoOrigen:      'Cancelación',
+    cuentaCargo:     '4200020002',  // Descuentos s/Ventas 0%
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       null,
+    prioridad:       74,
+  },
+  {
+    nombre:          'Reg CC-TOR-CAN-N — NC Cancelación Desc Sin Tasa ERP',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tipoOrigen:      'Cancelación',
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (fallback)
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       '2104010001',
+    prioridad:       74,
+  },
+
   // ── CC2. BONIFICACIÓN GENÉRICA (prio 75) ─────────────────────────────────
   // Captura 'BONIFICACIÓN' y 'Bonificacion' (con/sin acento).
   // formaPago=01 gana por spec sobre formaPago=null en empate de prioridad.

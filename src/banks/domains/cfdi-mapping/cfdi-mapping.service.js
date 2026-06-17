@@ -95,7 +95,10 @@ function findRuleInList(cfdi, rules) {
   // Contiene el tipoDeComprobante del primer CFDI relacionado (pre-fetched de MongoDB).
   const cfdiRelacionadoTipo = cfdi._relacionadoTipo ?? null;
 
-  const cfdiDescripcion = (cfdi.conceptos?.[0]?.descripcion ?? cfdi.conceptos?.[0]?.Descripcion ?? '').toLowerCase();
+  const cfdiDescripcion = (cfdi.conceptos ?? [])
+    .map(c => c.descripcion ?? c.Descripcion ?? '')
+    .join(' ')
+    .toLowerCase();
   const cfdiTipoOrigen  = cfdi.tipoOrigen ?? _derivarTipoOrigen(cfdi) ?? null;
 
   const matching = rules.filter(r =>

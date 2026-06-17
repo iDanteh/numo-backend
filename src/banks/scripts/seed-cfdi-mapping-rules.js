@@ -855,8 +855,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '1101010003',  // Caja
     cuentaAbono:  '1103010002',  // Clientes 0% (liquida CxC 0%)
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    70,
   },
@@ -867,8 +867,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '1102011005',
     cuentaAbono:  '1103010002',
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    71,
   },
@@ -879,8 +879,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '1102011005',
     cuentaAbono:  '1103010002',
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    72,
   },
@@ -891,8 +891,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '1102011005',
     cuentaAbono:  '1103010002',
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    72,
   },
@@ -903,8 +903,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '1102011005',
     cuentaAbono:  '1103010002',
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    73,
   },
@@ -915,8 +915,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '1102011005',
     cuentaAbono:  '1103010002',
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    74,
   },
@@ -945,8 +945,8 @@ const reglas = [
     tasaIva:      '0',
     cuentaCargo:  '2103090002',  // Anticipos Otros Club Tuberos
     cuentaAbono:  '1103010002',  // Clientes 0%
-    cuentaIva:    '2104010001',
-    cuentaIvaPPD: '2105010001',
+    cuentaIva:    null,
+    cuentaIvaPPD: null,
     conceptoContiene: null,
     prioridad:    70,
   },
@@ -2089,7 +2089,7 @@ const reglas = [
     tieneDescuento:  false,
     cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
     cuentaAbono:     '1103010001',  // Clientes (sin efectivo)
-    cuentaIva:       '2105010001',  // IVA Por Trasladar (condonación = diferido)
+    cuentaIva:       '2104010001',  // IVA Trasladado definitivo (Art. 11 LIVA: PUE ya causó)
     cuentaIvaPPD:    '2105010001',
     conceptoContiene: null,
     prioridad:       80,
@@ -2240,6 +2240,21 @@ const reglas = [
     cuentaIva:       null,
     conceptoContiene: null,
     prioridad:       89,
+  },
+  {
+    // NC ERP sin información de tasa (conceptos vacíos, sin traslados header).
+    // _detectTasaIva devuelve null → Reg 20/21 no hacen match (requieren tasaIva='16'/'0').
+    // Sin esta regla caerían a E-FALL (prio 98) → Devoluciones (4200010001). Incorrecto:
+    // tipoRelacion='01' son descuentos/bonificaciones retroactivas, no devoluciones físicas.
+    nombre:          'Reg 20N — Bonificación s/Ventas Sin Tasa (NC ERP sin impuestos)',
+    tipoComprobante: 'E',
+    tipoRelacion:    '01',
+    tasaIva:         null,
+    cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
+    cuentaAbono:     '1102011005',  // Bancos
+    cuentaIva:       '2104010001',  // IVA Trasladado definitivo
+    conceptoContiene: null,
+    prioridad:       88,
   },
 
   // ── 14. NC APLICACIÓN DE ANTICIPO (Regla 23) ─────────────────────────────
@@ -3654,9 +3669,10 @@ const reglas = [
     formaPago: '17',
     tipoRelacion: '01',
     tasaIva: '16',
-    cuentaCargo: '4200010001',
-    cuentaAbono: '2103090001',
-    cuentaIva: '2104010001',
+    cuentaCargo: '4200020001',  // Descuentos s/Ventas 16% (compensación = descuento, no devolución)
+    cuentaAbono: '2103090001',  // Anticipos Otros (genera pasivo saldo a favor)
+    cuentaIva:    '2104010001',
+    cuentaIvaPPD: '2105010001',
     prioridad: 84,
   },
   {
@@ -3665,7 +3681,7 @@ const reglas = [
     formaPago: '17',
     tipoRelacion: '01',
     tasaIva: '0',
-    cuentaCargo: '4200010002',
+    cuentaCargo: '4200020002',  // Descuentos s/Ventas 0%
     cuentaAbono: '2103090001',
     prioridad: 84,
   },

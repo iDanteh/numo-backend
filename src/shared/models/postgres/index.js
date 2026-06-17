@@ -170,6 +170,11 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS cuenta_abono2   VARCHAR(20)
   `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_iva_ppd/cuenta_abono2 (reglas):', e.message));
 
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS veces_usada INTEGER NOT NULL DEFAULT 0
+  `).catch(e => console.warn('[syncModels] ADD COLUMN veces_usada (reglas):', e.message));
+
   await BankRule.sequelize.query(`
     ALTER TABLE bank_rules ADD COLUMN IF NOT EXISTS estado_destino VARCHAR(30)
   `).catch(e => console.warn('[syncModels] ADD COLUMN estado_destino (bank_rules):', e.message));

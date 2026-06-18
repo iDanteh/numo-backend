@@ -247,7 +247,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       ...filtroReclasificaciones,
       ...filtroMesesPosteriores,
     })
-      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
+      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.formaDePagoP complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
       .maxTimeMS(60_000)
       .lean();
 
@@ -318,13 +318,14 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
         : (cfdi.metodoPago || erp.metodoPago);
 
       const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+      const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
       return {
         ...cfdi,
         formaPago:              cfdi.formaPago  || erp.formaPago,
         metodoPago:             metodoPagoFinal,
         conceptos:              satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
         impuestos:              satHasBaseTraslados ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-        tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+        tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
         documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
         cfdiRelacionados:       relEnriq,
       };
@@ -736,7 +737,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       tipoDeComprobante: tipo, source: 'SAT', satStatus: 'Vigente', isActive: true,
       ...filtroPagosSustitutos, ...filtroAnticipos, ...filtroReclasificaciones, ...filtroMesesPosteriores,
     })
-      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor.rfc emisor.nombre receptor.rfc receptor.nombre subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
+      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor.rfc emisor.nombre receptor.rfc receptor.nombre subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.formaDePagoP complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
       .maxTimeMS(60_000).lean();
 
     const uuidsParaEnriquecer = new Set(
@@ -771,13 +772,14 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
         ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
       const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+      const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
       return {
         ...cfdi,
         formaPago:              cfdi.formaPago || erp.formaPago,
         metodoPago:             metodoPagoFinal,
         conceptos:              satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
         impuestos:              satHasBaseTraslados ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-        tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+        tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
         documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
         cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
       };
@@ -939,4 +941,219 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
   };
 }
 
-module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99 };
+/**
+ * Devuelve todos los movimientos CFDI→cuenta del periodo en una lista plana,
+ * con cuenta, regla y datos del comprobante. Usado para el export Excel completo.
+ */
+async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
+  excluirPagosSustitutos = false, excluirAplicacionesAnticipos = false,
+  excluirReclasificaciones = false, incluirFechaCruzada = false, excluirMesesPosteriores = false }) {
+
+  if (!rfc)       throw new BadRequestError('RFC requerido');
+  if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
+  if (!periodo)   throw new BadRequestError('Periodo requerido');
+
+  const tipos = tipoCfdi ? [tipoCfdi] : ['I', 'E', 'P'];
+
+  const filtroPagosSustitutos = excluirPagosSustitutos
+    ? { $nor: [{ tipoDeComprobante: 'P', 'cfdiRelacionados.tipoRelacion': '04' }, { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '04' }] }
+    : {};
+  const filtroPeriodo = incluirFechaCruzada
+    ? { $or: [{ periodo: Number(periodo) }, { $expr: { $eq: [{ $month: '$fecha' }, Number(periodo)] } }] }
+    : { periodo: Number(periodo) };
+  const filtroReclasificaciones = excluirReclasificaciones ? { $expr: { $eq: [{ $month: '$fecha' }, Number(periodo)] } } : {};
+  const filtroMesesPosteriores  = excluirMesesPosteriores  ? { $expr: { $lte: [{ $month: '$fecha' }, Number(periodo)] } } : {};
+  const filtroAnticipos = excluirAplicacionesAnticipos
+    ? { $nor: [{ tipoDeComprobante: 'I', 'cfdiRelacionados.tipoRelacion': '07' }, { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '07' }] }
+    : {};
+
+  const rules = await _getRulesActive();
+
+  const codigosTodos = [...new Set(
+    rules.flatMap(r => [
+      r.cuentaCargo, r.cuentaAbono, r.cuentaAbono2, r.cuentaIva, r.cuentaIvaPPD,
+      r.cuentaIvaRetenido, r.cuentaIsrRetenido, r.cuentaIvaAnticipo, r.cuentaDeltaAnticipo,
+      r.cuentaCargo2, r.cuentaDescuento, r.cuentaDescuento0, r.cuentaCargoMixto0, r.cuentaIvaAbono,
+    ].filter(Boolean)),
+  )];
+
+  const cuentasRows = codigosTodos.length
+    ? await AccountPlan.findAll({ where: { codigo: { [Op.in]: codigosTodos } }, attributes: ['id', 'codigo', 'nombre', 'tipo'], raw: true })
+    : [];
+  const cuentaMapByCod = Object.fromEntries(cuentasRows.map(c => [c.codigo, c.id]));
+  const cuentaInfoById = Object.fromEntries(cuentasRows.map(c => [c.id, { codigo: c.codigo, nombre: c.nombre, tipo: c.tipo }]));
+
+  // Pre-query facturas PUE formaPago=30 para fix doble-contabilización anticipo
+  const _uuidsFactPue = new Set();
+  {
+    const _fp = await CFDI.find({
+      $or: [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+      ejercicio: Number(ejercicio), ...filtroPeriodo,
+      tipoDeComprobante: 'I', formaPago: '30',
+      source: 'SAT', satStatus: 'Vigente', isActive: true, ...filtroMesesPosteriores,
+    }).select('uuid').lean();
+    for (const c of _fp) { if (c.uuid) _uuidsFactPue.add(c.uuid.toUpperCase()); }
+  }
+
+  const entradas = [];
+  let sinRegla = 0;
+
+  for (const tipo of tipos) {
+    const cfdis = await CFDI.find({
+      $or: [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+      ejercicio: Number(ejercicio), ...filtroPeriodo,
+      tipoDeComprobante: tipo, source: 'SAT', satStatus: 'Vigente', isActive: true,
+      ...filtroPagosSustitutos, ...filtroAnticipos, ...filtroReclasificaciones, ...filtroMesesPosteriores,
+    })
+      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor.rfc emisor.nombre receptor.rfc receptor.nombre subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.formaDePagoP complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
+      .maxTimeMS(60_000).lean();
+
+    const uuidsParaEnriquecer = new Set(
+      cfdis.filter(c => c.uuid && (
+        !c.formaPago || !c.metodoPago || !c.conceptos?.length ||
+        c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
+        (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
+         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      )).map(c => c.uuid),
+    );
+
+    let erpMetaMap = {};
+    if (uuidsParaEnriquecer.size) {
+      const erpCfdis = await CFDI.find({ uuid: { $in: [...uuidsParaEnriquecer] }, source: 'ERP' })
+        .select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
+      erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
+    }
+
+    const cfdisEnriquecidos = cfdis.map(cfdi => {
+      const erp = erpMetaMap[cfdi.uuid];
+      if (!erp) return cfdi;
+      const satHasTraslados    = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+      const satHasBaseTraslados = (cfdi.impuestos?.traslados ?? []).some(t => (t.base ?? 0) > 0);
+      const relSAT = cfdi.cfdiRelacionados ?? [];
+      const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
+      const relERP = (erp.cfdiRelacionados ?? []).filter(r => {
+        if (tiposEnSAT.has(r.tipoRelacion)) return false;
+        if (cfdi.tipoDeComprobante === 'E' && r.tipoRelacion === '07' && relSAT.length > 0) return false;
+        return true;
+      });
+      const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE') ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
+      const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+      const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
+      return {
+        ...cfdi,
+        formaPago:  cfdi.formaPago || erp.formaPago,
+        metodoPago: metodoPagoFinal,
+        conceptos:  satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+        impuestos:  satHasBaseTraslados ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
+        tipoOrigen: esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+        documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
+        cfdiRelacionados: relERP.length ? [...relSAT, ...relERP] : relSAT,
+      };
+    });
+
+    if (tipo === 'P') {
+      await _enrichTasaIvaFromRelatedCfdis(cfdisEnriquecidos);
+      const sinTasaErp = cfdisEnriquecidos.filter(c =>
+        c.tasaIvaInferida == null && !c.complementoPago?.pagos?.length && c.cfdiRelacionados?.length);
+      if (sinTasaErp.length) {
+        const uuidToIdxs = new Map();
+        for (let i = 0; i < sinTasaErp.length; i++) {
+          const uuids = (sinTasaErp[i].cfdiRelacionados ?? [])
+            .flatMap(r => r.uuids ?? []).flatMap(u => u.split(/\s*\|\s*/))
+            .map(u => u.trim().toUpperCase()).filter(u => u.length >= 32);
+          for (const uuid of uuids) {
+            if (!uuidToIdxs.has(uuid)) uuidToIdxs.set(uuid, []);
+            uuidToIdxs.get(uuid).push(i);
+          }
+        }
+        if (uuidToIdxs.size) {
+          const erpDocs = await ErpCuentaPendiente.find(
+            { folioFiscal: { $in: [...uuidToIdxs.keys()] } },
+            { folioFiscal: 1, factorImpuesto: 1, impuesto: 1, subtotal: 1 },
+          ).lean();
+          const tasasPorIdx = new Map();
+          for (const erp of erpDocs) {
+            const uuidNorm = (erp.folioFiscal || '').trim().toUpperCase();
+            const tasa = erp.factorImpuesto != null
+              ? (erp.factorImpuesto > 0 ? '16' : '0')
+              : (erp.subtotal > 0 && erp.impuesto != null ? (erp.impuesto > 0 ? '16' : '0') : null);
+            if (!tasa) continue;
+            for (const idx of (uuidToIdxs.get(uuidNorm) ?? [])) {
+              if (!tasasPorIdx.has(idx)) tasasPorIdx.set(idx, []);
+              tasasPorIdx.get(idx).push(tasa);
+            }
+          }
+          for (const [idx, tasas] of tasasPorIdx) {
+            const tiene16 = tasas.some(t => t === '16' || t === 'mixto');
+            const tiene0  = tasas.some(t => t === '0'  || t === 'mixto');
+            sinTasaErp[idx].tasaIvaInferida = (tiene16 && tiene0) ? 'mixto' : tiene16 ? '16' : tiene0 ? '0' : null;
+          }
+        }
+      }
+    }
+
+    _normalizarEgresoPue99(cfdisEnriquecidos);
+
+    const cfdisFinalesBase = excluirPagosSustitutos
+      ? cfdisEnriquecidos.filter(c => !(['P', 'E'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.some(r => r.tipoRelacion === '04')))
+      : cfdisEnriquecidos;
+
+    const cfdisFinales = _uuidsFactPue.size
+      ? cfdisFinalesBase.filter(c => {
+          if (c.tipoDeComprobante !== 'E') return true;
+          if (!c.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) return true;
+          const rel07 = (c.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
+          const uuid07 = (rel07?.uuids?.[0] ?? rel07?.uuid ?? '').toUpperCase() || undefined;
+          return !(uuid07 && _uuidsFactPue.has(uuid07));
+        })
+      : cfdisFinalesBase;
+
+    for (const cfdi of cfdisFinales) {
+      const rule = mappingSvc.findRuleInList(cfdi, rules);
+      if (!rule) { sinRegla++; continue; }
+      const movs    = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMapByCod);
+      const tasaIva = mappingSvc._detectTasaIvaPublic(cfdi);
+
+      for (const mov of movs) {
+        if (!mov.cuentaId) continue;
+        const info = cuentaInfoById[mov.cuentaId];
+        if (!info) continue;
+        entradas.push({
+          cuentaCodigo:      info.codigo,
+          cuentaNombre:      info.nombre,
+          cuentaTipo:        info.tipo,
+          uuid:              cfdi.uuid,
+          tipoDeComprobante: cfdi.tipoDeComprobante,
+          fecha:             cfdi.fecha,
+          folio:             cfdi.folio ?? null,
+          serie:             cfdi.serie ?? null,
+          rfcEmisor:         cfdi.emisor?.rfc     ?? null,
+          emisorNombre:      cfdi.emisor?.nombre   ?? null,
+          rfcReceptor:       cfdi.receptor?.rfc   ?? null,
+          receptorNombre:    cfdi.receptor?.nombre ?? null,
+          subTotal:          Number(cfdi.subTotal || 0),
+          descuento:         Number(cfdi.descuento || 0),
+          total:             Number(cfdi.total    || 0),
+          formaPago:         cfdi.formaPago  ?? null,
+          metodoPago:        cfdi.metodoPago ?? null,
+          tasaIvaDetectada:  tasaIva,
+          debe:              Math.round(Number(mov.debe  || 0) * 100) / 100,
+          haber:             Math.round(Number(mov.haber || 0) * 100) / 100,
+          concepto:          mov.concepto ?? null,
+          reglaNombre:       rule.nombre,
+          porQue:            _porQueAplicoRegla(cfdi, rule),
+        });
+      }
+    }
+  }
+
+  entradas.sort((a, b) => {
+    const cc = (a.cuentaCodigo ?? '').localeCompare(b.cuentaCodigo ?? '');
+    if (cc !== 0) return cc;
+    return new Date(a.fecha) - new Date(b.fecha);
+  });
+  return { entradas, sinRegla };
+}
+
+module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, generarDetalleExport, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99 };

@@ -810,12 +810,24 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre, filename } 
             const bnetInc = ((m.concepto    || '').match(BNET_RE) || [])[1];
             const bnetCnd = ((cand.concepto || '').match(BNET_RE) || [])[1];
             if (bnetInc && bnetCnd && bnetInc === bnetCnd) {
-              hashesExistentes.add(m.hash);
-              softDuplicados++;
-              // Enriquecer si el reimport trae datos que el existente no tiene
-              const enrichBnet = buildSoftEnrich(m, cand);
-              if (enrichBnet) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnet, via: 'capa1d' });
-              break;
+              // Guard: en formato "PAGO CUENTA DE TERCERO / {authNum} BNET {accountNum}",
+              // el token tras BNET es el número de cuenta destino del beneficiario —
+              // compartido entre múltiples pagos al mismo destinatario, NO un ID único
+              // de transacción.  Si ambos lados tienen auth real y distinto, el BNET
+              // es cuenta destino; dejar pasar al chequeo de saldo que los distinguirá.
+              const incRealAuth = m.numeroAutorizacion && !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion);
+              const cndRealAuth = cand.numeroAutorizacion && !isBBVAPseudoAuth(cand.banco, cand.numeroAutorizacion);
+              const authsDiffer = incRealAuth && cndRealAuth && !authMatch(m.numeroAutorizacion, cand.numeroAutorizacion);
+              if (!authsDiffer) {
+                hashesExistentes.add(m.hash);
+                softDuplicados++;
+                // Enriquecer si el reimport trae datos que el existente no tiene
+                const enrichBnet = buildSoftEnrich(m, cand);
+                if (enrichBnet) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnet, via: 'capa1d' });
+                break;
+              }
+              // authsDiffer=true → BNET es cuenta destino, no ID de transacción.
+              // Continuar al chequeo de saldo.
             }
             // Si ninguno tiene número BNET, seguir con el check de saldo+concepto.
           }

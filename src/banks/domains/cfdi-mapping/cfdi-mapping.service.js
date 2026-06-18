@@ -1,13 +1,25 @@
 'use strict';
 
-const { CfdiMappingRule, AccountPlan, PolizaMovimiento } = require('../../../shared/models/postgres');
-const { Op }            = require('sequelize');
+const { CfdiMappingRule, AccountPlan, PolizaMovimiento, Poliza } = require('../../../shared/models/postgres');
+const { Op, fn, col, literal } = require('sequelize');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 
 // ── CRUD de reglas ────────────────────────────────────────────────────────────
 
 async function list() {
   return CfdiMappingRule.findAll({
+    attributes: {
+      include: [[
+        literal(`(
+          SELECT COUNT(pm.id)
+          FROM poliza_movimientos pm
+          JOIN polizas p ON p.id = pm.poliza_id
+          WHERE pm.regla_id = "CfdiMappingRule"."id"
+            AND p.estado IN ('borrador', 'contabilizada')
+        )`),
+        'vecesUsadaActiva',
+      ]],
+    },
     order: [['prioridad', 'ASC'], ['nombre', 'ASC']],
   });
 }
@@ -95,6 +107,12 @@ function findRuleInList(cfdi, rules) {
   // Contiene el tipoDeComprobante del primer CFDI relacionado (pre-fetched de MongoDB).
   const cfdiRelacionadoTipo = cfdi._relacionadoTipo ?? null;
 
+  // Para tipo P, formaPago va en el complemento (formaDePagoP), no en el header.
+  const cfdiFormaPago = cfdi.formaPago
+    ?? (cfdi.tipoDeComprobante === 'P'
+      ? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? null
+      : null);
+
   const cfdiDescripcion = (cfdi.conceptos ?? [])
     .map(c => c.descripcion ?? c.Descripcion ?? '')
     .join(' ')
@@ -106,7 +124,7 @@ function findRuleInList(cfdi, rules) {
     (!r.rfcEmisor          || r.rfcEmisor        === cfdi.emisor?.rfc) &&
     (!r.rfcReceptor        || r.rfcReceptor      === cfdi.receptor?.rfc) &&
     (!r.metodoPago         || r.metodoPago       === cfdi.metodoPago) &&
-    (!r.formaPago          || r.formaPago         === cfdi.formaPago) &&
+    (!r.formaPago          || r.formaPago         === cfdiFormaPago) &&
     (!r.claveProdServ      || r.claveProdServ     === cfdiClaveProdServ) &&
     (!r.tipoRelacion       || r.tipoRelacion      === cfdiTipoRelacion) &&
     (!r.relacionadoTipo    || r.relacionadoTipo   === cfdiRelacionadoTipo) &&
@@ -1016,4 +1034,29 @@ function _validate(data) {
   if (!data.cuentaAbono?.trim()) throw new BadRequestError('La cuenta de abono es requerida');
 }
 
-module.exports = { list, getById, create, update, remove, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos };
+async function getRulePolizas(ruleId) {
+  const rule = await CfdiMappingRule.findByPk(ruleId);
+  if (!rule) throw new NotFoundError('Regla de mapeo');
+
+  const counts = await PolizaMovimiento.findAll({
+    where:      { reglaId: ruleId },
+    attributes: ['polizaId', [fn('COUNT', col('id')), 'cnt']],
+    group:      ['polizaId'],
+    raw:        true,
+  });
+  if (!counts.length) return [];
+
+  const idSet    = counts.map(c => c.polizaId);
+  const countMap = Object.fromEntries(counts.map(c => [c.polizaId, parseInt(c.cnt, 10)]));
+
+  const polizas = await Poliza.findAll({
+    where:      { id: { [Op.in]: idSet }, estado: { [Op.in]: ['borrador', 'contabilizada'] } },
+    attributes: ['id', 'tipo', 'numero', 'fecha', 'concepto', 'ejercicio', 'periodo', 'rfc', 'estado'],
+    order:      [['fecha', 'DESC']],
+    raw:        true,
+  });
+
+  return polizas.map(p => ({ ...p, movimientosConRegla: countMap[p.id] ?? 0 }));
+}
+
+module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos };

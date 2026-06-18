@@ -183,13 +183,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+    const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
@@ -478,13 +479,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+    const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };

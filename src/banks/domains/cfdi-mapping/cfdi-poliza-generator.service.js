@@ -159,8 +159,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         !c.conceptos?.length ||
         c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
-         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        // Enriquecer también sustitutos (tipoRelacion='04'): se conservan en
+        // la póliza y necesitan formaPago/conceptos/tipoOrigen del ERP.
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
       ))
       .map(c => c.uuid),
   );
@@ -206,8 +207,26 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
   _normalizarEgresoPue99(cfdisSinPolizaFinal);
 
+  // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
+  // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
+  const _canceladosPorSustitutoProp = new Set(
+    cfdisSinPolizaFinal
+      .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                   c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      .flatMap(c => (c.cfdiRelacionados || [])
+        .filter(r => r.tipoRelacion === '04')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .map(u => u.toUpperCase())
+      )
+  );
+  const cfdisSinPolizaFinalFiltrado = _canceladosPorSustitutoProp.size
+    ? cfdisSinPolizaFinal.filter(c =>
+        !_canceladosPorSustitutoProp.has(c.uuid?.toUpperCase() ?? '')
+      )
+    : cfdisSinPolizaFinal;
+
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
-  const cfdiConRegla = cfdisSinPolizaFinal.map(cfdi => ({
+  const cfdiConRegla = cfdisSinPolizaFinalFiltrado.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
@@ -455,8 +474,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         !c.conceptos?.length ||
         c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
-         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        // Enriquecer también sustitutos (tipoRelacion='04'): se conservan en
+        // la póliza y necesitan formaPago/conceptos/tipoOrigen del ERP.
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
       ))
       .map(c => c.uuid),
   );
@@ -502,8 +522,26 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
   _normalizarEgresoPue99(cfdisSinPolizaFinalGuard);
 
+  // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
+  // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
+  const _canceladosPorSustitutoGuard = new Set(
+    cfdisSinPolizaFinalGuard
+      .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                   c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      .flatMap(c => (c.cfdiRelacionados || [])
+        .filter(r => r.tipoRelacion === '04')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .map(u => u.toUpperCase())
+      )
+  );
+  const cfdisSinPolizaFinalGuardFiltrado = _canceladosPorSustitutoGuard.size
+    ? cfdisSinPolizaFinalGuard.filter(c =>
+        !_canceladosPorSustitutoGuard.has(c.uuid?.toUpperCase() ?? '')
+      )
+    : cfdisSinPolizaFinalGuard;
+
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
-  const cfdiConRegla = cfdisSinPolizaFinalGuard.map(cfdi => ({
+  const cfdiConRegla = cfdisSinPolizaFinalGuardFiltrado.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));

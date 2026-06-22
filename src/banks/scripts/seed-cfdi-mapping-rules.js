@@ -1213,8 +1213,11 @@ const reglas = [
   // NCs de ERP con tipoOrigen='Cancelación' y tipoRelacion='01' son ajustes de
   // precio (no devolución física). El ERP los importa sin conceptos[], por lo que
   // las reglas keyword (CC-CAN-D) nunca disparan. Se usa tipoOrigen directamente.
-  // tipoRelacion='01' es obligatorio: protege NCs tipo03 con tipoOrigen='Cancelación'
-  // (devoluciones reales) para que sigan cayendo a Devoluciones.
+  // tipoRelacion='01' es obligatorio: protege NCs con tipoOrigen='Cancelación'
+  // pero sin tipoRelacion='01' (devoluciones reales) → caen a TO-CAN (prio 65).
+  // NOTA: prio 74 > 65 (TO-CAN) — actualmente TO-CAN gana sobre esta regla para
+  // todos los tipoOrigen='Cancelación'. Requiere investigación de qué registros
+  // específicos deben ir a Descuentos antes de reducir la prioridad a 63.
   {
     nombre:          'Reg CC-TOR-CAN-16-EF — NC Cancelación Desc 16% ERP Efectivo',
     tipoComprobante: 'E',
@@ -3609,9 +3612,9 @@ const reglas = [
     prioridad: 71,
   },
   // ── TO-EGR. EGRESO ERP (tipoOrigen='Egreso') (prio 69) ──────────────────
-  // NCs del ERP con tipoOrigen='Egreso': ajustes administrativos que cancelan CxC
-  // sin categoría específica (ni Bonificación ni Devolución ni Cancelación).
-  // Tratamiento conservador: Devoluciones DEBE, Clientes HABER (sin efectivo).
+  // NCs del ERP con tipoOrigen='Egreso': aplican anticipos (adelantos de cliente)
+  // cancelando la CxC del anticipo. ContPaq los registra como DEBE Anticipo de Clientes
+  // (2103010001) / HABER Clientes — nunca en Devoluciones.
   // Prioridad 69 para estar al mismo nivel que CC-BON-ERP y ganar sobre reglas
   // genéricas de concepto (prio 74+) que no tienen acceso al campo tipoOrigen.
   {
@@ -3619,7 +3622,7 @@ const reglas = [
     tipoComprobante: 'E',
     tipoOrigen:    'Egreso',
     tasaIva:       '16',
-    cuentaCargo:   '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaCargo:   '2103010001',  // Anticipos De Clientes (extingue pasivo anticipo)
     cuentaAbono:   '1103010001',  // Clientes 16% (extingue CxC — sin efectivo)
     cuentaIva:     '2104010001',  // IVA Trasladado (PUE)
     cuentaIvaPPD:  '2105010001', // IVA Por Trasladar (PPD)
@@ -3630,7 +3633,7 @@ const reglas = [
     tipoComprobante: 'E',
     tipoOrigen:    'Egreso',
     tasaIva:       '0',
-    cuentaCargo:   '4200010002',  // Devoluciones s/Ventas 0%
+    cuentaCargo:   '2103010001',  // Anticipos De Clientes (extingue pasivo anticipo)
     cuentaAbono:   '1103010002',  // Clientes 0%
     cuentaIva:     null,
     cuentaIvaPPD:  null,
@@ -3641,9 +3644,9 @@ const reglas = [
     tipoComprobante: 'E',
     tipoOrigen:    'Egreso',
     tasaIva:       'mixto',
-    cuentaCargo:   '4200010001',  // Devoluciones s/Ventas 16%
+    cuentaCargo:   '2103010001',  // Anticipos De Clientes 16% (motor mixto E: cargo principal)
     cuentaAbono:   '1103010001',  // Clientes 16%
-    cuentaAbono2:  '4200010002',  // Devoluciones 0% (motor mixto E)
+    cuentaAbono2:  '2103010001',  // Anticipos De Clientes 0% (motor mixto E: cargo secundario)
     cuentaIva:     '2104010001',
     cuentaIvaPPD:  '2105010001',
     prioridad:     69,

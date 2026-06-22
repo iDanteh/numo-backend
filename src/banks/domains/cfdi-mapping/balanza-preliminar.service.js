@@ -130,17 +130,11 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
   const tipos = tipoCfdi ? [tipoCfdi] : ['I', 'E', 'P'];
-  // Filtro 1: excluir CFDIs sustitutos (tipoRelacion='04') de tipo P y E.
-  // CONTPAQi los maneja por separado (reverso del original + nuevo asiento),
-  // por lo que incluirlos en NUMO genera doble conteo.
-  // Nota: los que el SAT no tiene con '04' pero el ERP sí, se filtran en memoria
-  // después del enriquecimiento de cfdiRelacionados.
-  const filtroPagosSustitutos = excluirPagosSustitutos
-    ? { $nor: [
-        { tipoDeComprobante: 'P', 'cfdiRelacionados.tipoRelacion': '04' },
-        { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '04' },
-      ]}
-    : {};
+  // Filtro sustitutos: cuando excluirPagosSustitutos=true, se resuelve en memoria
+  // post-enriquecimiento (no en MongoDB). El CFDI cancelado (original) se excluye;
+  // el sustituto (tipoRelacion='04') se mantiene. Así NUMO espeja el comportamiento
+  // de CONTPAQi, que conserva solo el CFDI final vigente.
+  const filtroPagosSustitutos = {};  // manejado en memoria — ver _canceladosPorSustituto
 
   // Filtro 3 + 4: control de qué CFDIs incluir según periodo/fecha
   //
@@ -273,11 +267,9 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
           // Tipo I PPD: cargar ERP para detectar si fue cobrado de contado (ERP=PUE).
           // Corrige $54.95 de diferencia en 1103010001 vs CONTPAQI.
           (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-          (
-            ['E', 'P'].includes(c.tipoDeComprobante) &&
-            c.cfdiRelacionados?.length > 0 &&
-            !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04')
-          )
+          // Enriquecer también sustitutos (tipoRelacion='04'): ahora se conservan en
+          // la balanza y necesitan formaPago/conceptos/tipoOrigen del ERP.
+          ['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0
         ))
         .map(c => c.uuid)
     );
@@ -388,12 +380,24 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
     // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
     _normalizarEgresoPue99(cfdisEnriquecidos);
 
-    // Filtro en memoria post-enriquecimiento: excluir E y P con tipoRelacion='04'.
-    // Cubre los casos donde el SAT no tenía '04' pero el ERP lo inyectó en memoria.
+    // Filtro en memoria post-enriquecimiento: excluir el CFDI CANCELADO cuando existe
+    // un sustituto (tipoRelacion='04') que lo reemplaza. El sustituto se conserva.
+    // Permite que NUMO espeje CONTPAQi: solo el CFDI vigente final genera asiento.
+    const _canceladosPorSustituto = excluirPagosSustitutos
+      ? new Set(
+          cfdisEnriquecidos
+            .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                         c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+            .flatMap(c => (c.cfdiRelacionados || [])
+              .filter(r => r.tipoRelacion === '04')
+              .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+              .map(u => u.toUpperCase())
+            )
+        )
+      : null;
     const cfdisEnriquecidosFiltrados = excluirPagosSustitutos
       ? cfdisEnriquecidos.filter(c =>
-          !(['P', 'E'].includes(c.tipoDeComprobante) &&
-            c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+          !_canceladosPorSustituto.has(c.uuid?.toUpperCase() ?? '')
         )
       : cfdisEnriquecidos;
 
@@ -664,12 +668,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
 
   const tipos = tipoCfdi ? [tipoCfdi] : ['I', 'E', 'P'];
 
-  const filtroPagosSustitutos = excluirPagosSustitutos
-    ? { $nor: [
-        { tipoDeComprobante: 'P', 'cfdiRelacionados.tipoRelacion': '04' },
-        { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '04' },
-      ]}
-    : {};
+  const filtroPagosSustitutos = {};  // manejado en memoria — ver _canceladosPorSustitutoDrill
 
   const filtroPeriodo = incluirFechaCruzada
     ? { $or: [{ periodo: Number(periodo) }, { $expr: { $eq: [{ $month: '$fecha' }, Number(periodo)] } }] }
@@ -745,8 +744,8 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
         !c.formaPago || !c.metodoPago || !c.conceptos?.length ||
         c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
-         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        // Enriquecer también sustitutos (tipoRelacion='04').
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
       )).map(c => c.uuid),
     );
 
@@ -830,9 +829,21 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
     // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
     _normalizarEgresoPue99(cfdisEnriquecidos);
 
+    const _canceladosPorSustitutoDrill = excluirPagosSustitutos
+      ? new Set(
+          cfdisEnriquecidos
+            .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                         c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+            .flatMap(c => (c.cfdiRelacionados || [])
+              .filter(r => r.tipoRelacion === '04')
+              .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+              .map(u => u.toUpperCase())
+            )
+        )
+      : null;
     const _cfdisFinalesBase = excluirPagosSustitutos
       ? cfdisEnriquecidos.filter(c =>
-          !(['P', 'E'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+          !_canceladosPorSustitutoDrill.has(c.uuid?.toUpperCase() ?? '')
         )
       : cfdisEnriquecidos;
 
@@ -955,9 +966,7 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
 
   const tipos = tipoCfdi ? [tipoCfdi] : ['I', 'E', 'P'];
 
-  const filtroPagosSustitutos = excluirPagosSustitutos
-    ? { $nor: [{ tipoDeComprobante: 'P', 'cfdiRelacionados.tipoRelacion': '04' }, { tipoDeComprobante: 'E', 'cfdiRelacionados.tipoRelacion': '04' }] }
-    : {};
+  const filtroPagosSustitutos = {};  // manejado en memoria — ver _canceladosPorSustitutoExp
   const filtroPeriodo = incluirFechaCruzada
     ? { $or: [{ periodo: Number(periodo) }, { $expr: { $eq: [{ $month: '$fecha' }, Number(periodo)] } }] }
     : { periodo: Number(periodo) };
@@ -1013,8 +1022,8 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
         !c.formaPago || !c.metodoPago || !c.conceptos?.length ||
         c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
-         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        // Enriquecer también sustitutos (tipoRelacion='04').
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
       )).map(c => c.uuid),
     );
 
@@ -1095,8 +1104,22 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
 
     _normalizarEgresoPue99(cfdisEnriquecidos);
 
+    const _canceladosPorSustitutoExp = excluirPagosSustitutos
+      ? new Set(
+          cfdisEnriquecidos
+            .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                         c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+            .flatMap(c => (c.cfdiRelacionados || [])
+              .filter(r => r.tipoRelacion === '04')
+              .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+              .map(u => u.toUpperCase())
+            )
+        )
+      : null;
     const cfdisFinalesBase = excluirPagosSustitutos
-      ? cfdisEnriquecidos.filter(c => !(['P', 'E'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.some(r => r.tipoRelacion === '04')))
+      ? cfdisEnriquecidos.filter(c =>
+          !_canceladosPorSustitutoExp.has(c.uuid?.toUpperCase() ?? '')
+        )
       : cfdisEnriquecidos;
 
     const cfdisFinales = _uuidsFactPue.size

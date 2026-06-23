@@ -202,8 +202,9 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
   const cuentaMapByCod  = Object.fromEntries(cuentasRows.map(c => [c.codigo, c.id]));
 
   // 3a. Pre-query: UUIDs de facturas PUE (tipo I, formaPago=30) del periodo.
-  // Necesario para omitir la NC tipo E cuando la factura final ya genera el asiento completo.
-  // Se hace antes del loop porque cada iteración solo trae un tipo de CFDI.
+  // Solo se agregan al set las que matcheen una regla con cuentaCargo=2103010001 (modelo
+  // 2 asientos). En el modelo 3 asientos (cuentaCargo=1103010001 Clientes) la NC sí
+  // debe procesarse como asiento 3 independiente.
   const uuidsFacturasPueAnticipo = new Set();
   {
     const _facturasPue = await CFDI.find({
@@ -216,9 +217,11 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       satStatus:         'Vigente',
       isActive:          true,
       ...filtroMesesPosteriores,
-    }).select('uuid').lean();
+    }).select('uuid tipoDeComprobante emisor receptor metodoPago formaPago conceptos cfdiRelacionados tipoOrigen').lean();
     for (const c of _facturasPue) {
-      if (c.uuid) uuidsFacturasPueAnticipo.add(c.uuid.toUpperCase());
+      if (!c.uuid) continue;
+      const _r = mappingSvc.findRuleInList(c, rules);
+      if (_r?.cuentaCargo === '2103010001') uuidsFacturasPueAnticipo.add(c.uuid.toUpperCase());
     }
   }
 
@@ -715,6 +718,8 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
   }
 
   // Pre-query: UUIDs de facturas PUE (tipo I, formaPago=30) del periodo para el drill-down.
+  // Solo modelo 2 asientos (cuentaCargo=2103010001 Anticipos). En modelo 3 asientos la NC
+  // sí se procesa como asiento 3 independiente.
   const _uuidsFactPueDrill = new Set();
   {
     const _fp = await CFDI.find({
@@ -723,8 +728,12 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       tipoDeComprobante: 'I', formaPago: '30',
       source: 'SAT', satStatus: 'Vigente', isActive: true,
       ...filtroMesesPosteriores,
-    }).select('uuid').lean();
-    for (const c of _fp) { if (c.uuid) _uuidsFactPueDrill.add(c.uuid.toUpperCase()); }
+    }).select('uuid tipoDeComprobante emisor receptor metodoPago formaPago conceptos cfdiRelacionados tipoOrigen').lean();
+    for (const c of _fp) {
+      if (!c.uuid) continue;
+      const _r = mappingSvc.findRuleInList(c, rules);
+      if (_r?.cuentaCargo === '2103010001') _uuidsFactPueDrill.add(c.uuid.toUpperCase());
+    }
   }
 
   const resultado = [];
@@ -992,7 +1001,9 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
   const cuentaMapByCod = Object.fromEntries(cuentasRows.map(c => [c.codigo, c.id]));
   const cuentaInfoById = Object.fromEntries(cuentasRows.map(c => [c.id, { codigo: c.codigo, nombre: c.nombre, tipo: c.tipo }]));
 
-  // Pre-query facturas PUE formaPago=30 para fix doble-contabilización anticipo
+  // Pre-query facturas PUE formaPago=30 para fix doble-contabilización anticipo.
+  // Solo modelo 2 asientos (cuentaCargo=2103010001 Anticipos). En modelo 3 asientos la NC
+  // sí se procesa como asiento 3 independiente.
   const _uuidsFactPue = new Set();
   {
     const _fp = await CFDI.find({
@@ -1000,8 +1011,12 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
       ejercicio: Number(ejercicio), ...filtroPeriodo,
       tipoDeComprobante: 'I', formaPago: '30',
       source: 'SAT', satStatus: 'Vigente', isActive: true, ...filtroMesesPosteriores,
-    }).select('uuid').lean();
-    for (const c of _fp) { if (c.uuid) _uuidsFactPue.add(c.uuid.toUpperCase()); }
+    }).select('uuid tipoDeComprobante emisor receptor metodoPago formaPago conceptos cfdiRelacionados tipoOrigen').lean();
+    for (const c of _fp) {
+      if (!c.uuid) continue;
+      const _r = mappingSvc.findRuleInList(c, rules);
+      if (_r?.cuentaCargo === '2103010001') _uuidsFactPue.add(c.uuid.toUpperCase());
+    }
   }
 
   const entradas = [];

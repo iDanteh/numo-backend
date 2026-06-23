@@ -458,17 +458,33 @@ const reglas = [
   },
 
   // ── 7. FACTURA FINAL ANTICIPO PUE (Regla 22C) ────────────────────────────
+  // Modelo 3 asientos: la factura final reconoce ingreso vs Clientes CxC.
+  // La NC tipo E (tipoRelacion=07, Reg 23) cancela Anticipos vs Clientes en asiento 3.
+  // El swap de IVA diferido → definitivo ocurre en asiento 3 (Reg 23), no aquí.
   {
     nombre:              'Reg 22C — Factura Final Anticipo PUE (formaPago 30)',
     tipoComprobante:     'I',
     metodoPago:          'PUE',
     formaPago:           '30',
-    cuentaCargo:         '2103010001',  // Anticipos de Clientes General (subtotal — cancela pasivo)
+    tasaIva:             '16',
+    cuentaCargo:         '1103010001',  // Clientes 16% (CxC — se cancela en asiento 3 via NC)
     cuentaAbono:         '4100010001',  // Ingresos Contado 16%
     cuentaIva:           '2104010001',  // IVA Trasladado definitivo (HABER)
-    cuentaIvaAnticipo:   '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
-    cuentaDeltaAnticipo: '1102011005',  // Bancos (5° mov: cash por saldo > anticipo, si aplica)
-    conceptoContiene: null,
+    cuentaDeltaAnticipo: '1102011005',  // Bancos (cash por saldo > anticipo, si aplica)
+    conceptoContiene:    null,
+    prioridad:           12,
+  },
+  {
+    nombre:              'Reg 22C-0 — Factura Final Anticipo PUE Tasa 0% (formaPago 30)',
+    tipoComprobante:     'I',
+    metodoPago:          'PUE',
+    formaPago:           '30',
+    tasaIva:             '0',
+    cuentaCargo:         '1103010002',  // Clientes 0% (CxC — se cancela en asiento 3 via NC)
+    cuentaAbono:         '4100010002',  // Ingresos Contado 0%
+    cuentaIva:           null,
+    cuentaDeltaAnticipo: '1102011005',
+    conceptoContiene:    null,
     prioridad:           12,
   },
 
@@ -1663,10 +1679,22 @@ const reglas = [
     nombre:            'Reg CC-ANT — NC Aplicación de Anticipo (por descripción)',
     tipoComprobante:   'E',
     conceptoContiene:  'anticipo',
+    tasaIva:           '16',
     cuentaCargo:       '2103010001',  // Anticipos De Clientes General (cancela pasivo)
     cuentaAbono:       '1103010001',  // Clientes Nac Gral 16% (reduce CxC)
     cuentaIva:         '2104010001',  // IVA Trasladado definitivo (HABER)
     cuentaIvaAnticipo: '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
+    prioridad:         78,
+  },
+  {
+    nombre:            'Reg CC-ANT-0 — NC Aplicación de Anticipo Tasa 0% (por descripción)',
+    tipoComprobante:   'E',
+    conceptoContiene:  'anticipo',
+    tasaIva:           '0',
+    cuentaCargo:       '2103010001',  // Anticipos De Clientes General (cancela pasivo)
+    cuentaAbono:       '1103010002',  // Clientes Nac Gral 0% (reduce CxC)
+    cuentaIva:         null,
+    cuentaIvaAnticipo: null,
     prioridad:         78,
   },
 
@@ -2155,6 +2183,57 @@ const reglas = [
     conceptoContiene: null,
     prioridad:       85,
   },
+  // Sustitución Mixta (0%+16%) PUE Efectivo
+  {
+    nombre:          'TO-SUS-M-EF-PUE — Sustitución Mixta Efectivo PUE',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tipoRelacion:    '04',
+    tasaIva:         'mixto',
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1101010003',
+    cuentaAbono2:    '4200010002',
+    cuentaIva:       '2104010001',
+    prioridad:       64,
+  },
+  // Sustitución Mixta (0%+16%) PPD
+  {
+    nombre:          'TO-SUS-M-PPD — Sustitución Mixta PPD',
+    tipoComprobante: 'E',
+    metodoPago:      'PPD',
+    tipoRelacion:    '04',
+    tasaIva:         'mixto',
+    cuentaCargo:     '4200010001',
+    cuentaAbono:     '1103010001',
+    cuentaAbono2:    '4200010002',
+    cuentaIva:       '2104010001',
+    cuentaIvaPPD:    '2105010001',
+    prioridad:       64,
+  },
+  // Sustitución Tasa 0% PUE Efectivo
+  {
+    nombre:          'TO-SUS-0-EF-PUE — Sustitución 0% Efectivo PUE',
+    tipoComprobante: 'E',
+    metodoPago:      'PUE',
+    formaPago:       '01',
+    tipoRelacion:    '04',
+    tasaIva:         '0',
+    cuentaCargo:     '4200010002',
+    cuentaAbono:     '1101010003',
+    prioridad:       64,
+  },
+  // Sustitución Tasa 0% PPD
+  {
+    nombre:          'TO-SUS-0-PPD — Sustitución 0% PPD',
+    tipoComprobante: 'E',
+    metodoPago:      'PPD',
+    tipoRelacion:    '04',
+    tasaIva:         '0',
+    cuentaCargo:     '4200010002',
+    cuentaAbono:     '1103010002',
+    prioridad:       64,
+  },
 
   // ── 12D. CONDONACIÓN tipoRelacion=15 (Reglas 15A + 15B) ──────────────────
   // tipoRelacion='15' = "Condonación". El vendedor perdona una deuda PPD no cobrada.
@@ -2266,11 +2345,24 @@ const reglas = [
     nombre:            'Reg 23 — NC Aplicación de Anticipo (TipoRelacion 07)',
     tipoComprobante:   'E',
     tipoRelacion:      '07',
+    tasaIva:           '16',
     cuentaCargo:       '2103010001',  // Anticipos De Clientes General (subtotal — cancela pasivo)
     cuentaAbono:       '1103010001',  // Clientes Nac Gral 16% (reduce CxC de factura final)
     cuentaIva:         '2104010001',  // IVA Trasladado definitivo (HABER)
     cuentaIvaAnticipo: '2104010002',  // IVA Trasladado Anticipos (DEBE — cancela diferido)
     conceptoContiene: null,
+    prioridad:         90,
+  },
+  {
+    nombre:            'Reg 23-0 — NC Aplicación de Anticipo Tasa 0% (TipoRelacion 07)',
+    tipoComprobante:   'E',
+    tipoRelacion:      '07',
+    tasaIva:           '0',
+    cuentaCargo:       '2103010001',  // Anticipos De Clientes General (subtotal — cancela pasivo)
+    cuentaAbono:       '1103010002',  // Clientes Nac Gral 0% (reduce CxC de factura final)
+    cuentaIva:         null,          // Sin IVA — el anticipo 0% no generó IVA diferido
+    cuentaIvaAnticipo: null,
+    conceptoContiene:  null,
     prioridad:         90,
   },
 

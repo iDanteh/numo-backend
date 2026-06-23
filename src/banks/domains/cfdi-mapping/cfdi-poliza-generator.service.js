@@ -282,16 +282,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const ccBySerieMapProp = await centrosSvc.resolveBySerieMap();
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Para cada aplicación de anticipo PUE, SAT emite DOS CFDIs en el mismo período:
-  //   (a) Factura final tipo I, formaPago=30, tipoRelacion=07 → Reg 22C → DEBE Anticipos
-  //   (b) NC tipo E, tipoRelacion=07 → Reg 23 → DEBE Anticipos de nuevo (doble!)
-  // Si ambos están en el batch, se genera el DEBE en Anticipos dos veces.
-  // Solución: Reg 22C ya hace la contabilización completa; omitir la NC tipo E.
-  // Se construye el set de UUIDs de anticipos originales cubiertos por una factura
-  // final PUE (formaPago=30) en este mismo batch.
+  // Solo aplica cuando la factura final (formaPago=30) usa el modelo 2 asientos
+  // (cuentaCargo=2103010001 Anticipos). En el modelo 3 asientos (cuentaCargo=1103010001
+  // Clientes) la NC sí debe procesarse — cancela Anticipos vs Clientes en asiento 3.
   const anticosCubiertosPorReg22C = new Set();
-  for (const { cfdi: c } of cfdiConRegla) {
+  for (const { cfdi: c, rule: r } of cfdiConRegla) {
     if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
+    if (r?.cuentaCargo !== '2103010001') continue;
     if (c.uuid) anticosCubiertosPorReg22C.add(c.uuid.toUpperCase());
   }
 

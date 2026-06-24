@@ -1,6 +1,6 @@
 'use strict';
 
-const { Transaction, QueryTypes } = require('sequelize');
+const { Transaction, QueryTypes, Op } = require('sequelize');
 const { sequelize }        = require('../../../../config/database.postgres');
 const { Poliza, PolizaMovimiento, AccountPlan, CentroCosto, CfdiMappingRule } = require('../../../../shared/models/postgres');
 const CFDI = require('../../../../visor/models/CFDI');
@@ -40,6 +40,13 @@ async function findAll(filters = {}) {
   if (filters.periodo)   where.periodo    = Number(filters.periodo);
   if (filters.tipo)      where.tipo       = filters.tipo.toUpperCase();
   if (filters.estado)    where.estado     = filters.estado;
+  if (filters.q) {
+    const q = `%${filters.q.trim()}%`;
+    where[Op.or] = [
+      { concepto: { [Op.iLike]: q } },
+      { folio:    { [Op.iLike]: q } },
+    ];
+  }
 
   const page  = Math.max(1, Number(filters.page)  || 1);
   const limit = Math.min(100, Number(filters.limit) || 50);

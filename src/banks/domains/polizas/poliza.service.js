@@ -6,7 +6,7 @@ const { AccountPlan, PolizaMovimiento, Poliza } = require('../../../shared/model
 const { Op } = require('sequelize');
 
 function userLabel(user) {
-  return user?.nombre || user?.email || user?.nombre || String(user?.dbId ?? 'sistema');
+  return user?.nombre || user?.email || String(user?.dbId ?? 'sistema');
 }
 
 function validateBalance(movimientos) {
@@ -17,6 +17,8 @@ function validateBalance(movimientos) {
     debe  += Number(m.debe  || 0);
     haber += Number(m.haber || 0);
   }
+  debe  = Math.round(debe  * 100) / 100;
+  haber = Math.round(haber * 100) / 100;
   if (debe === 0 && haber === 0) {
     throw new ValidationError('La póliza debe tener importes mayores a cero');
   }
@@ -44,13 +46,11 @@ async function create(data, user) {
   if (!data.periodo)   throw new ValidationError('El periodo es requerido');
   if (!data.rfc)       throw new ValidationError('El RFC es requerido');
 
-  if (data.fecha && data.ejercicio && data.periodo) {
-    const d = new Date(data.fecha);
-    if (d.getFullYear() !== Number(data.ejercicio) || d.getMonth() + 1 !== Number(data.periodo)) {
-      throw new ValidationError(
-        `La fecha ${data.fecha} no corresponde al ejercicio ${data.ejercicio} periodo ${data.periodo}`,
-      );
-    }
+  const d = new Date(data.fecha);
+  if (d.getFullYear() !== Number(data.ejercicio) || d.getMonth() + 1 !== Number(data.periodo)) {
+    throw new ValidationError(
+      `La fecha ${data.fecha} no corresponde al ejercicio ${data.ejercicio} periodo ${data.periodo}`,
+    );
   }
 
   validateBalance(data.movimientos);

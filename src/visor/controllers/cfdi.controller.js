@@ -114,11 +114,22 @@ const list = asyncHandler(async (req, res) => {
   } else if (uuid) {
     const term = uuid.trim();
     const termUpper = term.toUpperCase();
-    filter.$or = [
-      { uuid: { $regex: term, $options: 'i' } },
-      { 'emisor.rfc': termUpper },
+    // Detectar patrón serie-folio: "A0-2260100011" → buscar por serie + folio
+    const serieFolioMatch = term.match(/^([A-Za-z0-9]{1,10})-(.+)$/);
+    const orConds = [
+      { uuid:          { $regex: term, $options: 'i' } },
+      { 'emisor.rfc':  termUpper },
       { 'receptor.rfc': termUpper },
+      { folio:         { $regex: term, $options: 'i' } },   // búsqueda solo por folio
     ];
+    if (serieFolioMatch) {
+      // Búsqueda exacta de serie + folio combinados
+      orConds.push({
+        serie: { $regex: `^${serieFolioMatch[1]}$`, $options: 'i' },
+        folio: { $regex: `^${serieFolioMatch[2]}`,  $options: 'i' },
+      });
+    }
+    filter.$or = orConds;
   }
   if (source) {
     const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);

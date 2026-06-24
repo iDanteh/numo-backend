@@ -40,7 +40,7 @@ async function generarBalanceGeneral({ rfc, ejercicio, periodo }) {
   //   Se usa el saldo con signo negado: -saldo → ingresos netos correctos.
   const sum = (arr, fn) => Math.round(arr.reduce((s, c) => s + fn(c), 0) * 100) / 100;
 
-// Para grupos ACREEDORES (PASIVO, CAPITAL, INGRESO): se usa -c.saldo en lugar de Math.abs.
+  // Para grupos ACREEDORES (PASIVO, CAPITAL, INGRESO): se usa -c.saldo en lugar de Math.abs.
   // Math.abs falla cuando una cuenta acredora tiene saldo POSITIVO (anormal):
   //   Math.abs(+X) = X → suma al pasivo (incorrecto, debería restar)
   //   -c.saldo = -(+X) = -X → resta del pasivo (correcto)

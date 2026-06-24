@@ -373,6 +373,22 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       (ppd07.length > 5 ? ` y ${ppd07.length - 5} más` : ''),
     );
   }
+  // Sustitutos cuyo CFDI original ya tiene póliza contabilizada → doble asiento potencial
+  if (_canceladosPorSustitutoProp.size) {
+    for (const c of cfdisSinPolizaFinal) {
+      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
+      for (const rel of (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04')) {
+        for (const uA of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
+          if (uuidsYaUsados.has(uA.toUpperCase())) {
+            advertencias.push(
+              `⚠ Sustitución: ${c.uuid?.slice(0, 8)}… sustituye al CFDI ${uA.slice(0, 8)}… ` +
+              `que ya tiene póliza contabilizada — reviértela y cancélala antes de procesar este sustituto`,
+            );
+          }
+        }
+      }
+    }
+  }
 
   return {
     tipo:       tipoPropuesta,
@@ -673,6 +689,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
       });
+    }
+  }
+
+  // Sustitutos cuyo CFDI original ya tiene póliza contabilizada → doble asiento potencial
+  if (_canceladosPorSustitutoGuard.size) {
+    for (const c of cfdisSinPolizaFinalGuard) {
+      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
+      for (const rel of (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04')) {
+        for (const uA of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
+          if (uuidsYaUsados.has(uA.toUpperCase())) {
+            advertencias.push(
+              `⚠ Sustitución: ${c.uuid?.slice(0, 8)}… sustituye al CFDI ${uA.slice(0, 8)}… ` +
+              `que ya tiene póliza contabilizada — reviértela y cancélala antes de contabilizar este sustituto`,
+            );
+          }
+        }
+      }
     }
   }
 

@@ -24,6 +24,7 @@ const Poliza            = require('./Poliza');
 const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
+const ClienteCatalogo   = require('./ClienteCatalogo');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -77,9 +78,10 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS es_intercompania BOOLEAN NOT NULL DEFAULT FALSE
   `).catch(e => console.warn('[syncModels] ADD COLUMN es_intercompania:', e.message));
 
-  // CentroCosto: force:false para evitar conflictos con alter en primera ejecución.
+  // CentroCosto/ClienteCatalogo: force:false para evitar conflictos con alter en primera ejecución.
   // La columna centro_costo_id en poliza_movimientos se agrega vía raw SQL más abajo.
   await CentroCosto.sync({ force: false });
+  await ClienteCatalogo.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await AccountPlan.sync({ alter: !isProd });
@@ -201,4 +203,4 @@ async function syncModels() {
   `).catch(() => {});
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

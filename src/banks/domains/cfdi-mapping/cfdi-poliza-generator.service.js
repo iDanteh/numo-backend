@@ -292,6 +292,39 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     if (c.uuid) anticosCubiertosPorReg22C.add(c.uuid.toUpperCase());
   }
 
+  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
+  // Si el UUID relacionado tipo 07 de alguna NC ya tiene movimiento en una regla con cuentaIvaAnticipo
+  // en una póliza no cancelada, la NC está cubierta aunque no esté en el batch actual.
+  {
+    const uuids07 = new Set(
+      cfdiConRegla
+        .filter(({ cfdi: c }) =>
+          c.tipoDeComprobante === 'E' &&
+          c.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .flatMap(({ cfdi: c }) =>
+          (c.cfdiRelacionados || [])
+            .filter(r => r.tipoRelacion === '07')
+            .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+            .map(u => u.toUpperCase()),
+        ),
+    );
+    if (uuids07.size > 0) {
+      const reglasAnticipo = await CfdiMappingRule.findAll({
+        where: { cuentaIvaAnticipo: { [Op.ne]: null } },
+        attributes: ['id'], raw: true,
+      });
+      const idsAnticipo = reglasAnticipo.map(r => r.id);
+      if (idsAnticipo.length > 0) {
+        const yaEnBD = await PolizaMovimiento.findAll({
+          where: { cfdiUuid: { [Op.in]: [...uuids07] }, reglaId: { [Op.in]: idsAnticipo } },
+          attributes: ['cfdiUuid'],
+          include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
+        });
+        for (const m of yaEnBD) anticosCubiertosPorReg22C.add(m.cfdiUuid.toUpperCase());
+      }
+    }
+  }
+
   const movimientosResult = [];
   let sinRegla = 0;
 
@@ -361,9 +394,24 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     c.cfdiRelacionados?.some(r => r.tipoRelacion === '07')
   );
 
+  // Recopilar diagnóstico de CFDIs sin regla para incluir en advertencias
+  const _sinReglaInfo = cfdiConRegla
+    .filter(({ rule }) => !rule)
+    .slice(0, 5)
+    .map(({ cfdi: c }) => {
+      const tasaDetectada = c.tipoDeComprobante === 'P' ? mappingSvc.detectTasaIva(c) : undefined;
+      return (
+        `${c.uuid?.slice(0, 8)}… tipo=${c.tipoDeComprobante} método=${c.metodoPago || '—'} ` +
+        `forma=${c.formaPago || '—'} emisor=${c.emisor?.rfc || '—'}` +
+        (tasaDetectada !== undefined ? ` tasaIva=${tasaDetectada ?? 'null (sin datos de tasa — descarga XML)'}` : '')
+      );
+    });
+
   const advertencias = [];
   if (sinRegla > 0) {
     advertencias.push(`${sinRegla} CFDI(s) sin regla de mapeo — las cuentas deben asignarse manualmente`);
+    for (const info of _sinReglaInfo) advertencias.push(`  • ${info}`);
+    if (sinRegla > 5) advertencias.push(`  … y ${sinRegla - 5} más`);
   }
   if (ppd07.length > 0) {
     advertencias.push(
@@ -618,6 +666,37 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (c.uuid) anticosCubiertosPorReg22CGuard.add(c.uuid.toUpperCase());
   }
 
+  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
+  {
+    const uuids07g = new Set(
+      cfdiConRegla
+        .filter(({ cfdi: c }) =>
+          c.tipoDeComprobante === 'E' &&
+          c.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .flatMap(({ cfdi: c }) =>
+          (c.cfdiRelacionados || [])
+            .filter(r => r.tipoRelacion === '07')
+            .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+            .map(u => u.toUpperCase()),
+        ),
+    );
+    if (uuids07g.size > 0) {
+      const reglasAnticipoG = await CfdiMappingRule.findAll({
+        where: { cuentaIvaAnticipo: { [Op.ne]: null } },
+        attributes: ['id'], raw: true,
+      });
+      const idsAnticipoG = reglasAnticipoG.map(r => r.id);
+      if (idsAnticipoG.length > 0) {
+        const yaEnBDG = await PolizaMovimiento.findAll({
+          where: { cfdiUuid: { [Op.in]: [...uuids07g] }, reglaId: { [Op.in]: idsAnticipoG } },
+          attributes: ['cfdiUuid'],
+          include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
+        });
+        for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.add(m.cfdiUuid.toUpperCase());
+      }
+    }
+  }
+
   const todosLosMovimientos = [];
   let sinRegla = 0;
   const advertencias = [];
@@ -637,12 +716,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (!rule) {
       sinRegla++;
       if (muestrasSinRegla.length < 5) {
+        const _tasaDet = cfdi.tipoDeComprobante === 'P' ? mappingSvc.detectTasaIva(cfdi) : undefined;
         muestrasSinRegla.push({
           uuid:    cfdi.uuid?.slice(0, 8),
           tipo:    cfdi.tipoDeComprobante,
           metodo:  cfdi.metodoPago,
           forma:   cfdi.formaPago,
           emisor:  cfdi.emisor?.rfc,
+          ...(_tasaDet !== undefined ? { tasaIva: _tasaDet ?? 'null (sin datos — descarga XML)' } : {}),
         });
       }
       continue;
@@ -764,8 +845,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     advertenciasFinal.push(`${sinRegla} CFDI(s) omitidos por no tener regla de mapeo`);
     // Muestra diagnóstico de los primeros 5 ignorados
     for (const m of muestrasSinRegla) {
+      const tasaStr = m.tasaIva !== undefined ? ` tasaIva=${m.tasaIva}` : '';
       advertenciasFinal.push(
-        `  Ej. ${m.uuid}… → tipo=${m.tipo} método=${m.metodo || '—'} forma=${m.forma || '—'} emisor=${m.emisor || '—'}`,
+        `  Ej. ${m.uuid}… → tipo=${m.tipo} método=${m.metodo || '—'} forma=${m.forma || '—'} emisor=${m.emisor || '—'}${tasaStr}`,
       );
     }
     // Resumen de reglas activas para comparar

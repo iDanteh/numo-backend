@@ -91,6 +91,7 @@ const parseCFDI = async (xmlString) => {
 
     xmlContent: xmlString,
     xmlHash: crypto.createHash('sha256').update(xmlString).digest('hex'),
+    origenDescarga: 'xml',
   };
 
   if (complementoPago) {

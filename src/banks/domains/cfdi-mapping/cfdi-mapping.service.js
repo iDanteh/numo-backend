@@ -935,15 +935,16 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     return ao - bo;
   });
 
-  // Validar cuadre contable: ∑DEBE debe igualar ∑HABER dentro de $0.02 de tolerancia
+  // Validar cuadre contable: ∑DEBE debe igualar ∑HABER dentro de $0.01 (tolerancia SAT Anexo 24)
   const _sumDebe  = movs.reduce((s, m) => s + (m.debe  || 0), 0);
   const _sumHaber = movs.reduce((s, m) => s + (m.haber || 0), 0);
-  if (Math.abs(_sumDebe - _sumHaber) > 0.02) {
+  if (Math.abs(_sumDebe - _sumHaber) > 0.01) {
     console.warn(
       `[cfdiToMovimientos] ASIENTO DESBALANCEADO uuid=${cfdi.uuid} regla="${rule?.nombre}" ` +
       `debe=${_sumDebe.toFixed(2)} haber=${_sumHaber.toFixed(2)} ` +
       `diff=${(_sumDebe - _sumHaber).toFixed(2)}`
     );
+    movs.forEach(m => { m._desbalanceado = true; });
   }
 
   // Enriquecer cada movimiento con los campos SAT del CFDI origen y la regla usada
@@ -1059,4 +1060,4 @@ async function getRulePolizas(ruleId) {
   return polizas.map(p => ({ ...p, movimientosConRegla: countMap[p.id] ?? 0 }));
 }
 
-module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos };
+module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos, detectTasaIva: _detectTasaIva };

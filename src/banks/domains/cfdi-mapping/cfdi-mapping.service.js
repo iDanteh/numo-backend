@@ -596,11 +596,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const cuentaIvaAplicable = (esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva;
     if (cuentaIvaAplicable) {
       const ivaEsHaber = esIngreso || esIvaHaber;
-      // Derivar IVA de montos SAT (2 decimales) para evitar artefactos IEEE-754.
-      // Formula SAT: total = subtotal − descuento + IVA → IVA = total − subtotal + descuento.
-      // Se suma descuento solo cuando la regla genera movimiento separado (tieneDescuento=true);
-      // si no hay movimiento de descuento, el término es 0 y la fórmula no cambia.
-      const _descuentoEnIva = (rule.tieneDescuento && !esPago) ? Number(cfdi.descuento || 0) : 0;
+      // Fórmula SAT: total = subtotal − descuento + IVA → IVA = total − subtotal + descuento.
+      // Para Tipo I el descuento está neteado en montoAbono (subtotal−desc), así que se suma aquí.
+      // Para Tipo E montoCargo = subtotal (bruto), por lo que no se suma descuento al IVA.
+      const _descuentoEnIva = (esIngreso && !esPago) ? Number(cfdi.descuento || 0) : 0;
       const ivaR = (ivaRet === 0 && isrRet === 0)
         ? parseFloat((total - subtotal + _descuentoEnIva).toFixed(2))
         : iva;
@@ -739,22 +738,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // Split IVA abono: cuentaAbono recibe solo subtotal, cuentaIvaAbono recibe IVA
     montoAbono = subtotal;
   } else if (esIngreso) {
-    // IVA = total − subtotal + descuento (cuando tieneDescuento), por lo que el complemento
-    // exacto de HABER es subtotal (importe bruto pre-descuento del CFDI). D=H garantizado.
-    // Para CFDIs con retenciones se usa total−iva (rama else de ivaR arriba) — caso separado.
-    // Excepción: no-mixto con tieneDescuento sin línea de IVA efectiva (cuentaIva no configurada
-    // en la regla, o iva=0). En ese caso subTotal SAT puede ser inconsistente con total+descuento
-    // (artefacto de metadata). Forzar montoAbono = total + descuento para garantizar D=H.
-    const _cuentaIvaEfectiva = !esAnticipo && iva > 0
-      ? ((esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva)
-      : null;
-    if (rule.tasaIva !== 'mixto' && rule.tieneDescuento && !_cuentaIvaEfectiva) {
-      montoAbono = parseFloat((total + Number(cfdi.descuento || 0)).toFixed(2));
-    } else {
-      montoAbono = (ivaRet === 0 && isrRet === 0) || esMetadataConDescuento
-        ? subtotal
-        : parseFloat((total - iva).toFixed(2));
-    }
+    // El descuento se netea directo en el ingreso: montoAbono = subtotal − descuento.
+    // Fórmula D=H: cargo(total) = abono(subtotal−desc) + IVA(total−subtotal+desc).
+    // Con retenciones se usa total−iva que ya equivale al neto cuando hay retenciones.
+    const descuento = Number(cfdi.descuento || 0);
+    montoAbono = (ivaRet === 0 && isrRet === 0) || esMetadataConDescuento
+      ? parseFloat((subtotal - descuento).toFixed(2))
+      : parseFloat((total - iva).toFixed(2));
   } else {
     montoAbono = total - ivaRet - isrRet;
   }
@@ -767,24 +757,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const { subTotal16, subTotal0 } = _calcCfdiMontos(cfdi);
     if (subTotal16 + subTotal0 > 0) {
       if (esIngreso) {
-        const subTotal16R = parseFloat(subTotal16.toFixed(2));
-        const subTotal0R  = parseFloat(subTotal0.toFixed(2));
-        // Con descuentos separados: Ingresos deben ser BRUTO para que D=H.
-        // BRUTO16 = (total+descuento−IVA)×sub16/(sub16+sub0). La proporción sub16/(sub16+sub0)
-        // es idéntica con XML completo (sub=bruto) y con metadata SAT (sub=neto), por lo que
-        // la fórmula garantiza balance en ambos casos sin detectar el origen del CFDI.
-        // Sin descuentos separados, el neto garantiza el balance directamente.
-        let haber16R, haber0R;
-        if (rule.tieneDescuento) {
-          const descTotal  = Number(cfdi.descuento || 0);
-          const grossTotal = parseFloat((total + descTotal - iva).toFixed(2));
-          const sumSub     = subTotal16 + subTotal0;
-          haber16R = parseFloat((grossTotal * subTotal16 / sumSub).toFixed(2));
-          haber0R  = parseFloat((grossTotal - haber16R).toFixed(2));
-        } else {
-          haber16R = parseFloat(((parseFloat((total - iva).toFixed(2))) - subTotal0R).toFixed(2));
-          haber0R  = subTotal0R;
-        }
+        // Usamos total−iva como neto garantizado (= subtotal−descuento siempre).
+        // subTotal16/subTotal0 pueden ser brutos o netos según el fallback usado,
+        // pero su PROPORCIÓN es correcta para repartir el neto entre tasas.
+        const netTotal = parseFloat((total - iva).toFixed(2));
+        const sumSub   = subTotal16 + subTotal0;
+        const haber16R = parseFloat((netTotal * subTotal16 / sumSub).toFixed(2));
+        const haber0R  = parseFloat((netTotal - haber16R).toFixed(2));
         montoAbono = haber16R;
         if (haber0R > 0) {
           movs.push({
@@ -794,20 +773,19 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
             debe: 0, haber: haber0R,
             cfdiUuid: cfdi.uuid, rfcTercero,
           });
-          // Split cargo 0%: cuentaCargo recibe la parte 16%+IVA (total−NET0),
-          // cuentaCargoMixto0 recibe NET0 (efectivo cobrado por items 0%, sin IVA).
-          if (rule.cuentaCargoMixto0 && subTotal0R > 0) {
+          // Split cargo 0%: cuentaCargoMixto0 recibe el neto 0% (sin IVA).
+          if (rule.cuentaCargoMixto0 && haber0R > 0) {
             const cargoLine = movs.find(m =>
               m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0
             );
             if (cargoLine) {
-              cargoLine.debe = parseFloat((cargoLine.debe - subTotal0R).toFixed(2));
+              cargoLine.debe = parseFloat((cargoLine.debe - haber0R).toFixed(2));
             }
             movs.push({
               cuentaId:    cuentaMap[rule.cuentaCargoMixto0] ?? null,
               concepto:    `${concepto} (0%)`,
               centroCosto, ventaFecha, serie: serieCfdi,
-              debe: subTotal0R, haber: 0,
+              debe: haber0R, haber: 0,
               cfdiUuid: cfdi.uuid, rfcTercero,
             });
           }
@@ -863,37 +841,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     }
   }
 
-  // ── Motor extendido: reglas con DESCUENTO (tieneDescuento=true) ───────────
-  // Agrega línea(s) de Descuentos s/Ventas como DEBE (reducen el ingreso bruto).
-  // Solo para tipo I y E — los pagos no tienen descuento propio.
-  if (!esPago && rule.tieneDescuento) {
-    const { desc16, desc0 } = _calcCfdiMontos(cfdi);
-    const descHeader = Number(cfdi.descuento || 0);
-    // Para reglas mixtas usamos desc16 (concepto); para 16% o 0% usamos el header para
-    // mantener consistencia con montoAbono = cfdi.subTotal (ambos de la misma fuente SAT).
-    const descPrincipal = rule.tasaIva === 'mixto' ? desc16 : descHeader;
-
-    if (rule.cuentaDescuento && descPrincipal > 0) {
-      movs.push({
-        cuentaId:    cuentaMap[rule.cuentaDescuento] ?? null,
-        concepto:    `Dto. - ${concepto}`,
-        centroCosto, ventaFecha, serie: serieCfdi,
-        debe:  esIngreso ? descPrincipal : 0,
-        haber: esIngreso ? 0 : descPrincipal,
-        cfdiUuid: cfdi.uuid, rfcTercero,
-      });
-    }
-    if (rule.cuentaDescuento0 && rule.tasaIva === 'mixto' && desc0 > 0) {
-      movs.push({
-        cuentaId:    cuentaMap[rule.cuentaDescuento0] ?? null,
-        concepto:    `Dto.0% - ${concepto}`,
-        centroCosto, ventaFecha, serie: serieCfdi,
-        debe:  esIngreso ? desc0 : 0,
-        haber: esIngreso ? 0 : desc0,
-        cfdiUuid: cfdi.uuid, rfcTercero,
-      });
-    }
-  }
+  // El descuento se netea directamente en montoAbono (subtotal − descuento).
+  // No se genera línea separada de Descuentos s/Ventas.
 
   movs.push({
     cuentaId:    cuentaMap[rule.cuentaAbono] ?? null,
@@ -911,8 +860,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // HABER cuentaIvaAbono = IVA (ej. 2104010002 IVA Trasladado Anticipos para Club Tuberos)
   // Esto espeja el patrón CONTPAQI: HABER Monedero=subtotal + HABER IVAAnticipo=IVA
   if (tieneIvaAbonoSplit && rule.cuentaIvaAbono) {
-    const _desc2 = rule.tieneDescuento ? Number(cfdi.descuento || 0) : 0;
-    const ivaR = parseFloat((total - subtotal + _desc2).toFixed(2));
+    const ivaR = parseFloat((total - subtotal + Number(cfdi.descuento || 0)).toFixed(2));
     if (ivaR > 0) {
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaIvaAbono] ?? null,

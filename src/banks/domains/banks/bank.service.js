@@ -125,6 +125,7 @@ async function getCards() {
           no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
           identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
+          reclasificado:   { $sum: { $cond: [{ $eq:  ['$status', 'reclasificado'] }, 1, 0] } },
           saldoPendiente: {
             // Σ depósitos con status 'no_identificado'.
             // Retiros, 'identificado' y 'otros' no participan en este cálculo.
@@ -220,9 +221,60 @@ async function getCards() {
         no_identificado: b.no_identificado,
         identificado:    b.identificado,
         otros:           b.otros,
+        reclasificado:   b.reclasificado,
       },
     };
   });
+}
+
+async function getStatusStats(year, month) {
+  const match = { isActive: true };
+
+  if (year) {
+    const y = parseInt(year, 10);
+    const m = month ? parseInt(month, 10) : null;
+    if (m && m >= 1 && m <= 12) {
+      match.fecha = { $gte: new Date(y, m - 1, 1), $lt: new Date(y, m, 1) };
+    } else {
+      match.fecha = { $gte: new Date(y, 0, 1), $lt: new Date(y + 1, 0, 1) };
+    }
+  }
+
+  const [statsAgg, yearsAgg] = await Promise.all([
+    BankMovement.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id:             null,
+          no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          dep_no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+        },
+      },
+    ]),
+    BankMovement.aggregate([
+      { $match: { isActive: true } },
+      { $group: { _id: { $year: '$fecha' } } },
+      { $sort:  { _id: -1 } },
+    ]),
+  ]);
+
+  return {
+    no_identificado:     statsAgg[0]?.no_identificado     ?? 0,
+    identificado:        statsAgg[0]?.identificado        ?? 0,
+    otros:               statsAgg[0]?.otros               ?? 0,
+    reclasificado:       statsAgg[0]?.reclasificado       ?? 0,
+    dep_no_identificado: statsAgg[0]?.dep_no_identificado ?? 0,
+    dep_identificado:    statsAgg[0]?.dep_identificado    ?? 0,
+    dep_otros:           statsAgg[0]?.dep_otros           ?? 0,
+    dep_reclasificado:   statsAgg[0]?.dep_reclasificado   ?? 0,
+    years: yearsAgg.map(r => r._id).filter(y => y != null && y > 1990),
+  };
 }
 
 async function listMovements(filters) {
@@ -320,8 +372,8 @@ async function listMovements(filters) {
       const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
       _amountLo = decimalPlaces === 0 ? num             : num - tolerance;
       _amountHi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
-      orClauses.push({ deposito: { $gte: _amountLo, $lt: _amountHi } });
-      orClauses.push({ retiro:   { $gte: _amountLo, $lt: _amountHi } });
+      orClauses.push({ deposito: { $gte: _amountLo, $lte: _amountHi } });
+      orClauses.push({ retiro:   { $gte: _amountLo, $lte: _amountHi } });
     }
 
     filter.$or = orClauses;
@@ -503,7 +555,7 @@ async function getSummary(fechaInicio, fechaFin) {
   ]);
 }
 
-async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
+async function importFile(buffer, banco, userId, { auth0Sub, nombre, filename } = {}) {
   const bancoValidado = BANCOS_VALIDOS.includes(banco) ? banco : null;
   const { movements, sinFecha, sinImporte, summary, errors } = await parseBankFile(buffer, bancoValidado);
   const sinFechaMovs   = sinFecha   || [];
@@ -519,7 +571,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   // ── 1. Detectar duplicados ANTES de reservar secuenciales ─────────────────
   const hashes = movements.map(m => m.hash);
   const existentes = await BankMovement.find(
-    { hash: { $in: hashes } },
+    { isActive: true, hash: { $in: hashes } },
     '_id hash banco numeroAutorizacion referenciaNumerica',
   ).lean();
 
@@ -550,7 +602,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       enrich.referenciaNumerica = inc.referenciaNumerica;
     }
     if (Object.keys(enrich).length > 0) {
-      enrichmentUpdates.push({ _id: ex._id, $set: enrich });
+      enrichmentUpdates.push({ _id: ex._id, $set: enrich, via: 'capa1a' });
     }
   }
 
@@ -588,7 +640,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     const bancosAuth = [...new Set(authMovs.map(m => m.banco))];
 
     const existByAuth = await BankMovement.find(
-      { banco: { $in: bancosAuth }, $or: authConditions },
+      { isActive: true, banco: { $in: bancosAuth }, $or: authConditions },
       '_id banco numeroAutorizacion referenciaNumerica fecha deposito retiro',
     ).lean();
 
@@ -609,15 +661,13 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         return montoOk;
       });
       if (!incoming) continue;
-      // Programar actualización de fecha si cambió
-      const existingFecha = new Date(existing.fecha).getTime();
-      const incomingFecha = new Date(incoming.fecha).getTime();
-      if (existingFecha !== incomingFecha) {
-        fechaUpdates.push({ _id: existing._id, fecha: incoming.fecha });
-      }
+      // Layer 1b NO actualiza fecha: su propósito es enriquecer campos faltantes
+      // (referenciaNumerica, deposito/retiro).  Los cambios de fecha por distinto
+      // extracto bancario son responsabilidad de Layer 1e (cross-date dedup) que
+      // aplica la lógica de "fecha de valor más reciente".
       // Enriquecer referenciaNumerica si el reimport la trae y el existente no la tiene
       if (incoming.referenciaNumerica && !existing.referenciaNumerica) {
-        enrichmentUpdates.push({ _id: existing._id, $set: { referenciaNumerica: incoming.referenciaNumerica } });
+        enrichmentUpdates.push({ _id: existing._id, $set: { referenciaNumerica: incoming.referenciaNumerica }, via: 'capa1b' });
       }
       // Enriquecer deposito/retiro si el existente no tiene importe (legacy del bug
       // de "Referencia alfanumérica") y el reimport ya lo trae correctamente parseado.
@@ -626,7 +676,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         if (incoming.deposito != null) enrich.deposito = incoming.deposito;
         if (incoming.retiro   != null) enrich.retiro   = incoming.retiro;
         if (Object.keys(enrich).length > 0) {
-          enrichmentUpdates.push({ _id: existing._id, $set: enrich });
+          enrichmentUpdates.push({ _id: existing._id, $set: enrich, via: 'capa1b' });
         }
       }
       // Marcar como ya existente para que no se re-inserte
@@ -662,7 +712,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     const bancosRef = [...new Set(refNumMovs.map(m => m.banco))];
 
     const existByRef = await BankMovement.find(
-      { banco: { $in: bancosRef }, $or: refConditions },
+      { isActive: true, banco: { $in: bancosRef }, $or: refConditions },
       '_id banco referenciaNumerica numeroAutorizacion deposito retiro',
     ).lean();
 
@@ -674,7 +724,16 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         const montoOk =
           (m.deposito != null && existing.deposito != null && Math.abs(m.deposito - existing.deposito) < 0.01) ||
           (m.retiro   != null && existing.retiro   != null && Math.abs(m.retiro   - existing.retiro  ) < 0.01);
-        return montoOk;
+        if (!montoOk) return false;
+        // referenciaNumerica puede ser código de sucursal/ruta (no ID de transacción).
+        // Si ambos lados tienen numeroAutorizacion real, debe coincidir; de lo contrario
+        // dos transacciones distintas con misma ref+monto serían tratadas como duplicado.
+        const incomingHasAuth = m.numeroAutorizacion && !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion);
+        const existingHasAuth = existing.numeroAutorizacion && !isBBVAPseudoAuth(existing.banco, existing.numeroAutorizacion);
+        if (incomingHasAuth && existingHasAuth) {
+          return authMatch(m.numeroAutorizacion, existing.numeroAutorizacion);
+        }
+        return true;
       });
       if (!incoming) continue;
       // Enriquecer numeroAutorizacion si el reimport la trae y el existente no la tiene
@@ -684,7 +743,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         !isBBVAPseudoAuth(incoming.banco, incoming.numeroAutorizacion) &&
         (!existing.numeroAutorizacion || existingAuthIsPseudo)
       ) {
-        enrichmentUpdates.push({ _id: existing._id, $set: { numeroAutorizacion: incoming.numeroAutorizacion } });
+        enrichmentUpdates.push({ _id: existing._id, $set: { numeroAutorizacion: incoming.numeroAutorizacion }, via: 'capa1c' });
       }
       hashesExistentes.add(incoming.hash);
     }
@@ -716,9 +775,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
         banco, fecha: { $gte: fechaStart, $lte: fechaEnd },
       }));
       const dbCands = await BankMovement.find(
-        { $or: orConds },
+        { isActive: true, $or: orConds },
         '_id banco fecha deposito retiro saldo concepto numeroAutorizacion referenciaNumerica',
-      ).lean();
+      ).limit(5000).lean();
 
       // Group DB candidates by banco+fecha key
       const candsByKey = new Map();
@@ -751,12 +810,24 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
             const bnetInc = ((m.concepto    || '').match(BNET_RE) || [])[1];
             const bnetCnd = ((cand.concepto || '').match(BNET_RE) || [])[1];
             if (bnetInc && bnetCnd && bnetInc === bnetCnd) {
-              hashesExistentes.add(m.hash);
-              softDuplicados++;
-              // Enriquecer si el reimport trae datos que el existente no tiene
-              const enrichBnet = buildSoftEnrich(m, cand);
-              if (enrichBnet) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnet });
-              break;
+              // Guard: en formato "PAGO CUENTA DE TERCERO / {authNum} BNET {accountNum}",
+              // el token tras BNET es el número de cuenta destino del beneficiario —
+              // compartido entre múltiples pagos al mismo destinatario, NO un ID único
+              // de transacción.  Si ambos lados tienen auth real y distinto, el BNET
+              // es cuenta destino; dejar pasar al chequeo de saldo que los distinguirá.
+              const incRealAuth = m.numeroAutorizacion && !isBBVAPseudoAuth(m.banco, m.numeroAutorizacion);
+              const cndRealAuth = cand.numeroAutorizacion && !isBBVAPseudoAuth(cand.banco, cand.numeroAutorizacion);
+              const authsDiffer = incRealAuth && cndRealAuth && !authMatch(m.numeroAutorizacion, cand.numeroAutorizacion);
+              if (!authsDiffer) {
+                hashesExistentes.add(m.hash);
+                softDuplicados++;
+                // Enriquecer si el reimport trae datos que el existente no tiene
+                const enrichBnet = buildSoftEnrich(m, cand);
+                if (enrichBnet) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnet, via: 'capa1d' });
+                break;
+              }
+              // authsDiffer=true → BNET es cuenta destino, no ID de transacción.
+              // Continuar al chequeo de saldo.
             }
             // Si ninguno tiene número BNET, seguir con el check de saldo+concepto.
           }
@@ -777,7 +848,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
               hashesExistentes.add(m.hash);
               softDuplicados++;
               const enrichBnmx = buildSoftEnrich(m, cand);
-              if (enrichBnmx) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnmx });
+              if (enrichBnmx) enrichmentUpdates.push({ _id: cand._id, $set: enrichBnmx, via: 'capa1d' });
               break;
             }
             // saldo=null sin auth coincidente → no es posible determinar duplicado
@@ -807,7 +878,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
             hashesExistentes.add(m.hash);
             softDuplicados++;
             const enrichSoft = buildSoftEnrich(m, cand);
-            if (enrichSoft) enrichmentUpdates.push({ _id: cand._id, $set: enrichSoft });
+            if (enrichSoft) enrichmentUpdates.push({ _id: cand._id, $set: enrichSoft, via: 'capa1d' });
             break;
           }
 
@@ -831,7 +902,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
             softDuplicados++;
             // Enriquecer si el reimport trae datos que el existente no tiene
             const enrichSoft = buildSoftEnrich(m, cand);
-            if (enrichSoft) enrichmentUpdates.push({ _id: cand._id, $set: enrichSoft });
+            if (enrichSoft) enrichmentUpdates.push({ _id: cand._id, $set: enrichSoft, via: 'capa1d' });
             break;
           }
         }
@@ -859,17 +930,29 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
   );
 
   if (sinIdentificador.length > 0) {
-    // Una condición por movimiento: banco + saldo ±0.01 + importe ±0.01
-    const saldoConds = sinIdentificador.map(m => ({
-      banco: m.banco,
-      saldo: { $gte: m.saldo - 0.01, $lte: m.saldo + 0.01 },
-      ...(m.deposito != null
-        ? { deposito: { $gte: m.deposito - 0.01, $lte: m.deposito + 0.01 } }
-        : { retiro:   { $gte: m.retiro   - 0.01, $lte: m.retiro   + 0.01 } }),
-    }));
+    // Ventana máxima entre fecha de operación y fecha de valor en extractos bancarios.
+    // BBVA puede diferir 1-3 días hábiles; 7 días cubre cualquier caso real y evita
+    // que un movimiento del mismo saldo+monto en un período distinto se tome como dup.
+    const CROSS_DATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+    // Una condición por movimiento: banco + fecha ±7d + saldo ±0.01 + importe ±0.01
+    const saldoConds = sinIdentificador.map(m => {
+      const fechaBase = new Date(m.fecha).getTime();
+      return {
+        banco: m.banco,
+        fecha: {
+          $gte: new Date(fechaBase - CROSS_DATE_WINDOW_MS),
+          $lte: new Date(fechaBase + CROSS_DATE_WINDOW_MS),
+        },
+        saldo: { $gte: m.saldo - 0.01, $lte: m.saldo + 0.01 },
+        ...(m.deposito != null
+          ? { deposito: { $gte: m.deposito - 0.01, $lte: m.deposito + 0.01 } }
+          : { retiro:   { $gte: m.retiro   - 0.01, $lte: m.retiro   + 0.01 } }),
+      };
+    });
 
     const existBySaldo = await BankMovement.find(
-      { $or: saldoConds },
+      { isActive: true, $or: saldoConds },
       '_id banco saldo deposito retiro concepto numeroAutorizacion referenciaNumerica fecha',
     ).lean();
 
@@ -904,11 +987,11 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       const fechaIncoming = new Date(incoming.fecha).getTime();
       if (fechaExisting !== fechaIncoming) {
         const fechaCorrecta = fechaIncoming > fechaExisting ? incoming.fecha : existing.fecha;
-        fechaUpdates.push({ _id: existing._id, fecha: fechaCorrecta });
+        fechaUpdates.push({ _id: existing._id, fecha: fechaCorrecta, de: existing.fecha, via: 'capa1e', importFile: filename });
       }
 
       const enrichCross = buildSoftEnrich(incoming, existing);
-      if (enrichCross) enrichmentUpdates.push({ _id: existing._id, $set: enrichCross });
+      if (enrichCross) enrichmentUpdates.push({ _id: existing._id, $set: enrichCross, via: 'capa1e' });
       hashesExistentes.add(incoming.hash);
       softDuplicados++;
     }
@@ -928,6 +1011,9 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     const intraAuthSeen  = new Map(); // `banco|normAuth|dep|ret` → true
     const intraSaldoSeen = new Map(); // `banco|dep|ret|saldo`    → true
     const intraDupHashes = new Set();
+    // Normaliza a centavos enteros para evitar falsos negativos por variación de
+    // punto flotante entre filas del mismo archivo (0.01 threshold = 1 centavo).
+    const toCents = v => v != null ? Math.round(v * 100) : '';
 
     for (const m of nuevos) {
       const auth = m.numeroAutorizacion;
@@ -936,7 +1022,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
       // Auth + monto (idéntico a Capa A del parser, bank-agnostic)
       if (auth && auth !== '0' && !isBBVAPseudoAuth(m.banco, auth)) {
         const normAuth = /^\d+$/.test(auth) ? String(parseInt(auth, 10)) : auth;
-        const k = `${m.banco}|${normAuth}|${m.deposito ?? ''}|${m.retiro ?? ''}`;
+        const k = `${m.banco}|${normAuth}|${toCents(m.deposito)}|${toCents(m.retiro)}`;
         if (intraAuthSeen.has(k)) {
           isDup = true;
           softDuplicados++;
@@ -947,7 +1033,7 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
 
       // Monto + saldo (idéntico a Capa B del parser, bank-agnostic)
       if (!isDup && m.saldo != null && (m.deposito != null || m.retiro != null)) {
-        const k = `${m.banco}|${m.deposito ?? ''}|${m.retiro ?? ''}|${m.saldo}`;
+        const k = `${m.banco}|${toCents(m.deposito)}|${toCents(m.retiro)}|${toCents(m.saldo)}`;
         if (intraSaldoSeen.has(k)) {
           isDup = true;
           softDuplicados++;
@@ -1011,10 +1097,17 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     });
   }
 
-  // ── 3b. Actualizar fecha de movimientos Banamex deduplicados por auth ──────
+  // ── 3b. Actualizar fecha de movimientos deduplicados por cross-date (capa1e) ─
   if (fechaUpdates.length > 0) {
-    const fechaOps = fechaUpdates.map(({ _id, fecha }) => ({
-      updateOne: { filter: { _id }, update: { $set: { fecha } } },
+    const now = new Date();
+    const fechaOps = fechaUpdates.map(({ _id, fecha, de, via, importFile: file }) => ({
+      updateOne: {
+        filter: { _id },
+        update: {
+          $set:  { fecha },
+          $push: { _changelog: { at: now, via, campo: 'fecha', de, a: fecha, importFile: file } },
+        },
+      },
     }));
     await BankMovement.bulkWrite(fechaOps, { ordered: false });
   }
@@ -1031,16 +1124,32 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre } = {}) {
     // capas (ej. Capa 1 por hash y Capa 2 por auth) generando entradas redundantes.
     // Fusionar los $set evita operaciones duplicadas y mantiene el conteo preciso.
     const enrichById = new Map();
-    for (const { _id, $set } of enrichmentUpdates) {
+    for (const { _id, $set, via } of enrichmentUpdates) {
       const key = String(_id);
       if (!enrichById.has(key)) {
-        enrichById.set(key, { _id, $set: { ...$set } });
+        enrichById.set(key, { _id, $set: { ...$set }, vias: [via] });
       } else {
-        Object.assign(enrichById.get(key).$set, $set);
+        const entry = enrichById.get(key);
+        Object.assign(entry.$set, $set);
+        if (!entry.vias.includes(via)) entry.vias.push(via);
       }
     }
-    const enrichOps = [...enrichById.values()].map(({ _id, $set }) => ({
-      updateOne: { filter: { _id }, update: { $set } },
+    const enrichNow = new Date();
+    const enrichOps = [...enrichById.values()].map(({ _id, $set, vias }) => ({
+      updateOne: {
+        filter: { _id },
+        update: {
+          $set,
+          $push: {
+            _changelog: {
+              at:         enrichNow,
+              via:        vias.join('+'),
+              campos:     Object.keys($set),
+              importFile: filename,
+            },
+          },
+        },
+      },
     }));
     try {
       const result = await BankMovement.bulkWrite(enrichOps, { ordered: false });
@@ -2428,7 +2537,7 @@ async function revertirConciliacion(runId, userId) {
 }
 
 module.exports = {
-  getCards, listMovements, getSummary,
+  getCards, listMovements, getSummary, getStatusStats,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, reclasifyMovements, updateMovement, generateTemplate,

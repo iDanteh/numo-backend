@@ -1744,4 +1744,370 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache };
+/**
+ * GET /api/reports/pagos-banco
+ * Cruza CFDIs de pago (tipo P) con movimientos bancarios vía folioFiscal.
+ * Params: uuid, serie, folio, fechaInicio, fechaFin, estado (todos|con_pago|sin_pago), page, limit
+ */
+const pagosBanco = asyncHandler(async (req, res) => {
+  const {
+    uuid, serie, folio, banco,
+    fechaInicio, fechaFin,
+    ejercicio, periodo,
+    estado = 'todos',
+    page  = 1,
+    limit = 20,
+  } = req.query;
+
+  const pg = parseInt(page);
+  const lm = Math.min(parseInt(limit), 100);
+
+  const baseMatch = {
+    tipoDeComprobante: 'P',
+    isActive: true,
+    'complementoPago.pagos.doctosRelacionados.0': { $exists: true },
+  };
+  if (ejercicio) baseMatch.ejercicio = parseInt(ejercicio);
+  if (periodo)   baseMatch.periodo   = parseInt(periodo);
+  if (uuid) {
+    const u = uuid.trim().toUpperCase();
+    baseMatch.$or = [
+      { uuid: { $regex: u, $options: 'i' } },
+      { 'complementoPago.pagos.doctosRelacionados.idDocumento': { $regex: u, $options: 'i' } },
+    ];
+  }
+
+  const drMatch = {};
+  if (serie) drMatch['complementoPago.pagos.doctosRelacionados.serie'] = { $regex: serie.trim(), $options: 'i' };
+  if (folio) drMatch['complementoPago.pagos.doctosRelacionados.folio'] = { $regex: folio.trim(), $options: 'i' };
+  if (fechaInicio || fechaFin) {
+    drMatch['complementoPago.pagos.fechaPago'] = {};
+    if (fechaInicio) drMatch['complementoPago.pagos.fechaPago'].$gte = new Date(fechaInicio);
+    if (fechaFin) {
+      const fin = new Date(fechaFin);
+      fin.setUTCDate(fin.getUTCDate() + 1);
+      drMatch['complementoPago.pagos.fechaPago'].$lt = fin;
+    }
+  }
+
+  const estadoMatch = {};
+  if (estado === 'con_pago') estadoMatch['movimientos.0'] = { $exists: true };
+  if (estado === 'sin_pago') estadoMatch.movimientos = { $size: 0 };
+
+  const bancoMatch = banco ? { 'movimientos.banco': { $regex: banco.trim(), $options: 'i' } } : null;
+
+  const pipeline = [
+    { $match: baseMatch },
+    { $unwind: '$complementoPago.pagos' },
+    { $unwind: '$complementoPago.pagos.doctosRelacionados' },
+    ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
+    // localField/foreignField permite usar el índice multikey directamente
+    {
+      $lookup: {
+        from:         'bank_movements',
+        localField:   'complementoPago.pagos.doctosRelacionados.idDocumento',
+        foreignField: 'erpLinks.folioFiscal',
+        as:           'movimientos',
+      },
+    },
+    // filtrar inactivos y proyectar solo los campos necesarios
+    {
+      $addFields: {
+        movimientos: {
+          $map: {
+            input: { $filter: { input: '$movimientos', as: 'm', cond: { $eq: ['$$m.isActive', true] } } },
+            as: 'm',
+            in: {
+              banco:        '$$m.banco',
+              fecha:        '$$m.fecha',
+              deposito:     '$$m.deposito',
+              folio:        '$$m.folio',
+              concepto:     '$$m.concepto',
+              numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+            },
+          },
+        },
+      },
+    },
+    ...(bancoMatch ? [{ $match: bancoMatch }] : []),
+    {
+      $facet: {
+        data: [
+          ...(Object.keys(estadoMatch).length ? [{ $match: estadoMatch }] : []),
+          { $sort: { 'complementoPago.pagos.fechaPago': -1 } },
+          { $skip: (pg - 1) * lm },
+          { $limit: lm },
+          {
+            $project: {
+              _id: 0,
+              cfdiUuid:        '$uuid',
+              satStatus:       '$satStatus',
+              source:          '$source',
+              fechaPago:       '$complementoPago.pagos.fechaPago',
+              montoPago:       '$complementoPago.pagos.monto',
+              facturaUuid:     '$complementoPago.pagos.doctosRelacionados.idDocumento',
+              serie:           '$complementoPago.pagos.doctosRelacionados.serie',
+              folio:           '$complementoPago.pagos.doctosRelacionados.folio',
+              numParcialidad:  '$complementoPago.pagos.doctosRelacionados.numParcialidad',
+              impPagado:       '$complementoPago.pagos.doctosRelacionados.impPagado',
+              impSaldoInsoluto:'$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+              tienePago:       { $gt: [{ $size: '$movimientos' }, 0] },
+              banco:           { $arrayElemAt: ['$movimientos.banco',        0] },
+              movFecha:        { $arrayElemAt: ['$movimientos.fecha',        0] },
+              movFolio:        { $arrayElemAt: ['$movimientos.folio',        0] },
+              deposito:        { $arrayElemAt: ['$movimientos.deposito',     0] },
+              movConcepto:     { $arrayElemAt: ['$movimientos.concepto',     0] },
+              numOperacion:    { $arrayElemAt: ['$movimientos.numOperacion', 0] },
+              diferencia: {
+                $round: [{ $subtract: [
+                  '$complementoPago.pagos.doctosRelacionados.impPagado',
+                  { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] },
+                ]}, 2],
+              },
+            },
+          },
+        ],
+        resumenAgg: [
+          {
+            $group: {
+              _id:           { tienePago: { $gt: [{ $size: '$movimientos' }, 0] } },
+              cantidad:      { $sum: 1 },
+              sumaImpPagado: { $sum: '$complementoPago.pagos.doctosRelacionados.impPagado' },
+            },
+          },
+        ],
+        totalAgg: [
+          ...(Object.keys(estadoMatch).length ? [{ $match: estadoMatch }] : []),
+          { $count: 'count' },
+        ],
+      },
+    },
+  ];
+
+  const [result] = await CFDI.aggregate(pipeline).allowDiskUse(true);
+  const total = result.totalAgg[0]?.count ?? 0;
+
+  const resumen = { conPago: { cantidad: 0, monto: 0 }, sinPago: { cantidad: 0, monto: 0 } };
+  for (const t of result.resumenAgg) {
+    const key = t._id.tienePago ? 'conPago' : 'sinPago';
+    resumen[key] = { cantidad: t.cantidad, monto: Math.round(t.sumaImpPagado * 100) / 100 };
+  }
+
+  res.json({ data: result.data, total, page: pg, limit: lm, pages: Math.ceil(total / lm), resumen });
+});
+
+/**
+ * GET /api/reports/pagos-banco/export
+ * Descarga Excel con los mismos filtros que pagosBanco (sin paginación).
+ */
+const pagosBancoExport = asyncHandler(async (req, res) => {
+  const { uuid, serie, folio, banco, fechaInicio, fechaFin, ejercicio, periodo, estado = 'todos' } = req.query;
+
+  const baseMatch = {
+    tipoDeComprobante: 'P',
+    isActive: true,
+    'complementoPago.pagos.doctosRelacionados.0': { $exists: true },
+  };
+  if (ejercicio) baseMatch.ejercicio = parseInt(ejercicio);
+  if (periodo)   baseMatch.periodo   = parseInt(periodo);
+  if (uuid) {
+    const u = uuid.trim().toUpperCase();
+    baseMatch.$or = [
+      { uuid: { $regex: u, $options: 'i' } },
+      { 'complementoPago.pagos.doctosRelacionados.idDocumento': { $regex: u, $options: 'i' } },
+    ];
+  }
+
+  const drMatch = {};
+  if (serie) drMatch['complementoPago.pagos.doctosRelacionados.serie'] = { $regex: serie.trim(), $options: 'i' };
+  if (folio) drMatch['complementoPago.pagos.doctosRelacionados.folio'] = { $regex: folio.trim(), $options: 'i' };
+  if (fechaInicio || fechaFin) {
+    drMatch['complementoPago.pagos.fechaPago'] = {};
+    if (fechaInicio) drMatch['complementoPago.pagos.fechaPago'].$gte = new Date(fechaInicio);
+    if (fechaFin) {
+      const fin = new Date(fechaFin);
+      fin.setUTCDate(fin.getUTCDate() + 1);
+      drMatch['complementoPago.pagos.fechaPago'].$lt = fin;
+    }
+  }
+
+  const estadoMatch = {};
+  if (estado === 'con_pago') estadoMatch['movimientos.0'] = { $exists: true };
+  if (estado === 'sin_pago') estadoMatch.movimientos = { $size: 0 };
+
+  const pipeline = [
+    { $match: baseMatch },
+    { $unwind: '$complementoPago.pagos' },
+    { $unwind: '$complementoPago.pagos.doctosRelacionados' },
+    ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
+    { $lookup: { from: 'bank_movements', localField: 'complementoPago.pagos.doctosRelacionados.idDocumento', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
+    { $addFields: { movimientos: { $map: { input: { $filter: { input: '$movimientos', as: 'm', cond: { $eq: ['$$m.isActive', true] } } }, as: 'm', in: { banco: '$$m.banco', fecha: '$$m.fecha', deposito: '$$m.deposito', folio: '$$m.folio', numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] } } } } } },
+    ...(banco ? [{ $match: { 'movimientos.banco': { $regex: banco.trim(), $options: 'i' } } }] : []),
+    ...(Object.keys(estadoMatch).length ? [{ $match: estadoMatch }] : []),
+    { $sort: { 'complementoPago.pagos.fechaPago': -1 } },
+    { $limit: 50000 },
+    { $project: {
+      _id: 0,
+      cfdiUuid:         '$uuid',
+      satStatus:        '$satStatus',
+      fechaPago:        '$complementoPago.pagos.fechaPago',
+      facturaUuid:      '$complementoPago.pagos.doctosRelacionados.idDocumento',
+      serie:            '$complementoPago.pagos.doctosRelacionados.serie',
+      folio:            '$complementoPago.pagos.doctosRelacionados.folio',
+      numParcialidad:   '$complementoPago.pagos.doctosRelacionados.numParcialidad',
+      impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
+      impSaldoInsoluto: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+      tienePago:        { $gt: [{ $size: '$movimientos' }, 0] },
+      banco:            { $arrayElemAt: ['$movimientos.banco',        0] },
+      movFecha:         { $arrayElemAt: ['$movimientos.fecha',        0] },
+      movFolio:         { $arrayElemAt: ['$movimientos.folio',        0] },
+      deposito:         { $arrayElemAt: ['$movimientos.deposito',     0] },
+      numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
+      diferencia:       { $round: [{ $subtract: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] }, 2] },
+    }},
+  ];
+
+  const rows = await CFDI.aggregate(pipeline).allowDiskUse(true);
+
+  const workbook  = new ExcelJS.Workbook();
+  const sheet     = workbook.addWorksheet('Pagos Asociados');
+
+  sheet.columns = [
+    { header: 'UUID CFDI Pago',    key: 'cfdiUuid',         width: 38 },
+    { header: 'Estado SAT',        key: 'satStatus',         width: 12 },
+    { header: 'Fecha Pago',        key: 'fechaPago',         width: 14 },
+    { header: 'UUID Factura',       key: 'facturaUuid',       width: 38 },
+    { header: 'Serie',              key: 'serie',             width: 8  },
+    { header: 'Folio',              key: 'folio',             width: 12 },
+    { header: 'Parcialidad',        key: 'numParcialidad',    width: 12 },
+    { header: 'Imp. Pagado',        key: 'impPagado',         width: 16 },
+    { header: 'Saldo Insoluto',     key: 'impSaldoInsoluto',  width: 16 },
+    { header: 'Tiene Pago',         key: 'tienePago',         width: 12 },
+    { header: 'Banco',              key: 'banco',             width: 20 },
+    { header: 'Fecha Movimiento',   key: 'movFecha',          width: 16 },
+    { header: 'Folio Movimiento',   key: 'movFolio',          width: 16 },
+    { header: 'Depósito',           key: 'deposito',          width: 16 },
+    { header: 'Núm. Autorización',  key: 'numOperacion',      width: 22 },
+    { header: 'Diferencia',         key: 'diferencia',        width: 16 },
+  ];
+
+  // Estilo encabezado
+  sheet.getRow(1).eachCell(cell => {
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } };
+    cell.font   = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+    cell.border = { bottom: { style: 'thin', color: { argb: 'FF3B82F6' } } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+  sheet.getRow(1).height = 22;
+
+  const mxn = { numFmt: '"$"#,##0.00' };
+  const fecha = { numFmt: 'dd/mm/yyyy' };
+
+  rows.forEach((r, idx) => {
+    const row = sheet.addRow({
+      cfdiUuid:         r.cfdiUuid,
+      satStatus:        r.satStatus || '—',
+      fechaPago:        r.fechaPago ? new Date(r.fechaPago) : null,
+      facturaUuid:      r.facturaUuid,
+      serie:            r.serie || '',
+      folio:            r.folio || '',
+      numParcialidad:   r.numParcialidad,
+      impPagado:        r.impPagado,
+      impSaldoInsoluto: r.impSaldoInsoluto,
+      tienePago:        r.tienePago ? 'Sí' : 'No',
+      banco:            r.banco || '—',
+      movFecha:         r.movFecha ? new Date(r.movFecha) : null,
+      movFolio:         r.movFolio || '—',
+      deposito:         r.deposito ?? null,
+      numOperacion:     r.numOperacion || '—',
+      diferencia:       r.diferencia,
+    });
+
+    // Formato moneda y fecha
+    row.getCell('impPagado').numFmt        = mxn.numFmt;
+    row.getCell('impSaldoInsoluto').numFmt = mxn.numFmt;
+    row.getCell('deposito').numFmt         = mxn.numFmt;
+    row.getCell('diferencia').numFmt       = mxn.numFmt;
+    row.getCell('fechaPago').numFmt        = fecha.numFmt;
+    row.getCell('movFecha').numFmt         = fecha.numFmt;
+
+    // Color fila sin pago
+    if (!r.tienePago) {
+      row.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF2F2' } }; });
+    } else if (r.diferencia !== 0) {
+      row.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFBEB' } }; });
+    }
+
+    // Alternar fila par
+    if (!r.tienePago || r.diferencia === 0) {
+      if (idx % 2 === 0 && r.tienePago) {
+        row.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } }; });
+      }
+    }
+
+    // Diferencia negativa en rojo
+    const difCell = row.getCell('diferencia');
+    if (r.diferencia > 0)       difCell.font = { color: { argb: 'FFB91C1C' }, bold: true };
+    else if (r.diferencia < 0)  difCell.font = { color: { argb: 'FF15803D' }, bold: true };
+  });
+
+  // Fila de totales
+  const totalRow = sheet.addRow({
+    cfdiUuid:    'TOTALES',
+    impPagado:   rows.reduce((s, r) => s + (r.impPagado || 0), 0),
+    deposito:    rows.reduce((s, r) => s + (r.deposito  || 0), 0),
+    diferencia:  rows.reduce((s, r) => s + (r.diferencia || 0), 0),
+  });
+  totalRow.eachCell(cell => {
+    cell.font   = { bold: true };
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+    cell.border = { top: { style: 'medium' } };
+  });
+  totalRow.getCell('impPagado').numFmt  = mxn.numFmt;
+  totalRow.getCell('deposito').numFmt   = mxn.numFmt;
+  totalRow.getCell('diferencia').numFmt = mxn.numFmt;
+
+  sheet.autoFilter = { from: 'A1', to: 'P1' };
+
+  const label = estado !== 'todos' ? `_${estado}` : '';
+  const per   = periodo ? `_${periodo}` : '';
+  const ej    = ejercicio ? `_${ejercicio}` : '';
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="pagos_banco${ej}${per}${label}_${Date.now()}.xlsx"`);
+  await workbook.xlsx.write(res);
+  res.end();
+});
+
+/**
+ * GET /api/reports/pagos-banco/detalle?facturaUuid=XXX
+ * Devuelve el satStatus de la factura y los movimientos bancarios vinculados.
+ * Se llama solo al abrir el panel de detalle de una fila.
+ */
+const pagosBancoDetalle = asyncHandler(async (req, res) => {
+  const { facturaUuid } = req.query;
+  if (!facturaUuid) return res.status(400).json({ error: 'facturaUuid requerido' });
+
+  const uuid = facturaUuid.trim().toUpperCase();
+
+  const [factura, movimientos] = await Promise.all([
+    CFDI.findOne({ uuid }).select('uuid satStatus serie folio total fecha emisor receptor').lean(),
+    CFDI.db.collection('bank_movements').find(
+      { isActive: true, 'erpLinks.folioFiscal': uuid },
+      { projection: { banco: 1, fecha: 1, deposito: 1, retiro: 1, folio: 1, concepto: 1, status: 1, numeroAutorizacion: 1, referenciaNumerica: 1 } },
+    ).toArray(),
+  ]);
+
+  res.json({ factura: factura || null, movimientos });
+});
+
+/**
+ * GET /api/reports/pagos-banco/bancos
+ * Devuelve lista de bancos distintos en bank_movements activos.
+ */
+const pagosBancosDistintos = asyncHandler(async (req, res) => {
+  const bancos = await CFDI.db.collection('bank_movements')
+    .distinct('banco', { isActive: true });
+  res.json(bancos.filter(Boolean).sort());
+});
+
+module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos };

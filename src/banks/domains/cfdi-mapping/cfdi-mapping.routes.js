@@ -26,6 +26,13 @@ router.get('/rules/:id',
   asyncHandler(async (req, res) => res.json(await svc.getById(req.params.id))),
 );
 
+// GET /api/cfdi-mapping/rules/:id/polizas
+router.get('/rules/:id/polizas',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => res.json(await svc.getRulePolizas(req.params.id))),
+);
+
 // POST /api/cfdi-mapping/rules
 router.post('/rules',
   authenticate,
@@ -105,6 +112,26 @@ router.get('/balanza-cuenta-cfdis',
             incluirFechaCruzada, excluirMesesPosteriores } = req.query;
     res.json(await balanza.generarDetalleCuenta({
       rfc, ejercicio, periodo, tipoCfdi, cuentaCodigo,
+      excluirPagosSustitutos:       excluirPagosSustitutos      === 'true',
+      excluirAplicacionesAnticipos: excluirAplicacionesAnticipos === 'true',
+      excluirReclasificaciones:     excluirReclasificaciones     === 'true',
+      incluirFechaCruzada:          incluirFechaCruzada          === 'true',
+      excluirMesesPosteriores:      excluirMesesPosteriores      === 'true',
+    }));
+  }),
+);
+
+// GET /api/cfdi-mapping/balanza-detalle-export
+// Devuelve lista plana de todos los movimientos CFDI→cuenta del periodo para el export Excel.
+router.get('/balanza-detalle-export',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, ejercicio, periodo, tipoCfdi,
+            excluirPagosSustitutos, excluirAplicacionesAnticipos, excluirReclasificaciones,
+            incluirFechaCruzada, excluirMesesPosteriores } = req.query;
+    res.json(await balanza.generarDetalleExport({
+      rfc, ejercicio, periodo, tipoCfdi,
       excluirPagosSustitutos:       excluirPagosSustitutos      === 'true',
       excluirAplicacionesAnticipos: excluirAplicacionesAnticipos === 'true',
       excluirReclasificaciones:     excluirReclasificaciones     === 'true',

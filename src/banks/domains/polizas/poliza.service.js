@@ -2,11 +2,11 @@
 
 const repo = require('./repositories/poliza.repository');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
-const { AccountPlan, PolizaMovimiento, Poliza } = require('../../../shared/models/postgres');
+const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza } = require('../../../shared/models/postgres');
 const { Op } = require('sequelize');
 
 function userLabel(user) {
-  return user?.nombre || user?.email || user?.nombre || String(user?.dbId ?? 'sistema');
+  return user?.nombre || user?.email || String(user?.dbId ?? 'sistema');
 }
 
 function validateBalance(movimientos) {
@@ -17,6 +17,8 @@ function validateBalance(movimientos) {
     debe  += Number(m.debe  || 0);
     haber += Number(m.haber || 0);
   }
+  debe  = Math.round(debe  * 100) / 100;
+  haber = Math.round(haber * 100) / 100;
   if (debe === 0 && haber === 0) {
     throw new ValidationError('La póliza debe tener importes mayores a cero');
   }
@@ -44,13 +46,11 @@ async function create(data, user) {
   if (!data.periodo)   throw new ValidationError('El periodo es requerido');
   if (!data.rfc)       throw new ValidationError('El RFC es requerido');
 
-  if (data.fecha && data.ejercicio && data.periodo) {
-    const d = new Date(data.fecha);
-    if (d.getFullYear() !== Number(data.ejercicio) || d.getMonth() + 1 !== Number(data.periodo)) {
-      throw new ValidationError(
-        `La fecha ${data.fecha} no corresponde al ejercicio ${data.ejercicio} periodo ${data.periodo}`,
-      );
-    }
+  const d = new Date(data.fecha);
+  if (d.getFullYear() !== Number(data.ejercicio) || d.getMonth() + 1 !== Number(data.periodo)) {
+    throw new ValidationError(
+      `La fecha ${data.fecha} no corresponde al ejercicio ${data.ejercicio} periodo ${data.periodo}`,
+    );
   }
 
   validateBalance(data.movimientos);
@@ -105,7 +105,38 @@ async function cancel(id, user, motivo) {
     motivoCancelacion:  motivo || null,
   });
   if (!result) throw new NotFoundError('Póliza');
-  return result;
+
+  // Advertir si la póliza tenía movimientos de IVA PPD (IVA por cobrar/pagar).
+  // Cancelar la póliza deja saldo fantasma en esa cuenta — se requiere asiento de reversa.
+  let advertenciaIvaPpd = null;
+  if (poliza.estado === 'contabilizada' && poliza.movimientos?.length > 0) {
+    try {
+      const reglasConPpd = await CfdiMappingRule.findAll({
+        where: { cuentaIvaPPD: { [Op.ne]: null } },
+        attributes: ['cuentaIvaPPD'],
+        raw: true,
+      });
+      const codigosPpd = [...new Set(reglasConPpd.map(r => r.cuentaIvaPPD).filter(Boolean))];
+      if (codigosPpd.length > 0) {
+        const cuentasPpdRows = await AccountPlan.findAll({
+          where: { codigo: { [Op.in]: codigosPpd } },
+          attributes: ['id'],
+          raw: true,
+        });
+        const idsPpd = new Set(cuentasPpdRows.map(c => c.id));
+        const tieneIvaPpd = poliza.movimientos.some(m => idsPpd.has(m.cuentaId));
+        if (tieneIvaPpd) {
+          advertenciaIvaPpd =
+            'Esta póliza contenía movimientos de IVA PPD (IVA por cobrar/pagar pendiente de reconocer). ' +
+            'Debes crear un asiento de reversa manual para limpiar el saldo de esa cuenta y evitar ' +
+            'diferencias en la DIOT y la balanza de comprobación.';
+        }
+      }
+    } catch (_) { /* no bloquear la cancelación por error en advertencia */ }
+  }
+
+  const resultPlain = typeof result?.toJSON === 'function' ? result.toJSON() : result;
+  return { ...resultPlain, advertenciaIvaPpd };
 }
 
 async function contabilizar(id, user) {
@@ -114,6 +145,14 @@ async function contabilizar(id, user) {
   if (!poliza)                      throw new NotFoundError('Póliza');
   if (poliza.estado !== 'borrador') throw new ValidationError('Solo se pueden contabilizar pólizas en borrador');
   if (!poliza.movimientos?.length)  throw new ValidationError('La póliza no tiene movimientos');
+
+  const _cuentasFaltantes = poliza.movimientos.filter(m => m.cuentaFaltante || m.cuentaId == null).length;
+  if (_cuentasFaltantes > 0) {
+    throw new ValidationError(
+      `No se puede contabilizar: ${_cuentasFaltantes} movimiento(s) sin cuenta contable asignada. ` +
+      `Edita la póliza y asigna las cuentas faltantes antes de contabilizar.`,
+    );
+  }
 
   validateBalance(poliza.movimientos.map(m => ({ debe: m.debe, haber: m.haber })));
 
@@ -243,10 +282,17 @@ async function generarCierreIVA({ rfc, ejercicio, periodo, user }) {
   const totalHaber = Math.round(movs.reduce((s, m) => s + Number(m.haber || 0), 0) * 100) / 100;
   const netIVA     = Math.round((totalHaber - totalDebe) * 100) / 100;
 
-  if (netIVA <= 0.01) {
+  if (Math.abs(netIVA) <= 0.01) {
     throw new ValidationError(
-      `IVA Trasladado neto = ${netIVA.toFixed(2)} — saldo cero o deudor, no hay cierre que generar. ` +
-      `(Debe: ${totalDebe.toFixed(2)}, Haber: ${totalHaber.toFixed(2)})`
+      `IVA Trasladado con saldo cero (${netIVA.toFixed(2)}) — no hay cierre que generar. ` +
+      `(Debe: ${totalDebe.toFixed(2)}, Haber: ${totalHaber.toFixed(2)})`,
+    );
+  }
+  if (netIVA < 0) {
+    throw new ValidationError(
+      `IVA Trasladado con saldo DEUDOR (${netIVA.toFixed(2)}): hay más cancelaciones/débitos ` +
+      `que IVA trasladado cobrado en el período. Revisa los movimientos de la cuenta 2104010001 ` +
+      `antes de generar el cierre. (Debe: ${totalDebe.toFixed(2)}, Haber: ${totalHaber.toFixed(2)})`,
     );
   }
 

@@ -159,8 +159,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         !c.conceptos?.length ||
         c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
-         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        // Enriquecer también sustitutos (tipoRelacion='04'): se conservan en
+        // la póliza y necesitan formaPago/conceptos/tipoOrigen del ERP.
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
       ))
       .map(c => c.uuid),
   );
@@ -183,13 +184,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+    const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
@@ -205,8 +207,26 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
   _normalizarEgresoPue99(cfdisSinPolizaFinal);
 
+  // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
+  // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
+  const _canceladosPorSustitutoProp = new Set(
+    cfdisSinPolizaFinal
+      .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                   c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      .flatMap(c => (c.cfdiRelacionados || [])
+        .filter(r => r.tipoRelacion === '04')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .map(u => u.toUpperCase())
+      )
+  );
+  const cfdisSinPolizaFinalFiltrado = _canceladosPorSustitutoProp.size
+    ? cfdisSinPolizaFinal.filter(c =>
+        !_canceladosPorSustitutoProp.has(c.uuid?.toUpperCase() ?? '')
+      )
+    : cfdisSinPolizaFinal;
+
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
-  const cfdiConRegla = cfdisSinPolizaFinal.map(cfdi => ({
+  const cfdiConRegla = cfdisSinPolizaFinalFiltrado.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
@@ -262,17 +282,47 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const ccBySerieMapProp = await centrosSvc.resolveBySerieMap();
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Para cada aplicación de anticipo PUE, SAT emite DOS CFDIs en el mismo período:
-  //   (a) Factura final tipo I, formaPago=30, tipoRelacion=07 → Reg 22C → DEBE Anticipos
-  //   (b) NC tipo E, tipoRelacion=07 → Reg 23 → DEBE Anticipos de nuevo (doble!)
-  // Si ambos están en el batch, se genera el DEBE en Anticipos dos veces.
-  // Solución: Reg 22C ya hace la contabilización completa; omitir la NC tipo E.
-  // Se construye el set de UUIDs de anticipos originales cubiertos por una factura
-  // final PUE (formaPago=30) en este mismo batch.
+  // Solo aplica cuando la factura final (formaPago=30) usa el modelo 2 asientos
+  // (cuentaCargo=2103010001 Anticipos). En el modelo 3 asientos (cuentaCargo=1103010001
+  // Clientes) la NC sí debe procesarse — cancela Anticipos vs Clientes en asiento 3.
   const anticosCubiertosPorReg22C = new Set();
-  for (const { cfdi: c } of cfdiConRegla) {
+  for (const { cfdi: c, rule: r } of cfdiConRegla) {
     if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
+    if (r?.cuentaCargo !== '2103010001') continue;
     if (c.uuid) anticosCubiertosPorReg22C.add(c.uuid.toUpperCase());
+  }
+
+  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
+  // Si el UUID relacionado tipo 07 de alguna NC ya tiene movimiento en una regla con cuentaIvaAnticipo
+  // en una póliza no cancelada, la NC está cubierta aunque no esté en el batch actual.
+  {
+    const uuids07 = new Set(
+      cfdiConRegla
+        .filter(({ cfdi: c }) =>
+          c.tipoDeComprobante === 'E' &&
+          c.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .flatMap(({ cfdi: c }) =>
+          (c.cfdiRelacionados || [])
+            .filter(r => r.tipoRelacion === '07')
+            .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+            .map(u => u.toUpperCase()),
+        ),
+    );
+    if (uuids07.size > 0) {
+      const reglasAnticipo = await CfdiMappingRule.findAll({
+        where: { cuentaIvaAnticipo: { [Op.ne]: null } },
+        attributes: ['id'], raw: true,
+      });
+      const idsAnticipo = reglasAnticipo.map(r => r.id);
+      if (idsAnticipo.length > 0) {
+        const yaEnBD = await PolizaMovimiento.findAll({
+          where: { cfdiUuid: { [Op.in]: [...uuids07] }, reglaId: { [Op.in]: idsAnticipo } },
+          attributes: ['cfdiUuid'],
+          include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
+        });
+        for (const m of yaEnBD) anticosCubiertosPorReg22C.add(m.cfdiUuid.toUpperCase());
+      }
+    }
   }
 
   const movimientosResult = [];
@@ -344,9 +394,24 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     c.cfdiRelacionados?.some(r => r.tipoRelacion === '07')
   );
 
+  // Recopilar diagnóstico de CFDIs sin regla para incluir en advertencias
+  const _sinReglaInfo = cfdiConRegla
+    .filter(({ rule }) => !rule)
+    .slice(0, 5)
+    .map(({ cfdi: c }) => {
+      const tasaDetectada = c.tipoDeComprobante === 'P' ? mappingSvc.detectTasaIva(c) : undefined;
+      return (
+        `${c.uuid?.slice(0, 8)}… tipo=${c.tipoDeComprobante} método=${c.metodoPago || '—'} ` +
+        `forma=${c.formaPago || '—'} emisor=${c.emisor?.rfc || '—'}` +
+        (tasaDetectada !== undefined ? ` tasaIva=${tasaDetectada ?? 'null (sin datos de tasa — descarga XML)'}` : '')
+      );
+    });
+
   const advertencias = [];
   if (sinRegla > 0) {
     advertencias.push(`${sinRegla} CFDI(s) sin regla de mapeo — las cuentas deben asignarse manualmente`);
+    for (const info of _sinReglaInfo) advertencias.push(`  • ${info}`);
+    if (sinRegla > 5) advertencias.push(`  … y ${sinRegla - 5} más`);
   }
   if (ppd07.length > 0) {
     advertencias.push(
@@ -355,6 +420,22 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       `Folios: ${ppd07.map(c => [c.serie, c.folio].filter(Boolean).join('-')).slice(0, 5).join(', ')}` +
       (ppd07.length > 5 ? ` y ${ppd07.length - 5} más` : ''),
     );
+  }
+  // Sustitutos cuyo CFDI original ya tiene póliza contabilizada → doble asiento potencial
+  if (_canceladosPorSustitutoProp.size) {
+    for (const c of cfdisSinPolizaFinal) {
+      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
+      for (const rel of (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04')) {
+        for (const uA of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
+          if (uuidsYaUsados.has(uA.toUpperCase())) {
+            advertencias.push(
+              `⚠ Sustitución: ${c.uuid?.slice(0, 8)}… sustituye al CFDI ${uA.slice(0, 8)}… ` +
+              `que ya tiene póliza contabilizada — reviértela y cancélala antes de procesar este sustituto`,
+            );
+          }
+        }
+      }
+    }
   }
 
   return {
@@ -454,8 +535,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         !c.conceptos?.length ||
         c.conceptos.every(con => !(con.impuestos?.traslados?.length)) ||
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0 &&
-         !c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+        // Enriquecer también sustitutos (tipoRelacion='04'): se conservan en
+        // la póliza y necesitan formaPago/conceptos/tipoOrigen del ERP.
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
       ))
       .map(c => c.uuid),
   );
@@ -478,13 +560,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const metodoPagoFinal = (cfdi.metodoPago === 'PPD' && erp.metodoPago === 'PUE')
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+    const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
@@ -500,8 +583,26 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
   _normalizarEgresoPue99(cfdisSinPolizaFinalGuard);
 
+  // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
+  // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
+  const _canceladosPorSustitutoGuard = new Set(
+    cfdisSinPolizaFinalGuard
+      .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
+                   c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      .flatMap(c => (c.cfdiRelacionados || [])
+        .filter(r => r.tipoRelacion === '04')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .map(u => u.toUpperCase())
+      )
+  );
+  const cfdisSinPolizaFinalGuardFiltrado = _canceladosPorSustitutoGuard.size
+    ? cfdisSinPolizaFinalGuard.filter(c =>
+        !_canceladosPorSustitutoGuard.has(c.uuid?.toUpperCase() ?? '')
+      )
+    : cfdisSinPolizaFinalGuard;
+
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
-  const cfdiConRegla = cfdisSinPolizaFinalGuard.map(cfdi => ({
+  const cfdiConRegla = cfdisSinPolizaFinalGuardFiltrado.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
@@ -565,9 +666,41 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (c.uuid) anticosCubiertosPorReg22CGuard.add(c.uuid.toUpperCase());
   }
 
+  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
+  {
+    const uuids07g = new Set(
+      cfdiConRegla
+        .filter(({ cfdi: c }) =>
+          c.tipoDeComprobante === 'E' &&
+          c.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .flatMap(({ cfdi: c }) =>
+          (c.cfdiRelacionados || [])
+            .filter(r => r.tipoRelacion === '07')
+            .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+            .map(u => u.toUpperCase()),
+        ),
+    );
+    if (uuids07g.size > 0) {
+      const reglasAnticipoG = await CfdiMappingRule.findAll({
+        where: { cuentaIvaAnticipo: { [Op.ne]: null } },
+        attributes: ['id'], raw: true,
+      });
+      const idsAnticipoG = reglasAnticipoG.map(r => r.id);
+      if (idsAnticipoG.length > 0) {
+        const yaEnBDG = await PolizaMovimiento.findAll({
+          where: { cfdiUuid: { [Op.in]: [...uuids07g] }, reglaId: { [Op.in]: idsAnticipoG } },
+          attributes: ['cfdiUuid'],
+          include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
+        });
+        for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.add(m.cfdiUuid.toUpperCase());
+      }
+    }
+  }
+
   const todosLosMovimientos = [];
   let sinRegla = 0;
   const advertencias = [];
+  const ruleUsageCount = new Map();
   // Diagnóstico: acumular los primeros 5 CFDIs sin regla para dar info útil
   const muestrasSinRegla = [];
 
@@ -583,12 +716,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (!rule) {
       sinRegla++;
       if (muestrasSinRegla.length < 5) {
+        const _tasaDet = cfdi.tipoDeComprobante === 'P' ? mappingSvc.detectTasaIva(cfdi) : undefined;
         muestrasSinRegla.push({
           uuid:    cfdi.uuid?.slice(0, 8),
           tipo:    cfdi.tipoDeComprobante,
           metodo:  cfdi.metodoPago,
           forma:   cfdi.formaPago,
           emisor:  cfdi.emisor?.rfc,
+          ...(_tasaDet !== undefined ? { tasaIva: _tasaDet ?? 'null (sin datos — descarga XML)' } : {}),
         });
       }
       continue;
@@ -611,6 +746,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
 
     if (rule?.esAplicacionSaldo) {
       const usado = movs.find(m => m._saldoUsado != null)?._saldoUsado ?? 0;
@@ -634,6 +770,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
       });
+    }
+  }
+
+  // Sustitutos cuyo CFDI original ya tiene póliza contabilizada → doble asiento potencial
+  if (_canceladosPorSustitutoGuard.size) {
+    for (const c of cfdisSinPolizaFinalGuard) {
+      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
+      for (const rel of (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04')) {
+        for (const uA of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
+          if (uuidsYaUsados.has(uA.toUpperCase())) {
+            advertencias.push(
+              `⚠ Sustitución: ${c.uuid?.slice(0, 8)}… sustituye al CFDI ${uA.slice(0, 8)}… ` +
+              `que ya tiene póliza contabilizada — reviértela y cancélala antes de contabilizar este sustituto`,
+            );
+          }
+        }
+      }
     }
   }
 
@@ -678,13 +831,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     return polizaHeader;
   });
 
+  // Incrementar contador de uso por regla (fuera de la transacción para no bloquearla)
+  if (ruleUsageCount.size > 0) {
+    await Promise.all(
+      [...ruleUsageCount.entries()].map(([id, count]) =>
+        CfdiMappingRule.increment('vecesUsada', { by: count, where: { id } }),
+      ),
+    );
+  }
+
   const advertenciasFinal = [];
   if (sinRegla > 0) {
     advertenciasFinal.push(`${sinRegla} CFDI(s) omitidos por no tener regla de mapeo`);
     // Muestra diagnóstico de los primeros 5 ignorados
     for (const m of muestrasSinRegla) {
+      const tasaStr = m.tasaIva !== undefined ? ` tasaIva=${m.tasaIva}` : '';
       advertenciasFinal.push(
-        `  Ej. ${m.uuid}… → tipo=${m.tipo} método=${m.metodo || '—'} forma=${m.forma || '—'} emisor=${m.emisor || '—'}`,
+        `  Ej. ${m.uuid}… → tipo=${m.tipo} método=${m.metodo || '—'} forma=${m.forma || '—'} emisor=${m.emisor || '—'}${tasaStr}`,
       );
     }
     // Resumen de reglas activas para comparar

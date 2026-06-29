@@ -168,6 +168,12 @@ const CfdiMappingRule = sequelize.define('CfdiMappingRule', {
     allowNull: true,
     comment:   'Centro de costo que se asigna a los movimientos generados',
   },
+  vecesUsada: {
+    type:         DataTypes.INTEGER,
+    allowNull:    false,
+    defaultValue: 0,
+    comment:      'Número de asientos contables generados con esta regla',
+  },
   prioridad: {
     type:         DataTypes.INTEGER,
     allowNull:    false,

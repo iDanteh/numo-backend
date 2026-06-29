@@ -24,6 +24,7 @@ const Poliza            = require('./Poliza');
 const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
+const ClienteCatalogo   = require('./ClienteCatalogo');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -77,9 +78,10 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS es_intercompania BOOLEAN NOT NULL DEFAULT FALSE
   `).catch(e => console.warn('[syncModels] ADD COLUMN es_intercompania:', e.message));
 
-  // CentroCosto: force:false para evitar conflictos con alter en primera ejecución.
+  // CentroCosto/ClienteCatalogo: force:false para evitar conflictos con alter en primera ejecución.
   // La columna centro_costo_id en poliza_movimientos se agrega vía raw SQL más abajo.
   await CentroCosto.sync({ force: false });
+  await ClienteCatalogo.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await AccountPlan.sync({ alter: !isProd });
@@ -164,6 +166,17 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS cuenta_cargo_mixto0 VARCHAR(20)
   `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_cargo_mixto0 (reglas):', e.message));
 
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS cuenta_iva_ppd  VARCHAR(20),
+      ADD COLUMN IF NOT EXISTS cuenta_abono2   VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_iva_ppd/cuenta_abono2 (reglas):', e.message));
+
+  await Poliza.sequelize.query(`
+    ALTER TABLE cfdi_mapping_rules
+      ADD COLUMN IF NOT EXISTS veces_usada INTEGER NOT NULL DEFAULT 0
+  `).catch(e => console.warn('[syncModels] ADD COLUMN veces_usada (reglas):', e.message));
+
   await BankRule.sequelize.query(`
     ALTER TABLE bank_rules ADD COLUMN IF NOT EXISTS estado_destino VARCHAR(30)
   `).catch(e => console.warn('[syncModels] ADD COLUMN estado_destino (bank_rules):', e.message));
@@ -190,4 +203,4 @@ async function syncModels() {
   `).catch(() => {});
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

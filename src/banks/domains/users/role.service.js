@@ -32,6 +32,8 @@ async function createRole({ value, label, permissions }) {
   if (exists) throw new ConflictError(`El rol '${value}' ya existe.`);
   const role = await Role.create({ value, label, permissions: permissions ?? [], isSystem: false });
   invalidate();
+  const io = getIo();
+  if (io) io.emit('role:definition:updated', { role: value });
   return role;
 }
 
@@ -39,33 +41,37 @@ async function updateRole(value, updates) {
   const { Role, User } = db();
   const role = await Role.findByPk(value);
   if (!role) throw new NotFoundError(`Rol '${value}' no encontrado.`);
+
   if (updates.label       !== undefined) role.label       = updates.label;
-  if (updates.permissions !== undefined) role.permissions = updates.permissions;
+  if (updates.permissions !== undefined) {
+    role.permissions = updates.permissions;
+    // Forzar el dirty flag: Sequelize puede no detectar la reasignación de un
+    // array JSONB como cambio si la referencia es distinta pero el contenido igual.
+    role.changed('permissions', true);
+  }
+
   await role.save();
   invalidate();
 
-  // When permissions change, notify all users with this role in real time
-  if (updates.permissions !== undefined) {
-    const io = getIo();
-    if (io) {
-      // 1. Notifica a los usuarios con ese rol para que actualicen sus permisos en sesión
+  const io = getIo();
+  if (io) {
+    if (updates.permissions !== undefined) {
+      // Notifica a los usuarios con ese rol para que actualicen sus permisos en sesión
       const affected = await User.findAll({
         where: { role: value },
         attributes: ['auth0Sub'],
         raw: true,
       });
       for (const u of affected) {
-        // Sequelize returns camelCase when using named attributes even with raw:true + underscored
         const sub = u.auth0Sub ?? u.auth0_sub;
         if (sub) {
           io.to(`user:${sub}`).emit('role:updated', { role: value, permissions: role.permissions });
         }
       }
-
-      // 2. Broadcast global para que la vista de usuarios/roles se refresque en
-      //    todas las sesiones activas (admins viendo la pantalla de gestión de roles).
-      io.emit('role:definition:updated', { role: value });
     }
+
+    // Broadcast siempre (label o permissions) para refrescar la vista de gestión
+    io.emit('role:definition:updated', { role: value });
   }
 
   return role;
@@ -86,6 +92,8 @@ async function deleteRole(value) {
   }
   await role.destroy();
   invalidate();
+  const io = getIo();
+  if (io) io.emit('role:definition:updated', { role: value, deleted: true });
 }
 
 // ── Permisos ──────────────────────────────────────────────────────────────────

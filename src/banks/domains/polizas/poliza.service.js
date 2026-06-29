@@ -14,11 +14,9 @@ function validateBalance(movimientos) {
   let debe  = 0;
   let haber = 0;
   for (const m of movimientos) {
-    debe  += Number(m.debe  || 0);
-    haber += Number(m.haber || 0);
+    debe  = Math.round((debe  + (Number(m.debe)  || 0)) * 100) / 100;
+    haber = Math.round((haber + (Number(m.haber) || 0)) * 100) / 100;
   }
-  debe  = Math.round(debe  * 100) / 100;
-  haber = Math.round(haber * 100) / 100;
   if (debe === 0 && haber === 0) {
     throw new ValidationError('La póliza debe tener importes mayores a cero');
   }
@@ -278,8 +276,8 @@ async function generarCierreIVA({ rfc, ejercicio, periodo, user }) {
     raw:        true,
   });
 
-  const totalDebe  = Math.round(movs.reduce((s, m) => s + Number(m.debe  || 0), 0) * 100) / 100;
-  const totalHaber = Math.round(movs.reduce((s, m) => s + Number(m.haber || 0), 0) * 100) / 100;
+  const totalDebe  = movs.reduce((s, m) => Math.round((s + Number(m.debe  || 0)) * 100) / 100, 0);
+  const totalHaber = movs.reduce((s, m) => Math.round((s + Number(m.haber || 0)) * 100) / 100, 0);
   const netIVA     = Math.round((totalHaber - totalDebe) * 100) / 100;
 
   if (Math.abs(netIVA) <= 0.01) {

@@ -72,6 +72,7 @@ const dashboard = asyncHandler(async (req, res) => {
   if (ejercicio)         periodoFilter.ejercicio         = parseInt(ejercicio);
   if (periodo)           periodoFilter.periodo           = parseInt(periodo);
   if (tipoDeComprobante) periodoFilter.tipoDeComprobante = tipoDeComprobante;
+  else                   periodoFilter.tipoDeComprobante = { $ne: 'N' }; // nómina no suma en "todos los tipos"
 
   // Filtro base para KPIs de conciliación (solo ERP activos, sin cancelados ni deshabilitados)
   // Debe coincidir con los mismos criterios que countERP del aggregate de montos.

@@ -549,10 +549,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // esAnticipo + tipo I/E: cargo cancela el pasivo del anticipo → subtotalAnticipo
   // esAnticipo + tipo P: cargo aplica el saldo completo del monedero → total
   // esAplicacionSaldo: cargo = min(saldoDisponible, total) — el resto en cuentaCargo2
+  // Egreso normal: cargo = subtotal − descuento (netear igual que el abono de un ingreso)
   let montoCargo;
   if (esAnticipo)        montoCargo = esPago ? total : subtotalAnticipo;
   else if (esIvaHaber)   montoCargo = total;
-  else                   montoCargo = (esIngreso || esPago) ? total : subtotal;
+  else                   montoCargo = (esIngreso || esPago) ? total : parseFloat((subtotal - Number(cfdi.descuento || 0)).toFixed(2));
 
   if (esAplicacionSaldo) {
     const saldoAplicado = parseFloat(Math.min(context.saldoDisponible, montoCargo).toFixed(2));
@@ -597,9 +598,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     if (cuentaIvaAplicable) {
       const ivaEsHaber = esIngreso || esIvaHaber;
       // Fórmula SAT: total = subtotal − descuento + IVA → IVA = total − subtotal + descuento.
-      // Para Tipo I el descuento está neteado en montoAbono (subtotal−desc), así que se suma aquí.
-      // Para Tipo E montoCargo = subtotal (bruto), por lo que no se suma descuento al IVA.
-      const _descuentoEnIva = (esIngreso && !esPago) ? Number(cfdi.descuento || 0) : 0;
+      // Tanto ingreso (abono neteado) como egreso (cargo neteado) llevan descuento aquí.
+      const _descuentoEnIva = !esPago ? Number(cfdi.descuento || 0) : 0;
       const ivaR = (ivaRet === 0 && isrRet === 0)
         ? parseFloat((total - subtotal + _descuentoEnIva).toFixed(2))
         : iva;

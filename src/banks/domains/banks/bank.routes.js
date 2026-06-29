@@ -187,6 +187,14 @@ router.patch('/movements/:id/status',
   }),
 );
 
+router.patch('/movements/:id/categoria',
+  authenticate,
+  permit('banks:movement:edit'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.updateCategoria(req.params.id, req.body.categoria, req.user));
+  })
+)
+
 // PATCH /api/banks/movements/:id/erp-ids  (remove individual)
 router.patch('/movements/:id/erp-ids',
   authenticate,
@@ -436,7 +444,7 @@ router.patch('/movements/reclasify',
 // PATCH /api/banks/movements/:id  — edición de campos del movimiento
 router.patch('/movements/:id',
   authenticate,
-  permit('banks:update'),
+  permit('banks:movement:edit'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateMovement(req.params.id, req.body, req.user));
   }),

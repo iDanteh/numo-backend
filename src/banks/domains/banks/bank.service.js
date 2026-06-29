@@ -99,7 +99,7 @@ async function getCards() {
   // El join con la configuración se hace en la capa de aplicación.
   const [agg, configMap] = await Promise.all([
     BankMovement.aggregate([
-      { $match: { isActive: true } },
+      { $match: { isActive: true, oculto: { $ne: true } } },
       { $sort:  { banco: 1, fecha: 1, _id: 1 } },
       {
         $group: {
@@ -127,12 +127,19 @@ async function getCards() {
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $eq:  ['$status', 'reclasificado'] }, 1, 0] } },
           saldoPendiente: {
-            // Σ depósitos con status 'no_identificado'.
-            // Retiros, 'identificado' y 'otros' no participan en este cálculo.
+            // Σ de no_identificados ponderada por CxC vinculadas:
+            // · Con saldoErp: se suma solo la diferencia (deposito - saldoErp), mínimo 0.
+            // · Sin saldoErp: se suma el depósito completo.
             $sum: {
               $cond: [
                 { $in: ['$status', ['no_identificado', null]] },
-                { $ifNull: ['$deposito', 0] },
+                {
+                  $cond: [
+                    { $ne: ['$saldoErp', null] },
+                    { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] },
+                    { $ifNull: ['$deposito', 0] },
+                  ],
+                },
                 0,
               ],
             },
@@ -149,7 +156,7 @@ async function getCards() {
           saldoOtros: {
             $sum: {
               $cond: [
-                { $eq: ['$status', 'otros'] },
+                { $in: ['$status', ['otros', 'reclasificado']] },
                 { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
                 0,
               ],
@@ -228,7 +235,7 @@ async function getCards() {
 }
 
 async function getStatusStats(year, month) {
-  const match = { isActive: true };
+  const match = { isActive: true, oculto: { $ne: true } };
 
   if (year) {
     const y = parseInt(year, 10);
@@ -250,7 +257,7 @@ async function getStatusStats(year, month) {
           identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
-          dep_no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, { $cond: [{ $ne: ['$saldoErp', null] }, { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] }, { $ifNull: ['$deposito', 0] }] }, 0] } },
           dep_identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
           dep_otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
           dep_reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
@@ -1174,14 +1181,20 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre, filename } 
         for (const mov of docsInsertados) {
           const $set = {};
           for (const rule of catRules) {
-            if (matchRegla(mov, rule)) { $set.categoria = rule.nombre; break; }
+            if (matchRegla(mov, rule)) {
+              $set.categoria = rule.nombre;
+              if (rule.estadoDestino) $set.status = rule.estadoDestino;
+              break;
+            }
           }
           if ($set.categoria) categorizados++;
           for (const rule of ocultarRules) {
             if (matchRegla(mov, rule)) { $set.oculto = true; break; }
           }
-          for (const rule of cambiarEstadoRules) {
-            if (matchRegla(mov, rule)) { $set.status = rule.estadoDestino; break; }
+          if (!$set.status) {
+            for (const rule of cambiarEstadoRules) {
+              if (matchRegla(mov, rule)) { $set.status = rule.estadoDestino; break; }
+            }
           }
           if (Object.keys($set).length > 0) {
             ops.push({ updateOne: { filter: { _id: mov._id }, update: { $set } } });
@@ -1276,9 +1289,11 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
       bankRuleRepo.listByBanco(bancoValidado, { accion: 'cambiar_estado' }),
     ]);
 
+    let catEstadoAplicado = false;
     for (const rule of catRules) {
       if (matchRegla(nuevo, rule)) {
         nuevo.categoria = rule.nombre;
+        if (rule.estadoDestino) { nuevo.status = rule.estadoDestino; catEstadoAplicado = true; }
         categorizado = true;
         break;
       }
@@ -1286,9 +1301,11 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
     for (const rule of ocultarRules) {
       if (matchRegla(nuevo, rule)) { nuevo.oculto = true; break; }
     }
-    let estadoCambiado = false;
-    for (const rule of cambiarEstadoRules) {
-      if (matchRegla(nuevo, rule)) { nuevo.status = rule.estadoDestino; estadoCambiado = true; break; }
+    let estadoCambiado = catEstadoAplicado;
+    if (!catEstadoAplicado) {
+      for (const rule of cambiarEstadoRules) {
+        if (matchRegla(nuevo, rule)) { nuevo.status = rule.estadoDestino; estadoCambiado = true; break; }
+      }
     }
     if (categorizado || nuevo.oculto || estadoCambiado) await nuevo.save();
   }
@@ -1327,9 +1344,17 @@ function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
     ? links.reduce((sum, l) => {
-        const ref = (l.saldoActual != null && l.saldoActual > 0)
-          ? l.saldoActual
-          : (l.total ?? 0);
+        // saldoPagado: monto acumulado de transferencias para este link (PPD parcial).
+        // Si está presente y > 0, se usa directamente. Si null (dato legacy o sin cobro
+        // registrado), cae al comportamiento anterior: saldoActual > 0 o total.
+        let ref;
+        if (l.saldoPagado != null && l.saldoPagado > 0) {
+          ref = l.saldoPagado;
+        } else {
+          ref = (l.saldoActual != null && l.saldoActual > 0)
+            ? l.saldoActual
+            : (l.total ?? 0);
+        }
         return sum + ref;
       }, 0)
     : null;
@@ -1397,6 +1422,56 @@ async function updateStatus(id, status, user) {
   return updated;
 }
 
+async function updateCategoria(id, categoria, user) {
+  if (categoria !== undefined && categoria !== null && typeof categoria !== 'string') {
+    throw new BadRequestError('categoria debe ser string o null');
+  }
+  const categoriaLimpia = typeof categoria === 'string' ? (categoria.trim() || null) : null;
+
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  const anterior = mov.categoria ?? null;
+  if (anterior === categoriaLimpia) {
+    return { _id: mov._id, banco: mov.banco, categoria: anterior, status: mov.status };
+  }
+
+  // Al asignar categoría manualmente:
+  //   - Si el movimiento ya está 'identificado' (tiene CxC conciliada), conservamos ese status.
+  //     Asignar una categoría es una anotación organizacional, no revierte la conciliación.
+  //   - En cualquier otro status pasamos a 'reclasificado' para indicar intervención manual.
+  // Al limpiarla → vuelve a 'identificado' si tiene ERP, sino 'no_identificado'.
+  let newStatus = mov.status;
+  if (categoriaLimpia) {
+    if (mov.status !== 'identificado') {
+      newStatus = 'reclasificado';
+    }
+  } else if (mov.status === 'reclasificado') {
+    newStatus = (mov.erpIds?.length ?? 0) > 0 ? 'identificado' : 'no_identificado';
+  }
+
+  await BankMovement.updateOne(
+    { _id: id },
+    {
+      $set:  { categoria: categoriaLimpia, status: newStatus },
+      $push: {
+        _changelog: {
+          at:         new Date(),
+          via:        user ? `manual:${user._id}` : 'manual',
+          campo:      'categoria',
+          de:         anterior,
+          a:          categoriaLimpia,
+          importFile: null,
+        },
+      },
+    }
+  );
+
+  const result = { _id: mov._id, banco: mov.banco, categoria: categoriaLimpia, status: newStatus };
+  emitToBanco(mov.banco, 'bank:movement:updated', result);
+  return result;
+}
+
 async function updateErpIds(id, action, erpId, user) {
   if (action !== 'remove') throw new BadRequestError('Solo se acepta action "remove"');
   if (!erpId || typeof erpId !== 'string' || !erpId.trim()) {
@@ -1448,10 +1523,12 @@ async function setErpIds(id, erpLinks, user) {
     .map(l => ({
       erpId:        String(l.erpId || '').trim(),
       saldoActual:  l.saldoActual != null ? Number(l.saldoActual) : null,
+      saldoPagado:  l.saldoPagado != null ? Number(l.saldoPagado) : null,
       folioFiscal:  l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
       total:        l.total != null ? Number(l.total) : null,
       serie:        l.serie ? String(l.serie).trim() : null,
       folioExterno: l.folioExterno ? String(l.folioExterno).trim() : null,
+      tipoPago:     l.tipoPago ? String(l.tipoPago).trim().toUpperCase() : null,
     }))
     .filter(l => l.erpId);
 
@@ -1915,6 +1992,15 @@ async function updateMovement(id, data, user) {
     if (campo in data) {
       mov[campo] = data[campo] ?? null;
       if (CAMPOS_QUE_AFECTAN_HASH.has(campo)) recalcularHash = true;
+    }
+  }
+
+  // Reflejar status cuando la categoría cambia manualmente
+  if ('categoria' in data) {
+    if (mov.categoria) {
+      mov.status = 'reclasificado';
+    } else if (mov.status === 'reclasificado') {
+      mov.status = (mov.erpIds?.length ?? 0) > 0 ? 'identificado' : 'no_identificado';
     }
   }
 
@@ -2528,7 +2614,7 @@ module.exports = {
   getCards, listMovements, getSummary, getStatusStats,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
-  exportMovements, deleteMovements, reclasifyMovements, updateMovement, generateTemplate,
+  exportMovements, deleteMovements, reclasifyMovements, updateMovement, updateCategoria, generateTemplate,
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,

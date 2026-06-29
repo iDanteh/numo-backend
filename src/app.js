@@ -117,23 +117,27 @@ app.use('/api/banks',                bankRoutes);
 app.use('/api/account-plan',         accountPlanRoutes);
 app.use('/api/centros-costo',        centrosCostoRoutes);
 app.use('/api/collection-requests',  collectionRequestRoutes);
+// Rutas ERP del módulo de bancos: CxC, cobros Kore, CYC, formas de pago.
+// Comparte prefijo /api/erp con visorErpRoutes (abajo); no hay colisión de paths.
+// Express evalúa este router primero y hace fall-through al siguiente si no hay match.
 app.use('/api/erp',                  bankErpRoutes);
 app.use('/api/users',                userRoutes);
-app.use('/api/polizas',             polizaRoutes);
-app.use('/api/cfdi-mapping',        cfdiMappingRoutes);
+app.use('/api/polizas',              polizaRoutes);
+app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
 
 // Visor module
-app.use('/api/auth',             authRoutes);
-app.use('/api/cfdis',            cfdiRoutes);
-app.use('/api/comparisons',      comparisonRoutes);
-app.use('/api/discrepancies',    discrepancyRoutes);
-app.use('/api/reports',          reportRoutes);
-app.use('/api/sat',              satRoutes);
-app.use('/api/entities',         entityRoutes);
-app.use('/api/drive',            driveRoutes);
+app.use('/api/auth',              authRoutes);
+app.use('/api/cfdis',             cfdiRoutes);
+app.use('/api/comparisons',       comparisonRoutes);
+app.use('/api/discrepancies',     discrepancyRoutes);
+app.use('/api/reports',           reportRoutes);
+app.use('/api/sat',               satRoutes);
+app.use('/api/entities',          entityRoutes);
+app.use('/api/drive',             driveRoutes);
 app.use('/api/periodos-fiscales', periodosFiscalesRoutes);
-app.use('/api/erp',              visorErpRoutes);
-app.use('/api/schedule',         scheduleRoutes);
+// Rutas ERP del módulo visor: carga/previsualización de facturas y enriquecimiento de pagos.
+app.use('/api/erp',               visorErpRoutes);
+app.use('/api/schedule',          scheduleRoutes);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => {

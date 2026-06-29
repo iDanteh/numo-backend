@@ -30,13 +30,17 @@ const { ROLES, PERMISSIONS } = require('../../shared/config/rbac');
 const PERM_META = {
   'banks:read':         { label: 'Ver movimientos bancarios',       module: 'Bancos' },
   'banks:import':       { label: 'Importar movimientos',            module: 'Bancos' },
-  'banks:update':       { label: 'Editar movimientos',              module: 'Bancos' },
-  'banks:config':       { label: 'Configurar bancos',               module: 'Bancos' },
+  'banks:update':        { label: 'Actualizar movimientos (status, ERP, auxiliar)', module: 'Bancos' },
+  'banks:movement:edit': { label: 'Editar datos del movimiento',    module: 'Bancos' },
+  'banks:config':        { label: 'Configurar bancos',              module: 'Bancos' },
   'banks:rules':        { label: 'Reglas de clasificación',         module: 'Bancos' },
   'banks:ficha':        { label: 'Registrar/eliminar fichas',       module: 'Bancos' },
   'banks:admin':        { label: 'Operaciones admin de bancos',     module: 'Bancos' },
   'banks:export':       { label: 'Exportar movimientos a Excel',    module: 'Bancos' },
   'banks:export:all':   { label: 'Exportar movimientos de cualquier usuario', module: 'Bancos' },
+  'banks:erp:link':     { label: 'Vincular CxC del ERP directamente',        module: 'Bancos' },
+  'banks:cobro':        { label: 'Aplicar cobro bancario',                   module: 'Bancos' },
+  'banks:erp:unlink':   { label: 'Desvincular CxC del ERP',                 module: 'Bancos' },
   'account-plan:read':  { label: 'Ver catálogo contable',           module: 'Contabilidad' },
   'account-plan:write': { label: 'Editar catálogo contable',        module: 'Contabilidad' },
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },
@@ -67,22 +71,39 @@ async function seedRbac() {
     module: PERM_META[key]?.module ?? 'General',
   }));
   const permsBefore = await Permission.count();
-  await Permission.bulkCreate(perms, { ignoreDuplicates: true });
+  // updateOnDuplicate: actualiza label y module si ya existe el key.
+  // Esto corrige permisos que fueron sembrados antes de tener entrada en PERM_META
+  // y quedaron con module='General' o label=key (fallback).
+  await Permission.bulkCreate(perms, { updateOnDuplicate: ['label', 'module'] });
   const permsAfter = await Permission.count();
   const nuevosPerms = permsAfter - permsBefore;
   if (nuevosPerms > 0) {
     console.log(`[seed] ${nuevosPerms} permiso(s) nuevo(s) registrado(s) (total: ${permsAfter}).`);
   } else {
-    console.log(`[seed] Catálogo de permisos: ${permsAfter} permisos (sin cambios).`);
+    console.log(`[seed] Catálogo de permisos: ${permsAfter} permisos (sin cambios, labels/módulos sincronizados).`);
   }
 
-  // ── Roles del sistema: upsert desde rbac.js ───────────────────────────────
-  // Los roles del sistema siempre se sincronizan con el código fuente (rbac.js).
-  // Los roles personalizados creados por el admin en la UI no se tocan.
+  // ── Roles del sistema: crear si no existen, nunca sobreescribir permisos ─────
+  // En el primer arranque se crean con los permisos de rbac.js.
+  // En reinicios posteriores solo se sincroniza el label e isSystem, preservando
+  // cualquier cambio manual hecho a los permisos desde la UI.
+  let createdRoles = 0;
   for (const [value, { label, permissions }] of Object.entries(ROLES)) {
-    await Role.upsert({ value, label, permissions, isSystem: true });
+    const [, created] = await Role.findOrCreate({
+      where:    { value },
+      defaults: { label, permissions, isSystem: true },
+    });
+    if (!created) {
+      // Sincronizar solo label e isSystem — nunca tocar permissions
+      await Role.update({ label, isSystem: true }, { where: { value } });
+    } else {
+      createdRoles++;
+    }
   }
-  console.log(`[seed] ${Object.keys(ROLES).length} rol(es) del sistema sincronizados.`);
+  if (createdRoles > 0) {
+    console.log(`[seed] ${createdRoles} rol(es) del sistema creados.`);
+  }
+  console.log(`[seed] ${Object.keys(ROLES).length} rol(es) del sistema verificados (permisos preservados).`);
 }
 
 async function seedUser({ email, nombre, role }) {

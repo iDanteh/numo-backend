@@ -56,17 +56,23 @@ const bankMovementSchema = new mongoose.Schema({
     type: [{
       erpId:          { type: String, required: true },
       saldoActual:    { type: Number, default: 0 },
+      saldoPagado:    { type: Number, default: null },
       folioFiscal:    { type: String, default: null },
       total:          { type: Number, default: null },
       serie:          { type: String, default: null },
       folioExterno:   { type: String, default: null },
       tieneRetencion: { type: Boolean, default: false },
+      tipoPago:       { type: String, default: null },
     }],
     default: [],
   },
 
   // Suma de saldoActual de todos los erpLinks; null cuando no hay vínculos
   saldoErp: { type: Number, default: null },
+
+  // Timestamp que indica cuándo fue procesado por el job Sync Saldo ERP.
+  // null = pendiente (se incluye en un "reanudar"); Date = ya procesado (se salta en reanudar).
+  saldoErpSyncedAt: { type: Date, default: null },
 
   // Nombre del cliente identificado mediante el catálogo auxiliar
   auxNombre: { type: String, default: null, index: true },

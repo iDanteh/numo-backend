@@ -404,6 +404,58 @@ router.get('/cobros/conceptos', authenticate, asyncHandler(async (req, res) => {
   res.json(conceptos);
 }));
 
+// GET /api/erp/cobros/cuentas?ids=<id1>,<id2>
+// Consulta el detalle de una o varias CxC en Kore, incluyendo políticas de descuento
+// (pronto pago). Devuelve Descuentos[] y SaldoActualCalculado por cuenta.
+router.get('/cobros/cuentas', authenticate, asyncHandler(async (req, res) => {
+  const koreToken = getKoreToken(req, res);
+  if (!koreToken) return;
+
+  const { ids } = req.query;
+  if (!ids) {
+    return res.status(400).json({ error: 'Se requiere el parámetro ids.' });
+  }
+
+  let r;
+  try {
+    r = await axios.get(`${KORE_CAJA_BASE_URL}/cuentas`, {
+      params:  { ids },
+      headers: { Authorization: `Bearer ${koreToken}` },
+      timeout: 10000,
+    });
+  } catch (axiosErr) {
+    if (axiosErr.response) {
+      const body = axiosErr.response.data ?? {};
+      const msg  = body.Mensaje || body.message || body.error
+        || `Error al consultar cuentas (${axiosErr.response.status})`;
+      console.warn(`[cobros/cuentas] Kore rechazó con ${axiosErr.response.status}:`, body);
+      return res.status(axiosErr.response.status).json({ error: msg });
+    }
+    throw axiosErr;
+  }
+
+  const cuentas = (r.data?.Data?.cuentas ?? []).map(c => ({
+    id:                   c.Id,
+    serie:                c.Serie            ?? null,
+    folio:                c.Folio            ?? null,
+    tipoPago:             c.TipoPago         ?? null,
+    total:                c.Total,
+    saldoActual:          c.SaldoActual,
+    saldoActualCalculado: c.SaldoActualCalculado ?? c.SaldoActual,
+    descuentos: (c.Descuentos ?? []).map(d => ({
+      idPolitica:     d.IDPolitica,
+      dias:           d.Dias,
+      porcentaje:     d.Porcentaje,
+      monto:          d.Monto,
+      iniciado:       d.Iniciado      ?? false,
+      diasTolerancia: d.DiasTolerancia ?? 0,
+    })),
+  }));
+
+  console.log(`[cobros/cuentas] ids=${ids} → ${cuentas.length} cuentas, ${cuentas.filter(c => c.descuentos.length > 0).length} con descuento`);
+  res.json(cuentas);
+}));
+
 // POST /api/erp/cobros/operacion/:sesionId — aplica cobro a una CxC en el sistema de caja
 router.post('/cobros/operacion/:sesionId', authenticate, asyncHandler(async (req, res) => {
   const koreToken = getKoreToken(req, res);

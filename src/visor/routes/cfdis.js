@@ -9,6 +9,7 @@ const {
   upload, importExcel, importFromErpApi,
   create, compare, remove, exportExcel,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
+  repairXmlSubtotals,
 } = require('../controllers/cfdi.controller');
 
 const router = express.Router();
@@ -56,6 +57,7 @@ router.get('/reclasificacion-global/plan',    authenticate, permit('admin', 'con
 router.post('/reclasificacion-global/aplicar', authenticate, permit('admin', 'contador'), aplicarReclasificacionGlobal);
 
 router.post('/migrar-periodo-bulk',        authenticate, permit('admin', 'contador'), migrarPeriodoBulk);
+router.post('/repair-xml',                 authenticate, permit('admin', 'contador'), repairXmlSubtotals);
 router.post('/upload',                     authenticate, permit('visor:write'), handleXmlUpload, upload);
 router.post('/import-excel',               authenticate, permit('visor:write'), excelUpload.single('excelFile'), importExcel);
 router.post('/import-erp-api',             authenticate, permit('visor:write'), importFromErpApi);

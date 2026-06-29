@@ -24,6 +24,47 @@ const { upsertFromERP } = require('../repositories/cfdi.repository');
 
 const CRON_HORA = config.sat.cronHora;
 
+/**
+ * Re-parsea el xmlContent de CFDIs que tienen XML guardado pero subTotal = 0.
+ * Se llama en background después de cada sync para recuperar datos sobrescritos por metadata.
+ */
+const repararSubtotalesDesdeXml = async ({ source, ejercicio, periodo } = {}) => {
+  const filter = { isActive: true, xmlHash: { $exists: true, $ne: null }, subTotal: 0 };
+  if (source)    filter.source    = source.toUpperCase();
+  if (ejercicio) filter.ejercicio = parseInt(ejercicio);
+  if (periodo)   filter.periodo   = parseInt(periodo);
+
+  const cfdis = await CFDI.find(filter).select('+xmlContent').lean();
+  if (cfdis.length === 0) return;
+
+  let reparados = 0;
+  for (const cfdi of cfdis) {
+    if (!cfdi.xmlContent) continue;
+    try {
+      const parsed = await parseCFDI(cfdi.xmlContent);
+      if (parsed.subTotal === 0) continue;
+      await CFDI.updateOne(
+        { _id: cfdi._id },
+        {
+          $set: {
+            subTotal:        parsed.subTotal,
+            descuento:       parsed.descuento,
+            total:           parsed.total,
+            moneda:          parsed.moneda,
+            tipoCambio:      parsed.tipoCambio,
+            conceptos:       parsed.conceptos,
+            impuestos:       parsed.impuestos,
+            complementoPago: parsed.complementoPago,
+            origenDescarga:  'xml',
+          },
+        },
+      );
+      reparados++;
+    } catch (_) { /* ignorar errores individuales */ }
+  }
+  if (reparados > 0) logger.info(`[SatSyncJob] repararSubtotalesDesdeXml: ${reparados}/${cfdis.length} CFDIs reparados.`);
+};
+
 // ── Helper: derivar fechas de inicio/fin de un periodo ────────────────────────
 const derivarFechasERP = (ejercicio, periodo) => {
   const mes       = String(periodo).padStart(2, '0');
@@ -1029,7 +1070,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
               if (registrosMeta.length > 0) {
                 await CFDI.bulkWrite(registrosMeta.map(row => ({
                   updateOne: {
-                    filter: { uuid: row.uuid.toUpperCase(), source: 'SAT' },
+                    filter: { uuid: row.uuid.toUpperCase(), source: 'SAT', origenDescarga: { $ne: 'xml' } },
                     update: {
                       $set: {
                         uuid:                 row.uuid.toUpperCase(),
@@ -1203,10 +1244,11 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                   }, 'uuid').lean();
                   const erpUuids = new Set(erpMetaDocs.map(c => c.uuid.toUpperCase()));
 
-                  // Guardar en MongoDB
+                  // Guardar en MongoDB — solo actualizar si NO ya existe como XML
+                  // (evita sobrescribir subTotal/origenDescarga de CFDIs descargados como XML en sesiones previas)
                   await CFDI.bulkWrite(soloMetaRows.map(row => ({
                     updateOne: {
-                      filter: { uuid: row.uuid.toUpperCase(), source: 'SAT' },
+                      filter: { uuid: row.uuid.toUpperCase(), source: 'SAT', origenDescarga: { $ne: 'xml' } },
                       update: {
                         $set: {
                           uuid:                 row.uuid.toUpperCase(),
@@ -1354,6 +1396,11 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
       totalReportadoSAT: resultado.totalReportadoSAT,
       incompleta:        resultado.incompleta,
     });
+
+    // Reparar en background CFDIs que tengan XML guardado pero subTotal=0
+    setImmediate(() => repararSubtotalesDesdeXml({ source: 'SAT', ejercicio, periodo })
+      .catch(err => logger.warn(`[SatSyncJob] repararSubtotalesDesdeXml falló: ${err.message}`))
+    );
 
     return resultado;
 

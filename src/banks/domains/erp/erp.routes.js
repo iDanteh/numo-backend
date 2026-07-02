@@ -3,6 +3,7 @@
 const express = require('express');
 const multer  = require('multer');
 const axios   = require('axios');
+const ExcelJS = require('exceljs');
 const { authenticate, permit }           = require('../../shared/middleware/auth.real');
 const { asyncHandler }                   = require('../../shared/middleware/error-handler');
 const { sincronizarCuentasPendientes }   = require('./erp-sync.service');
@@ -710,18 +711,32 @@ let saldoSyncRunning      = false;
 let saldoSyncCurrentJobId = null;   // jobId del job activo (null si inactivo)
 const saldoSyncControl    = { paused: false, stopped: false, pauseResolve: null };
 const SALDO_SYNC_JOBS      = new Map(); // jobId → { status, auth0Sub, result?, error? }
-const SALDO_SYNC_JOB_TTL   = 15 * 60 * 1000;
-const SALDO_SYNC_DELAY_MS  = 500;        // pausa entre requests a Kore
-const SALDO_SYNC_BACKOFF   = 25_000;     // fallback si Kore no indica cuánto esperar
-const SALDO_SYNC_MAX_RETRIES = 4;        // intentos por link antes de contar como error
+const SALDO_SYNC_JOB_TTL   = 2 * 60 * 60 * 1000; // el resultado (y el detalle para el reporte) vive en memoria este tiempo tras terminar
+const SALDO_SYNC_DELAY_MS    = 500;        // pausa entre requests a Kore
+const SALDO_SYNC_BACKOFF     = 25_000;     // fallback si Kore no indica cuánto esperar
+const SALDO_SYNC_MAX_RETRIES = 4;          // intentos por link antes de contar como error
+const SALDO_SYNC_FECHA_INICIO = new Date('2026-05-06T00:00:00.000Z');
+const SALDO_SYNC_FECHA_FIN    = new Date('2026-06-30T23:59:00.000Z');
 
 const _sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function _montoTransferenciaDeMovimientos(movimientos) {
-  return (movimientos ?? [])
-    .flatMap(m => m.formasPago ?? [])
-    .filter(fp => fp.nombreFormaPago?.toUpperCase() === 'TRANSFERENCIA')
-    .reduce((sum, fp) => sum + (fp.monto ?? 0), 0);
+// True si algún erpLink con este erpId fue identificado por una persona (no erp-auto).
+function _erpIdIdentificadoPorHumano(identificadoPor, erpId) {
+  return (identificadoPor ?? []).some(
+    e => e.erpId === erpId && e.userId && e.userId !== 'erp-auto',
+  );
+}
+
+// Monto realmente cobrado por el banco para una cuenta ya saldada: suma el 'total'
+// (nunca formasPago[].monto, que puede ser un depósito compartido entre varias CxC)
+// de cada movimiento con formaPago. Si la cuenta no está saldada, no hay abono que
+// tomar como definitivo — sin fallback a "abono más cercano".
+function _montoSaldoLink(raw0) {
+  if (!raw0 || raw0.saldoActual !== 0) return 0;
+  const conPago = (raw0.movimientos ?? []).filter(
+    m => Array.isArray(m.formasPago) && m.formasPago.length > 0,
+  );
+  return conPago.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
 }
 
 // Kore folios encode YYMMxxxxx (e.g. "260600250" → year=2026, month=06).
@@ -776,19 +791,27 @@ async function _checkSyncControl() {
 }
 
 // Siempre salta movimientos ya marcados — cada ejecución continúa desde el checkpoint.
-async function _syncSaldoJob(auth0Sub, jobId) {
+// fechaInicio/fechaFin son ajustables por corrida (ver POST /sync-saldo-transferencia);
+// caen en SALDO_SYNC_FECHA_INICIO/FIN por defecto si el admin no las cambia.
+async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
   saldoSyncCurrentJobId = jobId;
   try {
-    // null captura tanto el valor explícito null como documentos que aún no tienen el campo
-    const filter = { 'erpIds.0': { $exists: true }, saldoErpSyncedAt: null };
+    // null captura tanto el valor explícito null como documentos que aún no tienen el campo.
+    const filter = {
+      'erpIds.0':       { $exists: true },
+      saldoErpSyncedAt: null,
+      fecha:            { $gte: fechaInicio, $lte: fechaFin },
+      identificadoPor:  { $elemMatch: { userId: { $nin: ['erp-auto', null] } } },
+    };
 
     const movements = await BankMovement.find(filter)
-      .select('_id erpLinks')
+      .select('_id folio banco concepto deposito fecha saldoErp erpLinks identificadoPor')
       .lean();
 
     let procesados = 0, actualizados = 0, sinTransferencia = 0, errores = 0;
     const total    = movements.length;
     let stopped    = false;
+    const detalles = []; // una entrada por movimiento — insumo del reporte Excel
 
     emitToUser(auth0Sub, 'bank:erp:saldo:progress',
       { jobId, procesados, total, actualizados, sinTransferencia, errores, pct: 0 });
@@ -797,10 +820,13 @@ async function _syncSaldoJob(auth0Sub, jobId) {
       if (!await _checkSyncControl()) { stopped = true; break; }
 
       const links = mov.erpLinks ?? [];
-      let montoTotal = 0;
+      let montoTotal  = 0;
+      let huboErrorMov = false;
+      const linksDetalle = [];
 
       for (const link of links) {
         if (!link.serie || !link.folioExterno) continue;
+        if (!_erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId)) continue;
         const rango = _rangoDesdeFollo(link.folioExterno);
         if (!rango) continue;
         try {
@@ -810,20 +836,50 @@ async function _syncSaldoJob(auth0Sub, jobId) {
             fechaDesde:   rango.fechaDesde,
             fechaHasta:   rango.fechaHasta,
           });
-          if (raw[0]) {
-            montoTotal += _montoTransferenciaDeMovimientos(raw[0].movimientos);
-          }
+          const aporte = _montoSaldoLink(raw[0]);
+          montoTotal += aporte;
+          linksDetalle.push({
+            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+            saldoActual: raw[0]?.saldoActual ?? null, montoAportado: aporte,
+          });
           await _sleep(SALDO_SYNC_DELAY_MS);
         } catch (err) {
           errores++;
+          huboErrorMov = true;
+          linksDetalle.push({
+            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+            error: err.message || 'Error al consultar Kore',
+          });
         }
       }
 
-      // Construir update: siempre marcar checkpoint; solo sobreescribir saldoErp si hubo monto
-      const update = { saldoErpSyncedAt: new Date() };
-      if (montoTotal > 0) { update.saldoErp = montoTotal; actualizados++; }
-      else if (links.length > 0) sinTransferencia++;
+      // Construir update: siempre marcar checkpoint; solo sobreescribir saldoErp si hubo monto.
+      // Si se actualiza, se registra en _changelog (de/a + runId) para el reporte y para poder revertir.
+      const saldoErpAntes = mov.saldoErp ?? null;
+      const update = { $set: { saldoErpSyncedAt: new Date() } };
+      let estado;
+      if (montoTotal > 0) {
+        update.$set.saldoErp = montoTotal;
+        update.$push = {
+          _changelog: {
+            at: new Date(), via: 'erp-saldo-sync', campo: 'saldoErp',
+            de: saldoErpAntes, a: montoTotal, runId: jobId, revertedAt: null,
+          },
+        };
+        actualizados++;
+        estado = 'actualizado';
+      } else {
+        if (links.length > 0) sinTransferencia++;
+        estado = huboErrorMov ? 'error' : 'sinTransferencia';
+      }
       await BankMovement.findByIdAndUpdate(mov._id, update);
+
+      detalles.push({
+        movementId: mov._id, folio: mov.folio, banco: mov.banco, concepto: mov.concepto,
+        fecha: mov.fecha, deposito: mov.deposito,
+        saldoErpAntes, saldoErpDespues: montoTotal > 0 ? montoTotal : saldoErpAntes,
+        estado, links: linksDetalle,
+      });
 
       procesados++;
       emitToUser(auth0Sub, 'bank:erp:saldo:progress', {
@@ -834,11 +890,11 @@ async function _syncSaldoJob(auth0Sub, jobId) {
 
     if (stopped) {
       const result = { procesados, total, actualizados, sinTransferencia, errores };
-      SALDO_SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result });
+      SALDO_SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles });
       emitToUser(auth0Sub, 'bank:erp:saldo:stopped', { jobId, ...result });
     } else {
       const result = { total, actualizados, sinTransferencia, errores };
-      SALDO_SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result });
+      SALDO_SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles });
       emitToUser(auth0Sub, 'bank:erp:saldo:done', { jobId, ...result });
     }
   } catch (err) {
@@ -852,9 +908,33 @@ async function _syncSaldoJob(auth0Sub, jobId) {
   }
 }
 
+// GET los límites de fecha por defecto — el frontend los usa para precargar el formulario
+// antes de dejar que el admin los ajuste manualmente.
+router.get('/sync-saldo-transferencia/defaults', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  res.json({
+    fechaDesde: SALDO_SYNC_FECHA_INICIO.toISOString(),
+    fechaHasta: SALDO_SYNC_FECHA_FIN.toISOString(),
+  });
+}));
+
 router.post('/sync-saldo-transferencia', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
   if (saldoSyncRunning) {
     return res.status(409).json({ error: 'Ya hay un proceso de sincronización en curso.' });
+  }
+
+  // Rango de fechas ajustable por corrida — cae en los defaults si no se manda nada.
+  let fechaInicio = SALDO_SYNC_FECHA_INICIO;
+  let fechaFin    = SALDO_SYNC_FECHA_FIN;
+  if (req.body.fechaDesde) {
+    fechaInicio = new Date(req.body.fechaDesde);
+    if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
+  }
+  if (req.body.fechaHasta) {
+    fechaFin = new Date(req.body.fechaHasta);
+    if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
+  }
+  if (fechaInicio > fechaFin) {
+    return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
   }
 
   // Resetear control antes de cada job nuevo
@@ -869,7 +949,7 @@ router.post('/sync-saldo-transferencia', authenticate, permit('banks:admin'), as
   SALDO_SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
   res.status(202).json({ jobId });
 
-  _syncSaldoJob(auth0Sub, jobId); // sin await — corre en background
+  _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
 }));
 
 router.post('/sync-saldo-transferencia/pause', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
@@ -912,6 +992,238 @@ router.post('/sync-saldo-transferencia/stop', authenticate, permit('banks:admin'
     saldoSyncControl.pauseResolve = null;
   }
   res.json({ ok: true });
+}));
+
+// GET polling de estado — permite recuperar el job tras un reload de página (fallback del socket).
+// Sin chequeo de dueño: el job es global (un solo Sync Saldo ERP corre a la vez para todo el
+// sistema, igual que pause/resume/stop), así que cualquier admin puede consultarlo.
+router.get('/sync-saldo-transferencia/:jobId/status', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const job = SALDO_SYNC_JOBS.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job no encontrado o expirado' });
+  const { auth0Sub: _auth0Sub, detalles: _detalles, ...jobResponse } = job;
+  res.json(jobResponse);
+}));
+
+// GET historial de corridas recientes (mientras sigan vivas en memoria, ver SALDO_SYNC_JOB_TTL).
+// Permite recuperar el reporte/revertir una corrida anterior, no solo la última.
+router.get('/sync-saldo-transferencia/jobs', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const jobs = [...SALDO_SYNC_JOBS.entries()]
+    .map(([jobId, job]) => ({
+      jobId,
+      status:    job.status,
+      result:    job.result ?? null,
+      error:     job.error  ?? null,
+      hasReport: Array.isArray(job.detalles) && job.detalles.length > 0,
+    }))
+    .sort((a, b) => (a.jobId < b.jobId ? 1 : -1)); // más reciente primero (jobId = saldo-sync-<timestamp>)
+  res.json(jobs);
+}));
+
+// ── Reporte Excel del job Sync Saldo ERP ──────────────────────────────────────
+// 3 hojas: Actualizados (antes/después) · Sin transferencia · Errores.
+function _generarExcelSaldoErp(detalles) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Sync Saldo ERP';
+  wb.created = new Date();
+
+  const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
+  const HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+  const OK_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
+  const WARN_FILL   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF9C3' } };
+  const ERR_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEE2E2' } };
+
+  function formatFecha(d) {
+    if (!d) return '';
+    const dt = d instanceof Date ? d : new Date(d);
+    if (isNaN(dt.getTime())) return '';
+    return dt.toLocaleDateString('es-MX', { day: '2-digit', month: '2-digit', year: 'numeric' });
+  }
+
+  function styleHeader(ws) {
+    ws.getRow(1).eachCell(cell => {
+      cell.fill = HEADER_FILL;
+      cell.font = HEADER_FONT;
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+    });
+    ws.getRow(1).height = 20;
+  }
+
+  const foliosCxc = d => d.links.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', ');
+
+  // ── Hoja 1: Actualizados ──────────────────────────────────────────────────
+  const wsAct = wb.addWorksheet('Actualizados');
+  wsAct.columns = [
+    { header: 'Movimiento (folio)', key: 'folio',    width: 14 },
+    { header: 'Banco',              key: 'banco',    width: 14 },
+    { header: 'Fecha',              key: 'fecha',    width: 12 },
+    { header: 'Depósito',           key: 'deposito', width: 14 },
+    { header: 'Saldo ERP antes',    key: 'antes',    width: 16 },
+    { header: 'Saldo ERP después',  key: 'despues',  width: 16 },
+    { header: 'Diferencia',         key: 'diff',     width: 14 },
+    { header: 'CxC vinculadas',     key: 'cxc',      width: 30 },
+    { header: 'Movimiento ID',      key: 'id',       width: 28 },
+  ];
+  styleHeader(wsAct);
+  for (const d of detalles.filter(d => d.estado === 'actualizado')) {
+    const antes = d.saldoErpAntes ?? 0;
+    const row = wsAct.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
+      deposito: d.deposito, antes: d.saldoErpAntes, despues: d.saldoErpDespues,
+      diff: (d.saldoErpDespues ?? 0) - antes, cxc: foliosCxc(d), id: String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = OK_FILL; });
+  }
+  ['deposito', 'antes', 'despues', 'diff'].forEach(k => { wsAct.getColumn(k).numFmt = '#,##0.00'; });
+  if (wsAct.lastColumn) wsAct.autoFilter = { from: 'A1', to: wsAct.lastColumn.letter + '1' };
+
+  // ── Hoja 2: Sin transferencia ─────────────────────────────────────────────
+  const wsSin = wb.addWorksheet('Sin transferencia');
+  wsSin.columns = [
+    { header: 'Movimiento (folio)', key: 'folio',    width: 14 },
+    { header: 'Banco',              key: 'banco',    width: 14 },
+    { header: 'Fecha',              key: 'fecha',    width: 12 },
+    { header: 'Depósito',           key: 'deposito', width: 14 },
+    { header: 'Saldo ERP',          key: 'saldo',    width: 16 },
+    { header: 'CxC vinculadas',     key: 'cxc',      width: 30 },
+    { header: 'Movimiento ID',      key: 'id',       width: 28 },
+  ];
+  styleHeader(wsSin);
+  for (const d of detalles.filter(d => d.estado === 'sinTransferencia')) {
+    const row = wsSin.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
+      deposito: d.deposito, saldo: d.saldoErpAntes, cxc: foliosCxc(d), id: String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = WARN_FILL; });
+  }
+  ['deposito', 'saldo'].forEach(k => { wsSin.getColumn(k).numFmt = '#,##0.00'; });
+
+  // ── Hoja 3: Errores ───────────────────────────────────────────────────────
+  const wsErr = wb.addWorksheet('Errores');
+  wsErr.columns = [
+    { header: 'Movimiento (folio)', key: 'folio',   width: 14 },
+    { header: 'Banco',              key: 'banco',   width: 14 },
+    { header: 'Fecha',              key: 'fecha',   width: 12 },
+    { header: 'CxC con error',      key: 'cxc',     width: 30 },
+    { header: 'Detalle del error',  key: 'detalle', width: 50 },
+    { header: 'Movimiento ID',      key: 'id',      width: 28 },
+  ];
+  styleHeader(wsErr);
+  for (const d of detalles.filter(d => d.estado === 'error')) {
+    const conError = d.links.filter(l => l.error);
+    const row = wsErr.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
+      cxc:     conError.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', '),
+      detalle: conError.map(l => l.error).join(' | '),
+      id:      String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = ERR_FILL; });
+  }
+
+  return wb.xlsx.writeBuffer();
+}
+
+// GET reporte de una corrida — disponible solo mientras el job siga en memoria (SALDO_SYNC_JOB_TTL).
+router.get('/sync-saldo-transferencia/:jobId/report', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const job = SALDO_SYNC_JOBS.get(req.params.jobId);
+  if (!job || !job.detalles) {
+    return res.status(404).json({ error: 'El reporte ya no está disponible (expiró o el jobId no existe).' });
+  }
+
+  const buffer = await _generarExcelSaldoErp(job.detalles);
+  const fecha  = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="sync-saldo-erp-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
+// POST revierte todos los saldoErp actualizados por una corrida (runId = jobId).
+// Restaura el valor 'de' guardado en _changelog y limpia saldoErpSyncedAt para que
+// el próximo sync vuelva a tomar el movimiento. No revierte movimientos que ya fueron
+// tocados por una corrida MÁS RECIENTE (se detecta comparando 'at' dentro de _changelog),
+// para no pisar trabajo de sincronización posterior. Las entradas de _changelog nunca
+// se borran — se marcan con revertedAt, preservando el rastro de auditoría.
+router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const runId = req.params.jobId;
+
+  const result = await BankMovement.updateMany(
+    { _changelog: { $elemMatch: { via: 'erp-saldo-sync', runId, revertedAt: null } } },
+    [
+      {
+        $set: {
+          _entradaRevert: {
+            $first: {
+              $filter: {
+                input: '$_changelog', as: 'c',
+                cond: {
+                  $and: [
+                    { $eq: ['$$c.via', 'erp-saldo-sync'] },
+                    { $eq: ['$$c.runId', runId] },
+                    { $eq: ['$$c.revertedAt', null] },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        $set: {
+          _esLaMasReciente: {
+            $eq: [
+              {
+                $size: {
+                  $filter: {
+                    input: '$_changelog', as: 'c',
+                    cond: {
+                      $and: [
+                        { $eq: ['$$c.via', 'erp-saldo-sync'] },
+                        { $gt: ['$$c.at', '$_entradaRevert.at'] },
+                      ],
+                    },
+                  },
+                },
+              },
+              0,
+            ],
+          },
+        },
+      },
+      {
+        $set: {
+          saldoErp:         { $cond: ['$_esLaMasReciente', '$_entradaRevert.de', '$saldoErp'] },
+          saldoErpSyncedAt: { $cond: ['$_esLaMasReciente', null, '$saldoErpSyncedAt'] },
+          _changelog: {
+            $map: {
+              input: '$_changelog', as: 'c',
+              in: {
+                $cond: [
+                  {
+                    $and: [
+                      '$_esLaMasReciente',
+                      { $eq: ['$$c.via', 'erp-saldo-sync'] },
+                      { $eq: ['$$c.runId', runId] },
+                      { $eq: ['$$c.revertedAt', null] },
+                    ],
+                  },
+                  { $mergeObjects: ['$$c', { revertedAt: '$$NOW' }] },
+                  '$$c',
+                ],
+              },
+            },
+          },
+        },
+      },
+      { $unset: ['_entradaRevert', '_esLaMasReciente'] },
+    ],
+  );
+
+  const omitidos = result.matchedCount - result.modifiedCount;
+  res.json({
+    ok:                            true,
+    matched:                       result.matchedCount,
+    revertidos:                    result.modifiedCount,
+    omitidosPorCorridaMasReciente: omitidos > 0 ? omitidos : 0,
+  });
 }));
 
 module.exports = router;

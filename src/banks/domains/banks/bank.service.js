@@ -1356,11 +1356,16 @@ function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
     ? links.reduce((sum, l) => {
-        // saldoPagado: monto acumulado de transferencias para este link (PPD parcial).
-        // Si está presente y > 0, se usa directamente. Si null (dato legacy o sin cobro
-        // registrado), cae al comportamiento anterior: saldoActual > 0 o total.
+        // saldoPagado: monto acumulado cobrado por transferencia/depósito en efectivo para
+        // este link (ver cobro-panel _buildCobroSaldosErp). Si el cobro-panel ya lo calculó
+        // explícitamente (no es null, aunque sea 0 — ej. se cobró todo en efectivo de caja),
+        // ES la fuente de verdad y NO se cae a saldoActual/total: si cayera, un pago hecho
+        // por una forma no bancaria terminaría contando como si el banco lo hubiera cubierto.
+        // Solo cuando saldoPagado nunca se ha determinado (null — CxC vinculada sin pasar por
+        // el cobro-panel, ej. ya estaba pagada en Kore por otro canal) cae al comportamiento
+        // legado: saldoActual > 0 o total.
         let ref;
-        if (l.saldoPagado != null && l.saldoPagado > 0) {
+        if (l.saldoPagado != null) {
           ref = l.saldoPagado;
         } else {
           ref = (l.saldoActual != null && l.saldoActual > 0)

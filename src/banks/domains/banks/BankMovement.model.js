@@ -120,6 +120,8 @@ const bankMovementSchema = new mongoose.Schema({
       de:         { type: mongoose.Schema.Types.Mixed, default: null },
       a:          { type: mongoose.Schema.Types.Mixed, default: null },
       importFile: { type: String, default: null },
+      runId:      { type: String, default: null },   // ID de la corrida bulk que generó este cambio (permite revert selectivo)
+      revertedAt: { type: Date,   default: null },    // se marca al revertir, la entrada nunca se borra (rastro de auditoría)
     }],
     default: [],
   },

@@ -281,7 +281,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
   // reduce datos transferidos desde MongoDB a Node.js.
   const stageProyeccion = {
     $project: {
-      erpId: 1, total: 1, folioFiscal: 1, serie: 1, folioExterno: 1,
+      erpId: 1, total: 1, folioFiscal: 1, serie: 1, folioExterno: 1, tipoPago: 1,
       fechaRealPago: 1, fechaAfectacion: 1,
       movimientos: {
         $filter: {
@@ -376,6 +376,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
         serie:          cxc.serie          ?? null,
         folioExterno:   cxc.folioExterno   ?? null,
         tieneRetencion: cxc.tieneRetencion ?? false,
+        tipoPago:       cxc.tipoPago ? String(cxc.tipoPago).trim().toUpperCase() : null,
       });
       newIds.push(cxc.erpId);
     }

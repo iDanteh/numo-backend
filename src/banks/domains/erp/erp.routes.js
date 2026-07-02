@@ -822,9 +822,15 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
       const links = mov.erpLinks ?? [];
       let montoTotal  = 0;
       let huboErrorMov = false;
+      let huboTipoPagoNuevo = false;
       const linksDetalle = [];
+      // Copia editable de erpLinks — el sync ya re-consulta cada CxC en Kore para el
+      // cálculo de saldoErp, así que se aprovecha esa misma respuesta para completar
+      // `tipoPago` en links antiguos que se vincularon antes de que se capturara ese dato.
+      const linksActualizados = links.map(l => ({ ...l }));
 
-      for (const link of links) {
+      for (let i = 0; i < links.length; i++) {
+        const link = links[i];
         if (!link.serie || !link.folioExterno) continue;
         if (!_erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId)) continue;
         const rango = _rangoDesdeFollo(link.folioExterno);
@@ -838,6 +844,13 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
           });
           const aporte = _montoSaldoLink(raw[0]);
           montoTotal += aporte;
+          if (raw[0]?.tipoPago) {
+            const tipoPagoNorm = String(raw[0].tipoPago).trim().toUpperCase();
+            if (tipoPagoNorm !== (link.tipoPago ?? null)) {
+              linksActualizados[i].tipoPago = tipoPagoNorm;
+              huboTipoPagoNuevo = true;
+            }
+          }
           linksDetalle.push({
             erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
             saldoActual: raw[0]?.saldoActual ?? null, montoAportado: aporte,
@@ -853,10 +866,12 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
         }
       }
 
-      // Construir update: siempre marcar checkpoint; solo sobreescribir saldoErp si hubo monto.
-      // Si se actualiza, se registra en _changelog (de/a + runId) para el reporte y para poder revertir.
+      // Construir update: siempre marcar checkpoint; solo sobreescribir saldoErp si hubo monto;
+      // solo sobreescribir erpLinks si se completó algún tipoPago faltante (backfill).
+      // Si se actualiza saldoErp, se registra en _changelog (de/a + runId) para el reporte y para poder revertir.
       const saldoErpAntes = mov.saldoErp ?? null;
       const update = { $set: { saldoErpSyncedAt: new Date() } };
+      if (huboTipoPagoNuevo) update.$set.erpLinks = linksActualizados;
       let estado;
       if (montoTotal > 0) {
         update.$set.saldoErp = montoTotal;

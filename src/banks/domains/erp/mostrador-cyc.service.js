@@ -232,7 +232,7 @@ async function procesarMostradorCyc(buffer, usuarioId, usuarioNombre) {
         {
           erpId: 1, serie: 1, folio: 1,
           serieExterna: 1, folioExterno: 1, folioFiscal: 1,
-          saldoActual: 1, total: 1,
+          saldoActual: 1, total: 1, tipoPago: 1,
         },
       ).lean()
     : [];
@@ -511,6 +511,7 @@ async function procesarMostradorCyc(buffer, usuarioId, usuarioNombre) {
       serie:          cxc.serie        ?? null,
       folioExterno:   cxc.folioExterno ?? null,
       tieneRetencion: false,
+      tipoPago:       cxc.tipoPago ? String(cxc.tipoPago).trim().toUpperCase() : null,
     }));
     const newIds = cxcsResueltas.map(c => c.erpId);
 

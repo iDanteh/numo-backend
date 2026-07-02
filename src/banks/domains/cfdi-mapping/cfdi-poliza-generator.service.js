@@ -8,7 +8,8 @@ const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
 const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99 } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
-const { BadRequestError }  = require('../../shared/errors/AppError');
+const { BadRequestError }          = require('../../shared/errors/AppError');
+const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
 
 /**
  * Enriquece en memoria el campo `tasaIvaInferida` de CFDIs tipo P Metadata
@@ -120,6 +121,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const cfdis = await CFDI.find(filtroBase)
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
     .lean();
+
+  await repararSubtotalDesdeXml(cfdis);
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
 
@@ -496,6 +499,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const cfdis = await CFDI.find(filtroBase)
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida')
     .lean();
+
+  await repararSubtotalDesdeXml(cfdis);
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
 

@@ -12,6 +12,7 @@ const { paginate, skip } = require('../utils/pagination');
 const { generarPlan, aplicarReclasificacion } = require('../services/reclasificacionGlobal.service');
 const Comparison = require('../models/Comparison');
 const { logger } = require('../../shared/utils/logger');
+const { repararSubtotalDesdeXml } = require('../services/cfdiSubtotalRepair');
 
 const MONTO_EFECTIVO_EXPR = {
   $round: [{
@@ -238,6 +239,8 @@ const list = asyncHandler(async (req, res) => {
     ]),
   ]);
 
+  await repararSubtotalDesdeXml(cfdis);
+
   const totales = { suma: 0, sumaSubTotal: 0, sumaTotal: 0, porTipo: {} };
   for (const t of totalesAgg) {
     totales.suma       += t.suma       || 0;
@@ -258,6 +261,7 @@ const list = asyncHandler(async (req, res) => {
 const getById = asyncHandler(async (req, res) => {
   const cfdi = await CFDI.findById(req.params.id, { xmlContent: 0 }).lean();
   if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado' });
+  await repararSubtotalDesdeXml([cfdi]);
   res.json(cfdi);
 });
 
@@ -1432,7 +1436,62 @@ const migrarPeriodo = asyncHandler(async (req, res) => {
   });
 });
 
+/**
+ * POST /api/cfdis/repair-xml
+ * Re-parsea el xmlContent de CFDIs que tienen XML guardado pero subTotal = 0.
+ * Acepta filtros opcionales: source, ejercicio, periodo.
+ */
+const repairXmlSubtotals = asyncHandler(async (req, res) => {
+  const { source, ejercicio, periodo } = req.body ?? {};
+
+  const filter = {
+    isActive:  true,
+    xmlHash:   { $exists: true, $ne: null },
+    subTotal:  0,
+  };
+  if (source)    filter.source    = source.toUpperCase();
+  if (ejercicio) filter.ejercicio = parseInt(ejercicio);
+  if (periodo)   filter.periodo   = parseInt(periodo);
+
+  const cfdis = await CFDI.find(filter).select('+xmlContent').lean();
+  if (cfdis.length === 0) return res.json({ reparados: 0, errores: [] });
+
+  let reparados = 0;
+  const errores = [];
+
+  for (const cfdi of cfdis) {
+    if (!cfdi.xmlContent) { errores.push({ id: cfdi._id, uuid: cfdi.uuid, error: 'xmlContent vacío' }); continue; }
+    try {
+      const parsed = await parseCFDI(cfdi.xmlContent);
+      if (parsed.subTotal === 0) continue; // el XML realmente tiene 0, no hay nada que reparar
+      await CFDI.updateOne(
+        { _id: cfdi._id },
+        {
+          $set: {
+            subTotal:        parsed.subTotal,
+            descuento:       parsed.descuento,
+            total:           parsed.total,
+            moneda:          parsed.moneda,
+            tipoCambio:      parsed.tipoCambio,
+            conceptos:       parsed.conceptos,
+            impuestos:       parsed.impuestos,
+            complementoPago: parsed.complementoPago,
+            origenDescarga:  'xml',
+          },
+        },
+      );
+      reparados++;
+    } catch (err) {
+      errores.push({ id: cfdi._id, uuid: cfdi.uuid, error: err.message });
+    }
+  }
+
+  logger.info(`[repairXmlSubtotals] Reparados: ${reparados}/${cfdis.length}, errores: ${errores.length}`);
+  res.json({ revisados: cfdis.length, reparados, errores });
+});
+
 module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
+  repairXmlSubtotals,
 };

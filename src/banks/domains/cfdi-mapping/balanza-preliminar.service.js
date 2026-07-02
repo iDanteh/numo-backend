@@ -5,7 +5,8 @@ const ErpCuentaPendiente  = require('../erp/ErpCuentaPendiente.model');
 const { AccountPlan, CfdiMappingRule, Poliza, PolizaMovimiento } = require('../../../shared/models/postgres');
 const { Op }              = require('sequelize');
 const mappingSvc          = require('./cfdi-mapping.service');
-const { BadRequestError } = require('../../shared/errors/AppError');
+const { BadRequestError }          = require('../../shared/errors/AppError');
+const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
 
 // ── Helpers de enriquecimiento en memoria para tasaIvaInferida ────────────────
 
@@ -403,6 +404,8 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       .maxTimeMS(60_000)
       .lean();
 
+    await repararSubtotalDesdeXml(cfdis);
+
     totalCfdis += cfdis.length;
 
     const cfdisParaBalanza = await _enrichAndFilterCfdis(cfdis, tipo, {
@@ -447,8 +450,8 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       };
     }
 
-    byAccount[key].debe     += Number(m.debe)  || 0;
-    byAccount[key].haber    += Number(m.haber) || 0;
+    byAccount[key].debe     = Math.round((byAccount[key].debe  + (Number(m.debe)  || 0)) * 100) / 100;
+    byAccount[key].haber    = Math.round((byAccount[key].haber + (Number(m.haber) || 0)) * 100) / 100;
     byAccount[key].movCount += 1;
   }
 
@@ -523,10 +526,10 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
         saldoInicialMap[padre.codigo] = 0;
       }
 
-      byAccount[padre.codigo].debe     += dR;
-      byAccount[padre.codigo].haber    += hR;
+      byAccount[padre.codigo].debe     = Math.round((byAccount[padre.codigo].debe  + dR) * 100) / 100;
+      byAccount[padre.codigo].haber    = Math.round((byAccount[padre.codigo].haber + hR) * 100) / 100;
       byAccount[padre.codigo].movCount += acc.movCount;
-      saldoInicialMap[padre.codigo]    += sR;
+      saldoInicialMap[padre.codigo]    = Math.round((saldoInicialMap[padre.codigo] + sR) * 100) / 100;
 
       parentId = padre.parentId;
     }
@@ -555,11 +558,18 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
   // doble conteo: cada cuenta agrupadora ya incluye el saldo de sus hijos.
   const hoja = cuentas.filter(c => !c.esAgrupadora);
   const totales = {
-    debe:         Math.round(hoja.reduce((s, c) => s + c.debe,         0) * 100) / 100,
-    haber:        Math.round(hoja.reduce((s, c) => s + c.haber,        0) * 100) / 100,
-    saldoInicial: Math.round(hoja.reduce((s, c) => s + c.saldoInicial, 0) * 100) / 100,
-    saldoFinal:   Math.round(hoja.reduce((s, c) => s + c.saldo,        0) * 100) / 100,
+    debe:         hoja.reduce((s, c) => Math.round((s + c.debe)         * 100) / 100, 0),
+    haber:        hoja.reduce((s, c) => Math.round((s + c.haber)        * 100) / 100, 0),
+    saldoInicial: hoja.reduce((s, c) => Math.round((s + c.saldoInicial) * 100) / 100, 0),
+    saldoFinal:   hoja.reduce((s, c) => Math.round((s + c.saldo)        * 100) / 100, 0),
   };
+  // Normalizar diferencia de redondeo: en partida doble las sumas DEBEN ser iguales;
+  // una diferencia ≤ 0.01 es artefacto de redondeo por cuenta, no un descuadre real.
+  if (Math.abs(totales.debe - totales.haber) <= 0.01) {
+    const max = Math.max(totales.debe, totales.haber);
+    totales.debe  = max;
+    totales.haber = max;
+  }
 
   return {
     cuentas,

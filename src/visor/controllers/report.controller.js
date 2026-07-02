@@ -72,6 +72,7 @@ const dashboard = asyncHandler(async (req, res) => {
   if (ejercicio)         periodoFilter.ejercicio         = parseInt(ejercicio);
   if (periodo)           periodoFilter.periodo           = parseInt(periodo);
   if (tipoDeComprobante) periodoFilter.tipoDeComprobante = tipoDeComprobante;
+  else                   periodoFilter.tipoDeComprobante = { $ne: 'N' }; // nómina no suma en "todos los tipos"
 
   // Filtro base para KPIs de conciliación (solo ERP activos, sin cancelados ni deshabilitados)
   // Debe coincidir con los mismos criterios que countERP del aggregate de montos.
@@ -1752,6 +1753,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 const pagosBanco = asyncHandler(async (req, res) => {
   const {
     uuid, serie, folio, banco,
+    numAutorizacion, idNumo,
     fechaInicio, fechaFin,
     ejercicio, periodo,
     estado = 'todos',
@@ -1794,8 +1796,6 @@ const pagosBanco = asyncHandler(async (req, res) => {
   if (estado === 'con_pago') estadoMatch['movimientos.0'] = { $exists: true };
   if (estado === 'sin_pago') estadoMatch.movimientos = { $size: 0 };
 
-  const bancoMatch = banco ? { 'movimientos.banco': { $regex: banco.trim(), $options: 'i' } } : null;
-
   const pipeline = [
     { $match: baseMatch },
     { $unwind: '$complementoPago.pagos' },
@@ -1810,12 +1810,28 @@ const pagosBanco = asyncHandler(async (req, res) => {
         as:           'movimientos',
       },
     },
-    // filtrar inactivos y proyectar solo los campos necesarios
+    // Filtrar inactivos + filtrar por banco si se especificó (antes de tomar [0])
     {
       $addFields: {
         movimientos: {
           $map: {
-            input: { $filter: { input: '$movimientos', as: 'm', cond: { $eq: ['$$m.isActive', true] } } },
+            input: {
+              $filter: {
+                input: '$movimientos',
+                as: 'm',
+                cond: {
+                  $and: [
+                    { $eq: ['$$m.isActive', true] },
+                    ...(banco ? [{ $regexMatch: { input: { $ifNull: ['$$m.banco', ''] }, regex: banco.trim(), options: 'i' } }] : []),
+                    ...(numAutorizacion ? [{ $or: [
+                      { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.numeroAutorizacion' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+                      { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.referenciaNumerica' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+                    ]}] : []),
+                    ...(idNumo ? [{ $regexMatch: { input: { $ifNull: [{ $toString: '$$m.folio' }, ''] }, regex: idNumo.trim(), options: 'i' } }] : []),
+                  ],
+                },
+              },
+            },
             as: 'm',
             in: {
               banco:        '$$m.banco',
@@ -1824,12 +1840,35 @@ const pagosBanco = asyncHandler(async (req, res) => {
               folio:        '$$m.folio',
               concepto:     '$$m.concepto',
               numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+              // Saldo que queda en el ERP para esta factura según el erpLink del movimiento
+              saldoMovimiento: {
+                $let: {
+                  vars: {
+                    link: {
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$$m.erpLinks', []] },
+                          as: 'l',
+                          cond: {
+                            $eq: [
+                              { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                              { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                            ],
+                          },
+                        },
+                      }, 0],
+                    },
+                  },
+                  in: '$$link.saldoActual',
+                },
+              },
             },
           },
         },
       },
     },
-    ...(bancoMatch ? [{ $match: bancoMatch }] : []),
+    // Si filtramos por banco/autorización/idNumo, solo conservar documentos con al menos un movimiento válido
+    ...((banco || numAutorizacion || idNumo) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
     {
       $facet: {
         data: [
@@ -1849,8 +1888,9 @@ const pagosBanco = asyncHandler(async (req, res) => {
               serie:           '$complementoPago.pagos.doctosRelacionados.serie',
               folio:           '$complementoPago.pagos.doctosRelacionados.folio',
               numParcialidad:  '$complementoPago.pagos.doctosRelacionados.numParcialidad',
-              impPagado:       '$complementoPago.pagos.doctosRelacionados.impPagado',
-              impSaldoInsoluto:'$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+              impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
+              impSaldoAnt: '$complementoPago.pagos.doctosRelacionados.impSaldoAnt',
+              impSaldoInsoluto: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
               tienePago:       { $gt: [{ $size: '$movimientos' }, 0] },
               banco:           { $arrayElemAt: ['$movimientos.banco',        0] },
               movFecha:        { $arrayElemAt: ['$movimientos.fecha',        0] },
@@ -1864,6 +1904,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] },
                 ]}, 2],
               },
+              saldoMovimiento: { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
             },
           },
         ],
@@ -1901,7 +1942,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
  * Descarga Excel con los mismos filtros que pagosBanco (sin paginación).
  */
 const pagosBancoExport = asyncHandler(async (req, res) => {
-  const { uuid, serie, folio, banco, fechaInicio, fechaFin, ejercicio, periodo, estado = 'todos' } = req.query;
+  const { uuid, serie, folio, banco, numAutorizacion, idNumo, fechaInicio, fechaFin, ejercicio, periodo, estado = 'todos' } = req.query;
 
   const baseMatch = {
     tipoDeComprobante: 'P',
@@ -1941,8 +1982,61 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { $unwind: '$complementoPago.pagos.doctosRelacionados' },
     ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
     { $lookup: { from: 'bank_movements', localField: 'complementoPago.pagos.doctosRelacionados.idDocumento', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
-    { $addFields: { movimientos: { $map: { input: { $filter: { input: '$movimientos', as: 'm', cond: { $eq: ['$$m.isActive', true] } } }, as: 'm', in: { banco: '$$m.banco', fecha: '$$m.fecha', deposito: '$$m.deposito', folio: '$$m.folio', numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] } } } } } },
-    ...(banco ? [{ $match: { 'movimientos.banco': { $regex: banco.trim(), $options: 'i' } } }] : []),
+    {
+      $addFields: {
+        movimientos: {
+          $map: {
+            input: {
+              $filter: {
+                input: '$movimientos',
+                as: 'm',
+                cond: {
+                  $and: [
+                    { $eq: ['$$m.isActive', true] },
+                    ...(banco ? [{ $regexMatch: { input: { $ifNull: ['$$m.banco', ''] }, regex: banco.trim(), options: 'i' } }] : []),
+                    ...(numAutorizacion ? [{ $or: [
+                      { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.numeroAutorizacion' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+                      { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.referenciaNumerica' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+                    ]}] : []),
+                    ...(idNumo ? [{ $regexMatch: { input: { $ifNull: [{ $toString: '$$m.folio' }, ''] }, regex: idNumo.trim(), options: 'i' } }] : []),
+                  ],
+                },
+              },
+            },
+            as: 'm',
+            in: {
+              banco: '$$m.banco',
+              fecha: '$$m.fecha',
+              deposito: '$$m.deposito',
+              folio: '$$m.folio',
+              numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+              saldoMovimiento: {
+                $let: {
+                  vars: {
+                    link: {
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$$m.erpLinks', []] },
+                          as: 'l',
+                          cond: {
+                            $eq: [
+                              { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                              { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                            ],
+                          },
+                        },
+                      }, 0],
+                    },
+                  },
+                  in: '$$link.saldoActual',
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    ...((banco || numAutorizacion || idNumo) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
     ...(Object.keys(estadoMatch).length ? [{ $match: estadoMatch }] : []),
     { $sort: { 'complementoPago.pagos.fechaPago': -1 } },
     { $limit: 50000 },
@@ -1956,6 +2050,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       folio:            '$complementoPago.pagos.doctosRelacionados.folio',
       numParcialidad:   '$complementoPago.pagos.doctosRelacionados.numParcialidad',
       impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
+      impSaldoAnt: '$complementoPago.pagos.doctosRelacionados.impSaldoAnt',
       impSaldoInsoluto: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
       tienePago:        { $gt: [{ $size: '$movimientos' }, 0] },
       banco:            { $arrayElemAt: ['$movimientos.banco',        0] },
@@ -1964,6 +2059,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       deposito:         { $arrayElemAt: ['$movimientos.deposito',     0] },
       numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
       diferencia:       { $round: [{ $subtract: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] }, 2] },
+      saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
     }},
   ];
 
@@ -1981,14 +2077,16 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { header: 'Folio',              key: 'folio',             width: 12 },
     { header: 'Parcialidad',        key: 'numParcialidad',    width: 12 },
     { header: 'Imp. Pagado',        key: 'impPagado',         width: 16 },
+    { header: 'Saldo Anterior',     key: 'impSaldoAnt',  width: 16 },
     { header: 'Saldo Insoluto',     key: 'impSaldoInsoluto',  width: 16 },
     { header: 'Tiene Pago',         key: 'tienePago',         width: 12 },
     { header: 'Banco',              key: 'banco',             width: 20 },
     { header: 'Fecha Movimiento',   key: 'movFecha',          width: 16 },
-    { header: 'Folio Movimiento',   key: 'movFolio',          width: 16 },
+    { header: 'ID NUMO',             key: 'movFolio',          width: 16 },
     { header: 'Depósito',           key: 'deposito',          width: 16 },
     { header: 'Núm. Autorización',  key: 'numOperacion',      width: 22 },
     { header: 'Diferencia',         key: 'diferencia',        width: 16 },
+    { header: 'Saldo Movimiento',   key: 'saldoMovimiento',   width: 18 },
   ];
 
   // Estilo encabezado
@@ -2013,6 +2111,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       folio:            r.folio || '',
       numParcialidad:   r.numParcialidad,
       impPagado:        r.impPagado,
+      impSaldoAnt: r.impSaldoAnt ?? null,
       impSaldoInsoluto: r.impSaldoInsoluto,
       tienePago:        r.tienePago ? 'Sí' : 'No',
       banco:            r.banco || '—',
@@ -2021,13 +2120,16 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       deposito:         r.deposito ?? null,
       numOperacion:     r.numOperacion || '—',
       diferencia:       r.diferencia,
+      saldoMovimiento:  r.saldoMovimiento ?? null,
     });
 
     // Formato moneda y fecha
     row.getCell('impPagado').numFmt        = mxn.numFmt;
+    row.getCell('impSaldoAnt').numFmt = mxn.numFmt;
     row.getCell('impSaldoInsoluto').numFmt = mxn.numFmt;
     row.getCell('deposito').numFmt         = mxn.numFmt;
     row.getCell('diferencia').numFmt       = mxn.numFmt;
+    row.getCell('saldoMovimiento').numFmt  = mxn.numFmt;
     row.getCell('fechaPago').numFmt        = fecha.numFmt;
     row.getCell('movFecha').numFmt         = fecha.numFmt;
 
@@ -2053,21 +2155,23 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
 
   // Fila de totales
   const totalRow = sheet.addRow({
-    cfdiUuid:    'TOTALES',
-    impPagado:   rows.reduce((s, r) => s + (r.impPagado || 0), 0),
-    deposito:    rows.reduce((s, r) => s + (r.deposito  || 0), 0),
-    diferencia:  rows.reduce((s, r) => s + (r.diferencia || 0), 0),
+    cfdiUuid:        'TOTALES',
+    impPagado:       rows.reduce((s, r) => s + (r.impPagado || 0), 0),
+    deposito:        rows.reduce((s, r) => s + (r.deposito  || 0), 0),
+    diferencia:      rows.reduce((s, r) => s + (r.diferencia || 0), 0),
+    saldoMovimiento: rows.reduce((s, r) => s + (r.saldoMovimiento || 0), 0),
   });
   totalRow.eachCell(cell => {
     cell.font   = { bold: true };
     cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
     cell.border = { top: { style: 'medium' } };
   });
-  totalRow.getCell('impPagado').numFmt  = mxn.numFmt;
-  totalRow.getCell('deposito').numFmt   = mxn.numFmt;
-  totalRow.getCell('diferencia').numFmt = mxn.numFmt;
+  totalRow.getCell('impPagado').numFmt       = mxn.numFmt;
+  totalRow.getCell('deposito').numFmt        = mxn.numFmt;
+  totalRow.getCell('diferencia').numFmt      = mxn.numFmt;
+  totalRow.getCell('saldoMovimiento').numFmt = mxn.numFmt;
 
-  sheet.autoFilter = { from: 'A1', to: 'P1' };
+  sheet.autoFilter = { from: 'A1', to: 'Q1' };
 
   const label = estado !== 'todos' ? `_${estado}` : '';
   const per   = periodo ? `_${periodo}` : '';
@@ -2089,15 +2193,45 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
 
   const uuid = facturaUuid.trim().toUpperCase();
 
-  const [factura, movimientos] = await Promise.all([
+  const [factura, movimientos, parcialidades] = await Promise.all([
     CFDI.findOne({ uuid }).select('uuid satStatus serie folio total fecha emisor receptor').lean(),
     CFDI.db.collection('bank_movements').find(
       { isActive: true, 'erpLinks.folioFiscal': uuid },
-      { projection: { banco: 1, fecha: 1, deposito: 1, retiro: 1, folio: 1, concepto: 1, status: 1, numeroAutorizacion: 1, referenciaNumerica: 1 } },
+      { projection: { banco: 1, fecha: 1, deposito: 1, retiro: 1, folio: 1, concepto: 1, status: 1, numeroAutorizacion: 1, referenciaNumerica: 1, erpLinks: 1 } },
     ).toArray(),
+    // Todos los CFDI-P que referencian esta factura, ordenados por parcialidad
+    CFDI.aggregate([
+      {
+        $match: {
+          tipoDeComprobante: 'P',
+          isActive: true,
+          'complementoPago.pagos.doctosRelacionados.idDocumento': { $regex: uuid, $options: 'i' },
+        },
+      },
+      { $unwind: '$complementoPago.pagos' },
+      { $unwind: '$complementoPago.pagos.doctosRelacionados' },
+      {
+        $match: {
+          $expr: { $eq: [{ $toUpper: '$complementoPago.pagos.doctosRelacionados.idDocumento' }, uuid] },
+        },
+      },
+      {
+        $project: {
+          _id:              0,
+          serie:            '$serie',
+          folio:            '$folio',
+          fecha:            '$complementoPago.pagos.fechaPago',
+          numParcialidad:   '$complementoPago.pagos.doctosRelacionados.numParcialidad',
+          impSaldoAnt: '$complementoPago.pagos.doctosRelacionados.impSaldoAnt',
+          impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
+          impSaldoInsoluto: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+        },
+      },
+      { $sort: { numParcialidad: 1, fecha: 1 } },
+    ]),
   ]);
 
-  res.json({ factura: factura || null, movimientos });
+  res.json({ factura: factura || null, movimientos, parcialidades });
 });
 
 /**
@@ -2110,4 +2244,45 @@ const pagosBancosDistintos = asyncHandler(async (req, res) => {
   res.json(bancos.filter(Boolean).sort());
 });
 
-module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos };
+/**
+ * GET /api/reports/pagos-banco/contexto-banco?banco=BBVA&fecha=2026-05-10&folio=000123&limit=10
+ * Devuelve los últimos N movimientos del banco dado hasta la fecha indicada,
+ * en orden cronológico, marcando con esFoco:true la fila cuyo folio coincide.
+ */
+const pagosBancoContextoBanco = asyncHandler(async (req, res) => {
+  const { banco, fecha, folio, limit = '10' } = req.query;
+  if (!banco || !fecha) return res.status(400).json({ error: 'banco y fecha son requeridos' });
+
+  const lm      = Math.min(Math.max(parseInt(limit) || 10, 1), 50);
+  const fechaLte = new Date(fecha);
+  // Incluir movimientos del mismo día aunque sean posteriores en hora (hasta fin del día)
+  fechaLte.setUTCHours(23, 59, 59, 999);
+
+  // Traer lm+1 para detectar si hay más anteriores fuera de la ventana
+  const docs = await CFDI.db.collection('bank_movements')
+    .find(
+      { banco, isActive: true, fecha: { $lte: fechaLte } },
+      { projection: { folio: 1, fecha: 1, concepto: 1, deposito: 1, retiro: 1, saldo: 1, status: 1 } },
+    )
+    .sort({ fecha: -1, _id: -1 })
+    .limit(lm + 1)
+    .toArray();
+
+  const hayMasAnteriores = docs.length > lm;
+  const slice = docs.slice(0, lm).reverse(); // cronológico ascendente
+
+  const movimientos = slice.map(m => ({
+    folio:    m.folio   ?? null,
+    fecha:    m.fecha,
+    concepto: m.concepto ?? null,
+    deposito: m.deposito ?? null,
+    retiro:   m.retiro   ?? null,
+    saldo:    m.saldo    ?? null,
+    status:   m.status,
+    esFoco:   folio ? m.folio === folio : false,
+  }));
+
+  res.json({ movimientos, hayMasAnteriores });
+});
+
+module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco };

@@ -15,8 +15,12 @@ const OPERADORES_VALIDOS = [
   'mayor_que', 'menor_que', 'mayor_igual', 'menor_igual',
 ];
 const OPERADORES_NUMERICOS = ['mayor_que', 'menor_que', 'mayor_igual', 'menor_igual'];
-const ACCIONES_VALIDAS       = ['categorizar', 'bloquear_identificacion', 'ocultar', 'cambiar_estado'];
+const ACCIONES_VALIDAS       = ['categorizar', 'bloquear_identificacion', 'cambiar_estado'];
 const ESTADOS_DESTINO_VALIDOS = ['no_identificado', 'otros', 'reclasificado'];
+// Roles a los que se les puede ocultar una categoría (campo extra de 'categorizar').
+// Cerrado a propósito: son los únicos roles con acceso a movimientos bancarios además
+// de admin (que siempre ve todo vía banks:admin) — Tienda no tiene banks:read.
+const OCULTAR_ROLES_VALIDOS = ['contabilidad', 'cobranza'];
 
 // ── Validación ────────────────────────────────────────────────────────────────
 
@@ -60,6 +64,12 @@ function validarRegla(data) {
     }
   } else if (data.estadoDestino && !ESTADOS_DESTINO_VALIDOS.includes(data.estadoDestino)) {
     throw new BadRequestError(`estadoDestino debe ser: ${ESTADOS_DESTINO_VALIDOS.join(', ')}`);
+  }
+  // ocultarRoles es un campo extra de 'categorizar' (igual que "también cambiar estado")
+  if (data.ocultarRoles !== undefined && data.ocultarRoles !== null && data.ocultarRoles.length > 0) {
+    if (!Array.isArray(data.ocultarRoles) || data.ocultarRoles.some(r => !OCULTAR_ROLES_VALIDOS.includes(r))) {
+      throw new BadRequestError(`ocultarRoles debe ser un subconjunto de: ${OCULTAR_ROLES_VALIDOS.join(', ')}`);
+    }
   }
 }
 
@@ -107,6 +117,14 @@ function matchRegla(mov, regla) {
   return condiciones.every(c => matchCondicion(mov, c));
 }
 
+/** Compara dos arreglos de roles sin importar el orden. */
+function sameRoleSet(a, b) {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((v, i) => v === sortedB[i]);
+}
+
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
 /**
@@ -144,8 +162,9 @@ async function updateRule(id, data) {
   const existing = await bankRuleRepo.findById(ruleId);
   if (!existing) throw new NotFoundError('Regla');
 
-  const oldNombre      = existing.nombre;
-  const oldEstado      = existing.estadoDestino ?? null;
+  const oldNombre        = existing.nombre;
+  const oldEstado        = existing.estadoDestino ?? null;
+  const oldOcultarRoles  = existing.ocultarRoles  ?? [];
   const { accion, banco } = existing;
 
   const rule = await bankRuleRepo.update(ruleId, data);
@@ -156,6 +175,7 @@ async function updateRule(id, data) {
   if (accion === 'categorizar') {
     const newNombre = String(data.nombre).trim();
     const newEstado = data.estadoDestino !== undefined ? (data.estadoDestino || null) : oldEstado;
+    const newOcultarRoles = data.ocultarRoles !== undefined ? (data.ocultarRoles || []) : oldOcultarRoles;
 
     // Si cambió el nombre, reasignar categoria en movimientos que tenían el nombre anterior
     if (oldNombre !== newNombre) {
@@ -179,16 +199,28 @@ async function updateRule(id, data) {
           { $set: { status: newEstado ?? 'no_identificado' } },
         );
       } else if (newEstado) {
-        // La regla ahora cambia estado: aplicar a movimientos ya categorizados
+        // La regla ahora cambia estado: aplicar a movimientos ya categorizados.
+        // 'identificado' es el único status protegido de cambios de status por reglas;
+        // 'reclasificado' (Por conciliar) sí debe recibir el cambio de estado.
         await BankMovement.updateMany(
           {
             banco,
             categoria: newNombre,
-            status: { $nin: ['identificado', 'reclasificado'] },
+            status: { $ne: 'identificado' },
           },
           { $set: { status: newEstado } },
         );
       }
+    }
+
+    // Si cambiaron los roles a los que se oculta, propagar a los movimientos ya
+    // categorizados por esta regla (sin excluir ningún status: ocultar es visibilidad,
+    // no afecta el status protegido de 'identificado').
+    if (!sameRoleSet(oldOcultarRoles, newOcultarRoles)) {
+      await BankMovement.updateMany(
+        { banco, categoria: newNombre },
+        { $set: { ocultoRoles: newOcultarRoles } },
+      );
     }
   }
 
@@ -203,28 +235,32 @@ async function deleteRule(id) {
 
   let movRevertidos = 0;
 
-  // Solo las reglas de categorización dejan huella rastreable en categoria
+  // Solo las reglas de categorización dejan huella rastreable en categoria.
+  // La categoría huérfana se limpia en TODOS los movimientos que la tengan, sin importar
+  // su status — una regla eliminada no debe seguir apareciendo en movimientos ni en el
+  // filtro del reporte de Excel (que se alimenta de los valores distintos de `categoria`
+  // en Mongo, ver listCategories()). El único campo protegido para 'identificado' es el
+  // `status` (nunca se le cambia por una regla), no la etiqueta de `categoria`.
   if (rule.accion === 'categorizar') {
-    const baseFilter = {
-      banco:     rule.banco,
-      categoria: rule.nombre,
-      status:    { $nin: ['identificado', 'reclasificado'] },
-    };
+    const baseFilter = { banco: rule.banco, categoria: rule.nombre };
 
     if (rule.estadoDestino) {
-      // Movimientos donde la regla también cambió el status → revertir ambos
+      // Movimientos donde la regla también había cambiado el status → revertir ambos.
+      // estadoDestino nunca puede ser 'identificado' (ver ESTADOS_DESTINO_VALIDOS),
+      // así que este revert de status jamás toca un movimiento identificado.
       const r1 = await BankMovement.updateMany(
         { ...baseFilter, status: rule.estadoDestino },
-        { $set: { categoria: null, status: 'no_identificado' } },
+        { $set: { categoria: null, status: 'no_identificado', ocultoRoles: [] } },
       );
-      // Movimientos donde la regla solo categorizó (status diferente al que pone la regla)
+      // Resto de movimientos con esta categoría (incluye 'identificado' y 'reclasificado'):
+      // solo se limpia la categoría huérfana (y el ocultamiento por rol), sin tocar su status.
       const r2 = await BankMovement.updateMany(
-        { ...baseFilter, status: { $nin: ['identificado', 'reclasificado', rule.estadoDestino] } },
-        { $set: { categoria: null } },
+        { ...baseFilter, status: { $ne: rule.estadoDestino } },
+        { $set: { categoria: null, ocultoRoles: [] } },
       );
       movRevertidos = (r1.modifiedCount ?? 0) + (r2.modifiedCount ?? 0);
     } else {
-      const r = await BankMovement.updateMany(baseFilter, { $set: { categoria: null } });
+      const r = await BankMovement.updateMany(baseFilter, { $set: { categoria: null, ocultoRoles: [] } });
       movRevertidos = r.modifiedCount ?? 0;
     }
   }
@@ -241,13 +277,13 @@ async function reorderRules(ids) {
 // ── Aplicar reglas a movimientos ──────────────────────────────────────────────
 
 /**
- * Recorre todos los movimientos de un banco y aplica reglas de tipo
- * 'categorizar' y 'ocultar'. Las reglas de bloqueo aplican al identificar.
+ * Recorre todos los movimientos de un banco y aplica reglas de tipo 'categorizar'
+ * (incluye su campo extra de ocultar-por-rol) y 'cambiar_estado'. Las reglas de
+ * bloqueo aplican al identificar.
  */
 async function applyRules(banco, soloSinCategoria = false) {
-  const [catRules, ocultarRules, cambiarEstadoRules] = await Promise.all([
+  const [catRules, cambiarEstadoRules] = await Promise.all([
     bankRuleRepo.listByBanco(banco, { accion: 'categorizar' }),
-    bankRuleRepo.listByBanco(banco, { accion: 'ocultar' }),
     bankRuleRepo.listByBanco(banco, { accion: 'cambiar_estado' }),
   ]);
 
@@ -271,27 +307,30 @@ async function applyRules(banco, soloSinCategoria = false) {
 
       // Categorizar: primera regla que aplica gana.
       // Reglas de prioridad de status:
-      //   'reclasificado' → categoría manual, conservar; reglas de estado no aplican
+      //   'reclasificado' → categoría manual, se conserva (no se re-evalúan condiciones),
+      //                     pero si la regla vigente con ese nombre trae cambio de estado,
+      //                     ese cambio SÍ aplica — 'reclasificado' no está protegido de
+      //                     cambios de status, solo 'identificado' lo está.
       //   'identificado'  → movimiento confirmado; la categoría puede actualizarse pero el
       //                     status NUNCA se toca (protege datos que dependen de este estado)
-      let matchedCat      = null;
-      let matchedCatEstado = null; // estadoDestino de la catRule ganadora (si lo tiene)
+      let matchedCat         = null;
+      let matchedCatEstado   = null; // estadoDestino de la catRule ganadora (si lo tiene)
+      let matchedOcultaRoles = [];   // ocultarRoles de la catRule ganadora (si lo tiene)
       if (mov.status === 'reclasificado') {
         matchedCat = mov.categoria ?? null;
+        const catRuleVigente = matchedCat ? catRules.find(r => r.nombre === matchedCat) : null;
+        matchedCatEstado   = catRuleVigente ? (catRuleVigente.estadoDestino ?? null) : null;
+        matchedOcultaRoles = catRuleVigente?.ocultarRoles?.length ? catRuleVigente.ocultarRoles : [];
       } else {
         for (const rule of catRules) {
           if (matchRegla(mov, rule)) {
             matchedCat       = rule.nombre;
             // estadoDestino solo aplica si el movimiento no está identificado
-            matchedCatEstado = !isIdentificado ? (rule.estadoDestino ?? null) : null;
+            matchedCatEstado   = !isIdentificado ? (rule.estadoDestino ?? null) : null;
+            matchedOcultaRoles = rule.ocultarRoles?.length ? rule.ocultarRoles : [];
             break;
           }
         }
-      }
-      // Ocultar: basta con que una regla aplique
-      let shouldOcultar = false;
-      for (const rule of ocultarRules) {
-        if (matchRegla(mov, rule)) { shouldOcultar = true; break; }
       }
       // Cambiar estado: primero el estadoDestino de la catRule ganadora (si tiene),
       // luego las reglas cambiar_estado independientes.
@@ -303,18 +342,18 @@ async function applyRules(banco, soloSinCategoria = false) {
         }
       }
 
-      const newCat      = matchedCat ?? null;
-      const oldCat      = mov.categoria ?? null;
-      const oldOculto   = mov.oculto    ?? false;
-      const catChanged    = newCat !== oldCat;
-      const ocultoChanged = shouldOcultar !== oldOculto;
-      const statusChanged = matchedEstado !== null && matchedEstado !== mov.status;
+      const newCat         = matchedCat ?? null;
+      const oldCat         = mov.categoria    ?? null;
+      const oldOcultaRoles = mov.ocultoRoles  ?? [];
+      const catChanged         = newCat !== oldCat;
+      const ocultaRolesChanged = !sameRoleSet(matchedOcultaRoles, oldOcultaRoles);
+      const statusChanged      = matchedEstado !== null && matchedEstado !== mov.status;
 
-      if (catChanged || ocultoChanged || statusChanged) {
+      if (catChanged || ocultaRolesChanged || statusChanged) {
         const $set = {};
-        if (catChanged)    $set.categoria = newCat;
-        if (ocultoChanged) $set.oculto    = shouldOcultar;
-        if (statusChanged) $set.status    = matchedEstado;
+        if (catChanged)         $set.categoria   = newCat;
+        if (ocultaRolesChanged) $set.ocultoRoles = matchedOcultaRoles;
+        if (statusChanged)      $set.status      = matchedEstado;
         ops.push({
           updateOne: {
             filter: { _id: mov._id },

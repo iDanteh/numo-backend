@@ -712,7 +712,7 @@ let saldoSyncCurrentJobId = null;   // jobId del job activo (null si inactivo)
 const saldoSyncControl    = { paused: false, stopped: false, pauseResolve: null };
 const SALDO_SYNC_JOBS      = new Map(); // jobId → { status, auth0Sub, result?, error? }
 const SALDO_SYNC_JOB_TTL   = 2 * 60 * 60 * 1000; // el resultado (y el detalle para el reporte) vive en memoria este tiempo tras terminar
-const SALDO_SYNC_DELAY_MS    = 500;        // pausa entre requests a Kore
+const SALDO_SYNC_DELAY_MS    = 1000;       // pausa entre requests a Kore (subida de 500ms — Kore devolvía 429 con la anterior)
 const SALDO_SYNC_BACKOFF     = 25_000;     // fallback si Kore no indica cuánto esperar
 const SALDO_SYNC_MAX_RETRIES = 4;          // intentos por link antes de contar como error
 const SALDO_SYNC_FECHA_INICIO = new Date('2026-05-06T00:00:00.000Z');
@@ -737,6 +737,24 @@ function _montoSaldoLink(raw0) {
     m => Array.isArray(m.formasPago) && m.formasPago.length > 0,
   );
   return conPago.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
+}
+
+// Snapshot mínimo de movimientos Kore para rastreo/conciliación manual — se guarda en
+// erpLinks[].movimientosKore. Se descarta el primero (el cargo original que crea la CxC,
+// no un abono/ajuste) y solo se conservan los campos indispensables, nunca formasPago.
+function _movimientosKoreDesde(raw0) {
+  return (raw0?.movimientos ?? []).slice(1).map(m => ({
+    serie:         m.serie         ?? null,
+    folio:         m.folio         ?? null,
+    serieOrigen:   m.serieOrigen   ?? null,
+    folioOrigen:   m.folioOrigen   ?? null,
+    fecha:         m.fecha ? new Date(m.fecha) : null,
+    saldoAnterior: m.saldoAnterior ?? null,
+    saldoActual:   m.saldoActual   ?? null,
+    subtotal:      m.subtotal      ?? null,
+    impuesto:      m.impuesto      ?? null,
+    total:         m.total         ?? null,
+  }));
 }
 
 // Kore folios encode YYMMxxxxx (e.g. "260600250" → year=2026, month=06).
@@ -822,11 +840,12 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
       const links = mov.erpLinks ?? [];
       let montoTotal  = 0;
       let huboErrorMov = false;
-      let huboTipoPagoNuevo = false;
+      let huboLinksActualizados = false;
       const linksDetalle = [];
       // Copia editable de erpLinks — el sync ya re-consulta cada CxC en Kore para el
       // cálculo de saldoErp, así que se aprovecha esa misma respuesta para completar
-      // `tipoPago` en links antiguos que se vincularon antes de que se capturara ese dato.
+      // `tipoPago` en links antiguos que se vincularon antes de que se capturara ese dato,
+      // y para guardar el snapshot de `movimientosKore` (rastreo de conciliación).
       const linksActualizados = links.map(l => ({ ...l }));
 
       for (let i = 0; i < links.length; i++) {
@@ -848,9 +867,11 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             const tipoPagoNorm = String(raw[0].tipoPago).trim().toUpperCase();
             if (tipoPagoNorm !== (link.tipoPago ?? null)) {
               linksActualizados[i].tipoPago = tipoPagoNorm;
-              huboTipoPagoNuevo = true;
+              huboLinksActualizados = true;
             }
           }
+          linksActualizados[i].movimientosKore = _movimientosKoreDesde(raw[0]);
+          huboLinksActualizados = true;
           linksDetalle.push({
             erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
             saldoActual: raw[0]?.saldoActual ?? null, montoAportado: aporte,
@@ -867,11 +888,12 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
       }
 
       // Construir update: siempre marcar checkpoint; solo sobreescribir saldoErp si hubo monto;
-      // solo sobreescribir erpLinks si se completó algún tipoPago faltante (backfill).
+      // solo sobreescribir erpLinks si se completó algún tipoPago faltante o se guardó el
+      // snapshot de movimientosKore (huboLinksActualizados cubre ambos casos).
       // Si se actualiza saldoErp, se registra en _changelog (de/a + runId) para el reporte y para poder revertir.
       const saldoErpAntes = mov.saldoErp ?? null;
       const update = { $set: { saldoErpSyncedAt: new Date() } };
-      if (huboTipoPagoNuevo) update.$set.erpLinks = linksActualizados;
+      if (huboLinksActualizados) update.$set.erpLinks = linksActualizados;
       let estado;
       if (montoTotal > 0) {
         update.$set.saldoErp = montoTotal;
@@ -930,6 +952,57 @@ router.get('/sync-saldo-transferencia/defaults', authenticate, permit('banks:adm
     fechaDesde: SALDO_SYNC_FECHA_INICIO.toISOString(),
     fechaHasta: SALDO_SYNC_FECHA_FIN.toISOString(),
   });
+}));
+
+// POST /sync-saldo-transferencia/reset-checkpoint — herramienta de rescate.
+// El checkpoint `saldoErpSyncedAt` excluye para siempre a un movimiento ya procesado,
+// y "Revertir esta corrida" solo funciona para movimientos con entrada en _changelog
+// (los que quedaron 'actualizado'; 'sinTransferencia'/'error' nunca la tienen) y mientras
+// el jobId siga vivo en memoria (SALDO_SYNC_JOBS, TTL 2h). Cuando ninguna de las dos
+// rutas normales sirve (corrida vieja, o resultado sin changelog), este endpoint limpia
+// el checkpoint directamente — SOLO para movimientos a los que aún les falta
+// `movimientosKore` en algún erpLink — para que la siguiente corrida normal los vuelva
+// a tomar y complete ese campo. No toca saldoErp ni _changelog.
+router.post('/sync-saldo-transferencia/reset-checkpoint', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  if (saldoSyncRunning) {
+    return res.status(409).json({ error: 'Ya hay un proceso de sincronización en curso.' });
+  }
+
+  let fechaInicio = SALDO_SYNC_FECHA_INICIO;
+  let fechaFin    = SALDO_SYNC_FECHA_FIN;
+  if (req.body.fechaDesde) {
+    fechaInicio = new Date(req.body.fechaDesde);
+    if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
+  }
+  if (req.body.fechaHasta) {
+    fechaFin = new Date(req.body.fechaHasta);
+    if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
+  }
+  if (fechaInicio > fechaFin) {
+    return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
+  }
+
+  const result = await BankMovement.updateMany(
+    {
+      'erpIds.0':       { $exists: true },
+      saldoErpSyncedAt: { $ne: null },
+      fecha:            { $gte: fechaInicio, $lte: fechaFin },
+      identificadoPor:  { $elemMatch: { userId: { $nin: ['erp-auto', null] } } },
+      erpLinks: {
+        $elemMatch: {
+          serie:        { $ne: null },
+          folioExterno: { $ne: null },
+          $or: [
+            { movimientosKore: { $exists: false } },
+            { movimientosKore: { $size: 0 } },
+          ],
+        },
+      },
+    },
+    { $set: { saldoErpSyncedAt: null } },
+  );
+
+  res.json({ ok: true, reiniciados: result.modifiedCount });
 }));
 
 router.post('/sync-saldo-transferencia', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {

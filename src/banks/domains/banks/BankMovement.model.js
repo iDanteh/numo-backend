@@ -63,6 +63,24 @@ const bankMovementSchema = new mongoose.Schema({
       folioExterno:   { type: String, default: null },
       tieneRetencion: { type: Boolean, default: false },
       tipoPago:       { type: String, default: null },
+      // Snapshot de movimientos Kore para esta CxC (todos menos el primero — el primero
+      // es el cargo original, no aporta al rastreo de conciliación). Lo llena el job
+      // Sync Saldo ERP con la misma respuesta que ya usa para calcular saldoErp.
+      movimientosKore: {
+        type: [{
+          serie:         { type: String, default: null },
+          folio:         { type: String, default: null },
+          serieOrigen:   { type: String, default: null },
+          folioOrigen:   { type: String, default: null },
+          fecha:         { type: Date,   default: null },
+          saldoAnterior: { type: Number, default: null },
+          saldoActual:   { type: Number, default: null },
+          subtotal:      { type: Number, default: null },
+          impuesto:      { type: Number, default: null },
+          total:         { type: Number, default: null },
+        }],
+        default: [],
+      },
     }],
     default: [],
   },
@@ -104,6 +122,9 @@ const bankMovementSchema = new mongoose.Schema({
 
   // Oculto por regla — el movimiento existe pero no aparece en vistas normales
   oculto: { type: Boolean, default: false, index: true },
+
+  // Oculto solo para estos roles (regla 'ocultar' con ocultarRoles). Independiente de `oculto`.
+  ocultoRoles: { type: [String], default: [] },
 
   // Auditoría
   uploadedBy: { type: String, default: null },

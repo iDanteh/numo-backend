@@ -88,6 +88,11 @@ router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), 
     const scope = hasExportAll ? MOVEMENT_SCOPE.ALL : getMovementScope(req.user.role);
     ({ query } = applyMovementRestrictions(query, req.user._id, { scope, forExport: true }));
   }
+  // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
+  // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
+  // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  query.rolActual = hasAdminAccess ? null : req.user.role;
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
   const fecha  = new Date().toISOString().slice(0, 10);
@@ -110,6 +115,11 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
     }
     query = restricted;
   }
+  // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
+  // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
+  // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  query.rolActual = hasAdminAccess ? null : req.user.role;
   res.json(await service.listMovements(query));
 }));
 

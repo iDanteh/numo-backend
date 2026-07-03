@@ -293,10 +293,11 @@ async function listMovements(filters) {
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
     identificadoPorUsuario,
-    movId,
+    movId, rolActual,
   } = filters;
 
   const filter = { isActive: true, oculto: { $ne: true } };
+  if (rolActual) filter.ocultoRoles = { $ne: rolActual };
   if (banco)  filter.banco  = banco;
   if (status) {
     const statusVals = status.split(',').map(v => v.trim()).filter(Boolean);
@@ -1681,7 +1682,7 @@ async function exportMovements(filters) {
     importeMin, importeMax,
     folioFiscal: folioFiscalFilter,
     ficha:       fichaParamFilter,
-    columnas,
+    columnas, rolActual,
   } = filters;
 
   // Columnas opcionales activas (default: las 3 más útiles)
@@ -1691,6 +1692,7 @@ async function exportMovements(filters) {
 
   // ── Query ────────────────────────────────────────────────────────────────
   const filter = { isActive: true, oculto: { $ne: true } };
+  if (rolActual) filter.ocultoRoles = { $ne: rolActual };
 
   if (banco) {
     const bancoVals = banco.split(',').map(v => v.trim()).filter(Boolean);

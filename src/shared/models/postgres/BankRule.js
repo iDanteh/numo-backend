@@ -56,7 +56,7 @@ const BankRule = sequelize.define('BankRule', {
     type:         DataTypes.STRING(30),
     allowNull:    false,
     defaultValue: 'categorizar',
-    validate:     { isIn: [['categorizar', 'bloquear_identificacion', 'ocultar', 'cambiar_estado']] },
+    validate:     { isIn: [['categorizar', 'bloquear_identificacion', 'cambiar_estado']] },
   },
 
   // Mensaje mostrado al usuario cuando una regla bloquea la identificación.
@@ -71,6 +71,15 @@ const BankRule = sequelize.define('BankRule', {
   estadoDestino: {
     type:      DataTypes.STRING(30),
     allowNull: true,
+  },
+
+  // Roles para los que se oculta el movimiento categorizado por esta regla — campo extra
+  // de accion = 'categorizar' (igual que estadoDestino con "también cambiar estado").
+  // Vacío = no oculta a nadie por esta vía; solo admite 'contabilidad'/'cobranza'.
+  ocultarRoles: {
+    type:         DataTypes.JSONB,
+    allowNull:    false,
+    defaultValue: [],
   },
 
   // Posición de la regla dentro del banco (primera que aplica gana).

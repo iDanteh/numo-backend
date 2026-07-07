@@ -1512,11 +1512,18 @@ function scoreMovement(mov, ext) {
   else                   { return null; }  // descartado
 
   // ── Fecha (25 pts) ────────────────────────────────────────────────────────
+  // Comparación por día calendario en UTC, NO con .toDateString() (usa la zona
+  // horaria LOCAL del servidor) — ext.fecha siempre viene sin hora ("YYYY-MM-DD",
+  // así lo pide el prompt de extracción), y new Date("YYYY-MM-DD") se parsea
+  // como medianoche UTC. En un servidor en America/Mexico_City (UTC-6),
+  // .toDateString() la regresaba un día atrás, restando puntos a comprobantes
+  // del MISMO día (verificado: "2026-06-30" → "Mon Jun 29 2026" en local).
   if (ext.fecha) {
-    const days = Math.abs(
-      (new Date(new Date(mov.fecha).toDateString()).getTime() -
-       new Date(new Date(ext.fecha).toDateString()).getTime()) / 86_400_000
-    );
+    const diaUTC = (d) => {
+      const x = new Date(d);
+      return Date.UTC(x.getUTCFullYear(), x.getUTCMonth(), x.getUTCDate());
+    };
+    const days = Math.abs((diaUTC(mov.fecha) - diaUTC(ext.fecha)) / 86_400_000);
     if      (days === 0) { score += 25; reasons.push('Misma fecha'); }
     else if (days <= 1)  { score += 20; reasons.push('±1 día'); }
     else if (days <= 3)  { score += 15; reasons.push('±3 días'); }
@@ -1606,6 +1613,24 @@ function scoreMovement(mov, ext) {
   return { score: Math.min(score, 100), reasons };
 }
 
+// Puntaje MÁXIMO alcanzable para ESTE comprobante específico — solo cuenta las
+// categorías donde el OCR sí logró extraer un dato comparable (si el comprobante
+// nunca trae "últimos 4 dígitos", esa categoría no cuenta ni a favor ni en contra).
+// Es el mismo para todos los movimientos candidatos de una misma solicitud —
+// permite expresar el score como un % real (score/maxPosible) en vez de puntos
+// crudos sobre un máximo teórico (~125) que casi ningún comprobante alcanza.
+function _maxPosibleScore(ext) {
+  let max = 40; // monto — siempre aplica (ext.monto ya se garantiza antes de llamar a esto)
+  if (ext.fecha) max += 25;
+  if (ext.claveRastreo || ext.referencia || ext.numeroAutorizacion) max += 20;
+  if (ext.bancoOrigen || ext.bancoDestino) max += 15;
+  if (ext.cuentaOrigenUltimos4 || ext.cuentaDestinoUltimos4) max += 5;
+  if (ext.titularOrigen || ext.titularDestino) max += 10;
+  if (ext.concepto) max += 5;
+  if (ext.clabe && ext.clabe.length === 18) max += 5;
+  return Math.min(max, 100); // scoreMovement ya topa en 100, mantener consistente
+}
+
 /**
  * Busca movimientos bancarios candidatos para el comprobante analizado.
  * Si no hay monto, devuelve los 15 más recientes para selección manual.
@@ -1620,6 +1645,7 @@ async function findMatchingMovements(ext) {
     return recent.map(mov => ({
       movement: mov,
       score:    0,
+      porcentaje: 0,
       reasons:  ['Sin monto extraído — selección manual'],
       nivel:    'bajo',
     }));
@@ -1647,12 +1673,15 @@ async function findMatchingMovements(ext) {
   const candidates = await BankMovement.find(filter)
     .sort({ fecha: -1 }).limit(150).lean();
 
+  const maxPosible = _maxPosibleScore(ext);
+
   return candidates
     .map(mov => {
       const r = scoreMovement(mov, ext);
       if (!r) return null;
-      return { movement: mov, score: r.score, reasons: r.reasons,
-               nivel: r.score >= 80 ? 'alto' : r.score >= 50 ? 'medio' : 'bajo' };
+      const porcentaje = Math.round(Math.min(100, (r.score / maxPosible) * 100));
+      return { movement: mov, score: r.score, porcentaje, reasons: r.reasons,
+               nivel: porcentaje >= 80 ? 'alto' : porcentaje >= 50 ? 'medio' : 'bajo' };
     })
     .filter(Boolean)
     .sort((a, b) => b.score - a.score)

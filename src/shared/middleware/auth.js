@@ -21,6 +21,8 @@
  */
 
 const { auth }    = require('express-oauth2-jwt-bearer');
+const jwt         = require('jsonwebtoken');
+const config      = require('../../config/env');
 const userSvc     = require('../../banks/domains/users/user.service');
 const rbacStore   = require('../services/rbac-store');
 const { logger }  = require('../utils/logger');
@@ -34,43 +36,72 @@ const jwtCheck = auth({
   tokenSigningAlg: 'RS256',
 });
 
+// Atajo de SOLO pruebas: acepta tokens HS256 firmados con TEST_AUTH_SECRET en
+// vez de exigir un JWT RS256 real de Auth0. Doble candado — nunca se activa en
+// producción aunque alguien deje la variable puesta por error, y nunca se
+// activa sin la variable aunque el entorno no sea producción. Ver
+// shared/routes/dev-auth.routes.js (emite estos tokens) y POST /api/dev/test-token.
+const TEST_AUTH_ENABLED = config.env !== 'production' && !!process.env.TEST_AUTH_SECRET;
+if (TEST_AUTH_ENABLED) {
+  logger.warn(`[auth] TEST_AUTH_SECRET activo (NODE_ENV=${config.env}) — /api/dev/test-token y sus tokens HS256 están habilitados`);
+}
+
+/**
+ * Puebla req.user a partir de los claims ya validados (de Auth0 o del atajo
+ * de pruebas) consultando/creando el usuario correspondiente en PostgreSQL.
+ */
+async function resolveUser(payload, req, res, next) {
+  try {
+    const userDoc = await userSvc.findOrCreate({
+      auth0Sub: payload.sub,
+      nombre:   payload[NOMBRE_CLAIM] ?? '',
+      email:    payload[EMAIL_CLAIM]  ?? payload.email ?? '',
+    });
+
+    if (!userDoc.isActive) {
+      return res.status(403).json({ error: 'Usuario desactivado. Contacta al administrador.' });
+    }
+
+    req.user = {
+      _id:    payload.sub,                   // auth0 sub (string)
+      dbId:   String(userDoc.id),            // PG integer id como string
+      nombre: userDoc.nombre || payload[NOMBRE_CLAIM] || '',
+      email:  userDoc.email  || payload[EMAIL_CLAIM]  || '',
+      role:   userDoc.role,
+    };
+
+    next();
+  } catch (dbErr) {
+    logger.error(`[auth] Error resolviendo usuario en DB: ${dbErr.message}`);
+    return res.status(500).json({ error: 'Error interno de autenticación' });
+  }
+}
+
 /**
  * Valida el JWT y puebla req.user con datos desde PostgreSQL.
  * Si el usuario está desactivado devuelve 403.
  */
 const authenticate = (req, res, next) => {
-  jwtCheck(req, res, async (err) => {
+  if (TEST_AUTH_ENABLED) {
+    const authHeader = req.get('Authorization') || '';
+    const bearer     = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (bearer) {
+      try {
+        const payload = jwt.verify(bearer, process.env.TEST_AUTH_SECRET, { algorithms: ['HS256'] });
+        return resolveUser(payload, req, res, next);
+      } catch (_testErr) {
+        // No es un token de prueba válido (o es un JWT real RS256 de Auth0) —
+        // sigue el flujo normal de abajo.
+      }
+    }
+  }
+
+  jwtCheck(req, res, (err) => {
     if (err) {
       logger.debug(`[auth] jwtCheck falló: ${err.message}`);
       return res.status(401).json({ error: 'Token inválido', details: err.message });
     }
-
-    const payload = req.auth?.payload ?? {};
-
-    try {
-      const userDoc = await userSvc.findOrCreate({
-        auth0Sub: payload.sub,
-        nombre:   payload[NOMBRE_CLAIM] ?? '',
-        email:    payload[EMAIL_CLAIM]  ?? payload.email ?? '',
-      });
-
-      if (!userDoc.isActive) {
-        return res.status(403).json({ error: 'Usuario desactivado. Contacta al administrador.' });
-      }
-
-      req.user = {
-        _id:    payload.sub,                   // auth0 sub (string)
-        dbId:   String(userDoc.id),            // PG integer id como string
-        nombre: userDoc.nombre || payload[NOMBRE_CLAIM] || '',
-        email:  userDoc.email  || payload[EMAIL_CLAIM]  || '',
-        role:   userDoc.role,
-      };
-
-      next();
-    } catch (dbErr) {
-      logger.error(`[auth] Error resolviendo usuario en DB: ${dbErr.message}`);
-      return res.status(500).json({ error: 'Error interno de autenticación' });
-    }
+    return resolveUser(req.auth?.payload ?? {}, req, res, next);
   });
 };
 
@@ -106,4 +137,4 @@ const permit = (...permissions) => async (req, res, next) => {
   }
 };
 
-module.exports = { authenticate, permit };
+module.exports = { authenticate, permit, NOMBRE_CLAIM, EMAIL_CLAIM };

@@ -141,6 +141,14 @@ app.use('/api/periodos-fiscales', periodosFiscalesRoutes);
 app.use('/api/erp',               visorErpRoutes);
 app.use('/api/schedule',          scheduleRoutes);
 
+// Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se
+// registra en producción, ni siquiera si TEST_AUTH_SECRET quedó puesta por error.
+if (process.env.NODE_ENV !== 'production' && process.env.TEST_AUTH_SECRET) {
+  const devAuthRoutes = require('./shared/routes/dev-auth.routes');
+  app.use('/api/dev/test-token', devAuthRoutes);
+  logger.warn('[dev] POST /api/dev/test-token habilitado — SOLO usar en desarrollo/pruebas, nunca en producción');
+}
+
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: 'Ruta no encontrada' });
@@ -172,6 +180,8 @@ const startServer = async () => {
   }
 
   require('./visor/jobs/satSyncJob');
+  require('./banks/jobs/erpSyncCron');
+  require('./banks/jobs/collectionRequestAutoMatchCron');
   try {
     await seed();
   } catch (err) {

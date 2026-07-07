@@ -65,6 +65,8 @@
     "sharp": "^0.34.5",
     "soap": "^1.0.0",
     "socket.io": "^4.8.3",
+    "swagger-jsdoc": "^6.3.0",
+    "swagger-ui-express": "^5.0.1",
     "tesseract.js": "^7.0.0",
     "winston": "^3.11.0",
     "xml2js": "^0.6.2",

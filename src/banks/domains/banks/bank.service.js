@@ -451,10 +451,20 @@ async function listMovements(filters) {
     }
 
     // ── Campo calculado para ordenar por diferencia ──────────────────────────
+    // Misma fórmula y gate que erpDiferencia() en el frontend: null si no hay
+    // saldoErp o no hay CxC vinculadas (en vez de tratarlos como 0, que antes
+    // producía una "diferencia" fantasma igual al depósito completo).
     if (rawSortBy === 'diferencia') {
-      pipeline.push({ $addFields: { _diferencia: { $subtract: [
-        { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-        { $ifNull: ['$saldoErp', 0] },
+      pipeline.push({ $addFields: { _diferencia: { $cond: [
+        { $and: [
+          { $ne: ['$saldoErp', null] },
+          { $gt: [{ $size: { $ifNull: ['$erpLinks', []] } }, 0] },
+        ] },
+        { $subtract: [
+          { $ifNull: ['$deposito', { $ifNull: ['$retiro', 0] }] },
+          '$saldoErp',
+        ] },
+        null,
       ] } } });
     }
 
@@ -1357,16 +1367,20 @@ function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
     ? links.reduce((sum, l) => {
-        // saldoPagado: monto acumulado cobrado por transferencia/depósito en efectivo para
-        // este link (ver cobro-panel _buildCobroSaldosErp). Si el cobro-panel ya lo calculó
-        // explícitamente (no es null, aunque sea 0 — ej. se cobró todo en efectivo de caja),
-        // ES la fuente de verdad y NO se cae a saldoActual/total: si cayera, un pago hecho
-        // por una forma no bancaria terminaría contando como si el banco lo hubiera cubierto.
-        // Solo cuando saldoPagado nunca se ha determinado (null — CxC vinculada sin pasar por
-        // el cobro-panel, ej. ya estaba pagada en Kore por otro canal) cae al comportamiento
-        // legado: saldoActual > 0 o total.
+        // saldoPagadoTotal: monto acumulado cobrado por CUALQUIER forma de pago para este
+        // link (ver cobro-panel _buildCobroSaldosErp) — es la fuente de verdad para saldoErp/
+        // status: si el depósito bancario cubre la CxC aunque se haya pagado con cheque,
+        // efectivo de caja, tarjeta, etc., el movimiento sí debe quedar identificado.
+        // (saldoPagado, en cambio, solo cuenta lo bancario — transferencia/depósito en
+        // efectivo — y se conserva aparte para el badge "CxC vinculadas" de la tabla.)
+        // Si el cobro-panel ya lo calculó explícitamente (no es null, aunque sea 0), ES la
+        // fuente de verdad y NO se cae a saldoActual/total. Solo cuando nunca se ha
+        // determinado (null — CxC vinculada sin pasar por el cobro-panel, ej. ya estaba
+        // pagada en Kore por otro canal) cae al comportamiento legado: saldoActual > 0 o total.
         let ref;
-        if (l.saldoPagado != null) {
+        if (l.saldoPagadoTotal != null) {
+          ref = l.saldoPagadoTotal;
+        } else if (l.saldoPagado != null) {
           ref = l.saldoPagado;
         } else {
           ref = (l.saldoActual != null && l.saldoActual > 0)
@@ -1539,9 +1553,10 @@ async function setErpIds(id, erpLinks, user) {
 
   const cleanLinks = erpLinks
     .map(l => ({
-      erpId:        String(l.erpId || '').trim(),
-      saldoActual:  l.saldoActual != null ? Number(l.saldoActual) : null,
-      saldoPagado:  l.saldoPagado != null ? Number(l.saldoPagado) : null,
+      erpId:            String(l.erpId || '').trim(),
+      saldoActual:      l.saldoActual != null ? Number(l.saldoActual) : null,
+      saldoPagado:      l.saldoPagado != null ? Number(l.saldoPagado) : null,
+      saldoPagadoTotal: l.saldoPagadoTotal != null ? Number(l.saldoPagadoTotal) : null,
       folioFiscal:  l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
       total:        l.total != null ? Number(l.total) : null,
       serie:        l.serie ? String(l.serie).trim() : null,
@@ -1821,11 +1836,20 @@ async function exportMovements(filters) {
 
   let movements;
   if (rawSortBy === 'diferencia') {
+    // Misma fórmula y gate que erpDiferencia() en el frontend (ver pipeline
+    // análogo más arriba, en la función de listado paginado).
     movements = await BankMovement.aggregate([
       { $match: filter },
-      { $addFields: { _diferencia: { $subtract: [
-        { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-        { $ifNull: ['$saldoErp', 0] },
+      { $addFields: { _diferencia: { $cond: [
+        { $and: [
+          { $ne: ['$saldoErp', null] },
+          { $gt: [{ $size: { $ifNull: ['$erpLinks', []] } }, 0] },
+        ] },
+        { $subtract: [
+          { $ifNull: ['$deposito', { $ifNull: ['$retiro', 0] }] },
+          '$saldoErp',
+        ] },
+        null,
       ] } } },
       { $sort: { _diferencia: sortOrder, _id: 1 } },
     ]);
@@ -1888,8 +1912,11 @@ async function exportMovements(filters) {
 
   // ── Filas ────────────────────────────────────────────────────────────────
   for (const m of movements) {
-    const bankAmount = (m.deposito ?? 0) + (m.retiro ?? 0);
-    const diferencia = m.saldoErp != null ? Math.abs(bankAmount - m.saldoErp) : null;
+    // Misma fórmula y gate que erpDiferencia() en el frontend.
+    const bankAmount = m.deposito ?? m.retiro ?? 0;
+    const diferencia = (m.saldoErp != null && (m.erpLinks || []).length > 0)
+      ? Math.abs(bankAmount - m.saldoErp)
+      : null;
 
     const fechasAplicacion = [
       ...(m.identificadoPor || []).map(e => e.fechaId ? new Date(e.fechaId).getTime() : null),

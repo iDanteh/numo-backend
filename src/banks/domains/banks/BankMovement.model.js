@@ -54,9 +54,16 @@ const bankMovementSchema = new mongoose.Schema({
   // Snapshot por cada CxC vinculada: saldoActual, folioFiscal, serie y folioExterno al momento de la vinculación
   erpLinks: {
     type: [{
-      erpId:          { type: String, required: true },
-      saldoActual:    { type: Number, default: 0 },
-      saldoPagado:    { type: Number, default: null },
+      erpId:            { type: String, required: true },
+      saldoActual:      { type: Number, default: 0 },
+      // Acumulado cobrado por transferencia/depósito en efectivo (forma "bancaria") —
+      // alimenta el badge/dropdown "CxC vinculadas" en la tabla de movimientos.
+      saldoPagado:      { type: Number, default: null },
+      // Acumulado cobrado por TODAS las formas de pago (transferencia, efectivo, cheque,
+      // tarjeta, etc.) — es la fuente de saldoErp/status en aplicarLogicaErp. Ver
+      // bank.service.js. Deliberadamente separado de saldoPagado: ese sigue siendo
+      // bancario-only para no inflar el dropdown de CxC vinculadas con formas no bancarias.
+      saldoPagadoTotal: { type: Number, default: null },
       folioFiscal:    { type: String, default: null },
       total:          { type: Number, default: null },
       serie:          { type: String, default: null },
@@ -65,7 +72,8 @@ const bankMovementSchema = new mongoose.Schema({
       tipoPago:       { type: String, default: null },
       // Snapshot de movimientos Kore para esta CxC (todos menos el primero — el primero
       // es el cargo original, no aporta al rastreo de conciliación). Lo llena el job
-      // Sync Saldo ERP con la misma respuesta que ya usa para calcular saldoErp.
+      // "Sync Histórico Kore" (independiente de Sync Saldo ERP — solo enriquece, nunca
+      // toca saldoErp/tipoPago/total).
       movimientosKore: {
         type: [{
           serie:         { type: String, default: null },
@@ -81,6 +89,14 @@ const bankMovementSchema = new mongoose.Schema({
         }],
         default: [],
       },
+      // Checkpoint de "Sync Histórico Kore" — se marca SOLO cuando Kore respondió con
+      // éxito para este link (aunque el movimientosKore resultante quede vacío). Si Kore
+      // falla, queda null y la siguiente corrida reintenta sola (no necesita un botón de
+      // "reiniciar checkpoint" como el de Sync Saldo ERP).
+      movimientosKoreSyncedAt: { type: Date, default: null },
+      // jobId de la corrida que escribió el movimientosKore actual — permite revertir
+      // selectivamente solo los links tocados por esa corrida específica.
+      movimientosKoreRunId: { type: String, default: null },
     }],
     default: [],
   },

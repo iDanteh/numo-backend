@@ -13,7 +13,30 @@ const { parseCxcs, parseFormasPago }               = require('./collection-reque
 const { buildPayloadSingle, buildPayloadMulti }    = require('./collection-request-kore-payload');
 const { buildErpLinksParaCobro }                   = require('./collection-request-erp-links');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
+const driveComprobantes                  = require('./drive-comprobantes.service');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
+
+// Combina el comprobante LEGACY (Mongo, un solo archivo, campo `comprobante`)
+// con los nuevos (Drive, arreglo `comprobantes[]`) en una sola lista uniforme
+// por índice — así todo lo que lee/analiza comprobantes no necesita bifurcar
+// su lógica según de dónde viene cada uno. Los documentos nuevos solo llenan
+// `comprobantes[]`; los viejos solo tienen `comprobante` — nunca ambos a la vez
+// en la práctica, pero si algún día coexistieran, Drive gana (es lo vigente).
+function _comprobantesUnificados(cr) {
+  if (cr.comprobantes?.length > 0) {
+    return cr.comprobantes.map(c => ({
+      storage: 'drive', driveFileId: c.driveFileId,
+      mimetype: c.mimetype, originalName: c.originalName,
+    }));
+  }
+  if (cr.comprobante?.data) {
+    return [{
+      storage: 'mongo', data: cr.comprobante.data,
+      mimetype: cr.comprobante.mimetype, originalName: cr.comprobante.originalName,
+    }];
+  }
+  return [];
+}
 
 async function analyzeReceipt(fileBuffer, mimetype) {
   const extracted  = await extractReceiptData(fileBuffer, mimetype);
@@ -21,90 +44,13 @@ async function analyzeReceipt(fileBuffer, mimetype) {
   return { extracted, candidates, totalCandidatos: candidates.length };
 }
 
-// ── Auto-match: identificar y aplicar el cobro SIN intervención humana ────────
-// cuando el comprobante adjunto coincide con muy alta confianza contra un
-// movimiento bancario. Se dispara (a) justo después de crear la solicitud
-// (fire-and-forget, ver create()) y (b) periódicamente por el cron
-// (collectionRequestAutoMatchCron.js) para solicitudes que sigan pendientes —
-// el depósito bancario muchas veces se importa a Numo DESPUÉS de que Kore
-// avisa la solicitud, así que un solo intento al crear no basta.
-//
-// Se queda EN ESTE ARCHIVO (no se extrae a un módulo aparte) porque llama
-// directamente a identificar() y analyzeStoredComprobante(), que también
-// viven aquí — extraerla generaría un require() circular con este mismo
-// archivo. Es la única pieza de la lógica de auto-match/Kore que no se separó.
-const AUTO_MATCH_UMBRAL_PCT = 95;
-const AUTO_MATCH_USER = Object.freeze({
-  _id:    'sistema-auto-match',
-  nombre: 'Conciliación automática (OCR)',
-  // 'cobranza' y no 'admin' a propósito: setErpIds() usa el role para el
-  // chequeo de "¿puede forzar un movimiento ya tomado por otro?" — el
-  // auto-match NUNCA debe poder pisar un movimiento que un humano (u otro
-  // proceso) ya identificó, solo tomar los que están genuinamente libres.
-  role:   'cobranza',
-});
-
-// Exige, además del umbral de %, que el comprobante haya podido extraer al
-// menos fecha Y alguna clave/referencia (no solo el monto) — de lo contrario
-// un comprobante que solo trae el monto podría llegar a "100%" (40/40) sin
-// ninguna señal corroborante, lo cual es demasiado riesgoso para aplicar un
-// cobro real sin que lo revise una persona.
-function _tieneSenalesSuficientes(ext) {
-  return !!ext.fecha && !!(ext.claveRastreo || ext.referencia || ext.numeroAutorizacion);
-}
-
-// Intenta identificar+aplicar el cobro de una solicitud de forma automática.
-// Nunca lanza — cualquier fallo (OCR, Kore, sin match suficiente) se traga y
-// se loguea, dejando la solicitud tal cual para revisión manual o un
-// reintento posterior del cron. Regresa un resumen solo para logging/tests.
-async function intentarAutoMatch(id) {
-  const cr = await CollectionRequest.findById(id);
-  if (!cr)                     return { aplicado: false, motivo: 'Solicitud no encontrada' };
-  if (cr.status !== 'pendiente') return { aplicado: false, motivo: `status=${cr.status}` };
-  if (!cr.comprobante?.data)   return { aplicado: false, motivo: 'Sin comprobante' };
-  if (!cr.conceptoId)          return { aplicado: false, motivo: 'Sin conceptoId' };
-
-  let extracted, candidates;
-  try {
-    ({ extracted, candidates } = await analyzeStoredComprobante(id));
-  } catch (err) {
-    console.warn(`[auto-match] ${id}: falló el análisis del comprobante — ${err.message}`);
-    return { aplicado: false, motivo: 'OCR falló', error: err.message };
-  }
-
-  const top = candidates[0];
-  if (!top) return { aplicado: false, motivo: 'Sin candidatos' };
-
-  if (!_tieneSenalesSuficientes(extracted)) {
-    console.log(`[auto-match] ${id}: comprobante sin fecha/referencia extraída — no es candidato a auto-match (top=${top.porcentaje}%)`);
-    return { aplicado: false, motivo: 'Comprobante sin señales suficientes', porcentaje: top.porcentaje };
-  }
-
-  const montoMov    = top.movement.deposito ?? top.movement.retiro ?? 0;
-  const montoExacto = extracted.monto != null && Math.abs(montoMov - extracted.monto) < 0.01;
-
-  if (top.porcentaje < AUTO_MATCH_UMBRAL_PCT || !montoExacto) {
-    console.log(`[auto-match] ${id}: no alcanza el umbral (top=${top.porcentaje}%, montoExacto=${montoExacto}) — queda pendiente para revisión manual`);
-    return { aplicado: false, motivo: 'Debajo del umbral', porcentaje: top.porcentaje, montoExacto };
-  }
-
-  try {
-    await identificar(id, top.movement._id.toString(), AUTO_MATCH_USER, { automatico: true });
-    console.log(`[auto-match] ${id}: identificado y cobro aplicado automáticamente (${top.porcentaje}%, movimiento ${top.movement._id})`);
-    return { aplicado: true, porcentaje: top.porcentaje, bankMovementId: top.movement._id.toString() };
-  } catch (err) {
-    // Cubre p.ej. ConflictError (alguien más ya tomó el movimiento) o que Kore
-    // rechace el cobro (sesión de caja cerrada, etc.) — se deja pendiente para
-    // revisión manual o el siguiente reintento del cron.
-    console.warn(`[auto-match] ${id}: match de ${top.porcentaje}% pero identificar() falló — ${err.message}`);
-    return { aplicado: false, motivo: 'identificar() falló', error: err.message, porcentaje: top.porcentaje };
-  }
-}
-
 // Crea una solicitud de cobro — llamada por el ERP (Kore), sin sesión Numo (ver
 // middleware requireErpApiKey en routes.js). El "usuario que solicita" viaja en
 // el body porque quien llama no es ese usuario, es el backend del ERP.
-async function create(data, file) {
+// `files` es un arreglo (multer .array) — puede venir vacío, con 1 o con varios
+// comprobantes; cada uno puede corresponder a un depósito bancario distinto
+// (ej. mitad transferencia + mitad efectivo, cada uno con su propio comprobante).
+async function create(data, files = []) {
   const {
     cxcs, formasPago, descripcion, conceptoId, solicitudIdErp,
     usuarioSolicitanteId, usuarioSolicitanteNombre,
@@ -112,17 +58,14 @@ async function create(data, file) {
 
   if (!usuarioSolicitanteId) throw new BadRequestError('usuarioSolicitanteId es requerido');
 
-  // undefined (no null) a propósito cuando no viene — ver comentario en el
-  // modelo sobre por qué el campo no puede tener default: null.
-  const solicitudIdErpTrim = solicitudIdErp ? String(solicitudIdErp).trim() : undefined;
+  const solicitudIdErpTrim = solicitudIdErp ? String(solicitudIdErp).trim() : '';
+  if (!solicitudIdErpTrim) throw new BadRequestError('solicitudIdErp es requerido');
 
   // Idempotencia: si el ERP reintenta el mismo POST (timeout de red, retry
   // automático, etc.) con el mismo solicitudIdErp, no se duplica — se regresa
   // la solicitud ya creada.
-  if (solicitudIdErpTrim) {
-    const existente = await CollectionRequest.findOne({ solicitudIdErp: solicitudIdErpTrim });
-    if (existente) return _toSafeJSON(existente);
-  }
+  const existente = await CollectionRequest.findOne({ solicitudIdErp: solicitudIdErpTrim });
+  if (existente) return _toSafeJSON(existente);
 
   const cxcsParsed = parseCxcs(cxcs);
   const cxcInvalido = cxcsParsed.find(c => !c.erpId);
@@ -147,6 +90,23 @@ async function create(data, file) {
 
   const monto = Math.round(formasPagoParsed.reduce((s, f) => s + f.importe, 0) * 100) / 100;
 
+  // Comprobantes nuevos van SIEMPRE a Drive (nunca a Mongo) — el campo legacy
+  // `comprobante` ya no se escribe. Se suben ANTES de crear el documento: si
+  // Kore reintenta con el mismo solicitudIdErp por un timeout de red real
+  // (nada que ver con esto), el chequeo de idempotencia de arriba ya regresó
+  // antes de llegar aquí, así que no se vuelve a subir nada en un retry normal.
+  let comprobantesSubidos = [];
+  if (files.length > 0) {
+    try {
+      comprobantesSubidos = await Promise.all(files.map(async (f) => {
+        const { driveFileId, driveWebViewLink } = await driveComprobantes.subirComprobante(f.buffer, f.mimetype, f.originalname);
+        return { driveFileId, driveWebViewLink, mimetype: f.mimetype, originalName: f.originalname };
+      }));
+    } catch (err) {
+      throw new BadRequestError(`No se pudieron subir los comprobantes: ${err.message}`);
+    }
+  }
+
   try {
     const cr = await CollectionRequest.create({
       cxcs: cxcsParsed,
@@ -157,25 +117,10 @@ async function create(data, file) {
         : `Solicitud de cobro de ${usuarioSolicitanteNombre || usuarioSolicitanteId} con fecha ${new Date().toISOString().slice(0, 10)}`,
       conceptoId:       conceptoId ? String(conceptoId).trim() : null,
       solicitudIdErp:   solicitudIdErpTrim,
-      comprobante: file
-        ? { data: file.buffer, mimetype: file.mimetype, originalName: file.originalname }
-        : undefined,
+      comprobantes:      comprobantesSubidos,
       solicitanteUserId: String(usuarioSolicitanteId).trim(),
       solicitanteNombre: usuarioSolicitanteNombre ? String(usuarioSolicitanteNombre).trim() : null,
     });
-
-    // Auto-match en segundo plano — NO se espera (fire-and-forget) para no
-    // demorar la respuesta a Kore con el OCR + la aplicación del cobro, que
-    // puede tardar varios segundos. Si falla o no alcanza el umbral, la
-    // solicitud simplemente queda "pendiente" como si esto no hubiera corrido
-    // (el cron periódico la vuelve a intentar más tarde).
-    if (file) {
-      setImmediate(() => {
-        intentarAutoMatch(cr._id.toString()).catch(err => {
-          console.error(`[auto-match] ${cr._id}: error inesperado —`, err.message);
-        });
-      });
-    }
 
     return _toSafeJSON(cr);
   } catch (err) {
@@ -190,8 +135,9 @@ async function create(data, file) {
   }
 }
 
-// Oculta el binario del comprobante en las respuestas de listado/detalle —
-// se sirve aparte vía GET /:id/comprobante.
+// Oculta el binario del comprobante legacy en las respuestas de listado/detalle
+// — se sirve aparte vía GET /:id/comprobante(s). `comprobantes[]` (Drive) nunca
+// trae binario en Mongo, así que no necesita ocultarse.
 function _toSafeJSON(doc) {
   const obj = doc.toObject ? doc.toObject() : doc;
   if (obj.comprobante) {
@@ -202,6 +148,13 @@ function _toSafeJSON(doc) {
     };
   }
   return obj;
+}
+
+// tieneComprobante debe ser true si hay AL MENOS uno, sin importar la fuente
+// (legacy en Mongo o nuevos en Drive) — usado por list/listMine/getById/getByErpId,
+// que trabajan sobre documentos `.lean()` (por eso no reusan _toSafeJSON).
+function _tieneAlgunComprobante(doc) {
+  return !!doc.comprobante?.mimetype || (doc.comprobantes?.length ?? 0) > 0;
 }
 
 async function list(filters) {
@@ -222,7 +175,7 @@ async function list(filters) {
   ]);
 
   return {
-    data: data.map(d => ({ ...d, comprobante: { ...d.comprobante, tieneComprobante: !!d.comprobante?.mimetype } })),
+    data: data.map(d => ({ ...d, comprobante: { ...d.comprobante, tieneComprobante: _tieneAlgunComprobante(d) } })),
     pagination: { total, page: parseInt(page), limit: parseInt(limit), pages: Math.ceil(total / parseInt(limit)) },
   };
 }
@@ -246,7 +199,7 @@ async function listMine(userId, filters) {
   ]);
 
   return {
-    data: data.map(d => ({ ...d, comprobante: { ...d.comprobante, tieneComprobante: !!d.comprobante?.mimetype } })),
+    data: data.map(d => ({ ...d, comprobante: { ...d.comprobante, tieneComprobante: _tieneAlgunComprobante(d) } })),
     pagination: { total, page: parseInt(page), limit: parseInt(limit), pages: Math.ceil(total / parseInt(limit)) },
   };
 }
@@ -257,29 +210,67 @@ async function getById(id) {
     .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
-  return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: !!cr.comprobante?.mimetype } };
+  return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: _tieneAlgunComprobante(cr) } };
 }
 
-async function getComprobante(id) {
-  // Sin .lean(): con lean() Mongoose no castea el campo Buffer y regresa el
-  // tipo BSON crudo (Binary), que Express NO sabe enviar como binario (res.send
-  // lo trata como objeto plano y lo serializa mal) — hay que dejar que Mongoose
-  // haga el cast normal a Buffer real.
-  const cr = await CollectionRequest.findById(id).select('comprobante');
-  if (!cr?.comprobante?.data) throw new NotFoundError('Comprobante');
-  return cr.comprobante; // { data: Buffer, mimetype, originalName }
+// Para que el ERP (Kore) consulte el estado de una solicitud que él mismo creó
+// — busca por solicitudIdErp (lo único que Kore conoce de antemano, nunca el
+// _id interno de Numo). El documento ya trae cxcs[]/status juntos para Modo 1
+// y Modo 2 por igual, así que no hace falta "relacionar" nada aparte: es el
+// mismo shape que getById, solo que la búsqueda es por el ID del ERP.
+async function getByErpId(solicitudIdErp) {
+  const cr = await CollectionRequest.findOne({ solicitudIdErp: String(solicitudIdErp).trim() })
+    .select('-comprobante.data')
+    .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
+    .lean();
+  if (!cr) throw new NotFoundError('Solicitud');
+  return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: _tieneAlgunComprobante(cr) } };
+}
+
+// `index` selecciona CUÁL comprobante de la lista unificada (legacy Mongo +
+// Drive) — por default el primero, que sigue funcionando igual que antes para
+// las solicitudes viejas de un solo comprobante.
+async function getComprobante(id, index = 0) {
+  // Sin .lean(): con lean() Mongoose no castea el campo Buffer legacy y regresa
+  // el tipo BSON crudo (Binary), que Express NO sabe enviar como binario
+  // (res.send lo trata como objeto plano y lo serializa mal) — hay que dejar
+  // que Mongoose haga el cast normal a Buffer real.
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes');
+  if (!cr) throw new NotFoundError('Solicitud');
+
+  const item = _comprobantesUnificados(cr)[index];
+  if (!item) throw new NotFoundError('Comprobante');
+
+  const data = item.storage === 'drive'
+    ? await driveComprobantes.descargarComprobante(item.driveFileId)
+    : item.data;
+  return { data, mimetype: item.mimetype, originalName: item.originalName };
 }
 
 // Corre el mismo motor de OCR + matching que ya usa OcrModalComponent
-// (analyzeReceipt), pero sobre el comprobante YA guardado en la solicitud —
-// el usuario no tiene que volver a subir el archivo. Ayuda a ubicar el
-// depósito bancario correspondiente cuando el auto-match/búsqueda manual no
-// lo encuentran a simple vista.
-async function analyzeStoredComprobante(id) {
-  const comprobante = await getComprobante(id); // ya valida que exista
-  const extracted   = await extractReceiptData(comprobante.data, comprobante.mimetype);
-  const candidates  = await findMatchingMovements(extracted);
-  return { extracted, candidates, totalCandidatos: candidates.length };
+// (analyzeReceipt), pero sobre los comprobantes YA guardados en la solicitud —
+// el usuario no tiene que volver a subirlos. Cada comprobante se analiza de
+// forma INDEPENDIENTE (nunca se combinan candidatos entre archivos — cada uno
+// puede corresponder a un depósito bancario distinto), y se regresa un
+// resultado por comprobante para que la búsqueda ayude a ubicar cada depósito.
+async function analyzeStoredComprobantes(id) {
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes');
+  if (!cr) throw new NotFoundError('Solicitud');
+
+  const lista = _comprobantesUnificados(cr);
+  if (lista.length === 0) throw new NotFoundError('Comprobante');
+
+  const resultados = [];
+  for (let i = 0; i < lista.length; i++) {
+    const item = lista[i];
+    const data = item.storage === 'drive'
+      ? await driveComprobantes.descargarComprobante(item.driveFileId)
+      : item.data;
+    const extracted  = await extractReceiptData(data, item.mimetype);
+    const candidates  = await findMatchingMovements(extracted);
+    resultados.push({ comprobanteIndex: i, extracted, candidates, totalCandidatos: candidates.length });
+  }
+  return resultados;
 }
 
 // Concilia la solicitud contra un BankMovement Y aplica el cobro real en Kore,
@@ -291,8 +282,7 @@ async function analyzeStoredComprobante(id) {
 // La sesión de caja se resuelve con el CAJERO que generó la solicitud
 // (cr.solicitanteUserId), NO con el usuario de cobranza/contabilidad que está
 // identificando — es el cajero quien tiene una caja abierta en Kore.
-async function identificar(id, bankMovementId, user, opts = {}) {
-  const automatico = !!opts.automatico;
+async function identificar(id, bankMovementId, user) {
   if (!bankMovementId) throw new BadRequestError('bankMovementId es requerido');
 
   const cr = await CollectionRequest.findById(id);
@@ -387,7 +377,6 @@ async function identificar(id, bankMovementId, user, opts = {}) {
   cr.cobroAplicado       = true;
   cr.cobroAplicadoAt     = new Date();
   cr.koreOperacionResult = koreResult;
-  cr.autoIdentificado    = automatico;
   await cr.save();
 
   return _toSafeJSON(cr);
@@ -410,6 +399,6 @@ async function rechazar(id, motivo, user) {
 }
 
 module.exports = {
-  analyzeReceipt, create, list, listMine, getById, getComprobante, analyzeStoredComprobante,
-  identificar, rechazar, intentarAutoMatch,
+  analyzeReceipt, create, list, listMine, getById, getByErpId, getComprobante, analyzeStoredComprobantes,
+  identificar, rechazar,
 };

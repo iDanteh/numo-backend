@@ -83,14 +83,33 @@ const collectionRequestSchema = new mongoose.Schema({
   // índice sparse solo excluye documentos donde el campo está AUSENTE, no en null.
   solicitudIdErp: { type: String, trim: true },
 
-  // ── Comprobante de transferencia (opcional) ──────────────────────────────────
-  // Se guarda como binario en Mongo (no en disco) para no depender de un volumen
-  // persistente en el contenedor — límite bajo (ver multer en routes.js) para no
-  // acercarse al máximo de 16MB por documento de MongoDB.
+  // ── Comprobante de transferencia (opcional, LEGACY) ──────────────────────────
+  // Se guardaba como binario en Mongo (no en disco, para no depender de un
+  // volumen persistente en el contenedor) — límite bajo para no acercarse al
+  // máximo de 16MB por documento de MongoDB. Ya NO se escribe para solicitudes
+  // nuevas (ver `comprobantes[]` abajo, subidas a Drive) — se deja el campo tal
+  // cual para no perder los comprobantes de documentos viejos ni migrar nada.
   comprobante: {
     data:         { type: Buffer, default: null },
     mimetype:     { type: String, default: null },
     originalName: { type: String, default: null },
+  },
+
+  // ── Comprobantes de transferencia (uno o varios, guardados en Drive) ────────
+  // Cada uno puede corresponder a un depósito bancario DISTINTO (ej. cliente
+  // paga mitad por transferencia y mitad en efectivo, cada uno con su propio
+  // comprobante) — por eso es un arreglo y no un objeto único como el legacy.
+  // El binario vive en la carpeta compartida de Drive (GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID,
+  // ver drive-comprobantes.service.js); aquí solo se guarda la referencia.
+  comprobantes: {
+    type: [{
+      driveFileId:      { type: String, required: true, trim: true },
+      driveWebViewLink: { type: String, default: null },
+      mimetype:         { type: String, default: null },
+      originalName:     { type: String, default: null },
+      uploadedAt:       { type: Date, default: Date.now },
+    }],
+    default: [],
   },
 
   // ── Solicitante (usuario Numo con rol tienda, identificado por el ERP) ────────
@@ -129,13 +148,6 @@ const collectionRequestSchema = new mongoose.Schema({
   cobroAplicado:       { type: Boolean, default: false },
   cobroAplicadoAt:     { type: Date,    default: null },
   koreOperacionResult: { type: mongoose.Schema.Types.Mixed, default: null },
-
-  // true cuando el sistema identificó y aplicó el cobro solo (OCR del comprobante
-  // ≥95% de coincidencia normalizada + monto exacto), sin intervención humana —
-  // ver intentarAutoMatch() en collection-request.service.js. Cuando es true,
-  // resueltoPorUserId/resueltoPorNombre e identificadoPor (en el BankMovement)
-  // quedan con una identidad sintética, no con una persona real.
-  autoIdentificado:    { type: Boolean, default: false },
 
 }, { timestamps: true, collection: 'collection_requests' });
 

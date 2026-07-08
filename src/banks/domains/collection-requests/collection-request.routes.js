@@ -19,12 +19,15 @@ const upload = multer({
   },
 });
 
-// El comprobante de una solicitud de cobro se guarda como binario en Mongo (no en
-// disco — evita depender de un volumen persistente en el contenedor), así que se
-// limita a 5MB para no acercarse al máximo de 16MB por documento de MongoDB.
+// Los comprobantes de una solicitud de cobro se suben a Google Drive (ver
+// drive-comprobantes.service.js), no a Mongo — sin el límite de 5MB que antes
+// era necesario para no acercarse al máximo de 16MB por documento de MongoDB.
+// Hasta 6 archivos por solicitud (uno por depósito bancario distinto, típico
+// de Modo 1 con transferencia + efectivo + cheque).
+const MAX_COMPROBANTES = 6;
 const uploadComprobante = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: 5 * 1024 * 1024 },
+  limits:  { fileSize: 15 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
     const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
     if (allowed.includes(file.mimetype)) return cb(null, true);
@@ -59,12 +62,14 @@ router.post('/analyze',
 );
 
 // POST /api/collection-requests — crea una solicitud de cobro. Lo llama el ERP
-// (Kore) directamente, autenticado con API key, no con sesión Numo.
+// (Kore) directamente, autenticado con API key, no con sesión Numo. El campo
+// multipart es "comprobantes" (repetido una vez por archivo) — antes era
+// "comprobante" (singular); Kore debe actualizar su integración.
 router.post('/',
   requireErpApiKey,
-  uploadComprobante.single('comprobante'),
+  uploadComprobante.array('comprobantes', MAX_COMPROBANTES),
   asyncHandler(async (req, res) => {
-    res.status(201).json(await service.create(req.body, req.file));
+    res.status(201).json(await service.create(req.body, req.files));
   }),
 );
 
@@ -72,6 +77,14 @@ router.post('/',
 // (rol tienda revisando el estatus de lo que ha solicitado). Debe ir antes de /:id.
 router.get('/mias', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
   res.json(await service.listMine(req.user._id, req.query));
+}));
+
+// GET /api/collection-requests/erp/:solicitudIdErp — el ERP (Kore) consulta el
+// estado de la solicitud que él mismo creó, autenticado con su API key (no hay
+// sesión Numo). Debe ir antes de /:id para que Express no intente matchear
+// "erp" como si fuera un _id de Mongo.
+router.get('/erp/:solicitudIdErp', requireErpApiKey, asyncHandler(async (req, res) => {
+  res.json(await service.getByErpId(req.params.solicitudIdErp));
 }));
 
 // GET /api/collection-requests — bandeja para revisión (cobranza/contabilidad/admin)
@@ -84,19 +97,31 @@ router.get('/:id', authenticate, permit('collections:read'), asyncHandler(async 
   res.json(await service.getById(req.params.id));
 }));
 
-// GET /api/collection-requests/:id/comprobante — imagen/PDF del comprobante
+// GET /api/collection-requests/:id/comprobante — imagen/PDF del PRIMER
+// comprobante (compat con solicitudes de un solo archivo, viejas o nuevas).
 router.get('/:id/comprobante', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  const { data, mimetype, originalName } = await service.getComprobante(req.params.id);
+  const { data, mimetype, originalName } = await service.getComprobante(req.params.id, 0);
+  res.set('Content-Type', mimetype || 'application/octet-stream');
+  res.set('Content-Disposition', `inline; filename="${originalName || 'comprobante'}"`);
+  res.send(data);
+}));
+
+// GET /api/collection-requests/:id/comprobantes/:index — imagen/PDF del
+// comprobante en esa posición (0-based) — para solicitudes con varios.
+// Proxy autenticado: el archivo vive en Drive, nunca se expone un link público.
+router.get('/:id/comprobantes/:index', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  const { data, mimetype, originalName } = await service.getComprobante(req.params.id, parseInt(req.params.index, 10) || 0);
   res.set('Content-Type', mimetype || 'application/octet-stream');
   res.set('Content-Disposition', `inline; filename="${originalName || 'comprobante'}"`);
   res.send(data);
 }));
 
 // GET /api/collection-requests/:id/analyze-comprobante — corre OCR + matching
-// sobre el comprobante ya guardado (mismo motor que /analyze, sin volver a subir
-// el archivo), para ayudar a ubicar el movimiento bancario correspondiente.
+// sobre CADA comprobante ya guardado (mismo motor que /analyze, sin volver a
+// subir los archivos) — regresa un resultado por comprobante, nunca combinados,
+// para ayudar a ubicar el movimiento bancario correspondiente a cada uno.
 router.get('/:id/analyze-comprobante', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  res.json(await service.analyzeStoredComprobante(req.params.id));
+  res.json(await service.analyzeStoredComprobantes(req.params.id));
 }));
 
 // PATCH /api/collection-requests/:id/identificar — vincula la solicitud a un

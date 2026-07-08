@@ -181,7 +181,6 @@ const startServer = async () => {
 
   require('./visor/jobs/satSyncJob');
   require('./banks/jobs/erpSyncCron');
-  require('./banks/jobs/collectionRequestAutoMatchCron');
   try {
     await seed();
   } catch (err) {

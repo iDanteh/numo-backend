@@ -1639,6 +1639,10 @@ async function findMatchingMovements(ext) {
   if (!ext.monto) {
     const recent = await BankMovement.find({
       isActive: true,
+      // Solo movimientos libres — uno ya 'identificado' pertenece a otra CxC/
+      // solicitud y no debe ofrecerse como candidato (docs viejos sin status
+      // seteado cuentan como libres también, ver aplicarLogicaErp).
+      status:   { $in: ['no_identificado', null] },
       fecha:    { $gte: new Date(Date.now() - FALLBACK_WINDOW * 86_400_000) },
     }).sort({ fecha: -1 }).limit(15).lean();
 
@@ -1654,6 +1658,10 @@ async function findMatchingMovements(ext) {
   const tol = Math.max(0.50, ext.monto * 0.005);
   const filter = {
     isActive: true,
+    // Solo movimientos libres — uno ya 'identificado' pertenece a otra CxC/
+    // solicitud y no debe ofrecerse como candidato (docs viejos sin status
+    // seteado cuentan como libres también, ver aplicarLogicaErp).
+    status:   { $in: ['no_identificado', null] },
     $or: [
       { deposito: { $gte: ext.monto - tol, $lte: ext.monto + tol } },
       { retiro:   { $gte: ext.monto - tol, $lte: ext.monto + tol } },

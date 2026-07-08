@@ -106,9 +106,10 @@ const config = Object.freeze({
 
   /** Google Drive — integración via Service Account */
   google: Object.freeze({
-    serviceAccountKey: process.env.GOOGLE_SERVICE_ACCOUNT_KEY   || null,
-    driveRootFolderId: process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID  || null,
-    driveErpFolderId:  process.env.GOOGLE_DRIVE_ERP_FOLDER_ID   || null,
+    serviceAccountKey:         process.env.GOOGLE_SERVICE_ACCOUNT_KEY           || null,
+    driveRootFolderId:         process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID          || null,
+    driveErpFolderId:          process.env.GOOGLE_DRIVE_ERP_FOLDER_ID           || null,
+    driveComprobantesFolderId: process.env.GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID  || null,
   }),
 
 });

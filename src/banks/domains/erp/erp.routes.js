@@ -14,6 +14,7 @@ const { procesarPagosCyc,
         generarExcelPagosCyc }           = require('./pagos-cyc.service');
 const BankMovement                       = require('../banks/BankMovement.model');
 const { emitToUser }                     = require('../../shared/socket');
+const { ERP_TOLERANCE }                  = require('../banks/bank.service');
 const {
   KoreCajaError, koreTokenCache, KORE_CAJA_BASE_URL,
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
@@ -598,49 +599,105 @@ router.get('/cobros/saldos-favor/:personaId', authenticate, asyncHandler(async (
   res.json(filtrado);
 }));
 
-// ── POST /api/erp/sync-saldo-transferencia ────────────────────────────────────
-// Backfill: itera todos los movimientos bancarios con CxC vinculada, consulta
-// Kore por cada erpLink y actualiza saldoErp con la suma exacta de TRANSFERENCIA.
+// ── POST /api/erp/sync-erp-kore ────────────────────────────────────────────────
+// Job único de conciliación ERP-Kore. Reemplaza los antiguos "Sync Saldo ERP" y "Sync
+// Histórico Kore" (fusionados el 2026-07-09 para dejar de consultar Kore dos veces por la
+// misma CxC). Por cada erpLink con serie+folioExterno aún sin finalizar
+// (conciliacionFinalizadaAt === null):
+//   1. Siempre refresca el snapshot erpLinks[].movimientosKore con la respuesta actual de
+//      Kore, sin importar si la CxC ya se saldó — permite rastrear/auditar una CxC en curso.
+//   2. Si Kore confirma saldoActual === 0 (CxC saldada): calcula (solo si el vínculo es de
+//      un humano) el monto real aportado a saldoErp — ver _montoSaldoLink — y marca
+//      conciliacionFinalizadaAt (con o sin aporte; un vínculo de motor automático también
+//      se cierra, simplemente nunca aporta). Ya no hay nada más que Kore pueda reportar
+//      para esa CxC, así que el link deja de reconsultarse en corridas futuras.
+//   3. Si saldoActual !== 0: el link se deja abierto (conciliacionFinalizadaAt sigue null)
+//      — la siguiente corrida (manual, o el cron diario, que no acota por fecha) lo
+//      vuelve a intentar sin límite de antigüedad, hasta que la CxC se salde.
+// saldoErp/status del movimiento se recalculan SOLO si al menos un link (de esta corrida o
+// de una anterior) ya está finalizado; si ninguno lo está, se deja el valor existente
+// intacto (puede provenir de otra fuente — ver aplicarLogicaErp en bank.service.js).
 // Corre en background; emite progreso via Socket.IO al admin que lo disparó.
 
-let saldoSyncRunning      = false;
-let saldoSyncCurrentJobId = null;   // jobId del job activo (null si inactivo)
-const saldoSyncControl    = { paused: false, stopped: false, pauseResolve: null };
-const SALDO_SYNC_JOBS      = new Map(); // jobId → { status, auth0Sub, result?, error? }
-const SALDO_SYNC_JOB_TTL   = 2 * 60 * 60 * 1000; // el resultado (y el detalle para el reporte) vive en memoria este tiempo tras terminar
-const SALDO_SYNC_DELAY_MS    = 1000;       // pausa entre requests a Kore (subida de 500ms — Kore devolvía 429 con la anterior)
-const SALDO_SYNC_BACKOFF     = 25_000;     // fallback si Kore no indica cuánto esperar
-const SALDO_SYNC_MAX_RETRIES = 4;          // intentos por link antes de contar como error
-const SALDO_SYNC_FECHA_INICIO = new Date('2026-05-06T00:00:00.000Z');
-const SALDO_SYNC_FECHA_FIN    = new Date('2026-06-30T23:59:00.000Z');
-
-// "Sync Histórico Kore" — job independiente que solo enriquece erpLinks[].movimientosKore.
-// Comparte con Sync Saldo ERP la conexión a Kore y su rate limit, así que nunca corren a
-// la vez (cada POST de arranque valida ambas banderas: saldoSyncRunning || movKoreSyncRunning).
-let movKoreSyncRunning      = false;
-let movKoreSyncCurrentJobId = null;
-const movKoreSyncControl    = { paused: false, stopped: false, pauseResolve: null };
-const MOVKORE_SYNC_JOBS     = new Map(); // jobId → { status, auth0Sub, result?, error? }
+let syncRunning      = false;
+let syncCurrentJobId = null;   // jobId del job activo (null si inactivo)
+const syncControl    = { paused: false, stopped: false, pauseResolve: null };
+const SYNC_JOBS      = new Map(); // jobId → { status, auth0Sub, result?, error?, detalles? }
+const SYNC_JOB_TTL   = 2 * 60 * 60 * 1000; // el resultado (y el detalle para el reporte) vive en memoria este tiempo tras terminar
+const SYNC_DELAY_MS    = 1000;       // pausa entre requests a Kore (subida de 500ms — Kore devolvía 429 con la anterior)
+const SYNC_BACKOFF     = 25_000;     // fallback si Kore no indica cuánto esperar
+const SYNC_MAX_RETRIES = 4;          // intentos por link antes de contar como error
 
 const _sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// True si algún erpLink con este erpId fue identificado por una persona (no erp-auto).
+// True si algún erpLink con este erpId fue identificado por una persona (no por un motor
+// automático — MOTOR_USER_IDS, definida arriba: 'erp-auto' y 'aut-match').
 function _erpIdIdentificadoPorHumano(identificadoPor, erpId) {
   return (identificadoPor ?? []).some(
-    e => e.erpId === erpId && e.userId && e.userId !== 'erp-auto',
+    e => e.erpId === erpId && e.userId && !MOTOR_USER_IDS.includes(e.userId),
   );
 }
 
+// Nombres del catálogo de formas de pago de Kore que representan un DEPÓSITO BANCARIO real
+// para efectos de saldoErp. Deliberadamente DISTINTO de _esFormaBancaria() (cobro-panel /
+// collection-requests), que excluye cheque porque ese concepto solo alimenta el badge
+// "CxC vinculadas" — aquí SÍ se incluye: un cheque cobrado también es dinero real que entró
+// vía el banco. Coincidencia flexible (sin acentos, insensible a mayúsculas) porque no hay
+// certeza de que "depósito en efectivo" sea siempre el nombre exacto en el catálogo de Kore.
+function _esFormaPagoBancariaKore(nombreFormaPago) {
+  const norm = String(nombreFormaPago ?? '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .trim().toUpperCase();
+  return norm === 'TRANSFERENCIA'
+      || norm === 'CHEQUE'
+      || /DEPOSITO.*EFECTIVO/.test(norm);
+}
+
 // Monto realmente cobrado por el banco para una cuenta ya saldada: suma el 'total'
-// (nunca formasPago[].monto, que puede ser un depósito compartido entre varias CxC)
-// de cada movimiento con formaPago. Si la cuenta no está saldada, no hay abono que
-// tomar como definitivo — sin fallback a "abono más cercano".
+// (nunca formasPago[].monto, que puede ser un depósito compartido entre varias CxC, o —
+// como en el caso de una aplicación de saldo a favor/anticipo— ni siquiera corresponder al
+// total del movimiento que lo contiene) de cada movimiento cuya forma de pago sea bancaria
+// real. Excluye a propósito aplicaciones de saldo a favor, efectivo de caja, tarjeta, etc.
+// — esos movimientos también traen `formasPago` no vacío pero no son un depósito bancario.
 function _montoSaldoLink(raw0) {
   if (!raw0 || raw0.saldoActual !== 0) return 0;
-  const conPago = (raw0.movimientos ?? []).filter(
-    m => Array.isArray(m.formasPago) && m.formasPago.length > 0,
+  const conPagoBancario = (raw0.movimientos ?? []).filter(
+    m => Array.isArray(m.formasPago)
+      && m.formasPago.some(fp => _esFormaPagoBancariaKore(fp.nombreFormaPago)),
   );
-  return conPago.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
+  return conPagoBancario.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
+}
+
+// Deja solo dígitos y quita ceros a la izquierda — Kore antepone "REF " a algunas
+// autorizaciones y puede traer ceros a la izquierda distintos a los del banco.
+function _normalizarAutorizacion(v) {
+  return String(v ?? '').replace(/\D/g, '').replace(/^0+/, '');
+}
+
+// Monto aportado por un vínculo hecho por un MOTOR automático (erp-auto/aut-match).
+// A diferencia de _montoSaldoLink (usado para vínculos humanos, que suma TODO lo bancario
+// de la CxC), aquí NO se puede sumar todo — una CxC puede recibir varios depósitos
+// bancarios de movimientos bancarios distintos a lo largo del tiempo, y sumarlos todos
+// atribuiría a ESTE movimiento dinero que en realidad entró por otro depósito. En vez de
+// eso, se busca el movimiento de Kore cuya forma de pago trae la MISMA autorización
+// bancaria (`adicionales` → "Aut") que este depósito (`mov.numeroAutorizacion`) — el mismo
+// criterio que ya usa el motor de matching (bank-autorizaciones.service.js) para vincular
+// en primer lugar. Regresa null (no 0) si no se encuentra ninguna coincidencia — "no se
+// pudo determinar" es distinto de "el aporte es cero", y el llamador debe respetar esa
+// diferencia para no pisar un saldoErp ya correcto con un cero falso.
+function _montoSaldoLinkPorAutorizacion(raw0, numeroAutorizacion) {
+  if (!raw0 || raw0.saldoActual !== 0) return null;
+  const autNorm = _normalizarAutorizacion(numeroAutorizacion);
+  if (!autNorm) return null;
+  const movimiento = (raw0.movimientos ?? []).find(m =>
+    Array.isArray(m.formasPago) && m.formasPago.some(fp =>
+      _esFormaPagoBancariaKore(fp.nombreFormaPago)
+      && (fp.adicionales ?? []).some(a =>
+        a.nombre === 'Aut' && _normalizarAutorizacion(a.valor) === autNorm,
+      ),
+    ),
+  );
+  return movimiento ? Math.abs(movimiento.total ?? 0) : null;
 }
 
 // Snapshot mínimo de movimientos Kore para rastreo/conciliación manual — se guarda en
@@ -688,76 +745,73 @@ function _parseRetryAfterMs(responseData) {
 // Reintenta automáticamente en 429/503 respetando el tiempo que indica Kore.
 // Lanza en el último intento fallido o ante cualquier error no recuperable.
 async function _sincronizarConRetry(params) {
-  for (let attempt = 0; attempt < SALDO_SYNC_MAX_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < SYNC_MAX_RETRIES; attempt++) {
     try {
       return await sincronizarCuentasPendientes(params);
     } catch (err) {
       const status = err.response?.status;
       const retryable = status === 429 || status === 503;
-      if (!retryable || attempt === SALDO_SYNC_MAX_RETRIES - 1) throw err;
-      const wait = _parseRetryAfterMs(err.response?.data) ?? SALDO_SYNC_BACKOFF;
+      if (!retryable || attempt === SYNC_MAX_RETRIES - 1) throw err;
+      const wait = _parseRetryAfterMs(err.response?.data) ?? SYNC_BACKOFF;
       await _sleep(wait);
     }
   }
 }
 
-// Verifica si el job debe continuar (compartida por Sync Saldo ERP y Sync Histórico Kore,
-// cada uno con su propio objeto de control).
-// Si está en pausa, aguarda hasta que llegue el resume.
+// Verifica si el job debe continuar. Si está en pausa, aguarda hasta que llegue el resume.
 // Devuelve false si fue detenido (el loop debe hacer break).
-async function _checkSyncControl(control) {
-  if (control.stopped) return false;
-  if (control.paused) {
-    await new Promise(resolve => { control.pauseResolve = resolve; });
+async function _checkSyncControl() {
+  if (syncControl.stopped) return false;
+  if (syncControl.paused) {
+    await new Promise(resolve => { syncControl.pauseResolve = resolve; });
   }
-  return !control.stopped;
+  return !syncControl.stopped;
 }
 
-// Siempre salta movimientos ya marcados — cada ejecución continúa desde el checkpoint.
-// fechaInicio/fechaFin son ajustables por corrida (ver POST /sync-saldo-transferencia);
-// caen en SALDO_SYNC_FECHA_INICIO/FIN por defecto si el admin no las cambia.
-async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
-  saldoSyncCurrentJobId = jobId;
+// fechaInicio/fechaFin son ajustables por corrida manual (ver POST /sync-erp-kore); si
+// vienen null (corrida automática del cron, o manual sin fechas) no se acota por fecha —
+// se revisa TODO lo aún no finalizado, sin importar su antigüedad (ver punto 4 del diseño:
+// nunca dejar CxC rezagadas fuera del alcance de la corrida automática diaria).
+async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
+  syncCurrentJobId = jobId;
   try {
-    // null captura tanto el valor explícito null como documentos que aún no tienen el campo.
     const filter = {
-      'erpIds.0':       { $exists: true },
-      saldoErpSyncedAt: null,
-      fecha:            { $gte: fechaInicio, $lte: fechaFin },
-      identificadoPor:  { $elemMatch: { userId: { $nin: ['erp-auto', null] } } },
+      erpLinks: {
+        $elemMatch: {
+          serie:                    { $ne: null },
+          folioExterno:             { $ne: null },
+          conciliacionFinalizadaAt: null,
+        },
+      },
     };
+    if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
 
     const movements = await BankMovement.find(filter)
-      .select('_id folio banco concepto deposito fecha saldoErp erpLinks identificadoPor')
+      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor')
       .lean();
 
-    let procesados = 0, actualizados = 0, sinTransferencia = 0, errores = 0;
+    let procesados = 0, actualizados = 0, pendientes = 0, errores = 0;
     const total    = movements.length;
     let stopped    = false;
     const detalles = []; // una entrada por movimiento — insumo del reporte Excel
 
-    emitToUser(auth0Sub, 'bank:erp:saldo:progress',
-      { jobId, procesados, total, actualizados, sinTransferencia, errores, pct: 0 });
+    emitToUser(auth0Sub, 'bank:erp:sync:progress',
+      { jobId, procesados, total, actualizados, pendientes, errores, pct: 0 });
 
     for (const mov of movements) {
-      if (!await _checkSyncControl(saldoSyncControl)) { stopped = true; break; }
+      if (!await _checkSyncControl()) { stopped = true; break; }
 
       const links = mov.erpLinks ?? [];
-      let montoTotal  = 0;
-      let huboErrorMov = false;
-      let huboTipoPagoNuevo = false;
-      const linksDetalle = [];
-      // Copia editable de erpLinks — el sync ya re-consulta cada CxC en Kore para el
-      // cálculo de saldoErp, así que se aprovecha esa misma respuesta para completar
-      // `tipoPago` en links antiguos que se vincularon antes de que se capturara ese dato.
-      // El snapshot `movimientosKore` es responsabilidad exclusiva del job "Sync Histórico
-      // Kore" — este job nunca lo toca.
+      let huboErrorMov              = false;
+      let huboLinkTocado            = false;
+      let huboTipoPagoNuevo         = false;
+      let huboFinalizacionEnCorrida = false;
+      const linksDetalle    = [];
       const linksActualizados = links.map(l => ({ ...l }));
 
       for (let i = 0; i < links.length; i++) {
         const link = links[i];
-        if (!link.serie || !link.folioExterno) continue;
-        if (!_erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId)) continue;
+        if (!link.serie || !link.folioExterno || link.conciliacionFinalizadaAt) continue;
         const rango = _rangoDesdeFollo(link.folioExterno);
         if (!rango) continue;
         try {
@@ -767,104 +821,140 @@ async function _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             fechaDesde:   rango.fechaDesde,
             fechaHasta:   rango.fechaHasta,
           });
-          const aporte = _montoSaldoLink(raw[0]);
-          montoTotal += aporte;
-          if (raw[0]?.tipoPago) {
-            const tipoPagoNorm = String(raw[0].tipoPago).trim().toUpperCase();
+          const raw0 = raw[0];
+          linksActualizados[i].movimientosKore = _movimientosKoreDesde(raw0);
+          huboLinkTocado = true;
+
+          if (raw0?.tipoPago) {
+            const tipoPagoNorm = String(raw0.tipoPago).trim().toUpperCase();
             if (tipoPagoNorm !== (link.tipoPago ?? null)) {
               linksActualizados[i].tipoPago = tipoPagoNorm;
               huboTipoPagoNuevo = true;
             }
           }
-          linksDetalle.push({
-            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
-            saldoActual: raw[0]?.saldoActual ?? null, montoAportado: aporte,
-          });
-          await _sleep(SALDO_SYNC_DELAY_MS);
+
+          if (raw0?.saldoActual === 0) {
+            // CxC saldada. Vínculo humano: suma TODO lo bancario de la CxC (un humano ya
+            // confirmó visualmente que este depósito es el correcto). Vínculo de motor
+            // automático: NUNCA se suma todo lo bancario (la CxC pudo recibir varios
+            // depósitos de movimientos bancarios distintos a lo largo del tiempo) — se
+            // busca específicamente el movimiento de Kore cuya autorización bancaria
+            // coincide con la de ESTE depósito (mismo criterio que ya usa el motor de
+            // matching para vincular). Si no hay coincidencia, el aporte queda `null`
+            // ("no determinado", nunca "cero") para no pisar un saldoErp ya correcto.
+            const esHumano = _erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId);
+            const aporte   = esHumano
+              ? _montoSaldoLink(raw0)
+              : _montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
+            if (aporte != null) linksActualizados[i].saldoErpAportado = aporte;
+            linksActualizados[i].conciliacionFinalizadaAt = new Date();
+            linksActualizados[i].conciliacionRunId        = jobId;
+            huboFinalizacionEnCorrida = true;
+            linksDetalle.push({
+              erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+              estado: 'finalizado', montoAportado: aporte,
+            });
+          } else {
+            linksDetalle.push({
+              erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+              estado: 'pendiente', saldoActual: raw0?.saldoActual ?? null,
+            });
+          }
+          await _sleep(SYNC_DELAY_MS);
         } catch (err) {
           errores++;
           huboErrorMov = true;
           linksDetalle.push({
             erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
-            error: err.message || 'Error al consultar Kore',
+            estado: 'error', error: err.message || 'Error al consultar Kore',
           });
         }
       }
 
-      // Construir update: siempre marcar checkpoint; solo sobreescribir saldoErp si hubo monto;
-      // solo sobreescribir erpLinks si se completó algún tipoPago faltante.
-      // Si se actualiza saldoErp, se registra en _changelog (de/a + runId) para el reporte y para poder revertir.
-      const saldoErpAntes = mov.saldoErp ?? null;
-      const update = { $set: { saldoErpSyncedAt: new Date() } };
-      if (huboTipoPagoNuevo) update.$set.erpLinks = linksActualizados;
-      let estado;
-      if (montoTotal > 0) {
-        update.$set.saldoErp = montoTotal;
-        update.$push = {
-          _changelog: {
-            at: new Date(), via: 'erp-saldo-sync', campo: 'saldoErp',
-            de: saldoErpAntes, a: montoTotal, runId: jobId, revertedAt: null,
-          },
-        };
-        actualizados++;
-        estado = 'actualizado';
-      } else {
-        if (links.length > 0) sinTransferencia++;
-        estado = huboErrorMov ? 'error' : 'sinTransferencia';
+      const update = {};
+      if (huboLinkTocado || huboTipoPagoNuevo) update.$set = { erpLinks: linksActualizados };
+
+      // saldoErp/status se recalculan SOLO si al menos un link (de esta corrida o de una
+      // anterior) tiene un aporte realmente determinado (saldoErpAportado != null) —
+      // deliberadamente NO basta con que esté "finalizado": un vínculo de motor cerrado
+      // sin autorización coincidente no aporta nada confiable, y dejarlo disparar el
+      // recálculo pisaría con un cero falso un saldoErp que ya era correcto.
+      const hayAlgunAporteDeterminado = linksActualizados.some(l => l.saldoErpAportado != null);
+      if (hayAlgunAporteDeterminado) {
+        const saldoErpNuevo = linksActualizados.reduce((s, l) => s + (l.saldoErpAportado ?? 0), 0);
+        const bankAmount    = Math.abs(mov.deposito ?? mov.retiro ?? 0);
+        let statusNuevo      = saldoErpNuevo >= bankAmount - ERP_TOLERANCE ? 'identificado' : 'no_identificado';
+        if (mov.ficha && statusNuevo === 'no_identificado') statusNuevo = 'identificado';
+
+        if (saldoErpNuevo !== (mov.saldoErp ?? null) || statusNuevo !== mov.status) {
+          update.$set = { ...(update.$set ?? {}), saldoErp: saldoErpNuevo, status: statusNuevo };
+          update.$push = {
+            _changelog: {
+              at: new Date(), via: 'erp-sync', campo: 'saldoErp+status',
+              de: { saldoErp: mov.saldoErp ?? null, status: mov.status },
+              a:  { saldoErp: saldoErpNuevo, status: statusNuevo },
+              runId: jobId, revertedAt: null,
+            },
+          };
+        }
       }
-      await BankMovement.findByIdAndUpdate(mov._id, update);
+
+      let estado;
+      if (huboErrorMov)                                   estado = 'error';
+      else if (update.$push || huboFinalizacionEnCorrida)  estado = 'actualizado';
+      else                                                  estado = 'pendiente';
+      if (estado === 'actualizado') actualizados++;
+      if (estado === 'pendiente')   pendientes++;
+
+      if (update.$set || update.$push) {
+        await BankMovement.findByIdAndUpdate(mov._id, update);
+      }
 
       detalles.push({
         movementId: mov._id, folio: mov.folio, banco: mov.banco, concepto: mov.concepto,
         fecha: mov.fecha, deposito: mov.deposito,
-        saldoErpAntes, saldoErpDespues: montoTotal > 0 ? montoTotal : saldoErpAntes,
+        saldoErpAntes:   mov.saldoErp ?? null,
+        saldoErpDespues: update.$set?.saldoErp ?? mov.saldoErp ?? null,
         estado, links: linksDetalle,
       });
 
       procesados++;
-      emitToUser(auth0Sub, 'bank:erp:saldo:progress', {
-        jobId, procesados, total, actualizados, sinTransferencia, errores,
+      emitToUser(auth0Sub, 'bank:erp:sync:progress', {
+        jobId, procesados, total, actualizados, pendientes, errores,
         pct: Math.round((procesados / total) * 100),
       });
     }
 
     if (stopped) {
-      const result = { procesados, total, actualizados, sinTransferencia, errores };
-      SALDO_SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles });
-      emitToUser(auth0Sub, 'bank:erp:saldo:stopped', { jobId, ...result });
+      const result = { procesados, total, actualizados, pendientes, errores };
+      SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles });
+      emitToUser(auth0Sub, 'bank:erp:sync:stopped', { jobId, ...result });
     } else {
-      const result = { total, actualizados, sinTransferencia, errores };
-      SALDO_SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles });
-      emitToUser(auth0Sub, 'bank:erp:saldo:done', { jobId, ...result });
+      const result = { total, actualizados, pendientes, errores };
+      SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles });
+      emitToUser(auth0Sub, 'bank:erp:sync:done', { jobId, ...result });
     }
   } catch (err) {
-    const error = err.message || 'Error en sincronización de saldo ERP';
-    SALDO_SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error });
-    emitToUser(auth0Sub, 'bank:erp:saldo:error', { jobId, error });
+    const error = err.message || 'Error en sincronización ERP-Kore';
+    SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error });
+    emitToUser(auth0Sub, 'bank:erp:sync:error', { jobId, error });
   } finally {
-    saldoSyncRunning      = false;
-    saldoSyncCurrentJobId = null;
-    setTimeout(() => SALDO_SYNC_JOBS.delete(jobId), SALDO_SYNC_JOB_TTL);
+    syncRunning      = false;
+    syncCurrentJobId = null;
+    setTimeout(() => SYNC_JOBS.delete(jobId), SYNC_JOB_TTL);
   }
 }
 
-// GET los límites de fecha por defecto — el frontend los usa para precargar el formulario
-// antes de dejar que el admin los ajuste manualmente.
-router.get('/sync-saldo-transferencia/defaults', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  res.json({
-    fechaDesde: SALDO_SYNC_FECHA_INICIO.toISOString(),
-    fechaHasta: SALDO_SYNC_FECHA_FIN.toISOString(),
-  });
-}));
-
-router.post('/sync-saldo-transferencia', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (saldoSyncRunning || movKoreSyncRunning) {
-    return res.status(409).json({ error: 'Ya hay un proceso de sincronización ERP en curso.' });
+router.post('/sync-erp-kore', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  if (syncRunning) {
+    return res.status(409).json({ error: 'Ya hay una sincronización ERP-Kore en curso.' });
   }
 
-  // Rango de fechas ajustable por corrida — cae en los defaults si no se manda nada.
-  let fechaInicio = SALDO_SYNC_FECHA_INICIO;
-  let fechaFin    = SALDO_SYNC_FECHA_FIN;
+  // Rango de fechas OPCIONAL — sin acotar por defecto (procesa todo lo aún no finalizado,
+  // igual que la corrida automática). El admin puede escribir un rango para acotar una
+  // corrida puntual (ej. reprocesar solo un mes específico).
+  let fechaInicio = null;
+  let fechaFin    = null;
   if (req.body.fechaDesde) {
     fechaInicio = new Date(req.body.fechaDesde);
     if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
@@ -873,81 +963,81 @@ router.post('/sync-saldo-transferencia', authenticate, permit('banks:admin'), as
     fechaFin = new Date(req.body.fechaHasta);
     if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
   }
-  if (fechaInicio > fechaFin) {
+  if (fechaInicio && fechaFin && fechaInicio > fechaFin) {
     return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
   }
 
   // Resetear control antes de cada job nuevo
-  saldoSyncControl.paused       = false;
-  saldoSyncControl.stopped      = false;
-  saldoSyncControl.pauseResolve = null;
+  syncControl.paused       = false;
+  syncControl.stopped      = false;
+  syncControl.pauseResolve = null;
 
-  saldoSyncRunning = true;
-  const jobId    = `saldo-sync-${Date.now()}`;
+  syncRunning = true;
+  const jobId    = `erp-sync-${Date.now()}`;
   const auth0Sub = req.user._id;
 
-  SALDO_SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
   res.status(202).json({ jobId });
 
-  _syncSaldoJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
+  _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
 }));
 
-router.post('/sync-saldo-transferencia/pause', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (!saldoSyncRunning || saldoSyncControl.paused) {
+router.post('/sync-erp-kore/pause', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  if (!syncRunning || syncControl.paused) {
     return res.status(409).json({ error: 'No hay sincronización activa para pausar.' });
   }
-  saldoSyncControl.paused = true;
-  if (saldoSyncCurrentJobId) {
-    const job = SALDO_SYNC_JOBS.get(saldoSyncCurrentJobId);
-    if (job) SALDO_SYNC_JOBS.set(saldoSyncCurrentJobId, { ...job, status: 'paused' });
-    emitToUser(req.user._id, 'bank:erp:saldo:paused', { jobId: saldoSyncCurrentJobId });
+  syncControl.paused = true;
+  if (syncCurrentJobId) {
+    const job = SYNC_JOBS.get(syncCurrentJobId);
+    if (job) SYNC_JOBS.set(syncCurrentJobId, { ...job, status: 'paused' });
+    emitToUser(req.user._id, 'bank:erp:sync:paused', { jobId: syncCurrentJobId });
   }
   res.json({ ok: true });
 }));
 
-router.post('/sync-saldo-transferencia/resume', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (!saldoSyncRunning || !saldoSyncControl.paused) {
+router.post('/sync-erp-kore/resume', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  if (!syncRunning || !syncControl.paused) {
     return res.status(409).json({ error: 'No hay sincronización en pausa para reanudar.' });
   }
-  saldoSyncControl.paused = false;
-  saldoSyncControl.pauseResolve?.();
-  saldoSyncControl.pauseResolve = null;
-  if (saldoSyncCurrentJobId) {
-    const job = SALDO_SYNC_JOBS.get(saldoSyncCurrentJobId);
-    if (job) SALDO_SYNC_JOBS.set(saldoSyncCurrentJobId, { ...job, status: 'running' });
-    emitToUser(req.user._id, 'bank:erp:saldo:resumed', { jobId: saldoSyncCurrentJobId });
+  syncControl.paused = false;
+  syncControl.pauseResolve?.();
+  syncControl.pauseResolve = null;
+  if (syncCurrentJobId) {
+    const job = SYNC_JOBS.get(syncCurrentJobId);
+    if (job) SYNC_JOBS.set(syncCurrentJobId, { ...job, status: 'running' });
+    emitToUser(req.user._id, 'bank:erp:sync:resumed', { jobId: syncCurrentJobId });
   }
   res.json({ ok: true });
 }));
 
-router.post('/sync-saldo-transferencia/stop', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (!saldoSyncRunning) {
+router.post('/sync-erp-kore/stop', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  if (!syncRunning) {
     return res.status(409).json({ error: 'No hay sincronización en curso para detener.' });
   }
-  saldoSyncControl.stopped = true;
+  syncControl.stopped = true;
   // Si estaba en pausa, destrabar el await para que el job detecte stopped
-  if (saldoSyncControl.paused) {
-    saldoSyncControl.paused = false;
-    saldoSyncControl.pauseResolve?.();
-    saldoSyncControl.pauseResolve = null;
+  if (syncControl.paused) {
+    syncControl.paused = false;
+    syncControl.pauseResolve?.();
+    syncControl.pauseResolve = null;
   }
   res.json({ ok: true });
 }));
 
 // GET polling de estado — permite recuperar el job tras un reload de página (fallback del socket).
-// Sin chequeo de dueño: el job es global (un solo Sync Saldo ERP corre a la vez para todo el
-// sistema, igual que pause/resume/stop), así que cualquier admin puede consultarlo.
-router.get('/sync-saldo-transferencia/:jobId/status', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const job = SALDO_SYNC_JOBS.get(req.params.jobId);
+// Sin chequeo de dueño: el job es global (una sola corrida a la vez para todo el sistema,
+// igual que pause/resume/stop), así que cualquier admin puede consultarlo.
+router.get('/sync-erp-kore/:jobId/status', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const job = SYNC_JOBS.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job no encontrado o expirado' });
   const { auth0Sub: _auth0Sub, detalles: _detalles, ...jobResponse } = job;
   res.json(jobResponse);
 }));
 
-// GET historial de corridas recientes (mientras sigan vivas en memoria, ver SALDO_SYNC_JOB_TTL).
+// GET historial de corridas recientes (mientras sigan vivas en memoria, ver SYNC_JOB_TTL).
 // Permite recuperar el reporte/revertir una corrida anterior, no solo la última.
-router.get('/sync-saldo-transferencia/jobs', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const jobs = [...SALDO_SYNC_JOBS.entries()]
+router.get('/sync-erp-kore/jobs', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const jobs = [...SYNC_JOBS.entries()]
     .map(([jobId, job]) => ({
       jobId,
       status:    job.status,
@@ -955,15 +1045,16 @@ router.get('/sync-saldo-transferencia/jobs', authenticate, permit('banks:admin')
       error:     job.error  ?? null,
       hasReport: Array.isArray(job.detalles) && job.detalles.length > 0,
     }))
-    .sort((a, b) => (a.jobId < b.jobId ? 1 : -1)); // más reciente primero (jobId = saldo-sync-<timestamp>)
+    .sort((a, b) => (a.jobId < b.jobId ? 1 : -1)); // más reciente primero (jobId = erp-sync-<timestamp>)
   res.json(jobs);
 }));
 
-// ── Reporte Excel del job Sync Saldo ERP ──────────────────────────────────────
-// 3 hojas: Actualizados (antes/después) · Sin transferencia · Errores.
-function _generarExcelSaldoErp(detalles) {
+// ── Reporte Excel del job Sync ERP-Kore ───────────────────────────────────────
+// 3 hojas: Actualizados (antes/después + diferencia vs. depósito real) · Pendientes
+// (CxC aún no saldada en Kore) · Errores.
+function _generarExcelSyncErpKore(detalles) {
   const wb = new ExcelJS.Workbook();
-  wb.creator = 'Numo — Sync Saldo ERP';
+  wb.creator = 'Numo — Sync ERP-Kore';
   wb.created = new Date();
 
   const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
@@ -993,49 +1084,57 @@ function _generarExcelSaldoErp(detalles) {
   // ── Hoja 1: Actualizados ──────────────────────────────────────────────────
   const wsAct = wb.addWorksheet('Actualizados');
   wsAct.columns = [
-    { header: 'Movimiento (folio)', key: 'folio',    width: 14 },
-    { header: 'Banco',              key: 'banco',    width: 14 },
-    { header: 'Fecha',              key: 'fecha',    width: 12 },
-    { header: 'Depósito',           key: 'deposito', width: 14 },
-    { header: 'Saldo ERP antes',    key: 'antes',    width: 16 },
-    { header: 'Saldo ERP después',  key: 'despues',  width: 16 },
-    { header: 'Diferencia',         key: 'diff',     width: 14 },
-    { header: 'CxC vinculadas',     key: 'cxc',      width: 30 },
-    { header: 'Movimiento ID',      key: 'id',       width: 28 },
+    { header: 'Movimiento (folio)',            key: 'folio',    width: 14 },
+    { header: 'Banco',                         key: 'banco',    width: 14 },
+    { header: 'Fecha',                         key: 'fecha',    width: 12 },
+    { header: 'Depósito',                      key: 'deposito', width: 14 },
+    { header: 'Saldo ERP antes',                key: 'antes',    width: 16 },
+    { header: 'Saldo ERP después',              key: 'despues',  width: 16 },
+    { header: 'Diferencia',                     key: 'diff',     width: 14 },
+    { header: 'Diferencia vs. depósito real',   key: 'diffDep',  width: 22 },
+    { header: 'CxC vinculadas',                 key: 'cxc',      width: 30 },
+    { header: 'Movimiento ID',                  key: 'id',       width: 28 },
   ];
   styleHeader(wsAct);
   for (const d of detalles.filter(d => d.estado === 'actualizado')) {
-    const antes = d.saldoErpAntes ?? 0;
+    const antes  = d.saldoErpAntes ?? 0;
+    const despues = d.saldoErpDespues ?? 0;
     const row = wsAct.addRow({
       folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
       deposito: d.deposito, antes: d.saldoErpAntes, despues: d.saldoErpDespues,
-      diff: (d.saldoErpDespues ?? 0) - antes, cxc: foliosCxc(d), id: String(d.movementId),
+      diff: despues - antes, diffDep: despues - Math.abs(d.deposito ?? 0),
+      cxc: foliosCxc(d), id: String(d.movementId),
     });
     row.eachCell(cell => { cell.fill = OK_FILL; });
   }
-  ['deposito', 'antes', 'despues', 'diff'].forEach(k => { wsAct.getColumn(k).numFmt = '#,##0.00'; });
+  ['deposito', 'antes', 'despues', 'diff', 'diffDep'].forEach(k => { wsAct.getColumn(k).numFmt = '#,##0.00'; });
   if (wsAct.lastColumn) wsAct.autoFilter = { from: 'A1', to: wsAct.lastColumn.letter + '1' };
 
-  // ── Hoja 2: Sin transferencia ─────────────────────────────────────────────
-  const wsSin = wb.addWorksheet('Sin transferencia');
-  wsSin.columns = [
+  // ── Hoja 2: Pendientes ────────────────────────────────────────────────────
+  const wsPen = wb.addWorksheet('Pendientes');
+  wsPen.columns = [
     { header: 'Movimiento (folio)', key: 'folio',    width: 14 },
     { header: 'Banco',              key: 'banco',    width: 14 },
     { header: 'Fecha',              key: 'fecha',    width: 12 },
     { header: 'Depósito',           key: 'deposito', width: 14 },
-    { header: 'Saldo ERP',          key: 'saldo',    width: 16 },
-    { header: 'CxC vinculadas',     key: 'cxc',      width: 30 },
+    { header: 'Saldo ERP actual',   key: 'saldo',    width: 16 },
+    { header: 'Motivo',             key: 'motivo',   width: 26 },
+    { header: 'CxC pendientes',     key: 'cxc',      width: 30 },
     { header: 'Movimiento ID',      key: 'id',       width: 28 },
   ];
-  styleHeader(wsSin);
-  for (const d of detalles.filter(d => d.estado === 'sinTransferencia')) {
-    const row = wsSin.addRow({
+  styleHeader(wsPen);
+  for (const d of detalles.filter(d => d.estado === 'pendiente')) {
+    const pendientesLinks = d.links.filter(l => l.estado === 'pendiente');
+    const row = wsPen.addRow({
       folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
-      deposito: d.deposito, saldo: d.saldoErpAntes, cxc: foliosCxc(d), id: String(d.movementId),
+      deposito: d.deposito, saldo: d.saldoErpAntes,
+      motivo: 'CxC aún no saldada en Kore',
+      cxc: pendientesLinks.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', '),
+      id: String(d.movementId),
     });
     row.eachCell(cell => { cell.fill = WARN_FILL; });
   }
-  ['deposito', 'saldo'].forEach(k => { wsSin.getColumn(k).numFmt = '#,##0.00'; });
+  ['deposito', 'saldo'].forEach(k => { wsPen.getColumn(k).numFmt = '#,##0.00'; });
 
   // ── Hoja 3: Errores ───────────────────────────────────────────────────────
   const wsErr = wb.addWorksheet('Errores');
@@ -1062,31 +1161,38 @@ function _generarExcelSaldoErp(detalles) {
   return wb.xlsx.writeBuffer();
 }
 
-// GET reporte de una corrida — disponible solo mientras el job siga en memoria (SALDO_SYNC_JOB_TTL).
-router.get('/sync-saldo-transferencia/:jobId/report', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const job = SALDO_SYNC_JOBS.get(req.params.jobId);
+// GET reporte de una corrida — disponible solo mientras el job siga en memoria (SYNC_JOB_TTL).
+router.get('/sync-erp-kore/:jobId/report', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const job = SYNC_JOBS.get(req.params.jobId);
   if (!job || !job.detalles) {
     return res.status(404).json({ error: 'El reporte ya no está disponible (expiró o el jobId no existe).' });
   }
 
-  const buffer = await _generarExcelSaldoErp(job.detalles);
+  const buffer = await _generarExcelSyncErpKore(job.detalles);
   const fecha  = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="sync-saldo-erp-${fecha}.xlsx"`);
+  res.setHeader('Content-Disposition', `attachment; filename="sync-erp-kore-${fecha}.xlsx"`);
   res.send(buffer);
 }));
 
-// POST revierte todos los saldoErp actualizados por una corrida (runId = jobId).
-// Restaura el valor 'de' guardado en _changelog y limpia saldoErpSyncedAt para que
-// el próximo sync vuelva a tomar el movimiento. No revierte movimientos que ya fueron
-// tocados por una corrida MÁS RECIENTE (se detecta comparando 'at' dentro de _changelog),
-// para no pisar trabajo de sincronización posterior. Las entradas de _changelog nunca
-// se borran — se marcan con revertedAt, preservando el rastro de auditoría.
-router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+// POST revierte una corrida (runId = jobId): restaura saldoErp/status al valor 'de' guardado
+// en _changelog (sin pisar una corrida MÁS RECIENTE — mismo criterio que antes) Y limpia el
+// checkpoint por CxC (conciliacionFinalizadaAt/saldoErpAportado/conciliacionRunId) de los
+// links finalizados por esta corrida exacta, para que la próxima corrida los vuelva a tomar.
+// A diferencia del changelog (que si puede quedar "protegido" por una corrida posterior), el
+// checkpoint por link SIEMPRE se limpia si coincide el runId — una CxC finalizada no puede
+// haber sido "re-finalizada" por otra corrida más nueva mientras siga marcada, así que no
+// necesita la misma guardia de "más reciente".
+router.post('/sync-erp-kore/:jobId/revert', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
   const runId = req.params.jobId;
 
   const result = await BankMovement.updateMany(
-    { _changelog: { $elemMatch: { via: 'erp-saldo-sync', runId, revertedAt: null } } },
+    {
+      $or: [
+        { _changelog: { $elemMatch: { via: 'erp-sync', runId, revertedAt: null } } },
+        { 'erpLinks.conciliacionRunId': runId },
+      ],
+    },
     [
       {
         $set: {
@@ -1096,7 +1202,7 @@ router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('ban
                 input: '$_changelog', as: 'c',
                 cond: {
                   $and: [
-                    { $eq: ['$$c.via', 'erp-saldo-sync'] },
+                    { $eq: ['$$c.via', 'erp-sync'] },
                     { $eq: ['$$c.runId', runId] },
                     { $eq: ['$$c.revertedAt', null] },
                   ],
@@ -1116,7 +1222,7 @@ router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('ban
                     input: '$_changelog', as: 'c',
                     cond: {
                       $and: [
-                        { $eq: ['$$c.via', 'erp-saldo-sync'] },
+                        { $eq: ['$$c.via', 'erp-sync'] },
                         { $gt: ['$$c.at', '$_entradaRevert.at'] },
                       ],
                     },
@@ -1130,8 +1236,18 @@ router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('ban
       },
       {
         $set: {
-          saldoErp:         { $cond: ['$_esLaMasReciente', '$_entradaRevert.de', '$saldoErp'] },
-          saldoErpSyncedAt: { $cond: ['$_esLaMasReciente', null, '$saldoErpSyncedAt'] },
+          saldoErp: {
+            $cond: [
+              { $and: ['$_entradaRevert', '$_esLaMasReciente'] },
+              '$_entradaRevert.de.saldoErp', '$saldoErp',
+            ],
+          },
+          status: {
+            $cond: [
+              { $and: ['$_entradaRevert', '$_esLaMasReciente'] },
+              '$_entradaRevert.de.status', '$status',
+            ],
+          },
           _changelog: {
             $map: {
               input: '$_changelog', as: 'c',
@@ -1140,13 +1256,33 @@ router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('ban
                   {
                     $and: [
                       '$_esLaMasReciente',
-                      { $eq: ['$$c.via', 'erp-saldo-sync'] },
+                      { $eq: ['$$c.via', 'erp-sync'] },
                       { $eq: ['$$c.runId', runId] },
                       { $eq: ['$$c.revertedAt', null] },
                     ],
                   },
                   { $mergeObjects: ['$$c', { revertedAt: '$$NOW' }] },
                   '$$c',
+                ],
+              },
+            },
+          },
+        },
+      },
+      {
+        $set: {
+          erpLinks: {
+            $map: {
+              input: '$erpLinks', as: 'l',
+              in: {
+                $cond: [
+                  { $eq: ['$$l.conciliacionRunId', runId] },
+                  {
+                    $mergeObjects: ['$$l', {
+                      saldoErpAportado: null, conciliacionFinalizadaAt: null, conciliacionRunId: null,
+                    }],
+                  },
+                  '$$l',
                 ],
               },
             },
@@ -1166,408 +1302,34 @@ router.post('/sync-saldo-transferencia/:jobId/revert', authenticate, permit('ban
   });
 }));
 
-// ── POST /api/erp/sync-movimientos-kore ───────────────────────────────────────
-// Enriquece erpLinks[].movimientosKore para CUALQUIER movimiento con CxC vinculada
-// (humana o de motor automático — a diferencia de Sync Saldo ERP, no filtra por
-// identificadoPor). Responsabilidad única: nunca toca saldoErp, tipoPago,
-// erpLinks[].total ni _changelog. Mutuamente excluyente con Sync Saldo ERP (comparten
-// Kore y su rate limit).
-async function _syncMovimientosKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
-  movKoreSyncCurrentJobId = jobId;
-  try {
-    const filter = {
-      fecha: { $gte: fechaInicio, $lte: fechaFin },
-      erpLinks: {
-        $elemMatch: {
-          serie:                   { $ne: null },
-          folioExterno:            { $ne: null },
-          movimientosKoreSyncedAt: null,
-        },
-      },
-    };
-
-    const movements = await BankMovement.find(filter)
-      .select('_id folio banco concepto fecha erpLinks')
-      .lean();
-
-    let procesados = 0, enriquecidos = 0, sinMovimientosAdicionales = 0, errores = 0;
-    const total    = movements.length;
-    let stopped    = false;
-    const detalles = []; // una entrada por movimiento — insumo del reporte Excel
-
-    emitToUser(auth0Sub, 'bank:erp:movkore:progress',
-      { jobId, procesados, total, enriquecidos, sinMovimientosAdicionales, errores, pct: 0 });
-
-    for (const mov of movements) {
-      if (!await _checkSyncControl(movKoreSyncControl)) { stopped = true; break; }
-
-      const links = mov.erpLinks ?? [];
-      let huboErrorMov      = false;
-      let huboEnriquecido   = false;
-      let huboLinkTocado    = false;
-      const linksDetalle    = [];
-      const linksActualizados = links.map(l => ({ ...l }));
-
-      for (let i = 0; i < links.length; i++) {
-        const link = links[i];
-        if (!link.serie || !link.folioExterno || link.movimientosKoreSyncedAt) continue;
-        const rango = _rangoDesdeFollo(link.folioExterno);
-        if (!rango) continue;
-        try {
-          const { raw } = await _sincronizarConRetry({
-            serieExterna: link.serie,
-            folioExterno: String(link.folioExterno),
-            fechaDesde:   rango.fechaDesde,
-            fechaHasta:   rango.fechaHasta,
-          });
-          const movKore = _movimientosKoreDesde(raw[0]);
-          linksActualizados[i].movimientosKore        = movKore;
-          linksActualizados[i].movimientosKoreSyncedAt = new Date();
-          linksActualizados[i].movimientosKoreRunId    = jobId;
-          huboLinkTocado = true;
-          if (movKore.length > 0) huboEnriquecido = true;
-          linksDetalle.push({
-            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
-            movimientosAgregados: movKore.length,
-          });
-          await _sleep(SALDO_SYNC_DELAY_MS);
-        } catch (err) {
-          errores++;
-          huboErrorMov = true;
-          // No se toca el checkpoint de este link — la siguiente corrida lo reintenta sola.
-          linksDetalle.push({
-            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
-            error: err.message || 'Error al consultar Kore',
-          });
-        }
-      }
-
-      if (huboLinkTocado) {
-        await BankMovement.findByIdAndUpdate(mov._id, { $set: { erpLinks: linksActualizados } });
-      }
-
-      let estado;
-      if (huboErrorMov) { estado = 'error'; }
-      else if (huboEnriquecido) { estado = 'enriquecido'; enriquecidos++; }
-      else { estado = 'sinMovimientosAdicionales'; sinMovimientosAdicionales++; }
-
-      detalles.push({
-        movementId: mov._id, folio: mov.folio, banco: mov.banco, concepto: mov.concepto,
-        fecha: mov.fecha, estado, links: linksDetalle,
-      });
-
-      procesados++;
-      emitToUser(auth0Sub, 'bank:erp:movkore:progress', {
-        jobId, procesados, total, enriquecidos, sinMovimientosAdicionales, errores,
-        pct: Math.round((procesados / total) * 100),
-      });
-    }
-
-    if (stopped) {
-      const result = { procesados, total, enriquecidos, sinMovimientosAdicionales, errores };
-      MOVKORE_SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles });
-      emitToUser(auth0Sub, 'bank:erp:movkore:stopped', { jobId, ...result });
-    } else {
-      const result = { total, enriquecidos, sinMovimientosAdicionales, errores };
-      MOVKORE_SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles });
-      emitToUser(auth0Sub, 'bank:erp:movkore:done', { jobId, ...result });
-    }
-  } catch (err) {
-    const error = err.message || 'Error en sincronización de movimientos Kore';
-    MOVKORE_SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error });
-    emitToUser(auth0Sub, 'bank:erp:movkore:error', { jobId, error });
-  } finally {
-    movKoreSyncRunning      = false;
-    movKoreSyncCurrentJobId = null;
-    setTimeout(() => MOVKORE_SYNC_JOBS.delete(jobId), SALDO_SYNC_JOB_TTL);
-  }
-}
-
-router.post('/sync-movimientos-kore', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (saldoSyncRunning || movKoreSyncRunning) {
-    return res.status(409).json({ error: 'Ya hay un proceso de sincronización ERP en curso.' });
-  }
-
-  // Mismo rango de fechas (y mismos defaults) que usa Sync Saldo ERP.
-  let fechaInicio = SALDO_SYNC_FECHA_INICIO;
-  let fechaFin    = SALDO_SYNC_FECHA_FIN;
-  if (req.body.fechaDesde) {
-    fechaInicio = new Date(req.body.fechaDesde);
-    if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
-  }
-  if (req.body.fechaHasta) {
-    fechaFin = new Date(req.body.fechaHasta);
-    if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
-  }
-  if (fechaInicio > fechaFin) {
-    return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
-  }
-
-  movKoreSyncControl.paused       = false;
-  movKoreSyncControl.stopped      = false;
-  movKoreSyncControl.pauseResolve = null;
-
-  movKoreSyncRunning = true;
-  const jobId    = `movkore-sync-${Date.now()}`;
-  const auth0Sub = req.user._id;
-
-  MOVKORE_SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
-  res.status(202).json({ jobId });
-
-  _syncMovimientosKoreJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
-}));
-
-router.post('/sync-movimientos-kore/pause', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (!movKoreSyncRunning || movKoreSyncControl.paused) {
-    return res.status(409).json({ error: 'No hay sincronización activa para pausar.' });
-  }
-  movKoreSyncControl.paused = true;
-  if (movKoreSyncCurrentJobId) {
-    const job = MOVKORE_SYNC_JOBS.get(movKoreSyncCurrentJobId);
-    if (job) MOVKORE_SYNC_JOBS.set(movKoreSyncCurrentJobId, { ...job, status: 'paused' });
-    emitToUser(req.user._id, 'bank:erp:movkore:paused', { jobId: movKoreSyncCurrentJobId });
-  }
-  res.json({ ok: true });
-}));
-
-router.post('/sync-movimientos-kore/resume', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (!movKoreSyncRunning || !movKoreSyncControl.paused) {
-    return res.status(409).json({ error: 'No hay sincronización en pausa para reanudar.' });
-  }
-  movKoreSyncControl.paused = false;
-  movKoreSyncControl.pauseResolve?.();
-  movKoreSyncControl.pauseResolve = null;
-  if (movKoreSyncCurrentJobId) {
-    const job = MOVKORE_SYNC_JOBS.get(movKoreSyncCurrentJobId);
-    if (job) MOVKORE_SYNC_JOBS.set(movKoreSyncCurrentJobId, { ...job, status: 'running' });
-    emitToUser(req.user._id, 'bank:erp:movkore:resumed', { jobId: movKoreSyncCurrentJobId });
-  }
-  res.json({ ok: true });
-}));
-
-router.post('/sync-movimientos-kore/stop', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (!movKoreSyncRunning) {
-    return res.status(409).json({ error: 'No hay sincronización en curso para detener.' });
-  }
-  movKoreSyncControl.stopped = true;
-  if (movKoreSyncControl.paused) {
-    movKoreSyncControl.paused = false;
-    movKoreSyncControl.pauseResolve?.();
-    movKoreSyncControl.pauseResolve = null;
-  }
-  res.json({ ok: true });
-}));
-
-// GET polling de estado — permite recuperar el job tras un reload de página (fallback del socket).
-router.get('/sync-movimientos-kore/:jobId/status', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const job = MOVKORE_SYNC_JOBS.get(req.params.jobId);
-  if (!job) return res.status(404).json({ error: 'Job no encontrado o expirado' });
-  const { auth0Sub: _auth0Sub, detalles: _detalles, ...jobResponse } = job;
-  res.json(jobResponse);
-}));
-
-// GET historial de corridas recientes (mientras sigan vivas en memoria, ver SALDO_SYNC_JOB_TTL).
-router.get('/sync-movimientos-kore/jobs', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const jobs = [...MOVKORE_SYNC_JOBS.entries()]
-    .map(([jobId, job]) => ({
-      jobId,
-      status:    job.status,
-      result:    job.result ?? null,
-      error:     job.error  ?? null,
-      hasReport: Array.isArray(job.detalles) && job.detalles.length > 0,
-    }))
-    .sort((a, b) => (a.jobId < b.jobId ? 1 : -1)); // más reciente primero (jobId = movkore-sync-<timestamp>)
-  res.json(jobs);
-}));
-
-// ── Reporte Excel del job Sync Histórico Kore ─────────────────────────────────
-// 3 hojas: Enriquecidos · Sin movimientos adicionales · Errores.
-function _generarExcelMovimientosKore(detalles) {
-  const wb = new ExcelJS.Workbook();
-  wb.creator = 'Numo — Sync Histórico Kore';
-  wb.created = new Date();
-
-  const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
-  const HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
-  const OK_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
-  const WARN_FILL   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF9C3' } };
-  const ERR_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEE2E2' } };
-
-  function formatFecha(d) {
-    if (!d) return '';
-    const dt = d instanceof Date ? d : new Date(d);
-    if (isNaN(dt.getTime())) return '';
-    return dt.toLocaleDateString('es-MX', { day: '2-digit', month: '2-digit', year: 'numeric' });
-  }
-
-  function styleHeader(ws) {
-    ws.getRow(1).eachCell(cell => {
-      cell.fill = HEADER_FILL;
-      cell.font = HEADER_FONT;
-      cell.alignment = { vertical: 'middle', horizontal: 'center' };
-    });
-    ws.getRow(1).height = 20;
-  }
-
-  const foliosCxc = d => d.links.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', ');
-
-  // ── Hoja 1: Enriquecidos ──────────────────────────────────────────────────
-  const wsEnr = wb.addWorksheet('Enriquecidos');
-  wsEnr.columns = [
-    { header: 'Movimiento (folio)',      key: 'folio',   width: 14 },
-    { header: 'Banco',                   key: 'banco',   width: 14 },
-    { header: 'Fecha',                   key: 'fecha',   width: 12 },
-    { header: 'CxC vinculadas',          key: 'cxc',     width: 30 },
-    { header: 'Movimientos Kore agregados', key: 'n',    width: 20 },
-    { header: 'Movimiento ID',           key: 'id',      width: 28 },
-  ];
-  styleHeader(wsEnr);
-  for (const d of detalles.filter(d => d.estado === 'enriquecido')) {
-    const n = d.links.reduce((s, l) => s + (l.movimientosAgregados ?? 0), 0);
-    const row = wsEnr.addRow({
-      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
-      cxc: foliosCxc(d), n, id: String(d.movementId),
-    });
-    row.eachCell(cell => { cell.fill = OK_FILL; });
-  }
-  if (wsEnr.lastColumn) wsEnr.autoFilter = { from: 'A1', to: wsEnr.lastColumn.letter + '1' };
-
-  // ── Hoja 2: Sin movimientos adicionales ───────────────────────────────────
-  const wsSin = wb.addWorksheet('Sin movimientos adicionales');
-  wsSin.columns = [
-    { header: 'Movimiento (folio)', key: 'folio', width: 14 },
-    { header: 'Banco',              key: 'banco', width: 14 },
-    { header: 'Fecha',              key: 'fecha', width: 12 },
-    { header: 'CxC vinculadas',     key: 'cxc',   width: 30 },
-    { header: 'Movimiento ID',      key: 'id',    width: 28 },
-  ];
-  styleHeader(wsSin);
-  for (const d of detalles.filter(d => d.estado === 'sinMovimientosAdicionales')) {
-    const row = wsSin.addRow({
-      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
-      cxc: foliosCxc(d), id: String(d.movementId),
-    });
-    row.eachCell(cell => { cell.fill = WARN_FILL; });
-  }
-
-  // ── Hoja 3: Errores ───────────────────────────────────────────────────────
-  const wsErr = wb.addWorksheet('Errores');
-  wsErr.columns = [
-    { header: 'Movimiento (folio)', key: 'folio',   width: 14 },
-    { header: 'Banco',              key: 'banco',   width: 14 },
-    { header: 'Fecha',              key: 'fecha',   width: 12 },
-    { header: 'CxC con error',      key: 'cxc',     width: 30 },
-    { header: 'Detalle del error',  key: 'detalle', width: 50 },
-    { header: 'Movimiento ID',      key: 'id',      width: 28 },
-  ];
-  styleHeader(wsErr);
-  for (const d of detalles.filter(d => d.estado === 'error')) {
-    const conError = d.links.filter(l => l.error);
-    const row = wsErr.addRow({
-      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
-      cxc:     conError.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', '),
-      detalle: conError.map(l => l.error).join(' | '),
-      id:      String(d.movementId),
-    });
-    row.eachCell(cell => { cell.fill = ERR_FILL; });
-  }
-
-  return wb.xlsx.writeBuffer();
-}
-
-// GET reporte de una corrida — disponible solo mientras el job siga en memoria (SALDO_SYNC_JOB_TTL).
-router.get('/sync-movimientos-kore/:jobId/report', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const job = MOVKORE_SYNC_JOBS.get(req.params.jobId);
-  if (!job || !job.detalles) {
-    return res.status(404).json({ error: 'El reporte ya no está disponible (expiró o el jobId no existe).' });
-  }
-
-  const buffer = await _generarExcelMovimientosKore(job.detalles);
-  const fecha  = new Date().toISOString().slice(0, 10);
-  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="sync-movimientos-kore-${fecha}.xlsx"`);
-  res.send(buffer);
-}));
-
-// POST revierte el enriquecimiento de movimientosKore hecho por una corrida (runId = jobId).
-// Solo limpia los links marcados con ese runId exacto — nunca toca saldoErp, tipoPago ni
-// _changelog (dominio exclusivo de Sync Saldo ERP). Si un link ya fue re-procesado por una
-// corrida más nueva, su movimientosKoreRunId ya cambió y este filtro no lo alcanza — queda
-// protegido automáticamente, sin necesitar una guardia extra de "corrida más reciente".
-router.post('/sync-movimientos-kore/:jobId/revert', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  const runId = req.params.jobId;
-
-  const result = await BankMovement.updateMany(
-    { 'erpLinks.movimientosKoreRunId': runId },
-    [
-      {
-        $set: {
-          erpLinks: {
-            $map: {
-              input: '$erpLinks', as: 'l',
-              in: {
-                $cond: [
-                  { $eq: ['$$l.movimientosKoreRunId', runId] },
-                  { $mergeObjects: ['$$l', { movimientosKore: [], movimientosKoreSyncedAt: null, movimientosKoreRunId: null }] },
-                  '$$l',
-                ],
-              },
-            },
-          },
-        },
-      },
-    ],
-  );
-
-  res.json({ ok: true, matched: result.matchedCount, revertidos: result.modifiedCount });
-}));
-
 // ── Corrida automática diaria (cron) ──────────────────────────────────────────
 // Se dispara vía node-cron desde numo-backend/src/banks/jobs/erpSyncCron.js (mismo
 // patrón que los jobs de src/visor/jobs/satSyncJob.js), no desde HTTP — por eso corre
 // sin usuario real (auth0Sub = null; emitToUser lo ignora en silencio si no hay auth0Sub).
-// Encadena los dos jobs: primero Sync Saldo ERP y, SOLO si terminó en 'done' (no 'error'
-// ni 'stopped'), Sync Histórico Kore — para no pegarle a Kore dos veces si el primero ya
-// falló por algo como Kore caído. Cubre siempre las últimas 48h desde el momento de la
-// corrida (no un rango fijo) para no reprocesar el histórico completo cada día; el
-// checkpoint de cada job hace que sea seguro que el rango se traslape día a día.
-// Ambas corridas quedan registradas en SALDO_SYNC_JOBS/MOVKORE_SYNC_JOBS igual que una
-// corrida manual — visibles en "Historial Sync Saldo"/"Historial Sync Kore" del panel Admin.
+// A propósito SIN rango de fecha (fechaInicio/fechaFin = null): revisa TODO lo aún no
+// finalizado sin importar su antigüedad, para que ninguna CxC rezagada quede fuera del
+// alcance de la corrida automática solo por ser más vieja que una ventana fija. Es seguro
+// y barato de repetir cada día — un link ya finalizado nunca se vuelve a consultar (ver
+// checkpoint conciliacionFinalizadaAt), así que el costo real solo lo aporta lo que
+// sigue genuinamente pendiente. Queda registrada en SYNC_JOBS igual que una corrida
+// manual — visible en "Historial Sync ERP-Kore" del panel Admin.
 async function runErpSyncAutomatico() {
-  if (saldoSyncRunning || movKoreSyncRunning) {
-    console.warn('[CronErpSync] Ya hay una sincronización ERP en curso — se omite la corrida automática de hoy.');
+  if (syncRunning) {
+    console.warn('[CronErpSync] Ya hay una sincronización ERP-Kore en curso — se omite la corrida automática de hoy.');
     return;
   }
 
-  const auth0Sub    = null;
-  const fechaFin    = new Date();
-  const fechaInicio = new Date(fechaFin.getTime() - 48 * 60 * 60 * 1000);
+  const auth0Sub = null;
+  console.log('[CronErpSync] Iniciando Sync ERP-Kore automático (sin límite de fecha)...');
+  syncControl.paused       = false;
+  syncControl.stopped      = false;
+  syncControl.pauseResolve = null;
+  syncRunning = true;
+  const jobId = `erp-sync-${Date.now()}`;
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
+  await _syncErpKoreJob(auth0Sub, jobId, null, null);
 
-  console.log(`[CronErpSync] Iniciando Sync Saldo ERP automático (${fechaInicio.toISOString()} → ${fechaFin.toISOString()})...`);
-  saldoSyncControl.paused       = false;
-  saldoSyncControl.stopped      = false;
-  saldoSyncControl.pauseResolve = null;
-  saldoSyncRunning = true;
-  const jobId1 = `saldo-sync-${Date.now()}`;
-  SALDO_SYNC_JOBS.set(jobId1, { status: 'running', auth0Sub });
-  await _syncSaldoJob(auth0Sub, jobId1, fechaInicio, fechaFin);
-
-  const resultado1 = SALDO_SYNC_JOBS.get(jobId1);
-  if (resultado1?.status !== 'done') {
-    console.warn(`[CronErpSync] Sync Saldo ERP automático terminó en estado '${resultado1?.status}' — se cancela Sync Histórico Kore de hoy.`);
-    return;
-  }
-  console.log('[CronErpSync] Sync Saldo ERP automático completado OK — iniciando Sync Histórico Kore automático...');
-
-  movKoreSyncControl.paused       = false;
-  movKoreSyncControl.stopped      = false;
-  movKoreSyncControl.pauseResolve = null;
-  movKoreSyncRunning = true;
-  const jobId2 = `movkore-sync-${Date.now()}`;
-  MOVKORE_SYNC_JOBS.set(jobId2, { status: 'running', auth0Sub });
-  await _syncMovimientosKoreJob(auth0Sub, jobId2, fechaInicio, fechaFin);
-
-  console.log('[CronErpSync] Sync Histórico Kore automático completado.');
+  console.log('[CronErpSync] Sync ERP-Kore automático completado.');
 }
 
 router.runErpSyncAutomatico = runErpSyncAutomatico;

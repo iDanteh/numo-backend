@@ -1693,7 +1693,6 @@ async function exportMovements(filters) {
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
-    formaPago,
     importeMin, importeMax,
     folioFiscal: folioFiscalFilter,
     ficha:       fichaParamFilter,
@@ -1787,17 +1786,6 @@ async function exportMovements(filters) {
   }
 
   // ── Nuevos filtros ───────────────────────────────────────────────────────
-
-  // Forma de pago ERP: al menos un erpLink con tipoPago en los valores seleccionados
-  if (formaPago) {
-    const fps = formaPago.split(',').map(v => v.trim()).filter(Boolean);
-    if (fps.length > 0) {
-      filter.$and = filter.$and ?? [];
-      filter.$and.push({
-        erpLinks: { $elemMatch: { tipoPago: fps.length === 1 ? fps[0] : { $in: fps } } },
-      });
-    }
-  }
 
   // Rango de importe (aplica sobre deposito o retiro)
   if (importeMin != null || importeMax != null) {

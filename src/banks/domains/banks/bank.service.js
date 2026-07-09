@@ -2802,4 +2802,5 @@ module.exports = {
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,
+  ERP_TOLERANCE,
 };

@@ -107,6 +107,10 @@ const config = Object.freeze({
   /** Google Drive — integración via Service Account */
   google: Object.freeze({
     serviceAccountKey:         process.env.GOOGLE_SERVICE_ACCOUNT_KEY           || null,
+    // Cuenta de servicio DEDICADA para comprobantes (proyecto GCP "comprobantes-nuno"),
+    // separada de GOOGLE_SERVICE_ACCOUNT_KEY (usada en producción por visor/drive.controller.js
+    // para CFDIs) — comparten nombre de variable solo por accidente si no se distinguen aquí.
+    serviceAccountKeyComprobantes: process.env.GOOGLE_SERVICE_ACCOUNT_KEY2      || null,
     driveRootFolderId:         process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID          || null,
     driveErpFolderId:          process.env.GOOGLE_DRIVE_ERP_FOLDER_ID           || null,
     driveComprobantesFolderId: process.env.GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID  || null,

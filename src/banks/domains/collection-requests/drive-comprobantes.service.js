@@ -28,14 +28,17 @@ let _driveClient = null;
 function getDriveClient() {
   if (_driveClient) return _driveClient;
 
-  const keyRaw = config.google.serviceAccountKey;
-  if (!keyRaw) throw new DriveComprobantesError('GOOGLE_SERVICE_ACCOUNT_KEY no está configurada en .env');
+  // Cuenta de servicio dedicada a comprobantes (proyecto GCP "comprobantes-nuno") —
+  // deliberadamente distinta de config.google.serviceAccountKey, que es la que usa
+  // visor/drive.controller.js en producción para CFDIs. Nunca reusar esa aquí.
+  const keyRaw = config.google.serviceAccountKeyComprobantes;
+  if (!keyRaw) throw new DriveComprobantesError('GOOGLE_SERVICE_ACCOUNT_KEY2 no está configurada en .env');
 
   let credentials;
   try {
     credentials = JSON.parse(keyRaw);
   } catch {
-    throw new DriveComprobantesError('GOOGLE_SERVICE_ACCOUNT_KEY no es un JSON válido');
+    throw new DriveComprobantesError('GOOGLE_SERVICE_ACCOUNT_KEY2 no es un JSON válido');
   }
 
   const auth = new google.auth.GoogleAuth({

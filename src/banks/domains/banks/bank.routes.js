@@ -79,15 +79,10 @@ router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), asyncHandler(async (req, res) => {
-  let query = { ...req.query };
-  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
-  if (!hasFullAccess) {
-    // banks:export:all → puede exportar depósitos de TODOS los usuarios identificadores,
-    // pero sigue sin acceso a retiros ni a "otros" (no tiene banks:config).
-    const hasExportAll = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_EXPORT_ALL);
-    const scope = hasExportAll ? MOVEMENT_SCOPE.ALL : getMovementScope(req.user.role);
-    ({ query } = applyMovementRestrictions(query, req.user._id, { scope, forExport: true }));
-  }
+  const query = { ...req.query };
+  // Reporte de movimientos: todas las opciones (retiros, "otros"/"reclasificado",
+  // identificadoPor de cualquier usuario) disponibles sin restricción por rol —
+  // a diferencia del listado principal (GET /movements), que sigue restringido.
   // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
   // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
   // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.

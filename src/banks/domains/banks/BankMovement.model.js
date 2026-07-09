@@ -71,9 +71,8 @@ const bankMovementSchema = new mongoose.Schema({
       tieneRetencion: { type: Boolean, default: false },
       tipoPago:       { type: String, default: null },
       // Snapshot de movimientos Kore para esta CxC (todos menos el primero — el primero
-      // es el cargo original, no aporta al rastreo de conciliación). Lo llena el job
-      // "Sync Histórico Kore" (independiente de Sync Saldo ERP — solo enriquece, nunca
-      // toca saldoErp/tipoPago/total).
+      // es el cargo original, no aporta al rastreo de conciliación). Lo llena y refresca
+      // el job "Sync ERP-Kore" en cada corrida mientras la CxC siga abierta.
       movimientosKore: {
         type: [{
           serie:         { type: String, default: null },
@@ -89,24 +88,26 @@ const bankMovementSchema = new mongoose.Schema({
         }],
         default: [],
       },
-      // Checkpoint de "Sync Histórico Kore" — se marca SOLO cuando Kore respondió con
-      // éxito para este link (aunque el movimientosKore resultante quede vacío). Si Kore
-      // falla, queda null y la siguiente corrida reintenta sola (no necesita un botón de
-      // "reiniciar checkpoint" como el de Sync Saldo ERP).
-      movimientosKoreSyncedAt: { type: Date, default: null },
-      // jobId de la corrida que escribió el movimientosKore actual — permite revertir
-      // selectivamente solo los links tocados por esa corrida específica.
-      movimientosKoreRunId: { type: String, default: null },
+      // Monto real aportado por esta CxC a saldoErp — solo se calcula cuando Kore confirma
+      // saldoActual===0 (CxC saldada) Y el vínculo fue hecho por un humano (los vínculos de
+      // motores automáticos se cierran igual, ver conciliacionFinalizadaAt, pero nunca aportan
+      // aquí). Suma solo movimientos con forma de pago bancaria real — transferencia, cheque,
+      // depósito en efectivo — nunca formasPago[].monto (ver _montoSaldoLink en erp.routes.js).
+      saldoErpAportado: { type: Number, default: null },
+      // Checkpoint de conciliación por CxC (job "Sync ERP-Kore"): se marca SOLO cuando Kore
+      // confirma que la CxC ya está saldada (saldoActual===0) — ya no hay nada más que Kore
+      // pueda reportar para ella, así que deja de reconsultarse. Mientras sea null (CxC
+      // todavía abierta), toda corrida futura —manual o el cron diario, sin límite de
+      // antigüedad— vuelve a intentarla.
+      conciliacionFinalizadaAt: { type: Date, default: null },
+      // jobId de la corrida que finalizó este link — permite revertir selectivamente.
+      conciliacionRunId: { type: String, default: null },
     }],
     default: [],
   },
 
-  // Suma de saldoActual de todos los erpLinks; null cuando no hay vínculos
+  // Suma de erpLinks[].saldoErpAportado de los links ya finalizados; null cuando no hay vínculos
   saldoErp: { type: Number, default: null },
-
-  // Timestamp que indica cuándo fue procesado por el job Sync Saldo ERP.
-  // null = pendiente (se incluye en un "reanudar"); Date = ya procesado (se salta en reanudar).
-  saldoErpSyncedAt: { type: Date, default: null },
 
   // Nombre del cliente identificado mediante el catálogo auxiliar
   auxNombre: { type: String, default: null, index: true },

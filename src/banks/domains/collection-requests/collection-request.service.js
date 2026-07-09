@@ -22,6 +22,32 @@ const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError
 // su lógica según de dónde viene cada uno. Los documentos nuevos solo llenan
 // `comprobantes[]`; los viejos solo tienen `comprobante` — nunca ambos a la vez
 // en la práctica, pero si algún día coexistieran, Drive gana (es lo vigente).
+const _MIME_A_EXT = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
+  'image/gif': 'gif', 'application/pdf': 'pdf',
+};
+
+function _extensionDe(originalName, mimetype) {
+  const dePorNombre = /\.([a-z0-9]+)$/i.exec(originalName || '')?.[1];
+  return (dePorNombre || _MIME_A_EXT[mimetype] || 'bin').toLowerCase();
+}
+
+// Nombre de archivo en Drive: serie-folio de la CxC cuando la solicitud es de una sola
+// CxC (Modo 1) — identifica de un vistazo a qué cuenta corresponde el comprobante sin
+// tener que abrirlo. Con varias CxC (Modo 2) no hay un solo serie-folio al que apuntar,
+// así que se usa el solicitudIdErp. `originalName` (el nombre real que subió el usuario)
+// se conserva aparte en la metadata del comprobante — esto solo renombra el archivo
+// que vive en Drive, para que sea buscable/identificable ahí directamente.
+function _nombreDriveComprobante(cxcsParsed, solicitudIdErp, index, total, originalName, mimetype) {
+  const unaSolaCxc = cxcsParsed.length === 1 ? cxcsParsed[0] : null;
+  const base = (unaSolaCxc?.serie && unaSolaCxc?.folioExterno)
+    ? `${unaSolaCxc.serie}-${unaSolaCxc.folioExterno}`
+    : solicitudIdErp;
+  const sufijo = total > 1 ? `-${index + 1}` : '';
+  const ext    = _extensionDe(originalName, mimetype);
+  return `${base}${sufijo}.${ext}`;
+}
+
 function _comprobantesUnificados(cr) {
   if (cr.comprobantes?.length > 0) {
     return cr.comprobantes.map(c => ({
@@ -98,8 +124,11 @@ async function create(data, files = []) {
   let comprobantesSubidos = [];
   if (files.length > 0) {
     try {
-      comprobantesSubidos = await Promise.all(files.map(async (f) => {
-        const { driveFileId, driveWebViewLink } = await driveComprobantes.subirComprobante(f.buffer, f.mimetype, f.originalname);
+      comprobantesSubidos = await Promise.all(files.map(async (f, i) => {
+        const driveName = _nombreDriveComprobante(
+          cxcsParsed, solicitudIdErpTrim, i, files.length, f.originalname, f.mimetype,
+        );
+        const { driveFileId, driveWebViewLink } = await driveComprobantes.subirComprobante(f.buffer, f.mimetype, driveName);
         return { driveFileId, driveWebViewLink, mimetype: f.mimetype, originalName: f.originalname };
       }));
     } catch (err) {
@@ -215,16 +244,30 @@ async function getById(id) {
 
 // Para que el ERP (Kore) consulte el estado de una solicitud que él mismo creó
 // — busca por solicitudIdErp (lo único que Kore conoce de antemano, nunca el
-// _id interno de Numo). El documento ya trae cxcs[]/status juntos para Modo 1
-// y Modo 2 por igual, así que no hace falta "relacionar" nada aparte: es el
-// mismo shape que getById, solo que la búsqueda es por el ID del ERP.
+// _id interno de Numo). Respuesta deliberadamente MÍNIMA (a diferencia de
+// getById, que sí regresa el documento completo para la bandeja de Numo):
+// Kore ya conoce cxcs/formasPago/comprobantes (los mandó él al crearla) y no
+// necesita IDs internos de Mongo ni quién en Numo la resolvió — solo el
+// estatus, el motivo si se rechazó, cuándo se resolvió, y el movimiento
+// bancario al que quedó vinculada (folio/fecha/depósito).
 async function getByErpId(solicitudIdErp) {
   const cr = await CollectionRequest.findOne({ solicitudIdErp: String(solicitudIdErp).trim() })
-    .select('-comprobante.data')
-    .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
+    .select('solicitudIdErp status motivoRechazo resueltoAt bankMovementId')
+    .populate('bankMovementId', 'folio fecha deposito')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
-  return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: _tieneAlgunComprobante(cr) } };
+
+  return {
+    solicitudIdErp: cr.solicitudIdErp,
+    status:         cr.status,
+    motivoRechazo:  cr.motivoRechazo ?? null,
+    resueltoAt:     cr.resueltoAt ?? null,
+    bankMovement: cr.bankMovementId ? {
+      folio:    cr.bankMovementId.folio    ?? null,
+      fecha:    cr.bankMovementId.fecha    ?? null,
+      deposito: cr.bankMovementId.deposito ?? null,
+    } : null,
+  };
 }
 
 // `index` selecciona CUÁL comprobante de la lista unificada (legacy Mongo +
@@ -254,12 +297,13 @@ async function getComprobante(id, index = 0) {
 // puede corresponder a un depósito bancario distinto), y se regresa un
 // resultado por comprobante para que la búsqueda ayude a ubicar cada depósito.
 async function analyzeStoredComprobantes(id) {
-  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes');
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes cxcs');
   if (!cr) throw new NotFoundError('Solicitud');
 
   const lista = _comprobantesUnificados(cr);
   if (lista.length === 0) throw new NotFoundError('Comprobante');
 
+  const ownErpIds = cr.cxcs.map(c => c.erpId);
   const resultados = [];
   for (let i = 0; i < lista.length; i++) {
     const item = lista[i];
@@ -267,7 +311,7 @@ async function analyzeStoredComprobantes(id) {
       ? await driveComprobantes.descargarComprobante(item.driveFileId)
       : item.data;
     const extracted  = await extractReceiptData(data, item.mimetype);
-    const candidates  = await findMatchingMovements(extracted);
+    const candidates  = await findMatchingMovements(extracted, ownErpIds);
     resultados.push({ comprobanteIndex: i, extracted, candidates, totalCandidatos: candidates.length });
   }
   return resultados;

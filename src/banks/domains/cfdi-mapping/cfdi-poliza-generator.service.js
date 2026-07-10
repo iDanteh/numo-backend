@@ -6,7 +6,7 @@ const centrosSvc = require('../centros-costo/centros-costo.service');
 const { Op, QueryTypes }   = require('sequelize');
 const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
-const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion } = require('./balanza-preliminar.service');
+const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -188,18 +188,27 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
 
   _normalizarEgresoPue99(ncsEnriquecidas);
 
-  // metodoPago real de la factura relacionada: primero se busca entre las ya
-  // cargadas en este mismo batch (sin costo extra de query); lo que falte
-  // (factura de otro periodo) se resuelve con una consulta puntual.
-  const metodoPagoPorFactura = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), c.metodoPago]));
+  // metodoPago/formaPago reales de la factura relacionada: primero se busca
+  // entre las ya cargadas en este mismo batch (sin costo extra de query); lo
+  // que falte (factura de otro periodo) se resuelve con una consulta puntual.
+  // metodoPagoPorFactura (solo metodoPago) alimenta _normalizarEgresoCondonacion
+  // (formaPago=15); facturaRelacionadaMeta (metodoPago+formaPago) alimenta
+  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
+  const metodoPagoPorFactura   = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), c.metodoPago]));
+  const facturaRelacionadaMeta = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
   const faltantes = [...new Set(ncsEnriquecidas.flatMap(relUuidsDe))]
     .map(u => (u || '').toUpperCase())
     .filter(u => !(u in metodoPagoPorFactura));
   if (faltantes.length) {
-    const extra = await CFDI.find({ uuid: { $in: faltantes } }).select('uuid metodoPago').lean();
-    for (const f of extra) metodoPagoPorFactura[(f.uuid || '').toUpperCase()] = f.metodoPago;
+    const extra = await CFDI.find({ uuid: { $in: faltantes } }).select('uuid metodoPago formaPago').lean();
+    for (const f of extra) {
+      const uuidUp = (f.uuid || '').toUpperCase();
+      metodoPagoPorFactura[uuidUp]   = f.metodoPago;
+      facturaRelacionadaMeta[uuidUp] = { metodoPago: f.metodoPago, formaPago: f.formaPago };
+    }
   }
   _normalizarEgresoCondonacion(ncsEnriquecidas, metodoPagoPorFactura);
+  _normalizarEgresoSegunFacturaRelacionada(ncsEnriquecidas, facturaRelacionadaMeta);
 
   return ncsEnriquecidas;
 }
@@ -288,12 +297,15 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   )];
   const relTipoCfdisArr = relTipoUuidsProp.length
     ? await CFDI.find({ uuid: { $in: relTipoUuidsProp } })
-        .select('uuid tipoDeComprobante metodoPago').lean()
+        .select('uuid tipoDeComprobante metodoPago formaPago').lean()
     : [];
   const relTipoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.tipoDeComprobante]));
   // uuid de factura → su metodoPago — usado por _normalizarEgresoCondonacion
   // para resolver el metodoPago real de NCs formaPago=15 (Condonación).
   const relMetodoPagoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.metodoPago]));
+  // uuid de factura → metodoPago+formaPago — usado por
+  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
+  const relFacturaMetaMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
 
   // Inyectar _relacionadoTipo en cada CFDI antes del matching
   const cfdisSinPolizaEnriquecidos = cfdisSinPoliza.map(cfdi => {
@@ -362,6 +374,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   _normalizarEgresoPue99(cfdisSinPolizaFinal);
   // Normalización: E formaPago=15 (Condonación) → metodoPago real de la factura relacionada
   _normalizarEgresoCondonacion(cfdisSinPolizaFinal, relMetodoPagoMap);
+  // Normalización: E con medio de pago real (Efectivo/Cheque/Transferencia/Tarjeta)
+  // que ajusta una factura PPD nunca cobrada → formaPago+metodoPago de esa factura.
+  _normalizarEgresoSegunFacturaRelacionada(cfdisSinPolizaFinal, relFacturaMetaMap);
 
   // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
   // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
@@ -720,7 +735,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   )];
   const relTipoCfdisGuard = relTipoUuidsGuard.length
     ? await CFDI.find({ uuid: { $in: relTipoUuidsGuard } })
-        .select('uuid tipoDeComprobante metodoPago').lean()
+        .select('uuid tipoDeComprobante metodoPago formaPago').lean()
     : [];
   const relTipoMapGuard = Object.fromEntries(
     relTipoCfdisGuard.map(c => [c.uuid, c.tipoDeComprobante]),
@@ -728,6 +743,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // uuid de factura → su metodoPago — usado por _normalizarEgresoCondonacion
   // para resolver el metodoPago real de NCs formaPago=15 (Condonación).
   const relMetodoPagoMapGuard = Object.fromEntries(relTipoCfdisGuard.map(c => [c.uuid, c.metodoPago]));
+  // uuid de factura → metodoPago+formaPago — usado por
+  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
+  const relFacturaMetaMapGuard = Object.fromEntries(relTipoCfdisGuard.map(c => [c.uuid, { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
 
   const cfdisSinPolizaEnriquecidosGuard = cfdisSinPoliza.map(cfdi => {
     const primerUuid = (cfdi.cfdiRelacionados || [])[0]?.uuid;
@@ -794,6 +812,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   _normalizarEgresoPue99(cfdisSinPolizaFinalGuard);
   // Normalización: E formaPago=15 (Condonación) → metodoPago real de la factura relacionada
   _normalizarEgresoCondonacion(cfdisSinPolizaFinalGuard, relMetodoPagoMapGuard);
+  // Normalización: E con medio de pago real (Efectivo/Cheque/Transferencia/Tarjeta)
+  // que ajusta una factura PPD nunca cobrada → formaPago+metodoPago de esa factura.
+  _normalizarEgresoSegunFacturaRelacionada(cfdisSinPolizaFinalGuard, relFacturaMetaMapGuard);
 
   // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
   // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.

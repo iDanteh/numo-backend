@@ -7,6 +7,16 @@
 
 const { BadRequestError } = require('../../shared/errors/AppError');
 
+// Saldo(s) a favor / anticipo(s) que el ERP dice haber usado para cubrir una
+// forma de pago específica — ver formasPago[].saldosAplicados en el modelo.
+function parseSaldosAplicados(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map(s => ({
+    id:    String(s?.id ?? '').trim(),
+    monto: Number(s?.monto),
+  }));
+}
+
 function parseFormasPago(raw) {
   const arr = typeof raw === 'string' ? JSON.parse(raw) : raw;
   if (!Array.isArray(arr) || arr.length === 0) {
@@ -21,6 +31,7 @@ function parseFormasPago(raw) {
     referencia:           null,
     bancoKoreId:          f.bancoKoreId      ? String(f.bancoKoreId).trim()      : null,
     bancoDescripcion:     f.bancoDescripcion ? String(f.bancoDescripcion).trim() : null,
+    saldosAplicados:      parseSaldosAplicados(f.saldosAplicados),
   }));
 }
 

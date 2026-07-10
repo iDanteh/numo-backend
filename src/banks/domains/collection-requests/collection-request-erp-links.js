@@ -25,6 +25,19 @@ function esFormaBancaria(f) {
   return /deposito.*efectivo/.test(normFormaPago(desc));
 }
 
+// Puerto exacto de esSaldoEspecial() en cobro-panel.component.ts — clasifica una
+// forma de pago como saldo a favor / anticipo, los dos únicos tipos que requieren
+// un id de Kore + monto específico (ver formasPago[].saldosAplicados en el modelo).
+// "Compensación" se detecta en el frontend pero no maneja id/monto propio — viaja
+// como forma de pago normal en DetalleFormaPago, sin entrada en saldosAFavorAUsar/
+// anticipos, así que aquí no se clasifica como caso especial.
+function tipoSaldoEspecial(f) {
+  const n = normFormaPago(f?.formaPagoDescripcion);
+  if (n.includes('saldo a favor')) return 'saldo_favor';
+  if (n === 'anticipo') return 'anticipo';
+  return null;
+}
+
 // erpLinks[] a pasar a bankService.setErpIds() — mismo cálculo que
 // _buildCobroSaldosErp() en cobro-panel.component.ts:
 //   - saldoActual: saldo EN VIVO de Kore (antes de este cobro) menos lo pagado ahora.
@@ -75,4 +88,4 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
   return [...preservados, ...nuevos];
 }
 
-module.exports = { normFormaPago, esFormaBancaria, buildErpLinksParaCobro };
+module.exports = { normFormaPago, esFormaBancaria, tipoSaldoEspecial, buildErpLinksParaCobro };

@@ -79,6 +79,7 @@ const config = Object.freeze({
     cajaUrl: process.env.ERP_CAJA_BASE_URL?.trim(),   // cajas / bancos
     baseUrl:  process.env.ERP_FACT_BASE_URL?.trim(),  // facturación — import CFDIs
     // Normaliza el token: garantiza el prefijo "Bearer " independientemente
+    //cambio 2
     // de si el .env lo incluye o no.
     token: (() => {
       const t = process.env.ERP_TOKEN?.trim() ?? '';

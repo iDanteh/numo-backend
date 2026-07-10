@@ -101,6 +101,14 @@ const CfdiMappingRule = sequelize.define('CfdiMappingRule', {
   cuentaIvaPPD: {
     type:      DataTypes.STRING(20),
     allowNull: true,
+    // Fijo explícito: el mapeo automático `underscored: true` de Sequelize
+    // inserta un guión bajo antes de CADA mayúscula (sin agrupar "PPD" como
+    // una sola sigla), generando `cuenta_iva_p_p_d` — una columna distinta
+    // de la real `cuenta_iva_ppd` que usan las migraciones y correcciones
+    // manuales por SQL. Sin este `field` explícito, el ORM lee/escribe una
+    // columna fantasma y cualquier UPDATE directo en `cuenta_iva_ppd` es
+    // invisible para la aplicación.
+    field:     'cuenta_iva_ppd',
     comment:   'IVA por cobrar/por pagar en PPD — se traspasa a cuentaIva al recibir el CFDI de Pago',
   },
   cuentaIvaRetenido: {

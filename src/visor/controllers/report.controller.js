@@ -2136,6 +2136,53 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   in: '$$link.saldoActual',
                 },
               },
+              // Usuario que identificó/vinculó ESTA CxC específica al movimiento
+              // (identificadoPor.erpId se cruza contra el erpId del erpLink que
+              // corresponde a este idDocumento — un mismo movimiento puede tener
+              // varias CxC vinculadas por distintos usuarios).
+              identificadoPorNombre: {
+                $let: {
+                  vars: {
+                    erpIdLink: {
+                      $let: {
+                        vars: {
+                          link: {
+                            $arrayElemAt: [{
+                              $filter: {
+                                input: { $ifNull: ['$$m.erpLinks', []] },
+                                as: 'l',
+                                cond: {
+                                  $eq: [
+                                    { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                    { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                                  ],
+                                },
+                              },
+                            }, 0],
+                          },
+                        },
+                        in: '$$link.erpId',
+                      },
+                    },
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        idEntry: {
+                          $arrayElemAt: [{
+                            $filter: {
+                              input: { $ifNull: ['$$m.identificadoPor', []] },
+                              as: 'ip',
+                              cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                            },
+                          }, 0],
+                        },
+                      },
+                      in: '$$idEntry.nombre',
+                    },
+                  },
+                },
+              },
             },
           },
         },
@@ -2178,7 +2225,8 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] },
                 ]}, 2],
               },
-              saldoMovimiento: { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+              saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+              identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
             },
           },
         ],
@@ -2331,6 +2379,49 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                   in: '$$link.saldoActual',
                 },
               },
+              identificadoPorNombre: {
+                $let: {
+                  vars: {
+                    erpIdLink: {
+                      $let: {
+                        vars: {
+                          link: {
+                            $arrayElemAt: [{
+                              $filter: {
+                                input: { $ifNull: ['$$m.erpLinks', []] },
+                                as: 'l',
+                                cond: {
+                                  $eq: [
+                                    { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                    { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                                  ],
+                                },
+                              },
+                            }, 0],
+                          },
+                        },
+                        in: '$$link.erpId',
+                      },
+                    },
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        idEntry: {
+                          $arrayElemAt: [{
+                            $filter: {
+                              input: { $ifNull: ['$$m.identificadoPor', []] },
+                              as: 'ip',
+                              cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                            },
+                          }, 0],
+                        },
+                      },
+                      in: '$$idEntry.nombre',
+                    },
+                  },
+                },
+              },
             },
           },
         },
@@ -2360,6 +2451,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
       diferencia:       { $round: [{ $subtract: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] }, 2] },
       saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+      identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
     }},
   ];
 
@@ -2387,6 +2479,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { header: 'Núm. Autorización',  key: 'numOperacion',      width: 22 },
     { header: 'Diferencia',         key: 'diferencia',        width: 16 },
     { header: 'Saldo Movimiento',   key: 'saldoMovimiento',   width: 18 },
+    { header: 'Identificado por',   key: 'identificadoPor',   width: 20 },
   ];
 
   // Estilo encabezado

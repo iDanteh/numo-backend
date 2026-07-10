@@ -43,7 +43,7 @@ function formatearRestante(horas) {
  *   `faltan: false` (default) → las credenciales existen pero están por vencer en `horas`.
  */
 function construirCorreo({ nombre, rfc, horas, urgente, faltan = false }) {
-  const empresa = nombre ? `${nombre} (RFC ${rfc})` : `RFC ${rfc}`;
+  const empresa = nombre ? `${nombre} (RFC: ${rfc})` : `RFC: ${rfc}`;
 
   if (faltan) {
     return {
@@ -51,16 +51,21 @@ function construirCorreo({ nombre, rfc, horas, urgente, faltan = false }) {
       html: `
         <div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto">
           <h2 style="color:#dc2626">⚠ Faltan credenciales del SAT</h2>
-          <p>Hola,</p>
           <p>
-            Actualmente <strong>no hay credenciales del SAT cargadas en Numo</strong>
-            para <strong>${empresa}</strong>.
+            Le informamos que actualmente no se cuenta con las credenciales del
+            SAT registradas en Numo para la entidad <strong>${empresa}</strong>.
           </p>
           <p>
-            Mientras no se suban, Numo no puede descargar automáticamente los
-            CFDIs de esta entidad. Por favor sube las credenciales del SAT lo
-            antes posible.
+            Mientras dichas credenciales no sean cargadas, el sistema no podrá
+            realizar la descarga automática de los CFDIs correspondientes a
+            esta entidad.
           </p>
+          <p>
+            Le solicitamos, por favor, cargar las credenciales del SAT a la
+            brevedad posible para evitar retrasos en el proceso.
+          </p>
+          <p>Quedamos atentos a cualquier duda o comentario.</p>
+          <p>Saludos cordiales.</p>
           <p style="color:#6b7280;font-size:.85rem;margin-top:1.5rem">
             Este es un aviso automático de Numo — no responder a este correo.
           </p>
@@ -135,6 +140,33 @@ async function verificarVencimientoCredenciales() {
 }
 
 /**
+ * Revisa las entidades con descarga nocturna automática habilitada y avisa
+ * por correo a las que NO tienen ninguna credencial SAT cargada — a
+ * diferencia de `verificarVencimientoCredenciales` (que solo mira
+ * credenciales YA existentes), esto cubre el caso de una entidad que nunca
+ * llegó a subir sus credenciales. Pensado para correr una vez al día
+ * (8:00 am hora de México) — se repite cada día mientras falten, hasta que
+ * se carguen.
+ */
+async function verificarCredencialesFaltantes() {
+  const entidades = await entityRepo.findWithAutoSync();
+
+  for (const entity of entidades) {
+    const estado = await credencialesSvc.tieneCredenciales(entity.rfc);
+    if (estado.tiene) continue;
+
+    const emails = (entity.emailsAlerta || []).filter(Boolean);
+    if (emails.length === 0) {
+      logger.warn(`[credencialesAlertJob] ${entity.rfc} sin credenciales SAT y sin emailsAlerta configurado — se omite aviso`);
+      continue;
+    }
+
+    const { subject, html } = construirCorreo({ nombre: entity.nombre, rfc: entity.rfc, horas: 0, urgente: true, faltan: true });
+    await emailSvc.enviarCorreo({ to: emails, subject, html });
+  }
+}
+
+/**
  * Envío manual e inmediato (botón "Enviar alerta ahora"), sin tocar las
  * banderas de `alertasEnviadas` — es independiente del ciclo automático.
  *
@@ -166,4 +198,10 @@ cron.schedule('0 * * * *', async () => {
   catch (err) { logger.error(`[credencialesAlertJob] Error fatal: ${err.message}`); }
 }, { timezone: 'America/Mexico_City' });
 
-module.exports = { verificarVencimientoCredenciales, enviarAlertaManual };
+// ── Cron: revisa credenciales faltantes a las 8:00 am ─────────────────────────
+cron.schedule('0 8 * * *', async () => {
+  try { await verificarCredencialesFaltantes(); }
+  catch (err) { logger.error(`[credencialesAlertJob] Error fatal (faltantes): ${err.message}`); }
+}, { timezone: 'America/Mexico_City' });
+
+module.exports = { verificarVencimientoCredenciales, verificarCredencialesFaltantes, enviarAlertaManual };

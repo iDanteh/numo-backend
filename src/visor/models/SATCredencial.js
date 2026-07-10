@@ -25,6 +25,15 @@ const satCredencialSchema = new mongoose.Schema({
     default: Date.now,
     expires: 5 * 24 * 60 * 60, // 432000 segundos
   },
+
+  // Qué avisos de vencimiento ya se mandaron para esta "generación" de
+  // credenciales (se reinicia cada vez que se suben credenciales nuevas,
+  // ver `guardar()` en sat/credenciales.js).
+  alertasEnviadas: {
+    d2:    { type: Boolean, default: false }, // 2 días antes
+    d1:    { type: Boolean, default: false }, // 1 día antes
+    horas: { type: Boolean, default: false }, // últimas N horas (SAT_CREDENCIALES_ALERTA_HORAS_ANTES)
+  },
 });
 
 module.exports = mongoose.model('SATCredencial', satCredencialSchema);

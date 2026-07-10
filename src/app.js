@@ -168,6 +168,7 @@ const startServer = async () => {
   }
 
   require('./visor/jobs/satSyncJob');
+  require('./visor/jobs/credencialesAlertJob');
   try {
     await seed();
   } catch (err) {
@@ -241,3 +242,4 @@ startServer().catch((err) => {
 });
 
 module.exports = app;
+

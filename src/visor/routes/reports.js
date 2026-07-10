@@ -1,6 +1,6 @@
 const express = require('express');
 const { authenticate, permit } = require('../../shared/middleware/auth');
-const { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco } = require('../controllers/report.controller');
+const { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport } = require('../controllers/report.controller');
 
 const router = express.Router();
 
@@ -17,5 +17,8 @@ router.get('/pagos-banco/detalle', authenticate, pagosBancoDetalle);
 router.get('/pagos-banco/export', authenticate, pagosBancoExport);
 router.get('/pagos-banco/contexto-banco', authenticate, pagosBancoContextoBanco);
 router.get('/pagos-banco/bancos', authenticate, pagosBancosDistintos);
+router.get('/depositos-ingresos', authenticate, depositosIngresos);
+router.get('/depositos-ingresos/detalle', authenticate, depositosIngresosDetalle);
+router.get('/depositos-ingresos/export', authenticate, depositosIngresosExport);
 
 module.exports = router;

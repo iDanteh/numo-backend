@@ -68,6 +68,13 @@ const bankMovementSchema = new mongoose.Schema({
   // Suma de saldoActual de todos los erpLinks; null cuando no hay vínculos
   saldoErp: { type: Number, default: null },
 
+  // Última vez que saldoErp se sincronizó contra el ERP externo
+  saldoErpSyncedAt: { type: Date, default: null },
+
+  // Roles a los que este movimiento se les oculta (visibilidad selectiva),
+  // independiente del flag general `oculto`.
+  ocultoRoles: { type: [String], default: [] },
+
   // Nombre del cliente identificado mediante el catálogo auxiliar
   auxNombre: { type: String, default: null, index: true },
 

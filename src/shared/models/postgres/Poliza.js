@@ -88,6 +88,23 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.STRING(500),
     allowNull: true,
   },
+  // ── Folio real asociado en CONTPAQi tras importar el export ───────────────
+  contpaqFolioContado: {
+    type:      DataTypes.INTEGER,
+    allowNull: true,
+  },
+  contpaqFolioCredito: {
+    type:      DataTypes.INTEGER,
+    allowNull: true,
+  },
+  contpaqAsociadoPor: {
+    type:      DataTypes.STRING(150),
+    allowNull: true,
+  },
+  contpaqAsociadoEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName:   'polizas',
   underscored: true,

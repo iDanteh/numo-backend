@@ -115,6 +115,23 @@ const config = Object.freeze({
     driveErpFolderId:  process.env.GOOGLE_DRIVE_ERP_FOLDER_ID   || null,
   }),
 
+  /** Correo saliente (SMTP) — usado para alertas (ej. vencimiento credenciales SAT) */
+  smtp: Object.freeze({
+    host:   process.env.SMTP_HOST?.trim()   || null,
+    port:   parseInt(process.env.SMTP_PORT, 10) || 587,
+    secure: process.env.SMTP_SECURE === 'true',
+    user:   process.env.SMTP_USER?.trim()   || null,
+    pass:   process.env.SMTP_PASS,
+    from:   process.env.SMTP_FROM?.trim()   || 'Numo <no-reply@numo.local>',
+  }),
+
+  /** Alertas de vencimiento de credenciales SAT */
+  alertasSat: Object.freeze({
+    // Además de los avisos fijos de 2 días y 1 día antes, cuántas horas antes
+    // del vencimiento se manda el aviso final ("última llamada").
+    horasAntes: parseInt(process.env.SAT_CREDENCIALES_ALERTA_HORAS_ANTES, 10) || 4,
+  }),
+
 });
 
 module.exports = config;

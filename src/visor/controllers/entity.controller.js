@@ -8,6 +8,7 @@
 
 const entityRepo          = require('../repositories/entity.repository');
 const { asyncHandler }    = require('../../shared/middleware/error-handler');
+const { enviarAlertaManual } = require('../jobs/credencialesAlertJob');
 
 /**
  * GET /api/entities
@@ -21,7 +22,7 @@ const list = asyncHandler(async (_req, res) => {
  * POST /api/entities
  */
 const create = asyncHandler(async (req, res) => {
-  const { rfc, nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, esIntercompania, notes } = req.body;
+  const { rfc, nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, esIntercompania, notes, emailsAlerta } = req.body;
 
   if (!rfc || !nombre || !tipo) {
     return res.status(400).json({ error: 'Los campos rfc, nombre y tipo son obligatorios.' });
@@ -41,6 +42,7 @@ const create = asyncHandler(async (req, res) => {
     ...(isOwn            !== undefined && { isOwn }),
     ...(esIntercompania  !== undefined && { esIntercompania }),
     ...(notes            !== undefined && { notes }),
+    ...(emailsAlerta     !== undefined && { emailsAlerta }),
   });
   res.status(201).json(entity);
 });
@@ -49,7 +51,7 @@ const create = asyncHandler(async (req, res) => {
  * PATCH /api/entities/:id
  */
 const update = asyncHandler(async (req, res) => {
-  const { nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, isActive, esIntercompania, notes } = req.body;
+  const { nombre, tipo, regimenFiscal, domicilioFiscal, syncConfig, isOwn, isActive, esIntercompania, notes, emailsAlerta } = req.body;
 
   if (tipo !== undefined && !['moral', 'fisica'].includes(tipo)) {
     return res.status(400).json({ error: 'El campo tipo debe ser "moral" o "fisica".' });
@@ -66,6 +68,7 @@ const update = asyncHandler(async (req, res) => {
     ...(isActive         !== undefined && { isActive }),
     ...(esIntercompania  !== undefined && { esIntercompania }),
     ...(notes            !== undefined && { notes }),
+    ...(emailsAlerta     !== undefined && { emailsAlerta }),
   };
 
   const entity = await entityRepo.update(req.params.id, data);
@@ -73,4 +76,17 @@ const update = asyncHandler(async (req, res) => {
   res.json(entity);
 });
 
-module.exports = { list, create, update };
+/**
+ * POST /api/entities/:id/alertar-credenciales-sat
+ * Envío manual e inmediato del correo de aviso de vencimiento de credenciales.
+ */
+const alertarCredencialesSat = asyncHandler(async (req, res) => {
+  const entity = await entityRepo.findById(req.params.id);
+  if (!entity) return res.status(404).json({ error: 'Entidad no encontrada' });
+
+  const resultado = await enviarAlertaManual(entity);
+  if (!resultado.ok) return res.status(400).json({ error: resultado.motivo });
+  res.json({ ok: true });
+});
+
+module.exports = { list, create, update, alertarCredencialesSat };

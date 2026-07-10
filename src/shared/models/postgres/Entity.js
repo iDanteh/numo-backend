@@ -79,6 +79,11 @@ const Entity = sequelize.define('Entity', {
     defaultValue: false,
     comment:      'true = este RFC pertenece al grupo corporativo (intercompañía)',
   },
+  /** Correos a los que se avisa cuando las credenciales SAT están por vencer */
+  emailsAlerta: {
+    type:         DataTypes.ARRAY(DataTypes.STRING),
+    defaultValue: [],
+  },
   notes: {
     type:      DataTypes.TEXT,
     allowNull: true,

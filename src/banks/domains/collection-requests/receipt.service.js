@@ -351,7 +351,8 @@ function extractFieldsFromLines(lines) {
     },
     {
       field: 'titularDestino',
-      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|nombre|para)\s*[:\-]?$/i,
+      // "cliente" cubre tickets físicos de depósito (Banco Azteca: "Cliente: X")
+      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|nombre|para|cliente)\s*[:\-]?$/i,
     },
     {
       field: 'claveRastreo',
@@ -359,7 +360,8 @@ function extractFieldsFromLines(lines) {
     },
     {
       field: 'referencia',
-      re: /^(referencia|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
+      // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica" (Vault México)
+      re: /^(referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
     },
     {
       field: 'numeroAutorizacion',
@@ -414,6 +416,11 @@ function extractFieldsFromLines(lines) {
       for (let j = i + 1; j <= Math.min(i + 3, texts.length - 1); j++) {
         const val = texts[j];
         if (!val || isAnyLabel(val)) break;
+        // titularOrigen/titularDestino: si la etiqueta es un encabezado de SECCIÓN
+        // (ej. "Emisor") seguido de una subetiqueta ("Cuenta de retiro", "Banco
+        // destino") en vez del nombre, esa subetiqueta no es un nombre válido —
+        // se descarta y se sigue buscando en las líneas siguientes.
+        if ((field === 'titularOrigen' || field === 'titularDestino') && CAMPO_NO_NOMBRE_RE.test(val)) continue;
         result[field] = val;
         break;
       }
@@ -457,8 +464,21 @@ function extractFecha(text) {
   m = text.match(/\b(\d{1,2})\/(\d{1,2})\/(20\d{2})\b/);
   if (m) { const [,d,mo,y]=m; return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`; }
 
+  // DD/Mon/YYYY con slashes y mes abreviado en letras: "04/Mar/2026"
+  // (visto en comprobante de fondo oscuro estilo Banco Azteca)
+  m = text.match(/\b(\d{1,2})\/([A-Za-zÁÉÍÓÚáéíóúñÑ]{3,9})\/(20\d{2})\b/);
+  if (m) {
+    const mesTxt = m[2].toLowerCase();
+    const mes = MESES_ABBR[mesTxt.slice(0, 3)] || MESES_ES[mesTxt];
+    if (mes) return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  }
+
   m = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
   if (m) return m[0];
+
+  // YYYY/MM/DD con slashes: "2026/03/10" (visto en estado de cuenta Scotiabank)
+  m = text.match(/\b(20\d{2})\/(\d{2})\/(\d{2})\b/);
+  if (m) { const [,y,mo,d]=m; return `${y}-${mo}-${d}`; }
 
   // Formato completo con o sin "de": "03 de marzo de 2026" / "03 marzo 2026"
   m = text.match(/(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?(20\d{2})/i);
@@ -508,18 +528,23 @@ function extractClaveRastreo(text) {
 function extractReferencia(text) {
   // "folio(?:\s+de\s+(?:la\s+)?operación)?" cubre "Folio: X", "Folio de operación\nX"
   // y "Folio de la operación\nX" (BBVA usa el artículo "la" en su formato estándar).
+  // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica: X" (Vault México), no solo
+  // "Referencia" a secas.
   // "[:\s#\n]*" usa \n explícito para cruzar línea cuando el valor está en la siguiente
   const m = text.match(
-    /(?:referencia|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
+    /(?:referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
   );
   return m ? m[1] : null;
 }
 
 function extractNumeroAutorizacion(text) {
+  // Permite un prefijo de una letra antes de los dígitos: "M01215390"
+  // (visto en ticket físico de depósito Banco Azteca) — el prefijo se conserva
+  // porque es parte del número real, no un artefacto de OCR.
   const m = text.match(
-    /(?:autorizaci[oó]n|auth(?:orization)?|aprobaci[oó]n|c[oó]digo\s+(?:de\s+)?auth)[:\s#]*(\d{6,15})/i
+    /(?:autorizaci[oó]n|auth(?:orization)?|aprobaci[oó]n|c[oó]digo\s+(?:de\s+)?auth)[:\s#]*([A-Z]?\d{6,15})/i
   );
-  return m ? m[1] : null;
+  return m ? m[1].toUpperCase() : null;
 }
 
 function extractClabe(text) {
@@ -625,17 +650,34 @@ function _indiceSeccionDestino(lines) {
   return null;
 }
 
+// Prefijos que delatan que lo capturado es en realidad OTRA etiqueta de campo
+// (cuenta/banco/clabe/...), no un nombre de persona. Ocurre cuando "Emisor"/
+// "Receptor"/"Ordenante" son encabezados de SECCIÓN seguidos de una subetiqueta
+// en vez de preceder directamente el nombre (ej. Vault México, Scotiabank:
+// "Emisor\nCuenta de retiro\n..." → sin la guardia se capturaba literalmente
+// "CUENTA DE RETIRO" como si fuera el nombre del ordenante).
+const CAMPO_NO_NOMBRE_RE = /^(cuenta|banco|clabe|tarjeta|sucursal|titular|n[uú]mero|folio|referencia|autorizaci[oó]n|monto|importe|total|fecha|hora|concepto|rastreo|rfc|tel[eé]fono|correo|direcci[oó]n)\b/i;
+
 function extractTitular(text, role) {
   const labels = role === 'origen'
     ? ['ordenante','remitente','emisor','nombre del emisor','nombre de origen','nombre del ordenante']
-    // "nombre" solo aplica a destino: en BBVA mismo banco, "Nombre: X" es el beneficiario
-    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','nombre','para'];
+    // "nombre"/"cliente" solo aplican a destino: en BBVA mismo banco, "Nombre: X" es el
+    // beneficiario; "Cliente: X" aparece en tickets físicos de depósito (Banco Azteca).
+    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','nombre','para','cliente'];
 
   const re = new RegExp(
-    `(?:${labels.join('|')})[:\\s]+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\\s\\.]{3,60})`, 'i'
+    `(?:${labels.join('|')})[:\\s]+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\\s\\.]{3,60})`, 'gi'
   );
-  const m = text.match(re);
-  return m ? m[1].split('\n')[0].trim().toUpperCase().slice(0, 60) : null;
+
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const candidate = m[1].split('\n')[0].trim();
+    // Descarta la captura si en realidad es otra etiqueta de campo — sigue buscando
+    // en las siguientes coincidencias por si el nombre real aparece más adelante.
+    if (CAMPO_NO_NOMBRE_RE.test(candidate)) continue;
+    return candidate.toUpperCase().slice(0, 60);
+  }
+  return null;
 }
 
 // Etiquetas que NO deben tomarse como valor de concepto (evitar capturar la siguiente etiqueta)

@@ -1,5 +1,6 @@
 'use strict';
 const mongoose = require('mongoose');
+const { tipoSaldoEspecial } = require('./collection-request-erp-links');
 
 /**
  * CollectionRequest — Solicitud de cobro generada por el ERP (Kore), para una o
@@ -63,6 +64,19 @@ const collectionRequestSchema = new mongoose.Schema({
       referencia:           { type: String, trim: true, default: null },
       bancoKoreId:          { type: String, trim: true, default: null },
       bancoDescripcion:     { type: String, trim: true, default: null },
+      // Saldo(s) a favor / anticipo(s) REALES que cubren esta forma de pago —
+      // obligatorio cuando formaPagoDescripcion es "saldo a favor" o "anticipo"
+      // (ver tipoSaldoEspecial en collection-request-erp-links.js). Sin esto,
+      // Kore no sabe de qué registro específico descontar — puede haber más de
+      // uno si el importe se cubre repartido entre varios (mismo patrón que
+      // cobroSaldosAFavorConfirmados/cobroAnticiposConfirmados en cobro-panel).
+      saldosAplicados: {
+        type: [{
+          id:    { type: String, required: true, trim: true }, // ErpSaldoFavor.id (Kore)
+          monto: { type: Number, required: true },
+        }],
+        default: [],
+      },
     }],
     default: [],
     validate: {
@@ -170,6 +184,31 @@ collectionRequestSchema.pre('validate', function (next) {
       return next(new Error('En Modo 2, cada CxC requiere montoAsignado > 0'));
     }
   }
+
+  // Saldo a favor / anticipo: sin saldosAplicados, Kore recibiría anticipos/
+  // saldosAFavorAUsar vacíos y aplicaría el pago sin descontar del registro
+  // correcto (mismo bug que se corrigió aquí: ver [[project_collection_requests]]).
+  for (const f of (this.formasPago ?? [])) {
+    const tipo = tipoSaldoEspecial(f);
+    if (!tipo) continue;
+    if (!f.saldosAplicados?.length) {
+      return next(new Error(
+        `La forma de pago "${f.formaPagoDescripcion}" requiere saldosAplicados (id + monto de cada saldo a favor/anticipo usado)`,
+      ));
+    }
+    if (f.saldosAplicados.some(s => !s.id || !(s.monto > 0))) {
+      return next(new Error(
+        `La forma de pago "${f.formaPagoDescripcion}" tiene un saldoAplicado inválido (falta id o monto > 0)`,
+      ));
+    }
+    const suma = Math.round(f.saldosAplicados.reduce((s, x) => s + x.monto, 0) * 100) / 100;
+    if (Math.abs(suma - f.importe) > 0.01) {
+      return next(new Error(
+        `La forma de pago "${f.formaPagoDescripcion}": la suma de saldosAplicados (${suma}) no coincide con el importe (${f.importe})`,
+      ));
+    }
+  }
+
   next();
 });
 

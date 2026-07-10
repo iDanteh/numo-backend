@@ -260,6 +260,25 @@ async function _enrichAndFilterCfdis(cfdis, tipo, { excluirPagosSustitutos, uuid
     _normalizarEgresoCondonacion(cfdisEnriquecidos, metodoPagoRelacionado);
   }
 
+  // 5C. Normalización: E con medio de pago real (Efectivo/Cheque/Transferencia/
+  // Tarjeta) que ajusta una factura PPD nunca cobrada → formaPago+metodoPago
+  // de esa factura (ver _normalizarEgresoSegunFacturaRelacionada) — misma
+  // regla que ya aplica al generar la póliza real; sin esto la balanza
+  // preliminar mostraría una cuenta distinta a la que la póliza usa.
+  const relPagoRealUuids = [...new Set(
+    cfdisEnriquecidos
+      .filter(c => c.tipoDeComprobante === 'E' && FORMAS_PAGO_REALES.includes(c.formaPago))
+      .flatMap(c => (c.cfdiRelacionados ?? [])
+        .filter(r => r.tipoRelacion === '01' || r.tipoRelacion === '03')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
+  )];
+  if (relPagoRealUuids.length) {
+    const facturasPagoReal = await CFDI.find({ uuid: { $in: relPagoRealUuids } })
+      .select('uuid metodoPago formaPago').lean();
+    const facturaRelacionada = Object.fromEntries(facturasPagoReal.map(f => [f.uuid, { metodoPago: f.metodoPago, formaPago: f.formaPago }]));
+    _normalizarEgresoSegunFacturaRelacionada(cfdisEnriquecidos, facturaRelacionada);
+  }
+
   // 6. Marcar sustitutos — siempre, independiente de excluirPagosSustitutos.
   //    El marcado es información factual del CFDI (tipoRelacion='04').
   //    La EXCLUSIÓN del saldo de CFDI-A es condicional (ver generarBalanzaPreliminar).

@@ -60,6 +60,40 @@ router.get('/:id',
   }),
 );
 
+// GET /api/polizas/:id/export-contpaq?fecha=&folioContado=&folioCredito=&conceptoContado=&conceptoCredito=&centroCostoIds=1,2,3
+router.get('/:id/export-contpaq',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { fecha, folioContado, folioCredito, conceptoContado, conceptoCredito, centroCostoIds } = req.query;
+    const overrides = {
+      fecha:           fecha || undefined,
+      folioContado:    folioContado    != null ? parseInt(folioContado, 10)    : undefined,
+      folioCredito:    folioCredito    != null ? parseInt(folioCredito, 10)    : undefined,
+      conceptoContado: conceptoContado || undefined,
+      conceptoCredito: conceptoCredito || undefined,
+      centroCostoIds:  centroCostoIds
+        ? String(centroCostoIds).split(',').map(v => parseInt(v, 10)).filter(v => !Number.isNaN(v))
+        : undefined,
+    };
+    const { workbook, poliza } = await service.exportContpaqXlsx(req.params.id, overrides);
+    const mes = String(poliza.periodo).padStart(2, '0');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mes}_CONTPAQ.xlsx"`);
+    await workbook.xlsx.write(res);
+  }),
+);
+
+// PATCH /api/polizas/:id/contpaq-folio
+// Body: { folioContado, folioCredito }
+router.patch('/:id/contpaq-folio',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.asociarFolioContpaq(req.params.id, req.body, req.user));
+  }),
+);
+
 // POST /api/polizas
 router.post('/',
   authenticate,
@@ -93,6 +127,20 @@ router.post('/:id/cancelar',
   permit('polizas:write'),
   asyncHandler(async (req, res) => {
     res.json(await service.cancel(req.params.id, req.user, req.body?.motivo));
+  }),
+);
+
+// POST /api/polizas/cancelar-todas
+// Cancela todas las pólizas en estado 'borrador' del rfc/ejercicio/periodo
+// (las contabilizadas y ya canceladas quedan fuera — se cancelan una por una).
+// Body: { rfc, ejercicio, periodo, motivo? }
+// Response: { canceladas, total, errores: [{ polizaId, numero, tipo, error }] }
+router.post('/cancelar-todas',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, ejercicio, periodo, motivo } = req.body;
+    res.json(await service.cancelarTodas({ rfc, ejercicio, periodo }, req.user, motivo));
   }),
 );
 

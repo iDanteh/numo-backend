@@ -1,10 +1,17 @@
 'use strict';
 const mongoose = require('mongoose');
 
+const adicionalSchema = new mongoose.Schema({
+  nombre: { type: String, default: null },
+  valor:  { type: String, default: null },
+}, { _id: false });
+
 const formaPagoSchema = new mongoose.Schema({
-  formasPago:  { type: String, default: null },
-  monto:       { type: Number, default: null },
-  autorizacion:{ type: String, default: null },
+  formasPago:      { type: String, default: null },
+  nombreFormaPago: { type: String, default: null },
+  monto:           { type: Number, default: null },
+  autorizacion:    { type: String, default: null },
+  adicionales:     { type: [adicionalSchema], default: [] },
 }, { _id: false });
 
 const movimientoSchema = new mongoose.Schema({
@@ -12,6 +19,9 @@ const movimientoSchema = new mongoose.Schema({
   folio:          { type: String, default: null },
   serieOrigen:    { type: String, default: null },
   folioOrigen:    { type: String, default: null },
+  // Fecha/hora real del movimiento en el ERP — única fuente de orden
+  // cronológico confiable del kardex (antes se perdía por no estar declarada).
+  fecha:          { type: Date, default: null },
   saldoAnterior:  { type: Number, default: null },
   saldoActual:    { type: Number, default: null },
   subtotal:       { type: Number, default: null },

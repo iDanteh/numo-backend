@@ -11,10 +11,32 @@ const bankService       = require('../banks/bank.service'); // setErpIds — mis
 const koreCaja          = require('../erp/kore-caja.service');
 const { parseCxcs, parseFormasPago }               = require('./collection-request.parsers');
 const { buildPayloadSingle, buildPayloadMulti }    = require('./collection-request-kore-payload');
-const { buildErpLinksParaCobro }                   = require('./collection-request-erp-links');
+const { buildErpLinksParaCobro, tipoSaldoEspecial } = require('./collection-request-erp-links');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
 const driveComprobantes                  = require('./drive-comprobantes.service');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
+const { emitToAll }                      = require('../../shared/socket');
+
+// Payload mínimo para 'collection-request:updated' — mismo criterio que
+// bank:movement:updated en bank.service.js: solo lo que la bandeja necesita
+// para actualizar la fila en el arreglo local sin volver a pedir todo el listado.
+function _eventoActualizacion(cr, mov) {
+  return {
+    _id:               cr._id.toString(),
+    status:            cr.status,
+    motivoRechazo:     cr.motivoRechazo,
+    resueltoPorUserId: cr.resueltoPorUserId,
+    resueltoPorNombre: cr.resueltoPorNombre,
+    resueltoAt:        cr.resueltoAt,
+    cobroAplicado:     cr.cobroAplicado,
+    cobroAplicadoAt:   cr.cobroAplicadoAt,
+    solicitanteUserId: cr.solicitanteUserId,
+    bankMovementId: mov ? {
+      _id: mov._id.toString(), banco: mov.banco, fecha: mov.fecha,
+      concepto: mov.concepto, deposito: mov.deposito, retiro: mov.retiro,
+    } : null,
+  };
+}
 
 // Combina el comprobante LEGACY (Mongo, un solo archivo, campo `comprobante`)
 // con los nuevos (Drive, arreglo `comprobantes[]`) en una sola lista uniforme
@@ -101,6 +123,26 @@ async function create(data, files = []) {
   const montoInvalido = formasPagoParsed.find(f => !f.formaPagoId || !f.formaPagoDescripcion || !(f.importe > 0));
   if (montoInvalido) {
     throw new BadRequestError('Cada forma de pago requiere formaPagoId, formaPagoDescripcion e importe > 0');
+  }
+
+  // Saldo a favor / anticipo: sin el id + monto del registro específico usado,
+  // Kore recibiría saldosAFavorAUsar/anticipos vacíos y no sabría de dónde
+  // descontar (ver collection-request-kore-payload.js). El mismo chequeo vive
+  // en el pre('validate') del modelo — se repite aquí para dar un error claro
+  // antes de tocar Mongo, igual que ya se hace con la validación de Modo 2.
+  const saldoEspecialInvalido = formasPagoParsed.find(f => {
+    const tipo = tipoSaldoEspecial(f);
+    if (!tipo) return false;
+    if (!f.saldosAplicados.length) return true;
+    if (f.saldosAplicados.some(s => !s.id || !(s.monto > 0))) return true;
+    const suma = Math.round(f.saldosAplicados.reduce((s, x) => s + x.monto, 0) * 100) / 100;
+    return Math.abs(suma - f.importe) > 0.01;
+  });
+  if (saldoEspecialInvalido) {
+    throw new BadRequestError(
+      `La forma de pago "${saldoEspecialInvalido.formaPagoDescripcion}" requiere saldosAplicados ` +
+      '(id + monto de cada saldo a favor/anticipo usado) cuya suma sea igual al importe',
+    );
   }
 
   // Modo 2 (varias CxC): Kore/cobro-panel no soportan combinar N CxC con M
@@ -248,20 +290,34 @@ async function getById(id) {
 // getById, que sí regresa el documento completo para la bandeja de Numo):
 // Kore ya conoce cxcs/formasPago/comprobantes (los mandó él al crearla) y no
 // necesita IDs internos de Mongo ni quién en Numo la resolvió — solo el
-// estatus, el motivo si se rechazó, cuándo se resolvió, y el movimiento
-// bancario al que quedó vinculada (folio/fecha/depósito).
+// estatus, el motivo si se rechazó, cuándo se resolvió, el movimiento bancario
+// al que quedó vinculada, y (agregado a petición del usuario) qué CxC quedaron
+// afectadas y con qué monto — antes había que adivinarlo cruzando con Kore.
 async function getByErpId(solicitudIdErp) {
   const cr = await CollectionRequest.findOne({ solicitudIdErp: String(solicitudIdErp).trim() })
-    .select('solicitudIdErp status motivoRechazo resueltoAt bankMovementId')
+    .select('solicitudIdErp status motivoRechazo resueltoAt bankMovementId cxcs monto cobroAplicado cobroAplicadoAt')
     .populate('bankMovementId', 'folio fecha deposito')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
 
   return {
-    solicitudIdErp: cr.solicitudIdErp,
-    status:         cr.status,
-    motivoRechazo:  cr.motivoRechazo ?? null,
-    resueltoAt:     cr.resueltoAt ?? null,
+    solicitudIdErp:  cr.solicitudIdErp,
+    status:          cr.status,
+    motivoRechazo:   cr.motivoRechazo ?? null,
+    resueltoAt:      cr.resueltoAt ?? null,
+    monto:           cr.monto,
+    cobroAplicado:   cr.cobroAplicado ?? false,
+    cobroAplicadoAt: cr.cobroAplicadoAt ?? null,
+    // CxC afectadas por esta solicitud — montoAsignado solo viene lleno en
+    // Modo 2 (varias CxC); en Modo 1 (una sola CxC) el monto cobrado es `monto`
+    // de arriba, ya que ahí no se reparte entre cuentas.
+    cxcs: (cr.cxcs || []).map(c => ({
+      erpId:         c.erpId,
+      serie:         c.serie ?? null,
+      folioExterno:  c.folioExterno ?? null,
+      folioFiscal:   c.folioFiscal ?? null,
+      montoAsignado: c.montoAsignado ?? null,
+    })),
     bankMovement: cr.bankMovementId ? {
       folio:    cr.bankMovementId.folio    ?? null,
       fecha:    cr.bankMovementId.fecha    ?? null,
@@ -423,6 +479,11 @@ async function identificar(id, bankMovementId, user) {
   cr.koreOperacionResult = koreResult;
   await cr.save();
 
+  // 7. Avisar en tiempo real a quien tenga la bandeja abierta (cobranza/contabilidad/
+  // admin) y a la tienda que la solicitó — sin esto, cualquier otra sesión con la
+  // vista abierta se queda con el estado viejo hasta que alguien recargue a mano.
+  emitToAll('collection-request:updated', _eventoActualizacion(cr, mov));
+
   return _toSafeJSON(cr);
 }
 
@@ -439,6 +500,9 @@ async function rechazar(id, motivo, user) {
     { new: true },
   );
   if (!cr) throw new NotFoundError('Solicitud no encontrada o ya identificada');
+
+  emitToAll('collection-request:updated', _eventoActualizacion(cr, null));
+
   return _toSafeJSON(cr);
 }
 

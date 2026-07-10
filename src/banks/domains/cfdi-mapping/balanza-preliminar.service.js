@@ -648,6 +648,54 @@ function _normalizarEgresoCondonacion(cfdis, metodoPagoRelacionado) {
   }
 }
 
+// c_FormaPago SAT que representan un medio de pago REAL (efectivo, cheque,
+// transferencia, tarjeta) — a diferencia de marcadores de negocio como '15'
+// (Condonación, ya cubierto por `_normalizarEgresoCondonacion`) o '99' (Por
+// definir, que ya cae en la familia de reglas de Crédito por diseño). Para
+// estos códigos SÍ hace falta corregir tanto formaPago como metodoPago,
+// porque el catálogo de reglas usa formaPago para elegir cuenta de abono
+// (Caja/Bancos vs Clientes) — no solo metodoPago.
+const FORMAS_PAGO_REALES = ['01', '02', '03', '04', '28', '29'];
+
+/**
+ * Normalización en memoria: Egreso (NC) que declara un medio de pago real
+ * (Efectivo/Cheque/Transferencia/Tarjeta) pero cuya factura relacionada
+ * sigue PPD (nunca cobrada) → se reclasifica con el formaPago Y metodoPago
+ * de ESA factura, no los propios. Aplica ANTES del matching de reglas. No
+ * escribe a MongoDB.
+ *
+ * Razón: confirmado con el usuario y con datos reales (ver
+ * diag-nc-metodopago-cruzado.js) — una NC de devolución/bonificación puede
+ * declarar "Efectivo/PUE" aunque la venta que ajusta nunca se cobró (era a
+ * crédito). No tiene sentido un "reembolso en efectivo" de algo que nunca se
+ * pagó: en realidad la NC debe reducir la Cuenta por Cobrar (Clientes), no
+ * Caja/Bancos, y su IVA debe cancelar "IVA Por Trasladar" (PPD), no "IVA
+ * Trasladado" (PUE). Sin este fix, la NC cae en el bloque/cuenta de Contado
+ * equivocado.
+ *
+ * No aplica a formaPago='15' (Condonación) — ese es un marcador de negocio,
+ * no un medio de pago; ya lo maneja `_normalizarEgresoCondonacion` sin tocar
+ * formaPago (cambiarlo ahí rompería la clasificación de Condonación).
+ *
+ * @param {Array} cfdis
+ * @param {Object<string,{metodoPago:string,formaPago:string}>} facturaRelacionada - uuid de factura → sus datos
+ */
+function _normalizarEgresoSegunFacturaRelacionada(cfdis, facturaRelacionada) {
+  if (!facturaRelacionada) return;
+  for (const cfdi of cfdis) {
+    if (cfdi.tipoDeComprobante !== 'E') continue;
+    if (!FORMAS_PAGO_REALES.includes(cfdi.formaPago)) continue;
+    const relUuid = (cfdi.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '01' || r.tipoRelacion === '03')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .find(u => facturaRelacionada[u]?.metodoPago === 'PPD');
+    if (relUuid) {
+      cfdi.formaPago  = facturaRelacionada[relUuid].formaPago ?? cfdi.formaPago;
+      cfdi.metodoPago = 'PPD';
+    }
+  }
+}
+
 /**
  * Genera un array de razones (strings) que explican por qué una regla
  * fue seleccionada para un CFDI específico.
@@ -1144,4 +1192,4 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
   return { entradas, sinRegla };
 }
 
-module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, generarDetalleExport, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion };
+module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, generarDetalleExport, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada };

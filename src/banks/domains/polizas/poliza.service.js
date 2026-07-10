@@ -420,13 +420,19 @@ const FORMA_PAGO_TRANSFERENCIA = '03';
 // export real donde Efectivo y Tarjeta salen en cuentas/líneas separadas.
 const LABEL_FORMA_PAGO_CONSOLIDADO = { '01': 'EFECTIVO', '04': 'TARJETA', '28': 'TARJETA' };
 
-// Cuentas de pasivo que representan la CREACIÓN de un saldo a favor del
-// cliente (Anticipos Otros / monedero Club Tuberos) o su IVA diferido — a
-// diferencia de una devolución en efectivo/banco, esta línea de abono SÍ debe
-// mostrarse (no es un reembolso, es un nuevo pasivo que el cliente puede
-// usar después) — confirmado con el usuario contra un export real.
+// Cuentas cuyo abono en una Devolución/Cancelación SÍ debe mostrarse — a
+// diferencia de un reembolso real en efectivo/banco (que se oculta, ver
+// `esAjusteContadoMov`/`bloquesAjustesContado`), estas dos representan algo
+// que el cliente sigue "debiendo o teniendo a favor", no dinero que salió:
+//   - Saldo a favor (Anticipos Otros / monedero Club Tuberos) o su IVA
+//     diferido — se crea un pasivo que el cliente puede usar después.
+//   - Clientes (CxC) — la NC en realidad ajusta una venta A CRÉDITO (nunca
+//     cobrada): el "abono" es la reducción de esa cuenta por cobrar, no un
+//     reembolso — confirmado con el usuario: "cuando sean DEV a crédito debe
+//     estar el asiento completo no solo los cargos".
 const CUENTAS_SALDO_FAVOR = new Set(['2103090001', '2103090002', '2104010002']);
-const esAbonoSaldoFavor = (m) => CUENTAS_SALDO_FAVOR.has(m.cuenta?.codigo);
+const CUENTAS_CLIENTES    = new Set(['1103010001', '1103010002']);
+const esAbonoSaldoFavor = (m) => CUENTAS_SALDO_FAVOR.has(m.cuenta?.codigo) || CUENTAS_CLIENTES.has(m.cuenta?.codigo);
 
 // "OPA" = anticipo (confirmado por el usuario). Aplica a CUALQUIER regla de
 // anticipo — recepción (Reg 22, 22A, 22-0, 22C-DESC, "Recepción Anticipo por
@@ -574,35 +580,26 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       continue;
     }
 
-    // Transferencia REAL (verificada contra Bancos, no solo declarada por el
-    // CFDI): desglosado, una línea por CFDI con la referencia bancaria real
-    // como serie. `esTransferenciaVerificada` manda sobre el `formaPago` que
-    // el CFDI declara — cubre tanto "CFDI dice transferencia y el banco lo
-    // confirma" como "CFDI dice otra forma de pago (efectivo/tarjeta/etc.)
-    // pero el banco muestra que en realidad se pagó por transferencia
-    // (SPEI/traspaso)" — confirmado con el usuario.
-    if (esTransferenciaVerificada) {
+    // CON depósito ligado en Bancos (identificado contra un movimiento real,
+    // con su propio número de autorización/referencia) se desglosa
+    // individual — sin importar la forma de pago que declare el CFDI
+    // (transferencia, tarjeta, cheque, "99 Por definir", etc.). SIN un
+    // depósito real que mostrar, no aplica el desglose: una línea individual
+    // repitiendo solo la serie del propio CFDI (que ya aparece en el
+    // concepto) no aporta nada — se consolida como cualquier otro cargo,
+    // igual que antes. Confirmado con el usuario contra un export real.
+    if (bancario?.referencia) {
+      const etiqueta = esTransferenciaVerificada ? 'Transferencia' : 'Depósito identificado';
       transferencias.push(armarIndividual(
-        'Transferencia',
-        subcodigoTransferencia,
+        etiqueta,
+        esTransferenciaVerificada ? subcodigoTransferencia : 0,
         null,
-        bancario?.referencia || m.serie || '',
+        bancario.referencia,
       ));
       continue;
     }
 
     const label = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] ?? null;
-
-    // CUALQUIER CFDI con depósito ligado en Bancos (identificado contra un
-    // movimiento real, sin importar la forma de pago que declare — tarjeta,
-    // cheque, "99 Por definir", etc.) se desglosa igual que Transferencia,
-    // con el número de autorización real de NUMO como serie — confirmado con
-    // el usuario. Sin depósito ligado, sigue consolidándose por forma de
-    // pago como siempre.
-    if (bancario?.referencia) {
-      transferencias.push(armarIndividual('Depósito identificado', 0, null, bancario.referencia));
-      continue;
-    }
 
     const key = `${m.cuenta?.codigo}|${centroCosto}|${label ?? ''}`;
     if (!grupos.has(key)) {

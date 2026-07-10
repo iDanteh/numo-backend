@@ -205,6 +205,21 @@ async function syncModels() {
       ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'A'; END IF;
     END$$;
   `).catch(() => {});
+
+  // Folio real asociado en CONTPAQi tras importar el export (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS contpaq_folio_contado INTEGER,
+      ADD COLUMN IF NOT EXISTS contpaq_folio_credito INTEGER,
+      ADD COLUMN IF NOT EXISTS contpaq_asociado_por  VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS contpaq_asociado_en   TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN contpaq_*:', e.message));
+
+  // Correos de alerta por entidad (vencimiento de credenciales SAT)
+  await Entity.sequelize.query(`
+    ALTER TABLE entities
+      ADD COLUMN IF NOT EXISTS emails_alerta TEXT[] DEFAULT '{}'
+  `).catch(e => console.warn('[syncModels] ADD COLUMN emails_alerta:', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

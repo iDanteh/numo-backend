@@ -152,7 +152,8 @@ const guardar = async (rfc, { cerB64, keyB64, password }) => {
       cerCifrado,
       keyCifrado,
       passwordCifrado,
-      createdAt: new Date(), // Reinicia el TTL
+      createdAt:       new Date(), // Reinicia el TTL
+      alertasEnviadas: { d2: false, d1: false, horas: false }, // nueva generación, nuevos avisos
     },
     { upsert: true, new: true },
   );
@@ -239,4 +240,33 @@ const actualizarKey = async (rfc, keyB64) => {
   logger.info(`[Credenciales] Llave actualizada para RFC: ${rfcNorm}`);
 };
 
-module.exports = { guardar, obtener, eliminar, limpiarBuffers, tieneCredenciales, actualizarKey };
+/**
+ * Lista todas las credenciales vigentes (sin descifrar) para el job de
+ * alertas de vencimiento — solo los campos necesarios para calcular el TTL
+ * y saber qué avisos ya se mandaron.
+ *
+ * @returns {Promise<Array<{ rfc: string, createdAt: Date, alertasEnviadas: object }>>}
+ */
+const listarParaAlertas = async () => {
+  return SATCredencial.find({}, 'rfc createdAt alertasEnviadas').lean();
+};
+
+/**
+ * Marca un tipo de aviso de vencimiento como ya enviado, para no duplicarlo
+ * en la siguiente corrida del cron.
+ *
+ * @param {string} rfc
+ * @param {'d2'|'d1'|'horas'} tipo
+ */
+const marcarAlertaEnviada = async (rfc, tipo) => {
+  const rfcNorm = rfc.toUpperCase().trim();
+  await SATCredencial.updateOne(
+    { rfc: rfcNorm },
+    { $set: { [`alertasEnviadas.${tipo}`]: true } },
+  );
+};
+
+module.exports = {
+  guardar, obtener, eliminar, limpiarBuffers, tieneCredenciales, actualizarKey,
+  listarParaAlertas, marcarAlertaEnviada,
+};

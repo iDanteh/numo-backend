@@ -17,6 +17,7 @@ const erpFacturaPagoSchema = new mongoose.Schema({
     serie: { type: String, default: null },
     folio: { type: String, default: null },
     subtotal: { type: Number, default: null },
+    descuento: { type: Number, default: null },
     totalIva: { type: Number, default: null },
     totalRetenciones: { type: Number, default: null },
     importe: { type: Number, default: null },

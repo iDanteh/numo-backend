@@ -596,22 +596,33 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       continue;
     }
 
+    // Transferencia confirmada (20 o 21, según el bloque) SIEMPRE se desglosa
+    // individual, con o sin número de autorización real del banco — a
+    // diferencia de Tarjeta/Efectivo, que solo se desglosan cuando SÍ hay un
+    // depósito bancario identificado (ver bloque siguiente). Sin referencia
+    // bancaria, se usa la serie/folio propio del CFDI (armarIndividual cae a
+    // `m.serie` cuando no se pasa `serieOverride`). Confirmado con el usuario.
+    if (esTransferenciaVerificada) {
+      transferencias.push(armarIndividual(
+        'Transferencia',
+        subcodigoTransferencia,
+        null,
+        bancario?.referencia,
+      ));
+      continue;
+    }
+
     // CON depósito ligado en Bancos (identificado contra un movimiento real,
     // con su propio número de autorización/referencia) se desglosa
     // individual — sin importar la forma de pago que declare el CFDI
-    // (transferencia, tarjeta, cheque, "99 Por definir", etc.). SIN un
-    // depósito real que mostrar, no aplica el desglose: una línea individual
-    // repitiendo solo la serie del propio CFDI (que ya aparece en el
-    // concepto) no aporta nada — se consolida como cualquier otro cargo,
-    // igual que antes. Confirmado con el usuario contra un export real.
+    // (tarjeta, cheque, "99 Por definir", etc. — transferencia ya se manejó
+    // arriba). SIN un depósito real que mostrar, no aplica el desglose: una
+    // línea individual repitiendo solo la serie del propio CFDI (que ya
+    // aparece en el concepto) no aporta nada — se consolida como cualquier
+    // otro cargo, igual que antes. Confirmado con el usuario contra un export
+    // real.
     if (bancario?.referencia) {
-      const etiqueta = esTransferenciaVerificada ? 'Transferencia' : 'Depósito identificado';
-      transferencias.push(armarIndividual(
-        etiqueta,
-        esTransferenciaVerificada ? subcodigoTransferencia : 0,
-        null,
-        bancario.referencia,
-      ));
+      transferencias.push(armarIndividual('Depósito identificado', 0, null, bancario.referencia));
       continue;
     }
 

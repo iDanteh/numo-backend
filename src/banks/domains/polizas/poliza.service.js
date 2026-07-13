@@ -598,8 +598,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
 
     // Transferencia confirmada (20 o 21, según el bloque) SIEMPRE se desglosa
     // individual, con o sin número de autorización real del banco — a
-    // diferencia de Tarjeta/Efectivo, que solo se desglosan cuando SÍ hay un
-    // depósito bancario identificado (ver bloque siguiente). Sin referencia
+    // diferencia de Efectivo, que siempre se consolida. Sin referencia
     // bancaria, se usa la serie/folio propio del CFDI (armarIndividual cae a
     // `m.serie` cuando no se pasa `serieOverride`). Confirmado con el usuario.
     if (esTransferenciaVerificada) {
@@ -612,15 +611,26 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       continue;
     }
 
+    // Tarjeta (crédito '04' o débito '28') SIEMPRE se desglosa individual,
+    // igual que Transferencia — antes solo se desglosaba cuando había un
+    // depósito bancario identificado; sin él, se consolidaba en "Depósitos
+    // consolidados (Tarjeta)". Confirmado con el usuario: Tarjeta también
+    // debe salir completa, no agrupada. Subcódigo 0 (no tiene código propio
+    // como Transferencia/Anticipo — confirmado con el usuario).
+    if (LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA') {
+      transferencias.push(armarIndividual('Tarjeta', 0, null, bancario?.referencia));
+      continue;
+    }
+
     // CON depósito ligado en Bancos (identificado contra un movimiento real,
     // con su propio número de autorización/referencia) se desglosa
     // individual — sin importar la forma de pago que declare el CFDI
-    // (tarjeta, cheque, "99 Por definir", etc. — transferencia ya se manejó
-    // arriba). SIN un depósito real que mostrar, no aplica el desglose: una
-    // línea individual repitiendo solo la serie del propio CFDI (que ya
-    // aparece en el concepto) no aporta nada — se consolida como cualquier
-    // otro cargo, igual que antes. Confirmado con el usuario contra un export
-    // real.
+    // (cheque, "99 Por definir", etc. — transferencia y tarjeta ya se
+    // manejaron arriba). SIN un depósito real que mostrar, no aplica el
+    // desglose: una línea individual repitiendo solo la serie del propio CFDI
+    // (que ya aparece en el concepto) no aporta nada — se consolida como
+    // cualquier otro cargo, igual que antes. Confirmado con el usuario contra
+    // un export real.
     if (bancario?.referencia) {
       transferencias.push(armarIndividual('Depósito identificado', 0, null, bancario.referencia));
       continue;

@@ -667,9 +667,17 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     _esResto:    true,
   }));
 
+  // Cada categoría se ordena internamente por serie/folio ascendente — antes
+  // quedaban en el orden en que llegaron los CFDIs de entrada (arbitrario).
+  // El orden RELATIVO de las categorías entre sí no cambia: Devolución,
+  // Descuento, Bonificación y Anticipos primero; Club Tuberos, Transferencia/
+  // Tarjeta con referencia real, y los cargos consolidados van al final,
+  // en ese orden — confirmado con el usuario.
+  const porSerieFolio = (arr) => [...arr].sort(compararSerieFolio);
+
   return [
-    ...porCategoria.devolucion, ...porCategoria.descuento, ...porCategoria.bonificacion,
-    ...porCategoria.clubTuberos, ...anticipos, ...transferencias, ...consolidados,
+    ...porSerieFolio(porCategoria.devolucion), ...porSerieFolio(porCategoria.descuento), ...porSerieFolio(porCategoria.bonificacion),
+    ...porSerieFolio(porCategoria.clubTuberos), ...porSerieFolio(anticipos), ...porSerieFolio(transferencias), ...consolidados,
   ];
 }
 

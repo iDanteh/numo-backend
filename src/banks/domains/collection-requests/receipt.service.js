@@ -16,10 +16,55 @@
 const Tesseract    = require('tesseract.js');
 const paddleOcr    = require('./paddle-ocr.service');
 const BankMovement = require('../banks/BankMovement.model');
+const { withTimeout }     = require('../../../shared/utils/with-timeout');
+const { logger }          = require('../../../shared/utils/logger');
+const { UnprocessableError } = require('../../../shared/errors/AppError');
 
 const DATE_WINDOW_DAYS = 30;
 const FALLBACK_WINDOW  = 90;
 const SUPPORTED_MIME   = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
+
+// Un comprobante real nunca se acerca a esto (una o dos páginas de texto, unos
+// pocos KB) — protege contra un PDF de puro texto anormalmente grande (dentro
+// del límite de 20MB de multer) que forzaría a los ~20 regex de extracción a
+// correr sobre decenas de millones de caracteres de forma síncrona.
+const MAX_PDF_TEXT_LENGTH = 50_000;
+
+// Los 14 campos que puede llenar el motor de extracción — usado tanto para
+// fusionar PSM 4/PSM 6 (mergeOcrFields) como para el resumen de diagnóstico
+// que se loguea en cada extracción (ver _logExtraccion).
+const CAMPOS_RECIBO = [
+  'monto', 'fecha', 'hora', 'claveRastreo', 'referencia',
+  'numeroAutorizacion', 'clabe', 'bancoOrigen', 'bancoDestino',
+  'cuentaOrigenUltimos4', 'cuentaDestinoUltimos4',
+  'titularOrigen', 'titularDestino', 'concepto',
+];
+
+/**
+ * Loguea un resumen de la extracción SIN exponer el texto OCR crudo (que
+ * puede incluir nombres, cuentas y otros datos financieros sensibles) — solo
+ * metadata: motor usado, confianza, y qué campos se extrajeron vs. cuáles
+ * quedaron null. Corre siempre (dev Y producción), a diferencia de
+ * `_ocrText`/`_ocrLines` que solo viajan en la respuesta fuera de producción.
+ *
+ * Esto es lo único que queda para diagnosticar un comprobante real que falla
+ * en producción sin tener que re-descargarlo y correrlo local con
+ * NODE_ENV distinto — con `label` (ej. nombre original del archivo o
+ * "solicitud-folio#índice") se puede correlacionar el log con el comprobante.
+ */
+function _logExtraccion(engine, fields, confianza, ocrConfidence, label) {
+  const presentes = CAMPOS_RECIBO.filter(c => fields[c] != null);
+  const faltantes = CAMPOS_RECIBO.filter(c => fields[c] == null);
+  logger.info(
+    `[receiptService] extracción engine=${engine} label="${label ?? 'sin-label'}" `
+    + `confianza=${confianza} ocrConfidence=${ocrConfidence} `
+    + `presentes=[${presentes.join(',')}] faltantes=[${faltantes.join(',')}]`,
+  );
+}
+
+// El reconocimiento real toma pocos segundos por imagen — 30s solo cubre un
+// cuelgue real del worker de Tesseract (imagen corrupta, proceso atorado).
+const OCR_TIMEOUT_MS = 30000;
 
 // ── Catálogo de bancos ────────────────────────────────────────────────────────
 
@@ -129,7 +174,14 @@ async function runOCR(imageBuffer, mimeType = 'image/jpeg') {
   // PSM 4 = columna única — layout real de recibos bancarios.
   const worker  = await getFullWorker();
   const dataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
-  const { data: { text, confidence } } = await worker.recognize(dataUrl);
+  const { data: { text, confidence } } = await withTimeout(
+    worker.recognize(dataUrl), OCR_TIMEOUT_MS, 'Tesseract.recognize (full)',
+    () => {
+      logger.error('[Tesseract] worker "full" excedió el timeout — se descarta y se reinicia en la próxima llamada');
+      _workerFullPromise = null;
+      worker.terminate().catch(() => {});
+    },
+  );
   return { text, confidence };
 }
 
@@ -137,7 +189,14 @@ async function runOCRBlock(imageBuffer, mimeType = 'image/jpeg') {
   // PSM 6 = bloque uniforme — layouts horizontales, PDFs y capturas de pantalla anchas.
   const worker  = await getBlockWorker();
   const dataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
-  const { data: { text, confidence } } = await worker.recognize(dataUrl);
+  const { data: { text, confidence } } = await withTimeout(
+    worker.recognize(dataUrl), OCR_TIMEOUT_MS, 'Tesseract.recognize (block)',
+    () => {
+      logger.error('[Tesseract] worker "block" excedió el timeout — se descarta y se reinicia en la próxima llamada');
+      _workerBlockPromise = null;
+      worker.terminate().catch(() => {});
+    },
+  );
   return { text, confidence };
 }
 
@@ -149,7 +208,14 @@ async function runOCRBlock(imageBuffer, mimeType = 'image/jpeg') {
 async function runOCRAmounts(imageBuffer, mimeType = 'image/jpeg') {
   const worker  = await getNumsWorker();
   const dataUrl = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
-  const { data: { text } } = await worker.recognize(dataUrl);
+  const { data: { text } } = await withTimeout(
+    worker.recognize(dataUrl), OCR_TIMEOUT_MS, 'Tesseract.recognize (amounts)',
+    () => {
+      logger.error('[Tesseract] worker "amounts" excedió el timeout — se descarta y se reinicia en la próxima llamada');
+      _workerNumsPromise = null;
+      worker.terminate().catch(() => {});
+    },
+  );
   return text;
 }
 
@@ -742,16 +808,10 @@ function extractAllFields(clean) {
  *  - Campos de 4/8 dígitos (cuentaOrigenUltimos4, etc.): longitud fija → PSM 4.
  */
 function mergeOcrFields(f4, f6) {
-  const CAMPOS = [
-    'monto', 'fecha', 'hora', 'claveRastreo', 'referencia',
-    'numeroAutorizacion', 'clabe', 'bancoOrigen', 'bancoDestino',
-    'cuentaOrigenUltimos4', 'cuentaDestinoUltimos4',
-    'titularOrigen', 'titularDestino', 'concepto',
-  ];
   const LONGITUD_FIJA = new Set(['cuentaOrigenUltimos4', 'cuentaDestinoUltimos4', 'fecha', 'hora']);
 
   const merged = {};
-  for (const campo of CAMPOS) {
+  for (const campo of CAMPOS_RECIBO) {
     const v4 = f4[campo] ?? null;
     const v6 = f6[campo] ?? null;
 
@@ -770,7 +830,7 @@ function mergeOcrFields(f4, f6) {
   return merged;
 }
 
-async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg') {
+async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg', label = null) {
   // Preprocesar una sola vez — las tres pasadas comparten el mismo buffer PNG.
   const processedBuffer = await preprocessImage(imageBuffer);
 
@@ -811,6 +871,8 @@ async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg')
     ? Math.round(baseConfianza * 0.8)
     : baseConfianza;
 
+  _logExtraccion('tesseract', fields, adjustedConfianza, ocrConfidence, label);
+
   return {
     ...fields,
     confianza:      adjustedConfianza,
@@ -825,6 +887,16 @@ async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg')
 // ════════════════════════════════════════════════════════════════════════════
 // HELPERS DE PREPROCESAMIENTO
 // ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Cede el control al event loop de Node. Usado dentro de bucles síncronos
+ * pesados (deskew, binarización adaptativa) para que otras requests HTTP,
+ * sockets o timers puedan atenderse ENTRE tandas de cómputo, en vez de
+ * esperar a que termine todo el bucle de una sola vez.
+ */
+function _yieldToEventLoop() {
+  return new Promise(resolve => setImmediate(resolve));
+}
 
 /**
  * Clasifica la imagen como screenshot digital o fotografía física.
@@ -902,6 +974,13 @@ async function smartUpscale(buffer, isScreenshot) {
  * Se trabaja sobre una copia reducida (≤ 400 px de ancho) para eficiencia.
  * Resolución angular: 0.5° — suficiente para OCR con LSTM.
  *
+ * Nota de concurrencia: cada ángulo probado cede el hilo con `setImmediate`
+ * al terminar (ver `_yieldToEventLoop`) — sin esto, el barrido completo
+ * (41 ángulos × miles de píxeles) corre de forma síncrona y bloquea TODO
+ * el servidor (cualquier otra request/socket) mientras dura. El resultado
+ * numérico es idéntico a la versión sin ceder — solo cambia cuándo el
+ * event loop puede atender otras tareas entre ángulo y ángulo.
+ *
  * @returns {number} ángulo de corrección en grados (0 si la inclinación < 0.5°)
  */
 async function detectSkewAngle(grayBuffer) {
@@ -948,6 +1027,8 @@ async function detectSkewAngle(grayBuffer) {
         bestVariance = variance;
         bestAngle    = deg;
       }
+
+      await _yieldToEventLoop();
     }
 
     return Math.abs(bestAngle) >= 0.5 ? bestAngle : 0;
@@ -973,12 +1054,19 @@ async function detectSkewAngle(grayBuffer) {
  * La imagen integral permite calcular la suma de cualquier rectángulo
  * en O(1) con 4 accesos, llevando la complejidad total a O(n).
  *
+ * Nota de concurrencia: igual que `detectSkewAngle`, esto es un bucle síncrono
+ * sobre TODA la imagen a resolución completa (más pesado aún, porque acá no
+ * hay downsampling de por medio) — cede el hilo cada `YIELD_EVERY_ROWS` filas
+ * para no monopolizar el event loop del servidor. Mismo resultado numérico,
+ * solo cambia cuándo el event loop puede atender otras tareas.
+ *
  * @param {Buffer} grayBuffer  PNG en escala de grises (fondo claro asumido)
  * @param {number} windowSize  Tamaño de ventana local en px (impar, default 29)
  * @param {number} k           Factor de offset del umbral (default 0.15)
  */
 async function adaptiveThreshold(grayBuffer, windowSize = 29, k = 0.15) {
   const sharp = require('sharp');
+  const YIELD_EVERY_ROWS = 40;
 
   const { data, info } = await sharp(grayBuffer)
     .grayscale()
@@ -997,6 +1085,7 @@ async function adaptiveThreshold(grayBuffer, windowSize = 29, k = 0.15) {
       const aboveLft = (y > 0 && x > 0) ? integral[(y - 1) * width + (x - 1)]    : 0;
       integral[i]    = data[i] + above + left - aboveLft;
     }
+    if (y % YIELD_EVERY_ROWS === 0) await _yieldToEventLoop();
   }
 
   const output = Buffer.alloc(width * height);
@@ -1017,6 +1106,7 @@ async function adaptiveThreshold(grayBuffer, windowSize = 29, k = 0.15) {
       // Texto (oscuro) si cae por debajo del umbral local adaptativo
       output[y * width + x] = data[y * width + x] < localMean * (1 - k) ? 0 : 255;
     }
+    if (y % YIELD_EVERY_ROWS === 0) await _yieldToEventLoop();
   }
 
   return sharp(output, { raw: { width, height, channels: 1 } }).png().toBuffer();
@@ -1174,7 +1264,16 @@ async function preprocessImage(imageBuffer) {
 async function extractTextFromPdf(pdfBuffer) {
   const pdfParse = require('pdf-parse');
   const data     = await pdfParse(pdfBuffer);
-  return (data.text || '').trim();
+  const text     = (data.text || '').trim();
+
+  if (text.length > MAX_PDF_TEXT_LENGTH) {
+    logger.warn(
+      `[extractTextFromPdf] Texto embebido de ${text.length} caracteres excede el límite `
+      + `(${MAX_PDF_TEXT_LENGTH}) — se recorta antes de correr los extractores.`,
+    );
+    return text.slice(0, MAX_PDF_TEXT_LENGTH);
+  }
+  return text;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1231,23 +1330,39 @@ async function renderPdfToImages(pdfBuffer, maxPages = 2) {
  * Si la primera página produce confianza baja (< 40), intenta la segunda.
  * Retorna el resultado de mayor confianza.
  */
-async function extractReceiptDataPdfScanned(pdfBuffer) {
-  const logger = require('../../../shared/utils/logger');
-  const pages  = await renderPdfToImages(pdfBuffer, 2);
+async function extractReceiptDataPdfScanned(pdfBuffer, label = null) {
+  let pages;
+  try {
+    pages = await renderPdfToImages(pdfBuffer, 2);
+  } catch (renderErr) {
+    logger.warn('[extractReceiptDataPdfScanned] renderPdfToImages falló:', renderErr.message);
+    // Errores nombrados por pdfjs-dist (ver PasswordException/InvalidPDFException
+    // en pdfjs-dist/legacy/build/pdf.js) — se distinguen por .name, igual que el
+    // resto de error-handler.js distingue CastError/MulterError/etc.
+    if (renderErr.name === 'PasswordException') {
+      throw new UnprocessableError(
+        'El PDF está protegido con contraseña — no se puede leer automáticamente. Súbelo sin contraseña, o como imagen (foto o captura de pantalla).',
+      );
+    }
+    if (renderErr.name === 'InvalidPDFException') {
+      throw new UnprocessableError('El archivo no es un PDF válido o está corrupto.');
+    }
+    throw new UnprocessableError(`No se pudo renderizar el PDF para lectura por OCR: ${renderErr.message}`);
+  }
 
   if (!pages.length) {
-    throw new Error('renderPdfToImages no devolvió ninguna página');
+    throw new UnprocessableError('El PDF no tiene páginas para procesar.');
   }
 
   const results = [];
   for (const pagePng of pages) {
     try {
-      const r = await extractReceiptDataPaddle(pagePng, 'image/png');
+      const r = await extractReceiptDataPaddle(pagePng, 'image/png', label);
       results.push({ ...r, _engine: 'paddle-ocr-pdf-render' });
     } catch (paddleErr) {
       logger.warn('[extractReceiptDataPdfScanned] Paddle falló en una página:', paddleErr.message);
       try {
-        const r = await extractReceiptDataTesseract(pagePng, 'image/png');
+        const r = await extractReceiptDataTesseract(pagePng, 'image/png', label);
         results.push({ ...r, _engine: 'tesseract-pdf-render' });
       } catch (tessErr) {
         logger.warn('[extractReceiptDataPdfScanned] Tesseract también falló en esa página:', tessErr.message);
@@ -1258,7 +1373,7 @@ async function extractReceiptDataPdfScanned(pdfBuffer) {
   }
 
   if (!results.length) {
-    throw new Error('Ningún motor pudo extraer datos de las páginas del PDF renderizado');
+    throw new UnprocessableError('Ningún motor de OCR pudo extraer datos de las páginas del PDF renderizado.');
   }
 
   // Elegir el resultado con mayor confianza entre todas las páginas/motores probados
@@ -1270,16 +1385,19 @@ async function extractReceiptDataPdfScanned(pdfBuffer) {
  * extractores de campo usados por los motores de imagen. Devuelve null si el
  * PDF no trae texto suficiente (indicio de que está escaneado como imagen).
  */
-async function extractReceiptDataFromPdfText(pdfBuffer) {
+async function extractReceiptDataFromPdfText(pdfBuffer, label = null) {
   const rawText = await extractTextFromPdf(pdfBuffer);
   if (!rawText || rawText.length < 20) return null;
 
-  const clean  = normalizeOcrText(rawText);
-  const fields = extractAllFields(clean);
+  const clean     = normalizeOcrText(rawText);
+  const fields    = extractAllFields(clean);
+  const confianza = calcConfianza(fields);
+
+  _logExtraccion('pdf-parse', fields, confianza, null, label);
 
   return {
     ...fields,
-    confianza: calcConfianza(fields),
+    confianza,
     _engine:   'pdf-parse',
     _ocrText:  process.env.NODE_ENV !== 'production' ? clean : undefined,
   };
@@ -1298,6 +1416,26 @@ async function preprocessForPaddle(imageBuffer) {
     let buf = await sharp(imageBuffer, { failOn: 'none' }).rotate().toBuffer();
     const isScreenshot = await detectIsScreenshot(buf);
     buf = await smartUpscale(buf, isScreenshot);
+
+    // Deskew (solo fotos, igual que en preprocessImage/Tesseract — los
+    // screenshots ya vienen perfectamente alineados por el SO). Antes esto
+    // solo corría en el motor de respaldo; se extiende acá porque Paddle es
+    // el motor PRIMARIO y una foto tomada a mano casi nunca queda perfecta.
+    // Solo es seguro reutilizarlo aquí ahora que detectSkewAngle cede el
+    // hilo entre ángulos (ver _yieldToEventLoop) — si no, correr esto en
+    // cada foto (no solo en el fallback) agravaría el bloqueo del event loop.
+    // Pendiente: no se ha validado todavía contra comprobantes reales
+    // inclinados con Paddle — confirmar que mejora (y no empeora) la lectura.
+    if (!isScreenshot) {
+      const grayBuf   = await sharp(buf).grayscale().png().toBuffer();
+      const skewAngle = await detectSkewAngle(grayBuf);
+      if (Math.abs(skewAngle) >= 0.5) {
+        buf = await sharp(buf)
+          .rotate(-skewAngle, { background: { r: 255, g: 255, b: 255, alpha: 1 } })
+          .toBuffer();
+      }
+    }
+
     return buf;
   } catch (err) {
     const logger = require('../../../shared/utils/logger');
@@ -1312,7 +1450,7 @@ async function preprocessForPaddle(imageBuffer) {
  * fallback estructurado por línea (extractFieldsFromLines/extractMontoFromLines)
  * para los casos donde el texto plano no basta.
  */
-async function extractReceiptDataPaddle(imageBuffer, mimeType = 'image/jpeg') {
+async function extractReceiptDataPaddle(imageBuffer, mimeType = 'image/jpeg', label = null) {
   const processedBuffer = await preprocessForPaddle(imageBuffer);
   const { text: rawText, lines: rawLines, confidence } = await paddleOcr.recognize(processedBuffer);
 
@@ -1350,6 +1488,8 @@ async function extractReceiptDataPaddle(imageBuffer, mimeType = 'image/jpeg') {
   const baseConfianza     = calcConfianza(fields);
   const adjustedConfianza = ocrConfidence < 60 ? Math.round(baseConfianza * 0.8) : baseConfianza;
 
+  _logExtraccion('paddle-ocr', fields, adjustedConfianza, ocrConfidence, label);
+
   return {
     ...fields,
     confianza:      adjustedConfianza,
@@ -1376,25 +1516,30 @@ async function extractReceiptDataPaddle(imageBuffer, mimeType = 'image/jpeg') {
  *   2. pdfjs + PaddleOCR  — renderiza páginas a PNG y aplica OCR (PDFs escaneados)
  *   3. pdfjs + Tesseract  — si Paddle falla en esa página
  */
-async function extractReceiptData(imageBuffer, mimeType) {
+/**
+ * @param {string|null} [label] - identificador legible para correlacionar los
+ *   logs de diagnóstico con el comprobante real (ej. nombre de archivo o
+ *   "folio#índice") — ver `_logExtraccion`. Opcional, no afecta el resultado.
+ */
+async function extractReceiptData(imageBuffer, mimeType, label = null) {
   if (!SUPPORTED_MIME.includes(mimeType))
     throw new Error(`Tipo no soportado: "${mimeType}". Usa JPG, PNG, WEBP o PDF.`);
 
   if (mimeType === 'application/pdf') {
     try {
-      const fromText = await extractReceiptDataFromPdfText(imageBuffer);
+      const fromText = await extractReceiptDataFromPdfText(imageBuffer, label);
       if (fromText) return fromText;
       console.warn('[receiptService] PDF sin texto embebido suficiente — renderizando a imagen.');
     } catch (pdfParseErr) {
       console.warn('[receiptService] pdf-parse falló:', pdfParseErr.message);
     }
 
-    return await extractReceiptDataPdfScanned(imageBuffer);
+    return await extractReceiptDataPdfScanned(imageBuffer, label);
   }
 
   // ── Motor 1: PaddleOCR ─────────────────────────────────────────
   try {
-    return await extractReceiptDataPaddle(imageBuffer, mimeType);
+    return await extractReceiptDataPaddle(imageBuffer, mimeType, label);
   } catch (paddleErr) {
     console.warn('[receiptService] PaddleOCR falló:', paddleErr.message);
   }
@@ -1402,7 +1547,7 @@ async function extractReceiptData(imageBuffer, mimeType) {
   // ── Motor 2: Tesseract (fallback) ───────────────────────────────
   console.warn('[receiptService] Usando Tesseract como último fallback.');
   return {
-    ...(await extractReceiptDataTesseract(imageBuffer, mimeType)),
+    ...(await extractReceiptDataTesseract(imageBuffer, mimeType, label)),
     _engine: 'tesseract',
   };
 }

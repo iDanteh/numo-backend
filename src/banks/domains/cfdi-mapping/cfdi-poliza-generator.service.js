@@ -6,10 +6,14 @@ const centrosSvc = require('../centros-costo/centros-costo.service');
 const { Op, QueryTypes }   = require('sequelize');
 const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
-const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99 } = require('./balanza-preliminar.service');
+const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
+
+// Extrae los uuids de CFDIs relacionados de un CFDI — soporta tanto `uuids`
+// (array, formato ERP) como `uuid` (singular, formato SAT), según el origen.
+const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
 
 /**
  * Enriquece en memoria el campo `tasaIvaInferida` de CFDIs tipo P Metadata
@@ -67,6 +71,149 @@ async function _enrichTasaIvaErp(cfdis) {
 }
 
 /**
+ * Busca las Notas de Crédito (tipo E, tipoRelacion 01/03 — devolución,
+ * descuento, bonificación, Club Tuberos) relacionadas a las facturas de
+ * Ingreso de este batch, para FUSIONARLAS en la misma póliza de Ingreso en
+ * vez de generarse como póliza de Egreso aparte. Confirmado con el usuario:
+ * las NC deben vivir dentro de la póliza de la venta que ajustan, no en una
+ * póliza de Egreso independiente — así el bloque Contado/Crédito de
+ * `poliza.service.js` las puede agrupar y colorear junto a esa venta.
+ *
+ * Excluye NC que ya tengan movimiento en una póliza activa (mismo criterio
+ * que `uuidsYaUsados`, ya resuelto por el caller).
+ *
+ * fechaInicio/fechaFin (opcionales, generación por día): cuando se generan
+ * pólizas por día, la NC debe vivir en la póliza de SU PROPIO día (fecha
+ * efectiva ERP/SAT — confirmado con el usuario), no en la del día de la
+ * factura que ajusta si cae en un día distinto. Sin fechaInicio/fechaFin
+ * (generación de todo el periodo) no se filtra por fecha — comportamiento
+ * previo sin cambios.
+ *
+ * centroCostoId (opcional, generación por sucursal): en modo por día, la NC
+ * solo se fusiona si SU PROPIA serie pertenece a esta sucursal — si no, se
+ * excluye aquí y se recoge cuando le toque generarse la póliza de su propia
+ * sucursal. Requiere `ccBySerieMap` (mapa serie→centro ya resuelto por el
+ * caller, se reutiliza para no pagar una consulta extra a Postgres).
+ *
+ * @param {Array} facturasI - CFDIs tipo I ya cargados/enriquecidos de este batch
+ * @param {string} rfc
+ * @param {Set<string>} uuidsYaUsados - uuids (mayúsculas) con póliza activa
+ * @param {{ejercicio?: number, periodo?: number, fechaInicio?: string, fechaFin?: string, centroCostoId?: string|number, ccBySerieMap?: object}} [opts]
+ */
+async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts = {}) {
+  const { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap } = opts;
+  const facturaUuids = facturasI.map(c => c.uuid).filter(Boolean);
+
+  const relUuidsDe = (c) => (c.cfdiRelacionados ?? [])
+    .filter(r => r.tipoRelacion === '01' || r.tipoRelacion === '03')
+    .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
+
+  const filtroBaseNc = {
+    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    tipoDeComprobante: 'E',
+    source:            'SAT',
+    satStatus:         'Vigente',
+    isActive:          true,
+    'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] },
+  };
+  const selectNc = 'uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida';
+
+  let ncs;
+  if (fechaInicio && fechaFin) {
+    // Generación por día: la NC debe vivir en la póliza de SU PROPIO día
+    // (fecha efectiva ERP/SAT — confirmado con el usuario), sin importar si
+    // la factura que ajusta cayó en un día distinto y por tanto no está en
+    // `facturasI` de este batch. Por eso se busca DIRECTO por la fecha
+    // efectiva de la NC, no partiendo de la relación con las facturas del
+    // lote (que nunca encontraría una NC cuya factura ya se generó en otro
+    // día).
+    const uuidsNcDelDia = await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi: 'E', fechaInicio, fechaFin });
+    if (!uuidsNcDelDia.size) return [];
+    const ncsRaw = await CFDI.find({ ...filtroBaseNc, uuid: { $in: [...uuidsNcDelDia] } })
+      .select(selectNc)
+      .lean();
+    ncs = ncsRaw.filter(nc => !uuidsYaUsados.has((nc.uuid || '').toUpperCase()));
+    // Generación por sucursal (centroCostoId presente): la NC solo debe
+    // fusionarse aquí si SU PROPIA serie pertenece a esta sucursal — si no,
+    // se estaba colando en la póliza de una sucursal ajena (bug real
+    // reportado: "seleccioné solo Atzompa y me manda de más sucursales").
+    if (centroCostoId && ccBySerieMap) {
+      ncs = ncs.filter(nc => String(ccBySerieMap[nc.serie]?.id ?? '') === String(centroCostoId));
+    }
+  } else {
+    // Generación de todo el periodo: comportamiento original, por relación
+    // con las facturas ya cargadas en este batch.
+    if (!facturaUuids.length) return [];
+    const ncsRaw = await CFDI.find(filtroBaseNc).select(selectNc).lean();
+    const facturaSet = new Set(facturaUuids.map(u => u.toUpperCase()));
+    ncs = ncsRaw.filter(nc =>
+      !uuidsYaUsados.has((nc.uuid || '').toUpperCase()) &&
+      relUuidsDe(nc).some(u => facturaSet.has((u || '').toUpperCase())),
+    );
+  }
+  if (!ncs.length) return [];
+
+  await repararSubtotalDesdeXml(ncs);
+
+  // Enriquecer con ERP — mismo patrón que el resto del pipeline.
+  const uuidsSinMeta = ncs
+    .filter(c => !c.formaPago || !c.metodoPago || !c.conceptos?.length)
+    .map(c => c.uuid);
+  let erpMetaMap = {};
+  if (uuidsSinMeta.length) {
+    const erpCfdis = await CFDI.find({ uuid: { $in: uuidsSinMeta }, source: 'ERP' })
+      .select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
+    erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
+  }
+  const ncsEnriquecidas = ncs.map(cfdi => {
+    const erp = erpMetaMap[cfdi.uuid];
+    if (!erp) return cfdi;
+    const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
+    const relSAT     = cfdi.cfdiRelacionados ?? [];
+    const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
+    const relERP     = (erp.cfdiRelacionados ?? []).filter(r => !tiposEnSAT.has(r.tipoRelacion));
+    const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
+    const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
+    return {
+      ...cfdi,
+      formaPago:              cfdi.formaPago  || erp.formaPago,
+      metodoPago:             cfdi.metodoPago || erp.metodoPago,
+      conceptos:              satHasTraslados ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
+      impuestos:              erp.impuestos ?? cfdi.impuestos,
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
+      cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
+    };
+  });
+
+  _normalizarEgresoPue99(ncsEnriquecidas);
+
+  // metodoPago/formaPago reales de la factura relacionada: primero se busca
+  // entre las ya cargadas en este mismo batch (sin costo extra de query); lo
+  // que falte (factura de otro periodo) se resuelve con una consulta puntual.
+  // metodoPagoPorFactura (solo metodoPago) alimenta _normalizarEgresoCondonacion
+  // (formaPago=15); facturaRelacionadaMeta (metodoPago+formaPago) alimenta
+  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
+  const metodoPagoPorFactura   = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), c.metodoPago]));
+  const facturaRelacionadaMeta = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
+  const faltantes = [...new Set(ncsEnriquecidas.flatMap(relUuidsDe))]
+    .map(u => (u || '').toUpperCase())
+    .filter(u => !(u in metodoPagoPorFactura));
+  if (faltantes.length) {
+    const extra = await CFDI.find({ uuid: { $in: faltantes } }).select('uuid metodoPago formaPago').lean();
+    for (const f of extra) {
+      const uuidUp = (f.uuid || '').toUpperCase();
+      metodoPagoPorFactura[uuidUp]   = f.metodoPago;
+      facturaRelacionadaMeta[uuidUp] = { metodoPago: f.metodoPago, formaPago: f.formaPago };
+    }
+  }
+  _normalizarEgresoCondonacion(ncsEnriquecidas, metodoPagoPorFactura);
+  _normalizarEgresoSegunFacturaRelacionada(ncsEnriquecidas, facturaRelacionadaMeta);
+
+  return ncsEnriquecidas;
+}
+
+/**
  * Genera una PROPUESTA de póliza a partir de los CFDIs vigentes del periodo
  * que aún no tienen movimiento contable registrado.
  *
@@ -76,7 +223,7 @@ async function _enrichTasaIvaErp(cfdis) {
 const LIMITE_CFDIS = 500;
 const CHUNK_SIZE   = 200;
 
-async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi }) {
+async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -99,6 +246,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   // 2. CFDIs vigentes del periodo filtrados por tipo
   // Proyección mínima: solo los campos que necesita cfdiToMovimientos
+  // fechaInicio/fechaFin (opcionales): acotan el periodo a un rango de días
+  // específico — usado por `generarYGuardarPorDia` y por el filtro manual de
+  // fecha en la UI. Sin ellos, el comportamiento es el de siempre (mes completo).
+  // El filtro usa la fecha EFECTIVA (ERP cuando existe, SAT si no — ver
+  // `_uuidsPorFechaEfectiva`), no el `fecha` crudo de SAT.
+  const uuidsPorFechaProp = (fechaInicio && fechaFin)
+    ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
+    : null;
   const filtroBase = {
     $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
     ejercicio:         Number(ejercicio),
@@ -106,6 +261,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     tipoDeComprobante: tipoCfdi,
     source:            'SAT',
     satStatus:         'Vigente',
+    ...(uuidsPorFechaProp ? { uuid: { $in: [...uuidsPorFechaProp] } } : {}),
     isActive:          true,
   };
 
@@ -134,15 +290,22 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const rules = await _getRulesActive();
 
   // 4. Pre-fetch tipoDeComprobante de CFDIs relacionados para discriminador relacionadoTipo
+  // (r.uuid singular o r.uuids array — cfdiRelacionados usa ambas formas según el origen).
   const relTipoUuidsProp = [...new Set(
     cfdisSinPoliza
-      .flatMap(c => (c.cfdiRelacionados || []).map(r => r.uuid).filter(Boolean)),
+      .flatMap(c => (c.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
   )];
   const relTipoCfdisArr = relTipoUuidsProp.length
     ? await CFDI.find({ uuid: { $in: relTipoUuidsProp } })
-        .select('uuid tipoDeComprobante').lean()
+        .select('uuid tipoDeComprobante metodoPago formaPago').lean()
     : [];
   const relTipoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.tipoDeComprobante]));
+  // uuid de factura → su metodoPago — usado por _normalizarEgresoCondonacion
+  // para resolver el metodoPago real de NCs formaPago=15 (Condonación).
+  const relMetodoPagoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.metodoPago]));
+  // uuid de factura → metodoPago+formaPago — usado por
+  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
+  const relFacturaMetaMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
 
   // Inyectar _relacionadoTipo en cada CFDI antes del matching
   const cfdisSinPolizaEnriquecidos = cfdisSinPoliza.map(cfdi => {
@@ -209,6 +372,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
   _normalizarEgresoPue99(cfdisSinPolizaFinal);
+  // Normalización: E formaPago=15 (Condonación) → metodoPago real de la factura relacionada
+  _normalizarEgresoCondonacion(cfdisSinPolizaFinal, relMetodoPagoMap);
+  // Normalización: E con medio de pago real (Efectivo/Cheque/Transferencia/Tarjeta)
+  // que ajusta una factura PPD nunca cobrada → formaPago+metodoPago de esa factura.
+  _normalizarEgresoSegunFacturaRelacionada(cfdisSinPolizaFinal, relFacturaMetaMap);
 
   // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
   // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
@@ -222,14 +390,38 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .map(u => u.toUpperCase())
       )
   );
-  const cfdisSinPolizaFinalFiltrado = _canceladosPorSustitutoProp.size
+  const cfdisSinPolizaFinalFiltradoSustituto = _canceladosPorSustitutoProp.size
     ? cfdisSinPolizaFinal.filter(c =>
         !_canceladosPorSustitutoProp.has(c.uuid?.toUpperCase() ?? '')
       )
     : cfdisSinPolizaFinal;
 
+  // Centro de costo por serie de facturación del CFDI (asignación automática).
+  // Se resuelve aquí (antes del matching de reglas) para poder filtrar por
+  // sucursal cuando se pide una sola, y se reutiliza más abajo para etiquetar
+  // cada movimiento — evita una segunda consulta a Postgres.
+  const ccBySerieMapProp = await centrosSvc.resolveBySerieMap();
+
+  const cfdisSinPolizaFinalFiltrado = centroCostoId
+    ? cfdisSinPolizaFinalFiltradoSustituto.filter(c =>
+        String(ccBySerieMapProp[c.serie]?.id ?? '') === String(centroCostoId),
+      )
+    : cfdisSinPolizaFinalFiltradoSustituto;
+
+  if (centroCostoId && cfdisSinPolizaFinalFiltrado.length === 0) {
+    throw new BadRequestError('No hay CFDIs sin póliza para la sucursal seleccionada en este periodo');
+  }
+
+  // Fusionar NC (tipo E) relacionadas a estas facturas en la MISMA póliza de
+  // Ingreso — ver _fetchNotasCreditoParaFusion. Se agregan al final del batch
+  // 'I'; el resto del pipeline (matching de reglas, cfdiToMovimientos) ya
+  // maneja tipos mixtos genéricamente.
+  const cfdisConNCProp = tipoCfdi === 'I'
+    ? [...cfdisSinPolizaFinalFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap: ccBySerieMapProp })]
+    : cfdisSinPolizaFinalFiltrado;
+
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
-  const cfdiConRegla = cfdisSinPolizaFinalFiltrado.map(cfdi => ({
+  const cfdiConRegla = cfdisConNCProp.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
@@ -242,6 +434,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         r.cuentaIvaPPD, r.cuentaIvaRetenido, r.cuentaIsrRetenido,
         r.cuentaAbono2, r.cuentaDescuento, r.cuentaDescuento0,
         r.cuentaIvaAnticipo, r.cuentaDeltaAnticipo, r.cuentaCargo2,
+        r.cuentaCargoMixto0, r.cuentaIvaAbono,
       ].filter(Boolean)),
   )];
 
@@ -281,8 +474,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   }
 
   // 6. Generar movimientos usando cuentaMap pre-cargado
-  // Centro de costo por serie de facturación del CFDI (asignación automática)
-  const ccBySerieMapProp = await centrosSvc.resolveBySerieMap();
+  // (ccBySerieMapProp ya se resolvió arriba, antes del filtro por sucursal)
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
   // Solo aplica cuando la factura final (formaPago=30) usa el modelo 2 asientos
@@ -355,6 +547,15 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     if (rule?.esAplicacionSaldo && saldoRestanteProp > 0) {
       context.saldoDisponible = saldoRestanteProp;
     }
+    // Las NC (tipo E) deben tratarse como la VENTA ORIGINAL que ajustan, no
+    // según su propio metodoPago declarado (puede no coincidir — confirmado
+    // con el usuario: una NC "Efectivo/PUE" puede estar ajustando una
+    // factura PPD nunca cobrada). Con esto el motor usa cuentaIvaPPD en vez
+    // de cuentaIva cuando la factura relacionada era a crédito.
+    if (cfdi.tipoDeComprobante === 'E') {
+      const metodoPagoRel = _uuidsRelacionados(cfdi).map(u => relMetodoPagoMap[u]).find(Boolean);
+      if (metodoPagoRel) context.metodoPagoRelacionado = metodoPagoRel;
+    }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
 
@@ -385,7 +586,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   }
 
   // 4. Construir propuesta (no guardada)
-  const fecha = new Date();
+  // Si se generó para un día específico (fechaInicio), el encabezado debe
+  // mostrar ESE día, no la fecha en la que se corrió la generación — si no,
+  // una póliza del 1 de mayo mostraría en el encabezado la fecha de hoy.
+  const fecha = fechaInicio ? new Date(`${fechaInicio}T12:00:00.000Z`) : new Date();
   const mesStr = String(periodo).padStart(2, '0');
 
   // ── Obs 4: detectar facturas PPD con tipoRelacion='07' que deberían ser PUE ──
@@ -411,6 +615,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     });
 
   const advertencias = [];
+  const _ncFusionadasProp = cfdisConNCProp.length - cfdisSinPolizaFinalFiltrado.length;
+  if (_ncFusionadasProp > 0) {
+    advertencias.push(`${_ncFusionadasProp} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
+  }
   if (sinRegla > 0) {
     advertencias.push(`${sinRegla} CFDI(s) sin regla de mapeo — las cuentas deben asignarse manualmente`);
     for (const info of _sinReglaInfo) advertencias.push(`  • ${info}`);
@@ -444,7 +652,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   return {
     tipo:       tipoPropuesta,
     fecha:      fecha.toISOString().slice(0, 10),
-    concepto:   `CFDIs ${mesStr}/${ejercicio} — ${cfdisSinPoliza.length} comprobante(s)`,
+    // Mismo fix que totalCfdis: con centroCostoId, cfdisSinPoliza.length sigue
+    // siendo el total del periodo completo (antes del filtro por sucursal).
+    concepto:   `CFDIs ${mesStr}/${ejercicio} — ${(centroCostoId ? cfdisSinPolizaFinalFiltrado.length : cfdisSinPoliza.length)} comprobante(s)`,
     ejercicio:  Number(ejercicio),
     periodo:    Number(periodo),
     rfc,
@@ -464,7 +674,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
  *
  * Devuelve: { polizaId, totalCfdis, sinRegla, advertencias }
  */
-async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi }) {
+async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -486,6 +696,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const uuidsYaUsados = new Set(yaContabilizados.map(m => m.cfdiUuid));
 
   // 2. CFDIs vigentes del periodo (sin límite)
+  // fechaInicio/fechaFin (opcionales): ver misma nota en `generarPropuesta`
+  // (usa la fecha EFECTIVA vía `_uuidsPorFechaEfectiva`, no el fecha crudo de SAT).
+  const uuidsPorFechaGuard = (fechaInicio && fechaFin)
+    ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
+    : null;
   const filtroBase = {
     $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
     ejercicio:         Number(ejercicio),
@@ -493,6 +708,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     tipoDeComprobante: tipoCfdi,
     source:            'SAT',
     satStatus:         'Vigente',
+    ...(uuidsPorFechaGuard ? { uuid: { $in: [...uuidsPorFechaGuard] } } : {}),
     isActive:          true,
   };
 
@@ -512,17 +728,24 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const rules = await _getRulesActive();
 
   // 4. Pre-fetch tipoDeComprobante de CFDIs relacionados para discriminador relacionadoTipo
+  // (r.uuid singular o r.uuids array — cfdiRelacionados usa ambas formas según el origen).
   const relTipoUuidsGuard = [...new Set(
     cfdisSinPoliza
-      .flatMap(c => (c.cfdiRelacionados || []).map(r => r.uuid).filter(Boolean)),
+      .flatMap(c => (c.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
   )];
   const relTipoCfdisGuard = relTipoUuidsGuard.length
     ? await CFDI.find({ uuid: { $in: relTipoUuidsGuard } })
-        .select('uuid tipoDeComprobante').lean()
+        .select('uuid tipoDeComprobante metodoPago formaPago').lean()
     : [];
   const relTipoMapGuard = Object.fromEntries(
     relTipoCfdisGuard.map(c => [c.uuid, c.tipoDeComprobante]),
   );
+  // uuid de factura → su metodoPago — usado por _normalizarEgresoCondonacion
+  // para resolver el metodoPago real de NCs formaPago=15 (Condonación).
+  const relMetodoPagoMapGuard = Object.fromEntries(relTipoCfdisGuard.map(c => [c.uuid, c.metodoPago]));
+  // uuid de factura → metodoPago+formaPago — usado por
+  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
+  const relFacturaMetaMapGuard = Object.fromEntries(relTipoCfdisGuard.map(c => [c.uuid, { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
 
   const cfdisSinPolizaEnriquecidosGuard = cfdisSinPoliza.map(cfdi => {
     const primerUuid = (cfdi.cfdiRelacionados || [])[0]?.uuid;
@@ -587,6 +810,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Normalización: E PUE formaPago=99 → PPD (en memoria, antes de matching)
   _normalizarEgresoPue99(cfdisSinPolizaFinalGuard);
+  // Normalización: E formaPago=15 (Condonación) → metodoPago real de la factura relacionada
+  _normalizarEgresoCondonacion(cfdisSinPolizaFinalGuard, relMetodoPagoMapGuard);
+  // Normalización: E con medio de pago real (Efectivo/Cheque/Transferencia/Tarjeta)
+  // que ajusta una factura PPD nunca cobrada → formaPago+metodoPago de esa factura.
+  _normalizarEgresoSegunFacturaRelacionada(cfdisSinPolizaFinalGuard, relFacturaMetaMapGuard);
 
   // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
   // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
@@ -600,14 +828,33 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .map(u => u.toUpperCase())
       )
   );
-  const cfdisSinPolizaFinalGuardFiltrado = _canceladosPorSustitutoGuard.size
+  const cfdisSinPolizaFinalGuardFiltradoSustituto = _canceladosPorSustitutoGuard.size
     ? cfdisSinPolizaFinalGuard.filter(c =>
         !_canceladosPorSustitutoGuard.has(c.uuid?.toUpperCase() ?? '')
       )
     : cfdisSinPolizaFinalGuard;
 
+  // Centro de costo por serie de facturación (ver comentario en generarPropuesta).
+  const ccBySerieMap = await centrosSvc.resolveBySerieMap();
+
+  const cfdisSinPolizaFinalGuardFiltrado = centroCostoId
+    ? cfdisSinPolizaFinalGuardFiltradoSustituto.filter(c =>
+        String(ccBySerieMap[c.serie]?.id ?? '') === String(centroCostoId),
+      )
+    : cfdisSinPolizaFinalGuardFiltradoSustituto;
+
+  if (centroCostoId && cfdisSinPolizaFinalGuardFiltrado.length === 0) {
+    throw new BadRequestError('No hay CFDIs sin póliza para la sucursal seleccionada en este periodo');
+  }
+
+  // Fusionar NC (tipo E) relacionadas a estas facturas en la MISMA póliza de
+  // Ingreso — ver _fetchNotasCreditoParaFusion.
+  const cfdisConNCGuard = tipoCfdi === 'I'
+    ? [...cfdisSinPolizaFinalGuardFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalGuardFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap })]
+    : cfdisSinPolizaFinalGuardFiltrado;
+
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
-  const cfdiConRegla = cfdisSinPolizaFinalGuardFiltrado.map(cfdi => ({
+  const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
@@ -620,6 +867,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         r.cuentaIvaPPD, r.cuentaIvaRetenido, r.cuentaIsrRetenido,
         r.cuentaAbono2, r.cuentaDescuento, r.cuentaDescuento0,
         r.cuentaIvaAnticipo, r.cuentaDeltaAnticipo, r.cuentaCargo2,
+        r.cuentaCargoMixto0, r.cuentaIvaAbono,
       ].filter(Boolean)),
   )];
 
@@ -659,8 +907,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   // 6. Generar movimientos en memoria
-  // Centro de costo por serie de facturación del CFDI (asignación automática)
-  const ccBySerieMap = await centrosSvc.resolveBySerieMap();
+  // (ccBySerieMap ya se resolvió arriba, antes del filtro por sucursal)
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
   // Misma lógica que en generarPropuesta: si hay una factura PUE formaPago=30
@@ -749,6 +996,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (rule?.esAplicacionSaldo && saldoRestanteGuard > 0) {
       context.saldoDisponible = saldoRestanteGuard;
     }
+    // Las NC (tipo E) deben tratarse como la VENTA ORIGINAL que ajustan, no
+    // según su propio metodoPago declarado — ver comentario equivalente en
+    // generarPropuesta.
+    if (cfdi.tipoDeComprobante === 'E') {
+      const metodoPagoRel = _uuidsRelacionados(cfdi).map(u => relMetodoPagoMapGuard[u]).find(Boolean);
+      if (metodoPagoRel) context.metodoPagoRelacionado = metodoPagoRel;
+    }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
@@ -796,9 +1050,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
-  const fecha    = new Date();
+  // Si se generó para un día específico (fechaInicio), el encabezado debe
+  // mostrar ESE día, no la fecha en la que se corrió la generación.
+  const fecha    = fechaInicio ? new Date(`${fechaInicio}T12:00:00.000Z`) : new Date();
   const mesStr   = String(periodo).padStart(2, '0');
-  const concepto = `CFDIs ${mesStr}/${ejercicio} — ${cfdisSinPoliza.length} comprobante(s)`;
+  // Mismo fix que totalCfdis: con centroCostoId, cfdisSinPoliza.length sigue
+  // siendo el total del periodo completo (antes del filtro por sucursal) —
+  // se guardaba un concepto con el conteo de TODAS las sucursales aunque la
+  // póliza solo tuviera los CFDIs correctos de esta.
+  const concepto = `CFDIs ${mesStr}/${ejercicio} — ${(centroCostoId ? cfdisSinPolizaFinalGuardFiltrado.length : cfdisSinPoliza.length)} comprobante(s)`;
 
   const poliza = await sequelize.transaction(async (t) => {
     await sequelize.query(
@@ -846,6 +1106,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   const advertenciasFinal = [];
+  const _ncFusionadasGuard = cfdisConNCGuard.length - cfdisSinPolizaFinalGuardFiltrado.length;
+  if (_ncFusionadasGuard > 0) {
+    advertenciasFinal.push(`${_ncFusionadasGuard} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
+  }
   if (sinRegla > 0) {
     advertenciasFinal.push(`${sinRegla} CFDI(s) omitidos por no tener regla de mapeo`);
     // Muestra diagnóstico de los primeros 5 ignorados
@@ -867,11 +1131,241 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   advertenciasFinal.push(...advertencias);
 
   return {
-    polizaId:     poliza.id,
-    totalCfdis:   cfdisSinPoliza.length,
+    polizaId:   poliza.id,
+    // Bug corregido: con centroCostoId, cfdisSinPoliza.length sigue siendo el
+    // total del día/periodo completo (antes del filtro por sucursal) — se
+    // reportaba el conteo de TODAS las sucursales aunque la póliza guardada
+    // sí contenía solo los CFDIs correctos de esa sucursal.
+    totalCfdis:   centroCostoId ? cfdisSinPolizaFinalGuardFiltrado.length : cfdisSinPoliza.length,
     sinRegla,
     advertencias: advertenciasFinal,
   };
 }
 
-module.exports = { generarPropuesta, generarYGuardar };
+/**
+ * Genera una póliza POR CADA sucursal (centro de costo) que tenga CFDIs sin
+ * póliza en el periodo, en vez de una sola póliza con todo mezclado.
+ * Reutiliza generarYGuardar por sucursal — no duplica lógica de mapeo.
+ *
+ * Devuelve: { resultados: [{ centroCosto, centroCostoId, polizaId?, totalCfdis?, sinRegla?, error? }] }
+ */
+async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi }) {
+  const centros = await centrosSvc.list();
+  const centrosConSerie = centros.filter(c => c.serieFacturacion);
+
+  if (!centrosConSerie.length) {
+    throw new BadRequestError('No hay centros de costo con serie de facturación configurada');
+  }
+
+  const resultados = await _conLimite(centrosConSerie, CONCURRENCIA_GENERACION, async (cc) => {
+    try {
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id });
+      return { centroCosto: cc.sucursal, centroCostoId: cc.id, ...r };
+    } catch (err) {
+      // "No hay CFDIs para esta sucursal" es esperado (no toda sucursal tiene
+      // movimientos en cada periodo) — se reporta sin detener a las demás.
+      return { centroCosto: cc.sucursal, centroCostoId: cc.id, error: err.message };
+    }
+  });
+
+  return { resultados };
+}
+
+function _fmtDia(d) {
+  const y  = d.getFullYear();
+  const m  = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
+/**
+ * Lista de días (strings 'YYYY-MM-DD') entre fechaInicio/fechaFin, o del mes
+ * calendario completo de ejercicio/periodo si no se especifica rango (mismo
+ * supuesto "periodo fiscal = mes calendario" que usa el resto del sistema).
+ * Construido con componentes y/m/d en vez de toISOString() para no depender
+ * de la zona horaria del proceso Node.
+ */
+function _diasDelRango({ ejercicio, periodo, fechaInicio, fechaFin }) {
+  const inicio = fechaInicio ? new Date(`${fechaInicio}T00:00:00`) : new Date(Number(ejercicio), Number(periodo) - 1, 1);
+  const fin    = fechaFin    ? new Date(`${fechaFin}T00:00:00`)    : new Date(Number(ejercicio), Number(periodo), 0);
+
+  const dias = [];
+  for (const d = new Date(inicio); d <= fin; d.setDate(d.getDate() + 1)) {
+    dias.push(_fmtDia(d));
+  }
+  return dias;
+}
+
+// Medianoche de `fechaYMD` en America/Mexico_City, como instante UTC real.
+// México abolió el horario de verano (DST) desde 2022 — el offset es fijo
+// UTC-6 todo el año, así que sumar 6 horas basta (no hace falta librería de
+// zonas horarias).
+function _medianocheMx(fechaYMD) {
+  return new Date(`${fechaYMD}T06:00:00.000Z`);
+}
+
+function _diaSiguiente(fechaYMD) {
+  // OJO: no reutilizar _fmtDia aquí — usa getters LOCALES, pero `d` se
+  // construye y manipula en términos UTC (mismo tipo de bug de zona horaria
+  // ya encontrado antes). Formatear con getters UTC para que sea consistente.
+  const d = new Date(`${fechaYMD}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  const y  = d.getUTCFullYear();
+  const m  = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
+/**
+ * Resuelve qué UUIDs de CFDI (tipo `tipoCfdi`, del RFC dado) tienen su fecha
+ * EFECTIVA dentro de [fechaInicio, fechaFin] — usado para separar pólizas por
+ * día. La fecha "efectiva" es la del documento ERP homólogo (mismo uuid,
+ * source='ERP') cuando existe: el ERP entrega su fecha con hora real ya
+ * resuelta a UTC (`FechaGeneracion`), mientras que la fecha del CFDI/SAT NO
+ * trae zona horaria fiable — la mayoría son solo "fecha sin hora" (medianoche
+ * UTC ingenua) y el resto es la hora de CDMX mal etiquetada como UTC. Por eso
+ * NO se puede simplemente comparar `fecha` de SAT contra límites de huso
+ * horario reales: quedaría corrida para las facturas emitidas por la tarde/
+ * noche (~16% de los casos verificados). Cuando el CFDI no tiene homólogo ERP
+ * (~34% de los casos), se usa su propio fecha de SAT con los mismos límites
+ * "ingenuos" (UTC sin ajuste) que ya usaba el sistema — ese fecha, aunque no
+ * es UTC real, ya está alineado por casualidad al día calendario de CDMX.
+ */
+async function _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin }) {
+  const naiveInicio = new Date(`${fechaInicio}T00:00:00.000Z`);
+  const naiveFin     = new Date(`${fechaFin}T23:59:59.999Z`);
+  const mxInicio     = _medianocheMx(fechaInicio);
+  const mxFin        = new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1);
+
+  const filtroComun = {
+    tipoDeComprobante: tipoCfdi,
+    $or: [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+  };
+
+  // 1. SAT cuyo fecha "ingenuo" cae en el rango — mismo universo que el
+  //    filtro viejo, acotado por periodo (rápido, es el caso de siempre).
+  const satNaive = await CFDI.find({
+    ...filtroComun, source: 'SAT', ejercicio: Number(ejercicio), periodo: Number(periodo),
+    fecha: { $gte: naiveInicio, $lte: naiveFin },
+  }).select('uuid').lean();
+  const uuidsSatNaive = satNaive.map(c => c.uuid.toUpperCase());
+
+  // 2. De esos (no de TODO el histórico ERP del rfc), cuáles tienen homólogo
+  //    ERP — para saber a cuáles no aplicarles el fallback de su fecha SAT.
+  const erpDeEsosSat = uuidsSatNaive.length
+    ? await CFDI.find({ uuid: { $in: uuidsSatNaive }, source: 'ERP' }).select('uuid').lean()
+    : [];
+  const uuidsConErp = new Set(erpDeEsosSat.map(c => c.uuid.toUpperCase()));
+
+  // 3. UUIDs cuyo homólogo ERP cae en el rango (huso horario real de México)
+  //    — acotado al rango de días, no a todo el histórico. Esto también
+  //    reclasifica hacia este día CFDIs cuyo fecha SAT ingenuo cayó en OTRO
+  //    día pero cuya fecha ERP real sí es este.
+  const erpEnRango = await CFDI.find({ ...filtroComun, source: 'ERP', fecha: { $gte: mxInicio, $lte: mxFin } })
+    .select('uuid').lean();
+  const resultado = new Set(erpEnRango.map(c => c.uuid.toUpperCase()));
+
+  // 4. SAT sin homólogo ERP → fallback a su propio fecha (ya está en rango,
+  //    viene del paso 1). Los que SÍ tienen homólogo se descartan aquí: su
+  //    inclusión/exclusión ya la decidió el paso 3 según su fecha ERP real.
+  for (const uuid of uuidsSatNaive) {
+    if (!uuidsConErp.has(uuid)) resultado.add(uuid);
+  }
+
+  return resultado;
+}
+
+// Corre `fn` sobre `items` con como máximo `limite` llamadas en vuelo a la
+// vez, preservando el orden de `items` en el arreglo devuelto. Usado para que
+// generar N pólizas (por día/sucursal) no espere una por una en serie —
+// generarYGuardar ya serializa la parte crítica (asignar `numero`) con
+// advisory lock por rfc/ejercicio/periodo, así que correr el resto en
+// paralelo (fetch/enriquecimiento de CFDIs) es seguro.
+async function _conLimite(items, limite, fn) {
+  const resultado = new Array(items.length);
+  let siguiente = 0;
+  async function trabajador() {
+    while (siguiente < items.length) {
+      const idx = siguiente++;
+      resultado[idx] = await fn(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limite, items.length) }, trabajador));
+  return resultado;
+}
+
+const CONCURRENCIA_GENERACION = 4;
+
+/**
+ * Genera una póliza POR CADA DÍA del rango indicado (o del mes calendario
+ * completo de ejercicio/periodo si no se especifica fechaInicio/fechaFin)
+ * que tenga CFDIs sin póliza. Mismo patrón que `generarYGuardarPorSucursal`:
+ * reutiliza generarYGuardar por día, no duplica lógica de mapeo.
+ *
+ * Devuelve: { resultados: [{ fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
+ */
+async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+  if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
+  if (!periodo)   throw new BadRequestError('Periodo requerido');
+
+  const dias = _diasDelRango({ ejercicio, periodo, fechaInicio, fechaFin });
+  if (!dias.length) throw new BadRequestError('Rango de fechas inválido');
+
+  const resultados = await _conLimite(dias, CONCURRENCIA_GENERACION, async (dia) => {
+    try {
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia });
+      return { fecha: dia, ...r };
+    } catch (err) {
+      // "No hay CFDIs para este día" es esperado (no todos los días tienen
+      // movimientos) — se reporta sin detener a los demás.
+      return { fecha: dia, error: err.message };
+    }
+  });
+
+  return { resultados };
+}
+
+/**
+ * Genera una póliza POR CADA COMBINACIÓN sucursal × día — el cruce de
+ * `generarYGuardarPorSucursal` y `generarYGuardarPorDia`. Útil para el
+ * export a CONTPAQ en ZIP con una carpeta por sucursal y un archivo por día
+ * dentro de cada una.
+ *
+ * Devuelve: { resultados: [{ centroCosto, centroCostoId, fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
+ */
+async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin }) {
+  if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
+  if (!periodo)   throw new BadRequestError('Periodo requerido');
+
+  const centros = await centrosSvc.list();
+  const centrosConSerie = centros.filter(c => c.serieFacturacion);
+  if (!centrosConSerie.length) {
+    throw new BadRequestError('No hay centros de costo con serie de facturación configurada');
+  }
+
+  const dias = _diasDelRango({ ejercicio, periodo, fechaInicio, fechaFin });
+  if (!dias.length) throw new BadRequestError('Rango de fechas inválido');
+
+  // Aplanar sucursal × día en una sola lista de combinaciones para que el
+  // límite de concurrencia aplique sobre el total, no por sucursal.
+  const combinaciones = centrosConSerie.flatMap(cc => dias.map(dia => ({ cc, dia })));
+
+  const resultados = await _conLimite(combinaciones, CONCURRENCIA_GENERACION, async ({ cc, dia }) => {
+    try {
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia });
+      return { centroCosto: cc.sucursal, centroCostoId: cc.id, fecha: dia, ...r };
+    } catch (err) {
+      // "No hay CFDIs para esta sucursal/día" es esperado — se reporta sin
+      // detener las demás combinaciones.
+      return { centroCosto: cc.sucursal, centroCostoId: cc.id, fecha: dia, error: err.message };
+    }
+  });
+
+  return { resultados };
+}
+
+module.exports = {
+  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
+  generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
+  _uuidsPorFechaEfectiva,
+};

@@ -75,7 +75,11 @@ const config = Object.freeze({
 
   /** Integración con el ERP externo */
   erp: Object.freeze({
-    cajaUrl: process.env.ERP_CAJA_BASE_URL?.trim(),
+    cajaUrl: process.env.ERP_CAJA_BASE_URL?.trim(),   // cajas / bancos
+    baseUrl:  process.env.ERP_FACT_BASE_URL?.trim(),  // facturación — import CFDIs
+    // Normaliza el token: garantiza el prefijo "Bearer " independientemente
+    //cambio 2
+    // de si el .env lo incluye o no.
     token: (() => {
       const t = process.env.ERP_TOKEN?.trim() ?? '';
       return t.startsWith('Bearer ') ? t : `Bearer ${t}`;
@@ -114,6 +118,23 @@ const config = Object.freeze({
     driveRootFolderId:         process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID          || null,
     driveErpFolderId:          process.env.GOOGLE_DRIVE_ERP_FOLDER_ID           || null,
     driveComprobantesFolderId: process.env.GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID  || null,
+  }),
+
+  /** Correo saliente (SMTP) — usado para alertas (ej. vencimiento credenciales SAT) */
+  smtp: Object.freeze({
+    host:   process.env.SMTP_HOST?.trim()   || null,
+    port:   parseInt(process.env.SMTP_PORT, 10) || 587,
+    secure: process.env.SMTP_SECURE === 'true',
+    user:   process.env.SMTP_USER?.trim()   || null,
+    pass:   process.env.SMTP_PASS,
+    from:   process.env.SMTP_FROM?.trim()   || 'Numo <no-reply@numo.local>',
+  }),
+
+  /** Alertas de vencimiento de credenciales SAT */
+  alertasSat: Object.freeze({
+    // Además de los avisos fijos de 2 días y 1 día antes, cuántas horas antes
+    // del vencimiento se manda el aviso final ("última llamada").
+    horasAntes: parseInt(process.env.SAT_CREDENCIALES_ALERTA_HORAS_ANTES, 10) || 4,
   }),
 
 });

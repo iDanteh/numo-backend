@@ -7,6 +7,7 @@ const svc                      = require('./cfdi-mapping.service');
 const generator                = require('./cfdi-poliza-generator.service');
 const balanza                  = require('./balanza-preliminar.service');
 const balanceGeneral           = require('./balance-general.service');
+const polizaExportZip          = require('../polizas/poliza-export-zip.service');
 
 const router = express.Router();
 
@@ -65,7 +66,9 @@ router.post('/rules/migrar-ppd-descuento',
 // ── Generador de propuesta ────────────────────────────────────────────────────
 
 // POST /api/cfdi-mapping/generar-propuesta
-// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi }
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, fechaInicio?, fechaFin? }
+// fechaInicio/fechaFin: si se mandan (ambos), acotan el periodo a ese rango de
+// días en vez de procesar el mes completo.
 router.post('/generar-propuesta',
   authenticate,
   permit('polizas:write'),
@@ -74,12 +77,55 @@ router.post('/generar-propuesta',
 
 // POST /api/cfdi-mapping/generar-y-guardar
 // Guarda la póliza directo como borrador (sin límite de CFDIs).
-// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi }
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, centroCostoId?, fechaInicio?, fechaFin? }
+// centroCostoId: si se manda, solo procesa CFDIs de esa sucursal. Si se omite,
+// procesa todas las sucursales mezcladas en una sola póliza (comportamiento previo).
+// fechaInicio/fechaFin: mismo filtro opcional que en generar-propuesta.
 // Response: { polizaId, totalCfdis, sinRegla, advertencias }
 router.post('/generar-y-guardar',
   authenticate,
   permit('polizas:write'),
   asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardar(req.body))),
+);
+
+// POST /api/cfdi-mapping/generar-y-guardar-por-sucursal
+// Genera una póliza SEPARADA por cada sucursal (centro de costo) que tenga
+// CFDIs sin póliza en el periodo, en vez de una sola póliza con todo mezclado.
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi }
+// Response: { resultados: [{ centroCosto, centroCostoId, polizaId?, totalCfdis?, sinRegla?, error? }] }
+router.post('/generar-y-guardar-por-sucursal',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardarPorSucursal(req.body))),
+);
+
+// POST /api/cfdi-mapping/generar-y-guardar-por-dia
+// Genera una póliza SEPARADA por cada día del rango (o del mes completo si no
+// se manda fechaInicio/fechaFin) que tenga CFDIs sin póliza.
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, centroCostoId?, fechaInicio?, fechaFin? }
+// Response: { resultados: [{ fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
+router.post('/generar-y-guardar-por-dia',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardarPorDia(req.body))),
+);
+
+// POST /api/cfdi-mapping/exportar-contpaq-zip
+// Genera (si hace falta) las pólizas del modo pedido y regresa un ZIP con el
+// .xlsx de CONTPAQ de cada una — carpeta por sucursal cuando el modo incluye
+// sucursal, un archivo por día cuando incluye día, más un _resumen.txt con
+// éxitos/errores de cada combinación (no cabe un JSON aparte junto al binario).
+// Body: { rfc, ejercicio, periodo, tipoCfdi, tipoPropuesta?, modo: 'porSucursal'|'porDia'|'porDiaYSucursal', fechaInicio?, fechaFin? }
+router.post('/exportar-contpaq-zip',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { buffer, nombreZip } = await polizaExportZip.exportarContpaqZip(req.body);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreZip}"`);
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
+  }),
 );
 
 // GET /api/cfdi-mapping/balanza-preliminar

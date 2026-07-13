@@ -3,12 +3,256 @@ const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
+const { SERIES_CON_AUTH } = require('../../banks/domains/erp/erp-auth.utils');
 
 // Cache in-memory para el dashboard — evita lanzar 15 queries MongoDB
 // en cada carga de pantalla cuando múltiples usuarios consultan al mismo tiempo.
 // TTL de 30 s: suficiente para agrupar clicks rápidos, sin ocultar cambios recientes.
 const DASHBOARD_CACHE_TTL_MS = 30_000;
 const dashboardCache = new Map(); // key → { data, expiresAt }
+
+// El ERP sí manda `fecha` por movimiento del kardex — antes se perdía porque
+// `movimientoSchema` (ErpCuentaPendiente.model.js) no la declaraba y Mongoose
+// la recortaba silenciosamente al guardar. Ya está corregida ahí; de aquí en
+// adelante los kardex sincronizados de nuevo van a traer `fecha` real.
+//
+// Para el kardex ya guardado ANTES de ese fix (sin `fecha`), se usa como
+// respaldo la cadena de saldos (saldoAnterior de uno == saldoActual del
+// anterior). Si esa cadena tampoco es inequívoca (empatada o rota), el
+// último recurso es el folio: el ERP lo arma con prefijo AAMMDD (ej.
+// 260512029 = 2026-05-12), por lo que es comparable numéricamente aun
+// entre series distintas (RET/CPF/A0/BON/...) y sirve de proxy cronológico
+// — mejor que dejar el orden nativo de Mongo, que puede venir invertido.
+const centavos = (n) => Math.round((n ?? 0) * 100);
+
+function ordenarPorFolio(movimientos) {
+  const folios = movimientos.map(m => Number(m.folio));
+  if (folios.some(f => !Number.isFinite(f))) return movimientos; // folio no numérico — no arriesgar
+  return movimientos
+    .map((m, i) => [m, folios[i]])
+    .sort((a, b) => a[1] - b[1])
+    .map(([m]) => m);
+}
+
+function ordenarPorCadenaDeSaldos(movimientos) {
+  if (movimientos.length <= 1) return movimientos;
+
+  const saldosActuales = movimientos.map(m => centavos(m.saldoActual));
+  const raices = movimientos.filter(m => !saldosActuales.includes(centavos(m.saldoAnterior)));
+  if (raices.length !== 1) return ordenarPorFolio(movimientos);
+
+  const usados   = new Set([raices[0]]);
+  const ordenado = [raices[0]];
+  let actual = raices[0];
+
+  while (ordenado.length < movimientos.length) {
+    const buscado    = centavos(actual.saldoActual);
+    const candidatos = movimientos.filter(m => !usados.has(m) && centavos(m.saldoAnterior) === buscado);
+    if (candidatos.length !== 1) return ordenarPorFolio(movimientos); // ambiguo o roto — usar folio
+    actual = candidatos[0];
+    usados.add(actual);
+    ordenado.push(actual);
+  }
+  return ordenado;
+}
+
+/**
+ * Ordena el kardex de una CxC cronológicamente. Usa `fecha` cuando TODOS los
+ * movimientos la tienen (dato real del ERP, 100% confiable); si falta en
+ * alguno (kardex sincronizado antes del fix), cae a la cadena de saldos.
+ */
+function ordenarKardex(movimientos) {
+  if (movimientos.length <= 1) return movimientos;
+  if (movimientos.every(m => m.fecha)) {
+    return [...movimientos].sort((a, b) => new Date(a.fecha) - new Date(b.fecha));
+  }
+  return ordenarPorCadenaDeSaldos(movimientos);
+}
+
+// Trae las CxC del ERP por erpId y marca cada movimiento de su kardex como
+// pago bancario real (series con autorización: CBT/ABO/CPF/CFC) o ajuste sin
+// depósito (bonificación, descuento, devolución, retención, etc.) — para que
+// la UI pueda explicar por qué el saldo bajó sin que exista un depósito.
+async function buscarCuentasPorCobrarConMovimientos(erpIds) {
+  if (!erpIds.length) return [];
+  const docs = await CFDI.db.collection('erp_cuentas_pendientes').find(
+    { erpId: { $in: erpIds } },
+    { projection: {
+      erpId: 1, serie: 1, folio: 1, serieExterna: 1, folioExterno: 1,
+      total: 1, saldoActual: 1, concepto: 1, tipoPago: 1, tipoMovimiento: 1,
+      fechaCreacion: 1, fechaAfectacion: 1, fechaRealPago: 1, movimientos: 1,
+    } },
+  ).toArray();
+
+  return docs.map(doc => ({
+    ...doc,
+    movimientos: ordenarKardex(doc.movimientos ?? []).map(m => ({
+      ...m,
+      esPagoBancario: SERIES_CON_AUTH.includes(m.serie),
+    })),
+  }));
+}
+
+// Series que en documentosRelacionados marcan el TIPO de Nota de Crédito
+// (Bonificación/Devolución/Cargo a Cliente), no una referencia a documento.
+const TIPO_MARCADORES = ['BON', 'BCT', 'DEV', 'CAC'];
+
+// Clasifica una Nota de Crédito (Egreso) relacionada usando la misma convención
+// de Serie en documentosRelacionados que usa el motor de balanza (BCT/BON/DEV/CAC).
+function clasificarEgreso(doc) {
+  const marcador = (doc.documentosRelacionados ?? []).find(d => TIPO_MARCADORES.includes((d.Serie ?? '').toUpperCase()));
+  const serieRel = (marcador?.Serie ?? '').toUpperCase();
+  if (serieRel === 'BCT') return 'Bonificación Club Tuberos';
+  if (serieRel === 'BON') return 'Bonificación';
+  if (serieRel === 'DEV') return 'Devolución';
+  if (serieRel === 'CAC') return 'Cargo a Cliente';
+  return 'Nota de Crédito';
+}
+
+// documentosRelacionados suele traer DOS entradas: una marca el TIPO (BON/BCT/
+// DEV/CAC) y la otra es la referencia real a la CxC específica que afectó, vía
+// su serieExterna/folioExterno — verificado contra datos reales: en los casos
+// probados coincide exacto con el erpId correcto, incluso cuando la factura
+// tiene decenas de registros de CxC (Facturas Globales). No siempre está
+// presente (ej. algunas Bonificación Club Tuberos no la traen).
+function extraerReferenciaCxc(doc) {
+  const ref = (doc.documentosRelacionados ?? []).find(d =>
+    !TIPO_MARCADORES.includes((d.Serie ?? '').toUpperCase()) && d.Folio,
+  );
+  return ref ? { serie: ref.Serie ?? null, folio: ref.Folio ?? null } : null;
+}
+
+// Notas de Crédito (CFDI tipo E) relacionadas a una factura por UUID (relación
+// fiscal estándar cfdiRelacionados, tipoRelacion='01'). Es la fuente confiable
+// para saber si a una factura se le aplicó una bonificación/descuento/devolución
+// documentada — a diferencia del kardex interno de la CxC, que no siempre tiene
+// una Nota de Crédito 1 a 1. Solo lectura sobre `cfdis`, no toca el módulo de bancos.
+async function buscarEgresosRelacionados(facturaUuid) {
+  if (!facturaUuid) return [];
+  const docs = await CFDI.find(
+    { tipoDeComprobante: 'E', isActive: true, 'cfdiRelacionados.uuids': facturaUuid },
+    'uuid satStatus source serie folio fecha total documentosRelacionados',
+  ).lean();
+
+  // Puede haber copia SAT y ERP del mismo UUID; se prefiere la de ERP porque
+  // trae documentosRelacionados (necesario para clasificar y para cxcRef).
+  const porUuid = new Map();
+  for (const doc of docs) {
+    const actual = porUuid.get(doc.uuid);
+    if (!actual || (doc.source === 'ERP' && actual.source !== 'ERP')) porUuid.set(doc.uuid, doc);
+  }
+
+  return [...porUuid.values()].map(doc => ({
+    uuid:       doc.uuid,
+    satStatus:  doc.satStatus ?? null,
+    serie:      doc.serie ?? null,
+    folio:      doc.folio ?? null,
+    fecha:      doc.fecha ?? null,
+    total:      doc.total ?? null,
+    tipo:       clasificarEgreso(doc),
+    cxcRef:     extraerReferenciaCxc(doc),
+  }));
+}
+
+// Tolerancia de redondeo al comparar el total de una Nota de Crédito contra
+// un monto del kardex de la CxC (se han visto diferencias de 1 centavo).
+const TOLERANCIA_NC_MXN = 1.00;
+
+// RFC genérico del SAT para "Público en General" — casi siempre acompaña a una
+// Factura Global, pero el indicador OFICIAL es el nodo InformacionGlobal del
+// propio CFDI (obligatorio en CFDI 4.0 cuando aplica). Se checan los dos: el
+// RFC cubre CFDIs 3.3 o con datos incompletos donde InformacionGlobal no llegó
+// a guardarse; informacionGlobal cubre el caso (raro) de un RFC distinto.
+const RFC_PUBLICO_GENERAL = 'XAXX010101000';
+
+function esFacturaGlobal(factura) {
+  return factura?.receptor?.rfc === RFC_PUBLICO_GENERAL || !!factura?.informacionGlobal?.mes;
+}
+
+// Cruza el kardex de cada CxC con las Notas de Crédito (Egresos) relacionadas
+// a la factura, SOLO si están Vigentes ante el SAT. Dos niveles de confianza:
+//
+//  'exacta'   — la NC trae en documentosRelacionados una referencia real a la
+//               serieExterna/folioExterno de ESTA CxC específica (cxcRef). No es
+//               una suposición: es una llave que coincidió en todos los casos
+//               probados contra datos reales, incluso en Facturas Globales con
+//               decenas de registros de CxC. Se usa siempre que esté disponible.
+//  'inferida' — la NC no trae esa referencia (ej. algunas Bonificación Club
+//               Tuberos), así que solo se puede intentar por coincidencia de
+//               monto (±$1). Esto SÍ es una suposición, y por eso se desactiva
+//               en Facturas Globales: ahí el mismo monto podría pertenecerle a
+//               cualquiera de los otros clientes que comparten folioFiscal.
+//
+// En ambos casos, si el kardex ya tiene un movimiento "sin depósito" del monto
+// correspondiente se anota sobre él; si no existe (el ERP aún no lo registró),
+// se agrega un movimiento "virtual" marcado como tal. Nunca se modifica el
+// saldoActual real del ERP — solo se anota/explica.
+function enriquecerConNotasDeCredito(cuentasPorCobrar, egresosRelacionados, factura) {
+  const vigentes = (egresosRelacionados ?? []).filter(e => e.satStatus === 'Vigente');
+  if (!vigentes.length) return cuentasPorCobrar;
+
+  const conReferencia = vigentes.filter(nc => nc.cxcRef);
+  const sinReferencia = esFacturaGlobal(factura) ? [] : vigentes.filter(nc => !nc.cxcRef);
+
+  return cuentasPorCobrar.map(cxc => {
+    const usadas = new Set();
+    const exactasDeEstaCxc = conReferencia.filter(nc =>
+      nc.cxcRef.serie === cxc.serieExterna && nc.cxcRef.folio === cxc.folioExterno,
+    );
+
+    const anotar = (nc, confianza) => {
+      usadas.add(nc.uuid);
+      return { uuid: nc.uuid, serie: nc.serie, folio: nc.folio, tipo: nc.tipo, confianza };
+    };
+
+    let movimientos = (cxc.movimientos ?? []).map(m => {
+      if (m.esPagoBancario) return m;
+      const montoCoincide = (nc) => !usadas.has(nc.uuid) &&
+        Math.abs(Math.abs(m.total ?? 0) - Math.abs(nc.total ?? 0)) <= TOLERANCIA_NC_MXN;
+
+      const exacta = exactasDeEstaCxc.find(montoCoincide);
+      if (exacta) return { ...m, notaCredito: anotar(exacta, 'exacta') };
+
+      const inferida = sinReferencia.find(montoCoincide);
+      if (inferida) return { ...m, notaCredito: anotar(inferida, 'inferida') };
+
+      return m;
+    });
+
+    // NC con referencia exacta a esta CxC que no calzó con ningún movimiento
+    // existente del kardex — se agrega como movimiento virtual igual, porque
+    // SÍ sabemos con certeza que pertenece aquí (solo falta que el ERP la registre).
+    for (const nc of exactasDeEstaCxc) {
+      if (usadas.has(nc.uuid)) continue;
+      movimientos = [...movimientos, {
+        serie: nc.serie, folio: nc.folio, serieOrigen: null, folioOrigen: null,
+        saldoAnterior: null, saldoActual: null, subtotal: null, impuesto: null,
+        total: -Math.abs(nc.total ?? 0),
+        esPagoBancario: false, esVirtual: true,
+        notaCredito: anotar(nc, 'exacta'),
+      }];
+    }
+
+    // Fallback por monto (solo no-Global): si queda saldo pendiente sin explicar
+    // y una NC sin referencia coincide con ese monto exacto.
+    const saldoPendiente = cxc.saldoActual ?? 0;
+    const ncRestanteInferida = saldoPendiente > 0
+      ? sinReferencia.find(nc => !usadas.has(nc.uuid) && Math.abs(saldoPendiente - Math.abs(nc.total ?? 0)) <= TOLERANCIA_NC_MXN)
+      : null;
+    if (ncRestanteInferida) {
+      movimientos = [...movimientos, {
+        serie: ncRestanteInferida.serie, folio: ncRestanteInferida.folio,
+        serieOrigen: null, folioOrigen: null,
+        saldoAnterior: saldoPendiente, saldoActual: 0, subtotal: null, impuesto: null,
+        total: -Math.abs(ncRestanteInferida.total ?? 0),
+        esPagoBancario: false, esVirtual: true,
+        notaCredito: anotar(ncRestanteInferida, 'inferida'),
+      }];
+    }
+
+    return { ...cxc, movimientos };
+  });
+}
 
 const getCacheKey = (query) => JSON.stringify(query);
 
@@ -1754,6 +1998,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
   const {
     uuid, serie, folio, banco,
     numAutorizacion, idNumo,
+    serieCxc, folioCxc,
     fechaInicio, fechaFin,
     ejercicio, periodo,
     estado = 'todos',
@@ -1796,6 +2041,24 @@ const pagosBanco = asyncHandler(async (req, res) => {
   if (estado === 'con_pago') estadoMatch['movimientos.0'] = { $exists: true };
   if (estado === 'sin_pago') estadoMatch.movimientos = { $size: 0 };
 
+  // La CxC tiene dos numeraciones (interna serie/folio y serieExterna/folioExterno)
+  // y erpLinks solo guarda serie + folioExterno, así que resolvemos el erpId
+  // primero aceptando cualquiera de las dos numeraciones.
+  const erpIdsCxc = (serieCxc || folioCxc)
+    ? (await CFDI.db.collection('erp_cuentas_pendientes').find({
+        $or: [
+          {
+            ...(serieCxc ? { serie: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folio: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+          {
+            ...(serieCxc ? { serieExterna: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folioExterno: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+        ],
+      }, { projection: { erpId: 1 } }).toArray()).map(c => c.erpId)
+    : null;
+
   const pipeline = [
     { $match: baseMatch },
     { $unwind: '$complementoPago.pagos' },
@@ -1828,6 +2091,17 @@ const pagosBanco = asyncHandler(async (req, res) => {
                       { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.referenciaNumerica' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
                     ]}] : []),
                     ...(idNumo ? [{ $regexMatch: { input: { $ifNull: [{ $toString: '$$m.folio' }, ''] }, regex: idNumo.trim(), options: 'i' } }] : []),
+                    ...(erpIdsCxc ? [{
+                      $gt: [{
+                        $size: {
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: { $in: ['$$l.erpId', erpIdsCxc] },
+                          },
+                        },
+                      }, 0],
+                    }] : []),
                   ],
                 },
               },
@@ -1862,13 +2136,60 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   in: '$$link.saldoActual',
                 },
               },
+              // Usuario que identificó/vinculó ESTA CxC específica al movimiento
+              // (identificadoPor.erpId se cruza contra el erpId del erpLink que
+              // corresponde a este idDocumento — un mismo movimiento puede tener
+              // varias CxC vinculadas por distintos usuarios).
+              identificadoPorNombre: {
+                $let: {
+                  vars: {
+                    erpIdLink: {
+                      $let: {
+                        vars: {
+                          link: {
+                            $arrayElemAt: [{
+                              $filter: {
+                                input: { $ifNull: ['$$m.erpLinks', []] },
+                                as: 'l',
+                                cond: {
+                                  $eq: [
+                                    { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                    { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                                  ],
+                                },
+                              },
+                            }, 0],
+                          },
+                        },
+                        in: '$$link.erpId',
+                      },
+                    },
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        idEntry: {
+                          $arrayElemAt: [{
+                            $filter: {
+                              input: { $ifNull: ['$$m.identificadoPor', []] },
+                              as: 'ip',
+                              cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                            },
+                          }, 0],
+                        },
+                      },
+                      in: '$$idEntry.nombre',
+                    },
+                  },
+                },
+              },
             },
           },
         },
       },
     },
-    // Si filtramos por banco/autorización/idNumo, solo conservar documentos con al menos un movimiento válido
-    ...((banco || numAutorizacion || idNumo) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
+    // Si filtramos por banco/autorización/idNumo/CxC, solo conservar documentos con al menos un movimiento válido
+    ...((banco || numAutorizacion || idNumo || serieCxc || folioCxc) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
     {
       $facet: {
         data: [
@@ -1904,7 +2225,8 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] },
                 ]}, 2],
               },
-              saldoMovimiento: { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+              saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+              identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
             },
           },
         ],
@@ -1942,7 +2264,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
  * Descarga Excel con los mismos filtros que pagosBanco (sin paginación).
  */
 const pagosBancoExport = asyncHandler(async (req, res) => {
-  const { uuid, serie, folio, banco, numAutorizacion, idNumo, fechaInicio, fechaFin, ejercicio, periodo, estado = 'todos' } = req.query;
+  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, ejercicio, periodo, estado = 'todos' } = req.query;
 
   const baseMatch = {
     tipoDeComprobante: 'P',
@@ -1976,6 +2298,21 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
   if (estado === 'con_pago') estadoMatch['movimientos.0'] = { $exists: true };
   if (estado === 'sin_pago') estadoMatch.movimientos = { $size: 0 };
 
+  const erpIdsCxc = (serieCxc || folioCxc)
+    ? (await CFDI.db.collection('erp_cuentas_pendientes').find({
+        $or: [
+          {
+            ...(serieCxc ? { serie: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folio: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+          {
+            ...(serieCxc ? { serieExterna: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folioExterno: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+        ],
+      }, { projection: { erpId: 1 } }).toArray()).map(c => c.erpId)
+    : null;
+
   const pipeline = [
     { $match: baseMatch },
     { $unwind: '$complementoPago.pagos' },
@@ -1999,6 +2336,17 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                       { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.referenciaNumerica' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
                     ]}] : []),
                     ...(idNumo ? [{ $regexMatch: { input: { $ifNull: [{ $toString: '$$m.folio' }, ''] }, regex: idNumo.trim(), options: 'i' } }] : []),
+                    ...(erpIdsCxc ? [{
+                      $gt: [{
+                        $size: {
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: { $in: ['$$l.erpId', erpIdsCxc] },
+                          },
+                        },
+                      }, 0],
+                    }] : []),
                   ],
                 },
               },
@@ -2031,12 +2379,55 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                   in: '$$link.saldoActual',
                 },
               },
+              identificadoPorNombre: {
+                $let: {
+                  vars: {
+                    erpIdLink: {
+                      $let: {
+                        vars: {
+                          link: {
+                            $arrayElemAt: [{
+                              $filter: {
+                                input: { $ifNull: ['$$m.erpLinks', []] },
+                                as: 'l',
+                                cond: {
+                                  $eq: [
+                                    { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                    { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                                  ],
+                                },
+                              },
+                            }, 0],
+                          },
+                        },
+                        in: '$$link.erpId',
+                      },
+                    },
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        idEntry: {
+                          $arrayElemAt: [{
+                            $filter: {
+                              input: { $ifNull: ['$$m.identificadoPor', []] },
+                              as: 'ip',
+                              cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                            },
+                          }, 0],
+                        },
+                      },
+                      in: '$$idEntry.nombre',
+                    },
+                  },
+                },
+              },
             },
           },
         },
       },
     },
-    ...((banco || numAutorizacion || idNumo) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
+    ...((banco || numAutorizacion || idNumo || serieCxc || folioCxc) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
     ...(Object.keys(estadoMatch).length ? [{ $match: estadoMatch }] : []),
     { $sort: { 'complementoPago.pagos.fechaPago': -1 } },
     { $limit: 50000 },
@@ -2060,6 +2451,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
       diferencia:       { $round: [{ $subtract: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] }, 2] },
       saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+      identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
     }},
   ];
 
@@ -2087,6 +2479,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { header: 'Núm. Autorización',  key: 'numOperacion',      width: 22 },
     { header: 'Diferencia',         key: 'diferencia',        width: 16 },
     { header: 'Saldo Movimiento',   key: 'saldoMovimiento',   width: 18 },
+    { header: 'Identificado por',   key: 'identificadoPor',   width: 20 },
   ];
 
   // Estilo encabezado
@@ -2194,7 +2587,7 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
   const uuid = facturaUuid.trim().toUpperCase();
 
   const [factura, movimientos, parcialidades] = await Promise.all([
-    CFDI.findOne({ uuid }).select('uuid satStatus serie folio total fecha emisor receptor').lean(),
+    CFDI.findOne({ uuid }).select('uuid satStatus serie folio total fecha emisor receptor informacionGlobal').lean(),
     CFDI.db.collection('bank_movements').find(
       { isActive: true, 'erpLinks.folioFiscal': uuid },
       { projection: { banco: 1, fecha: 1, deposito: 1, retiro: 1, folio: 1, concepto: 1, status: 1, numeroAutorizacion: 1, referenciaNumerica: 1, erpLinks: 1 } },
@@ -2231,7 +2624,20 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
     ]),
   ]);
 
-  res.json({ factura: factura || null, movimientos, parcialidades });
+  // Cuentas por cobrar (CxC del ERP) afectadas por estos movimientos.
+  const erpIds = [...new Set(
+    movimientos.flatMap(m => (m.erpLinks ?? [])
+      .filter(l => l.folioFiscal?.toUpperCase() === uuid)
+      .map(l => l.erpId)),
+  )];
+
+  const [cuentasPorCobrarRaw, egresosRelacionados] = await Promise.all([
+    buscarCuentasPorCobrarConMovimientos(erpIds),
+    buscarEgresosRelacionados(uuid),
+  ]);
+  const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura);
+
+  res.json({ factura: factura || null, movimientos, parcialidades, cuentasPorCobrar, egresosRelacionados, facturaEsGlobal: esFacturaGlobal(factura) });
 });
 
 /**
@@ -2285,4 +2691,445 @@ const pagosBancoContextoBanco = asyncHandler(async (req, res) => {
   res.json({ movimientos, hayMasAnteriores });
 });
 
-module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco };
+/**
+ * GET /api/reports/depositos-ingresos
+ * Relaciona facturas de Ingreso con su depósito bancario real, vía
+ * bank_movements.erpLinks.folioFiscal (el ERP liga el depósito directo al UUID
+ * de la factura de Ingreso, sin pasar por un complemento de pago — a diferencia
+ * de pagosBanco, que sí necesita el $unwind de doctosRelacionados).
+ * Pestañas Contado/Crédito = filtro `tipoVenta`, mismo criterio que el export
+ * a CONTPAQ: metodoPago!=='PPD' → Contado, ==='PPD' → Crédito.
+ */
+const depositosIngresos = asyncHandler(async (req, res) => {
+  const {
+    uuid, serie, folio, banco,
+    numAutorizacion, idNumo,
+    serieCxc, folioCxc,
+    fechaInicio, fechaFin,
+    ejercicio, periodo,
+    tipoVenta      = 'todos',
+    tieneDeposito  = 'todos', // 'todos' | 'con_deposito' | 'sin_deposito'
+    page  = 1,
+    limit = 20,
+  } = req.query;
+
+  const pg = parseInt(page);
+  const lm = Math.min(parseInt(limit), 100);
+
+  const baseMatch = { tipoDeComprobante: 'I', source: 'ERP', satStatus: 'Vigente', isActive: true };
+  if (ejercicio) baseMatch.ejercicio = parseInt(ejercicio);
+  if (periodo)   baseMatch.periodo   = parseInt(periodo);
+  if (uuid)  baseMatch.uuid  = { $regex: uuid.trim().toUpperCase(), $options: 'i' };
+  if (serie) baseMatch.serie = { $regex: serie.trim(), $options: 'i' };
+  if (folio) baseMatch.folio = { $regex: folio.trim(), $options: 'i' };
+  if (fechaInicio || fechaFin) {
+    baseMatch.fecha = {};
+    if (fechaInicio) baseMatch.fecha.$gte = new Date(fechaInicio);
+    if (fechaFin) {
+      const fin = new Date(fechaFin);
+      fin.setUTCDate(fin.getUTCDate() + 1);
+      baseMatch.fecha.$lt = fin;
+    }
+  }
+
+  const tipoVentaMatch = {};
+  if (tipoVenta === 'contado') tipoVentaMatch.tipoVenta = 'Contado';
+  if (tipoVenta === 'credito') tipoVentaMatch.tipoVenta = 'Credito';
+
+  const depositoMatch = {};
+  if (tieneDeposito === 'con_deposito') depositoMatch['movimientos.0'] = { $exists: true };
+  if (tieneDeposito === 'sin_deposito') depositoMatch.movimientos = { $size: 0 };
+
+  // La CxC tiene DOS numeraciones distintas (serie/folio interno del ERP y
+  // serieExterna/folioExterno) y erpLinks solo guarda serie + folioExterno.
+  // Para no depender de cuál usó el usuario, resolvemos primero los erpId
+  // que coinciden por CUALQUIERA de las dos numeraciones.
+  const erpIdsCxc = (serieCxc || folioCxc)
+    ? (await CFDI.db.collection('erp_cuentas_pendientes').find({
+        $or: [
+          {
+            ...(serieCxc ? { serie: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folio: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+          {
+            ...(serieCxc ? { serieExterna: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folioExterno: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+        ],
+      }, { projection: { erpId: 1 } }).toArray()).map(c => c.erpId)
+    : null;
+
+  const movimientosFilterCond = {
+    $and: [
+      { $eq: ['$$m.isActive', true] },
+      ...(banco ? [{ $regexMatch: { input: { $ifNull: ['$$m.banco', ''] }, regex: banco.trim(), options: 'i' } }] : []),
+      ...(numAutorizacion ? [{ $or: [
+        { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.numeroAutorizacion' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+        { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.referenciaNumerica' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+      ] }] : []),
+      ...(idNumo ? [{ $regexMatch: { input: { $ifNull: [{ $toString: '$$m.folio' }, ''] }, regex: idNumo.trim(), options: 'i' } }] : []),
+      ...(erpIdsCxc ? [{
+        $gt: [{
+          $size: {
+            $filter: {
+              input: { $ifNull: ['$$m.erpLinks', []] },
+              as: 'l',
+              cond: { $in: ['$$l.erpId', erpIdsCxc] },
+            },
+          },
+        }, 0],
+      }] : []),
+    ],
+  };
+
+  const pipeline = [
+    { $match: baseMatch },
+    { $lookup: { from: 'bank_movements', localField: 'uuid', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
+    {
+      $addFields: {
+        tipoVenta: { $cond: [{ $eq: ['$metodoPago', 'PPD'] }, 'Credito', 'Contado'] },
+        movimientos: {
+          $map: {
+            input: { $filter: { input: '$movimientos', as: 'm', cond: movimientosFilterCond } },
+            as: 'm',
+            in: {
+              banco:        '$$m.banco',
+              fecha:        '$$m.fecha',
+              deposito:     '$$m.deposito',
+              folio:        '$$m.folio',
+              concepto:     '$$m.concepto',
+              numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+              saldoMovimiento: {
+                $let: {
+                  vars: {
+                    link: {
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$$m.erpLinks', []] },
+                          as: 'l',
+                          cond: { $eq: [{ $toLower: { $ifNull: ['$$l.folioFiscal', ''] } }, { $toLower: '$uuid' }] },
+                        },
+                      }, 0],
+                    },
+                  },
+                  in: '$$link.saldoActual',
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    ...((banco || numAutorizacion || idNumo || serieCxc || folioCxc) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
+    ...(Object.keys(depositoMatch).length ? [{ $match: depositoMatch }] : []),
+    {
+      $facet: {
+        data: [
+          ...(Object.keys(tipoVentaMatch).length ? [{ $match: tipoVentaMatch }] : []),
+          { $sort: { fecha: -1 } },
+          { $skip: (pg - 1) * lm },
+          { $limit: lm },
+          {
+            $project: {
+              _id:          0,
+              cfdiUuid:     '$uuid',
+              satStatus:    '$satStatus',
+              tipoVenta:      1,
+              metodoPago:     1,
+              serie:          1,
+              folio:          1,
+              fecha:          1,
+              total:          1,
+              tienePago:      { $gt: [{ $size: '$movimientos' }, 0] },
+              numMovimientos: { $size: '$movimientos' },
+              // Con más de un depósito vinculado (anticipos acumulados, etc.), el
+              // primero es solo referencia — el monto real es la SUMA de todos.
+              banco:          { $arrayElemAt: ['$movimientos.banco',        0] },
+              movFecha:       { $arrayElemAt: ['$movimientos.fecha',        0] },
+              movFolio:       { $arrayElemAt: ['$movimientos.folio',        0] },
+              movConcepto:    { $arrayElemAt: ['$movimientos.concepto',     0] },
+              numOperacion:   { $arrayElemAt: ['$movimientos.numOperacion', 0] },
+              deposito:       { $round: [{ $sum: '$movimientos.deposito' }, 2] },
+              diferencia:     { $round: [{ $subtract: ['$total', { $sum: '$movimientos.deposito' }] }, 2] },
+              saldoMovimiento: { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+            },
+          },
+        ],
+        resumenAgg: [
+          { $group: { _id: '$tipoVenta', cantidad: { $sum: 1 }, monto: { $sum: '$total' } } },
+        ],
+        totalAgg: [
+          ...(Object.keys(tipoVentaMatch).length ? [{ $match: tipoVentaMatch }] : []),
+          { $count: 'count' },
+        ],
+      },
+    },
+  ];
+
+  const [result] = await CFDI.aggregate(pipeline).allowDiskUse(true);
+  const total = result.totalAgg[0]?.count ?? 0;
+
+  const resumen = { contado: { cantidad: 0, monto: 0 }, credito: { cantidad: 0, monto: 0 } };
+  for (const t of result.resumenAgg) {
+    const key = t._id === 'Credito' ? 'credito' : 'contado';
+    resumen[key] = { cantidad: t.cantidad, monto: Math.round(t.monto * 100) / 100 };
+  }
+
+  res.json({ data: result.data, total, page: pg, limit: lm, pages: Math.ceil(total / lm), resumen });
+});
+
+/**
+ * GET /api/reports/depositos-ingresos/detalle?facturaUuid=XXX
+ * Devuelve la factura y los movimientos bancarios vinculados (sin parcialidades
+ * — eso es un concepto de Pagos, no aplica a una factura de Ingreso).
+ */
+const depositosIngresosDetalle = asyncHandler(async (req, res) => {
+  const { facturaUuid } = req.query;
+  if (!facturaUuid) return res.status(400).json({ error: 'facturaUuid requerido' });
+
+  const uuid = facturaUuid.trim().toUpperCase();
+
+  const [factura, movimientos] = await Promise.all([
+    CFDI.findOne({ uuid, tipoDeComprobante: 'I', source: 'ERP' }).select('uuid satStatus serie folio total fecha metodoPago emisor receptor informacionGlobal').lean(),
+    CFDI.db.collection('bank_movements').find(
+      { isActive: true, 'erpLinks.folioFiscal': uuid },
+      { projection: { banco: 1, fecha: 1, deposito: 1, retiro: 1, folio: 1, concepto: 1, status: 1, numeroAutorizacion: 1, referenciaNumerica: 1, erpLinks: 1 } },
+    ).sort({ fecha: -1 }).toArray(),
+  ]);
+
+  // Cuentas por cobrar (CxC del ERP) afectadas por estos movimientos — para
+  // mostrarlas en el detalle sin que el usuario tenga que salir a otra pantalla.
+  const erpIds = [...new Set(
+    movimientos.flatMap(m => (m.erpLinks ?? [])
+      .filter(l => l.folioFiscal?.toUpperCase() === uuid)
+      .map(l => l.erpId)),
+  )];
+
+  const [cuentasPorCobrarRaw, egresosRelacionados] = await Promise.all([
+    buscarCuentasPorCobrarConMovimientos(erpIds),
+    buscarEgresosRelacionados(uuid),
+  ]);
+  const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura);
+
+  res.json({ factura: factura || null, movimientos, cuentasPorCobrar, egresosRelacionados, facturaEsGlobal: esFacturaGlobal(factura) });
+});
+
+/**
+ * GET /api/reports/depositos-ingresos/export
+ * Descarga Excel con los mismos filtros que depositosIngresos (sin paginación).
+ */
+const depositosIngresosExport = asyncHandler(async (req, res) => {
+  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, ejercicio, periodo, tipoVenta = 'todos', tieneDeposito = 'todos' } = req.query;
+
+  const baseMatch = { tipoDeComprobante: 'I', source: 'ERP', satStatus: 'Vigente', isActive: true };
+  if (ejercicio) baseMatch.ejercicio = parseInt(ejercicio);
+  if (periodo)   baseMatch.periodo   = parseInt(periodo);
+  if (uuid)  baseMatch.uuid  = { $regex: uuid.trim().toUpperCase(), $options: 'i' };
+  if (serie) baseMatch.serie = { $regex: serie.trim(), $options: 'i' };
+  if (folio) baseMatch.folio = { $regex: folio.trim(), $options: 'i' };
+  if (fechaInicio || fechaFin) {
+    baseMatch.fecha = {};
+    if (fechaInicio) baseMatch.fecha.$gte = new Date(fechaInicio);
+    if (fechaFin) {
+      const fin = new Date(fechaFin);
+      fin.setUTCDate(fin.getUTCDate() + 1);
+      baseMatch.fecha.$lt = fin;
+    }
+  }
+
+  const tipoVentaMatch = {};
+  if (tipoVenta === 'contado') tipoVentaMatch.tipoVenta = 'Contado';
+  if (tipoVenta === 'credito') tipoVentaMatch.tipoVenta = 'Credito';
+
+  const depositoMatch = {};
+  if (tieneDeposito === 'con_deposito') depositoMatch['movimientos.0'] = { $exists: true };
+  if (tieneDeposito === 'sin_deposito') depositoMatch.movimientos = { $size: 0 };
+
+  // Ver nota en depositosIngresos: la CxC tiene dos numeraciones (interna y
+  // externa) y erpLinks solo guarda serie + folioExterno, así que resolvemos
+  // el erpId primero para aceptar cualquiera de las dos numeraciones.
+  const erpIdsCxc = (serieCxc || folioCxc)
+    ? (await CFDI.db.collection('erp_cuentas_pendientes').find({
+        $or: [
+          {
+            ...(serieCxc ? { serie: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folio: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+          {
+            ...(serieCxc ? { serieExterna: { $regex: serieCxc.trim(), $options: 'i' } } : {}),
+            ...(folioCxc ? { folioExterno: { $regex: folioCxc.trim(), $options: 'i' } } : {}),
+          },
+        ],
+      }, { projection: { erpId: 1 } }).toArray()).map(c => c.erpId)
+    : null;
+
+  const movimientosFilterCond = {
+    $and: [
+      { $eq: ['$$m.isActive', true] },
+      ...(banco ? [{ $regexMatch: { input: { $ifNull: ['$$m.banco', ''] }, regex: banco.trim(), options: 'i' } }] : []),
+      ...(numAutorizacion ? [{ $or: [
+        { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.numeroAutorizacion' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+        { $regexMatch: { input: { $ifNull: [{ $toString: '$$m.referenciaNumerica' }, ''] }, regex: numAutorizacion.trim(), options: 'i' } },
+      ] }] : []),
+      ...(idNumo ? [{ $regexMatch: { input: { $ifNull: [{ $toString: '$$m.folio' }, ''] }, regex: idNumo.trim(), options: 'i' } }] : []),
+      ...(erpIdsCxc ? [{
+        $gt: [{
+          $size: {
+            $filter: {
+              input: { $ifNull: ['$$m.erpLinks', []] },
+              as: 'l',
+              cond: { $in: ['$$l.erpId', erpIdsCxc] },
+            },
+          },
+        }, 0],
+      }] : []),
+    ],
+  };
+
+  const pipeline = [
+    { $match: baseMatch },
+    { $lookup: { from: 'bank_movements', localField: 'uuid', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
+    {
+      $addFields: {
+        tipoVenta: { $cond: [{ $eq: ['$metodoPago', 'PPD'] }, 'Credito', 'Contado'] },
+        movimientos: {
+          $map: {
+            input: { $filter: { input: '$movimientos', as: 'm', cond: movimientosFilterCond } },
+            as: 'm',
+            in: {
+              banco:        '$$m.banco',
+              fecha:        '$$m.fecha',
+              deposito:     '$$m.deposito',
+              folio:        '$$m.folio',
+              numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+            },
+          },
+        },
+      },
+    },
+    ...((banco || numAutorizacion || idNumo || serieCxc || folioCxc) ? [{ $match: { 'movimientos.0': { $exists: true } } }] : []),
+    ...(Object.keys(depositoMatch).length ? [{ $match: depositoMatch }] : []),
+    ...(Object.keys(tipoVentaMatch).length ? [{ $match: tipoVentaMatch }] : []),
+    { $sort: { fecha: -1 } },
+    { $limit: 50000 },
+    {
+      $project: {
+        _id:          0,
+        cfdiUuid:       '$uuid',
+        satStatus:      '$satStatus',
+        tipoVenta:      1,
+        serie:          1,
+        folio:          1,
+        fecha:          1,
+        total:          1,
+        tienePago:      { $gt: [{ $size: '$movimientos' }, 0] },
+        numMovimientos: { $size: '$movimientos' },
+        banco:          { $arrayElemAt: ['$movimientos.banco',        0] },
+        movFecha:       { $arrayElemAt: ['$movimientos.fecha',        0] },
+        movFolio:       { $arrayElemAt: ['$movimientos.folio',        0] },
+        numOperacion:   { $arrayElemAt: ['$movimientos.numOperacion', 0] },
+        deposito:       { $round: [{ $sum: '$movimientos.deposito' }, 2] },
+        diferencia:     { $round: [{ $subtract: ['$total', { $sum: '$movimientos.deposito' }] }, 2] },
+      },
+    },
+  ];
+
+  const rows = await CFDI.aggregate(pipeline).allowDiskUse(true);
+
+  const workbook = new ExcelJS.Workbook();
+  const sheet    = workbook.addWorksheet('Depósitos Ingresos');
+
+  sheet.columns = [
+    { header: 'UUID Factura',      key: 'cfdiUuid',     width: 38 },
+    { header: 'Estado SAT',        key: 'satStatus',     width: 12 },
+    { header: 'Tipo de Venta',     key: 'tipoVenta',     width: 12 },
+    { header: 'Serie',             key: 'serie',         width: 8  },
+    { header: 'Folio',             key: 'folio',         width: 12 },
+    { header: 'Fecha',             key: 'fecha',         width: 14 },
+    { header: 'Total',             key: 'total',         width: 16 },
+    { header: 'Tiene Depósito',    key: 'tienePago',     width: 14 },
+    { header: 'Movimientos',       key: 'numMovimientos', width: 12 },
+    { header: 'Banco',             key: 'banco',         width: 20 },
+    { header: 'Fecha Movimiento',  key: 'movFecha',       width: 16 },
+    { header: 'ID NUMO',           key: 'movFolio',       width: 16 },
+    { header: 'Depósito (suma)',   key: 'deposito',       width: 16 },
+    { header: 'Núm. Autorización', key: 'numOperacion',   width: 22 },
+    { header: 'Diferencia',        key: 'diferencia',     width: 16 },
+  ];
+
+  sheet.getRow(1).eachCell(cell => {
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } };
+    cell.font   = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+    cell.border = { bottom: { style: 'thin', color: { argb: 'FF3B82F6' } } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  });
+  sheet.getRow(1).height = 22;
+
+  const mxn   = { numFmt: '"$"#,##0.00' };
+  const fecha = { numFmt: 'dd/mm/yyyy' };
+
+  rows.forEach((r, idx) => {
+    const row = sheet.addRow({
+      cfdiUuid:     r.cfdiUuid,
+      satStatus:    r.satStatus || '—',
+      tipoVenta:    r.tipoVenta,
+      serie:        r.serie || '',
+      folio:        r.folio || '',
+      fecha:        r.fecha ? new Date(r.fecha) : null,
+      total:          r.total,
+      tienePago:      r.tienePago ? 'Sí' : 'No',
+      numMovimientos: r.numMovimientos || 0,
+      banco:          r.banco || '—',
+      movFecha:       r.movFecha ? new Date(r.movFecha) : null,
+      movFolio:       r.movFolio || '—',
+      deposito:       r.deposito ?? null,
+      numOperacion:   r.numOperacion || '—',
+      diferencia:     r.diferencia,
+    });
+
+    row.getCell('total').numFmt        = mxn.numFmt;
+    row.getCell('deposito').numFmt     = mxn.numFmt;
+    row.getCell('diferencia').numFmt   = mxn.numFmt;
+    row.getCell('fecha').numFmt        = fecha.numFmt;
+    row.getCell('movFecha').numFmt     = fecha.numFmt;
+
+    if (!r.tienePago) {
+      row.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF2F2' } }; });
+    } else if (r.diferencia !== 0) {
+      row.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFBEB' } }; });
+    } else if (idx % 2 === 0) {
+      row.eachCell(cell => { cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } }; });
+    }
+
+    const difCell = row.getCell('diferencia');
+    if (r.diferencia > 0)      difCell.font = { color: { argb: 'FFB91C1C' }, bold: true };
+    else if (r.diferencia < 0) difCell.font = { color: { argb: 'FF15803D' }, bold: true };
+  });
+
+  const totalRow = sheet.addRow({
+    cfdiUuid:   'TOTALES',
+    total:      rows.reduce((s, r) => s + (r.total || 0), 0),
+    deposito:   rows.reduce((s, r) => s + (r.deposito || 0), 0),
+    diferencia: rows.reduce((s, r) => s + (r.diferencia || 0), 0),
+  });
+  totalRow.eachCell(cell => {
+    cell.font   = { bold: true };
+    cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
+    cell.border = { top: { style: 'medium' } };
+  });
+  totalRow.getCell('total').numFmt      = mxn.numFmt;
+  totalRow.getCell('deposito').numFmt   = mxn.numFmt;
+  totalRow.getCell('diferencia').numFmt = mxn.numFmt;
+
+  sheet.autoFilter = { from: 'A1', to: 'O1' };
+
+  const label = tipoVenta !== 'todos' ? `_${tipoVenta}` : '';
+  const per   = periodo   ? `_${periodo}`   : '';
+  const ej    = ejercicio ? `_${ejercicio}` : '';
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="depositos_ingresos${ej}${per}${label}_${Date.now()}.xlsx"`);
+  await workbook.xlsx.write(res);
+  res.end();
+});
+
+module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };

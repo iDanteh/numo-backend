@@ -815,11 +815,16 @@ function bloquesAjustesContado(movs) {
 
   return ordenCfdi.map(key => {
     const { categoria, movs: grupo } = porCfdi.get(key);
-    const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria }));
+    // Anticipo (recepción o aplicación/cierre) siempre lleva subcódigo 22,
+    // sin importar cómo se cobró — confirmado con el usuario. Antes esta
+    // función solo etiquetaba `_categoria: 'anticipo'` sin asignar el
+    // subcódigo, cayendo al 0 por defecto en la hoja de CONTPAQ.
+    const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
+    const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = categoria === 'devolucion'
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
-    return [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria }))];
+    return [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
   });
 }
 
@@ -895,11 +900,15 @@ function moverAjustesAlFinal(movs) {
     // cargo (salvo que el abono sea la creación de un saldo a favor —
     // `esAbonoSaldoFavor` — que sí se muestra), y dentro de cada lado la
     // cuenta de Ingresos/Devoluciones va antes que la de IVA.
-    const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria }));
+    // Anticipo siempre lleva subcódigo 22, sin importar cómo se cobró —
+    // mismo fix que en `bloquesAjustesContado` (Contado); antes solo se
+    // etiquetaba `_categoria: 'anticipo'` sin asignar el subcódigo.
+    const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
+    const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = categoria === 'devolucion'
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
-    const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria }))];
+    const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
     bloques.push(bloque);
   }
 

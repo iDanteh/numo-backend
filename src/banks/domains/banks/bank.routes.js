@@ -63,8 +63,15 @@ const upload = multer({
 });
 
 // GET /api/banks/cards
-router.get('/cards', authenticate, asyncHandler(async (req, res) => {
-  res.json(await service.getCards());
+router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  // El dashboard muestra "Identificados" de TODO el equipo (scope ALL) aunque el rol tenga
+  // scope OWN en la tabla de movimientos — decisión explícita del usuario, independiente de
+  // getMovementScope()/rbac.js; la tabla de abajo sigue restringida a lo propio por defecto.
+  const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
+  const rolActual     = hasAdminAccess ? null : req.user.role;
+  res.json(await service.getCards(restrictions, rolActual));
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)
@@ -124,10 +131,16 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
   res.json(await service.getSummary(fechaInicio, fechaFin));
 }));
 
-// GET /api/banks/stats — conteos globales por estado con filtro de año/mes opcional
-router.get('/stats', authenticate, asyncHandler(async (req, res) => {
+// GET /api/banks/stats — conteos por estado con filtro de año/mes opcional, restringido por rol
+router.get('/stats', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { year, month } = req.query;
-  res.json(await service.getStatusStats(year, month));
+  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  // Mismo criterio que /cards: "Identificados" del dashboard es de todo el equipo, no solo del
+  // usuario logueado, aunque su rol tenga scope OWN en la tabla de movimientos.
+  const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
+  const rolActual     = hasAdminAccess ? null : req.user.role;
+  res.json(await service.getStatusStats(year, month, restrictions, rolActual));
 }));
 
 // POST /api/banks/upload

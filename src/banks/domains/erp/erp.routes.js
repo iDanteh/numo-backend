@@ -719,7 +719,10 @@ function _movimientosKoreDesde(raw0) {
 }
 
 // Kore folios encode YYMMxxxxx (e.g. "260600250" → year=2026, month=06).
-// Kore requires full ISO datetime and a max one-month window.
+// Kore exige un rango MÁXIMO de un mes — si se excede, responde 400:
+// { "Codigo": 400, "Data": "parsing time \"...\": day out of range", "Mensaje": "Parámetros inválidos" }
+// Por eso esta función SIEMPRE devuelve el mes calendario exacto (nunca más), sin ningún
+// margen extra — ver _rangoSpilloverSiguienteMes más abajo para el caso de fin de mes.
 function _rangoDesdeFollo(folioExterno) {
   const str = String(folioExterno).trim();
   if (str.length < 4) return null;
@@ -734,6 +737,31 @@ function _rangoDesdeFollo(folioExterno) {
     fechaDesde: `${year}-${mmStr}-01T00:00:00Z`,
     fechaHasta: `${year}-${mmStr}-${lastStr}T23:59:59Z`,
   };
+}
+
+// Ventana de "rescate" para el desfase de fin de mes: el reloj del servidor del ERP tiene un
+// adelanto de ~6hrs sobre la hora local (Ciudad de México), así que una venta hecha cerca de
+// medianoche el ÚLTIMO día del mes (hora local) puede quedar registrada en Kore con fecha ya
+// del día 1 del mes SIGUIENTE — ej. venta real 31-03 19:33 hora local → Kore la guarda
+// ~01:33 del 01-04. El folio sigue diciendo "03" (mes de negocio), así que `_rangoDesdeFollo`
+// (marzo completo) nunca la encuentra.
+//
+// En vez de agrandar la ventana normal (arriesgando pasarse del límite de un mes que exige
+// Kore — ver el 400 de arriba), esta función devuelve una ventana CORTA de un solo día: el
+// día 1 del mes siguiente. Se usa como segundo intento SOLO cuando la consulta normal no
+// encuentra nada — la gran mayoría de los links se resuelven en el primer intento y nunca
+// disparan esta consulta extra.
+function _rangoSpilloverSiguienteMes(folioExterno) {
+  const str = String(folioExterno).trim();
+  if (str.length < 4) return null;
+  const yy = parseInt(str.slice(0, 2), 10);
+  const mm = parseInt(str.slice(2, 4), 10);
+  if (isNaN(yy) || isNaN(mm) || mm < 1 || mm > 12) return null;
+  const year = 2000 + yy;
+  // mm ya viene 1-indexado, así que equivale al índice 0-based del mes SIGUIENTE en Date.UTC.
+  const desde = new Date(Date.UTC(year, mm, 1, 0, 0, 0));
+  const hasta = new Date(Date.UTC(year, mm, 1, 23, 59, 59));
+  return { fechaDesde: desde.toISOString(), fechaHasta: hasta.toISOString() };
 }
 
 // Extrae el tiempo de espera del mensaje de Kore: "retry after: 20.398s" → 20898 ms
@@ -815,12 +843,30 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
         const rango = _rangoDesdeFollo(link.folioExterno);
         if (!rango) continue;
         try {
-          const { raw } = await _sincronizarConRetry({
+          let { raw } = await _sincronizarConRetry({
             serieExterna: link.serie,
             folioExterno: String(link.folioExterno),
             fechaDesde:   rango.fechaDesde,
             fechaHasta:   rango.fechaHasta,
           });
+
+          // Ventana normal vacía → puede ser una venta de fin de mes que Kore registró ya
+          // en el día 1 del mes siguiente (ver _rangoSpilloverSiguienteMes). Segundo intento
+          // acotado a un solo día — no dispara en el caso común (ventana normal con datos).
+          if (raw.length === 0) {
+            const spillover = _rangoSpilloverSiguienteMes(link.folioExterno);
+            if (spillover) {
+              await _sleep(SYNC_DELAY_MS);
+              const retryRes = await _sincronizarConRetry({
+                serieExterna: link.serie,
+                folioExterno: String(link.folioExterno),
+                fechaDesde:   spillover.fechaDesde,
+                fechaHasta:   spillover.fechaHasta,
+              });
+              if (retryRes.raw.length > 0) raw = retryRes.raw;
+            }
+          }
+
           const raw0 = raw[0];
           linksActualizados[i].movimientosKore = _movimientosKoreDesde(raw0);
           huboLinkTocado = true;

@@ -203,7 +203,7 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
     { $or: folioFilters },
     {
       erpId: 1, serieExterna: 1, folioExterno: 1,
-      saldoActual: 1, total: 1, folioFiscal: 1, serie: 1,
+      saldoActual: 1, total: 1, folioFiscal: 1, serie: 1, tipoPago: 1,
       // Necesitamos movimientos para calcular el monto de pago real (ABO/CBT/CPF/CFC)
       // El root.saldoActual puede ser 0 (CxC ya liquidada) y root.total es el total
       // original de la factura — ninguno refleja lo que pagó este depósito bancario.
@@ -443,6 +443,7 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
         serie:          cxc.serie        ?? null,
         folioExterno:   cxc.folioExterno ?? null,
         tieneRetencion: false,
+        tipoPago:       cxc.tipoPago ? String(cxc.tipoPago).trim().toUpperCase() : null,
       });
       newIds.push(cxc.erpId);
     }

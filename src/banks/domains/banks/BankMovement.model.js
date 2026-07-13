@@ -54,18 +54,59 @@ const bankMovementSchema = new mongoose.Schema({
   // Snapshot por cada CxC vinculada: saldoActual, folioFiscal, serie y folioExterno al momento de la vinculación
   erpLinks: {
     type: [{
-      erpId:          { type: String, required: true },
-      saldoActual:    { type: Number, default: 0 },
+      erpId:            { type: String, required: true },
+      saldoActual:      { type: Number, default: 0 },
+      // Acumulado cobrado por transferencia/depósito en efectivo (forma "bancaria") —
+      // alimenta el badge/dropdown "CxC vinculadas" en la tabla de movimientos.
+      saldoPagado:      { type: Number, default: null },
+      // Acumulado cobrado por TODAS las formas de pago (transferencia, efectivo, cheque,
+      // tarjeta, etc.) — es la fuente de saldoErp/status en aplicarLogicaErp. Ver
+      // bank.service.js. Deliberadamente separado de saldoPagado: ese sigue siendo
+      // bancario-only para no inflar el dropdown de CxC vinculadas con formas no bancarias.
+      saldoPagadoTotal: { type: Number, default: null },
       folioFiscal:    { type: String, default: null },
       total:          { type: Number, default: null },
       serie:          { type: String, default: null },
       folioExterno:   { type: String, default: null },
       tieneRetencion: { type: Boolean, default: false },
+      tipoPago:       { type: String, default: null },
+      // Snapshot de movimientos Kore para esta CxC (todos menos el primero — el primero
+      // es el cargo original, no aporta al rastreo de conciliación). Lo llena y refresca
+      // el job "Sync ERP-Kore" en cada corrida mientras la CxC siga abierta.
+      movimientosKore: {
+        type: [{
+          serie:         { type: String, default: null },
+          folio:         { type: String, default: null },
+          serieOrigen:   { type: String, default: null },
+          folioOrigen:   { type: String, default: null },
+          fecha:         { type: Date,   default: null },
+          saldoAnterior: { type: Number, default: null },
+          saldoActual:   { type: Number, default: null },
+          subtotal:      { type: Number, default: null },
+          impuesto:      { type: Number, default: null },
+          total:         { type: Number, default: null },
+        }],
+        default: [],
+      },
+      // Monto real aportado por esta CxC a saldoErp — solo se calcula cuando Kore confirma
+      // saldoActual===0 (CxC saldada) Y el vínculo fue hecho por un humano (los vínculos de
+      // motores automáticos se cierran igual, ver conciliacionFinalizadaAt, pero nunca aportan
+      // aquí). Suma solo movimientos con forma de pago bancaria real — transferencia, cheque,
+      // depósito en efectivo — nunca formasPago[].monto (ver _montoSaldoLink en erp.routes.js).
+      saldoErpAportado: { type: Number, default: null },
+      // Checkpoint de conciliación por CxC (job "Sync ERP-Kore"): se marca SOLO cuando Kore
+      // confirma que la CxC ya está saldada (saldoActual===0) — ya no hay nada más que Kore
+      // pueda reportar para ella, así que deja de reconsultarse. Mientras sea null (CxC
+      // todavía abierta), toda corrida futura —manual o el cron diario, sin límite de
+      // antigüedad— vuelve a intentarla.
+      conciliacionFinalizadaAt: { type: Date, default: null },
+      // jobId de la corrida que finalizó este link — permite revertir selectivamente.
+      conciliacionRunId: { type: String, default: null },
     }],
     default: [],
   },
 
-  // Suma de saldoActual de todos los erpLinks; null cuando no hay vínculos
+  // Suma de erpLinks[].saldoErpAportado de los links ya finalizados; null cuando no hay vínculos
   saldoErp: { type: Number, default: null },
 
   // Última vez que saldoErp se sincronizó contra el ERP externo
@@ -106,6 +147,9 @@ const bankMovementSchema = new mongoose.Schema({
   // Oculto por regla — el movimiento existe pero no aparece en vistas normales
   oculto: { type: Boolean, default: false, index: true },
 
+  // Oculto solo para estos roles (regla 'ocultar' con ocultarRoles). Independiente de `oculto`.
+  ocultoRoles: { type: [String], default: [] },
+
   // Auditoría
   uploadedBy: { type: String, default: null },
   isActive:   { type: Boolean, default: true, index: true },
@@ -121,6 +165,8 @@ const bankMovementSchema = new mongoose.Schema({
       de:         { type: mongoose.Schema.Types.Mixed, default: null },
       a:          { type: mongoose.Schema.Types.Mixed, default: null },
       importFile: { type: String, default: null },
+      runId:      { type: String, default: null },   // ID de la corrida bulk que generó este cambio (permite revert selectivo)
+      revertedAt: { type: Date,   default: null },    // se marca al revertir, la entrada nunca se borra (rastro de auditoría)
     }],
     default: [],
   },

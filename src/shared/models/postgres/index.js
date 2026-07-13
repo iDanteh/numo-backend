@@ -181,6 +181,10 @@ async function syncModels() {
     ALTER TABLE bank_rules ADD COLUMN IF NOT EXISTS estado_destino VARCHAR(30)
   `).catch(e => console.warn('[syncModels] ADD COLUMN estado_destino (bank_rules):', e.message));
 
+  await BankRule.sequelize.query(`
+    ALTER TABLE bank_rules ADD COLUMN IF NOT EXISTS ocultar_roles JSONB DEFAULT '[]'::jsonb
+  `).catch(e => console.warn('[syncModels] ADD COLUMN ocultar_roles (bank_rules):', e.message));
+
   // Motivo de cancelación/reversión + tipo Cheque (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

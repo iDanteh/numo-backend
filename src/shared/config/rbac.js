@@ -39,6 +39,7 @@ const PERMISSIONS = Object.freeze({
   BANKS_READ:          'banks:read',
   BANKS_IMPORT:        'banks:import',
   BANKS_UPDATE:        'banks:update',
+  BANKS_MOVEMENT_EDIT: 'banks:movement:edit',
   BANKS_CONFIG:        'banks:config',
   BANKS_RULES:         'banks:rules',
 
@@ -88,6 +89,18 @@ const PERMISSIONS = Object.freeze({
   // Roles con este permiso ven todos los depósitos identificados, no solo los propios.
   // Úsalo para roles tipo "jefe de cobranza" que supervisan a su equipo.
   BANKS_EXPORT_ALL:    'banks:export:all',
+
+  // Vincular CxC del ERP directamente a un movimiento bancario (sin flujo de cobro).
+  // Permite al área de contabilidad registrar la conciliación sin generar un cobro.
+  BANKS_ERP_LINK:      'banks:erp:link',
+
+  // Aplicar cobro bancario desde el modal ERP (genera el recibo de pago en Kore).
+  // Exclusivo del área de cobranza; contabilidad usa banks:erp:link en su lugar.
+  BANKS_COBRO:         'banks:cobro',
+
+  // Desvincular una CxC ya asociada a un movimiento bancario.
+  // Restringido a admin — ningún otro rol puede eliminar una vinculación existente.
+  BANKS_ERP_UNLINK:    'banks:erp:unlink',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────
@@ -104,11 +117,13 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_READ,
       PERMISSIONS.BANKS_IMPORT,
       PERMISSIONS.BANKS_UPDATE,
+      PERMISSIONS.BANKS_MOVEMENT_EDIT,
       PERMISSIONS.BANKS_CONFIG,
       PERMISSIONS.BANKS_RULES,
       PERMISSIONS.BANKS_FICHA,
       PERMISSIONS.BANKS_EXPORT,
       PERMISSIONS.BANKS_EXPORT_ALL,
+      PERMISSIONS.BANKS_ERP_LINK,
       PERMISSIONS.ACCOUNT_PLAN_READ,
       PERMISSIONS.ACCOUNT_PLAN_WRITE,
       PERMISSIONS.POLIZAS_READ,
@@ -134,6 +149,8 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_UPDATE,        // puede cambiar estado de movimientos
       PERMISSIONS.BANKS_EXPORT,        // puede exportar Excel (con vista restringida)
       PERMISSIONS.BANKS_FICHA,         // puede identificar movimientos a partir de una ficha
+      // PERMISSIONS.BANKS_COBRO,         // aplica cobros desde el modal ERP (genera recibo en Kore)
+      PERMISSIONS.BANKS_ERP_LINK,
       PERMISSIONS.COLLECTIONS_READ,
       PERMISSIONS.COLLECTIONS_WRITE,
     ],

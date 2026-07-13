@@ -99,7 +99,7 @@ async function getCards() {
   // El join con la configuración se hace en la capa de aplicación.
   const [agg, configMap] = await Promise.all([
     BankMovement.aggregate([
-      { $match: { isActive: true } },
+      { $match: { isActive: true, oculto: { $ne: true } } },
       { $sort:  { banco: 1, fecha: 1, _id: 1 } },
       {
         $group: {
@@ -127,12 +127,19 @@ async function getCards() {
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $eq:  ['$status', 'reclasificado'] }, 1, 0] } },
           saldoPendiente: {
-            // Σ depósitos con status 'no_identificado'.
-            // Retiros, 'identificado' y 'otros' no participan en este cálculo.
+            // Σ de no_identificados ponderada por CxC vinculadas:
+            // · Con saldoErp: se suma solo la diferencia (deposito - saldoErp), mínimo 0.
+            // · Sin saldoErp: se suma el depósito completo.
             $sum: {
               $cond: [
                 { $in: ['$status', ['no_identificado', null]] },
-                { $ifNull: ['$deposito', 0] },
+                {
+                  $cond: [
+                    { $ne: ['$saldoErp', null] },
+                    { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] },
+                    { $ifNull: ['$deposito', 0] },
+                  ],
+                },
                 0,
               ],
             },
@@ -149,7 +156,7 @@ async function getCards() {
           saldoOtros: {
             $sum: {
               $cond: [
-                { $eq: ['$status', 'otros'] },
+                { $in: ['$status', ['otros', 'reclasificado']] },
                 { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
                 0,
               ],
@@ -228,7 +235,7 @@ async function getCards() {
 }
 
 async function getStatusStats(year, month) {
-  const match = { isActive: true };
+  const match = { isActive: true, oculto: { $ne: true } };
 
   if (year) {
     const y = parseInt(year, 10);
@@ -250,7 +257,7 @@ async function getStatusStats(year, month) {
           identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
           otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
-          dep_no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, { $cond: [{ $ne: ['$saldoErp', null] }, { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] }, { $ifNull: ['$deposito', 0] }] }, 0] } },
           dep_identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
           dep_otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
           dep_reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
@@ -286,10 +293,11 @@ async function listMovements(filters) {
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
     identificadoPorUsuario,
-    movId,
+    movId, rolActual,
   } = filters;
 
   const filter = { isActive: true, oculto: { $ne: true } };
+  if (rolActual) filter.ocultoRoles = { $ne: rolActual };
   if (banco)  filter.banco  = banco;
   if (status) {
     const statusVals = status.split(',').map(v => v.trim()).filter(Boolean);
@@ -443,10 +451,20 @@ async function listMovements(filters) {
     }
 
     // ── Campo calculado para ordenar por diferencia ──────────────────────────
+    // Misma fórmula y gate que erpDiferencia() en el frontend: null si no hay
+    // saldoErp o no hay CxC vinculadas (en vez de tratarlos como 0, que antes
+    // producía una "diferencia" fantasma igual al depósito completo).
     if (rawSortBy === 'diferencia') {
-      pipeline.push({ $addFields: { _diferencia: { $subtract: [
-        { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-        { $ifNull: ['$saldoErp', 0] },
+      pipeline.push({ $addFields: { _diferencia: { $cond: [
+        { $and: [
+          { $ne: ['$saldoErp', null] },
+          { $gt: [{ $size: { $ifNull: ['$erpLinks', []] } }, 0] },
+        ] },
+        { $subtract: [
+          { $ifNull: ['$deposito', { $ifNull: ['$retiro', 0] }] },
+          '$saldoErp',
+        ] },
+        null,
       ] } } });
     }
 
@@ -1186,14 +1204,20 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre, filename } 
         for (const mov of docsInsertados) {
           const $set = {};
           for (const rule of catRules) {
-            if (matchRegla(mov, rule)) { $set.categoria = rule.nombre; break; }
+            if (matchRegla(mov, rule)) {
+              $set.categoria = rule.nombre;
+              if (rule.estadoDestino) $set.status = rule.estadoDestino;
+              break;
+            }
           }
           if ($set.categoria) categorizados++;
           for (const rule of ocultarRules) {
             if (matchRegla(mov, rule)) { $set.oculto = true; break; }
           }
-          for (const rule of cambiarEstadoRules) {
-            if (matchRegla(mov, rule)) { $set.status = rule.estadoDestino; break; }
+          if (!$set.status) {
+            for (const rule of cambiarEstadoRules) {
+              if (matchRegla(mov, rule)) { $set.status = rule.estadoDestino; break; }
+            }
           }
           if (Object.keys($set).length > 0) {
             ops.push({ updateOne: { filter: { _id: mov._id }, update: { $set } } });
@@ -1288,9 +1312,11 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
       bankRuleRepo.listByBanco(bancoValidado, { accion: 'cambiar_estado' }),
     ]);
 
+    let catEstadoAplicado = false;
     for (const rule of catRules) {
       if (matchRegla(nuevo, rule)) {
         nuevo.categoria = rule.nombre;
+        if (rule.estadoDestino) { nuevo.status = rule.estadoDestino; catEstadoAplicado = true; }
         categorizado = true;
         break;
       }
@@ -1298,9 +1324,11 @@ async function importIndividual(mov, banco, userId, { auth0Sub } = {}) {
     for (const rule of ocultarRules) {
       if (matchRegla(nuevo, rule)) { nuevo.oculto = true; break; }
     }
-    let estadoCambiado = false;
-    for (const rule of cambiarEstadoRules) {
-      if (matchRegla(nuevo, rule)) { nuevo.status = rule.estadoDestino; estadoCambiado = true; break; }
+    let estadoCambiado = catEstadoAplicado;
+    if (!catEstadoAplicado) {
+      for (const rule of cambiarEstadoRules) {
+        if (matchRegla(nuevo, rule)) { nuevo.status = rule.estadoDestino; estadoCambiado = true; break; }
+      }
     }
     if (categorizado || nuevo.oculto || estadoCambiado) await nuevo.save();
   }
@@ -1339,9 +1367,26 @@ function aplicarLogicaErp(mov) {
   const links = mov.erpLinks || [];
   const saldoErp = links.length > 0
     ? links.reduce((sum, l) => {
-        const ref = (l.saldoActual != null && l.saldoActual > 0)
-          ? l.saldoActual
-          : (l.total ?? 0);
+        // saldoPagadoTotal: monto acumulado cobrado por CUALQUIER forma de pago para este
+        // link (ver cobro-panel _buildCobroSaldosErp) — es la fuente de verdad para saldoErp/
+        // status: si el depósito bancario cubre la CxC aunque se haya pagado con cheque,
+        // efectivo de caja, tarjeta, etc., el movimiento sí debe quedar identificado.
+        // (saldoPagado, en cambio, solo cuenta lo bancario — transferencia/depósito en
+        // efectivo — y se conserva aparte para el badge "CxC vinculadas" de la tabla.)
+        // Si el cobro-panel ya lo calculó explícitamente (no es null, aunque sea 0), ES la
+        // fuente de verdad y NO se cae a saldoActual/total. Solo cuando nunca se ha
+        // determinado (null — CxC vinculada sin pasar por el cobro-panel, ej. ya estaba
+        // pagada en Kore por otro canal) cae al comportamiento legado: saldoActual > 0 o total.
+        let ref;
+        if (l.saldoPagadoTotal != null) {
+          ref = l.saldoPagadoTotal;
+        } else if (l.saldoPagado != null) {
+          ref = l.saldoPagado;
+        } else {
+          ref = (l.saldoActual != null && l.saldoActual > 0)
+            ? l.saldoActual
+            : (l.total ?? 0);
+        }
         return sum + ref;
       }, 0)
     : null;
@@ -1409,6 +1454,56 @@ async function updateStatus(id, status, user) {
   return updated;
 }
 
+async function updateCategoria(id, categoria, user) {
+  if (categoria !== undefined && categoria !== null && typeof categoria !== 'string') {
+    throw new BadRequestError('categoria debe ser string o null');
+  }
+  const categoriaLimpia = typeof categoria === 'string' ? (categoria.trim() || null) : null;
+
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  const anterior = mov.categoria ?? null;
+  if (anterior === categoriaLimpia) {
+    return { _id: mov._id, banco: mov.banco, categoria: anterior, status: mov.status };
+  }
+
+  // Al asignar categoría manualmente:
+  //   - Si el movimiento ya está 'identificado' (tiene CxC conciliada), conservamos ese status.
+  //     Asignar una categoría es una anotación organizacional, no revierte la conciliación.
+  //   - En cualquier otro status pasamos a 'reclasificado' para indicar intervención manual.
+  // Al limpiarla → vuelve a 'identificado' si tiene ERP, sino 'no_identificado'.
+  let newStatus = mov.status;
+  if (categoriaLimpia) {
+    if (mov.status !== 'identificado') {
+      newStatus = 'reclasificado';
+    }
+  } else if (mov.status === 'reclasificado') {
+    newStatus = (mov.erpIds?.length ?? 0) > 0 ? 'identificado' : 'no_identificado';
+  }
+
+  await BankMovement.updateOne(
+    { _id: id },
+    {
+      $set:  { categoria: categoriaLimpia, status: newStatus },
+      $push: {
+        _changelog: {
+          at:         new Date(),
+          via:        user ? `manual:${user._id}` : 'manual',
+          campo:      'categoria',
+          de:         anterior,
+          a:          categoriaLimpia,
+          importFile: null,
+        },
+      },
+    }
+  );
+
+  const result = { _id: mov._id, banco: mov.banco, categoria: categoriaLimpia, status: newStatus };
+  emitToBanco(mov.banco, 'bank:movement:updated', result);
+  return result;
+}
+
 async function updateErpIds(id, action, erpId, user) {
   if (action !== 'remove') throw new BadRequestError('Solo se acepta action "remove"');
   if (!erpId || typeof erpId !== 'string' || !erpId.trim()) {
@@ -1458,12 +1553,15 @@ async function setErpIds(id, erpLinks, user) {
 
   const cleanLinks = erpLinks
     .map(l => ({
-      erpId:        String(l.erpId || '').trim(),
-      saldoActual:  l.saldoActual != null ? Number(l.saldoActual) : null,
+      erpId:            String(l.erpId || '').trim(),
+      saldoActual:      l.saldoActual != null ? Number(l.saldoActual) : null,
+      saldoPagado:      l.saldoPagado != null ? Number(l.saldoPagado) : null,
+      saldoPagadoTotal: l.saldoPagadoTotal != null ? Number(l.saldoPagadoTotal) : null,
       folioFiscal:  l.folioFiscal ? String(l.folioFiscal).trim().toUpperCase() : null,
       total:        l.total != null ? Number(l.total) : null,
       serie:        l.serie ? String(l.serie).trim() : null,
       folioExterno: l.folioExterno ? String(l.folioExterno).trim() : null,
+      tipoPago:     l.tipoPago ? String(l.tipoPago).trim().toUpperCase() : null,
     }))
     .filter(l => l.erpId);
 
@@ -1594,11 +1692,22 @@ async function exportMovements(filters) {
     fechaAplicacionInicio, fechaAplicacionFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
-    status, categorias,
-    identificadoPor,        // comma-separated userIds (nombre correcto enviado por el frontend)
+    status, categorias, identificadoPor,
+    importeMin, importeMax,
+    folioFiscal: folioFiscalFilter,
+    ficha:       fichaParamFilter,
+    columnas, rolActual,
   } = filters;
 
+  // Columnas opcionales activas (default: las 3 más útiles)
+  const colSet = columnas
+    ? new Set(columnas.split(',').map(v => v.trim()).filter(Boolean))
+    : new Set(['saldoErp', 'folioFiscal', 'formaPago']);
+
+  // ── Query ────────────────────────────────────────────────────────────────
   const filter = { isActive: true, oculto: { $ne: true } };
+  if (rolActual) filter.ocultoRoles = { $ne: rolActual };
+
   if (banco) {
     const bancoVals = banco.split(',').map(v => v.trim()).filter(Boolean);
     filter.banco = bancoVals.length === 1 ? bancoVals[0] : { $in: bancoVals };
@@ -1610,8 +1719,6 @@ async function exportMovements(filters) {
     else if (statusVals.length > 1) filter.status = { $in: statusVals };
   }
 
-  // Filtro por identificador: cubre identificadoPor[].userId Y fichaBy
-  // (ambas fuentes son las que usa listIdentificadores para poblar las opciones).
   if (identificadoPor) {
     const userIds = identificadoPor.split(',').map(v => v.trim()).filter(Boolean);
     if (userIds.length > 0) {
@@ -1634,7 +1741,6 @@ async function exportMovements(filters) {
       if (tipoVals[0] === 'deposito') filter.deposito = { $gt: 0 };
       if (tipoVals[0] === 'retiro')   filter.retiro   = { $gt: 0 };
     }
-    // Si vienen ambos o ninguno → sin filtro de tipo
   }
 
   if (concepto) {
@@ -1648,8 +1754,6 @@ async function exportMovements(filters) {
     if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
   }
 
-  // Filtro por fecha de aplicación usando $elemMatch (compatible con todas las versiones de MongoDB).
-  // Usa $or: fichaAt en rango OR algún elemento de identificadoPor con fechaId en rango (mismo elemento).
   if (fechaAplicacionInicio || fechaAplicacionFin) {
     const df = {};
     if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
@@ -1668,8 +1772,6 @@ async function exportMovements(filters) {
       { concepto: re }, { numeroAutorizacion: re },
       { referenciaNumerica: re }, { folio: re }, { uuidXML: re },
     ];
-    // Búsqueda por monto — tolerancia basada en los decimales ingresados:
-    // sin decimales → rango de 1 peso completo; 1 decimal → ±0.05; 2 decimales → ±0.005
     const cleanNum = search.replace(/[$,\s]/g, '');
     const num = parseFloat(cleanNum);
     if (!isNaN(num) && num > 0) {
@@ -1683,6 +1785,37 @@ async function exportMovements(filters) {
     filter.$or = orClauses;
   }
 
+  // ── Nuevos filtros ───────────────────────────────────────────────────────
+
+  // Rango de importe (aplica sobre deposito o retiro)
+  if (importeMin != null || importeMax != null) {
+    const min = importeMin != null ? Number(importeMin) : null;
+    const max = importeMax != null ? Number(importeMax) : null;
+    const rangeFilter = {};
+    if (min != null) rangeFilter.$gte = min;
+    if (max != null) rangeFilter.$lte = max;
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [{ deposito: rangeFilter }, { retiro: rangeFilter }] });
+  }
+
+  // Folio fiscal (con / sin)
+  if (folioFiscalFilter === 'con') {
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ erpLinks: { $elemMatch: { folioFiscal: { $nin: [null, ''] } } } });
+  } else if (folioFiscalFilter === 'sin') {
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $nor: [{ erpLinks: { $elemMatch: { folioFiscal: { $nin: [null, ''] } } } }] });
+  }
+
+  // Ficha de conciliación (con / sin)
+  if (fichaParamFilter === 'con') {
+    filter.ficha = { $nin: [null, ''] };
+  } else if (fichaParamFilter === 'sin') {
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [{ ficha: null }, { ficha: { $exists: false } }] });
+  }
+
+  // ── Sort + query ─────────────────────────────────────────────────────────
   const SORTABLE  = ['fecha', 'banco', 'deposito', 'retiro', 'saldo', 'saldo-erp', 'diferencia'];
   const rawSortBy = SORTABLE.includes(sortBy) ? sortBy : 'fecha';
   const FIELD_MAP = { 'saldo-erp': 'saldoErp' };
@@ -1691,11 +1824,20 @@ async function exportMovements(filters) {
 
   let movements;
   if (rawSortBy === 'diferencia') {
+    // Misma fórmula y gate que erpDiferencia() en el frontend (ver pipeline
+    // análogo más arriba, en la función de listado paginado).
     movements = await BankMovement.aggregate([
       { $match: filter },
-      { $addFields: { _diferencia: { $subtract: [
-        { $add: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-        { $ifNull: ['$saldoErp', 0] },
+      { $addFields: { _diferencia: { $cond: [
+        { $and: [
+          { $ne: ['$saldoErp', null] },
+          { $gt: [{ $size: { $ifNull: ['$erpLinks', []] } }, 0] },
+        ] },
+        { $subtract: [
+          { $ifNull: ['$deposito', { $ifNull: ['$retiro', 0] }] },
+          '$saldoErp',
+        ] },
+        null,
       ] } } },
       { $sort: { _diferencia: sortOrder, _id: 1 } },
     ]);
@@ -1705,31 +1847,49 @@ async function exportMovements(filters) {
       .lean();
   }
 
+  // ── Excel ────────────────────────────────────────────────────────────────
   const ExcelJS = require('exceljs');
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('Movimientos');
 
-  sheet.columns = [
-    { header: 'Fecha',            key: 'fecha',              width: 14 },
-    { header: 'Folio',            key: 'folio',              width: 10 },
-    { header: 'Banco',            key: 'banco',              width: 14 },
-    { header: 'Concepto',         key: 'concepto',           width: 50 },
-    { header: 'Fecha aplicación', key: 'fechaAplicacion',    width: 18 },
-    { header: 'Depósito',         key: 'deposito',           width: 16 },
-    { header: 'Retiro',           key: 'retiro',             width: 16 },
-    { header: 'Serie-Folio / Ficha', key: 'erpIds',           width: 32 },
-    { header: 'Saldo ERP',        key: 'saldoErp',           width: 16 },
-    { header: 'Diferencia',       key: 'diferencia',         width: 16 },
-    { header: 'Categoría',        key: 'categoria',          width: 20 },
-    { header: 'Estado',           key: 'status',             width: 16 },
-    { header: 'N° Autorización',  key: 'numeroAutorizacion', width: 20 },
-    { header: 'Identificado por', key: 'identificadoPor',    width: 24 },
+  // Columnas base (siempre presentes)
+  const baseCols = [
+    { header: 'Fecha',             key: 'fecha',              width: 13 },
+    { header: 'Banco',             key: 'banco',              width: 13 },
+    { header: 'Aut. NUMO',        key: 'folio',              width: 12 },
+    { header: 'Concepto',          key: 'concepto',           width: 48 },
+    { header: 'Fecha aplicación',  key: 'fechaAplicacion',    width: 17 },
+    { header: 'Depósito',          key: 'deposito',           width: 16 },
+    { header: 'Retiro',            key: 'retiro',             width: 16 },
+    { header: 'Serie-Folio ERP',   key: 'erpIds',             width: 30 },
+    { header: 'Saldo ERP',         key: 'saldoErp',           width: 16 },
+    { header: 'Diferencia',        key: 'diferencia',         width: 14 },
+    { header: 'Estado',            key: 'status',             width: 17 },
+    { header: 'Aut. Bancaria',   key: 'numeroAutorizacion', width: 20 },
+    { header: 'Categoría',         key: 'categoria',          width: 18 },
+    { header: 'Identificado por',  key: 'identificadoPor',    width: 22 },
   ];
 
+  // Columnas opcionales
+  const addlColDefs = {
+    folioFiscal: { header: 'UUID Venta',  key: 'folioFiscalCol', width: 20 },
+    formaPago:   { header: 'Forma de pago', key: 'formaPagoCol',   width: 16 },
+    retencion:   { header: 'Retención',     key: 'retencionCol',   width: 12 },
+    ficha:       { header: 'N° Ficha',      key: 'fichaCol',       width: 14 },
+  };
+
+  const activeCols = [...baseCols];
+  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha']) {
+    if (colSet.has(key)) activeCols.push(addlColDefs[key]);
+  }
+  sheet.columns = activeCols;
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
   const STATUS_LABELS = {
     no_identificado: 'No identificado',
     identificado:    'Identificado',
     otros:           'Otros',
+    reclasificado:   'Reclasificado',
   };
 
   const formatUTCDate = (raw) => {
@@ -1738,9 +1898,13 @@ async function exportMovements(filters) {
     return `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${d.getUTCFullYear()}`;
   };
 
+  // ── Filas ────────────────────────────────────────────────────────────────
   for (const m of movements) {
-    const bankAmount  = (m.deposito ?? 0) + (m.retiro ?? 0);
-    const diferencia  = m.saldoErp != null ? Math.abs(bankAmount - m.saldoErp) : null;
+    // Misma fórmula y gate que erpDiferencia() en el frontend.
+    const bankAmount = m.deposito ?? m.retiro ?? 0;
+    const diferencia = (m.saldoErp != null && (m.erpLinks || []).length > 0)
+      ? Math.abs(bankAmount - m.saldoErp)
+      : null;
 
     const fechasAplicacion = [
       ...(m.identificadoPor || []).map(e => e.fechaId ? new Date(e.fechaId).getTime() : null),
@@ -1750,40 +1914,108 @@ async function exportMovements(filters) {
       ? formatUTCDate(new Date(Math.max(...fechasAplicacion)))
       : null;
 
-    sheet.addRow({
-      folio:              m.status === 'identificado' ? (m.folio ?? null) : null,
-      banco:              m.banco ?? null,
+    const links   = m.erpLinks || [];
+    const erpBase = links
+      .map(l => (l.serie && l.folioExterno) ? `${l.serie}-${l.folioExterno}` : (l.folioExterno || l.erpId))
+      .join(', ');
+    const erpIdsFicha = [erpBase, m.ficha ?? null].filter(Boolean).join(' · ') || null;
+
+    const rowData = {
       fecha:              formatUTCDate(m.fecha),
+      banco:              m.banco ?? null,
+      folio:              m.status === 'identificado' ? (m.folio ?? null) : null,
       concepto:           m.concepto ?? null,
       deposito:           m.deposito ?? null,
       retiro:             m.retiro   ?? null,
-      categoria:          m.categoria ?? null,
       status:             STATUS_LABELS[m.status] ?? m.status,
-      erpIds:             (() => {
-                            const erp   = (m.erpLinks || [])
-                              .map(l => (l.serie && l.folioExterno) ? `${l.serie}-${l.folioExterno}` : (l.folioExterno || l.erpId))
-                              .join(', ');
-                            const parts = [erp, m.ficha ?? null].filter(Boolean);
-                            return parts.join(' · ') || null;
-                          })(),
+      categoria:          m.categoria ?? null,
+      erpIds:             erpIdsFicha,
       saldoErp:           m.saldoErp ?? null,
       diferencia,
-      numeroAutorizacion: m.numeroAutorizacion ?? null,
+      fechaAplicacion,
       identificadoPor:    [...new Set([
                             ...(m.identificadoPor || []).map(e => e.nombre || e.userId || '?'),
                             ...(m.fichaNombre ? [m.fichaNombre] : m.fichaBy ? [m.fichaBy] : []),
                           ])].join(', ') || null,
-      fechaAplicacion,
-    });
+      numeroAutorizacion: m.numeroAutorizacion ?? null,
+    };
+
+    if (colSet.has('folioFiscal'))
+      rowData.folioFiscalCol = links.map(l => l.folioFiscal).filter(Boolean).join(', ') || null;
+    if (colSet.has('formaPago'))
+      rowData.formaPagoCol   = [...new Set(links.map(l => l.tipoPago).filter(Boolean))].join(', ') || null;
+    if (colSet.has('retencion'))
+      rowData.retencionCol   = links.length > 0 ? (links.some(l => l.tieneRetencion) ? 'Sí' : 'No') : null;
+    if (colSet.has('ficha'))
+      rowData.fichaCol       = m.ficha ?? null;
+
+    sheet.addRow(rowData);
   }
 
-  // Estilo del encabezado
-  const headerRow = sheet.getRow(1);
-  headerRow.font = { bold: true };
-  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
-  headerRow.border = {
-    bottom: { style: 'thin', color: { argb: 'FFB0BAC4' } },
+  // ── Estilos ──────────────────────────────────────────────────────────────
+  const numColKeys = new Set(['deposito', 'retiro', 'saldoErp', 'diferencia']);
+  const numFmt     = '#,##0.00';
+
+  const STATUS_COLORS = {
+    'Identificado':    { fgColor: { argb: 'FFD1FAE5' }, fontColor: { argb: 'FF065F46' } },
+    'No identificado': { fgColor: { argb: 'FFFEF9C3' }, fontColor: { argb: 'FF713F12' } },
+    'Otros':           { fgColor: { argb: 'FFF1F5F9' }, fontColor: { argb: 'FF475569' } },
+    'Reclasificado':   { fgColor: { argb: 'FFDBEAFE' }, fontColor: { argb: 'FF1E40AF' } },
   };
+
+  const statusColIdx  = activeCols.findIndex(c => c.key === 'status') + 1;
+  const depositColIdx = activeCols.findIndex(c => c.key === 'deposito') + 1;
+  const retiroColIdx  = activeCols.findIndex(c => c.key === 'retiro') + 1;
+
+  // Header
+  const headerRow = sheet.getRow(1);
+  headerRow.height = 22;
+  headerRow.font   = { bold: true, color: { argb: 'FFE0E7FF' }, size: 10 };
+  headerRow.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+  headerRow.eachCell(cell => {
+    cell.border = { bottom: { style: 'medium', color: { argb: 'FF4F46E5' } } };
+  });
+
+  // Data rows
+  const evenFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFF' } };
+  sheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const isEven = rowNumber % 2 === 0;
+
+    for (let col = 1; col <= activeCols.length; col++) {
+      const cell   = row.getCell(col);
+      const colKey = activeCols[col - 1].key;
+      const isNum  = numColKeys.has(colKey);
+
+      if (isEven) cell.fill = evenFill;
+      cell.alignment = { vertical: 'middle', horizontal: isNum ? 'right' : 'left' };
+      if (isNum && cell.value != null) cell.numFmt = numFmt;
+    }
+
+    // Estado: coloreado por valor
+    if (statusColIdx > 0) {
+      const sc    = row.getCell(statusColIdx);
+      const style = STATUS_COLORS[sc.value];
+      if (style) {
+        sc.fill = { type: 'pattern', pattern: 'solid', fgColor: style.fgColor };
+        sc.font = { bold: true, color: style.fontColor, size: 9.5 };
+      }
+    }
+
+    // Depósito → verde, Retiro → rojo
+    if (depositColIdx > 0) {
+      const c = row.getCell(depositColIdx);
+      if (c.value != null) c.font = { bold: true, color: { argb: 'FF15803D' } };
+    }
+    if (retiroColIdx > 0) {
+      const c = row.getCell(retiroColIdx);
+      if (c.value != null) c.font = { bold: true, color: { argb: 'FFB91C1C' } };
+    }
+  });
+
+  // Encabezado congelado
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
 
   return workbook.xlsx.writeBuffer();
 }
@@ -1930,6 +2162,15 @@ async function updateMovement(id, data, user) {
     }
   }
 
+  // Reflejar status cuando la categoría cambia manualmente
+  if ('categoria' in data) {
+    if (mov.categoria) {
+      mov.status = 'reclasificado';
+    } else if (mov.status === 'reclasificado') {
+      mov.status = (mov.erpIds?.length ?? 0) > 0 ? 'identificado' : 'no_identificado';
+    }
+  }
+
   // Actualizar hash para mantener la integridad de deduplicación futura
   if (recalcularHash) {
     const nuevoHash = makeHash(mov);
@@ -2025,142 +2266,157 @@ async function generateTemplate() {
 }
 
 // ── findPotentialDuplicates ───────────────────────────────────────────────────
-// Detecta movimientos que, aunque tienen hashes distintos (es decir, pasaron la
-// dedup por hash), comparten los campos clave que los hacen sospechosamente
-// iguales: misma fecha, banco, importe (depósito o retiro) y saldo; o bien,
-// misma fecha, banco y número de autorización.
+// Detecta movimientos que, aunque tienen hashes distintos (pasaron la dedup por
+// hash), comparten campos clave que los hacen sospechosamente iguales.
 //
-// Causas típicas:
-//  • Concepto ligeramente diferente entre importaciones → hash distinto → 2 docs
-//  • Reexportación del banco con autorizaciones en formato distinto
-//  • Carga manual doble con pequeña variación en el concepto
+// Cuatro criterios en orden de prioridad:
+//  1. importe_saldo_fecha  — banco + día + monto + saldo (concepto diferente)
+//  2. importe_saldo_auth   — banco + monto + saldo + auth (sin restricción de fecha)
+//  3. importe_fecha_auth   — banco + día + monto + auth (saldo diferente)
+//  4. auth_monto_sin_saldo — banco + día + monto con relación de auth (DEP MIXTO)
 async function findPotentialDuplicates() {
-  // ── Estrategia 1: mismo banco + día + deposito + retiro + saldo ────────────
-  // Si el importe y saldo coinciden exactamente pero el concepto varía,
-  // el hash difiere y ambos documentos existen en la colección.
-  const byImporte = await BankMovement.aggregate([
-    { $match: { isActive: true } },
-    {
-      $group: {
-        _id: {
-          banco:    '$banco',
-          dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
-          deposito: '$deposito',
-          retiro:   '$retiro',
-          saldo:    '$saldo',
-        },
-        count: { $sum: 1 },
-        ids:   { $push: '$_id' },
-      },
+  // Campo calculado reutilizado en varias estrategias: normaliza auth numérico
+  // para equiparar "00199480" con "199480" (datos históricos vs. nuevos).
+  const authNormField = {
+    $cond: {
+      if:   { $regexMatch: { input: '$numeroAutorizacion', regex: /^\d+$/ } },
+      then: { $toString: { $toLong: '$numeroAutorizacion' } },
+      else: '$numeroAutorizacion',
     },
-    { $match: { count: { $gte: 2 } } },
-    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
-    { $limit: 500 },
-  ]);
+  };
 
-  // ── Estrategia 2: mismo banco + día + numeroAutorizacion ──────────────────
-  // Detecta transacciones que el banco identifica con el mismo número de
-  // autorización pero que llegaron con concepto o saldo diferente (p.ej. dos
-  // renglones del mismo cargo importados en archivos distintos).
-  //
-  // Normalización de ceros iniciales: registros históricos podían almacenar
-  // "00199480" antes del fix de normalizeAuthNum; registros nuevos guardan
-  // "199480".  $toLong convierte el string a entero cuando es puramente numérico
-  // para que "00199480" y "199480" caigan en el mismo bucket.  Si no es
-  // numérico ($toLong devuelve null), se usa el string tal cual.
-  const byAuthNum = await BankMovement.aggregate([
-    { $match: { isActive: true, numeroAutorizacion: { $nin: [null, ''] } } },
-    {
-      $addFields: {
-        _authNorm: {
-          $cond: {
-            if:   { $regexMatch: { input: '$numeroAutorizacion', regex: /^\d+$/ } },
-            then: { $toString: { $toLong: '$numeroAutorizacion' } },
-            else: '$numeroAutorizacion',
+  const [
+    byImporteSaldoFecha,
+    byImporteSaldoAuth,
+    byImporteFechaAuth,
+    byMontoSinSaldo,
+  ] = await Promise.all([
+
+    // 1. importe+saldo+fecha — mismo banco + día + monto + saldo, concepto distinto
+    BankMovement.aggregate([
+      { $match: { isActive: true } },
+      {
+        $group: {
+          _id: {
+            banco:    '$banco',
+            dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+            deposito: '$deposito',
+            retiro:   '$retiro',
+            saldo:    '$saldo',
           },
+          count: { $sum: 1 },
+          ids:   { $push: '$_id' },
         },
       },
-    },
-    {
-      $group: {
-        _id: {
-          banco:   '$banco',
-          dia:     { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
-          authKey: '$_authNorm',
-        },
-        count: { $sum: 1 },
-        ids:   { $push: '$_id' },
-      },
-    },
-    { $match: { count: { $gte: 2 } } },
-    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
-    { $limit: 500 },
-  ]);
+      { $match: { count: { $gte: 2 } } },
+      { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    ]),
 
-  // ── Estrategia 3: mismo banco + día + monto (sin saldo) con auth compartido ─
-  // Detecta el patrón "Abono por cobranza" + "DEP EN EFECTIVO" de Banamex:
-  // ambas filas representan el mismo depósito mixto, comparten auth y monto pero
-  // tienen saldos distintos (balances intermedios) → Estrategia 1 los pierde.
-  // También captura variantes con saldo=null (re-exportaciones sin columna saldo).
-  //
-  // Condición de validez: al menos dos documentos del grupo comparten el mismo
-  // numeroAutorizacion no nulo, lo que elimina falsos positivos por coincidencia
-  // de monto (p.ej. dos depósitos legítimos de $5,000 en el mismo día).
-  const byMontoSinSaldo = await BankMovement.aggregate([
-    { $match: { isActive: true } },
-    {
-      $group: {
-        _id: {
-          banco:    '$banco',
-          dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
-          deposito: '$deposito',
-          retiro:   '$retiro',
+    // 2. importe+saldo+auth — mismo banco + monto + saldo + auth (sin fecha)
+    // Detecta el mismo movimiento importado desde archivos de periodos distintos.
+    BankMovement.aggregate([
+      { $match: { isActive: true, numeroAutorizacion: { $nin: [null, ''] } } },
+      { $addFields: { _authNorm: authNormField } },
+      {
+        $group: {
+          _id: {
+            banco:    '$banco',
+            deposito: '$deposito',
+            retiro:   '$retiro',
+            saldo:    '$saldo',
+            authKey:  '$_authNorm',
+          },
+          count: { $sum: 1 },
+          ids:   { $push: '$_id' },
         },
-        count: { $sum: 1 },
-        ids:   { $push: '$_id' },
-        auths: { $push: '$numeroAutorizacion' },
       },
-    },
-    { $match: { count: { $gte: 2 } } },
-    { $sort: { '_id.dia': -1, '_id.banco': 1 } },
-    { $limit: 500 },
+      { $match: { count: { $gte: 2 } } },
+      { $sort: { '_id.banco': 1 } },
+    ]),
+
+    // 3. importe+fecha+auth — mismo banco + día + monto + auth, saldo diferente
+    // Captura duplicados donde el balance difiere (registro en distinto orden)
+    // pero la transacción es inequívoca: mismo auth + monto + fecha.
+    BankMovement.aggregate([
+      { $match: { isActive: true, numeroAutorizacion: { $nin: [null, ''] } } },
+      { $addFields: { _authNorm: authNormField } },
+      {
+        $group: {
+          _id: {
+            banco:    '$banco',
+            dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+            deposito: '$deposito',
+            retiro:   '$retiro',
+            authKey:  '$_authNorm',
+          },
+          count: { $sum: 1 },
+          ids:   { $push: '$_id' },
+        },
+      },
+      { $match: { count: { $gte: 2 } } },
+      { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    ]),
+
+    // 4. auth+monto (sin saldo) — mismo banco + día + monto, con relación de auth
+    // Patrón DEP MIXTO Banamex: fila A tiene auth, fila B no; mismo monto y día.
+    // La validación post-aggregation filtra coincidencias accidentales de monto.
+    BankMovement.aggregate([
+      { $match: { isActive: true } },
+      {
+        $group: {
+          _id: {
+            banco:    '$banco',
+            dia:      { $dateToString: { format: '%Y-%m-%d', date: '$fecha' } },
+            deposito: '$deposito',
+            retiro:   '$retiro',
+          },
+          count: { $sum: 1 },
+          ids:   { $push: '$_id' },
+          auths: { $push: '$numeroAutorizacion' },
+        },
+      },
+      { $match: { count: { $gte: 2 } } },
+      { $sort: { '_id.dia': -1, '_id.banco': 1 } },
+    ]),
   ]);
 
   // ── Construir mapa de grupos (deduplicando por conjunto de IDs) ───────────
+  // El orden de los loops define la prioridad: el primer criterio en ver un
+  // conjunto de IDs lo "gana". Los más específicos van primero.
   const seen = new Map();
-  for (const g of byImporte) {
+
+  for (const g of byImporteSaldoFecha) {
     const key = g.ids.map(id => id.toString()).sort().join('|');
     if (!seen.has(key)) {
       seen.set(key, { ids: g.ids, criterio: 'importe_saldo_fecha', meta: g._id, count: g.count });
     }
   }
-  for (const g of byAuthNum) {
+
+  for (const g of byImporteSaldoAuth) {
     const key = g.ids.map(id => id.toString()).sort().join('|');
     if (!seen.has(key)) {
-      seen.set(key, { ids: g.ids, criterio: 'numero_autorizacion', meta: g._id, count: g.count });
+      seen.set(key, { ids: g.ids, criterio: 'importe_saldo_auth', meta: g._id, count: g.count });
     }
   }
+
+  for (const g of byImporteFechaAuth) {
+    const key = g.ids.map(id => id.toString()).sort().join('|');
+    if (!seen.has(key)) {
+      seen.set(key, { ids: g.ids, criterio: 'importe_fecha_auth', meta: g._id, count: g.count });
+    }
+  }
+
   for (const g of byMontoSinSaldo) {
     const key = g.ids.map(id => id.toString()).sort().join('|');
     if (seen.has(key)) continue;
-    // Validar que el grupo corresponda a una transacción real y no a una
-    // coincidencia accidental de monto.  Dos patrones aceptables:
-    //
-    //   a) authCompartido: el mismo auth aparece en 2+ documentos del grupo.
-    //      Ocurre cuando el mismo movimiento se importó dos veces desde archivos
-    //      distintos y ambas filas capturaron la sub-fila de autorización.
-    //
-    //   b) authMixto: al menos un documento tiene auth y al menos uno no.
-    //      Patrón DEP MIXTO Banamex: la fila A captura el número de autorización
-    //      (tiene sub-fila "No. de Autorización") y la fila B no la tiene.
-    //      Ningún auth se repite exactamente, pero la combinación misma-fecha+
-    //      mismo-monto + uno-con-auth / uno-sin-auth es señal fiable de duplicado.
+    // Dos patrones válidos para evitar falsos positivos por coincidencia de monto:
+    //   a) authCompartido — el mismo auth en 2+ docs: mismo mov importado dos veces.
+    //   b) authMixto      — al menos un doc con auth y uno sin: patrón DEP MIXTO.
     const authCounts = new Map();
     let docsConAuth = 0;
     for (const a of g.auths) {
       if (!a || a === '' || a === '0') continue;
       docsConAuth++;
-      // Normalizar ceros iniciales para equiparar "199480" con "00199480"
       const norm = /^\d+$/.test(a) ? String(parseInt(a, 10)) : a;
       authCounts.set(norm, (authCounts.get(norm) || 0) + 1);
     }
@@ -2198,16 +2454,18 @@ async function findPotentialDuplicates() {
     }
   }
 
-  // Fecha descendente primero
+  // Fecha descendente; grupos sin día (importe_saldo_auth, cruza fechas) van al final.
   grupos.sort((a, b) => {
-    const da = a.meta.dia || '';
-    const db = b.meta.dia || '';
+    const da = a.meta.dia ?? '';
+    const db = b.meta.dia ?? '';
     if (da > db) return -1;
     if (da < db) return  1;
-    return (a.meta.banco || '').localeCompare(b.meta.banco || '');
+    return (a.meta.banco ?? '').localeCompare(b.meta.banco ?? '');
   });
 
-  return { total: grupos.length, grupos };
+  // Límite DESPUÉS del merge — un grupo detectado por N estrategias consume 1 slot.
+  const gruposFinal = grupos.slice(0, 500);
+  return { total: gruposFinal.length, grupos: gruposFinal };
 }
 
 // ── identificarAnterioresAMayo ────────────────────────────────────────────────
@@ -2540,8 +2798,9 @@ module.exports = {
   getCards, listMovements, getSummary, getStatusStats,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
-  exportMovements, deleteMovements, reclasifyMovements, updateMovement, generateTemplate,
+  exportMovements, deleteMovements, reclasifyMovements, updateMovement, updateCategoria, generateTemplate,
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,
+  ERP_TOLERANCE,
 };

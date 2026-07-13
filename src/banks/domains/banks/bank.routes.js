@@ -79,15 +79,15 @@ router.get('/identificadores', authenticate, asyncHandler(async (req, res) => {
 
 // GET /api/banks/movements/export  — descarga Excel respetando filtros activos
 router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), asyncHandler(async (req, res) => {
-  let query = { ...req.query };
-  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
-  if (!hasFullAccess) {
-    // banks:export:all → puede exportar depósitos de TODOS los usuarios identificadores,
-    // pero sigue sin acceso a retiros ni a "otros" (no tiene banks:config).
-    const hasExportAll = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_EXPORT_ALL);
-    const scope = hasExportAll ? MOVEMENT_SCOPE.ALL : getMovementScope(req.user.role);
-    ({ query } = applyMovementRestrictions(query, req.user._id, { scope, forExport: true }));
-  }
+  const query = { ...req.query };
+  // Reporte de movimientos: todas las opciones (retiros, "otros"/"reclasificado",
+  // identificadoPor de cualquier usuario) disponibles sin restricción por rol —
+  // a diferencia del listado principal (GET /movements), que sigue restringido.
+  // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
+  // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
+  // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  query.rolActual = hasAdminAccess ? null : req.user.role;
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
   const fecha  = new Date().toISOString().slice(0, 10);
@@ -110,6 +110,11 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
     }
     query = restricted;
   }
+  // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
+  // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
+  // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  query.rolActual = hasAdminAccess ? null : req.user.role;
   res.json(await service.listMovements(query));
 }));
 
@@ -186,6 +191,14 @@ router.patch('/movements/:id/status',
     res.json(await service.updateStatus(req.params.id, req.body.status, req.user));
   }),
 );
+
+router.patch('/movements/:id/categoria',
+  authenticate,
+  permit('banks:movement:edit'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.updateCategoria(req.params.id, req.body.categoria, req.user));
+  })
+)
 
 // PATCH /api/banks/movements/:id/erp-ids  (remove individual)
 router.patch('/movements/:id/erp-ids',
@@ -436,7 +449,7 @@ router.patch('/movements/reclasify',
 // PATCH /api/banks/movements/:id  — edición de campos del movimiento
 router.patch('/movements/:id',
   authenticate,
-  permit('banks:update'),
+  permit('banks:movement:edit'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateMovement(req.params.id, req.body, req.user));
   }),

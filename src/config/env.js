@@ -23,7 +23,6 @@ const REQUIRED = [
   'JWT_SECRET',          // Firma tokens de sesión
   'CREDS_MASTER_KEY',    // Cifra credenciales e.firma del SAT
   'ERP_CAJA_BASE_URL',   // URL base ERP cajas/bancos
-  'ERP_FACT_BASE_URL',   // URL base ERP facturación (import CFDIs)
   'ERP_TOKEN',           // Token de autenticación del ERP
 ];
 
@@ -111,9 +110,14 @@ const config = Object.freeze({
 
   /** Google Drive — integración via Service Account */
   google: Object.freeze({
-    serviceAccountKey: process.env.GOOGLE_SERVICE_ACCOUNT_KEY   || null,
-    driveRootFolderId: process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID  || null,
-    driveErpFolderId:  process.env.GOOGLE_DRIVE_ERP_FOLDER_ID   || null,
+    serviceAccountKey:         process.env.GOOGLE_SERVICE_ACCOUNT_KEY           || null,
+    // Cuenta de servicio DEDICADA para comprobantes (proyecto GCP "comprobantes-nuno"),
+    // separada de GOOGLE_SERVICE_ACCOUNT_KEY (usada en producción por visor/drive.controller.js
+    // para CFDIs) — comparten nombre de variable solo por accidente si no se distinguen aquí.
+    serviceAccountKeyComprobantes: process.env.GOOGLE_SERVICE_ACCOUNT_KEY2      || null,
+    driveRootFolderId:         process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID          || null,
+    driveErpFolderId:          process.env.GOOGLE_DRIVE_ERP_FOLDER_ID           || null,
+    driveComprobantesFolderId: process.env.GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID  || null,
   }),
 
   /** Correo saliente (SMTP) — usado para alertas (ej. vencimiento credenciales SAT) */

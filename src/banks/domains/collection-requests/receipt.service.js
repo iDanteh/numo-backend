@@ -3,66 +3,19 @@
 /**
  * receiptService.js — Extracción de datos de comprobantes de transferencia
  *
- * Motor 1 (primario) : Gemini 2.0 Flash — entiende imagen/PDF directamente,
- *                      devuelve JSON estructurado sin regex.
- *                      Requiere GEMINI_API_KEY en .env (gratuito hasta 1,500 req/día).
- * Motor 2 (secundario): Google Cloud Vision API — DOCUMENT_TEXT_DETECTION
- *                      Usa el service account ya configurado para Drive.
- * Motor 3 (fallback)  : Tesseract.js — completamente local, sin dependencias externas.
+ * Motor 1 (primario) : PaddleOCR (PP-OCRv6 vía ONNX Runtime) — corre embebido
+ *                      en el proceso Node, sin Python ni servicios externos.
+ *                      Gratuito, sin cuota, ver paddle-ocr.service.js.
+ * Motor 2 (fallback) : Tesseract.js — completamente local, 3 pasadas PSM en paralelo.
  *
- * PDFs : Gemini y Vision los leen de forma nativa (base64).
- *        Si ambos fallan, se intenta pdf-parse para texto embebido.
+ * PDFs : primero se intenta pdf-parse (texto embebido, PDFs digitales).
+ *        Si el PDF está escaneado (sin texto), se renderiza a imagen y se
+ *        aplica la misma cadena Paddle → Tesseract.
  */
 
 const Tesseract    = require('tesseract.js');
+const paddleOcr    = require('./paddle-ocr.service');
 const BankMovement = require('../banks/BankMovement.model');
-
-// ── Gemini (lazy) ────────────────────────────────────────────────────────────
-const GEMINI_PROMPT = `Eres un extractor experto de datos de comprobantes de pago bancarios mexicanos.
-
-Analiza el comprobante adjunto (transferencia, recibo, ticket, factura) y devuelve ÚNICAMENTE un objeto JSON. Sin texto adicional, sin bloques markdown.
-
-{
-  "monto": <número decimal sin símbolo de moneda — ej: 1500.20>,
-  "fecha": "<YYYY-MM-DD>",
-  "hora": "<HH:MM> o null",
-  "titularOrigen": "<NOMBRE EN MAYÚSCULAS del remitente/ordenante> o null",
-  "titularDestino": "<NOMBRE EN MAYÚSCULAS del beneficiario/destinatario> o null",
-  "bancoOrigen": "<banco que envía> o null",
-  "bancoDestino": "<banco que recibe> o null",
-  "claveRastreo": "<clave alfanumérica SPEI, 18-30 caracteres> o null",
-  "referencia": "<número de referencia, folio u operación> o null",
-  "numeroAutorizacion": "<código de autorización o aprobación> o null",
-  "clabe": "<CLABE interbancaria 18 dígitos> o null",
-  "cuentaOrigenUltimos4": "<últimos 4 dígitos de cuenta origen> o null",
-  "cuentaDestinoUltimos4": "<últimos 4 dígitos de cuenta destino> o null",
-  "concepto": "<descripción o motivo del pago> o null"
-}
-
-Reglas:
-- Formato MXN: coma separa miles (1,500 = 1500), punto separa decimales (1,500.20 = 1500.20)
-- Si ves superíndice o decimales en renglón separado ("1,500" + "20"), el monto es 1500.20
-- El banco del encabezado suele ser el banco destino (quien generó el comprobante)
-- La clave SPEI suele iniciar con letras del banco (BBVAMEX..., BNAM..., HDNX...)
-- Solo 4 dígitos para cuentaOrigenUltimos4 y cuentaDestinoUltimos4
-- null si no encuentras el campo con certeza`;
-
-// ── Google Cloud Vision (lazy) ───────────────────────────────────────────────
-let _visionClient = null;
-function getVisionClient() {
-  if (_visionClient) return _visionClient;
-  const keyPath = (process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH || '').trim();
-  if (!keyPath) {
-    throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY_PATH no está configurado — Vision desactivado');
-  }
-  const fs = require('fs');
-  if (!fs.existsSync(keyPath)) {
-    throw new Error(`Archivo de credenciales no encontrado: "${keyPath}" — Vision desactivado`);
-  }
-  const { ImageAnnotatorClient } = require('@google-cloud/vision');
-  _visionClient = new ImageAnnotatorClient({ keyFilename: keyPath });
-  return _visionClient;
-}
 
 const DATE_WINDOW_DAYS = 30;
 const FALLBACK_WINDOW  = 90;
@@ -100,7 +53,7 @@ const MESES_ABBR = {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
-// MOTOR 1 — TESSERACT  (workers singleton — se inicializan una vez y se reusan)
+// MOTOR 2 — TESSERACT  (workers singleton — se inicializan una vez y se reusan)
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
@@ -381,17 +334,25 @@ function extractMontoFromLines(lines) {
 function extractFieldsFromLines(lines) {
   if (!lines || !lines.length) return {};
 
-  const texts = lines.map(l => (l.text || '').trim());
+  // Se quita un bullet/viñeta inicial ("• De", "· Para") antes de comparar contra las
+  // etiquetas — algunos layouts (ej. Mercado Pago) prefijan cada sección con un bullet
+  // que de otro modo rompe el anclaje ^...$ de los regex de labelMap.
+  const texts = lines.map(l => (l.text || '').trim().replace(/^[•·]\s*/, ''));
   const result = {};
 
   const labelMap = [
     {
+      // "de"/"desde" cubre el patrón informal "De: <nombre> / Para: <nombre>" usado por
+      // apps de pago P2P (Mercado Pago, Banorte "Transferir a otros", etc.) — no son
+      // sinónimo de preposición libre porque re.test() se aplica a la LÍNEA COMPLETA
+      // ya recortada (^...$), no a texto corrido, así que no generan falsos positivos.
       field: 'titularOrigen',
-      re: /^(ordenante|remitente|emisor|nombre\s+del?\s+(emisor|ordenante|remitente))\s*[:\-]?$/i,
+      re: /^(ordenante|remitente|emisor|de|desde|nombre\s+del?\s+(emisor|ordenante|remitente))\s*[:\-]?$/i,
     },
     {
       field: 'titularDestino',
-      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|nombre|para)\s*[:\-]?$/i,
+      // "cliente" cubre tickets físicos de depósito (Banco Azteca: "Cliente: X")
+      re: /^(beneficiario|destinatario|receptor|nombre\s+del?\s+(beneficiario|receptor|destinatario)|nombre|para|cliente)\s*[:\-]?$/i,
     },
     {
       field: 'claveRastreo',
@@ -399,7 +360,8 @@ function extractFieldsFromLines(lines) {
     },
     {
       field: 'referencia',
-      re: /^(referencia|folio(?:\s+de\s+operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
+      // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica" (Vault México)
+      re: /^(referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
     },
     {
       field: 'numeroAutorizacion',
@@ -415,11 +377,11 @@ function extractFieldsFromLines(lines) {
     },
     {
       field: 'fecha',
-      re: /^(fecha(\s+(de\s+)?(operaci[oó]n|transferencia|pago|movimiento|env[ií]o))?)\s*[:\-]?$/i,
+      re: /^(fecha(\s+(de\s+(?:la\s+)?)?(operaci[oó]n|transferencia|pago|movimiento|env[ií]o))?)\s*[:\-]?$/i,
     },
     {
       field: 'hora',
-      re: /^(hora(\s+(de\s+)?(operaci[oó]n|pago|env[ií]o))?)\s*[:\-]?$/i,
+      re: /^(hora(\s+(de\s+(?:la\s+)?)?(operaci[oó]n|pago|env[ií]o))?)\s*[:\-]?$/i,
     },
     {
       field: 'cuentaOrigen',
@@ -454,6 +416,11 @@ function extractFieldsFromLines(lines) {
       for (let j = i + 1; j <= Math.min(i + 3, texts.length - 1); j++) {
         const val = texts[j];
         if (!val || isAnyLabel(val)) break;
+        // titularOrigen/titularDestino: si la etiqueta es un encabezado de SECCIÓN
+        // (ej. "Emisor") seguido de una subetiqueta ("Cuenta de retiro", "Banco
+        // destino") en vez del nombre, esa subetiqueta no es un nombre válido —
+        // se descarta y se sigue buscando en las líneas siguientes.
+        if ((field === 'titularOrigen' || field === 'titularDestino') && CAMPO_NO_NOMBRE_RE.test(val)) continue;
         result[field] = val;
         break;
       }
@@ -497,8 +464,21 @@ function extractFecha(text) {
   m = text.match(/\b(\d{1,2})\/(\d{1,2})\/(20\d{2})\b/);
   if (m) { const [,d,mo,y]=m; return `${y}-${mo.padStart(2,'0')}-${d.padStart(2,'0')}`; }
 
+  // DD/Mon/YYYY con slashes y mes abreviado en letras: "04/Mar/2026"
+  // (visto en comprobante de fondo oscuro estilo Banco Azteca)
+  m = text.match(/\b(\d{1,2})\/([A-Za-zÁÉÍÓÚáéíóúñÑ]{3,9})\/(20\d{2})\b/);
+  if (m) {
+    const mesTxt = m[2].toLowerCase();
+    const mes = MESES_ABBR[mesTxt.slice(0, 3)] || MESES_ES[mesTxt];
+    if (mes) return `${m[3]}-${String(mes).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  }
+
   m = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
   if (m) return m[0];
+
+  // YYYY/MM/DD con slashes: "2026/03/10" (visto en estado de cuenta Scotiabank)
+  m = text.match(/\b(20\d{2})\/(\d{2})\/(\d{2})\b/);
+  if (m) { const [,y,mo,d]=m; return `${y}-${mo}-${d}`; }
 
   // Formato completo con o sin "de": "03 de marzo de 2026" / "03 marzo 2026"
   m = text.match(/(\d{1,2})\s+(?:de\s+)?(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?(20\d{2})/i);
@@ -546,19 +526,25 @@ function extractClaveRastreo(text) {
 }
 
 function extractReferencia(text) {
-  // "folio(?:\s+de\s+operación)?" cubre tanto "Folio: X" como "Folio de operación\nX"
+  // "folio(?:\s+de\s+(?:la\s+)?operación)?" cubre "Folio: X", "Folio de operación\nX"
+  // y "Folio de la operación\nX" (BBVA usa el artículo "la" en su formato estándar).
+  // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica: X" (Vault México), no solo
+  // "Referencia" a secas.
   // "[:\s#\n]*" usa \n explícito para cruzar línea cuando el valor está en la siguiente
   const m = text.match(
-    /(?:referencia|folio(?:\s+de\s+operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
+    /(?:referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
   );
   return m ? m[1] : null;
 }
 
 function extractNumeroAutorizacion(text) {
+  // Permite un prefijo de una letra antes de los dígitos: "M01215390"
+  // (visto en ticket físico de depósito Banco Azteca) — el prefijo se conserva
+  // porque es parte del número real, no un artefacto de OCR.
   const m = text.match(
-    /(?:autorizaci[oó]n|auth(?:orization)?|aprobaci[oó]n|c[oó]digo\s+(?:de\s+)?auth)[:\s#]*(\d{6,15})/i
+    /(?:autorizaci[oó]n|auth(?:orization)?|aprobaci[oó]n|c[oó]digo\s+(?:de\s+)?auth)[:\s#]*([A-Z]?\d{6,15})/i
   );
-  return m ? m[1] : null;
+  return m ? m[1].toUpperCase() : null;
 }
 
 function extractClabe(text) {
@@ -617,20 +603,25 @@ function extractBancos(text) {
   return { bancoOrigen: detectarBanco(top), bancoDestino: detectarBanco(bot) };
 }
 
-function extractUltimos4(text) {
+function extractUltimos4(text, { preferLast = false } = {}) {
+  const pick = (regexG) => {
+    const matches = [...text.matchAll(regexG)];
+    if (!matches.length) return null;
+    return preferLast ? matches[matches.length - 1] : matches[0];
+  };
   let m;
 
   // Bullet "•" / "·" — formato BBVA: "CUENTA • 14588", "•4352"
   // Toma los últimos 4 dígitos si el grupo capturado tiene 3–5 dígitos
-  m = text.match(/[•·\u2022\u00b7]\s*(\d{3,5})\b/);
+  m = pick(/[•·\u2022\u00b7]\s*(\d{3,5})\b/g);
   if (m) return m[1].slice(-4);
 
   // Asteriscos dobles — formato Banamex: "Priority **546", "**120/971"
-  m = text.match(/\*{2,4}\s*(\d{3,4})(?:\/\d+)?\b/);
+  m = pick(/\*{2,4}\s*(\d{3,4})(?:\/\d+)?\b/g);
   if (m) return m[1].slice(-4);
 
   // Asteriscos/X/puntos — formato estándar: "****1234", "XX1234"
-  m = text.match(/[*Xx\.]{3,4}[\s-]?(\d{4})\b/);
+  m = pick(/[*Xx\.]{3,4}[\s-]?(\d{4})\b/g);
   if (m) return m[1];
 
   m = text.match(/(?:termina(?:ndo)?|ending|últ(?:imos)?\.?)\s+(?:en\s+)?(\d{4})\b/i);
@@ -642,17 +633,51 @@ function extractUltimos4(text) {
   return null;
 }
 
+/**
+ * Encuentra el índice de línea donde empieza la sección "destino" de un
+ * comprobante (Para/Destino/Beneficiario/Hacia), para partir ahí el texto en
+ * vez de a la mitad por conteo de líneas — evita que la cuenta origen y la
+ * cuenta destino se mezclen cuando una sección ocupa más líneas que la otra
+ * (ej. "De" con 3 líneas y "Para" con 4 líneas quedarían mal repartidas por
+ * un split 50/50 puro). Devuelve null si no se detecta un marcador claro —
+ * en ese caso el llamador debe usar el split por mitad como respaldo.
+ */
+function _indiceSeccionDestino(lines) {
+  const DESTINO_RE = /^[•·]?\s*(para|destino|hacia|beneficiario|destinatario|receptor)\s*[:\-]?\s*$/i;
+  for (let i = 1; i < lines.length; i++) {
+    if (DESTINO_RE.test(lines[i].trim())) return i;
+  }
+  return null;
+}
+
+// Prefijos que delatan que lo capturado es en realidad OTRA etiqueta de campo
+// (cuenta/banco/clabe/...), no un nombre de persona. Ocurre cuando "Emisor"/
+// "Receptor"/"Ordenante" son encabezados de SECCIÓN seguidos de una subetiqueta
+// en vez de preceder directamente el nombre (ej. Vault México, Scotiabank:
+// "Emisor\nCuenta de retiro\n..." → sin la guardia se capturaba literalmente
+// "CUENTA DE RETIRO" como si fuera el nombre del ordenante).
+const CAMPO_NO_NOMBRE_RE = /^(cuenta|banco|clabe|tarjeta|sucursal|titular|n[uú]mero|folio|referencia|autorizaci[oó]n|monto|importe|total|fecha|hora|concepto|rastreo|rfc|tel[eé]fono|correo|direcci[oó]n)\b/i;
+
 function extractTitular(text, role) {
   const labels = role === 'origen'
     ? ['ordenante','remitente','emisor','nombre del emisor','nombre de origen','nombre del ordenante']
-    // "nombre" solo aplica a destino: en BBVA mismo banco, "Nombre: X" es el beneficiario
-    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','nombre','para'];
+    // "nombre"/"cliente" solo aplican a destino: en BBVA mismo banco, "Nombre: X" es el
+    // beneficiario; "Cliente: X" aparece en tickets físicos de depósito (Banco Azteca).
+    : ['beneficiario','destinatario','receptor','nombre del receptor','nombre del beneficiario','nombre','para','cliente'];
 
   const re = new RegExp(
-    `(?:${labels.join('|')})[:\\s]+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\\s\\.]{3,60})`, 'i'
+    `(?:${labels.join('|')})[:\\s]+([A-ZÁÉÍÓÚÑÜ][A-ZÁÉÍÓÚÑÜ\\s\\.]{3,60})`, 'gi'
   );
-  const m = text.match(re);
-  return m ? m[1].split('\n')[0].trim().toUpperCase().slice(0, 60) : null;
+
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const candidate = m[1].split('\n')[0].trim();
+    // Descarta la captura si en realidad es otra etiqueta de campo — sigue buscando
+    // en las siguientes coincidencias por si el nombre real aparece más adelante.
+    if (CAMPO_NO_NOMBRE_RE.test(candidate)) continue;
+    return candidate.toUpperCase().slice(0, 60);
+  }
+  return null;
 }
 
 // Etiquetas que NO deben tomarse como valor de concepto (evitar capturar la siguiente etiqueta)
@@ -687,7 +712,7 @@ function calcConfianza(fields) {
  */
 function extractAllFields(clean) {
   const lines = clean.split('\n');
-  const half  = Math.floor(lines.length / 2);
+  const half  = _indiceSeccionDestino(lines) ?? Math.floor(lines.length / 2);
   return {
     monto:                 extractMonto(clean),
     fecha:                 extractFecha(clean),
@@ -698,7 +723,7 @@ function extractAllFields(clean) {
     clabe:                 extractClabe(clean),
     ...extractBancos(clean),
     cuentaOrigenUltimos4:  extractUltimos4(lines.slice(0, half).join('\n')),
-    cuentaDestinoUltimos4: extractUltimos4(lines.slice(half).join('\n')),
+    cuentaDestinoUltimos4: extractUltimos4(lines.slice(half).join('\n'), { preferLast: true }),
     titularOrigen:         extractTitular(clean, 'origen'),
     titularDestino:        extractTitular(clean, 'destino'),
     concepto:              extractConcepto(clean),
@@ -796,83 +821,6 @@ async function extractReceiptDataTesseract(imageBuffer, mimeType = 'image/jpeg')
     _ocrAmounts:    process.env.NODE_ENV !== 'production' ? cleanAmounts : undefined,
   };
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-// MOTOR 1 — GEMINI 2.0 FLASH
-// ════════════════════════════════════════════════════════════════════════════
-
-/**
- * Envía imagen o PDF directamente a Gemini y extrae campos estructurados.
- * Gemini entiende el documento completo — no necesita regex ni normalización.
- * Requiere GEMINI_API_KEY en .env (gratuito en Google AI Studio).
- */
-async function extractReceiptDataGemini(imageBuffer, mimeType) {
-  if (!process.env.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY no configurada en .env');
-
-  const { GoogleGenerativeAI } = require('@google/generative-ai');
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({
-    model:            'gemini-2.0-flash',
-    generationConfig: { temperature: 0.05, topP: 0.95 },
-  });
-
-  const result = await model.generateContent([
-    GEMINI_PROMPT,
-    { inlineData: { data: imageBuffer.toString('base64'), mimeType } },
-  ]);
-
-  const raw   = result.response.text().trim();
-  const clean = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
-  const data  = JSON.parse(clean);
-
-  const parseMonto = (v) => {
-    if (v === null || v === undefined) return null;
-    const n = typeof v === 'string' ? parseFloat(v.replace(/,/g, '')) : Number(v);
-    return ok(n) ? n : null;
-  };
-
-  // Normalizar fecha — Gemini debe devolver YYYY-MM-DD, pero por si acaso
-  const parseFecha = (d) => {
-    if (!d) return null;
-    if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
-    return extractFecha(d);
-  };
-
-  const fields = {
-    monto:                 parseMonto(data.monto),
-    fecha:                 parseFecha(data.fecha),
-    hora:                  data.hora                  || null,
-    claveRastreo:          data.claveRastreo          || null,
-    referencia:            data.referencia            || null,
-    numeroAutorizacion:    data.numeroAutorizacion    || null,
-    clabe:                 data.clabe                 || null,
-    bancoOrigen:           data.bancoOrigen           || null,
-    bancoDestino:          data.bancoDestino          || null,
-    cuentaOrigenUltimos4:  data.cuentaOrigenUltimos4  || null,
-    cuentaDestinoUltimos4: data.cuentaDestinoUltimos4 || null,
-    titularOrigen:         data.titularOrigen         || null,
-    titularDestino:        data.titularDestino        || null,
-    concepto:              data.concepto              || null,
-  };
-
-  const confianza = calcConfianza(fields);
-  // Si Gemini no extrajo ningún campo útil (ej. imagen ilegible o fuera de contexto),
-  // lanzar error para que el dispatcher pruebe el siguiente motor en lugar de
-  // retornar un resultado vacío que bloquea la cadena de fallback.
-  if (confianza === 0) {
-    throw new Error('Gemini no extrajo datos útiles del comprobante (todos los campos null)');
-  }
-
-  return {
-    ...fields,
-    confianza,
-    _engine: 'gemini-2.0-flash',
-  };
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// MOTOR 2 — GOOGLE CLOUD VISION API
-// ════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════
 // HELPERS DE PREPROCESAMIENTO
@@ -1278,15 +1226,14 @@ async function renderPdfToImages(pdfBuffer, maxPages = 2) {
 }
 
 /**
- * Motor para PDFs escaneados (sin texto embebido).
- *
- * Flujo: renderizar cada página a PNG → preprocessImage → Tesseract (3 PSMs).
+ * Motor para PDFs escaneados (sin texto embebido): renderiza cada página a PNG
+ * y aplica la cadena Paddle → Tesseract (misma prioridad que para imágenes).
  * Si la primera página produce confianza baja (< 40), intenta la segunda.
  * Retorna el resultado de mayor confianza.
  */
-async function extractReceiptDataPdfAsImage(pdfBuffer) {
-  const logger  = require('../../../shared/utils/logger');
-  const pages   = await renderPdfToImages(pdfBuffer, 2);
+async function extractReceiptDataPdfScanned(pdfBuffer) {
+  const logger = require('../../../shared/utils/logger');
+  const pages  = await renderPdfToImages(pdfBuffer, 2);
 
   if (!pages.length) {
     throw new Error('renderPdfToImages no devolvió ninguna página');
@@ -1295,76 +1242,87 @@ async function extractReceiptDataPdfAsImage(pdfBuffer) {
   const results = [];
   for (const pagePng of pages) {
     try {
-      const r = await extractReceiptDataTesseract(pagePng, 'image/png');
-      results.push(r);
-      // Si ya tenemos buena confianza en la primera página, no renderizar más
-      if (r.confianza >= 40) break;
-    } catch (pageErr) {
-      logger.warn('[extractReceiptDataPdfAsImage] Error procesando página PDF→imagen:', pageErr.message);
+      const r = await extractReceiptDataPaddle(pagePng, 'image/png');
+      results.push({ ...r, _engine: 'paddle-ocr-pdf-render' });
+    } catch (paddleErr) {
+      logger.warn('[extractReceiptDataPdfScanned] Paddle falló en una página:', paddleErr.message);
+      try {
+        const r = await extractReceiptDataTesseract(pagePng, 'image/png');
+        results.push({ ...r, _engine: 'tesseract-pdf-render' });
+      } catch (tessErr) {
+        logger.warn('[extractReceiptDataPdfScanned] Tesseract también falló en esa página:', tessErr.message);
+      }
     }
+    // Si ya tenemos buena confianza, no renderizar/procesar más páginas
+    if (results.length && results[results.length - 1].confianza >= 40) break;
   }
 
   if (!results.length) {
-    throw new Error('Tesseract no pudo extraer datos de ninguna página del PDF renderizado');
+    throw new Error('Ningún motor pudo extraer datos de las páginas del PDF renderizado');
   }
 
-  // Elegir la página con mayor confianza
-  const best = results.reduce((a, b) => (b.confianza > a.confianza ? b : a));
-  return { ...best, _engine: 'tesseract-pdf-render' };
+  // Elegir el resultado con mayor confianza entre todas las páginas/motores probados
+  return results.reduce((a, b) => (b.confianza > a.confianza ? b : a));
 }
 
 /**
- * Motor principal — Google Cloud Vision API.
- *
- * Imágenes : preprocessImage → DOCUMENT_TEXT_DETECTION → extracción de campos
- * PDFs     : pdf-parse (texto embebido) → extracción de campos
- *            Si el PDF está vacío (escaneado), lanza error claro.
- *
- * Auth     : usa GOOGLE_SERVICE_ACCOUNT_KEY_PATH del .env
- *            (el mismo service account ya configurado para Drive)
+ * Extrae texto embebido de un PDF digital (pdf-parse) y aplica los mismos
+ * extractores de campo usados por los motores de imagen. Devuelve null si el
+ * PDF no trae texto suficiente (indicio de que está escaneado como imagen).
  */
-async function extractReceiptDataVision(imageBuffer, mimeType = 'image/jpeg') {
-  const isPdf = mimeType === 'application/pdf';
+async function extractReceiptDataFromPdfText(pdfBuffer) {
+  const rawText = await extractTextFromPdf(pdfBuffer);
+  if (!rawText || rawText.length < 20) return null;
 
-  let rawText;
-  let engine;
+  const clean  = normalizeOcrText(rawText);
+  const fields = extractAllFields(clean);
 
-  if (isPdf) {
-    rawText = await extractTextFromPdf(imageBuffer);
-    engine  = 'pdf-parse';
+  return {
+    ...fields,
+    confianza: calcConfianza(fields),
+    _engine:   'pdf-parse',
+    _ocrText:  process.env.NODE_ENV !== 'production' ? clean : undefined,
+  };
+}
 
-    if (!rawText || rawText.length < 20) {
-      throw new Error(
-        'El PDF no contiene texto extraíble (posiblemente escaneado). ' +
-        'Envía una foto del documento como imagen (JPG/PNG).'
-      );
-    }
-  } else {
-    // Preprocesar imagen para mejorar reconocimiento de imágenes de WhatsApp
-    const processedBuffer = await preprocessImage(imageBuffer);
+/**
+ * Preprocesamiento ligero para PaddleOCR: solo auto-rotación EXIF + upscaling
+ * inteligente. A diferencia de Tesseract, la red neuronal de PaddleOCR ya está
+ * entrenada sobre fotos naturales a color — la binarización/CLAHE agresivos de
+ * preprocessImage() (diseñados para el motor clásico LSTM de Tesseract) pueden
+ * destruir información útil en vez de ayudar.
+ */
+async function preprocessForPaddle(imageBuffer) {
+  try {
+    const sharp = require('sharp');
+    let buf = await sharp(imageBuffer, { failOn: 'none' }).rotate().toBuffer();
+    const isScreenshot = await detectIsScreenshot(buf);
+    buf = await smartUpscale(buf, isScreenshot);
+    return buf;
+  } catch (err) {
+    const logger = require('../../../shared/utils/logger');
+    logger.warn('[preprocessForPaddle] Pipeline falló, usando buffer original:', err.message);
+    return imageBuffer;
+  }
+}
 
-    const client = getVisionClient();
-    const [result] = await client.documentTextDetection({
-      image:        { content: processedBuffer },
-      imageContext: { languageHints: ['es', 'es-MX', 'es-419'] },
-    });
+/**
+ * Motor principal — PaddleOCR (PP-OCRv6 vía ONNX Runtime, ver paddle-ocr.service.js).
+ * Reutiliza los mismos extractores de campo por regex que Tesseract, más el
+ * fallback estructurado por línea (extractFieldsFromLines/extractMontoFromLines)
+ * para los casos donde el texto plano no basta.
+ */
+async function extractReceiptDataPaddle(imageBuffer, mimeType = 'image/jpeg') {
+  const processedBuffer = await preprocessForPaddle(imageBuffer);
+  const { text: rawText, lines: rawLines, confidence } = await paddleOcr.recognize(processedBuffer);
 
-    if (result.error && result.error.code) {
-      throw new Error(`Vision API error ${result.error.code}: ${result.error.message}`);
-    }
-
-    if (!result.fullTextAnnotation || !result.fullTextAnnotation.text) {
-      throw new Error('Google Vision no detectó texto en la imagen.');
-    }
-
-    rawText = result.fullTextAnnotation.text;
-    engine  = 'google-vision';
+  if (!rawText || rawText.trim().length < 3) {
+    throw new Error('PaddleOCR no detectó texto en la imagen.');
   }
 
-  const clean    = normalizeOcrText(rawText);
-  const lines    = clean.split('\n');
-  const half     = Math.floor(lines.length / 2);
-  const rawLines = rawText.split('\n').filter(Boolean).map(t => ({ text: t.trim() }));
+  const clean = normalizeOcrText(rawText);
+  const lines = clean.split('\n');
+  const half  = _indiceSeccionDestino(lines) ?? Math.floor(lines.length / 2);
 
   const lf     = extractFieldsFromLines(rawLines);
   const bancos = extractBancos(clean);
@@ -1380,18 +1338,25 @@ async function extractReceiptDataVision(imageBuffer, mimeType = 'image/jpeg') {
     bancoOrigen:           bancos.bancoOrigen               ?? lf.bancoOrigen,
     bancoDestino:          bancos.bancoDestino              ?? lf.bancoDestino,
     cuentaOrigenUltimos4:  extractUltimos4(lines.slice(0, half).join('\n')) ?? lf.cuentaOrigenUltimos4,
-    cuentaDestinoUltimos4: extractUltimos4(lines.slice(half).join('\n'))    ?? lf.cuentaDestinoUltimos4,
+    cuentaDestinoUltimos4: extractUltimos4(lines.slice(half).join('\n'), { preferLast: true }) ?? lf.cuentaDestinoUltimos4,
     titularOrigen:         extractTitular(clean, 'origen')  ?? lf.titularOrigen,
     titularDestino:        extractTitular(clean, 'destino') ?? lf.titularDestino,
     concepto:              extractConcepto(clean)           ?? lf.concepto,
   };
 
+  // confidence de ppu-paddle-ocr viene en escala 0-1 — normalizar a 0-100 para
+  // que sea comparable con ocrConfidence de Tesseract (Tesseract.js ya usa 0-100).
+  const ocrConfidence     = Math.round(confidence * 100);
+  const baseConfianza     = calcConfianza(fields);
+  const adjustedConfianza = ocrConfidence < 60 ? Math.round(baseConfianza * 0.8) : baseConfianza;
+
   return {
     ...fields,
-    confianza: calcConfianza(fields),
-    _engine:   engine,
-    _ocrText:  process.env.NODE_ENV !== 'production' ? clean    : undefined,
-    _ocrLines: process.env.NODE_ENV !== 'production' ? rawLines : undefined,
+    confianza:      adjustedConfianza,
+    _engine:        'paddle-ocr',
+    _ocrConfidence: ocrConfidence,
+    _ocrText:       process.env.NODE_ENV !== 'production' ? clean    : undefined,
+    _ocrLines:      process.env.NODE_ENV !== 'production' ? rawLines : undefined,
   };
 }
 
@@ -1403,51 +1368,38 @@ async function extractReceiptDataVision(imageBuffer, mimeType = 'image/jpeg') {
  * Extrae datos de un comprobante de pago.
  *
  * Cadena de motores (imágenes):
- *   1. Gemini 2.0 Flash  — mejor precisión, entiende PDF e imagen de forma nativa
- *   2. Google Vision API — DOCUMENT_TEXT_DETECTION + preprocessImage
- *   3. Tesseract.js      — fallback local completo (3 PSMs en paralelo)
+ *   1. PaddleOCR (PP-OCRv6, ONNX Runtime) — embebido en el proceso Node
+ *   2. Tesseract.js                       — fallback local (3 PSMs en paralelo)
  *
  * Cadena de motores (PDF):
- *   1. Gemini           — acepta PDF base64 de forma nativa
- *   2. Vision + pdf-parse — para PDFs con texto embebido (vectorial/digital)
- *   3. pdfjs + Tesseract — renderiza páginas a PNG y aplica OCR (PDFs escaneados)
+ *   1. pdf-parse          — texto embebido (PDFs digitales/vectoriales)
+ *   2. pdfjs + PaddleOCR  — renderiza páginas a PNG y aplica OCR (PDFs escaneados)
+ *   3. pdfjs + Tesseract  — si Paddle falla en esa página
  */
 async function extractReceiptData(imageBuffer, mimeType) {
   if (!SUPPORTED_MIME.includes(mimeType))
     throw new Error(`Tipo no soportado: "${mimeType}". Usa JPG, PNG, WEBP o PDF.`);
 
-  const isPdf = mimeType === 'application/pdf';
-
-  // ── Motor 1: Gemini ───────────────────────────────────────────
-  try {
-    return await extractReceiptDataGemini(imageBuffer, mimeType);
-  } catch (geminiErr) {
-    console.warn('[receiptService] Gemini falló:', geminiErr.message);
-  }
-
-  // ── Motor 2: Google Vision ────────────────────────────────────
-  try {
-    return await extractReceiptDataVision(imageBuffer, mimeType);
-  } catch (visionErr) {
-    console.warn('[receiptService] Vision falló:', visionErr.message);
-
-    if (isPdf) {
-      // Motor 3-PDF: renderizar cada página del PDF a imagen PNG y aplicar Tesseract.
-      // Cubre PDFs escaneados (imagen dentro de PDF) que pdf-parse no puede extraer.
-      console.warn('[receiptService] PDF sin texto embebido — intentando render PDF→imagen con Tesseract.');
-      try {
-        return await extractReceiptDataPdfAsImage(imageBuffer);
-      } catch (pdfRenderErr) {
-        console.warn('[receiptService] Render PDF→imagen falló:', pdfRenderErr.message);
-        throw new Error(
-          'No se pudo procesar el PDF con ningún motor disponible. ' +
-          `Vision: ${visionErr.message} | Render: ${pdfRenderErr.message}`
-        );
-      }
+  if (mimeType === 'application/pdf') {
+    try {
+      const fromText = await extractReceiptDataFromPdfText(imageBuffer);
+      if (fromText) return fromText;
+      console.warn('[receiptService] PDF sin texto embebido suficiente — renderizando a imagen.');
+    } catch (pdfParseErr) {
+      console.warn('[receiptService] pdf-parse falló:', pdfParseErr.message);
     }
+
+    return await extractReceiptDataPdfScanned(imageBuffer);
   }
 
-  // ── Motor 3: Tesseract (imágenes) ─────────────────────────────
+  // ── Motor 1: PaddleOCR ─────────────────────────────────────────
+  try {
+    return await extractReceiptDataPaddle(imageBuffer, mimeType);
+  } catch (paddleErr) {
+    console.warn('[receiptService] PaddleOCR falló:', paddleErr.message);
+  }
+
+  // ── Motor 2: Tesseract (fallback) ───────────────────────────────
   console.warn('[receiptService] Usando Tesseract como último fallback.');
   return {
     ...(await extractReceiptDataTesseract(imageBuffer, mimeType)),
@@ -1512,11 +1464,18 @@ function scoreMovement(mov, ext) {
   else                   { return null; }  // descartado
 
   // ── Fecha (25 pts) ────────────────────────────────────────────────────────
+  // Comparación por día calendario en UTC, NO con .toDateString() (usa la zona
+  // horaria LOCAL del servidor) — ext.fecha siempre viene sin hora ("YYYY-MM-DD",
+  // así lo pide el prompt de extracción), y new Date("YYYY-MM-DD") se parsea
+  // como medianoche UTC. En un servidor en America/Mexico_City (UTC-6),
+  // .toDateString() la regresaba un día atrás, restando puntos a comprobantes
+  // del MISMO día (verificado: "2026-06-30" → "Mon Jun 29 2026" en local).
   if (ext.fecha) {
-    const days = Math.abs(
-      (new Date(new Date(mov.fecha).toDateString()).getTime() -
-       new Date(new Date(ext.fecha).toDateString()).getTime()) / 86_400_000
-    );
+    const diaUTC = (d) => {
+      const x = new Date(d);
+      return Date.UTC(x.getUTCFullYear(), x.getUTCMonth(), x.getUTCDate());
+    };
+    const days = Math.abs((diaUTC(mov.fecha) - diaUTC(ext.fecha)) / 86_400_000);
     if      (days === 0) { score += 25; reasons.push('Misma fecha'); }
     else if (days <= 1)  { score += 20; reasons.push('±1 día'); }
     else if (days <= 3)  { score += 15; reasons.push('±3 días'); }
@@ -1606,20 +1565,63 @@ function scoreMovement(mov, ext) {
   return { score: Math.min(score, 100), reasons };
 }
 
+// Puntaje MÁXIMO alcanzable para ESTE comprobante específico — solo cuenta las
+// categorías donde el OCR sí logró extraer un dato comparable (si el comprobante
+// nunca trae "últimos 4 dígitos", esa categoría no cuenta ni a favor ni en contra).
+// Es el mismo para todos los movimientos candidatos de una misma solicitud —
+// permite expresar el score como un % real (score/maxPosible) en vez de puntos
+// crudos sobre un máximo teórico (~125) que casi ningún comprobante alcanza.
+function _maxPosibleScore(ext) {
+  let max = 40; // monto — siempre aplica (ext.monto ya se garantiza antes de llamar a esto)
+  if (ext.fecha) max += 25;
+  if (ext.claveRastreo || ext.referencia || ext.numeroAutorizacion) max += 20;
+  if (ext.bancoOrigen || ext.bancoDestino) max += 15;
+  if (ext.cuentaOrigenUltimos4 || ext.cuentaDestinoUltimos4) max += 5;
+  if (ext.titularOrigen || ext.titularDestino) max += 10;
+  if (ext.concepto) max += 5;
+  if (ext.clabe && ext.clabe.length === 18) max += 5;
+  return Math.min(max, 100); // scoreMovement ya topa en 100, mantener consistente
+}
+
+// Un movimiento cuenta como "libre" si no tiene NINGÚN erpId ajeno a esta solicitud —
+// aunque su `status` siga en 'no_identificado' (aplicarLogicaErp lo deja así mientras
+// el saldoErp acumulado no cubra el depósito completo), ya puede tener una CxC de OTRA
+// solicitud parcialmente enganchada. Ofrecerlo como candidato para una CxC distinta
+// arriesgaría mezclar dos solicitudes no relacionadas en el mismo depósito. Un
+// movimiento sin erpIds, o cuyos erpIds sean TODOS de esta misma solicitud (reintento),
+// sigue contando como libre.
+function _sinCxcAjena(ownErpIds) {
+  return {
+    $or: [
+      { erpIds: { $exists: false } },
+      { erpIds: { $size: 0 } },
+      { erpIds: { $not: { $elemMatch: { $nin: ownErpIds } } } },
+    ],
+  };
+}
+
 /**
  * Busca movimientos bancarios candidatos para el comprobante analizado.
  * Si no hay monto, devuelve los 15 más recientes para selección manual.
+ * `ownErpIds` (opcional): erpIds de las CxC de la solicitud actual — un movimiento con
+ * una CxC de OTRA solicitud ya enganchada no cuenta como candidato libre (ver _sinCxcAjena).
  */
-async function findMatchingMovements(ext) {
+async function findMatchingMovements(ext, ownErpIds = []) {
   if (!ext.monto) {
     const recent = await BankMovement.find({
       isActive: true,
+      // Solo movimientos libres — uno ya 'identificado' pertenece a otra CxC/
+      // solicitud y no debe ofrecerse como candidato (docs viejos sin status
+      // seteado cuentan como libres también, ver aplicarLogicaErp).
+      status:   { $in: ['no_identificado', null] },
+      ..._sinCxcAjena(ownErpIds),
       fecha:    { $gte: new Date(Date.now() - FALLBACK_WINDOW * 86_400_000) },
     }).sort({ fecha: -1 }).limit(15).lean();
 
     return recent.map(mov => ({
       movement: mov,
       score:    0,
+      porcentaje: 0,
       reasons:  ['Sin monto extraído — selección manual'],
       nivel:    'bajo',
     }));
@@ -1628,6 +1630,11 @@ async function findMatchingMovements(ext) {
   const tol = Math.max(0.50, ext.monto * 0.005);
   const filter = {
     isActive: true,
+    // Solo movimientos libres — uno ya 'identificado' pertenece a otra CxC/
+    // solicitud y no debe ofrecerse como candidato (docs viejos sin status
+    // seteado cuentan como libres también, ver aplicarLogicaErp).
+    status:   { $in: ['no_identificado', null] },
+    ..._sinCxcAjena(ownErpIds),
     $or: [
       { deposito: { $gte: ext.monto - tol, $lte: ext.monto + tol } },
       { retiro:   { $gte: ext.monto - tol, $lte: ext.monto + tol } },
@@ -1647,12 +1654,15 @@ async function findMatchingMovements(ext) {
   const candidates = await BankMovement.find(filter)
     .sort({ fecha: -1 }).limit(150).lean();
 
+  const maxPosible = _maxPosibleScore(ext);
+
   return candidates
     .map(mov => {
       const r = scoreMovement(mov, ext);
       if (!r) return null;
-      return { movement: mov, score: r.score, reasons: r.reasons,
-               nivel: r.score >= 80 ? 'alto' : r.score >= 50 ? 'medio' : 'bajo' };
+      const porcentaje = Math.round(Math.min(100, (r.score / maxPosible) * 100));
+      return { movement: mov, score: r.score, porcentaje, reasons: r.reasons,
+               nivel: porcentaje >= 80 ? 'alto' : porcentaje >= 50 ? 'medio' : 'bajo' };
     })
     .filter(Boolean)
     .sort((a, b) => b.score - a.score)

@@ -52,6 +52,7 @@ async function create(banco, data) {
     accion:         data.accion         || 'categorizar',
     mensajeBloqueo: data.mensajeBloqueo ? String(data.mensajeBloqueo).trim() : null,
     estadoDestino:  data.estadoDestino  || null,
+    ocultarRoles:   Array.isArray(data.ocultarRoles) ? data.ocultarRoles : [],
     orden:          Number(data.orden)  || 0,
   });
 }
@@ -74,6 +75,7 @@ async function update(id, data) {
     estadoDestino:  data.estadoDestino !== undefined
       ? (data.estadoDestino || null)
       : rule.estadoDestino,
+    ocultarRoles:   Array.isArray(data.ocultarRoles) ? data.ocultarRoles : rule.ocultarRoles,
     ...(data.orden !== undefined && { orden: Number(data.orden) }),
   });
   return rule;

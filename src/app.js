@@ -119,23 +119,35 @@ app.use('/api/account-plan',         accountPlanRoutes);
 app.use('/api/centros-costo',        centrosCostoRoutes);
 app.use('/api/clientes',             clientesRoutes);
 app.use('/api/collection-requests',  collectionRequestRoutes);
+// Rutas ERP del módulo de bancos: CxC, cobros Kore, CYC, formas de pago.
+// Comparte prefijo /api/erp con visorErpRoutes (abajo); no hay colisión de paths.
+// Express evalúa este router primero y hace fall-through al siguiente si no hay match.
 app.use('/api/erp',                  bankErpRoutes);
 app.use('/api/users',                userRoutes);
-app.use('/api/polizas',             polizaRoutes);
-app.use('/api/cfdi-mapping',        cfdiMappingRoutes);
+app.use('/api/polizas',              polizaRoutes);
+app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
 
 // Visor module
-app.use('/api/auth',             authRoutes);
-app.use('/api/cfdis',            cfdiRoutes);
-app.use('/api/comparisons',      comparisonRoutes);
-app.use('/api/discrepancies',    discrepancyRoutes);
-app.use('/api/reports',          reportRoutes);
-app.use('/api/sat',              satRoutes);
-app.use('/api/entities',         entityRoutes);
-app.use('/api/drive',            driveRoutes);
+app.use('/api/auth',              authRoutes);
+app.use('/api/cfdis',             cfdiRoutes);
+app.use('/api/comparisons',       comparisonRoutes);
+app.use('/api/discrepancies',     discrepancyRoutes);
+app.use('/api/reports',           reportRoutes);
+app.use('/api/sat',               satRoutes);
+app.use('/api/entities',          entityRoutes);
+app.use('/api/drive',             driveRoutes);
 app.use('/api/periodos-fiscales', periodosFiscalesRoutes);
-app.use('/api/erp',              visorErpRoutes);
-app.use('/api/schedule',         scheduleRoutes);
+// Rutas ERP del módulo visor: carga/previsualización de facturas y enriquecimiento de pagos.
+app.use('/api/erp',               visorErpRoutes);
+app.use('/api/schedule',          scheduleRoutes);
+
+// Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se
+// registra en producción, ni siquiera si TEST_AUTH_SECRET quedó puesta por error.
+if (process.env.NODE_ENV !== 'production' && process.env.TEST_AUTH_SECRET) {
+  const devAuthRoutes = require('./shared/routes/dev-auth.routes');
+  app.use('/api/dev/test-token', devAuthRoutes);
+  logger.warn('[dev] POST /api/dev/test-token habilitado — SOLO usar en desarrollo/pruebas, nunca en producción');
+}
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => {
@@ -168,6 +180,7 @@ const startServer = async () => {
   }
 
   require('./visor/jobs/satSyncJob');
+  require('./banks/jobs/erpSyncCron');
   require('./visor/jobs/credencialesAlertJob');
   try {
     await seed();

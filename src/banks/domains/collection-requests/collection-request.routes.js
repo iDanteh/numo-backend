@@ -57,7 +57,7 @@ router.post('/analyze',
   upload.single('comprobante'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Se requiere una imagen en el campo "comprobante"' });
-    res.json(await service.analyzeReceipt(req.file.buffer, req.file.mimetype));
+    res.json(await service.analyzeReceipt(req.file.buffer, req.file.mimetype, req.file.originalname));
   }),
 );
 

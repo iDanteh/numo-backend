@@ -271,11 +271,13 @@ async function getCards(restrictions = null, rolActual = null) {
  *   'no_identificado' y 'reclasificado' son pool compartido (nadie los filtra por usuario),
  *   igual que en la tabla de movimientos.
  * @param {string|null} [rolActual] - si viene, excluye movimientos ocultos-por-regla para ese rol.
+ * @param {string|null} [banco] - si viene, limita las estadísticas (y los años disponibles) a ese banco.
  */
-async function getStatusStats(year, month, restrictions = null, rolActual = null) {
+async function getStatusStats(year, month, restrictions = null, rolActual = null, banco = null) {
   const match = { isActive: true, oculto: { $ne: true } };
   if (rolActual)    match.ocultoRoles = { $ne: rolActual };
   if (restrictions) match.status      = { $ne: 'otros' };
+  if (banco)        match.banco       = banco;
 
   if (year) {
     const y = parseInt(year, 10);
@@ -299,6 +301,7 @@ async function getStatusStats(year, month, restrictions = null, rolActual = null
   const yearsMatch = { isActive: true };
   if (rolActual)    yearsMatch.ocultoRoles = { $ne: rolActual };
   if (restrictions) yearsMatch.status      = { $ne: 'otros' };
+  if (banco)        yearsMatch.banco       = banco;
 
   const [statsAgg, yearsAgg] = await Promise.all([
     BankMovement.aggregate([

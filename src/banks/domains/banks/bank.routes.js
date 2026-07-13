@@ -131,16 +131,16 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
   res.json(await service.getSummary(fechaInicio, fechaFin));
 }));
 
-// GET /api/banks/stats — conteos por estado con filtro de año/mes opcional, restringido por rol
+// GET /api/banks/stats — conteos por estado con filtro de año/mes/banco opcional, restringido por rol
 router.get('/stats', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const { year, month } = req.query;
+  const { year, month, banco } = req.query;
   const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
   const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
   // Mismo criterio que /cards: "Identificados" del dashboard es de todo el equipo, no solo del
   // usuario logueado, aunque su rol tenga scope OWN en la tabla de movimientos.
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
   const rolActual     = hasAdminAccess ? null : req.user.role;
-  res.json(await service.getStatusStats(year, month, restrictions, rolActual));
+  res.json(await service.getStatusStats(year, month, restrictions, rolActual, banco || null));
 }));
 
 // POST /api/banks/upload

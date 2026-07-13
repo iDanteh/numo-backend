@@ -102,6 +102,20 @@ const bankMovementSchema = new mongoose.Schema({
       conciliacionFinalizadaAt: { type: Date, default: null },
       // jobId de la corrida que finalizó este link — permite revertir selectivamente.
       conciliacionRunId: { type: String, default: null },
+      // Bitácora de auditoría: una entrada por cada forma de pago usada en cada cobro
+      // aplicado a esta CxC. Se ACUMULA a través de varios cobros parciales (PPD) sobre
+      // la misma CxC — nunca se sobreescribe, solo crece. saldoPagado/saldoPagadoTotal
+      // siguen siendo los acumulados rápidos; esto es el detalle que los respalda (de
+      // dónde salió cada peso: cuánto en efectivo, transferencia, cheque, etc.).
+      desglosePorFormaPago: {
+        type: [{
+          formaPagoId:          { type: String, default: null },
+          formaPagoDescripcion: { type: String, default: null },
+          monto:                { type: Number, required: true },
+          fecha:                { type: Date, default: Date.now },
+        }],
+        default: [],
+      },
     }],
     default: [],
   },

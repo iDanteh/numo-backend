@@ -11,6 +11,7 @@ const { NotFoundError, BadRequestError, ConflictError, ForbiddenError } = requir
 const { emitToUser, emitToBanco } = require('../../shared/socket');
 const { matchRegla }   = require('./bank-rules.service');
 const bankRuleRepo     = require('./repositories/bank-rule.repository');
+const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const BANCOS_VALIDOS = [
@@ -93,13 +94,37 @@ function generarFolio(seq) {
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
-async function getCards() {
+/**
+ * Estadísticas de movimientos por banco.
+ *
+ * @param {{ scope: 'own'|'all', userId: string }|null} [restrictions] - null = acceso completo
+ *   (banks:config). Mismo criterio que `getStatusStats()`: 'otros' queda excluido y el bucket
+ *   'identificado'/'saldoIdentificado' se limita a `userId` cuando scope === MOVEMENT_SCOPE.OWN.
+ *   NOTA: totalDepositos/totalRetiros/saldoFinal/saldoActualizado/cuentaContable/numeroCuenta/
+ *   saldoInicial/lastImportBy NO se restringen aquí — son datos de configuración/saldo real del
+ *   banco que hoy expone la tabla de resumen por banco (`banks-table-wrap`) sin ningún guard de
+ *   permiso en el frontend; esa es una exposición aparte, pendiente de decidir por separado.
+ * @param {string|null} [rolActual] - si viene, excluye movimientos ocultos-por-regla para ese rol.
+ */
+async function getCards(restrictions = null, rolActual = null) {
   // Agregación MongoDB: estadísticas de movimientos por banco.
   // BankConfig ya no está en MongoDB → el $lookup se eliminó.
   // El join con la configuración se hace en la capa de aplicación.
+  const match = { isActive: true, oculto: { $ne: true } };
+  if (rolActual)    match.ocultoRoles = { $ne: rolActual };
+  if (restrictions) match.status      = { $ne: 'otros' };
+
+  const ownUserId = restrictions?.scope === MOVEMENT_SCOPE.OWN ? restrictions.userId : null;
+  const identificadoCond = {
+    $and: [
+      { $eq: ['$status', 'identificado'] },
+      ...(ownUserId ? [{ $in: [ownUserId, { $ifNull: ['$identificadoPor.userId', []] }] }] : []),
+    ],
+  };
+
   const [agg, configMap] = await Promise.all([
     BankMovement.aggregate([
-      { $match: { isActive: true, oculto: { $ne: true } } },
+      { $match: match },
       { $sort:  { banco: 1, fecha: 1, _id: 1 } },
       {
         $group: {
@@ -123,7 +148,7 @@ async function getCards() {
           ultimaImport:   { $max: '$createdAt' },
           saldoFinal:     { $last: '$saldo' },
           no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
-          identificado:    { $sum: { $cond: [{ $eq:  ['$status', 'identificado'] }, 1, 0] } },
+          identificado:    { $sum: { $cond: [identificadoCond, 1, 0] } },
           otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $eq:  ['$status', 'reclasificado'] }, 1, 0] } },
           saldoPendiente: {
@@ -147,7 +172,7 @@ async function getCards() {
           saldoIdentificado: {
             $sum: {
               $cond: [
-                { $eq: ['$status', 'identificado'] },
+                identificadoCond,
                 { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
                 0,
               ],
@@ -234,8 +259,25 @@ async function getCards() {
   });
 }
 
-async function getStatusStats(year, month) {
+/**
+ * Conteos globales por estado con filtro de año/mes opcional.
+ *
+ * @param {string|number} [year]
+ * @param {string|number} [month]
+ * @param {{ scope: 'own'|'all', userId: string }|null} [restrictions] - null = acceso completo
+ *   (banks:config). Si viene, replica exactamente lo que `applyMovementRestrictions()` hace
+ *   para el listado: 'otros' queda completamente excluido, y el bucket 'identificado' se
+ *   limita a los movimientos identificados por `userId` cuando scope === MOVEMENT_SCOPE.OWN.
+ *   'no_identificado' y 'reclasificado' son pool compartido (nadie los filtra por usuario),
+ *   igual que en la tabla de movimientos.
+ * @param {string|null} [rolActual] - si viene, excluye movimientos ocultos-por-regla para ese rol.
+ * @param {string|null} [banco] - si viene, limita las estadísticas (y los años disponibles) a ese banco.
+ */
+async function getStatusStats(year, month, restrictions = null, rolActual = null, banco = null) {
   const match = { isActive: true, oculto: { $ne: true } };
+  if (rolActual)    match.ocultoRoles = { $ne: rolActual };
+  if (restrictions) match.status      = { $ne: 'otros' };
+  if (banco)        match.banco       = banco;
 
   if (year) {
     const y = parseInt(year, 10);
@@ -247,6 +289,20 @@ async function getStatusStats(year, month) {
     }
   }
 
+  const ownUserId = restrictions?.scope === MOVEMENT_SCOPE.OWN ? restrictions.userId : null;
+  const identificadoCond = {
+    $and: [
+      { $eq: ['$status', 'identificado'] },
+      { $gt: [{ $ifNull: ['$deposito', 0] }, 0] },
+      ...(ownUserId ? [{ $in: [ownUserId, { $ifNull: ['$identificadoPor.userId', []] }] }] : []),
+    ],
+  };
+
+  const yearsMatch = { isActive: true };
+  if (rolActual)    yearsMatch.ocultoRoles = { $ne: rolActual };
+  if (restrictions) yearsMatch.status      = { $ne: 'otros' };
+  if (banco)        yearsMatch.banco       = banco;
+
   const [statsAgg, yearsAgg] = await Promise.all([
     BankMovement.aggregate([
       { $match: match },
@@ -254,18 +310,18 @@ async function getStatusStats(year, month) {
         $group: {
           _id:             null,
           no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
-          identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
+          identificado:    { $sum: { $cond: [identificadoCond, 1, 0] } },
           otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, 1, 0] } },
           dep_no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, { $cond: [{ $ne: ['$saldoErp', null] }, { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] }, { $ifNull: ['$deposito', 0] }] }, 0] } },
-          dep_identificado:    { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'identificado'] },           { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
+          dep_identificado:    { $sum: { $cond: [identificadoCond, { $ifNull: ['$deposito', 0] }, 0] } },
           dep_otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },                  { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
           dep_reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },          { $gt: [{ $ifNull: ['$deposito', 0] }, 0] }] }, { $ifNull: ['$deposito', 0] }, 0] } },
         },
       },
     ]),
     BankMovement.aggregate([
-      { $match: { isActive: true } },
+      { $match: yearsMatch },
       { $group: { _id: { $year: '$fecha' } } },
       { $sort:  { _id: -1 } },
     ]),
@@ -1562,6 +1618,17 @@ async function setErpIds(id, erpLinks, user) {
       serie:        l.serie ? String(l.serie).trim() : null,
       folioExterno: l.folioExterno ? String(l.folioExterno).trim() : null,
       tipoPago:     l.tipoPago ? String(l.tipoPago).trim().toUpperCase() : null,
+      // Bitácora de auditoría por forma de pago — ver BankMovement.model.js. Se acepta
+      // tal cual la manda el frontend (ya viene acumulada: lo que traía + lo nuevo de
+      // este cobro), solo se sanea el tipo de cada entrada.
+      desglosePorFormaPago: Array.isArray(l.desglosePorFormaPago)
+        ? l.desglosePorFormaPago.map(d => ({
+            formaPagoId:          d?.formaPagoId ? String(d.formaPagoId).trim() : null,
+            formaPagoDescripcion: d?.formaPagoDescripcion ? String(d.formaPagoDescripcion).trim() : null,
+            monto:                Number(d?.monto) || 0,
+            fecha:                d?.fecha ? new Date(d.fecha) : new Date(),
+          }))
+        : [],
     }))
     .filter(l => l.erpId);
 

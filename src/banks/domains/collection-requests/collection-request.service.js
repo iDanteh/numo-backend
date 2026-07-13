@@ -16,6 +16,7 @@ const { extractReceiptData, findMatchingMovements } = require('./receipt.service
 const driveComprobantes                  = require('./drive-comprobantes.service');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 const { emitToAll }                      = require('../../shared/socket');
+const { logger }                         = require('../../shared/utils/logger');
 
 // Payload mínimo para 'collection-request:updated' — mismo criterio que
 // bank:movement:updated en bank.service.js: solo lo que la bandeja necesita
@@ -86,8 +87,8 @@ function _comprobantesUnificados(cr) {
   return [];
 }
 
-async function analyzeReceipt(fileBuffer, mimetype) {
-  const extracted  = await extractReceiptData(fileBuffer, mimetype);
+async function analyzeReceipt(fileBuffer, mimetype, label = null) {
+  const extracted  = await extractReceiptData(fileBuffer, mimetype, label);
   const candidates = await findMatchingMovements(extracted);
   return { extracted, candidates, totalCandidatos: candidates.length };
 }
@@ -363,12 +364,22 @@ async function analyzeStoredComprobantes(id) {
   const resultados = [];
   for (let i = 0; i < lista.length; i++) {
     const item = lista[i];
-    const data = item.storage === 'drive'
-      ? await driveComprobantes.descargarComprobante(item.driveFileId)
-      : item.data;
-    const extracted  = await extractReceiptData(data, item.mimetype);
-    const candidates  = await findMatchingMovements(extracted, ownErpIds);
-    resultados.push({ comprobanteIndex: i, extracted, candidates, totalCandidatos: candidates.length });
+    // Cada comprobante se procesa de forma AISLADA: una solicitud puede traer
+    // varios (ej. mitad transferencia + mitad efectivo), y que uno esté
+    // corrupto o protegido con contraseña no debe tumbar la lectura de los
+    // demás, que sí pueden ser perfectamente legibles.
+    try {
+      const data = item.storage === 'drive'
+        ? await driveComprobantes.descargarComprobante(item.driveFileId)
+        : item.data;
+      const label      = item.originalName || `comprobante#${i}`;
+      const extracted  = await extractReceiptData(data, item.mimetype, label);
+      const candidates  = await findMatchingMovements(extracted, ownErpIds);
+      resultados.push({ comprobanteIndex: i, extracted, candidates, totalCandidatos: candidates.length });
+    } catch (err) {
+      logger.warn(`[analyzeStoredComprobantes] Comprobante #${i} no se pudo leer:`, err.message);
+      resultados.push({ comprobanteIndex: i, extracted: {}, candidates: [], totalCandidatos: 0, error: err.message });
+    }
   }
   return resultados;
 }

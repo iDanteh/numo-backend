@@ -152,10 +152,27 @@ async function _enrichAndFilterCfdis(cfdis, tipo, { excluirPagosSustitutos, uuid
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
 
+  // 2B. Pre-fetch tipoDeComprobante de CFDIs relacionados para el discriminador
+  // _relacionadoTipo — mismo criterio EXACTO que usa cfdi-poliza-generator.service.js
+  // (generarPropuesta/generarYGuardar), a propósito: el motor de reglas
+  // (cfdi-mapping.service.js) usa este campo para elegir regla, y si la balanza
+  // no lo inyecta igual que la póliza, puede escoger una cuenta distinta para
+  // el mismo CFDI (ver memoria del bug — balanza y póliza no coincidían).
+  const relTipoUuids = [...new Set(
+    cfdis.flatMap(c => (c.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
+  )];
+  const relTipoCfdisArr = relTipoUuids.length
+    ? await CFDI.find({ uuid: { $in: relTipoUuids } }).select('uuid tipoDeComprobante').lean()
+    : [];
+  const relTipoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.tipoDeComprobante]));
+
   // 3. Aplicar enriquecimiento en memoria
   const cfdisEnriquecidos = cfdis.map(cfdi => {
+    const primerUuidRel = (cfdi.cfdiRelacionados || [])[0]?.uuid;
+    const _relacionadoTipo = (primerUuidRel && relTipoMap[primerUuidRel]) || null;
+
     const erp = erpMetaMap[cfdi.uuid];
-    if (!erp) return cfdi;
+    if (!erp) return _relacionadoTipo ? { ...cfdi, _relacionadoTipo } : cfdi;
     const satHasTraslados     = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
     const satHasBaseTraslados = (cfdi.impuestos?.traslados ?? []).some(t => (t.base ?? 0) > 0);
 
@@ -179,6 +196,7 @@ async function _enrichAndFilterCfdis(cfdis, tipo, { excluirPagosSustitutos, uuid
     const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
     return {
       ...cfdi,
+      ...(_relacionadoTipo ? { _relacionadoTipo } : {}),
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),

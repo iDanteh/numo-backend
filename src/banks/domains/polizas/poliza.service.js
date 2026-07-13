@@ -13,12 +13,18 @@ const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO'];
 
 /**
  * Cruza los CFDIs de la póliza contra sus movimientos bancarios reales
- * (bank_movements.uuidXML) para saber, con el dato real del banco, si el
- * cobro fue transferencia o no — más confiable que el `formaPago` que el
- * CFDI declara, que a veces no coincide con lo que realmente pasó en el banco
- * (ej. CFDI dice "03-Transferencia" pero el banco registró un depósito en
- * efectivo). Solo aplica a Ingresos (bank_movements.uuidXML nunca enlaza a
- * CFDIs tipo Pago), que es justo el caso del subcódigo 21.
+ * (bank_movements.erpLinks.folioFiscal) para saber, con el dato real del
+ * banco, si el cobro fue transferencia o no — más confiable que el
+ * `formaPago` que el CFDI declara, que a veces no coincide con lo que
+ * realmente pasó en el banco (ej. CFDI dice "03-Transferencia" pero el banco
+ * registró un depósito en efectivo).
+ *
+ * Antes cruzaba por `uuidXML` (campo legado, solo 13% de cobertura en
+ * bank_movements). Se cambió a `erpLinks.folioFiscal` — el mismo campo que ya
+ * usan los reportes de Pagos Asociados / Depósitos Ingresos, con ~59% de
+ * cobertura. erpLinks.folioFiscal tiene case inconsistente en los datos
+ * (confirmado al corregir el mismo problema en report.controller.js) — se
+ * busca con regex case-insensitive, no igualdad exacta.
  *
  * También trae la referencia bancaria real (numeroAutorizacion o, si no hay,
  * referenciaNumerica) — usada como "serie" de las líneas de cargo por
@@ -37,17 +43,27 @@ async function construirVerdadBancaria(cfdiUuids) {
   const uuidsUnicos = [...new Set(cfdiUuids.filter(Boolean).map(u => u.toUpperCase()))];
   if (uuidsUnicos.length === 0) return mapa;
 
+  const uuidsSet = new Set(uuidsUnicos);
   const movs = await BankMovement.find(
-    { uuidXML: { $in: uuidsUnicos } },
-    { uuidXML: 1, categoria: 1, numeroAutorizacion: 1, referenciaNumerica: 1 },
+    { 'erpLinks.folioFiscal': { $in: uuidsUnicos.map(u => new RegExp(`^${u}$`, 'i')) } },
+    { erpLinks: 1, categoria: 1, numeroAutorizacion: 1, referenciaNumerica: 1 },
   ).lean();
 
   for (const m of movs) {
     const cat = (m.categoria || '').toUpperCase();
-    mapa.set(m.uuidXML.toUpperCase(), {
-      esTransferencia: CATEGORIAS_TRANSFERENCIA_BANCO.some(c => cat.includes(c)),
-      referencia:      m.numeroAutorizacion || m.referenciaNumerica || null,
-    });
+    const esTransferencia = CATEGORIAS_TRANSFERENCIA_BANCO.some(c => cat.includes(c));
+    const referencia = m.numeroAutorizacion || m.referenciaNumerica || null;
+
+    for (const link of (m.erpLinks ?? [])) {
+      const folioFiscalUpper = (link.folioFiscal || '').toUpperCase();
+      if (!uuidsSet.has(folioFiscalUpper)) continue;
+      // Un mismo CFDI puede tener varios movimientos ligados (varias
+      // parcialidades) — si alguno confirma transferencia, esa gana.
+      const actual = mapa.get(folioFiscalUpper);
+      if (!actual || (!actual.esTransferencia && esTransferencia)) {
+        mapa.set(folioFiscalUpper, { esTransferencia, referencia });
+      }
+    }
   }
   return mapa;
 }

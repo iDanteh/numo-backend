@@ -37,23 +37,40 @@ function ordenarPorFolio(movimientos) {
 function ordenarPorCadenaDeSaldos(movimientos) {
   if (movimientos.length <= 1) return movimientos;
 
-  const saldosActuales = movimientos.map(m => centavos(m.saldoActual));
-  const raices = movimientos.filter(m => !saldosActuales.includes(centavos(m.saldoAnterior)));
-  if (raices.length !== 1) return ordenarPorFolio(movimientos);
+  const encadenarDesde = (raiz) => {
+    const usados   = new Set([raiz]);
+    const ordenado = [raiz];
+    let actual = raiz;
+    while (ordenado.length < movimientos.length) {
+      const buscado    = centavos(actual.saldoActual);
+      const candidatos = movimientos.filter(m => !usados.has(m) && centavos(m.saldoAnterior) === buscado);
+      if (candidatos.length !== 1) return null; // ambiguo o roto
+      actual = candidatos[0];
+      usados.add(actual);
+      ordenado.push(actual);
+    }
+    return ordenado;
+  };
 
-  const usados   = new Set([raices[0]]);
-  const ordenado = [raices[0]];
-  let actual = raices[0];
+  // La raíz real (factura que origina la CxC) tiene saldoAnterior=0 y monto
+  // POSITIVO. Un movimiento que en cambio LIQUIDA la CxC (queda en $0) tiene
+  // saldoActual=0 — mismo valor que la raíz, pero en el extremo opuesto de la
+  // cadena. En una CxC totalmente pagada, esa coincidencia numérica (0 == 0)
+  // hacía que el detector de raíz anterior (basado solo en saldoAnterior vs.
+  // saldosActuales) no reconociera a la factura como única raíz y cayera al
+  // orden por folio, que no siempre es exactamente cronológico (visto en
+  // producción: una Nota de Crédito quedaba entre dos abonos que en realidad
+  // la precedían a ambos). El monto positivo distingue de forma confiable la
+  // factura (raíz) de cualquier movimiento que también cierre en 0.
+  const raicesPorMonto = movimientos.filter(m => centavos(m.saldoAnterior) === 0 && (m.total ?? 0) > 0);
 
-  while (ordenado.length < movimientos.length) {
-    const buscado    = centavos(actual.saldoActual);
-    const candidatos = movimientos.filter(m => !usados.has(m) && centavos(m.saldoAnterior) === buscado);
-    if (candidatos.length !== 1) return ordenarPorFolio(movimientos); // ambiguo o roto — usar folio
-    actual = candidatos[0];
-    usados.add(actual);
-    ordenado.push(actual);
-  }
-  return ordenado;
+  const saldosActuales  = movimientos.map(m => centavos(m.saldoActual));
+  const raicesPorSaldo  = movimientos.filter(m => !saldosActuales.includes(centavos(m.saldoAnterior)));
+
+  const candidatasRaiz = raicesPorMonto.length === 1 ? raicesPorMonto : raicesPorSaldo;
+  if (candidatasRaiz.length !== 1) return ordenarPorFolio(movimientos);
+
+  return encadenarDesde(candidatasRaiz[0]) ?? ordenarPorFolio(movimientos);
 }
 
 /**
@@ -120,6 +137,62 @@ function extraerReferenciaCxc(doc) {
     !TIPO_MARCADORES.includes((d.Serie ?? '').toUpperCase()) && d.Folio,
   );
   return ref ? { serie: ref.Serie ?? null, folio: ref.Folio ?? null } : null;
+}
+
+// Clasifica una Nota de Crédito (Egreso) solo en Bonificación o Devolución
+// (para la columna "Tipo NC" del reporte Pagos Asociados). Bonificación Club
+// Tuberos se pliega dentro de "Bonificación" — el reporte solo distingue esas
+// dos categorías. Cargo a Cliente y NCs sin marcador reconocido se ignoran
+// (no cuentan para esta columna, a diferencia de clasificarEgreso()).
+function clasificarBonificacionODevolucion(doc) {
+  const marcador = (doc.documentosRelacionados ?? []).find(d => TIPO_MARCADORES.includes((d.Serie ?? '').toUpperCase()));
+  const serieRel = (marcador?.Serie ?? '').toUpperCase();
+  if (serieRel === 'BON' || serieRel === 'BCT') return 'Bonificación';
+  if (serieRel === 'DEV') return 'Devolución';
+  return null;
+}
+
+// Busca, en UNA sola consulta, las Notas de Crédito vigentes (Bonificación o
+// Devolución) relacionadas a un lote de facturas — usado en pagosBanco /
+// pagosBancoExport para no hacer N+1 queries (hasta 50,000 filas). Devuelve
+// un Map facturaUuid -> { tipos: Set<string>, monto: number (suma, positiva) }.
+async function buscarNotasCreditoPorFacturasBatch(facturaUuids) {
+  const uuidsUnicos = [...new Set(facturaUuids.filter(Boolean))];
+  if (!uuidsUnicos.length) return new Map();
+
+  const docs = await CFDI.find(
+    { tipoDeComprobante: 'E', isActive: true, satStatus: 'Vigente', 'cfdiRelacionados.uuids': { $in: uuidsUnicos } },
+    'uuid source cfdiRelacionados documentosRelacionados total',
+  ).lean();
+
+  // Preferir la copia ERP si hay duplicado del mismo UUID (mismo criterio que
+  // buscarEgresosRelacionados: la copia ERP trae documentosRelacionados).
+  const porUuid = new Map();
+  for (const doc of docs) {
+    const actual = porUuid.get(doc.uuid);
+    if (!actual || (doc.source === 'ERP' && actual.source !== 'ERP')) porUuid.set(doc.uuid, doc);
+  }
+
+  const uuidsSet = new Set(uuidsUnicos);
+  const porFactura = new Map();
+
+  for (const nc of porUuid.values()) {
+    const tipo = clasificarBonificacionODevolucion(nc);
+    if (!tipo) continue;
+
+    const facturasRelacionadas = (nc.cfdiRelacionados ?? [])
+      .flatMap(r => r.uuids ?? [])
+      .filter(u => uuidsSet.has(u));
+
+    for (const facturaUuid of facturasRelacionadas) {
+      const acc = porFactura.get(facturaUuid) ?? { tipos: new Set(), monto: 0 };
+      acc.tipos.add(tipo);
+      acc.monto += Math.abs(nc.total ?? 0);
+      porFactura.set(facturaUuid, acc);
+    }
+  }
+
+  return porFactura;
 }
 
 // Notas de Crédito (CFDI tipo E) relacionadas a una factura por UUID (relación
@@ -2064,11 +2137,24 @@ const pagosBanco = asyncHandler(async (req, res) => {
     { $unwind: '$complementoPago.pagos' },
     { $unwind: '$complementoPago.pagos.doctosRelacionados' },
     ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
-    // localField/foreignField permite usar el índice multikey directamente
+    // erpLinks.folioFiscal se guarda con case inconsistente (algunos motores de
+    // match lo escriben en minúsculas) — se generan las 3 variantes para que el
+    // $lookup, que sigue usando localField/foreignField (índice multikey), no
+    // pierda el match por diferencia de mayúsculas/minúsculas.
+    {
+      $addFields: {
+        _idDocVariants: {
+          $let: {
+            vars: { d: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+            in: ['$$d', { $toUpper: '$$d' }, { $toLower: '$$d' }],
+          },
+        },
+      },
+    },
     {
       $lookup: {
         from:         'bank_movements',
-        localField:   'complementoPago.pagos.doctosRelacionados.idDocumento',
+        localField:   '_idDocVariants',
         foreignField: 'erpLinks.folioFiscal',
         as:           'movimientos',
       },
@@ -2136,6 +2222,80 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   in: '$$link.saldoActual',
                 },
               },
+              // Serie/Folio de la factura origen — fallback cuando el CFDI de pago no
+              // trae su propio doctoRelacionado con esos campos (mismo dato ya
+              // capturado en el erpLink de este movimiento al vincularlo).
+              serieOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $ifNull: [{
+                        $arrayElemAt: [{
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: {
+                              $eq: [
+                                { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                              ],
+                            },
+                          },
+                        }, 0],
+                      }, null],
+                    },
+                  },
+                  in: '$$link.serie',
+                },
+              },
+              folioOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $ifNull: [{
+                        $arrayElemAt: [{
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: {
+                              $eq: [
+                                { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                              ],
+                            },
+                          },
+                        }, 0],
+                      }, null],
+                    },
+                  },
+                  in: '$$link.folioExterno',
+                },
+              },
+              // erpId de la CxC vinculada — se usa después para cruzar con el
+              // kardex de erp_cuentas_pendientes (Parcialidad / Saldo Anterior).
+              erpIdOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $ifNull: [{
+                        $arrayElemAt: [{
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: {
+                              $eq: [
+                                { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                              ],
+                            },
+                          },
+                        }, 0],
+                      }, null],
+                    },
+                  },
+                  in: '$$link.erpId',
+                },
+              },
               // Usuario que identificó/vinculó ESTA CxC específica al movimiento
               // (identificadoPor.erpId se cruza contra el erpId del erpLink que
               // corresponde a este idDocumento — un mismo movimiento puede tener
@@ -2161,24 +2321,209 @@ const pagosBanco = asyncHandler(async (req, res) => {
                             }, 0],
                           },
                         },
-                        in: '$$link.erpId',
+                        // Mismo cuidado que en idEntry: forzar a null real, no "missing".
+                        in: { $ifNull: ['$$link.erpId', null] },
                       },
                     },
                   },
                   in: {
                     $let: {
                       vars: {
+                        // $arrayElemAt sobre un arreglo vacío regresa "missing" (no null) —
+                        // usar ese valor directo como variable de $let envenena toda la
+                        // expresión contenedora (el campo entero desaparece). Se envuelve
+                        // en $ifNull para forzarlo a null real.
                         idEntry: {
-                          $arrayElemAt: [{
-                            $filter: {
-                              input: { $ifNull: ['$$m.identificadoPor', []] },
-                              as: 'ip',
-                              cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                          $ifNull: [{
+                            $arrayElemAt: [{
+                              $filter: {
+                                input: { $ifNull: ['$$m.identificadoPor', []] },
+                                as: 'ip',
+                                cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                              },
+                            }, 0],
+                          }, null],
+                        },
+                        // Fallback: varios motores de match (pagos-cyc, mostrador-cyc,
+                        // refacturaciones-cyc) guardan una sola entrada resumen para todo
+                        // el movimiento sin erpId por CxC. Si no hay coincidencia exacta,
+                        // se listan los nombres disponibles — igual que ya hace Bancos
+                        // (identificadoPorLabel en banks.component.ts).
+                        todosNombres: {
+                          $reduce: {
+                            input: { $ifNull: ['$$m.identificadoPor', []] },
+                            initialValue: [],
+                            in: {
+                              $let: {
+                                vars: { n: { $ifNull: ['$$this.nombre', '$$this.userId'] } },
+                                in: {
+                                  $cond: [
+                                    { $or: [{ $eq: ['$$n', null] }, { $in: ['$$n', '$$value'] }] },
+                                    '$$value',
+                                    { $concatArrays: ['$$value', ['$$n']] },
+                                  ],
+                                },
+                              },
                             },
-                          }, 0],
+                          },
                         },
                       },
-                      in: '$$idEntry.nombre',
+                      in: {
+                        $cond: [
+                          { $ne: ['$$idEntry', null] },
+                          '$$idEntry.nombre',
+                          {
+                            $cond: [
+                              { $gt: [{ $size: '$$todosNombres' }, 0] },
+                              {
+                                $reduce: {
+                                  input: '$$todosNombres',
+                                  initialValue: '',
+                                  in: { $cond: [{ $eq: ['$$value', ''] }, '$$this', { $concat: ['$$value', ', ', '$$this'] }] },
+                                },
+                              },
+                              null,
+                            ],
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    // Cuando la factura tiene varios movimientos bancarios vinculados (ej.
+    // varias parcialidades pagadas por depósitos distintos), el índice 0 de
+    // `movimientos` podía quedar en cualquiera de ellos — no necesariamente
+    // el que corresponde a ESTE complemento de pago. Se reordena por
+    // cercanía de monto al impPagado de este pago, así los $arrayElemAt(
+    // movimientos.X, 0) de más abajo (Banco, Depósito, Diferencia, etc.)
+    // toman el movimiento correcto en vez del primero que haya quedado ahí.
+    {
+      $addFields: {
+        movimientos: {
+          $sortArray: {
+            input: {
+              $map: {
+                input: '$movimientos',
+                as: 'mv',
+                in: {
+                  $mergeObjects: ['$$mv', {
+                    _diffAbs: {
+                      $abs: {
+                        $subtract: [
+                          { $ifNull: ['$$mv.deposito', 0] },
+                          { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impPagado', 0] },
+                        ],
+                      },
+                    },
+                  }],
+                },
+              },
+            },
+            sortBy: { _diffAbs: 1 },
+          },
+        },
+      },
+    },
+    // Cruce con el kardex de CxC del ERP (erp_cuentas_pendientes) para recuperar
+    // Parcialidad y Saldo Anterior — datos que no vienen ni en el CFDI ni en el
+    // erpLink del movimiento bancario, solo en el historial de abonos de la CxC.
+    {
+      $lookup: {
+        from:         'erp_cuentas_pendientes',
+        localField:   'movimientos.erpIdOrigen',
+        foreignField: 'erpId',
+        as:           'cuentasPendientes',
+      },
+    },
+    {
+      $addFields: {
+        parcialidadInfo: {
+          $let: {
+            vars: {
+              erpIdActual: { $ifNull: [{ $arrayElemAt: ['$movimientos.erpIdOrigen', 0] }, null] },
+            },
+            in: {
+              $let: {
+                vars: {
+                  cxc: {
+                    $ifNull: [{
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$cuentasPendientes', []] },
+                          as: 'c',
+                          cond: { $eq: ['$$c.erpId', '$$erpIdActual'] },
+                        },
+                      }, 0],
+                    }, null],
+                  },
+                },
+                in: {
+                  $let: {
+                    vars: {
+                      // Abono de esa CxC (trae formasPago) cuyo monto coincide con este
+                      // pago (±$1 de tolerancia por redondeo).
+                      abonoCoincidente: {
+                        $ifNull: [{
+                          $arrayElemAt: [{
+                            $filter: {
+                              input: { $ifNull: ['$$cxc.movimientos', []] },
+                              as: 'mv',
+                              cond: {
+                                $and: [
+                                  { $gt: [{ $size: { $ifNull: ['$$mv.formasPago', []] } }, 0] },
+                                  {
+                                    $lte: [
+                                      { $abs: { $subtract: [
+                                        { $sum: { $map: { input: { $ifNull: ['$$mv.formasPago', []] }, as: 'fp', in: { $ifNull: ['$$fp.monto', 0] } } } },
+                                        { $ifNull: ['$complementoPago.pagos.monto', 0] },
+                                      ] } },
+                                      1,
+                                    ],
+                                  },
+                                ],
+                              },
+                            },
+                          }, 0],
+                        }, null],
+                      },
+                      // Todos los abonos de esa CxC (para calcular la posición = parcialidad)
+                      todosAbonos: {
+                        $filter: {
+                          input: { $ifNull: ['$$cxc.movimientos', []] },
+                          as: 'mv',
+                          cond: { $gt: [{ $size: { $ifNull: ['$$mv.formasPago', []] } }, 0] },
+                        },
+                      },
+                    },
+                    in: {
+                      $cond: [
+                        { $ne: ['$$abonoCoincidente', null] },
+                        {
+                          saldoAnterior: '$$abonoCoincidente.saldoAnterior',
+                          saldoActual: '$$abonoCoincidente.saldoActual',
+                          numParcialidad: {
+                            $add: [
+                              1,
+                              {
+                                $size: {
+                                  $filter: {
+                                    input: '$$todosAbonos',
+                                    as: 'a',
+                                    cond: { $lt: ['$$a.fecha', '$$abonoCoincidente.fecha'] },
+                                  },
+                                },
+                              },
+                            ],
+                          },
+                        },
+                        null,
+                      ],
                     },
                   },
                 },
@@ -2206,12 +2551,26 @@ const pagosBanco = asyncHandler(async (req, res) => {
               fechaPago:       '$complementoPago.pagos.fechaPago',
               montoPago:       '$complementoPago.pagos.monto',
               facturaUuid:     '$complementoPago.pagos.doctosRelacionados.idDocumento',
-              serie:           '$complementoPago.pagos.doctosRelacionados.serie',
-              folio:           '$complementoPago.pagos.doctosRelacionados.folio',
-              numParcialidad:  '$complementoPago.pagos.doctosRelacionados.numParcialidad',
+              // Serie/Folio: si el CFDI no los trae, usar los del erpLink del movimiento
+              // vinculado (mismo dato, capturado al momento de identificar el pago).
+              serie:           { $ifNull: ['$complementoPago.pagos.doctosRelacionados.serie', { $ifNull: [{ $arrayElemAt: ['$movimientos.serieOrigen', 0] }, null] }] },
+              folio:           { $ifNull: ['$complementoPago.pagos.doctosRelacionados.folio', { $ifNull: [{ $arrayElemAt: ['$movimientos.folioOrigen', 0] }, null] }] },
+              // Parcialidad/Saldo Anterior: si el CFDI no los trae, usar el kardex
+              // de erp_cuentas_pendientes (parcialidadInfo, calculado arriba).
+              numParcialidad:  { $ifNull: ['$complementoPago.pagos.doctosRelacionados.numParcialidad', '$parcialidadInfo.numParcialidad'] },
               impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
-              impSaldoAnt: '$complementoPago.pagos.doctosRelacionados.impSaldoAnt',
-              impSaldoInsoluto: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+              impSaldoAnt: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impSaldoAnt', '$parcialidadInfo.saldoAnterior'] },
+              // Saldo Insoluto: si el CFDI no lo trae, usar el saldoActual de la CxC
+              // en el erpLink del movimiento (mismo concepto: saldo pendiente actual).
+              // Prioridad: CFDI propio > saldoActual del abono exacto en el kardex ERP
+              // (más preciso, refleja el efecto de ESTE pago) > snapshot del erpLink
+              // del movimiento bancario (puede quedar desactualizado).
+              impSaldoInsoluto: {
+                $ifNull: [
+                  '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+                  { $ifNull: ['$parcialidadInfo.saldoActual', { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, null] }] },
+                ],
+              },
               tienePago:       { $gt: [{ $size: '$movimientos' }, 0] },
               banco:           { $arrayElemAt: ['$movimientos.banco',        0] },
               movFecha:        { $arrayElemAt: ['$movimientos.fecha',        0] },
@@ -2256,7 +2615,17 @@ const pagosBanco = asyncHandler(async (req, res) => {
     resumen[key] = { cantidad: t.cantidad, monto: Math.round(t.sumaImpPagado * 100) / 100 };
   }
 
-  res.json({ data: result.data, total, page: pg, limit: lm, pages: Math.ceil(total / lm), resumen });
+  const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(result.data.map(r => r.facturaUuid));
+  const data = result.data.map(r => {
+    const nc = notasPorFactura.get(r.facturaUuid);
+    return {
+      ...r,
+      tipoNC:  nc ? [...nc.tipos].sort().join(', ') : null,
+      montoNC: nc ? Math.round(nc.monto * 100) / 100 : null,
+    };
+  });
+
+  res.json({ data, total, page: pg, limit: lm, pages: Math.ceil(total / lm), resumen });
 });
 
 /**
@@ -2318,7 +2687,19 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { $unwind: '$complementoPago.pagos' },
     { $unwind: '$complementoPago.pagos.doctosRelacionados' },
     ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
-    { $lookup: { from: 'bank_movements', localField: 'complementoPago.pagos.doctosRelacionados.idDocumento', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
+    // Ver comentario equivalente en pagosBanco: erpLinks.folioFiscal tiene case
+    // inconsistente en los datos, se generan variantes para no perder el match.
+    {
+      $addFields: {
+        _idDocVariants: {
+          $let: {
+            vars: { d: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+            in: ['$$d', { $toUpper: '$$d' }, { $toLower: '$$d' }],
+          },
+        },
+      },
+    },
+    { $lookup: { from: 'bank_movements', localField: '_idDocVariants', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
     {
       $addFields: {
         movimientos: {
@@ -2379,6 +2760,79 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                   in: '$$link.saldoActual',
                 },
               },
+              serieOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $ifNull: [{
+                        $arrayElemAt: [{
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: {
+                              $eq: [
+                                { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                              ],
+                            },
+                          },
+                        }, 0],
+                      }, null],
+                    },
+                  },
+                  in: '$$link.serie',
+                },
+              },
+              folioOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $ifNull: [{
+                        $arrayElemAt: [{
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: {
+                              $eq: [
+                                { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                              ],
+                            },
+                          },
+                        }, 0],
+                      }, null],
+                    },
+                  },
+                  in: '$$link.folioExterno',
+                },
+              },
+              // erpId de la CxC vinculada — se usa después para cruzar con el
+              // kardex de erp_cuentas_pendientes (Parcialidad / Saldo Anterior).
+              // (faltaba en este pipeline — sí estaba en pagosBanco — por eso el
+              // export nunca rellenaba Parcialidad/Saldo Anterior vía fallback ERP).
+              erpIdOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $ifNull: [{
+                        $arrayElemAt: [{
+                          $filter: {
+                            input: { $ifNull: ['$$m.erpLinks', []] },
+                            as: 'l',
+                            cond: {
+                              $eq: [
+                                { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                                { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                              ],
+                            },
+                          },
+                        }, 0],
+                      }, null],
+                    },
+                  },
+                  in: '$$link.erpId',
+                },
+              },
               identificadoPorNombre: {
                 $let: {
                   vars: {
@@ -2400,24 +2854,206 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                             }, 0],
                           },
                         },
-                        in: '$$link.erpId',
+                        // Mismo cuidado que en idEntry: forzar a null real, no "missing".
+                        in: { $ifNull: ['$$link.erpId', null] },
                       },
                     },
                   },
                   in: {
                     $let: {
                       vars: {
+                        // $arrayElemAt sobre un arreglo vacío regresa "missing" (no null) —
+                        // usar ese valor directo como variable de $let envenena toda la
+                        // expresión contenedora (el campo entero desaparece). Se envuelve
+                        // en $ifNull para forzarlo a null real.
                         idEntry: {
-                          $arrayElemAt: [{
-                            $filter: {
-                              input: { $ifNull: ['$$m.identificadoPor', []] },
-                              as: 'ip',
-                              cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                          $ifNull: [{
+                            $arrayElemAt: [{
+                              $filter: {
+                                input: { $ifNull: ['$$m.identificadoPor', []] },
+                                as: 'ip',
+                                cond: { $eq: ['$$ip.erpId', '$$erpIdLink'] },
+                              },
+                            }, 0],
+                          }, null],
+                        },
+                        // Fallback: varios motores de match (pagos-cyc, mostrador-cyc,
+                        // refacturaciones-cyc) guardan una sola entrada resumen para todo
+                        // el movimiento sin erpId por CxC. Si no hay coincidencia exacta,
+                        // se listan los nombres disponibles — igual que ya hace Bancos
+                        // (identificadoPorLabel en banks.component.ts).
+                        todosNombres: {
+                          $reduce: {
+                            input: { $ifNull: ['$$m.identificadoPor', []] },
+                            initialValue: [],
+                            in: {
+                              $let: {
+                                vars: { n: { $ifNull: ['$$this.nombre', '$$this.userId'] } },
+                                in: {
+                                  $cond: [
+                                    { $or: [{ $eq: ['$$n', null] }, { $in: ['$$n', '$$value'] }] },
+                                    '$$value',
+                                    { $concatArrays: ['$$value', ['$$n']] },
+                                  ],
+                                },
+                              },
                             },
-                          }, 0],
+                          },
                         },
                       },
-                      in: '$$idEntry.nombre',
+                      in: {
+                        $cond: [
+                          { $ne: ['$$idEntry', null] },
+                          '$$idEntry.nombre',
+                          {
+                            $cond: [
+                              { $gt: [{ $size: '$$todosNombres' }, 0] },
+                              {
+                                $reduce: {
+                                  input: '$$todosNombres',
+                                  initialValue: '',
+                                  in: { $cond: [{ $eq: ['$$value', ''] }, '$$this', { $concat: ['$$value', ', ', '$$this'] }] },
+                                },
+                              },
+                              null,
+                            ],
+                          },
+                        ],
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    // Cuando la factura tiene varios movimientos bancarios vinculados (ej.
+    // varias parcialidades pagadas por depósitos distintos), el índice 0 de
+    // `movimientos` podía quedar en cualquiera de ellos — no necesariamente
+    // el que corresponde a ESTE complemento de pago. Se reordena por
+    // cercanía de monto al impPagado de este pago, así los $arrayElemAt(
+    // movimientos.X, 0) de más abajo (Banco, Depósito, Diferencia, etc.)
+    // toman el movimiento correcto en vez del primero que haya quedado ahí.
+    {
+      $addFields: {
+        movimientos: {
+          $sortArray: {
+            input: {
+              $map: {
+                input: '$movimientos',
+                as: 'mv',
+                in: {
+                  $mergeObjects: ['$$mv', {
+                    _diffAbs: {
+                      $abs: {
+                        $subtract: [
+                          { $ifNull: ['$$mv.deposito', 0] },
+                          { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impPagado', 0] },
+                        ],
+                      },
+                    },
+                  }],
+                },
+              },
+            },
+            sortBy: { _diffAbs: 1 },
+          },
+        },
+      },
+    },
+    // Cruce con el kardex de CxC del ERP (erp_cuentas_pendientes) para recuperar
+    // Parcialidad y Saldo Anterior — datos que no vienen ni en el CFDI ni en el
+    // erpLink del movimiento bancario, solo en el historial de abonos de la CxC.
+    {
+      $lookup: {
+        from:         'erp_cuentas_pendientes',
+        localField:   'movimientos.erpIdOrigen',
+        foreignField: 'erpId',
+        as:           'cuentasPendientes',
+      },
+    },
+    {
+      $addFields: {
+        parcialidadInfo: {
+          $let: {
+            vars: {
+              erpIdActual: { $ifNull: [{ $arrayElemAt: ['$movimientos.erpIdOrigen', 0] }, null] },
+            },
+            in: {
+              $let: {
+                vars: {
+                  cxc: {
+                    $ifNull: [{
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$cuentasPendientes', []] },
+                          as: 'c',
+                          cond: { $eq: ['$$c.erpId', '$$erpIdActual'] },
+                        },
+                      }, 0],
+                    }, null],
+                  },
+                },
+                in: {
+                  $let: {
+                    vars: {
+                      abonoCoincidente: {
+                        $ifNull: [{
+                          $arrayElemAt: [{
+                            $filter: {
+                              input: { $ifNull: ['$$cxc.movimientos', []] },
+                              as: 'mv',
+                              cond: {
+                                $and: [
+                                  { $gt: [{ $size: { $ifNull: ['$$mv.formasPago', []] } }, 0] },
+                                  {
+                                    $lte: [
+                                      { $abs: { $subtract: [
+                                        { $sum: { $map: { input: { $ifNull: ['$$mv.formasPago', []] }, as: 'fp', in: { $ifNull: ['$$fp.monto', 0] } } } },
+                                        { $ifNull: ['$complementoPago.pagos.monto', 0] },
+                                      ] } },
+                                      1,
+                                    ],
+                                  },
+                                ],
+                              },
+                            },
+                          }, 0],
+                        }, null],
+                      },
+                      todosAbonos: {
+                        $filter: {
+                          input: { $ifNull: ['$$cxc.movimientos', []] },
+                          as: 'mv',
+                          cond: { $gt: [{ $size: { $ifNull: ['$$mv.formasPago', []] } }, 0] },
+                        },
+                      },
+                    },
+                    in: {
+                      $cond: [
+                        { $ne: ['$$abonoCoincidente', null] },
+                        {
+                          saldoAnterior: '$$abonoCoincidente.saldoAnterior',
+                          saldoActual: '$$abonoCoincidente.saldoActual',
+                          numParcialidad: {
+                            $add: [
+                              1,
+                              {
+                                $size: {
+                                  $filter: {
+                                    input: '$$todosAbonos',
+                                    as: 'a',
+                                    cond: { $lt: ['$$a.fecha', '$$abonoCoincidente.fecha'] },
+                                  },
+                                },
+                              },
+                            ],
+                          },
+                        },
+                        null,
+                      ],
                     },
                   },
                 },
@@ -2437,12 +3073,17 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       satStatus:        '$satStatus',
       fechaPago:        '$complementoPago.pagos.fechaPago',
       facturaUuid:      '$complementoPago.pagos.doctosRelacionados.idDocumento',
-      serie:            '$complementoPago.pagos.doctosRelacionados.serie',
-      folio:            '$complementoPago.pagos.doctosRelacionados.folio',
-      numParcialidad:   '$complementoPago.pagos.doctosRelacionados.numParcialidad',
+      serie:            { $ifNull: ['$complementoPago.pagos.doctosRelacionados.serie', { $ifNull: [{ $arrayElemAt: ['$movimientos.serieOrigen', 0] }, null] }] },
+      folio:            { $ifNull: ['$complementoPago.pagos.doctosRelacionados.folio', { $ifNull: [{ $arrayElemAt: ['$movimientos.folioOrigen', 0] }, null] }] },
+      numParcialidad:   { $ifNull: ['$complementoPago.pagos.doctosRelacionados.numParcialidad', '$parcialidadInfo.numParcialidad'] },
       impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
-      impSaldoAnt: '$complementoPago.pagos.doctosRelacionados.impSaldoAnt',
-      impSaldoInsoluto: '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+      impSaldoAnt: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impSaldoAnt', '$parcialidadInfo.saldoAnterior'] },
+      impSaldoInsoluto: {
+        $ifNull: [
+          '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
+          { $ifNull: ['$parcialidadInfo.saldoActual', { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, null] }] },
+        ],
+      },
       tienePago:        { $gt: [{ $size: '$movimientos' }, 0] },
       banco:            { $arrayElemAt: ['$movimientos.banco',        0] },
       movFecha:         { $arrayElemAt: ['$movimientos.fecha',        0] },
@@ -2456,6 +3097,13 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
   ];
 
   const rows = await CFDI.aggregate(pipeline).allowDiskUse(true);
+
+  const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(rows.map(r => r.facturaUuid));
+  for (const r of rows) {
+    const nc = notasPorFactura.get(r.facturaUuid);
+    r.tipoNC  = nc ? [...nc.tipos].sort().join(', ') : null;
+    r.montoNC = nc ? Math.round(nc.monto * 100) / 100 : null;
+  }
 
   const workbook  = new ExcelJS.Workbook();
   const sheet     = workbook.addWorksheet('Pagos Asociados');
@@ -2471,6 +3119,8 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { header: 'Imp. Pagado',        key: 'impPagado',         width: 16 },
     { header: 'Saldo Anterior',     key: 'impSaldoAnt',  width: 16 },
     { header: 'Saldo Insoluto',     key: 'impSaldoInsoluto',  width: 16 },
+    { header: 'Tipo NC',            key: 'tipoNC',            width: 20 },
+    { header: 'Monto NC',           key: 'montoNC',           width: 16 },
     { header: 'Tiene Pago',         key: 'tienePago',         width: 12 },
     { header: 'Banco',              key: 'banco',             width: 20 },
     { header: 'Fecha Movimiento',   key: 'movFecha',          width: 16 },
@@ -2506,6 +3156,8 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       impPagado:        r.impPagado,
       impSaldoAnt: r.impSaldoAnt ?? null,
       impSaldoInsoluto: r.impSaldoInsoluto,
+      tipoNC:           r.tipoNC || '—',
+      montoNC:          r.montoNC ?? null,
       tienePago:        r.tienePago ? 'Sí' : 'No',
       banco:            r.banco || '—',
       movFecha:         r.movFecha ? new Date(r.movFecha) : null,
@@ -2514,12 +3166,14 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       numOperacion:     r.numOperacion || '—',
       diferencia:       r.diferencia,
       saldoMovimiento:  r.saldoMovimiento ?? null,
+      identificadoPor:  r.identificadoPor || '—',
     });
 
     // Formato moneda y fecha
     row.getCell('impPagado').numFmt        = mxn.numFmt;
     row.getCell('impSaldoAnt').numFmt = mxn.numFmt;
     row.getCell('impSaldoInsoluto').numFmt = mxn.numFmt;
+    row.getCell('montoNC').numFmt          = mxn.numFmt;
     row.getCell('deposito').numFmt         = mxn.numFmt;
     row.getCell('diferencia').numFmt       = mxn.numFmt;
     row.getCell('saldoMovimiento').numFmt  = mxn.numFmt;
@@ -2784,7 +3438,10 @@ const depositosIngresos = asyncHandler(async (req, res) => {
 
   const pipeline = [
     { $match: baseMatch },
-    { $lookup: { from: 'bank_movements', localField: 'uuid', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
+    // erpLinks.folioFiscal tiene case inconsistente en los datos (ver mismo
+    // comentario en pagosBanco); se generan variantes para no perder el match.
+    { $addFields: { _uuidVariants: ['$uuid', { $toUpper: '$uuid' }, { $toLower: '$uuid' }] } },
+    { $lookup: { from: 'bank_movements', localField: '_uuidVariants', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
     {
       $addFields: {
         tipoVenta: { $cond: [{ $eq: ['$metodoPago', 'PPD'] }, 'Credito', 'Contado'] },
@@ -2988,7 +3645,10 @@ const depositosIngresosExport = asyncHandler(async (req, res) => {
 
   const pipeline = [
     { $match: baseMatch },
-    { $lookup: { from: 'bank_movements', localField: 'uuid', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
+    // erpLinks.folioFiscal tiene case inconsistente en los datos (ver mismo
+    // comentario en pagosBanco); se generan variantes para no perder el match.
+    { $addFields: { _uuidVariants: ['$uuid', { $toUpper: '$uuid' }, { $toLower: '$uuid' }] } },
+    { $lookup: { from: 'bank_movements', localField: '_uuidVariants', foreignField: 'erpLinks.folioFiscal', as: 'movimientos' } },
     {
       $addFields: {
         tipoVenta: { $cond: [{ $eq: ['$metodoPago', 'PPD'] }, 'Credito', 'Contado'] },

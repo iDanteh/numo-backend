@@ -109,20 +109,20 @@ const parseDate = (v) => {
  * @param {object} factura — objeto aplanado de la factura ERP
  * @returns {object|undefined}
  */
-const extraerComplementoPago = (factura) => {
+const extraerComplementoPago = (factura, relacionesFallbackUuids = []) => {
   // ── Ruta 1: ComplementoPago.Pagos ─────────────────────────────────────────
   const cpNode = factura?.ComplementoPago ?? factura?.Complemento?.Pagos20 ?? null;
   if (cpNode) {
     const pagosRaw = cpNode.Pagos ?? cpNode.Pago ?? [];
     const pagosList = Array.isArray(pagosRaw) ? pagosRaw : [pagosRaw];
     if (pagosList.length) {
-      return normalizarPagosERP(pagosList, cpNode.Version);
+      return normalizarPagosERP(pagosList, cpNode.Version, relacionesFallbackUuids);
     }
   }
 
   // ── Ruta 2: factura.Pagos[] ───────────────────────────────────────────────
   if (Array.isArray(factura?.Pagos) && factura.Pagos.length) {
-    return normalizarPagosERP(factura.Pagos, null);
+    return normalizarPagosERP(factura.Pagos, null, relacionesFallbackUuids);
   }
 
   // ── Ruta 3: campos planos mínimos (FechaPago / MontoPago / Importe) ──────
@@ -144,13 +144,20 @@ const extraerComplementoPago = (factura) => {
 
 /**
  * Normaliza un array de objetos de pago del ERP al sub-schema interno.
+ *
+ * @param {object[]} pagosList
+ * @param {string} version
+ * @param {string[]} relacionesFallbackUuids — UUIDs de `factura.Relaciones` (cabecera).
+ *   Solo se usan para enriquecer un pago cuando este NO trae su propio
+ *   DoctoRelacionado Y el caso es inequívoco (1 solo pago, 1 sola relación) —
+ *   nunca sobreescribe datos que el ERP ya haya mandado a nivel de pago.
  */
-const normalizarPagosERP = (pagosList, version) => {
+const normalizarPagosERP = (pagosList, version, relacionesFallbackUuids = []) => {
   const pagos = pagosList.map((p) => {
     const drRaw = p.DoctoRelacionado ?? p.DocumentosRelacionados ?? p.Documentos ?? [];
     const drList = Array.isArray(drRaw) ? drRaw : [drRaw];
 
-    const doctosRelacionados = drList.filter(Boolean).map((dr) => ({
+    let doctosRelacionados = drList.filter(Boolean).map((dr) => ({
       idDocumento:      (dr.IdDocumento ?? dr.UUID ?? '').toString().toUpperCase() || undefined,
       serie:            dr.Serie            || undefined,
       folio:            dr.Folio            || undefined,
@@ -162,6 +169,17 @@ const normalizarPagosERP = (pagosList, version) => {
       impPagado:        parseNum(dr.ImpPagado)         ?? undefined,
       impSaldoInsoluto: parseNum(dr.ImpSaldoInsoluto)  ?? undefined,
     }));
+
+    // Enriquecimiento: el ERP no siempre manda el DoctoRelacionado dentro del
+    // pago — a veces solo lo manda como relación de cabecera (factura.Relaciones).
+    // Si el pago quedó sin doctosRelacionados y el caso es inequívoco
+    // (1 solo pago en la factura, 1 sola relación de cabecera), se usa esa
+    // relación como el documento pagado. impPagado = monto del pago completo,
+    // ya que con 1 sola relación no hay reparto entre varios documentos.
+    if (doctosRelacionados.length === 0 && pagosList.length === 1 && relacionesFallbackUuids.length === 1) {
+      const montoPago = parseNum(p.Monto ?? p.MontoPago) ?? 0;
+      doctosRelacionados = [{ idDocumento: relacionesFallbackUuids[0], impPagado: montoPago }];
+    }
 
     return {
       fechaPago:    parseDate(p.FechaPago)   ?? undefined,
@@ -575,7 +593,8 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
     }));
   }
   if (Object.keys(timbre).length) doc.timbreFiscalDigital = timbre;
-  const complementoPago = extraerComplementoPago(factura);
+  const relacionesFallbackUuids = cfdiRelacionados.flatMap(r => r.uuids);
+  const complementoPago = extraerComplementoPago(factura, relacionesFallbackUuids);
   if (complementoPago) doc.complementoPago = complementoPago;
   // Versión CFDI: desde el TFD si está disponible
   if (tfd?.Version && ['3.3', '4.0'].includes(tfd.Version)) doc.version = tfd.Version;

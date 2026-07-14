@@ -541,22 +541,32 @@ function categorizarAjusteContado(m) {
  *   uuid CFDI → info bancaria real (ver `construirVerdadBancaria`). Cuando el
  *   CFDI está en el mapa, su dato manda sobre el `formaPago` autodeclarado.
  *
- * Transferencia (formaPago SAT declarado = 03) NO se consolida: cada CFDI
- * queda como línea individual, con la referencia bancaria real
- * (numeroAutorizacion/referenciaNumerica) como serie cuando está disponible —
- * cada transferencia es un depósito bancario propio, rastreable por
- * separado. Tarjeta se comporta igual, pero SOLO cuando tiene un depósito
- * ligado en Bancos (`verdadBancaria`) — sin ligar, sigue consolidándose.
- * Efectivo siempre se consolida. Efectivo y Tarjeta consolidados van cada
- * uno en su PROPIA línea/cuenta (ya no juntos en un solo "Depósitos
- * consolidados") — confirmado con el usuario contra un export real de
- * ContPaQi.
+ * Efectivo, Tarjeta y Transferencia se consolidan CADA UNO en su propia
+ * línea/cuenta ("Depósitos consolidados (Efectivo/Tarjeta/Transferencia)")
+ * — pero SOLO cuando NO tienen un depósito bancario real identificado.
+ *
+ * En cuanto un movimiento (sea Efectivo, Tarjeta, Transferencia o cualquier
+ * otra forma de pago) SÍ tiene un número de autorización/referencia real
+ * ligado en Bancos (`verdadBancaria`), se SACA del consolidado y se muestra
+ * como línea individual con esa referencia como serie — confirmado con el
+ * usuario con un ejemplo concreto: 3 CFDIs de Tarjeta por $1,000, dos sin
+ * match bancario y uno con match, deben verse como "Tarjeta" consolidada
+ * ($2,000) + 1 línea individual ($1,000) con su número de autorización, no
+ * los 3 juntos. Esta línea individual ("Depósito identificado") se devuelve
+ * aparte para que el caller la coloque al final del export.
+ *
+ * @returns {{
+ *   porCategoria: { devolucion: object[], descuento: object[], bonificacion: object[], clubTuberos: object[] },
+ *   anticipos: object[], consolidados: object[], depositosIdentificados: object[],
+ * }} — cada arreglo ya viene ordenado por serie/folio (salvo `consolidados`,
+ *   ordenado Efectivo → Tarjeta → Transferencia). El caller decide en qué
+ *   secuencia los concatena (ver `aplanarCargosConsolidados` y `armarBloqueContado`).
  */
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null) {
   const grupos = new Map();
   const porCategoria = { devolucion: [], descuento: [], bonificacion: [], clubTuberos: [] };
-  const anticipos      = [];  // Recepción Y Aplicación — después de las 4 categorías, antes del resto
-  const transferencias = [];  // formaPago=03 (siempre) y Tarjeta con depósito ligado — desglosado
+  const anticipos = [];              // Recepción Y Aplicación
+  const depositosIdentificados = []; // forma de pago sin mapear + depósito real ligado en Bancos — va al final
 
   for (const m of movs) {
     if (!(Number(m.debe) > 0)) continue;
@@ -596,47 +606,31 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       continue;
     }
 
-    // Transferencia confirmada (20 o 21, según el bloque) SIEMPRE se desglosa
-    // individual, con o sin número de autorización real del banco — a
-    // diferencia de Efectivo, que siempre se consolida. Sin referencia
-    // bancaria, se usa la serie/folio propio del CFDI (armarIndividual cae a
-    // `m.serie` cuando no se pasa `serieOverride`). Confirmado con el usuario.
-    if (esTransferenciaVerificada) {
-      transferencias.push(armarIndividual(
-        'Transferencia',
-        subcodigoTransferencia,
+    // Depósito real identificado en Bancos (número de autorización/referencia
+    // real ligado) — SIEMPRE se saca del consolidado, sin importar la forma
+    // de pago declarada (Efectivo, Tarjeta, Transferencia, cheque, etc.):
+    // confirmado con el usuario, ver docstring. La etiqueta conserva la forma
+    // de pago real cuando se conoce, para que la línea individual siga siendo
+    // legible aunque ya no vaya agrupada.
+    if (bancario?.referencia) {
+      const etiquetaIdentificado = esTransferenciaVerificada ? 'Transferencia'
+        : LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'Tarjeta'
+        : 'Depósito identificado';
+      depositosIdentificados.push(armarIndividual(
+        etiquetaIdentificado,
+        esTransferenciaVerificada ? subcodigoTransferencia : 0,
         null,
-        bancario?.referencia,
+        bancario.referencia,
       ));
       continue;
     }
 
-    // Tarjeta (crédito '04' o débito '28') SIEMPRE se desglosa individual,
-    // igual que Transferencia — antes solo se desglosaba cuando había un
-    // depósito bancario identificado; sin él, se consolidaba en "Depósitos
-    // consolidados (Tarjeta)". Confirmado con el usuario: Tarjeta también
-    // debe salir completa, no agrupada. Subcódigo 0 (no tiene código propio
-    // como Transferencia/Anticipo — confirmado con el usuario).
-    if (LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA') {
-      transferencias.push(armarIndividual('Tarjeta', 0, null, bancario?.referencia));
-      continue;
-    }
-
-    // CON depósito ligado en Bancos (identificado contra un movimiento real,
-    // con su propio número de autorización/referencia) se desglosa
-    // individual — sin importar la forma de pago que declare el CFDI
-    // (cheque, "99 Por definir", etc. — transferencia y tarjeta ya se
-    // manejaron arriba). SIN un depósito real que mostrar, no aplica el
-    // desglose: una línea individual repitiendo solo la serie del propio CFDI
-    // (que ya aparece en el concepto) no aporta nada — se consolida como
-    // cualquier otro cargo, igual que antes. Confirmado con el usuario contra
-    // un export real.
-    if (bancario?.referencia) {
-      transferencias.push(armarIndividual('Depósito identificado', 0, null, bancario.referencia));
-      continue;
-    }
-
-    const label = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] ?? null;
+    // Sin depósito real que mostrar: se consolida por la forma de pago
+    // declarada (Efectivo, Tarjeta o Transferencia — cada una en su propia
+    // línea/cuenta).
+    const label = esTransferenciaVerificada ? 'TRANSFERENCIA'
+      : LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'TARJETA'
+      : LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] ?? null;
 
     const key = `${m.cuenta?.codigo}|${centroCosto}|${label ?? ''}`;
     if (!grupos.has(key)) {
@@ -651,33 +645,56 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null });
   }
 
-  const consolidados = [...grupos.values()].map(g => ({
-    cuenta:      g.cuenta,
-    serie:       g.label ?? '',
-    concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
-               : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
-               : 'Depósitos consolidados',
-    centroCosto: g.centroCosto,
-    debe:        g.debe,
-    haber:       0,
-    cfdiUuid:    null,
-    _subcodigo:  g.algunaTransferenciaVerificada ? subcodigoTransferencia : 0,
-    _detalle:    g.detalle,
-    _esTransferencia: g.algunaTransferenciaVerificada,
-    _esResto:    true,
-  }));
+  // Efectivo → Tarjeta → Transferencia → resto, siempre en ese orden dentro
+  // de los cargos consolidados (confirmado con el usuario).
+  const ORDEN_LABEL_CONSOLIDADO = { EFECTIVO: 0, TARJETA: 1, TRANSFERENCIA: 2 };
+  const consolidados = [...grupos.values()]
+    .map(g => ({
+      cuenta:      g.cuenta,
+      serie:       g.label ?? '',
+      concepto:    g.label === 'EFECTIVO'      ? 'Depósitos consolidados (Efectivo)'
+                 : g.label === 'TARJETA'       ? 'Depósitos consolidados (Tarjeta)'
+                 : g.label === 'TRANSFERENCIA' ? 'Depósitos consolidados (Transferencia)'
+                 : 'Depósitos consolidados',
+      centroCosto: g.centroCosto,
+      debe:        g.debe,
+      haber:       0,
+      cfdiUuid:    null,
+      _subcodigo:  g.algunaTransferenciaVerificada ? subcodigoTransferencia : 0,
+      _detalle:    g.detalle,
+      _esTransferencia: g.algunaTransferenciaVerificada,
+      _esResto:    true,
+    }))
+    .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 3) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 3));
 
-  // Cada categoría se ordena internamente por serie/folio ascendente — antes
+  // Cada arreglo se ordena internamente por serie/folio ascendente — antes
   // quedaban en el orden en que llegaron los CFDIs de entrada (arbitrario).
-  // El orden RELATIVO de las categorías entre sí no cambia: Devolución,
-  // Descuento, Bonificación y Anticipos primero; Club Tuberos, Transferencia/
-  // Tarjeta con referencia real, y los cargos consolidados van al final,
-  // en ese orden — confirmado con el usuario.
   const porSerieFolio = (arr) => [...arr].sort(compararSerieFolio);
 
+  return {
+    porCategoria: {
+      devolucion:   porSerieFolio(porCategoria.devolucion),
+      descuento:    porSerieFolio(porCategoria.descuento),
+      bonificacion: porSerieFolio(porCategoria.bonificacion),
+      clubTuberos:  porSerieFolio(porCategoria.clubTuberos),
+    },
+    anticipos: porSerieFolio(anticipos),
+    consolidados,
+    depositosIdentificados: porSerieFolio(depositosIdentificados),
+  };
+}
+
+/**
+ * Aplana el resultado de `consolidarCargos` en el orden legado (usado por el
+ * bloque de Pagos/PPD, que no tiene el reordenamiento especial de Contado):
+ * Devolución, Descuento, Bonificación, Club Tuberos, Anticipos, cargos
+ * consolidados (Efectivo/Tarjeta/Transferencia) y, al final, Depósito
+ * identificado.
+ */
+function aplanarCargosConsolidados(resultado) {
   return [
-    ...porSerieFolio(porCategoria.devolucion), ...porSerieFolio(porCategoria.descuento), ...porSerieFolio(porCategoria.bonificacion),
-    ...porSerieFolio(porCategoria.clubTuberos), ...porSerieFolio(anticipos), ...porSerieFolio(transferencias), ...consolidados,
+    ...resultado.porCategoria.devolucion, ...resultado.porCategoria.descuento, ...resultado.porCategoria.bonificacion,
+    ...resultado.porCategoria.clubTuberos, ...resultado.anticipos, ...resultado.consolidados, ...resultado.depositosIdentificados,
   ];
 }
 
@@ -797,16 +814,20 @@ function bloquesAbonosNormales(movs) {
  * porque no es un reembolso sino un nuevo pasivo que el cliente puede usar
  * después — confirmado con el usuario contra un export real.
  *
- * No ordena entre bloques ni entre categorías: el caller (`armarBloqueContado`)
- * los mezcla con los de venta normal y los ordena TODOS juntos por serie/folio
- * — confirmado con el usuario: sin separar por categoría, una sola secuencia
- * continua por folio (el color de fila sigue distinguiendo cada categoría).
+ * No ordena entre bloques: el caller (`armarBloqueContado`) agrupa cada
+ * categoría en su sección correspondiente del export y ordena por
+ * serie/folio DENTRO de cada sección (ver esa función para el orden completo).
  *
  * Reemplaza el esquema anterior donde el cargo de un ajuste vivía en el
  * bloque de "Depósitos consolidados" y su abono en el bloque de abonos
  * normales — lejos uno del otro en el archivo (confirmado contra un export
  * real: el cargo y el abono de una misma NC de Club Tuberos aparecían a
  * miles de filas de distancia).
+ *
+ * @returns {{categoria: string, bloque: object[]}[]} — bloque = movimientos
+ *   (cargo+abono) de un mismo CFDI, `categoria` para que el caller decida en
+ *   qué sección va (devolucion/descuento/bonificacion → ventas normales;
+ *   clubTuberos → su propia sección; anticipo → Anticipos y saldo a favor).
  */
 function bloquesAjustesContado(movs) {
   const porCfdi   = new Map();
@@ -832,34 +853,52 @@ function bloquesAjustesContado(movs) {
     const abonosCandidatos = categoria === 'devolucion'
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
-    return [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
+    const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
+    return { categoria, bloque };
   });
 }
 
 /**
- * Arma el bloque completo de Contado: ventas normales y ajustes (Devolución,
- * Descuento, Bonificación, Club Tuberos, Anticipo) mezclados en UNA sola
- * secuencia continua por serie/folio ascendente — confirmado con el usuario:
- * ya no van agrupados por categoría al final, cada CFDI aparece en su
- * posición de folio, con su color de categoría cuando aplica. Al final va el
- * cargo normal consolidado por cuenta/centro de costo/forma de pago. Los CFDI
- * de ajuste se excluyen de `consolidarCargos` para que no se dupliquen ni
- * queden separados de su abono.
+ * Arma el bloque completo de Contado en 5 secciones, en este orden fijo
+ * (confirmado con el usuario):
+ *   1. Ventas normales — incluye Devolución/Cancelación y Bonificación
+ *      genérica (Descuento igual) — una sola secuencia por serie/folio.
+ *   2. Bonificación Club Tuberos — su propia sección, por serie/folio.
+ *   3. Cargo consolidado por forma de pago: Efectivo, Tarjeta, Transferencia.
+ *   4. Anticipos y saldo a favor (Recepción y Aplicación), por serie/folio.
+ *   5. Depósito identificado (forma de pago sin mapear con depósito bancario
+ *      real ligado) — al final del export.
  */
 function armarBloqueContado(contado, verdadBancaria, nombresClientes) {
   const contadoAjuste = contado.filter(esAjusteContadoMov);
   const contadoNormal = contado.filter(m => !esAjusteContadoMov(m));
 
-  const bloques = [
+  const ajustes = bloquesAjustesContado(contadoAjuste);
+  const bloquesDeCategorias = (...categorias) =>
+    ajustes.filter(a => categorias.includes(a.categoria)).map(a => a.bloque);
+
+  const bloquesVentas = [
     ...bloquesAbonosNormales(contadoNormal.filter(m => Number(m.haber) > 0)),
-    ...bloquesAjustesContado(contadoAjuste),
+    ...bloquesDeCategorias('devolucion', 'descuento', 'bonificacion'),
   ];
-  bloques.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
+  bloquesVentas.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
-  const abonosYAjustes = enriquecerConceptoConCliente(bloques.flat(), nombresClientes);
-  const consolidados   = consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes);
+  const bloquesClubTuberos = bloquesDeCategorias('clubTuberos');
+  bloquesClubTuberos.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
-  return [...abonosYAjustes, ...consolidados];
+  const bloquesAnticipos = bloquesDeCategorias('anticipo');
+  bloquesAnticipos.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
+
+  const { consolidados, depositosIdentificados } =
+    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes);
+
+  const ventasYClubTuberos = enriquecerConceptoConCliente(
+    [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
+    nombresClientes,
+  );
+  const anticiposEnriquecidos = enriquecerConceptoConCliente(bloquesAnticipos.flat(), nombresClientes);
+
+  return [...ventasYClubTuberos, ...consolidados, ...anticiposEnriquecidos, ...depositosIdentificados];
 }
 
 // Igual que `categorizarAjusteContado`, pero también reconoce Anticipo — en
@@ -1036,7 +1075,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
     bloques = [{
       tipoVenta: null,
       movs:      esPagos
-        ? [...movimientos.filter(m => Number(m.haber) > 0), ...consolidarCargos(movimientos, 20, false, verdadBancaria, nombresClientes)]
+        ? [...movimientos.filter(m => Number(m.haber) > 0), ...aplanarCargosConsolidados(consolidarCargos(movimientos, 20, false, verdadBancaria, nombresClientes))]
         : ordenarCargoAntesDeAbono(movimientos),
       folio:     overrides.folioContado   ?? poliza.numero,
       concepto:  overrides.conceptoContado ?? poliza.concepto,

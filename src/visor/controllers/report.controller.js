@@ -1,7 +1,9 @@
 const ExcelJS = require('exceljs');
+const mongoose = require('mongoose');
 const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
+const BankMovement = require('../../banks/domains/banks/BankMovement.model');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { SERIES_CON_AUTH } = require('../../banks/domains/erp/erp-auth.utils');
 
@@ -2062,6 +2064,123 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   res.end();
 });
 
+// Un mismo CFDI de pago puede existir dos veces en Mongo: una vez importado
+// de SAT (XML real, complementoPago correcto) y otra de ERP (fallback de
+// `enrichComplementoPago`, que puede usar el total de la factura como
+// impPagado cuando no conoce el desglose real de un pago que cubre varias
+// facturas — ver esa función). Sin deduplicar, el reporte muestra AMBAS
+// versiones como filas distintas con montos distintos para el mismo pago
+// real. Se agrupa por `uuid` y se prefiere la versión SAT cuando existe.
+const DEDUP_PAGO_PREFIERE_SAT = [
+  { $addFields: { _srcOrden: { $cond: [{ $eq: ['$source', 'SAT'] }, 0, 1] } } },
+  { $sort: { uuid: 1, _srcOrden: 1 } },
+  { $group: { _id: '$uuid', doc: { $first: '$$ROOT' } } },
+  { $replaceRoot: { newRoot: '$doc' } },
+];
+
+/**
+ * "Saldo Banco": el saldo del depósito real de un movimiento bancario
+ * conforme se va APLICANDO a las facturas que ese mismo depósito paga (vía
+ * erpLinks.folioFiscal) — no un total fijo repetido en cada fila, sino un
+ * saldo CORRIENTE que baja cronológicamente: cada aplicación (un pago-CFDI
+ * + una factura) resta su `impPagado` del saldo que quedaba tras la
+ * aplicación anterior. Reemplaza a "Saldo Movimiento" (que solo mostraba
+ * `erpLinks.saldoActual`, el saldo de UNA CxC en el ERP, sin relación con
+ * el depósito compartido). Confirmado con el usuario contra un caso real
+ * donde un depósito de $7,365.02 se comparaba contra una sola factura de
+ * $16,094.85 (marcando una "diferencia" que en realidad correspondía a
+ * otras facturas pagadas por el mismo depósito), y que el saldo debe
+ * "ir bajando" según se va ocupando en cada factura, no quedar fijo.
+ *
+ * No se puede calcular dentro del pipeline paginado de `pagosBanco` porque
+ * las demás aplicaciones de un mismo depósito pueden caer en otra página —
+ * se calcula aparte, sobre TODAS las aplicaciones de cada movimiento,
+ * independiente de la paginación/filtros del reporte.
+ *
+ * @param {Array<string|null>} movimientoIds — _id (string) de bank_movements
+ * @returns {Promise<Map<string, number>>} clave `${movimientoId}|${cfdiUuid}|${facturaUuid}`
+ *   (mayúsculas) → saldo del depósito INMEDIATAMENTE DESPUÉS de esa aplicación.
+ */
+async function calcularSaldosBanco(movimientoIds) {
+  const mapa = new Map();
+  const ids = [...new Set(movimientoIds.filter(Boolean).map(String))];
+  if (ids.length === 0) return mapa;
+
+  const movimientos = await BankMovement.find(
+    { _id: { $in: ids.map((id) => new mongoose.Types.ObjectId(id)) } },
+    { deposito: 1, 'erpLinks.folioFiscal': 1 },
+  ).lean();
+
+  // folioFiscal (mayúsculas) → [movimientoId, ...] — normalmente un folio
+  // pertenece a un solo movimiento, pero se soporta N:N por si acaso.
+  const folioAMovimientos = new Map();
+  for (const m of movimientos) {
+    for (const link of (m.erpLinks ?? [])) {
+      const folio = (link.folioFiscal || '').toUpperCase();
+      if (!folio) continue;
+      if (!folioAMovimientos.has(folio)) folioAMovimientos.set(folio, []);
+      folioAMovimientos.get(folio).push(String(m._id));
+    }
+  }
+
+  const foliosUnicos = [...folioAMovimientos.keys()];
+  if (foliosUnicos.length === 0) return mapa;
+
+  // Traer TODAS las aplicaciones (un pago-CFDI + una factura) que tocan
+  // cualquiera de esos folios, deduplicadas SAT/ERP, con su fecha real de
+  // pago para poder ordenarlas cronológicamente y calcular el acumulado.
+  const aplicaciones = await CFDI.aggregate([
+    {
+      $match: {
+        tipoDeComprobante: 'P',
+        isActive: true,
+        'complementoPago.pagos.doctosRelacionados.idDocumento': {
+          $in: foliosUnicos.map((f) => new RegExp(`^${f}$`, 'i')),
+        },
+      },
+    },
+    ...DEDUP_PAGO_PREFIERE_SAT,
+    { $unwind: '$complementoPago.pagos' },
+    { $unwind: '$complementoPago.pagos.doctosRelacionados' },
+    {
+      $project: {
+        _id:         0,
+        cfdiUuid:    { $toUpper: '$uuid' },
+        facturaUuid: { $toUpper: '$complementoPago.pagos.doctosRelacionados.idDocumento' },
+        fechaPago:   '$complementoPago.pagos.fechaPago',
+        impPagado:   '$complementoPago.pagos.doctosRelacionados.impPagado',
+      },
+    },
+  ]);
+
+  // Agrupar aplicaciones por movimiento (un folioFiscal puede pertenecer a
+  // varios movimientos si N:N), ordenar cronológicamente por fechaPago, y
+  // calcular el saldo restante ACUMULADO tras cada una.
+  const aplicacionesPorMovimiento = new Map();
+  for (const a of aplicaciones) {
+    for (const movId of (folioAMovimientos.get(a.facturaUuid) ?? [])) {
+      if (!aplicacionesPorMovimiento.has(movId)) aplicacionesPorMovimiento.set(movId, []);
+      aplicacionesPorMovimiento.get(movId).push(a);
+    }
+  }
+
+  for (const m of movimientos) {
+    const idStr = String(m._id);
+    const lista = (aplicacionesPorMovimiento.get(idStr) ?? [])
+      .slice()
+      .sort((a, b) => new Date(a.fechaPago) - new Date(b.fechaPago));
+
+    let acumulado = 0;
+    for (const a of lista) {
+      acumulado += Number(a.impPagado) || 0;
+      const saldoTrasEsta = Math.round(((m.deposito ?? 0) - acumulado) * 100) / 100;
+      mapa.set(`${idStr}|${a.cfdiUuid}|${a.facturaUuid}`, saldoTrasEsta);
+    }
+  }
+
+  return mapa;
+}
+
 /**
  * GET /api/reports/pagos-banco
  * Cruza CFDIs de pago (tipo P) con movimientos bancarios vía folioFiscal.
@@ -2134,6 +2253,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
 
   const pipeline = [
     { $match: baseMatch },
+    ...DEDUP_PAGO_PREFIERE_SAT,
     { $unwind: '$complementoPago.pagos' },
     { $unwind: '$complementoPago.pagos.doctosRelacionados' },
     ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
@@ -2194,6 +2314,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
             },
             as: 'm',
             in: {
+              _id:          '$$m._id',
               banco:        '$$m.banco',
               fecha:        '$$m.fecha',
               deposito:     '$$m.deposito',
@@ -2584,7 +2705,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
                   { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] },
                 ]}, 2],
               },
-              saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+              movimientoId:     { $arrayElemAt: ['$movimientos._id', 0] },
               identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
             },
           },
@@ -2616,12 +2737,15 @@ const pagosBanco = asyncHandler(async (req, res) => {
   }
 
   const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(result.data.map(r => r.facturaUuid));
+  const saldosBanco = await calcularSaldosBanco(result.data.map(r => r.movimientoId));
   const data = result.data.map(r => {
     const nc = notasPorFactura.get(r.facturaUuid);
+    const claveSaldoBanco = `${r.movimientoId}|${(r.cfdiUuid || '').toUpperCase()}|${(r.facturaUuid || '').toUpperCase()}`;
     return {
       ...r,
-      tipoNC:  nc ? [...nc.tipos].sort().join(', ') : null,
-      montoNC: nc ? Math.round(nc.monto * 100) / 100 : null,
+      tipoNC:     nc ? [...nc.tipos].sort().join(', ') : null,
+      montoNC:    nc ? Math.round(nc.monto * 100) / 100 : null,
+      saldoBanco: r.movimientoId ? saldosBanco.get(claveSaldoBanco) ?? null : null,
     };
   });
 
@@ -2684,6 +2808,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
 
   const pipeline = [
     { $match: baseMatch },
+    ...DEDUP_PAGO_PREFIERE_SAT,
     { $unwind: '$complementoPago.pagos' },
     { $unwind: '$complementoPago.pagos.doctosRelacionados' },
     ...(Object.keys(drMatch).length ? [{ $match: drMatch }] : []),
@@ -2734,6 +2859,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
             },
             as: 'm',
             in: {
+              _id: '$$m._id',
               banco: '$$m.banco',
               fecha: '$$m.fecha',
               deposito: '$$m.deposito',
@@ -3091,7 +3217,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       deposito:         { $arrayElemAt: ['$movimientos.deposito',     0] },
       numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
       diferencia:       { $round: [{ $subtract: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] }, 2] },
-      saldoMovimiento:  { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] },
+      movimientoId:     { $arrayElemAt: ['$movimientos._id', 0] },
       identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
     }},
   ];
@@ -3099,10 +3225,13 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
   const rows = await CFDI.aggregate(pipeline).allowDiskUse(true);
 
   const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(rows.map(r => r.facturaUuid));
+  const saldosBanco = await calcularSaldosBanco(rows.map(r => r.movimientoId));
   for (const r of rows) {
     const nc = notasPorFactura.get(r.facturaUuid);
-    r.tipoNC  = nc ? [...nc.tipos].sort().join(', ') : null;
-    r.montoNC = nc ? Math.round(nc.monto * 100) / 100 : null;
+    const claveSaldoBanco = `${r.movimientoId}|${(r.cfdiUuid || '').toUpperCase()}|${(r.facturaUuid || '').toUpperCase()}`;
+    r.tipoNC     = nc ? [...nc.tipos].sort().join(', ') : null;
+    r.montoNC    = nc ? Math.round(nc.monto * 100) / 100 : null;
+    r.saldoBanco = r.movimientoId ? saldosBanco.get(claveSaldoBanco) ?? null : null;
   }
 
   const workbook  = new ExcelJS.Workbook();
@@ -3128,7 +3257,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     { header: 'Fecha Movimiento',   key: 'movFecha',          width: 16 },
     { header: 'ID NUMO',             key: 'movFolio',          width: 16 },
     { header: 'Núm. Autorización',  key: 'numOperacion',      width: 22 },
-    { header: 'Saldo Movimiento',   key: 'saldoMovimiento',   width: 18 },
+    { header: 'Saldo Banco',        key: 'saldoBanco',        width: 18 },
     { header: 'Identificado por',   key: 'identificadoPor',   width: 20 },
   ];
 
@@ -3165,7 +3294,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       deposito:         r.deposito ?? null,
       numOperacion:     r.numOperacion || '—',
       diferencia:       r.diferencia,
-      saldoMovimiento:  r.saldoMovimiento ?? null,
+      saldoBanco:       r.saldoBanco ?? null,
       identificadoPor:  r.identificadoPor || '—',
     });
 
@@ -3176,7 +3305,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     row.getCell('montoNC').numFmt          = mxn.numFmt;
     row.getCell('deposito').numFmt         = mxn.numFmt;
     row.getCell('diferencia').numFmt       = mxn.numFmt;
-    row.getCell('saldoMovimiento').numFmt  = mxn.numFmt;
+    row.getCell('saldoBanco').numFmt       = mxn.numFmt;
     row.getCell('fechaPago').numFmt        = fecha.numFmt;
     row.getCell('movFecha').numFmt         = fecha.numFmt;
 
@@ -3200,23 +3329,36 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
     else if (r.diferencia < 0)  difCell.font = { color: { argb: 'FF15803D' }, bold: true };
   });
 
-  // Fila de totales
+  // Fila de totales — saldoBanco es un saldo CORRIENTE (baja con cada
+  // aplicación), no un total fijo por fila: se suma una sola vez por
+  // depósito (movimientoId), tomando el valor de la aplicación más
+  // reciente (fechaPago), que es el saldo final real de ese depósito.
+  const saldoBancoPorMovimiento = new Map(); // movimientoId -> { fecha, saldo }
+  for (const r of rows) {
+    if (!r.movimientoId) continue;
+    const key    = String(r.movimientoId);
+    const fecha  = r.fechaPago ? new Date(r.fechaPago).getTime() : 0;
+    const actual = saldoBancoPorMovimiento.get(key);
+    if (!actual || fecha >= actual.fecha) {
+      saldoBancoPorMovimiento.set(key, { fecha, saldo: r.saldoBanco ?? 0 });
+    }
+  }
   const totalRow = sheet.addRow({
-    cfdiUuid:        'TOTALES',
-    impPagado:       rows.reduce((s, r) => s + (r.impPagado || 0), 0),
-    deposito:        rows.reduce((s, r) => s + (r.deposito  || 0), 0),
-    diferencia:      rows.reduce((s, r) => s + (r.diferencia || 0), 0),
-    saldoMovimiento: rows.reduce((s, r) => s + (r.saldoMovimiento || 0), 0),
+    cfdiUuid:    'TOTALES',
+    impPagado:   rows.reduce((s, r) => s + (r.impPagado || 0), 0),
+    deposito:    rows.reduce((s, r) => s + (r.deposito  || 0), 0),
+    diferencia:  rows.reduce((s, r) => s + (r.diferencia || 0), 0),
+    saldoBanco:  [...saldoBancoPorMovimiento.values()].reduce((s, v) => s + v.saldo, 0),
   });
   totalRow.eachCell(cell => {
     cell.font   = { bold: true };
     cell.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE2E8F0' } };
     cell.border = { top: { style: 'medium' } };
   });
-  totalRow.getCell('impPagado').numFmt       = mxn.numFmt;
-  totalRow.getCell('deposito').numFmt        = mxn.numFmt;
-  totalRow.getCell('diferencia').numFmt      = mxn.numFmt;
-  totalRow.getCell('saldoMovimiento').numFmt = mxn.numFmt;
+  totalRow.getCell('impPagado').numFmt  = mxn.numFmt;
+  totalRow.getCell('deposito').numFmt   = mxn.numFmt;
+  totalRow.getCell('diferencia').numFmt = mxn.numFmt;
+  totalRow.getCell('saldoBanco').numFmt = mxn.numFmt;
 
   sheet.autoFilter = { from: 'A1', to: 'Q1' };
 
@@ -3255,6 +3397,7 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
           'complementoPago.pagos.doctosRelacionados.idDocumento': { $regex: uuid, $options: 'i' },
         },
       },
+      ...DEDUP_PAGO_PREFIERE_SAT,
       { $unwind: '$complementoPago.pagos' },
       { $unwind: '$complementoPago.pagos.doctosRelacionados' },
       {

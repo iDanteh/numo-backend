@@ -53,6 +53,13 @@ async function construirVerdadBancaria(cfdiUuids) {
     const cat = (m.categoria || '').toUpperCase();
     const esTransferencia = CATEGORIAS_TRANSFERENCIA_BANCO.some(c => cat.includes(c));
     const referencia = m.numeroAutorizacion || m.referenciaNumerica || null;
+    // La mayoría de los movimientos ligados NO traen `categoria` (viene null)
+    // — confirmado contra datos reales: ~18,000 de ~18,650 movimientos con
+    // erpLinks no tienen categoria. Sin esto, `esTransferencia` (abajo)
+    // siempre da `false` para ellos, y el caller (consolidarCargos) lo
+    // tomaba como "confirmado que NO es transferencia", perdiendo el
+    // subcódigo 21 en transferencias reales solo por falta de categoría.
+    const categoriaConocida = m.categoria != null;
 
     for (const link of (m.erpLinks ?? [])) {
       const folioFiscalUpper = (link.folioFiscal || '').toUpperCase();
@@ -61,7 +68,7 @@ async function construirVerdadBancaria(cfdiUuids) {
       // parcialidades) — si alguno confirma transferencia, esa gana.
       const actual = mapa.get(folioFiscalUpper);
       if (!actual || (!actual.esTransferencia && esTransferencia)) {
-        mapa.set(folioFiscalUpper, { esTransferencia, referencia });
+        mapa.set(folioFiscalUpper, { esTransferencia, referencia, categoriaConocida });
       }
     }
   }
@@ -572,7 +579,16 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     if (!(Number(m.debe) > 0)) continue;
     const centroCosto = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
     const bancario    = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
-    const esTransferenciaVerificada = bancario ? bancario.esTransferencia : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
+    // Solo se confía en `bancario.esTransferencia` cuando el movimiento
+    // bancario SÍ trae `categoria` (SPEI/TRASPASO/otra) — si el match existe
+    // pero la categoría nunca se llenó (`categoriaConocida: false`, el caso
+    // más común), no hay evidencia real de que NO sea transferencia, así que
+    // se usa el formaPago que el propio CFDI declaró. Confirmado con el
+    // usuario: sin esto se perdía el subcódigo 21 en transferencias reales
+    // solo por falta de categoría en bank_movements.
+    const esTransferenciaVerificada = bancario?.categoriaConocida
+      ? bancario.esTransferencia
+      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
     const esAnticipo        = detectarAnticipo && esReglaAnticipo(m.reglaNombre);
     const esAnticipoSinUsar = esAnticipo && esRecepcionAnticipo(m.reglaNombre);
 

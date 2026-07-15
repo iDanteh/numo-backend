@@ -1048,6 +1048,17 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // exportan como DOS pólizas de CONTPAQi (folios consecutivos) dentro del mismo
   // archivo/hoja — Numo por dentro sigue manejando una sola póliza combinada.
   // `metodoPago` ya viene poblado desde cfdiToMovimientos → satMeta (cfdi-mapping.service.js).
+  //
+  // poliza.concepto es la única fuente de la fecha/sucursal (ver
+  // _construirConceptoIngresoBase en cfdi-poliza-generator.service.js) — aquí
+  // solo se le inserta el calificativo Contado/Credito para columna G del
+  // Excel, nunca se recalcula la fecha para evitar que se desincronice del
+  // encabezado (columna B, `fechaFinal`). Pólizas viejas (concepto formato
+  // "CFDIs MM/YYYY...") conservan su comportamiento anterior.
+  const _conceptoConTipoVenta = (tipoVenta, sufijoLegacy) => poliza.concepto?.startsWith('Ingresos por Ventas ')
+    ? poliza.concepto.replace('Ingresos por Ventas ', `Ingresos por Ventas de ${tipoVenta} `)
+    : sufijoLegacy;
+
   let bloques;
   if (poliza.tipo === 'I') {
     const contado = movimientos.filter(m => m.metodoPago !== 'PPD');
@@ -1061,13 +1072,13 @@ async function exportContpaqXlsx(id, overrides = {}) {
             tipoVenta: 'Contado',
             movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes),
             folio:     overrides.folioContado   ?? poliza.numero,
-            concepto:  overrides.conceptoContado ?? `${poliza.concepto} - Ventas de Contado`,
+            concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
           {
             tipoVenta: 'Credito',
             movs:      enriquecerConceptoConCliente(moverAjustesAlFinal(credito), nombresClientes),
             folio:     overrides.folioCredito   ?? (poliza.numero + 1),
-            concepto:  overrides.conceptoCredito ?? `${poliza.concepto} - Ventas de Crédito`,
+            concepto:  overrides.conceptoCredito ?? _conceptoConTipoVenta('Credito', `${poliza.concepto} - Ventas de Crédito`),
           },
         ]
       // Un solo tipo de venta presente: no hace falta un segundo folio, pero si
@@ -1079,7 +1090,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
             ? armarBloqueContado(contado, verdadBancaria, nombresClientes)
             : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
           folio:     overrides.folioContado   ?? poliza.numero,
-          concepto:  overrides.conceptoContado ?? poliza.concepto,
+          concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),
         }];
   } else {
     // Pólizas de Pago (cobros de facturas PPD): internamente son tipo 'D',
@@ -1219,6 +1230,50 @@ async function exportContpaqXlsx(id, overrides = {}) {
         row.getCell('monto').numFmt = '#,##0.00';
       });
     wsDesglose.autoFilter = { from: 'A1', to: 'G1' };
+  }
+
+  // Hoja de CFDIs sustitutos (tipoRelacion='04') excluidos automáticamente al
+  // generar esta póliza por riesgo de doble conteo — ver
+  // _particionarSustitutosPorRiesgo en cfdi-poliza-generator.service.js. No se
+  // contabilizaron; quedan aquí para que el contador decida caso por caso.
+  if (poliza.sustitutosExcluidos?.length > 0) {
+    const wsSustitutos = workbook.addWorksheet('CFDIs Sustitutos');
+    wsSustitutos.columns = [
+      { header: 'UUID Sustituto', key: 'uuid',        width: 38 },
+      { header: 'Serie-Folio',    key: 'serieFolio',   width: 16 },
+      { header: 'Fecha',          key: 'fecha',        width: 14 },
+      { header: 'Tipo',           key: 'tipo',         width: 8 },
+      { header: 'Total',          key: 'total',        width: 14 },
+      { header: 'Sustituye a (UUID)', key: 'sustituyeA', width: 60 },
+      { header: 'Periodo original',   key: 'periodoOriginal', width: 18 },
+      { header: 'Motivo exclusión',   key: 'motivo',    width: 26 },
+    ];
+    wsSustitutos.getRow(1).font = { bold: true };
+    wsSustitutos.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    });
+    const motivoLabel = {
+      ya_contabilizado_en_numo: 'Sustituto — original ya contabilizado en Numo',
+      periodo_anterior:         'Sustituto — original de periodo anterior',
+      sin_riesgo_detectado:     'Sustituto — sin riesgo detectado, revisar manualmente',
+    };
+    for (const s of poliza.sustitutosExcluidos) {
+      const row = wsSustitutos.addRow({
+        uuid:            s.uuid,
+        serieFolio:      [s.serie, s.folio].filter(Boolean).join('-') || null,
+        fecha:           s.fecha ? new Date(s.fecha) : null,
+        tipo:            s.tipoDeComprobante,
+        total:           s.total,
+        sustituyeA:      (s.sustituyeA || []).join(', '),
+        periodoOriginal: (s.originales || [])
+          .map(o => (o.periodo != null ? `${o.periodo}/${o.ejercicio}` : '—'))
+          .join(', '),
+        motivo: motivoLabel[s.motivo] ?? s.motivo,
+      });
+      if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'm/d/yy';
+      row.getCell('total').numFmt = '#,##0.00';
+    }
+    wsSustitutos.autoFilter = { from: 'A1', to: 'H1' };
   }
 
   return { workbook, poliza };

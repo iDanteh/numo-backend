@@ -105,6 +105,14 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.DATE,
     allowNull: true,
   },
+  // CFDIs sustitutos (tipoRelacion='04') detectados y excluidos automáticamente
+  // del cálculo al generar esta póliza — se listan aparte (no se contabilizan)
+  // para que el contador decida caso por caso si ya se contabilizaron en el
+  // periodo del CFDI original o si deben incorporarse manualmente.
+  sustitutosExcluidos: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
 }, {
   tableName:   'polizas',
   underscored: true,

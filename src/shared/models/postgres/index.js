@@ -220,6 +220,13 @@ async function syncModels() {
     ALTER TABLE entities
       ADD COLUMN IF NOT EXISTS emails_alerta TEXT[] DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN emails_alerta:', e.message));
+
+  // CFDIs sustitutos (tipoRelacion='04') excluidos automáticamente al generar
+  // la póliza por riesgo de doble conteo (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS sustitutos_excluidos JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN sustitutos_excluidos:', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

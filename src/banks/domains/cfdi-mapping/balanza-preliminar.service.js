@@ -7,6 +7,12 @@ const { Op }              = require('sequelize');
 const mappingSvc          = require('./cfdi-mapping.service');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
+const {
+  _splitUuids,
+  _extraerSustitutos,
+  _enriquecerSustitutosConPeriodoOriginal,
+  _particionarSustitutosPorRiesgo,
+} = require('./sustitutos-cfdi.util');
 
 // ── Helpers de enriquecimiento en memoria para tasaIvaInferida ────────────────
 
@@ -305,11 +311,13 @@ async function _enrichAndFilterCfdis(cfdis, tipo, { excluirPagosSustitutos, uuid
   {
     const originalASustituto = new Map(); // uuid-A (upper) → uuid-B (upper)
     for (const c of cfdisEnriquecidos) {
-      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
       const rels04 = (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04');
       if (!rels04.length) continue;
       const uuidB      = (c.uuid ?? '').toUpperCase();
-      const sustituyeA = rels04.flatMap(r => (r.uuids ?? (r.uuid ? [r.uuid] : [])).map(u => u.toUpperCase()));
+      const sustituyeA = rels04
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .flatMap(_splitUuids)
+        .map(u => u.toUpperCase());
       for (const uuidA of sustituyeA) originalASustituto.set(uuidA, uuidB);
       c._meta = { esSustituto: true, sustituyeA };
     }
@@ -435,8 +443,25 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
     }
   }
 
+  // 2.5. UUIDs ya contabilizados en Numo (para detectar sustitutos de riesgo —
+  // ver _particionarSustitutosPorRiesgo).
+  const yaContabilizados = await PolizaMovimiento.findAll({
+    where:      { cfdiUuid: { [Op.ne]: null } },
+    attributes: ['cfdiUuid'],
+    include: [{
+      model:      Poliza,
+      as:         'poliza',
+      attributes: [],
+      where:      { rfc, estado: { [Op.ne]: 'cancelada' } },
+      required:   true,
+    }],
+    raw: true,
+  });
+  const uuidsYaUsados = new Set(yaContabilizados.map(m => m.cfdiUuid));
+
   // 3. Procesar CFDIs por tipo
-  const movimientosTodos = [];
+  const movimientosTodos   = [];
+  const sustitutosExcluidos = [];
   let totalCfdis = 0;
   let sinRegla   = 0;
 
@@ -454,7 +479,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       ...filtroReclasificaciones,
       ...filtroMesesPosteriores,
     })
-      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.formaDePagoP complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
+      .select('uuid tipoDeComprobante metodoPago formaPago emisor.rfc receptor.rfc subTotal total descuento impuestos serie folio fecha conceptos.importe conceptos.Importe conceptos.descuento conceptos.Descuento conceptos.impuestos conceptos.descripcion conceptos.Descripcion complementoPago.totales complementoPago.pagos.monto complementoPago.pagos.formaDePagoP complementoPago.pagos.doctosRelacionados.trasladosDR cfdiRelacionados tasaIvaInferida')
       .maxTimeMS(60_000)
       .lean();
 
@@ -467,10 +492,19 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
       uuidsFacturasPueAnticipo,
     });
 
+    // Ningún sustituto se contabiliza automático — todos se excluyen del
+    // cálculo y se listan aparte, ver sustitutos-cfdi.util.js.
+    const sustitutosEnriquecidosTipo = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisParaBalanza));
+    const { excluidos: sustitutosExcluidosTipo } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosTipo, { uuidsYaUsados, ejercicio, periodo });
+    sustitutosExcluidos.push(...sustitutosExcluidosTipo);
+    const uuidsSustitutosExcluidosTipo = new Set(sustitutosExcluidosTipo.map(s => s.uuid?.toUpperCase()).filter(Boolean));
+
     const resultados = await Promise.all(
       cfdisParaBalanza.map(async (cfdi) => {
         // Opción C: el original marcado como fueReemplazado no aporta al saldo
         if (excluirPagosSustitutos && cfdi._meta?.fueReemplazado) return { sinRegla: 0, movs: [] };
+        // Sustituto de riesgo: no aporta al saldo — ver "sustitutos" en la respuesta
+        if (uuidsSustitutosExcluidosTipo.has((cfdi.uuid ?? '').toUpperCase())) return { sinRegla: 0, movs: [] };
         const rule = mappingSvc.findRuleInList(cfdi, rules);
         if (!rule) return { sinRegla: 1, movs: [] };
         const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMapByCod);
@@ -628,6 +662,7 @@ async function generarBalanzaPreliminar({ rfc, ejercicio, periodo, tipoCfdi, exc
   return {
     cuentas,
     totales,
+    sustitutos: sustitutosExcluidos,
     meta: {
       totalCfdis,
       sinRegla,
@@ -831,6 +866,22 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
 
   const rules = await _getRulesActive();
 
+  // UUIDs ya contabilizados en Numo (para detectar sustitutos de riesgo —
+  // ver _particionarSustitutosPorRiesgo).
+  const yaContabilizadosCuenta = await PolizaMovimiento.findAll({
+    where:      { cfdiUuid: { [Op.ne]: null } },
+    attributes: ['cfdiUuid'],
+    include: [{
+      model:      Poliza,
+      as:         'poliza',
+      attributes: [],
+      where:      { rfc, estado: { [Op.ne]: 'cancelada' } },
+      required:   true,
+    }],
+    raw: true,
+  });
+  const uuidsYaUsadosCuenta = new Set(yaContabilizadosCuenta.map(m => m.cfdiUuid));
+
   const cuentaObj = await AccountPlan.findOne({ where: { codigo: cuentaCodigo }, raw: true });
 
   const codigosTodos = [...new Set(
@@ -872,6 +923,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
   }
 
   const resultado = [];
+  const sustitutosExcluidosCuenta = [];
 
   for (const tipo of tipos) {
     const cfdis = await CFDI.find({
@@ -887,6 +939,13 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       excluirPagosSustitutos,
       uuidsFacturasPueAnticipo,
     });
+
+    // Sustitutos: nunca aportan al saldo — se marcan para excluirlos de
+    // totales (siguen apareciendo en la lista `cfdis` para trazabilidad).
+    const sustitutosEnriquecidosCuentaTipo = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisFinales));
+    const { excluidos: sustitutosExcluidosCuentaTipo } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosCuentaTipo, { uuidsYaUsados: uuidsYaUsadosCuenta, ejercicio, periodo });
+    sustitutosExcluidosCuenta.push(...sustitutosExcluidosCuentaTipo);
+    const uuidsSustitutosExcluidosCuentaTipo = new Set(sustitutosExcluidosCuentaTipo.map(s => s.uuid?.toUpperCase()).filter(Boolean));
 
     for (const cfdi of cfdisFinales) {
       const rule = mappingSvc.findRuleInList(cfdi, rules);
@@ -970,6 +1029,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
         reemplazadoPor: cfdi._meta?.reemplazadoPor ?? null,
         esSustituto:    cfdi._meta?.esSustituto    ?? false,
         sustituyeA:     cfdi._meta?.sustituyeA     ?? null,
+        sustitutoExcluido: uuidsSustitutosExcluidosCuentaTipo.has((cfdi.uuid ?? '').toUpperCase()),
       });
     }
   }
@@ -1088,12 +1148,13 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
 
   resultado.sort((a, b) => new Date(b.fecha) - new Date(a.fecha));
 
-  // Totales excluyen CFDIs marcados como fueReemplazado — solo el sustituto aporta al saldo
-  // Totales: excluir CFDI-A del saldo solo cuando el toggle está activo.
-  // Cuando excluirPagosSustitutos=false el original sí suma (vista informativa).
-  const resultadoParaTotales = excluirPagosSustitutos
-    ? resultado.filter(c => !c.fueReemplazado)
-    : resultado;
+  // Totales: excluir CFDI-A (original) del saldo solo cuando el toggle está
+  // activo (cuando excluirPagosSustitutos=false el original sí suma — vista
+  // informativa). El sustituto (CFDI-B) marcado sustitutoExcluido nunca aporta,
+  // sin importar el toggle — ver _particionarSustitutosPorRiesgo.
+  const resultadoParaTotales = resultado.filter(c =>
+    !(excluirPagosSustitutos && c.fueReemplazado) && !c.sustitutoExcluido,
+  );
   return {
     cuenta: { codigo: cuentaCodigo, nombre: cuentaObj?.nombre ?? cuentaCodigo, tipo: cuentaObj?.tipo ?? '?' },
     cfdis:   resultado,
@@ -1101,6 +1162,7 @@ async function generarDetalleCuenta({ rfc, ejercicio, periodo, tipoCfdi, cuentaC
       debe:  Math.round(resultadoParaTotales.reduce((s, c) => s + c.debe,  0) * 100) / 100,
       haber: Math.round(resultadoParaTotales.reduce((s, c) => s + c.haber, 0) * 100) / 100,
     },
+    sustitutos: sustitutosExcluidosCuenta,
   };
 }
 
@@ -1129,6 +1191,22 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
     : {};
 
   const rules = await _getRulesActive();
+
+  // UUIDs ya contabilizados en Numo (para detectar sustitutos de riesgo —
+  // ver _particionarSustitutosPorRiesgo).
+  const yaContabilizadosExport = await PolizaMovimiento.findAll({
+    where:      { cfdiUuid: { [Op.ne]: null } },
+    attributes: ['cfdiUuid'],
+    include: [{
+      model:      Poliza,
+      as:         'poliza',
+      attributes: [],
+      where:      { rfc, estado: { [Op.ne]: 'cancelada' } },
+      required:   true,
+    }],
+    raw: true,
+  });
+  const uuidsYaUsadosExport = new Set(yaContabilizadosExport.map(m => m.cfdiUuid));
 
   const codigosTodos = [...new Set(
     rules.flatMap(r => [
@@ -1161,6 +1239,7 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
   }
 
   const entradas = [];
+  const sustitutosExcluidosExport = [];
   let sinRegla = 0;
 
   for (const tipo of tipos) {
@@ -1178,7 +1257,15 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
       uuidsFacturasPueAnticipo,
     });
 
+    // Sustitutos: nunca aportan al export — se excluyen por completo y se
+    // listan aparte (ver _particionarSustitutosPorRiesgo).
+    const sustitutosEnriquecidosExportTipo = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisFinales));
+    const { excluidos: sustitutosExcluidosExportTipo } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosExportTipo, { uuidsYaUsados: uuidsYaUsadosExport, ejercicio, periodo });
+    sustitutosExcluidosExport.push(...sustitutosExcluidosExportTipo);
+    const uuidsSustitutosExcluidosExportTipo = new Set(sustitutosExcluidosExportTipo.map(s => s.uuid?.toUpperCase()).filter(Boolean));
+
     for (const cfdi of cfdisFinales) {
+      if (uuidsSustitutosExcluidosExportTipo.has((cfdi.uuid ?? '').toUpperCase())) continue;
       const rule = mappingSvc.findRuleInList(cfdi, rules);
       if (!rule) { sinRegla++; continue; }
       const movs    = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMapByCod);
@@ -1226,7 +1313,7 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
     if (cc !== 0) return cc;
     return new Date(a.fecha) - new Date(b.fecha);
   });
-  return { entradas, sinRegla };
+  return { entradas, sinRegla, sustitutos: sustitutosExcluidosExport };
 }
 
 module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, generarDetalleExport, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada };

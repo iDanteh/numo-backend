@@ -72,14 +72,14 @@ async function softDelete(id) {
 async function resolveBySerieMap() {
   const rows = await CentroCosto.findAll({
     where:      { isActive: true, serieFacturacion: { [Op.ne]: null } },
-    attributes: ['id', 'clave', 'serieFacturacion'],
+    attributes: ['id', 'clave', 'sucursal', 'serieFacturacion'],
     raw:        true,
   });
   // Un mismo serie puede apuntar a un solo centro; si hay duplicados gana el primero.
   const map = {};
   for (const r of rows) {
     if (r.serieFacturacion && !map[r.serieFacturacion]) {
-      map[r.serieFacturacion] = { id: r.id, clave: r.clave };
+      map[r.serieFacturacion] = { id: r.id, clave: r.clave, sucursal: r.sucursal };
     }
   }
   return map;

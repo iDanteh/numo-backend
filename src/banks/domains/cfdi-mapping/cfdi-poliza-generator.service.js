@@ -10,10 +10,47 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
+const {
+  _splitUuids,
+  _extraerSustitutos,
+  _enriquecerSustitutosConPeriodoOriginal,
+  _particionarSustitutosPorRiesgo,
+} = require('./sustitutos-cfdi.util');
 
 // Extrae los uuids de CFDIs relacionados de un CFDI — soporta tanto `uuids`
 // (array, formato ERP) como `uuid` (singular, formato SAT), según el origen.
 const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
+
+const SUCURSAL_DEFAULT = 'Cedis';
+
+function _fmtDMY(fechaISO) {
+  const [y, m, d] = fechaISO.split('-');
+  return `${d}/${m}/${y}`;
+}
+
+function _ultimoDiaDelMes(ejercicio, periodo) {
+  return new Date(Date.UTC(Number(ejercicio), Number(periodo), 0)).toISOString().slice(0, 10);
+}
+
+// Concepto de pólizas de Ingreso (Contado/Crédito): base sin el calificativo de
+// tipo de venta — poliza.service.js lo inserta al exportar según el bloque
+// (Contado/Crédito), así la fecha/sucursal salen de esta única fuente y nunca
+// se desincronizan entre el encabezado (columna B) y el concepto (columna G).
+function _construirConceptoIngresoBase({ centroCostoId, ccBySerieMap, fechaInicio, fechaFin, ejercicio, periodo }) {
+  const centro = centroCostoId
+    ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))
+    : null;
+  const sucursal = centro?.sucursal || SUCURSAL_DEFAULT;
+  let rango;
+  if (fechaInicio && fechaFin && fechaInicio !== fechaFin) {
+    rango = `Día: ${_fmtDMY(fechaInicio)} al ${_fmtDMY(fechaFin)}`;
+  } else if (fechaInicio) {
+    rango = `Día: ${_fmtDMY(fechaInicio)}`;
+  } else {
+    rango = `Día: ${_fmtDMY(`${ejercicio}-${String(periodo).padStart(2, '0')}-01`)} al ${_fmtDMY(_ultimoDiaDelMes(ejercicio, periodo))}`;
+  }
+  return `Ingresos por Ventas Suc. ${sucursal} ${rango}`;
+}
 
 /**
  * Enriquece en memoria el campo `tasaIvaInferida` de CFDIs tipo P Metadata
@@ -379,20 +416,27 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   _normalizarEgresoSegunFacturaRelacionada(cfdisSinPolizaFinal, relFacturaMetaMap);
 
   // Excluir el CFDI cancelado cuando existe un sustituto (tipoRelacion='04').
-  // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
   const _canceladosPorSustitutoProp = new Set(
     cfdisSinPolizaFinal
-      .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
-                   c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      .filter(c => c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
       .flatMap(c => (c.cfdiRelacionados || [])
         .filter(r => r.tipoRelacion === '04')
         .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .flatMap(_splitUuids)
         .map(u => u.toUpperCase())
       )
   );
-  const cfdisSinPolizaFinalFiltradoSustituto = _canceladosPorSustitutoProp.size
+  // Ningún sustituto se contabiliza automático — todos se excluyen y se
+  // listan aparte (`sustitutos`) para revisión manual, ver
+  // _particionarSustitutosPorRiesgo.
+  const sustitutosEnriquecidosProp = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinal));
+  const { excluidos: sustitutosProp } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosProp, { uuidsYaUsados, ejercicio, periodo });
+  const _uuidsSustitutosExcluidosProp = new Set(sustitutosProp.map(s => s.uuid?.toUpperCase()).filter(Boolean));
+
+  const cfdisSinPolizaFinalFiltradoSustituto = (_canceladosPorSustitutoProp.size || _uuidsSustitutosExcluidosProp.size)
     ? cfdisSinPolizaFinal.filter(c =>
-        !_canceladosPorSustitutoProp.has(c.uuid?.toUpperCase() ?? '')
+        !_canceladosPorSustitutoProp.has(c.uuid?.toUpperCase() ?? '') &&
+        !_uuidsSustitutosExcluidosProp.has(c.uuid?.toUpperCase() ?? '')
       )
     : cfdisSinPolizaFinal;
 
@@ -632,21 +676,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       (ppd07.length > 5 ? ` y ${ppd07.length - 5} más` : ''),
     );
   }
-  // Sustitutos cuyo CFDI original ya tiene póliza contabilizada → doble asiento potencial
-  if (_canceladosPorSustitutoProp.size) {
-    for (const c of cfdisSinPolizaFinal) {
-      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
-      for (const rel of (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04')) {
-        for (const uA of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
-          if (uuidsYaUsados.has(uA.toUpperCase())) {
-            advertencias.push(
-              `⚠ Sustitución: ${c.uuid?.slice(0, 8)}… sustituye al CFDI ${uA.slice(0, 8)}… ` +
-              `que ya tiene póliza contabilizada — reviértela y cancélala antes de procesar este sustituto`,
-            );
-          }
-        }
-      }
+  // Sustitutos excluidos automáticamente por riesgo de doble conteo — ver
+  // _particionarSustitutosPorRiesgo. Los "normales" (sin riesgo detectado) no
+  // generan advertencia: se contabilizan igual que cualquier otro CFDI.
+  if (sustitutosProp.length) {
+    advertencias.push(
+      `⚠ ${sustitutosProp.length} CFDI(s) sustituto(s) excluido(s) automáticamente de esta póliza por riesgo de doble conteo — revisa la lista "sustitutos" antes de incorporarlos manualmente`,
+    );
+    for (const s of sustitutosProp.slice(0, 5)) {
+      const motivoTxt = s.motivo === 'ya_contabilizado_en_numo'
+        ? 'el original ya tiene póliza contabilizada en Numo'
+        : `el original es de un periodo anterior (${s.originales.map(o => `${o.periodo ?? '?'}/${o.ejercicio ?? '?'}`).join(', ')})`;
+      advertencias.push(`  • ${s.uuid?.slice(0, 8)}… sustituye a ${s.sustituyeA.map(u => u.slice(0, 8)).join(', ')}… — ${motivoTxt}`);
     }
+    if (sustitutosProp.length > 5) advertencias.push(`  … y ${sustitutosProp.length - 5} más`);
   }
 
   return {
@@ -654,11 +697,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     fecha:      fecha.toISOString().slice(0, 10),
     // Mismo fix que totalCfdis: con centroCostoId, cfdisSinPoliza.length sigue
     // siendo el total del periodo completo (antes del filtro por sucursal).
-    concepto:   `CFDIs ${mesStr}/${ejercicio} — ${(centroCostoId ? cfdisSinPolizaFinalFiltrado.length : cfdisSinPoliza.length)} comprobante(s)`,
+    concepto:   tipoPropuesta === 'I'
+      ? _construirConceptoIngresoBase({ centroCostoId, ccBySerieMap: ccBySerieMapProp, fechaInicio, fechaFin, ejercicio, periodo })
+      : `CFDIs ${mesStr}/${ejercicio} — ${(centroCostoId ? cfdisSinPolizaFinalFiltrado.length : cfdisSinPoliza.length)} comprobante(s)`,
     ejercicio:  Number(ejercicio),
     periodo:    Number(periodo),
     rfc,
     movimientos: movimientosResult,
+    sustitutos: sustitutosProp,
     _meta: {
       totalCfdis:   cfdisSinPoliza.length,
       sinRegla,
@@ -820,17 +866,25 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // Genera póliza solo para el CFDI vigente final — espeja CONTPAQi.
   const _canceladosPorSustitutoGuard = new Set(
     cfdisSinPolizaFinalGuard
-      .filter(c => ['P', 'E'].includes(c.tipoDeComprobante) &&
-                   c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
+      .filter(c => c.cfdiRelacionados?.some(r => r.tipoRelacion === '04'))
       .flatMap(c => (c.cfdiRelacionados || [])
         .filter(r => r.tipoRelacion === '04')
         .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+        .flatMap(_splitUuids)
         .map(u => u.toUpperCase())
       )
   );
-  const cfdisSinPolizaFinalGuardFiltradoSustituto = _canceladosPorSustitutoGuard.size
+  // Ningún sustituto se contabiliza automático — todos se excluyen y se
+  // listan aparte (`sustitutos`) para revisión manual, ver
+  // _particionarSustitutosPorRiesgo.
+  const sustitutosEnriquecidosGuard = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinalGuard));
+  const { excluidos: sustitutosGuard } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosGuard, { uuidsYaUsados, ejercicio, periodo });
+  const _uuidsSustitutosExcluidosGuard = new Set(sustitutosGuard.map(s => s.uuid?.toUpperCase()).filter(Boolean));
+
+  const cfdisSinPolizaFinalGuardFiltradoSustituto = (_canceladosPorSustitutoGuard.size || _uuidsSustitutosExcluidosGuard.size)
     ? cfdisSinPolizaFinalGuard.filter(c =>
-        !_canceladosPorSustitutoGuard.has(c.uuid?.toUpperCase() ?? '')
+        !_canceladosPorSustitutoGuard.has(c.uuid?.toUpperCase() ?? '') &&
+        !_uuidsSustitutosExcluidosGuard.has(c.uuid?.toUpperCase() ?? '')
       )
     : cfdisSinPolizaFinalGuard;
 
@@ -1032,21 +1086,20 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
   }
 
-  // Sustitutos cuyo CFDI original ya tiene póliza contabilizada → doble asiento potencial
-  if (_canceladosPorSustitutoGuard.size) {
-    for (const c of cfdisSinPolizaFinalGuard) {
-      if (!['P', 'E'].includes(c.tipoDeComprobante)) continue;
-      for (const rel of (c.cfdiRelacionados || []).filter(r => r.tipoRelacion === '04')) {
-        for (const uA of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
-          if (uuidsYaUsados.has(uA.toUpperCase())) {
-            advertencias.push(
-              `⚠ Sustitución: ${c.uuid?.slice(0, 8)}… sustituye al CFDI ${uA.slice(0, 8)}… ` +
-              `que ya tiene póliza contabilizada — reviértela y cancélala antes de contabilizar este sustituto`,
-            );
-          }
-        }
-      }
+  // Sustitutos excluidos automáticamente por riesgo de doble conteo — ver
+  // _particionarSustitutosPorRiesgo. Los "normales" (sin riesgo detectado) no
+  // generan advertencia: ya están contabilizados igual que cualquier CFDI.
+  if (sustitutosGuard.length) {
+    advertencias.push(
+      `⚠ ${sustitutosGuard.length} CFDI(s) sustituto(s) excluido(s) automáticamente de esta póliza por riesgo de doble conteo — revisa "sustitutosExcluidos" antes de incorporarlos manualmente`,
+    );
+    for (const s of sustitutosGuard.slice(0, 5)) {
+      const motivoTxt = s.motivo === 'ya_contabilizado_en_numo'
+        ? 'el original ya tiene póliza contabilizada en Numo'
+        : `el original es de un periodo anterior (${s.originales.map(o => `${o.periodo ?? '?'}/${o.ejercicio ?? '?'}`).join(', ')})`;
+      advertencias.push(`  • ${s.uuid?.slice(0, 8)}… sustituye a ${s.sustituyeA.map(u => u.slice(0, 8)).join(', ')}… — ${motivoTxt}`);
     }
+    if (sustitutosGuard.length > 5) advertencias.push(`  … y ${sustitutosGuard.length - 5} más`);
   }
 
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
@@ -1058,7 +1111,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // siendo el total del periodo completo (antes del filtro por sucursal) —
   // se guardaba un concepto con el conteo de TODAS las sucursales aunque la
   // póliza solo tuviera los CFDIs correctos de esta.
-  const concepto = `CFDIs ${mesStr}/${ejercicio} — ${(centroCostoId ? cfdisSinPolizaFinalGuardFiltrado.length : cfdisSinPoliza.length)} comprobante(s)`;
+  const concepto = tipoPropuesta === 'I'
+    ? _construirConceptoIngresoBase({ centroCostoId, ccBySerieMap, fechaInicio, fechaFin, ejercicio, periodo })
+    : `CFDIs ${mesStr}/${ejercicio} — ${(centroCostoId ? cfdisSinPolizaFinalGuardFiltrado.length : cfdisSinPoliza.length)} comprobante(s)`;
 
   const poliza = await sequelize.transaction(async (t) => {
     await sequelize.query(
@@ -1081,6 +1136,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       periodo:   Number(periodo),
       rfc,
       estado:    'borrador',
+      sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
     }, { transaction: t });
 
     for (let i = 0; i < todosLosMovimientos.length; i += CHUNK_SIZE) {
@@ -1139,6 +1195,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     totalCfdis:   centroCostoId ? cfdisSinPolizaFinalGuardFiltrado.length : cfdisSinPoliza.length,
     sinRegla,
     advertencias: advertenciasFinal,
+    sustitutos:   sustitutosGuard,
   };
 }
 

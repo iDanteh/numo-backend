@@ -2108,18 +2108,23 @@ async function calcularSaldosBanco(movimientoIds) {
 
   const movimientos = await BankMovement.find(
     { _id: { $in: ids.map((id) => new mongoose.Types.ObjectId(id)) } },
-    { deposito: 1, 'erpLinks.folioFiscal': 1 },
+    { deposito: 1, 'erpLinks.folioFiscal': 1, 'erpLinks.saldoActual': 1 },
   ).lean();
 
-  // folioFiscal (mayúsculas) → [movimientoId, ...] — normalmente un folio
-  // pertenece a un solo movimiento, pero se soporta N:N por si acaso.
+  // folioFiscal (mayúsculas) → [{movId, saldoActual}, ...] — una misma factura
+  // puede haberse pagado con VARIOS depósitos distintos en fechas distintas
+  // (ej. una parcialidad chica hoy, otra grande el mes que entra), cada uno
+  // con su propio movimiento. saldoActual aquí es el monto de ESE depósito
+  // específico aplicado a esa factura (ver comentario en pagosBanco) — se usa
+  // más abajo para saber a CUÁL de los movimientos candidatos pertenece cada
+  // aplicación real, en vez de metérsela a todos por compartir la factura.
   const folioAMovimientos = new Map();
   for (const m of movimientos) {
     for (const link of (m.erpLinks ?? [])) {
       const folio = (link.folioFiscal || '').toUpperCase();
       if (!folio) continue;
       if (!folioAMovimientos.has(folio)) folioAMovimientos.set(folio, []);
-      folioAMovimientos.get(folio).push(String(m._id));
+      folioAMovimientos.get(folio).push({ movId: String(m._id), saldoActual: Number(link.saldoActual) || 0 });
     }
   }
 
@@ -2153,15 +2158,22 @@ async function calcularSaldosBanco(movimientoIds) {
     },
   ]);
 
-  // Agrupar aplicaciones por movimiento (un folioFiscal puede pertenecer a
-  // varios movimientos si N:N), ordenar cronológicamente por fechaPago, y
-  // calcular el saldo restante ACUMULADO tras cada una.
+  // Agrupar aplicaciones por movimiento: cada aplicación se atribuye SOLO al
+  // movimiento candidato cuyo erpLinks.saldoActual (monto de ESE depósito
+  // aplicado a esa factura) está más cerca de su propio impPagado — no a
+  // todos los movimientos que alguna vez tocaron esa factura. Sin esto, una
+  // factura pagada por dos depósitos distintos en fechas distintas mezclaba
+  // la aplicación de un depósito dentro del saldo corriente del otro.
   const aplicacionesPorMovimiento = new Map();
   for (const a of aplicaciones) {
-    for (const movId of (folioAMovimientos.get(a.facturaUuid) ?? [])) {
-      if (!aplicacionesPorMovimiento.has(movId)) aplicacionesPorMovimiento.set(movId, []);
-      aplicacionesPorMovimiento.get(movId).push(a);
-    }
+    const candidatos = folioAMovimientos.get(a.facturaUuid) ?? [];
+    if (candidatos.length === 0) continue;
+    const impPagadoNum = Number(a.impPagado) || 0;
+    const mejor = candidatos.reduce((best, c) =>
+      Math.abs(c.saldoActual - impPagadoNum) < Math.abs(best.saldoActual - impPagadoNum) ? c : best,
+    );
+    if (!aplicacionesPorMovimiento.has(mejor.movId)) aplicacionesPorMovimiento.set(mejor.movId, []);
+    aplicacionesPorMovimiento.get(mejor.movId).push(a);
   }
 
   for (const m of movimientos) {
@@ -2679,19 +2691,19 @@ const pagosBanco = asyncHandler(async (req, res) => {
               // Parcialidad/Saldo Anterior: si el CFDI no los trae, usar el kardex
               // de erp_cuentas_pendientes (parcialidadInfo, calculado arriba).
               numParcialidad:  { $ifNull: ['$complementoPago.pagos.doctosRelacionados.numParcialidad', '$parcialidadInfo.numParcialidad'] },
-              impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
+              // Imp. Pagado: si el CFDI no lo trae, usar saldoMovimiento (monto de
+              // ESTE depósito específico aplicado a ESTA factura, vía el erpLink
+              // cuyo folioFiscal coincide con el idDocumento) — no el saldoActual
+              // del kardex ERP, que es un saldo remanente, no un monto pagado.
+              impPagado: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }] },
               impSaldoAnt: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impSaldoAnt', '$parcialidadInfo.saldoAnterior'] },
               // Saldo Insoluto: si el CFDI no lo trae, usar el saldoActual de la CxC
               // en el erpLink del movimiento (mismo concepto: saldo pendiente actual).
-              // Prioridad: CFDI propio > saldoActual del abono exacto en el kardex ERP
-              // (más preciso, refleja el efecto de ESTE pago) > snapshot del erpLink
-              // del movimiento bancario (puede quedar desactualizado).
-              impSaldoInsoluto: {
-                $ifNull: [
-                  '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
-                  { $ifNull: ['$parcialidadInfo.saldoActual', { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, null] }] },
-                ],
-              },
+              // OJO: NO usar movimientos.saldoMovimiento aquí — ese campo es el monto
+              // APLICADO de este depósito (equivale a Imp. Pagado, no a un saldo
+              // restante); usarlo como saldo insoluto mostraba el pago aplicado en la
+              // columna equivocada.
+              impSaldoInsoluto: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto', '$parcialidadInfo.saldoActual'] },
               tienePago:       { $gt: [{ $size: '$movimientos' }, 0] },
               banco:           { $arrayElemAt: ['$movimientos.banco',        0] },
               movFecha:        { $arrayElemAt: ['$movimientos.fecha',        0] },
@@ -2699,11 +2711,27 @@ const pagosBanco = asyncHandler(async (req, res) => {
               deposito:        { $arrayElemAt: ['$movimientos.deposito',     0] },
               movConcepto:     { $arrayElemAt: ['$movimientos.concepto',     0] },
               numOperacion:    { $arrayElemAt: ['$movimientos.numOperacion', 0] },
+              // Diferencia: comparar impPagado contra la porción de ESE depósito
+              // aplicada a ESTA factura (saldoMovimiento), no contra el depósito
+              // completo — un depósito de lote que cubre varias facturas mostraba
+              // una "diferencia" enorme y sin sentido contra cada factura individual.
+              //
+              // Caso sin datos suficientes: cuando 2+ CFDIs de pago distintos aplican
+              // a la MISMA factura desde el MISMO movimiento, erpLinks solo guarda un
+              // acumulado (no hay forma de saber cuál REP es cuál). Si el impPagado de
+              // ESTE REP no coincide (±$1) con ese único saldoActual disponible, la
+              // diferencia calculada sería de ese OTRO REP, no de este — se muestra
+              // null en vez de un número engañoso.
               diferencia: {
-                $round: [{ $subtract: [
-                  '$complementoPago.pagos.doctosRelacionados.impPagado',
-                  { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] },
-                ]}, 2],
+                $let: {
+                  vars: {
+                    diff: { $round: [{ $subtract: [
+                      '$complementoPago.pagos.doctosRelacionados.impPagado',
+                      { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] },
+                    ]}, 2] },
+                  },
+                  in: { $cond: [{ $lte: [{ $abs: '$$diff' }, 1] }, '$$diff', null] },
+                },
               },
               movimientoId:     { $arrayElemAt: ['$movimientos._id', 0] },
               identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
@@ -3202,21 +3230,33 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       serie:            { $ifNull: ['$complementoPago.pagos.doctosRelacionados.serie', { $ifNull: [{ $arrayElemAt: ['$movimientos.serieOrigen', 0] }, null] }] },
       folio:            { $ifNull: ['$complementoPago.pagos.doctosRelacionados.folio', { $ifNull: [{ $arrayElemAt: ['$movimientos.folioOrigen', 0] }, null] }] },
       numParcialidad:   { $ifNull: ['$complementoPago.pagos.doctosRelacionados.numParcialidad', '$parcialidadInfo.numParcialidad'] },
-      impPagado:        '$complementoPago.pagos.doctosRelacionados.impPagado',
+      // Ver comentario equivalente en pagosBanco: impPagado cae a saldoMovimiento
+      // (monto de ESTE depósito aplicado a ESTA factura), impSaldoInsoluto ya NO
+      // cae a saldoMovimiento (ese es un monto aplicado, no un saldo restante).
+      impPagado: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }] },
       impSaldoAnt: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impSaldoAnt', '$parcialidadInfo.saldoAnterior'] },
-      impSaldoInsoluto: {
-        $ifNull: [
-          '$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto',
-          { $ifNull: ['$parcialidadInfo.saldoActual', { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, null] }] },
-        ],
-      },
+      impSaldoInsoluto: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.impSaldoInsoluto', '$parcialidadInfo.saldoActual'] },
       tienePago:        { $gt: [{ $size: '$movimientos' }, 0] },
       banco:            { $arrayElemAt: ['$movimientos.banco',        0] },
       movFecha:         { $arrayElemAt: ['$movimientos.fecha',        0] },
       movFolio:         { $arrayElemAt: ['$movimientos.folio',        0] },
       deposito:         { $arrayElemAt: ['$movimientos.deposito',     0] },
       numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
-      diferencia:       { $round: [{ $subtract: ['$complementoPago.pagos.doctosRelacionados.impPagado', { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] }, 2] },
+      // Diferencia: contra la porción de este depósito aplicada a esta factura
+      // (saldoMovimiento), no contra el depósito completo — null si no coincide
+      // (±$1), caso de 2+ REPs distintos compartiendo un mismo erpLink acumulado
+      // sin forma de saber cuál es cuál (ver comentario completo en pagosBanco).
+      diferencia: {
+        $let: {
+          vars: {
+            diff: { $round: [{ $subtract: [
+              '$complementoPago.pagos.doctosRelacionados.impPagado',
+              { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] },
+            ]}, 2] },
+          },
+          in: { $cond: [{ $lte: [{ $abs: '$$diff' }, 1] }, '$$diff', null] },
+        },
+      },
       movimientoId:     { $arrayElemAt: ['$movimientos._id', 0] },
       identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
     }},

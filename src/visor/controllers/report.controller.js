@@ -262,9 +262,8 @@ function esFacturaGlobal(factura) {
 // correspondiente se anota sobre él; si no existe (el ERP aún no lo registró),
 // se agrega un movimiento "virtual" marcado como tal. Nunca se modifica el
 // saldoActual real del ERP — solo se anota/explica.
-function enriquecerConNotasDeCredito(cuentasPorCobrar, egresosRelacionados, factura) {
+function enriquecerConNotasDeCredito(cuentasPorCobrar, egresosRelacionados, factura, movimientosBanco = []) {
   const vigentes = (egresosRelacionados ?? []).filter(e => e.satStatus === 'Vigente');
-  if (!vigentes.length) return cuentasPorCobrar;
 
   const conReferencia = vigentes.filter(nc => nc.cxcRef);
   const sinReferencia = esFacturaGlobal(factura) ? [] : vigentes.filter(nc => !nc.cxcRef);
@@ -293,6 +292,29 @@ function enriquecerConNotasDeCredito(cuentasPorCobrar, egresosRelacionados, fact
 
       return m;
     });
+
+    // Pagos bancarios (ABO/CBT/CPF/CFC) que Kore ya confirmó al conciliar el
+    // depósito (bank_movements.erpLinks.movimientosKore) pero que el kardex
+    // del ERP todavía no registra — mismo patrón que las NC virtuales de abajo:
+    // se agregan como movimiento "virtual" sin tocar el saldoActual real.
+    // Solo series con autorización bancaria real; las de Nota de Crédito
+    // (RET/BON/etc.) ya se cubren mediante egresosRelacionados arriba.
+    const yaEnKardex = new Set(movimientos.map(m => `${m.serie}-${m.folio}`));
+    const koreDeEstaCxc = movimientosBanco
+      .flatMap(bm => bm.erpLinks ?? [])
+      .find(l => l.erpId === cxc.erpId)
+      ?.movimientosKore ?? [];
+    for (const mk of koreDeEstaCxc) {
+      if (!SERIES_CON_AUTH.includes(mk.serie)) continue;
+      if (yaEnKardex.has(`${mk.serie}-${mk.folio}`)) continue;
+      movimientos = [...movimientos, {
+        serie: mk.serie, folio: mk.folio,
+        serieOrigen: mk.serieOrigen ?? null, folioOrigen: mk.folioOrigen ?? null,
+        saldoAnterior: mk.saldoAnterior ?? null, saldoActual: mk.saldoActual ?? null,
+        subtotal: mk.subtotal ?? null, impuesto: mk.impuesto ?? null, total: mk.total ?? 0,
+        esPagoBancario: true, esVirtual: true,
+      }];
+    }
 
     // NC con referencia exacta a esta CxC que no calzó con ningún movimiento
     // existente del kardex — se agrega como movimiento virtual igual, porque
@@ -2333,7 +2355,13 @@ const pagosBanco = asyncHandler(async (req, res) => {
               folio:        '$$m.folio',
               concepto:     '$$m.concepto',
               numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
-              // Saldo que queda en el ERP para esta factura según el erpLink del movimiento
+              // Monto de ESTE depósito realmente aplicado a esta factura específica —
+              // misma jerarquía que aplicarLogicaErp() en bank.service.js:
+              // saldoPagadoTotal (cobro-panel, cualquier forma de pago) → saldoPagado
+              // (solo bancario) → comportamiento legado (saldoActual si >0, si no total).
+              // NO usar saldoActual a secas: en links legado es el SALDO RESTANTE de la
+              // CxC (no lo aplicado), y comparar impPagado contra eso hacía que
+              // "Diferencia" saliera en blanco para la mayoría de los pagos.
               saldoMovimiento: {
                 $let: {
                   vars: {
@@ -2352,7 +2380,25 @@ const pagosBanco = asyncHandler(async (req, res) => {
                       }, 0],
                     },
                   },
-                  in: '$$link.saldoActual',
+                  in: {
+                    $cond: [
+                      { $ne: ['$$link.saldoPagadoTotal', null] },
+                      '$$link.saldoPagadoTotal',
+                      {
+                        $cond: [
+                          { $ne: ['$$link.saldoPagado', null] },
+                          '$$link.saldoPagado',
+                          {
+                            $cond: [
+                              { $and: [{ $ne: ['$$link.saldoActual', null] }, { $gt: ['$$link.saldoActual', 0] }] },
+                              '$$link.saldoActual',
+                              { $ifNull: ['$$link.total', 0] },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
                 },
               },
               // Serie/Folio de la factura origen — fallback cuando el CFDI de pago no
@@ -2716,18 +2762,28 @@ const pagosBanco = asyncHandler(async (req, res) => {
               // completo — un depósito de lote que cubre varias facturas mostraba
               // una "diferencia" enorme y sin sentido contra cada factura individual.
               //
-              // Caso sin datos suficientes: cuando 2+ CFDIs de pago distintos aplican
-              // a la MISMA factura desde el MISMO movimiento, erpLinks solo guarda un
-              // acumulado (no hay forma de saber cuál REP es cuál). Si el impPagado de
-              // ESTE REP no coincide (±$1) con ese único saldoActual disponible, la
-              // diferencia calculada sería de ese OTRO REP, no de este — se muestra
-              // null en vez de un número engañoso.
+              // Cuando UN depósito paga VARIAS facturas distintas, erpLinks solo
+              // guarda un acumulado por CxC y no siempre distingue cuál porción es
+              // de cuál factura. Pero cada CxC tiene su PROPIO kardex en el ERP
+              // (erp_cuentas_pendientes) con su propio abono específico — ya
+              // matcheado arriba en parcialidadInfo por monto de formasPago. Cuando
+              // existe, saldoAnterior−saldoActual de ESE abono es el monto exacto
+              // aplicado a ESTA factura, más preciso que erpLinks. Solo si tampoco
+              // hay parcialidadInfo se cae a erpLinks/depósito completo, y si ni así
+              // coincide (±$1) se muestra null en vez de un número engañoso.
               diferencia: {
                 $let: {
                   vars: {
                     diff: { $round: [{ $subtract: [
                       '$complementoPago.pagos.doctosRelacionados.impPagado',
-                      { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] },
+                      { $ifNull: [
+                        { $cond: [
+                          { $ne: ['$parcialidadInfo', null] },
+                          { $subtract: ['$parcialidadInfo.saldoAnterior', '$parcialidadInfo.saldoActual'] },
+                          null,
+                        ] },
+                        { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] },
+                      ] },
                     ]}, 2] },
                   },
                   in: { $cond: [{ $lte: [{ $abs: '$$diff' }, 1] }, '$$diff', null] },
@@ -2893,6 +2949,9 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
               deposito: '$$m.deposito',
               folio: '$$m.folio',
               numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+              // Ver comentario completo en pagosBanco — misma jerarquía que
+              // aplicarLogicaErp() en bank.service.js (saldoPagadoTotal → saldoPagado
+              // → legado saldoActual/total). NO usar saldoActual a secas.
               saldoMovimiento: {
                 $let: {
                   vars: {
@@ -2911,7 +2970,25 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                       }, 0],
                     },
                   },
-                  in: '$$link.saldoActual',
+                  in: {
+                    $cond: [
+                      { $ne: ['$$link.saldoPagadoTotal', null] },
+                      '$$link.saldoPagadoTotal',
+                      {
+                        $cond: [
+                          { $ne: ['$$link.saldoPagado', null] },
+                          '$$link.saldoPagado',
+                          {
+                            $cond: [
+                              { $and: [{ $ne: ['$$link.saldoActual', null] }, { $gt: ['$$link.saldoActual', 0] }] },
+                              '$$link.saldoActual',
+                              { $ifNull: ['$$link.total', 0] },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
                 },
               },
               serieOrigen: {
@@ -3242,16 +3319,23 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       movFolio:         { $arrayElemAt: ['$movimientos.folio',        0] },
       deposito:         { $arrayElemAt: ['$movimientos.deposito',     0] },
       numOperacion:     { $arrayElemAt: ['$movimientos.numOperacion', 0] },
-      // Diferencia: contra la porción de este depósito aplicada a esta factura
-      // (saldoMovimiento), no contra el depósito completo — null si no coincide
-      // (±$1), caso de 2+ REPs distintos compartiendo un mismo erpLink acumulado
-      // sin forma de saber cuál es cuál (ver comentario completo en pagosBanco).
+      // Ver comentario completo en pagosBanco: cuando un depósito paga varias
+      // facturas, se prefiere el abono específico de ESTA CxC en su propio
+      // kardex del ERP (parcialidadInfo.saldoAnterior − saldoActual) antes de
+      // caer a erpLinks/depósito completo.
       diferencia: {
         $let: {
           vars: {
             diff: { $round: [{ $subtract: [
               '$complementoPago.pagos.doctosRelacionados.impPagado',
-              { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] },
+              { $ifNull: [
+                { $cond: [
+                  { $ne: ['$parcialidadInfo', null] },
+                  { $subtract: ['$parcialidadInfo.saldoAnterior', '$parcialidadInfo.saldoActual'] },
+                  null,
+                ] },
+                { $ifNull: [{ $arrayElemAt: ['$movimientos.saldoMovimiento', 0] }, { $ifNull: [{ $arrayElemAt: ['$movimientos.deposito', 0] }, 0] }] },
+              ] },
             ]}, 2] },
           },
           in: { $cond: [{ $lte: [{ $abs: '$$diff' }, 1] }, '$$diff', null] },
@@ -3472,7 +3556,7 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
     buscarCuentasPorCobrarConMovimientos(erpIds),
     buscarEgresosRelacionados(uuid),
   ]);
-  const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura);
+  const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura, movimientos);
 
   res.json({ factura: factura || null, movimientos, parcialidades, cuentasPorCobrar, egresosRelacionados, facturaEsGlobal: esFacturaGlobal(factura) });
 });
@@ -3639,6 +3723,9 @@ const depositosIngresos = asyncHandler(async (req, res) => {
               folio:        '$$m.folio',
               concepto:     '$$m.concepto',
               numOperacion: { $ifNull: ['$$m.numeroAutorizacion', '$$m.referenciaNumerica'] },
+              // Ver comentario completo en pagosBanco — misma jerarquía que
+              // aplicarLogicaErp() en bank.service.js (saldoPagadoTotal → saldoPagado
+              // → legado saldoActual/total). NO usar saldoActual a secas.
               saldoMovimiento: {
                 $let: {
                   vars: {
@@ -3652,7 +3739,25 @@ const depositosIngresos = asyncHandler(async (req, res) => {
                       }, 0],
                     },
                   },
-                  in: '$$link.saldoActual',
+                  in: {
+                    $cond: [
+                      { $ne: ['$$link.saldoPagadoTotal', null] },
+                      '$$link.saldoPagadoTotal',
+                      {
+                        $cond: [
+                          { $ne: ['$$link.saldoPagado', null] },
+                          '$$link.saldoPagado',
+                          {
+                            $cond: [
+                              { $and: [{ $ne: ['$$link.saldoActual', null] }, { $gt: ['$$link.saldoActual', 0] }] },
+                              '$$link.saldoActual',
+                              { $ifNull: ['$$link.total', 0] },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
                 },
               },
             },
@@ -3749,7 +3854,7 @@ const depositosIngresosDetalle = asyncHandler(async (req, res) => {
     buscarCuentasPorCobrarConMovimientos(erpIds),
     buscarEgresosRelacionados(uuid),
   ]);
-  const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura);
+  const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura, movimientos);
 
   res.json({ factura: factura || null, movimientos, cuentasPorCobrar, egresosRelacionados, facturaEsGlobal: esFacturaGlobal(factura) });
 });

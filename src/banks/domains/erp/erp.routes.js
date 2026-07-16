@@ -687,14 +687,17 @@ router.get('/cobros/saldos-favor/:personaId', authenticate, asyncHandler(async (
 // (conciliacionFinalizadaAt === null):
 //   1. Siempre refresca el snapshot erpLinks[].movimientosKore con la respuesta actual de
 //      Kore, sin importar si la CxC ya se saldó — permite rastrear/auditar una CxC en curso.
-//   2. Si Kore confirma saldoActual === 0 (CxC saldada): calcula (solo si el vínculo es de
-//      un humano) el monto real aportado a saldoErp — ver _montoSaldoLink — y marca
-//      conciliacionFinalizadaAt (con o sin aporte; un vínculo de motor automático también
-//      se cierra, simplemente nunca aporta). Ya no hay nada más que Kore pueda reportar
-//      para esa CxC, así que el link deja de reconsultarse en corridas futuras.
-//   3. Si saldoActual !== 0: el link se deja abierto (conciliacionFinalizadaAt sigue null)
-//      — la siguiente corrida (manual, o el cron diario, que no acota por fecha) lo
-//      vuelve a intentar sin límite de antigüedad, hasta que la CxC se salde.
+//   2. Si Kore confirma saldoActual <= 0 (CxC saldada, o con saldo A FAVOR — un saldo
+//      negativo puede tardar mucho o nunca volver exactamente a 0, p.ej. por una retención
+//      posterior al pago): calcula (solo si el vínculo es de un humano) el monto real
+//      aportado a saldoErp — ver _montoSaldoLink — y marca conciliacionFinalizadaAt (con o
+//      sin aporte; un vínculo de motor automático también se cierra, simplemente nunca
+//      aporta). Ya no hay nada más que Kore pueda reportar para esa CxC, así que el link
+//      deja de reconsultarse en corridas futuras.
+//   3. Si saldoActual > 0 (aún pendiente de pago): el link se deja abierto
+//      (conciliacionFinalizadaAt sigue null) — la siguiente corrida (manual, o el cron
+//      diario, que no acota por fecha) lo vuelve a intentar sin límite de antigüedad, hasta
+//      que la CxC se salde.
 // saldoErp/status del movimiento se recalculan SOLO si al menos un link (de esta corrida o
 // de una anterior) ya está finalizado; si ninguno lo está, se deja el valor existente
 // intacto (puede provenir de otra fuente — ver aplicarLogicaErp en bank.service.js).
@@ -734,14 +737,19 @@ function _esFormaPagoBancariaKore(nombreFormaPago) {
       || /DEPOSITO.*EFECTIVO/.test(norm);
 }
 
-// Monto realmente cobrado por el banco para una cuenta ya saldada: suma el 'total'
+// Monto realmente cobrado por el banco para una cuenta ya saldada (saldoActual 0) o con
+// saldo A FAVOR (saldoActual negativo — p.ej. una retención aplicada después del pago
+// completo, que puede tardar mucho o nunca en volver exactamente a 0): suma el 'total'
 // (nunca formasPago[].monto, que puede ser un depósito compartido entre varias CxC, o —
 // como en el caso de una aplicación de saldo a favor/anticipo— ni siquiera corresponder al
 // total del movimiento que lo contiene) de cada movimiento cuya forma de pago sea bancaria
 // real. Excluye a propósito aplicaciones de saldo a favor, efectivo de caja, tarjeta, etc.
 // — esos movimientos también traen `formasPago` no vacío pero no son un depósito bancario.
+// Movimientos de retención (serie RET) no traen `formasPago` en absoluto, así que quedan
+// excluidos naturalmente — el monto recuperado es el que SALDÓ la CxC, no el saldo negativo
+// resultante de un ajuste posterior.
 function _montoSaldoLink(raw0) {
-  if (!raw0 || raw0.saldoActual !== 0) return 0;
+  if (!raw0 || raw0.saldoActual > 0) return 0;
   const conPagoBancario = (raw0.movimientos ?? []).filter(
     m => Array.isArray(m.formasPago)
       && m.formasPago.some(fp => _esFormaPagoBancariaKore(fp.nombreFormaPago)),
@@ -767,7 +775,7 @@ function _normalizarAutorizacion(v) {
 // pudo determinar" es distinto de "el aporte es cero", y el llamador debe respetar esa
 // diferencia para no pisar un saldoErp ya correcto con un cero falso.
 function _montoSaldoLinkPorAutorizacion(raw0, numeroAutorizacion) {
-  if (!raw0 || raw0.saldoActual !== 0) return null;
+  if (!raw0 || raw0.saldoActual > 0) return null;
   const autNorm = _normalizarAutorizacion(numeroAutorizacion);
   if (!autNorm) return null;
   const movimiento = (raw0.movimientos ?? []).find(m =>
@@ -960,8 +968,11 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             }
           }
 
-          if (raw0?.saldoActual === 0) {
-            // CxC saldada. Vínculo humano: suma TODO lo bancario de la CxC (un humano ya
+          if (raw0?.saldoActual <= 0) {
+            // CxC saldada (0) o con saldo A FAVOR (negativo — p.ej. una retención posterior
+            // al pago completo, que puede tardar mucho o nunca en volver exactamente a 0:
+            // no tiene sentido dejar el link abierto esperando un 0 exacto que quizá nunca
+            // llegue). Vínculo humano: suma TODO lo bancario de la CxC (un humano ya
             // confirmó visualmente que este depósito es el correcto). Vínculo de motor
             // automático: NUNCA se suma todo lo bancario (la CxC pudo recibir varios
             // depósitos de movimientos bancarios distintos a lo largo del tiempo) — se

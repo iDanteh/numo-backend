@@ -62,15 +62,17 @@ CfdiMappingRule.hasMany(PolizaMovimiento,   { foreignKey: 'reglaId', as: 'movimi
 async function syncModels() {
   const isProd = process.env.NODE_ENV === 'production';
 
-  // Tablas sin FK externas primero
-  await Promise.all([
-    User.sync({ alter: !isProd }),
-    BankConfig.sync({ alter: !isProd }),
-    BankRule.sync({ alter: !isProd }),
-    Entity.sync({ alter: !isProd }),
-    Permission.sync({ alter: !isProd }),
-    Role.sync({ alter: !isProd }),
-  ]);
+  // Tablas sin FK externas primero. Se sincronizan una por una (no en
+  // Promise.all): varios ALTER TABLE concurrentes contra el mismo Postgres
+  // agotan la memoria compartida de locks/catálogo (error "memoria compartida
+  // agotada" / "out of shared memory", típico con max_locks_per_transaction
+  // bajo en instancias de desarrollo).
+  await User.sync({ alter: !isProd });
+  await BankConfig.sync({ alter: !isProd });
+  await BankRule.sync({ alter: !isProd });
+  await Entity.sync({ alter: !isProd });
+  await Permission.sync({ alter: !isProd });
+  await Role.sync({ alter: !isProd });
 
   // Columna intercompañía en entidades (idempotente)
   await Poliza.sequelize.query(`

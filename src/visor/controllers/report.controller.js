@@ -5,6 +5,7 @@ const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
 const BankMovement = require('../../banks/domains/banks/BankMovement.model');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
+const entityRepo = require('../repositories/entity.repository');
 const { SERIES_CON_AUTH } = require('../../banks/domains/erp/erp-auth.utils');
 
 // Cache in-memory para el dashboard — evita lanzar 15 queries MongoDB
@@ -397,6 +398,16 @@ const dashboard = asyncHandler(async (req, res) => {
 
   const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
 
+  // El dashboard solo debe contar Emitidos — nunca Recibidos (aunque compartan
+  // source SAT/MANUAL/ERP). Si el frontend no manda rfcEmisor (ej. mientras
+  // carga la entidad activa), se restringe a las RFC de las entidades propias
+  // en vez de dejar el filtro abierto a cualquier emisor.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
+
   const dateFilter = {};
   if (fechaInicio) {
     const d = fechaInicio.split('T')[0];
@@ -418,13 +429,11 @@ const dashboard = asyncHandler(async (req, res) => {
   // Filtro base para KPIs de conciliación (solo ERP activos, sin cancelados ni deshabilitados)
   // Debe coincidir con los mismos criterios que countERP del aggregate de montos.
   // ERP: se filtra por erpStatus (estado en el origen), no satStatus
-  const cfdiFilter = { isActive: true, source: 'ERP', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter };
-  if (rfcEmisor) cfdiFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const cfdiFilter = { isActive: true, source: 'ERP', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID/ }, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) cfdiFilter.fecha = dateFilter;
 
   // Filtro para IVA y tipos: todos los CFDIs activos (ERP + SAT + MANUAL)
-  const baseFilter = { isActive: true, ...periodoFilter };
-  if (rfcEmisor) baseFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const baseFilter = { isActive: true, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) baseFilter.fecha = dateFilter;
 
   // Filtro para montos: ERP, SAT y MANUAL (MANUAL = XMLs del portal SAT subidos manualmente).
@@ -433,23 +442,19 @@ const dashboard = asyncHandler(async (req, res) => {
   // o isActive=1 no serían encontrados con la comparación estricta boolean.
   // MANUAL se agrupa junto con SAT (igual que en comparisonEngine) para que el
   // total SAT del dashboard refleje todos los documentos del lado SAT.
-  const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter };
-  if (rfcEmisor) montosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) montosFilter.fecha = dateFilter;
 
   // Filtro para CFDIs SAT/MANUAL que no tienen contraparte ERP
-  const satSoloFilter = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, lastComparisonStatus: 'not_in_erp', ...periodoFilter };
-  if (rfcEmisor) satSoloFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const satSoloFilter = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, lastComparisonStatus: 'not_in_erp', 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) satSoloFilter.fecha = dateFilter;
 
   // Cancelados ERP: solo los que tienen erpStatus = 'Cancelado'
-  const canceladosFilter = { source: 'ERP', erpStatus: 'Cancelado', ...periodoFilter };
-  if (rfcEmisor) canceladosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const canceladosFilter = { source: 'ERP', erpStatus: 'Cancelado', 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) canceladosFilter.fecha = dateFilter;
 
   // Vigentes en SAT que también están en ERP
-  const vigenteErpSatFilter = { isActive: true, source: 'ERP', satStatus: 'Vigente', uuid: { $not: /^SINUUID/ }, ...periodoFilter };
-  if (rfcEmisor) vigenteErpSatFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const vigenteErpSatFilter = { isActive: true, source: 'ERP', satStatus: 'Vigente', uuid: { $not: /^SINUUID/ }, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) vigenteErpSatFilter.fecha = dateFilter;
 
   const [
@@ -461,7 +466,7 @@ const dashboard = asyncHandler(async (req, res) => {
     ivaAggregate, ivaByTipoAggregate,
   ] = await Promise.all([
     // Total: solo ERP activos válidos + SAT/MANUAL activos válidos (sin deshabilitados ni SINUUID)
-    CFDI.countDocuments({ isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, uuid: { $not: /^SINUUID/ }, satStatus: { $nin: ['Deshabilitado'] }, erpStatus: { $nin: ['Deshabilitado'] }, ...periodoFilter, ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }), ...(Object.keys(dateFilter).length && { fecha: dateFilter }) }),
+    CFDI.countDocuments({ isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, uuid: { $not: /^SINUUID/ }, satStatus: { $nin: ['Deshabilitado'] }, erpStatus: { $nin: ['Deshabilitado'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter, ...(Object.keys(dateFilter).length && { fecha: dateFilter }) }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['match', 'conciliado'] } }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['discrepancy', 'warning'] } }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: [null, 'error', 'pending'] } }),
@@ -536,8 +541,7 @@ const dashboard = asyncHandler(async (req, res) => {
     //   SAT/MANUAL → satStatus Vigente
     //   isActive: { $ne: false } en lugar de true para evitar problemas de type-casting en aggregate
     CFDI.aggregate([
-      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter,
-        ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }),
+      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter,
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
@@ -555,8 +559,7 @@ const dashboard = asyncHandler(async (req, res) => {
 
     // IVA desglosado por tipo de comprobante (modal de detalle), mismos criterios
     CFDI.aggregate([
-      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter,
-        ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }),
+      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter,
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [

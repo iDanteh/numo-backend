@@ -1155,6 +1155,45 @@ const exportExcel = asyncHandler(async (req, res) => {
   res.end();
 });
 
+/**
+ * GET /api/cfdis/export-zip-recibidos
+ * Descarga en un ZIP los XML de los CFDIs Recibidos descargados del SAT
+ * (source='SAT') para un RFC receptor y mes (ejercicio/periodo) dados.
+ * Query: rfcReceptor, ejercicio, periodo
+ */
+const exportZipRecibidos = asyncHandler(async (req, res) => {
+  const { rfcReceptor, ejercicio, periodo } = req.query;
+  if (!rfcReceptor) return res.status(400).json({ error: 'rfcReceptor es requerido' });
+  if (!ejercicio || !periodo) return res.status(400).json({ error: 'ejercicio y periodo son requeridos' });
+
+  const ej = parseInt(ejercicio);
+  const pe = parseInt(periodo);
+
+  const cfdis = await CFDI.find({
+    isActive:        true,
+    source:          'SAT',
+    'receptor.rfc':  rfcReceptor.toUpperCase(),
+    ejercicio:       ej,
+    periodo:         pe,
+  }, 'uuid xmlContent').select('+xmlContent').lean();
+
+  const conXml = cfdis.filter(c => c.xmlContent);
+  if (!conXml.length) {
+    return res.status(404).json({ error: 'No hay CFDIs recibidos SAT con XML disponible para ese RFC y periodo.' });
+  }
+
+  const zip = new AdmZip();
+  for (const c of conXml) zip.addFile(`${c.uuid}.xml`, Buffer.from(c.xmlContent, 'utf-8'));
+
+  const nombreZip = `Recibidos_SAT_${rfcReceptor.toUpperCase()}_${ej}${String(pe).padStart(2, '0')}.zip`;
+  const buffer    = zip.toBuffer();
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${nombreZip}"`);
+  res.setHeader('Content-Length', buffer.length);
+  res.send(buffer);
+});
+
 // ── Reclasificación Global ────────────────────────────────────────────────────
 
 /**
@@ -1492,6 +1531,7 @@ const repairXmlSubtotals = asyncHandler(async (req, res) => {
 
 module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
+  exportZipRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
   repairXmlSubtotals,
 };

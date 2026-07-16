@@ -236,7 +236,7 @@ const solicitar = async (params) => {
       TipoSolicitud:  tipoSolicitud,
     };
     if (tipoDeComprobante)  solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
-    if (esRecibidosReq)     solicitudAttrs.EstadoComprobante = '1';
+    if (esRecibidosReq)     solicitudAttrs.EstadoComprobante = 'Vigente';
     if (folioFiscalUUID)    solicitudAttrs.FolioFiscalUUID   = folioFiscalUUID.toUpperCase();
 
     const canonical = canonizarSolicitud(solicitudAttrs, ns);
@@ -248,7 +248,7 @@ const solicitar = async (params) => {
     const firma   = await crearFirmaSolicitud(cerCopy, keyCopy, pwdCopy, canonical);
 
     const tipoAttr   = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
-    const estadoAttr = esRecibidosReq ? ' EstadoComprobante="1"' : '';
+    const estadoAttr = esRecibidosReq ? ' EstadoComprobante="Vigente"' : '';
     const uuidAttr   = folioFiscalUUID ? ` FolioFiscalUUID="${folioFiscalUUID.toUpperCase()}"` : '';
 
     return `<?xml version="1.0" encoding="UTF-8"?>

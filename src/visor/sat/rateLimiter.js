@@ -25,7 +25,7 @@ const SatRateLimit = require('../models/SatRateLimit');
  *    anteriores ya terminaron o se reanudaron.
  */
 
-const MAX_DIARIO  = 10; // Límite empírico conservador; SAT empieza a throttlear alrededor de 10 solicitudes/día
+const MAX_DIARIO  = 15; // Límite empírico conservador; SAT empieza a throttlear alrededor de 10 solicitudes/día
 const MAX_ACTIVOS = 3;
 
 // Map<rfc, { activas: number }> — solo activas en memoria (por instancia)

@@ -89,6 +89,26 @@ const bankMovementSchema = new mongoose.Schema({
           subtotal:      { type: Number, default: null },
           impuesto:      { type: Number, default: null },
           total:         { type: Number, default: null },
+          // Desglose por forma de pago que Kore reporta para ESTE movimiento — información
+          // adicional para análisis futuro (nunca se usa hoy para calcular saldoErpAportado
+          // ni ningún otro campo; ver _montoSaldoLink en erp.routes.js, que sigue basándose
+          // solo en `total`). Se pisa completo en cada corrida junto con el resto de
+          // movimientosKore — no es una bitácora acumulativa como desglosePorFormaPago.
+          formasPago: {
+            type: [{
+              formaPagoId:          { type: String, default: null },
+              formaPagoDescripcion: { type: String, default: null },
+              monto:                { type: Number, default: null },
+              adicionales: {
+                type: [{
+                  nombre: { type: String, default: null },
+                  valor:  { type: String, default: null },
+                }],
+                default: [],
+              },
+            }],
+            default: [],
+          },
         }],
         default: [],
       },

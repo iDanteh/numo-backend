@@ -7,9 +7,10 @@
 
 // Puerto exacto de _esFormaBancaria()/_norm() en cobro-panel.component.ts — NO
 // se basa en si la forma trae banco seleccionado (bancoKoreId), sino en el
-// TEXTO de la descripción: transferencia o depósito en efectivo cuentan como
-// "bancaria" (alimentan saldoPagado), cualquier otra (cheque, efectivo de
-// caja, tarjeta, etc.) no, aunque sí liquide la CxC (saldoPagadoTotal).
+// TEXTO de la descripción: transferencia, cheque o depósito en efectivo
+// cuentan como "bancaria" (alimentan saldoPagado — dropdown "CxC vinculadas"
+// de la tabla de movimientos), cualquier otra (efectivo de caja, tarjeta,
+// compensación, etc.) no, aunque sí liquide la CxC (saldoPagadoTotal).
 // "Depósito en efectivo" normalmente no trae bancoKoreId (no siempre exige
 // elegir banco), por eso basarse en bancoKoreId lo excluía por error.
 function normFormaPago(s) {
@@ -22,6 +23,7 @@ function esFormaBancaria(f) {
   if (!f) return false;
   const desc = f.formaPagoDescripcion || '';
   if (/transferencia/i.test(desc)) return true;
+  if (/cheque/i.test(desc)) return true;
   return /deposito.*efectivo/.test(normFormaPago(desc));
 }
 
@@ -41,19 +43,23 @@ function tipoSaldoEspecial(f) {
 // erpLinks[] a pasar a bankService.setErpIds() — mismo cálculo que
 // _buildCobroSaldosErp() en cobro-panel.component.ts:
 //   - saldoActual: saldo EN VIVO de Kore (antes de este cobro) menos lo pagado ahora.
-//   - saldoPagado: acumulado de formas BANCARIAS (transferencia/depósito) — alimenta
-//     el badge de la tabla de bancos.
+//   - saldoPagado: acumulado de formas BANCARIAS (transferencia/cheque/depósito) —
+//     alimenta el badge de la tabla de bancos.
 //   - saldoPagadoTotal: acumulado de CUALQUIER forma — alimenta saldoErp.
-// Ambos acumulados se suman sobre lo que ya tuviera el erpLink existente (por si la
-// CxC ya traía pagos parciales previos en ese mismo movimiento).
+//   - desglosePorFormaPago: bitácora de auditoría, una entrada por cada forma de pago
+//     usada en ESTE cobro — igual que hace cobro-panel.component.ts.
+// Los 3 acumulados/bitácora se suman sobre lo que ya tuviera el erpLink existente (por
+// si la CxC ya traía pagos parciales previos en ese mismo movimiento) — nunca se
+// sobreescriben.
 // setErpIds() REEMPLAZA por completo mov.erpLinks, así que aquí también se preservan
 // los links de otras CxC ajenas a esta solicitud que ya estuvieran en el movimiento.
 function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
   const round2       = (n) => Math.round(n * 100) / 100;
   const cuentaPorId   = new Map(cuentasKore.map(c => [String(c.id), c]));
   const existingPorId = new Map((existingLinks || []).map(l => [l.erpId, l]));
+  const fechaCobro    = new Date();
 
-  function _link(cxc, pagadoBanco, pagadoTotal) {
+  function _link(cxc, pagadoBanco, pagadoTotal, nuevoDesglose) {
     const cuenta    = cuentaPorId.get(cxc.erpId);
     const prevSaldo = cuenta?.saldoActual ?? cxc.total ?? 0;
     const existing  = existingPorId.get(cxc.erpId);
@@ -67,19 +73,36 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
       serie:            cxc.serie ?? cuenta?.serie ?? null,
       folioExterno:     cxc.folioExterno ?? cuenta?.folio ?? null,
       tipoPago:         cxc.tipoPago ?? cuenta?.tipoPago ?? null,
+      desglosePorFormaPago: [...(existing?.desglosePorFormaPago ?? []), ...nuevoDesglose],
     };
+  }
+
+  function _desgloseDe(formaPago, monto) {
+    if (!(monto > 0)) return [];
+    return [{
+      formaPagoId:          formaPago.formaPagoId,
+      formaPagoDescripcion: formaPago.formaPagoDescripcion,
+      monto:                round2(monto),
+      fecha:                fechaCobro,
+    }];
   }
 
   let nuevos;
   if (cr.cxcs.length === 1) {
+    // Modo 1 — N formas de pago, todas contra la misma (única) CxC: una entrada de
+    // desglose por cada forma de pago con importe > 0.
     const totalPaid = cr.formasPago.reduce((s, f) => s + f.importe, 0);
     const bancoPaid = cr.formasPago.filter(esFormaBancaria).reduce((s, f) => s + f.importe, 0);
-    nuevos = [_link(cr.cxcs[0], bancoPaid, totalPaid)];
+    const desglose  = cr.formasPago.flatMap(f => _desgloseDe(f, f.importe));
+    nuevos = [_link(cr.cxcs[0], bancoPaid, totalPaid, desglose)];
   } else {
+    // Modo 2 — 1 sola forma de pago global, repartida entre N CxC: cada CxC recibe UNA
+    // entrada de desglose con la misma forma de pago y el monto que le tocó (montoAsignado).
     const esBancaria = esFormaBancaria(cr.formasPago[0]);
     nuevos = cr.cxcs.map(cxc => {
-      const paid = cxc.montoAsignado ?? 0;
-      return _link(cxc, esBancaria ? paid : 0, paid);
+      const paid     = cxc.montoAsignado ?? 0;
+      const desglose = _desgloseDe(cr.formasPago[0], paid);
+      return _link(cxc, esBancaria ? paid : 0, paid, desglose);
     });
   }
 

@@ -10,7 +10,6 @@ const bankService       = require('../banks/bank.service'); // setErpIds — mis
 // refactor — desestructurar aquí rompería esa capacidad de prueba.
 const koreCaja          = require('../erp/kore-caja.service');
 const { parseCxcs, parseFormasPago }               = require('./collection-request.parsers');
-const { buildPayloadSingle, buildPayloadMulti }    = require('./collection-request-kore-payload');
 const { buildErpLinksParaCobro, tipoSaldoEspecial } = require('./collection-request-erp-links');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
 const driveComprobantes                  = require('./drive-comprobantes.service');
@@ -127,10 +126,10 @@ async function create(data, files = []) {
   }
 
   // Saldo a favor / anticipo: sin el id + monto del registro específico usado,
-  // Kore recibiría saldosAFavorAUsar/anticipos vacíos y no sabría de dónde
-  // descontar (ver collection-request-kore-payload.js). El mismo chequeo vive
-  // en el pre('validate') del modelo — se repite aquí para dar un error claro
-  // antes de tocar Mongo, igual que ya se hace con la validación de Modo 2.
+  // no queda claro de qué registro se descontó cada saldo/anticipo al
+  // guardar la solicitud. El mismo chequeo vive en el pre('validate') del
+  // modelo — se repite aquí para dar un error claro antes de tocar Mongo,
+  // igual que ya se hace con la validación de Modo 2.
   const saldoEspecialInvalido = formasPagoParsed.find(f => {
     const tipo = tipoSaldoEspecial(f);
     if (!tipo) return false;
@@ -194,7 +193,11 @@ async function create(data, files = []) {
       solicitanteNombre: usuarioSolicitanteNombre ? String(usuarioSolicitanteNombre).trim() : null,
     });
 
-    return _toSafeJSON(cr);
+    const safe = _toSafeJSON(cr);
+    // Kore ya avisa en tiempo real con este mismo POST — lo único que faltaba era
+    // propagarlo a quien tenga la bandeja abierta, sin tener que recargar a mano.
+    emitToAll('collection-request:created', safe);
+    return safe;
   } catch (err) {
     // Race condition: dos requests casi simultáneas con el mismo solicitudIdErp
     // pasaron el check de arriba antes de que la primera terminara de insertar
@@ -441,20 +444,47 @@ async function identificar(id, bankMovementId, user) {
   const referencia        = String(mov.folio ?? '');
   const formasPagoConRef  = cr.formasPago.map(f => ({ ...f.toObject(), referencia }));
 
-  // 4. Armar payload y llamar a Kore — Modo 1 (1 CxC) o Modo 2 (N CxC).
+  // 4. Avisar a Kore el estatus de revisión contable de la solicitud (endpoint
+  // distinto al de aplicar el cobro) — con el token del usuario de cobranza/
+  // contabilidad que está identificando, NO el del cajero: esta acción es
+  // "revisión contable", no aplicar un cobro, y el cajero puede no tener nada
+  // que ver con quién revisa. Kore EXIGE este aviso (APROBADO) antes de
+  // permitir aplicar el cobro — confirmado con Kore real: intentar aplicar el
+  // cobro sin este paso responde 400 "no puede aplicar operaciones... hasta
+  // resolver las solicitudes generadas anteriormente". Todo o nada: si Kore
+  // rechaza este aviso, no se aplica el cobro (paso 5) ni se persiste nada en
+  // Numo.
+  try {
+    const tokenRevisor = await koreCaja.obtenerTokenKore(user._id);
+    const avisoResult = await koreCaja.actualizarEstatusSolicitud(tokenRevisor, cr.solicitudIdErp, 'APROBADO', 'Cobro conciliado y aplicado en Numo');
+    console.log(`[collection-requests] identificar ${id}: Kore confirmó APROBADO para solicitudIdErp=${cr.solicitudIdErp} →`, JSON.stringify(avisoResult));
+  } catch (err) {
+    if (koreCaja.esErrorYaEnEstatus(err, 'APROBADO')) {
+      // Reintento sobre una solicitud que un intento anterior ya dejó
+      // APROBADO en Kore, pero que no se persistió en Numo porque el cobro
+      // (paso 5) falló en ese intento previo — no es un error real, se sigue.
+      console.warn(`[collection-requests] identificar ${id}: Kore ya tenía solicitudIdErp=${cr.solicitudIdErp} en APROBADO (reintento) — se continúa con el cobro.`);
+    } else if (err instanceof koreCaja.KoreCajaError) {
+      throw new BadRequestError(`No se pudo notificar el estatus a Kore: ${err.message}`);
+    } else {
+      throw err;
+    }
+  }
+
+  // 5. Aplicar el cobro — ahora que Kore ya aprobó la solicitud, este endpoint
+  // dedicado la aplica internamente con los datos que Kore ya tiene desde que
+  // ÉL creó la solicitud: no se le manda ningún payload de cobro, solo
+  // Comentario + Estatus, igual en Modo 1 y Modo 2.
   let koreResult;
   try {
-    if (cr.cxcs.length === 1) {
-      const payload = buildPayloadSingle(cr, formasPagoConRef, mov, sesionId);
-      koreResult = await koreCaja.aplicarCobroOperacion(sesionId, koreToken, payload);
-    } else {
-      const payload = buildPayloadMulti(cr, formasPagoConRef, mov, sesionId);
-      koreResult = await koreCaja.aplicarCobroOperacionMultiple(sesionId, koreToken, payload);
-    }
+    koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, {
+      Comentario: 'Cobro conciliado y aplicado en Numo',
+      Estatus:    'APROBADO',
+    });
   } catch (err) {
     if (err instanceof koreCaja.KoreCajaError) {
-      // aplicarCobroOperacion(Multiple) ya loguea el payload y el rechazo crudo
-      // de Kore por consola — este log adicional deja explícito con qué
+      // aplicarSolicitudOperacion ya loguea el payload y el rechazo crudo de
+      // Kore por consola — este log adicional deja explícito con qué
       // solicitud/CxC se relaciona ese rechazo, para no tener que cruzar logs.
       console.warn(`[collection-requests] identificar ${id}: Kore rechazó el cobro (cxcs=${cr.cxcs.map(c => c.erpId).join(',')}, conceptoId=${cr.conceptoId}):`, err.message, err.koreBody ? JSON.stringify(err.koreBody) : '');
       throw new BadRequestError(`Kore rechazó el cobro: ${err.message}`);
@@ -462,7 +492,7 @@ async function identificar(id, bankMovementId, user) {
     throw err;
   }
 
-  // 5. Kore aceptó el cobro — vincular la(s) CxC al movimiento con el MISMO
+  // 6. Kore aceptó el cobro — vincular la(s) CxC al movimiento con el MISMO
   // mecanismo que usa el panel de cobros (erpLinks/erpIds/identificadoPor/
   // saldoErp/status vía aplicarLogicaErp), no un simple status a mano. Puede
   // lanzar ConflictError si otro usuario ya tiene el movimiento tomado — se
@@ -478,7 +508,7 @@ async function identificar(id, bankMovementId, user) {
   const identidadCajero = { _id: cr.solicitanteUserId, nombre: cr.solicitanteNombre, role: user.role };
   await bankService.setErpIds(bankMovementId, erpLinks, identidadCajero);
 
-  // 6. Solo si todo lo anterior salió bien: persistir la solicitud.
+  // 7. Solo si todo lo anterior salió bien: persistir la solicitud.
   cr.formasPago          = formasPagoConRef;
   cr.bankMovementId      = bankMovementId;
   cr.status              = 'identificada';
@@ -490,7 +520,7 @@ async function identificar(id, bankMovementId, user) {
   cr.koreOperacionResult = koreResult;
   await cr.save();
 
-  // 7. Avisar en tiempo real a quien tenga la bandeja abierta (cobranza/contabilidad/
+  // 8. Avisar en tiempo real a quien tenga la bandeja abierta (cobranza/contabilidad/
   // admin) y a la tienda que la solicitó — sin esto, cualquier otra sesión con la
   // vista abierta se queda con el estado viejo hasta que alguien recargue a mano.
   emitToAll('collection-request:updated', _eventoActualizacion(cr, mov));
@@ -498,8 +528,34 @@ async function identificar(id, bankMovementId, user) {
   return _toSafeJSON(cr);
 }
 
+// Antes de tocar Mongo, se avisa a Kore el estatus de revisión contable
+// (RECHAZADO) — con el token del usuario de cobranza/contabilidad que ejecuta
+// la acción (no el del cajero: ver el mismo criterio en identificar()). No hay
+// paso de "aplicar" para un rechazo — solo existe para aprobar un cobro. Todo
+// o nada: si Kore rechaza este aviso, no se marca "rechazada" en Numo tampoco.
+// El `motivo` que ya captura el usuario es el mismo texto que viaja como
+// Comentario a Kore — no hace falta pedir un campo aparte.
 async function rechazar(id, motivo, user) {
-  const cr = await CollectionRequest.findOneAndUpdate(
+  const cr = await CollectionRequest.findOne({ _id: id, status: { $ne: 'identificada' } });
+  if (!cr) throw new NotFoundError('Solicitud no encontrada o ya identificada');
+
+  try {
+    const tokenRevisor = await koreCaja.obtenerTokenKore(user._id);
+    await koreCaja.actualizarEstatusSolicitud(tokenRevisor, cr.solicitudIdErp, 'RECHAZADO', motivo || 'Solicitud rechazada en Numo');
+  } catch (err) {
+    if (koreCaja.esErrorYaEnEstatus(err, 'RECHAZADO')) {
+      console.warn(`[collection-requests] rechazar ${id}: Kore ya tenía solicitudIdErp=${cr.solicitudIdErp} en RECHAZADO (reintento) — se continúa.`);
+    } else if (err instanceof koreCaja.KoreCajaError) {
+      throw new BadRequestError(`No se pudo notificar el estatus a Kore: ${err.message}`);
+    } else {
+      throw err;
+    }
+  }
+
+  // Guard atómico repetido a propósito: entre el findOne de arriba y este
+  // update pudo haberse identificado la solicitud desde otra sesión — el
+  // filtro { status: { $ne: 'identificada' } } evita pisar ese resultado.
+  const actualizada = await CollectionRequest.findOneAndUpdate(
     { _id: id, status: { $ne: 'identificada' } },
     {
       status:            'rechazada',
@@ -510,11 +566,11 @@ async function rechazar(id, motivo, user) {
     },
     { new: true },
   );
-  if (!cr) throw new NotFoundError('Solicitud no encontrada o ya identificada');
+  if (!actualizada) throw new NotFoundError('Solicitud no encontrada o ya identificada');
 
-  emitToAll('collection-request:updated', _eventoActualizacion(cr, null));
+  emitToAll('collection-request:updated', _eventoActualizacion(actualizada, null));
 
-  return _toSafeJSON(cr);
+  return _toSafeJSON(actualizada);
 }
 
 module.exports = {

@@ -143,8 +143,16 @@ const derivarFechas = (ejercicio, periodo) => {
  * @param {object} facturaRaw   — objeto original del ERP (para FechaPago/FormaPago)
  */
 const enrichComplementoPago = async (doc, facturaRaw) => {
-  // Solo aplica si el transformer NO pudo construir el complemento
-  if (doc.complementoPago) return;
+  // Aplica si el transformer NO pudo construir el complemento, O si lo construyó
+  // pero dejó algún pago sin doctosRelacionados (ej. el transformer solo resuelve
+  // pagos de una sola factura — ver `normalizarPagosERP` — y este documento venía
+  // de un intento anterior con esa limitación). Antes esto se saltaba con solo
+  // `if (doc.complementoPago) return`, lo que bloqueaba PARA SIEMPRE el
+  // reintento de cualquier documento que ya tuviera complementoPago, aunque
+  // viniera incompleto (confirmado contra un caso real en producción).
+  const pagos = doc.complementoPago?.pagos ?? [];
+  const yaCompleto = pagos.length > 0 && pagos.every((p) => (p.doctosRelacionados ?? []).length > 0);
+  if (yaCompleto) return;
 
   // Extraer UUIDs de relaciones tipo "08" (aplicación de pagos)
   const uuidsRelacionados = (doc.cfdiRelacionados ?? [])
@@ -506,13 +514,16 @@ const previsualizar = asyncHandler(async (req, res) => {
 // ─── POST /api/erp/enriquecer-pagos ──────────────────────────────────────────
 
 /**
- * Reprocesa CFDIs tipo P sin complementoPago usando dos estrategias:
+ * Reprocesa CFDIs tipo P sin complementoPago, O con complementoPago incompleto
+ * (algún pago sin doctosRelacionados — ver nota en `enrichComplementoPago` de
+ * por qué esto ya no se limita a "campo totalmente ausente"), usando dos
+ * estrategias:
  *
  *   SAT / MANUAL / RECEPTOR  → re-parsea xmlContent almacenado en BD
  *   ERP                      → busca facturas relacionadas (TipoRelacion "08")
  *
  * Body (opcional): { ejercicio, periodo }
- *   Sin parámetros → procesa TODOS los P sin complementoPago.
+ *   Sin parámetros → procesa TODOS los P pendientes.
  */
 const enriquecerPagos = asyncHandler(async (req, res) => {
   const ejercicio = req.body.ejercicio ? parseInt(req.body.ejercicio, 10) : null;
@@ -520,7 +531,10 @@ const enriquecerPagos = asyncHandler(async (req, res) => {
 
   const filtro = {
     tipoDeComprobante: 'P',
-    complementoPago: { $exists: false },
+    $or: [
+      { complementoPago: { $exists: false } },
+      { 'complementoPago.pagos': { $elemMatch: { doctosRelacionados: { $size: 0 } } } },
+    ],
   };
   if (ejercicio) filtro.ejercicio = ejercicio;
   if (periodo)   filtro.periodo   = periodo;

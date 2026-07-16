@@ -968,6 +968,26 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             }
           }
 
+          // tieneRetencion/montoRetenido se recalculan en CADA corrida (no solo al crear el
+          // link) — una retención puede llegar después de que el link ya existía (ej. la CxC
+          // se pagó por completo y semanas más tarde Kore aplicó una retención fiscal), y sin
+          // este refresh el reporte "Retención" (bank.service.js) quedaría desactualizado para
+          // siempre en esos casos. Mismo criterio que usa el motor automático al crear el
+          // link (bank-autorizaciones.service.js): movimientos con serie 'RET'. montoRetenido
+          // suma su `total` en valor absoluto — evita recorrer movimientosKore para saber
+          // cuánto está retenido ahora mismo.
+          const movsRetencion = (raw0?.movimientos ?? []).filter(m => m.serie === 'RET');
+          const tieneRetencionAhora = movsRetencion.length > 0;
+          const montoRetenidoAhora  = tieneRetencionAhora
+            ? movsRetencion.reduce((s, m) => s + Math.abs(m.total ?? 0), 0)
+            : null;
+          if (tieneRetencionAhora !== (link.tieneRetencion ?? false)) {
+            linksActualizados[i].tieneRetencion = tieneRetencionAhora;
+          }
+          if (montoRetenidoAhora !== (link.montoRetenido ?? null)) {
+            linksActualizados[i].montoRetenido = montoRetenidoAhora;
+          }
+
           if (raw0?.saldoActual <= 0) {
             // CxC saldada (0) o con saldo A FAVOR (negativo — p.ej. una retención posterior
             // al pago completo, que puede tardar mucho o nunca en volver exactamente a 0:

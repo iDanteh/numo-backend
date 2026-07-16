@@ -235,9 +235,16 @@ const ejecutarComparacionAuto = async ({ ejercicioParam, periodoParam } = {}) =>
 
   const baseFilter = { isActive: true, ejercicio, periodo, tipoDeComprobante: { $ne: 'T' } };
 
+  // Recibidos SAT es solo para descarga/archivo — NO debe entrar al motor de
+  // comparación ERP vs SAT. Se filtra al lado Emitidos exigiendo que el emisor
+  // sea una de nuestras propias entidades (si el emisor es un tercero, el CFDI
+  // es un recibido y se excluye de este query, sin importar su "source").
+  const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+  const satFilter = { ...baseFilter, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc': { $in: entidadesRfcs } };
+
   const [erpCfdis, satCfdis, allErpUuids] = await Promise.all([
     CFDI.find({ ...baseFilter, source: 'ERP' }, '_id uuid').lean(),
-    CFDI.find({ ...baseFilter, source: { $in: ['SAT', 'MANUAL'] } }, '_id uuid').lean(),
+    CFDI.find(satFilter, '_id uuid').lean(),
     CFDI.find({ ...baseFilter, source: 'ERP' }, 'uuid').lean(),
   ]);
 
@@ -429,8 +436,8 @@ const reintentarIncompletos = async () => {
   }
 };
 
-const ejecutarDescargaMasiva = async () => {
-  logger.info('[SatSyncJob] Iniciando descarga masiva nocturna...');
+const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = {}) => {
+  logger.info(`[SatSyncJob] Iniciando descarga masiva nocturna (${tiposObjetivo.join(', ')})...`);
 
   // Fechas en hora de México (el SAT usa CDMX como referencia)
   const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
@@ -520,10 +527,14 @@ const ejecutarDescargaMasiva = async () => {
       for (const rango of rangos) {
         logger.info(`[SatSyncJob] RFC ${rfc}: procesando rango "${rango.label}"`);
 
-        // Solo Emitidos (Recibidos desactivado — error 301 del SAT)
-        const tipos = [];
-        if (entidad.syncConfig?.syncEmitidos !== false) tipos.push('Emitidos');
-        if (tipos.length === 0) tipos.push('Emitidos');
+        // Filtra los tipos pedidos por el caller según la config de sincronización de la entidad.
+        // Emitidos y Recibidos corren en jobs/horarios separados (ver reprogramarJobs) para no
+        // saturar al SAT con solicitudes simultáneas del mismo RFC.
+        const tipos = tiposObjetivo.filter(t => {
+          if (t === 'Emitidos')  return entidad.syncConfig?.syncEmitidos  !== false;
+          if (t === 'Recibidos') return entidad.syncConfig?.syncRecibidos !== false;
+          return true;
+        });
 
         for (const tipoComprobante of tipos) {
           // Cada Emitidos se divide en 4 sub-solicitudes SAT
@@ -737,10 +748,10 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
         { $set: { ejercicio, periodo, fechaFin: fechaFin.slice(0, 10), status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0, error: null, updatedAt: new Date() } },
         { upsert: true, new: true },
       );
-      idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, folioFiscalUUID });
-      await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
-
       try {
+        idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, folioFiscalUUID });
+        await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
+
         ({ idsPaquetes, totalCfdis: totalReportadoSATLocal } = await verificar(idSolicitud, rfc, creds));
         break; // solicitud aceptada y terminada — salir del loop de reintentos
       } catch (rechazadaErr) {
@@ -1637,9 +1648,21 @@ const jobVerificacionSAT = async () => {
 
 const jobDescargaMasiva = async () => {
   try {
-    await ejecutarDescargaMasiva();
+    await ejecutarDescargaMasiva({ tipos: ['Emitidos'] });
   } catch (err) {
     logger.error(`[SatSyncJob] Error fatal en descarga masiva: ${err.message}`);
+  }
+};
+
+// Job separado para Recibidos — corre en un horario distinto al de Emitidos
+// (ver reprogramarJobs) para no disparar solicitudes simultáneas del mismo RFC.
+// Comparte el mismo limitador de cuota SAT (rateLimiter) que Emitidos, así que
+// ambos jobs nunca exceden juntos el máximo diario ni el máximo de activas.
+const jobDescargaMasivaRecibidos = async () => {
+  try {
+    await ejecutarDescargaMasiva({ tipos: ['Recibidos'] });
+  } catch (err) {
+    logger.error(`[SatSyncJob] Error fatal en descarga masiva de Recibidos: ${err.message}`);
   }
 };
 
@@ -1663,10 +1686,11 @@ const horaACron = (hora) => {
 };
 
 // Instancias actuales de los jobs (para poder destruirlas y recrearlas)
-let _jobVerif       = null;
-let _jobDescarga    = null;
-let _jobERP         = null;
-let _jobComparacion = null;
+let _jobVerif             = null;
+let _jobDescarga          = null;
+let _jobDescargaRecibidos = null;
+let _jobERP               = null;
+let _jobComparacion       = null;
 
 const jobDescargaERP = async () => {
   try { await ejecutarDescargaERP(); }
@@ -1881,20 +1905,25 @@ cron.schedule('*/5 * * * *', async () => {
  * (Re)programa los cuatro jobs con los horarios indicados.
  * Llamado al arrancar la app y cuando el usuario cambia el horario via API.
  */
-const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVerificacion = '02:00', comparacion = '04:00' } = {}) => {
-  if (_jobVerif)       { _jobVerif.stop();       _jobVerif       = null; }
-  if (_jobDescarga)    { _jobDescarga.stop();    _jobDescarga    = null; }
-  if (_jobERP)         { _jobERP.stop();         _jobERP         = null; }
-  if (_jobComparacion) { _jobComparacion.stop(); _jobComparacion = null; }
+const reprogramarJobs = ({
+  satDescarga = '01:00', satDescargaRecibidos = '22:00',
+  erpDescarga = '03:00', erpVerificacion = '02:00', comparacion = '04:00',
+} = {}) => {
+  if (_jobVerif)             { _jobVerif.stop();             _jobVerif             = null; }
+  if (_jobDescarga)          { _jobDescarga.stop();          _jobDescarga          = null; }
+  if (_jobDescargaRecibidos) { _jobDescargaRecibidos.stop(); _jobDescargaRecibidos = null; }
+  if (_jobERP)               { _jobERP.stop();               _jobERP               = null; }
+  if (_jobComparacion)       { _jobComparacion.stop();       _jobComparacion       = null; }
 
-  _jobDescarga    = cron.schedule(horaACron(satDescarga),     jobDescargaMasiva,   { timezone: 'America/Mexico_City' });
-  _jobERP         = cron.schedule(horaACron(erpDescarga),     jobDescargaERP,      { timezone: 'America/Mexico_City' });
-  _jobVerif       = cron.schedule(horaACron(erpVerificacion), jobVerificacionSAT,  { timezone: 'America/Mexico_City' });
-  _jobComparacion = cron.schedule(horaACron(comparacion),     jobComparacionAuto,  { timezone: 'America/Mexico_City' });
+  _jobDescarga          = cron.schedule(horaACron(satDescarga),          jobDescargaMasiva,          { timezone: 'America/Mexico_City' });
+  _jobDescargaRecibidos = cron.schedule(horaACron(satDescargaRecibidos), jobDescargaMasivaRecibidos, { timezone: 'America/Mexico_City' });
+  _jobERP               = cron.schedule(horaACron(erpDescarga),          jobDescargaERP,             { timezone: 'America/Mexico_City' });
+  _jobVerif             = cron.schedule(horaACron(erpVerificacion),      jobVerificacionSAT,         { timezone: 'America/Mexico_City' });
+  _jobComparacion       = cron.schedule(horaACron(comparacion),          jobComparacionAuto,         { timezone: 'America/Mexico_City' });
 
   logger.info(
-    `[SatSyncJob] Jobs programados — Descarga SAT: ${satDescarga} | Descarga ERP: ${erpDescarga} | ` +
-    `Verificación: ${erpVerificacion} | Comparación: ${comparacion} (America/Mexico_City)`
+    `[SatSyncJob] Jobs programados — Descarga SAT Emitidos: ${satDescarga} | Descarga SAT Recibidos: ${satDescargaRecibidos} | ` +
+    `Descarga ERP: ${erpDescarga} | Verificación: ${erpVerificacion} | Comparación: ${comparacion} (America/Mexico_City)`
   );
 };
 
@@ -1902,16 +1931,17 @@ const reprogramarJobs = ({ satDescarga = '01:00', erpDescarga = '03:00', erpVeri
 (async () => {
   try {
     const AppConfig = require('../models/AppConfig');
-    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'erpDescarga', 'erpVerificacion', 'comparacion'] } }).lean();
+    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion'] } }).lean();
     const map       = Object.fromEntries(configs.map(c => [c.key, c.value]));
     reprogramarJobs({
-      satDescarga:     map.satDescarga     ?? '01:00',
-      erpDescarga:     map.erpDescarga     ?? '03:00',
-      erpVerificacion: map.erpVerificacion ?? '02:00',
-      comparacion:     map.comparacion     ?? '04:00',
+      satDescarga:          map.satDescarga          ?? '01:00',
+      satDescargaRecibidos: map.satDescargaRecibidos ?? '22:00',
+      erpDescarga:          map.erpDescarga          ?? '03:00',
+      erpVerificacion:      map.erpVerificacion      ?? '02:00',
+      comparacion:          map.comparacion          ?? '04:00',
     });
   } catch (err) {
-    logger.error(`[SatSyncJob] No se pudo leer horario de BD al arrancar — usando defaults (01:00/03:00/02:00/04:00). Error: ${err.message}`);
+    logger.error(`[SatSyncJob] No se pudo leer horario de BD al arrancar — usando defaults (01:00/22:00/03:00/02:00/04:00). Error: ${err.message}`);
     reprogramarJobs();
   }
 

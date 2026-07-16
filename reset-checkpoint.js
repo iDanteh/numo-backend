@@ -6,7 +6,7 @@ const mongoose = require('mongoose');
 const RFC = 'CCO011113663';
 
 mongoose.connect(process.env.MONGODB_URI).then(async () => {
-  const r = await mongoose.connection.collection('satjobcheckpoints').updateMany(
+  const r = await mongoose.connection.collection('sat_job_checkpoints').updateMany(
     { rfc: RFC, status: { $in: ['solicitando', 'verificando', 'descargando'] } },
     { $set: { status: 'error', error: 'Reseteado manualmente', updatedAt: new Date() } }
   );

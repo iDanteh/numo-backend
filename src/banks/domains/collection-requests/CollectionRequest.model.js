@@ -17,10 +17,10 @@ const { tipoSaldoEspecial } = require('./collection-request-erp-links');
  *   identificada → un usuario de cobranza/contabilidad la vinculó a un BankMovement
  *   rechazada   → no se encontró el depósito o la solicitud es inválida
  *
- * NOTA: esta versión NO aplica el cobro en Kore automáticamente — solo registra
- * la solicitud y su vinculación/rechazo. La aplicación real (aplicarCobroOperacion/
- * aplicarCobroOperacionMultiple) queda para una siguiente iteración, ver memoria
- * "Solicitudes de Cobro ERP-Kore".
+ * Al identificar/rechazar, collection-request.service.js avisa el estatus a Kore
+ * (kore-caja.service.js#actualizarEstatusSolicitud, revision-contable) y, solo al
+ * aprobar, aplica el cobro en un segundo paso (#aplicarSolicitudOperacion) — ver
+ * memoria del proyecto "Solicitudes de Cobro ERP-Kore".
  */
 const collectionRequestSchema = new mongoose.Schema({
 

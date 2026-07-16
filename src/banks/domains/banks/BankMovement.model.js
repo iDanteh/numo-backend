@@ -69,6 +69,10 @@ const bankMovementSchema = new mongoose.Schema({
       serie:          { type: String, default: null },
       folioExterno:   { type: String, default: null },
       tieneRetencion: { type: Boolean, default: false },
+      // Suma de movimientosKore[] con serie 'RET' (valor absoluto) — cuánto tiene retenido
+      // esta CxC ahora mismo, sin tener que recorrer movimientosKore para calcularlo. Lo
+      // refresca el sync junto con tieneRetencion; null cuando no hay ninguna retención.
+      montoRetenido:  { type: Number, default: null },
       tipoPago:       { type: String, default: null },
       // Snapshot de movimientos Kore para esta CxC (todos menos el primero — el primero
       // es el cargo original, no aporta al rastreo de conciliación). Lo llena y refresca
@@ -85,6 +89,26 @@ const bankMovementSchema = new mongoose.Schema({
           subtotal:      { type: Number, default: null },
           impuesto:      { type: Number, default: null },
           total:         { type: Number, default: null },
+          // Desglose por forma de pago que Kore reporta para ESTE movimiento — información
+          // adicional para análisis futuro (nunca se usa hoy para calcular saldoErpAportado
+          // ni ningún otro campo; ver _montoSaldoLink en erp.routes.js, que sigue basándose
+          // solo en `total`). Se pisa completo en cada corrida junto con el resto de
+          // movimientosKore — no es una bitácora acumulativa como desglosePorFormaPago.
+          formasPago: {
+            type: [{
+              formaPagoId:          { type: String, default: null },
+              formaPagoDescripcion: { type: String, default: null },
+              monto:                { type: Number, default: null },
+              adicionales: {
+                type: [{
+                  nombre: { type: String, default: null },
+                  valor:  { type: String, default: null },
+                }],
+                default: [],
+              },
+            }],
+            default: [],
+          },
         }],
         default: [],
       },

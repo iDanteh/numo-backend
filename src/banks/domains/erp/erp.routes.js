@@ -723,11 +723,10 @@ function _erpIdIdentificadoPorHumano(identificadoPor, erpId) {
 }
 
 // Nombres del catálogo de formas de pago de Kore que representan un DEPÓSITO BANCARIO real
-// para efectos de saldoErp. Deliberadamente DISTINTO de _esFormaBancaria() (cobro-panel /
-// collection-requests), que excluye cheque porque ese concepto solo alimenta el badge
-// "CxC vinculadas" — aquí SÍ se incluye: un cheque cobrado también es dinero real que entró
-// vía el banco. Coincidencia flexible (sin acentos, insensible a mayúsculas) porque no hay
-// certeza de que "depósito en efectivo" sea siempre el nombre exacto en el catálogo de Kore.
+// para efectos de saldoErp — mismo criterio de fondo que _esFormaBancaria() (cobro-panel /
+// collection-requests): transferencia, cheque o depósito en efectivo. Coincidencia flexible
+// (sin acentos, insensible a mayúsculas) porque no hay certeza de que "depósito en efectivo"
+// sea siempre el nombre exacto en el catálogo de Kore.
 function _esFormaPagoBancariaKore(nombreFormaPago) {
   const norm = String(nombreFormaPago ?? '')
     .normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -789,9 +788,14 @@ function _montoSaldoLinkPorAutorizacion(raw0, numeroAutorizacion) {
   return movimiento ? Math.abs(movimiento.total ?? 0) : null;
 }
 
-// Snapshot mínimo de movimientos Kore para rastreo/conciliación manual — se guarda en
+// Snapshot de movimientos Kore para rastreo/conciliación manual — se guarda en
 // erpLinks[].movimientosKore. Se descarta el primero (el cargo original que crea la CxC,
-// no un abono/ajuste) y solo se conservan los campos indispensables, nunca formasPago.
+// no un abono/ajuste). Incluye formasPago tal cual las manda Kore — información adicional
+// para análisis futuro, nunca usada para calcular saldoErpAportado/tieneRetencion/
+// montoRetenido (esos siguen basándose solo en `total`/`serie`, ver más abajo) — este campo
+// se pisa completo en cada corrida junto con el resto de movimientosKore, así que no hay
+// riesgo de duplicar ni corromper la bitácora desglosePorFormaPago (esa es acumulativa y
+// la sigue llenando solo Numo al aplicar un cobro, el sync nunca la toca).
 function _movimientosKoreDesde(raw0) {
   return (raw0?.movimientos ?? []).slice(1).map(m => ({
     serie:         m.serie         ?? null,
@@ -804,6 +808,16 @@ function _movimientosKoreDesde(raw0) {
     subtotal:      m.subtotal      ?? null,
     impuesto:      m.impuesto      ?? null,
     total:         m.total         ?? null,
+    formasPago: Array.isArray(m.formasPago)
+      ? m.formasPago.map(fp => ({
+          formaPagoId:          fp.formasPago      ?? null,
+          formaPagoDescripcion: fp.nombreFormaPago ?? null,
+          monto:                fp.monto           ?? null,
+          adicionales: Array.isArray(fp.adicionales)
+            ? fp.adicionales.map(a => ({ nombre: a.nombre ?? null, valor: a.valor ?? null }))
+            : [],
+        }))
+      : [],
   }));
 }
 
@@ -966,6 +980,26 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
               linksActualizados[i].tipoPago = tipoPagoNorm;
               huboTipoPagoNuevo = true;
             }
+          }
+
+          // tieneRetencion/montoRetenido se recalculan en CADA corrida (no solo al crear el
+          // link) — una retención puede llegar después de que el link ya existía (ej. la CxC
+          // se pagó por completo y semanas más tarde Kore aplicó una retención fiscal), y sin
+          // este refresh el reporte "Retención" (bank.service.js) quedaría desactualizado para
+          // siempre en esos casos. Mismo criterio que usa el motor automático al crear el
+          // link (bank-autorizaciones.service.js): movimientos con serie 'RET'. montoRetenido
+          // suma su `total` en valor absoluto — evita recorrer movimientosKore para saber
+          // cuánto está retenido ahora mismo.
+          const movsRetencion = (raw0?.movimientos ?? []).filter(m => m.serie === 'RET');
+          const tieneRetencionAhora = movsRetencion.length > 0;
+          const montoRetenidoAhora  = tieneRetencionAhora
+            ? movsRetencion.reduce((s, m) => s + Math.abs(m.total ?? 0), 0)
+            : null;
+          if (tieneRetencionAhora !== (link.tieneRetencion ?? false)) {
+            linksActualizados[i].tieneRetencion = tieneRetencionAhora;
+          }
+          if (montoRetenidoAhora !== (link.montoRetenido ?? null)) {
+            linksActualizados[i].montoRetenido = montoRetenidoAhora;
           }
 
           if (raw0?.saldoActual <= 0) {
@@ -1475,5 +1509,14 @@ router.runErpSyncAutomatico = runErpSyncAutomatico;
 // obtenerSesionCaja/aplicarCobroOperacion(Multiple)/obtenerCuentasKore/KoreCajaError
 // ya NO se re-exportan aquí — collection-request.service.js las importa
 // directamente de ./kore-caja.service (ver kore-caja.service.js).
+
+// Helpers re-expuestos para scripts de backfill one-off (ver banks/scripts/) que
+// necesitan reconsultar Kore con el MISMO criterio de ventana/reintento que usa
+// el job real, sin duplicar esa lógica y arriesgar que se desincronice con el tiempo.
+router._rangoDesdeFollo             = _rangoDesdeFollo;
+router._rangoSpilloverSiguienteMes  = _rangoSpilloverSiguienteMes;
+router._sincronizarConRetry         = _sincronizarConRetry;
+router._movimientosKoreDesde        = _movimientosKoreDesde;
+router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 
 module.exports = router;

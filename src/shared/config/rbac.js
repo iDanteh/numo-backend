@@ -71,7 +71,9 @@ const PERMISSIONS = Object.freeze({
 
   // Entidades fiscales
   ENTITIES_READ:       'entities:read',
-  ENTITIES_WRITE:      'entities:write',
+  ENTITIES_WRITE:      'entities:write',   // acceso amplio heredado (también usado por schedule.js) — no confundir con los permisos finos de abajo
+  ENTITIES_EDIT:       'entities:edit',    // crear/editar datos de la entidad (razón social, config de sync, activar/desactivar)
+  ENTITIES_MESSAGE:    'entities:message', // enviar manualmente la alerta de credenciales SAT por correo
 
   // Administración de usuarios
   USERS_MANAGE:        'users:manage',

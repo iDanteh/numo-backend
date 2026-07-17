@@ -653,6 +653,133 @@ const dashboard = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/reports/dashboard-recibidos
+ * Dashboard de CFDIs Recibidos — a diferencia de /dashboard (Emitidos), aquí no
+ * existe motor de comparación contra ERP: Recibidos solo tiene verificación SAT
+ * (Vigente/Cancelado/No Encontrado/etc.), así que las estadísticas se limitan a eso.
+ */
+const dashboardRecibidos = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey({ _scope: 'recibidos', ...req.query });
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const { rfcReceptor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
+
+  let receptorConstraint = rfcReceptor ? rfcReceptor.toUpperCase() : null;
+  if (!receptorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    receptorConstraint = { $in: entidadesRfcs };
+  }
+
+  const dateFilter = {};
+  if (fechaInicio) {
+    const d = fechaInicio.split('T')[0];
+    dateFilter.$gte = new Date(`${d}T06:00:00Z`);
+  }
+  if (fechaFin) {
+    const d   = fechaFin.split('T')[0];
+    const fin = new Date(`${d}T06:00:00Z`);
+    fin.setUTCDate(fin.getUTCDate() + 1);
+    dateFilter.$lt = fin;
+  }
+
+  const periodoFilter = {};
+  if (ejercicio)         periodoFilter.ejercicio         = parseInt(ejercicio);
+  if (periodo)           periodoFilter.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) periodoFilter.tipoDeComprobante = tipoDeComprobante;
+  else                   periodoFilter.tipoDeComprobante = { $ne: 'N' };
+
+  const baseFilter = {
+    isActive: { $ne: false },
+    source: { $in: ['SAT', 'MANUAL'] },
+    'receptor.rfc': receptorConstraint,
+    ...periodoFilter,
+  };
+  if (Object.keys(dateFilter).length) baseFilter.fecha = dateFilter;
+
+  const [totalCFDIs, cfdisBySatStatus, cfdisByTipo, vigenteAggregate, sinVerificar] = await Promise.all([
+    CFDI.countDocuments(baseFilter),
+    CFDI.aggregate([
+      { $match: baseFilter },
+      { $group: { _id: '$satStatus', count: { $sum: 1 }, total: { $sum: MONTO_EFECTIVO_EXPR } } },
+      { $sort: { count: -1 } },
+    ]),
+    CFDI.aggregate([
+      { $match: baseFilter },
+      { $group: { _id: '$tipoDeComprobante', count: { $sum: 1 }, total: { $sum: MONTO_EFECTIVO_EXPR } } },
+      { $sort: { _id: 1 } },
+    ]),
+    CFDI.aggregate([
+      { $match: { ...baseFilter, satStatus: 'Vigente' } },
+      { $group: { _id: null, total: { $sum: MONTO_EFECTIVO_EXPR }, count: { $sum: 1 } } },
+    ]),
+    CFDI.countDocuments({ ...baseFilter, satStatus: { $in: [null, 'Pendiente'] } }),
+  ]);
+
+  const responseData = {
+    kpis: {
+      totalCFDIs,
+      totalVigente:  vigenteAggregate[0]?.total ?? 0,
+      countVigente:  vigenteAggregate[0]?.count ?? 0,
+      sinVerificar,
+      cfdisBySatStatus,
+      cfdisByTipo,
+    },
+  };
+
+  setCache(cacheKey, responseData);
+  res.json(responseData);
+});
+
+/**
+ * GET /api/reports/resumen-cfdis
+ * Resumen ligero (solo conteos) de CFDIs Emitidos y Recibidos descargados
+ * del SAT (source SAT/MANUAL — no cuenta los CFDIs que solo existen como
+ * registro ERP), para la tarjeta de resumen del hub general de CFDIs.
+ * A diferencia de /dashboard y /dashboard-recibidos, no corre el motor de
+ * comparación — son 6 countDocuments simples, pensado para cargar rápido.
+ */
+const resumenCfdis = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey({ _scope: 'resumen', ...req.query });
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const { rfcEmisor, rfcReceptor, ejercicio, periodo } = req.query;
+
+  let emisorConstraint   = rfcEmisor   ? rfcEmisor.toUpperCase()   : null;
+  let receptorConstraint = rfcReceptor ? rfcReceptor.toUpperCase() : null;
+  if (!emisorConstraint || !receptorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    if (!emisorConstraint)   emisorConstraint   = { $in: entidadesRfcs };
+    if (!receptorConstraint) receptorConstraint = { $in: entidadesRfcs };
+  }
+
+  const periodoFilter = {};
+  if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
+  if (periodo)   periodoFilter.periodo   = parseInt(periodo);
+
+  const emitidosFilter  = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc':   emisorConstraint,   ...periodoFilter };
+  const recibidosFilter = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, 'receptor.rfc': receptorConstraint, ...periodoFilter };
+
+  const [emitidosTotal, emitidosVigente, emitidosCancelado, recibidosTotal, recibidosVigente, recibidosCancelado] = await Promise.all([
+    CFDI.countDocuments(emitidosFilter),
+    CFDI.countDocuments({ ...emitidosFilter, satStatus: 'Vigente' }),
+    CFDI.countDocuments({ ...emitidosFilter, satStatus: 'Cancelado' }),
+    CFDI.countDocuments(recibidosFilter),
+    CFDI.countDocuments({ ...recibidosFilter, satStatus: 'Vigente' }),
+    CFDI.countDocuments({ ...recibidosFilter, satStatus: 'Cancelado' }),
+  ]);
+
+  const responseData = {
+    emitidos:  { total: emitidosTotal,  vigente: emitidosVigente,  cancelado: emitidosCancelado },
+    recibidos: { total: recibidosTotal, vigente: recibidosVigente, cancelado: recibidosCancelado },
+  };
+
+  setCache(cacheKey, responseData);
+  res.json(responseData);
+});
+
+/**
  * GET /api/reports/discrepancias-montos
  * Retorna comparaciones con diferencias en montos/impuestos para el modal del dashboard.
  */
@@ -4083,4 +4210,4 @@ const depositosIngresosExport = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };
+module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };

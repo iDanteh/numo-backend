@@ -23,6 +23,39 @@ const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => 
 
 const SUCURSAL_DEFAULT = 'Cedis';
 
+// Series de documentosRelacionados (ERP) que identifican una NC como ajuste
+// de una venta (bonificación/devolución/cancelación) — mismo catálogo que
+// TIPO_MARCADORES de report.controller.js, más 'CANCELACION' (NCs de
+// refacturación por cancelación, encontradas 2026-07-17: no traen
+// cfdiRelacionados.tipoRelacion poblado, solo este indicador del ERP).
+const SERIES_FUSION_NC = ['BCT', 'BON', 'DEV', 'CAC', 'CANCELACION'];
+
+// Folios (del ERP) referenciados por NCs Serie=CANCELACION dentro del rango
+// de fecha efectiva — usado para detectar la factura de REFACTURACIÓN que
+// reemplaza la venta cancelada (misma serie que la NC, mismo Folio
+// referenciado). Cruce exacto por Folio: NO basta con "documentosRelacionados
+// trae algún Serie=propia con Folio distinto al mío" — ese patrón es normal
+// en casi cualquier factura del ERP (dato interno sin relación con
+// cancelaciones), confirmado con datos reales 2026-07-17 (8 de 9 facturas de
+// un día cualquiera lo tenían, falso positivo masivo).
+async function _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin }) {
+  if (!fechaInicio || !fechaFin) return new Set();
+  const uuidsE = await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi: 'E', fechaInicio, fechaFin });
+  if (!uuidsE.size) return new Set();
+  const docs = await CFDI.find({
+    uuid:   { $in: [...uuidsE] },
+    source: 'ERP',
+    'documentosRelacionados.Serie': 'CANCELACION',
+  }).select('documentosRelacionados').lean();
+  const folios = new Set();
+  for (const d of docs) {
+    for (const dr of d.documentosRelacionados || []) {
+      if (dr.Serie === 'CANCELACION' && dr.Folio) folios.add(dr.Folio);
+    }
+  }
+  return folios;
+}
+
 function _fmtDMY(fechaISO) {
   const [y, m, d] = fechaISO.split('-');
   return `${d}/${m}/${y}`;
@@ -151,7 +184,6 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     source:            'SAT',
     satStatus:         'Vigente',
     isActive:          true,
-    'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] },
   };
   const selectNc = 'uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida';
 
@@ -166,7 +198,27 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     // día).
     const uuidsNcDelDia = await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi: 'E', fechaInicio, fechaFin });
     if (!uuidsNcDelDia.size) return [];
-    const ncsRaw = await CFDI.find({ ...filtroBaseNc, uuid: { $in: [...uuidsNcDelDia] } })
+
+    // Algunas NCs (Club Tuberos, cancelaciones-refacturación) no traen
+    // cfdiRelacionados.tipoRelacion poblado a nivel SAT — solo se identifican
+    // por el indicador documentosRelacionados del ERP (hallazgo 2026-07-17,
+    // UUIDs 102A4165.../79B7BB10... no se fusionaban por esto). Se calcula
+    // el set de UUIDs con ese indicador para incluirlas también.
+    const erpConIndicador = await CFDI.find({
+      uuid:   { $in: [...uuidsNcDelDia] },
+      source: 'ERP',
+      'documentosRelacionados.Serie': { $in: SERIES_FUSION_NC },
+    }).select('uuid').lean();
+    const uuidsConIndicadorErp = erpConIndicador.map(d => d.uuid);
+
+    const ncsRaw = await CFDI.find({
+      ...filtroBaseNc,
+      uuid: { $in: [...uuidsNcDelDia] },
+      $or: [
+        { 'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] } },
+        { uuid: { $in: uuidsConIndicadorErp } },
+      ],
+    })
       .select(selectNc)
       .lean();
     ncs = ncsRaw.filter(nc => !uuidsYaUsados.has((nc.uuid || '').toUpperCase()));
@@ -179,9 +231,14 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     }
   } else {
     // Generación de todo el periodo: comportamiento original, por relación
-    // con las facturas ya cargadas en este batch.
+    // con las facturas ya cargadas en este batch. NOTA: a diferencia del
+    // branch por día, aquí NO se agrega el indicador documentosRelacionados
+    // (BCT/CANCELACION/etc.) — esas NCs no tienen cfdiRelacionados.uuid, así
+    // que el matching por relUuidsDe()/facturaSet nunca las encontraría de
+    // todos modos; requeriría matching por serie+folio, no por UUID. Pendiente
+    // si se necesita generación de periodo completo (no por día) con estas NCs.
     if (!facturaUuids.length) return [];
-    const ncsRaw = await CFDI.find(filtroBaseNc).select(selectNc).lean();
+    const ncsRaw = await CFDI.find({ ...filtroBaseNc, 'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] } }).select(selectNc).lean();
     const facturaSet = new Set(facturaUuids.map(u => u.toUpperCase()));
     ncs = ncsRaw.filter(nc =>
       !uuidsYaUsados.has((nc.uuid || '').toUpperCase()) &&
@@ -291,6 +348,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const uuidsPorFechaProp = (fechaInicio && fechaFin)
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
+  const foliosCancelacionProp = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
   const filtroBase = {
     $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
     ejercicio:         Number(ejercicio),
@@ -388,13 +446,23 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
     const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
+    // Refacturación (factura nueva que reemplaza una venta cancelada, misma
+    // serie/sucursal, Folio referenciado coincide con el que referencia una
+    // NC Serie=CANCELACION del mismo día) — confirmado con el usuario
+    // 2026-07-17: su cargo (dinero en banco/caja) ya está contabilizado en el
+    // asiento de la CANCELACION original, así que no debe consolidarse como
+    // depósito nuevo (ver `esRefacturacion` en poliza.service.js). Cruce
+    // exacto por Folio contra `foliosCancelacionProp` — ver comentario en
+    // `_foliosCancelacionDelDia`.
+    const esRefacturacion = !esBCT && !esBON &&
+      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionProp.has(d.Folio));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : esRefacturacion ? 'Refacturación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
@@ -747,6 +815,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const uuidsPorFechaGuard = (fechaInicio && fechaFin)
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
+  const foliosCancelacionGuard = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
   const filtroBase = {
     $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
     ejercicio:         Number(ejercicio),
@@ -835,13 +904,17 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
     const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
+    // Refacturación — ver comentario en generarPropuesta (misma detección,
+    // cruce exacto por Folio contra `foliosCancelacionGuard`).
+    const esRefacturacion = !esBCT && !esBON &&
+      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionGuard.has(d.Folio));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : esRefacturacion ? 'Refacturación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };

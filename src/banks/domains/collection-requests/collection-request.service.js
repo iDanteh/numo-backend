@@ -45,7 +45,7 @@ function _eventoActualizacion(cr, mov) {
 // `comprobantes[]`; los viejos solo tienen `comprobante` — nunca ambos a la vez
 // en la práctica, pero si algún día coexistieran, Drive gana (es lo vigente).
 const _MIME_A_EXT = {
-  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
+  'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/webp': 'webp',
   'image/gif': 'gif', 'application/pdf': 'pdf',
 };
 

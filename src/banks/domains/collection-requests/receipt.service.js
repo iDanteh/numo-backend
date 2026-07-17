@@ -22,7 +22,10 @@ const { UnprocessableError } = require('../../../shared/errors/AppError');
 
 const DATE_WINDOW_DAYS = 30;
 const FALLBACK_WINDOW  = 90;
-const SUPPORTED_MIME   = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
+// 'image/jpg' no es un MIME type estándar (lo correcto es 'image/jpeg' para
+// .jpg Y .jpeg), pero algunos clientes HTTP lo mandan igual — se acepta como
+// alias para no rechazar un comprobante válido por un detalle del cliente.
+const SUPPORTED_MIME   = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
 
 // Un comprobante real nunca se acerca a esto (una o dos páginas de texto, unos
 // pocos KB) — protege contra un PDF de puro texto anormalmente grande (dentro
@@ -1523,7 +1526,7 @@ async function extractReceiptDataPaddle(imageBuffer, mimeType = 'image/jpeg', la
  */
 async function extractReceiptData(imageBuffer, mimeType, label = null) {
   if (!SUPPORTED_MIME.includes(mimeType))
-    throw new Error(`Tipo no soportado: "${mimeType}". Usa JPG, PNG, WEBP o PDF.`);
+    throw new Error(`Tipo no soportado: "${mimeType}". Usa JPG, JPEG, PNG, WEBP o PDF.`);
 
   if (mimeType === 'application/pdf') {
     try {

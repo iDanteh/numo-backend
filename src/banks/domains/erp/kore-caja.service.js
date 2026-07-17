@@ -219,10 +219,11 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
 // cobro de una solicitud YA aprobada — se llama DESPUÉS de que
 // actualizarEstatusSolicitud (revision-contable, más abajo) confirmó APROBADO.
 // Body `{ DatosAdicionalesPorFormaPago }`: un elemento por cada forma de pago
-// de la solicitud, con su FormaPagoID y un dato "Autorizacion" cuyo valor es el
-// folio interno de Numo del movimiento identificado (con respaldo al
-// numeroAutorizacion bancario si el movimiento no tiene folio) — NUNCA el
-// payload de cobro completo (cuenta/detalle/formasPago): Kore ya tiene esos
+// de la solicitud, con su FormaPagoID y DOS datos por separado del movimiento
+// identificado — "Autorizacion" (folio interno de Numo) y "Numo"
+// (numeroAutorizacion bancario real) — ninguno reemplaza al otro, ver
+// collection-request.service.js#identificar (paso 5) para dónde se arman —
+// NUNCA el payload de cobro completo (cuenta/detalle/formasPago): Kore ya tiene esos
 // datos desde que ÉL creó la solicitud, y los aplica internamente. Confirmado
 // con Kore real (pruebas en Insomnia): mandarle el payload de cobro
 // (buildPayloadSingle/Multi) causaba 400 "hay solicitudes relacionadas

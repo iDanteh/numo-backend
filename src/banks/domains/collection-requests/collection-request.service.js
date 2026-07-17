@@ -473,14 +473,23 @@ async function identificar(id, bankMovementId, user) {
 
   // 5. Aplicar el cobro — ahora que Kore ya aprobó la solicitud, este endpoint
   // dedicado la aplica internamente con los datos que Kore ya tiene desde que
-  // ÉL creó la solicitud: no se le manda ningún payload de cobro, solo
-  // Comentario + Estatus, igual en Modo 1 y Modo 2.
+  // ÉL creó la solicitud; lo único que se manda, por cada forma de pago, es su
+  // FormaPagoID y DOS datos del movimiento identificado: "Autorizacion" (el
+  // folio interno de Numo, mismo folio que `referencia`, arriba) y "Numo" (el
+  // numeroAutorizacion bancario real, extraído por OCR) — ambos por separado,
+  // ninguno reemplaza al otro. Igual en Modo 1 y Modo 2 — un elemento del
+  // arreglo por cada forma de pago.
+  const datosAdicionalesPorFormaPago = cr.formasPago.map(f => ({
+    FormaPagoID:      f.formaPagoId,
+    DatosAdicionales: [
+      { Nombre: 'Autorizacion', Valor: mov.folio || '' },
+      { Nombre: 'Numo',         Valor: mov.numeroAutorizacion || '' },
+    ],
+  }));
+
   let koreResult;
   try {
-    koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, {
-      Comentario: 'Cobro conciliado y aplicado en Numo',
-      Estatus:    'APROBADO',
-    });
+    koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, datosAdicionalesPorFormaPago);
   } catch (err) {
     if (err instanceof koreCaja.KoreCajaError) {
       // aplicarSolicitudOperacion ya loguea el payload y el rechazo crudo de

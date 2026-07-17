@@ -218,20 +218,23 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
 // Endpoint dedicado del flujo ERP-Kore (collection-requests) para aplicar el
 // cobro de una solicitud YA aprobada — se llama DESPUÉS de que
 // actualizarEstatusSolicitud (revision-contable, más abajo) confirmó APROBADO.
-// Body `{ Comentario, Estatus: 'APROBADO' }` — mismo shape que revision-contable,
-// pero NUNCA el payload de cobro (cuenta/detalle/formasPago): Kore ya tiene esos
+// Body `{ DatosAdicionalesPorFormaPago }`: un elemento por cada forma de pago
+// de la solicitud, con su FormaPagoID y un dato "Autorizacion" cuyo valor es el
+// folio interno de Numo del movimiento identificado (con respaldo al
+// numeroAutorizacion bancario si el movimiento no tiene folio) — NUNCA el
+// payload de cobro completo (cuenta/detalle/formasPago): Kore ya tiene esos
 // datos desde que ÉL creó la solicitud, y los aplica internamente. Confirmado
 // con Kore real (pruebas en Insomnia): mandarle el payload de cobro
 // (buildPayloadSingle/Multi) causaba 400 "hay solicitudes relacionadas
-// pendientes y/o rechazados"; con el body simple, Kore aplica el cobro y la
-// CxC queda cobrada en el ERP. Ambos placeholders de la URL son de la
+// pendientes y/o rechazados"; con este body, Kore aplica el cobro y la CxC
+// queda cobrada en el ERP. Ambos placeholders de la URL son de la
 // solicitud/sesión — NINGUNO es la cuenta o la CxC. `sesionId` es la sesión de
 // caja del CAJERO solicitante (obtenerSesionCaja).
-async function aplicarSolicitudOperacion(sesionId, solicitudIdErp, koreToken, { Comentario, Estatus }) {
-  console.log('[aplicarSolicitudOperacion] payload →', JSON.stringify({ sesionId, solicitudIdErp, Estatus, Comentario }));
+async function aplicarSolicitudOperacion(sesionId, solicitudIdErp, koreToken, datosAdicionalesPorFormaPago) {
+  console.log('[aplicarSolicitudOperacion] payload →', JSON.stringify({ sesionId, solicitudIdErp, datosAdicionalesPorFormaPago }));
   return _operacionConReintento(
     'put', `${KORE_CAJA_BASE_URL}/solicitud-operacion/${sesionId}/aplicar/${solicitudIdErp}`,
-    { Comentario, Estatus }, koreToken, 'aplicarSolicitudOperacion', Estatus,
+    { DatosAdicionalesPorFormaPago: datosAdicionalesPorFormaPago }, koreToken, 'aplicarSolicitudOperacion', solicitudIdErp,
   );
 }
 

@@ -13,9 +13,9 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 20 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
+    const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
     if (allowed.includes(file.mimetype)) return cb(null, true);
-    cb(new Error(`Tipo no soportado: ${file.mimetype}. Usa JPG, PNG, WEBP o PDF.`));
+    cb(new Error(`Tipo no soportado: ${file.mimetype}. Usa JPG, JPEG, PNG, WEBP o PDF.`));
   },
 });
 
@@ -29,9 +29,9 @@ const uploadComprobante = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 15 * 1024 * 1024 },
   fileFilter(_req, file, cb) {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
+    const allowed = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif', 'application/pdf'];
     if (allowed.includes(file.mimetype)) return cb(null, true);
-    cb(new Error(`Tipo no soportado: ${file.mimetype}. Usa JPG, PNG, WEBP o PDF.`));
+    cb(new Error(`Tipo no soportado: ${file.mimetype}. Usa JPG, JPEG, PNG, WEBP o PDF.`));
   },
 });
 

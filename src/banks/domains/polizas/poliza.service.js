@@ -455,6 +455,17 @@ const LABEL_FORMA_PAGO_CONSOLIDADO = { '01': 'EFECTIVO', '04': 'TARJETA', '28': 
 //     estar el asiento completo no solo los cargos".
 const CUENTAS_SALDO_FAVOR = new Set(['2103090001', '2103090002', '2104010002']);
 const CUENTAS_CLIENTES    = new Set(['1103010001', '1103010002']);
+// Caja por identificar (1101010003): cuenta puente para NCs "CANCELACION-
+// refacturación" (Serie=CANCELACION en documentosRelacionados) — no es un
+// reembolso real en efectivo/banco, es una cancelación de facturación sin
+// movimiento de dinero real. Confirmado con el usuario 2026-07-17: su abono
+// SÍ debe mostrarse (a diferencia de un reembolso real, que se oculta).
+// NOTA 2026-07-17: Caja por identificar (1101010003, cuenta puente de las NCs
+// "CANCELACION-refacturación") se probó primero incluida aquí para que su
+// abono SÍ se mostrara — el usuario revirtió esa decisión: en el reporte
+// CONTPAQ, una CANCELACION debe mostrar SIEMPRE solo sus 2 cargos
+// (Devoluciones+IVA), nunca su abono, sin importar si tiene o no una
+// refacturación pareja. Por eso NO se agrega 1101010003 a este set.
 const esAbonoSaldoFavor = (m) => CUENTAS_SALDO_FAVOR.has(m.cuenta?.codigo) || CUENTAS_CLIENTES.has(m.cuenta?.codigo);
 
 // "OPA" = anticipo (confirmado por el usuario). Aplica a CUALQUIER regla de
@@ -577,6 +588,13 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
 
   for (const m of movs) {
     if (!(Number(m.debe) > 0)) continue;
+    // Refacturación (factura que reemplaza una venta cancelada, ver
+    // `esRefacturacion` en cfdi-poliza-generator.service.js): su cargo
+    // (dinero en banco/caja) ya quedó contabilizado en el asiento de la
+    // CANCELACION original — mostrarlo aquí (individual o consolidado)
+    // duplicaría el depósito. Se omite por completo; su abono (Ingreso+IVA)
+    // sigue su camino normal (bloquesAbonosNormales), sin tocar.
+    if (/refacturaci[oó]n/i.test(m.tipoOrigen || '')) continue;
     const centroCosto = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
     const bancario    = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
     // Solo se confía en `bancario.esTransferencia` cuando el movimiento
@@ -993,8 +1011,14 @@ function enriquecerConceptoConCliente(movs, nombresClientes) {
     // escribir la celda, lo que corrompe el .xlsx). Hay que aplanar primero.
     const plano  = m.get ? m.get({ plain: true }) : m;
     const nombre = nombresClientes.get((plano.cfdiUuid || '').toUpperCase()) || '';
-    // `serie` ya viene como "SERIE-FOLIO" completo (ej. "I0-251100402").
-    const partes = [nombre, plano.serie].filter(Boolean);
+    // Club Tuberos y Cancelación-refacturación: el sufijo muestra el tipo de
+    // ajuste en vez del serie-folio crudo (confirmado con el usuario
+    // 2026-07-17) — el resto de categorías conserva "SERIE-FOLIO" como
+    // siempre (ej. "I0-251100402").
+    const sufijo = plano._categoria === 'clubTuberos' ? 'BCT-'
+      : (plano._categoria === 'devolucion' && /cancelaci[oó]n/i.test(plano.tipoOrigen || '')) ? 'cancelacion'
+      : plano.serie;
+    const partes = [nombre, sufijo].filter(Boolean);
     return { ...plano, concepto: partes.join(' / ') };
   });
 }

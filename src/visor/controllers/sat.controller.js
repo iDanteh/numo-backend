@@ -266,8 +266,14 @@ const testKey = asyncHandler(async (req, res) => {
   }
 
   const { autenticar } = require('../sat/auth');
-  logger.info(`[testKey] cerBuffer: ${creds.cerBuffer.length}B first8=${creds.cerBuffer.slice(0,8).toString('hex')}`);
-  logger.info(`[testKey] keyBuffer: ${creds.keyBuffer.length}B first8=${creds.keyBuffer.slice(0,8).toString('hex')}`);
+  const crypto = require('crypto');
+  const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+  // Hash SHA-256 completo (nunca el contenido) — permite comparar bit a bit
+  // contra otro entorno sin exponer la llave/contraseña real.
+  logger.info(`[testKey] node=${process.version} forge=${require('node-forge/package.json').version} openssl=${process.versions.openssl}`);
+  logger.info(`[testKey] cerBuffer: ${creds.cerBuffer.length}B first8=${creds.cerBuffer.slice(0,8).toString('hex')} sha256=${sha256(creds.cerBuffer)}`);
+  logger.info(`[testKey] keyBuffer: ${creds.keyBuffer.length}B first8=${creds.keyBuffer.slice(0,8).toString('hex')} sha256=${sha256(creds.keyBuffer)}`);
+  logger.info(`[testKey] passwordBuffer: ${creds.passwordBuffer.length}B sha256=${sha256(creds.passwordBuffer)}`);
   try {
     const { token, rfcCertificado } = await autenticar(
       creds.cerBuffer,

@@ -56,7 +56,9 @@ const PERM_META = {
   'drive:read':         { label: 'Google Drive (leer)',             module: 'Drive' },
   'drive:import':       { label: 'Google Drive (importar)',         module: 'Drive' },
   'entities:read':      { label: 'Ver entidades fiscales',          module: 'Entidades' },
-  'entities:write':     { label: 'Gestionar entidades fiscales',    module: 'Entidades' },
+  'entities:write':     { label: 'Gestionar entidades fiscales (heredado, incluye programación de jobs)', module: 'Entidades' },
+  'entities:edit':      { label: 'Editar entidades fiscales',       module: 'Entidades' },
+  'entities:message':   { label: 'Enviar alerta de credenciales SAT', module: 'Entidades' },
   'users:manage':       { label: 'Administrar usuarios y roles',    module: 'Administración' },
 };
 

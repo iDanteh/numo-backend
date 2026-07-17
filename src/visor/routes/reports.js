@@ -1,11 +1,13 @@
 const express = require('express');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const { PERMISSIONS } = require('../../shared/config/rbac');
-const { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport } = require('../controllers/report.controller');
+const { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport } = require('../controllers/report.controller');
 
 const router = express.Router();
 
 router.get('/dashboard', authenticate, dashboard);
+router.get('/dashboard-recibidos', authenticate, dashboardRecibidos);
+router.get('/resumen-cfdis', authenticate, resumenCfdis);
 router.get('/export/excel', authenticate, exportExcel);
 router.get('/discrepancias-montos', authenticate, discrepanciasMontos);
 router.get('/sat-vigente-erp-inactivo', authenticate, satVigenteErpInactivo);

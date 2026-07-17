@@ -6,9 +6,9 @@ const { list, create, update, alertarCredencialesSat } = require('../controllers
 
 const router = express.Router();
 
-router.get('/',     authenticate,                         list);
-router.post('/',    authenticate, permit('entities:write'), create);
-router.patch('/:id', authenticate, permit('entities:write'), update);
-router.post('/:id/alertar-credenciales-sat', authenticate, permit('entities:write'), alertarCredencialesSat);
+router.get('/',      authenticate, permit('entities:read'),    list);
+router.post('/',     authenticate, permit('entities:edit'),    create);
+router.patch('/:id', authenticate, permit('entities:edit'),    update);
+router.post('/:id/alertar-credenciales-sat', authenticate, permit('entities:message'), alertarCredencialesSat);
 
 module.exports = router;

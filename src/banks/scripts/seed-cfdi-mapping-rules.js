@@ -1159,6 +1159,7 @@ const reglas = [
     cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16%
     cuentaAbono:      '2103090002',  // Anticipos Otros Club Tuberos (acredita monedero)
     cuentaIva:        '2104010001',  // IVA Trasladado
+    cuentaIvaAbono:   '2104010002',  // IVA Trasladado - Anticipos (split del abono: monedero + IVA aparte)
     prioridad:        74,
   },
   {
@@ -1182,6 +1183,7 @@ const reglas = [
     cuentaCargo:      '4200020001',  // Descuentos s/Ventas 16% (fallback conservador)
     cuentaAbono:      '2103090002',  // Anticipos Otros Club Tuberos
     cuentaIva:        '2104010001',  // IVA Trasladado — evita desbalance si CFDI tiene IVA real
+    cuentaIvaAbono:   '2104010002',  // IVA Trasladado - Anticipos (split del abono: monedero + IVA aparte)
     prioridad:        74,
   },
 
@@ -1198,6 +1200,7 @@ const reglas = [
     cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16%
     cuentaAbono:     '2103090002',  // Anticipos Otros Club Tuberos
     cuentaIva:       '2104010001',  // IVA Trasladado
+    cuentaIvaAbono:  '2104010002',  // IVA Trasladado - Anticipos (split del abono: monedero + IVA aparte)
     prioridad:       74,
   },
   {
@@ -1222,6 +1225,7 @@ const reglas = [
     cuentaCargo:     '4200020001',  // Descuentos s/Ventas 16% (fallback conservador)
     cuentaAbono:     '2103090002',  // Anticipos Otros Club Tuberos
     cuentaIva:       '2104010001',  // IVA Trasladado — evita desbalance si CFDI tiene IVA real
+    cuentaIvaAbono:  '2104010002',  // IVA Trasladado - Anticipos (split del abono: monedero + IVA aparte)
     prioridad:       74,
   },
 
@@ -2987,7 +2991,7 @@ const reglas = [
     tasaIva: '0',
     tipoOrigen: 'Cancelación',
     cuentaCargo: '4200010002',
-    cuentaAbono: '1102011005',
+    cuentaAbono: '1101010003',
     prioridad: 65,
   },
   {
@@ -3007,7 +3011,7 @@ const reglas = [
     tasaIva: '16',
     tipoOrigen: 'Cancelación',
     cuentaCargo: '4200010001',
-    cuentaAbono: '1102011005',
+    cuentaAbono: '1101010003',
     cuentaIva: '2104010001',
     prioridad: 65,
   },
@@ -3020,6 +3024,7 @@ const reglas = [
     cuentaCargo: '4200010001',
     cuentaAbono: '1101010003',
     cuentaIva: '2104010001',
+    cuentaAbono2: '4200010002',
     prioridad: 65,
   },
   {
@@ -3028,8 +3033,9 @@ const reglas = [
     tasaIva: 'mixto',
     tipoOrigen: 'Cancelación',
     cuentaCargo: '4200010001',
-    cuentaAbono: '1102011005',
+    cuentaAbono: '1101010003',
     cuentaIva: '2104010001',
+    cuentaAbono2: '4200010002',
     prioridad: 65,
   },
   {

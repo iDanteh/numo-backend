@@ -736,24 +736,34 @@ function _esFormaPagoBancariaKore(nombreFormaPago) {
       || /DEPOSITO.*EFECTIVO/.test(norm);
 }
 
-// Monto realmente cobrado por el banco para una cuenta ya saldada (saldoActual 0) o con
-// saldo A FAVOR (saldoActual negativo — p.ej. una retención aplicada después del pago
-// completo, que puede tardar mucho o nunca en volver exactamente a 0): suma el 'total'
-// (nunca formasPago[].monto, que puede ser un depósito compartido entre varias CxC, o —
-// como en el caso de una aplicación de saldo a favor/anticipo— ni siquiera corresponder al
-// total del movimiento que lo contiene) de cada movimiento cuya forma de pago sea bancaria
-// real. Excluye a propósito aplicaciones de saldo a favor, efectivo de caja, tarjeta, etc.
-// — esos movimientos también traen `formasPago` no vacío pero no son un depósito bancario.
-// Movimientos de retención (serie RET) no traen `formasPago` en absoluto, así que quedan
-// excluidos naturalmente — el monto recuperado es el que SALDÓ la CxC, no el saldo negativo
-// resultante de un ajuste posterior.
+// Monto realmente cobrado para una cuenta ya saldada (saldoActual 0) o con saldo A FAVOR
+// (saldoActual negativo — p.ej. una retención aplicada después del pago completo, que puede
+// tardar mucho o nunca en volver exactamente a 0): suma el 'total' (nunca formasPago[].monto,
+// que puede ser un depósito compartido entre varias CxC, o —como en el caso de una aplicación
+// de saldo a favor/anticipo— ni siquiera corresponder al total del movimiento que lo
+// contiene) de CUALQUIER movimiento con `formasPago` no vacío, sin filtrar por tipo — mismo
+// criterio que `saldoPagadoTotal` en el flujo manual de cobro (`aplicarLogicaErp`,
+// bank.service.js). Movimientos de retención (serie RET) no traen `formasPago` en absoluto,
+// así que quedan excluidos naturalmente.
+//
+// DECISIÓN EXPLÍCITA DEL USUARIO (2026-07-17): antes esto filtraba solo formas bancarias
+// (`_esFormaPagoBancariaKore` — transferencia/cheque/depósito en efectivo), precisamente para
+// corregir un bug del 2026-07-09 donde una "aplicación de saldo a favor" (pagada en
+// EFECTIVO/TARJETA/SALDO A FAVOR de caja) se contaba igual que una transferencia real,
+// inflando saldoErp con dinero que nunca entró al banco por ESE depósito. Se revirtió ese
+// filtro a propósito porque casos reales de depósito bancario legítimo (ej. efectivo llevado
+// físicamente al banco) llegaban con un nombre de forma de pago en Kore que no coincidía con
+// el regex ("EFECTIVO" a secas, no "DEPOSITO EN EFECTIVO"), dejando `saldoErpAportado` en 0
+// y el movimiento en `no_identificado` pese a ser un depósito real. Riesgo aceptado
+// conscientemente: puede volver a inflar saldoErp si Kore trae una aplicación de saldo a
+// favor/anticipo/tarjeta como parte de la misma cuenta — no "corregir" este comentario sin
+// que el usuario lo pida de nuevo.
 function _montoSaldoLink(raw0) {
   if (!raw0 || raw0.saldoActual > 0) return 0;
-  const conPagoBancario = (raw0.movimientos ?? []).filter(
-    m => Array.isArray(m.formasPago)
-      && m.formasPago.some(fp => _esFormaPagoBancariaKore(fp.nombreFormaPago)),
+  const conFormaPago = (raw0.movimientos ?? []).filter(
+    m => Array.isArray(m.formasPago) && m.formasPago.length > 0,
   );
-  return conPagoBancario.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
+  return conFormaPago.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
 }
 
 // Deja solo dígitos y quita ceros a la izquierda — Kore antepone "REF " a algunas
@@ -1517,6 +1527,8 @@ router._rangoDesdeFollo             = _rangoDesdeFollo;
 router._rangoSpilloverSiguienteMes  = _rangoSpilloverSiguienteMes;
 router._sincronizarConRetry         = _sincronizarConRetry;
 router._movimientosKoreDesde        = _movimientosKoreDesde;
+router._montoSaldoLink              = _montoSaldoLink;
+router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
 router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 
 module.exports = router;

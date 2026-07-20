@@ -52,16 +52,24 @@ async function exportarContpaqZip({ rfc, ejercicio, periodo, tipoCfdi, tipoPropu
   const zip = new AdmZip();
 
   for (const entry of exitosos) {
-    const { workbook, poliza } = await polizaSvc.exportContpaqXlsx(entry.polizaId, {});
-    const buffer = await workbook.xlsx.writeBuffer();
+    const { workbooks, poliza } = await polizaSvc.exportContpaqXlsx(entry.polizaId, {});
     const mesPeriodo = String(poliza.periodo).padStart(2, '0');
-    const nombreArchivo = entry.fecha
-      ? `Poliza_${poliza.tipo}${poliza.numero}_${entry.fecha}_CONTPAQ.xlsx`
-      : `Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mesPeriodo}_CONTPAQ.xlsx`;
-    const ruta = entry.centroCosto
-      ? `${sanitize(entry.centroCosto)}/${nombreArchivo}`
-      : nombreArchivo;
-    zip.addFile(ruta, Buffer.from(buffer));
+    // CEDIS trae 3 workbooks (Ventas, Bonificaciones, Descuentos y
+    // Devoluciones — cada uno con su par Contado/Crédito adentro) — cada uno
+    // se guarda como su propio archivo .xlsx dentro de la carpeta de la
+    // sucursal. El resto de sucursales sigue trayendo un solo workbook (todos
+    // los bloques juntos), igual que siempre.
+    for (const { tipoVenta, workbook } of workbooks) {
+      const buffer = await workbook.xlsx.writeBuffer();
+      const sufijo = workbooks.length > 1 ? `_${sanitize(tipoVenta)}` : '';
+      const nombreArchivo = entry.fecha
+        ? `Poliza_${poliza.tipo}${poliza.numero}_${entry.fecha}${sufijo}_CONTPAQ.xlsx`
+        : `Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mesPeriodo}${sufijo}_CONTPAQ.xlsx`;
+      const ruta = entry.centroCosto
+        ? `${sanitize(entry.centroCosto)}/${nombreArchivo}`
+        : nombreArchivo;
+      zip.addFile(ruta, Buffer.from(buffer));
+    }
   }
 
   // Resumen de todas las combinaciones (incluidas las que no generaron

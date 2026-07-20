@@ -786,9 +786,18 @@ const resumenCfdis = asyncHandler(async (req, res) => {
 const CAMPOS_MONTO = ['total', 'subTotal', 'impuestos.totalImpuestosTrasladados', 'impuestos.totalImpuestosRetenidos', 'complementoPago.montoTotalPagos'];
 
 const discrepanciasMontos = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, tipoDeComprobante, page = 1, limit = 100, campos } = req.query;
+  const { ejercicio, periodo, tipoDeComprobante, page = 1, limit = 100, campos, rfcEmisor } = req.query;
   const pg = Math.max(1, parseInt(page));
   const lm = Math.min(1000, Math.max(1, parseInt(limit)));
+
+  // Este reporte es solo de Emitidos — igual que /dashboard y /not-in-erp,
+  // nunca debe incluir Recibidos (que jamás tienen contraparte ERP y
+  // contaminarían la sección "sin contraparte en ERP" de este modal).
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   // Si se pasa `campos` (csv), filtrar solo esos; si no, todos los de monto
   const camposFiltro = campos
@@ -807,6 +816,7 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     source: 'ERP',
     erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] },
     lastComparisonStatus: { $in: ['discrepancy', 'warning'] },
+    'emisor.rfc': emisorConstraint,
     ...periodoFiltro,
   }).select('_id').lean().then(docs => docs.map(d => d._id));
 
@@ -832,7 +842,7 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
   const cfdiSelect = 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda';
 
   // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito
-  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } };
+  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint };
   if (tipoDeComprobante) pendienteFiltro.tipoDeComprobante = tipoDeComprobante;
   if (ejercicio && periodo) {
     const ej = parseInt(ejercicio), pe = parseInt(periodo);
@@ -857,15 +867,15 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     Comparison.countDocuments(filter),
 
     // ERP en el periodo que no tienen contraparte en SAT
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, lastComparisonStatus: 'not_in_sat', ...cfdiPeriodoFiltro })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, lastComparisonStatus: 'not_in_sat', 'emisor.rfc': emisorConstraint, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
 
     // SAT/MANUAL en el periodo que no tienen contraparte en ERP
-    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...cfdiPeriodoFiltro })
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', 'emisor.rfc': emisorConstraint, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
 
     // ERP activo pero SAT cancelado (cruce de estatus fiscal)
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, ...cfdiPeriodoFiltro })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
 
     // ERP con RFC con & — verificación SAT pendiente (SOAP no soporta %26)
@@ -991,8 +1001,17 @@ const satVigenteErpInactivo = asyncHandler(async (req, res) => {
  * incluyendo not_in_erp, not_in_sat, discrepancias de monto, RFC, etc.
  */
 const discrepanciasCriticas = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
+  const { ejercicio, periodo, tipoDeComprobante, limit = 500, rfcEmisor } = req.query;
   const lm = Math.min(2000, Math.max(1, parseInt(limit)));
+
+  // Este reporte es solo de Emitidos — igual que /dashboard, /not-in-erp y
+  // /discrepancias-montos, nunca debe incluir Recibidos (que jamás tienen
+  // contraparte ERP y contaminarían el bucket "not_in_erp" de este reporte).
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   // matchPeriodo sobre Comparison — solo ejercicio/periodo, NO tipoDeComprobante
   // (tipoDeComprobante puede ser null en Comparisons antiguos, lo filtramos post-lookup)
@@ -1001,8 +1020,8 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   if (periodo)   matchPeriodo.periodo   = parseInt(periodo);
 
   // Filtro CFDI para los casos que se leen directamente de la colección CFDI
-  const cfdiErp = { source: 'ERP', isActive: { $ne: false } };
-  const cfdiSat = { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false } };
+  const cfdiErp = { source: 'ERP', isActive: { $ne: false }, 'emisor.rfc': emisorConstraint };
+  const cfdiSat = { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, 'emisor.rfc': emisorConstraint };
   if (ejercicio)         { cfdiErp.ejercicio = parseInt(ejercicio); cfdiSat.ejercicio = parseInt(ejercicio); }
   if (periodo)           { cfdiErp.periodo   = parseInt(periodo);   cfdiSat.periodo   = parseInt(periodo);   }
   if (tipoDeComprobante) { cfdiErp.tipoDeComprobante = tipoDeComprobante; cfdiSat.tipoDeComprobante = tipoDeComprobante; }
@@ -1115,8 +1134,17 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
  * registros históricos de la colección Comparison.
  */
 const notInErp = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
+  const { ejercicio, periodo, tipoDeComprobante, rfcEmisor, limit = 500 } = req.query;
   const lm = Math.min(2000, Math.max(1, parseInt(limit)));
+
+  // Este reporte es solo de Emitidos — igual que /dashboard, nunca debe
+  // incluir Recibidos (que jamás tienen contraparte ERP y contaminarían
+  // el listado). Si no llega rfcEmisor se restringe a las entidades propias.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   const periodoBase = {};
   if (ejercicio)         periodoBase.ejercicio         = parseInt(ejercicio);
@@ -1126,11 +1154,11 @@ const notInErp = asyncHandler(async (req, res) => {
   const selectFields = 'uuid serie folio fecha tipoDeComprobante total moneda emisor receptor satStatus lastComparisonStatus ejercicio periodo source';
 
   // Paso 1: ERP del periodo seleccionado
-  const erpDelPeriodo = await CFDI.find({ isActive: { $ne: false }, source: 'ERP', ...periodoBase }, 'uuid ejercicio periodo').lean();
+  const erpDelPeriodo = await CFDI.find({ isActive: { $ne: false }, source: 'ERP', 'emisor.rfc': emisorConstraint, ...periodoBase }, 'uuid ejercicio periodo').lean();
   const erpUuidsPeriodo = new Set(erpDelPeriodo.map(d => d.uuid?.toUpperCase()).filter(Boolean));
 
   // Paso 2: SAT/MANUAL del periodo seleccionado (sin filtro de tipo)
-  const satFiltroBase = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] } };
+  const satFiltroBase = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint };
   if (periodoBase.ejercicio) satFiltroBase.ejercicio = periodoBase.ejercicio;
   if (periodoBase.periodo)   satFiltroBase.periodo   = periodoBase.periodo;
 

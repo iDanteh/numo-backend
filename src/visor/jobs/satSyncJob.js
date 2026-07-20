@@ -1646,6 +1646,58 @@ const jobVerificacionSAT = async () => {
   logger.info(`[SatSyncJob] Verificación completada: ${success} exitosos, ${failed} fallidos`);
 };
 
+// Verifica el estado SAT de CFDIs Recibidos (source: 'SAT', receptor = entidad propia)
+// que nunca se han verificado o cuya última verificación tiene más de un día.
+// A diferencia de jobVerificacionSAT (Emitidos), aquí no se llama a compareCFDI —
+// Recibidos no tiene motor de comparación contra ERP, solo se actualiza satStatus.
+const jobVerificacionSATRecibidos = async () => {
+  logger.info('[SatSyncJob] Iniciando verificación de estado SAT para Recibidos...');
+
+  const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+  if (entidadesRfcs.length === 0) {
+    logger.warn('[SatSyncJob] Sin entidades registradas — se omite verificación de Recibidos.');
+    return;
+  }
+
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const cfdis = await CFDI.find({
+    source:          'SAT',
+    isActive:        { $ne: false },
+    'receptor.rfc':  { $in: entidadesRfcs },
+    $or: [
+      { satStatus: null },
+      { satLastCheck: { $lt: yesterday } },
+      { satStatus: 'Pendiente' },
+    ],
+  }, '_id uuid emisor receptor total version sello timbreFiscalDigital tipoDeComprobante').limit(2000).lean();
+
+  logger.info(`[SatSyncJob] ${cfdis.length} CFDIs Recibidos por verificar`);
+
+  let success = 0, failed = 0, omitidos = 0;
+  for (const cfdi of cfdis) {
+    // RFCs con & no son consultables vía SOAP (el servicio no decodifica %26)
+    const rfcConAmpersand = (cfdi.emisor?.rfc || '').includes('&') || (cfdi.receptor?.rfc || '').includes('&');
+    if (rfcConAmpersand || !cfdi.emisor?.rfc || !cfdi.receptor?.rfc) {
+      omitidos++;
+      continue;
+    }
+    try {
+      const sello  = cfdi.timbreFiscalDigital?.selloCFD || cfdi.sello || '';
+      const result = await verifyCFDIWithSAT(
+        cfdi.uuid, cfdi.emisor.rfc, cfdi.receptor.rfc,
+        cfdi.total, sello, cfdi.version || '4.0', cfdi.tipoDeComprobante,
+      );
+      await CFDI.updateMany({ uuid: cfdi.uuid }, { $set: { satStatus: result.state, satLastCheck: new Date() } });
+      success++;
+      await new Promise(r => setTimeout(r, 600));
+    } catch (err) {
+      failed++;
+      logger.error(`[SatSyncJob] Error CFDI Recibido ${cfdi.uuid}: ${err.message}`);
+    }
+  }
+  logger.info(`[SatSyncJob] Verificación Recibidos completada: ${success} exitosos, ${failed} fallidos, ${omitidos} omitidos`);
+};
+
 const jobDescargaMasiva = async () => {
   try {
     await ejecutarDescargaMasiva({ tipos: ['Emitidos'] });
@@ -1687,6 +1739,7 @@ const horaACron = (hora) => {
 
 // Instancias actuales de los jobs (para poder destruirlas y recrearlas)
 let _jobVerif             = null;
+let _jobVerifRecibidos    = null;
 let _jobDescarga          = null;
 let _jobDescargaRecibidos = null;
 let _jobERP               = null;
@@ -1700,6 +1753,11 @@ const jobDescargaERP = async () => {
 const jobComparacionAuto = async () => {
   try { await ejecutarComparacionAuto(); }
   catch (err) { logger.error(`[CompJobAuto] Error fatal en comparación: ${err.message}`); }
+};
+
+const jobVerificacionRecibidos = async () => {
+  try { await jobVerificacionSATRecibidos(); }
+  catch (err) { logger.error(`[SatSyncJob] Error fatal en verificación de Recibidos: ${err.message}`); }
 };
 
 /**
@@ -1908,22 +1966,26 @@ cron.schedule('*/5 * * * *', async () => {
 const reprogramarJobs = ({
   satDescarga = '01:00', satDescargaRecibidos = '22:00',
   erpDescarga = '03:00', erpVerificacion = '02:00', comparacion = '04:00',
+  satVerificacionRecibidos = '06:00',
 } = {}) => {
   if (_jobVerif)             { _jobVerif.stop();             _jobVerif             = null; }
+  if (_jobVerifRecibidos)    { _jobVerifRecibidos.stop();    _jobVerifRecibidos    = null; }
   if (_jobDescarga)          { _jobDescarga.stop();          _jobDescarga          = null; }
   if (_jobDescargaRecibidos) { _jobDescargaRecibidos.stop(); _jobDescargaRecibidos = null; }
   if (_jobERP)               { _jobERP.stop();               _jobERP               = null; }
   if (_jobComparacion)       { _jobComparacion.stop();       _jobComparacion       = null; }
 
-  _jobDescarga          = cron.schedule(horaACron(satDescarga),          jobDescargaMasiva,          { timezone: 'America/Mexico_City' });
-  _jobDescargaRecibidos = cron.schedule(horaACron(satDescargaRecibidos), jobDescargaMasivaRecibidos, { timezone: 'America/Mexico_City' });
-  _jobERP               = cron.schedule(horaACron(erpDescarga),          jobDescargaERP,             { timezone: 'America/Mexico_City' });
-  _jobVerif             = cron.schedule(horaACron(erpVerificacion),      jobVerificacionSAT,         { timezone: 'America/Mexico_City' });
-  _jobComparacion       = cron.schedule(horaACron(comparacion),          jobComparacionAuto,         { timezone: 'America/Mexico_City' });
+  _jobDescarga          = cron.schedule(horaACron(satDescarga),             jobDescargaMasiva,          { timezone: 'America/Mexico_City' });
+  _jobDescargaRecibidos = cron.schedule(horaACron(satDescargaRecibidos),    jobDescargaMasivaRecibidos, { timezone: 'America/Mexico_City' });
+  _jobERP               = cron.schedule(horaACron(erpDescarga),             jobDescargaERP,             { timezone: 'America/Mexico_City' });
+  _jobVerif             = cron.schedule(horaACron(erpVerificacion),         jobVerificacionSAT,         { timezone: 'America/Mexico_City' });
+  _jobVerifRecibidos    = cron.schedule(horaACron(satVerificacionRecibidos), jobVerificacionRecibidos,  { timezone: 'America/Mexico_City' });
+  _jobComparacion       = cron.schedule(horaACron(comparacion),             jobComparacionAuto,         { timezone: 'America/Mexico_City' });
 
   logger.info(
     `[SatSyncJob] Jobs programados — Descarga SAT Emitidos: ${satDescarga} | Descarga SAT Recibidos: ${satDescargaRecibidos} | ` +
-    `Descarga ERP: ${erpDescarga} | Verificación: ${erpVerificacion} | Comparación: ${comparacion} (America/Mexico_City)`
+    `Descarga ERP: ${erpDescarga} | Verificación: ${erpVerificacion} | Verificación Recibidos: ${satVerificacionRecibidos} | ` +
+    `Comparación: ${comparacion} (America/Mexico_City)`
   );
 };
 
@@ -1931,17 +1993,18 @@ const reprogramarJobs = ({
 (async () => {
   try {
     const AppConfig = require('../models/AppConfig');
-    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion'] } }).lean();
+    const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'] } }).lean();
     const map       = Object.fromEntries(configs.map(c => [c.key, c.value]));
     reprogramarJobs({
-      satDescarga:          map.satDescarga          ?? '01:00',
-      satDescargaRecibidos: map.satDescargaRecibidos ?? '22:00',
-      erpDescarga:          map.erpDescarga          ?? '03:00',
-      erpVerificacion:      map.erpVerificacion      ?? '02:00',
-      comparacion:          map.comparacion          ?? '04:00',
+      satDescarga:              map.satDescarga              ?? '01:00',
+      satDescargaRecibidos:     map.satDescargaRecibidos     ?? '22:00',
+      erpDescarga:              map.erpDescarga              ?? '03:00',
+      erpVerificacion:          map.erpVerificacion          ?? '02:00',
+      comparacion:              map.comparacion              ?? '04:00',
+      satVerificacionRecibidos: map.satVerificacionRecibidos ?? '06:00',
     });
   } catch (err) {
-    logger.error(`[SatSyncJob] No se pudo leer horario de BD al arrancar — usando defaults (01:00/22:00/03:00/02:00/04:00). Error: ${err.message}`);
+    logger.error(`[SatSyncJob] No se pudo leer horario de BD al arrancar — usando defaults (01:00/22:00/03:00/02:00/04:00/06:00). Error: ${err.message}`);
     reprogramarJobs();
   }
 

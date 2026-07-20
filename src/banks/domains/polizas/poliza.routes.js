@@ -1,9 +1,14 @@
 'use strict';
 
 const express = require('express');
+const AdmZip  = require('adm-zip');
 const { authenticate, permit } = require('../../shared/middleware/auth.real');
 const { asyncHandler }         = require('../../shared/middleware/error-handler');
 const service                  = require('./poliza.service');
+
+// Sin caracteres fuera de [A-Za-z0-9_-] en nombres de archivo dentro del ZIP —
+// mismo criterio que poliza-export-zip.service.js.
+const sanitize = (s) => String(s ?? '').replace(/[^\w-]+/g, '_');
 
 const router = express.Router();
 
@@ -76,11 +81,25 @@ router.get('/:id/export-contpaq',
         ? String(centroCostoIds).split(',').map(v => parseInt(v, 10)).filter(v => !Number.isNaN(v))
         : undefined,
     };
-    const { workbook, poliza } = await service.exportContpaqXlsx(req.params.id, overrides);
+    const { workbooks, poliza } = await service.exportContpaqXlsx(req.params.id, overrides);
     const mes = String(poliza.periodo).padStart(2, '0');
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mes}_CONTPAQ.xlsx"`);
-    await workbook.xlsx.write(res);
+
+    if (workbooks.length === 1) {
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mes}_CONTPAQ.xlsx"`);
+      await workbooks[0].workbook.xlsx.write(res);
+      return;
+    }
+
+    // CEDIS: más de un bloque → un .xlsx por bloque, entregados juntos en un ZIP.
+    const zip = new AdmZip();
+    for (const { tipoVenta, workbook } of workbooks) {
+      const buffer = await workbook.xlsx.writeBuffer();
+      zip.addFile(`Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mes}_${sanitize(tipoVenta)}_CONTPAQ.xlsx`, Buffer.from(buffer));
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mes}_CONTPAQ.zip"`);
+    res.send(zip.toBuffer());
   }),
 );
 

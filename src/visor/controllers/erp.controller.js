@@ -183,15 +183,32 @@ const enrichComplementoPago = async (doc, facturaRaw) => {
     return;
   }
 
-  const doctosRelacionados = relacionadas.map((r) => ({
-    idDocumento: r.uuid,
-    serie:       r.serie  || undefined,
-    folio:       r.folio  || undefined,
-    monedaDR:    r.moneda || 'MXN',
-    impPagado:   r.total  ?? 0,
-  }));
+  // Si el pago ya trae un monto correcto (ej. del campo plano `Importe` del
+  // ERP) y hay una sola factura relacionada, ese monto es lo realmente
+  // pagado — no se debe reconstruir desde el total de la factura, ya que
+  // esta pudo pagarse en parcialidades (confirmado contra un caso real:
+  // factura de $28,860.52 pagada en una parcialidad de $27,706.09).
+  const montoExistente = pagos.length === 1 && typeof pagos[0].monto === 'number' && pagos[0].monto > 0
+    ? pagos[0].monto
+    : null;
 
-  const monto = doctosRelacionados.reduce((s, d) => s + (d.impPagado ?? 0), 0);
+  const doctosRelacionados = (relacionadas.length === 1 && montoExistente != null)
+    ? [{
+        idDocumento: relacionadas[0].uuid,
+        serie:       relacionadas[0].serie  || undefined,
+        folio:       relacionadas[0].folio  || undefined,
+        monedaDR:    relacionadas[0].moneda || 'MXN',
+        impPagado:   montoExistente,
+      }]
+    : relacionadas.map((r) => ({
+        idDocumento: r.uuid,
+        serie:       r.serie  || undefined,
+        folio:       r.folio  || undefined,
+        monedaDR:    r.moneda || 'MXN',
+        impPagado:   r.total  ?? 0,
+      }));
+
+  const monto = montoExistente ?? doctosRelacionados.reduce((s, d) => s + (d.impPagado ?? 0), 0);
 
   const fechaPagoRaw = facturaRaw?.FechaPago ?? facturaRaw?.FechaGeneracion ?? null;
   const fechaPago    = fechaPagoRaw ? new Date(fechaPagoRaw) : undefined;
@@ -594,15 +611,33 @@ const enriquecerPagos = asyncHandler(async (req, res) => {
 
     if (!relacionadas.length) { omitidos++; continue; }
 
-    const doctosRelacionados = relacionadas.map((r) => ({
-      idDocumento: r.uuid,
-      serie:       r.serie  || undefined,
-      folio:       r.folio  || undefined,
-      monedaDR:    r.moneda || 'MXN',
-      impPagado:   r.total  ?? 0,
-    }));
+    // Ver nota en `enrichComplementoPago`: si ya existe un monto correcto
+    // (ej. del campo plano `Importe` del ERP) y hay una sola factura
+    // relacionada, ese monto es lo realmente pagado — no reconstruir desde
+    // el total de la factura, que puede diferir por pago en parcialidades.
+    const pagosExistentes = doc.complementoPago?.pagos ?? [];
+    const montoExistente = pagosExistentes.length === 1
+      && typeof pagosExistentes[0].monto === 'number' && pagosExistentes[0].monto > 0
+      ? pagosExistentes[0].monto
+      : null;
 
-    const monto = doctosRelacionados.reduce((s, d) => s + (d.impPagado ?? 0), 0);
+    const doctosRelacionados = (relacionadas.length === 1 && montoExistente != null)
+      ? [{
+          idDocumento: relacionadas[0].uuid,
+          serie:       relacionadas[0].serie  || undefined,
+          folio:       relacionadas[0].folio  || undefined,
+          monedaDR:    relacionadas[0].moneda || 'MXN',
+          impPagado:   montoExistente,
+        }]
+      : relacionadas.map((r) => ({
+          idDocumento: r.uuid,
+          serie:       r.serie  || undefined,
+          folio:       r.folio  || undefined,
+          monedaDR:    r.moneda || 'MXN',
+          impPagado:   r.total  ?? 0,
+        }));
+
+    const monto = montoExistente ?? doctosRelacionados.reduce((s, d) => s + (d.impPagado ?? 0), 0);
 
     await CFDI.updateOne(
       { _id: doc._id },

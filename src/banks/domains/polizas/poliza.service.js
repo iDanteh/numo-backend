@@ -903,7 +903,12 @@ function bloquesAjustesContado(movs) {
  *   5. Depósito identificado (forma de pago sin mapear con depósito bancario
  *      real ligado) — al final del export.
  */
-function armarBloqueContado(contado, verdadBancaria, nombresClientes) {
+// `separarCategorias` (usado solo para la sucursal CEDIS — ver exportContpaqXlsx):
+// cuando es `true`, Bonificación (genérica + Club Tuberos) y Descuento/Devolución
+// (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
+// caller las arme como sus propias pólizas. Anticipos y depósitos identificados
+// no cambian, siguen dentro de `ventas` igual que siempre.
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false } = {}) {
   const contadoAjuste = contado.filter(esAjusteContadoMov);
   const contadoNormal = contado.filter(m => !esAjusteContadoMov(m));
 
@@ -913,11 +918,11 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes) {
 
   const bloquesVentas = [
     ...bloquesAbonosNormales(contadoNormal.filter(m => Number(m.haber) > 0)),
-    ...bloquesDeCategorias('devolucion', 'descuento', 'bonificacion'),
+    ...(separarCategorias ? [] : bloquesDeCategorias('devolucion', 'descuento', 'bonificacion')),
   ];
   bloquesVentas.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
-  const bloquesClubTuberos = bloquesDeCategorias('clubTuberos');
+  const bloquesClubTuberos = separarCategorias ? [] : bloquesDeCategorias('clubTuberos');
   bloquesClubTuberos.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
   const bloquesAnticipos = bloquesDeCategorias('anticipo');
@@ -932,7 +937,21 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes) {
   );
   const anticiposEnriquecidos = enriquecerConceptoConCliente(bloquesAnticipos.flat(), nombresClientes);
 
-  return [...ventasYClubTuberos, ...consolidados, ...anticiposEnriquecidos, ...depositosIdentificados];
+  const ventas = [...ventasYClubTuberos, ...consolidados, ...anticiposEnriquecidos, ...depositosIdentificados];
+
+  if (!separarCategorias) return ventas;
+
+  const bloquesBonificaciones = [...bloquesDeCategorias('bonificacion'), ...bloquesDeCategorias('clubTuberos')];
+  bloquesBonificaciones.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
+
+  const bloquesDescuentoDevolucion = [...bloquesDeCategorias('descuento'), ...bloquesDeCategorias('devolucion')];
+  bloquesDescuentoDevolucion.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
+
+  return {
+    ventas,
+    bonificaciones:         enriquecerConceptoConCliente(bloquesBonificaciones.flat(), nombresClientes),
+    descuentosDevoluciones: enriquecerConceptoConCliente(bloquesDescuentoDevolucion.flat(), nombresClientes),
+  };
 }
 
 // Igual que `categorizarAjusteContado`, pero también reconoce Anticipo — en
@@ -958,7 +977,12 @@ function categoriaDeGrupoCredito(movs) {
  * posición de folio (el color de fila sigue distinguiendo cada categoría).
  * Reemplaza a `moverBCTAlFinal` para los bloques de Crédito.
  */
-function moverAjustesAlFinal(movs) {
+// `separarCategorias` (usado solo para la sucursal CEDIS — ver exportContpaqXlsx):
+// mismo criterio que `armarBloqueContado` — Bonificación (genérica + Club
+// Tuberos) y Descuento/Devolución (incluye Cancelación) se devuelven aparte en
+// vez de mezclarse en la secuencia normal. Anticipo (y venta normal, categoría
+// `null`) se quedan en `ventas`, igual que siempre.
+function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
   // Aplanar primero (mismo motivo que `enriquecerConceptoConCliente`): `m`
   // puede ser una instancia de Sequelize, y un spread directo más adelante
   // perdería todos sus campos reales.
@@ -972,11 +996,11 @@ function moverAjustesAlFinal(movs) {
     porCfdi.get(key).push(m);
   }
 
-  const bloques = [];
+  const bloques = []; // { categoria: string|null, bloque: object[] }
   for (const key of ordenCfdi) {
     const grupo    = porCfdi.get(key);
     const categoria = categoriaDeGrupoCredito(grupo);
-    if (!categoria) { bloques.push(grupo); continue; }
+    if (!categoria) { bloques.push({ categoria: null, bloque: grupo }); continue; }
     // Mismo criterio que en Contado: Devolución/Cancelación solo muestra el
     // cargo (salvo que el abono sea la creación de un saldo a favor —
     // `esAbonoSaldoFavor` — que sí se muestra), y dentro de cada lado la
@@ -990,11 +1014,21 @@ function moverAjustesAlFinal(movs) {
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
     const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
-    bloques.push(bloque);
+    bloques.push({ categoria, bloque });
   }
 
-  bloques.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
-  return bloques.flat();
+  bloques.sort((b1, b2) => compararSerieFolio(b1.bloque[0], b2.bloque[0]));
+
+  if (!separarCategorias) return bloques.map(b => b.bloque).flat();
+
+  const deCategorias = (...categorias) =>
+    bloques.filter(b => categorias.includes(b.categoria)).map(b => b.bloque).flat();
+
+  return {
+    ventas:                 deCategorias(null, 'anticipo'),
+    bonificaciones:         deCategorias('bonificacion', 'clubTuberos'),
+    descuentosDevoluciones: deCategorias('descuento', 'devolucion'),
+  };
 }
 
 /**
@@ -1049,6 +1083,12 @@ async function exportContpaqXlsx(id, overrides = {}) {
     }
   }
 
+  // CEDIS es la única sucursal donde, además de Contado/Crédito, se piden
+  // Bonificaciones y Descuentos/Devoluciones/Cancelaciones como pólizas propias
+  // (ver rama `esCedis` más abajo) — el resto de sucursales sigue igual.
+  const esCedis = movimientos.length > 0 &&
+    movimientos.every(m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS');
+
   const sinCuenta = movimientos.filter(m => m.cuentaFaltante || m.cuentaId == null);
   if (sinCuenta.length > 0) {
     throw new ValidationError(
@@ -1087,6 +1127,46 @@ async function exportContpaqXlsx(id, overrides = {}) {
   if (poliza.tipo === 'I') {
     const contado = movimientos.filter(m => m.metodoPago !== 'PPD');
     const credito = movimientos.filter(m => m.metodoPago === 'PPD');
+
+    if (esCedis) {
+      // CEDIS: hasta 6 pólizas — Contado, Crédito, Bonificaciones de Contado,
+      // Bonificaciones de Crédito, Descuentos/Devoluciones/Cancelaciones de
+      // Contado y de Crédito. Solo se genera la que tenga movimientos —
+      // mismo principio que ya usa el resto de sucursales cuando falta
+      // Contado o Crédito (folios consecutivos, sin huecos).
+      const cSplit = contado.length > 0
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true })
+        : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
+      const rSplit = credito.length > 0
+        ? moverAjustesAlFinal(credito, { separarCategorias: true })
+        : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
+
+      let folio = overrides.folioContado ?? poliza.numero;
+      bloques = [];
+      const push = (tipoVenta, movs, folioOverride) => {
+        if (!movs.length) return;
+        bloques.push({
+          tipoVenta,
+          movs,
+          folio:    folioOverride ?? folio++,
+          concepto: _conceptoConTipoVenta(tipoVenta, `${poliza.concepto} - ${tipoVenta}`),
+        });
+      };
+      // `armarBloqueContado` (Contado) ya enriquece el concepto internamente;
+      // `moverAjustesAlFinal` (Crédito) no lo hace — mismo patrón que el
+      // camino legado (línea de abajo: `enriquecerConceptoConCliente(moverAjustesAlFinal(credito), ...)`).
+      push('Contado',                              cSplit.ventas,                                                         overrides.folioContado);
+      push('Credito',                              enriquecerConceptoConCliente(rSplit.ventas, nombresClientes),          overrides.folioCredito);
+      push('Bonificaciones de Contado',             cSplit.bonificaciones);
+      push('Bonificaciones de Crédito',             enriquecerConceptoConCliente(rSplit.bonificaciones, nombresClientes));
+      push('Descuentos y Devoluciones de Contado',  cSplit.descuentosDevoluciones);
+      push('Descuentos y Devoluciones de Crédito',  enriquecerConceptoConCliente(rSplit.descuentosDevoluciones, nombresClientes));
+
+      if (bloques.length === 0) {
+        throw new ValidationError('No hay movimientos para generar la póliza de CEDIS.');
+      }
+    } else
+
     bloques = (contado.length > 0 && credito.length > 0)
       ? [
           // Contado: la práctica contable real solo registra el abono (Ingreso+IVA)
@@ -1133,6 +1213,49 @@ async function exportContpaqXlsx(id, overrides = {}) {
     }];
   }
 
+  if (esCedis) {
+    // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
+    // Crédito) y Descuentos y Devoluciones (Contado+Crédito). Cada archivo
+    // trae 1 o 2 encabezados 'P' — mismo patrón que ya usa el resto de
+    // sucursales para Contado/Crédito (un solo folio si falta un lado, dos
+    // folios consecutivos compartiendo archivo si están ambos).
+    const GRUPO_POR_TIPO_VENTA = {
+      'Contado': 'Ventas', 'Credito': 'Ventas',
+      'Bonificaciones de Contado': 'Bonificaciones', 'Bonificaciones de Crédito': 'Bonificaciones',
+      'Descuentos y Devoluciones de Contado': 'Descuentos y Devoluciones',
+      'Descuentos y Devoluciones de Crédito': 'Descuentos y Devoluciones',
+    };
+    const gruposOrdenados = ['Ventas', 'Bonificaciones', 'Descuentos y Devoluciones'];
+    const bloquesPorGrupo = new Map(gruposOrdenados.map(g => [g, []]));
+    for (const bloque of bloques) {
+      bloquesPorGrupo.get(GRUPO_POR_TIPO_VENTA[bloque.tipoVenta]).push(bloque);
+    }
+
+    const workbooks = [];
+    for (const grupo of gruposOrdenados) {
+      const bloquesGrupo = bloquesPorGrupo.get(grupo);
+      if (bloquesGrupo.length === 0) continue;
+      workbooks.push({
+        tipoVenta: grupo,
+        folio:     bloquesGrupo[0].folio,
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes),
+      });
+    }
+    return { poliza, workbooks };
+  }
+
+  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes);
+  return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
+}
+
+/**
+ * Arma el workbook de CONTPAQ (hoja `poliza` con filas P/M1/AD, más las hojas
+ * informativas de Desglose Consolidado y CFDIs Sustitutos si aplican) para el
+ * subconjunto de `bloques` recibido — 1 sola llamada para el caso normal
+ * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
+ * bloque en su propio archivo).
+ */
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -1300,7 +1423,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
     wsSustitutos.autoFilter = { from: 'A1', to: 'H1' };
   }
 
-  return { workbook, poliza };
+  return workbook;
 }
 
 /**

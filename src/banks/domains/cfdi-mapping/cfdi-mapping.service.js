@@ -402,11 +402,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // metodoPago propio de la NC — pueden no coincidir (confirmado con el
   // usuario: una NC "Efectivo/PUE" puede estar ajustando una factura PPD
   // nunca cobrada; en ese caso el IVA debe cancelarse contra cuentaIvaPPD,
-  // no contra cuentaIva). Sin ese dato (I/P, o E sin relación resuelta), cae
-  // al metodoPago propio del CFDI, comportamiento previo sin cambios.
-  const esPPD     = (tipo === 'E' && context.metodoPagoRelacionado)
-    ? context.metodoPagoRelacionado === 'PPD'
-    : cfdi.metodoPago === 'PPD';
+  // no contra cuentaIva, Y el movimiento debe clasificarse como PPD/Crédito
+  // en la póliza — no solo la cuenta de IVA, ver `satMeta.metodoPago` abajo).
+  // Sin ese dato (I/P, o E sin relación resuelta), cae al metodoPago propio
+  // del CFDI, comportamiento previo sin cambios.
+  const metodoPagoResuelto = (tipo === 'E' && context.metodoPagoRelacionado)
+    ? context.metodoPagoRelacionado
+    : cfdi.metodoPago;
+  const esPPD     = metodoPagoResuelto === 'PPD';
 
   // Para CFDI tipo P, total y subTotal son siempre 0 por diseño SAT.
   // Los montos reales viven en el complemento de pago.
@@ -910,7 +913,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // PPD por transferencia) nunca se detecta porque formaPago siempre llega null.
   const satMeta = {
     tipoComprobante: cfdi.tipoDeComprobante                      ?? null,
-    metodoPago:      cfdi.metodoPago                            ?? null,
+    // metodoPago ya resuelto arriba (factura origen para NC tipo E, ver
+    // `metodoPagoResuelto`) — no el metodoPago crudo de la NC. Esto es lo que
+    // luego decide el bloque Contado/Crédito en el export CONTPAQ
+    // (`poliza.service.js` → `exportContpaqXlsx`).
+    metodoPago:      metodoPagoResuelto                         ?? null,
     formaPago:       cfdi.formaPago
       ?? (cfdi.tipoDeComprobante === 'P'
         ? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? null

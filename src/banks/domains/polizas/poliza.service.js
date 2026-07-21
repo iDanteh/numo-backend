@@ -1275,7 +1275,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
       bloque.folio,
       '1',
       '0',
-      bloque.concepto,
+      `${bloque.concepto} - DEV`,
       '11',
       '0',
       '0',

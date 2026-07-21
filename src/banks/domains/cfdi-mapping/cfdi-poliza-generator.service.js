@@ -21,6 +21,34 @@ const {
 // (array, formato ERP) como `uuid` (singular, formato SAT), según el origen.
 const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
 
+// El pre-fetch de relMetodoPagoMap/relFacturaMetaMap (más abajo, `relTipoUuidsProp`/
+// `relTipoUuidsGuard`) se calcula ANTES del merge con ERP, a partir del
+// `cfdiRelacionados` crudo de SAT — pero algunas NC (Devolución/Bonificación)
+// solo traen `cfdiRelacionados` poblado en la fuente ERP, no en SAT (confirmado
+// con el usuario: NC 82AA95D2-A255-4441-9C99-BEE4D3E9B959, factura origen
+// A0-260615344 PPD — su `cfdiRelacionados` en SAT llega vacío, solo aparece
+// tras el merge ERP). Sin esto, esas NC nunca resuelven `metodoPagoRelacionado`
+// (ni tampoco lo ven `_normalizarEgresoCondonacion`/`_normalizarEgresoSegunFacturaRelacionada`,
+// que dependen del mismo mapa) y se clasifican con su propio metodoPago en vez
+// del de la venta que ajustan. Se llama DESPUÉS del merge para completar los
+// mapas con los uuids relacionados que solo aparecieron ahí (solo agrega, nunca
+// sobrescribe lo que el pre-fetch original ya resolvió).
+async function _completarRelacionadosPostMerge(cfdisFinal, relMetodoPagoMap, relFacturaMetaMap) {
+  const faltantes = [...new Set(cfdisFinal.flatMap(c => _uuidsRelacionados(c)))]
+    .filter(u => !(u in relMetodoPagoMap));
+  if (!faltantes.length) return;
+  const relCfdis = await CFDI.find({ uuid: { $in: faltantes } })
+    .select('uuid metodoPago formaPago').lean();
+  for (const c of relCfdis) {
+    // Un mismo uuid trae DOS documentos (source SAT y ERP) — el de SAT suele
+    // no tener metodoPago/formaPago propio (undefined). Sin este guard, si el
+    // doc SAT se procesa después del ERP, pisa el valor bueno con `undefined`.
+    if (c.metodoPago == null) continue;
+    relMetodoPagoMap[c.uuid]  = c.metodoPago;
+    relFacturaMetaMap[c.uuid] = { metodoPago: c.metodoPago, formaPago: c.formaPago };
+  }
+}
+
 const SUCURSAL_DEFAULT = 'Cedis';
 
 // Series de documentosRelacionados (ERP) que identifican una NC como ajuste
@@ -468,6 +496,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     };
   });
 
+  // Completar relMetodoPagoMap/relFacturaMetaMap con relacionados que solo
+  // aparecieron tras el merge ERP — ver `_completarRelacionadosPostMerge`.
+  await _completarRelacionadosPostMerge(cfdisSinPolizaFinal, relMetodoPagoMap, relFacturaMetaMap);
+
   // Enriquecer tasaIvaInferida en memoria para CFDIs P Metadata.
   // Paso 1: facturas relacionadas en MongoDB SAT. Paso 2: fallback ERP.
   if (tipoCfdi === 'P') {
@@ -531,6 +563,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const cfdisConNCProp = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap: ccBySerieMapProp })]
     : cfdisSinPolizaFinalFiltrado;
+
+  // Las NC fusionadas (_fetchNotasCreditoParaFusion) se agregan DESPUÉS del
+  // primer `_completarRelacionadosPostMerge` — completar de nuevo (solo agrega
+  // lo que aún falte) para que su `context.metodoPagoRelacionado` también se
+  // resuelva más abajo.
+  await _completarRelacionadosPostMerge(cfdisConNCProp, relMetodoPagoMap, relFacturaMetaMap);
 
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
   const cfdiConRegla = cfdisConNCProp.map(cfdi => ({
@@ -920,6 +958,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     };
   });
 
+  // Completar relMetodoPagoMapGuard/relFacturaMetaMapGuard con relacionados que
+  // solo aparecieron tras el merge ERP — ver `_completarRelacionadosPostMerge`.
+  await _completarRelacionadosPostMerge(cfdisSinPolizaFinalGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
+
   // Enriquecer tasaIvaInferida en memoria para CFDIs P Metadata.
   // Paso 1: facturas relacionadas en MongoDB SAT. Paso 2: fallback ERP.
   if (tipoCfdi === 'P') {
@@ -979,6 +1021,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const cfdisConNCGuard = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalGuardFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalGuardFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap })]
     : cfdisSinPolizaFinalGuardFiltrado;
+
+  // Las NC fusionadas se agregan DESPUÉS del primer `_completarRelacionadosPostMerge`
+  // — completar de nuevo (solo agrega lo que aún falte), ver comentario equivalente
+  // en generarPropuesta.
+  await _completarRelacionadosPostMerge(cfdisConNCGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
 
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({

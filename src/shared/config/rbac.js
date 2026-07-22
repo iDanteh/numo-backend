@@ -40,6 +40,7 @@ const PERMISSIONS = Object.freeze({
   BANKS_IMPORT:        'banks:import',
   BANKS_UPDATE:        'banks:update',
   BANKS_MOVEMENT_EDIT: 'banks:movement:edit',
+  BANKS_MOVEMENT_CATEGORIA: 'banks:movement:categoria',
   BANKS_CONFIG:        'banks:config',
   BANKS_RULES:         'banks:rules',
 
@@ -120,6 +121,7 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_IMPORT,
       PERMISSIONS.BANKS_UPDATE,
       PERMISSIONS.BANKS_MOVEMENT_EDIT,
+      PERMISSIONS.BANKS_MOVEMENT_CATEGORIA,
       PERMISSIONS.BANKS_CONFIG,
       PERMISSIONS.BANKS_RULES,
       PERMISSIONS.BANKS_FICHA,

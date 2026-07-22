@@ -105,24 +105,44 @@ function generarFolio(seq) {
  *   banco que hoy expone la tabla de resumen por banco (`banks-table-wrap`) sin ningún guard de
  *   permiso en el frontend; esa es una exposición aparte, pendiente de decidir por separado.
  * @param {string|null} [rolActual] - si viene, excluye movimientos ocultos-por-regla para ese rol.
+ * @param {string|number} [year] - si viene, limita movimientos/porStatus/porCategoria a ese año
+ *   (y mes, si también viene). `saldoActualizado` NO se afecta: es el saldo real vigente, no
+ *   tiene sentido acotarlo a un periodo pasado.
+ * @param {string|number} [month]
  */
-async function getCards(restrictions = null, rolActual = null) {
+async function getCards(restrictions = null, rolActual = null, year = null, month = null) {
   // Agregación MongoDB: estadísticas de movimientos por banco.
   // BankConfig ya no está en MongoDB → el $lookup se eliminó.
   // El join con la configuración se hace en la capa de aplicación.
   const match = { isActive: true, oculto: { $ne: true } };
   if (rolActual)    match.ocultoRoles = { $ne: rolActual };
   if (restrictions) match.status      = { $ne: 'otros' };
+  if (year) {
+    const y = parseInt(year, 10);
+    const m = month ? parseInt(month, 10) : null;
+    match.fecha = (m && m >= 1 && m <= 12)
+      ? { $gte: new Date(y, m - 1, 1), $lt: new Date(y, m, 1) }
+      : { $gte: new Date(y, 0, 1), $lt: new Date(y + 1, 0, 1) };
+  }
 
+  // Igual que en getStatusStats() (el endpoint que este KPI fusionado reemplaza como fuente):
+  // estas 4 categorías cuentan solo depósitos, nunca retiros — el dashboard de conciliación
+  // siempre trató "identificado/otros/por conciliar/no identificado" como buckets de depósitos.
+  // Antes de esta fusión, porStatus solo se usaba como fallback ocasional (si /banks/stats
+  // fallaba) y le faltaba este filtro sin que se notara; ahora es la fuente primaria de cada
+  // carga, así que el descuido pasó de inofensivo a una discrepancia visible contra la columna
+  // "No identificados" de la tabla (que sí filtra por depósito vía movimientoNoIdentificado).
+  const depositoCond = { $gt: [{ $ifNull: ['$deposito', 0] }, 0] };
   const ownUserId = restrictions?.scope === MOVEMENT_SCOPE.OWN ? restrictions.userId : null;
   const identificadoCond = {
     $and: [
       { $eq: ['$status', 'identificado'] },
+      depositoCond,
       ...(ownUserId ? [{ $in: [ownUserId, { $ifNull: ['$identificadoPor.userId', []] }] }] : []),
     ],
   };
 
-  const [agg, configMap] = await Promise.all([
+  const [agg, catAgg, configMap] = await Promise.all([
     BankMovement.aggregate([
       { $match: match },
       { $sort:  { banco: 1, fecha: 1, _id: 1 } },
@@ -147,10 +167,10 @@ async function getCards(restrictions = null, rolActual = null) {
           ultimaFecha:    { $max: '$fecha' },
           ultimaImport:   { $max: '$createdAt' },
           saldoFinal:     { $last: '$saldo' },
-          no_identificado: { $sum: { $cond: [{ $in: ['$status', ['no_identificado', null]] }, 1, 0] } },
+          no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, depositoCond] }, 1, 0] } },
           identificado:    { $sum: { $cond: [identificadoCond, 1, 0] } },
-          otros:           { $sum: { $cond: [{ $eq:  ['$status', 'otros'] }, 1, 0] } },
-          reclasificado:   { $sum: { $cond: [{ $eq:  ['$status', 'reclasificado'] }, 1, 0] } },
+          otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },          depositoCond] }, 1, 0] } },
+          reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },  depositoCond] }, 1, 0] } },
           saldoPendiente: {
             // Σ de no_identificados ponderada por CxC vinculadas:
             // · Con saldoErp: se suma solo la diferencia (deposito - saldoErp), mínimo 0.
@@ -187,13 +207,54 @@ async function getCards(restrictions = null, rolActual = null) {
               ],
             },
           },
+          // Aditivos: `saldoOtros` (arriba) mezcla 'otros'+'reclasificado' y algo más podría
+          // depender de ese valor combinado, así que se deja intacto. Estos dos separan el monto
+          // para poder mostrar "Por conciliar" con su propia cifra en el KPI, en vez de agruparlo.
+          saldoOtrosSolo: {
+            $sum: {
+              $cond: [
+                { $eq: ['$status', 'otros'] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
+          },
+          saldoReclasificado: {
+            $sum: {
+              $cond: [
+                { $eq: ['$status', 'reclasificado'] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
+          },
         },
       },
       { $sort: { _id: 1 } },
-    ]),
+    ], { allowDiskUse: true }),
+    // Desglose por categoría dentro de cada banco (chips de categoría en la vista de tarjetas).
+    // Mismo `match` que la agregación principal; se excluyen movimientos sin categoría asignada.
+    BankMovement.aggregate([
+      { $match: { ...match, categoria: { $nin: [null, ''] } } },
+      {
+        $group: {
+          _id:    { banco: '$banco', categoria: '$categoria' },
+          count:  { $sum: 1 },
+          monto:  { $sum: { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] } },
+        },
+      },
+      { $sort: { count: -1 } },
+    ], { allowDiskUse: true }),
     // Join en aplicación: config proviene de PostgreSQL
     bankConfigRepo.findAllAsMap(),
   ]);
+
+  const porCategoriaMap = new Map();
+  for (const c of catAgg) {
+    const list = porCategoriaMap.get(c._id.banco) ?? [];
+    list.push({ categoria: c._id.categoria, count: c.count, monto: c.monto });
+    porCategoriaMap.set(c._id.banco, list);
+  }
 
   // ── Saldo actualizado por banco ────────────────────────────────────────────
   // Para cada banco que tiene saldo inicial definido, acumulamos el delta de
@@ -246,6 +307,8 @@ async function getCards(restrictions = null, rolActual = null) {
       saldoPendiente:    b.saldoPendiente    ?? 0,
       saldoIdentificado: b.saldoIdentificado ?? 0,
       saldoOtros:        b.saldoOtros        ?? 0,
+      saldoOtrosSolo:      b.saldoOtrosSolo      ?? 0,
+      saldoReclasificado:  b.saldoReclasificado  ?? 0,
       saldoActualizado:  saldoActualizadoMap[b._id] ?? null,
       lastImportBy:      cfg?.lastImportBy  ?? null,
       lastImportAt:      cfg?.lastImportAt  ?? null,
@@ -255,6 +318,7 @@ async function getCards(restrictions = null, rolActual = null) {
         otros:           b.otros,
         reclasificado:   b.reclasificado,
       },
+      porCategoria: porCategoriaMap.get(b._id) ?? [],
     };
   });
 }
@@ -1510,6 +1574,42 @@ async function updateStatus(id, status, user) {
   return updated;
 }
 
+/**
+ * Dada una categoría (o null) y el status actual de un movimiento, resuelve el
+ * nuevo status y ocultoRoles según la BankRule 'categorizar' vigente con ese
+ * nombre — mismo criterio que applyRules() en bank-rules.service.js, para que
+ * la asignación manual (individual o masiva) nunca diverja del motor automático.
+ *
+ * Al asignar categoría manualmente:
+ *   - Si el movimiento ya está 'identificado' (tiene CxC conciliada), conservamos ese status.
+ *     Asignar una categoría es una anotación organizacional, no revierte la conciliación.
+ *   - En cualquier otro status pasamos a 'reclasificado' para indicar intervención manual,
+ *     salvo que la regla vigente de esta categoría traiga su propio estadoDestino — mismo
+ *     criterio que applyRules() en bank-rules.service.js, para no bifurcar la lógica entre
+ *     el motor automático y la recategorización manual.
+ *   - ocultarRoles de la regla vigente se replica igual que hace applyRules().
+ * Al limpiarla → vuelve a 'identificado' si tiene ERP, sino 'no_identificado'; y se libera
+ * cualquier ocultamiento por rol heredado de la categoría anterior.
+ */
+async function resolveCategoriaEffects(banco, categoriaLimpia, currentStatus, erpIdsLength) {
+  let newStatus   = currentStatus;
+  let ocultoRoles = [];
+
+  if (categoriaLimpia) {
+    const catRules = await bankRuleRepo.listByBanco(banco, { accion: 'categorizar' });
+    const catRule  = catRules.find(r => r.nombre === categoriaLimpia) ?? null;
+
+    if (currentStatus !== 'identificado') {
+      newStatus = catRule?.estadoDestino || 'reclasificado';
+    }
+    ocultoRoles = catRule?.ocultarRoles?.length ? catRule.ocultarRoles : [];
+  } else if (currentStatus === 'reclasificado') {
+    newStatus = (erpIdsLength ?? 0) > 0 ? 'identificado' : 'no_identificado';
+  }
+
+  return { newStatus, ocultoRoles };
+}
+
 async function updateCategoria(id, categoria, user) {
   if (categoria !== undefined && categoria !== null && typeof categoria !== 'string') {
     throw new BadRequestError('categoria debe ser string o null');
@@ -1524,24 +1624,14 @@ async function updateCategoria(id, categoria, user) {
     return { _id: mov._id, banco: mov.banco, categoria: anterior, status: mov.status };
   }
 
-  // Al asignar categoría manualmente:
-  //   - Si el movimiento ya está 'identificado' (tiene CxC conciliada), conservamos ese status.
-  //     Asignar una categoría es una anotación organizacional, no revierte la conciliación.
-  //   - En cualquier otro status pasamos a 'reclasificado' para indicar intervención manual.
-  // Al limpiarla → vuelve a 'identificado' si tiene ERP, sino 'no_identificado'.
-  let newStatus = mov.status;
-  if (categoriaLimpia) {
-    if (mov.status !== 'identificado') {
-      newStatus = 'reclasificado';
-    }
-  } else if (mov.status === 'reclasificado') {
-    newStatus = (mov.erpIds?.length ?? 0) > 0 ? 'identificado' : 'no_identificado';
-  }
+  const { newStatus, ocultoRoles } = await resolveCategoriaEffects(
+    mov.banco, categoriaLimpia, mov.status, mov.erpIds?.length,
+  );
 
   await BankMovement.updateOne(
     { _id: id },
     {
-      $set:  { categoria: categoriaLimpia, status: newStatus },
+      $set:  { categoria: categoriaLimpia, status: newStatus, ocultoRoles },
       $push: {
         _changelog: {
           at:         new Date(),
@@ -1740,11 +1830,18 @@ async function listIdentificadores(banco) {
 async function listCategories(banco) {
   // banco: string opcional con uno o varios bancos separados por coma.
   const q = { isActive: true };
+  let bancoVals = null;
   if (banco) {
-    const vals = banco.split(',').map(v => v.trim()).filter(Boolean);
-    q.banco = vals.length === 1 ? vals[0] : { $in: vals };
+    bancoVals = banco.split(',').map(v => v.trim()).filter(Boolean);
+    q.banco = bancoVals.length === 1 ? bancoVals[0] : { $in: bancoVals };
   }
-  const values = await BankMovement.distinct('categoria', q);
+  const [enMovimientos, enReglas] = await Promise.all([
+    BankMovement.distinct('categoria', q),
+    bankRuleRepo.listNombresCategorizar(bancoVals),
+  ]);
+  // Unión con las categorías definidas por reglas (bank-rules.service.js), aunque todavía
+  // ningún movimiento las tenga asignadas — así el filtro muestra el catálogo completo.
+  const values = [...new Set([...enMovimientos, ...enReglas])];
   // Sort: non-null first alphabetically, then null last
   return values.sort((a, b) => {
     if (a === null) return 1;
@@ -1766,8 +1863,11 @@ async function exportMovements(filters) {
     columnas, rolActual,
   } = filters;
 
-  // Columnas opcionales activas (default: las 3 más útiles)
-  const colSet = columnas
+  // Columnas opcionales activas (default: las 3 más útiles).
+  // columnas === '' (string vacío) es DISTINTO de columnas === undefined: el
+  // primero significa "el usuario desmarcó todas las columnas a propósito" (0
+  // columnas adicionales), el segundo "no se mandó el parámetro" (usar default).
+  const colSet = columnas !== undefined
     ? new Set(columnas.split(',').map(v => v.trim()).filter(Boolean))
     : new Set(['saldoErp', 'folioFiscal', 'formaPago']);
 
@@ -1943,10 +2043,11 @@ async function exportMovements(filters) {
     formaPago:   { header: 'Forma de pago', key: 'formaPagoCol',   width: 16 },
     retencion:   { header: 'Retención',     key: 'retencionCol',   width: 12 },
     ficha:       { header: 'N° Ficha',      key: 'fichaCol',       width: 14 },
+    regla:       { header: 'Regla aplicada', key: 'reglaCol',      width: 16 },
   };
 
   const activeCols = [...baseCols];
-  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha']) {
+  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha', 'regla']) {
     if (colSet.has(key)) activeCols.push(addlColDefs[key]);
   }
   sheet.columns = activeCols;
@@ -2015,6 +2116,8 @@ async function exportMovements(filters) {
       rowData.retencionCol   = links.length > 0 ? (links.some(l => l.tieneRetencion) ? 'Sí' : 'No') : null;
     if (colSet.has('ficha'))
       rowData.fichaCol       = m.ficha ?? null;
+    if (colSet.has('regla'))
+      rowData.reglaCol = m.status === 'reclasificado' ? 'Manual' : (m.categoria ? 'Automática' : null);
 
     sheet.addRow(rowData);
   }
@@ -2100,6 +2203,50 @@ async function reclasifyMovements(ids) {
     { $set: { status: 'reclasificado' } }
   );
   return { reclasified: result.modifiedCount };
+}
+
+async function bulkUpdateCategoria(ids, categoria, user) {
+  if (!Array.isArray(ids) || ids.length === 0) throw new BadRequestError('Se requiere al menos un ID');
+  if (categoria !== undefined && categoria !== null && typeof categoria !== 'string') {
+    throw new BadRequestError('categoria debe ser string o null');
+  }
+  const categoriaLimpia = typeof categoria === 'string' ? (categoria.trim() || null) : null;
+
+  const movs = await BankMovement.find({ _id: { $in: ids } });
+  const porBanco = new Map();
+  for (const mov of movs) {
+    if (!porBanco.has(mov.banco)) porBanco.set(mov.banco, []);
+    porBanco.get(mov.banco).push(mov);
+  }
+
+  let actualizados = 0;
+  for (const [banco, movsBanco] of porBanco) {
+    for (const mov of movsBanco) {
+      const anterior = mov.categoria ?? null;
+      if (anterior === categoriaLimpia) continue;
+
+      const { newStatus, ocultoRoles } = await resolveCategoriaEffects(
+        banco, categoriaLimpia, mov.status, mov.erpIds?.length,
+      );
+
+      await BankMovement.updateOne(
+        { _id: mov._id },
+        {
+          $set:  { categoria: categoriaLimpia, status: newStatus, ocultoRoles },
+          $push: {
+            _changelog: {
+              at: new Date(), via: user ? `manual-masivo:${user._id}` : 'manual-masivo',
+              campo: 'categoria', de: anterior, a: categoriaLimpia, importFile: null,
+            },
+          },
+        }
+      );
+      emitToBanco(banco, 'bank:movement:updated', { _id: mov._id, banco, categoria: categoriaLimpia, status: newStatus });
+      actualizados++;
+    }
+  }
+
+  return { actualizados };
 }
 
 async function setFicha(id, ficha, user) {
@@ -2194,7 +2341,7 @@ async function deleteFicha(id, user) {
 // ── Campos que el usuario puede editar manualmente ───────────────────────────
 const CAMPOS_EDITABLES = [
   'concepto', 'fecha', 'deposito', 'retiro', 'saldo',
-  'numeroAutorizacion', 'referenciaNumerica', 'categoria',
+  'numeroAutorizacion', 'referenciaNumerica',
 ];
 
 // Campos incluidos en el hash de deduplicación (banco no cambia en edición)
@@ -2226,15 +2373,6 @@ async function updateMovement(id, data, user) {
     if (campo in data) {
       mov[campo] = data[campo] ?? null;
       if (CAMPOS_QUE_AFECTAN_HASH.has(campo)) recalcularHash = true;
-    }
-  }
-
-  // Reflejar status cuando la categoría cambia manualmente
-  if ('categoria' in data) {
-    if (mov.categoria) {
-      mov.status = 'reclasificado';
-    } else if (mov.status === 'reclasificado') {
-      mov.status = (mov.erpIds?.length ?? 0) > 0 ? 'identificado' : 'no_identificado';
     }
   }
 
@@ -2865,7 +3003,7 @@ module.exports = {
   getCards, listMovements, getSummary, getStatusStats,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
-  exportMovements, deleteMovements, reclasifyMovements, updateMovement, updateCategoria, generateTemplate,
+  exportMovements, deleteMovements, reclasifyMovements, bulkUpdateCategoria, updateMovement, updateCategoria, generateTemplate,
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,

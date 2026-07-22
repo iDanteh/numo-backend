@@ -223,6 +223,10 @@ bankMovementSchema.index({ fecha: -1, banco: 1 });
 bankMovementSchema.index({ numeroAutorizacion: 1, banco: 1 });
 bankMovementSchema.index({ banco: 1, status: 1 });
 bankMovementSchema.index({ banco: 1, categoria: 1 });
+// Soporta la agregación de porCategoria en getCards() (bank.service.js), que agrupa por
+// banco+categoria SIN acotar por banco en el $match — a diferencia del índice de arriba,
+// aquí categoria va primero porque es el campo que el $match sí filtra (excluye null/'').
+bankMovementSchema.index({ categoria: 1, isActive: 1 });
 // Índices para el motor Match ERP
 bankMovementSchema.index({ isActive: 1, status: 1, deposito: 1 });
 bankMovementSchema.index({ 'identificadoPor.userId': 1 });

@@ -7,6 +7,7 @@
  * Reemplaza el acceso directo a BankRule (Mongoose).
  */
 
+const { Op }        = require('sequelize');
 const { BankRule }  = require('../../../../shared/models/postgres');
 const { sequelize } = require('../../../../config/database.postgres');
 
@@ -37,6 +38,18 @@ async function findBlockingRules(banco) {
 
 async function findById(id) {
   return BankRule.findByPk(id);
+}
+
+/**
+ * Nombres únicos de reglas 'categorizar' — el catálogo de categorías definidas,
+ * exista o no todavía un movimiento con esa categoría asignada.
+ * @param {string[]} [bancos] — opcional; si se omite, trae de todos los bancos.
+ */
+async function listNombresCategorizar(bancos) {
+  const where = { accion: 'categorizar' };
+  if (bancos?.length) where.banco = { [Op.in]: bancos };
+  const rules = await BankRule.findAll({ where, attributes: ['nombre'] });
+  return [...new Set(rules.map(r => r.nombre))];
 }
 
 async function create(banco, data) {
@@ -106,4 +119,4 @@ async function reorder(ids) {
   }
 }
 
-module.exports = { listByBanco, findBlockingRules, findById, create, update, remove, reorder };
+module.exports = { listByBanco, findBlockingRules, findById, listNombresCategorizar, create, update, remove, reorder };

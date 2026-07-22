@@ -71,7 +71,8 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   // getMovementScope()/rbac.js; la tabla de abajo sigue restringida a lo propio por defecto.
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
   const rolActual     = hasAdminAccess ? null : req.user.role;
-  res.json(await service.getCards(restrictions, rolActual));
+  const { year, month } = req.query;
+  res.json(await service.getCards(restrictions, rolActual, year, month));
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)
@@ -207,11 +208,24 @@ router.patch('/movements/:id/status',
 
 router.patch('/movements/:id/categoria',
   authenticate,
-  permit('banks:movement:edit'),
+  permit('banks:movement:categoria'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateCategoria(req.params.id, req.body.categoria, req.user));
   })
 )
+
+// PATCH /api/banks/movements/categoria/bulk — recategorización manual masiva
+router.patch('/movements/categoria/bulk',
+  authenticate,
+  permit('banks:movement:categoria'),
+  asyncHandler(async (req, res) => {
+    const { ids, categoria } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'Se requiere un array de IDs en body.ids' });
+    }
+    res.json(await service.bulkUpdateCategoria(ids, categoria ?? null, req.user));
+  }),
+);
 
 // PATCH /api/banks/movements/:id/erp-ids  (remove individual)
 router.patch('/movements/:id/erp-ids',

@@ -28,7 +28,14 @@ function validarRegla(data) {
   if (!data.nombre || !String(data.nombre).trim()) {
     throw new BadRequestError('El nombre de la regla es requerido');
   }
-  if (!Array.isArray(data.condiciones) || data.condiciones.length === 0) {
+  if (!Array.isArray(data.condiciones)) {
+    throw new BadRequestError('condiciones debe ser un arreglo');
+  }
+  // 'categorizar' puede quedar sin condiciones: sirve para definir el catálogo de una
+  // categoría (nombre, estadoDestino, ocultarRoles) sin match automático — matchRegla()
+  // ya la excluye siempre de import/applyRules() cuando no tiene condiciones, así que
+  // nunca se auto-aplica; solo queda disponible para asignación manual (updateCategoria).
+  if (data.condiciones.length === 0 && data.accion !== 'categorizar') {
     throw new BadRequestError('Se requiere al menos una condición');
   }
   for (const c of data.condiciones) {

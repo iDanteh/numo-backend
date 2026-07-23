@@ -1645,7 +1645,7 @@ async function updateCategoria(id, categoria, user) {
     }
   );
 
-  const result = { _id: mov._id, banco: mov.banco, categoria: categoriaLimpia, status: newStatus };
+  const result = { _id: mov._id, banco: mov.banco, categoria: categoriaLimpia, status: newStatus, ocultoRoles };
   emitToBanco(mov.banco, 'bank:movement:updated', result);
   return result;
 }
@@ -2241,7 +2241,7 @@ async function bulkUpdateCategoria(ids, categoria, user) {
           },
         }
       );
-      emitToBanco(banco, 'bank:movement:updated', { _id: mov._id, banco, categoria: categoriaLimpia, status: newStatus });
+      emitToBanco(banco, 'bank:movement:updated', { _id: mov._id, banco, categoria: categoriaLimpia, status: newStatus, ocultoRoles });
       actualizados++;
     }
   }

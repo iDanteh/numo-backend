@@ -126,6 +126,15 @@ const bankMovementSchema = new mongoose.Schema({
       conciliacionFinalizadaAt: { type: Date, default: null },
       // jobId de la corrida que finalizó este link — permite revertir selectivamente.
       conciliacionRunId: { type: String, default: null },
+      // Checkpoint del job "Recalcular saldo ERP" (backfill+recompute unificado, ver
+      // erp.routes.js#_recomputeErpKoreJob): se marca cuando este link YA finalizado
+      // recibió el backfill de movimientosKore Y (si es humano) la revisión de
+      // saldoErpAportado con el criterio de todas las formas de pago — sin importar si
+      // hubo cambios. Evita volver a pegarle a Kore por este link en corridas futuras
+      // del mismo job. Se limpia al revertir la corrida que lo puso (mismo criterio que
+      // conciliacionRunId), para que un link reabierto por el revert vuelva a ser
+      // candidato cuando el sync normal lo re-finalice.
+      recomputedFormasPagoAt: { type: Date, default: null },
       // Bitácora de auditoría: una entrada por cada forma de pago usada en cada cobro
       // aplicado a esta CxC. Se ACUMULA a través de varios cobros parciales (PPD) sobre
       // la misma CxC — nunca se sobreescribe, solo crece. saldoPagado/saldoPagadoTotal

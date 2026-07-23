@@ -3,6 +3,12 @@
 /**
  * banks/scripts/recompute-saldo-erp-todas-formas-pago.js
  * ─────────────────────────────────────────────────────────────────────────────
+ * NOTA: esta lógica (y la de migrate-erp-movimientoskore-formaspago.js) ya vive
+ * también en el botón "Recalcular saldo ERP" del panel Admin (una sola consulta
+ * a Kore por link, con checkpoint propio vía recomputedFormasPagoAt — ver
+ * erp.routes.js#_recomputeErpKoreJob). Este script se conserva para uso desde
+ * CLI fuera de la app; para operación normal, usar el botón.
+ *
  * Recalcula saldoErpAportado/saldoErp/status de erpLinks YA finalizados
  * (conciliacionFinalizadaAt !== null) e identificados por un HUMANO, aplicando
  * el criterio nuevo de _montoSaldoLink (erp.routes.js): suma TODAS las formas

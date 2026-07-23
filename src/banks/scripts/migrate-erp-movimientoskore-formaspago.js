@@ -3,6 +3,12 @@
 /**
  * banks/scripts/migrate-erp-movimientoskore-formaspago.js
  * ─────────────────────────────────────────────────────────────────────────────
+ * NOTA: esta lógica (y la de recompute-saldo-erp-todas-formas-pago.js) ya vive
+ * también en el botón "Recalcular saldo ERP" del panel Admin (una sola consulta
+ * a Kore por link, con checkpoint propio vía recomputedFormasPagoAt — ver
+ * erp.routes.js#_recomputeErpKoreJob). Este script se conserva para uso desde
+ * CLI fuera de la app; para operación normal, usar el botón.
+ *
  * Backfill idempotente: refresca erpLinks[].movimientosKore (que ahora incluye
  * formasPago[], ver erp.routes.js#_movimientosKoreDesde) en links que YA
  * quedaron finalizados (conciliacionFinalizadaAt !== null) ANTES de que se

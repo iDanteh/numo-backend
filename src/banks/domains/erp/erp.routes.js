@@ -1109,22 +1109,339 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
 
     if (stopped) {
       const result = { procesados, total, actualizados, pendientes, errores };
-      SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles });
+      SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles, kind: 'sync' });
       emitToUser(auth0Sub, 'bank:erp:sync:stopped', { jobId, ...result });
     } else {
       const result = { total, actualizados, pendientes, errores };
-      SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles });
+      SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles, kind: 'sync' });
       emitToUser(auth0Sub, 'bank:erp:sync:done', { jobId, ...result });
     }
   } catch (err) {
     const error = err.message || 'Error en sincronización ERP-Kore';
-    SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error });
+    SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error, kind: 'sync' });
     emitToUser(auth0Sub, 'bank:erp:sync:error', { jobId, error });
   } finally {
     syncRunning      = false;
     syncCurrentJobId = null;
     setTimeout(() => SYNC_JOBS.delete(jobId), SYNC_JOB_TTL);
   }
+}
+
+// ── Job "Recalcular saldo ERP" (backfill unificado) ───────────────────────────────────────
+// Fusiona en un solo paso por link lo que antes eran dos scripts separados
+// (migrate-erp-movimientoskore-formaspago.js + recompute-saldo-erp-todas-formas-pago.js):
+// por cada erpLink YA finalizado (conciliacionFinalizadaAt !== null) sin recomputar todavía
+// (recomputedFormasPagoAt === null), UNA sola consulta a Kore por link — refresca siempre el
+// snapshot movimientosKore, y si el vínculo es humano recalcula saldoErpAportado con el
+// criterio de "todas las formas de pago" (2026-07-17). Los vínculos de motor solo reciben el
+// backfill del snapshot, su cálculo por autorización no cambió.
+//
+// Reutiliza el MISMO SYNC_JOBS/syncControl/syncRunning que el job normal — mutuamente
+// excluyentes entre sí (comparten el rate limit de Kore, nunca corren dos a la vez) — y el
+// MISMO endpoint de revert (via:'erp-sync', runId=jobId), sin tooling nuevo.
+//
+// A diferencia de los scripts originales, SÍ tiene checkpoint (recomputedFormasPagoAt): una
+// corrida repetida solo procesa lo que quedó pendiente de una corrida anterior (links
+// finalizados nuevos desde entonces, o que no se pudieron consultar la vez pasada), nunca
+// vuelve a pegarle a Kore por un link que ya se revisó.
+async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryRun = false) {
+  syncCurrentJobId = jobId;
+  try {
+    const filter = {
+      erpLinks: {
+        $elemMatch: {
+          serie:                    { $ne: null },
+          folioExterno:             { $ne: null },
+          conciliacionFinalizadaAt: { $ne: null },
+          recomputedFormasPagoAt:   null,
+        },
+      },
+    };
+    if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
+
+    const movements = await BankMovement.find(filter)
+      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor')
+      .lean();
+
+    let procesados = 0, actualizados = 0, sinDatos = 0, errores = 0;
+    const total    = movements.length;
+    let stopped    = false;
+    const detalles = []; // una entrada por movimiento con cambios — insumo del reporte Excel
+
+    emitToUser(auth0Sub, 'bank:erp:sync:progress',
+      { jobId, procesados, total, actualizados, pendientes: sinDatos, errores, pct: 0 });
+
+    for (const mov of movements) {
+      if (!await _checkSyncControl()) { stopped = true; break; }
+
+      const links = mov.erpLinks ?? [];
+      let huboErrorMov     = false;
+      let huboLinkTocado   = false; // avanzó el checkpoint (con o sin cambio de aporte)
+      let huboCambioAporte = false;
+      let huboSinDatos     = false;
+      const linksDetalle      = [];
+      const linksActualizados = links.map(l => ({ ...l }));
+
+      for (let i = 0; i < links.length; i++) {
+        const link = links[i];
+        if (!link.serie || !link.folioExterno || !link.conciliacionFinalizadaAt || link.recomputedFormasPagoAt) continue;
+
+        const rango = _rangoDesdeFollo(link.folioExterno);
+        if (!rango) continue;
+
+        try {
+          let { raw } = await _sincronizarConRetry({
+            serieExterna: link.serie,
+            folioExterno: String(link.folioExterno),
+            fechaDesde:   rango.fechaDesde,
+            fechaHasta:   rango.fechaHasta,
+          });
+
+          if (raw.length === 0) {
+            const spillover = _rangoSpilloverSiguienteMes(link.folioExterno);
+            if (spillover) {
+              await _sleep(SYNC_DELAY_MS);
+              const retryRes = await _sincronizarConRetry({
+                serieExterna: link.serie,
+                folioExterno: String(link.folioExterno),
+                fechaDesde:   spillover.fechaDesde,
+                fechaHasta:   spillover.fechaHasta,
+              });
+              if (retryRes.raw.length > 0) raw = retryRes.raw;
+            }
+          }
+
+          const raw0 = raw[0];
+          if (!raw0) {
+            huboSinDatos = true;
+            linksDetalle.push({
+              erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+              estado: 'sin_datos',
+            });
+            await _sleep(SYNC_DELAY_MS);
+            continue;
+          }
+
+          // Vínculo humano: recalcula el aporte con el criterio nuevo (todas las formas de
+          // pago) — vínculo de motor: se deja intacto, solo recibe el backfill del snapshot.
+          const esHumano  = _erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId);
+          let aporteNuevo = link.saldoErpAportado ?? null;
+          let cambioAporte = false;
+          if (esHumano) {
+            const calculado = _montoSaldoLink(raw0);
+            if (Math.abs(calculado - (link.saldoErpAportado ?? 0)) > 0.01) {
+              aporteNuevo  = calculado;
+              cambioAporte = true;
+            }
+          }
+
+          linksActualizados[i] = {
+            ...link,
+            movimientosKore:        _movimientosKoreDesde(raw0),
+            saldoErpAportado:       aporteNuevo,
+            conciliacionRunId:      cambioAporte ? jobId : link.conciliacionRunId,
+            recomputedFormasPagoAt: new Date(),
+          };
+          huboLinkTocado = true;
+          if (cambioAporte) huboCambioAporte = true;
+
+          linksDetalle.push({
+            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+            estado: cambioAporte ? 'actualizado' : 'sin_cambio',
+            aporteAntes: link.saldoErpAportado ?? null, aporteDespues: aporteNuevo,
+          });
+        } catch (err) {
+          errores++;
+          huboErrorMov = true;
+          linksDetalle.push({
+            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+            estado: 'error', error: err.message || 'Error al consultar Kore',
+          });
+        }
+
+        await _sleep(SYNC_DELAY_MS);
+      }
+
+      const update = {};
+      if (huboLinkTocado) update.$set = { erpLinks: linksActualizados };
+
+      if (huboCambioAporte) {
+        const hayAlgunAporteDeterminado = linksActualizados.some(l => l.saldoErpAportado != null);
+        if (hayAlgunAporteDeterminado) {
+          const saldoErpNuevo = linksActualizados.reduce((s, l) => s + (l.saldoErpAportado ?? 0), 0);
+          const bankAmount    = Math.abs(mov.deposito ?? mov.retiro ?? 0);
+          let statusNuevo     = saldoErpNuevo >= bankAmount - ERP_TOLERANCE ? 'identificado' : 'no_identificado';
+          if (mov.ficha && statusNuevo === 'no_identificado') statusNuevo = 'identificado';
+
+          if (saldoErpNuevo !== (mov.saldoErp ?? null) || statusNuevo !== mov.status) {
+            update.$set = { ...(update.$set ?? {}), saldoErp: saldoErpNuevo, status: statusNuevo };
+            update.$push = {
+              _changelog: {
+                at: new Date(), via: 'erp-sync', campo: 'saldoErp+status',
+                de: { saldoErp: mov.saldoErp ?? null, status: mov.status },
+                a:  { saldoErp: saldoErpNuevo, status: statusNuevo },
+                runId: jobId, revertedAt: null,
+              },
+            };
+          }
+        }
+      }
+
+      let estado;
+      if (huboErrorMov)          estado = 'error';
+      else if (update.$push)     estado = 'actualizado';
+      else if (huboSinDatos)     estado = 'sin_datos';
+      else if (huboLinkTocado)   estado = 'backfill'; // checkpoint avanzó, sin cambio de saldo
+      else                       estado = null;       // nada elegible pudo procesarse (ej. folio inválido)
+      if (estado === 'actualizado') actualizados++;
+      if (estado === 'sin_datos')   sinDatos++;
+
+      // dryRun: todo el cálculo/reporte de arriba corre igual — nada se escribe en Mongo,
+      // así que el checkpoint recomputedFormasPagoAt tampoco avanza (una corrida real
+      // posterior vuelve a ver estos mismos links como pendientes, sin nada perdido).
+      if (!dryRun && (update.$set || update.$push)) {
+        await BankMovement.findByIdAndUpdate(mov._id, update);
+      }
+
+      if (estado) {
+        detalles.push({
+          movementId: mov._id, folio: mov.folio, banco: mov.banco, concepto: mov.concepto,
+          fecha: mov.fecha, deposito: mov.deposito,
+          saldoErpAntes:   mov.saldoErp ?? null,
+          saldoErpDespues: update.$set?.saldoErp ?? mov.saldoErp ?? null,
+          estado, links: linksDetalle,
+        });
+      }
+
+      procesados++;
+      emitToUser(auth0Sub, 'bank:erp:sync:progress', {
+        jobId, procesados, total, actualizados, pendientes: sinDatos, errores,
+        pct: Math.round((procesados / total) * 100),
+      });
+    }
+
+    if (stopped) {
+      const result = { procesados, total, actualizados, pendientes: sinDatos, errores, dryRun };
+      SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles, kind: 'recompute', dryRun });
+      emitToUser(auth0Sub, 'bank:erp:sync:stopped', { jobId, ...result });
+    } else {
+      const result = { total, actualizados, pendientes: sinDatos, errores, dryRun };
+      SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles, kind: 'recompute', dryRun });
+      emitToUser(auth0Sub, 'bank:erp:sync:done', { jobId, ...result });
+    }
+  } catch (err) {
+    const error = err.message || 'Error al recalcular saldo ERP';
+    SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error, kind: 'recompute' });
+    emitToUser(auth0Sub, 'bank:erp:sync:error', { jobId, error });
+  } finally {
+    syncRunning      = false;
+    syncCurrentJobId = null;
+    setTimeout(() => SYNC_JOBS.delete(jobId), SYNC_JOB_TTL);
+  }
+}
+
+// ── Reporte Excel del job "Recalcular saldo ERP" ──────────────────────────────────────────
+// 4 hojas: Saldo actualizado (cambió saldoErp/status) · Backfill sin cambio (checkpoint
+// avanzó, snapshot refrescado, aporte igual o vínculo de motor) · Sin datos en Kore (se
+// reintenta en la próxima corrida) · Errores.
+function _generarExcelRecomputeErpKore(detalles) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Recalcular saldo ERP';
+  wb.created = new Date();
+
+  const formatFecha = _xlsxFormatFecha;
+  const styleHeader = _xlsxStyleHeader;
+  const foliosCxc   = d => d.links.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', ');
+
+  const baseCols = [
+    { header: 'Movimiento (folio)', key: 'folio',    width: 14 },
+    { header: 'Banco',              key: 'banco',    width: 14 },
+    { header: 'Fecha',              key: 'fecha',    width: 12 },
+    { header: 'Depósito',           key: 'deposito', width: 14 },
+  ];
+
+  // ── Hoja 1: Saldo actualizado ─────────────────────────────────────────────
+  const wsAct = wb.addWorksheet('Saldo actualizado');
+  wsAct.columns = [
+    ...baseCols,
+    { header: 'Saldo ERP antes',   key: 'antes',   width: 16 },
+    { header: 'Saldo ERP después', key: 'despues', width: 16 },
+    { header: 'Diferencia',        key: 'diff',    width: 14 },
+    { header: 'CxC afectadas',     key: 'cxc',     width: 30 },
+    { header: 'Movimiento ID',     key: 'id',      width: 28 },
+  ];
+  styleHeader(wsAct);
+  for (const d of detalles.filter(d => d.estado === 'actualizado')) {
+    const antes = d.saldoErpAntes ?? 0, despues = d.saldoErpDespues ?? 0;
+    const row = wsAct.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha), deposito: d.deposito,
+      antes: d.saldoErpAntes, despues: d.saldoErpDespues, diff: despues - antes,
+      cxc: foliosCxc(d), id: String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = XLSX_OK_FILL; });
+  }
+  ['deposito', 'antes', 'despues', 'diff'].forEach(k => { wsAct.getColumn(k).numFmt = '#,##0.00'; });
+  if (wsAct.lastColumn) wsAct.autoFilter = { from: 'A1', to: wsAct.lastColumn.letter + '1' };
+
+  // ── Hoja 2: Backfill sin cambio de saldo ──────────────────────────────────
+  const wsBk = wb.addWorksheet('Backfill sin cambio');
+  wsBk.columns = [
+    ...baseCols,
+    { header: 'Saldo ERP',      key: 'saldo', width: 16 },
+    { header: 'CxC refrescadas', key: 'cxc',  width: 30 },
+    { header: 'Movimiento ID',  key: 'id',    width: 28 },
+  ];
+  styleHeader(wsBk);
+  for (const d of detalles.filter(d => d.estado === 'backfill')) {
+    const row = wsBk.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha), deposito: d.deposito,
+      saldo: d.saldoErpAntes, cxc: foliosCxc(d), id: String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = XLSX_WARN_FILL; });
+  }
+  wsBk.getColumn('saldo').numFmt = '#,##0.00';
+
+  // ── Hoja 3: Sin datos en Kore (se reintenta en la próxima corrida) ────────
+  const wsSd = wb.addWorksheet('Sin datos en Kore');
+  wsSd.columns = [
+    ...baseCols,
+    { header: 'CxC sin respuesta', key: 'cxc', width: 30 },
+    { header: 'Movimiento ID',     key: 'id',  width: 28 },
+  ];
+  styleHeader(wsSd);
+  for (const d of detalles.filter(d => d.estado === 'sin_datos')) {
+    const sinDatosLinks = d.links.filter(l => l.estado === 'sin_datos');
+    const row = wsSd.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha), deposito: d.deposito,
+      cxc: sinDatosLinks.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', '),
+      id: String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = XLSX_WARN_FILL; });
+  }
+
+  // ── Hoja 4: Errores ────────────────────────────────────────────────────────
+  const wsErr = wb.addWorksheet('Errores');
+  wsErr.columns = [
+    { header: 'Movimiento (folio)', key: 'folio',   width: 14 },
+    { header: 'Banco',              key: 'banco',   width: 14 },
+    { header: 'Fecha',              key: 'fecha',   width: 12 },
+    { header: 'CxC con error',      key: 'cxc',     width: 30 },
+    { header: 'Detalle del error',  key: 'detalle', width: 50 },
+    { header: 'Movimiento ID',      key: 'id',      width: 28 },
+  ];
+  styleHeader(wsErr);
+  for (const d of detalles.filter(d => d.estado === 'error')) {
+    const conError = d.links.filter(l => l.error);
+    const row = wsErr.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha),
+      cxc:     conError.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', '),
+      detalle: conError.map(l => l.error).join(' | '),
+      id:      String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = XLSX_ERR_FILL; });
+  }
+
+  return wb.xlsx.writeBuffer();
 }
 
 router.post('/sync-erp-kore', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
@@ -1158,10 +1475,47 @@ router.post('/sync-erp-kore', authenticate, permit('banks:admin'), asyncHandler(
   const jobId    = `erp-sync-${Date.now()}`;
   const auth0Sub = req.user._id;
 
-  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'sync' });
   res.status(202).json({ jobId });
 
   _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
+}));
+
+// POST recalcular saldo ERP (backfill unificado) — mismo guard/control que el sync normal,
+// mutuamente excluyentes (comparten syncRunning/syncControl, ver _recomputeErpKoreJob).
+router.post('/sync-erp-kore/recompute', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  if (syncRunning) {
+    return res.status(409).json({ error: 'Ya hay una sincronización ERP-Kore en curso.' });
+  }
+
+  let fechaInicio = null;
+  let fechaFin    = null;
+  if (req.body.fechaDesde) {
+    fechaInicio = new Date(req.body.fechaDesde);
+    if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
+  }
+  if (req.body.fechaHasta) {
+    fechaFin = new Date(req.body.fechaHasta);
+    if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
+  }
+  if (fechaInicio && fechaFin && fechaInicio > fechaFin) {
+    return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
+  }
+
+  const dryRun = req.body.dryRun === true;
+
+  syncControl.paused       = false;
+  syncControl.stopped      = false;
+  syncControl.pauseResolve = null;
+
+  syncRunning = true;
+  const jobId    = `erp-recompute-${Date.now()}`;
+  const auth0Sub = req.user._id;
+
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'recompute', dryRun });
+  res.status(202).json({ jobId });
+
+  _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryRun); // sin await — corre en background
 }));
 
 router.post('/sync-erp-kore/pause', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
@@ -1219,47 +1573,59 @@ router.get('/sync-erp-kore/:jobId/status', authenticate, permit('banks:admin'), 
 // GET historial de corridas recientes (mientras sigan vivas en memoria, ver SYNC_JOB_TTL).
 // Permite recuperar el reporte/revertir una corrida anterior, no solo la última.
 router.get('/sync-erp-kore/jobs', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  // jobId trae el timestamp al final (erp-sync-<ts> / erp-recompute-<ts>) — se extrae para
+  // ordenar por recencia real, ya que comparar el string completo ya no sirve desde que hay
+  // dos prefijos distintos conviviendo en el mismo historial.
   const jobs = [...SYNC_JOBS.entries()]
     .map(([jobId, job]) => ({
       jobId,
+      kind:      job.kind ?? 'sync',
+      dryRun:    job.dryRun ?? job.result?.dryRun ?? false,
       status:    job.status,
       result:    job.result ?? null,
       error:     job.error  ?? null,
       hasReport: Array.isArray(job.detalles) && job.detalles.length > 0,
     }))
-    .sort((a, b) => (a.jobId < b.jobId ? 1 : -1)); // más reciente primero (jobId = erp-sync-<timestamp>)
+    .sort((a, b) => Number(b.jobId.match(/(\d+)$/)?.[1] ?? 0) - Number(a.jobId.match(/(\d+)$/)?.[1] ?? 0));
   res.json(jobs);
 }));
 
 // ── Reporte Excel del job Sync ERP-Kore ───────────────────────────────────────
 // 3 hojas: Actualizados (antes/después + diferencia vs. depósito real) · Pendientes
 // (CxC aún no saldada en Kore) · Errores.
+// ── Estilos compartidos entre los reportes Excel de ERP-Kore (sync y recompute) ─────────────
+const XLSX_HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
+const XLSX_HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+const XLSX_OK_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
+const XLSX_WARN_FILL   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF9C3' } };
+const XLSX_ERR_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEE2E2' } };
+
+function _xlsxFormatFecha(d) {
+  if (!d) return '';
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt.getTime())) return '';
+  return dt.toLocaleDateString('es-MX', { day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+
+function _xlsxStyleHeader(ws) {
+  ws.getRow(1).eachCell(cell => {
+    cell.fill = XLSX_HEADER_FILL;
+    cell.font = XLSX_HEADER_FONT;
+    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+  });
+  ws.getRow(1).height = 20;
+}
+
 function _generarExcelSyncErpKore(detalles) {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Numo — Sync ERP-Kore';
   wb.created = new Date();
 
-  const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
-  const HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
-  const OK_FILL     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
-  const WARN_FILL   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF9C3' } };
-  const ERR_FILL    = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEE2E2' } };
-
-  function formatFecha(d) {
-    if (!d) return '';
-    const dt = d instanceof Date ? d : new Date(d);
-    if (isNaN(dt.getTime())) return '';
-    return dt.toLocaleDateString('es-MX', { day: '2-digit', month: '2-digit', year: 'numeric' });
-  }
-
-  function styleHeader(ws) {
-    ws.getRow(1).eachCell(cell => {
-      cell.fill = HEADER_FILL;
-      cell.font = HEADER_FONT;
-      cell.alignment = { vertical: 'middle', horizontal: 'center' };
-    });
-    ws.getRow(1).height = 20;
-  }
+  const formatFecha  = _xlsxFormatFecha;
+  const styleHeader  = _xlsxStyleHeader;
+  const OK_FILL      = XLSX_OK_FILL;
+  const WARN_FILL    = XLSX_WARN_FILL;
+  const ERR_FILL     = XLSX_ERR_FILL;
 
   const foliosCxc = d => d.links.map(l => `${l.serie ?? ''}${l.folioExterno ?? ''}`).join(', ');
 
@@ -1350,10 +1716,14 @@ router.get('/sync-erp-kore/:jobId/report', authenticate, permit('banks:admin'), 
     return res.status(404).json({ error: 'El reporte ya no está disponible (expiró o el jobId no existe).' });
   }
 
-  const buffer = await _generarExcelSyncErpKore(job.detalles);
+  const esRecompute = job.kind === 'recompute';
+  const buffer = esRecompute
+    ? await _generarExcelRecomputeErpKore(job.detalles)
+    : await _generarExcelSyncErpKore(job.detalles);
   const fecha  = new Date().toISOString().slice(0, 10);
+  const nombre = esRecompute ? 'recalcular-saldo-erp' : 'sync-erp-kore';
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  res.setHeader('Content-Disposition', `attachment; filename="sync-erp-kore-${fecha}.xlsx"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${nombre}-${fecha}.xlsx"`);
   res.send(buffer);
 }));
 
@@ -1462,6 +1832,7 @@ router.post('/sync-erp-kore/:jobId/revert', authenticate, permit('banks:admin'),
                   {
                     $mergeObjects: ['$$l', {
                       saldoErpAportado: null, conciliacionFinalizadaAt: null, conciliacionRunId: null,
+                      recomputedFormasPagoAt: null,
                     }],
                   },
                   '$$l',
@@ -1508,7 +1879,7 @@ async function runErpSyncAutomatico() {
   syncControl.pauseResolve = null;
   syncRunning = true;
   const jobId = `erp-sync-${Date.now()}`;
-  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub });
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'sync' });
   await _syncErpKoreJob(auth0Sub, jobId, null, null);
 
   console.log('[CronErpSync] Sync ERP-Kore automático completado.');

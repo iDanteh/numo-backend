@@ -184,10 +184,14 @@ async function updateRule(id, data) {
     const newEstado = data.estadoDestino !== undefined ? (data.estadoDestino || null) : oldEstado;
     const newOcultarRoles = data.ocultarRoles !== undefined ? (data.ocultarRoles || []) : oldOcultarRoles;
 
-    // Si cambió el nombre, reasignar categoria en movimientos que tenían el nombre anterior
+    // Si cambió el nombre, reasignar categoria en movimientos que tenían el nombre anterior.
+    // Sin filtro de status: 'reclasificado' es justamente el status por defecto que esta
+    // misma regla les asigna cuando no tiene estadoDestino, así que excluirlo dejaba
+    // huérfanos (nombre viejo, sin ocultarRoles/estadoDestino) a la mayoría de los
+    // movimientos ya categorizados por la regla.
     if (oldNombre !== newNombre) {
       const r = await BankMovement.updateMany(
-        { banco, categoria: oldNombre, status: { $nin: ['reclasificado'] } },
+        { banco, categoria: oldNombre },
         { $set: { categoria: newNombre } },
       );
       movSincronizados = r.modifiedCount ?? 0;

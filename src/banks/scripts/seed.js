@@ -32,6 +32,7 @@ const PERM_META = {
   'banks:import':       { label: 'Importar movimientos',            module: 'Bancos' },
   'banks:update':        { label: 'Actualizar movimientos (status, ERP, auxiliar)', module: 'Bancos' },
   'banks:movement:edit': { label: 'Editar datos del movimiento',    module: 'Bancos' },
+  'banks:movement:categoria': { label: 'Recategorizar movimientos', module: 'Bancos' },
   'banks:config':        { label: 'Configurar bancos',              module: 'Bancos' },
   'banks:rules':        { label: 'Reglas de clasificación',         module: 'Bancos' },
   'banks:ficha':        { label: 'Registrar/eliminar fichas',       module: 'Bancos' },

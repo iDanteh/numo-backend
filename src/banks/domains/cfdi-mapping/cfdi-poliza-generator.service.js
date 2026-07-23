@@ -56,7 +56,18 @@ const SUCURSAL_DEFAULT = 'Cedis';
 // TIPO_MARCADORES de report.controller.js, más 'CANCELACION' (NCs de
 // refacturación por cancelación, encontradas 2026-07-17: no traen
 // cfdiRelacionados.tipoRelacion poblado, solo este indicador del ERP).
-const SERIES_FUSION_NC = ['BCT', 'BON', 'DEV', 'CAC', 'CANCELACION'];
+// 'DVE' = "Devolución Especial", variante real del ERP (10 casos, no un typo
+// de 'DEV') que tampoco trae cfdiRelacionados.tipoRelacion a nivel SAT —
+// sin este marcador la NC nunca se fusiona con ningún día/sucursal
+// (encontrado 2026-07-23, UUID B576F5AE-EE3E-449A-B654-9C1A6F44141A).
+// 'BEP'/'BXC'/'BN' = variantes de Bonificación (Especial / Por Cambio /
+// Cliente Mostrador); 'ANN'/'CES' = variantes de Cancelación (de Anticipos /
+// Especial) -- mismo problema de fusión, tipoOrigen ya viene correcto del
+// ERP ("Bonificación"/"Cancelación") pero sin este marcador tampoco se
+// fusionan (BEP: 5 casos, BN: 42 casos, CES: 1 caso confirmados en base;
+// BXC/ANN sin casos aún pero se agregan igual, aportadas por el usuario
+// 2026-07-23).
+const SERIES_FUSION_NC = ['BCT', 'BON', 'DEV', 'DVE', 'CAC', 'CANCELACION', 'BEP', 'BXC', 'BN', 'ANN', 'CES'];
 
 // Folios (del ERP) referenciados por NCs Serie=CANCELACION dentro del rango
 // de fecha efectiva — usado para detectar la factura de REFACTURACIÓN que

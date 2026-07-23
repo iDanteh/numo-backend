@@ -389,6 +389,35 @@ function _calcCfdiMontos(cfdi) {
   return { subTotal16, subTotal0, desc16, desc0 };
 }
 
+// Series de documentosRelacionados (ERP) que marcan una NC como ajuste de una
+// venta (Bonificación/Devolución/Cancelación en sus variantes) -- mismo
+// catálogo que SERIES_FUSION_NC en cfdi-poliza-generator.service.js. 'BON'
+// usa startsWith (variantes numeradas tipo "BON01"), el resto es match exacto.
+const SERIES_MARCADOR_AJUSTE = new Set(['BCT', 'DEV', 'DVE', 'CANCELACION', 'CAC', 'BEP', 'BXC', 'BN', 'ANN', 'CES']);
+
+// Para movimientos de ajuste (Bonificación/Devolución/Cancelación en
+// cualquiera de sus variantes), el concepto de la póliza debe mostrar la
+// serie-folio del PROPIO marcador del ajuste (ej. "DEV-054861"), no la
+// serie-folio de la factura original que se está ajustando -- confirmado con
+// el usuario 2026-07-23 (antes se usaba la serie-folio de la factura
+// original con un sufijo de texto; ahora se usa directo la del marcador).
+// Devuelve null si el CFDI no es un ajuste (venta normal), para que el
+// llamador use la serie-folio propia del CFDI como siempre.
+function _serieMarcadorAjuste(documentosRelacionados) {
+  for (const d of (documentosRelacionados || [])) {
+    if (!d.Serie) continue;
+    if (SERIES_MARCADOR_AJUSTE.has(d.Serie) || d.Serie.startsWith('BON')) {
+      // BCT en particular suele venir con Folio vacío ("") en el ERP -- sin
+      // este fallback, `!d.Folio` (string vacío es falsy) saltaba la entrada
+      // completa y el concepto caía en la serie-folio de la factura original
+      // en vez de mostrar el marcador (encontrado 2026-07-23, folios B0-260700408
+      // y B0-260700785, ambos Serie='BCT' con Folio='').
+      return d.Folio ? `${d.Serie}-${d.Folio}`.slice(0, 25) : d.Serie;
+    }
+  }
+  return null;
+}
+
 /**
  * Convierte un CFDI en movimientos contables usando la regla encontrada.
  * Si no hay regla, devuelve movimientos con cuentaId null (requieren revisión manual).
@@ -501,8 +530,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const centroCosto = rule?.centroCosto ?? '';
   // Fecha del CFDI como fecha de venta en formato YYYY-MM-DD
   const ventaFecha  = cfdi.fecha ? new Date(cfdi.fecha).toISOString().slice(0, 10) : null;
-  // Serie del CFDI como referencia (serie+folio si existen)
-  const serieCfdi   = [cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null;
+  // Serie del CFDI como referencia (serie+folio si existen) -- si es un
+  // movimiento de ajuste (Bonificación/Devolución/Cancelación), se usa la
+  // serie-folio del propio marcador del ajuste en vez de la factura original.
+  const serieCfdi   = _serieMarcadorAjuste(cfdi.documentosRelacionados)
+    ?? ([cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null);
 
   if (!rule) {
     return [

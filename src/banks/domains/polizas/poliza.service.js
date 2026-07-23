@@ -486,7 +486,14 @@ const esRecepcionAnticipo = (reglaNombre) => /recepci[oó]n/i.test(reglaNombre |
 // reglas de Ingreso donde "descuento" aparece en el nombre; su cargo usa la
 // MISMA cuenta de Caja/Bancos que una venta normal, así que hoy se mezclan
 // indistinguibles dentro de "Depósitos consolidados".
-const esVentaConDescuento = (reglaNombre) => /descuento/i.test(reglaNombre || '');
+// Excluye las reglas "CC-CAN-D-*" (ej. "NC Cancelación Descuento 16%
+// Efectivo") -- son Notas de Crédito de Cancelación cuyo nombre también
+// menciona "descuento" (describe la tasa/mecánica fiscal, no el tipo de
+// ajuste), y sin esta exclusión ganaban la prioridad sobre Devolución/
+// Cancelación, cayendo siempre en la categoría "descuento" genérica y
+// perdiendo el sufijo CANCELACION-REFACTURACION/CANCELACION-DEV/CAC
+// (encontrado 2026-07-23 al validar el export real de una CC-CAN-D-16-EF).
+const esVentaConDescuento = (reglaNombre) => /descuento/i.test(reglaNombre || '') && !/cancelaci[oó]n/i.test(reglaNombre || '');
 
 // Club Tuberos identificado por texto literal en la descripción/concepto del
 // CFDI (confirmado por el usuario) — independiente de la detección por
@@ -611,8 +618,15 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     const esAnticipoSinUsar = esAnticipo && esRecepcionAnticipo(m.reglaNombre);
 
     const armarIndividual = (etiqueta, subcodigo, categoria, serieOverride) => {
-      const nombre   = nombresClientes?.get((m.cfdiUuid || '').toUpperCase()) || '';
-      const concepto = [nombre, m.serie].filter(Boolean).join(' / ') || etiqueta;
+      const nombre = nombresClientes?.get((m.cfdiUuid || '').toUpperCase()) || '';
+      // Devolución (no Cancelación): el concepto debe terminar en "DEV" —
+      // mismo criterio que `enriquecerConceptoConCliente`, confirmado con el
+      // usuario 2026-07-22.
+      const esCancelacionAqui = categoria === 'devolucion' && /cancelaci[oó]n/i.test(m.tipoOrigen || '');
+      const serieSufijo = (categoria === 'devolucion' && !esCancelacionAqui && m.serie)
+        ? `${m.serie} DEV`
+        : m.serie;
+      const concepto = [nombre, serieSufijo].filter(Boolean).join(' / ') || etiqueta;
       return {
         cuenta: m.cuenta, serie: serieOverride ?? (m.serie || ''), concepto, centroCosto,
         debe: Number(m.debe), haber: 0, cfdiUuid: m.cfdiUuid, _subcodigo: subcodigo,
@@ -1001,18 +1015,17 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     const grupo    = porCfdi.get(key);
     const categoria = categoriaDeGrupoCredito(grupo);
     if (!categoria) { bloques.push({ categoria: null, bloque: grupo }); continue; }
-    // Mismo criterio que en Contado: Devolución/Cancelación solo muestra el
-    // cargo (salvo que el abono sea la creación de un saldo a favor —
-    // `esAbonoSaldoFavor` — que sí se muestra), y dentro de cada lado la
-    // cuenta de Ingresos/Devoluciones va antes que la de IVA.
+    // A diferencia de Contado, en Crédito SIEMPRE se muestran los 3 registros
+    // de una Devolución/Cancelación (los 2 cargos + su abono, sea reembolso
+    // real en banco o saldo a favor) — confirmado con el usuario 2026-07-23.
+    // Dentro de cada lado, la cuenta de Ingresos/Devoluciones va antes que la
+    // de IVA (`conImpuestoAlFinal`).
     // Anticipo siempre lleva subcódigo 22, sin importar cómo se cobró —
     // mismo fix que en `bloquesAjustesContado` (Contado); antes solo se
     // etiquetaba `_categoria: 'anticipo'` sin asignar el subcódigo.
     const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    const abonosCandidatos = categoria === 'devolucion'
-      ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
-      : grupo.filter(m => !(Number(m.debe) > 0));
+    const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
     const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
     bloques.push({ categoria, bloque });
   }
@@ -1035,7 +1048,17 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
  * Para las líneas que quedan una por CFDI (el abono de Contado y toda la
  * venta de Crédito — no aplica a los renglones ya consolidados de cargo/
  * depósito): reemplaza el concepto original (descripción de productos, a
- * veces muy larga) por "Nombre del cliente / Serie-Folio interno".
+ * veces muy larga) por "Nombre del cliente / Serie-Folio".
+ *
+ * Para movimientos de ajuste (Club Tuberos/Bonificación/Devolución/
+ * Cancelación en cualquiera de sus variantes: BON, BEP, BXC, BN, DEV, DVE,
+ * CANCELACION, CAC, ANN, CES...), `plano.serie` YA trae la serie-folio del
+ * propio marcador del ajuste (ej. "DEV-054861") en vez de la de la factura
+ * original -- se resuelve en cfdi-mapping.service.js (`_serieMarcadorAjuste`,
+ * ver `cfdiToMovimientos`) al momento de generar la póliza, así que aquí no
+ * hace falta ninguna lógica especial por categoría (confirmado con el
+ * usuario 2026-07-23; antes esto se armaba aquí con sufijos de texto
+ * distintos por categoría -- BCT-, CANCELACION a secas, CAC+serie, etc.).
  */
 function enriquecerConceptoConCliente(movs, nombresClientes) {
   return movs.map(m => {
@@ -1045,14 +1068,7 @@ function enriquecerConceptoConCliente(movs, nombresClientes) {
     // escribir la celda, lo que corrompe el .xlsx). Hay que aplanar primero.
     const plano  = m.get ? m.get({ plain: true }) : m;
     const nombre = nombresClientes.get((plano.cfdiUuid || '').toUpperCase()) || '';
-    // Club Tuberos y Cancelación-refacturación: el sufijo muestra el tipo de
-    // ajuste en vez del serie-folio crudo (confirmado con el usuario
-    // 2026-07-17) — el resto de categorías conserva "SERIE-FOLIO" como
-    // siempre (ej. "I0-251100402").
-    const sufijo = plano._categoria === 'clubTuberos' ? 'BCT-'
-      : (plano._categoria === 'devolucion' && /cancelaci[oó]n/i.test(plano.tipoOrigen || '')) ? 'cancelacion'
-      : plano.serie;
-    const partes = [nombre, sufijo].filter(Boolean);
+    const partes = [nombre, plano.serie].filter(Boolean);
     return { ...plano, concepto: partes.join(' / ') };
   });
 }
@@ -1268,6 +1284,12 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
   for (const bloque of bloques) {
     // La columna Fecha del encabezado en el archivo real es una celda de fecha
     // genuina (ctype XL_CELL_DATE, formato "m/d/yy"), no un número plano.
+    // "- DEV" solo aplica al encabezado cuando el bloque completo es de
+    // Descuentos/Devoluciones (CEDIS) — el resto de bloques (Ventas, Crédito,
+    // Pagos, Bonificaciones) no debe llevarlo (confirmado con el usuario
+    // 2026-07-22; antes se pegaba a todos los bloques por error).
+    const esBloqueDevoluciones = /devoluci[oó]n/i.test(bloque.tipoVenta || '');
+    const conceptoHeader = esBloqueDevoluciones ? `${bloque.concepto} - DEV` : bloque.concepto;
     const headerRow = sheet.addRow([
       'P',
       fechaFinal,
@@ -1275,7 +1297,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
       bloque.folio,
       '1',
       '0',
-      `${bloque.concepto} - DEV`,
+      conceptoHeader,
       '11',
       '0',
       '0',

@@ -7,6 +7,7 @@ const BankMovement = require('../../banks/domains/banks/BankMovement.model');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const entityRepo = require('../repositories/entity.repository');
 const { SERIES_CON_AUTH } = require('../../banks/domains/erp/erp-auth.utils');
+const { generarSugerencias: generarSugerenciasConciliacion } = require('../services/conciliacion-sugerencias.service');
 
 // Cache in-memory para el dashboard — evita lanzar 15 queries MongoDB
 // en cada carga de pantalla cuando múltiples usuarios consultan al mismo tiempo.
@@ -3771,6 +3772,22 @@ const pagosBancoContextoBanco = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/reports/pagos-banco/sugerencias-conciliacion?fechaInicio=&fechaFin=&banco=
+ * Sugerencias de vinculación para depósitos bancarios 'no_identificado' cuya CxC ya
+ * no está en erp_cuentas_pendientes (ya saldada en el ERP) -- el motor real de match
+ * (matchAutorizacionesDesdeErp) solo cruza contra ese feed, así que en ese caso nunca
+ * tiene con qué cruzar. Ver conciliacion-sugerencias.service.js para el detalle del
+ * algoritmo (monto+fecha contra `cfdis` + firma bancaria contra el historial de
+ * bank_movements, ninguna de las dos fuentes se purga). Solo lectura -- no escribe
+ * erpLinks; el visor arma el erpLink y llama al PUT /banks/movements/:id/erp-ids
+ * ya existente para aceptar una sugerencia.
+ */
+const pagosBancoSugerencias = asyncHandler(async (req, res) => {
+  const { fechaInicio, fechaFin, banco } = req.query;
+  res.json(await generarSugerenciasConciliacion({ fechaInicio, fechaFin, banco }));
+});
+
+/**
  * GET /api/reports/depositos-ingresos
  * Relaciona facturas de Ingreso con su depósito bancario real, vía
  * bank_movements.erpLinks.folioFiscal (el ERP liga el depósito directo al UUID
@@ -4238,4 +4255,4 @@ const depositosIngresosExport = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };
+module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, pagosBancoSugerencias, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };

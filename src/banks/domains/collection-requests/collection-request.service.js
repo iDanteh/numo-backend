@@ -239,8 +239,11 @@ async function list(filters) {
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const [data, total] = await Promise.all([
+    // Bandeja de revisión: más antigua primero — se atiende en el orden en que llegó,
+    // no la más reciente (decisión del usuario 2026-07-24). NO tocar listMine() (abajo,
+    // historial personal del solicitante en /mias) — sigue más reciente primero a propósito.
     CollectionRequest.find(filter)
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: 1 })
       .skip(skip)
       .limit(parseInt(limit))
       .select('-comprobante.data')

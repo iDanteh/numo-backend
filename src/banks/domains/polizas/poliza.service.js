@@ -7,6 +7,7 @@ const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza } = require('../.
 const { Op } = require('sequelize');
 const BankMovement = require('../banks/BankMovement.model');
 const CFDI = require('../../../visor/models/CFDI');
+const { esConceptoMarcadorAjuste } = require('../cfdi-mapping/cfdi-mapping.service');
 
 // Categorías de bank_movements que representan una transferencia electrónica real.
 const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO'];
@@ -1052,13 +1053,13 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
  *
  * Para movimientos de ajuste (Club Tuberos/Bonificación/Devolución/
  * Cancelación en cualquiera de sus variantes: BON, BEP, BXC, BN, DEV, DVE,
- * CANCELACION, CAC, ANN, CES...), `plano.serie` YA trae la serie-folio del
- * propio marcador del ajuste (ej. "DEV-054861") en vez de la de la factura
- * original -- se resuelve en cfdi-mapping.service.js (`_serieMarcadorAjuste`,
- * ver `cfdiToMovimientos`) al momento de generar la póliza, así que aquí no
- * hace falta ninguna lógica especial por categoría (confirmado con el
- * usuario 2026-07-23; antes esto se armaba aquí con sufijos de texto
- * distintos por categoría -- BCT-, CANCELACION a secas, CAC+serie, etc.).
+ * CANCELACION, CAC, ANN, CES...), `plano.serie` es la serie-folio de la
+ * factura/CFDI (columna C, nunca el marcador -- corregido 2026-07-24) y
+ * `plano.concepto` YA trae el marcador del ajuste (ej. "DEV-054861"), puesto
+ * por cfdi-mapping.service.js (`_serieMarcadorAjuste`, ver `cfdiToMovimientos`)
+ * al momento de generar la póliza -- aquí se detecta con
+ * `esConceptoMarcadorAjuste` y se preserva en vez de usar la serie-folio de
+ * la factura, para que la columna H siga mostrando el marcador del ajuste.
  */
 function enriquecerConceptoConCliente(movs, nombresClientes) {
   return movs.map(m => {
@@ -1068,7 +1069,8 @@ function enriquecerConceptoConCliente(movs, nombresClientes) {
     // escribir la celda, lo que corrompe el .xlsx). Hay que aplanar primero.
     const plano  = m.get ? m.get({ plain: true }) : m;
     const nombre = nombresClientes.get((plano.cfdiUuid || '').toUpperCase()) || '';
-    const partes = [nombre, plano.serie].filter(Boolean);
+    const refSerieOMarcador = esConceptoMarcadorAjuste(plano.concepto) ? plano.concepto : plano.serie;
+    const partes = [nombre, refSerieOMarcador].filter(Boolean);
     return { ...plano, concepto: partes.join(' / ') };
   });
 }

@@ -389,33 +389,58 @@ function _calcCfdiMontos(cfdi) {
   return { subTotal16, subTotal0, desc16, desc0 };
 }
 
-// Series de documentosRelacionados (ERP) que marcan una NC como ajuste de una
-// venta (Bonificación/Devolución/Cancelación en sus variantes) -- mismo
-// catálogo que SERIES_FUSION_NC en cfdi-poliza-generator.service.js. 'BON'
-// usa startsWith (variantes numeradas tipo "BON01"), el resto es match exacto.
-const SERIES_MARCADOR_AJUSTE = new Set(['BCT', 'DEV', 'DVE', 'CANCELACION', 'CAC', 'BEP', 'BXC', 'BN', 'ANN', 'CES']);
-
-// Para movimientos de ajuste (Bonificación/Devolución/Cancelación en
-// cualquiera de sus variantes), el concepto de la póliza debe mostrar la
-// serie-folio del PROPIO marcador del ajuste (ej. "DEV-054861"), no la
-// serie-folio de la factura original que se está ajustando -- confirmado con
-// el usuario 2026-07-23 (antes se usaba la serie-folio de la factura
-// original con un sufijo de texto; ahora se usa directo la del marcador).
-// Devuelve null si el CFDI no es un ajuste (venta normal), para que el
-// llamador use la serie-folio propia del CFDI como siempre.
-function _serieMarcadorAjuste(documentosRelacionados) {
+// Para CFDIs con `documentosRelacionados` (Bonificación/Devolución/
+// Cancelación en cualquiera de sus variantes -- BON/BCT/DEV/CAC/etc. -- pero
+// también facturas normales relacionadas a otro documento del ERP, ej.
+// {Serie:"M0", Folio:"260701736"}), el CONCEPTO de la póliza (columna H) debe
+// mostrar la serie-folio de esa primera referencia relacionada, sin importar
+// cuál sea su Serie -- la columna C (serie) siempre lleva la serie-folio de
+// la factura/CFDI propia, nunca la del documento relacionado (corregido
+// 2026-07-24: el commit del 2026-07-23 que introdujo esta función lo aplicaba
+// por error a la columna C en vez de la H, y además limitaba el marcador a
+// una lista fija de Series -- confirmado con el usuario que cualquier
+// documentosRelacionados debe reflejarse en H, no solo esa lista).
+// Devuelve null si el CFDI no tiene documentosRelacionados, para que el
+// llamador use la descripción del CFDI en el concepto como siempre.
+function _referenciaDocRelacionado(documentosRelacionados) {
   for (const d of (documentosRelacionados || [])) {
     if (!d.Serie) continue;
-    if (SERIES_MARCADOR_AJUSTE.has(d.Serie) || d.Serie.startsWith('BON')) {
-      // BCT en particular suele venir con Folio vacío ("") en el ERP -- sin
-      // este fallback, `!d.Folio` (string vacío es falsy) saltaba la entrada
-      // completa y el concepto caía en la serie-folio de la factura original
-      // en vez de mostrar el marcador (encontrado 2026-07-23, folios B0-260700408
-      // y B0-260700785, ambos Serie='BCT' con Folio='').
-      return d.Folio ? `${d.Serie}-${d.Folio}`.slice(0, 25) : d.Serie;
-    }
+    // Folio vacío ("") es falsy -- sin este fallback, `!d.Folio` saltaba la
+    // entrada completa y el concepto caía en la serie-folio de la factura
+    // propia en vez de mostrar la referencia (encontrado 2026-07-23, folios
+    // B0-260700408 y B0-260700785, ambos Serie='BCT' con Folio='').
+    return d.Folio ? `${d.Serie}-${d.Folio}`.slice(0, 25) : d.Serie;
   }
   return null;
+}
+
+// Detecta si un `concepto` ya persistido en poliza_movimientos ES (o
+// CONTIENE, con alguno de los prefijos/sufijos que cfdiToMovimientos le
+// agrega a las líneas de IVA/ISR/Saldo -- "IVA - ", "IVA cobrado - ",
+// "IVA ant. - ", "IVA ret. - ", "ISR ret. - ", "Saldo - ", "... (0%)") una
+// referencia de documentosRelacionados (lo que `_referenciaDocRelacionado`
+// devuelve, ej. "DEV-054861" o "M0-260701736") en vez de una descripción de
+// producto -- usado en poliza.service.js (`enriquecerConceptoConCliente`)
+// para saber si debe preservar la referencia en la columna H al reconstruir
+// el concepto como "Cliente / ...", ya que a esa altura ya no se tiene
+// `documentosRelacionados` a la mano (el movimiento viene de Postgres, no del
+// CFDI en Mongo). Una referencia siempre tiene forma "Serie" o "Serie-Folio"
+// (alfanumérico corto, sin espacios); una descripción de producto real
+// siempre trae espacios -- esa es la señal que las distingue.
+//
+// Los prefijos se quitan por lista exacta (no con un recorte genérico de
+// "... - ") porque una descripción de producto real puede traer un guion
+// propio (ej. "Tubo galvanizado - 3/4"), y un recorte genérico hasta el
+// último " - " confundiría la última palabra con un código.
+const _PREFIJOS_CONCEPTO = ['IVA cobrado - ', 'IVA ant. - ', 'IVA ret. - ', 'ISR ret. - ', 'Saldo - ', 'IVA - '];
+const _REFERENCIA_REGEX  = /^[A-Z0-9]+(-\d+)?$/i;
+function esConceptoMarcadorAjuste(concepto) {
+  let nucleo = String(concepto || '');
+  for (const prefijo of _PREFIJOS_CONCEPTO) {
+    if (nucleo.startsWith(prefijo)) { nucleo = nucleo.slice(prefijo.length); break; }
+  }
+  if (nucleo.endsWith(' (0%)')) nucleo = nucleo.slice(0, -' (0%)'.length);
+  return _REFERENCIA_REGEX.test(nucleo);
 }
 
 /**
@@ -523,18 +548,21 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
 
   // Descripcion: algunos documentos tienen el campo en minúsculas (schema Mongoose)
   // y otros con mayúscula inicial (como viene del XML del SAT)
-  const descRaw     = cfdi.conceptos?.[0]?.descripcion || cfdi.conceptos?.[0]?.Descripcion || '';
-  const concepto    = descRaw.trim()
-    ? descRaw.trim().slice(0, 200)
-    : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`;
+  const descRaw        = cfdi.conceptos?.[0]?.descripcion || cfdi.conceptos?.[0]?.Descripcion || '';
+  // CFDI con documentosRelacionados (ajuste -- Bonificación/Devolución/
+  // Cancelación en cualquiera de sus variantes -- o cualquier otra referencia
+  // del ERP a otro documento): el concepto (columna H) muestra esa referencia
+  // en vez de la descripción de producto -- ver `_referenciaDocRelacionado`.
+  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados);
+  const concepto    = marcadorAjuste
+    ?? (descRaw.trim() ? descRaw.trim().slice(0, 200) : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`);
   const centroCosto = rule?.centroCosto ?? '';
   // Fecha del CFDI como fecha de venta en formato YYYY-MM-DD
   const ventaFecha  = cfdi.fecha ? new Date(cfdi.fecha).toISOString().slice(0, 10) : null;
-  // Serie del CFDI como referencia (serie+folio si existen) -- si es un
-  // movimiento de ajuste (Bonificación/Devolución/Cancelación), se usa la
-  // serie-folio del propio marcador del ajuste en vez de la factura original.
-  const serieCfdi   = _serieMarcadorAjuste(cfdi.documentosRelacionados)
-    ?? ([cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null);
+  // Serie del CFDI como referencia (serie+folio si existen) -- SIEMPRE la
+  // propia serie-folio de la factura/CFDI (columna C), nunca el marcador de
+  // ajuste (ese va en `concepto`, columna H -- ver arriba).
+  const serieCfdi   = [cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null;
 
   if (!rule) {
     return [
@@ -1062,4 +1090,4 @@ async function getRulePolizas(ruleId) {
   return polizas.map(p => ({ ...p, movimientosConRegla: countMap[p.id] ?? 0 }));
 }
 
-module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos, detectTasaIva: _detectTasaIva };
+module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, esConceptoMarcadorAjuste, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos, detectTasaIva: _detectTasaIva };

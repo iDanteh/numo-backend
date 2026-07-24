@@ -766,6 +766,36 @@ function _montoSaldoLink(raw0) {
   return conFormaPago.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
 }
 
+// Bancario-only: mismo criterio que tenía _montoSaldoLink ANTES del cambio del 2026-07-17
+// (transferencia/cheque/depósito en efectivo, vía _esFormaPagoBancariaKore), aplicado ahora
+// para backfillear `saldoPagado` (bancario-only) mientras saldoErpAportado/saldoPagadoTotal
+// siguen sumando TODAS las formas de pago — ver _recomputeErpKoreJob.
+function _montoSaldoLinkBancario(raw0) {
+  if (!raw0 || raw0.saldoActual > 0) return 0;
+  const conFormaBancaria = (raw0.movimientos ?? []).filter(
+    m => Array.isArray(m.formasPago) && m.formasPago.some(fp => _esFormaPagoBancariaKore(fp.nombreFormaPago)),
+  );
+  return conFormaBancaria.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
+}
+
+// Deriva saldoPagado/saldoPagadoTotal/folioFiscal de un erpLink a partir de la respuesta de
+// Kore YA consultada (raw0) — compartido por _syncErpKoreJob (al finalizar un link por
+// primera vez, sin pegarle a Kore una segunda vez) y _recomputeErpKoreJob (backfill
+// histórico del botón "Recalcular saldo ERP"), para que ambos usen exactamente el mismo
+// criterio y no se desincronicen con el tiempo.
+// folioFiscalPendiente=true → el llamador NO debe avanzar recomputedFormasPagoAt (se
+// reintenta en la próxima corrida): decisión del usuario 2026-07-24 — si saldoActual===0
+// (CxC cerrada de forma limpia) se acepta folioFiscal null para siempre (Kore no tiene por
+// qué facturar esa CxC nunca); si saldoActual!==0 (saldo a favor/retención, todavía "en
+// movimiento") vale la pena seguir reintentando.
+function _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporteNuevo) {
+  const saldoPagadoTotal = aporteNuevo;
+  const saldoPagado      = esHumano ? _montoSaldoLinkBancario(raw0) : aporteNuevo;
+  const folioFiscal      = link.folioFiscal ?? raw0.folioFiscal ?? null;
+  const folioFiscalPendiente = folioFiscal == null && raw0.saldoActual !== 0;
+  return { saldoPagadoTotal, saldoPagado, folioFiscal, folioFiscalPendiente };
+}
+
 // Deja solo dígitos y quita ceros a la izquierda — Kore antepone "REF " a algunas
 // autorizaciones y puede traer ceros a la izquierda distintos a los del banco.
 function _normalizarAutorizacion(v) {
@@ -1029,8 +1059,25 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
               ? _montoSaldoLink(raw0)
               : _montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
             if (aporte != null) linksActualizados[i].saldoErpAportado = aporte;
+
+            // Backfill inmediato de saldoPagado/saldoPagadoTotal/folioFiscal AL FINALIZAR
+            // (2026-07-24, mismo criterio que el botón "Recalcular saldo ERP" —
+            // _backfillFormasPagoYFolioFiscal) — reutiliza el MISMO raw0 ya consultado, sin
+            // pegarle a Kore otra vez. Así un link creado por el motor automático o vinculado
+            // a mano sin cobro (que nunca pasa por setErpIds/buildErpLinksParaCobro) no
+            // depende de que un admin corra el backfill manual para tener esta info desde el
+            // día en que se cierra.
+            const backfill = _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporte);
+            linksActualizados[i].saldoPagadoTotal = backfill.saldoPagadoTotal;
+            linksActualizados[i].saldoPagado      = backfill.saldoPagado;
+            linksActualizados[i].folioFiscal      = backfill.folioFiscal;
+
             linksActualizados[i].conciliacionFinalizadaAt = new Date();
             linksActualizados[i].conciliacionRunId        = jobId;
+            // Mismo checkpoint que usa el botón de backfill: si folioFiscal no se resolvió y
+            // la CxC sigue "en movimiento" (saldoActual!==0), queda pendiente para que una
+            // corrida futura (automática o el botón "Recalcular saldo ERP") lo reintente.
+            linksActualizados[i].recomputedFormasPagoAt = backfill.folioFiscalPendiente ? null : new Date();
             huboFinalizacionEnCorrida = true;
             linksDetalle.push({
               erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
@@ -1163,22 +1210,23 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
       .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor')
       .lean();
 
-    let procesados = 0, actualizados = 0, sinDatos = 0, errores = 0;
+    let procesados = 0, actualizados = 0, sinDatos = 0, errores = 0, pendientesFolioFiscal = 0;
     const total    = movements.length;
     let stopped    = false;
     const detalles = []; // una entrada por movimiento con cambios — insumo del reporte Excel
 
     emitToUser(auth0Sub, 'bank:erp:sync:progress',
-      { jobId, procesados, total, actualizados, pendientes: sinDatos, errores, pct: 0 });
+      { jobId, procesados, total, actualizados, pendientes: sinDatos, pendientesFolioFiscal, errores, pct: 0 });
 
     for (const mov of movements) {
       if (!await _checkSyncControl()) { stopped = true; break; }
 
       const links = mov.erpLinks ?? [];
-      let huboErrorMov     = false;
-      let huboLinkTocado   = false; // avanzó el checkpoint (con o sin cambio de aporte)
-      let huboCambioAporte = false;
-      let huboSinDatos     = false;
+      let huboErrorMov             = false;
+      let huboLinkTocado           = false; // avanzó el checkpoint (con o sin cambio de aporte)
+      let huboCambioAporte         = false;
+      let huboSinDatos             = false;
+      let huboFolioFiscalPendiente = false; // algún link quedó sin folioFiscal y sin avanzar checkpoint
       const linksDetalle      = [];
       const linksActualizados = links.map(l => ({ ...l }));
 
@@ -1235,19 +1283,25 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
             }
           }
 
+          const backfill = _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporteNuevo);
+
           linksActualizados[i] = {
             ...link,
             movimientosKore:        _movimientosKoreDesde(raw0),
             saldoErpAportado:       aporteNuevo,
+            saldoPagadoTotal:       backfill.saldoPagadoTotal,
+            saldoPagado:            backfill.saldoPagado,
+            folioFiscal:            backfill.folioFiscal,
             conciliacionRunId:      cambioAporte ? jobId : link.conciliacionRunId,
-            recomputedFormasPagoAt: new Date(),
+            recomputedFormasPagoAt: backfill.folioFiscalPendiente ? null : new Date(),
           };
           huboLinkTocado = true;
           if (cambioAporte) huboCambioAporte = true;
+          if (backfill.folioFiscalPendiente) huboFolioFiscalPendiente = true;
 
           linksDetalle.push({
             erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
-            estado: cambioAporte ? 'actualizado' : 'sin_cambio',
+            estado: backfill.folioFiscalPendiente ? 'folio_fiscal_pendiente' : (cambioAporte ? 'actualizado' : 'sin_cambio'),
             aporteAntes: link.saldoErpAportado ?? null, aporteDespues: aporteNuevo,
           });
         } catch (err) {
@@ -1288,13 +1342,15 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
       }
 
       let estado;
-      if (huboErrorMov)          estado = 'error';
-      else if (update.$push)     estado = 'actualizado';
-      else if (huboSinDatos)     estado = 'sin_datos';
-      else if (huboLinkTocado)   estado = 'backfill'; // checkpoint avanzó, sin cambio de saldo
-      else                       estado = null;       // nada elegible pudo procesarse (ej. folio inválido)
-      if (estado === 'actualizado') actualizados++;
-      if (estado === 'sin_datos')   sinDatos++;
+      if (huboErrorMov)                   estado = 'error';
+      else if (huboFolioFiscalPendiente)  estado = 'folio_fiscal_pendiente';
+      else if (update.$push)              estado = 'actualizado';
+      else if (huboSinDatos)              estado = 'sin_datos';
+      else if (huboLinkTocado)            estado = 'backfill'; // checkpoint avanzó, sin cambio de saldo
+      else                                estado = null;       // nada elegible pudo procesarse (ej. folio inválido)
+      if (estado === 'actualizado')            actualizados++;
+      if (estado === 'sin_datos')              sinDatos++;
+      if (estado === 'folio_fiscal_pendiente') pendientesFolioFiscal++;
 
       // dryRun: todo el cálculo/reporte de arriba corre igual — nada se escribe en Mongo,
       // así que el checkpoint recomputedFormasPagoAt tampoco avanza (una corrida real
@@ -1315,17 +1371,17 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
 
       procesados++;
       emitToUser(auth0Sub, 'bank:erp:sync:progress', {
-        jobId, procesados, total, actualizados, pendientes: sinDatos, errores,
+        jobId, procesados, total, actualizados, pendientes: sinDatos, pendientesFolioFiscal, errores,
         pct: Math.round((procesados / total) * 100),
       });
     }
 
     if (stopped) {
-      const result = { procesados, total, actualizados, pendientes: sinDatos, errores, dryRun };
+      const result = { procesados, total, actualizados, pendientes: sinDatos, pendientesFolioFiscal, errores, dryRun };
       SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles, kind: 'recompute', dryRun });
       emitToUser(auth0Sub, 'bank:erp:sync:stopped', { jobId, ...result });
     } else {
-      const result = { total, actualizados, pendientes: sinDatos, errores, dryRun };
+      const result = { total, actualizados, pendientes: sinDatos, pendientesFolioFiscal, errores, dryRun };
       SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles, kind: 'recompute', dryRun });
       emitToUser(auth0Sub, 'bank:erp:sync:done', { jobId, ...result });
     }
@@ -1341,8 +1397,9 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
 }
 
 // ── Reporte Excel del job "Recalcular saldo ERP" ──────────────────────────────────────────
-// 4 hojas: Saldo actualizado (cambió saldoErp/status) · Backfill sin cambio (checkpoint
-// avanzó, snapshot refrescado, aporte igual o vínculo de motor) · Sin datos en Kore (se
+// 5 hojas: Saldo actualizado (cambió saldoErp/status) · Backfill sin cambio (checkpoint
+// avanzó, snapshot refrescado, aporte igual o vínculo de motor) · Folio fiscal pendiente
+// (checkpoint NO avanzó, se reintenta en la próxima corrida) · Sin datos en Kore (se
 // reintenta en la próxima corrida) · Errores.
 function _generarExcelRecomputeErpKore(detalles) {
   const wb = new ExcelJS.Workbook();
@@ -1401,7 +1458,23 @@ function _generarExcelRecomputeErpKore(detalles) {
   }
   wsBk.getColumn('saldo').numFmt = '#,##0.00';
 
-  // ── Hoja 3: Sin datos en Kore (se reintenta en la próxima corrida) ────────
+  // ── Hoja 3: Folio fiscal pendiente (checkpoint NO avanzó, se reintenta) ──
+  const wsFf = wb.addWorksheet('Folio fiscal pendiente');
+  wsFf.columns = [
+    ...baseCols,
+    { header: 'CxC sin folio fiscal', key: 'cxc', width: 30 },
+    { header: 'Movimiento ID',        key: 'id',  width: 28 },
+  ];
+  styleHeader(wsFf);
+  for (const d of detalles.filter(d => d.estado === 'folio_fiscal_pendiente')) {
+    const row = wsFf.addRow({
+      folio: d.folio ?? '', banco: d.banco ?? '', fecha: formatFecha(d.fecha), deposito: d.deposito,
+      cxc: foliosCxc(d), id: String(d.movementId),
+    });
+    row.eachCell(cell => { cell.fill = XLSX_WARN_FILL; });
+  }
+
+  // ── Hoja 4: Sin datos en Kore (se reintenta en la próxima corrida) ────────
   const wsSd = wb.addWorksheet('Sin datos en Kore');
   wsSd.columns = [
     ...baseCols,
@@ -1419,7 +1492,7 @@ function _generarExcelRecomputeErpKore(detalles) {
     row.eachCell(cell => { cell.fill = XLSX_WARN_FILL; });
   }
 
-  // ── Hoja 4: Errores ────────────────────────────────────────────────────────
+  // ── Hoja 5: Errores ────────────────────────────────────────────────────────
   const wsErr = wb.addWorksheet('Errores');
   wsErr.columns = [
     { header: 'Movimiento (folio)', key: 'folio',   width: 14 },
@@ -1878,11 +1951,45 @@ async function runErpSyncAutomatico() {
   syncControl.stopped      = false;
   syncControl.pauseResolve = null;
   syncRunning = true;
-  const jobId = `erp-sync-${Date.now()}`;
-  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'sync' });
-  await _syncErpKoreJob(auth0Sub, jobId, null, null);
+  const syncJobId = `erp-sync-${Date.now()}`;
+  SYNC_JOBS.set(syncJobId, { status: 'running', auth0Sub, kind: 'sync' });
+  await _syncErpKoreJob(auth0Sub, syncJobId, null, null);
+  const syncJob = SYNC_JOBS.get(syncJobId);
+  console.log(`[CronErpSync] Sync ERP-Kore automático completado — status=${syncJob?.status}.`);
 
-  console.log('[CronErpSync] Sync ERP-Kore automático completado.');
+  // Encadenar el backfill (saldoPagado/saldoPagadoTotal/folioFiscal, 2026-07-24) SOLO si el
+  // sync principal terminó limpio — mismo criterio que el diseño de dos-jobs pre-2026-07-09
+  // (comentario histórico arriba de este archivo): si el sync se detuvo o falló, no tiene
+  // sentido encadenar un segundo paso sobre datos a medio procesar. Automatiza lo que antes
+  // dependía de que un admin corriera a mano el botón "Recalcular saldo ERP".
+  let recomputeJobId = null;
+  let recomputeJob   = null;
+  if (syncJob?.status === 'done') {
+    console.log('[CronErpSync] Sync OK — iniciando backfill automático (Recalcular saldo ERP)...');
+    syncControl.paused       = false;
+    syncControl.stopped      = false;
+    syncControl.pauseResolve = null;
+    syncRunning = true;
+    recomputeJobId = `erp-recompute-${Date.now()}`;
+    SYNC_JOBS.set(recomputeJobId, { status: 'running', auth0Sub, kind: 'recompute', dryRun: false });
+    await _recomputeErpKoreJob(auth0Sub, recomputeJobId, null, null, false);
+    recomputeJob = SYNC_JOBS.get(recomputeJobId);
+  } else {
+    console.warn(`[CronErpSync] Sync terminó en status "${syncJob?.status}" — se omite el backfill automático de hoy.`);
+  }
+
+  // Resumen estructurado de una sola línea, con tag fijo greppable en logs/app.log — permite
+  // confirmar que la corrida automática de hoy (sync + backfill encadenado) corrió bien sin
+  // tener que rearmar el contexto de líneas sueltas. `grep '\[CronErpSync\]\[RESUMEN\]'`.
+  const ok = syncJob?.status === 'done' && (recomputeJobId === null || recomputeJob?.status === 'done');
+  const resumen = {
+    fecha: new Date().toISOString(),
+    sync:      { jobId: syncJobId, status: syncJob?.status ?? null, result: syncJob?.result ?? null },
+    recompute: recomputeJobId
+      ? { jobId: recomputeJobId, status: recomputeJob?.status ?? null, result: recomputeJob?.result ?? null }
+      : null,
+  };
+  console.log(`[CronErpSync][RESUMEN][${ok ? 'OK' : 'REVISAR'}] ${JSON.stringify(resumen)}`);
 }
 
 router.runErpSyncAutomatico = runErpSyncAutomatico;

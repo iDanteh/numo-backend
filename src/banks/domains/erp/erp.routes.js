@@ -792,7 +792,15 @@ function _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporteNuevo) {
   const saldoPagadoTotal = aporteNuevo;
   const saldoPagado      = esHumano ? _montoSaldoLinkBancario(raw0) : aporteNuevo;
   const folioFiscal      = link.folioFiscal ?? raw0.folioFiscal ?? null;
-  const folioFiscalPendiente = folioFiscal == null && raw0.saldoActual !== 0;
+  // Una CxC puede llegar a saldoActual===0 por una RETENCIÓN/bonificación (serie 'RET') en
+  // vez de un pago bancario completo — en ese caso Kore puede timbrar el CFDI DESPUÉS de que
+  // el saldo ya cerró en 0 (caso real: folio 036827, cerrado por retención el mismo día en
+  // que el CFDI todavía no existía en Kore — el checkpoint avanzó con folioFiscal null antes
+  // de que apareciera). Tratar esos casos igual que "saldoActual!==0" para el gate de
+  // reintento evita que folioFiscal quede null para siempre apenas la retención cierra el
+  // saldo, sin oportunidad de reintentar cuando Kore termine de facturar.
+  const tieneRetencion = (raw0.movimientos ?? []).some(m => m.serie === 'RET');
+  const folioFiscalPendiente = folioFiscal == null && (raw0.saldoActual !== 0 || tieneRetencion);
   return { saldoPagadoTotal, saldoPagado, folioFiscal, folioFiscalPendiente };
 }
 
@@ -1926,6 +1934,96 @@ router.post('/sync-erp-kore/:jobId/revert', authenticate, permit('banks:admin'),
     revertidos:                    result.modifiedCount,
     omitidosPorCorridaMasReciente: omitidos > 0 ? omitidos : 0,
   });
+}));
+
+// Patrón exacto del síntoma (folio 036827 y cualquier otro con el mismo bug): el checkpoint
+// de "Recalcular saldo ERP" avanzó (recomputedFormasPagoAt no-null) con folioFiscal todavía
+// null, en un link cerrado por RETENCIÓN (tieneRetencion:true) — la regla vieja de
+// _backfillFormasPagoYFolioFiscal daba por perdido el folioFiscal apenas saldoActual llegaba
+// a 0, sin considerar que Kore podía timbrar el CFDI después. Ya arreglado hacia adelante
+// (ver el fix arriba); este filtro identifica solo lo que quedó atrapado con la regla vieja
+// — nunca toca links con folioFiscal ya resuelto ni links "saldo a favor" (esos nunca
+// llegaron a marcar el checkpoint, así que no necesitan rescate).
+const _FILTRO_LINK_ATRAPADO = {
+  conciliacionFinalizadaAt: { $ne: null },
+  recomputedFormasPagoAt:   { $ne: null },
+  folioFiscal:              null,
+  tieneRetencion:           true,
+};
+// Mismas condiciones, con el prefijo que exige `arrayFilters` (identificador posicional
+// $[link] en vez de nombre de campo relativo al array, como pide $elemMatch).
+const _ARRAY_FILTRO_LINK_ATRAPADO = Object.fromEntries(
+  Object.entries(_FILTRO_LINK_ATRAPADO).map(([k, v]) => [`link.${k}`, v]),
+);
+
+// POST rescate manual — libera el checkpoint `recomputedFormasPagoAt` sin llamar a Kore.
+// Existe para casos como el folio 036827 (ver _FILTRO_LINK_ATRAPADO arriba). Dos modos:
+// - Con `folio` en el body: rescata solo ese movimiento (opcionalmente acotado a `erpId`),
+//   sin exigir que cumpla el patrón — rescate dirigido, para un caso puntual ya diagnosticado.
+// - Sin `folio`: modo masivo, un solo `updateMany` sobre TODOS los erpLinks que calzan
+//   exactamente con el patrón del bug — pensado para correrse UNA VEZ como backfill
+//   retroactivo (el fix de arriba ya evita que el patrón vuelva a producirse hacia adelante,
+//   así que no hace falta un cron para esto).
+// En ambos casos, la próxima corrida de "Recalcular saldo ERP" (o el cron diario) vuelve a
+// tomar los links liberados normalmente — este endpoint nunca llama a Kore ni toca saldoErp.
+router.post('/sync-erp-kore/reset-recompute', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const { folio, erpId } = req.body;
+
+  if (!folio) {
+    // Rango de fechas OPCIONAL — sin acotar por defecto (mismo comportamiento que antes de
+    // este cambio). Permite correr el rescate masivo en tandas por fecha desde el frontend.
+    // Mismo patrón de validación que /sync-erp-kore y /sync-erp-kore/recompute.
+    let fechaInicio = null;
+    let fechaFin    = null;
+    if (req.body.fechaDesde) {
+      fechaInicio = new Date(req.body.fechaDesde);
+      if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
+    }
+    if (req.body.fechaHasta) {
+      fechaFin = new Date(req.body.fechaHasta);
+      if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
+    }
+    if (fechaInicio && fechaFin && fechaInicio > fechaFin) {
+      return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
+    }
+
+    const filtroFecha = {};
+    if (fechaInicio && fechaFin) filtroFecha.fecha = { $gte: fechaInicio, $lte: fechaFin };
+
+    const result = await BankMovement.updateMany(
+      { ...filtroFecha, erpLinks: { $elemMatch: _FILTRO_LINK_ATRAPADO } },
+      { $set: { 'erpLinks.$[link].recomputedFormasPagoAt': null } },
+      { arrayFilters: [_ARRAY_FILTRO_LINK_ATRAPADO] },
+    );
+    return res.json({
+      ok:                     true,
+      modo:                   'masivo',
+      movimientosAfectados:   result.matchedCount,
+      movimientosModificados: result.modifiedCount,
+      fechaDesde:             req.body.fechaDesde ?? null,
+      fechaHasta:             req.body.fechaHasta ?? null,
+    });
+  }
+
+  const mov = await BankMovement.findOne({ folio: String(folio) });
+  if (!mov) return res.status(404).json({ error: `No existe un movimiento con folio ${folio}` });
+
+  const links = mov.erpLinks ?? [];
+  if (erpId && !links.some(l => String(l.erpId) === String(erpId))) {
+    return res.status(404).json({ error: 'erpId no encontrado en este movimiento' });
+  }
+
+  let reiniciados = 0;
+  for (const link of links) {
+    if (erpId && String(link.erpId) !== String(erpId)) continue;
+    if (link.recomputedFormasPagoAt != null) {
+      link.recomputedFormasPagoAt = null;
+      reiniciados++;
+    }
+  }
+  if (reiniciados > 0) await mov.save();
+
+  res.json({ ok: true, modo: 'puntual', folio: mov.folio, reiniciados });
 }));
 
 // ── Corrida automática diaria (cron) ──────────────────────────────────────────

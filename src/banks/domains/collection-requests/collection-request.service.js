@@ -10,7 +10,7 @@ const bankService       = require('../banks/bank.service'); // setErpIds — mis
 // refactor — desestructurar aquí rompería esa capacidad de prueba.
 const koreCaja          = require('../erp/kore-caja.service');
 const { parseCxcs, parseFormasPago }               = require('./collection-request.parsers');
-const { buildErpLinksParaCobro, tipoSaldoEspecial } = require('./collection-request-erp-links');
+const { buildErpLinksParaCobro, tipoSaldoEspecial, matchBancoDefault } = require('./collection-request-erp-links');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
 const driveComprobantes                  = require('./drive-comprobantes.service');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
@@ -474,15 +474,42 @@ async function identificar(id, bankMovementId, user) {
     }
   }
 
-  // 5. Aplicar el cobro — ahora que Kore ya aprobó la solicitud, este endpoint
+  // 5. BancoID — igual criterio que _matchBancoDefault() en cobro-panel.component.ts
+  // (panel manual): solo las formas de pago con claveSAT '03' (transferencia) lo
+  // necesitan. Acá no hay un humano confirmando el banco en pantalla antes de
+  // aplicar (a diferencia del panel manual), pero el usuario confirmó (2026-07-28)
+  // que igual quiere el mismo fallback: si `mov.banco` no matchea ningún banco del
+  // catálogo de Kore, se manda bancos[0] (el primero del catálogo) en vez de
+  // dejar el cobro sin BancoID. Todo o nada: si Kore rechaza cualquiera de los 2
+  // catálogos, no se aplica el cobro (mismo criterio que el resto de la función).
+  let bancoDefault = null;
+  const formaPagoRequiereBanco = new Map();
+  try {
+    const formasPagoKore = await koreCaja.listarFormasPago(koreToken);
+    for (const f of formasPagoKore) formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
+
+    const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
+    if (algunaFormaRequiereBanco) {
+      const bancosKore = await koreCaja.listarBancos(koreToken);
+      bancoDefault = matchBancoDefault(bancosKore, mov.banco);
+    }
+  } catch (err) {
+    if (err instanceof koreCaja.KoreCajaError) {
+      throw new BadRequestError(`No se pudo resolver el banco para aplicar el cobro: ${err.message}`);
+    }
+    throw err;
+  }
+
+  // 6. Aplicar el cobro — ahora que Kore ya aprobó la solicitud, este endpoint
   // dedicado la aplica internamente con los datos que Kore ya tiene desde que
   // ÉL creó la solicitud; lo único que se manda, por cada forma de pago, es su
-  // FormaPagoID y DOS datos del movimiento identificado: "Autorizacion" (el
-  // folio interno de Numo, mismo folio que `referencia`, arriba) y "Numo" (el
-  // numeroAutorizacion bancario real, extraído por OCR) — ambos por separado,
-  // ninguno reemplaza al otro. Igual en Modo 1 y Modo 2 — un elemento del
-  // arreglo por cada forma de pago.
+  // FormaPagoID, BancoID (solo si esa forma de pago lo requiere, ver arriba) y
+  // DOS datos del movimiento identificado: "Autorizacion" (el folio interno de
+  // Numo, mismo folio que `referencia`, arriba) y "Numo" (el numeroAutorizacion
+  // bancario real, extraído por OCR) — ambos por separado, ninguno reemplaza al
+  // otro. Igual en Modo 1 y Modo 2 — un elemento del arreglo por cada forma de pago.
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => ({
+    ...(formaPagoRequiereBanco.get(f.formaPagoId) && bancoDefault ? { BancoID: bancoDefault.id } : {}),
     FormaPagoID:      f.formaPagoId,
     DatosAdicionales: [
       { Nombre: 'Autorizacion', Valor: mov.folio || '' },
@@ -504,7 +531,7 @@ async function identificar(id, bankMovementId, user) {
     throw err;
   }
 
-  // 6. Kore aceptó el cobro — vincular la(s) CxC al movimiento con el MISMO
+  // 7. Kore aceptó el cobro — vincular la(s) CxC al movimiento con el MISMO
   // mecanismo que usa el panel de cobros (erpLinks/erpIds/identificadoPor/
   // saldoErp/status vía aplicarLogicaErp), no un simple status a mano. Puede
   // lanzar ConflictError si otro usuario ya tiene el movimiento tomado — se
@@ -520,7 +547,7 @@ async function identificar(id, bankMovementId, user) {
   const identidadCajero = { _id: cr.solicitanteUserId, nombre: cr.solicitanteNombre, role: user.role };
   await bankService.setErpIds(bankMovementId, erpLinks, identidadCajero);
 
-  // 7. Solo si todo lo anterior salió bien: persistir la solicitud.
+  // 8. Solo si todo lo anterior salió bien: persistir la solicitud.
   cr.formasPago          = formasPagoConRef;
   cr.bankMovementId      = bankMovementId;
   cr.status              = 'identificada';
@@ -532,7 +559,7 @@ async function identificar(id, bankMovementId, user) {
   cr.koreOperacionResult = koreResult;
   await cr.save();
 
-  // 8. Avisar en tiempo real a quien tenga la bandeja abierta (cobranza/contabilidad/
+  // 9. Avisar en tiempo real a quien tenga la bandeja abierta (cobranza/contabilidad/
   // admin) y a la tienda que la solicitó — sin esto, cualquier otra sesión con la
   // vista abierta se queda con el estado viejo hasta que alguien recargue a mano.
   emitToAll('collection-request:updated', _eventoActualizacion(cr, mov));

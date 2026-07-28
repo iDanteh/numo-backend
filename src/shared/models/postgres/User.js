@@ -46,6 +46,15 @@ const User = sequelize.define('User', {
     type:      DataTypes.DATE,
     allowNull: true,
   },
+  // Empresas fijas asignadas directo a ESTE usuario (RFCs) — se asignan desde
+  // la pantalla de Roles (selección múltiple de usuarios + empresa). Array
+  // vacío = sin restricción, puede elegir cualquier empresa. Un usuario puede
+  // tener varias (confirmado con el usuario 2026-07-28).
+  empresaRfcs: {
+    type:         DataTypes.ARRAY(DataTypes.STRING(20)),
+    allowNull:    false,
+    defaultValue: [],
+  },
 }, {
   tableName:  'users',
   underscored: true,

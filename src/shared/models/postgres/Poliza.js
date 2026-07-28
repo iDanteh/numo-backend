@@ -1,6 +1,6 @@
 'use strict';
 
-const { DataTypes } = require('sequelize');
+const { DataTypes, Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 
 const Poliza = sequelize.define('Poliza', {
@@ -119,7 +119,20 @@ const Poliza = sequelize.define('Poliza', {
   indexes: [
     { fields: ['rfc', 'ejercicio', 'periodo'] },
     { fields: ['rfc', 'ejercicio', 'periodo', 'fecha'] }, // cubre ORDER BY fecha DESC
-    { fields: ['tipo', 'numero', 'rfc', 'ejercicio', 'periodo'], unique: true },
+    // Parcial (WHERE estado != 'cancelada'): una póliza cancelada no debe
+    // bloquear para siempre su folio — al cancelarla, ese folio queda libre
+    // para que una futura generación lo reutilice (confirmado con el usuario
+    // 2026-07-27, ver rangos de folio por sucursal en cfdi-poliza-generator).
+    // El nombre del índice se mantiene igual que antes; el reemplazo real
+    // (DROP del índice viejo sin WHERE + CREATE de este) se hace en
+    // syncModels() con SQL crudo — Sequelize no migra bien un cambio de
+    // índice existente solo con esta definición.
+    {
+      name:   'polizas_tipo_numero_rfc_ejercicio_periodo',
+      fields: ['tipo', 'numero', 'rfc', 'ejercicio', 'periodo'],
+      unique: true,
+      where:  { estado: { [Op.ne]: 'cancelada' } },
+    },
   ],
 });
 

@@ -51,6 +51,101 @@ async function _completarRelacionadosPostMerge(cfdisFinal, relMetodoPagoMap, rel
 
 const SUCURSAL_DEFAULT = 'Cedis';
 
+// Rango de folios de CONTPAQ reservado por sucursal (confirmado con el
+// usuario 2026-07-27) — cada póliza de Ingreso nueva de esa sucursal toma el
+// siguiente folio libre DENTRO de su rango, nunca fuera de él. El rango se
+// reinicia cada periodo (ejercicio+periodo): el primer folio de la sucursal
+// en un mes nuevo siempre es `desde`. Nombres deben coincidir EXACTO con
+// CentroCosto.sucursal (ver seed-account-plan.js) — comparación case-insensitive.
+const RANGOS_FOLIO_POR_SUCURSAL = [
+  { sucursales: ['CEDIS', 'PROMOTORIA'],          desde: 100,  hasta: 199 },
+  { sucursales: ['HIDALGO', 'LICITACION HIDALGO'], desde: 300,  hasta: 399 },
+  { sucursales: ['CONSTRUCASA'],                  desde: 400,  hasta: 499 },
+  { sucursales: ['REFORMA'],                       desde: 500,  hasta: 599 },
+  { sucursales: ['SIMBOLOS'],                      desde: 600,  hasta: 699 },
+  { sucursales: ['FERROCARRIL'],                   desde: 700,  hasta: 799 },
+  { sucursales: ['ATZOMPA'],                       desde: 800,  hasta: 899 },
+  { sucursales: ['TEHUANTEPEC'],                   desde: 900,  hasta: 999 },
+  { sucursales: ['SANTA ROSA'],                    desde: 1000, hasta: 1099 },
+  { sucursales: ['VIGUERA'],                        desde: 1100, hasta: 1199 },
+  { sucursales: ['PUERTO ESCONDIDO'],               desde: 1200, hasta: 1299 },
+];
+
+function _rangoFolioPorSucursal(sucursal) {
+  if (!sucursal) return null;
+  const norm = String(sucursal).trim().toUpperCase();
+  return RANGOS_FOLIO_POR_SUCURSAL.find(r => r.sucursales.includes(norm)) ?? null;
+}
+
+// Folio siguiente disponible dentro del rango de la sucursal — a diferencia
+// de un contador que solo sube, aquí una póliza CANCELADA libera su folio
+// para que una futura generación lo reutilice (confirmado con el usuario
+// 2026-07-27). Una póliza de Ingreso con Contado Y Crédito mezclados ocupa
+// DOS folios consecutivos en el export (numero y numero+1, ver
+// _conceptoConTipoVenta/bloques en poliza.service.js) aunque en Postgres solo
+// exista una fila — por eso se deriva de sus propios movimientos (metodoPago)
+// si cada póliza activa ocupó 1 o 2 folios, en vez de asumirlo.
+// CEDIS es un caso aparte: además de Contado/Crédito separa Bonificaciones y
+// Descuentos/Devoluciones en pólizas propias (ver rama `esCedis` en
+// poliza.service.js), consumiendo hasta 6 folios consecutivos desde una sola
+// fila de Postgres. Replicar aquí cuántos de esos 6 bloques tuvieron datos
+// requeriría duplicar la categorización completa del export, así que para
+// una póliza CEDIS (pasada o nueva) siempre se reservan/bloquean los 6 —
+// conservador pero sin riesgo de colisión.
+const FOLIOS_MAX_CEDIS = 6;
+
+function _esCedisPorSucursal(sucursal) {
+  return (sucursal || '').trim().toUpperCase() === 'CEDIS';
+}
+
+async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction }) {
+  if (!rangoFolio) {
+    const max = await Poliza.max('numero', {
+      where: { tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo) },
+      transaction,
+    });
+    return { numero: (max || 0) + 1, agotado: false };
+  }
+
+  const activas = await Poliza.findAll({
+    where: {
+      tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo),
+      estado: { [Op.ne]: 'cancelada' },
+      numero: { [Op.between]: [rangoFolio.desde, rangoFolio.hasta] },
+    },
+    attributes: ['id', 'numero'],
+    include: [{ model: PolizaMovimiento, as: 'movimientos', attributes: ['metodoPago', 'centroCostoId'], required: false }],
+    transaction,
+  });
+
+  const sucursalDeCentro = (id) => Object.values(ccBySerieMap ?? {}).find(c => String(c.id) === String(id))?.sucursal ?? null;
+
+  const ocupados = new Set();
+  for (const p of activas) {
+    const movs = p.movimientos ?? [];
+    const esCedisPast = movs.length > 0 && movs.every(m => _esCedisPorSucursal(sucursalDeCentro(m.centroCostoId)));
+    if (esCedisPast) {
+      for (let i = 0; i < FOLIOS_MAX_CEDIS; i++) ocupados.add(p.numero + i);
+      continue;
+    }
+    const metodos = new Set(movs.map(m => m.metodoPago));
+    const tieneContado = [...metodos].some(m => m !== 'PPD');
+    const tieneCredito = metodos.has('PPD');
+    ocupados.add(p.numero);
+    if (tieneContado && tieneCredito) ocupados.add(p.numero + 1);
+  }
+
+  const necesarios = foliosNecesarios ?? 1;
+  for (let n = rangoFolio.desde; n <= rangoFolio.hasta - necesarios + 1; n++) {
+    let libre = true;
+    for (let i = 0; i < necesarios; i++) {
+      if (ocupados.has(n + i)) { libre = false; break; }
+    }
+    if (libre) return { numero: n, agotado: false };
+  }
+  return { numero: null, agotado: true };
+}
+
 // Series de documentosRelacionados (ERP) que identifican una NC como ajuste
 // de una venta (bonificación/devolución/cancelación) — mismo catálogo que
 // TIPO_MARCADORES de report.controller.js, más 'CANCELACION' (NCs de
@@ -217,8 +312,14 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     .filter(r => r.tipoRelacion === '01' || r.tipoRelacion === '03')
     .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
 
+  // Solo NCs EMITIDAS por esta entidad — una NC donde `rfc` es receptor es una
+  // que le dieron a esta entidad como CLIENTE (compra), no una que emitió
+  // sobre sus propias ventas. Mismo bug de fondo que ya se corrigió en
+  // notInErp/discrepanciasMontos/discrepanciasCriticas (faltaba filtro
+  // emisor.rfc) — confirmado con el usuario 2026-07-28 al encontrar un CFDI
+  // recibido colado en una póliza de Ingresos vía este mismo patrón de $or.
   const filtroBaseNc = {
-    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc':      rfc,
     tipoDeComprobante: 'E',
     source:            'SAT',
     satStatus:         'Vigente',
@@ -388,8 +489,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
   const foliosCancelacionProp = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
+  // Solo CFDIs EMITIDOS por esta entidad — con receptor.rfc en el filtro se
+  // colaban compras/gastos (CFDIs donde `rfc` es cliente de un tercero) dentro
+  // de la póliza de Ingresos de sus propias ventas (confirmado con el usuario
+  // 2026-07-28, mismo patrón de bug ya corregido en notInErp/discrepancias*).
   const filtroBase = {
-    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc':      rfc,
     ejercicio:         Number(ejercicio),
     periodo:           Number(periodo),
     tipoDeComprobante: tipoCfdi,
@@ -865,8 +970,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
   const foliosCancelacionGuard = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
+  // Solo CFDIs EMITIDOS por esta entidad — ver comentario equivalente en
+  // generarPropuesta (mismo fix, mismo motivo: receptor.rfc colaba compras
+  // ajenas dentro de la póliza de Ingresos).
   const filtroBase = {
-    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc':      rfc,
     ejercicio:         Number(ejercicio),
     periodo:           Number(periodo),
     tipoDeComprobante: tipoCfdi,
@@ -1252,11 +1360,33 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       { replacements: { key: `poliza-${tipoPropuesta}-${rfc}-${ejercicio}-${periodo}` }, transaction: t },
     );
 
-    const max = await Poliza.max('numero', {
-      where: { tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo) },
-      transaction: t,
+    // Rango de folios reservado por sucursal (ver RANGOS_FOLIO_POR_SUCURSAL):
+    // el folio nunca sale de su rango y se reinicia en `desde` cada periodo.
+    // Sin centroCostoId (o sucursal sin rango asignado) se conserva el
+    // comportamiento anterior: contador simple por tipo/rfc/ejercicio/periodo.
+    const centroFolio = centroCostoId
+      ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))
+      : null;
+    const rangoFolio = _rangoFolioPorSucursal(centroFolio?.sucursal);
+
+    // ¿Esta póliza nueva va a mezclar Contado y Crédito? (solo aplica a
+    // Ingreso) — si sí, necesita reservar 2 folios consecutivos, no 1.
+    // CEDIS es un caso especial que puede necesitar hasta 6 (ver
+    // _folioSiguienteDisponible arriba) — se reservan siempre los 6.
+    const metodosPagoNuevos = new Set(todosLosMovimientos.map(m => m.metodoPago));
+    const consumeDosFolios = tipoPropuesta === 'I'
+      && [...metodosPagoNuevos].some(m => m !== 'PPD') && metodosPagoNuevos.has('PPD');
+    const foliosNecesarios = _esCedisPorSucursal(centroFolio?.sucursal) ? FOLIOS_MAX_CEDIS : (consumeDosFolios ? 2 : 1);
+
+    const { numero, agotado } = await _folioSiguienteDisponible({
+      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t,
     });
-    const numero = (max || 0) + 1;
+
+    if (agotado) {
+      throw new BadRequestError(
+        `Se agotó el rango de folios de ${centroFolio.sucursal} para este periodo (${rangoFolio.desde}-${rangoFolio.hasta}).`,
+      );
+    }
 
     const polizaHeader = await Poliza.create({
       tipo:      tipoPropuesta,
@@ -1425,9 +1555,13 @@ async function _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fecha
   const mxInicio     = _medianocheMx(fechaInicio);
   const mxFin        = new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1);
 
+  // Mismo fix que filtroBase en generarPropuesta/generarYGuardar — este
+  // universo de UUIDs por fecha debe coincidir exactamente con el de esas
+  // funciones (emisor.rfc únicamente) o el filtro por rango de fechas
+  // seleccionaría un conjunto distinto de CFDIs al de la generación real.
   const filtroComun = {
     tipoDeComprobante: tipoCfdi,
-    $or: [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc': rfc,
   };
 
   // 1. SAT cuyo fecha "ingenuo" cae en el rango — mismo universo que el

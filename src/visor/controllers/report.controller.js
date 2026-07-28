@@ -94,7 +94,14 @@ function ordenarKardex(movimientos) {
 // pago bancario real (series con autorización: CBT/ABO/CPF/CFC) o ajuste sin
 // depósito (bonificación, descuento, devolución, retención, etc.) — para que
 // la UI pueda explicar por qué el saldo bajó sin que exista un depósito.
-async function buscarCuentasPorCobrarConMovimientos(erpIds) {
+//
+// `erp_cuentas_pendientes` es un feed que el ERP expone SOLO con cuentas
+// ABIERTAS: en cuanto se saldan (o quedan fuera de la ventana de sync)
+// desaparecen del feed para siempre. Para los erpId que ya no aparecen ahí,
+// se reconstruye una CxC sintética a partir de bank_movements.erpLinks — el
+// snapshot que Kore guardó al momento de conciliar (total/saldoActual/
+// movimientosKore) — para no perder el dato solo porque el ERP lo purgó.
+async function buscarCuentasPorCobrarConMovimientos(erpIds, movimientosBanco = []) {
   if (!erpIds.length) return [];
   const docs = await CFDI.db.collection('erp_cuentas_pendientes').find(
     { erpId: { $in: erpIds } },
@@ -105,13 +112,65 @@ async function buscarCuentasPorCobrarConMovimientos(erpIds) {
     } },
   ).toArray();
 
-  return docs.map(doc => ({
+  const encontrados = new Set(docs.map(d => d.erpId));
+  const faltantes = erpIds.filter(id => !encontrados.has(id));
+  const sinteticos = faltantes
+    .map(erpId => construirCxcSintetica(erpId, movimientosBanco))
+    .filter(Boolean);
+
+  return [...docs, ...sinteticos].map(doc => ({
     ...doc,
     movimientos: ordenarKardex(doc.movimientos ?? []).map(m => ({
       ...m,
       esPagoBancario: SERIES_CON_AUTH.includes(m.serie),
     })),
   }));
+}
+
+// Reconstruye una CxC "solo en banco" (ya purgada de erp_cuentas_pendientes)
+// a partir de los erpLinks que Kore guardó al conciliar. Una misma CxC puede
+// tener varias parcialidades -> varios bank_movements distintos con su propio
+// erpLink para el MISMO erpId, cada uno con su fracción de movimientosKore;
+// hay que juntarlos todos, no solo el primero que aparezca.
+function construirCxcSintetica(erpId, movimientosBanco) {
+  const links = movimientosBanco.flatMap(bm => bm.erpLinks ?? []).filter(l => l.erpId === erpId);
+  if (!links.length) return null;
+
+  const movimientos = ordenarKardex(
+    links.flatMap(l => l.movimientosKore ?? []).map(mk => ({
+      serie: mk.serie ?? null, folio: mk.folio ?? null,
+      serieOrigen: mk.serieOrigen ?? null, folioOrigen: mk.folioOrigen ?? null,
+      fecha: mk.fecha ?? null,
+      saldoAnterior: mk.saldoAnterior ?? null, saldoActual: mk.saldoActual ?? null,
+      total: mk.total ?? 0,
+    })),
+  );
+
+  // erpLink.saldoActual es un snapshot tomado al momento de conciliar ESE
+  // movimiento puntual — puede quedar desfasado si hubo abonos posteriores.
+  // El saldoActual real y más reciente es el del ÚLTIMO movimiento de la
+  // cadena ya ordenada cronológicamente; el link solo se usa de fallback si
+  // no hay ningún movimientoKore (caso extremo, no debería pasar en la práctica).
+  const ultimoMovimiento = movimientos[movimientos.length - 1] ?? null;
+  const link = links[0];
+
+  return {
+    erpId,
+    serie: null,
+    folio: null,
+    serieExterna: link.serie ?? null,
+    folioExterno: link.folioExterno ?? null,
+    total: link.total ?? null,
+    saldoActual: ultimoMovimiento?.saldoActual ?? link.saldoActual ?? null,
+    concepto: null,
+    tipoPago: link.tipoPago ?? null,
+    tipoMovimiento: null,
+    fechaCreacion: null,
+    fechaAfectacion: null,
+    fechaRealPago: null,
+    soloEnBanco: true,
+    movimientos,
+  };
 }
 
 // Series que en documentosRelacionados marcan el TIPO de Nota de Crédito
@@ -3223,6 +3282,32 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                   in: '$$link.erpId',
                 },
               },
+              // Kardex embebido de esta CxC (snapshot que Kore guardó al conciliar).
+              // Fallback para Parcialidad/Saldo Anterior cuando la CxC ya se purgó
+              // de erp_cuentas_pendientes (ese feed solo trae cuentas ABIERTAS) y
+              // el CFDI-P tampoco trae sus propios impSaldoAnt/impSaldoInsoluto —
+              // mismo patrón que construirCxcSintetica() usa para el modal de CxC.
+              movimientosKoreOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$$m.erpLinks', []] },
+                          as: 'l',
+                          cond: {
+                            $eq: [
+                              { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                              { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                            ],
+                          },
+                        },
+                      }, 0],
+                    },
+                  },
+                  in: { $ifNull: ['$$link.movimientosKore', []] },
+                },
+              },
               identificadoPorNombre: {
                 $let: {
                   vars: {
@@ -3502,10 +3587,43 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       },
       movimientoId:     { $arrayElemAt: ['$movimientos._id', 0] },
       identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
+      // Solo para el fallback en JS de abajo — no se exporta al Excel (no está
+      // en sheet.columns).
+      movKardexFallback: { $ifNull: [{ $arrayElemAt: ['$movimientos.movimientosKoreOrigen', 0] }, []] },
+      pagoMontoTotal:    '$complementoPago.pagos.monto',
     }},
   ];
 
   const rows = await CFDI.aggregate(pipeline).allowDiskUse(true);
+
+  // Fallback: si ni el CFDI-P (impSaldoAnt/impSaldoInsoluto propios) ni el
+  // cruce con erp_cuentas_pendientes (parcialidadInfo, ya resuelto arriba en
+  // el pipeline) lograron llenar Parcialidad/Saldo Anterior/Saldo Insoluto,
+  // se reconstruye desde el kardex embebido en bank_movements.erpLinks
+  // (movKardexFallback) — la misma CxC purgada del feed ERP que ya se
+  // resuelve así en el modal (ver construirCxcSintetica).
+  for (const r of rows) {
+    if (r.impSaldoAnt != null || r.impSaldoInsoluto != null) continue;
+    const kardex = r.movKardexFallback;
+    if (!kardex?.length) continue;
+
+    const montoPago = r.pagoMontoTotal ?? r.impPagado ?? 0;
+    const ordenado = kardex.every(mk => mk.fecha)
+      ? [...kardex].sort((a, b) => new Date(a.fecha) - new Date(b.fecha))
+      : kardex;
+    const abono = ordenado.find(mk =>
+      Math.abs((mk.formasPago ?? []).reduce((s, fp) => s + (fp.monto ?? 0), 0) - montoPago) <= 1,
+    );
+    if (!abono) continue;
+
+    r.impSaldoAnt      = abono.saldoAnterior ?? null;
+    r.impSaldoInsoluto = abono.saldoActual   ?? null;
+    if (r.numParcialidad == null) {
+      r.numParcialidad = 1 + ordenado.filter(mk =>
+        mk.fecha && abono.fecha && new Date(mk.fecha) < new Date(abono.fecha),
+      ).length;
+    }
+  }
 
   const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(rows.map(r => r.facturaUuid));
   const saldosBanco = await calcularSaldosBanco(rows.map(r => r.movimientoId));
@@ -3712,7 +3830,7 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
   )];
 
   const [cuentasPorCobrarRaw, egresosRelacionados] = await Promise.all([
-    buscarCuentasPorCobrarConMovimientos(erpIds),
+    buscarCuentasPorCobrarConMovimientos(erpIds, movimientos),
     buscarEgresosRelacionados(uuid),
   ]);
   const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura, movimientos);
@@ -4026,7 +4144,7 @@ const depositosIngresosDetalle = asyncHandler(async (req, res) => {
   )];
 
   const [cuentasPorCobrarRaw, egresosRelacionados] = await Promise.all([
-    buscarCuentasPorCobrarConMovimientos(erpIds),
+    buscarCuentasPorCobrarConMovimientos(erpIds, movimientos),
     buscarEgresosRelacionados(uuid),
   ]);
   const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura, movimientos);

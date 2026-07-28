@@ -47,6 +47,16 @@ async function findAll(filters = {}) {
       { folio:    { [Op.iLike]: q } },
     ];
   }
+  // Vista "Pólizas de Cobranza": pólizas con al menos un movimiento que viene
+  // de un CFDI de Pago (complemento de pago / cobranza de cartera), mismo
+  // marcador que usa poliza.service.js (esPagos) para el export CONTPAQ.
+  if (filters.soloCobranza === true || filters.soloCobranza === 'true') {
+    where.id = {
+      [Op.in]: sequelize.literal(
+        `(SELECT DISTINCT poliza_id FROM poliza_movimientos WHERE tipo_comprobante = 'P')`,
+      ),
+    };
+  }
 
   const page  = Math.max(1, Number(filters.page)  || 1);
   const limit = Math.min(100, Number(filters.limit) || 50);

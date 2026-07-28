@@ -64,11 +64,20 @@ router.delete('/permissions/:key', authenticate, permit('users:manage'),
 router.get('/me', authenticate,
   asyncHandler(async (req, res) => {
     const role = await roleSvc.getRoleByValue(req.user.role);
+    const empresaRfcs = req.user.empresaRfcs ?? [];
+    let empresas = [];
+    if (empresaRfcs.length) {
+      const { Entity } = require('../../../shared/models/postgres');
+      const { Op } = require('sequelize');
+      const rows = await Entity.findAll({ where: { rfc: { [Op.in]: empresaRfcs } }, attributes: ['rfc', 'nombre'], raw: true });
+      empresas = rows.map(r => ({ rfc: r.rfc, nombre: r.nombre }));
+    }
     res.json({
       dbId:        req.user.dbId,
       nombre:      req.user.nombre,
       role:        req.user.role,
       permissions: role?.permissions ?? [],
+      empresas,
     });
   }),
 );
@@ -84,6 +93,14 @@ router.get('/', authenticate, permit('users:manage'),
 router.patch('/:id/role', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
     res.json(await userSvc.updateRole(req.params.id, req.body.role));
+  }),
+);
+
+// Empresas fijas asignadas directo a este usuario (puede tener varias).
+// Body: { empresaRfcs: string[] } — reemplaza la lista completa ([] = sin restricción).
+router.patch('/:id/empresas', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    res.json(await userSvc.updateEmpresas(req.params.id, req.body.empresaRfcs));
   }),
 );
 

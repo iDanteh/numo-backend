@@ -436,12 +436,17 @@ async function generarCierreIVA({ rfc, ejercicio, periodo, user }) {
 // la MISMA cuenta de Bancos (1102011005) pero no llevan ese subcódigo, por eso
 // la agrupación también separa por formaPago y no solo por cuenta.
 const FORMA_PAGO_TRANSFERENCIA = '03';
+// c_FormaPago SAT para "Cheque nominativo" — igual que Transferencia, se
+// desglosa siempre por CFDI y solo se agrupa cuando comparte el mismo número
+// de autorización/referencia real ligado en Bancos (confirmado con el usuario
+// 2026-07-24; ver bloque de detalle en `consolidarCargos`).
+const FORMA_PAGO_CHEQUE = '02';
 
 // c_FormaPago SAT → etiqueta para las líneas consolidadas de Efectivo/Tarjeta
-// (Transferencia nunca llega aquí — se desglosa individual, ver
-// `consolidarCargos`). formaPago sin mapear (cheque, etc.) cae al bucket
-// genérico de siempre (sin etiqueta), confirmado con el usuario contra un
-// export real donde Efectivo y Tarjeta salen en cuentas/líneas separadas.
+// (Transferencia y Cheque nunca llegan aquí — se desglosan individual, ver
+// `consolidarCargos`). formaPago sin mapear (distinto de estos cuatro) cae al
+// bucket genérico de siempre (sin etiqueta), confirmado con el usuario contra
+// un export real donde Efectivo y Tarjeta salen en cuentas/líneas separadas.
 const LABEL_FORMA_PAGO_CONSOLIDADO = { '01': 'EFECTIVO', '04': 'TARJETA', '28': 'TARJETA' };
 
 // Cuentas cuyo abono en una Devolución/Cancelación SÍ debe mostrarse — a
@@ -567,29 +572,39 @@ function categorizarAjusteContado(m) {
  *   uuid CFDI → info bancaria real (ver `construirVerdadBancaria`). Cuando el
  *   CFDI está en el mapa, su dato manda sobre el `formaPago` autodeclarado.
  *
- * Efectivo, Tarjeta y Transferencia se consolidan CADA UNO en su propia
- * línea/cuenta ("Depósitos consolidados (Efectivo/Tarjeta/Transferencia)")
- * — pero SOLO cuando NO tienen un depósito bancario real identificado.
+ * Efectivo y Tarjeta se consolidan CADA UNO en su propia línea/cuenta
+ * ("Depósitos consolidados (Efectivo/Tarjeta)") — pero SOLO cuando NO tienen
+ * un depósito bancario real identificado.
  *
- * En cuanto un movimiento (sea Efectivo, Tarjeta, Transferencia o cualquier
- * otra forma de pago) SÍ tiene un número de autorización/referencia real
- * ligado en Bancos (`verdadBancaria`), se SACA del consolidado y se muestra
- * como línea individual con esa referencia como serie — confirmado con el
- * usuario con un ejemplo concreto: 3 CFDIs de Tarjeta por $1,000, dos sin
- * match bancario y uno con match, deben verse como "Tarjeta" consolidada
- * ($2,000) + 1 línea individual ($1,000) con su número de autorización, no
- * los 3 juntos. Esta línea individual ("Depósito identificado") se devuelve
- * aparte para que el caller la coloque al final del export.
+ * En cuanto un movimiento de Efectivo o Tarjeta SÍ tiene un número de
+ * autorización/referencia real ligado en Bancos (`verdadBancaria`), se SACA
+ * del consolidado y se muestra como línea individual con esa referencia como
+ * serie — confirmado con el usuario con un ejemplo concreto: 3 CFDIs de
+ * Tarjeta por $1,000, dos sin match bancario y uno con match, deben verse
+ * como "Tarjeta" consolidada ($2,000) + 1 línea individual ($1,000) con su
+ * número de autorización, no los 3 juntos. Esta línea individual ("Depósito
+ * identificado") se devuelve aparte para que el caller la coloque al final
+ * del export.
+ *
+ * Transferencia y Cheque NUNCA se consolidan en un bucket genérico (a
+ * diferencia de Efectivo/Tarjeta): cada una se muestra en su propia línea con
+ * su serie-folio real, salvo que dos o más (del mismo tipo) compartan el
+ * MISMO número de autorización/referencia real ligado en Bancos — en ese
+ * caso sí se juntan en una sola línea, porque es literalmente el mismo
+ * depósito bancario aplicado a varias facturas (confirmado con el usuario
+ * 2026-07-24). Estas líneas también se devuelven en `depositosIdentificados`,
+ * junto con Tarjeta/Depósito identificado.
  *
  * @returns {{
  *   porCategoria: { devolucion: object[], descuento: object[], bonificacion: object[], clubTuberos: object[] },
  *   anticipos: object[], consolidados: object[], depositosIdentificados: object[],
  * }} — cada arreglo ya viene ordenado por serie/folio (salvo `consolidados`,
- *   ordenado Efectivo → Tarjeta → Transferencia). El caller decide en qué
- *   secuencia los concatena (ver `aplanarCargosConsolidados` y `armarBloqueContado`).
+ *   ordenado Efectivo → Tarjeta). El caller decide en qué secuencia los
+ *   concatena (ver `aplanarCargosConsolidados` y `armarBloqueContado`).
  */
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null) {
   const grupos = new Map();
+  const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
   const porCategoria = { devolucion: [], descuento: [], bonificacion: [], clubTuberos: [] };
   const anticipos = [];              // Recepción Y Aplicación
   const depositosIdentificados = []; // forma de pago sin mapear + depósito real ligado en Bancos — va al final
@@ -655,66 +670,123 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       continue;
     }
 
-    // Depósito real identificado en Bancos (número de autorización/referencia
-    // real ligado) — SIEMPRE se saca del consolidado, sin importar la forma
-    // de pago declarada (Efectivo, Tarjeta, Transferencia, cheque, etc.):
-    // confirmado con el usuario, ver docstring. La etiqueta conserva la forma
-    // de pago real cuando se conoce, para que la línea individual siga siendo
-    // legible aunque ya no vaya agrupada.
+    // Transferencia y Cheque: SIEMPRE se detallan (nunca caen al bucket
+    // genérico de "Depósitos consolidados") — solo se agrupan entre sí las
+    // que comparten el MISMO número de autorización/referencia real
+    // (bancario.referencia), porque eso significa que son literalmente el
+    // mismo depósito bancario aplicado a varias facturas. Sin ese match, cada
+    // una queda en su propia línea (con su serie-folio propio), nunca
+    // mezclada con otra solo por compartir forma de pago (corregido
+    // 2026-07-24: antes, cualquier transferencia sin depósito bancario ligado
+    // caía al bucket genérico junto con otras transferencias no relacionadas
+    // entre sí, perdiendo el detalle por CFDI; extendido a Cheque el mismo
+    // día, mismo criterio).
+    const esChequeDeclarado = m.formaPago === FORMA_PAGO_CHEQUE;
+    if (esTransferenciaVerificada || esChequeDeclarado) {
+      const tipoDetalle = esTransferenciaVerificada ? 'TRANSFERENCIA' : 'CHEQUE';
+      const subcodigoDetalle = esTransferenciaVerificada ? subcodigoTransferencia : 0;
+      const referencia = bancario?.referencia ?? null;
+      const key = `${m.cuenta?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? `__cfdi_${m.cfdiUuid}`}`;
+      if (!gruposDetallados.has(key)) {
+        gruposDetallados.set(key, {
+          cuenta: m.cuenta, centroCosto, referencia, tipoDetalle, subcodigo: subcodigoDetalle,
+          debe: 0, detalle: [], primerMov: m,
+        });
+      }
+      const gt = gruposDetallados.get(key);
+      gt.debe += Number(m.debe);
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: tipoDetalle });
+      continue;
+    }
+
+    // Depósito real identificado en Bancos (Tarjeta u otra forma de pago con
+    // número de autorización/referencia real ligado; Transferencia y Cheque
+    // ya se manejaron arriba) — SIEMPRE se saca del consolidado. La etiqueta
+    // conserva la forma de pago real cuando se conoce, para que la línea
+    // individual siga siendo legible aunque ya no vaya agrupada.
     if (bancario?.referencia) {
-      const etiquetaIdentificado = esTransferenciaVerificada ? 'Transferencia'
-        : LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'Tarjeta'
+      const etiquetaIdentificado = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'Tarjeta'
         : 'Depósito identificado';
-      depositosIdentificados.push(armarIndividual(
-        etiquetaIdentificado,
-        esTransferenciaVerificada ? subcodigoTransferencia : 0,
-        null,
-        bancario.referencia,
-      ));
+      depositosIdentificados.push(armarIndividual(etiquetaIdentificado, 0, null, bancario.referencia));
       continue;
     }
 
     // Sin depósito real que mostrar: se consolida por la forma de pago
-    // declarada (Efectivo, Tarjeta o Transferencia — cada una en su propia
-    // línea/cuenta).
-    const label = esTransferenciaVerificada ? 'TRANSFERENCIA'
-      : LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'TARJETA'
+    // declarada (Efectivo o Tarjeta — cada una en su propia línea/cuenta;
+    // Transferencia y Cheque ya se manejaron arriba, nunca llegan aquí).
+    const label = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'TARJETA'
       : LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] ?? null;
 
     const key = `${m.cuenta?.codigo}|${centroCosto}|${label ?? ''}`;
     if (!grupos.has(key)) {
-      grupos.set(key, { cuenta: m.cuenta, centroCosto, label, algunaTransferenciaVerificada: false, debe: 0, detalle: [] });
+      grupos.set(key, { cuenta: m.cuenta, centroCosto, label, debe: 0, detalle: [] });
     }
     const g = grupos.get(key);
     g.debe += Number(m.debe);
-    if (esTransferenciaVerificada) g.algunaTransferenciaVerificada = true;
     // Se guarda qué CFDI aportó cada monto — no va en la póliza de CONTPAQ
     // (esa línea sigue sin serie/folio, sigue siendo un total agregado), pero
     // permite armar la hoja de desglose para poder rastrear el detalle.
     g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null });
   }
 
-  // Efectivo → Tarjeta → Transferencia → resto, siempre en ese orden dentro
-  // de los cargos consolidados (confirmado con el usuario).
-  const ORDEN_LABEL_CONSOLIDADO = { EFECTIVO: 0, TARJETA: 1, TRANSFERENCIA: 2 };
+  // Efectivo → Tarjeta → resto, siempre en ese orden dentro de los cargos
+  // consolidados (confirmado con el usuario). Transferencia y Cheque nunca
+  // llegan a este bucket (ver arriba) — se arman aparte más abajo, dentro de
+  // `depositosIdentificados` (bucle sobre `gruposDetallados`).
+  const ORDEN_LABEL_CONSOLIDADO = { EFECTIVO: 0, TARJETA: 1 };
   const consolidados = [...grupos.values()]
     .map(g => ({
       cuenta:      g.cuenta,
       serie:       g.label ?? '',
-      concepto:    g.label === 'EFECTIVO'      ? 'Depósitos consolidados (Efectivo)'
-                 : g.label === 'TARJETA'       ? 'Depósitos consolidados (Tarjeta)'
-                 : g.label === 'TRANSFERENCIA' ? 'Depósitos consolidados (Transferencia)'
+      concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
+                 : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
                  : 'Depósitos consolidados',
       centroCosto: g.centroCosto,
       debe:        g.debe,
       haber:       0,
       cfdiUuid:    null,
-      _subcodigo:  g.algunaTransferenciaVerificada ? subcodigoTransferencia : 0,
+      _subcodigo:  0,
       _detalle:    g.detalle,
-      _esTransferencia: g.algunaTransferenciaVerificada,
+      _esTransferencia: false,
       _esResto:    true,
     }))
-    .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 3) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 3));
+    .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 2) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 2));
+
+  // Transferencia y Cheque detallados: una línea por CFDI, salvo cuando dos o
+  // más comparten el mismo número de autorización/referencia real
+  // (bancario.referencia) — en ese caso sí se consolidan en una sola línea,
+  // porque es literalmente el mismo depósito bancario aplicado a varias
+  // facturas. Se agregan a `depositosIdentificados` para conservar el mismo
+  // lugar en el export (al final, junto con Tarjeta/Depósito identificado)
+  // que ya tenían las transferencias con match bancario antes de este cambio.
+  // Individual: "Cliente / Serie-Folio Transferencia" (o "Cheque") — mismo
+  // patrón que Devolución, que agrega "DEV" al final de la serie (confirmado
+  // con el usuario 2026-07-24). Agrupada (mismo número de autorización real
+  // en 2+ CFDIs): sin cliente único que mostrar, solo la etiqueta.
+  const ETIQUETA_TIPO_DETALLE = { TRANSFERENCIA: 'TRANSFERENCIA', CHEQUE: 'CHEQUE' };
+  for (const gt of gruposDetallados.values()) {
+    const m = gt.primerMov;
+    const etiqueta = ETIQUETA_TIPO_DETALLE[gt.tipoDetalle];
+    const esGrupo = gt.detalle.length > 1;
+    const nombre = nombresClientes?.get((m.cfdiUuid || '').toUpperCase()) || '';
+    const serieFinal = gt.referencia ?? (m.serie || '');
+    // Individual (un solo CFDI): la columna C (serie) pasa a mostrar el TIPO
+    // ("Transferencia"/"Cheque") en vez del serie-folio — el serie-folio se
+    // conserva en el concepto (columna H) junto al cliente, sin repetir la
+    // etiqueta ahí. Confirmado con el usuario 2026-07-28. Agrupada (mismo
+    // número de autorización real en 2+ CFDIs): sin cambios — la columna C
+    // sigue mostrando la referencia bancaria real (gt.referencia), dato que
+    // se perdería si también se reemplazara por la etiqueta.
+    const concepto = esGrupo ? etiqueta : ([nombre, serieFinal].filter(Boolean).join(' / ') || etiqueta);
+    const serieColumnaC = esGrupo ? serieFinal : etiqueta;
+    depositosIdentificados.push({
+      cuenta: gt.cuenta, serie: serieColumnaC, concepto,
+      centroCosto: gt.centroCosto, debe: gt.debe, haber: 0,
+      cfdiUuid: esGrupo ? null : m.cfdiUuid, _subcodigo: gt.subcodigo,
+      _categoria: null,
+      ...(esGrupo ? { _detalle: gt.detalle, _esTransferencia: gt.tipoDetalle === 'TRANSFERENCIA', _esResto: true } : {}),
+    });
+  }
 
   // Cada arreglo se ordena internamente por serie/folio ascendente — antes
   // quedaban en el orden en que llegaron los CFDIs de entrada (arbitrario).
@@ -737,7 +809,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
  * Aplana el resultado de `consolidarCargos` en el orden legado (usado por el
  * bloque de Pagos/PPD, que no tiene el reordenamiento especial de Contado):
  * Devolución, Descuento, Bonificación, Club Tuberos, Anticipos, cargos
- * consolidados (Efectivo/Tarjeta/Transferencia) y, al final, Depósito
+ * consolidados (Efectivo/Tarjeta) y, al final, Transferencia/Depósito
  * identificado.
  */
 function aplanarCargosConsolidados(resultado) {
@@ -913,10 +985,11 @@ function bloquesAjustesContado(movs) {
  *   1. Ventas normales — incluye Devolución/Cancelación y Bonificación
  *      genérica (Descuento igual) — una sola secuencia por serie/folio.
  *   2. Bonificación Club Tuberos — su propia sección, por serie/folio.
- *   3. Cargo consolidado por forma de pago: Efectivo, Tarjeta, Transferencia.
+ *   3. Cargo consolidado por forma de pago: Efectivo, Tarjeta.
  *   4. Anticipos y saldo a favor (Recepción y Aplicación), por serie/folio.
- *   5. Depósito identificado (forma de pago sin mapear con depósito bancario
- *      real ligado) — al final del export.
+ *   5. Transferencia (siempre detallada por CFDI, o agrupada cuando comparte
+ *      número de autorización real) y Depósito identificado (forma de pago
+ *      sin mapear con depósito bancario real ligado) — al final del export.
  */
 // `separarCategorias` (usado solo para la sucursal CEDIS — ver exportContpaqXlsx):
 // cuando es `true`, Bonificación (genérica + Club Tuberos) y Descuento/Devolución
@@ -1277,6 +1350,25 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
+  // Sin anchos de columna, Excel muestra "#######" en celdas numéricas/fecha
+  // que no entran en el ancho default (~8.4) — ej. columna B con "dd/mm/yyyy"
+  // (10 caracteres). Solo afecta la vista en Excel, nunca el valor real de la
+  // celda que lee CONTPAQ. Anchos cubren tanto la fila 'P' (encabezado, 10
+  // columnas) como 'M1' (detalle, 9 columnas, desplazadas — concepto cae en
+  // la columna H, no G) y 'AD' (2 columnas).
+  sheet.columns = [
+    { width: 6 },   // A: marcador P/M1/AD
+    { width: 14 },  // B: fecha (P) / cuenta contable (M1)
+    { width: 10 },  // C: tipo póliza (P) / serie (M1)
+    { width: 10 },  // D: folio (P) / cargo-abono (M1)
+    { width: 16 },  // E: '1' (P) / monto (M1)
+    { width: 10 },  // F: '0' (P) / subcódigo (M1)
+    { width: 65 },  // G: concepto del encabezado (P)
+    { width: 50 },  // H: '11' (P) / concepto del movimiento (M1)
+    { width: 14 },  // I: '0' (P) / centro de costo (M1)
+    { width: 10 },  // J: '0' (P)
+  ];
+
   // Detalle de qué CFDIs componen cada línea consolidada (Depósitos/Anticipos) —
   // esas líneas de la póliza no llevan serie/folio propio por ser un total
   // agregado; este arreglo alimenta la hoja "Desglose Consolidado" para poder
@@ -1284,8 +1376,12 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
   const desgloseConsolidado = [];
 
   for (const bloque of bloques) {
-    // La columna Fecha del encabezado en el archivo real es una celda de fecha
-    // genuina (ctype XL_CELL_DATE, formato "m/d/yy"), no un número plano.
+    // La columna Fecha del encabezado es una celda de fecha genuina (ctype
+    // XL_CELL_DATE), no un número plano ni texto — CONTPAQ lee el valor real
+    // de la celda, no el formato de despliegue, así que cambiar `numFmt` es
+    // seguro para la importación. Formato "dd/mm/yyyy" (ej. "09/07/2026", con
+    // cero a la izquierda en día/mes) confirmado con el usuario 2026-07-24;
+    // antes usaba "m/d/yy" (formato de EE.UU., sin ceros a la izquierda).
     // "- DEV" solo aplica al encabezado cuando el bloque completo es de
     // Descuentos/Devoluciones (CEDIS) — el resto de bloques (Ventas, Crédito,
     // Pagos, Bonificaciones) no debe llevarlo (confirmado con el usuario
@@ -1304,7 +1400,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
       '0',
       '0',
     ]);
-    headerRow.getCell(2).numFmt = 'm/d/yy';
+    headerRow.getCell(2).numFmt = 'dd/mm/yyyy';
     headerRow.eachCell({ includeEmpty: true }, (cell) => {
       cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF000000' } };

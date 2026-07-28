@@ -40,6 +40,25 @@ function tipoSaldoEspecial(f) {
   return null;
 }
 
+// Puerto exacto de _matchBancoDefault() en cobro-panel.component.ts — resuelve
+// el banco de Kore que corresponde al `banco` del BankMovement identificado
+// (ej. "BBVA"), para poder mandar BancoID al aplicar el cobro automático (ver
+// identificar() en collection-request.service.js). A diferencia del panel
+// manual, acá no hay un humano confirmando el banco en pantalla antes de
+// aplicar — el usuario confirmó (2026-07-28) que igual quiere el mismo
+// fallback: si no hay match, usar bancos[0] (el primero del catálogo) en vez
+// de dejar el cobro sin BancoID.
+function matchBancoDefault(bancos, movBanco) {
+  const banco = (movBanco ?? '').toUpperCase().trim();
+  if (!banco) return bancos[0] ?? null;
+  return (
+    bancos.find(b => b.claveBanco.toUpperCase() === banco) ??
+    bancos.find(b => banco.includes(b.claveBanco.toUpperCase()) || b.claveBanco.toUpperCase().includes(banco)) ??
+    bancos.find(b => b.descripcion.toUpperCase().includes(banco) || banco.includes(b.descripcion.toUpperCase())) ??
+    bancos[0] ?? null
+  );
+}
+
 // erpLinks[] a pasar a bankService.setErpIds() — mismo cálculo que
 // _buildCobroSaldosErp() en cobro-panel.component.ts:
 //   - saldoActual: saldo EN VIVO de Kore (antes de este cobro) menos lo pagado ahora.
@@ -111,4 +130,4 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
   return [...preservados, ...nuevos];
 }
 
-module.exports = { normFormaPago, esFormaBancaria, tipoSaldoEspecial, buildErpLinksParaCobro };
+module.exports = { normFormaPago, esFormaBancaria, tipoSaldoEspecial, matchBancoDefault, buildErpLinksParaCobro };

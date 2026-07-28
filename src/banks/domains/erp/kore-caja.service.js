@@ -16,6 +16,11 @@ const KORE_AUTH_URL      = (process.env.KORE_AUTH_URL      || 'https://app.login
 const KORE_SERVICIO      = process.env.KORE_SERVICIO       || '6491faf156358100016565e5';
 const KORE_CAJA_URL      = (process.env.KORE_CAJA_URL      || 'https://test.cajas.koreingenieria.com/index');
 const KORE_CAJA_BASE_URL = (process.env.KORE_CAJA_BASE_URL || 'https://test.cajas.koreingenieria.com');
+// Catálogos de bancos y formas de pago — antes exclusivos de erp.routes.js
+// (GET /cobros/bancos, /formas-pago); se movieron acá 2026-07-28 para que
+// collection-request.service.js pueda resolver BancoID al aplicar un cobro
+// automático, con el MISMO criterio que ya usa el panel de cobros manual.
+const KORE_FORMASPAGO_BASE_URL = (process.env.KORE_FORMASPAGO_BASE_URL || 'https://test.formaspagos.koreingenieria.com');
 
 // Token Kore por usuario — se guarda cuando verifica sesión de caja, se usa en
 // los proxies de cobros de erp.routes.js (getKoreToken). Compartido entre
@@ -146,6 +151,45 @@ async function obtenerCuentasKore(koreToken, ids) {
       diasTolerancia: d.DiasTolerancia ?? 0,
     })),
   }));
+}
+
+// Catálogo de bancos de Kore — mismo mapeo que ya usaba GET /cobros/bancos en
+// erp.routes.js (movido acá 2026-07-28 para compartirlo con
+// collection-request.service.js). Filtra bancos inactivos, igual que antes.
+async function listarBancos(koreToken) {
+  const r = await axios.get(`${KORE_FORMASPAGO_BASE_URL}/api/bancos`, {
+    headers: { Authorization: `Bearer ${koreToken}` },
+    timeout: 10000,
+  });
+  return (r.data?.Data ?? [])
+    .filter(b => b.Activo !== false)
+    .map(b => ({
+      id:          b.ID,
+      nombre:      b.Nombre       ?? '',
+      claveBanco:  b.ClaveBanco   ?? '',
+      descripcion: b.Descripcion  ?? '',
+    }));
+}
+
+// Catálogo de formas de pago de Kore — mismo mapeo que ya usaba GET
+// /formas-pago en erp.routes.js (movido acá por el mismo motivo que
+// listarBancos). claveSAT sirve para replicar el mismo criterio que ya usa
+// cobro-panel.component.ts (_mapFormaPago: requiereBanco = claveSAT === '03')
+// al decidir si una forma de pago necesita BancoID.
+async function listarFormasPago(koreToken) {
+  const r = await axios.get(`${KORE_FORMASPAGO_BASE_URL}/api/formasdepago`, {
+    headers: { Authorization: `Bearer ${koreToken}` },
+    timeout: 10000,
+  });
+  return (r.data?.Data ?? [])
+    .filter(f => f.Estatus === true)
+    .map(f => ({
+      id:             f.ID,
+      nombre:         f.Nombre,
+      claveSAT:       f.ClaveSAT,
+      esBancarizada:  f.EsBancarizada  ?? false,
+      reqNombreBanco: f.ReqNombreBanco ?? false,
+    }));
 }
 
 // Kore puede rechazar la aplicación de un cobro con "hasta resolver las
@@ -301,9 +345,12 @@ module.exports = {
   KORE_SERVICIO,
   KORE_CAJA_URL,
   KORE_CAJA_BASE_URL,
+  KORE_FORMASPAGO_BASE_URL,
   obtenerTokenKore,
   obtenerSesionCaja,
   obtenerCuentasKore,
+  listarBancos,
+  listarFormasPago,
   aplicarCobroOperacion,
   aplicarSolicitudOperacion,
   aplicarCobroOperacionMultiple,

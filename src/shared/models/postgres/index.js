@@ -229,6 +229,39 @@ async function syncModels() {
     ALTER TABLE polizas
       ADD COLUMN IF NOT EXISTS sustitutos_excluidos JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN sustitutos_excluidos:', e.message));
+
+  // El índice único (tipo, numero, rfc, ejercicio, periodo) bloqueaba para
+  // siempre el folio de una póliza cancelada (la fila sigue existiendo,
+  // solo con estado='cancelada') — impedía reutilizar ese folio en una
+  // futura generación aunque el rango por sucursal ya lo diera por libre.
+  // Se reemplaza por un índice PARCIAL (solo cubre filas no canceladas) para
+  // que cancelar una póliza libere su folio de verdad (confirmado con el
+  // usuario 2026-07-27). Sequelize no migra este cambio solo con la
+  // definición del modelo — DROP + CREATE explícito, idempotente.
+  await Poliza.sequelize.query(`
+    DROP INDEX IF EXISTS polizas_tipo_numero_rfc_ejercicio_periodo
+  `).catch(e => console.warn('[syncModels] DROP INDEX polizas_tipo_numero_rfc_ejercicio_periodo:', e.message));
+
+  await Poliza.sequelize.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS polizas_tipo_numero_rfc_ejercicio_periodo
+      ON polizas (tipo, numero, rfc, ejercicio, periodo)
+      WHERE estado != 'cancelada'
+  `).catch(e => console.warn('[syncModels] CREATE INDEX parcial polizas_tipo_numero_rfc_ejercicio_periodo:', e.message));
+
+  // Empresas fijas por usuario individual (idempotente) — ver User.js. Se
+  // asignan desde la pantalla de Roles (selección múltiple de usuarios +
+  // empresa) — no hay default por rol. Un usuario puede tener varias, por
+  // eso es ARRAY y no una sola columna VARCHAR (confirmado con el usuario
+  // 2026-07-28, corrigiendo el diseño de un solo RFC del mismo día).
+  await User.sequelize.query(`
+    ALTER TABLE users
+      DROP COLUMN IF EXISTS empresa_rfc
+  `).catch(e => console.warn('[syncModels] DROP COLUMN empresa_rfc (users):', e.message));
+
+  await User.sequelize.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS empresa_rfcs VARCHAR(20)[] NOT NULL DEFAULT '{}'
+  `).catch(e => console.warn('[syncModels] ADD COLUMN empresa_rfcs (users):', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

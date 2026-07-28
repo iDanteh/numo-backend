@@ -68,6 +68,9 @@ async function resolveUser(payload, req, res, next) {
       nombre: userDoc.nombre || payload[NOMBRE_CLAIM] || '',
       email:  userDoc.email  || payload[EMAIL_CLAIM]  || '',
       role:   userDoc.role,
+      // Empresas fijas asignadas directo al usuario (puede tener varias) —
+      // [] = sin restricción, puede elegir cualquier empresa.
+      empresaRfcs: userDoc.empresaRfcs ?? [],
     };
 
     next();

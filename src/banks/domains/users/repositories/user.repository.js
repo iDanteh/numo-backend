@@ -78,6 +78,11 @@ async function updateActive(id, isActive) {
   return User.findByPk(id);
 }
 
+async function updateEmpresas(id, empresaRfcs) {
+  await User.update({ empresaRfcs }, { where: { id } });
+  return User.findByPk(id);
+}
+
 async function create(data) {
   return User.create(data);
 }
@@ -91,5 +96,6 @@ module.exports = {
   findById,
   updateRole,
   updateActive,
+  updateEmpresas,
   create,
 };

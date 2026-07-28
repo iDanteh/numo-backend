@@ -19,6 +19,7 @@ const { ERP_TOLERANCE }                  = require('../banks/bank.service');
 const {
   KoreCajaError, koreTokenCache, KORE_CAJA_BASE_URL,
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
+  listarBancos, listarFormasPago,
 }                                         = require('./kore-caja.service');
 
 const uploadCyc = multer({
@@ -31,11 +32,6 @@ const uploadCyc = multer({
 });
 
 const router = express.Router();
-
-// KORE_FORMASPAGO_BASE_URL es exclusivo de este archivo (catálogo de bancos y
-// formas de pago) — las demás constantes/funciones de Kore-caja viven en
-// kore-caja.service.js (importado arriba) y se comparten desde ahí.
-const KORE_FORMASPAGO_BASE_URL = (process.env.KORE_FORMASPAGO_BASE_URL || 'https://test.formaspagos.koreingenieria.com');
 
 const ERP_PAGE_SIZE = 50;
 
@@ -371,23 +367,7 @@ router.get('/formas-pago', authenticate, asyncHandler(async (req, res) => {
   const koreToken = getKoreToken(req, res);
   if (!koreToken) return;
 
-  const response = await axios.get(`${KORE_FORMASPAGO_BASE_URL}/api/formasdepago`, {
-    headers: { Authorization: `Bearer ${koreToken}` },
-    timeout: 10000,
-  });
-
-  const raw = response.data?.Data ?? [];
-  const formas = raw
-    .filter(f => f.Estatus === true)
-    .map(f => ({
-      id:             f.ID,
-      nombre:         f.Nombre,
-      claveSAT:       f.ClaveSAT,
-      esBancarizada:  f.EsBancarizada  ?? false,
-      reqNombreBanco: f.ReqNombreBanco ?? false,
-    }));
-
-  res.json(formas);
+  res.json(await listarFormasPago(koreToken));
 }));
 
 // ── Helpers de cobros ────────────────────────────────────────────────────────
@@ -422,22 +402,7 @@ router.get('/cobros/bancos', authenticate, asyncHandler(async (req, res) => {
   const koreToken = getKoreToken(req, res);
   if (!koreToken) return;
 
-  console.log(`[cobros/bancos] llamando a ${KORE_FORMASPAGO_BASE_URL}/api/bancos`);
-  const r = await axios.get(`${KORE_FORMASPAGO_BASE_URL}/api/bancos`, {
-    headers: { Authorization: `Bearer ${koreToken}` },
-    timeout: 10000,
-  });
-
-  const bancos = (r.data?.Data ?? [])
-    .filter(b => b.Activo !== false)
-    .map(b => ({
-      id:          b.ID,
-      nombre:      b.Nombre       ?? '',
-      claveBanco:  b.ClaveBanco   ?? '',
-      descripcion: b.Descripcion  ?? '',
-    }));
-
-  res.json(bancos);
+  res.json(await listarBancos(koreToken));
 }));
 
 // GET /api/erp/cobros/conceptos — conceptos de caja tipo ENTRADA

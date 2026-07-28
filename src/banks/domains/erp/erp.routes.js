@@ -758,8 +758,18 @@ function _esFormaPagoBancariaKore(nombreFormaPago) {
 // conscientemente: puede volver a inflar saldoErp si Kore trae una aplicación de saldo a
 // favor/anticipo/tarjeta como parte de la misma cuenta — no "corregir" este comentario sin
 // que el usuario lo pida de nuevo.
+// NO se gatea por `raw0.saldoActual` aquí (fix 2026-07-28, folio 036789): este guard vivió
+// aquí desde el diseño original, cuando el ÚNICO llamador (_syncErpKoreJob) ya garantizaba
+// saldoActual<=0 antes de invocar la función — redundante ahí, pero cuando
+// _recomputeErpKoreJob empezó a llamarla directamente sobre links YA finalizados (para
+// backfillear con el Kore más fresco), el guard se volvió activo y destructivo: el saldo de
+// una CxC en Kore NO es monótono (una retención/bonificación puede revertirse después con un
+// ABO y reabrir saldoActual por encima de 0 aunque el pago bancario original siga intacto en
+// el historial) — el guard descartaba a 0 un aporte real y ya confirmado solo porque el saldo
+// ACTUAL (no el de cuando se cerró) volvió a ser positivo. Ambas funciones ahora solo suman lo
+// que el historial de `movimientos` diga, sin importar el saldo vigente.
 function _montoSaldoLink(raw0) {
-  if (!raw0 || raw0.saldoActual > 0) return 0;
+  if (!raw0) return 0;
   const conFormaPago = (raw0.movimientos ?? []).filter(
     m => Array.isArray(m.formasPago) && m.formasPago.length > 0,
   );
@@ -769,13 +779,84 @@ function _montoSaldoLink(raw0) {
 // Bancario-only: mismo criterio que tenía _montoSaldoLink ANTES del cambio del 2026-07-17
 // (transferencia/cheque/depósito en efectivo, vía _esFormaPagoBancariaKore), aplicado ahora
 // para backfillear `saldoPagado` (bancario-only) mientras saldoErpAportado/saldoPagadoTotal
-// siguen sumando TODAS las formas de pago — ver _recomputeErpKoreJob.
+// siguen sumando TODAS las formas de pago — ver _recomputeErpKoreJob. Ya no se usa desde
+// _recomputeErpKoreJob/_syncErpKoreJob (ver _montoSaldoLinkPorMovimiento) — se deja solo
+// para el script CLI deprecado (recompute-saldo-erp-todas-formas-pago.js).
 function _montoSaldoLinkBancario(raw0) {
-  if (!raw0 || raw0.saldoActual > 0) return 0;
+  if (!raw0) return 0;
   const conFormaBancaria = (raw0.movimientos ?? []).filter(
     m => Array.isArray(m.formasPago) && m.formasPago.some(fp => _esFormaPagoBancariaKore(fp.nombreFormaPago)),
   );
   return conFormaBancaria.reduce((sum, m) => sum + Math.abs(m.total ?? 0), 0);
+}
+
+// Compara el `Aut`/`Numo` de un forma-de-pago de Kore contra la identidad de ESTE
+// movimiento bancario — dos señales redundantes porque Kore no las usa de forma
+// consistente: "Numo" suele traer el numeroAutorizacion real del banco (cuando Numo aplicó
+// el cobro), "Aut" suele traer el FOLIO de Numo (confirmado 2026-07-28 con datos reales de
+// producción — folios 036789/033439/033764/036170: su propio `Aut` siempre es idéntico a su
+// `folio`, nunca al numeroAutorizacion). Se aceptan ambas coincidencias porque una misma CxC
+// puede traer movimientos tageados con una u otra según cómo Kore/Numo aplicó cada pago.
+function _perteneceAEsteMovimiento(fp, mov) {
+  const autNormMov = _normalizarAutorizacion(mov.numeroAutorizacion);
+  const numoTag    = (fp.adicionales ?? []).find(a => a.nombre === 'Numo');
+  if (numoTag && autNormMov && _normalizarAutorizacion(numoTag.valor) === autNormMov) return true;
+  const autTag = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
+  if (autTag && String(autTag.valor ?? '').trim() === String(mov.folio ?? '').trim()) return true;
+  return false;
+}
+
+// Aporte NETO (no suma de valores absolutos) que corresponde específicamente a ESTE
+// movimiento bancario, para vínculos HUMANOS — reemplaza a _montoSaldoLink en
+// _syncErpKoreJob/_recomputeErpKoreJob (fix 2026-07-28, folios 033439/033764/036170).
+// _montoSaldoLink sumaba abs(total) de CUALQUIER movimiento con formasPago, sin importar
+// (a) si un ciclo aplicar→revertir→reaplicar (series ABO→RAB→ABO, confirmado con Kore real)
+// triplicaba el mismo pago, o (b) si la CxC recibió pagos de VARIOS depósitos bancarios
+// distintos a lo largo del tiempo (caso real: folioExterno 260601153 recibió pagos de los
+// movimientos 033439 Y 033764), atribuyendo a este movimiento dinero que entró por otro.
+//
+// Algoritmo: recorre los movimientos con formaPago en orden cronológico, sumando CON SIGNO
+// (no absoluto) a un acumulador "mío" (su Aut/Numo coincide con ESTE movimiento, ver
+// _perteneceAEsteMovimiento) o "de otro" (coincide con una autorización distinta — sabemos
+// que no es nuestro). Las reversas (series RAB u otras) casi nunca traen Aut/Numo de
+// vuelta — se atribuyen al acumulador cuyo neto actual coincide EXACTAMENTE en magnitud
+// opuesta (una reversa, por definición, cancela algo que ya estaba ahí; si no cancela nada
+// con exactitud, se ignora — no se inventa a qué autorización pertenece). Sumar con signo
+// hace que un ciclo aplicar→revertir→reaplicar quede en el último valor vigente, sin
+// triplicar. Devuelve null (nunca 0) si nunca hubo una coincidencia propia — "no
+// determinado" evita pisar un saldoErp ya correcto con un cero falso.
+function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) {
+  if (!raw0) return null;
+  const conFormaPago = (raw0.movimientos ?? []).filter(
+    m => Array.isArray(m.formasPago) && m.formasPago.some(incluirFormaPago),
+  );
+
+  let miNeto = 0;
+  let otroNeto = 0;
+  let huboCoincidenciaPropia = false;
+
+  for (const m of conFormaPago) {
+    const esMio    = m.formasPago.some(fp => _perteneceAEsteMovimiento(fp, mov));
+    const esDeOtro = !esMio && m.formasPago.some(fp =>
+      (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut'),
+    );
+    const total = m.total ?? 0;
+
+    if (esMio) {
+      miNeto += total;
+      huboCoincidenciaPropia = true;
+    } else if (esDeOtro) {
+      otroNeto += total;
+    } else if (miNeto !== 0 && Math.abs(miNeto + total) < 0.01) {
+      miNeto += total; // reversa sin tag — cancela lo que ya llevaba "mío"
+    } else if (otroNeto !== 0 && Math.abs(otroNeto + total) < 0.01) {
+      otroNeto += total; // reversa sin tag — cancela lo que ya llevaba "de otro"
+    }
+    // si una reversa sin tag no cancela ningún acumulador con magnitud exacta, se ignora:
+    // no se puede atribuir con certeza y preferimos no adivinar.
+  }
+
+  return huboCoincidenciaPropia ? Math.abs(miNeto) : null;
 }
 
 // Deriva saldoPagado/saldoPagadoTotal/folioFiscal de un erpLink a partir de la respuesta de
@@ -788,10 +869,22 @@ function _montoSaldoLinkBancario(raw0) {
 // (CxC cerrada de forma limpia) se acepta folioFiscal null para siempre (Kore no tiene por
 // qué facturar esa CxC nunca); si saldoActual!==0 (saldo a favor/retención, todavía "en
 // movimiento") vale la pena seguir reintentando.
-function _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporteNuevo) {
-  const saldoPagadoTotal = aporteNuevo;
-  const saldoPagado      = esHumano ? _montoSaldoLinkBancario(raw0) : aporteNuevo;
-  const folioFiscal      = link.folioFiscal ?? raw0.folioFiscal ?? null;
+function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo) {
+  // aporteNuevo/saldoPagadoCalc ahora pueden venir en null (_montoSaldoLinkPorMovimiento no
+  // encontró coincidencia propia) — se conserva el valor previo del link en vez de pisarlo
+  // con un cero falso (mismo criterio de "no determinado" != "cero" del resto del archivo).
+  const saldoPagadoTotal   = aporteNuevo ?? link.saldoPagadoTotal ?? null;
+  const saldoPagadoCalc    = esHumano
+    ? _montoSaldoLinkPorMovimiento(raw0, mov, fp => _esFormaPagoBancariaKore(fp.nombreFormaPago))
+    : aporteNuevo;
+  const saldoPagado      = saldoPagadoCalc ?? link.saldoPagado ?? null;
+  // Fix 2026-07-28 (folio 034310): Kore puede devolver folioFiscal como '' (string vacío) en
+  // vez de null/ausente cuando el CFDI todavía no existe. `??` no trata '' como "ausente" (no
+  // es null/undefined) — antes, en cuanto raw0.folioFiscal llegaba como '', ese '' se guardaba
+  // en el link para siempre y NUNCA se volvía a revisar Kore (link.folioFiscal ?? ... siempre
+  // devolvía el '' ya guardado). El `||` sí normaliza '' a "ausente", igual que null/undefined
+  // — seguro aquí porque folioFiscal es un UUID/string, nunca un 0/false legítimo.
+  const folioFiscal = (link.folioFiscal || null) ?? (raw0.folioFiscal || null) ?? null;
   // Una CxC puede llegar a saldoActual===0 por una RETENCIÓN/bonificación (serie 'RET') en
   // vez de un pago bancario completo — en ese caso Kore puede timbrar el CFDI DESPUÉS de que
   // el saldo ya cerró en 0 (caso real: folio 036827, cerrado por retención el mismo día en
@@ -802,6 +895,33 @@ function _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporteNuevo) {
   const tieneRetencion = (raw0.movimientos ?? []).some(m => m.serie === 'RET');
   const folioFiscalPendiente = folioFiscal == null && (raw0.saldoActual !== 0 || tieneRetencion);
   return { saldoPagadoTotal, saldoPagado, folioFiscal, folioFiscalPendiente };
+}
+
+// Retención NETA vigente ahora mismo (para los campos persistidos link.tieneRetencion/
+// link.montoRetenido, que alimentan el reporte "Retención" de bank.service.js) — fix
+// 2026-07-28 (folio 036789): la implementación vieja sumaba abs(total) de movimientos con
+// serie==='RET', pero una retención puede revertirse después vía un movimiento que NO trae
+// serie 'RET' (caso real: un 'ABO' con el monto exacto en positivo) — filtrar por serie no
+// alcanza para detectar la reversa, así que una retención ya cancelada se seguía contando
+// como vigente para siempre. La señal robusta es la AUSENCIA de `formasPago`: tanto una
+// retención como su reversa son ajustes contables internos (nunca dinero real de banco), a
+// diferencia de un cobro/abono real que siempre trae formasPago. Sumar CON SIGNO (no abs)
+// hace que una retención + su reversa exacta neteen a cero, dejando solo lo que sigue
+// genuinamente retenido. Se descarta el primer movimiento (el cargo original, mismo criterio
+// que _movimientosKoreDesde) porque nunca es un abono/ajuste y arruinaría el neto.
+//
+// OJO: distinto del `tieneRetencion` local de _backfillFormasPagoYFolioFiscal (arriba,
+// "¿alguna vez hubo un RET?", más laxo a propósito) — ese sigue intacto porque gatea el
+// reintento de folioFiscal y preferimos que sea conservador (seguir reintentando de más es
+// seguro; no es lo que se pidió corregir acá).
+function _retencionVigente(raw0) {
+  const movsNoBancarios = (raw0?.movimientos ?? []).slice(1).filter(
+    m => !Array.isArray(m.formasPago) || m.formasPago.length === 0,
+  );
+  const neto = movsNoBancarios.reduce((s, m) => s + (m.total ?? 0), 0);
+  const tieneRetencion = Math.abs(neto) > 0.01;
+  const montoRetenido  = tieneRetencion ? Math.abs(neto) : null;
+  return { tieneRetencion, montoRetenido };
 }
 
 // Deja solo dígitos y quita ceros a la izquierda — Kore antepone "REF " a algunas
@@ -966,7 +1086,7 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
     if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
 
     const movements = await BankMovement.find(filter)
-      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor')
+      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor numeroAutorizacion')
       .lean();
 
     let procesados = 0, actualizados = 0, pendientes = 0, errores = 0;
@@ -1034,20 +1154,27 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
           // link) — una retención puede llegar después de que el link ya existía (ej. la CxC
           // se pagó por completo y semanas más tarde Kore aplicó una retención fiscal), y sin
           // este refresh el reporte "Retención" (bank.service.js) quedaría desactualizado para
-          // siempre en esos casos. Mismo criterio que usa el motor automático al crear el
-          // link (bank-autorizaciones.service.js): movimientos con serie 'RET'. montoRetenido
-          // suma su `total` en valor absoluto — evita recorrer movimientosKore para saber
-          // cuánto está retenido ahora mismo.
-          const movsRetencion = (raw0?.movimientos ?? []).filter(m => m.serie === 'RET');
-          const tieneRetencionAhora = movsRetencion.length > 0;
-          const montoRetenidoAhora  = tieneRetencionAhora
-            ? movsRetencion.reduce((s, m) => s + Math.abs(m.total ?? 0), 0)
-            : null;
-          if (tieneRetencionAhora !== (link.tieneRetencion ?? false)) {
-            linksActualizados[i].tieneRetencion = tieneRetencionAhora;
+          // siempre en esos casos. Ver _retencionVigente (neto, no suma de absolutos — una
+          // retención revertida más tarde por Kore no debe seguir contando como vigente).
+          const retencionAhora = _retencionVigente(raw0);
+          if (retencionAhora.tieneRetencion !== (link.tieneRetencion ?? false)) {
+            linksActualizados[i].tieneRetencion = retencionAhora.tieneRetencion;
           }
-          if (montoRetenidoAhora !== (link.montoRetenido ?? null)) {
-            linksActualizados[i].montoRetenido = montoRetenidoAhora;
+          if (retencionAhora.montoRetenido !== (link.montoRetenido ?? null)) {
+            linksActualizados[i].montoRetenido = retencionAhora.montoRetenido;
+          }
+
+          // saldoActual también se refresca en CADA corrida — fix 2026-07-28 (folio 036789):
+          // este campo antes SOLO se escribía una vez, en setErpIds() al vincular la CxC (ver
+          // bank.service.js), y nunca se volvía a tocar. Si Kore reabre el saldo después (ej.
+          // una bonificación aplicada se revierte vía ABO), el link quedaba con un `0`
+          // congelado para siempre. cobro-panel.component.ts (_openCobroPanel) confía en este
+          // campo por encima del caché de Kore cuando `saldoPagado != null` — con el `0`
+          // obsoleto, la CxC parecía completamente saldada y el panel de "Aplicar cobro"
+          // la excluía por completo, mostrando pantalla en blanco pese a que Kore sí tenía
+          // saldo disponible para cobrar.
+          if (raw0?.saldoActual != null && raw0.saldoActual !== (link.saldoActual ?? null)) {
+            linksActualizados[i].saldoActual = raw0.saldoActual;
           }
 
           if (raw0?.saldoActual <= 0) {
@@ -1064,7 +1191,7 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             // ("no determinado", nunca "cero") para no pisar un saldoErp ya correcto.
             const esHumano = _erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId);
             const aporte   = esHumano
-              ? _montoSaldoLink(raw0)
+              ? _montoSaldoLinkPorMovimiento(raw0, mov)
               : _montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
             if (aporte != null) linksActualizados[i].saldoErpAportado = aporte;
 
@@ -1075,7 +1202,7 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             // a mano sin cobro (que nunca pasa por setErpIds/buildErpLinksParaCobro) no
             // depende de que un admin corra el backfill manual para tener esta info desde el
             // día en que se cierra.
-            const backfill = _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporte);
+            const backfill = _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporte);
             linksActualizados[i].saldoPagadoTotal = backfill.saldoPagadoTotal;
             linksActualizados[i].saldoPagado      = backfill.saldoPagado;
             linksActualizados[i].folioFiscal      = backfill.folioFiscal;
@@ -1118,7 +1245,17 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
       // recálculo pisaría con un cero falso un saldoErp que ya era correcto.
       const hayAlgunAporteDeterminado = linksActualizados.some(l => l.saldoErpAportado != null);
       if (hayAlgunAporteDeterminado) {
-        const saldoErpNuevo = linksActualizados.reduce((s, l) => s + (l.saldoErpAportado ?? 0), 0);
+        // Fix 2026-07-28 (folio 036636, cobro múltiple): al sumar, un link con
+        // saldoErpAportado:null usaba 0 — correcto SOLO si de verdad no se sabe nada de esa
+        // CxC, pero incorrecto cuando esa CxC es enorme (se paga en varias exhibiciones a lo
+        // largo de meses) y todavía no cierra por su cuenta (saldoActual!==0), aunque un
+        // humano YA aplicó y confirmó un cobro real de ESTE depósito sobre ella
+        // (saldoPagadoTotal, seteado por setErpIds()/aplicarLogicaErp al momento del cobro).
+        // Tratar ese caso como "aportó 0" descartaba dinero real ya confirmado. Se prioriza
+        // saldoErpAportado (el valor riguroso, re-verificado contra Kore) y solo se cae a
+        // saldoPagadoTotal (la estimación del cobro humano) cuando el primero es null —
+        // nunca 0 salvo que NINGUNO de los dos esté determinado.
+        const saldoErpNuevo = linksActualizados.reduce((s, l) => s + (l.saldoErpAportado ?? l.saldoPagadoTotal ?? 0), 0);
         const bankAmount    = Math.abs(mov.deposito ?? mov.retiro ?? 0);
         let statusNuevo      = saldoErpNuevo >= bankAmount - ERP_TOLERANCE ? 'identificado' : 'no_identificado';
         if (mov.ficha && statusNuevo === 'no_identificado') statusNuevo = 'identificado';
@@ -1215,7 +1352,7 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
     if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
 
     const movements = await BankMovement.find(filter)
-      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor')
+      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor numeroAutorizacion')
       .lean();
 
     let procesados = 0, actualizados = 0, sinDatos = 0, errores = 0, pendientesFolioFiscal = 0;
@@ -1284,14 +1421,23 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
           let aporteNuevo = link.saldoErpAportado ?? null;
           let cambioAporte = false;
           if (esHumano) {
-            const calculado = _montoSaldoLink(raw0);
-            if (Math.abs(calculado - (link.saldoErpAportado ?? 0)) > 0.01) {
+            // calculado puede venir null (ninguna entrada de Kore trae el Aut/Numo de ESTE
+            // movimiento) — en ese caso NO se toca aporteNuevo, se conserva el valor previo
+            // del link en vez de pisarlo con un cero falso.
+            const calculado = _montoSaldoLinkPorMovimiento(raw0, mov);
+            if (calculado != null && Math.abs(calculado - (link.saldoErpAportado ?? 0)) > 0.01) {
               aporteNuevo  = calculado;
               cambioAporte = true;
             }
           }
 
-          const backfill = _backfillFormasPagoYFolioFiscal(link, raw0, esHumano, aporteNuevo);
+          const backfill = _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo);
+          // Fix 2026-07-28 (folio 036789): a diferencia de _syncErpKoreJob, este job antes
+          // NUNCA refrescaba tieneRetencion/montoRetenido — una vez que el link finalizaba,
+          // esos campos quedaban congelados para siempre aunque Kore aplicara/revirtiera una
+          // retención después. _recomputeErpKoreJob es justo el que reconsulta links ya
+          // finalizados con Kore fresco, así que es el lugar correcto para mantenerlos al día.
+          const retencionAhora = _retencionVigente(raw0);
 
           linksActualizados[i] = {
             ...link,
@@ -1300,6 +1446,14 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
             saldoPagadoTotal:       backfill.saldoPagadoTotal,
             saldoPagado:            backfill.saldoPagado,
             folioFiscal:            backfill.folioFiscal,
+            tieneRetencion:         retencionAhora.tieneRetencion,
+            montoRetenido:          retencionAhora.montoRetenido,
+            // Fix 2026-07-28 (folio 036789): mismo motivo que tieneRetencion/montoRetenido
+            // arriba — antes NUNCA se refrescaba tras finalizar el link, y cobro-panel
+            // (_openCobroPanel) confía en este campo por encima del caché de Kore, así que un
+            // `saldoActual` congelado en 0 excluía por completo una CxC que Kore sí tenía
+            // disponible para cobrar, mostrando pantalla en blanco en "Aplicar cobro".
+            saldoActual:            raw0.saldoActual ?? link.saldoActual ?? null,
             conciliacionRunId:      cambioAporte ? jobId : link.conciliacionRunId,
             recomputedFormasPagoAt: backfill.folioFiscalPendiente ? null : new Date(),
           };
@@ -1330,7 +1484,12 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
       if (huboCambioAporte) {
         const hayAlgunAporteDeterminado = linksActualizados.some(l => l.saldoErpAportado != null);
         if (hayAlgunAporteDeterminado) {
-          const saldoErpNuevo = linksActualizados.reduce((s, l) => s + (l.saldoErpAportado ?? 0), 0);
+          // Fix 2026-07-28 (folio 036636, cobro múltiple) — mismo criterio que
+          // _syncErpKoreJob: un link con saldoErpAportado:null (CxC grande, pagada en varias
+          // exhibiciones, todavía no cierra por su cuenta) puede tener igual un cobro humano
+          // ya confirmado de ESTE depósito (saldoPagadoTotal) — usar 0 ahí descartaba dinero
+          // real. Se prioriza saldoErpAportado, se cae a saldoPagadoTotal si es null.
+          const saldoErpNuevo = linksActualizados.reduce((s, l) => s + (l.saldoErpAportado ?? l.saldoPagadoTotal ?? 0), 0);
           const bankAmount    = Math.abs(mov.deposito ?? mov.retiro ?? 0);
           let statusNuevo     = saldoErpNuevo >= bankAmount - ERP_TOLERANCE ? 'identificado' : 'no_identificado';
           if (mov.ficha && statusNuevo === 'no_identificado') statusNuevo = 'identificado';
@@ -1524,6 +1683,89 @@ function _generarExcelRecomputeErpKore(detalles) {
 
   return wb.xlsx.writeBuffer();
 }
+
+// POST /api/erp/erp-links/:erpId/refrescar — refresca UNA sola CxC contra Kore bajo
+// demanda (fuera del ciclo de sync/recompute), pensado para llamarse desde el frontend
+// justo antes de abrir "Vincular CxC del ERP"/"Aplicar cobro" — así el usuario siempre ve
+// el dato más fresco en el momento que lo necesita, sin esperar al cron de las 7am ni al
+// botón masivo "Recalcular saldo ERP" (fix 2026-07-28, folio 036789: "Aplicar cobro"
+// mostraba pantalla en blanco porque erpLinks[].saldoActual quedaba congelado desde la
+// vinculación y nunca se refrescaba hasta la próxima corrida grande). Reutiliza EXACTAMENTE
+// los mismos helpers que _syncErpKoreJob/_recomputeErpKoreJob sobre un solo link — no toca
+// conciliacionFinalizadaAt/recomputedFormasPagoAt/conciliacionRunId, esos checkpoints siguen
+// siendo exclusivos de los jobs grandes. Solo `authenticate` (sin `permit`), igual que
+// /cuentas-pendientes — es una lectura/refresco, no una acción privilegiada por sí sola.
+router.post('/erp-links/:erpId/refrescar', authenticate, asyncHandler(async (req, res) => {
+  const { erpId }      = req.params;
+  const { movementId } = req.body;
+  if (!movementId) return res.status(400).json({ error: 'Se requiere movementId.' });
+
+  const mov = await BankMovement.findOne({ _id: movementId, 'erpLinks.erpId': erpId });
+  if (!mov) return res.status(404).json({ error: 'No se encontró el vínculo ERP indicado en este movimiento.' });
+
+  const link = mov.erpLinks.find(l => l.erpId === erpId);
+  if (!link.serie || !link.folioExterno) {
+    return res.status(400).json({ error: 'Este vínculo no tiene serie/folioExterno para consultar Kore.' });
+  }
+
+  const rango = _rangoDesdeFollo(link.folioExterno);
+  if (!rango) return res.status(400).json({ error: 'No se pudo determinar el rango de fecha para este folio.' });
+
+  let raw;
+  try {
+    ({ raw } = await _sincronizarConRetry({
+      serieExterna: link.serie, folioExterno: String(link.folioExterno),
+      fechaDesde:   rango.fechaDesde, fechaHasta: rango.fechaHasta,
+    }));
+  } catch (err) {
+    return res.status(502).json({ error: err.message || 'Error al consultar Kore.' });
+  }
+
+  const raw0 = raw[0];
+  if (!raw0) return res.status(404).json({ error: 'Kore no devolvió datos para esta CxC en el rango esperado.' });
+
+  const esHumano = _erpIdIdentificadoPorHumano(mov.identificadoPor, erpId);
+  let aporte = link.saldoErpAportado ?? null;
+  if (esHumano) {
+    const calculado = _montoSaldoLinkPorMovimiento(raw0, mov);
+    if (calculado != null) aporte = calculado;
+  } else {
+    const calculado = _montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
+    if (calculado != null) aporte = calculado;
+  }
+
+  const backfill  = _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporte);
+  const retencion = _retencionVigente(raw0);
+
+  link.movimientosKore  = _movimientosKoreDesde(raw0);
+  link.saldoErpAportado = aporte;
+  link.saldoPagadoTotal = backfill.saldoPagadoTotal;
+  link.saldoPagado      = backfill.saldoPagado;
+  link.folioFiscal      = backfill.folioFiscal;
+  link.tieneRetencion   = retencion.tieneRetencion;
+  link.montoRetenido    = retencion.montoRetenido;
+  link.saldoActual      = raw0.saldoActual ?? link.saldoActual ?? null;
+
+  await mov.save();
+
+  res.json({
+    ok: true,
+    erpId,
+    link: {
+      erpId:                link.erpId,
+      saldoActual:          link.saldoActual,
+      saldoPagado:          link.saldoPagado,
+      saldoPagadoTotal:     link.saldoPagadoTotal,
+      total:                link.total,
+      folioFiscal:          link.folioFiscal,
+      serie:                link.serie,
+      folioExterno:         link.folioExterno,
+      tieneRetencion:       link.tieneRetencion,
+      tipoPago:             link.tipoPago,
+      desglosePorFormaPago: link.desglosePorFormaPago,
+    },
+  });
+}));
 
 router.post('/sync-erp-kore', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
   if (syncRunning) {
@@ -1938,16 +2180,20 @@ router.post('/sync-erp-kore/:jobId/revert', authenticate, permit('banks:admin'),
 
 // Patrón exacto del síntoma (folio 036827 y cualquier otro con el mismo bug): el checkpoint
 // de "Recalcular saldo ERP" avanzó (recomputedFormasPagoAt no-null) con folioFiscal todavía
-// null, en un link cerrado por RETENCIÓN (tieneRetencion:true) — la regla vieja de
+// sin resolver, en un link cerrado por RETENCIÓN (tieneRetencion:true) — la regla vieja de
 // _backfillFormasPagoYFolioFiscal daba por perdido el folioFiscal apenas saldoActual llegaba
 // a 0, sin considerar que Kore podía timbrar el CFDI después. Ya arreglado hacia adelante
 // (ver el fix arriba); este filtro identifica solo lo que quedó atrapado con la regla vieja
 // — nunca toca links con folioFiscal ya resuelto ni links "saldo a favor" (esos nunca
 // llegaron a marcar el checkpoint, así que no necesitan rescate).
+// `folioFiscal: { $in: [null, ''] }` (fix 2026-07-28, folio 034310): Kore puede devolver
+// folioFiscal como '' en vez de null/ausente — Mongo NO trata '' como null (a diferencia de
+// `??`/`==null` en JS, que además ya se corrigieron en _backfillFormasPagoYFolioFiscal), así
+// que un link atrapado con '' quedaba invisible para este filtro y para el botón que lo usa.
 const _FILTRO_LINK_ATRAPADO = {
   conciliacionFinalizadaAt: { $ne: null },
   recomputedFormasPagoAt:   { $ne: null },
-  folioFiscal:              null,
+  folioFiscal:              { $in: [null, ''] },
   tieneRetencion:           true,
 };
 // Mismas condiciones, con el prefijo que exige `arrayFilters` (identificador posicional
@@ -2104,6 +2350,8 @@ router._rangoSpilloverSiguienteMes  = _rangoSpilloverSiguienteMes;
 router._sincronizarConRetry         = _sincronizarConRetry;
 router._movimientosKoreDesde        = _movimientosKoreDesde;
 router._montoSaldoLink              = _montoSaldoLink;
+router._montoSaldoLinkPorMovimiento = _montoSaldoLinkPorMovimiento;
+router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
 router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 

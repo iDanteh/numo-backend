@@ -71,6 +71,10 @@ async function resolveUser(payload, req, res, next) {
       // Empresas fijas asignadas directo al usuario (puede tener varias) —
       // [] = sin restricción, puede elegir cualquier empresa.
       empresaRfcs: userDoc.empresaRfcs ?? [],
+      // Permisos extra asignados directo a este usuario, además de los que ya
+      // le da su rol — se leen aquí porque el registro ya se consulta en cada
+      // request (sin round-trip extra). Puramente aditivo, ver rbac-store.js.
+      extraPermissions: userDoc.extraPermissions ?? [],
     };
 
     next();
@@ -127,7 +131,7 @@ const permit = (...permissions) => async (req, res, next) => {
   }
 
   try {
-    const ok = await rbacStore.hasAllPermissions(role, permissions);
+    const ok = await rbacStore.hasAllPermissions(role, permissions, req.user.extraPermissions);
     if (!ok) {
       return res.status(403).json({
         error:    'Permisos insuficientes para esta acción.',

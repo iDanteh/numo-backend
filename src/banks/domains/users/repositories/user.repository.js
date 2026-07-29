@@ -83,6 +83,11 @@ async function updateEmpresas(id, empresaRfcs) {
   return User.findByPk(id);
 }
 
+async function updateExtraPermissions(id, extraPermissions) {
+  await User.update({ extraPermissions }, { where: { id } });
+  return User.findByPk(id);
+}
+
 async function create(data) {
   return User.create(data);
 }
@@ -97,5 +102,6 @@ module.exports = {
   updateRole,
   updateActive,
   updateEmpresas,
+  updateExtraPermissions,
   create,
 };

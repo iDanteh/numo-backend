@@ -64,8 +64,8 @@ const upload = multer({
 
 // GET /api/banks/cards
 router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
   // El dashboard muestra "Identificados" de TODO el equipo (scope ALL) aunque el rol tenga
   // scope OWN en la tabla de movimientos — decisión explícita del usuario, independiente de
   // getMovementScope()/rbac.js; la tabla de abajo sigue restringida a lo propio por defecto.
@@ -94,7 +94,7 @@ router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), 
   // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
   // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
   // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
   query.rolActual = hasAdminAccess ? null : req.user.role;
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -109,7 +109,7 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   // Cuando viene movId (navegación desde OCR) el usuario puede ver ese movimiento
   // sin restricciones de status/tipo para que la navegación funcione correctamente.
   let query = { ...req.query };
-  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
+  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
   if (!hasFullAccess && !query.movId) {
     const scope = getMovementScope(req.user.role);
     const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id, { scope });
@@ -121,7 +121,7 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
   // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
   // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
   query.rolActual = hasAdminAccess ? null : req.user.role;
   res.json(await service.listMovements(query));
 }));
@@ -135,8 +135,8 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
 // GET /api/banks/stats — conteos por estado con filtro de año/mes/banco opcional, restringido por rol
 router.get('/stats', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { year, month, banco } = req.query;
-  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG);
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN);
+  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
   // Mismo criterio que /cards: "Identificados" del dashboard es de todo el equipo, no solo del
   // usuario logueado, aunque su rol tenga scope OWN en la tabla de movimientos.
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };

@@ -1,5 +1,6 @@
 'use strict';
 
+const ExcelJS           = require('exceljs'); // reporte descargable de Solicitudes de Cobro (buildReport/buildReportMine)
 const CollectionRequest = require('./CollectionRequest.model');
 const BankMovement      = require('../banks/BankMovement.model');
 const bankService       = require('../banks/bank.service'); // setErpIds — mismo mecanismo que usa el panel de cobros
@@ -232,9 +233,53 @@ function _tieneAlgunComprobante(doc) {
   return !!doc.comprobante?.mimetype || (doc.comprobantes?.length ?? 0) > 0;
 }
 
-async function list(filters) {
-  const { page = 1, limit = 50, status } = filters;
+// Filtro compartido por list()/listMine() para búsqueda de texto + rango de fecha
+// de creación — mismo criterio que listMovements() en bank.service.js (Bancos),
+// pero sin la complejidad de aggregation/_score: esta bandeja es mucho más chica
+// y un $or plano alcanza, no hace falta rankear resultados por relevancia.
+function _buildBusquedaFilter({ search, fechaInicio, fechaFin }) {
   const filter = {};
+
+  // Rango sobre createdAt (cuándo se creó la solicitud), no sobre una fecha de
+  // movimiento bancario — esta bandeja no tiene equivalente a "fecha" de Bancos.
+  if (fechaInicio || fechaFin) {
+    filter.createdAt = {};
+    if (fechaInicio) filter.createdAt.$gte = new Date(fechaInicio);
+    // Inclusive de todo el día — mismo criterio que fechaFin en bank.service.js.
+    if (fechaFin) filter.createdAt.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
+  }
+
+  if (search) {
+    const esc = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re  = new RegExp(esc, 'i');
+    const orClauses = [
+      { solicitudIdErp: re },
+      { solicitanteNombre: re },
+      { 'cxcs.folioExterno': re },
+      { 'cxcs.nombrePersona': re },
+    ];
+
+    // Búsqueda por monto — mismo criterio de tolerancia que bank.service.js:
+    // sin decimales → ±1 peso; 1 decimal → ±0.05; 2+ decimales → ±0.005.
+    const cleanNum = search.replace(/[$,\s]/g, '');
+    const num       = parseFloat(cleanNum);
+    if (!isNaN(num) && num > 0) {
+      const decimalPlaces = (cleanNum.split('.')[1] || '').length;
+      const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
+      const lo = decimalPlaces === 0 ? num : num - tolerance;
+      const hi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
+      orClauses.push({ monto: { $gte: lo, $lte: hi } });
+    }
+
+    filter.$or = orClauses;
+  }
+
+  return filter;
+}
+
+async function list(filters) {
+  const { page = 1, limit = 50, status, search, fechaInicio, fechaFin } = filters;
+  const filter = _buildBusquedaFilter({ search, fechaInicio, fechaFin });
   if (status) filter.status = status;
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -260,8 +305,8 @@ async function list(filters) {
 
 // Solicitudes creadas por el propio usuario autenticado (rol tienda revisando su historial).
 async function listMine(userId, filters) {
-  const { page = 1, limit = 50, status } = filters;
-  const filter = { solicitanteUserId: userId };
+  const { page = 1, limit = 50, status, search, fechaInicio, fechaFin } = filters;
+  const filter = { ..._buildBusquedaFilter({ search, fechaInicio, fechaFin }), solicitanteUserId: userId };
   if (status) filter.status = status;
 
   const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -280,6 +325,58 @@ async function listMine(userId, filters) {
     data: data.map(d => ({ ...d, comprobante: { ...d.comprobante, tieneComprobante: _tieneAlgunComprobante(d) } })),
     pagination: { total, page: parseInt(page), limit: parseInt(limit), pages: Math.ceil(total / parseInt(limit)) },
   };
+}
+
+// Inicio del día en curso en hora de MÉXICO (no la hora local del servidor,
+// que puede correr en otra zona) — mismo patrón ya usado en
+// cfdi-poliza-generator.service.js (_medianocheMx): México abolió el DST desde
+// 2022, offset fijo UTC-6, así que no hace falta librería de zonas horarias.
+// El "hoy" de este conteo debe coincidir con el "hoy" que ve el usuario en
+// México, no con la medianoche UTC ni la del servidor.
+function _inicioDeHoy() {
+  const hoyMX = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+  return new Date(`${hoyMX}T06:00:00.000Z`);
+}
+
+// Conteos para las tarjetas de stats y los badges de las pestañas (Pendientes/
+// Identificadas/Rechazadas, "hoy", monto pendiente). Antes se calculaban en el
+// frontend sobre el arreglo de hasta 200 solicitudes que list()/listMine()
+// devolvía SIN filtrar por status — con paginación real por status (arriba),
+// ese arreglo ya no trae todos los estatus a la vez, así que estos conteos se
+// calculan aparte, directo en Mongo, sobre el universo completo (no la página
+// actual). `baseFilter` acota a las solicitudes propias en statsMine().
+async function _stats(baseFilter) {
+  const inicioHoy = _inicioDeHoy();
+  const [porStatus, identificadasHoy, rechazadasHoy, montoPendienteAgg] = await Promise.all([
+    CollectionRequest.aggregate([
+      { $match: baseFilter },
+      { $group: { _id: '$status', count: { $sum: 1 } } },
+    ]),
+    CollectionRequest.countDocuments({ ...baseFilter, status: 'identificada', resueltoAt: { $gte: inicioHoy } }),
+    CollectionRequest.countDocuments({ ...baseFilter, status: 'rechazada', resueltoAt: { $gte: inicioHoy } }),
+    CollectionRequest.aggregate([
+      { $match: { ...baseFilter, status: 'pendiente' } },
+      { $group: { _id: null, total: { $sum: '$monto' } } },
+    ]),
+  ]);
+
+  const counts = { pendiente: 0, identificada: 0, rechazada: 0 };
+  for (const r of porStatus) if (r._id in counts) counts[r._id] = r.count;
+
+  return {
+    counts,
+    identificadasHoy,
+    rechazadasHoy,
+    montoPendienteTotal: montoPendienteAgg[0]?.total ?? 0,
+  };
+}
+
+async function stats() {
+  return _stats({});
+}
+
+async function statsMine(userId) {
+  return _stats({ solicitanteUserId: userId });
 }
 
 async function getById(id) {
@@ -537,15 +634,15 @@ async function identificar(id, bankMovementId, user) {
   // lanzar ConflictError si otro usuario ya tiene el movimiento tomado — se
   // deja propagar tal cual (mismo comportamiento que el panel).
   //
-  // identificadoPor debe quedar a nombre del CAJERO que generó la solicitud
-  // (cr.solicitanteUserId/Nombre, el mismo que viene en el body original) — no
-  // el usuario de cobranza/contabilidad que dio clic en "Identificar" en Numo.
-  // El `role` sí es el del usuario que ejecuta la acción: setErpIds lo usa
-  // únicamente para el chequeo de permisos/conflicto (¿puede forzar un
-  // movimiento ya tomado?), no para la identidad que se guarda.
+  // identificadoPor queda a nombre de quien AUTORIZA (el usuario de cobranza/
+  // contabilidad que ejecuta esta acción) — cambio de criterio 2026-07-29,
+  // revierte la decisión del 2026-07-07 que dejaba acá al cajero solicitante.
+  // `cr.resueltoPorUserId`/`resueltoPorNombre` (más abajo) ya guardaban a este
+  // mismo usuario desde el 07-07 — ahora esa misma identidad también queda en
+  // el BankMovement, consistente con el resto del sistema (cobro-panel deja
+  // en identificadoPor a quien aplica el cobro, no a un tercero).
   const erpLinks = buildErpLinksParaCobro(cr, cuentasKore, mov.erpLinks);
-  const identidadCajero = { _id: cr.solicitanteUserId, nombre: cr.solicitanteNombre, role: user.role };
-  await bankService.setErpIds(bankMovementId, erpLinks, identidadCajero);
+  await bankService.setErpIds(bankMovementId, erpLinks, user);
 
   // 8. Solo si todo lo anterior salió bien: persistir la solicitud.
   cr.formasPago          = formasPagoConRef;
@@ -612,7 +709,187 @@ async function rechazar(id, motivo, user) {
   return _toSafeJSON(actualizada);
 }
 
+// ── Reporte Excel de Solicitudes de Cobro (2026-07-29) ──────────────────────────
+// Solo cubre solicitudes RESUELTAS (Autorizadas = identificada, Rechazadas =
+// rechazada) — nunca pendiente, sin importar qué pestaña esté activa en el
+// frontend (el botón vive en la barra de filtros compartida, no dentro de una
+// sola pestaña). El status va HARDCODEADO al armar el filtro: nunca se lee
+// filters.status aquí, para que no haya forma de que un query param lo cambie.
+const XLSX_HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
+const XLSX_HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+
+function _xlsxFormatFecha(d) {
+  if (!d) return '';
+  const dt = d instanceof Date ? d : new Date(d);
+  if (isNaN(dt.getTime())) return '';
+  return dt.toLocaleDateString('es-MX', { day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+
+function _xlsxStyleHeader(ws) {
+  ws.getRow(1).eachCell(cell => {
+    cell.fill = XLSX_HEADER_FILL;
+    cell.font = XLSX_HEADER_FONT;
+    cell.alignment = { vertical: 'middle', horizontal: 'center' };
+  });
+  ws.getRow(1).height = 20;
+}
+
+// Mismo criterio de resumen que folioLabel() en collection-request.component.ts:
+// una sola CxC se muestra directo (serie-folio), varias se resumen a "N CxC" —
+// el detalle completo de cada una solo aparece en la columna "CxC detalle" del
+// reporte rico (RICH).
+function _cxcResumen(cxcs) {
+  if (!cxcs || cxcs.length === 0) return '';
+  if (cxcs.length === 1) {
+    const c = cxcs[0];
+    return c.serie && c.folioExterno ? `${c.serie}-${c.folioExterno}` : (c.folioExterno || c.erpId);
+  }
+  return `${cxcs.length} CxC`;
+}
+
+// Detalle por CxC (solo reporte rico) — Modo 2 (varias CxC) es el caso que más
+// aporta acá, ya que el resumen de arriba las colapsa a "N CxC"; se incluye
+// también en Modo 1 por consistencia de columna entre filas.
+function _cxcDetalle(cxcs) {
+  if (!cxcs || cxcs.length === 0) return '';
+  return cxcs.map(c => {
+    const folio = c.serie && c.folioExterno ? `${c.serie}-${c.folioExterno}` : (c.folioExterno || c.erpId);
+    const monto = c.montoAsignado ?? c.total ?? 0;
+    return `${c.nombrePersona || '—'} (${folio}, ${c.tipoPago || '—'}, ${monto.toFixed(2)})`;
+  }).join('; ');
+}
+
+function _formaPagoDetalle(formasPago) {
+  return (formasPago || [])
+    .map(f => `${f.bancoDescripcion || ''} ${f.referencia || ''}`.trim())
+    .filter(Boolean)
+    .join('; ');
+}
+
+function _columnasReporte(rico) {
+  const base = [
+    { header: 'Folio de solicitud',     key: 'folio',            width: 16 },
+    { header: 'Fecha de solicitud',      key: 'fechaSolicitud',    width: 14 },
+    { header: 'Estatus',                 key: 'estatus',           width: 12 },
+    { header: 'Monto',                   key: 'monto',             width: 14 },
+    { header: 'CxC',                     key: 'cxc',               width: 20 },
+    { header: 'Forma de pago',           key: 'formaPago',         width: 20 },
+    { header: 'Fecha de resolución',     key: 'fechaResolucion',   width: 16 },
+    { header: 'Motivo de rechazo',       key: 'motivoRechazo',     width: 30 },
+  ];
+  if (!rico) return base;
+  return [
+    ...base,
+    { header: 'Solicitó',                key: 'solicito',            width: 20 },
+    { header: 'Banco',                   key: 'banco',               width: 14 },
+    { header: 'Fecha del depósito',      key: 'fechaDeposito',       width: 16 },
+    { header: 'Concepto',                key: 'concepto',            width: 26 },
+    { header: 'Depósito',                key: 'deposito',            width: 14 },
+    { header: 'Retiro',                  key: 'retiro',              width: 14 },
+    { header: 'Autorización bancaria',   key: 'autorizacionBancaria', width: 20 },
+    { header: 'Autorizó/Rechazó',        key: 'resolvio',            width: 20 },
+    { header: 'Cobro aplicado',          key: 'cobroAplicado',       width: 14 },
+    { header: 'Fecha cobro aplicado',    key: 'fechaCobroAplicado',  width: 16 },
+    { header: 'CxC detalle',             key: 'cxcDetalle',          width: 40 },
+    { header: 'Forma de pago detalle',   key: 'formaPagoDetalle',    width: 30 },
+  ];
+}
+
+function _filaReporte(cr, rico) {
+  const fila = {
+    folio:           cr.solicitudIdErp || '',
+    fechaSolicitud:  _xlsxFormatFecha(cr.createdAt),
+    estatus:         cr.status === 'identificada' ? 'Autorizada' : 'Rechazada',
+    monto:           cr.monto ?? 0,
+    cxc:             _cxcResumen(cr.cxcs),
+    formaPago:       (cr.formasPago || []).map(f => f.formaPagoDescripcion).join(', '),
+    fechaResolucion: _xlsxFormatFecha(cr.resueltoAt),
+    motivoRechazo:   cr.motivoRechazo || '',
+  };
+  if (!rico) return fila;
+  return {
+    ...fila,
+    solicito:             cr.solicitanteNombre || '',
+    banco:                cr.bankMovementId?.banco || '',
+    fechaDeposito:        _xlsxFormatFecha(cr.bankMovementId?.fecha),
+    concepto:             cr.bankMovementId?.concepto || '',
+    deposito:             cr.bankMovementId?.deposito ?? '',
+    retiro:               cr.bankMovementId?.retiro ?? '',
+    autorizacionBancaria: cr.bankMovementId?.numeroAutorizacion || '',
+    resolvio:             cr.resueltoPorNombre || '',
+    cobroAplicado:        cr.cobroAplicado ? 'Sí' : 'No',
+    fechaCobroAplicado:   _xlsxFormatFecha(cr.cobroAplicadoAt),
+    cxcDetalle:           _cxcDetalle(cr.cxcs),
+    formaPagoDetalle:     _formaPagoDetalle(cr.formasPago),
+  };
+}
+
+// Dos hojas fijas (Autorizadas/Rechazadas) sobre el mismo arreglo `data` (ya
+// viene acotado a solo esos dos status desde buildReport/buildReportMine) — se
+// reparte por status al llenar cada hoja, no con dos queries separadas.
+async function _generarExcelSolicitudes(data, { rico }) {
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Solicitudes de Cobro';
+  wb.created = new Date();
+
+  const columnas    = _columnasReporte(rico);
+  const currencyKeys = rico ? ['monto', 'deposito', 'retiro'] : ['monto'];
+
+  const wsAut = wb.addWorksheet('Autorizadas');
+  wsAut.columns = columnas;
+  _xlsxStyleHeader(wsAut);
+  for (const cr of data.filter(d => d.status === 'identificada')) wsAut.addRow(_filaReporte(cr, rico));
+  currencyKeys.forEach(k => { wsAut.getColumn(k).numFmt = '#,##0.00'; });
+  if (wsAut.lastColumn) wsAut.autoFilter = { from: 'A1', to: wsAut.lastColumn.letter + '1' };
+
+  const wsRec = wb.addWorksheet('Rechazadas');
+  wsRec.columns = columnas;
+  _xlsxStyleHeader(wsRec);
+  for (const cr of data.filter(d => d.status === 'rechazada')) wsRec.addRow(_filaReporte(cr, rico));
+  currencyKeys.forEach(k => { wsRec.getColumn(k).numFmt = '#,##0.00'; });
+  if (wsRec.lastColumn) wsRec.autoFilter = { from: 'A1', to: wsRec.lastColumn.letter + '1' };
+
+  return wb.xlsx.writeBuffer();
+}
+
+// Reporte completo (cobranza/contabilidad/admin, collections:write) — mismo
+// filtro de búsqueda/fecha que list(), pero el status queda FIJO a resueltas
+// (nunca se acepta filters.status: si se leyera, un query ?status=pendiente
+// podría colar solicitudes pendientes al reporte). Columnas RICAS: incluye el
+// movimiento bancario vinculado y quién resolvió — información que tienda no
+// necesita ver de solicitudes ajenas.
+async function buildReport(filters) {
+  const { search, fechaInicio, fechaFin } = filters;
+  const filter = {
+    ..._buildBusquedaFilter({ search, fechaInicio, fechaFin }),
+    status: { $in: ['identificada', 'rechazada'] },
+  };
+  const data = await CollectionRequest.find(filter)
+    .sort({ createdAt: 1 })
+    .select('-comprobante.data')
+    .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
+    .lean();
+  return _generarExcelSolicitudes(data, { rico: true });
+}
+
+// Reporte acotado (rol tienda, collections:read) — mismas solicitudes propias
+// que listMine(), solo resueltas. Columnas MÍNIMAS: sin movimiento bancario ni
+// quién resolvió — tienda no necesita ese detalle interno, solo el resultado.
+async function buildReportMine(userId, filters) {
+  const { search, fechaInicio, fechaFin } = filters;
+  const filter = {
+    ..._buildBusquedaFilter({ search, fechaInicio, fechaFin }),
+    status: { $in: ['identificada', 'rechazada'] },
+    solicitanteUserId: userId,
+  };
+  const data = await CollectionRequest.find(filter)
+    .sort({ createdAt: 1 })
+    .select('-comprobante.data')
+    .lean();
+  return _generarExcelSolicitudes(data, { rico: false });
+}
+
 module.exports = {
   analyzeReceipt, create, list, listMine, getById, getByErpId, getComprobante, analyzeStoredComprobantes,
-  identificar, rechazar,
+  identificar, rechazar, stats, statsMine, buildReport, buildReportMine,
 };

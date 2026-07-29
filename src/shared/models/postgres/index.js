@@ -262,6 +262,16 @@ async function syncModels() {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS empresa_rfcs VARCHAR(20)[] NOT NULL DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN empresa_rfcs (users):', e.message));
+
+  // Permisos extra por usuario individual (idempotente) — ver User.js. Puramente
+  // aditivo sobre los permisos que ya da el rol (sin mecanismo de revocación).
+  // TEXT[] y no VARCHAR(20)[] como empresa_rfcs: las claves de permiso
+  // 'modulo:accion' pueden superar los 20 caracteres (confirmado con el
+  // usuario 2026-07-29).
+  await User.sequelize.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS extra_permissions TEXT[] NOT NULL DEFAULT '{}'
+  `).catch(e => console.warn('[syncModels] ADD COLUMN extra_permissions (users):', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

@@ -79,6 +79,43 @@ router.get('/mias', authenticate, permit('collections:read'), asyncHandler(async
   res.json(await service.listMine(req.user._id, req.query));
 }));
 
+// GET /api/collection-requests/stats — conteos por status + "hoy" + monto
+// pendiente total, para las tarjetas superiores y los badges de las pestañas.
+// Aparte de list(): con paginación real por status, el arreglo de list() ya no
+// trae todos los estatus a la vez. Debe ir antes de /:id.
+router.get('/stats', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  res.json(await service.stats());
+}));
+
+// GET /api/collection-requests/mias/stats — mismo propósito, acotado a las
+// solicitudes del usuario autenticado (rol tienda en "mis solicitudes").
+router.get('/mias/stats', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  res.json(await service.statsMine(req.user._id));
+}));
+
+// GET /api/collection-requests/report — reporte Excel de TODAS las solicitudes
+// resueltas (Autorizadas + Rechazadas, nunca pendientes — ver buildReport en el
+// service). Requiere collections:write: solo cobranza/contabilidad/admin ven el
+// universo completo. Debe ir antes de /:id.
+router.get('/report', authenticate, permit('collections:write'), asyncHandler(async (req, res) => {
+  const buffer = await service.buildReport(req.query);
+  const fecha = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Solicitudes-Cobro-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
+// GET /api/collection-requests/mias/report — mismo reporte, acotado a las
+// solicitudes resueltas del usuario autenticado (rol tienda). Requiere solo
+// collections:read: es lo único que tienda tiene. Debe ir antes de /:id.
+router.get('/mias/report', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  const buffer = await service.buildReportMine(req.user._id, req.query);
+  const fecha = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Mis-Solicitudes-Cobro-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
 // GET /api/collection-requests/erp/:solicitudIdErp — el ERP (Kore) consulta el
 // estado de la solicitud que él mismo creó, autenticado con su API key (no hay
 // sesión Numo). Debe ir antes de /:id para que Express no intente matchear

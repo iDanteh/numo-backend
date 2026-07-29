@@ -57,7 +57,9 @@ const PERM_META = {
   'drive:read':         { label: 'Google Drive (leer)',             module: 'Drive' },
   'drive:import':       { label: 'Google Drive (importar)',         module: 'Drive' },
   'entities:read':      { label: 'Ver entidades fiscales',          module: 'Entidades' },
-  'entities:write':     { label: 'Gestionar entidades fiscales',    module: 'Entidades' },
+  'entities:write':     { label: 'Gestionar entidades fiscales (heredado, incluye programación de jobs)', module: 'Entidades' },
+  'entities:edit':      { label: 'Editar entidades fiscales',       module: 'Entidades' },
+  'entities:message':   { label: 'Enviar alerta de credenciales SAT', module: 'Entidades' },
   'users:manage':       { label: 'Administrar usuarios y roles',    module: 'Administración' },
 };
 
@@ -85,14 +87,23 @@ async function seedRbac() {
   }
 
   // ── Roles del sistema: crear si no existen, nunca sobreescribir permisos ─────
-  // En el primer arranque se crean con los permisos de rbac.js.
-  // En reinicios posteriores solo se sincroniza el label e isSystem, preservando
-  // cualquier cambio manual hecho a los permisos desde la UI.
+  // En el primer arranque se crean con los permisos de rbac.js — o con los del
+  // snapshot en disco (roles.snapshot.json) si hay uno más reciente, por si
+  // esta base viene de un restore viejo y el snapshot ya tiene los permisos
+  // que se editaron después desde la UI (ver role.service.js:_guardarSnapshot,
+  // confirmado con el usuario 2026-07-28).
+  // En reinicios normales (el rol YA existe) solo se sincroniza label e
+  // isSystem, preservando cualquier cambio manual hecho a los permisos.
+  const { leerSnapshot } = require('../domains/users/role.service');
+  const snapshotPorValue = new Map(leerSnapshot().map(r => [r.value, r]));
+
   let createdRoles = 0;
   for (const [value, { label, permissions }] of Object.entries(ROLES)) {
+    const snap = snapshotPorValue.get(value);
+    snapshotPorValue.delete(value);   // lo que queda al final son roles personalizados
     const [, created] = await Role.findOrCreate({
       where:    { value },
-      defaults: { label, permissions, isSystem: true },
+      defaults: { label: snap?.label ?? label, permissions: snap?.permissions ?? permissions, isSystem: true },
     });
     if (!created) {
       // Sincronizar solo label e isSystem — nunca tocar permissions
@@ -101,8 +112,22 @@ async function seedRbac() {
       createdRoles++;
     }
   }
+
+  // Roles personalizados (creados desde la UI, no existen en rbac.js) que el
+  // snapshot recuerda pero esta base no tiene — se restauran tal cual estaban.
+  for (const [value, snap] of snapshotPorValue) {
+    const [, created] = await Role.findOrCreate({
+      where:    { value },
+      defaults: { label: snap.label, permissions: snap.permissions, isSystem: false },
+    });
+    if (created) {
+      createdRoles++;
+      console.log(`[seed] Rol personalizado restaurado desde snapshot: ${value}`);
+    }
+  }
+
   if (createdRoles > 0) {
-    console.log(`[seed] ${createdRoles} rol(es) del sistema creados.`);
+    console.log(`[seed] ${createdRoles} rol(es) creados (de sistema y/o restaurados desde snapshot).`);
   }
   console.log(`[seed] ${Object.keys(ROLES).length} rol(es) del sistema verificados (permisos preservados).`);
 }

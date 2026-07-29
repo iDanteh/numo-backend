@@ -21,7 +21,174 @@ const {
 // (array, formato ERP) como `uuid` (singular, formato SAT), según el origen.
 const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
 
+// El pre-fetch de relMetodoPagoMap/relFacturaMetaMap (más abajo, `relTipoUuidsProp`/
+// `relTipoUuidsGuard`) se calcula ANTES del merge con ERP, a partir del
+// `cfdiRelacionados` crudo de SAT — pero algunas NC (Devolución/Bonificación)
+// solo traen `cfdiRelacionados` poblado en la fuente ERP, no en SAT (confirmado
+// con el usuario: NC 82AA95D2-A255-4441-9C99-BEE4D3E9B959, factura origen
+// A0-260615344 PPD — su `cfdiRelacionados` en SAT llega vacío, solo aparece
+// tras el merge ERP). Sin esto, esas NC nunca resuelven `metodoPagoRelacionado`
+// (ni tampoco lo ven `_normalizarEgresoCondonacion`/`_normalizarEgresoSegunFacturaRelacionada`,
+// que dependen del mismo mapa) y se clasifican con su propio metodoPago en vez
+// del de la venta que ajustan. Se llama DESPUÉS del merge para completar los
+// mapas con los uuids relacionados que solo aparecieron ahí (solo agrega, nunca
+// sobrescribe lo que el pre-fetch original ya resolvió).
+async function _completarRelacionadosPostMerge(cfdisFinal, relMetodoPagoMap, relFacturaMetaMap) {
+  const faltantes = [...new Set(cfdisFinal.flatMap(c => _uuidsRelacionados(c)))]
+    .filter(u => !(u in relMetodoPagoMap));
+  if (!faltantes.length) return;
+  const relCfdis = await CFDI.find({ uuid: { $in: faltantes } })
+    .select('uuid metodoPago formaPago').lean();
+  for (const c of relCfdis) {
+    // Un mismo uuid trae DOS documentos (source SAT y ERP) — el de SAT suele
+    // no tener metodoPago/formaPago propio (undefined). Sin este guard, si el
+    // doc SAT se procesa después del ERP, pisa el valor bueno con `undefined`.
+    if (c.metodoPago == null) continue;
+    relMetodoPagoMap[c.uuid]  = c.metodoPago;
+    relFacturaMetaMap[c.uuid] = { metodoPago: c.metodoPago, formaPago: c.formaPago };
+  }
+}
+
 const SUCURSAL_DEFAULT = 'Cedis';
+
+// Rango de folios de CONTPAQ reservado por sucursal (confirmado con el
+// usuario 2026-07-27) — cada póliza de Ingreso nueva de esa sucursal toma el
+// siguiente folio libre DENTRO de su rango, nunca fuera de él. El rango se
+// reinicia cada periodo (ejercicio+periodo): el primer folio de la sucursal
+// en un mes nuevo siempre es `desde`. Nombres deben coincidir EXACTO con
+// CentroCosto.sucursal (ver seed-account-plan.js) — comparación case-insensitive.
+const RANGOS_FOLIO_POR_SUCURSAL = [
+  { sucursales: ['CEDIS', 'PROMOTORIA'],          desde: 100,  hasta: 199 },
+  { sucursales: ['HIDALGO', 'LICITACION HIDALGO'], desde: 300,  hasta: 399 },
+  { sucursales: ['CONSTRUCASA'],                  desde: 400,  hasta: 499 },
+  { sucursales: ['REFORMA'],                       desde: 500,  hasta: 599 },
+  { sucursales: ['SIMBOLOS'],                      desde: 600,  hasta: 699 },
+  { sucursales: ['FERROCARRIL'],                   desde: 700,  hasta: 799 },
+  { sucursales: ['ATZOMPA'],                       desde: 800,  hasta: 899 },
+  { sucursales: ['TEHUANTEPEC'],                   desde: 900,  hasta: 999 },
+  { sucursales: ['SANTA ROSA'],                    desde: 1000, hasta: 1099 },
+  { sucursales: ['VIGUERA'],                        desde: 1100, hasta: 1199 },
+  { sucursales: ['PUERTO ESCONDIDO'],               desde: 1200, hasta: 1299 },
+];
+
+function _rangoFolioPorSucursal(sucursal) {
+  if (!sucursal) return null;
+  const norm = String(sucursal).trim().toUpperCase();
+  return RANGOS_FOLIO_POR_SUCURSAL.find(r => r.sucursales.includes(norm)) ?? null;
+}
+
+// Folio siguiente disponible dentro del rango de la sucursal — a diferencia
+// de un contador que solo sube, aquí una póliza CANCELADA libera su folio
+// para que una futura generación lo reutilice (confirmado con el usuario
+// 2026-07-27). Una póliza de Ingreso con Contado Y Crédito mezclados ocupa
+// DOS folios consecutivos en el export (numero y numero+1, ver
+// _conceptoConTipoVenta/bloques en poliza.service.js) aunque en Postgres solo
+// exista una fila — por eso se deriva de sus propios movimientos (metodoPago)
+// si cada póliza activa ocupó 1 o 2 folios, en vez de asumirlo.
+// CEDIS es un caso aparte: además de Contado/Crédito separa Bonificaciones y
+// Descuentos/Devoluciones en pólizas propias (ver rama `esCedis` en
+// poliza.service.js), consumiendo hasta 6 folios consecutivos desde una sola
+// fila de Postgres. Replicar aquí cuántos de esos 6 bloques tuvieron datos
+// requeriría duplicar la categorización completa del export, así que para
+// una póliza CEDIS (pasada o nueva) siempre se reservan/bloquean los 6 —
+// conservador pero sin riesgo de colisión.
+const FOLIOS_MAX_CEDIS = 6;
+
+function _esCedisPorSucursal(sucursal) {
+  return (sucursal || '').trim().toUpperCase() === 'CEDIS';
+}
+
+async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction }) {
+  if (!rangoFolio) {
+    const max = await Poliza.max('numero', {
+      where: { tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo) },
+      transaction,
+    });
+    return { numero: (max || 0) + 1, agotado: false };
+  }
+
+  const activas = await Poliza.findAll({
+    where: {
+      tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo),
+      estado: { [Op.ne]: 'cancelada' },
+      numero: { [Op.between]: [rangoFolio.desde, rangoFolio.hasta] },
+    },
+    attributes: ['id', 'numero'],
+    include: [{ model: PolizaMovimiento, as: 'movimientos', attributes: ['metodoPago', 'centroCostoId'], required: false }],
+    transaction,
+  });
+
+  const sucursalDeCentro = (id) => Object.values(ccBySerieMap ?? {}).find(c => String(c.id) === String(id))?.sucursal ?? null;
+
+  const ocupados = new Set();
+  for (const p of activas) {
+    const movs = p.movimientos ?? [];
+    const esCedisPast = movs.length > 0 && movs.every(m => _esCedisPorSucursal(sucursalDeCentro(m.centroCostoId)));
+    if (esCedisPast) {
+      for (let i = 0; i < FOLIOS_MAX_CEDIS; i++) ocupados.add(p.numero + i);
+      continue;
+    }
+    const metodos = new Set(movs.map(m => m.metodoPago));
+    const tieneContado = [...metodos].some(m => m !== 'PPD');
+    const tieneCredito = metodos.has('PPD');
+    ocupados.add(p.numero);
+    if (tieneContado && tieneCredito) ocupados.add(p.numero + 1);
+  }
+
+  const necesarios = foliosNecesarios ?? 1;
+  for (let n = rangoFolio.desde; n <= rangoFolio.hasta - necesarios + 1; n++) {
+    let libre = true;
+    for (let i = 0; i < necesarios; i++) {
+      if (ocupados.has(n + i)) { libre = false; break; }
+    }
+    if (libre) return { numero: n, agotado: false };
+  }
+  return { numero: null, agotado: true };
+}
+
+// Series de documentosRelacionados (ERP) que identifican una NC como ajuste
+// de una venta (bonificación/devolución/cancelación) — mismo catálogo que
+// TIPO_MARCADORES de report.controller.js, más 'CANCELACION' (NCs de
+// refacturación por cancelación, encontradas 2026-07-17: no traen
+// cfdiRelacionados.tipoRelacion poblado, solo este indicador del ERP).
+// 'DVE' = "Devolución Especial", variante real del ERP (10 casos, no un typo
+// de 'DEV') que tampoco trae cfdiRelacionados.tipoRelacion a nivel SAT —
+// sin este marcador la NC nunca se fusiona con ningún día/sucursal
+// (encontrado 2026-07-23, UUID B576F5AE-EE3E-449A-B654-9C1A6F44141A).
+// 'BEP'/'BXC'/'BN' = variantes de Bonificación (Especial / Por Cambio /
+// Cliente Mostrador); 'ANN'/'CES' = variantes de Cancelación (de Anticipos /
+// Especial) -- mismo problema de fusión, tipoOrigen ya viene correcto del
+// ERP ("Bonificación"/"Cancelación") pero sin este marcador tampoco se
+// fusionan (BEP: 5 casos, BN: 42 casos, CES: 1 caso confirmados en base;
+// BXC/ANN sin casos aún pero se agregan igual, aportadas por el usuario
+// 2026-07-23).
+const SERIES_FUSION_NC = ['BCT', 'BON', 'DEV', 'DVE', 'CAC', 'CANCELACION', 'BEP', 'BXC', 'BN', 'ANN', 'CES'];
+
+// Folios (del ERP) referenciados por NCs Serie=CANCELACION dentro del rango
+// de fecha efectiva — usado para detectar la factura de REFACTURACIÓN que
+// reemplaza la venta cancelada (misma serie que la NC, mismo Folio
+// referenciado). Cruce exacto por Folio: NO basta con "documentosRelacionados
+// trae algún Serie=propia con Folio distinto al mío" — ese patrón es normal
+// en casi cualquier factura del ERP (dato interno sin relación con
+// cancelaciones), confirmado con datos reales 2026-07-17 (8 de 9 facturas de
+// un día cualquiera lo tenían, falso positivo masivo).
+async function _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin }) {
+  if (!fechaInicio || !fechaFin) return new Set();
+  const uuidsE = await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi: 'E', fechaInicio, fechaFin });
+  if (!uuidsE.size) return new Set();
+  const docs = await CFDI.find({
+    uuid:   { $in: [...uuidsE] },
+    source: 'ERP',
+    'documentosRelacionados.Serie': 'CANCELACION',
+  }).select('documentosRelacionados').lean();
+  const folios = new Set();
+  for (const d of docs) {
+    for (const dr of d.documentosRelacionados || []) {
+      if (dr.Serie === 'CANCELACION' && dr.Folio) folios.add(dr.Folio);
+    }
+  }
+  return folios;
+}
 
 function _fmtDMY(fechaISO) {
   const [y, m, d] = fechaISO.split('-');
@@ -145,13 +312,18 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     .filter(r => r.tipoRelacion === '01' || r.tipoRelacion === '03')
     .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
 
+  // Solo NCs EMITIDAS por esta entidad — una NC donde `rfc` es receptor es una
+  // que le dieron a esta entidad como CLIENTE (compra), no una que emitió
+  // sobre sus propias ventas. Mismo bug de fondo que ya se corrigió en
+  // notInErp/discrepanciasMontos/discrepanciasCriticas (faltaba filtro
+  // emisor.rfc) — confirmado con el usuario 2026-07-28 al encontrar un CFDI
+  // recibido colado en una póliza de Ingresos vía este mismo patrón de $or.
   const filtroBaseNc = {
-    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc':      rfc,
     tipoDeComprobante: 'E',
     source:            'SAT',
     satStatus:         'Vigente',
     isActive:          true,
-    'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] },
   };
   const selectNc = 'uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida';
 
@@ -166,7 +338,27 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     // día).
     const uuidsNcDelDia = await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi: 'E', fechaInicio, fechaFin });
     if (!uuidsNcDelDia.size) return [];
-    const ncsRaw = await CFDI.find({ ...filtroBaseNc, uuid: { $in: [...uuidsNcDelDia] } })
+
+    // Algunas NCs (Club Tuberos, cancelaciones-refacturación) no traen
+    // cfdiRelacionados.tipoRelacion poblado a nivel SAT — solo se identifican
+    // por el indicador documentosRelacionados del ERP (hallazgo 2026-07-17,
+    // UUIDs 102A4165.../79B7BB10... no se fusionaban por esto). Se calcula
+    // el set de UUIDs con ese indicador para incluirlas también.
+    const erpConIndicador = await CFDI.find({
+      uuid:   { $in: [...uuidsNcDelDia] },
+      source: 'ERP',
+      'documentosRelacionados.Serie': { $in: SERIES_FUSION_NC },
+    }).select('uuid').lean();
+    const uuidsConIndicadorErp = erpConIndicador.map(d => d.uuid);
+
+    const ncsRaw = await CFDI.find({
+      ...filtroBaseNc,
+      uuid: { $in: [...uuidsNcDelDia] },
+      $or: [
+        { 'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] } },
+        { uuid: { $in: uuidsConIndicadorErp } },
+      ],
+    })
       .select(selectNc)
       .lean();
     ncs = ncsRaw.filter(nc => !uuidsYaUsados.has((nc.uuid || '').toUpperCase()));
@@ -179,9 +371,14 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     }
   } else {
     // Generación de todo el periodo: comportamiento original, por relación
-    // con las facturas ya cargadas en este batch.
+    // con las facturas ya cargadas en este batch. NOTA: a diferencia del
+    // branch por día, aquí NO se agrega el indicador documentosRelacionados
+    // (BCT/CANCELACION/etc.) — esas NCs no tienen cfdiRelacionados.uuid, así
+    // que el matching por relUuidsDe()/facturaSet nunca las encontraría de
+    // todos modos; requeriría matching por serie+folio, no por UUID. Pendiente
+    // si se necesita generación de periodo completo (no por día) con estas NCs.
     if (!facturaUuids.length) return [];
-    const ncsRaw = await CFDI.find(filtroBaseNc).select(selectNc).lean();
+    const ncsRaw = await CFDI.find({ ...filtroBaseNc, 'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] } }).select(selectNc).lean();
     const facturaSet = new Set(facturaUuids.map(u => u.toUpperCase()));
     ncs = ncsRaw.filter(nc =>
       !uuidsYaUsados.has((nc.uuid || '').toUpperCase()) &&
@@ -291,8 +488,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const uuidsPorFechaProp = (fechaInicio && fechaFin)
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
+  const foliosCancelacionProp = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
+  // Solo CFDIs EMITIDOS por esta entidad — con receptor.rfc en el filtro se
+  // colaban compras/gastos (CFDIs donde `rfc` es cliente de un tercero) dentro
+  // de la póliza de Ingresos de sus propias ventas (confirmado con el usuario
+  // 2026-07-28, mismo patrón de bug ya corregido en notInErp/discrepancias*).
   const filtroBase = {
-    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc':      rfc,
     ejercicio:         Number(ejercicio),
     periodo:           Number(periodo),
     tipoDeComprobante: tipoCfdi,
@@ -388,17 +590,31 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
     const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
+    // Refacturación (factura nueva que reemplaza una venta cancelada, misma
+    // serie/sucursal, Folio referenciado coincide con el que referencia una
+    // NC Serie=CANCELACION del mismo día) — confirmado con el usuario
+    // 2026-07-17: su cargo (dinero en banco/caja) ya está contabilizado en el
+    // asiento de la CANCELACION original, así que no debe consolidarse como
+    // depósito nuevo (ver `esRefacturacion` en poliza.service.js). Cruce
+    // exacto por Folio contra `foliosCancelacionProp` — ver comentario en
+    // `_foliosCancelacionDelDia`.
+    const esRefacturacion = !esBCT && !esBON &&
+      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionProp.has(d.Folio));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : esRefacturacion ? 'Refacturación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
   });
+
+  // Completar relMetodoPagoMap/relFacturaMetaMap con relacionados que solo
+  // aparecieron tras el merge ERP — ver `_completarRelacionadosPostMerge`.
+  await _completarRelacionadosPostMerge(cfdisSinPolizaFinal, relMetodoPagoMap, relFacturaMetaMap);
 
   // Enriquecer tasaIvaInferida en memoria para CFDIs P Metadata.
   // Paso 1: facturas relacionadas en MongoDB SAT. Paso 2: fallback ERP.
@@ -463,6 +679,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const cfdisConNCProp = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap: ccBySerieMapProp })]
     : cfdisSinPolizaFinalFiltrado;
+
+  // Las NC fusionadas (_fetchNotasCreditoParaFusion) se agregan DESPUÉS del
+  // primer `_completarRelacionadosPostMerge` — completar de nuevo (solo agrega
+  // lo que aún falte) para que su `context.metodoPagoRelacionado` también se
+  // resuelva más abajo.
+  await _completarRelacionadosPostMerge(cfdisConNCProp, relMetodoPagoMap, relFacturaMetaMap);
 
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
   const cfdiConRegla = cfdisConNCProp.map(cfdi => ({
@@ -747,8 +969,12 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const uuidsPorFechaGuard = (fechaInicio && fechaFin)
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
+  const foliosCancelacionGuard = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
+  // Solo CFDIs EMITIDOS por esta entidad — ver comentario equivalente en
+  // generarPropuesta (mismo fix, mismo motivo: receptor.rfc colaba compras
+  // ajenas dentro de la póliza de Ingresos).
   const filtroBase = {
-    $or:               [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc':      rfc,
     ejercicio:         Number(ejercicio),
     periodo:           Number(periodo),
     tipoDeComprobante: tipoCfdi,
@@ -835,17 +1061,25 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       ? 'PUE' : (cfdi.metodoPago || erp.metodoPago);
     const esBCT = erp.documentosRelacionados?.some(d => d.Serie === 'BCT');
     const esBON = !esBCT && erp.documentosRelacionados?.some(d => (d.Serie ?? '').startsWith('BON'));
+    // Refacturación — ver comentario en generarPropuesta (misma detección,
+    // cruce exacto por Folio contra `foliosCancelacionGuard`).
+    const esRefacturacion = !esBCT && !esBON &&
+      erp.documentosRelacionados?.some(d => d.Serie === cfdi.serie && foliosCancelacionGuard.has(d.Folio));
     return {
       ...cfdi,
       formaPago:              cfdi.formaPago  || erp.formaPago,
       metodoPago:             metodoPagoFinal,
       conceptos:              satHasTraslados     ? cfdi.conceptos : (erp.conceptos?.length ? erp.conceptos : cfdi.conceptos ?? []),
       impuestos:              satHasBaseTraslados  ? cfdi.impuestos : (erp.impuestos ?? cfdi.impuestos),
-      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
+      tipoOrigen:             esBCT ? 'Bonificación Club Tuberos' : esBON ? 'Bonificación' : esRefacturacion ? 'Refacturación' : (cfdi.tipoOrigen ?? erp.tipoOrigen ?? null),
       documentosRelacionados: erp.documentosRelacionados ?? cfdi.documentosRelacionados ?? [],
       cfdiRelacionados:       relERP.length ? [...relSAT, ...relERP] : relSAT,
     };
   });
+
+  // Completar relMetodoPagoMapGuard/relFacturaMetaMapGuard con relacionados que
+  // solo aparecieron tras el merge ERP — ver `_completarRelacionadosPostMerge`.
+  await _completarRelacionadosPostMerge(cfdisSinPolizaFinalGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
 
   // Enriquecer tasaIvaInferida en memoria para CFDIs P Metadata.
   // Paso 1: facturas relacionadas en MongoDB SAT. Paso 2: fallback ERP.
@@ -906,6 +1140,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const cfdisConNCGuard = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalGuardFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalGuardFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap })]
     : cfdisSinPolizaFinalGuardFiltrado;
+
+  // Las NC fusionadas se agregan DESPUÉS del primer `_completarRelacionadosPostMerge`
+  // — completar de nuevo (solo agrega lo que aún falte), ver comentario equivalente
+  // en generarPropuesta.
+  await _completarRelacionadosPostMerge(cfdisConNCGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
 
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
@@ -1121,11 +1360,33 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       { replacements: { key: `poliza-${tipoPropuesta}-${rfc}-${ejercicio}-${periodo}` }, transaction: t },
     );
 
-    const max = await Poliza.max('numero', {
-      where: { tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo) },
-      transaction: t,
+    // Rango de folios reservado por sucursal (ver RANGOS_FOLIO_POR_SUCURSAL):
+    // el folio nunca sale de su rango y se reinicia en `desde` cada periodo.
+    // Sin centroCostoId (o sucursal sin rango asignado) se conserva el
+    // comportamiento anterior: contador simple por tipo/rfc/ejercicio/periodo.
+    const centroFolio = centroCostoId
+      ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))
+      : null;
+    const rangoFolio = _rangoFolioPorSucursal(centroFolio?.sucursal);
+
+    // ¿Esta póliza nueva va a mezclar Contado y Crédito? (solo aplica a
+    // Ingreso) — si sí, necesita reservar 2 folios consecutivos, no 1.
+    // CEDIS es un caso especial que puede necesitar hasta 6 (ver
+    // _folioSiguienteDisponible arriba) — se reservan siempre los 6.
+    const metodosPagoNuevos = new Set(todosLosMovimientos.map(m => m.metodoPago));
+    const consumeDosFolios = tipoPropuesta === 'I'
+      && [...metodosPagoNuevos].some(m => m !== 'PPD') && metodosPagoNuevos.has('PPD');
+    const foliosNecesarios = _esCedisPorSucursal(centroFolio?.sucursal) ? FOLIOS_MAX_CEDIS : (consumeDosFolios ? 2 : 1);
+
+    const { numero, agotado } = await _folioSiguienteDisponible({
+      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t,
     });
-    const numero = (max || 0) + 1;
+
+    if (agotado) {
+      throw new BadRequestError(
+        `Se agotó el rango de folios de ${centroFolio.sucursal} para este periodo (${rangoFolio.desde}-${rangoFolio.hasta}).`,
+      );
+    }
 
     const polizaHeader = await Poliza.create({
       tipo:      tipoPropuesta,
@@ -1294,9 +1555,13 @@ async function _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fecha
   const mxInicio     = _medianocheMx(fechaInicio);
   const mxFin        = new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1);
 
+  // Mismo fix que filtroBase en generarPropuesta/generarYGuardar — este
+  // universo de UUIDs por fecha debe coincidir exactamente con el de esas
+  // funciones (emisor.rfc únicamente) o el filtro por rango de fechas
+  // seleccionaría un conjunto distinto de CFDIs al de la generación real.
   const filtroComun = {
     tipoDeComprobante: tipoCfdi,
-    $or: [{ 'emisor.rfc': rfc }, { 'receptor.rfc': rfc }],
+    'emisor.rfc': rfc,
   };
 
   // 1. SAT cuyo fecha "ingenuo" cae en el rango — mismo universo que el

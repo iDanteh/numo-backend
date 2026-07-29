@@ -70,4 +70,33 @@ async function toggleActive(id) {
   return updated;
 }
 
-module.exports = { findOrCreate, listUsers, updateRole, toggleActive };
+// Reemplaza la lista COMPLETA de empresas fijas del usuario (no es
+// add/remove incremental — el caller manda el array final deseado).
+async function updateEmpresas(id, empresaRfcs) {
+  const { Entity } = require('../../../shared/models/postgres');
+  const rfcs = [...new Set((empresaRfcs ?? []).map(r => String(r).toUpperCase().trim()).filter(Boolean))];
+
+  let empresas = [];
+  if (rfcs.length) {
+    const { Op } = require('sequelize');
+    const rows = await Entity.findAll({ where: { rfc: { [Op.in]: rfcs } }, attributes: ['rfc', 'nombre'], raw: true });
+    const faltantes = rfcs.filter(rfc => !rows.some(r => r.rfc === rfc));
+    if (faltantes.length) throw new BadRequestError(`No existe ninguna empresa con RFC: ${faltantes.join(', ')}.`);
+    empresas = rows.map(r => ({ rfc: r.rfc, nombre: r.nombre }));
+  }
+
+  const user = await userRepo.updateEmpresas(id, rfcs);
+  if (!user) throw new NotFoundError('Usuario');
+
+  // Notifica al usuario en sesión con sus empresas asignadas — mismo evento
+  // que usa updateRole() para que el frontend no necesite dos listeners.
+  const io = getIo();
+  if (io && user.auth0Sub) {
+    const permissions = await rbacStore.getPermissions(user.role);
+    io.to(`user:${user.auth0Sub}`).emit('role:updated', { role: user.role, permissions, empresas });
+  }
+
+  return user;
+}
+
+module.exports = { findOrCreate, listUsers, updateRole, toggleActive, updateEmpresas };

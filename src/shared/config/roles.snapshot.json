@@ -1,0 +1,62 @@
+[
+  {
+    "value": "admin",
+    "label": "Administrador",
+    "permissions": [
+      "*"
+    ],
+    "isSystem": true
+  },
+  {
+    "value": "cobranza",
+    "label": "Cobranza",
+    "permissions": [
+      "banks:read",
+      "banks:update",
+      "banks:export",
+      "banks:ficha",
+      "banks:cobro",
+      "banks:import",
+      "banks:export:all"
+    ],
+    "isSystem": true
+  },
+  {
+    "value": "contabilidad",
+    "label": "Contabilidad",
+    "permissions": [
+      "banks:read",
+      "banks:import",
+      "banks:update",
+      "banks:config",
+      "banks:rules",
+      "banks:ficha",
+      "banks:export",
+      "banks:export:all",
+      "account-plan:read",
+      "account-plan:write",
+      "polizas:read",
+      "polizas:write",
+      "erp:manage",
+      "visor:write",
+      "visor:sat",
+      "drive:read",
+      "drive:import",
+      "banks:erp:link",
+      "visor:read",
+      "visor:reports",
+      "polizas:admin",
+      "entities:write",
+      "entities:read"
+    ],
+    "isSystem": true
+  },
+  {
+    "value": "tienda",
+    "label": "Tienda",
+    "permissions": [
+      "collections:read"
+    ],
+    "isSystem": true
+  }
+]

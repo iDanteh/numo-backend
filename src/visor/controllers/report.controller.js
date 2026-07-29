@@ -5,7 +5,9 @@ const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
 const BankMovement = require('../../banks/domains/banks/BankMovement.model');
 const { asyncHandler } = require('../../shared/middleware/error-handler');
+const entityRepo = require('../repositories/entity.repository');
 const { SERIES_CON_AUTH } = require('../../banks/domains/erp/erp-auth.utils');
+const { generarSugerencias: generarSugerenciasConciliacion } = require('../services/conciliacion-sugerencias.service');
 
 // Cache in-memory para el dashboard — evita lanzar 15 queries MongoDB
 // en cada carga de pantalla cuando múltiples usuarios consultan al mismo tiempo.
@@ -92,7 +94,14 @@ function ordenarKardex(movimientos) {
 // pago bancario real (series con autorización: CBT/ABO/CPF/CFC) o ajuste sin
 // depósito (bonificación, descuento, devolución, retención, etc.) — para que
 // la UI pueda explicar por qué el saldo bajó sin que exista un depósito.
-async function buscarCuentasPorCobrarConMovimientos(erpIds) {
+//
+// `erp_cuentas_pendientes` es un feed que el ERP expone SOLO con cuentas
+// ABIERTAS: en cuanto se saldan (o quedan fuera de la ventana de sync)
+// desaparecen del feed para siempre. Para los erpId que ya no aparecen ahí,
+// se reconstruye una CxC sintética a partir de bank_movements.erpLinks — el
+// snapshot que Kore guardó al momento de conciliar (total/saldoActual/
+// movimientosKore) — para no perder el dato solo porque el ERP lo purgó.
+async function buscarCuentasPorCobrarConMovimientos(erpIds, movimientosBanco = []) {
   if (!erpIds.length) return [];
   const docs = await CFDI.db.collection('erp_cuentas_pendientes').find(
     { erpId: { $in: erpIds } },
@@ -103,13 +112,65 @@ async function buscarCuentasPorCobrarConMovimientos(erpIds) {
     } },
   ).toArray();
 
-  return docs.map(doc => ({
+  const encontrados = new Set(docs.map(d => d.erpId));
+  const faltantes = erpIds.filter(id => !encontrados.has(id));
+  const sinteticos = faltantes
+    .map(erpId => construirCxcSintetica(erpId, movimientosBanco))
+    .filter(Boolean);
+
+  return [...docs, ...sinteticos].map(doc => ({
     ...doc,
     movimientos: ordenarKardex(doc.movimientos ?? []).map(m => ({
       ...m,
       esPagoBancario: SERIES_CON_AUTH.includes(m.serie),
     })),
   }));
+}
+
+// Reconstruye una CxC "solo en banco" (ya purgada de erp_cuentas_pendientes)
+// a partir de los erpLinks que Kore guardó al conciliar. Una misma CxC puede
+// tener varias parcialidades -> varios bank_movements distintos con su propio
+// erpLink para el MISMO erpId, cada uno con su fracción de movimientosKore;
+// hay que juntarlos todos, no solo el primero que aparezca.
+function construirCxcSintetica(erpId, movimientosBanco) {
+  const links = movimientosBanco.flatMap(bm => bm.erpLinks ?? []).filter(l => l.erpId === erpId);
+  if (!links.length) return null;
+
+  const movimientos = ordenarKardex(
+    links.flatMap(l => l.movimientosKore ?? []).map(mk => ({
+      serie: mk.serie ?? null, folio: mk.folio ?? null,
+      serieOrigen: mk.serieOrigen ?? null, folioOrigen: mk.folioOrigen ?? null,
+      fecha: mk.fecha ?? null,
+      saldoAnterior: mk.saldoAnterior ?? null, saldoActual: mk.saldoActual ?? null,
+      total: mk.total ?? 0,
+    })),
+  );
+
+  // erpLink.saldoActual es un snapshot tomado al momento de conciliar ESE
+  // movimiento puntual — puede quedar desfasado si hubo abonos posteriores.
+  // El saldoActual real y más reciente es el del ÚLTIMO movimiento de la
+  // cadena ya ordenada cronológicamente; el link solo se usa de fallback si
+  // no hay ningún movimientoKore (caso extremo, no debería pasar en la práctica).
+  const ultimoMovimiento = movimientos[movimientos.length - 1] ?? null;
+  const link = links[0];
+
+  return {
+    erpId,
+    serie: null,
+    folio: null,
+    serieExterna: link.serie ?? null,
+    folioExterno: link.folioExterno ?? null,
+    total: link.total ?? null,
+    saldoActual: ultimoMovimiento?.saldoActual ?? link.saldoActual ?? null,
+    concepto: null,
+    tipoPago: link.tipoPago ?? null,
+    tipoMovimiento: null,
+    fechaCreacion: null,
+    fechaAfectacion: null,
+    fechaRealPago: null,
+    soloEnBanco: true,
+    movimientos,
+  };
 }
 
 // Series que en documentosRelacionados marcan el TIPO de Nota de Crédito
@@ -397,6 +458,16 @@ const dashboard = asyncHandler(async (req, res) => {
 
   const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
 
+  // El dashboard solo debe contar Emitidos — nunca Recibidos (aunque compartan
+  // source SAT/MANUAL/ERP). Si el frontend no manda rfcEmisor (ej. mientras
+  // carga la entidad activa), se restringe a las RFC de las entidades propias
+  // en vez de dejar el filtro abierto a cualquier emisor.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
+
   const dateFilter = {};
   if (fechaInicio) {
     const d = fechaInicio.split('T')[0];
@@ -418,13 +489,11 @@ const dashboard = asyncHandler(async (req, res) => {
   // Filtro base para KPIs de conciliación (solo ERP activos, sin cancelados ni deshabilitados)
   // Debe coincidir con los mismos criterios que countERP del aggregate de montos.
   // ERP: se filtra por erpStatus (estado en el origen), no satStatus
-  const cfdiFilter = { isActive: true, source: 'ERP', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter };
-  if (rfcEmisor) cfdiFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const cfdiFilter = { isActive: true, source: 'ERP', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID/ }, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) cfdiFilter.fecha = dateFilter;
 
   // Filtro para IVA y tipos: todos los CFDIs activos (ERP + SAT + MANUAL)
-  const baseFilter = { isActive: true, ...periodoFilter };
-  if (rfcEmisor) baseFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const baseFilter = { isActive: true, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) baseFilter.fecha = dateFilter;
 
   // Filtro para montos: ERP, SAT y MANUAL (MANUAL = XMLs del portal SAT subidos manualmente).
@@ -433,23 +502,19 @@ const dashboard = asyncHandler(async (req, res) => {
   // o isActive=1 no serían encontrados con la comparación estricta boolean.
   // MANUAL se agrupa junto con SAT (igual que en comparisonEngine) para que el
   // total SAT del dashboard refleje todos los documentos del lado SAT.
-  const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter };
-  if (rfcEmisor) montosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const montosFilter = { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) montosFilter.fecha = dateFilter;
 
   // Filtro para CFDIs SAT/MANUAL que no tienen contraparte ERP
-  const satSoloFilter = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, lastComparisonStatus: 'not_in_erp', ...periodoFilter };
-  if (rfcEmisor) satSoloFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const satSoloFilter = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, lastComparisonStatus: 'not_in_erp', 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) satSoloFilter.fecha = dateFilter;
 
   // Cancelados ERP: solo los que tienen erpStatus = 'Cancelado'
-  const canceladosFilter = { source: 'ERP', erpStatus: 'Cancelado', ...periodoFilter };
-  if (rfcEmisor) canceladosFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const canceladosFilter = { source: 'ERP', erpStatus: 'Cancelado', 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) canceladosFilter.fecha = dateFilter;
 
   // Vigentes en SAT que también están en ERP
-  const vigenteErpSatFilter = { isActive: true, source: 'ERP', satStatus: 'Vigente', uuid: { $not: /^SINUUID/ }, ...periodoFilter };
-  if (rfcEmisor) vigenteErpSatFilter['emisor.rfc'] = rfcEmisor.toUpperCase();
+  const vigenteErpSatFilter = { isActive: true, source: 'ERP', satStatus: 'Vigente', uuid: { $not: /^SINUUID/ }, 'emisor.rfc': emisorConstraint, ...periodoFilter };
   if (Object.keys(dateFilter).length) vigenteErpSatFilter.fecha = dateFilter;
 
   const [
@@ -461,7 +526,7 @@ const dashboard = asyncHandler(async (req, res) => {
     ivaAggregate, ivaByTipoAggregate,
   ] = await Promise.all([
     // Total: solo ERP activos válidos + SAT/MANUAL activos válidos (sin deshabilitados ni SINUUID)
-    CFDI.countDocuments({ isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, uuid: { $not: /^SINUUID/ }, satStatus: { $nin: ['Deshabilitado'] }, erpStatus: { $nin: ['Deshabilitado'] }, ...periodoFilter, ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }), ...(Object.keys(dateFilter).length && { fecha: dateFilter }) }),
+    CFDI.countDocuments({ isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, uuid: { $not: /^SINUUID/ }, satStatus: { $nin: ['Deshabilitado'] }, erpStatus: { $nin: ['Deshabilitado'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter, ...(Object.keys(dateFilter).length && { fecha: dateFilter }) }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['match', 'conciliado'] } }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: ['discrepancy', 'warning'] } }),
     CFDI.countDocuments({ ...cfdiFilter, lastComparisonStatus: { $in: [null, 'error', 'pending'] } }),
@@ -536,8 +601,7 @@ const dashboard = asyncHandler(async (req, res) => {
     //   SAT/MANUAL → satStatus Vigente
     //   isActive: { $ne: false } en lugar de true para evitar problemas de type-casting en aggregate
     CFDI.aggregate([
-      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter,
-        ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }),
+      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter,
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
@@ -555,8 +619,7 @@ const dashboard = asyncHandler(async (req, res) => {
 
     // IVA desglosado por tipo de comprobante (modal de detalle), mismos criterios
     CFDI.aggregate([
-      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, ...periodoFilter,
-        ...(rfcEmisor && { 'emisor.rfc': rfcEmisor.toUpperCase() }),
+      { $match: { isActive: { $ne: false }, source: { $in: ['ERP', 'SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter,
         ...(Object.keys(dateFilter).length && { fecha: dateFilter }),
       }},
       { $match: { $or: [
@@ -650,15 +713,151 @@ const dashboard = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/reports/dashboard-recibidos
+ * Dashboard de CFDIs Recibidos — a diferencia de /dashboard (Emitidos), aquí no
+ * existe motor de comparación contra ERP: Recibidos solo tiene verificación SAT
+ * (Vigente/Cancelado/No Encontrado/etc.), así que las estadísticas se limitan a eso.
+ */
+const dashboardRecibidos = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey({ _scope: 'recibidos', ...req.query });
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const { rfcReceptor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
+
+  let receptorConstraint = rfcReceptor ? rfcReceptor.toUpperCase() : null;
+  if (!receptorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    receptorConstraint = { $in: entidadesRfcs };
+  }
+
+  const dateFilter = {};
+  if (fechaInicio) {
+    const d = fechaInicio.split('T')[0];
+    dateFilter.$gte = new Date(`${d}T06:00:00Z`);
+  }
+  if (fechaFin) {
+    const d   = fechaFin.split('T')[0];
+    const fin = new Date(`${d}T06:00:00Z`);
+    fin.setUTCDate(fin.getUTCDate() + 1);
+    dateFilter.$lt = fin;
+  }
+
+  const periodoFilter = {};
+  if (ejercicio)         periodoFilter.ejercicio         = parseInt(ejercicio);
+  if (periodo)           periodoFilter.periodo           = parseInt(periodo);
+  if (tipoDeComprobante) periodoFilter.tipoDeComprobante = tipoDeComprobante;
+  else                   periodoFilter.tipoDeComprobante = { $ne: 'N' };
+
+  const baseFilter = {
+    isActive: { $ne: false },
+    source: { $in: ['SAT', 'MANUAL'] },
+    'receptor.rfc': receptorConstraint,
+    ...periodoFilter,
+  };
+  if (Object.keys(dateFilter).length) baseFilter.fecha = dateFilter;
+
+  const [totalCFDIs, cfdisBySatStatus, cfdisByTipo, vigenteAggregate, sinVerificar] = await Promise.all([
+    CFDI.countDocuments(baseFilter),
+    CFDI.aggregate([
+      { $match: baseFilter },
+      { $group: { _id: '$satStatus', count: { $sum: 1 }, total: { $sum: MONTO_EFECTIVO_EXPR } } },
+      { $sort: { count: -1 } },
+    ]),
+    CFDI.aggregate([
+      { $match: baseFilter },
+      { $group: { _id: '$tipoDeComprobante', count: { $sum: 1 }, total: { $sum: MONTO_EFECTIVO_EXPR } } },
+      { $sort: { _id: 1 } },
+    ]),
+    CFDI.aggregate([
+      { $match: { ...baseFilter, satStatus: 'Vigente' } },
+      { $group: { _id: null, total: { $sum: MONTO_EFECTIVO_EXPR }, count: { $sum: 1 } } },
+    ]),
+    CFDI.countDocuments({ ...baseFilter, satStatus: { $in: [null, 'Pendiente'] } }),
+  ]);
+
+  const responseData = {
+    kpis: {
+      totalCFDIs,
+      totalVigente:  vigenteAggregate[0]?.total ?? 0,
+      countVigente:  vigenteAggregate[0]?.count ?? 0,
+      sinVerificar,
+      cfdisBySatStatus,
+      cfdisByTipo,
+    },
+  };
+
+  setCache(cacheKey, responseData);
+  res.json(responseData);
+});
+
+/**
+ * GET /api/reports/resumen-cfdis
+ * Resumen ligero (solo conteos) de CFDIs Emitidos y Recibidos descargados
+ * del SAT (source SAT/MANUAL — no cuenta los CFDIs que solo existen como
+ * registro ERP), para la tarjeta de resumen del hub general de CFDIs.
+ * A diferencia de /dashboard y /dashboard-recibidos, no corre el motor de
+ * comparación — son 6 countDocuments simples, pensado para cargar rápido.
+ */
+const resumenCfdis = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey({ _scope: 'resumen', ...req.query });
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const { rfcEmisor, rfcReceptor, ejercicio, periodo } = req.query;
+
+  let emisorConstraint   = rfcEmisor   ? rfcEmisor.toUpperCase()   : null;
+  let receptorConstraint = rfcReceptor ? rfcReceptor.toUpperCase() : null;
+  if (!emisorConstraint || !receptorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    if (!emisorConstraint)   emisorConstraint   = { $in: entidadesRfcs };
+    if (!receptorConstraint) receptorConstraint = { $in: entidadesRfcs };
+  }
+
+  const periodoFilter = {};
+  if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
+  if (periodo)   periodoFilter.periodo   = parseInt(periodo);
+
+  const emitidosFilter  = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc':   emisorConstraint,   ...periodoFilter };
+  const recibidosFilter = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, 'receptor.rfc': receptorConstraint, ...periodoFilter };
+
+  const [emitidosTotal, emitidosVigente, emitidosCancelado, recibidosTotal, recibidosVigente, recibidosCancelado] = await Promise.all([
+    CFDI.countDocuments(emitidosFilter),
+    CFDI.countDocuments({ ...emitidosFilter, satStatus: 'Vigente' }),
+    CFDI.countDocuments({ ...emitidosFilter, satStatus: 'Cancelado' }),
+    CFDI.countDocuments(recibidosFilter),
+    CFDI.countDocuments({ ...recibidosFilter, satStatus: 'Vigente' }),
+    CFDI.countDocuments({ ...recibidosFilter, satStatus: 'Cancelado' }),
+  ]);
+
+  const responseData = {
+    emitidos:  { total: emitidosTotal,  vigente: emitidosVigente,  cancelado: emitidosCancelado },
+    recibidos: { total: recibidosTotal, vigente: recibidosVigente, cancelado: recibidosCancelado },
+  };
+
+  setCache(cacheKey, responseData);
+  res.json(responseData);
+});
+
+/**
  * GET /api/reports/discrepancias-montos
  * Retorna comparaciones con diferencias en montos/impuestos para el modal del dashboard.
  */
 const CAMPOS_MONTO = ['total', 'subTotal', 'impuestos.totalImpuestosTrasladados', 'impuestos.totalImpuestosRetenidos', 'complementoPago.montoTotalPagos'];
 
 const discrepanciasMontos = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, tipoDeComprobante, page = 1, limit = 100, campos } = req.query;
+  const { ejercicio, periodo, tipoDeComprobante, page = 1, limit = 100, campos, rfcEmisor } = req.query;
   const pg = Math.max(1, parseInt(page));
   const lm = Math.min(1000, Math.max(1, parseInt(limit)));
+
+  // Este reporte es solo de Emitidos — igual que /dashboard y /not-in-erp,
+  // nunca debe incluir Recibidos (que jamás tienen contraparte ERP y
+  // contaminarían la sección "sin contraparte en ERP" de este modal).
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   // Si se pasa `campos` (csv), filtrar solo esos; si no, todos los de monto
   const camposFiltro = campos
@@ -677,6 +876,7 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     source: 'ERP',
     erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] },
     lastComparisonStatus: { $in: ['discrepancy', 'warning'] },
+    'emisor.rfc': emisorConstraint,
     ...periodoFiltro,
   }).select('_id').lean().then(docs => docs.map(d => d._id));
 
@@ -702,7 +902,7 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
   const cfdiSelect = 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda';
 
   // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito
-  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } };
+  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint };
   if (tipoDeComprobante) pendienteFiltro.tipoDeComprobante = tipoDeComprobante;
   if (ejercicio && periodo) {
     const ej = parseInt(ejercicio), pe = parseInt(periodo);
@@ -727,15 +927,15 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
     Comparison.countDocuments(filter),
 
     // ERP en el periodo que no tienen contraparte en SAT
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, lastComparisonStatus: 'not_in_sat', ...cfdiPeriodoFiltro })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, lastComparisonStatus: 'not_in_sat', 'emisor.rfc': emisorConstraint, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
 
     // SAT/MANUAL en el periodo que no tienen contraparte en ERP
-    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...cfdiPeriodoFiltro })
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', 'emisor.rfc': emisorConstraint, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
 
     // ERP activo pero SAT cancelado (cruce de estatus fiscal)
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, ...cfdiPeriodoFiltro })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint, ...cfdiPeriodoFiltro })
       .select(cfdiSelect).sort({ total: -1 }).limit(500).lean(),
 
     // ERP con RFC con & — verificación SAT pendiente (SOAP no soporta %26)
@@ -861,8 +1061,17 @@ const satVigenteErpInactivo = asyncHandler(async (req, res) => {
  * incluyendo not_in_erp, not_in_sat, discrepancias de monto, RFC, etc.
  */
 const discrepanciasCriticas = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
+  const { ejercicio, periodo, tipoDeComprobante, limit = 500, rfcEmisor } = req.query;
   const lm = Math.min(2000, Math.max(1, parseInt(limit)));
+
+  // Este reporte es solo de Emitidos — igual que /dashboard, /not-in-erp y
+  // /discrepancias-montos, nunca debe incluir Recibidos (que jamás tienen
+  // contraparte ERP y contaminarían el bucket "not_in_erp" de este reporte).
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   // matchPeriodo sobre Comparison — solo ejercicio/periodo, NO tipoDeComprobante
   // (tipoDeComprobante puede ser null en Comparisons antiguos, lo filtramos post-lookup)
@@ -871,8 +1080,8 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   if (periodo)   matchPeriodo.periodo   = parseInt(periodo);
 
   // Filtro CFDI para los casos que se leen directamente de la colección CFDI
-  const cfdiErp = { source: 'ERP', isActive: { $ne: false } };
-  const cfdiSat = { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false } };
+  const cfdiErp = { source: 'ERP', isActive: { $ne: false }, 'emisor.rfc': emisorConstraint };
+  const cfdiSat = { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, 'emisor.rfc': emisorConstraint };
   if (ejercicio)         { cfdiErp.ejercicio = parseInt(ejercicio); cfdiSat.ejercicio = parseInt(ejercicio); }
   if (periodo)           { cfdiErp.periodo   = parseInt(periodo);   cfdiSat.periodo   = parseInt(periodo);   }
   if (tipoDeComprobante) { cfdiErp.tipoDeComprobante = tipoDeComprobante; cfdiSat.tipoDeComprobante = tipoDeComprobante; }
@@ -985,8 +1194,17 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
  * registros históricos de la colección Comparison.
  */
 const notInErp = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, tipoDeComprobante, limit = 500 } = req.query;
+  const { ejercicio, periodo, tipoDeComprobante, rfcEmisor, limit = 500 } = req.query;
   const lm = Math.min(2000, Math.max(1, parseInt(limit)));
+
+  // Este reporte es solo de Emitidos — igual que /dashboard, nunca debe
+  // incluir Recibidos (que jamás tienen contraparte ERP y contaminarían
+  // el listado). Si no llega rfcEmisor se restringe a las entidades propias.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   const periodoBase = {};
   if (ejercicio)         periodoBase.ejercicio         = parseInt(ejercicio);
@@ -996,11 +1214,11 @@ const notInErp = asyncHandler(async (req, res) => {
   const selectFields = 'uuid serie folio fecha tipoDeComprobante total moneda emisor receptor satStatus lastComparisonStatus ejercicio periodo source';
 
   // Paso 1: ERP del periodo seleccionado
-  const erpDelPeriodo = await CFDI.find({ isActive: { $ne: false }, source: 'ERP', ...periodoBase }, 'uuid ejercicio periodo').lean();
+  const erpDelPeriodo = await CFDI.find({ isActive: { $ne: false }, source: 'ERP', 'emisor.rfc': emisorConstraint, ...periodoBase }, 'uuid ejercicio periodo').lean();
   const erpUuidsPeriodo = new Set(erpDelPeriodo.map(d => d.uuid?.toUpperCase()).filter(Boolean));
 
   // Paso 2: SAT/MANUAL del periodo seleccionado (sin filtro de tipo)
-  const satFiltroBase = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] } };
+  const satFiltroBase = { isActive: { $ne: false }, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc': emisorConstraint };
   if (periodoBase.ejercicio) satFiltroBase.ejercicio = periodoBase.ejercicio;
   if (periodoBase.periodo)   satFiltroBase.periodo   = periodoBase.periodo;
 
@@ -3064,6 +3282,32 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
                   in: '$$link.erpId',
                 },
               },
+              // Kardex embebido de esta CxC (snapshot que Kore guardó al conciliar).
+              // Fallback para Parcialidad/Saldo Anterior cuando la CxC ya se purgó
+              // de erp_cuentas_pendientes (ese feed solo trae cuentas ABIERTAS) y
+              // el CFDI-P tampoco trae sus propios impSaldoAnt/impSaldoInsoluto —
+              // mismo patrón que construirCxcSintetica() usa para el modal de CxC.
+              movimientosKoreOrigen: {
+                $let: {
+                  vars: {
+                    link: {
+                      $arrayElemAt: [{
+                        $filter: {
+                          input: { $ifNull: ['$$m.erpLinks', []] },
+                          as: 'l',
+                          cond: {
+                            $eq: [
+                              { $toLower: { $ifNull: ['$$l.folioFiscal', ''] } },
+                              { $toLower: { $ifNull: ['$complementoPago.pagos.doctosRelacionados.idDocumento', ''] } },
+                            ],
+                          },
+                        },
+                      }, 0],
+                    },
+                  },
+                  in: { $ifNull: ['$$link.movimientosKore', []] },
+                },
+              },
               identificadoPorNombre: {
                 $let: {
                   vars: {
@@ -3343,10 +3587,43 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
       },
       movimientoId:     { $arrayElemAt: ['$movimientos._id', 0] },
       identificadoPor:  { $arrayElemAt: ['$movimientos.identificadoPorNombre', 0] },
+      // Solo para el fallback en JS de abajo — no se exporta al Excel (no está
+      // en sheet.columns).
+      movKardexFallback: { $ifNull: [{ $arrayElemAt: ['$movimientos.movimientosKoreOrigen', 0] }, []] },
+      pagoMontoTotal:    '$complementoPago.pagos.monto',
     }},
   ];
 
   const rows = await CFDI.aggregate(pipeline).allowDiskUse(true);
+
+  // Fallback: si ni el CFDI-P (impSaldoAnt/impSaldoInsoluto propios) ni el
+  // cruce con erp_cuentas_pendientes (parcialidadInfo, ya resuelto arriba en
+  // el pipeline) lograron llenar Parcialidad/Saldo Anterior/Saldo Insoluto,
+  // se reconstruye desde el kardex embebido en bank_movements.erpLinks
+  // (movKardexFallback) — la misma CxC purgada del feed ERP que ya se
+  // resuelve así en el modal (ver construirCxcSintetica).
+  for (const r of rows) {
+    if (r.impSaldoAnt != null || r.impSaldoInsoluto != null) continue;
+    const kardex = r.movKardexFallback;
+    if (!kardex?.length) continue;
+
+    const montoPago = r.pagoMontoTotal ?? r.impPagado ?? 0;
+    const ordenado = kardex.every(mk => mk.fecha)
+      ? [...kardex].sort((a, b) => new Date(a.fecha) - new Date(b.fecha))
+      : kardex;
+    const abono = ordenado.find(mk =>
+      Math.abs((mk.formasPago ?? []).reduce((s, fp) => s + (fp.monto ?? 0), 0) - montoPago) <= 1,
+    );
+    if (!abono) continue;
+
+    r.impSaldoAnt      = abono.saldoAnterior ?? null;
+    r.impSaldoInsoluto = abono.saldoActual   ?? null;
+    if (r.numParcialidad == null) {
+      r.numParcialidad = 1 + ordenado.filter(mk =>
+        mk.fecha && abono.fecha && new Date(mk.fecha) < new Date(abono.fecha),
+      ).length;
+    }
+  }
 
   const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(rows.map(r => r.facturaUuid));
   const saldosBanco = await calcularSaldosBanco(rows.map(r => r.movimientoId));
@@ -3553,7 +3830,7 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
   )];
 
   const [cuentasPorCobrarRaw, egresosRelacionados] = await Promise.all([
-    buscarCuentasPorCobrarConMovimientos(erpIds),
+    buscarCuentasPorCobrarConMovimientos(erpIds, movimientos),
     buscarEgresosRelacionados(uuid),
   ]);
   const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura, movimientos);
@@ -3610,6 +3887,22 @@ const pagosBancoContextoBanco = asyncHandler(async (req, res) => {
   }));
 
   res.json({ movimientos, hayMasAnteriores });
+});
+
+/**
+ * GET /api/reports/pagos-banco/sugerencias-conciliacion?fechaInicio=&fechaFin=&banco=
+ * Sugerencias de vinculación para depósitos bancarios 'no_identificado' cuya CxC ya
+ * no está en erp_cuentas_pendientes (ya saldada en el ERP) -- el motor real de match
+ * (matchAutorizacionesDesdeErp) solo cruza contra ese feed, así que en ese caso nunca
+ * tiene con qué cruzar. Ver conciliacion-sugerencias.service.js para el detalle del
+ * algoritmo (monto+fecha contra `cfdis` + firma bancaria contra el historial de
+ * bank_movements, ninguna de las dos fuentes se purga). Solo lectura -- no escribe
+ * erpLinks; el visor arma el erpLink y llama al PUT /banks/movements/:id/erp-ids
+ * ya existente para aceptar una sugerencia.
+ */
+const pagosBancoSugerencias = asyncHandler(async (req, res) => {
+  const { fechaInicio, fechaFin, banco } = req.query;
+  res.json(await generarSugerenciasConciliacion({ fechaInicio, fechaFin, banco }));
 });
 
 /**
@@ -3851,7 +4144,7 @@ const depositosIngresosDetalle = asyncHandler(async (req, res) => {
   )];
 
   const [cuentasPorCobrarRaw, egresosRelacionados] = await Promise.all([
-    buscarCuentasPorCobrarConMovimientos(erpIds),
+    buscarCuentasPorCobrarConMovimientos(erpIds, movimientos),
     buscarEgresosRelacionados(uuid),
   ]);
   const cuentasPorCobrar = enriquecerConNotasDeCredito(cuentasPorCobrarRaw, egresosRelacionados, factura, movimientos);
@@ -4080,4 +4373,4 @@ const depositosIngresosExport = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };
+module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, pagosBancoSugerencias, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };

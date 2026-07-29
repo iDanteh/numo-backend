@@ -389,6 +389,60 @@ function _calcCfdiMontos(cfdi) {
   return { subTotal16, subTotal0, desc16, desc0 };
 }
 
+// Para CFDIs con `documentosRelacionados` (Bonificación/Devolución/
+// Cancelación en cualquiera de sus variantes -- BON/BCT/DEV/CAC/etc. -- pero
+// también facturas normales relacionadas a otro documento del ERP, ej.
+// {Serie:"M0", Folio:"260701736"}), el CONCEPTO de la póliza (columna H) debe
+// mostrar la serie-folio de esa primera referencia relacionada, sin importar
+// cuál sea su Serie -- la columna C (serie) siempre lleva la serie-folio de
+// la factura/CFDI propia, nunca la del documento relacionado (corregido
+// 2026-07-24: el commit del 2026-07-23 que introdujo esta función lo aplicaba
+// por error a la columna C en vez de la H, y además limitaba el marcador a
+// una lista fija de Series -- confirmado con el usuario que cualquier
+// documentosRelacionados debe reflejarse en H, no solo esa lista).
+// Devuelve null si el CFDI no tiene documentosRelacionados, para que el
+// llamador use la descripción del CFDI en el concepto como siempre.
+function _referenciaDocRelacionado(documentosRelacionados) {
+  for (const d of (documentosRelacionados || [])) {
+    if (!d.Serie) continue;
+    // Folio vacío ("") es falsy -- sin este fallback, `!d.Folio` saltaba la
+    // entrada completa y el concepto caía en la serie-folio de la factura
+    // propia en vez de mostrar la referencia (encontrado 2026-07-23, folios
+    // B0-260700408 y B0-260700785, ambos Serie='BCT' con Folio='').
+    return d.Folio ? `${d.Serie}-${d.Folio}`.slice(0, 25) : d.Serie;
+  }
+  return null;
+}
+
+// Detecta si un `concepto` ya persistido en poliza_movimientos ES (o
+// CONTIENE, con alguno de los prefijos/sufijos que cfdiToMovimientos le
+// agrega a las líneas de IVA/ISR/Saldo -- "IVA - ", "IVA cobrado - ",
+// "IVA ant. - ", "IVA ret. - ", "ISR ret. - ", "Saldo - ", "... (0%)") una
+// referencia de documentosRelacionados (lo que `_referenciaDocRelacionado`
+// devuelve, ej. "DEV-054861" o "M0-260701736") en vez de una descripción de
+// producto -- usado en poliza.service.js (`enriquecerConceptoConCliente`)
+// para saber si debe preservar la referencia en la columna H al reconstruir
+// el concepto como "Cliente / ...", ya que a esa altura ya no se tiene
+// `documentosRelacionados` a la mano (el movimiento viene de Postgres, no del
+// CFDI en Mongo). Una referencia siempre tiene forma "Serie" o "Serie-Folio"
+// (alfanumérico corto, sin espacios); una descripción de producto real
+// siempre trae espacios -- esa es la señal que las distingue.
+//
+// Los prefijos se quitan por lista exacta (no con un recorte genérico de
+// "... - ") porque una descripción de producto real puede traer un guion
+// propio (ej. "Tubo galvanizado - 3/4"), y un recorte genérico hasta el
+// último " - " confundiría la última palabra con un código.
+const _PREFIJOS_CONCEPTO = ['IVA cobrado - ', 'IVA ant. - ', 'IVA ret. - ', 'ISR ret. - ', 'Saldo - ', 'IVA - '];
+const _REFERENCIA_REGEX  = /^[A-Z0-9]+(-\d+)?$/i;
+function esConceptoMarcadorAjuste(concepto) {
+  let nucleo = String(concepto || '');
+  for (const prefijo of _PREFIJOS_CONCEPTO) {
+    if (nucleo.startsWith(prefijo)) { nucleo = nucleo.slice(prefijo.length); break; }
+  }
+  if (nucleo.endsWith(' (0%)')) nucleo = nucleo.slice(0, -' (0%)'.length);
+  return _REFERENCIA_REGEX.test(nucleo);
+}
+
 /**
  * Convierte un CFDI en movimientos contables usando la regla encontrada.
  * Si no hay regla, devuelve movimientos con cuentaId null (requieren revisión manual).
@@ -402,11 +456,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // metodoPago propio de la NC — pueden no coincidir (confirmado con el
   // usuario: una NC "Efectivo/PUE" puede estar ajustando una factura PPD
   // nunca cobrada; en ese caso el IVA debe cancelarse contra cuentaIvaPPD,
-  // no contra cuentaIva). Sin ese dato (I/P, o E sin relación resuelta), cae
-  // al metodoPago propio del CFDI, comportamiento previo sin cambios.
-  const esPPD     = (tipo === 'E' && context.metodoPagoRelacionado)
-    ? context.metodoPagoRelacionado === 'PPD'
-    : cfdi.metodoPago === 'PPD';
+  // no contra cuentaIva, Y el movimiento debe clasificarse como PPD/Crédito
+  // en la póliza — no solo la cuenta de IVA, ver `satMeta.metodoPago` abajo).
+  // Sin ese dato (I/P, o E sin relación resuelta), cae al metodoPago propio
+  // del CFDI, comportamiento previo sin cambios.
+  const metodoPagoResuelto = (tipo === 'E' && context.metodoPagoRelacionado)
+    ? context.metodoPagoRelacionado
+    : cfdi.metodoPago;
+  const esPPD     = metodoPagoResuelto === 'PPD';
 
   // Para CFDI tipo P, total y subTotal son siempre 0 por diseño SAT.
   // Los montos reales viven en el complemento de pago.
@@ -491,14 +548,20 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
 
   // Descripcion: algunos documentos tienen el campo en minúsculas (schema Mongoose)
   // y otros con mayúscula inicial (como viene del XML del SAT)
-  const descRaw     = cfdi.conceptos?.[0]?.descripcion || cfdi.conceptos?.[0]?.Descripcion || '';
-  const concepto    = descRaw.trim()
-    ? descRaw.trim().slice(0, 200)
-    : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`;
+  const descRaw        = cfdi.conceptos?.[0]?.descripcion || cfdi.conceptos?.[0]?.Descripcion || '';
+  // CFDI con documentosRelacionados (ajuste -- Bonificación/Devolución/
+  // Cancelación en cualquiera de sus variantes -- o cualquier otra referencia
+  // del ERP a otro documento): el concepto (columna H) muestra esa referencia
+  // en vez de la descripción de producto -- ver `_referenciaDocRelacionado`.
+  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados);
+  const concepto    = marcadorAjuste
+    ?? (descRaw.trim() ? descRaw.trim().slice(0, 200) : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`);
   const centroCosto = rule?.centroCosto ?? '';
   // Fecha del CFDI como fecha de venta en formato YYYY-MM-DD
   const ventaFecha  = cfdi.fecha ? new Date(cfdi.fecha).toISOString().slice(0, 10) : null;
-  // Serie del CFDI como referencia (serie+folio si existen)
+  // Serie del CFDI como referencia (serie+folio si existen) -- SIEMPRE la
+  // propia serie-folio de la factura/CFDI (columna C), nunca el marcador de
+  // ajuste (ese va en `concepto`, columna H -- ver arriba).
   const serieCfdi   = [cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null;
 
   if (!rule) {
@@ -910,7 +973,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // PPD por transferencia) nunca se detecta porque formaPago siempre llega null.
   const satMeta = {
     tipoComprobante: cfdi.tipoDeComprobante                      ?? null,
-    metodoPago:      cfdi.metodoPago                            ?? null,
+    // metodoPago ya resuelto arriba (factura origen para NC tipo E, ver
+    // `metodoPagoResuelto`) — no el metodoPago crudo de la NC. Esto es lo que
+    // luego decide el bloque Contado/Crédito en el export CONTPAQ
+    // (`poliza.service.js` → `exportContpaqXlsx`).
+    metodoPago:      metodoPagoResuelto                         ?? null,
     formaPago:       cfdi.formaPago
       ?? (cfdi.tipoDeComprobante === 'P'
         ? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? null
@@ -1023,4 +1090,4 @@ async function getRulePolizas(ruleId) {
   return polizas.map(p => ({ ...p, movimientosConRegla: countMap[p.id] ?? 0 }));
 }
 
-module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos, detectTasaIva: _detectTasaIva };
+module.exports = { list, getById, create, update, remove, getRulePolizas, findRuleForCfdi, findRuleInList, cfdiToMovimientos, migrarPpdDescuento, esConceptoMarcadorAjuste, _detectTasaIvaPublic: _detectTasaIva, _derivarTipoOrigenPublic: _derivarTipoOrigen, _calcCfdiMontosPublic: _calcCfdiMontos, detectTasaIva: _detectTasaIva };

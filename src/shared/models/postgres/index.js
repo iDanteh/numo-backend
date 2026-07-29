@@ -62,15 +62,17 @@ CfdiMappingRule.hasMany(PolizaMovimiento,   { foreignKey: 'reglaId', as: 'movimi
 async function syncModels() {
   const isProd = process.env.NODE_ENV === 'production';
 
-  // Tablas sin FK externas primero
-  await Promise.all([
-    User.sync({ alter: !isProd }),
-    BankConfig.sync({ alter: !isProd }),
-    BankRule.sync({ alter: !isProd }),
-    Entity.sync({ alter: !isProd }),
-    Permission.sync({ alter: !isProd }),
-    Role.sync({ alter: !isProd }),
-  ]);
+  // Tablas sin FK externas primero. Se sincronizan una por una (no en
+  // Promise.all): varios ALTER TABLE concurrentes contra el mismo Postgres
+  // agotan la memoria compartida de locks/catálogo (error "memoria compartida
+  // agotada" / "out of shared memory", típico con max_locks_per_transaction
+  // bajo en instancias de desarrollo).
+  await User.sync({ alter: !isProd });
+  await BankConfig.sync({ alter: !isProd });
+  await BankRule.sync({ alter: !isProd });
+  await Entity.sync({ alter: !isProd });
+  await Permission.sync({ alter: !isProd });
+  await Role.sync({ alter: !isProd });
 
   // Columna intercompañía en entidades (idempotente)
   await Poliza.sequelize.query(`
@@ -227,6 +229,39 @@ async function syncModels() {
     ALTER TABLE polizas
       ADD COLUMN IF NOT EXISTS sustitutos_excluidos JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN sustitutos_excluidos:', e.message));
+
+  // El índice único (tipo, numero, rfc, ejercicio, periodo) bloqueaba para
+  // siempre el folio de una póliza cancelada (la fila sigue existiendo,
+  // solo con estado='cancelada') — impedía reutilizar ese folio en una
+  // futura generación aunque el rango por sucursal ya lo diera por libre.
+  // Se reemplaza por un índice PARCIAL (solo cubre filas no canceladas) para
+  // que cancelar una póliza libere su folio de verdad (confirmado con el
+  // usuario 2026-07-27). Sequelize no migra este cambio solo con la
+  // definición del modelo — DROP + CREATE explícito, idempotente.
+  await Poliza.sequelize.query(`
+    DROP INDEX IF EXISTS polizas_tipo_numero_rfc_ejercicio_periodo
+  `).catch(e => console.warn('[syncModels] DROP INDEX polizas_tipo_numero_rfc_ejercicio_periodo:', e.message));
+
+  await Poliza.sequelize.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS polizas_tipo_numero_rfc_ejercicio_periodo
+      ON polizas (tipo, numero, rfc, ejercicio, periodo)
+      WHERE estado != 'cancelada'
+  `).catch(e => console.warn('[syncModels] CREATE INDEX parcial polizas_tipo_numero_rfc_ejercicio_periodo:', e.message));
+
+  // Empresas fijas por usuario individual (idempotente) — ver User.js. Se
+  // asignan desde la pantalla de Roles (selección múltiple de usuarios +
+  // empresa) — no hay default por rol. Un usuario puede tener varias, por
+  // eso es ARRAY y no una sola columna VARCHAR (confirmado con el usuario
+  // 2026-07-28, corrigiendo el diseño de un solo RFC del mismo día).
+  await User.sequelize.query(`
+    ALTER TABLE users
+      DROP COLUMN IF EXISTS empresa_rfc
+  `).catch(e => console.warn('[syncModels] DROP COLUMN empresa_rfc (users):', e.message));
+
+  await User.sequelize.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS empresa_rfcs VARCHAR(20)[] NOT NULL DEFAULT '{}'
+  `).catch(e => console.warn('[syncModels] ADD COLUMN empresa_rfcs (users):', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };

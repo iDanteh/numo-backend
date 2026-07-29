@@ -6,15 +6,24 @@
  * Endpoints de entidades fiscales. Ahora usa PostgreSQL via entity.repository.
  */
 
+const { Op }              = require('sequelize');
 const entityRepo          = require('../repositories/entity.repository');
 const { asyncHandler }    = require('../../shared/middleware/error-handler');
 const { enviarAlertaManual } = require('../jobs/credencialesAlertJob');
 
 /**
  * GET /api/entities
+ *
+ * Si el usuario tiene empresas fijas asignadas (User.empresaRfcs, asignadas
+ * desde la pantalla de Roles), solo se le devuelven esas — nunca ve ni puede
+ * elegir otra desde el selector. Sin restricción (array vacío) ve todas.
  */
-const list = asyncHandler(async (_req, res) => {
-  const entities = await entityRepo.findAll({ isActive: true });
+const list = asyncHandler(async (req, res) => {
+  const empresaRfcs = req.user?.empresaRfcs ?? [];
+  const entities = await entityRepo.findAll({
+    isActive: true,
+    ...(empresaRfcs.length ? { rfc: { [Op.in]: empresaRfcs } } : {}),
+  });
   res.json(entities);
 });
 

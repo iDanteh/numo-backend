@@ -17,13 +17,14 @@ const _locks = new Set();
 // Map en memoria solo para guardar el timeoutId (no persiste, se recrea al arrancar)
 const _timeouts = new Map();
 
-const KEYS     = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion'];
+const KEYS     = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'];
 const DEFAULTS = {
-  satDescarga:          '01:00',
-  satDescargaRecibidos: '22:00',
-  erpDescarga:          '03:00',
-  erpVerificacion:      '02:00',
-  comparacion:          '04:00',
+  satDescarga:              '01:00',
+  satDescargaRecibidos:     '22:00',
+  erpDescarga:              '03:00',
+  erpVerificacion:          '02:00',
+  comparacion:              '04:00',
+  satVerificacionRecibidos: '06:00',
 };
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
@@ -76,16 +77,17 @@ const getSchedule = asyncHandler(async (_req, res) => {
   const configs = await AppConfig.find({ key: { $in: KEYS } }).lean();
   const map     = Object.fromEntries(configs.map(c => [c.key, c.value]));
   res.json({
-    satDescarga:          map.satDescarga          ?? DEFAULTS.satDescarga,
-    satDescargaRecibidos: map.satDescargaRecibidos ?? DEFAULTS.satDescargaRecibidos,
-    erpDescarga:          map.erpDescarga          ?? DEFAULTS.erpDescarga,
-    erpVerificacion:      map.erpVerificacion      ?? DEFAULTS.erpVerificacion,
-    comparacion:          map.comparacion          ?? DEFAULTS.comparacion,
+    satDescarga:              map.satDescarga              ?? DEFAULTS.satDescarga,
+    satDescargaRecibidos:     map.satDescargaRecibidos     ?? DEFAULTS.satDescargaRecibidos,
+    erpDescarga:              map.erpDescarga              ?? DEFAULTS.erpDescarga,
+    erpVerificacion:          map.erpVerificacion          ?? DEFAULTS.erpVerificacion,
+    comparacion:              map.comparacion              ?? DEFAULTS.comparacion,
+    satVerificacionRecibidos: map.satVerificacionRecibidos ?? DEFAULTS.satVerificacionRecibidos,
   });
 });
 
 const updateSchedule = asyncHandler(async (req, res) => {
-  const campos = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion'];
+  const campos = ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'];
 
   for (const campo of campos) {
     const valor = req.body[campo];
@@ -100,11 +102,12 @@ const updateSchedule = asyncHandler(async (req, res) => {
   const map     = Object.fromEntries(configs.map(c => [c.key, c.value]));
 
   const resultado = {
-    satDescarga:          map.satDescarga          ?? DEFAULTS.satDescarga,
-    satDescargaRecibidos: map.satDescargaRecibidos ?? DEFAULTS.satDescargaRecibidos,
-    erpDescarga:          map.erpDescarga          ?? DEFAULTS.erpDescarga,
-    erpVerificacion:      map.erpVerificacion      ?? DEFAULTS.erpVerificacion,
-    comparacion:          map.comparacion          ?? DEFAULTS.comparacion,
+    satDescarga:              map.satDescarga              ?? DEFAULTS.satDescarga,
+    satDescargaRecibidos:     map.satDescargaRecibidos     ?? DEFAULTS.satDescargaRecibidos,
+    erpDescarga:              map.erpDescarga              ?? DEFAULTS.erpDescarga,
+    erpVerificacion:          map.erpVerificacion          ?? DEFAULTS.erpVerificacion,
+    comparacion:              map.comparacion              ?? DEFAULTS.comparacion,
+    satVerificacionRecibidos: map.satVerificacionRecibidos ?? DEFAULTS.satVerificacionRecibidos,
   };
 
   reprogramarJobs(resultado);

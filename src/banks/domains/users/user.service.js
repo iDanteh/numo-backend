@@ -99,4 +99,36 @@ async function updateEmpresas(id, empresaRfcs) {
   return user;
 }
 
-module.exports = { findOrCreate, listUsers, updateRole, toggleActive, updateEmpresas };
+// Reemplaza la lista COMPLETA de permisos extra del usuario (no es add/remove
+// incremental — el caller manda el array final deseado), igual que
+// updateEmpresas(). Puramente ADITIVO: se une con los permisos del rol al
+// calcular el merge, nunca resta lo que el rol ya concede (confirmado con el
+// usuario 2026-07-29, sin mecanismo de revocación).
+async function updateExtraPermissions(id, extraPermissions) {
+  const { Permission } = require('../../../shared/models/postgres');
+  const keys = [...new Set((extraPermissions ?? []).map(k => String(k).trim()).filter(Boolean))];
+
+  if (keys.length) {
+    const { Op } = require('sequelize');
+    const rows = await Permission.findAll({ where: { key: { [Op.in]: keys } }, attributes: ['key'], raw: true });
+    const faltantes = keys.filter(k => !rows.some(r => r.key === k));
+    if (faltantes.length) throw new BadRequestError(`No existe ningún permiso con clave: ${faltantes.join(', ')}.`);
+  }
+
+  const user = await userRepo.updateExtraPermissions(id, keys);
+  if (!user) throw new NotFoundError('Usuario');
+
+  // Notifica al usuario en sesión con sus permisos ya fusionados (rol + extra)
+  // — mismo evento 'role:updated' que updateRole()/updateEmpresas(), así el
+  // listener del frontend no necesita cambios.
+  const io = getIo();
+  if (io && user.auth0Sub) {
+    const rolePermissions = await rbacStore.getPermissions(user.role);
+    const mergedPermissions = [...new Set([...rolePermissions, ...keys])];
+    io.to(`user:${user.auth0Sub}`).emit('role:updated', { role: user.role, permissions: mergedPermissions });
+  }
+
+  return user;
+}
+
+module.exports = { findOrCreate, listUsers, updateRole, toggleActive, updateEmpresas, updateExtraPermissions };

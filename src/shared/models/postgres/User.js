@@ -55,6 +55,22 @@ const User = sequelize.define('User', {
     allowNull:    false,
     defaultValue: [],
   },
+  // Permisos extra asignados directo a ESTE usuario, además de los que ya le
+  // da su rol. Puramente ADITIVO: nunca revoca lo que el rol concede, solo
+  // amplía (unión con rbacStore.getPermissions(role) al calcular permisos
+  // efectivos — ver rbac-store.js). ARRAY(TEXT), no STRING(20) como empresaRfcs:
+  // las claves de permiso son 'modulo:accion' y pueden superar 20 caracteres
+  // (ej. 'banks:movement:categoria' = 24) — TEXT no impone límite. Debe
+  // coincidir EXACTO con el tipo real de la columna (TEXT[], ver el ALTER
+  // TABLE en index.js): User.sync({alter:true}) corre en no-prod y reconcilia
+  // el esquema contra este modelo — si acá dijera STRING (VARCHAR(255) por
+  // defecto), podría intentar angostar la columna de vuelta sin que nadie lo
+  // pidiera. Mismo criterio que empresaRfcs (STRING(20) ↔ VARCHAR(20)[] exacto).
+  extraPermissions: {
+    type:         DataTypes.ARRAY(DataTypes.TEXT),
+    allowNull:    false,
+    defaultValue: [],
+  },
 }, {
   tableName:  'users',
   underscored: true,

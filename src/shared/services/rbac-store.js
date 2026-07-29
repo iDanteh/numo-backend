@@ -30,15 +30,24 @@ async function _get() {
   return _cache;
 }
 
-async function hasPermission(role, permission) {
+/**
+ * @param {string} role
+ * @param {string} permission
+ * @param {string[]} [extraPerms] - Permisos extra concedidos directo al usuario
+ *   (además de los del rol) — ver User.js/extraPermissions. Puramente aditivo:
+ *   solo puede AMPLIAR el acceso, nunca lo restringe. Default [] para que
+ *   ningún call site existente (que solo pasa 2 args) cambie de comportamiento.
+ */
+async function hasPermission(role, permission, extraPerms = []) {
   const map    = await _get();
   const config = map.get(role);
-  if (!config) return false;
-  return config.permissions.includes('*') || config.permissions.includes(permission);
+  const rolePermissions = config?.permissions ?? [];
+  if (rolePermissions.includes('*')) return true;
+  return rolePermissions.includes(permission) || extraPerms.includes(permission);
 }
 
-async function hasAllPermissions(role, perms) {
-  const checks = await Promise.all(perms.map(p => hasPermission(role, p)));
+async function hasAllPermissions(role, perms, extraPerms = []) {
+  const checks = await Promise.all(perms.map(p => hasPermission(role, p, extraPerms)));
   return checks.every(Boolean);
 }
 

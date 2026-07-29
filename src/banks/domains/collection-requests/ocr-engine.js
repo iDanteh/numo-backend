@@ -266,7 +266,25 @@ function normalizeOcrText(raw) {
     }
   );
 
-  // 5. PaddleOCR — decimal en línea siguiente: "1,500\n20" o "1500\n20" → "1,500.20"
+  // 5. Superíndice PEGADO sin espacio, salto de línea NI etiqueta previa, tras
+  //    un separador de miles: "5,15943" → "5,159.43". Bug real (comprobante
+  //    Mercado Pago, 2026-07-29): el "43" (centavos, superíndice en la imagen)
+  //    quedó fusionado directo al bloque de miles, sin ningún separador — ni
+  //    el paso 3 (requiere espacio) ni el 4 (requiere etiqueta "monto:"/
+  //    "importe:") lo cubrían. Sin esta regla, extractMonto() (E2) hace
+  //    backtracking sobre `\d{1,3}(?:,\d{3})*\b` y como "5,159" no puede cerrar
+  //    el `\b` final (el "4" que sigue es otro dígito), retrocede hasta la
+  //    coincidencia más corta que sí cierra un `\b` — "5" solo, seguido de la
+  //    coma — devolviendo $5 en vez de $5,159.43. Se exige AL MENOS un grupo de
+  //    miles (`(?:,\d{3})+`, no `*`) para no confundir un entero legítimo de
+  //    5+ dígitos sin decimales (ej. un folio) con este patrón — el riesgo de
+  //    ambigüedad es el mismo que ya aceptan las reglas 3/4 de arriba.
+  t = t.replace(
+    /\b(\d{1,3}(?:,\d{3})+)(0\d|[1-9]\d)\b(?!\d)/g,
+    (match, integer, cents) => `${integer}.${cents}`,
+  );
+
+  // 6. PaddleOCR — decimal en línea siguiente: "1,500\n20" o "1500\n20" → "1,500.20"
   //    BUG FRECUENTE: el paso 2 ya eliminó los espacios de "1 500" → "1500",
   //    entonces el patrón debe aceptar dígitos con O SIN separador de miles.
   t = t.replace(
@@ -277,10 +295,10 @@ function normalizeOcrText(raw) {
     }
   );
 
-  // 6. PaddleOCR — punto decimal en línea siguiente: "1,500\n.20" → "1,500.20"
+  // 7. PaddleOCR — punto decimal en línea siguiente: "1,500\n.20" → "1,500.20"
   t = t.replace(/(\b[\d,]+)\n(\.\d{2})\b/g, (_, i, d) => `${i}${d}`);
 
-  // 7. PaddleOCR — signo $ en línea propia: "$\n1,500.20" → "$1,500.20"
+  // 8. PaddleOCR — signo $ en línea propia: "$\n1,500.20" → "$1,500.20"
   t = t.replace(/\$\s*\n\s*([\d,]+(?:\.\d{1,2})?)/g, (_, n) => `$${n}`);
 
   return t;
@@ -1541,4 +1559,10 @@ async function runExtraction(imageBuffer, mimeType, label = null) {
 }
 
 
-module.exports = { runExtraction };
+module.exports = {
+  runExtraction,
+  // Exportados para depuración/pruebas puntuales (ver sesión 2026-07-29,
+  // bug de monto truncado en comprobante Mercado Pago) — mismo patrón que
+  // otros helpers internos re-expuestos para scripts en el resto del repo.
+  normalizeOcrText, extractMonto, extractReceiptDataPaddle, extractReceiptDataTesseract,
+};

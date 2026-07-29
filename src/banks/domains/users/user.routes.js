@@ -72,11 +72,14 @@ router.get('/me', authenticate,
       const rows = await Entity.findAll({ where: { rfc: { [Op.in]: empresaRfcs } }, attributes: ['rfc', 'nombre'], raw: true });
       empresas = rows.map(r => ({ rfc: r.rfc, nombre: r.nombre }));
     }
+    // Permisos efectivos = permisos del rol UNIÓN permisos extra del usuario
+    // (aditivo — nunca resta lo que el rol ya concede). Ver rbac-store.js.
+    const permissions = [...new Set([...(role?.permissions ?? []), ...(req.user.extraPermissions ?? [])])];
     res.json({
-      dbId:        req.user.dbId,
-      nombre:      req.user.nombre,
-      role:        req.user.role,
-      permissions: role?.permissions ?? [],
+      dbId:   req.user.dbId,
+      nombre: req.user.nombre,
+      role:   req.user.role,
+      permissions,
       empresas,
     });
   }),
@@ -101,6 +104,15 @@ router.patch('/:id/role', authenticate, permit('users:manage'),
 router.patch('/:id/empresas', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
     res.json(await userSvc.updateEmpresas(req.params.id, req.body.empresaRfcs));
+  }),
+);
+
+// Permisos extra asignados directo a este usuario, ADEMÁS de los que ya le da
+// su rol (nunca los sustituye ni los revoca — puramente aditivo).
+// Body: { extraPermissions: string[] } — reemplaza la lista completa ([] = ninguno extra).
+router.patch('/:id/permissions', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    res.json(await userSvc.updateExtraPermissions(req.params.id, req.body.extraPermissions));
   }),
 );
 

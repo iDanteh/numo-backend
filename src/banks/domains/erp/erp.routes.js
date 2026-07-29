@@ -15,7 +15,7 @@ const { procesarPagosCyc,
 const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const BankMovement                       = require('../banks/BankMovement.model');
 const { emitToUser }                     = require('../../shared/socket');
-const { ERP_TOLERANCE }                  = require('../banks/bank.service');
+const { ERP_TOLERANCE, updateErpIds }     = require('../banks/bank.service');
 const {
   KoreCajaError, koreTokenCache, KORE_CAJA_BASE_URL,
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
@@ -758,16 +758,22 @@ function _montoSaldoLinkBancario(raw0) {
 // Compara el `Aut`/`Numo` de un forma-de-pago de Kore contra la identidad de ESTE
 // movimiento bancario — dos señales redundantes porque Kore no las usa de forma
 // consistente: "Numo" suele traer el numeroAutorizacion real del banco (cuando Numo aplicó
-// el cobro), "Aut" suele traer el FOLIO de Numo (confirmado 2026-07-28 con datos reales de
-// producción — folios 036789/033439/033764/036170: su propio `Aut` siempre es idéntico a su
-// `folio`, nunca al numeroAutorizacion). Se aceptan ambas coincidencias porque una misma CxC
-// puede traer movimientos tageados con una u otra según cómo Kore/Numo aplicó cada pago.
+// el cobro), "Aut" suele traer el FOLIO de Numo, pero NO siempre a secas — quien autoriza en
+// Kore a veces agrega texto alrededor (fix 2026-07-29, folio 037349: `Aut: "037349-CRISTIAN"`
+// no matcheaba con igualdad exacta contra `folio: "037349"`; mismo patrón en 037075 ("037075
+// C.P CRISTIAN") y 036472 ("AUTORIZA CRISTIAN 036472"), aunque estos últimos dos ya habían
+// cerrado con el criterio viejo pre-Aut-matching, antes de que este bug pudiera manifestarse).
+// La comparación ahora es "el folio aparece dentro del Aut" en vez de igualdad exacta — un
+// folio de 6 dígitos casi no tiene riesgo real de aparecer como substring de un Aut ajeno.
+// Se aceptan ambas coincidencias (Numo/Aut) porque una misma CxC puede traer movimientos
+// tageados con una u otra según cómo Kore/Numo aplicó cada pago.
 function _perteneceAEsteMovimiento(fp, mov) {
   const autNormMov = _normalizarAutorizacion(mov.numeroAutorizacion);
   const numoTag    = (fp.adicionales ?? []).find(a => a.nombre === 'Numo');
   if (numoTag && autNormMov && _normalizarAutorizacion(numoTag.valor) === autNormMov) return true;
-  const autTag = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
-  if (autTag && String(autTag.valor ?? '').trim() === String(mov.folio ?? '').trim()) return true;
+  const autTag  = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
+  const folioMov = String(mov.folio ?? '').trim();
+  if (autTag && folioMov && String(autTag.valor ?? '').trim().includes(folioMov)) return true;
   return false;
 }
 
@@ -1392,6 +1398,20 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
             const calculado = _montoSaldoLinkPorMovimiento(raw0, mov);
             if (calculado != null && Math.abs(calculado - (link.saldoErpAportado ?? 0)) > 0.01) {
               aporteNuevo  = calculado;
+              cambioAporte = true;
+            } else if (
+              calculado == null && link.saldoErpAportado === 0 &&
+              link.saldoPagadoTotal != null && Math.abs(link.saldoPagadoTotal) > 0.01
+            ) {
+              // Fix 2026-07-29 (folio 036030): una CxC puede cerrar por RETENCIÓN (sin
+              // formasPago real) en vez de un pago bancario — ahí _montoSaldoLinkPorMovimiento
+              // NUNCA va a poder determinar el aporte desde Kore (por diseño, calculado
+              // siempre null). El fallback `?? saldoPagadoTotal` del bug 6 (036636) no alcanza
+              // acá porque saldoErpAportado ya quedó en 0 CONCRETO (no null) por una corrida
+              // vieja anterior a estos fixes — un 0 nunca dispara un `??`. Decisión del usuario
+              // (2026-07-29): si un humano ya confirmó este cobro al vincular (saldoPagadoTotal
+              // real), ese valor gana sobre un 0 que Kore nunca pudo confirmar ni refutar.
+              aporteNuevo  = link.saldoPagadoTotal;
               cambioAporte = true;
             }
           }
@@ -2237,6 +2257,84 @@ router.post('/sync-erp-kore/reset-recompute', authenticate, permit('banks:admin'
   res.json({ ok: true, modo: 'puntual', folio: mov.folio, reiniciados });
 }));
 
+// ── Barrido: desvincular CxC cerradas por CANCELACIÓN/DEVOLUCIÓN sin pago real ──
+// Pedido del usuario (2026-07-29), tras confirmar con casos reales que estas CxC
+// están correctamente en saldoErpAportado:0 pero SIGUEN ocupando el depósito
+// bancario como si estuvieran vinculadas: la CxC se cerró en Kore por
+// CANCELACIÓN (serieOrigen 'CAC', confirmado con folio 036030) o DEVOLUCIÓN
+// (serieOrigen 'DEV', confirmado con folios 026829/028128) — en ambos casos el
+// depósito nunca pagó esa CxC de verdad. El link queda "identificado" con una
+// CxC que en realidad no cobró nada, mientras el dinero real de ese depósito
+// probablemente pagó OTRA CxC que nadie vinculó todavía. Este barrido libera
+// el depósito (quita erpId de erpLinks/erpIds/identificadoPor, recalcula
+// saldoErp/status con lo que quede) para que el usuario correspondiente pueda
+// buscar y vincular la CxC correcta.
+//
+// Deliberadamente ESTRICTO: "solo CAC y DEV" (pedido explícito — para
+// cualquier otro origen no hacer nada todavía). Un link SOLO califica si
+// TODOS sus movimientos RET son de origen CAC o DEV — si aparece cualquier
+// OTRO origen mezclado en el mismo link (BON, BN, CES, etc.), se excluye por
+// completo. Esto protege en particular a los folios YA conocidos del bug 2
+// (033439/033764/036170, cierran por BON) — esos se recuperan con
+// /reset-recompute + recompute, nunca con este barrido.
+function _esLinkPuroCancelacionODevolucion(link) {
+  const rets = (link.movimientosKore ?? []).filter(m => m.serie === 'RET');
+  if (rets.length === 0) return false;
+  return rets.every(m => m.serieOrigen === 'CAC' || m.serieOrigen === 'DEV');
+}
+
+// dryRun por defecto true — hay que pedir explícitamente `{dryRun:false}` para
+// ejecutar de verdad (mismo criterio cauteloso que "Recalcular saldo ERP").
+// Reusa updateErpIds() (el mismo mecanismo que ya usa el botón "Revertir" del
+// motor de matching) en vez de reimplementar la desvinculación — identidad
+// sintética con role:'admin' porque esto es una corrección administrativa,
+// no la acción de un usuario puntual, y necesita poder forzar la
+// desvinculación aunque el movimiento ya esté "identificado".
+router.post('/sync-erp-kore/desvincular-cancelaciones', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const dryRun = req.body?.dryRun !== false;
+
+  const candidatos = await BankMovement.find({
+    erpLinks: {
+      $elemMatch: {
+        conciliacionFinalizadaAt: { $ne: null },
+        saldoErpAportado:         0,
+        'movimientosKore.serie':  'RET',
+      },
+    },
+  }).select('_id folio banco deposito retiro erpLinks');
+
+  const detalle = [];
+  for (const mov of candidatos) {
+    for (const link of mov.erpLinks ?? []) {
+      if (link.conciliacionFinalizadaAt == null) continue;
+      if (link.saldoErpAportado !== 0) continue;
+      if (!_esLinkPuroCancelacionODevolucion(link)) continue;
+
+      const origenes = [...new Set(
+        (link.movimientosKore ?? []).filter(m => m.serie === 'RET').map(m => m.serieOrigen),
+      )];
+
+      detalle.push({
+        movimientoId: mov._id.toString(), folio: mov.folio, banco: mov.banco,
+        deposito: mov.deposito, retiro: mov.retiro,
+        erpId: link.erpId, folioExterno: link.folioExterno, origenes,
+      });
+
+      if (!dryRun) {
+        await updateErpIds(mov._id, 'remove', link.erpId, { _id: 'erp-barrido-cac-dev', role: 'admin' });
+      }
+    }
+  }
+
+  res.json({
+    ok:             true,
+    dryRun,
+    encontrados:    detalle.length,
+    desvinculados:  dryRun ? 0 : detalle.length,
+    detalle,
+  });
+}));
+
 // ── Corrida automática diaria (cron) ──────────────────────────────────────────
 // Se dispara vía node-cron desde numo-backend/src/banks/jobs/erpSyncCron.js (mismo
 // patrón que los jobs de src/visor/jobs/satSyncJob.js), no desde HTTP — por eso corre
@@ -2318,6 +2416,7 @@ router._montoSaldoLink              = _montoSaldoLink;
 router._montoSaldoLinkPorMovimiento = _montoSaldoLinkPorMovimiento;
 router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
+router._esLinkPuroCancelacionODevolucion = _esLinkPuroCancelacionODevolucion;
 router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 
 module.exports = router;

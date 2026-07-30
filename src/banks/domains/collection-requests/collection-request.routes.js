@@ -124,6 +124,16 @@ router.get('/erp/:solicitudIdErp', requireErpApiKey, asyncHandler(async (req, re
   res.json(await service.getByErpId(req.params.solicitudIdErp));
 }));
 
+// POST /api/collection-requests/erp/:solicitudIdErp/cancelar — Kore avisa que
+// canceló la CxC de su lado (ej. CAC) mientras la solicitud seguía pendiente en
+// Numo. Mismo mecanismo de autenticación que el resto de las llamadas de Kore
+// en este router (API key, no sesión Auth0/Numo). Body: { canceladoPorUserId,
+// canceladoPorNombre } — la identidad del usuario de Kore que confirmó la
+// cancelación, para mostrar "Cancelado por el usuario X" en la bandeja.
+router.post('/erp/:solicitudIdErp/cancelar', requireErpApiKey, asyncHandler(async (req, res) => {
+  res.json(await service.cancelarPorErp(req.params.solicitudIdErp, req.body));
+}));
+
 // GET /api/collection-requests — bandeja para revisión (cobranza/contabilidad/admin)
 router.get('/', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
   res.json(await service.list(req.query));

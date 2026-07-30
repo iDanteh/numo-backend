@@ -836,10 +836,14 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
 // histórico del botón "Recalcular saldo ERP"), para que ambos usen exactamente el mismo
 // criterio y no se desincronicen con el tiempo.
 // folioFiscalPendiente=true → el llamador NO debe avanzar recomputedFormasPagoAt (se
-// reintenta en la próxima corrida): decisión del usuario 2026-07-24 — si saldoActual===0
-// (CxC cerrada de forma limpia) se acepta folioFiscal null para siempre (Kore no tiene por
-// qué facturar esa CxC nunca); si saldoActual!==0 (saldo a favor/retención, todavía "en
-// movimiento") vale la pena seguir reintentando.
+// reintenta en la próxima corrida). Decisión del usuario 2026-07-24 (revertida 2026-07-30):
+// originalmente, si saldoActual===0 (CxC cerrada de forma limpia) se aceptaba folioFiscal
+// null para siempre, asumiendo que Kore no tenía por qué facturar esa CxC nunca. Evidencia
+// real (folios 036472/036917/036967/037095/037085/037076/037099, 2026-07-30): Kore SÍ
+// termina timbrando el CFDI después del cierre limpio en el 100% de una muestra de 7 casos
+// — la hipótesis no se sostenía. Ahora se reintenta SIEMPRE mientras folioFiscal siga null,
+// sin importar saldoActual/retención (mismo criterio ya usado para retención desde el
+// 2026-07-28, folio 036827, extendido a todos los cierres).
 function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo) {
   // aporteNuevo/saldoPagadoCalc ahora pueden venir en null (_montoSaldoLinkPorMovimiento no
   // encontró coincidencia propia) — se conserva el valor previo del link en vez de pisarlo
@@ -856,15 +860,9 @@ function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo)
   // devolvía el '' ya guardado). El `||` sí normaliza '' a "ausente", igual que null/undefined
   // — seguro aquí porque folioFiscal es un UUID/string, nunca un 0/false legítimo.
   const folioFiscal = (link.folioFiscal || null) ?? (raw0.folioFiscal || null) ?? null;
-  // Una CxC puede llegar a saldoActual===0 por una RETENCIÓN/bonificación (serie 'RET') en
-  // vez de un pago bancario completo — en ese caso Kore puede timbrar el CFDI DESPUÉS de que
-  // el saldo ya cerró en 0 (caso real: folio 036827, cerrado por retención el mismo día en
-  // que el CFDI todavía no existía en Kore — el checkpoint avanzó con folioFiscal null antes
-  // de que apareciera). Tratar esos casos igual que "saldoActual!==0" para el gate de
-  // reintento evita que folioFiscal quede null para siempre apenas la retención cierra el
-  // saldo, sin oportunidad de reintentar cuando Kore termine de facturar.
-  const tieneRetencion = (raw0.movimientos ?? []).some(m => m.serie === 'RET');
-  const folioFiscalPendiente = folioFiscal == null && (raw0.saldoActual !== 0 || tieneRetencion);
+  // Ver comentario arriba de la función (2026-07-30): ya no importa si la CxC cerró limpia,
+  // por retención o con saldo a favor — mientras folioFiscal siga sin resolver, se reintenta.
+  const folioFiscalPendiente = folioFiscal == null;
   return { saldoPagadoTotal, saldoPagado, folioFiscal, folioFiscalPendiente };
 }
 
@@ -2165,21 +2163,23 @@ router.post('/sync-erp-kore/:jobId/revert', authenticate, permit('banks:admin'),
 
 // Patrón exacto del síntoma (folio 036827 y cualquier otro con el mismo bug): el checkpoint
 // de "Recalcular saldo ERP" avanzó (recomputedFormasPagoAt no-null) con folioFiscal todavía
-// sin resolver, en un link cerrado por RETENCIÓN (tieneRetencion:true) — la regla vieja de
-// _backfillFormasPagoYFolioFiscal daba por perdido el folioFiscal apenas saldoActual llegaba
-// a 0, sin considerar que Kore podía timbrar el CFDI después. Ya arreglado hacia adelante
-// (ver el fix arriba); este filtro identifica solo lo que quedó atrapado con la regla vieja
-// — nunca toca links con folioFiscal ya resuelto ni links "saldo a favor" (esos nunca
-// llegaron a marcar el checkpoint, así que no necesitan rescate).
+// sin resolver — la regla vieja de _backfillFormasPagoYFolioFiscal daba por perdido el
+// folioFiscal apenas saldoActual llegaba a 0 (o, hasta el 2026-07-30, apenas cerraba limpio
+// sin retención), sin considerar que Kore podía timbrar el CFDI después. Ya arreglado hacia
+// adelante (ver el fix arriba); este filtro identifica solo lo que quedó atrapado con la
+// regla vieja — nunca toca links con folioFiscal ya resuelto.
 // `folioFiscal: { $in: [null, ''] }` (fix 2026-07-28, folio 034310): Kore puede devolver
 // folioFiscal como '' en vez de null/ausente — Mongo NO trata '' como null (a diferencia de
 // `??`/`==null` en JS, que además ya se corrigieron en _backfillFormasPagoYFolioFiscal), así
 // que un link atrapado con '' quedaba invisible para este filtro y para el botón que lo usa.
+// `tieneRetencion` (2026-07-30): se quitó del filtro — hasta ayer solo cubría cierres por
+// retención; los cierres limpios (036472/036917/036967/037095/037085/037076/037099) también
+// quedan atrapados con folioFiscal null y Kore SÍ termina facturándolos, así que también
+// califican para el rescate manual.
 const _FILTRO_LINK_ATRAPADO = {
   conciliacionFinalizadaAt: { $ne: null },
   recomputedFormasPagoAt:   { $ne: null },
   folioFiscal:              { $in: [null, ''] },
-  tieneRetencion:           true,
 };
 // Mismas condiciones, con el prefijo que exige `arrayFilters` (identificador posicional
 // $[link] en vez de nombre de campo relativo al array, como pide $elemMatch).
@@ -2417,6 +2417,7 @@ router._montoSaldoLinkPorMovimiento = _montoSaldoLinkPorMovimiento;
 router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
 router._esLinkPuroCancelacionODevolucion = _esLinkPuroCancelacionODevolucion;
+router._backfillFormasPagoYFolioFiscal   = _backfillFormasPagoYFolioFiscal;
 router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 
 module.exports = router;

@@ -12,6 +12,7 @@ const { emitToUser, emitToBanco } = require('../../shared/socket');
 const { matchRegla }   = require('./bank-rules.service');
 const bankRuleRepo     = require('./repositories/bank-rule.repository');
 const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
+const rbacStore = require('../../../shared/services/rbac-store');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const BANCOS_VALIDOS = [
@@ -48,7 +49,12 @@ const BANK_PREFIX = {
 // en dedup generaría falsos positivos entre movimientos distintos del mismo banco.
 // COMPENSACION: aparece en MORA SPEI NORMABANXICO — múltiples transacciones
 // distintas comparten este label; la dedup real la hace Layer 1d (saldo+concepto).
-const BBVA_PSEUDO_AUTH_RE = /^(BNET|REFBNTC|COMPENSACION)$/i;
+// `\*+\d+` (2026-07-30): cuenta/terminal enmascarada de "DEPOSITO EFECTIVO ... /
+// ******1014 ..." — el parser (bank.parser.js) ya la limpia a `null` en la fuente para
+// movimientos nuevos, pero este regex se mantiene igual como defensa adicional para
+// movimientos YA importados antes del fix (con `numeroAutorizacion:'******1014'` guardado
+// tal cual) que todavía puedan pasar por Capas 1c/2/dedup intra-lote.
+const BBVA_PSEUDO_AUTH_RE = /^(BNET|REFBNTC|COMPENSACION|\*+\d+)$/i;
 
 function isBBVAPseudoAuth(banco, auth) {
   return banco === 'BBVA' && !!auth && BBVA_PSEUDO_AUTH_RE.test(auth.trim());
@@ -1216,6 +1222,15 @@ async function importFile(buffer, banco, userId, { auth0Sub, nombre, filename } 
       const result = await BankMovement.bulkWrite(ops, { ordered: false });
       insertados += result.upsertedCount;
     } catch (err) {
+      // Hallazgo real 2026-07-30 (caso BBVA FOLIO:0097/0083, contador `folio`
+      // desincronizado): antes este catch solo contaba cuántos SÍ se insertaron y
+      // seguía — un fallo de escritura por documento (ej. E11000 en `folio`) quedaba
+      // completamente silencioso, sin rastro en logs ni en la respuesta al usuario.
+      // Loguear al menos un resumen evita que la próxima vez sea invisible.
+      if (err.writeErrors?.length) {
+        console.error(`[importFile] ${err.writeErrors.length} error(es) de escritura en el batch (${bancoValidado || banco}):`,
+          err.writeErrors.map(we => ({ index: we.index, code: we.code, errmsg: we.errmsg })));
+      }
       // BulkWriteError con ordered:false — algunos upserts pudieron completarse
       if (err.result) {
         insertados += err.result.nUpserted ?? 0;
@@ -1575,37 +1590,49 @@ async function updateStatus(id, status, user) {
 }
 
 /**
- * Dada una categoría (o null) y el status actual de un movimiento, resuelve el
- * nuevo status y ocultoRoles según la BankRule 'categorizar' vigente con ese
- * nombre — mismo criterio que applyRules() en bank-rules.service.js, para que
- * la asignación manual (individual o masiva) nunca diverja del motor automático.
+ * Dada una categoría (o null) y el movimiento completo, resuelve el nuevo status y
+ * ocultoRoles según la BankRule 'categorizar' vigente con ese nombre.
  *
- * Al asignar categoría manualmente:
- *   - Si el movimiento ya está 'identificado' (tiene CxC conciliada), conservamos ese status.
- *     Asignar una categoría es una anotación organizacional, no revierte la conciliación.
- *   - En cualquier otro status pasamos a 'reclasificado' para indicar intervención manual,
- *     salvo que la regla vigente de esta categoría traiga su propio estadoDestino — mismo
- *     criterio que applyRules() en bank-rules.service.js, para no bifurcar la lógica entre
- *     el motor automático y la recategorización manual.
- *   - ocultarRoles de la regla vigente se replica igual que hace applyRules().
- * Al limpiarla → vuelve a 'identificado' si tiene ERP, sino 'no_identificado'; y se libera
- * cualquier ocultamiento por rol heredado de la categoría anterior.
+ * Decisión del usuario 2026-07-30 (3 rondas — revierte el comportamiento anterior):
+ * asignar una categoría es una anotación organizacional — el status NUNCA cambia por el solo
+ * hecho de categorizar, salvo que la regla vigente de esa categoría traiga su propio
+ * `estadoDestino` explícito (mismo criterio que applyRules() en bank-rules.service.js, para
+ * no bifurcar la lógica entre el motor automático y la recategorización manual).
+ *
+ * Un `mov.status === 'identificado'` YA GUARDADO se preserva SIEMPRE, tal cual, sin volver a
+ * calcular nada — cubre tanto la conciliación real (erpLinks que cubren el depósito, o
+ * `ficha`) como un 'identificado' forzado a mano vía `updateStatus()` sin ningún erpLink real
+ * detrás (3er bug real reportado: ese caso se desmarcaba a 'no_identificado'/'por conciliar'
+ * al cambiar de categoría, porque una versión anterior de este fix recalculaba SIEMPRE desde
+ * `aplicarLogicaErp(mov)` — que solo sabe de erpLinks/ficha, nunca de un status forzado a
+ * mano — perdiendo ese caso). Para cualquier OTRO status ('no_identificado'/'otros'/
+ * 'reclasificado'), se recalcula desde el status NATURAL — `aplicarLogicaErp(mov)`, que por
+ * diseño nunca devuelve 'otros'/'reclasificado' (esos SOLO existen como overlay de una
+ * categoría) — en vez de partir de `mov.status`, para no quedar "pegado" al de una categoría
+ * anterior (2do bug real reportado: EMBARGO con estadoDestino:'otros' → cambiar después a una
+ * categoría sin estadoDestino dejaba el status pegado en 'otros' en vez de volver al natural).
+ * Si ese natural ya resulta 'identificado' (erpLinks que ahora sí cubren el depósito),
+ * tampoco lo pisa ninguna categoría, ni con estadoDestino explícito.
+ * ocultarRoles de la regla vigente se replica igual que hace applyRules(); al limpiar la
+ * categoría (o cambiar a una sin ocultarRoles) se libera cualquier ocultamiento heredado.
  */
-async function resolveCategoriaEffects(banco, categoriaLimpia, currentStatus, erpIdsLength) {
-  let newStatus   = currentStatus;
+async function resolveCategoriaEffects(banco, categoriaLimpia, mov) {
   let ocultoRoles = [];
-
+  let catRule     = null;
   if (categoriaLimpia) {
     const catRules = await bankRuleRepo.listByBanco(banco, { accion: 'categorizar' });
-    const catRule  = catRules.find(r => r.nombre === categoriaLimpia) ?? null;
-
-    if (currentStatus !== 'identificado') {
-      newStatus = catRule?.estadoDestino || 'reclasificado';
-    }
+    catRule = catRules.find(r => r.nombre === categoriaLimpia) ?? null;
     ocultoRoles = catRule?.ocultarRoles?.length ? catRule.ocultarRoles : [];
-  } else if (currentStatus === 'reclasificado') {
-    newStatus = (erpIdsLength ?? 0) > 0 ? 'identificado' : 'no_identificado';
   }
+
+  if (mov.status === 'identificado') {
+    return { newStatus: 'identificado', ocultoRoles };
+  }
+
+  const statusNatural = aplicarLogicaErp(mov).status;
+  const newStatus = (statusNatural !== 'identificado' && catRule?.estadoDestino)
+    ? catRule.estadoDestino
+    : statusNatural;
 
   return { newStatus, ocultoRoles };
 }
@@ -1624,9 +1651,7 @@ async function updateCategoria(id, categoria, user) {
     return { _id: mov._id, banco: mov.banco, categoria: anterior, status: mov.status };
   }
 
-  const { newStatus, ocultoRoles } = await resolveCategoriaEffects(
-    mov.banco, categoriaLimpia, mov.status, mov.erpIds?.length,
-  );
+  const { newStatus, ocultoRoles } = await resolveCategoriaEffects(mov.banco, categoriaLimpia, mov);
 
   await BankMovement.updateOne(
     { _id: id },
@@ -1732,6 +1757,24 @@ async function setErpIds(id, erpLinks, user) {
     !idPorSet.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
+  }
+
+  // Bug real 2026-07-30 (mismo hallazgo que el PATCH .../erp-ids de arriba): este endpoint
+  // REEMPLAZA el arreglo completo de erpLinks, así que un solo PUT puede representar un alta
+  // (vincular), una baja (desvincular vía el chip "✕" del modal ERP — ver
+  // erp-modal.component.ts, ese botón solo edita en memoria, el PUT es la persistencia real),
+  // o ambas a la vez. `permit('banks:erp:link')` en la ruta solo cubre el alta — la baja
+  // necesita 'banks:erp:unlink' explícito (mismo permiso "Restringido a admin" de rbac.js),
+  // calculado acá porque solo aquí se conoce el estado ANTERIOR (mov.erpIds) para comparar
+  // contra el nuevo arreglo entrante y saber si de verdad se está quitando algo.
+  const erpIdsAntes = mov.erpIds ?? [];
+  const erpIdsNuevos = cleanLinks.map(l => l.erpId);
+  const seQuitaAlgo = erpIdsAntes.some(eid => !erpIdsNuevos.includes(eid));
+  if (seQuitaAlgo) {
+    const puedeDesvincular = await rbacStore.hasPermission(user?.role, 'banks:erp:unlink', user?.extraPermissions);
+    if (!puedeDesvincular) {
+      throw new ForbiddenError('No tienes permiso para desvincular una CxC ya asociada a este movimiento.');
+    }
   }
 
   mov.erpLinks = cleanLinks;
@@ -2225,9 +2268,7 @@ async function bulkUpdateCategoria(ids, categoria, user) {
       const anterior = mov.categoria ?? null;
       if (anterior === categoriaLimpia) continue;
 
-      const { newStatus, ocultoRoles } = await resolveCategoriaEffects(
-        banco, categoriaLimpia, mov.status, mov.erpIds?.length,
-      );
+      const { newStatus, ocultoRoles } = await resolveCategoriaEffects(banco, categoriaLimpia, mov);
 
       await BankMovement.updateOne(
         { _id: mov._id },

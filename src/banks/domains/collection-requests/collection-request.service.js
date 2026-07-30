@@ -29,6 +29,9 @@ function _eventoActualizacion(cr, mov) {
     resueltoPorUserId: cr.resueltoPorUserId,
     resueltoPorNombre: cr.resueltoPorNombre,
     resueltoAt:        cr.resueltoAt,
+    canceladoPorUserId: cr.canceladoPorUserId,
+    canceladoPorNombre: cr.canceladoPorNombre,
+    canceladoAt:        cr.canceladoAt,
     cobroAplicado:     cr.cobroAplicado,
     cobroAplicadoAt:   cr.cobroAplicadoAt,
     solicitanteUserId: cr.solicitanteUserId,
@@ -360,7 +363,7 @@ async function _stats(baseFilter) {
     ]),
   ]);
 
-  const counts = { pendiente: 0, identificada: 0, rechazada: 0 };
+  const counts = { pendiente: 0, identificada: 0, rechazada: 0, cancelada: 0 };
   for (const r of porStatus) if (r._id in counts) counts[r._id] = r.count;
 
   return {
@@ -457,13 +460,12 @@ async function getComprobante(id, index = 0) {
 // puede corresponder a un depósito bancario distinto), y se regresa un
 // resultado por comprobante para que la búsqueda ayude a ubicar cada depósito.
 async function analyzeStoredComprobantes(id) {
-  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes cxcs');
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes');
   if (!cr) throw new NotFoundError('Solicitud');
 
   const lista = _comprobantesUnificados(cr);
   if (lista.length === 0) throw new NotFoundError('Comprobante');
 
-  const ownErpIds = cr.cxcs.map(c => c.erpId);
   const resultados = [];
   for (let i = 0; i < lista.length; i++) {
     const item = lista[i];
@@ -477,7 +479,7 @@ async function analyzeStoredComprobantes(id) {
         : item.data;
       const label      = item.originalName || `comprobante#${i}`;
       const extracted  = await extractReceiptData(data, item.mimetype, label);
-      const candidates  = await findMatchingMovements(extracted, ownErpIds);
+      const candidates  = await findMatchingMovements(extracted);
       resultados.push({ comprobanteIndex: i, extracted, candidates, totalCandidatos: candidates.length });
     } catch (err) {
       logger.warn(`[analyzeStoredComprobantes] Comprobante #${i} no se pudo leer:`, err.message);
@@ -709,6 +711,45 @@ async function rechazar(id, motivo, user) {
   return _toSafeJSON(actualizada);
 }
 
+// Kore cancela la CxC de su lado (ej. CAC) mientras la solicitud sigue
+// 'pendiente' en Numo — Kore avisa este endpoint DESPUÉS de que su propio
+// usuario confirmó la cancelación, sabiendo que ya existía una solicitud
+// previa en Numo (ver memoria "Solicitudes de Cobro ERP-Kore" para el caso
+// real que originó esto). No hay aviso de vuelta a Kore (a diferencia de
+// identificar/rechazar) — es Kore quien inicia esta acción, no Numo.
+// canceladoPorUserId/canceladoPorNombre viajan tal cual los manda Kore en el
+// body — no son necesariamente un usuario que Numo pueda resolver por su
+// cuenta, se guardan para mostrar "Cancelado por el usuario X" en la bandeja.
+async function cancelarPorErp(solicitudIdErp, { canceladoPorUserId, canceladoPorNombre } = {}) {
+  const cr = await CollectionRequest.findOne({ solicitudIdErp: String(solicitudIdErp).trim() });
+  if (!cr) throw new NotFoundError('Solicitud');
+  if (cr.status !== 'pendiente') {
+    throw new BadRequestError(`La solicitud ya fue resuelta (status: ${cr.status}), no se puede cancelar.`);
+  }
+
+  // Guard atómico repetido a propósito (mismo criterio que rechazar()): entre
+  // el findOne de arriba y este update, un revisor pudo haber identificado o
+  // rechazado la solicitud desde la bandeja — el filtro evita pisar ese resultado.
+  const actualizada = await CollectionRequest.findOneAndUpdate(
+    { _id: cr._id, status: 'pendiente' },
+    {
+      status:              'cancelada',
+      canceladoPorUserId:  canceladoPorUserId || null,
+      canceladoPorNombre:  canceladoPorNombre || null,
+      canceladoAt:         new Date(),
+    },
+    { new: true },
+  );
+  if (!actualizada) throw new BadRequestError('La solicitud ya fue resuelta, no se puede cancelar.');
+
+  // Tiempo real: si alguien tiene la bandeja abierta, la fila debe desaparecer
+  // de "Pendientes" (o pasar a "Canceladas" si esa es la pestaña activa) sin
+  // que nadie tenga que recargar — mismo mecanismo que identificar()/rechazar().
+  emitToAll('collection-request:updated', _eventoActualizacion(actualizada, null));
+
+  return _toSafeJSON(actualizada);
+}
+
 // ── Reporte Excel de Solicitudes de Cobro (2026-07-29) ──────────────────────────
 // Solo cubre solicitudes RESUELTAS (Autorizadas = identificada, Rechazadas =
 // rechazada) — nunca pendiente, sin importar qué pestaña esté activa en el
@@ -891,5 +932,5 @@ async function buildReportMine(userId, filters) {
 
 module.exports = {
   analyzeReceipt, create, list, listMine, getById, getByErpId, getComprobante, analyzeStoredComprobantes,
-  identificar, rechazar, stats, statsMine, buildReport, buildReportMine,
+  identificar, rechazar, cancelarPorErp, stats, statsMine, buildReport, buildReportMine,
 };

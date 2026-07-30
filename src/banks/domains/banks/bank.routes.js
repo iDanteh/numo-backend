@@ -228,18 +228,31 @@ router.patch('/movements/categoria/bulk',
 );
 
 // PATCH /api/banks/movements/:id/erp-ids  (remove individual)
+// Bug real 2026-07-30: este endpoint es la ÚNICA acción real de "desvincular" (el botón
+// del modal ERP solo edita el arreglo en memoria, ver erp-modal.component.ts) — estaba
+// guardado con 'banks:update' en vez de 'banks:erp:unlink', contradiciendo el comentario
+// explícito en rbac.js ("Restringido a admin — ningún otro rol puede eliminar una
+// vinculación existente"). El frontend ya filtraba el botón por 'banks:erp:unlink'
+// correctamente, así que este fix no cambia nada para roles existentes (nunca vieron el
+// botón) — solo hace que otorgar el permiso extra realmente funcione, y cierra el hueco de
+// que cualquiera con 'banks:update' pudiera desvincular llamando la API directo.
 router.patch('/movements/:id/erp-ids',
   authenticate,
-  permit('banks:update'),
+  permit('banks:erp:unlink'),
   asyncHandler(async (req, res) => {
     res.json(await service.updateErpIds(req.params.id, req.body.action, req.body.erpId, req.user));
   }),
 );
 
 // PUT /api/banks/movements/:id/erp-ids  (replace full array)
+// Base: 'banks:erp:link' (mínimo para poder vincular). Si el arreglo entrante representa
+// además una BAJA (quitar un erpId que ya existía), setErpIds() exige adicionalmente
+// 'banks:erp:unlink' — no se puede saber acá en la ruta si hay baja sin leer el movimiento
+// actual primero, así que ese chequeo vive dentro del servicio (mismo patrón ya usado en
+// el resto del archivo para lógica condicional de alcance/permiso).
 router.put('/movements/:id/erp-ids',
   authenticate,
-  permit('banks:update'),
+  permit('banks:erp:link'),
   asyncHandler(async (req, res) => {
     res.json(await service.setErpIds(req.params.id, req.body.erpLinks, req.user));
   }),

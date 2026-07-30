@@ -780,6 +780,21 @@ function parseBBVA(sheet) {
       if (chMatch) numeroAutorizacion = chMatch[1];
     }
 
+    // Caso real 2026-07-30: "DEPOSITO EFECTIVO PRACTIC / ******1014 MATELECTRICO 4908
+    // FOLIO:0097" — el bloque justo después del '/' NO es una autorización bancaria, es el
+    // número de cuenta/terminal ENMASCARADO (identifica la caja donde se hizo el depósito en
+    // efectivo, no la transacción — se repite igual en TODOS los depósitos de esa terminal,
+    // aunque sean de folios distintos). El fallback de arriba (^(\d+)) nunca matcheaba esto
+    // porque el token empieza con '*', así que quedaba el token completo con asteriscos. Sin
+    // este guard, 8 depósitos reales del mismo día con el mismo monto colisionaban en el
+    // dedup intra-lote (Capa A: banco+auth+monto, ver bank.service.js) porque compartían el
+    // mismo "auth" falso — se perdían 6 de 8 depósitos genuinos. No hay autorización bancaria
+    // real en un depósito en efectivo, así que null es más honesto que guardar la cuenta
+    // enmascarada como si fuera una.
+    if (numeroAutorizacion && /^\*+\d+$/.test(numeroAutorizacion)) {
+      numeroAutorizacion = null;
+    }
+
     // Extraer clave de rastreo SPEI para MORA SPEI NORMABANXICO.
     // BBVA incrusta el ID único de la transacción tras "COMPENSACION DE ":
     //   "MORA SPEI NORMABANXICO / COMPENSACION DE 8846APR1202605085280762645"
@@ -789,6 +804,15 @@ function parseBBVA(sheet) {
     const moraSpeiMatch = concepto.match(/\bCOMPENSACION\s+DE\s+([A-Z0-9]{10,})/i);
     if (moraSpeiMatch) {
       referenciaNumerica = moraSpeiMatch[1];
+    }
+
+    // Folio real del depósito en efectivo — "FOLIO:0097" en el mismo concepto de arriba. Es
+    // el identificador único de la transacción (a diferencia de la cuenta enmascarada del
+    // bloque anterior, que se repite entre depósitos distintos de la misma terminal). Mismo
+    // campo/patrón que usa moraSpeiMatch arriba, para no inventar uno nuevo.
+    if (!referenciaNumerica) {
+      const folioMatch = concepto.match(/\bFOLIO:\s*(\d+)/i);
+      if (folioMatch) referenciaNumerica = folioMatch[1];
     }
 
     const cargoRaw = toNumber(col3);

@@ -209,39 +209,19 @@ function _maxPosibleScore(ext) {
   return Math.min(max, 100); // scoreMovement ya topa en 100, mantener consistente
 }
 
-// Un movimiento cuenta como "libre" si no tiene NINGÚN erpId ajeno a esta solicitud —
-// aunque su `status` siga en 'no_identificado' (aplicarLogicaErp lo deja así mientras
-// el saldoErp acumulado no cubra el depósito completo), ya puede tener una CxC de OTRA
-// solicitud parcialmente enganchada. Ofrecerlo como candidato para una CxC distinta
-// arriesgaría mezclar dos solicitudes no relacionadas en el mismo depósito. Un
-// movimiento sin erpIds, o cuyos erpIds sean TODOS de esta misma solicitud (reintento),
-// sigue contando como libre.
-function _sinCxcAjena(ownErpIds) {
-  return {
-    $or: [
-      { erpIds: { $exists: false } },
-      { erpIds: { $size: 0 } },
-      { erpIds: { $not: { $elemMatch: { $nin: ownErpIds } } } },
-    ],
-  };
-}
-
 /**
  * Busca movimientos bancarios candidatos para el comprobante analizado.
  * Si no hay monto, devuelve los 15 más recientes para selección manual.
- * `ownErpIds` (opcional): erpIds de las CxC de la solicitud actual — un movimiento con
- * una CxC de OTRA solicitud ya enganchada no cuenta como candidato libre (ver _sinCxcAjena).
  */
-async function findMatchingMovements(ext, ownErpIds = []) {
+async function findMatchingMovements(ext) {
   if (!ext.monto) {
     const recent = await BankMovement.find({
       isActive: true,
-      // Solo movimientos libres — uno ya 'identificado' pertenece a otra CxC/
-      // solicitud y no debe ofrecerse como candidato (docs viejos sin status
-      // seteado cuentan como libres también, ver aplicarLogicaErp).
-      status:   { $in: ['no_identificado', null] },
-      ..._sinCxcAjena(ownErpIds),
-      fecha:    { $gte: new Date(Date.now() - FALLBACK_WINDOW * 86_400_000) },
+      // Decisión explícita del usuario (2026-07-30): esta búsqueda NO filtra por
+      // status/rol/regla, salvo 'identificado' — ver comentario completo más abajo,
+      // antes del filtro principal.
+      status: { $ne: 'identificado' },
+      fecha:  { $gte: new Date(Date.now() - FALLBACK_WINDOW * 86_400_000) },
     }).sort({ fecha: -1 }).limit(15).lean();
 
     return recent.map(mov => ({
@@ -256,11 +236,19 @@ async function findMatchingMovements(ext, ownErpIds = []) {
   const tol = Math.max(0.50, ext.monto * 0.005);
   const filter = {
     isActive: true,
-    // Solo movimientos libres — uno ya 'identificado' pertenece a otra CxC/
-    // solicitud y no debe ofrecerse como candidato (docs viejos sin status
-    // seteado cuentan como libres también, ver aplicarLogicaErp).
-    status:   { $in: ['no_identificado', null] },
-    ..._sinCxcAjena(ownErpIds),
+    // Decisión explícita del usuario (2026-07-30), con caso real: un depósito de $10,000
+    // puede cubrir 2 solicitudes de $5,000 cada una — mientras el depósito no esté
+    // TOTALMENTE cubierto (status !== 'identificado', ver aplicarLogicaErp: solo pasa a
+    // 'identificado' cuando saldoErp cubre el depósito completo), debe seguir apareciendo
+    // como candidato para CUALQUIER solicitud, sin importar si otra solicitud ya le
+    // enganchó una CxC parcial — por eso se quitó `_sinCxcAjena`/`ownErpIds` (protegía
+    // justo el escenario que el usuario confirmó que SÍ debe permitirse). Tampoco filtra
+    // por rol/regla de ocultamiento (`oculto`/`ocultoRoles` — nunca se filtraron acá, y a
+    // propósito se dejan sin tocar): esas son reglas de VISUALIZACIÓN en Bancos, no deben
+    // afectar la conciliación real de una solicitud de cobro. NO agregar de vuelta un
+    // filtro de rol, ni `_sinCxcAjena`, ni excluir 'reclasificado'/'otros' acá sin
+    // confirmar con el usuario — es intencional, no un descuido.
+    status: { $ne: 'identificado' },
     $or: [
       { deposito: { $gte: ext.monto - tol, $lte: ext.monto + tol } },
       { retiro:   { $gte: ext.monto - tol, $lte: ext.monto + tol } },

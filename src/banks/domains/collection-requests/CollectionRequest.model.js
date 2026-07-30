@@ -16,6 +16,10 @@ const { tipoSaldoEspecial } = require('./collection-request-erp-links');
  *   pendiente   → creada por el ERP, en espera de revisión (bandeja de Solicitudes de Cobro)
  *   identificada → un usuario de cobranza/contabilidad la vinculó a un BankMovement
  *   rechazada   → no se encontró el depósito o la solicitud es inválida
+ *   cancelada   → el ERP (Kore) canceló la CxC del lado de él antes de que Numo
+ *                 revisara la solicitud (ver #cancelarPorErp) — distinto de
+ *                 "rechazada": no es una decisión de un revisor de Numo, es un
+ *                 evento externo que Kore reporta.
  *
  * Al identificar/rechazar, collection-request.service.js avisa el estatus a Kore
  * (kore-caja.service.js#actualizarEstatusSolicitud, revision-contable) y, solo al
@@ -143,7 +147,7 @@ const collectionRequestSchema = new mongoose.Schema({
   // ── Estado ────────────────────────────────────────────────────────────────────
   status: {
     type:    String,
-    enum:    ['pendiente', 'identificada', 'rechazada'],
+    enum:    ['pendiente', 'identificada', 'rechazada', 'cancelada'],
     default: 'pendiente',
     index:   true,
   },
@@ -153,6 +157,15 @@ const collectionRequestSchema = new mongoose.Schema({
   resueltoPorUserId: { type: String, default: null },
   resueltoPorNombre: { type: String, default: null },
   resueltoAt:        { type: Date,   default: null },
+
+  // ── Cancelación (Kore, ver #cancelarPorErp) ──────────────────────────────────
+  // Identidad de quien cancela DEL LADO DE KORE — a diferencia de resueltoPor*
+  // (arriba), no siempre es un usuario que Numo pueda resolver por su cuenta;
+  // se guarda tal cual lo manda el ERP en el body (sub de Auth0 + nombre) para
+  // poder mostrar "Cancelado por el usuario X" en la bandeja sin adivinar.
+  canceladoPorUserId: { type: String, default: null },
+  canceladoPorNombre: { type: String, default: null },
+  canceladoAt:        { type: Date,   default: null },
 
   // ── Aplicación del cobro en Kore (al identificar) ────────────────────────────
   // "identificar" concilia Y aplica el cobro en un solo paso (todo o nada): si

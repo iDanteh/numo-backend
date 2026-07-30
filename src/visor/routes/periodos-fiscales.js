@@ -1,11 +1,12 @@
 const express = require('express');
 const { body } = require('express-validator');
 const { authenticate } = require('../../shared/middleware/auth');
-const { list, create, remove } = require('../controllers/periodoFiscal.controller');
+const { list, listSimple, create, remove } = require('../controllers/periodoFiscal.controller');
 
 const router = express.Router();
 
 router.get('/', authenticate, list);
+router.get('/simple', authenticate, listSimple);
 
 router.post('/',
   authenticate,

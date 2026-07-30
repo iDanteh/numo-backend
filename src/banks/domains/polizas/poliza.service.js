@@ -213,11 +213,34 @@ async function cancel(id, user, motivo) {
 }
 
 /**
- * Cancela TODAS las pólizas en estado 'borrador' del rfc/ejercicio/periodo
- * indicado (mismo alcance que usa el resto de la pantalla de Pólizas para
+ * Lista TODAS las pólizas en borrador del rfc/ejercicio/periodo — sin el tope
+ * de 100 que aplica `list()` (paginado, para la tabla) — para alimentar el
+ * modal de selección de "Cancelar todas". Mismo alcance/where que usa
+ * `cancelarTodas` para poder cancelar exactamente lo que aquí se muestra.
+ */
+async function listBorradorCandidatas({ rfc, ejercicio, periodo }) {
+  if (!rfc)       throw new ValidationError('RFC requerido');
+  if (!ejercicio) throw new ValidationError('Ejercicio requerido');
+  if (!periodo)   throw new ValidationError('Periodo requerido');
+
+  const polizas = await Poliza.findAll({
+    where: { rfc, ejercicio: Number(ejercicio), periodo: Number(periodo), estado: 'borrador' },
+    attributes: ['id', 'tipo', 'numero', 'concepto', 'fecha'],
+    order: [['fecha', 'DESC'], ['tipo', 'ASC'], ['numero', 'DESC']],
+  });
+  return polizas;
+}
+
+/**
+ * Cancela las pólizas en estado 'borrador' del rfc/ejercicio/periodo indicado
+ * (mismo alcance que usa el resto de la pantalla de Pólizas para
  * generar/exportar). Deliberadamente excluye 'contabilizada' y 'cancelada' —
  * las contabilizadas requieren el permiso de admin y se cancelan una por una
  * desde su propio modal, no en bulk.
+ *
+ * Si polizaIds viene con elementos, solo cancela esas (selección manual desde
+ * el modal de "Cancelar todas"); si no, cancela todas las de borrador del
+ * periodo (comportamiento previo).
  *
  * Reutiliza `cancel()` por cada póliza (misma validación, mismo aviso de IVA
  * PPD) en vez de duplicar la lógica — un error en una póliza no detiene las
@@ -225,13 +248,19 @@ async function cancel(id, user, motivo) {
  *
  * Devuelve: { canceladas: number, errores: [{ polizaId, numero, tipo, error }] }
  */
-async function cancelarTodas({ rfc, ejercicio, periodo }, user, motivo) {
+async function cancelarTodas({ rfc, ejercicio, periodo, polizaIds }, user, motivo) {
   if (!rfc)       throw new ValidationError('RFC requerido');
   if (!ejercicio) throw new ValidationError('Ejercicio requerido');
   if (!periodo)   throw new ValidationError('Periodo requerido');
 
+  const where = { rfc, ejercicio: Number(ejercicio), periodo: Number(periodo), estado: 'borrador' };
+  // Selección manual desde el modal — si no viene, se cancelan todas las de borrador.
+  if (Array.isArray(polizaIds) && polizaIds.length) {
+    where.id = polizaIds;
+  }
+
   const polizas = await Poliza.findAll({
-    where: { rfc, ejercicio: Number(ejercicio), periodo: Number(periodo), estado: 'borrador' },
+    where,
     attributes: ['id', 'numero', 'tipo'],
   });
 
@@ -1490,12 +1519,34 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes) 
     wsDesglose.getRow(1).eachCell(cell => {
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
     });
-    desgloseConsolidado
-      .sort((a, b) => (a.cuenta - b.cuenta) || a.centroCosto.localeCompare(b.centroCosto))
-      .forEach(d => {
-        const row = wsDesglose.addRow(d);
-        row.getCell('monto').numFmt = '#,##0.00';
-      });
+
+    // Efectivo y Tarjeta primero (mismo orden que en la póliza), agrupados
+    // TODOS juntos sin importar cuenta/sucursal — el usuario pidió que no
+    // queden mezclados, con un renglón de encabezado divisorio cada vez que
+    // cambia la forma de pago. Transferencia/Cheque agrupados (cuando
+    // comparten referencia bancaria real) y cualquier forma de pago sin
+    // mapear caen después, en el orden en que ya llegan.
+    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1 };
+    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6' };
+    desgloseConsolidado.sort((a, b) =>
+      (ORDEN_FORMA_PAGO_DESGLOSE[a.formaPago] ?? 2) - (ORDEN_FORMA_PAGO_DESGLOSE[b.formaPago] ?? 2)
+      || (a.cuenta - b.cuenta) || a.centroCosto.localeCompare(b.centroCosto),
+    );
+
+    let formaPagoAnterior = null;
+    for (const d of desgloseConsolidado) {
+      if (d.formaPago !== formaPagoAnterior) {
+        const rowHeader = wsDesglose.addRow([d.formaPago || 'OTRA FORMA DE PAGO']);
+        wsDesglose.mergeCells(`A${rowHeader.number}:H${rowHeader.number}`);
+        rowHeader.font = { bold: true };
+        rowHeader.eachCell({ includeEmpty: true }, cell => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: FILL_HEADER_FORMA_PAGO[d.formaPago] ?? 'FFE2E2E2' } };
+        });
+        formaPagoAnterior = d.formaPago;
+      }
+      const row = wsDesglose.addRow(d);
+      row.getCell('monto').numFmt = '#,##0.00';
+    }
     wsDesglose.autoFilter = { from: 'A1', to: 'G1' };
   }
 
@@ -1568,7 +1619,7 @@ async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
 }
 
 module.exports = {
-  list, getById, create, update, cancel, cancelarTodas, contabilizar, revertir, generarXmlSat,
+  list, getById, create, update, cancel, cancelarTodas, listBorradorCandidatas, contabilizar, revertir, generarXmlSat,
   reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,

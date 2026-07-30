@@ -42,6 +42,18 @@ router.get('/reporte-descuadradas',
   }),
 );
 
+// GET /api/polizas/borrador-candidatas?rfc=&ejercicio=&periodo=
+// Lista TODAS las pólizas en borrador del periodo (sin el tope de 100 de la
+// lista paginada) — alimenta el modal de selección de "Cancelar todas".
+router.get('/borrador-candidatas',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { rfc, ejercicio, periodo } = req.query;
+    res.json(await service.listBorradorCandidatas({ rfc, ejercicio, periodo }));
+  }),
+);
+
 // GET /api/polizas/xml-sat?rfc=&ejercicio=&periodo=&tipoSolicitud=AF&numOrden=&numTramite=
 router.get('/xml-sat',
   authenticate,
@@ -150,16 +162,18 @@ router.post('/:id/cancelar',
 );
 
 // POST /api/polizas/cancelar-todas
-// Cancela todas las pólizas en estado 'borrador' del rfc/ejercicio/periodo
+// Cancela las pólizas en estado 'borrador' del rfc/ejercicio/periodo
 // (las contabilizadas y ya canceladas quedan fuera — se cancelan una por una).
-// Body: { rfc, ejercicio, periodo, motivo? }
+// Si se manda polizaIds solo cancela esas (selección manual); si no, cancela
+// todas las de borrador del periodo (comportamiento previo).
+// Body: { rfc, ejercicio, periodo, motivo?, polizaIds?: number[] }
 // Response: { canceladas, total, errores: [{ polizaId, numero, tipo, error }] }
 router.post('/cancelar-todas',
   authenticate,
   permit('polizas:write'),
   asyncHandler(async (req, res) => {
-    const { rfc, ejercicio, periodo, motivo } = req.body;
-    res.json(await service.cancelarTodas({ rfc, ejercicio, periodo }, req.user, motivo));
+    const { rfc, ejercicio, periodo, motivo, polizaIds } = req.body;
+    res.json(await service.cancelarTodas({ rfc, ejercicio, periodo, polizaIds }, req.user, motivo));
   }),
 );
 

@@ -88,20 +88,27 @@ async function generarSugerencias({ fechaInicio, fechaFin, banco }) {
     ventanaInicio, ventanaFin, rfcEmpresa: RFC_EMPRESA,
   });
   const candidatosFacturaLibres = candidatosFactura.filter(c => !yaVinculadas.has(c.idDocumento.toUpperCase()));
+  // Mismo criterio para "pago completo": si TODAS las facturas que cubre ya tienen
+  // un movimiento vinculado (ya aparecen en Depósitos Ingresos), no hay nada nuevo
+  // que ofrecer -- se descarta el candidato completo. Si solo cubre una factura
+  // libre entre varias, se conserva (sigue habiendo algo por conciliar).
+  const candidatosPagoCompletoLibres = candidatosPagoCompleto.filter(c =>
+    c.facturas.length === 0 || !c.facturas.every(f => yaVinculadas.has(f.toUpperCase())),
+  );
 
   const sugerencias = [];
 
   for (const mov of movimientos) {
     const sugerencia = sugerirClientePorFirma(mov.concepto, catalogoFirmas);
 
-    const hitsGlobal = calcularHits(mov, candidatosFacturaLibres, candidatosPagoCompleto, {
+    const hitsGlobal = calcularHits(mov, candidatosFacturaLibres, candidatosPagoCompletoLibres, {
       toleranciaMonto: TOLERANCIA_MONTO, toleranciaDias: TOLERANCIA_DIAS_GLOBAL,
     });
 
     let estado, candidatos, extra = {};
 
     if (sugerencia) {
-      const hitsCliente = calcularHits(mov, candidatosFacturaLibres, candidatosPagoCompleto, {
+      const hitsCliente = calcularHits(mov, candidatosFacturaLibres, candidatosPagoCompletoLibres, {
         toleranciaMonto: TOLERANCIA_MONTO, toleranciaDias: TOLERANCIA_DIAS_FIRMA, rfcFiltro: sugerencia.cliente.rfc,
       });
 
@@ -118,9 +125,20 @@ async function generarSugerencias({ fechaInicio, fechaFin, banco }) {
         extra.clienteSugerido = clienteSugerido;
         if (hitsGlobal.length > 1) extra.ambiguedadResueltaPorFirma = true;
       } else if (hitsCliente.length === 0) {
+        // Sabemos quién es (firma bancaria) pero ninguna de sus facturas/pagos
+        // calza en monto/fecha. Igual mostramos sus candidatos SIN tolerancia
+        // (dentro de la ventana ya acotada por fecha) para que el usuario tenga
+        // un uuid con el que trabajar en vez de tener que buscarlo por fuera --
+        // el diffMonto/diffDias real queda visible en cada candidato para que
+        // se note que no es un match automático.
         estado = 'SOLO_FIRMA';
-        candidatos = [];
+        candidatos = calcularHits(mov, candidatosFacturaLibres, candidatosPagoCompletoLibres, {
+          toleranciaMonto: Infinity, toleranciaDias: Infinity, rfcFiltro: sugerencia.cliente.rfc,
+        });
         extra.clienteSugerido = clienteSugerido;
+        if (candidatos.length > 0) {
+          extra.nota = 'Sin match exacto en monto/fecha para este cliente -- revisa el diff antes de aceptar.';
+        }
       } else {
         estado = 'AMBIGUO';
         candidatos = hitsCliente;

@@ -16,6 +16,11 @@ const {
 const rulesService          = require('./bank-rules.service');
 const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
 const { emitToUser } = require('../../shared/socket');
+// erp.routes expone _sincronizarConRetry/_rangoDesdeFollo (mismo helper que ya usan los
+// scripts de backfill y collection-request.service.js) — sin ciclo: erp.routes.js requiere
+// bank.service.js, NUNCA bank.routes.js, así que esta ruta sí puede requerir erp.routes.
+const erpRoutes = require('../erp/erp.routes');
+const { logger } = require('../../shared/utils/logger');
 
 const router = express.Router();
 
@@ -65,14 +70,14 @@ const upload = multer({
 // GET /api/banks/cards
 router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
   // El dashboard muestra "Identificados" de TODO el equipo (scope ALL) aunque el rol tenga
   // scope OWN en la tabla de movimientos — decisión explícita del usuario, independiente de
   // getMovementScope()/rbac.js; la tabla de abajo sigue restringida a lo propio por defecto.
+  // No se calcula/pasa rolActual (2026-07-31): el dashboard ya no excluye por ocultar-por-rol,
+  // ver comentario en bank.service.js#getCards().
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
-  const rolActual     = hasAdminAccess ? null : req.user.role;
   const { year, month } = req.query;
-  res.json(await service.getCards(restrictions, rolActual, year, month));
+  res.json(await service.getCards(restrictions, year, month));
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)
@@ -142,6 +147,18 @@ router.get('/stats', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
   const rolActual     = hasAdminAccess ? null : req.user.role;
   res.json(await service.getStatusStats(year, month, restrictions, rolActual, banco || null));
+}));
+
+// GET /api/banks/years — años con al menos un movimiento, opcionalmente acotado a un banco.
+// 2026-07-31: separado de /stats para que el combo de año del dashboard no pague la agregación
+// completa de estadísticas solo para descartarla — mismo criterio de restricciones/rol que /stats.
+router.get('/years', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco } = req.query;
+  const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
+  const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
+  const rolActual     = hasAdminAccess ? null : req.user.role;
+  res.json({ years: await service.getAvailableYears(banco || null, rolActual, restrictions) });
 }));
 
 // POST /api/banks/upload
@@ -245,18 +262,48 @@ router.patch('/movements/:id/erp-ids',
 );
 
 // PUT /api/banks/movements/:id/erp-ids  (replace full array)
-// Base: 'banks:erp:link' (mínimo para poder vincular). Si el arreglo entrante representa
-// además una BAJA (quitar un erpId que ya existía), setErpIds() exige adicionalmente
-// 'banks:erp:unlink' — no se puede saber acá en la ruta si hay baja sin leer el movimiento
-// actual primero, así que ese chequeo vive dentro del servicio (mismo patrón ya usado en
-// el resto del archivo para lógica condicional de alcance/permiso).
+// Sin permit() propio a propósito: este PUT puede representar un alta (vincular —
+// 'banks:erp:link' O 'banks:cobro', ver bug 2026-07-31 en setErpIds()) y/o una baja
+// ('banks:erp:unlink') — no se puede saber acá en la ruta cuál de los dos es sin leer el
+// movimiento actual primero, así que ambos chequeos viven dentro del servicio (mismo
+// patrón ya usado en el resto del archivo para lógica condicional de alcance/permiso).
 router.put('/movements/:id/erp-ids',
   authenticate,
-  permit('banks:erp:link'),
   asyncHandler(async (req, res) => {
+    await _recuperarFolioFiscalFaltante(req.body.erpLinks);
     res.json(await service.setErpIds(req.params.id, req.body.erpLinks, req.user));
   }),
 );
+
+// Best-effort 2026-07-31 (mismo bug de fondo que en Solicitudes de Cobro, ver
+// collection-request.service.js#identificar paso 2b): el panel de cobros manual
+// (cobro-panel.component.ts + erp-modal.component.ts#confirmErp) arma erpLinks con el
+// folioFiscal que ya tenía CACHEADO en el navegador desde que se buscó/paginó la CxC — si
+// Kore timbra el CFDI entre esa búsqueda y el clic en "Aplicar Cobro"/"Guardar", ese
+// folioFiscal llega null y se queda así para siempre (ventana normalmente de segundos/
+// minutos, mucho más chica que en Solicitudes de Cobro, pero el mismo hueco). Antes de
+// persistir, se reintenta por cada link sin folioFiscal que sí traiga serie+folioExterno.
+// Nunca bloquea el guardado: si el ERP no responde o no lo encuentra, sigue sin ese dato.
+async function _recuperarFolioFiscalFaltante(erpLinks) {
+  if (!Array.isArray(erpLinks)) return;
+  for (const link of erpLinks) {
+    if (!link || link.folioFiscal || !link.serie || !link.folioExterno) continue;
+    const rango = erpRoutes._rangoDesdeFollo(link.folioExterno);
+    if (!rango) continue;
+    try {
+      const { raw } = await erpRoutes._sincronizarConRetry({
+        serieExterna: link.serie, folioExterno: String(link.folioExterno),
+        fechaDesde: rango.fechaDesde, fechaHasta: rango.fechaHasta,
+      });
+      const encontrada = raw.find(c =>
+        String(c.folioExterno) === String(link.folioExterno) && String(c.serieExterna) === String(link.serie),
+      );
+      if (encontrada?.folioFiscal) link.folioFiscal = encontrada.folioFiscal;
+    } catch (err) {
+      logger.warn(`[banks] PUT erp-ids: no se pudo recuperar folioFiscal para erpId=${link.erpId} vía /cuentas-pendientes (se continúa sin él): ${err.message}`);
+    }
+  }
+}
 
 // ── Reglas de categorización ─────────────────────────────────────────────────
 

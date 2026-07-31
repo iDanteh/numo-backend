@@ -110,18 +110,24 @@ function generarFolio(seq) {
  *   saldoInicial/lastImportBy NO se restringen aquí — son datos de configuración/saldo real del
  *   banco que hoy expone la tabla de resumen por banco (`banks-table-wrap`) sin ningún guard de
  *   permiso en el frontend; esa es una exposición aparte, pendiente de decidir por separado.
- * @param {string|null} [rolActual] - si viene, excluye movimientos ocultos-por-regla para ese rol.
  * @param {string|number} [year] - si viene, limita movimientos/porStatus/porCategoria a ese año
  *   (y mes, si también viene). `saldoActualizado` NO se afecta: es el saldo real vigente, no
  *   tiene sentido acotarlo a un periodo pasado.
  * @param {string|number} [month]
+ *
+ * 2026-07-31: a diferencia de listMovements()/exportMovements() (que sí excluyen por
+ * `ocultoRoles`, ocultando las FILAS de un movimiento al rol correspondiente), este endpoint ya
+ * NO recibe/aplica `rolActual` — decisión explícita del usuario: una categoría oculta-por-rol
+ * ("solo cobranza", oculta para contabilidad) debe seguir sin mostrar sus movimientos en la
+ * tabla, pero el DASHBOARD (KPIs + desglose por categoría) sí debe reflejar el panorama completo
+ * para cualquier rol — permite "consultar la información" agregada sin exponer el detalle fila
+ * por fila. Aplica a cualquier categoría que use ocultar-por-rol, no solo a una en particular.
  */
-async function getCards(restrictions = null, rolActual = null, year = null, month = null) {
+async function getCards(restrictions = null, year = null, month = null) {
   // Agregación MongoDB: estadísticas de movimientos por banco.
   // BankConfig ya no está en MongoDB → el $lookup se eliminó.
   // El join con la configuración se hace en la capa de aplicación.
   const match = { isActive: true, oculto: { $ne: true } };
-  if (rolActual)    match.ocultoRoles = { $ne: rolActual };
   if (restrictions) match.status      = { $ne: 'otros' };
   if (year) {
     const y = parseInt(year, 10);
@@ -240,6 +246,12 @@ async function getCards(restrictions = null, rolActual = null, year = null, mont
     ], { allowDiskUse: true }),
     // Desglose por categoría dentro de cada banco (chips de categoría en la vista de tarjetas).
     // Mismo `match` que la agregación principal; se excluyen movimientos sin categoría asignada.
+    // 2026-07-31: además de count/monto (ya existentes, alimentan el chip), ahora también trae
+    // el MISMO desglose por estatus/saldo que ya se calcula a nivel banco (líneas arriba) — sin
+    // esto, filtrar el dashboard por categoría solo podía incluir/excluir bancos completos, pero
+    // los KPIs seguían sumando el banco entero en vez del monto real de esa categoría (bug real
+    // reportado por el usuario). Mismas expresiones depositoCond/identificadoCond ya definidas
+    // arriba, solo agrupadas también por categoría.
     BankMovement.aggregate([
       { $match: { ...match, categoria: { $nin: [null, ''] } } },
       {
@@ -247,6 +259,52 @@ async function getCards(restrictions = null, rolActual = null, year = null, mont
           _id:    { banco: '$banco', categoria: '$categoria' },
           count:  { $sum: 1 },
           monto:  { $sum: { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] } },
+          no_identificado: { $sum: { $cond: [{ $and: [{ $in: ['$status', ['no_identificado', null]] }, depositoCond] }, 1, 0] } },
+          identificado:    { $sum: { $cond: [identificadoCond, 1, 0] } },
+          otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },          depositoCond] }, 1, 0] } },
+          reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },  depositoCond] }, 1, 0] } },
+          saldoPendiente: {
+            $sum: {
+              $cond: [
+                { $in: ['$status', ['no_identificado', null]] },
+                {
+                  $cond: [
+                    { $ne: ['$saldoErp', null] },
+                    { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] },
+                    { $ifNull: ['$deposito', 0] },
+                  ],
+                },
+                0,
+              ],
+            },
+          },
+          saldoIdentificado: {
+            $sum: {
+              $cond: [
+                identificadoCond,
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
+          },
+          saldoOtrosSolo: {
+            $sum: {
+              $cond: [
+                { $eq: ['$status', 'otros'] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
+          },
+          saldoReclasificado: {
+            $sum: {
+              $cond: [
+                { $eq: ['$status', 'reclasificado'] },
+                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
+                0,
+              ],
+            },
+          },
         },
       },
       { $sort: { count: -1 } },
@@ -258,7 +316,19 @@ async function getCards(restrictions = null, rolActual = null, year = null, mont
   const porCategoriaMap = new Map();
   for (const c of catAgg) {
     const list = porCategoriaMap.get(c._id.banco) ?? [];
-    list.push({ categoria: c._id.categoria, count: c.count, monto: c.monto });
+    list.push({
+      categoria: c._id.categoria, count: c.count, monto: c.monto,
+      porStatus: {
+        no_identificado: c.no_identificado,
+        identificado:    c.identificado,
+        otros:           c.otros,
+        reclasificado:   c.reclasificado,
+      },
+      saldoPendiente:     c.saldoPendiente     ?? 0,
+      saldoIdentificado:  c.saldoIdentificado  ?? 0,
+      saldoOtrosSolo:     c.saldoOtrosSolo     ?? 0,
+      saldoReclasificado: c.saldoReclasificado ?? 0,
+    });
     porCategoriaMap.set(c._id.banco, list);
   }
 
@@ -327,6 +397,33 @@ async function getCards(restrictions = null, rolActual = null, year = null, mont
       porCategoria: porCategoriaMap.get(b._id) ?? [],
     };
   });
+}
+
+/**
+ * Años con al menos un movimiento — para poblar el combo de año del dashboard.
+ * 2026-07-31: extraída de getStatusStats() (mismo yearsAgg que ya traía) porque el dashboard
+ * solo necesitaba esta lista y terminaba pagando también la agregación completa de
+ * estadísticas (statsAgg) para descartarla entera — desperdicio real en cada carga. Además,
+ * el dashboard nunca pasaba `banco`, así que el combo podía ofrecer años sin datos para el
+ * banco activo (el filtro de banco es client-side, nunca llegaba a este query).
+ *
+ * @param {string|null} [banco] - si viene, acota los años a ese banco.
+ * @param {string|null} [rolActual] - si viene, excluye movimientos ocultos-por-regla para ese rol.
+ * @param {{ scope: 'own'|'all', userId: string }|null} [restrictions] - null = acceso completo.
+ */
+async function getAvailableYears(banco = null, rolActual = null, restrictions = null) {
+  const yearsMatch = { isActive: true };
+  if (rolActual)    yearsMatch.ocultoRoles = { $ne: rolActual };
+  if (restrictions) yearsMatch.status      = { $ne: 'otros' };
+  if (banco)        yearsMatch.banco       = banco;
+
+  const yearsAgg = await BankMovement.aggregate([
+    { $match: yearsMatch },
+    { $group: { _id: { $year: '$fecha' } } },
+    { $sort:  { _id: -1 } },
+  ]);
+
+  return yearsAgg.map(r => r._id).filter(y => y != null && y > 1990);
 }
 
 /**
@@ -420,6 +517,13 @@ async function listMovements(filters) {
     status, categorias, identificadoPor,
     identificadoPorUsuario,
     movId, rolActual,
+    // 'amplia' (2026-07-31, pedido explícito para el buscador manual de "Conciliación
+    // bancaria" en Solicitudes de Cobro — collection-request.component.ts): opt-in, no cambia
+    // el comportamiento por default de este endpoint compartido (dashboard de Bancos, etc.).
+    // Cuando viene, la tolerancia de la búsqueda por monto usa el mismo criterio ya
+    // establecido para el matching de comprobantes OCR (receipt.service.js#findMatchingMovements,
+    // max($0.50, monto*0.5%)) en vez del esquema por-decimales-tipeados de abajo.
+    montoTolerancia,
   } = filters;
 
   const filter = { isActive: true, oculto: { $ne: true } };
@@ -499,13 +603,21 @@ async function listMovements(filters) {
 
     // Búsqueda por monto — tolerancia basada en los decimales ingresados:
     // sin decimales → rango de 1 peso completo; 1 decimal → ±0.05; 2 decimales → ±0.005
+    // `montoTolerancia === 'amplia'`: mismo criterio que el matching de comprobantes OCR
+    // (max($0.50, monto*0.5%)) — ver comentario en la desestructuración de filters arriba.
     const cleanNum = search.replace(/[$,\s]/g, '');
     const num      = parseFloat(cleanNum);
     if (!isNaN(num) && num > 0) {
-      const decimalPlaces = (cleanNum.split('.')[1] || '').length;
-      const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
-      _amountLo = decimalPlaces === 0 ? num             : num - tolerance;
-      _amountHi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
+      if (montoTolerancia === 'amplia') {
+        const tol = Math.max(0.50, num * 0.005);
+        _amountLo = num - tol;
+        _amountHi = num + tol;
+      } else {
+        const decimalPlaces = (cleanNum.split('.')[1] || '').length;
+        const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
+        _amountLo = decimalPlaces === 0 ? num             : num - tolerance;
+        _amountHi = decimalPlaces === 0 ? num + tolerance : num + tolerance;
+      }
       orClauses.push({ deposito: { $gte: _amountLo, $lte: _amountHi } });
       orClauses.push({ retiro:   { $gte: _amountLo, $lte: _amountHi } });
     }
@@ -1763,13 +1875,32 @@ async function setErpIds(id, erpLinks, user) {
   // REEMPLAZA el arreglo completo de erpLinks, así que un solo PUT puede representar un alta
   // (vincular), una baja (desvincular vía el chip "✕" del modal ERP — ver
   // erp-modal.component.ts, ese botón solo edita en memoria, el PUT es la persistencia real),
-  // o ambas a la vez. `permit('banks:erp:link')` en la ruta solo cubre el alta — la baja
-  // necesita 'banks:erp:unlink' explícito (mismo permiso "Restringido a admin" de rbac.js),
-  // calculado acá porque solo aquí se conoce el estado ANTERIOR (mov.erpIds) para comparar
-  // contra el nuevo arreglo entrante y saber si de verdad se está quitando algo.
+  // o ambas a la vez. La ruta ya NO trae permit() propio — el alta y la baja se resuelven
+  // acá porque solo aquí se conoce el estado ANTERIOR (mov.erpIds) para comparar contra el
+  // arreglo entrante y saber qué representa este PUT en concreto.
   const erpIdsAntes = mov.erpIds ?? [];
   const erpIdsNuevos = cleanLinks.map(l => l.erpId);
+  const seAgregaAlgo = erpIdsNuevos.some(eid => !erpIdsAntes.includes(eid));
   const seQuitaAlgo = erpIdsAntes.some(eid => !erpIdsNuevos.includes(eid));
+
+  // Bug real 2026-07-31 (reproducido en vivo por el usuario con un cobranza real: POST
+  // /cobros/operacion → 200 en Kore, PUT .../erp-ids → 403 inmediatamente después): el botón
+  // "Aplicar Cobro" del modal ERP se muestra con SOLO 'banks:cobro'
+  // (erp-modal.component.html:266, independiente de 'banks:erp:link') — la UI asume que poder
+  // aplicar un cobro alcanza para persistir su resultado. El backend exigía 'banks:erp:link'
+  // sin excepción para CUALQUIER alta, así que cobranza podía aplicar el cobro en Kore
+  // (aplicarCobroOperacion(Multiple) no exige este permiso) pero el POST siguiente
+  // (confirmErp() → este mismo endpoint) siempre devolvía 403 — 100% reproducible, no depende
+  // de red ni de Kore. 'banks:cobro' ahora también habilita el alta, igual que ya prometía la
+  // UI; la baja sigue exigiendo 'banks:erp:unlink' sin cambios (restringido a admin).
+  if (seAgregaAlgo) {
+    const puedeVincular =
+      (await rbacStore.hasPermission(user?.role, 'banks:erp:link', user?.extraPermissions)) ||
+      (await rbacStore.hasPermission(user?.role, 'banks:cobro', user?.extraPermissions));
+    if (!puedeVincular) {
+      throw new ForbiddenError('No tienes permiso para vincular una CxC a este movimiento.');
+    }
+  }
   if (seQuitaAlgo) {
     const puedeDesvincular = await rbacStore.hasPermission(user?.role, 'banks:erp:unlink', user?.extraPermissions);
     if (!puedeDesvincular) {
@@ -3041,7 +3172,7 @@ async function revertirConciliacion(runId, userId) {
 }
 
 module.exports = {
-  getCards, listMovements, getSummary, getStatusStats,
+  getCards, listMovements, getSummary, getStatusStats, getAvailableYears,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, reclasifyMovements, bulkUpdateCategoria, updateMovement, updateCategoria, generateTemplate,

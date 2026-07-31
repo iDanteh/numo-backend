@@ -1305,16 +1305,30 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
 // corrida repetida solo procesa lo que quedó pendiente de una corrida anterior (links
 // finalizados nuevos desde entonces, o que no se pudieron consultar la vez pasada), nunca
 // vuelve a pegarle a Kore por un link que ya se revisó.
+// Bug real 2026-07-31 (folio 038141): este job originalmente exigía conciliacionFinalizadaAt
+// no-nulo, un campo que SOLO marca el flujo tradicional de conciliación bancaria — los links
+// creados por Solicitudes de Cobro, por "Aplicar Cobro" del panel manual, o por "Guardar"
+// (vincular sin cobro) NUNCA tocan ese campo, así que quedaban invisibles para este job por
+// diseño, aunque su saldoPagadoTotal/saldoErpAportado nunca se hubiera determinado (caso
+// real: 3 CxC vinculadas manualmente, saldoPagado/saldoPagadoTotal/saldoErpAportado en null
+// para siempre, saldoErp calculado con el fallback legacy — total/saldoActual — en vez del
+// aporte bancario real). Ampliado: ahora también califica un link SIN conciliacionFinalizadaAt
+// mientras su saldoPagadoTotal siga sin determinar (null) — deliberadamente acotado a ese
+// caso, para no reprocesar de más los links de cobro-panel que YA tienen saldoPagadoTotal
+// bien calculado por _buildCobroSaldosErp() del lado del frontend.
 async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryRun = false) {
   syncCurrentJobId = jobId;
   try {
     const filter = {
       erpLinks: {
         $elemMatch: {
-          serie:                    { $ne: null },
-          folioExterno:             { $ne: null },
-          conciliacionFinalizadaAt: { $ne: null },
-          recomputedFormasPagoAt:   null,
+          serie:                  { $ne: null },
+          folioExterno:           { $ne: null },
+          recomputedFormasPagoAt: null,
+          $or: [
+            { conciliacionFinalizadaAt: { $ne: null } },
+            { saldoPagadoTotal: null },
+          ],
         },
       },
     };
@@ -1346,7 +1360,11 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
 
       for (let i = 0; i < links.length; i++) {
         const link = links[i];
-        if (!link.serie || !link.folioExterno || !link.conciliacionFinalizadaAt || link.recomputedFormasPagoAt) continue;
+        // Mismo criterio ampliado que el filtro de Mongo de arriba: califica si viene del
+        // flujo tradicional (conciliacionFinalizadaAt) O si su aporte nunca se determinó
+        // (saldoPagadoTotal null), sin importar el flujo que lo haya creado.
+        const elegible = link.conciliacionFinalizadaAt != null || link.saldoPagadoTotal == null;
+        if (!link.serie || !link.folioExterno || link.recomputedFormasPagoAt || !elegible) continue;
 
         const rango = _rangoDesdeFollo(link.folioExterno);
         if (!rango) continue;

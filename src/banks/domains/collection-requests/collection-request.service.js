@@ -10,6 +10,13 @@ const bankService       = require('../banks/bank.service'); // setErpIds — mis
 // ...) igual que ya se hacía con erpRoutes.obtenerSesionCaja antes de este
 // refactor — desestructurar aquí rompería esa capacidad de prueba.
 const koreCaja          = require('../erp/kore-caja.service');
+// erp.routes expone _sincronizarConRetry/_rangoDesdeFollo (mismo helper que ya
+// usan los scripts de backfill de este mismo dominio, ver
+// migrate-erp-movimientoskore-formaspago.js) — es la única consulta a Kore que
+// SÍ trae folioFiscal (endpoint /cuentas-pendientes del ERP; koreCaja habla con
+// /cuentas de caja, cuyo mapeo no expone ese campo). Kore exige rango de fecha
+// máximo un mes en este endpoint — nunca se le pega sin _rangoDesdeFollo.
+const erpRoutes         = require('../erp/erp.routes');
 const { parseCxcs, parseFormasPago }               = require('./collection-request.parsers');
 const { buildErpLinksParaCobro, tipoSaldoEspecial, matchBancoDefault } = require('./collection-request-erp-links');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
@@ -539,6 +546,32 @@ async function identificar(id, bankMovementId, user) {
       throw new BadRequestError(`No se pudo consultar el saldo de la(s) CxC en Kore: ${err.message}`);
     }
     throw err;
+  }
+
+  // 2b. Best-effort: si alguna CxC llegó sin folioFiscal (foto de cr.cxcs tomada al
+  // CREAR la solicitud — Kore puede timbrar el CFDI después, antes de autorizarla),
+  // se reintenta contra /cuentas-pendientes del ERP, que sí lo trae. Nunca bloquea el
+  // cobro: si el ERP no responde o no encuentra la cuenta, se sigue sin folioFiscal
+  // (mismo criterio de "recuperar cuando sea posible, nunca a costa de trabar el
+  // cobro" que ya usa _backfillFormasPagoYFolioFiscal en erp.routes.js).
+  const cuentaKorePorId = new Map(cuentasKore.map(c => [String(c.id), c]));
+  for (const cxc of cr.cxcs) {
+    if (cxc.folioFiscal) continue;
+    const rango = erpRoutes._rangoDesdeFollo(cxc.folioExterno);
+    if (!rango) continue; // folioExterno con formato inesperado — no se puede acotar la fecha, se deja para el rescate manual
+    try {
+      const { raw } = await erpRoutes._sincronizarConRetry({
+        serieExterna: cxc.serie, folioExterno: String(cxc.folioExterno),
+        fechaDesde: rango.fechaDesde, fechaHasta: rango.fechaHasta,
+      });
+      const encontrada = raw.find(c => String(c.folioExterno) === String(cxc.folioExterno) && (!cxc.serie || String(c.serieExterna) === String(cxc.serie)));
+      if (encontrada?.folioFiscal) {
+        const cuenta = cuentaKorePorId.get(String(cxc.erpId));
+        if (cuenta) cuenta.folioFiscal = encontrada.folioFiscal;
+      }
+    } catch (err) {
+      logger.warn(`[collection-requests] identificar ${id}: no se pudo recuperar folioFiscal para erpId=${cxc.erpId} vía /cuentas-pendientes (se continúa sin él): ${err.message}`);
+    }
   }
 
   // 3. La referencia bancaria SIEMPRE la asigna Numo con el folio del

@@ -112,6 +112,20 @@ const list = asyncHandler(async (_req, res) => {
 });
 
 /**
+ * GET /api/periodos-fiscales/simple
+ * Solo ejercicio/periodo/label, sin las 3 agregaciones de MongoDB de `list()`
+ * (comparaciones, discrepancias, CFDIs sobre la colección completa). Para
+ * selectores de ejercicio/periodo que no muestran esas estadísticas (pólizas,
+ * visor CFDIs, descarga manual, modal de selección de periodo) — `list()`
+ * puede tardar segundos en bases grandes y esos consumidores solo usan 3
+ * campos triviales.
+ */
+const listSimple = asyncHandler(async (_req, res) => {
+  const periodos = await periodoRepo.findAll();
+  res.json({ data: periodos.map((p) => p.toJSON()) });
+});
+
+/**
  * POST /api/periodos-fiscales
  */
 const create = asyncHandler(async (req, res) => {
@@ -160,4 +174,4 @@ const remove = asyncHandler(async (req, res) => {
   res.json({ message: 'Eliminado' });
 });
 
-module.exports = { list, create, remove };
+module.exports = { list, listSimple, create, remove };

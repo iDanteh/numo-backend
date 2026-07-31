@@ -87,7 +87,13 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
       saldoActual:      round2(Math.max(0, prevSaldo - pagadoTotal)),
       saldoPagado:      round2((existing?.saldoPagado ?? 0) + pagadoBanco),
       saldoPagadoTotal: round2((existing?.saldoPagadoTotal ?? 0) + pagadoTotal),
-      folioFiscal:      cxc.folioFiscal ?? null,
+      // A diferencia de serie/folioExterno/tipoPago (que no cambian tras crearse la
+      // solicitud), folioFiscal SÍ puede aparecer después: si Kore timbra el CFDI
+      // entre que se creó la solicitud y se autoriza, `cxc.folioFiscal` (foto vieja
+      // guardada en CollectionRequest.cxcs) queda null para siempre a menos que se
+      // priorice `cuenta` (consulta fresca a Kore, hecha en identificar() justo antes
+      // de aplicar el cobro) — mismo criterio que ya usa `total` arriba.
+      folioFiscal:      cuenta?.folioFiscal ?? cxc.folioFiscal ?? null,
       total:            cuenta?.total ?? cxc.total ?? 0,
       serie:            cxc.serie ?? cuenta?.serie ?? null,
       folioExterno:     cxc.folioExterno ?? cuenta?.folio ?? null,

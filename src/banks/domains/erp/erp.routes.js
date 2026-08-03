@@ -841,9 +841,26 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
 // null para siempre, asumiendo que Kore no tenía por qué facturar esa CxC nunca. Evidencia
 // real (folios 036472/036917/036967/037095/037085/037076/037099, 2026-07-30): Kore SÍ
 // termina timbrando el CFDI después del cierre limpio en el 100% de una muestra de 7 casos
-// — la hipótesis no se sostenía. Ahora se reintenta SIEMPRE mientras folioFiscal siga null,
+// — la hipótesis no se sostenía. Se pasó a reintentar SIEMPRE mientras folioFiscal siga null,
 // sin importar saldoActual/retención (mismo criterio ya usado para retención desde el
 // 2026-07-28, folio 036827, extendido a todos los cierres).
+// Acotado a 60 días (decisión del usuario 2026-08-03): el reintento indefinido no tenía techo
+// de costo — reconsulta Kore para siempre incluso en CxC que legítimamente nunca van a
+// facturarse. 60 días desde que Kore confirmó el cierre (conciliacionFinalizadaAt) da margen
+// de sobra a un CFDI que tarda en timbrarse sin reprocesar ese link para siempre. Pasada la
+// ventana, folioFiscal se acepta null (avanza el checkpoint) igual que la política vieja del
+// 24-jul, pero ahora con una ventana de gracia real en vez de "nunca reintentar".
+const DIAS_MAX_REINTENTO_FOLIO_FISCAL = 60;
+
+function _folioFiscalDentroDeVentanaReintento(conciliacionFinalizadaAt) {
+  // Sin fecha de cierre todavía (link recién finalizando en esta misma corrida, o aún sin
+  // conciliacionFinalizadaAt por venir de un flujo distinto al tradicional) — no hay "días
+  // transcurridos" que contar todavía, sigue dentro de ventana.
+  if (!conciliacionFinalizadaAt) return true;
+  const dias = (Date.now() - new Date(conciliacionFinalizadaAt).getTime()) / 86400000;
+  return dias <= DIAS_MAX_REINTENTO_FOLIO_FISCAL;
+}
+
 function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo) {
   // aporteNuevo/saldoPagadoCalc ahora pueden venir en null (_montoSaldoLinkPorMovimiento no
   // encontró coincidencia propia) — se conserva el valor previo del link en vez de pisarlo
@@ -860,9 +877,11 @@ function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo)
   // devolvía el '' ya guardado). El `||` sí normaliza '' a "ausente", igual que null/undefined
   // — seguro aquí porque folioFiscal es un UUID/string, nunca un 0/false legítimo.
   const folioFiscal = (link.folioFiscal || null) ?? (raw0.folioFiscal || null) ?? null;
-  // Ver comentario arriba de la función (2026-07-30): ya no importa si la CxC cerró limpia,
-  // por retención o con saldo a favor — mientras folioFiscal siga sin resolver, se reintenta.
-  const folioFiscalPendiente = folioFiscal == null;
+  // Ver comentario arriba de la función (2026-07-30 + 2026-08-03): ya no importa si la CxC
+  // cerró limpia, por retención o con saldo a favor — mientras folioFiscal siga sin resolver
+  // Y todavía estemos dentro de los 60 días desde el cierre, se reintenta.
+  const folioFiscalPendiente =
+    folioFiscal == null && _folioFiscalDentroDeVentanaReintento(link.conciliacionFinalizadaAt);
   return { saldoPagadoTotal, saldoPagado, folioFiscal, folioFiscalPendiente };
 }
 

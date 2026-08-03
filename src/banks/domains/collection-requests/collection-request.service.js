@@ -269,6 +269,29 @@ function _buildBusquedaFilter({ search, fechaInicio, fechaFin }) {
       { 'cxcs.nombrePersona': re },
     ];
 
+    // Folio compuesto de CxC ("D0-260705980") — reportado por el usuario: buscar solo el
+    // folioExterno ("260705980", la única forma posible hasta ahora, ver 'cxcs.folioExterno'
+    // arriba) es ambiguo, porque el mismo número puede repetirse bajo series distintas
+    // (D0-260705980 vs A0-260705980 serían indistinguibles). Si el término trae el formato
+    // "serie-folio", se agrega una cláusula PRECISA además de la anterior (no la reemplaza,
+    // para no romper la búsqueda parcial por folio solo) — $elemMatch es obligatorio acá:
+    // 'cxcs' es un arreglo, así que dos condiciones sueltas ({'cxcs.serie':X},
+    // {'cxcs.folioExterno':Y}) matchearían aunque X y Y vinieran de DOS CxC distintas de la
+    // misma solicitud, no de una sola — $elemMatch exige que ambas valgan en el MISMO elemento.
+    const folioCompuesto = search.match(/^\s*([A-Za-z0-9]{1,6})[\s-]+(\d+)\s*$/);
+    if (folioCompuesto) {
+      const [, serieRaw, folioRaw] = folioCompuesto;
+      const escSerie = serieRaw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      orClauses.push({
+        cxcs: {
+          $elemMatch: {
+            serie:        new RegExp(`^${escSerie}$`, 'i'),
+            folioExterno: new RegExp(folioRaw, 'i'),
+          },
+        },
+      });
+    }
+
     // Búsqueda por monto — mismo criterio de tolerancia que bank.service.js:
     // sin decimales → ±1 peso; 1 decimal → ±0.05; 2+ decimales → ±0.005.
     const cleanNum = search.replace(/[$,\s]/g, '');
@@ -966,4 +989,7 @@ async function buildReportMine(userId, filters) {
 module.exports = {
   analyzeReceipt, create, list, listMine, getById, getByErpId, getComprobante, analyzeStoredComprobantes,
   identificar, rechazar, cancelarPorErp, stats, statsMine, buildReport, buildReportMine,
+  // Re-expuesta para pruebas standalone (mismo patrón que erp.routes.js) — filtro puro,
+  // sin I/O, seguro de probar aislado.
+  _buildBusquedaFilter,
 };

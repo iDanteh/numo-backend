@@ -264,7 +264,7 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
 // actualizarEstatusSolicitud (revision-contable, más abajo) confirmó APROBADO.
 // Body `{ DatosAdicionalesPorFormaPago }`: un elemento por cada forma de pago
 // de la solicitud, con su FormaPagoID y DOS datos por separado del movimiento
-// identificado — "Autorizacion" (folio interno de Numo) y "Numo"
+// identificado — "Aut" (folio interno de Numo) y "Numo"
 // (numeroAutorizacion bancario real) — ninguno reemplaza al otro, ver
 // collection-request.service.js#identificar (paso 5) para dónde se arman —
 // NUNCA el payload de cobro completo (cuenta/detalle/formasPago): Kore ya tiene esos

@@ -852,12 +852,19 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
 // 24-jul, pero ahora con una ventana de gracia real en vez de "nunca reintentar".
 const DIAS_MAX_REINTENTO_FOLIO_FISCAL = 60;
 
-function _folioFiscalDentroDeVentanaReintento(conciliacionFinalizadaAt) {
-  // Sin fecha de cierre todavía (link recién finalizando en esta misma corrida, o aún sin
-  // conciliacionFinalizadaAt por venir de un flujo distinto al tradicional) — no hay "días
-  // transcurridos" que contar todavía, sigue dentro de ventana.
-  if (!conciliacionFinalizadaAt) return true;
-  const dias = (Date.now() - new Date(conciliacionFinalizadaAt).getTime()) / 86400000;
+// fechaAnclaAlterna (2026-08-04, folio 037600): los links creados por Solicitudes de
+// Cobro/Aplicar cobro manual NUNCA llenan conciliacionFinalizadaAt (ese campo es exclusivo
+// del flujo tradicional) — sin esto, `!conciliacionFinalizadaAt` siempre caía en "sigue
+// dentro de ventana" para ellos, es decir, reintento indefinido de por vida (el mismo
+// problema sin techo que esta ventana vino a resolver, solo que para otro flujo). El
+// llamador resuelve la fecha real de cierre de ESE flujo (identificadoPor.fechaId) y la
+// pasa acá como fallback cuando no hay conciliacionFinalizadaAt.
+function _folioFiscalDentroDeVentanaReintento(conciliacionFinalizadaAt, fechaAnclaAlterna = null) {
+  const ancla = conciliacionFinalizadaAt ?? fechaAnclaAlterna;
+  // Sin ninguna fecha de cierre todavía (link recién finalizando en esta misma corrida) —
+  // no hay "días transcurridos" que contar todavía, sigue dentro de ventana.
+  if (!ancla) return true;
+  const dias = (Date.now() - new Date(ancla).getTime()) / 86400000;
   return dias <= DIAS_MAX_REINTENTO_FOLIO_FISCAL;
 }
 
@@ -880,8 +887,13 @@ function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo)
   // Ver comentario arriba de la función (2026-07-30 + 2026-08-03): ya no importa si la CxC
   // cerró limpia, por retención o con saldo a favor — mientras folioFiscal siga sin resolver
   // Y todavía estemos dentro de los 60 días desde el cierre, se reintenta.
+  // fechaAnclaAlterna (2026-08-04): para links sin conciliacionFinalizadaAt (Solicitudes de
+  // Cobro/Aplicar cobro manual), la fecha de cierre real es cuándo se confirmó ESE cobro —
+  // identificadoPor.fechaId del erpId de este link, ya guardado por identificar()/setErpIds().
+  const fechaAnclaAlterna = mov.identificadoPor?.find(i => i.erpId === link.erpId)?.fechaId ?? null;
   const folioFiscalPendiente =
-    folioFiscal == null && _folioFiscalDentroDeVentanaReintento(link.conciliacionFinalizadaAt);
+    folioFiscal == null &&
+    _folioFiscalDentroDeVentanaReintento(link.conciliacionFinalizadaAt, fechaAnclaAlterna);
   return { saldoPagadoTotal, saldoPagado, folioFiscal, folioFiscalPendiente };
 }
 
@@ -1347,6 +1359,13 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
           $or: [
             { conciliacionFinalizadaAt: { $ne: null } },
             { saldoPagadoTotal: null },
+            // 2026-08-04 (folio 037600): sin esto, un link de Solicitud de Cobro con
+            // saldoPagadoTotal YA correcto (confirmado por un humano) y
+            // conciliacionFinalizadaAt que ese flujo nunca llena queda fuera de ESTE
+            // filtro para siempre — el cron diario nunca lo vuelve a seleccionar aunque
+            // folioFiscal siga null. La precisión real (¿sigue dentro de la ventana de
+            // 60 días?) se decide por-link más abajo, con el ancla que corresponda.
+            { folioFiscal: { $in: [null, ''] } },
           ],
         },
       },
@@ -1382,7 +1401,17 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
         // Mismo criterio ampliado que el filtro de Mongo de arriba: califica si viene del
         // flujo tradicional (conciliacionFinalizadaAt) O si su aporte nunca se determinó
         // (saldoPagadoTotal null), sin importar el flujo que lo haya creado.
-        const elegible = link.conciliacionFinalizadaAt != null || link.saldoPagadoTotal == null;
+        // 2026-08-04 (folio 037600): además califica si folioFiscal sigue sin resolver Y
+        // todavía estamos dentro de los 60 días desde el cierre real de ESTE link (mismo
+        // ancla que usa _backfillFormasPagoYFolioFiscal — conciliacionFinalizadaAt si
+        // existe, si no identificadoPor.fechaId del erpId). Pasada la ventana no hace
+        // falta seguir entrando aquí: aunque el filtro de Mongo lo traiga, folioFiscal ya
+        // se acepta null para siempre y no hay nada más que ganar reconsultando Kore.
+        const fechaAnclaAlterna = mov.identificadoPor?.find(ip => ip.erpId === link.erpId)?.fechaId ?? null;
+        const folioFiscalRecuperable = !link.folioFiscal
+          && _folioFiscalDentroDeVentanaReintento(link.conciliacionFinalizadaAt, fechaAnclaAlterna);
+        const elegible = link.conciliacionFinalizadaAt != null || link.saldoPagadoTotal == null
+          || folioFiscalRecuperable;
         if (!link.serie || !link.folioExterno || link.recomputedFormasPagoAt || !elegible) continue;
 
         const rango = _rangoDesdeFollo(link.folioExterno);
@@ -2455,6 +2484,7 @@ router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
 router._esLinkPuroCancelacionODevolucion = _esLinkPuroCancelacionODevolucion;
 router._backfillFormasPagoYFolioFiscal   = _backfillFormasPagoYFolioFiscal;
+router._folioFiscalDentroDeVentanaReintento = _folioFiscalDentroDeVentanaReintento;
 router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 
 module.exports = router;

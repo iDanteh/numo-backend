@@ -8,6 +8,8 @@ const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
 const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
+const { construirMovimientosPuente, _extraerDocumentosRelacionados } = require('./cobros-sucursal-puente.service');
+const { obtenerSaldosFavor } = require('../erp/erp-sync.service');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
 const {
@@ -50,6 +52,255 @@ async function _completarRelacionadosPostMerge(cfdisFinal, relMetodoPagoMap, rel
 }
 
 const SUCURSAL_DEFAULT = 'Cedis';
+
+// Misma lista que TIPO_MARCADORES en cobros-sucursal-puente.service.js — el
+// marcador de TIPO del documento relacionado (no la referencia real a la
+// venta). Duplicado a propósito (archivo pequeño, mismo patrón que
+// ETIQUETA_COBRO_SUCURSAL ya duplicado entre poliza.service.js y ese archivo).
+const TIPO_MARCADORES_DEV = ['BON', 'BCT', 'DEV', 'CAC'];
+
+// Etiqueta especial de columna C para el par generación+uso de un saldo a
+// favor que se "lava" el mismo día en el mismo almacén (ver
+// `_prefetchSaldosFavorGenerados`) — `_extraerCobrosSucursal`
+// (poliza.service.js) las omite del export por completo (ni siquiera como
+// "Cobro de otra sucursal"), pero SIGUEN existiendo en poliza_movimientos —
+// mismo patrón que ya usa el sistema para el Abono real de una Devolución
+// (se oculta del export, nunca se borra de la BD). Duplicado a propósito en
+// cobros-sucursal-puente.service.js.
+const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
+
+/**
+ * Para cada Devolución (CFDI tipo E) del batch, consulta en lote
+ * /desgloses-cobro/saldos-favor (vía `obtenerSaldosFavor`) usando el folioVenta
+ * de la venta ORIGINAL que ajusta (su documento relacionado, excluyendo el
+ * marcador de tipo) y devuelve `{ mapa, devsOcultos }`:
+ *   - `mapa`: `DEV|folio` → { monto, ventaSerie, ventaFolio, oculto } — para
+ *     saber si ESA Devolución específica generó un saldo a favor real, y a
+ *     qué VENTA se le atribuye (confirmado con el usuario 2026-08-04:
+ *     DEV-055225 generó $136.22 registrados bajo la venta I0-260700186 — NO
+ *     bajo el folio propio de la devolución).
+ *   - `devsOcultos`: Set de `DEV|folio` cuyo saldo se generó Y se consumió
+ *     POR COMPLETO el MISMO día en el MISMO almacén (una sola aplicación,
+ *     sin sobrante) — confirmado con el usuario 2026-08-04: ese caso es un
+ *     "lavado" interno del mismo almacén/día y no debe verse en el export
+ *     (ni la línea de generación ni la de uso), aunque sí queden guardadas.
+ *     Si se generó en OTRO almacén, se usó OTRO día, o el uso fue parcial
+ *     (sobrante > 0, sea del mismo almacén o de otro), SÍ debe verse.
+ *     `construirMovimientosPuente` (cobros-sucursal-puente.service.js) usa
+ *     este set para marcar igual el lado de "uso".
+ */
+async function _prefetchSaldosFavorGenerados(cfdis) {
+  const devolucionesConVenta = cfdis
+    .map(cfdi => {
+      if (cfdi.tipoDeComprobante !== 'E') return null;
+      const marcador = (cfdi.documentosRelacionados ?? [])
+        .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+      const venta = _extraerDocumentosRelacionados(cfdi)[0];
+      return (marcador && venta) ? { marcador, venta } : null;
+    })
+    .filter(Boolean);
+  if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+
+  const LOTE = 150;
+  const mapa = new Map();
+  const devsOcultos = new Set();
+  for (let i = 0; i < devolucionesConVenta.length; i += LOTE) {
+    const lote = devolucionesConVenta.slice(i, i + LOTE);
+    const resultado = await obtenerSaldosFavor({
+      series: lote.map(d => d.venta.serie),
+      folios: lote.map(d => d.venta.folio),
+    });
+    for (const cuenta of resultado) {
+      for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+        const key = `${gen.serieOrigen}|${gen.folioOrigen}`;
+        const usos = gen.usos ?? [];
+        const usoUnico = usos.length === 1 ? usos[0] : null;
+        const diaGen = gen.fecha ? new Date(gen.fecha).toISOString().slice(0, 10) : null;
+        const diaUso = usoUnico?.fecha ? new Date(usoUnico.fecha).toISOString().slice(0, 10) : null;
+        const usoCompleto = usoUnico && Math.abs(Number(usoUnico.montoSobrante) || 0) < 0.01;
+        const oculto = !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso && usoUnico.serieVenta === cuenta.serieVenta);
+        if (oculto) devsOcultos.add(key);
+        const prev = mapa.get(key);
+        mapa.set(key, {
+          monto:      (prev?.monto ?? 0) + (Math.abs(Number(gen.monto) || 0)),
+          ventaSerie: cuenta.serieVenta,
+          ventaFolio: cuenta.folioVenta,
+          oculto,
+        });
+      }
+    }
+  }
+  return { mapa, devsOcultos };
+}
+
+/**
+ * Arma las 2 líneas (Abono subtotal + Abono IVA, sin ningún Cargo que las
+ * compense) del saldo a favor generado por una Devolución — ver
+ * `_prefetchSaldosFavorGenerados`. Deliberadamente NO cancela ni toca el
+ * Abono normal de la Devolución (Caja/Bancos/Clientes, lo que sea):
+ * confirmado con el usuario 2026-08-04 que ambos deben coexistir tal cual,
+ * aunque a nivel de este único CFDI se vea "descuadrado" — el saldo a favor
+ * es una cuenta de pasivo con saldo corrido (como Clientes/CxC), no algo que
+ * tenga que cuadrar el mismo día; se resuelve solo cuando se registra su USO
+ * en otra venta (ver `usadosPorCuenta` en cobros-sucursal-puente.service.js).
+ * Concepto/serie usan la VENTA que generó el saldo, no el folio propio de la
+ * Devolución. Devuelve `[]` si esta Devolución no generó saldo a favor.
+ */
+function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cc }) {
+  if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
+  const marcador = (cfdi.documentosRelacionados ?? [])
+    .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+  if (!marcador) return [];
+  const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
+  if (!generado?.monto) return [];
+
+  const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
+  const iva = Math.round((generado.monto - subtotal) * 100) / 100;
+  const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+  const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
+
+  const base = {
+    concepto:      [nombreCliente, serieFolioVenta].filter(Boolean).join(' / '),
+    serie:         serieFolioVenta,
+    centroCosto:   cc?.clave ?? null,
+    centroCostoId: cc?.id    ?? null,
+    // tipoOrigen='Cobro Sucursal' (NO un tipo propio) — a propósito: solo así
+    // pasa por `_extraerCobrosSucursal` (poliza.service.js), que arma columna
+    // C = "SF" (por `reglaNombre`) SIN reconstruir el concepto — a diferencia
+    // de `bloquesAbonosNormales`+`enriquecerConceptoConCliente` (el camino que
+    // toma cualquier otro tipoOrigen), que SÍ reconstruye el concepto a partir
+    // de `serie` — poner serie="SF" ahí corrompía el concepto a "cliente / SF"
+    // en vez de "cliente / I0-260700186" (confirmado con el usuario 2026-08-04).
+    tipoOrigen:    'Cobro Sucursal',
+    // 'SF-OCULTO' cuando se generó y se consumió por completo el mismo día
+    // en el mismo almacén — ver `_prefetchSaldosFavorGenerados` — para que
+    // `_extraerCobrosSucursal` la omita del export (sigue en poliza_movimientos).
+    reglaNombre:   generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF',
+    cfdiUuid:      cfdi.uuid,
+    cuentaFaltante: false,
+    debe: 0,
+  };
+  return [
+    { ...base, cuentaId: cuentaSaldoFavorId,    haber: subtotal },
+    { ...base, cuentaId: cuentaIvaSaldoFavorId, haber: iva },
+  ];
+}
+
+// Cuentas fijas para los cobros cruzados de sucursales (ver
+// cobros-sucursal-puente.service.js). PUE usa directamente Caja/Bancos por
+// identificar en ambos lados; PPD usa la cuenta puente (2103040001) para el
+// asiento adicional que cierra Clientes contra el Cargo/Abono cruzado.
+// Saldo a favor (cualquiera de los dos) usa Anticipos Otros (2103090001) +
+// IVA Trasladado - Anticipos (2104010002), con columna C = "SF".
+const CODIGO_CUENTA_PUENTE_SUCURSALES = '2103040001';
+const CODIGO_CUENTA_CAJA              = '1101010003';
+const CODIGO_CUENTA_BANCOS            = '1102011005';
+const CODIGO_CUENTA_SALDO_FAVOR       = '2103090001';
+const CODIGO_CUENTA_IVA_SALDO_FAVOR   = '2104010002';
+
+// UUIDs cuyo Cargo YA está cubierto por una línea 'Cobro Sucursal' guardada
+// en CUALQUIER póliza no cancelada (de cualquier día) — complementa el
+// `facturasVendedorCubiertas` que devuelve `construirMovimientosPuente`, que
+// solo detecta lo del MISMO día que se está generando. Necesario cuando una
+// Factura Global se reconoce como Venta un día distinto al que se cobraron
+// sus tickets (ej. Global emitida el 11/07, tickets cobrados el 10/07): sin
+// esto, el día 11 nunca ve que esos tickets ya cubrieron su Cargo y termina
+// duplicándolo contra el Abono de Ingresos/IVA (confirmado con el usuario
+// 2026-08-04, Global I0-260700155).
+async function _uuidsConCargoCubiertoEnBD({ rfc }) {
+  const rows = await PolizaMovimiento.findAll({
+    where: { tipoOrigen: 'Cobro Sucursal', cfdiUuid: { [Op.ne]: null } },
+    attributes: ['cfdiUuid'],
+    include: [{
+      model:      Poliza,
+      as:         'poliza',
+      attributes: [],
+      where:      { rfc, estado: { [Op.ne]: 'cancelada' } },
+      required:   true,
+    }],
+    raw: true,
+  });
+  return new Set(rows.map(r => r.cfdiUuid?.toUpperCase()).filter(Boolean));
+}
+
+async function _resolverCuentasPuenteSucursales() {
+  const rows = await AccountPlan.findAll({
+    where:      { codigo: [CODIGO_CUENTA_PUENTE_SUCURSALES, CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR] },
+    attributes: ['id', 'codigo'],
+    raw:        true,
+  });
+  const byCodigo = Object.fromEntries(rows.map(r => [r.codigo, r.id]));
+  return {
+    cuentaPuenteId:        byCodigo[CODIGO_CUENTA_PUENTE_SUCURSALES] ?? null,
+    cuentaCajaId:          byCodigo[CODIGO_CUENTA_CAJA] ?? null,
+    cuentaBancosId:        byCodigo[CODIGO_CUENTA_BANCOS] ?? null,
+    cuentaSaldoFavorId:    byCodigo[CODIGO_CUENTA_SALDO_FAVOR] ?? null,
+    cuentaIvaSaldoFavorId: byCodigo[CODIGO_CUENTA_IVA_SALDO_FAVOR] ?? null,
+  };
+}
+
+// Universo de CFDIs para que construirMovimientosPuente resuelva documentos
+// relacionados (cliente/metodoPago de la venta original) SIN restringirlo al
+// día que se está generando — a diferencia de `cfdisSinPolizaFinal`, que sí
+// se acota al día (ver `uuidsPorFechaEfectiva` en generarPropuesta/
+// generarYGuardar). Necesario porque el CFDI que trae el `documentoRelacionado`
+// (ej. una Factura Global que agrupa varios tickets) puede fecharse un día
+// DESPUÉS del día real en que se cobraron esos tickets — sin este universo
+// amplio, esos cobros nunca se detectan al generar por día (confirmado con el
+// usuario 2026-08-04: ticket I0-260700183/184/etc., cobrados el 10/07, solo
+// referenciados por la Global I0-260700155 fechada el 11/07). El filtro por
+// fecha REAL del cobro (no del CFDI) se aplica después, dentro de
+// construirMovimientosPuente, vía `cobro.fecha` — ver fechaDesde/fechaHasta.
+//
+// Se acota a `serie` (la propia serie de facturación del centro que se está
+// generando) — el "documento relacionado" de una venta SIEMPRE sale de un
+// CFDI de la MISMA serie que vendió (nunca de quien solo cobró) — ampliar a
+// las 11 sucursales del mes completo saturaba el ERP (429 Too Many Requests,
+// confirmado con el usuario 2026-08-04). Limitación conocida: si este centro
+// actúa como COBRADOR de una venta PPD de OTRA sucursal, `cfdiOriginal` no se
+// resuelve (nombreCliente cae a 'CLIENTE NO IDENTIFICADO') — no afecta el
+// monto ni la cuenta, solo la etiqueta; revisar si se necesita ampliar de
+// nuevo con un límite de tasa hacia el ERP.
+async function _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie }) {
+  const satCfdis = await CFDI.find({
+    'emisor.rfc':      rfc,
+    ejercicio:         Number(ejercicio),
+    periodo:           Number(periodo),
+    tipoDeComprobante: tipoCfdi,
+    source:            'SAT',
+    satStatus:         'Vigente',
+    isActive:          true,
+    ...(serie ? { serie } : {}),
+  }).select('uuid documentosRelacionados receptor metodoPago serie folio fecha').lean();
+
+  const uuids = satCfdis.map(c => c.uuid);
+  const erpCfdis = uuids.length
+    ? await CFDI.find({ uuid: { $in: uuids }, source: 'ERP' }).select('uuid documentosRelacionados metodoPago').lean()
+    : [];
+  const erpMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
+
+  // Filtrar aquí (no dejárselo solo a construirMovimientosPuente) para no
+  // acarrear miles de CFDIs sin documento relacionado del periodo completo —
+  // la mayoría no trae ninguno.
+  //
+  // `metodoPago` también se fusiona con ERP (no solo `documentosRelacionados`):
+  // SAT muchas veces NO trae metodoPago propio (undefined) — sin este merge,
+  // `esPPD` en construirMovimientosPuente caía a `false` para esos CFDIs y el
+  // cobro se procesaba como PUE (Cargo directo a Bancos, sin Abono a Clientes)
+  // en vez de PPD (cuenta puente + Abono) — confirmado con el usuario
+  // 2026-08-04, HERROZINC I0-260700082: quedó como asiento descuadrado
+  // ($19,037.47 de Cargo sin ninguna contrapartida).
+  return satCfdis
+    .map(c => {
+      const erp = erpMap[c.uuid];
+      return {
+        ...c,
+        documentosRelacionados: erp?.documentosRelacionados ?? c.documentosRelacionados ?? [],
+        metodoPago:             c.metodoPago ?? erp?.metodoPago ?? null,
+      };
+    })
+    .filter(c => c.documentosRelacionados.length > 0);
+}
 
 // Rango de folios de CONTPAQ reservado por sucursal (confirmado con el
 // usuario 2026-07-27) — cada póliza de Ingreso nueva de esa sucursal toma el
@@ -465,7 +716,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   // 1. UUIDs ya contabilizados — solo los del RFC solicitado (JOIN con polizas)
   const yaContabilizados = await PolizaMovimiento.findAll({
-    where:      { cfdiUuid: { [Op.ne]: null } },
+    // tipoOrigen != 'Cobro Sucursal': esas líneas solo REFERENCIAN el CFDI
+    // (ej. una Factura Global citada por construirMovimientosPuente como
+    // `cfdiOriginal` de varios tickets cruzados) — no registran su propia
+    // venta. Sin esta exclusión, en cuanto la Global se cita una vez queda
+    // "ya contabilizada" para siempre y su propia línea de Venta (Ingresos +
+    // IVA) nunca se genera en ningún día (confirmado con el usuario
+    // 2026-08-04: Global I0-260700155 nunca aparecía como Venta).
+    where:      { cfdiUuid: { [Op.ne]: null }, tipoOrigen: { [Op.ne]: 'Cobro Sucursal' } },
     attributes: ['cfdiUuid'],
     include: [{
       model:      Poliza,
@@ -521,6 +779,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
 
+  // Antes ambos casos (cero CFDIs encontrados vs. todos ya poliza'dos) tiraban
+  // el mismo mensaje "ya tienen póliza registrada" — confuso cuando en
+  // realidad no se encontró ningún CFDI (ej. día sin facturas al generar "por
+  // día"): no había nada que contabilizar, no que ya estuviera contabilizado.
+  if (cfdis.length === 0) {
+    const rango = (fechaInicio && fechaFin)
+      ? (fechaInicio === fechaFin ? `el día ${fechaInicio}` : `el rango ${fechaInicio} a ${fechaFin}`)
+      : `el periodo ${periodo}/${ejercicio}`;
+    throw new BadRequestError(`No se encontró ningún CFDI tipo ${tipoCfdi} para ${rango}`);
+  }
   if (cfdisSinPoliza.length === 0) {
     throw new BadRequestError('Todos los CFDIs vigentes del periodo ya tienen póliza registrada');
   }
@@ -686,6 +954,67 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // resuelva más abajo.
   await _completarRelacionadosPostMerge(cfdisConNCProp, relMetodoPagoMap, relFacturaMetaMap);
 
+  // Saldos a favor generados por las Devoluciones de este batch — ANTES de
+  // construirMovimientosPuente porque `devsOcultos` (ver
+  // `_prefetchSaldosFavorGenerados`) debe llegar a esa llamada, para que el
+  // lado de "uso" también sepa marcar como oculto el mismo par
+  // generación+uso "lavado" el mismo día en el mismo almacén.
+  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp);
+
+  // Cobros de sucursales (Caja/Bancos por identificar, ver
+  // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
+  // Se calcula ANTES del loop de reglas (más abajo) porque
+  // `facturasVendedorCubiertas` se usa ahí para omitir el Cargo normal de las
+  // facturas cuyo Cargo ya cubre este flujo — si no se omite, la póliza queda
+  // con doble Cargo (uno normal + uno de sucursal) contra un solo Abono.
+  // Usa cfdisSinPolizaFinal (SIN filtrar por centro) para poder detectar el
+  // cobro cruzado en cualquier dirección; el propio construirMovimientosPuente
+  // filtra las líneas según centroCostoId.
+  //
+  // Al generar POR DÍA (fechaInicio/fechaFin), el universo de CFDIs para
+  // resolver documentos relacionados se amplía a TODO el periodo (ver
+  // `_fetchCfdisParaPuenteAmplio`) — el cobro se filtra por su fecha REAL
+  // (fechaDesde/fechaHasta, dentro de construirMovimientosPuente), no por la
+  // fecha del CFDI que lo referencia.
+  let movsPuente = [];
+  let facturasVendedorCubiertas = new Set();
+  let facturasPPDCubiertas = new Map();
+  let pendientesPorFacturarProp = [];
+  let cuentaSaldoFavorIdProp = null;
+  let cuentaIvaSaldoFavorIdProp = null;
+  if (tipoCfdi === 'I' && centroCostoId) {
+    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId } = await _resolverCuentasPuenteSucursales();
+    cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
+    cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
+    if (cuentaCajaId && cuentaBancosId) {
+      const serieDelCentro = Object.entries(ccBySerieMapProp).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0];
+      const cfdisParaPuente = (fechaInicio && fechaFin)
+        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
+        : cfdisSinPolizaFinal;
+      const resultadoPuente = await construirMovimientosPuente({
+        cfdis: cfdisParaPuente,
+        centroCostoId,
+        ccBySerieMap: ccBySerieMapProp,
+        cuentaCajaId,
+        cuentaBancosId,
+        cuentaPuenteId,
+        cuentaSaldoFavorId,
+        cuentaIvaSaldoFavorId,
+        rfc,
+        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+        devsOcultosSF: devsOcultosSFProp,
+      });
+      movsPuente = resultadoPuente.movimientos;
+      facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
+      facturasPPDCubiertas = resultadoPuente.facturasPPDCubiertas;
+      pendientesPorFacturarProp = resultadoPuente.pendientesPorFacturar ?? [];
+      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
+      // detectado hoy con lo ya cubierto en días previos.
+      for (const u of await _uuidsConCargoCubiertoEnBD({ rfc })) facturasVendedorCubiertas.add(u);
+    }
+  }
+
   // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
   const cfdiConRegla = cfdisConNCProp.map(cfdi => ({
     cfdi,
@@ -832,7 +1161,23 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     const ccProp = cfdi.serie ? (ccBySerieMapProp[cfdi.serie] ?? null) : null;
 
+    // Si esta factura ya recibió su Cargo vía cobros-sucursal-puente.service.js
+    // (cobrada en otra sucursal), se omite el Cargo normal de la regla — dejarlo
+    // duplicaría el débito contra el mismo Abono de Ventas/IVA. Ver bloque de
+    // `construirMovimientosPuente` más arriba.
+    const cargoCubiertoPorSucursal = facturasVendedorCubiertas.has(cfdi.uuid?.toUpperCase() ?? '');
+    // Facturas PPD cobradas en otra sucursal: el Cargo a Clientes de la venta
+    // sigue normal (sin tocar); se agrega ABAJO un asiento adicional (Abono a
+    // Clientes + la línea de Cargo a la cuenta puente que ya viene en
+    // movsPuente) — ver `facturasPPDCubiertas` en construirMovimientosPuente.
+    const ppdCubierta = facturasPPDCubiertas.get(cfdi.uuid?.toUpperCase() ?? '');
+
     for (const m of movs) {
+      const esLineaCargoPrincipal = !!rule?.cuentaCargo &&
+        m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0;
+      if (cargoCubiertoPorSucursal && esLineaCargoPrincipal) {
+        continue;
+      }
       movimientosResult.push({
         ...m,
         centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
@@ -848,8 +1193,132 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         },
       });
     }
+
+    // Saldo a favor generado por esta Devolución (ver
+    // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`) — nunca
+    // toca las líneas normales de la Devolución, solo agrega el pasivo aparte.
+    for (const linea of _inyectarSaldoFavorGenerado({
+      cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
+      cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp, cc: ccProp,
+    })) {
+      movimientosResult.push(linea);
+    }
+
+    // Asiento adicional PPD cobrada en otra sucursal: Abono a Clientes (misma
+    // cuenta que usó el Cargo de la venta) — cierra la CxC por el monto
+    // cobrado cruzado. Su contrapartida (Cargo a la cuenta puente) ya viene
+    // en `movsPuente`, agregado más abajo.
+    if (ppdCubierta && rule?.cuentaCargo && (cuentaMap[rule.cuentaCargo] ?? null)) {
+      // Reutiliza concepto/serie de la línea de Cargo normal (misma factura)
+      // en vez de recalcularlos — cfdiToMovimientos ya resuelve el marcador
+      // de documentosRelacionados (ej. "I0-260700186") cuando aplica; armarlos
+      // aquí desde cfdi.serie/cfdi.folio mostraba el folio propio de la
+      // factura en vez del documento relacionado, inconsistente con sus
+      // líneas hermanas.
+      const cargoOriginal = movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
+      const serieCfdi = cargoOriginal?.serie ?? ([cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null);
+      // `cargoOriginal.concepto` (armado por cfdiToMovimientos) NUNCA incluye
+      // el nombre del cliente — eso se agrega después vía
+      // enriquecerConceptoConCliente (poliza.service.js), un paso que solo
+      // corre sobre las líneas normales. Esta línea va por el camino de
+      // "Cobro Sucursal" (tipoOrigen abajo) y no pasa por ahí, así que hay
+      // que anteponer el nombre aquí mismo — mismo patrón que `conceptoBase`
+      // en cobros-sucursal-puente.service.js.
+      const conceptoConCliente = [cfdi.receptor?.nombre, cargoOriginal?.concepto ?? serieCfdi].filter(Boolean).join(' / ');
+      movimientosResult.push({
+        cuentaId:      cuentaMap[rule.cuentaCargo],
+        cuentaFaltante: false,
+        concepto:      conceptoConCliente,
+        debe:          0,
+        haber:         ppdCubierta.monto,
+        serie:         serieCfdi,
+        centroCosto:   ccProp?.clave ?? null,
+        centroCostoId: ccProp?.id    ?? null,
+        // metodoPago='PPD' es OBLIGATORIO: poliza.service.js (exportContpaqXlsx,
+        // ~línea 1356) separa Contado/Crédito únicamente por
+        // `m.metodoPago === 'PPD'` — sin esto, esta línea cae por default en
+        // Contado (huérfana, sin su Cargo original al lado) en vez de en
+        // Crédito junto a sus hermanas.
+        metodoPago:    'PPD',
+        // tipoOrigen='Cobro Sucursal': confirmado con el usuario 2026-08-03 —
+        // esta línea (y su contrapartida, el Cargo a la cuenta puente) debe
+        // quedar al FINAL del apartado de Crédito, no junto a sus hermanas
+        // por serie-folio. _extraerCobrosSucursal/_inyectarCobrosSucursal
+        // (poliza.service.js) la sacan y reinyectan al final del bloque
+        // correcto (Crédito, por `metodoPago==='PPD'`).
+        tipoOrigen:    'Cobro Sucursal',
+        reglaNombre:   ppdCubierta.reglaNombre,
+        cfdiUuid:      cfdi.uuid,
+        _cfdiInfo: {
+          uuid:              cfdi.uuid,
+          tipo:              cfdi.tipoDeComprobante,
+          emisor:            cfdi.emisor?.rfc,
+          total:             cfdi.total,
+          fecha:             cfdi.fecha,
+          sinRegla:          false,
+          comparisonStatus:  cfdi.lastComparisonStatus ?? null,
+        },
+      });
+    }
     if (!rule) sinRegla++;
   }
+
+  // Facturas PPD cobradas en otra sucursal cuya VENTA ORIGINAL no cae en el
+  // lote de hoy (ej. factura del día 4, cobrada el día 10 — normal en PPD,
+  // que por definición se cobra días/semanas después) — el Abono a Clientes
+  // de arriba nunca corre para ellas porque ese loop solo recorre
+  // `cfdiConRegla` (CFDIs del día que se está generando). Se resuelven aparte
+  // (confirmado con el usuario 2026-08-04, HERROZINC I0-260700082: factura
+  // del 04/07 cobrada en CEDIS el 10/07 — quedaba como asiento descuadrado,
+  // Cargo a la cuenta puente sin su Abono a Clientes).
+  const uuidsPPDManejadosProp = new Set(cfdiConRegla.map(({ cfdi: c }) => c.uuid?.toUpperCase()).filter(Boolean));
+  const uuidsPPDOrfanosProp = [...facturasPPDCubiertas.keys()].filter(u => !uuidsPPDManejadosProp.has(u));
+  if (uuidsPPDOrfanosProp.length) {
+    const satOrfanosProp = await CFDI.find({ uuid: { $in: uuidsPPDOrfanosProp }, source: 'SAT' })
+      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor conceptos impuestos').lean();
+    const erpOrfanosProp = await CFDI.find({ uuid: { $in: uuidsPPDOrfanosProp }, source: 'ERP' })
+      .select('uuid formaPago metodoPago conceptos impuestos').lean();
+    const erpOrfanosMapProp = Object.fromEntries(erpOrfanosProp.map(c => [c.uuid, c]));
+    for (const cfdiOrfano of satOrfanosProp) {
+      const erpOrf = erpOrfanosMapProp[cfdiOrfano.uuid];
+      const cfdiFinalOrf = {
+        ...cfdiOrfano,
+        formaPago:  cfdiOrfano.formaPago  || erpOrf?.formaPago,
+        metodoPago: cfdiOrfano.metodoPago || erpOrf?.metodoPago,
+        conceptos:  erpOrf?.conceptos?.length ? erpOrf.conceptos : cfdiOrfano.conceptos,
+        impuestos:  erpOrf?.impuestos ?? cfdiOrfano.impuestos,
+      };
+      const ruleOrfano = mappingSvc.findRuleInList(cfdiFinalOrf, rules);
+      if (!ruleOrfano?.cuentaCargo) continue;
+      let cuentaCargoIdOrfano = cuentaMap[ruleOrfano.cuentaCargo];
+      if (!cuentaCargoIdOrfano) {
+        const rowOrfano = await AccountPlan.findOne({ where: { codigo: ruleOrfano.cuentaCargo }, attributes: ['id'], raw: true });
+        cuentaCargoIdOrfano = rowOrfano?.id ?? null;
+        if (cuentaCargoIdOrfano) cuentaMap[ruleOrfano.cuentaCargo] = cuentaCargoIdOrfano;
+      }
+      if (!cuentaCargoIdOrfano) continue;
+      const ppdCubiertaOrfano = facturasPPDCubiertas.get(cfdiOrfano.uuid.toUpperCase());
+      const ccOrfano = cfdiFinalOrf.serie ? (ccBySerieMapProp[cfdiFinalOrf.serie] ?? null) : null;
+      const serieCfdiOrfano = [cfdiFinalOrf.serie, cfdiFinalOrf.folio].filter(Boolean).join('-').slice(0, 25) || null;
+      const conceptoOrfano = [cfdiFinalOrf.receptor?.nombre, serieCfdiOrfano].filter(Boolean).join(' / ');
+      movimientosResult.push({
+        cuentaId:      cuentaCargoIdOrfano,
+        cuentaFaltante: false,
+        concepto:      conceptoOrfano,
+        debe:          0,
+        haber:         ppdCubiertaOrfano.monto,
+        serie:         serieCfdiOrfano,
+        centroCosto:   ccOrfano?.clave ?? null,
+        centroCostoId: ccOrfano?.id    ?? null,
+        metodoPago:    'PPD',
+        tipoOrigen:    'Cobro Sucursal',
+        reglaNombre:   ppdCubiertaOrfano.reglaNombre,
+        cfdiUuid:      cfdiOrfano.uuid,
+      });
+    }
+  }
+
+  movimientosResult.push(...movsPuente);
 
   // 4. Construir propuesta (no guardada)
   // Si se generó para un día específico (fechaInicio), el encabezado debe
@@ -913,6 +1382,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
     if (sustitutosProp.length > 5) advertencias.push(`  … y ${sustitutosProp.length - 5} más`);
   }
+  // Tickets de cajas con cobro real pero sin ninguna factura ligada — hoja
+  // aparte "por facturar" (ver `_detectarPendientesPorFacturar`), nunca se
+  // suman a `movimientos` (confirmado con el usuario 2026-08-04).
+  if (pendientesPorFacturarProp.length) {
+    const totalPendiente = pendientesPorFacturarProp.reduce((s, p) => s + p.monto, 0);
+    advertencias.push(
+      `⚠ ${pendientesPorFacturarProp.length} ticket(s) de cajas cobrados este día por $${totalPendiente.toFixed(2)} ` +
+      `SIN ninguna factura ligada — ver "pendientesPorFacturar" (no se incluyen en la póliza).`,
+    );
+  }
 
   return {
     tipo:       tipoPropuesta,
@@ -927,6 +1406,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     rfc,
     movimientos: movimientosResult,
     sustitutos: sustitutosProp,
+    // Hoja aparte: tickets con cobro real sin factura ligada — ver comentario
+    // arriba y `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
+    pendientesPorFacturar: pendientesPorFacturarProp,
     _meta: {
       totalCfdis:   cfdisSinPoliza.length,
       sinRegla,
@@ -950,7 +1432,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // 1. UUIDs ya contabilizados (filtrado por RFC)
   const yaContabilizados = await PolizaMovimiento.findAll({
-    where:      { cfdiUuid: { [Op.ne]: null } },
+    // tipoOrigen != 'Cobro Sucursal': esas líneas solo REFERENCIAN el CFDI
+    // (ej. una Factura Global citada por construirMovimientosPuente como
+    // `cfdiOriginal` de varios tickets cruzados) — no registran su propia
+    // venta. Sin esta exclusión, en cuanto la Global se cita una vez queda
+    // "ya contabilizada" para siempre y su propia línea de Venta (Ingresos +
+    // IVA) nunca se genera en ningún día (confirmado con el usuario
+    // 2026-08-04: Global I0-260700155 nunca aparecía como Venta).
+    where:      { cfdiUuid: { [Op.ne]: null }, tipoOrigen: { [Op.ne]: 'Cobro Sucursal' } },
     attributes: ['cfdiUuid'],
     include: [{
       model:      Poliza,
@@ -992,6 +1481,16 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
 
+  // Antes ambos casos (cero CFDIs encontrados vs. todos ya poliza'dos) tiraban
+  // el mismo mensaje "ya tienen póliza registrada" — confuso cuando en
+  // realidad no se encontró ningún CFDI (ej. día sin facturas al generar "por
+  // día"): no había nada que contabilizar, no que ya estuviera contabilizado.
+  if (cfdis.length === 0) {
+    const rango = (fechaInicio && fechaFin)
+      ? (fechaInicio === fechaFin ? `el día ${fechaInicio}` : `el rango ${fechaInicio} a ${fechaFin}`)
+      : `el periodo ${periodo}/${ejercicio}`;
+    throw new BadRequestError(`No se encontró ningún CFDI tipo ${tipoCfdi} para ${rango}`);
+  }
   if (cfdisSinPoliza.length === 0) {
     throw new BadRequestError('Todos los CFDIs vigentes del periodo ya tienen póliza registrada');
   }
@@ -1145,6 +1644,56 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // — completar de nuevo (solo agrega lo que aún falte), ver comentario equivalente
   // en generarPropuesta.
   await _completarRelacionadosPostMerge(cfdisConNCGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
+
+  // Saldos a favor generados por las Devoluciones de este batch — ANTES de
+  // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
+  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard);
+
+  // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
+  // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
+  // poder omitir, ahí, el Cargo normal de las facturas cuyo Cargo ya cubre
+  // este flujo (si no, la póliza queda con doble Cargo contra un solo Abono).
+  //
+  // Universo ampliado + filtro por fecha real del cobro — ver comentario
+  // equivalente en generarPropuesta y `_fetchCfdisParaPuenteAmplio`.
+  let movsPuenteGuard = [];
+  let facturasVendedorCubiertasGuard = new Set();
+  let facturasPPDCubiertasGuard = new Map();
+  let pendientesPorFacturarGuard = [];
+  let cuentaSaldoFavorIdGuard = null;
+  let cuentaIvaSaldoFavorIdGuard = null;
+  if (tipoCfdi === 'I' && centroCostoId) {
+    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId } = await _resolverCuentasPuenteSucursales();
+    cuentaSaldoFavorIdGuard = cuentaSaldoFavorId;
+    cuentaIvaSaldoFavorIdGuard = cuentaIvaSaldoFavorId;
+    if (cuentaCajaId && cuentaBancosId) {
+      const serieDelCentroGuard = Object.entries(ccBySerieMap).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0];
+      const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
+        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
+        : cfdisSinPolizaFinalGuard;
+      const resultadoPuenteGuard = await construirMovimientosPuente({
+        cfdis: cfdisParaPuenteGuard,
+        centroCostoId,
+        ccBySerieMap: ccBySerieMap,
+        cuentaCajaId,
+        cuentaBancosId,
+        cuentaPuenteId,
+        cuentaSaldoFavorId,
+        cuentaIvaSaldoFavorId,
+        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+        rfc,
+        devsOcultosSF: devsOcultosSFGuard,
+      });
+      movsPuenteGuard = resultadoPuenteGuard.movimientos;
+      facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
+      facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
+      pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
+      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
+      // detectado hoy con lo ya cubierto en días previos.
+      for (const u of await _uuidsConCargoCubiertoEnBD({ rfc })) facturasVendedorCubiertasGuard.add(u);
+    }
+  }
 
   // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
@@ -1313,7 +1862,21 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
     const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
 
+    // Ver comentario equivalente en generarPropuesta: si esta factura ya
+    // recibió su Cargo vía cobros-sucursal-puente.service.js, se omite el
+    // Cargo normal de la regla para no duplicar el débito.
+    const cargoCubiertoPorSucursalGuard = facturasVendedorCubiertasGuard.has(cfdi.uuid?.toUpperCase() ?? '');
+    // Ver comentario equivalente en generarPropuesta: PPD cobrada en otra
+    // sucursal — el Cargo a Clientes normal no se toca; se agrega abajo un
+    // asiento adicional (Abono a Clientes + Cargo puente, que ya viene en movsPuenteGuard).
+    const ppdCubiertaGuard = facturasPPDCubiertasGuard.get(cfdi.uuid?.toUpperCase() ?? '');
+
     for (const m of movs) {
+      const esLineaCargoPrincipalGuard = !!rule?.cuentaCargo &&
+        m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0;
+      if (cargoCubiertoPorSucursalGuard && esLineaCargoPrincipalGuard) {
+        continue;
+      }
       // eslint-disable-next-line no-unused-vars
       const { _saldoUsado, ...cleanM } = m;
       todosLosMovimientos.push({
@@ -1321,6 +1884,94 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         cuentaFaltante: cleanM.cuentaId == null,
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
+      });
+    }
+
+    // Saldo a favor generado por esta Devolución — ver comentario
+    // equivalente en generarPropuesta.
+    for (const linea of _inyectarSaldoFavorGenerado({
+      cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
+      cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard, cc,
+    })) {
+      todosLosMovimientos.push(linea);
+    }
+
+    // Ver comentario equivalente en generarPropuesta.
+    if (ppdCubiertaGuard && rule?.cuentaCargo && (cuentaMap[rule.cuentaCargo] ?? null)) {
+      // Reutiliza concepto/serie de la línea de Cargo normal — ver comentario
+      // equivalente en generarPropuesta.
+      const cargoOriginalGuard = movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
+      const serieCfdiGuard = cargoOriginalGuard?.serie ?? ([cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null);
+      // Ver comentario equivalente en generarPropuesta: hay que anteponer el
+      // nombre del cliente aquí mismo (esta línea no pasa por
+      // enriquecerConceptoConCliente).
+      const conceptoConClienteGuard = [cfdi.receptor?.nombre, cargoOriginalGuard?.concepto ?? serieCfdiGuard].filter(Boolean).join(' / ');
+      todosLosMovimientos.push({
+        cuentaId:      cuentaMap[rule.cuentaCargo],
+        cuentaFaltante: false,
+        concepto:      conceptoConClienteGuard,
+        debe:          0,
+        haber:         ppdCubiertaGuard.monto,
+        serie:         serieCfdiGuard,
+        centroCosto:   cc?.clave ?? null,
+        centroCostoId: cc?.id    ?? null,
+        // Ver comentario equivalente en generarPropuesta: obligatorio para
+        // que exportContpaqXlsx la clasifique en el bloque de Crédito.
+        metodoPago:    'PPD',
+        // Ver comentario equivalente en generarPropuesta: al final del
+        // apartado de Crédito, no junto a sus hermanas.
+        tipoOrigen:    'Cobro Sucursal',
+        reglaNombre:   ppdCubiertaGuard.reglaNombre,
+        cfdiUuid:      cfdi.uuid,
+      });
+    }
+  }
+
+  // Facturas PPD cobradas en otra sucursal cuya VENTA ORIGINAL no cae en el
+  // lote de hoy — ver comentario equivalente en generarPropuesta.
+  const uuidsPPDManejadosGuard = new Set(cfdiConRegla.map(({ cfdi: c }) => c.uuid?.toUpperCase()).filter(Boolean));
+  const uuidsPPDOrfanosGuard = [...facturasPPDCubiertasGuard.keys()].filter(u => !uuidsPPDManejadosGuard.has(u));
+  if (uuidsPPDOrfanosGuard.length) {
+    const satOrfanosGuard = await CFDI.find({ uuid: { $in: uuidsPPDOrfanosGuard }, source: 'SAT' })
+      .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor conceptos impuestos').lean();
+    const erpOrfanosGuard = await CFDI.find({ uuid: { $in: uuidsPPDOrfanosGuard }, source: 'ERP' })
+      .select('uuid formaPago metodoPago conceptos impuestos').lean();
+    const erpOrfanosMapGuard = Object.fromEntries(erpOrfanosGuard.map(c => [c.uuid, c]));
+    for (const cfdiOrfanoGuard of satOrfanosGuard) {
+      const erpOrfG = erpOrfanosMapGuard[cfdiOrfanoGuard.uuid];
+      const cfdiFinalOrfG = {
+        ...cfdiOrfanoGuard,
+        formaPago:  cfdiOrfanoGuard.formaPago  || erpOrfG?.formaPago,
+        metodoPago: cfdiOrfanoGuard.metodoPago || erpOrfG?.metodoPago,
+        conceptos:  erpOrfG?.conceptos?.length ? erpOrfG.conceptos : cfdiOrfanoGuard.conceptos,
+        impuestos:  erpOrfG?.impuestos ?? cfdiOrfanoGuard.impuestos,
+      };
+      const ruleOrfanoGuard = mappingSvc.findRuleInList(cfdiFinalOrfG, rules);
+      if (!ruleOrfanoGuard?.cuentaCargo) continue;
+      let cuentaCargoIdOrfanoGuard = cuentaMap[ruleOrfanoGuard.cuentaCargo];
+      if (!cuentaCargoIdOrfanoGuard) {
+        const rowOrfanoGuard = await AccountPlan.findOne({ where: { codigo: ruleOrfanoGuard.cuentaCargo }, attributes: ['id'], raw: true });
+        cuentaCargoIdOrfanoGuard = rowOrfanoGuard?.id ?? null;
+        if (cuentaCargoIdOrfanoGuard) cuentaMap[ruleOrfanoGuard.cuentaCargo] = cuentaCargoIdOrfanoGuard;
+      }
+      if (!cuentaCargoIdOrfanoGuard) continue;
+      const ppdCubiertaOrfanoGuard = facturasPPDCubiertasGuard.get(cfdiOrfanoGuard.uuid.toUpperCase());
+      const ccOrfanoGuard = cfdiFinalOrfG.serie ? (ccBySerieMap[cfdiFinalOrfG.serie] ?? null) : null;
+      const serieCfdiOrfanoGuard = [cfdiFinalOrfG.serie, cfdiFinalOrfG.folio].filter(Boolean).join('-').slice(0, 25) || null;
+      const conceptoOrfanoGuard = [cfdiFinalOrfG.receptor?.nombre, serieCfdiOrfanoGuard].filter(Boolean).join(' / ');
+      todosLosMovimientos.push({
+        cuentaId:      cuentaCargoIdOrfanoGuard,
+        cuentaFaltante: false,
+        concepto:      conceptoOrfanoGuard,
+        debe:          0,
+        haber:         ppdCubiertaOrfanoGuard.monto,
+        serie:         serieCfdiOrfanoGuard,
+        centroCosto:   ccOrfanoGuard?.clave ?? null,
+        centroCostoId: ccOrfanoGuard?.id    ?? null,
+        metodoPago:    'PPD',
+        tipoOrigen:    'Cobro Sucursal',
+        reglaNombre:   ppdCubiertaOrfanoGuard.reglaNombre,
+        cfdiUuid:      cfdiOrfanoGuard.uuid,
       });
     }
   }
@@ -1340,6 +1991,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
     if (sustitutosGuard.length > 5) advertencias.push(`  … y ${sustitutosGuard.length - 5} más`);
   }
+
+  // Cobros de sucursales — ya calculado arriba (antes del loop de reglas),
+  // ver `movsPuenteGuard`. Se agrega ANTES de calcular folios para que entre
+  // en el mismo cálculo de rango/chunking que el resto.
+  todosLosMovimientos.push(...movsPuenteGuard);
 
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
   // Si se generó para un día específico (fechaInicio), el encabezado debe
@@ -1398,6 +2054,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       rfc,
       estado:    'borrador',
       sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
+      pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
     }, { transaction: t });
 
     for (let i = 0; i < todosLosMovimientos.length; i += CHUNK_SIZE) {
@@ -1446,6 +2103,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
   }
   advertenciasFinal.push(...advertencias);
+  // Tickets de cajas con cobro real pero sin ninguna factura ligada — hoja
+  // aparte, ver comentario equivalente en generarPropuesta.
+  if (pendientesPorFacturarGuard.length) {
+    const totalPendienteGuard = pendientesPorFacturarGuard.reduce((s, p) => s + p.monto, 0);
+    advertenciasFinal.push(
+      `⚠ ${pendientesPorFacturarGuard.length} ticket(s) de cajas cobrados este día por $${totalPendienteGuard.toFixed(2)} ` +
+      `SIN ninguna factura ligada — ver "pendientesPorFacturar" (no se incluyen en la póliza).`,
+    );
+  }
 
   return {
     polizaId:   poliza.id,
@@ -1457,6 +2123,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     sinRegla,
     advertencias: advertenciasFinal,
     sustitutos:   sustitutosGuard,
+    // Hoja aparte: tickets con cobro real sin factura ligada — ver
+    // `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
+    pendientesPorFacturar: pendientesPorFacturarGuard,
   };
 }
 

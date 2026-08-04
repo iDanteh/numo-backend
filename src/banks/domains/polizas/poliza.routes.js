@@ -42,15 +42,16 @@ router.get('/reporte-descuadradas',
   }),
 );
 
-// GET /api/polizas/borrador-candidatas?rfc=&ejercicio=&periodo=
+// GET /api/polizas/borrador-candidatas?rfc=&ejercicio=&periodo=&soloCobranza=
 // Lista TODAS las pólizas en borrador del periodo (sin el tope de 100 de la
 // lista paginada) — alimenta el modal de selección de "Cancelar todas".
+// soloCobranza=true/false separa Ingreso de Cobranza (ver listBorradorCandidatas).
 router.get('/borrador-candidatas',
   authenticate,
   permit('polizas:read'),
   asyncHandler(async (req, res) => {
-    const { rfc, ejercicio, periodo } = req.query;
-    res.json(await service.listBorradorCandidatas({ rfc, ejercicio, periodo }));
+    const { rfc, ejercicio, periodo, soloCobranza } = req.query;
+    res.json(await service.listBorradorCandidatas({ rfc, ejercicio, periodo, soloCobranza }));
   }),
 );
 

@@ -315,13 +315,18 @@ async function list(filters) {
   const filter = _buildBusquedaFilter({ search, fechaInicio, fechaFin });
   if (status) filter.status = status;
 
+  // Pendientes: más antigua primero — se atiende en el orden en que llegó (decisión
+  // del usuario 2026-07-24). Identificadas/rechazadas/canceladas (2026-08-04, a pedido
+  // del usuario): más reciente primero — son historial ya resuelto, lo último resuelto
+  // es lo que interesa ver arriba. `status` siempre viaja como un único valor (el tab
+  // activo, ver collection-request.component.ts#reload) — nunca una lista combinada acá.
+  const ordenAscendente = !status || status === 'pendiente';
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const [data, total] = await Promise.all([
-    // Bandeja de revisión: más antigua primero — se atiende en el orden en que llegó,
-    // no la más reciente (decisión del usuario 2026-07-24). NO tocar listMine() (abajo,
-    // historial personal del solicitante en /mias) — sigue más reciente primero a propósito.
+    // NO tocar listMine() (abajo, historial personal del solicitante en /mias) — sigue
+    // más reciente primero a propósito, sin depender de status.
     CollectionRequest.find(filter)
-      .sort({ createdAt: 1 })
+      .sort({ createdAt: ordenAscendente ? 1 : -1 })
       .skip(skip)
       .limit(parseInt(limit))
       .select('-comprobante.data')

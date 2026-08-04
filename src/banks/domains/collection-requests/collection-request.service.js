@@ -668,14 +668,30 @@ async function identificar(id, bankMovementId, user) {
   // producción), que es la única otra parte del sistema que manda este mismo
   // dato a Kore. El nombre equivocado provocaba errores del lado de Kore al
   // aplicar cobros vía Solicitudes de Cobro.
-  const datosAdicionalesPorFormaPago = cr.formasPago.map(f => ({
-    ...(formaPagoRequiereBanco.get(f.formaPagoId) && bancoDefault ? { BancoID: bancoDefault.id } : {}),
-    FormaPagoID:      f.formaPagoId,
-    DatosAdicionales: [
-      { Nombre: 'Aut',  Valor: mov.folio || '' },
-      { Nombre: 'Numo', Valor: mov.numeroAutorizacion || '' },
-    ],
-  }));
+  // Fix 2026-08-04 (mismo día, después) — Kore actualizó su configuración: ahora
+  // rechaza la solicitud completa si CUALQUIER forma de pago que no sea
+  // transferencia (saldo a favor, cheque, depósito en efectivo) trae
+  // DatosAdicionales. Antes se mandaba Aut/Numo sin importar el tipo; ahora se
+  // exige el MISMO criterio que ya usa BancoID (`formaPagoRequiereBanco`,
+  // claveSAT==='03') — nunca se manda DatosAdicionales fuera de transferencia.
+  // Riesgo aceptado, no un descuido: una solicitud pagada 100% en efectivo/
+  // cheque/saldo a favor ya no deja ningún tag Aut en Kore, así que
+  // _montoSaldoLinkPorMovimiento (erp.routes.js) no podrá volver a matchearla
+  // contra Kore más adelante — es una restricción nueva del lado de Kore, no
+  // algo que Numo pueda evitar mientras la solicitud se siga aplicando.
+  const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
+    const esTransferencia = formaPagoRequiereBanco.get(f.formaPagoId) === true;
+    return {
+      ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
+      FormaPagoID: f.formaPagoId,
+      ...(esTransferencia ? {
+        DatosAdicionales: [
+          { Nombre: 'Aut',  Valor: mov.folio || '' },
+          { Nombre: 'Numo', Valor: mov.numeroAutorizacion || '' },
+        ],
+      } : {}),
+    };
+  });
 
   let koreResult;
   try {

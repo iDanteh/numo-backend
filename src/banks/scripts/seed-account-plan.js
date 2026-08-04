@@ -3015,6 +3015,16 @@ const CUENTAS = [
     "ctaMayor": "2103030000"
   },
   {
+    "codigo": "2103040000",
+    "nombre": "Cobros De Sucursales Por Identificar",
+    "ctaMayor": "2103000000"
+  },
+  {
+    "codigo": "2103040001",
+    "nombre": "Cobros De Sucursales Por Identificar",
+    "ctaMayor": "2103040000"
+  },
+  {
     "codigo": "2103090000",
     "nombre": "Anticipos Otros",
     "ctaMayor": "2103000000"

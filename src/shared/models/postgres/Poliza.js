@@ -113,6 +113,15 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.JSONB,
     allowNull: true,
   },
+  // Tickets de cajas con cobro real (mismo día) pero SIN ninguna factura
+  // ligada — ej. venta de mostrador que nunca se globalizó. Informativo, no
+  // se contabiliza — ver `_detectarPendientesPorFacturar` en
+  // cobros-sucursal-puente.service.js. Se exporta en hoja aparte del CONTPAQ
+  // (ver `_construirWorkbookPoliza`, poliza.service.js).
+  pendientesPorFacturar: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
 }, {
   tableName:   'polizas',
   underscored: true,

@@ -659,16 +659,21 @@ async function identificar(id, bankMovementId, user) {
   // dedicado la aplica internamente con los datos que Kore ya tiene desde que
   // ÉL creó la solicitud; lo único que se manda, por cada forma de pago, es su
   // FormaPagoID, BancoID (solo si esa forma de pago lo requiere, ver arriba) y
-  // DOS datos del movimiento identificado: "Autorizacion" (el folio interno de
-  // Numo, mismo folio que `referencia`, arriba) y "Numo" (el numeroAutorizacion
+  // DOS datos del movimiento identificado: "Aut" (el folio interno de Numo,
+  // mismo folio que `referencia`, arriba) y "Numo" (el numeroAutorizacion
   // bancario real, extraído por OCR) — ambos por separado, ninguno reemplaza al
   // otro. Igual en Modo 1 y Modo 2 — un elemento del arreglo por cada forma de pago.
+  // Fix 2026-08-04: el nombre correcto es "Aut", no "Autorizacion" — confirmado
+  // contra el panel manual (cobro-panel.component.ts, ya funcionando en
+  // producción), que es la única otra parte del sistema que manda este mismo
+  // dato a Kore. El nombre equivocado provocaba errores del lado de Kore al
+  // aplicar cobros vía Solicitudes de Cobro.
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => ({
     ...(formaPagoRequiereBanco.get(f.formaPagoId) && bancoDefault ? { BancoID: bancoDefault.id } : {}),
     FormaPagoID:      f.formaPagoId,
     DatosAdicionales: [
-      { Nombre: 'Autorizacion', Valor: mov.folio || '' },
-      { Nombre: 'Numo',         Valor: mov.numeroAutorizacion || '' },
+      { Nombre: 'Aut',  Valor: mov.folio || '' },
+      { Nombre: 'Numo', Valor: mov.numeroAutorizacion || '' },
     ],
   }));
 

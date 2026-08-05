@@ -41,10 +41,31 @@
  *    movimiento de banco, es puramente la aplicación del saldo. Solo aplica a
  *    PUE: si la factura original es PPD, `esPPD` corta antes de llegar aquí
  *    (ver nota de PPD arriba).
+ *
+ * ── CÓMO SE ENTERA LA COBRADORA (2026-08-05): esta función recibe `cfdis`
+ *    acotado a la propia serie de facturación de la sucursal que se está
+ *    generando (ver `_fetchCfdisParaPuenteAmplio` en
+ *    cfdi-poliza-generator.service.js) — el "documento relacionado" que
+ *    revela un cobro cruzado SIEMPRE sale de un CFDI de la serie de quien
+ *    VENDIÓ, nunca de quien solo cobró. Por diseño, entonces, SOLO la
+ *    sucursal vendedora puede descubrir este cobro en su propia generación.
+ *    Se probó ampliar la búsqueda a las 11 sucursales para que la cobradora
+ *    también lo viera directo, pero saturaba el ERP con 429 y tardaba 5+
+ *    minutos aun con caché+reintento. En vez de eso: cuando la vendedora
+ *    detecta el cobro cruzado, además de su propio asiento, ENCOLA en
+ *    `CobroSucursalPendiente` lo que la cobradora necesita — cuando la
+ *    cobradora genera su propia póliza (con su propia serie, sin tocar el
+ *    ERP para esto), `_aplicarCobrosSucursalPendientes` lee esa cola y arma
+ *    su asiento directo. Si la cobradora genera ANTES que la vendedora
+ *    (orden no garantizado dentro de una misma corrida), simplemente no
+ *    encuentra nada todavía — al regenerar después de que la vendedora ya
+ *    corrió, sí lo toma (mismo comportamiento que cualquier otro ajuste
+ *    pendiente, visible en el reporte de "asientos descuadrados" mientras
+ *    tanto).
  */
 
 const { Op } = require('sequelize');
-const { PolizaMovimiento, Poliza, AccountPlan } = require('../../../shared/models/postgres');
+const { PolizaMovimiento, Poliza, AccountPlan, CobroSucursalPendiente } = require('../../../shared/models/postgres');
 const BankMovement = require('../banks/BankMovement.model');
 const { obtenerDesglosesCobroAlmacen, obtenerSaldosFavor } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -81,6 +102,30 @@ const CLAVE_SAT_EFECTIVO = '01';
 // prorrateado), solo hay que tener cuidado si se usa esto para otra cosa.
 function _esSaldoAFavor(fp) {
   return /saldo\s*a\s*favor/i.test(fp?.nombre ?? '');
+}
+
+// c_FormaPago SAT — Cheque y Tarjeta, para el orden fijo de abajo (Efectivo
+// ya tiene su propia constante arriba). Mismos códigos que
+// FORMA_PAGO_CHEQUE/LABEL_FORMA_PAGO_CONSOLIDADO en poliza.service.js
+// (duplicado a propósito, archivos pequeños, independientes).
+const CLAVE_SAT_CHEQUE           = '02';
+const CLAVES_SAT_TARJETA         = ['04', '28'];
+
+// Orden fijo de las líneas de un mismo cobro cuando tiene varias formas de
+// pago (ej. parte efectivo, parte tarjeta) — confirmado con el usuario
+// 2026-08-05: Efectivo, Transferencia, Saldo a favor, Cheque, Tarjeta (en
+// ese orden). Cualquier forma de pago no reconocida (o sin claveSat, ej.
+// "SIN FORMA DE PAGO — REVISAR") queda al final.
+function _ordenFormaPago(fp) {
+  if ((fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO) return 0;
+  if ((fp.claveSat ?? '').trim() === '03') return 1;
+  if (_esSaldoAFavor(fp)) return 2;
+  if ((fp.claveSat ?? '').trim() === CLAVE_SAT_CHEQUE) return 3;
+  if (CLAVES_SAT_TARJETA.includes((fp.claveSat ?? '').trim())) return 4;
+  return 5;
+}
+function _ordenarFormasPago(formasPago) {
+  return [...formasPago].sort((a, b) => _ordenFormaPago(a) - _ordenFormaPago(b));
 }
 
 // Tasa usada para partir el monto de "saldo a favor" en subtotal/IVA — todos
@@ -154,7 +199,7 @@ const PADDING_ESCANEO_POR_FACTURAR = 15;
  * lados (pendiente por facturar + asiento real), el dinero ya se cobró de
  * verdad aunque falte la factura.
  */
-async function _detectarPendientesPorFacturar({ foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta }) {
+async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta }) {
   if (!fechaDesde || !fechaHasta || !serieDelDia || !foliosDelDiaNumericos.length) return [];
 
   // Descartar outliers antes de sacar min/max: un solo folioVenta de otra
@@ -184,6 +229,7 @@ async function _detectarPendientesPorFacturar({ foliosDelDiaNumericos, serieDelD
   for (let i = 0; i < candidatosFolios.length; i += LOTE) {
     const lote = candidatosFolios.slice(i, i + LOTE);
     const resultado = await obtenerDesglosesCobroAlmacen({
+      rfc,
       series: lote.map(() => serieDelDia),
       folios: lote,
     });
@@ -216,6 +262,137 @@ async function _detectarPendientesPorFacturar({ foliosDelDiaNumericos, serieDelD
     }
   }
   return pendientes;
+}
+
+/**
+ * Encola (upsert) lo que la sucursal COBRADORA necesita para su propio
+ * asiento de "Cobro de otra sucursal" — ver nota de arquitectura en el
+ * encabezado del archivo. `lineas` ya viene resuelta (cuentaId real,
+ * incluyendo depósito bancario real o saldo a favor si aplica) por el
+ * caller — esta función solo persiste, no decide nada de contabilidad.
+ *
+ * Upsert por (rfc, centroCostoIdDestino, folioOrigen): si la vendedora se
+ * regenera (mismo folio), actualiza la fila existente en vez de duplicarla.
+ */
+async function _encolarCobroSucursalPendiente({
+  rfc, centroCostoIdOrigen, centroCostoIdDestino, serieFolioTicket, folioOrigen,
+  cfdiUuid, nombreCliente, montoTotal, lineas, tratamiento, fechaCobro,
+}) {
+  if (!folioOrigen || !centroCostoIdDestino || !lineas.length) return;
+  await CobroSucursalPendiente.sequelize.query(`
+    INSERT INTO cobros_sucursal_pendientes
+      (rfc, centro_costo_id_origen, centro_costo_id_destino, serie_folio_ticket,
+       folio_origen, cfdi_uuid, nombre_cliente, monto_total, lineas, tratamiento,
+       fecha_cobro, created_at, updated_at)
+    VALUES (:rfc, :centroCostoIdOrigen, :centroCostoIdDestino, :serieFolioTicket,
+            :folioOrigen, :cfdiUuid, :nombreCliente, :montoTotal, :lineas, :tratamiento,
+            :fechaCobro, NOW(), NOW())
+    ON CONFLICT (rfc, centro_costo_id_destino, folio_origen)
+    DO UPDATE SET
+      centro_costo_id_origen = EXCLUDED.centro_costo_id_origen,
+      serie_folio_ticket     = EXCLUDED.serie_folio_ticket,
+      cfdi_uuid              = EXCLUDED.cfdi_uuid,
+      nombre_cliente         = EXCLUDED.nombre_cliente,
+      monto_total            = EXCLUDED.monto_total,
+      lineas                 = EXCLUDED.lineas,
+      tratamiento            = EXCLUDED.tratamiento,
+      fecha_cobro            = EXCLUDED.fecha_cobro,
+      updated_at             = NOW()
+  `, {
+    replacements: {
+      rfc,
+      centroCostoIdOrigen:   centroCostoIdOrigen ?? null,
+      centroCostoIdDestino,
+      serieFolioTicket:      serieFolioTicket ?? null,
+      folioOrigen,
+      cfdiUuid:              cfdiUuid ?? null,
+      nombreCliente:         nombreCliente ?? null,
+      montoTotal,
+      lineas:                JSON.stringify(lineas),
+      tratamiento,
+      fechaCobro:            fechaCobro ?? null,
+    },
+  });
+}
+
+/**
+ * Punto de entrada único para mantener la cola al día — llamar SIEMPRE que
+ * se evalúe un folio candidato a cruce de sucursal (haya resultado cruzado o
+ * no esta vez), nunca solo cuando SÍ hay cruce. Sin esto, si un caso deja de
+ * ser cruzado entre una regeneración y otra (por un fix de código, un dato
+ * corregido en el ERP, etc.), la fila vieja queda huérfana para siempre —
+ * confirmado con el usuario 2026-08-05: pasó justo así con JONATAN/DEV-055225
+ * durante las pruebas de hoy, tuvo que borrarse a mano.
+ *
+ * `centroCostoIdDestino: null` (o `lineas` vacío) → ya NO es cruzado: borra
+ * cualquier fila vieja de este folio, sin importar a qué sucursal apuntaba.
+ * `centroCostoIdDestino` presente → upsert normal, y de paso limpia cualquier
+ * fila vieja de este MISMO folio que apuntara a una sucursal DISTINTA (caso
+ * borde: el cruce cambió de sucursal destino entre una corrida y otra).
+ */
+async function _sincronizarCobroSucursalPendiente(datos) {
+  const { rfc, folioOrigen, centroCostoIdDestino, lineas } = datos;
+  if (!rfc || !folioOrigen) return;
+  if (!centroCostoIdDestino || !lineas?.length) {
+    await CobroSucursalPendiente.destroy({ where: { rfc, folioOrigen } });
+    return;
+  }
+  await CobroSucursalPendiente.destroy({
+    where: { rfc, folioOrigen, centroCostoIdDestino: { [Op.ne]: centroCostoIdDestino } },
+  });
+  await _encolarCobroSucursalPendiente(datos);
+}
+
+/**
+ * Lee la cola de `_encolarCobroSucursalPendiente` para ESTE centroCostoId
+ * (como cobradora) y arma sus candidatas — sin tocar el ERP. `tratamiento`
+ * decide el patrón contable de cada línea (ver comentario en
+ * CobroSucursalPendiente.js):
+ *   - 'PUE': Cargo + Abono a la MISMA cuenta (self-balancing, cuadra contra
+ *     el Cargo sin contrapartida que la vendedora ya dejó en su póliza).
+ *   - 'HUERFANO': Cargo a Caja/Bancos + Abono a la cuenta puente (cuadra
+ *     contra el Cargo puente que la vendedora ya dejó).
+ *   - 'SF_GENERADO': Abono solo (sin Cargo que lo compense, igual que
+ *     `_inyectarSaldoFavorGenerado` en cfdi-poliza-generator.service.js) —
+ *     una Devolución generó un saldo a favor pero se procesó físicamente en
+ *     ESTA sucursal, no en la del CFDI (ver `_prefetchSaldosFavorGenerados`).
+ */
+async function _aplicarCobrosSucursalPendientes({ rfc, centroCostoId, centroCobradorClave, cuentaPuenteId, fechaDesde, fechaHasta }) {
+  const where = { rfc, centroCostoIdDestino: centroCostoId };
+  if (fechaDesde && fechaHasta) where.fechaCobro = { [Op.gte]: fechaDesde, [Op.lte]: fechaHasta };
+  const pendientes = await CobroSucursalPendiente.findAll({ where, raw: true });
+
+  const candidatas = [];
+  for (const p of pendientes) {
+    const lineas = p.lineas ?? [];
+    const concepto = [p.nombreCliente, p.serieFolioTicket].filter(Boolean).join(' / ');
+    const base = {
+      cuentaFaltante: false,
+      concepto,
+      serie:          p.serieFolioTicket,
+      folio:          p.folioOrigen,
+      centroCosto:    centroCobradorClave ?? null,
+      centroCostoId,
+      tipoOrigen:     'Cobro Sucursal',
+      cfdiUuid:       p.cfdiUuid ?? null,
+    };
+    if (p.tratamiento === 'PUE') {
+      lineas.forEach(l => {
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: l.monto, haber: 0, reglaNombre: l.reglaNombre });
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre });
+      });
+    } else if (p.tratamiento === 'HUERFANO' && cuentaPuenteId) {
+      lineas.forEach(l => {
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: l.monto, haber: 0, reglaNombre: l.reglaNombre });
+        candidatas.push({ ...base, cuentaId: cuentaPuenteId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre });
+      });
+    } else if (p.tratamiento === 'SF_GENERADO') {
+      lineas.forEach(l => {
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre });
+      });
+    }
+  }
+  return candidatas;
 }
 
 /**
@@ -316,6 +493,7 @@ async function construirMovimientosPuente({
   for (let i = 0; i < docsUnicos.length; i += LOTE) {
     const lote = docsUnicos.slice(i, i + LOTE);
     const resultado = await obtenerDesglosesCobroAlmacen({
+      rfc,
       series: lote.map(d => d.serie),
       folios: lote.map(d => d.folio),
     });
@@ -333,6 +511,7 @@ async function construirMovimientosPuente({
   for (let i = 0; i < docsUnicos.length; i += LOTE) {
     const lote = docsUnicos.slice(i, i + LOTE);
     const resultado = await obtenerSaldosFavor({
+      rfc,
       series: lote.map(d => d.serie),
       folios: lote.map(d => d.folio),
     });
@@ -363,6 +542,7 @@ async function construirMovimientosPuente({
   for (let i = 0; i < origenesUnicos.length; i += LOTE) {
     const lote = origenesUnicos.slice(i, i + LOTE);
     const resultado = await obtenerSaldosFavor({
+      rfc,
       series: lote.map(d => d.serie),
       folios: lote.map(d => d.folio),
     });
@@ -535,9 +715,9 @@ async function construirMovimientosPuente({
       // Sin formasPago no hay forma de saber Caja vs Bancos — se cae a
       // Bancos por defecto para que la póliza no quede sin su línea, y se
       // marca en el concepto para revisión manual.
-      const formasPago = (cobro.formasPago ?? []).length
+      const formasPago = _ordenarFormasPago((cobro.formasPago ?? []).length
         ? cobro.formasPago
-        : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: montoCobro }];
+        : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: montoCobro }]);
       const totalFormasPago = formasPago.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
       let acumulado = 0;
       // `lineas`: cada forma de pago se convierte en 1 línea contable, EXCEPTO
@@ -602,7 +782,7 @@ async function construirMovimientosPuente({
 
       // ── PUE lado VENDEDOR: cargo a Caja/Bancos por identificar (o a las
       // cuentas de saldo a favor, si la forma de pago es SF), una línea por
-      // forma de pago (misma cuenta que usa el lado cobrador para su cargo,
+      // forma de pago (misma cuenta que usará la cobradora para su cargo,
       // según claveSat) ──────────────────────────────────────────────────
       if (centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
         if (cfdiOriginal?.uuid) facturasVendedorCubiertas.add(cfdiOriginal.uuid.toUpperCase());
@@ -626,44 +806,32 @@ async function construirMovimientosPuente({
             cfdiUuid:      cfdiOriginal?.uuid ?? null,
           });
         });
-      }
 
-      // ── PUE lado COBRADOR: cargo Caja/Bancos (o SF) por forma de pago
-      // (cobro real) + abono a la MISMA cuenta por forma de pago — sin
-      // cuenta puente; el neto de esta póliza en esas cuentas es cero, pero
-      // cada línea cuadra contra su contraparte de la póliza vendedora al
-      // consolidar. ─────────────────────────────────────────────────────
-      if (centroCobrador && String(centroCobrador.id) === String(centroCostoId)) {
-        lineas.forEach(l => {
-          candidatas.push({
-            cuentaId:      l.cuentaId,
-            cuentaFaltante: false,
-            concepto:      l.concepto,
-            debe:          l.montoAsignado,
-            haber:         0,
-            serie:         serieFolioFactura,
-            folio:         cobro.folioOrigen ?? null,
-            centroCosto:   centroCobrador.clave,
-            centroCostoId: centroCobrador.id,
-            tipoOrigen:    'Cobro Sucursal',
-            reglaNombre:   l.reglaNombre,
-            cfdiUuid:      cfdiOriginal?.uuid ?? null,
+        // Lado COBRADOR: esta póliza (la vendedora) es la ÚNICA que puede
+        // ver este cobro cruzado (ver nota de arquitectura en el encabezado
+        // del archivo) — en vez de intentar generar aquí mismo el asiento de
+        // la cobradora (imposible sin su serie), se encola para que ella lo
+        // aplique al generar su propia póliza, sin tocar el ERP. SIEMPRE se
+        // llama (no solo cuando hay cruce): si esta vez NO es cruzado,
+        // `_sincronizarCobroSucursalPendiente` limpia cualquier fila vieja de
+        // este folio en vez de dejarla huérfana (confirmado con el usuario
+        // 2026-08-05, caso real JONATAN/DEV-055225).
+        const esCruzado = centroCobrador && String(centroCobrador.id) !== String(centroCostoId);
+        if (cobro.folioOrigen) {
+          await _sincronizarCobroSucursalPendiente({
+            rfc,
+            folioOrigen:          cobro.folioOrigen,
+            centroCostoIdOrigen:  centroVendedor.id,
+            centroCostoIdDestino: esCruzado ? centroCobrador.id : null,
+            serieFolioTicket:     serieFolioFactura,
+            cfdiUuid:             cfdiOriginal?.uuid ?? null,
+            nombreCliente,
+            montoTotal:           lineas.reduce((s, l) => s + l.montoAsignado, 0),
+            lineas:               esCruzado ? lineas.map(l => ({ cuentaId: l.cuentaId, monto: l.montoAsignado, reglaNombre: l.reglaNombre })) : [],
+            tratamiento:          'PUE',
+            fechaCobro:           cobro.fecha ?? null,
           });
-          candidatas.push({
-            cuentaId:      l.cuentaId,
-            cuentaFaltante: false,
-            concepto:      l.concepto,
-            debe:          0,
-            haber:         l.montoAsignado,
-            serie:         serieFolioFactura,
-            folio:         cobro.folioOrigen ?? null,
-            centroCosto:   centroCobrador.clave,
-            centroCostoId: centroCobrador.id,
-            tipoOrigen:    'Cobro Sucursal',
-            reglaNombre:   l.reglaNombre,
-            cfdiUuid:      cfdiOriginal?.uuid ?? null,
-          });
-        });
+        }
       }
     }
   }
@@ -688,10 +856,37 @@ async function construirMovimientosPuente({
   // puente (Cargo vendedor / Abono cobrador) en vez de Caja/Bancos directo
   // en el vendedor — se resuelve solo cuando el ticket se facture y el flujo
   // normal de arriba lo tome como cualquier otro documento relacionado.
+  // Ancla adicional para el escaneo heurístico: `foliosDelDiaNumericos` arriba
+  // solo se llena con folios YA conocidos por algún cruce real (un ticket
+  // referenciado por otra Devolución/Factura Global) — si esta sucursal no
+  // tuvo NINGÚN cruce ese día, el escaneo nunca arrancaba (`serieDelDia`
+  // quedaba null), aunque sí tuviera sus propias facturas normales ese mismo
+  // día que hubieran servido de ancla igual de bien. Se agregan los folios de
+  // las facturas NORMALES de la propia sucursal (mismo día, misma serie) como
+  // ancla de respaldo — confirmado con el usuario 2026-08-05, caso real
+  // GUADALUPE RUIZ RAMIREZ / A0-260700940 (CEDIS): un ticket 100% propio sin
+  // ningún cruce que nunca aparecía ni en "Pendientes por facturar" porque no
+  // había ningún otro ticket cruzado ese día que sirviera de ancla.
+  const serieDelCentro = Object.entries(ccBySerieMap).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0] ?? null;
+  if (serieDelCentro) {
+    for (const cfdi of cfdis) {
+      if (cfdi.serie !== serieDelCentro) continue;
+      if (fechaDesde && fechaHasta) {
+        const fechaCfdi = cfdi.fecha ? new Date(cfdi.fecha) : null;
+        if (!fechaCfdi || fechaCfdi < fechaDesde || fechaCfdi > fechaHasta) continue;
+      }
+      const folioNum = parseInt(cfdi.folio, 10);
+      if (!isNaN(folioNum)) {
+        foliosDelDiaNumericos.push(folioNum);
+        serieDelDia = serieDelDia ?? serieDelCentro;
+      }
+    }
+  }
+
   const foliosConocidos = new Set(docsUnicos.map(d => `${d.serie}|${d.folio}`));
   const centroDelDia = serieDelDia ? (ccBySerieMap[serieDelDia] ?? null) : null;
   const pendientesDetectados = await _detectarPendientesPorFacturar({
-    foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta,
+    rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta,
   });
 
   if (cuentaPuenteId) {
@@ -703,16 +898,15 @@ async function construirMovimientosPuente({
 
       const serieFolioTicket = `${p.serie ?? '?'}-${p.folio ?? '?'}`;
       const conceptoTicket = [p.nombreCliente, serieFolioTicket].filter(Boolean).join(' / ');
-      const formasPagoTicket = p.formasPago.length ? p.formasPago : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: p.monto }];
+      const formasPagoTicket = _ordenarFormasPago(p.formasPago.length ? p.formasPago : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: p.monto }]);
 
       // ── Lado VENDEDOR: Cargo a la cuenta puente por el total cobrado —
       // mismo principio que el lado vendedor PUE normal (Cargo Caja/Bancos
       // sin contrapartida en esta póliza, se compensa al consolidar), solo
       // que aquí no hay factura con la que cuadrar todavía, así que se usa
-      // la cuenta puente en vez de Caja/Bancos directo — la contrapartida
-      // exacta es el Abono puente que se agrega abajo en la póliza
-      // COBRADORA. Cuando el ticket se facture, el flujo normal de arriba
-      // tomará este mismo folio como cualquier otro documento relacionado.
+      // la cuenta puente en vez de Caja/Bancos directo. Cuando el ticket se
+      // facture, el flujo normal de arriba tomará este mismo folio como
+      // cualquier otro documento relacionado.
       if (centroVendedor && String(centroVendedor.id) === String(centroCostoId) && p.monto > 0) {
         candidatas.push({
           cuentaId:      cuentaPuenteId,
@@ -728,58 +922,58 @@ async function construirMovimientosPuente({
           reglaNombre:   formasPagoTicket.map(fp => fp.nombre).filter(Boolean).join('/') || null,
           cfdiUuid:      null,
         });
-      }
 
-      // ── Lado COBRADOR: Cargo Caja/Bancos (el cobro real) + Abono a la
-      // cuenta puente, por forma de pago — igual que el lado cobrador PUE
-      // normal, solo que el Abono va a la puente (no a la misma cuenta de
-      // Caja/Bancos) para casar contra el Cargo puente de la vendedora.
-      if (String(centroCobrador.id) === String(centroCostoId)) {
-        const totalFormasPagoTicket = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
-        let acumuladoTicket = 0;
-        formasPagoTicket.forEach((fp, idx) => {
-          const esUltimo = idx === formasPagoTicket.length - 1;
-          const share = totalFormasPagoTicket > 0 ? (Number(fp.monto) || 0) / totalFormasPagoTicket : 1 / formasPagoTicket.length;
-          const montoAsignado = esUltimo
-            ? Math.round((p.monto - acumuladoTicket) * 100) / 100
-            : Math.round(p.monto * share * 100) / 100;
-          acumuladoTicket += montoAsignado;
-          if (montoAsignado <= 0) return;
-          const esEfectivo = (fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO;
-          candidatas.push({
-            cuentaId:      esEfectivo ? cuentaCajaId : cuentaBancosId,
-            cuentaFaltante: false,
-            concepto:      conceptoTicket,
-            debe:          montoAsignado,
-            haber:         0,
-            serie:         serieFolioTicket,
-            folio:         p.folioOrigen,
-            centroCosto:   centroCobrador.clave,
-            centroCostoId: centroCobrador.id,
-            tipoOrigen:    'Cobro Sucursal',
-            reglaNombre:   fp.nombre || null,
-            cfdiUuid:      null,
+        // Lado COBRADOR: se encola (ver nota de arquitectura en el
+        // encabezado) — Cargo Caja/Bancos por forma de pago + Abono a la
+        // cuenta puente, para que cuadre contra el Cargo puente de arriba
+        // cuando la cobradora genere su propia póliza. SIEMPRE se llama (no
+        // solo cuando hay cruce) para que la cola se limpie sola si deja de
+        // serlo (ver `_sincronizarCobroSucursalPendiente`).
+        const esCruzadoHuerfano = String(centroCobrador.id) !== String(centroVendedor.id);
+        if (p.folioOrigen) {
+          const totalFormasPagoTicket = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+          let acumuladoTicket = 0;
+          const lineasCobrador = [];
+          formasPagoTicket.forEach((fp, idx) => {
+            const esUltimo = idx === formasPagoTicket.length - 1;
+            const share = totalFormasPagoTicket > 0 ? (Number(fp.monto) || 0) / totalFormasPagoTicket : 1 / formasPagoTicket.length;
+            const montoAsignado = esUltimo
+              ? Math.round((p.monto - acumuladoTicket) * 100) / 100
+              : Math.round(p.monto * share * 100) / 100;
+            acumuladoTicket += montoAsignado;
+            if (montoAsignado <= 0) return;
+            const esEfectivo = (fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO;
+            lineasCobrador.push({ cuentaId: esEfectivo ? cuentaCajaId : cuentaBancosId, monto: montoAsignado, reglaNombre: fp.nombre || null });
           });
-          candidatas.push({
-            cuentaId:      cuentaPuenteId,
-            cuentaFaltante: false,
-            concepto:      conceptoTicket,
-            debe:          0,
-            haber:         montoAsignado,
-            serie:         serieFolioTicket,
-            folio:         p.folioOrigen,
-            centroCosto:   centroCobrador.clave,
-            centroCostoId: centroCobrador.id,
-            tipoOrigen:    'Cobro Sucursal',
-            reglaNombre:   fp.nombre || null,
-            cfdiUuid:      null,
+          await _sincronizarCobroSucursalPendiente({
+            rfc,
+            folioOrigen:          p.folioOrigen,
+            centroCostoIdOrigen:  centroVendedor.id,
+            centroCostoIdDestino: esCruzadoHuerfano ? centroCobrador.id : null,
+            serieFolioTicket,
+            cfdiUuid:             null,
+            nombreCliente:        p.nombreCliente,
+            montoTotal:           lineasCobrador.reduce((s, l) => s + l.monto, 0),
+            lineas:               esCruzadoHuerfano ? lineasCobrador : [],
+            tratamiento:          'HUERFANO',
+            fechaCobro:           p.fecha ?? null,
           });
-        });
+        }
       }
     }
   }
 
   const pendientesPorFacturar = pendientesDetectados.map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
+
+  // Cola de cobros cruzados encolados por OTRA sucursal (cuando ESTA fue la
+  // vendedora) — ver nota de arquitectura en el encabezado del archivo. Se
+  // aplica sin importar si el loop de arriba encontró algo o no: esta
+  // póliza puede ser puramente cobradora de tickets vendidos en otro lado.
+  const centroPropio = Object.values(ccBySerieMap).find(cc => String(cc.id) === String(centroCostoId));
+  const candidatasPendientes = await _aplicarCobrosSucursalPendientes({
+    rfc, centroCostoId, centroCobradorClave: centroPropio?.clave ?? null, cuentaPuenteId, fechaDesde, fechaHasta,
+  });
+  candidatas.push(...candidatasPendientes);
 
   if (!candidatas.length) return { movimientos: [], facturasVendedorCubiertas, facturasPPDCubiertas, pendientesPorFacturar };
 
@@ -815,4 +1009,4 @@ async function construirMovimientosPuente({
   };
 }
 
-module.exports = { construirMovimientosPuente, _extraerDocumentosRelacionados };
+module.exports = { construirMovimientosPuente, _extraerDocumentosRelacionados, _encolarCobroSucursalPendiente, _sincronizarCobroSucursalPendiente };

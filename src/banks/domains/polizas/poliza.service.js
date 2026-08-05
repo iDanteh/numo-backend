@@ -1017,6 +1017,25 @@ const ETIQUETA_SALDO_FAVOR = 'SF';
 // confirmado con el usuario 2026-08-04.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 
+// Orden fijo del bloque de "Cobro de otra sucursal": Efectivo, Transferencia,
+// Saldo a favor, Cheque, Tarjeta (confirmado con el usuario 2026-08-05).
+// Las líneas con depósito bancario real identificado (`_referenciaBancoReal`
+// — muestran el folio del banco en vez de "TRANSFERENCIA"/"TARJETA", ver
+// `_extraerCobrosSucursal` más abajo) se tratan como Transferencia: en la
+// práctica casi nunca hay match 1 a 1 de Tarjeta contra un depósito bancario
+// real (las liquidaciones de terminal llegan en lote, no por venta),
+// confirmado con el usuario.
+function _categoriaCobroSucursal(f) {
+  if (f._referenciaBancoReal) return 1;
+  const label = (f._formaPagoLabel ?? '').toUpperCase();
+  if (label === ETIQUETA_SALDO_FAVOR)   return 2;
+  if (label.includes('EFECTIVO'))       return 0;
+  if (label.includes('TRANSFERENCIA'))  return 1;
+  if (label.includes('CHEQUE'))         return 3;
+  if (label.includes('TARJETA'))        return 4;
+  return 5;
+}
+
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
@@ -1061,7 +1080,11 @@ function _extraerCobrosSucursal(movimientos) {
       _referenciaBancoReal: esBancoReal ? (m.reglaNombre || null) : null,
     });
   }
-  filas.sort(compararSerieFolio);
+  // Primero por categoría de forma de pago (Efectivo → Transferencia → SF →
+  // Cheque → Tarjeta), y dentro de cada categoría por serie-folio — antes
+  // solo ordenaba por serie-folio, mezclando todos los tipos de cobro en el
+  // orden en que llegaban los tickets (confirmado con el usuario 2026-08-05).
+  filas.sort((a, b) => _categoriaCobroSucursal(a) - _categoriaCobroSucursal(b) || compararSerieFolio(a, b));
   // Columna C debe decir "Cobro de otra sucursal" en vez del serie-folio —
   // mismo patrón que Transferencia/Cheque individual (línea ~825): el
   // serie-folio real se conserva en el concepto (columna H) junto al

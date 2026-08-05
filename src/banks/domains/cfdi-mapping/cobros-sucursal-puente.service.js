@@ -24,25 +24,23 @@
  *     póliza en esas cuentas es cero, pero cada línea cuadra contra su
  *     contraparte de la póliza vendedora al consolidar.
  *
- * ── PPD (Crédito): el Cargo a Clientes normal de la venta se conserva
- *    intacto (lo genera cfdiToMovimientos como siempre) — este flujo agrega
- *    un asiento ADICIONAL que usa la cuenta puente "Cobros De Sucursales Por
- *    Identificar" (2103040001) para cerrar esa cuenta por cobrar:
- *   - Sucursal VENDEDORA: Abono a Clientes (misma cuenta que usó el Cargo
- *     original de la venta — la resuelve cfdi-poliza-generator.service.js vía
- *     `facturasPPDCubiertas`) + Cargo a la cuenta puente (este archivo).
- *   - Sucursal COBRADORA: Cargo a Caja/Bancos por identificar (el cobro real,
- *     por forma de pago) + Abono a la cuenta puente.
+ * ── PPD (Crédito): NO genera ningún movimiento aquí. Se probó un asiento
+ *    adicional vía la cuenta puente "Cobros De Sucursales Por Identificar"
+ *    (2103040001) para cerrar la CxC desde Ingreso, pero el usuario confirmó
+ *    (2026-08-05) que ese cierre es responsabilidad exclusiva de Cobranza —
+ *    la póliza de Ingreso nunca debe mostrar cobros de otra sucursal para
+ *    ventas a crédito. `esPPD` corta el procesamiento del cobro apenas se
+ *    detecta (ver `if (esPPD) continue;` más abajo).
  *
  * ── SALDO A FAVOR: cuando una forma de pago del cobro es "saldo a favor"
  *    (aplicación de un saldo existente del cliente, no dinero nuevo), NO usa
  *    Caja/Bancos ni la cuenta puente — usa directamente "Anticipos Otros"
  *    (2103090001, subtotal) + "IVA Trasladado - Anticipos" (2104010002, IVA
  *    16%), con columna C = "SF" (confirmado con el usuario 2026-08-03).
- *    Mismo patrón vendedor/cobrador que Efectivo/Transferencia, pero el
- *    Abono del lado cobrador va a esas MISMAS cuentas (no a la puente,
- *    aunque la factura sea PPD) — no es un movimiento de banco, es puramente
- *    la aplicación del saldo, así que no necesita pasar por la puente.
+ *    Mismo patrón vendedor/cobrador que Efectivo/Transferencia — no es un
+ *    movimiento de banco, es puramente la aplicación del saldo. Solo aplica a
+ *    PUE: si la factura original es PPD, `esPPD` corta antes de llegar aquí
+ *    (ver nota de PPD arriba).
  */
 
 const { Op } = require('sequelize');
@@ -147,9 +145,14 @@ const PADDING_ESCANEO_POR_FACTURAR = 15;
  * — es un heurístico, no garantiza encontrar el 100% (ej. si todos los
  * tickets del día cayeran fuera del padding).
  *
- * Devuelve una lista informativa (NO movimientos contables) para que se
- * muestre aparte como "pendientes por facturar" — nunca se mezcla con
- * `candidatas`.
+ * Devuelve una lista informativa para mostrar aparte como "pendientes por
+ * facturar" (esta función en sí NO arma movimientos contables). Si además el
+ * cobro resulta cruzado de sucursal, el CALLER (`construirMovimientosPuente`,
+ * justo después de invocar esta función) SÍ le genera su asiento de "Cobro
+ * de otra sucursal" (Cargo Caja/Bancos + Abono a la cuenta puente) aparte —
+ * confirmado con el usuario 2026-08-05: el ticket debe aparecer en AMBOS
+ * lados (pendiente por facturar + asiento real), el dinero ya se cobró de
+ * verdad aunque falte la factura.
  */
 async function _detectarPendientesPorFacturar({ foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta }) {
   if (!fechaDesde || !fechaHasta || !serieDelDia || !foliosDelDiaNumericos.length) return [];
@@ -198,9 +201,13 @@ async function _detectarPendientesPorFacturar({ foliosDelDiaNumericos, serieDelD
         serie:       cuenta.serieVenta ?? serieDelDia,
         folio:       cuenta.folioVenta,
         monto:       Math.abs(Number(cobro.monto) || 0),
-        formasPago:  (cobro.formasPago ?? []).map(fp => ({ nombre: fp.nombre ?? fp.claveSat ?? null, monto: Number(fp.monto) || 0 })),
+        formasPago:  (cobro.formasPago ?? []).map(fp => ({ nombre: fp.nombre ?? fp.claveSat ?? null, claveSat: fp.claveSat ?? null, monto: Number(fp.monto) || 0 })),
         fecha:       cobro.fecha,
         folioOrigen: cobro.folioOrigen ?? null,
+        // Centro que hizo el cobro (puede ser distinto al que vendió el
+        // ticket) — necesario para generar el asiento de "Cobro de otra
+        // sucursal" cuando aplica (ver uso en construirMovimientosPuente).
+        claveCentro: cobro.claveCentro ?? null,
         // Cajas no trae nombre de cliente para cuentas sin factura (por algo
         // no tienen documentoRelacionado que permita resolverlo) — mismo
         // fallback que usa `nombreCliente` arriba para cuentas normales.
@@ -419,10 +426,6 @@ async function construirMovimientosPuente({
   // 2. Armar líneas candidatas (antes de filtrar por idempotencia).
   const candidatas = [];
   const facturasVendedorCubiertas = new Set();
-  // Acumulador interno (Set de nombres de forma de pago, para la etiqueta
-  // combinada) — se convierte a `facturasPPDCubiertas` (monto + reglaNombre
-  // string) justo antes de retornar.
-  const facturasPPDAcumulado = new Map();
   // folioVenta (numérico) de cobros REALES del día — usado abajo para acotar
   // el rango de folios a escanear en busca de tickets "por facturar" (ver
   // `_detectarPendientesPorFacturar`). Solo se llenan con folioVenta ya
@@ -586,129 +589,16 @@ async function construirMovimientosPuente({
       });
       if (!lineas.length) continue;
 
-      const lineasNormales = lineas.filter(l => !l.esSF);
-      const lineasSF       = lineas.filter(l => l.esSF);
-      const formaPagoLabelCombinado = lineasNormales.map(l => l.reglaNombre).filter(Boolean).join('/') || null;
-
-      if (esPPD) {
-        // Cierre mismo día: la CxC de una venta PPD solo se cierra en ESTA
-        // póliza de Ingreso cuando la factura ORIGINAL es del MISMO día que
-        // se está generando — si es de un día distinto (ej. factura del
-        // 04/07 cobrada el 10/07 en otra sucursal), ese cierre le
-        // corresponde a Cobranza, no a Ingreso (confirmado con el usuario
-        // 2026-08-04, HERROZINC I0-260700082: quedaba inyectado aquí sin
-        // deber estarlo). Si no se puede determinar la fecha de la factura,
-        // se excluye por seguridad (mismo criterio).
-        if (fechaDesde && fechaHasta) {
-          const fechaFactura = cfdiOriginal?.fecha ? new Date(cfdiOriginal.fecha) : null;
-          if (!fechaFactura || fechaFactura < fechaDesde || fechaFactura > fechaHasta) continue;
-        }
-        // ── PPD lado VENDEDOR: NO se toca el Cargo a Clientes normal de la
-        // venta (lo sigue armando cfdiToMovimientos) — aquí se agrega el
-        // Cargo a la cuenta puente (solo con las formas de pago normales) y,
-        // aparte, una línea de Cargo por cada mitad de "saldo a favor" (no se
-        // mezcla con la puente). El Abono a Clientes que compensa TODO esto
-        // (puente + SF) lo agrega cfdi-poliza-generator.service.js usando
-        // `facturasPPDCubiertas`.
-        if (centroVendedor && String(centroVendedor.id) === String(centroCostoId) && cuentaPuenteId) {
-          const montoNeto = lineasNormales.reduce((s, l) => s + l.montoAsignado, 0);
-          let montoTotalCubierto = 0;
-          const nombresFormaPagoUsados = new Set();
-
-          if (cfdiOriginal?.uuid && montoNeto > 0) {
-            candidatas.push({
-              cuentaId:      cuentaPuenteId,
-              cuentaFaltante: false,
-              concepto:      conceptoBase,
-              debe:          montoNeto,
-              haber:         0,
-              serie:         serieFolioFactura,
-              folio:         cobro.folioOrigen ?? null,
-              centroCosto:   centroVendedor.clave,
-              centroCostoId: centroVendedor.id,
-              tipoOrigen:    'Cobro Sucursal',
-              reglaNombre:   formaPagoLabelCombinado,
-              cfdiUuid:      cfdiOriginal.uuid,
-              // Discrimina PPD/Crédito vs PUE/Contado para _inyectarCobrosSucursal.
-              metodoPago:    'PPD',
-            });
-            montoTotalCubierto += montoNeto;
-            lineasNormales.forEach(l => { if (l.reglaNombre) nombresFormaPagoUsados.add(l.reglaNombre); });
-          }
-
-          if (cfdiOriginal?.uuid) {
-            lineasSF.forEach(l => {
-              if (l.montoAsignado <= 0) return;
-              candidatas.push({
-                cuentaId:      l.cuentaId,
-                cuentaFaltante: false,
-                concepto:      l.concepto,
-                debe:          l.montoAsignado,
-                haber:         0,
-                serie:         serieFolioFactura,
-                folio:         cobro.folioOrigen ?? null,
-                centroCosto:   centroVendedor.clave,
-                centroCostoId: centroVendedor.id,
-                tipoOrigen:    'Cobro Sucursal',
-                reglaNombre:   l.reglaNombre,
-                cfdiUuid:      cfdiOriginal.uuid,
-                metodoPago:    'PPD',
-              });
-              montoTotalCubierto += l.montoAsignado;
-              nombresFormaPagoUsados.add(l.reglaNombre);
-            });
-          }
-
-          if (cfdiOriginal?.uuid && montoTotalCubierto > 0) {
-            const uuidUpper = cfdiOriginal.uuid.toUpperCase();
-            const prev = facturasPPDAcumulado.get(uuidUpper) ?? { monto: 0, nombresFormaPago: new Set() };
-            prev.monto += montoTotalCubierto;
-            nombresFormaPagoUsados.forEach(n => prev.nombresFormaPago.add(n));
-            facturasPPDAcumulado.set(uuidUpper, prev);
-          }
-        }
-
-        // ── PPD lado COBRADOR: igual que PUE (Cargo Caja/Bancos real o SF),
-        // pero el Abono de las formas de pago NORMALES va a la cuenta puente
-        // (la contrapartida vive en la póliza vendedora) — el Abono de "saldo
-        // a favor" va a esa MISMA cuenta SF (no a la puente: no es un
-        // movimiento de banco entre sucursales, es solo aplicar el saldo).
-        if (centroCobrador && String(centroCobrador.id) === String(centroCostoId) && cuentaPuenteId) {
-          lineas.forEach(l => {
-            candidatas.push({
-              cuentaId:      l.cuentaId,
-              cuentaFaltante: false,
-              concepto:      l.concepto,
-              debe:          l.montoAsignado,
-              haber:         0,
-              serie:         serieFolioFactura,
-              folio:         cobro.folioOrigen ?? null,
-              centroCosto:   centroCobrador.clave,
-              centroCostoId: centroCobrador.id,
-              tipoOrigen:    'Cobro Sucursal',
-              reglaNombre:   l.reglaNombre,
-              cfdiUuid:      cfdiOriginal?.uuid ?? null,
-              metodoPago:    'PPD',
-            });
-            candidatas.push({
-              cuentaId:      l.esSF ? l.cuentaId : cuentaPuenteId,
-              cuentaFaltante: false,
-              concepto:      l.concepto,
-              debe:          0,
-              haber:         l.montoAsignado,
-              serie:         serieFolioFactura,
-              folio:         cobro.folioOrigen ?? null,
-              centroCosto:   centroCobrador.clave,
-              centroCostoId: centroCobrador.id,
-              tipoOrigen:    'Cobro Sucursal',
-              reglaNombre:   l.reglaNombre,
-              cfdiUuid:      cfdiOriginal?.uuid ?? null,
-              metodoPago:    'PPD',
-            });
-          });
-        }
-        continue;
-      }
+      // PPD (Crédito): el cierre de la CxC cobrada en otra sucursal es
+      // responsabilidad exclusiva de Cobranza, nunca de Ingreso — antes este
+      // bloque generaba aquí un Cargo a la cuenta puente (vendedor) + Abono a
+      // Clientes y, del lado cobrador, Cargo Caja/Bancos + Abono puente, pero
+      // el usuario confirmó que esas líneas NO deben aparecer en la póliza de
+      // Ingreso bajo ningún caso (revertido 2026-08-05, ver
+      // `facturasPPDCubiertas` en cfdi-poliza-generator.service.js: al quedar
+      // siempre vacío, los bloques que dependían de él quedan inertes sin
+      // más cambios ahí).
+      if (esPPD) continue;
 
       // ── PUE lado VENDEDOR: cargo a Caja/Bancos por identificar (o a las
       // cuentas de saldo a favor, si la forma de pago es SF), una línea por
@@ -778,30 +668,118 @@ async function construirMovimientosPuente({
     }
   }
 
-  // reglaNombre SIN el prefijo "Cobro de otra sucursal -": la línea de Abono
-  // a Clientes (cfdi-poliza-generator.service.js) lleva tipoOrigen='Cobro
-  // Sucursal', así que _extraerCobrosSucursal (poliza.service.js) ya le
-  // agrega el prefijo — ponerlo aquí también lo duplicaba ("Cobro de otra
-  // sucursal - Cobro de otra sucursal - X", verificado con datos reales
-  // 2026-08-03).
-  const facturasPPDCubiertas = new Map(
-    [...facturasPPDAcumulado.entries()].map(([uuid, v]) => [
-      uuid,
-      {
-        monto: Math.round(v.monto * 100) / 100,
-        reglaNombre: v.nombresFormaPago.size ? [...v.nombresFormaPago].join('/') : null,
-      },
-    ]),
-  );
+  // PPD ya no genera nada aquí (ver el `if (esPPD) continue;` arriba) — se
+  // mantiene el Map vacío en el retorno porque cfdi-poliza-generator.service.js
+  // sigue consultándolo (`facturasPPDCubiertas.get(...)`); con el Map siempre
+  // vacío esos bloques quedan inertes sin tocar ese archivo.
+  const facturasPPDCubiertas = new Map();
 
   // Tickets con cobro real pero sin ninguna factura ligada (ver
-  // `_detectarPendientesPorFacturar`) — informativo, nunca se mezcla con
-  // `candidatas`/`movimientos`.
+  // `_detectarPendientesPorFacturar`) — la lista que se regresa abajo sigue
+  // siendo informativa (se muestra aparte, en la hoja de "Pendientes por
+  // facturar"), pero SI el cobro fue cruzado de sucursal (cobrado en un
+  // almacén distinto al que vendió el ticket) también se genera su asiento
+  // de "Cobro de otra sucursal" en AMBAS pólizas — confirmado con el usuario
+  // 2026-08-05: el dinero ya se cobró de verdad, no debe quedar sin
+  // registrar en ninguna cuenta solo porque el ticket todavía no tiene
+  // factura. Mismo principio que PUE normal (Cargo vendedor sin
+  // contrapartida en su propia póliza / Cargo+Abono cobrador), pero como no
+  // hay factura con qué cuadrar el lado vendedor, ambos lados usan la cuenta
+  // puente (Cargo vendedor / Abono cobrador) en vez de Caja/Bancos directo
+  // en el vendedor — se resuelve solo cuando el ticket se facture y el flujo
+  // normal de arriba lo tome como cualquier otro documento relacionado.
   const foliosConocidos = new Set(docsUnicos.map(d => `${d.serie}|${d.folio}`));
   const centroDelDia = serieDelDia ? (ccBySerieMap[serieDelDia] ?? null) : null;
-  const pendientesPorFacturar = (await _detectarPendientesPorFacturar({
+  const pendientesDetectados = await _detectarPendientesPorFacturar({
     foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta,
-  })).map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
+  });
+
+  if (cuentaPuenteId) {
+    for (const p of pendientesDetectados) {
+      const centroVendedor = p.serie ? (ccBySerieMap[p.serie] ?? null) : null;
+      const centroCobrador = p.claveCentro ? (ccBySerieMap[p.claveCentro] ?? null) : null;
+      if (!centroCobrador) continue;
+      if (centroVendedor && String(centroVendedor.id) === String(centroCobrador.id)) continue; // mismo almacén, no es cruzado
+
+      const serieFolioTicket = `${p.serie ?? '?'}-${p.folio ?? '?'}`;
+      const conceptoTicket = [p.nombreCliente, serieFolioTicket].filter(Boolean).join(' / ');
+      const formasPagoTicket = p.formasPago.length ? p.formasPago : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: p.monto }];
+
+      // ── Lado VENDEDOR: Cargo a la cuenta puente por el total cobrado —
+      // mismo principio que el lado vendedor PUE normal (Cargo Caja/Bancos
+      // sin contrapartida en esta póliza, se compensa al consolidar), solo
+      // que aquí no hay factura con la que cuadrar todavía, así que se usa
+      // la cuenta puente en vez de Caja/Bancos directo — la contrapartida
+      // exacta es el Abono puente que se agrega abajo en la póliza
+      // COBRADORA. Cuando el ticket se facture, el flujo normal de arriba
+      // tomará este mismo folio como cualquier otro documento relacionado.
+      if (centroVendedor && String(centroVendedor.id) === String(centroCostoId) && p.monto > 0) {
+        candidatas.push({
+          cuentaId:      cuentaPuenteId,
+          cuentaFaltante: false,
+          concepto:      conceptoTicket,
+          debe:          p.monto,
+          haber:         0,
+          serie:         serieFolioTicket,
+          folio:         p.folioOrigen,
+          centroCosto:   centroVendedor.clave,
+          centroCostoId: centroVendedor.id,
+          tipoOrigen:    'Cobro Sucursal',
+          reglaNombre:   formasPagoTicket.map(fp => fp.nombre).filter(Boolean).join('/') || null,
+          cfdiUuid:      null,
+        });
+      }
+
+      // ── Lado COBRADOR: Cargo Caja/Bancos (el cobro real) + Abono a la
+      // cuenta puente, por forma de pago — igual que el lado cobrador PUE
+      // normal, solo que el Abono va a la puente (no a la misma cuenta de
+      // Caja/Bancos) para casar contra el Cargo puente de la vendedora.
+      if (String(centroCobrador.id) === String(centroCostoId)) {
+        const totalFormasPagoTicket = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+        let acumuladoTicket = 0;
+        formasPagoTicket.forEach((fp, idx) => {
+          const esUltimo = idx === formasPagoTicket.length - 1;
+          const share = totalFormasPagoTicket > 0 ? (Number(fp.monto) || 0) / totalFormasPagoTicket : 1 / formasPagoTicket.length;
+          const montoAsignado = esUltimo
+            ? Math.round((p.monto - acumuladoTicket) * 100) / 100
+            : Math.round(p.monto * share * 100) / 100;
+          acumuladoTicket += montoAsignado;
+          if (montoAsignado <= 0) return;
+          const esEfectivo = (fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO;
+          candidatas.push({
+            cuentaId:      esEfectivo ? cuentaCajaId : cuentaBancosId,
+            cuentaFaltante: false,
+            concepto:      conceptoTicket,
+            debe:          montoAsignado,
+            haber:         0,
+            serie:         serieFolioTicket,
+            folio:         p.folioOrigen,
+            centroCosto:   centroCobrador.clave,
+            centroCostoId: centroCobrador.id,
+            tipoOrigen:    'Cobro Sucursal',
+            reglaNombre:   fp.nombre || null,
+            cfdiUuid:      null,
+          });
+          candidatas.push({
+            cuentaId:      cuentaPuenteId,
+            cuentaFaltante: false,
+            concepto:      conceptoTicket,
+            debe:          0,
+            haber:         montoAsignado,
+            serie:         serieFolioTicket,
+            folio:         p.folioOrigen,
+            centroCosto:   centroCobrador.clave,
+            centroCostoId: centroCobrador.id,
+            tipoOrigen:    'Cobro Sucursal',
+            reglaNombre:   fp.nombre || null,
+            cfdiUuid:      null,
+          });
+        });
+      }
+    }
+  }
+
+  const pendientesPorFacturar = pendientesDetectados.map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
 
   if (!candidatas.length) return { movimientos: [], facturasVendedorCubiertas, facturasPPDCubiertas, pendientesPorFacturar };
 

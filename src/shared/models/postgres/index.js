@@ -230,6 +230,13 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS sustitutos_excluidos JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN sustitutos_excluidos:', e.message));
 
+  // Tickets de cajas con cobro real pero sin factura ligada, detectados al
+  // generar la póliza (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS pendientes_por_facturar JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN pendientes_por_facturar:', e.message));
+
   // El índice único (tipo, numero, rfc, ejercicio, periodo) bloqueaba para
   // siempre el folio de una póliza cancelada (la fila sigue existiendo,
   // solo con estado='cancelada') — impedía reutilizar ese folio en una

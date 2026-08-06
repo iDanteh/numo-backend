@@ -842,6 +842,27 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
   return huboCoincidenciaPropia ? Math.abs(miNeto) : null;
 }
 
+// Piso de aporte para un depósito bancario ya vinculado por un HUMANO: nunca debe bajar en
+// una corrida posterior de "Recalcular saldo ERP", sin importar la causa (retención,
+// cancelación, devolución — CAC/DEV/RET, o cualquier otro ajuste que Kore aplique después).
+// Decisión explícita del usuario (2026-08-06, folio 032686): "el objetivo es subir los
+// movimientos, no bajarlos". Solo se permite subir si Kore trae un monto MAYOR atribuible a
+// este movimiento (una bonificación real) — nunca bajar.
+//
+// El piso es, en orden: el aporte ya confirmado (saldoErpAportado), o si nunca se determinó
+// el saldoPagadoTotal ya confirmado por un humano al vincular, o —último recurso, solo si
+// AMBOS ya se perdieron a null por una corrida vieja anterior a este fix, y el movimiento
+// tiene un ÚNICO erpLink— el monto real del depósito bancario: un solo link humano en un
+// movimiento es, por definición, todo ese depósito.
+function _aporteConRatchet(link, calculado, mov, totalLinksEnMovimiento) {
+  const pisoConfirmado = link.saldoErpAportado
+    ?? link.saldoPagadoTotal
+    ?? (totalLinksEnMovimiento === 1 ? Math.abs(mov.deposito ?? mov.retiro ?? 0) : null);
+  if (calculado == null) return pisoConfirmado;
+  if (pisoConfirmado == null) return calculado;
+  return Math.max(calculado, pisoConfirmado);
+}
+
 // Deriva saldoPagado/saldoPagadoTotal/folioFiscal de un erpLink a partir de la respuesta de
 // Kore YA consultada (raw0) — compartido por _syncErpKoreJob (al finalizar un link por
 // primera vez, sin pegarle a Kore una segunda vez) y _recomputeErpKoreJob (backfill
@@ -1405,6 +1426,7 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
       let huboCambioAporte         = false;
       let huboSinDatos             = false;
       let huboFolioFiscalPendiente = false; // algún link quedó sin folioFiscal y sin avanzar checkpoint
+      let huboFolioFiscalRecuperado = false; // algún link pasó de folioFiscal null a un valor real esta corrida
       const linksDetalle      = [];
       const linksActualizados = links.map(l => ({ ...l }));
 
@@ -1422,8 +1444,18 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
         const fechaAnclaAlterna = mov.identificadoPor?.find(ip => ip.erpId === link.erpId)?.fechaId ?? null;
         const folioFiscalRecuperable = !link.folioFiscal
           && _folioFiscalDentroDeVentanaReintento(link.conciliacionFinalizadaAt, fechaAnclaAlterna);
+        // `finalizadoManualmente` (2026-08-06): mismo rol que `conciliacionFinalizadaAt` pero
+        // para Solicitudes de Cobro/Aplicar cobro manual — un link con aporte YA confirmado
+        // (saldoPagadoTotal real) y una fecha de cierre propia (fechaAnclaAlterna) está tan
+        // "finalizado" como uno tradicional. Sin esto, el rescate masivo/puntual
+        // (`_FILTRO_LINK_ATRAPADO`/reset-recompute) resetea el checkpoint pero la SIGUIENTE
+        // corrida vuelve a excluirlo aquí mismo por la ventana de 60 días — el reset queda sin
+        // efecto. Igual que con conciliacionFinalizadaAt, la ventana sigue gobernando
+        // ÚNICAMENTE si el checkpoint vuelve a avanzar después de consultar Kore
+        // (folioFiscalPendiente, más abajo) — no si se consulta o no.
+        const finalizadoManualmente = link.saldoPagadoTotal != null && fechaAnclaAlterna != null;
         const elegible = link.conciliacionFinalizadaAt != null || link.saldoPagadoTotal == null
-          || folioFiscalRecuperable;
+          || finalizadoManualmente || folioFiscalRecuperable;
         if (!link.serie || !link.folioExterno || link.recomputedFormasPagoAt || !elegible) continue;
 
         const rango = _rangoDesdeFollo(link.folioExterno);
@@ -1469,25 +1501,13 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
           let cambioAporte = false;
           if (esHumano) {
             // calculado puede venir null (ninguna entrada de Kore trae el Aut/Numo de ESTE
-            // movimiento) — en ese caso NO se toca aporteNuevo, se conserva el valor previo
-            // del link en vez de pisarlo con un cero falso.
-            const calculado = _montoSaldoLinkPorMovimiento(raw0, mov);
-            if (calculado != null && Math.abs(calculado - (link.saldoErpAportado ?? 0)) > 0.01) {
-              aporteNuevo  = calculado;
-              cambioAporte = true;
-            } else if (
-              calculado == null && link.saldoErpAportado === 0 &&
-              link.saldoPagadoTotal != null && Math.abs(link.saldoPagadoTotal) > 0.01
-            ) {
-              // Fix 2026-07-29 (folio 036030): una CxC puede cerrar por RETENCIÓN (sin
-              // formasPago real) en vez de un pago bancario — ahí _montoSaldoLinkPorMovimiento
-              // NUNCA va a poder determinar el aporte desde Kore (por diseño, calculado
-              // siempre null). El fallback `?? saldoPagadoTotal` del bug 6 (036636) no alcanza
-              // acá porque saldoErpAportado ya quedó en 0 CONCRETO (no null) por una corrida
-              // vieja anterior a estos fixes — un 0 nunca dispara un `??`. Decisión del usuario
-              // (2026-07-29): si un humano ya confirmó este cobro al vincular (saldoPagadoTotal
-              // real), ese valor gana sobre un 0 que Kore nunca pudo confirmar ni refutar.
-              aporteNuevo  = link.saldoPagadoTotal;
+            // movimiento) — _aporteConRatchet decide el piso a usar en ese caso. Generaliza
+            // el fix 2026-07-29 (folio 036030, retención sin formasPago real) y agrega el
+            // ratchet 2026-08-06 (folio 032686, DEV bajando un depósito ya identificado).
+            const calculado   = _montoSaldoLinkPorMovimiento(raw0, mov);
+            const mejorAporte = _aporteConRatchet(link, calculado, mov, links.length);
+            if (mejorAporte != null && Math.abs(mejorAporte - (link.saldoErpAportado ?? 0)) > 0.01) {
+              aporteNuevo  = mejorAporte;
               cambioAporte = true;
             }
           }
@@ -1518,13 +1538,22 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
             conciliacionRunId:      cambioAporte ? jobId : link.conciliacionRunId,
             recomputedFormasPagoAt: backfill.folioFiscalPendiente ? null : new Date(),
           };
+          // Fix 2026-08-06 (lote de 16 folios en "Backfill sin cambio"): folioFiscal se
+          // escribe SIEMPRE (línea de arriba, backfill.folioFiscal), sin relación con
+          // cambioAporte — un link que recupera folioFiscal pero no mueve el aporte quedaba
+          // reportado como "sin cambio" aunque el dato SÍ se haya actualizado en Mongo.
+          const folioFiscalRecuperadoAhora = !link.folioFiscal && !!backfill.folioFiscal;
+
           huboLinkTocado = true;
           if (cambioAporte) huboCambioAporte = true;
           if (backfill.folioFiscalPendiente) huboFolioFiscalPendiente = true;
+          if (folioFiscalRecuperadoAhora) huboFolioFiscalRecuperado = true;
 
           linksDetalle.push({
             erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
-            estado: backfill.folioFiscalPendiente ? 'folio_fiscal_pendiente' : (cambioAporte ? 'actualizado' : 'sin_cambio'),
+            estado: backfill.folioFiscalPendiente
+              ? 'folio_fiscal_pendiente'
+              : ((cambioAporte || folioFiscalRecuperadoAhora) ? 'actualizado' : 'sin_cambio'),
             aporteAntes: link.saldoErpAportado ?? null, aporteDespues: aporteNuevo,
           });
         } catch (err) {
@@ -1570,12 +1599,12 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
       }
 
       let estado;
-      if (huboErrorMov)                   estado = 'error';
-      else if (huboFolioFiscalPendiente)  estado = 'folio_fiscal_pendiente';
-      else if (update.$push)              estado = 'actualizado';
-      else if (huboSinDatos)              estado = 'sin_datos';
-      else if (huboLinkTocado)            estado = 'backfill'; // checkpoint avanzó, sin cambio de saldo
-      else                                estado = null;       // nada elegible pudo procesarse (ej. folio inválido)
+      if (huboErrorMov)                                      estado = 'error';
+      else if (huboFolioFiscalPendiente)                     estado = 'folio_fiscal_pendiente';
+      else if (update.$push || huboFolioFiscalRecuperado)    estado = 'actualizado';
+      else if (huboSinDatos)                                 estado = 'sin_datos';
+      else if (huboLinkTocado)                               estado = 'backfill'; // checkpoint avanzó, sin cambio de saldo/folioFiscal
+      else                                                    estado = null;      // nada elegible pudo procesarse (ej. folio inválido)
       if (estado === 'actualizado')            actualizados++;
       if (estado === 'sin_datos')              sinDatos++;
       if (estado === 'folio_fiscal_pendiente') pendientesFolioFiscal++;
@@ -2254,10 +2283,15 @@ router.post('/sync-erp-kore/:jobId/revert', authenticate, permit('banks:admin'),
 // retención; los cierres limpios (036472/036917/036967/037095/037085/037076/037099) también
 // quedan atrapados con folioFiscal null y Kore SÍ termina facturándolos, así que también
 // califican para el rescate manual.
+// `conciliacionFinalizadaAt` (2026-08-06): se quitó como condición obligatoria — antes el
+// rescate masivo solo veía el flujo tradicional. Los links de Solicitudes de Cobro/Aplicar
+// cobro manual NUNCA llenan ese campo (ver fix 037600 más abajo) y quedaban invisibles para
+// este filtro aunque su checkpoint hubiera avanzado con folioFiscal todavía null — el mismo
+// patrón "atrapado", solo que en otro flujo. `recomputedFormasPagoAt != null` + `folioFiscal`
+// sin resolver ya identifica el patrón sin importar de qué flujo vino el link.
 const _FILTRO_LINK_ATRAPADO = {
-  conciliacionFinalizadaAt: { $ne: null },
-  recomputedFormasPagoAt:   { $ne: null },
-  folioFiscal:              { $in: [null, ''] },
+  recomputedFormasPagoAt: { $ne: null },
+  folioFiscal:            { $in: [null, ''] },
 };
 // Mismas condiciones, con el prefijo que exige `arrayFilters` (identificador posicional
 // $[link] en vez de nombre de campo relativo al array, como pide $elemMatch).
@@ -2492,6 +2526,8 @@ router._sincronizarConRetry         = _sincronizarConRetry;
 router._movimientosKoreDesde        = _movimientosKoreDesde;
 router._montoSaldoLink              = _montoSaldoLink;
 router._montoSaldoLinkPorMovimiento = _montoSaldoLinkPorMovimiento;
+router._aporteConRatchet            = _aporteConRatchet;
+router._FILTRO_LINK_ATRAPADO        = _FILTRO_LINK_ATRAPADO;
 router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
 router._esLinkPuroCancelacionODevolucion = _esLinkPuroCancelacionODevolucion;

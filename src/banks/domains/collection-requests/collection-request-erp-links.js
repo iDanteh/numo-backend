@@ -72,19 +72,34 @@ function matchBancoDefault(bancos, movBanco) {
 // sobreescriben.
 // setErpIds() REEMPLAZA por completo mov.erpLinks, así que aquí también se preservan
 // los links de otras CxC ajenas a esta solicitud que ya estuvieran en el movimiento.
-function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
+//
+// opts (multi-bank-movement, D5) — SOLO afecta la rama Modo 1, cada grupo
+// (movimiento) llama esta función por su cuenta:
+//   - opts.formasPago: acota totalPaid/bancoPaid/desglose al GRUPO de ESTE
+//     movimiento en vez de cr.formasPago completo. Default: cr.formasPago
+//     (= comportamiento de 3 argumentos, sin cambios).
+//   - opts.pagadoTotalCxc: monto total pagado por TODOS los grupos combinados
+//     de este cobro (Σ de todos los movimientos). Se usa SOLO para calcular
+//     saldoActual, para que los N links de un mismo cobro multi-movimiento
+//     coincidan en el saldo posterior — sin esto, 2×50k en una CxC de 100k
+//     dejaría saldoActual=50k en AMBOS links en vez de 0. Default: null →
+//     usa el totalPaid del propio grupo (idéntico al comportamiento anterior).
+//   saldoPagadoTotal/saldoPagado siguen acumulando SOLO lo de este grupo —
+//   cada movimiento lleva su propia bitácora de cuánto cubrió él.
+function buildErpLinksParaCobro(cr, cuentasKore, existingLinks, opts = {}) {
+  const { formasPago: formasPagoGrupo = cr.formasPago, pagadoTotalCxc = null } = opts;
   const round2       = (n) => Math.round(n * 100) / 100;
   const cuentaPorId   = new Map(cuentasKore.map(c => [String(c.id), c]));
   const existingPorId = new Map((existingLinks || []).map(l => [l.erpId, l]));
   const fechaCobro    = new Date();
 
-  function _link(cxc, pagadoBanco, pagadoTotal, nuevoDesglose) {
+  function _link(cxc, pagadoBanco, pagadoTotal, nuevoDesglose, saldoActualPagadoTotal) {
     const cuenta    = cuentaPorId.get(cxc.erpId);
     const prevSaldo = cuenta?.saldoActual ?? cxc.total ?? 0;
     const existing  = existingPorId.get(cxc.erpId);
     return {
       erpId:            cxc.erpId,
-      saldoActual:      round2(Math.max(0, prevSaldo - pagadoTotal)),
+      saldoActual:      round2(Math.max(0, prevSaldo - saldoActualPagadoTotal)),
       saldoPagado:      round2((existing?.saldoPagado ?? 0) + pagadoBanco),
       saldoPagadoTotal: round2((existing?.saldoPagadoTotal ?? 0) + pagadoTotal),
       // A diferencia de serie/folioExterno/tipoPago (que no cambian tras crearse la
@@ -115,19 +130,22 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks) {
   let nuevos;
   if (cr.cxcs.length === 1) {
     // Modo 1 — N formas de pago, todas contra la misma (única) CxC: una entrada de
-    // desglose por cada forma de pago con importe > 0.
-    const totalPaid = cr.formasPago.reduce((s, f) => s + f.importe, 0);
-    const bancoPaid = cr.formasPago.filter(esFormaBancaria).reduce((s, f) => s + f.importe, 0);
-    const desglose  = cr.formasPago.flatMap(f => _desgloseDe(f, f.importe));
-    nuevos = [_link(cr.cxcs[0], bancoPaid, totalPaid, desglose)];
+    // desglose por cada forma de pago del GRUPO (opts.formasPago) con importe > 0.
+    const totalPaid = formasPagoGrupo.reduce((s, f) => s + f.importe, 0);
+    const bancoPaid = formasPagoGrupo.filter(esFormaBancaria).reduce((s, f) => s + f.importe, 0);
+    const desglose  = formasPagoGrupo.flatMap(f => _desgloseDe(f, f.importe));
+    const saldoActualPagadoTotal = pagadoTotalCxc ?? totalPaid;
+    nuevos = [_link(cr.cxcs[0], bancoPaid, totalPaid, desglose, saldoActualPagadoTotal)];
   } else {
     // Modo 2 — 1 sola forma de pago global, repartida entre N CxC: cada CxC recibe UNA
     // entrada de desglose con la misma forma de pago y el monto que le tocó (montoAsignado).
+    // opts NO aplica aquí (multi-bank-movement es exclusivo de Modo 1) — comportamiento
+    // idéntico al de 3 argumentos.
     const esBancaria = esFormaBancaria(cr.formasPago[0]);
     nuevos = cr.cxcs.map(cxc => {
       const paid     = cxc.montoAsignado ?? 0;
       const desglose = _desgloseDe(cr.formasPago[0], paid);
-      return _link(cxc, esBancaria ? paid : 0, paid, desglose);
+      return _link(cxc, esBancaria ? paid : 0, paid, desglose, paid);
     });
   }
 

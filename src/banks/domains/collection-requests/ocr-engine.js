@@ -1565,4 +1565,5 @@ module.exports = {
   // bug de monto truncado en comprobante Mercado Pago) — mismo patrón que
   // otros helpers internos re-expuestos para scripts en el resto del repo.
   normalizeOcrText, extractMonto, extractReceiptDataPaddle, extractReceiptDataTesseract,
+  renderPdfToImages,
 };

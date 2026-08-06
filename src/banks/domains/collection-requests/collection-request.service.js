@@ -19,16 +19,35 @@ const koreCaja          = require('../erp/kore-caja.service');
 const erpRoutes         = require('../erp/erp.routes');
 const { parseCxcs, parseFormasPago }               = require('./collection-request.parsers');
 const { buildErpLinksParaCobro, tipoSaldoEspecial, matchBancoDefault } = require('./collection-request-erp-links');
+// multi-bank-movement (sdd/collection-request-multi-bank-movement, PR1): funciones
+// puras de resolución de asignación {formaPago -> BankMovement} y reconciliación
+// de montos — ver collection-request-asignaciones.js.
+const { resolverAsignaciones, calcularReconciliacion, movimientosDe } = require('./collection-request-asignaciones');
+// conTransaccion (D5): N x setErpIds + cr.save() en una sola transacción Mongo
+// cuando la topología lo soporta, con fallback standalone documentado.
+const { conTransaccion }                            = require('../../shared/utils/mongo-tx');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
 const driveComprobantes                  = require('./drive-comprobantes.service');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
-const { emitToAll }                      = require('../../shared/socket');
+const { emitToAll, emitToBanco }         = require('../../shared/socket');
 const { logger }                         = require('../../shared/utils/logger');
 
 // Payload mínimo para 'collection-request:updated' — mismo criterio que
 // bank:movement:updated en bank.service.js: solo lo que la bandeja necesita
 // para actualizar la fila en el arreglo local sin volver a pedir todo el listado.
-function _eventoActualizacion(cr, mov) {
+//
+// multi-bank-movement: `movs` es un arreglo de 0..N BankMovement (identificar()
+// manda TODOS los movimientos distintos asignados; rechazar()/cancelarPorErp()
+// mandan null/[], nunca tuvieron movimiento). `bankMovementId` se conserva
+// (= primer movimiento) para no romper consumidores existentes del socket;
+// `bankMovements[]` es el agregado nuevo con todos.
+function _eventoActualizacion(cr, movs) {
+  const lista = (movs || []).filter(Boolean);
+  const resumen = m => ({
+    _id: m._id.toString(), banco: m.banco, fecha: m.fecha,
+    concepto: m.concepto, deposito: m.deposito, retiro: m.retiro,
+  });
+  const primero = lista[0] ?? null;
   return {
     _id:               cr._id.toString(),
     status:            cr.status,
@@ -42,10 +61,8 @@ function _eventoActualizacion(cr, mov) {
     cobroAplicado:     cr.cobroAplicado,
     cobroAplicadoAt:   cr.cobroAplicadoAt,
     solicitanteUserId: cr.solicitanteUserId,
-    bankMovementId: mov ? {
-      _id: mov._id.toString(), banco: mov.banco, fecha: mov.fecha,
-      concepto: mov.concepto, deposito: mov.deposito, retiro: mov.retiro,
-    } : null,
+    bankMovementId: primero ? resumen(primero) : null,
+    bankMovements:  lista.map(resumen),
   };
 }
 
@@ -243,10 +260,22 @@ function _tieneAlgunComprobante(doc) {
   return !!doc.comprobante?.mimetype || (doc.comprobantes?.length ?? 0) > 0;
 }
 
+// Convierte un string "YYYY-MM-DD" (fecha civil que el usuario elige en el
+// calendario, sin zona horaria) a la medianoche REAL de ese día en México,
+// expresada en UTC — mismo criterio que _inicioDeHoy() (México sin DST desde
+// 2022, offset fijo UTC-6, no hace falta librería de zonas horarias).
+function _medianocheMx(fechaStr) {
+  return new Date(`${fechaStr}T06:00:00.000Z`);
+}
+
 // Filtro compartido por list()/listMine() para búsqueda de texto + rango de fecha
-// de creación — mismo criterio que listMovements() en bank.service.js (Bancos),
-// pero sin la complejidad de aggregation/_score: esta bandeja es mucho más chica
-// y un $or plano alcanza, no hace falta rankear resultados por relevancia.
+// de creación. Bug real 2026-08-05: este rango operaba sobre createdAt (timestamp
+// real de creación) con los mismos límites que listMovements() en bank.service.js
+// usa para BankMovement.fecha (fecha de calendario, sin hora real) — pero acá SÍ
+// importa la hora: "fechaFin T23:59:59.999Z" equivale a las 17:59:59 hora de
+// México, así que cualquier solicitud creada después de las 6pm hora de México en
+// el último día del rango quedaba excluida. Ahora ambos extremos se anclan a la
+// medianoche real de México (mismo criterio que _inicioDeHoy()).
 function _buildBusquedaFilter({ search, fechaInicio, fechaFin }) {
   const filter = {};
 
@@ -254,9 +283,12 @@ function _buildBusquedaFilter({ search, fechaInicio, fechaFin }) {
   // movimiento bancario — esta bandeja no tiene equivalente a "fecha" de Bancos.
   if (fechaInicio || fechaFin) {
     filter.createdAt = {};
-    if (fechaInicio) filter.createdAt.$gte = new Date(fechaInicio);
-    // Inclusive de todo el día — mismo criterio que fechaFin en bank.service.js.
-    if (fechaFin) filter.createdAt.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
+    if (fechaInicio) filter.createdAt.$gte = _medianocheMx(fechaInicio);
+    // $lt (exclusivo) la medianoche MX del día SIGUIENTE — cubre el día completo
+    // de fechaFin en hora de México, sin el corte anticipado de antes.
+    if (fechaFin) {
+      filter.createdAt.$lt = new Date(_medianocheMx(fechaFin).getTime() + 24 * 60 * 60 * 1000);
+    }
   }
 
   if (search) {
@@ -331,6 +363,7 @@ async function list(filters) {
       .limit(parseInt(limit))
       .select('-comprobante.data')
       .populate('bankMovementId', 'banco fecha concepto deposito retiro')
+      .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro')
       .lean(),
     CollectionRequest.countDocuments(filter),
   ]);
@@ -355,6 +388,7 @@ async function listMine(userId, filters) {
       .limit(parseInt(limit))
       .select('-comprobante.data')
       .populate('bankMovementId', 'banco fecha concepto deposito retiro')
+      .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro')
       .lean(),
     CollectionRequest.countDocuments(filter),
   ]);
@@ -421,6 +455,7 @@ async function getById(id) {
   const cr = await CollectionRequest.findById(id)
     .select('-comprobante.data')
     .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
+    .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
   return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: _tieneAlgunComprobante(cr) } };
@@ -437,10 +472,30 @@ async function getById(id) {
 // afectadas y con qué monto — antes había que adivinarlo cruzando con Kore.
 async function getByErpId(solicitudIdErp) {
   const cr = await CollectionRequest.findOne({ solicitudIdErp: String(solicitudIdErp).trim() })
-    .select('solicitudIdErp status motivoRechazo resueltoAt bankMovementId cxcs monto cobroAplicado cobroAplicadoAt')
+    .select('solicitudIdErp status motivoRechazo resueltoAt bankMovementId cxcs monto cobroAplicado cobroAplicadoAt formasPago')
     .populate('bankMovementId', 'folio fecha deposito')
+    .populate('formasPago.bankMovementId', 'folio fecha deposito')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
+
+  // multi-bank-movement: `bankMovement` (singular, arriba) se mantiene
+  // byte-idéntico por compatibilidad con Kore (= primer movimiento, campo
+  // deprecado en el modelo) — `bankMovements[]` es el agregado nuevo, uno por
+  // movimiento DISTINTO, con las formasPago que le tocaron a cada uno.
+  const bankMovements = [];
+  const entradaPorMovId = new Map();
+  for (const f of (cr.formasPago || [])) {
+    const mov = f.bankMovementId;
+    if (!mov) continue;
+    const key = String(mov._id);
+    let entrada = entradaPorMovId.get(key);
+    if (!entrada) {
+      entrada = { folio: mov.folio ?? null, fecha: mov.fecha ?? null, deposito: mov.deposito ?? null, formasPago: [] };
+      entradaPorMovId.set(key, entrada);
+      bankMovements.push(entrada);
+    }
+    entrada.formasPago.push({ formaPagoDescripcion: f.formaPagoDescripcion, importe: f.importe });
+  }
 
   return {
     solicitudIdErp:  cr.solicitudIdErp,
@@ -465,6 +520,7 @@ async function getByErpId(solicitudIdErp) {
       fecha:    cr.bankMovementId.fecha    ?? null,
       deposito: cr.bankMovementId.deposito ?? null,
     } : null,
+    bankMovements,
   };
 }
 
@@ -524,18 +580,29 @@ async function analyzeStoredComprobantes(id) {
   return resultados;
 }
 
-// Concilia la solicitud contra un BankMovement Y aplica el cobro real en Kore,
-// en un solo paso (todo o nada): si cualquier parte de la llamada a Kore falla,
-// no se guarda nada — ni el status, ni el bankMovementId, ni la referencia —
-// para no dejar la solicitud en un estado a medias. El usuario ve el error y
-// puede corregir (p.ej. pedirle al cajero que abra su caja) y reintentar.
+// Concilia la solicitud contra uno o varios BankMovement Y aplica el cobro real
+// en Kore, en un solo paso (todo o nada): si cualquier parte de la llamada a
+// Kore falla, no se guarda nada — ni el status, ni los bankMovementId, ni la
+// referencia — para no dejar la solicitud en un estado a medias. El usuario ve
+// el error y puede corregir (p.ej. pedirle al cajero que abra su caja) y
+// reintentar.
+//
+// multi-bank-movement (sdd/collection-request-multi-bank-movement): `body`
+// reemplaza al antiguo `bankMovementId` escalar — acepta { bankMovementId }
+// (atajo D3, expande a TODAS las formasPago, comportamiento byte-idéntico al de
+// antes de este cambio) o { asignaciones: [{ formaPagoDocId, bankMovementId }] }
+// (una asignación por forma de pago; clave = _id REAL del subdocumento, D2 —
+// nunca formaPagoId, que no es único dentro de formasPago[]).
+// resolverAsignaciones() aplica el guard todo-o-nada ANTES de tocar Kore/Mongo:
+// no existe identificación parcial (spec). Sigue habiendo EXACTAMENTE una
+// llamada a Kore (aplicarSolicitudOperacion) sin importar cuántos movimientos
+// distintos resulten — N=1 usa el mismo camino que N>1 (D5: "una sola rama, sin
+// bifurcación"), solo con 1 iteración del bucle de setErpIds.
 //
 // La sesión de caja se resuelve con el CAJERO que generó la solicitud
 // (cr.solicitanteUserId), NO con el usuario de cobranza/contabilidad que está
 // identificando — es el cajero quien tiene una caja abierta en Kore.
-async function identificar(id, bankMovementId, user) {
-  if (!bankMovementId) throw new BadRequestError('bankMovementId es requerido');
-
+async function identificar(id, body, user) {
   const cr = await CollectionRequest.findById(id);
   if (!cr) throw new NotFoundError('Solicitud');
   if (cr.status === 'identificada') throw new BadRequestError('La solicitud ya está identificada');
@@ -547,8 +614,30 @@ async function identificar(id, bankMovementId, user) {
     );
   }
 
-  const mov = await BankMovement.findOne({ _id: bankMovementId, uuidXML: null });
-  if (!mov) throw new NotFoundError('Movimiento bancario');
+  // Guard todo-o-nada (spec: "Todo-o-nada completeness gate") — ANTES de tocar
+  // Kore o Mongo (más allá del findById de arriba). resolverAsignaciones lanza
+  // BadRequestError si CUALQUIER formaPago queda sin bankMovementId asignado.
+  const asignacionesPorMovId = resolverAsignaciones(cr, body);
+  const movIds = [...asignacionesPorMovId.keys()];
+
+  // 1 sola query para TODOS los movimientos asignados (reemplaza el antiguo
+  // findOne de un solo bankMovementId) — spec: "el número de queries no escala".
+  const movs = await BankMovement.find({ _id: { $in: movIds }, uuidXML: null });
+  if (movs.length !== movIds.length) throw new NotFoundError('Movimiento bancario');
+  const movPorId = new Map(movs.map(m => [String(m._id), m]));
+  const movsOrdenados = movIds.map(movId => movPorId.get(movId));
+
+  // Mapa inverso formaPagoDocId -> movId, para resolver referencia/Aut/Numo/
+  // BancoID de CADA forma de pago con SU PROPIO movimiento asignado — antes de
+  // este cambio solo existía un `mov` global para toda la solicitud.
+  const movIdPorFormaPagoDocId = new Map();
+  for (const [movId, formasDelGrupo] of asignacionesPorMovId) {
+    for (const f of formasDelGrupo) movIdPorFormaPagoDocId.set(String(f._id), movId);
+  }
+
+  // Reconciliación de montos — advisory (spec: "NUNCA bloquea"). Se calcula
+  // aquí porque ya tenemos formasPago + movimientos, sin depender de Kore.
+  const reconciliacion = calcularReconciliacion(cr, movsOrdenados);
 
   // 1. Sesión de caja del cajero solicitante.
   let sesionId, koreToken;
@@ -603,9 +692,18 @@ async function identificar(id, bankMovementId, user) {
   }
 
   // 3. La referencia bancaria SIEMPRE la asigna Numo con el folio del
-  // movimiento identificado — nunca la que (no) haya mandado el ERP.
-  const referencia        = String(mov.folio ?? '');
-  const formasPagoConRef  = cr.formasPago.map(f => ({ ...f.toObject(), referencia }));
+  // movimiento identificado — nunca la que (no) haya mandado el ERP. Ahora
+  // CADA forma de pago usa el folio de SU PROPIO movimiento asignado (antes
+  // había un solo `mov` para toda la solicitud) y persiste su propio
+  // bankMovementId (D1/D2).
+  const formasPagoConRef = cr.formasPago.map(f => {
+    const movDeEstaForma = movPorId.get(movIdPorFormaPagoDocId.get(String(f._id)));
+    return {
+      ...f.toObject(),
+      referencia:     String(movDeEstaForma.folio ?? ''),
+      bankMovementId: movDeEstaForma._id,
+    };
+  });
 
   // 4. Avisar a Kore el estatus de revisión contable de la solicitud (endpoint
   // distinto al de aplicar el cobro) — con el token del usuario de cobranza/
@@ -638,11 +736,15 @@ async function identificar(id, bankMovementId, user) {
   // (panel manual): solo las formas de pago con claveSAT '03' (transferencia) lo
   // necesitan. Acá no hay un humano confirmando el banco en pantalla antes de
   // aplicar (a diferencia del panel manual), pero el usuario confirmó (2026-07-28)
-  // que igual quiere el mismo fallback: si `mov.banco` no matchea ningún banco del
-  // catálogo de Kore, se manda bancos[0] (el primero del catálogo) en vez de
-  // dejar el cobro sin BancoID. Todo o nada: si Kore rechaza cualquiera de los 2
-  // catálogos, no se aplica el cobro (mismo criterio que el resto de la función).
-  let bancoDefault = null;
+  // que igual quiere el mismo fallback: si el banco del movimiento no matchea
+  // ningún banco del catálogo de Kore, se manda bancos[0] (el primero del
+  // catálogo) en vez de dejar el cobro sin BancoID. Con varios movimientos, cada
+  // uno puede corresponder a un banco distinto (ej. transferencia BBVA + otra
+  // Santander) — el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los
+  // catálogos (formasPagoKore/bancosKore) se piden UNA sola vez, no por
+  // movimiento. Todo o nada: si Kore rechaza cualquiera de los 2 catálogos, no
+  // se aplica el cobro (mismo criterio que el resto de la función).
+  const bancoDefaultPorMovId = new Map();
   const formaPagoRequiereBanco = new Map();
   try {
     const formasPagoKore = await koreCaja.listarFormasPago(koreToken);
@@ -651,7 +753,9 @@ async function identificar(id, bankMovementId, user) {
     const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
     if (algunaFormaRequiereBanco) {
       const bancosKore = await koreCaja.listarBancos(koreToken);
-      bancoDefault = matchBancoDefault(bancosKore, mov.banco);
+      for (const movDelGrupo of movsOrdenados) {
+        bancoDefaultPorMovId.set(String(movDelGrupo._id), matchBancoDefault(bancosKore, movDelGrupo.banco));
+      }
     }
   } catch (err) {
     if (err instanceof koreCaja.KoreCajaError) {
@@ -685,14 +789,17 @@ async function identificar(id, bankMovementId, user) {
   // contra Kore más adelante — es una restricción nueva del lado de Kore, no
   // algo que Numo pueda evitar mientras la solicitud se siga aplicando.
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
+    const movId          = movIdPorFormaPagoDocId.get(String(f._id));
+    const movDeEstaForma = movPorId.get(movId);
+    const bancoDefault   = bancoDefaultPorMovId.get(movId) ?? null;
     const esTransferencia = formaPagoRequiereBanco.get(f.formaPagoId) === true;
     return {
       ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
       ...(esTransferencia ? {
         DatosAdicionales: [
-          { Nombre: 'Aut',  Valor: mov.folio || '' },
-          { Nombre: 'Numo', Valor: mov.numeroAutorizacion || '' },
+          { Nombre: 'Aut',  Valor: movDeEstaForma.folio || '' },
+          { Nombre: 'Numo', Valor: movDeEstaForma.numeroAutorizacion || '' },
         ],
       } : {}),
     };
@@ -712,40 +819,88 @@ async function identificar(id, bankMovementId, user) {
     throw err;
   }
 
-  // 7. Kore aceptó el cobro — vincular la(s) CxC al movimiento con el MISMO
-  // mecanismo que usa el panel de cobros (erpLinks/erpIds/identificadoPor/
-  // saldoErp/status vía aplicarLogicaErp), no un simple status a mano. Puede
-  // lanzar ConflictError si otro usuario ya tiene el movimiento tomado — se
-  // deja propagar tal cual (mismo comportamiento que el panel).
+  // 7. Kore YA ACEPTÓ el cobro (paso irreversible desde Numo, D4) — vincular
+  // CADA grupo de CxC/movimiento con el MISMO mecanismo que usa el panel de
+  // cobros (erpLinks/erpIds/identificadoPor/saldoErp/status vía
+  // aplicarLogicaErp), no un simple status a mano, y guardar la solicitud —
+  // TODO dentro de una sola transacción Mongo (conTransaccion, D5). Si
+  // cualquier escritura falla a mitad de camino (incluido un ConflictError
+  // porque otro usuario ya tiene un movimiento tomado — antes se dejaba
+  // propagar tal cual; ahora Kore YA aplicó el cobro, así que un reintento
+  // ciego lo duplicaría, ver catch más abajo), NO se reintenta: se marca
+  // inconsistenciaPostKore para revisión manual. Un solo grupo (N=1) usa
+  // exactamente el mismo camino, sin bifurcación (D5).
   //
-  // identificadoPor queda a nombre de quien AUTORIZA (el usuario de cobranza/
-  // contabilidad que ejecuta esta acción) — cambio de criterio 2026-07-29,
-  // revierte la decisión del 2026-07-07 que dejaba acá al cajero solicitante.
-  // `cr.resueltoPorUserId`/`resueltoPorNombre` (más abajo) ya guardaban a este
-  // mismo usuario desde el 07-07 — ahora esa misma identidad también queda en
-  // el BankMovement, consistente con el resto del sistema (cobro-panel deja
-  // en identificadoPor a quien aplica el cobro, no a un tercero).
-  const erpLinks = buildErpLinksParaCobro(cr, cuentasKore, mov.erpLinks);
-  await bankService.setErpIds(bankMovementId, erpLinks, user);
+  // identificadoPor (dentro de setErpIds) queda a nombre de quien AUTORIZA (el
+  // usuario de cobranza/contabilidad que ejecuta esta acción) — cambio de
+  // criterio 2026-07-29, revierte la decisión del 2026-07-07 que dejaba acá al
+  // cajero solicitante. `cr.resueltoPorUserId`/`resueltoPorNombre` (más abajo)
+  // ya guardaban a este mismo usuario desde el 07-07 — ahora esa misma
+  // identidad también queda en cada BankMovement.
+  //
+  // pagadoTotalCxc (D5, solo Modo 1): total pagado a la CxC ÚNICA por TODOS
+  // los grupos combinados de este cobro — sin esto, cada grupo vería solo su
+  // propia porción y dos links de un mismo cobro multi-movimiento quedarían
+  // con saldoActual distinto entre sí (bug documentado en el design: 2×50k en
+  // una CxC de 100k dejaría saldoActual=50k en AMBOS links en vez de 0).
+  const pagadoTotalCxc = cr.cxcs.length === 1 ? cr.monto : null;
+  const emisionesDiferidas = [];
+  try {
+    await conTransaccion(async (session) => {
+      for (const [movId, formasDelGrupo] of asignacionesPorMovId) {
+        const movDelGrupo = movPorId.get(movId);
+        const erpLinks = buildErpLinksParaCobro(cr, cuentasKore, movDelGrupo.erpLinks, {
+          formasPago: formasDelGrupo,
+          pagadoTotalCxc,
+        });
+        const updated = await bankService.setErpIds(movId, erpLinks, user, { session });
+        // setErpIds ya emite de inmediato cuando NO corre dentro de una sesión
+        // real (fallback standalone: cada write ya es definitivo al guardarse)
+        // — solo se diferencia el emit acá cuando SÍ hay sesión (replica set),
+        // para no anunciar un cambio que el commit todavía podría revertir.
+        if (session) emisionesDiferidas.push(updated);
+      }
 
-  // 8. Solo si todo lo anterior salió bien: persistir la solicitud.
-  cr.formasPago          = formasPagoConRef;
-  cr.bankMovementId      = bankMovementId;
-  cr.status              = 'identificada';
-  cr.resueltoPorUserId   = user._id;
-  cr.resueltoPorNombre   = user.nombre ?? null;
-  cr.resueltoAt          = new Date();
-  cr.cobroAplicado       = true;
-  cr.cobroAplicadoAt     = new Date();
-  cr.koreOperacionResult = koreResult;
-  await cr.save();
+      cr.formasPago          = formasPagoConRef;
+      cr.bankMovementId      = movsOrdenados[0]._id; // D1: raíz deprecada = primer movimiento asignado
+      cr.status              = 'identificada';
+      cr.resueltoPorUserId   = user._id;
+      cr.resueltoPorNombre   = user.nombre ?? null;
+      cr.resueltoAt          = new Date();
+      cr.cobroAplicado       = true;
+      cr.cobroAplicadoAt     = new Date();
+      cr.koreOperacionResult = koreResult;
+      await cr.save({ session });
+    });
+  } catch (err) {
+    // Marca de revisión manual (D4) — NUNCA reintentar: Kore ya aplicó el
+    // cobro y buildErpLinksParaCobro ACUMULA sobre saldos existentes, así que
+    // un reintento ciego lo duplicaría. updateOne SIN sesión a propósito: la
+    // transacción que falló ya abortó (o nunca corrió, en standalone), este
+    // write es independiente y debe llegar a disco sí o sí.
+    const mensaje = `Kore aceptó el cobro (solicitudIdErp=${cr.solicitudIdErp}) pero la escritura en Mongo falló/abortó: ${err.message}`;
+    await CollectionRequest.updateOne({ _id: cr._id }, {
+      inconsistenciaPostKore: { at: new Date(), mensaje, movimientosPendientes: movIds },
+    });
+    logger.error(`[collection-requests] INCONSISTENCIA-POST-KORE id=${id} solicitudIdErp=${cr.solicitudIdErp}: ${err.message}`);
+    throw new BadRequestError(
+      `Kore ya aplicó el cobro pero no se pudo guardar en Numo (${err.message}). ` +
+      'NO reintentar — la solicitud quedó marcada para revisión manual (inconsistenciaPostKore).',
+    );
+  }
+
+  // 8. Emitir los avisos de Bancos que quedaron DIFERIDOS (solo hay diferidos
+  // si hubo sesión real) — recién ahora, con el commit ya confirmado.
+  for (const updated of emisionesDiferidas) {
+    emitToBanco(updated.banco, 'bank:movement:updated', updated);
+  }
 
   // 9. Avisar en tiempo real a quien tenga la bandeja abierta (cobranza/contabilidad/
   // admin) y a la tienda que la solicitó — sin esto, cualquier otra sesión con la
   // vista abierta se queda con el estado viejo hasta que alguien recargue a mano.
-  emitToAll('collection-request:updated', _eventoActualizacion(cr, mov));
+  emitToAll('collection-request:updated', _eventoActualizacion(cr, movsOrdenados));
 
-  return _toSafeJSON(cr);
+  return { ..._toSafeJSON(cr), reconciliacion };
 }
 
 // Antes de tocar Mongo, se avisa a Kore el estatus de revisión contable
@@ -889,6 +1044,21 @@ function _formaPagoDetalle(formasPago) {
     .join('; ');
 }
 
+// multi-bank-movement (D7): 1 movimiento -> valor tal cual (numérico para
+// deposito/retiro, string para el resto — comportamiento SIN cambios); 2+ ->
+// valores concatenados con "; " (Excel ignora numFmt en celdas de texto —
+// aceptado, es la única forma de mantener 1 fila por solicitud con N
+// movimientos). `movs` ya viene deduplicado por movimientosDe().
+function _celdaMultiMovimiento(movs, valorDe) {
+  if (!movs || movs.length === 0) return '';
+  if (movs.length === 1) return valorDe(movs[0]) ?? '';
+  return movs
+    .map(m => valorDe(m))
+    .filter(v => v != null && v !== '')
+    .map(String)
+    .join('; ');
+}
+
 function _columnasReporte(rico) {
   const base = [
     { header: 'Folio de solicitud',     key: 'folio',            width: 16 },
@@ -930,15 +1100,19 @@ function _filaReporte(cr, rico) {
     motivoRechazo:   cr.motivoRechazo || '',
   };
   if (!rico) return fila;
+  // multi-bank-movement (D7): movimientosDe() ya trae los DISTINTOS movimientos
+  // (post-backfill vía formasPago[].bankMovementId, o el campo raíz deprecado
+  // como único fallback para documentos pre-backfill).
+  const movs = movimientosDe(cr);
   return {
     ...fila,
     solicito:             cr.solicitanteNombre || '',
-    banco:                cr.bankMovementId?.banco || '',
-    fechaDeposito:        _xlsxFormatFecha(cr.bankMovementId?.fecha),
-    concepto:             cr.bankMovementId?.concepto || '',
-    deposito:             cr.bankMovementId?.deposito ?? '',
-    retiro:               cr.bankMovementId?.retiro ?? '',
-    autorizacionBancaria: cr.bankMovementId?.numeroAutorizacion || '',
+    banco:                _celdaMultiMovimiento(movs, m => m?.banco),
+    fechaDeposito:        _celdaMultiMovimiento(movs, m => _xlsxFormatFecha(m?.fecha)),
+    concepto:             _celdaMultiMovimiento(movs, m => m?.concepto),
+    deposito:             _celdaMultiMovimiento(movs, m => m?.deposito),
+    retiro:               _celdaMultiMovimiento(movs, m => m?.retiro),
+    autorizacionBancaria: _celdaMultiMovimiento(movs, m => m?.numeroAutorizacion),
     resolvio:             cr.resueltoPorNombre || '',
     cobroAplicado:        cr.cobroAplicado ? 'Sí' : 'No',
     fechaCobroAplicado:   _xlsxFormatFecha(cr.cobroAplicadoAt),
@@ -991,6 +1165,7 @@ async function buildReport(filters) {
     .sort({ createdAt: 1 })
     .select('-comprobante.data')
     .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
+    .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .lean();
   return _generarExcelSolicitudes(data, { rico: true });
 }
@@ -1015,7 +1190,7 @@ async function buildReportMine(userId, filters) {
 module.exports = {
   analyzeReceipt, create, list, listMine, getById, getByErpId, getComprobante, analyzeStoredComprobantes,
   identificar, rechazar, cancelarPorErp, stats, statsMine, buildReport, buildReportMine,
-  // Re-expuesta para pruebas standalone (mismo patrón que erp.routes.js) — filtro puro,
-  // sin I/O, seguro de probar aislado.
-  _buildBusquedaFilter,
+  // Re-expuestas para pruebas standalone (mismo patrón que erp.routes.js) — funciones
+  // puras, sin I/O, seguras de probar aisladas.
+  _buildBusquedaFilter, _filaReporte,
 };

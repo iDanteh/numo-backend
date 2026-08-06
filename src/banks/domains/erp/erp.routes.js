@@ -43,7 +43,7 @@ const ERP_TOKEN         = process.env.ERP_TOKEN || '';
 // Parámetros: fechaDesde, fechaHasta, estadoCobro (opcional; 'pendiente' para solo pendientes), page
 // La paginación se aplica localmente sobre la respuesta completa del ERP.
 router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) => {
-  const { fechaDesde, fechaHasta, estadoCobro, page, serieExterna, folioExterno, nombrePersona } = req.query;
+  const { fechaDesde, fechaHasta, estadoCobro, page, serieExterna, folioExterno, nombrePersona, origen } = req.query;
   const pageNum = Math.max(1, parseInt(page ?? '1', 10));
 
   // sincronizarCuentasPendientes llama al ERP, upserta en el caché y devuelve los
@@ -51,7 +51,7 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
   let raw = [];
   try {
     ({ raw } = await sincronizarCuentasPendientes({
-      fechaDesde, fechaHasta, estadoCobro, serieExterna, folioExterno, nombrePersona,
+      fechaDesde, fechaHasta, estadoCobro, serieExterna, folioExterno, nombrePersona, origen,
     }));
   } catch (err) {
     if (err.message?.includes('ERP no configurado')) {
@@ -60,7 +60,7 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     throw err;
   }
 
-  const allCuentas = raw.map(c => ({
+  let allCuentas = raw.map(c => ({
     id:                   c.id,
     serie:                c.serie                ?? null,
     folio:                c.folio                ?? null,
@@ -76,7 +76,19 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
     nombrePersona:        c.nombrePersona        ?? null,
     nombreTipoMovimiento: c.nombreTipoMovimiento ?? null,
     personaId:            c.personaId            ?? null,
+    esAnticipo:           c.esAnticipo           ?? false,
+    origen:               c.origen               ?? null,
   }));
+
+  // El ERP a veces mezcla ventas normales dentro de origen=anticipo — se refuerza
+  // el filtro con el campo esAnticipo, que sí es confiable (pedido del usuario 2026-08-05).
+  // Además solo se muestran los que tienen saldo disponible REAL (> 0) — se excluyen
+  // tanto los ya aplicados por completo (saldo 0) como los de saldo negativo (2026-08-05,
+  // pedido explícito: un saldo negativo no es un anticipo disponible para usar).
+  // Epsilon en vez de > 0 exacto, por el ruido de punto flotante típico en montos.
+  if (origen === 'anticipo') {
+    allCuentas = allCuentas.filter(c => c.esAnticipo === true && c.saldoActual > 0.01);
+  }
 
   // Local pagination (filtering is now handled server-side by the ERP via serieExterna/folioExterno)
   const total        = allCuentas.length;

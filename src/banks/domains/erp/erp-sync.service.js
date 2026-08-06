@@ -17,6 +17,7 @@ async function sincronizarCuentasPendientes(params = {}) {
   if (params.serieExterna)  queryParams.serieExterna  = String(params.serieExterna).trim();
   if (params.folioExterno)  queryParams.folioExterno  = String(params.folioExterno).trim();
   if (params.nombrePersona) queryParams.nombrePersona = String(params.nombrePersona).trim();
+  if (params.origen)        queryParams.origen        = String(params.origen).trim();
 
   let response;
   try {

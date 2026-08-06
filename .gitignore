@@ -11,3 +11,5 @@ satcfdis-34fdcfae6d93.json
 .env
 logs/app.log
 logs/errors.log
+coverage/
+.atl/

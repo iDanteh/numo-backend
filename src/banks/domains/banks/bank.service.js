@@ -1795,15 +1795,12 @@ async function updateErpIds(id, action, erpId, user) {
   const cleanId = erpId.trim();
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
-  const idPorEntries = mov.identificadoPor ?? [];
-  if (
-    user?.role !== 'admin' &&
-    mov.status === 'identificado' &&
-    idPorEntries.length > 0 &&
-    !idPorEntries.some(e => e.userId === user?._id)
-  ) {
-    throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
-  }
+
+  // Decisión 2026-08-05: esta ruta ya exige 'banks:erp:unlink' vía permit() (ver
+  // bank.routes.js) — quien lo tiene puede desvincular CUALQUIER CxC del sistema, sin
+  // importar quién identificó el movimiento, mismo comportamiento que ya tenía admin.
+  // Antes había acá un candado adicional de "propio usuario" que dejaba sin efecto el
+  // permiso para cualquiera que no fuera admin.
 
   mov.erpIds          = (mov.erpIds          || []).filter(x => x !== cleanId);
   mov.erpLinks        = (mov.erpLinks        || []).filter(l => l.erpId !== cleanId);
@@ -1831,7 +1828,15 @@ async function updateErpIds(id, action, erpId, user) {
   return updated;
 }
 
-async function setErpIds(id, erpLinks, user) {
+// opts.session (multi-bank-movement, D5 — sdd/collection-request-multi-bank-movement):
+// cuando el caller (identificar(), N x setErpIds dentro de conTransaccion) pasa una
+// sesión Mongo real, el guardado NO es definitivo hasta que la transacción completa
+// haga commit — por eso el emitToBanco de este write se DIFIERE, el caller es
+// responsable de emitirlo él mismo tras el commit. Sin session (todos los demás
+// callers de hoy, ej. PUT /movements/:id/erp-ids), el guardado ya es definitivo
+// aquí mismo, así que se emite de inmediato — comportamiento sin cambios.
+async function setErpIds(id, erpLinks, user, opts = {}) {
+  const { session = null } = opts;
   if (!Array.isArray(erpLinks)) throw new BadRequestError('erpLinks debe ser un arreglo');
 
   const cleanLinks = erpLinks
@@ -1859,17 +1864,9 @@ async function setErpIds(id, erpLinks, user) {
     }))
     .filter(l => l.erpId);
 
-  const mov = await BankMovement.findById(id);
+  const movQuery = BankMovement.findById(id);
+  const mov = await (session ? movQuery.session(session) : movQuery);
   if (!mov) throw new NotFoundError('Movimiento');
-  const idPorSet = mov.identificadoPor ?? [];
-  if (
-    user?.role !== 'admin' &&
-    mov.status === 'identificado' &&
-    idPorSet.length > 0 &&
-    !idPorSet.some(e => e.userId === user?._id)
-  ) {
-    throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
-  }
 
   // Bug real 2026-07-30 (mismo hallazgo que el PATCH .../erp-ids de arriba): este endpoint
   // REEMPLAZA el arreglo completo de erpLinks, así que un solo PUT puede representar un alta
@@ -1883,6 +1880,25 @@ async function setErpIds(id, erpLinks, user) {
   const seAgregaAlgo = erpIdsNuevos.some(eid => !erpIdsAntes.includes(eid));
   const seQuitaAlgo = erpIdsAntes.some(eid => !erpIdsNuevos.includes(eid));
 
+  const idPorSet = mov.identificadoPor ?? [];
+  const puedeDesvincularCualquiera = user?.role === 'admin' ||
+    await rbacStore.hasPermission(user?.role, 'banks:erp:unlink', user?.extraPermissions);
+
+  // Decisión 2026-08-05: quien tiene 'banks:erp:unlink' puede desvincular CUALQUIER CxC,
+  // sin importar quién identificó el movimiento — mismo comportamiento que ya tenía admin.
+  // El candado de "propio usuario" sigue aplicando si el PUT también agrega una CxC nueva
+  // (seAgregaAlgo) o si quien lo pide no tiene ese permiso — vincular a un movimiento ajeno
+  // no cambió, sigue fuera de alcance de este permiso.
+  if (
+    user?.role !== 'admin' &&
+    mov.status === 'identificado' &&
+    idPorSet.length > 0 &&
+    !idPorSet.some(e => e.userId === user?._id) &&
+    (seAgregaAlgo || !puedeDesvincularCualquiera)
+  ) {
+    throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
+  }
+
   // Bug real 2026-07-31 (reproducido en vivo por el usuario con un cobranza real: POST
   // /cobros/operacion → 200 en Kore, PUT .../erp-ids → 403 inmediatamente después): el botón
   // "Aplicar Cobro" del modal ERP se muestra con SOLO 'banks:cobro'
@@ -1892,7 +1908,7 @@ async function setErpIds(id, erpLinks, user) {
   // (aplicarCobroOperacion(Multiple) no exige este permiso) pero el POST siguiente
   // (confirmErp() → este mismo endpoint) siempre devolvía 403 — 100% reproducible, no depende
   // de red ni de Kore. 'banks:cobro' ahora también habilita el alta, igual que ya prometía la
-  // UI; la baja sigue exigiendo 'banks:erp:unlink' sin cambios (restringido a admin).
+  // UI.
   if (seAgregaAlgo) {
     const puedeVincular =
       (await rbacStore.hasPermission(user?.role, 'banks:erp:link', user?.extraPermissions)) ||
@@ -1901,11 +1917,8 @@ async function setErpIds(id, erpLinks, user) {
       throw new ForbiddenError('No tienes permiso para vincular una CxC a este movimiento.');
     }
   }
-  if (seQuitaAlgo) {
-    const puedeDesvincular = await rbacStore.hasPermission(user?.role, 'banks:erp:unlink', user?.extraPermissions);
-    if (!puedeDesvincular) {
-      throw new ForbiddenError('No tienes permiso para desvincular una CxC ya asociada a este movimiento.');
-    }
+  if (seQuitaAlgo && !puedeDesvincularCualquiera) {
+    throw new ForbiddenError('No tienes permiso para desvincular una CxC ya asociada a este movimiento.');
   }
 
   mov.erpLinks = cleanLinks;
@@ -1933,14 +1946,16 @@ async function setErpIds(id, erpLinks, user) {
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
   mov.status   = status;
-  await mov.save();
+  await mov.save(session ? { session } : undefined);
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
     saldoErp: mov.saldoErp, uuidXML: mov.uuidXML, status: mov.status,
     identificadoPor: mov.identificadoPor,
   };
-  emitToBanco(mov.banco, 'bank:movement:updated', updated);
+  if (!session) {
+    emitToBanco(mov.banco, 'bank:movement:updated', updated);
+  }
 
   return updated;
 }
@@ -2513,11 +2528,18 @@ async function deleteFicha(id, user) {
 // ── Campos que el usuario puede editar manualmente ───────────────────────────
 const CAMPOS_EDITABLES = [
   'concepto', 'fecha', 'deposito', 'retiro', 'saldo',
-  'numeroAutorizacion', 'referenciaNumerica',
+  'numeroAutorizacion', 'referenciaNumerica', 'status',
 ];
 
-// Campos incluidos en el hash de deduplicación (banco no cambia en edición)
+// Campos incluidos en el hash de deduplicación (banco no cambia en edición) —
+// 'status' no forma parte de la identidad del movimiento para dedup, a propósito.
 const CAMPOS_QUE_AFECTAN_HASH = new Set(['fecha', 'saldo', 'deposito', 'retiro', 'concepto']);
+
+// 2026-08-05: 'status' se agregó a CAMPOS_EDITABLES (modal "Editar movimiento",
+// pedido explícito del usuario, alcance acotado a propósito) — sin la validación
+// más fina que ya tiene PATCH /movements/:id/status (updateStatus(), candados de
+// cuadre ERP/bloqueo por otro usuario/transiciones), solo se valida que el valor
+// pertenezca al enum real del modelo (reusa STATUS_VALIDOS, línea 24).
 
 async function updateMovement(id, data, user) {
   const mov = await BankMovement.findById(id);
@@ -2532,6 +2554,10 @@ async function updateMovement(id, data, user) {
     !idPorEntries.some(e => e.userId === user?._id)
   ) {
     throw new ConflictError('Movimiento bloqueado: fue identificado por otro usuario');
+  }
+
+  if ('status' in data && data.status != null && !STATUS_VALIDOS.includes(data.status)) {
+    throw new BadRequestError(`status inválido: ${data.status}`);
   }
 
   // Los montos no son editables si hay CxC vinculadas (protege la conciliación)

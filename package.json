@@ -32,12 +32,14 @@
     "fix:clt:ef": "node src/banks/scripts/fix-clt-efectivo.js",
     "fix:clt:ef:dry": "node src/banks/scripts/fix-clt-efectivo.js --dry-run",
     "revert:clt:ef": "node src/banks/scripts/fix-clt-efectivo.js",
-    "diag:tipo-p": "node src/banks/scripts/diag-tipo-p-monedero.js"
+    "diag:tipo-p": "node src/banks/scripts/diag-tipo-p-monedero.js",
+    "backfill:fp-movimiento": "node src/banks/scripts/backfill-formaspago-bankmovementid.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
     "axios": "^1.6.0",
     "bcryptjs": "^2.4.3",
+    "canvas": "^3.2.3",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

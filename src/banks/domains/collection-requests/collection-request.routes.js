@@ -171,13 +171,18 @@ router.get('/:id/analyze-comprobante', authenticate, permit('collections:read'),
   res.json(await service.analyzeStoredComprobantes(req.params.id));
 }));
 
-// PATCH /api/collection-requests/:id/identificar — vincula la solicitud a un
-// movimiento bancario encontrado manualmente.
+// PATCH /api/collection-requests/:id/identificar — vincula la solicitud a uno o
+// varios movimientos bancarios encontrados manualmente. Body: { bankMovementId }
+// (atajo escalar, expande a todas las formasPago) o { asignaciones: [{
+// formaPagoDocId, bankMovementId }] } (una asignación por forma de pago,
+// multi-bank-movement — ver design/sdd/collection-request-multi-bank-movement).
+// Se pasa el body COMPLETO — resolverAsignaciones() en el service decide cuál
+// forma aplica.
 router.patch('/:id/identificar',
   authenticate,
   permit('collections:write'),
   asyncHandler(async (req, res) => {
-    res.json(await service.identificar(req.params.id, req.body.bankMovementId, req.user));
+    res.json(await service.identificar(req.params.id, req.body, req.user));
   }),
 );
 

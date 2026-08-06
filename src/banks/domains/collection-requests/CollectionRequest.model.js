@@ -81,6 +81,21 @@ const collectionRequestSchema = new mongoose.Schema({
         }],
         default: [],
       },
+      // Movimiento bancario asignado a ESTA forma de pago específica (multi-
+      // bank-movement, D2). Clave de asignación = el _id del subdocumento
+      // (formaPagoDocId), no formaPagoId — este último NO es único dentro de
+      // formasPago[] (dos entradas "transferencia" son legales en Modo 1) y
+      // resolverAsignaciones() dependería de una clave ambigua. Antes del
+      // backfill (ver banks/scripts/backfill-formaspago-bankmovementid.js)
+      // queda null para documentos históricos — movimientosDe() en
+      // collection-request-asignaciones.js es el ÚNICO punto que hace fallback
+      // al campo raíz bankMovementId (deprecado, ver abajo) en ese caso.
+      bankMovementId: {
+        type:    mongoose.Schema.Types.ObjectId,
+        ref:     'BankMovement',
+        default: null,
+        index:   true,
+      },
     }],
     default: [],
     validate: {
@@ -137,11 +152,39 @@ const collectionRequestSchema = new mongoose.Schema({
   solicitanteNombre: { type: String, trim: true, default: null },
 
   // ── Movimiento bancario vinculado (al identificar la solicitud) ──────────────
+  // @deprecated — multi-bank-movement (D1): la fuente de verdad ahora es
+  // formasPago[].bankMovementId. Se mantiene y se SIGUE escribiendo (= el
+  // primer movimiento asignado) porque bank.service.js:736-751 y los scripts
+  // de backfill de folioFiscal todavía lo consultan, y el índice
+  // bankMovementId:1 ya existente depende de él. No leer este campo en código
+  // nuevo — usar movimientosDe(cr) (collection-request-asignaciones.js), que
+  // hace el fallback a este campo en el único lugar donde corresponde
+  // (documentos previos al backfill).
   bankMovementId: {
     type:    mongoose.Schema.Types.ObjectId,
     ref:     'BankMovement',
     default: null,
     index:   true,
+  },
+
+  // ── Inconsistencia post-Kore (multi-bank-movement, D4) ───────────────────────
+  // Kore ya aceptó aplicarSolicitudOperacion (paso irreversible desde Numo)
+  // pero el commit de Mongo (conTransaccion: N x setErpIds + cr.save) falló o
+  // abortó. Marca la solicitud para revisión manual — NO reintentar el cobro
+  // automáticamente (buildErpLinksParaCobro acumula sobre saldos existentes,
+  // así que un reintento ciego duplicaría el saldoPagado). Queda null en el
+  // camino feliz (inmensa mayoría de los casos).
+  inconsistenciaPostKore: {
+    type: {
+      at:      { type: Date,   default: null },
+      mensaje: { type: String, default: null },
+      // Grupos (movimientos) cuyo setErpIds/cr.save nunca llegó a comitear.
+      movimientosPendientes: {
+        type:    [{ type: mongoose.Schema.Types.ObjectId, ref: 'BankMovement' }],
+        default: [],
+      },
+    },
+    default: null,
   },
 
   // ── Estado ────────────────────────────────────────────────────────────────────

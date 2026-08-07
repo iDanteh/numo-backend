@@ -21,6 +21,7 @@ const { emitToUser } = require('../../shared/socket');
 // bank.service.js, NUNCA bank.routes.js, así que esta ruta sí puede requerir erp.routes.
 const erpRoutes = require('../erp/erp.routes');
 const { logger } = require('../../shared/utils/logger');
+const CFDI = require('../../../visor/models/CFDI');
 
 const router = express.Router();
 
@@ -211,6 +212,42 @@ router.delete('/movements/:id/ficha',
   permit('banks:ficha'),
   asyncHandler(async (req, res) => {
     res.json(await service.deleteFicha(req.params.id, req.user));
+  }),
+);
+
+// GET /api/banks/cfdis/buscar — busca CFDIs por serie/folio, SOLO source='ERP'
+// (colección `cfdis`, modelo del dominio visor — cross-domain, mismo patrón ya
+// usado por cfdi-poliza-generator.service.js). Usada por el input nuevo de la
+// sección de ficha del modal ERP (2026-08-07, permiso propio banks:cfdi:read,
+// sin asignar a ningún rol todavía). Match exacto case-insensitive: son
+// identificadores precisos, no texto libre — ninguno de los 2 params es
+// obligatorio por sí solo, pero al menos uno debe venir para no traer la
+// colección entera.
+router.get('/cfdis/buscar',
+  authenticate,
+  permit(PERMISSIONS.BANKS_CFDI_READ),
+  asyncHandler(async (req, res) => {
+    const serie = (req.query.serie ?? '').toString().trim();
+    const folio = (req.query.folio ?? '').toString().trim();
+    if (!serie && !folio) return res.json([]);
+
+    const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const filter = { source: 'ERP' };
+    if (serie) filter.serie = new RegExp(`^${escapeRegex(serie)}$`, 'i');
+    if (folio) filter.folio = new RegExp(`^${escapeRegex(folio)}$`, 'i');
+
+    // maxTimeMS: la colección `cfdis` no tiene un índice que respalde bien este regex
+    // case-insensitive (el único índice con serie de líder no sirve para eso) — sin este
+    // límite, una búsqueda lenta podría retener una conexión del pool compartido de Mongo
+    // (usado por todo el backend) hasta el timeout de socket de 5 minutos.
+    const resultados = await CFDI.find(filter)
+      .select('uuid serie folio fecha total')
+      .sort({ fecha: -1 })
+      .limit(20)
+      .maxTimeMS(5000)
+      .lean();
+
+    res.json(resultados);
   }),
 );
 

@@ -104,6 +104,19 @@ const PERMISSIONS = Object.freeze({
   // Desvincular una CxC ya asociada a un movimiento bancario.
   // Restringido a admin — ningún otro rol puede eliminar una vinculación existente.
   BANKS_ERP_UNLINK:    'banks:erp:unlink',
+
+  // Ver/buscar CxC pendientes del ERP desde el modal "Vincular CxC del ERP"
+  // (GET /erp/cuentas-pendientes). Sin este permiso, ningún dato del ERP
+  // (montos, folios, clientes) debe ser visible.
+  BANKS_ERP_READ:       'banks:erp:read',
+
+  // Usar el switch "Solo anticipos" del modal ERP (filtra por origen=anticipo).
+  BANKS_ERP_ANTICIPOS:  'banks:erp:anticipos',
+
+  // Buscar CFDIs (colección cfdis, solo source='ERP') por serie-folio desde el
+  // modal ERP. Permiso nuevo, sin asignar a ningún rol todavía — decisión
+  // pendiente del usuario, admin lo tiene por el wildcard '*'.
+  BANKS_CFDI_READ:      'banks:cfdi:read',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────
@@ -116,6 +129,9 @@ const ROLES = Object.freeze({
 
   contabilidad: {
     label: 'Contabilidad',
+    // Nota: seed.js NO sincroniza permisos nuevos a roles que ya existen en Postgres —
+    // tras desplegar BANKS_ERP_READ/BANKS_ERP_ANTICIPOS hay que asignarlos a mano vía
+    // /users → Roles, o este rol queda con 403 en /erp/cuentas-pendientes.
     permissions: [
       PERMISSIONS.BANKS_READ,
       PERMISSIONS.BANKS_IMPORT,
@@ -128,6 +144,8 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_EXPORT,
       PERMISSIONS.BANKS_EXPORT_ALL,
       PERMISSIONS.BANKS_ERP_LINK,
+      PERMISSIONS.BANKS_ERP_READ,
+      PERMISSIONS.BANKS_ERP_ANTICIPOS,
       PERMISSIONS.ACCOUNT_PLAN_READ,
       PERMISSIONS.ACCOUNT_PLAN_WRITE,
       PERMISSIONS.POLIZAS_READ,
@@ -148,6 +166,9 @@ const ROLES = Object.freeze({
   cobranza: {
     label: 'Cobranza',
     movementScope: MOVEMENT_SCOPE.OWN, // cambia a ALL para ver todos los identificados
+    // Nota: seed.js NO sincroniza permisos nuevos a roles que ya existen en Postgres —
+    // tras desplegar BANKS_ERP_READ/BANKS_ERP_ANTICIPOS hay que asignarlos a mano vía
+    // /users → Roles, o este rol queda con 403 en /erp/cuentas-pendientes.
     permissions: [
       PERMISSIONS.BANKS_READ,
       PERMISSIONS.BANKS_UPDATE,        // puede cambiar estado de movimientos
@@ -155,6 +176,8 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_FICHA,         // puede identificar movimientos a partir de una ficha
       // PERMISSIONS.BANKS_COBRO,         // aplica cobros desde el modal ERP (genera recibo en Kore)
       PERMISSIONS.BANKS_ERP_LINK,
+      PERMISSIONS.BANKS_ERP_READ,
+      PERMISSIONS.BANKS_ERP_ANTICIPOS,
       PERMISSIONS.COLLECTIONS_READ,
       PERMISSIONS.COLLECTIONS_WRITE,
     ],

@@ -4,6 +4,58 @@ const { CfdiMappingRule, AccountPlan, PolizaMovimiento, Poliza } = require('../.
 const { Op, fn, col, literal } = require('sequelize');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 
+// tipoOrigen para las porciones de Saldo a Favor/Puntos DENTRO del split de
+// una factura NORMAL — deliberadamente DISTINTO de 'Cobro Sucursal' (el que
+// usa el mecanismo de cruces reales entre sucursales, cobros-sucursal-puente
+// .service.js): `_uuidsConCargoCubiertoEnBD` (cfdi-poliza-generator.service.js)
+// consulta PolizaMovimiento por `tipoOrigen: 'Cobro Sucursal'` para saber
+// qué facturas ya tienen su Cargo cubierto por un cruce real — si estas
+// líneas (que NO son un cruce, son solo una forma de pago del split normal)
+// compartieran ese mismo valor, una regeneración futura las confundiría con
+// un cruce real y omitiría el Cargo de Efectivo/Tarjeta de la MISMA factura
+// por error. `_extraerCobrosSucursal` (poliza.service.js) sí las reconoce
+// para el mismo tratamiento de display (individual, nunca consolidado, sin
+// prefijo en la columna C) — mismo patrón que TIPO_ORIGEN_PENDIENTE_PROPIO
+// en cobros-sucursal-puente.service.js.
+const TIPO_ORIGEN_CARGO_ESPECIAL = 'Cargo Especial';
+
+// Caja/Bancos "por identificar" — mismos códigos que
+// cfdi-poliza-generator.service.js/cobros-sucursal-puente.service.js
+// (duplicado a propósito, archivos pequeños, independientes). Son las ÚNICAS
+// cuentas cuya selección depende realmente de `formaPago` — ver
+// `esCasoNormalParaSplit` en `cfdiToMovimientos`.
+const CODIGO_CUENTA_CAJA   = '1101010003';
+const CODIGO_CUENTA_BANCOS = '1102011005';
+// Saldo a Favor / monedero Club Tuberos — mismos códigos y mismo split 16%
+// (subtotal + IVA) que ya usa cobros-sucursal-puente.service.js. Necesarios
+// aquí porque el desglose REAL de cajas puede traer estas formas de pago
+// también en facturas normales (no solo en cobros cruzados de sucursal) —
+// confirmado con datos reales 2026-08-06: "SALDO A FAVOR" usa claveSat='30'
+// (cuenta propia, no colisiona) pero "PUNTOS" reutiliza claveSat='01', el
+// MISMO que Efectivo — sin distinguir por `nombre`, un pago con monedero
+// Club Tuberos se clasificaría como Efectivo real (a Caja), y un Saldo a
+// Favor (claveSat='30', no reconocido) caería al bucket genérico de Bancos
+// sin ninguna etiqueta válida (visible en el export como "Depósitos
+// consolidados" sin sufijo Efectivo/Tarjeta).
+const CODIGO_CUENTA_SALDO_FAVOR     = '2103090001';
+const CODIGO_CUENTA_CLUB_TUBEROS    = '2103090002';
+const CODIGO_CUENTA_IVA_SALDO_FAVOR = '2104010002';
+const TASA_IVA_SALDO_FAVOR = 0.16;
+// NOTA (2026-08-06, corrección del mismo día): las funciones `_esSaldoAFavorReal`/
+// `_esPuntosReal` que escaneaban `formasPago` de /desgloses-cobro/almacen para
+// detectar SF/Puntos DENTRO del desglose de Efectivo/Tarjeta quedaron
+// eliminadas — confirmado con datos reales del usuario que ese desglose casi
+// nunca trae el pago principal junto con el ajuste de SF/Puntos (solo trae
+// eventos de series ABO/CBT/CPF/CFC, ver SERIES_CON_AUTH), así que "encontrar
+// una sola formaPago ahí" NO significa "eso es el 100% de la factura" — mi
+// split proporcional anterior asumía eso y atribuía el CARGO COMPLETO a SF/
+// Puntos cuando solo era una fracción (caso real: factura de $1,023.63 con
+// $87.79 de Puntos redimidos, terminaba con $1,023.63 completos en la cuenta
+// de Puntos). Ahora SF y Puntos llegan ya resueltos y CONFIABLES vía
+// `context.saldoFavorUsadoPropio`/`context.montoPuntosUsado`
+// (`_prefetchSaldoFavorUsadoPropio`/`_prefetchDesglosePagoReal` en
+// cfdi-poliza-generator.service.js) — ver `esCasoAjusteSFPuntos` más abajo.
+
 // ── CRUD de reglas ────────────────────────────────────────────────────────────
 
 async function list() {
@@ -648,18 +700,161 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     }
   }
 
-  movs.push({
-    cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
-    concepto,
-    centroCosto,
-    ventaFecha,
-    serie:       serieCfdi,
-    debe:        montoCargo,
-    haber:       0,
-    cfdiUuid:    cfdi.uuid,
-    rfcTercero,
-    ...(esAplicacionSaldo && !rule.cuentaCargo2 ? { _saldoUsado: montoCargo } : {}),
-  });
+  // Split del cargo por forma de pago REAL (2026-08-06): el `formaPago` que
+  // declara el CFDI ante el SAT con frecuencia viene mal/genérico — el
+  // desglose real de cobro en cajas (`context.desglosePagoReal`, ver
+  // `_prefetchDesglosePagoReal` en cfdi-poliza-generator.service.js) es la
+  // fuente confiable. Solo aplica cuando la cuenta que ya seleccionó la
+  // regla es una de las genéricas "por identificar" (Caja/Bancos) — las
+  // ÚNICAS cuya selección depende realmente de `formaPago`; cualquier otra
+  // cuenta (Devoluciones, Anticipos, un banco real ya específico, etc.) no
+  // se toca. Alcance de esta primera versión (confirmado con el usuario):
+  // SOLO tipo I, SOLO el caso normal — `esAnticipo`/`esAplicacionSaldo`/
+  // `tasaIva==='mixto'` ya tocan el cargo por su cuenta y colisionarían con
+  // un split aquí (esos mecanismos usan `movs.find(...)` para localizar "la"
+  // línea de cargo, asumiendo que hay una sola — ver `_esCargoPrincipal` más
+  // abajo, que le da al caller una señal explícita en vez de esa
+  // reconstrucción frágil).
+  const gateBase = !esAnticipo && !esAplicacionSaldo && rule.tasaIva !== 'mixto'
+    && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo);
+
+  // Ajuste por Saldo a Favor/Puntos REALMENTE usados en esta factura —
+  // corrección del mismo día (2026-08-06): ya NO se detectan escaneando
+  // `formasPago` de /desgloses-cobro/almacen (ver nota junto a las
+  // constantes, arriba). `montoSFUsado` viene de `/saldos-favor`
+  // (`saldosFavorUsados[].montoUsado`, autoritativo) y `montoPuntosUsado` de
+  // los `cobros[]` con `serieOrigen: 'CBT'` de /desgloses-cobro/almacen
+  // (ambos ya resueltos por el generator antes de llamar esta función — ver
+  // `_prefetchSaldoFavorUsadoPropio`/`_prefetchDesglosePagoReal` en
+  // cfdi-poliza-generator.service.js).
+  const montoSFUsado     = Number(context.saldoFavorUsadoPropio?.monto) || 0;
+  const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
+  const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
+    && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_CLUB_TUBEROS];
+
+  // Suma de las formasPago reales encontradas — calculada ANTES del gate
+  // porque el gate mismo la necesita (ver comentario abajo).
+  const totalFormasPagoReal = Array.isArray(context.desglosePagoReal)
+    ? context.desglosePagoReal.reduce((s, fp) => s + (Number(fp.monto) || 0), 0)
+    : 0;
+  const esCasoNormalParaSplit = !esCasoAjusteSFPuntos && gateBase
+    && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
+    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS]
+    // Verificación de suma (2026-08-07): el desglose real de cajas puede
+    // venir PARCIAL — confirmado con el usuario, caso real donde un cobro
+    // CBT de $87.79 (Puntos) era el ÚNICO encontrado para una factura de
+    // $1,023.63, y el split proporcional le atribuía el Cargo COMPLETO a
+    // Puntos. Si la suma de lo encontrado no coincide con el Cargo real de
+    // ESTA factura, no es información confiable para partirlo — se cae al
+    // comportamiento de una sola línea (ver `else` más abajo), igual que si
+    // no hubiera desglose en absoluto.
+    && Math.abs(totalFormasPagoReal - montoCargo) < 0.02;
+
+  if (esCasoAjusteSFPuntos) {
+    let restante = montoCargo;
+    // Saldo a Favor: individual por cliente/factura (confirmado con el
+    // usuario 2026-08-06) — mismo patrón que un cruce real de sucursal, pero
+    // con `tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL` (distinto a propósito, ver
+    // comentario en la constante) para no confundirse con
+    // `_uuidsConCargoCubiertoEnBD`.
+    if (montoSFUsado > 0) {
+      const monto = Math.min(montoSFUsado, restante);
+      const subtotal = Math.round((monto / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+      const iva = Math.round((monto - subtotal) * 100) / 100;
+      const conceptoCliente = [cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO', serieCfdi].filter(Boolean).join(' / ');
+      const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', _esCargoPrincipal: true };
+      movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
+      movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
+      restante = parseFloat((restante - monto).toFixed(2));
+    }
+    // Puntos/Club Tuberos: a diferencia de SF, va CONSOLIDADO en una sola
+    // línea genérica por sucursal/día ("CLIENTE DE MOSTRADOR SUC. X"), no
+    // individual (confirmado con el usuario 2026-08-06 — revirtió la
+    // decisión anterior sobre Puntos, Saldo a Favor sigue individual). Esta
+    // función no arma esa línea consolidada (no tiene visibilidad del resto
+    // del batch) — solo marca `_puntosUsado` en la línea de remanente para
+    // que el generator la acumule y agregue una sola vez al final del batch
+    // (ver `puntosAcumulados` en cfdi-poliza-generator.service.js).
+    const montoPuntosAplicado = Math.min(montoPuntosUsado, restante);
+    if (montoPuntosAplicado > 0) {
+      restante = parseFloat((restante - montoPuntosAplicado).toFixed(2));
+    }
+    // Remanente: lo que sigue en Caja/Bancos (la cuenta que ya eligió la
+    // regla) sin partir más — el desglose de cajas no es confiable para
+    // partir Efectivo/Tarjeta cuando además hubo SF/Puntos en la misma
+    // consulta (ver nota junto a las constantes). Se empuja SIEMPRE, aunque
+    // sea $0 (factura pagada 100% con SF/Puntos) para que el marcador
+    // `_puntosUsado` tenga dónde ir — no rompe el cuadre, el otro lado de esa
+    // porción ya quedó representado arriba (SF) o en la línea consolidada que
+    // arma el generator (Puntos).
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      concepto, centroCosto, ventaFecha, serie: serieCfdi,
+      debe:        restante,
+      haber:       0,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+      _esCargoPrincipal: true,
+      ...(montoPuntosAplicado > 0 ? { _puntosUsado: montoPuntosAplicado } : {}),
+    });
+  } else if (esCasoNormalParaSplit) {
+    const formasPagoReal  = context.desglosePagoReal;
+    const totalFormasPago = totalFormasPagoReal;
+    let acumulado = 0;
+    formasPagoReal.forEach((fp, idx) => {
+      const esUltimo = idx === formasPagoReal.length - 1;
+      const share = totalFormasPago > 0 ? (Number(fp.monto) || 0) / totalFormasPago : 1 / formasPagoReal.length;
+      // El último absorbe el residuo de redondeo (mismo patrón que
+      // cobros-sucursal-puente.service.js) — el monto real ancla en
+      // `montoCargo` (el total de ESTA factura), nunca en `fp.monto`
+      // directo: puede venir sin prorratear cuando un mismo pago del ERP
+      // cubre varias facturas a la vez.
+      const montoLinea = esUltimo
+        ? parseFloat((montoCargo - acumulado).toFixed(2))
+        : parseFloat((montoCargo * share).toFixed(2));
+      acumulado += montoLinea;
+      if (montoLinea <= 0) return;
+
+      const esEfectivo = (fp.claveSat ?? '').trim() === '01';
+      movs.push({
+        cuentaId:    esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS],
+        concepto,
+        centroCosto,
+        ventaFecha,
+        serie:       serieCfdi,
+        debe:        montoLinea,
+        haber:       0,
+        cfdiUuid:    cfdi.uuid,
+        rfcTercero,
+        _esCargoPrincipal: true,
+        // El `formaPago` que se persiste (satMeta, al final de esta función)
+        // por defecto es el que declara el CFDI — para una línea partida por
+        // el desglose real, ESA línea concreta debe llevar el claveSat REAL
+        // (fp.claveSat), no el del CFDI, o el export (`consolidarCargos` en
+        // poliza.service.js, que agrupa "Depósitos consolidados (Efectivo/
+        // Tarjeta)" por `LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago]`) etiqueta
+        // TODAS las líneas de esta factura igual que el CFDI original, sin
+        // importar a qué cuenta fue cada una — resultando en "Efectivo"
+        // apareciendo también en la cuenta de Bancos y viceversa (confirmado
+        // con el usuario 2026-08-06, caso real VENTAS SUC.HIDALGO).
+        _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+      });
+    });
+  } else {
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      concepto,
+      centroCosto,
+      ventaFecha,
+      serie:       serieCfdi,
+      debe:        montoCargo,
+      haber:       0,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+      _esCargoPrincipal: true,
+      ...(esAplicacionSaldo && !rule.cuentaCargo2 ? { _saldoUsado: montoCargo } : {}),
+    });
+  }
 
   // IVA en facturas (tipo I y E)
   // PPD → cuenta "por cobrar/por pagar" (cuentaIvaPPD); PUE → cuenta final (cuentaIva)
@@ -990,7 +1185,25 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     tipoOrigen:      cfdi.tipoOrigen ?? _derivarTipoOrigen(cfdi) ?? null,
   };
 
-  return movs.map(m => ({ ...m, ...satMeta }));
+  // `_formaPagoReal` (ver split del cargo más arriba): si esta línea puntual
+  // fue partida por el desglose real de cobro, su `formaPago` correcto es el
+  // claveSat REAL de esa porción, no el que declara el CFDI completo — debe
+  // sobrevivir al spread de `satMeta` (que de otro modo lo pisaría con el
+  // mismo valor para TODAS las líneas de la factura, rompiendo el bucket
+  // Efectivo/Tarjeta del export — ver comentario en el split).
+  //
+  // Mismo problema con las líneas de Saldo a Favor/Puntos (`tipoOrigen:
+  // TIPO_ORIGEN_CARGO_ESPECIAL`, ver arriba): `satMeta.tipoOrigen`/
+  // `satMeta.reglaNombre` son del CFDI/regla completos y pisarían el
+  // tipoOrigen especial que las saca del pipeline normal de consolidación,
+  // dejándolas otra vez como 'Venta' — deben sobrevivir igual que
+  // `_formaPagoReal`.
+  return movs.map(m => ({
+    ...m,
+    ...satMeta,
+    ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
+    ...(m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre } : {}),
+  }));
 }
 
 /**

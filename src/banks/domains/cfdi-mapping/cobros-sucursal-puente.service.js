@@ -104,6 +104,17 @@ function _esSaldoAFavor(fp) {
   return /saldo\s*a\s*favor/i.test(fp?.nombre ?? '');
 }
 
+// "PUNTOS" = monedero electrónico Club Tuberos aplicado como forma de pago —
+// mismo principio que Saldo a Favor (reduce un pasivo existente, no es
+// dinero nuevo), pero cuenta distinta (2103090002, Anticipos Otros Club
+// Tuberos) — confirmado con el usuario 2026-08-06. Cajas reutiliza
+// claveSat="01" (Efectivo) para este tipo, así que SOLO el texto de `nombre`
+// distingue el caso — sin este check, "PUNTOS" se clasificaría como Efectivo
+// normal.
+function _esPuntos(fp) {
+  return /puntos/i.test(fp?.nombre ?? '');
+}
+
 // c_FormaPago SAT — Cheque y Tarjeta, para el orden fijo de abajo (Efectivo
 // ya tiene su propia constante arriba). Mismos códigos que
 // FORMA_PAGO_CHEQUE/LABEL_FORMA_PAGO_CONSOLIDADO en poliza.service.js
@@ -120,6 +131,7 @@ function _ordenFormaPago(fp) {
   if ((fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO) return 0;
   if ((fp.claveSat ?? '').trim() === '03') return 1;
   if (_esSaldoAFavor(fp)) return 2;
+  if (_esPuntos(fp)) return 2.5;
   if ((fp.claveSat ?? '').trim() === CLAVE_SAT_CHEQUE) return 3;
   if (CLAVES_SAT_TARJETA.includes((fp.claveSat ?? '').trim())) return 4;
   return 5;
@@ -132,8 +144,9 @@ function _ordenarFormasPago(formasPago) {
 // los casos reales vistos hasta ahora son tasa 16%.
 const TASA_IVA_SALDO_FAVOR = 0.16;
 
-// Mismo texto que ETIQUETA_COBRO_SUCURSAL en poliza.service.js (columna C).
-const ETIQUETA_COBRO_SUCURSAL = 'Cobro de otra sucursal';
+// Mismo texto que ETIQUETA_COBRO_SUCURSAL en poliza.service.js (columna C) —
+// formato "COS-FORMADEPAGO" (confirmado con el usuario 2026-08-07).
+const ETIQUETA_COBRO_SUCURSAL = 'COS';
 // Columna C para líneas de saldo a favor — literal "SF", sin el prefijo
 // "Cobro de otra sucursal -" (confirmado con el usuario 2026-08-03).
 const ETIQUETA_SALDO_FAVOR = 'SF';
@@ -145,6 +158,19 @@ const ETIQUETA_SALDO_FAVOR = 'SF';
 // cfdi-poliza-generator.service.js) ya viene calculada desde fuera; aquí solo
 // se aplica al lado de "uso" de cada par.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
+// Columna C para líneas de monedero Club Tuberos ("PUNTOS") — literal "PAGO",
+// sin el prefijo "Cobro de otra sucursal -", mismo criterio que SF
+// (confirmado con el usuario 2026-08-06).
+const ETIQUETA_PUNTOS = 'PAGO';
+// tipoOrigen distinto de 'Cobro Sucursal' para los tickets sin factura de la
+// PROPIA sucursal (sin cruce real) — necesario para que la columna C en el
+// export NO lleve el prefijo "Cobro de otra sucursal -" (ver
+// `_extraerCobrosSucursal` en poliza.service.js, que trata ambos tipoOrigen
+// pero solo agrega el prefijo a 'Cobro Sucursal'). Confirmado con el usuario
+// 2026-08-06: antes estos tickets se saltaban por completo (mismo almacén,
+// no es cruzado) — ahora también generan su asiento (Cargo flotante sin
+// contrapartida, se resuelve al facturar), solo que sin cruce de sucursal.
+const TIPO_ORIGEN_PENDIENTE_PROPIO = 'Pendiente Propio';
 
 /**
  * Extrae TODOS los documentos relacionados (serie/folio interno) de un CFDI —
@@ -422,14 +448,24 @@ async function _aplicarCobrosSucursalPendientes({ rfc, centroCostoId, centroCobr
  * @param {number} [cuentaIvaSaldoFavorId] - AccountPlan.id de 2104010002
  *   (IVA Trasladado - Anticipos) — IVA de las porciones "saldo a favor".
  * @param {string} rfc
- * @returns {Promise<{movimientos: Array, facturasVendedorCubiertas: Set<string>, facturasPPDCubiertas: Map<string,{monto:number, reglaNombre:string}>}>}
+ * @returns {Promise<{movimientos: Array, facturasVendedorCubiertas: Map<string,number>, facturasPPDCubiertas: Map<string,{monto:number, reglaNombre:string}>}>}
  *   `movimientos`: líneas listas para concatenar a movimientosResult/todosLosMovimientos.
- *   `facturasVendedorCubiertas`: UUIDs (mayúsculas) de las facturas PUE de
- *   ESTE centroCostoId (como vendedora) cuyo Cargo normal (el que arma
- *   cfdiToMovimientos según formaPago del propio CFDI) debe OMITIRSE, porque
- *   ya lo cubre la línea Cargo a Caja/Bancos por identificar de este flujo —
- *   sin esto, la póliza queda con doble Cargo contra un solo Abono
- *   (ver cfdi-poliza-generator.service.js, donde se usa para filtrar).
+ *   `facturasVendedorCubiertas`: UUID (mayúsculas) → monto YA cubierto por
+ *   líneas de Cargo a Caja/Bancos por identificar de este flujo, para ESTE
+ *   centroCostoId (como vendedora). El Cargo normal que arma cfdiToMovimientos
+ *   según formaPago del propio CFDI debe reducirse por este monto (no
+ *   omitirse siempre por completo) — corrección 2026-08-06: para una Factura
+ *   Global (un solo CFDI que agrupa cientos de tickets), basta con que UN
+ *   ticket se haya cobrado en otra sucursal para que el monto acumulado aquí
+ *   sea MENOR al total de la factura — el resto (tickets cobrados en la
+ *   MISMA sucursal) necesita su propio Cargo normal, que antes se omitía por
+ *   completo tratando esto como un booleano sí/no (caso real: Global de
+ *   $206,937.70 con 3 tickets cruzados por $9,773.35 — el código omitía LOS
+ *   $206,937.70 completos, perdiendo ~$197,164 de cargo real). Para una
+ *   factura normal (no Global), el monto acumulado es simplemente el total de
+ *   la factura y el efecto es el mismo que antes (Cargo completo omitido).
+ *   Ver cfdi-poliza-generator.service.js, donde se usa para calcular el
+ *   remanente en vez de solo filtrar.
  *   `facturasPPDCubiertas`: UUID (mayúsculas) → { monto, reglaNombre } para
  *   facturas PPD de ESTE centroCostoId (como vendedora) cobradas en otra
  *   sucursal — cfdi-poliza-generator.service.js usa esto para agregar el
@@ -446,6 +482,7 @@ async function construirMovimientosPuente({
   cuentaPuenteId,
   cuentaSaldoFavorId,
   cuentaIvaSaldoFavorId,
+  cuentaClubTuberosId,
   rfc,
   // Set de claves `${serieOrigen}|${folioOrigen}` (la Devolución que generó
   // el saldo) que deben ocultarse del export — ver `ETIQUETA_SALDO_FAVOR_OCULTO`.
@@ -462,7 +499,7 @@ async function construirMovimientosPuente({
   fechaDesde,
   fechaHasta,
 }) {
-  const vacio = { movimientos: [], facturasVendedorCubiertas: new Set(), facturasPPDCubiertas: new Map(), pendientesPorFacturar: [] };
+  const vacio = { movimientos: [], facturasVendedorCubiertas: new Map(), facturasPPDCubiertas: new Map(), pendientesPorFacturar: [] };
   if (!centroCostoId || !cuentaCajaId || !cuentaBancosId) return vacio;
 
   // 1. Documentos relacionados de todos los CFDIs del periodo → batch de consulta.
@@ -605,7 +642,7 @@ async function construirMovimientosPuente({
 
   // 2. Armar líneas candidatas (antes de filtrar por idempotencia).
   const candidatas = [];
-  const facturasVendedorCubiertas = new Set();
+  const facturasVendedorCubiertas = new Map(); // uuid → monto acumulado cubierto (ver docstring)
   // folioVenta (numérico) de cobros REALES del día — usado abajo para acotar
   // el rango de folios a escanear en busca de tickets "por facturar" (ver
   // `_detectarPendientesPorFacturar`). Solo se llenan con folioVenta ya
@@ -750,6 +787,15 @@ async function construirMovimientosPuente({
           lineas.push({ cuentaId: cuentaIvaSaldoFavorId, montoAsignado: iva, reglaNombre: reglaSF, esSF: true, concepto: conceptoSF });
           return;
         }
+
+        if (_esPuntos(fp)) {
+          if (!cuentaClubTuberosId || !cuentaIvaSaldoFavorId || montoAsignado <= 0) return;
+          const subtotal = Math.round((montoAsignado / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+          const iva = Math.round((montoAsignado - subtotal) * 100) / 100;
+          lineas.push({ cuentaId: cuentaClubTuberosId, montoAsignado: subtotal, reglaNombre: ETIQUETA_PUNTOS, esSF: true, concepto: conceptoBase });
+          lineas.push({ cuentaId: cuentaIvaSaldoFavorId, montoAsignado: iva, reglaNombre: ETIQUETA_PUNTOS, esSF: true, concepto: conceptoBase });
+          return;
+        }
         const esEfectivo = (fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO;
         // Depósito bancario real identificado (ver `bancoPorVenta` arriba) —
         // solo aplica a Transferencia/Tarjeta (nunca Efectivo, que no pasa
@@ -785,7 +831,10 @@ async function construirMovimientosPuente({
       // forma de pago (misma cuenta que usará la cobradora para su cargo,
       // según claveSat) ──────────────────────────────────────────────────
       if (centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
-        if (cfdiOriginal?.uuid) facturasVendedorCubiertas.add(cfdiOriginal.uuid.toUpperCase());
+        if (cfdiOriginal?.uuid) {
+          const uuidUpper = cfdiOriginal.uuid.toUpperCase();
+          facturasVendedorCubiertas.set(uuidUpper, (facturasVendedorCubiertas.get(uuidUpper) ?? 0) + montoCobro);
+        }
         lineas.forEach(l => {
           candidatas.push({
             cuentaId:      l.cuentaId,
@@ -894,11 +943,76 @@ async function construirMovimientosPuente({
       const centroVendedor = p.serie ? (ccBySerieMap[p.serie] ?? null) : null;
       const centroCobrador = p.claveCentro ? (ccBySerieMap[p.claveCentro] ?? null) : null;
       if (!centroCobrador) continue;
-      if (centroVendedor && String(centroVendedor.id) === String(centroCobrador.id)) continue; // mismo almacén, no es cruzado
 
       const serieFolioTicket = `${p.serie ?? '?'}-${p.folio ?? '?'}`;
       const conceptoTicket = [p.nombreCliente, serieFolioTicket].filter(Boolean).join(' / ');
       const formasPagoTicket = _ordenarFormasPago(p.formasPago.length ? p.formasPago : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: p.monto }]);
+
+      const mismaSucursal = centroVendedor && String(centroVendedor.id) === String(centroCobrador.id);
+
+      if (mismaSucursal) {
+        // Ticket sin factura cobrado en SU PROPIA sucursal (sin cruce) —
+        // confirmado con el usuario 2026-08-06: antes se saltaba por
+        // completo (solo aparecía en la lista informativa de "Pendientes por
+        // facturar"); ahora también genera su asiento — Cargo directo por
+        // forma de pago (o split Club Tuberos si aplica, ver `_esPuntos`),
+        // SIN cuenta puente (no hay otra sucursal con la que cuadrar):
+        // floating debit hasta que se facture, mismo principio que el lado
+        // vendedor de un cruce. tipoOrigen='Pendiente Propio' (no 'Cobro
+        // Sucursal') para que la columna C NO lleve el prefijo "Cobro de
+        // otra sucursal -" (ver `_extraerCobrosSucursal`, poliza.service.js:
+        // no es un cruce real, sería una etiqueta falsa).
+        if (String(centroVendedor.id) !== String(centroCostoId) || !p.folioOrigen) continue;
+
+        // Limpieza defensiva: si este folio había quedado mal encolado como
+        // cruzado en una corrida anterior (antes de este fix, o por un dato
+        // que cambió de lado), se borra esa fila vieja de la cola.
+        await _sincronizarCobroSucursalPendiente({
+          rfc, folioOrigen: p.folioOrigen, centroCostoIdOrigen: centroVendedor.id,
+          centroCostoIdDestino: null, serieFolioTicket, cfdiUuid: null,
+          nombreCliente: p.nombreCliente, montoTotal: 0, lineas: [],
+          tratamiento: 'HUERFANO', fechaCobro: p.fecha ?? null,
+        });
+
+        const totalFormasPagoTicket = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+        let acumuladoTicket = 0;
+        formasPagoTicket.forEach((fp, idx) => {
+          const esUltimo = idx === formasPagoTicket.length - 1;
+          const share = totalFormasPagoTicket > 0 ? (Number(fp.monto) || 0) / totalFormasPagoTicket : 1 / formasPagoTicket.length;
+          const montoAsignado = esUltimo
+            ? Math.round((p.monto - acumuladoTicket) * 100) / 100
+            : Math.round(p.monto * share * 100) / 100;
+          acumuladoTicket += montoAsignado;
+          if (montoAsignado <= 0) return;
+
+          if (_esPuntos(fp) && cuentaClubTuberosId && cuentaIvaSaldoFavorId) {
+            const subtotal = Math.round((montoAsignado / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+            const iva = Math.round((montoAsignado - subtotal) * 100) / 100;
+            candidatas.push({
+              cuentaId: cuentaClubTuberosId, cuentaFaltante: false, concepto: conceptoTicket,
+              debe: subtotal, haber: 0, serie: serieFolioTicket, folio: p.folioOrigen,
+              centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+              tipoOrigen: TIPO_ORIGEN_PENDIENTE_PROPIO, reglaNombre: ETIQUETA_PUNTOS, cfdiUuid: null,
+            });
+            candidatas.push({
+              cuentaId: cuentaIvaSaldoFavorId, cuentaFaltante: false, concepto: conceptoTicket,
+              debe: iva, haber: 0, serie: serieFolioTicket, folio: p.folioOrigen,
+              centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+              tipoOrigen: TIPO_ORIGEN_PENDIENTE_PROPIO, reglaNombre: ETIQUETA_PUNTOS, cfdiUuid: null,
+            });
+            return;
+          }
+
+          const esEfectivo = (fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO;
+          candidatas.push({
+            cuentaId: esEfectivo ? cuentaCajaId : cuentaBancosId, cuentaFaltante: false,
+            concepto: conceptoTicket, debe: montoAsignado, haber: 0, serie: serieFolioTicket,
+            folio: p.folioOrigen, centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+            tipoOrigen: TIPO_ORIGEN_PENDIENTE_PROPIO, reglaNombre: fp.nombre || null, cfdiUuid: null,
+          });
+        });
+        continue;
+      }
 
       // ── Lado VENDEDOR: Cargo a la cuenta puente por el total cobrado —
       // mismo principio que el lado vendedor PUE normal (Cargo Caja/Bancos
@@ -942,6 +1056,15 @@ async function construirMovimientosPuente({
               : Math.round(p.monto * share * 100) / 100;
             acumuladoTicket += montoAsignado;
             if (montoAsignado <= 0) return;
+
+            if (_esPuntos(fp) && cuentaClubTuberosId && cuentaIvaSaldoFavorId) {
+              const subtotal = Math.round((montoAsignado / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+              const iva = Math.round((montoAsignado - subtotal) * 100) / 100;
+              lineasCobrador.push({ cuentaId: cuentaClubTuberosId, monto: subtotal, reglaNombre: ETIQUETA_PUNTOS });
+              lineasCobrador.push({ cuentaId: cuentaIvaSaldoFavorId, monto: iva, reglaNombre: ETIQUETA_PUNTOS });
+              return;
+            }
+
             const esEfectivo = (fp.claveSat ?? '').trim() === CLAVE_SAT_EFECTIVO;
             lineasCobrador.push({ cuentaId: esEfectivo ? cuentaCajaId : cuentaBancosId, monto: montoAsignado, reglaNombre: fp.nombre || null });
           });

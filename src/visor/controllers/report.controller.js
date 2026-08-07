@@ -1288,9 +1288,16 @@ const notInErp = asyncHandler(async (req, res) => {
  * Solo tiene sentido cuando se filtra por tipoDeComprobante=P.
  */
 const pagosRelacionados = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo } = req.query;
+  const { ejercicio, periodo, rfcEmisor } = req.query;
 
-  const matchFilter = { tipoDeComprobante: 'P', isActive: { $ne: false } };
+  // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
+
+  const matchFilter = { tipoDeComprobante: 'P', isActive: { $ne: false }, 'emisor.rfc': emisorConstraint };
   if (ejercicio) matchFilter.ejercicio = parseInt(ejercicio);
   if (periodo)   matchFilter.periodo   = parseInt(periodo);
 
@@ -2341,7 +2348,7 @@ const DEDUP_PAGO_PREFIERE_SAT = [
  * @returns {Promise<Map<string, number>>} clave `${movimientoId}|${cfdiUuid}|${facturaUuid}`
  *   (mayúsculas) → saldo del depósito INMEDIATAMENTE DESPUÉS de esa aplicación.
  */
-async function calcularSaldosBanco(movimientoIds) {
+async function calcularSaldosBanco(movimientoIds, emisorConstraint) {
   const mapa = new Map();
   const ids = [...new Set(movimientoIds.filter(Boolean).map(String))];
   if (ids.length === 0) return mapa;
@@ -2379,6 +2386,8 @@ async function calcularSaldosBanco(movimientoIds) {
       $match: {
         tipoDeComprobante: 'P',
         isActive: true,
+        // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
+        ...(emisorConstraint ? { 'emisor.rfc': emisorConstraint } : {}),
         'complementoPago.pagos.doctosRelacionados.idDocumento': {
           $in: foliosUnicos.map((f) => new RegExp(`^${f}$`, 'i')),
         },
@@ -2445,6 +2454,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
     serieCxc, folioCxc,
     fechaInicio, fechaFin,
     ejercicio, periodo,
+    rfcEmisor,
     estado = 'todos',
     page  = 1,
     limit = 20,
@@ -2453,9 +2463,17 @@ const pagosBanco = asyncHandler(async (req, res) => {
   const pg = parseInt(page);
   const lm = Math.min(parseInt(limit), 100);
 
+  // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
+
   const baseMatch = {
     tipoDeComprobante: 'P',
     isActive: true,
+    'emisor.rfc': emisorConstraint,
     'complementoPago.pagos.doctosRelacionados.0': { $exists: true },
   };
   if (ejercicio) baseMatch.ejercicio = parseInt(ejercicio);
@@ -3039,7 +3057,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
   }
 
   const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(result.data.map(r => r.facturaUuid));
-  const saldosBanco = await calcularSaldosBanco(result.data.map(r => r.movimientoId));
+  const saldosBanco = await calcularSaldosBanco(result.data.map(r => r.movimientoId), emisorConstraint);
   const data = result.data.map(r => {
     const nc = notasPorFactura.get(r.facturaUuid);
     const claveSaldoBanco = `${r.movimientoId}|${(r.cfdiUuid || '').toUpperCase()}|${(r.facturaUuid || '').toUpperCase()}`;
@@ -3059,11 +3077,19 @@ const pagosBanco = asyncHandler(async (req, res) => {
  * Descarga Excel con los mismos filtros que pagosBanco (sin paginación).
  */
 const pagosBancoExport = asyncHandler(async (req, res) => {
-  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, ejercicio, periodo, estado = 'todos' } = req.query;
+  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, ejercicio, periodo, rfcEmisor, estado = 'todos' } = req.query;
+
+  // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   const baseMatch = {
     tipoDeComprobante: 'P',
     isActive: true,
+    'emisor.rfc': emisorConstraint,
     'complementoPago.pagos.doctosRelacionados.0': { $exists: true },
   };
   if (ejercicio) baseMatch.ejercicio = parseInt(ejercicio);
@@ -3626,7 +3652,7 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
   }
 
   const notasPorFactura = await buscarNotasCreditoPorFacturasBatch(rows.map(r => r.facturaUuid));
-  const saldosBanco = await calcularSaldosBanco(rows.map(r => r.movimientoId));
+  const saldosBanco = await calcularSaldosBanco(rows.map(r => r.movimientoId), emisorConstraint);
   for (const r of rows) {
     const nc = notasPorFactura.get(r.facturaUuid);
     const claveSaldoBanco = `${r.movimientoId}|${(r.cfdiUuid || '').toUpperCase()}|${(r.facturaUuid || '').toUpperCase()}`;
@@ -3778,10 +3804,17 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
  * Se llama solo al abrir el panel de detalle de una fila.
  */
 const pagosBancoDetalle = asyncHandler(async (req, res) => {
-  const { facturaUuid } = req.query;
+  const { facturaUuid, rfcEmisor } = req.query;
   if (!facturaUuid) return res.status(400).json({ error: 'facturaUuid requerido' });
 
   const uuid = facturaUuid.trim().toUpperCase();
+
+  // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   const [factura, movimientos, parcialidades] = await Promise.all([
     CFDI.findOne({ uuid }).select('uuid satStatus serie folio total fecha emisor receptor informacionGlobal').lean(),
@@ -3795,6 +3828,7 @@ const pagosBancoDetalle = asyncHandler(async (req, res) => {
         $match: {
           tipoDeComprobante: 'P',
           isActive: true,
+          'emisor.rfc': emisorConstraint,
           'complementoPago.pagos.doctosRelacionados.idDocumento': { $regex: uuid, $options: 'i' },
         },
       },

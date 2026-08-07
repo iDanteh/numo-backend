@@ -16,6 +16,8 @@ const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const BankMovement                       = require('../banks/BankMovement.model');
 const { emitToUser }                     = require('../../shared/socket');
 const { ERP_TOLERANCE, updateErpIds }     = require('../banks/bank.service');
+const { PERMISSIONS }                    = require('../../../shared/config/rbac');
+const rbacStore                           = require('../../../shared/services/rbac-store');
 const {
   KoreCajaError, koreTokenCache, KORE_CAJA_BASE_URL,
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
@@ -42,9 +44,27 @@ const ERP_TOKEN         = process.env.ERP_TOKEN || '';
 // GET /api/erp/cuentas-pendientes
 // Parámetros: fechaDesde, fechaHasta, estadoCobro (opcional; 'pendiente' para solo pendientes), page
 // La paginación se aplica localmente sobre la respuesta completa del ERP.
-router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) => {
+router.get('/cuentas-pendientes', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
   const { fechaDesde, fechaHasta, estadoCobro, page, serieExterna, folioExterno, nombrePersona, origen } = req.query;
   const pageNum = Math.max(1, parseInt(page ?? '1', 10));
+
+  // origen=anticipo depende de un query param, así que no se puede exigir con permit()
+  // (permit() solo conoce permisos fijos por ruta) — se verifica aquí adentro, además del
+  // banks:erp:read ya exigido arriba para el resto de la consulta.
+  // Nota: este permiso solo bloquea la petición explícita origen=anticipo (el switch
+  // "Solo anticipos"); no oculta registros de anticipo del listado normal paginado —
+  // no es un filtro de datos completo.
+  if (origen === 'anticipo') {
+    const puedeVerAnticipos = await rbacStore.hasPermission(
+      req.user.role, PERMISSIONS.BANKS_ERP_ANTICIPOS, req.user.extraPermissions,
+    );
+    if (!puedeVerAnticipos) {
+      return res.status(403).json({
+        error:    'Permisos insuficientes para esta acción.',
+        required: [PERMISSIONS.BANKS_ERP_ANTICIPOS],
+      });
+    }
+  }
 
   // sincronizarCuentasPendientes llama al ERP, upserta en el caché y devuelve los
   // datos crudos para que este endpoint pueda construir la respuesta paginada.
@@ -100,6 +120,77 @@ router.get('/cuentas-pendientes', authenticate, asyncHandler(async (req, res) =>
   res.json({
     data: cuentas,
     pagination: { page: safePage, totalPaginas, total },
+  });
+}));
+
+// GET /api/erp/cuenta-por-serie-folio — resuelve UNA CxC puntual contra Kore por
+// serie+folio exactos (segunda parte del buscador de CFDI del modal ERP, 2026-08-07):
+// un CFDI (colección `cfdis`, dominio visor) trae `total` de la factura, NUNCA el saldo
+// pendiente EN VIVO (puede haber pagos parciales) — para que "vincular" calcule bien
+// diferencia/status hay que traer el dato fresco de Kore, no confiar en el CFDI.
+// Reutiliza EXACTAMENTE el mismo patrón que /erp-links/:erpId/refrescar/_syncErpKoreJob
+// (_rangoDesdeFollo + _sincronizarConRetry + reintento con _rangoSpilloverSiguienteMes si
+// la ventana normal viene vacía) — deriva el rango de fecha del folio, sin que el usuario
+// tenga que elegir un rango a mano. Mismo permiso que el buscador de CFDI
+// (banks:cfdi:read): esto solo tiene sentido como continuación de ese flujo, no es un
+// acceso genérico a Kore.
+router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFDI_READ), asyncHandler(async (req, res) => {
+  const serieExterna = (req.query.serie ?? '').toString().trim();
+  const folioExterno = (req.query.folio ?? '').toString().trim();
+  if (!serieExterna || !folioExterno) {
+    return res.status(400).json({ error: 'Se requiere serie y folio.' });
+  }
+
+  const rango = _rangoDesdeFollo(folioExterno);
+  if (!rango) return res.status(400).json({ error: 'No se pudo determinar el rango de fecha para este folio.' });
+
+  let raw;
+  try {
+    ({ raw } = await _sincronizarConRetry({
+      serieExterna, folioExterno, fechaDesde: rango.fechaDesde, fechaHasta: rango.fechaHasta,
+    }));
+
+    if (raw.length === 0) {
+      const spillover = _rangoSpilloverSiguienteMes(folioExterno);
+      if (spillover) {
+        await _sleep(SYNC_DELAY_MS);
+        const retryRes = await _sincronizarConRetry({
+          serieExterna, folioExterno, fechaDesde: spillover.fechaDesde, fechaHasta: spillover.fechaHasta,
+        });
+        if (retryRes.raw.length > 0) raw = retryRes.raw;
+      }
+    }
+  } catch (err) {
+    return res.status(502).json({ error: err.message || 'Error al consultar Kore.' });
+  }
+
+  // Sin fallback a raw[0]: si Kore devuelve cuentas pero ninguna calza EXACTO con la
+  // serie/folio pedida, es preferible un 404 (el usuario puede reintentar) a vincular la
+  // cuenta equivocada en silencio — bug real encontrado en revisión, el `?? raw[0]`
+  // original podía devolver una CxC de otra serie-folio sin ningún aviso.
+  const raw0 = raw.find(c => String(c.folioExterno) === folioExterno && String(c.serieExterna) === serieExterna);
+  if (!raw0) {
+    return res.status(404).json({ error: 'No se encontró esta CxC en Kore — puede que ya no esté disponible para vincular.' });
+  }
+
+  res.json({
+    id:                   raw0.id,
+    serie:                raw0.serie                ?? null,
+    folio:                raw0.folio                ?? null,
+    serieExterna:         raw0.serieExterna         ?? null,
+    folioExterno:         raw0.folioExterno         ?? null,
+    folioFiscal:          raw0.folioFiscal          ?? null,
+    tipoPago:             raw0.tipoPago             ?? null,
+    subtotal:             raw0.subtotal,
+    impuesto:             raw0.impuesto,
+    total:                raw0.total,
+    saldoActual:          raw0.saldoActual,
+    fechaVencimiento:     raw0.fechaVencimiento     ?? null,
+    nombrePersona:        raw0.nombrePersona        ?? null,
+    nombreTipoMovimiento: raw0.nombreTipoMovimiento ?? null,
+    personaId:            raw0.personaId            ?? null,
+    esAnticipo:           raw0.esAnticipo           ?? false,
+    origen:               raw0.origen               ?? null,
   });
 }));
 

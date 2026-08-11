@@ -52,6 +52,34 @@ describe('setErpIds — approval (SIN session, comportamiento actual, sin cambio
     expect(emitToBanco).toHaveBeenCalledWith('BBVA', 'bank:movement:updated', updated);
     expect(updated.erpIds).toEqual(['CXC-1']);
   });
+
+  // Pedido 2026-08-10: origen ('cfdi_liquidado') debe sobrevivir a setErpIds igual que
+  // tipoPago/serie — antes se descartaba en silencio (whitelist explícito de cleanLinks).
+  test('erpLinks con origen: se persiste tal cual en el link guardado', async () => {
+    const mov = fakeMov();
+    BankMovement.findById.mockReturnValue(fakeQuery(mov));
+
+    const updated = await bankService.setErpIds(
+      'mov-1',
+      [{ erpId: 'CXC-1', saldoActual: 0, origen: 'cfdi_liquidado' }],
+      { _id: 'user-1', role: 'admin' },
+    );
+
+    expect(updated.erpLinks[0].origen).toBe('cfdi_liquidado');
+  });
+
+  test('erpLinks sin origen: se guarda como null (no undefined)', async () => {
+    const mov = fakeMov();
+    BankMovement.findById.mockReturnValue(fakeQuery(mov));
+
+    const updated = await bankService.setErpIds(
+      'mov-1',
+      [{ erpId: 'CXC-1', saldoActual: 0 }],
+      { _id: 'user-1', role: 'admin' },
+    );
+
+    expect(updated.erpLinks[0].origen).toBeNull();
+  });
 });
 
 describe('setErpIds — opts.session (multi-bank-movement, D5, comportamiento nuevo)', () => {

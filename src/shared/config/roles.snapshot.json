@@ -18,7 +18,12 @@
       "banks:cobro",
       "banks:export:all",
       "banks:movement:categoria",
-      "banks:import"
+      "banks:import",
+      "banks:erp:anticipos",
+      "banks:erp:read",
+      "banks:erp:unlink",
+      "banks:cfdi:read",
+      "banks:erp:reversiones"
     ],
     "isSystem": true
   },
@@ -49,7 +54,10 @@
       "banks:movement:categoria",
       "collections:read",
       "collections:write",
-      "banks:config"
+      "banks:config",
+      "banks:cfdi:read",
+      "banks:erp:anticipos",
+      "banks:erp:read"
     ],
     "isSystem": true
   },

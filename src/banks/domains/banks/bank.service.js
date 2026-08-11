@@ -1850,6 +1850,7 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
       serie:        l.serie ? String(l.serie).trim() : null,
       folioExterno: l.folioExterno ? String(l.folioExterno).trim() : null,
       tipoPago:     l.tipoPago ? String(l.tipoPago).trim().toUpperCase() : null,
+      origen:       l.origen ? String(l.origen).trim() : null,
       // Bitácora de auditoría por forma de pago — ver BankMovement.model.js. Se acepta
       // tal cual la manda el frontend (ya viene acumulada: lo que traía + lo nuevo de
       // este cobro), solo se sanea el tipo de cada entrada.
@@ -3205,5 +3206,5 @@ module.exports = {
   findPotentialDuplicates,
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,
-  ERP_TOLERANCE,
+  ERP_TOLERANCE, aplicarLogicaErp,
 };

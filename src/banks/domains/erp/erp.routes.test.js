@@ -59,12 +59,22 @@ jest.mock('./erp-sync.service', () => ({
   sincronizarCuentasPendientes: jest.fn(),
 }));
 
+// CFDI (dominio visor) — límite de I/O real del fallback nuevo de GET /cuenta-por-serie-folio
+// (2026-08-10: factura liquidada al 100%, Kore la excluye de /cuentas-pendientes sin importar
+// el rango de fecha). Mismo patrón de mock ya usado en bank.routes.test.js para /cfdis/buscar.
+jest.mock('../../../visor/models/CFDI', () => ({
+  findOne: jest.fn(() => ({
+    lean: jest.fn(),
+  })),
+}));
+
 const express      = require('express');
 const request      = require('supertest');
 const router       = require('./erp.routes');
 const rbacStore    = require('../../../shared/services/rbac-store');
 const koreCaja     = require('./kore-caja.service');
 const { sincronizarCuentasPendientes } = require('./erp-sync.service');
+const CFDI         = require('../../../visor/models/CFDI');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 describe('_aporteConRatchet', () => {
@@ -293,4 +303,143 @@ describe('GET /cuenta-por-serie-folio', () => {
       fechaDesde: '2026-09-01T00:00:00.000Z', fechaHasta: '2026-09-01T23:59:59.000Z',
     });
   }, 10000);
+
+  // Fallback nuevo (2026-08-10): factura YA LIQUIDADA (pagada al 100%) — Kore la excluye
+  // por completo de /cuentas-pendientes sin importar el rango de fecha, así que raw0 nunca
+  // aparece. Caso real: CFDI H0-260100639, pago 488.73 == total 488.73. Pedido explícito
+  // del usuario: permitir vincular igual esa CxC ("es solo una relación simple"), sin
+  // verificarla en vivo contra Kore.
+  test('Kore sin match + CFDI local encontrado con erpId válido y sin cancelar -> 200 con saldoActual:0 y origen:cfdi_liquidado', async () => {
+    sincronizarCuentasPendientes.mockResolvedValue({ raw: [] });
+    CFDI.findOne.mockReturnValue({
+      lean: jest.fn().mockResolvedValue({
+        erpId:     'erp-liquidado-1',
+        serie:     'H0',
+        folio:     '260100639',
+        uuid:      'UUID-LIQUIDADO-1',
+        formaPago: '03',
+        subTotal:  421.32,
+        impuestos: { totalImpuestosTrasladados: 67.41 },
+        total:     488.73,
+        receptor:  { nombre: 'Cliente Test' },
+        erpStatus: 'Timbrado',
+        satStatus: 'Vigente',
+      }),
+    });
+
+    const res = await request(app)
+      .get('/cuenta-por-serie-folio')
+      .query({ serie: 'H0', folio: '260100639' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_CFDI_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      id:                   'erp-liquidado-1',
+      serie:                'H0',
+      folio:                '260100639',
+      serieExterna:         'H0',
+      folioExterno:         '260100639',
+      folioFiscal:          'UUID-LIQUIDADO-1',
+      tipoPago:             '03',
+      subtotal:             421.32,
+      impuesto:             67.41,
+      total:                488.73,
+      saldoActual:          0,
+      fechaVencimiento:     null,
+      nombrePersona:        'Cliente Test',
+      nombreTipoMovimiento: null,
+      personaId:            null,
+      esAnticipo:           false,
+      origen:               'cfdi_liquidado',
+    });
+    expect(CFDI.findOne).toHaveBeenCalledWith({ source: 'ERP', serie: 'H0', folio: '260100639' });
+  });
+
+  test('Kore sin match + CFDI local SIN erpId -> 404 con mensaje específico (sin ID de Kore no se puede vincular)', async () => {
+    sincronizarCuentasPendientes.mockResolvedValue({ raw: [] });
+    CFDI.findOne.mockReturnValue({
+      lean: jest.fn().mockResolvedValue({
+        erpId: null, serie: 'H0', folio: '260100639', total: 488.73,
+      }),
+    });
+
+    const res = await request(app)
+      .get('/cuenta-por-serie-folio')
+      .query({ serie: 'H0', folio: '260100639' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_CFDI_READ]));
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Esta factura no tiene un identificador de ERP asociado — no se puede vincular.');
+  });
+
+  test('Kore sin match + CFDI local con erpStatus:Cancelado -> 404 con mensaje específico', async () => {
+    sincronizarCuentasPendientes.mockResolvedValue({ raw: [] });
+    CFDI.findOne.mockReturnValue({
+      lean: jest.fn().mockResolvedValue({
+        erpId: 'erp-cancelado-1', serie: 'H0', folio: '260100639', total: 488.73,
+        erpStatus: 'Cancelado',
+      }),
+    });
+
+    const res = await request(app)
+      .get('/cuenta-por-serie-folio')
+      .query({ serie: 'H0', folio: '260100639' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_CFDI_READ]));
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('Esta factura está cancelada — no se puede vincular.');
+  });
+
+  test('Kore sin match + CFDI no existe tampoco localmente -> 404 genérico (sin regresión)', async () => {
+    sincronizarCuentasPendientes.mockResolvedValue({ raw: [] });
+    CFDI.findOne.mockReturnValue({ lean: jest.fn().mockResolvedValue(null) });
+
+    const res = await request(app)
+      .get('/cuenta-por-serie-folio')
+      .query({ serie: 'H0', folio: '260100639' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_CFDI_READ]));
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('No se encontró esta CxC en Kore — puede que ya no esté disponible para vincular.');
+  });
+});
+
+// _resolverCuentaDesdeCfdiLiquidado — función pura del fallback nuevo (2026-08-10),
+// testeada aislada sin pasar por la ruta ni mockear Mongo.
+describe('_resolverCuentaDesdeCfdiLiquidado', () => {
+  test('sin erpId -> error específico', () => {
+    const resultado = router._resolverCuentaDesdeCfdiLiquidado({ erpId: null, total: 100 });
+    expect(resultado).toEqual({ error: 'Esta factura no tiene un identificador de ERP asociado — no se puede vincular.' });
+  });
+
+  test('erpStatus Cancelado -> error específico', () => {
+    const resultado = router._resolverCuentaDesdeCfdiLiquidado({ erpId: 'x', erpStatus: 'Cancelado', total: 100 });
+    expect(resultado).toEqual({ error: 'Esta factura está cancelada — no se puede vincular.' });
+  });
+
+  test('satStatus Cancelado -> error específico', () => {
+    const resultado = router._resolverCuentaDesdeCfdiLiquidado({ erpId: 'x', satStatus: 'Cancelado', total: 100 });
+    expect(resultado).toEqual({ error: 'Esta factura está cancelada — no se puede vincular.' });
+  });
+
+  test('CFDI válido -> cuenta con saldoActual:0 y origen cfdi_liquidado', () => {
+    const resultado = router._resolverCuentaDesdeCfdiLiquidado({
+      erpId: 'erp-1', serie: 'H0', folio: '260100639', uuid: 'UUID-1',
+      formaPago: '03', subTotal: 421.32, impuestos: { totalImpuestosTrasladados: 67.41 },
+      total: 488.73, receptor: { nombre: 'Cliente Test' },
+      erpStatus: 'Timbrado', satStatus: 'Vigente',
+    });
+
+    expect(resultado).toEqual({
+      cuenta: {
+        id: 'erp-1', serie: 'H0', folio: '260100639',
+        serieExterna: 'H0', folioExterno: '260100639',
+        folioFiscal: 'UUID-1', tipoPago: '03',
+        subtotal: 421.32, impuesto: 67.41, total: 488.73,
+        saldoActual: 0, fechaVencimiento: null,
+        nombrePersona: 'Cliente Test', nombreTipoMovimiento: null,
+        personaId: null, esAnticipo: false, origen: 'cfdi_liquidado',
+      },
+    });
+  });
 });

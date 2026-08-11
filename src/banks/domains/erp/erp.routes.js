@@ -12,8 +12,11 @@ const { procesarMostradorCyc,
         generarExcelMostradorCyc }       = require('./mostrador-cyc.service');
 const { procesarPagosCyc,
         generarExcelPagosCyc }           = require('./pagos-cyc.service');
+const { procesarFormasPagoCxc,
+        generarExcelFormasPagoCxc }      = require('./formas-pago-cxc.service');
 const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const BankMovement                       = require('../banks/BankMovement.model');
+const CFDI                               = require('../../../visor/models/CFDI');
 const { emitToUser }                     = require('../../shared/socket');
 const { ERP_TOLERANCE, updateErpIds }     = require('../banks/bank.service');
 const { PERMISSIONS }                    = require('../../../shared/config/rbac');
@@ -170,6 +173,24 @@ router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFD
   // original podía devolver una CxC de otra serie-folio sin ningún aviso.
   const raw0 = raw.find(c => String(c.folioExterno) === folioExterno && String(c.serieExterna) === serieExterna);
   if (!raw0) {
+    // Kore excluye por completo del endpoint /cuentas-pendientes cualquier factura YA
+    // LIQUIDADA (pagada al 100%), sin importar el rango de fecha — no es que no exista,
+    // es que Kore ya no la considera "pendiente". Caso real: CFDI H0-260100639, pago por
+    // 488.73 == total 488.73. Pedido explícito del usuario (2026-08-10): permitir vincular
+    // igual esa CxC — "es solo una relación simple", no hace falta verificarla en vivo
+    // contra Kore, porque el propio CFDI ya prueba que no le queda saldo pendiente.
+    // Fallback: buscar el CFDI local por serie+folio EXACTOS (no regex — a diferencia del
+    // buscador de texto libre, acá ya sabemos serie/folio exactos porque vienen del
+    // resultado que el usuario clickeó, mismo patrón cross-domain que /cfdis/buscar en
+    // bank.routes.js).
+    const cfdiLocal = await CFDI.findOne({ source: 'ERP', serie: serieExterna, folio: folioExterno }).lean();
+    if (cfdiLocal) {
+      const resuelto = _resolverCuentaDesdeCfdiLiquidado(cfdiLocal);
+      if (resuelto.error) {
+        return res.status(404).json({ error: resuelto.error });
+      }
+      return res.json(resuelto.cuenta);
+    }
     return res.status(404).json({ error: 'No se encontró esta CxC en Kore — puede que ya no esté disponible para vincular.' });
   }
 
@@ -193,6 +214,48 @@ router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFD
     origen:               raw0.origen               ?? null,
   });
 }));
+
+// Resuelve el shape de "cuenta" que espera el frontend a partir de un CFDI local, para el
+// fallback de GET /cuenta-por-serie-folio cuando Kore ya no reporta la CxC como pendiente
+// (factura liquidada al 100%). Función pura (sin I/O) para poder testearla aislada sin
+// mockear Mongo — recibe el documento CFDI ya encontrado y devuelve { error } si no se
+// puede vincular, o { cuenta } con el mismo shape que devuelve esta ruta en el camino
+// normal (con Kore).
+// saldoActual siempre 0: si llegamos a este fallback es PORQUE Kore ya no considera esta
+// CxC pendiente, así que el saldo remanente es 0 por definición de este camino.
+// origen: 'cfdi_liquidado' — marca de procedencia, para que quede auditable que esta
+// cuenta NO se verificó en vivo contra Kore (a diferencia del camino normal, donde origen
+// viene de Kore).
+function _resolverCuentaDesdeCfdiLiquidado(cfdi) {
+  if (!cfdi.erpId) {
+    return { error: 'Esta factura no tiene un identificador de ERP asociado — no se puede vincular.' };
+  }
+  if (cfdi.erpStatus === 'Cancelado' || cfdi.satStatus === 'Cancelado') {
+    return { error: 'Esta factura está cancelada — no se puede vincular.' };
+  }
+
+  return {
+    cuenta: {
+      id:                   cfdi.erpId,
+      serie:                cfdi.serie ?? null,
+      folio:                cfdi.folio ?? null,
+      serieExterna:         cfdi.serie ?? null,
+      folioExterno:         cfdi.folio ?? null,
+      folioFiscal:          cfdi.uuid  ?? null,
+      tipoPago:             cfdi.formaPago ?? null,
+      subtotal:             cfdi.subTotal,
+      impuesto:             cfdi.impuestos?.totalImpuestosTrasladados ?? 0,
+      total:                cfdi.total,
+      saldoActual:          0,
+      fechaVencimiento:     null,
+      nombrePersona:        cfdi.receptor?.nombre ?? null,
+      nombreTipoMovimiento: null,
+      personaId:            null,
+      esAnticipo:           false,
+      origen:               'cfdi_liquidado',
+    },
+  };
+}
 
 // GET /api/erp/facturas/reporte
 // Parámetros: fechaDesde, fechaHasta, tipo_comprobante (opcional)
@@ -461,6 +524,57 @@ router.post('/pagos-cyc/export',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition',
       `attachment; filename="pagos-cyc-${fecha}.xlsx"`);
+    res.send(buffer);
+  }),
+);
+
+// ── POST /api/erp/formas-pago-cxc/upload ─────────────────────────────────────
+// Procesa el Excel "Pagos Asociados" (21 columnas, un pago CFDI por fila que aún no tiene
+// movimiento bancario identificado). Por cada fila:
+//   1. Ubica la factura en `cfdis` por Serie+Folio (source ERP, tipoDeComprobante 'I').
+//   2. Lee documentosRelacionados[0] → Serie/Folio del PEDIDO (no de la factura).
+//   3. Consulta la CxC en Kore con esa Serie/Folio del pedido (serieExterna/folioExterno).
+//   4. Lee las formas de pago reales de los abonos de esa CxC.
+//   5. Clasifica: bancaria / no bancaria / sin resolver (sin_factura, sin_pedido,
+//      sin_cxc_en_kore).
+// SÍNCRONO a propósito (mismo patrón que pagos-cyc/mostrador-cyc): puede tardar varios
+// minutos por la pausa de 1s entre llamados a Kore.
+router.post('/formas-pago-cxc/upload',
+  authenticate,
+  permit('banks:admin'),
+  uploadCyc.single('excelFile'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+    const result = await procesarFormasPagoCxc(
+      req.file.buffer,
+      req.user._id,
+      req.user.nombre,
+    );
+    res.json(result);
+  }),
+);
+
+// ── POST /api/erp/formas-pago-cxc/export ─────────────────────────────────────
+// Genera un Excel con 3 hojas a partir del resultado del upload:
+//   · Hoja "Concentrado bancarias" — filas cuya forma de pago real es bancaria (verde)
+//   · Hoja "No bancarias"          — filas cuya forma de pago real NO es bancaria (amarillo)
+//   · Hoja "Sin resolver"          — factura/pedido/CxC no encontrados, con razón y detalle (rojo)
+router.post('/formas-pago-cxc/export',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const resultado = req.body;
+    if (!resultado || typeof resultado !== 'object') {
+      return res.status(400).json({ error: 'Se requiere el resultado del procesamiento en el cuerpo' });
+    }
+
+    const buffer = await generarExcelFormasPagoCxc(resultado);
+
+    const fecha = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="formas-pago-cxc-${fecha}.xlsx"`);
     res.send(buffer);
   }),
 );
@@ -2624,6 +2738,7 @@ router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;
 router._esLinkPuroCancelacionODevolucion = _esLinkPuroCancelacionODevolucion;
 router._backfillFormasPagoYFolioFiscal   = _backfillFormasPagoYFolioFiscal;
 router._folioFiscalDentroDeVentanaReintento = _folioFiscalDentroDeVentanaReintento;
+router._resolverCuentaDesdeCfdiLiquidado    = _resolverCuentaDesdeCfdiLiquidado;
 router.SYNC_DELAY_MS                = SYNC_DELAY_MS;
 
 module.exports = router;

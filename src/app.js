@@ -23,6 +23,7 @@ const centrosCostoRoutes      = require('./banks/domains/centros-costo/centros-c
 const clientesRoutes          = require('./banks/domains/clientes/clientes.routes');
 const collectionRequestRoutes = require('./banks/domains/collection-requests/collection-request.routes');
 const bankErpRoutes           = require('./banks/domains/erp/erp.routes');
+const erpReversionRoutes      = require('./banks/domains/erp/erp-reversion.routes');
 const userRoutes              = require('./banks/domains/users/user.routes');
 const polizaRoutes            = require('./banks/domains/polizas/poliza.routes');
 const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mapping.routes');
@@ -123,6 +124,12 @@ app.use('/api/collection-requests',  collectionRequestRoutes);
 // Comparte prefijo /api/erp con visorErpRoutes (abajo); no hay colisión de paths.
 // Express evalúa este router primero y hace fall-through al siguiente si no hay match.
 app.use('/api/erp',                  bankErpRoutes);
+// Webhook de Kore (reversión/cancelación de CxC vinculada) + bandeja de auditoría. Prefijo
+// propio bajo /api/erp: erp.routes.js NO aplica authenticate a nivel de router (lo aplica
+// ruta por ruta), así que este montaje comparte el mismo comportamiento — el POST raíz de
+// erp-reversion.routes.js sigue autenticándose solo con X-Api-Key (verifyKoreApiKey), nunca
+// con Auth0, sin que ningún app.use() de nivel superior pueda interponerse por accidente.
+app.use('/api/erp/cxc-reversiones',  erpReversionRoutes);
 app.use('/api/users',                userRoutes);
 app.use('/api/polizas',              polizaRoutes);
 app.use('/api/cfdi-mapping',         cfdiMappingRoutes);

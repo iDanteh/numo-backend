@@ -117,6 +117,11 @@ const PERMISSIONS = Object.freeze({
   // modal ERP. Permiso nuevo, sin asignar a ningún rol todavía — decisión
   // pendiente del usuario, admin lo tiene por el wildcard '*'.
   BANKS_CFDI_READ:      'banks:cfdi:read',
+
+  // Ver la bandeja de auditoría de reversiones de CxC (webhook de Kore) y deshacer una si fue
+  // un error. Permiso nuevo, sin asignar a ningún rol todavía — mismo criterio que
+  // BANKS_CFDI_READ: decisión pendiente del usuario, admin lo tiene por el wildcard '*'.
+  BANKS_ERP_REVERSIONES: 'banks:erp:reversiones',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

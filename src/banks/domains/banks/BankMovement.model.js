@@ -74,6 +74,11 @@ const bankMovementSchema = new mongoose.Schema({
       // refresca el sync junto con tieneRetencion; null cuando no hay ninguna retención.
       montoRetenido:  { type: Number, default: null },
       tipoPago:       { type: String, default: null },
+      // Marca de procedencia de la CxC: 'cfdi_liquidado' cuando se resolvió vía el buscador
+      // de CFDI sin verificación en vivo contra Kore (ver erp.routes.js,
+      // _resolverCuentaDesdeCfdiLiquidado). Persistido para que la regla de negocio "una CxC
+      // de origen CFDI nunca es cobrable" sobreviva a cerrar y reabrir el modal ERP.
+      origen:         { type: String, default: null },
       // Snapshot de movimientos Kore para esta CxC (todos menos el primero — el primero
       // es el cargo original, no aporta al rastreo de conciliación). Lo llena y refresca
       // el job "Sync ERP-Kore" en cada corrida mientras la CxC siga abierta.

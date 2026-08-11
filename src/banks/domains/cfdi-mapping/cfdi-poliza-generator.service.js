@@ -54,6 +54,22 @@ async function _completarRelacionadosPostMerge(cfdisFinal, relMetodoPagoMap, rel
 
 const SUCURSAL_DEFAULT = 'Cedis';
 
+// Categorías de filtro por forma de pago para la póliza de Cobranza (Pagos) —
+// mismas categorías/códigos que ya usa el export CONTPAQ
+// (poliza.service.js: LABEL_FORMA_PAGO_CONSOLIDADO/FORMA_PAGO_TRANSFERENCIA/
+// FORMA_PAGO_CHEQUE), duplicado a propósito aquí (mismo patrón que otras
+// constantes pequeñas ya compartidas entre estos dos archivos). Solo aplica
+// cuando `tipoCfdi === 'P'` — para Ingreso/Egreso se ignora (confirmado con
+// el usuario 2026-08-11).
+const FORMA_PAGO_A_CATEGORIA = { '01': 'EFECTIVO', '02': 'CHEQUE', '03': 'TRANSFERENCIA', '04': 'TARJETA', '28': 'TARJETA' };
+
+// Para tipo P, `formaPago` casi nunca viene en el header del CFDI — vive en
+// el complemento (mismo fallback que ya usa `findRuleInList`/`satMeta` en
+// cfdi-mapping.service.js).
+function _formaPagoResuelta(cfdi) {
+  return cfdi.formaPago ?? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? null;
+}
+
 // Misma lista que TIPO_MARCADORES en cobros-sucursal-puente.service.js — el
 // marcador de TIPO del documento relacionado (no la referencia real a la
 // venta). Duplicado a propósito (archivo pequeño, mismo patrón que
@@ -426,15 +442,106 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
 }
 
 /**
- * Arma las 2 líneas (Abono subtotal + Abono IVA, sin ningún Cargo que las
- * compense) del saldo a favor generado por una Devolución — ver
- * `_prefetchSaldosFavorGenerados`. Deliberadamente NO cancela ni toca el
- * Abono normal de la Devolución (Caja/Bancos/Clientes, lo que sea):
- * confirmado con el usuario 2026-08-04 que ambos deben coexistir tal cual,
- * aunque a nivel de este único CFDI se vea "descuadrado" — el saldo a favor
- * es una cuenta de pasivo con saldo corrido (como Clientes/CxC), no algo que
- * tenga que cuadrar el mismo día; se resuelve solo cuando se registra su USO
- * en otra venta (ver `usadosPorCuenta` en cobros-sucursal-puente.service.js).
+ * Para cada CFDI tipo P (Complemento de Pago), extrae de
+ * `complementoPago.pagos[].doctosRelacionados[]` la serie/folio/monto de
+ * CADA factura que ese Pago liquida (`doctosPorUuid`, indexado por el UUID
+ * del propio Pago) — consumido por `cfdiToMovimientos` (`context.doctosPago`)
+ * para partir TANTO el Cargo como el Abono (columna H) en un asiento completo
+ * POR FACTURA liquidada, con concepto "{cliente} / {serie}-{folio de esa
+ * factura}" en vez de una sola línea agregada con el concepto genérico del
+ * Pago completo (confirmado con el usuario 2026-08-11 — solo aplica a Pagos,
+ * nunca a Ingreso/Egreso).
+ *
+ * Cada documento trae también su propio `montoSF` — lo consultado en
+ * `/desgloses-cobro/saldos-favor` (mismo endpoint que
+ * `_prefetchAjustesFacturaPropia` usa para tipo I) por la serie/folio de ESA
+ * factura específica, para saber si esa liquidación puntual se pagó (parcial
+ * o totalmente) con saldo a favor del cliente. A diferencia de tipo I, aquí
+ * NO se fusiona en el mapa agregado de `esCasoAjusteSFPuntos` — cada factura
+ * necesita su propio Cargo a Anticipos Otros individual, no uno agregado por
+ * todo el Pago (confirmado con el usuario 2026-08-11, corrigiendo el diseño
+ * inicial de esta función que sí agregaba por Pago).
+ *
+ * Simplificación consciente (confirmado con el usuario 2026-08-11): a
+ * diferencia de `_prefetchAjustesFacturaPropia`, NO filtra por día ni
+ * prorratea retenciones de IVA/ISR — un Pago PPD casi siempre ocurre días
+ * después de la venta que liquida, así que filtrar por el día de la factura
+ * descartaría el uso real; y este cliente no maneja Pagos con retención en la
+ * práctica. Si eso cambia, hay que revisar ambos puntos.
+ */
+async function _prefetchDoctosPago(cfdiConRegla, rfc) {
+  const pagos = cfdiConRegla.filter(({ cfdi }) => cfdi.tipoDeComprobante === 'P');
+  const doctosPorUuid = new Map(); // uuid del Pago → [{ serie, folio, monto }]
+  const paresVistos   = new Map(); // `${serie}|${folio}` → { serie, folio } (dedup entre Pagos)
+
+  for (const { cfdi } of pagos) {
+    const doctos = [];
+    for (const pago of (cfdi.complementoPago?.pagos ?? [])) {
+      for (const dr of (pago.doctosRelacionados ?? [])) {
+        const serie = dr.serie ?? null;
+        const folio = dr.folio ?? null;
+        const monto = Number(dr.impPagado ?? 0);
+        if (!serie || !folio || monto <= 0) continue;
+        // IVA de ESTE doctoRelacionado — mismo cálculo que el agregado de
+        // `iva` en cfdiToMovimientos (líneas ~558-565), pero por documento en
+        // vez de sumado para todo el Pago, para poder partir el swap "IVA
+        // cobrado" (Debe cuentaIvaPPD / Haber cuentaIva) por factura.
+        const ivaDoc = (dr.trasladosDR ?? [])
+          .filter(t => (t.impuesto || t.Impuesto || '') === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
+          .reduce((s, t) => s + Number(t.importe || t.importeDR || t.ImporteDR || 0), 0);
+        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc });
+        paresVistos.set(`${serie}|${folio}`, { serie, folio });
+      }
+    }
+    if (doctos.length > 0 && cfdi.uuid) doctosPorUuid.set(cfdi.uuid, doctos);
+  }
+
+  if (paresVistos.size === 0) return { doctosPorUuid };
+
+  const pares = [...paresVistos.values()];
+  const LOTE  = 150;
+  const saldoFavorPorFactura = new Map(); // `${serie}|${folio}` de la factura → monto usado
+  for (let i = 0; i < pares.length; i += LOTE) {
+    const lote = pares.slice(i, i + LOTE);
+    const resultado = await obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
+    for (const cuenta of resultado) {
+      const usados = cuenta.saldosFavorUsados ?? [];
+      if (!usados.length) continue;
+      const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+      if (monto > 0) saldoFavorPorFactura.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, monto);
+    }
+  }
+
+  if (saldoFavorPorFactura.size > 0) {
+    for (const doctos of doctosPorUuid.values()) {
+      for (const d of doctos) {
+        const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
+        if (sf > 0) d.montoSF = sf;
+      }
+    }
+  }
+
+  return { doctosPorUuid };
+}
+
+/**
+ * Arma las 2 líneas (Abono subtotal + Abono IVA) del saldo a favor generado
+ * por una Devolución — ver `_prefetchSaldosFavorGenerados` (el monto viene
+ * confirmado por el ERP, no es especulativo). Hasta 2026-08-10 estas 2 líneas
+ * se dejaban deliberadamente sin ningún Cargo que las compensara (confirmado
+ * con el usuario 2026-08-04: "el saldo a favor es un pasivo con saldo
+ * corrido, no tiene que cuadrar el mismo día") — pero eso descuadraba el
+ * asiento completo, porque el Abono normal de la Devolución (Caja por
+ * identificar/Bancos/Clientes) ya contaba el mismo dinero como "salida de
+ * efectivo" Y estas 2 líneas lo contaban OTRA VEZ como "pasivo nuevo". Ambas
+ * cosas no pueden ser ciertas a la vez por el mismo monto. El caller (ver
+ * `generarPropuesta`/`generarPolizaDesdeMovimientos`) ahora agrega una
+ * tercera línea de Cargo que cierra exactamente ese Abono normal por el
+ * monto que se convirtió en saldo a favor — el pasivo en sí (cuenta
+ * Anticipos Otros) sigue con saldo corrido igual que antes; lo que cambia es
+ * que ya no se duplica el mismo dinero dentro de ESTE asiento. Su consumo
+ * futuro (cuando el saldo se aplica a otra venta) sigue sin tocarse aquí —
+ * ver `usadosPorCuenta` en cobros-sucursal-puente.service.js.
  * Concepto/serie usan la VENTA que generó el saldo, no el folio propio de la
  * Devolución. Devuelve `[]` si esta Devolución no generó saldo a favor.
  *
@@ -445,7 +552,8 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
  * propia serie), pero el asiento le corresponde a la otra sucursal. En vez de
  * eso, ENCOLA en `CobroSucursalPendiente` (mismo mecanismo que un cobro
  * cruzado normal) para que esa sucursal lo aplique al generar su propia
- * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza).
+ * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza — tampoco
+ * hay Cargo de cierre que agregar en el caller, porque no hay líneas).
  */
 async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cc, rfc }) {
   if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
@@ -1060,7 +1168,7 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
 const LIMITE_CFDIS = 500;
 const CHUNK_SIZE   = 200;
 
-async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -1129,7 +1237,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   await repararSubtotalDesdeXml(cfdis);
 
-  const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
+  // Filtro por forma de pago (solo Cobranza/Pagos) — ver `FORMA_PAGO_A_CATEGORIA`.
+  const cfdisSinPoliza = cfdis.filter(c =>
+    !uuidsYaUsados.has(c.uuid) &&
+    (!formaPagoFiltro || tipoCfdi !== 'P' || FORMA_PAGO_A_CATEGORIA[_formaPagoResuelta(c)] === formaPagoFiltro),
+  );
 
   // Antes ambos casos (cero CFDIs encontrados vs. todos ya poliza'dos) tiraban
   // el mismo mensaje "ya tienen póliza registrada" — confuso cuando en
@@ -1300,6 +1412,15 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     ? [...cfdisSinPolizaFinalFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap: ccBySerieMapProp })]
     : cfdisSinPolizaFinalFiltrado;
 
+  // Póliza de Pagos (Cobranza): ordenar por folio del Pago ascendente — sin
+  // esto el orden es el que regresa Mongo (esencialmente arbitrario), lo que
+  // resultaba en saltos entre centros de costo sin ningún criterio visible
+  // (confirmado con el usuario 2026-08-11). Solo tipo P — Ingreso/Egreso no
+  // se tocan.
+  if (tipoCfdi === 'P') {
+    cfdisConNCProp.sort((a, b) => Number(a.folio) - Number(b.folio));
+  }
+
   // Las NC fusionadas (_fetchNotasCreditoParaFusion) se agregan DESPUÉS del
   // primer `_completarRelacionadosPostMerge` — completar de nuevo (solo agrega
   // lo que aún falte) para que su `context.metodoPagoRelacionado` también se
@@ -1411,6 +1532,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Desglose real de forma de pago (ver `_prefetchDesglosePagoReal`) — antes
   // de precalcular el `context` por CFDI, para que esté disponible ahí.
   const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc);
+  // Documentos liquidados por cada Pago (asiento completo por factura,
+  // incluyendo su propio saldo a favor si aplica) — ver `_prefetchDoctosPago`.
+  const { doctosPorUuid: doctosPagoMapProp } = await _prefetchDoctosPago(cfdiConRegla, rfc);
   // Acumulador de Puntos usados en TODO el batch, por sucursal — Puntos va
   // consolidado en una sola línea genérica al final (a diferencia de Saldo a
   // Favor, que sí es individual), ver push al final de este flujo.
@@ -1533,6 +1657,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
     }
+    if (cfdi.tipoDeComprobante === 'P') {
+      const doctosPago = doctosPagoMapProp.get(cfdi.uuid);
+      if (doctosPago) context.doctosPago = doctosPago;
+    }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
 
@@ -1623,13 +1751,42 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     // Saldo a favor generado por esta Devolución (ver
-    // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`) — nunca
-    // toca las líneas normales de la Devolución, solo agrega el pasivo aparte.
-    for (const linea of await _inyectarSaldoFavorGenerado({
+    // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`).
+    const lineasSaldoFavorProp = await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
       cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp, cc: ccProp, rfc,
-    })) {
+    });
+    for (const linea of lineasSaldoFavorProp) {
       movimientosResult.push(linea);
+    }
+    // Cierra el Abono de Caja/Bancos/Clientes que dejó la Devolución (mismo
+    // monto que se convirtió en Anticipos Otros) — sin esto el asiento queda
+    // descuadrado: el mismo dinero se contaba dos veces (salida de
+    // Caja/Bancos Y pasivo de saldo a favor). Revierte, para el cuadre por
+    // asiento que exige el export CONTPAQ, la coexistencia deliberada
+    // confirmada 2026-08-04 (ver docstring de `_inyectarSaldoFavorGenerado`)
+    // — confirmado con el usuario 2026-08-10 que debe cuadrar por asiento.
+    if (lineasSaldoFavorProp.length > 0) {
+      const montoSaldoFavorProp = lineasSaldoFavorProp.reduce((s, l) => s + (Number(l.haber) || 0), 0);
+      const abonoDevolucionProp = movs.find(m => Number(m.haber) > 0);
+      if (abonoDevolucionProp && montoSaldoFavorProp > 0) {
+        movimientosResult.push({
+          ...abonoDevolucionProp,
+          debe:          montoSaldoFavorProp,
+          haber:         0,
+          centroCosto:   ccProp?.clave ?? abonoDevolucionProp.centroCosto ?? null,
+          centroCostoId: ccProp?.id    ?? null,
+          _cfdiInfo: {
+            uuid:              cfdi.uuid,
+            tipo:              cfdi.tipoDeComprobante,
+            emisor:            cfdi.emisor?.rfc,
+            total:             cfdi.total,
+            fecha:             cfdi.fecha,
+            sinRegla:          !!abonoDevolucionProp._sinRegla,
+            comparisonStatus:  cfdi.lastComparisonStatus ?? null,
+          },
+        });
+      }
     }
 
     // Asiento adicional PPD cobrada en otra sucursal: Abono a Clientes (misma
@@ -1875,7 +2032,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
  *
  * Devuelve: { polizaId, totalCfdis, sinRegla, advertencias }
  */
-async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -1930,7 +2087,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   await repararSubtotalDesdeXml(cfdis);
 
-  const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
+  // Filtro por forma de pago (solo Cobranza/Pagos) — ver `FORMA_PAGO_A_CATEGORIA`.
+  const cfdisSinPoliza = cfdis.filter(c =>
+    !uuidsYaUsados.has(c.uuid) &&
+    (!formaPagoFiltro || tipoCfdi !== 'P' || FORMA_PAGO_A_CATEGORIA[_formaPagoResuelta(c)] === formaPagoFiltro),
+  );
 
   // Antes ambos casos (cero CFDIs encontrados vs. todos ya poliza'dos) tiraban
   // el mismo mensaje "ya tienen póliza registrada" — confuso cuando en
@@ -2091,6 +2252,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     ? [...cfdisSinPolizaFinalGuardFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalGuardFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap })]
     : cfdisSinPolizaFinalGuardFiltrado;
 
+  // Ver comentario equivalente en generarPropuesta.
+  if (tipoCfdi === 'P') {
+    cfdisConNCGuard.sort((a, b) => Number(a.folio) - Number(b.folio));
+  }
+
   // Las NC fusionadas se agregan DESPUÉS del primer `_completarRelacionadosPostMerge`
   // — completar de nuevo (solo agrega lo que aún falte), ver comentario equivalente
   // en generarPropuesta.
@@ -2182,6 +2348,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc);
+  // Ver comentario equivalente en generarPropuesta.
+  const { doctosPorUuid: doctosPagoMapGuard } = await _prefetchDoctosPago(cfdiConRegla, rfc);
   const puntosAcumuladosGuard = new Map(); // centroCostoId → { monto, centroCosto }
 
   // 6. Pre-fetch CFDIs relacionados (5° movimiento anticipo) y saldo a favor
@@ -2315,6 +2483,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
     }
+    if (cfdi.tipoDeComprobante === 'P') {
+      const doctosPago = doctosPagoMapGuard.get(cfdi.uuid);
+      if (doctosPago) context.doctosPago = doctosPago;
+    }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
@@ -2385,11 +2557,28 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
     // Saldo a favor generado por esta Devolución — ver comentario
     // equivalente en generarPropuesta.
-    for (const linea of await _inyectarSaldoFavorGenerado({
+    const lineasSaldoFavorGuard = await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
       cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard, cc, rfc,
-    })) {
+    });
+    for (const linea of lineasSaldoFavorGuard) {
       todosLosMovimientos.push(linea);
+    }
+    // Cierra el Abono de Caja/Bancos/Clientes de la Devolución — ver
+    // comentario equivalente en generarPropuesta.
+    if (lineasSaldoFavorGuard.length > 0) {
+      const montoSaldoFavorGuard = lineasSaldoFavorGuard.reduce((s, l) => s + (Number(l.haber) || 0), 0);
+      const abonoDevolucionGuard = movs.find(m => Number(m.haber) > 0);
+      if (abonoDevolucionGuard && montoSaldoFavorGuard > 0) {
+        todosLosMovimientos.push({
+          ...abonoDevolucionGuard,
+          debe:           montoSaldoFavorGuard,
+          haber:          0,
+          cuentaFaltante: abonoDevolucionGuard.cuentaId == null,
+          centroCosto:    cc?.clave ?? abonoDevolucionGuard.centroCosto ?? null,
+          centroCostoId:  cc?.id    ?? null,
+        });
+      }
     }
 
     // Ver comentario equivalente en generarPropuesta.
@@ -2648,7 +2837,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
  *
  * Devuelve: { resultados: [{ centroCosto, centroCostoId, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi }) {
+async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, formaPagoFiltro }) {
   const centros = await centrosSvc.list();
   const centrosConSerie = centros.filter(c => c.serieFacturacion);
 
@@ -2658,7 +2847,7 @@ async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropues
 
   const resultados = await _conLimite(centrosConSerie, CONCURRENCIA_GENERACION, async (cc) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, formaPagoFiltro });
       return { centroCosto: cc.sucursal, centroCostoId: cc.id, ...r };
     } catch (err) {
       // "No hay CFDIs para esta sucursal" es esperado (no toda sucursal tiene
@@ -2807,7 +2996,7 @@ const CONCURRENCIA_GENERACION = 4;
  *
  * Devuelve: { resultados: [{ fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
@@ -2816,7 +3005,7 @@ async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 
 
   const resultados = await _conLimite(dias, CONCURRENCIA_GENERACION, async (dia) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia, formaPagoFiltro });
       return { fecha: dia, ...r };
     } catch (err) {
       // "No hay CFDIs para este día" es esperado (no todos los días tienen
@@ -2836,7 +3025,7 @@ async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 
  *
  * Devuelve: { resultados: [{ centroCosto, centroCostoId, fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin }) {
+async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
@@ -2855,7 +3044,7 @@ async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPro
 
   const resultados = await _conLimite(combinaciones, CONCURRENCIA_GENERACION, async ({ cc, dia }) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia, formaPagoFiltro });
       return { centroCosto: cc.sucursal, centroCostoId: cc.id, fecha: dia, ...r };
     } catch (err) {
       // "No hay CFDIs para esta sucursal/día" es esperado — se reporta sin

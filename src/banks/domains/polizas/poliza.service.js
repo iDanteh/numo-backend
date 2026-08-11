@@ -76,7 +76,7 @@ const BANCO_A_CODIGO_CUENTA = {
  *
  * @param {{cfdiUuid: string, serie: string}[]} movimientos
  * @param {string} rfc
- * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, cuentaBanco: {codigo:string,nombre:string}|null}>>}
+ * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, cuentaBanco: {id:number,codigo:string,nombre:string}|null}>>}
  *   uuid (mayúsculas) → info bancaria. `cuentaBanco`: cuenta real del banco
  *   donde cayó el depósito (ver `BANCO_A_CODIGO_CUENTA`) — null cuando el
  *   banco no tiene cuenta dedicada en el catálogo, o no se pudo determinar.
@@ -127,10 +127,10 @@ async function construirVerdadBancaria(movimientos, rfc) {
   const codigosBanco = Object.values(BANCO_A_CODIGO_CUENTA);
   const cuentasBancoRows = await AccountPlan.findAll({
     where:      { codigo: { [Op.in]: codigosBanco } },
-    attributes: ['codigo', 'nombre'],
+    attributes: ['id', 'codigo', 'nombre'],
     raw:        true,
   });
-  const cuentaPorCodigo = new Map(cuentasBancoRows.map(r => [r.codigo, { codigo: r.codigo, nombre: r.nombre }]));
+  const cuentaPorCodigo = new Map(cuentasBancoRows.map(r => [r.codigo, { id: r.id, codigo: r.codigo, nombre: r.nombre }]));
 
   for (const m of movs) {
     const cat = (m.categoria || '').toUpperCase();
@@ -401,6 +401,136 @@ async function cancelarTodas({ rfc, ejercicio, periodo, polizaIds }, user, motiv
   return { canceladas, errores, total: polizas.length };
 }
 
+// Códigos de cuenta bancaria real (destino del reemplazo) — un movimiento que
+// YA quedó en una de estas cuentas no se vuelve a tocar.
+const CODIGOS_CUENTA_BANCO_REAL = new Set(Object.values(BANCO_A_CODIGO_CUENTA));
+
+// Cuentas genéricas/placeholder (ver seed-account-plan.js) — un movimiento que
+// siga en alguna de estas después del cruce automático se reporta como
+// "pendiente" para que el usuario lo resuelva a mano (ver `resolverCuentasBanco`).
+const CODIGOS_CUENTA_PUENTE = new Set(['1101010003', '1102010004', '1102011005']);
+
+/**
+ * Reemplaza, en los movimientos de la póliza, la cuenta genérica ("Bancos por
+ * identificar") por la cuenta bancaria real — usando el mismo cruce
+ * (`construirVerdadBancaria`) que ya usa el export CONTPAQ, pero persistido
+ * en `poliza_movimientos.cuenta_id` en vez de calculado solo al exportar.
+ * Cobertura parcial (~59%, ver docstring de `construirVerdadBancaria`): los
+ * movimientos sin cruce posible (sin `cfdiUuid`, o sin `erpLinks` en su
+ * `BankMovement`) se quedan con la cuenta que ya tenían — no es un error,
+ * quedan disponibles para el reemplazo manual (`reemplazarCuenta`).
+ */
+async function _resolverCuentasBancoReal(poliza) {
+  const verdadBancaria = await construirVerdadBancaria(
+    poliza.movimientos.map(m => ({ cfdiUuid: m.cfdiUuid, serie: m.serie })),
+    poliza.rfc,
+  );
+  if (verdadBancaria.size === 0) return [];
+
+  const actualizaciones = [];
+  for (const m of poliza.movimientos) {
+    if (!m.cfdiUuid) continue;
+    if (CODIGOS_CUENTA_BANCO_REAL.has(m.cuenta?.codigo)) continue; // ya es cuenta real
+    const info = verdadBancaria.get(m.cfdiUuid.toUpperCase());
+    if (info?.cuentaBanco?.id) {
+      actualizaciones.push({ movimientoId: m.id, cuentaId: info.cuentaBanco.id });
+    }
+  }
+  return actualizaciones;
+}
+
+/**
+ * Corre el cruce automático de cuentas de banco (`_resolverCuentasBancoReal`)
+ * y lo persiste, sin cambiar el estado de la póliza. Pensado como paso previo
+ * a `contabilizar` desde el frontend: primero resuelve lo que se puede
+ * automáticamente, y devuelve agrupado lo que quedó en cuenta puente para que
+ * el usuario decida manualmente (modal) antes de confirmar la contabilización.
+ */
+/**
+ * Corre `_resolverCuentasBancoReal` y persiste — compartido por
+ * `resolverCuentasBanco` (modal al contabilizar) y `exportContpaqXlsx`
+ * (para que el Excel y lo guardado en la póliza siempre coincidan). No
+ * revalida estado — quien llama decide si aplica (cualquier estado excepto
+ * 'cancelada' es seguro: cambiar la cuenta no altera debe/haber).
+ */
+async function _resolverYPersistirCuentasBanco(poliza) {
+  const actualizacionesCuenta = await _resolverCuentasBancoReal(poliza);
+  if (actualizacionesCuenta.length === 0) return { poliza, actualizados: 0 };
+  await repo.actualizarCuentasMovimientos(poliza.id, actualizacionesCuenta);
+  return { poliza: await repo.findByIdLight(poliza.id), actualizados: actualizacionesCuenta.length };
+}
+
+async function resolverCuentasBanco(id) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza)                      throw new NotFoundError('Póliza');
+  if (poliza.estado !== 'borrador') throw new ValidationError('Solo se pueden resolver cuentas en pólizas en borrador');
+
+  const { poliza: actualizada, actualizados } = await _resolverYPersistirCuentasBanco(poliza);
+
+  const pendientesMap = new Map();
+  for (const m of actualizada.movimientos) {
+    const codigo = m.cuenta?.codigo;
+    if (!codigo || !CODIGOS_CUENTA_PUENTE.has(codigo)) continue;
+    const prev = pendientesMap.get(m.cuentaId) ?? {
+      cuentaId: m.cuentaId, codigo, nombre: m.cuenta.nombre, cantidadLineas: 0, monto: 0,
+    };
+    prev.cantidadLineas += 1;
+    prev.monto = parseFloat((prev.monto + Number(m.debe || 0) + Number(m.haber || 0)).toFixed(2));
+    pendientesMap.set(m.cuentaId, prev);
+  }
+
+  return { actualizados, pendientes: [...pendientesMap.values()] };
+}
+
+/**
+ * Resuelve, para los CFDIs cuyo movimiento bancario se acaba de identificar
+ * (ver `setErpIds` en bank.service.js), cualquier línea de póliza que siga en
+ * cuenta puente para ese mismo `cfdiUuid` — sin importar si la póliza ya está
+ * en borrador o contabilizada (cambiar la cuenta no altera el cuadre, solo
+ * corrige la clasificación). No toca pólizas canceladas.
+ *
+ * Llamado desde el módulo de bancos justo después de guardar `erpLinks`, para
+ * que la cuenta puente se resuelva sola en el momento en que se concilia el
+ * banco, sin que el usuario tenga que volver a la póliza.
+ *
+ * @param {string[]} uuids       — folioFiscal de los CFDIs recién vinculados
+ * @param {string}   bancoNombre — `BankMovement.banco` (ver BANCO_A_CODIGO_CUENTA)
+ * @returns {Promise<number>} cantidad de líneas actualizadas
+ */
+async function resolverCuentasPorCfdisIdentificados(uuids, bancoNombre) {
+  const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[bancoNombre];
+  if (!codigoCuentaBanco || !uuids?.length) return 0;
+
+  const cuentaBanco = await AccountPlan.findOne({ where: { codigo: codigoCuentaBanco }, attributes: ['id'] });
+  if (!cuentaBanco) return 0;
+
+  const uuidsUpper = [...new Set(uuids.filter(Boolean).map(u => u.toUpperCase()))];
+  if (uuidsUpper.length === 0) return 0;
+
+  const movimientos = await PolizaMovimiento.findAll({
+    where: { cfdiUuid: { [Op.in]: uuidsUpper } },
+    include: [
+      { model: AccountPlan, as: 'cuenta', attributes: ['codigo'] },
+      { model: Poliza, as: 'poliza', attributes: ['id', 'estado'] },
+    ],
+  });
+
+  const porPoliza = new Map();
+  for (const m of movimientos) {
+    if (m.poliza?.estado === 'cancelada') continue;
+    if (!CODIGOS_CUENTA_PUENTE.has(m.cuenta?.codigo)) continue;
+    if (!porPoliza.has(m.polizaId)) porPoliza.set(m.polizaId, []);
+    porPoliza.get(m.polizaId).push({ movimientoId: m.id, cuentaId: cuentaBanco.id });
+  }
+
+  let total = 0;
+  for (const [polizaId, actualizaciones] of porPoliza) {
+    await repo.actualizarCuentasMovimientos(polizaId, actualizaciones);
+    total += actualizaciones.length;
+  }
+  return total;
+}
+
 async function contabilizar(id, user) {
   // findByIdLight: sólo PostgreSQL, sin consulta cruzada a MongoDB
   const poliza = await repo.findByIdLight(id);
@@ -418,6 +548,16 @@ async function contabilizar(id, user) {
 
   validateBalance(poliza.movimientos.map(m => ({ debe: m.debe, haber: m.haber })));
 
+  // Antes de contabilizar: reemplazar cuenta genérica de banco por la cuenta
+  // real donde se identificó el depósito (ver `_resolverCuentasBancoReal`).
+  // No afecta el cuadre (mismo movimiento, solo cambia la cuenta) — se hace
+  // antes de `validateBalance` conceptualmente, pero como no altera debe/haber
+  // no hace falta revalidar.
+  const actualizacionesCuenta = await _resolverCuentasBancoReal(poliza);
+  if (actualizacionesCuenta.length > 0) {
+    await repo.actualizarCuentasMovimientos(id, actualizacionesCuenta);
+  }
+
   const updated = await repo.setEstado(id, 'contabilizada', {
     contabilizadoPor: userLabel(user),
     contabilizadaAt:  new Date(),
@@ -425,10 +565,42 @@ async function contabilizar(id, user) {
   return updated;
 }
 
-async function revertir(id, user, motivo) {
+/**
+ * Reemplazo manual: cambia todas las líneas de la póliza que usan
+ * `cuentaPuenteId` por `cuentaDestinoId`. Pensado para resolver a mano el
+ * resto de los casos que `_resolverCuentasBancoReal` no pudo cruzar
+ * automáticamente al contabilizar.
+ */
+async function reemplazarCuenta(id, { cuentaPuenteId, cuentaDestinoId }, user) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+  if (poliza.estado === 'cancelada') throw new ValidationError('No se puede modificar una póliza cancelada');
+  if (!cuentaPuenteId || !cuentaDestinoId) {
+    throw new ValidationError('cuentaPuenteId y cuentaDestinoId son requeridos');
+  }
+  if (Number(cuentaPuenteId) === Number(cuentaDestinoId)) {
+    throw new ValidationError('La cuenta destino debe ser distinta de la cuenta puente');
+  }
+
+  const destino = await AccountPlan.findByPk(cuentaDestinoId);
+  if (!destino) throw new ValidationError('Cuenta destino no encontrada en el catálogo');
+
+  const afectados = await repo.reemplazarCuentaEnPoliza(id, cuentaPuenteId, cuentaDestinoId);
+  return { afectados, poliza: await repo.findByIdLight(id) };
+}
+
+async function revertir(id, user, motivo, revertirCuentas = true) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza)                           throw new NotFoundError('Póliza');
   if (poliza.estado !== 'contabilizada') throw new ValidationError('Solo se pueden revertir pólizas contabilizadas');
+
+  // Deshace el cruce banco-real (automático o manual) que se hizo al
+  // contabilizar — la póliza vuelve a quedar exactamente como estaba antes.
+  // Opcional (default true): el usuario puede optar por conservar el cruce
+  // ya resuelto si solo revierte para corregir algo distinto.
+  if (revertirCuentas) {
+    await repo.restaurarCuentasAnteriores(id);
+  }
 
   const updated = await repo.setEstado(id, 'borrador', {
     revertidoPor:    userLabel(user),
@@ -762,6 +934,70 @@ function categorizarAjusteContado(m) {
  *   ordenado Efectivo → Tarjeta). El caller decide en qué secuencia los
  *   concatena (ver `aplanarCargosConsolidados` y `armarBloqueContado`).
  */
+/**
+ * Variante de `consolidarCargos` para la póliza de Cobranza (Pagos) SIN
+ * agrupar/mezclar líneas — anota cada Cargo (debe>0) con su cuenta bancaria
+ * real y subcódigo (transferencia o no), pero conserva exactamente una línea
+ * de salida por cada línea de entrada, en el mismo orden. A diferencia de
+ * Contado/Crédito, aquí NO se quiere consolidar varias facturas del mismo
+ * Pago en una sola línea: `cfdiToMovimientos` (cfdi-mapping.service.js,
+ * `esSplitPagoPorFactura`) ya arma Cargo+IVA+Abono agrupados por factura
+ * liquidada, y `consolidarCargos` los volvía a fusionar en una sola línea
+ * porque agrupa por `cfdiUuid` cuando no hay referencia bancaria — todas las
+ * líneas de un mismo Pago comparten el mismo `cfdiUuid` (confirmado con el
+ * usuario 2026-08-11). Los Abono (haber>0) tampoco se separan aparte — se
+ * dejan intercalados como ya vienen.
+ */
+function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null) {
+  return movs.map(m => {
+    if (!(Number(m.debe) > 0)) return m;
+    // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
+    // SF no representan un depósito bancario — no se les debe cambiar la
+    // cuenta a un banco real ni asignarles el subcódigo de transferencia
+    // (confirmado con el usuario 2026-08-11). Se dejan pasar tal cual, solo
+    // con subcódigo 0.
+    if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL) {
+      return {
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: m.serie, concepto: m.concepto,
+        centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
+        debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
+        rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
+        tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+      };
+    }
+    const bancario = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
+    const esTransferenciaVerificada = bancario?.categoriaConocida
+      ? bancario.esTransferencia
+      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
+    // El concepto por-factura que arma `cfdiToMovimientos` ("cliente /
+    // serie-folio") ya viene completo — se deja tal cual. Si no lo tiene
+    // (caso viejo/`tasaIva==='mixto'` sin split), se enriquece aquí con el
+    // nombre del cliente, mismo criterio que antes hacía `consolidarCargos`.
+    const nombre = nombresClientes?.get((m.cfdiUuid || '').toUpperCase()) || '';
+    const yaEnriquecido = !nombre || m.concepto?.includes(nombre);
+    // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
+    // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
+    // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
+    // `armarIndividual` en `consolidarCargos`, se listan los campos a mano.
+    return {
+      cuenta:         bancario?.cuentaBanco ?? m.cuenta,
+      cuentaId:       m.cuentaId,
+      serie:          m.serie,
+      concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
+      centroCosto:    m.centroCosto,
+      centroCostoObj: m.centroCostoObj,
+      debe:           Number(m.debe),
+      haber:          Number(m.haber),
+      cfdiUuid:       m.cfdiUuid,
+      rfcTercero:     m.rfcTercero,
+      formaPago:      m.formaPago,
+      reglaNombre:    m.reglaNombre,
+      tipoOrigen:     m.tipoOrigen,
+      _subcodigo:     esTransferenciaVerificada ? subcodigoTransferencia : 0,
+    };
+  });
+}
+
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
@@ -1168,6 +1404,16 @@ function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
   for (const m of movimientos) {
+    // Las líneas de Saldo a Favor de un Pago (tipoComprobante='P',
+    // `esSplitPagoPorFactura` en cfdi-mapping.service.js) también llevan
+    // `tipoOrigen: 'Cargo Especial'` para reusar la misma etiqueta 'SF' —
+    // pero a diferencia del caso de Ingreso (SF/Puntos en una venta normal,
+    // donde SÍ deben salir a este bloque aparte), aquí deben quedarse en su
+    // lugar dentro de `movimientos`, junto a las otras 3 líneas de su misma
+    // factura (confirmado con el usuario 2026-08-11 — si se extraen, se ven
+    // sueltas en vez de agrupadas por factura).
+    const esCargoEspecialDePago = m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.tipoComprobante === 'P';
+    if (esCargoEspecialDePago) { resto.push(m); continue; }
     if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
     if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO) continue;
     // OJO: NO usar `verdadBancaria`/`construirVerdadBancaria` aquí (busca por
@@ -1558,8 +1804,17 @@ function enriquecerConceptoConCliente(movs, nombresClientes) {
  *   { fecha, folioContado, folioCredito, conceptoContado, conceptoCredito }
  */
 async function exportContpaqXlsx(id, overrides = {}) {
-  const poliza = await repo.findByIdLight(id);
+  let poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
+
+  // Persistir cualquier cruce banco-real pendiente ANTES de armar el Excel —
+  // así lo que se exporta y lo que queda guardado en poliza_movimientos
+  // siempre coinciden, en vez de que el export lo calcule aparte cada vez
+  // (ver `_resolverYPersistirCuentasBanco`). Cambiar la cuenta no altera
+  // debe/haber, así que es seguro para cualquier estado excepto 'cancelada'.
+  if (poliza.estado !== 'cancelada') {
+    ({ poliza } = await _resolverYPersistirCuentasBanco(poliza));
+  }
 
   let movimientos = poliza.movimientos ?? [];
 
@@ -1712,7 +1967,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
     bloques = [{
       tipoVenta: null,
       movs:      esPagos
-        ? [...movimientos.filter(m => Number(m.haber) > 0), ...aplanarCargosConsolidados(consolidarCargos(movimientos, 20, false, verdadBancaria, nombresClientes))]
+        ? anotarCargosPorFacturaSinAgrupar(movimientos, 20, verdadBancaria, nombresClientes)
         : ordenarCargoAntesDeAbono(movimientos),
       folio:     overrides.folioContado   ?? poliza.numero,
       concepto:  overrides.conceptoContado ?? poliza.concepto,
@@ -2086,7 +2341,8 @@ async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
 
 module.exports = {
   list, getById, create, update, cancel, cancelarTodas, listBorradorCandidatas, contabilizar, revertir, generarXmlSat,
-  reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq,
+  reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
+  resolverCuentasPorCfdisIdentificados,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
 };

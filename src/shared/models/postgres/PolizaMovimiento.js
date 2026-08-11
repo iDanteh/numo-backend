@@ -30,6 +30,12 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
     allowNull:    false,
     defaultValue: false,        // true = cuenta configurada en la regla no existe en catálogo
   },
+  cuentaAnteriorId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'account_plans', key: 'id' },
+    comment:    'Cuenta antes del cruce banco-real/reemplazo manual (ver poliza.service.js) — se restaura al revertir la póliza a borrador y se limpia después.',
+  },
   concepto: {
     type:      DataTypes.STRING(500),
     allowNull: false,

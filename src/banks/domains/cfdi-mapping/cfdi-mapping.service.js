@@ -661,6 +661,17 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const esIvaHaber        = !!(rule.ivaHaber === true && tipo === 'E');
   const esAplicacionSaldo = !!(rule.esAplicacionSaldo && context.saldoDisponible != null);
 
+  // Split de Pago (Cargo Y Abono) por FACTURA liquidada — solo Pagos (nunca
+  // Ingreso/Egreso), confirmado con el usuario 2026-08-11. `context.doctosPago`
+  // viene de `_prefetchDoctosPago` (cfdi-poliza-generator.service.js): cada
+  // factura que este Complemento de Pago liquida forma su propio asiento
+  // completo (Cargo + Abono), en vez de un solo Cargo agregado para todo el
+  // Pago. No aplica junto con `tasaIva==='mixto'` (ese motor ya parte el
+  // abono por tasa) ni con `esAnticipo`/`esAplicacionSaldo` (casos distintos,
+  // fuera de alcance por ahora).
+  const esSplitPagoPorFactura = esPago && !esAnticipo && !esAplicacionSaldo && rule.tasaIva !== 'mixto'
+    && Array.isArray(context.doctosPago) && context.doctosPago.length > 0;
+
   // H1: para Reg 22C cuando factura final > anticipo, el cargo debe cancelar SOLO el pasivo del
   // anticipo (no el subtotal completo de la factura). El IVA diferido a cancelar también es solo
   // el del anticipo. El exceso va a Bancos via el bloque delta.
@@ -750,7 +761,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // no hubiera desglose en absoluto.
     && Math.abs(totalFormasPagoReal - montoCargo) < 0.02;
 
-  if (esCasoAjusteSFPuntos) {
+  if (esSplitPagoPorFactura) {
+    // Asiento completo (Cargo + IVA cobrado + Abono) POR FACTURA liquidada —
+    // para que las líneas de una misma factura queden CONSECUTIVAS en vez de
+    // en tres pasadas separadas (todos los Cargos, luego todo el IVA cobrado,
+    // luego todos los Abonos), se difiere todo a un solo bucle unificado más
+    // abajo, junto al Abono (confirmado con el usuario 2026-08-11: los
+    // renglones de cada factura deben verse juntos). Ver ese bloque para el
+    // detalle de Cargo/SF/IVA — aquí no se empuja nada.
+  } else if (esCasoAjusteSFPuntos) {
     let restante = montoCargo;
     // Saldo a Favor: individual por cliente/factura (confirmado con el
     // usuario 2026-08-06) — mismo patrón que un cruce real de sucursal, pero
@@ -887,7 +906,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // Reconocimiento de IVA al cobro (solo tipo P con PPD configurado)
   // Cancela el saldo de cuentaIvaPPD y lo traslada a cuentaIva.
   // esAnticipo usa su propio bloque de swap IVA → se omite aquí.
-  if (esPago && !esAnticipo && iva > 0 && rule.cuentaIvaPPD && rule.cuentaIva) {
+  // Split por factura: diferido al bucle unificado junto al Abono (ver
+  // comentario en el bloque de Cargo) — aquí solo se arma para el caso NO
+  // partido.
+  if (esPago && !esAnticipo && iva > 0 && rule.cuentaIvaPPD && rule.cuentaIva && !esSplitPagoPorFactura) {
     movs.push({
       cuentaId:    cuentaMap[rule.cuentaIvaPPD] ?? null,
       concepto:    `IVA cobrado - ${concepto}`,
@@ -1111,17 +1133,79 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // El descuento se netea directamente en montoAbono (subtotal − descuento).
   // No se genera línea separada de Descuentos s/Ventas.
 
-  movs.push({
-    cuentaId:    cuentaMap[rule.cuentaAbono] ?? null,
-    concepto,
-    centroCosto,
-    ventaFecha,
-    serie:       serieCfdi,
-    debe:        0,
-    haber:       montoAbono,
-    cfdiUuid:    cfdi.uuid,
-    rfcTercero,
-  });
+  // Asiento completo POR FACTURA liquidada — Cargo (+SF si aplica) + IVA
+  // cobrado + Abono, todo consecutivo por factura (confirmado con el usuario
+  // 2026-08-11: los renglones de una misma factura deben verse juntos, no en
+  // tres pasadas separadas). Reemplaza los bloques de Cargo/IVA cobrado de
+  // arriba para este caso (ver sus comentarios) y el Abono agregado del
+  // `else` de aquí abajo.
+  if (esSplitPagoPorFactura) {
+    const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+    const totalDoctos    = context.doctosPago.reduce((s, d) => s + d.monto, 0);
+    const aplicaIvaCobrado = iva > 0 && rule.cuentaIvaPPD && rule.cuentaIva;
+    let acumuladoCargo = 0;
+    let acumuladoAbono = 0;
+    context.doctosPago.forEach((d, idx) => {
+      const esUltimo = idx === context.doctosPago.length - 1;
+      const share = totalDoctos > 0 ? d.monto / totalDoctos : 1 / context.doctosPago.length;
+      const conceptoFactura = [nombreCliente, `${d.serie}-${d.folio}`].filter(Boolean).join(' / ');
+      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieCfdi, cfdiUuid: cfdi.uuid, rfcTercero };
+
+      // 1. Cargo (+SF si esta factura se pagó con saldo a favor) — mismo
+      // prorrateo con residuo que `esCasoNormalParaSplit`.
+      const montoLineaCargo = esUltimo
+        ? parseFloat((montoCargo - acumuladoCargo).toFixed(2))
+        : parseFloat((montoCargo * share).toFixed(2));
+      acumuladoCargo += montoLineaCargo;
+      if (montoLineaCargo > 0) {
+        const montoSFLinea = cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]
+          ? Math.min(Number(d.montoSF) || 0, montoLineaCargo)
+          : 0;
+        let restanteLinea = montoLineaCargo;
+        if (montoSFLinea > 0) {
+          const subtotalSF = Math.round((montoSFLinea / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+          const ivaSF       = Math.round((montoSFLinea - subtotalSF) * 100) / 100;
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSF, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF,      haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
+          restanteLinea = parseFloat((restanteLinea - montoSFLinea).toFixed(2));
+        }
+        if (restanteLinea > 0) {
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaCargo] ?? null, debe: restanteLinea, haber: 0, _esCargoPrincipal: true });
+        }
+      }
+
+      // 2. IVA cobrado (swap cuentaIvaPPD → cuentaIva) — IVA real de ESTA
+      // factura (`d.ivaDoc`), no prorrateado.
+      if (aplicaIvaCobrado) {
+        const ivaFactura = Number(d.ivaDoc) || 0;
+        if (ivaFactura > 0) {
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
+        }
+      }
+
+      // 3. Abono que cierra la CxC de esta factura.
+      const montoLineaAbono = esUltimo
+        ? parseFloat((montoAbono - acumuladoAbono).toFixed(2))
+        : parseFloat((montoAbono * share).toFixed(2));
+      acumuladoAbono += montoLineaAbono;
+      if (montoLineaAbono > 0) {
+        movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
+      }
+    });
+  } else {
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaAbono] ?? null,
+      concepto,
+      centroCosto,
+      ventaFecha,
+      serie:       serieCfdi,
+      debe:        0,
+      haber:       montoAbono,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+    });
+  }
 
   // Split IVA abono: cuando cuentaIvaAbono está definida, el IVA va a cuenta separada
   // HABER cuentaIvaAbono = IVA (ej. 2104010002 IVA Trasladado Anticipos para Club Tuberos)
@@ -1143,12 +1227,19 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     }
   }
 
-  // Dentro del asiento de cada CFDI: cargos (debe > 0) primero, abonos después
-  movs.sort((a, b) => {
-    const ao = (a.debe || 0) > 0 ? 0 : 1;
-    const bo = (b.debe || 0) > 0 ? 0 : 1;
-    return ao - bo;
-  });
+  // Dentro del asiento de cada CFDI: cargos (debe > 0) primero, abonos
+  // después — EXCEPTO en el split de Pago por factura (`esSplitPagoPorFactura`),
+  // donde el orden ya se armó a propósito para que Cargo+IVA+Abono de una
+  // misma factura queden consecutivos; este sort global los separaría de
+  // vuelta en "todos los cargos" / "todos los abonos" (confirmado con el
+  // usuario 2026-08-11).
+  if (!esSplitPagoPorFactura) {
+    movs.sort((a, b) => {
+      const ao = (a.debe || 0) > 0 ? 0 : 1;
+      const bo = (b.debe || 0) > 0 ? 0 : 1;
+      return ao - bo;
+    });
+  }
 
   // Validar cuadre contable: ∑DEBE debe igualar ∑HABER dentro de $0.01 (tolerancia SAT Anexo 24)
   const _sumDebe  = movs.reduce((s, m) => s + (m.debe  || 0), 0);

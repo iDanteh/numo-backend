@@ -130,6 +130,13 @@ async function syncModels() {
     `ALTER TABLE poliza_movimientos ALTER COLUMN cuenta_id DROP NOT NULL`
   ).catch(e => console.warn('[syncModels] DROP NOT NULL cuenta_id:', e.message));
 
+  // Cuenta antes del cruce banco-real/reemplazo manual — se restaura al
+  // revertir la póliza a borrador (ver `revertir`/`restaurarCuentasAnteriores`).
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS cuenta_anterior_id INTEGER REFERENCES account_plans(id)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_anterior_id:', e.message));
+
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ADD COLUMN IF NOT EXISTS cuenta_faltante BOOLEAN NOT NULL DEFAULT FALSE`
   ).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_faltante:', e.message));

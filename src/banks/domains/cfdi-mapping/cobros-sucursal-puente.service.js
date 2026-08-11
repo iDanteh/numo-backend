@@ -1124,8 +1124,25 @@ async function construirMovimientosPuente({
   });
   const foliosYaRegistrados = new Set(yaRegistrados.map(m => m.folio));
 
+  // TIPO_ORIGEN_PENDIENTE_PROPIO (ticket sin factura cobrado en SU PROPIA
+  // sucursal, sin cruce real — ver bloque `mismaSucursal` arriba) es
+  // puramente informativo: es un Cargo flotante sin ninguna contrapartida en
+  // esta póliza (no hay otra sucursal con la que cuadrar). Confirmado con el
+  // usuario 2026-08-10: estas líneas ("CLIENTE NO IDENTIFICADO / <folio>"
+  // contra Caja/Bancos por identificar) NO deben aparecer en "Movimientos
+  // contables" — solo en la hoja/lista separada `pendientesPorFacturar`
+  // (que se arma aparte, arriba, a partir de `pendientesDetectados`, así que
+  // excluirlas de aquí no le quita nada a esa lista). Las líneas de
+  // 'Cobro Sucursal' (incluidas las que nacen del mismo ticket huérfano
+  // cuando SÍ hay cruce, líneas ~1035 y ~849) siguen intactas — esas cuadran
+  // contra la cuenta puente 2103040001 en la póliza cobradora y deben seguir
+  // contabilizándose de verdad.
+  const movimientos = candidatas.filter(c =>
+    !foliosYaRegistrados.has(c.folio) && c.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO
+  );
+
   return {
-    movimientos: candidatas.filter(c => !foliosYaRegistrados.has(c.folio)),
+    movimientos,
     facturasVendedorCubiertas,
     facturasPPDCubiertas,
     pendientesPorFacturar,

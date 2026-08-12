@@ -746,9 +746,19 @@ async function identificar(id, body, user) {
   // se aplica el cobro (mismo criterio que el resto de la función).
   const bancoDefaultPorMovId = new Map();
   const formaPagoRequiereBanco = new Map();
+  // Depósito en efectivo no tiene claveSAT propia (Kore la reporta como Efectivo, '01'),
+  // así que se identifica por NOMBRE — mismo criterio ya usado por
+  // _esFormaPagoBancariaKore() en formas-pago-cxc.service.js.
+  const formaPagoEsDepositoEfectivo = new Map();
+  const _esDepositoEfectivoKore = (nombreFormaPago) => /DEPOSITO.*EFECTIVO/.test(
+    String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
+  );
   try {
     const formasPagoKore = await koreCaja.listarFormasPago(koreToken);
-    for (const f of formasPagoKore) formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
+    for (const f of formasPagoKore) {
+      formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
+      formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
+    }
 
     const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
     if (algunaFormaRequiereBanco) {
@@ -788,11 +798,18 @@ async function identificar(id, body, user) {
   // _montoSaldoLinkPorMovimiento (erp.routes.js) no podrá volver a matchearla
   // contra Kore más adelante — es una restricción nueva del lado de Kore, no
   // algo que Numo pueda evitar mientras la solicitud se siga aplicando.
+  //
+  // 2026-08-12 — Depósito en efectivo TAMBIÉN manda DatosAdicionales, a pedido
+  // explícito del usuario, pero con un contrato distinto al de transferencia:
+  // un solo tag `Num Recibo` (no el par Aut/Numo) con el folio consecutivo de
+  // Numo — confirmado contra el ejemplo real que Kore espera para esta forma
+  // de pago específica.
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
     const movId          = movIdPorFormaPagoDocId.get(String(f._id));
     const movDeEstaForma = movPorId.get(movId);
     const bancoDefault   = bancoDefaultPorMovId.get(movId) ?? null;
-    const esTransferencia = formaPagoRequiereBanco.get(f.formaPagoId) === true;
+    const esTransferencia     = formaPagoRequiereBanco.get(f.formaPagoId) === true;
+    const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
     return {
       ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
@@ -800,6 +817,11 @@ async function identificar(id, body, user) {
         DatosAdicionales: [
           { Nombre: 'Aut',  Valor: movDeEstaForma.folio || '' },
           { Nombre: 'Numo', Valor: movDeEstaForma.numeroAutorizacion || '' },
+        ],
+      } : {}),
+      ...(esDepositoEfectivo ? {
+        DatosAdicionales: [
+          { Nombre: 'Num Recibo', Valor: movDeEstaForma.folio || '' },
         ],
       } : {}),
     };

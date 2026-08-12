@@ -307,6 +307,22 @@ cfdiSchema.index({ total: 1, 'emisor.rfc': 1 });
 // Índice para deduplicación de facturas ERP sin UUID (serie+folio+emisor.rfc+total)
 cfdiSchema.index({ serie: 1, folio: 1, 'emisor.rfc': 1, total: 1, source: 1 });
 
+// Índice parcial + collation case-insensitive para GET /banks/cfdis/buscar
+// (bank.routes.js) — el índice de arriba no sirve para ese endpoint porque la búsqueda
+// ahí es case-insensitive (strength:2) y ese índice usa la collation binaria por
+// defecto. `partialFilterExpression: {source:'ERP'}` en vez de agregar `source` como
+// campo indexado: ese endpoint SIEMPRE filtra por source='ERP' fijo (nunca SAT/MANUAL/
+// RECEPTOR), así que un índice parcial queda más chico/liviano que uno compuesto con
+// source como key. La query debe usar `.collation({locale:'en', strength:2})` para que
+// Mongo elija este índice — sin eso, cae de vuelta a un scan completo.
+cfdiSchema.index(
+  { serie: 1, folio: 1 },
+  {
+    collation: { locale: 'en', strength: 2 },
+    partialFilterExpression: { source: 'ERP' },
+  },
+);
+
 // Índice único parcial para fileHash: solo indexa documentos donde fileHash
 // es un string real. Documentos con fileHash: null (ERP, importaciones sin XML)
 // quedan fuera del índice y no causan conflictos entre sí.

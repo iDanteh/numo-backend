@@ -34,6 +34,28 @@ function _normalizeFormaPago(nombreFormaPago) {
     .trim().toUpperCase();
 }
 
+// ── Misma lógica que _rangoDesdeFollo() en erp.routes.js — duplicada aquí a propósito
+// (no exportada como función standalone, y erp.routes.js YA requiere a este archivo para
+// exponer /formas-pago-cxc/upload+export, así que importarla de vuelta crearía un require
+// circular real). Kore folios codifican YYMMxxxxx (ej. "260704784" → año=2026, mes=07);
+// /cuentas-pendientes EXIGE FechaDesde/FechaHasta (400 si faltan) y un rango máximo de un
+// mes, así que esta función siempre devuelve el mes calendario exacto del folio.
+function _rangoDesdeFollo(folioExterno) {
+  const str = String(folioExterno).trim();
+  if (str.length < 4) return null;
+  const yy = parseInt(str.slice(0, 2), 10);
+  const mm = parseInt(str.slice(2, 4), 10);
+  if (isNaN(yy) || isNaN(mm) || mm < 1 || mm > 12) return null;
+  const year    = 2000 + yy;
+  const mmStr   = String(mm).padStart(2, '0');
+  const lastDay = new Date(Date.UTC(year, mm, 0)).getUTCDate();
+  const lastStr = String(lastDay).padStart(2, '0');
+  return {
+    fechaDesde: `${year}-${mmStr}-01T00:00:00Z`,
+    fechaHasta: `${year}-${mmStr}-${lastStr}T23:59:59Z`,
+  };
+}
+
 // ── Extrae el valor "plano" de una celda ExcelJS (Date, fórmula, texto enriquecido, etc.) ────
 function _cellValue(raw) {
   if (raw == null) return null;
@@ -146,6 +168,15 @@ async function procesarFormasPagoCxc(buffer, _usuarioId, _usuarioNombre) {
     }
 
     // 3. Consultar la CxC en Kore usando Serie/Folio del pedido ──────────────────
+    const rango = _rangoDesdeFollo(pedidoFolio);
+    if (!rango) {
+      sinResolver(
+        'sin_cxc_en_kore',
+        `No se pudo determinar el rango de fecha para el folio del pedido ${pedidoSerie}-${pedidoFolio}.`,
+      );
+      continue;
+    }
+
     if (llamoKoreAlMenosUnaVez) await sleep(SYNC_DELAY_MS);
     llamoKoreAlMenosUnaVez = true;
 
@@ -153,6 +184,7 @@ async function procesarFormasPagoCxc(buffer, _usuarioId, _usuarioNombre) {
     try {
       ({ raw } = await sincronizarCuentasPendientes({
         serieExterna: pedidoSerie, folioExterno: pedidoFolio,
+        fechaDesde: rango.fechaDesde, fechaHasta: rango.fechaHasta,
       }));
     } catch (err) {
       sinResolver(

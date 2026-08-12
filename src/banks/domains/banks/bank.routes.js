@@ -223,6 +223,13 @@ router.delete('/movements/:id/ficha',
 // identificadores precisos, no texto libre — ninguno de los 2 params es
 // obligatorio por sí solo, pero al menos uno debe venir para no traer la
 // colección entera.
+//
+// CORRECCIÓN 2026-08-12: la primera versión usaba regex `^...$` con flag `i` — Mongo NO
+// puede usar un índice B-tree normal para acotar un regex case-insensitive, así que caía
+// en un scan completo (confirmado en producción: "operation exceeded time limit" contra
+// maxTimeMS). Cambiado a igualdad exacta + `.collation({strength:2})`, respaldado por el
+// índice parcial de CFDI.js (serie+folio, solo documentos source='ERP') — con esto Mongo
+// SÍ puede resolver la búsqueda con un IXSCAN case-insensitive real.
 router.get('/cfdis/buscar',
   authenticate,
   permit(PERMISSIONS.BANKS_CFDI_READ),
@@ -231,17 +238,16 @@ router.get('/cfdis/buscar',
     const folio = (req.query.folio ?? '').toString().trim();
     if (!serie && !folio) return res.json([]);
 
-    const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const filter = { source: 'ERP' };
-    if (serie) filter.serie = new RegExp(`^${escapeRegex(serie)}$`, 'i');
-    if (folio) filter.folio = new RegExp(`^${escapeRegex(folio)}$`, 'i');
+    if (serie) filter.serie = serie;
+    if (folio) filter.folio = folio;
 
-    // maxTimeMS: la colección `cfdis` no tiene un índice que respalde bien este regex
-    // case-insensitive (el único índice con serie de líder no sirve para eso) — sin este
-    // límite, una búsqueda lenta podría retener una conexión del pool compartido de Mongo
-    // (usado por todo el backend) hasta el timeout de socket de 5 minutos.
+    // maxTimeMS se conserva como red de seguridad (evita retener una conexión del pool
+    // compartido de Mongo si algo más deja de usar el índice), pero ya no es lo único que
+    // sostiene la performance de esta búsqueda — ver índice parcial+collation en CFDI.js.
     const resultados = await CFDI.find(filter)
       .select('uuid serie folio fecha total')
+      .collation({ locale: 'en', strength: 2 })
       .sort({ fecha: -1 })
       .limit(20)
       .maxTimeMS(5000)

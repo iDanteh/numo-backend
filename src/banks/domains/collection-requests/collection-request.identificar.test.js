@@ -155,6 +155,27 @@ describe('identificar() — N=2 (asignaciones explícitas, multi-bank-movement)'
   });
 });
 
+describe('identificar() — Depósito en efectivo manda "Num Recibo" en vez de Aut/Numo', () => {
+  test('DatosAdicionales trae un solo tag Num Recibo con el folio consecutivo de Numo, sin BancoID', async () => {
+    const f1 = formaPago('f1', 'Depósito en efectivo', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    // Depósito en efectivo no tiene claveSAT propia en Kore (se reporta como
+    // Efectivo, '01') — se distingue por nombre, igual que el resto del código.
+    koreCaja.listarFormasPago.mockResolvedValue([{ id: 'fp-f1', claveSAT: '01', nombre: 'Depósito en efectivo' }]);
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    expect(datosAdicionales).toHaveLength(1);
+    expect(datosAdicionales[0].BancoID).toBeUndefined();
+    expect(datosAdicionales[0].DatosAdicionales).toEqual([{ Nombre: 'Num Recibo', Valor: 'F-mov-1' }]);
+  });
+});
+
 describe('identificar() — todo-o-nada (spec: rechazo antes de Kore/Mongo)', () => {
   test('1 de 2 formasPago sin asignar -> BadRequestError, NINGÚN Kore/Mongo tocado', async () => {
     const f1 = formaPago('f1', 'Transferencia', 60000);

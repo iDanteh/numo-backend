@@ -2,10 +2,12 @@
 
 // bank.routes.test.js — primer test de este router (no existía ninguno). Cobertura
 // mínima de la ruta nueva GET /cfdis/buscar (2026-08-07, permiso banks:cfdi:read):
-// gate de permiso, filtro source='ERP' siempre fijo, escapado de regex, y el
-// short-circuit de "sin serie ni folio". Requerir el router real no pega a Mongo —
-// los modelos solo declaran esquemas, las llamadas HTTP viven dentro de handlers,
-// nunca a nivel de módulo (mismo criterio ya documentado en erp.routes.test.js).
+// gate de permiso, filtro source='ERP' siempre fijo, match exacto vía collation
+// (2026-08-12: reemplazó al regex case-insensitive original, que no podía usar
+// ningún índice y terminó agotando maxTimeMS en producción), y el short-circuit
+// de "sin serie ni folio". Requerir el router real no pega a Mongo — los modelos
+// solo declaran esquemas, las llamadas HTTP viven dentro de handlers, nunca a
+// nivel de módulo (mismo criterio ya documentado en erp.routes.test.js).
 jest.mock('../../shared/middleware/auth.real', () => ({
   authenticate: (req, _res, next) => {
     req.user = {
@@ -30,11 +32,12 @@ jest.mock('../../shared/middleware/auth.real', () => ({
 const mockLean = jest.fn();
 jest.mock('../../../visor/models/CFDI', () => ({
   find: jest.fn(() => ({
-    select:    jest.fn().mockReturnThis(),
-    sort:      jest.fn().mockReturnThis(),
-    limit:     jest.fn().mockReturnThis(),
-    maxTimeMS: jest.fn().mockReturnThis(),
-    lean:      mockLean,
+    select:     jest.fn().mockReturnThis(),
+    collation:  jest.fn().mockReturnThis(),
+    sort:       jest.fn().mockReturnThis(),
+    limit:      jest.fn().mockReturnThis(),
+    maxTimeMS:  jest.fn().mockReturnThis(),
+    lean:       mockLean,
   })),
 }));
 
@@ -76,7 +79,7 @@ describe('GET /cfdis/buscar', () => {
     expect(CFDI.find).not.toHaveBeenCalled();
   });
 
-  test('filtra siempre por source=ERP, sin importar qué mande el cliente', async () => {
+  test('filtra siempre por source=ERP, match exacto (no regex) para serie/folio', async () => {
     await request(app)
       .get('/cfdis/buscar')
       .query({ serie: 'A0', folio: '123' })
@@ -85,24 +88,35 @@ describe('GET /cfdis/buscar', () => {
     expect(CFDI.find).toHaveBeenCalledTimes(1);
     const filtroUsado = CFDI.find.mock.calls[0][0];
     expect(filtroUsado.source).toBe('ERP');
-    expect(filtroUsado.serie).toBeInstanceOf(RegExp);
-    expect(filtroUsado.folio).toBeInstanceOf(RegExp);
-    // Match exacto (anclado), case-insensitive — no texto libre.
-    expect(filtroUsado.serie.source).toBe('^A0$');
-    expect(filtroUsado.serie.flags).toContain('i');
+    // Igualdad exacta, sin regex — el case-insensitive lo resuelve la collation de Mongo
+    // (ver .collation() abajo), no un patrón armado en JS.
+    expect(filtroUsado.serie).toBe('A0');
+    expect(filtroUsado.folio).toBe('123');
   });
 
-  test('escapa caracteres especiales de regex en serie/folio (sin inyección de patrón)', async () => {
+  test('usa collation case-insensitive (strength:2) para aprovechar el índice parcial de CFDI.js', async () => {
+    await request(app)
+      .get('/cfdis/buscar')
+      .query({ serie: 'A0', folio: '123' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_CFDI_READ]));
+
+    // El mock de CFDI.find() crea una cadena nueva por invocación — hay que leer la
+    // instancia real que devolvió la llamada dentro del handler, no crear una propia.
+    const cadenaUsada = CFDI.find.mock.results[0].value;
+    expect(cadenaUsada.collation).toHaveBeenCalledWith({ locale: 'en', strength: 2 });
+  });
+
+  test('caracteres especiales en serie/folio viajan literales (sin interpretarse como patrón)', async () => {
     await request(app)
       .get('/cfdis/buscar')
       .query({ serie: 'A.*', folio: '1(2)3' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_CFDI_READ]));
 
     const filtroUsado = CFDI.find.mock.calls[0][0];
-    // Los caracteres especiales quedan escapados: el regex busca el texto LITERAL "A.*",
-    // no "A seguido de cualquier cosa" (que sería el comportamiento sin escapar).
-    expect(filtroUsado.serie.source).toBe('^A\\.\\*$');
-    expect(filtroUsado.folio.source).toBe('^1\\(2\\)3$');
+    // Al ser igualdad exacta (no regex), no hay nada que escapar ni forma de inyectar un
+    // patrón — el string se compara tal cual, literal.
+    expect(filtroUsado.serie).toBe('A.*');
+    expect(filtroUsado.folio).toBe('1(2)3');
   });
 
   test('acepta solo serie o solo folio (el otro no se agrega al filtro)', async () => {
@@ -113,7 +127,7 @@ describe('GET /cfdis/buscar', () => {
 
     const filtroUsado = CFDI.find.mock.calls[0][0];
     expect(filtroUsado.serie).toBeUndefined();
-    expect(filtroUsado.folio).toBeInstanceOf(RegExp);
+    expect(filtroUsado.folio).toBe('456');
   });
 
   test('devuelve los resultados de Mongo tal cual (uuid/serie/folio/fecha/total)', async () => {

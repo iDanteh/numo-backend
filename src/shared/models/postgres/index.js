@@ -25,6 +25,7 @@ const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
 const ClienteCatalogo   = require('./ClienteCatalogo');
+const CobroSucursalPendiente = require('./CobroSucursalPendiente');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -84,6 +85,10 @@ async function syncModels() {
   // La columna centro_costo_id en poliza_movimientos se agrega vía raw SQL más abajo.
   await CentroCosto.sync({ force: false });
   await ClienteCatalogo.sync({ force: false });
+
+  // Cola de cobros cruzados de sucursal (ver CobroSucursalPendiente.js) —
+  // tabla nueva, force:false para solo crearla si no existe.
+  await CobroSucursalPendiente.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await AccountPlan.sync({ alter: !isProd });
@@ -230,6 +235,13 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS sustitutos_excluidos JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN sustitutos_excluidos:', e.message));
 
+  // Tickets de cajas con cobro real pero sin factura ligada, detectados al
+  // generar la póliza (idempotente)
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS pendientes_por_facturar JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN pendientes_por_facturar:', e.message));
+
   // El índice único (tipo, numero, rfc, ejercicio, periodo) bloqueaba para
   // siempre el folio de una póliza cancelada (la fila sigue existiendo,
   // solo con estado='cancelada') — impedía reutilizar ese folio en una
@@ -274,4 +286,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ADD COLUMN extra_permissions (users):', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, syncModels };

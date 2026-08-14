@@ -9,7 +9,7 @@ const mappingSvc           = require('./cfdi-mapping.service');
 const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
-const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
+const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -53,6 +53,22 @@ async function _completarRelacionadosPostMerge(cfdisFinal, relMetodoPagoMap, rel
 }
 
 const SUCURSAL_DEFAULT = 'Cedis';
+
+// Categorías de filtro por forma de pago para la póliza de Cobranza (Pagos) —
+// mismas categorías/códigos que ya usa el export CONTPAQ
+// (poliza.service.js: LABEL_FORMA_PAGO_CONSOLIDADO/FORMA_PAGO_TRANSFERENCIA/
+// FORMA_PAGO_CHEQUE), duplicado a propósito aquí (mismo patrón que otras
+// constantes pequeñas ya compartidas entre estos dos archivos). Solo aplica
+// cuando `tipoCfdi === 'P'` — para Ingreso/Egreso se ignora (confirmado con
+// el usuario 2026-08-11).
+const FORMA_PAGO_A_CATEGORIA = { '01': 'EFECTIVO', '02': 'CHEQUE', '03': 'TRANSFERENCIA', '04': 'TARJETA', '28': 'TARJETA' };
+
+// Para tipo P, `formaPago` casi nunca viene en el header del CFDI — vive en
+// el complemento (mismo fallback que ya usa `findRuleInList`/`satMeta` en
+// cfdi-mapping.service.js).
+function _formaPagoResuelta(cfdi) {
+  return cfdi.formaPago ?? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? null;
+}
 
 // Misma lista que TIPO_MARCADORES en cobros-sucursal-puente.service.js — el
 // marcador de TIPO del documento relacionado (no la referencia real a la
@@ -127,10 +143,44 @@ const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 // de esa cuenta era una transferencia de $25,546.16 sin relación, ajena al
 // saldo de $136.22, y encoló mal la generación a CEDIS cuando debía quedarse
 // en PROMOTORIA).
-function _claveCentroPorMonto(cobrosPorCuenta, serie, folio, monto) {
+// Forma de pago SAT dominante (por monto acumulado) de los cobros REALES de
+// una venta — mismo criterio de filtrado que `_prefetchAjustesFacturaPropia`
+// (solo SERIES_CON_AUTH, excluye Puntos/Saldo a favor del texto de la forma
+// de pago), pero sin filtrar por día: aquí solo se usa para el caso "mismo
+// folio" (ver `_prefetchSaldosFavorGenerados`), donde ya sabemos que
+// generación y consumo son la MISMA venta, así que cualquier cobro real de
+// esa cuenta es válido. Se usa UN solo valor dominante (no desglose) porque
+// el usuario pidió restar directo del consolidado sin partir por forma de
+// pago (confirmado 2026-08-13).
+function _formaPagoDominante(cobros) {
+  const acumuladoPorClave = new Map();
+  for (const c of (cobros ?? [])) {
+    if (!SERIES_CON_AUTH.includes((c.serieOrigen ?? '').toUpperCase())) continue;
+    for (const fp of (c.formasPago ?? [])) {
+      if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+      const clave = (fp.claveSat ?? '').trim();
+      if (!clave) continue;
+      acumuladoPorClave.set(clave, (acumuladoPorClave.get(clave) ?? 0) + (Number(fp.monto) || 0));
+    }
+  }
+  if (!acumuladoPorClave.size) return null;
+  return [...acumuladoPorClave.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
+// 'APA' (2026-08-14, confirmado con el usuario — caso real LAZARO ROJAS
+// RODRIGUEZ, ventas antiguas E0-260500658/659): cuando se USA un saldo a
+// favor, el ERP registra en la cuenta que lo GENERÓ un cobro espejo
+// serieOrigen='APA' con el mismo monto y la misma hora exacta que el cobro
+// real del lado que lo usó, y sí trae `claveCentro` confiable. No es un pago
+// real (no debe entrar al split de forma de pago ni a bank-autorizaciones),
+// por eso NO se agrega a SERIES_CON_AUTH global — se acepta solo aquí, para
+// resolver claveCentro del lado de generación de saldo a favor.
+const SERIES_CLAVE_CENTRO_SF = [...SERIES_CON_AUTH, 'APA'];
+
+function _claveCentroPorMonto(cobrosPorCuenta, serie, folio, monto, fechaExacta) {
   const cobros = cobrosPorCuenta.get(`${serie}|${folio}`) ?? [];
   const match = cobros.find(c => {
-    if (!SERIES_CON_AUTH.includes((c.serieOrigen ?? '').toUpperCase()) || !c.claveCentro) return false;
+    if (!SERIES_CLAVE_CENTRO_SF.includes((c.serieOrigen ?? '').toUpperCase()) || !c.claveCentro) return false;
     // El cobro que generó/usó el saldo puede ser un pago MIXTO (ej. parte
     // efectivo + parte saldo a favor en un solo registro) — el monto TOTAL
     // del cobro no coincide con el monto del saldo en ese caso (confirmado
@@ -139,15 +189,25 @@ function _claveCentroPorMonto(cobrosPorCuenta, serie, folio, monto) {
     // match si el TOTAL coincide (caso simple) O si el monto aparece exacto
     // dentro de alguna de sus formasPago (caso mixto).
     if (Math.abs(Math.abs(Number(c.monto) || 0) - Number(monto)) < 0.01) return true;
-    return (c.formasPago ?? []).some(fp =>
+    if ((c.formasPago ?? []).some(fp =>
       /saldo\s*a\s*favor/i.test(fp.nombre ?? '')
       && Math.abs(Math.abs(Number(fp.monto) || 0) - Number(monto)) < 0.01,
-    );
+    )) return true;
+    // Varios saldos a favor DISTINTOS pueden aplicarse JUNTOS en un solo
+    // cobro (caso real LAZARO ROJAS RODRIGUEZ, 2026-08-14: dos DEV de 252.82
+    // y 402.17 se usaron en un solo pago combinado de 654.99 — ningún monto
+    // individual coincide con esa formaPago sumada). En ese caso se acepta
+    // el match por fecha EXACTA (mismo evento de aplicación, hasta el
+    // microsegundo, confirmado idéntico entre `usos[].fecha` y `cobro.fecha`
+    // en los datos reales del ERP).
+    if (fechaExacta && c.fecha && new Date(c.fecha).getTime() === new Date(fechaExacta).getTime()
+      && (c.formasPago ?? []).some(fp => /saldo\s*a\s*favor/i.test(fp.nombre ?? ''))) return true;
+    return false;
   });
   return match?.claveCentro ?? null;
 }
 
-async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
+async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones = {}) {
   const devolucionesConVenta = cfdis
     .map(cfdi => {
       if (cfdi.tipoDeComprobante !== 'E') return null;
@@ -212,6 +272,38 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
     for (const cuenta of resultadoAlmacen) cobrosPorVentaUso.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, cuenta.cobros ?? []);
   }
 
+  // 3b. Enriquecer con la consulta "por centro+fecha" (2026-08-14, confirmado
+  // con el usuario — mismo hallazgo que en `_prefetchAjustesFacturaPropia`):
+  // la consulta de arriba (por serie/folio propio de CADA venta) a veces no
+  // encuentra el `claveCentro` real (caso confirmado: Devolución que ajusta
+  // una venta de un periodo MUY anterior — el cobro/reclasificación que sí
+  // pasó el día de la Devolución no siempre aparece al consultar solo por el
+  // serie/folio de esa venta vieja). La consulta "por centro" trae TODOS los
+  // cobros de esta sucursal en el rango de fechas del batch, sin depender de
+  // conocer de antemano la venta — se usa para COMPLETAR (no reemplazar)
+  // `cobrosPorVenta`/`cobrosPorVentaUso`, agregando cualquier cobro adicional
+  // que encuentre para las mismas cuentas. Si falla (timeout, ERP caído), se
+  // ignora esta fuente — el cálculo de oculto/mismoFolio sigue funcionando
+  // igual que antes, solo sin esta mejora.
+  const { centroPropioClave, fechaDesde, fechaHasta } = opciones;
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    try {
+      const cuentasPorCentro = await obtenerDesglosesCobroAlmacenPorCentro({
+        rfc, centro: centroPropioClave, fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
+      });
+      for (const cuenta of cuentasPorCentro) {
+        const k = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+        const cobrosNuevos = cuenta.cobros ?? [];
+        if (!cobrosNuevos.length) continue;
+        cobrosPorVenta.set(k, [...(cobrosPorVenta.get(k) ?? []), ...cobrosNuevos]);
+        cobrosPorVentaUso.set(k, [...(cobrosPorVentaUso.get(k) ?? []), ...cobrosNuevos]);
+      }
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[SF] Consulta "por centro" para enriquecer claveCentro falló (${err.message}), se ignora esta fuente.`);
+    }
+  }
+
   // 4. Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
   const mapa = new Map();
   const devsOcultos = new Set();
@@ -225,7 +317,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
 
     const claveCentroGen = _claveCentroPorMonto(cobrosPorVenta, cuenta.serieVenta, cuenta.folioVenta, gen.monto);
     const claveCentroUso = usoUnico
-      ? _claveCentroPorMonto(cobrosPorVentaUso, usoUnico.serieVenta, usoUnico.folioVenta, usoUnico.montoUsado)
+      ? _claveCentroPorMonto(cobrosPorVentaUso, usoUnico.serieVenta, usoUnico.folioVenta, usoUnico.montoUsado, usoUnico.fecha)
       : null;
     const centro = (claveCentroGen && ccBySerieMap) ? (ccBySerieMap[claveCentroGen] ?? null) : null;
 
@@ -243,12 +335,30 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
     const oculto = !esCruzado && !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso
       && claveCentroGen && claveCentroUso && claveCentroGen === claveCentroUso);
     if (oculto) devsOcultos.add(key);
+
+    // Caso "mismo folio" (confirmado con el usuario 2026-08-13): la MISMA
+    // venta generó Y consumió el saldo a favor (uso completo, sin sobrante) —
+    // a diferencia de `oculto` (día+almacén), este criterio compara
+    // directamente la venta de generación contra la venta de uso. Cuando
+    // aplica, `_inyectarSaldoFavorGenerado` NO contabiliza el pasivo
+    // (Anticipos Otros) — trata el monto como salida real de caja y lo resta
+    // del consolidado de Efectivo/Tarjeta, usando la forma de pago real de
+    // ESTA MISMA venta (ya la tenemos en `cobrosPorVenta`, sin llamada extra
+    // al ERP).
+    const mismoFolio = !!(usoUnico && usoCompleto
+      && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
+      && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
+
     const prev = mapa.get(key);
     mapa.set(key, {
       monto:      (prev?.monto ?? 0) + (Math.abs(Number(gen.monto) || 0)),
       ventaSerie: cuenta.serieVenta,
       ventaFolio: cuenta.folioVenta,
       oculto,
+      mismoFolio: mismoFolio || prev?.mismoFolio || false,
+      formaPagoReal: mismoFolio
+        ? (_formaPagoDominante(cobrosPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)) ?? prev?.formaPagoReal ?? null)
+        : (prev?.formaPagoReal ?? null),
       centroProcesamiento: centro ?? prev?.centroProcesamiento ?? null,
     });
   }
@@ -305,6 +415,32 @@ function _diaMx(fechaIso) {
   return new Date(new Date(fechaIso).getTime() - 6 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// Diferencia en días calendario (México) entre una fecha/hora ISO (ej. un
+// cobro) y un día ya resuelto en formato 'YYYY-MM-DD' (ej. `_diaMx` de un
+// CFDI) — usada para la tolerancia de ±1 día de facturación diferida (ver
+// `TOLERANCIA_DIAS_FACTURACION_DIFERIDA` más abajo). null si falta cualquiera.
+function _diferenciaDiasMx(fechaIso, diaYaResuelto) {
+  const diaCobro = _diaMx(fechaIso);
+  if (!diaCobro || !diaYaResuelto) return null;
+  const msCobro = new Date(`${diaCobro}T00:00:00Z`).getTime();
+  const msObjetivo = new Date(`${diaYaResuelto}T00:00:00Z`).getTime();
+  return Math.round(Math.abs(msCobro - msObjetivo) / (24 * 3600 * 1000));
+}
+
+// Tolerancia de ±1 día calendario entre el cobro real y la fecha de la
+// factura (2026-08-14, confirmado con el usuario — caso real Hidalgo
+// B0-260701096/098/099/133/185/213, 09→10/07/2026): el cliente pagó el 9,
+// pero la Factura Global que agrupa su ticket no se emitió hasta el 10 —
+// un desfase de UN día entre cobro y facturación, distinto del caso de
+// "días/semanas después" que el filtro exacto por día ya bloqueaba a
+// propósito (ver comentario de `_diaMx` arriba, caso Puntos 04/06→10/07: ESE
+// sigue bloqueado, la diferencia ahí es de 4-6 días, fuera de esta
+// tolerancia). Los cobros de facturas viejas (varios días/semanas antes,
+// típicamente cobranza de crédito) siguen excluidos — esos los maneja
+// Cobranza, no Ingreso (confirmado con el usuario, mismo criterio ya
+// aplicado a PPD en cobros-sucursal-puente.service.js).
+const TOLERANCIA_DIAS_FACTURACION_DIFERIDA = 1;
+
 /**
  * Fusión de `_prefetchDesglosePagoReal` + `_prefetchSaldoFavorUsadoPropio`
  * (2026-08-07, optimización): ambas funciones filtraban EXACTAMENTE el mismo
@@ -326,7 +462,7 @@ function _diaMx(fechaIso) {
  * IDÉNTICO al de las dos funciones por separado (mismo póliza de prueba,
  * mismos montos por cuenta) antes de reemplazarlas.
  */
-async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
+async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   const candidatos = cfdiConRegla.filter(({ cfdi, rule }) =>
     cfdi.tipoDeComprobante === 'I' && cfdi.serie && cfdi.folio &&
     rule?.cuentaCargo && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo),
@@ -338,44 +474,126 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
   // serie/folio pero son de un día distinto (ver `_diaMx`).
   const diaCfdiPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, _diaMx(cfdi.fecha)]));
 
-  const LOTE = 150;
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
 
-  for (let i = 0; i < candidatos.length; i += LOTE) {
-    const lote = candidatos.slice(i, i + LOTE);
-    const series = lote.map(({ cfdi }) => cfdi.serie);
-    const folios = lote.map(({ cfdi }) => cfdi.folio);
+  // Fuente de los cobros reales — confirmado con el usuario 2026-08-14:
+  // reemplaza POR COMPLETO la consulta por serie/folio propio cuando se
+  // conoce el centro+rango de fechas de esta sucursal. La consulta por
+  // serie/folio (bloque `else`) solo encuentra cobros de ventas que YA
+  // sabíamos buscar (las del batch actual) — cualquier cobro real de esa
+  // sucursal que no quedara ligado a esa venta específica (venta de
+  // mostrador, ticket sin CFDI directo ese día, etc.) se perdía, y el split
+  // de Cargo (`esCasoNormalParaSplit`/`esCasoAjusteSFPuntos` en
+  // cfdi-mapping.service.js) caía al `formaPago` genérico declarado por el
+  // CFDI en vez del real — caso real confirmado: Atzompa 09/07/2026, Tarjeta
+  // de $16,067.38 contabilizada casi toda como Efectivo por falta de
+  // desglose confiable. La consulta "por centro" trae TODOS los cobros de esa
+  // sucursal en el rango sin depender de conocer de antemano cada serie/folio,
+  // así que cubre ese hueco. Sigue filtrando por día de CADA factura
+  // (`diaCfdiPorClave`/`_diaMx`) exactamente igual que antes.
+  const { centroPropioClave, fechaDesde, fechaHasta } = opciones;
+  let resultadosAlmacen = [];
+  let resultadosSaldos  = [];
+  let usoCaminoPorCentro = false;
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    try {
+      // Ventana ampliada ±1 día SOLO para esta consulta (no para
+      // `candidatos`/`diaCfdiPorClave`, que siguen siendo exactos al día de
+      // esta generación) — ver `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`: un
+      // cobro de "ayer" puede pertenecer a una factura de "hoy" (facturación
+      // diferida de un día), así que hay que poder VERLO antes de poder
+      // decidir si aplica.
+      const UN_DIA_MS = 24 * 3600 * 1000;
+      const fechaDesdeAmpliada = new Date(fechaDesde.getTime() - TOLERANCIA_DIAS_FACTURACION_DIFERIDA * UN_DIA_MS);
+      const fechaHastaAmpliada = new Date(fechaHasta.getTime() + TOLERANCIA_DIAS_FACTURACION_DIFERIDA * UN_DIA_MS);
+      [resultadosAlmacen, resultadosSaldos] = await Promise.all([
+        obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: centroPropioClave, fechaDesde: fechaDesdeAmpliada.toISOString(), fechaHasta: fechaHastaAmpliada.toISOString() }),
+        obtenerSaldosFavorPorCentro({ rfc, centro: centroPropioClave, fechaDesde: fechaDesdeAmpliada.toISOString(), fechaHasta: fechaHastaAmpliada.toISOString() }),
+      ]);
+      usoCaminoPorCentro = true;
+    } catch (err) {
+      // Si el endpoint "por centro" falla (timeout, 5xx, lo que sea) esto NO
+      // debe tumbar la generación completa de la póliza — confirmado con el
+      // usuario 2026-08-14, caso real: timeout de 15s en
+      // obtenerSaldosFavorPorCentro reventó generarYGuardar por completo
+      // (la excepción se propagaba sin capturar). Se ignora esta fuente y se
+      // cae al camino viejo por serie/folio (mismo patrón defensivo que ya
+      // usa `construirMovimientosPuente` en cobros-sucursal-puente.service.js
+      // para este mismo endpoint).
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[AjustesFacturaPropia] Camino "por centro" falló (${err.message}), cae al camino viejo por serie/folio.`);
+      resultadosAlmacen = [];
+      resultadosSaldos  = [];
+    }
+  }
+  if (!usoCaminoPorCentro) {
+    // Fallback: sin centro/rango de fechas conocido (ej. generación sin
+    // fechaInicio/fechaFin, o sin centroCostoId resuelto), o si el camino por
+    // centro falló — vuelve al camino viejo, por serie/folio de cada factura
+    // del batch.
+    const LOTE = 150;
+    for (let i = 0; i < candidatos.length; i += LOTE) {
+      const lote = candidatos.slice(i, i + LOTE);
+      const series = lote.map(({ cfdi }) => cfdi.serie);
+      const folios = lote.map(({ cfdi }) => cfdi.folio);
+      const [rA, rS] = await Promise.all([
+        obtenerDesglosesCobroAlmacen({ rfc, series, folios }),
+        obtenerSaldosFavor({ rfc, series, folios }),
+      ]);
+      resultadosAlmacen.push(...rA);
+      resultadosSaldos.push(...rS);
+    }
+  }
 
-    const [resultadoAlmacen, resultadoSaldos] = await Promise.all([
-      obtenerDesglosesCobroAlmacen({ rfc, series, folios }),
-      obtenerSaldosFavor({ rfc, series, folios }),
-    ]);
-
-    for (const cuenta of resultadoAlmacen) {
-      const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+  {
+    for (const cuenta of resultadosAlmacen) {
+      // `serieFactura`/`folioFactura` (2026-08-14, confirmado con datos
+      // reales de producción): en una Factura Global, MUCHOS tickets de
+      // mostrador individuales (cada uno con su propio `serieVenta`/
+      // `folioVenta` en cajas) se facturan juntos bajo UN solo CFDI — el
+      // ERP ya trae esa relación en cada cuenta. Si se agrupa por
+      // `serieVenta/folioVenta` (el ticket), la clave nunca coincide con la
+      // factura real que está procesando `cfdiToMovimientos` (que busca por
+      // su propio serie/folio, el de la Factura Global) y el split nunca se
+      // aplicaba — aunque el desglose ya estuviera disponible. Se usa
+      // `serieFactura/folioFactura` cuando vienen (fallback a
+      // serieVenta/folioVenta si no, para no romper el camino viejo por
+      // serie/folio, donde ambos suelen coincidir). Como varios tickets caen
+      // bajo la MISMA factura, hay que ACUMULAR (no sobreescribir).
+      const key = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
       const diaCfdi = diaCfdiPorClave.get(key);
       const formasPago = [];
       let montoPuntos = 0;
       for (const cobro of (cuenta.cobros ?? [])) {
-        // El cobro debe haber ocurrido el MISMO día que la factura — ver
-        // `_diaMx`. Sin esto, una cuenta/ticket abierta días antes (factura
-        // emitida después) mezcla actividad de OTRO día en el batch de hoy.
-        if (diaCfdi && _diaMx(cobro.fecha) !== diaCfdi) continue;
+        // El cobro debe haber ocurrido el MISMO día que la factura (con
+        // tolerancia de ±1 día por facturación diferida — ver
+        // `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`/`_diferenciaDiasMx`). Sin
+        // esto, una cuenta/ticket abierta DÍAS o SEMANAS antes (cobranza de
+        // una factura vieja, no un simple desfase de frontera) mezclaría esa
+        // actividad en el batch de hoy — la tolerancia de 1 día sigue
+        // bloqueando ese caso (confirmado con el usuario 2026-08-14).
+        const diffDias = _diferenciaDiasMx(cobro.fecha, diaCfdi);
+        if (diaCfdi && (diffDias === null || diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA)) continue;
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
+        // 'CBT' NO es exclusivamente Puntos/Club Tuberos — confirmado con
+        // datos reales 2026-08-06: un mismo cobro CBT puede traer
+        // EFECTIVO/TARJETA/TRANSFERENCIA/SALDO A FAVOR mezclados (parece ser
+        // un evento genérico de reclasificación/corrección de forma de pago,
+        // no específico de monedero). Sumar TODO el cobro atribuía de más a
+        // Puntos (caso real: $202,152 sumado vs $527.51 real filtrando por
+        // nombre) — hay que filtrar por `nombre` cada `formaPago` individual.
+        //
+        // Corrección 2026-08-14 (caso real Atzompa E0-092, confirmado con el
+        // usuario): este mismo filtro por texto (Puntos/Saldo a favor) SOLO
+        // se aplicaba para origen CBT — un cobro `ABO` con un $654.99
+        // etiquetado "SALDO A FAVOR" dentro de sus formasPago se colaba sin
+        // filtrar, contándose como Tarjeta/Bancos real (no es Efectivo, cae
+        // al bucket contrario) cuando ese monto YA se contabiliza aparte vía
+        // `/saldos-favor` (`saldoFavorUsado`). El filtro ahora aplica igual
+        // para CUALQUIER origen reconocido (CBT/ABO/CPF/CFC), no solo CBT.
         if (origen === 'CBT') {
-          // 'CBT' NO es exclusivamente Puntos/Club Tuberos — confirmado con
-          // datos reales 2026-08-06: un mismo cobro CBT puede traer
-          // EFECTIVO/TARJETA/TRANSFERENCIA/SALDO A FAVOR mezclados (parece
-          // ser un evento genérico de reclasificación/corrección de forma de
-          // pago, no específico de monedero). Sumar TODO el cobro atribuía de
-          // más a Puntos (caso real: $202,152 sumado vs $527.51 real filtrando
-          // por nombre) — hay que filtrar por `nombre` cada `formaPago`
-          // individual, igual que antes hacía `_esPuntosReal` en
-          // cfdi-mapping.service.js (ahí eliminado, la responsabilidad de
-          // filtrar correctamente pasa a esta función).
-          //
           // Corrección 2026-08-07: las formasPago NO-Puntos dentro de un
           // cobro CBT (Efectivo/Tarjeta/Transferencia/SF) SÍ deben entrar al
           // `formasPago` general — antes se descartaban por completo, y una
@@ -388,36 +606,93 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
           // `cfdi-mapping.service.js` verificando que la suma de
           // `formasPago` encontradas coincida con el total del Cargo antes
           // de usarlas para partir (si no coincide, no se fuerza el split).
-          for (const fp of (cobro.formasPago ?? [])) {
-            if (/puntos/i.test(fp.nombre ?? '')) { montoPuntos += Number(fp.monto) || 0; continue; }
-            // "Saldo a favor" dentro de un cobro CBT se ignora aquí — la
-            // fuente autoritativa para SF usado es `/saldos-favor`
-            // (`saldoFavorUsado`, ver abajo), no este texto — mezclarlo en
-            // `formasPago` lo trataría como Efectivo/Bancos real.
-            if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
-            formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto: Number(fp.monto) || 0 });
-          }
+        } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }
-        if (!SERIES_CON_AUTH.includes(origen)) continue;
-        for (const fp of (cobro.formasPago ?? [])) {
-          formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto: Number(fp.monto) || 0 });
+        // Bug del ERP (2026-08-14, confirmado con el usuario contra el
+        // corte de caja real de Atzompa 09/07 y contra la consulta directa
+        // por serie/folio): cuando UN pago real cierra varios tickets con
+        // montos DESIGUALES (ej. real: $16.19 + $178.75 + $188.70 = $383.64
+        // entre 3 tickets), este endpoint regresa `formasPago[].monto` con
+        // el TOTAL del pago ($383.64) repetido en CADA ticket afectado, en
+        // vez del monto real de cada uno — triplicando el monto real a
+        // $1,150.92 (era ~86% del excedente de $892.03 encontrado en esa
+        // Factura Global). El campo `cobro.monto` (nivel superior, no el de
+        // `formasPago[]`) SÍ trae el monto real de ESE ticket específico
+        // (confirmado: consulta directa por serie/folio del ticket
+        // 260700883 devolvió `cobro.monto: -178.75`, exacto al corte de
+        // caja, mientras `formasPago[0].monto` seguía en 383.64). Cuando el
+        // cobro trae UN solo formaPago, `|cobro.monto|` y `fp.monto` deben
+        // ser el mismo número en el caso normal (confirmado contra decenas
+        // de cobros reales) — así que usar `cobro.monto` en ese caso corrige
+        // el bug sin afectar los cobros normales. Con 2+ formasPago
+        // mezclados no se puede hacer este reemplazo (ahí `cobro.monto` es
+        // la suma de todos, no de uno solo), así que se deja `fp.monto` tal
+        // cual para ese caso.
+        const cobrosFormaPago = cobro.formasPago ?? [];
+        for (const fp of cobrosFormaPago) {
+          if (/puntos/i.test(fp.nombre ?? '')) { montoPuntos += Number(fp.monto) || 0; continue; }
+          // "Saldo a favor" en el texto de la forma de pago se ignora aquí —
+          // la fuente autoritativa para SF usado es `/saldos-favor`
+          // (`saldoFavorUsado`, ver abajo), no este texto — mezclarlo en
+          // `formasPago` lo trataría como Efectivo/Bancos real.
+          if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+          const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
+            ? Math.abs(Number(cobro.monto) || 0)
+            : (Number(fp.monto) || 0);
+          formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto });
         }
       }
-      if (formasPago.length) desglosePagoReal.set(key, formasPago);
-      if (montoPuntos > 0) puntosUsado.set(key, montoPuntos);
+      if (formasPago.length) {
+        const prevFp = desglosePagoReal.get(key) ?? [];
+        desglosePagoReal.set(key, [...prevFp, ...formasPago]);
+      }
+      if (montoPuntos > 0) puntosUsado.set(key, (puntosUsado.get(key) ?? 0) + montoPuntos);
     }
 
-    for (const cuenta of resultadoSaldos) {
-      const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+    // Saldo a favor generado y consumido DENTRO de la misma Factura Global
+    // (2026-08-14, confirmado con el usuario, caso real Atzompa DEV-055175):
+    // cuando la devolución ocurre ANTES de facturar la Global (el ticket
+    // vendido ese mismo día aún no tiene CFDI al cual aplicársela), el ERP no
+    // puede hacer una devolución normal — genera un saldo a favor temporal en
+    // su lugar. Para cuando se factura la Global (al final del día), esa
+    // devolución YA está reflejada: el ticket que la generó entra a la
+    // Global con su monto NETO (post-devolución), no el original. Si esa
+    // misma SF se consume en OTRO ticket de la MISMA Global, restarla de
+    // nuevo aquí sería una doble resta — el monto de la factura ya viene sin
+    // ese dinero contado. Para distinguir este caso del normal (SF generado
+    // por una Devolución de un día/factura ANTERIOR — ahí sí hay que restar,
+    // confirmado con datos reales de la factura E0-092), se arma primero un
+    // mapa `folioOrigen del marcador → factura de la venta que lo generó`
+    // recorriendo TODOS los `saldosFavorGenerados` del batch.
+    const _facturaGeneradoraPorMarcador = new Map();
+    for (const cuenta of resultadosSaldos) {
+      const keyGen = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
+      for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+        const marcador = `${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`;
+        _facturaGeneradoraPorMarcador.set(marcador, keyGen);
+      }
+    }
+
+    for (const cuenta of resultadosSaldos) {
+      // Mismo criterio que arriba — agrupar por la factura real, no por el ticket.
+      const key = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
       const diaCfdi = diaCfdiPorClave.get(key);
-      const usados = (cuenta.saldosFavorUsados ?? []).filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi);
+      const usados = (cuenta.saldosFavorUsados ?? [])
+        .filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi)
+        // Excluir el caso "generado y usado en la misma Factura Global" — ver
+        // comentario arriba. Si el marcador que generó este SF no se
+        // encuentra en el mapa (generado por una Devolución con su propio
+        // CFDI, caso normal) o pertenece a OTRA factura, sí se resta (igual
+        // que antes).
+        .filter(u => _facturaGeneradoraPorMarcador.get(`${(u.serieOrigen ?? '').toUpperCase()}|${u.folioOrigen ?? ''}`) !== key);
       if (!usados.length) continue;
       const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
       if (monto <= 0) continue;
+      const prevSF = saldoFavorUsado.get(key);
       saldoFavorUsado.set(key, {
-        monto,
-        detalle: usados.map(u => ({ serieOrigen: u.serieOrigen ?? null, folioOrigen: u.folioOrigen ?? null, monto: Math.abs(Number(u.montoUsado)) || 0 })),
+        monto: (prevSF?.monto ?? 0) + monto,
+        detalle: [...(prevSF?.detalle ?? []), ...usados.map(u => ({ serieOrigen: u.serieOrigen ?? null, folioOrigen: u.folioOrigen ?? null, monto: Math.abs(Number(u.montoUsado)) || 0 }))],
       });
     }
   }
@@ -426,15 +701,106 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
 }
 
 /**
- * Arma las 2 líneas (Abono subtotal + Abono IVA, sin ningún Cargo que las
- * compense) del saldo a favor generado por una Devolución — ver
- * `_prefetchSaldosFavorGenerados`. Deliberadamente NO cancela ni toca el
- * Abono normal de la Devolución (Caja/Bancos/Clientes, lo que sea):
- * confirmado con el usuario 2026-08-04 que ambos deben coexistir tal cual,
- * aunque a nivel de este único CFDI se vea "descuadrado" — el saldo a favor
- * es una cuenta de pasivo con saldo corrido (como Clientes/CxC), no algo que
- * tenga que cuadrar el mismo día; se resuelve solo cuando se registra su USO
- * en otra venta (ver `usadosPorCuenta` en cobros-sucursal-puente.service.js).
+ * Para cada CFDI tipo P (Complemento de Pago), extrae de
+ * `complementoPago.pagos[].doctosRelacionados[]` la serie/folio/monto de
+ * CADA factura que ese Pago liquida (`doctosPorUuid`, indexado por el UUID
+ * del propio Pago) — consumido por `cfdiToMovimientos` (`context.doctosPago`)
+ * para partir TANTO el Cargo como el Abono (columna H) en un asiento completo
+ * POR FACTURA liquidada, con concepto "{cliente} / {serie}-{folio de esa
+ * factura}" en vez de una sola línea agregada con el concepto genérico del
+ * Pago completo (confirmado con el usuario 2026-08-11 — solo aplica a Pagos,
+ * nunca a Ingreso/Egreso).
+ *
+ * Cada documento trae también su propio `montoSF` — lo consultado en
+ * `/desgloses-cobro/saldos-favor` (mismo endpoint que
+ * `_prefetchAjustesFacturaPropia` usa para tipo I) por la serie/folio de ESA
+ * factura específica, para saber si esa liquidación puntual se pagó (parcial
+ * o totalmente) con saldo a favor del cliente. A diferencia de tipo I, aquí
+ * NO se fusiona en el mapa agregado de `esCasoAjusteSFPuntos` — cada factura
+ * necesita su propio Cargo a Anticipos Otros individual, no uno agregado por
+ * todo el Pago (confirmado con el usuario 2026-08-11, corrigiendo el diseño
+ * inicial de esta función que sí agregaba por Pago).
+ *
+ * Simplificación consciente (confirmado con el usuario 2026-08-11): a
+ * diferencia de `_prefetchAjustesFacturaPropia`, NO filtra por día ni
+ * prorratea retenciones de IVA/ISR — un Pago PPD casi siempre ocurre días
+ * después de la venta que liquida, así que filtrar por el día de la factura
+ * descartaría el uso real; y este cliente no maneja Pagos con retención en la
+ * práctica. Si eso cambia, hay que revisar ambos puntos.
+ */
+async function _prefetchDoctosPago(cfdiConRegla, rfc) {
+  const pagos = cfdiConRegla.filter(({ cfdi }) => cfdi.tipoDeComprobante === 'P');
+  const doctosPorUuid = new Map(); // uuid del Pago → [{ serie, folio, monto }]
+  const paresVistos   = new Map(); // `${serie}|${folio}` → { serie, folio } (dedup entre Pagos)
+
+  for (const { cfdi } of pagos) {
+    const doctos = [];
+    for (const pago of (cfdi.complementoPago?.pagos ?? [])) {
+      for (const dr of (pago.doctosRelacionados ?? [])) {
+        const serie = dr.serie ?? null;
+        const folio = dr.folio ?? null;
+        const monto = Number(dr.impPagado ?? 0);
+        if (!serie || !folio || monto <= 0) continue;
+        // IVA de ESTE doctoRelacionado — mismo cálculo que el agregado de
+        // `iva` en cfdiToMovimientos (líneas ~558-565), pero por documento en
+        // vez de sumado para todo el Pago, para poder partir el swap "IVA
+        // cobrado" (Debe cuentaIvaPPD / Haber cuentaIva) por factura.
+        const ivaDoc = (dr.trasladosDR ?? [])
+          .filter(t => (t.impuesto || t.Impuesto || '') === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
+          .reduce((s, t) => s + Number(t.importe || t.importeDR || t.ImporteDR || 0), 0);
+        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc });
+        paresVistos.set(`${serie}|${folio}`, { serie, folio });
+      }
+    }
+    if (doctos.length > 0 && cfdi.uuid) doctosPorUuid.set(cfdi.uuid, doctos);
+  }
+
+  if (paresVistos.size === 0) return { doctosPorUuid };
+
+  const pares = [...paresVistos.values()];
+  const LOTE  = 150;
+  const saldoFavorPorFactura = new Map(); // `${serie}|${folio}` de la factura → monto usado
+  for (let i = 0; i < pares.length; i += LOTE) {
+    const lote = pares.slice(i, i + LOTE);
+    const resultado = await obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
+    for (const cuenta of resultado) {
+      const usados = cuenta.saldosFavorUsados ?? [];
+      if (!usados.length) continue;
+      const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+      if (monto > 0) saldoFavorPorFactura.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, monto);
+    }
+  }
+
+  if (saldoFavorPorFactura.size > 0) {
+    for (const doctos of doctosPorUuid.values()) {
+      for (const d of doctos) {
+        const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
+        if (sf > 0) d.montoSF = sf;
+      }
+    }
+  }
+
+  return { doctosPorUuid };
+}
+
+/**
+ * Arma las 2 líneas (Abono subtotal + Abono IVA) del saldo a favor generado
+ * por una Devolución — ver `_prefetchSaldosFavorGenerados` (el monto viene
+ * confirmado por el ERP, no es especulativo). Hasta 2026-08-10 estas 2 líneas
+ * se dejaban deliberadamente sin ningún Cargo que las compensara (confirmado
+ * con el usuario 2026-08-04: "el saldo a favor es un pasivo con saldo
+ * corrido, no tiene que cuadrar el mismo día") — pero eso descuadraba el
+ * asiento completo, porque el Abono normal de la Devolución (Caja por
+ * identificar/Bancos/Clientes) ya contaba el mismo dinero como "salida de
+ * efectivo" Y estas 2 líneas lo contaban OTRA VEZ como "pasivo nuevo". Ambas
+ * cosas no pueden ser ciertas a la vez por el mismo monto. El caller (ver
+ * `generarPropuesta`/`generarPolizaDesdeMovimientos`) ahora agrega una
+ * tercera línea de Cargo que cierra exactamente ese Abono normal por el
+ * monto que se convirtió en saldo a favor — el pasivo en sí (cuenta
+ * Anticipos Otros) sigue con saldo corrido igual que antes; lo que cambia es
+ * que ya no se duplica el mismo dinero dentro de ESTE asiento. Su consumo
+ * futuro (cuando el saldo se aplica a otra venta) sigue sin tocarse aquí —
+ * ver `usadosPorCuenta` en cobros-sucursal-puente.service.js.
  * Concepto/serie usan la VENTA que generó el saldo, no el folio propio de la
  * Devolución. Devuelve `[]` si esta Devolución no generó saldo a favor.
  *
@@ -445,9 +811,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc) {
  * propia serie), pero el asiento le corresponde a la otra sucursal. En vez de
  * eso, ENCOLA en `CobroSucursalPendiente` (mismo mecanismo que un cobro
  * cruzado normal) para que esa sucursal lo aplique al generar su propia
- * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza).
+ * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza — tampoco
+ * hay Cargo de cierre que agregar en el caller, porque no hay líneas).
  */
-async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cc, rfc }) {
+async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc }) {
   if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
   const marcador = (cfdi.documentosRelacionados ?? [])
     .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
@@ -489,6 +856,48 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     serie:         serieFolioVenta,
     centroCosto:   cc?.clave ?? null,
     centroCostoId: cc?.id    ?? null,
+    cfdiUuid:      cfdi.uuid,
+    cuentaFaltante: false,
+  };
+
+  // Caso "mismo folio" (confirmado con el usuario 2026-08-13, ver
+  // `_prefetchSaldosFavorGenerados`): la MISMA venta generó y consumió el
+  // saldo — no es un pasivo real, es una salida de caja que ya volvió a
+  // entrar. En vez de las 2 líneas de Anticipos Otros, se devuelve UNA sola
+  // línea de Cargo NEGATIVO a Caja/Bancos (según la forma de pago real de esa
+  // venta) — al llegar a `consolidarCargos` (poliza.service.js), que solo
+  // agrupa por cuenta+centro+forma de pago y SUMA `debe`, este valor negativo
+  // resta directo del total sin crear una fila propia (confirmado con el
+  // usuario: "solo restarlo", sin desglose). `_ajusteConsolidadoSF` le indica
+  // al caller (generarPropuesta/generarYGuardar) que trate esta línea como
+  // el equivalente del Abono SF para efectos de cerrar/cancelar el Abono
+  // normal de la Devolución (mismo mecanismo de cuadre por asiento que ya
+  // existe para el caso normal, ver comentario junto al caller).
+  // Alcance: solo si además NO hay cruce de sucursal (`esCruzado` ya
+  // descartado arriba) — la combinación mismoFolio+cruzado no tiene caso real
+  // confirmado con el usuario; si aparece, cae al comportamiento normal de
+  // abajo (pasivo vía Anticipos Otros).
+  if (generado.mismoFolio) {
+    const esTarjeta      = generado.formaPagoReal === '04' || generado.formaPagoReal === '28';
+    const cuentaAjusteId = esTarjeta ? cuentaBancosId : cuentaCajaId;
+    if (cuentaAjusteId) {
+      return [{
+        ...base,
+        cuentaId:    cuentaAjusteId,
+        tipoOrigen:  'Ajuste Consolidado SF',
+        reglaNombre: 'SF-MISMO-FOLIO',
+        formaPago:   generado.formaPagoReal ?? null,
+        debe:        -(subtotal + iva),
+        haber:       0,
+        _ajusteConsolidadoSF: true,
+      }];
+    }
+    // Sin cuenta de Caja/Bancos disponible: no hay dónde ajustar el
+    // consolidado — cae al comportamiento normal (pasivo) en vez de perder el
+    // registro por completo.
+  }
+
+  return [
     // tipoOrigen='Cobro Sucursal' (NO un tipo propio) — a propósito: solo así
     // pasa por `_extraerCobrosSucursal` (poliza.service.js), que arma columna
     // C = "SF" (por `reglaNombre`) SIN reconstruir el concepto — a diferencia
@@ -496,18 +905,11 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     // toma cualquier otro tipoOrigen), que SÍ reconstruye el concepto a partir
     // de `serie` — poner serie="SF" ahí corrompía el concepto a "cliente / SF"
     // en vez de "cliente / I0-260700186" (confirmado con el usuario 2026-08-04).
-    tipoOrigen:    'Cobro Sucursal',
     // 'SF-OCULTO' cuando se generó y se consumió por completo el mismo día
     // en el mismo almacén — ver `_prefetchSaldosFavorGenerados` — para que
     // `_extraerCobrosSucursal` la omita del export (sigue en poliza_movimientos).
-    reglaNombre:   reglaSF,
-    cfdiUuid:      cfdi.uuid,
-    cuentaFaltante: false,
-    debe: 0,
-  };
-  return [
-    { ...base, cuentaId: cuentaSaldoFavorId,    haber: subtotal },
-    { ...base, cuentaId: cuentaIvaSaldoFavorId, haber: iva },
+    { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: subtotal },
+    { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: iva },
   ];
 }
 
@@ -1060,7 +1462,7 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
 const LIMITE_CFDIS = 500;
 const CHUNK_SIZE   = 200;
 
-async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -1129,7 +1531,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   await repararSubtotalDesdeXml(cfdis);
 
-  const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
+  // Filtro por forma de pago (solo Cobranza/Pagos) — ver `FORMA_PAGO_A_CATEGORIA`.
+  const cfdisSinPoliza = cfdis.filter(c =>
+    !uuidsYaUsados.has(c.uuid) &&
+    (!formaPagoFiltro || tipoCfdi !== 'P' || FORMA_PAGO_A_CATEGORIA[_formaPagoResuelta(c)] === formaPagoFiltro),
+  );
 
   // Antes ambos casos (cero CFDIs encontrados vs. todos ya poliza'dos) tiraban
   // el mismo mensaje "ya tienen póliza registrada" — confuso cuando en
@@ -1262,11 +1668,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .map(u => u.toUpperCase())
       )
   );
-  // Ningún sustituto se contabiliza automático — todos se excluyen y se
-  // listan aparte (`sustitutos`) para revisión manual, ver
-  // _particionarSustitutosPorRiesgo.
+  // Sustitutos cuyo original es de un periodo ya cerrado (o no se pudo
+  // determinar su periodo) se excluyen y se listan aparte (`sustitutos`) para
+  // revisión manual — ver _particionarSustitutosPorRiesgo. Los del MISMO
+  // periodo (`mismoPeriodo`) se contabilizan automático más abajo: el
+  // sustituto entra normal al batch, y el original se agrega aparte con su
+  // asiento + reversión (ver `cfdisOriginalesCanceladosProp`).
   const sustitutosEnriquecidosProp = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinal));
-  const { excluidos: sustitutosProp } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosProp, { uuidsYaUsados, ejercicio, periodo });
+  const { excluidos: sustitutosClasificadosProp } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosProp, { uuidsYaUsados, ejercicio, periodo });
+  const sustitutosMismoPeriodoProp = sustitutosClasificadosProp.filter(s => s.mismoPeriodo);
+  const sustitutosProp = sustitutosClasificadosProp.filter(s => !s.mismoPeriodo);
   const _uuidsSustitutosExcluidosProp = new Set(sustitutosProp.map(s => s.uuid?.toUpperCase()).filter(Boolean));
 
   const cfdisSinPolizaFinalFiltradoSustituto = (_canceladosPorSustitutoProp.size || _uuidsSustitutosExcluidosProp.size)
@@ -1296,9 +1707,32 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Ingreso — ver _fetchNotasCreditoParaFusion. Se agregan al final del batch
   // 'I'; el resto del pipeline (matching de reglas, cfdiToMovimientos) ya
   // maneja tipos mixtos genéricamente.
-  const cfdisConNCProp = tipoCfdi === 'I'
+  const cfdisConNCSinReversionProp = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap: ccBySerieMapProp })]
     : cfdisSinPolizaFinalFiltrado;
+
+  // Originales cancelados-con-sustitución del MISMO periodo (ver
+  // `sustitutosMismoPeriodoProp` arriba) — se agregan al batch para que
+  // pasen por el mismo matching de reglas y `cfdiToMovimientos` que
+  // cualquier CFDI normal (su asiento "como si estuviera vigente"); el
+  // asiento de reversión que lo cancela se agrega después de generar todos
+  // los movimientos (ver `sustitutosMismoPeriodoProp` más abajo, tras el
+  // loop principal).
+  const cfdisOriginalesCanceladosProp = sustitutosMismoPeriodoProp.length
+    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoProp.flatMap(s => s.sustituyeA) } })
+        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
+        .lean()
+    : [];
+  const cfdisConNCProp = [...cfdisConNCSinReversionProp, ...cfdisOriginalesCanceladosProp];
+
+  // Póliza de Pagos (Cobranza): ordenar por folio del Pago ascendente — sin
+  // esto el orden es el que regresa Mongo (esencialmente arbitrario), lo que
+  // resultaba en saltos entre centros de costo sin ningún criterio visible
+  // (confirmado con el usuario 2026-08-11). Solo tipo P — Ingreso/Egreso no
+  // se tocan.
+  if (tipoCfdi === 'P') {
+    cfdisConNCProp.sort((a, b) => Number(a.folio) - Number(b.folio));
+  }
 
   // Las NC fusionadas (_fetchNotasCreditoParaFusion) se agregan DESPUÉS del
   // primer `_completarRelacionadosPostMerge` — completar de nuevo (solo agrega
@@ -1306,12 +1740,24 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // resuelva más abajo.
   await _completarRelacionadosPostMerge(cfdisConNCProp, relMetodoPagoMap, relFacturaMetaMap);
 
+  // Serie propia de esta sucursal — se calcula aquí (antes de lo que la
+  // necesita: `_prefetchSaldosFavorGenerados` y, más abajo,
+  // `_prefetchAjustesFacturaPropia`) como `centroPropioClave` para consultar
+  // por centro+fecha en vez de por serie/folio propio.
+  let serieDelCentroProp = centroCostoId
+    ? Object.entries(ccBySerieMapProp).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0]
+    : null;
+
   // Saldos a favor generados por las Devoluciones de este batch — ANTES de
   // construirMovimientosPuente porque `devsOcultos` (ver
   // `_prefetchSaldosFavorGenerados`) debe llegar a esa llamada, para que el
   // lado de "uso" también sepa marcar como oculto el mismo par
   // generación+uso "lavado" el mismo día en el mismo almacén.
-  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp);
+  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
+    centroPropioClave: serieDelCentroProp,
+    fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+    fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+  });
 
   // Cobros de sucursales (Caja/Bancos por identificar, ver
   // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
@@ -1339,10 +1785,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
     cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
     if (cuentaCajaId && cuentaBancosId) {
-      // Acotado a la serie propia — el lado cobrador ya NO depende de
-      // ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio` y la cola
-      // `CobroSucursalPendiente`).
-      const serieDelCentro = Object.entries(ccBySerieMapProp).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0];
+      // Acotado a la serie propia para ESTA consulta — el lado cobrador ya no
+      // depende SOLO de ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio`
+      // y la cola `CobroSucursalPendiente`): cuando se genera por día, además
+      // se consulta directo por centro+fecha vía `centroPropioClave` (ver
+      // comentario en `construirMovimientosPuente`).
+      const serieDelCentro = serieDelCentroProp;
       const cfdisParaPuente = (fechaInicio && fechaFin)
         ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
         : cfdisSinPolizaFinal;
@@ -1360,6 +1808,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
         fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
         devsOcultosSF: devsOcultosSFProp,
+        centroPropioClave: serieDelCentro,
       });
       movsPuente = resultadoPuente.movimientos;
       facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
@@ -1410,7 +1859,17 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   // Desglose real de forma de pago (ver `_prefetchDesglosePagoReal`) — antes
   // de precalcular el `context` por CFDI, para que esté disponible ahí.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc);
+  // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
+  // centro+rango de fechas en vez de por serie/folio propio — ver docstring
+  // en `_prefetchAjustesFacturaPropia`.
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, {
+    centroPropioClave: serieDelCentroProp,
+    fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+    fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+  });
+  // Documentos liquidados por cada Pago (asiento completo por factura,
+  // incluyendo su propio saldo a favor si aplica) — ver `_prefetchDoctosPago`.
+  const { doctosPorUuid: doctosPagoMapProp } = await _prefetchDoctosPago(cfdiConRegla, rfc);
   // Acumulador de Puntos usados en TODO el batch, por sucursal — Puntos va
   // consolidado en una sola línea genérica al final (a diferencia de Saldo a
   // Favor, que sí es individual), ver push al final de este flujo.
@@ -1533,6 +1992,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
     }
+    if (cfdi.tipoDeComprobante === 'P') {
+      const doctosPago = doctosPagoMapProp.get(cfdi.uuid);
+      if (doctosPago) context.doctosPago = doctosPago;
+    }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
 
@@ -1623,13 +2086,48 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     // Saldo a favor generado por esta Devolución (ver
-    // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`) — nunca
-    // toca las líneas normales de la Devolución, solo agrega el pasivo aparte.
-    for (const linea of await _inyectarSaldoFavorGenerado({
+    // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`).
+    const lineasSaldoFavorProp = await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
-      cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp, cc: ccProp, rfc,
-    })) {
+      cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp,
+      cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
+      cc: ccProp, rfc,
+    });
+    for (const linea of lineasSaldoFavorProp) {
       movimientosResult.push(linea);
+    }
+    // Cierra el Abono de Caja/Bancos/Clientes que dejó la Devolución (mismo
+    // monto que se convirtió en Anticipos Otros) — sin esto el asiento queda
+    // descuadrado: el mismo dinero se contaba dos veces (salida de
+    // Caja/Bancos Y pasivo de saldo a favor). Revierte, para el cuadre por
+    // asiento que exige el export CONTPAQ, la coexistencia deliberada
+    // confirmada 2026-08-04 (ver docstring de `_inyectarSaldoFavorGenerado`)
+    // — confirmado con el usuario 2026-08-10 que debe cuadrar por asiento.
+    // `_ajusteConsolidadoSF` (caso "mismo folio", 2026-08-13): esa línea no
+    // trae `haber` (es un Cargo negativo), así que se suma su `debe` en
+    // valor absoluto para seguir cerrando el mismo Abono con el mismo monto.
+    if (lineasSaldoFavorProp.length > 0) {
+      const montoSaldoFavorProp = lineasSaldoFavorProp.reduce((s, l) =>
+        s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
+      const abonoDevolucionProp = movs.find(m => Number(m.haber) > 0);
+      if (abonoDevolucionProp && montoSaldoFavorProp > 0) {
+        movimientosResult.push({
+          ...abonoDevolucionProp,
+          debe:          montoSaldoFavorProp,
+          haber:         0,
+          centroCosto:   ccProp?.clave ?? abonoDevolucionProp.centroCosto ?? null,
+          centroCostoId: ccProp?.id    ?? null,
+          _cfdiInfo: {
+            uuid:              cfdi.uuid,
+            tipo:              cfdi.tipoDeComprobante,
+            emisor:            cfdi.emisor?.rfc,
+            total:             cfdi.total,
+            fecha:             cfdi.fecha,
+            sinRegla:          !!abonoDevolucionProp._sinRegla,
+            comparisonStatus:  cfdi.lastComparisonStatus ?? null,
+          },
+        });
+      }
     }
 
     // Asiento adicional PPD cobrada en otra sucursal: Abono a Clientes (misma
@@ -1771,6 +2269,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   movimientosResult.push(...movsPuente);
 
+  // Reversión de originales cancelados-con-sustitución del mismo periodo (ver
+  // `sustitutosMismoPeriodoProp`/`cfdisOriginalesCanceladosProp` arriba): ya
+  // se generó su asiento normal (como si estuviera vigente, junto con el
+  // resto del batch); aquí se agrega el asiento contrario (debe/haber
+  // invertidos) que lo cancela — confirmado con el usuario 2026-08-13.
+  if (sustitutosMismoPeriodoProp.length) {
+    const uuidsOriginalesMismoPeriodoProp = new Set(sustitutosMismoPeriodoProp.flatMap(s => s.sustituyeA));
+    const reversionesProp = movimientosResult
+      .filter(m => m.cfdiUuid && uuidsOriginalesMismoPeriodoProp.has(m.cfdiUuid.toUpperCase()))
+      .map(m => ({
+        ...m,
+        debe:        m.haber,
+        haber:       m.debe,
+        tipoOrigen:  'Cancelación por Sustitución',
+        reglaNombre: `Reversión — ${m.reglaNombre ?? ''}`.trim(),
+      }));
+    movimientosResult.push(...reversionesProp);
+  }
+
   // 4. Construir propuesta (no guardada)
   // Si se generó para un día específico (fechaInicio), el encabezado debe
   // mostrar ESE día, no la fecha en la que se corrió la generación — si no,
@@ -1801,7 +2318,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     });
 
   const advertencias = [];
-  const _ncFusionadasProp = cfdisConNCProp.length - cfdisSinPolizaFinalFiltrado.length;
+  const _ncFusionadasProp = cfdisConNCSinReversionProp.length - cfdisSinPolizaFinalFiltrado.length;
   if (_ncFusionadasProp > 0) {
     advertencias.push(`${_ncFusionadasProp} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
   }
@@ -1832,6 +2349,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       advertencias.push(`  • ${s.uuid?.slice(0, 8)}… sustituye a ${s.sustituyeA.map(u => u.slice(0, 8)).join(', ')}… — ${motivoTxt}`);
     }
     if (sustitutosProp.length > 5) advertencias.push(`  … y ${sustitutosProp.length - 5} más`);
+  }
+  // Sustitutos del MISMO periodo: se contabilizaron automático (original con
+  // su asiento + reversión, sustituto normal) — solo informativo, no hace
+  // falta revisión manual.
+  if (sustitutosMismoPeriodoProp.length) {
+    advertencias.push(
+      `ℹ ${sustitutosMismoPeriodoProp.length} cancelación(es) con sustitución del mismo periodo contabilizada(s) automático (original + asiento de reversión, sustituto normal)`,
+    );
   }
   // Tickets de cajas con cobro real pero sin ninguna factura ligada — hoja
   // aparte "por facturar" (ver `_detectarPendientesPorFacturar`), nunca se
@@ -1875,7 +2400,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
  *
  * Devuelve: { polizaId, totalCfdis, sinRegla, advertencias }
  */
-async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -1930,7 +2455,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   await repararSubtotalDesdeXml(cfdis);
 
-  const cfdisSinPoliza = cfdis.filter(c => !uuidsYaUsados.has(c.uuid));
+  // Filtro por forma de pago (solo Cobranza/Pagos) — ver `FORMA_PAGO_A_CATEGORIA`.
+  const cfdisSinPoliza = cfdis.filter(c =>
+    !uuidsYaUsados.has(c.uuid) &&
+    (!formaPagoFiltro || tipoCfdi !== 'P' || FORMA_PAGO_A_CATEGORIA[_formaPagoResuelta(c)] === formaPagoFiltro),
+  );
 
   // Antes ambos casos (cero CFDIs encontrados vs. todos ya poliza'dos) tiraban
   // el mismo mensaje "ya tienen póliza registrada" — confuso cuando en
@@ -2058,11 +2587,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .map(u => u.toUpperCase())
       )
   );
-  // Ningún sustituto se contabiliza automático — todos se excluyen y se
-  // listan aparte (`sustitutos`) para revisión manual, ver
-  // _particionarSustitutosPorRiesgo.
+  // Sustitutos del mismo periodo se contabilizan automático (ver comentario
+  // equivalente en generarPropuesta) — los demás se excluyen y se listan
+  // aparte (`sustitutos`) para revisión manual, ver _particionarSustitutosPorRiesgo.
   const sustitutosEnriquecidosGuard = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinalGuard));
-  const { excluidos: sustitutosGuard } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosGuard, { uuidsYaUsados, ejercicio, periodo });
+  const { excluidos: sustitutosClasificadosGuard } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosGuard, { uuidsYaUsados, ejercicio, periodo });
+  const sustitutosMismoPeriodoGuard = sustitutosClasificadosGuard.filter(s => s.mismoPeriodo);
+  const sustitutosGuard = sustitutosClasificadosGuard.filter(s => !s.mismoPeriodo);
   const _uuidsSustitutosExcluidosGuard = new Set(sustitutosGuard.map(s => s.uuid?.toUpperCase()).filter(Boolean));
 
   const cfdisSinPolizaFinalGuardFiltradoSustituto = (_canceladosPorSustitutoGuard.size || _uuidsSustitutosExcluidosGuard.size)
@@ -2087,18 +2618,41 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Fusionar NC (tipo E) relacionadas a estas facturas en la MISMA póliza de
   // Ingreso — ver _fetchNotasCreditoParaFusion.
-  const cfdisConNCGuard = tipoCfdi === 'I'
+  const cfdisConNCSinReversionGuard = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalGuardFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalGuardFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap })]
     : cfdisSinPolizaFinalGuardFiltrado;
+
+  // Originales cancelados-con-sustitución del mismo periodo — ver comentario
+  // equivalente en generarPropuesta.
+  const cfdisOriginalesCanceladosGuard = sustitutosMismoPeriodoGuard.length
+    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoGuard.flatMap(s => s.sustituyeA) } })
+        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
+        .lean()
+    : [];
+  const cfdisConNCGuard = [...cfdisConNCSinReversionGuard, ...cfdisOriginalesCanceladosGuard];
+
+  // Ver comentario equivalente en generarPropuesta.
+  if (tipoCfdi === 'P') {
+    cfdisConNCGuard.sort((a, b) => Number(a.folio) - Number(b.folio));
+  }
 
   // Las NC fusionadas se agregan DESPUÉS del primer `_completarRelacionadosPostMerge`
   // — completar de nuevo (solo agrega lo que aún falte), ver comentario equivalente
   // en generarPropuesta.
   await _completarRelacionadosPostMerge(cfdisConNCGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
 
+  // Serie propia de esta sucursal — ver comentario equivalente en generarPropuesta.
+  let serieDelCentroGuard = centroCostoId
+    ? Object.entries(ccBySerieMap).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0]
+    : null;
+
   // Saldos a favor generados por las Devoluciones de este batch — ANTES de
   // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
-  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap);
+  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
+    centroPropioClave: serieDelCentroGuard,
+    fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+    fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+  });
 
   // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
   // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
@@ -2119,7 +2673,6 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     cuentaIvaSaldoFavorIdGuard = cuentaIvaSaldoFavorId;
     if (cuentaCajaId && cuentaBancosId) {
       // Acotado a la serie propia — ver comentario equivalente en generarPropuesta.
-      const serieDelCentroGuard = Object.entries(ccBySerieMap).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0];
       const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
         ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
         : cfdisSinPolizaFinalGuard;
@@ -2137,6 +2690,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
         rfc,
         devsOcultosSF: devsOcultosSFGuard,
+        centroPropioClave: serieDelCentroGuard,
       });
       movsPuenteGuard = resultadoPuenteGuard.movimientos;
       facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
@@ -2181,7 +2735,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const cuentaMap = Object.fromEntries(cuentasRows.map(c => [c.codigo, c.id]));
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc);
+  // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, {
+    centroPropioClave: serieDelCentroGuard,
+    fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+    fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+  });
+  // Ver comentario equivalente en generarPropuesta.
+  const { doctosPorUuid: doctosPagoMapGuard } = await _prefetchDoctosPago(cfdiConRegla, rfc);
   const puntosAcumuladosGuard = new Map(); // centroCostoId → { monto, centroCosto }
 
   // 6. Pre-fetch CFDIs relacionados (5° movimiento anticipo) y saldo a favor
@@ -2315,6 +2876,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
     }
+    if (cfdi.tipoDeComprobante === 'P') {
+      const doctosPago = doctosPagoMapGuard.get(cfdi.uuid);
+      if (doctosPago) context.doctosPago = doctosPago;
+    }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
@@ -2385,11 +2950,31 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
     // Saldo a favor generado por esta Devolución — ver comentario
     // equivalente en generarPropuesta.
-    for (const linea of await _inyectarSaldoFavorGenerado({
+    const lineasSaldoFavorGuard = await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
-      cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard, cc, rfc,
-    })) {
+      cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard,
+      cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
+      cc, rfc,
+    });
+    for (const linea of lineasSaldoFavorGuard) {
       todosLosMovimientos.push(linea);
+    }
+    // Cierra el Abono de Caja/Bancos/Clientes de la Devolución — ver
+    // comentario equivalente en generarPropuesta.
+    if (lineasSaldoFavorGuard.length > 0) {
+      const montoSaldoFavorGuard = lineasSaldoFavorGuard.reduce((s, l) =>
+        s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
+      const abonoDevolucionGuard = movs.find(m => Number(m.haber) > 0);
+      if (abonoDevolucionGuard && montoSaldoFavorGuard > 0) {
+        todosLosMovimientos.push({
+          ...abonoDevolucionGuard,
+          debe:           montoSaldoFavorGuard,
+          haber:          0,
+          cuentaFaltante: abonoDevolucionGuard.cuentaId == null,
+          centroCosto:    cc?.clave ?? abonoDevolucionGuard.centroCosto ?? null,
+          centroCostoId:  cc?.id    ?? null,
+        });
+      }
     }
 
     // Ver comentario equivalente en generarPropuesta.
@@ -2503,11 +3088,35 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
     if (sustitutosGuard.length > 5) advertencias.push(`  … y ${sustitutosGuard.length - 5} más`);
   }
+  // Sustitutos del MISMO periodo: se contabilizaron automático — ver
+  // comentario equivalente en generarPropuesta.
+  if (sustitutosMismoPeriodoGuard.length) {
+    advertencias.push(
+      `ℹ ${sustitutosMismoPeriodoGuard.length} cancelación(es) con sustitución del mismo periodo contabilizada(s) automático (original + asiento de reversión, sustituto normal)`,
+    );
+  }
 
   // Cobros de sucursales — ya calculado arriba (antes del loop de reglas),
   // ver `movsPuenteGuard`. Se agrega ANTES de calcular folios para que entre
   // en el mismo cálculo de rango/chunking que el resto.
   todosLosMovimientos.push(...movsPuenteGuard);
+
+  // Reversión de originales cancelados-con-sustitución del mismo periodo —
+  // ver comentario equivalente en generarPropuesta. Se agrega ANTES de la
+  // transacción de guardado para que quede persistida junto con el resto.
+  if (sustitutosMismoPeriodoGuard.length) {
+    const uuidsOriginalesMismoPeriodoGuard = new Set(sustitutosMismoPeriodoGuard.flatMap(s => s.sustituyeA));
+    const reversionesGuard = todosLosMovimientos
+      .filter(m => m.cfdiUuid && uuidsOriginalesMismoPeriodoGuard.has(m.cfdiUuid.toUpperCase()))
+      .map(m => ({
+        ...m,
+        debe:        m.haber,
+        haber:       m.debe,
+        tipoOrigen:  'Cancelación por Sustitución',
+        reglaNombre: `Reversión — ${m.reglaNombre ?? ''}`.trim(),
+      }));
+    todosLosMovimientos.push(...reversionesGuard);
+  }
 
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
   // Si se generó para un día específico (fechaInicio), el encabezado debe
@@ -2592,7 +3201,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   const advertenciasFinal = [];
-  const _ncFusionadasGuard = cfdisConNCGuard.length - cfdisSinPolizaFinalGuardFiltrado.length;
+  const _ncFusionadasGuard = cfdisConNCSinReversionGuard.length - cfdisSinPolizaFinalGuardFiltrado.length;
   if (_ncFusionadasGuard > 0) {
     advertenciasFinal.push(`${_ncFusionadasGuard} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
   }
@@ -2648,7 +3257,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
  *
  * Devuelve: { resultados: [{ centroCosto, centroCostoId, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi }) {
+async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, formaPagoFiltro }) {
   const centros = await centrosSvc.list();
   const centrosConSerie = centros.filter(c => c.serieFacturacion);
 
@@ -2658,7 +3267,7 @@ async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropues
 
   const resultados = await _conLimite(centrosConSerie, CONCURRENCIA_GENERACION, async (cc) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, formaPagoFiltro });
       return { centroCosto: cc.sucursal, centroCostoId: cc.id, ...r };
     } catch (err) {
       // "No hay CFDIs para esta sucursal" es esperado (no toda sucursal tiene
@@ -2807,7 +3416,7 @@ const CONCURRENCIA_GENERACION = 4;
  *
  * Devuelve: { resultados: [{ fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin }) {
+async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
@@ -2816,7 +3425,7 @@ async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 
 
   const resultados = await _conLimite(dias, CONCURRENCIA_GENERACION, async (dia) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia, formaPagoFiltro });
       return { fecha: dia, ...r };
     } catch (err) {
       // "No hay CFDIs para este día" es esperado (no todos los días tienen
@@ -2836,7 +3445,7 @@ async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 
  *
  * Devuelve: { resultados: [{ centroCosto, centroCostoId, fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin }) {
+async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro }) {
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
@@ -2855,7 +3464,7 @@ async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPro
 
   const resultados = await _conLimite(combinaciones, CONCURRENCIA_GENERACION, async ({ cc, dia }) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia, formaPagoFiltro });
       return { centroCosto: cc.sucursal, centroCostoId: cc.id, fecha: dia, ...r };
     } catch (err) {
       // "No hay CFDIs para esta sucursal/día" es esperado — se reporta sin
@@ -2871,4 +3480,6 @@ module.exports = {
   generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   _uuidsPorFechaEfectiva,
+  _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
+  _prefetchAjustesFacturaPropia,
 };

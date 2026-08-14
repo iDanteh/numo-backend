@@ -4,6 +4,7 @@ const { Transaction, QueryTypes, Op } = require('sequelize');
 const { sequelize }        = require('../../../../config/database.postgres');
 const { Poliza, PolizaMovimiento, AccountPlan, CentroCosto, CfdiMappingRule } = require('../../../../shared/models/postgres');
 const CFDI = require('../../../../visor/models/CFDI');
+const { _extraerSustitutos } = require('../../cfdi-mapping/sustitutos-cfdi.util');
 
 // ── Inclusión estándar de movimientos con cuenta y centro de costo ───────────
 const MOVIMIENTOS_INCLUDE = {
@@ -47,15 +48,19 @@ async function findAll(filters = {}) {
       { folio:    { [Op.iLike]: q } },
     ];
   }
-  // Vista "Pólizas de Cobranza": pólizas con al menos un movimiento que viene
-  // de un CFDI de Pago (complemento de pago / cobranza de cartera), mismo
-  // marcador que usa poliza.service.js (esPagos) para el export CONTPAQ.
+  // Vista "Pólizas de Cobranza" vs. "Pólizas de Ingreso": separa estrictamente
+  // por si la póliza tiene algún movimiento que viene de un CFDI de Pago
+  // (complemento de pago / cobranza de cartera), mismo marcador que usa
+  // poliza.service.js (esPagos) para el export CONTPAQ — true = solo esas
+  // (Cobranza); false = solo las que NO tienen ninguna (Ingreso), para que no
+  // se mezclen (confirmado con el usuario 2026-08-11 — antes solo se
+  // filtraba el caso true, dejando las de Cobranza visibles también en
+  // Ingreso). Mismo criterio que ya usa `listBorradorCandidatas`.
+  const SUBQUERY_POLIZAS_PAGO = `(SELECT DISTINCT poliza_id FROM poliza_movimientos WHERE tipo_comprobante = 'P')`;
   if (filters.soloCobranza === true || filters.soloCobranza === 'true') {
-    where.id = {
-      [Op.in]: sequelize.literal(
-        `(SELECT DISTINCT poliza_id FROM poliza_movimientos WHERE tipo_comprobante = 'P')`,
-      ),
-    };
+    where.id = { [Op.in]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
+  } else if (filters.soloCobranza === false || filters.soloCobranza === 'false') {
+    where.id = { [Op.notIn]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
   }
 
   const page  = Math.max(1, Number(filters.page)  || 1);
@@ -153,13 +158,13 @@ async function findById(id) {
   if (uuids.length > 0) {
     const cfdis = await CFDI.find(
       { uuid: { $in: uuids } },
-      { uuid: 1, satStatus: 1, erpStatus: 1, source: 1, metodoPago: 1, formaPago: 1, _id: 0 },
+      { uuid: 1, satStatus: 1, erpStatus: 1, source: 1, metodoPago: 1, formaPago: 1, 'emisor.rfc': 1, tipoDeComprobante: 1, _id: 0 },
     ).lean();
 
     // Consolidar por uuid — un UUID puede tener registro SAT y ERP por separado
     const byUuid = {};
     for (const c of cfdis) {
-      if (!byUuid[c.uuid]) byUuid[c.uuid] = { satStatus: null, erpStatus: null, sources: new Set(), metodoPago: null, formaPago: null };
+      if (!byUuid[c.uuid]) byUuid[c.uuid] = { satStatus: null, erpStatus: null, sources: new Set(), metodoPago: null, formaPago: null, rfc: c.emisor?.rfc ?? null, tipoDeComprobante: c.tipoDeComprobante ?? null };
       byUuid[c.uuid].sources.add(c.source);
       if (c.source === 'SAT' && c.satStatus)    byUuid[c.uuid].satStatus  = c.satStatus;
       if (c.source === 'ERP' && c.erpStatus)    byUuid[c.uuid].erpStatus  = c.erpStatus;
@@ -191,6 +196,33 @@ async function findById(id) {
 
       if (alerts.length > 0) {
         cfdiAlertMap[uuid] = { satStatus: info.satStatus, erpStatus: info.erpStatus, alerts };
+      }
+    }
+
+    // Para los CFDIs cancelados de esta póliza: ¿ya tienen un sustituto
+    // (tipoRelacion='04')? Botón "CFDIs cancelados" del detalle de póliza —
+    // se reutiliza `_extraerSustitutos` (mismo parseo que usa el generador,
+    // incluye el fix del bug real de dos UUIDs concatenados en un solo
+    // string) en vez de una query Mongo ingenua por `uuids: uuid`.
+    const uuidsCancelados = Object.keys(cfdiAlertMap).filter(u => cfdiAlertMap[u].alerts.includes('cancelado_sat'));
+    if (uuidsCancelados.length > 0) {
+      const rfcs  = [...new Set(uuidsCancelados.map(u => byUuid[u]?.rfc).filter(Boolean))];
+      const tipos = [...new Set(uuidsCancelados.map(u => byUuid[u]?.tipoDeComprobante).filter(Boolean))];
+      const candidatosSustituto = (rfcs.length && tipos.length)
+        ? await CFDI.find({
+            'emisor.rfc':        { $in: rfcs },
+            tipoDeComprobante:   { $in: tipos },
+            'cfdiRelacionados.tipoRelacion': '04',
+          }, { uuid: 1, serie: 1, folio: 1, tipoDeComprobante: 1, cfdiRelacionados: 1, _id: 0 }).lean()
+        : [];
+      const sustitutoPorOriginal = new Map();
+      for (const s of _extraerSustitutos(candidatosSustituto)) {
+        for (const uOriginal of s.sustituyeA) {
+          sustitutoPorOriginal.set(uOriginal, { uuid: s.uuid, serie: s.serie, folio: s.folio });
+        }
+      }
+      for (const uuid of uuidsCancelados) {
+        cfdiAlertMap[uuid].sustituto = sustitutoPorOriginal.get(uuid.toUpperCase()) ?? null;
       }
     }
 
@@ -258,6 +290,52 @@ async function update(id, data) {
 
     return findById(id);
   });
+}
+
+// Antes de sobreescribir cuentaId, guarda la cuenta previa en
+// cuentaAnteriorId — SOLO si todavía no había una guardada (COALESCE), para
+// que tras varios reemplazos encadenados (automático + manual) siempre quede
+// la cuenta ORIGINAL de antes del primer cruce, no la intermedia. Se usa
+// tanto en el cruce automático como en el reemplazo manual, y se restaura al
+// revertir la póliza a borrador (ver `restaurarCuentasAnteriores`).
+const _GUARDAR_CUENTA_ANTERIOR = sequelize.literal('COALESCE("cuenta_anterior_id", "cuenta_id")');
+
+// Actualiza cuentaId de movimientos puntuales de una póliza (usado por
+// `_resolverCuentasBancoReal` al contabilizar) — un UPDATE por fila porque
+// cada movimiento va a una cuenta distinta (no es un reemplazo uniforme).
+async function actualizarCuentasMovimientos(polizaId, actualizaciones) {
+  if (!actualizaciones?.length) return 0;
+  return sequelize.transaction(async (t) => {
+    for (const { movimientoId, cuentaId } of actualizaciones) {
+      await PolizaMovimiento.update(
+        { cuentaId, cuentaFaltante: false, cuentaAnteriorId: _GUARDAR_CUENTA_ANTERIOR },
+        { where: { id: movimientoId, polizaId }, transaction: t },
+      );
+    }
+    return actualizaciones.length;
+  });
+}
+
+// Reemplazo manual uniforme: toda línea de la póliza que use `cuentaPuenteId`
+// pasa a `cuentaDestinoId`. Usado para resolver a mano lo que el cruce
+// automático de `contabilizar` no pudo cruzar.
+async function reemplazarCuentaEnPoliza(polizaId, cuentaPuenteId, cuentaDestinoId) {
+  const [afectados] = await PolizaMovimiento.update(
+    { cuentaId: cuentaDestinoId, cuentaFaltante: false, cuentaAnteriorId: _GUARDAR_CUENTA_ANTERIOR },
+    { where: { polizaId, cuentaId: cuentaPuenteId } },
+  );
+  return afectados;
+}
+
+// Deshace el/los cruce(s) de cuenta banco-real (automático o manual) al
+// revertir la póliza a borrador — limpia cuentaAnteriorId para que el
+// próximo `contabilizar`/`resolverCuentasBanco` vuelva a calcular desde cero.
+async function restaurarCuentasAnteriores(polizaId) {
+  const [afectados] = await PolizaMovimiento.update(
+    { cuentaId: sequelize.literal('"cuenta_anterior_id"'), cuentaAnteriorId: null },
+    { where: { polizaId, cuentaAnteriorId: { [Op.ne]: null } } },
+  );
+  return afectados;
 }
 
 // Cambio de estado con lock — evita TOCTOU en contabilizar/cancelar/revertir
@@ -341,4 +419,7 @@ async function findAllContabilizadas({ rfc, ejercicio, periodo }) {
   });
 }
 
-module.exports = { findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas, findDescuadradas };
+module.exports = {
+  findAll, findById, findByIdLight, create, update, cancel, setEstado, destroy, findAllContabilizadas, findDescuadradas,
+  actualizarCuentasMovimientos, reemplazarCuentaEnPoliza, restaurarCuentasAnteriores,
+};

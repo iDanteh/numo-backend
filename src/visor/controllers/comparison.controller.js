@@ -218,7 +218,9 @@ const batch = asyncHandler(async (req, res) => {
   }
 
   // Buscar también CFDIs SAT/MANUAL del mismo periodo para detectar los que no están en ERP
-  const satFilter = { source: { $in: ['SAT', 'MANUAL'] }, isActive: true };
+  // — excluye los ya conciliados manualmente, ver comentario en compareSATOnlyCFDI
+  // (comparisonEngine.js) sobre por qué no deben volver a compararse.
+  const satFilter = { source: { $in: ['SAT', 'MANUAL'] }, isActive: true, lastComparisonStatus: { $ne: 'conciliado' } };
   if (cfdiFilter.ejercicio)          satFilter.ejercicio          = cfdiFilter.ejercicio;
   if (cfdiFilter.periodo)            satFilter.periodo            = cfdiFilter.periodo;
   if (cfdiFilter.tipoDeComprobante)  satFilter.tipoDeComprobante  = cfdiFilter.tipoDeComprobante;

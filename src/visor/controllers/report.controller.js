@@ -1227,8 +1227,16 @@ const notInErp = asyncHandler(async (req, res) => {
     .sort({ fecha: -1 })
     .lean();
 
-  // Paso 3a: SAT sin contraparte ERP en este mismo periodo
-  const sinContraparteErp = satDocs.filter(d => !erpUuidsPeriodo.has(d.uuid?.toUpperCase()));
+  // Paso 3a: SAT sin contraparte ERP en este mismo periodo — excluye los ya
+  // conciliados manualmente (`POST /comparisons/conciliar-not-in-erp`, ver
+  // comparison.controller.js): ese endpoint marca `lastComparisonStatus:
+  // 'conciliado'` en el CFDI, pero este reporte recalcula "sin contraparte
+  // ERP" desde cero por diferencia de sets de UUID en cada llamada — sin este
+  // filtro, la factura conciliada seguía sin existir en ERP y por lo tanto
+  // volvía a aparecer aquí siempre, ignorando la conciliación (confirmado con
+  // el usuario 2026-08-14: concilió una factura y seguía apareciendo).
+  const sinContraparteErp = satDocs.filter(d =>
+    !erpUuidsPeriodo.has(d.uuid?.toUpperCase()) && d.lastComparisonStatus !== 'conciliado');
 
   // Paso 3b: duplicados SAT — mismo UUID más de una vez en SAT para el periodo
   const uuidCount = {};
@@ -2453,6 +2461,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
     numAutorizacion, idNumo,
     serieCxc, folioCxc,
     fechaInicio, fechaFin,
+    formaPago,
     ejercicio, periodo,
     rfcEmisor,
     estado = 'todos',
@@ -2489,6 +2498,10 @@ const pagosBanco = asyncHandler(async (req, res) => {
   const drMatch = {};
   if (serie) drMatch['complementoPago.pagos.doctosRelacionados.serie'] = { $regex: serie.trim(), $options: 'i' };
   if (folio) drMatch['complementoPago.pagos.doctosRelacionados.folio'] = { $regex: folio.trim(), $options: 'i' };
+  // formaPago = "Método de pago" en la UI: forma de pago REAL con la que se
+  // hizo el pago (catálogo c_FormaPago, ej. 01 Efectivo/03 Transferencia) —
+  // va en el Pago, no en la factura liquidada.
+  if (formaPago) drMatch['complementoPago.pagos.formaDePagoP'] = formaPago;
   if (fechaInicio || fechaFin) {
     drMatch['complementoPago.pagos.fechaPago'] = {};
     if (fechaInicio) drMatch['complementoPago.pagos.fechaPago'].$gte = new Date(fechaInicio);
@@ -3077,7 +3090,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
  * Descarga Excel con los mismos filtros que pagosBanco (sin paginación).
  */
 const pagosBancoExport = asyncHandler(async (req, res) => {
-  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, ejercicio, periodo, rfcEmisor, estado = 'todos' } = req.query;
+  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, formaPago, ejercicio, periodo, rfcEmisor, estado = 'todos' } = req.query;
 
   // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
   let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
@@ -3105,6 +3118,10 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
   const drMatch = {};
   if (serie) drMatch['complementoPago.pagos.doctosRelacionados.serie'] = { $regex: serie.trim(), $options: 'i' };
   if (folio) drMatch['complementoPago.pagos.doctosRelacionados.folio'] = { $regex: folio.trim(), $options: 'i' };
+  // formaPago = "Método de pago" en la UI: forma de pago REAL con la que se
+  // hizo el pago (catálogo c_FormaPago, ej. 01 Efectivo/03 Transferencia) —
+  // va en el Pago, no en la factura liquidada.
+  if (formaPago) drMatch['complementoPago.pagos.formaDePagoP'] = formaPago;
   if (fechaInicio || fechaFin) {
     drMatch['complementoPago.pagos.fechaPago'] = {};
     if (fechaInicio) drMatch['complementoPago.pagos.fechaPago'].$gte = new Date(fechaInicio);

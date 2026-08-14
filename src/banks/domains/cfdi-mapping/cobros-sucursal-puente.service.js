@@ -67,7 +67,11 @@
 const { Op } = require('sequelize');
 const { PolizaMovimiento, Poliza, AccountPlan, CobroSucursalPendiente } = require('../../../shared/models/postgres');
 const BankMovement = require('../banks/BankMovement.model');
-const { obtenerDesglosesCobroAlmacen, obtenerSaldosFavor } = require('../erp/erp-sync.service');
+const CFDI = require('../../../visor/models/CFDI');
+const {
+  obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
+  obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
+} = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 
 // `BankMovement.banco` → código de cuenta bancaria real del catálogo — mismo
@@ -498,6 +502,16 @@ async function construirMovimientosPuente({
   // Si vienen null (generación sin acotar por día), no se filtra nada.
   fechaDesde,
   fechaHasta,
+  // Serie de facturación de ESTA sucursal (ej. "E0" para Atzompa) — cuando
+  // viene junto con fechaDesde/fechaHasta, permite que la sucursal COBRADORA
+  // descubra DIRECTO (sin depender de que la vendedora ya se haya generado)
+  // lo que cobró de otras sucursales ese día, vía el endpoint nuevo
+  // `/desgloses-cobro/almacen` y `/saldos-favor` filtrado por centro+fecha
+  // (ver `obtenerDesglosesCobroAlmacenPorCentro`/`obtenerSaldosFavorPorCentro`
+  // en erp-sync.service.js). Complementa (no reemplaza) la cola
+  // `CobroSucursalPendiente`: si algo no llega por aquí (fuera del rango de
+  // fechas, endpoint caído, etc.), la cola sigue siendo la red de seguridad.
+  centroPropioClave,
 }) {
   const vacio = { movimientos: [], facturasVendedorCubiertas: new Map(), facturasPPDCubiertas: new Map(), pendientesPorFacturar: [] };
   if (!centroCostoId || !cuentaCajaId || !cuentaBancosId) return vacio;
@@ -508,7 +522,10 @@ async function construirMovimientosPuente({
   const docsPorCfdi = cfdis
     .flatMap(cfdi => _extraerDocumentosRelacionados(cfdi).map(doc => ({ cfdi, doc })));
 
-  if (!docsPorCfdi.length) return vacio;
+  // Puede seguir sin ningún documento relacionado conocido y AÚN encontrar
+  // cobros cruzados vía la consulta directa por centro+fecha (más abajo) —
+  // solo se corta aquí si tampoco hay esa vía disponible.
+  if (!docsPorCfdi.length && !(centroPropioClave && fechaDesde && fechaHasta)) return vacio;
 
   // Mapa serie|folio del documento relacionado → CFDI original, para poder
   // recuperar el nombre del cliente (receptor) de cada cuenta que regrese la
@@ -536,6 +553,63 @@ async function construirMovimientosPuente({
     });
     cuentas.push(...resultado);
   }
+
+  // 1a-bis. Consulta DIRECTA por centro+fecha (2026-08-13) — a diferencia del
+  // bloque anterior (que solo conoce los documentos referenciados por `cfdis`,
+  // acotado a la serie PROPIA), este endpoint regresa TODO lo cobrado/vendido
+  // en ESTE centro ese día, sin importar de qué serie sea la venta. Es lo que
+  // permite que la sucursal COBRADORA descubra un cruce por su cuenta, sin
+  // esperar a que la VENDEDORA se haya generado primero y encolado el dato en
+  // `CobroSucursalPendiente`. Solo aplica generando por día (necesita
+  // fechaDesde/fechaHasta acotados a un único día — no tiene sentido pedirle
+  // al ERP "todo lo cobrado en este centro en el mes completo").
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    // Ya liberado en producción (confirmado con el usuario 2026-08-14) — el
+    // try/catch se deja de todos modos: si falla por cualquier otra razón
+    // (ERP caído, timeout, etc.), esto NO debe tumbar la generación completa
+    // de la póliza: se ignora esta fuente y se sigue solo con lo que ya
+    // encontró la vía de siempre (documentos relacionados + cola
+    // `CobroSucursalPendiente`).
+    try {
+      const fechaDesdeIso = fechaDesde.toISOString();
+      const fechaHastaIso = fechaHasta.toISOString();
+      const cuentasIdsConocidas = new Set(cuentas.map(c => c.cuentaId).filter(Boolean));
+
+      const cuentasDirecto = await obtenerDesglosesCobroAlmacenPorCentro({
+        rfc, centro: centroPropioClave, fechaDesde: fechaDesdeIso, fechaHasta: fechaHastaIso,
+      });
+      for (const c of cuentasDirecto) {
+        if (c.cuentaId && cuentasIdsConocidas.has(c.cuentaId)) continue;
+        cuentas.push(c);
+        if (c.cuentaId) cuentasIdsConocidas.add(c.cuentaId);
+      }
+
+      // Resolver nombreCliente/metodoPago (vía Mongo, NO el ERP) de las cuentas
+      // que la consulta directa trajo y que `cfdiPorDoc` todavía no conoce —
+      // mismo criterio que usa `cfdiPorDoc` para las demás, solo que la fuente
+      // del serie/folio es `cuenta.serieVenta`/`folioVenta` en vez de
+      // `documentosRelacionados` de un CFDI ya cargado.
+      const paresSinCfdi = [...new Map(
+        cuentasDirecto
+          .filter(c => c.serieVenta && c.folioVenta && !cfdiPorDoc.has(`${c.serieVenta}|${c.folioVenta}`))
+          .map(c => [`${c.serieVenta}|${c.folioVenta}`, { serie: c.serieVenta, folio: c.folioVenta }]),
+      ).values()];
+      if (paresSinCfdi.length) {
+        const cfdisEncontrados = await CFDI.find({
+          'emisor.rfc': rfc,
+          $or: paresSinCfdi.map(p => ({ serie: p.serie, folio: p.folio })),
+        }).select('serie folio receptor metodoPago').lean();
+        for (const cf of cfdisEncontrados) {
+          const key = `${cf.serie}|${cf.folio}`;
+          if (!cfdiPorDoc.has(key)) cfdiPorDoc.set(key, cf);
+        }
+      }
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[CobrosSucursalPuente] Consulta directa por centro (${centroPropioClave}) falló, se ignora: ${err.message}`);
+    }
+  }
+
   if (!cuentas.length) return vacio;
 
   // 1b. Saldos a favor USADOS por estas mismas ventas — mismo lote de
@@ -557,6 +631,26 @@ async function construirMovimientosPuente({
       if (cuenta.saldosFavorUsados?.length) {
         usadosPorCuenta.set(key, [...(usadosPorCuenta.get(key) ?? []), ...cuenta.saldosFavorUsados]);
       }
+    }
+  }
+  // Misma consulta, pero por centro+fecha (ver 1a-bis) — cubre las cuentas
+  // que la sucursal cobradora descubrió directo y que `docsUnicos` no traía.
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    // Mismo criterio que la consulta directa de arriba: endpoint aún no
+    // liberado en producción — un fallo aquí no debe tumbar la póliza.
+    try {
+      const resultadoDirecto = await obtenerSaldosFavorPorCentro({
+        rfc, centro: centroPropioClave, fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
+      });
+      for (const cuenta of resultadoDirecto) {
+        const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+        if (cuenta.saldosFavorUsados?.length && !usadosPorCuenta.has(key)) {
+          usadosPorCuenta.set(key, [...cuenta.saldosFavorUsados]);
+        }
+      }
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[CobrosSucursalPuente] Consulta directa de saldos a favor por centro (${centroPropioClave}) falló, se ignora: ${err.message}`);
     }
   }
 
@@ -1124,8 +1218,25 @@ async function construirMovimientosPuente({
   });
   const foliosYaRegistrados = new Set(yaRegistrados.map(m => m.folio));
 
+  // TIPO_ORIGEN_PENDIENTE_PROPIO (ticket sin factura cobrado en SU PROPIA
+  // sucursal, sin cruce real — ver bloque `mismaSucursal` arriba) es
+  // puramente informativo: es un Cargo flotante sin ninguna contrapartida en
+  // esta póliza (no hay otra sucursal con la que cuadrar). Confirmado con el
+  // usuario 2026-08-10: estas líneas ("CLIENTE NO IDENTIFICADO / <folio>"
+  // contra Caja/Bancos por identificar) NO deben aparecer en "Movimientos
+  // contables" — solo en la hoja/lista separada `pendientesPorFacturar`
+  // (que se arma aparte, arriba, a partir de `pendientesDetectados`, así que
+  // excluirlas de aquí no le quita nada a esa lista). Las líneas de
+  // 'Cobro Sucursal' (incluidas las que nacen del mismo ticket huérfano
+  // cuando SÍ hay cruce, líneas ~1035 y ~849) siguen intactas — esas cuadran
+  // contra la cuenta puente 2103040001 en la póliza cobradora y deben seguir
+  // contabilizándose de verdad.
+  const movimientos = candidatas.filter(c =>
+    !foliosYaRegistrados.has(c.folio) && c.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO
+  );
+
   return {
-    movimientos: candidatas.filter(c => !foliosYaRegistrados.has(c.folio)),
+    movimientos,
     facturasVendedorCubiertas,
     facturasPPDCubiertas,
     pendientesPorFacturar,

@@ -640,6 +640,16 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
   const satCfdi = await CFDI.findById(satCfdiId);
   if (!satCfdi) throw new Error(`CFDI SAT no encontrado: ${satCfdiId}`);
 
+  // Ya conciliado manualmente (`POST /comparisons/conciliar-not-in-erp`) — no
+  // sobrescribir. Sin este corte, cada vez que se vuelve a comparar (manual o
+  // el job automático) este mismo CFDI seguía sin tener contraparte real en
+  // ERP y el bloque de abajo pisaba `lastComparisonStatus` de vuelta a
+  // 'not_in_erp'/'cancelled_not_in_erp', perdiendo la conciliación manual
+  // como si nunca se hubiera hecho (confirmado con el usuario 2026-08-14).
+  if (satCfdi.lastComparisonStatus === 'conciliado') {
+    return { status: 'conciliado', uuid: satCfdi.uuid };
+  }
+
   const cfdiDate  = new Date(satCfdi.fecha);
   const ejercicio = satCfdi.ejercicio ?? cfdiDate.getFullYear();
   const periodo   = satCfdi.periodo   ?? (cfdiDate.getMonth() + 1);
@@ -741,7 +751,7 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
   logger.info(`[Batch] Iniciando sesión ${sessionId} con ${erpCfdiIds.length} ERP + ${satOnlyIds.length} solo-SAT`);
 
   const results = { success: 0, failed: 0, discrepancies: 0, errors: [], sessionId };
-  const statusCounts = { match: 0, match_cancelled: 0, warning: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, error: 0 };
+  const statusCounts = { match: 0, match_cancelled: 0, warning: 0, discrepancy: 0, not_in_sat: 0, not_in_erp: 0, cancelled_not_in_erp: 0, cancelled: 0, conciliado: 0, error: 0 };
   const concurrency = options.concurrency || 5;
 
   // ── 1. Comparar CFDIs ERP ──────────────────────────────────────────────────
@@ -771,7 +781,9 @@ const batchCompareCFDIs = async (erpCfdiIds, options = {}) => {
       compareSATOnlyCFDI(id, { ...options, sessionId })
         .then((comp) => {
           results.success++;
-          if (comp.status === 'cancelled_not_in_erp') {
+          if (comp.status === 'conciliado') {
+            statusCounts.conciliado++;
+          } else if (comp.status === 'cancelled_not_in_erp') {
             statusCounts.cancelled_not_in_erp++;
           } else {
             statusCounts.not_in_erp++;
@@ -912,4 +924,4 @@ const detectarDiferencias = (sat, erp) => {
   return diffs;
 };
 
-module.exports = { compareCFDI, batchCompareCFDIs, compararArrays, formatSessionName };
+module.exports = { compareCFDI, batchCompareCFDIs, compararArrays, formatSessionName, compareSATOnlyCFDI };

@@ -92,13 +92,18 @@ async function _enriquecerSustitutosConPeriodoOriginal(sustitutos) {
     .filter(s => s.originales.length > 0);
 }
 
-// TODOS los sustitutos se excluyen del cálculo automático, sin excepción —
-// nunca se contabilizan solos, siempre quedan para revisión manual (hoja
-// "CFDIs Sustitutos" / campo `sustitutos`). `motivo` es solo informativo, para
-// que el contador priorice: si el original ya tiene póliza en Numo, o es de un
-// periodo anterior, el riesgo de doble conteo es alto; si no se detectó nada
-// (`sin_riesgo_detectado`) probablemente sea una corrección normal del mismo
-// periodo, pero igual se excluye por política — no se decide solo.
+// Confirmado con el usuario 2026-08-13: cuando el/los CFDI(s) original(es)
+// sustituido(s) son del MISMO periodo que se está generando (y se pudo
+// determinar su periodo — si el original no se encontró en Mongo no hay nada
+// que reversar), el par se contabiliza automático — el original con su
+// asiento normal MÁS un asiento de reversión (ver `mismoPeriodo` más abajo y
+// su uso en cfdi-poliza-generator.service.js), y el sustituto se contabiliza
+// normal como cualquier otro CFDI. Esto aplica sin importar `motivo` (incluso
+// si el original ya tiene póliza en Numo — también se reversa). Solo cuando
+// el original es de un periodo YA CERRADO (`periodoAnterior`) se mantiene la
+// política anterior: excluir ambos lados y dejar para revisión manual (hoja
+// "CFDIs Sustitutos" / campo `sustitutos`), porque reabrir/reversar un
+// periodo cerrado no es seguro hacerlo automático.
 function _particionarSustitutosPorRiesgo(sustitutosEnriquecidos, { uuidsYaUsados, ejercicio, periodo }) {
   const excluidos = sustitutosEnriquecidos.map(s => {
     const yaEnNumo = s.sustituyeA.some(uA => uuidsYaUsados.has(uA));
@@ -108,8 +113,12 @@ function _particionarSustitutosPorRiesgo(sustitutosEnriquecidos, { uuidsYaUsados
         (Number(o.ejercicio) === Number(ejercicio) && Number(o.periodo) < Number(periodo))
       ),
     );
+    const mismoPeriodo = s.originales.length > 0 && s.originales.every(o =>
+      o.ejercicio != null && o.periodo != null &&
+      Number(o.ejercicio) === Number(ejercicio) && Number(o.periodo) === Number(periodo),
+    );
     const motivo = yaEnNumo ? 'ya_contabilizado_en_numo' : periodoAnterior ? 'periodo_anterior' : 'sin_riesgo_detectado';
-    return { ...s, motivo };
+    return { ...s, motivo, mismoPeriodo };
   });
   return { excluidos, normales: [] };
 }

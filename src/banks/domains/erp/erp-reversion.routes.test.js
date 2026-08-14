@@ -2,7 +2,7 @@
 
 // erp-reversion.routes.test.js — webhook server-to-server que consume Kore para avisar que
 // revirtió/canceló una CxC ya vinculada a un depósito bancario, más la bandeja de auditoría
-// (GET) y el "deshacer" (POST /:id/revertir) que usa la UI con sesión Numo normal.
+// (GET, solo lectura) que usa la UI con sesión Numo normal.
 //
 // Mismo criterio de "mockear los límites de I/O" que erp.routes.test.js /
 // bank.service.setErpIds.test.js: se mockea auth.real (authenticate/permit vía headers de
@@ -56,26 +56,18 @@ function fakeMov(overrides = {}) {
   };
 }
 
-function fakeReversion(overrides = {}) {
-  return {
-    _id: 'rev-1', estado: 'aplicada', movimientosAfectados: [],
-    save: jest.fn().mockResolvedValue(undefined),
-    ...overrides,
-  };
-}
-
 const ALLOWED = JSON.stringify([PERMISSIONS.BANKS_ERP_REVERSIONES]);
 
 let app;
 
 beforeEach(() => {
   jest.clearAllMocks();
-  process.env.KORE_REVERSION_API_KEY = API_KEY;
+  process.env.KORE_API_KEY = API_KEY;
   app = buildApp();
 });
 
 afterAll(() => {
-  delete process.env.KORE_REVERSION_API_KEY;
+  delete process.env.KORE_API_KEY;
 });
 
 describe('POST /api/erp/cxc-reversiones — autenticación por API key', () => {
@@ -96,8 +88,8 @@ describe('POST /api/erp/cxc-reversiones — autenticación por API key', () => {
     expect(res.body).toEqual({ error: 'API key inválida o ausente.' });
   });
 
-  test('503 si KORE_REVERSION_API_KEY no está configurada en el servidor', async () => {
-    delete process.env.KORE_REVERSION_API_KEY;
+  test('503 si KORE_API_KEY no está configurada en el servidor', async () => {
+    delete process.env.KORE_API_KEY;
 
     const res = await request(app)
       .post('/api/erp/cxc-reversiones')
@@ -105,7 +97,7 @@ describe('POST /api/erp/cxc-reversiones — autenticación por API key', () => {
       .send({ erpId: 'CXC-1' });
 
     expect(res.status).toBe(503);
-    expect(res.body).toEqual({ error: 'Reversión de CxC no configurada' });
+    expect(res.body).toEqual({ error: 'Integración con Kore no configurada en el servidor' });
   });
 });
 
@@ -215,6 +207,31 @@ describe('POST /api/erp/cxc-reversiones — procesa la reversión', () => {
     expect(ErpReversion.create).not.toHaveBeenCalled();
   });
 
+  test('desvinculación (webhook Kore, sin sesión real): NO limpia primeraIdentificacionAt aunque el movimiento vuelva a no_identificado', async () => {
+    const previo = new Date('2026-01-01T00:00:00.000Z');
+    const mov = fakeMov({
+      erpIds:   ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 500, total: 500, serie: 'A0', folioExterno: '100' }],
+      deposito: 500,
+      status:   'identificado',
+      primeraIdentificacionAt: previo,
+      primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' },
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-5' });
+
+    const res = await request(app)
+      .post('/api/erp/cxc-reversiones')
+      .set('X-Api-Key', API_KEY)
+      .send({ erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100' });
+
+    expect(res.status).toBe(200);
+    expect(mov.status).toBe('no_identificado');
+    // Inmutable: nunca se limpia al desvincular, aunque el webhook no tenga usuario real.
+    expect(mov.primeraIdentificacionAt).toEqual(previo);
+    expect(mov.primeraIdentificacionPor).toEqual({ userId: 'user-1', nombre: 'Ana' });
+  });
+
   test('detecta serieFolioMismatch cuando el link vinculado no coincide con la serie/folio que manda Kore', async () => {
     const mov = fakeMov({
       erpIds:   ['CXC-1'],
@@ -291,66 +308,5 @@ describe('GET /api/erp/cxc-reversiones', () => {
     // Los caracteres especiales quedan escapados: el regex busca el texto LITERAL "A.(1)",
     // no lo que significarían como metacaracteres de regex sin escapar.
     expect(filtroUsado.$or[0].erpId.source).toBe('A\\.\\(1\\)');
-  });
-});
-
-describe('POST /api/erp/cxc-reversiones/:id/revertir', () => {
-  test('403 sin permiso banks:erp:reversiones', async () => {
-    const res = await request(app)
-      .post('/api/erp/cxc-reversiones/rev-1/revertir')
-      .set('x-test-permissions', JSON.stringify([]));
-
-    expect(res.status).toBe(403);
-    expect(res.body.required).toEqual([PERMISSIONS.BANKS_ERP_REVERSIONES]);
-    expect(ErpReversion.findById).not.toHaveBeenCalled();
-  });
-
-  test('200: restaura erpIds/erpLinks del movimiento afectado', async () => {
-    const erpLinkRemovido = { erpId: 'CXC-1', saldoActual: 500, total: 500, serie: 'A0', folioExterno: '100' };
-    const reversion = fakeReversion({
-      movimientosAfectados: [{ movementId: 'mov-1', erpLinkRemovido, identificadoPorRemovido: null }],
-    });
-    ErpReversion.findById.mockResolvedValue(reversion);
-    const mov = fakeMov({ _id: 'mov-1', erpIds: [], erpLinks: [], deposito: 500 });
-    BankMovement.findById.mockResolvedValue(mov);
-
-    const res = await request(app)
-      .post('/api/erp/cxc-reversiones/rev-1/revertir')
-      .set('x-test-permissions', ALLOWED);
-
-    expect(res.status).toBe(200);
-    expect(mov.erpIds).toEqual(['CXC-1']);
-    expect(mov.erpLinks).toEqual([erpLinkRemovido]);
-    expect(mov.save).toHaveBeenCalledTimes(1);
-    expect(reversion.estado).toBe('revertida');
-    expect(reversion.revertidoPor).toBe('test@example.com');
-    expect(reversion.save).toHaveBeenCalledTimes(1);
-  });
-
-  test('409 al revertir una reversión que ya fue deshecha (segunda vez)', async () => {
-    const reversion = fakeReversion({ movimientosAfectados: [] });
-    ErpReversion.findById.mockResolvedValue(reversion);
-
-    const primera = await request(app)
-      .post('/api/erp/cxc-reversiones/rev-1/revertir')
-      .set('x-test-permissions', ALLOWED);
-    expect(primera.status).toBe(200);
-
-    const segunda = await request(app)
-      .post('/api/erp/cxc-reversiones/rev-1/revertir')
-      .set('x-test-permissions', ALLOWED);
-
-    expect(segunda.status).toBe(409);
-    expect(segunda.body).toEqual({ error: 'Esta reversión ya fue deshecha.' });
-  });
-
-  test('404 si la reversión no existe', async () => {
-    ErpReversion.findById.mockResolvedValue(null);
-
-    const res = await request(app)
-      .post('/api/erp/cxc-reversiones/rev-inexistente/revertir')
-      .set('x-test-permissions', ALLOWED);
-
-    expect(res.status).toBe(404);
   });
 });

@@ -3,8 +3,8 @@
 const BankMovement = require('../banks/BankMovement.model');
 const ErpReversion  = require('./ErpReversion.model');
 const { aplicarLogicaErp }        = require('../banks/bank.service');
+const { resolvePrimeraIdentificacion } = require('../banks/identificacion-timestamp.util');
 const { emitToBanco }             = require('../../shared/socket');
-const { NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 // Mismo tamaño de página que ya usa el resto del módulo ERP (ver ERP_PAGE_SIZE en erp.routes.js).
 const ERP_REVERSION_PAGE_SIZE = 50;
@@ -17,10 +17,10 @@ function _snapshot(value) {
   return typeof value.toObject === 'function' ? value.toObject() : JSON.parse(JSON.stringify(value));
 }
 
-// Quita el erpId de UN movimiento bancario: guarda snapshots de lo que había (para poder
-// revertir la operación después), limpia erpLinks/erpIds/identificadoPor, recalcula
-// saldoErp/uuidXML/status con la misma lógica pura que usa el flujo manual (aplicarLogicaErp,
-// bank.service.js) y emite el mismo shape que ya emite setErpIds.
+// Quita el erpId de UN movimiento bancario: guarda snapshots de lo que había (como rastro de
+// auditoría), limpia erpLinks/erpIds/identificadoPor, recalcula saldoErp/uuidXML/status con la
+// misma lógica pura que usa el flujo manual (aplicarLogicaErp, bank.service.js) y emite el
+// mismo shape que ya emite setErpIds.
 //
 // NO se usa setErpIds aquí: esa función asume un `user` de Auth0 para decidir permisos de
 // ownership (quién puede desvincular qué) que no aplican a un webhook server-to-server sin
@@ -58,6 +58,15 @@ async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExtern
   mov.uuidXML  = uuidXML;
   mov.status   = status;
 
+  // Webhook server-to-server (Kore), sin sesión Auth0 real detrás — no hay `user` que pasar.
+  // El helper es no-op en casi todos los casos aquí (esta operación suele desvincular, es decir
+  // llevar el status HACIA no_identificado), pero se llama igual por si otro link deja el
+  // movimiento igual identificado.
+  const { primeraIdentificacionAt, primeraIdentificacionPor } =
+    resolvePrimeraIdentificacion(status, mov, null);
+  mov.primeraIdentificacionAt  = primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraIdentificacionPor;
+
   await mov.save();
 
   emitToBanco(mov.banco, 'bank:movement:updated', {
@@ -76,18 +85,17 @@ async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExtern
 
 // Punto de entrada del webhook: Kore avisó que revirtió/canceló una CxC. Busca todos los
 // movimientos bancarios que la tengan vinculada (puede haber 0, 1 o varios), la desvincula
-// de cada uno y deja un rastro de auditoría (ErpReversion) que permite deshacer la operación
-// si fue un error.
+// de cada uno y deja un rastro de auditoría (ErpReversion) para la bandeja de consulta.
 async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folioExterno, referencia, payloadOriginal } = {}) {
   const movs = await BankMovement.find({ erpIds: erpId });
 
   if (movs.length === 0) {
     // Kore avisó una reversión que ya no encontramos vinculada a ningún movimiento — ya sea
     // porque nunca se vinculó de este lado, o porque este mismo evento (o un reintento suyo)
-    // ya se procesó antes. No se persiste ningún ErpReversion: no hay nada que auditar ni que
-    // el botón "Revertir" pudiera restaurar (movimientosAfectados quedaría vacío igual), y
-    // guardar un registro por cada llamada repetida inflaba la bandeja con filas idénticas sin
-    // información nueva (detectado 2026-08-10, probando el endpoint varias veces seguidas).
+    // ya se procesó antes. No se persiste ningún ErpReversion: no hay nada que auditar
+    // (movimientosAfectados quedaría vacío igual), y guardar un registro por cada llamada
+    // repetida inflaba la bandeja con filas idénticas sin información nueva (detectado
+    // 2026-08-10, probando el endpoint varias veces seguidas).
     // La respuesta sigue siendo 200/yaEstabaDesvinculada:true — el contrato con Kore no cambia.
     return { reversionId: null, movimientosAfectados: 0, yaEstabaDesvinculada: true };
   }
@@ -116,74 +124,6 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
   });
 
   return { reversionId: reversion._id, movimientosAfectados: movs.length, yaEstabaDesvinculada: false };
-}
-
-// Deshace una reversión aplicada por error: restaura el snapshot de cada movimiento
-// afectado. NO le avisa nada a Kore — es una corrección puramente de nuestro lado.
-// Si un movimiento ya no existe, o si alguien ya volvió a vincular manualmente la misma
-// CxC mientras tanto, ese movimiento en particular se salta (no aborta toda la operación)
-// y se reporta en `noRestaurados`.
-async function revertirReversion(reversionId, user) {
-  const reversion = await ErpReversion.findById(reversionId);
-  if (!reversion) throw new NotFoundError('Reversión');
-  if (reversion.estado === 'revertida') {
-    throw new ConflictError('Esta reversión ya fue deshecha.');
-  }
-
-  const restaurados   = [];
-  const noRestaurados = [];
-
-  for (const entry of reversion.movimientosAfectados) {
-    if (!entry.erpLinkRemovido) {
-      noRestaurados.push({ movementId: entry.movementId, motivo: 'No había un snapshot que restaurar.' });
-      continue;
-    }
-
-    const mov = await BankMovement.findById(entry.movementId);
-    if (!mov) {
-      noRestaurados.push({ movementId: entry.movementId, motivo: 'El movimiento ya no existe.' });
-      continue;
-    }
-
-    const erpId = entry.erpLinkRemovido.erpId;
-    const yaVinculada = (mov.erpLinks ?? []).some(l => l.erpId === erpId);
-    if (yaVinculada) {
-      noRestaurados.push({ movementId: entry.movementId, motivo: 'La CxC ya fue vinculada nuevamente de forma manual.' });
-      continue;
-    }
-
-    mov.erpLinks = [...(mov.erpLinks ?? []), entry.erpLinkRemovido];
-    mov.erpIds   = [...(mov.erpIds ?? []), erpId];
-    if (entry.identificadoPorRemovido) {
-      mov.identificadoPor = [...(mov.identificadoPor ?? []), entry.identificadoPorRemovido];
-    }
-
-    const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
-    mov.saldoErp = saldoErp;
-    mov.uuidXML  = uuidXML;
-    mov.status   = status;
-    await mov.save();
-
-    emitToBanco(mov.banco, 'bank:movement:updated', {
-      _id:             mov._id,
-      banco:           mov.banco,
-      erpIds:          mov.erpIds,
-      erpLinks:        mov.erpLinks,
-      saldoErp:        mov.saldoErp,
-      uuidXML:         mov.uuidXML,
-      status:          mov.status,
-      identificadoPor: mov.identificadoPor,
-    });
-
-    restaurados.push(entry.movementId);
-  }
-
-  reversion.estado       = 'revertida';
-  reversion.revertidoPor = user?.email ?? user?._id ?? null;
-  reversion.revertidoEn  = new Date();
-  await reversion.save();
-
-  return { reversion, restaurados, noRestaurados };
 }
 
 // Listado paginado para la UI (bandeja de reversiones aplicadas por Kore).
@@ -220,4 +160,4 @@ async function listarReversiones({ page = 1, estado, q } = {}) {
   };
 }
 
-module.exports = { procesarReversionKore, revertirReversion, listarReversiones };
+module.exports = { procesarReversionKore, listarReversiones };

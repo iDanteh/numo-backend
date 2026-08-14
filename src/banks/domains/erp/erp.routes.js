@@ -16,6 +16,7 @@ const { procesarFormasPagoCxc,
         generarExcelFormasPagoCxc }      = require('./formas-pago-cxc.service');
 const ErpFacturaPago                     = require('./ErpFacturaPago.model');
 const BankMovement                       = require('../banks/BankMovement.model');
+const { resolvePrimeraIdentificacion }   = require('../banks/identificacion-timestamp.util');
 const CFDI                               = require('../../../visor/models/CFDI');
 const { emitToUser }                     = require('../../shared/socket');
 const { ERP_TOLERANCE, updateErpIds }     = require('../banks/bank.service');
@@ -1324,7 +1325,7 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
     if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
 
     const movements = await BankMovement.find(filter)
-      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor numeroAutorizacion')
+      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor numeroAutorizacion primeraIdentificacionAt primeraIdentificacionPor')
       .lean();
 
     let procesados = 0, actualizados = 0, pendientes = 0, errores = 0;
@@ -1499,7 +1500,17 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
         if (mov.ficha && statusNuevo === 'no_identificado') statusNuevo = 'identificado';
 
         if (saldoErpNuevo !== (mov.saldoErp ?? null) || statusNuevo !== mov.status) {
-          update.$set = { ...(update.$set ?? {}), saldoErp: saldoErpNuevo, status: statusNuevo };
+          // Solo se toca primeraIdentificacionAt/Por en esta rama, donde el status
+          // realmente cambia — no en cada corrida sin cambios de saldo/status.
+          const { primeraIdentificacionAt, primeraIdentificacionPor } =
+            resolvePrimeraIdentificacion(statusNuevo, mov, null);
+          update.$set = {
+            ...(update.$set ?? {}),
+            saldoErp: saldoErpNuevo,
+            status:   statusNuevo,
+            primeraIdentificacionAt,
+            primeraIdentificacionPor,
+          };
           update.$push = {
             _changelog: {
               at: new Date(), via: 'erp-sync', campo: 'saldoErp+status',
@@ -1611,7 +1622,7 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
     if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
 
     const movements = await BankMovement.find(filter)
-      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor numeroAutorizacion')
+      .select('_id folio banco concepto deposito retiro fecha saldoErp status ficha erpLinks identificadoPor numeroAutorizacion primeraIdentificacionAt primeraIdentificacionPor')
       .lean();
 
     let procesados = 0, actualizados = 0, sinDatos = 0, errores = 0, pendientesFolioFiscal = 0;
@@ -1790,7 +1801,17 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
           if (mov.ficha && statusNuevo === 'no_identificado') statusNuevo = 'identificado';
 
           if (saldoErpNuevo !== (mov.saldoErp ?? null) || statusNuevo !== mov.status) {
-            update.$set = { ...(update.$set ?? {}), saldoErp: saldoErpNuevo, status: statusNuevo };
+            // Solo se toca primeraIdentificacionAt/Por en esta rama, donde el status
+            // realmente cambia — no en cada corrida sin cambios de saldo/status.
+            const { primeraIdentificacionAt, primeraIdentificacionPor } =
+              resolvePrimeraIdentificacion(statusNuevo, mov, null);
+            update.$set = {
+              ...(update.$set ?? {}),
+              saldoErp: saldoErpNuevo,
+              status:   statusNuevo,
+              primeraIdentificacionAt,
+              primeraIdentificacionPor,
+            };
             update.$push = {
               _changelog: {
                 at: new Date(), via: 'erp-sync', campo: 'saldoErp+status',

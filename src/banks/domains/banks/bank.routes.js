@@ -14,7 +14,13 @@ const {
   listMovimientosAuxiliar,
 } = require('./bank-auxiliary.parser');
 const rulesService          = require('./bank-rules.service');
+const indicadoresService    = require('./bank-indicadores.service');
 const { matchAutorizaciones, matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
+const {
+  matchTraspasosInternos,
+  revertirTraspasosInternos,
+  generarExcelTraspasosInternos,
+} = require('./traspasos-internos.service');
 const { emitToUser } = require('../../shared/socket');
 // erp.routes expone _sincronizarConRetry/_rangoDesdeFollo (mismo helper que ya usan los
 // scripts de backfill y collection-request.service.js) — sin ciclo: erp.routes.js requiere
@@ -79,6 +85,17 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
   const { year, month } = req.query;
   res.json(await service.getCards(restrictions, year, month));
+}));
+
+// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos).
+// Mismo cálculo de restrictions que /cards: el promedio general y el backlog son de
+// TODO el equipo (scope ALL) aunque el rol tenga scope OWN en la tabla de movimientos;
+// ver bank-indicadores.service.js#getIndicadoresIdentificacion para el criterio completo.
+router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
+  const { banco, categoria, year, month } = req.query;
+  res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, restrictions }));
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)
@@ -633,6 +650,56 @@ router.post('/admin/revertir-conciliacion',
     const { runId } = req.body;
     if (!runId) return res.status(400).json({ error: 'Se requiere el runId de la importación' });
     res.json(await service.revertirConciliacion(runId, req.user._id));
+  }),
+);
+
+// POST /api/banks/admin/traspasos-internos
+// Motor de detección de traspasos entre cuentas propias (BBVA depósito categorizado por
+// el usuario ↔ retiro real en el banco contraparte, mismo día UTC + mismo monto,
+// exactamente 1 candidato de cada lado). El banco contraparte NO es fijo — se determina
+// por movimiento a partir del concepto del depósito BBVA (ver
+// traspasos-internos.service.js#_extraerBancoContraparte); si no se puede determinar,
+// el movimiento se reporta aparte en `sinBancoDetectado`, nunca se asume un banco al azar.
+// body: { categoriaBbva, dryRun }. dryRun=true (default): solo devuelve la clasificación,
+// sin escribir en Mongo.
+router.post('/admin/traspasos-internos',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const { categoriaBbva, dryRun } = req.body;
+    if (!categoriaBbva) return res.status(400).json({ error: 'Se requiere categoriaBbva' });
+    res.json(await matchTraspasosInternos({ categoriaBbva, dryRun }, req.user));
+  }),
+);
+
+// POST /api/banks/admin/traspasos-internos/revertir
+// Deshace exactamente lo aplicado por traspasos-internos para el runId dado.
+// Preserva identificaciones manuales humanas posteriores del mismo movimiento.
+router.post('/admin/traspasos-internos/revertir',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const { runId } = req.body;
+    if (!runId) return res.status(400).json({ error: 'Se requiere el runId de la operación' });
+    res.json(await revertirTraspasosInternos(runId, req.user._id));
+  }),
+);
+
+// GET /api/banks/admin/traspasos-internos/reporte?categoriaBbva=...
+// Corre el mismo motor en dry-run y devuelve el Excel directo como descarga —
+// operación síncrona corta, sin persistir jobId (mismo criterio que /movements/export).
+router.get('/admin/traspasos-internos/reporte',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const { categoriaBbva } = req.query;
+    if (!categoriaBbva) return res.status(400).json({ error: 'Se requiere categoriaBbva' });
+    const resultado = await matchTraspasosInternos({ categoriaBbva, dryRun: true }, req.user);
+    const buffer    = await generarExcelTraspasosInternos(resultado);
+    const fecha     = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="traspasos-internos-${fecha}.xlsx"`);
+    res.send(Buffer.from(buffer));
   }),
 );
 

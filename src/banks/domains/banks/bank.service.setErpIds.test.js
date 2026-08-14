@@ -82,6 +82,40 @@ describe('setErpIds — approval (SIN session, comportamiento actual, sin cambio
   });
 });
 
+describe('setErpIds — primeraIdentificacionAt/primeraIdentificacionPor (indicador de tiempo de identificación)', () => {
+  test('primera vez que el movimiento queda identificado: setea primeraIdentificacionAt/primeraIdentificacionPor', async () => {
+    const mov = fakeMov({ primeraIdentificacionAt: null, primeraIdentificacionPor: null });
+    BankMovement.findById.mockReturnValue(fakeQuery(mov));
+
+    await bankService.setErpIds(
+      'mov-1',
+      [{ erpId: 'CXC-1', saldoActual: 0 }],
+      { _id: 'user-1', role: 'admin', nombre: 'Usuario Uno' },
+    );
+
+    expect(mov.status).toBe('identificado');
+    expect(mov.primeraIdentificacionAt).toBeInstanceOf(Date);
+    expect(mov.primeraIdentificacionPor).toEqual({ userId: 'user-1', nombre: 'Usuario Uno' });
+  });
+
+  test('ya tenía primeraIdentificacionAt: no se sobreescribe (inmutable)', async () => {
+    const fechaOriginal = new Date('2026-01-01T00:00:00.000Z');
+    const porOriginal   = { userId: 'user-999', nombre: 'Otro Usuario' };
+    const mov = fakeMov({ primeraIdentificacionAt: fechaOriginal, primeraIdentificacionPor: porOriginal });
+    BankMovement.findById.mockReturnValue(fakeQuery(mov));
+
+    await bankService.setErpIds(
+      'mov-1',
+      [{ erpId: 'CXC-1', saldoActual: 0 }],
+      { _id: 'user-1', role: 'admin', nombre: 'Usuario Uno' },
+    );
+
+    expect(mov.status).toBe('identificado');
+    expect(mov.primeraIdentificacionAt).toBe(fechaOriginal);
+    expect(mov.primeraIdentificacionPor).toBe(porOriginal);
+  });
+});
+
 describe('setErpIds — opts.session (multi-bank-movement, D5, comportamiento nuevo)', () => {
   test('con session: BankMovement.findById().session(session), mov.save({session}), emit DIFERIDO (no se llama)', async () => {
     const mov = fakeMov();

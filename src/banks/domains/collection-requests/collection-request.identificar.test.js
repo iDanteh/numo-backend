@@ -62,8 +62,11 @@ function makeCr({ id = 'cr-1', formasPago, cxcs, monto, conceptoId = 'concepto-1
   };
 }
 
+// `fecha` (2026-08-14): valor por default fijo para que fechaRealPago sea
+// determinístico en los tests que no la sobreescriben — mismo criterio de
+// fixtures fijas que el resto del archivo (folio/numeroAutorizacion).
 function bankMovement(id, overrides = {}) {
-  return { _id: id, folio: `F-${id}`, banco: 'BBVA', numeroAutorizacion: `AUT-${id}`, erpLinks: [], ...overrides };
+  return { _id: id, folio: `F-${id}`, banco: 'BBVA', numeroAutorizacion: `AUT-${id}`, erpLinks: [], fecha: new Date('2026-08-01T00:00:00.000Z'), ...overrides };
 }
 
 function setupHappyKore() {
@@ -109,6 +112,12 @@ describe('identificar() — N=1 (atajo escalar, comportamiento sin cambios)', ()
     expect(cr.status).toBe('identificada');
     expect(resultado.reconciliacion).toBeDefined();
     expect(emitToAll).toHaveBeenCalledWith('collection-request:updated', expect.objectContaining({ _id: 'cr-1' }));
+
+    // 2026-08-14: fechaRealPago viaja como campo hermano de FormaPagoID, con la
+    // fecha del movimiento asignado (2026-08-01) + el ajuste de +7hrs (mismo
+    // criterio que _toISOFechaPago() en cobro-panel.component.ts).
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    expect(datosAdicionales[0].fechaRealPago).toBe('2026-08-01T07:00:00Z');
   });
 });
 
@@ -118,7 +127,12 @@ describe('identificar() — N=2 (asignaciones explícitas, multi-bank-movement)'
     const f2 = formaPago('f2', 'Transferencia', 40000);
     const cr = makeCr({ formasPago: [f1, f2], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
-    BankMovement.find.mockResolvedValue([bankMovement('mov-A'), bankMovement('mov-B')]);
+    // Fechas distintas por movimiento (2026-08-14): confirma que cada forma de
+    // pago manda SU PROPIA fechaRealPago, no una fecha global de la solicitud.
+    BankMovement.find.mockResolvedValue([
+      bankMovement('mov-A', { fecha: new Date('2026-08-10T00:00:00.000Z') }),
+      bankMovement('mov-B', { fecha: new Date('2026-08-12T00:00:00.000Z') }),
+    ]);
     setupHappyKore();
 
     await service.identificar(
@@ -137,6 +151,8 @@ describe('identificar() — N=2 (asignaciones explícitas, multi-bank-movement)'
     expect(datosAdicionales.find(d => d.FormaPagoID === 'fp-f2').DatosAdicionales).toEqual(
       expect.arrayContaining([{ Nombre: 'Aut', Valor: 'F-mov-B' }, { Nombre: 'Numo', Valor: 'AUT-mov-B' }]),
     );
+    expect(datosAdicionales.find(d => d.FormaPagoID === 'fp-f1').fechaRealPago).toBe('2026-08-10T07:00:00Z');
+    expect(datosAdicionales.find(d => d.FormaPagoID === 'fp-f2').fechaRealPago).toBe('2026-08-12T07:00:00Z');
 
     // Dos movimientos distintos -> dos setErpIds, uno por grupo.
     expect(bankService.setErpIds).toHaveBeenCalledTimes(2);
@@ -173,6 +189,31 @@ describe('identificar() — Depósito en efectivo manda "Num Recibo" en vez de A
     expect(datosAdicionales).toHaveLength(1);
     expect(datosAdicionales[0].BancoID).toBeUndefined();
     expect(datosAdicionales[0].DatosAdicionales).toEqual([{ Nombre: 'Num Recibo', Valor: 'F-mov-1' }]);
+    // 2026-08-14: fechaRealPago se manda igual para depósito en efectivo, sin
+    // condición de tipo (a diferencia de BancoID/DatosAdicionales).
+    expect(datosAdicionales[0].fechaRealPago).toBe('2026-08-01T07:00:00Z');
+  });
+});
+
+describe('identificar() — otra forma de pago (cheque/saldo a favor) sin BancoID ni DatosAdicionales', () => {
+  test('fechaRealPago SÍ se manda aunque no haya BancoID ni DatosAdicionales', async () => {
+    const f1 = formaPago('f1', 'Cheque', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    // Cheque: ni claveSAT '03' (transferencia) ni "DEPOSITO EFECTIVO" por
+    // nombre — no dispara ni BancoID ni DatosAdicionales.
+    koreCaja.listarFormasPago.mockResolvedValue([{ id: 'fp-f1', claveSAT: '02', nombre: 'Cheque' }]);
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    expect(datosAdicionales).toHaveLength(1);
+    expect(datosAdicionales[0].BancoID).toBeUndefined();
+    expect(datosAdicionales[0].DatosAdicionales).toBeUndefined();
+    expect(datosAdicionales[0].fechaRealPago).toBe('2026-08-01T07:00:00Z');
   });
 });
 

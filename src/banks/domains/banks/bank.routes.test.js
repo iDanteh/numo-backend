@@ -41,11 +41,21 @@ jest.mock('../../../visor/models/CFDI', () => ({
   })),
 }));
 
+// GET /indicadores: bank-indicadores.service.js completo mockeado — esta ruta solo se
+// prueba a nivel de gate de permiso + paso de query params, no de agregación (esa lógica
+// tiene su propio test: bank-indicadores.service.test.js).
+jest.mock('../../../shared/services/rbac-store');
+jest.mock('./bank-indicadores.service', () => ({
+  getIndicadoresIdentificacion: jest.fn(),
+}));
+
 const express = require('express');
 const request = require('supertest');
 const router  = require('./bank.routes');
 const CFDI    = require('../../../visor/models/CFDI');
-const { PERMISSIONS } = require('../../../shared/config/rbac');
+const rbacStore = require('../../../shared/services/rbac-store');
+const indicadoresService = require('./bank-indicadores.service');
+const { PERMISSIONS, MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 
 describe('GET /cfdis/buscar', () => {
   let app;
@@ -144,5 +154,79 @@ describe('GET /cfdis/buscar', () => {
     expect(res.body).toEqual([
       { uuid: 'U1', serie: 'A0', folio: '123', fecha: '2026-08-01T00:00:00.000Z', total: 1500.5 },
     ]);
+  });
+});
+
+describe('GET /indicadores', () => {
+  let app;
+
+  const FAKE_RESULT = {
+    promedioHoras: 12.5,
+    totalIdentificadosConDato: 3,
+    backlog: { menos24h: 1, de1a3d: 0, de3a7d: 0, mas7d: 0 },
+    porUsuario: [{ userId: 'user-1', nombre: 'Ana', promedioHoras: 12.5, count: 3 }],
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config por defecto
+    indicadoresService.getIndicadoresIdentificacion.mockResolvedValue(FAKE_RESULT);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/indicadores')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_READ]);
+    expect(indicadoresService.getIndicadoresIdentificacion).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco/categoria/year/month tal cual al service', async () => {
+    const res = await request(app)
+      .get('/indicadores')
+      .query({ banco: 'BBVA', categoria: 'Renta', year: '2026', month: '8' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(indicadoresService.getIndicadoresIdentificacion).toHaveBeenCalledTimes(1);
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.banco).toBe('BBVA');
+    expect(args.categoria).toBe('Renta');
+    expect(args.year).toBe('2026');
+    expect(args.month).toBe('8');
+  });
+
+  test('sin banks:config: restrictions = { scope: ALL, userId } — mismo criterio que /cards', async () => {
+    await request(app)
+      .get('/indicadores')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.restrictions).toEqual({ scope: MOVEMENT_SCOPE.ALL, userId: 'user-test' });
+  });
+
+  test('con banks:config: restrictions = null (acceso completo)', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
+    await request(app)
+      .get('/indicadores')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.restrictions).toBeNull();
+  });
+
+  test('devuelve el shape básico del resultado del service tal cual', async () => {
+    const res = await request(app)
+      .get('/indicadores')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FAKE_RESULT);
   });
 });

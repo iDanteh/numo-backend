@@ -4,6 +4,7 @@ const ExcelJS            = require('exceljs');
 const mongoose           = require('mongoose');
 const BankMovement       = require('../banks/BankMovement.model');
 const ErpCuentaPendiente = require('./ErpCuentaPendiente.model');
+const { resolvePrimeraIdentificacion } = require('../banks/identificacion-timestamp.util');
 
 const MOTOR_ID     = 'mostrador-cyc';
 const MOTOR_NOMBRE = 'Excel Mostrador CYC';
@@ -263,6 +264,7 @@ async function procesarMostradorCyc(buffer, usuarioId, usuarioNombre) {
           _id: 1, concepto: 1, deposito: 1, banco: 1, fecha: 1,
           numeroAutorizacion: 1, referenciaNumerica: 1,
           status: 1, erpIds: 1, erpLinks: 1, identificadoPor: 1, folio: 1,
+          primeraIdentificacionAt: 1, primeraIdentificacionPor: 1,
         },
       ).lean()
     : [];
@@ -524,6 +526,10 @@ async function procesarMostradorCyc(buffer, usuarioId, usuarioNombre) {
     }, 0);
     const uuidXML = newLinks.find(l => l.folioFiscal)?.folioFiscal?.toUpperCase() ?? null;
 
+    const newStatus = 'identificado';
+    const { primeraIdentificacionAt, primeraIdentificacionPor } =
+      resolvePrimeraIdentificacion(newStatus, foundMov, { _id: usuarioId, nombre: usuarioNombre });
+
     ops.push({
       updateOne: {
         // Guard ACID: solo escribir si no existe identificación humana ni CxC links
@@ -544,12 +550,14 @@ async function procesarMostradorCyc(buffer, usuarioId, usuarioNombre) {
             erpLinks: newLinks,
             saldoErp,
             uuidXML,
-            status:   'identificado',
+            status:   newStatus,
             identificadoPor: [{
               userId:  usuarioId   ?? MOTOR_ID,
               nombre:  usuarioNombre ?? MOTOR_NOMBRE,
               fechaId: new Date(),
             }],
+            primeraIdentificacionAt,
+            primeraIdentificacionPor,
           },
         },
       },

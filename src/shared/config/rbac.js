@@ -118,8 +118,8 @@ const PERMISSIONS = Object.freeze({
   // pendiente del usuario, admin lo tiene por el wildcard '*'.
   BANKS_CFDI_READ:      'banks:cfdi:read',
 
-  // Ver la bandeja de auditoría de reversiones de CxC (webhook de Kore) y deshacer una si fue
-  // un error. Permiso nuevo, sin asignar a ningún rol todavía — mismo criterio que
+  // Ver la bandeja de auditoría (bitácora, solo lectura) de reversiones de CxC aplicadas por
+  // el webhook de Kore. Permiso nuevo, sin asignar a ningún rol todavía — mismo criterio que
   // BANKS_CFDI_READ: decisión pendiente del usuario, admin lo tiene por el wildcard '*'.
   BANKS_ERP_REVERSIONES: 'banks:erp:reversiones',
 });

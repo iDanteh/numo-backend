@@ -121,7 +121,7 @@ async function analyzeReceipt(fileBuffer, mimetype, label = null) {
 }
 
 // Crea una solicitud de cobro — llamada por el ERP (Kore), sin sesión Numo (ver
-// middleware requireErpApiKey en routes.js). El "usuario que solicita" viaja en
+// middleware verifyKoreApiKey en routes.js). El "usuario que solicita" viaja en
 // el body porque quien llama no es ese usuario, es el backend del ERP.
 // `files` es un arreglo (multer .array) — puede venir vacío, con 1 o con varios
 // comprobantes; cada uno puede corresponder a un depósito bancario distinto
@@ -602,6 +602,19 @@ async function analyzeStoredComprobantes(id) {
 // La sesión de caja se resuelve con el CAJERO que generó la solicitud
 // (cr.solicitanteUserId), NO con el usuario de cobranza/contabilidad que está
 // identificando — es el cajero quien tiene una caja abierta en Kore.
+
+// 2026-08-14: mismo ajuste de +7hrs ya usado por _toISOFechaPago() en el panel
+// manual de cobros (cobro-panel.component.ts) — Kore muestra fecha_real_pago
+// con el día ANTERIOR si se manda a medianoche UTC (T00:00:00Z, desfase de
+// servidor de ~6hrs), así que se compone la fecha civil (UTC) + T07:00:00Z.
+// Recibe el `fecha` (Date) de un BankMovement; fallback a "ahora" si no hay
+// fecha válida (no debería pasar nunca — `fecha` es required en el schema).
+function _fechaRealPagoKore(fecha) {
+  const d = fecha instanceof Date ? fecha : new Date(fecha);
+  if (Number.isNaN(d.getTime())) return new Date().toISOString();
+  return `${d.toISOString().slice(0, 10)}T07:00:00Z`;
+}
+
 async function identificar(id, body, user) {
   const cr = await CollectionRequest.findById(id);
   if (!cr) throw new NotFoundError('Solicitud');
@@ -804,6 +817,15 @@ async function identificar(id, body, user) {
   // un solo tag `Num Recibo` (no el par Aut/Numo) con el folio consecutivo de
   // Numo — confirmado contra el ejemplo real que Kore espera para esta forma
   // de pago específica.
+  //
+  // 2026-08-14 - fechaRealPago se agrega como campo HERMANO de FormaPagoID/
+  // BancoID (no dentro de DatosAdicionales) para las TRES variantes de forma
+  // de pago, sin condicion de tipo (a diferencia de BancoID/DatosAdicionales)
+  // - a pedido explicito del usuario, ya validado contra Kore. Cada forma de
+  // pago manda la fecha de SU PROPIO movimiento (movDeEstaForma.fecha), no
+  // una fecha global de la solicitud - soporta el caso multi-movimiento donde
+  // 2 formas de pago estan asignadas a 2 depositos distintos con fechas
+  // distintas. Ver _fechaRealPagoKore() arriba para el ajuste de +7hrs.
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
     const movId          = movIdPorFormaPagoDocId.get(String(f._id));
     const movDeEstaForma = movPorId.get(movId);
@@ -813,6 +835,7 @@ async function identificar(id, body, user) {
     return {
       ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
+      fechaRealPago: _fechaRealPagoKore(movDeEstaForma.fecha),
       ...(esTransferencia ? {
         DatosAdicionales: [
           { Nombre: 'Aut',  Valor: movDeEstaForma.folio || '' },

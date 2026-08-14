@@ -5,6 +5,7 @@ const mongoose           = require('mongoose');
 const BankMovement       = require('../banks/BankMovement.model');
 const ErpCuentaPendiente = require('./ErpCuentaPendiente.model');
 const { normalizarAuth, SERIES_CON_AUTH } = require('./erp-auth.utils');
+const { resolvePrimeraIdentificacion } = require('../banks/identificacion-timestamp.util');
 
 const TOLERANCIA_MXN = 1.00;
 const MOTOR_ID       = 'refact-cyc';
@@ -224,6 +225,7 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
       _id: 1, numeroAutorizacion: 1, referenciaNumerica: 1,
       concepto: 1, deposito: 1, banco: 1, status: 1,
       erpIds: 1, erpLinks: 1, identificadoPor: 1,
+      primeraIdentificacionAt: 1, primeraIdentificacionPor: 1,
     },
   ).lean();
 
@@ -462,6 +464,9 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
       ? 'identificado'
       : 'no_identificado';
 
+    const { primeraIdentificacionAt, primeraIdentificacionPor } =
+      resolvePrimeraIdentificacion(newStatus, foundMov, { _id: usuarioId, nombre: usuarioNombre });
+
     ops.push({
       updateOne: {
         // Protección ACID: solo escribir si no existe identificación humana en DB
@@ -486,6 +491,8 @@ async function procesarRefacturacionesCyc(buffer, usuarioId, usuarioNombre) {
                 fechaId: new Date(),
               },
             ],
+            primeraIdentificacionAt,
+            primeraIdentificacionPor,
           },
         },
       },

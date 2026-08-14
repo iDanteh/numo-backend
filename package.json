@@ -83,5 +83,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "nodemonConfig": {
+    "ignore": ["src/shared/config/roles.snapshot.json"]
   }
 }

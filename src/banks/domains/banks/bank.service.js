@@ -11,6 +11,7 @@ const { NotFoundError, BadRequestError, ConflictError, ForbiddenError } = requir
 const { emitToUser, emitToBanco } = require('../../shared/socket');
 const { matchRegla }   = require('./bank-rules.service');
 const bankRuleRepo     = require('./repositories/bank-rule.repository');
+const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
 const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 const rbacStore = require('../../../shared/services/rbac-store');
 // ── Constantes ────────────────────────────────────────────────────────────────
@@ -1693,6 +1694,13 @@ async function updateStatus(id, status, user) {
   }
   mov.status = status;
   // identificadoPor es gestionado exclusivamente al vincular/desvincular CxCs — no se toca aquí
+  const primeraId = resolvePrimeraIdentificacion(
+    mov.status,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
+  mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
   await mov.save();
 
   const updated = { _id: mov._id, banco: mov.banco, status: mov.status, identificadoPor: mov.identificadoPor };
@@ -1764,11 +1772,20 @@ async function updateCategoria(id, categoria, user) {
   }
 
   const { newStatus, ocultoRoles } = await resolveCategoriaEffects(mov.banco, categoriaLimpia, mov);
+  const primeraId = resolvePrimeraIdentificacion(
+    newStatus,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
 
   await BankMovement.updateOne(
     { _id: id },
     {
-      $set:  { categoria: categoriaLimpia, status: newStatus, ocultoRoles },
+      $set:  {
+        categoria: categoriaLimpia, status: newStatus, ocultoRoles,
+        primeraIdentificacionAt:  primeraId.primeraIdentificacionAt,
+        primeraIdentificacionPor: primeraId.primeraIdentificacionPor,
+      },
       $push: {
         _changelog: {
           at:         new Date(),
@@ -1817,6 +1834,13 @@ async function updateErpIds(id, action, erpId, user) {
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
   mov.status   = status;
+  const primeraId = resolvePrimeraIdentificacion(
+    mov.status,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
+  mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
   await mov.save();
 
   const updated = {
@@ -1947,6 +1971,13 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
   mov.status   = status;
+  const primeraId = resolvePrimeraIdentificacion(
+    mov.status,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
+  mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
   await mov.save(session ? { session } : undefined);
 
   const updated = {
@@ -2416,11 +2447,20 @@ async function bulkUpdateCategoria(ids, categoria, user) {
       if (anterior === categoriaLimpia) continue;
 
       const { newStatus, ocultoRoles } = await resolveCategoriaEffects(banco, categoriaLimpia, mov);
+      const primeraId = resolvePrimeraIdentificacion(
+        newStatus,
+        { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+        user,
+      );
 
       await BankMovement.updateOne(
         { _id: mov._id },
         {
-          $set:  { categoria: categoriaLimpia, status: newStatus, ocultoRoles },
+          $set:  {
+            categoria: categoriaLimpia, status: newStatus, ocultoRoles,
+            primeraIdentificacionAt:  primeraId.primeraIdentificacionAt,
+            primeraIdentificacionPor: primeraId.primeraIdentificacionPor,
+          },
           $push: {
             _changelog: {
               at: new Date(), via: user ? `manual-masivo:${user._id}` : 'manual-masivo',
@@ -2455,6 +2495,14 @@ async function setFicha(id, ficha, user) {
   mov.fichaNombre = user.nombre ?? null;
   mov.fichaAt     = new Date();
   mov.status      = 'identificado';
+
+  const primeraId = resolvePrimeraIdentificacion(
+    mov.status,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
+  mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
 
   const updated = await mov.save();
 
@@ -2502,6 +2550,17 @@ async function deleteFicha(id, user) {
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
   mov.status   = status;
+
+  // Normalmente no-op: el status suele volver a 'no_identificado' al quitar la ficha,
+  // así que resolvePrimeraIdentificacion no encuentra un nuevo 'identificado' que setear.
+  // Se llama igual para respetar la regla de inmutabilidad (si ya había valor, se conserva).
+  const primeraId = resolvePrimeraIdentificacion(
+    mov.status,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
+  mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
 
   const updated = await mov.save();
 
@@ -2584,6 +2643,17 @@ async function updateMovement(id, data, user) {
     }
     mov.hash = nuevoHash;
   }
+
+  // Se llama siempre, haya venido 'status' en el payload o no: si no vino, se resuelve
+  // igual contra mov.status actual (por si el doc ya estaba en 'identificado' por otra
+  // vía y aún no tenía primeraIdentificacionAt seteado — improbable pero seguro).
+  const primeraId = resolvePrimeraIdentificacion(
+    mov.status,
+    { primeraIdentificacionAt: mov.primeraIdentificacionAt, primeraIdentificacionPor: mov.primeraIdentificacionPor },
+    user,
+  );
+  mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
+  mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
 
   await mov.save();
 
@@ -2890,6 +2960,12 @@ const TODOS_MOTORES_HISTORICO = [
   MOTOR_ID_HISTORICO,
 ];
 
+// NOTA: a propósito, este motor NO setea primeraIdentificacionAt/primeraIdentificacionPor.
+// $$NOW aquí es la fecha en que corre este job histórico, no la fecha real de negocio en
+// que el movimiento fue identificado (que ni siquiera se conoce para estos registros
+// anteriores a mayo) — grabar ese timestamp como "primera identificación" sería un dato
+// falso para el indicador de tiempo de identificación del dashboard. No "arreglar" esto
+// agregando el campo sin conocer el dato real.
 async function identificarAnterioresAMayo() {
   const resultado = await BankMovement.updateMany(
     {
@@ -3082,6 +3158,15 @@ async function importarConciliacion(buffer, user) {
     const dayStart = new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth(), fecha.getUTCDate()));
     const dayEnd   = new Date(Date.UTC(fecha.getUTCFullYear(), fecha.getUTCMonth(), fecha.getUTCDate() + 1));
 
+    // Pipeline update (no $set plano): el filtro exige status:'no_identificado' pero eso
+    // no garantiza primeraIdentificacionAt=null — el movimiento pudo haber sido identificado
+    // antes y revertido. No hay doc en memoria (findOneAndUpdate directo, sin findById previo)
+    // así que la inmutabilidad se expresa con $ifNull en el propio pipeline: conserva el valor
+    // existente si ya lo hay, lo setea solo si es null/no existe. Mismo criterio que
+    // resolvePrimeraIdentificacion(), pero en Mongo porque no se puede invocar JS dentro de
+    // un pipeline. `now` se captura una sola vez para que fechaId y primeraIdentificacionAt
+    // (cuando aplique) queden con el mismo instante.
+    const now = new Date();
     const updated = await BankMovement.findOneAndUpdate(
       {
         isActive: true,
@@ -3090,19 +3175,30 @@ async function importarConciliacion(buffer, user) {
         banco:    { $regex: new RegExp(`^${banco.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') },
         deposito: monto,
       },
-      {
-        $set:  { status: 'identificado' },
-        $push: {
-          identificadoPor: {
-            userId:  user._id,
-            nombre:  user.nombre ?? user._id,
-            fechaId: new Date(),
-            erpId:   null,
-            source:  SOURCE_CONCILIACION,
-            runId,
+      [
+        {
+          $set: {
+            status: 'identificado',
+            identificadoPor: {
+              $concatArrays: [
+                { $ifNull: ['$identificadoPor', []] },
+                [{
+                  userId:  user._id,
+                  nombre:  user.nombre ?? user._id,
+                  fechaId: now,
+                  erpId:   null,
+                  source:  SOURCE_CONCILIACION,
+                  runId,
+                }],
+              ],
+            },
+            primeraIdentificacionAt: { $ifNull: ['$primeraIdentificacionAt', now] },
+            primeraIdentificacionPor: {
+              $ifNull: ['$primeraIdentificacionPor', { userId: user._id, nombre: user.nombre ?? user._id }],
+            },
           },
         },
-      },
+      ],
     );
 
     if (updated) {
@@ -3207,4 +3303,8 @@ module.exports = {
   identificarAnterioresAMayo, revertirAnterioresAMayo,
   importarConciliacion, revertirConciliacion,
   ERP_TOLERANCE, aplicarLogicaErp,
+  // Exportado para traspasos-internos.service.js: mismo criterio de "quedan
+  // identificaciones humanas" que usa revertirConciliacion, replicado ahí para el
+  // revert selectivo de traspasos entre cuentas propias.
+  TODOS_MOTORES_HISTORICO,
 };

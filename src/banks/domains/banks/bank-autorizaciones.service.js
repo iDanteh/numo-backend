@@ -9,6 +9,7 @@ const {
   normalizarAuth,
   normalizarAuthBloques,
 } = require('../erp/erp-auth.utils');
+const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
 
 const ERP_TOLERANCE   = 1.00; // $1 MXN — misma tolerancia que el resto del sistema
 
@@ -39,6 +40,13 @@ const BANCO_MAP = {
   scotiabank:      'Scotiabank',
   banbajio:        'BanBajío',
   'banbajío':      'BanBajío',
+  afirme:          'Afirme',
+  intercam:        'Intercam',
+  nu:              'Nu',
+  spin:            'Spin',
+  'hey banco':     'Hey Banco',
+  heybanco:        'Hey Banco',
+  albo:            'Albo',
 };
 
 function normalizarBanco(nombre) {
@@ -239,7 +247,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     // Protección: ningún humano ha intervenido en este movimiento
     identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
     ...(bancoNorm ? { banco: bancoNorm } : {}),
-  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito erpIds erpLinks banco fecha').lean();
+  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito erpIds erpLinks banco fecha status primeraIdentificacionAt primeraIdentificacionPor').lean();
 
   if (!movimientos.length) {
     return { total: 0, matcheados: 0, identificados: 0, sinMatch: 0, noMatcheados: [] };
@@ -391,6 +399,11 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       : 'no_identificado';
     if (newStatus === 'identificado') identificados++;
 
+    // Motor automático, sin `user` real detrás — el helper solo setea
+    // userId/nombre=null si es la primera vez que este movimiento se identifica.
+    const { primeraIdentificacionAt, primeraIdentificacionPor } =
+      resolvePrimeraIdentificacion(newStatus, mov, null);
+
     ops.push({
       updateOne: {
         // Protección ACID: replica la misma condición de la query inicial.
@@ -408,6 +421,8 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
             saldoErp,
             status:   newStatus,
             identificadoPor: [{ userId: 'erp-auto', nombre: 'Motor ERP', fechaId: new Date() }],
+            primeraIdentificacionAt,
+            primeraIdentificacionPor,
           },
         },
       },
@@ -653,7 +668,7 @@ async function ejecutarMatch(rows, user) {
   // usa como criterio de preferencia (no de exclusión) dentro de findInIndex.
   const movimientos = await BankMovement.find({
     isActive: true,
-  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco fecha').lean();
+  }).select('_id numeroAutorizacion referenciaNumerica concepto deposito retiro status banco fecha primeraIdentificacionAt primeraIdentificacionPor').lean();
 
   // ── Índices de búsqueda ───────────────────────────────────────────────────
   const byAuthNorm          = new Map();
@@ -706,7 +721,13 @@ async function ejecutarMatch(rows, user) {
 
   // ── Motor de match ────────────────────────────────────────────────────────
   const usedMovIds         = new Set(); // evita que dos filas consuman el mismo movimiento
-  const idsAIdentificar    = new Set();
+  // movId → { primeraIdentificacionAt, primeraIdentificacionPor } — antes era un Set<string>
+  // de movIds; se amplió a Map para poder resolver primeraIdentificacion() una sola vez por
+  // movimiento (en el momento en que se decide agregarlo, con el `mov` todavía en memoria)
+  // y reusar ese resultado al armar el $set del bulkWrite más abajo, sin tener que volver
+  // a buscar el `mov` original por id. idsAIdentificar no se usa en ningún otro lado del
+  // archivo (confirmado por grep) — el cambio de tipo es seguro.
+  const idsAIdentificar    = new Map();
   // movId → autNorm: movimientos donde faltaba auth en DB y ahora podemos completarlo
   const idsActualizarAuth  = new Map();
   const noMatcheados       = [];
@@ -786,7 +807,15 @@ async function ejecutarMatch(rows, user) {
         idsActualizarAuth.set(mov._id.toString(), row.autNorm);
       }
       const esNuevo = mov.status !== 'identificado';
-      if (esNuevo) idsAIdentificar.add(mov._id.toString());
+      if (esNuevo) {
+        // Se resuelve aquí, con `mov` todavía en memoria (viene de .lean() más arriba),
+        // en vez de volver a buscarlo al armar el bulkWrite. La transición siempre es
+        // hacia 'identificado' en esta rama (ver bulkWrite de idsAIdentificar abajo).
+        const primeraId = resolvePrimeraIdentificacion(
+          'identificado', mov, { _id: user.userId, nombre: user.nombre },
+        );
+        idsAIdentificar.set(mov._id.toString(), primeraId);
+      }
       matcheadosList.push({
         autorizacion: row.autNorm,
         importe:      row.importe ?? null,
@@ -848,12 +877,14 @@ async function ejecutarMatch(rows, user) {
   let identificados = 0;
   if (idsAIdentificar.size > 0) {
     const ahora = new Date();
-    const ops = [...idsAIdentificar].map(id => {
+    const ops = [...idsAIdentificar.entries()].map(([id, primeraId]) => {
       const upd = {
         $set: {
           status:          'identificado',
           // Registrar al usuario real que cargó el Excel, no un motor genérico.
           identificadoPor: [{ userId: user.userId, nombre: user.nombre, fechaId: ahora }],
+          primeraIdentificacionAt:  primeraId.primeraIdentificacionAt,
+          primeraIdentificacionPor: primeraId.primeraIdentificacionPor,
         },
       };
       // Incluir auth si lo tenemos y no estaba en DB — queda vinculado desde esta corrida
@@ -981,4 +1012,15 @@ async function matchAutorizaciones(buffer, user) {
   return ejecutarMatch(await parseAutorizaciones(buffer), user);
 }
 
-module.exports = { matchAutorizacionesDesdeErp, matchAutorizaciones };
+module.exports = {
+  matchAutorizacionesDesdeErp,
+  matchAutorizaciones,
+  // Exportado únicamente para test de regresión (bank-autorizaciones.service.ejecutarMatch.test.js).
+  // No es parte de la API pública del módulo — matchAutorizaciones() sigue siendo el entry point real.
+  ejecutarMatch,
+  // Exportados para traspasos-internos.service.js: reusa el mismo helper de bulkWrite con
+  // detección de topología (replica set vs standalone) y el mismo normalizador de nombre
+  // de banco, en vez de duplicar la lógica.
+  ejecutarBulkConTransaccion,
+  normalizarBanco,
+};

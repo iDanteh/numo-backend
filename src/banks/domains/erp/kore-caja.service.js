@@ -275,6 +275,10 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
 // queda cobrada en el ERP. Ambos placeholders de la URL son de la
 // solicitud/sesión — NINGUNO es la cuenta o la CxC. `sesionId` es la sesión de
 // caja del CAJERO solicitante (obtenerSesionCaja).
+// 2026-08-14: cada elemento de datosAdicionalesPorFormaPago también trae
+// `fechaRealPago` (campo hermano de FormaPagoID/BancoID) — ver
+// collection-request.service.js#identificar (paso 6) para dónde se arma; esta
+// función no cambia, solo pasa el arreglo tal cual en el body.
 async function aplicarSolicitudOperacion(sesionId, solicitudIdErp, koreToken, datosAdicionalesPorFormaPago) {
   console.log('[aplicarSolicitudOperacion] payload →', JSON.stringify({ sesionId, solicitudIdErp, datosAdicionalesPorFormaPago }));
   return _operacionConReintento(

@@ -3,11 +3,11 @@
 const express = require('express');
 const { authenticate, permit }         = require('../../shared/middleware/auth.real');
 const { asyncHandler }                 = require('../../shared/middleware/error-handler');
-const { verifyKoreApiKey }             = require('../../../shared/middleware/kore-reversion-auth');
+const { verifyKoreApiKey }             = require('../../../shared/middleware/kore-api-key-auth');
 const { PERMISSIONS }                  = require('../../../shared/config/rbac');
 const { logger }                       = require('../../../shared/utils/logger');
 const {
-  procesarReversionKore, revertirReversion, listarReversiones,
+  procesarReversionKore, listarReversiones,
 } = require('./erp-reversion.service');
 
 const router = express.Router();
@@ -54,12 +54,6 @@ router.post('/', verifyKoreApiKey, asyncHandler(async (req, res) => {
 router.get('/', authenticate, permit(PERMISSIONS.BANKS_ERP_REVERSIONES), asyncHandler(async (req, res) => {
   const { page, estado, q } = req.query;
   res.json(await listarReversiones({ page, estado, q }));
-}));
-
-// POST /api/erp/cxc-reversiones/:id/revertir — deshace una reversión aplicada por error.
-// NO le avisa nada a Kore, es una corrección puramente de nuestro lado.
-router.post('/:id/revertir', authenticate, permit(PERMISSIONS.BANKS_ERP_REVERSIONES), asyncHandler(async (req, res) => {
-  res.json(await revertirReversion(req.params.id, req.user));
 }));
 
 module.exports = router;

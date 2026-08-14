@@ -158,6 +158,22 @@ const bankMovementSchema = new mongoose.Schema({
     default: [],
   },
 
+  // Snapshot de la contraparte cuando este movimiento es un lado de un traspaso entre
+  // cuentas propias (ej. BBVA categorizado "Traspaso entre cuentas propias" con retiro
+  // espejo real en Banamex mismo día/monto). Lo llena traspasos-internos.service.js al
+  // confirmar un par 1:1; apunta al OTRO BankMovement del par, nunca a sí mismo.
+  traspasoInterno: {
+    type: {
+      movimientoId: { type: mongoose.Schema.Types.ObjectId, ref: 'BankMovement', default: null },
+      banco:        { type: String, default: null },
+      folio:        { type: String, default: null },
+      fecha:        { type: Date,   default: null },
+      monto:        { type: Number, default: null },
+      runId:        { type: String, default: null },
+    },
+    default: null,
+  },
+
   // Suma de erpLinks[].saldoErpAportado de los links ya finalizados; null cuando no hay vínculos
   saldoErp: { type: Number, default: null },
 
@@ -195,6 +211,30 @@ const bankMovementSchema = new mongoose.Schema({
   fichaBy:     { type: String, default: null },   // userId que registró la ficha
   fichaNombre: { type: String, default: null },   // nombre display del usuario
   fichaAt:     { type: Date,   default: null },
+
+  // Timestamp INMUTABLE: se setea una sola vez, la primera vez que status pasa de
+  // no_identificado a identificado (ver resolvePrimeraIdentificacion(), llamado desde
+  // todos los call-sites que pueden hacer esa transición). NUNCA se sobreescribe ni se
+  // limpia después — ni al desvincular una CxC, ni al revertir, ni al reclasificar.
+  // null = sin dato (doc anterior al deploy de esta feature, o transicionado por el
+  // motor histórico identificarAnterioresAMayo, excluido a propósito — ver ese archivo).
+  primeraIdentificacionAt: { type: Date, default: null },
+  primeraIdentificacionPor: {
+    type: {
+      userId: { type: String, default: null },
+      nombre: { type: String, default: null },
+    },
+    default: null,
+  },
+
+  // Marca INMUTABLE, estampada UNA SOLA VEZ por una migración de una sola corrida en el
+  // momento real del deploy de este indicador — jamás se vuelve a tocar después (ni al
+  // identificar el movimiento, ni al revertirlo de vuelta a no_identificado). true = este
+  // movimiento YA estaba no_identificado cuando el indicador se puso en marcha (backlog
+  // histórico); false/default = apareció después (backlog nuevo, medido desde el día 1).
+  // Ver scripts/migrate-backlog-preexistente.js — NUNCA re-correr esa migración una vez
+  // ejecutada de verdad en producción, corromperia la marca.
+  backlogPreExistente: { type: Boolean, default: false },
 
   // Oculto por regla — el movimiento existe pero no aparece en vistas normales
   oculto: { type: Boolean, default: false, index: true },
@@ -244,6 +284,8 @@ bankMovementSchema.index({ categoria: 1, isActive: 1 });
 // Índices para el motor Match ERP
 bankMovementSchema.index({ isActive: 1, status: 1, deposito: 1 });
 bankMovementSchema.index({ 'identificadoPor.userId': 1 });
+// Soporta bank-indicadores.service.js: promedio de tiempo de identificación.
+bankMovementSchema.index({ status: 1, primeraIdentificacionAt: 1 });
 bankMovementSchema.index({ erpIds: 1, isActive: 1 });
 
 // Índice de texto para el buscador

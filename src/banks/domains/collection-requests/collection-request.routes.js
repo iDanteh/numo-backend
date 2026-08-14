@@ -1,10 +1,10 @@
 'use strict';
 
 const express = require('express');
-const crypto  = require('crypto');
 const multer  = require('multer');
 const { authenticate, permit }    = require('../../shared/middleware/auth.real');
 const { asyncHandler }            = require('../../shared/middleware/error-handler');
+const { verifyKoreApiKey }        = require('../../../shared/middleware/kore-api-key-auth');
 const service                     = require('./collection-request.service');
 
 const router = express.Router();
@@ -35,22 +35,6 @@ const uploadComprobante = multer({
   },
 });
 
-// Autenticación para el endpoint que llama el ERP (Kore) directamente, servidor a
-// servidor — no hay sesión Numo/Auth0 en esa llamada. Comparación en tiempo
-// constante para evitar timing attacks. Requiere COLLECTION_REQUESTS_API_KEY en .env.
-function requireErpApiKey(req, res, next) {
-  const expected = process.env.COLLECTION_REQUESTS_API_KEY;
-  if (!expected) {
-    return res.status(500).json({ error: 'COLLECTION_REQUESTS_API_KEY no configurada en el servidor' });
-  }
-  const received = req.get('X-Api-Key') || '';
-  const a = Buffer.from(received);
-  const b = Buffer.from(expected);
-  const valid = a.length === b.length && crypto.timingSafeEqual(a, b);
-  if (!valid) return res.status(401).json({ error: 'API key inválida' });
-  next();
-}
-
 // POST /api/collection-requests/analyze
 router.post('/analyze',
   authenticate,
@@ -66,7 +50,7 @@ router.post('/analyze',
 // multipart es "comprobantes" (repetido una vez por archivo) — antes era
 // "comprobante" (singular); Kore debe actualizar su integración.
 router.post('/',
-  requireErpApiKey,
+  verifyKoreApiKey,
   uploadComprobante.array('comprobantes', MAX_COMPROBANTES),
   asyncHandler(async (req, res) => {
     res.status(201).json(await service.create(req.body, req.files));
@@ -120,7 +104,7 @@ router.get('/mias/report', authenticate, permit('collections:read'), asyncHandle
 // estado de la solicitud que él mismo creó, autenticado con su API key (no hay
 // sesión Numo). Debe ir antes de /:id para que Express no intente matchear
 // "erp" como si fuera un _id de Mongo.
-router.get('/erp/:solicitudIdErp', requireErpApiKey, asyncHandler(async (req, res) => {
+router.get('/erp/:solicitudIdErp', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await service.getByErpId(req.params.solicitudIdErp));
 }));
 
@@ -130,7 +114,7 @@ router.get('/erp/:solicitudIdErp', requireErpApiKey, asyncHandler(async (req, re
 // en este router (API key, no sesión Auth0/Numo). Body: { canceladoPorUserId,
 // canceladoPorNombre } — la identidad del usuario de Kore que confirmó la
 // cancelación, para mostrar "Cancelado por el usuario X" en la bandeja.
-router.post('/erp/:solicitudIdErp/cancelar', requireErpApiKey, asyncHandler(async (req, res) => {
+router.post('/erp/:solicitudIdErp/cancelar', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await service.cancelarPorErp(req.params.solicitudIdErp, req.body));
 }));
 

@@ -37,12 +37,19 @@ async function sincronizarCuentasPendientes(params = {}) {
   return { raw };
 }
 
-// ── Reintento con backoff para 429 ──────────────────────────────────────────
+// ── Reintento con backoff para 429 y timeouts ───────────────────────────────
 // El ERP regresa "retry after: X segundos" en el cuerpo del 429 (campo Data).
 // Antes un solo 429 tronaba toda la generación de la póliza — ahora se
 // espera el tiempo indicado (+1s de margen, tope 60s) y se reintenta, hasta
 // MAX_INTENTOS veces (confirmado con el usuario 2026-08-05, después de que
 // generar las 11 sucursales de un mismo periodo saturó el ERP).
+//
+// Timeouts (2026-08-14, confirmado con el usuario): un timeout aislado de
+// 15s en un endpoint "por centro" (consulta pesada, ej. un día completo de
+// una sucursal grande) no debe hacer que el caller se rinda de inmediato y
+// caiga al camino viejo/menos preciso — primero vale la pena reintentar,
+// igual que ya se hace con 429, antes de darse por vencido. Backoff fijo (no
+// hay "retry after" para un timeout) con un pequeño incremento por intento.
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   for (let intento = 1; intento <= MAX_INTENTOS_429; intento++) {
@@ -53,13 +60,20 @@ async function _getConReintento(url, params, logLabel) {
         timeout: 15000,
       });
     } catch (axErr) {
-      const status = axErr.response?.status;
+      const status    = axErr.response?.status;
+      const esTimeout = axErr.code === 'ECONNABORTED' || /timeout/i.test(axErr.message || '');
+      const { logger } = require('../../../shared/utils/logger');
       if (status === 429 && intento < MAX_INTENTOS_429) {
         const dataMsg   = String(axErr.response?.data?.Data ?? '');
         const match     = /retry after:\s*([\d.]+)/i.exec(dataMsg);
         const esperaSeg = Math.min((match ? Number(match[1]) : 10) + 1, 60);
-        const { logger } = require('../../../shared/utils/logger');
         logger.warn(`[ErpSync] 429 en ${logLabel}, reintentando en ${esperaSeg.toFixed(1)}s (intento ${intento}/${MAX_INTENTOS_429})`);
+        await new Promise(r => setTimeout(r, esperaSeg * 1000));
+        continue;
+      }
+      if (esTimeout && intento < MAX_INTENTOS_429) {
+        const esperaSeg = 3 * intento;
+        logger.warn(`[ErpSync] timeout en ${logLabel}, reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS_429})`);
         await new Promise(r => setTimeout(r, esperaSeg * 1000));
         continue;
       }

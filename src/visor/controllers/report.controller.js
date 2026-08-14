@@ -1227,8 +1227,16 @@ const notInErp = asyncHandler(async (req, res) => {
     .sort({ fecha: -1 })
     .lean();
 
-  // Paso 3a: SAT sin contraparte ERP en este mismo periodo
-  const sinContraparteErp = satDocs.filter(d => !erpUuidsPeriodo.has(d.uuid?.toUpperCase()));
+  // Paso 3a: SAT sin contraparte ERP en este mismo periodo — excluye los ya
+  // conciliados manualmente (`POST /comparisons/conciliar-not-in-erp`, ver
+  // comparison.controller.js): ese endpoint marca `lastComparisonStatus:
+  // 'conciliado'` en el CFDI, pero este reporte recalcula "sin contraparte
+  // ERP" desde cero por diferencia de sets de UUID en cada llamada — sin este
+  // filtro, la factura conciliada seguía sin existir en ERP y por lo tanto
+  // volvía a aparecer aquí siempre, ignorando la conciliación (confirmado con
+  // el usuario 2026-08-14: concilió una factura y seguía apareciendo).
+  const sinContraparteErp = satDocs.filter(d =>
+    !erpUuidsPeriodo.has(d.uuid?.toUpperCase()) && d.lastComparisonStatus !== 'conciliado');
 
   // Paso 3b: duplicados SAT — mismo UUID más de una vez en SAT para el periodo
   const uuidCount = {};

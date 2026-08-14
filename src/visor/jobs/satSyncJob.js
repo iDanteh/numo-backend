@@ -24,6 +24,33 @@ const { upsertFromERP } = require('../repositories/cfdi.repository');
 
 const CRON_HORA = config.sat.cronHora;
 
+// Protege el estatus de conciliación manual (`lastComparisonStatus:
+// 'conciliado'`, ver comparison.controller.js `conciliarNotInErp`) durante la
+// reingesta de CFDIs SAT — los `bulkWrite` de más abajo pisan
+// `lastComparisonStatus` a 'not_in_erp'/'match' sin saber si ya fue conciliado
+// a mano. Confirmado con el usuario 2026-08-14: SOLO debe protegerse este
+// campo para los conciliados manualmente, el resto de la reingesta (subTotal,
+// xmlContent, satStatus, etc.) debe seguir comportándose exactamente igual.
+// Patrón: leer ANTES cuáles ya estaban conciliados, dejar correr el bulkWrite
+// tal cual, y restaurar el campo después solo para esos UUIDs — así no hay
+// que tocar los `$set` grandes de cada bulkWrite (menor riesgo de romper algún
+// otro campo).
+const _uuidsConciliadosPrevios = async (uuidsCandidatos) => {
+  if (!uuidsCandidatos.length) return new Set();
+  const previos = await CFDI.find(
+    { uuid: { $in: uuidsCandidatos }, source: 'SAT', lastComparisonStatus: 'conciliado' },
+    'uuid',
+  ).lean();
+  return new Set(previos.map(d => d.uuid.toUpperCase()));
+};
+const _restaurarConciliados = async (uuidsConciliadosPrevios) => {
+  if (!uuidsConciliadosPrevios.size) return;
+  await CFDI.updateMany(
+    { uuid: { $in: [...uuidsConciliadosPrevios] }, source: 'SAT' },
+    { $set: { lastComparisonStatus: 'conciliado' } },
+  );
+};
+
 /**
  * Re-parsea el xmlContent de CFDIs que tienen XML guardado pero subTotal = 0.
  * Se llama en background después de cada sync para recuperar datos sobrescritos por metadata.
@@ -240,7 +267,9 @@ const ejecutarComparacionAuto = async ({ ejercicioParam, periodoParam } = {}) =>
   // sea una de nuestras propias entidades (si el emisor es un tercero, el CFDI
   // es un recibido y se excluye de este query, sin importar su "source").
   const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
-  const satFilter = { ...baseFilter, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc': { $in: entidadesRfcs } };
+  // Excluye los ya conciliados manualmente — ver comentario en
+  // compareSATOnlyCFDI (comparisonEngine.js).
+  const satFilter = { ...baseFilter, source: { $in: ['SAT', 'MANUAL'] }, 'emisor.rfc': { $in: entidadesRfcs }, lastComparisonStatus: { $ne: 'conciliado' } };
 
   const [erpCfdis, satCfdis, allErpUuids] = await Promise.all([
     CFDI.find({ ...baseFilter, source: 'ERP' }, '_id uuid').lean(),
@@ -1079,6 +1108,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
             if (esMetadata) {
               const registrosMeta = r.filter(row => soloEnSATUuids.has((row.uuid || '').toUpperCase()));
               if (registrosMeta.length > 0) {
+                const _conciliadosPrevios = await _uuidsConciliadosPrevios(registrosMeta.map(row => row.uuid.toUpperCase()));
                 await CFDI.bulkWrite(registrosMeta.map(row => ({
                   updateOne: {
                     filter: { uuid: row.uuid.toUpperCase(), source: 'SAT', origenDescarga: { $ne: 'xml' } },
@@ -1110,11 +1140,13 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                     upsert: true,
                   },
                 })));
+                await _restaurarConciliados(_conciliadosPrevios);
                 logger.info(`[SatSyncJob] ✓ Tipo ${tipoActual}: ${registrosMeta.length} registros metadata guardados en MongoDB.`);
               }
             } else {
               const cfdisNuevos = r.filter(c => soloEnSATUuids.has((c.uuid || '').toUpperCase()));
               if (cfdisNuevos.length > 0) {
+                const _conciliadosPreviosXml = await _uuidsConciliadosPrevios(cfdisNuevos.map(c => c.uuid.toUpperCase()));
                 await CFDI.bulkWrite(cfdisNuevos.map(c => ({
                   updateOne: {
                     filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
@@ -1150,6 +1182,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                     upsert: true,
                   },
                 })));
+                await _restaurarConciliados(_conciliadosPreviosXml);
                 logger.info(`[SatSyncJob] ✓ Tipo ${tipoActual}: ${cfdisNuevos.length} CFDIs XML guardados en MongoDB.`);
 
                 // Reclasificación inmediata por tipo (solo XML — tiene InformacionGlobal)
@@ -1257,6 +1290,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
 
                   // Guardar en MongoDB — solo actualizar si NO ya existe como XML
                   // (evita sobrescribir subTotal/origenDescarga de CFDIs descargados como XML en sesiones previas)
+                  const _conciliadosPreviosMeta2 = await _uuidsConciliadosPrevios(soloMetaRows.map(row => row.uuid.toUpperCase()));
                   await CFDI.bulkWrite(soloMetaRows.map(row => ({
                     updateOne: {
                       filter: { uuid: row.uuid.toUpperCase(), source: 'SAT', origenDescarga: { $ne: 'xml' } },
@@ -1287,6 +1321,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                       upsert: true,
                     },
                   })));
+                  await _restaurarConciliados(_conciliadosPreviosMeta2);
 
                   // Acumular en resultados de comparación
                   const metaCoinc   = soloMetaRows.filter(m =>  erpUuids.has((m.uuid || '').toUpperCase())).map(normalizarMetadato);
@@ -2017,4 +2052,4 @@ const reprogramarJobs = ({
   }
 })();
 
-module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs };
+module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs, _uuidsConciliadosPrevios, _restaurarConciliados };

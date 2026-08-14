@@ -748,18 +748,57 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const totalFormasPagoReal = Array.isArray(context.desglosePagoReal)
     ? context.desglosePagoReal.reduce((s, fp) => s + (Number(fp.monto) || 0), 0)
     : 0;
+  // Verificación de suma exacta (2026-08-07, QUITADA 2026-08-14): existió acá
+  // porque el desglose real de cajas puede venir PARCIAL — caso real donde un
+  // cobro CBT de $87.79 (Puntos) era el ÚNICO encontrado para una factura de
+  // $1,023.63, y el split proporcional le atribuía el Cargo COMPLETO a
+  // Puntos. Pero exigir cuadre exacto (<0.02) resultó DEMASIADO estricto para
+  // Facturas Globales grandes (caso real Hidalgo B0-260701074, 09/07/2026:
+  // factura de $201,995.71 con desglose real de $170,386.71 — solo 15.6% de
+  // "ruido" de reclasificación del ERP, mismo fenómeno ya documentado para
+  // Atzompa — caía al fallback de una sola línea, escondiendo $31,609 del
+  // consolidado real de Efectivo/Tarjeta). Se quita la verificación (mismo
+  // criterio ya usado en el remanente de `esCasoAjusteSFPuntos`, confirmado
+  // con el usuario 2026-08-14): partir proporcional con lo que se encontró es
+  // preferible a mandar la factura completa a una sola forma de pago.
   const esCasoNormalParaSplit = !esCasoAjusteSFPuntos && gateBase
     && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
-    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS]
-    // Verificación de suma (2026-08-07): el desglose real de cajas puede
-    // venir PARCIAL — confirmado con el usuario, caso real donde un cobro
-    // CBT de $87.79 (Puntos) era el ÚNICO encontrado para una factura de
-    // $1,023.63, y el split proporcional le atribuía el Cargo COMPLETO a
-    // Puntos. Si la suma de lo encontrado no coincide con el Cargo real de
-    // ESTA factura, no es información confiable para partirlo — se cae al
-    // comportamiento de una sola línea (ver `else` más abajo), igual que si
-    // no hubiera desglose en absoluto.
-    && Math.abs(totalFormasPagoReal - montoCargo) < 0.02;
+    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
+
+  // Reparte `montoAPartir` entre Efectivo/Tarjeta usando `context.desglosePagoReal`
+  // — extraído del bloque `esCasoNormalParaSplit` (2026-08-14) para poder
+  // reutilizarlo también en el remanente de `esCasoAjusteSFPuntos` (ver ahí).
+  // `extraEnUltima` se adjunta SOLO a la última línea empujada (mismo lugar
+  // que ya absorbe el residuo de redondeo) — usado para no perder el
+  // marcador `_puntosUsado` cuando el remanente también se parte.
+  const splitPorFormaPagoReal = (montoAPartir, extraEnUltima = {}) => {
+    const formasPagoReal = context.desglosePagoReal;
+    let acumulado = 0;
+    formasPagoReal.forEach((fp, idx) => {
+      const esUltimo = idx === formasPagoReal.length - 1;
+      const share = totalFormasPagoReal > 0 ? (Number(fp.monto) || 0) / totalFormasPagoReal : 1 / formasPagoReal.length;
+      const montoLinea = esUltimo
+        ? parseFloat((montoAPartir - acumulado).toFixed(2))
+        : parseFloat((montoAPartir * share).toFixed(2));
+      acumulado += montoLinea;
+      if (montoLinea <= 0) return;
+
+      const esEfectivo = (fp.claveSat ?? '').trim() === '01';
+      movs.push({
+        cuentaId:    esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS],
+        concepto, centroCosto, ventaFecha, serie: serieCfdi,
+        debe:        montoLinea,
+        haber:       0,
+        cfdiUuid:    cfdi.uuid,
+        rfcTercero,
+        _esCargoPrincipal: true,
+        // Ver comentario más abajo (bloque `esCasoNormalParaSplit`) sobre por
+        // qué esta línea concreta debe llevar el claveSat REAL, no el del CFDI.
+        _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+        ...(esUltimo ? extraEnUltima : {}),
+      });
+    });
+  };
 
   if (esSplitPagoPorFactura) {
     // Asiento completo (Cargo + IVA cobrado + Abono) POR FACTURA liquidada —
@@ -798,67 +837,59 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     if (montoPuntosAplicado > 0) {
       restante = parseFloat((restante - montoPuntosAplicado).toFixed(2));
     }
-    // Remanente: lo que sigue en Caja/Bancos (la cuenta que ya eligió la
-    // regla) sin partir más — el desglose de cajas no es confiable para
-    // partir Efectivo/Tarjeta cuando además hubo SF/Puntos en la misma
-    // consulta (ver nota junto a las constantes). Se empuja SIEMPRE, aunque
-    // sea $0 (factura pagada 100% con SF/Puntos) para que el marcador
-    // `_puntosUsado` tenga dónde ir — no rompe el cuadre, el otro lado de esa
-    // porción ya quedó representado arriba (SF) o en la línea consolidada que
-    // arma el generator (Puntos).
-    movs.push({
-      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
-      concepto, centroCosto, ventaFecha, serie: serieCfdi,
-      debe:        restante,
-      haber:       0,
-      cfdiUuid:    cfdi.uuid,
-      rfcTercero,
-      _esCargoPrincipal: true,
-      ...(montoPuntosAplicado > 0 ? { _puntosUsado: montoPuntosAplicado } : {}),
-    });
-  } else if (esCasoNormalParaSplit) {
-    const formasPagoReal  = context.desglosePagoReal;
-    const totalFormasPago = totalFormasPagoReal;
-    let acumulado = 0;
-    formasPagoReal.forEach((fp, idx) => {
-      const esUltimo = idx === formasPagoReal.length - 1;
-      const share = totalFormasPago > 0 ? (Number(fp.monto) || 0) / totalFormasPago : 1 / formasPagoReal.length;
-      // El último absorbe el residuo de redondeo (mismo patrón que
-      // cobros-sucursal-puente.service.js) — el monto real ancla en
-      // `montoCargo` (el total de ESTA factura), nunca en `fp.monto`
-      // directo: puede venir sin prorratear cuando un mismo pago del ERP
-      // cubre varias facturas a la vez.
-      const montoLinea = esUltimo
-        ? parseFloat((montoCargo - acumulado).toFixed(2))
-        : parseFloat((montoCargo * share).toFixed(2));
-      acumulado += montoLinea;
-      if (montoLinea <= 0) return;
-
-      const esEfectivo = (fp.claveSat ?? '').trim() === '01';
+    // Remanente: lo que sigue después de SF/Puntos. Corrección 2026-08-14
+    // (caso real Atzompa, Factura Global de mostrador con Puntos usados):
+    // antes esto SIEMPRE se mandaba completo a la cuenta por defecto de la
+    // regla (Efectivo/Caja), aunque `context.desglosePagoReal` sí trajera un
+    // desglose real de Efectivo/Tarjeta.
+    // A diferencia de `esCasoNormalParaSplit` (que exige que la suma cuadre
+    // casi exacto contra `montoCargo`, por el caso real de un desglose
+    // gravemente INCOMPLETO que le atribuía el Cargo completo a Puntos), aquí
+    // NO se exige ese cuadre exacto (confirmado con el usuario 2026-08-14,
+    // caso real Atzompa: la consulta "por centro" del ERP trae cobros CBT que
+    // parecen incluir eventos de reclasificación/corrección, dejando un
+    // sobrante ~1.7% sin explicar frente a `restante` — no se pudo aislar la
+    // causa exacta, pero partir proporcional sigue siendo preferible a mandar
+    // todo el remanente a una sola forma de pago). El monto total del
+    // remanente NUNCA cambia (el prorrateo ancla en `restante`, no en la suma
+    // del desglose — ver `splitPorFormaPagoReal`), así que esto solo afecta
+    // la PROPORCIÓN Efectivo/Tarjeta, nunca el cuadre del asiento.
+    const remanenteConfiableParaSplit = Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
+      && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
+    const extraRemanente = montoPuntosAplicado > 0 ? { _puntosUsado: montoPuntosAplicado } : {};
+    if (remanenteConfiableParaSplit && restante > 0) {
+      splitPorFormaPagoReal(restante, extraRemanente);
+    } else {
+      // Se empuja SIEMPRE, aunque sea $0 (factura pagada 100% con SF/Puntos)
+      // para que el marcador `_puntosUsado` tenga dónde ir — no rompe el
+      // cuadre, el otro lado de esa porción ya quedó representado arriba
+      // (SF) o en la línea consolidada que arma el generator (Puntos).
       movs.push({
-        cuentaId:    esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS],
-        concepto,
-        centroCosto,
-        ventaFecha,
-        serie:       serieCfdi,
-        debe:        montoLinea,
+        cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+        concepto, centroCosto, ventaFecha, serie: serieCfdi,
+        debe:        restante,
         haber:       0,
         cfdiUuid:    cfdi.uuid,
         rfcTercero,
         _esCargoPrincipal: true,
-        // El `formaPago` que se persiste (satMeta, al final de esta función)
-        // por defecto es el que declara el CFDI — para una línea partida por
-        // el desglose real, ESA línea concreta debe llevar el claveSat REAL
-        // (fp.claveSat), no el del CFDI, o el export (`consolidarCargos` en
-        // poliza.service.js, que agrupa "Depósitos consolidados (Efectivo/
-        // Tarjeta)" por `LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago]`) etiqueta
-        // TODAS las líneas de esta factura igual que el CFDI original, sin
-        // importar a qué cuenta fue cada una — resultando en "Efectivo"
-        // apareciendo también en la cuenta de Bancos y viceversa (confirmado
-        // con el usuario 2026-08-06, caso real VENTAS SUC.HIDALGO).
-        _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+        ...extraRemanente,
       });
-    });
+    }
+  } else if (esCasoNormalParaSplit) {
+    // El `formaPago` que se persiste (satMeta, al final de esta función) por
+    // defecto es el que declara el CFDI — para una línea partida por el
+    // desglose real, ESA línea concreta debe llevar el claveSat REAL
+    // (`_formaPagoReal`, ver `splitPorFormaPagoReal`), no el del CFDI, o el
+    // export (`consolidarCargos` en poliza.service.js, que agrupa "Depósitos
+    // consolidados (Efectivo/Tarjeta)" por
+    // `LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago]`) etiqueta TODAS las líneas
+    // de esta factura igual que el CFDI original, sin importar a qué cuenta
+    // fue cada una — resultando en "Efectivo" apareciendo también en la
+    // cuenta de Bancos y viceversa (confirmado con el usuario 2026-08-06,
+    // caso real VENTAS SUC.HIDALGO). Idéntico al split del remanente de
+    // `esCasoAjusteSFPuntos` (ancla en `montoCargo`, no en la suma
+    // encontrada) — se reutiliza el mismo helper.
+    splitPorFormaPagoReal(montoCargo);
   } else {
     movs.push({
       cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,

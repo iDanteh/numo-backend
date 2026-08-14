@@ -1114,42 +1114,20 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       continue;
     }
 
-    // Tarjeta: agrupar por número de autorización REAL (bancario.numeroAutorizacion,
-    // de BankMovement — el código que da el banco/terminal por swipe/lote),
-    // mismo patrón que Transferencia/Cheque arriba pero con un concepto de
-    // referencia DISTINTO — ahí se usa el folio propio de Numo (representa el
-    // depósito bancario); aquí se usa el número de autorización de la tarjeta
-    // (representa el lote de la terminal, un concepto distinto — confirmado
-    // con el usuario 2026-08-07). Solo aplica cuando existe match bancario con
-    // ese dato — sin él, Tarjeta sigue su camino normal (depósito identificado
-    // por referencia genérica, o el consolidado anónimo).
-    const esTarjetaDeclarada = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA';
-    if (esTarjetaDeclarada && bancario?.numeroAutorizacion) {
-      const cuentaLinea = bancario?.cuentaBanco ?? m.cuenta;
-      const key = `${cuentaLinea?.codigo}|${centroCosto}|TARJETA|${bancario.numeroAutorizacion}`;
-      if (!gruposDetallados.has(key)) {
-        gruposDetallados.set(key, {
-          cuenta: cuentaLinea, centroCosto, referencia: bancario.numeroAutorizacion, tipoDetalle: 'TARJETA', subcodigo: 0,
-          debe: 0, detalle: [], primerMov: m,
-        });
-      }
-      const gtTarjeta = gruposDetallados.get(key);
-      gtTarjeta.debe += Number(m.debe);
-      gtTarjeta.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: 'TARJETA' });
-      continue;
-    }
-
-    // Depósito real identificado en Bancos (Tarjeta u otra forma de pago con
-    // número de autorización/referencia real ligado; Transferencia y Cheque
-    // ya se manejaron arriba) — SIEMPRE se saca del consolidado. La etiqueta
-    // conserva la forma de pago real cuando se conoce, para que la línea
-    // individual siga siendo legible aunque ya no vaya agrupada.
-    if (bancario?.referencia) {
-      const etiquetaIdentificado = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' ? 'Tarjeta'
-        : 'Depósito identificado';
-      depositosIdentificados.push(armarIndividual(etiquetaIdentificado, 0, null, bancario.referencia, bancario.cuentaBanco));
-      continue;
-    }
+    // Tarjeta/Efectivo NUNCA se sacan del consolidado por un match de
+    // `verdadBancaria` (quitado 2026-08-14, confirmado con el usuario —
+    // caso real Hidalgo B0-260701074): `construirVerdadBancaria` resuelve el
+    // banco real POR CFDI completo (una sola entrada por `cfdiUuid`), no por
+    // línea individual. Una Factura Global agrupa ~150 tickets, cada uno con
+    // su propio posible depósito — un solo match parcial (ej. un lote de
+    // tarjeta de $1,720.93 de un ticket cualquiera) hacía que las 175 líneas
+    // completas de la factura ($201,995.71) se sacaran del consolidado hacia
+    // esa cuenta bancaria, ocultando casi todo el Efectivo/Tarjeta real del
+    // día. `verdadBancaria` sigue siendo confiable para Transferencia (única
+    // forma de pago que ya se maneja arriba antes de llegar aquí, vía
+    // `esTransferenciaVerificada`) — para Tarjeta/Efectivo/cualquier otra,
+    // siempre se consolida por forma de pago declarada, sin importar si hay
+    // match bancario.
 
     // Sin depósito real que mostrar: se consolida por la forma de pago
     // declarada (Efectivo o Tarjeta — cada una en su propia línea/cuenta;

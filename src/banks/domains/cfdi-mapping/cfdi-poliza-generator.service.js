@@ -143,6 +143,30 @@ const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 // de esa cuenta era una transferencia de $25,546.16 sin relación, ajena al
 // saldo de $136.22, y encoló mal la generación a CEDIS cuando debía quedarse
 // en PROMOTORIA).
+// Forma de pago SAT dominante (por monto acumulado) de los cobros REALES de
+// una venta — mismo criterio de filtrado que `_prefetchAjustesFacturaPropia`
+// (solo SERIES_CON_AUTH, excluye Puntos/Saldo a favor del texto de la forma
+// de pago), pero sin filtrar por día: aquí solo se usa para el caso "mismo
+// folio" (ver `_prefetchSaldosFavorGenerados`), donde ya sabemos que
+// generación y consumo son la MISMA venta, así que cualquier cobro real de
+// esa cuenta es válido. Se usa UN solo valor dominante (no desglose) porque
+// el usuario pidió restar directo del consolidado sin partir por forma de
+// pago (confirmado 2026-08-13).
+function _formaPagoDominante(cobros) {
+  const acumuladoPorClave = new Map();
+  for (const c of (cobros ?? [])) {
+    if (!SERIES_CON_AUTH.includes((c.serieOrigen ?? '').toUpperCase())) continue;
+    for (const fp of (c.formasPago ?? [])) {
+      if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+      const clave = (fp.claveSat ?? '').trim();
+      if (!clave) continue;
+      acumuladoPorClave.set(clave, (acumuladoPorClave.get(clave) ?? 0) + (Number(fp.monto) || 0));
+    }
+  }
+  if (!acumuladoPorClave.size) return null;
+  return [...acumuladoPorClave.entries()].sort((a, b) => b[1] - a[1])[0][0];
+}
+
 function _claveCentroPorMonto(cobrosPorCuenta, serie, folio, monto) {
   const cobros = cobrosPorCuenta.get(`${serie}|${folio}`) ?? [];
   const match = cobros.find(c => {
@@ -164,6 +188,19 @@ function _claveCentroPorMonto(cobrosPorCuenta, serie, folio, monto) {
 }
 
 async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
+  // DIAGNÓSTICO TEMPORAL 2026-08-13 (quitar tras resolver el reporte de SF
+  // faltantes en Atzompa) — traza qué CFDIs tipo E se detectan como
+  // Devolución-con-venta y cuáles quedan fuera por no tener marcador/venta.
+  const { logger: _dbgLogger } = require('../../../shared/utils/logger');
+  const _cfdisE = cfdis.filter(c => c.tipoDeComprobante === 'E');
+  _dbgLogger.warn(`[SF-DEBUG] CFDIs tipo E en el batch: ${_cfdisE.length}`);
+  for (const cfdi of _cfdisE) {
+    const marcador = (cfdi.documentosRelacionados ?? [])
+      .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+    const venta = _extraerDocumentosRelacionados(cfdi)[0];
+    _dbgLogger.warn(`[SF-DEBUG] E uuid=${cfdi.uuid} serie=${cfdi.serie} folio=${cfdi.folio} docsRel=${JSON.stringify(cfdi.documentosRelacionados)} marcador=${JSON.stringify(marcador)} venta=${JSON.stringify(venta)}`);
+  }
+
   const devolucionesConVenta = cfdis
     .map(cfdi => {
       if (cfdi.tipoDeComprobante !== 'E') return null;
@@ -173,6 +210,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
       return (marcador && venta) ? { marcador, venta, cfdiSerie: cfdi.serie ?? null } : null;
     })
     .filter(Boolean);
+  _dbgLogger.warn(`[SF-DEBUG] devolucionesConVenta encontradas: ${devolucionesConVenta.length}`);
   if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set() };
   // Venta (serie|folio) → serie del CFDI de la Devolución que la referenció —
   // para saber la sucursal "dueña" y así detectar cruce de sucursal más abajo.
@@ -259,16 +297,37 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap) {
     const oculto = !esCruzado && !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso
       && claveCentroGen && claveCentroUso && claveCentroGen === claveCentroUso);
     if (oculto) devsOcultos.add(key);
+
+    // Caso "mismo folio" (confirmado con el usuario 2026-08-13): la MISMA
+    // venta generó Y consumió el saldo a favor (uso completo, sin sobrante) —
+    // a diferencia de `oculto` (día+almacén), este criterio compara
+    // directamente la venta de generación contra la venta de uso. Cuando
+    // aplica, `_inyectarSaldoFavorGenerado` NO contabiliza el pasivo
+    // (Anticipos Otros) — trata el monto como salida real de caja y lo resta
+    // del consolidado de Efectivo/Tarjeta, usando la forma de pago real de
+    // ESTA MISMA venta (ya la tenemos en `cobrosPorVenta`, sin llamada extra
+    // al ERP).
+    const mismoFolio = !!(usoUnico && usoCompleto
+      && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
+      && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
+
     const prev = mapa.get(key);
     mapa.set(key, {
       monto:      (prev?.monto ?? 0) + (Math.abs(Number(gen.monto) || 0)),
       ventaSerie: cuenta.serieVenta,
       ventaFolio: cuenta.folioVenta,
       oculto,
+      mismoFolio: mismoFolio || prev?.mismoFolio || false,
+      formaPagoReal: mismoFolio
+        ? (_formaPagoDominante(cobrosPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)) ?? prev?.formaPagoReal ?? null)
+        : (prev?.formaPagoReal ?? null),
       centroProcesamiento: centro ?? prev?.centroProcesamiento ?? null,
     });
+    // DIAGNÓSTICO TEMPORAL 2026-08-13 (quitar tras resolver el reporte).
+    _dbgLogger.warn(`[SF-DEBUG] gen key=${key} ventaSerie=${cuenta.serieVenta} ventaFolio=${cuenta.folioVenta} monto=${gen.monto} usos=${JSON.stringify(gen.usos)} usoUnico=${JSON.stringify(usoUnico)} usoCompleto=${usoCompleto} mismoFolio=${mismoFolio} esCruzado=${esCruzado} claveCentroGen=${claveCentroGen} claveCentroUso=${claveCentroUso} centro=${JSON.stringify(centro)} cc=${JSON.stringify(cc)} mapaFinal=${JSON.stringify(mapa.get(key))}`);
   }
 
+  _dbgLogger.warn(`[SF-DEBUG] mapa final tiene ${mapa.size} entradas: ${JSON.stringify([...mapa.entries()])}`);
   return { mapa, devsOcultos };
 }
 
@@ -555,12 +614,19 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
  * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza — tampoco
  * hay Cargo de cierre que agregar en el caller, porque no hay líneas).
  */
-async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cc, rfc }) {
+async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc }) {
+  // DIAGNÓSTICO TEMPORAL 2026-08-13 (quitar tras resolver el reporte).
+  const { logger: _dbgLogger2 } = require('../../../shared/utils/logger');
+  if (cfdi.tipoDeComprobante === 'E') {
+    _dbgLogger2.warn(`[SF-DEBUG] _inyectarSaldoFavorGenerado uuid=${cfdi.uuid} serie=${cfdi.serie} folio=${cfdi.folio} cuentaSaldoFavorId=${cuentaSaldoFavorId} cuentaIvaSaldoFavorId=${cuentaIvaSaldoFavorId} cuentaCajaId=${cuentaCajaId} cuentaBancosId=${cuentaBancosId} cc=${JSON.stringify(cc)}`);
+  }
   if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
   const marcador = (cfdi.documentosRelacionados ?? [])
     .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+  _dbgLogger2.warn(`[SF-DEBUG] marcador=${JSON.stringify(marcador)} para uuid=${cfdi.uuid}`);
   if (!marcador) return [];
   const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
+  _dbgLogger2.warn(`[SF-DEBUG] generado lookup key=${marcador.Serie}|${marcador.Folio} => ${JSON.stringify(generado)}`);
   if (!generado?.monto) return [];
 
   const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
@@ -571,6 +637,8 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
 
   const centroReal = generado.centroProcesamiento;
   const esCruzado = !!(centroReal && (!cc || String(centroReal.id) !== String(cc.id)));
+  // DIAGNÓSTICO TEMPORAL 2026-08-13 (quitar tras resolver el reporte).
+  _dbgLogger2.warn(`[SF-DEBUG] uuid=${cfdi.uuid} centroReal=${JSON.stringify(centroReal)} cc=${JSON.stringify(cc)} esCruzado=${esCruzado} mismoFolio=${generado.mismoFolio} formaPagoReal=${generado.formaPagoReal}`);
   // Siempre se sincroniza (no solo cuando hay cruce): si esta vez NO es
   // cruzado, limpia cualquier fila vieja de este folio en vez de dejarla
   // huérfana (ver `_sincronizarCobroSucursalPendiente`).
@@ -597,6 +665,48 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     serie:         serieFolioVenta,
     centroCosto:   cc?.clave ?? null,
     centroCostoId: cc?.id    ?? null,
+    cfdiUuid:      cfdi.uuid,
+    cuentaFaltante: false,
+  };
+
+  // Caso "mismo folio" (confirmado con el usuario 2026-08-13, ver
+  // `_prefetchSaldosFavorGenerados`): la MISMA venta generó y consumió el
+  // saldo — no es un pasivo real, es una salida de caja que ya volvió a
+  // entrar. En vez de las 2 líneas de Anticipos Otros, se devuelve UNA sola
+  // línea de Cargo NEGATIVO a Caja/Bancos (según la forma de pago real de esa
+  // venta) — al llegar a `consolidarCargos` (poliza.service.js), que solo
+  // agrupa por cuenta+centro+forma de pago y SUMA `debe`, este valor negativo
+  // resta directo del total sin crear una fila propia (confirmado con el
+  // usuario: "solo restarlo", sin desglose). `_ajusteConsolidadoSF` le indica
+  // al caller (generarPropuesta/generarYGuardar) que trate esta línea como
+  // el equivalente del Abono SF para efectos de cerrar/cancelar el Abono
+  // normal de la Devolución (mismo mecanismo de cuadre por asiento que ya
+  // existe para el caso normal, ver comentario junto al caller).
+  // Alcance: solo si además NO hay cruce de sucursal (`esCruzado` ya
+  // descartado arriba) — la combinación mismoFolio+cruzado no tiene caso real
+  // confirmado con el usuario; si aparece, cae al comportamiento normal de
+  // abajo (pasivo vía Anticipos Otros).
+  if (generado.mismoFolio) {
+    const esTarjeta      = generado.formaPagoReal === '04' || generado.formaPagoReal === '28';
+    const cuentaAjusteId = esTarjeta ? cuentaBancosId : cuentaCajaId;
+    if (cuentaAjusteId) {
+      return [{
+        ...base,
+        cuentaId:    cuentaAjusteId,
+        tipoOrigen:  'Ajuste Consolidado SF',
+        reglaNombre: 'SF-MISMO-FOLIO',
+        formaPago:   generado.formaPagoReal ?? null,
+        debe:        -(subtotal + iva),
+        haber:       0,
+        _ajusteConsolidadoSF: true,
+      }];
+    }
+    // Sin cuenta de Caja/Bancos disponible: no hay dónde ajustar el
+    // consolidado — cae al comportamiento normal (pasivo) en vez de perder el
+    // registro por completo.
+  }
+
+  return [
     // tipoOrigen='Cobro Sucursal' (NO un tipo propio) — a propósito: solo así
     // pasa por `_extraerCobrosSucursal` (poliza.service.js), que arma columna
     // C = "SF" (por `reglaNombre`) SIN reconstruir el concepto — a diferencia
@@ -604,18 +714,11 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     // toma cualquier otro tipoOrigen), que SÍ reconstruye el concepto a partir
     // de `serie` — poner serie="SF" ahí corrompía el concepto a "cliente / SF"
     // en vez de "cliente / I0-260700186" (confirmado con el usuario 2026-08-04).
-    tipoOrigen:    'Cobro Sucursal',
     // 'SF-OCULTO' cuando se generó y se consumió por completo el mismo día
     // en el mismo almacén — ver `_prefetchSaldosFavorGenerados` — para que
     // `_extraerCobrosSucursal` la omita del export (sigue en poliza_movimientos).
-    reglaNombre:   reglaSF,
-    cfdiUuid:      cfdi.uuid,
-    cuentaFaltante: false,
-    debe: 0,
-  };
-  return [
-    { ...base, cuentaId: cuentaSaldoFavorId,    haber: subtotal },
-    { ...base, cuentaId: cuentaIvaSaldoFavorId, haber: iva },
+    { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: subtotal },
+    { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: iva },
   ];
 }
 
@@ -1374,11 +1477,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .map(u => u.toUpperCase())
       )
   );
-  // Ningún sustituto se contabiliza automático — todos se excluyen y se
-  // listan aparte (`sustitutos`) para revisión manual, ver
-  // _particionarSustitutosPorRiesgo.
+  // Sustitutos cuyo original es de un periodo ya cerrado (o no se pudo
+  // determinar su periodo) se excluyen y se listan aparte (`sustitutos`) para
+  // revisión manual — ver _particionarSustitutosPorRiesgo. Los del MISMO
+  // periodo (`mismoPeriodo`) se contabilizan automático más abajo: el
+  // sustituto entra normal al batch, y el original se agrega aparte con su
+  // asiento + reversión (ver `cfdisOriginalesCanceladosProp`).
   const sustitutosEnriquecidosProp = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinal));
-  const { excluidos: sustitutosProp } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosProp, { uuidsYaUsados, ejercicio, periodo });
+  const { excluidos: sustitutosClasificadosProp } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosProp, { uuidsYaUsados, ejercicio, periodo });
+  const sustitutosMismoPeriodoProp = sustitutosClasificadosProp.filter(s => s.mismoPeriodo);
+  const sustitutosProp = sustitutosClasificadosProp.filter(s => !s.mismoPeriodo);
   const _uuidsSustitutosExcluidosProp = new Set(sustitutosProp.map(s => s.uuid?.toUpperCase()).filter(Boolean));
 
   const cfdisSinPolizaFinalFiltradoSustituto = (_canceladosPorSustitutoProp.size || _uuidsSustitutosExcluidosProp.size)
@@ -1408,9 +1516,23 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Ingreso — ver _fetchNotasCreditoParaFusion. Se agregan al final del batch
   // 'I'; el resto del pipeline (matching de reglas, cfdiToMovimientos) ya
   // maneja tipos mixtos genéricamente.
-  const cfdisConNCProp = tipoCfdi === 'I'
+  const cfdisConNCSinReversionProp = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap: ccBySerieMapProp })]
     : cfdisSinPolizaFinalFiltrado;
+
+  // Originales cancelados-con-sustitución del MISMO periodo (ver
+  // `sustitutosMismoPeriodoProp` arriba) — se agregan al batch para que
+  // pasen por el mismo matching de reglas y `cfdiToMovimientos` que
+  // cualquier CFDI normal (su asiento "como si estuviera vigente"); el
+  // asiento de reversión que lo cancela se agrega después de generar todos
+  // los movimientos (ver `sustitutosMismoPeriodoProp` más abajo, tras el
+  // loop principal).
+  const cfdisOriginalesCanceladosProp = sustitutosMismoPeriodoProp.length
+    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoProp.flatMap(s => s.sustituyeA) } })
+        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
+        .lean()
+    : [];
+  const cfdisConNCProp = [...cfdisConNCSinReversionProp, ...cfdisOriginalesCanceladosProp];
 
   // Póliza de Pagos (Cobranza): ordenar por folio del Pago ascendente — sin
   // esto el orden es el que regresa Mongo (esencialmente arbitrario), lo que
@@ -1460,9 +1582,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
     cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
     if (cuentaCajaId && cuentaBancosId) {
-      // Acotado a la serie propia — el lado cobrador ya NO depende de
-      // ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio` y la cola
-      // `CobroSucursalPendiente`).
+      // Acotado a la serie propia para ESTA consulta — el lado cobrador ya no
+      // depende SOLO de ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio`
+      // y la cola `CobroSucursalPendiente`): cuando se genera por día, además
+      // se consulta directo por centro+fecha vía `centroPropioClave` (ver
+      // comentario en `construirMovimientosPuente`).
       const serieDelCentro = Object.entries(ccBySerieMapProp).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0];
       const cfdisParaPuente = (fechaInicio && fechaFin)
         ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
@@ -1481,6 +1605,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
         fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
         devsOcultosSF: devsOcultosSFProp,
+        centroPropioClave: serieDelCentro,
       });
       movsPuente = resultadoPuente.movimientos;
       facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
@@ -1754,7 +1879,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`).
     const lineasSaldoFavorProp = await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
-      cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp, cc: ccProp, rfc,
+      cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp,
+      cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
+      cc: ccProp, rfc,
     });
     for (const linea of lineasSaldoFavorProp) {
       movimientosResult.push(linea);
@@ -1766,8 +1893,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // asiento que exige el export CONTPAQ, la coexistencia deliberada
     // confirmada 2026-08-04 (ver docstring de `_inyectarSaldoFavorGenerado`)
     // — confirmado con el usuario 2026-08-10 que debe cuadrar por asiento.
+    // `_ajusteConsolidadoSF` (caso "mismo folio", 2026-08-13): esa línea no
+    // trae `haber` (es un Cargo negativo), así que se suma su `debe` en
+    // valor absoluto para seguir cerrando el mismo Abono con el mismo monto.
     if (lineasSaldoFavorProp.length > 0) {
-      const montoSaldoFavorProp = lineasSaldoFavorProp.reduce((s, l) => s + (Number(l.haber) || 0), 0);
+      const montoSaldoFavorProp = lineasSaldoFavorProp.reduce((s, l) =>
+        s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionProp = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionProp && montoSaldoFavorProp > 0) {
         movimientosResult.push({
@@ -1928,6 +2059,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   movimientosResult.push(...movsPuente);
 
+  // Reversión de originales cancelados-con-sustitución del mismo periodo (ver
+  // `sustitutosMismoPeriodoProp`/`cfdisOriginalesCanceladosProp` arriba): ya
+  // se generó su asiento normal (como si estuviera vigente, junto con el
+  // resto del batch); aquí se agrega el asiento contrario (debe/haber
+  // invertidos) que lo cancela — confirmado con el usuario 2026-08-13.
+  if (sustitutosMismoPeriodoProp.length) {
+    const uuidsOriginalesMismoPeriodoProp = new Set(sustitutosMismoPeriodoProp.flatMap(s => s.sustituyeA));
+    const reversionesProp = movimientosResult
+      .filter(m => m.cfdiUuid && uuidsOriginalesMismoPeriodoProp.has(m.cfdiUuid.toUpperCase()))
+      .map(m => ({
+        ...m,
+        debe:        m.haber,
+        haber:       m.debe,
+        tipoOrigen:  'Cancelación por Sustitución',
+        reglaNombre: `Reversión — ${m.reglaNombre ?? ''}`.trim(),
+      }));
+    movimientosResult.push(...reversionesProp);
+  }
+
   // 4. Construir propuesta (no guardada)
   // Si se generó para un día específico (fechaInicio), el encabezado debe
   // mostrar ESE día, no la fecha en la que se corrió la generación — si no,
@@ -1958,7 +2108,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     });
 
   const advertencias = [];
-  const _ncFusionadasProp = cfdisConNCProp.length - cfdisSinPolizaFinalFiltrado.length;
+  const _ncFusionadasProp = cfdisConNCSinReversionProp.length - cfdisSinPolizaFinalFiltrado.length;
   if (_ncFusionadasProp > 0) {
     advertencias.push(`${_ncFusionadasProp} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
   }
@@ -1989,6 +2139,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       advertencias.push(`  • ${s.uuid?.slice(0, 8)}… sustituye a ${s.sustituyeA.map(u => u.slice(0, 8)).join(', ')}… — ${motivoTxt}`);
     }
     if (sustitutosProp.length > 5) advertencias.push(`  … y ${sustitutosProp.length - 5} más`);
+  }
+  // Sustitutos del MISMO periodo: se contabilizaron automático (original con
+  // su asiento + reversión, sustituto normal) — solo informativo, no hace
+  // falta revisión manual.
+  if (sustitutosMismoPeriodoProp.length) {
+    advertencias.push(
+      `ℹ ${sustitutosMismoPeriodoProp.length} cancelación(es) con sustitución del mismo periodo contabilizada(s) automático (original + asiento de reversión, sustituto normal)`,
+    );
   }
   // Tickets de cajas con cobro real pero sin ninguna factura ligada — hoja
   // aparte "por facturar" (ver `_detectarPendientesPorFacturar`), nunca se
@@ -2219,11 +2377,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .map(u => u.toUpperCase())
       )
   );
-  // Ningún sustituto se contabiliza automático — todos se excluyen y se
-  // listan aparte (`sustitutos`) para revisión manual, ver
-  // _particionarSustitutosPorRiesgo.
+  // Sustitutos del mismo periodo se contabilizan automático (ver comentario
+  // equivalente en generarPropuesta) — los demás se excluyen y se listan
+  // aparte (`sustitutos`) para revisión manual, ver _particionarSustitutosPorRiesgo.
   const sustitutosEnriquecidosGuard = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinalGuard));
-  const { excluidos: sustitutosGuard } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosGuard, { uuidsYaUsados, ejercicio, periodo });
+  const { excluidos: sustitutosClasificadosGuard } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosGuard, { uuidsYaUsados, ejercicio, periodo });
+  const sustitutosMismoPeriodoGuard = sustitutosClasificadosGuard.filter(s => s.mismoPeriodo);
+  const sustitutosGuard = sustitutosClasificadosGuard.filter(s => !s.mismoPeriodo);
   const _uuidsSustitutosExcluidosGuard = new Set(sustitutosGuard.map(s => s.uuid?.toUpperCase()).filter(Boolean));
 
   const cfdisSinPolizaFinalGuardFiltradoSustituto = (_canceladosPorSustitutoGuard.size || _uuidsSustitutosExcluidosGuard.size)
@@ -2248,9 +2408,18 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Fusionar NC (tipo E) relacionadas a estas facturas en la MISMA póliza de
   // Ingreso — ver _fetchNotasCreditoParaFusion.
-  const cfdisConNCGuard = tipoCfdi === 'I'
+  const cfdisConNCSinReversionGuard = tipoCfdi === 'I'
     ? [...cfdisSinPolizaFinalGuardFiltrado, ...await _fetchNotasCreditoParaFusion(cfdisSinPolizaFinalGuardFiltrado, rfc, uuidsYaUsados, { ejercicio, periodo, fechaInicio, fechaFin, centroCostoId, ccBySerieMap })]
     : cfdisSinPolizaFinalGuardFiltrado;
+
+  // Originales cancelados-con-sustitución del mismo periodo — ver comentario
+  // equivalente en generarPropuesta.
+  const cfdisOriginalesCanceladosGuard = sustitutosMismoPeriodoGuard.length
+    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoGuard.flatMap(s => s.sustituyeA) } })
+        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
+        .lean()
+    : [];
+  const cfdisConNCGuard = [...cfdisConNCSinReversionGuard, ...cfdisOriginalesCanceladosGuard];
 
   // Ver comentario equivalente en generarPropuesta.
   if (tipoCfdi === 'P') {
@@ -2303,6 +2472,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
         rfc,
         devsOcultosSF: devsOcultosSFGuard,
+        centroPropioClave: serieDelCentroGuard,
       });
       movsPuenteGuard = resultadoPuenteGuard.movimientos;
       facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
@@ -2559,7 +2729,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // equivalente en generarPropuesta.
     const lineasSaldoFavorGuard = await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
-      cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard, cc, rfc,
+      cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard,
+      cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
+      cc, rfc,
     });
     for (const linea of lineasSaldoFavorGuard) {
       todosLosMovimientos.push(linea);
@@ -2567,7 +2739,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // Cierra el Abono de Caja/Bancos/Clientes de la Devolución — ver
     // comentario equivalente en generarPropuesta.
     if (lineasSaldoFavorGuard.length > 0) {
-      const montoSaldoFavorGuard = lineasSaldoFavorGuard.reduce((s, l) => s + (Number(l.haber) || 0), 0);
+      const montoSaldoFavorGuard = lineasSaldoFavorGuard.reduce((s, l) =>
+        s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionGuard = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionGuard && montoSaldoFavorGuard > 0) {
         todosLosMovimientos.push({
@@ -2692,11 +2865,35 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
     if (sustitutosGuard.length > 5) advertencias.push(`  … y ${sustitutosGuard.length - 5} más`);
   }
+  // Sustitutos del MISMO periodo: se contabilizaron automático — ver
+  // comentario equivalente en generarPropuesta.
+  if (sustitutosMismoPeriodoGuard.length) {
+    advertencias.push(
+      `ℹ ${sustitutosMismoPeriodoGuard.length} cancelación(es) con sustitución del mismo periodo contabilizada(s) automático (original + asiento de reversión, sustituto normal)`,
+    );
+  }
 
   // Cobros de sucursales — ya calculado arriba (antes del loop de reglas),
   // ver `movsPuenteGuard`. Se agrega ANTES de calcular folios para que entre
   // en el mismo cálculo de rango/chunking que el resto.
   todosLosMovimientos.push(...movsPuenteGuard);
+
+  // Reversión de originales cancelados-con-sustitución del mismo periodo —
+  // ver comentario equivalente en generarPropuesta. Se agrega ANTES de la
+  // transacción de guardado para que quede persistida junto con el resto.
+  if (sustitutosMismoPeriodoGuard.length) {
+    const uuidsOriginalesMismoPeriodoGuard = new Set(sustitutosMismoPeriodoGuard.flatMap(s => s.sustituyeA));
+    const reversionesGuard = todosLosMovimientos
+      .filter(m => m.cfdiUuid && uuidsOriginalesMismoPeriodoGuard.has(m.cfdiUuid.toUpperCase()))
+      .map(m => ({
+        ...m,
+        debe:        m.haber,
+        haber:       m.debe,
+        tipoOrigen:  'Cancelación por Sustitución',
+        reglaNombre: `Reversión — ${m.reglaNombre ?? ''}`.trim(),
+      }));
+    todosLosMovimientos.push(...reversionesGuard);
+  }
 
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
   // Si se generó para un día específico (fechaInicio), el encabezado debe
@@ -2781,7 +2978,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   const advertenciasFinal = [];
-  const _ncFusionadasGuard = cfdisConNCGuard.length - cfdisSinPolizaFinalGuardFiltrado.length;
+  const _ncFusionadasGuard = cfdisConNCSinReversionGuard.length - cfdisSinPolizaFinalGuardFiltrado.length;
   if (_ncFusionadasGuard > 0) {
     advertenciasFinal.push(`${_ncFusionadasGuard} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
   }
@@ -3060,4 +3257,5 @@ module.exports = {
   generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   _uuidsPorFechaEfectiva,
+  _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
 };

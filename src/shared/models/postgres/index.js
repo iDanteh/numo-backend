@@ -26,6 +26,7 @@ const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
+const Notificacion      = require('./Notificacion');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -42,6 +43,10 @@ Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimien
 PolizaMovimiento.belongsTo(Poliza,       { foreignKey: 'polizaId', as: 'poliza' });
 PolizaMovimiento.belongsTo(AccountPlan,  { foreignKey: 'cuentaId', as: 'cuenta' });
 AccountPlan.hasMany   (PolizaMovimiento, { foreignKey: 'cuentaId', as: 'movimientos' });
+
+/** Notificaciones (bandeja) */
+Notificacion.belongsTo(Poliza, { foreignKey: 'polizaId', as: 'poliza' });
+Poliza.hasMany(Notificacion,   { foreignKey: 'polizaId', as: 'notificaciones' });
 
 /** Centros de costo */
 PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
@@ -102,6 +107,20 @@ async function syncModels() {
   // Pólizas: force:false para no tocar ENUMs ni datos existentes.
   await Poliza.sync({ force: false });
   await PolizaMovimiento.sync({ force: false });
+
+  // Bandeja de notificaciones (ver Notificacion.js) — tabla nueva, force:false
+  // para solo crearla si no existe; depende de `polizas`, por eso va después.
+  // Ojo: si la tabla ya existe SIN alguna columna del modelo (ej. `resuelta`,
+  // agregada después), `.sync({force:false})` falla al intentar crear el
+  // índice de esa columna — por eso el ALTER de columnas nuevas va ANTES del
+  // único `.sync()`, nunca después.
+  await Notificacion.sequelize.query(`
+    ALTER TABLE notificaciones
+      ADD COLUMN IF NOT EXISTS resuelta     BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS resuelta_por VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS resuelta_at  TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN resuelta en notificaciones:', e.message));
+  await Notificacion.sync({ force: false });
 
   // Agregar columnas de auditoría si no existen (seguro correrlo múltiples veces)
   await Poliza.sequelize.query(`
@@ -283,4 +302,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ADD COLUMN empresa_rfcs (users):', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, syncModels };

@@ -26,6 +26,7 @@ const bankErpRoutes           = require('./banks/domains/erp/erp.routes');
 const userRoutes              = require('./banks/domains/users/user.routes');
 const polizaRoutes            = require('./banks/domains/polizas/poliza.routes');
 const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mapping.routes');
+const notificacionRoutes      = require('./banks/domains/notificaciones/notificacion.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -126,6 +127,7 @@ app.use('/api/erp',                  bankErpRoutes);
 app.use('/api/users',                userRoutes);
 app.use('/api/polizas',              polizaRoutes);
 app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
+app.use('/api/notificaciones',       notificacionRoutes);
 
 // Visor module
 app.use('/api/auth',              authRoutes);
@@ -182,6 +184,7 @@ const startServer = async () => {
   require('./visor/jobs/satSyncJob');
   require('./banks/jobs/erpSyncCron');
   require('./visor/jobs/credencialesAlertJob');
+  require('./visor/jobs/cfdiCanceladoNotificacionJob');
   try {
     await seed();
   } catch (err) {

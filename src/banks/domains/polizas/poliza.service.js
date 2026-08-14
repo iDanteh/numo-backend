@@ -998,6 +998,17 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   });
 }
 
+// Mismo literal que usa `_inyectarSaldoFavorGenerado` (cfdi-poliza-generator.
+// service.js) para el caso "mismo folio" (confirmado con el usuario
+// 2026-08-13): una Devolución cuyo saldo a favor generado se consumió por
+// completo contra la MISMA venta que lo generó — no es un pasivo real, es
+// caja que salió y volvió a entrar. Esa línea llega como un Cargo NEGATIVO a
+// Caja/Bancos; `consolidarCargos` necesita dejarla pasar su filtro inicial
+// (que de otro modo descarta cualquier `debe` que no sea > 0) para que reste
+// del total en vez de perderse — sin crear una fila propia en el export
+// (confirmado: "solo restarlo", sin desglose).
+const TIPO_ORIGEN_AJUSTE_CONSOLIDADO_SF = 'Ajuste Consolidado SF';
+
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
@@ -1006,7 +1017,8 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   const depositosIdentificados = []; // forma de pago sin mapear + depósito real ligado en Bancos — va al final
 
   for (const m of movs) {
-    if (!(Number(m.debe) > 0)) continue;
+    const esAjusteConsolidadoSF = m.tipoOrigen === TIPO_ORIGEN_AJUSTE_CONSOLIDADO_SF;
+    if (!(Number(m.debe) > 0) && !esAjusteConsolidadoSF) continue;
     // Refacturación (factura que reemplaza una venta cancelada, ver
     // `esRefacturacion` en cfdi-poliza-generator.service.js): su cargo
     // (dinero en banco/caja) ya quedó contabilizado en el asiento de la

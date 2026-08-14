@@ -86,6 +86,11 @@ async function _getConReintento(url, params, logLabel) {
 const TTL_CACHE_MS = 20 * 60 * 1000;
 const _cacheAlmacen     = new Map(); // clave → { data, ts }
 const _cacheSaldosFavor = new Map();
+// Caché de las variantes "por centro + rango de fechas" (ver
+// obtenerDesglosesCobroAlmacenPorCentro/obtenerSaldosFavorPorCentro) — clave
+// distinta a la de series/folios porque el criterio de búsqueda es otro.
+const _cacheAlmacenPorCentro     = new Map();
+const _cacheSaldosFavorPorCentro = new Map();
 
 function _claveLote(rfc, series, folios) {
   const pares = series.map((s, i) => `${s}|${folios[i]}`).sort();
@@ -172,4 +177,78 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   return cuentas;
 }
 
-module.exports = { sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor };
+// Consulta, por CENTRO (clave de serie de facturación, ej. "A0"/"B0"/"E0") y
+// rango de fechas (ISO, ej. "2024-01-01T00:00:00Z"), todos los cobros de
+// almacén hechos FÍSICAMENTE en ese centro — a diferencia de
+// `obtenerDesglosesCobroAlmacen` (que requiere conocer de antemano series y
+// folios de los documentos relacionados), esta variante no depende de que la
+// sucursal VENDEDORA ya se haya generado: permite a la sucursal COBRADORA
+// descubrir directamente lo que cobró de otras sucursales sin pasar por la
+// cola `CobroSucursalPendiente` (ver cobros-sucursal-puente.service.js).
+// Ya liberado en producción (confirmado con el usuario 2026-08-14) —
+// ERP_CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
+// igual que el resto de los endpoints de este archivo.
+async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
+  if (!ERP_CAJA_BASE_URL) {
+    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
+  }
+  if (!rfc) throw new Error('obtenerDesglosesCobroAlmacenPorCentro: rfc requerido (aísla la caché por empresa)');
+  if (!centro || !fechaDesde || !fechaHasta) return [];
+
+  const clave = `${rfc}::${centro}::${fechaDesde}::${fechaHasta}`;
+  const cacheado = _leerCache(_cacheAlmacenPorCentro, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  let response;
+  try {
+    response = await _getConReintento(`${ERP_CAJA_BASE_URL}/desgloses-cobro/almacen`, {
+      centro, fechaDesde, fechaHasta,
+    }, '/desgloses-cobro/almacen (por centro)');
+  } catch (axErr) {
+    const status = axErr.response?.status;
+    const body   = JSON.stringify(axErr.response?.data ?? {});
+    const { logger } = require('../../../shared/utils/logger');
+    logger.error(`[ErpSync] ERP /desgloses-cobro/almacen (por centro) ${status}: ${body} | centro=${centro} fechaDesde=${fechaDesde} fechaHasta=${fechaHasta}`);
+    throw axErr;
+  }
+
+  const cuentas = response.data?.Data?.cuentas || [];
+  _cacheAlmacenPorCentro.set(clave, { data: cuentas, ts: Date.now() });
+  return cuentas;
+}
+
+// Misma idea que `obtenerDesglosesCobroAlmacenPorCentro`, para saldos a
+// favor generados/usados en un centro y rango de fechas — ver notas ahí.
+async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
+  if (!ERP_CAJA_BASE_URL) {
+    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
+  }
+  if (!rfc) throw new Error('obtenerSaldosFavorPorCentro: rfc requerido (aísla la caché por empresa)');
+  if (!centro || !fechaDesde || !fechaHasta) return [];
+
+  const clave = `${rfc}::${centro}::${fechaDesde}::${fechaHasta}`;
+  const cacheado = _leerCache(_cacheSaldosFavorPorCentro, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  let response;
+  try {
+    response = await _getConReintento(`${ERP_CAJA_BASE_URL}/desgloses-cobro/saldos-favor`, {
+      centro, fechaDesde, fechaHasta,
+    }, '/desgloses-cobro/saldos-favor (por centro)');
+  } catch (axErr) {
+    const status = axErr.response?.status;
+    const body   = JSON.stringify(axErr.response?.data ?? {});
+    const { logger } = require('../../../shared/utils/logger');
+    logger.error(`[ErpSync] ERP /desgloses-cobro/saldos-favor (por centro) ${status}: ${body} | centro=${centro} fechaDesde=${fechaDesde} fechaHasta=${fechaHasta}`);
+    throw axErr;
+  }
+
+  const cuentas = response.data?.Data?.cuentas || [];
+  _cacheSaldosFavorPorCentro.set(clave, { data: cuentas, ts: Date.now() });
+  return cuentas;
+}
+
+module.exports = {
+  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
+  obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
+};

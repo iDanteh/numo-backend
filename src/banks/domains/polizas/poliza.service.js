@@ -431,6 +431,12 @@ async function _resolverCuentasBancoReal(poliza) {
   for (const m of poliza.movimientos) {
     if (!m.cfdiUuid) continue;
     if (CODIGOS_CUENTA_BANCO_REAL.has(m.cuenta?.codigo)) continue; // ya es cuenta real
+    // Efectivo (01) y Tarjeta (04/28) NUNCA se reasignan al banco real —
+    // una Factura Global agrupa ~150 tickets con formas de pago mixtas bajo
+    // un solo cfdiUuid; si la Transferencia de esa FG está ligada a Banamex,
+    // sin este filtro todos los movimientos (Efectivo y Tarjeta incluidos)
+    // se irían a Banamex en lugar de quedar en CAJA/BANCOS genérico.
+    if (['01', '04', '28'].includes(m.formaPago)) continue;
     const info = verdadBancaria.get(m.cfdiUuid.toUpperCase());
     if (info?.cuentaBanco?.id) {
       actualizaciones.push({ movimientoId: m.id, cuentaId: info.cuentaBanco.id });
@@ -519,6 +525,14 @@ async function resolverCuentasPorCfdisIdentificados(uuids, bancoNombre) {
   for (const m of movimientos) {
     if (m.poliza?.estado === 'cancelada') continue;
     if (!CODIGOS_CUENTA_PUENTE.has(m.cuenta?.codigo)) continue;
+    // Efectivo (01) y Tarjeta (04/28) no se remapean al banco real — igual
+    // que se quitó el override de verdadBancaria en el export (2026-08-14).
+    // Una FG agrupa ~150 tickets con formas de pago mixtas bajo un solo UUID;
+    // remapear por UUID completo pierde esa distinción y manda Efectivo a
+    // Bancos y Tarjeta al banco específico cuando deben quedar en CAJA/BANCOS
+    // genérico. Solo Transferencias (y formas de pago sin código específico)
+    // se remapean al banco real confirmado (confirmado con el usuario 2026-08-15).
+    if (['01', '04', '28'].includes(m.formaPago)) continue;
     if (!porPoliza.has(m.polizaId)) porPoliza.set(m.polizaId, []);
     porPoliza.get(m.polizaId).push({ movimientoId: m.id, cuentaId: cuentaBanco.id });
   }
@@ -1393,6 +1407,18 @@ function _categoriaCobroSucursal(f) {
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
+  // Pre-calcular los conceptos de las entradas 'Cobro Sucursal' (haber) para
+  // poder identificar y también extraer el DEBE correspondiente ('Venta') del
+  // mismo par. Sin esto, el DEBE queda en `resto` → `consolidarCargos` →
+  // "Depósitos consolidados", inflando el total con montos que se cancelan
+  // contra el haber del cobro-sucursal (el par neto es 0 en CAJA, pero solo
+  // el haber se extraía, dejando el debe suelto en el consolidado).
+  const _conceptosCobroSucursal = new Set(
+    movimientos
+      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0))
+      .map(m => m.concepto)
+      .filter(Boolean),
+  );
   for (const m of movimientos) {
     // Las líneas de Saldo a Favor de un Pago (tipoComprobante='P',
     // `esSplitPagoPorFactura` en cfdi-mapping.service.js) también llevan
@@ -1404,7 +1430,30 @@ function _extraerCobrosSucursal(movimientos) {
     // sueltas en vez de agrupadas por factura).
     const esCargoEspecialDePago = m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.tipoComprobante === 'P';
     if (esCargoEspecialDePago) { resto.push(m); continue; }
-    if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
+    // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
+    // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
+    // Va a filas con el mismo concepto que su HABER correspondiente para que
+    // el cuadre CONTPAQ se mantenga dentro de la sección cobros-sucursal.
+    if (m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
+        && m.concepto && _conceptosCobroSucursal.has(m.concepto)) {
+      filas.push({
+        cuenta:             m.cuenta,
+        serie:              m.serie || '',
+        concepto:           m.concepto || '',
+        centroCosto:        m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        debe:               Number(m.debe),
+        haber:              0,
+        cfdiUuid:           null,
+        metodoPago:         m.metodoPago ?? null,
+        _subcodigo:         0,
+        _categoria:         null,
+        _formaPagoLabel:    m.reglaNombre || null,
+        _referenciaBancoReal: null,
+        _esPendientePropio: false,
+      });
+      continue;
+    }
+    if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== 'Venta Sin Cobro' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
     if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO) continue;
     // OJO: NO usar `verdadBancaria`/`construirVerdadBancaria` aquí (busca por
     // `cfdiUuid`, sin distinguir vendedor/cobrador) — para una factura PPD,

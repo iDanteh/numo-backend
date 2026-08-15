@@ -26,6 +26,23 @@ const TIPO_ORIGEN_CARGO_ESPECIAL = 'Cargo Especial';
 // `esCasoNormalParaSplit` en `cfdiToMovimientos`.
 const CODIGO_CUENTA_CAJA   = '1101010003';
 const CODIGO_CUENTA_BANCOS = '1102011005';
+// Cuentas bancarias específicas (igual que `BANCO_A_CODIGO_CUENTA` en
+// poliza.service.js — duplicado a propósito). Una regla que apunte a
+// cualquiera de estas cuentas se trata igual que si apuntara a la cuenta
+// genérica CAJA/BANCOS para el split de `splitPorFormaPagoReal`: Efectivo →
+// CAJA, todo lo demás → BANCOS genérico. El mapping banco-real se hace
+// DESPUÉS (en poliza.service.js, vía verdadBancaria) solo para Transferencias,
+// no para Tarjeta/Efectivo (confirmado con el usuario 2026-08-15).
+const CODIGOS_CUENTAS_CAJA_O_BANCO = new Set([
+  '1101010003', // CAJA
+  '1102011005', // BANCOS (genérico, "por identificar")
+  '1102011001', // BBVA
+  '1102012001', // Banamex
+  '1102013001', // Santander
+  '1102014001', // Banorte
+  '1102015001', // Scotiabank
+  '1102016001', // Azteca
+]);
 // Saldo a Favor / monedero Club Tuberos — mismos códigos y mismo split 16%
 // (subtotal + IVA) que ya usa cobros-sucursal-puente.service.js. Necesarios
 // aquí porque el desglose REAL de cajas puede traer estas formas de pago
@@ -727,7 +744,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // abajo, que le da al caller una señal explícita en vez de esa
   // reconstrucción frágil).
   const gateBase = !esAnticipo && !esAplicacionSaldo && rule.tasaIva !== 'mixto'
-    && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo);
+    && CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo);
 
   // Ajuste por Saldo a Favor/Puntos REALMENTE usados en esta factura —
   // corrección del mismo día (2026-08-06): ya NO se detectan escaneando
@@ -740,6 +757,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // cfdi-poliza-generator.service.js).
   const montoSFUsado     = Number(context.saldoFavorUsadoPropio?.monto) || 0;
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
+
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
     && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_CLUB_TUBEROS];
 
@@ -891,8 +909,32 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // encontrada) — se reutiliza el mismo helper.
     splitPorFormaPagoReal(montoCargo);
   } else {
+    // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
+    // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta
+    // se cobró en OTRA sucursal. El cargo a la cuenta puente se marca como
+    // 'Cobro Sucursal' para que _extraerCobrosSucursal (poliza.service.js)
+    // lo extraiga como "registro aparte" y NO llegue a consolidarCargos
+    // (que armaría el consolidado de Efectivo/Tarjeta con dinero que no
+    // se recibió físicamente aquí). La otra sucursal cobrador incluirá
+    // el depósito real en su propio poliza vía cobrosCobradoraDirecta.
+    const sinCobrosEnSucursal = gateBase
+      && Array.isArray(context.desglosePagoReal)
+      && context.desglosePagoReal.length === 0;
+    // Cuando gateBase=true (regla apunta a Caja/Bancos, genérica o específica
+    // como Banamex/BBVA), el cargo de fallback debe ir a CAJA (Efectivo) o
+    // BANCOS genérico (cualquier otra formaPago), no a la cuenta específica.
+    // Esto cubre el caso donde desglosePagoReal está vacío/null (sin cobros
+    // ERP para este CFDI) pero la regla apuntaba a un banco real
+    // (confirmado con el usuario 2026-08-15: FG con cuentaCargo=1102012001
+    // aparecía como "Depósitos consolidados (Efectivo/Tarjeta)" en Banamex
+    // en vez de en CAJA/BANCOS por identificar).
+    const _esEfectivoCfdi = (cfdi.formaPago ?? '') === '01';
+    const _cuentaIdFallback = gateBase
+      ? ((_esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS])
+          ?? cuentaMap[rule.cuentaCargo] ?? null)
+      : (cuentaMap[rule.cuentaCargo] ?? null);
     movs.push({
-      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      cuentaId:    _cuentaIdFallback,
       concepto,
       centroCosto,
       ventaFecha,
@@ -903,6 +945,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       rfcTercero,
       _esCargoPrincipal: true,
       ...(esAplicacionSaldo && !rule.cuentaCargo2 ? { _saldoUsado: montoCargo } : {}),
+      ...(sinCobrosEnSucursal ? { tipoOrigen: 'Venta Sin Cobro' } : {}),
     });
   }
 
@@ -1324,7 +1367,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ...m,
     ...satMeta,
     ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
-    ...(m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre } : {}),
+    ...(
+      m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL
+        ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }
+        : m.tipoOrigen === 'Venta Sin Cobro'
+          ? { tipoOrigen: 'Venta Sin Cobro' }
+          : {}
+    ),
   }));
 }
 

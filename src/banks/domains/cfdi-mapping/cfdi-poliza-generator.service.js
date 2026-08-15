@@ -576,6 +576,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // bloqueando ese caso (confirmado con el usuario 2026-08-14).
         const diffDias = _diferenciaDiasMx(cobro.fecha, diaCfdi);
         if (diaCfdi && (diffDias === null || diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA)) continue;
+        // Cobro cruzado de sucursal (2026-08-14, caso real Ferrocarril
+        // 09/07/2026): un ticket de la Factura Global de ESTA sucursal puede
+        // haberse cobrado FÍSICAMENTE en otra (`cobro.claveCentro` distinto
+        // de `centroPropioClave`) — ej. $9,159.56 en Tarjeta cobrados en C0
+        // pero facturados en la Global de Ferrocarril (F0). Ese dinero no es
+        // parte del Efectivo/Tarjeta de ESTA sucursal — el cruce ya lo
+        // maneja aparte `cobros-sucursal-puente.service.js` (cuenta puente +
+        // encolado para la sucursal cobradora). Sin este filtro, se sumaba
+        // por partida doble: como Cargo normal aquí Y como cruce allá.
+        if (centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
         // 'CBT' NO es exclusivamente Puntos/Club Tuberos — confirmado con
         // datos reales 2026-08-06: un mismo cobro CBT puede traer

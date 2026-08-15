@@ -1131,7 +1131,12 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                         tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
                         emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
                         receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '', usoCFDI: row.usoCFDI || '' },
-                        lastComparisonStatus: 'not_in_erp',
+                        // Recibidos jamás tienen contraparte en nuestro ERP —
+                        // "not_in_erp" ahí no es una discrepancia real (ver
+                        // nota en guardarResultados). Se deja sin status en
+                        // vez de marcarlo, para no contaminar los reportes de
+                        // conciliación (que son solo de Emitidos).
+                        lastComparisonStatus: esRecibidos ? null : 'not_in_erp',
                         lastComparisonAt:     new Date(),
                       },
                       // ejercicio/periodo solo en inserción — preserva reclasificaciones previas
@@ -1173,7 +1178,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                         xmlHash:              c.xmlHash,
                         timbreFiscalDigital:  c.timbreFiscalDigital,
                         complementoPago:      c.complementoPago,
-                        lastComparisonStatus: 'not_in_erp',
+                        lastComparisonStatus: esRecibidos ? null : 'not_in_erp',
                         lastComparisonAt:     new Date(),
                       },
                       // ejercicio/periodo solo en inserción — preserva reclasificaciones previas
@@ -1313,7 +1318,7 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                           tipoDeComprobante:    EFECTO_MAP[row.efecto] || row.efecto || '',
                           emisor:               { rfc: (row.rfcEmisor   || '').toUpperCase(), nombre: row.nombreEmisor   || '' },
                           receptor:             { rfc: (row.rfcReceptor || '').toUpperCase(), nombre: row.nombreReceptor || '', usoCFDI: row.usoCFDI || '' },
-                          lastComparisonStatus: erpUuids.has((row.uuid || '').toUpperCase()) ? 'match' : 'not_in_erp',
+                          lastComparisonStatus: erpUuids.has((row.uuid || '').toUpperCase()) ? 'match' : (esRecibidos ? null : 'not_in_erp'),
                           lastComparisonAt:     new Date(),
                         },
                         $setOnInsert: { ejercicio, periodo },
@@ -1465,6 +1470,14 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
 const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid = [], ejercicio, periodo }) => {
   const ahora = new Date();
   const fp    = { ejercicio, periodo };
+  // Recibidos (facturas de proveedores) NUNCA tienen contraparte en nuestro
+  // ERP (que solo registra lo que NOSOTROS facturamos) — "solo en SAT" es el
+  // resultado esperado siempre, no una discrepancia real. Antes esto
+  // marcaba `not_in_erp` + creaba un Discrepancy MISSING_IN_ERP para cada
+  // factura recibida descargada, contaminando los reportes de conciliación
+  // (que son solo de Emitidos) con ruido — mismo bug ya corregido del lado
+  // de lectura en report.controller.js/comparison.controller.js.
+  const esRecibidos = tipoComprobante === 'Recibidos' || (tipoComprobante ?? '').startsWith('Recibidos');
 
   // ── Coinciden — bulkWrite (puede ser la mayoría de 30k CFDIs) ─────────────
   if (coinciden.length > 0) {
@@ -1494,7 +1507,7 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
   }
 
   // ── Solo en SAT — bulkWrite Comparison + Discrepancy ─────────────────────
-  if (soloEnSAT.length > 0) {
+  if (soloEnSAT.length > 0 && !esRecibidos) {
     await Comparison.bulkWrite(soloEnSAT.map(cfdi => ({
       updateOne: {
         filter: { uuid: cfdi.uuid },

@@ -7,6 +7,7 @@ const { batchCompareCFDIs, formatSessionName } = require('../services/comparison
 const { asyncHandler } = require('../../shared/middleware/error-handler');
 const { paginate, skip } = require('../utils/pagination');
 const { clearDashboardCache } = require('./report.controller');
+const entityRepo = require('../repositories/entity.repository');
 
 /**
  * GET /api/comparisons/ejercicios/resumen
@@ -219,8 +220,13 @@ const batch = asyncHandler(async (req, res) => {
 
   // Buscar también CFDIs SAT/MANUAL del mismo periodo para detectar los que no están en ERP
   // — excluye los ya conciliados manualmente, ver comentario en compareSATOnlyCFDI
-  // (comparisonEngine.js) sobre por qué no deben volver a compararse.
-  const satFilter = { source: { $in: ['SAT', 'MANUAL'] }, isActive: true, lastComparisonStatus: { $ne: 'conciliado' } };
+  // (comparisonEngine.js) sobre por qué no deben volver a compararse. También
+  // excluye Recibidos (emisor ajeno) — este botón compara EMITIDOS vs ERP,
+  // los Recibidos nunca tienen contraparte ERP y quedaban marcados
+  // `not_in_erp` por error (mismo bug ya corregido en report.controller.js:
+  // notInErp/discrepanciasMontos/discrepanciasCriticas/conciliacionExcel).
+  const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+  const satFilter = { source: { $in: ['SAT', 'MANUAL'] }, isActive: true, lastComparisonStatus: { $ne: 'conciliado' }, 'emisor.rfc': { $in: entidadesRfcs } };
   if (cfdiFilter.ejercicio)          satFilter.ejercicio          = cfdiFilter.ejercicio;
   if (cfdiFilter.periodo)            satFilter.periodo            = cfdiFilter.periodo;
   if (cfdiFilter.tipoDeComprobante)  satFilter.tipoDeComprobante  = cfdiFilter.tipoDeComprobante;

@@ -872,11 +872,38 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // remanente NUNCA cambia (el prorrateo ancla en `restante`, no en la suma
     // del desglose — ver `splitPorFormaPagoReal`), así que esto solo afecta
     // la PROPORCIÓN Efectivo/Tarjeta, nunca el cuadre del asiento.
+    //
+    // Corrección 2026-08-16 (caso real Ferrocarril F0|260800117):
+    // cuando `restante > totalFormasPagoReal`, prorratear `restante` directo
+    // infla cada renglón dp por encima de su monto real — la diferencia es
+    // la cobranza de otra sucursal (incluida en montoCargo vía
+    // facturasVendedorCubiertas pero AUSENTE del desglosePagoReal de este
+    // centro). Se empuja primero el exceso como línea CAJA aparte para que
+    // la reducción greedy de montoCubierto la consuma antes que los renglones
+    // dp; luego se distribuyen esos renglones con sus montos ABSOLUTOS
+    // (splitPorFormaPagoReal anclado en totalFormasPagoReal, no en restante).
+    // El total del asiento no cambia.
     const remanenteConfiableParaSplit = Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
       && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
     const extraRemanente = montoPuntosAplicado > 0 ? { _puntosUsado: montoPuntosAplicado } : {};
     if (remanenteConfiableParaSplit && restante > 0) {
-      splitPorFormaPagoReal(restante, extraRemanente);
+      const excesoCubrir = totalFormasPagoReal > 0
+        ? parseFloat((restante - totalFormasPagoReal).toFixed(2))
+        : 0;
+      if (excesoCubrir > 0.01 && totalFormasPagoReal > 0) {
+        movs.push({
+          cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
+          concepto, centroCosto, ventaFecha, serie: serieCfdi,
+          debe:        excesoCubrir,
+          haber:       0,
+          cfdiUuid:    cfdi.uuid,
+          rfcTercero,
+          _esCargoPrincipal: true,
+        });
+        splitPorFormaPagoReal(totalFormasPagoReal, extraRemanente);
+      } else {
+        splitPorFormaPagoReal(restante, extraRemanente);
+      }
     } else {
       // Se empuja SIEMPRE, aunque sea $0 (factura pagada 100% con SF/Puntos)
       // para que el marcador `_puntosUsado` tenga dónde ir — no rompe el
@@ -907,7 +934,35 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // caso real VENTAS SUC.HIDALGO). Idéntico al split del remanente de
     // `esCasoAjusteSFPuntos` (ancla en `montoCargo`, no en la suma
     // encontrada) — se reutiliza el mismo helper.
-    splitPorFormaPagoReal(montoCargo);
+    //
+    // Corrección 2026-08-16 (caso real Ferrocarril F0|260800107/109):
+    // cuando `montoCargo > totalFormasPagoReal`, prorratear directo infla
+    // los renglones dp (igual que en `esCasoAjusteSFPuntos`). La diferencia
+    // representa cobros no registrados en desglosePagoReal de esta sucursal
+    // (otra sucursal, complemento de pago aún no procesado, discrepancia ERP).
+    // Se empuja el exceso como línea CAJA con `tipoOrigen: 'Venta Sin Cobro'`
+    // para que `_extraerCobrosSucursal` (poliza.service.js) la saque del
+    // pipeline de consolidación Efectivo/Tarjeta; los renglones dp se
+    // distribuyen con sus montos ABSOLUTOS (anclado en `totalFormasPagoReal`).
+    // El total del asiento no cambia.
+    const excesoCasoNormal = totalFormasPagoReal > 0
+      ? parseFloat((montoCargo - totalFormasPagoReal).toFixed(2))
+      : 0;
+    if (excesoCasoNormal > 0.01 && totalFormasPagoReal > 0) {
+      movs.push({
+        cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
+        concepto, centroCosto, ventaFecha, serie: serieCfdi,
+        debe:        excesoCasoNormal,
+        haber:       0,
+        cfdiUuid:    cfdi.uuid,
+        rfcTercero,
+        _esCargoPrincipal: true,
+        tipoOrigen:  'Venta Sin Cobro',
+      });
+      splitPorFormaPagoReal(totalFormasPagoReal);
+    } else {
+      splitPorFormaPagoReal(montoCargo);
+    }
   } else {
     // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
     // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta

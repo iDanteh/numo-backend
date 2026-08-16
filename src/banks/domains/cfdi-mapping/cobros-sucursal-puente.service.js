@@ -580,6 +580,15 @@ async function construirMovimientosPuente({
       });
       for (const c of cuentasDirecto) {
         if (c.cuentaId && cuentasIdsConocidas.has(c.cuentaId)) continue;
+        // Omitir entradas cuya sucursal VENDEDORA sea esta misma sucursal (o
+        // no identificable): ese cobro ya lo contabiliza el flujo normal de
+        // CFDI; incluirlo aquí lo duplicaría en el consolidado.
+        // — Si serieFactura es null no podemos saber quién vendió → se omite.
+        // — Si serieFactura === centroPropioClave el vendedor soy yo → se omite.
+        //   (el filtro en el loop principal usa ccBySerieMap, que puede no tener
+        //   la clave si el registro CentroCosto no tiene serieFacturacion definida
+        //   — esta comparación directa es más robusta, confirmado 2026-08-15.)
+        if (!c.serieFactura || c.serieFactura === centroPropioClave) continue;
         // Filtrar a solo los cobros que ocurrieron físicamente en ESTE centro.
         // El endpoint puede devolver el historial COMPLETO de un ticket,
         // incluyendo cobros en otros centros (ej. un ticket de Hidalgo que

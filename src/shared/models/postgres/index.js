@@ -73,12 +73,18 @@ async function syncModels() {
   // agotan la memoria compartida de locks/catálogo (error "memoria compartida
   // agotada" / "out of shared memory", típico con max_locks_per_transaction
   // bajo en instancias de desarrollo).
-  await User.sync({ alter: !isProd });
-  await BankConfig.sync({ alter: !isProd });
-  await BankRule.sync({ alter: !isProd });
-  await Entity.sync({ alter: !isProd });
-  await Permission.sync({ alter: !isProd });
-  await Role.sync({ alter: !isProd });
+  // Try-catch: en dev, `alter:true` puede fallar si pg tiene max_locks bajo;
+  // la tabla ya existe → el servidor arranca igualmente.
+  const syncAlter = async (model) => {
+    try { await model.sync({ alter: !isProd }); }
+    catch (e) { console.warn(`[syncModels] ${model.name}.sync alter falló (tabla ya existe): ${e.message}`); }
+  };
+  await syncAlter(User);
+  await syncAlter(BankConfig);
+  await syncAlter(BankRule);
+  await syncAlter(Entity);
+  await syncAlter(Permission);
+  await syncAlter(Role);
 
   // Columna intercompañía en entidades (idempotente)
   await Poliza.sequelize.query(`
@@ -96,13 +102,13 @@ async function syncModels() {
   await CobroSucursalPendiente.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
-  await AccountPlan.sync({ alter: !isProd });
+  await syncAlter(AccountPlan);
 
   // PeriodoFiscal depende de users
-  await PeriodoFiscal.sync({ alter: !isProd });
+  await syncAlter(PeriodoFiscal);
 
   // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
-  await CfdiMappingRule.sync({ alter: !isProd });
+  await syncAlter(CfdiMappingRule);
 
   // Pólizas: force:false para no tocar ENUMs ni datos existentes.
   await Poliza.sync({ force: false });

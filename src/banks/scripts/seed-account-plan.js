@@ -5548,6 +5548,13 @@ const CENTROS_COSTO = [
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function seedCuentas() {
+  // Si ya existen cuentas, no re-sembrar (evita 2000+ queries lentas al reiniciar)
+  const count = await AccountPlan.count();
+  if (count >= CUENTAS.length) {
+    console.log(`[seed-account-plan] ${count} cuentas ya existen — sin cambios.`);
+    return;
+  }
+
   // Primer paso: upsert de todas las cuentas sin parentId
   for (const c of CUENTAS) {
     await AccountPlan.upsert(

@@ -58,7 +58,7 @@ async function _getConReintento(url, params, logLabel) {
       return await axios.get(url, {
         params,
         headers: { Authorization: `Bearer ${ERP_TOKEN}` },
-        timeout: 15000,
+        timeout: 30000,
       });
     } catch (axErr) {
       const status    = axErr.response?.status;

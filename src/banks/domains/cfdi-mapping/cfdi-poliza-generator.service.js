@@ -765,7 +765,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
           if (monto <= 0) continue;
-          cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k });
+          cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, folioOrigen: cobro.folioOrigen ?? null });
         }
       }
     }
@@ -776,11 +776,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const serFolPairs = clavesUnicas.map(cv => { const [s, f] = cv.split('|'); return { serie: s, folio: f }; });
       const cfdisFac = await CFDI.find(
         { $or: serFolPairs },
-        { serie: 1, folio: 1, 'receptor.nombre': 1 },
+        { serie: 1, folio: 1, 'receptor.nombre': 1, uuid: 1 },
       ).lean();
       const nombrePorClave = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.receptor?.nombre ?? null]));
+      const uuidPorClave   = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.uuid ?? null]));
       for (const entry of cobrosCobradoraDirecta) {
-        entry.nombre = nombrePorClave.get(entry.claveFac) ?? null;
+        entry.nombre    = nombrePorClave.get(entry.claveFac) ?? null;
+        entry.cfdiUuid  = uuidPorClave.get(entry.claveFac)   ?? null;
       }
     }
   }
@@ -1796,7 +1798,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     : cfdisSinPolizaFinalFiltradoSustituto;
 
   if (centroCostoId && cfdisSinPolizaFinalFiltrado.length === 0) {
-    throw new BadRequestError('No hay CFDIs sin póliza para la sucursal seleccionada en este periodo');
+    const totalSinPoliza = cfdisSinPolizaFinalFiltradoSustituto.length;
+    const totalCfdis     = cfdis.length;
+    const totalUsados    = cfdis.filter(c => uuidsYaUsados.has(c.uuid)).length;
+    const seriesEncontradas = [...new Set(cfdisSinPolizaFinalFiltradoSustituto.map(c => c.serie).filter(Boolean))].join(', ') || '(ninguna)';
+    throw new BadRequestError(
+      `No hay CFDIs sin póliza para la sucursal seleccionada en este periodo. ` +
+      `(Total CFDIs del periodo: ${totalCfdis}, ya en póliza: ${totalUsados}, sin póliza: ${totalSinPoliza}, series disponibles: ${seriesEncontradas})`,
+    );
   }
 
   // Fusionar NC (tipo E) relacionadas a estas facturas en la MISMA póliza de
@@ -2378,12 +2387,35 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   if (cobrosCobradoraDirectaProp.length > 0 && _ccCobradora) {
     const cuentaCajaIdDir   = cuentaMap[CODIGO_CUENTA_CAJA]   ?? null;
     const cuentaBancosIdDir = cuentaMap[CODIGO_CUENTA_BANCOS] ?? null;
-    for (const { claveSat, monto, claveFac, nombre } of cobrosCobradoraDirectaProp) {
+    // Cobros que la cola CobroSucursalPendiente ya procesó (vendedora generó
+    // primero y encoló el dato para la cobradora). Deduplica por UUID del CFDI:
+    // el UUID es la clave SAT universal y está en la cola (cfdiUuid del vendedor)
+    // y en MongoDB (consultado más arriba en _prefetchAjustesFacturaPropia).
+    // El folioOrigen del ERP sirve de fallback por si el UUID no está disponible.
+    // NOTE: series/folios NO son confiables como clave de dedup porque el queue
+    // usa serieFolioTicket="serieVenta-folioVenta" (número interno de ticket) y
+    // cobrosCobradoraDirecta usa claveFac="serieFactura|folioFactura" (folio SAT)
+    // — son sistemas de numeración distintos (bug confirmado 2026-08-15).
+    const _uuidsYaEnPuente = new Set(
+      movsPuente
+        .filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.cfdiUuid)
+        .map(m => m.cfdiUuid.toUpperCase()),
+    );
+    const _foliosYaEnPuente = new Set(
+      movsPuente.filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.folio != null).map(m => String(m.folio)),
+    );
+    for (const { claveSat, monto, claveFac, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaProp) {
       const esEfe     = claveSat === '01';
       const cuentaDir = esEfe ? cuentaCajaIdDir : cuentaBancosIdDir;
       if (!cuentaDir || monto <= 0) continue;
       const [_serie, _folio] = (claveFac ?? '').split('|');
       const _serFol = _serie && _folio ? `${_serie}-${_folio}` : (claveFac ?? '');
+      // Saltar si la cola ya tiene este cobro — el DEBE+HABER de cobradora
+      // ya lo generó `construirMovimientosPuente` (en movsPuente arriba).
+      // Incluirlo aquí también inflaría el consolidado por partida doble
+      // (bug real: Hidalgo EFECTIVO $215k vs $147k esperado, 2026-08-15).
+      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) continue;
+      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) continue;
       const _concepto = nombre ? `${nombre} / ${_serFol}` : _serFol;
       const baseDir = {
         cuentaId:      cuentaDir,
@@ -2394,9 +2426,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         cfdiUuid:      null,
         formaPago:     claveSat || null,
       };
-      // Cargo: tipoOrigen neutral → consolidarCargos → Efectivo/Tarjeta
-      // Abono: 'Cobro Sucursal' → _extraerCobrosSucursal lo saca aparte
-      movimientosResult.push({ ...baseDir, tipoOrigen: 'Venta',          debe: monto,  haber: 0     });
+      // DEBE: Cargo a Caja/Bancos — cash físico recibido aquí de otra sucursal
+      // → va al consolidado ("Depósitos consolidados") para su depósito.
+      // HABER: Abono a la misma cuenta → va a cobros-sucursal como
+      // contrapartida (representa la deuda con la sucursal vendedora).
+      movimientosResult.push({ ...baseDir, tipoOrigen: 'Venta',         debe: monto,  haber: 0     });
       movimientosResult.push({ ...baseDir, tipoOrigen: 'Cobro Sucursal', debe: 0,      haber: monto });
     }
   }
@@ -2747,7 +2781,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     : cfdisSinPolizaFinalGuardFiltradoSustituto;
 
   if (centroCostoId && cfdisSinPolizaFinalGuardFiltrado.length === 0) {
-    throw new BadRequestError('No hay CFDIs sin póliza para la sucursal seleccionada en este periodo');
+    const totalSinPolizaGuard = cfdisSinPolizaFinalGuardFiltradoSustituto.length;
+    const totalCfdisGuard     = cfdis.length;
+    const totalUsadosGuard    = cfdis.filter(c => uuidsYaUsados.has(c.uuid)).length;
+    const seriesGuard = [...new Set(cfdisSinPolizaFinalGuardFiltradoSustituto.map(c => c.serie).filter(Boolean))].join(', ') || '(ninguna)';
+    throw new BadRequestError(
+      `No hay CFDIs sin póliza para la sucursal seleccionada en este periodo. ` +
+      `(Total CFDIs del periodo: ${totalCfdisGuard}, ya en póliza: ${totalUsadosGuard}, sin póliza: ${totalSinPolizaGuard}, series disponibles: ${seriesGuard})`,
+    );
   }
 
   // Fusionar NC (tipo E) relacionadas a estas facturas en la MISMA póliza de
@@ -3245,12 +3286,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   if (cobrosCobradoraDirectaGuard.length > 0 && _ccCobradoraGuard) {
     const cuentaCajaIdCos   = cuentaMap[CODIGO_CUENTA_CAJA]   ?? null;
     const cuentaBancosIdCos = cuentaMap[CODIGO_CUENTA_BANCOS] ?? null;
-    for (const { claveSat, monto, claveFac, nombre } of cobrosCobradoraDirectaGuard) {
+    // Mismo criterio de dedup que en generarPropuesta — ver comentario allá.
+    const _uuidsYaEnPuenteGuard = new Set(
+      movsPuenteGuard
+        .filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.cfdiUuid)
+        .map(m => m.cfdiUuid.toUpperCase()),
+    );
+    const _foliosYaEnPuenteGuard = new Set(
+      movsPuenteGuard.filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.folio != null).map(m => String(m.folio)),
+    );
+    for (const { claveSat, monto, claveFac, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaGuard) {
       const esEfe    = claveSat === '01';
       const cuentaCos = esEfe ? cuentaCajaIdCos : cuentaBancosIdCos;
       if (!cuentaCos || monto <= 0) continue;
       const [_serieG, _folioG] = (claveFac ?? '').split('|');
       const _serFolG = _serieG && _folioG ? `${_serieG}-${_folioG}` : (claveFac ?? '');
+      if (cfdiUuid && _uuidsYaEnPuenteGuard.has(cfdiUuid.toUpperCase())) continue;
+      if (folioOrigen != null && _foliosYaEnPuenteGuard.has(String(folioOrigen))) continue;
       const _conceptoG = nombre ? `${nombre} / ${_serFolG}` : _serFolG;
       const baseCos = {
         cuentaId:      cuentaCos,
@@ -3261,9 +3313,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         cfdiUuid:      null,
         formaPago:     claveSat || null,
       };
-      // Cargo: tipoOrigen neutral para que llegue a consolidarCargos → Efectivo/Tarjeta
-      // Abono: 'Cobro Sucursal' para que _extraerCobrosSucursal lo saque aparte
-      todosLosMovimientos.push({ ...baseCos, tipoOrigen: 'Venta',          debe: monto, haber: 0     });
+      // Mismo criterio que en generarPropuesta (ver comentario allá).
+      todosLosMovimientos.push({ ...baseCos, tipoOrigen: 'Venta',         debe: monto, haber: 0     });
       todosLosMovimientos.push({ ...baseCos, tipoOrigen: 'Cobro Sucursal', debe: 0,     haber: monto });
     }
   }

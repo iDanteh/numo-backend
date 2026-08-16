@@ -580,7 +580,21 @@ async function construirMovimientosPuente({
       });
       for (const c of cuentasDirecto) {
         if (c.cuentaId && cuentasIdsConocidas.has(c.cuentaId)) continue;
-        cuentas.push(c);
+        // Filtrar a solo los cobros que ocurrieron físicamente en ESTE centro.
+        // El endpoint puede devolver el historial COMPLETO de un ticket,
+        // incluyendo cobros en otros centros (ej. un ticket de Hidalgo que
+        // también tuvo un cobro en CEDIS). Esos cobros-en-otro-centro para
+        // CFDIs PROPIOS ya los detecta el camino serie/folio y los procesa
+        // en el bloque vendedor → `facturasVendedorCubiertas`. Procesarlos
+        // aquí TAMBIÉN los contaría por duplicado, reduciendo el `debe` de
+        // `cfdiToMovimientos` a cero para esas facturas y haciéndolas
+        // desaparecer del consolidado (bug real: Hidalgo TARJETA $37k vs
+        // $150k esperado, confirmado 2026-08-15).
+        const cobrosFiltrados = (c.cobros ?? []).filter(
+          cobro => !centroPropioClave || !cobro.claveCentro || cobro.claveCentro === centroPropioClave,
+        );
+        if (!cobrosFiltrados.length) continue;
+        cuentas.push({ ...c, cobros: cobrosFiltrados });
         if (c.cuentaId) cuentasIdsConocidas.add(c.cuentaId);
       }
 

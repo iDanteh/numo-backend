@@ -1407,16 +1407,25 @@ function _categoriaCobroSucursal(f) {
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
-  // Pre-calcular los conceptos de las entradas 'Cobro Sucursal' (haber) para
+  // Pre-calcular los cfdiUuids de las entradas 'Cobro Sucursal' HABER para
   // poder identificar y también extraer el DEBE correspondiente ('Venta') del
   // mismo par. Sin esto, el DEBE queda en `resto` → `consolidarCargos` →
   // "Depósitos consolidados", inflando el total con montos que se cancelan
   // contra el haber del cobro-sucursal (el par neto es 0 en CAJA, pero solo
   // el haber se extraía, dejando el debe suelto en el consolidado).
-  const _conceptosCobroSucursal = new Set(
+  // Se usa cfdiUuid (no concepto) para identificar el par: más robusto que
+  // texto y no puede colisionar con entradas de otras facturas.
+  // IMPORTANTE: solo HABER (no DEBE) — las HABER de la cola cobrador tienen
+  // cfdiUuid del vendedor; las DEBE del camino vendedor también tienen cfdiUuid
+  // pero corresponden a cobros parciales cuyo 'Venta' DEBE restante SÍ debe
+  // quedarse en consolidado (el monto fue cobrado aquí) — usarlas extraería
+  // incorrectamente entradas que deben estar en "Depósitos consolidados"
+  // (bug real: $127k de EFECTIVO/TARJETA removidos de más, 2026-08-15).
+  const _uuidsCobradosPorSucursal = new Set(
     movimientos
-      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0))
-      .map(m => m.concepto)
+      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
+                && m.cfdiUuid != null)
+      .map(m => m.cfdiUuid)
       .filter(Boolean),
   );
   for (const m of movimientos) {
@@ -1432,10 +1441,12 @@ function _extraerCobrosSucursal(movimientos) {
     if (esCargoEspecialDePago) { resto.push(m); continue; }
     // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
     // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
-    // Va a filas con el mismo concepto que su HABER correspondiente para que
-    // el cuadre CONTPAQ se mantenga dentro de la sección cobros-sucursal.
+    // Usa cfdiUuid para identificar el par de forma determinista: el mismo
+    // UUID que tiene la entrada 'Cobro Sucursal' DEBE de cobros-sucursal-puente
+    // identifica sin ambigüedad la 'Venta' DEBE de cfdiToMovimientos.
     if (m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
-        && m.concepto && _conceptosCobroSucursal.has(m.concepto)) {
+        && m.cfdiUuid != null
+        && _uuidsCobradosPorSucursal.has(m.cfdiUuid)) {
       filas.push({
         cuenta:             m.cuenta,
         serie:              m.serie || '',

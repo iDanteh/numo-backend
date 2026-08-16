@@ -603,19 +603,35 @@ async function construirMovimientosPuente({
       // mismo criterio que usa `cfdiPorDoc` para las demás, solo que la fuente
       // del serie/folio es `cuenta.serieVenta`/`folioVenta` en vez de
       // `documentosRelacionados` de un CFDI ya cargado.
-      const paresSinCfdi = [...new Map(
-        cuentasDirecto
-          .filter(c => c.serieVenta && c.folioVenta && !cfdiPorDoc.has(`${c.serieVenta}|${c.folioVenta}`))
-          .map(c => [`${c.serieVenta}|${c.folioVenta}`, { serie: c.serieVenta, folio: c.folioVenta }]),
-      ).values()];
-      if (paresSinCfdi.length) {
+      // MongoDB almacena CFDIs indexados por serie/folio SAT (serieFactura/
+      // folioFactura del ERP), NO por el número de ticket interno
+      // (serieVenta/folioVenta). Se consulta por serieFactura|folioFactura y
+      // se guarda bajo serieVenta|folioVenta (la clave que usa cfdiPorDoc en el
+      // loop de más abajo) para que cfdiOriginal.uuid quede poblado y el dedup
+      // por UUID en cfdi-poliza-generator funcione correctamente.
+      const factKeyAVentaKey = new Map();
+      for (const c of cuentasDirecto) {
+        if (!c.serieVenta || !c.folioVenta) continue;
+        const ventaKey = `${c.serieVenta}|${c.folioVenta}`;
+        if (cfdiPorDoc.has(ventaKey)) continue;
+        if (c.serieFactura && c.folioFactura) {
+          const factKey = `${c.serieFactura}|${c.folioFactura}`;
+          if (!factKeyAVentaKey.has(factKey)) factKeyAVentaKey.set(factKey, ventaKey);
+        }
+      }
+      if (factKeyAVentaKey.size) {
+        const queryPairs = [...factKeyAVentaKey.keys()].map(k => {
+          const [s, f] = k.split('|');
+          return { serie: s, folio: f };
+        });
         const cfdisEncontrados = await CFDI.find({
           'emisor.rfc': rfc,
-          $or: paresSinCfdi.map(p => ({ serie: p.serie, folio: p.folio })),
-        }).select('serie folio receptor metodoPago').lean();
+          $or: queryPairs,
+        }).select('serie folio receptor metodoPago uuid').lean();
         for (const cf of cfdisEncontrados) {
-          const key = `${cf.serie}|${cf.folio}`;
-          if (!cfdiPorDoc.has(key)) cfdiPorDoc.set(key, cf);
+          const factKey  = `${cf.serie}|${cf.folio}`;
+          const ventaKey = factKeyAVentaKey.get(factKey) ?? factKey;
+          if (!cfdiPorDoc.has(ventaKey)) cfdiPorDoc.set(ventaKey, cf);
         }
       }
     } catch (err) {

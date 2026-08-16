@@ -2423,7 +2423,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         centroCosto:   _ccCobradora.clave ?? null,
         centroCostoId: _ccCobradora.id    ?? null,
         reglaNombre:   'COS',
-        cfdiUuid:      null,
+        cfdiUuid:      cfdiUuid ?? null,
         formaPago:     claveSat || null,
       };
       // DEBE: Cargo a Caja/Bancos — cash físico recibido aquí de otra sucursal
@@ -3310,7 +3310,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         centroCosto:   _ccCobradoraGuard.clave ?? null,
         centroCostoId: _ccCobradoraGuard.id    ?? null,
         reglaNombre:   'COS',
-        cfdiUuid:      null,
+        cfdiUuid:      cfdiUuid ?? null,
         formaPago:     claveSat || null,
       };
       // Mismo criterio que en generarPropuesta (ver comentario allá).

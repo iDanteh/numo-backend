@@ -201,24 +201,14 @@ describe('GET /indicadores', () => {
     expect(args.month).toBe('8');
   });
 
-  test('sin banks:config: restrictions = { scope: ALL, userId } — mismo criterio que /cards', async () => {
+  test('no distingue scope por rol: la ruta nunca pasa restrictions al service (siempre equipo completo)', async () => {
     await request(app)
       .get('/indicadores')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
-    expect(args.restrictions).toEqual({ scope: MOVEMENT_SCOPE.ALL, userId: 'user-test' });
-  });
-
-  test('con banks:config: restrictions = null (acceso completo)', async () => {
-    rbacStore.hasPermission.mockResolvedValue(true);
-
-    await request(app)
-      .get('/indicadores')
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
-
-    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
-    expect(args.restrictions).toBeNull();
+    expect(args.restrictions).toBeUndefined();
+    expect(rbacStore.hasPermission).not.toHaveBeenCalled();
   });
 
   test('devuelve el shape básico del resultado del service tal cual', async () => {

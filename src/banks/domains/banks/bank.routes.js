@@ -87,15 +87,12 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   res.json(await service.getCards(restrictions, year, month));
 }));
 
-// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos).
-// Mismo cálculo de restrictions que /cards: el promedio general y el backlog son de
-// TODO el equipo (scope ALL) aunque el rol tenga scope OWN en la tabla de movimientos;
-// ver bank-indicadores.service.js#getIndicadoresIdentificacion para el criterio completo.
+// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos). Siempre de
+// TODO el equipo, sin distinción de scope por rol — ver
+// bank-indicadores.service.js#getIndicadoresIdentificacion para el criterio completo.
 router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
-  const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
   const { banco, categoria, year, month } = req.query;
-  res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, restrictions }));
+  res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month }));
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)

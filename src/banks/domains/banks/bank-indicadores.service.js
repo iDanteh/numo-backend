@@ -1,12 +1,20 @@
 'use strict';
 
 const BankMovement = require('./BankMovement.model');
-const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 
 const MS_PER_HOUR = 3600000;
 
 // Boundaries del $bucket de backlog: [0,24) < 24h, [24,72) 1-3d, [72,168) 3-7d, [168,∞) 7d+.
 const BACKLOG_BOUNDARIES = [0, 24, 72, 168, Number.MAX_SAFE_INTEGER];
+
+// Fecha de corte del dashboard completo (tiempo Y backlog): decisión explícita del usuario
+// (2026-08-17) de medir SOLO desde que se implementa este indicador en adelante, para no
+// ensuciar el promedio ni el backlog con historial viejo que nunca se pensó medir. Reemplaza
+// al anterior split histórico/nuevo vía `backlogPreExistente` (ver BankMovement.model.js y
+// scripts/migrate-backlog-preexistente.js, ahora sin uso). Mismo criterio de construcción
+// (hora local del servidor) que applyDateRange() más abajo. Si el deploy real de este cambio
+// ocurre en otra fecha, ACTUALIZAR este valor a mano antes de desplegar.
+const INDICADORES_DESDE = new Date(2026, 7, 17);
 
 // Estatus que cuentan como "pendiente" para el backlog: no_identificado (nunca se tocó) y
 // reclasificado (se identificó mal y quedó otra vez esperando revisión) — ambos son trabajo
@@ -15,6 +23,14 @@ const BACKLOG_BOUNDARIES = [0, 24, 72, 168, Number.MAX_SAFE_INTEGER];
 const BACKLOG_STATUSES = ['no_identificado', 'reclasificado'];
 const BACKLOG_KEY_BY_BOUNDARY = { 0: 'menos24h', 24: 'de1a3d', 72: 'de3a7d', 168: 'mas7d' };
 const BACKLOG_DEFAULT = Object.freeze({ menos24h: 0, de1a3d: 0, de3a7d: 0, mas7d: 0 });
+
+// Horario laboral usado para "horas hábiles" del promedio/mediana de identificación —
+// decisión explícita del usuario (2026-08-17): 8:00-20:00, lunes a SÁBADO (el sábado
+// cuenta como día laboral completo — el usuario dijo "excluye noches y domingos", no
+// "fines de semana"). Domingo completo = 0 horas hábiles sin importar el horario.
+const HORA_INICIO_LABORAL = 8;
+const HORA_FIN_LABORAL    = 20;
+const DIA_DOMINGO         = 0; // Date#getDay()
 
 /**
  * Filtro plano banco/categoria compartido por las 3 agregaciones. A diferencia de
@@ -61,101 +77,137 @@ function mapBacklogBuckets(buckets) {
 }
 
 /**
+ * Horas hábiles entre 2 timestamps: lunes-sábado, 8:00-20:00 (hora local del servidor,
+ * mismo criterio que applyDateRange() arriba). Domingo completo y las horas fuera de
+ * 8-20 en cualquier día NO cuentan. Recorre día por día (acotado: la cantidad de días
+ * entre inicio/fin de un caso real de identificación es chica, nunca miles) y suma el
+ * solape de cada día con la ventana [inicio, fin] — así una franja que cruza varios
+ * días (ej. viernes a la noche → lunes) se reparte bien entre los días que sí cuentan.
+ *
+ * No calculado en el pipeline de Mongo a propósito: esta lógica de calendario (saltar
+ * domingos, recortar cada día a su ventana laboral) sería un `$reduce` de agregación
+ * ilegible e imposible de testear con confianza — se resuelve en JS, sobre los pocos
+ * cientos/miles de documentos que trae getIndicadoresIdentificacion() con find().lean().
+ */
+function horasHabilesEntre(inicio, fin) {
+  if (!(fin > inicio)) return 0;
+  let totalMs = 0;
+  let cursor = new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate());
+  while (cursor < fin) {
+    if (cursor.getDay() !== DIA_DOMINGO) {
+      const ventanaInicio = new Date(cursor); ventanaInicio.setHours(HORA_INICIO_LABORAL, 0, 0, 0);
+      const ventanaFin    = new Date(cursor); ventanaFin.setHours(HORA_FIN_LABORAL, 0, 0, 0);
+      const solapeInicio = ventanaInicio > inicio ? ventanaInicio : inicio;
+      const solapeFin    = ventanaFin    < fin   ? ventanaFin    : fin;
+      if (solapeFin > solapeInicio) totalMs += solapeFin.getTime() - solapeInicio.getTime();
+    }
+    cursor = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1);
+  }
+  return totalMs / MS_PER_HOUR;
+}
+
+function promedio(valores) {
+  if (!valores.length) return null;
+  return valores.reduce((a, b) => a + b, 0) / valores.length;
+}
+
+// Mediana: menos sensible que el promedio a outliers (ej. un puñado de movimientos que
+// tardaron semanas por vacaciones/un banco raro) — da una lectura más honesta de "cuánto
+// tarda normalmente el equipo" que un promedio que esos casos pueden inflar solos.
+function mediana(valores) {
+  if (!valores.length) return null;
+  const ordenados = [...valores].sort((a, b) => a - b);
+  const mid = Math.floor(ordenados.length / 2);
+  return ordenados.length % 2 === 0
+    ? (ordenados[mid - 1] + ordenados[mid]) / 2
+    : ordenados[mid];
+}
+
+/**
  * Indicadores de tiempo de identificación de movimientos bancarios — cuánto tarda un
  * usuario en marcar un depósito como `identificado` desde que se cargó en Numo
- * (`primeraIdentificacionAt - createdAt`). Acotado a depósitos (deposito > 0, sin oculto),
- * igual criterio que getCards() — ver buildBaseMatch().
+ * (`primeraIdentificacionAt - createdAt`, en HORAS HÁBILES — ver horasHabilesEntre()).
+ * Acotado a depósitos (deposito > 0, sin oculto), igual criterio que getCards() — ver
+ * buildBaseMatch().
  *
  * @param {object} [opts]
  * @param {string} [opts.banco]
  * @param {string} [opts.categoria]
- * @param {string|number} [opts.year]  - limita el promedio general y el desglose por
- *   usuario a ese año (y mes, si también viene). El backlog NO se acota por year/month:
- *   la antigüedad de un pendiente se mide contra AHORA, no contra un periodo pasado.
+ * @param {string|number} [opts.year]  - limita el promedio/mediana general y el desglose
+ *   por usuario a ese año (y mes, si también viene). El backlog NO se acota por year/month:
+ *   la antigüedad de un pendiente se mide contra AHORA, no contra un periodo pasado (y
+ *   sigue en tiempo de RELOJ, no horas hábiles — ver Pipeline 2 abajo).
  *   El backlog cuenta status no_identificado + reclasificado (BACKLOG_STATUSES) — ambos
  *   son trabajo real sin cerrar; "otros" queda afuera por ser un estatus terminal.
- *   Viene partido en `backlog.historico` / `backlog.nuevo` según el flag INMUTABLE
- *   `backlogPreExistente` (estampado una sola vez por scripts/migrate-backlog-preexistente.js
- *   en el momento del deploy de este split) — nunca por comparar `createdAt` contra una
- *   fecha de corte dinámica, que se corrompería con reimportaciones tardías de Excels
- *   viejos y con movimientos revertidos después del corte.
+ *   Tanto el promedio como el backlog están acotados además a `createdAt >= INDICADORES_DESDE`
+ *   (ver constante arriba) — el dashboard completo mide solo desde su propia implementación.
  * @param {string|number} [opts.month]
- * @param {{scope: 'own'|'all', userId: string}|null} [opts.restrictions] - null = acceso
- *   completo (banks:config). Mismo criterio que getCards() para "Identificados": el
- *   promedio general y el backlog son siempre del equipo completo; solo el desglose "por
- *   usuario" se acota a `restrictions.userId` cuando scope === MOVEMENT_SCOPE.OWN.
  */
-async function getIndicadoresIdentificacion({ banco, categoria, year, month, restrictions } = {}) {
+async function getIndicadoresIdentificacion({ banco, categoria, year, month } = {}) {
   const matchConFecha = applyDateRange(buildBaseMatch({ banco, categoria }), year, month);
-  const matchSoloBancoCategoria = buildBaseMatch({ banco, categoria });
-  const ownUserId = restrictions?.scope === MOVEMENT_SCOPE.OWN ? restrictions.userId : null;
+  const matchSoloBancoCategoria = { ...buildBaseMatch({ banco, categoria }), createdAt: { $gte: INDICADORES_DESDE } };
+  const matchTiempo = {
+    ...matchConFecha,
+    status: 'identificado',
+    primeraIdentificacionAt: { $ne: null },
+    createdAt: { $gte: INDICADORES_DESDE },
+  };
 
-  const [tiempoAgg, backlogAgg, porUsuarioAgg] = await Promise.all([
-    // Pipeline 1 — promedio de tiempo de identificación (equipo completo).
-    BankMovement.aggregate([
-      { $match: { ...matchConFecha, status: 'identificado', primeraIdentificacionAt: { $ne: null } } },
-      { $project: { horas: { $divide: [{ $subtract: ['$primeraIdentificacionAt', '$createdAt'] }, MS_PER_HOUR] } } },
-      { $group: { _id: null, promedioHoras: { $avg: '$horas' }, n: { $sum: 1 } } },
-    ], { allowDiskUse: true }),
+  const [identificados, backlogAgg] = await Promise.all([
+    // Trae los documentos ya identificados (equipo completo, desde INDICADORES_DESDE) para
+    // calcular horas hábiles en JS — ver horasHabilesEntre() arriba sobre por qué esto no
+    // se hace dentro de la agregación de Mongo. Con los volúmenes actuales (cientos/pocos
+    // miles desde el cutoff) traer los documentos a Node es perfectamente razonable; si el
+    // volumen creciera mucho con los años, valdría la pena revisar el enfoque (ej. mover el
+    // cálculo a un job que lo materialice), pero no hace falta resolverlo ahora.
+    BankMovement.find(matchTiempo)
+      .select('createdAt primeraIdentificacionAt primeraIdentificacionPor')
+      .lean(),
     // Pipeline 2 — backlog de pendientes (no_identificado + reclasificado, BACKLOG_STATUSES)
-    // por antigüedad (sin year/month; equipo completo), partido en 2 grupos vía $facet (una
-    // sola query, más barato que 2 aggregate() separados): "historico" = ya era backlog
-    // antes del deploy de este split (backlogPreExistente:true, estampado UNA VEZ por
-    // migrate-backlog-preexistente.js) y "nuevo" = apareció después (false/default). Evita
-    // que un backlog histórico enorme se mezcle para siempre con el que el equipo genera
-    // desde que se empezó a medir esto.
+    // por antigüedad (sin year/month; equipo completo), desde INDICADORES_DESDE. Sigue en
+    // tiempo de RELOJ a propósito — el usuario pidió horas hábiles para los promedios, no
+    // para la antigüedad del backlog (decisión de alcance explícita, no un olvido).
     BankMovement.aggregate([
       { $match: { ...matchSoloBancoCategoria, status: { $in: BACKLOG_STATUSES } } },
-      { $project: { horas: { $divide: [{ $subtract: ['$$NOW', '$createdAt'] }, MS_PER_HOUR] }, backlogPreExistente: 1 } },
-      {
-        $facet: {
-          historico: [
-            { $match: { backlogPreExistente: true } },
-            { $bucket: { groupBy: '$horas', boundaries: BACKLOG_BOUNDARIES, default: 'otro', output: { count: { $sum: 1 } } } },
-          ],
-          nuevo: [
-            { $match: { backlogPreExistente: { $ne: true } } },
-            { $bucket: { groupBy: '$horas', boundaries: BACKLOG_BOUNDARIES, default: 'otro', output: { count: { $sum: 1 } } } },
-          ],
-        },
-      },
-    ], { allowDiskUse: true }),
-    // Pipeline 3 — desglose por usuario que identificó primero (acotado a userId si scope OWN).
-    BankMovement.aggregate([
-      {
-        $match: {
-          ...matchConFecha,
-          status: 'identificado',
-          primeraIdentificacionAt: { $ne: null },
-          ...(ownUserId ? { 'primeraIdentificacionPor.userId': ownUserId } : {}),
-        },
-      },
-      {
-        $group: {
-          _id: '$primeraIdentificacionPor.userId',
-          nombre: { $first: '$primeraIdentificacionPor.nombre' },
-          promedioHoras: { $avg: { $divide: [{ $subtract: ['$primeraIdentificacionAt', '$createdAt'] }, MS_PER_HOUR] } },
-          count: { $sum: 1 },
-        },
-      },
-      { $sort: { count: -1 } },
+      { $project: { horas: { $divide: [{ $subtract: ['$$NOW', '$createdAt'] }, MS_PER_HOUR] } } },
+      { $bucket: { groupBy: '$horas', boundaries: BACKLOG_BOUNDARIES, default: 'otro', output: { count: { $sum: 1 } } } },
     ], { allowDiskUse: true }),
   ]);
 
+  const conHoras = identificados.map(d => ({
+    horas:  horasHabilesEntre(d.createdAt, d.primeraIdentificacionAt),
+    userId: d.primeraIdentificacionPor?.userId ?? null,
+    nombre: d.primeraIdentificacionPor?.nombre ?? null,
+  }));
+  const todasLasHoras = conHoras.map(d => d.horas);
+
+  // Desglose por usuario — agrupado en JS sobre las mismas horas hábiles ya calculadas
+  // (misma definición de "horas" que el promedio/mediana del equipo, para que sea
+  // comparable). Solo promedio por usuario, sin mediana — la tabla ya es compacta.
+  const porUsuarioMap = new Map();
+  for (const d of conHoras) {
+    const key = d.userId ?? '__sin_usuario__';
+    if (!porUsuarioMap.has(key)) {
+      porUsuarioMap.set(key, { userId: d.userId, nombre: d.nombre, horas: [] });
+    }
+    porUsuarioMap.get(key).horas.push(d.horas);
+  }
+  const porUsuario = [...porUsuarioMap.values()]
+    .map(u => ({
+      userId: u.userId,
+      nombre: u.nombre,
+      promedioHoras: promedio(u.horas),
+      count: u.horas.length,
+    }))
+    .sort((a, b) => b.count - a.count);
+
   return {
-    promedioHoras: tiempoAgg[0]?.promedioHoras ?? null,
-    totalIdentificadosConDato: tiempoAgg[0]?.n ?? 0,
-    backlog: {
-      historico: mapBacklogBuckets(backlogAgg[0]?.historico ?? []),
-      nuevo:     mapBacklogBuckets(backlogAgg[0]?.nuevo ?? []),
-    },
-    porUsuario: porUsuarioAgg.map(r => ({
-      userId: r._id ?? null,
-      nombre: r.nombre ?? null,
-      promedioHoras: r.promedioHoras,
-      count: r.count,
-    })),
+    promedioHoras: promedio(todasLasHoras),
+    medianaHoras:  mediana(todasLasHoras),
+    totalIdentificadosConDato: todasLasHoras.length,
+    backlog: mapBacklogBuckets(backlogAgg ?? []),
+    porUsuario,
   };
 }
 
-module.exports = { getIndicadoresIdentificacion };
+module.exports = { getIndicadoresIdentificacion, horasHabilesEntre };

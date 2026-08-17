@@ -69,6 +69,15 @@ const CASOS = [
   { archivo: '2639.01.jpg',     mime: 'image/jpeg',      monto: 2639.01 },
   { archivo: '11536.63.pdf',    mime: 'application/pdf', monto: 11536.63 },
   { archivo: '1802.53.pdf',     mime: 'application/pdf', monto: 1802.53 },
+  // Comprobante Mercado Pago Wallet (2026-08-17) — regresión de 4 fixes reales en
+  // ocr-engine.js: centavos pegados sin separador a "MXN" ("2,99546MXN"), hora sin
+  // cero a la izquierda ("9:00"), etiqueta "Comprobante" no reconocida como folio,
+  // y encabezado combinado "Origen y destino" sin "De:"/"Para:" por parte.
+  // `requierePaddle: true`: bajo Jest (sin Paddle real) Tesseract PSM4 lee mal los
+  // propios dígitos del monto ("2,9954" en vez de "2,99546") — es precisión del
+  // motor de OCR, no algo que un fix de regex pueda corregir; mismo criterio que
+  // 5547.84.jpg arriba.
+  { archivo: '2995.46.png',     mime: 'image/png',       monto: 2995.46, requierePaddle: true },
 ];
 
 describeReal('extractReceiptData — regresión con comprobantes reales (Docs/Comprobantes)', () => {

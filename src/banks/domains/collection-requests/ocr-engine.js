@@ -279,8 +279,14 @@ function normalizeOcrText(raw) {
   //    miles (`(?:,\d{3})+`, no `*`) para no confundir un entero legítimo de
   //    5+ dígitos sin decimales (ej. un folio) con este patrón — el riesgo de
   //    ambigüedad es el mismo que ya aceptan las reglas 3/4 de arriba.
+  //    2026-08-17: el `\b` final se sacó — entre un dígito y una letra (ej.
+  //    "46MXN") no hay límite de palabra (ambos son \w), así que la regla
+  //    nunca disparaba cuando el sufijo de moneda queda pegado sin espacio
+  //    ("2,99546MXN", comprobante Mercado Pago real). El `(?!\d)` que sigue
+  //    ya garantiza por sí solo que no venga otro dígito después — es la
+  //    única condición que hace falta.
   t = t.replace(
-    /\b(\d{1,3}(?:,\d{3})+)(0\d|[1-9]\d)\b(?!\d)/g,
+    /\b(\d{1,3}(?:,\d{3})+)(0\d|[1-9]\d)(?!\d)/g,
     (match, integer, cents) => `${integer}.${cents}`,
   );
 
@@ -317,7 +323,12 @@ function extractMonto(text) {
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
   // E2: $ + número MXN (con o sin separador de miles)
-  m = text.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d{1,9}(?:\.\d{1,2})?)\b/);
+  // `(?!\d)` en vez de `\b` final — entre el último dígito de los centavos y una
+  // moneda pegada sin espacio ("2,995.46MXN") no hay límite de palabra (ambos \w),
+  // así que un `\b` ahí recortaba el match a "2,995" perdiendo los centavos
+  // (bug real, comprobante Mercado Pago 2026-08-17). `(?!\d)` da la misma garantía
+  // de "no cortar un número más largo" sin bloquear un sufijo de letras.
+  m = text.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d{1,9}(?:\.\d{1,2})?)(?!\d)/);
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
   // E3: prefijo MXN / MX$ / USD — solo en la misma línea (no cruzar \n)
@@ -325,19 +336,19 @@ function extractMonto(text) {
   m = text.match(/(?:MXN|MX\$|USD)[^\S\n]*([\d,]+(?:\.\d{1,2})?)\b/i);
   if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
 
-  // E4: número con coma como separador de miles: 15,000.00
+  // E4: número con coma como separador de miles: 15,000.00 (mismo fix de `\b`→`(?!\d)` que E2)
   const c4 = [];
-  const r4 = /\b(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?)\b/g;
+  const r4 = /\b(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?)(?!\d)/g;
   while ((m = r4.exec(text)) !== null) {
     const v = parseFloat(m[1].replace(/,/g, ''));
     if (ok(v)) c4.push(v);
   }
   if (c4.length > 0) return c4[0];
 
-  // E5: decimal sin separador de miles: 1500.00, 750.50
+  // E5: decimal sin separador de miles: 1500.00, 750.50 (mismo fix de `\b`→`(?!\d)` que E2)
   //     Mínimo 2 dígitos antes del punto; excluye años (2000-2099)
   const c5 = [];
-  const r5 = /\b(\d{2,7}\.\d{2})\b/g;
+  const r5 = /\b(\d{2,7}\.\d{2})(?!\d)/g;
   while ((m = r5.exec(text)) !== null) {
     const v = parseFloat(m[1]);
     if (v >= 10 && v < 100_000_000 && !(v >= 2000 && v <= 2099)) c5.push(v);
@@ -433,7 +444,8 @@ function extractFieldsFromLines(lines) {
     {
       field: 'referencia',
       // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica" (Vault México)
-      re: /^(referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato)\s*[:\-]?$/i,
+      // "comprobante" cubre la etiqueta de Mercado Pago ("Comprobante" / "#172880688243")
+      re: /^(referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|no\.?\s*operaci[oó]n|n[úu]mero\s+de\s+operaci[oó]n|confirmaci[oó]n|contrato|comprobante)\s*[:\-]?$/i,
     },
     {
       field: 'numeroAutorizacion',
@@ -495,6 +507,38 @@ function extractFieldsFromLines(lines) {
         if ((field === 'titularOrigen' || field === 'titularDestino') && CAMPO_NO_NOMBRE_RE.test(val)) continue;
         result[field] = val;
         break;
+      }
+    }
+  }
+
+  // Mercado Pago (y posibles apps P2P similares) no repite "De:"/"Para:" por cada
+  // parte — usa UN encabezado de sección combinado ("Origen y destino") seguido de
+  // 2 bloques consecutivos sin etiqueta propia: nombre / proveedor (banco o wallet) /
+  // línea "CLABE: ****XXXX". El labelMap de arriba no lo cubre porque no hay ninguna
+  // etiqueta POR PARTE que anclar. Se resuelve posicionalmente, y solo si el
+  // mecanismo normal de arriba no encontró ya alguno de los 2 titulares (nunca pisa
+  // un resultado ya obtenido por un layout con etiquetas explícitas).
+  if (!result.titularOrigen || !result.titularDestino) {
+    const idxCombinado = texts.findIndex(t => /^origen\s+y\s+destino\s*[:\-]?$/i.test(t));
+    if (idxCombinado !== -1) {
+      if (!result.titularOrigen) {
+        for (let j = idxCombinado + 1; j < texts.length; j++) {
+          const val = texts[j];
+          if (!val || isAnyLabel(val) || CAMPO_NO_NOMBRE_RE.test(val)) continue;
+          result.titularOrigen = val;
+          break;
+        }
+      }
+      if (!result.titularDestino) {
+        const idxClabe = texts.findIndex((t, i) => i > idxCombinado && /clabe/i.test(t));
+        if (idxClabe !== -1) {
+          for (let j = idxClabe + 1; j < texts.length; j++) {
+            const val = texts[j];
+            if (!val || isAnyLabel(val) || CAMPO_NO_NOMBRE_RE.test(val)) continue;
+            result.titularDestino = val;
+            break;
+          }
+        }
       }
     }
   }
@@ -576,8 +620,12 @@ function extractFecha(text) {
 }
 
 function extractHora(text) {
-  const m = text.match(/\b([01]\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?\b/);
-  return m ? `${m[1]}:${m[2]}` : null;
+  // Acepta 1 o 2 dígitos de hora — "a las 9:00" (Mercado Pago no rellena con
+  // cero a la izquierda) no matcheaba cuando exigía exactamente 2 dígitos.
+  // Los minutos exactos de 2 dígitos ([0-5]\d) ya evitan falsos positivos
+  // sobre fragmentos numéricos sueltos tipo "5:1".
+  const m = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?\b/);
+  return m ? `${m[1].padStart(2, '0')}:${m[2]}` : null;
 }
 
 function extractClaveRastreo(text) {
@@ -603,8 +651,12 @@ function extractReferencia(text) {
   // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica: X" (Vault México), no solo
   // "Referencia" a secas.
   // "[:\s#\n]*" usa \n explícito para cruzar línea cuando el valor está en la siguiente
+  // "comprobante" cubre la etiqueta de Mercado Pago ("Comprobante\n#172880688243") — no
+  // choca con el título "Comprobante de transferencia" del encabezado porque ahí la
+  // palabra sigue con letras ("de transferencia"), que rompen el `[:\s#\n]*` antes de
+  // llegar a ningún dígito.
   const m = text.match(
-    /(?:referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato)[:\s#\n]*(\d{4,20})/i
+    /(?:referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato|comprobante)[:\s#\n]*(\d{4,20})/i
   );
   return m ? m[1] : null;
 }
@@ -1566,4 +1618,8 @@ module.exports = {
   // otros helpers internos re-expuestos para scripts en el resto del repo.
   normalizeOcrText, extractMonto, extractReceiptDataPaddle, extractReceiptDataTesseract,
   renderPdfToImages,
+  // Exportados para ocr-engine.test.js (2026-08-17, fixes de comprobante Mercado
+  // Pago) — permiten testear los extractores individuales sin depender de OCR
+  // real (Paddle no carga bajo Jest, ver receipt.service.test.js).
+  extractHora, extractReferencia, extractFieldsFromLines,
 };

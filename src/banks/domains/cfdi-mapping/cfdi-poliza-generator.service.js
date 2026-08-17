@@ -736,7 +736,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // o siguiente (presentes en la ventana ampliada) aparecían en la póliza
   // incorrecta (caso real 2026-08-15: G1|260800010 del 6-ago en la póliza
   // del 5-ago, G1|260800005 del 4-ago idem, misma causa).
-  const cobrosCobradoraDirecta = [];
+  let cobrosCobradoraDirecta = [];
   if (usoCaminoPorCentro) {
     // Derivar el prefijo de periodo del batch y el día exacto de la poliza.
     let folioPrefijoBatch = null;
@@ -773,7 +773,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
           if (monto <= 0) continue;
-          cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, folioOrigen: cobro.folioOrigen ?? null });
+          // `claveFac` (serieFactura|folioFactura) es SOLO para resolver el CFDI
+          // en Mongo (que indexa por folio SAT) — el texto que se le muestra al
+          // contador (concepto) debe usar el documento relacionado real
+          // (serieVenta/folioVenta, "serie y folio interno" auditable en cajas),
+          // nunca el folio de la factura (confirmado con el usuario 2026-08-17:
+          // mostrar el folio de factura llevaba a buscar un ticket equivocado en
+          // Kore y comparar contra un saldo que no correspondía).
+          const serFolTicket = `${cuenta.serieVenta || serie}-${cuenta.folioVenta ? String(cuenta.folioVenta) : folio}`;
+          cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, serFolTicket, folioOrigen: cobro.folioOrigen ?? null });
         }
       }
     }
@@ -784,14 +792,24 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const serFolPairs = clavesUnicas.map(cv => { const [s, f] = cv.split('|'); return { serie: s, folio: f }; });
       const cfdisFac = await CFDI.find(
         { $or: serFolPairs },
-        { serie: 1, folio: 1, 'receptor.nombre': 1, uuid: 1 },
+        { serie: 1, folio: 1, 'receptor.nombre': 1, uuid: 1, metodoPago: 1 },
       ).lean();
-      const nombrePorClave = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.receptor?.nombre ?? null]));
-      const uuidPorClave   = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.uuid ?? null]));
+      const nombrePorClave     = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.receptor?.nombre ?? null]));
+      const uuidPorClave       = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.uuid ?? null]));
+      const metodoPagoPorClave = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.metodoPago ?? null]));
       for (const entry of cobrosCobradoraDirecta) {
         entry.nombre    = nombrePorClave.get(entry.claveFac) ?? null;
         entry.cfdiUuid  = uuidPorClave.get(entry.claveFac)   ?? null;
       }
+      // PPD (Crédito): el cierre de esta CxC es responsabilidad exclusiva de
+      // Cobranza, nunca de Ingreso — mismo criterio que `esPPD` en
+      // cobros-sucursal-puente.service.js (confirmado con el usuario
+      // 2026-08-05). Este camino ("por centro", 2026-08-15) no tenía el
+      // filtro y dejaba pasar cobros de facturas PPD (confirmado con el
+      // usuario 2026-08-17).
+      cobrosCobradoraDirecta = cobrosCobradoraDirecta.filter(
+        entry => metodoPagoPorClave.get(entry.claveFac) !== 'PPD',
+      );
     }
   }
 
@@ -2494,12 +2512,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const _foliosYaEnPuente = new Set(
       movsPuente.filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.folio != null).map(m => String(m.folio)),
     );
-    for (const { claveSat, monto, claveFac, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaProp) {
+    for (const { claveSat, monto, claveFac, serFolTicket, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaProp) {
       const esEfe     = claveSat === '01';
       const cuentaDir = esEfe ? cuentaCajaIdDir : cuentaBancosIdDir;
       if (!cuentaDir || monto <= 0) continue;
-      const [_serie, _folio] = (claveFac ?? '').split('|');
-      const _serFol = _serie && _folio ? `${_serie}-${_folio}` : (claveFac ?? '');
+      // Concepto: SIEMPRE el documento relacionado (serieVenta-folioVenta,
+      // "serie y folio interno" auditable en cajas) — nunca serieFactura/
+      // folioFactura (`claveFac`, que solo sirve para resolver el CFDI en
+      // Mongo). Mostrar el folio de factura llevaba a buscar un ticket
+      // equivocado en Kore (confirmado con el usuario 2026-08-17).
+      const _serFol = serFolTicket || (claveFac ?? '');
       // Saltar si la cola ya tiene este cobro — el DEBE+HABER de cobradora
       // ya lo generó `construirMovimientosPuente` (en movsPuente arriba).
       // Incluirlo aquí también inflaría el consolidado por partida doble
@@ -3441,12 +3463,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const _foliosYaEnPuenteGuard = new Set(
       movsPuenteGuard.filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.folio != null).map(m => String(m.folio)),
     );
-    for (const { claveSat, monto, claveFac, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaGuard) {
+    for (const { claveSat, monto, claveFac, serFolTicket, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaGuard) {
       const esEfe    = claveSat === '01';
       const cuentaCos = esEfe ? cuentaCajaIdCos : cuentaBancosIdCos;
       if (!cuentaCos || monto <= 0) continue;
-      const [_serieG, _folioG] = (claveFac ?? '').split('|');
-      const _serFolG = _serieG && _folioG ? `${_serieG}-${_folioG}` : (claveFac ?? '');
+      // Concepto: documento relacionado (serieVenta-folioVenta), nunca la
+      // factura (`claveFac`) — ver comentario equivalente en generarPropuesta.
+      const _serFolG = serFolTicket || (claveFac ?? '');
       if (cfdiUuid && _uuidsYaEnPuenteGuard.has(cfdiUuid.toUpperCase())) continue;
       if (folioOrigen != null && _foliosYaEnPuenteGuard.has(String(folioOrigen))) continue;
       const _conceptoG = nombre ? `${nombre} / ${_serFolG}` : _serFolG;

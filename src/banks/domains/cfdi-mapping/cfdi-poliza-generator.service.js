@@ -208,128 +208,140 @@ function _claveCentroPorMonto(cobrosPorCuenta, serie, folio, monto, fechaExacta)
 }
 
 async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones = {}) {
-  const devolucionesConVenta = cfdis
-    .map(cfdi => {
-      if (cfdi.tipoDeComprobante !== 'E') return null;
-      const marcador = (cfdi.documentosRelacionados ?? [])
-        .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
-      const venta = _extraerDocumentosRelacionados(cfdi)[0];
-      return (marcador && venta) ? { marcador, venta, cfdiSerie: cfdi.serie ?? null } : null;
-    })
-    .filter(Boolean);
-  if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set() };
-  // Venta (serie|folio) → serie del CFDI de la Devolución que la referenció —
-  // para saber la sucursal "dueña" y así detectar cruce de sucursal más abajo.
-  const cfdiSeriePorVenta = new Map(devolucionesConVenta.map(d => [`${d.venta.serie}|${d.venta.folio}`, d.cfdiSerie]));
+  const { centroPropioClave, fechaDesde, fechaHasta } = opciones;
 
-  const LOTE = 150;
-
-  // 1. Saldos generados por cada venta (sin resolver todavía dónde se
-  // procesó cada lado — eso necesita las cuentas de las ventas de USO
-  // también, que aún no conocemos hasta terminar este paso).
   const generadosPorCuenta = []; // [{ cuenta, gen }]
-  for (let i = 0; i < devolucionesConVenta.length; i += LOTE) {
-    const lote = devolucionesConVenta.slice(i, i + LOTE);
-    const resultado = await obtenerSaldosFavor({
-      rfc,
-      series: lote.map(d => d.venta.serie),
-      folios: lote.map(d => d.venta.folio),
-    });
-    for (const cuenta of resultado) {
+  const cobrosPorVenta     = new Map();
+  const cobrosPorVentaUso  = new Map();
+  // Solo se popula en el camino fallback (sin centro+fecha), donde conocemos
+  // los CFDIs del batch y podemos mapear venta → serie del CFDI de Devolución.
+  const cfdiSeriePorVenta  = new Map();
+
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    // Camino principal: consulta directa por centro+fecha — fuente única para
+    // saldos generados y cobros. Equivalente a lo que ya hace
+    // `construirMovimientosPuente` para el lado de USO, pero para el lado de
+    // GENERACIÓN. Encuentra todos los saldos del día en este centro sin
+    // requerir conocer de antemano las ventas de cada Devolución — incluyendo
+    // las que no tienen referencia de venta en `documentosRelacionados`.
+    const [cuentasSF, cuentasAlm] = await Promise.all([
+      obtenerSaldosFavorPorCentro({
+        rfc, centro: centroPropioClave,
+        fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
+      }),
+      obtenerDesglosesCobroAlmacenPorCentro({
+        rfc, centro: centroPropioClave,
+        fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
+      }),
+    ]);
+    for (const cuenta of cuentasSF) {
       for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
         generadosPorCuenta.push({ cuenta, gen });
       }
     }
-  }
-  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+    for (const cuenta of cuentasAlm) {
+      const k = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+      const cobros = cuenta.cobros ?? [];
+      if (!cobros.length) continue;
+      cobrosPorVenta.set(k, [...(cobrosPorVenta.get(k) ?? []), ...cobros]);
+      cobrosPorVentaUso.set(k, [...(cobrosPorVentaUso.get(k) ?? []), ...cobros]);
+    }
+  } else {
+    // Camino fallback: sin centro+fecha conocidos (ej. generación de periodo
+    // completo sin filtro de sucursal). Usa las Devoluciones del batch y sus
+    // ventas relacionadas para consultar el ERP por serie/folio.
+    const devolucionesConVenta = cfdis
+      .map(cfdi => {
+        if (cfdi.tipoDeComprobante !== 'E') return null;
+        const marcador = (cfdi.documentosRelacionados ?? [])
+          .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+        const venta = _extraerDocumentosRelacionados(cfdi)[0];
+        return (marcador && venta) ? { marcador, venta, cfdiSerie: cfdi.serie ?? null } : null;
+      })
+      .filter(Boolean);
+    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+    devolucionesConVenta.forEach(d => cfdiSeriePorVenta.set(`${d.venta.serie}|${d.venta.folio}`, d.cfdiSerie));
 
-  // 2. Cobros crudos de las ventas que GENERARON el saldo (dedup).
-  const paresGeneracion = [...new Map(
-    generadosPorCuenta.map(({ cuenta }) => [`${cuenta.serieVenta}|${cuenta.folioVenta}`, { serie: cuenta.serieVenta, folio: cuenta.folioVenta }]),
-  ).values()];
-  const cobrosPorVenta = new Map();
-  for (let i = 0; i < paresGeneracion.length; i += LOTE) {
-    const lote = paresGeneracion.slice(i, i + LOTE);
-    const resultadoAlmacen = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
-    for (const cuenta of resultadoAlmacen) cobrosPorVenta.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, cuenta.cobros ?? []);
-  }
-
-  // 3. Cobros crudos de las ventas que USARON el saldo (para poder comparar
-  // "mismo almacén" contra dónde se cobró REALMENTE cada lado, no contra la
-  // serie de facturación — confirmado con el usuario 2026-08-05: dos ventas
-  // de PROMOTORIA (misma serie I0) pueden haberse cobrado ambas en CEDIS; la
-  // serie no distingue eso, el claveCentro real sí).
-  const paresUso = [...new Map(
-    generadosPorCuenta
-      .map(({ gen }) => (gen.usos ?? []).length === 1 ? gen.usos[0] : null)
-      .filter(Boolean)
-      .map(u => [`${u.serieVenta}|${u.folioVenta}`, { serie: u.serieVenta, folio: u.folioVenta }]),
-  ).values()];
-  const cobrosPorVentaUso = new Map();
-  for (let i = 0; i < paresUso.length; i += LOTE) {
-    const lote = paresUso.slice(i, i + LOTE);
-    const resultadoAlmacen = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
-    for (const cuenta of resultadoAlmacen) cobrosPorVentaUso.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, cuenta.cobros ?? []);
-  }
-
-  // 3b. Enriquecer con la consulta "por centro+fecha" (2026-08-14, confirmado
-  // con el usuario — mismo hallazgo que en `_prefetchAjustesFacturaPropia`):
-  // la consulta de arriba (por serie/folio propio de CADA venta) a veces no
-  // encuentra el `claveCentro` real (caso confirmado: Devolución que ajusta
-  // una venta de un periodo MUY anterior — el cobro/reclasificación que sí
-  // pasó el día de la Devolución no siempre aparece al consultar solo por el
-  // serie/folio de esa venta vieja). La consulta "por centro" trae TODOS los
-  // cobros de esta sucursal en el rango de fechas del batch, sin depender de
-  // conocer de antemano la venta — se usa para COMPLETAR (no reemplazar)
-  // `cobrosPorVenta`/`cobrosPorVentaUso`, agregando cualquier cobro adicional
-  // que encuentre para las mismas cuentas. Si falla (timeout, ERP caído), se
-  // ignora esta fuente — el cálculo de oculto/mismoFolio sigue funcionando
-  // igual que antes, solo sin esta mejora.
-  const { centroPropioClave, fechaDesde, fechaHasta } = opciones;
-  if (centroPropioClave && fechaDesde && fechaHasta) {
-    try {
-      const cuentasPorCentro = await obtenerDesglosesCobroAlmacenPorCentro({
-        rfc, centro: centroPropioClave, fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
+    const LOTE = 150;
+    for (let i = 0; i < devolucionesConVenta.length; i += LOTE) {
+      const lote = devolucionesConVenta.slice(i, i + LOTE);
+      const resultado = await obtenerSaldosFavor({
+        rfc,
+        series: lote.map(d => d.venta.serie),
+        folios: lote.map(d => d.venta.folio),
       });
-      for (const cuenta of cuentasPorCentro) {
-        const k = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
-        const cobrosNuevos = cuenta.cobros ?? [];
-        if (!cobrosNuevos.length) continue;
-        cobrosPorVenta.set(k, [...(cobrosPorVenta.get(k) ?? []), ...cobrosNuevos]);
-        cobrosPorVentaUso.set(k, [...(cobrosPorVentaUso.get(k) ?? []), ...cobrosNuevos]);
+      for (const cuenta of resultado) {
+        for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+          generadosPorCuenta.push({ cuenta, gen });
+        }
       }
-    } catch (err) {
-      const { logger } = require('../../../shared/utils/logger');
-      logger.warn(`[SF] Consulta "por centro" para enriquecer claveCentro falló (${err.message}), se ignora esta fuente.`);
+    }
+    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+
+    const paresGeneracion = [...new Map(
+      generadosPorCuenta.map(({ cuenta }) => [`${cuenta.serieVenta}|${cuenta.folioVenta}`, { serie: cuenta.serieVenta, folio: cuenta.folioVenta }]),
+    ).values()];
+    for (let i = 0; i < paresGeneracion.length; i += LOTE) {
+      const lote = paresGeneracion.slice(i, i + LOTE);
+      const resultadoAlmacen = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
+      for (const cuenta of resultadoAlmacen) cobrosPorVenta.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, cuenta.cobros ?? []);
+    }
+
+    const paresUso = [...new Map(
+      generadosPorCuenta
+        .map(({ gen }) => (gen.usos ?? []).length === 1 ? gen.usos[0] : null)
+        .filter(Boolean)
+        .map(u => [`${u.serieVenta}|${u.folioVenta}`, { serie: u.serieVenta, folio: u.folioVenta }]),
+    ).values()];
+    for (let i = 0; i < paresUso.length; i += LOTE) {
+      const lote = paresUso.slice(i, i + LOTE);
+      const resultadoAlmacen = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
+      for (const cuenta of resultadoAlmacen) cobrosPorVentaUso.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, cuenta.cobros ?? []);
     }
   }
 
-  // 4. Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
+  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+
+  // Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
   const mapa = new Map();
   const devsOcultos = new Set();
   for (const { cuenta, gen } of generadosPorCuenta) {
     const key = `${gen.serieOrigen}|${gen.folioOrigen}`;
-    const usos = gen.usos ?? [];
+    const usos     = gen.usos ?? [];
     const usoUnico = usos.length === 1 ? usos[0] : null;
-    const diaGen = gen.fecha ? new Date(gen.fecha).toISOString().slice(0, 10) : null;
-    const diaUso = usoUnico?.fecha ? new Date(usoUnico.fecha).toISOString().slice(0, 10) : null;
+    // _diaMx: hora México (UTC-6) — sin esto, eventos después de las 6pm local
+    // cruzan al "día siguiente" en UTC y la comparación diaGen===diaUso falla.
+    const diaGen = _diaMx(gen.fecha);
+    const diaUso = _diaMx(usoUnico?.fecha ?? null);
     const usoCompleto = usoUnico && Math.abs(Number(usoUnico.montoSobrante) || 0) < 0.01;
 
-    const claveCentroGen = _claveCentroPorMonto(cobrosPorVenta, cuenta.serieVenta, cuenta.folioVenta, gen.monto);
+    // En el camino principal (centro+fecha), `obtenerSaldosFavorPorCentro`
+    // garantiza que TODOS los saldosFavorGenerados pertenecen al centro
+    // consultado — la venta GEN puede ser de un día anterior y sus cobros no
+    // estarán en `cobrosPorVenta` (que solo cubre el día del batch), así que
+    // usar `_claveCentroPorMonto` devolvería null y rompería la detección de
+    // `oculto`. En el camino fallback (por lote) sí usamos los cobros porque
+    // no tenemos certeza del centro.
+    const claveCentroGen = centroPropioClave
+      ?? _claveCentroPorMonto(cobrosPorVenta, cuenta.serieVenta, cuenta.folioVenta, gen.monto);
+    // En el camino principal, `cobrosPorVentaUso` se llena desde
+    // `obtenerDesglosesCobroAlmacenPorCentro` — si la venta USO aparece en ese
+    // mapa, ya sabemos que pertenece a `centroPropioClave`, aunque los cobros
+    // individuales no tengan `serieOrigen` en SERIES_CLAVE_CENTRO_SF (que es el
+    // requisito interno de `_claveCentroPorMonto` para extraer `claveCentro`).
+    // Se usa `centroPropioClave` como fallback en lugar de dejar null y romper
+    // la detección de SF-OCULTO (confirmado con el usuario 2026-08-17).
     const claveCentroUso = usoUnico
-      ? _claveCentroPorMonto(cobrosPorVentaUso, usoUnico.serieVenta, usoUnico.folioVenta, usoUnico.montoUsado, usoUnico.fecha)
+      ? (_claveCentroPorMonto(cobrosPorVentaUso, usoUnico.serieVenta, usoUnico.folioVenta, usoUnico.montoUsado, usoUnico.fecha)
+         ?? (centroPropioClave && cobrosPorVentaUso.has(`${usoUnico.serieVenta}|${usoUnico.folioVenta}`) ? centroPropioClave : null))
       : null;
     const centro = (claveCentroGen && ccBySerieMap) ? (ccBySerieMap[claveCentroGen] ?? null) : null;
 
-    // Cruce de sucursal: la Devolución se facturó con la serie de UNA
-    // sucursal (`cc`, ej. PROMOTORIA) pero se cobró/procesó físicamente en
-    // OTRA (`centro`, ej. CEDIS). Si es cruce, NUNCA se oculta aunque sea
-    // lavado el mismo día — la regla de "mismo almacén" solo aplica a un
-    // lavado dentro de la MISMA sucursal, sin cruce de por medio (confirmado
-    // con el usuario 2026-08-05: quiere ver SIEMPRE un cruce de sucursal,
-    // aunque el saldo se haya generado y usado el mismo día).
+    // `cfdiSeriePorVenta` solo tiene datos en el camino fallback — en el
+    // camino por centro+fecha cc=null → esCruzado=false (el cruce real ya lo
+    // detecta `_inyectarSaldoFavorGenerado` vía `centroProcesamiento`).
     const cfdiSerie = cfdiSeriePorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`);
-    const cc = (cfdiSerie && ccBySerieMap) ? (ccBySerieMap[cfdiSerie] ?? null) : null;
+    const cc        = (cfdiSerie && ccBySerieMap) ? (ccBySerieMap[cfdiSerie] ?? null) : null;
     const esCruzado = !!(centro && cc && String(centro.id) !== String(cc.id));
 
     const oculto = !esCruzado && !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso
@@ -337,15 +349,11 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     if (oculto) devsOcultos.add(key);
 
     // Caso "mismo folio" (confirmado con el usuario 2026-08-13): la MISMA
-    // venta generó Y consumió el saldo a favor (uso completo, sin sobrante) —
-    // a diferencia de `oculto` (día+almacén), este criterio compara
-    // directamente la venta de generación contra la venta de uso. Cuando
-    // aplica, `_inyectarSaldoFavorGenerado` NO contabiliza el pasivo
-    // (Anticipos Otros) — trata el monto como salida real de caja y lo resta
-    // del consolidado de Efectivo/Tarjeta, usando la forma de pago real de
-    // ESTA MISMA venta (ya la tenemos en `cobrosPorVenta`, sin llamada extra
-    // al ERP).
+    // venta generó Y consumió el saldo a favor (uso completo, sin sobrante).
+    // Guard: solo si ambas ventas tienen serie+folio no nulos, para evitar
+    // que dos saldos sin venta asociada se igualen falsamente por `null===null`.
     const mismoFolio = !!(usoUnico && usoCompleto
+      && cuenta.serieVenta && cuenta.folioVenta
       && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
       && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
 
@@ -2097,7 +2105,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // (registro aparte, no entra al consolidado de Efectivo/Tarjeta).
       if (desgloseReal || usoCaminoPorCentroProp) context.desglosePagoReal = desgloseReal ?? [];
       const sfUsado = saldoFavorUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
-      if (sfUsado) context.saldoFavorUsadoPropio = sfUsado;
+      if (sfUsado) {
+        const esSFOculto = sfUsado.detalle?.length > 0 && sfUsado.detalle.every(
+          d => devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`)
+        );
+        context.saldoFavorUsadoPropio = esSFOculto ? { ...sfUsado, esSFOculto: true } : sfUsado;
+      }
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
     }
@@ -2297,6 +2310,52 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       });
     }
     if (!rule) sinRegla++;
+  }
+
+  // Saldos a favor GEN-huérfanos: entradas del mapa cuya Devolución no pasó
+  // por el loop de CFDIs (ej. su CFDI tiene fecha distinta, serie de otra
+  // sucursal o no tiene los marcadores SAT/ERP que exige
+  // `_fetchNotasCreditoParaFusion` para incluirla en el batch). El mapa ya
+  // las tiene porque `_prefetchSaldosFavorGenerados` usa
+  // `obtenerSaldosFavorPorCentro` (por centro+fecha) como fuente principal —
+  // `_inyectarSaldoFavorGenerado` nunca se llamó para ellas, así que las
+  // líneas HABER no se crearon. Se inyectan aquí con el mismo formato que
+  // produce `_inyectarSaldoFavorGenerado` (tipoOrigen='Cobro Sucursal',
+  // reglaNombre='SF'/'SF-OCULTO') para que `_extraerCobrosSucursal`
+  // (poliza.service.js) las trate exactamente igual.
+  if (cuentaSaldoFavorIdProp && cuentaIvaSaldoFavorIdProp) {
+    const ccOrfanos = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+    const clavesConsumidas = new Set(
+      cfdisConNCProp
+        .filter(c => c.tipoDeComprobante === 'E')
+        .map(c => {
+          const marcador = (c.documentosRelacionados ?? [])
+            .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+          return marcador ? `${marcador.Serie}|${marcador.Folio}` : null;
+        })
+        .filter(Boolean),
+    );
+    for (const [key, generado] of mapaSaldosFavorGeneradosProp) {
+      if (clavesConsumidas.has(key)) continue;
+      if (!generado?.monto) continue;
+      const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
+      const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
+      const iva      = Math.round((generado.monto - subtotal) * 100) / 100;
+      const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
+      const base = {
+        concepto:       serieFolioVenta ?? key,
+        serie:          serieFolioVenta,
+        centroCosto:    ccOrfanos?.clave ?? null,
+        centroCostoId:  ccOrfanos?.id    ?? null,
+        cfdiUuid:       null,
+        cuentaFaltante: false,
+        tipoOrigen:     'Cobro Sucursal',
+        reglaNombre:    reglaSF,
+        debe:           0,
+      };
+      movimientosResult.push({ ...base, cuentaId: cuentaSaldoFavorIdProp,    haber: subtotal });
+      movimientosResult.push({ ...base, cuentaId: cuentaIvaSaldoFavorIdProp, haber: iva     });
+    }
   }
 
   // Puntos/Club Tuberos usados en el batch: UNA sola línea consolidada por
@@ -3051,7 +3110,12 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // (registro aparte, no entra al consolidado de Efectivo/Tarjeta).
       if (desgloseReal || usoCaminoPorCentroGuard) context.desglosePagoReal = desgloseReal ?? [];
       const sfUsado = saldoFavorUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
-      if (sfUsado) context.saldoFavorUsadoPropio = sfUsado;
+      if (sfUsado) {
+        const esSFOculto = sfUsado.detalle?.length > 0 && sfUsado.detalle.every(
+          d => devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`)
+        );
+        context.saldoFavorUsadoPropio = esSFOculto ? { ...sfUsado, esSFOculto: true } : sfUsado;
+      }
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
     }
@@ -3185,6 +3249,42 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         reglaNombre:   ppdCubiertaGuard.reglaNombre,
         cfdiUuid:      cfdi.uuid,
       });
+    }
+  }
+
+  // SF GEN-huérfanos — ver comentario equivalente en generarPropuesta.
+  if (cuentaSaldoFavorIdGuard && cuentaIvaSaldoFavorIdGuard) {
+    const ccOrfanosGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
+    const clavesConsumidasGuard = new Set(
+      cfdisConNCGuard
+        .filter(c => c.tipoDeComprobante === 'E')
+        .map(c => {
+          const marcador = (c.documentosRelacionados ?? [])
+            .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
+          return marcador ? `${marcador.Serie}|${marcador.Folio}` : null;
+        })
+        .filter(Boolean),
+    );
+    for (const [key, generado] of mapaSaldosFavorGeneradosGuard) {
+      if (clavesConsumidasGuard.has(key)) continue;
+      if (!generado?.monto) continue;
+      const reglaSFG = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
+      const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
+      const ivaG      = Math.round((generado.monto - subtotalG) * 100) / 100;
+      const serieFolioVentaG = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
+      const baseG = {
+        concepto:       serieFolioVentaG ?? key,
+        serie:          serieFolioVentaG,
+        centroCosto:    ccOrfanosGuard?.clave ?? null,
+        centroCostoId:  ccOrfanosGuard?.id    ?? null,
+        cfdiUuid:       null,
+        cuentaFaltante: false,
+        tipoOrigen:     'Cobro Sucursal',
+        reglaNombre:    reglaSFG,
+        debe:           0,
+      };
+      todosLosMovimientos.push({ ...baseG, cuentaId: cuentaSaldoFavorIdGuard,    haber: subtotalG });
+      todosLosMovimientos.push({ ...baseG, cuentaId: cuentaIvaSaldoFavorIdGuard, haber: ivaG     });
     }
   }
 

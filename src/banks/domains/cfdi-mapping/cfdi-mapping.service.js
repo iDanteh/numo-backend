@@ -838,7 +838,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       const subtotal = Math.round((monto / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
       const iva = Math.round((monto - subtotal) * 100) / 100;
       const conceptoCliente = [cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO', serieCfdi].filter(Boolean).join(' / ');
-      const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', _esCargoPrincipal: true };
+      const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: context.saldoFavorUsadoPropio?.esSFOculto ? 'SF-OCULTO' : 'SF', _esCargoPrincipal: true };
       movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
       movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
       restante = parseFloat((restante - monto).toFixed(2));

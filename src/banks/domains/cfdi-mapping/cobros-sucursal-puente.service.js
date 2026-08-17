@@ -575,21 +575,28 @@ async function construirMovimientosPuente({
       const fechaHastaIso = fechaHasta.toISOString();
       const cuentasIdsConocidas = new Set(cuentas.map(c => c.cuentaId).filter(Boolean));
 
+      // Folios de CFDIs propios de este centro en el batch actual — ya los
+      // procesa cfdiToMovimientos, incluirlos aquí duplicaría sus cobros.
+      // CFDIs de períodos ANTERIORES (ej. factura de julio con un SF usado
+      // hoy en agosto) NO están en el batch y nadie más los registra, así
+      // que el puente debe hacerlo (política: si el SF se usó ese día, va
+      // en esa póliza, sin importar cuándo se generó, confirmado 2026-08-17).
+      const ownBatchFolios = new Set(
+        cfdis.filter(c => c.serie === centroPropioClave && c.folio).map(c => String(c.folio))
+      );
+
       const cuentasDirecto = await obtenerDesglosesCobroAlmacenPorCentro({
         rfc, centro: centroPropioClave, fechaDesde: fechaDesdeIso, fechaHasta: fechaHastaIso,
       });
       for (const c of cuentasDirecto) {
         if (c.cuentaId && cuentasIdsConocidas.has(c.cuentaId)) continue;
-        // Omitir entradas cuya sucursal VENDEDORA es esta misma sucursal:
-        // ese cobro ya lo contabiliza el flujo normal de CFDI; incluirlo
-        // aquí lo duplicaría en el consolidado.
-        // — Si serieFactura === centroPropioClave el vendedor soy yo → omitir.
-        // — Si serieFactura es null no se sabe quién vendió → SE INCLUYE:
-        //   puede ser un cobro legítimo de otra sucursal (ej. SF de ISIDRO/
-        //   ANDER) cuya serieFactura el ERP no llenó. El riesgo de duplicado
-        //   es bajo porque el filtro principal (loop de cuentas) ya excluye
-        //   cuentasIdsConocidas (confirmado 2026-08-16).
-        if (centroPropioClave && c.serieFactura === centroPropioClave) continue;
+        // Omitir entradas cuya sucursal VENDEDORA es esta misma sucursal Y
+        // cuyo CFDI SÍ está en el batch actual (cfdiToMovimientos lo cubre).
+        // Si el folio es de un período anterior, el CFDI no está en el batch
+        // y el puente es el único que puede registrar el SF usado ese día.
+        // — Si serieFactura es null no se sabe quién vendió → SE INCLUYE.
+        if (centroPropioClave && c.serieFactura === centroPropioClave
+            && ownBatchFolios.has(String(c.folioFactura || c.folioVenta || ''))) continue;
         // Filtrar a solo los cobros que ocurrieron físicamente en ESTE centro.
         // El endpoint puede devolver el historial COMPLETO de un ticket,
         // incluyendo cobros en otros centros (ej. un ticket de Hidalgo que
@@ -606,6 +613,8 @@ async function construirMovimientosPuente({
         if (!cobrosFiltrados.length) continue;
         cuentas.push({ ...c, cobros: cobrosFiltrados });
         if (c.cuentaId) cuentasIdsConocidas.add(c.cuentaId);
+        // DEBUG TEMP
+        { const { logger } = require('../../../shared/utils/logger'); logger.warn(`[PUENTE-CUENTA] serieVenta=${c.serieVenta} folioVenta=${c.folioVenta} serieFactura=${c.serieFactura} folioFactura=${c.folioFactura} cobros=${cobrosFiltrados.length} seriesOrigen=${cobrosFiltrados.map(cb=>cb.serieOrigen).join(',')}`); }
       }
 
       // Resolver nombreCliente/metodoPago (vía Mongo, NO el ERP) de las cuentas
@@ -682,10 +691,37 @@ async function construirMovimientosPuente({
       const resultadoDirecto = await obtenerSaldosFavorPorCentro({
         rfc, centro: centroPropioClave, fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
       });
+      { const { logger } = require('../../../shared/utils/logger'); logger.warn(`[SF-CENTRO-RAW] cuentas=${resultadoDirecto.length} keys=${resultadoDirecto.slice(0,5).map(c=>c.serieVenta+"|"+c.folioVenta).join(",")}`); resultadoDirecto.forEach(c => { if (c.saldosFavorGenerados?.length) { c.saldosFavorGenerados.forEach(g => { if (g.usos?.length) logger.warn(`[SF-CENTRO-GEN] gen=${c.serieVenta}|${c.folioVenta} genOrigen=${g.serieOrigen}|${g.folioOrigen} usos=${JSON.stringify(g.usos.slice(0,3))}`); }); } if (c.saldosFavorUsados?.length) logger.warn(`[SF-CENTRO-USO] venta=${c.serieVenta}|${c.folioVenta} usados=${JSON.stringify(c.saldosFavorUsados.slice(0,3))}`); }); }
       for (const cuenta of resultadoDirecto) {
         const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
         if (cuenta.saldosFavorUsados?.length && !usadosPorCuenta.has(key)) {
           usadosPorCuenta.set(key, [...cuenta.saldosFavorUsados]);
+        }
+        // El ERP indexa los SF por la venta GEN (no por la venta USO), así
+        // que no hay un `saldosFavorUsados` de nivel superior — los usos
+        // vienen anidados en `saldosFavorGenerados[].usos[]`. Se extraen aquí
+        // para que ventas de períodos anteriores (ej. factura de julio con
+        // SF aplicado hoy en agosto) también aparezcan en `usadosPorCuenta`
+        // y el puente pueda registrar sus líneas de SF (2026-08-17).
+        for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+          for (const uso of (gen.usos ?? [])) {
+            const usoKey = `${uso.serieVenta}|${uso.folioVenta}`;
+            const existentes = usadosPorCuenta.get(usoKey) ?? [];
+            const yaExiste = existentes.some(
+              e => e.serieOrigen === gen.serieOrigen && String(e.folioOrigen) === String(gen.folioOrigen)
+            );
+            if (!yaExiste) {
+              usadosPorCuenta.set(usoKey, [...existentes, {
+                serieOrigen:   gen.serieOrigen,
+                folioOrigen:   gen.folioOrigen,
+                montoUsado:    uso.montoUsado,
+                fecha:         uso.fecha,
+                montoSobrante: uso.montoSobrante,
+                serieVenta:    uso.serieVenta,
+                folioVenta:    uso.folioVenta,
+              }]);
+            }
+          }
         }
       }
     } catch (err) {
@@ -942,7 +978,7 @@ async function construirMovimientosPuente({
         lineas.push({
           cuentaId:    esEfectivo ? cuentaCajaId : (idCuentaBancoReal ?? cuentaBancosId),
           montoAsignado,
-          reglaNombre: (idCuentaBancoReal && bancoReal?.referencia) ? bancoReal.referencia : (fp.nombre || fp.claveSat || null),
+          reglaNombre: (idCuentaBancoReal && bancoReal?.referencia) ? bancoReal.referencia : (fp.autorizacion || fp.nombre || fp.claveSat || null),
           esSF: false,
           concepto: conceptoBase,
         });
@@ -1013,6 +1049,53 @@ async function construirMovimientosPuente({
             lineas:               esCruzado ? lineas.map(l => ({ cuentaId: l.cuentaId, monto: l.montoAsignado, reglaNombre: l.reglaNombre })) : [],
             tratamiento:          'PUE',
             fechaCobro:           cobro.fecha ?? null,
+          });
+        }
+      }
+    }
+
+    // SF usado por ventas de períodos anteriores pagadas puramente con APA
+    // (aplicación de saldo a favor): la serie 'APA' no pasa el filtro
+    // SERIES_CON_AUTH del loop de arriba (ver nota ahí — ese filtro es
+    // correcto para ventas propias del batch). Para ventas de otro período
+    // que solo tienen cobros APA, los datos ya están en usadosPorCuenta
+    // (poblado desde saldosFavorGenerados[].usos[]). Política confirmada
+    // 2026-08-17: si el SF se usó ese día, va en esa póliza sin importar
+    // cuándo se generó ni el período de la venta original.
+    if (!esPPD && cuentaSaldoFavorId && cuentaIvaSaldoFavorId) {
+      const sfUsadosVenta = (usadosPorCuenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
+        .filter(u => {
+          if (!fechaDesde || !fechaHasta) return true;
+          const f = u.fecha ? new Date(u.fecha) : null;
+          return f && f >= fechaDesde && f <= fechaHasta;
+        });
+      const soloCobrosAPA = (cuenta.cobros ?? []).length > 0
+        && (cuenta.cobros ?? []).every(cb => (cb.serieOrigen ?? '').toUpperCase() === 'APA');
+      { const { logger } = require('../../../shared/utils/logger'); logger.warn(`[SF-APA] venta=${cuenta.serieVenta}|${cuenta.folioVenta} sfUsados=${sfUsadosVenta.length} soloCobrosAPA=${soloCobrosAPA} centroVendedorId=${centroVendedor?.id} centroCostoId=${centroCostoId}`); }
+      if (sfUsadosVenta.length > 0 && soloCobrosAPA
+          && centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
+        const montoSF = Math.round(
+          sfUsadosVenta.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0) * 100
+        ) / 100;
+        if (montoSF > 0) {
+          const usoOcultoAPA = sfUsadosVenta.every(
+            u => devsOcultosCombinado.has(`${u.serieOrigen}|${u.folioOrigen}`)
+          );
+          const reglaSF    = usoOcultoAPA ? ETIQUETA_SALDO_FAVOR_OCULTO : ETIQUETA_SALDO_FAVOR;
+          const subtotal   = Math.round((montoSF / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+          const iva        = Math.round((montoSF - subtotal) * 100) / 100;
+          const conceptoSF = [nombreCliente, serieFolioFactura].filter(Boolean).join(' / ');
+          candidatas.push({
+            cuentaId: cuentaSaldoFavorId, cuentaFaltante: false, concepto: conceptoSF,
+            debe: subtotal, haber: 0, serie: serieFolioFactura, folio: null,
+            centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+            tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, cfdiUuid: cfdiOriginal?.uuid ?? null,
+          });
+          candidatas.push({
+            cuentaId: cuentaIvaSaldoFavorId, cuentaFaltante: false, concepto: conceptoSF,
+            debe: iva, haber: 0, serie: serieFolioFactura, folio: null,
+            centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+            tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, cfdiUuid: cfdiOriginal?.uuid ?? null,
           });
         }
       }

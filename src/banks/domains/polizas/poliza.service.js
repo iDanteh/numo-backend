@@ -1407,6 +1407,10 @@ function _categoriaCobroSucursal(f) {
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
+  // SF-OCULTO: generados y usados el mismo día en la misma sucursal — no van
+  // a la póliza principal, pero SÍ deben aparecer en la hoja "Otros Ingresos"
+  // (antes se descartaban con `continue`, ahora se reencaminan).
+  const filasOtrosIngresosOcultos = [];
   // Pre-calcular los cfdiUuids de las entradas 'Cobro Sucursal' HABER para
   // poder identificar y también extraer el DEBE correspondiente ('Venta') del
   // mismo par. Sin esto, el DEBE queda en `resto` → `consolidarCargos` →
@@ -1465,7 +1469,16 @@ function _extraerCobrosSucursal(movimientos) {
       continue;
     }
     if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== 'Venta Sin Cobro' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
-    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO) continue;
+    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO) {
+      filasOtrosIngresosOcultos.push({
+        cuenta:      m.cuenta,
+        centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        concepto:    m.concepto || '',
+        debe:        Number(m.debe),
+        haber:       Number(m.haber),
+      });
+      continue;
+    }
     // OJO: NO usar `verdadBancaria`/`construirVerdadBancaria` aquí (busca por
     // `cfdiUuid`, sin distinguir vendedor/cobrador) — para una factura PPD,
     // el lado VENDEDOR (Abono Clientes + Cargo a la cuenta puente) comparte
@@ -1558,6 +1571,10 @@ function _extraerCobrosSucursal(movimientos) {
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;
   }
+  // Agregar los SF-OCULTO (mismo día + misma sucursal) a la hoja "Otros Ingresos" —
+  // nunca suman a depósitos consolidados de efectivo/tarjeta.
+  if (filasOtrosIngresosOcultos.length) filasOtrosIngresos.push(...filasOtrosIngresosOcultos);
+
   return { resto, filas, filasOtrosIngresos };
 }
 

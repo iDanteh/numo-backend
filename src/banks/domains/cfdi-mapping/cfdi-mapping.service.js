@@ -756,6 +756,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // `_prefetchSaldoFavorUsadoPropio`/`_prefetchDesglosePagoReal` en
   // cfdi-poliza-generator.service.js).
   const montoSFUsado     = Number(context.saldoFavorUsadoPropio?.monto) || 0;
+  const montoSFOculto    = Number(context.saldoFavorUsadoPropio?.montoOculto) || 0;
+  const montoSFVisible   = Number(context.saldoFavorUsadoPropio?.montoVisible) || 0;
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
@@ -834,14 +836,25 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // comentario en la constante) para no confundirse con
     // `_uuidsConCargoCubiertoEnBD`.
     if (montoSFUsado > 0) {
-      const monto = Math.min(montoSFUsado, restante);
-      const subtotal = Math.round((monto / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
-      const iva = Math.round((monto - subtotal) * 100) / 100;
+      // Split por origen (2026-08-17): una Factura Global puede combinar SF
+      // ocultable (generado/usado mismo día-almacén) con SF no-ocultable (de
+      // un periodo anterior) — cada porción se emite como su propia línea
+      // con su propio reglaNombre, en vez de una sola línea todo-o-nada (ver
+      // comentario en `_prefetchAjustesFacturaPropia`/generarPropuesta,
+      // cfdi-poliza-generator.service.js).
       const conceptoCliente = [cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO', serieCfdi].filter(Boolean).join(' / ');
-      const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: context.saldoFavorUsadoPropio?.esSFOculto ? 'SF-OCULTO' : 'SF', _esCargoPrincipal: true };
-      movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
-      movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
-      restante = parseFloat((restante - monto).toFixed(2));
+      const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, _esCargoPrincipal: true };
+      const emitirLineaSF = (montoBruto, reglaNombre) => {
+        if (montoBruto <= 0 || restante <= 0) return;
+        const monto = Math.min(montoBruto, restante);
+        const subtotal = Math.round((monto / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+        const iva = Math.round((monto - subtotal) * 100) / 100;
+        movs.push({ ...baseSF, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
+        movs.push({ ...baseSF, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
+        restante = parseFloat((restante - monto).toFixed(2));
+      };
+      emitirLineaSF(montoSFOculto, 'SF-OCULTO');
+      emitirLineaSF(montoSFVisible, 'SF');
     }
     // Puntos/Club Tuberos: a diferencia de SF, va CONSOLIDADO en una sola
     // línea genérica por sucursal/día ("CLIENTE DE MOSTRADOR SUC. X"), no

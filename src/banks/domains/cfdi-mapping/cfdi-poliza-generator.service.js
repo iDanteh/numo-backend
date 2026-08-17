@@ -1575,7 +1575,24 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // "ya contabilizada" para siempre y su propia línea de Venta (Ingresos +
     // IVA) nunca se genera en ningún día (confirmado con el usuario
     // 2026-08-04: Global I0-260700155 nunca aparecía como Venta).
-    where:      { cfdiUuid: { [Op.ne]: null }, tipoOrigen: { [Op.ne]: 'Cobro Sucursal' } },
+    // reglaNombre != 'COS': mismo problema, otra variante — el Cargo del
+    // mecanismo "cobrosCobradoraDirecta" (línea ~2506) etiqueta su propia
+    // mitad del par cruzado como tipoOrigen='Venta' (a propósito, para que
+    // entre al consolidado de Depósitos de la sucursal COBRADORA), pero eso
+    // la deja indistinguible de la Venta real de la Factura Global — vuelve a
+    // marcarla "ya contabilizada" para siempre en la sucursal VENDEDORA (caso
+    // real confirmado 2026-08-17: VIGUERA N0-260800019 nunca generaba su
+    // línea de Venta porque el ticket 260800046 cobrado en otra sucursal ya
+    // había insertado esta fila). 'COS' es el único reglaNombre que usa este
+    // mecanismo (nunca lo usa una regla de mapeo real). `[Op.or]` con
+    // `reglaNombre: null` porque `!=` en SQL no matchea NULL — sin esto,
+    // cualquier Venta normal con reglaNombre NULL se excluiría por error de
+    // "ya contabilizados" (nunca se marcaría como ya usada).
+    where: {
+      cfdiUuid:   { [Op.ne]: null },
+      tipoOrigen: { [Op.ne]: 'Cobro Sucursal' },
+      [Op.or]:    [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }],
+    },
     attributes: ['cfdiUuid'],
     include: [{
       model:      Poliza,
@@ -2106,10 +2123,24 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       if (desgloseReal || usoCaminoPorCentroProp) context.desglosePagoReal = desgloseReal ?? [];
       const sfUsado = saldoFavorUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (sfUsado) {
-        const esSFOculto = sfUsado.detalle?.length > 0 && sfUsado.detalle.every(
-          d => devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`)
-        );
-        context.saldoFavorUsadoPropio = esSFOculto ? { ...sfUsado, esSFOculto: true } : sfUsado;
+        // Split por origen (no todo-o-nada): una Factura Global puede combinar
+        // SF de VARIAS Devoluciones — algunas "lavadas" el mismo día/almacén
+        // (ocultables) y otras de un periodo anterior (NO ocultables). El
+        // `.every()` anterior exigía que TODAS calificaran para ocultar
+        // cualquier cosa, así que un solo origen no-ocultable escondía la
+        // ocultación de TODO el monto combinado (caso real confirmado
+        // 2026-08-17: Atzompa E0-260800025, DEV-056098 mismo día/almacén +
+        // DEV-055729 de julio — el monto completo se quedaba visible en vez
+        // de ocultar solo la porción de DEV-056098).
+        const detalle = sfUsado.detalle ?? [];
+        const montoOculto = Math.round(detalle
+          .filter(d => devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`))
+          .reduce((s, d) => s + (Number(d.monto) || 0), 0) * 100) / 100;
+        context.saldoFavorUsadoPropio = {
+          ...sfUsado,
+          montoOculto,
+          montoVisible: Math.round((sfUsado.monto - montoOculto) * 100) / 100,
+        };
       }
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
@@ -2640,7 +2671,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // "ya contabilizada" para siempre y su propia línea de Venta (Ingresos +
     // IVA) nunca se genera en ningún día (confirmado con el usuario
     // 2026-08-04: Global I0-260700155 nunca aparecía como Venta).
-    where:      { cfdiUuid: { [Op.ne]: null }, tipoOrigen: { [Op.ne]: 'Cobro Sucursal' } },
+    // reglaNombre != 'COS': ver comentario equivalente en generarPropuesta —
+    // mismo problema con el Cargo de "cobrosCobradoraDirecta" etiquetado
+    // tipoOrigen='Venta' (caso real VIGUERA N0-260800019, 2026-08-17).
+    // `[Op.or]` con reglaNombre: null porque `!=` en SQL no matchea NULL.
+    where: {
+      cfdiUuid:   { [Op.ne]: null },
+      tipoOrigen: { [Op.ne]: 'Cobro Sucursal' },
+      [Op.or]:    [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }],
+    },
     attributes: ['cfdiUuid'],
     include: [{
       model:      Poliza,
@@ -3111,10 +3150,17 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       if (desgloseReal || usoCaminoPorCentroGuard) context.desglosePagoReal = desgloseReal ?? [];
       const sfUsado = saldoFavorUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (sfUsado) {
-        const esSFOculto = sfUsado.detalle?.length > 0 && sfUsado.detalle.every(
-          d => devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`)
-        );
-        context.saldoFavorUsadoPropio = esSFOculto ? { ...sfUsado, esSFOculto: true } : sfUsado;
+        // Ver comentario equivalente en generarPropuesta sobre el split por
+        // origen (no todo-o-nada) de una Factura Global con SF combinado.
+        const detalle = sfUsado.detalle ?? [];
+        const montoOculto = Math.round(detalle
+          .filter(d => devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`))
+          .reduce((s, d) => s + (Number(d.monto) || 0), 0) * 100) / 100;
+        context.saldoFavorUsadoPropio = {
+          ...sfUsado,
+          montoOculto,
+          montoVisible: Math.round((sfUsado.monto - montoOculto) * 100) / 100,
+        };
       }
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;

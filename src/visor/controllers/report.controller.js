@@ -1227,8 +1227,16 @@ const notInErp = asyncHandler(async (req, res) => {
     .sort({ fecha: -1 })
     .lean();
 
-  // Paso 3a: SAT sin contraparte ERP en este mismo periodo
-  const sinContraparteErp = satDocs.filter(d => !erpUuidsPeriodo.has(d.uuid?.toUpperCase()));
+  // Paso 3a: SAT sin contraparte ERP en este mismo periodo — excluye los ya
+  // conciliados manualmente (`POST /comparisons/conciliar-not-in-erp`, ver
+  // comparison.controller.js): ese endpoint marca `lastComparisonStatus:
+  // 'conciliado'` en el CFDI, pero este reporte recalcula "sin contraparte
+  // ERP" desde cero por diferencia de sets de UUID en cada llamada — sin este
+  // filtro, la factura conciliada seguía sin existir en ERP y por lo tanto
+  // volvía a aparecer aquí siempre, ignorando la conciliación (confirmado con
+  // el usuario 2026-08-14: concilió una factura y seguía apareciendo).
+  const sinContraparteErp = satDocs.filter(d =>
+    !erpUuidsPeriodo.has(d.uuid?.toUpperCase()) && d.lastComparisonStatus !== 'conciliado');
 
   // Paso 3b: duplicados SAT — mismo UUID más de una vez en SAT para el periodo
   const uuidCount = {};
@@ -1384,10 +1392,22 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
  *     IVA, diferencia de monto y detalle campo a campo de por qué difieren.
  */
 const conciliacionExcel = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo } = req.query;
+  const { ejercicio, periodo, rfcEmisor } = req.query;
   const periodoFilter = {};
   if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
   if (periodo)   periodoFilter.periodo   = parseInt(periodo);
+
+  // Este reporte es solo de Emitidos — igual que /dashboard y /not-in-erp,
+  // nunca debe incluir Recibidos (que jamás tienen contraparte ERP y
+  // contaminarían el listado de "sin contraparte ERP" como si fueran
+  // ventas propias). Si no llega rfcEmisor se restringe a las entidades
+  // propias (confirmado con el usuario: mismo bug ya corregido en
+  // notInErp/discrepanciasMontos/discrepanciasCriticas, reaparecido aquí).
+  let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
+  if (!emisorConstraint) {
+    const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
+    emisorConstraint = { $in: entidadesRfcs };
+  }
 
   const TIPO_LABEL    = { I: 'Ingreso', E: 'Egreso', P: 'Pago', T: 'Traslado', N: 'Nómina' };
   const SEV_LABEL     = { critical: 'Crítica', high: 'Alta', warning: 'Advertencia', medium: 'Media', low: 'Baja' };
@@ -1400,38 +1420,38 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   const [allErpCfdis, erpCancelados, erpDeshabilitados, erpInactivoSatVigente, allSatForPeriod, resumenTipos, resumenSAT, cfdisMigrados, sinUuidCfdis] = await Promise.all([
 
     // CFDIs ERP Timbrados/Habilitados — igual que montosAggregate del dashboard
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, 'emisor.rfc': emisorConstraint, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, lastComparisonStatus: 1, fecha: -1 })
       .lean(),
 
     // CFDIs ERP cancelados del periodo (hoja separada)
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente'] }, ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
     // CFDIs ERP deshabilitados del periodo (hoja separada)
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: 'Deshabilitado', ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: 'Deshabilitado', 'emisor.rfc': emisorConstraint, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
     // ERP inactivo (Cancelado/Cancelacion Pendiente/Deshabilitado) pero SAT aún Vigente — hacen diferencia
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Vigente', erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente', 'Deshabilitado'] }, ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, satStatus: 'Vigente', erpStatus: { $in: ['Cancelado', 'Cancelacion Pendiente', 'Deshabilitado'] }, 'emisor.rfc': emisorConstraint, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
 
     // CFDIs SAT/MANUAL sin contraparte ERP (por lastComparisonStatus)
-    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', ...periodoFilter })
+    CFDI.find({ source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, lastComparisonStatus: 'not_in_erp', 'emisor.rfc': emisorConstraint, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal impuestos total moneda satStatus ejercicio periodo source')
       .sort({ tipoDeComprobante: 1, total: -1 })
       .lean(),
 
     // Resumen KPI ERP por tipo
     CFDI.aggregate([
-      { $match: { source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, ...periodoFilter } },
+      { $match: { source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: { $not: /^SINUUID/ }, 'emisor.rfc': emisorConstraint, ...periodoFilter } },
       { $group: {
         _id:             '$tipoDeComprobante',
         count:           { $sum: 1 },
@@ -1448,7 +1468,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
     // Totales SAT — solo Vigente
     CFDI.aggregate([
-      { $match: { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, satStatus: 'Vigente', ...periodoFilter } },
+      { $match: { source: { $in: ['SAT', 'MANUAL'] }, isActive: { $ne: false }, satStatus: 'Vigente', 'emisor.rfc': emisorConstraint, ...periodoFilter } },
       { $group: {
         _id:                '$tipoDeComprobante',
         totalMonto:         { $sum: MONTO_EFECTIVO_EXPR },
@@ -1464,6 +1484,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     CFDI.find({
       isActive: { $ne: false },
       'informacionGlobal.mes': { $exists: true, $nin: [null, ''] },
+      'emisor.rfc': emisorConstraint,
       ...periodoFilter,
       ...(periodoFilter.ejercicio || periodoFilter.periodo ? {
         $or: [
@@ -1477,7 +1498,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
       .lean(),
 
     // CFDIs ERP sin timbrar (uuid SINUUID-*): existen en ERP pero sin UUID fiscal real
-    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: /^SINUUID/, ...periodoFilter })
+    CFDI.find({ source: 'ERP', isActive: { $ne: false }, erpStatus: { $in: ['Timbrado', 'Habilitado'] }, uuid: /^SINUUID/, 'emisor.rfc': emisorConstraint, ...periodoFilter })
       .select('uuid serie folio tipoDeComprobante fecha emisor receptor subTotal descuento impuestos total moneda erpStatus satStatus lastComparisonStatus ejercicio periodo')
       .sort({ tipoDeComprobante: 1, fecha: -1 })
       .lean(),
@@ -2453,6 +2474,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
     numAutorizacion, idNumo,
     serieCxc, folioCxc,
     fechaInicio, fechaFin,
+    formaPago,
     ejercicio, periodo,
     rfcEmisor,
     estado = 'todos',
@@ -2489,6 +2511,10 @@ const pagosBanco = asyncHandler(async (req, res) => {
   const drMatch = {};
   if (serie) drMatch['complementoPago.pagos.doctosRelacionados.serie'] = { $regex: serie.trim(), $options: 'i' };
   if (folio) drMatch['complementoPago.pagos.doctosRelacionados.folio'] = { $regex: folio.trim(), $options: 'i' };
+  // formaPago = "Método de pago" en la UI: forma de pago REAL con la que se
+  // hizo el pago (catálogo c_FormaPago, ej. 01 Efectivo/03 Transferencia) —
+  // va en el Pago, no en la factura liquidada.
+  if (formaPago) drMatch['complementoPago.pagos.formaDePagoP'] = formaPago;
   if (fechaInicio || fechaFin) {
     drMatch['complementoPago.pagos.fechaPago'] = {};
     if (fechaInicio) drMatch['complementoPago.pagos.fechaPago'].$gte = new Date(fechaInicio);
@@ -3077,7 +3103,7 @@ const pagosBanco = asyncHandler(async (req, res) => {
  * Descarga Excel con los mismos filtros que pagosBanco (sin paginación).
  */
 const pagosBancoExport = asyncHandler(async (req, res) => {
-  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, ejercicio, periodo, rfcEmisor, estado = 'todos' } = req.query;
+  const { uuid, serie, folio, banco, numAutorizacion, idNumo, serieCxc, folioCxc, fechaInicio, fechaFin, formaPago, ejercicio, periodo, rfcEmisor, estado = 'todos' } = req.query;
 
   // Solo Emitidos — nunca Recibidos — mismo criterio que /dashboard.
   let emisorConstraint = rfcEmisor ? rfcEmisor.toUpperCase() : null;
@@ -3105,6 +3131,10 @@ const pagosBancoExport = asyncHandler(async (req, res) => {
   const drMatch = {};
   if (serie) drMatch['complementoPago.pagos.doctosRelacionados.serie'] = { $regex: serie.trim(), $options: 'i' };
   if (folio) drMatch['complementoPago.pagos.doctosRelacionados.folio'] = { $regex: folio.trim(), $options: 'i' };
+  // formaPago = "Método de pago" en la UI: forma de pago REAL con la que se
+  // hizo el pago (catálogo c_FormaPago, ej. 01 Efectivo/03 Transferencia) —
+  // va en el Pago, no en la factura liquidada.
+  if (formaPago) drMatch['complementoPago.pagos.formaDePagoP'] = formaPago;
   if (fechaInicio || fechaFin) {
     drMatch['complementoPago.pagos.fechaPago'] = {};
     if (fechaInicio) drMatch['complementoPago.pagos.fechaPago'].$gte = new Date(fechaInicio);

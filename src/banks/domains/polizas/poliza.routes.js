@@ -153,6 +153,30 @@ router.post('/:id/contabilizar',
   }),
 );
 
+// POST /api/polizas/:id/resolver-cuentas-banco
+// Corre el cruce automático de cuenta puente → cuenta bancaria real y lo
+// persiste; devuelve { actualizados, pendientes } — pendientes = grupos que
+// quedaron sin cruce posible, para que el frontend los muestre en un modal
+// antes de confirmar la contabilización.
+router.post('/:id/resolver-cuentas-banco',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.resolverCuentasBanco(req.params.id));
+  }),
+);
+
+// POST /api/polizas/:id/reemplazar-cuenta
+// Reemplaza en toda la póliza las líneas que usan cuentaPuenteId por cuentaDestinoId.
+// Body: { cuentaPuenteId, cuentaDestinoId }
+router.post('/:id/reemplazar-cuenta',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.reemplazarCuenta(req.params.id, req.body, req.user));
+  }),
+);
+
 // POST /api/polizas/:id/cancelar
 router.post('/:id/cancelar',
   authenticate,
@@ -189,11 +213,13 @@ router.post('/cierre-iva',
 );
 
 // POST /api/polizas/:id/revertir  (solo admin)
+// Body: { motivo?, revertirCuentas? }  — revertirCuentas default true.
 router.post('/:id/revertir',
   authenticate,
   permit('polizas:admin'),
   asyncHandler(async (req, res) => {
-    res.json(await service.revertir(req.params.id, req.user, req.body?.motivo));
+    const revertirCuentas = req.body?.revertirCuentas !== false;
+    res.json(await service.revertir(req.params.id, req.user, req.body?.motivo, revertirCuentas));
   }),
 );
 

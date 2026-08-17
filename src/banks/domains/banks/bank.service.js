@@ -14,6 +14,8 @@ const bankRuleRepo     = require('./repositories/bank-rule.repository');
 const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
 const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 const rbacStore = require('../../../shared/services/rbac-store');
+const polizaService      = require('../polizas/poliza.service');
+const { logger }         = require('../../../shared/utils/logger');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const BANCOS_VALIDOS = [
@@ -1979,6 +1981,16 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
   mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
   await mov.save(session ? { session } : undefined);
+
+  // Resuelve sola cualquier línea de póliza que seguía en cuenta puente para
+  // los CFDIs que este movimiento acaba de identificar — no bloquea la
+  // respuesta ni el guardado de erpLinks si falla (efecto secundario, no
+  // crítico para la conciliación bancaria en sí).
+  const uuidsRecienLigados = cleanLinks.map(l => l.folioFiscal).filter(Boolean);
+  if (uuidsRecienLigados.length > 0) {
+    polizaService.resolverCuentasPorCfdisIdentificados(uuidsRecienLigados, mov.banco)
+      .catch(err => logger.warn(`[BankService] resolverCuentasPorCfdisIdentificados falló: ${err.message}`));
+  }
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,

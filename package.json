@@ -57,7 +57,7 @@
     "multer": "^1.4.5-lts.1",
     "node-cron": "^3.0.3",
     "node-forge": "^1.4.0",
-    "nodemailer": "^9.0.3",
+    "nodemailer": "^9.0.5",
     "onnxruntime-node": "^1.27.0",
     "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^3.11.174",
@@ -85,6 +85,8 @@
     "node": ">=18.0.0"
   },
   "nodemonConfig": {
-    "ignore": ["src/shared/config/roles.snapshot.json"]
+    "ignore": [
+      "src/shared/config/roles.snapshot.json"
+    ]
   }
 }

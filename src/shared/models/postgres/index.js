@@ -26,6 +26,7 @@ const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
+const Notificacion      = require('./Notificacion');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -42,6 +43,10 @@ Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimien
 PolizaMovimiento.belongsTo(Poliza,       { foreignKey: 'polizaId', as: 'poliza' });
 PolizaMovimiento.belongsTo(AccountPlan,  { foreignKey: 'cuentaId', as: 'cuenta' });
 AccountPlan.hasMany   (PolizaMovimiento, { foreignKey: 'cuentaId', as: 'movimientos' });
+
+/** Notificaciones (bandeja) */
+Notificacion.belongsTo(Poliza, { foreignKey: 'polizaId', as: 'poliza' });
+Poliza.hasMany(Notificacion,   { foreignKey: 'polizaId', as: 'notificaciones' });
 
 /** Centros de costo */
 PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
@@ -68,12 +73,18 @@ async function syncModels() {
   // agotan la memoria compartida de locks/catálogo (error "memoria compartida
   // agotada" / "out of shared memory", típico con max_locks_per_transaction
   // bajo en instancias de desarrollo).
-  await User.sync({ alter: !isProd });
-  await BankConfig.sync({ alter: !isProd });
-  await BankRule.sync({ alter: !isProd });
-  await Entity.sync({ alter: !isProd });
-  await Permission.sync({ alter: !isProd });
-  await Role.sync({ alter: !isProd });
+  // Try-catch: en dev, `alter:true` puede fallar si pg tiene max_locks bajo;
+  // la tabla ya existe → el servidor arranca igualmente.
+  const syncAlter = async (model) => {
+    try { await model.sync({ alter: !isProd }); }
+    catch (e) { console.warn(`[syncModels] ${model.name}.sync alter falló (tabla ya existe): ${e.message}`); }
+  };
+  await syncAlter(User);
+  await syncAlter(BankConfig);
+  await syncAlter(BankRule);
+  await syncAlter(Entity);
+  await syncAlter(Permission);
+  await syncAlter(Role);
 
   // Columna intercompañía en entidades (idempotente)
   await Poliza.sequelize.query(`
@@ -91,17 +102,31 @@ async function syncModels() {
   await CobroSucursalPendiente.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
-  await AccountPlan.sync({ alter: !isProd });
+  await syncAlter(AccountPlan);
 
   // PeriodoFiscal depende de users
-  await PeriodoFiscal.sync({ alter: !isProd });
+  await syncAlter(PeriodoFiscal);
 
   // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
-  await CfdiMappingRule.sync({ alter: !isProd });
+  await syncAlter(CfdiMappingRule);
 
   // Pólizas: force:false para no tocar ENUMs ni datos existentes.
   await Poliza.sync({ force: false });
   await PolizaMovimiento.sync({ force: false });
+
+  // Bandeja de notificaciones (ver Notificacion.js) — tabla nueva, force:false
+  // para solo crearla si no existe; depende de `polizas`, por eso va después.
+  // Ojo: si la tabla ya existe SIN alguna columna del modelo (ej. `resuelta`,
+  // agregada después), `.sync({force:false})` falla al intentar crear el
+  // índice de esa columna — por eso el ALTER de columnas nuevas va ANTES del
+  // único `.sync()`, nunca después.
+  await Notificacion.sequelize.query(`
+    ALTER TABLE notificaciones
+      ADD COLUMN IF NOT EXISTS resuelta     BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS resuelta_por VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS resuelta_at  TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN resuelta en notificaciones:', e.message));
+  await Notificacion.sync({ force: false });
 
   // Agregar columnas de auditoría si no existen (seguro correrlo múltiples veces)
   await Poliza.sequelize.query(`
@@ -129,6 +154,13 @@ async function syncModels() {
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ALTER COLUMN cuenta_id DROP NOT NULL`
   ).catch(e => console.warn('[syncModels] DROP NOT NULL cuenta_id:', e.message));
+
+  // Cuenta antes del cruce banco-real/reemplazo manual — se restaura al
+  // revertir la póliza a borrador (ver `revertir`/`restaurarCuentasAnteriores`).
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS cuenta_anterior_id INTEGER REFERENCES account_plans(id)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_anterior_id:', e.message));
 
   await Poliza.sequelize.query(
     `ALTER TABLE poliza_movimientos ADD COLUMN IF NOT EXISTS cuenta_faltante BOOLEAN NOT NULL DEFAULT FALSE`
@@ -286,4 +318,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ADD COLUMN extra_permissions (users):', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, syncModels };

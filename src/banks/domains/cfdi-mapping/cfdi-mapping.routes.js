@@ -66,9 +66,11 @@ router.post('/rules/migrar-ppd-descuento',
 // ── Generador de propuesta ────────────────────────────────────────────────────
 
 // POST /api/cfdi-mapping/generar-propuesta
-// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, fechaInicio?, fechaFin? }
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, fechaInicio?, fechaFin?, formaPagoFiltro? }
 // fechaInicio/fechaFin: si se mandan (ambos), acotan el periodo a ese rango de
 // días en vez de procesar el mes completo.
+// formaPagoFiltro: solo aplica si tipoCfdi='P' (Cobranza) — 'EFECTIVO'|'TRANSFERENCIA'|
+// 'TARJETA'|'CHEQUE', ver FORMA_PAGO_A_CATEGORIA en cfdi-poliza-generator.service.js.
 router.post('/generar-propuesta',
   authenticate,
   permit('polizas:write'),
@@ -77,10 +79,10 @@ router.post('/generar-propuesta',
 
 // POST /api/cfdi-mapping/generar-y-guardar
 // Guarda la póliza directo como borrador (sin límite de CFDIs).
-// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, centroCostoId?, fechaInicio?, fechaFin? }
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, centroCostoId?, fechaInicio?, fechaFin?, formaPagoFiltro? }
 // centroCostoId: si se manda, solo procesa CFDIs de esa sucursal. Si se omite,
 // procesa todas las sucursales mezcladas en una sola póliza (comportamiento previo).
-// fechaInicio/fechaFin: mismo filtro opcional que en generar-propuesta.
+// fechaInicio/fechaFin/formaPagoFiltro: mismo filtro opcional que en generar-propuesta.
 // Response: { polizaId, totalCfdis, sinRegla, advertencias }
 router.post('/generar-y-guardar',
   authenticate,
@@ -91,7 +93,7 @@ router.post('/generar-y-guardar',
 // POST /api/cfdi-mapping/generar-y-guardar-por-sucursal
 // Genera una póliza SEPARADA por cada sucursal (centro de costo) que tenga
 // CFDIs sin póliza en el periodo, en vez de una sola póliza con todo mezclado.
-// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi }
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, fechaInicio?, fechaFin?, formaPagoFiltro? }
 // Response: { resultados: [{ centroCosto, centroCostoId, polizaId?, totalCfdis?, sinRegla?, error? }] }
 router.post('/generar-y-guardar-por-sucursal',
   authenticate,
@@ -102,7 +104,7 @@ router.post('/generar-y-guardar-por-sucursal',
 // POST /api/cfdi-mapping/generar-y-guardar-por-dia
 // Genera una póliza SEPARADA por cada día del rango (o del mes completo si no
 // se manda fechaInicio/fechaFin) que tenga CFDIs sin póliza.
-// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, centroCostoId?, fechaInicio?, fechaFin? }
+// Body: { rfc, ejercicio, periodo, tipoPropuesta?, tipoCfdi, centroCostoId?, fechaInicio?, fechaFin?, formaPagoFiltro? }
 // Response: { resultados: [{ fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
 router.post('/generar-y-guardar-por-dia',
   authenticate,
@@ -115,7 +117,7 @@ router.post('/generar-y-guardar-por-dia',
 // .xlsx de CONTPAQ de cada una — carpeta por sucursal cuando el modo incluye
 // sucursal, un archivo por día cuando incluye día, más un _resumen.txt con
 // éxitos/errores de cada combinación (no cabe un JSON aparte junto al binario).
-// Body: { rfc, ejercicio, periodo, tipoCfdi, tipoPropuesta?, modo: 'porSucursal'|'porDia'|'porDiaYSucursal', fechaInicio?, fechaFin? }
+// Body: { rfc, ejercicio, periodo, tipoCfdi, tipoPropuesta?, modo: 'porSucursal'|'porDia'|'porDiaYSucursal', fechaInicio?, fechaFin?, formaPagoFiltro? }
 router.post('/exportar-contpaq-zip',
   authenticate,
   permit('polizas:write'),

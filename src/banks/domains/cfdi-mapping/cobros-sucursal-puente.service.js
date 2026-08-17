@@ -67,7 +67,11 @@
 const { Op } = require('sequelize');
 const { PolizaMovimiento, Poliza, AccountPlan, CobroSucursalPendiente } = require('../../../shared/models/postgres');
 const BankMovement = require('../banks/BankMovement.model');
-const { obtenerDesglosesCobroAlmacen, obtenerSaldosFavor } = require('../erp/erp-sync.service');
+const CFDI = require('../../../visor/models/CFDI');
+const {
+  obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
+  obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
+} = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 
 // `BankMovement.banco` → código de cuenta bancaria real del catálogo — mismo
@@ -498,6 +502,16 @@ async function construirMovimientosPuente({
   // Si vienen null (generación sin acotar por día), no se filtra nada.
   fechaDesde,
   fechaHasta,
+  // Serie de facturación de ESTA sucursal (ej. "E0" para Atzompa) — cuando
+  // viene junto con fechaDesde/fechaHasta, permite que la sucursal COBRADORA
+  // descubra DIRECTO (sin depender de que la vendedora ya se haya generado)
+  // lo que cobró de otras sucursales ese día, vía el endpoint nuevo
+  // `/desgloses-cobro/almacen` y `/saldos-favor` filtrado por centro+fecha
+  // (ver `obtenerDesglosesCobroAlmacenPorCentro`/`obtenerSaldosFavorPorCentro`
+  // en erp-sync.service.js). Complementa (no reemplaza) la cola
+  // `CobroSucursalPendiente`: si algo no llega por aquí (fuera del rango de
+  // fechas, endpoint caído, etc.), la cola sigue siendo la red de seguridad.
+  centroPropioClave,
 }) {
   const vacio = { movimientos: [], facturasVendedorCubiertas: new Map(), facturasPPDCubiertas: new Map(), pendientesPorFacturar: [] };
   if (!centroCostoId || !cuentaCajaId || !cuentaBancosId) return vacio;
@@ -508,7 +522,10 @@ async function construirMovimientosPuente({
   const docsPorCfdi = cfdis
     .flatMap(cfdi => _extraerDocumentosRelacionados(cfdi).map(doc => ({ cfdi, doc })));
 
-  if (!docsPorCfdi.length) return vacio;
+  // Puede seguir sin ningún documento relacionado conocido y AÚN encontrar
+  // cobros cruzados vía la consulta directa por centro+fecha (más abajo) —
+  // solo se corta aquí si tampoco hay esa vía disponible.
+  if (!docsPorCfdi.length && !(centroPropioClave && fechaDesde && fechaHasta)) return vacio;
 
   // Mapa serie|folio del documento relacionado → CFDI original, para poder
   // recuperar el nombre del cliente (receptor) de cada cuenta que regrese la
@@ -536,6 +553,111 @@ async function construirMovimientosPuente({
     });
     cuentas.push(...resultado);
   }
+
+  // 1a-bis. Consulta DIRECTA por centro+fecha (2026-08-13) — a diferencia del
+  // bloque anterior (que solo conoce los documentos referenciados por `cfdis`,
+  // acotado a la serie PROPIA), este endpoint regresa TODO lo cobrado/vendido
+  // en ESTE centro ese día, sin importar de qué serie sea la venta. Es lo que
+  // permite que la sucursal COBRADORA descubra un cruce por su cuenta, sin
+  // esperar a que la VENDEDORA se haya generado primero y encolado el dato en
+  // `CobroSucursalPendiente`. Solo aplica generando por día (necesita
+  // fechaDesde/fechaHasta acotados a un único día — no tiene sentido pedirle
+  // al ERP "todo lo cobrado en este centro en el mes completo").
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    // Ya liberado en producción (confirmado con el usuario 2026-08-14) — el
+    // try/catch se deja de todos modos: si falla por cualquier otra razón
+    // (ERP caído, timeout, etc.), esto NO debe tumbar la generación completa
+    // de la póliza: se ignora esta fuente y se sigue solo con lo que ya
+    // encontró la vía de siempre (documentos relacionados + cola
+    // `CobroSucursalPendiente`).
+    try {
+      const fechaDesdeIso = fechaDesde.toISOString();
+      const fechaHastaIso = fechaHasta.toISOString();
+      const cuentasIdsConocidas = new Set(cuentas.map(c => c.cuentaId).filter(Boolean));
+
+      // Folios de CFDIs propios de este centro en el batch actual — ya los
+      // procesa cfdiToMovimientos, incluirlos aquí duplicaría sus cobros.
+      // CFDIs de períodos ANTERIORES (ej. factura de julio con un SF usado
+      // hoy en agosto) NO están en el batch y nadie más los registra, así
+      // que el puente debe hacerlo (política: si el SF se usó ese día, va
+      // en esa póliza, sin importar cuándo se generó, confirmado 2026-08-17).
+      const ownBatchFolios = new Set(
+        cfdis.filter(c => c.serie === centroPropioClave && c.folio).map(c => String(c.folio))
+      );
+
+      const cuentasDirecto = await obtenerDesglosesCobroAlmacenPorCentro({
+        rfc, centro: centroPropioClave, fechaDesde: fechaDesdeIso, fechaHasta: fechaHastaIso,
+      });
+      for (const c of cuentasDirecto) {
+        if (c.cuentaId && cuentasIdsConocidas.has(c.cuentaId)) continue;
+        // Omitir entradas cuya sucursal VENDEDORA es esta misma sucursal Y
+        // cuyo CFDI SÍ está en el batch actual (cfdiToMovimientos lo cubre).
+        // Si el folio es de un período anterior, el CFDI no está en el batch
+        // y el puente es el único que puede registrar el SF usado ese día.
+        // — Si serieFactura es null no se sabe quién vendió → SE INCLUYE.
+        if (centroPropioClave && c.serieFactura === centroPropioClave
+            && ownBatchFolios.has(String(c.folioFactura || c.folioVenta || ''))) continue;
+        // Filtrar a solo los cobros que ocurrieron físicamente en ESTE centro.
+        // El endpoint puede devolver el historial COMPLETO de un ticket,
+        // incluyendo cobros en otros centros (ej. un ticket de Hidalgo que
+        // también tuvo un cobro en CEDIS). Esos cobros-en-otro-centro para
+        // CFDIs PROPIOS ya los detecta el camino serie/folio y los procesa
+        // en el bloque vendedor → `facturasVendedorCubiertas`. Procesarlos
+        // aquí TAMBIÉN los contaría por duplicado, reduciendo el `debe` de
+        // `cfdiToMovimientos` a cero para esas facturas y haciéndolas
+        // desaparecer del consolidado (bug real: Hidalgo TARJETA $37k vs
+        // $150k esperado, confirmado 2026-08-15).
+        const cobrosFiltrados = (c.cobros ?? []).filter(
+          cobro => !centroPropioClave || !cobro.claveCentro || cobro.claveCentro === centroPropioClave,
+        );
+        if (!cobrosFiltrados.length) continue;
+        cuentas.push({ ...c, cobros: cobrosFiltrados });
+        if (c.cuentaId) cuentasIdsConocidas.add(c.cuentaId);
+
+      }
+
+      // Resolver nombreCliente/metodoPago (vía Mongo, NO el ERP) de las cuentas
+      // que la consulta directa trajo y que `cfdiPorDoc` todavía no conoce —
+      // mismo criterio que usa `cfdiPorDoc` para las demás, solo que la fuente
+      // del serie/folio es `cuenta.serieVenta`/`folioVenta` en vez de
+      // `documentosRelacionados` de un CFDI ya cargado.
+      // MongoDB almacena CFDIs indexados por serie/folio SAT (serieFactura/
+      // folioFactura del ERP), NO por el número de ticket interno
+      // (serieVenta/folioVenta). Se consulta por serieFactura|folioFactura y
+      // se guarda bajo serieVenta|folioVenta (la clave que usa cfdiPorDoc en el
+      // loop de más abajo) para que cfdiOriginal.uuid quede poblado y el dedup
+      // por UUID en cfdi-poliza-generator funcione correctamente.
+      const factKeyAVentaKey = new Map();
+      for (const c of cuentasDirecto) {
+        if (!c.serieVenta || !c.folioVenta) continue;
+        const ventaKey = `${c.serieVenta}|${c.folioVenta}`;
+        if (cfdiPorDoc.has(ventaKey)) continue;
+        if (c.serieFactura && c.folioFactura) {
+          const factKey = `${c.serieFactura}|${c.folioFactura}`;
+          if (!factKeyAVentaKey.has(factKey)) factKeyAVentaKey.set(factKey, ventaKey);
+        }
+      }
+      if (factKeyAVentaKey.size) {
+        const queryPairs = [...factKeyAVentaKey.keys()].map(k => {
+          const [s, f] = k.split('|');
+          return { serie: s, folio: f };
+        });
+        const cfdisEncontrados = await CFDI.find({
+          'emisor.rfc': rfc,
+          $or: queryPairs,
+        }).select('serie folio receptor metodoPago uuid').lean();
+        for (const cf of cfdisEncontrados) {
+          const factKey  = `${cf.serie}|${cf.folio}`;
+          const ventaKey = factKeyAVentaKey.get(factKey) ?? factKey;
+          if (!cfdiPorDoc.has(ventaKey)) cfdiPorDoc.set(ventaKey, cf);
+        }
+      }
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[CobrosSucursalPuente] Consulta directa por centro (${centroPropioClave}) falló, se ignora: ${err.message}`);
+    }
+  }
+
   if (!cuentas.length) return vacio;
 
   // 1b. Saldos a favor USADOS por estas mismas ventas — mismo lote de
@@ -557,6 +679,62 @@ async function construirMovimientosPuente({
       if (cuenta.saldosFavorUsados?.length) {
         usadosPorCuenta.set(key, [...(usadosPorCuenta.get(key) ?? []), ...cuenta.saldosFavorUsados]);
       }
+    }
+  }
+  // Misma consulta, pero por centro+fecha (ver 1a-bis) — cubre las cuentas
+  // que la sucursal cobradora descubrió directo y que `docsUnicos` no traía.
+  if (centroPropioClave && fechaDesde && fechaHasta) {
+    // Mismo criterio que la consulta directa de arriba: endpoint aún no
+    // liberado en producción — un fallo aquí no debe tumbar la póliza.
+    try {
+      const resultadoDirecto = await obtenerSaldosFavorPorCentro({
+        rfc, centro: centroPropioClave, fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
+      });
+      for (const cuenta of resultadoDirecto) {
+        const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+        // En la consulta por centro+fecha el ERP devuelve el dato desde la
+        // perspectiva de la venta GEN: cuenta.serieVenta|folioVenta = GEN venta,
+        // y saldosFavorUsados[].serieVenta|folioVenta = USE venta (la que aplicó
+        // el saldo). Se indexa por USE venta para que el SF-APA fallback y el
+        // loop de cobros la encuentren (distinto al path por-folio, donde la
+        // cuenta misma ya es la USE venta y se indexa directamente por su clave).
+        for (const uso of (cuenta.saldosFavorUsados ?? [])) {
+          const usoKey = `${uso.serieVenta}|${uso.folioVenta}`;
+          const existentesUso = usadosPorCuenta.get(usoKey) ?? [];
+          if (!existentesUso.some(e => e.serieOrigen === uso.serieOrigen && String(e.folioOrigen) === String(uso.folioOrigen))) {
+            usadosPorCuenta.set(usoKey, [...existentesUso, uso]);
+          }
+        }
+        // El ERP indexa los SF por la venta GEN (no por la venta USO), así
+        // que no hay un `saldosFavorUsados` de nivel superior — los usos
+        // vienen anidados en `saldosFavorGenerados[].usos[]`. Se extraen aquí
+        // para que ventas de períodos anteriores (ej. factura de julio con
+        // SF aplicado hoy en agosto) también aparezcan en `usadosPorCuenta`
+        // y el puente pueda registrar sus líneas de SF (2026-08-17).
+        for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+          for (const uso of (gen.usos ?? [])) {
+            const usoKey = `${uso.serieVenta}|${uso.folioVenta}`;
+            const existentes = usadosPorCuenta.get(usoKey) ?? [];
+            const yaExiste = existentes.some(
+              e => e.serieOrigen === gen.serieOrigen && String(e.folioOrigen) === String(gen.folioOrigen)
+            );
+            if (!yaExiste) {
+              usadosPorCuenta.set(usoKey, [...existentes, {
+                serieOrigen:   gen.serieOrigen,
+                folioOrigen:   gen.folioOrigen,
+                montoUsado:    uso.montoUsado,
+                fecha:         uso.fecha,
+                montoSobrante: uso.montoSobrante,
+                serieVenta:    uso.serieVenta,
+                folioVenta:    uso.folioVenta,
+              }]);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[CobrosSucursalPuente] Consulta directa de saldos a favor por centro (${centroPropioClave}) falló, se ignora: ${err.message}`);
     }
   }
 
@@ -808,7 +986,7 @@ async function construirMovimientosPuente({
         lineas.push({
           cuentaId:    esEfectivo ? cuentaCajaId : (idCuentaBancoReal ?? cuentaBancosId),
           montoAsignado,
-          reglaNombre: (idCuentaBancoReal && bancoReal?.referencia) ? bancoReal.referencia : (fp.nombre || fp.claveSat || null),
+          reglaNombre: (idCuentaBancoReal && bancoReal?.referencia) ? bancoReal.referencia : (fp.autorizacion || fp.nombre || fp.claveSat || null),
           esSF: false,
           concepto: conceptoBase,
         });
@@ -879,6 +1057,52 @@ async function construirMovimientosPuente({
             lineas:               esCruzado ? lineas.map(l => ({ cuentaId: l.cuentaId, monto: l.montoAsignado, reglaNombre: l.reglaNombre })) : [],
             tratamiento:          'PUE',
             fechaCobro:           cobro.fecha ?? null,
+          });
+        }
+      }
+    }
+
+    // SF usado por ventas de períodos anteriores pagadas puramente con APA
+    // (aplicación de saldo a favor): la serie 'APA' no pasa el filtro
+    // SERIES_CON_AUTH del loop de arriba (ver nota ahí — ese filtro es
+    // correcto para ventas propias del batch). Para ventas de otro período
+    // que solo tienen cobros APA, los datos ya están en usadosPorCuenta
+    // (poblado desde saldosFavorGenerados[].usos[]). Política confirmada
+    // 2026-08-17: si el SF se usó ese día, va en esa póliza sin importar
+    // cuándo se generó ni el período de la venta original.
+    if (!esPPD && cuentaSaldoFavorId && cuentaIvaSaldoFavorId) {
+      const sfUsadosVenta = (usadosPorCuenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
+        .filter(u => {
+          if (!fechaDesde || !fechaHasta) return true;
+          const f = u.fecha ? new Date(u.fecha) : null;
+          return f && f >= fechaDesde && f <= fechaHasta;
+        });
+      const soloCobrosAPA = (cuenta.cobros ?? []).length > 0
+        && (cuenta.cobros ?? []).every(cb => (cb.serieOrigen ?? '').toUpperCase() === 'APA');
+      if (sfUsadosVenta.length > 0 && soloCobrosAPA
+          && centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
+        const montoSF = Math.round(
+          sfUsadosVenta.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0) * 100
+        ) / 100;
+        if (montoSF > 0) {
+          const usoOcultoAPA = sfUsadosVenta.every(
+            u => devsOcultosCombinado.has(`${u.serieOrigen}|${u.folioOrigen}`)
+          );
+          const reglaSF    = usoOcultoAPA ? ETIQUETA_SALDO_FAVOR_OCULTO : ETIQUETA_SALDO_FAVOR;
+          const subtotal   = Math.round((montoSF / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+          const iva        = Math.round((montoSF - subtotal) * 100) / 100;
+          const conceptoSF = [nombreCliente, serieFolioFactura].filter(Boolean).join(' / ');
+          candidatas.push({
+            cuentaId: cuentaSaldoFavorId, cuentaFaltante: false, concepto: conceptoSF,
+            debe: subtotal, haber: 0, serie: serieFolioFactura, folio: null,
+            centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+            tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, cfdiUuid: cfdiOriginal?.uuid ?? null,
+          });
+          candidatas.push({
+            cuentaId: cuentaIvaSaldoFavorId, cuentaFaltante: false, concepto: conceptoSF,
+            debe: iva, haber: 0, serie: serieFolioFactura, folio: null,
+            centroCosto: centroVendedor.clave, centroCostoId: centroVendedor.id,
+            tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, cfdiUuid: cfdiOriginal?.uuid ?? null,
           });
         }
       }
@@ -1124,8 +1348,25 @@ async function construirMovimientosPuente({
   });
   const foliosYaRegistrados = new Set(yaRegistrados.map(m => m.folio));
 
+  // TIPO_ORIGEN_PENDIENTE_PROPIO (ticket sin factura cobrado en SU PROPIA
+  // sucursal, sin cruce real — ver bloque `mismaSucursal` arriba) es
+  // puramente informativo: es un Cargo flotante sin ninguna contrapartida en
+  // esta póliza (no hay otra sucursal con la que cuadrar). Confirmado con el
+  // usuario 2026-08-10: estas líneas ("CLIENTE NO IDENTIFICADO / <folio>"
+  // contra Caja/Bancos por identificar) NO deben aparecer en "Movimientos
+  // contables" — solo en la hoja/lista separada `pendientesPorFacturar`
+  // (que se arma aparte, arriba, a partir de `pendientesDetectados`, así que
+  // excluirlas de aquí no le quita nada a esa lista). Las líneas de
+  // 'Cobro Sucursal' (incluidas las que nacen del mismo ticket huérfano
+  // cuando SÍ hay cruce, líneas ~1035 y ~849) siguen intactas — esas cuadran
+  // contra la cuenta puente 2103040001 en la póliza cobradora y deben seguir
+  // contabilizándose de verdad.
+  const movimientos = candidatas.filter(c =>
+    !foliosYaRegistrados.has(c.folio) && c.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO
+  );
+
   return {
-    movimientos: candidatas.filter(c => !foliosYaRegistrados.has(c.folio)),
+    movimientos,
     facturasVendedorCubiertas,
     facturasPPDCubiertas,
     pendientesPorFacturar,

@@ -613,8 +613,7 @@ async function construirMovimientosPuente({
         if (!cobrosFiltrados.length) continue;
         cuentas.push({ ...c, cobros: cobrosFiltrados });
         if (c.cuentaId) cuentasIdsConocidas.add(c.cuentaId);
-        // DEBUG TEMP
-        { const { logger } = require('../../../shared/utils/logger'); logger.warn(`[PUENTE-CUENTA] serieVenta=${c.serieVenta} folioVenta=${c.folioVenta} serieFactura=${c.serieFactura} folioFactura=${c.folioFactura} cobros=${cobrosFiltrados.length} seriesOrigen=${cobrosFiltrados.map(cb=>cb.serieOrigen).join(',')}`); }
+
       }
 
       // Resolver nombreCliente/metodoPago (vía Mongo, NO el ERP) de las cuentas
@@ -691,11 +690,20 @@ async function construirMovimientosPuente({
       const resultadoDirecto = await obtenerSaldosFavorPorCentro({
         rfc, centro: centroPropioClave, fechaDesde: fechaDesde.toISOString(), fechaHasta: fechaHasta.toISOString(),
       });
-      { const { logger } = require('../../../shared/utils/logger'); logger.warn(`[SF-CENTRO-RAW] cuentas=${resultadoDirecto.length} keys=${resultadoDirecto.slice(0,5).map(c=>c.serieVenta+"|"+c.folioVenta).join(",")}`); resultadoDirecto.forEach(c => { if (c.saldosFavorGenerados?.length) { c.saldosFavorGenerados.forEach(g => { if (g.usos?.length) logger.warn(`[SF-CENTRO-GEN] gen=${c.serieVenta}|${c.folioVenta} genOrigen=${g.serieOrigen}|${g.folioOrigen} usos=${JSON.stringify(g.usos.slice(0,3))}`); }); } if (c.saldosFavorUsados?.length) logger.warn(`[SF-CENTRO-USO] venta=${c.serieVenta}|${c.folioVenta} usados=${JSON.stringify(c.saldosFavorUsados.slice(0,3))}`); }); }
       for (const cuenta of resultadoDirecto) {
         const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
-        if (cuenta.saldosFavorUsados?.length && !usadosPorCuenta.has(key)) {
-          usadosPorCuenta.set(key, [...cuenta.saldosFavorUsados]);
+        // En la consulta por centro+fecha el ERP devuelve el dato desde la
+        // perspectiva de la venta GEN: cuenta.serieVenta|folioVenta = GEN venta,
+        // y saldosFavorUsados[].serieVenta|folioVenta = USE venta (la que aplicó
+        // el saldo). Se indexa por USE venta para que el SF-APA fallback y el
+        // loop de cobros la encuentren (distinto al path por-folio, donde la
+        // cuenta misma ya es la USE venta y se indexa directamente por su clave).
+        for (const uso of (cuenta.saldosFavorUsados ?? [])) {
+          const usoKey = `${uso.serieVenta}|${uso.folioVenta}`;
+          const existentesUso = usadosPorCuenta.get(usoKey) ?? [];
+          if (!existentesUso.some(e => e.serieOrigen === uso.serieOrigen && String(e.folioOrigen) === String(uso.folioOrigen))) {
+            usadosPorCuenta.set(usoKey, [...existentesUso, uso]);
+          }
         }
         // El ERP indexa los SF por la venta GEN (no por la venta USO), así
         // que no hay un `saldosFavorUsados` de nivel superior — los usos
@@ -1071,7 +1079,6 @@ async function construirMovimientosPuente({
         });
       const soloCobrosAPA = (cuenta.cobros ?? []).length > 0
         && (cuenta.cobros ?? []).every(cb => (cb.serieOrigen ?? '').toUpperCase() === 'APA');
-      { const { logger } = require('../../../shared/utils/logger'); logger.warn(`[SF-APA] venta=${cuenta.serieVenta}|${cuenta.folioVenta} sfUsados=${sfUsadosVenta.length} soloCobrosAPA=${soloCobrosAPA} centroVendedorId=${centroVendedor?.id} centroCostoId=${centroCostoId}`); }
       if (sfUsadosVenta.length > 0 && soloCobrosAPA
           && centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
         const montoSF = Math.round(

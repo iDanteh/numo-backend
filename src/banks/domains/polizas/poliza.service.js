@@ -431,6 +431,22 @@ async function _resolverCuentasBancoReal(poliza) {
   for (const m of poliza.movimientos) {
     if (!m.cfdiUuid) continue;
     if (CODIGOS_CUENTA_BANCO_REAL.has(m.cuenta?.codigo)) continue; // ya es cuenta real
+    // Solo debe tocar cuentas GENÉRICAS/puente ("Bancos por identificar" y
+    // similares, ver docstring arriba) — sin este guard, cualquier movimiento
+    // con el mismo cfdiUuid que SÍ tuviera un depósito ligado se reasignaba,
+    // incluyendo Clientes/IVA-PPD/Ingresos de la Venta a Crédito original
+    // (comparten cfdiUuid con el Pago que la liquida después). Caso real
+    // confirmado 2026-08-17: Puerto Escondido, PAZCUAL HERNANDEZ CORTES
+    // O0-260800130 (Reg 6 — Venta PPD) — sus 3 líneas (Cargo Clientes, Abono
+    // IVA-PPD, Abono Ingresos) terminaron las 3 en la cuenta de BBVA Bancomer
+    // solo porque esa factura eventualmente se cobró por transferencia.
+    if (!CODIGOS_CUENTA_PUENTE.has(m.cuenta?.codigo)) continue;
+    // Refuerzo explícito (2026-08-17, a petición del usuario): las líneas de
+    // Crédito (PPD) NUNCA deben pasar por este cruce — la Venta a Crédito se
+    // liquida con un Pago (P) aparte más adelante, que es el que de verdad
+    // tiene el depósito bancario; la Venta original no debe tocarse aunque
+    // comparta cfdiUuid con ese Pago.
+    if (m.metodoPago === 'PPD') continue;
     // Efectivo (01) y Tarjeta (04/28) NUNCA se reasignan al banco real —
     // una Factura Global agrupa ~150 tickets con formas de pago mixtas bajo
     // un solo cfdiUuid; si la Transferencia de esa FG está ligada a Banamex,
@@ -1476,6 +1492,10 @@ function _extraerCobrosSucursal(movimientos) {
         concepto:    m.concepto || '',
         debe:        Number(m.debe),
         haber:       Number(m.haber),
+        // Columna "Motivo" en la hoja "Otros Ingresos" (2026-08-17, confirmado
+        // con el usuario) — distingue este caso del de SF ≤ $50 más abajo, que
+        // antes se mezclaban sin forma de saber cuál era cuál en el Excel.
+        motivo:      'Oculto — generado y usado el mismo día/almacén',
       });
       continue;
     }
@@ -1540,6 +1560,8 @@ function _extraerCobrosSucursal(movimientos) {
   const filasOtrosIngresos = filas.filter(f =>
     f._formaPagoLabel === ETIQUETA_SALDO_FAVOR && (totalPorConceptoSF.get(f.concepto) ?? 0) <= UMBRAL_SF_OTROS_INGRESOS,
   );
+  // Columna "Motivo" — ver comentario equivalente en filasOtrosIngresosOcultos.
+  for (const f of filasOtrosIngresos) f.motivo = `Monto ≤ $${UMBRAL_SF_OTROS_INGRESOS}`;
   if (filasOtrosIngresos.length) {
     const idsOtrosIngresos = new Set(filasOtrosIngresos);
     for (let i = filas.length - 1; i >= 0; i--) {
@@ -2282,6 +2304,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       { header: 'Sucursal',      key: 'centroCosto', width: 12 },
       { header: 'Cliente / Serie-Folio', key: 'concepto', width: 40 },
       { header: 'Monto',         key: 'monto',       width: 16 },
+      { header: 'Motivo',        key: 'motivo',      width: 42 },
     ];
     wsOtrosIngresos.getRow(1).font = { bold: true };
     wsOtrosIngresos.getRow(1).eachCell(cell => {
@@ -2293,10 +2316,11 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
         centroCosto: f.centroCosto ?? '',
         concepto:    f.concepto ?? '',
         monto:       Number(f.debe) || Number(f.haber) || 0,
+        motivo:      f.motivo ?? '',
       });
       row.getCell('monto').numFmt = '#,##0.00';
     }
-    wsOtrosIngresos.autoFilter = { from: 'A1', to: 'D1' };
+    wsOtrosIngresos.autoFilter = { from: 'A1', to: 'E1' };
   }
 
   // Hoja de CFDIs sustitutos (tipoRelacion='04') excluidos automáticamente al

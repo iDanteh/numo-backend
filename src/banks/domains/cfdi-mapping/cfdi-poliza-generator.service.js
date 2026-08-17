@@ -794,9 +794,26 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         { $or: serFolPairs },
         { serie: 1, folio: 1, 'receptor.nombre': 1, uuid: 1, metodoPago: 1 },
       ).lean();
-      const nombrePorClave     = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.receptor?.nombre ?? null]));
-      const uuidPorClave       = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.uuid ?? null]));
-      const metodoPagoPorClave = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.metodoPago ?? null]));
+      // OJO: la colección CFDI puede tener MÁS DE UN documento para el mismo
+      // uuid/serie/folio (un "stub" incompleto sincronizado antes que el CFDI
+      // completo, confirmado con el usuario 2026-08-17: caso real FILEMON
+      // A0-260801889, dos documentos con el mismo uuid, uno sin `metodoPago`).
+      // Un Map normal se queda con el ÚLTIMO valor visto sin importar cuál —
+      // si el stub llega después, pisa el PPD real con `null` y el filtro de
+      // abajo nunca lo detecta. Se recorre a mano prefiriendo SIEMPRE el
+      // documento que sí trae el dato, sin importar el orden que regrese Mongo.
+      const nombrePorClave     = new Map();
+      const uuidPorClave       = new Map();
+      const metodoPagoPorClave = new Map();
+      for (const c of cfdisFac) {
+        const key = `${c.serie}|${c.folio}`;
+        if (c.receptor?.nombre) nombrePorClave.set(key, c.receptor.nombre);
+        else if (!nombrePorClave.has(key)) nombrePorClave.set(key, null);
+        if (c.uuid) uuidPorClave.set(key, c.uuid);
+        else if (!uuidPorClave.has(key)) uuidPorClave.set(key, null);
+        if (c.metodoPago) metodoPagoPorClave.set(key, c.metodoPago);
+        else if (!metodoPagoPorClave.has(key)) metodoPagoPorClave.set(key, null);
+      }
       for (const entry of cobrosCobradoraDirecta) {
         entry.nombre    = nombrePorClave.get(entry.claveFac) ?? null;
         entry.cfdiUuid  = uuidPorClave.get(entry.claveFac)   ?? null;

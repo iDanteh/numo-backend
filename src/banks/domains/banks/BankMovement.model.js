@@ -227,13 +227,10 @@ const bankMovementSchema = new mongoose.Schema({
     default: null,
   },
 
-  // Marca INMUTABLE, estampada UNA SOLA VEZ por una migración de una sola corrida en el
-  // momento real del deploy de este indicador — jamás se vuelve a tocar después (ni al
-  // identificar el movimiento, ni al revertirlo de vuelta a no_identificado). true = este
-  // movimiento YA estaba no_identificado cuando el indicador se puso en marcha (backlog
-  // histórico); false/default = apareció después (backlog nuevo, medido desde el día 1).
-  // Ver scripts/migrate-backlog-preexistente.js — NUNCA re-correr esa migración una vez
-  // ejecutada de verdad en producción, corromperia la marca.
+  // Dejó de leerse en bank-indicadores.service.js desde el cutoff de fecha (2026-08-17,
+  // INDICADORES_DESDE) — el dashboard ahora filtra directo por `createdAt`, sin distinguir
+  // histórico/nuevo. Campo conservado por compatibilidad con documentos existentes; pendiente
+  // decidir si se remueve del todo junto con scripts/migrate-backlog-preexistente.js.
   backlogPreExistente: { type: Boolean, default: false },
 
   // Oculto por regla — el movimiento existe pero no aparece en vistas normales
@@ -286,6 +283,9 @@ bankMovementSchema.index({ isActive: 1, status: 1, deposito: 1 });
 bankMovementSchema.index({ 'identificadoPor.userId': 1 });
 // Soporta bank-indicadores.service.js: promedio de tiempo de identificación.
 bankMovementSchema.index({ status: 1, primeraIdentificacionAt: 1 });
+// Soporta bank-indicadores.service.js tras el cutoff de fecha (2026-08-17): ambos pipelines
+// (tiempo y backlog) ahora filtran status + createdAt >= INDICADORES_DESDE.
+bankMovementSchema.index({ status: 1, createdAt: 1 });
 bankMovementSchema.index({ erpIds: 1, isActive: 1 });
 
 // Índice de texto para el buscador

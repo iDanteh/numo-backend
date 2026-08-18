@@ -1448,6 +1448,23 @@ function _extraerCobrosSucursal(movimientos) {
       .map(m => m.cfdiUuid)
       .filter(Boolean),
   );
+  // Fallback SOLO para pares sin cfdiUuid: un ticket "pendiente por facturar"
+  // (sin factura todavía) cobrado en otra sucursal llega con AMBAS líneas del
+  // par (Venta debe / Cobro Sucursal haber) con cfdiUuid null — ver
+  // `cobrosCobradoraDirecta` en cfdi-poliza-generator.service.js. El
+  // emparejamiento por uuid de arriba nunca las conecta, así que el DEBE
+  // quedaba suelto en "Depósitos consolidados" duplicando el monto contra el
+  // HABER que sí se extrae al bloque "Cobro de otra sucursal" (confirmado con
+  // el usuario 2026-08-18, caso real A0-260800476, $5,308.69 sumándose de más
+  // a Efectivo). Se empareja por concepto+monto SOLO cuando cfdiUuid es null
+  // en ambos lados — nunca puede colisionar con el caso de cobro PARCIAL de
+  // una factura real (ese siempre trae uuid, ver comentario de más arriba).
+  const _conceptosCobradosPorSucursalSinUuid = new Set(
+    movimientos
+      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
+                && m.cfdiUuid == null)
+      .map(m => `${m.concepto || ''}|${Number(m.haber).toFixed(2)}`),
+  );
   for (const m of movimientos) {
     // Las líneas de Saldo a Favor de un Pago (tipoComprobante='P',
     // `esSplitPagoPorFactura` en cfdi-mapping.service.js) también llevan
@@ -1465,8 +1482,10 @@ function _extraerCobrosSucursal(movimientos) {
     // UUID que tiene la entrada 'Cobro Sucursal' DEBE de cobros-sucursal-puente
     // identifica sin ambigüedad la 'Venta' DEBE de cfdiToMovimientos.
     if (m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
-        && m.cfdiUuid != null
-        && _uuidsCobradosPorSucursal.has(m.cfdiUuid)) {
+        && (
+          (m.cfdiUuid != null && _uuidsCobradosPorSucursal.has(m.cfdiUuid))
+          || (m.cfdiUuid == null && _conceptosCobradosPorSucursalSinUuid.has(`${m.concepto || ''}|${Number(m.debe).toFixed(2)}`))
+        )) {
       filas.push({
         cuenta:             m.cuenta,
         serie:              m.serie || '',

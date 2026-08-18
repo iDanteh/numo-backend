@@ -2314,12 +2314,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionProp = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionProp && montoSaldoFavorProp > 0) {
+        // Si el SF que se está cerrando es TODO oculto (generado y usado el
+        // mismo día/almacén, ver `_inyectarSaldoFavorGenerado`), esta línea de
+        // cierre debe ocultarse igual que sus hermanas — sin esto queda
+        // visible en la póliza principal como un Cargo "Cancelación" extra
+        // sin contrapartida aparente (el abono que revierte SÍ existe, solo
+        // que está oculto), confundiendo al contador (confirmado con el
+        // usuario 2026-08-18, caso real NORBERTO VELAZQUEZ JUAREZ/CAC-077337).
+        // `tipoOrigen` también se sobreescribe: `_extraerCobrosSucursal`
+        // (poliza.service.js) solo revisa `reglaNombre` en líneas cuyo
+        // tipoOrigen YA es 'Cobro Sucursal' — con el tipoOrigen original
+        // ('Cancelación') la línea nunca llegaba a esa revisión.
+        const todoOcultoProp = lineasSaldoFavorProp.every(l => l.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO);
         movimientosResult.push({
           ...abonoDevolucionProp,
           debe:          montoSaldoFavorProp,
           haber:         0,
           centroCosto:   ccProp?.clave ?? abonoDevolucionProp.centroCosto ?? null,
           centroCostoId: ccProp?.id    ?? null,
+          ...(todoOcultoProp ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
           _cfdiInfo: {
             uuid:              cfdi.uuid,
             tipo:              cfdi.tipoDeComprobante,
@@ -3309,6 +3322,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionGuard = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionGuard && montoSaldoFavorGuard > 0) {
+        // Ver comentario equivalente en generarPropuesta: si el SF que se
+        // cierra es todo oculto, esta línea debe ocultarse igual que sus
+        // hermanas (confirmado con el usuario 2026-08-18, caso real NORBERTO
+        // VELAZQUEZ JUAREZ/CAC-077337).
+        const todoOcultoGuard = lineasSaldoFavorGuard.every(l => l.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO);
         todosLosMovimientos.push({
           ...abonoDevolucionGuard,
           debe:           montoSaldoFavorGuard,
@@ -3316,6 +3334,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           cuentaFaltante: abonoDevolucionGuard.cuentaId == null,
           centroCosto:    cc?.clave ?? abonoDevolucionGuard.centroCosto ?? null,
           centroCostoId:  cc?.id    ?? null,
+          ...(todoOcultoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         });
       }
     }

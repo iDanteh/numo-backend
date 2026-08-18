@@ -87,6 +87,36 @@ const TIPO_MARCADORES_DEV = ['BON', 'BCT', 'DEV', 'CAC'];
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 
 /**
+ * Deduplica líneas de Saldo a Favor (SF/SF-OCULTO) que DOS mecanismos
+ * independientes pueden detectar por separado para el MISMO saldo usado,
+ * generando dos líneas idénticas en vez de una:
+ *   1. `_prefetchAjustesFacturaPropia` (consulta "por centro", cubre TODO el
+ *      uso de SF de esta factura sin importar forma de pago ni período).
+ *   2. El bloque "SF usado por ventas de período anterior pagadas con APA"
+ *      en `construirMovimientosPuente` (cobros-sucursal-puente.service.js,
+ *      2026-08-17) — pensado para huecos que el (1) no cubría, pero ahora
+ *      que (1) también cubre período anterior, se solapan para tickets que
+ *      SÍ están en el batch actual.
+ * Se identifican por compartir concepto+cuenta+debe+haber exactos — una
+ * coincidencia casi imposible entre dos SF reales distintos (confirmado con
+ * el usuario 2026-08-18, caso real Global 89CF6A7F: DEV-055991 aparecía dos
+ * veces, $365.16+$58.42 cada vez, una como 'Cargo Especial' y otra como
+ * 'Cobro Sucursal').
+ */
+function _deduplicarSFRedundante(movs) {
+  const vistos = new Set();
+  const resultado = [];
+  for (const m of movs) {
+    if (m.reglaNombre !== 'SF' && m.reglaNombre !== ETIQUETA_SALDO_FAVOR_OCULTO) { resultado.push(m); continue; }
+    const key = `${m.concepto}|${m.cuentaId}|${Number(m.debe).toFixed(2)}|${Number(m.haber).toFixed(2)}`;
+    if (vistos.has(key)) continue;
+    vistos.add(key);
+    resultado.push(m);
+  }
+  return resultado;
+}
+
+/**
  * Para cada Devolución (CFDI tipo E) del batch, consulta en lote
  * /desgloses-cobro/saldos-favor (vía `obtenerSaldosFavor`) usando el folioVenta
  * de la venta ORIGINAL que ajusta (su documento relacionado, excluyendo el
@@ -2721,7 +2751,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     ejercicio:  Number(ejercicio),
     periodo:    Number(periodo),
     rfc,
-    movimientos: movimientosResult,
+    movimientos: _deduplicarSFRedundante(movimientosResult),
     sustitutos: sustitutosProp,
     // Hoja aparte: tickets con cobro real sin factura ligada — ver comentario
     // arriba y `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
@@ -3637,8 +3667,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
     }, { transaction: t });
 
-    for (let i = 0; i < todosLosMovimientos.length; i += CHUNK_SIZE) {
-      const chunk = todosLosMovimientos.slice(i, i + CHUNK_SIZE);
+    const movimientosFinales = _deduplicarSFRedundante(todosLosMovimientos);
+    for (let i = 0; i < movimientosFinales.length; i += CHUNK_SIZE) {
+      const chunk = movimientosFinales.slice(i, i + CHUNK_SIZE);
       const rows  = chunk.map((m, j) => ({
         ...m,
         polizaId: polizaHeader.id,

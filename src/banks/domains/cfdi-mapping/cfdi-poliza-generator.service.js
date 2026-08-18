@@ -658,12 +658,22 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
-          // `autorizacion`: número real de autorización de la terminal (cuando
-          // cajas lo trae) — permite que Tarjeta se agrupe por depósito real
-          // en `consolidarCargos` en vez de un solo total ciego, igual que ya
-          // se hace con Transferencia/Cheque (confirmado con el usuario
-          // 2026-08-18). Efectivo normalmente no trae este dato.
-          formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto, autorizacion: fp.autorizacion ?? null });
+          // `serieVentaTicket`/`folioVentaTicket`: ticket real de cajas al que
+          // pertenece ESTA porción del cobro (no la Factura Global que lo
+          // agrupa) — confirmado con el usuario 2026-08-18 que cajas NO manda
+          // número de autorización en este endpoint (`fp.autorizacion` no
+          // existe); el dato real vive en `bank_movements.erpLinks` ligado
+          // por serie+folioExterno DEL TICKET (verificado con datos reales:
+          // Factura Global O0-260800164, 41 tickets, 6 BankMovements
+          // distintos cada uno ligado a UN ticket específico vía erpLinks,
+          // con su propio numeroAutorizacion). Permite que `consolidarCargos`
+          // resuelva la autorización real POR TICKET (nunca por CFDI
+          // completo, que fue justo el bug de Facturas Globales de Hidalgo
+          // 2026-08-14) y agrupe Tarjeta por ella.
+          formasPago.push({
+            nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto,
+            serieVentaTicket: cuenta.serieVenta ?? null, folioVentaTicket: cuenta.folioVenta ?? null,
+          });
         }
       }
       if (formasPago.length) {

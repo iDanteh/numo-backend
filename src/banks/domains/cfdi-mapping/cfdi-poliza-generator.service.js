@@ -2183,6 +2183,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // DEV-055729 de julio — el monto completo se quedaba visible en vez
         // de ocultar solo la porción de DEV-056098).
         const detalle = sfUsado.detalle ?? [];
+        // `detalleVisible`: cada origen NO ocultable (periodo anterior) por
+        // separado, con su propia referencia (serieOrigen-folioOrigen) — antes
+        // se combinaban en un solo monto bajo el concepto del CFDI actual,
+        // perdiendo de qué devolución/cancelación viene cada porción
+        // (confirmado con el usuario 2026-08-18, caso real Global 89CF6A7F:
+        // DEV-055991 de julio + CAC-075406 de junio, combinados como un solo
+        // "$523.91 SF" sin poder rastrear el origen de cada uno).
+        const detalleVisible = detalle.filter(d => !devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`));
         const montoOculto = Math.round(detalle
           .filter(d => devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`))
           .reduce((s, d) => s + (Number(d.monto) || 0), 0) * 100) / 100;
@@ -2190,6 +2198,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           ...sfUsado,
           montoOculto,
           montoVisible: Math.round((sfUsado.monto - montoOculto) * 100) / 100,
+          detalleVisible,
         };
       }
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
@@ -3220,6 +3229,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         // Ver comentario equivalente en generarPropuesta sobre el split por
         // origen (no todo-o-nada) de una Factura Global con SF combinado.
         const detalle = sfUsado.detalle ?? [];
+        // Ver comentario equivalente en generarPropuesta sobre `detalleVisible`.
+        const detalleVisible = detalle.filter(d => !devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`));
         const montoOculto = Math.round(detalle
           .filter(d => devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`))
           .reduce((s, d) => s + (Number(d.monto) || 0), 0) * 100) / 100;
@@ -3227,6 +3238,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           ...sfUsado,
           montoOculto,
           montoVisible: Math.round((sfUsado.monto - montoOculto) * 100) / 100,
+          detalleVisible,
         };
       }
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);

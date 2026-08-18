@@ -758,6 +758,9 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const montoSFUsado     = Number(context.saldoFavorUsadoPropio?.monto) || 0;
   const montoSFOculto    = Number(context.saldoFavorUsadoPropio?.montoOculto) || 0;
   const montoSFVisible   = Number(context.saldoFavorUsadoPropio?.montoVisible) || 0;
+  // Cada origen NO ocultable (periodo anterior) por separado, con su propia
+  // referencia (serieOrigen-folioOrigen) — ver comentario en `emitirLineaSF`.
+  const detalleSFVisible = context.saldoFavorUsadoPropio?.detalleVisible ?? [];
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
@@ -849,19 +852,39 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       // con su propio reglaNombre, en vez de una sola línea todo-o-nada (ver
       // comentario en `_prefetchAjustesFacturaPropia`/generarPropuesta,
       // cfdi-poliza-generator.service.js).
-      const conceptoCliente = [cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO', serieCfdi].filter(Boolean).join(' / ');
+      const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+      const conceptoCliente = [nombreCliente, serieCfdi].filter(Boolean).join(' / ');
       const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, _esCargoPrincipal: true };
-      const emitirLineaSF = (montoBruto, reglaNombre) => {
+      const emitirLineaSF = (montoBruto, reglaNombre, overrides = {}) => {
         if (montoBruto <= 0 || restante <= 0) return;
         const monto = Math.min(montoBruto, restante);
         const subtotal = Math.round((monto / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
         const iva = Math.round((monto - subtotal) * 100) / 100;
-        movs.push({ ...baseSF, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
-        movs.push({ ...baseSF, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
+        movs.push({ ...baseSF, ...overrides, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
+        movs.push({ ...baseSF, ...overrides, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
         restante = parseFloat((restante - monto).toFixed(2));
       };
       emitirLineaSF(montoSFOculto, 'SF-OCULTO');
-      emitirLineaSF(montoSFVisible, 'SF');
+      // Visible (de periodo anterior): una línea POR ORIGEN, con su propia
+      // referencia (serieOrigen-folioOrigen, ej. "DEV-055991") en vez de
+      // combinar todo bajo el concepto del CFDI actual — sin esto, dos
+      // devoluciones de meses distintos (ej. julio y junio) se veían como un
+      // solo monto sin poder rastrear de cuál venía cada porción (confirmado
+      // con el usuario 2026-08-18, caso real Global 89CF6A7F: DEV-055991 +
+      // CAC-075406). Si por lo que sea no hay detalle disponible (dato viejo
+      // sin `detalleVisible`), cae al comportamiento anterior (una sola línea
+      // con el concepto del CFDI actual).
+      if (detalleSFVisible.length > 0) {
+        for (const d of detalleSFVisible) {
+          const referenciaOrigen = [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+          emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF', {
+            serie: referenciaOrigen,
+            concepto: [nombreCliente, referenciaOrigen].filter(Boolean).join(' / '),
+          });
+        }
+      } else {
+        emitirLineaSF(montoSFVisible, 'SF');
+      }
     }
     // Puntos/Club Tuberos: a diferencia de SF, va CONSOLIDADO en una sola
     // línea genérica por sucursal/día ("CLIENTE DE MOSTRADOR SUC. X"), no

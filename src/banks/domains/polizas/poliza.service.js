@@ -184,25 +184,34 @@ async function construirVerdadBancaria(movimientos, rfc) {
   return mapa;
 }
 
+// Categorías de bank_movements que representan una transferencia electrónica
+// real — mismo criterio que `construirVerdadBancaria` (CATEGORIAS_TRANSFERENCIA_BANCO).
+const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO'];
+
 /**
- * Resuelve el número de autorización REAL de Tarjeta cruzando bank_movements
- * por TICKET individual (`erpLinks.serie`+`erpLinks.folioExterno`, el mismo
- * criterio ya usado por `bancoPorVenta` en cobros-sucursal-puente.service.js
- * para el caso cruzado) — a propósito NO usa `cfdiUuid`/`folioFiscal` como
+ * Resuelve el depósito bancario REAL cruzando bank_movements por TICKET
+ * individual (`erpLinks.serie`+`erpLinks.folioExterno`, el mismo criterio ya
+ * usado por `bancoPorVenta` en cobros-sucursal-puente.service.js para el caso
+ * cruzado) — a propósito NO usa `cfdiUuid`/`folioFiscal` como
  * `construirVerdadBancaria`: ese match es por CFDI COMPLETO, y en una Factura
- * Global (un solo CFDI que agrupa decenas de tickets) mezclaría la
- * autorización de un ticket cualquiera con el resto de la factura (bug real
- * confirmado 2026-08-14, Hidalgo B0-260701074). Verificado con datos reales
- * 2026-08-18: Factura Global O0-260800164 (41 documentos relacionados) tiene
- * 6 `BankMovement` distintos, cada uno ligado a UN ticket específico
- * (erpLinks.serie/folioExterno) con su propia autorización — resolver por
- * ticket es lo único que no los mezcla.
+ * Global (un solo CFDI que agrupa decenas de tickets) mezclaría el depósito
+ * de un ticket cualquiera con el resto de la factura — confirmado con datos
+ * reales dos veces (2026-08-18): Tarjeta (bug original, Hidalgo
+ * B0-260701074, 2026-08-14) Y Transferencia (Factura Global O0-260800164,
+ * 41 documentos relacionados, 6 `BankMovement` distintos cada uno ligado a
+ * un ticket específico — un ticket pagado por Banamex quedaba con la cuenta
+ * de BBVA de OTRO ticket de la misma factura). Usado tanto para Tarjeta
+ * (agrupar por `numeroAutorizacion`) como para Transferencia/Cheque
+ * (resolver el banco/referencia real en vez del de `construirVerdadBancaria`
+ * cuando hay dato por ticket disponible).
  *
  * @param {{serieVentaTicket: string, folioVentaTicket: string}[]} movimientos
- * @returns {Promise<Map<string, {numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null}>>}
+ * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null}>>}
  *   `serieVentaTicket|folioVentaTicket` → info bancaria del ticket.
+ *   `referencia`: folio propio de Numo (para Transferencia/Cheque).
+ *   `numeroAutorizacion`: número de autorización real de terminal (para Tarjeta).
  */
-async function construirAutorizacionTarjetaPorTicket(movimientos) {
+async function construirBancoRealPorTicket(movimientos) {
   const mapa = new Map();
   const pares = [...new Map(
     movimientos
@@ -218,24 +227,30 @@ async function construirAutorizacionTarjetaPorTicket(movimientos) {
     raw:        true,
   });
   const cuentaPorCodigo = new Map(cuentasBancoRows.map(r => [r.codigo, { id: r.id, codigo: r.codigo, nombre: r.nombre }]));
+  const paresSet = new Set(pares.map(p => `${p.serie}|${p.folio}`));
 
   const LOTE = 150;
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
     const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, banco: 1, numeroAutorizacion: 1, referenciaNumerica: 1 },
+      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1 },
     ).lean();
     for (const m of movs) {
       const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[m.banco];
       const cuentaBanco = codigoCuentaBanco ? (cuentaPorCodigo.get(codigoCuentaBanco) ?? null) : null;
+      const cat = (m.categoria || '').toUpperCase();
+      const esTransferencia = _CATEGORIAS_TRANSFERENCIA.some(c => cat.includes(c));
+      // Folio propio de Numo — referencia para Transferencia/Cheque (mismo
+      // criterio que `construirVerdadBancaria`, ver comentario ahí).
+      const referencia = m.folio || null;
       const numeroAutorizacion = m.numeroAutorizacion || m.referenciaNumerica || null;
-      if (!numeroAutorizacion) continue;
+      if (!referencia && !numeroAutorizacion) continue;
       for (const link of (m.erpLinks ?? [])) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
-        if (!pares.some(p => `${p.serie}|${p.folio}` === key)) continue;
-        if (!mapa.has(key)) mapa.set(key, { numeroAutorizacion, banco: m.banco ?? null, cuentaBanco });
+        if (!paresSet.has(key)) continue;
+        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco });
       }
     }
   }
@@ -1097,7 +1112,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
 // (confirmado: "solo restarlo", sin desglose).
 const TIPO_ORIGEN_AJUSTE_CONSOLIDADO_SF = 'Ajuste Consolidado SF';
 
-function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, autorizacionTarjetaPorTicket = null) {
+function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
   const porCategoria = { devolucion: [], descuento: [], bonificacion: [], clubTuberos: [] };
@@ -1183,12 +1198,23 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     if (esTransferenciaVerificada || esChequeDeclarado) {
       const tipoDetalle = esTransferenciaVerificada ? 'TRANSFERENCIA' : 'CHEQUE';
       const subcodigoDetalle = esTransferenciaVerificada ? subcodigoTransferencia : 0;
-      const referencia = bancario?.referencia ?? null;
+      // Info por TICKET (`bancoRealPorTicket`, ver docstring) tiene prioridad
+      // sobre `bancario` (`construirVerdadBancaria`, por CFDI completo): en
+      // una Factura Global, `bancario` puede traer el depósito de OTRO
+      // ticket de la misma factura — confirmado con datos reales 2026-08-18
+      // (Global O0-260800164, ticket 260800269 pagado por Banamex quedaba
+      // con la cuenta BBVA de otro ticket de la misma factura). Sin dato por
+      // ticket (venta normal, no partida), `bancario` sigue siendo correcto
+      // (un solo ticket por CFDI, ambos coinciden).
+      const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
+        ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
+        : null;
+      const referencia = infoTicketTransfCheque?.referencia ?? bancario?.referencia ?? null;
       // Cuenta real del banco donde cayó el depósito (ver
       // `BANCO_A_CODIGO_CUENTA`/`construirVerdadBancaria`) en vez de la
       // genérica "Bancos por identificar" que ya traía la línea — solo
       // cuando el banco tiene cuenta dedicada en el catálogo.
-      const cuentaLinea = bancario?.cuentaBanco ?? m.cuenta;
+      const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? bancario?.cuentaBanco ?? m.cuenta;
       const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? `__cfdi_${m.cfdiUuid}`}`;
       if (!gruposDetallados.has(key)) {
         gruposDetallados.set(key, {
@@ -1217,8 +1243,8 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // siempre se consolida por forma de pago declarada, sin importar si hay
     // match bancario.
 
-    // Tarjeta con número de autorización REAL por TICKET (`autorizacionTarjetaPorTicket`
-    // — ver `construirAutorizacionTarjetaPorTicket`, cruza bank_movements por
+    // Tarjeta con número de autorización REAL por TICKET (`bancoRealPorTicket`
+    // — ver `construirBancoRealPorTicket`, cruza bank_movements por
     // `erpLinks.serie`+`folioExterno` del ticket real de cajas, NUNCA por
     // `cfdiUuid`/CFDI completo como `verdadBancaria` — no repite el problema
     // de Facturas Globales de arriba, porque el match es por ticket
@@ -1231,7 +1257,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // depósitos con autorización distinta, ej. Factura Global O0-260800164).
     const esTarjetaDeclarada = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA';
     const infoTarjetaTicket = (esTarjetaDeclarada && m.serieVentaTicket && m.folioVentaTicket)
-      ? autorizacionTarjetaPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
+      ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
       : null;
     if (esTarjetaDeclarada && infoTarjetaTicket?.numeroAutorizacion) {
       const cuentaLineaTarjeta = infoTarjetaTicket.cuentaBanco ?? m.cuenta;
@@ -1839,7 +1865,7 @@ function bloquesAjustesContado(movs) {
 // (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
-function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, autorizacionTarjetaPorTicket = null } = {}) {
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null } = {}) {
   const contadoAjuste = contado.filter(esAjusteContadoMov);
   const contadoNormal = contado.filter(m => !esAjusteContadoMov(m));
 
@@ -1860,7 +1886,7 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   bloquesAnticipos.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
   const { consolidados, depositosIdentificados } =
-    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, autorizacionTarjetaPorTicket);
+    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket);
 
   const ventasYClubTuberos = enriquecerConceptoConCliente(
     [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
@@ -2055,9 +2081,9 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // 2026-08-04.
   const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.cfdiUuid, serie: m.serie })));
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
-  // `construirAutorizacionTarjetaPorTicket`) — solo las líneas partidas por
+  // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.
-  const autorizacionTarjetaPorTicket = await construirAutorizacionTarjetaPorTicket(
+  const bancoRealPorTicket = await construirBancoRealPorTicket(
     movimientos.map(m => ({ serieVentaTicket: m.serieVentaTicket, folioVentaTicket: m.folioVentaTicket })),
   );
 
@@ -2099,7 +2125,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // mismo principio que ya usa el resto de sucursales cuando falta
       // Contado o Crédito (folios consecutivos, sin huecos).
       const cSplit = contado.length > 0
-        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, autorizacionTarjetaPorTicket })
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
@@ -2138,7 +2164,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
           // factura) — refleja el depósito real de caja/banco del periodo.
           {
             tipoVenta: 'Contado',
-            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { autorizacionTarjetaPorTicket }),
+            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket }),
             folio:     overrides.folioContado   ?? poliza.numero,
             concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
@@ -2155,7 +2181,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       : [{
           tipoVenta: null,
           movs:      contado.length > 0
-            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { autorizacionTarjetaPorTicket })
+            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket })
             : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
           folio:     overrides.folioContado   ?? poliza.numero,
           concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),

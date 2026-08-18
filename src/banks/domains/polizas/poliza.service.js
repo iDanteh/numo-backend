@@ -1972,7 +1972,18 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
   for (const key of ordenCfdi) {
     const grupo    = porCfdi.get(key);
     const categoria = categoriaDeGrupoCredito(grupo);
-    if (!categoria) { bloques.push({ categoria: null, bloque: grupo }); continue; }
+    if (!categoria) {
+      // Venta normal a Crédito (sin categoría de ajuste): los Abonos
+      // (Ingresos, luego IVA-PPD) van ANTES que el Cargo a Clientes —
+      // orden invertido respecto a Devolución/Descuento/Bonificación/
+      // Anticipo (esos SÍ van cargo-primero, confirmado 2026-07-23, ver
+      // abajo) — confirmado con el usuario 2026-08-18, caso real PAZCUAL
+      // HERNANDEZ CORTES/O0-260800214.
+      const cargosVenta  = grupo.filter(m => Number(m.debe) > 0);
+      const abonosVenta   = conImpuestoAlFinal(grupo.filter(m => !(Number(m.debe) > 0)));
+      bloques.push({ categoria: null, bloque: [...abonosVenta, ...cargosVenta] });
+      continue;
+    }
     // A diferencia de Contado, en Crédito SIEMPRE se muestran los 3 registros
     // de una Devolución/Cancelación (los 2 cargos + su abono, sea reembolso
     // real en banco o saldo a favor) — confirmado con el usuario 2026-07-23.

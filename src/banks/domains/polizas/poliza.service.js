@@ -1159,6 +1159,32 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // siempre se consolida por forma de pago declarada, sin importar si hay
     // match bancario.
 
+    // Tarjeta con número de autorización REAL por línea (`numAutorizacionReal`
+    // — ver `_prefetchAjustesFacturaPropia`/`splitPorFormaPagoReal`, dato que
+    // viene de cajas por cada cobro individual, NO de `verdadBancaria` — no
+    // repite el problema de Facturas Globales de arriba, porque cada línea ya
+    // trae su propio monto real, nunca el total de la factura completa):
+    // mismo criterio que Transferencia/Cheque, se agrupan SOLO las que
+    // comparten el mismo número de autorización (mismo depósito/lote real de
+    // terminal); sin ese dato, cae al bucket genérico de abajo, sin cambios
+    // (confirmado con el usuario 2026-08-18, caso real Puerto Escondido
+    // A0-260800476 — $41,572.15 de Tarjeta consolidados a ciegas cuando en
+    // realidad correspondían a depósitos con autorización distinta).
+    const esTarjetaDeclarada = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA';
+    if (esTarjetaDeclarada && m.numAutorizacionReal) {
+      const key = `${m.cuenta?.codigo}|${centroCosto}|TARJETA|${m.numAutorizacionReal}`;
+      if (!gruposDetallados.has(key)) {
+        gruposDetallados.set(key, {
+          cuenta: m.cuenta, centroCosto, referencia: m.numAutorizacionReal, tipoDetalle: 'TARJETA', subcodigo: 0,
+          debe: 0, detalle: [], primerMov: m,
+        });
+      }
+      const gt = gruposDetallados.get(key);
+      gt.debe += Number(m.debe);
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: 'TARJETA' });
+      continue;
+    }
+
     // Sin depósito real que mostrar: se consolida por la forma de pago
     // declarada (Efectivo o Tarjeta — cada una en su propia línea/cuenta;
     // Transferencia y Cheque ya se manejaron arriba, nunca llegan aquí).

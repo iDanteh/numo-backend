@@ -658,7 +658,12 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
-          formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto });
+          // `autorizacion`: número real de autorización de la terminal (cuando
+          // cajas lo trae) — permite que Tarjeta se agrupe por depósito real
+          // en `consolidarCargos` en vez de un solo total ciego, igual que ya
+          // se hace con Transferencia/Cheque (confirmado con el usuario
+          // 2026-08-18). Efectivo normalmente no trae este dato.
+          formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto, autorizacion: fp.autorizacion ?? null });
         }
       }
       if (formasPago.length) {

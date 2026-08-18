@@ -815,6 +815,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Ver comentario más abajo (bloque `esCasoNormalParaSplit`) sobre por
         // qué esta línea concreta debe llevar el claveSat REAL, no el del CFDI.
         _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+        // Número de autorización real de esta porción (cajas) — ver
+        // comentario en `_prefetchAjustesFacturaPropia`. Permite agrupar
+        // Tarjeta por depósito real en `consolidarCargos` en vez de un total
+        // ciego (confirmado con el usuario 2026-08-18).
+        _numAutorizacionReal: fp.autorizacion ?? null,
         ...(esUltimo ? extraEnUltima : {}),
       });
     });
@@ -1435,6 +1440,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ...m,
     ...satMeta,
     ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
+    // Sobrevive al spread de `satMeta` por la misma razón que `_formaPagoReal`
+    // — ver comentario ahí. `consolidarCargos` lo usa para agrupar Tarjeta
+    // por número de autorización real en vez de un total ciego.
+    ...(m._numAutorizacionReal != null ? { numAutorizacionReal: m._numAutorizacionReal } : {}),
     ...(
       m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL
         ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }

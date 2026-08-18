@@ -517,6 +517,14 @@ function esConceptoMarcadorAjuste(concepto) {
  * Si no hay regla, devuelve movimientos con cuentaId null (requieren revisión manual).
  */
 async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = {}) {
+  // DIAG TEMPORAL 2026-08-18 — remover después de encontrar el duplicado CAC-077337.
+  if (cfdi.uuid === 'C218AFD7-A84F-46E9-9D62-67434E02928E') {
+    console.log('[DIAG-CAC] cfdiToMovimientos llamado', {
+      uuid: cfdi.uuid, rule: rule?.nombre, contextKeys: Object.keys(context || {}),
+      desglosePagoRealTiene: Array.isArray(context?.desglosePagoReal) ? context.desglosePagoReal.length : (context?.desglosePagoReal instanceof Map ? context.desglosePagoReal.size : typeof context?.desglosePagoReal),
+      stack: new Error().stack.split('\n').slice(1, 5).join(' | '),
+    });
+  }
   const tipo      = cfdi.tipoDeComprobante;
   const esIngreso = tipo === 'I';
   const esPago    = tipo === 'P';

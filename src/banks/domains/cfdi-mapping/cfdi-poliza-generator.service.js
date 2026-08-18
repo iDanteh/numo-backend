@@ -725,7 +725,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const prevSF = saldoFavorUsado.get(key);
       saldoFavorUsado.set(key, {
         monto: (prevSF?.monto ?? 0) + monto,
-        detalle: [...(prevSF?.detalle ?? []), ...usados.map(u => ({ serieOrigen: u.serieOrigen ?? null, folioOrigen: u.folioOrigen ?? null, monto: Math.abs(Number(u.montoUsado)) || 0 }))],
+        // `serieVenta`/`folioVenta`: la VENTA que generó el saldo (no el
+        // marcador DEV/CAC) — para SF visible (periodo anterior), la columna
+        // C debe mostrar esta referencia real de venta, no el marcador
+        // (confirmado con el usuario 2026-08-18: DEV-055991/CAC-075406 no son
+        // "serie y folio" auditables en cajas, la venta real sí lo es).
+        detalle: [...(prevSF?.detalle ?? []), ...usados.map(u => ({
+          serieOrigen: u.serieOrigen ?? null, folioOrigen: u.folioOrigen ?? null,
+          monto: Math.abs(Number(u.montoUsado)) || 0,
+          ventaSerie: u.serieVenta ?? null, ventaFolio: u.folioVenta ?? null,
+        }))],
       });
     }
   }

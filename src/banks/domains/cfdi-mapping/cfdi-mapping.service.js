@@ -876,10 +876,16 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       // con el concepto del CFDI actual).
       if (detalleSFVisible.length > 0) {
         for (const d of detalleSFVisible) {
-          const referenciaOrigen = [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+          // Serie y folio de la VENTA que generó el saldo (auditable en
+          // cajas) — nunca el marcador DEV/CAC (ese no es un documento que se
+          // pueda buscar como "serie y folio interno", solo identifica el
+          // TIPO de ajuste). Si por lo que sea no viene la venta, cae al
+          // marcador como último recurso (mejor que dejarlo vacío).
+          const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
+            || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
           emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF', {
-            serie: referenciaOrigen,
-            concepto: [nombreCliente, referenciaOrigen].filter(Boolean).join(' / '),
+            serie: referenciaVenta,
+            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / '),
           });
         }
       } else {

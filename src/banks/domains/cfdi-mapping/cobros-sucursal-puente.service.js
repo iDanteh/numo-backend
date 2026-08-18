@@ -646,10 +646,17 @@ async function construirMovimientosPuente({
           'emisor.rfc': rfc,
           $or: queryPairs,
         }).select('serie folio receptor metodoPago uuid').lean();
+        // OJO: la colección CFDI puede tener MÁS DE UN documento para el mismo
+        // uuid/serie/folio (un "stub" incompleto sincronizado antes que el CFDI
+        // completo, ej. sin `metodoPago` — confirmado con el usuario
+        // 2026-08-17, caso real FILEMON A0-260801889). "el primero que llegue
+        // gana" puede quedarse con el stub y dejar `esPPD` en `false` por
+        // error — se prefiere SIEMPRE el documento que sí trae `metodoPago`.
         for (const cf of cfdisEncontrados) {
           const factKey  = `${cf.serie}|${cf.folio}`;
           const ventaKey = factKeyAVentaKey.get(factKey) ?? factKey;
-          if (!cfdiPorDoc.has(ventaKey)) cfdiPorDoc.set(ventaKey, cf);
+          const existente = cfdiPorDoc.get(ventaKey);
+          if (!existente || (!existente.metodoPago && cf.metodoPago)) cfdiPorDoc.set(ventaKey, cf);
         }
       }
     } catch (err) {

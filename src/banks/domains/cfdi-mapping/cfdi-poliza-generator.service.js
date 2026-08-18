@@ -658,7 +658,22 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
-          formasPago.push({ nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto });
+          // `serieVentaTicket`/`folioVentaTicket`: ticket real de cajas al que
+          // pertenece ESTA porción del cobro (no la Factura Global que lo
+          // agrupa) — confirmado con el usuario 2026-08-18 que cajas NO manda
+          // número de autorización en este endpoint (`fp.autorizacion` no
+          // existe); el dato real vive en `bank_movements.erpLinks` ligado
+          // por serie+folioExterno DEL TICKET (verificado con datos reales:
+          // Factura Global O0-260800164, 41 tickets, 6 BankMovements
+          // distintos cada uno ligado a UN ticket específico vía erpLinks,
+          // con su propio numeroAutorizacion). Permite que `consolidarCargos`
+          // resuelva la autorización real POR TICKET (nunca por CFDI
+          // completo, que fue justo el bug de Facturas Globales de Hidalgo
+          // 2026-08-14) y agrupe Tarjeta por ella.
+          formasPago.push({
+            nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto,
+            serieVentaTicket: cuenta.serieVenta ?? null, folioVentaTicket: cuenta.folioVenta ?? null,
+          });
         }
       }
       if (formasPago.length) {
@@ -736,7 +751,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // o siguiente (presentes en la ventana ampliada) aparecían en la póliza
   // incorrecta (caso real 2026-08-15: G1|260800010 del 6-ago en la póliza
   // del 5-ago, G1|260800005 del 4-ago idem, misma causa).
-  const cobrosCobradoraDirecta = [];
+  let cobrosCobradoraDirecta = [];
   if (usoCaminoPorCentro) {
     // Derivar el prefijo de periodo del batch y el día exacto de la poliza.
     let folioPrefijoBatch = null;
@@ -773,7 +788,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
           if (monto <= 0) continue;
-          cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, folioOrigen: cobro.folioOrigen ?? null });
+          // `claveFac` (serieFactura|folioFactura) es SOLO para resolver el CFDI
+          // en Mongo (que indexa por folio SAT) — el texto que se le muestra al
+          // contador (concepto) debe usar el documento relacionado real
+          // (serieVenta/folioVenta, "serie y folio interno" auditable en cajas),
+          // nunca el folio de la factura (confirmado con el usuario 2026-08-17:
+          // mostrar el folio de factura llevaba a buscar un ticket equivocado en
+          // Kore y comparar contra un saldo que no correspondía).
+          const serFolTicket = `${cuenta.serieVenta || serie}-${cuenta.folioVenta ? String(cuenta.folioVenta) : folio}`;
+          cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, serFolTicket, folioOrigen: cobro.folioOrigen ?? null });
         }
       }
     }
@@ -784,14 +807,41 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const serFolPairs = clavesUnicas.map(cv => { const [s, f] = cv.split('|'); return { serie: s, folio: f }; });
       const cfdisFac = await CFDI.find(
         { $or: serFolPairs },
-        { serie: 1, folio: 1, 'receptor.nombre': 1, uuid: 1 },
+        { serie: 1, folio: 1, 'receptor.nombre': 1, uuid: 1, metodoPago: 1 },
       ).lean();
-      const nombrePorClave = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.receptor?.nombre ?? null]));
-      const uuidPorClave   = new Map(cfdisFac.map(c => [`${c.serie}|${c.folio}`, c.uuid ?? null]));
+      // OJO: la colección CFDI puede tener MÁS DE UN documento para el mismo
+      // uuid/serie/folio (un "stub" incompleto sincronizado antes que el CFDI
+      // completo, confirmado con el usuario 2026-08-17: caso real FILEMON
+      // A0-260801889, dos documentos con el mismo uuid, uno sin `metodoPago`).
+      // Un Map normal se queda con el ÚLTIMO valor visto sin importar cuál —
+      // si el stub llega después, pisa el PPD real con `null` y el filtro de
+      // abajo nunca lo detecta. Se recorre a mano prefiriendo SIEMPRE el
+      // documento que sí trae el dato, sin importar el orden que regrese Mongo.
+      const nombrePorClave     = new Map();
+      const uuidPorClave       = new Map();
+      const metodoPagoPorClave = new Map();
+      for (const c of cfdisFac) {
+        const key = `${c.serie}|${c.folio}`;
+        if (c.receptor?.nombre) nombrePorClave.set(key, c.receptor.nombre);
+        else if (!nombrePorClave.has(key)) nombrePorClave.set(key, null);
+        if (c.uuid) uuidPorClave.set(key, c.uuid);
+        else if (!uuidPorClave.has(key)) uuidPorClave.set(key, null);
+        if (c.metodoPago) metodoPagoPorClave.set(key, c.metodoPago);
+        else if (!metodoPagoPorClave.has(key)) metodoPagoPorClave.set(key, null);
+      }
       for (const entry of cobrosCobradoraDirecta) {
         entry.nombre    = nombrePorClave.get(entry.claveFac) ?? null;
         entry.cfdiUuid  = uuidPorClave.get(entry.claveFac)   ?? null;
       }
+      // PPD (Crédito): el cierre de esta CxC es responsabilidad exclusiva de
+      // Cobranza, nunca de Ingreso — mismo criterio que `esPPD` en
+      // cobros-sucursal-puente.service.js (confirmado con el usuario
+      // 2026-08-05). Este camino ("por centro", 2026-08-15) no tenía el
+      // filtro y dejaba pasar cobros de facturas PPD (confirmado con el
+      // usuario 2026-08-17).
+      cobrosCobradoraDirecta = cobrosCobradoraDirecta.filter(
+        entry => metodoPagoPorClave.get(entry.claveFac) !== 'PPD',
+      );
     }
   }
 
@@ -2264,12 +2314,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionProp = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionProp && montoSaldoFavorProp > 0) {
+        // Si el SF que se está cerrando es TODO oculto (generado y usado el
+        // mismo día/almacén, ver `_inyectarSaldoFavorGenerado`), esta línea de
+        // cierre debe ocultarse igual que sus hermanas — sin esto queda
+        // visible en la póliza principal como un Cargo "Cancelación" extra
+        // sin contrapartida aparente (el abono que revierte SÍ existe, solo
+        // que está oculto), confundiendo al contador (confirmado con el
+        // usuario 2026-08-18, caso real NORBERTO VELAZQUEZ JUAREZ/CAC-077337).
+        // `tipoOrigen` también se sobreescribe: `_extraerCobrosSucursal`
+        // (poliza.service.js) solo revisa `reglaNombre` en líneas cuyo
+        // tipoOrigen YA es 'Cobro Sucursal' — con el tipoOrigen original
+        // ('Cancelación') la línea nunca llegaba a esa revisión.
+        const todoOcultoProp = lineasSaldoFavorProp.every(l => l.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO);
         movimientosResult.push({
           ...abonoDevolucionProp,
           debe:          montoSaldoFavorProp,
           haber:         0,
           centroCosto:   ccProp?.clave ?? abonoDevolucionProp.centroCosto ?? null,
           centroCostoId: ccProp?.id    ?? null,
+          ...(todoOcultoProp ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
           _cfdiInfo: {
             uuid:              cfdi.uuid,
             tipo:              cfdi.tipoDeComprobante,
@@ -2494,12 +2557,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const _foliosYaEnPuente = new Set(
       movsPuente.filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.folio != null).map(m => String(m.folio)),
     );
-    for (const { claveSat, monto, claveFac, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaProp) {
+    for (const { claveSat, monto, claveFac, serFolTicket, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaProp) {
       const esEfe     = claveSat === '01';
       const cuentaDir = esEfe ? cuentaCajaIdDir : cuentaBancosIdDir;
       if (!cuentaDir || monto <= 0) continue;
-      const [_serie, _folio] = (claveFac ?? '').split('|');
-      const _serFol = _serie && _folio ? `${_serie}-${_folio}` : (claveFac ?? '');
+      // Concepto: SIEMPRE el documento relacionado (serieVenta-folioVenta,
+      // "serie y folio interno" auditable en cajas) — nunca serieFactura/
+      // folioFactura (`claveFac`, que solo sirve para resolver el CFDI en
+      // Mongo). Mostrar el folio de factura llevaba a buscar un ticket
+      // equivocado en Kore (confirmado con el usuario 2026-08-17).
+      const _serFol = serFolTicket || (claveFac ?? '');
       // Saltar si la cola ya tiene este cobro — el DEBE+HABER de cobradora
       // ya lo generó `construirMovimientosPuente` (en movsPuente arriba).
       // Incluirlo aquí también inflaría el consolidado por partida doble
@@ -3255,6 +3322,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionGuard = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionGuard && montoSaldoFavorGuard > 0) {
+        // Ver comentario equivalente en generarPropuesta: si el SF que se
+        // cierra es todo oculto, esta línea debe ocultarse igual que sus
+        // hermanas (confirmado con el usuario 2026-08-18, caso real NORBERTO
+        // VELAZQUEZ JUAREZ/CAC-077337).
+        const todoOcultoGuard = lineasSaldoFavorGuard.every(l => l.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO);
         todosLosMovimientos.push({
           ...abonoDevolucionGuard,
           debe:           montoSaldoFavorGuard,
@@ -3262,6 +3334,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           cuentaFaltante: abonoDevolucionGuard.cuentaId == null,
           centroCosto:    cc?.clave ?? abonoDevolucionGuard.centroCosto ?? null,
           centroCostoId:  cc?.id    ?? null,
+          ...(todoOcultoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         });
       }
     }
@@ -3441,12 +3514,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const _foliosYaEnPuenteGuard = new Set(
       movsPuenteGuard.filter(m => m.tipoOrigen === 'Cobro Sucursal' && m.folio != null).map(m => String(m.folio)),
     );
-    for (const { claveSat, monto, claveFac, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaGuard) {
+    for (const { claveSat, monto, claveFac, serFolTicket, nombre, folioOrigen, cfdiUuid } of cobrosCobradoraDirectaGuard) {
       const esEfe    = claveSat === '01';
       const cuentaCos = esEfe ? cuentaCajaIdCos : cuentaBancosIdCos;
       if (!cuentaCos || monto <= 0) continue;
-      const [_serieG, _folioG] = (claveFac ?? '').split('|');
-      const _serFolG = _serieG && _folioG ? `${_serieG}-${_folioG}` : (claveFac ?? '');
+      // Concepto: documento relacionado (serieVenta-folioVenta), nunca la
+      // factura (`claveFac`) — ver comentario equivalente en generarPropuesta.
+      const _serFolG = serFolTicket || (claveFac ?? '');
       if (cfdiUuid && _uuidsYaEnPuenteGuard.has(cfdiUuid.toUpperCase())) continue;
       if (folioOrigen != null && _foliosYaEnPuenteGuard.has(String(folioOrigen))) continue;
       const _conceptoG = nombre ? `${nombre} / ${_serFolG}` : _serFolG;

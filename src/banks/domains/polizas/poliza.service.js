@@ -1130,6 +1130,12 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // sigue su camino normal (bloquesAbonosNormales), sin tocar.
     if (/refacturaci[oó]n/i.test(m.tipoOrigen || '')) continue;
     const centroCosto = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
+    // Ticket real (serieVentaTicket/folioVentaTicket) en vez de `m.serie`
+    // (la Factura, que en una Global es la misma para decenas de tickets) —
+    // usado para el detalle de la hoja "Desglose Consolidado" más abajo.
+    const serieParaDetalle = (m.serieVentaTicket && m.folioVentaTicket)
+      ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
+      : (m.serie || '');
     const bancario    = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
     // Solo se confía en `bancario.esTransferencia` cuando el movimiento
     // bancario SÍ trae `categoria` (SPEI/TRASPASO/otra) — si el match existe
@@ -1224,7 +1230,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: tipoDetalle });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle });
       continue;
     }
 
@@ -1270,7 +1276,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: 'TARJETA' });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA' });
       continue;
     }
 
@@ -1338,17 +1344,26 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // autorización/referencia bancaria REAL cuando existe (gt.referencia,
     // ej. "034135") — solo cae al tipo genérico ("Transferencia"/"Cheque")
     // si no hay depósito bancario real ligado. Columna H (concepto) SIEMPRE
-    // usa el serie-folio INTERNO del propio CFDI (m.serie, ej.
-    // "B0-260701094"), nunca la referencia bancaria — invertido 2026-08-06
-    // (antes: columna C mostraba el tipo genérico y columna H la referencia,
-    // confirmado 2026-07-28; el usuario pidió el orden contrario para poder
-    // conciliar la referencia bancaria directo desde la columna C). Agrupada
-    // (mismo número de autorización real en 2+ CFDIs): sin cambios — la
-    // columna C sigue mostrando la referencia bancaria real (gt.referencia),
-    // que siempre existe en este caso (ver `key` más arriba, agrupar solo
-    // ocurre cuando hay referencia).
-    const serieFinal = gt.referencia ?? (m.serie || '');
-    const concepto = esGrupo ? etiqueta : ([nombre, (m.serie || '')].filter(Boolean).join(' / ') || etiqueta);
+    // usa el serie-folio INTERNO real, nunca la referencia bancaria —
+    // invertido 2026-08-06 (antes: columna C mostraba el tipo genérico y
+    // columna H la referencia, confirmado 2026-07-28; el usuario pidió el
+    // orden contrario para poder conciliar la referencia bancaria directo
+    // desde la columna C). Agrupada (mismo número de autorización real en
+    // 2+ CFDIs): sin cambios — la columna C sigue mostrando la referencia
+    // bancaria real (gt.referencia), que siempre existe en este caso (ver
+    // `key` más arriba, agrupar solo ocurre cuando hay referencia).
+    //
+    // El "serie-folio interno real" es el TICKET (serieVentaTicket/
+    // folioVentaTicket), no `m.serie` (la Factura, que en una Global es la
+    // misma para decenas de tickets distintos) — sin esto, todas las líneas
+    // resueltas por ticket de una misma Global mostraban el folio de la
+    // factura repetido en vez del ticket real (confirmado con el usuario
+    // 2026-08-18, caso real Factura Global O0-260800164).
+    const serFolReal = (m.serieVentaTicket && m.folioVentaTicket)
+      ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
+      : (m.serie || '');
+    const serieFinal = gt.referencia ?? serFolReal;
+    const concepto = esGrupo ? etiqueta : ([nombre, serFolReal].filter(Boolean).join(' / ') || etiqueta);
     const serieColumnaC = esGrupo ? serieFinal : (gt.referencia ?? etiqueta);
     depositosIdentificados.push({
       cuenta: gt.cuenta, serie: serieColumnaC, concepto,

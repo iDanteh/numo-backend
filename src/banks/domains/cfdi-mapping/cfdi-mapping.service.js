@@ -815,6 +815,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Ver comentario más abajo (bloque `esCasoNormalParaSplit`) sobre por
         // qué esta línea concreta debe llevar el claveSat REAL, no el del CFDI.
         _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+        // Ticket real (cajas) al que pertenece esta porción — ver comentario
+        // en `_prefetchAjustesFacturaPropia`. `consolidarCargos` lo usa para
+        // resolver la autorización real de Tarjeta POR TICKET vía
+        // bank_movements.erpLinks, nunca por CFDI completo (evita el bug de
+        // Facturas Globales de Hidalgo 2026-08-14).
+        _serieVentaTicket: fp.serieVentaTicket ?? null,
+        _folioVentaTicket: fp.folioVentaTicket ?? null,
         ...(esUltimo ? extraEnUltima : {}),
       });
     });
@@ -1435,6 +1442,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ...m,
     ...satMeta,
     ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
+    // Sobrevive al spread de `satMeta` por la misma razón que `_formaPagoReal`
+    // — ver comentario ahí. `consolidarCargos` los usa para resolver la
+    // autorización real de Tarjeta por ticket (bank_movements.erpLinks).
+    ...(m._serieVentaTicket != null ? { serieVentaTicket: m._serieVentaTicket } : {}),
+    ...(m._folioVentaTicket != null ? { folioVentaTicket: m._folioVentaTicket } : {}),
     ...(
       m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL
         ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }

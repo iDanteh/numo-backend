@@ -768,20 +768,30 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     // puede hacer una devolución normal — genera un saldo a favor temporal en
     // su lugar. Para cuando se factura la Global (al final del día), esa
     // devolución YA está reflejada: el ticket que la generó entra a la
-    // Global con su monto NETO (post-devolución), no el original. Si esa
-    // misma SF se consume en OTRO ticket de la MISMA Global, restarla de
-    // nuevo aquí sería una doble resta — el monto de la factura ya viene sin
-    // ese dinero contado. Para distinguir este caso del normal (SF generado
-    // por una Devolución de un día/factura ANTERIOR — ahí sí hay que restar,
+    // Global con su monto NETO (post-devolución), no el original. Si ESE
+    // MISMO ticket usa su propio saldo, restarla de nuevo aquí sería una
+    // doble resta — el monto de la factura ya viene sin ese dinero contado.
+    // OJO (2026-08-19, caso real confirmado: C0-260800403 generó DEV-056086
+    // $89.15, usado en C0-260800431 $85.36 — TICKETS DISTINTOS dentro de la
+    // misma Global de 200+ tickets): el neteo "monto NETO post-devolución"
+    // solo aplica a la propia línea del ticket que generó el saldo — no a
+    // cualquier OTRO ticket de la misma Global que después lo use. El cobro
+    // real de ese otro ticket ya excluye ese monto (filtro "saldo a favor" en
+    // formasPago, línea ~735) y nadie más lo resta, así que ese dinero
+    // desaparecía del split de Cargo por completo. La clave para decidir
+    // "ya viene neto" debe ser la VENTA (ticket) que generó el saldo, NO la
+    // Factura Global completa — solo se excluye cuando el mismo ticket generó
+    // Y usó su propio saldo. Para distinguir del caso normal (SF generado por
+    // una Devolución de un día/factura ANTERIOR — ahí sí hay que restar,
     // confirmado con datos reales de la factura E0-092), se arma primero un
-    // mapa `folioOrigen del marcador → factura de la venta que lo generó`
-    // recorriendo TODOS los `saldosFavorGenerados` del batch.
-    const _facturaGeneradoraPorMarcador = new Map();
+    // mapa `marcador → venta (ticket) que lo generó` recorriendo TODOS los
+    // `saldosFavorGenerados` del batch.
+    const _ventaGeneradoraPorMarcador = new Map();
     for (const cuenta of resultadosSaldos) {
-      const keyGen = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
+      const ventaGenKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
       for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
         const marcador = `${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`;
-        _facturaGeneradoraPorMarcador.set(marcador, keyGen);
+        _ventaGeneradoraPorMarcador.set(marcador, ventaGenKey);
       }
     }
 
@@ -789,14 +799,14 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       // Mismo criterio que arriba — agrupar por la factura real, no por el ticket.
       const key = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
       const diaCfdi = diaCfdiPorClave.get(key);
+      const ventaConsumidora = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
       const usados = (cuenta.saldosFavorUsados ?? [])
         .filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi)
-        // Excluir el caso "generado y usado en la misma Factura Global" — ver
-        // comentario arriba. Si el marcador que generó este SF no se
-        // encuentra en el mapa (generado por una Devolución con su propio
-        // CFDI, caso normal) o pertenece a OTRA factura, sí se resta (igual
-        // que antes).
-        .filter(u => _facturaGeneradoraPorMarcador.get(`${(u.serieOrigen ?? '').toUpperCase()}|${u.folioOrigen ?? ''}`) !== key);
+        // Excluir SOLO el autoconsumo real (mismo ticket genera y usa su
+        // propio saldo) — ver comentario arriba. Si el marcador no se
+        // encuentra (Devolución con su propio CFDI, caso normal) o el ticket
+        // que lo generó es DISTINTO al que lo usa, sí se resta.
+        .filter(u => _ventaGeneradoraPorMarcador.get(`${(u.serieOrigen ?? '').toUpperCase()}|${u.folioOrigen ?? ''}`) !== ventaConsumidora);
       if (!usados.length) continue;
       const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
       if (monto <= 0) continue;

@@ -1892,7 +1892,10 @@ function bloquesAjustesContado(movs) {
  *      genérica (Descuento igual) — una sola secuencia por serie/folio.
  *   2. Bonificación Club Tuberos — su propia sección, por serie/folio.
  *   3. Cargo consolidado por forma de pago: Efectivo, Tarjeta.
- *   4. Anticipos y saldo a favor (Recepción y Aplicación), por serie/folio.
+ *   4. Saldo a favor (Recepción y Aplicación), por serie/folio — Anticipo
+ *      (estándar con NC del SAT, y OPA sin NC) ya NO va aquí, se mezcla con
+ *      Ventas normales (punto 1), ordenado por su propio serie/folio
+ *      (confirmado con el usuario 2026-08-19).
  *   5. Transferencia (siempre detallada por CFDI, o agrupada cuando comparte
  *      número de autorización real) y Depósito identificado (forma de pago
  *      sin mapear con depósito bancario real ligado) — al final del export.
@@ -1910,17 +1913,28 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   const bloquesDeCategorias = (...categorias) =>
     ajustes.filter(a => categorias.includes(a.categoria)).map(a => a.bloque);
 
+  // Anticipo (estándar con NC del SAT, y OPA sin NC): a diferencia de Saldo a
+  // Favor (que sigue en su propio flujo/sección, sin tocar), el Anticipo ya
+  // NO va en una sección aparte después de Efectivo/Tarjeta — se mezcla con
+  // Ventas normales, ordenado por su propio serie/folio (confirmado con el
+  // usuario 2026-08-19: aplica a ambos mecanismos, no solo a OPA).
+  const bloquesAnticipoTodos = bloquesDeCategorias('anticipo');
+
   const bloquesVentas = [
     ...bloquesAbonosNormales(contadoNormal.filter(m => Number(m.haber) > 0)),
     ...(separarCategorias ? [] : bloquesDeCategorias('devolucion', 'descuento', 'bonificacion')),
+    // Anticipo siempre va en `bloquesVentas` sin importar `separarCategorias`
+    // — a diferencia de devolucion/descuento/bonificacion, no tiene una salida
+    // aparte en el modo CEDIS, así que excluirlo aquí lo perdería por completo.
+    ...bloquesAnticipoTodos,
   ];
   bloquesVentas.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
   const bloquesClubTuberos = separarCategorias ? [] : bloquesDeCategorias('clubTuberos');
   bloquesClubTuberos.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
 
-  const bloquesAnticipos = bloquesDeCategorias('anticipo');
-  bloquesAnticipos.sort((b1, b2) => compararSerieFolio(b1[0], b2[0]));
+  // Ya no queda ningún bloque de anticipo aparte — todos se mezclaron arriba.
+  const bloquesAnticipos = [];
 
   const { consolidados, depositosIdentificados } =
     consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket);

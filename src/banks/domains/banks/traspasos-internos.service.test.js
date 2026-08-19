@@ -20,7 +20,12 @@ jest.mock('./BankMovement.model');
 
 const BankMovement = require('./BankMovement.model');
 const { TODOS_MOTORES_HISTORICO } = require('./bank.service');
-const { matchTraspasosInternos, revertirTraspasosInternos } = require('./traspasos-internos.service');
+const {
+  matchTraspasosInternos, revertirTraspasosInternos,
+  generarPolizaContpaqTraspasos, generarPolizasContpaqTraspasosPorRango,
+} = require('./traspasos-internos.service');
+const ExcelJS = require('exceljs');
+const AdmZip  = require('adm-zip');
 
 const BANCO_ENUM = [
   'Banamex', 'BBVA', 'Santander', 'Azteca',
@@ -43,6 +48,10 @@ function matchFilter(doc, filter) {
 }
 
 function matchField(val, cond) {
+  // RegExp como filtro (ej. RE_CATEGORIA_TRASPASO_INTERNO) — mismo comportamiento que
+  // Mongo/Mongoose real (find({campo: /regex/i})), sin esto Object.entries(regex) da []
+  // y el filtro matchearía cualquier cosa por error.
+  if (cond instanceof RegExp) return typeof val === 'string' && cond.test(val);
   if (cond !== null && typeof cond === 'object' && !Array.isArray(cond) && !(cond instanceof Date)) {
     return Object.entries(cond).every(([op, arg]) => {
       if (op === '$in') return arg.includes(val);
@@ -432,5 +441,171 @@ describe('revertirTraspasosInternos', () => {
     // Contraparte: sin identificaciones humanas restantes → sí vuelve a no_identificado
     expect(docContrapartePost.status).toBe('no_identificado');
     expect(docContrapartePost.traspasoInterno).toBeNull();
+  });
+});
+
+describe('generarPolizaContpaqTraspasos', () => {
+  async function leerHojaPoliza(buffer) {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    return wb.getWorksheet('poliza');
+  }
+
+  test('2 pares (Banamex + Santander) → 1 fila P + 4 filas M1 con cuenta/cargo-abono/monto/subcódigo correctos', async () => {
+    const relacionados = [
+      { bbva: bbva({ _id: 'bbva-1', deposito: 720000 }), contraparte: contraparte({ _id: 'bnmx-1', banco: 'Banamex', retiro: 720000 }) },
+      { bbva: bbva({ _id: 'bbva-2', deposito: 110000 }), contraparte: contraparte({ _id: 'sant-1', banco: 'Santander', retiro: 110000 }) },
+    ];
+
+    const buffer = await generarPolizaContpaqTraspasos(relacionados, { folio: 46246, fecha: new Date('2026-08-08T00:00:00Z') });
+    const sheet  = await leerHojaPoliza(buffer);
+
+    expect(sheet.rowCount).toBe(5); // 1 'P' + 4 'M1'
+
+    const headerRow = sheet.getRow(1);
+    expect(headerRow.getCell(1).value).toBe('P');
+    expect(headerRow.getCell(3).value).toBe('3');
+    expect(headerRow.getCell(4).value).toBe(46246);
+    expect(headerRow.getCell(7).value).toBe('Traspaso Entre Cuentas Propias');
+    expect(headerRow.getCell(9).value).toBe(1); // col I — verificado contra el .xls real
+
+    const rowCargoBanamex = sheet.getRow(2);
+    expect(rowCargoBanamex.getCell(1).value).toBe('M1');
+    expect(rowCargoBanamex.getCell(2).value).toBe('1102011001'); // BBVA
+    expect(rowCargoBanamex.getCell(4).value).toBe(0);            // cargo
+    expect(rowCargoBanamex.getCell(5).value).toBe(720000);
+    expect(rowCargoBanamex.getCell(6).value).toBe(26);           // Ingr traspasos
+    expect(rowCargoBanamex.getCell(8).value).toBe('TRASPASO ENTRE CUENTAS PROPIAS');
+    expect(rowCargoBanamex.getCell(9).value).toBe(1);            // col I — verificado contra el .xls real
+
+    const rowAbonoBanamex = sheet.getRow(3);
+    expect(rowAbonoBanamex.getCell(2).value).toBe('1102012001'); // Banamex
+    expect(rowAbonoBanamex.getCell(4).value).toBe(1);            // abono
+    expect(rowAbonoBanamex.getCell(5).value).toBe(720000);
+    expect(rowAbonoBanamex.getCell(6).value).toBe(46);           // Egr traspasos
+
+    const rowCargoSantander = sheet.getRow(4);
+    expect(rowCargoSantander.getCell(2).value).toBe('1102011001');
+    expect(rowCargoSantander.getCell(5).value).toBe(110000);
+
+    const rowAbonoSantander = sheet.getRow(5);
+    expect(rowAbonoSantander.getCell(2).value).toBe('1102013001'); // Santander
+    expect(rowAbonoSantander.getCell(5).value).toBe(110000);
+  });
+
+  test('banco sin cuenta contable mapeada (ej. HSBC) → lanza error identificando el banco', async () => {
+    const relacionados = [
+      { bbva: bbva(), contraparte: contraparte({ banco: 'HSBC' }) },
+    ];
+    await expect(generarPolizaContpaqTraspasos(relacionados, { folio: 1 }))
+      .rejects.toThrow(/HSBC/);
+  });
+
+  test('relacionados vacío → lanza error', async () => {
+    await expect(generarPolizaContpaqTraspasos([], { folio: 1 })).rejects.toThrow();
+    await expect(generarPolizaContpaqTraspasos(null, { folio: 1 })).rejects.toThrow();
+  });
+
+  test('sin folio → lanza error', async () => {
+    const relacionados = [{ bbva: bbva(), contraparte: contraparte() }];
+    await expect(generarPolizaContpaqTraspasos(relacionados, {})).rejects.toThrow();
+  });
+});
+
+describe('generarPolizasContpaqTraspasosPorRango', () => {
+  test('rango de 2 días con pares en ambos → 2 archivos en el zip, folio provisional secuencial (1, 2...)', async () => {
+    const fechaDia1 = new Date('2026-08-08T12:00:00.000Z');
+    const fechaDia2 = new Date('2026-08-09T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-d1', deposito: 720000, fecha: fechaDia1, concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-d1', banco: 'Banamex', retiro: 720000, fecha: fechaDia1 }),
+      bbva({ _id: 'bbva-d2', deposito: 110000, fecha: fechaDia2, concepto: conceptoRecibido('Santander') }),
+      contraparte({ _id: 'sant-d2', banco: 'Santander', retiro: 110000, fecha: fechaDia2 }),
+    ]);
+
+    const { buffer, nombreZip } = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-09' }, USER,
+    );
+    expect(nombreZip).toBe('Traspasos_CONTPAQ_2026-08-08_a_2026-08-09.zip');
+
+    const zip     = new AdmZip(buffer);
+    const nombres = zip.getEntries().map(e => e.entryName).sort();
+    expect(nombres).toEqual([
+      'Poliza_Traspasos_20260808_CONTPAQ.xlsx',
+      'Poliza_Traspasos_20260809_CONTPAQ.xlsx',
+    ]);
+
+    const wb1 = new ExcelJS.Workbook();
+    await wb1.xlsx.load(zip.getEntry('Poliza_Traspasos_20260808_CONTPAQ.xlsx').getData());
+    const sheet1 = wb1.getWorksheet('poliza');
+    expect(sheet1.getRow(1).getCell(4).value).toBe(1); // folio provisional secuencial
+    expect(sheet1.getRow(2).getCell(5).value).toBe(720000);
+
+    const wb2 = new ExcelJS.Workbook();
+    await wb2.xlsx.load(zip.getEntry('Poliza_Traspasos_20260809_CONTPAQ.xlsx').getData());
+    const sheet2 = wb2.getWorksheet('poliza');
+    expect(sheet2.getRow(1).getCell(4).value).toBe(2);
+    expect(sheet2.getRow(2).getCell(5).value).toBe(110000);
+  });
+
+  test('pares fuera del rango quedan excluidos', async () => {
+    const fechaDentro = new Date('2026-08-08T12:00:00.000Z');
+    const fechaFuera  = new Date('2026-08-15T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-dentro', deposito: 500, fecha: fechaDentro, concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-dentro', banco: 'Banamex', retiro: 500, fecha: fechaDentro }),
+      bbva({ _id: 'bbva-fuera', deposito: 999, fecha: fechaFuera, concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-fuera', banco: 'Banamex', retiro: 999, fecha: fechaFuera }),
+    ]);
+
+    const { buffer } = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-09' }, USER,
+    );
+
+    const zip = new AdmZip(buffer);
+    expect(zip.getEntries()).toHaveLength(1);
+    expect(zip.getEntries()[0].entryName).toBe('Poliza_Traspasos_20260808_CONTPAQ.xlsx');
+  });
+
+  test('sin ningún par relacionado en el rango → lanza error', async () => {
+    setupDb([]);
+    await expect(generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-09' }, USER,
+    )).rejects.toThrow(/rango de fechas/);
+  });
+
+  test('faltan fechas → lanza error', async () => {
+    await expect(generarPolizasContpaqTraspasosPorRango(
+      { fechaFin: '2026-08-09' }, USER,
+    )).rejects.toThrow();
+    await expect(generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08' }, USER,
+    )).rejects.toThrow();
+  });
+
+  test('categoría con mayúsculas/redacción distinta a la del fixture → igual matchea (case-insensitive, tolerante a variaciones)', async () => {
+    const fecha = new Date('2026-08-08T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-var', deposito: 300, fecha, categoria: 'TRASPASOS ENTRE CUENTAS PROPIAS', concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-var', banco: 'Banamex', retiro: 300, fecha }),
+    ]);
+
+    const { buffer } = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
+    );
+    const zip = new AdmZip(buffer);
+    expect(zip.getEntries()).toHaveLength(1);
+  });
+
+  test('categoría que NO es de traspaso interno → no matchea, lanza error', async () => {
+    const fecha = new Date('2026-08-08T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-otra', deposito: 300, fecha, categoria: 'Pago de nómina', concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-otra', banco: 'Banamex', retiro: 300, fecha }),
+    ]);
+
+    await expect(generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
+    )).rejects.toThrow(/rango de fechas/);
   });
 });

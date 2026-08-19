@@ -861,7 +861,28 @@ async function identificar(id, body, user) {
       console.warn(`[collection-requests] identificar ${id}: Kore rechazó el cobro (cxcs=${cr.cxcs.map(c => c.erpId).join(',')}, conceptoId=${cr.conceptoId}):`, err.message, err.koreBody ? JSON.stringify(err.koreBody) : '');
       throw new BadRequestError(`Kore rechazó el cobro: ${err.message}`);
     }
-    throw err;
+    // Error de RED (sin respuesta HTTP: timeout, ECONNRESET, DNS, etc. — ver
+    // kore-caja.service.js#_operacionConReintento, que relanza el error de axios
+    // TAL CUAL cuando no hay `response`) — a diferencia de KoreCajaError (Kore
+    // respondió, aunque sea con un rechazo), acá NO hay forma de saber si Kore
+    // alcanzó a aplicar el cobro antes de que se perdiera la respuesta. Incidente
+    // real 2026-08-19: un corte de red justo acá dejó la CxC cobrada en Kore sin
+    // NINGÚN rastro en Numo (ni inconsistenciaPostKore, ni bankMovementId), porque
+    // este catch simplemente relanzaba el error crudo — la solicitud quedaba en
+    // 'pendiente' para siempre, y un segundo intento chocaba con Kore rechazando
+    // "ya aplicado" sin que Numo supiera qué había pasado. Mismo criterio de
+    // "nunca reintentar a ciegas" que ya usa el catch de la transacción más abajo
+    // (paso 7) — se marca inconsistenciaPostKore aunque acá todavía no haya
+    // `koreResult` (justamente porque no se sabe si lo hay del lado de Kore).
+    const mensaje = `Error de red al aplicar el cobro en Kore (solicitudIdErp=${cr.solicitudIdErp}) — no se pudo confirmar si Kore alcanzó a procesarlo: ${err.message}`;
+    await CollectionRequest.updateOne({ _id: cr._id }, {
+      inconsistenciaPostKore: { at: new Date(), mensaje, movimientosPendientes: movIds },
+    });
+    logger.error(`[collection-requests] INCONSISTENCIA-POST-KORE (red, aplicarSolicitudOperacion) id=${id} solicitudIdErp=${cr.solicitudIdErp}: ${err.message}`);
+    throw new BadRequestError(
+      `No se pudo confirmar si Kore aplicó el cobro (falla de red: ${err.message}). ` +
+      'Verificá manualmente en Kore antes de reintentar — la solicitud quedó marcada para revisión manual (inconsistenciaPostKore).',
+    );
   }
 
   // 7. Kore YA ACEPTÓ el cobro (paso irreversible desde Numo, D4) — vincular

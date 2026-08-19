@@ -796,19 +796,16 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // marcador `_puntosUsado` cuando el remanente también se parte.
   const splitPorFormaPagoReal = (montoAPartir, extraEnUltima = {}) => {
     const formasPagoReal = context.desglosePagoReal;
-    let acumulado = 0;
     formasPagoReal.forEach((fp, idx) => {
       const esUltimo = idx === formasPagoReal.length - 1;
-      // Monto REAL de cada ticket (no proporcional) para todas las líneas
-      // salvo la última — la última absorbe en silencio la diferencia entre
-      // `montoAPartir` (total facturado) y la suma real de las anteriores
-      // ("ruido" de reclasificación del ERP), sin generar una fila aparte
-      // (confirmado con el usuario 2026-08-19: no quiere una línea visible de
-      // sobrante/faltante — mismo lugar donde ya se absorbía el redondeo).
-      const montoLinea = esUltimo
-        ? parseFloat((montoAPartir - acumulado).toFixed(2))
-        : Math.round((Number(fp.monto) || 0) * 100) / 100;
-      acumulado += montoLinea;
+      // Monto REAL de cada ticket, tal cual, SIN ajustar ni reescalar ninguna
+      // línea para forzar el cierre contra `montoAPartir` (confirmado con el
+      // usuario 2026-08-19: si la Factura Global no cierra 1 a 1 por "ruido"
+      // de reclasificación del ERP, se acepta desbalanceada en vez de restarle
+      // a un ticket puntual — la línea anterior que absorbía el residuo en la
+      // última línea podía dejarla en negativo y perderse por completo, caso
+      // real CONSTRUCASA 13-ago, ticket C0-260802371).
+      const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
       if (montoLinea <= 0) return;
 
       const esEfectivo = (fp.claveSat ?? '').trim() === '01';

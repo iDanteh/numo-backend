@@ -364,10 +364,19 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     const usosMismoDia = diaGen ? usos.filter(u => _diaMx(u.fecha) === diaGen) : [];
     const sumaUsosMismoDia = usosMismoDia.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
     const saldoRestanteSF = Math.round(((Number(gen.monto) || 0) - sumaUsosMismoDia) * 100) / 100;
+    // Solo los usos tipo ABO (retiro en efectivo) se restan aquí del Abono de
+    // generación — ver `montoAEmitir` abajo. Un uso normal (venta que pagó con
+    // este saldo en OTRO ticket) ya se debita por separado en
+    // `saldoFavorUsado` (ver `_prefetchAjustesFacturaPropia`, corrección
+    // 2026-08-19 ticket C0-260800403/431) — restarlo TAMBIÉN aquí sería una
+    // doble resta (el caso que este comentario original advertía, pero que
+    // solo aplicaba de verdad al retiro ABO, no a cualquier uso).
+    let sumaABOMismoDia = 0;
     for (const u of usosMismoDia) {
       if ((u.serieOrigen ?? u.serieVenta ?? '').toUpperCase() !== 'ABO') continue;
       const montoRetiro = Math.abs(Number(u.montoUsado)) || 0;
       if (montoRetiro <= 0) continue;
+      sumaABOMismoDia += montoRetiro;
       ajustesEfectivoRetiroSF.push({
         monto: montoRetiro,
         centro: centroPropioClave ?? null,
@@ -376,6 +385,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         ventaFolio: cuenta.folioVenta ?? null,
       });
     }
+    const saldoRestanteSoloABO = Math.round(((Number(gen.monto) || 0) - sumaABOMismoDia) * 100) / 100;
 
     // En el camino principal (centro+fecha), `obtenerSaldosFavorPorCentro`
     // garantiza que TODOS los saldosFavorGenerados pertenecen al centro
@@ -426,14 +436,25 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
       && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
 
-    // Monto a EMITIR como Abono de Saldo a Favor: el remanente después de
-    // restar los usos del mismo día (ver `saldoRestanteSF`), no el generado
-    // completo — sin esto, un retiro parcial en efectivo (ABO) se contaba
-    // dos veces: una vía el Abono completo aquí y otra vía el ajuste
-    // negativo de Efectivo (`ajustesEfectivoRetiroSF`). Si no hubo NINGÚN
-    // uso el mismo día (`usosMismoDia.length === 0`), se mantiene el
-    // comportamiento anterior (se emite el monto generado completo).
-    const montoAEmitir = usosMismoDia.length > 0 ? Math.max(saldoRestanteSF, 0) : (Number(gen.monto) || 0);
+    // Monto a EMITIR como Abono de Saldo a Favor:
+    // - Si el día cierra en $0 (oculto, ver arriba) se usa `saldoRestanteSF`
+    //   (resta TODOS los usos) — da ~0, sin cambios respecto al caso ya
+    //   confirmado (CAC-077160: venta + ABO cierran juntos el saldo).
+    // - Si NO cierra (remanente visible), solo se resta el retiro ABO
+    //   (`saldoRestanteSoloABO`) — un retiro en efectivo no tiene otra fila
+    //   que lo compense, así que se descuenta aquí. Un uso normal (venta en
+    //   otro ticket) SÍ tiene su propia fila (débito vía `saldoFavorUsado`),
+    //   así que el Abono de generación se emite en BRUTO respecto a ese uso
+    //   — restarlo aquí también sería la doble resta que el comentario
+    //   original de este archivo advertía (2026-08-19, caso real
+    //   C0-260800403 $89.15 generado / C0-260800431 $85.36 usado: se
+    //   emitía solo el sobrante de $3.79 en vez del generado completo,
+    //   dejando el Abono de $85.36 sin su Cargo compensatorio).
+    // - Si no hubo NINGÚN uso el mismo día, se emite el monto generado
+    //   completo (comportamiento anterior, sin cambios).
+    const montoAEmitir = oculto
+      ? Math.max(saldoRestanteSF, 0)
+      : (usosMismoDia.length > 0 ? Math.max(saldoRestanteSoloABO, 0) : (Number(gen.monto) || 0));
 
     const prev = mapa.get(key);
     mapa.set(key, {

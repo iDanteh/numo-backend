@@ -2244,7 +2244,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     : [];
   const anticipoFolioPorUuidProp = {
     ...Object.fromEntries(
-      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
+      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
     ),
     ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
   };
@@ -2510,7 +2510,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .filter(Boolean)
         .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0)?.haber)
         .find(v => Number(v) > 0) ?? 0;
-      const refOpaProp = `OPA-${anticipoFolioRefProp}`;
+      const refOpaProp = anticipoFolioRefProp; // ya viene armado como "OPA-..." (real o placeholder)
       const baseAnticipoProp = {
         concepto: refOpaProp, serie: refOpaProp, centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
         cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
@@ -3382,7 +3382,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     : [];
   const anticipoFolioPorUuidGuard = {
     ...Object.fromEntries(
-      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
+      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
     ),
     ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
   };
@@ -3618,7 +3618,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .filter(Boolean)
         .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0)?.haber)
         .find(v => Number(v) > 0) ?? 0;
-      const refOpaGuard = `OPA-${anticipoFolioRefGuard}`;
+      const refOpaGuard = anticipoFolioRefGuard; // ya viene armado como "OPA-..." (real o placeholder)
       const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
       const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
       const baseAnticipoGuard = {

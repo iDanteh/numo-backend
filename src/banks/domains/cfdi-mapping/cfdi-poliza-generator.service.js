@@ -2479,7 +2479,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .find(v => Number(v) > 0) ?? 0;
       const refOpaProp = `OPA-${anticipoFolioRefProp}`;
       const baseAnticipoProp = {
-        serie: refOpaProp, centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
+        concepto: refOpaProp, serie: refOpaProp, centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
         cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'Anticipo',
         _cfdiInfo: {
           uuid: cfdi.uuid, tipo: cfdi.tipoDeComprobante, emisor: cfdi.emisor?.rfc,
@@ -3586,7 +3586,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
       const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
       const baseAnticipoGuard = {
-        serie: refOpaGuard, centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+        concepto: refOpaGuard, serie: refOpaGuard, centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
         cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'Anticipo',
       };
       if (Number(montoVentasAnticipoGuard) > 0) {

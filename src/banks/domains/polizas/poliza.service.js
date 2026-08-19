@@ -1606,6 +1606,15 @@ function _extraerCobrosSucursal(movimientos) {
     // sueltas en vez de agrupadas por factura).
     const esCargoEspecialDePago = m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.tipoComprobante === 'P';
     if (esCargoEspecialDePago) { resto.push(m); continue; }
+    // Anticipo sin NC del SAT (cfdi-poliza-generator.service.js, 2026-08-19):
+    // también usa `tipoOrigen: 'Cargo Especial'` (mismo patrón que SF/Puntos),
+    // pero a diferencia de esos, aquí NO hay "otra sucursal" ni forma de pago
+    // que mostrar — es simplemente el Cargo normal de ESA factura (Anticipos +
+    // IVA-anticipo en vez de Clientes). Debe quedarse junto a sus líneas
+    // hermanas (Abono Ventas/IVA), no desglosarse en el bloque de "Cobro de
+    // otra sucursal" (confirmado con el usuario: aparecía como "COS-Anticipo"
+    // separado de su factura).
+    if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.reglaNombre === 'Anticipo') { resto.push(m); continue; }
     // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
     // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
     // Usa cfdiUuid para identificar el par de forma determinista: el mismo

@@ -981,13 +981,13 @@ function categorizarAjusteContado(m) {
   if (esVentaConDescuento(m.reglaNombre)) return 'descuento';
   if (esDevolucionOCancelacion(m)) return 'devolucion';
   if (esBonificacionGenerica(m)) return 'bonificacion';
-  // 'OPA' (cfdi-poliza-generator.service.js, 2026-08-19): anticipo aplicado
-  // sin NC del SAT — mismo tratamiento de categoría que `esReglaAnticipo`
-  // (agrupa junto con el Abono de su factura), pero con `reglaNombre` propio
-  // en vez del nombre de la regla, para poder distinguir el orden cargo/abono
-  // (ver `bloquesAjustesContado`/`moverAjustesAlFinal`) sin afectar el
-  // mecanismo estándar (Reg 22C/23 con NC).
-  if (m.reglaNombre === 'OPA') return 'anticipo';
+  // OPA / Sobrante / Faltante de caja (ver `REGLAS_MEZCLADAS_CON_VENTAS`):
+  // mismo tratamiento de categoría que `esReglaAnticipo` (se mezclan con
+  // Ventas normales por folio), pero con `reglaNombre` propio en vez del
+  // nombre de la regla, para poder distinguir el orden cargo/abono (ver
+  // `bloquesAjustesContado`/`moverAjustesAlFinal`) sin afectar el mecanismo
+  // estándar de anticipo (Reg 22C/23 con NC).
+  if (REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre)) return 'anticipo';
   return null;
 }
 
@@ -1538,6 +1538,13 @@ const TIPO_ORIGEN_PENDIENTE_PROPIO = 'Pendiente Propio';
 // `_uuidsConCargoCubiertoEnBD` (cfdi-poliza-generator.service.js).
 const TIPO_ORIGEN_CARGO_ESPECIAL = 'Cargo Especial';
 
+// Reglas ('Cargo Especial') que se mezclan con Ventas normales por su propio
+// serie/folio en vez de ir a una sección aparte — OPA (anticipo sin NC,
+// 2026-08-19) y Sobrante/Faltante de caja (splitPorFormaPagoReal sin
+// reescalar, 2026-08-19): ambas son líneas complementarias de una factura
+// normal, no un cruce de sucursal ni un ajuste de venta real.
+const REGLAS_MEZCLADAS_CON_VENTAS = new Set(['OPA', 'Faltante de caja', 'Sobrante de caja']);
+
 // Orden fijo del bloque de "Cobro de otra sucursal": Efectivo, Transferencia,
 // Saldo a favor, Cheque, Tarjeta (confirmado con el usuario 2026-08-05).
 // Las líneas con depósito bancario real identificado (`_referenciaBancoReal`
@@ -1613,15 +1620,15 @@ function _extraerCobrosSucursal(movimientos) {
     // sueltas en vez de agrupadas por factura).
     const esCargoEspecialDePago = m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.tipoComprobante === 'P';
     if (esCargoEspecialDePago) { resto.push(m); continue; }
-    // Anticipo sin NC del SAT (cfdi-poliza-generator.service.js, 2026-08-19):
-    // también usa `tipoOrigen: 'Cargo Especial'` (mismo patrón que SF/Puntos),
-    // pero a diferencia de esos, aquí NO hay "otra sucursal" ni forma de pago
-    // que mostrar — es simplemente el Cargo normal de ESA factura (Anticipos +
-    // IVA-anticipo en vez de Clientes). Debe quedarse junto a sus líneas
-    // hermanas (Abono Ventas/IVA), no desglosarse en el bloque de "Cobro de
-    // otra sucursal" (confirmado con el usuario: aparecía como "COS-Anticipo"
+    // OPA / Sobrante / Faltante de caja (ver `REGLAS_MEZCLADAS_CON_VENTAS`,
+    // cfdi-mapping.service.js 2026-08-19): también usan `tipoOrigen: 'Cargo
+    // Especial'` (mismo patrón que SF/Puntos), pero a diferencia de esos, aquí
+    // NO hay "otra sucursal" ni forma de pago que mostrar — son líneas
+    // complementarias de ESA factura normal. Deben quedarse junto a sus
+    // líneas hermanas, no desglosarse en el bloque de "Cobro de otra
+    // sucursal" (confirmado con el usuario: OPA aparecía como "COS-Anticipo"
     // separado de su factura).
-    if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.reglaNombre === 'OPA') { resto.push(m); continue; }
+    if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre)) { resto.push(m); continue; }
     // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
     // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
     // Usa cfdiUuid para identificar el par de forma determinista: el mismo
@@ -1971,7 +1978,7 @@ function categoriaDeGrupoCredito(movs) {
   if (movs.some(m => esVentaConDescuento(m.reglaNombre))) return 'descuento';
   if (movs.some(esDevolucionOCancelacion)) return 'devolucion';
   if (movs.some(esBonificacionGenerica)) return 'bonificacion';
-  if (movs.some(m => esReglaAnticipo(m.reglaNombre))) return 'anticipo';
+  if (movs.some(m => esReglaAnticipo(m.reglaNombre) || REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre))) return 'anticipo';
   return null;
 }
 

@@ -858,6 +858,12 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         haber:       esFaltante ? 0 : -diferencia,
         cfdiUuid:    cfdi.uuid,
         rfcTercero,
+        // `Cargo Especial` (mismo tratamiento que SF/Puntos/OPA): saca esta
+        // línea del pipeline normal de consolidación Efectivo/Tarjeta y de
+        // "Cobro de otra sucursal" — ver exclusiones por `reglaNombre` en
+        // poliza.service.js (`categorizarAjusteContado`/`_extraerCobrosSucursal`).
+        tipoOrigen:  TIPO_ORIGEN_CARGO_ESPECIAL,
+        _esCargoPrincipal: true,
         reglaNombre: esFaltante ? 'Faltante de caja' : 'Sobrante de caja',
         ...(ultimoIdxConMonto === -1 ? extraEnUltima : {}),
       });

@@ -8,6 +8,7 @@ const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
 const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
+const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -1206,6 +1207,35 @@ const CODIGO_CUENTA_CLUB_TUBEROS      = '2103090002';
 // C0-260800064/065 contra el anticipo C0-260701665).
 const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
 const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
+
+// Referencia real del RECIBO del anticipo (ej. "OPA-00766") — el ERP la
+// identifica con su propia serie/folio interno en `bank_movements.erpLinks`,
+// SIN relación directa con el folio de la factura de anticipo ni con
+// `folioFiscal` (confirmado con el usuario 2026-08-19, caso real:
+// transferencia BBVA $689,000, `erpLinks: [{serie:'OPA', folioExterno:'00766',
+// total: 689000}]`, encontrada solo por monto exacto — ni por folioFiscal ni
+// por el folio de la factura/ticket). Se busca por el TOTAL exacto de la
+// factura de anticipo dentro de una ventana de ±5 días de su fecha. Si no se
+// encuentra (aún no sincronizado con bancos), el caller cae al placeholder de
+// serie-folio de la factura.
+async function _resolverReferenciaOpaPorMonto(anticiposCfdi) {
+  const mapa = {};
+  for (const c of anticiposCfdi) {
+    const totalAnticipo = Number(c.total) || 0;
+    if (totalAnticipo <= 0 || !c.fecha) continue;
+    const fechaAnticipo = new Date(c.fecha);
+    const VENTANA_MS = 5 * 24 * 3600 * 1000;
+    const bm = await BankMovement.findOne({
+      fecha: { $gte: new Date(fechaAnticipo.getTime() - VENTANA_MS), $lte: new Date(fechaAnticipo.getTime() + VENTANA_MS) },
+      'erpLinks.total': { $gte: totalAnticipo - 0.01, $lte: totalAnticipo + 0.01 },
+    }).select('erpLinks').lean();
+    const link = (bm?.erpLinks ?? []).find(l => Math.abs((Number(l.total) || 0) - totalAnticipo) < 0.01);
+    if (link?.serie && link?.folioExterno) {
+      mapa[c.uuid.toUpperCase()] = `${link.serie}-${link.folioExterno}`;
+    }
+  }
+  return mapa;
+}
 // Mismo texto que TIPO_ORIGEN_CARGO_ESPECIAL en cfdi-mapping.service.js/
 // poliza.service.js (duplicado a propósito) — usado aquí solo para la línea
 // consolidada de Puntos del batch (ver `puntosAcumuladosProp` más abajo).
@@ -2209,12 +2239,15 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .filter(r => r.tipoRelacion === '07')
         .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
   )];
-  const anticipoFolioPorUuidProp = _rel07UuidsSinReglaProp.length
-    ? Object.fromEntries(
-        (await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaProp } }).select('uuid serie folio').lean())
-          .map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
-      )
-    : {};
+  const anticipoCfdisProp = _rel07UuidsSinReglaProp.length
+    ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaProp } }).select('uuid serie folio total fecha').lean()
+    : [];
+  const anticipoFolioPorUuidProp = {
+    ...Object.fromEntries(
+      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
+    ),
+    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
+  };
 
   let saldoRestanteProp = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -3344,12 +3377,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .filter(r => r.tipoRelacion === '07')
         .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
   )];
-  const anticipoFolioPorUuidGuard = _rel07UuidsSinReglaGuard.length
-    ? Object.fromEntries(
-        (await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaGuard } }).select('uuid serie folio').lean())
-          .map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
-      )
-    : {};
+  const anticipoCfdisGuard = _rel07UuidsSinReglaGuard.length
+    ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaGuard } }).select('uuid serie folio total fecha').lean()
+    : [];
+  const anticipoFolioPorUuidGuard = {
+    ...Object.fromEntries(
+      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
+    ),
+    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
+  };
 
   let saldoRestanteGuard = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {

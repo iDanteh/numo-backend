@@ -1,0 +1,19 @@
+pesadas
+node_modules/
+.angular/
+dist/
+.git/
+
+# Archivos de configuración de Angular que no aportan al flujo lógico
+tsconfig.json
+tsconfig.app.json
+tsconfig.spec.json
+angular.json
+package-lock.json
+
+# Archivos de entorno con datos sensibles
+.env
+.env.local
+
+# Reportes previos de Graphify
+graphify-out/

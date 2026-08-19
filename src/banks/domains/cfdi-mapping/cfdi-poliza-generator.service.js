@@ -2184,7 +2184,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // matcheó Efectivo/Caja, pero el desglose real trae una porción de
       // Tarjeta, o de Saldo a Favor/Puntos) — sin esto, `cuentaMap[...]`
       // saldría undefined y esa porción del split se saltaría en silencio.
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO]),
+      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_PUENTE_SUCURSALES]),
   )];
 
   const cuentasRows = codigosNecesarios.length
@@ -2844,20 +2844,47 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) continue;
       const _concepto = nombre ? `${nombre} / ${_serFol}` : _serFol;
       const baseDir = {
-        cuentaId:      cuentaDir,
         concepto:      _concepto.slice(0, 255) || 'Cobro Suc. Ajena',
         centroCosto:   _ccCobradora.clave ?? null,
         centroCostoId: _ccCobradora.id    ?? null,
         reglaNombre:   'COS',
-        cfdiUuid:      cfdiUuid ?? null,
         formaPago:     claveSat || null,
       };
       // DEBE: Cargo a Caja/Bancos — cash físico recibido aquí de otra sucursal
-      // → va al consolidado ("Depósitos consolidados") para su depósito.
-      // HABER: Abono a la misma cuenta → va a cobros-sucursal como
-      // contrapartida (representa la deuda con la sucursal vendedora).
-      movimientosResult.push({ ...baseDir, tipoOrigen: 'Venta',         debe: monto,  haber: 0     });
-      movimientosResult.push({ ...baseDir, tipoOrigen: 'Cobro Sucursal', debe: 0,      haber: monto });
+      // → SIEMPRE va al consolidado ("Depósitos consolidados") para su depósito.
+      // `cfdiUuid` solo se conserva para Efectivo (lo necesita el emparejado
+      // de abajo) — en Tarjeta/Transferencia se omite a propósito: si ESE
+      // MISMO ticket también tuviera una porción en Efectivo (mismo cfdiUuid),
+      // el emparejamiento de esa porción marcaría el uuid como "ya cobrado en
+      // otra sucursal" y arrastraría también esta línea de Tarjeta aunque su
+      // Abono no comparta cuenta ni uuid con ella.
+      movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: esEfe ? (cfdiUuid ?? null) : null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
+      // HABER (contrapartida): Efectivo SÍ puede transferirse físicamente
+      // entre sucursales, así que su Abono va a la MISMA cuenta (con el mismo
+      // cfdiUuid, para que `_extraerCobrosSucursal` empareje y saque AMBAS
+      // líneas del consolidado — el efectivo termina donde lo requiera la
+      // sucursal vendedora, no se queda aquí). Tarjeta/Transferencia NUNCA se
+      // pueden "mover" — el banco ya depositó en la cuenta de ESTA sucursal
+      // sin importar quién facturó, así que su Abono va a la cuenta puente
+      // (2103040001, deuda con la sucursal vendedora) SIN cfdiUuid — para que
+      // el Cargo de arriba NO se empareje/extraiga y sí cuente en el
+      // consolidado de Tarjeta (confirmado con el usuario 2026-08-19, caso
+      // real CONSTRUCASA 13-ago: el corte de caja de Tarjeta cierra exacto
+      // contra el bruto sin excluir cruces, a diferencia de Efectivo).
+      if (esEfe) {
+        movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto });
+      } else {
+        // Concepto deliberadamente DISTINTO al del Cargo (arriba): el
+        // emparejador de `_extraerCobrosSucursal` también empareja pares sin
+        // cfdiUuid por concepto+monto idénticos (caso "pendiente por
+        // facturar") — si el concepto fuera el mismo, esta línea volvería a
+        // arrastrar el Cargo de Tarjeta fuera del consolidado por esa otra vía.
+        movimientosResult.push({
+          ...baseDir, cuentaId: cuentaMap[CODIGO_CUENTA_PUENTE_SUCURSALES] ?? null,
+          concepto: `${baseDir.concepto} (cruce sucursal)`.slice(0, 255),
+          cfdiUuid: null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto,
+        });
+      }
     }
   }
 
@@ -3331,7 +3358,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       ].filter(Boolean))
       // Caja/Bancos/Saldo a Favor/Club Tuberos SIEMPRE — ver comentario
       // equivalente en generarPropuesta.
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO]),
+      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_PUENTE_SUCURSALES]),
   )];
 
   const cuentasRows = codigosNecesarios.length
@@ -3878,17 +3905,30 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       if (folioOrigen != null && _foliosYaEnPuenteGuard.has(String(folioOrigen))) continue;
       const _conceptoG = nombre ? `${nombre} / ${_serFolG}` : _serFolG;
       const baseCos = {
-        cuentaId:      cuentaCos,
         concepto:      _conceptoG.slice(0, 255) || 'Cobro Suc. Ajena',
         centroCosto:   _ccCobradoraGuard.clave ?? null,
         centroCostoId: _ccCobradoraGuard.id    ?? null,
         reglaNombre:   'COS',
-        cfdiUuid:      cfdiUuid ?? null,
         formaPago:     claveSat || null,
       };
-      // Mismo criterio que en generarPropuesta (ver comentario allá).
-      todosLosMovimientos.push({ ...baseCos, tipoOrigen: 'Venta',         debe: monto, haber: 0     });
-      todosLosMovimientos.push({ ...baseCos, tipoOrigen: 'Cobro Sucursal', debe: 0,     haber: monto });
+      // Mismo criterio que en generarPropuesta (ver comentario allá): Efectivo
+      // se puede mover entre sucursales (Abono a la misma cuenta, emparejado
+      // por cfdiUuid, ambas líneas se sacan del consolidado). Tarjeta/
+      // Transferencia NUNCA se mueven — el banco ya depositó aquí — así que su
+      // Abono va a la cuenta puente SIN cfdiUuid, para que el Cargo sí cuente
+      // en el consolidado.
+      // `cfdiUuid` solo se conserva para Efectivo — ver comentario equivalente en generarPropuesta.
+      todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: esEfe ? (cfdiUuid ?? null) : null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
+      if (esEfe) {
+        todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto });
+      } else {
+        // Concepto distinto al del Cargo — ver comentario equivalente en generarPropuesta.
+        todosLosMovimientos.push({
+          ...baseCos, cuentaId: cuentaMap[CODIGO_CUENTA_PUENTE_SUCURSALES] ?? null,
+          concepto: `${baseCos.concepto} (cruce sucursal)`.slice(0, 255),
+          cfdiUuid: null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto,
+        });
+      }
     }
   }
 

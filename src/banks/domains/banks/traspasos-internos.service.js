@@ -17,6 +17,7 @@
 
 const { randomUUID }   = require('crypto');
 const ExcelJS           = require('exceljs');
+const AdmZip            = require('adm-zip');
 const BankMovement      = require('./BankMovement.model');
 const { TODOS_MOTORES_HISTORICO } = require('./bank.service');
 const { ejecutarBulkConTransaccion, normalizarBanco } = require('./bank-autorizaciones.service');
@@ -504,8 +505,208 @@ async function generarExcelTraspasosInternos(resultado) {
   return wb.xlsx.writeBuffer();
 }
 
+// ── generarPolizaContpaqTraspasos ────────────────────────────────────────────────
+// Arma el Excel de póliza en formato de importación CONTPAQ (filas 'P'/'M1') para un
+// lote de `resultado.relacionados` ya confirmado — NO crea nada en Postgres/Poliza
+// (a propósito: el usuario eligió el camino "solo Excel", sin acoplar este dominio de
+// bancos al de pólizas). Mismo esquema de filas/columnas que ya usa
+// `_construirWorkbookPoliza` en poliza.service.js (verificado contra dos plantillas
+// reales armadas a mano: "Ejemplo traspaso entre cuentas propias.xls" y
+// "POLIZA PARA TRASPASOS.xls", ambas en la raíz del proyecto).
+//
+// Mapeo banco→cuenta contable: igual que `BANCO_A_CODIGO_CUENTA` en poliza.service.js
+// — duplicado a propósito (mismo criterio ya usado en cfdi-mapping.service.js) para no
+// acoplar el dominio de bancos al de pólizas.
+const BANCO_A_CODIGO_CUENTA = {
+  'Banamex':    '1102012001',
+  'BBVA':       '1102011001',
+  'Santander':  '1102013001',
+  'Banorte':    '1102014001',
+  'Scotiabank': '1102015001',
+  'Azteca':     '1102016001',
+};
+
+// Categoría BBVA fija para la póliza CONTPAQ por rango de fechas — este flujo YA NO pide
+// categoría al usuario (confirmado 2026-08-18: siempre es la misma categoría de traspaso
+// entre cuentas propias). No se hardcodea un string exacto porque `categoria` en Mongo es
+// texto libre capturado por BankRule y puede variar en mayúsculas/plural/redacción exacta
+// ("Traspaso entre cuentas propias", "TRASPASOS ENTRE CUENTAS PROPIAS", etc. — confirmado
+// con el usuario: debe tolerar mayúsculas/minúsculas y variaciones de letras de más/menos).
+// Exige los 3 radicales clave en orden, insensible a mayúsculas — sin acentos porque los
+// radicales elegidos (traspas/cuenta/propi) no los llevan.
+const RE_CATEGORIA_TRASPASO_INTERNO = /traspas.*cuenta.*propi/i;
+
+// Códigos del catálogo CONTPAQ "CATALOGO DE CUENTA DE FLUJOS" (hoja embebida en
+// "POLIZA PARA TRASPASOS.xls"): 26 "Ingr traspasos" se ocupa para el cargo (lado BBVA,
+// que recibe el depósito), 46 "Egr traspasos" se ocupa para el abono (lado contraparte,
+// que hace el retiro). No existían en el código antes de esto — son específicos de
+// traspasos, ningún otro generador de pólizas los usa.
+const SUBCODIGO_CARGO_TRASPASO = 26;
+const SUBCODIGO_ABONO_TRASPASO = 46;
+
+// Dos conceptos distintos, confirmados contra las dos plantillas reales: el encabezado
+// 'P' va en Title Case, el concepto de cada movimiento 'M1' va en mayúsculas — no es el
+// mismo texto reutilizado, CONTPAQ los trae así en ambos archivos de ejemplo.
+const CONCEPTO_TRASPASO_HEADER = 'Traspaso Entre Cuentas Propias';
+const CONCEPTO_TRASPASO_MOVIMIENTO = 'TRASPASO ENTRE CUENTAS PROPIAS';
+
+/**
+ * Genera el Excel de póliza CONTPAQ (una fila 'P' + 2 filas 'M1' por cada par) a partir
+ * de los pares ya confirmados en `resultado.relacionados` de `matchTraspasosInternos`.
+ * No toca Mongo ni Postgres — solo arma el buffer .xlsx.
+ *
+ * @param {Array<{ bbva: object, contraparte: object }>} relacionados
+ * @param {{ folio: number|string, fecha?: Date|string }} opts
+ * @returns {Promise<Buffer>}
+ */
+async function generarPolizaContpaqTraspasos(relacionados, { folio, fecha } = {}) {
+  if (!Array.isArray(relacionados) || relacionados.length === 0) {
+    throw new Error('Se requiere al menos un par relacionado para generar la póliza.');
+  }
+  if (!folio) {
+    throw new Error('Se requiere el folio de la póliza.');
+  }
+
+  // Cuentas faltantes en el catálogo — se juntan TODAS antes de tirar el error (no una
+  // por una) para que el usuario vea de una vez qué bancos hace falta mapear, mismo
+  // criterio que la validación de "cuenta faltante" en exportContpaqXlsx.
+  const bancosFaltantes = new Set();
+  for (const { bbva, contraparte } of relacionados) {
+    if (!BANCO_A_CODIGO_CUENTA[bbva.banco])        bancosFaltantes.add(bbva.banco);
+    if (!BANCO_A_CODIGO_CUENTA[contraparte.banco]) bancosFaltantes.add(contraparte.banco);
+  }
+  if (bancosFaltantes.size > 0) {
+    throw new Error(
+      `Banco(s) sin cuenta contable mapeada para exportar a CONTPAQ: ${[...bancosFaltantes].join(', ')}.`,
+    );
+  }
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Traspasos Internos';
+  wb.created = new Date();
+
+  const sheet = wb.addWorksheet('poliza');
+  sheet.columns = [
+    { width: 6 }, { width: 14 }, { width: 10 }, { width: 10 }, { width: 16 },
+    { width: 10 }, { width: 65 }, { width: 50 }, { width: 14 }, { width: 10 },
+  ];
+
+  const fechaPoliza = fecha ? new Date(fecha) : new Date();
+
+  // Columna I (posición 8) = 1 tanto en el encabezado como en cada M1 — verificado celda
+  // por celda contra "Ejemplo traspaso entre cuentas propias.xls" (no vacío/'0' como se
+  // había dejado antes; corregido 2026-08-18 tras comparación exacta con el usuario).
+  const headerRow = sheet.addRow(['P', fechaPoliza, '3', folio, '1', '0', CONCEPTO_TRASPASO_HEADER, '11', 1, '0']);
+  headerRow.getCell(2).numFmt = 'dd/mm/yyyy';
+  // Sin relleno de color: verificado con formatting_info contra los dos .xls reales — ninguno
+  // usa fill (el patrón negro + fuente blanca es de _construirWorkbookPoliza en
+  // poliza.service.js, para CFDI, NO aplica aquí). Negrita sí, sin forzar color de fuente
+  // (coincide con "POLIZA PARA TRASPASOS.xls", la plantilla más reciente).
+  headerRow.eachCell({ includeEmpty: true }, (cell) => {
+    cell.font = { bold: true };
+  });
+
+  for (const { bbva, contraparte } of relacionados) {
+    const monto = bbva.deposito ?? contraparte.retiro;
+
+    const rowCargo = sheet.addRow([
+      'M1', BANCO_A_CODIGO_CUENTA[bbva.banco], 'TRASP', 0, monto,
+      SUBCODIGO_CARGO_TRASPASO, 0, CONCEPTO_TRASPASO_MOVIMIENTO, 1,
+    ]);
+    rowCargo.getCell(5).numFmt = '#,##0.00';
+
+    const rowAbono = sheet.addRow([
+      'M1', BANCO_A_CODIGO_CUENTA[contraparte.banco], 'TRASP', 1, monto,
+      SUBCODIGO_ABONO_TRASPASO, 0, CONCEPTO_TRASPASO_MOVIMIENTO, 1,
+    ]);
+    rowAbono.getCell(5).numFmt = '#,##0.00';
+  }
+
+  return wb.xlsx.writeBuffer();
+}
+
+// Medianoche UTC del día calendario de `fecha` (Date o string ISO) — usado para comparar
+// contra el rango fechaInicio/fechaFin sin arrastrar hora/timezone, mismo criterio de "día
+// UTC" que ya usa diaUtcKey/bucketKey para el matching (ver comentario de diaUtcKey arriba).
+function _utcMidnight(fecha) {
+  const d = new Date(fecha);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+/**
+ * Arma un ZIP con una póliza CONTPAQ por cada día (UTC) dentro de [fechaInicio, fechaFin]
+ * que tenga al menos un par relacionado. Los traspasos siempre son mismo-día (ver
+ * `bucketKey` más arriba — el motor nunca empareja movimientos de días distintos), así que
+ * agrupar por día antes de armar cada Excel respeta esa misma premisa en vez de mezclar
+ * movimientos de días distintos bajo un solo encabezado 'P'.
+ *
+ * Siempre corre el matching en dry-run — esta función solo genera archivos, nunca marca
+ * movimientos como identificados (eso sigue siendo `matchTraspasosInternos({dryRun:false})`,
+ * un flujo aparte que no se toca aquí).
+ *
+ * Folio PROVISIONAL: número secuencial pequeño (1, 2, 3... por día dentro de la corrida),
+ * NO derivado de la fecha — un folio tipo "20260808" no coincide con el estilo de las
+ * plantillas reales (folios chicos: 1, 8). Es un placeholder hasta que el departamento de
+ * contabilidad defina la nomenclatura real de folio para este tipo de póliza (pendiente,
+ * confirmado con el usuario 2026-08-18 — no es la implementación final).
+ *
+ * Ya NO recibe categoriaBbva — este flujo siempre busca sobre la categoría de traspaso
+ * entre cuentas propias (ver RE_CATEGORIA_TRASPASO_INTERNO arriba), nunca otra. Único
+ * input real: el rango de fechas.
+ *
+ * @param {{ fechaInicio: string, fechaFin: string }} params
+ * @param {{ _id: string, nombre?: string }} user
+ * @returns {Promise<{ buffer: Buffer, nombreZip: string }>}
+ */
+async function generarPolizasContpaqTraspasosPorRango({ fechaInicio, fechaFin } = {}, user) {
+  if (!fechaInicio || !fechaFin) throw new Error('Se requiere fechaInicio y fechaFin.');
+
+  const inicioUtc = _utcMidnight(fechaInicio);
+  const finUtc    = _utcMidnight(fechaFin);
+
+  const resultado = await matchTraspasosInternos({ categoriaBbva: RE_CATEGORIA_TRASPASO_INTERNO, dryRun: true }, user);
+
+  // diaUtcKey → { fechaIso, pares[] } — agrupa los pares ya filtrados al rango por su día
+  // UTC (mismo criterio que bucketKey usa para el matching).
+  const porDia = new Map();
+  for (const par of resultado.relacionados) {
+    const movUtc = _utcMidnight(par.bbva.fecha);
+    if (movUtc < inicioUtc || movUtc > finUtc) continue;
+
+    const key = diaUtcKey(par.bbva.fecha);
+    if (!porDia.has(key)) {
+      porDia.set(key, { fechaIso: new Date(movUtc).toISOString().slice(0, 10), pares: [] });
+    }
+    porDia.get(key).pares.push(par);
+  }
+
+  if (porDia.size === 0) {
+    throw new Error('No hay traspasos relacionados en el rango de fechas seleccionado.');
+  }
+
+  const dias = [...porDia.values()].sort((a, b) => a.fechaIso.localeCompare(b.fechaIso));
+
+  // Folio PROVISIONAL: número secuencial pequeño (1, 2, 3...) por día dentro de esta
+  // corrida — NO un valor derivado de la fecha (ej. 20260811), que no coincide con el
+  // estilo de folio de las plantillas reales (ahí son números chicos: 1, 8). Sigue
+  // pendiente de que contabilidad defina la nomenclatura real (ver docstring arriba).
+  const zip = new AdmZip();
+  let folio = 1;
+  for (const { fechaIso, pares } of dias) {
+    const buffer = await generarPolizaContpaqTraspasos(pares, { folio, fecha: fechaIso });
+    zip.addFile(`Poliza_Traspasos_${fechaIso.replace(/-/g, '')}_CONTPAQ.xlsx`, Buffer.from(buffer));
+    folio++;
+  }
+
+  const nombreZip = `Traspasos_CONTPAQ_${fechaInicio}_a_${fechaFin}.zip`;
+  return { buffer: zip.toBuffer(), nombreZip };
+}
+
 module.exports = {
   matchTraspasosInternos,
   revertirTraspasosInternos,
   generarExcelTraspasosInternos,
+  generarPolizaContpaqTraspasos,
+  generarPolizasContpaqTraspasosPorRango,
+  RE_CATEGORIA_TRASPASO_INTERNO,
 };

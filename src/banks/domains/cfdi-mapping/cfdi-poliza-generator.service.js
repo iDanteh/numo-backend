@@ -2480,7 +2480,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const refOpaProp = `OPA-${anticipoFolioRefProp}`;
       const baseAnticipoProp = {
         concepto: refOpaProp, serie: refOpaProp, centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
-        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'Anticipo',
+        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
         _cfdiInfo: {
           uuid: cfdi.uuid, tipo: cfdi.tipoDeComprobante, emisor: cfdi.emisor?.rfc,
           total: cfdi.total, fecha: cfdi.fecha, sinRegla: false,
@@ -3587,7 +3587,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
       const baseAnticipoGuard = {
         concepto: refOpaGuard, serie: refOpaGuard, centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
-        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'Anticipo',
+        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
       };
       if (Number(montoVentasAnticipoGuard) > 0) {
         todosLosMovimientos.push({ ...baseAnticipoGuard, cuentaId: cuentaAnticiposIdGuard, debe: montoVentasAnticipoGuard, cuentaFaltante: cuentaAnticiposIdGuard == null });

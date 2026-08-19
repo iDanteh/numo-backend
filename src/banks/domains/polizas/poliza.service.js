@@ -981,6 +981,13 @@ function categorizarAjusteContado(m) {
   if (esVentaConDescuento(m.reglaNombre)) return 'descuento';
   if (esDevolucionOCancelacion(m)) return 'devolucion';
   if (esBonificacionGenerica(m)) return 'bonificacion';
+  // 'OPA' (cfdi-poliza-generator.service.js, 2026-08-19): anticipo aplicado
+  // sin NC del SAT — mismo tratamiento de categoría que `esReglaAnticipo`
+  // (agrupa junto con el Abono de su factura), pero con `reglaNombre` propio
+  // en vez del nombre de la regla, para poder distinguir el orden cargo/abono
+  // (ver `bloquesAjustesContado`/`moverAjustesAlFinal`) sin afectar el
+  // mecanismo estándar (Reg 22C/23 con NC).
+  if (m.reglaNombre === 'OPA') return 'anticipo';
   return null;
 }
 
@@ -1614,7 +1621,7 @@ function _extraerCobrosSucursal(movimientos) {
     // hermanas (Abono Ventas/IVA), no desglosarse en el bloque de "Cobro de
     // otra sucursal" (confirmado con el usuario: aparecía como "COS-Anticipo"
     // separado de su factura).
-    if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.reglaNombre === 'Anticipo') { resto.push(m); continue; }
+    if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && m.reglaNombre === 'OPA') { resto.push(m); continue; }
     // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
     // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
     // Usa cfdiUuid para identificar el par de forma determinista: el mismo
@@ -1867,7 +1874,13 @@ function bloquesAjustesContado(movs) {
     const abonosCandidatos = categoria === 'devolucion'
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
-    const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
+    const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
+    // OPA (anticipo sin NC, ver `categorizarAjusteContado`): a diferencia del
+    // anticipo estándar (Reg 22C/23, cargo primero), aquí el Ingreso (Abono)
+    // debe verse PRIMERO y la aplicación del anticipo (Cargo OPA) después,
+    // para trazabilidad — confirmado con el usuario 2026-08-19.
+    const esOpa = categoria === 'anticipo' && grupo.some(m => m.reglaNombre === 'OPA');
+    const bloque = esOpa ? [...abonos, ...cargos] : [...cargos, ...abonos];
     return { categoria, bloque };
   });
 }
@@ -2004,7 +2017,10 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
-    const bloque = [...cargos, ...conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }))];
+    const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
+    // OPA (anticipo sin NC) — ver comentario equivalente en `bloquesAjustesContado`.
+    const esOpa = categoria === 'anticipo' && grupo.some(m => m.reglaNombre === 'OPA');
+    const bloque = esOpa ? [...abonos, ...cargos] : [...cargos, ...abonos];
     bloques.push({ categoria, bloque });
   }
 

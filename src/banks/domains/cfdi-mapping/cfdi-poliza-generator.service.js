@@ -1207,6 +1207,13 @@ const CODIGO_CUENTA_CLUB_TUBEROS      = '2103090002';
 // C0-260800064/065 contra el anticipo C0-260701665).
 const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
 const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
+// Sobrante/Faltante de caja (mismos códigos que en cfdi-mapping.service.js,
+// duplicados a propósito — ver `splitPorFormaPagoReal`): la diferencia entre
+// el total facturado y la suma REAL de cobros de una Factura Global (2026-08-19,
+// confirmado con el usuario) — solo se necesitan aquí para que `cuentaMap`
+// los resuelva (ver `codigosNecesarios` más abajo).
+const CODIGO_CUENTA_SOBRANTE_CAJA = '5204990000';
+const CODIGO_CUENTA_FALTANTE_CAJA = '5202990001';
 
 // Referencia real del RECIBO del anticipo (ej. "OPA-00766") — el ERP la
 // identifica con su propia serie/folio interno en `bank_movements.erpLinks`,
@@ -2184,7 +2191,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // matcheó Efectivo/Caja, pero el desglose real trae una porción de
       // Tarjeta, o de Saldo a Favor/Puntos) — sin esto, `cuentaMap[...]`
       // saldría undefined y esa porción del split se saltaría en silencio.
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO]),
+      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_SOBRANTE_CAJA, CODIGO_CUENTA_FALTANTE_CAJA]),
   )];
 
   const cuentasRows = codigosNecesarios.length
@@ -3331,7 +3338,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       ].filter(Boolean))
       // Caja/Bancos/Saldo a Favor/Club Tuberos SIEMPRE — ver comentario
       // equivalente en generarPropuesta.
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO]),
+      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_SOBRANTE_CAJA, CODIGO_CUENTA_FALTANTE_CAJA]),
   )];
 
   const cuentasRows = codigosNecesarios.length

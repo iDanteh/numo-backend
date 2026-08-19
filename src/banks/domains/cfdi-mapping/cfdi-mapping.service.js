@@ -54,6 +54,15 @@ const CODIGOS_CUENTAS_CAJA_O_BANCO = new Set([
 // Favor (claveSat='30', no reconocido) caería al bucket genérico de Bancos
 // sin ninguna etiqueta válida (visible en el export como "Depósitos
 // consolidados" sin sufijo Efectivo/Tarjeta).
+// Sobrante/Faltante de caja (2026-08-19, confirmado con el usuario): al usar
+// el monto REAL de cada ticket en `splitPorFormaPagoReal` (sin reescalar
+// proporcionalmente contra `montoCargo`), la suma de cobros reales de la
+// Factura Global puede no cerrar exacto contra su propio total facturado
+// ("ruido" de reclasificación del ERP). Esa diferencia se registra en una de
+// estas dos cuentas dedicadas en vez de absorberse en Efectivo/Tarjeta (que
+// así quedan exactos al ERP) o de perderse reescalando cada ticket.
+const CODIGO_CUENTA_SOBRANTE_CAJA = '5204990000'; // real > facturado → HABER
+const CODIGO_CUENTA_FALTANTE_CAJA = '5202990001'; // real < facturado → DEBE
 const CODIGO_CUENTA_SALDO_FAVOR     = '2103090001';
 const CODIGO_CUENTA_CLUB_TUBEROS    = '2103090002';
 const CODIGO_CUENTA_IVA_SALDO_FAVOR = '2104010002';
@@ -797,16 +806,23 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const splitPorFormaPagoReal = (montoAPartir, extraEnUltima = {}) => {
     const formasPagoReal = context.desglosePagoReal;
     let acumulado = 0;
+    let ultimoEsEfectivo = true;
+    let ultimoIdxConMonto = -1;
     formasPagoReal.forEach((fp, idx) => {
-      const esUltimo = idx === formasPagoReal.length - 1;
-      const share = totalFormasPagoReal > 0 ? (Number(fp.monto) || 0) / totalFormasPagoReal : 1 / formasPagoReal.length;
-      const montoLinea = esUltimo
-        ? parseFloat((montoAPartir - acumulado).toFixed(2))
-        : parseFloat((montoAPartir * share).toFixed(2));
+      // Monto REAL de cada ticket, SIN reescalar proporcionalmente contra
+      // `montoAPartir` (confirmado con el usuario 2026-08-19: prefiere ver el
+      // monto real de cada ticket aunque la Factura Global no cierre 1 a 1
+      // contra su propio total — esa diferencia se registra aparte, ver
+      // `CODIGO_CUENTA_SOBRANTE_CAJA`/`CODIGO_CUENTA_FALTANTE_CAJA` más abajo,
+      // en vez de perderse/reescalarse silenciosamente en cada ticket).
+      const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
       acumulado += montoLinea;
       if (montoLinea <= 0) return;
+      ultimoIdxConMonto = idx;
 
       const esEfectivo = (fp.claveSat ?? '').trim() === '01';
+      ultimoEsEfectivo = esEfectivo;
+      const esUltimo = idx === formasPagoReal.length - 1;
       movs.push({
         cuentaId:    esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS],
         concepto, centroCosto, ventaFecha, serie: serieCfdi,
@@ -828,6 +844,24 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         ...(esUltimo ? extraEnUltima : {}),
       });
     });
+    // Sobrante/Faltante (ver constantes arriba): la suma de montos reales
+    // (`acumulado`) puede no coincidir con `montoAPartir` (el total facturado
+    // de este Cargo) por "ruido" de reclasificación del ERP. Se registra
+    // aparte, sin tocar las líneas de Efectivo/Tarjeta ya emitidas arriba.
+    const diferencia = Math.round((montoAPartir - acumulado) * 100) / 100;
+    if (Math.abs(diferencia) > 0.01) {
+      const esFaltante = diferencia > 0; // real < facturado
+      movs.push({
+        cuentaId:    cuentaMap[esFaltante ? CODIGO_CUENTA_FALTANTE_CAJA : CODIGO_CUENTA_SOBRANTE_CAJA] ?? null,
+        concepto, centroCosto, ventaFecha, serie: serieCfdi,
+        debe:        esFaltante ? diferencia : 0,
+        haber:       esFaltante ? 0 : -diferencia,
+        cfdiUuid:    cfdi.uuid,
+        rfcTercero,
+        reglaNombre: esFaltante ? 'Faltante de caja' : 'Sobrante de caja',
+        ...(ultimoIdxConMonto === -1 ? extraEnUltima : {}),
+      });
+    }
   };
 
   if (esSplitPagoPorFactura) {

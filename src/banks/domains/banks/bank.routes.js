@@ -20,6 +20,7 @@ const {
   matchTraspasosInternos,
   revertirTraspasosInternos,
   generarExcelTraspasosInternos,
+  generarPolizasContpaqTraspasosPorRango,
 } = require('./traspasos-internos.service');
 const { emitToUser } = require('../../shared/socket');
 // erp.routes expone _sincronizarConRetry/_rangoDesdeFollo (mismo helper que ya usan los
@@ -697,6 +698,28 @@ router.get('/admin/traspasos-internos/reporte',
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="traspasos-internos-${fecha}.xlsx"`);
     res.send(Buffer.from(buffer));
+  }),
+);
+
+// GET /api/banks/admin/traspasos-internos/poliza-contpaq?fechaInicio=&fechaFin=
+// Corre el motor en dry-run (nunca marca movimientos como identificados) y arma un ZIP con
+// una póliza CONTPAQ (formato de importación P/M1) por cada día del rango que tenga al
+// menos un par relacionado — mismo criterio síncrono/sin jobId que /traspasos-internos/reporte,
+// pero en formato importable en vez de reporte informativo. Ya NO recibe categoriaBbva —
+// generarPolizasContpaqTraspasosPorRango siempre busca sobre la categoría de traspaso entre
+// cuentas propias (confirmado con el usuario 2026-08-18), único input real: el rango.
+router.get('/admin/traspasos-internos/poliza-contpaq',
+  authenticate,
+  permit('banks:admin'),
+  asyncHandler(async (req, res) => {
+    const { fechaInicio, fechaFin } = req.query;
+    if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'Se requiere fechaInicio y fechaFin' });
+    const { buffer, nombreZip } = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio, fechaFin }, req.user,
+    );
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${nombreZip}"`);
+    res.send(buffer);
   }),
 );
 

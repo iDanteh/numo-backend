@@ -287,4 +287,40 @@ describe('identificar() — abort post-Kore (D4: inconsistenciaPostKore, NO rein
     // cr.save() nunca se completa dentro del bloque que abortó.
     expect(cr.save).not.toHaveBeenCalled();
   });
+
+  // Incidente real 2026-08-19: un error de RED (sin `response`, ej. timeout) al
+  // llamar aplicarSolicitudOperacion dejaba la CxC cobrada en Kore SIN ningún
+  // rastro en Numo — ni inconsistenciaPostKore ni bankMovementId — porque el
+  // catch de ese paso solo reconocía KoreCajaError (Kore respondió) y relanzaba
+  // cualquier otro error tal cual. Este test cubre el fix: un error de red en
+  // ESE paso específico también debe marcar inconsistenciaPostKore.
+  test('aplicarSolicitudOperacion falla por error de RED (sin response, no KoreCajaError) -> marca inconsistenciaPostKore igual', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 60000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    CollectionRequest.updateOne = jest.fn().mockResolvedValue({ acknowledged: true });
+    BankMovement.find.mockResolvedValue([bankMovement('mov-A')]);
+    setupHappyKore();
+    const errorDeRed = new Error('timeout of 15000ms exceeded');
+    errorDeRed.code = 'ECONNABORTED'; // sin `response` — no es instancia de KoreCajaError
+    koreCaja.aplicarSolicitudOperacion.mockRejectedValue(errorDeRed);
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-A' }, { _id: 'user-1' }),
+    ).rejects.toThrow(/no se pudo confirmar si Kore aplicó el cobro/i);
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    // Nunca se llega a setErpIds/cr.save — el catch corta antes de la transacción.
+    expect(bankService.setErpIds).not.toHaveBeenCalled();
+    expect(cr.save).not.toHaveBeenCalled();
+    expect(CollectionRequest.updateOne).toHaveBeenCalledWith(
+      { _id: 'cr-1' },
+      expect.objectContaining({
+        inconsistenciaPostKore: expect.objectContaining({
+          movimientosPendientes: ['mov-A'],
+          mensaje: expect.stringContaining('Error de red'),
+        }),
+      }),
+    );
+  });
 });

@@ -13,3 +13,4 @@ logs/app.log
 logs/errors.log
 coverage/
 .atl/
+graphify-out

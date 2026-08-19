@@ -1195,6 +1195,17 @@ const CODIGO_CUENTA_IVA_SALDO_FAVOR   = '2104010002';
 // mismo split 16% e IVA compartido (2104010002) que usa Saldo a Favor —
 // confirmado con el usuario 2026-08-06.
 const CODIGO_CUENTA_CLUB_TUBEROS      = '2103090002';
+// Anticipos de clientes (2103010001) + IVA Trasladado Anticipos (2104010002,
+// misma cuenta que CODIGO_CUENTA_IVA_SALDO_FAVOR) — usados cuando una factura
+// tipo I trae `cfdiRelacionados` tipoRelacion='07' (aplicación de anticipo)
+// pero la regla que le tocó NO es una regla de anticipo (sin `cuentaIvaAnticipo`,
+// ver "Fix doble-contabilización anticipo PUE" más abajo): el ERP no emite una
+// Nota de Crédito que cancele el anticipo, así que sin este ajuste el Cargo se
+// iba completo a Clientes en vez de cancelar el pasivo de Anticipos (2026-08-19,
+// confirmado con el usuario, caso real CONSTRUCTORA CARRASCO ORTEGA
+// C0-260800064/065 contra el anticipo C0-260701665).
+const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
+const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
 // Mismo texto que TIPO_ORIGEN_CARGO_ESPECIAL en cfdi-mapping.service.js/
 // poliza.service.js (duplicado a propósito) — usado aquí solo para la línea
 // consolidada de Puntos del batch (ver `puntosAcumuladosProp` más abajo).
@@ -2186,6 +2197,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       )
     : {};
 
+  // Aplicación de anticipo SIN Nota de Crédito SAT — ver comentario en
+  // `CODIGO_CUENTA_ANTICIPOS_CLIENTES`. Solo se resuelve el folio del anticipo
+  // para las facturas que califican (regla sin `cuentaIvaAnticipo`, para no
+  // pisar el mecanismo ya existente cuando la regla SÍ es de anticipo).
+  const _rel07UuidsSinReglaProp = [...new Set(
+    cfdiConRegla
+      .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+        && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+      .flatMap(({ cfdi }) => cfdi.cfdiRelacionados
+        .filter(r => r.tipoRelacion === '07')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
+  )];
+  const anticipoFolioPorUuidProp = _rel07UuidsSinReglaProp.length
+    ? Object.fromEntries(
+        (await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaProp } }).select('uuid serie folio').lean())
+          .map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
+      )
+    : {};
+
   let saldoRestanteProp = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
     const rows = await sequelize.query(
@@ -2336,6 +2366,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     const ccProp = cfdi.serie ? (ccBySerieMapProp[cfdi.serie] ?? null) : null;
 
+    // Aplicación de anticipo SIN Nota de Crédito SAT — ver comentario en
+    // `CODIGO_CUENTA_ANTICIPOS_CLIENTES`. Si esta factura califica, el Cargo
+    // principal (normalmente a Clientes) se sustituye más abajo por Anticipos
+    // + IVA-anticipo, referenciando el folio del anticipo con el marcador
+    // "OPA" (confirmado con el usuario 2026-08-19: por lo mientras, sin dato
+    // de marcador real del ERP para este caso).
+    const rel07SinReglaProp = (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo)
+      ? cfdi.cfdiRelacionados?.find(r => r.tipoRelacion === '07')
+      : null;
+    const anticipoFolioRefProp = rel07SinReglaProp
+      ? anticipoFolioPorUuidProp[(rel07SinReglaProp.uuids?.[0] ?? rel07SinReglaProp.uuid ?? '').toUpperCase()]
+      : null;
+
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver `puntosAcumuladosProp` — Puntos va consolidado, no individual).
     const puntosUsadoEstaCfdi = movs.find(m => m._puntosUsado != null)?._puntosUsado ?? 0;
@@ -2372,6 +2415,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // de saldo/tasa mixta, fuera del alcance del split).
       const esLineaCargoPrincipal = m._esCargoPrincipal === true || (!!rule?.cuentaCargo &&
         m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
+      // Anticipo sin NC (ver `anticipoFolioRefProp` arriba): el Cargo
+      // principal NO se registra — se sustituye abajo por Anticipos/IVA-anticipo.
+      if (anticipoFolioRefProp && esLineaCargoPrincipal) continue;
       // La reducción por cruce de sucursal SOLO aplica a Caja/Bancos — nunca
       // a las líneas de SF/Puntos (`_esCargoPrincipal` también las marca,
       // pero representan dinero que fue a Anticipos Otros/Club Tuberos, no
@@ -2413,6 +2459,40 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           comparisonStatus:  cfdi.lastComparisonStatus ?? null,
         },
       });
+    }
+
+    // Anticipo sin NC — sustituye el Cargo principal omitido arriba por
+    // Anticipos + IVA-anticipo, con la misma referencia "OPA-{folio del
+    // anticipo}" en ambas líneas (ver `CODIGO_CUENTA_ANTICIPOS_CLIENTES`).
+    // Se reutilizan los montos YA calculados por la regla para Ventas/IVA
+    // (en vez de recalcular desde el CFDI) para no duplicar esa lógica ni
+    // arriesgar una descuadrada si difieren por descuentos/retenciones.
+    if (anticipoFolioRefProp) {
+      const montoVentasAnticipoProp = rule?.cuentaAbono
+        ? (movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)?.haber ?? 0)
+        : 0;
+      // Puede ser PPD (`rule.cuentaIvaPPD`, IVA por cobrar) o PUE (`rule.cuentaIva`) —
+      // se prueban ambas cuentas, la que traiga un haber real gana.
+      const montoIvaAnticipoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+        .filter(Boolean)
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0)?.haber)
+        .find(v => Number(v) > 0) ?? 0;
+      const refOpaProp = `OPA-${anticipoFolioRefProp}`;
+      const baseAnticipoProp = {
+        serie: refOpaProp, centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
+        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'Anticipo',
+        _cfdiInfo: {
+          uuid: cfdi.uuid, tipo: cfdi.tipoDeComprobante, emisor: cfdi.emisor?.rfc,
+          total: cfdi.total, fecha: cfdi.fecha, sinRegla: false,
+          comparisonStatus: cfdi.lastComparisonStatus ?? null,
+        },
+      };
+      if (Number(montoVentasAnticipoProp) > 0) {
+        movimientosResult.push({ ...baseAnticipoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null, debe: montoVentasAnticipoProp });
+      }
+      if (Number(montoIvaAnticipoProp) > 0) {
+        movimientosResult.push({ ...baseAnticipoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, debe: montoIvaAnticipoProp });
+      }
     }
 
     // Saldo a favor generado por esta Devolución (ver
@@ -3254,6 +3334,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       )
     : {};
 
+  // Aplicación de anticipo SIN Nota de Crédito SAT — ver comentario en
+  // `CODIGO_CUENTA_ANTICIPOS_CLIENTES` (misma lógica que en generarPropuesta).
+  const _rel07UuidsSinReglaGuard = [...new Set(
+    cfdiConRegla
+      .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+        && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+      .flatMap(({ cfdi }) => cfdi.cfdiRelacionados
+        .filter(r => r.tipoRelacion === '07')
+        .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
+  )];
+  const anticipoFolioPorUuidGuard = _rel07UuidsSinReglaGuard.length
+    ? Object.fromEntries(
+        (await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaGuard } }).select('uuid serie folio').lean())
+          .map(c => [c.uuid.toUpperCase(), [c.serie, c.folio].filter(Boolean).join('-') || c.folio || c.uuid]),
+      )
+    : {};
+
   let saldoRestanteGuard = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
     const rows = await sequelize.query(
@@ -3412,6 +3509,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
     const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
 
+    // Anticipo sin NC — ver comentario equivalente en generarPropuesta.
+    const rel07SinReglaGuard = (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo)
+      ? cfdi.cfdiRelacionados?.find(r => r.tipoRelacion === '07')
+      : null;
+    const anticipoFolioRefGuard = rel07SinReglaGuard
+      ? anticipoFolioPorUuidGuard[(rel07SinReglaGuard.uuids?.[0] ?? rel07SinReglaGuard.uuid ?? '').toUpperCase()]
+      : null;
+
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver comentario equivalente en generarPropuesta).
     const puntosUsadoEstaCfdiGuard = movs.find(m => m._puntosUsado != null)?._puntosUsado ?? 0;
@@ -3436,6 +3541,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // Ver comentario equivalente en generarPropuesta (`_esCargoPrincipal`).
       const esLineaCargoPrincipalGuard = m._esCargoPrincipal === true || (!!rule?.cuentaCargo &&
         m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
+      // Anticipo sin NC (ver `anticipoFolioRefGuard` arriba): el Cargo
+      // principal NO se registra — se sustituye abajo por Anticipos/IVA-anticipo.
+      if (anticipoFolioRefGuard && esLineaCargoPrincipalGuard) continue;
       // Ver comentario equivalente en generarPropuesta: la reducción solo
       // aplica a Caja/Bancos, nunca a SF/Puntos.
       const esLineaCajaOBancosGuard = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
@@ -3461,6 +3569,32 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
       });
+    }
+
+    // Anticipo sin NC — ver comentario equivalente en generarPropuesta.
+    if (anticipoFolioRefGuard) {
+      const montoVentasAnticipoGuard = rule?.cuentaAbono
+        ? (movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)?.haber ?? 0)
+        : 0;
+      // Puede ser PPD (`rule.cuentaIvaPPD`) o PUE (`rule.cuentaIva`) — ver
+      // comentario equivalente en generarPropuesta.
+      const montoIvaAnticipoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+        .filter(Boolean)
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0)?.haber)
+        .find(v => Number(v) > 0) ?? 0;
+      const refOpaGuard = `OPA-${anticipoFolioRefGuard}`;
+      const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
+      const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
+      const baseAnticipoGuard = {
+        serie: refOpaGuard, centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'Anticipo',
+      };
+      if (Number(montoVentasAnticipoGuard) > 0) {
+        todosLosMovimientos.push({ ...baseAnticipoGuard, cuentaId: cuentaAnticiposIdGuard, debe: montoVentasAnticipoGuard, cuentaFaltante: cuentaAnticiposIdGuard == null });
+      }
+      if (Number(montoIvaAnticipoGuard) > 0) {
+        todosLosMovimientos.push({ ...baseAnticipoGuard, cuentaId: cuentaIvaAnticipoIdGuard, debe: montoIvaAnticipoGuard, cuentaFaltante: cuentaIvaAnticipoIdGuard == null });
+      }
     }
 
     // Saldo a favor generado por esta Devolución — ver comentario

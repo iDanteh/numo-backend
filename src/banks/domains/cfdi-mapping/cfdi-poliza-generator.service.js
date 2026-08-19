@@ -330,11 +330,19 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     }
   }
 
-  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [] };
 
   // Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
   const mapa = new Map();
   const devsOcultos = new Set();
+  // Retiros en EFECTIVO del saldo a favor (serieOrigen='ABO' dentro de
+  // `usos`, confirmado con el usuario 2026-08-19: un "ABO" no es otra venta
+  // que consume el saldo, es al cliente sacando su saldo en efectivo de
+  // caja) — dinero real que salió, así que se resta del consolidado de
+  // Efectivo (mismo patrón que `_ajusteConsolidadoSF`/"SF-MISMO-FOLIO":
+  // Cargo NEGATIVO, sin fila propia), SIEMPRE — sin importar si el saldo
+  // generado terminó en $0 ese día o le quedó un remanente pendiente.
+  const ajustesEfectivoRetiroSF = [];
   for (const { cuenta, gen } of generadosPorCuenta) {
     const key = `${gen.serieOrigen}|${gen.folioOrigen}`;
     const usos     = gen.usos ?? [];
@@ -344,6 +352,30 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     const diaGen = _diaMx(gen.fecha);
     const diaUso = _diaMx(usoUnico?.fecha ?? null);
     const usoCompleto = usoUnico && Math.abs(Number(usoUnico.montoSobrante) || 0) < 0.01;
+
+    // Multi-uso el mismo día (2026-08-19, caso real CAC-077160: $97.36
+    // aplicados a otra venta + $195.54 retirados en efectivo vía ABO, ambos
+    // el mismo día de la generación): a diferencia del caso de un solo uso
+    // (arriba), aquí se suman TODOS los usos del día y se compara contra lo
+    // generado — si cierra en $0, se oculta igual que el caso normal; si NO
+    // cierra, el remanente (`saldoRestanteSF`) se muestra como línea visible
+    // de SF en vez de todo-o-nada. El retiro en efectivo se resta del
+    // consolidado SIEMPRE, sin importar si cierra en $0 o no.
+    const usosMismoDia = diaGen ? usos.filter(u => _diaMx(u.fecha) === diaGen) : [];
+    const sumaUsosMismoDia = usosMismoDia.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+    const saldoRestanteSF = Math.round(((Number(gen.monto) || 0) - sumaUsosMismoDia) * 100) / 100;
+    for (const u of usosMismoDia) {
+      if ((u.serieOrigen ?? u.serieVenta ?? '').toUpperCase() !== 'ABO') continue;
+      const montoRetiro = Math.abs(Number(u.montoUsado)) || 0;
+      if (montoRetiro <= 0) continue;
+      ajustesEfectivoRetiroSF.push({
+        monto: montoRetiro,
+        centro: centroPropioClave ?? null,
+        fecha: u.fecha ?? gen.fecha ?? null,
+        ventaSerie: cuenta.serieVenta ?? null,
+        ventaFolio: cuenta.folioVenta ?? null,
+      });
+    }
 
     // En el camino principal (centro+fecha), `obtenerSaldosFavorPorCentro`
     // garantiza que TODOS los saldosFavorGenerados pertenecen al centro
@@ -374,8 +406,15 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     const cc        = (cfdiSerie && ccBySerieMap) ? (ccBySerieMap[cfdiSerie] ?? null) : null;
     const esCruzado = !!(centro && cc && String(centro.id) !== String(cc.id));
 
-    const oculto = !esCruzado && !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso
-      && claveCentroGen && claveCentroUso && claveCentroGen === claveCentroUso);
+    // Multi-uso resuelto el mismo día (ver `saldoRestanteSF` arriba): oculta
+    // igual que el caso de un solo uso cuando la SUMA de todos los usos de
+    // ese día cierra el saldo en $0 — no se exige coincidencia de almacén
+    // por uso individual (a diferencia del caso de un solo uso) porque un
+    // retiro en efectivo (ABO) no necesariamente ocurre en el mismo almacén
+    // que la generación, y eso no lo hace menos "resuelto el mismo día".
+    const ocultoMultiUso = usosMismoDia.length > 1 && Math.abs(saldoRestanteSF) < 0.01;
+    const oculto = ocultoMultiUso || (!esCruzado && !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso
+      && claveCentroGen && claveCentroUso && claveCentroGen === claveCentroUso));
     if (oculto) devsOcultos.add(key);
 
     // Caso "mismo folio" (confirmado con el usuario 2026-08-13): la MISMA
@@ -387,9 +426,18 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
       && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
 
+    // Monto a EMITIR como Abono de Saldo a Favor: el remanente después de
+    // restar los usos del mismo día (ver `saldoRestanteSF`), no el generado
+    // completo — sin esto, un retiro parcial en efectivo (ABO) se contaba
+    // dos veces: una vía el Abono completo aquí y otra vía el ajuste
+    // negativo de Efectivo (`ajustesEfectivoRetiroSF`). Si no hubo NINGÚN
+    // uso el mismo día (`usosMismoDia.length === 0`), se mantiene el
+    // comportamiento anterior (se emite el monto generado completo).
+    const montoAEmitir = usosMismoDia.length > 0 ? Math.max(saldoRestanteSF, 0) : (Number(gen.monto) || 0);
+
     const prev = mapa.get(key);
     mapa.set(key, {
-      monto:      (prev?.monto ?? 0) + (Math.abs(Number(gen.monto) || 0)),
+      monto:      (prev?.monto ?? 0) + montoAEmitir,
       ventaSerie: cuenta.serieVenta,
       ventaFolio: cuenta.folioVenta,
       oculto,
@@ -401,7 +449,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     });
   }
 
-  return { mapa, devsOcultos };
+  return { mapa, devsOcultos, ajustesEfectivoRetiroSF };
 }
 
 /**
@@ -1972,7 +2020,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `_prefetchSaldosFavorGenerados`) debe llegar a esa llamada, para que el
   // lado de "uso" también sepa marcar como oculto el mismo par
   // generación+uso "lavado" el mismo día en el mismo almacén.
-  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
+  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -2497,6 +2545,35 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       };
       movimientosResult.push({ ...base, cuentaId: cuentaSaldoFavorIdProp,    haber: subtotal });
       movimientosResult.push({ ...base, cuentaId: cuentaIvaSaldoFavorIdProp, haber: iva     });
+    }
+  }
+
+  // Retiros en EFECTIVO de saldo a favor (ABO) — ver
+  // `_prefetchSaldosFavorGenerados`/`ajustesEfectivoRetiroSF`: dinero real
+  // que salió de caja, se resta del consolidado de Efectivo con un Cargo
+  // NEGATIVO sin fila propia (mismo patrón que "SF-MISMO-FOLIO"), sin
+  // importar si el saldo generado terminó en $0 ese día o le quedó un
+  // remanente pendiente (ese remanente, si existe, ya se muestra aparte
+  // como línea de SF visible más arriba).
+  if (cuentaMap[CODIGO_CUENTA_CAJA] && ajustesEfectivoRetiroSFProp.length) {
+    const ccRetiroProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+    for (const ret of ajustesEfectivoRetiroSFProp) {
+      const serieFolioRetiro = [ret.ventaSerie, ret.ventaFolio].filter(Boolean).join('-') || null;
+      movimientosResult.push({
+        concepto:       serieFolioRetiro ?? 'Retiro de saldo a favor',
+        serie:          serieFolioRetiro,
+        centroCosto:    ccRetiroProp?.clave ?? null,
+        centroCostoId:  ccRetiroProp?.id    ?? null,
+        cfdiUuid:       null,
+        cuentaFaltante: false,
+        tipoOrigen:     'Ajuste Consolidado SF',
+        reglaNombre:    'SF-RETIRO-EFECTIVO',
+        formaPago:      '01',
+        cuentaId:       cuentaMap[CODIGO_CUENTA_CAJA],
+        debe:           -ret.monto,
+        haber:          0,
+        _ajusteConsolidadoSF: true,
+      });
     }
   }
 
@@ -3036,7 +3113,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Saldos a favor generados por las Devoluciones de este batch — ANTES de
   // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
-  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
+  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -3455,6 +3532,30 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       };
       todosLosMovimientos.push({ ...baseG, cuentaId: cuentaSaldoFavorIdGuard,    haber: subtotalG });
       todosLosMovimientos.push({ ...baseG, cuentaId: cuentaIvaSaldoFavorIdGuard, haber: ivaG     });
+    }
+  }
+
+  // Retiros en EFECTIVO de saldo a favor (ABO) — ver comentario equivalente
+  // en generarPropuesta.
+  if (cuentaMap[CODIGO_CUENTA_CAJA] && ajustesEfectivoRetiroSFGuard.length) {
+    const ccRetiroGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
+    for (const ret of ajustesEfectivoRetiroSFGuard) {
+      const serieFolioRetiroG = [ret.ventaSerie, ret.ventaFolio].filter(Boolean).join('-') || null;
+      todosLosMovimientos.push({
+        concepto:       serieFolioRetiroG ?? 'Retiro de saldo a favor',
+        serie:          serieFolioRetiroG,
+        centroCosto:    ccRetiroGuard?.clave ?? null,
+        centroCostoId:  ccRetiroGuard?.id    ?? null,
+        cfdiUuid:       null,
+        cuentaFaltante: false,
+        tipoOrigen:     'Ajuste Consolidado SF',
+        reglaNombre:    'SF-RETIRO-EFECTIVO',
+        formaPago:      '01',
+        cuentaId:       cuentaMap[CODIGO_CUENTA_CAJA],
+        debe:           -ret.monto,
+        haber:          0,
+        _ajusteConsolidadoSF: true,
+      });
     }
   }
 

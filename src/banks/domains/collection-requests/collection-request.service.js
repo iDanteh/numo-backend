@@ -603,16 +603,20 @@ async function analyzeStoredComprobantes(id) {
 // (cr.solicitanteUserId), NO con el usuario de cobranza/contabilidad que está
 // identificando — es el cajero quien tiene una caja abierta en Kore.
 
-// 2026-08-14: mismo ajuste de +7hrs ya usado por _toISOFechaPago() en el panel
-// manual de cobros (cobro-panel.component.ts) — Kore muestra fecha_real_pago
-// con el día ANTERIOR si se manda a medianoche UTC (T00:00:00Z, desfase de
-// servidor de ~6hrs), así que se compone la fecha civil (UTC) + T07:00:00Z.
+// 2026-08-14: mismo tipo de ajuste que ya usaba _toISOFechaPago() en el panel
+// manual de cobros (cobro-panel.component.ts, que sigue en +7hrs — NO TOCAR
+// ese archivo, es un contrato distinto) — Kore muestra fecha_real_pago con el
+// día ANTERIOR si se manda a medianoche UTC (T00:00:00Z), así que se compone
+// la fecha civil (UTC) + un offset fijo.
+// 2026-08-20: Kore cambió el offset que corrige el desfase de +7hrs a +10hrs
+// para Solicitudes de Cobro — confirmado por el usuario, aplica a TODAS las
+// solicitudes sin excepción (no depende de tipo de forma de pago).
 // Recibe el `fecha` (Date) de un BankMovement; fallback a "ahora" si no hay
 // fecha válida (no debería pasar nunca — `fecha` es required en el schema).
 function _fechaRealPagoKore(fecha) {
   const d = fecha instanceof Date ? fecha : new Date(fecha);
   if (Number.isNaN(d.getTime())) return new Date().toISOString();
-  return `${d.toISOString().slice(0, 10)}T07:00:00Z`;
+  return `${d.toISOString().slice(0, 10)}T10:00:00Z`;
 }
 
 async function identificar(id, body, user) {
@@ -825,7 +829,23 @@ async function identificar(id, body, user) {
   // pago manda la fecha de SU PROPIO movimiento (movDeEstaForma.fecha), no
   // una fecha global de la solicitud - soporta el caso multi-movimiento donde
   // 2 formas de pago estan asignadas a 2 depositos distintos con fechas
-  // distintas. Ver _fechaRealPagoKore() arriba para el ajuste de +7hrs.
+  // distintas. Ver _fechaRealPagoKore() arriba para el ajuste de offset.
+  // 2026-08-20: Kore renombró el campo a snake_case ("fecha_real_pago") —
+  // confirmado por el usuario, este cambio es propio de Solicitudes de Cobro,
+  // el panel manual de cobros no usa este mismo objeto y no se toca.
+  //
+  // 2026-08-20 (mismo día, corrección real contra Kore): Kore además EXIGE
+  // fecha_real_pago A NIVEL RAÍZ del body (hermano de todo el arreglo
+  // DatosAdicionalesPorFormaPago, no solo dentro de cada elemento) — rechazo
+  // real confirmado por el usuario: "fecha_real_pago es obligatorio para
+  // solicitudes de Tipo=REVISION_CONTABLE". El de cada forma de pago (arriba)
+  // se conserva para el desglose real por depósito (pedido explícito del
+  // usuario); el de raíz usa la fecha del PRIMER movimiento asignado — solo
+  // para satisfacer el chequeo obligatorio de Kore, decisión confirmada con
+  // el usuario ante la ambigüedad de qué fecha única usar si hay varios
+  // movimientos con fechas distintas.
+  const fechaRealPagoRaiz = _fechaRealPagoKore(movsOrdenados[0].fecha);
+
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
     const movId          = movIdPorFormaPagoDocId.get(String(f._id));
     const movDeEstaForma = movPorId.get(movId);
@@ -835,7 +855,7 @@ async function identificar(id, body, user) {
     return {
       ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
-      fechaRealPago: _fechaRealPagoKore(movDeEstaForma.fecha),
+      fecha_real_pago: _fechaRealPagoKore(movDeEstaForma.fecha),
       ...(esTransferencia ? {
         DatosAdicionales: [
           { Nombre: 'Aut',  Valor: movDeEstaForma.folio || '' },
@@ -852,7 +872,7 @@ async function identificar(id, body, user) {
 
   let koreResult;
   try {
-    koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, datosAdicionalesPorFormaPago);
+    koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, datosAdicionalesPorFormaPago, fechaRealPagoRaiz);
   } catch (err) {
     if (err instanceof koreCaja.KoreCajaError) {
       // aplicarSolicitudOperacion ya loguea el payload y el rechazo crudo de

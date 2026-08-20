@@ -276,14 +276,20 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
 // solicitud/sesión — NINGUNO es la cuenta o la CxC. `sesionId` es la sesión de
 // caja del CAJERO solicitante (obtenerSesionCaja).
 // 2026-08-14: cada elemento de datosAdicionalesPorFormaPago también trae
-// `fechaRealPago` (campo hermano de FormaPagoID/BancoID) — ver
+// `fecha_real_pago` (campo hermano de FormaPagoID/BancoID; renombrado por Kore
+// a snake_case el 2026-08-20, antes `fechaRealPago`) — ver
 // collection-request.service.js#identificar (paso 6) para dónde se arma; esta
 // función no cambia, solo pasa el arreglo tal cual en el body.
-async function aplicarSolicitudOperacion(sesionId, solicitudIdErp, koreToken, datosAdicionalesPorFormaPago) {
-  console.log('[aplicarSolicitudOperacion] payload →', JSON.stringify({ sesionId, solicitudIdErp, datosAdicionalesPorFormaPago }));
+// 2026-08-20 (mismo día, corrección real): Kore además EXIGE `fecha_real_pago`
+// A NIVEL RAÍZ del body ("obligatorio para solicitudes de Tipo=REVISION_CONTABLE",
+// rechazo real confirmado por el usuario) — hermano de DatosAdicionalesPorFormaPago,
+// no solo dentro de cada elemento. `fechaRealPagoRaiz` se calcula en
+// collection-request.service.js (fecha del primer movimiento asignado).
+async function aplicarSolicitudOperacion(sesionId, solicitudIdErp, koreToken, datosAdicionalesPorFormaPago, fechaRealPagoRaiz) {
+  console.log('[aplicarSolicitudOperacion] payload →', JSON.stringify({ sesionId, solicitudIdErp, datosAdicionalesPorFormaPago, fechaRealPagoRaiz }));
   return _operacionConReintento(
     'put', `${KORE_CAJA_BASE_URL}/solicitud-operacion/${sesionId}/aplicar/${solicitudIdErp}`,
-    { DatosAdicionalesPorFormaPago: datosAdicionalesPorFormaPago }, koreToken, 'aplicarSolicitudOperacion', solicitudIdErp,
+    { DatosAdicionalesPorFormaPago: datosAdicionalesPorFormaPago, fecha_real_pago: fechaRealPagoRaiz }, koreToken, 'aplicarSolicitudOperacion', solicitudIdErp,
   );
 }
 

@@ -29,11 +29,16 @@ async function main() {
   console.log(`Total CFDIs tipo I del batch (${SERIE}, ${FECHA}):`, cfdis.length);
 
   const cfdiConRegla = cfdis.map(cfdi => ({ cfdi, rule: { cuentaCargo: '1101010003' } }));
-  const { desglosePagoReal } = await _prefetchAjustesFacturaPropia(cfdiConRegla, RFC, {
+  const { desglosePagoReal, usoCaminoPorCentro, cobrosCobradoraDirecta, puntosUsado, saldoFavorUsado } = await _prefetchAjustesFacturaPropia(cfdiConRegla, RFC, {
     centroPropioClave: SERIE, fechaDesde: desde, fechaHasta: hasta,
   });
 
+  console.log('usoCaminoPorCentro:', usoCaminoPorCentro);
+  console.log('cobrosCobradoraDirecta.length:', cobrosCobradoraDirecta?.length);
+  console.log('puntosUsado.size:', puntosUsado?.size);
+  console.log('saldoFavorUsado.size:', saldoFavorUsado?.size);
   console.log('Claves con desglosePagoReal encontrado:', desglosePagoReal.size);
+  console.log('Todas las claves de desglosePagoReal:', JSON.stringify([...desglosePagoReal.keys()]));
 
   let totalConDesglose = 0;
   let totalSinDesglose = 0;

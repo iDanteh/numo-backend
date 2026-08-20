@@ -1531,6 +1531,46 @@ async function _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, 
   return foliosRaw;
 }
 
+// Busca facturas tipo I canceladas en SAT (dentro del mismo rango de uuids
+// por fecha efectiva que ya se usa para las vigentes) que NO tengan ninguna
+// NC/sustituto (`cfdiRelacionados`) apuntándoles — esas SÍ están correctamente
+// manejadas por el flujo normal de Devolución/Cancelación. Las que quedan sin
+// ningún documento que las compense son las huérfanas: el CFDI se canceló
+// pero nadie más contabiliza ese dinero. Devuelve los CFDIs listos para unirse
+// al batch normal (mismos campos que `filtroBase`).
+async function _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorFecha }) {
+  const filtro = {
+    'emisor.rfc':      rfc,
+    ejercicio:         Number(ejercicio),
+    periodo:           Number(periodo),
+    tipoDeComprobante: 'I',
+    source:            'SAT',
+    satStatus:         'Cancelado',
+    ...(uuidsPorFecha ? { uuid: { $in: [...uuidsPorFecha] } } : {}),
+    isActive:          true,
+  };
+  const candidatas = await CFDI.find(filtro)
+    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
+    .lean();
+  if (!candidatas.length) return [];
+
+  const uuidsCandidatas = candidatas.map(c => c.uuid.toUpperCase());
+  const conNC = await CFDI.find({
+    'emisor.rfc': rfc,
+    $or: [
+      { 'cfdiRelacionados.uuid':  { $in: uuidsCandidatas } },
+      { 'cfdiRelacionados.uuids': { $in: uuidsCandidatas } },
+    ],
+  }).select('cfdiRelacionados').lean();
+  const uuidsConNC = new Set();
+  for (const doc of conNC) {
+    for (const r of doc.cfdiRelacionados || []) {
+      for (const u of (r.uuids ?? (r.uuid ? [r.uuid] : []))) uuidsConNC.add(String(u).toUpperCase());
+    }
+  }
+  return candidatas.filter(c => !uuidsConNC.has(c.uuid.toUpperCase()));
+}
+
 function _fmtDMY(fechaISO) {
   const [y, m, d] = fechaISO.split('-');
   return `${d}/${m}/${y}`;
@@ -1881,6 +1921,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const cfdis = await CFDI.find(filtroBase)
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
     .lean();
+
+  // Facturas tipo I canceladas en SAT SIN ninguna NC/sustituto que las
+  // compense: el CFDI se canceló pero el dinero SÍ entró y quedó huérfano —
+  // sin esto ese efectivo/tarjeta real nunca puede entrar a ninguna póliza
+  // (confirmado con el usuario 2026-08-20, caso real B0-260801159, $41,533.90
+  // Efectivo, cancelada sin NC/sustituto ligado). Se agregan al MISMO batch
+  // que las vigentes — si el desglose real de cajas no encuentra cobro para
+  // alguna de ellas, el mecanismo ya existente (`sinCobrosEnSucursal`/"Venta
+  // Sin Cobro") la excluye igual que a cualquier otra factura sin cobro; esto
+  // solo abre la puerta, nunca fuerza su inclusión.
+  const cfdisCanceladasSinCompensar = tipoCfdi === 'I'
+    ? await _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorFecha: uuidsPorFechaProp })
+    : [];
+  if (cfdisCanceladasSinCompensar.length) cfdis.push(...cfdisCanceladasSinCompensar);
 
   await repararSubtotalDesdeXml(cfdis);
 
@@ -3108,6 +3162,12 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const cfdis = await CFDI.find(filtroBase)
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida')
     .lean();
+
+  // Ver comentario equivalente en generarPropuesta / _cfdisCanceladasSinCompensar.
+  const cfdisCanceladasSinCompensarGuard = tipoCfdi === 'I'
+    ? await _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorFecha: uuidsPorFechaGuard })
+    : [];
+  if (cfdisCanceladasSinCompensarGuard.length) cfdis.push(...cfdisCanceladasSinCompensarGuard);
 
   await repararSubtotalDesdeXml(cfdis);
 

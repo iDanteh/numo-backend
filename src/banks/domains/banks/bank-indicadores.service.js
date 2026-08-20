@@ -210,4 +210,7 @@ async function getIndicadoresIdentificacion({ banco, categoria, year, month } = 
   };
 }
 
-module.exports = { getIndicadoresIdentificacion, horasHabilesEntre };
+// promedio/mediana también se exportan para collection-request-indicadores.service.js
+// (mismo dominio conceptual — tiempo de identificación — pero acotado a Solicitudes de
+// Cobro, ver ese archivo).
+module.exports = { getIndicadoresIdentificacion, horasHabilesEntre, promedio, mediana };

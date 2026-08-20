@@ -20,6 +20,15 @@ const REFERENCIA_REGEX = /^[0-9a-fA-F]{24}$/;
 // No debe filtrar detalle interno a un llamador externo: cualquier excepción no esperada se
 // atrapa aquí mismo y responde 500 genérico, con el detalle real solo en el log.
 router.post('/', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  // 2026-08-20 (pedido explícito del usuario): log crudo del body ANTES de cualquier
+  // validación — sin esto no quedaba ningún rastro en consola de lo que Kore realmente
+  // mandó cuando el request se rechaza (400) o cuando "yaEstabaDesvinculada" (200 pero
+  // sin persistir ErpReversion, ver procesarReversionKore). El payload COMPLETO también
+  // queda guardado en ErpReversion.payloadOriginal cuando SÍ hay movimientos afectados —
+  // consultable vía GET /api/erp/cxc-reversiones (bandeja) o directo en Mongo
+  // (`db.erpreversions.find({erpId:'...'}).sort({createdAt:-1})`).
+  console.log('[erp-reversion] payload recibido de Kore →', JSON.stringify(req.body));
+
   const { erpId, referencia, motivo, fecha, serieExterna, folioExterno } = req.body;
 
   if (!erpId || typeof erpId !== 'string' || !erpId.trim()) {

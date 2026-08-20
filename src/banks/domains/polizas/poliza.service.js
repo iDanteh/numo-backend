@@ -1223,7 +1223,14 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // entre sí, perdiendo el detalle por CFDI; extendido a Cheque el mismo
     // día, mismo criterio).
     const esChequeDeclarado = m.formaPago === FORMA_PAGO_CHEQUE;
-    if (esTransferenciaVerificada || esChequeDeclarado) {
+    // Remanentes menores a $10 (ej. sobrante de $0.01-$9.99 cuando SF/Puntos
+    // cubre casi toda la factura y no se encontró desglose real completo,
+    // ver `esCasoAjusteSFPuntos` en cfdi-mapping.service.js): no vale la pena
+    // mostrarlos como su propia línea de Transferencia/Cheque/Tarjeta — caen
+    // al bucket genérico de abajo en vez de individualizarse (confirmado con
+    // el usuario 2026-08-20).
+    const esRemanenteMenor = Number(m.debe) < 10;
+    if ((esTransferenciaVerificada || esChequeDeclarado) && !esRemanenteMenor) {
       const tipoDetalle = esTransferenciaVerificada ? 'TRANSFERENCIA' : 'CHEQUE';
       const subcodigoDetalle = esTransferenciaVerificada ? subcodigoTransferencia : 0;
       // Info por TICKET (`bancoRealPorTicket`, ver docstring) tiene prioridad
@@ -1287,7 +1294,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     const infoTarjetaTicket = (esTarjetaDeclarada && m.serieVentaTicket && m.folioVentaTicket)
       ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
       : null;
-    if (esTarjetaDeclarada && infoTarjetaTicket?.numeroAutorizacion) {
+    if (esTarjetaDeclarada && infoTarjetaTicket?.numeroAutorizacion && !esRemanenteMenor) {
       const cuentaLineaTarjeta = infoTarjetaTicket.cuentaBanco ?? m.cuenta;
       const key = `${cuentaLineaTarjeta?.codigo}|${centroCosto}|TARJETA|${infoTarjetaTicket.numeroAutorizacion}`;
       if (!gruposDetallados.has(key)) {

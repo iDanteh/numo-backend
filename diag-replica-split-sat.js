@@ -4,6 +4,13 @@ const { connectMongo, disconnectMongo } = require('./src/config/database.mongo')
 const { sequelize } = require('./src/config/database.postgres');
 const CFDI = require('./src/visor/models/CFDI');
 const { _prefetchAjustesFacturaPropia, _uuidsPorFechaEfectiva } = require('./src/banks/domains/cfdi-mapping/cfdi-poliza-generator.service.js');
+const mappingSvc = require('./src/banks/domains/cfdi-mapping/cfdi-mapping.service.js');
+const CfdiMappingRule = require('./src/shared/models/postgres/CfdiMappingRule');
+
+const CODIGOS_CUENTAS_CAJA_O_BANCO = new Set([
+  '1101010003', '1102011005', '1102011001', '1102012001',
+  '1102013001', '1102014001', '1102015001', '1102016001',
+]);
 
 const RFC = process.env.DIAG_RFC || 'CCO011113663';
 const SERIE = process.env.DIAG_SERIE || 'B0';
@@ -33,14 +40,44 @@ async function main() {
 
   const desde = new Date(`${FECHA}T00:00:00-06:00`);
   const hasta = new Date(`${FECHA}T23:59:59.999-06:00`);
-  const cfdiConRegla = cfdisSat.map(cfdi => ({ cfdi, rule: { cuentaCargo: '1101010003' } }));
+
+  // Regla REAL por CFDI (antes hardcodeada a 1101010003 -- eso asumia
+  // gateBase=true para las 116 facturas, lo cual sobreestimo el Efectivo).
+  const rules = await CfdiMappingRule.findAll({ where: { isActive: true }, order: [['prioridad', 'ASC']] });
+  const cfdiConRegla = cfdisSat.map(cfdi => ({ cfdi, rule: mappingSvc.findRuleInList(cfdi, rules) }));
+
+  const sinRegla = cfdiConRegla.filter(({ rule }) => !rule);
+  console.log('CFDIs sin ninguna regla matcheada:', sinRegla.length);
+  for (const { cfdi } of sinRegla) console.log('  SIN REGLA:', cfdi.serie, cfdi.folio, cfdi.total);
+
+  const noGateBase = cfdiConRegla.filter(({ rule }) => rule && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo));
+  console.log('\nCFDIs cuya regla NO apunta a Caja/Bancos (gateBase=false, sin split):', noGateBase.length);
+  for (const { cfdi, rule } of noGateBase) {
+    console.log(`  ${cfdi.serie}-${cfdi.folio} total=${cfdi.total} formaPagoCFDI=${cfdi.formaPago} reglaNombre=${rule.nombre} cuentaCargoRegla=${rule.cuentaCargo}`);
+  }
+  const noGateBaseUuids = new Set(noGateBase.map(({ cfdi }) => cfdi.uuid));
+
   const { desglosePagoReal, puntosUsado, saldoFavorUsado } = await _prefetchAjustesFacturaPropia(cfdiConRegla, RFC, {
     centroPropioClave: SERIE, fechaDesde: desde, fechaHasta: hasta,
   });
 
   let totalEfectivo = 0;
+  let efectivoExcluidoPorGateBase = 0;
   const detalleExceso = [];
   for (const cfdi of cfdisSat) {
+    if (noGateBaseUuids.has(cfdi.uuid)) {
+      // gateBase=false: la regla real NO es Caja/Bancos -- el split nunca
+      // ocurre, todo el montoCargo va a la cuenta que diga la regla, sin
+      // importar la forma de pago real. Medimos aqui cuanto "efectivo real"
+      // se estaria perdiendo de este calculo por esta razon.
+      const key = `${cfdi.serie}|${cfdi.folio}`;
+      const formasPago = desglosePagoReal.get(key) ?? [];
+      const efectivoQueSeHubieraContado = formasPago
+        .filter(fp => (fp.claveSat ?? '').trim() === '01')
+        .reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+      efectivoExcluidoPorGateBase += efectivoQueSeHubieraContado;
+      continue;
+    }
     const key = `${cfdi.serie}|${cfdi.folio}`;
     const formasPago = desglosePagoReal.get(key) ?? [];
     const totalFormasPagoReal = formasPago.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
@@ -81,7 +118,8 @@ async function main() {
     totalEfectivo += efectivoDeEstaFactura;
   }
 
-  console.log('\nTotal Efectivo calculado (replica fiel del batch real):', totalEfectivo.toFixed(2));
+  console.log('\nTotal Efectivo calculado (replica fiel del batch real, respetando gateBase):', totalEfectivo.toFixed(2));
+  console.log('Efectivo real que NO entra por gateBase=false (regla especifica, sin split):', efectivoExcluidoPorGateBase.toFixed(2));
   console.log('\nCasos con exceso o fallback relevante:');
   for (const d of detalleExceso) console.log(JSON.stringify(d));
 

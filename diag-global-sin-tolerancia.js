@@ -19,6 +19,7 @@ async function main() {
 
   const cuentas = await obtenerDesglosesCobroAlmacen({ rfc: RFC, series: [SERIE], folios: [FOLIO_GLOBAL] });
   console.log(`Total "cuentas" (tickets) devueltos por /desgloses-cobro/almacen para ${SERIE}-${FOLIO_GLOBAL}:`, cuentas.length);
+  console.log('RAW:', JSON.stringify(cuentas, null, 2));
 
   const porClave = {};
   const detalle = [];

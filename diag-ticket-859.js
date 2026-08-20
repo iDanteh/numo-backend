@@ -6,6 +6,8 @@ const { Op } = require('sequelize');
 const CFDI = require('./src/visor/models/CFDI');
 const CentroCosto = require('./src/shared/models/postgres/CentroCosto');
 const CobroSucursalPendiente = require('./src/shared/models/postgres/CobroSucursalPendiente');
+const PolizaMovimiento = require('./src/shared/models/postgres/PolizaMovimiento');
+const Poliza = require('./src/shared/models/postgres/Poliza');
 const { obtenerDesglosesCobroAlmacen } = require('./src/banks/domains/erp/erp-sync.service');
 
 const RFC = process.env.DIAG_RFC || 'CCO011113663';
@@ -45,6 +47,23 @@ async function main() {
     raw: true,
   });
   console.log('\n4) CobroSucursalPendiente ligado a este ticket/cfdi:', JSON.stringify(pendientes, null, 2));
+
+  // 5. TODOS los movimientos de poliza (cualquier poliza) ligados a este
+  // cfdiUuid -- para ver exactamente que genero cada linea y en que poliza
+  // quedo (la factura real es del 11-ago segun el CFDI, no del 7).
+  const movs = await PolizaMovimiento.findAll({
+    where: { cfdiUuid: UUID_FACTURA },
+    attributes: ['id', 'polizaId', 'cuentaId', 'debe', 'haber', 'tipoOrigen', 'reglaNombre', 'concepto', 'serie', 'folio', 'formaPago', 'centroCosto'],
+    raw: true,
+  });
+  console.log(`\n5) PolizaMovimiento con cfdiUuid=${UUID_FACTURA}: ${movs.length}`);
+  for (const m of movs) console.log(JSON.stringify(m));
+
+  if (movs.length) {
+    const polizaIds = [...new Set(movs.map(m => m.polizaId))];
+    const polizas = await Poliza.findAll({ where: { id: { [Op.in]: polizaIds } }, attributes: ['id', 'numero', 'fecha', 'estado', 'createdAt'], raw: true });
+    console.log('\n6) Polizas donde aparece esta factura:', JSON.stringify(polizas, null, 2));
+  }
 
   await disconnectMongo();
   await sequelize.close();

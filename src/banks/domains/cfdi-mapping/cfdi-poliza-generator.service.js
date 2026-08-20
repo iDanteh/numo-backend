@@ -724,6 +724,21 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // `cfdi-mapping.service.js` verificando que la suma de
           // `formasPago` encontradas coincida con el total del Cargo antes
           // de usarlas para partir (si no coincide, no se fuerza el split).
+        } else if (origen === 'APS') {
+          // 'APS' (2026-08-20, confirmado con el usuario contra datos reales
+          // de Hidalgo/B0 — caso real folioOrigen 260800139/260800133): a
+          // diferencia de 'APA' (mero espejo de atribución, sin dinero
+          // nuevo, por eso NUNCA se agrega a SERIES_CON_AUTH), un cobro 'APS'
+          // ES el pago real y primario del ticket cuando parte se cubrió con
+          // dinero real y parte con saldo a favor ya existente (ej. $860.58
+          // Tarjeta + $228.47 Saldo a Favor en un solo cobro APS, sin ningún
+          // otro cobro ABO/CBT asociado a esa cuenta). Al no estar en
+          // SERIES_CON_AUTH, el cobro completo — incluida su porción de
+          // dinero real — se descartaba, faltando del corte de caja de
+          // Efectivo/Tarjeta (parte de la brecha de $5,958.81 en Tarjeta de
+          // Hidalgo 11-ago). La porción "saldo a favor" del texto de la
+          // forma de pago se sigue filtrando abajo igual que en cualquier
+          // otro origen — solo se deja pasar la porción de dinero real.
         } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }
@@ -900,7 +915,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         }
         if (centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
-        if (!SERIES_CON_AUTH.includes(origen)) continue;
+        // 'APS' se acepta aquí igual que arriba (ver comentario 2026-08-20 en
+        // el loop de `desglosePagoReal`) — es un cobro real mixto (dinero
+        // real + saldo a favor), no un espejo como 'APA'.
+        if (origen !== 'APS' && !SERIES_CON_AUTH.includes(origen)) continue;
         for (const fp of (cobro.formasPago ?? [])) {
           if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
           const monto = (cobro.formasPago.length === 1 && cobro.monto != null)

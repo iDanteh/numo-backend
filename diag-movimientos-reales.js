@@ -9,10 +9,9 @@ async function main() {
   await sequelize.authenticate();
 
   const [polizas] = await sequelize.query(`
-    SELECT p.id, p.fecha, p.estado, p.created_at, cc.clave AS centro_clave
+    SELECT p.id, p.fecha, p.estado, p.created_at, p.centro_costo
     FROM polizas p
-    LEFT JOIN centros_costo cc ON cc.id = p.centro_costo_id
-    WHERE p.fecha = :fecha AND cc.clave = :centro
+    WHERE p.fecha = :fecha AND p.centro_costo = :centro
     ORDER BY p.id DESC
     LIMIT 5
   `, { replacements: { fecha: FECHA, centro: CENTRO_CLAVE } });

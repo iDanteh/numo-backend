@@ -25,7 +25,7 @@ async function main() {
   const cfdis = await CFDI.find({
     'emisor.rfc': RFC, serie: SERIE, tipoDeComprobante: 'I', source: 'ERP',
     fecha: { $gte: desde, $lte: hasta },
-  }).select('uuid serie folio fecha total metodoPago formaPago receptor.nombre').lean();
+  }).select('uuid serie folio fecha total metodoPago formaPago tipoDeComprobante receptor.nombre').lean();
   console.log(`Total CFDIs tipo I del batch (${SERIE}, ${FECHA}):`, cfdis.length);
 
   const cfdiConRegla = cfdis.map(cfdi => ({ cfdi, rule: { cuentaCargo: '1101010003' } }));

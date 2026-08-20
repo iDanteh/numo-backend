@@ -31,11 +31,16 @@ async function main() {
     fechaInicio: FECHA, fechaFin: FECHA,
   });
 
+  // SIN .select(): findRuleInList depende de campos completos del CFDI
+  // (emisor.rfc, receptor.rfc, conceptos, cfdiRelacionados, descuento,
+  // impuestos, tipoOrigen...) -- un .select() parcial anterior los omitia,
+  // causando que TODAS las reglas especificas (ej. cuentaCargo=4200010001)
+  // fallaran en silencio y cayeran a la regla generica de Caja/Bancos.
   const cfdisSat = await CFDI.find({
     'emisor.rfc': RFC, ejercicio: Number(EJERCICIO), periodo: Number(PERIODO),
     tipoDeComprobante: 'I', source: 'SAT', satStatus: 'Vigente',
     uuid: { $in: [...uuidsPorFecha] }, isActive: true, serie: SERIE,
-  }).select('uuid serie folio fecha total metodoPago formaPago tipoDeComprobante receptor.nombre').lean();
+  }).lean();
   console.log(`Total CFDIs reales del batch (source=SAT, serie=${SERIE}, ${FECHA}):`, cfdisSat.length);
 
   const desde = new Date(`${FECHA}T00:00:00-06:00`);

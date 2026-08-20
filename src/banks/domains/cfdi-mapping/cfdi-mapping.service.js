@@ -4,6 +4,11 @@ const { CfdiMappingRule, AccountPlan, PolizaMovimiento, Poliza } = require('../.
 const { Op, fn, col, literal } = require('sequelize');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 
+// DEBUG TEMPORAL (2026-08-20, quitar después de investigar el gap de
+// Efectivo de Hidalgo/B0 11-ago) — activar con DEBUG_SPLIT_PAGO=1.
+const { logger: _debugLogger } = require('../../../shared/utils/logger');
+const _DEBUG_SPLIT_PAGO = process.env.DEBUG_SPLIT_PAGO === '1';
+
 // tipoOrigen para las porciones de Saldo a Favor/Puntos DENTRO del split de
 // una factura NORMAL — deliberadamente DISTINTO de 'Cobro Sucursal' (el que
 // usa el mecanismo de cruces reales entre sucursales, cobros-sucursal-puente
@@ -788,6 +793,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
     && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
 
+  if (_DEBUG_SPLIT_PAGO) {
+    _debugLogger.warn(`[DEBUG_SPLIT] ${serieCfdi}-${cfdi.folio} uuid=${cfdi.uuid} total=${cfdi.total} formaPagoCFDI=${cfdi.formaPago} `
+      + `gateBase=${gateBase} esAnticipo=${!!esAnticipo} esAplicacionSaldo=${!!esAplicacionSaldo} tasaIvaMixto=${rule.tasaIva === 'mixto'} `
+      + `cuentaCargoRegla=${rule.cuentaCargo} montoCargo=${montoCargo} `
+      + `montoSFUsado=${montoSFUsado} montoPuntosUsado=${montoPuntosUsado} `
+      + `desglosePagoRealLen=${Array.isArray(context.desglosePagoReal) ? context.desglosePagoReal.length : 'N/A'} `
+      + `totalFormasPagoReal=${totalFormasPagoReal} esCasoAjusteSFPuntos=${esCasoAjusteSFPuntos} esCasoNormalParaSplit=${esCasoNormalParaSplit}`);
+  }
+
   // Reparte `montoAPartir` entre Efectivo/Tarjeta usando `context.desglosePagoReal`
   // — extraído del bloque `esCasoNormalParaSplit` (2026-08-14) para poder
   // reutilizarlo también en el remanente de `esCasoAjusteSFPuntos` (ver ahí).
@@ -941,6 +955,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       const excesoCubrir = totalFormasPagoReal > 0
         ? parseFloat((restante - totalFormasPagoReal).toFixed(2))
         : 0;
+      if (_DEBUG_SPLIT_PAGO) {
+        _debugLogger.warn(`[DEBUG_SPLIT_SFPUNTOS] ${serieCfdi}-${cfdi.folio} restante=${restante} totalFormasPagoReal=${totalFormasPagoReal} `
+          + `excesoCubrir=${excesoCubrir} -> ${excesoCubrir > 0.01 && totalFormasPagoReal > 0 ? 'EXCESO_A_CAJA_SIN_EXCLUIR' : 'SPLIT_DIRECTO_RESTANTE'}`);
+      }
       if (excesoCubrir > 0.01 && totalFormasPagoReal > 0) {
         movs.push({
           cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
@@ -999,6 +1017,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const excesoCasoNormal = totalFormasPagoReal > 0
       ? parseFloat((montoCargo - totalFormasPagoReal).toFixed(2))
       : 0;
+    if (_DEBUG_SPLIT_PAGO) {
+      _debugLogger.warn(`[DEBUG_SPLIT_NORMAL] ${serieCfdi}-${cfdi.folio} montoCargo=${montoCargo} totalFormasPagoReal=${totalFormasPagoReal} `
+        + `excesoCasoNormal=${excesoCasoNormal} -> ${excesoCasoNormal > 0.01 && totalFormasPagoReal > 0 ? 'EXCESO_EXCLUIDO_VENTA_SIN_COBRO' : 'SPLIT_DIRECTO_MONTOCARGO'}`);
+    }
     if (excesoCasoNormal > 0.01 && totalFormasPagoReal > 0) {
       movs.push({
         cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
@@ -1039,6 +1061,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       ? ((_esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS])
           ?? cuentaMap[rule.cuentaCargo] ?? null)
       : (cuentaMap[rule.cuentaCargo] ?? null);
+    if (_DEBUG_SPLIT_PAGO) {
+      _debugLogger.warn(`[DEBUG_SPLIT_FALLBACK] ${serieCfdi}-${cfdi.folio} montoCargo=${montoCargo} formaPagoCFDI=${cfdi.formaPago} `
+        + `sinCobrosEnSucursal=${sinCobrosEnSucursal} tipoOrigenAplicado=${sinCobrosEnSucursal ? 'Venta Sin Cobro' : 'NINGUNO (SI CONSOLIDA)'}`);
+    }
     movs.push({
       cuentaId:    _cuentaIdFallback,
       concepto,

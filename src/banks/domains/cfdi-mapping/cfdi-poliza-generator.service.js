@@ -1923,18 +1923,15 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     .lean();
 
   // Facturas tipo I canceladas en SAT SIN ninguna NC/sustituto que las
-  // compense: el CFDI se canceló pero el dinero SÍ entró y quedó huérfano —
-  // sin esto ese efectivo/tarjeta real nunca puede entrar a ninguna póliza
-  // (confirmado con el usuario 2026-08-20, caso real B0-260801159, $41,533.90
-  // Efectivo, cancelada sin NC/sustituto ligado). Se agregan al MISMO batch
-  // que las vigentes — si el desglose real de cajas no encuentra cobro para
-  // alguna de ellas, el mecanismo ya existente (`sinCobrosEnSucursal`/"Venta
-  // Sin Cobro") la excluye igual que a cualquier otra factura sin cobro; esto
-  // solo abre la puerta, nunca fuerza su inclusión.
-  const cfdisCanceladasSinCompensar = tipoCfdi === 'I'
+  // compense: el CFDI se canceló pero el dinero SÍ entró y quedó huérfano.
+  // NO se procesan con la regla normal (eso reconocería Ingresos/IVA de un
+  // CFDI sin efecto fiscal) — se les da un asiento aparte más abajo (solo
+  // Cargo Caja/Bancos por el cobro real contra Anticipos de Clientes, ver
+  // `_asientosCanceladasConCobroReal`), confirmado con el usuario 2026-08-20
+  // caso real B0-260801159 ($41,533.90 Efectivo).
+  const cfdisCanceladasSinCompensarProp = tipoCfdi === 'I'
     ? await _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorFecha: uuidsPorFechaProp })
     : [];
-  if (cfdisCanceladasSinCompensar.length) cfdis.push(...cfdisCanceladasSinCompensar);
 
   await repararSubtotalDesdeXml(cfdis);
 
@@ -2250,6 +2247,15 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
 
+  // Solo para que `_prefetchAjustesFacturaPropia` también resuelva el cobro
+  // real de las canceladas-sin-compensar (ver bloque más abajo que las
+  // convierte en línea de Efectivo/Bancos) — la regla-placeholder NUNCA se
+  // usa para generar movimientos vía `cfdiToMovimientos` (esas facturas no
+  // entran a `cfdiConRegla`, solo a esta copia extendida).
+  const cfdiConReglaParaDesglose = cfdisCanceladasSinCompensarProp.length
+    ? [...cfdiConRegla, ...cfdisCanceladasSinCompensarProp.map(cfdi => ({ cfdi, rule: { cuentaCargo: CODIGO_CUENTA_CAJA } }))]
+    : cfdiConRegla;
+
   const codigosNecesarios = [...new Set(
     cfdiConRegla
       .filter(({ rule }) => rule)
@@ -2284,7 +2290,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -2804,6 +2810,52 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
   }
 
+  // Facturas tipo I canceladas en SAT sin NC/sustituto que las compense (ver
+  // `_cfdisCanceladasSinCompensar`), con cobro real encontrado en cajas: el
+  // dinero SÍ entró aunque el CFDI se haya cancelado — se funde en el MISMO
+  // "Depósitos consolidados (Efectivo/Tarjeta)" que cualquier venta normal
+  // (`tipoOrigen: 'Venta'`), SIN generar Abono ni IVA (el CFDI cancelado no
+  // tiene efecto fiscal que reconocer) — confirmado con el usuario 2026-08-20,
+  // caso real B0-260801159 ($41,533.90 Efectivo). Si no se encontró cobro
+  // real para alguna, simplemente no se agrega nada (no se inventa dinero).
+  // `reglaNombre`/`concepto` distintos permiten identificarla en el desglose
+  // sin disparar los filtros de texto de `categorizarAjusteContado` (solo
+  // busca "devolución"/"cancelación" en `tipoOrigen`, y "devolución" en
+  // `concepto" — "cancelada" en concepto no dispara nada).
+  for (const cfdiCancelada of cfdisCanceladasSinCompensarProp) {
+    const keyCancelada = `${cfdiCancelada.serie}|${cfdiCancelada.folio}`;
+    const formasPagoRealCancelada = desglosePagoRealMapProp.get(keyCancelada) ?? [];
+    if (!formasPagoRealCancelada.length) continue;
+    const ccCancelada = cfdiCancelada.serie ? (ccBySerieMapProp[cfdiCancelada.serie] ?? null) : null;
+    const conceptoCancelada = [
+      cfdiCancelada.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO',
+      `${cfdiCancelada.serie}-${cfdiCancelada.folio}`,
+      '(factura cancelada, cobro real)',
+    ].filter(Boolean).join(' / ');
+    for (const fp of formasPagoRealCancelada) {
+      const montoLineaCancelada = Math.round((Number(fp.monto) || 0) * 100) / 100;
+      if (montoLineaCancelada <= 0) continue;
+      const esEfectivoCancelada = (fp.claveSat ?? '').trim() === '01';
+      movimientosResult.push({
+        concepto:       conceptoCancelada,
+        serie:          `${cfdiCancelada.serie}-${cfdiCancelada.folio}`,
+        centroCosto:    ccCancelada?.clave ?? null,
+        centroCostoId:  ccCancelada?.id    ?? null,
+        cfdiUuid:       cfdiCancelada.uuid,
+        cuentaId:       esEfectivoCancelada ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null),
+        debe:           montoLineaCancelada,
+        haber:          0,
+        tipoOrigen:     'Venta',
+        reglaNombre:    'FACTURA-CANCELADA-COBRO-REAL',
+        formaPago:      (fp.claveSat ?? '').trim() || null,
+        _cfdiInfo: {
+          uuid: cfdiCancelada.uuid, tipo: cfdiCancelada.tipoDeComprobante, emisor: cfdiCancelada.emisor?.rfc,
+          total: cfdiCancelada.total, fecha: cfdiCancelada.fecha, sinRegla: false, comparisonStatus: null,
+        },
+      });
+    }
+  }
+
   // Puntos/Club Tuberos usados en el batch: UNA sola línea consolidada por
   // sucursal (no individual, a diferencia de Saldo a Favor — confirmado con
   // el usuario 2026-08-06, revirtió su decisión anterior sobre Puntos),
@@ -3164,10 +3216,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     .lean();
 
   // Ver comentario equivalente en generarPropuesta / _cfdisCanceladasSinCompensar.
+  // NO se unen a `cfdis` (eso les aplicaría la regla normal, reconociendo
+  // Ingresos/IVA de un CFDI sin efecto fiscal) — se procesan aparte más abajo.
   const cfdisCanceladasSinCompensarGuard = tipoCfdi === 'I'
     ? await _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorFecha: uuidsPorFechaGuard })
     : [];
-  if (cfdisCanceladasSinCompensarGuard.length) cfdis.push(...cfdisCanceladasSinCompensarGuard);
 
   await repararSubtotalDesdeXml(cfdis);
 
@@ -3435,6 +3488,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
 
+  // Ver comentario equivalente en generarPropuesta.
+  const cfdiConReglaParaDesglose = cfdisCanceladasSinCompensarGuard.length
+    ? [...cfdiConRegla, ...cfdisCanceladasSinCompensarGuard.map(cfdi => ({ cfdi, rule: { cuentaCargo: CODIGO_CUENTA_CAJA } }))]
+    : cfdiConRegla;
+
   const codigosNecesarios = [...new Set(
     cfdiConRegla
       .filter(({ rule }) => rule)
@@ -3461,7 +3519,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false } = await _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -3872,6 +3930,43 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         debe:           -ret.monto,
         haber:          0,
         _ajusteConsolidadoSF: true,
+      });
+    }
+  }
+
+  // Facturas tipo I canceladas en SAT sin NC/sustituto que las compense, con
+  // cobro real encontrado en cajas — ver comentario equivalente en
+  // generarPropuesta.
+  for (const cfdiCanceladaGuard of cfdisCanceladasSinCompensarGuard) {
+    const keyCanceladaGuard = `${cfdiCanceladaGuard.serie}|${cfdiCanceladaGuard.folio}`;
+    const formasPagoRealCanceladaGuard = desglosePagoRealMapGuard.get(keyCanceladaGuard) ?? [];
+    if (!formasPagoRealCanceladaGuard.length) continue;
+    const ccCanceladaGuard = cfdiCanceladaGuard.serie ? (ccBySerieMap[cfdiCanceladaGuard.serie] ?? null) : null;
+    const conceptoCanceladaGuard = [
+      cfdiCanceladaGuard.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO',
+      `${cfdiCanceladaGuard.serie}-${cfdiCanceladaGuard.folio}`,
+      '(factura cancelada, cobro real)',
+    ].filter(Boolean).join(' / ');
+    for (const fp of formasPagoRealCanceladaGuard) {
+      const montoLineaCanceladaGuard = Math.round((Number(fp.monto) || 0) * 100) / 100;
+      if (montoLineaCanceladaGuard <= 0) continue;
+      const esEfectivoCanceladaGuard = (fp.claveSat ?? '').trim() === '01';
+      todosLosMovimientos.push({
+        concepto:       conceptoCanceladaGuard,
+        serie:          `${cfdiCanceladaGuard.serie}-${cfdiCanceladaGuard.folio}`,
+        centroCosto:    ccCanceladaGuard?.clave ?? null,
+        centroCostoId:  ccCanceladaGuard?.id    ?? null,
+        cfdiUuid:       cfdiCanceladaGuard.uuid,
+        cuentaId:       esEfectivoCanceladaGuard ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null),
+        debe:           montoLineaCanceladaGuard,
+        haber:          0,
+        tipoOrigen:     'Venta',
+        reglaNombre:    'FACTURA-CANCELADA-COBRO-REAL',
+        formaPago:      (fp.claveSat ?? '').trim() || null,
+        _cfdiInfo: {
+          uuid: cfdiCanceladaGuard.uuid, tipo: cfdiCanceladaGuard.tipoDeComprobante, emisor: cfdiCanceladaGuard.emisor?.rfc,
+          total: cfdiCanceladaGuard.total, fecha: cfdiCanceladaGuard.fecha, sinRegla: false, comparisonStatus: null,
+        },
       });
     }
   }

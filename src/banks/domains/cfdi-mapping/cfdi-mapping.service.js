@@ -957,9 +957,20 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         : 0;
       if (_DEBUG_SPLIT_PAGO) {
         _debugLogger.warn(`[DEBUG_SPLIT_SFPUNTOS] ${serieCfdi}-${cfdi.folio} restante=${restante} totalFormasPagoReal=${totalFormasPagoReal} `
-          + `excesoCubrir=${excesoCubrir} -> ${excesoCubrir > 0.01 && totalFormasPagoReal > 0 ? 'EXCESO_A_CAJA_SIN_EXCLUIR' : 'SPLIT_DIRECTO_RESTANTE'}`);
+          + `excesoCubrir=${excesoCubrir} -> ${excesoCubrir > 0.01 && totalFormasPagoReal > 0 ? 'EXCESO_VENTA_SIN_COBRO_EXCLUIDO' : 'SPLIT_DIRECTO_RESTANTE'}`);
       }
       if (excesoCubrir > 0.01 && totalFormasPagoReal > 0) {
+        // Antes este exceso se mandaba SIEMPRE a Caja sin excluir (a
+        // diferencia del caso normal, ver `esCasoNormalParaSplit` abajo, que
+        // sí lo etiqueta "Venta Sin Cobro"). Investigación exhaustiva
+        // 2026-08-20 (caso real Global Hidalgo B0-260801256, $5,087.28):
+        // se agotaron 4 fuentes independientes (API de cobros ±15 días, API
+        // por factura sin restricción de fecha, reporte oficial de
+        // Movimientos en Cajas completo, y /cuentas-pendientes) y NINGUNA
+        // mostró ticket real que respalde este remanente — no es "ruido de
+        // reclasificación" recuperable, es dinero sin ticket detrás. Se
+        // alinea con el caso normal: se excluye del consolidado de
+        // Efectivo/Tarjeta en vez de sumarse a ciegas.
         movs.push({
           cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
           concepto, centroCosto, ventaFecha, serie: serieCfdi,
@@ -968,6 +979,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
           cfdiUuid:    cfdi.uuid,
           rfcTercero,
           _esCargoPrincipal: true,
+          tipoOrigen:  'Venta Sin Cobro',
         });
         splitPorFormaPagoReal(totalFormasPagoReal, extraRemanente);
       } else {

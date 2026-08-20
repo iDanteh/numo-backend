@@ -2752,6 +2752,7 @@ router._sincronizarConRetry         = _sincronizarConRetry;
 router._movimientosKoreDesde        = _movimientosKoreDesde;
 router._montoSaldoLink              = _montoSaldoLink;
 router._montoSaldoLinkPorMovimiento = _montoSaldoLinkPorMovimiento;
+router._montoSaldoLinkPorAutorizacion = _montoSaldoLinkPorAutorizacion;
 router._aporteConRatchet            = _aporteConRatchet;
 router._FILTRO_LINK_ATRAPADO        = _FILTRO_LINK_ATRAPADO;
 router._retencionVigente            = _retencionVigente;

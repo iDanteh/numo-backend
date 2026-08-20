@@ -6,6 +6,7 @@ const { authenticate, permit }    = require('../../shared/middleware/auth.real')
 const { asyncHandler }            = require('../../shared/middleware/error-handler');
 const { verifyKoreApiKey }        = require('../../../shared/middleware/kore-api-key-auth');
 const service                     = require('./collection-request.service');
+const indicadoresService          = require('./collection-request-indicadores.service');
 
 const router = express.Router();
 
@@ -75,6 +76,15 @@ router.get('/stats', authenticate, permit('collections:read'), asyncHandler(asyn
 // solicitudes del usuario autenticado (rol tienda en "mis solicitudes").
 router.get('/mias/stats', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
   res.json(await service.statsMine(req.user._id));
+}));
+
+// GET /api/collection-requests/indicadores — tiempo de identificación ACOTADO a
+// Solicitudes de Cobro (total + fase banco/Kore + fase contador), siempre de
+// TODO el equipo — ver collection-request-indicadores.service.js para el
+// criterio completo. Debe ir antes de /:id.
+router.get('/indicadores', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  const { year, month } = req.query;
+  res.json(await indicadoresService.getIndicadoresSolicitudesCobro({ year, month }));
 }));
 
 // GET /api/collection-requests/report — reporte Excel de TODAS las solicitudes

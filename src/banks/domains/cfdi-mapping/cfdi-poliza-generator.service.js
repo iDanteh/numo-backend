@@ -739,6 +739,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // Hidalgo 11-ago). La porción "saldo a favor" del texto de la
           // forma de pago se sigue filtrando abajo igual que en cualquier
           // otro origen — solo se deja pasar la porción de dinero real.
+        } else if (origen === 'MIS') {
+          // 'MIS' (2026-08-20, confirmado con el usuario contra el "Reporte
+          // de Movimientos en Cajas" real de Hidalgo/B0 11-ago): es "VENTA
+          // MISCELANEA" (ej. "TIENDITA TYC" — venta de refresco/artículos
+          // varios en la caja), NO una venta sin facturar como se asumió
+          // inicialmente — el reporte oficial del ERP SÍ la suma dentro del
+          // total de Efectivo de "ventas" ($633.11 confirmado exacto contra
+          // el reporte). Siempre 100% dinero real (nunca mezclado con saldo
+          // a favor en los casos observados), así que se acepta igual que
+          // ABO/CBT/CPF/CFC.
         } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }
@@ -915,10 +925,11 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         }
         if (centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
-        // 'APS' se acepta aquí igual que arriba (ver comentario 2026-08-20 en
-        // el loop de `desglosePagoReal`) — es un cobro real mixto (dinero
-        // real + saldo a favor), no un espejo como 'APA'.
-        if (origen !== 'APS' && !SERIES_CON_AUTH.includes(origen)) continue;
+        // 'APS'/'MIS' se aceptan aquí igual que arriba (ver comentarios
+        // 2026-08-20 en el loop de `desglosePagoReal`) — dinero real
+        // (mixto con SF en el caso de APS, venta miscelánea en el caso de
+        // MIS), a diferencia de 'APA' que es solo un espejo.
+        if (origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
         for (const fp of (cobro.formasPago ?? [])) {
           if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
           const monto = (cobro.formasPago.length === 1 && cobro.monto != null)

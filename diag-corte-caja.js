@@ -33,7 +33,7 @@ async function main() {
       if (diaCobro !== FECHA) continue;
 
       const origen = (cobro.serieOrigen ?? '').toUpperCase();
-      if (origen !== 'CBT' && origen !== 'APS' && !SERIES_CON_AUTH.includes(origen)) continue;
+      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
 
       const dedupeKey = `${cobro.serieOrigen}|${cobro.folioOrigen}|${cuenta.serieVenta}|${cuenta.folioVenta}`;
       if (vistos.has(dedupeKey)) continue;

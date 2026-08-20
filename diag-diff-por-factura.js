@@ -108,6 +108,37 @@ async function main() {
   const movsReales = movsTodas.filter(m => m.polizaId === polizaMasReciente?.id);
   console.log('Movimientos reales (solo poliza mas reciente):', movsReales.length);
 
+  // Desglose por tipoOrigen -- para ver que categorias, aunque posteen a
+  // Caja, se extraen del consolidado "Depositos consolidados (Efectivo)"
+  // para mostrarse como fila aparte.
+  const porTipoOrigen = new Map();
+  for (const m of movsReales) {
+    const tag = m.tipoOrigen ?? '(sin tipoOrigen / default)';
+    const neto = Number(m.debe || 0) - Number(m.haber || 0);
+    porTipoOrigen.set(tag, (porTipoOrigen.get(tag) ?? 0) + neto);
+  }
+  console.log('\nDesglose por tipoOrigen (dentro de mis 116 uuids, poliza mas reciente):');
+  for (const [tag, monto] of porTipoOrigen) console.log(`  ${tag}: ${monto.toFixed(2)}`);
+
+  // TODOS los movimientos de Caja de esta poliza (sin filtrar por uuid) --
+  // para ver el total real de la cuenta y comparar contra el consolidado
+  // mostrado ($219,089.06) y contra la suma de solo mis 116 uuids.
+  const movsCajaTodaLaPoliza = await PolizaMovimiento.findAll({
+    where: { polizaId: polizaMasReciente?.id, cuentaId: cajaId },
+    attributes: ['cfdiUuid', 'debe', 'haber', 'tipoOrigen'],
+    raw: true,
+  });
+  const totalCajaPoliza = movsCajaTodaLaPoliza.reduce((s, m) => s + Number(m.debe || 0) - Number(m.haber || 0), 0);
+  console.log('\nTotal Caja de TODA la poliza (todos los uuids, incluyendo fuera de mis 116):', totalCajaPoliza.toFixed(2));
+  const porTipoOrigenTodaPoliza = new Map();
+  for (const m of movsCajaTodaLaPoliza) {
+    const tag = m.tipoOrigen ?? '(sin tipoOrigen / default)';
+    const neto = Number(m.debe || 0) - Number(m.haber || 0);
+    porTipoOrigenTodaPoliza.set(tag, (porTipoOrigenTodaPoliza.get(tag) ?? 0) + neto);
+  }
+  console.log('\nDesglose por tipoOrigen (TODA la poliza, cuenta Caja):');
+  for (const [tag, monto] of porTipoOrigenTodaPoliza) console.log(`  ${tag}: ${monto.toFixed(2)}`);
+
   const realPorUuid = new Map();
   for (const m of movsReales) {
     const u = (m.cfdiUuid || '').toUpperCase();

@@ -1923,21 +1923,54 @@ function bloquesAjustesContado(movs) {
 // no cambian, siguen dentro de `ventas` igual que siempre.
 function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null } = {}) {
   // Cancelación/Devolución en EFECTIVO (2026-08-20, confirmado con el
-  // usuario): el CARGO de estas líneas es dinero real de caja y debe sumarse
-  // a "Depósitos consolidados (Efectivo)" en vez de mostrarse en su propia
-  // línea — a diferencia de Tarjeta/Transferencia, que conservan el
-  // tratamiento anterior (línea individual, fuera del consolidado). El ABONO
-  // (haber) de estas mismas líneas NO se toca — sigue su camino normal
-  // (`bloquesAjustesContado`), solo se mueve el lado del cargo.
-  const esDevolucionOCancelacionEfectivoDebe = (m) => {
+  // usuario): el NETO (cargo − abono) de estas líneas es dinero real de caja
+  // y debe sumarse a "Depósitos consolidados (Efectivo)" — a diferencia de
+  // Tarjeta/Transferencia, que conservan el tratamiento anterior (línea
+  // individual, fuera del consolidado).
+  //
+  // No basta con mover las líneas de cargo/abono crudas a `contadoNormal`:
+  // (a) `consolidarCargos` vuelve a detectar la categoría internamente
+  // (línea ~1190, mismo `categorizarAjusteContado`) y las separaría otra vez
+  // sin importar este filtro, y (b) su acumulador genérico solo suma `debe`
+  // (`g.debe += Number(m.debe)`) — una línea de abono puro (debe=0) aportaría
+  // $0 en vez de restar, perdiendo el monto en silencio. Se calcula el NETO
+  // aquí y se inyecta como UNA sola línea de ajuste sintética (mismo patrón
+  // ya usado y verificado para SF-RETIRO-EFECTIVO: `debe` puede ser
+  // negativo) con un `tipoOrigen` que `categorizarAjusteContado` no
+  // reconoce, así no cae otra vez en el bloque de ajustes.
+  const esDevolucionOCancelacionEfectivo = (m) => {
     const plano = m.get ? m.get({ plain: true }) : m;
-    return Number(plano.debe) > 0 && !(Number(plano.haber) > 0)
-      && (plano.formaPago ?? '').trim() === '01'
-      && categorizarAjusteContado(plano) === 'devolucion';
+    return (plano.formaPago ?? '').trim() === '01' && categorizarAjusteContado(plano) === 'devolucion';
   };
 
-  const contadoAjuste = contado.filter(m => esAjusteContadoMov(m) && !esDevolucionOCancelacionEfectivoDebe(m));
-  const contadoNormal = contado.filter(m => !esAjusteContadoMov(m) || esDevolucionOCancelacionEfectivoDebe(m));
+  const contado_ = contado.map(m => (m.get ? m.get({ plain: true }) : m));
+  const lineasDevCancEfectivo = contado_.filter(esDevolucionOCancelacionEfectivo);
+  const netoDevCancEfectivo = Math.round(
+    lineasDevCancEfectivo.reduce((s, m) => s + (Number(m.debe) || 0) - (Number(m.haber) || 0), 0) * 100,
+  ) / 100;
+
+  const contadoAjuste = contado_.filter(m => esAjusteContadoMov(m) && !esDevolucionOCancelacionEfectivo(m));
+  const contadoNormal = contado_.filter(m => !esAjusteContadoMov(m));
+  if (lineasDevCancEfectivo.length && Math.abs(netoDevCancEfectivo) > 0.001) {
+    const base = lineasDevCancEfectivo[0];
+    contadoNormal.push({
+      ...base,
+      debe: netoDevCancEfectivo,
+      haber: 0,
+      cfdiUuid: null,
+      serie: null,
+      serieVentaTicket: null,
+      folioVentaTicket: null,
+      tipoOrigen: 'Ajuste Consolidado Contado',
+      // OJO: `categorizarAjusteContado`/`esDevolucionOCancelacion` también
+      // matchea por TEXTO en `concepto` (no solo `tipoOrigen`) — el concepto
+      // de esta línea sintética NO debe contener "devolución"/"cancelación",
+      // o `consolidarCargos` la volvería a clasificar como ajuste y la
+      // separaría otra vez del consolidado (justo lo que se quiere evitar).
+      reglaNombre: 'AJUSTE-CONSOLIDADO-EFECTIVO',
+      concepto: 'Ajuste consolidado de caja (Efectivo)',
+    });
+  }
 
   const ajustes = bloquesAjustesContado(contadoAjuste);
   const bloquesDeCategorias = (...categorias) =>

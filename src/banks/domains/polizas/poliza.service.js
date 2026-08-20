@@ -1691,8 +1691,10 @@ function _extraerCobrosSucursal(movimientos) {
     // que también debe sumarse a "Depósitos consolidados (Efectivo)" en vez
     // de solo mostrarse en "Cobro de otra sucursal". Tarjeta/Transferencia
     // conservan el tratamiento anterior (solo línea individual).
+    // "Efectivo" por la cuenta ya asignada (Caja), no por el campo
+    // `formaPago` — mismo criterio/motivo que en `armarBloqueContado`.
     if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
-        && (m.formaPago ?? '').trim() === '01') {
+        && m.cuenta?.codigo === '1101010003') {
       resto.push(m);
       continue;
     }
@@ -1938,9 +1940,16 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   // ya usado y verificado para SF-RETIRO-EFECTIVO: `debe` puede ser
   // negativo) con un `tipoOrigen` que `categorizarAjusteContado` no
   // reconoce, así no cae otra vez en el bloque de ajustes.
+  // "Efectivo" se determina por la CUENTA ya asignada (1101010003, Caja por
+  // identificar), no por el campo `formaPago` de la línea — confirmado con
+  // datos reales 2026-08-20: la regla "TO-CAN-16" (sin sufijo "-EF") también
+  // postea a Caja, pero su `formaPago` no siempre viene poblado como '01'.
+  // Si ya está en la cuenta de Caja, es efectivo por definición, sin importar
+  // ese campo.
+  const CODIGO_CUENTA_CAJA_LOCAL = '1101010003';
   const esDevolucionOCancelacionEfectivo = (m) => {
     const plano = m.get ? m.get({ plain: true }) : m;
-    return (plano.formaPago ?? '').trim() === '01' && categorizarAjusteContado(plano) === 'devolucion';
+    return plano.cuenta?.codigo === CODIGO_CUENTA_CAJA_LOCAL && categorizarAjusteContado(plano) === 'devolucion';
   };
 
   const contado_ = contado.map(m => (m.get ? m.get({ plain: true }) : m));

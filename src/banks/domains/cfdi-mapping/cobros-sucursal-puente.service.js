@@ -270,7 +270,12 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
   for (const cuenta of cuentasEscaneadas) {
     if (cuenta.serieFactura && cuenta.folioFactura) continue; // ya tiene factura — no es un pendiente
     for (const cobro of (cuenta.cobros ?? [])) {
-      if (!SERIES_CON_AUTH.includes((cobro.serieOrigen ?? '').toUpperCase())) continue;
+      const origenPend = (cobro.serieOrigen ?? '').toUpperCase();
+      // 'APS'/'MIS' se aceptan igual que en cfdi-poliza-generator.service.js
+      // (2026-08-20, confirmado contra el Reporte de Movimientos en Cajas
+      // real de Hidalgo/B0) — dinero real (pago mixto con SF, o venta
+      // miscelánea), no espejos como 'APA'.
+      if (origenPend !== 'APS' && origenPend !== 'MIS' && !SERIES_CON_AUTH.includes(origenPend)) continue;
       const fechaCobro = cobro.fecha ? new Date(cobro.fecha) : null;
       if (!fechaCobro || fechaCobro < fechaDesde || fechaCobro > fechaHasta) continue;
       pendientes.push({
@@ -864,7 +869,12 @@ async function construirMovimientosPuente({
       // 'ABO' — descartaba cobros reales tipo 'CPF' (confirmado con el usuario
       // 2026-08-03, I0-260700183: su cobro CPF-260701517 nunca entraba a la
       // póliza).
-      if (!SERIES_CON_AUTH.includes((cobro.serieOrigen ?? '').toUpperCase())) continue;
+      const origenPuente = (cobro.serieOrigen ?? '').toUpperCase();
+      // 'APS'/'MIS' se aceptan igual que en cfdi-poliza-generator.service.js
+      // (2026-08-20, confirmado contra el Reporte de Movimientos en Cajas
+      // real de Hidalgo/B0 11-ago) — dinero real (pago mixto con SF, o
+      // venta miscelánea), a diferencia de 'APA' que es solo un espejo.
+      if (origenPuente !== 'APS' && origenPuente !== 'MIS' && !SERIES_CON_AUTH.includes(origenPuente)) continue;
 
       // Filtro por día real del cobro (ver comentario en la firma de la función).
       if (fechaDesde && fechaHasta) {

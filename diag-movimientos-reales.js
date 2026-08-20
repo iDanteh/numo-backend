@@ -11,14 +11,17 @@ async function main() {
   const [polizas] = await sequelize.query(`
     SELECT p.id, p.fecha, p.estado, p.created_at, p.centro_costo
     FROM polizas p
-    WHERE p.fecha = :fecha AND p.centro_costo = :centro
+    WHERE p.fecha = :fecha
     ORDER BY p.id DESC
-    LIMIT 5
-  `, { replacements: { fecha: FECHA, centro: CENTRO_CLAVE } });
-  console.log('Polizas encontradas:', JSON.stringify(polizas, null, 2));
+    LIMIT 10
+  `, { replacements: { fecha: FECHA } });
+  console.log('Polizas encontradas (todas las de esa fecha):', JSON.stringify(polizas, null, 2));
   if (!polizas.length) { console.log('NO SE ENCONTRO POLIZA'); process.exit(0); }
 
-  const idPoliza = polizas[0].id;
+  const match = polizas.find(p => (p.centro_costo ?? '').toUpperCase().includes(CENTRO_CLAVE.toUpperCase())
+    || (p.centro_costo ?? '').toUpperCase().includes('HIDALGO')) ?? polizas[0];
+  console.log('\nPoliza seleccionada:', JSON.stringify(match));
+  const idPoliza = match.id;
 
   const [cuentas] = await sequelize.query(`
     SELECT id, codigo, nombre FROM account_plans WHERE codigo IN ('1101010003', '1102011005')

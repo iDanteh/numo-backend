@@ -1118,6 +1118,15 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
 // (confirmado: "solo restarlo", sin desglose).
 const TIPO_ORIGEN_AJUSTE_CONSOLIDADO_SF = 'Ajuste Consolidado SF';
 
+// Movimientos de cobro real sin CFDI "normal" detrás — inyectados directo al
+// consolidado de Efectivo/Tarjeta por cfdi-poliza-generator.service.js (ver
+// `_cfdisCanceladasSinCompensar`/`_cobrosSinFacturaPorCentro`) — marcados por
+// `reglaNombre` para poder anotarlos en la hoja "Desglose Consolidado".
+const NOTA_AJUSTE_SIN_CFDI = {
+  'FACTURA-CANCELADA-COBRO-REAL': 'CANCELADA (cobro real, sin efecto fiscal)',
+  'COBRO-SIN-FACTURA':            'SIN FACTURA (cobro real, sin CFDI asociado)',
+};
+
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
@@ -1135,12 +1144,13 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // duplicaría el depósito. Se omite por completo; su abono (Ingreso+IVA)
     // sigue su camino normal (bloquesAbonosNormales), sin tocar.
     if (/refacturaci[oó]n/i.test(m.tipoOrigen || '')) continue;
-    // Factura cancelada en SAT sin NC/sustituto pero con cobro real (ver
-    // `_cfdisCanceladasSinCompensar`/nuevo bloque en cfdi-poliza-generator.
-    // service.js) — se funde en el mismo consolidado de Efectivo/Tarjeta,
-    // pero debe quedar marcada en la hoja "Desglose Consolidado" (confirmado
-    // con el usuario 2026-08-20, caso real B0-260801159).
-    const esCanceladaConCobroReal = m.reglaNombre === 'FACTURA-CANCELADA-COBRO-REAL';
+    // Ajustes de cobro real sin CFDI "normal" detrás (factura cancelada sin
+    // NC/sustituto, o cobro sin ninguna factura — ver `_cfdisCanceladasSinCompensar`/
+    // `_cobrosSinFacturaPorCentro` en cfdi-poliza-generator.service.js): se
+    // funden en el mismo consolidado de Efectivo/Tarjeta, pero deben quedar
+    // marcados en la hoja "Desglose Consolidado" (confirmado con el usuario
+    // 2026-08-20, casos reales B0-260801159 y B0 11-ago $759.59 sin factura).
+    const notaAjusteSinCfdi = NOTA_AJUSTE_SIN_CFDI[m.reglaNombre] ?? null;
     const centroCosto = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
     // Ticket real (serieVentaTicket/folioVentaTicket) en vez de `m.serie`
     // (la Factura, que en una Global es la misma para decenas de tickets) —
@@ -1242,7 +1252,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, cancelada: esCanceladaConCobroReal });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaAjusteSinCfdi });
       continue;
     }
 
@@ -1288,7 +1298,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', cancelada: esCanceladaConCobroReal });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', nota: notaAjusteSinCfdi });
       continue;
     }
 
@@ -1307,7 +1317,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // Se guarda qué CFDI aportó cada monto — no va en la póliza de CONTPAQ
     // (esa línea sigue sin serie/folio, sigue siendo un total agregado), pero
     // permite armar la hoja de desglose para poder rastrear el detalle.
-    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, cancelada: esCanceladaConCobroReal });
+    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, nota: notaAjusteSinCfdi });
   }
 
   // Efectivo → Tarjeta → resto, siempre en ese orden dentro de los cargos
@@ -2460,7 +2470,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
             cfdiSerie:        d.serie || '',
             cliente:          nombresClientes.get((d.cfdiUuid || '').toUpperCase()) || '',
             monto:            d.monto,
-            nota:             d.cancelada ? 'CANCELADA (cobro real, sin efecto fiscal)' : '',
+            nota:             d.nota || '',
           });
         }
       }

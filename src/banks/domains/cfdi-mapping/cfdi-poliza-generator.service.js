@@ -1571,6 +1571,63 @@ async function _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorF
   return candidatas.filter(c => !uuidsConNC.has(c.uuid.toUpperCase()));
 }
 
+// Cobros reales (Efectivo/Tarjeta/etc., origen reconocido) de cuentas SIN
+// ninguna factura asociada (ni Global ni individual) — dinero real cobrado
+// en cajas que el pipeline CFDI-driven no puede representar porque no existe
+// ningún CFDI al cual atarlo (confirmado con el usuario 2026-08-20, caso real
+// B0 11-ago $759.59). Mismo criterio de reconocimiento/dedupe/filtrado que
+// `_prefetchAjustesFacturaPropia` (CBT/APS/MIS/SERIES_CON_AUTH, excluye texto
+// Puntos/Saldo a Favor, usa `cobro.monto` cuando solo hay una formaPago).
+// Devuelve Map<claveSat, monto> para inyectar como línea aparte (sin CFDI).
+async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }) {
+  const porClave = new Map();
+  if (!centro || !fechaInicio || !fechaFin) return porClave;
+
+  let resultado = [];
+  try {
+    resultado = await obtenerDesglosesCobroAlmacenPorCentro({
+      rfc, centro,
+      fechaDesde: new Date(`${fechaInicio}T00:00:00-06:00`).toISOString(),
+      fechaHasta: new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString(),
+    });
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn(`[CobrosSinFactura] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
+    return porClave;
+  }
+
+  const vistos = new Set();
+  for (const cuenta of resultado) {
+    if (cuenta.serieFactura && cuenta.folioFactura) continue; // SÍ tiene factura -- no es el caso que buscamos
+    for (const cobro of (cuenta.cobros ?? [])) {
+      if (cobro.claveCentro !== centro) continue;
+      const fechaCobroMx = new Date(cobro.fecha);
+      fechaCobroMx.setHours(fechaCobroMx.getHours() - 6);
+      const diaCobro = fechaCobroMx.toISOString().slice(0, 10);
+      if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
+
+      const origen = (cobro.serieOrigen ?? '').toUpperCase();
+      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
+
+      const dedupeKey = `${cobro.serieOrigen}|${cobro.folioOrigen}|${cuenta.serieVenta}|${cuenta.folioVenta}`;
+      if (vistos.has(dedupeKey)) continue;
+      vistos.add(dedupeKey);
+
+      const formasPago = cobro.formasPago ?? [];
+      for (const fp of formasPago) {
+        if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+        const monto = (formasPago.length === 1 && cobro.monto != null)
+          ? Math.abs(Number(cobro.monto) || 0)
+          : (Number(fp.monto) || 0);
+        const clave = (fp.claveSat ?? '').trim();
+        if (!clave || monto <= 0) continue;
+        porClave.set(clave, Math.round(((porClave.get(clave) ?? 0) + monto) * 100) / 100);
+      }
+    }
+  }
+  return porClave;
+}
+
 function _fmtDMY(fechaISO) {
   const [y, m, d] = fechaISO.split('-');
   return `${d}/${m}/${y}`;
@@ -2856,6 +2913,34 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
   }
 
+  // Cobros reales (Efectivo/Tarjeta) de tickets SIN ninguna factura (ni
+  // Global ni individual) — dinero real que el pipeline CFDI-driven no puede
+  // representar porque no hay ningún CFDI al cual atarlo (ver
+  // `_cobrosSinFacturaPorCentro`). Se inyecta como línea aparte (cfdiUuid:
+  // null, mismo patrón que SF-RETIRO-EFECTIVO), sin Abono/IVA — confirmado
+  // con el usuario 2026-08-20, caso real B0 11-ago $759.59.
+  if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin) {
+    const cobrosSinFacturaProp = await _cobrosSinFacturaPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
+    const ccSinFacturaProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+    for (const [claveSatSF, montoSF] of cobrosSinFacturaProp) {
+      const cuentaDestinoSF = claveSatSF === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      if (!cuentaDestinoSF || montoSF <= 0) continue;
+      movimientosResult.push({
+        concepto:      'Cobros sin factura',
+        serie:         null,
+        centroCosto:   ccSinFacturaProp?.clave ?? null,
+        centroCostoId: ccSinFacturaProp?.id    ?? null,
+        cfdiUuid:      null,
+        cuentaId:      cuentaDestinoSF,
+        debe:          montoSF,
+        haber:         0,
+        tipoOrigen:    'Venta',
+        reglaNombre:   'COBRO-SIN-FACTURA',
+        formaPago:     claveSatSF,
+      });
+    }
+  }
+
   // Puntos/Club Tuberos usados en el batch: UNA sola línea consolidada por
   // sucursal (no individual, a diferencia de Saldo a Favor — confirmado con
   // el usuario 2026-08-06, revirtió su decisión anterior sobre Puntos),
@@ -3967,6 +4052,29 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           uuid: cfdiCanceladaGuard.uuid, tipo: cfdiCanceladaGuard.tipoDeComprobante, emisor: cfdiCanceladaGuard.emisor?.rfc,
           total: cfdiCanceladaGuard.total, fecha: cfdiCanceladaGuard.fecha, sinRegla: false, comparisonStatus: null,
         },
+      });
+    }
+  }
+
+  // Cobros sin factura — ver comentario equivalente en generarPropuesta.
+  if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin) {
+    const cobrosSinFacturaGuard = await _cobrosSinFacturaPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
+    const ccSinFacturaGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
+    for (const [claveSatSFG, montoSFG] of cobrosSinFacturaGuard) {
+      const cuentaDestinoSFG = claveSatSFG === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      if (!cuentaDestinoSFG || montoSFG <= 0) continue;
+      todosLosMovimientos.push({
+        concepto:      'Cobros sin factura',
+        serie:         null,
+        centroCosto:   ccSinFacturaGuard?.clave ?? null,
+        centroCostoId: ccSinFacturaGuard?.id    ?? null,
+        cfdiUuid:      null,
+        cuentaId:      cuentaDestinoSFG,
+        debe:          montoSFG,
+        haber:         0,
+        tipoOrigen:    'Venta',
+        reglaNombre:   'COBRO-SIN-FACTURA',
+        formaPago:     claveSatSFG,
       });
     }
   }

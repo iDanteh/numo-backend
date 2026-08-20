@@ -18,16 +18,23 @@ async function main() {
   // Buscar SIN filtrar por poliza (puede que se hayan regenerado otras
   // sucursales despues de Hidalgo/B0) -- el monto exacto es suficientemente
   // especifico para encontrarlo entre todas las polizas recientes.
+  // OJO: en el layout M1, la columna D es CARGO y la E es ABONO -- la linea
+  // pegada por el usuario ("... 0 618.81 0 0 ...") trae 0 en cargo y 618.81
+  // en abono, asi que puede ser un HABER, no un DEBE. Tambien buscamos por
+  // concepto = "B0-260801859" (columna H, ese es el concepto real del M1,
+  // no la regla).
   const movs = await PolizaMovimiento.findAll({
     where: {
-      reglaNombre: { [Op.like]: '%COS%' },
-      debe: MONTO,
+      [Op.or]: [
+        { reglaNombre: { [Op.like]: '%COS%' }, [Op.or]: [{ debe: MONTO }, { haber: MONTO }] },
+        { concepto: { [Op.like]: `%${SERIEFOLIO}%` } },
+      ],
     },
     attributes: ['id', 'polizaId', 'cuentaId', 'debe', 'haber', 'tipoOrigen', 'reglaNombre', 'concepto', 'serie', 'cfdiUuid', 'formaPago', 'centroCosto'],
     raw: true,
     limit: 20,
   });
-  console.log(`\nMovimientos con reglaNombre LIKE '%COS%' y debe=${MONTO} (todas las polizas):`, movs.length);
+  console.log(`\nMovimientos con reglaNombre LIKE '%COS%' (debe o haber=${MONTO}) O concepto LIKE '%${SERIEFOLIO}%' (todas las polizas):`, movs.length);
   for (const m of movs) console.log(JSON.stringify(m, null, 2));
 
   if (movs.length) {
@@ -45,8 +52,12 @@ async function main() {
     for (const m of todosCos) console.log(JSON.stringify(m));
   } else {
     console.log('\nNo se encontro ningun movimiento con ese monto exacto -- puede que el monto tenga mas decimales o el nombre de regla sea distinto. Buscando variantes cercanas...');
+    const rango = [Number(MONTO) - 0.02, Number(MONTO) + 0.02];
     const cercanos = await PolizaMovimiento.findAll({
-      where: { reglaNombre: { [Op.like]: '%COS%' }, debe: { [Op.between]: [Number(MONTO) - 0.02, Number(MONTO) + 0.02] } },
+      where: {
+        reglaNombre: { [Op.like]: '%COS%' },
+        [Op.or]: [{ debe: { [Op.between]: rango } }, { haber: { [Op.between]: rango } }],
+      },
       attributes: ['polizaId', 'debe', 'haber', 'tipoOrigen', 'reglaNombre', 'concepto', 'serie', 'cfdiUuid', 'formaPago'],
       raw: true,
     });

@@ -1135,6 +1135,12 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // duplicaría el depósito. Se omite por completo; su abono (Ingreso+IVA)
     // sigue su camino normal (bloquesAbonosNormales), sin tocar.
     if (/refacturaci[oó]n/i.test(m.tipoOrigen || '')) continue;
+    // Factura cancelada en SAT sin NC/sustituto pero con cobro real (ver
+    // `_cfdisCanceladasSinCompensar`/nuevo bloque en cfdi-poliza-generator.
+    // service.js) — se funde en el mismo consolidado de Efectivo/Tarjeta,
+    // pero debe quedar marcada en la hoja "Desglose Consolidado" (confirmado
+    // con el usuario 2026-08-20, caso real B0-260801159).
+    const esCanceladaConCobroReal = m.reglaNombre === 'FACTURA-CANCELADA-COBRO-REAL';
     const centroCosto = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
     // Ticket real (serieVentaTicket/folioVentaTicket) en vez de `m.serie`
     // (la Factura, que en una Global es la misma para decenas de tickets) —
@@ -1236,7 +1242,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, cancelada: esCanceladaConCobroReal });
       continue;
     }
 
@@ -1282,7 +1288,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA' });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', cancelada: esCanceladaConCobroReal });
       continue;
     }
 
@@ -1301,7 +1307,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // Se guarda qué CFDI aportó cada monto — no va en la póliza de CONTPAQ
     // (esa línea sigue sin serie/folio, sigue siendo un total agregado), pero
     // permite armar la hoja de desglose para poder rastrear el detalle.
-    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null });
+    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, cancelada: esCanceladaConCobroReal });
   }
 
   // Efectivo → Tarjeta → resto, siempre en ese orden dentro de los cargos
@@ -2454,6 +2460,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
             cfdiSerie:        d.serie || '',
             cliente:          nombresClientes.get((d.cfdiUuid || '').toUpperCase()) || '',
             monto:            d.monto,
+            nota:             d.cancelada ? 'CANCELADA (cobro real, sin efecto fiscal)' : '',
           });
         }
       }
@@ -2483,6 +2490,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       { header: 'CFDI (Serie-Folio)', key: 'cfdiSerie', width: 20 },
       { header: 'Cliente',       key: 'cliente',        width: 34 },
       { header: 'Monto',         key: 'monto',          width: 16 },
+      { header: 'Nota',          key: 'nota',           width: 34 },
     ];
     wsDesglose.getRow(1).font = { bold: true };
     wsDesglose.getRow(1).eachCell(cell => {

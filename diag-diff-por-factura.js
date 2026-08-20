@@ -9,6 +9,7 @@ const mappingSvc = require('./src/banks/domains/cfdi-mapping/cfdi-mapping.servic
 const CfdiMappingRule = require('./src/shared/models/postgres/CfdiMappingRule');
 const AccountPlan = require('./src/shared/models/postgres/AccountPlan');
 const PolizaMovimiento = require('./src/shared/models/postgres/PolizaMovimiento');
+const Poliza = require('./src/shared/models/postgres/Poliza');
 
 const CODIGOS_CUENTAS_CAJA_O_BANCO = new Set([
   '1101010003', '1102011005', '1102011001', '1102012001',
@@ -88,12 +89,24 @@ async function main() {
   const cajaRow = await AccountPlan.findOne({ where: { codigo: '1101010003' }, attributes: ['id'], raw: true });
   const cajaId = cajaRow?.id;
   const todosUuids = cfdisSat.map(c => c.uuid.toUpperCase());
-  const movsReales = await PolizaMovimiento.findAll({
+  const movsTodas = await PolizaMovimiento.findAll({
     where: { cfdiUuid: { [Op.in]: todosUuids }, cuentaId: cajaId },
     attributes: ['cfdiUuid', 'debe', 'haber', 'tipoOrigen', 'polizaId'],
     raw: true,
   });
-  console.log('Movimientos reales encontrados en Caja para estos uuids:', movsReales.length);
+  console.log('Movimientos totales en Caja para estos uuids (TODAS las polizas/regeneraciones):', movsTodas.length);
+
+  // Puede haber VARIAS polizas (regeneraciones repetidas durante esta
+  // sesion) con movimientos para los mismos uuids -- quedarse solo con la
+  // MAS RECIENTE (createdAt) para no sumar duplicados de corridas viejas.
+  const polizaIds = [...new Set(movsTodas.map(m => m.polizaId))];
+  const polizas = await Poliza.findAll({ where: { id: { [Op.in]: polizaIds } }, attributes: ['id', 'createdAt', 'estado'], raw: true });
+  console.log('\nPolizas distintas encontradas:', polizas.map(p => `id=${p.id} estado=${p.estado} createdAt=${p.createdAt}`).join(' | '));
+  const polizaMasReciente = polizas.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0];
+  console.log('Usando poliza mas reciente: id=', polizaMasReciente?.id);
+
+  const movsReales = movsTodas.filter(m => m.polizaId === polizaMasReciente?.id);
+  console.log('Movimientos reales (solo poliza mas reciente):', movsReales.length);
 
   const realPorUuid = new Map();
   for (const m of movsReales) {

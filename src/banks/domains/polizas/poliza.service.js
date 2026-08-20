@@ -1684,20 +1684,12 @@ function _extraerCobrosSucursal(movimientos) {
     // vienen correctos desde ahí — solo hace falta detectarlo por el código
     // de cuenta (mismo mapeo que `BANCO_A_CODIGO_CUENTA`) para no mostrarlo
     // con el prefijo "Cobro de otra sucursal -".
-    // Cobro Sucursal en EFECTIVO, lado COBRADORA (Cargo Caja sin su par
-    // Haber en la misma línea — el Haber va a la cuenta puente, cuenta
-    // distinta, así que no hay riesgo de romper el balance) — 2026-08-20,
-    // confirmado con el usuario: es dinero real físicamente cobrado aquí, así
-    // que también debe sumarse a "Depósitos consolidados (Efectivo)" en vez
-    // de solo mostrarse en "Cobro de otra sucursal". Tarjeta/Transferencia
-    // conservan el tratamiento anterior (solo línea individual).
-    // "Efectivo" por la cuenta ya asignada (Caja), no por el campo
-    // `formaPago` — mismo criterio/motivo que en `armarBloqueContado`.
-    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
-        && m.cuenta?.codigo === '1101010003') {
-      resto.push(m);
-      continue;
-    }
+    // REVERTIDO 2026-08-20: se intentó sumar "Cobro Sucursal" en Efectivo al
+    // consolidado, pero al cruzar contra el Reporte de Movimientos en Cajas
+    // real (Hidalgo/B0 11-ago) no aparece NINGÚN cobro de otra sucursal ese
+    // día (columna "Serie y Folio" siempre B0) — sin respaldo real, se revierte
+    // al tratamiento original: línea individual en "Cobro de otra sucursal",
+    // fuera del consolidado, sin importar la forma de pago.
     const esBancoReal = Object.values(BANCO_A_CODIGO_CUENTA).includes(m.cuenta?.codigo);
     filas.push({
       cuenta:      m.cuenta,
@@ -1924,62 +1916,18 @@ function bloquesAjustesContado(movs) {
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
 function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null } = {}) {
-  // Cancelación/Devolución en EFECTIVO (2026-08-20, confirmado con el
-  // usuario): el NETO (cargo − abono) de estas líneas es dinero real de caja
-  // y debe sumarse a "Depósitos consolidados (Efectivo)" — a diferencia de
-  // Tarjeta/Transferencia, que conservan el tratamiento anterior (línea
-  // individual, fuera del consolidado).
-  //
-  // No basta con mover las líneas de cargo/abono crudas a `contadoNormal`:
-  // (a) `consolidarCargos` vuelve a detectar la categoría internamente
-  // (línea ~1190, mismo `categorizarAjusteContado`) y las separaría otra vez
-  // sin importar este filtro, y (b) su acumulador genérico solo suma `debe`
-  // (`g.debe += Number(m.debe)`) — una línea de abono puro (debe=0) aportaría
-  // $0 en vez de restar, perdiendo el monto en silencio. Se calcula el NETO
-  // aquí y se inyecta como UNA sola línea de ajuste sintética (mismo patrón
-  // ya usado y verificado para SF-RETIRO-EFECTIVO: `debe` puede ser
-  // negativo) con un `tipoOrigen` que `categorizarAjusteContado` no
-  // reconoce, así no cae otra vez en el bloque de ajustes.
-  // "Efectivo" se determina por la CUENTA ya asignada (1101010003, Caja por
-  // identificar), no por el campo `formaPago` de la línea — confirmado con
-  // datos reales 2026-08-20: la regla "TO-CAN-16" (sin sufijo "-EF") también
-  // postea a Caja, pero su `formaPago` no siempre viene poblado como '01'.
-  // Si ya está en la cuenta de Caja, es efectivo por definición, sin importar
-  // ese campo.
-  const CODIGO_CUENTA_CAJA_LOCAL = '1101010003';
-  const esDevolucionOCancelacionEfectivo = (m) => {
-    const plano = m.get ? m.get({ plain: true }) : m;
-    return plano.cuenta?.codigo === CODIGO_CUENTA_CAJA_LOCAL && categorizarAjusteContado(plano) === 'devolucion';
-  };
-
-  const contado_ = contado.map(m => (m.get ? m.get({ plain: true }) : m));
-  const lineasDevCancEfectivo = contado_.filter(esDevolucionOCancelacionEfectivo);
-  const netoDevCancEfectivo = Math.round(
-    lineasDevCancEfectivo.reduce((s, m) => s + (Number(m.debe) || 0) - (Number(m.haber) || 0), 0) * 100,
-  ) / 100;
-
-  const contadoAjuste = contado_.filter(m => esAjusteContadoMov(m) && !esDevolucionOCancelacionEfectivo(m));
-  const contadoNormal = contado_.filter(m => !esAjusteContadoMov(m));
-  if (lineasDevCancEfectivo.length && Math.abs(netoDevCancEfectivo) > 0.001) {
-    const base = lineasDevCancEfectivo[0];
-    contadoNormal.push({
-      ...base,
-      debe: netoDevCancEfectivo,
-      haber: 0,
-      cfdiUuid: null,
-      serie: null,
-      serieVentaTicket: null,
-      folioVentaTicket: null,
-      tipoOrigen: 'Ajuste Consolidado Contado',
-      // OJO: `categorizarAjusteContado`/`esDevolucionOCancelacion` también
-      // matchea por TEXTO en `concepto` (no solo `tipoOrigen`) — el concepto
-      // de esta línea sintética NO debe contener "devolución"/"cancelación",
-      // o `consolidarCargos` la volvería a clasificar como ajuste y la
-      // separaría otra vez del consolidado (justo lo que se quiere evitar).
-      reglaNombre: 'AJUSTE-CONSOLIDADO-EFECTIVO',
-      concepto: 'Ajuste consolidado de caja (Efectivo)',
-    });
-  }
+  // REVERTIDO 2026-08-20: se intentó sumar Cancelación/Devolución en Efectivo
+  // al consolidado, pero al cruzar contra el "Reporte de Movimientos en
+  // Cajas" real (Hidalgo/B0 11-ago) se confirmó que NO hay ningún movimiento
+  // de caja real detrás de esos montos (~$24,136.86 netos) — el reporte solo
+  // trae UN retiro real por cancelación ($132.59, ya cubierto por
+  // SF-RETIRO-EFECTIVO). "TO-CAN-16"/"TO-DEV-16-EF" son reclasificaciones
+  // contables de CFDI cancelado, no efectivo físico — sumarlas inflaba el
+  // consolidado sin respaldo real. Cancelación/Devolución vuelven a su
+  // tratamiento original: línea individual, fuera del consolidado, sin
+  // importar la forma de pago.
+  const contadoAjuste = contado.filter(esAjusteContadoMov);
+  const contadoNormal = contado.filter(m => !esAjusteContadoMov(m));
 
   const ajustes = bloquesAjustesContado(contadoAjuste);
   const bloquesDeCategorias = (...categorias) =>

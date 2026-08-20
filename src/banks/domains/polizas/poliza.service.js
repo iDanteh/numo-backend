@@ -1684,6 +1684,18 @@ function _extraerCobrosSucursal(movimientos) {
     // vienen correctos desde ahí — solo hace falta detectarlo por el código
     // de cuenta (mismo mapeo que `BANCO_A_CODIGO_CUENTA`) para no mostrarlo
     // con el prefijo "Cobro de otra sucursal -".
+    // Cobro Sucursal en EFECTIVO, lado COBRADORA (Cargo Caja sin su par
+    // Haber en la misma línea — el Haber va a la cuenta puente, cuenta
+    // distinta, así que no hay riesgo de romper el balance) — 2026-08-20,
+    // confirmado con el usuario: es dinero real físicamente cobrado aquí, así
+    // que también debe sumarse a "Depósitos consolidados (Efectivo)" en vez
+    // de solo mostrarse en "Cobro de otra sucursal". Tarjeta/Transferencia
+    // conservan el tratamiento anterior (solo línea individual).
+    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
+        && (m.formaPago ?? '').trim() === '01') {
+      resto.push(m);
+      continue;
+    }
     const esBancoReal = Object.values(BANCO_A_CODIGO_CUENTA).includes(m.cuenta?.codigo);
     filas.push({
       cuenta:      m.cuenta,
@@ -1910,8 +1922,22 @@ function bloquesAjustesContado(movs) {
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
 function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null } = {}) {
-  const contadoAjuste = contado.filter(esAjusteContadoMov);
-  const contadoNormal = contado.filter(m => !esAjusteContadoMov(m));
+  // Cancelación/Devolución en EFECTIVO (2026-08-20, confirmado con el
+  // usuario): el CARGO de estas líneas es dinero real de caja y debe sumarse
+  // a "Depósitos consolidados (Efectivo)" en vez de mostrarse en su propia
+  // línea — a diferencia de Tarjeta/Transferencia, que conservan el
+  // tratamiento anterior (línea individual, fuera del consolidado). El ABONO
+  // (haber) de estas mismas líneas NO se toca — sigue su camino normal
+  // (`bloquesAjustesContado`), solo se mueve el lado del cargo.
+  const esDevolucionOCancelacionEfectivoDebe = (m) => {
+    const plano = m.get ? m.get({ plain: true }) : m;
+    return Number(plano.debe) > 0 && !(Number(plano.haber) > 0)
+      && (plano.formaPago ?? '').trim() === '01'
+      && categorizarAjusteContado(plano) === 'devolucion';
+  };
+
+  const contadoAjuste = contado.filter(m => esAjusteContadoMov(m) && !esDevolucionOCancelacionEfectivoDebe(m));
+  const contadoNormal = contado.filter(m => !esAjusteContadoMov(m) || esDevolucionOCancelacionEfectivoDebe(m));
 
   const ajustes = bloquesAjustesContado(contadoAjuste);
   const bloquesDeCategorias = (...categorias) =>

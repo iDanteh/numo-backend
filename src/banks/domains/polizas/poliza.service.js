@@ -1559,6 +1559,19 @@ const TIPO_ORIGEN_PENDIENTE_PROPIO = 'Pendiente Propio';
 // tipoOrigen DISTINTO para no confundirse con un cruce real de sucursal en
 // `_uuidsConCargoCubiertoEnBD` (cfdi-poliza-generator.service.js).
 const TIPO_ORIGEN_CARGO_ESPECIAL = 'Cargo Especial';
+// Etiqueta para `tipoOrigen: 'Venta Sin Cobro'` (excedente de una factura sin
+// forma de pago real que lo respalde, ver `esCasoAjusteSFPuntos`/
+// `esCasoNormalParaSplit` en cfdi-mapping.service.js) — bug encontrado
+// 2026-08-20 (caso real Hidalgo/B0, factura E48070D3, $618.81): esta línea se
+// trataba igual que 'Cobro Sucursal' y salía con el prefijo "COS-" (Cobro de
+// OTRA sucursal), una etiqueta falsa — no hay cruce de sucursal aquí, solo un
+// cobro real que el desglose de cajas no pudo emparejar dentro de su ventana
+// de búsqueda (puede ser de días anteriores en la MISMA sucursal, o
+// directamente sin ticket real detrás, ver comentario en cfdi-mapping.service.js).
+// Se mantiene aparte del consolidado (mismo tratamiento que COS), pero con
+// etiqueta propia — confirmado con el usuario 2026-08-21, opción (b) de las
+// 3 presentadas.
+const ETIQUETA_VENTA_SIN_COBRO = 'SIN-COBRO';
 
 // Reglas ('Cargo Especial') que se mezclan con Ventas normales por su propio
 // serie/folio en vez de ir a una sección aparte — OPA (anticipo sin NC,
@@ -1575,6 +1588,12 @@ const REGLAS_MEZCLADAS_CON_VENTAS = new Set(['OPA']);
 // real (las liquidaciones de terminal llegan en lote, no por venta),
 // confirmado con el usuario.
 function _categoriaCobroSucursal(f) {
+  // 'Venta Sin Cobro' NO trae una forma de pago real en `_formaPagoLabel`
+  // (hereda el nombre completo de la regla fiscal, ej. "Reg 1C — Venta PUE
+  // Cheque 16%") — sin este corte temprano, el `.includes('CHEQUE')` de abajo
+  // hace match por accidente contra ese texto y la ordena como si fuera un
+  // cobro real en Cheque. Va siempre al final, categoría propia.
+  if (f._esVentaSinCobro) return 6;
   if (f._referenciaBancoReal) return 1;
   const label = (f._formaPagoLabel ?? '').toUpperCase();
   if (label === ETIQUETA_SALDO_FAVOR)   return 2;
@@ -1734,6 +1753,11 @@ function _extraerCobrosSucursal(movimientos) {
       _formaPagoLabel: m.reglaNombre || null,
       _referenciaBancoReal: esBancoReal ? (m.reglaNombre || null) : null,
       _esPendientePropio: m.tipoOrigen === TIPO_ORIGEN_PENDIENTE_PROPIO,
+      // Ver `ETIQUETA_VENTA_SIN_COBRO` — no es un cruce de sucursal, así que
+      // NUNCA debe llevar el prefijo "COS-" ni mostrar `reglaNombre` (que en
+      // este caso es el nombre completo de la regla fiscal, no una forma de
+      // pago, ej. "Reg 1C — Venta PUE Cheque 16%" — mostrarlo confundiría más).
+      _esVentaSinCobro: m.tipoOrigen === 'Venta Sin Cobro',
     });
   }
   // Primero por categoría de forma de pago (Efectivo → Transferencia → SF →
@@ -1782,14 +1806,17 @@ function _extraerCobrosSucursal(movimientos) {
   // tampoco lleva el prefijo — confirmado con el usuario 2026-08-06, no es un
   // cruce real, decirlo sería una etiqueta falsa.
   for (const f of filas) {
-    f.serie = f._referenciaBancoReal
-      ? f._referenciaBancoReal
-      : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
-        ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
-        : (f._formaPagoLabel ? `${ETIQUETA_COBRO_SUCURSAL}-${f._formaPagoLabel}` : ETIQUETA_COBRO_SUCURSAL);
+    f.serie = f._esVentaSinCobro
+      ? ETIQUETA_VENTA_SIN_COBRO
+      : f._referenciaBancoReal
+        ? f._referenciaBancoReal
+        : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
+          ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
+          : (f._formaPagoLabel ? `${ETIQUETA_COBRO_SUCURSAL}-${f._formaPagoLabel}` : ETIQUETA_COBRO_SUCURSAL);
     delete f._formaPagoLabel;
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;
+    delete f._esVentaSinCobro;
   }
   // Agregar los SF-OCULTO (mismo día + misma sucursal) a la hoja "Otros Ingresos" —
   // nunca suman a depósitos consolidados de efectivo/tarjeta.

@@ -582,6 +582,27 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // serie/folio pero son de un día distinto (ver `_diaMx`).
   const diaCfdiPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, _diaMx(cfdi.fecha)]));
 
+  // Ticket real de la venta (misma sucursal, factura PUE facturada días
+  // después de que ya se cobró) — el CFDI ya declara esa relación en
+  // `documentosRelacionados` (mismo campo que usa `_referenciaDocRelacionado`
+  // en cfdi-mapping.service.js para armar el concepto, ej. "B0-260801859"),
+  // así que no hay que ADIVINAR el cobro real por fecha — se consulta por su
+  // folio EXACTO, sin la ventana ±1 día ni el filtro de `TOLERANCIA_DIAS_
+  // FACTURACION_DIFERIDA` de abajo (confirmado con el usuario 2026-08-21,
+  // caso real Hidalgo/B0 E48070D3 $618.81: venta B0-260801859 cobrada por
+  // Tarjeta el 2026-08-07, factura emitida hasta el 2026-08-11, 4 días
+  // después — el filtro de tolerancia normal lo descartaba como "sin cobro
+  // real" pese a que el vínculo con el ticket ya estaba disponible en el
+  // propio CFDI). Solo PUE: una factura PPD "cobrada antes" de facturarse no
+  // aplica aquí — eso es cobranza de crédito, la maneja Cobranza.
+  const ticketsPropioPorClave = new Map(); // clave factura `serie|folio` -> {serie, folio} del ticket real
+  for (const { cfdi } of candidatos) {
+    if (cfdi.metodoPago !== 'PUE') continue;
+    const ticket = _extraerDocumentosRelacionados(cfdi)[0];
+    if (!ticket || (ticket.serie === cfdi.serie && ticket.folio === cfdi.folio)) continue;
+    ticketsPropioPorClave.set(`${cfdi.serie}|${cfdi.folio}`, ticket);
+  }
+
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
@@ -655,6 +676,33 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     }
   }
 
+  // Completa `resultadosAlmacen`/`resultadosSaldos` con los tickets propios
+  // detectados arriba (`ticketsPropioPorClave`) que NINGUNO de los dos
+  // caminos anteriores trajo — el camino "por centro" solo mira ±1 día
+  // alrededor del batch (no llega a un cobro de días atrás) y el camino
+  // viejo consulta por el folio DE LA FACTURA, no el del ticket real. Se
+  // consulta por folio exacto (sin ventana de fecha) y se marcan con
+  // `_viaTicketPropio` para que el loop de abajo no les aplique el filtro de
+  // `TOLERANCIA_DIAS_FACTURACION_DIFERIDA` (el vínculo ya es exacto, no una
+  // adivinanza por fecha).
+  if (ticketsPropioPorClave.size) {
+    const yaPresentes = new Set(resultadosAlmacen.map(c => `${c.serieVenta}|${c.folioVenta}`));
+    const faltantes = [...ticketsPropioPorClave.values()]
+      .filter(t => !yaPresentes.has(`${t.serie}|${t.folio}`));
+    const LOTE = 150;
+    for (let i = 0; i < faltantes.length; i += LOTE) {
+      const lote = faltantes.slice(i, i + LOTE);
+      const [rA, rS] = await Promise.all([
+        obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(t => t.serie), folios: lote.map(t => t.folio) }),
+        obtenerSaldosFavor({ rfc, series: lote.map(t => t.serie), folios: lote.map(t => t.folio) }),
+      ]);
+      for (const c of rA) c._viaTicketPropio = true;
+      for (const c of rS) c._viaTicketPropio = true;
+      resultadosAlmacen.push(...rA);
+      resultadosSaldos.push(...rS);
+    }
+  }
+
   {
     for (const cuenta of resultadosAlmacen) {
       // `serieFactura`/`folioFactura` (2026-08-14, confirmado con datos
@@ -682,8 +730,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // una factura vieja, no un simple desfase de frontera) mezclaría esa
         // actividad en el batch de hoy — la tolerancia de 1 día sigue
         // bloqueando ese caso (confirmado con el usuario 2026-08-14).
+        // Excepción: `_viaTicketPropio` (ver `ticketsPropioPorClave` arriba)
+        // — el vínculo con este ticket ya viene EXACTO del propio CFDI
+        // (`documentosRelacionados`), no de una adivinanza por fecha, así que
+        // no aplica ningún límite de días (confirmado con el usuario
+        // 2026-08-21).
         const diffDias = _diferenciaDiasMx(cobro.fecha, diaCfdi);
-        if (diaCfdi && (diffDias === null || diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA)) continue;
+        if (diaCfdi && !cuenta._viaTicketPropio && (diffDias === null || diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA)) continue;
         // Cobro cruzado de sucursal (2026-08-14, caso real Ferrocarril
         // 09/07/2026): un ticket de la Factura Global de ESTA sucursal puede
         // haberse cobrado FÍSICAMENTE en otra (`cobro.claveCentro` distinto
@@ -848,7 +901,8 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const diaCfdi = diaCfdiPorClave.get(key);
       const ventaConsumidora = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
       const usados = (cuenta.saldosFavorUsados ?? [])
-        .filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi)
+        // Mismo exento que en `resultadosAlmacen` — ver `_viaTicketPropio`.
+        .filter(u => cuenta._viaTicketPropio || !diaCfdi || _diaMx(u.fecha) === diaCfdi)
         // Excluir SOLO el autoconsumo real (mismo ticket genera y usa su
         // propio saldo) — ver comentario arriba. Si el marcador no se
         // encuentra (Devolución con su propio CFDI, caso normal) o el ticket

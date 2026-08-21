@@ -742,13 +742,27 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // ÚNICAS cuya selección depende realmente de `formaPago`; cualquier otra
   // cuenta (Devoluciones, Anticipos, un banco real ya específico, etc.) no
   // se toca. Alcance de esta primera versión (confirmado con el usuario):
-  // SOLO tipo I, SOLO el caso normal — `esAnticipo`/`esAplicacionSaldo`/
-  // `tasaIva==='mixto'` ya tocan el cargo por su cuenta y colisionarían con
-  // un split aquí (esos mecanismos usan `movs.find(...)` para localizar "la"
-  // línea de cargo, asumiendo que hay una sola — ver `_esCargoPrincipal` más
-  // abajo, que le da al caller una señal explícita en vez de esa
-  // reconstrucción frágil).
-  const gateBase = !esAnticipo && !esAplicacionSaldo && rule.tasaIva !== 'mixto'
+  // SOLO tipo I, SOLO el caso normal — `esAnticipo`/`esAplicacionSaldo`
+  // ya tocan el cargo por su cuenta y colisionarían con un split aquí (esos
+  // mecanismos usan `movs.find(...)` para localizar "la" línea de cargo,
+  // asumiendo que hay una sola — ver `_esCargoPrincipal` más abajo, que le
+  // da al caller una señal explícita en vez de esa reconstrucción frágil).
+  //
+  // Corrección 2026-08-21 (caso real Hidalgo B0-260800846, Factura Global
+  // $194,749.74, regla "Reg 12A — Venta Mixta PUE Efectivo"): antes
+  // `tasaIva==='mixto'` bloqueaba el split por completo — el cargo entero se
+  // iba a Efectivo (el `formaPago` genérico que declara toda Factura Global)
+  // aunque el desglose real de cobro mostrara Efectivo/Tarjeta/Transferencia
+  // mezclados, escondiendo ~$113,000 de Tarjeta+Transferencia. El split por
+  // tasa (16%/0%, líneas 1263+ más abajo) SOLO toca el ABONO (ingreso
+  // reconocido) — es ortogonal al split por forma de pago del CARGO — así
+  // que ambos pueden convivir. La única colisión real es con el ajuste
+  // OPCIONAL de cargo `rule.cuentaCargoMixto0` (línea ~1284), que asume una
+  // sola línea de cargo vía `movs.find(...)` — se excluye ESE caso
+  // específico (`!rule.cuentaCargoMixto0`) para no romperlo; ninguna regla
+  // real usa ambos mecanismos a la vez hasta donde se ha confirmado.
+  const gateBase = !esAnticipo && !esAplicacionSaldo
+    && (rule.tasaIva !== 'mixto' || (esIngreso && !rule.cuentaCargoMixto0))
     && CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo);
 
   // Ajuste por Saldo a Favor/Puntos REALMENTE usados en esta factura —

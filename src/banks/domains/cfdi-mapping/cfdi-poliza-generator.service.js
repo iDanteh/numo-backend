@@ -1644,22 +1644,45 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   const porClave = new Map();
   if (!centro || !fechaInicio || !fechaFin) return porClave;
 
+  const fechaDesdeISO = new Date(`${fechaInicio}T00:00:00-06:00`).toISOString();
+  const fechaHastaISO = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
+
   let resultado = [];
+  let resultadosSaldos = [];
   try {
-    resultado = await obtenerDesglosesCobroAlmacenPorCentro({
-      rfc, centro,
-      fechaDesde: new Date(`${fechaInicio}T00:00:00-06:00`).toISOString(),
-      fechaHasta: new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString(),
-    });
+    [resultado, resultadosSaldos] = await Promise.all([
+      obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO }),
+      obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO }),
+    ]);
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
     logger.warn(`[CobrosSinFactura] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
     return porClave;
   }
 
+  // Ventas canceladas/devueltas (2026-08-21, confirmado con el usuario contra
+  // el reporte oficial de Movimientos en Caja de Hidalgo/B0 11-ago, caso real
+  // B0-260802634 OPERADORA DE FRANQUICIAS SEB $132.59): cuando un ticket SIN
+  // factura se cobra y LUEGO se cancela/devuelve en caja (RETD), el ERP no
+  // borra el cobro original en `/desgloses-cobro/almacen` — en vez de eso,
+  // `/saldos-favor` trae una Devolución (`serieOrigen: 'DEV'`) generada por la
+  // MISMA venta (serieVenta/folioVenta), por el monto cancelado. Sin restar
+  // esto, esta función sobreestimaba "Cobros sin factura" por cada venta
+  // cancelada el mismo día.
+  const devGeneradoPorVenta = new Map(); // `${serieVenta}|${folioVenta}` -> monto DEV
+  for (const cuenta of resultadosSaldos) {
+    const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+    for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+      if ((gen.serieOrigen ?? '').toUpperCase() !== 'DEV') continue;
+      devGeneradoPorVenta.set(ventaKey, (devGeneradoPorVenta.get(ventaKey) ?? 0) + (Math.abs(Number(gen.monto)) || 0));
+    }
+  }
+
   const vistos = new Set();
+  const porVenta = new Map(); // ventaKey -> [{ clave, monto }], mismo orden en que llegan los cobros
   for (const cuenta of resultado) {
     if (cuenta.serieFactura && cuenta.folioFactura) continue; // SÍ tiene factura -- no es el caso que buscamos
+    const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
     for (const cobro of (cuenta.cobros ?? [])) {
       if (cobro.claveCentro !== centro) continue;
       const fechaCobroMx = new Date(cobro.fecha);
@@ -1682,8 +1705,26 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
           : (Number(fp.monto) || 0);
         const clave = (fp.claveSat ?? '').trim();
         if (!clave || monto <= 0) continue;
-        porClave.set(clave, Math.round(((porClave.get(clave) ?? 0) + monto) * 100) / 100);
+        if (!porVenta.has(ventaKey)) porVenta.set(ventaKey, []);
+        porVenta.get(ventaKey).push({ clave, monto });
       }
+    }
+  }
+
+  // Restar la Devolución de cada venta cancelada de sus propios renglones
+  // (más recientes primero — la cancelación reversa el cobro más reciente de
+  // esa venta) antes de sumar al total por forma de pago.
+  for (const [ventaKey, renglones] of porVenta) {
+    let devRestante = devGeneradoPorVenta.get(ventaKey) ?? 0;
+    for (let i = renglones.length - 1; i >= 0 && devRestante > 0.01; i--) {
+      const r = renglones[i];
+      const reduccion = Math.min(r.monto, devRestante);
+      r.monto -= reduccion;
+      devRestante -= reduccion;
+    }
+    for (const r of renglones) {
+      if (r.monto <= 0) continue;
+      porClave.set(r.clave, Math.round(((porClave.get(r.clave) ?? 0) + r.monto) * 100) / 100);
     }
   }
   return porClave;

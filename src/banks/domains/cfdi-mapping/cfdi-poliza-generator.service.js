@@ -595,11 +595,18 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // real" pese a que el vínculo con el ticket ya estaba disponible en el
   // propio CFDI). Solo PUE: una factura PPD "cobrada antes" de facturarse no
   // aplica aquí — eso es cobranza de crédito, la maneja Cobranza.
+  // 'OPA' (anticipo aplicado sin NC, ver REGLAS_MEZCLADAS_CON_VENTAS en
+  // poliza.service.js) NO es un ticket real de venta en cajas — es la
+  // referencia del recibo de anticipo. `_extraerDocumentosRelacionados` solo
+  // excluye BON/BCT/DEV/CAC (TIPO_MARCADORES), no OPA, así que hay que
+  // filtrarlo aparte aquí — bug encontrado 2026-08-21 (caso real folio
+  // OPA-260702661): sin este filtro, se consultaba el ERP con
+  // series='OPA'/folios='260702661' como si fuera un ticket de almacén.
   const ticketsPropioPorClave = new Map(); // clave factura `serie|folio` -> {serie, folio} del ticket real
   for (const { cfdi } of candidatos) {
     if (cfdi.metodoPago !== 'PUE') continue;
     const ticket = _extraerDocumentosRelacionados(cfdi)[0];
-    if (!ticket || (ticket.serie === cfdi.serie && ticket.folio === cfdi.folio)) continue;
+    if (!ticket || ticket.serie === 'OPA' || (ticket.serie === cfdi.serie && ticket.folio === cfdi.folio)) continue;
     ticketsPropioPorClave.set(`${cfdi.serie}|${cfdi.folio}`, ticket);
   }
 

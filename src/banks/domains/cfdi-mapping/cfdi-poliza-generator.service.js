@@ -1678,10 +1678,52 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
     }
   }
 
+  // Cobranza de facturas que aún no existen el día del cobro (2026-08-21,
+  // confirmado con el usuario: "el cobro debe caer el día que se cobró y la
+  // factura o los asientos saldrán cuando se timbre" — caso real Hidalgo
+  // B0-260801397, $50,286.19: ticket vendido 29-jul, cobrado en efectivo el
+  // 7-ago, pero la Factura Global que lo agrupa no se timbró hasta el 13-ago,
+  // 6 días después — muy fuera de `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`
+  // (±1 día). Antes esto se perdía por completo: el filtro de arriba
+  // descartaba la cuenta por tener `folioFactura`, asumiendo (incorrecto)
+  // que el pipeline normal por CFDI ya la cubriría — pero ese pipeline solo
+  // procesa candidatos del DÍA que se está generando, y esta factura no
+  // pertenece al batch del 7-ago (pertenece al del 13). El dinero real
+  // cobrado el 7-ago no debe esperar a que exista la factura: se inyecta
+  // aquí mismo, en el día real del cobro, igual que un "cobro sin factura"
+  // — la factura seguirá generando su propio asiento de Ingreso/IVA normal
+  // el día que se timbre, sin duplicar el cargo (ese día no vuelve a
+  // encontrar este cobro porque para entonces sí cae dentro de tolerancia
+  // del lado del pipeline normal).
+  const foliosFacturaReferenciados = new Set();
+  for (const cuenta of resultado) {
+    if (cuenta.serieFactura && cuenta.folioFactura) {
+      foliosFacturaReferenciados.add(`${cuenta.serieFactura}|${cuenta.folioFactura}`);
+    }
+  }
+  const diaCfdiPorFolioFactura = new Map();
+  if (foliosFacturaReferenciados.size) {
+    const orConditions = [...foliosFacturaReferenciados].map(k => {
+      const [serie, folio] = k.split('|');
+      return { serie, folio };
+    });
+    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha').lean();
+    for (const c of cfdisReferenciados) {
+      const key = `${c.serie}|${c.folio}`;
+      const dia = _diaMx(c.fecha);
+      // Si hay varios CFDIs con el mismo serie/folio (visto en producción,
+      // registros duplicados), se queda con la fecha MÁS TEMPRANA — es la
+      // interpretación más conservadora (más probabilidad de estar dentro
+      // de tolerancia del cobro real).
+      const actual = diaCfdiPorFolioFactura.get(key);
+      if (!actual || dia < actual) diaCfdiPorFolioFactura.set(key, dia);
+    }
+  }
+
   const vistos = new Set();
   const porVenta = new Map(); // ventaKey -> [{ clave, monto }], mismo orden en que llegan los cobros
   for (const cuenta of resultado) {
-    if (cuenta.serieFactura && cuenta.folioFactura) continue; // SÍ tiene factura -- no es el caso que buscamos
+    const facturaKey = (cuenta.serieFactura && cuenta.folioFactura) ? `${cuenta.serieFactura}|${cuenta.folioFactura}` : null;
     const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
     for (const cobro of (cuenta.cobros ?? [])) {
       if (cobro.claveCentro !== centro) continue;
@@ -1689,6 +1731,13 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       fechaCobroMx.setHours(fechaCobroMx.getHours() - 6);
       const diaCobro = fechaCobroMx.toISOString().slice(0, 10);
       if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
+
+      if (facturaKey) {
+        const diaCfdi = diaCfdiPorFolioFactura.get(facturaKey);
+        // CFDI existe Y su fecha está dentro de tolerancia del cobro → el
+        // pipeline normal por CFDI ya lo cubre (o lo cubrirá) — no duplicar.
+        if (diaCfdi && _diferenciaDiasMx(cobro.fecha, diaCfdi) <= TOLERANCIA_DIAS_FACTURACION_DIFERIDA) continue;
+      }
 
       const origen = (cobro.serieOrigen ?? '').toUpperCase();
       if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;

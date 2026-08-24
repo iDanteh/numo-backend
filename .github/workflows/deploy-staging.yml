@@ -15,6 +15,8 @@ jobs:
       CREDS_MASTER_KEY: 9bcba551ac024af1a48af5c40d232a3c61aca49337f47c9403dc3f4cbd151374
       ERP_CAJA_BASE_URL: https://ci-dummy.local
       ERP_TOKEN: ci-dummy-token
+      AUTH0_DOMAIN: ci-dummy.auth0.com
+      AUTH0_AUDIENCE: https://ci-dummy-audience
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

@@ -2,17 +2,24 @@
 
 const axios = require('axios');
 
-// ERP_CAJA_BASE_TEST_URL (opcional) tiene prioridad sobre ERP_CAJA_BASE_URL cuando está
-// presente — pensada para servidores de staging/test (ej. testnumo), donde un .env mal
-// copiado puede pisar ERP_CAJA_BASE_URL con la URL de producción sin que nadie lo note
-// (caso real, 2026-08-24: reversiones comparaban contra Kore de PRODUCCIÓN en testnumo,
-// "atribución ambigua" con números que no tenían nada que ver). En producción esta
-// variable simplemente no existe, así que el comportamiento no cambia ahí.
-const ERP_CAJA_BASE_URL = (process.env.ERP_CAJA_BASE_TEST_URL || process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
+const ERP_CAJA_BASE_URL = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
+// ERP_CAJA_BASE_TEST_URL (opcional) — SOLO para `sincronizarCuentasPendientes` (el sync de
+// reversiones/cuentas-pendientes), nunca para el resto de este archivo (desgloses-cobro,
+// usado por la generación de pólizas, que siempre debe ver los datos reales de producción
+// para poder validar Efectivo/Tarjeta contra el corte de caja real). Pensada para
+// servidores de staging/test (ej. testnumo): un .env mal copiado puede pisar
+// ERP_CAJA_BASE_URL con la URL de producción sin que nadie lo note (caso real,
+// 2026-08-24: reversiones comparaban contra Kore de PRODUCCIÓN en testnumo, "atribución
+// ambigua" con números que no tenían nada que ver). Si esta variable global apuntaba al
+// sandbox, arrastraba sin querer también a la generación de pólizas, dejando el corte de
+// caja completo en "Venta Sin Cobro" por falta de datos reales — de ahí que quede acotada
+// solo a esta función. En producción esta variable simplemente no existe, así que el
+// comportamiento no cambia ahí.
+const ERP_CAJA_BASE_URL_REVERSIONES = (process.env.ERP_CAJA_BASE_TEST_URL || process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
 const ERP_TOKEN         = process.env.ERP_TOKEN || '';
 
 async function sincronizarCuentasPendientes(params = {}) {
-  if (!ERP_CAJA_BASE_URL) {
+  if (!ERP_CAJA_BASE_URL_REVERSIONES) {
     throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
   }
 
@@ -27,7 +34,7 @@ async function sincronizarCuentasPendientes(params = {}) {
 
   let response;
   try {
-    response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
+    response = await axios.get(`${ERP_CAJA_BASE_URL_REVERSIONES}/cuentas-pendientes`, {
       params:  queryParams,
       headers: { Authorization: `Bearer ${ERP_TOKEN}` },
       timeout: 15000,

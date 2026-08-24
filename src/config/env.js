@@ -75,10 +75,10 @@ const config = Object.freeze({
 
   /** Integración con el ERP externo */
   erp: Object.freeze({
-    // ERP_CAJA_BASE_TEST_URL (opcional) manda sobre ERP_CAJA_BASE_URL cuando está presente —
-    // ver erp-sync.service.js para el porqué (protección contra .env de staging apuntando
-    // por error a Kore de producción).
-    cajaUrl: process.env.ERP_CAJA_BASE_TEST_URL?.trim() || process.env.ERP_CAJA_BASE_URL?.trim(),   // cajas / bancos
+    // ERP_CAJA_BASE_TEST_URL (staging/test) se acota solo a `sincronizarCuentasPendientes`
+    // en erp-sync.service.js (sync de reversiones) — este valor general sigue siendo
+    // siempre el de producción, ver ese archivo para el porqué.
+    cajaUrl: process.env.ERP_CAJA_BASE_URL?.trim(),   // cajas / bancos
     baseUrl:  process.env.ERP_FACT_BASE_URL?.trim(),  // facturación — import CFDIs
     // Normaliza el token: garantiza el prefijo "Bearer " independientemente
     //cambio 2

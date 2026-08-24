@@ -610,24 +610,6 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     ticketsPropioPorClave.set(`${cfdi.serie}|${cfdi.folio}`, ticket);
   }
 
-  // Reparto proporcional cuando el MISMO ticket se facturó en varios CFDIs
-  // distintos (el ERP solo asocia su cobro a UNO vía serieFactura/
-  // folioFactura, ver más abajo) — confirmado con el usuario 2026-08-24,
-  // caso real Viguera B0-260801749: el ticket se facturó en 5 CFDIs (folios
-  // 767-771), pero el ERP solo liga el cobro real ($9,430.13) a la factura
-  // 771 — las otras 4 (767-770) nunca encontraban su cobro y caían en
-  // "Venta Sin Cobro" pese a que el dinero sí existe. Se reparte
-  // proporcional al `total` de cada factura que comparte el ticket.
-  const candidatosPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, cfdi]));
-  const facturasPorTicket = new Map(); // ticketKey `serie|folio` -> [{ facturaKey, total }]
-  for (const [facturaKey, ticket] of ticketsPropioPorClave) {
-    const ticketKey = `${ticket.serie}|${ticket.folio}`;
-    const cfdiRef = candidatosPorClave.get(facturaKey);
-    const arr = facturasPorTicket.get(ticketKey) ?? [];
-    arr.push({ facturaKey, total: Number(cfdiRef?.total) || 0 });
-    facturasPorTicket.set(ticketKey, arr);
-  }
-
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
@@ -726,6 +708,41 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       resultadosAlmacen.push(...rA);
       resultadosSaldos.push(...rS);
     }
+  }
+
+  // Reparto proporcional cuando el MISMO ticket se facturó en varios CFDIs
+  // distintos (el ERP solo asocia su cobro a UNO vía serieFactura/
+  // folioFactura, ver más abajo) — confirmado con el usuario 2026-08-24,
+  // caso real Viguera B0-260801749: el ticket se facturó en 5 CFDIs (folios
+  // 767-771), pero el ERP solo liga el cobro real ($9,430.13) a la factura
+  // 771 — las otras 4 (767-770) nunca encontraban su cobro y caían en
+  // "Venta Sin Cobro" pese a que el dinero sí existe. Se reparte
+  // proporcional al `total` de cada factura que comparte el ticket.
+  //
+  // `ticketsPropioPorClave` viene de `documentosRelacionados` (campo interno
+  // del ERP) — confirmado con datos reales 2026-07-17 que ese campo trae en
+  // 8 de 9 facturas una referencia "ruido" (Serie propia + folio distinto,
+  // sin relación real, ver `_foliosCancelacionDelDia`). Regresión encontrada
+  // el mismo día del fix original: sin filtrar ese ruido, el reparto
+  // proporcional agrupaba facturas SIN relación real bajo el mismo
+  // ticketKey y mezclaba dinero entre facturas ajenas, vaciando
+  // Efectivo/Tarjeta/SF/Puntos de casi toda la póliza a "Venta Sin Cobro".
+  // Se exige que el ticket candidato exista REALMENTE como cuenta de cajas
+  // (`serieVenta`/`folioVenta` presente en `resultadosAlmacen`, ya sea
+  // porque ya estaba en el batch o porque la consulta de "faltantes" de
+  // arriba encontró una cuenta real para él) — un folio ruido no
+  // corresponde a ningún ticket real, así que nunca aparece ahí y se
+  // descarta solo, sin necesidad de adivinar cuál referencia es falsa.
+  const ticketsRealesConfirmados = new Set(resultadosAlmacen.map(c => `${c.serieVenta}|${c.folioVenta}`));
+  const candidatosPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, cfdi]));
+  const facturasPorTicket = new Map(); // ticketKey `serie|folio` -> [{ facturaKey, total }]
+  for (const [facturaKey, ticket] of ticketsPropioPorClave) {
+    const ticketKey = `${ticket.serie}|${ticket.folio}`;
+    if (!ticketsRealesConfirmados.has(ticketKey)) continue;
+    const cfdiRef = candidatosPorClave.get(facturaKey);
+    const arr = facturasPorTicket.get(ticketKey) ?? [];
+    arr.push({ facturaKey, total: Number(cfdiRef?.total) || 0 });
+    facturasPorTicket.set(ticketKey, arr);
   }
 
   {

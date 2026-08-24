@@ -120,6 +120,32 @@ function _claveLote(rfc, series, folios) {
   return `${rfc}::${pares.join(',')}`;
 }
 
+// El ERP rechaza con HTTP 400 "rango de fechas mayor a 31 días sin criterio
+// de factura" cualquier consulta "por centro" más amplia — y la generación
+// de pólizas amplía el período ±1 día de tolerancia
+// (TOLERANCIA_DIAS_FACTURACION_DIFERIDA en cfdi-poliza-generator.service.js),
+// así que CUALQUIER mes de 30 o 31 días ya excede el límite (confirmado
+// 2026-08-24, caso real Viguera/Hidalgo agosto: rango ampliado 31-jul a
+// 1-sep = 33 días → HTTP 400 → el catch de `_prefetchAjustesFacturaPropia`
+// lo trataba como falla genérica y caía en silencio al camino "por
+// serie/folio", incompleto — de ahí las líneas "Venta Sin Cobro" recurrentes
+// cada mes, no solo en agosto). Se trocea el rango en bloques ≤30 días y se
+// combinan los resultados — transparente para el caller.
+const MS_UN_DIA = 24 * 60 * 60 * 1000;
+const MAX_DIAS_RANGO_ERP = 30;
+function _trocearRango(fechaDesdeIso, fechaHastaIso) {
+  const desde = new Date(fechaDesdeIso);
+  const hasta = new Date(fechaHastaIso);
+  const bloques = [];
+  let cursor = desde;
+  while (cursor < hasta) {
+    const finBloque = new Date(Math.min(cursor.getTime() + MAX_DIAS_RANGO_ERP * MS_UN_DIA, hasta.getTime()));
+    bloques.push({ fechaDesde: cursor.toISOString(), fechaHasta: finBloque.toISOString() });
+    cursor = new Date(finBloque.getTime() + 1);
+  }
+  return bloques;
+}
+
 function _leerCache(cache, clave) {
   const entry = cache.get(clave);
   if (!entry) return undefined;
@@ -222,11 +248,14 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
   const cacheado = _leerCache(_cacheAlmacenPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  let response;
+  let cuentas;
   try {
-    response = await _getConReintento(`${ERP_CAJA_BASE_URL}/desgloses-cobro/almacen`, {
-      centro, fechaDesde, fechaHasta,
-    }, '/desgloses-cobro/almacen (por centro)');
+    const respuestas = await Promise.all(
+      _trocearRango(fechaDesde, fechaHasta).map(({ fechaDesde: fd, fechaHasta: fh }) => _getConReintento(
+        `${ERP_CAJA_BASE_URL}/desgloses-cobro/almacen`, { centro, fechaDesde: fd, fechaHasta: fh }, '/desgloses-cobro/almacen (por centro)',
+      )),
+    );
+    cuentas = respuestas.flatMap(r => r.data?.Data?.cuentas || []);
   } catch (axErr) {
     const status = axErr.response?.status;
     const body   = JSON.stringify(axErr.response?.data ?? {});
@@ -235,7 +264,6 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
     throw axErr;
   }
 
-  const cuentas = response.data?.Data?.cuentas || [];
   _cacheAlmacenPorCentro.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
@@ -253,11 +281,14 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   const cacheado = _leerCache(_cacheSaldosFavorPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  let response;
+  let cuentas;
   try {
-    response = await _getConReintento(`${ERP_CAJA_BASE_URL}/desgloses-cobro/saldos-favor`, {
-      centro, fechaDesde, fechaHasta,
-    }, '/desgloses-cobro/saldos-favor (por centro)');
+    const respuestas = await Promise.all(
+      _trocearRango(fechaDesde, fechaHasta).map(({ fechaDesde: fd, fechaHasta: fh }) => _getConReintento(
+        `${ERP_CAJA_BASE_URL}/desgloses-cobro/saldos-favor`, { centro, fechaDesde: fd, fechaHasta: fh }, '/desgloses-cobro/saldos-favor (por centro)',
+      )),
+    );
+    cuentas = respuestas.flatMap(r => r.data?.Data?.cuentas || []);
   } catch (axErr) {
     const status = axErr.response?.status;
     const body   = JSON.stringify(axErr.response?.data ?? {});
@@ -266,7 +297,6 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
     throw axErr;
   }
 
-  const cuentas = response.data?.Data?.cuentas || [];
   _cacheSaldosFavorPorCentro.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }

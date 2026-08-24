@@ -262,6 +262,52 @@ describe('identificar() — reconciliación advisory (nunca bloquea)', () => {
   });
 });
 
+// Bug real 2026-08-24: el filtro de BankMovement.find() usaba `uuidXML: null`
+// (= "sin NINGÚN erpLink con folioFiscal"), lo que bloqueaba reutilizar un
+// movimiento con un abono parcial previo para agregar OTRO abono parcial
+// legítimo contra la MISMA CxC vía una solicitud de cobro distinta. Regla de
+// negocio confirmada: un movimiento sigue siendo candidato mientras su
+// `status` sea 'no_identificado' o 'reclasificado' — 'identificado'/'otros' lo
+// excluyen. Estos tests fijan el filtro real usado (antes no había cobertura
+// de este guard en absoluto).
+describe('identificar() — guard de disponibilidad del movimiento (status, no uuidXML)', () => {
+  test('BankMovement.find() filtra por status no_identificado/reclasificado, nunca por uuidXML', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 10000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 220336 }], monto: 10000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    // Movimiento con un erpLink previo (abono parcial de otra solicitud) — uuidXML
+    // ya no-nulo en un escenario real, pero eso no debe ser lo que se filtra.
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1', {
+      uuidXML: 'FOLIO-FISCAL-EXISTENTE',
+      erpLinks: [{ erpId: 'CXC-1', saldoPagado: 50000, saldoPagadoTotal: 50000, folioFiscal: 'FOLIO-FISCAL-EXISTENTE' }],
+    })]);
+    setupHappyKore();
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1' });
+
+    expect(BankMovement.find).toHaveBeenCalledWith({
+      _id: { $in: ['mov-1'] },
+      status: { $in: ['no_identificado', 'reclasificado'] },
+    });
+  });
+
+  test('movimiento excluido por la query (ej. status identificado/otros) -> NotFoundError', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 10000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 10000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    // Simula lo que Mongo devolvería para un movimiento con status 'identificado'/'otros':
+    // no matchea el filtro, así que el find real ya lo excluye del arreglo.
+    BankMovement.find.mockResolvedValue([]);
+    setupHappyKore();
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1' }),
+    ).rejects.toThrow('Movimiento bancario');
+
+    expect(koreCaja.obtenerSesionCaja).not.toHaveBeenCalled();
+  });
+});
+
 describe('identificar() — abort post-Kore (D4: inconsistenciaPostKore, NO reintentar)', () => {
   test('Kore acepta pero el 2do setErpIds falla -> marca inconsistenciaPostKore y NO reintenta', async () => {
     const f1 = formaPago('f1', 'Transferencia', 60000);

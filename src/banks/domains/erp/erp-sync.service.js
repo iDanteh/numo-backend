@@ -51,6 +51,14 @@ async function sincronizarCuentasPendientes(params = {}) {
 // caiga al camino viejo/menos preciso — primero vale la pena reintentar,
 // igual que ya se hace con 429, antes de darse por vencido. Backoff fijo (no
 // hay "retry after" para un timeout) con un pequeño incremento por intento.
+//
+// 2026-08-24: 30s tampoco alcanzaba contra el ERP REAL de producción —
+// medido con curl: /desgloses-cobro/saldos-favor (por centro) tardó 35.75s
+// en responder (caso real Viguera/Hidalgo, ~24 días de rango). Con 30s, las
+// 3 reintentos hacían timeout igual y el caller caía al camino "por
+// serie/folio" (incompleto), dejando cobros reales sin encontrar y
+// fragmentando la venta en líneas "Venta Sin Cobro" (caso real B0-260803791,
+// $24,981.27 cobrados en Efectivo, solo $1,462.89 se reconciliaban).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   for (let intento = 1; intento <= MAX_INTENTOS_429; intento++) {
@@ -58,7 +66,7 @@ async function _getConReintento(url, params, logLabel) {
       return await axios.get(url, {
         params,
         headers: { Authorization: `Bearer ${ERP_TOKEN}` },
-        timeout: 30000,
+        timeout: 60000,
       });
     } catch (axErr) {
       const status    = axErr.response?.status;

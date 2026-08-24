@@ -610,6 +610,24 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     ticketsPropioPorClave.set(`${cfdi.serie}|${cfdi.folio}`, ticket);
   }
 
+  // Reparto proporcional cuando el MISMO ticket se facturó en varios CFDIs
+  // distintos (el ERP solo asocia su cobro a UNO vía serieFactura/
+  // folioFactura, ver más abajo) — confirmado con el usuario 2026-08-24,
+  // caso real Viguera B0-260801749: el ticket se facturó en 5 CFDIs (folios
+  // 767-771), pero el ERP solo liga el cobro real ($9,430.13) a la factura
+  // 771 — las otras 4 (767-770) nunca encontraban su cobro y caían en
+  // "Venta Sin Cobro" pese a que el dinero sí existe. Se reparte
+  // proporcional al `total` de cada factura que comparte el ticket.
+  const candidatosPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, cfdi]));
+  const facturasPorTicket = new Map(); // ticketKey `serie|folio` -> [{ facturaKey, total }]
+  for (const [facturaKey, ticket] of ticketsPropioPorClave) {
+    const ticketKey = `${ticket.serie}|${ticket.folio}`;
+    const cfdiRef = candidatosPorClave.get(facturaKey);
+    const arr = facturasPorTicket.get(ticketKey) ?? [];
+    arr.push({ facturaKey, total: Number(cfdiRef?.total) || 0 });
+    facturasPorTicket.set(ticketKey, arr);
+  }
+
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
@@ -861,11 +879,33 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           });
         }
       }
+      // Si el ticket de esta cuenta se facturó en varias facturas distintas
+      // (ver `facturasPorTicket` arriba), el cobro se reparte proporcional
+      // al `total` de cada una — en vez de irse completo a la única factura
+      // que el ERP marca como dueña (`key`), dejando a las demás sin cobro.
+      const ticketKeyCuenta = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+      const facturasCompartidas = facturasPorTicket.get(ticketKeyCuenta);
+      const targets = (facturasCompartidas && facturasCompartidas.length > 1)
+        ? facturasCompartidas
+        : [{ facturaKey: key, total: 1 }];
+      const totalPeso = targets.reduce((s, t) => s + t.total, 0) || targets.length;
       if (formasPago.length) {
-        const prevFp = desglosePagoReal.get(key) ?? [];
-        desglosePagoReal.set(key, [...prevFp, ...formasPago]);
+        for (const t of targets) {
+          const peso = (t.total || (totalPeso / targets.length)) / totalPeso;
+          const prevFp = desglosePagoReal.get(t.facturaKey) ?? [];
+          const formasPagoRepartidas = targets.length > 1
+            ? formasPago.map(fp => ({ ...fp, monto: parseFloat((fp.monto * peso).toFixed(2)) }))
+            : formasPago;
+          desglosePagoReal.set(t.facturaKey, [...prevFp, ...formasPagoRepartidas]);
+        }
       }
-      if (montoPuntos > 0) puntosUsado.set(key, (puntosUsado.get(key) ?? 0) + montoPuntos);
+      if (montoPuntos > 0) {
+        for (const t of targets) {
+          const peso = (t.total || (totalPeso / targets.length)) / totalPeso;
+          const montoRepartido = targets.length > 1 ? montoPuntos * peso : montoPuntos;
+          puntosUsado.set(t.facturaKey, (puntosUsado.get(t.facturaKey) ?? 0) + montoRepartido);
+        }
+      }
     }
 
     // Saldo a favor generado y consumido DENTRO de la misma Factura Global

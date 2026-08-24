@@ -1,0 +1,33 @@
+name: CI/CD Staging
+
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      # El servidor fuerza el comando vía authorized_keys (forced command) —
+      # cualquier "script" que se mande acá es ignorado, la conexión SSH sola
+      # ya dispara /var/www/numo/auto-update.sh.
+      - name: Trigger deploy en testnumo
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.STAGING_HOST }}
+          username: ${{ vars.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: echo "deploy trigger"

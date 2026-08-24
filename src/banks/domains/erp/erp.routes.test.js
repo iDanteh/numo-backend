@@ -260,6 +260,106 @@ describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruza
 
     expect(resultado.get(0)).toBe(100); // solo el propio, el ajeno se ignora por completo
   });
+
+  // Caso real 2026-08-24, folioExterno 260800204: "Depósito en efectivo" manda un tag
+  // DISTINTO a Aut/Numo — { Nombre: 'Num Recibo', Valor: mov.folio } (collection-request.
+  // service.js). Antes del fix, _perteneceAEsteMovimiento/_tieneTagIdentidadPropia no
+  // reconocían 'Num Recibo': los 2 abonos ($500 y $100) caían como "sin tag propio", nunca se
+  // empujaban a la pila, y la reversión de $100 (sin tag, como toda REV ABO) no encontraba
+  // nada que cancelar — calculado quedaba en 0 (vacío) aunque Kore reportara $500 vigentes
+  // (total-saldoActual=500), disparando la red de seguridad de atribución y bloqueando la
+  // reversión entera ("NO se toca ningún link").
+  test('caso real folioExterno 260800204: Depósito en efectivo (tag "Num Recibo") se reconoce como aporte propio, no como reversa anónima', () => {
+    const raw0 = {
+      total: 2203.36,
+      saldoActual: 1703.36, // total-saldoActual = 500 (el abono de $500 sigue vigente)
+      movimientos: [
+        { serie: 'A0', folio: '260800204', fecha: '2026-08-01T00:00:00Z', total: 2203.36 },
+        { serie: 'ABO', folio: '1', fecha: '2026-08-24T18:40:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-4361' },
+          ] }] },
+        { serie: 'ABO', folio: '2', fecha: '2026-08-24T18:52:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 100, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-4361' },
+          ] }] },
+        { serie: 'REV ABO', folio: '3', fecha: '2026-08-24T18:52:11Z', total: 100,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 100 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: null, folio: 'F-4361' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500);
+    expect(resultado.get(0)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  // Misma CxC pagada con 2 movimientos de tipos DISTINTOS: uno por Depósito en efectivo
+  // (tag 'Num Recibo') y otro por Transferencia (tags 'Aut'/'Numo'). Antes del fix ambos
+  // tags convivían sin problema entre sí (el bug era que 'Num Recibo' no se reconocía EN
+  // ABSOLUTO, no que se confundiera con 'Aut'/'Numo') — este test fija que, con los 3 tags
+  // ahora reconocidos, cada aporte sigue atribuyéndose EXCLUSIVAMENTE a su propio
+  // movimiento, sin cruzarse entre el depósito en efectivo y la transferencia.
+  test('depósito en efectivo (Num Recibo) y transferencia (Aut/Numo) como aportes de 2 movimientos distintos a la misma CxC, sin cruzarse', () => {
+    const raw0 = {
+      total: 1000, saldoActual: 400, // 600 pagados entre los dos
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 1000 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -400,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 400, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-EFECTIVO' },
+          ] }] },
+        { serie: 'ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: -200,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 200, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' },
+          ] }] },
+      ],
+    };
+    const movEfectivo      = { numeroAutorizacion: null,          folio: 'F-EFECTIVO' };
+    const movTransferencia = { numeroAutorizacion: '18411758',    folio: 'F-TRANSFER' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [movEfectivo, movTransferencia]);
+
+    expect(resultado.get(0)).toBe(400); // efectivo: solo lo suyo
+    expect(resultado.get(1)).toBe(200); // transferencia: solo lo suyo
+    expect(resultado.get(0) + resultado.get(1)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+});
+
+describe('_montoSaldoLinkPorMovimiento — reconoce "Num Recibo" (Depósito en efectivo, caso real 2026-08-24)', () => {
+  test('abono propio tageado con Num Recibo se atribuye a este movimiento (no cae en el neteo de "reversa sin tag")', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-4361' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: null, folio: 'F-4361' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    expect(resultado).toBe(500);
+  });
+
+  test('abono con Num Recibo de OTRO movimiento se atribuye a "de otro", no se confunde con una reversa sin tag propia', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-OTRO' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: null, folio: 'F-4361' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    // Sin ninguna coincidencia PROPIA, huboCoincidenciaPropia queda false -> null (no 0).
+    expect(resultado).toBeNull();
+  });
 });
 
 describe('_backfillFormasPagoYFolioFiscal — aporteBancarioPrevio (2026-08-21, bug real: saldoPagado quedaba en $0 en el dropdown "CxC vinculadas")', () => {

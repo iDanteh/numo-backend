@@ -983,15 +983,26 @@ function _montoSaldoLinkBancario(raw0) {
 // cerrado con el criterio viejo pre-Aut-matching, antes de que este bug pudiera manifestarse).
 // La comparación ahora es "el folio aparece dentro del Aut" en vez de igualdad exacta — un
 // folio de 6 dígitos casi no tiene riesgo real de aparecer como substring de un Aut ajeno.
-// Se aceptan ambas coincidencias (Numo/Aut) porque una misma CxC puede traer movimientos
-// tageados con una u otra según cómo Kore/Numo aplicó cada pago.
+// Se aceptan las 3 coincidencias (Numo/Aut/Num Recibo) porque una misma CxC puede traer
+// movimientos tageados con cualquiera de ellas según cómo Kore/Numo aplicó cada pago —
+// 'Num Recibo' es el tag propio de "Depósito en efectivo" (collection-request.service.js,
+// DatosAdicionales: [{ Nombre: 'Num Recibo', Valor: mov.folio }]), un contrato distinto al
+// de Aut/Numo (folio consecutivo de Numo, no una autorización bancaria) — match EXACTO
+// contra mov.folio, no `.includes()` como Aut, porque el valor mandado a Kore ES literalmente
+// mov.folio, no una cadena más larga que lo contiene.
+function _tieneTagIdentidadPropia(fp) {
+  return (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut' || a.nombre === 'Num Recibo');
+}
+
 function _perteneceAEsteMovimiento(fp, mov) {
   const autNormMov = _normalizarAutorizacion(mov.numeroAutorizacion);
   const numoTag    = (fp.adicionales ?? []).find(a => a.nombre === 'Numo');
   if (numoTag && autNormMov && _normalizarAutorizacion(numoTag.valor) === autNormMov) return true;
-  const autTag  = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
   const folioMov = String(mov.folio ?? '').trim();
+  const autTag  = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
   if (autTag && folioMov && String(autTag.valor ?? '').trim().includes(folioMov)) return true;
+  const numReciboTag = (fp.adicionales ?? []).find(a => a.nombre === 'Num Recibo');
+  if (numReciboTag && folioMov && String(numReciboTag.valor ?? '').trim() === folioMov) return true;
   return false;
 }
 
@@ -1026,9 +1037,7 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
 
   for (const m of conFormaPago) {
     const esMio    = m.formasPago.some(fp => _perteneceAEsteMovimiento(fp, mov));
-    const esDeOtro = !esMio && m.formasPago.some(fp =>
-      (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut'),
-    );
+    const esDeOtro = !esMio && m.formasPago.some(fp => _tieneTagIdentidadPropia(fp));
     const total = m.total ?? 0;
 
     if (esMio) {
@@ -1083,9 +1092,7 @@ function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true) 
   const pila = []; // { movIndex, monto } — monto siempre positivo, orden = orden de llegada
   for (const m of conFormaPago) {
     const movIndex = movs.findIndex(mov => m.formasPago.some(fp => _perteneceAEsteMovimiento(fp, mov)));
-    const tieneTagPropio = m.formasPago.some(fp =>
-      (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut'),
-    );
+    const tieneTagPropio = m.formasPago.some(fp => _tieneTagIdentidadPropia(fp));
 
     if (movIndex !== -1) {
       pila.push({ movIndex, monto: Math.abs(m.total ?? 0) });

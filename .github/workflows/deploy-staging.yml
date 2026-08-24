@@ -1,0 +1,43 @@
+name: CI/CD Staging
+
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Valores dummy — el CI no habla con Mongo/Postgres/ERP real, solo
+      # necesita pasar la validación de config/env.js para poder importar
+      # los módulos que la requieren transitivamente.
+      JWT_SECRET: ci-dummy-jwt-secret
+      CREDS_MASTER_KEY: 9bcba551ac024af1a48af5c40d232a3c61aca49337f47c9403dc3f4cbd151374
+      ERP_CAJA_BASE_URL: https://ci-dummy.local
+      ERP_TOKEN: ci-dummy-token
+      AUTH0_DOMAIN: ci-dummy.auth0.com
+      AUTH0_AUDIENCE: https://ci-dummy-audience
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      # El servidor fuerza el comando vía authorized_keys (forced command) —
+      # cualquier "script" que se mande acá es ignorado, la conexión SSH sola
+      # ya dispara /var/www/numo/auto-update.sh.
+      - name: Trigger deploy en testnumo
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.STAGING_HOST }}
+          username: ${{ vars.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: echo "deploy trigger"

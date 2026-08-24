@@ -142,6 +142,273 @@ describe('_aporteConRatchet', () => {
   });
 });
 
+describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruzada entre movimientos)', () => {
+  // Caso real simple, folioExterno 260800166: 2 movimientos pagan $100 cada uno a la misma
+  // CxC, se revierte 1 sin Aut/Numo — la reversión canceló el abono MÁS RECIENTE (American
+  // Express), no el más viejo (BANCOMER). _montoSaldoLinkPorMovimiento (evaluado por
+  // separado) daba 0 y 0 para este caso — Kore reportaba $100 pagados de verdad.
+  test('caso real folioExterno 260800166: reversión sin tag cancela el abono MÁS RECIENTE, no el más viejo', () => {
+    const raw0 = {
+      total: 1591.72,
+      saldoActual: 1491.72,
+      movimientos: [
+        { serie: 'A0', folio: '260800186', fecha: '2026-08-21T16:40:25.531697Z', total: 1591.72 },
+        { serie: 'ABO', folio: '260800300', fecha: '2026-08-21T16:45:15.898396Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' }, { nombre: 'Banco', valor: 'BANCOMER' },
+          ] }] },
+        { serie: 'ABO', folio: '260800302', fecha: '2026-08-21T16:46:02.926969Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '040727' }, { nombre: 'Numo', valor: '477911' }, { nombre: 'Banco', valor: 'American Express' },
+          ] }] },
+        { serie: 'REV ABO', folio: '260800024', fecha: '2026-08-21T16:50:11.280541Z', total: 100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100 }] },
+      ],
+    };
+    const movBancomer = { numeroAutorizacion: '18411758', folio: 'X' }; // se revierte NUNCA — debe quedar con $100
+    const movAmex      = { numeroAutorizacion: '477911',   folio: 'Y' }; // se revierte — debe quedar sin aporte
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [movBancomer, movAmex]);
+
+    expect(resultado.get(0)).toBe(100); // BANCOMER, índice 0
+    expect(resultado.has(1)).toBe(false); // American Express, índice 1 — completamente revertido
+  });
+
+  // Caso real complejo, folioExterno 260800164: 2 movimientos (BANCOMER/American Express)
+  // con 3 ciclos de aplicar→revertir intercalados en ~5 minutos. Verificado a mano contra el
+  // propio total de Kore (total-saldoActual=150): BANCOMER debía terminar en $100 (su primer
+  // abono, nunca tocado de nuevo) y American Express en $50 (su última reaplicación, la única
+  // que no se volvió a revertir). _montoSaldoLinkPorMovimiento (evaluado por separado) daba 0
+  // y 0 para este caso.
+  test('caso real folioExterno 260800164: 3 ciclos de aplicar/revertir intercalados entre 2 movimientos, cada reversión cancela lo más reciente', () => {
+    const raw0 = {
+      total: 346.62,
+      saldoActual: 196.62,
+      movimientos: [
+        { serie: 'A0', folio: '260800183', fecha: '2026-08-21T14:59:51.206396Z', total: 346.62 },
+        { serie: 'ABO', folio: '260800288', fecha: '2026-08-21T15:09:13.048446Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' }, { nombre: 'Banco', valor: 'BANCOMER' },
+          ] }] },
+        { serie: 'ABO', folio: '260800290', fecha: '2026-08-21T15:12:19.709737Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '040727' }, { nombre: 'Numo', valor: '477911' }, { nombre: 'Banco', valor: 'American Express' },
+          ] }] },
+        { serie: 'REV ABO', folio: '260800021', fecha: '2026-08-21T16:10:10.799155Z', total: 100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100 }] },
+        { serie: 'ABO', folio: '260800292', fecha: '2026-08-21T16:11:31.330654Z', total: -246.62,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 246.62, adicionales: [
+            { nombre: 'Aut', valor: '040727' }, { nombre: 'Numo', valor: '477911' }, { nombre: 'Banco', valor: 'American Express' },
+          ] }] },
+        { serie: 'REV ABO', folio: '260800022', fecha: '2026-08-21T16:12:04.677325Z', total: 246.62,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 246.62 }] },
+        { serie: 'ABO', folio: '260800294', fecha: '2026-08-21T16:13:02.653023Z', total: -50,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 50, adicionales: [
+            { nombre: 'Aut', valor: '040727' }, { nombre: 'Numo', valor: '477911' }, { nombre: 'Banco', valor: 'American Express' },
+          ] }] },
+        { serie: 'ABO', folio: '260800296', fecha: '2026-08-21T16:13:54.622154Z', total: -50,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 50, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' }, { nombre: 'Banco', valor: 'BANCOMER' },
+          ] }] },
+        { serie: 'REV ABO', folio: '260800023', fecha: '2026-08-21T16:14:20.116981Z', total: 50,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 50 }] },
+      ],
+    };
+    const movBancomer = { numeroAutorizacion: '18411758', folio: 'X' };
+    const movAmex      = { numeroAutorizacion: '477911',   folio: 'Y' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [movBancomer, movAmex]);
+
+    expect(resultado.get(0)).toBe(100); // BANCOMER: solo su primer abono (288) sigue vigente
+    expect(resultado.get(1)).toBe(50);  // American Express: solo su última reaplicación (294) sigue vigente
+    // Reconcilia exacto con Kore: total-saldoActual = 346.62-196.62 = 150 = 100+50.
+    expect(resultado.get(0) + resultado.get(1)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  test('reversa cuyo monto no coincide con NINGUNA entrada de la pila se ignora (no se inventa a qué abono pertenece)', () => {
+    const raw0 = {
+      total: 200, saldoActual: 100,
+      movimientos: [
+        { serie: 'ABO', folio: '1', fecha: '2026-01-01T00:00:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Numo', valor: '111' },
+          ] }] },
+        { serie: 'REV ABO', folio: '2', fecha: '2026-01-01T00:05:00Z', total: 37, // no coincide con nada
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 37 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '111', folio: 'X' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(100); // la reversa sin match no toca nada
+  });
+
+  test('un abono tageado que pertenece a OTRO movimiento fuera del grupo no compite por la pila de este grupo', () => {
+    const raw0 = {
+      total: 200, saldoActual: 100,
+      movimientos: [
+        { serie: 'ABO', folio: '1', fecha: '2026-01-01T00:00:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [{ nombre: 'Numo', valor: '111' }] }] },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [{ nombre: 'Numo', valor: '999-AJENO' }] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '111', folio: 'X' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(100); // solo el propio, el ajeno se ignora por completo
+  });
+
+  // Caso real 2026-08-24, folioExterno 260800204: "Depósito en efectivo" manda un tag
+  // DISTINTO a Aut/Numo — { Nombre: 'Num Recibo', Valor: mov.folio } (collection-request.
+  // service.js). Antes del fix, _perteneceAEsteMovimiento/_tieneTagIdentidadPropia no
+  // reconocían 'Num Recibo': los 2 abonos ($500 y $100) caían como "sin tag propio", nunca se
+  // empujaban a la pila, y la reversión de $100 (sin tag, como toda REV ABO) no encontraba
+  // nada que cancelar — calculado quedaba en 0 (vacío) aunque Kore reportara $500 vigentes
+  // (total-saldoActual=500), disparando la red de seguridad de atribución y bloqueando la
+  // reversión entera ("NO se toca ningún link").
+  test('caso real folioExterno 260800204: Depósito en efectivo (tag "Num Recibo") se reconoce como aporte propio, no como reversa anónima', () => {
+    const raw0 = {
+      total: 2203.36,
+      saldoActual: 1703.36, // total-saldoActual = 500 (el abono de $500 sigue vigente)
+      movimientos: [
+        { serie: 'A0', folio: '260800204', fecha: '2026-08-01T00:00:00Z', total: 2203.36 },
+        { serie: 'ABO', folio: '1', fecha: '2026-08-24T18:40:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-4361' },
+          ] }] },
+        { serie: 'ABO', folio: '2', fecha: '2026-08-24T18:52:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 100, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-4361' },
+          ] }] },
+        { serie: 'REV ABO', folio: '3', fecha: '2026-08-24T18:52:11Z', total: 100,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 100 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: null, folio: 'F-4361' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500);
+    expect(resultado.get(0)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  // Misma CxC pagada con 2 movimientos de tipos DISTINTOS: uno por Depósito en efectivo
+  // (tag 'Num Recibo') y otro por Transferencia (tags 'Aut'/'Numo'). Antes del fix ambos
+  // tags convivían sin problema entre sí (el bug era que 'Num Recibo' no se reconocía EN
+  // ABSOLUTO, no que se confundiera con 'Aut'/'Numo') — este test fija que, con los 3 tags
+  // ahora reconocidos, cada aporte sigue atribuyéndose EXCLUSIVAMENTE a su propio
+  // movimiento, sin cruzarse entre el depósito en efectivo y la transferencia.
+  test('depósito en efectivo (Num Recibo) y transferencia (Aut/Numo) como aportes de 2 movimientos distintos a la misma CxC, sin cruzarse', () => {
+    const raw0 = {
+      total: 1000, saldoActual: 400, // 600 pagados entre los dos
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 1000 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -400,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 400, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-EFECTIVO' },
+          ] }] },
+        { serie: 'ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: -200,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 200, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' },
+          ] }] },
+      ],
+    };
+    const movEfectivo      = { numeroAutorizacion: null,          folio: 'F-EFECTIVO' };
+    const movTransferencia = { numeroAutorizacion: '18411758',    folio: 'F-TRANSFER' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [movEfectivo, movTransferencia]);
+
+    expect(resultado.get(0)).toBe(400); // efectivo: solo lo suyo
+    expect(resultado.get(1)).toBe(200); // transferencia: solo lo suyo
+    expect(resultado.get(0) + resultado.get(1)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+});
+
+describe('_montoSaldoLinkPorMovimiento — reconoce "Num Recibo" (Depósito en efectivo, caso real 2026-08-24)', () => {
+  test('abono propio tageado con Num Recibo se atribuye a este movimiento (no cae en el neteo de "reversa sin tag")', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-4361' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: null, folio: 'F-4361' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    expect(resultado).toBe(500);
+  });
+
+  test('abono con Num Recibo de OTRO movimiento se atribuye a "de otro", no se confunde con una reversa sin tag propia', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: 'F-OTRO' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: null, folio: 'F-4361' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    // Sin ninguna coincidencia PROPIA, huboCoincidenciaPropia queda false -> null (no 0).
+    expect(resultado).toBeNull();
+  });
+});
+
+describe('_backfillFormasPagoYFolioFiscal — aporteBancarioPrevio (2026-08-21, bug real: saldoPagado quedaba en $0 en el dropdown "CxC vinculadas")', () => {
+  // Reproduce el caso real folioExterno 260800166: BANCOMER debía terminar en $150
+  // (saldoErpAportado ya viene corregido por fuera vía _aportesPorErpIdCronologico), pero
+  // saldoPagado (bancario-únicamente) se calculaba con _montoSaldoLinkPorMovimiento evaluado
+  // AISLADO — el mismo bug de atribución cruzada, dando $0 en vez de $150. El dropdown "CxC
+  // vinculadas" (banks.component.html) muestra `saldoPagado` con prioridad sobre saldoActual.
+  const raw0 = {
+    total: 1591.72, saldoActual: 1441.72,
+    movimientos: [
+      { serie: 'ABO', fecha: '2026-08-21T16:45:15Z', total: -100,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [{ nombre: 'Numo', valor: '18411758' }] }] },
+      { serie: 'ABO', fecha: '2026-08-21T16:46:02Z', total: -100,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [{ nombre: 'Numo', valor: '477911' }] }] },
+      { serie: 'REV ABO', fecha: '2026-08-21T16:50:11Z', total: 100,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100 }] },
+      { serie: 'ABO', fecha: '2026-08-21T17:11:55Z', total: -50,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 50, adicionales: [{ nombre: 'Numo', valor: '18411758' }] }] },
+      { serie: 'ABO', fecha: '2026-08-21T17:12:59Z', total: -50,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 50, adicionales: [{ nombre: 'Numo', valor: '477911' }] }] },
+      { serie: 'REV ABO', fecha: '2026-08-21T17:13:43Z', total: 50,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 50 }] },
+    ],
+  };
+  const movBancomer = { numeroAutorizacion: '18411758', folio: 'X' };
+  const link = { saldoErpAportado: null, saldoPagadoTotal: null, saldoPagado: null, folioFiscal: null };
+
+  test('sin aporteBancarioPrevio (llamadores viejos, sync/recompute): sigue con el cálculo aislado de siempre (bug preexistente, sin cambios)', () => {
+    const resultado = router._backfillFormasPagoYFolioFiscal(link, raw0, movBancomer, true, 150);
+
+    expect(resultado.saldoPagadoTotal).toBe(150); // este SÍ viene del aporteNuevo pasado, no del cálculo aislado
+    expect(resultado.saldoPagado).toBe(0); // bug preexistente: el cálculo aislado interno sigue dando 0
+  });
+
+  test('CON aporteBancarioPrevio (erp-reversion.service.js): usa el valor ya calculado por la pasada cronológica, corrigiendo el bug', () => {
+    const resultado = router._backfillFormasPagoYFolioFiscal(link, raw0, movBancomer, true, 150, 150);
+
+    expect(resultado.saldoPagadoTotal).toBe(150);
+    expect(resultado.saldoPagado).toBe(150); // corregido — coincide con saldoErpAportado
+  });
+
+  test('aporteBancarioPrevio=0 (movimiento completamente revertido) se respeta tal cual, no cae al fallback', () => {
+    const resultado = router._backfillFormasPagoYFolioFiscal(link, raw0, movBancomer, true, null, 0);
+
+    expect(resultado.saldoPagado).toBe(0);
+  });
+});
+
 // _FILTRO_LINK_ATRAPADO — fix 2026-08-06: antes exigía conciliacionFinalizadaAt != null,
 // invisible para los links de Solicitudes de Cobro/Aplicar cobro manual (ese campo NUNCA se
 // llena en ese flujo). Ahora el patrón "atrapado" (checkpoint avanzó, folioFiscal sin

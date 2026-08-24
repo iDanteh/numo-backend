@@ -262,6 +262,99 @@ describe('identificar() — reconciliación advisory (nunca bloquea)', () => {
   });
 });
 
+// Bug real 2026-08-24: el filtro de BankMovement.find() usaba `uuidXML: null`
+// (= "sin NINGÚN erpLink con folioFiscal"), lo que bloqueaba reutilizar un
+// movimiento con un abono parcial previo para agregar OTRO abono parcial
+// legítimo contra la MISMA CxC vía una solicitud de cobro distinta. Regla de
+// negocio confirmada: un movimiento sigue siendo candidato mientras su
+// `status` sea 'no_identificado' o 'reclasificado' — 'identificado'/'otros' lo
+// excluyen. Estos tests fijan el filtro real usado (antes no había cobertura
+// de este guard en absoluto).
+describe('identificar() — guard de disponibilidad del movimiento (status, no uuidXML)', () => {
+  test('BankMovement.find() filtra por status no_identificado/reclasificado, nunca por uuidXML', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 10000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 220336 }], monto: 10000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    // Movimiento con un erpLink previo (abono parcial de otra solicitud) — uuidXML
+    // ya no-nulo en un escenario real, pero eso no debe ser lo que se filtra.
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1', {
+      uuidXML: 'FOLIO-FISCAL-EXISTENTE',
+      erpLinks: [{ erpId: 'CXC-1', saldoPagado: 50000, saldoPagadoTotal: 50000, folioFiscal: 'FOLIO-FISCAL-EXISTENTE' }],
+    })]);
+    setupHappyKore();
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1' });
+
+    expect(BankMovement.find).toHaveBeenCalledWith({
+      _id: { $in: ['mov-1'] },
+      status: { $in: ['no_identificado', 'reclasificado'] },
+    });
+  });
+
+  test('movimiento excluido por la query (ej. status identificado/otros) -> NotFoundError', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 10000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 10000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    // Simula lo que Mongo devolvería para un movimiento con status 'identificado'/'otros':
+    // no matchea el filtro, así que el find real ya lo excluye del arreglo.
+    BankMovement.find.mockResolvedValue([]);
+    setupHappyKore();
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1' }),
+    ).rejects.toThrow('Movimiento bancario');
+
+    expect(koreCaja.obtenerSesionCaja).not.toHaveBeenCalled();
+  });
+});
+
+// Caso real folioExterno 260800204 (2026-08-24): tras el fix del guard de status, un
+// movimiento con un abono parcial previo ($500, otra solicitud) vuelve a ser candidato
+// para un 2do abono ($100) contra la MISMA CxC. Esto solo es correcto si
+// buildErpLinksParaCobro (collection-request-erp-links.js, NO mockeado en este archivo —
+// corre real) ACUMULA sobre el erpLink existente en vez de reemplazarlo. El guard nuevo
+// (test de arriba) prueba que la query ya no bloquea el movimiento; este prueba que, una
+// vez adentro, el dato queda bien sumado — la mitad de la regla de negocio que faltaba
+// cubrir end-to-end.
+describe('identificar() — 2do abono parcial ACUMULA sobre erpLink existente (regla de negocio, caso real folioExterno 260800204)', () => {
+  test('buildErpLinksParaCobro suma sobre el erpLink previo de la misma CxC, no lo reemplaza', async () => {
+    const f1 = formaPago('f1', 'Depósito en efectivo', 100);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 2203.36 }], monto: 100 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    // Movimiento con un erpLink previo de $500 (otra solicitud de cobro, ya autorizada) —
+    // status sigue 'no_identificado' (el depósito de $4361.38 no fue cubierto por ese solo
+    // abono), así que pasa el guard nuevo y llega a acumular.
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1', {
+      erpLinks: [{
+        erpId: 'CXC-1', saldoActual: 1703.36, saldoPagado: 500, saldoPagadoTotal: 500,
+        total: 2203.36, serie: 'A0', folioExterno: '260800204', tipoPago: 'PPD',
+        desglosePorFormaPago: [{
+          formaPagoId: 'fp-anterior', formaPagoDescripcion: 'DEPOSITO EN EFECTIVO',
+          monto: 500, fecha: new Date('2026-08-24T18:40:00Z'),
+        }],
+      }],
+    })]);
+    setupHappyKore();
+    koreCaja.obtenerCuentasKore.mockResolvedValue([{ id: 'CXC-1', saldoActual: 1703.36, total: 2203.36 }]);
+    koreCaja.listarFormasPago.mockResolvedValue([{ id: 'fp-f1', claveSAT: '01', nombre: 'Depósito en efectivo' }]);
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    const erpLinksArg = bankService.setErpIds.mock.calls[0][1];
+    const link = erpLinksArg.find(l => l.erpId === 'CXC-1');
+    // Acumulado, NO reemplazado: 500 (previo) + 100 (nuevo) = 600.
+    expect(link.saldoPagadoTotal).toBe(600);
+    expect(link.saldoPagado).toBe(600);
+    // El desglose del abono viejo se PRESERVA junto al nuevo — no se pisa.
+    expect(link.desglosePorFormaPago).toHaveLength(2);
+    expect(link.desglosePorFormaPago[0].monto).toBe(500);
+    expect(link.desglosePorFormaPago[1].monto).toBe(100);
+    // saldoActual baja solo por el pago NUEVO ($100), sobre el saldoActual fresco de Kore
+    // (1703.36), no se recalcula sobre el histórico completo.
+    expect(link.saldoActual).toBeCloseTo(1603.36, 2);
+  });
+});
+
 describe('identificar() — abort post-Kore (D4: inconsistenciaPostKore, NO reintentar)', () => {
   test('Kore acepta pero el 2do setErpIds falla -> marca inconsistenciaPostKore y NO reintenta', async () => {
     const f1 = formaPago('f1', 'Transferencia', 60000);

@@ -983,15 +983,26 @@ function _montoSaldoLinkBancario(raw0) {
 // cerrado con el criterio viejo pre-Aut-matching, antes de que este bug pudiera manifestarse).
 // La comparación ahora es "el folio aparece dentro del Aut" en vez de igualdad exacta — un
 // folio de 6 dígitos casi no tiene riesgo real de aparecer como substring de un Aut ajeno.
-// Se aceptan ambas coincidencias (Numo/Aut) porque una misma CxC puede traer movimientos
-// tageados con una u otra según cómo Kore/Numo aplicó cada pago.
+// Se aceptan las 3 coincidencias (Numo/Aut/Num Recibo) porque una misma CxC puede traer
+// movimientos tageados con cualquiera de ellas según cómo Kore/Numo aplicó cada pago —
+// 'Num Recibo' es el tag propio de "Depósito en efectivo" (collection-request.service.js,
+// DatosAdicionales: [{ Nombre: 'Num Recibo', Valor: mov.folio }]), un contrato distinto al
+// de Aut/Numo (folio consecutivo de Numo, no una autorización bancaria) — match EXACTO
+// contra mov.folio, no `.includes()` como Aut, porque el valor mandado a Kore ES literalmente
+// mov.folio, no una cadena más larga que lo contiene.
+function _tieneTagIdentidadPropia(fp) {
+  return (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut' || a.nombre === 'Num Recibo');
+}
+
 function _perteneceAEsteMovimiento(fp, mov) {
   const autNormMov = _normalizarAutorizacion(mov.numeroAutorizacion);
   const numoTag    = (fp.adicionales ?? []).find(a => a.nombre === 'Numo');
   if (numoTag && autNormMov && _normalizarAutorizacion(numoTag.valor) === autNormMov) return true;
-  const autTag  = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
   const folioMov = String(mov.folio ?? '').trim();
+  const autTag  = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
   if (autTag && folioMov && String(autTag.valor ?? '').trim().includes(folioMov)) return true;
+  const numReciboTag = (fp.adicionales ?? []).find(a => a.nombre === 'Num Recibo');
+  if (numReciboTag && folioMov && String(numReciboTag.valor ?? '').trim() === folioMov) return true;
   return false;
 }
 
@@ -1026,9 +1037,7 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
 
   for (const m of conFormaPago) {
     const esMio    = m.formasPago.some(fp => _perteneceAEsteMovimiento(fp, mov));
-    const esDeOtro = !esMio && m.formasPago.some(fp =>
-      (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut'),
-    );
+    const esDeOtro = !esMio && m.formasPago.some(fp => _tieneTagIdentidadPropia(fp));
     const total = m.total ?? 0;
 
     if (esMio) {
@@ -1046,6 +1055,67 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
   }
 
   return huboCoincidenciaPropia ? Math.abs(miNeto) : null;
+}
+
+// 2026-08-21 (bug real encontrado en producción, folioExterno 260800164/260800166):
+// _montoSaldoLinkPorMovimiento (arriba) evalúa cada movimiento POR SEPARADO, sin saber nada
+// de los otros movimientos que comparten la misma CxC — cuando 2+ movimientos tienen
+// acumuladores "míos" que coinciden en magnitud en el mismo punto de la secuencia (algo
+// común: montos redondos repetidos, $50/$100), una reversa SIN Aut/Numo (Kore nunca las
+// tagea) puede quedar atribuida a AMBOS cálculos a la vez, dejando los dos en 0 aunque Kore
+// tenga plata realmente pagada. Confirmado corriendo el caso real: dio 0 y 0 cuando el
+// correcto era 100 y 50.
+//
+// Esta función resuelve el aporte de TODOS los movimientos humanos de una CxC en UNA sola
+// pasada cronológica compartida, con una pila (LIFO): cada abono identificable (Aut/Numo
+// propio de alguno de `movs`) se apila junto con su monto; una reversa sin identidad cancela
+// la entrada MÁS RECIENTE de la pila cuyo monto coincide exacto (tolerancia de 1 centavo).
+// Confirmado con 2 casos reales de producción, independientes entre sí: una reversión SIEMPRE
+// cancela el abono más reciente todavía sin resolver, sin importar de qué movimiento sea —
+// Kore, aparentemente, no permite tener más de una "corrección" pendiente a la vez. Si
+// ninguna entrada de la pila coincide en magnitud, la reversa se ignora (no se inventa a qué
+// abono pertenece — mismo criterio que ya usa _montoSaldoLinkPorMovimiento).
+//
+// `incluirFormaPago` (opcional, mismo contrato que en _montoSaldoLinkPorMovimiento): filtra
+// qué formasPago de Kore participan de la pila — usado para separar el aporte "bancario
+// únicamente" (saldoPagado) del aporte "todas las formas" (saldoErpAportado/saldoPagadoTotal).
+//
+// Devuelve un Map<índice en `movs`, montoNeto> — un movimiento sin ninguna coincidencia
+// propia (nunca apareció en la pila) o completamente revertido (su entrada fue cancelada)
+// simplemente no aparece en el mapa, equivalente al `null`/`0` de _montoSaldoLinkPorMovimiento
+// para efectos de sus llamadores (ambos casos llevan a desvincular).
+function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true) {
+  const conFormaPago = (raw0?.movimientos ?? []).filter(
+    m => Array.isArray(m.formasPago) && m.formasPago.some(incluirFormaPago),
+  );
+
+  const pila = []; // { movIndex, monto } — monto siempre positivo, orden = orden de llegada
+  for (const m of conFormaPago) {
+    const movIndex = movs.findIndex(mov => m.formasPago.some(fp => _perteneceAEsteMovimiento(fp, mov)));
+    const tieneTagPropio = m.formasPago.some(fp => _tieneTagIdentidadPropia(fp));
+
+    if (movIndex !== -1) {
+      pila.push({ movIndex, monto: Math.abs(m.total ?? 0) });
+    } else if (!tieneTagPropio) {
+      // Reversa sin identidad propia — cancela la entrada más reciente que coincide en monto.
+      const montoRev = Math.abs(m.total ?? 0);
+      for (let i = pila.length - 1; i >= 0; i--) {
+        if (Math.abs(pila[i].monto - montoRev) < 0.01) {
+          pila.splice(i, 1);
+          break;
+        }
+      }
+      // si ninguna coincide, se ignora — no se inventa a qué abono pertenece.
+    }
+    // si tiene tag propio pero no matchea NINGÚN movimiento de `movs` (pertenece a otro
+    // movimiento fuera de este grupo), se ignora — no compite por la pila de este grupo.
+  }
+
+  const resultado = new Map();
+  for (const { movIndex, monto } of pila) {
+    resultado.set(movIndex, (resultado.get(movIndex) ?? 0) + monto);
+  }
+  return resultado;
 }
 
 // Piso de aporte para un depósito bancario ya vinculado por un HUMANO: nunca debe bajar en
@@ -1107,13 +1177,22 @@ function _folioFiscalDentroDeVentanaReintento(conciliacionFinalizadaAt, fechaAnc
   return dias <= DIAS_MAX_REINTENTO_FOLIO_FISCAL;
 }
 
-function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo) {
+// aporteBancarioPrevio (2026-08-21, opcional): cuando el llamador YA calculó el aporte
+// bancario-únicamente con _aportesPorErpIdCronologico (cruzando todos los movimientos de la
+// CxC, ver erp-reversion.service.js), se reusa acá en vez de recalcularlo con
+// _montoSaldoLinkPorMovimiento evaluado por separado — ese enfoque aislado es el que
+// atribuía la MISMA reversión a 2 movimientos distintos (bug real, folioExterno
+// 260800164/260800166: el `saldoPagado` de este mismo helper quedaba en $0 aunque
+// saldoErpAportado ya viniera corregido en $150 por fuera). Sin este parámetro (undefined),
+// se mantiene el cálculo aislado de siempre — necesario para _syncErpKoreJob/
+// _recomputeErpKoreJob, que todavía no pasan por una pasada cronológica cruzada.
+function _backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, aporteNuevo, aporteBancarioPrevio) {
   // aporteNuevo/saldoPagadoCalc ahora pueden venir en null (_montoSaldoLinkPorMovimiento no
   // encontró coincidencia propia) — se conserva el valor previo del link en vez de pisarlo
   // con un cero falso (mismo criterio de "no determinado" != "cero" del resto del archivo).
   const saldoPagadoTotal   = aporteNuevo ?? link.saldoPagadoTotal ?? null;
   const saldoPagadoCalc    = esHumano
-    ? _montoSaldoLinkPorMovimiento(raw0, mov, fp => _esFormaPagoBancariaKore(fp.nombreFormaPago))
+    ? (aporteBancarioPrevio !== undefined ? aporteBancarioPrevio : _montoSaldoLinkPorMovimiento(raw0, mov, fp => _esFormaPagoBancariaKore(fp.nombreFormaPago)))
     : aporteNuevo;
   const saldoPagado      = saldoPagadoCalc ?? link.saldoPagado ?? null;
   // Fix 2026-07-28 (folio 034310): Kore puede devolver folioFiscal como '' (string vacío) en
@@ -2752,6 +2831,8 @@ router._sincronizarConRetry         = _sincronizarConRetry;
 router._movimientosKoreDesde        = _movimientosKoreDesde;
 router._montoSaldoLink              = _montoSaldoLink;
 router._montoSaldoLinkPorMovimiento = _montoSaldoLinkPorMovimiento;
+router._aportesPorErpIdCronologico  = _aportesPorErpIdCronologico;
+router._esFormaPagoBancariaKore     = _esFormaPagoBancariaKore;
 router._montoSaldoLinkPorAutorizacion = _montoSaldoLinkPorAutorizacion;
 router._aporteConRatchet            = _aporteConRatchet;
 router._FILTRO_LINK_ATRAPADO        = _FILTRO_LINK_ATRAPADO;

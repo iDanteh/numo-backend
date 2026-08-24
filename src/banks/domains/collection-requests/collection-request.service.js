@@ -639,7 +639,21 @@ async function identificar(id, body, user) {
 
   // 1 sola query para TODOS los movimientos asignados (reemplaza el antiguo
   // findOne de un solo bankMovementId) — spec: "el número de queries no escala".
-  const movs = await BankMovement.find({ _id: { $in: movIds }, uuidXML: null });
+  //
+  // Bug real 2026-08-24: este filtro usaba `uuidXML: null`, que se recalcula en
+  // aplicarLogicaErp() (bank.service.js) como "¿tiene ALGÚN erpLink con
+  // folioFiscal?" — bloqueaba CUALQUIER movimiento que ya hubiera tocado
+  // cualquier CxC alguna vez, incluso para agregar un SEGUNDO abono parcial
+  // legítimo contra la MISMA CxC desde otra solicitud de cobro (reproducido en
+  // vivo: un depósito con un abono parcial de $500/$2203.36, status todavía
+  // 'no_identificado', fue rechazado 404 al intentar aplicarle $100 más de la
+  // misma CxC). Regla de negocio confirmada por el usuario: un depósito sigue
+  // siendo candidato a nuevas identificaciones mientras su `status` sea
+  // 'no_identificado' o 'reclasificado' (por conciliar) — 'identificado' u
+  // 'otros' sí deben excluirlo. buildErpLinksParaCobro() (collection-request-erp-links.js)
+  // ya acumulaba correctamente sobre erpLinks existentes del mismo erpId — el
+  // único bloqueo real estaba acá.
+  const movs = await BankMovement.find({ _id: { $in: movIds }, status: { $in: ['no_identificado', 'reclasificado'] } });
   if (movs.length !== movIds.length) throw new NotFoundError('Movimiento bancario');
   const movPorId = new Map(movs.map(m => [String(m._id), m]));
   const movsOrdenados = movIds.map(movId => movPorId.get(movId));

@@ -24,6 +24,15 @@ const _DEBUG_SPLIT_PAGO = process.env.DEBUG_SPLIT_PAGO === '1';
 // en cobros-sucursal-puente.service.js.
 const TIPO_ORIGEN_CARGO_ESPECIAL = 'Cargo Especial';
 
+// Mismo patrón de ocultamiento que ETIQUETA_SALDO_FAVOR_OCULTO
+// (poliza.service.js/cobros-sucursal-puente.service.js: tipoOrigen='Cobro
+// Sucursal' + este reglaNombre → `_extraerCobrosSucursal` lo saca a "Otros
+// Ingresos oculto"), pero para un caso distinto (2026-08-25): un Cargo de
+// Efectivo/Tarjeta cuyo cobro real ya se contabilizó otro día vía
+// `_cobrosSinFacturaPorCentro` (ver `yaContabilizadoOtroDia` en
+// `_prefetchAjustesFacturaPropia`, cfdi-poliza-generator.service.js).
+const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
+
 // Caja/Bancos "por identificar" — mismos códigos que
 // cfdi-poliza-generator.service.js/cobros-sucursal-puente.service.js
 // (duplicado a propósito, archivos pequeños, independientes). Son las ÚNICAS
@@ -862,6 +871,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Facturas Globales de Hidalgo 2026-08-14).
         _serieVentaTicket: fp.serieVentaTicket ?? null,
         _folioVentaTicket: fp.folioVentaTicket ?? null,
+        // `yaContabilizadoOtroDia` (ver `_prefetchAjustesFacturaPropia`,
+        // 2026-08-25): este cobro real ya se contabilizó en su día REAL vía
+        // "Cobros sin factura" (`_cobrosSinFacturaPorCentro`) — se oculta
+        // este Cargo (día de la factura) de "Depósitos consolidados" para no
+        // duplicar el dinero entre los dos días. El Abono Ingresos/IVA de
+        // esta misma factura queda visible sin cambios (la venta sí ocurrió
+        // y se facturó aquí, solo el lado de caja ya se contó antes).
+        ...(fp.yaContabilizadoOtroDia ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_COBRO_YA_CONTABILIZADO } : {}),
         ...(esUltimo ? extraEnUltima : {}),
       });
     });
@@ -1551,7 +1568,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }
         : m.tipoOrigen === 'Venta Sin Cobro'
           ? { tipoOrigen: 'Venta Sin Cobro' }
-          : {}
+          // `yaContabilizadoOtroDia` (ver arriba, `splitPorFormaPagoReal`):
+          // mismo problema — debe sobrevivir al spread de `satMeta` o se
+          // pierde el ocultamiento y el Cargo vuelve a verse como 'Venta'
+          // normal, duplicando el dinero entre los dos días.
+          : m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
+            ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }
+            : {}
     ),
   }));
 }

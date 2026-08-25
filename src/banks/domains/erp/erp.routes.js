@@ -22,8 +22,9 @@ const { emitToUser }                     = require('../../shared/socket');
 const { ERP_TOLERANCE, updateErpIds }     = require('../banks/bank.service');
 const { PERMISSIONS }                    = require('../../../shared/config/rbac');
 const rbacStore                           = require('../../../shared/services/rbac-store');
+const globalConfigService                 = require('../../../shared/services/global-config.service');
 const {
-  KoreCajaError, koreTokenCache, KORE_CAJA_BASE_URL,
+  KoreCajaError, koreTokenCache, obtenerCajaBaseUrl,
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
   listarBancos, listarFormasPago,
 }                                         = require('./kore-caja.service');
@@ -41,9 +42,21 @@ const router = express.Router();
 
 const ERP_PAGE_SIZE = 50;
 
-// Exclusivos de GET /reporte (facturas para reporte de pagos-banco).
-const ERP_FACT_BASE_URL = (process.env.ERP_FACT_BASE_URL || '').replace(/\/$/, '');
-const ERP_TOKEN         = process.env.ERP_TOKEN || '';
+// Configuraciones Globales, sección `bancos`, clave FACT_BASE_URL — exclusiva de
+// GET /reporte (facturas para reporte de pagos-banco), reemplaza
+// process.env.ERP_FACT_BASE_URL.
+async function _factBaseUrl() {
+  const valor = await globalConfigService.getValue('bancos', 'FACT_BASE_URL');
+  return valor.replace(/\/$/, '');
+}
+
+// Configuraciones Globales, sección `bancos`, clave TOKEN (misma que
+// erp-sync.service.js) — reemplaza process.env.ERP_TOKEN para este archivo;
+// visor/services/erp.service.js sigue leyendo el .env directo (mismo valor
+// físico, migración gradual).
+async function _erpToken() {
+  return globalConfigService.getValue('bancos', 'TOKEN');
+}
 
 // GET /api/erp/cuentas-pendientes
 // Parámetros: fechaDesde, fechaHasta, estadoCobro (opcional; 'pendiente' para solo pendientes), page
@@ -78,7 +91,12 @@ router.get('/cuentas-pendientes', authenticate, permit(PERMISSIONS.BANKS_ERP_REA
       fechaDesde, fechaHasta, estadoCobro, serieExterna, folioExterno, nombrePersona, origen,
     }));
   } catch (err) {
-    if (err.message?.includes('ERP no configurado')) {
+    // 'ERP no configurado' es el mensaje histórico (.env ausente); 'No existe la
+    // configuración' es el que tira global-config.service.js cuando la sección
+    // `bancos` todavía no fue sembrada en este ambiente (ver
+    // banks/scripts/seed-global-config-banks.js) — ambos casos son "el ERP
+    // no está configurado todavía", mismo 503 amigable para los dos.
+    if (err.message?.includes('ERP no configurado') || err.message?.includes('No existe la configuración')) {
       return res.status(503).json({ error: err.message });
     }
     throw err;
@@ -261,8 +279,11 @@ function _resolverCuentaDesdeCfdiLiquidado(cfdi) {
 // GET /api/erp/facturas/reporte
 // Parámetros: fechaDesde, fechaHasta, tipo_comprobante (opcional)
 router.get('/reporte', authenticate, asyncHandler(async (req, res) => {
-  if (!ERP_FACT_BASE_URL) {
-    return res.status(503).json({ error: 'ERP no configurado (ERP_FACT_BASE_URL ausente)' });
+  let factBaseUrl;
+  try {
+    factBaseUrl = await _factBaseUrl();
+  } catch {
+    return res.status(503).json({ error: 'ERP no configurado (sección bancos sin FACT_BASE_URL en Configuraciones Globales)' });
   }
 
   const { fechaInicio, fechaFin, tipo_comprobante } = req.query;
@@ -271,9 +292,9 @@ router.get('/reporte', authenticate, asyncHandler(async (req, res) => {
   const params = { fecha_inicio: fechaInicio, fecha_fin: fechaFin };
   if (tipo_comprobante) params.tipo_comprobante = tipo_comprobante;
 
-  const response = await axios.get(`${ERP_FACT_BASE_URL}/api/facturas/reporte`, {
+  const response = await axios.get(`${factBaseUrl}/api/facturas/reporte`, {
     params,
-    headers: { Authorization: `Bearer ${ERP_TOKEN}` },
+    headers: { Authorization: `Bearer ${await _erpToken()}` },
     timeout: 15000,
   });
 
@@ -628,8 +649,9 @@ router.get('/cobros/conceptos', authenticate, asyncHandler(async (req, res) => {
   const koreToken = getKoreToken(req, res);
   if (!koreToken) return;
 
-  console.log(`[cobros/conceptos] llamando a ${KORE_CAJA_BASE_URL}/conceptos`);
-  const r = await axios.get(`${KORE_CAJA_BASE_URL}/conceptos`, {
+  const cajaBaseUrl = await obtenerCajaBaseUrl();
+  console.log(`[cobros/conceptos] llamando a ${cajaBaseUrl}/conceptos`);
+  const r = await axios.get(`${cajaBaseUrl}/conceptos`, {
     params:  { TYPE: 'ENTRADA' },
     headers: { Authorization: `Bearer ${koreToken}` },
     timeout: 10000,
@@ -725,7 +747,7 @@ router.get('/cobros/saldos-favor/buscar', authenticate, asyncHandler(async (req,
   let r;
   try {
     r = await axios.get(
-      `${KORE_CAJA_BASE_URL}/anticipos/0`,
+      `${await obtenerCajaBaseUrl()}/anticipos/0`,
       {
         params:  { serie, folio, esAnticipo: buscarAnticipo },
         headers: { Authorization: `Bearer ${koreToken}` },
@@ -788,7 +810,7 @@ router.get('/cobros/saldos-favor/:personaId', authenticate, asyncHandler(async (
   let r;
   try {
     r = await axios.get(
-      `${KORE_CAJA_BASE_URL}/anticipos/${encodeURIComponent(personaId)}`,
+      `${await obtenerCajaBaseUrl()}/anticipos/${encodeURIComponent(personaId)}`,
       {
         headers: { Authorization: `Bearer ${koreToken}` },
         timeout: 10000,

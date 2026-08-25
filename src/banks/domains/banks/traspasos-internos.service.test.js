@@ -56,6 +56,9 @@ function matchField(val, cond) {
     return Object.entries(cond).every(([op, arg]) => {
       if (op === '$in') return arg.includes(val);
       if (op === '$gt') return (val ?? 0) > arg;
+      if (op === '$gte') return (val ?? 0) >= arg;
+      if (op === '$lt') return (val ?? 0) < arg;
+      if (op === '$ne') return val !== arg;
       if (op === '$size') return Array.isArray(val) && val.length === arg;
       if (op === '$elemMatch') return Array.isArray(val) && val.some(item => matchFilter(item, arg));
       throw new Error(`op no soportado en fake mongo (filter): ${op}`);
@@ -154,6 +157,15 @@ class FakeCollection {
     return q;
   }
 
+  findOne(filter) {
+    const result = this.docs.find(d => matchFilter(d, filter)) ?? null;
+    const q = {};
+    q.select = jest.fn(() => q);
+    q.sort   = jest.fn(() => q);
+    q.lean   = jest.fn().mockResolvedValue(result);
+    return q;
+  }
+
   async bulkWrite(ops) {
     let modifiedCount = 0;
     for (const { updateOne } of ops) {
@@ -180,6 +192,7 @@ let collection;
 function setupDb(docs) {
   collection = new FakeCollection(docs);
   BankMovement.find.mockImplementation(filter => collection.find(filter));
+  BankMovement.findOne.mockImplementation(filter => collection.findOne(filter));
   BankMovement.bulkWrite.mockImplementation(ops => collection.bulkWrite(ops));
   BankMovement.updateMany.mockImplementation((filter, pipeline) => collection.updateMany(filter, pipeline));
 }
@@ -607,5 +620,81 @@ describe('generarPolizasContpaqTraspasosPorRango', () => {
     await expect(generarPolizasContpaqTraspasosPorRango(
       { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
     )).rejects.toThrow(/rango de fechas/);
+  });
+});
+
+describe('generarPolizasContpaqTraspasosPorRango — persistencia automática de la relación 1-1', () => {
+  test('genera la póliza Y persiste la relación para los pares del rango: status identificado, traspasoInterno cruzado, identificadoPor con el usuario que generó la póliza', async () => {
+    const fecha = new Date('2026-08-08T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-p', deposito: 500, fecha, concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-p', banco: 'Banamex', retiro: 500, fecha }),
+    ]);
+
+    const { runId } = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
+    );
+    expect(runId).toEqual(expect.any(String));
+
+    const docBbva        = collection.docs.find(d => d._id === 'bbva-p');
+    const docContraparte = collection.docs.find(d => d._id === 'bnmx-p');
+
+    expect(docBbva.status).toBe('identificado');
+    expect(docContraparte.status).toBe('identificado');
+    expect(docBbva.traspasoInterno).toMatchObject({ movimientoId: 'bnmx-p', runId });
+    expect(docContraparte.traspasoInterno).toMatchObject({ movimientoId: 'bbva-p', runId });
+    expect(docBbva.identificadoPor[0]).toMatchObject({ userId: 'user-1', source: 'traspaso-interno', runId });
+    expect(docContraparte.identificadoPor[0]).toMatchObject({ userId: 'user-1', source: 'traspaso-interno', runId });
+  });
+
+  test('el runId devuelto sirve para revertir con revertirTraspasosInternos ya existente — vuelven a no_identificado y quedan disponibles de nuevo', async () => {
+    const fecha = new Date('2026-08-08T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-r', deposito: 500, fecha, concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-r', banco: 'Banamex', retiro: 500, fecha }),
+    ]);
+
+    const { runId } = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
+    );
+
+    const revertResult = await revertirTraspasosInternos(runId, 'user-1');
+    expect(revertResult.revertidos).toBe(2);
+
+    const docBbva        = collection.docs.find(d => d._id === 'bbva-r');
+    const docContraparte = collection.docs.find(d => d._id === 'bnmx-r');
+    expect(docBbva.status).toBe('no_identificado');
+    expect(docContraparte.status).toBe('no_identificado');
+    expect(docBbva.traspasoInterno).toBeNull();
+    expect(docContraparte.traspasoInterno).toBeNull();
+
+    // Al volver a no_identificado, vuelven a calificar como candidatos para un matching nuevo.
+    const resultado = await matchTraspasosInternos({ categoriaBbva: CAT, dryRun: true }, USER);
+    expect(resultado.relacionados.map(p => p.bbva._id)).toContain('bbva-r');
+  });
+
+  test('regenerar la MISMA póliza (mismo rango) una segunda vez → mensaje específico con fecha/usuario/runId, no el genérico', async () => {
+    const fecha = new Date('2026-08-08T12:00:00.000Z');
+    setupDb([
+      bbva({ _id: 'bbva-dup', deposito: 500, fecha, concepto: conceptoRecibido('Banamex') }),
+      contraparte({ _id: 'bnmx-dup', banco: 'Banamex', retiro: 500, fecha }),
+    ]);
+
+    const primero = await generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
+    );
+
+    await expect(generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-08', fechaFin: '2026-08-08' }, USER,
+    )).rejects.toThrow(
+      new RegExp(`ya fueron relacionados.*${USER.nombre}.*${primero.runId}`),
+    );
+  });
+
+  test('rango distinto sin ningún candidato real (nunca hubo pares) → sigue con el mensaje genérico de siempre', async () => {
+    setupDb([]);
+    await expect(generarPolizasContpaqTraspasosPorRango(
+      { fechaInicio: '2026-08-20', fechaFin: '2026-08-20' }, USER,
+    )).rejects.toThrow('No hay traspasos relacionados en el rango de fechas seleccionado.');
   });
 });

@@ -6,10 +6,19 @@
 // debe incluir primeraIdentificacionAt/primeraIdentificacionPor.
 jest.mock('./BankMovement.model');
 jest.mock('../erp/ErpCuentaPendiente.model');
+// DATE_WINDOW_DAYS ahora viene de Configuraciones Globales (sección erp-caja) en vez
+// de process.env.ERP_DATE_WINDOW_DAYS — se mockea para no depender de Postgres real
+// en este test y reproducir el mismo default (30 días) que tenía el código viejo.
+jest.mock('../../../shared/services/global-config.service');
 
 const BankMovement       = require('./BankMovement.model');
 const ErpCuentaPendiente = require('../erp/ErpCuentaPendiente.model');
+const globalConfigService = require('../../../shared/services/global-config.service');
 const { matchAutorizacionesDesdeErp } = require('./bank-autorizaciones.service');
+
+beforeEach(() => {
+  globalConfigService.getValue.mockResolvedValue('30');
+});
 
 function fakeFindQuery(result) {
   const q = {};

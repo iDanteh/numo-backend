@@ -22,9 +22,12 @@ require('dotenv').config();
 const REQUIRED = [
   'JWT_SECRET',          // Firma tokens de sesión
   'CREDS_MASTER_KEY',    // Cifra credenciales e.firma del SAT
-  'ERP_CAJA_BASE_URL',   // URL base ERP cajas/bancos
   'ERP_TOKEN',           // Token de autenticación del ERP
 ];
+// ERP_CAJA_BASE_URL YA NO es requerida acá — migrada a Configuraciones Globales
+// (sección `erp-caja`, ver global-config.service.js/erp-sync.service.js). El
+// servidor ya no depende del .env para esto; depende de que la sección esté
+// sembrada en Postgres (ver banks/scripts/seed-global-config-erp-caja.js).
 
 const missing = REQUIRED.filter((key) => !process.env[key]?.trim());
 
@@ -75,10 +78,9 @@ const config = Object.freeze({
 
   /** Integración con el ERP externo */
   erp: Object.freeze({
-    // ERP_CAJA_BASE_TEST_URL (opcional) manda sobre ERP_CAJA_BASE_URL cuando está presente —
-    // ver erp-sync.service.js para el porqué (protección contra .env de staging apuntando
-    // por error a Kore de producción).
-    cajaUrl: process.env.ERP_CAJA_BASE_TEST_URL?.trim() || process.env.ERP_CAJA_BASE_URL?.trim(),   // cajas / bancos
+    // cajaUrl (Kore Cajas/bancos) ya NO vive acá — migrado a Configuraciones Globales
+    // (sección `erp-caja`, ver shared/services/global-config.service.js). erp-sync.service.js
+    // lo lee de ahí directo, no de esta config.
     baseUrl:  process.env.ERP_FACT_BASE_URL?.trim(),  // facturación — import CFDIs
     // Normaliza el token: garantiza el prefijo "Bearer " independientemente
     //cambio 2

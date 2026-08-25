@@ -122,6 +122,14 @@ const PERMISSIONS = Object.freeze({
   // el webhook de Kore. Permiso nuevo, sin asignar a ningún rol todavía — mismo criterio que
   // BANKS_CFDI_READ: decisión pendiente del usuario, admin lo tiene por el wildcard '*'.
   BANKS_ERP_REVERSIONES: 'banks:erp:reversiones',
+
+  // Configuraciones Globales (runtime, ver global-config.service.js) — dos niveles a propósito,
+  // mismo patrón que banks:erp:read/link/unlink. CONFIG_MANAGE: ver/crear secciones, ver
+  // valores (secretos enmascarados), editar cualquier valor. CONFIG_SECRETS_REVEAL: además,
+  // desenmascarar el valor real de un secreto puntual. Permisos nuevos, sin asignar a ningún
+  // rol todavía — admin los tiene por el wildcard '*'.
+  CONFIG_MANAGE:         'config:manage',
+  CONFIG_SECRETS_REVEAL: 'config:secrets:reveal',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

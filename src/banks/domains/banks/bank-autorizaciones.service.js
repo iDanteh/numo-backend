@@ -10,13 +10,23 @@ const {
   normalizarAuthBloques,
 } = require('../erp/erp-auth.utils');
 const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
+const globalConfigService = require('../../../shared/services/global-config.service');
 
 const ERP_TOLERANCE   = 1.00; // $1 MXN — misma tolerancia que el resto del sistema
 
 // Ventana de fecha para match ERP: el depósito bancario debe estar dentro de
 // ±N días de la fechaRealPago / fechaAfectacion de la CxC.
 // Se usa solo como criterio de preferencia, no de exclusión total.
-const DATE_MATCH_WINDOW_MS = Number(process.env.ERP_DATE_WINDOW_DAYS ?? 30) * 24 * 60 * 60 * 1000;
+// Configuraciones Globales, sección `bancos` (misma que CUENTAS_PENDIENTES_URL/
+// TOKEN) — reemplaza process.env.ERP_DATE_WINDOW_DAYS. Resuelto UNA vez al
+// principio de cada corrida de match (matchAutorizacionesDesdeErp/ejecutarMatch)
+// y pasado como valor ya calculado al resto de funciones de este archivo (varias
+// son síncronas y corren dentro de loops calientes — no tiene sentido, ni es
+// seguro, awaitear por cada movimiento comparado).
+async function _dateMatchWindowMs() {
+  const dias = Number(await globalConfigService.getValue('bancos', 'DATE_WINDOW_DAYS'));
+  return (Number.isFinite(dias) ? dias : 30) * 24 * 60 * 60 * 1000;
+}
 
 // ── Normalización de nombre de banco ─────────────────────────────────────────
 const BANCO_MAP = {
@@ -136,7 +146,7 @@ function extraerTokensConcepto(concepto) {
 //   3. importe correcto (fuera de ventana, pero amount sí matchea)
 //   4. dentro de ventana de fecha + banco correcto
 //   5. (solo si monto=0 o strict=false) cualquier candidato disponible
-function findInIndex(index, autNorm, monto, usedMovIds, banco, fecha, strict = false) {
+function findInIndex(index, autNorm, monto, usedMovIds, banco, fecha, strict = false, dateMatchWindowMs) {
   const all = index.get(autNorm);
   if (!all?.length) return null;
   const pool = all.filter(m => !usedMovIds.has(m._id.toString()));
@@ -149,7 +159,7 @@ function findInIndex(index, autNorm, monto, usedMovIds, banco, fecha, strict = f
   // Cuando no hay fecha de referencia o el movimiento no tiene fecha, siempre pasa.
   const enVentana = (m) => {
     if (!fecha || !m.fecha) return true;
-    return Math.abs(new Date(m.fecha).getTime() - new Date(fecha).getTime()) <= DATE_MATCH_WINDOW_MS;
+    return Math.abs(new Date(m.fecha).getTime() - new Date(fecha).getTime()) <= dateMatchWindowMs;
   };
 
   return (
@@ -231,6 +241,7 @@ async function ejecutarBulkConTransaccion(ops) {
 // ══════════════════════════════════════════════════════════════════════════════
 async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgress } = {}) {
   const bancoNorm = banco ? normalizarBanco(banco) : null;
+  const dateMatchWindowMs = await _dateMatchWindowMs();
 
   onProgress?.({ phase: 'loading-mov', pct: 5, msg: 'Cargando movimientos bancarios...' });
   // ── 1. Movimientos bancarios elegibles ─────────────────────────────────────
@@ -478,7 +489,7 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       if (usedMovIds.has(m._idStr)) continue;
       if (!importeOk(m, grupoTotal)) continue;
       if (grupoFechaMs !== null && m.fechaMs !== null &&
-          Math.abs(m.fechaMs - grupoFechaMs) > DATE_MATCH_WINDOW_MS) continue;
+          Math.abs(m.fechaMs - grupoFechaMs) > dateMatchWindowMs) continue;
       return m;
     }
     return null;
@@ -650,8 +661,8 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
 // Igual que findInIndex pero con firma adaptada al motor Excel.
 // fecha es el valor de la columna Fecha del Excel: se usa como preferencia de proximidad
 // temporal dentro de findInIndex (sin ser criterio de exclusión — strict=false).
-function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds, fecha) {
-  return findInIndex(indice, autNorm, importe, usedMovIds, banco, fecha);
+function buscarEnIndice(indice, autNorm, importe, banco, usedMovIds, fecha, dateMatchWindowMs) {
+  return findInIndex(indice, autNorm, importe, usedMovIds, banco, fecha, false, dateMatchWindowMs);
 }
 
 // user: { userId, nombre } — identifica quién ejecutó la carga del Excel.
@@ -660,6 +671,8 @@ async function ejecutarMatch(rows, user) {
   if (!rows.length) {
     return { total: 0, matcheados: 0, identificados: 0, yaIdentificados: 0, sinMatch: 0, noMatcheados: [] };
   }
+
+  const dateMatchWindowMs = await _dateMatchWindowMs();
 
   // ── Carga de movimientos ──────────────────────────────────────────────────
   // Se cargan todos los movimientos activos sin restricción de banco porque un
@@ -741,10 +754,10 @@ async function ejecutarMatch(rows, user) {
     let mov = null;
 
     // 1a: por numeroAutorizacion (respeta banco, usedMovIds y fecha como preferencia)
-    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha);
+    mov = buscarEnIndice(byAuthNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha, dateMatchWindowMs);
 
     // 1b: por referenciaNumerica
-    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha);
+    if (!mov) mov = buscarEnIndice(byRefNorm, row.autNorm, row.importe, row.banco, usedMovIds, row.fecha, dateMatchWindowMs);
 
     // 2: auth dentro del concepto
     if (!mov) {
@@ -777,7 +790,7 @@ async function ejecutarMatch(rows, user) {
         // Importe exacto — filtro muy selectivo, hace la iteración eficiente
         if (!importeOk(m, row.importe)) continue;
         // Fecha dentro de la ventana — obligatorio para evitar homonimia temporal
-        if (m.fecha && Math.abs(new Date(m.fecha).getTime() - refMs) > DATE_MATCH_WINDOW_MS) continue;
+        if (m.fecha && Math.abs(new Date(m.fecha).getTime() - refMs) > dateMatchWindowMs) continue;
         // Banco — si ambos están disponibles deben coincidir
         if (row.banco && m.banco && row.banco !== m.banco) continue;
 

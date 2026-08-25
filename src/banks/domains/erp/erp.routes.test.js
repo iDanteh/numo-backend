@@ -42,7 +42,11 @@ jest.mock('../../../shared/services/rbac-store', () => ({
 jest.mock('./kore-caja.service', () => ({
   KoreCajaError:          class KoreCajaError extends Error {},
   koreTokenCache:         new Map(),
-  KORE_CAJA_BASE_URL:     'http://kore.test',
+  // obtenerCajaBaseUrl reemplaza al viejo export KORE_CAJA_BASE_URL (ahora viene de
+  // Configuraciones Globales, sección `kore`) — ningún test de este archivo ejercita
+  // las rutas que la usan (/cobros/conceptos, /cobros/anticipos/*), se deja igual mockeada
+  // por completitud del mock del módulo.
+  obtenerCajaBaseUrl:     jest.fn().mockResolvedValue('http://kore.test'),
   obtenerSesionCaja:      jest.fn(),
   obtenerCuentasKore:     jest.fn(),
   aplicarCobroOperacion:  jest.fn(),

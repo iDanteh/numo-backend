@@ -702,23 +702,31 @@ router.get('/admin/traspasos-internos/reporte',
 );
 
 // GET /api/banks/admin/traspasos-internos/poliza-contpaq?fechaInicio=&fechaFin=
-// Corre el motor en dry-run (nunca marca movimientos como identificados) y arma un ZIP con
-// una póliza CONTPAQ (formato de importación P/M1) por cada día del rango que tenga al
-// menos un par relacionado — mismo criterio síncrono/sin jobId que /traspasos-internos/reporte,
-// pero en formato importable en vez de reporte informativo. Ya NO recibe categoriaBbva —
-// generarPolizasContpaqTraspasosPorRango siempre busca sobre la categoría de traspaso entre
-// cuentas propias (confirmado con el usuario 2026-08-18), único input real: el rango.
+// La clasificación corre en dry-run, pero esta llamada SÍ persiste: cada par que entra en
+// la póliza generada queda relacionado 1-1 (traspasoInterno + identificado, con el usuario
+// que generó la póliza) — ver el docstring de generarPolizasContpaqTraspasosPorRango para el
+// detalle completo. Arma un ZIP con una póliza CONTPAQ (formato de importación P/M1) por
+// cada día del rango que tenga al menos un par relacionado — mismo criterio síncrono/sin
+// jobId que /traspasos-internos/reporte, pero en formato importable en vez de reporte
+// informativo. Ya NO recibe categoriaBbva — generarPolizasContpaqTraspasosPorRango siempre
+// busca sobre la categoría de traspaso entre cuentas propias (confirmado con el usuario
+// 2026-08-18), único input real: el rango.
+// El runId de la relación persistida viaja en el header X-Traspasos-Run-Id (el body es el
+// ZIP binario, no hay dónde más mandarlo) — el frontend lo usa para ofrecer "Revertir
+// relación" reusando el endpoint /admin/traspasos-internos/revertir ya existente.
 router.get('/admin/traspasos-internos/poliza-contpaq',
   authenticate,
   permit('banks:admin'),
   asyncHandler(async (req, res) => {
     const { fechaInicio, fechaFin } = req.query;
     if (!fechaInicio || !fechaFin) return res.status(400).json({ error: 'Se requiere fechaInicio y fechaFin' });
-    const { buffer, nombreZip } = await generarPolizasContpaqTraspasosPorRango(
+    const { buffer, nombreZip, runId } = await generarPolizasContpaqTraspasosPorRango(
       { fechaInicio, fechaFin }, req.user,
     );
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${nombreZip}"`);
+    res.setHeader('X-Traspasos-Run-Id', runId);
+    res.setHeader('Access-Control-Expose-Headers', 'X-Traspasos-Run-Id');
     res.send(buffer);
   }),
 );

@@ -633,6 +633,39 @@ function _utcMidnight(fecha) {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 }
 
+const UN_DIA_MS = 24 * 60 * 60 * 1000;
+
+// ── _buscarYaRelacionadosEnRango ─────────────────────────────────────────────────
+// Como _cargarCandidatos excluye status:'identificado', regenerar la MISMA póliza
+// (mismo rango) una segunda vez encuentra 0 candidatos — no porque nunca hubo pares,
+// sino porque la corrida anterior ya los relacionó. Esta función distingue ambos casos
+// para poder dar un mensaje de error específico en vez del genérico "no hay traspasos".
+// Busca solo del lado BBVA (mismo campo que ancla la búsqueda de candidatos) un
+// movimiento ya identificado vía este motor, con fecha dentro del rango — y devuelve
+// la entrada de identificadoPor más reciente de este motor (recorrida desde el final,
+// por si el movimiento tiene más de una identificación con distinto runId a través del
+// tiempo — solo interesa la última).
+async function _buscarYaRelacionadosEnRango(inicioUtc, finUtc) {
+  const mov = await BankMovement.findOne({
+    banco:           'BBVA',
+    categoria:        RE_CATEGORIA_TRASPASO_INTERNO,
+    status:          'identificado',
+    traspasoInterno: { $ne: null },
+    isActive:        true,
+    deposito:        { $gt: 0 },
+    fecha:           { $gte: new Date(inicioUtc), $lt: new Date(finUtc + UN_DIA_MS) },
+  }).select('identificadoPor').lean();
+
+  if (!mov) return null;
+
+  const entrada = [...(mov.identificadoPor ?? [])].reverse()
+    .find((e) => e.source === SOURCE_TRASPASO_INTERNO);
+
+  if (!entrada) return null;
+
+  return { fecha: entrada.fechaId, nombre: entrada.nombre, runId: entrada.runId };
+}
+
 /**
  * Arma un ZIP con una póliza CONTPAQ por cada día (UTC) dentro de [fechaInicio, fechaFin]
  * que tenga al menos un par relacionado. Los traspasos siempre son mismo-día (ver
@@ -640,9 +673,20 @@ function _utcMidnight(fecha) {
  * agrupar por día antes de armar cada Excel respeta esa misma premisa en vez de mezclar
  * movimientos de días distintos bajo un solo encabezado 'P'.
  *
- * Siempre corre el matching en dry-run — esta función solo genera archivos, nunca marca
- * movimientos como identificados (eso sigue siendo `matchTraspasosInternos({dryRun:false})`,
- * un flujo aparte que no se toca aquí).
+ * La CLASIFICACIÓN corre en dry-run (matchTraspasosInternos({dryRun:true})) — solo lee.
+ * Pero una vez armado el ZIP completo en memoria sin errores, esta función SÍ PERSISTE: cada
+ * par que efectivamente entró en la póliza generada queda relacionado 1-1 (`traspasoInterno`
+ * en ambos lados, mismo runId nuevo) y marcado `identificado`, con el usuario que generó la
+ * póliza en `identificadoPor` — puramente para trazabilidad/consulta interna, reversible con
+ * `revertirTraspasosInternos(runId, userId)` (ya existe, sin cambios). El requisito de que
+ * un par relacionado no vuelva a aparecer en el Excel se cumple gratis: `_cargarCandidatos`
+ * ya excluye `status:'identificado'`, así que una vez relacionado deja de ser candidato en
+ * cualquier corrida futura del matching (incluida la de esta misma función).
+ *
+ * Efecto colateral de lo anterior: regenerar la MISMA póliza (mismo rango) una segunda vez
+ * ya no encuentra esos pares (ver `_buscarYaRelacionadosEnRango`, da un mensaje de error
+ * específico en vez del genérico "no hay traspasos" para no confundir con "nunca hubo
+ * pares").
  *
  * Folio PROVISIONAL: número secuencial pequeño (1, 2, 3... por día dentro de la corrida),
  * NO derivado de la fecha — un folio tipo "20260808" no coincide con el estilo de las
@@ -656,7 +700,7 @@ function _utcMidnight(fecha) {
  *
  * @param {{ fechaInicio: string, fechaFin: string }} params
  * @param {{ _id: string, nombre?: string }} user
- * @returns {Promise<{ buffer: Buffer, nombreZip: string }>}
+ * @returns {Promise<{ buffer: Buffer, nombreZip: string, runId: string }>}
  */
 async function generarPolizasContpaqTraspasosPorRango({ fechaInicio, fechaFin } = {}, user) {
   if (!fechaInicio || !fechaFin) throw new Error('Se requiere fechaInicio y fechaFin.');
@@ -681,6 +725,19 @@ async function generarPolizasContpaqTraspasosPorRango({ fechaInicio, fechaFin } 
   }
 
   if (porDia.size === 0) {
+    const yaRelacionado = await _buscarYaRelacionadosEnRango(inicioUtc, finUtc);
+    if (yaRelacionado) {
+      const fechaStr = yaRelacionado.fecha
+        ? new Date(yaRelacionado.fecha).toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' })
+        : 'fecha desconocida';
+      const quien = yaRelacionado.nombre ?? 'un usuario';
+      const pistaRevertir = yaRelacionado.runId
+        ? ` Usá "Revertir" con el runId "${yaRelacionado.runId}" si necesitás regenerar la póliza.`
+        : '';
+      throw new Error(
+        `Los traspasos de este rango ya fueron relacionados el ${fechaStr} por ${quien}.${pistaRevertir}`,
+      );
+    }
     throw new Error('No hay traspasos relacionados en el rango de fechas seleccionado.');
   }
 
@@ -698,8 +755,24 @@ async function generarPolizasContpaqTraspasosPorRango({ fechaInicio, fechaFin } 
     folio++;
   }
 
+  // Persistir la relación 1-1 recién ahora, con el ZIP completo ya armado en memoria sin
+  // errores (ej. banco sin cuenta contable mapeada) — así una falla generando el Excel
+  // nunca deja movimientos marcados `identificado` sin que exista la póliza correspondiente.
+  const runId = randomUUID();
+  const now   = new Date();
+  const ops   = [];
+  for (const { pares } of dias) {
+    for (const { bbva, contraparte } of pares) {
+      ops.push(_buildIdentificarOp(bbva, contraparte, user, runId, now));
+      ops.push(_buildIdentificarOp(contraparte, bbva, user, runId, now));
+    }
+  }
+  if (ops.length > 0) {
+    await ejecutarBulkConTransaccion(ops);
+  }
+
   const nombreZip = `Traspasos_CONTPAQ_${fechaInicio}_a_${fechaFin}.zip`;
-  return { buffer: zip.toBuffer(), nombreZip };
+  return { buffer: zip.toBuffer(), nombreZip, runId };
 }
 
 module.exports = {

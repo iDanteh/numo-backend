@@ -27,6 +27,10 @@ jest.mock('../../shared/middleware/auth.real', () => ({
 jest.mock('../banks/BankMovement.model');
 jest.mock('./ErpReversion.model');
 jest.mock('../../shared/socket');
+// KORE_API_KEY ahora vive en Configuraciones Globales (sección kore-webhooks) en vez
+// de process.env — se mockea global-config.service.js en vez de setear/borrar la
+// variable de entorno directamente.
+jest.mock('../../../shared/services/global-config.service');
 // 2026-08-20: erp-reversion.service.js ahora reconsulta a Kore EN VIVO reusando los
 // helpers que erp.routes.js re-expone en el router (mismo patrón ya usado por
 // collection-request.service.js) — se mockea el módulo completo, un límite de I/O real
@@ -59,6 +63,7 @@ const ErpReversion = require('./ErpReversion.model');
 const erpRoutes    = require('./erp.routes');
 const { emitToBanco } = require('../../shared/socket');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
+const globalConfigService = require('../../../shared/services/global-config.service');
 
 const API_KEY = 'test-kore-api-key';
 
@@ -85,7 +90,7 @@ let app;
 
 beforeEach(() => {
   jest.clearAllMocks();
-  process.env.KORE_API_KEY = API_KEY;
+  globalConfigService.getValue.mockResolvedValue(API_KEY);
   app = buildApp();
   // 2026-08-20: el handler ahora loguea el payload crudo de Kore por consola (pedido
   // explícito del usuario, para poder diagnosticar reversiones que "corren pero mal") —
@@ -102,9 +107,6 @@ afterEach(() => {
   console.log.mockRestore();
 });
 
-afterAll(() => {
-  delete process.env.KORE_API_KEY;
-});
 
 describe('POST /api/erp/cxc-reversiones — autenticación por API key', () => {
   test('401 sin X-Api-Key', async () => {
@@ -125,7 +127,7 @@ describe('POST /api/erp/cxc-reversiones — autenticación por API key', () => {
   });
 
   test('503 si KORE_API_KEY no está configurada en el servidor', async () => {
-    delete process.env.KORE_API_KEY;
+    globalConfigService.getValue.mockRejectedValueOnce(new Error("No existe la configuración 'kore-webhooks.API_KEY'"));
 
     const res = await request(app)
       .post('/api/erp/cxc-reversiones')

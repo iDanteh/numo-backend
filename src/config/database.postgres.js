@@ -41,6 +41,12 @@ const connectPostgres = async () => {
   await sequelize.authenticate();
   logger.info('PostgreSQL conectado');
 
+  // pgcrypto: usado por Configuraciones Globales (shared/services/global-config.service.js)
+  // para cifrar/descifrar secretos (pgp_sym_encrypt/pgp_sym_decrypt). Debe existir ANTES de
+  // que syncModels() cree global_configs (columna valor_cifrado es bytea, no depende de la
+  // extensión para el tipo en sí, pero las queries de lectura/escritura sí la necesitan).
+  await sequelize.query('CREATE EXTENSION IF NOT EXISTS pgcrypto');
+
   // Importación deferida: los modelos ya importan `sequelize` desde este módulo
   const { syncModels } = require('../shared/models/postgres');
   await syncModels();

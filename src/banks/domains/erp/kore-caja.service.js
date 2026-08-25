@@ -9,18 +9,33 @@
 // de aquí — no se duplicó nada.
 
 const axios = require('axios');
+const globalConfigService = require('../../../shared/services/global-config.service');
 
-// KORE_AUTH_URL apunta a producción (auth real de usuarios).
-// El resto de las URLs Kore apuntan al ambiente de pruebas.
-const KORE_AUTH_URL      = (process.env.KORE_AUTH_URL      || 'https://app.login.tubosyconexiones.mx/logink/tokenKore');
-const KORE_SERVICIO      = process.env.KORE_SERVICIO       || '6491faf156358100016565e5';
-const KORE_CAJA_URL      = (process.env.KORE_CAJA_URL      || 'https://test.cajas.koreingenieria.com/index');
-const KORE_CAJA_BASE_URL = (process.env.KORE_CAJA_BASE_URL || 'https://test.cajas.koreingenieria.com');
+// Configuraciones Globales, sección `kore` (runtime/DB, ver
+// shared/services/global-config.service.js — reemplaza KORE_AUTH_URL/KORE_SERVICIO/
+// KORE_CAJA_URL/KORE_CAJA_BASE_URL del .env). AUTH_URL apunta a producción (auth real
+// de usuarios); el resto de las URLs Kore apuntan al ambiente de pruebas — mismo
+// criterio que ya tenía el .env, ahora por fila en Postgres en vez de por variable.
+async function _authUrl()     { return globalConfigService.getValue('kore', 'AUTH_URL'); }
+async function _servicio()    { return globalConfigService.getValue('kore', 'SERVICIO'); }
+async function _cajaUrl()     { return globalConfigService.getValue('kore', 'CAJA_URL'); }
+// Exportada (no con guión bajo) porque erp.routes.js también la necesita
+// directo para sus propias rutas /cobros/conceptos y /cobros/anticipos/*.
+async function obtenerCajaBaseUrl() { return globalConfigService.getValue('kore', 'CAJA_BASE_URL'); }
 // Catálogos de bancos y formas de pago — antes exclusivos de erp.routes.js
 // (GET /cobros/bancos, /formas-pago); se movieron acá 2026-07-28 para que
 // collection-request.service.js pueda resolver BancoID al aplicar un cobro
 // automático, con el MISMO criterio que ya usa el panel de cobros manual.
-const KORE_FORMASPAGO_BASE_URL = (process.env.KORE_FORMASPAGO_BASE_URL || 'https://test.formaspagos.koreingenieria.com');
+//
+// Configuraciones Globales, sección `bancos`, clave FORMASPAGO_BASE_URL (runtime/DB,
+// ver shared/services/global-config.service.js) — reemplaza a KORE_FORMASPAGO_BASE_URL
+// del .env. Vive en `bancos` (no en `kore`) porque el catálogo de formas de pago se
+// usa donde se aplican los cobros (decisión explícita del usuario 2026-08-25). Cada
+// ambiente (local/staging/producción) tiene su propia fila en su propia Postgres con
+// el valor que le corresponde — ver banks/scripts/seed-global-config-banks.js.
+async function _formasPagoBaseUrl() {
+  return globalConfigService.getValue('bancos', 'FORMASPAGO_BASE_URL');
+}
 
 // Token Kore por usuario — se guarda cuando verifica sesión de caja, se usa en
 // los proxies de cobros de erp.routes.js (getKoreToken). Compartido entre
@@ -55,8 +70,8 @@ function _mensajeErrorKore(axiosErr, fallback) {
 // no tiene ninguna caja abierta — no es un cajero).
 async function obtenerTokenKore(auth0Id) {
   try {
-    const tokenRes = await axios.get(KORE_AUTH_URL, {
-      params:  { id: auth0Id, servicio: KORE_SERVICIO },
+    const tokenRes = await axios.get(await _authUrl(), {
+      params:  { id: auth0Id, servicio: await _servicio() },
       timeout: 10000,
     });
     if (tokenRes.data?.Codigo !== 200 || !tokenRes.data?.Data) {
@@ -91,7 +106,7 @@ async function obtenerSesionCaja(auth0Id) {
   const koreToken = await obtenerTokenKore(auth0Id);
 
   try {
-    const sesionRes = await axios.get(KORE_CAJA_URL, {
+    const sesionRes = await axios.get(await _cajaUrl(), {
       headers: { Authorization: `Bearer ${koreToken}` },
       timeout: 10000,
     });
@@ -121,7 +136,7 @@ async function obtenerSesionCaja(auth0Id) {
 async function obtenerCuentasKore(koreToken, ids) {
   let r;
   try {
-    r = await axios.get(`${KORE_CAJA_BASE_URL}/cuentas`, {
+    r = await axios.get(`${await obtenerCajaBaseUrl()}/cuentas`, {
       params:  { ids },
       headers: { Authorization: `Bearer ${koreToken}` },
       timeout: 10000,
@@ -157,7 +172,8 @@ async function obtenerCuentasKore(koreToken, ids) {
 // erp.routes.js (movido acá 2026-07-28 para compartirlo con
 // collection-request.service.js). Filtra bancos inactivos, igual que antes.
 async function listarBancos(koreToken) {
-  const r = await axios.get(`${KORE_FORMASPAGO_BASE_URL}/api/bancos`, {
+  const baseUrl = await _formasPagoBaseUrl();
+  const r = await axios.get(`${baseUrl}/api/bancos`, {
     headers: { Authorization: `Bearer ${koreToken}` },
     timeout: 10000,
   });
@@ -177,7 +193,8 @@ async function listarBancos(koreToken) {
 // cobro-panel.component.ts (_mapFormaPago: requiereBanco = claveSAT === '03')
 // al decidir si una forma de pago necesita BancoID.
 async function listarFormasPago(koreToken) {
-  const r = await axios.get(`${KORE_FORMASPAGO_BASE_URL}/api/formasdepago`, {
+  const baseUrl = await _formasPagoBaseUrl();
+  const r = await axios.get(`${baseUrl}/api/formasdepago`, {
     headers: { Authorization: `Bearer ${koreToken}` },
     timeout: 10000,
   });
@@ -254,7 +271,7 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
     formasPago: (payload.detalle?.DetalleFormaPago ?? []).map(f => ({ id: f.FormaPagoID, nombre: f.FormaPagoNombre, monto: f.Monto, bancoId: f.BancoID })),
   }));
   return _operacionConReintento(
-    'post', `${KORE_CAJA_BASE_URL}/sesiones/${sesionId}/operaciones`,
+    'post', `${await obtenerCajaBaseUrl()}/sesiones/${sesionId}/operaciones`,
     payload, koreToken, 'aplicarCobroOperacion', payload.cuenta,
   );
 }
@@ -288,7 +305,7 @@ async function aplicarCobroOperacion(sesionId, koreToken, payload) {
 async function aplicarSolicitudOperacion(sesionId, solicitudIdErp, koreToken, datosAdicionalesPorFormaPago, fechaRealPagoRaiz) {
   console.log('[aplicarSolicitudOperacion] payload →', JSON.stringify({ sesionId, solicitudIdErp, datosAdicionalesPorFormaPago, fechaRealPagoRaiz }));
   return _operacionConReintento(
-    'put', `${KORE_CAJA_BASE_URL}/solicitud-operacion/${sesionId}/aplicar/${solicitudIdErp}`,
+    'put', `${await obtenerCajaBaseUrl()}/solicitud-operacion/${sesionId}/aplicar/${solicitudIdErp}`,
     { DatosAdicionalesPorFormaPago: datosAdicionalesPorFormaPago, fecha_real_pago: fechaRealPagoRaiz }, koreToken, 'aplicarSolicitudOperacion', solicitudIdErp,
   );
 }
@@ -306,7 +323,7 @@ async function aplicarCobroOperacionMultiple(sesionId, koreToken, payload) {
     formasPago: (payload.detalle?.DetalleFormaPago ?? []).map(f => ({ id: f.FormaPagoID, nombre: f.FormaPagoNombre, monto: f.Monto, bancoId: f.BancoID })),
   }));
   return _operacionConReintento(
-    'post', `${KORE_CAJA_BASE_URL}/sesiones/${sesionId}/operacionesmultiples`,
+    'post', `${await obtenerCajaBaseUrl()}/sesiones/${sesionId}/operacionesmultiples`,
     payload, koreToken, 'aplicarCobroOperacionMultiple', JSON.stringify(payload.cuentas),
   );
 }
@@ -322,7 +339,7 @@ async function aplicarCobroOperacionMultiple(sesionId, koreToken, payload) {
 async function actualizarEstatusSolicitud(koreToken, solicitudIdErp, estatus, comentario) {
   try {
     const r = await axios.put(
-      `${KORE_CAJA_BASE_URL}/solicitud-operacion/revision-contable/${solicitudIdErp}`,
+      `${await obtenerCajaBaseUrl()}/solicitud-operacion/revision-contable/${solicitudIdErp}`,
       { Comentario: comentario, Estatus: estatus },
       { headers: { Authorization: `Bearer ${koreToken}`, 'Content-Type': 'application/json' }, timeout: 10000 },
     );
@@ -351,11 +368,7 @@ function esErrorYaEnEstatus(err, estatus) {
 module.exports = {
   KoreCajaError,
   koreTokenCache,
-  KORE_AUTH_URL,
-  KORE_SERVICIO,
-  KORE_CAJA_URL,
-  KORE_CAJA_BASE_URL,
-  KORE_FORMASPAGO_BASE_URL,
+  obtenerCajaBaseUrl,
   obtenerTokenKore,
   obtenerSesionCaja,
   obtenerCuentasKore,

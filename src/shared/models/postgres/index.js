@@ -27,6 +27,9 @@ const CentroCosto       = require('./CentroCosto');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
 const Notificacion      = require('./Notificacion');
+const ConfigSection     = require('./ConfigSection');
+const GlobalConfig      = require('./GlobalConfig');
+const ConfigAuditLog    = require('./ConfigAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -55,6 +58,12 @@ CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movi
 /** Regla de mapeo CFDI usada al generar el movimiento */
 PolizaMovimiento.belongsTo(CfdiMappingRule, { foreignKey: 'reglaId', as: 'regla' });
 CfdiMappingRule.hasMany(PolizaMovimiento,   { foreignKey: 'reglaId', as: 'movimientosGenerados' });
+
+/** Configuraciones Globales — catálogo relacional estricto + auditoría */
+ConfigSection.hasMany(GlobalConfig,     { foreignKey: 'sectionId', as: 'configs', onDelete: 'CASCADE' });
+GlobalConfig.belongsTo(ConfigSection,   { foreignKey: 'sectionId', as: 'section' });
+GlobalConfig.hasMany(ConfigAuditLog,    { foreignKey: 'configId', as: 'auditLog', onDelete: 'CASCADE' });
+ConfigAuditLog.belongsTo(GlobalConfig,  { foreignKey: 'configId', as: 'config' });
 
 // ── Sincronización ────────────────────────────────────────────────────────────
 
@@ -326,6 +335,13 @@ async function syncModels() {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS extra_permissions TEXT[] NOT NULL DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN extra_permissions (users):', e.message));
+
+  // Configuraciones Globales (ver ConfigSection/GlobalConfig/ConfigAuditLog) — tablas
+  // nuevas, force:false para solo crearlas si no existen. Orden: ConfigSection primero
+  // (GlobalConfig tiene FK a ella), GlobalConfig antes que ConfigAuditLog (FK a GlobalConfig).
+  await ConfigSection.sync({ force: false });
+  await GlobalConfig.sync({ force: false });
+  await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

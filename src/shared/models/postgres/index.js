@@ -175,6 +175,16 @@ async function syncModels() {
     `ALTER TABLE poliza_movimientos ADD COLUMN IF NOT EXISTS cuenta_faltante BOOLEAN NOT NULL DEFAULT FALSE`
   ).catch(e => console.warn('[syncModels] ADD COLUMN cuenta_faltante:', e.message));
 
+  // Ticket real de cajas (serieVenta/folioVenta) por línea de Tarjeta —
+  // permite resolver la autorización bancaria real POR TICKET al exportar
+  // (ver PolizaMovimiento.js / construirAutorizacionTarjetaPorTicket en
+  // poliza.service.js), sin mezclar tickets de una misma Factura Global.
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS serie_venta_ticket VARCHAR(25),
+      ADD COLUMN IF NOT EXISTS folio_venta_ticket VARCHAR(40)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN serie_venta_ticket/folio_venta_ticket:', e.message));
+
   // Trazabilidad de regla de mapeo en movimientos
   await Poliza.sequelize.query(`
     ALTER TABLE poliza_movimientos

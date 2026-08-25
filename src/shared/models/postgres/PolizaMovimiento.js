@@ -54,6 +54,22 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
     type:      DataTypes.STRING(25),
     allowNull: true,
   },
+  // Ticket real de cajas (serieVenta/folioVenta) al que pertenece esta
+  // porción del cobro — distinto de `serie` (serie-folio del CFDI propio,
+  // que en una Factura Global es la factura completa, no el ticket
+  // individual). Solo se llena en líneas de Tarjeta partidas por el
+  // desglose real de cobro (ver `_prefetchAjustesFacturaPropia`/
+  // `splitPorFormaPagoReal`) — permite resolver la autorización bancaria
+  // real POR TICKET al exportar, sin mezclar tickets de una misma Global
+  // (ver `construirAutorizacionTarjetaPorTicket`, poliza.service.js).
+  serieVentaTicket: {
+    type:      DataTypes.STRING(25),
+    allowNull: true,
+  },
+  folioVentaTicket: {
+    type:      DataTypes.STRING(40),
+    allowNull: true,
+  },
   ventaFecha: {
     type:      DataTypes.DATEONLY,
     allowNull: true,

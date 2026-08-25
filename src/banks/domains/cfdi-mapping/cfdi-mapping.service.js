@@ -4,6 +4,11 @@ const { CfdiMappingRule, AccountPlan, PolizaMovimiento, Poliza } = require('../.
 const { Op, fn, col, literal } = require('sequelize');
 const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
 
+// DEBUG TEMPORAL (2026-08-20, quitar después de investigar el gap de
+// Efectivo de Hidalgo/B0 11-ago) — activar con DEBUG_SPLIT_PAGO=1.
+const { logger: _debugLogger } = require('../../../shared/utils/logger');
+const _DEBUG_SPLIT_PAGO = process.env.DEBUG_SPLIT_PAGO === '1';
+
 // tipoOrigen para las porciones de Saldo a Favor/Puntos DENTRO del split de
 // una factura NORMAL — deliberadamente DISTINTO de 'Cobro Sucursal' (el que
 // usa el mecanismo de cruces reales entre sucursales, cobros-sucursal-puente
@@ -737,13 +742,27 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // ÚNICAS cuya selección depende realmente de `formaPago`; cualquier otra
   // cuenta (Devoluciones, Anticipos, un banco real ya específico, etc.) no
   // se toca. Alcance de esta primera versión (confirmado con el usuario):
-  // SOLO tipo I, SOLO el caso normal — `esAnticipo`/`esAplicacionSaldo`/
-  // `tasaIva==='mixto'` ya tocan el cargo por su cuenta y colisionarían con
-  // un split aquí (esos mecanismos usan `movs.find(...)` para localizar "la"
-  // línea de cargo, asumiendo que hay una sola — ver `_esCargoPrincipal` más
-  // abajo, que le da al caller una señal explícita en vez de esa
-  // reconstrucción frágil).
-  const gateBase = !esAnticipo && !esAplicacionSaldo && rule.tasaIva !== 'mixto'
+  // SOLO tipo I, SOLO el caso normal — `esAnticipo`/`esAplicacionSaldo`
+  // ya tocan el cargo por su cuenta y colisionarían con un split aquí (esos
+  // mecanismos usan `movs.find(...)` para localizar "la" línea de cargo,
+  // asumiendo que hay una sola — ver `_esCargoPrincipal` más abajo, que le
+  // da al caller una señal explícita en vez de esa reconstrucción frágil).
+  //
+  // Corrección 2026-08-21 (caso real Hidalgo B0-260800846, Factura Global
+  // $194,749.74, regla "Reg 12A — Venta Mixta PUE Efectivo"): antes
+  // `tasaIva==='mixto'` bloqueaba el split por completo — el cargo entero se
+  // iba a Efectivo (el `formaPago` genérico que declara toda Factura Global)
+  // aunque el desglose real de cobro mostrara Efectivo/Tarjeta/Transferencia
+  // mezclados, escondiendo ~$113,000 de Tarjeta+Transferencia. El split por
+  // tasa (16%/0%, líneas 1263+ más abajo) SOLO toca el ABONO (ingreso
+  // reconocido) — es ortogonal al split por forma de pago del CARGO — así
+  // que ambos pueden convivir. La única colisión real es con el ajuste
+  // OPCIONAL de cargo `rule.cuentaCargoMixto0` (línea ~1284), que asume una
+  // sola línea de cargo vía `movs.find(...)` — se excluye ESE caso
+  // específico (`!rule.cuentaCargoMixto0`) para no romperlo; ninguna regla
+  // real usa ambos mecanismos a la vez hasta donde se ha confirmado.
+  const gateBase = !esAnticipo && !esAplicacionSaldo
+    && (rule.tasaIva !== 'mixto' || (esIngreso && !rule.cuentaCargoMixto0))
     && CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo);
 
   // Ajuste por Saldo a Favor/Puntos REALMENTE usados en esta factura —
@@ -758,6 +777,9 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const montoSFUsado     = Number(context.saldoFavorUsadoPropio?.monto) || 0;
   const montoSFOculto    = Number(context.saldoFavorUsadoPropio?.montoOculto) || 0;
   const montoSFVisible   = Number(context.saldoFavorUsadoPropio?.montoVisible) || 0;
+  // Cada origen NO ocultable (periodo anterior) por separado, con su propia
+  // referencia (serieOrigen-folioOrigen) — ver comentario en `emitirLineaSF`.
+  const detalleSFVisible = context.saldoFavorUsadoPropio?.detalleVisible ?? [];
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
@@ -785,6 +807,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
     && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
 
+  if (_DEBUG_SPLIT_PAGO) {
+    _debugLogger.warn(`[DEBUG_SPLIT] ${serieCfdi}-${cfdi.folio} uuid=${cfdi.uuid} total=${cfdi.total} formaPagoCFDI=${cfdi.formaPago} `
+      + `gateBase=${gateBase} esAnticipo=${!!esAnticipo} esAplicacionSaldo=${!!esAplicacionSaldo} tasaIvaMixto=${rule.tasaIva === 'mixto'} `
+      + `cuentaCargoRegla=${rule.cuentaCargo} montoCargo=${montoCargo} `
+      + `montoSFUsado=${montoSFUsado} montoPuntosUsado=${montoPuntosUsado} `
+      + `desglosePagoRealLen=${Array.isArray(context.desglosePagoReal) ? context.desglosePagoReal.length : 'N/A'} `
+      + `totalFormasPagoReal=${totalFormasPagoReal} esCasoAjusteSFPuntos=${esCasoAjusteSFPuntos} esCasoNormalParaSplit=${esCasoNormalParaSplit}`);
+  }
+
   // Reparte `montoAPartir` entre Efectivo/Tarjeta usando `context.desglosePagoReal`
   // — extraído del bloque `esCasoNormalParaSplit` (2026-08-14) para poder
   // reutilizarlo también en el remanente de `esCasoAjusteSFPuntos` (ver ahí).
@@ -793,14 +824,16 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // marcador `_puntosUsado` cuando el remanente también se parte.
   const splitPorFormaPagoReal = (montoAPartir, extraEnUltima = {}) => {
     const formasPagoReal = context.desglosePagoReal;
-    let acumulado = 0;
     formasPagoReal.forEach((fp, idx) => {
       const esUltimo = idx === formasPagoReal.length - 1;
-      const share = totalFormasPagoReal > 0 ? (Number(fp.monto) || 0) / totalFormasPagoReal : 1 / formasPagoReal.length;
-      const montoLinea = esUltimo
-        ? parseFloat((montoAPartir - acumulado).toFixed(2))
-        : parseFloat((montoAPartir * share).toFixed(2));
-      acumulado += montoLinea;
+      // Monto REAL de cada ticket, tal cual, SIN ajustar ni reescalar ninguna
+      // línea para forzar el cierre contra `montoAPartir` (confirmado con el
+      // usuario 2026-08-19: si la Factura Global no cierra 1 a 1 por "ruido"
+      // de reclasificación del ERP, se acepta desbalanceada en vez de restarle
+      // a un ticket puntual — la línea anterior que absorbía el residuo en la
+      // última línea podía dejarla en negativo y perderse por completo, caso
+      // real CONSTRUCASA 13-ago, ticket C0-260802371).
+      const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
       if (montoLinea <= 0) return;
 
       const esEfectivo = (fp.claveSat ?? '').trim() === '01';
@@ -815,6 +848,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Ver comentario más abajo (bloque `esCasoNormalParaSplit`) sobre por
         // qué esta línea concreta debe llevar el claveSat REAL, no el del CFDI.
         _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+        // Ticket real (cajas) al que pertenece esta porción — ver comentario
+        // en `_prefetchAjustesFacturaPropia`. `consolidarCargos` lo usa para
+        // resolver la autorización real de Tarjeta POR TICKET vía
+        // bank_movements.erpLinks, nunca por CFDI completo (evita el bug de
+        // Facturas Globales de Hidalgo 2026-08-14).
+        _serieVentaTicket: fp.serieVentaTicket ?? null,
+        _folioVentaTicket: fp.folioVentaTicket ?? null,
         ...(esUltimo ? extraEnUltima : {}),
       });
     });
@@ -842,19 +882,45 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       // con su propio reglaNombre, en vez de una sola línea todo-o-nada (ver
       // comentario en `_prefetchAjustesFacturaPropia`/generarPropuesta,
       // cfdi-poliza-generator.service.js).
-      const conceptoCliente = [cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO', serieCfdi].filter(Boolean).join(' / ');
+      const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+      const conceptoCliente = [nombreCliente, serieCfdi].filter(Boolean).join(' / ');
       const baseSF = { centroCosto, ventaFecha, serie: serieCfdi, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, concepto: conceptoCliente, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, _esCargoPrincipal: true };
-      const emitirLineaSF = (montoBruto, reglaNombre) => {
+      const emitirLineaSF = (montoBruto, reglaNombre, overrides = {}) => {
         if (montoBruto <= 0 || restante <= 0) return;
         const monto = Math.min(montoBruto, restante);
         const subtotal = Math.round((monto / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
         const iva = Math.round((monto - subtotal) * 100) / 100;
-        movs.push({ ...baseSF, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
-        movs.push({ ...baseSF, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
+        movs.push({ ...baseSF, ...overrides, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR], debe: subtotal });
+        movs.push({ ...baseSF, ...overrides, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
         restante = parseFloat((restante - monto).toFixed(2));
       };
       emitirLineaSF(montoSFOculto, 'SF-OCULTO');
-      emitirLineaSF(montoSFVisible, 'SF');
+      // Visible (de periodo anterior): una línea POR ORIGEN, con su propia
+      // referencia (serieOrigen-folioOrigen, ej. "DEV-055991") en vez de
+      // combinar todo bajo el concepto del CFDI actual — sin esto, dos
+      // devoluciones de meses distintos (ej. julio y junio) se veían como un
+      // solo monto sin poder rastrear de cuál venía cada porción (confirmado
+      // con el usuario 2026-08-18, caso real Global 89CF6A7F: DEV-055991 +
+      // CAC-075406). Si por lo que sea no hay detalle disponible (dato viejo
+      // sin `detalleVisible`), cae al comportamiento anterior (una sola línea
+      // con el concepto del CFDI actual).
+      if (detalleSFVisible.length > 0) {
+        for (const d of detalleSFVisible) {
+          // Serie y folio de la VENTA que generó el saldo (auditable en
+          // cajas) — nunca el marcador DEV/CAC (ese no es un documento que se
+          // pueda buscar como "serie y folio interno", solo identifica el
+          // TIPO de ajuste). Si por lo que sea no viene la venta, cae al
+          // marcador como último recurso (mejor que dejarlo vacío).
+          const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
+            || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+          emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF', {
+            serie: referenciaVenta,
+            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / '),
+          });
+        }
+      } else {
+        emitirLineaSF(montoSFVisible, 'SF');
+      }
     }
     // Puntos/Club Tuberos: a diferencia de SF, va CONSOLIDADO en una sola
     // línea genérica por sucursal/día ("CLIENTE DE MOSTRADOR SUC. X"), no
@@ -903,7 +969,22 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       const excesoCubrir = totalFormasPagoReal > 0
         ? parseFloat((restante - totalFormasPagoReal).toFixed(2))
         : 0;
+      if (_DEBUG_SPLIT_PAGO) {
+        _debugLogger.warn(`[DEBUG_SPLIT_SFPUNTOS] ${serieCfdi}-${cfdi.folio} restante=${restante} totalFormasPagoReal=${totalFormasPagoReal} `
+          + `excesoCubrir=${excesoCubrir} -> ${excesoCubrir > 0.01 && totalFormasPagoReal > 0 ? 'EXCESO_VENTA_SIN_COBRO_EXCLUIDO' : 'SPLIT_DIRECTO_RESTANTE'}`);
+      }
       if (excesoCubrir > 0.01 && totalFormasPagoReal > 0) {
+        // Antes este exceso se mandaba SIEMPRE a Caja sin excluir (a
+        // diferencia del caso normal, ver `esCasoNormalParaSplit` abajo, que
+        // sí lo etiqueta "Venta Sin Cobro"). Investigación exhaustiva
+        // 2026-08-20 (caso real Global Hidalgo B0-260801256, $5,087.28):
+        // se agotaron 4 fuentes independientes (API de cobros ±15 días, API
+        // por factura sin restricción de fecha, reporte oficial de
+        // Movimientos en Cajas completo, y /cuentas-pendientes) y NINGUNA
+        // mostró ticket real que respalde este remanente — no es "ruido de
+        // reclasificación" recuperable, es dinero sin ticket detrás. Se
+        // alinea con el caso normal: se excluye del consolidado de
+        // Efectivo/Tarjeta en vez de sumarse a ciegas.
         movs.push({
           cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
           concepto, centroCosto, ventaFecha, serie: serieCfdi,
@@ -912,6 +993,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
           cfdiUuid:    cfdi.uuid,
           rfcTercero,
           _esCargoPrincipal: true,
+          tipoOrigen:  'Venta Sin Cobro',
         });
         splitPorFormaPagoReal(totalFormasPagoReal, extraRemanente);
       } else {
@@ -961,6 +1043,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     const excesoCasoNormal = totalFormasPagoReal > 0
       ? parseFloat((montoCargo - totalFormasPagoReal).toFixed(2))
       : 0;
+    if (_DEBUG_SPLIT_PAGO) {
+      _debugLogger.warn(`[DEBUG_SPLIT_NORMAL] ${serieCfdi}-${cfdi.folio} montoCargo=${montoCargo} totalFormasPagoReal=${totalFormasPagoReal} `
+        + `excesoCasoNormal=${excesoCasoNormal} -> ${excesoCasoNormal > 0.01 && totalFormasPagoReal > 0 ? 'EXCESO_EXCLUIDO_VENTA_SIN_COBRO' : 'SPLIT_DIRECTO_MONTOCARGO'}`);
+    }
     if (excesoCasoNormal > 0.01 && totalFormasPagoReal > 0) {
       movs.push({
         cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
@@ -1001,6 +1087,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       ? ((_esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS])
           ?? cuentaMap[rule.cuentaCargo] ?? null)
       : (cuentaMap[rule.cuentaCargo] ?? null);
+    if (_DEBUG_SPLIT_PAGO) {
+      _debugLogger.warn(`[DEBUG_SPLIT_FALLBACK] ${serieCfdi}-${cfdi.folio} montoCargo=${montoCargo} formaPagoCFDI=${cfdi.formaPago} `
+        + `sinCobrosEnSucursal=${sinCobrosEnSucursal} tipoOrigenAplicado=${sinCobrosEnSucursal ? 'Venta Sin Cobro' : 'NINGUNO (SI CONSOLIDA)'}`);
+    }
     movs.push({
       cuentaId:    _cuentaIdFallback,
       concepto,
@@ -1435,6 +1525,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ...m,
     ...satMeta,
     ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
+    // Sobrevive al spread de `satMeta` por la misma razón que `_formaPagoReal`
+    // — ver comentario ahí. `consolidarCargos` los usa para resolver la
+    // autorización real de Tarjeta por ticket (bank_movements.erpLinks).
+    ...(m._serieVentaTicket != null ? { serieVentaTicket: m._serieVentaTicket } : {}),
+    ...(m._folioVentaTicket != null ? { folioVentaTicket: m._folioVentaTicket } : {}),
     ...(
       m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL
         ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }

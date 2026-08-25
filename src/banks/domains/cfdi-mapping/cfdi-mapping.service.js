@@ -507,7 +507,14 @@ function _referenciaDocRelacionado(documentosRelacionados) {
 // propio (ej. "Tubo galvanizado - 3/4"), y un recorte genérico hasta el
 // último " - " confundiría la última palabra con un código.
 const _PREFIJOS_CONCEPTO = ['IVA cobrado - ', 'IVA ant. - ', 'IVA ret. - ', 'ISR ret. - ', 'Saldo - ', 'IVA - '];
-const _REFERENCIA_REGEX  = /^[A-Z0-9]+(-\d+)?$/i;
+// `(-\d+)*-?` (en vez de `(-\d+)?`): acepta VARIOS anticipos concatenados
+// ("OPA-00763-00665", ver `anticipoFolioRefGuard` en cfdi-poliza-generator.
+// service.js) y un guion colgante final cuando alguno no resolvió folio
+// todavía ("OPA-00763-") — sin esto, ese guion colgante rompía el match y
+// `enriquecerConceptoConCliente` caía a mostrar la serie-folio de la venta
+// en vez de la referencia OPA en la columna H (confirmado con el usuario
+// 2026-08-25, caso real MONSAN B0-260801098).
+const _REFERENCIA_REGEX  = /^[A-Z0-9]+(-\d+)*-?$/i;
 function esConceptoMarcadorAjuste(concepto) {
   let nucleo = String(concepto || '');
   for (const prefijo of _PREFIJOS_CONCEPTO) {
@@ -1123,7 +1130,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         : iva;
       movs.push({
         cuentaId:    cuentaMap[cuentaIvaAplicable] ?? null,
-        concepto:    `IVA - ${concepto}`,
+        // Sin prefijo "IVA - " en la columna H (confirmado con el usuario
+        // 2026-08-25) — la cuenta contable ya identifica que es IVA, el
+        // prefijo era redundante con la referencia real (serie-folio/OPA-...).
+        concepto,
         centroCosto,
         ventaFecha,
         serie:       serieCfdi,
@@ -1321,7 +1331,12 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         const s0R  = parseFloat(subTotal0.toFixed(2));
         const cargoLine = movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
         if (cargoLine) cargoLine.debe = s16R;
-        const ivaLineMixto = movs.find(m => m.concepto?.startsWith('IVA - ') && m.debe > 0);
+        // Localiza la línea de IVA por CUENTA (misma que usó el push original,
+        // línea ~1122), no por el prefijo "IVA - " del concepto — ese prefijo
+        // se quitó de la columna H (confirmado con el usuario 2026-08-25), así
+        // que ya no sirve como identificador aquí.
+        const cuentaIvaAplicableMixto = (esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva;
+        const ivaLineMixto = movs.find(m => m.cuentaId === (cuentaMap[cuentaIvaAplicableMixto] ?? null) && m.debe > 0);
         if (ivaLineMixto) {
           ivaLineMixto.debe = parseFloat((total - s16R - s0R).toFixed(2));
         }
@@ -1447,7 +1462,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     if (ivaR > 0) {
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaIvaAbono] ?? null,
-        concepto:    `IVA - ${concepto}`,
+        // Ver comentario equivalente arriba: sin prefijo "IVA - " en columna H.
+        concepto,
         centroCosto,
         ventaFecha,
         serie:       serieCfdi,

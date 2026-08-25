@@ -2228,6 +2228,34 @@ async function exportContpaqXlsx(id, overrides = {}) {
   const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos } = _extraerCobrosSucursal(movimientos);
   movimientos = movimientosSinCobroSucursal;
 
+  // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
+  // MEXICANA DE ANTEQUERA B0-260801134): un Cargo de Venta normal por un
+  // monto chico (< $10) suele ser un residuo de redondeo entre el Saldo a
+  // Favor usado y el total real de la factura (el SF no cubre el 100% por un
+  // par de centavos, y el faltante cae a la forma de pago que declaró el CFDI
+  // aunque no hubo depósito/transferencia real) — se oculta igual que el SF
+  // chico (mismo umbral $50 de `UMBRAL_SF_OTROS_INGRESOS`, pero aquí a
+  // propósito más chico, $10, para no esconder ventas reales pequeñas por
+  // error). PENDIENTE (ver memoria): la solución correcta es cruzar esto con
+  // el monto de SF usado por la MISMA factura y absorber el residuo ahí en
+  // vez de esconderlo a ciegas por monto.
+  const UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS = 10;
+  const residuosVenta = [];
+  movimientos = movimientos.filter((m) => {
+    const esResiduoChico = m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && Number(m.debe) < UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS && Number(m.haber) === 0;
+    if (!esResiduoChico) return true;
+    residuosVenta.push({
+      cuenta:      m.cuenta,
+      centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+      concepto:    m.concepto || '',
+      debe:        Number(m.debe),
+      haber:       Number(m.haber),
+      motivo:      `Monto < $${UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS} (posible residuo de redondeo SF)`,
+    });
+    return false;
+  });
+  if (residuosVenta.length) filasOtrosIngresos.push(...residuosVenta);
+
   // Nombres de cliente — para el bloque de Crédito (cada CFDI es su propia
   // línea) y también para la hoja de desglose de los consolidados de Contado
   // (ahí cada CFDI se resume en un total, pero el desglose sí lista cada uno).

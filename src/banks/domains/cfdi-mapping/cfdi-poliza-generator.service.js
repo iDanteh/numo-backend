@@ -1372,11 +1372,22 @@ async function _resolverReferenciaOpaPorMonto(anticiposCfdi) {
     if (totalAnticipo <= 0 || !c.fecha) continue;
     const fechaAnticipo = new Date(c.fecha);
     const VENTANA_MS = 5 * 24 * 3600 * 1000;
-    const bm = await BankMovement.findOne({
+    // OJO (2026-08-25, caso real MONSAN B0-260801098/6037C46E): `findOne` con
+    // este mismo filtro devolvía un documento que NO cumplía la condición de
+    // `erpLinks.total` (comportamiento inconsistente de Mongo/Mongoose con
+    // `findOne` + rango sobre un campo dentro de un array, sin `$elemMatch`,
+    // reproducido en real — `find` con el filtro IDÉNTICO sí trae el
+    // documento correcto entre varios). Se usa `find` + selección en JS del
+    // primero cuyo `erpLinks` realmente calce, en vez de confiar en `findOne`.
+    const candidatos = await BankMovement.find({
       fecha: { $gte: new Date(fechaAnticipo.getTime() - VENTANA_MS), $lte: new Date(fechaAnticipo.getTime() + VENTANA_MS) },
       'erpLinks.total': { $gte: totalAnticipo - 0.01, $lte: totalAnticipo + 0.01 },
     }).select('erpLinks').lean();
-    const link = (bm?.erpLinks ?? []).find(l => Math.abs((Number(l.total) || 0) - totalAnticipo) < 0.01);
+    let link = null;
+    for (const bm of candidatos) {
+      link = (bm.erpLinks ?? []).find(l => Math.abs((Number(l.total) || 0) - totalAnticipo) < 0.01);
+      if (link) break;
+    }
     if (link?.serie && link?.folioExterno) {
       mapa[c.uuid.toUpperCase()] = `${link.serie}-${link.folioExterno}`;
     }
@@ -1759,12 +1770,22 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
     }
   }
   const diaCfdiPorFolioFactura = new Map();
+  // Ticket EXACTO (vía `documentosRelacionados`) que cada factura declara como
+  // su venta real — mismo criterio que `_viaTicketPropio` en
+  // `_prefetchAjustesFacturaPropia` (2026-08-21, caso E48070D3 $618.81).
+  // Necesario aquí para NO reclamar como "cobro sin factura" un ticket que esa
+  // otra función YA va a cubrir en el día real de la factura sin importar
+  // cuántos días de diferencia haya — de lo contrario se cuenta por partida
+  // doble: una vez aquí (día del cobro) y otra en el día de la factura (fix
+  // 2026-08-25, mismo caso E48070D3: $618.81 aparecía en Tarjeta tanto el
+  // 7-ago como el 11-ago).
+  const ticketExactoPorFolioFactura = new Map();
   if (foliosFacturaReferenciados.size) {
     const orConditions = [...foliosFacturaReferenciados].map(k => {
       const [serie, folio] = k.split('|');
       return { serie, folio };
     });
-    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha').lean();
+    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha metodoPago documentosRelacionados').lean();
     for (const c of cfdisReferenciados) {
       const key = `${c.serie}|${c.folio}`;
       const dia = _diaMx(c.fecha);
@@ -1774,6 +1795,13 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       // de tolerancia del cobro real).
       const actual = diaCfdiPorFolioFactura.get(key);
       if (!actual || dia < actual) diaCfdiPorFolioFactura.set(key, dia);
+
+      if (c.metodoPago === 'PUE' && !ticketExactoPorFolioFactura.has(key)) {
+        const ticket = _extraerDocumentosRelacionados(c)[0];
+        if (ticket && ticket.serie !== 'OPA' && !(ticket.serie === c.serie && ticket.folio === c.folio)) {
+          ticketExactoPorFolioFactura.set(key, `${ticket.serie}|${ticket.folio}`);
+        }
+      }
     }
   }
 
@@ -1790,6 +1818,11 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
 
       if (facturaKey) {
+        // Vínculo EXACTO ticket↔factura (`documentosRelacionados`, PUE): el
+        // pipeline normal ya lo cubrirá en el día de la factura vía
+        // `_viaTicketPropio`, sin importar la diferencia de días — no duplicar.
+        if (ticketExactoPorFolioFactura.get(facturaKey) === ventaKey) continue;
+
         const diaCfdi = diaCfdiPorFolioFactura.get(facturaKey);
         // CFDI existe Y su fecha está dentro de tolerancia del cobro → el
         // pipeline normal por CFDI ya lo cubre (o lo cubrirá) — no duplicar.
@@ -2261,7 +2294,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
         // Enriquecer también sustitutos (tipoRelacion='04'): se conservan en
         // la póliza y necesitan formaPago/conceptos/tipoOrigen del ERP.
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0) ||
+        // Factura Final de Anticipo (formaPago='30', marcador interno del ERP,
+        // no un c_FormaPago real del SAT) sin tipoRelacion='07' declarado a
+        // nivel SAT (caso real 2026-08-25, MONSAN B0-260801098/EDDCAB96: SAT
+        // trae cfdiRelacionados=[] pero el ERP sí trae 2 entradas tipoRelacion
+        // 07) — sin esto, `_rel07UuidsSinReglaGuard`/`rel07SinReglaProp` nunca
+        // encontraba la relación con el anticipo (solo miraba `cfdiRelacionados`
+        // ya mezclado, que se quedaba vacío porque este CFDI ya venía "completo"
+        // a nivel SAT y no disparaba ningún otro motivo de enriquecimiento).
+        (c.tipoDeComprobante === 'I' && c.formaPago === '30' && !c.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
       ))
       .map(c => c.uuid),
   );
@@ -2754,17 +2796,43 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const ccProp = cfdi.serie ? (ccBySerieMapProp[cfdi.serie] ?? null) : null;
 
     // Aplicación de anticipo SIN Nota de Crédito SAT — ver comentario en
-    // `CODIGO_CUENTA_ANTICIPOS_CLIENTES`. Si esta factura califica, el Cargo
-    // principal (normalmente a Clientes) se sustituye más abajo por Anticipos
-    // + IVA-anticipo, referenciando el folio del anticipo con el marcador
-    // "OPA" (confirmado con el usuario 2026-08-19: por lo mientras, sin dato
-    // de marcador real del ERP para este caso).
-    const rel07SinReglaProp = (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo)
-      ? cfdi.cfdiRelacionados?.find(r => r.tipoRelacion === '07')
-      : null;
-    const anticipoFolioRefProp = rel07SinReglaProp
-      ? anticipoFolioPorUuidProp[(rel07SinReglaProp.uuids?.[0] ?? rel07SinReglaProp.uuid ?? '').toUpperCase()]
-      : null;
+    // `CODIGO_CUENTA_ANTICIPOS_CLIENTES`. Si esta factura califica, se agrega
+    // MÁS ABAJO un cierre adicional (Cargo Ingresos+IVA revirtiendo la venta +
+    // Abono Anticipos/IVA-anticipo liberando el pasivo), referenciando el
+    // folio del anticipo con el marcador "OPA" — el Cargo principal a
+    // Clientes y el Abono normal de Ingresos/IVA de la regla NO se tocan
+    // (confirmado con el usuario 2026-08-25, caso real MONSAN
+    // B0-260801098/EDDCAB96: antes se sustituía el Cargo Clientes, ahora se
+    // deja intacto y el cierre se agrega aparte).
+    // Puede haber VARIAS relaciones tipoRelacion='07' (caso real 2026-08-25,
+    // MONSAN B0-260801098/EDDCAB96: 2 anticipos, OPA-00763 y OPA-00665) — se
+    // concatenan TODAS las que logren resolver folio (formato
+    // "OPA-00763-00665"), no solo la primera. Mejora pendiente (pedida por el
+    // usuario): cuando alguna de las relacionadas no tiene su CFDI
+    // sincronizado en Mongo (como pasa aquí con OPA-00665) no se puede
+    // resolver su folio ni prorratear el monto entre ambos anticipos — por
+    // ahora solo se refleja el/los que sí resuelven.
+    let anticipoFolioRefProp = null;
+    if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
+      // Solo los folios que SÍ resuelven se concatenan ("OPA-00763-00665");
+      // si además hay alguna relación sin resolver (CFDI relacionado sin
+      // sincronizar en Mongo), se agrega UN solo "-" al final ("OPA-00763-"),
+      // sin importar en qué posición del arreglo venga la que no resolvió —
+      // así nunca queda un guion doble en medio (bug real 2026-08-25: el no
+      // resuelto venía primero y el join daba "OPA--00763").
+      const foliosResueltosProp = [];
+      let faltaAlgunoProp = false;
+      for (const rel of (cfdi.cfdiRelacionados ?? [])) {
+        if (rel.tipoRelacion !== '07') continue;
+        let refRel = null;
+        for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
+          const ref = anticipoFolioPorUuidProp[(u || '').toUpperCase()];
+          if (ref) { refRel = ref.replace(/^OPA-/, ''); break; }
+        }
+        if (refRel) foliosResueltosProp.push(refRel); else faltaAlgunoProp = true;
+      }
+      if (foliosResueltosProp.length) anticipoFolioRefProp = `OPA-${foliosResueltosProp.join('-')}${faltaAlgunoProp ? '-' : ''}`;
+    }
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver `puntosAcumuladosProp` — Puntos va consolidado, no individual).
@@ -2802,14 +2870,17 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // de saldo/tasa mixta, fuera del alcance del split).
       const esLineaCargoPrincipal = m._esCargoPrincipal === true || (!!rule?.cuentaCargo &&
         m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
-      // Anticipo sin NC (ver `anticipoFolioRefProp` arriba): el Cargo
-      // principal NO se registra — se sustituye abajo por Anticipos/IVA-anticipo.
-      if (anticipoFolioRefProp && esLineaCargoPrincipal) continue;
       // La reducción por cruce de sucursal SOLO aplica a Caja/Bancos — nunca
       // a las líneas de SF/Puntos (`_esCargoPrincipal` también las marca,
       // pero representan dinero que fue a Anticipos Otros/Club Tuberos, no
       // efectivo/tarjeta cobrado — un cruce de sucursal cubre esto último).
       const esLineaCajaOBancos = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      // Anticipo sin NC: el Cargo Clientes se queda en BD (necesario para el
+      // cuadre del asiento normal de la regla) pero se oculta del export — el
+      // cierre de abajo ya muestra lo relevante (Abono Anticipos/IVA-anticipo);
+      // mostrarlo también duplicaría visualmente la venta (confirmado con el
+      // usuario 2026-08-25, caso real MONSAN B0-260801098).
+      const ocultarPorAnticipo = anticipoFolioRefProp && esLineaCargoPrincipal;
       if (montoCubiertoRestante > 0 && esLineaCargoPrincipal && esLineaCajaOBancos && Number(m.debe) > 0) {
         const reduccion = Math.min(montoCubiertoRestante, Number(m.debe));
         montoCubiertoRestante = parseFloat((montoCubiertoRestante - reduccion).toFixed(2));
@@ -2820,6 +2891,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           debe:          debeAjustado,
           centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
           centroCostoId: ccProp?.id      ?? null,
+          ...(ocultarPorAnticipo ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
           _cfdiInfo: {
             uuid:              cfdi.uuid,
             tipo:              cfdi.tipoDeComprobante,
@@ -2836,6 +2908,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         ...m,
         centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
         centroCostoId: ccProp?.id      ?? null,
+        ...(ocultarPorAnticipo ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         _cfdiInfo: {
           uuid:              cfdi.uuid,
           tipo:              cfdi.tipoDeComprobante,
@@ -2848,37 +2921,61 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       });
     }
 
-    // Anticipo sin NC — sustituye el Cargo principal omitido arriba por
-    // Anticipos + IVA-anticipo, con la misma referencia "OPA-{folio del
-    // anticipo}" en ambas líneas (ver `CODIGO_CUENTA_ANTICIPOS_CLIENTES`).
-    // Se reutilizan los montos YA calculados por la regla para Ventas/IVA
-    // (en vez de recalcular desde el CFDI) para no duplicar esa lógica ni
-    // arriesgar una descuadrada si difieren por descuentos/retenciones.
+    // Aplicación de anticipo SIN Nota de Crédito SAT — cierre ADICIONAL (el
+    // Abono Ingresos/IVA de la regla se queda tal cual, es la venta normal):
+    // Cargo Anticipos/IVA-anticipo (libera/aplica el pasivo del anticipo,
+    // referenciando el folio "OPA-{folio}") contra un Abono a Clientes oculto
+    // (cierra la CxC contra el Cargo Clientes original, también oculto — neto
+    // cero, es la misma cuenta) — confirmado con el usuario 2026-08-25, caso
+    // real MONSAN B0-260801098/EDDCAB96 (Anticipos/IVA-anticipo van de CARGO,
+    // no de abono — corrige un intento anterior con la polaridad invertida).
     if (anticipoFolioRefProp) {
-      const montoVentasAnticipoProp = rule?.cuentaAbono
-        ? (movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)?.haber ?? 0)
-        : 0;
+      const movVentasAbonoProp = rule?.cuentaAbono
+        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
+        : null;
       // Puede ser PPD (`rule.cuentaIvaPPD`, IVA por cobrar) o PUE (`rule.cuentaIva`) —
       // se prueban ambas cuentas, la que traiga un haber real gana.
-      const montoIvaAnticipoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+      const movIvaAbonoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
         .filter(Boolean)
-        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0)?.haber)
-        .find(v => Number(v) > 0) ?? 0;
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
+        .find(Boolean) ?? null;
+      const montoVentasAnticipoProp = movVentasAbonoProp?.haber ?? 0;
+      const montoIvaAnticipoProp    = movIvaAbonoProp?.haber ?? 0;
       const refOpaProp = anticipoFolioRefProp; // ya viene armado como "OPA-..." (real o placeholder)
-      const baseAnticipoProp = {
-        concepto: refOpaProp, serie: refOpaProp, centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
-        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
+      const baseInfoProp = {
+        centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
         _cfdiInfo: {
           uuid: cfdi.uuid, tipo: cfdi.tipoDeComprobante, emisor: cfdi.emisor?.rfc,
           total: cfdi.total, fecha: cfdi.fecha, sinRegla: false,
           comparisonStatus: cfdi.lastComparisonStatus ?? null,
         },
       };
+      // El Abono a Clientes (cierre de la CxC contra el anticipo) es puro
+      // ajuste interno — nunca se muestra, solo las 2 líneas de Cargo
+      // (Anticipos/IVA-anticipo, sí visibles con 'OPA').
+      const baseInfoPropOculto = { ...baseInfoProp, tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO };
+      const totalAnticipoProp = Number(montoVentasAnticipoProp) + Number(montoIvaAnticipoProp);
+      if (totalAnticipoProp > 0) {
+        movimientosResult.push({
+          ...baseInfoPropOculto, cuentaId: cuentaMap[rule.cuentaCargo] ?? null,
+          concepto: refOpaProp, serie: refOpaProp, debe: 0, haber: totalAnticipoProp,
+        });
+      }
+      // Columna C (serie) = serie-folio real de la VENTA (la factura que
+      // cierra el anticipo), columna H (concepto) = folio del anticipo
+      // ("OPA-...") — confirmado con el usuario 2026-08-25.
       if (Number(montoVentasAnticipoProp) > 0) {
-        movimientosResult.push({ ...baseAnticipoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null, debe: montoVentasAnticipoProp });
+        movimientosResult.push({
+          ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
+          concepto: refOpaProp, serie: movVentasAbonoProp?.serie ?? refOpaProp, debe: montoVentasAnticipoProp, haber: 0,
+        });
       }
       if (Number(montoIvaAnticipoProp) > 0) {
-        movimientosResult.push({ ...baseAnticipoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, debe: montoIvaAnticipoProp });
+        movimientosResult.push({
+          ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
+          concepto: refOpaProp, serie: movIvaAbonoProp?.serie ?? refOpaProp, debe: montoIvaAnticipoProp, haber: 0,
+        });
       }
     }
 
@@ -2908,25 +3005,28 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionProp = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionProp && montoSaldoFavorProp > 0) {
-        // Si el SF que se está cerrando es TODO oculto (generado y usado el
-        // mismo día/almacén, ver `_inyectarSaldoFavorGenerado`), esta línea de
-        // cierre debe ocultarse igual que sus hermanas — sin esto queda
-        // visible en la póliza principal como un Cargo "Cancelación" extra
-        // sin contrapartida aparente (el abono que revierte SÍ existe, solo
-        // que está oculto), confundiendo al contador (confirmado con el
-        // usuario 2026-08-18, caso real NORBERTO VELAZQUEZ JUAREZ/CAC-077337).
+        // Esta línea de cierre SIEMPRE debe ocultarse del export, sin importar
+        // si el SF que está cerrando es visible u oculto (generado y usado el
+        // mismo día/almacén) — es puramente un ajuste interno (cancela, en la
+        // MISMA cuenta, el Abono que ya está oculto) para que el asiento
+        // cuadre; nunca representa un cargo real de la Cancelación. Antes solo
+        // se ocultaba cuando TODO el SF era oculto (confirmado con el usuario
+        // 2026-08-18, caso NORBERTO VELAZQUEZ JUAREZ/CAC-077337), dejando
+        // visible este mismo cargo fantasma cuando el SF era visible (caso
+        // real 2026-08-25, PUBLICO EN GENERAL/CAC-077472: 3 cargos en vez de
+        // 2, el tercero era este cierre sin ocultar).
         // `tipoOrigen` también se sobreescribe: `_extraerCobrosSucursal`
         // (poliza.service.js) solo revisa `reglaNombre` en líneas cuyo
         // tipoOrigen YA es 'Cobro Sucursal' — con el tipoOrigen original
         // ('Cancelación') la línea nunca llegaba a esa revisión.
-        const todoOcultoProp = lineasSaldoFavorProp.every(l => l.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO);
         movimientosResult.push({
           ...abonoDevolucionProp,
           debe:          montoSaldoFavorProp,
           haber:         0,
           centroCosto:   ccProp?.clave ?? abonoDevolucionProp.centroCosto ?? null,
           centroCostoId: ccProp?.id    ?? null,
-          ...(todoOcultoProp ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
+          tipoOrigen:  'Cobro Sucursal',
+          reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO,
           _cfdiInfo: {
             uuid:              cfdi.uuid,
             tipo:              cfdi.tipoDeComprobante,
@@ -3578,7 +3678,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         (c.tipoDeComprobante === 'I' && c.metodoPago === 'PPD') ||
         // Enriquecer también sustitutos (tipoRelacion='04'): se conservan en
         // la póliza y necesitan formaPago/conceptos/tipoOrigen del ERP.
-        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0)
+        (['E', 'P'].includes(c.tipoDeComprobante) && c.cfdiRelacionados?.length > 0) ||
+        // Ver comentario equivalente en generarPropuesta: Factura Final de
+        // Anticipo (formaPago='30') sin tipoRelacion='07' a nivel SAT.
+        (c.tipoDeComprobante === 'I' && c.formaPago === '30' && !c.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
       ))
       .map(c => c.uuid),
   );
@@ -4012,13 +4115,29 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
     const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
 
-    // Anticipo sin NC — ver comentario equivalente en generarPropuesta.
-    const rel07SinReglaGuard = (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo)
-      ? cfdi.cfdiRelacionados?.find(r => r.tipoRelacion === '07')
-      : null;
-    const anticipoFolioRefGuard = rel07SinReglaGuard
-      ? anticipoFolioPorUuidGuard[(rel07SinReglaGuard.uuids?.[0] ?? rel07SinReglaGuard.uuid ?? '').toUpperCase()]
-      : null;
+    // Anticipo sin NC — ver comentario equivalente en generarPropuesta. Puede
+    // haber VARIAS relaciones tipoRelacion='07' (caso real 2026-08-25, MONSAN
+    // B0-260801098/EDDCAB96: 2 anticipos, OPA-00763 y OPA-00665) — se
+    // concatenan TODAS las que resuelvan folio ("OPA-00763-00665"), no solo
+    // la primera. Mejora pendiente: si alguna relacionada no tiene su CFDI
+    // sincronizado en Mongo, esa no se puede resolver ni prorratear.
+    let anticipoFolioRefGuard = null;
+    if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
+      // Ver comentario equivalente en generarPropuesta: el "-" colgante de las
+      // relaciones sin resolver SIEMPRE va al final, nunca en medio.
+      const foliosResueltosGuard = [];
+      let faltaAlgunoGuard = false;
+      for (const rel of (cfdi.cfdiRelacionados ?? [])) {
+        if (rel.tipoRelacion !== '07') continue;
+        let refRel = null;
+        for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
+          const ref = anticipoFolioPorUuidGuard[(u || '').toUpperCase()];
+          if (ref) { refRel = ref.replace(/^OPA-/, ''); break; }
+        }
+        if (refRel) foliosResueltosGuard.push(refRel); else faltaAlgunoGuard = true;
+      }
+      if (foliosResueltosGuard.length) anticipoFolioRefGuard = `OPA-${foliosResueltosGuard.join('-')}${faltaAlgunoGuard ? '-' : ''}`;
+    }
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver comentario equivalente en generarPropuesta).
@@ -4044,14 +4163,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // Ver comentario equivalente en generarPropuesta (`_esCargoPrincipal`).
       const esLineaCargoPrincipalGuard = m._esCargoPrincipal === true || (!!rule?.cuentaCargo &&
         m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
-      // Anticipo sin NC (ver `anticipoFolioRefGuard` arriba): el Cargo
-      // principal NO se registra — se sustituye abajo por Anticipos/IVA-anticipo.
-      if (anticipoFolioRefGuard && esLineaCargoPrincipalGuard) continue;
       // Ver comentario equivalente en generarPropuesta: la reducción solo
       // aplica a Caja/Bancos, nunca a SF/Puntos.
       const esLineaCajaOBancosGuard = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
       // eslint-disable-next-line no-unused-vars
       const { _saldoUsado, ...cleanM } = m;
+      // Ver comentario equivalente en generarPropuesta: oculta el Cargo
+      // Clientes cuando aplica el cierre de anticipo sin NC.
+      const ocultarPorAnticipoGuard = anticipoFolioRefGuard && esLineaCargoPrincipalGuard;
       if (montoCubiertoRestanteGuard > 0 && esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && Number(m.debe) > 0) {
         const reduccion = Math.min(montoCubiertoRestanteGuard, Number(m.debe));
         montoCubiertoRestanteGuard = parseFloat((montoCubiertoRestanteGuard - reduccion).toFixed(2));
@@ -4063,6 +4182,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           cuentaFaltante: cleanM.cuentaId == null,
           centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
           centroCostoId:  cc?.id    ?? null,
+          ...(ocultarPorAnticipoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         });
         continue;
       }
@@ -4071,32 +4191,58 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         cuentaFaltante: cleanM.cuentaId == null,
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
+        ...(ocultarPorAnticipoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
       });
     }
 
     // Anticipo sin NC — ver comentario equivalente en generarPropuesta.
     if (anticipoFolioRefGuard) {
-      const montoVentasAnticipoGuard = rule?.cuentaAbono
-        ? (movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)?.haber ?? 0)
-        : 0;
+      const movVentasAbonoGuard = rule?.cuentaAbono
+        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
+        : null;
       // Puede ser PPD (`rule.cuentaIvaPPD`) o PUE (`rule.cuentaIva`) — ver
       // comentario equivalente en generarPropuesta.
-      const montoIvaAnticipoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+      const movIvaAbonoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
         .filter(Boolean)
-        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0)?.haber)
-        .find(v => Number(v) > 0) ?? 0;
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
+        .find(Boolean) ?? null;
+      const montoVentasAnticipoGuard = movVentasAbonoGuard?.haber ?? 0;
+      const montoIvaAnticipoGuard    = movIvaAbonoGuard?.haber ?? 0;
       const refOpaGuard = anticipoFolioRefGuard; // ya viene armado como "OPA-..." (real o placeholder)
       const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
       const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
-      const baseAnticipoGuard = {
-        concepto: refOpaGuard, serie: refOpaGuard, centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
-        cfdiUuid: cfdi.uuid, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
+      const baseInfoGuard = {
+        centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
       };
+      // Ver comentario equivalente en generarPropuesta: Anticipos/IVA-anticipo
+      // van de CARGO (visibles con 'OPA'); el Abono a Clientes que cierra la
+      // CxC es ajuste interno oculto (neto cero contra el Cargo Clientes
+      // original, también oculto).
+      const baseInfoGuardOculto = { ...baseInfoGuard, tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO };
+      const totalAnticipoGuard = Number(montoVentasAnticipoGuard) + Number(montoIvaAnticipoGuard);
+      if (totalAnticipoGuard > 0) {
+        todosLosMovimientos.push({
+          ...baseInfoGuardOculto, cuentaId: cuentaMap[rule.cuentaCargo] ?? null,
+          concepto: refOpaGuard, serie: refOpaGuard, debe: 0, haber: totalAnticipoGuard,
+          cuentaFaltante: (cuentaMap[rule.cuentaCargo] ?? null) == null,
+        });
+      }
+      // Ver comentario equivalente en generarPropuesta: columna C = serie-folio
+      // real de la venta, columna H = folio del anticipo.
       if (Number(montoVentasAnticipoGuard) > 0) {
-        todosLosMovimientos.push({ ...baseAnticipoGuard, cuentaId: cuentaAnticiposIdGuard, debe: montoVentasAnticipoGuard, cuentaFaltante: cuentaAnticiposIdGuard == null });
+        todosLosMovimientos.push({
+          ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
+          concepto: refOpaGuard, serie: movVentasAbonoGuard?.serie ?? refOpaGuard, debe: montoVentasAnticipoGuard, haber: 0,
+          cuentaFaltante: cuentaAnticiposIdGuard == null,
+        });
       }
       if (Number(montoIvaAnticipoGuard) > 0) {
-        todosLosMovimientos.push({ ...baseAnticipoGuard, cuentaId: cuentaIvaAnticipoIdGuard, debe: montoIvaAnticipoGuard, cuentaFaltante: cuentaIvaAnticipoIdGuard == null });
+        todosLosMovimientos.push({
+          ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
+          concepto: refOpaGuard, serie: movIvaAbonoGuard?.serie ?? refOpaGuard, debe: montoIvaAnticipoGuard, haber: 0,
+          cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
+        });
       }
     }
 
@@ -4118,11 +4264,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         s + (Number(l.haber) || 0) + (l._ajusteConsolidadoSF ? Math.abs(Number(l.debe) || 0) : 0), 0);
       const abonoDevolucionGuard = movs.find(m => Number(m.haber) > 0);
       if (abonoDevolucionGuard && montoSaldoFavorGuard > 0) {
-        // Ver comentario equivalente en generarPropuesta: si el SF que se
-        // cierra es todo oculto, esta línea debe ocultarse igual que sus
-        // hermanas (confirmado con el usuario 2026-08-18, caso real NORBERTO
-        // VELAZQUEZ JUAREZ/CAC-077337).
-        const todoOcultoGuard = lineasSaldoFavorGuard.every(l => l.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO);
+        // Ver comentario equivalente en generarPropuesta: esta línea de
+        // cierre SIEMPRE se oculta, sin importar si el SF es visible u
+        // oculto — es un ajuste interno puro, nunca un cargo real.
         todosLosMovimientos.push({
           ...abonoDevolucionGuard,
           debe:           montoSaldoFavorGuard,
@@ -4130,7 +4274,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           cuentaFaltante: abonoDevolucionGuard.cuentaId == null,
           centroCosto:    cc?.clave ?? abonoDevolucionGuard.centroCosto ?? null,
           centroCostoId:  cc?.id    ?? null,
-          ...(todoOcultoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
+          tipoOrigen:  'Cobro Sucursal',
+          reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO,
         });
       }
     }

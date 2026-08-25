@@ -1568,6 +1568,12 @@ const ETIQUETA_SALDO_FAVOR = 'SF';
 // mismo día en el mismo almacén: se omite del export (queda en BD intacto)
 // confirmado con el usuario 2026-08-04.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
+// Mismo texto que ETIQUETA_COBRO_YA_CONTABILIZADO en cfdi-mapping.service.js
+// (2026-08-25) — Cargo de Efectivo/Tarjeta de una factura cuyo cobro real ya
+// se contabilizó otro día vía "Cobros sin factura" (facturación diferida
+// fuera de tolerancia, ver `yaContabilizadoOtroDia`): se oculta del export
+// igual que SF-OCULTO, para no duplicar el dinero entre los dos días.
+const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
 // Mismo texto que ETIQUETA_PUNTOS en cobros-sucursal-puente.service.js —
 // monedero electrónico Club Tuberos aplicado como forma de pago, columna C =
 // "PAGO" sin prefijo, mismo criterio que SF (confirmado con el usuario
@@ -1725,7 +1731,7 @@ function _extraerCobrosSucursal(movimientos) {
       continue;
     }
     if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== 'Venta Sin Cobro' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
-    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO) {
+    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,
         centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
@@ -1735,7 +1741,9 @@ function _extraerCobrosSucursal(movimientos) {
         // Columna "Motivo" en la hoja "Otros Ingresos" (2026-08-17, confirmado
         // con el usuario) — distingue este caso del de SF ≤ $50 más abajo, que
         // antes se mezclaban sin forma de saber cuál era cuál en el Excel.
-        motivo:      'Oculto — generado y usado el mismo día/almacén',
+        motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
+          ? 'Oculto — cobro real ya contabilizado el día real del cobro'
+          : 'Oculto — generado y usado el mismo día/almacén',
       });
       continue;
     }

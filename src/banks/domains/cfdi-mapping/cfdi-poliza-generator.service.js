@@ -535,19 +535,21 @@ function _diferenciaDiasMx(fechaIso, diaYaResuelto) {
   return Math.round(Math.abs(msCobro - msObjetivo) / (24 * 3600 * 1000));
 }
 
-// Tolerancia de ±1 día calendario entre el cobro real y la fecha de la
-// factura (2026-08-14, confirmado con el usuario — caso real Hidalgo
-// B0-260701096/098/099/133/185/213, 09→10/07/2026): el cliente pagó el 9,
-// pero la Factura Global que agrupa su ticket no se emitió hasta el 10 —
-// un desfase de UN día entre cobro y facturación, distinto del caso de
-// "días/semanas después" que el filtro exacto por día ya bloqueaba a
-// propósito (ver comentario de `_diaMx` arriba, caso Puntos 04/06→10/07: ESE
-// sigue bloqueado, la diferencia ahí es de 4-6 días, fuera de esta
-// tolerancia). Los cobros de facturas viejas (varios días/semanas antes,
-// típicamente cobranza de crédito) siguen excluidos — esos los maneja
-// Cobranza, no Ingreso (confirmado con el usuario, mismo criterio ya
-// aplicado a PPD en cobros-sucursal-puente.service.js).
-const TOLERANCIA_DIAS_FACTURACION_DIFERIDA = 1;
+// Tolerancia entre el cobro real y la fecha de la factura — ELIMINADA
+// (2026-08-25, confirmado con el usuario, caso real B0-260801321/ticket
+// 260802904: Transferencia $6,262.49 cobrada el 11-ago, factura timbrada
+// hasta el 12-ago — el usuario confirmó que debe caer en el día REAL del
+// cobro, el 11, sin importar que la diferencia sea de solo 1 día). Antes
+// (2026-08-14) se toleraba ±1 día completo, dejando el asiento en el día de
+// la factura para ese caso — esa decisión quedó revertida explícitamente hoy:
+// CUALQUIER diferencia (1 día o más) manda el dinero al día real del cobro
+// vía `_cobrosSinFacturaPorCentro`, y el día de la factura oculta su propio
+// Cargo (`sinCobrosEnSucursal`/`yaContabilizadoOtroDia`, ver
+// `_prefetchAjustesFacturaPropia`) para no duplicar. En 0 el comportamiento
+// es "mismo día calendario exacto o se considera facturación diferida" — los
+// cobros de facturas viejas (varios días/semanas antes, cobranza de crédito)
+// siguen excluidos de este mecanismo, esos los maneja Cobranza.
+const TOLERANCIA_DIAS_FACTURACION_DIFERIDA = 0;
 
 /**
  * Fusión de `_prefetchDesglosePagoReal` + `_prefetchSaldoFavorUsadoPropio`
@@ -637,13 +639,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     try {
       // Ventana ampliada ±1 día SOLO para esta consulta (no para
       // `candidatos`/`diaCfdiPorClave`, que siguen siendo exactos al día de
-      // esta generación) — ver `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`: un
-      // cobro de "ayer" puede pertenecer a una factura de "hoy" (facturación
-      // diferida de un día), así que hay que poder VERLO antes de poder
-      // decidir si aplica.
+      // esta generación) — puramente para poder VER cobros de un día
+      // calendario adyacente (ej. redondeo de zona horaria en el límite del
+      // día) antes de decidir si aplican; la decisión real de "aplica o no"
+      // ya no depende de esto, usa `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`
+      // (=0 desde 2026-08-25) más abajo. Se mantiene fija en 1 día aunque la
+      // tolerancia de negocio se haya eliminado — es solo margen de consulta.
+      const VENTANA_CONSULTA_ERP_DIAS = 1;
       const UN_DIA_MS = 24 * 3600 * 1000;
-      const fechaDesdeAmpliada = new Date(fechaDesde.getTime() - TOLERANCIA_DIAS_FACTURACION_DIFERIDA * UN_DIA_MS);
-      const fechaHastaAmpliada = new Date(fechaHasta.getTime() + TOLERANCIA_DIAS_FACTURACION_DIFERIDA * UN_DIA_MS);
+      const fechaDesdeAmpliada = new Date(fechaDesde.getTime() - VENTANA_CONSULTA_ERP_DIAS * UN_DIA_MS);
+      const fechaHastaAmpliada = new Date(fechaHasta.getTime() + VENTANA_CONSULTA_ERP_DIAS * UN_DIA_MS);
       [resultadosAlmacen, resultadosSaldos] = await Promise.all([
         obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro: centroPropioClave, fechaDesde: fechaDesdeAmpliada.toISOString(), fechaHasta: fechaHastaAmpliada.toISOString() }),
         obtenerSaldosFavorPorCentro({ rfc, centro: centroPropioClave, fechaDesde: fechaDesdeAmpliada.toISOString(), fechaHasta: fechaHastaAmpliada.toISOString() }),
@@ -707,6 +712,85 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       for (const c of rS) c._viaTicketPropio = true;
       resultadosAlmacen.push(...rA);
       resultadosSaldos.push(...rS);
+    }
+  }
+
+  // Verificación uno-a-uno de tickets de Factura Global "sin cobro" (2026-08-25,
+  // confirmado con el usuario, caso real B0-260801256/$6,207.20): cada
+  // concepto de una Factura Global trae `noIdentificacion` = folio del ticket
+  // real de cajas. El camino "por centro" (ventana de fechas del batch) puede
+  // no traer un ticket si su cuenta quedó fuera del filtro por factura — se
+  // consulta INDIVIDUALMENTE (mismo patrón de lote que `ticketsPropioPorClave`
+  // arriba, sin ventana de fecha) cada ticket de concepto que el camino
+  // anterior no había asociado a ESTA factura, para no dejar la duda: o bien
+  // aparece con su cobro real (se agrega a `resultadosAlmacen` normal — si el
+  // ERP lo liga a esta misma factura, entra al split normal), o bien se
+  // confirma con certeza que no hay cobro.
+  //
+  // Caso real encontrado (2026-08-25, ticket B0-260802904, $6,262.50): la
+  // consulta individual SÍ encontró el ticket con su cobro real ($6,262.49
+  // Transferencia) — pero el ERP lo tiene ligado a OTRA factura
+  // (folioFactura=260801321), no a la que lo lista en `conceptos`
+  // (260801256). A diferencia del "reparto proporcional" de abajo (que
+  // reparte cuando el mismo ticket aparece en varios `documentosRelacionados`
+  // de CFDIs distintos, cada uno representando ese ticket casi por completo),
+  // aquí no hay forma segura de saber cuál de las dos facturas es la dueña
+  // real del ticket (¿doble facturación en el ERP? ¿reasignación posterior?)
+  // — forzar un reparto adivinando sería un asiento contable incorrecto. Se
+  // deja tal cual (el monto NO se atribuye a esta factura, sigue cayendo en
+  // "Venta Sin Cobro") pero se loguea el conflicto explícito para que el
+  // equipo de cajas lo resuelva del lado del ERP.
+  {
+    const facturaKeyPorTicketConceptos = new Map(); // `${serie}|${folioTicket}` -> facturaKey que lo reclama en `conceptos`
+    const ticketsEsperados = []; // [{ serie, folio, facturaKey, montoEsperado }]
+    const yaAtribuidosAEstaFactura = new Set(
+      resultadosAlmacen.map(c => `${c.serieVenta}|${c.folioVenta}|${c.serieFactura}|${c.folioFactura}`),
+    );
+    for (const { cfdi } of candidatos) {
+      if (!Array.isArray(cfdi.conceptos) || cfdi.conceptos.length < 2) continue;
+      const facturaKey = `${cfdi.serie}|${cfdi.folio}`;
+      for (const concepto of cfdi.conceptos) {
+        const folioTicket = (concepto.noIdentificacion ?? '').trim();
+        if (!folioTicket || folioTicket === cfdi.folio) continue;
+        const ticketKey = `${cfdi.serie}|${folioTicket}`;
+        facturaKeyPorTicketConceptos.set(ticketKey, facturaKey);
+        if (yaAtribuidosAEstaFactura.has(`${ticketKey}|${facturaKey}`)) continue;
+        ticketsEsperados.push({ serie: cfdi.serie, folio: folioTicket, facturaKey, montoEsperado: Number(concepto.importe) || 0 });
+      }
+    }
+    if (ticketsEsperados.length) {
+      const yaConsultados = new Set(resultadosAlmacen.map(c => `${c.serieVenta}|${c.folioVenta}`));
+      const porConsultar = ticketsEsperados.filter(t => !yaConsultados.has(`${t.serie}|${t.folio}`));
+      const LOTE = 150;
+      for (let i = 0; i < porConsultar.length; i += LOTE) {
+        const lote = porConsultar.slice(i, i + LOTE);
+        const [rA, rS] = await Promise.all([
+          obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(t => t.serie), folios: lote.map(t => t.folio) }),
+          obtenerSaldosFavor({ rfc, series: lote.map(t => t.serie), folios: lote.map(t => t.folio) }),
+        ]);
+        resultadosAlmacen.push(...rA);
+        resultadosSaldos.push(...rS);
+      }
+
+      const { logger } = require('../../../shared/utils/logger');
+      const encontradosPorTicket = new Map(resultadosAlmacen.map(c => [`${c.serieVenta}|${c.folioVenta}`, c]));
+      const sinCobro = [];
+      const atribuidosAOtraFactura = [];
+      for (const t of ticketsEsperados) {
+        const ticketKey = `${t.serie}|${t.folio}`;
+        const cuenta = encontradosPorTicket.get(ticketKey);
+        if (!cuenta) { sinCobro.push(t); continue; }
+        const facturaReal = (cuenta.serieFactura && cuenta.folioFactura) ? `${cuenta.serieFactura}|${cuenta.folioFactura}` : null;
+        if (facturaReal && facturaReal !== t.facturaKey) {
+          atribuidosAOtraFactura.push({ ...t, facturaReal, montoCobradoReal: (cuenta.cobros ?? []).reduce((s, cb) => s + Math.abs(Number(cb.monto) || 0), 0) });
+        }
+      }
+      if (sinCobro.length) {
+        logger.warn(`[VentaSinCobro] ${sinCobro.length} ticket(s) de Factura Global CONFIRMADOS sin cobro en el ERP (consulta individual por serie/folio, no solo por centro): ${JSON.stringify(sinCobro)}`);
+      }
+      if (atribuidosAOtraFactura.length) {
+        logger.warn(`[VentaSinCobro] ${atribuidosAOtraFactura.length} ticket(s) con cobro real encontrado pero atribuido en el ERP a OTRA factura distinta de la que lo declara en "conceptos" (revisar del lado del ERP/cajas cual es la dueña real): ${JSON.stringify(atribuidosAOtraFactura)}`);
+      }
     }
   }
 
@@ -893,6 +977,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           formasPago.push({
             nombre: fp.nombre ?? null, claveSat: fp.claveSat ?? null, monto,
             serieVentaTicket: cuenta.serieVenta ?? null, folioVentaTicket: cuenta.folioVenta ?? null,
+            // Este cobro solo llegó aquí gracias a `_viaTicketPropio` (línea
+            // 781: sin ese bypass, `diffDias > TOLERANCIA` habría hecho
+            // `continue`) — es decir, el cobro real ocurrió DÍAS antes que la
+            // factura, fuera de la tolerancia normal. `_cobrosSinFacturaPorCentro`
+            // (mismo criterio de origen CBT/APS/MIS/SERIES_CON_AUTH) ya lo
+            // contabilizó en el día REAL del cobro — este Cargo, en el día de
+            // la factura, debe quedar oculto de "Depósitos consolidados" para
+            // no contar el mismo dinero dos veces (fix 2026-08-25, caso real
+            // E48070D3 $618.81: Tarjeta duplicada entre el 7-ago y el 11-ago).
+            yaContabilizadoOtroDia: !!(diaCfdi && diffDias !== null && diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA),
           });
         }
       }
@@ -1770,22 +1864,12 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
     }
   }
   const diaCfdiPorFolioFactura = new Map();
-  // Ticket EXACTO (vía `documentosRelacionados`) que cada factura declara como
-  // su venta real — mismo criterio que `_viaTicketPropio` en
-  // `_prefetchAjustesFacturaPropia` (2026-08-21, caso E48070D3 $618.81).
-  // Necesario aquí para NO reclamar como "cobro sin factura" un ticket que esa
-  // otra función YA va a cubrir en el día real de la factura sin importar
-  // cuántos días de diferencia haya — de lo contrario se cuenta por partida
-  // doble: una vez aquí (día del cobro) y otra en el día de la factura (fix
-  // 2026-08-25, mismo caso E48070D3: $618.81 aparecía en Tarjeta tanto el
-  // 7-ago como el 11-ago).
-  const ticketExactoPorFolioFactura = new Map();
   if (foliosFacturaReferenciados.size) {
     const orConditions = [...foliosFacturaReferenciados].map(k => {
       const [serie, folio] = k.split('|');
       return { serie, folio };
     });
-    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha metodoPago documentosRelacionados').lean();
+    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha').lean();
     for (const c of cfdisReferenciados) {
       const key = `${c.serie}|${c.folio}`;
       const dia = _diaMx(c.fecha);
@@ -1795,13 +1879,6 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       // de tolerancia del cobro real).
       const actual = diaCfdiPorFolioFactura.get(key);
       if (!actual || dia < actual) diaCfdiPorFolioFactura.set(key, dia);
-
-      if (c.metodoPago === 'PUE' && !ticketExactoPorFolioFactura.has(key)) {
-        const ticket = _extraerDocumentosRelacionados(c)[0];
-        if (ticket && ticket.serie !== 'OPA' && !(ticket.serie === c.serie && ticket.folio === c.folio)) {
-          ticketExactoPorFolioFactura.set(key, `${ticket.serie}|${ticket.folio}`);
-        }
-      }
     }
   }
 
@@ -1818,11 +1895,6 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
 
       if (facturaKey) {
-        // Vínculo EXACTO ticket↔factura (`documentosRelacionados`, PUE): el
-        // pipeline normal ya lo cubrirá en el día de la factura vía
-        // `_viaTicketPropio`, sin importar la diferencia de días — no duplicar.
-        if (ticketExactoPorFolioFactura.get(facturaKey) === ventaKey) continue;
-
         const diaCfdi = diaCfdiPorFolioFactura.get(facturaKey);
         // CFDI existe Y su fecha está dentro de tolerancia del cobro → el
         // pipeline normal por CFDI ya lo cubre (o lo cubrirá) — no duplicar.

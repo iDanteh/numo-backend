@@ -9,6 +9,12 @@ const { sequelize } = require('../../../config/database.postgres');
 const BankMovement = require('../banks/BankMovement.model');
 const CFDI = require('../../../visor/models/CFDI');
 const { esConceptoMarcadorAjuste } = require('../cfdi-mapping/cfdi-mapping.service');
+// Pólizas Traspasos C.P. (2026-08-25) — reusa el motor de detección/relación 1-1 de
+// traspasos entre cuentas propias. El require va en ESTE sentido (poliza.service.js →
+// traspasos-internos.service.js) y nunca al revés, a propósito: evita un require
+// circular (traspasos-internos.service.js no conoce ni necesita conocer poliza.service.js).
+const traspasosInternosService = require('../banks/traspasos-internos.service');
+const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
 
 // Categorías de bank_movements que representan una transferencia electrónica real.
 const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO'];
@@ -389,8 +395,31 @@ async function cancel(id, user, motivo) {
     } catch (_) { /* no bloquear la cancelación por error en advertencia */ }
   }
 
+  // Traspasos C.P. (2026-08-25): cancelar la póliza también desvincula los
+  // BankMovement que había relacionado 1-1 al generarla — mismo efecto que ya
+  // tenía el botón "Revertir relación" del panel de Admin, ahora automático al
+  // cancelar. NO afecta el flujo de cancelación de I/E/P (bloque acotado al final,
+  // después de que el soft-delete ya se aplicó con éxito).
+  let traspasosRevertidos = null;
+  if (poliza.tipo === 'T') {
+    const runIdPoliza = String(id);
+    // revertirTraspasosInternos exige el MISMO userId que generó la relación (queda
+    // en identificadoPor[].userId, ver _buildIdentificarOp) — no necesariamente el
+    // usuario que está cancelando ahora. Se resuelve leyendo un movimiento cualquiera
+    // ya relacionado con este runId, en vez de asumir que el canceller es el generador.
+    const movRelacionado = await BankMovement.findOne(
+      { 'traspasoInterno.runId': runIdPoliza },
+      { identificadoPor: 1 },
+    ).lean();
+    const entradaGeneradora = movRelacionado?.identificadoPor
+      ?.find(e => e.source === 'traspaso-interno' && e.runId === runIdPoliza);
+    if (entradaGeneradora) {
+      traspasosRevertidos = await traspasosInternosService.revertirTraspasosInternos(runIdPoliza, entradaGeneradora.userId);
+    }
+  }
+
   const resultPlain = typeof result?.toJSON === 'function' ? result.toJSON() : result;
-  return { ...resultPlain, advertenciaIvaPpd };
+  return { ...resultPlain, advertenciaIvaPpd, traspasosRevertidos };
 }
 
 /**
@@ -2690,6 +2719,153 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
  * Registra con qué folio(s) de CONTPAQi quedó asociada la póliza tras importar
  * el archivo exportado — es solo trazabilidad, no vuelve a tocar el archivo.
  */
+// ── Pólizas Traspasos C.P. (2026-08-25) ─────────────────────────────────────────
+// El usuario decidió que esta póliza tenga el MISMO ciclo de vida que Ingreso/
+// Cobranza (folio real vía create()/repo.create() — advisory lock + numeración
+// simple MAX+1, balance validado, índice único parcial gratis), en vez del runId
+// ad-hoc que usaba el flujo standalone (generarPolizasContpaqTraspasosPorRango,
+// que sigue existiendo tal cual, sin tocar, para quien todavía la use directo).
+//
+// UNA póliza por día (UTC) dentro del rango — mismo agrupamiento que ya usa
+// generarPolizasContpaqTraspasosPorRango (los traspasos siempre son mismo-día,
+// ver bucketKey en traspasos-internos.service.js) — necesario además porque
+// Poliza.fecha tiene que caer dentro de Poliza.ejercicio/periodo (validado en
+// create() de este archivo), y un rango puede cruzar de mes.
+async function generarYGuardarTraspasos({ rfc, fechaInicio, fechaFin }, user) {
+  if (!rfc)                      throw new ValidationError('El RFC es requerido');
+  if (!fechaInicio || !fechaFin) throw new ValidationError('Se requiere fechaInicio y fechaFin');
+
+  const resultado = await traspasosInternosService.matchTraspasosInternos(
+    { categoriaBbva: traspasosInternosService.RE_CATEGORIA_TRASPASO_INTERNO, dryRun: true }, user,
+  );
+
+  const _utcMidnight = (fecha) => {
+    const d = new Date(fecha);
+    return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  };
+  const inicioUtc = _utcMidnight(fechaInicio);
+  const finUtc    = _utcMidnight(fechaFin);
+
+  const porDia = new Map(); // diaUtcMs → { fechaIso, pares[] }
+  for (const par of resultado.relacionados) {
+    const diaUtc = _utcMidnight(par.bbva.fecha);
+    if (diaUtc < inicioUtc || diaUtc > finUtc) continue;
+    if (!porDia.has(diaUtc)) porDia.set(diaUtc, { fechaIso: new Date(diaUtc).toISOString().slice(0, 10), pares: [] });
+    porDia.get(diaUtc).pares.push(par);
+  }
+
+  if (porDia.size === 0) {
+    throw new ValidationError('No hay traspasos relacionados en el rango de fechas seleccionado.');
+  }
+
+  // Cuenta contable real por banco — un solo query para todos los días del rango.
+  // BANCO_A_CODIGO_CUENTA ya está definido arriba en este mismo archivo (línea ~24),
+  // mismo mapa que usa construirVerdadBancaria — no se duplica de nuevo.
+  const bancosNecesarios = new Set();
+  for (const { pares } of porDia.values()) {
+    for (const { bbva, contraparte } of pares) { bancosNecesarios.add(bbva.banco); bancosNecesarios.add(contraparte.banco); }
+  }
+  const codigosNecesarios = [...bancosNecesarios].map(b => BANCO_A_CODIGO_CUENTA[b]).filter(Boolean);
+  const cuentasRows = codigosNecesarios.length
+    ? await AccountPlan.findAll({ where: { codigo: { [Op.in]: codigosNecesarios } }, attributes: ['id', 'codigo'], raw: true })
+    : [];
+  const cuentaIdPorCodigo = new Map(cuentasRows.map(r => [r.codigo, r.id]));
+  const cuentaIdPorBanco  = (banco) => {
+    const codigo = BANCO_A_CODIGO_CUENTA[banco];
+    return codigo ? (cuentaIdPorCodigo.get(codigo) ?? null) : null;
+  };
+
+  const dias = [...porDia.values()].sort((a, b) => a.fechaIso.localeCompare(b.fechaIso));
+  const polizasCreadas = [];
+
+  for (const { fechaIso, pares } of dias) {
+    const movimientos = [];
+    for (const { bbva, contraparte } of pares) {
+      const monto        = bbva.deposito ?? contraparte.retiro;
+      const cuentaCargo   = cuentaIdPorBanco(bbva.banco);
+      const cuentaAbono   = cuentaIdPorBanco(contraparte.banco);
+      const folioRef      = contraparte.folio ?? bbva.folio ?? '';
+      // cuentaId puede quedar null (banco sin cuenta dedicada en el catálogo, ver
+      // BANCO_A_CODIGO_CUENTA arriba) — PolizaMovimiento.cuentaId ya es nullable
+      // para exactamente este caso (mismo criterio que el flujo CFDI: cuentaFaltante
+      // marca la línea para resolverla después vía resolver-cuentas-banco/reemplazar-cuenta,
+      // en vez de bloquear la generación de la póliza).
+      movimientos.push({
+        cuentaId: cuentaCargo, cuentaFaltante: !cuentaCargo,
+        concepto: `TRASPASO ENTRE CUENTAS PROPIAS — ${bbva.banco} → ${contraparte.banco} (folio ${folioRef})`.slice(0, 500),
+        debe: monto, haber: 0,
+      });
+      movimientos.push({
+        cuentaId: cuentaAbono, cuentaFaltante: !cuentaAbono,
+        concepto: `TRASPASO ENTRE CUENTAS PROPIAS — ${bbva.banco} → ${contraparte.banco} (folio ${folioRef})`.slice(0, 500),
+        debe: 0, haber: monto,
+      });
+    }
+
+    const d         = new Date(`${fechaIso}T00:00:00.000Z`);
+    const ejercicio = d.getUTCFullYear();
+    const periodo   = d.getUTCMonth() + 1;
+
+    // Snapshot liviano para poder reconstruir el Excel CONTPAQ más adelante sin
+    // depender de resolver cuentaId → nombre de banco (ver Poliza.js#traspasosPares).
+    const traspasosPares = pares.map(({ bbva, contraparte }) => ({
+      bbva:        { banco: bbva.banco, folio: bbva.folio ?? null, fecha: bbva.fecha, deposito: bbva.deposito ?? null },
+      contraparte: { banco: contraparte.banco, folio: contraparte.folio ?? null, fecha: contraparte.fecha, retiro: contraparte.retiro ?? null },
+    }));
+
+    // eslint-disable-next-line no-await-in-loop -- cada día necesita su propio advisory
+    // lock/folio dentro de create(); no hay forma segura de paralelizar esto.
+    const poliza = await create({
+      tipo: 'T', fecha: fechaIso, concepto: `Traspasos entre cuentas propias — ${fechaIso}`,
+      ejercicio, periodo, rfc, movimientos,
+    }, user);
+
+    // eslint-disable-next-line no-await-in-loop
+    await Poliza.update({ traspasosPares }, { where: { id: poliza.id } });
+
+    // Relación 1-1 (BankMovement.traspasoInterno) — mismo mecanismo que ya usa
+    // generarPolizasContpaqTraspasosPorRango, con el id de la Poliza recién creada
+    // como correlador (reemplaza el runId ad-hoc — ver revertirTraspasosInternos en
+    // el cancel() de más abajo, que ahora resuelve este mismo id).
+    const runIdPoliza = String(poliza.id);
+    const now = new Date();
+    const ops = [];
+    for (const { bbva, contraparte } of pares) {
+      ops.push(traspasosInternosService._buildIdentificarOp(bbva, contraparte, user, runIdPoliza, now));
+      ops.push(traspasosInternosService._buildIdentificarOp(contraparte, bbva, user, runIdPoliza, now));
+    }
+    // eslint-disable-next-line no-await-in-loop
+    if (ops.length > 0) await ejecutarBulkConTransaccion(ops);
+
+    polizasCreadas.push(poliza);
+  }
+
+  return polizasCreadas;
+}
+
+/**
+ * Exporta a Excel CONTPAQ (formato P/M1) una póliza de Traspasos YA persistida —
+ * reusa generarPolizaContpaqTraspasos() tal cual (traspasos-internos.service.js),
+ * alimentada por el snapshot guardado en Poliza.traspasosPares en vez de re-consultar
+ * MongoDB en vivo (los movimientos ya pueden estar en otro estado para entonces).
+ */
+async function exportContpaqTraspasosXlsx(id) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+  if (poliza.tipo !== 'T') throw new ValidationError('Esta póliza no es de tipo Traspasos.');
+
+  const pares = poliza.traspasosPares;
+  if (!Array.isArray(pares) || pares.length === 0) {
+    throw new ValidationError('Esta póliza no tiene traspasos guardados para exportar.');
+  }
+
+  const relacionados = pares.map(p => ({ bbva: p.bbva, contraparte: p.contraparte }));
+  const buffer = await traspasosInternosService.generarPolizaContpaqTraspasos(
+    relacionados, { folio: poliza.numero, fecha: poliza.fecha },
+  );
+  return { buffer, poliza };
+}
+
 async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
@@ -2711,6 +2887,8 @@ module.exports = {
   list, getById, create, update, cancel, cancelarTodas, listBorradorCandidatas, contabilizar, revertir, generarXmlSat,
   reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
   resolverCuentasPorCfdisIdentificados,
+  // Pólizas Traspasos C.P. (2026-08-25)
+  generarYGuardarTraspasos, exportContpaqTraspasosXlsx,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
 };

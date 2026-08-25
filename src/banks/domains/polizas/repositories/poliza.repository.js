@@ -147,8 +147,15 @@ async function findByIdLight(id) {
   return Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE] });
 }
 
-async function findById(id) {
-  const poliza = await Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE] });
+// `transaction` opcional: create()/update() de abajo lo llaman DESDE DENTRO de su
+// propia transacción, antes de que confirme — sin pasarla acá, Poliza.findByPk usa
+// otra conexión del pool que bajo READ COMMITTED todavía no ve la fila recién creada
+// (isolation normal de Postgres, no un bug de Sequelize) y devuelve null. Bug real
+// encontrado 2026-08-25 al generar la primera póliza de Traspasos C.P. (create()
+// nunca se había ejercitado antes en la práctica — generarYGuardar(), el camino real
+// de generación desde CFDIs, no pasa por acá).
+async function findById(id, transaction) {
+  const poliza = await Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE], transaction });
   if (!poliza) return null;
 
   const uuids = [...new Set(
@@ -264,7 +271,7 @@ async function create(data) {
       await PolizaMovimiento.bulkCreate(rows, { transaction: t });
     }
 
-    return findById(poliza.id);
+    return findById(poliza.id, t);
   });
 }
 
@@ -288,7 +295,7 @@ async function update(id, data) {
       }
     }
 
-    return findById(id);
+    return findById(id, t);
   });
 }
 

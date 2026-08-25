@@ -782,4 +782,7 @@ module.exports = {
   generarPolizaContpaqTraspasos,
   generarPolizasContpaqTraspasosPorRango,
   RE_CATEGORIA_TRASPASO_INTERNO,
+  // Exportado además para poliza.service.js#generarYGuardarTraspasos (Pólizas Traspasos
+  // C.P., 2026-08-25) — reusa el mismo pipeline de relación 1-1 en vez de duplicarlo.
+  _buildIdentificarOp,
 };

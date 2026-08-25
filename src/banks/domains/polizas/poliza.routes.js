@@ -69,6 +69,22 @@ router.get('/xml-sat',
   }),
 );
 
+// POST /api/polizas/traspasos/generar
+// Body: { rfc, fechaInicio, fechaFin } — genera y PERSISTE (a diferencia del flujo
+// standalone de banks/admin/traspasos-internos/poliza-contpaq, que solo arma un Excel
+// sin tocar Postgres) una póliza tipo='T' por cada día del rango con traspasos entre
+// cuentas propias relacionados, con folio/estado real. Ruta estática antes de /:id a
+// propósito, para que Express no la confunda con un id.
+router.post('/traspasos/generar',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, fechaInicio, fechaFin } = req.body;
+    const polizas = await service.generarYGuardarTraspasos({ rfc, fechaInicio, fechaFin }, req.user);
+    res.status(201).json({ polizas });
+  }),
+);
+
 // GET /api/polizas/:id
 router.get('/:id',
   authenticate,
@@ -113,6 +129,18 @@ router.get('/:id/export-contpaq',
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.ejercicio}${mes}_CONTPAQ.zip"`);
     res.send(zip.toBuffer());
+  }),
+);
+
+// GET /api/polizas/:id/export-contpaq-traspasos — solo pólizas tipo='T'
+router.get('/:id/export-contpaq-traspasos',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { buffer, poliza } = await service.exportContpaqTraspasosXlsx(req.params.id);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="Poliza_T${poliza.numero}_${poliza.fecha}_CONTPAQ.xlsx"`);
+    res.send(buffer);
   }),
 );
 

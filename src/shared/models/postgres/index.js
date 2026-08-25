@@ -264,6 +264,25 @@ async function syncModels() {
     END$$;
   `).catch(() => {});
 
+  // T = Traspasos entre cuentas propias (Pólizas Traspasos C.P., 2026-08-25) — mismo
+  // patrón idempotente que C/A arriba.
+  await Poliza.sequelize.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+        WHERE t.typname = 'enum_polizas_tipo' AND e.enumlabel = 'T'
+      ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'T'; END IF;
+    END$$;
+  `).catch(() => {});
+
+  // Snapshot de pares BBVA/contraparte para poder reconstruir el Excel CONTPAQ de una
+  // póliza de Traspasos ya persistida (ver Poliza.js#traspasosPares) — idempotente.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS traspasos_pares JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN traspasos_pares:', e.message));
+
   // Folio real asociado en CONTPAQi tras importar el export (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

@@ -61,6 +61,10 @@ async function findAll(filters = {}) {
     where.id = { [Op.in]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
   } else if (filters.soloCobranza === false || filters.soloCobranza === 'false') {
     where.id = { [Op.notIn]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
+    // Pólizas de Traspaso (tipo T, movimientos entre cuentas bancarias propias)
+    // no son Ingreso ni Cobranza — se excluyen de esta vista (confirmado con
+    // el usuario 2026-08-26). Si ya se filtró por un tipo explícito, se respeta.
+    if (!filters.tipo) where.tipo = { [Op.ne]: 'T' };
   }
 
   const page  = Math.max(1, Number(filters.page)  || 1);

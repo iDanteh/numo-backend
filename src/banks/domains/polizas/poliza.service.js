@@ -417,6 +417,9 @@ async function listBorradorCandidatas({ rfc, ejercicio, periodo, soloCobranza })
     where.id = { [Op.in]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
   } else if (soloCobranza === false || soloCobranza === 'false') {
     where.id = { [Op.notIn]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
+    // Mismo criterio que list() en poliza.repository.js: las de tipo T
+    // (Traspaso) no pertenecen a Ingreso ni a Cobranza.
+    where.tipo = { [Op.ne]: 'T' };
   }
 
   const polizas = await Poliza.findAll({
@@ -1610,6 +1613,12 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
+// Mismo umbral que `UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS` (25-ago, residuos SF)
+// pero para líneas 'Venta Sin Cobro' — confirmado con el usuario 2026-08-26,
+// caso real Hidalgo B0-260801157 ($0.01): un excedente de unos centavos es
+// ruido de redondeo, no dinero real sin explicar.
+const UMBRAL_RESIDUO_VENTA_SIN_COBRO = 10;
+
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
@@ -1715,6 +1724,23 @@ function _extraerCobrosSucursal(movimientos) {
         motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
           ? 'Oculto — cobro real ya contabilizado el día real del cobro'
           : 'Oculto — generado y usado el mismo día/almacén',
+      });
+      continue;
+    }
+    // Venta Sin Cobro de monto chico (< $UMBRAL_RESIDUO_VENTA_SIN_COBRO): mismo
+    // criterio que el residuo de redondeo SF de `armarBloqueContado`
+    // (confirmado con el usuario 2026-08-26) — un excedente de unos centavos
+    // no es dinero real sin explicar, es ruido de redondeo; no vale la pena
+    // mostrarlo como línea de "Venta Sin Cobro" en la póliza principal. Se
+    // reencamina a "Otros Ingresos oculto" igual que los casos de arriba.
+    if (m.tipoOrigen === 'Venta Sin Cobro' && Number(m.debe) + Number(m.haber) < UMBRAL_RESIDUO_VENTA_SIN_COBRO) {
+      filasOtrosIngresosOcultos.push({
+        cuenta:      m.cuenta,
+        centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        concepto:    m.concepto || '',
+        debe:        Number(m.debe),
+        haber:       Number(m.haber),
+        motivo:      `Oculto — monto < $${UMBRAL_RESIDUO_VENTA_SIN_COBRO} (posible residuo de redondeo)`,
       });
       continue;
     }
@@ -2237,32 +2263,14 @@ async function exportContpaqXlsx(id, overrides = {}) {
   movimientos = movimientosSinCobroSucursal;
 
   // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
-  // MEXICANA DE ANTEQUERA B0-260801134): un Cargo de Venta normal por un
-  // monto chico (< $10) suele ser un residuo de redondeo entre el Saldo a
-  // Favor usado y el total real de la factura (el SF no cubre el 100% por un
-  // par de centavos, y el faltante cae a la forma de pago que declaró el CFDI
-  // aunque no hubo depósito/transferencia real) — se oculta igual que el SF
-  // chico (mismo umbral $50 de `UMBRAL_SF_OTROS_INGRESOS`, pero aquí a
-  // propósito más chico, $10, para no esconder ventas reales pequeñas por
-  // error). PENDIENTE (ver memoria): la solución correcta es cruzar esto con
-  // el monto de SF usado por la MISMA factura y absorber el residuo ahí en
-  // vez de esconderlo a ciegas por monto.
-  const UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS = 10;
-  const residuosVenta = [];
-  movimientos = movimientos.filter((m) => {
-    const esResiduoChico = m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && Number(m.debe) < UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS && Number(m.haber) === 0;
-    if (!esResiduoChico) return true;
-    residuosVenta.push({
-      cuenta:      m.cuenta,
-      centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-      concepto:    m.concepto || '',
-      debe:        Number(m.debe),
-      haber:       Number(m.haber),
-      motivo:      `Monto < $${UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS} (posible residuo de redondeo SF)`,
-    });
-    return false;
-  });
-  if (residuosVenta.length) filasOtrosIngresos.push(...residuosVenta);
+  // MEXICANA DE ANTEQUERA B0-260801134) — QUITADA 2026-08-26 (confirmado con
+  // el usuario, caso real Hidalgo 11-ago: comparando contra el Reporte de
+  // Movimientos en Cajas oficial del ERP, estos residuos < $10 SÍ son dinero
+  // real cobrado físicamente ese día — ocultarlos del consolidado hacía que
+  // "Depósitos consolidados (Efectivo)" quedara $82.94 por debajo del total
+  // oficial). Los residuos de Venta, sin importar el monto, ya NO se ocultan
+  // a "Otros Ingresos" — se quedan en el consolidado normal, igual que
+  // cualquier otra venta.
 
   // Nombres de cliente — para el bloque de Crédito (cada CFDI es su propia
   // línea) y también para la hoja de desglose de los consolidados de Contado

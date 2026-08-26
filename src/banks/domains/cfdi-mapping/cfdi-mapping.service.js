@@ -483,11 +483,25 @@ function _calcCfdiMontos(cfdi) {
 // por error a la columna C en vez de la H, y además limitaba el marcador a
 // una lista fija de Series -- confirmado con el usuario que cualquier
 // documentosRelacionados debe reflejarse en H, no solo esa lista).
-// Devuelve null si el CFDI no tiene documentosRelacionados, para que el
-// llamador use la descripción del CFDI en el concepto como siempre.
-function _referenciaDocRelacionado(documentosRelacionados) {
+//
+// Excepción agregada 2026-08-26 (caso real Hidalgo B0-260801157/B0-260801256):
+// cuando la Serie de la referencia es la MISMA que la de la propia factura
+// (ej. B0→B0), NO es un documento relacionado real -- es un ticket interno de
+// cajas ligado por el mecanismo de "factura PUE cobrada días después"
+// (`ticketsPropioPorClave`, cfdi-poliza-generator.service.js), y puede haber
+// 1 o cientos de ellos (Factura Global). Tomar el PRIMERO al azar como si
+// fuera "el" documento relacionado sobreescribía el concepto de TODA la
+// factura con un ticket arbitrario, perdiendo el nombre del cliente en el
+// proceso. Una referencia real a otro documento (ajuste, fusión) SIEMPRE
+// trae una Serie DISTINTA a la propia (BON/DEV/CAC/M0/etc.) -- ese caso sigue
+// mostrándose igual que antes.
+// Devuelve null si el CFDI no tiene documentosRelacionados (o solo trae
+// tickets internos de su propia serie), para que el llamador use la
+// descripción del CFDI en el concepto como siempre.
+function _referenciaDocRelacionado(documentosRelacionados, serieCfdiPropia) {
   for (const d of (documentosRelacionados || [])) {
     if (!d.Serie) continue;
+    if ((d.Serie ?? '').toUpperCase() === (serieCfdiPropia ?? '').toUpperCase()) continue;
     // Folio vacío ("") es falsy -- sin este fallback, `!d.Folio` saltaba la
     // entrada completa y el concepto caía en la serie-folio de la factura
     // propia en vez de mostrar la referencia (encontrado 2026-07-23, folios
@@ -643,7 +657,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // Cancelación en cualquiera de sus variantes -- o cualquier otra referencia
   // del ERP a otro documento): el concepto (columna H) muestra esa referencia
   // en vez de la descripción de producto -- ver `_referenciaDocRelacionado`.
-  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados);
+  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados, cfdi.serie);
   const concepto    = marcadorAjuste
     ?? (descRaw.trim() ? descRaw.trim().slice(0, 200) : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`);
   const centroCosto = rule?.centroCosto ?? '';
@@ -653,6 +667,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // propia serie-folio de la factura/CFDI (columna C), nunca el marcador de
   // ajuste (ese va en `concepto`, columna H -- ver arriba).
   const serieCfdi   = [cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null;
+  // Concepto específico para la línea "Venta Sin Cobro" (columna H): cuando
+  // `_prefetchAjustesFacturaPropia` encontró que el dinero de este ticket
+  // está atribuido en el ERP a OTRA factura (`context.atribuidoOtraFactura`,
+  // ej. "B0-260801321"), se muestra esa factura real en vez del concepto
+  // genérico de esta factura -- confirmado con el usuario 2026-08-26, caso
+  // real B0-260801256 ($6,207.20, ticket B0-260802904 atribuido a B0-260801321)
+  // -- mucho más rastreable para cajas/facturación que el ticket o el folio
+  // propio. Si no hay atribución conocida, se usa el concepto normal.
+  const conceptoVentaSinCobro = context.atribuidoOtraFactura ?? concepto;
 
   if (!rule) {
     return [
@@ -800,6 +823,24 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
     && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_CLUB_TUBEROS];
+
+  // Caso espejo de `esCasoAjusteSFPuntos` (2026-08-26, confirmado con el
+  // usuario, caso real Atzompa/E0 11-ago, Reg 22C id 406, factura
+  // E0-260800110 $1,355.92 = $1,308.61 saldo a favor + $47.31 efectivo real):
+  // cuando `rule.cuentaCargo` YA es una cuenta de Saldo a Favor/pasivo (no
+  // Caja/Bancos — reglas tipo "formaPago 30", fuera de `gateBase`) pero el
+  // ticket se pagó SOLO PARCIALMENTE con ese saldo, el resto (real, según
+  // `desglosePagoReal`) nunca llegaba a Caja/Bancos — el Cargo completo se
+  // iba a la cuenta de SF. Aquí el cargo "por defecto" ya es la cuenta de SF
+  // (al revés de `esCasoAjusteSFPuntos`, donde el default es Caja/Bancos), así
+  // que se separa el remanente REAL (no cubierto por SF) hacia Caja/Bancos vía
+  // `splitPorFormaPagoReal`, dejando en `cuentaCargo` solo lo realmente
+  // cubierto por saldo a favor.
+  const esCasoCargoSFConRemanenteReal = !esAnticipo && !esAplicacionSaldo && !esPago
+    && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
+    && montoSFUsado > 0.01 && montoSFUsado < montoCargo - 0.01
+    && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
+    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
 
   // Suma de las formasPago reales encontradas — calculada ANTES del gate
   // porque el gate mismo la necesita (ver comentario abajo).
@@ -1011,7 +1052,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Efectivo/Tarjeta en vez de sumarse a ciegas.
         movs.push({
           cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
-          concepto, centroCosto, ventaFecha, serie: serieCfdi,
+          concepto: conceptoVentaSinCobro, centroCosto, ventaFecha, serie: serieCfdi,
           debe:        excesoCubrir,
           haber:       0,
           cfdiUuid:    cfdi.uuid,
@@ -1074,7 +1115,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     if (excesoCasoNormal > 0.01 && totalFormasPagoReal > 0) {
       movs.push({
         cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
-        concepto, centroCosto, ventaFecha, serie: serieCfdi,
+        concepto: conceptoVentaSinCobro, centroCosto, ventaFecha, serie: serieCfdi,
         debe:        excesoCasoNormal,
         haber:       0,
         cfdiUuid:    cfdi.uuid,
@@ -1086,6 +1127,18 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     } else {
       splitPorFormaPagoReal(montoCargo);
     }
+  } else if (esCasoCargoSFConRemanenteReal) {
+    const remanenteReal = parseFloat((montoCargo - montoSFUsado).toFixed(2));
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      concepto, centroCosto, ventaFecha, serie: serieCfdi,
+      debe:        montoSFUsado,
+      haber:       0,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+      _esCargoPrincipal: true,
+    });
+    splitPorFormaPagoReal(remanenteReal);
   } else {
     // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
     // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta
@@ -1117,7 +1170,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     }
     movs.push({
       cuentaId:    _cuentaIdFallback,
-      concepto,
+      concepto:    sinCobrosEnSucursal ? conceptoVentaSinCobro : concepto,
       centroCosto,
       ventaFecha,
       serie:       serieCfdi,

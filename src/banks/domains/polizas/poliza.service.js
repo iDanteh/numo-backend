@@ -1568,6 +1568,12 @@ const ETIQUETA_SALDO_FAVOR = 'SF';
 // mismo día en el mismo almacén: se omite del export (queda en BD intacto)
 // confirmado con el usuario 2026-08-04.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
+// Mismo texto que ETIQUETA_COBRO_YA_CONTABILIZADO en cfdi-mapping.service.js
+// (2026-08-25) — Cargo de Efectivo/Tarjeta de una factura cuyo cobro real ya
+// se contabilizó otro día vía "Cobros sin factura" (facturación diferida
+// fuera de tolerancia, ver `yaContabilizadoOtroDia`): se oculta del export
+// igual que SF-OCULTO, para no duplicar el dinero entre los dos días.
+const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
 // Mismo texto que ETIQUETA_PUNTOS en cobros-sucursal-puente.service.js —
 // monedero electrónico Club Tuberos aplicado como forma de pago, columna C =
 // "PAGO" sin prefijo, mismo criterio que SF (confirmado con el usuario
@@ -1725,7 +1731,7 @@ function _extraerCobrosSucursal(movimientos) {
       continue;
     }
     if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== 'Venta Sin Cobro' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
-    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO) {
+    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,
         centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
@@ -1735,7 +1741,9 @@ function _extraerCobrosSucursal(movimientos) {
         // Columna "Motivo" en la hoja "Otros Ingresos" (2026-08-17, confirmado
         // con el usuario) — distingue este caso del de SF ≤ $50 más abajo, que
         // antes se mezclaban sin forma de saber cuál era cuál en el Excel.
-        motivo:      'Oculto — generado y usado el mismo día/almacén',
+        motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
+          ? 'Oculto — cobro real ya contabilizado el día real del cobro'
+          : 'Oculto — generado y usado el mismo día/almacén',
       });
       continue;
     }
@@ -2256,6 +2264,34 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
   const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos } = _extraerCobrosSucursal(movimientos);
   movimientos = movimientosSinCobroSucursal;
+
+  // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
+  // MEXICANA DE ANTEQUERA B0-260801134): un Cargo de Venta normal por un
+  // monto chico (< $10) suele ser un residuo de redondeo entre el Saldo a
+  // Favor usado y el total real de la factura (el SF no cubre el 100% por un
+  // par de centavos, y el faltante cae a la forma de pago que declaró el CFDI
+  // aunque no hubo depósito/transferencia real) — se oculta igual que el SF
+  // chico (mismo umbral $50 de `UMBRAL_SF_OTROS_INGRESOS`, pero aquí a
+  // propósito más chico, $10, para no esconder ventas reales pequeñas por
+  // error). PENDIENTE (ver memoria): la solución correcta es cruzar esto con
+  // el monto de SF usado por la MISMA factura y absorber el residuo ahí en
+  // vez de esconderlo a ciegas por monto.
+  const UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS = 10;
+  const residuosVenta = [];
+  movimientos = movimientos.filter((m) => {
+    const esResiduoChico = m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && Number(m.debe) < UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS && Number(m.haber) === 0;
+    if (!esResiduoChico) return true;
+    residuosVenta.push({
+      cuenta:      m.cuenta,
+      centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+      concepto:    m.concepto || '',
+      debe:        Number(m.debe),
+      haber:       Number(m.haber),
+      motivo:      `Monto < $${UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS} (posible residuo de redondeo SF)`,
+    });
+    return false;
+  });
+  if (residuosVenta.length) filasOtrosIngresos.push(...residuosVenta);
 
   // Nombres de cliente — para el bloque de Crédito (cada CFDI es su propia
   // línea) y también para la hoja de desglose de los consolidados de Contado

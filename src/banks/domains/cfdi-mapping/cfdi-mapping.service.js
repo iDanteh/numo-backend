@@ -24,6 +24,15 @@ const _DEBUG_SPLIT_PAGO = process.env.DEBUG_SPLIT_PAGO === '1';
 // en cobros-sucursal-puente.service.js.
 const TIPO_ORIGEN_CARGO_ESPECIAL = 'Cargo Especial';
 
+// Mismo patrón de ocultamiento que ETIQUETA_SALDO_FAVOR_OCULTO
+// (poliza.service.js/cobros-sucursal-puente.service.js: tipoOrigen='Cobro
+// Sucursal' + este reglaNombre → `_extraerCobrosSucursal` lo saca a "Otros
+// Ingresos oculto"), pero para un caso distinto (2026-08-25): un Cargo de
+// Efectivo/Tarjeta cuyo cobro real ya se contabilizó otro día vía
+// `_cobrosSinFacturaPorCentro` (ver `yaContabilizadoOtroDia` en
+// `_prefetchAjustesFacturaPropia`, cfdi-poliza-generator.service.js).
+const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
+
 // Caja/Bancos "por identificar" — mismos códigos que
 // cfdi-poliza-generator.service.js/cobros-sucursal-puente.service.js
 // (duplicado a propósito, archivos pequeños, independientes). Son las ÚNICAS
@@ -507,7 +516,14 @@ function _referenciaDocRelacionado(documentosRelacionados) {
 // propio (ej. "Tubo galvanizado - 3/4"), y un recorte genérico hasta el
 // último " - " confundiría la última palabra con un código.
 const _PREFIJOS_CONCEPTO = ['IVA cobrado - ', 'IVA ant. - ', 'IVA ret. - ', 'ISR ret. - ', 'Saldo - ', 'IVA - '];
-const _REFERENCIA_REGEX  = /^[A-Z0-9]+(-\d+)?$/i;
+// `(-\d+)*-?` (en vez de `(-\d+)?`): acepta VARIOS anticipos concatenados
+// ("OPA-00763-00665", ver `anticipoFolioRefGuard` en cfdi-poliza-generator.
+// service.js) y un guion colgante final cuando alguno no resolvió folio
+// todavía ("OPA-00763-") — sin esto, ese guion colgante rompía el match y
+// `enriquecerConceptoConCliente` caía a mostrar la serie-folio de la venta
+// en vez de la referencia OPA en la columna H (confirmado con el usuario
+// 2026-08-25, caso real MONSAN B0-260801098).
+const _REFERENCIA_REGEX  = /^[A-Z0-9]+(-\d+)*-?$/i;
 function esConceptoMarcadorAjuste(concepto) {
   let nucleo = String(concepto || '');
   for (const prefijo of _PREFIJOS_CONCEPTO) {
@@ -855,6 +871,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Facturas Globales de Hidalgo 2026-08-14).
         _serieVentaTicket: fp.serieVentaTicket ?? null,
         _folioVentaTicket: fp.folioVentaTicket ?? null,
+        // `yaContabilizadoOtroDia` (ver `_prefetchAjustesFacturaPropia`,
+        // 2026-08-25): este cobro real ya se contabilizó en su día REAL vía
+        // "Cobros sin factura" (`_cobrosSinFacturaPorCentro`) — se oculta
+        // este Cargo (día de la factura) de "Depósitos consolidados" para no
+        // duplicar el dinero entre los dos días. El Abono Ingresos/IVA de
+        // esta misma factura queda visible sin cambios (la venta sí ocurrió
+        // y se facturó aquí, solo el lado de caja ya se contó antes).
+        ...(fp.yaContabilizadoOtroDia ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_COBRO_YA_CONTABILIZADO } : {}),
         ...(esUltimo ? extraEnUltima : {}),
       });
     });
@@ -1123,7 +1147,10 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         : iva;
       movs.push({
         cuentaId:    cuentaMap[cuentaIvaAplicable] ?? null,
-        concepto:    `IVA - ${concepto}`,
+        // Sin prefijo "IVA - " en la columna H (confirmado con el usuario
+        // 2026-08-25) — la cuenta contable ya identifica que es IVA, el
+        // prefijo era redundante con la referencia real (serie-folio/OPA-...).
+        concepto,
         centroCosto,
         ventaFecha,
         serie:       serieCfdi,
@@ -1321,7 +1348,12 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         const s0R  = parseFloat(subTotal0.toFixed(2));
         const cargoLine = movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaCargo] ?? null) && m.debe > 0);
         if (cargoLine) cargoLine.debe = s16R;
-        const ivaLineMixto = movs.find(m => m.concepto?.startsWith('IVA - ') && m.debe > 0);
+        // Localiza la línea de IVA por CUENTA (misma que usó el push original,
+        // línea ~1122), no por el prefijo "IVA - " del concepto — ese prefijo
+        // se quitó de la columna H (confirmado con el usuario 2026-08-25), así
+        // que ya no sirve como identificador aquí.
+        const cuentaIvaAplicableMixto = (esPPD && rule.cuentaIvaPPD) ? rule.cuentaIvaPPD : rule.cuentaIva;
+        const ivaLineMixto = movs.find(m => m.cuentaId === (cuentaMap[cuentaIvaAplicableMixto] ?? null) && m.debe > 0);
         if (ivaLineMixto) {
           ivaLineMixto.debe = parseFloat((total - s16R - s0R).toFixed(2));
         }
@@ -1447,7 +1479,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     if (ivaR > 0) {
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaIvaAbono] ?? null,
-        concepto:    `IVA - ${concepto}`,
+        // Ver comentario equivalente arriba: sin prefijo "IVA - " en columna H.
+        concepto,
         centroCosto,
         ventaFecha,
         serie:       serieCfdi,
@@ -1535,7 +1568,13 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }
         : m.tipoOrigen === 'Venta Sin Cobro'
           ? { tipoOrigen: 'Venta Sin Cobro' }
-          : {}
+          // `yaContabilizadoOtroDia` (ver arriba, `splitPorFormaPagoReal`):
+          // mismo problema — debe sobrevivir al spread de `satMeta` o se
+          // pierde el ocultamiento y el Cargo vuelve a verse como 'Venta'
+          // normal, duplicando el dinero entre los dos días.
+          : m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
+            ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre }
+            : {}
     ),
   }));
 }

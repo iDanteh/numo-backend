@@ -118,13 +118,13 @@ async function construirVerdadBancaria(movimientos, rfc) {
   const condicionFolioFiscal = { 'erpLinks.folioFiscal': { $in: uuidsUnicos.map(u => new RegExp(`^${u}$`, 'i')) } };
   movs.push(...await BankMovement.find(
     condicionFolioFiscal,
-    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1 },
+    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
   ).lean());
   for (let i = 0; i < paresSerieFolio.length; i += LOTE) {
     const lote = paresSerieFolio.slice(i, i + LOTE);
     movs.push(...await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1 },
+      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
     ).lean());
   }
 
@@ -169,6 +169,14 @@ async function construirVerdadBancaria(movimientos, rfc) {
     // la TARJETA, para agrupar ventas que comparten la misma autorización
     // (confirmado con el usuario 2026-08-07).
     const numeroAutorizacion = m.numeroAutorizacion || null;
+    // Monto REAL depositado en el banco para este movimiento (2026-08-26,
+    // confirmado con el usuario) — usado SOLO para Transferencia (ver
+    // `consolidarCargos`) en vez de la suma de cobros de caja/ERP atribuidos
+    // a esa referencia, que puede no coincidir exacto con lo que el banco
+    // realmente recibió. Se acepta que el asiento exportado quede
+    // desbalanceado contra el Abono/IVA en ese caso (mismo criterio que
+    // otros "ruido" de reclasificación ya tolerados en el export).
+    const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
 
     for (const link of (m.erpLinks ?? [])) {
       const folioFiscalUpper = (link.folioFiscal || '').toUpperCase();
@@ -183,7 +191,7 @@ async function construirVerdadBancaria(movimientos, rfc) {
       // parcialidades) — si alguno confirma transferencia, esa gana.
       const actual = mapa.get(uuidResuelto);
       if (!actual || (!actual.esTransferencia && esTransferencia)) {
-        mapa.set(uuidResuelto, { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion });
+        mapa.set(uuidResuelto, { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal });
       }
     }
   }
@@ -240,7 +248,7 @@ async function construirBancoRealPorTicket(movimientos) {
     const lote = pares.slice(i, i + LOTE);
     const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1 },
+      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1 },
     ).lean();
     for (const m of movs) {
       const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[m.banco];
@@ -252,11 +260,13 @@ async function construirBancoRealPorTicket(movimientos) {
       const referencia = m.folio || null;
       const numeroAutorizacion = m.numeroAutorizacion || m.referenciaNumerica || null;
       if (!referencia && !numeroAutorizacion) continue;
+      // Ver comentario equivalente en `construirVerdadBancaria`.
+      const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
       for (const link of (m.erpLinks ?? [])) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
         if (!paresSet.has(key)) continue;
-        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco });
+        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }
     }
   }
@@ -1225,9 +1235,15 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // mismo criterio que `enriquecerConceptoConCliente`, confirmado con el
       // usuario 2026-07-22.
       const esCancelacionAqui = categoria === 'devolucion' && /cancelaci[oó]n/i.test(m.tipoOrigen || '');
+      // Anticipo (Reg 22C/23 cobrado con Saldo a Favor): el concepto (columna
+      // H) debe mostrar el ticket real de cajas (`serieParaDetalle`), no la
+      // serie-folio de la factura propia (esa ya va en columna C) — confirmado
+      // con el usuario 2026-08-26, caso real E0-260800126/E0-260801137. Las
+      // demás categorías (Devolución/Descuento/Bonificación/Club Tuberos)
+      // siguen usando `m.serie` sin cambios.
       const serieSufijo = (categoria === 'devolucion' && !esCancelacionAqui && m.serie)
         ? `${m.serie} DEV`
-        : m.serie;
+        : (categoria === 'anticipo' ? (serieParaDetalle || m.serie) : m.serie);
       const concepto = [nombre, serieSufijo].filter(Boolean).join(' / ') || etiqueta;
       return {
         // Cuenta real del banco donde cayó el depósito (ver
@@ -1298,14 +1314,27 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // cuando el banco tiene cuenta dedicada en el catálogo.
       const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? bancario?.cuentaBanco ?? m.cuenta;
       const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? `__cfdi_${m.cfdiUuid}`}`;
+      // Monto real depositado en el banco para esta Transferencia (2026-08-26,
+      // confirmado con el usuario) — SOLO Transferencia, nunca Cheque/Tarjeta:
+      // reemplaza la suma de cobros de caja/ERP atribuidos a esta referencia
+      // por el depósito real (`BankMovement.deposito`), que es la fuente
+      // autoritativa de cuánto entró realmente al banco. Se acepta que el
+      // renglón quede desbalanceado contra el Abono/IVA de la factura en caso
+      // de diferencia (mismo criterio que otro "ruido" ya tolerado en el
+      // export) — el `debe` de este grupo queda FIJO en cuanto se conoce el
+      // depósito real, no se sigue acumulando por cada CFDI que comparte la
+      // misma referencia.
+      const montoBancoReal = esTransferenciaVerificada
+        ? (infoTicketTransfCheque?.montoBancoReal ?? bancario?.montoBancoReal ?? null)
+        : null;
       if (!gruposDetallados.has(key)) {
         gruposDetallados.set(key, {
           cuenta: cuentaLinea, centroCosto, referencia, tipoDetalle, subcodigo: subcodigoDetalle,
-          debe: 0, detalle: [], primerMov: m,
+          debe: montoBancoReal ?? 0, detalle: [], primerMov: m, _debeFijoBanco: montoBancoReal != null,
         });
       }
       const gt = gruposDetallados.get(key);
-      gt.debe += Number(m.debe);
+      if (!gt._debeFijoBanco) gt.debe += Number(m.debe);
       gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaAjusteSinCfdi });
       continue;
     }

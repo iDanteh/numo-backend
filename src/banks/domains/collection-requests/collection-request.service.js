@@ -816,19 +816,6 @@ async function identificar(id, body, user) {
       formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
       formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
     }
-    // 2026-08-27 (diagnóstico temporal): Kore rechazó un cobro real de Depósito en
-    // efectivo exigiendo "el campo extra que empieza con numo, en el catálogo de la
-    // forma de pago" — nombre que Numo no captura hoy (siempre manda "Num Recibo",
-    // hardcodeado desde 2026-08-12). Logueado SOLO para las formasPago que esta
-    // solicitud realmente usa, para no ensuciar el log con el catálogo completo.
-    // Quitar una vez confirmado el nombre real del campo contra Kore.
-    for (const f of cr.formasPago) {
-      const catalogo = formasPagoKore.find(fk => String(fk.id) === String(f.formaPagoId));
-      if (catalogo) {
-        console.log(`[collection-requests] identificar ${id}: catálogo crudo Kore para formaPagoId=${f.formaPagoId} →`, JSON.stringify(catalogo.raw));
-      }
-    }
-
     const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
     if (algunaFormaRequiereBanco) {
       const bancosKore = await koreCaja.listarBancos(koreToken);
@@ -929,23 +916,17 @@ async function identificar(id, body, user) {
           { Nombre: 'Numo', Valor: numoJuntos },
         ],
       } : {}),
-      // 2026-08-27 (HIPÓTESIS a validar contra Kore real, ver catálogo crudo
-      // logueado arriba en este mismo archivo): Depósito en efectivo sigue
-      // mandando "Num Recibo" (el único campo que SU catálogo declara en
-      // CamposExtras), pero además se agrega "Numo" — Kore rechazó un cobro
-      // real con "debe indicar el dato adicional... el campo extra que empieza
-      // con numo" a pesar de que "Num Recibo" es justo lo que ese catálogo
-      // pide; "Num Recibo" NO empieza con el literal "numo" (con espacio antes
-      // de "Recibo"). Transferencia sí tenía un tag "Numo" (por el número de
-      // autorización bancario) y nunca dio este error — sospecha: Kore valida
-      // "N comprobantes = N valores separados por coma" contra un campo que
-      // empiece con "Numo" SIN IMPORTAR lo que declare el catálogo de cada
-      // forma de pago, no algo específico de "Num Recibo". Si Kore rechaza
-      // igual, sacar este tag extra y reconsiderar.
+      // Depósito en efectivo: SOLO "Num Recibo" — es el único campo que su
+      // catálogo declara en CamposExtras. Se probó agregar también "Numo" (por
+      // el mensaje de Kore "el campo extra que empieza con numo"), pero Kore lo
+      // rechazó explícitamente: "el dato adicional 'Numo' no está configurado en
+      // la forma de pago DEPOSITO EN EFECTIVO... los campos configurados son:
+      // Num Recibo" (confirmado 2026-08-27 contra Kore real). No volver a
+      // agregar "Numo" aquí — el mensaje original de "campo que empieza con
+      // numo" se refería a otra cosa, no a este tag.
       ...(esDepositoEfectivo ? {
         DatosAdicionales: [
           { Nombre: 'Num Recibo', Valor: autJuntos },
-          { Nombre: 'Numo',       Valor: autJuntos },
         ],
       } : {}),
     };

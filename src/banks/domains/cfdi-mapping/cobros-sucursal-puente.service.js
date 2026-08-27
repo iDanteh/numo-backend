@@ -457,24 +457,30 @@ async function _aplicarCobrosSucursalPendientes({ rfc, centroCostoId, centroCobr
  * @param {number} [cuentaIvaSaldoFavorId] - AccountPlan.id de 2104010002
  *   (IVA Trasladado - Anticipos) — IVA de las porciones "saldo a favor".
  * @param {string} rfc
- * @returns {Promise<{movimientos: Array, facturasVendedorCubiertas: Map<string,number>, facturasPPDCubiertas: Map<string,{monto:number, reglaNombre:string}>}>}
+ * @returns {Promise<{movimientos: Array, facturasVendedorCubiertas: Map<string,{monto:number, detalle:Array<{serieVenta:string, folioVenta:string, monto:number}>}>, facturasPPDCubiertas: Map<string,{monto:number, reglaNombre:string}>}>}
  *   `movimientos`: líneas listas para concatenar a movimientosResult/todosLosMovimientos.
- *   `facturasVendedorCubiertas`: UUID (mayúsculas) → monto YA cubierto por
- *   líneas de Cargo a Caja/Bancos por identificar de este flujo, para ESTE
- *   centroCostoId (como vendedora). El Cargo normal que arma cfdiToMovimientos
- *   según formaPago del propio CFDI debe reducirse por este monto (no
- *   omitirse siempre por completo) — corrección 2026-08-06: para una Factura
- *   Global (un solo CFDI que agrupa cientos de tickets), basta con que UN
- *   ticket se haya cobrado en otra sucursal para que el monto acumulado aquí
- *   sea MENOR al total de la factura — el resto (tickets cobrados en la
+ *   `facturasVendedorCubiertas`: UUID (mayúsculas) → { monto, detalle } YA
+ *   cubierto por líneas de Cargo a Caja/Bancos por identificar de este flujo,
+ *   para ESTE centroCostoId (como vendedora). El Cargo normal que arma
+ *   cfdiToMovimientos según formaPago del propio CFDI debe reducirse por este
+ *   monto (no omitirse siempre por completo) — corrección 2026-08-06: para una
+ *   Factura Global (un solo CFDI que agrupa cientos de tickets), basta con que
+ *   UN ticket se haya cobrado en otra sucursal para que el monto acumulado
+ *   aquí sea MENOR al total de la factura — el resto (tickets cobrados en la
  *   MISMA sucursal) necesita su propio Cargo normal, que antes se omitía por
  *   completo tratando esto como un booleano sí/no (caso real: Global de
  *   $206,937.70 con 3 tickets cruzados por $9,773.35 — el código omitía LOS
  *   $206,937.70 completos, perdiendo ~$197,164 de cargo real). Para una
  *   factura normal (no Global), el monto acumulado es simplemente el total de
  *   la factura y el efecto es el mismo que antes (Cargo completo omitido).
- *   Ver cfdi-poliza-generator.service.js, donde se usa para calcular el
- *   remanente en vez de solo filtrar.
+ *   `detalle` (2026-08-27, confirmado con el usuario, caso real Reforma
+ *   1-ago/Global D0-260800038: ticket D0-260800176 cubierto por $2,018.68 vía
+ *   Tarjeta en otra sucursal, pero al ser solo un total agregado la resta caía
+ *   en la PRIMERA línea Caja/Bancos que apareciera en el batch — el exceso
+ *   "Venta Sin Cobro" y luego el ticket D0-260800218, AMBOS ajenos al cruce
+ *   real, perdiendo $386.53 de efectivo genuino de Reforma): permite que el
+ *   consumidor reste el monto de la línea del ticket CORRECTO, no de la
+ *   primera que encuentre. Ver cfdi-poliza-generator.service.js.
  *   `facturasPPDCubiertas`: UUID (mayúsculas) → { monto, reglaNombre } para
  *   facturas PPD de ESTE centroCostoId (como vendedora) cobradas en otra
  *   sucursal — cfdi-poliza-generator.service.js usa esto para agregar el
@@ -1028,7 +1034,11 @@ async function construirMovimientosPuente({
       if (centroVendedor && String(centroVendedor.id) === String(centroCostoId)) {
         if (cfdiOriginal?.uuid) {
           const uuidUpper = cfdiOriginal.uuid.toUpperCase();
-          facturasVendedorCubiertas.set(uuidUpper, (facturasVendedorCubiertas.get(uuidUpper) ?? 0) + montoCobro);
+          const prevCubierto = facturasVendedorCubiertas.get(uuidUpper) ?? { monto: 0, detalle: [] };
+          facturasVendedorCubiertas.set(uuidUpper, {
+            monto: parseFloat((prevCubierto.monto + montoCobro).toFixed(2)),
+            detalle: [...prevCubierto.detalle, { serieVenta: cuenta.serieVenta ?? null, folioVenta: cuenta.folioVenta ?? null, monto: montoCobro }],
+          });
         }
         lineas.forEach(l => {
           candidatas.push({

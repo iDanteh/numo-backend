@@ -206,6 +206,13 @@ async function listarFormasPago(koreToken) {
       claveSAT:       f.ClaveSAT,
       esBancarizada:  f.EsBancarizada  ?? false,
       reqNombreBanco: f.ReqNombreBanco ?? false,
+      // Objeto crudo completo (2026-08-27, diagnóstico) — Kore rechazó un cobro real
+      // exigiendo "el campo extra que empieza con numo, en el catálogo de la forma
+      // de pago" para Depósito en efectivo; el mapeo de arriba nunca capturó ese
+      // dato. Se guarda el crudo para poder loguearlo/inspeccionarlo (ver
+      // identificar() en collection-request.service.js) hasta confirmar el nombre
+      // real del campo — quitar este passthrough una vez resuelto.
+      raw: f,
     }));
 }
 

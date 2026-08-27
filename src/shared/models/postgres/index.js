@@ -283,6 +283,29 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS traspasos_pares JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN traspasos_pares:', e.message));
 
+  // B/G = Compensaciones Bancarias / Intereses Ganados (Pólizas Compensaciones e
+  // Intereses C.P., 2026-08-27) — mismo patrón idempotente que T arriba.
+  await Poliza.sequelize.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+        WHERE t.typname = 'enum_polizas_tipo' AND e.enumlabel = 'B'
+      ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'B'; END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+        WHERE t.typname = 'enum_polizas_tipo' AND e.enumlabel = 'G'
+      ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'G'; END IF;
+    END$$;
+  `).catch(() => {});
+
+  // Snapshot de líneas de banco para reconstruir el Excel CONTPAQ de una póliza de
+  // Compensaciones/Intereses ya persistida (ver Poliza.js#compensacionesInteresesLineas).
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS compensaciones_intereses_lineas JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN compensaciones_intereses_lineas:', e.message));
+
   // Folio real asociado en CONTPAQi tras importar el export (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

@@ -179,6 +179,57 @@ describe('identificar() — N=2 (asignaciones explícitas, multi-bank-movement)'
   });
 });
 
+// 2026-08-27 — caso real confirmado contra Kore: la solicitud trae 1 SOLA forma
+// de pago pero 2 comprobantes, porque el cliente pagó ese único monto con 2
+// depósitos bancarios separados. Antes de este cambio no había forma de asignar
+// ambos sin duplicar el importe completo (100000) en el erpLink de CADA
+// movimiento — el riesgo real que motivó montoEfectivo().
+describe('identificar() — 1 forma de pago repartida entre 2 depósitos (split, sin doble conteo)', () => {
+  test('cada erpLink usa el depósito REAL de su movimiento, nunca el importe completo de la forma de pago', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([
+      bankMovement('mov-A', { deposito: 60000, fecha: new Date('2026-08-10T00:00:00.000Z') }),
+      bankMovement('mov-B', { deposito: 40000, fecha: new Date('2026-08-12T00:00:00.000Z') }),
+    ]);
+    setupHappyKore();
+
+    await service.identificar(
+      'cr-1',
+      { asignaciones: [{ formaPagoDocId: 'f1', bankMovementId: 'mov-A' }, { formaPagoDocId: 'f1', bankMovementId: 'mov-B' }] },
+      { _id: 'user-1', nombre: 'Ana' },
+    );
+
+    // 1 sola forma de pago -> 1 SOLO elemento en el arreglo (nunca uno repetido
+    // por depósito, ver corrección 2026-08-27 tras rechazo real de Kore: "debe
+    // indicar el dato adicional... con N valor(es) separados por coma") — Aut/
+    // Numo llevan los 2 folios/autorizaciones JUNTOS, separados por coma.
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    expect(datosAdicionales).toHaveLength(1);
+    expect(datosAdicionales[0].FormaPagoID).toBe('fp-f1');
+    expect(datosAdicionales[0].DatosAdicionales).toEqual(
+      expect.arrayContaining([{ Nombre: 'Aut', Valor: 'F-mov-A,F-mov-B' }, { Nombre: 'Numo', Valor: 'AUT-mov-A,AUT-mov-B' }]),
+    );
+
+    // El punto central: 2 setErpIds, cada uno con el monto REAL de SU depósito
+    // (60000 y 40000) — NUNCA el importe completo (100000) repetido en los 2.
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(2);
+    const erpLinksPorMov = new Map(bankService.setErpIds.mock.calls.map(c => [c[0], c[1][0]]));
+    expect(erpLinksPorMov.get('mov-A').saldoPagado).toBe(60000);
+    expect(erpLinksPorMov.get('mov-A').saldoPagadoTotal).toBe(60000);
+    expect(erpLinksPorMov.get('mov-B').saldoPagado).toBe(40000);
+    expect(erpLinksPorMov.get('mov-B').saldoPagadoTotal).toBe(40000);
+
+    // La forma de pago persiste el depósito PRIMARIO en bankMovementId y el
+    // segundo en depositosAdicionales, con su monto real.
+    const fGuardada = cr.formasPago.find(f => f._id === 'f1');
+    expect(fGuardada.bankMovementId).toBe('mov-A');
+    expect(fGuardada.depositosAdicionales).toEqual([{ bankMovementId: 'mov-B', montoEfectivo: 40000 }]);
+  });
+});
+
 describe('identificar() — Depósito en efectivo manda "Num Recibo" en vez de Aut/Numo', () => {
   test('DatosAdicionales trae un solo tag Num Recibo con el folio consecutivo de Numo, sin BancoID', async () => {
     const f1 = formaPago('f1', 'Depósito en efectivo', 100000);

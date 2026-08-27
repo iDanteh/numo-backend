@@ -132,6 +132,17 @@ router.get('/:id/export-contpaq',
   }),
 );
 
+// GET /api/polizas/:id/traspasos-movimiento/:movimientoId/banco — solo tipo='T'
+// Resuelve el BankMovement de Mongo del que salió ese cargo/abono, para poder
+// navegar desde "ver movimientos" hasta el registro real en Bancos.
+router.get('/:id/traspasos-movimiento/:movimientoId/banco',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.resolverBankMovimientoDeTraspaso(req.params.id, req.params.movimientoId));
+  }),
+);
+
 // GET /api/polizas/:id/export-contpaq-traspasos — solo pólizas tipo='T'
 router.get('/:id/export-contpaq-traspasos',
   authenticate,

@@ -358,6 +358,16 @@ async function cancel(id, user, motivo) {
   if (poliza.estado === 'contabilizada' && user?.role !== 'admin') {
     throw new ForbiddenError('Solo un administrador puede cancelar pólizas contabilizadas');
   }
+  // Traspasos C.P.: cancelar una contabilizada desvincula automáticamente los
+  // BankMovement reales (bloque más abajo) — a diferencia de I/E/P, ese efecto
+  // es sobre conciliación bancaria ya cerrada, no solo sobre el registro contable.
+  // Se exige pasar primero por "Revertir a borrador" (mismo botón que ya usan I/E/P)
+  // en vez de permitir el atajo admin de cancelar directo desde contabilizada.
+  if (poliza.tipo === 'T' && poliza.estado === 'contabilizada') {
+    throw new ValidationError(
+      'Esta póliza de Traspasos ya está contabilizada. Revertí a borrador primero y después cancelá.',
+    );
+  }
 
   const result = await repo.cancel(id, {
     canceladoPor:       userLabel(user),
@@ -514,6 +524,11 @@ const CODIGOS_CUENTA_BANCO_REAL = new Set(Object.values(BANCO_A_CODIGO_CUENTA));
 // siga en alguna de estas después del cruce automático se reporta como
 // "pendiente" para que el usuario lo resuelva a mano (ver `resolverCuentasBanco`).
 const CODIGOS_CUENTA_PUENTE = new Set(['1101010003', '1102010004', '1102011005']);
+
+// "Bancos por identificar" — la cuenta puente específica para transferencias
+// (nunca Caja), usada como fallback en Traspasos C.P. cuando el banco no
+// tiene cuenta dedicada en BANCO_A_CODIGO_CUENTA (ver generarYGuardarTraspasos).
+const CODIGO_CUENTA_PUENTE_BANCOS = '1102011005';
 
 /**
  * Reemplaza, en los movimientos de la póliza, la cuenta genérica ("Bancos por
@@ -2809,11 +2824,17 @@ async function generarYGuardarTraspasos({ rfc, fechaInicio, fechaFin }, user) {
   for (const { pares } of porDia.values()) {
     for (const { bbva, contraparte } of pares) { bancosNecesarios.add(bbva.banco); bancosNecesarios.add(contraparte.banco); }
   }
-  const codigosNecesarios = [...bancosNecesarios].map(b => BANCO_A_CODIGO_CUENTA[b]).filter(Boolean);
+  // Bancos sin cuenta dedicada (ver BANCO_A_CODIGO_CUENTA arriba) deben caer en
+  // la MISMA cuenta puente "Bancos por identificar" que usa el flujo CFDI —
+  // así el movimiento queda marcado `cuentaFaltante:true` sobre un `cuentaId`
+  // real (no `null`), y `resolverCuentasBanco`/`reemplazarCuenta` (2924, ya
+  // genéricos, sin acoplarse a cfdiUuid) lo resuelven sin cambios.
+  const codigosNecesarios = [...new Set([...bancosNecesarios].map(b => BANCO_A_CODIGO_CUENTA[b]).filter(Boolean).concat(CODIGO_CUENTA_PUENTE_BANCOS))];
   const cuentasRows = codigosNecesarios.length
     ? await AccountPlan.findAll({ where: { codigo: { [Op.in]: codigosNecesarios } }, attributes: ['id', 'codigo'], raw: true })
     : [];
   const cuentaIdPorCodigo = new Map(cuentasRows.map(r => [r.codigo, r.id]));
+  const cuentaPuenteBancosId = cuentaIdPorCodigo.get(CODIGO_CUENTA_PUENTE_BANCOS) ?? null;
   const cuentaIdPorBanco  = (banco) => {
     const codigo = BANCO_A_CODIGO_CUENTA[banco];
     return codigo ? (cuentaIdPorCodigo.get(codigo) ?? null) : null;
@@ -2825,23 +2846,28 @@ async function generarYGuardarTraspasos({ rfc, fechaInicio, fechaFin }, user) {
   for (const { fechaIso, pares } of dias) {
     const movimientos = [];
     for (const { bbva, contraparte } of pares) {
-      const monto        = bbva.deposito ?? contraparte.retiro;
-      const cuentaCargo   = cuentaIdPorBanco(bbva.banco);
-      const cuentaAbono   = cuentaIdPorBanco(contraparte.banco);
-      const folioRef      = contraparte.folio ?? bbva.folio ?? '';
-      // cuentaId puede quedar null (banco sin cuenta dedicada en el catálogo, ver
-      // BANCO_A_CODIGO_CUENTA arriba) — PolizaMovimiento.cuentaId ya es nullable
-      // para exactamente este caso (mismo criterio que el flujo CFDI: cuentaFaltante
-      // marca la línea para resolverla después vía resolver-cuentas-banco/reemplazar-cuenta,
-      // en vez de bloquear la generación de la póliza).
+      const monto          = bbva.deposito ?? contraparte.retiro;
+      const cuentaCargoReal = cuentaIdPorBanco(bbva.banco);
+      const cuentaAbonoReal = cuentaIdPorBanco(contraparte.banco);
+      // Cada lado del par tiene su PROPIO folio de estado de cuenta — antes se
+      // usaba un único `folioRef` (contraparte.folio ?? bbva.folio) para AMBOS
+      // conceptos, mostrando el mismo folio en cargo y abono. Cada movimiento
+      // debe mostrar el folio del banco al que está atado (bbva.folio para el
+      // cargo, contraparte.folio para el abono).
+      const folioBbva        = bbva.folio ?? '';
+      const folioContraparte = contraparte.folio ?? '';
+      // Banco sin cuenta dedicada en el catálogo (ver BANCO_A_CODIGO_CUENTA arriba)
+      // → cae en la cuenta puente "Bancos por identificar" (mismo criterio que el
+      // flujo CFDI: cuentaFaltante:true marca la línea para resolverla después vía
+      // resolver-cuentas-banco/reemplazar-cuenta, en vez de bloquear la póliza).
       movimientos.push({
-        cuentaId: cuentaCargo, cuentaFaltante: !cuentaCargo,
-        concepto: `TRASPASO ENTRE CUENTAS PROPIAS — ${bbva.banco} → ${contraparte.banco} (folio ${folioRef})`.slice(0, 500),
+        cuentaId: cuentaCargoReal ?? cuentaPuenteBancosId, cuentaFaltante: !cuentaCargoReal,
+        concepto: `TRASPASO ENTRE CUENTAS PROPIAS — ${bbva.banco} → ${contraparte.banco} (folio ${folioBbva})`.slice(0, 500),
         debe: monto, haber: 0,
       });
       movimientos.push({
-        cuentaId: cuentaAbono, cuentaFaltante: !cuentaAbono,
-        concepto: `TRASPASO ENTRE CUENTAS PROPIAS — ${bbva.banco} → ${contraparte.banco} (folio ${folioRef})`.slice(0, 500),
+        cuentaId: cuentaAbonoReal ?? cuentaPuenteBancosId, cuentaFaltante: !cuentaAbonoReal,
+        concepto: `TRASPASO ENTRE CUENTAS PROPIAS — ${bbva.banco} → ${contraparte.banco} (folio ${folioContraparte})`.slice(0, 500),
         debe: 0, haber: monto,
       });
     }
@@ -2910,6 +2936,44 @@ async function exportContpaqTraspasosXlsx(id) {
   return { buffer, poliza };
 }
 
+/**
+ * Resuelve, para UN movimiento (cargo o abono) de una póliza de Traspasos ya
+ * persistida, el BankMovement de Mongo del que salió — para poder navegar desde
+ * "ver movimientos" hasta el registro real en Bancos. `Poliza.traspasosPares`
+ * (snapshot liviano, sin _id de Mongo) + `PolizaMovimiento.orden` (1-based,
+ * cargo=impar/bbva, abono=par/contraparte, ver generarYGuardarTraspasos) ubican
+ * banco+folio+fecha del lado correcto; `traspasoInterno.runId` (=String(polizaId),
+ * ver traspasos-internos.service.js#_buildIdentificarOp) + banco + folio
+ * identifican el BankMovement exacto sin ambigüedad entre pares del mismo día.
+ */
+async function resolverBankMovimientoDeTraspaso(id, movimientoId) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+  if (poliza.tipo !== 'T') throw new ValidationError('Esta póliza no es de tipo Traspasos.');
+
+  const movimiento = poliza.movimientos.find(m => m.id === Number(movimientoId));
+  if (!movimiento) throw new NotFoundError('Movimiento de póliza');
+
+  const pares = poliza.traspasosPares;
+  if (!Array.isArray(pares) || pares.length === 0) {
+    throw new ValidationError('Esta póliza no tiene traspasos guardados.');
+  }
+
+  const idx  = movimiento.orden - 1;
+  const par  = pares[Math.floor(idx / 2)];
+  if (!par) throw new NotFoundError('Par de traspaso');
+  const lado = idx % 2 === 0 ? par.bbva : par.contraparte;
+  if (!lado) throw new NotFoundError('Lado del par de traspaso');
+
+  const bankMovement = await BankMovement.findOne(
+    { banco: lado.banco, folio: lado.folio, 'traspasoInterno.runId': String(id) },
+    { _id: 1, banco: 1 },
+  ).lean();
+  if (!bankMovement) throw new NotFoundError('Movimiento bancario relacionado');
+
+  return { bankMovementId: String(bankMovement._id), banco: bankMovement.banco };
+}
+
 async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
@@ -2932,7 +2996,7 @@ module.exports = {
   reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
   resolverCuentasPorCfdisIdentificados,
   // Pólizas Traspasos C.P. (2026-08-25)
-  generarYGuardarTraspasos, exportContpaqTraspasosXlsx,
+  generarYGuardarTraspasos, exportContpaqTraspasosXlsx, resolverBankMovimientoDeTraspaso,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
 };

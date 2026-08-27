@@ -1393,7 +1393,7 @@ async function extractReceiptDataPdfScanned(pdfBuffer, label = null) {
   try {
     pages = await renderPdfToImages(pdfBuffer, 2);
   } catch (renderErr) {
-    logger.warn('[extractReceiptDataPdfScanned] renderPdfToImages falló:', renderErr.message);
+    logger.warn('[extractReceiptDataPdfScanned] renderPdfToImages falló:', renderErr.stack || renderErr.message);
     // Errores nombrados por pdfjs-dist (ver PasswordException/InvalidPDFException
     // en pdfjs-dist/legacy/build/pdf.js) — se distinguen por .name, igual que el
     // resto de error-handler.js distingue CastError/MulterError/etc.

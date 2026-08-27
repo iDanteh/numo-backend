@@ -633,8 +633,11 @@ async function identificar(id, body, user) {
 
   // Guard todo-o-nada (spec: "Todo-o-nada completeness gate") — ANTES de tocar
   // Kore o Mongo (más allá del findById de arriba). resolverAsignaciones lanza
-  // BadRequestError si CUALQUIER formaPago queda sin bankMovementId asignado.
-  const asignacionesPorMovId = resolverAsignaciones(cr, body);
+  // BadRequestError si CUALQUIER formaPago queda sin AL MENOS un bankMovementId
+  // asignado. `movIdsPorFormaPago` (2026-08-27): una formaPago con 2+ movIds
+  // asignados = 1 sola forma de pago pagada con varios depósitos separados
+  // (ver depositosAdicionales en CollectionRequest.model.js).
+  const { porMovId: asignacionesPorMovId, movIdsPorFormaPago } = resolverAsignaciones(cr, body);
   const movIds = [...asignacionesPorMovId.keys()];
 
   // 1 sola query para TODOS los movimientos asignados (reemplaza el antiguo
@@ -658,12 +661,27 @@ async function identificar(id, body, user) {
   const movPorId = new Map(movs.map(m => [String(m._id), m]));
   const movsOrdenados = movIds.map(movId => movPorId.get(movId));
 
-  // Mapa inverso formaPagoDocId -> movId, para resolver referencia/Aut/Numo/
-  // BancoID de CADA forma de pago con SU PROPIO movimiento asignado — antes de
-  // este cambio solo existía un `mov` global para toda la solicitud.
+  // Mapa inverso formaPagoDocId -> PRIMER movId (orden de asignación), para
+  // resolver referencia/Aut/Numo/BancoID "principales" de CADA forma de pago
+  // con SU PROPIO movimiento asignado — antes de este cambio solo existía un
+  // `mov` global para toda la solicitud. Si la forma de pago tiene 2+ movIds
+  // (2026-08-27, split de 1 sola forma de pago entre varios depósitos), los
+  // adicionales se resuelven aparte (ver depositosAdicionalesPorFormaPagoDocId).
   const movIdPorFormaPagoDocId = new Map();
-  for (const [movId, formasDelGrupo] of asignacionesPorMovId) {
-    for (const f of formasDelGrupo) movIdPorFormaPagoDocId.set(String(f._id), movId);
+  for (const [docId, movIdsDeEstaForma] of movIdsPorFormaPago) {
+    movIdPorFormaPagoDocId.set(docId, movIdsDeEstaForma[0]);
+  }
+
+  // montoEfectivo por (formaPagoDocId, movId) — con 1 solo movimiento asignado,
+  // el efectivo es el importe COMPLETO de la forma de pago (comportamiento sin
+  // cambios); con 2+ (split), cada movimiento aporta lo que él mismo depositó
+  // (`deposito` real, nunca un reparto inventado a mano) — evita contar el
+  // importe completo de la forma de pago una vez por cada depósito asignado
+  // (ver buildErpLinksParaCobro, que suma esto para saldoPagado/saldoPagadoTotal).
+  function montoEfectivo(f, movId) {
+    const movIdsDeEstaForma = movIdsPorFormaPago.get(String(f._id)) ?? [];
+    if (movIdsDeEstaForma.length <= 1) return f.importe;
+    return movPorId.get(movId)?.deposito ?? 0;
   }
 
   // Reconciliación de montos — advisory (spec: "NUNCA bloquea"). Se calcula
@@ -726,13 +744,21 @@ async function identificar(id, body, user) {
   // movimiento identificado — nunca la que (no) haya mandado el ERP. Ahora
   // CADA forma de pago usa el folio de SU PROPIO movimiento asignado (antes
   // había un solo `mov` para toda la solicitud) y persiste su propio
-  // bankMovementId (D1/D2).
+  // bankMovementId (D1/D2). Si la forma de pago quedó con 2+ movimientos
+  // asignados (2026-08-27, split), el primero es el "principal"
+  // (bankMovementId, igual que siempre) y el resto se persisten en
+  // depositosAdicionales con su propio monto real depositado.
   const formasPagoConRef = cr.formasPago.map(f => {
-    const movDeEstaForma = movPorId.get(movIdPorFormaPagoDocId.get(String(f._id)));
+    const [movIdPrincipal, ...movIdsExtra] = movIdsPorFormaPago.get(String(f._id));
+    const movDeEstaForma = movPorId.get(movIdPrincipal);
     return {
       ...f.toObject(),
       referencia:     String(movDeEstaForma.folio ?? ''),
       bankMovementId: movDeEstaForma._id,
+      depositosAdicionales: movIdsExtra.map(movId => ({
+        bankMovementId: movPorId.get(movId)._id,
+        montoEfectivo:  montoEfectivo(f, movId),
+      })),
     };
   });
 
@@ -789,6 +815,18 @@ async function identificar(id, body, user) {
     for (const f of formasPagoKore) {
       formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
       formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
+    }
+    // 2026-08-27 (diagnóstico temporal): Kore rechazó un cobro real de Depósito en
+    // efectivo exigiendo "el campo extra que empieza con numo, en el catálogo de la
+    // forma de pago" — nombre que Numo no captura hoy (siempre manda "Num Recibo",
+    // hardcodeado desde 2026-08-12). Logueado SOLO para las formasPago que esta
+    // solicitud realmente usa, para no ensuciar el log con el catálogo completo.
+    // Quitar una vez confirmado el nombre real del campo contra Kore.
+    for (const f of cr.formasPago) {
+      const catalogo = formasPagoKore.find(fk => String(fk.id) === String(f.formaPagoId));
+      if (catalogo) {
+        console.log(`[collection-requests] identificar ${id}: catálogo crudo Kore para formaPagoId=${f.formaPagoId} →`, JSON.stringify(catalogo.raw));
+      }
     }
 
     const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
@@ -860,25 +898,40 @@ async function identificar(id, body, user) {
   // movimientos con fechas distintas.
   const fechaRealPagoRaiz = _fechaRealPagoKore(movsOrdenados[0].fecha);
 
+  // 2026-08-27 (CORREGIDO tras rechazo real de Kore): 1 SOLO elemento del arreglo
+  // por forma de pago — nunca uno repetido por depósito. Rechazo real: "la forma
+  // de pago X subió N comprobante(s)... debe indicar el dato adicional... con N
+  // valor(es) separados por coma" — Kore espera los N valores (uno por depósito)
+  // JUNTOS en el mismo campo, separados por coma, no N elementos con el mismo
+  // FormaPagoID repetido (lo que se había armado antes de esta corrección, sin
+  // probar). Con 1 solo depósito (caso común, sin split) el join() de un arreglo
+  // de 1 elemento da el mismo valor de siempre, sin coma — comportamiento
+  // idéntico al de antes de este cambio.
   const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
-    const movId          = movIdPorFormaPagoDocId.get(String(f._id));
-    const movDeEstaForma = movPorId.get(movId);
-    const bancoDefault   = bancoDefaultPorMovId.get(movId) ?? null;
+    const movIdsDeEstaForma = movIdsPorFormaPago.get(String(f._id));
+    const movsDeEstaForma   = movIdsDeEstaForma.map(movId => movPorId.get(movId));
+    const movPrincipal      = movsDeEstaForma[0];
+    const bancoDefault      = bancoDefaultPorMovId.get(movIdsDeEstaForma[0]) ?? null;
     const esTransferencia     = formaPagoRequiereBanco.get(f.formaPagoId) === true;
     const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
+    const autJuntos  = movsDeEstaForma.map(m => m.folio || '').join(',');
+    const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || '').join(',');
     return {
       ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
-      fecha_real_pago: _fechaRealPagoKore(movDeEstaForma.fecha),
+      // fecha_real_pago del PRIMER depósito asignado — mismo criterio que
+      // fechaRealPagoRaiz (abajo) para la ambigüedad de "varios movimientos,
+      // 1 sola fecha posible" cuando hay split.
+      fecha_real_pago: _fechaRealPagoKore(movPrincipal.fecha),
       ...(esTransferencia ? {
         DatosAdicionales: [
-          { Nombre: 'Aut',  Valor: movDeEstaForma.folio || '' },
-          { Nombre: 'Numo', Valor: movDeEstaForma.numeroAutorizacion || '' },
+          { Nombre: 'Aut',  Valor: autJuntos },
+          { Nombre: 'Numo', Valor: numoJuntos },
         ],
       } : {}),
       ...(esDepositoEfectivo ? {
         DatosAdicionales: [
-          { Nombre: 'Num Recibo', Valor: movDeEstaForma.folio || '' },
+          { Nombre: 'Num Recibo', Valor: autJuntos },
         ],
       } : {}),
     };
@@ -949,8 +1002,18 @@ async function identificar(id, body, user) {
     await conTransaccion(async (session) => {
       for (const [movId, formasDelGrupo] of asignacionesPorMovId) {
         const movDelGrupo = movPorId.get(movId);
+        // montoEfectivo (2026-08-27): con 1 forma de pago repartida entre 2+
+        // depósitos, cada grupo debe aportar SOLO lo que este movimiento en
+        // particular depositó — sin este override, formasDelGrupo sumaría el
+        // importe COMPLETO de la forma de pago en cada uno de sus grupos
+        // (doble conteo real de saldoPagado/saldoPagadoTotal, ver
+        // buildErpLinksParaCobro). Sin cambios cuando no hay split (1 solo
+        // movimiento asignado): montoEfectivo devuelve f.importe tal cual.
+        const formasDelGrupoConMonto = formasDelGrupo.map(f => ({
+          ...f.toObject(), importe: montoEfectivo(f, movId),
+        }));
         const erpLinks = buildErpLinksParaCobro(cr, cuentasKore, movDelGrupo.erpLinks, {
-          formasPago: formasDelGrupo,
+          formasPago: formasDelGrupoConMonto,
           pagadoTotalCxc,
         });
         const updated = await bankService.setErpIds(movId, erpLinks, user, { session });

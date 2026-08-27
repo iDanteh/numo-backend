@@ -20,11 +20,11 @@ describe('resolverAsignaciones', () => {
   test('atajo escalar {bankMovementId}: expande el mismo movimiento a TODAS las formasPago', () => {
     const cr = { formasPago: [forma('f1', 'Transferencia'), forma('f2', 'Efectivo')] };
 
-    const mapa = resolverAsignaciones(cr, { bankMovementId: 'mov-1' });
+    const { porMovId } = resolverAsignaciones(cr, { bankMovementId: 'mov-1' });
 
-    expect(mapa.size).toBe(1);
-    expect(mapa.get('mov-1')).toHaveLength(2);
-    expect(mapa.get('mov-1').map(f => f._id)).toEqual(['f1', 'f2']);
+    expect(porMovId.size).toBe(1);
+    expect(porMovId.get('mov-1')).toHaveLength(2);
+    expect(porMovId.get('mov-1').map(f => f._id)).toEqual(['f1', 'f2']);
   });
 
   test('arreglo explícito de asignaciones: agrupa por movimiento distinto, orden de aparición', () => {
@@ -39,11 +39,54 @@ describe('resolverAsignaciones', () => {
       ],
     };
 
-    const mapa = resolverAsignaciones(cr, body);
+    const { porMovId } = resolverAsignaciones(cr, body);
 
-    expect([...mapa.keys()]).toEqual(['mov-A', 'mov-B']);
-    expect(mapa.get('mov-A').map(f => f._id)).toEqual(['f1', 'f3']);
-    expect(mapa.get('mov-B').map(f => f._id)).toEqual(['f2']);
+    expect([...porMovId.keys()]).toEqual(['mov-A', 'mov-B']);
+    expect(porMovId.get('mov-A').map(f => f._id)).toEqual(['f1', 'f3']);
+    expect(porMovId.get('mov-B').map(f => f._id)).toEqual(['f2']);
+  });
+
+  // 2026-08-27 — caso real confirmado contra Kore: 1 sola forma de pago pagada
+  // con 2 depósitos separados (2 comprobantes, Kore no lo modela como 2
+  // formasPago). El mismo formaPagoDocId puede recibir 2+ bankMovementId sin
+  // que el segundo pise al primero.
+  test('1 forma de pago con 2 movimientos asignados (split): NO se sobreescribe, termina en los 2 grupos', () => {
+    const cr = { formasPago: [forma('f1', 'Transferencia')] };
+    const body = {
+      asignaciones: [
+        { formaPagoDocId: 'f1', bankMovementId: 'mov-A' },
+        { formaPagoDocId: 'f1', bankMovementId: 'mov-B' },
+      ],
+    };
+
+    const { porMovId, movIdsPorFormaPago } = resolverAsignaciones(cr, body);
+
+    expect(movIdsPorFormaPago.get('f1')).toEqual(['mov-A', 'mov-B']);
+    expect([...porMovId.keys()]).toEqual(['mov-A', 'mov-B']);
+    expect(porMovId.get('mov-A').map(f => f._id)).toEqual(['f1']);
+    expect(porMovId.get('mov-B').map(f => f._id)).toEqual(['f1']);
+    // Es el MISMO objeto formaPago en los 2 grupos (identificar() calcula
+    // cuánto aporta cada uno con montoEfectivo, no se duplica el importe acá).
+    expect(porMovId.get('mov-A')[0]).toBe(porMovId.get('mov-B')[0]);
+  });
+
+  test('mezcla: 1 forma de pago normal (1 movimiento) + 1 forma de pago split (2 movimientos)', () => {
+    const cr = { formasPago: [forma('f1', 'Transferencia'), forma('f2', 'Efectivo')] };
+    const body = {
+      asignaciones: [
+        { formaPagoDocId: 'f1', bankMovementId: 'mov-A' },
+        { formaPagoDocId: 'f2', bankMovementId: 'mov-B' },
+        { formaPagoDocId: 'f2', bankMovementId: 'mov-C' },
+      ],
+    };
+
+    const { porMovId, movIdsPorFormaPago } = resolverAsignaciones(cr, body);
+
+    expect(movIdsPorFormaPago.get('f1')).toEqual(['mov-A']);
+    expect(movIdsPorFormaPago.get('f2')).toEqual(['mov-B', 'mov-C']);
+    expect(porMovId.get('mov-A').map(f => f._id)).toEqual(['f1']);
+    expect(porMovId.get('mov-B').map(f => f._id)).toEqual(['f2']);
+    expect(porMovId.get('mov-C').map(f => f._id)).toEqual(['f2']);
   });
 
   test('formaPagoDocId desconocido: BadRequestError, ningún cálculo se realiza', () => {
@@ -152,5 +195,21 @@ describe('movimientosDe', () => {
     const movs = movimientosDe(cr);
 
     expect(movs).toEqual(['legacy-mov-1']);
+  });
+
+  // 2026-08-27 — depositosAdicionales: 1 forma de pago con 2 depósitos.
+  test('incluye depositosAdicionales[].bankMovementId, deduplicado, sin importar si se repite con el principal', () => {
+    const movA = { _id: 'mov-A' };
+    const movB = { _id: 'mov-B' };
+    const cr = {
+      formasPago: [
+        { bankMovementId: movA, depositosAdicionales: [{ bankMovementId: movB, montoEfectivo: 100 }] },
+        { bankMovementId: movA, depositosAdicionales: [] }, // repetido -> no debe duplicarse
+      ],
+    };
+
+    const movs = movimientosDe(cr);
+
+    expect(movs).toEqual([movA, movB]);
   });
 });

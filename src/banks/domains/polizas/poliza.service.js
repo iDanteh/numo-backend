@@ -1408,7 +1408,16 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   // llegan a este bucket (ver arriba) — se arman aparte más abajo, dentro de
   // `depositosIdentificados` (bucle sobre `gruposDetallados`).
   const ORDEN_LABEL_CONSOLIDADO = { EFECTIVO: 0, TARJETA: 1 };
+  // Residuo sin etiqueta (2026-08-27, confirmado con el usuario, caso real
+  // B0-260801134 $0.01): cuando `g.label` es null (formaPago sin mapear en
+  // `LABEL_FORMA_PAGO_CONSOLIDADO`, ej. Transferencia '03' cayendo al bucket
+  // genérico en vez de a `gruposDetallados`) y el monto es un residuo chico,
+  // el resultado es una línea "Depósitos consolidados" sin ninguna etiqueta
+  // útil — se oculta, mismo criterio que otros residuos de redondeo ya
+  // establecidos en el export (umbral $10).
+  const UMBRAL_RESIDUO_CONSOLIDADO_SIN_ETIQUETA = 10;
   const consolidados = [...grupos.values()]
+    .filter(g => !(g.label == null && Math.abs(g.debe) < UMBRAL_RESIDUO_CONSOLIDADO_SIN_ETIQUETA))
     .map(g => ({
       cuenta:      g.cuenta,
       serie:       g.label ?? '',
@@ -1686,12 +1695,6 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
-// Mismo umbral que `UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS` (25-ago, residuos SF)
-// pero para líneas 'Venta Sin Cobro' — confirmado con el usuario 2026-08-26,
-// caso real Hidalgo B0-260801157 ($0.01): un excedente de unos centavos es
-// ruido de redondeo, no dinero real sin explicar.
-const UMBRAL_RESIDUO_VENTA_SIN_COBRO = 10;
-
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
@@ -1736,6 +1739,18 @@ function _extraerCobrosSucursal(movimientos) {
       .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
                 && m.cfdiUuid == null)
       .map(m => `${m.concepto || ''}|${Number(m.haber).toFixed(2)}`),
+  );
+  // Par Cargo+Abono, AMBOS tipoOrigen='Cobro Sucursal' (2026-08-27, caso real
+  // Ferrocarril B0-260802776 $2,307.32 Tarjeta con depósito bancario
+  // identificado): a diferencia del par 'Venta'+'Cobro Sucursal' de arriba,
+  // este ocurre cuando cobros-sucursal-puente.service.js arma el Cargo
+  // (banco real) Y el Abono (cuenta puente) ambos con este mismo tipoOrigen —
+  // mismo criterio "solo Abono" que Anticipo (`bloquesAjustesContado`,
+  // confirmado con el usuario): el Cargo se omite aquí, sobrevive el Abono.
+  const _cobroSucursalHaberKeys = new Set(
+    movimientos
+      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0))
+      .map(m => m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.haber).toFixed(2)}`),
   );
   for (const m of movimientos) {
     // Las líneas de Saldo a Favor de un Pago (tipoComprobante='P',
@@ -1783,7 +1798,20 @@ function _extraerCobrosSucursal(movimientos) {
       });
       continue;
     }
-    if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== 'Venta Sin Cobro' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
+    // 'Venta Sin Cobro' (2026-08-27, confirmado con el usuario): se quita por
+    // completo del export, sin dejar rastro en ningún lado (ni póliza
+    // principal ni "Otros Ingresos") — revierte la decisión previa de
+    // mostrarlo con la etiqueta corregida. Se acepta que el asiento quede
+    // desbalanceado contra el Abono de Ingresos/IVA de esa misma factura
+    // (mismo criterio que otros residuos ya ocultados hoy).
+    if (m.tipoOrigen === 'Venta Sin Cobro') continue;
+    if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
+    // Ver `_cobroSucursalHaberKeys` arriba — el Cargo del par se omite cuando
+    // ya existe su Abono correspondiente.
+    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.debe) > 0 && !(Number(m.haber) > 0)) {
+      const _keyCargoPar = m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.debe).toFixed(2)}`;
+      if (_cobroSucursalHaberKeys.has(_keyCargoPar)) continue;
+    }
     if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,
@@ -1797,23 +1825,6 @@ function _extraerCobrosSucursal(movimientos) {
         motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
           ? 'Oculto — cobro real ya contabilizado el día real del cobro'
           : 'Oculto — generado y usado el mismo día/almacén',
-      });
-      continue;
-    }
-    // Venta Sin Cobro de monto chico (< $UMBRAL_RESIDUO_VENTA_SIN_COBRO): mismo
-    // criterio que el residuo de redondeo SF de `armarBloqueContado`
-    // (confirmado con el usuario 2026-08-26) — un excedente de unos centavos
-    // no es dinero real sin explicar, es ruido de redondeo; no vale la pena
-    // mostrarlo como línea de "Venta Sin Cobro" en la póliza principal. Se
-    // reencamina a "Otros Ingresos oculto" igual que los casos de arriba.
-    if (m.tipoOrigen === 'Venta Sin Cobro' && Number(m.debe) + Number(m.haber) < UMBRAL_RESIDUO_VENTA_SIN_COBRO) {
-      filasOtrosIngresosOcultos.push({
-        cuenta:      m.cuenta,
-        centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-        concepto:    m.concepto || '',
-        debe:        Number(m.debe),
-        haber:       Number(m.haber),
-        motivo:      `Oculto — monto < $${UMBRAL_RESIDUO_VENTA_SIN_COBRO} (posible residuo de redondeo)`,
       });
       continue;
     }
@@ -1912,10 +1923,53 @@ function _extraerCobrosSucursal(movimientos) {
   // 'Pendiente Propio' (ticket sin factura de la PROPIA sucursal, sin cruce)
   // tampoco lleva el prefijo — confirmado con el usuario 2026-08-06, no es un
   // cruce real, decirlo sería una etiqueta falsa.
+  // Tarjeta de otra sucursal TAMBIÉN debe sumar al consolidado de Tarjeta de
+  // ESTA sucursal (2026-08-27, confirmado con el usuario, caso real
+  // Ferrocarril 11-ago B0-260802776 $2,307.32) — el dinero entró físicamente
+  // por la terminal de tarjeta de ESTA sucursal ese día, aunque pertenezca a
+  // la factura de otra. A diferencia de Efectivo (revertido 2026-08-20 por
+  // falta de respaldo: el reporte oficial de Hidalgo/B0 11-ago no distinguía
+  // ningún cobro de otra sucursal ese día), este caso SÍ se confirmó contra
+  // el monto exacto faltante. Se calcula ANTES de borrar los campos `_` de
+  // abajo — la línea individual en "Cobro de otra sucursal" se sigue
+  // mostrando aparte, sin cambios, esto solo ajusta el TOTAL consolidado
+  // (ver `_inyectarCobrosSucursal`).
+  //
+  // NO usar `_categoriaCobroSucursal` (esa función prioriza
+  // `_referenciaBancoReal` sobre el texto real de la forma de pago — cuando
+  // SÍ hay un depósito bancario identificado para una Tarjeta, la categoriza
+  // como "Transferencia" para efectos de ORDEN visual, aunque siga siendo
+  // Tarjeta en la realidad). Aquí se necesita saber si es Tarjeta DE VERDAD,
+  // sin importar si además tiene depósito bancario identificado — se revisa
+  // el texto crudo de `_formaPagoLabel`.
+  // Corrección 2026-08-27 (caso real B0-260801256/Ferrocarril): comparado
+  // contra datos reales, la póliza VENDEDORA (B0) trae una fila SOLA de Cargo
+  // (`haber=0` — reconoce el derecho de cobro contra la sucursal cobradora,
+  // sin Abono en ESTA póliza) mientras que la póliza COBRADORA real (F0) trae
+  // el PAR completo Cargo+Abono, reducido por el fix de "solo Abono" de
+  // arriba (`_cobroSucursalHaberKeys`) a una sola fila con `haber>0`. Exigir
+  // `haber>0` aquí es lo que distingue "cobrado físicamente en ESTA
+  // sucursal" (cuenta) de "venta de ESTA sucursal, cobrada en otra" (no
+  // cuenta) — también excluye de paso al par 'Venta'+'Cobro Sucursal' de
+  // arriba (esa fila siempre trae `haber: 0` hardcodeado).
+  const filasTarjetaCobroSucursal = filas
+    .filter(f => !f._esVentaSinCobro && Number(f.haber) > 0 && (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA'))
+    .map(f => ({ concepto: f.concepto, monto: Number(f.haber) }));
+
+  // `_referenciaBancoReal` a veces NO es un folio bancario real distinguible
+  // (2026-08-27, caso real B0-260802776 Tarjeta): cuando `bancoReal.referencia`
+  // viene vacío pero SÍ se identificó la cuenta del banco, cobros-sucursal-
+  // puente.service.js cae a `fp.nombre` (ej. "TARJETA DE DEBITO" — el mismo
+  // texto genérico de la forma de pago, no una referencia real) — mostrarlo
+  // tal cual en columna C pierde el prefijo "COS-" sin aportar ningún dato
+  // nuevo. Un folio real de Numo es puramente numérico (ej. "034287") — si
+  // trae letras, es el nombre genérico, se trata como el caso normal (con
+  // prefijo COS-) en vez de como referencia bancaria real.
+  const _esReferenciaBancoRealGenuina = (ref) => !!ref && /^\d+$/.test(ref.trim());
   for (const f of filas) {
     f.serie = f._esVentaSinCobro
       ? ETIQUETA_VENTA_SIN_COBRO
-      : f._referenciaBancoReal
+      : _esReferenciaBancoRealGenuina(f._referenciaBancoReal)
         ? f._referenciaBancoReal
         : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
           ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
@@ -1929,7 +1983,7 @@ function _extraerCobrosSucursal(movimientos) {
   // nunca suman a depósitos consolidados de efectivo/tarjeta.
   if (filasOtrosIngresosOcultos.length) filasOtrosIngresos.push(...filasOtrosIngresosOcultos);
 
-  return { resto, filas, filasOtrosIngresos };
+  return { resto, filas, filasOtrosIngresos, filasTarjetaCobroSucursal };
 }
 
 // Inyecta las filas de cobro-sucursal en el bloque correspondiente — PUE en
@@ -1941,7 +1995,7 @@ function _extraerCobrosSucursal(movimientos) {
 // líneas hermanas por serie-folio. Nunca en Bonificaciones/Descuentos/
 // Devoluciones, que son categorías ajenas. Muta `bloques` in-place después de
 // que ya se calcularon todos sus `movs`.
-function _inyectarCobrosSucursal(bloques, filas) {
+function _inyectarCobrosSucursal(bloques, filas, filasTarjetaCobroSucursal = []) {
   if (!filas.length || !bloques.length) return;
   const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones) de/.test(t || '');
   // Discrimina por metodoPago (no por cuenta): el Cargo a la cuenta puente
@@ -1960,6 +2014,26 @@ function _inyectarCobrosSucursal(bloques, filas) {
       bloques.find(b => !esBonificacionODescuento(b.tipoVenta)) ??
       bloques[0];
     candidatoContado.movs.push(...filasPUE);
+    // Ver comentario en `_extraerCobrosSucursal` sobre `filasTarjetaCobroSucursal`
+    // — solo Tarjeta, ajusta el TOTAL de "Depósitos consolidados (Tarjeta)" sin
+    // tocar la línea individual que ya se agregó arriba. También se agrega a
+    // `_detalle` para que la hoja "Desglose Consolidado" muestre de dónde
+    // salió el ajuste — sin esto, el total subía pero el desglose no
+    // explicaba por qué.
+    if (filasTarjetaCobroSucursal.length) {
+      const sumaTarjeta = Math.round(filasTarjetaCobroSucursal.reduce((s, f) => s + f.monto, 0) * 100) / 100;
+      const lineaConsolidadoTarjeta = candidatoContado.movs.find(m => m.concepto === 'Depósitos consolidados (Tarjeta)');
+      if (lineaConsolidadoTarjeta && sumaTarjeta > 0) {
+        lineaConsolidadoTarjeta.debe = Math.round((Number(lineaConsolidadoTarjeta.debe) + sumaTarjeta) * 100) / 100;
+        if (!Array.isArray(lineaConsolidadoTarjeta._detalle)) lineaConsolidadoTarjeta._detalle = [];
+        for (const f of filasTarjetaCobroSucursal) {
+          lineaConsolidadoTarjeta._detalle.push({
+            cfdiUuid: null, serie: f.concepto, monto: f.monto, formaPago: 'TARJETA',
+            nota: 'Cobro de otra sucursal (también se muestra aparte)',
+          });
+        }
+      }
+    }
   }
 
   if (filasPPD.length) {
@@ -2042,12 +2116,13 @@ function bloquesAjustesContado(movs) {
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    // OPA (anticipo sin NC, ver `categorizarAjusteContado`): a diferencia del
-    // anticipo estándar (Reg 22C/23, cargo primero), aquí el Ingreso (Abono)
-    // debe verse PRIMERO y la aplicación del anticipo (Cargo OPA) después,
-    // para trazabilidad — confirmado con el usuario 2026-08-19.
-    const esOpa = categoria === 'anticipo' && grupo.some(m => m.reglaNombre === 'OPA');
-    const bloque = esOpa ? [...abonos, ...cargos] : [...cargos, ...abonos];
+    // Anticipo (Reg 22C/23 y OPA): el Cargo NUNCA se muestra en este bloque —
+    // solo el Abono (Ingresos+IVA, o el SF liberado) — confirmado con el
+    // usuario 2026-08-27 (caso real E0-260800110/E0-260801021). Revierte la
+    // decisión previa del 2026-08-19 de mostrar cargo+abono juntos para
+    // Anticipo; las demás categorías (Devolución/Descuento/Bonificación) NO
+    // cambian, siguen mostrando cargo+abono juntos.
+    const bloque = categoria === 'anticipo' ? abonos : [...cargos, ...abonos];
     return { categoria, bloque };
   });
 }
@@ -2209,9 +2284,10 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    // OPA (anticipo sin NC) — ver comentario equivalente en `bloquesAjustesContado`.
-    const esOpa = categoria === 'anticipo' && grupo.some(m => m.reglaNombre === 'OPA');
-    const bloque = esOpa ? [...abonos, ...cargos] : [...cargos, ...abonos];
+    // Anticipo: el Cargo NUNCA se muestra — ver comentario equivalente en
+    // `bloquesAjustesContado` (mismo fix, 2026-08-27, mismo criterio para
+    // Contado y Crédito).
+    const bloque = categoria === 'anticipo' ? abonos : [...cargos, ...abonos];
     bloques.push({ categoria, bloque });
   }
 
@@ -2332,7 +2408,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // Cobros de sucursal: se sacan ANTES del pipeline de Contado/Crédito (nunca
   // deben pasar por consolidarCargos) y se reinyectan ya armados una vez que
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
-  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos } = _extraerCobrosSucursal(movimientos);
+  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(movimientos);
   movimientos = movimientosSinCobroSucursal;
 
   // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
@@ -2455,7 +2531,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
     }];
   }
 
-  _inyectarCobrosSucursal(bloques, filasCobroSucursal);
+  _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
 
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+

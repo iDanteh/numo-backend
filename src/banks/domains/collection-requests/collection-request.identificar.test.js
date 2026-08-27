@@ -230,8 +230,8 @@ describe('identificar() — 1 forma de pago repartida entre 2 depósitos (split,
   });
 });
 
-describe('identificar() — Depósito en efectivo manda "Num Recibo" en vez de Aut/Numo', () => {
-  test('DatosAdicionales trae un solo tag Num Recibo con el folio consecutivo de Numo, sin BancoID', async () => {
+describe('identificar() — Depósito en efectivo manda "Num Recibo" + "Numo" (sin "Aut", sin BancoID)', () => {
+  test('DatosAdicionales trae Num Recibo Y Numo con el folio consecutivo de Numo, sin BancoID', async () => {
     const f1 = formaPago('f1', 'Depósito en efectivo', 100000);
     const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
@@ -247,7 +247,14 @@ describe('identificar() — Depósito en efectivo manda "Num Recibo" en vez de A
     const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
     expect(datosAdicionales).toHaveLength(1);
     expect(datosAdicionales[0].BancoID).toBeUndefined();
-    expect(datosAdicionales[0].DatosAdicionales).toEqual([{ Nombre: 'Num Recibo', Valor: 'F-mov-1' }]);
+    // 2026-08-27: se agregó "Numo" además de "Num Recibo" — Kore rechazó un
+    // cobro real de depósito en efectivo exigiendo un campo que empieza con
+    // "numo" para la validación de N-comprobantes/N-valores, algo que "Num
+    // Recibo" (el único campo que ese catálogo declaraba) no satisface.
+    expect(datosAdicionales[0].DatosAdicionales).toEqual([
+      { Nombre: 'Num Recibo', Valor: 'F-mov-1' },
+      { Nombre: 'Numo',       Valor: 'F-mov-1' },
+    ]);
     // 2026-08-14: fecha_real_pago se manda igual para depósito en efectivo, sin
     // condición de tipo (a diferencia de BancoID/DatosAdicionales).
     expect(datosAdicionales[0].fecha_real_pago).toBe('2026-08-01T10:00:00Z');

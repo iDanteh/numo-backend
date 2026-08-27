@@ -929,9 +929,23 @@ async function identificar(id, body, user) {
           { Nombre: 'Numo', Valor: numoJuntos },
         ],
       } : {}),
+      // 2026-08-27 (HIPÓTESIS a validar contra Kore real, ver catálogo crudo
+      // logueado arriba en este mismo archivo): Depósito en efectivo sigue
+      // mandando "Num Recibo" (el único campo que SU catálogo declara en
+      // CamposExtras), pero además se agrega "Numo" — Kore rechazó un cobro
+      // real con "debe indicar el dato adicional... el campo extra que empieza
+      // con numo" a pesar de que "Num Recibo" es justo lo que ese catálogo
+      // pide; "Num Recibo" NO empieza con el literal "numo" (con espacio antes
+      // de "Recibo"). Transferencia sí tenía un tag "Numo" (por el número de
+      // autorización bancario) y nunca dio este error — sospecha: Kore valida
+      // "N comprobantes = N valores separados por coma" contra un campo que
+      // empiece con "Numo" SIN IMPORTAR lo que declare el catálogo de cada
+      // forma de pago, no algo específico de "Num Recibo". Si Kore rechaza
+      // igual, sacar este tag extra y reconsiderar.
       ...(esDepositoEfectivo ? {
         DatosAdicionales: [
           { Nombre: 'Num Recibo', Valor: autJuntos },
+          { Nombre: 'Numo',       Valor: autJuntos },
         ],
       } : {}),
     };

@@ -1833,8 +1833,7 @@ async function _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorF
 // Puntos/Saldo a Favor, usa `cobro.monto` cuando solo hay una formaPago).
 // Devuelve Map<claveSat, monto> para inyectar como línea aparte (sin CFDI).
 async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }) {
-  const porClave = new Map();
-  if (!centro || !fechaInicio || !fechaFin) return porClave;
+  if (!centro || !fechaInicio || !fechaFin) return [];
 
   const fechaDesdeISO = new Date(`${fechaInicio}T00:00:00-06:00`).toISOString();
   const fechaHastaISO = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
@@ -1849,7 +1848,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
     logger.warn(`[CobrosSinFactura] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
-    return porClave;
+    return [];
   }
 
   // Ventas canceladas/devueltas (2026-08-21, confirmado con el usuario contra
@@ -1974,7 +1973,20 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
 
   // Restar la Devolución de cada venta cancelada de sus propios renglones
   // (más recientes primero — la cancelación reversa el cobro más reciente de
-  // esa venta) antes de sumar al total por forma de pago.
+  // esa venta) antes de devolver el detalle POR TICKET.
+  //
+  // Corrección 2026-08-27 (confirmado con el usuario): antes se devolvía un
+  // solo total agregado por forma de pago (`porClave`), perdiendo a qué
+  // ticket pertenecía cada monto — para Transferencia/Tarjeta eso hacía
+  // imposible mostrar el número de autorización real (una sola línea de
+  // $168,731.13 no puede tener "un" número de autorización, es la suma de
+  // varios depósitos distintos). Ahora se devuelve el detalle por ticket
+  // (`ventaSerie`/`ventaFolio`/`clave`/`monto`) marcado con
+  // `serieVentaTicket`/`folioVentaTicket` al inyectarlo — el mecanismo que
+  // YA existe para resolver el banco real por ticket (`bancoRealPorTicket`,
+  // `construirBancoRealPorTicket`) lo recoge automáticamente, sin necesidad
+  // de una consulta bancaria nueva aquí.
+  const detalle = []; // [{ ventaSerie, ventaFolio, clave, monto }]
   for (const [ventaKey, renglones] of porVenta) {
     let devRestante = devGeneradoPorVenta.get(ventaKey) ?? 0;
     for (let i = renglones.length - 1; i >= 0 && devRestante > 0.01; i--) {
@@ -1983,12 +1995,13 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       r.monto -= reduccion;
       devRestante -= reduccion;
     }
+    const [ventaSerie, ventaFolio] = ventaKey.split('|');
     for (const r of renglones) {
       if (r.monto <= 0) continue;
-      porClave.set(r.clave, Math.round(((porClave.get(r.clave) ?? 0) + r.monto) * 100) / 100);
+      detalle.push({ ventaSerie, ventaFolio, clave: r.clave, monto: Math.round(r.monto * 100) / 100 });
     }
   }
-  return porClave;
+  return detalle;
 }
 
 function _fmtDMY(fechaISO) {
@@ -3354,21 +3367,30 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin) {
     const cobrosSinFacturaProp = await _cobrosSinFacturaPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
     const ccSinFacturaProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
-    for (const [claveSatSF, montoSF] of cobrosSinFacturaProp) {
-      const cuentaDestinoSF = claveSatSF === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
-      if (!cuentaDestinoSF || montoSF <= 0) continue;
+    // Una línea POR TICKET (2026-08-27, confirmado con el usuario) — antes se
+    // consolidaba todo en una sola línea por forma de pago, imposibilitando
+    // mostrar el número de autorización real de Transferencia/Tarjeta (una
+    // suma de varios depósitos no puede tener "un" número). `serieVentaTicket`/
+    // `folioVentaTicket` deja que `bancoRealPorTicket`/`consolidarCargos`
+    // (poliza.service.js) resuelvan el banco real y agrupen por autorización
+    // exactamente igual que ya hacen para los tickets normales.
+    for (const t of cobrosSinFacturaProp) {
+      const cuentaDestinoSF = t.clave === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      if (!cuentaDestinoSF || t.monto <= 0) continue;
       movimientosResult.push({
-        concepto:      'Cobros sin factura',
+        concepto:      `Cobros sin factura / ${t.ventaSerie}-${t.ventaFolio}`,
         serie:         null,
         centroCosto:   ccSinFacturaProp?.clave ?? null,
         centroCostoId: ccSinFacturaProp?.id    ?? null,
         cfdiUuid:      null,
         cuentaId:      cuentaDestinoSF,
-        debe:          montoSF,
+        debe:          t.monto,
         haber:         0,
         tipoOrigen:    'Venta',
         reglaNombre:   'COBRO-SIN-FACTURA',
-        formaPago:     claveSatSF,
+        formaPago:     t.clave,
+        serieVentaTicket: t.ventaSerie,
+        folioVentaTicket: t.ventaFolio,
       });
     }
   }
@@ -4539,21 +4561,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin) {
     const cobrosSinFacturaGuard = await _cobrosSinFacturaPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
     const ccSinFacturaGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
-    for (const [claveSatSFG, montoSFG] of cobrosSinFacturaGuard) {
-      const cuentaDestinoSFG = claveSatSFG === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
-      if (!cuentaDestinoSFG || montoSFG <= 0) continue;
+    for (const t of cobrosSinFacturaGuard) {
+      const cuentaDestinoSFG = t.clave === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      if (!cuentaDestinoSFG || t.monto <= 0) continue;
       todosLosMovimientos.push({
-        concepto:      'Cobros sin factura',
+        concepto:      `Cobros sin factura / ${t.ventaSerie}-${t.ventaFolio}`,
         serie:         null,
         centroCosto:   ccSinFacturaGuard?.clave ?? null,
         centroCostoId: ccSinFacturaGuard?.id    ?? null,
         cfdiUuid:      null,
         cuentaId:      cuentaDestinoSFG,
-        debe:          montoSFG,
+        debe:          t.monto,
         haber:         0,
         tipoOrigen:    'Venta',
         reglaNombre:   'COBRO-SIN-FACTURA',
-        formaPago:     claveSatSFG,
+        formaPago:     t.clave,
+        serieVentaTicket: t.ventaSerie,
+        folioVentaTicket: t.ventaFolio,
       });
     }
   }

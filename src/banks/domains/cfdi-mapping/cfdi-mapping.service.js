@@ -483,11 +483,35 @@ function _calcCfdiMontos(cfdi) {
 // por error a la columna C en vez de la H, y además limitaba el marcador a
 // una lista fija de Series -- confirmado con el usuario que cualquier
 // documentosRelacionados debe reflejarse en H, no solo esa lista).
-// Devuelve null si el CFDI no tiene documentosRelacionados, para que el
-// llamador use la descripción del CFDI en el concepto como siempre.
-function _referenciaDocRelacionado(documentosRelacionados) {
-  for (const d of (documentosRelacionados || [])) {
+//
+// Excepción agregada 2026-08-26 (caso real Hidalgo B0-260801157/B0-260801256):
+// cuando la Serie de la referencia es la MISMA que la de la propia factura
+// (ej. B0→B0) Y HAY MÁS DE UNA referencia (Factura Global, puede traer 1 o
+// cientos), NO es un documento relacionado real -- son tickets internos de
+// cajas ligados por el mecanismo de "factura PUE cobrada días después"
+// (`ticketsPropioPorClave`, cfdi-poliza-generator.service.js). Tomar el
+// PRIMERO al azar como si fuera "el" documento relacionado sobreescribía el
+// concepto de TODA la factura con un ticket arbitrario, perdiendo el nombre
+// del cliente en el proceso. Una referencia real a otro documento (ajuste,
+// fusión) SIEMPRE trae una Serie DISTINTA a la propia (BON/DEV/CAC/M0/etc.)
+// -- ese caso sigue mostrándose igual que antes.
+//
+// Corrección 2026-08-26 (mismo día, caso real Atzompa E0-260800126, ticket
+// E0-260801137): cuando hay EXACTAMENTE UNA referencia y es de la misma
+// Serie, NO es ruido de Factura Global -- es el ÚNICO ticket real de esta
+// factura normal (mismo mecanismo `ticketsPropioPorClave`, pero sin
+// ambigüedad posible al haber un solo candidato) -- sí debe mostrarse.
+// Devuelve null si el CFDI no tiene documentosRelacionados (o solo trae
+// VARIOS tickets internos de su propia serie sin poder distinguir cuál es
+// el correcto), para que el llamador use la descripción del CFDI en el
+// concepto como siempre.
+function _referenciaDocRelacionado(documentosRelacionados, serieCfdiPropia) {
+  const lista = documentosRelacionados || [];
+  const esAmbiguo = lista.length > 1;
+  for (const d of lista) {
     if (!d.Serie) continue;
+    const mismaSerie = (d.Serie ?? '').toUpperCase() === (serieCfdiPropia ?? '').toUpperCase();
+    if (mismaSerie && esAmbiguo) continue;
     // Folio vacío ("") es falsy -- sin este fallback, `!d.Folio` saltaba la
     // entrada completa y el concepto caía en la serie-folio de la factura
     // propia en vez de mostrar la referencia (encontrado 2026-07-23, folios
@@ -643,9 +667,21 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // Cancelación en cualquiera de sus variantes -- o cualquier otra referencia
   // del ERP a otro documento): el concepto (columna H) muestra esa referencia
   // en vez de la descripción de producto -- ver `_referenciaDocRelacionado`.
-  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados);
+  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados, cfdi.serie);
   const concepto    = marcadorAjuste
     ?? (descRaw.trim() ? descRaw.trim().slice(0, 200) : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`);
+  // Ticket real único (mismo criterio que `_referenciaDocRelacionado`: un solo
+  // `documentosRelacionados` de la misma Serie no es ruido de Factura Global,
+  // es el ticket real de esta factura normal cobrada días después) -- se
+  // expone como `serieVentaTicket`/`folioVentaTicket` en `satMeta` (ver
+  // abajo) para que `armarIndividual` (consolidarCargos, poliza.service.js)
+  // muestre en columna H "cliente / ticket interno" en vez de "cliente /
+  // factura propia" en los renglones de Anticipo/SF (confirmado con el
+  // usuario 2026-08-26, caso real E0-260800126/E0-260801137).
+  const _docsRelPropios = cfdi.documentosRelacionados || [];
+  const ticketRealUnico = (_docsRelPropios.length === 1 && _docsRelPropios[0]?.Serie
+    && (_docsRelPropios[0].Serie ?? '').toUpperCase() === (cfdi.serie ?? '').toUpperCase())
+    ? _docsRelPropios[0] : null;
   const centroCosto = rule?.centroCosto ?? '';
   // Fecha del CFDI como fecha de venta en formato YYYY-MM-DD
   const ventaFecha  = cfdi.fecha ? new Date(cfdi.fecha).toISOString().slice(0, 10) : null;
@@ -653,6 +689,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // propia serie-folio de la factura/CFDI (columna C), nunca el marcador de
   // ajuste (ese va en `concepto`, columna H -- ver arriba).
   const serieCfdi   = [cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null;
+  // Concepto específico para la línea "Venta Sin Cobro" (columna H): cuando
+  // `_prefetchAjustesFacturaPropia` encontró que el dinero de este ticket
+  // está atribuido en el ERP a OTRA factura (`context.atribuidoOtraFactura`,
+  // ej. "B0-260801321"), se muestra esa factura real en vez del concepto
+  // genérico de esta factura -- confirmado con el usuario 2026-08-26, caso
+  // real B0-260801256 ($6,207.20, ticket B0-260802904 atribuido a B0-260801321)
+  // -- mucho más rastreable para cajas/facturación que el ticket o el folio
+  // propio. Si no hay atribución conocida, se usa el concepto normal.
+  const conceptoVentaSinCobro = context.atribuidoOtraFactura ?? concepto;
 
   if (!rule) {
     return [
@@ -801,6 +846,24 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
     && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_CLUB_TUBEROS];
 
+  // Caso espejo de `esCasoAjusteSFPuntos` (2026-08-26, confirmado con el
+  // usuario, caso real Atzompa/E0 11-ago, Reg 22C id 406, factura
+  // E0-260800110 $1,355.92 = $1,308.61 saldo a favor + $47.31 efectivo real):
+  // cuando `rule.cuentaCargo` YA es una cuenta de Saldo a Favor/pasivo (no
+  // Caja/Bancos — reglas tipo "formaPago 30", fuera de `gateBase`) pero el
+  // ticket se pagó SOLO PARCIALMENTE con ese saldo, el resto (real, según
+  // `desglosePagoReal`) nunca llegaba a Caja/Bancos — el Cargo completo se
+  // iba a la cuenta de SF. Aquí el cargo "por defecto" ya es la cuenta de SF
+  // (al revés de `esCasoAjusteSFPuntos`, donde el default es Caja/Bancos), así
+  // que se separa el remanente REAL (no cubierto por SF) hacia Caja/Bancos vía
+  // `splitPorFormaPagoReal`, dejando en `cuentaCargo` solo lo realmente
+  // cubierto por saldo a favor.
+  const esCasoCargoSFConRemanenteReal = !esAnticipo && !esAplicacionSaldo && !esPago
+    && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
+    && montoSFUsado > 0.01 && montoSFUsado < montoCargo - 0.01
+    && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
+    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
+
   // Suma de las formasPago reales encontradas — calculada ANTES del gate
   // porque el gate mismo la necesita (ver comentario abajo).
   const totalFormasPagoReal = Array.isArray(context.desglosePagoReal)
@@ -838,7 +901,15 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // `extraEnUltima` se adjunta SOLO a la última línea empujada (mismo lugar
   // que ya absorbe el residuo de redondeo) — usado para no perder el
   // marcador `_puntosUsado` cuando el remanente también se parte.
-  const splitPorFormaPagoReal = (montoAPartir, extraEnUltima = {}) => {
+  // `reglaNombreOverride` (2026-08-26, ver `esCasoCargoSFConRemanenteReal`):
+  // por defecto estas líneas heredan el nombre de LA REGLA completa (via
+  // `satMeta`, al final de esta función) — correcto cuando la regla ya es una
+  // Venta normal, pero para Reg 22C ("...Anticipo...") el remanente real NO
+  // es un anticipo, y `consolidarCargos`/`esReglaAnticipo` (poliza.service.js)
+  // lo sacaría del consolidado de Efectivo/Tarjeta solo por el texto
+  // "Anticipo" en el nombre de la regla. Se fuerza un nombre neutro que
+  // sobrevive al spread de `satMeta` (mismo mecanismo que `_formaPagoReal`).
+  const splitPorFormaPagoReal = (montoAPartir, extraEnUltima = {}, reglaNombreOverride = null) => {
     const formasPagoReal = context.desglosePagoReal;
     formasPagoReal.forEach((fp, idx) => {
       const esUltimo = idx === formasPagoReal.length - 1;
@@ -864,6 +935,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Ver comentario más abajo (bloque `esCasoNormalParaSplit`) sobre por
         // qué esta línea concreta debe llevar el claveSat REAL, no el del CFDI.
         _formaPagoReal: (fp.claveSat ?? '').trim() || null,
+        ...(reglaNombreOverride ? { _reglaNombreReal: reglaNombreOverride } : {}),
         // Ticket real (cajas) al que pertenece esta porción — ver comentario
         // en `_prefetchAjustesFacturaPropia`. `consolidarCargos` lo usa para
         // resolver la autorización real de Tarjeta POR TICKET vía
@@ -1011,7 +1083,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         // Efectivo/Tarjeta en vez de sumarse a ciegas.
         movs.push({
           cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
-          concepto, centroCosto, ventaFecha, serie: serieCfdi,
+          concepto: conceptoVentaSinCobro, centroCosto, ventaFecha, serie: serieCfdi,
           debe:        excesoCubrir,
           haber:       0,
           cfdiUuid:    cfdi.uuid,
@@ -1074,7 +1146,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     if (excesoCasoNormal > 0.01 && totalFormasPagoReal > 0) {
       movs.push({
         cuentaId:    cuentaMap[CODIGO_CUENTA_CAJA] ?? null,
-        concepto, centroCosto, ventaFecha, serie: serieCfdi,
+        concepto: conceptoVentaSinCobro, centroCosto, ventaFecha, serie: serieCfdi,
         debe:        excesoCasoNormal,
         haber:       0,
         cfdiUuid:    cfdi.uuid,
@@ -1086,6 +1158,21 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     } else {
       splitPorFormaPagoReal(montoCargo);
     }
+  } else if (esCasoCargoSFConRemanenteReal) {
+    const remanenteReal = parseFloat((montoCargo - montoSFUsado).toFixed(2));
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      concepto, centroCosto, ventaFecha, serie: serieCfdi,
+      debe:        montoSFUsado,
+      haber:       0,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+      _esCargoPrincipal: true,
+    });
+    // Nombre neutro (no "Anticipo") para que `consolidarCargos` sume esta
+    // porción al consolidado de Efectivo/Tarjeta en vez de sacarla como
+    // ajuste individual — ver comentario en `splitPorFormaPagoReal`.
+    splitPorFormaPagoReal(remanenteReal, {}, 'Venta — remanente real (no cubierto por saldo a favor)');
   } else {
     // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
     // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta
@@ -1117,7 +1204,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     }
     movs.push({
       cuentaId:    _cuentaIdFallback,
-      concepto,
+      concepto:    sinCobrosEnSucursal ? conceptoVentaSinCobro : concepto,
       centroCosto,
       ventaFecha,
       serie:       serieCfdi,
@@ -1539,6 +1626,12 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     reglaId:         rule?.id                                   ?? null,
     reglaNombre:     rule?.nombre                               ?? null,
     tipoOrigen:      cfdi.tipoOrigen ?? _derivarTipoOrigen(cfdi) ?? null,
+    // Ver `ticketRealUnico` arriba -- default para TODAS las líneas de este
+    // CFDI (incluida la de Abono, que no pasa por `splitPorFormaPagoReal` y
+    // por eso nunca trae su propio `_serieVentaTicket`). Una línea de Cargo
+    // partida por forma de pago real SÍ trae el suyo (`_serieVentaTicket`,
+    // por ticket) y lo sobrescribe más abajo -- esto es solo el default.
+    ...(ticketRealUnico ? { serieVentaTicket: ticketRealUnico.Serie, folioVentaTicket: ticketRealUnico.Folio } : {}),
   };
 
   // `_formaPagoReal` (ver split del cargo más arriba): si esta línea puntual
@@ -1558,6 +1651,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ...m,
     ...satMeta,
     ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
+    ...(m._reglaNombreReal != null ? { reglaNombre: m._reglaNombreReal } : {}),
     // Sobrevive al spread de `satMeta` por la misma razón que `_formaPagoReal`
     // — ver comentario ahí. `consolidarCargos` los usa para resolver la
     // autorización real de Tarjeta por ticket (bank_movements.erpLinks).

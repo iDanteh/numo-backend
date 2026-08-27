@@ -118,13 +118,13 @@ async function construirVerdadBancaria(movimientos, rfc) {
   const condicionFolioFiscal = { 'erpLinks.folioFiscal': { $in: uuidsUnicos.map(u => new RegExp(`^${u}$`, 'i')) } };
   movs.push(...await BankMovement.find(
     condicionFolioFiscal,
-    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1 },
+    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
   ).lean());
   for (let i = 0; i < paresSerieFolio.length; i += LOTE) {
     const lote = paresSerieFolio.slice(i, i + LOTE);
     movs.push(...await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1 },
+      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
     ).lean());
   }
 
@@ -169,6 +169,14 @@ async function construirVerdadBancaria(movimientos, rfc) {
     // la TARJETA, para agrupar ventas que comparten la misma autorización
     // (confirmado con el usuario 2026-08-07).
     const numeroAutorizacion = m.numeroAutorizacion || null;
+    // Monto REAL depositado en el banco para este movimiento (2026-08-26,
+    // confirmado con el usuario) — usado SOLO para Transferencia (ver
+    // `consolidarCargos`) en vez de la suma de cobros de caja/ERP atribuidos
+    // a esa referencia, que puede no coincidir exacto con lo que el banco
+    // realmente recibió. Se acepta que el asiento exportado quede
+    // desbalanceado contra el Abono/IVA en ese caso (mismo criterio que
+    // otros "ruido" de reclasificación ya tolerados en el export).
+    const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
 
     for (const link of (m.erpLinks ?? [])) {
       const folioFiscalUpper = (link.folioFiscal || '').toUpperCase();
@@ -183,7 +191,7 @@ async function construirVerdadBancaria(movimientos, rfc) {
       // parcialidades) — si alguno confirma transferencia, esa gana.
       const actual = mapa.get(uuidResuelto);
       if (!actual || (!actual.esTransferencia && esTransferencia)) {
-        mapa.set(uuidResuelto, { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion });
+        mapa.set(uuidResuelto, { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal });
       }
     }
   }
@@ -240,7 +248,7 @@ async function construirBancoRealPorTicket(movimientos) {
     const lote = pares.slice(i, i + LOTE);
     const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1 },
+      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1 },
     ).lean();
     for (const m of movs) {
       const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[m.banco];
@@ -252,11 +260,13 @@ async function construirBancoRealPorTicket(movimientos) {
       const referencia = m.folio || null;
       const numeroAutorizacion = m.numeroAutorizacion || m.referenciaNumerica || null;
       if (!referencia && !numeroAutorizacion) continue;
+      // Ver comentario equivalente en `construirVerdadBancaria`.
+      const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
       for (const link of (m.erpLinks ?? [])) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
         if (!paresSet.has(key)) continue;
-        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco });
+        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }
     }
   }
@@ -456,6 +466,9 @@ async function listBorradorCandidatas({ rfc, ejercicio, periodo, soloCobranza })
     where.id = { [Op.in]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
   } else if (soloCobranza === false || soloCobranza === 'false') {
     where.id = { [Op.notIn]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
+    // Mismo criterio que list() en poliza.repository.js: las de tipo T
+    // (Traspaso) no pertenecen a Ingreso ni a Cobranza.
+    where.tipo = { [Op.ne]: 'T' };
   }
 
   const polizas = await Poliza.findAll({
@@ -1222,9 +1235,15 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // mismo criterio que `enriquecerConceptoConCliente`, confirmado con el
       // usuario 2026-07-22.
       const esCancelacionAqui = categoria === 'devolucion' && /cancelaci[oó]n/i.test(m.tipoOrigen || '');
+      // Anticipo (Reg 22C/23 cobrado con Saldo a Favor): el concepto (columna
+      // H) debe mostrar el ticket real de cajas (`serieParaDetalle`), no la
+      // serie-folio de la factura propia (esa ya va en columna C) — confirmado
+      // con el usuario 2026-08-26, caso real E0-260800126/E0-260801137. Las
+      // demás categorías (Devolución/Descuento/Bonificación/Club Tuberos)
+      // siguen usando `m.serie` sin cambios.
       const serieSufijo = (categoria === 'devolucion' && !esCancelacionAqui && m.serie)
         ? `${m.serie} DEV`
-        : m.serie;
+        : (categoria === 'anticipo' ? (serieParaDetalle || m.serie) : m.serie);
       const concepto = [nombre, serieSufijo].filter(Boolean).join(' / ') || etiqueta;
       return {
         // Cuenta real del banco donde cayó el depósito (ver
@@ -1295,14 +1314,27 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // cuando el banco tiene cuenta dedicada en el catálogo.
       const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? bancario?.cuentaBanco ?? m.cuenta;
       const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? `__cfdi_${m.cfdiUuid}`}`;
+      // Monto real depositado en el banco para esta Transferencia (2026-08-26,
+      // confirmado con el usuario) — SOLO Transferencia, nunca Cheque/Tarjeta:
+      // reemplaza la suma de cobros de caja/ERP atribuidos a esta referencia
+      // por el depósito real (`BankMovement.deposito`), que es la fuente
+      // autoritativa de cuánto entró realmente al banco. Se acepta que el
+      // renglón quede desbalanceado contra el Abono/IVA de la factura en caso
+      // de diferencia (mismo criterio que otro "ruido" ya tolerado en el
+      // export) — el `debe` de este grupo queda FIJO en cuanto se conoce el
+      // depósito real, no se sigue acumulando por cada CFDI que comparte la
+      // misma referencia.
+      const montoBancoReal = esTransferenciaVerificada
+        ? (infoTicketTransfCheque?.montoBancoReal ?? bancario?.montoBancoReal ?? null)
+        : null;
       if (!gruposDetallados.has(key)) {
         gruposDetallados.set(key, {
           cuenta: cuentaLinea, centroCosto, referencia, tipoDetalle, subcodigo: subcodigoDetalle,
-          debe: 0, detalle: [], primerMov: m,
+          debe: montoBancoReal ?? 0, detalle: [], primerMov: m, _debeFijoBanco: montoBancoReal != null,
         });
       }
       const gt = gruposDetallados.get(key);
-      gt.debe += Number(m.debe);
+      if (!gt._debeFijoBanco) gt.debe += Number(m.debe);
       gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaAjusteSinCfdi });
       continue;
     }
@@ -1654,6 +1686,12 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
+// Mismo umbral que `UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS` (25-ago, residuos SF)
+// pero para líneas 'Venta Sin Cobro' — confirmado con el usuario 2026-08-26,
+// caso real Hidalgo B0-260801157 ($0.01): un excedente de unos centavos es
+// ruido de redondeo, no dinero real sin explicar.
+const UMBRAL_RESIDUO_VENTA_SIN_COBRO = 10;
+
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
@@ -1759,6 +1797,23 @@ function _extraerCobrosSucursal(movimientos) {
         motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
           ? 'Oculto — cobro real ya contabilizado el día real del cobro'
           : 'Oculto — generado y usado el mismo día/almacén',
+      });
+      continue;
+    }
+    // Venta Sin Cobro de monto chico (< $UMBRAL_RESIDUO_VENTA_SIN_COBRO): mismo
+    // criterio que el residuo de redondeo SF de `armarBloqueContado`
+    // (confirmado con el usuario 2026-08-26) — un excedente de unos centavos
+    // no es dinero real sin explicar, es ruido de redondeo; no vale la pena
+    // mostrarlo como línea de "Venta Sin Cobro" en la póliza principal. Se
+    // reencamina a "Otros Ingresos oculto" igual que los casos de arriba.
+    if (m.tipoOrigen === 'Venta Sin Cobro' && Number(m.debe) + Number(m.haber) < UMBRAL_RESIDUO_VENTA_SIN_COBRO) {
+      filasOtrosIngresosOcultos.push({
+        cuenta:      m.cuenta,
+        centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        concepto:    m.concepto || '',
+        debe:        Number(m.debe),
+        haber:       Number(m.haber),
+        motivo:      `Oculto — monto < $${UMBRAL_RESIDUO_VENTA_SIN_COBRO} (posible residuo de redondeo)`,
       });
       continue;
     }
@@ -2281,32 +2336,14 @@ async function exportContpaqXlsx(id, overrides = {}) {
   movimientos = movimientosSinCobroSucursal;
 
   // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
-  // MEXICANA DE ANTEQUERA B0-260801134): un Cargo de Venta normal por un
-  // monto chico (< $10) suele ser un residuo de redondeo entre el Saldo a
-  // Favor usado y el total real de la factura (el SF no cubre el 100% por un
-  // par de centavos, y el faltante cae a la forma de pago que declaró el CFDI
-  // aunque no hubo depósito/transferencia real) — se oculta igual que el SF
-  // chico (mismo umbral $50 de `UMBRAL_SF_OTROS_INGRESOS`, pero aquí a
-  // propósito más chico, $10, para no esconder ventas reales pequeñas por
-  // error). PENDIENTE (ver memoria): la solución correcta es cruzar esto con
-  // el monto de SF usado por la MISMA factura y absorber el residuo ahí en
-  // vez de esconderlo a ciegas por monto.
-  const UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS = 10;
-  const residuosVenta = [];
-  movimientos = movimientos.filter((m) => {
-    const esResiduoChico = m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && Number(m.debe) < UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS && Number(m.haber) === 0;
-    if (!esResiduoChico) return true;
-    residuosVenta.push({
-      cuenta:      m.cuenta,
-      centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-      concepto:    m.concepto || '',
-      debe:        Number(m.debe),
-      haber:       Number(m.haber),
-      motivo:      `Monto < $${UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS} (posible residuo de redondeo SF)`,
-    });
-    return false;
-  });
-  if (residuosVenta.length) filasOtrosIngresos.push(...residuosVenta);
+  // MEXICANA DE ANTEQUERA B0-260801134) — QUITADA 2026-08-26 (confirmado con
+  // el usuario, caso real Hidalgo 11-ago: comparando contra el Reporte de
+  // Movimientos en Cajas oficial del ERP, estos residuos < $10 SÍ son dinero
+  // real cobrado físicamente ese día — ocultarlos del consolidado hacía que
+  // "Depósitos consolidados (Efectivo)" quedara $82.94 por debajo del total
+  // oficial). Los residuos de Venta, sin importar el monto, ya NO se ocultan
+  // a "Otros Ingresos" — se quedan en el consolidado normal, igual que
+  // cualquier otra venta.
 
   // Nombres de cliente — para el bloque de Crédito (cada CFDI es su propia
   // línea) y también para la hoja de desglose de los consolidados de Contado

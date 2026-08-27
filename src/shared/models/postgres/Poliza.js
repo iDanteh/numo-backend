@@ -10,9 +10,9 @@ const Poliza = sequelize.define('Poliza', {
     autoIncrement: true,
   },
   tipo: {
-    type:      DataTypes.ENUM('A', 'I', 'E', 'D', 'N', 'C', 'P', 'T'),
+    type:      DataTypes.ENUM('A', 'I', 'E', 'D', 'N', 'C', 'P', 'T', 'B', 'G'),
     allowNull: false,
-    comment:   'A=Apertura I=Ingreso E=Egreso D=Diario N=Nomina C=Cheque P=Pago T=Traspasos entre cuentas propias',
+    comment:   'A=Apertura I=Ingreso E=Egreso D=Diario N=Nomina C=Cheque P=Pago T=Traspasos entre cuentas propias B=Compensaciones Bancarias G=Intereses Ganados',
   },
   numero: {
     type:      DataTypes.INTEGER,
@@ -129,6 +129,15 @@ const Poliza = sequelize.define('Poliza', {
   // persistida. Mismo criterio que sustitutosExcluidos/pendientesPorFacturar arriba:
   // JSONB nullable, solo lo usa el tipo de póliza al que corresponde.
   traspasosPares: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
+  // Snapshot de las líneas de banco (banco, concepto, monto, folio) que originaron
+  // esta póliza — SOLO tipo='B' (Compensaciones Bancarias) o tipo='G' (Intereses
+  // Ganados), 2026-08-27. Mismo criterio que traspasosPares arriba: sin esto no se
+  // puede reconstruir el Excel CONTPAQ (la línea de cierre agregada tampoco vive en
+  // PolizaMovimiento con suficiente detalle para reproducir el M1 original).
+  compensacionesInteresesLineas: {
     type:      DataTypes.JSONB,
     allowNull: true,
   },

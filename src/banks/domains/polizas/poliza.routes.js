@@ -85,6 +85,71 @@ router.post('/traspasos/generar',
   }),
 );
 
+// GET /api/polizas/traspasos/borrador-candidatas?rfc=
+// Lista TODAS las pólizas 'T' en borrador del rfc (sin acotar a un periodo — Traspasos
+// genera 1 póliza por día, puede haber varias de meses distintos a la vez) — alimenta
+// el modal de selección de "Cancelar todas" de esta bandeja.
+router.get('/traspasos/borrador-candidatas',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.listBorradorCandidatasTraspasos({ rfc: req.query.rfc }));
+  }),
+);
+
+// POST /api/polizas/traspasos/cancelar-todas
+// Cancela en bloque las pólizas 'T' en borrador del rfc. Si se manda polizaIds solo
+// cancela esas (selección manual); si no, cancela todas.
+// Body: { rfc, motivo?, polizaIds?: number[] }
+router.post('/traspasos/cancelar-todas',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, motivo, polizaIds } = req.body;
+    res.json(await service.cancelarTodasTraspasos({ rfc, polizaIds }, req.user, motivo));
+  }),
+);
+
+// POST /api/polizas/compensaciones-intereses/generar
+// Body: { rfc, fechaInicio, fechaFin } — genera y PERSISTE hasta 2 pólizas (tipo='B'
+// Compensaciones Bancarias, tipo='G' Intereses Ganados) con los BankMovement BBVA/
+// Banamex candidatos del rango, con folio/estado real (2026-08-27). Ruta estática
+// antes de /:id a propósito, mismo criterio que /traspasos/generar arriba.
+router.post('/compensaciones-intereses/generar',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, fechaInicio, fechaFin } = req.body;
+    const polizas = await service.generarYGuardarCompensacionesIntereses({ rfc, fechaInicio, fechaFin }, req.user);
+    res.status(201).json({ polizas });
+  }),
+);
+
+// GET /api/polizas/compensaciones-intereses/borrador-candidatas?rfc=
+// Lista TODAS las pólizas 'B'/'G' en borrador del rfc (sin acotar a un periodo —
+// acá puede haber varios meses a la vez por diseño) — alimenta el modal de
+// selección de "Cancelar todas" de esta bandeja.
+router.get('/compensaciones-intereses/borrador-candidatas',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.listBorradorCandidatasCompensacionesIntereses({ rfc: req.query.rfc }));
+  }),
+);
+
+// POST /api/polizas/compensaciones-intereses/cancelar-todas
+// Cancela en bloque las pólizas 'B'/'G' en borrador del rfc. Si se manda polizaIds
+// solo cancela esas (selección manual); si no, cancela todas.
+// Body: { rfc, motivo?, polizaIds?: number[] }
+router.post('/compensaciones-intereses/cancelar-todas',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, motivo, polizaIds } = req.body;
+    res.json(await service.cancelarTodasCompensacionesIntereses({ rfc, polizaIds }, req.user, motivo));
+  }),
+);
+
 // GET /api/polizas/:id
 router.get('/:id',
   authenticate,
@@ -151,6 +216,29 @@ router.get('/:id/export-contpaq-traspasos',
     const { buffer, poliza } = await service.exportContpaqTraspasosXlsx(req.params.id);
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="Poliza_T${poliza.numero}_${poliza.fecha}_CONTPAQ.xlsx"`);
+    res.send(buffer);
+  }),
+);
+
+// GET /api/polizas/:id/compensaciones-intereses-movimiento/:movimientoId/banco — solo 'B'/'G'
+// Resuelve el BankMovement de Mongo del que salió ese débito, para navegar desde
+// "ver movimientos" hasta el registro real en Bancos (mismo criterio que Traspasos).
+router.get('/:id/compensaciones-intereses-movimiento/:movimientoId/banco',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.resolverBankMovimientoDeCompensacionIntereses(req.params.id, req.params.movimientoId));
+  }),
+);
+
+// GET /api/polizas/:id/export-contpaq-compensaciones-intereses — solo tipo='B'/'G'
+router.get('/:id/export-contpaq-compensaciones-intereses',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { buffer, poliza } = await service.exportContpaqCompensacionesInteresesXlsx(req.params.id);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.fecha}_CONTPAQ.xlsx"`);
     res.send(buffer);
   }),
 );

@@ -14,6 +14,7 @@ const { esConceptoMarcadorAjuste } = require('../cfdi-mapping/cfdi-mapping.servi
 // traspasos-internos.service.js) y nunca al revés, a propósito: evita un require
 // circular (traspasos-internos.service.js no conoce ni necesita conocer poliza.service.js).
 const traspasosInternosService = require('../banks/traspasos-internos.service');
+const compensacionesInteresesService = require('../banks/compensaciones-intereses.service');
 const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
 
 // Categorías de bank_movements que representan una transferencia electrónica real.
@@ -378,6 +379,11 @@ async function cancel(id, user, motivo) {
       'Esta póliza de Traspasos ya está contabilizada. Revertí a borrador primero y después cancelá.',
     );
   }
+  if ((poliza.tipo === 'B' || poliza.tipo === 'G') && poliza.estado === 'contabilizada') {
+    throw new ValidationError(
+      'Esta póliza ya está contabilizada. Revertí a borrador primero y después cancelá.',
+    );
+  }
 
   const result = await repo.cancel(id, {
     canceladoPor:       userLabel(user),
@@ -438,8 +444,26 @@ async function cancel(id, user, motivo) {
     }
   }
 
+  // Compensaciones Bancarias / Intereses Ganados (2026-08-27): mismo criterio que
+  // Traspasos arriba — cancelar la póliza desvincula los BankMovement que
+  // identificó al generarla. Sin campo puntero como `traspasoInterno.runId` (acá no
+  // hay contraparte 1-1): se busca directo dentro de `identificadoPor` por source+runId.
+  let compensacionesInteresesRevertidos = null;
+  if (poliza.tipo === 'B' || poliza.tipo === 'G') {
+    const runIdPoliza = String(id);
+    const movRelacionado = await BankMovement.findOne(
+      { identificadoPor: { $elemMatch: { source: 'compensacion-interes-bancario', runId: runIdPoliza } } },
+      { identificadoPor: 1 },
+    ).lean();
+    const entradaGeneradora = movRelacionado?.identificadoPor
+      ?.find(e => e.source === 'compensacion-interes-bancario' && e.runId === runIdPoliza);
+    if (entradaGeneradora) {
+      compensacionesInteresesRevertidos = await compensacionesInteresesService.revertirCompensacionesIntereses(runIdPoliza, entradaGeneradora.userId);
+    }
+  }
+
   const resultPlain = typeof result?.toJSON === 'function' ? result.toJSON() : result;
-  return { ...resultPlain, advertenciaIvaPpd, traspasosRevertidos };
+  return { ...resultPlain, advertenciaIvaPpd, traspasosRevertidos, compensacionesInteresesRevertidos };
 }
 
 /**
@@ -467,8 +491,9 @@ async function listBorradorCandidatas({ rfc, ejercicio, periodo, soloCobranza })
   } else if (soloCobranza === false || soloCobranza === 'false') {
     where.id = { [Op.notIn]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
     // Mismo criterio que list() en poliza.repository.js: las de tipo T
-    // (Traspaso) no pertenecen a Ingreso ni a Cobranza.
-    where.tipo = { [Op.ne]: 'T' };
+    // (Traspaso) ni B/G (Compensaciones/Intereses Ganados, 2026-08-27)
+    // pertenecen a Ingreso ni a Cobranza.
+    where.tipo = { [Op.notIn]: ['T', 'B', 'G'] };
   }
 
   const polizas = await Poliza.findAll({
@@ -806,8 +831,13 @@ async function generarXmlSat({ rfc, ejercicio, periodo, tipoSolicitud = 'AF', nu
     }).join('\n');
 
     const numPol  = p.folio || String(p.numero);
-    // Tipo A (Apertura) es interno — el SAT solo acepta I,E,D,N,C → se mapea a D
-    const tipoSat = p.tipo === 'A' ? 'D' : p.tipo;
+    // El SAT solo acepta I,E,D,N,C (PolizasPeriodo_v1_3.xsd) — los tipos internos
+    // sin equivalente directo (A=Apertura, T=Traspasos, B=Compensaciones,
+    // G=Intereses Ganados) se mapean a D (Diario). Bug preexistente arreglado
+    // 2026-08-27: T nunca se mapeaba, así que una póliza de Traspasos ya
+    // contabilizada generaba un XML con Tipo="T" inválido para el SAT.
+    const TIPOS_SAT_VALIDOS = new Set(['I', 'E', 'D', 'N', 'C']);
+    const tipoSat = TIPOS_SAT_VALIDOS.has(p.tipo) ? p.tipo : 'D';
     return `    <BCE:Poliza NumUnIdenPol="${esc(numPol)}" Fecha="${p.fecha}" Concepto="${esc(p.concepto)}" Tipo="${esc(tipoSat)}">\n${transacciones}\n    </BCE:Poliza>`;
   }).join('\n');
 
@@ -3003,6 +3033,343 @@ async function resolverBankMovimientoDeTraspaso(id, movimientoId) {
   return { bankMovementId: String(bankMovement._id), banco: bankMovement.banco };
 }
 
+/**
+ * Candidatas para "Cancelar todas" en la bandeja de Traspasos C.P. — mismo criterio
+ * que la versión de Compensaciones/Intereses (listBorradorCandidatasCompensacionesIntereses):
+ * todas las pólizas tipo 'T' en borrador del rfc, sin acotar a un periodo — Traspasos
+ * genera 1 póliza POR DÍA, así que puede haber varias en borrador de meses distintos
+ * a la vez, no tiene sentido acotar a un solo periodo como hace Ingreso/Cobranza.
+ */
+async function listBorradorCandidatasTraspasos({ rfc }) {
+  if (!rfc) throw new ValidationError('RFC requerido');
+
+  return Poliza.findAll({
+    where: { rfc, tipo: 'T', estado: 'borrador' },
+    attributes: ['id', 'tipo', 'numero', 'concepto', 'fecha'],
+    order: [['fecha', 'DESC'], ['numero', 'DESC']],
+  });
+}
+
+/**
+ * Cancela en bloque las pólizas de Traspasos C.P. en borrador del rfc — mismo patrón
+ * que cancelarTodasCompensacionesIntereses: reusa cancel() por póliza (misma reversión
+ * de identificación vía revertirTraspasosInternos, mismo aviso de IVA PPD si aplicara),
+ * un error en una no detiene las demás.
+ */
+async function cancelarTodasTraspasos({ rfc, polizaIds }, user, motivo) {
+  if (!rfc) throw new ValidationError('RFC requerido');
+
+  const where = { rfc, tipo: 'T', estado: 'borrador' };
+  if (Array.isArray(polizaIds) && polizaIds.length) where.id = polizaIds;
+
+  const polizas = await Poliza.findAll({ where, attributes: ['id', 'numero', 'tipo'] });
+
+  let canceladas = 0;
+  const errores = [];
+  for (const p of polizas) {
+    try {
+      // eslint-disable-next-line no-await-in-loop -- un error en una póliza no
+      // debe detener el resto, mismo criterio que cancelarTodas.
+      await cancel(p.id, user, motivo);
+      canceladas++;
+    } catch (err) {
+      errores.push({ polizaId: p.id, numero: p.numero, tipo: p.tipo, error: err.message });
+    }
+  }
+
+  return { canceladas, errores, total: polizas.length };
+}
+
+const MESES_ES_CI = ['ENERO','FEBRERO','MARZO','ABRIL','MAYO','JUNIO','JULIO','AGOSTO','SEPTIEMBRE','OCTUBRE','NOVIEMBRE','DICIEMBRE'];
+
+// Agrupa candidatos por MES CALENDARIO (UTC) de su propia fecha, no del rango pedido
+// — normalmente una póliza cubre un mes completo (confirmado con el usuario
+// 2026-08-27); si el rango pedido cruza 2+ meses, cada mes con candidatos arma (o
+// retroalimenta, ver más abajo) su PROPIA póliza en vez de mezclarse en una sola.
+function _agruparPorMes(candidatos) {
+  const porMes = new Map(); // "ejercicio-periodo" → { ejercicio, periodo, candidatos[] }
+  for (const c of candidatos) {
+    const d         = new Date(c.fecha);
+    const ejercicio = d.getUTCFullYear();
+    const periodo   = d.getUTCMonth() + 1;
+    const key       = `${ejercicio}-${periodo}`;
+    if (!porMes.has(key)) porMes.set(key, { ejercicio, periodo, candidatos: [] });
+    porMes.get(key).candidatos.push(c);
+  }
+  return [...porMes.values()].sort((a, b) => a.ejercicio - b.ejercicio || a.periodo - b.periodo);
+}
+
+/**
+ * Genera y persiste las pólizas de Compensaciones Bancarias (tipo 'B') e Intereses
+ * Ganados (tipo 'G') para el rango de fechas dado — réplica de la póliza mensual que
+ * hoy arma contabilidad a mano ("D-185 COMP 186 INT GANADOS.xls"). A diferencia de
+ * Traspasos (1 póliza por día), acá es 1 póliza por CATEGORÍA y MES calendario (ver
+ * `_agruparPorMes` — un rango que cruza varios meses genera varias pólizas, no una
+ * sola), cada una con TODOS sus candidatos de ese mes agrupados: muchas líneas de
+ * banco individuales (una por BankMovement) contra UNA sola línea de cierre agregada.
+ * Si una categoría no tiene candidatos en un mes, esa póliza simplemente se omite
+ * (confirmado 2026-08-27: no es un error, el mes puede no tener intereses/compensaciones).
+ *
+ * "Retroalimentar" (2026-08-27, evita saturar de registros al re-generar con un rango
+ * más amplio que ya cubrió antes): si YA existe una póliza BORRADOR de ese mismo
+ * tipo+mes+rfc, los candidatos nuevos de ese mes se le agregan (nueva línea de cierre
+ * con el total recalculado) en vez de crear otra póliza — el `numero`/folio no cambia.
+ * Los candidatos que ya quedaron `identificado` en una corrida anterior nunca vuelven a
+ * aparecer como candidato (ver `_cargarCandidatos`, status excluye 'identificado'), así
+ * que esto es naturalmente idempotente: solo se agrega la diferencia real. Si la
+ * existente ya está CONTABILIZADA (no editable), se crea una póliza nueva solo con el
+ * resto — decisión confirmada con el usuario, no se reabre la contabilizada.
+ */
+async function generarYGuardarCompensacionesIntereses({ rfc, fechaInicio, fechaFin }, user) {
+  if (!rfc)                      throw new ValidationError('El RFC es requerido');
+  if (!fechaInicio || !fechaFin) throw new ValidationError('Se requiere fechaInicio y fechaFin');
+
+  const inicio = new Date(`${fechaInicio}T00:00:00.000Z`);
+  const fin    = new Date(`${fechaFin}T23:59:59.999Z`);
+
+  const [candidatosComp, candidatosInt] = await Promise.all([
+    compensacionesInteresesService._cargarCandidatos(compensacionesInteresesService.CATEGORIAS_COMPENSACIONES, inicio, fin),
+    compensacionesInteresesService._cargarCandidatos(compensacionesInteresesService.CATEGORIAS_INTERESES_GANADOS, inicio, fin),
+  ]);
+
+  if (candidatosComp.length === 0 && candidatosInt.length === 0) {
+    throw new ValidationError('No hay movimientos de Compensaciones ni de Intereses Ganados en el rango seleccionado.');
+  }
+
+  // Cuentas de cierre (fijas, ya en el catálogo semilla) + cuentas de banco reales
+  // (mismo mapa que ya usa Traspasos) — un solo query para todo lo que se necesite.
+  const codigosCierre = [
+    compensacionesInteresesService.CUENTA_OTROS_INGRESOS_CODIGO,
+    compensacionesInteresesService.CUENTA_INTERESES_GANADOS_CODIGO,
+  ];
+  const bancosNecesarios = new Set([...candidatosComp, ...candidatosInt].map(c => c.banco));
+  const codigosBanco = [...bancosNecesarios].map(b => BANCO_A_CODIGO_CUENTA[b]).filter(Boolean);
+  const cuentasRows = await AccountPlan.findAll({
+    where: { codigo: { [Op.in]: [...codigosCierre, ...codigosBanco] } },
+    attributes: ['id', 'codigo'], raw: true,
+  });
+  const cuentaIdPorCodigo = new Map(cuentasRows.map(r => [r.codigo, r.id]));
+  const cuentaIdPorBanco = (banco) => {
+    const codigo = BANCO_A_CODIGO_CUENTA[banco];
+    return codigo ? (cuentaIdPorCodigo.get(codigo) ?? null) : null;
+  };
+
+  const bancosFaltantes = [...bancosNecesarios].filter(b => !cuentaIdPorBanco(b));
+  if (bancosFaltantes.length > 0) {
+    throw new ValidationError(`Banco(s) sin cuenta contable mapeada: ${bancosFaltantes.join(', ')}.`);
+  }
+
+  const definiciones = [
+    {
+      candidatos: candidatosComp, tipo: 'B', nombreCategoria: 'COMPENSACIONES',
+      cuentaCierreCodigo: compensacionesInteresesService.CUENTA_OTROS_INGRESOS_CODIGO,
+      tagCierre:          compensacionesInteresesService.TAG_CIERRE_COMPENSACIONES,
+      conceptoCierre:     compensacionesInteresesService.CONCEPTO_CIERRE_COMPENSACIONES,
+    },
+    {
+      candidatos: candidatosInt, tipo: 'G', nombreCategoria: 'INTERESES GANADOS',
+      cuentaCierreCodigo: compensacionesInteresesService.CUENTA_INTERESES_GANADOS_CODIGO,
+      tagCierre:          compensacionesInteresesService.TAG_CIERRE_INTERESES,
+      conceptoCierre:     compensacionesInteresesService.CONCEPTO_CIERRE_INTERESES,
+    },
+  ];
+
+  const polizasResultado = [];
+
+  for (const def of definiciones) {
+    const meses = _agruparPorMes(def.candidatos);
+
+    for (const { ejercicio, periodo, candidatos } of meses) {
+      const mesNombre      = MESES_ES_CI[periodo - 1];
+      const concepto       = `${def.nombreCategoria} DEL MES DE ${mesNombre} ${ejercicio}`;
+      // Fecha de la póliza = último día del mes (Date.UTC con día 0 del mes siguiente),
+      // mismo criterio que "D-185 COMP 186 INT GANADOS.xls" (fecha 2026-07-31 para Julio).
+      const fechaPoliza    = new Date(Date.UTC(ejercicio, periodo, 0)).toISOString().slice(0, 10);
+      const cuentaCierreId = cuentaIdPorCodigo.get(def.cuentaCierreCodigo);
+      const total          = candidatos.reduce((s, c) => s + compensacionesInteresesService._montoCandidato(c), 0);
+
+      const movimientosNuevos = candidatos.map(c => ({
+        cuentaId: cuentaIdPorBanco(c.banco),
+        concepto: String(c.concepto || '').slice(0, 500),
+        debe:     compensacionesInteresesService._montoCandidato(c), haber: 0,
+      }));
+      const lineasNuevas = candidatos.map(c => ({
+        banco: c.banco, folio: c.folio ?? null, fecha: c.fecha, concepto: c.concepto,
+        monto: compensacionesInteresesService._montoCandidato(c), movimientoId: String(c._id),
+      }));
+
+      // eslint-disable-next-line no-await-in-loop -- cada mes/categoría se procesa uno
+      // por uno, necesita saber si ya hay una póliza borrador antes de decidir crear/actualizar.
+      const existente = await Poliza.findOne({ where: { tipo: def.tipo, rfc, ejercicio, periodo, estado: 'borrador' } });
+
+      let poliza;
+      if (existente) {
+        // eslint-disable-next-line no-await-in-loop
+        const full = await repo.findById(existente.id);
+        // La línea de cierre agregada es la única con haber > 0 (ver generarPoliza...
+        // más abajo, siempre 1 sola por póliza) — el resto son líneas de banco (debe > 0).
+        const cierreViejo   = full.movimientos.find(m => Number(m.haber) > 0);
+        const debitosViejos = full.movimientos.filter(m => Number(m.debe) > 0);
+        const totalNuevo    = (cierreViejo ? Number(cierreViejo.haber) : 0) + total;
+
+        const movimientosFinal = [
+          ...debitosViejos.map(m => ({ cuentaId: m.cuentaId, concepto: m.concepto, debe: m.debe, haber: 0 })),
+          ...movimientosNuevos,
+          { cuentaId: cuentaCierreId, concepto: def.conceptoCierre, debe: 0, haber: totalNuevo },
+        ];
+
+        // eslint-disable-next-line no-await-in-loop
+        poliza = await update(existente.id, { movimientos: movimientosFinal }, user);
+
+        const lineasFinal = [...(existente.compensacionesInteresesLineas || []), ...lineasNuevas];
+        // eslint-disable-next-line no-await-in-loop
+        await Poliza.update({ compensacionesInteresesLineas: lineasFinal }, { where: { id: existente.id } });
+      } else {
+        const movimientosFinal = [...movimientosNuevos, { cuentaId: cuentaCierreId, concepto: def.conceptoCierre, debe: 0, haber: total }];
+        // eslint-disable-next-line no-await-in-loop -- cada mes/tipo necesita su propio
+        // advisory lock/folio dentro de create(), igual que cada día en Traspasos.
+        poliza = await create({
+          tipo: def.tipo, fecha: fechaPoliza, concepto, ejercicio, periodo, rfc, movimientos: movimientosFinal,
+        }, user);
+        // eslint-disable-next-line no-await-in-loop
+        await Poliza.update({ compensacionesInteresesLineas: lineasNuevas }, { where: { id: poliza.id } });
+      }
+
+      const runIdPoliza = String(poliza.id);
+      const now = new Date();
+      const ops = candidatos.map(c => compensacionesInteresesService._buildIdentificarOp(c, user, runIdPoliza, now));
+      // eslint-disable-next-line no-await-in-loop
+      if (ops.length > 0) await ejecutarBulkConTransaccion(ops);
+
+      polizasResultado.push(poliza);
+    }
+  }
+
+  return polizasResultado;
+}
+
+/**
+ * Exporta a Excel CONTPAQ (formato P/M1) una póliza de Compensaciones/Intereses ya
+ * persistida — reusa generarPolizaContpaqCompensacionesIntereses() tal cual, alimentada
+ * por el snapshot guardado en Poliza.compensacionesInteresesLineas (mismo criterio que
+ * exportContpaqTraspasosXlsx).
+ */
+async function exportContpaqCompensacionesInteresesXlsx(id) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+  if (poliza.tipo !== 'B' && poliza.tipo !== 'G') {
+    throw new ValidationError('Esta póliza no es de tipo Compensaciones ni Intereses Ganados.');
+  }
+
+  const lineas = poliza.compensacionesInteresesLineas;
+  if (!Array.isArray(lineas) || lineas.length === 0) {
+    throw new ValidationError('Esta póliza no tiene movimientos guardados para exportar.');
+  }
+
+  const esCompensaciones = poliza.tipo === 'B';
+  const buffer = await compensacionesInteresesService.generarPolizaContpaqCompensacionesIntereses(
+    lineas.map(l => ({ banco: l.banco, deposito: l.monto, retiro: 0, concepto: l.concepto })),
+    {
+      folio: poliza.numero, fecha: poliza.fecha, concepto: poliza.concepto,
+      cuentaCierreCodigo: esCompensaciones
+        ? compensacionesInteresesService.CUENTA_OTROS_INGRESOS_CODIGO
+        : compensacionesInteresesService.CUENTA_INTERESES_GANADOS_CODIGO,
+      tagCierre: esCompensaciones
+        ? compensacionesInteresesService.TAG_CIERRE_COMPENSACIONES
+        : compensacionesInteresesService.TAG_CIERRE_INTERESES,
+      conceptoCierre: esCompensaciones
+        ? compensacionesInteresesService.CONCEPTO_CIERRE_COMPENSACIONES
+        : compensacionesInteresesService.CONCEPTO_CIERRE_INTERESES,
+    },
+  );
+  return { buffer, poliza };
+}
+
+/**
+ * Resuelve, para UNA línea de banco (débito) de una póliza de Compensaciones/Intereses
+ * ya persistida, el BankMovement de Mongo del que salió — para "ver movimientos" poder
+ * navegar hasta el registro real en Bancos. Más simple que el equivalente de Traspasos
+ * (resolverBankMovimientoDeTraspaso): acá el snapshot (`compensacionesInteresesLineas`)
+ * ya guarda el `movimientoId` de Mongo directo, no hace falta reconstruir por banco+folio.
+ * `PolizaMovimiento.orden` (1-based, ver generarYGuardarCompensacionesIntereses: primero
+ * N líneas de banco en el mismo orden que `lineas[]`, la última es el cierre agregado sin
+ * BankMovement de origen) ubica la entrada correcta del snapshot.
+ */
+async function resolverBankMovimientoDeCompensacionIntereses(id, movimientoId) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+  if (poliza.tipo !== 'B' && poliza.tipo !== 'G') {
+    throw new ValidationError('Esta póliza no es de tipo Compensaciones ni Intereses Ganados.');
+  }
+
+  const movimiento = poliza.movimientos.find(m => m.id === Number(movimientoId));
+  if (!movimiento) throw new NotFoundError('Movimiento de póliza');
+
+  const lineas = poliza.compensacionesInteresesLineas;
+  if (!Array.isArray(lineas) || lineas.length === 0) {
+    throw new ValidationError('Esta póliza no tiene movimientos guardados.');
+  }
+
+  const idx   = movimiento.orden - 1;
+  const linea = lineas[idx];
+  // idx === lineas.length es la línea de cierre agregada (Otros Ingresos/Intereses
+  // Ganados) — no sale de ningún BankMovement puntual, no hay a dónde navegar.
+  if (!linea) throw new ValidationError('Esta línea es el cierre de la póliza, no corresponde a un movimiento bancario puntual.');
+
+  const bankMovement = await BankMovement.findById(linea.movimientoId, { banco: 1 }).lean();
+  if (!bankMovement) throw new NotFoundError('Movimiento bancario relacionado');
+
+  return { bankMovementId: String(bankMovement._id), banco: bankMovement.banco };
+}
+
+/**
+ * Candidatas para "Cancelar todas" en la bandeja de Compensaciones/Intereses —
+ * todas las pólizas tipo 'B'/'G' en borrador del rfc, sin importar ejercicio/periodo
+ * (a diferencia de `listBorradorCandidatas`, acá SÍ puede haber varios meses a la vez
+ * por diseño, ver `generarYGuardarCompensacionesIntereses`/_agruparPorMes — no tiene
+ * sentido acotar a un solo periodo como hace Ingreso/Cobranza).
+ */
+async function listBorradorCandidatasCompensacionesIntereses({ rfc }) {
+  if (!rfc) throw new ValidationError('RFC requerido');
+
+  return Poliza.findAll({
+    where: { rfc, tipo: { [Op.in]: ['B', 'G'] }, estado: 'borrador' },
+    attributes: ['id', 'tipo', 'numero', 'concepto', 'fecha'],
+    order: [['fecha', 'DESC'], ['tipo', 'ASC'], ['numero', 'DESC']],
+  });
+}
+
+/**
+ * Cancela en bloque las pólizas de Compensaciones/Intereses en borrador del rfc —
+ * mismo patrón que `cancelarTodas` (Ingreso/Cobranza): reusa `cancel()` por póliza
+ * (misma reversión de identificación, mismo aviso de IVA PPD si aplicara), un error
+ * en una no detiene las demás. Si `polizaIds` viene con elementos, solo cancela esas
+ * (selección manual desde el modal); si no, cancela todas las de borrador del rfc.
+ */
+async function cancelarTodasCompensacionesIntereses({ rfc, polizaIds }, user, motivo) {
+  if (!rfc) throw new ValidationError('RFC requerido');
+
+  const where = { rfc, tipo: { [Op.in]: ['B', 'G'] }, estado: 'borrador' };
+  if (Array.isArray(polizaIds) && polizaIds.length) where.id = polizaIds;
+
+  const polizas = await Poliza.findAll({ where, attributes: ['id', 'numero', 'tipo'] });
+
+  let canceladas = 0;
+  const errores = [];
+  for (const p of polizas) {
+    try {
+      // eslint-disable-next-line no-await-in-loop -- un error en una póliza no
+      // debe detener el resto, mismo criterio que cancelarTodas.
+      await cancel(p.id, user, motivo);
+      canceladas++;
+    } catch (err) {
+      errores.push({ polizaId: p.id, numero: p.numero, tipo: p.tipo, error: err.message });
+    }
+  }
+
+  return { canceladas, errores, total: polizas.length };
+}
+
 async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
@@ -3026,6 +3393,11 @@ module.exports = {
   resolverCuentasPorCfdisIdentificados,
   // Pólizas Traspasos C.P. (2026-08-25)
   generarYGuardarTraspasos, exportContpaqTraspasosXlsx, resolverBankMovimientoDeTraspaso,
+  listBorradorCandidatasTraspasos, cancelarTodasTraspasos,
+  // Pólizas Compensaciones Bancarias / Intereses Ganados (2026-08-27)
+  generarYGuardarCompensacionesIntereses, exportContpaqCompensacionesInteresesXlsx,
+  resolverBankMovimientoDeCompensacionIntereses,
+  listBorradorCandidatasCompensacionesIntereses, cancelarTodasCompensacionesIntereses,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
 };

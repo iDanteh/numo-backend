@@ -14,7 +14,6 @@ const bankRuleRepo     = require('./repositories/bank-rule.repository');
 const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
 const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 const rbacStore = require('../../../shared/services/rbac-store');
-const polizaService      = require('../polizas/poliza.service');
 const { logger }         = require('../../../shared/utils/logger');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
@@ -1988,7 +1987,13 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   // crítico para la conciliación bancaria en sí).
   const uuidsRecienLigados = cleanLinks.map(l => l.folioFiscal).filter(Boolean);
   if (uuidsRecienLigados.length > 0) {
-    polizaService.resolverCuentasPorCfdisIdentificados(uuidsRecienLigados, mov.banco)
+    // require perezoso (no al tope del archivo): poliza.service.js requiere a su vez
+    // traspasos-internos.service.js, que requiere ESTE archivo (TODOS_MOTORES_HISTORICO)
+    // — un require de nivel de módulo acá crea un ciclo bank→poliza→traspasos-internos→bank
+    // que, según el orden de carga al arrancar, deja TODOS_MOTORES_HISTORICO en `undefined`
+    // (serializado como `null` en Mongo) y rompe revertirTraspasosInternos con
+    // "$in requires an array as a second argument, found: null" al cancelar una póliza T.
+    require('../polizas/poliza.service').resolverCuentasPorCfdisIdentificados(uuidsRecienLigados, mov.banco)
       .catch(err => logger.warn(`[BankService] resolverCuentasPorCfdisIdentificados falló: ${err.message}`));
   }
 

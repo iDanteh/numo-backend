@@ -2987,8 +2987,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // ticket cruzado de cientos NO cubre el total de la factura — tratarlo
     // como sí/no perdía el resto del cargo real, ver docstring de
     // `facturasVendedorCubiertas` en cobros-sucursal-puente.service.js).
-    const montoCubiertoPorSucursal = facturasVendedorCubiertas.get(cfdi.uuid?.toUpperCase() ?? '') ?? 0;
-    let montoCubiertoRestante = montoCubiertoPorSucursal;
+    // Por TICKET, no por la primera línea Caja/Bancos que aparezca — ver
+    // comentario equivalente en generarYGuardar (mismo bug real, mismo fix,
+    // 2026-08-27) y `facturasVendedorCubiertas.detalle` en
+    // cobros-sucursal-puente.service.js.
+    const cubiertoInfoProp = facturasVendedorCubiertas.get(cfdi.uuid?.toUpperCase() ?? '');
+    const montoCubiertoRestantePorTicketProp = new Map(
+      (cubiertoInfoProp?.detalle ?? []).map(d => [`${d.serieVenta}|${d.folioVenta}`, d.monto]),
+    );
     // Facturas PPD cobradas en otra sucursal: el Cargo a Clientes de la venta
     // sigue normal (sin tocar); se agrega ABAJO un asiento adicional (Abono a
     // Clientes + la línea de Cargo a la cuenta puente que ya viene en
@@ -3018,9 +3024,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // mostrarlo también duplicaría visualmente la venta (confirmado con el
       // usuario 2026-08-25, caso real MONSAN B0-260801098).
       const ocultarPorAnticipo = anticipoFolioRefProp && esLineaCargoPrincipal;
-      if (montoCubiertoRestante > 0 && esLineaCargoPrincipal && esLineaCajaOBancos && Number(m.debe) > 0) {
-        const reduccion = Math.min(montoCubiertoRestante, Number(m.debe));
-        montoCubiertoRestante = parseFloat((montoCubiertoRestante - reduccion).toFixed(2));
+      // Ver comentario equivalente en generarYGuardar sobre `ticketKeyLineaGuard`.
+      const ticketKeyLineaProp = m.folioVentaTicket != null
+        ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
+        : `${cfdi.serie}|${cfdi.folio}`;
+      const restanteTicketProp = montoCubiertoRestantePorTicketProp.get(ticketKeyLineaProp) ?? 0;
+      if (restanteTicketProp > 0 && esLineaCargoPrincipal && esLineaCajaOBancos && Number(m.debe) > 0) {
+        const reduccion = Math.min(restanteTicketProp, Number(m.debe));
+        montoCubiertoRestantePorTicketProp.set(ticketKeyLineaProp, parseFloat((restanteTicketProp - reduccion).toFixed(2)));
         const debeAjustado = parseFloat((Number(m.debe) - reduccion).toFixed(2));
         if (debeAjustado <= 0) continue; // esta línea quedó totalmente cubierta
         movimientosResult.push({
@@ -4300,8 +4311,18 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // recibió (parte de) su Cargo vía cobros-sucursal-puente.service.js, ese
     // monto se RESTA del Cargo normal de la regla (no se omite siempre por
     // completo — corrección 2026-08-06, Facturas Globales).
-    const montoCubiertoPorSucursalGuard = facturasVendedorCubiertasGuard.get(cfdi.uuid?.toUpperCase() ?? '') ?? 0;
-    let montoCubiertoRestanteGuard = montoCubiertoPorSucursalGuard;
+    //
+    // Por TICKET, no por la primera línea Caja/Bancos que aparezca (2026-08-27,
+    // bug real confirmado — Reforma 1-ago, Global D0-260800038: el ticket
+    // D0-260800176 se cubrió por $2,018.68 vía Tarjeta en otra sucursal, pero
+    // al restar de la primera línea encontrada en vez de la del ticket 176,
+    // la resta caía en el exceso "Venta Sin Cobro" y luego en el ticket
+    // D0-260800218 — ajenos al cruce, perdiendo $386.53 de efectivo genuino).
+    // Ver `facturasVendedorCubiertas.detalle` en cobros-sucursal-puente.service.js.
+    const cubiertoInfoGuard = facturasVendedorCubiertasGuard.get(cfdi.uuid?.toUpperCase() ?? '');
+    const montoCubiertoRestantePorTicketGuard = new Map(
+      (cubiertoInfoGuard?.detalle ?? []).map(d => [`${d.serieVenta}|${d.folioVenta}`, d.monto]),
+    );
     // Ver comentario equivalente en generarPropuesta: PPD cobrada en otra
     // sucursal — el Cargo a Clientes normal no se toca; se agrega abajo un
     // asiento adicional (Abono a Clientes + Cargo puente, que ya viene en movsPuenteGuard).
@@ -4319,9 +4340,17 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // Ver comentario equivalente en generarPropuesta: oculta el Cargo
       // Clientes cuando aplica el cierre de anticipo sin NC.
       const ocultarPorAnticipoGuard = anticipoFolioRefGuard && esLineaCargoPrincipalGuard;
-      if (montoCubiertoRestanteGuard > 0 && esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && Number(m.debe) > 0) {
-        const reduccion = Math.min(montoCubiertoRestanteGuard, Number(m.debe));
-        montoCubiertoRestanteGuard = parseFloat((montoCubiertoRestanteGuard - reduccion).toFixed(2));
+      // Ticket real de esta línea (por ticket dentro de una Factura Global) o,
+      // si no trae uno (factura normal de un solo ticket, o el exceso "Venta
+      // Sin Cobro"), la propia factura — ver comentario arriba sobre por qué
+      // ya no se resta de la primera línea Caja/Bancos que aparezca.
+      const ticketKeyLineaGuard = m.folioVentaTicket != null
+        ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
+        : `${cfdi.serie}|${cfdi.folio}`;
+      const restanteTicketGuard = montoCubiertoRestantePorTicketGuard.get(ticketKeyLineaGuard) ?? 0;
+      if (restanteTicketGuard > 0 && esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && Number(m.debe) > 0) {
+        const reduccion = Math.min(restanteTicketGuard, Number(m.debe));
+        montoCubiertoRestantePorTicketGuard.set(ticketKeyLineaGuard, parseFloat((restanteTicketGuard - reduccion).toFixed(2)));
         const debeAjustado = parseFloat((Number(m.debe) - reduccion).toFixed(2));
         if (debeAjustado <= 0) continue; // esta línea quedó totalmente cubierta
         todosLosMovimientos.push({

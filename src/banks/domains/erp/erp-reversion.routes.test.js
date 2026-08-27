@@ -61,7 +61,7 @@ const errorHandler = require('../../shared/middleware/error-handler');
 const BankMovement = require('../banks/BankMovement.model');
 const ErpReversion = require('./ErpReversion.model');
 const erpRoutes    = require('./erp.routes');
-const { emitToBanco } = require('../../shared/socket');
+const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 const globalConfigService = require('../../../shared/services/global-config.service');
 
@@ -222,6 +222,10 @@ describe('procesarReversionKore — procesa la reversión', () => {
     expect(emitToBanco).toHaveBeenCalledWith('BBVA', 'bank:movement:updated', expect.objectContaining({
       erpIds: [], erpLinks: [], status: 'no_identificado',
     }));
+    // Señal aparte para que la bandeja "Reversiones CxC" se autorefresque — global (emitToAll),
+    // no por banco, y desacoplada de bank:movement:updated (se emite una sola vez por webhook,
+    // no una vez por movimiento afectado).
+    expect(emitToAll).toHaveBeenCalledWith('erp:reversion:created', { reversionId: 'rev-1' });
   });
 
   test('2 movimientos afectados por el mismo erpId', async () => {
@@ -438,6 +442,9 @@ describe('procesarReversionKore — red de seguridad de atribución (2026-08-21,
         expect.objectContaining({ movementId: 'mov-B', tipo: 'sin_tocar' }),
       ],
     }));
+    // La bandeja debe enterarse IGUAL de que hubo un evento de reversión, aunque el resultado
+    // haya sido "sin_tocar" — es señal de "hay algo nuevo que listar/revisar", no de éxito.
+    expect(emitToAll).toHaveBeenCalledWith('erp:reversion:created', { reversionId: 'rev-sin-tocar' });
   });
 
   test('si la suma calculada SÍ reconcilia, sigue aplicando normalmente (sin falsos positivos)', async () => {

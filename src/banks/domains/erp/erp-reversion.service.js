@@ -4,7 +4,7 @@ const BankMovement = require('../banks/BankMovement.model');
 const ErpReversion  = require('./ErpReversion.model');
 const { aplicarLogicaErp }        = require('../banks/bank.service');
 const { resolvePrimeraIdentificacion } = require('../banks/identificacion-timestamp.util');
-const { emitToBanco }             = require('../../shared/socket');
+const { emitToBanco, emitToAll }  = require('../../shared/socket');
 const { logger }                  = require('../../../shared/utils/logger');
 // Mismo patrón ya usado por collection-request.service.js (erpRoutes._rangoDesdeFollo/
 // _sincronizarConRetry): erp.routes.js re-expone sus helpers internos en el objeto router
@@ -425,6 +425,14 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
       erpLinkAjustado:         r.erpLinkAjustado ?? null,
     })),
   });
+
+  // Señal para que la bandeja "Reversiones CxC" (admin-ops-panel) se autorefresque en vez de
+  // depender de que el usuario recargue a mano — no es específico de un banco (la bandeja lista
+  // reversiones de todos), por eso emitToAll y no emitToBanco. Solo un id: el frontend
+  // reconsulta vía GET /api/erp/cxc-reversiones, que ya está protegido por el permiso
+  // BANKS_ERP_REVERSIONES, así que no hay fuga de datos aunque el evento llegue a sockets sin
+  // ese permiso.
+  emitToAll('erp:reversion:created', { reversionId: reversion._id });
 
   return { reversionId: reversion._id, movimientosAfectados: movs.length, yaEstabaDesvinculada: false };
 }

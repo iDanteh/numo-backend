@@ -6,13 +6,14 @@
  * Responsabilidad única: comunicarse con el API externo del ERP.
  * No transforma datos ni accede a la base de datos.
  *
- * Configuración vía variables de entorno:
- *   ERP_API_BASE_URL  — URL base del ERP (ej. https://test.facturacion.koreingenieria.com)
- *   ERP_API_TOKEN     — Token de autenticación (KoreToken)
+ * Configuración: Configuraciones Globales, sección `bancos`, claves
+ * FACT_BASE_URL y TOKEN — mismas que usan erp.routes.js/erp-sync.service.js
+ * para el mismo ERP (migrado 2026-08-28, antes leía ERP_FACT_BASE_URL/
+ * ERP_TOKEN del .env directo vía config/env.js).
  */
 
 const axios  = require('axios');
-const config = require('../../config/env');
+const globalConfigService = require('../../shared/services/global-config.service');
 const { logger } = require('../../shared/utils/logger');
 
 const LIMITE_PG      = 100;    // registros por página — máximo que permite el ERP
@@ -23,18 +24,21 @@ const BACKOFF_BASE   = 2_000;  // espera inicial: 2s, 4s, 8s, 16s
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
- * Crea la instancia de Axios pre-configurada con la autenticación del ERP.
- * ERP_API_BASE_URL y ERP_API_TOKEN son validadas al arrancar en config/env.js,
- * por lo que aquí siempre estarán definidas.
+ * Crea la instancia de Axios pre-configurada con la autenticación del ERP,
+ * leyendo baseUrl/token de Configuraciones Globales (sección `bancos`).
  */
-const crearCliente = () => axios.create({
-  baseURL: config.erp.baseUrl,
-  timeout: TIMEOUT,
-  headers: {
-    Accept:        'application/json',
-    Authorization: config.erp.token,
-  },
-});
+const crearCliente = async () => {
+  const baseUrl = (await globalConfigService.getValue('bancos', 'FACT_BASE_URL')).replace(/\/$/, '');
+  const token   = await globalConfigService.getValue('bancos', 'TOKEN');
+  return axios.create({
+    baseURL: baseUrl,
+    timeout: TIMEOUT,
+    headers: {
+      Accept:        'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+  });
+};
 
 /** Espera ms milisegundos */
 const esperar = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -106,7 +110,7 @@ const clasificarError = (err) => {
  * @returns {Promise<{ facturas: object[], paginacion: object }>}
  */
 const fetchPagina = async ({ fechaInicio, fechaFin, pagina = 1 }) => {
-  const cliente = crearCliente();
+  const cliente = await crearCliente();
   const params = {
     fecha_inicio: fechaInicio,
     fecha_fin:    fechaFin,

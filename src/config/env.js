@@ -76,21 +76,6 @@ const config = Object.freeze({
     expiresIn: process.env.JWT_EXPIRES_IN || '24h',
   }),
 
-  /** Integración con el ERP externo */
-  erp: Object.freeze({
-    // cajaUrl (Kore Cajas/bancos) ya NO vive acá — migrado a Configuraciones Globales
-    // (sección `erp-caja`, ver shared/services/global-config.service.js). erp-sync.service.js
-    // lo lee de ahí directo, no de esta config.
-    baseUrl:  process.env.ERP_FACT_BASE_URL?.trim(),  // facturación — import CFDIs
-    // Normaliza el token: garantiza el prefijo "Bearer " independientemente
-    //cambio 2
-    // de si el .env lo incluye o no.
-    token: (() => {
-      const t = process.env.ERP_TOKEN?.trim() ?? '';
-      return t.startsWith('Bearer ') ? t : `Bearer ${t}`;
-    })(),
-  }),
-
   /** SAT — servicios web y configuración de descarga masiva */
   sat: Object.freeze({
     autenticacion:  process.env.SAT_DESCARGA_MASIVA_AUTENTICACION,

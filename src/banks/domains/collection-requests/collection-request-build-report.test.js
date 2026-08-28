@@ -76,15 +76,22 @@ function docBase(overrides = {}) {
   };
 }
 
-async function leerCeldaReporte(buffer, header) {
+async function leerCeldaReporte(buffer, header, { hoja = 'Autorizadas', fila = 2 } = {}) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
-  const ws = wb.getWorksheet('Autorizadas');
+  const ws = wb.getWorksheet(hoja);
   const headerRow = ws.getRow(1);
   let col = null;
   headerRow.eachCell((cell, colNumber) => { if (cell.value === header) col = colNumber; });
   if (col == null) throw new Error(`Columna "${header}" no encontrada en el reporte`);
-  return ws.getRow(2).getCell(col).value;
+  return ws.getRow(fila).getCell(col).value;
+}
+
+async function contarFilas(buffer, hoja) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const ws = wb.getWorksheet(hoja);
+  return ws.rowCount - 1; // sin contar el header
 }
 
 describe('buildReport() — populate real de formasPago.bankMovementId (regresión CRÍTICA de sdd-verify)', () => {
@@ -131,5 +138,64 @@ describe('buildReport() — populate real de formasPago.bankMovementId (regresi�
     const query = CollectionRequest.find.mock.results[0].value;
     const pathsPopulados = query.populate.mock.calls.map(call => call[0]);
     expect(pathsPopulados).toContain('formasPago.bankMovementId');
+  });
+});
+
+// 2026-08-28 — columnas "Minutos totales"/"Franja" + filtro opcional por franja (botón
+// "descargar esta franja" del histograma de distribución del dashboard). Ver
+// FRANJA_CORTES_MIN/_franjaLabel en collection-request.service.js.
+describe('buildReport() — columnas "Minutos totales"/"Franja" (2026-08-28)', () => {
+  test('solicitud identificada: "Minutos totales"/"Franja" calculados desde createdAt/resueltoAt', async () => {
+    // docBase: createdAt 2026-08-01T00:00, resueltoAt 2026-08-02T00:00 -> 1440 min.
+    const doc = docBase({ formasPago: [] });
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery([doc], {}));
+
+    const buffer = await buildReport({});
+
+    expect(await leerCeldaReporte(buffer, 'Minutos totales')).toBe(1440);
+    expect(await leerCeldaReporte(buffer, 'Franja')).toBe('Más de 120 min');
+  });
+
+  test('solicitud rechazada: "Minutos totales"/"Franja" quedan vacíos (el concepto no aplica)', async () => {
+    const doc = docBase({ status: 'rechazada', motivoRechazo: 'Comprobante inválido', formasPago: [] });
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery([doc], {}));
+
+    const buffer = await buildReport({});
+
+    expect(await leerCeldaReporte(buffer, 'Minutos totales', { hoja: 'Rechazadas' })).toBe('');
+    expect(await leerCeldaReporte(buffer, 'Franja', { hoja: 'Rechazadas' })).toBe('');
+  });
+
+  test('con desdeMin/hastaMin: excluye rechazadas por completo y solo entran las identificada dentro del rango de minutos', async () => {
+    const docDentro = docBase({
+      _id: 'cr-dentro', solicitudIdErp: 'SOL-DENTRO', formasPago: [],
+      createdAt: new Date('2026-08-01T00:00:00Z'), resueltoAt: new Date('2026-08-01T00:20:00Z'), // 20 min
+    });
+    const docFuera = docBase({
+      _id: 'cr-fuera', solicitudIdErp: 'SOL-FUERA', formasPago: [],
+      createdAt: new Date('2026-08-01T00:00:00Z'), resueltoAt: new Date('2026-08-01T01:00:00Z'), // 60 min
+    });
+    const docRechazada = docBase({
+      _id: 'cr-rechazada', solicitudIdErp: 'SOL-RECHAZADA', status: 'rechazada', formasPago: [],
+      createdAt: new Date('2026-08-01T00:00:00Z'), resueltoAt: new Date('2026-08-01T00:10:00Z'), // 10 min, pero rechazada
+    });
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery([docDentro, docFuera, docRechazada], {}));
+
+    const buffer = await buildReport({ desdeMin: 0, hastaMin: 30 });
+
+    expect(await contarFilas(buffer, 'Autorizadas')).toBe(1);
+    expect(await contarFilas(buffer, 'Rechazadas')).toBe(0);
+    expect(await leerCeldaReporte(buffer, 'Folio de solicitud')).toBe('SOL-DENTRO');
+  });
+
+  test('sin desdeMin: comportamiento sin cambios, ambas hojas con todo lo que vino de Mongo', async () => {
+    const docIdent = docBase({ _id: 'cr-1', formasPago: [] });
+    const docRech  = docBase({ _id: 'cr-2', status: 'rechazada', motivoRechazo: 'x', formasPago: [] });
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery([docIdent, docRech], {}));
+
+    const buffer = await buildReport({});
+
+    expect(await contarFilas(buffer, 'Autorizadas')).toBe(1);
+    expect(await contarFilas(buffer, 'Rechazadas')).toBe(1);
   });
 });

@@ -1570,9 +1570,9 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
     satStatus:                        'Vigente',
     isActive:                         true,
     'cfdiRelacionados.tipoRelacion':  '07',
-  }).select('uuid serie folio subTotal total cfdiRelacionados').lean();
+  }).select('uuid serie folio subTotal total fecha cfdiRelacionados').lean();
 
-  const mapa = new Map();
+  const matches = [];
   for (const eg of egresos) {
     const uuidsRel = (eg.cfdiRelacionados ?? [])
       .filter(r => r.tipoRelacion === '07')
@@ -1582,21 +1582,45 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
     if (!ventaMatch) continue;
     const total = Number(eg.total) || 0;
     if (total <= 0) continue;
-    const subTotal = Number(eg.subTotal) || total;
-    // Serie-folio del propio Egreso — se usa como referencia trazable en la
-    // columna C (serie) del cierre, para que quede ligado al documento SAT
-    // real en vez de solo al placeholder "OPA-..." (confirmado con el
-    // usuario 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
-    const serieFolio = [eg.serie, eg.folio].filter(Boolean).join('-') || null;
-    const prev = mapa.get(ventaMatch);
+    matches.push({
+      ventaUuid: ventaMatch,
+      uuid:      eg.uuid,
+      total,
+      subTotal:  Number(eg.subTotal) || total,
+      fecha:     eg.fecha,
+      // Serie-folio del propio Egreso — se usa como referencia trazable en la
+      // columna C (serie) del cierre, para que quede ligado al documento SAT
+      // real en vez de solo al placeholder "OPA-..." (confirmado con el
+      // usuario 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
+      serieFolio: [eg.serie, eg.folio].filter(Boolean).join('-') || null,
+    });
+  }
+  if (!matches.length) return new Map();
+
+  // Folio OPA real (BankMovement.erpLinks) resuelto con el monto/fecha del
+  // EGRESO en vez del CFDI del anticipo — encadenamiento pedido por el
+  // usuario 2026-08-28 ("para relacionarlo el ingreso busca al egreso y el
+  // egreso la opa"): más confiable porque no depende de que el CFDI del
+  // anticipo esté sincronizado en Mongo (caso pendiente real OPA-00665, ver
+  // memoria del proyecto — su CFDI nunca se sincronizó, pero el Egreso que
+  // aplica la venta sí puede existir).
+  const folioPorEgresoUuid = await _resolverReferenciaOpaPorMonto(
+    matches.map(m => ({ uuid: m.uuid, total: m.total, fecha: m.fecha })),
+  );
+
+  const mapa = new Map();
+  for (const m of matches) {
+    const folioOpa = folioPorEgresoUuid[m.uuid.toUpperCase()] ?? null;
+    const prev = mapa.get(m.ventaUuid);
     // Más de un Egreso aplicando al mismo anticipo/venta no debería ser
     // común, pero se suman para no perder datos si llegara a pasar.
     if (prev) {
-      prev.total    = parseFloat((prev.total + total).toFixed(2));
-      prev.subTotal = parseFloat((prev.subTotal + subTotal).toFixed(2));
-      prev.serieFolio = prev.serieFolio ?? serieFolio;
+      prev.total      = parseFloat((prev.total + m.total).toFixed(2));
+      prev.subTotal   = parseFloat((prev.subTotal + m.subTotal).toFixed(2));
+      prev.serieFolio = prev.serieFolio ?? m.serieFolio;
+      prev.folioOpa   = prev.folioOpa ?? folioOpa;
     } else {
-      mapa.set(ventaMatch, { total, subTotal, serieFolio });
+      mapa.set(m.ventaUuid, { total: m.total, subTotal: m.subTotal, serieFolio: m.serieFolio, folioOpa });
     }
   }
   return mapa;
@@ -3103,6 +3127,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         if (egresoAnticipoProp.subTotal > 0 && egresoAnticipoProp.total > egresoAnticipoProp.subTotal) {
           tasaIvaAnticipoEfectivaProp = (egresoAnticipoProp.total - egresoAnticipoProp.subTotal) / egresoAnticipoProp.subTotal;
         }
+        // Folio OPA resuelto con el monto/fecha del Egreso tiene prioridad
+        // sobre el resuelto por el CFDI del anticipo (puede no estar
+        // sincronizado en Mongo) — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
+        if (egresoAnticipoProp.folioOpa) anticipoFolioRefProp = egresoAnticipoProp.folioOpa;
       } else {
         montoAnticipoRealProp = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
       }
@@ -4522,6 +4550,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         if (egresoAnticipoGuard.subTotal > 0 && egresoAnticipoGuard.total > egresoAnticipoGuard.subTotal) {
           tasaIvaAnticipoEfectivaGuard = (egresoAnticipoGuard.total - egresoAnticipoGuard.subTotal) / egresoAnticipoGuard.subTotal;
         }
+        // Ver comentario equivalente en generarPropuesta.
+        if (egresoAnticipoGuard.folioOpa) anticipoFolioRefGuard = egresoAnticipoGuard.folioOpa;
       } else {
         montoAnticipoRealGuard = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
       }

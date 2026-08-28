@@ -1549,6 +1549,52 @@ async function _resolverReferenciaOpaPorMonto(anticiposCfdi) {
   }
   return mapa;
 }
+
+// Egreso SAT que formaliza la aplicación del anticipo directamente contra la
+// VENTA (tipoRelacion='07' apuntando al UUID de la propia venta — al revés
+// de la relación que trae la venta hacia SU anticipo). Cuando existe, trae el
+// monto REAL y exacto (subTotal/total propios) de lo aplicado — más confiable
+// que `montoAnticipoUsado` (desglose de Kore) cuando ese desglose no logra
+// identificar la porción de anticipo de un ticket (caso real 2026-08-28,
+// AIDA ISLAS ACEVEDO F0-260800426/Egreso F0-260800428: Kore no traía el
+// forma-de-pago "ANTICIPO" para ese ticket y el cierre OPA cayó al fallback
+// de 100%, tapando los $18.24 de Efectivo real cobrados aparte). Se prefiere
+// SIEMPRE sobre el dato de Kore cuando está disponible.
+async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
+  if (!ventaUuids?.length) return new Map();
+  const ventaSet = new Set(ventaUuids.map(u => (u || '').toUpperCase()));
+  const egresos = await CFDI.find({
+    'emisor.rfc':                     rfc,
+    tipoDeComprobante:                'E',
+    source:                           'SAT',
+    satStatus:                        'Vigente',
+    isActive:                         true,
+    'cfdiRelacionados.tipoRelacion':  '07',
+  }).select('uuid subTotal total cfdiRelacionados').lean();
+
+  const mapa = new Map();
+  for (const eg of egresos) {
+    const uuidsRel = (eg.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .map(u => (u || '').toUpperCase());
+    const ventaMatch = uuidsRel.find(u => ventaSet.has(u));
+    if (!ventaMatch) continue;
+    const total = Number(eg.total) || 0;
+    if (total <= 0) continue;
+    const subTotal = Number(eg.subTotal) || total;
+    const prev = mapa.get(ventaMatch);
+    // Más de un Egreso aplicando al mismo anticipo/venta no debería ser
+    // común, pero se suman para no perder datos si llegara a pasar.
+    if (prev) {
+      prev.total    = parseFloat((prev.total + total).toFixed(2));
+      prev.subTotal = parseFloat((prev.subTotal + subTotal).toFixed(2));
+    } else {
+      mapa.set(ventaMatch, { total, subTotal });
+    }
+  }
+  return mapa;
+}
 // Mismo texto que TIPO_ORIGEN_CARGO_ESPECIAL en cfdi-mapping.service.js/
 // poliza.service.js (duplicado a propósito) — usado aquí solo para la línea
 // consolidada de Puntos del batch (ver `puntosAcumuladosProp` más abajo).
@@ -2810,6 +2856,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     ),
     ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
   };
+  // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
+  // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
+  const ventaUuidsConAnticipoProp = cfdiConRegla
+    .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+      && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+    .map(({ cfdi }) => cfdi.uuid)
+    .filter(Boolean);
+  const egresosAnticipoPorVentaProp = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoProp, rfc);
 
   let saldoRestanteProp = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -3016,6 +3070,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     let movVentasAbonoProp = null;
     let movIvaAbonoProp    = null;
     let montoAnticipoRealProp = 0;
+    // Tasa efectiva para prorratear subtotal/IVA del cierre — 16% fijo salvo
+    // que haya un Egreso real (ver abajo), cuyo propio subTotal/total da la
+    // tasa exacta en vez de asumirla.
+    let tasaIvaAnticipoEfectivaProp = TASA_IVA_ANTICIPO;
     if (anticipoFolioRefProp) {
       movVentasAbonoProp = rule?.cuentaAbono
         ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
@@ -3025,7 +3083,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
         .find(Boolean) ?? null;
       const totalVentaProp = Number(movVentasAbonoProp?.haber ?? 0) + Number(movIvaAbonoProp?.haber ?? 0);
-      montoAnticipoRealProp = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
+      // Egreso SAT real (tipoRelacion=07 contra esta venta) tiene prioridad
+      // sobre `context.montoAnticipoUsado` (desglose de Kore) — es el dato
+      // oficial y exacto, y cubre los casos donde Kore no distingue la
+      // porción de anticipo (ver `_fetchEgresosAplicacionAnticipoPorVenta`).
+      const egresoAnticipoProp = egresosAnticipoPorVentaProp.get((cfdi.uuid || '').toUpperCase());
+      if (egresoAnticipoProp) {
+        montoAnticipoRealProp = Math.min(egresoAnticipoProp.total, totalVentaProp);
+        if (egresoAnticipoProp.subTotal > 0 && egresoAnticipoProp.total > egresoAnticipoProp.subTotal) {
+          tasaIvaAnticipoEfectivaProp = (egresoAnticipoProp.total - egresoAnticipoProp.subTotal) / egresoAnticipoProp.subTotal;
+        }
+      } else {
+        montoAnticipoRealProp = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
+      }
     }
     // Cuánto de ese monto real queda por "consumir" contra las líneas de
     // Cargo principal del loop de abajo — se va reduciendo línea a línea.
@@ -3150,7 +3220,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // ya se redujo directo en el loop de arriba, así que el asiento ya
       // cuadra sin ningún Abono de reversión (caso real 2026-08-28, AIDA
       // ISLAS ACEVEDO F0-260800426: $518.74 de $536.98, resto Efectivo real).
-      const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + TASA_IVA_ANTICIPO)) * 100) / 100;
+      const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
       const ivaAnticipoProp      = Math.round((montoAnticipoConsumidoProp - subtotalAnticipoProp) * 100) / 100;
       const refOpaProp = anticipoFolioRefProp;
       const baseInfoProp = {
@@ -4215,6 +4285,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     ),
     ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
   };
+  // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
+  // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta` (misma lógica que en
+  // generarPropuesta).
+  const ventaUuidsConAnticipoGuard = cfdiConRegla
+    .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+      && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+    .map(({ cfdi }) => cfdi.uuid)
+    .filter(Boolean);
+  const egresosAnticipoPorVentaGuard = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoGuard, rfc);
 
   let saldoRestanteGuard = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -4406,6 +4485,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     let movVentasAbonoGuard = null;
     let movIvaAbonoGuard    = null;
     let montoAnticipoRealGuard = 0;
+    // Ver comentario equivalente en generarPropuesta.
+    let tasaIvaAnticipoEfectivaGuard = TASA_IVA_ANTICIPO;
     if (anticipoFolioRefGuard) {
       movVentasAbonoGuard = rule?.cuentaAbono
         ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
@@ -4415,7 +4496,17 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
         .find(Boolean) ?? null;
       const totalVentaGuard = Number(movVentasAbonoGuard?.haber ?? 0) + Number(movIvaAbonoGuard?.haber ?? 0);
-      montoAnticipoRealGuard = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
+      // Egreso SAT real tiene prioridad sobre Kore — ver comentario
+      // equivalente en generarPropuesta.
+      const egresoAnticipoGuard = egresosAnticipoPorVentaGuard.get((cfdi.uuid || '').toUpperCase());
+      if (egresoAnticipoGuard) {
+        montoAnticipoRealGuard = Math.min(egresoAnticipoGuard.total, totalVentaGuard);
+        if (egresoAnticipoGuard.subTotal > 0 && egresoAnticipoGuard.total > egresoAnticipoGuard.subTotal) {
+          tasaIvaAnticipoEfectivaGuard = (egresoAnticipoGuard.total - egresoAnticipoGuard.subTotal) / egresoAnticipoGuard.subTotal;
+        }
+      } else {
+        montoAnticipoRealGuard = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
+      }
     }
     let montoAnticipoRestanteGuard = montoAnticipoRealGuard;
 
@@ -4503,7 +4594,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // Anticipo sin NC — ver comentario equivalente en generarYGuardar.
     if (anticipoFolioRefGuard && montoAnticipoConsumidoGuard > 0) {
       // CON dato real — ver comentario equivalente en generarYGuardar.
-      const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + TASA_IVA_ANTICIPO)) * 100) / 100;
+      const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
       const ivaAnticipoGuard      = Math.round((montoAnticipoConsumidoGuard - subtotalAnticipoGuard) * 100) / 100;
       const refOpaGuard = anticipoFolioRefGuard;
       const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;

@@ -4,7 +4,7 @@ const BankMovement = require('../banks/BankMovement.model');
 const ErpReversion  = require('./ErpReversion.model');
 const { aplicarLogicaErp }        = require('../banks/bank.service');
 const { resolvePrimeraIdentificacion } = require('../banks/identificacion-timestamp.util');
-const { emitToBanco }             = require('../../shared/socket');
+const { emitToBanco, emitToAll }  = require('../../shared/socket');
 const { logger }                  = require('../../../shared/utils/logger');
 // Mismo patrón ya usado por collection-request.service.js (erpRoutes._rangoDesdeFollo/
 // _sincronizarConRetry): erp.routes.js re-expone sus helpers internos en el objeto router
@@ -14,6 +14,69 @@ const erpRoutes = require('./erp.routes');
 
 // Mismo tamaño de página que ya usa el resto del módulo ERP (ver ERP_PAGE_SIZE en erp.routes.js).
 const ERP_REVERSION_PAGE_SIZE = 50;
+
+// 2026-08-21 (fix real, confirmado con caso real folioExterno 260800152/erpId
+// 6a8760103bfaed00011c8e68): Kore tarda en reflejar su PROPIO reverso en el endpoint que
+// reconsultamos — en ese caso real, más de 1min42s después de mandar el webhook, el
+// reverso seguía sin aparecer en /cuentas-pendientes. Sin este retry, `_aplicarReversionAMovimiento`
+// recalculaba con datos viejos y confirmaba como vigente un aporte que Kore ya había
+// revertido — la reversión quedaba "aplicada" en la bandeja sin bajar ni un peso.
+// Decisión explícita del usuario: reintentos DENTRO del mismo webhook (bloqueante), no un
+// job aparte — así Kore conserva su propia señal de éxito/fallo (un 500 real si algo truena),
+// en vez de recibir un 200 inmediato que oculte un fallo posterior en segundo plano.
+const REVERSION_CONFIRM_DELAYS_MS = [15_000, 30_000, 45_000];
+const _sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// ¿La reconsulta a Kore (`raw0.movimientos`) ya incluye la reversión puntual que Kore avisó
+// por webhook? Señal usada: la `fecha` que Kore manda en el webhook coincide, al segundo,
+// con la `fecha` de una entrada en su propio historial — confirmado con el caso real (la
+// entrada `REV ABO` trae la fecha EXACTA, al microsegundo, del payload del webhook). Sin
+// `fecha` en el payload no hay nada contra qué confirmar — se trata como "no confirmable" a
+// propósito (ver _sincronizarConfirmandoReversion: en ese caso se hace UN solo intento, sin
+// reintentos, mismo comportamiento que antes de este fix).
+function _reversionReflejadaEnKore(raw0, fechaReversion) {
+  if (!raw0 || !fechaReversion) return false;
+  const target = new Date(fechaReversion).getTime();
+  if (Number.isNaN(target)) return false;
+  return (raw0.movimientos ?? []).some(m => {
+    const t = new Date(m?.fecha).getTime();
+    return !Number.isNaN(t) && Math.abs(t - target) < 1000;
+  });
+}
+
+// Reconsulta a Kore reintentando con espera incremental (15s/30s/45s) hasta que la propia
+// reversión avisada por el webhook aparezca reflejada en la respuesta, o se agoten los
+// intentos — en ese caso se sigue con los datos más recientes disponibles (pueden seguir
+// desactualizados). Si Kore no mandó `fecha` en el webhook, se hace un único intento (no hay
+// forma de confirmar nada, reintentar sería solo esperar a ciegas).
+//
+// Devuelve `confirmada:false` en TODO caso donde no se haya podido verificar el match
+// contra Kore (agotados los reintentos, o sin `fecha` para comparar) — 2026-08-21, caso
+// real: Kore avisó una reversión de $100 (folioExterno 260800164) que JAMÁS aplicó de su
+// lado, ni siquiera minutos después de agotar los reintentos. Desde acá no hay forma de
+// distinguir "todavía no lo aplicó" de "falló y nunca lo va a aplicar" — ambos casos agotan
+// los reintentos por igual. `confirmada` es la señal que usa procesarReversionKore para NO
+// etiquetar esto como una reversión resuelta cuando en realidad nadie la verificó.
+async function _sincronizarConfirmandoReversion({ erpId, serieExterna, folioExterno, rango, fecha }) {
+  let raw0 = null;
+  const totalIntentos = REVERSION_CONFIRM_DELAYS_MS.length + 1;
+  for (let intento = 0; intento < totalIntentos; intento++) {
+    if (intento > 0) {
+      await _sleep(REVERSION_CONFIRM_DELAYS_MS[intento - 1]);
+    }
+    const { raw } = await erpRoutes._sincronizarConRetry({
+      serieExterna, folioExterno: String(folioExterno),
+      fechaDesde: rango.fechaDesde, fechaHasta: rango.fechaHasta,
+    });
+    raw0 = raw[0] ?? null;
+    if (fecha && _reversionReflejadaEnKore(raw0, fecha)) return { raw0, confirmada: true };
+    if (!fecha) return { raw0, confirmada: false };
+    logger.warn(`[erp-reversion] erpId=${erpId}: intento ${intento + 1}/${totalIntentos}, Kore todavía no refleja la reversión (fecha=${fecha}) en su propia consulta — reintentando.`);
+  }
+  const totalSegundos = REVERSION_CONFIRM_DELAYS_MS.reduce((a, b) => a + b, 0) / 1000;
+  logger.warn(`[erp-reversion] erpId=${erpId}: Kore no reflejó la reversión (fecha=${fecha}) tras ${totalIntentos} intentos (~${totalSegundos}s) — se continúa con los datos más recientes disponibles, marcada sin confirmar.`);
+  return { raw0, confirmada: false };
+}
 
 // Clona un subdocumento/entrada de Mongoose (o un objeto plano) para guardar un snapshot
 // que no cambie si el original se sigue mutando después. `.toObject()` cuando es un
@@ -114,7 +177,32 @@ async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExtern
 //     los números (saldoErpAportado/movimientosKore/saldoActual/etc.), el link NO se quita.
 //   - Si el recálculo da null o 0: ya no queda nada atribuible a este movimiento — se
 //     desvincula por completo (mismo comportamiento de siempre).
-async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExterno, raw0 }) {
+// 2026-08-21 (caso real, folioExterno 260800164): las entradas 'REV ABO' de Kore NUNCA
+// traen Aut/Numo propio — _montoSaldoLinkPorMovimiento adivina a qué movimiento pertenece
+// viendo si el monto cancela EXACTO el acumulador "mío" de ESE movimiento en particular. Con
+// 2+ movimientos pagando la misma CxC, si sus acumuladores coinciden en magnitud en el mismo
+// punto de la secuencia, AMBOS cálculos (corridos por separado, cada uno ciego del otro)
+// pueden reclamar la MISMA reversión como propia — bug preexistente de esa función
+// (2026-07-28), invisible hasta ahora porque los jobs de sync normales corren con "ratchet"
+// (nunca bajan un número, así que un 0 falso ahí no hace daño); la reversión corre SIN
+// ratchet a propósito, así que acá sí puede desvincular algo que sigue vigente de verdad.
+// Confirmado con el caso real: 2 movimientos dieron calculado=0 cuando Kore en verdad tenía
+// $150 pagados entre los dos (100+50, ninguno de los 2 abonos originales revertido).
+//
+// Chequeo: la SUMA de lo calculado para TODOS los movimientos de este erpId debe reconciliar
+// (misma tolerancia de $1 que el resto del dominio) contra lo que Kore dice pagado
+// (total - saldoActual). Si no reconcilia, el cálculo no es confiable — se prefiere no tocar
+// NINGÚN link (ni desvincular ni ajustar) antes que desvincular algo que puede seguir
+// vigente. Devuelve false (confiable) cuando no se puede verificar (raw0 sin total/saldoActual
+// numéricos) — no se bloquea por falta de dato, solo ante evidencia concreta de que está mal.
+function _atribucionInconsistente(raw0, calculosPorMovimiento) {
+  if (!raw0 || typeof raw0.total !== 'number' || typeof raw0.saldoActual !== 'number') return false;
+  const totalPagadoSegunKore = raw0.total - raw0.saldoActual;
+  const sumaCalculada = calculosPorMovimiento.reduce((a, b) => a + (b ?? 0), 0);
+  return Math.abs(sumaCalculada - totalPagadoSegunKore) > 1;
+}
+
+async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExterno, raw0, calculadoPrevio, calculadoBancarioPrevio } = {}) {
   if (!raw0) {
     // Sin datos frescos de Kore (no se pudo reconsultar — ver procesarReversionKore) — cae
     // al comportamiento anterior en vez de dejar el link con un número potencialmente
@@ -124,9 +212,12 @@ async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExt
 
   const link      = mov.erpLinks.find(l => l.erpId === erpId) ?? null;
   const esHumano  = erpRoutes._erpIdIdentificadoPorHumano(mov.identificadoPor, erpId);
-  const calculado = esHumano
+  // calculadoPrevio: ya viene calculado desde procesarReversionKore (necesita los valores de
+  // TODOS los movimientos por adelantado para el chequeo de reconciliación de arriba) — se
+  // reusa acá para no recalcular ni arriesgar que diverja del que ya se usó en el chequeo.
+  const calculado = calculadoPrevio !== undefined ? calculadoPrevio : (esHumano
     ? erpRoutes._montoSaldoLinkPorMovimiento(raw0, mov)
-    : erpRoutes._montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
+    : erpRoutes._montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion));
 
   // 2026-08-20: log de la decisión en sí — sin esto, un caso "se ajustó en vez de
   // desvincularse" no dejaba NINGÚN rastro de por qué (a diferencia de los casos de
@@ -141,10 +232,10 @@ async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExt
     return _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno });
   }
 
-  return _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado });
+  return _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado, calculadoBancarioPrevio });
 }
 
-async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado }) {
+async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado, calculadoBancarioPrevio }) {
   const link = mov.erpLinks.find(l => l.erpId === erpId);
 
   let mismatch = false;
@@ -153,7 +244,14 @@ async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExtern
 
   const erpLinkAntes = _snapshot(link);
 
-  const backfill  = erpRoutes._backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, calculado);
+  // 2026-08-21 (bug real, folioExterno 260800164/260800166): _backfillFormasPagoYFolioFiscal
+  // calcula `saldoPagado` (bancario-únicamente) con su propio criterio interno — sin pasarle
+  // calculadoBancarioPrevio, volvía a evaluar el movimiento AISLADO del resto (el mismo bug
+  // de atribución cruzada que ya se corrigió arriba para saldoErpAportado), dejando
+  // `saldoPagado` en $0 aunque saldoErpAportado ya viniera bien. El dropdown "CxC vinculadas"
+  // (banks.component.html) muestra justo `saldoPagado` con prioridad sobre saldoActual — por
+  // eso se veía "$0.00" pese a que el aporte real ya estaba correcto por dentro.
+  const backfill  = erpRoutes._backfillFormasPagoYFolioFiscal(link, raw0, mov, esHumano, calculado, calculadoBancarioPrevio);
   const retencion = erpRoutes._retencionVigente(raw0);
 
   link.movimientosKore  = erpRoutes._movimientosKoreDesde(raw0);
@@ -222,14 +320,15 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
   // construir el rango), se sigue igual con el comportamiento anterior (desvincular todo)
   // en vez de bloquear la reversión que Kore ya aplicó de su lado.
   let raw0 = null;
+  // 2026-08-21: por defecto false — solo se marca true cuando _sincronizarConfirmandoReversion
+  // efectivamente encuentra el match de `fecha` contra el historial de Kore. Ver
+  // ErpReversion.model.js#confirmadaEnKore para el porqué (caso real: reversión avisada por
+  // Kore que nunca aplicó de su lado).
+  let confirmadaEnKore = false;
   const rango = erpRoutes._rangoDesdeFollo(folioExterno);
   if (rango) {
     try {
-      const { raw } = await erpRoutes._sincronizarConRetry({
-        serieExterna, folioExterno: String(folioExterno),
-        fechaDesde: rango.fechaDesde, fechaHasta: rango.fechaHasta,
-      });
-      raw0 = raw[0] ?? null;
+      ({ raw0, confirmada: confirmadaEnKore } = await _sincronizarConfirmandoReversion({ erpId, serieExterna, folioExterno, rango, fecha }));
     } catch (err) {
       logger.error(`[erp-reversion] No se pudo reconsultar Kore en vivo para erpId=${erpId} (se sigue con el comportamiento de respaldo: desvincular por completo): ${err.message}`);
     }
@@ -240,9 +339,61 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
     logger.warn(`[erp-reversion] erpId=${erpId}: sin datos frescos de Kore, cada movimiento vinculado se desvinculará POR COMPLETO (comportamiento de respaldo).`);
   }
 
+  // 2026-08-21: calcular ANTES de tocar nada, y para los vínculos HUMANOS en una sola pasada
+  // cronológica compartida (_aportesPorErpIdCronologico, erp.routes.js) — reemplaza llamar
+  // _montoSaldoLinkPorMovimiento por separado para cada uno (ese enfoque no sabe nada de los
+  // otros movimientos que comparten la misma CxC, y puede atribuir la MISMA reversión sin
+  // Aut/Numo a 2 movimientos distintos si sus acumuladores privados coinciden en magnitud —
+  // bug real confirmado en producción, folioExterno 260800164/260800166, resuelto por la
+  // función cronológica en ambos casos). Vínculos de motor automático (esHumano=false) siguen
+  // con _montoSaldoLinkPorAutorizacion sin cambios — es un algoritmo distinto, sin el mismo
+  // riesgo de colisión (no hace neteo con signo entre movimientos).
+  // El chequeo de reconciliación (_atribucionInconsistente) de abajo sigue como red de
+  // seguridad final — ya no debería dispararse en los casos que motivaron este fix, pero
+  // queda para cualquier escenario todavía no visto.
+  let calculosPorMovimiento = null;
+  let calculosBancarioPorMovimiento = null;
+  if (raw0) {
+    const esHumanoPorMov = movs.map(mov => erpRoutes._erpIdIdentificadoPorHumano(mov.identificadoPor, erpId));
+    const movsHumanos    = movs.filter((mov, i) => esHumanoPorMov[i]);
+    const aportesHumanos = erpRoutes._aportesPorErpIdCronologico(raw0, movsHumanos);
+    // 2026-08-21: mismo pase cronológico compartido, filtrado a formas de pago bancarias —
+    // alimenta calculadoBancarioPrevio (ver _ajustarLinkTrasReversion) para que `saldoPagado`
+    // (bancario-únicamente, lo que muestra el dropdown "CxC vinculadas") no vuelva a caer en
+    // el cálculo aislado ambiguo.
+    const aportesHumanosBancario = erpRoutes._aportesPorErpIdCronologico(
+      raw0, movsHumanos, fp => erpRoutes._esFormaPagoBancariaKore(fp.nombreFormaPago),
+    );
+    calculosPorMovimiento = movs.map((mov, i) => {
+      if (!esHumanoPorMov[i]) return erpRoutes._montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
+      const idxEnHumanos = movsHumanos.indexOf(mov);
+      return aportesHumanos.get(idxEnHumanos) ?? null;
+    });
+    calculosBancarioPorMovimiento = movs.map((mov, i) => {
+      // Vínculos de motor (esHumano=false): _backfillFormasPagoYFolioFiscal usa `aporteNuevo`
+      // directo para saldoPagado en ese caso (sin distinguir bancario) — mismo criterio acá.
+      if (!esHumanoPorMov[i]) return calculosPorMovimiento[i];
+      const idxEnHumanos = movsHumanos.indexOf(mov);
+      return aportesHumanosBancario.get(idxEnHumanos) ?? null;
+    });
+  }
+
   const resultados = [];
-  for (const mov of movs) {
-    resultados.push(await _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExterno, raw0 }));
+  let atribucionConfiable = true;
+  if (calculosPorMovimiento && _atribucionInconsistente(raw0, calculosPorMovimiento)) {
+    atribucionConfiable = false;
+    const sumaCalculada = calculosPorMovimiento.reduce((a, b) => a + (b ?? 0), 0);
+    const totalPagadoSegunKore = raw0.total - raw0.saldoActual;
+    logger.error(`[erp-reversion] erpId=${erpId}: atribución ambigua entre ${movs.length} movimientos vinculados — suma calculada=${sumaCalculada}, Kore reporta pagado (total-saldoActual)=${totalPagadoSegunKore}. NO se toca ningún link (ni se desvincula ni se ajusta) — queda para revisión manual.`);
+    for (const mov of movs) {
+      resultados.push({ movementId: mov._id, tipo: 'sin_tocar', mismatch: false });
+    }
+  } else {
+    for (let i = 0; i < movs.length; i++) {
+      const calculadoPrevio         = calculosPorMovimiento ? calculosPorMovimiento[i] : undefined;
+      const calculadoBancarioPrevio = calculosBancarioPorMovimiento ? calculosBancarioPorMovimiento[i] : undefined;
+      resultados.push(await _aplicarReversionAMovimiento(movs[i], erpId, { serieExterna, folioExterno, raw0, calculadoPrevio, calculadoBancarioPrevio }));
+    }
   }
 
   const serieFolioMismatch = resultados.some(r => r.mismatch);
@@ -261,6 +412,8 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
     fechaKore:          fecha ?? null,
     serieExterna:       serieExterna ?? null,
     folioExterno:       folioExterno ?? null,
+    confirmadaEnKore,
+    atribucionConfiable,
     referencia:         referencia ?? null,
     serieFolioMismatch,
     payloadOriginal:    payloadOriginal ?? null,
@@ -272,6 +425,14 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
       erpLinkAjustado:         r.erpLinkAjustado ?? null,
     })),
   });
+
+  // Señal para que la bandeja "Reversiones CxC" (admin-ops-panel) se autorefresque en vez de
+  // depender de que el usuario recargue a mano — no es específico de un banco (la bandeja lista
+  // reversiones de todos), por eso emitToAll y no emitToBanco. Solo un id: el frontend
+  // reconsulta vía GET /api/erp/cxc-reversiones, que ya está protegido por el permiso
+  // BANKS_ERP_REVERSIONES, así que no hay fuga de datos aunque el evento llegue a sockets sin
+  // ese permiso.
+  emitToAll('erp:reversion:created', { reversionId: reversion._id });
 
   return { reversionId: reversion._id, movimientosAfectados: movs.length, yaEstabaDesvinculada: false };
 }

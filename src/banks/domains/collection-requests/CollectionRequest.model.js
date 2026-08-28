@@ -96,6 +96,22 @@ const collectionRequestSchema = new mongoose.Schema({
         default: null,
         index:   true,
       },
+      // Depósitos EXTRA para ESTA MISMA forma de pago (2026-08-27) — caso real
+      // confirmado contra Kore: una solicitud puede traer 1 sola formaPago pero
+      // 2+ comprobantes, porque el cliente pagó ese único monto con 2 depósitos
+      // bancarios separados (Kore no lo modela como 2 formasPago). `bankMovementId`
+      // arriba sigue siendo el depósito PRIMARIO (compatibilidad con todo el código
+      // que ya lo lee como valor único); acá van los adicionales. `montoEfectivo`
+      // = el `deposito` REAL de ese BankMovement (nunca un reparto inventado a
+      // mano) — ver identificar() en collection-request.service.js. Vacío en el
+      // camino feliz (1 depósito), no hace falta backfill para documentos viejos.
+      depositosAdicionales: {
+        type: [{
+          bankMovementId: { type: mongoose.Schema.Types.ObjectId, ref: 'BankMovement', required: true },
+          montoEfectivo:  { type: Number, required: true },
+        }],
+        default: [],
+      },
     }],
     default: [],
     validate: {

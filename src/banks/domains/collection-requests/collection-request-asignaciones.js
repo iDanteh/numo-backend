@@ -9,14 +9,23 @@
 const { BadRequestError } = require('../../shared/errors/AppError');
 
 // resolverAsignaciones — expande el body de identificar() (atajo escalar D3
-// o arreglo explícito) a Map<movIdString, formaPago[]>, en orden de
-// aparición dentro de formasPago[]. Clave de asignación = formaPagoDocId
-// (el _id del subdocumento Mongoose, D2) — formaPagoId NO es único dentro de
-// formasPago[] (dos entradas "transferencia" son legales en Modo 1).
+// o arreglo explícito) a { porMovId, movIdsPorFormaPago }. Clave de asignación
+// = formaPagoDocId (el _id del subdocumento Mongoose, D2) — formaPagoId NO es
+// único dentro de formasPago[] (dos entradas "transferencia" son legales en
+// Modo 1).
+//
+// Depósitos múltiples para UNA sola forma de pago (2026-08-27, caso real
+// confirmado contra Kore: 1 formaPago + 2 comprobantes porque el cliente pagó
+// ese único monto con 2 depósitos separados): el MISMO formaPagoDocId puede
+// aparecer en 2+ entradas de `asignaciones` — a diferencia de antes, ya NO se
+// sobreescribe, se ACUMULAN todos los movIds asignados a esa forma de pago
+// (`movIdsPorFormaPago`). `porMovId` sigue siendo Map<movId, formaPago[]> —
+// el MISMO objeto formaPago puede terminar en 2+ grupos (uno por cada
+// depósito que le toca), identificar() calcula cuánto aporta cada uno.
 //
 // Guard todo-o-nada (spec: "Todo-o-nada completeness gate"): rechaza ANTES
-// de tocar Kore/Mongo si CUALQUIER formaPago del request queda sin
-// bankMovementId asignado — no existe identificación parcial.
+// de tocar Kore/Mongo si CUALQUIER formaPago del request queda sin AL MENOS
+// un bankMovementId asignado — no existe identificación parcial.
 function resolverAsignaciones(cr, body) {
   const formasPago = cr.formasPago ?? [];
 
@@ -33,22 +42,26 @@ function resolverAsignaciones(cr, body) {
     asignaciones = Array.isArray(body?.asignaciones) ? body.asignaciones : [];
   }
 
-  const movIdPorFormaPagoDocId = new Map();
+  const movIdsPorFormaPagoDocId = new Map(); // formaPagoDocId -> string[] (sin duplicados)
   for (const a of asignaciones) {
     if (a?.formaPagoDocId == null || a?.bankMovementId == null) continue;
-    movIdPorFormaPagoDocId.set(String(a.formaPagoDocId), String(a.bankMovementId));
+    const docId = String(a.formaPagoDocId);
+    const movId = String(a.bankMovementId);
+    if (!movIdsPorFormaPagoDocId.has(docId)) movIdsPorFormaPagoDocId.set(docId, []);
+    const movIds = movIdsPorFormaPagoDocId.get(docId);
+    if (!movIds.includes(movId)) movIds.push(movId);
   }
 
   // formaPagoDocId desconocido ANTES del guard de completitud — es un error
   // de payload distinto de "falta asignar" (ej. id de otra solicitud).
   const idsValidos = new Set(formasPago.map(f => String(f._id)));
-  for (const docId of movIdPorFormaPagoDocId.keys()) {
+  for (const docId of movIdsPorFormaPagoDocId.keys()) {
     if (!idsValidos.has(docId)) {
       throw new BadRequestError(`formaPagoDocId desconocido: ${docId}`);
     }
   }
 
-  const sinAsignar = formasPago.filter(f => !movIdPorFormaPagoDocId.has(String(f._id)));
+  const sinAsignar = formasPago.filter(f => !movIdsPorFormaPagoDocId.has(String(f._id)));
   if (sinAsignar.length > 0) {
     const descripciones = sinAsignar.map(f => f.formaPagoDescripcion).join(', ');
     throw new BadRequestError(
@@ -58,13 +71,15 @@ function resolverAsignaciones(cr, body) {
     );
   }
 
-  const resultado = new Map();
+  const porMovId = new Map();
   for (const f of formasPago) {
-    const movId = movIdPorFormaPagoDocId.get(String(f._id));
-    if (!resultado.has(movId)) resultado.set(movId, []);
-    resultado.get(movId).push(f);
+    const movIds = movIdsPorFormaPagoDocId.get(String(f._id));
+    for (const movId of movIds) {
+      if (!porMovId.has(movId)) porMovId.set(movId, []);
+      porMovId.get(movId).push(f);
+    }
   }
-  return resultado;
+  return { porMovId, movIdsPorFormaPago: movIdsPorFormaPagoDocId };
 }
 
 function formatearMonto(n) {
@@ -112,13 +127,18 @@ function movimientosDe(cr) {
   const formasPago = cr.formasPago ?? [];
   const vistos   = new Set();
   const resultado = [];
-  for (const f of formasPago) {
-    const mov = f.bankMovementId;
-    if (mov == null) continue;
+  const agregar = (mov) => {
+    if (mov == null) return;
     const id = String(mov?._id ?? mov);
-    if (vistos.has(id)) continue;
+    if (vistos.has(id)) return;
     vistos.add(id);
     resultado.push(mov);
+  };
+  for (const f of formasPago) {
+    agregar(f.bankMovementId);
+    // Depósitos extra de UNA MISMA forma de pago (2026-08-27) — ver
+    // CollectionRequest.model.js#depositosAdicionales.
+    for (const d of (f.depositosAdicionales ?? [])) agregar(d.bankMovementId);
   }
   if (resultado.length === 0 && cr.bankMovementId != null) {
     return [cr.bankMovementId];

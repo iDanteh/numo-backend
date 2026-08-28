@@ -61,10 +61,11 @@ async function findAll(filters = {}) {
     where.id = { [Op.in]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
   } else if (filters.soloCobranza === false || filters.soloCobranza === 'false') {
     where.id = { [Op.notIn]: sequelize.literal(SUBQUERY_POLIZAS_PAGO) };
-    // Pólizas de Traspaso (tipo T, movimientos entre cuentas bancarias propias)
-    // no son Ingreso ni Cobranza — se excluyen de esta vista (confirmado con
-    // el usuario 2026-08-26). Si ya se filtró por un tipo explícito, se respeta.
-    if (!filters.tipo) where.tipo = { [Op.ne]: 'T' };
+    // Pólizas de Traspaso (T) ni de Compensaciones/Intereses Ganados (B/G,
+    // 2026-08-27) son Ingreso ni Cobranza — se excluyen de esta vista (mismo
+    // criterio confirmado con el usuario 2026-08-26 para T, extendido a B/G).
+    // Si ya se filtró por un tipo explícito, se respeta.
+    if (!filters.tipo) where.tipo = { [Op.notIn]: ['T', 'B', 'G'] };
   }
 
   const page  = Math.max(1, Number(filters.page)  || 1);
@@ -151,8 +152,15 @@ async function findByIdLight(id) {
   return Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE] });
 }
 
-async function findById(id) {
-  const poliza = await Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE] });
+// `transaction` opcional: create()/update() de abajo lo llaman DESDE DENTRO de su
+// propia transacción, antes de que confirme — sin pasarla acá, Poliza.findByPk usa
+// otra conexión del pool que bajo READ COMMITTED todavía no ve la fila recién creada
+// (isolation normal de Postgres, no un bug de Sequelize) y devuelve null. Bug real
+// encontrado 2026-08-25 al generar la primera póliza de Traspasos C.P. (create()
+// nunca se había ejercitado antes en la práctica — generarYGuardar(), el camino real
+// de generación desde CFDIs, no pasa por acá).
+async function findById(id, transaction) {
+  const poliza = await Poliza.findByPk(id, { include: [MOVIMIENTOS_INCLUDE], transaction });
   if (!poliza) return null;
 
   const uuids = [...new Set(
@@ -268,7 +276,7 @@ async function create(data) {
       await PolizaMovimiento.bulkCreate(rows, { transaction: t });
     }
 
-    return findById(poliza.id);
+    return findById(poliza.id, t);
   });
 }
 
@@ -292,7 +300,7 @@ async function update(id, data) {
       }
     }
 
-    return findById(id);
+    return findById(id, t);
   });
 }
 

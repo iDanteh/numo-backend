@@ -10,9 +10,9 @@ const Poliza = sequelize.define('Poliza', {
     autoIncrement: true,
   },
   tipo: {
-    type:      DataTypes.ENUM('A', 'I', 'E', 'D', 'N', 'C', 'P'),
+    type:      DataTypes.ENUM('A', 'I', 'E', 'D', 'N', 'C', 'P', 'T', 'B', 'G'),
     allowNull: false,
-    comment:   'A=Apertura I=Ingreso E=Egreso D=Diario N=Nomina C=Cheque P=Pago',
+    comment:   'A=Apertura I=Ingreso E=Egreso D=Diario N=Nomina C=Cheque P=Pago T=Traspasos entre cuentas propias B=Compensaciones Bancarias G=Intereses Ganados',
   },
   numero: {
     type:      DataTypes.INTEGER,
@@ -119,6 +119,25 @@ const Poliza = sequelize.define('Poliza', {
   // cobros-sucursal-puente.service.js. Se exporta en hoja aparte del CONTPAQ
   // (ver `_construirWorkbookPoliza`, poliza.service.js).
   pendientesPorFacturar: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
+  // Snapshot de los pares BBVA/contraparte (banco, folio, fecha, monto) que originaron
+  // esta póliza — SOLO tipo='T' (Traspasos entre cuentas propias). PolizaMovimiento
+  // guarda cuentaId (FK opaca), no el nombre del banco, así que sin este snapshot no
+  // se podría reconstruir el Excel CONTPAQ (filas P/M1) al exportar una póliza ya
+  // persistida. Mismo criterio que sustitutosExcluidos/pendientesPorFacturar arriba:
+  // JSONB nullable, solo lo usa el tipo de póliza al que corresponde.
+  traspasosPares: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
+  // Snapshot de las líneas de banco (banco, concepto, monto, folio) que originaron
+  // esta póliza — SOLO tipo='B' (Compensaciones Bancarias) o tipo='G' (Intereses
+  // Ganados), 2026-08-27. Mismo criterio que traspasosPares arriba: sin esto no se
+  // puede reconstruir el Excel CONTPAQ (la línea de cierre agregada tampoco vive en
+  // PolizaMovimiento con suficiente detalle para reproducir el M1 original).
+  compensacionesInteresesLineas: {
     type:      DataTypes.JSONB,
     allowNull: true,
   },

@@ -13,9 +13,18 @@
 // nada del comportamiento previo (mismo _id, mismo filter ACID, mismo status,
 // mismo identificadoPor) y sí agrega los campos nuevos correctamente.
 jest.mock('./BankMovement.model');
+// DATE_WINDOW_DAYS ahora viene de Configuraciones Globales (sección erp-caja) en vez
+// de process.env.ERP_DATE_WINDOW_DAYS — se mockea para no depender de Postgres real
+// en este test y reproducir el mismo default (30 días) que tenía el código viejo.
+jest.mock('../../../shared/services/global-config.service');
 
 const BankMovement = require('./BankMovement.model');
+const globalConfigService = require('../../../shared/services/global-config.service');
 const { ejecutarMatch } = require('./bank-autorizaciones.service');
+
+beforeEach(() => {
+  globalConfigService.getValue.mockResolvedValue('30');
+});
 
 // Mongoose Query real es chainable: find().select().lean() — se replica la
 // cadena con jest.fn() que devuelve el mismo objeto hasta el .lean() final,

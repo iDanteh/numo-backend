@@ -28,6 +28,7 @@ const userRoutes              = require('./banks/domains/users/user.routes');
 const polizaRoutes            = require('./banks/domains/polizas/poliza.routes');
 const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mapping.routes');
 const notificacionRoutes      = require('./banks/domains/notificaciones/notificacion.routes');
+const configRoutes            = require('./shared/routes/config.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -135,6 +136,7 @@ app.use('/api/users',                userRoutes);
 app.use('/api/polizas',              polizaRoutes);
 app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
 app.use('/api/notificaciones',       notificacionRoutes);
+app.use('/api/config',               configRoutes);
 
 // Visor module
 app.use('/api/auth',              authRoutes);

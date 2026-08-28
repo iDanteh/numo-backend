@@ -27,6 +27,9 @@ const CentroCosto       = require('./CentroCosto');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
 const Notificacion      = require('./Notificacion');
+const ConfigSection     = require('./ConfigSection');
+const GlobalConfig      = require('./GlobalConfig');
+const ConfigAuditLog    = require('./ConfigAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -55,6 +58,12 @@ CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movi
 /** Regla de mapeo CFDI usada al generar el movimiento */
 PolizaMovimiento.belongsTo(CfdiMappingRule, { foreignKey: 'reglaId', as: 'regla' });
 CfdiMappingRule.hasMany(PolizaMovimiento,   { foreignKey: 'reglaId', as: 'movimientosGenerados' });
+
+/** Configuraciones Globales — catálogo relacional estricto + auditoría */
+ConfigSection.hasMany(GlobalConfig,     { foreignKey: 'sectionId', as: 'configs', onDelete: 'CASCADE' });
+GlobalConfig.belongsTo(ConfigSection,   { foreignKey: 'sectionId', as: 'section' });
+GlobalConfig.hasMany(ConfigAuditLog,    { foreignKey: 'configId', as: 'auditLog', onDelete: 'CASCADE' });
+ConfigAuditLog.belongsTo(GlobalConfig,  { foreignKey: 'configId', as: 'config' });
 
 // ── Sincronización ────────────────────────────────────────────────────────────
 
@@ -255,6 +264,48 @@ async function syncModels() {
     END$$;
   `).catch(() => {});
 
+  // T = Traspasos entre cuentas propias (Pólizas Traspasos C.P., 2026-08-25) — mismo
+  // patrón idempotente que C/A arriba.
+  await Poliza.sequelize.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+        WHERE t.typname = 'enum_polizas_tipo' AND e.enumlabel = 'T'
+      ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'T'; END IF;
+    END$$;
+  `).catch(() => {});
+
+  // Snapshot de pares BBVA/contraparte para poder reconstruir el Excel CONTPAQ de una
+  // póliza de Traspasos ya persistida (ver Poliza.js#traspasosPares) — idempotente.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS traspasos_pares JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN traspasos_pares:', e.message));
+
+  // B/G = Compensaciones Bancarias / Intereses Ganados (Pólizas Compensaciones e
+  // Intereses C.P., 2026-08-27) — mismo patrón idempotente que T arriba.
+  await Poliza.sequelize.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+        WHERE t.typname = 'enum_polizas_tipo' AND e.enumlabel = 'B'
+      ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'B'; END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+        WHERE t.typname = 'enum_polizas_tipo' AND e.enumlabel = 'G'
+      ) THEN ALTER TYPE "enum_polizas_tipo" ADD VALUE 'G'; END IF;
+    END$$;
+  `).catch(() => {});
+
+  // Snapshot de líneas de banco para reconstruir el Excel CONTPAQ de una póliza de
+  // Compensaciones/Intereses ya persistida (ver Poliza.js#compensacionesInteresesLineas).
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS compensaciones_intereses_lineas JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN compensaciones_intereses_lineas:', e.message));
+
   // Folio real asociado en CONTPAQi tras importar el export (idempotente)
   await Poliza.sequelize.query(`
     ALTER TABLE polizas
@@ -326,6 +377,13 @@ async function syncModels() {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS extra_permissions TEXT[] NOT NULL DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN extra_permissions (users):', e.message));
+
+  // Configuraciones Globales (ver ConfigSection/GlobalConfig/ConfigAuditLog) — tablas
+  // nuevas, force:false para solo crearlas si no existen. Orden: ConfigSection primero
+  // (GlobalConfig tiene FK a ella), GlobalConfig antes que ConfigAuditLog (FK a GlobalConfig).
+  await ConfigSection.sync({ force: false });
+  await GlobalConfig.sync({ force: false });
+  await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

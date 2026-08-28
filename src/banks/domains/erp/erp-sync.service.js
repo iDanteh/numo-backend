@@ -1,14 +1,43 @@
 'use strict';
 
 const axios = require('axios');
+const globalConfigService = require('../../../shared/services/global-config.service');
 
-const ERP_CAJA_BASE_URL = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
-const ERP_TOKEN         = process.env.ERP_TOKEN || '';
+// Configuraciones Globales, sección `bancos` (runtime/DB, ver
+// shared/services/global-config.service.js — reemplaza lo que antes eran
+// ERP_CAJA_BASE_URL/ERP_CAJA_BASE_TEST_URL en el .env) — EXCLUSIVA de Bancos /
+// Solicitudes de Cobro / Reversiones (decisión explícita del usuario 2026-08-25:
+// una sección de Configuraciones Globales no debe mezclar uso con otros módulos).
+// Consolidada 2026-08-25 en una sola sección `bancos` junto con kore-formaspago
+// y erp-fact — antes eran 3 secciones separadas, ahora es una sola con más claves.
+//   - CUENTAS_PENDIENTES_URL: base para /cuentas-pendientes (sincronizarCuentasPendientes,
+//     usado por solicitudes de cobro/reversiones/bank-sync). Cada ambiente (staging/prod)
+//     tiene su propia fila en su propia Postgres con el valor correcto — ya no hace falta
+//     branching por DEPLOY_ENV en el código, cada Postgres ya sabe cuál le corresponde.
+//   - TOKEN: token del ERP para autenticar sincronizarCuentasPendientes — reemplaza
+//     process.env.ERP_TOKEN SOLO para esta función; visor/services/erp.service.js sigue
+//     leyendo el .env directo (mismo valor físico, dos consumidores independientes
+//     durante la migración gradual).
+async function _cuentasPendientesUrl() {
+  const valor = await globalConfigService.getValue('bancos', 'CUENTAS_PENDIENTES_URL');
+  return valor.replace(/\/$/, '');
+}
+
+async function _token() {
+  return globalConfigService.getValue('bancos', 'TOKEN');
+}
+
+// obtenerDesglosesCobroAlmacen/obtenerSaldosFavor/*PorCentro (más abajo) son EXCLUSIVAS
+// de Pólizas (cobros-sucursal-puente.service.js / cfdi-poliza-generator.service.js,
+// dominio cfdi-mapping/polizas) — fuera de alcance de Configuraciones Globales por
+// decisión explícita del usuario ("no quiero nada de pólizas por ahora"). Se quedan
+// leyendo el .env directo, tal cual estaban antes de que existiera Configuraciones
+// Globales — nunca deben pasar a `erp-caja` (esa sección es solo Bancos/Cobro/Reversiones).
+const ERP_CAJA_BASE_URL_POLIZAS = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
+const ERP_TOKEN_POLIZAS         = process.env.ERP_TOKEN || '';
 
 async function sincronizarCuentasPendientes(params = {}) {
-  if (!ERP_CAJA_BASE_URL) {
-    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
-  }
+  const cuentasPendientesUrl = await _cuentasPendientesUrl();
 
   const queryParams = {};
   if (params.fechaDesde)    queryParams.fechaDesde    = params.fechaDesde;
@@ -21,9 +50,9 @@ async function sincronizarCuentasPendientes(params = {}) {
 
   let response;
   try {
-    response = await axios.get(`${ERP_CAJA_BASE_URL}/cuentas-pendientes`, {
+    response = await axios.get(`${cuentasPendientesUrl}/cuentas-pendientes`, {
       params:  queryParams,
-      headers: { Authorization: `Bearer ${ERP_TOKEN}` },
+      headers: { Authorization: `Bearer ${await _token()}` },
       timeout: 15000,
     });
   } catch (axErr) {
@@ -65,8 +94,8 @@ async function _getConReintento(url, params, logLabel) {
     try {
       return await axios.get(url, {
         params,
-        headers: { Authorization: `Bearer ${ERP_TOKEN}` },
-        timeout: 60000,
+        headers: { Authorization: `Bearer ${ERP_TOKEN_POLIZAS}` },
+        timeout: 30000,
       });
     } catch (axErr) {
       const status    = axErr.response?.status;
@@ -159,9 +188,6 @@ function _leerCache(cache, clave) {
 // cobros-sucursal-puente.service.js para armar las líneas de Caja/Bancos
 // por identificar en la póliza de Ingreso.
 async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
-  if (!ERP_CAJA_BASE_URL) {
-    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
-  }
   if (!rfc) throw new Error('obtenerDesglosesCobroAlmacen: rfc requerido (aísla la caché por empresa)');
   if (!series?.length || !folios?.length) return [];
 
@@ -169,9 +195,10 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   const cacheado = _leerCache(_cacheAlmacen, clave);
   if (cacheado !== undefined) return cacheado;
 
+  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
   let response;
   try {
-    response = await _getConReintento(`${ERP_CAJA_BASE_URL}/desgloses-cobro/almacen`, {
+    response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
       series: series.join(','),
       folios: folios.join(','),
     }, '/desgloses-cobro/almacen');
@@ -197,9 +224,6 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
 // `formasPago` en /desgloses-cobro/almacen, sin saber a qué Devolución/venta
 // remontaban.
 async function obtenerSaldosFavor({ rfc, series, folios }) {
-  if (!ERP_CAJA_BASE_URL) {
-    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
-  }
   if (!rfc) throw new Error('obtenerSaldosFavor: rfc requerido (aísla la caché por empresa)');
   if (!series?.length || !folios?.length) return [];
 
@@ -207,9 +231,10 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   const cacheado = _leerCache(_cacheSaldosFavor, clave);
   if (cacheado !== undefined) return cacheado;
 
+  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
   let response;
   try {
-    response = await _getConReintento(`${ERP_CAJA_BASE_URL}/desgloses-cobro/saldos-favor`, {
+    response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
       series: series.join(','),
       folios: folios.join(','),
     }, '/desgloses-cobro/saldos-favor');
@@ -238,9 +263,6 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
 // ERP_CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
 // igual que el resto de los endpoints de este archivo.
 async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
-  if (!ERP_CAJA_BASE_URL) {
-    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
-  }
   if (!rfc) throw new Error('obtenerDesglosesCobroAlmacenPorCentro: rfc requerido (aísla la caché por empresa)');
   if (!centro || !fechaDesde || !fechaHasta) return [];
 
@@ -248,14 +270,12 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
   const cacheado = _leerCache(_cacheAlmacenPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  let cuentas;
+  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  let response;
   try {
-    const respuestas = await Promise.all(
-      _trocearRango(fechaDesde, fechaHasta).map(({ fechaDesde: fd, fechaHasta: fh }) => _getConReintento(
-        `${ERP_CAJA_BASE_URL}/desgloses-cobro/almacen`, { centro, fechaDesde: fd, fechaHasta: fh }, '/desgloses-cobro/almacen (por centro)',
-      )),
-    );
-    cuentas = respuestas.flatMap(r => r.data?.Data?.cuentas || []);
+    response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
+      centro, fechaDesde, fechaHasta,
+    }, '/desgloses-cobro/almacen (por centro)');
   } catch (axErr) {
     const status = axErr.response?.status;
     const body   = JSON.stringify(axErr.response?.data ?? {});
@@ -271,9 +291,6 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
 // Misma idea que `obtenerDesglosesCobroAlmacenPorCentro`, para saldos a
 // favor generados/usados en un centro y rango de fechas — ver notas ahí.
 async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
-  if (!ERP_CAJA_BASE_URL) {
-    throw new Error('ERP no configurado (ERP_CAJA_BASE_URL ausente)');
-  }
   if (!rfc) throw new Error('obtenerSaldosFavorPorCentro: rfc requerido (aísla la caché por empresa)');
   if (!centro || !fechaDesde || !fechaHasta) return [];
 
@@ -281,14 +298,12 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   const cacheado = _leerCache(_cacheSaldosFavorPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  let cuentas;
+  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  let response;
   try {
-    const respuestas = await Promise.all(
-      _trocearRango(fechaDesde, fechaHasta).map(({ fechaDesde: fd, fechaHasta: fh }) => _getConReintento(
-        `${ERP_CAJA_BASE_URL}/desgloses-cobro/saldos-favor`, { centro, fechaDesde: fd, fechaHasta: fh }, '/desgloses-cobro/saldos-favor (por centro)',
-      )),
-    );
-    cuentas = respuestas.flatMap(r => r.data?.Data?.cuentas || []);
+    response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
+      centro, fechaDesde, fechaHasta,
+    }, '/desgloses-cobro/saldos-favor (por centro)');
   } catch (axErr) {
     const status = axErr.response?.status;
     const body   = JSON.stringify(axErr.response?.data ?? {});

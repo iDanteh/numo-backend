@@ -318,30 +318,37 @@ async function applyRules(banco, soloSinCategoria = false) {
 
       // Categorizar: primera regla que aplica gana.
       // Reglas de prioridad de status:
-      //   'reclasificado' → categoría manual, se conserva (no se re-evalúan condiciones),
-      //                     pero si la regla vigente con ese nombre trae cambio de estado,
-      //                     ese cambio SÍ aplica — 'reclasificado' no está protegido de
-      //                     cambios de status, solo 'identificado' lo está.
+      //   'reclasificado' → SÍ se re-evalúan condiciones (2026-08-27, antes se
+      //                     conservaba la categoría manual sin tocar): si una regla
+      //                     matchea por concepto/depósito/etc., ajusta la categoría
+      //                     igual que a cualquier otro movimiento — permite que una
+      //                     regla nueva (ej. "SPEI COMPENSACION") alcance movimientos
+      //                     que alguien ya había reclasificado a mano. Si NINGUNA
+      //                     regla matchea, se conserva la categoría manual tal cual
+      //                     (NO se vacía) — protege categorías de asignación puramente
+      //                     manual sin condiciones (ver validarRegla: 'categorizar' sin
+      //                     condiciones = catálogo, nunca auto-matchea por diseño).
       //   'identificado'  → movimiento confirmado; la categoría puede actualizarse pero el
       //                     status NUNCA se toca (protege datos que dependen de este estado)
       let matchedCat         = null;
       let matchedCatEstado   = null; // estadoDestino de la catRule ganadora (si lo tiene)
       let matchedOcultaRoles = [];   // ocultarRoles de la catRule ganadora (si lo tiene)
-      if (mov.status === 'reclasificado') {
+      let matcheoPorRegla    = false;
+      for (const rule of catRules) {
+        if (matchRegla(mov, rule)) {
+          matchedCat       = rule.nombre;
+          // estadoDestino solo aplica si el movimiento no está identificado
+          matchedCatEstado   = !isIdentificado ? (rule.estadoDestino ?? null) : null;
+          matchedOcultaRoles = rule.ocultarRoles?.length ? rule.ocultarRoles : [];
+          matcheoPorRegla    = true;
+          break;
+        }
+      }
+      if (!matcheoPorRegla && mov.status === 'reclasificado') {
         matchedCat = mov.categoria ?? null;
         const catRuleVigente = matchedCat ? catRules.find(r => r.nombre === matchedCat) : null;
         matchedCatEstado   = catRuleVigente ? (catRuleVigente.estadoDestino ?? null) : null;
         matchedOcultaRoles = catRuleVigente?.ocultarRoles?.length ? catRuleVigente.ocultarRoles : [];
-      } else {
-        for (const rule of catRules) {
-          if (matchRegla(mov, rule)) {
-            matchedCat       = rule.nombre;
-            // estadoDestino solo aplica si el movimiento no está identificado
-            matchedCatEstado   = !isIdentificado ? (rule.estadoDestino ?? null) : null;
-            matchedOcultaRoles = rule.ocultarRoles?.length ? rule.ocultarRoles : [];
-            break;
-          }
-        }
       }
       // Cambiar estado: primero el estadoDestino de la catRule ganadora (si tiene),
       // luego las reglas cambiar_estado independientes.

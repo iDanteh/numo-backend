@@ -323,6 +323,27 @@ router.get('/reporte-anticipos',
   }),
 );
 
+// GET /api/cfdi-mapping/desglose-anticipos
+// Reporte de SOLO LECTURA (no genera ni toca ninguna póliza): desglose de
+// anticipos aplicados por venta, con la referencia OPA resuelta.
+// Query: rfc (requerido) + series,folios (arreglos paralelos separados por
+// coma) y/o fechaInicio,fechaFin (al menos uno de los 2 grupos es requerido)
+// + centroCostoId (opcional).
+router.get('/desglose-anticipos',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const { rfc, series, folios, centroCostoId, fechaInicio, fechaFin } = req.query;
+    res.json(await generator.desgloseAnticiposAplicados({
+      rfc,
+      series: series ? String(series).split(',').map(s => s.trim()).filter(Boolean) : undefined,
+      folios: folios ? String(folios).split(',').map(f => f.trim()).filter(Boolean) : undefined,
+      centroCostoId: centroCostoId != null ? Number(centroCostoId) : undefined,
+      fechaInicio, fechaFin,
+    }));
+  }),
+);
+
 // GET /api/cfdi-mapping/balance-general
 // Query: rfc, ejercicio, periodo
 router.get('/balance-general',

@@ -5132,9 +5132,121 @@ async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPro
   return { resultados };
 }
 
+/**
+ * GET /api/cfdi-mapping/desglose-anticipos — reporte de SOLO LECTURA (no
+ * genera ni toca ninguna póliza): para cada venta (factura tipo I) que aplicó
+ * uno o más anticipos (`cfdiRelacionados.tipoRelacion === '07'`), devuelve el
+ * desglose de anticipos aplicados con su referencia OPA resuelta — mismo
+ * mecanismo que usa `generarYGuardar` para el cierre "Aplicación de anticipo
+ * sin NC" (ver `_resolverReferenciaOpaPorMonto` y el bloque `anticipoFolioRefProp`
+ * más arriba), expuesto acá para consulta sin tener que generar la póliza.
+ *
+ * Filtros: `rfc` (requerido) + al menos uno de (`series`+`folios`) o
+ * (`fechaInicio`+`fechaFin`) — para no escanear todo el historial de la
+ * empresa sin acotar.
+ *   - `series`/`folios`: arreglos PARALELOS (mismo índice = misma venta),
+ *     misma convención que `obtenerDesglosesCobroAlmacen({ series, folios })`
+ *     en erp-sync.service.js.
+ *   - `centroCostoId`: acota a un centro de costo, resuelto por la serie de
+ *     facturación de la venta contra `CentroCosto.serieFacturacion`.
+ *   - `fechaInicio`/`fechaFin`: ISO, inclusive, sobre la fecha de la VENTA
+ *     (no de los anticipos).
+ *
+ * Cada anticipo trae `resuelto: true` cuando la referencia "OPA-..." viene del
+ * recibo bancario real (`BankMovement.erpLinks`, por monto+fecha) y `false`
+ * cuando es el placeholder armado con serie/folio del propio CFDI de anticipo
+ * (mismo criterio de `anticipoFolioPorUuidProp` en `generarYGuardar`) —
+ * `encontrado: false` cuando el uuid relacionado todavía no está sincronizado
+ * en Mongo, y por lo tanto no se puede resolver en absoluto.
+ */
+async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, fechaInicio, fechaFin }) {
+  if (!rfc) throw new BadRequestError('rfc es requerido');
+
+  const tieneSeriesFolios = Array.isArray(series) && series.length > 0 && Array.isArray(folios) && folios.length > 0;
+  if (!tieneSeriesFolios && (!fechaInicio || !fechaFin)) {
+    throw new BadRequestError('Se requiere series+folios, o fechaInicio+fechaFin, para acotar la búsqueda');
+  }
+  if (tieneSeriesFolios && series.length !== folios.length) {
+    throw new BadRequestError('series y folios deben tener la misma longitud (son arreglos paralelos)');
+  }
+
+  const filtro = {
+    'emisor.rfc':                     rfc,
+    tipoDeComprobante:                'I',
+    satStatus:                        'Vigente',
+    source:                           'SAT',
+    isActive:                         true,
+    'cfdiRelacionados.tipoRelacion':  '07',
+  };
+  if (tieneSeriesFolios) {
+    filtro.$or = series.map((s, i) => ({ serie: s, folio: String(folios[i]) }));
+  }
+  if (fechaInicio || fechaFin) {
+    filtro.fecha = {};
+    if (fechaInicio) filtro.fecha.$gte = new Date(fechaInicio);
+    if (fechaFin)    filtro.fecha.$lte = new Date(fechaFin);
+  }
+
+  const ventas = await CFDI.find(filtro)
+    .select('uuid serie folio fecha total cfdiRelacionados receptor.rfc receptor.nombre')
+    .sort({ fecha: 1 })
+    .lean();
+
+  if (!ventas.length) return { total: 0, ventas: [] };
+
+  const bySerieMap = await centrosSvc.resolveBySerieMap();
+  let ventasFiltradas = ventas;
+  if (centroCostoId != null) {
+    ventasFiltradas = ventas.filter(v => bySerieMap[v.serie]?.id === Number(centroCostoId));
+  }
+
+  // Resuelve TODOS los CFDIs de anticipo referenciados en un solo lote (no uno
+  // por venta) — mismo criterio de prefetch que el resto del generador.
+  const uuidsAnticipos = [...new Set(
+    ventasFiltradas.flatMap(v => (v.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
+  )];
+  const anticipoCfdis = uuidsAnticipos.length
+    ? await CFDI.find({ uuid: { $in: uuidsAnticipos } }).select('uuid serie folio total fecha').lean()
+    : [];
+  const anticipoPorUuid = Object.fromEntries(anticipoCfdis.map(c => [c.uuid.toUpperCase(), c]));
+  const referenciasResueltas = await _resolverReferenciaOpaPorMonto(anticipoCfdis);
+
+  const ventasResultado = ventasFiltradas.map(v => {
+    const cc = bySerieMap[v.serie] ?? null;
+    const anticipos = (v.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .map(uuid => {
+        const c = anticipoPorUuid[(uuid || '').toUpperCase()];
+        if (!c) return { uuid, encontrado: false };
+        const referenciaReal = referenciasResueltas[c.uuid.toUpperCase()] ?? null;
+        return {
+          uuid: c.uuid, serie: c.serie ?? '', folio: c.folio ?? '',
+          total: c.total, fecha: c.fecha,
+          referencia: referenciaReal ?? `OPA-${c.folio || c.serie || c.uuid}`,
+          resuelto:   !!referenciaReal,
+          encontrado: true,
+        };
+      });
+    return {
+      uuid: v.uuid, serie: v.serie ?? '', folio: v.folio ?? '',
+      fecha: v.fecha, total: v.total,
+      receptorRfc: v.receptor?.rfc ?? '', receptorNombre: v.receptor?.nombre ?? '',
+      centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+      totalAnticiposAplicados: anticipos.length,
+      anticipos,
+    };
+  });
+
+  return { total: ventasResultado.length, ventas: ventasResultado };
+}
+
 module.exports = {
   generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
+  desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
   _prefetchAjustesFacturaPropia,

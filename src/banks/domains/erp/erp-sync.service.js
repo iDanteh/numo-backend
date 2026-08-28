@@ -291,6 +291,7 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
     throw axErr;
   }
 
+  const cuentas = response.data?.Data?.cuentas || [];
   _cacheAlmacenPorCentro.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
@@ -319,6 +320,7 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
     throw axErr;
   }
 
+  const cuentas = response.data?.Data?.cuentas || [];
   _cacheSaldosFavorPorCentro.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }

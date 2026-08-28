@@ -921,9 +921,13 @@ async function identificar(id, body, user) {
       // el mensaje de Kore "el campo extra que empieza con numo"), pero Kore lo
       // rechazó explícitamente: "el dato adicional 'Numo' no está configurado en
       // la forma de pago DEPOSITO EN EFECTIVO... los campos configurados son:
-      // Num Recibo" (confirmado 2026-08-27 contra Kore real). No volver a
-      // agregar "Numo" aquí — el mensaje original de "campo que empieza con
-      // numo" se refería a otra cosa, no a este tag.
+      // Num Recibo" (confirmado 2026-08-27 Y RECONFIRMADO 2026-08-28 contra
+      // Kore real). No volver a agregar "Numo" aquí — es una contradicción del
+      // propio catálogo de Kore (su validación de comprobantes exige un campo
+      // que empiece con "numo" para esta forma de pago, pero el catálogo no
+      // tiene ninguno declarado salvo "Num Recibo", que no califica) — reportado
+      // a Kore, no se puede resolver desde este código. Ver
+      // collection-request.identificar.test.js para el caso de test.
       ...(esDepositoEfectivo ? {
         DatosAdicionales: [
           { Nombre: 'Num Recibo', Valor: autJuntos },

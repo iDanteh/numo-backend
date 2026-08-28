@@ -577,7 +577,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     cfdi.tipoDeComprobante === 'I' && cfdi.serie && cfdi.folio &&
     rule?.cuentaCargo && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo),
   );
-  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map() };
+  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map() };
   if (!candidatos.length) return vacio;
 
   // Día de CADA factura (México) — para filtrar cobros/usos que coinciden en
@@ -615,6 +615,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
+  // Monto REAL de anticipo aplicado a esta venta, desde el desglose de Kore
+  // (formaPago nombre='ANTICIPO', mismo claveSat='30' que "SALDO A FAVOR" pero
+  // texto distinto — confirmado con el usuario 2026-08-28, caso real AIDA
+  // ISLAS ACEVEDO F0-260800426: $518.74 de anticipo + $18.24 Efectivo real).
+  // Usado por el cierre "Aplicación de anticipo sin NC" (`anticipoFolioRefProp`
+  // más abajo) para NO asumir que el anticipo cubre el 100% de la venta —
+  // antes de este fix, si además había un tipoRelacion='07' en el CFDI, se
+  // cerraba el Abono Ingresos+IVA COMPLETO contra Anticipos/IVA-anticipo, sin
+  // dejar rastro del Efectivo real que sí entró aparte.
+  const anticipoUsado = new Map();    // `${serie}|${folio}` → monto
 
   // Fuente de los cobros reales — confirmado con el usuario 2026-08-14:
   // reemplaza POR COMPLETO la consulta por serie/folio propio cuando se
@@ -878,6 +888,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const diaCfdi = diaCfdiPorClave.get(key);
       const formasPago = [];
       let montoPuntos = 0;
+      let montoAnticipo = 0;
       for (const cobro of (cuenta.cobros ?? [])) {
         // El cobro debe haber ocurrido el MISMO día que la factura (con
         // tolerancia de ±1 día por facturación diferida — ver
@@ -989,6 +1000,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // (`saldoFavorUsado`, ver abajo), no este texto — mezclarlo en
           // `formasPago` lo trataría como Efectivo/Bancos real.
           if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+          // "ANTICIPO" (2026-08-28, caso real AIDA ISLAS ACEVEDO F0-260800426):
+          // mismo claveSat='30' que "SALDO A FAVOR" pero texto distinto — sin
+          // este filtro caía sin distinguir al bucket genérico de Bancos "por
+          // identificar" en `splitPorFormaPagoReal` (cfdi-mapping.service.js),
+          // como si fuera un depósito bancario real. Se acumula aparte
+          // (`montoAnticipo`) para el cierre de Anticipos/IVA-anticipo más
+          // abajo, con el monto REAL aplicado en vez de asumir el 100% de la
+          // venta.
+          if (/anticipo/i.test(fp.nombre ?? '')) { montoAnticipo += Number(fp.monto) || 0; continue; }
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
@@ -1045,6 +1065,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           const peso = (t.total || (totalPeso / targets.length)) / totalPeso;
           const montoRepartido = targets.length > 1 ? montoPuntos * peso : montoPuntos;
           puntosUsado.set(t.facturaKey, (puntosUsado.get(t.facturaKey) ?? 0) + montoRepartido);
+        }
+      }
+      if (montoAnticipo > 0) {
+        for (const t of targets) {
+          const peso = (t.total || (totalPeso / targets.length)) / totalPeso;
+          const montoRepartido = targets.length > 1 ? montoAnticipo * peso : montoAnticipo;
+          anticipoUsado.set(t.facturaKey, (anticipoUsado.get(t.facturaKey) ?? 0) + montoRepartido);
         }
       }
     }
@@ -1235,7 +1262,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     }
   }
 
-  return { desglosePagoReal, puntosUsado, saldoFavorUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap };
+  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap };
 }
 
 /**
@@ -1478,6 +1505,10 @@ const CODIGO_CUENTA_CLUB_TUBEROS      = '2103090002';
 // C0-260800064/065 contra el anticipo C0-260701665).
 const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
 const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
+// Mismo split subtotal/IVA que usa Saldo a Favor (TASA_IVA_SALDO_FAVOR en
+// cfdi-mapping.service.js) para prorratear el monto REAL de anticipo
+// aplicado (ver `montoAnticipoRealProp` más abajo).
+const TASA_IVA_ANTICIPO = 0.16;
 
 // Referencia real del RECIBO del anticipo (ej. "OPA-00766") — el ERP la
 // identifica con su propia serie/folio interno en `bank_movements.erpLinks`,
@@ -2732,7 +2763,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -2917,6 +2948,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       }
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
+      const anticipoUsadoCfdi = anticipoUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
+      if (anticipoUsadoCfdi > 0) context.montoAnticipoUsado = anticipoUsadoCfdi;
     }
     if (cfdi.tipoDeComprobante === 'P') {
       const doctosPago = doctosPagoMapProp.get(cfdi.uuid);
@@ -2970,6 +3003,33 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       }
       if (foliosResueltosProp.length) anticipoFolioRefProp = `OPA-${foliosResueltosProp.join('-')}${faltaAlgunoProp ? '-' : ''}`;
     }
+    // Monto REAL de anticipo aplicado (ver `anticipoUsado`/`montoAnticipoUsado`
+    // en `_prefetchAjustesFacturaPropia`) — cuando está disponible (viene del
+    // desglose real de Kore, formaPago nombre='ANTICIPO'), evita asumir que el
+    // anticipo cubre el 100% del Abono Ingresos+IVA (caso real 2026-08-28,
+    // AIDA ISLAS ACEVEDO F0-260800426: anticipo $518.74 de una venta de
+    // $536.98, resto $18.24 Efectivo real aparte). Capado al total de la venta
+    // para nunca generar un Cargo Anticipos mayor a la venta misma. Si no hay
+    // dato real (`=== 0`), el cierre de más abajo cae al comportamiento viejo
+    // (asumir 100%, ocultar+revertir el Cargo completo) — mismo criterio ya
+    // confirmado para los casos sin desglose real disponible (ej. PPD).
+    let movVentasAbonoProp = null;
+    let movIvaAbonoProp    = null;
+    let montoAnticipoRealProp = 0;
+    if (anticipoFolioRefProp) {
+      movVentasAbonoProp = rule?.cuentaAbono
+        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
+        : null;
+      movIvaAbonoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+        .filter(Boolean)
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
+        .find(Boolean) ?? null;
+      const totalVentaProp = Number(movVentasAbonoProp?.haber ?? 0) + Number(movIvaAbonoProp?.haber ?? 0);
+      montoAnticipoRealProp = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
+    }
+    // Cuánto de ese monto real queda por "consumir" contra las líneas de
+    // Cargo principal del loop de abajo — se va reduciendo línea a línea.
+    let montoAnticipoRestanteProp = montoAnticipoRealProp;
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver `puntosAcumuladosProp` — Puntos va consolidado, no individual).
@@ -3018,45 +3078,46 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // pero representan dinero que fue a Anticipos Otros/Club Tuberos, no
       // efectivo/tarjeta cobrado — un cruce de sucursal cubre esto último).
       const esLineaCajaOBancos = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
-      // Anticipo sin NC: el Cargo Clientes se queda en BD (necesario para el
-      // cuadre del asiento normal de la regla) pero se oculta del export — el
-      // cierre de abajo ya muestra lo relevante (Abono Anticipos/IVA-anticipo);
-      // mostrarlo también duplicaría visualmente la venta (confirmado con el
-      // usuario 2026-08-25, caso real MONSAN B0-260801098).
-      const ocultarPorAnticipo = anticipoFolioRefProp && esLineaCargoPrincipal;
+      // Anticipo sin NC — dos modos:
+      //  - CON dato real (`montoAnticipoRealProp > 0`): el Cargo se REDUCE
+      //    línea a línea más abajo (nunca se oculta) por el monto real
+      //    aplicado — el resto (si lo hay, ej. Efectivo real) queda visible
+      //    tal cual. El cierre de más abajo ya no necesita revertir nada con
+      //    un Abono oculto: reducir el Cargo directamente ya deja el asiento
+      //    cuadrado (caso real 2026-08-28, AIDA ISLAS ACEVEDO F0-260800426).
+      //  - SIN dato real (`=== 0`, ej. PPD o desglose no disponible): cae al
+      //    comportamiento viejo confirmado 2026-08-25 (caso MONSAN
+      //    B0-260801098) — se asume 100% cubierto, se oculta el Cargo
+      //    completo y el cierre de abajo lo revierte con un Abono oculto.
+      const ocultarPorAnticipoTotal = anticipoFolioRefProp && montoAnticipoRealProp === 0 && esLineaCargoPrincipal;
       // Ver comentario equivalente en generarYGuardar sobre `ticketKeyLineaGuard`.
       const ticketKeyLineaProp = m.folioVentaTicket != null
         ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
         : `${cfdi.serie}|${cfdi.folio}`;
       const restanteTicketProp = montoCubiertoRestantePorTicketProp.get(ticketKeyLineaProp) ?? 0;
-      if (restanteTicketProp > 0 && esLineaCargoPrincipal && esLineaCajaOBancos && Number(m.debe) > 0) {
-        const reduccion = Math.min(restanteTicketProp, Number(m.debe));
-        montoCubiertoRestantePorTicketProp.set(ticketKeyLineaProp, parseFloat((restanteTicketProp - reduccion).toFixed(2)));
-        const debeAjustado = parseFloat((Number(m.debe) - reduccion).toFixed(2));
-        if (debeAjustado <= 0) continue; // esta línea quedó totalmente cubierta
-        movimientosResult.push({
-          ...m,
-          debe:          debeAjustado,
-          centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
-          centroCostoId: ccProp?.id      ?? null,
-          ...(ocultarPorAnticipo ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
-          _cfdiInfo: {
-            uuid:              cfdi.uuid,
-            tipo:              cfdi.tipoDeComprobante,
-            emisor:            cfdi.emisor?.rfc,
-            total:             cfdi.total,
-            fecha:             cfdi.fecha,
-            sinRegla:          !!m._sinRegla,
-            comparisonStatus:  cfdi.lastComparisonStatus ?? null,
-          },
-        });
-        continue;
+      let debeFinalProp = Number(m.debe);
+      let huboReduccionProp = false;
+      if (esLineaCargoPrincipal && esLineaCajaOBancos && debeFinalProp > 0) {
+        if (restanteTicketProp > 0) {
+          const reduccion = Math.min(restanteTicketProp, debeFinalProp);
+          montoCubiertoRestantePorTicketProp.set(ticketKeyLineaProp, parseFloat((restanteTicketProp - reduccion).toFixed(2)));
+          debeFinalProp = parseFloat((debeFinalProp - reduccion).toFixed(2));
+          huboReduccionProp = true;
+        }
+        if (montoAnticipoRestanteProp > 0 && debeFinalProp > 0) {
+          const reduccionAnticipo = Math.min(montoAnticipoRestanteProp, debeFinalProp);
+          montoAnticipoRestanteProp = parseFloat((montoAnticipoRestanteProp - reduccionAnticipo).toFixed(2));
+          debeFinalProp = parseFloat((debeFinalProp - reduccionAnticipo).toFixed(2));
+          huboReduccionProp = true;
+        }
       }
+      if (huboReduccionProp && debeFinalProp <= 0) continue; // línea totalmente cubierta
       movimientosResult.push({
         ...m,
+        ...(huboReduccionProp ? { debe: debeFinalProp } : {}),
         centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
         centroCostoId: ccProp?.id      ?? null,
-        ...(ocultarPorAnticipo ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
+        ...(ocultarPorAnticipoTotal ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         _cfdiInfo: {
           uuid:              cfdi.uuid,
           tipo:              cfdi.tipoDeComprobante,
@@ -3077,16 +3138,57 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // cero, es la misma cuenta) — confirmado con el usuario 2026-08-25, caso
     // real MONSAN B0-260801098/EDDCAB96 (Anticipos/IVA-anticipo van de CARGO,
     // no de abono — corrige un intento anterior con la polaridad invertida).
-    if (anticipoFolioRefProp) {
-      const movVentasAbonoProp = rule?.cuentaAbono
-        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
-        : null;
-      // Puede ser PPD (`rule.cuentaIvaPPD`, IVA por cobrar) o PUE (`rule.cuentaIva`) —
-      // se prueban ambas cuentas, la que traiga un haber real gana.
-      const movIvaAbonoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
-        .filter(Boolean)
-        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
-        .find(Boolean) ?? null;
+    // Monto REALMENTE consumido en el loop de arriba (nunca el total "pedido"
+    // — si la regla no usa Caja/Bancos como cuentaCargo, o el Cargo real ya
+    // era menor al anticipo, la reducción no pudo aplicarse por completo).
+    // Usar esto en vez de `montoAnticipoRealProp` garantiza que el cierre
+    // NUNCA descuadre el asiento, sin importar la forma de la regla.
+    const montoAnticipoConsumidoProp = parseFloat((montoAnticipoRealProp - montoAnticipoRestanteProp).toFixed(2));
+    if (anticipoFolioRefProp && montoAnticipoConsumidoProp > 0) {
+      // CON dato real: split subtotal/IVA proporcional (16%, mismo criterio
+      // que Saldo a Favor) del monto REALMENTE aplicado — el Cargo principal
+      // ya se redujo directo en el loop de arriba, así que el asiento ya
+      // cuadra sin ningún Abono de reversión (caso real 2026-08-28, AIDA
+      // ISLAS ACEVEDO F0-260800426: $518.74 de $536.98, resto Efectivo real).
+      const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + TASA_IVA_ANTICIPO)) * 100) / 100;
+      const ivaAnticipoProp      = Math.round((montoAnticipoConsumidoProp - subtotalAnticipoProp) * 100) / 100;
+      const refOpaProp = anticipoFolioRefProp;
+      const baseInfoProp = {
+        centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
+        _cfdiInfo: {
+          uuid: cfdi.uuid, tipo: cfdi.tipoDeComprobante, emisor: cfdi.emisor?.rfc,
+          total: cfdi.total, fecha: cfdi.fecha, sinRegla: false,
+          comparisonStatus: cfdi.lastComparisonStatus ?? null,
+        },
+      };
+      if (subtotalAnticipoProp > 0) {
+        movimientosResult.push({
+          ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
+          concepto: refOpaProp, serie: refOpaProp, debe: subtotalAnticipoProp, haber: 0,
+        });
+      }
+      if (ivaAnticipoProp > 0) {
+        movimientosResult.push({
+          ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
+          concepto: refOpaProp, serie: refOpaProp, debe: ivaAnticipoProp, haber: 0,
+        });
+      }
+    } else if (anticipoFolioRefProp && montoAnticipoRealProp === 0) {
+      // SIN dato real en absoluto (fallback, comportamiento viejo confirmado
+      // 2026-08-25, caso MONSAN B0-260801098/EDDCAB96): se asume que el
+      // anticipo cubre el 100% del Abono Ingresos+IVA de la regla — el Cargo
+      // principal se ocultó completo en el loop de arriba
+      // (`ocultarPorAnticipoTotal`, misma condición `=== 0`) y este bloque lo
+      // revierte con un Abono a Clientes oculto (neto cero).
+      //
+      // NOTA: si `montoAnticipoRealProp > 0` pero `montoAnticipoConsumidoProp`
+      // dio 0 (la regla no usa Caja/Bancos como cuentaCargo — no debería pasar
+      // en la práctica, ver `_prefetchAjustesFacturaPropia`), NINGUNA rama de
+      // este `if` aplica a propósito: el Cargo principal nunca se ocultó en el
+      // loop (esa condición también exige `=== 0`), así que revertirlo aquí
+      // duplicaría visualmente la venta en vez de corregirla — se prefiere no
+      // registrar el cierre a arriesgar un asiento incorrecto.
       const montoVentasAnticipoProp = movVentasAbonoProp?.haber ?? 0;
       const montoIvaAnticipoProp    = movIvaAbonoProp?.haber ?? 0;
       const refOpaProp = anticipoFolioRefProp; // ya viene armado como "OPA-..." (real o placeholder)
@@ -4072,7 +4174,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -4252,6 +4354,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       }
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
+      const anticipoUsadoCfdi = anticipoUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
+      if (anticipoUsadoCfdi > 0) context.montoAnticipoUsado = anticipoUsadoCfdi;
     }
     if (cfdi.tipoDeComprobante === 'P') {
       const doctosPago = doctosPagoMapGuard.get(cfdi.uuid);
@@ -4297,6 +4401,23 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       }
       if (foliosResueltosGuard.length) anticipoFolioRefGuard = `OPA-${foliosResueltosGuard.join('-')}${faltaAlgunoGuard ? '-' : ''}`;
     }
+    // Monto REAL de anticipo aplicado — ver comentario equivalente en
+    // generarYGuardar (`montoAnticipoRealProp`).
+    let movVentasAbonoGuard = null;
+    let movIvaAbonoGuard    = null;
+    let montoAnticipoRealGuard = 0;
+    if (anticipoFolioRefGuard) {
+      movVentasAbonoGuard = rule?.cuentaAbono
+        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
+        : null;
+      movIvaAbonoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+        .filter(Boolean)
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
+        .find(Boolean) ?? null;
+      const totalVentaGuard = Number(movVentasAbonoGuard?.haber ?? 0) + Number(movIvaAbonoGuard?.haber ?? 0);
+      montoAnticipoRealGuard = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
+    }
+    let montoAnticipoRestanteGuard = montoAnticipoRealGuard;
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver comentario equivalente en generarPropuesta).
@@ -4337,9 +4458,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const esLineaCajaOBancosGuard = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
       // eslint-disable-next-line no-unused-vars
       const { _saldoUsado, ...cleanM } = m;
-      // Ver comentario equivalente en generarPropuesta: oculta el Cargo
-      // Clientes cuando aplica el cierre de anticipo sin NC.
-      const ocultarPorAnticipoGuard = anticipoFolioRefGuard && esLineaCargoPrincipalGuard;
+      // Ver comentario equivalente en generarYGuardar (`ocultarPorAnticipoTotal`):
+      // CON dato real, el Cargo se reduce línea a línea (nunca se oculta);
+      // SIN dato real, cae al comportamiento viejo (ocultar el Cargo completo).
+      const ocultarPorAnticipoTotalGuard = anticipoFolioRefGuard && montoAnticipoRealGuard === 0 && esLineaCargoPrincipalGuard;
       // Ticket real de esta línea (por ticket dentro de una Factura Global) o,
       // si no trae uno (factura normal de un solo ticket, o el exceso "Venta
       // Sin Cobro"), la propia factura — ver comentario arriba sobre por qué
@@ -4348,41 +4470,66 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
         : `${cfdi.serie}|${cfdi.folio}`;
       const restanteTicketGuard = montoCubiertoRestantePorTicketGuard.get(ticketKeyLineaGuard) ?? 0;
-      if (restanteTicketGuard > 0 && esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && Number(m.debe) > 0) {
-        const reduccion = Math.min(restanteTicketGuard, Number(m.debe));
-        montoCubiertoRestantePorTicketGuard.set(ticketKeyLineaGuard, parseFloat((restanteTicketGuard - reduccion).toFixed(2)));
-        const debeAjustado = parseFloat((Number(m.debe) - reduccion).toFixed(2));
-        if (debeAjustado <= 0) continue; // esta línea quedó totalmente cubierta
-        todosLosMovimientos.push({
-          ...cleanM,
-          debe:           debeAjustado,
-          cuentaFaltante: cleanM.cuentaId == null,
-          centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
-          centroCostoId:  cc?.id    ?? null,
-          ...(ocultarPorAnticipoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
-        });
-        continue;
+      let debeFinalGuard = Number(m.debe);
+      let huboReduccionGuard = false;
+      if (esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && debeFinalGuard > 0) {
+        if (restanteTicketGuard > 0) {
+          const reduccion = Math.min(restanteTicketGuard, debeFinalGuard);
+          montoCubiertoRestantePorTicketGuard.set(ticketKeyLineaGuard, parseFloat((restanteTicketGuard - reduccion).toFixed(2)));
+          debeFinalGuard = parseFloat((debeFinalGuard - reduccion).toFixed(2));
+          huboReduccionGuard = true;
+        }
+        if (montoAnticipoRestanteGuard > 0 && debeFinalGuard > 0) {
+          const reduccionAnticipo = Math.min(montoAnticipoRestanteGuard, debeFinalGuard);
+          montoAnticipoRestanteGuard = parseFloat((montoAnticipoRestanteGuard - reduccionAnticipo).toFixed(2));
+          debeFinalGuard = parseFloat((debeFinalGuard - reduccionAnticipo).toFixed(2));
+          huboReduccionGuard = true;
+        }
       }
+      if (huboReduccionGuard && debeFinalGuard <= 0) continue; // línea totalmente cubierta
       todosLosMovimientos.push({
         ...cleanM,
+        ...(huboReduccionGuard ? { debe: debeFinalGuard } : {}),
         cuentaFaltante: cleanM.cuentaId == null,
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
-        ...(ocultarPorAnticipoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
+        ...(ocultarPorAnticipoTotalGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
       });
     }
 
-    // Anticipo sin NC — ver comentario equivalente en generarPropuesta.
-    if (anticipoFolioRefGuard) {
-      const movVentasAbonoGuard = rule?.cuentaAbono
-        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
-        : null;
-      // Puede ser PPD (`rule.cuentaIvaPPD`) o PUE (`rule.cuentaIva`) — ver
-      // comentario equivalente en generarPropuesta.
-      const movIvaAbonoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
-        .filter(Boolean)
-        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
-        .find(Boolean) ?? null;
+    // Monto REALMENTE consumido en el loop — ver comentario equivalente en
+    // generarYGuardar (`montoAnticipoConsumidoProp`).
+    const montoAnticipoConsumidoGuard = parseFloat((montoAnticipoRealGuard - montoAnticipoRestanteGuard).toFixed(2));
+    // Anticipo sin NC — ver comentario equivalente en generarYGuardar.
+    if (anticipoFolioRefGuard && montoAnticipoConsumidoGuard > 0) {
+      // CON dato real — ver comentario equivalente en generarYGuardar.
+      const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + TASA_IVA_ANTICIPO)) * 100) / 100;
+      const ivaAnticipoGuard      = Math.round((montoAnticipoConsumidoGuard - subtotalAnticipoGuard) * 100) / 100;
+      const refOpaGuard = anticipoFolioRefGuard;
+      const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
+      const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
+      const baseInfoGuard = {
+        centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
+      };
+      if (subtotalAnticipoGuard > 0) {
+        todosLosMovimientos.push({
+          ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
+          concepto: refOpaGuard, serie: refOpaGuard, debe: subtotalAnticipoGuard, haber: 0,
+          cuentaFaltante: cuentaAnticiposIdGuard == null,
+        });
+      }
+      if (ivaAnticipoGuard > 0) {
+        todosLosMovimientos.push({
+          ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
+          concepto: refOpaGuard, serie: refOpaGuard, debe: ivaAnticipoGuard, haber: 0,
+          cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
+        });
+      }
+    } else if (anticipoFolioRefGuard && montoAnticipoRealGuard === 0) {
+      // SIN dato real en absoluto (fallback) — ver comentario equivalente en
+      // generarYGuardar sobre por qué el caso "real>0 pero consumido=0" no
+      // entra a ninguna rama a propósito.
       const montoVentasAnticipoGuard = movVentasAbonoGuard?.haber ?? 0;
       const montoIvaAnticipoGuard    = movIvaAbonoGuard?.haber ?? 0;
       const refOpaGuard = anticipoFolioRefGuard; // ya viene armado como "OPA-..." (real o placeholder)

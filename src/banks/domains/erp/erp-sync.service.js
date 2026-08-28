@@ -29,12 +29,18 @@ async function _token() {
 
 // obtenerDesglosesCobroAlmacen/obtenerSaldosFavor/*PorCentro (más abajo) son EXCLUSIVAS
 // de Pólizas (cobros-sucursal-puente.service.js / cfdi-poliza-generator.service.js,
-// dominio cfdi-mapping/polizas) — fuera de alcance de Configuraciones Globales por
-// decisión explícita del usuario ("no quiero nada de pólizas por ahora"). Se quedan
-// leyendo el .env directo, tal cual estaban antes de que existiera Configuraciones
-// Globales — nunca deben pasar a `erp-caja` (esa sección es solo Bancos/Cobro/Reversiones).
-const ERP_CAJA_BASE_URL_POLIZAS = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
-const ERP_TOKEN_POLIZAS         = process.env.ERP_TOKEN || '';
+// dominio cfdi-mapping/polizas). Migradas 2026-08-28 a Configuraciones Globales, sección
+// propia `polizas` (antes leían ERP_CAJA_BASE_URL/ERP_TOKEN del .env directo por decisión
+// explícita del usuario de dejarlas fuera — esa decisión ya no aplica: "no funciona nada
+// si no está ahí"). Nunca comparten sección con `bancos` (esa es solo Bancos/Cobro/Reversiones).
+async function _cajaBaseUrlPolizas() {
+  const valor = await globalConfigService.getValue('polizas', 'CAJA_BASE_URL');
+  return valor.replace(/\/$/, '');
+}
+
+async function _tokenPolizas() {
+  return globalConfigService.getValue('polizas', 'TOKEN');
+}
 
 async function sincronizarCuentasPendientes(params = {}) {
   const cuentasPendientesUrl = await _cuentasPendientesUrl();
@@ -90,11 +96,12 @@ async function sincronizarCuentasPendientes(params = {}) {
 // $24,981.27 cobrados en Efectivo, solo $1,462.89 se reconciliaban).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
+  const token = await _tokenPolizas();
   for (let intento = 1; intento <= MAX_INTENTOS_429; intento++) {
     try {
       return await axios.get(url, {
         params,
-        headers: { Authorization: `Bearer ${ERP_TOKEN_POLIZAS}` },
+        headers: { Authorization: `Bearer ${token}` },
         timeout: 30000,
       });
     } catch (axErr) {
@@ -195,7 +202,7 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   const cacheado = _leerCache(_cacheAlmacen, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
     response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
@@ -231,7 +238,7 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   const cacheado = _leerCache(_cacheSaldosFavor, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
     response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
@@ -260,7 +267,7 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
 // descubrir directamente lo que cobró de otras sucursales sin pasar por la
 // cola `CobroSucursalPendiente` (ver cobros-sucursal-puente.service.js).
 // Ya liberado en producción (confirmado con el usuario 2026-08-14) —
-// ERP_CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
+// polizas.CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
 // igual que el resto de los endpoints de este archivo.
 async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
   if (!rfc) throw new Error('obtenerDesglosesCobroAlmacenPorCentro: rfc requerido (aísla la caché por empresa)');
@@ -270,7 +277,7 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
   const cacheado = _leerCache(_cacheAlmacenPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
     response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
@@ -298,7 +305,7 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   const cacheado = _leerCache(_cacheSaldosFavorPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
     response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {

@@ -11,6 +11,8 @@
     "seed:catalog": "node src/banks/scripts/seed-account-plan.js",
     "seed:banks": "node src/banks/scripts/seed-global-config-banks.js",
     "reset:banks": "node src/banks/scripts/reset-global-config-banks.js",
+    "seed:polizas": "node src/banks/scripts/seed-global-config-polizas.js",
+    "reset:polizas": "node src/banks/scripts/reset-global-config-polizas.js",
     "add:devoluciones": "node src/banks/scripts/add-devoluciones-accounts.js",
     "seed:rules": "node src/banks/scripts/seed-cfdi-mapping-rules.js",
     "sync:rules": "node src/banks/scripts/seed-cfdi-mapping-rules.js --sync",

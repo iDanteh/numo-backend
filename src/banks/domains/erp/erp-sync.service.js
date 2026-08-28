@@ -80,6 +80,14 @@ async function sincronizarCuentasPendientes(params = {}) {
 // caiga al camino viejo/menos preciso — primero vale la pena reintentar,
 // igual que ya se hace con 429, antes de darse por vencido. Backoff fijo (no
 // hay "retry after" para un timeout) con un pequeño incremento por intento.
+//
+// 2026-08-24: 30s tampoco alcanzaba contra el ERP REAL de producción —
+// medido con curl: /desgloses-cobro/saldos-favor (por centro) tardó 35.75s
+// en responder (caso real Viguera/Hidalgo, ~24 días de rango). Con 30s, las
+// 3 reintentos hacían timeout igual y el caller caía al camino "por
+// serie/folio" (incompleto), dejando cobros reales sin encontrar y
+// fragmentando la venta en líneas "Venta Sin Cobro" (caso real B0-260803791,
+// $24,981.27 cobrados en Efectivo, solo $1,462.89 se reconciliaban).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   for (let intento = 1; intento <= MAX_INTENTOS_429; intento++) {
@@ -139,6 +147,32 @@ const _cacheSaldosFavorPorCentro = new Map();
 function _claveLote(rfc, series, folios) {
   const pares = series.map((s, i) => `${s}|${folios[i]}`).sort();
   return `${rfc}::${pares.join(',')}`;
+}
+
+// El ERP rechaza con HTTP 400 "rango de fechas mayor a 31 días sin criterio
+// de factura" cualquier consulta "por centro" más amplia — y la generación
+// de pólizas amplía el período ±1 día de tolerancia
+// (TOLERANCIA_DIAS_FACTURACION_DIFERIDA en cfdi-poliza-generator.service.js),
+// así que CUALQUIER mes de 30 o 31 días ya excede el límite (confirmado
+// 2026-08-24, caso real Viguera/Hidalgo agosto: rango ampliado 31-jul a
+// 1-sep = 33 días → HTTP 400 → el catch de `_prefetchAjustesFacturaPropia`
+// lo trataba como falla genérica y caía en silencio al camino "por
+// serie/folio", incompleto — de ahí las líneas "Venta Sin Cobro" recurrentes
+// cada mes, no solo en agosto). Se trocea el rango en bloques ≤30 días y se
+// combinan los resultados — transparente para el caller.
+const MS_UN_DIA = 24 * 60 * 60 * 1000;
+const MAX_DIAS_RANGO_ERP = 30;
+function _trocearRango(fechaDesdeIso, fechaHastaIso) {
+  const desde = new Date(fechaDesdeIso);
+  const hasta = new Date(fechaHastaIso);
+  const bloques = [];
+  let cursor = desde;
+  while (cursor < hasta) {
+    const finBloque = new Date(Math.min(cursor.getTime() + MAX_DIAS_RANGO_ERP * MS_UN_DIA, hasta.getTime()));
+    bloques.push({ fechaDesde: cursor.toISOString(), fechaHasta: finBloque.toISOString() });
+    cursor = new Date(finBloque.getTime() + 1);
+  }
+  return bloques;
 }
 
 function _leerCache(cache, clave) {
@@ -250,7 +284,6 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
     throw axErr;
   }
 
-  const cuentas = response.data?.Data?.cuentas || [];
   _cacheAlmacenPorCentro.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
@@ -279,7 +312,6 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
     throw axErr;
   }
 
-  const cuentas = response.data?.Data?.cuentas || [];
   _cacheSaldosFavorPorCentro.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }

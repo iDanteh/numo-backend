@@ -2146,13 +2146,20 @@ function bloquesAjustesContado(movs) {
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
       : grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    // Anticipo (Reg 22C/23 y OPA): el Cargo NUNCA se muestra en este bloque —
-    // solo el Abono (Ingresos+IVA, o el SF liberado) — confirmado con el
-    // usuario 2026-08-27 (caso real E0-260800110/E0-260801021). Revierte la
-    // decisión previa del 2026-08-19 de mostrar cargo+abono juntos para
-    // Anticipo; las demás categorías (Devolución/Descuento/Bonificación) NO
-    // cambian, siguen mostrando cargo+abono juntos.
-    const bloque = categoria === 'anticipo' ? abonos : [...cargos, ...abonos];
+    // Anticipo ESTÁNDAR (Reg 22C/23, con NC del SAT): el Cargo NUNCA se
+    // muestra en este bloque — solo el Abono (Ingresos+IVA, o el SF liberado)
+    // — confirmado con el usuario 2026-08-27 (caso real
+    // E0-260800110/E0-260801021). OPA (aplicación de anticipo SIN NC,
+    // `REGLAS_MEZCLADAS_CON_VENTAS`) es la EXCEPCIÓN: sus 2 líneas de Cargo
+    // (Anticipos/IVA-anticipo) SÍ deben verse — es la única evidencia visible
+    // de que el anticipo se aplicó, distinta del Cargo estándar (que
+    // duplicaría visualmente la venta, por eso se oculta). Sin esta
+    // excepción, la regla de 2026-08-27 se comía también las líneas OPA sin
+    // querer (bug real 2026-08-28, caso MONSAN B0-260801098: las 2 líneas
+    // Cargo Anticipos/IVA-Anticipo desaparecían del export aunque estaban
+    // correctamente marcadas como visibles en `_extraerCobrosSucursal`).
+    const cargosOPA = cargos.filter(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    const bloque = categoria === 'anticipo' ? [...cargosOPA, ...abonos] : [...cargos, ...abonos];
     return { categoria, bloque };
   });
 }
@@ -2314,10 +2321,12 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    // Anticipo: el Cargo NUNCA se muestra — ver comentario equivalente en
-    // `bloquesAjustesContado` (mismo fix, 2026-08-27, mismo criterio para
-    // Contado y Crédito).
-    const bloque = categoria === 'anticipo' ? abonos : [...cargos, ...abonos];
+    // Anticipo ESTÁNDAR: el Cargo NUNCA se muestra — ver comentario
+    // equivalente en `bloquesAjustesContado` (mismo fix, 2026-08-27, mismo
+    // criterio para Contado y Crédito). OPA es la excepción — ver comentario
+    // equivalente en `bloquesAjustesContado` (fix 2026-08-28).
+    const cargosOPA = cargos.filter(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    const bloque = categoria === 'anticipo' ? [...cargosOPA, ...abonos] : [...cargos, ...abonos];
     bloques.push({ categoria, bloque });
   }
 

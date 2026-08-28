@@ -1570,7 +1570,7 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
     satStatus:                        'Vigente',
     isActive:                         true,
     'cfdiRelacionados.tipoRelacion':  '07',
-  }).select('uuid subTotal total cfdiRelacionados').lean();
+  }).select('uuid serie folio subTotal total cfdiRelacionados').lean();
 
   const mapa = new Map();
   for (const eg of egresos) {
@@ -1583,14 +1583,20 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
     const total = Number(eg.total) || 0;
     if (total <= 0) continue;
     const subTotal = Number(eg.subTotal) || total;
+    // Serie-folio del propio Egreso — se usa como referencia trazable en la
+    // columna C (serie) del cierre, para que quede ligado al documento SAT
+    // real en vez de solo al placeholder "OPA-..." (confirmado con el
+    // usuario 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
+    const serieFolio = [eg.serie, eg.folio].filter(Boolean).join('-') || null;
     const prev = mapa.get(ventaMatch);
     // Más de un Egreso aplicando al mismo anticipo/venta no debería ser
     // común, pero se suman para no perder datos si llegara a pasar.
     if (prev) {
       prev.total    = parseFloat((prev.total + total).toFixed(2));
       prev.subTotal = parseFloat((prev.subTotal + subTotal).toFixed(2));
+      prev.serieFolio = prev.serieFolio ?? serieFolio;
     } else {
-      mapa.set(ventaMatch, { total, subTotal });
+      mapa.set(ventaMatch, { total, subTotal, serieFolio });
     }
   }
   return mapa;
@@ -3074,6 +3080,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // que haya un Egreso real (ver abajo), cuyo propio subTotal/total da la
     // tasa exacta en vez de asumirla.
     let tasaIvaAnticipoEfectivaProp = TASA_IVA_ANTICIPO;
+    // Serie-folio del Egreso real (columna C del cierre) cuando exista —
+    // ver `_fetchEgresosAplicacionAnticipoPorVenta`.
+    let serieEgresoAnticipoProp = null;
     if (anticipoFolioRefProp) {
       movVentasAbonoProp = rule?.cuentaAbono
         ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
@@ -3090,6 +3099,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const egresoAnticipoProp = egresosAnticipoPorVentaProp.get((cfdi.uuid || '').toUpperCase());
       if (egresoAnticipoProp) {
         montoAnticipoRealProp = Math.min(egresoAnticipoProp.total, totalVentaProp);
+        serieEgresoAnticipoProp = egresoAnticipoProp.serieFolio ?? null;
         if (egresoAnticipoProp.subTotal > 0 && egresoAnticipoProp.total > egresoAnticipoProp.subTotal) {
           tasaIvaAnticipoEfectivaProp = (egresoAnticipoProp.total - egresoAnticipoProp.subTotal) / egresoAnticipoProp.subTotal;
         }
@@ -3223,6 +3233,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
       const ivaAnticipoProp      = Math.round((montoAnticipoConsumidoProp - subtotalAnticipoProp) * 100) / 100;
       const refOpaProp = anticipoFolioRefProp;
+      // Columna C (serie) = folio del Egreso real que cancela el anticipo
+      // cuando existe (trazable al documento SAT); columna H (concepto) =
+      // siempre la referencia "OPA-..." (confirmado con el usuario
+      // 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
+      const serieCierreProp = serieEgresoAnticipoProp ?? refOpaProp;
       const baseInfoProp = {
         centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
         cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
@@ -3235,13 +3250,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       if (subtotalAnticipoProp > 0) {
         movimientosResult.push({
           ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
-          concepto: refOpaProp, serie: refOpaProp, debe: subtotalAnticipoProp, haber: 0,
+          concepto: refOpaProp, serie: serieCierreProp, debe: subtotalAnticipoProp, haber: 0,
         });
       }
       if (ivaAnticipoProp > 0) {
         movimientosResult.push({
           ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
-          concepto: refOpaProp, serie: refOpaProp, debe: ivaAnticipoProp, haber: 0,
+          concepto: refOpaProp, serie: serieCierreProp, debe: ivaAnticipoProp, haber: 0,
         });
       }
     } else if (anticipoFolioRefProp && montoAnticipoRealProp === 0) {
@@ -4487,6 +4502,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     let montoAnticipoRealGuard = 0;
     // Ver comentario equivalente en generarPropuesta.
     let tasaIvaAnticipoEfectivaGuard = TASA_IVA_ANTICIPO;
+    // Ver comentario equivalente en generarPropuesta.
+    let serieEgresoAnticipoGuard = null;
     if (anticipoFolioRefGuard) {
       movVentasAbonoGuard = rule?.cuentaAbono
         ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
@@ -4501,6 +4518,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const egresoAnticipoGuard = egresosAnticipoPorVentaGuard.get((cfdi.uuid || '').toUpperCase());
       if (egresoAnticipoGuard) {
         montoAnticipoRealGuard = Math.min(egresoAnticipoGuard.total, totalVentaGuard);
+        serieEgresoAnticipoGuard = egresoAnticipoGuard.serieFolio ?? null;
         if (egresoAnticipoGuard.subTotal > 0 && egresoAnticipoGuard.total > egresoAnticipoGuard.subTotal) {
           tasaIvaAnticipoEfectivaGuard = (egresoAnticipoGuard.total - egresoAnticipoGuard.subTotal) / egresoAnticipoGuard.subTotal;
         }
@@ -4597,6 +4615,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
       const ivaAnticipoGuard      = Math.round((montoAnticipoConsumidoGuard - subtotalAnticipoGuard) * 100) / 100;
       const refOpaGuard = anticipoFolioRefGuard;
+      // Columna C (serie) = folio del Egreso real cuando existe; columna H
+      // (concepto) = siempre "OPA-..." — ver comentario equivalente en
+      // generarPropuesta.
+      const serieCierreGuard = serieEgresoAnticipoGuard ?? refOpaGuard;
       const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
       const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
       const baseInfoGuard = {
@@ -4606,14 +4628,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       if (subtotalAnticipoGuard > 0) {
         todosLosMovimientos.push({
           ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
-          concepto: refOpaGuard, serie: refOpaGuard, debe: subtotalAnticipoGuard, haber: 0,
+          concepto: refOpaGuard, serie: serieCierreGuard, debe: subtotalAnticipoGuard, haber: 0,
           cuentaFaltante: cuentaAnticiposIdGuard == null,
         });
       }
       if (ivaAnticipoGuard > 0) {
         todosLosMovimientos.push({
           ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
-          concepto: refOpaGuard, serie: refOpaGuard, debe: ivaAnticipoGuard, haber: 0,
+          concepto: refOpaGuard, serie: serieCierreGuard, debe: ivaAnticipoGuard, haber: 0,
           cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
         });
       }

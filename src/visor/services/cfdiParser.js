@@ -70,6 +70,7 @@ const parseCFDI = async (xmlString) => {
 
     conceptos: parseConceptos(conceptosNode),
     impuestos: parseImpuestos(impuestosNode),
+    cfdiRelacionados: parseCfdiRelacionados(comprobante),
 
     timbreFiscalDigital: timbreNode ? {
       uuid: timbreNode.UUID || timbreNode['$']?.UUID,
@@ -234,6 +235,34 @@ const getComplementoPago = (comprobante) => {
   } catch {
     return null;
   }
+};
+
+/**
+ * Extrae `<cfdi:CfdiRelacionados>` del header — puede haber VARIOS bloques
+ * (uno por cada TipoRelacion distinto, ej. un CFDI que sustituye a otro Y
+ * aplica un anticipo a la vez) y cada bloque puede traer VARIOS
+ * `<cfdi:CfdiRelacionado UUID="...">` hijos. Con `explicitArray: false`,
+ * xml2js entrega un objeto único cuando hay uno solo de cada, o un array
+ * cuando hay más de uno — se normaliza siempre a array acá.
+ */
+const parseCfdiRelacionados = (comprobante) => {
+  const raw = comprobante['cfdi:CfdiRelacionados'] || comprobante['CfdiRelacionados'];
+  if (!raw) return [];
+  const bloques = Array.isArray(raw) ? raw : [raw];
+
+  return bloques
+    .map((bloque) => {
+      const tipoRelacion = bloque?.TipoRelacion || bloque?.['$']?.TipoRelacion;
+      const relacionadoRaw = bloque?.['cfdi:CfdiRelacionado'] || bloque?.['CfdiRelacionado'];
+      const relacionadoList = relacionadoRaw
+        ? (Array.isArray(relacionadoRaw) ? relacionadoRaw : [relacionadoRaw])
+        : [];
+      const uuids = relacionadoList
+        .map((r) => (r?.UUID || r?.['$']?.UUID || '').toString().trim().toUpperCase())
+        .filter(Boolean);
+      return tipoRelacion && uuids.length ? { tipoRelacion, uuids } : null;
+    })
+    .filter(Boolean);
 };
 
 const getTimbre = (comprobante) => {

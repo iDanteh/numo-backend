@@ -230,8 +230,8 @@ describe('identificar() — 1 forma de pago repartida entre 2 depósitos (split,
   });
 });
 
-describe('identificar() — Depósito en efectivo manda "Num Recibo" (sin "Aut", sin "Numo", sin BancoID)', () => {
-  test('DatosAdicionales trae SOLO Num Recibo con el folio, sin BancoID', async () => {
+describe('identificar() — Depósito en efectivo manda "Num Recibo" vacío + "Numo"/"Aut" invertidos (sin BancoID)', () => {
+  test('DatosAdicionales trae Num Recibo vacío, Numo=folio, Aut=autorización bancaria, sin BancoID', async () => {
     const f1 = formaPago('f1', 'Depósito en efectivo', 100000);
     const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
@@ -247,12 +247,14 @@ describe('identificar() — Depósito en efectivo manda "Num Recibo" (sin "Aut",
     const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
     expect(datosAdicionales).toHaveLength(1);
     expect(datosAdicionales[0].BancoID).toBeUndefined();
-    // 2026-08-27: se probó agregar "Numo" además de "Num Recibo", pero Kore lo
-    // rechazó explícitamente ("el dato adicional 'Numo' no está configurado en
-    // la forma de pago DEPOSITO EN EFECTIVO... los campos configurados son:
-    // Num Recibo") — confirmado contra Kore real, revertido a solo Num Recibo.
+    // 2026-08-28: confirmado contra Kore real — "Num Recibo" siempre vacío,
+    // "Numo" lleva el folio interno (autJuntos) y "Aut" la autorización
+    // bancaria (numoJuntos). Semántica INVERTIDA a propósito respecto a
+    // Transferencia (ver collection-request.service.js ~línea 935).
     expect(datosAdicionales[0].DatosAdicionales).toEqual([
-      { Nombre: 'Num Recibo', Valor: 'F-mov-1' },
+      { Nombre: 'Num Recibo', Valor: '' },
+      { Nombre: 'Numo', Valor: 'F-mov-1' },
+      { Nombre: 'Aut', Valor: 'AUT-mov-1' },
     ]);
     // 2026-08-14: fecha_real_pago se manda igual para depósito en efectivo, sin
     // condición de tipo (a diferencia de BancoID/DatosAdicionales).
@@ -261,16 +263,45 @@ describe('identificar() — Depósito en efectivo manda "Num Recibo" (sin "Aut",
   });
 });
 
-describe('identificar() — otra forma de pago (cheque/saldo a favor) sin BancoID ni DatosAdicionales', () => {
-  test('fecha_real_pago SÍ se manda aunque no haya BancoID ni DatosAdicionales', async () => {
+describe('identificar() — Cheque manda "Numo"/"Aut" (su catálogo no tiene "Num Recibo")', () => {
+  test('DatosAdicionales trae Numo=folio, Aut=autorización bancaria, sin BancoID', async () => {
     const f1 = formaPago('f1', 'Cheque', 100000);
     const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
     BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
     setupHappyKore();
-    // Cheque: ni claveSAT '03' (transferencia) ni "DEPOSITO EFECTIVO" por
-    // nombre — no dispara ni BancoID ni DatosAdicionales.
+    // Cheque no tiene claveSAT propia distintiva (no es '03') — se distingue
+    // por nombre, mismo criterio que Depósito en efectivo.
     koreCaja.listarFormasPago.mockResolvedValue([{ id: 'fp-f1', claveSAT: '02', nombre: 'Cheque' }]);
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    expect(datosAdicionales).toHaveLength(1);
+    expect(datosAdicionales[0].BancoID).toBeUndefined();
+    // 2026-08-28: confirmado contra Kore real — Cheque no tiene "Num Recibo" en
+    // su catálogo ("los campos configurados son: Numo"), manda Numo=folio y
+    // Aut=autorización bancaria, mismos 2 campos que Depósito en efectivo.
+    expect(datosAdicionales[0].DatosAdicionales).toEqual([
+      { Nombre: 'Numo', Valor: 'F-mov-1' },
+      { Nombre: 'Aut', Valor: 'AUT-mov-1' },
+    ]);
+    expect(datosAdicionales[0].fecha_real_pago).toBe('2026-08-01T10:00:00Z');
+    expect(fechaRealPagoRaiz).toBe('2026-08-01T10:00:00Z');
+  });
+});
+
+describe('identificar() — otra forma de pago (saldo a favor) sin BancoID ni DatosAdicionales', () => {
+  test('fecha_real_pago SÍ se manda aunque no haya BancoID ni DatosAdicionales', async () => {
+    const f1 = formaPago('f1', 'Saldo a favor', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    // Saldo a favor: ni claveSAT '03' (transferencia), ni "DEPOSITO EFECTIVO" ni
+    // "CHEQUE" por nombre — no dispara ni BancoID ni DatosAdicionales.
+    koreCaja.listarFormasPago.mockResolvedValue([{ id: 'fp-f1', claveSAT: '99', nombre: 'Saldo a favor' }]);
 
     await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
 

@@ -263,6 +263,25 @@ describe('identificar() — Depósito en efectivo manda "Num Recibo" vacío + "N
   });
 });
 
+describe('identificar() — sin autorización bancaria (OCR no la detectó), se manda "NULL"', () => {
+  test('el campo de autorización bancaria trae la leyenda "NULL" en vez de vacío', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1', { numeroAutorizacion: null })]);
+    setupHappyKore();
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    // 2026-08-31: pedido explícito del usuario — SOLO Solicitudes de Cobro, el
+    // cobro manual (cobro-panel.component.ts) no manda el tag en vez de "NULL".
+    expect(datosAdicionales[0].DatosAdicionales).toEqual(
+      expect.arrayContaining([{ Nombre: 'Aut', Valor: 'F-mov-1' }, { Nombre: 'Numo', Valor: 'NULL' }]),
+    );
+  });
+});
+
 describe('identificar() — Cheque manda "Numo"/"Aut" (su catálogo no tiene "Num Recibo")', () => {
   test('DatosAdicionales trae Numo=folio, Aut=autorización bancaria, sin BancoID', async () => {
     const f1 = formaPago('f1', 'Cheque', 100000);

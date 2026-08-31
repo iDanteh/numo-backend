@@ -221,8 +221,11 @@ const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO'];
  * cuando hay dato por ticket disponible).
  *
  * @param {{serieVentaTicket: string, folioVentaTicket: string}[]} movimientos
- * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null}>>}
- *   `serieVentaTicket|folioVentaTicket` → info bancaria del ticket.
+ * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null, montoBancoReal: number|null}[]>>}
+ *   `serieVentaTicket|folioVentaTicket` → arreglo de depósitos bancarios reales
+ *   ligados a ese ticket (normalmente uno solo; puede haber más de uno cuando
+ *   el ticket se pagó en VARIAS parcialidades de Transferencia — ver
+ *   `_elegirBancoRealPorMonto`, que elige la entrada correcta por monto).
  *   `referencia`: folio propio de Numo (para Transferencia/Cheque).
  *   `numeroAutorizacion`: número de autorización real de terminal (para Tarjeta).
  */
@@ -267,11 +270,41 @@ async function construirBancoRealPorTicket(movimientos) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
         if (!paresSet.has(key)) continue;
-        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
+        // Un mismo ticket puede tener MÁS de un depósito bancario real
+        // (parcialidades de Transferencia — confirmado con el usuario
+        // 2026-08-31, caso real Santa Rosa/M0 27-ago: factura M0-260800752,
+        // ticket M0-260802850, pagada en 2 transferencias BBVA distintas,
+        // folios 043291 $227.86 y 043294 $23,127.65). Antes solo se guardaba
+        // la PRIMERA encontrada por ticket (`if (!mapa.has(key))`) — la
+        // segunda se perdía por completo, y como ambas líneas de la factura
+        // compartían la misma referencia resuelta, se fusionaban en una sola
+        // línea del export con el monto FIJO del banco (`_debeFijoBanco` en
+        // `consolidarCargos`) igual al del primer depósito, descartando el
+        // segundo sin dejar rastro visible en la póliza (solo quedaba en el
+        // detalle de la hoja "Desglose Consolidado"). Ahora se acumulan TODAS
+        // las entradas por ticket — `_elegirBancoRealPorMonto` elige la que
+        // corresponde a cada línea por su monto exacto.
+        if (!mapa.has(key)) mapa.set(key, []);
+        mapa.get(key).push({ esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }
     }
   }
   return mapa;
+}
+
+// Elige, de las entradas bancarias reales ligadas a un ticket (ver
+// `construirBancoRealPorTicket`), la que corresponde a una línea puntual por
+// su MONTO — normalmente hay una sola entrada y no hace falta elegir; cuando
+// hay varias (parcialidades), se prefiere la que calza exacto (±$0.01) con el
+// monto de esta línea, mismo criterio de match por monto que ya usa
+// `_resolverReferenciaOpaPorMonto` (cfdi-poliza-generator.service.js). Si
+// ninguna calza exacto (ruido de reclasificación, remanente repartido, etc.),
+// cae a la primera como antes — nunca peor que el comportamiento previo.
+function _elegirBancoRealPorMonto(candidatos, monto) {
+  if (!candidatos || candidatos.length === 0) return null;
+  if (candidatos.length === 1) return candidatos[0];
+  const exacto = candidatos.find(c => c.montoBancoReal != null && Math.abs(c.montoBancoReal - monto) < 0.01);
+  return exacto ?? candidatos[0];
 }
 
 // Poliza.tipo interno (A,I,E,D,N,C,P) → TipoPol de CONTPAQi (1=Ingreso 2=Egreso 3=Diario)
@@ -1335,7 +1368,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // ticket (venta normal, no partida), `bancario` sigue siendo correcto
       // (un solo ticket por CFDI, ambos coinciden).
       const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
-        ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
+        ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
         : null;
       const referencia = infoTicketTransfCheque?.referencia ?? bancario?.referencia ?? null;
       // Cuenta real del banco donde cayó el depósito (ver
@@ -1398,7 +1431,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // depósitos con autorización distinta, ej. Factura Global O0-260800164).
     const esTarjetaDeclarada = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA';
     const infoTarjetaTicket = (esTarjetaDeclarada && m.serieVentaTicket && m.folioVentaTicket)
-      ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
+      ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
       : null;
     if (esTarjetaDeclarada && infoTarjetaTicket?.numeroAutorizacion && !esRemanenteMenor) {
       const cuentaLineaTarjeta = infoTarjetaTicket.cuentaBanco ?? m.cuenta;
@@ -3485,4 +3518,9 @@ module.exports = {
   listBorradorCandidatasCompensacionesIntereses, cancelarTodasCompensacionesIntereses,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
+  // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
+  // — expone funciones ya existentes para poder reproducir el pipeline real de
+  // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
+  _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _extraerCobrosSucursal, _armarBloqueContado: armarBloqueContado,
 };

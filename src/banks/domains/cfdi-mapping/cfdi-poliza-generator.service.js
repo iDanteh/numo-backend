@@ -25,6 +25,11 @@ const {
 // (array, formato ERP) como `uuid` (singular, formato SAT), según el origen.
 const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
 
+// Debug temporal (2026-08-31): imprime por qué anticipoFolioRef no resuelve
+// para un CFDI puntual — activar con DEBUG_OPA_UUID=<uuid> (mayúsculas o
+// minúsculas, se normaliza). Seguro quitar después.
+const _DEBUG_OPA_UUID = (process.env.DEBUG_OPA_UUID || '').toUpperCase() || null;
+
 // El pre-fetch de relMetodoPagoMap/relFacturaMetaMap (más abajo, `relTipoUuidsProp`/
 // `relTipoUuidsGuard`) se calcula ANTES del merge con ERP, a partir del
 // `cfdiRelacionados` crudo de SAT — pero algunas NC (Devolución/Bonificación)
@@ -3087,6 +3092,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       }
       if (foliosResueltosProp.length) anticipoFolioRefProp = `OPA-${foliosResueltosProp.join('-')}${faltaAlgunoProp ? '-' : ''}`;
     }
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_PROP] ${cfdi.serie}-${cfdi.folio} uuid=${cfdi.uuid} formaPago=${cfdi.formaPago} `
+        + `cuentaIvaAnticipo=${rule?.cuentaIvaAnticipo} cfdiRelacionados=${JSON.stringify(cfdi.cfdiRelacionados)} `
+        + `anticipoFolioPorUuidProp=${JSON.stringify(anticipoFolioPorUuidProp)} anticipoFolioRefProp=${anticipoFolioRefProp}`);
+    }
     // Monto REAL de anticipo aplicado (ver `anticipoUsado`/`montoAnticipoUsado`
     // en `_prefetchAjustesFacturaPropia`) — cuando está disponible (viene del
     // desglose real de Kore, formaPago nombre='ANTICIPO'), evita asumir que el
@@ -3138,6 +3148,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // Cuánto de ese monto real queda por "consumir" contra las líneas de
     // Cargo principal del loop de abajo — se va reduciendo línea a línea.
     let montoAnticipoRestanteProp = montoAnticipoRealProp;
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_PROP_MONTO] uuid=${cfdi.uuid} montoAnticipoUsadoContext=${context.montoAnticipoUsado} `
+        + `montoAnticipoRealProp=${montoAnticipoRealProp} rule.cuentaCargo=${rule?.cuentaCargo} `
+        + `cuentaCargoId=${cuentaMap[rule?.cuentaCargo]} CODIGO_CUENTA_CAJA_id=${cuentaMap[CODIGO_CUENTA_CAJA]} CODIGO_CUENTA_BANCOS_id=${cuentaMap[CODIGO_CUENTA_BANCOS]}`);
+    }
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver `puntosAcumuladosProp` — Puntos va consolidado, no individual).
@@ -3198,6 +3213,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       //    B0-260801098) — se asume 100% cubierto, se oculta el Cargo
       //    completo y el cierre de abajo lo revierte con un Abono oculto.
       const ocultarPorAnticipoTotal = anticipoFolioRefProp && montoAnticipoRealProp === 0 && esLineaCargoPrincipal;
+      if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+        console.warn(`[DEBUG_OPA_PROP_LINEA] cuentaId=${m.cuentaId} debe=${m.debe} _esCargoPrincipal=${m._esCargoPrincipal} `
+          + `esLineaCargoPrincipal=${esLineaCargoPrincipal} esLineaCajaOBancos=${esLineaCajaOBancos} ocultarPorAnticipoTotal=${ocultarPorAnticipoTotal}`);
+      }
       // Ver comentario equivalente en generarYGuardar sobre `ticketKeyLineaGuard`.
       const ticketKeyLineaProp = m.folioVentaTicket != null
         ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
@@ -3205,19 +3224,31 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const restanteTicketProp = montoCubiertoRestantePorTicketProp.get(ticketKeyLineaProp) ?? 0;
       let debeFinalProp = Number(m.debe);
       let huboReduccionProp = false;
-      if (esLineaCargoPrincipal && esLineaCajaOBancos && debeFinalProp > 0) {
-        if (restanteTicketProp > 0) {
-          const reduccion = Math.min(restanteTicketProp, debeFinalProp);
-          montoCubiertoRestantePorTicketProp.set(ticketKeyLineaProp, parseFloat((restanteTicketProp - reduccion).toFixed(2)));
-          debeFinalProp = parseFloat((debeFinalProp - reduccion).toFixed(2));
-          huboReduccionProp = true;
-        }
-        if (montoAnticipoRestanteProp > 0 && debeFinalProp > 0) {
-          const reduccionAnticipo = Math.min(montoAnticipoRestanteProp, debeFinalProp);
-          montoAnticipoRestanteProp = parseFloat((montoAnticipoRestanteProp - reduccionAnticipo).toFixed(2));
-          debeFinalProp = parseFloat((debeFinalProp - reduccionAnticipo).toFixed(2));
-          huboReduccionProp = true;
-        }
+      if (esLineaCargoPrincipal && esLineaCajaOBancos && debeFinalProp > 0 && restanteTicketProp > 0) {
+        const reduccion = Math.min(restanteTicketProp, debeFinalProp);
+        montoCubiertoRestantePorTicketProp.set(ticketKeyLineaProp, parseFloat((restanteTicketProp - reduccion).toFixed(2)));
+        debeFinalProp = parseFloat((debeFinalProp - reduccion).toFixed(2));
+        huboReduccionProp = true;
+      }
+      // La reducción por ANTICIPO se separó del `if` de arriba (2026-08-31,
+      // caso real ESCUELA PRIMARIA VESPERTINA CARLOS A. CARRILLO H0-260800539):
+      // el cruce de sucursal SÍ debe limitarse a Caja/Bancos (nunca tocar
+      // SF/Puntos, ver comentario de `esLineaCajaOBancos` arriba), pero el
+      // anticipo puede aplicarse contra CUALQUIER cuenta que la regla use
+      // como `cuentaCargo` — incluida una cuenta de pasivo (Reg 22C —
+      // "Factura Final Anticipo", cuentaCargo=Anticipos de Clientes, NO
+      // Caja/Bancos). Antes, al estar anidada bajo `esLineaCajaOBancos`, la
+      // reducción nunca se aplicaba para este tipo de regla — el Cargo se
+      // quedaba íntegro (100% a Anticipos) sin dejar rastro del Efectivo
+      // real ($41.99 de $177.97) ni disparar el cierre OPA (`montoAnticipo
+      // Consumido` siempre daba 0).
+      const esLineaCargoDeLaReglaProp = m.cuentaId === (cuentaMap[rule?.cuentaCargo] ?? null);
+      if (esLineaCargoPrincipal && (esLineaCajaOBancos || esLineaCargoDeLaReglaProp)
+          && montoAnticipoRestanteProp > 0 && debeFinalProp > 0) {
+        const reduccionAnticipo = Math.min(montoAnticipoRestanteProp, debeFinalProp);
+        montoAnticipoRestanteProp = parseFloat((montoAnticipoRestanteProp - reduccionAnticipo).toFixed(2));
+        debeFinalProp = parseFloat((debeFinalProp - reduccionAnticipo).toFixed(2));
+        huboReduccionProp = true;
       }
       if (huboReduccionProp && debeFinalProp <= 0) continue; // línea totalmente cubierta
       movimientosResult.push({
@@ -3252,6 +3283,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // Usar esto en vez de `montoAnticipoRealProp` garantiza que el cierre
     // NUNCA descuadre el asiento, sin importar la forma de la regla.
     const montoAnticipoConsumidoProp = parseFloat((montoAnticipoRealProp - montoAnticipoRestanteProp).toFixed(2));
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_PROP_CIERRE] montoAnticipoRealProp=${montoAnticipoRealProp} montoAnticipoRestanteProp=${montoAnticipoRestanteProp} `
+        + `montoAnticipoConsumidoProp=${montoAnticipoConsumidoProp} anticipoFolioRefProp=${anticipoFolioRefProp}`);
+    }
     if (anticipoFolioRefProp && montoAnticipoConsumidoProp > 0) {
       // CON dato real: split subtotal/IVA proporcional (16%, mismo criterio
       // que Saldo a Favor) del monto REALMENTE aplicado — el Cargo principal
@@ -4523,6 +4558,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       }
       if (foliosResueltosGuard.length) anticipoFolioRefGuard = `OPA-${foliosResueltosGuard.join('-')}${faltaAlgunoGuard ? '-' : ''}`;
     }
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_GUARD] ${cfdi.serie}-${cfdi.folio} uuid=${cfdi.uuid} formaPago=${cfdi.formaPago} `
+        + `cuentaIvaAnticipo=${rule?.cuentaIvaAnticipo} cfdiRelacionados=${JSON.stringify(cfdi.cfdiRelacionados)} `
+        + `anticipoFolioPorUuidGuard=${JSON.stringify(anticipoFolioPorUuidGuard)} anticipoFolioRefGuard=${anticipoFolioRefGuard}`);
+    }
     // Monto REAL de anticipo aplicado — ver comentario equivalente en
     // generarYGuardar (`montoAnticipoRealProp`).
     let movVentasAbonoGuard = null;
@@ -4611,19 +4651,22 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const restanteTicketGuard = montoCubiertoRestantePorTicketGuard.get(ticketKeyLineaGuard) ?? 0;
       let debeFinalGuard = Number(m.debe);
       let huboReduccionGuard = false;
-      if (esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && debeFinalGuard > 0) {
-        if (restanteTicketGuard > 0) {
-          const reduccion = Math.min(restanteTicketGuard, debeFinalGuard);
-          montoCubiertoRestantePorTicketGuard.set(ticketKeyLineaGuard, parseFloat((restanteTicketGuard - reduccion).toFixed(2)));
-          debeFinalGuard = parseFloat((debeFinalGuard - reduccion).toFixed(2));
-          huboReduccionGuard = true;
-        }
-        if (montoAnticipoRestanteGuard > 0 && debeFinalGuard > 0) {
-          const reduccionAnticipo = Math.min(montoAnticipoRestanteGuard, debeFinalGuard);
-          montoAnticipoRestanteGuard = parseFloat((montoAnticipoRestanteGuard - reduccionAnticipo).toFixed(2));
-          debeFinalGuard = parseFloat((debeFinalGuard - reduccionAnticipo).toFixed(2));
-          huboReduccionGuard = true;
-        }
+      if (esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && debeFinalGuard > 0 && restanteTicketGuard > 0) {
+        const reduccion = Math.min(restanteTicketGuard, debeFinalGuard);
+        montoCubiertoRestantePorTicketGuard.set(ticketKeyLineaGuard, parseFloat((restanteTicketGuard - reduccion).toFixed(2)));
+        debeFinalGuard = parseFloat((debeFinalGuard - reduccion).toFixed(2));
+        huboReduccionGuard = true;
+      }
+      // Ver comentario equivalente en generarPropuesta sobre por qué la
+      // reducción por ANTICIPO se separó del cruce de sucursal (caso real
+      // H0-260800539, Reg 22C con cuentaCargo=Anticipos de Clientes).
+      const esLineaCargoDeLaReglaGuard = m.cuentaId === (cuentaMap[rule?.cuentaCargo] ?? null);
+      if (esLineaCargoPrincipalGuard && (esLineaCajaOBancosGuard || esLineaCargoDeLaReglaGuard)
+          && montoAnticipoRestanteGuard > 0 && debeFinalGuard > 0) {
+        const reduccionAnticipo = Math.min(montoAnticipoRestanteGuard, debeFinalGuard);
+        montoAnticipoRestanteGuard = parseFloat((montoAnticipoRestanteGuard - reduccionAnticipo).toFixed(2));
+        debeFinalGuard = parseFloat((debeFinalGuard - reduccionAnticipo).toFixed(2));
+        huboReduccionGuard = true;
       }
       if (huboReduccionGuard && debeFinalGuard <= 0) continue; // línea totalmente cubierta
       todosLosMovimientos.push({

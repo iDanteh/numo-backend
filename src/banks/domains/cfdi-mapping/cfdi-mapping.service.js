@@ -842,6 +842,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // referencia (serieOrigen-folioOrigen) — ver comentario en `emitirLineaSF`.
   const detalleSFVisible = context.saldoFavorUsadoPropio?.detalleVisible ?? [];
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
+  // Monto REAL de anticipo aplicado (ver `_prefetchAjustesFacturaPropia`,
+  // `context.montoAnticipoUsado`) — mismo dato que usa el cierre OPA en
+  // `cfdi-poliza-generator.service.js`, aquí se usa para separar el
+  // remanente real (ver `esCasoCargoAnticipoConRemanenteReal` abajo).
+  const montoAnticipoUsado = Number(context.montoAnticipoUsado) || 0;
 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
     && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_CLUB_TUBEROS];
@@ -861,6 +866,24 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const esCasoCargoSFConRemanenteReal = !esAnticipo && !esAplicacionSaldo && !esPago
     && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
     && montoSFUsado > 0.01 && montoSFUsado < montoCargo - 0.01
+    && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
+    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
+
+  // Caso espejo de `esCasoCargoSFConRemanenteReal`, pero para Anticipo en vez
+  // de Saldo a Favor (2026-08-31, confirmado con el usuario, caso real
+  // ESCUELA PRIMARIA VESPERTINA CARLOS A. CARRILLO H0-260800539: $177.97 =
+  // $135.98 anticipo + $41.99 efectivo real). Reg 22C — "Factura Final
+  // Anticipo" (formaPago=30) tiene `cuentaCargo` apuntando a Anticipos de
+  // Clientes (pasivo, fuera de `gateBase`), igual que el caso de SF — cuando
+  // el ticket se cubrió SOLO PARCIALMENTE con el anticipo, el remanente real
+  // (según `desglosePagoReal`) se separa hacia Caja/Bancos vía
+  // `splitPorFormaPagoReal`, dejando en `cuentaCargo` solo lo realmente
+  // aplicado del anticipo (el cierre OPA en `cfdi-poliza-generator.service.js`
+  // luego reduce esa porción a 0 y la reemplaza por sus propias líneas de
+  // Cargo Anticipos/IVA-Anticipo — ver `esLineaCargoDeLaReglaGuard/Prop` ahí).
+  const esCasoCargoAnticipoConRemanenteReal = !esAnticipo && !esAplicacionSaldo && !esPago
+    && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
+    && montoAnticipoUsado > 0.01 && montoAnticipoUsado < montoCargo - 0.01
     && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
     && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
 
@@ -1173,6 +1196,26 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // porción al consolidado de Efectivo/Tarjeta en vez de sacarla como
     // ajuste individual — ver comentario en `splitPorFormaPagoReal`.
     splitPorFormaPagoReal(remanenteReal, {}, 'Venta — remanente real (no cubierto por saldo a favor)');
+  } else if (esCasoCargoAnticipoConRemanenteReal) {
+    // Ver comentario en `esCasoCargoAnticipoConRemanenteReal` — mismo patrón
+    // que el bloque de SF de arriba, con `montoAnticipoUsado` en vez de
+    // `montoSFUsado`. La porción que queda en `cuentaCargo` (Anticipos) la
+    // reduce/reemplaza después el cierre OPA en `cfdi-poliza-generator.service.js`.
+    const remanenteRealAnticipo = parseFloat((montoCargo - montoAnticipoUsado).toFixed(2));
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      concepto, centroCosto, ventaFecha, serie: serieCfdi,
+      debe:        montoAnticipoUsado,
+      haber:       0,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+      _esCargoPrincipal: true,
+    });
+    // Nombre neutro (no "Anticipo") — mismo motivo que en el bloque de SF: sin
+    // esto, `consolidarCargos`/`esReglaAnticipo` (poliza.service.js) sacaría
+    // esta porción real del consolidado de Efectivo/Tarjeta solo por el texto
+    // "Anticipo" en el nombre completo de la regla.
+    splitPorFormaPagoReal(remanenteRealAnticipo, {}, 'Venta — remanente real (no cubierto por anticipo)');
   } else {
     // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
     // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta

@@ -302,7 +302,22 @@ async function construirBancoRealPorTicket(movimientos) {
 // cae a la primera como antes — nunca peor que el comportamiento previo.
 function _elegirBancoRealPorMonto(candidatos, monto) {
   if (!candidatos || candidatos.length === 0) return null;
-  if (candidatos.length === 1) return candidatos[0];
+  if (candidatos.length === 1) {
+    const unico = candidatos[0];
+    // Si el único candidato SÍ trae su propio depósito real (`montoBancoReal`)
+    // y claramente NO corresponde al monto de esta línea, se rechaza en vez
+    // de usarlo a ciegas (2026-08-31, caso real Global 06A72D7F/M0-260801419,
+    // centro Santa Rosa: un ticket con Transferencia $5,805.27 + Tarjeta
+    // $10,000, pero solo se sincronizó UN BankMovement — el de la
+    // Transferencia — cuyo `numeroAutorizacion` terminaba prestándose para
+    // la línea de Tarjeta, monto completamente distinto). Mejor sin
+    // referencia (cae al bucket genérico de esa forma de pago) que con una
+    // referencia que en realidad pertenece a otro cargo del mismo ticket.
+    // Cuando `montoBancoReal` es null (dato no disponible, no se puede
+    // validar) se mantiene el comportamiento permisivo de siempre.
+    if (unico.montoBancoReal != null && Math.abs(unico.montoBancoReal - monto) >= 0.01) return null;
+    return unico;
+  }
   const exacto = candidatos.find(c => c.montoBancoReal != null && Math.abs(c.montoBancoReal - monto) < 0.01);
   return exacto ?? candidatos[0];
 }

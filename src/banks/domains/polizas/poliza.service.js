@@ -17,8 +17,16 @@ const traspasosInternosService = require('../banks/traspasos-internos.service');
 const compensacionesInteresesService = require('../banks/compensaciones-intereses.service');
 const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
 
-// Categorías de bank_movements que representan una transferencia electrónica real.
-const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO'];
+// Categorías de bank_movements que representan una transferencia electrónica
+// real. Incluye "DEPOSITO" (2026-08-31, confirmado con el usuario, caso real
+// GAS MILENIUM SA DE CV, ticket M0-260801312, Factura Global 06A72D7F):
+// categoria del banco "DEPOSITO EN EFECTIVO" (dinero depositado directo en
+// sucursal bancaria, no en la caja de la tienda) — el propio ERP (Kore) ya
+// trae esta misma línea clasificada como `formaPagoDescripcion:"TRANSFERENCIA"`
+// con su propio número de autorización real ("Aut"), así que para efectos
+// contables SÍ cuenta como transferencia identificada, aunque el banco la
+// etiquete genéricamente como "depósito" en vez de "SPEI"/"TRASPASO".
+const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO', 'DEPOSITO'];
 
 // `BankMovement.banco` (enum de conciliación) → código de cuenta bancaria
 // real del catálogo — confirmado con el usuario 2026-08-04. BBVA usa la
@@ -200,8 +208,9 @@ async function construirVerdadBancaria(movimientos, rfc) {
 }
 
 // Categorías de bank_movements que representan una transferencia electrónica
-// real — mismo criterio que `construirVerdadBancaria` (CATEGORIAS_TRANSFERENCIA_BANCO).
-const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO'];
+// real — mismo criterio que `construirVerdadBancaria` (CATEGORIAS_TRANSFERENCIA_BANCO,
+// ver comentario ahí sobre "DEPOSITO").
+const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO', 'DEPOSITO'];
 
 /**
  * Resuelve el depósito bancario REAL cruzando bank_movements por TICKET
@@ -1335,21 +1344,27 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // usuario: sin esto se perdía el subcódigo 21 en transferencias reales
     // solo por falta de categoría en bank_movements.
     //
-    // IMPORTANTE (2026-08-31): en cuanto exista un match POR TICKET
-    // (`infoTicketTransfCheque`), NUNCA se consulta `bancario` (CFDI
-    // completo) — ni siquiera como fallback cuando el ticket no trae
-    // categoría. `bancario` puede venir de OTRO ticket cualquiera de la
-    // misma Factura Global (mismo `folioFiscal`); "subir" a ese dato cuando
-    // ya se sabe específicamente cuál es el banco/depósito de ESTE ticket
-    // reintroduce el mismo problema que se está corrigiendo. Solo se cae a
-    // `bancario` cuando no hay NINGÚN dato por ticket (`infoTicketTransfCheque
-    // === null` — venta sin ticket propio, o ticket sin ningún BankMovement
-    // ligado).
+    // IMPORTANTE (2026-08-31): en cuanto la línea pertenezca a un ticket
+    // propio (`serieVentaTicket`/`folioVentaTicket` — Factura Global o split
+    // por forma de pago real), NUNCA se consulta `bancario` (CFDI completo)
+    // — ni cuando ESE ticket no tiene ningún BankMovement ligado. `bancario`
+    // puede venir de OTRO ticket cualquiera de la misma Factura Global
+    // (mismo `folioFiscal`); usar ese dato para un ticket sin match propio
+    // reintroduce el mismo problema que se está corrigiendo, en cualquier
+    // dirección (tanto ocultando una transferencia real como, al revés,
+    // "prestándole" a una línea de Tarjeta sin match propio la confirmación
+    // de transferencia de un ticket ajeno — caso real 2026-08-31, ticket
+    // M0-260801437 formaPago Tarjeta sin BankMovement propio, agrupado por
+    // error con la transferencia real de OTRO ticket de la misma Global).
+    // Sin ticket propio (venta normal, un solo ticket = un solo CFDI),
+    // `bancario` sigue siendo correcto y es el único dato disponible.
     const esTransferenciaVerificada = infoTicketTransfCheque
       ? (infoTicketTransfCheque.categoriaConocida ? infoTicketTransfCheque.esTransferencia : (m.formaPago === FORMA_PAGO_TRANSFERENCIA))
-      : (bancario?.categoriaConocida
-        ? bancario.esTransferencia
-        : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
+      : (m.serieVentaTicket && m.folioVentaTicket)
+        ? (m.formaPago === FORMA_PAGO_TRANSFERENCIA)
+        : (bancario?.categoriaConocida
+          ? bancario.esTransferencia
+          : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
     const esAnticipo        = detectarAnticipo && esReglaAnticipo(m.reglaNombre);
     const esAnticipoSinUsar = esAnticipo && esRecepcionAnticipo(m.reglaNombre);
 

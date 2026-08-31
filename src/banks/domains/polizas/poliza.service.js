@@ -221,7 +221,7 @@ const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO'];
  * cuando hay dato por ticket disponible).
  *
  * @param {{serieVentaTicket: string, folioVentaTicket: string}[]} movimientos
- * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null, montoBancoReal: number|null}[]>>}
+ * @returns {Promise<Map<string, {esTransferencia: boolean, categoriaConocida: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null, montoBancoReal: number|null}[]>>}
  *   `serieVentaTicket|folioVentaTicket` → arreglo de depósitos bancarios reales
  *   ligados a ese ticket (normalmente uno solo; puede haber más de uno cuando
  *   el ticket se pagó en VARIAS parcialidades de Transferencia — ver
@@ -259,6 +259,11 @@ async function construirBancoRealPorTicket(movimientos) {
       const cuentaBanco = codigoCuentaBanco ? (cuentaPorCodigo.get(codigoCuentaBanco) ?? null) : null;
       const cat = (m.categoria || '').toUpperCase();
       const esTransferencia = _CATEGORIAS_TRANSFERENCIA.some(c => cat.includes(c));
+      // Igual que en `construirVerdadBancaria`: la mayoría de los movimientos
+      // no traen `categoria` — sin esto, `esTransferencia` (arriba) daría
+      // `false` para casi todos y el gate de `consolidarCargos` los tomaría
+      // como "confirmado que NO es transferencia" en vez de "no se sabe".
+      const categoriaConocida = m.categoria != null;
       // Folio propio de Numo — referencia para Transferencia/Cheque (mismo
       // criterio que `construirVerdadBancaria`, ver comentario ahí).
       const referencia = m.folio || null;
@@ -285,7 +290,7 @@ async function construirBancoRealPorTicket(movimientos) {
         // las entradas por ticket — `_elegirBancoRealPorMonto` elige la que
         // corresponde a cada línea por su monto exacto.
         if (!mapa.has(key)) mapa.set(key, []);
-        mapa.get(key).push({ esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
+        mapa.get(key).push({ esTransferencia, categoriaConocida, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }
     }
   }
@@ -315,7 +320,19 @@ function _elegirBancoRealPorMonto(candidatos, monto) {
     // referencia que en realidad pertenece a otro cargo del mismo ticket.
     // Cuando `montoBancoReal` es null (dato no disponible, no se puede
     // validar) se mantiene el comportamiento permisivo de siempre.
-    if (unico.montoBancoReal != null && Math.abs(unico.montoBancoReal - monto) >= 0.01) return null;
+    //
+    // Tolerancia GENEROSA a propósito (no ±$0.01, corregido el mismo
+    // 2026-08-31 al probar este fix): el depósito bancario real casi
+    // siempre difiere un poco del monto declarado en el CFDI (comisiones,
+    // redondeo) — caso real de la misma Global: ticket 260801312, CFDI
+    // $2,345.82 vs depósito real $2,346.00 (diferencia $0.18) — con ±$0.01
+    // se rechazaban TODOS los tickets legítimos de esa factura, no solo el
+    // caso realmente equivocado ($10,000 vs $5,805.27, diferencia ~$4,195).
+    // Umbral: más de $10 O más del 5% del monto (lo que sea mayor) — cubre
+    // holgado el margen de comisiones/redondeo sin dejar de detectar un
+    // monto de una forma de pago completamente distinta.
+    const diferenciaTolerable = Math.max(10, monto * 0.05);
+    if (unico.montoBancoReal != null && Math.abs(unico.montoBancoReal - monto) > diferenciaTolerable) return null;
     return unico;
   }
   const exacto = candidatos.find(c => c.montoBancoReal != null && Math.abs(c.montoBancoReal - monto) < 0.01);
@@ -1294,16 +1311,45 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
       : (m.serie || '');
     const bancario    = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
-    // Solo se confía en `bancario.esTransferencia` cuando el movimiento
-    // bancario SÍ trae `categoria` (SPEI/TRASPASO/otra) — si el match existe
-    // pero la categoría nunca se llenó (`categoriaConocida: false`, el caso
-    // más común), no hay evidencia real de que NO sea transferencia, así que
-    // se usa el formaPago que el propio CFDI declaró. Confirmado con el
+    // Dato POR TICKET (bancoRealPorTicket) — se calcula ANTES del gate y se
+    // reutiliza más abajo (ya no se recalcula dentro del bloque de detalle).
+    // Tiene prioridad sobre `bancario` (CFDI completo) para decidir si ESTA
+    // línea es Transferencia: en una Factura Global, `bancario` resuelve por
+    // `folioFiscal` (toda la factura junta), así que la categoría de UN
+    // ticket cualquiera (ej. "DEPOSITO EN EFECTIVO") apagaba
+    // `esTransferenciaVerificada` para TODOS los demás tickets de la misma
+    // factura, aunque cada uno tuviera su propio depósito real perfectamente
+    // identificado (bug real 2026-08-31, caso real Global 06A72D7F: 5 líneas
+    // de Transferencia genuina, cada una con su propio BankMovement, caían al
+    // bucket genérico "Depósitos consolidados" solo por la categoría de un
+    // SEXTO ticket ajeno de la misma factura). Mismo patrón que ya se usaba
+    // para resolver referencia/monto — solo faltaba aplicarlo también al gate.
+    const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
+      ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
+      : null;
+    // Solo se confía en `esTransferencia` cuando el movimiento bancario SÍ
+    // trae `categoria` (SPEI/TRASPASO/otra) — si el match existe pero la
+    // categoría nunca se llenó (`categoriaConocida: false`, el caso más
+    // común), no hay evidencia real de que NO sea transferencia, así que se
+    // usa el formaPago que el propio CFDI declaró. Confirmado con el
     // usuario: sin esto se perdía el subcódigo 21 en transferencias reales
     // solo por falta de categoría en bank_movements.
-    const esTransferenciaVerificada = bancario?.categoriaConocida
-      ? bancario.esTransferencia
-      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
+    //
+    // IMPORTANTE (2026-08-31): en cuanto exista un match POR TICKET
+    // (`infoTicketTransfCheque`), NUNCA se consulta `bancario` (CFDI
+    // completo) — ni siquiera como fallback cuando el ticket no trae
+    // categoría. `bancario` puede venir de OTRO ticket cualquiera de la
+    // misma Factura Global (mismo `folioFiscal`); "subir" a ese dato cuando
+    // ya se sabe específicamente cuál es el banco/depósito de ESTE ticket
+    // reintroduce el mismo problema que se está corrigiendo. Solo se cae a
+    // `bancario` cuando no hay NINGÚN dato por ticket (`infoTicketTransfCheque
+    // === null` — venta sin ticket propio, o ticket sin ningún BankMovement
+    // ligado).
+    const esTransferenciaVerificada = infoTicketTransfCheque
+      ? (infoTicketTransfCheque.categoriaConocida ? infoTicketTransfCheque.esTransferencia : (m.formaPago === FORMA_PAGO_TRANSFERENCIA))
+      : (bancario?.categoriaConocida
+        ? bancario.esTransferencia
+        : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
     const esAnticipo        = detectarAnticipo && esReglaAnticipo(m.reglaNombre);
     const esAnticipoSinUsar = esAnticipo && esRecepcionAnticipo(m.reglaNombre);
 
@@ -1374,17 +1420,15 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     if ((esTransferenciaVerificada || esChequeDeclarado) && !esRemanenteMenor) {
       const tipoDetalle = esTransferenciaVerificada ? 'TRANSFERENCIA' : 'CHEQUE';
       const subcodigoDetalle = esTransferenciaVerificada ? subcodigoTransferencia : 0;
-      // Info por TICKET (`bancoRealPorTicket`, ver docstring) tiene prioridad
-      // sobre `bancario` (`construirVerdadBancaria`, por CFDI completo): en
-      // una Factura Global, `bancario` puede traer el depósito de OTRO
-      // ticket de la misma factura — confirmado con datos reales 2026-08-18
-      // (Global O0-260800164, ticket 260800269 pagado por Banamex quedaba
-      // con la cuenta BBVA de otro ticket de la misma factura). Sin dato por
-      // ticket (venta normal, no partida), `bancario` sigue siendo correcto
-      // (un solo ticket por CFDI, ambos coinciden).
-      const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
-        ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
-        : null;
+      // `infoTicketTransfCheque` ya se calculó arriba (lo usa también el
+      // gate `esTransferenciaVerificada`) — info por TICKET tiene prioridad
+      // sobre `bancario` (CFDI completo): en una Factura Global, `bancario`
+      // puede traer el depósito de OTRO ticket de la misma factura —
+      // confirmado con datos reales 2026-08-18 (Global O0-260800164, ticket
+      // 260800269 pagado por Banamex quedaba con la cuenta BBVA de otro
+      // ticket de la misma factura). Sin dato por ticket (venta normal, no
+      // partida), `bancario` sigue siendo correcto (un solo ticket por CFDI,
+      // ambos coinciden).
       const referencia = infoTicketTransfCheque?.referencia ?? bancario?.referencia ?? null;
       // Cuenta real del banco donde cayó el depósito (ver
       // `BANCO_A_CODIGO_CUENTA`/`construirVerdadBancaria`) en vez de la

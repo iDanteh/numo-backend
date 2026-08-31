@@ -11,7 +11,7 @@ jest.mock('./CollectionRequest.model');
 
 const CollectionRequest = require('./CollectionRequest.model');
 const {
-  getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, INDICADORES_CR_DESDE,
+  getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, distribucionPorMinutos, INDICADORES_CR_DESDE,
 } = require('./collection-request-indicadores.service');
 
 function mockPopulatingQuery(docs, movimientosPorId) {
@@ -88,6 +88,59 @@ describe('inicioFaseContador() — fix real 2026-08-20: el reloj del contador nu
   test('mismas fechas exactas: cualquiera de las dos, el resultado es ese instante', () => {
     const fecha = new Date('2026-08-20T09:00:00Z');
     expect(inicioFaseContador(fecha, fecha)).toEqual(fecha);
+  });
+});
+
+describe('distribucionPorMinutos() — pedido 2026-08-28: franjas de 30min calibradas contra el ciclo real de carga bancaria', () => {
+  test('bucketing básico con datos conocidos, cortes default [30,60,120] (4 franjas, corrección /frontend-design del mismo día: se sacó el paso de 90min por no representar ningún límite operativo real)', () => {
+    // 5 valores: 10min, 29min, 30min (borde, entra al SIGUIENTE bucket), 75min, 200min.
+    const horasArr = [10 / 60, 29 / 60, 30 / 60, 75 / 60, 200 / 60];
+
+    const res = distribucionPorMinutos(horasArr);
+
+    expect(res).toEqual([
+      { desdeMin: 0,   hastaMin: 30,   count: 2, porcentaje: 40 },  // 10min, 29min
+      { desdeMin: 30,  hastaMin: 60,   count: 1, porcentaje: 20 },  // 30min (borde inclusivo abajo)
+      { desdeMin: 60,  hastaMin: 120,  count: 1, porcentaje: 20 },  // 75min
+      { desdeMin: 120, hastaMin: null, count: 1, porcentaje: 20 }, // 200min, bucket abierto
+    ]);
+  });
+
+  test('los porcentajes suman ~100 (redondeo independiente por bucket, tolerancia chica esperada)', () => {
+    const horasArr = [5, 20, 45, 50, 65, 100, 130].map(m => m / 60);
+
+    const res = distribucionPorMinutos(horasArr);
+    const sumaPorcentajes = res.reduce((acc, b) => acc + b.porcentaje, 0);
+    const sumaCounts = res.reduce((acc, b) => acc + b.count, 0);
+
+    expect(sumaCounts).toBe(horasArr.length);
+    // Cada bucket redondea a 1 decimal de forma independiente (no ajuste tipo "largest
+    // remainder") — la suma puede desviarse de 100 por hasta ~0.05 * cantidad de buckets,
+    // nunca más. No usar toBeCloseTo con precisión alta acá, es matemáticamente esperable
+    // que no dé exactamente 100.
+    expect(Math.abs(sumaPorcentajes - 100)).toBeLessThan(0.5);
+  });
+
+  test('array vacío: todos los buckets en 0, nunca NaN', () => {
+    const res = distribucionPorMinutos([]);
+
+    expect(res).toHaveLength(4);
+    res.forEach(b => {
+      expect(b.count).toBe(0);
+      expect(b.porcentaje).toBe(0);
+      expect(Number.isNaN(b.porcentaje)).toBe(false);
+    });
+  });
+
+  test('cortes custom', () => {
+    const horasArr = [15 / 60, 45 / 60];
+
+    const res = distribucionPorMinutos(horasArr, [30]);
+
+    expect(res).toEqual([
+      { desdeMin: 0, hastaMin: 30, count: 1, porcentaje: 50 },
+      { desdeMin: 30, hastaMin: null, count: 1, porcentaje: 50 },
+    ]);
   });
 });
 
@@ -208,6 +261,20 @@ describe('getIndicadoresSolicitudesCobro()', () => {
     // habría sido ~10 días de horas hábiles.
     expect(res.fase2Contador.promedioHoras).toBeCloseTo(5 / 60, 3);
     expect(res.porUsuario[0].promedioHoras).toBeCloseTo(5 / 60, 3);
+  });
+
+  test('expone distribucionTotal calculada sobre totalHorasArr (25h -> bucket abierto >120min)', async () => {
+    const doc = cr({
+      createdAt:  new Date('2026-08-10T09:00:00Z'),
+      resueltoAt: new Date('2026-08-11T10:00:00Z'), // 25h de total
+    });
+    const movimientosPorId = { 'mov-1': mov('mov-1', '2026-08-10T15:00:00Z') };
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery([doc], movimientosPorId));
+
+    const res = await getIndicadoresSolicitudesCobro({});
+
+    expect(res.distribucionTotal).toEqual(distribucionPorMinutos([25]));
+    expect(res.distribucionTotal.find(b => b.hastaMin === null)).toMatchObject({ count: 1, porcentaje: 100 });
   });
 
   test('porUsuario agrupa por resueltoPorUserId y ordena por count desc', async () => {

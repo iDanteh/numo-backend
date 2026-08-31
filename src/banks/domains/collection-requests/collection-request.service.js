@@ -918,7 +918,11 @@ async function identificar(id, body, user) {
     const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
     const esCheque            = formaPagoEsCheque.get(f.formaPagoId) === true;
     const autJuntos  = movsDeEstaForma.map(m => m.folio || '').join(',');
-    const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || '').join(',');
+    // 2026-08-31 (pedido explícito del usuario, SOLO Solicitudes de Cobro — el cobro
+    // manual de cobro-panel.component.ts no manda este tag si no hay autorización, en
+    // vez de mandar un literal): cuando el depósito no trae autorización bancaria
+    // (OCR no la detectó), se manda la leyenda "NULL" en vez de string vacío.
+    const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || 'NULL').join(',');
     return {
       ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,

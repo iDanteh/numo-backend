@@ -1211,11 +1211,14 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       rfcTercero,
       _esCargoPrincipal: true,
     });
-    // Nombre neutro (no "Anticipo") — mismo motivo que en el bloque de SF: sin
-    // esto, `consolidarCargos`/`esReglaAnticipo` (poliza.service.js) sacaría
-    // esta porción real del consolidado de Efectivo/Tarjeta solo por el texto
-    // "Anticipo" en el nombre completo de la regla.
-    splitPorFormaPagoReal(remanenteRealAnticipo, {}, 'Venta — remanente real (no cubierto por anticipo)');
+    // Nombre neutro — mismo motivo que en el bloque de SF: `esReglaAnticipo`
+    // (poliza.service.js) es un match de texto simple (`/anticipo/i`), así
+    // que el override NUNCA debe contener la palabra "anticipo" o esta línea
+    // se saldría del consolidado de Efectivo/Tarjeta hacia el bloque de
+    // ajustes (bug real encontrado 2026-08-31 probando este mismo fix: el
+    // primer texto usado, "...no cubierto por anticipo", disparaba
+    // exactamente ese problema).
+    splitPorFormaPagoReal(remanenteRealAnticipo, {}, 'Venta — remanente real (no cubierto por OPA)');
   } else {
     // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
     // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta

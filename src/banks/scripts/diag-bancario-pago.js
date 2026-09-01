@@ -46,7 +46,7 @@ async function main() {
   console.log('serie-folio:', cfdi.serie, cfdi.folio);
   console.log('formaPago (header):', cfdi.formaPago);
   console.log('formaDePagoP (complemento):', cfdi.complementoPago?.pagos?.[0]?.formaDePagoP);
-  console.log('doctosRelacionados:', (cfdi.complementoPago?.pagos ?? []).flatMap(p => p.doctosRelacionados ?? []).map(d => `${d.serie}-${d.folio} $${d.impPagado}`));
+  console.log('doctosRelacionados:', (cfdi.complementoPago?.pagos ?? []).flatMap(p => p.doctosRelacionados ?? []).map(d => `${d.serie}-${d.folio} $${d.impPagado} uuid=${d.idDocumento}`));
 
   console.log('\n--- BankMovement ligados por erpLinks.folioFiscal (case-insensitive) ---');
   const movs = await BankMovement.find({
@@ -75,11 +75,20 @@ async function main() {
   // Pago liquida, no al del Pago mismo. Se revisa cada doctoRelacionado.
   const doctos = (cfdi.complementoPago?.pagos ?? []).flatMap(p => p.doctosRelacionados ?? []);
   for (const d of doctos) {
-    console.log(`\n--- Factura liquidada ${d.serie}-${d.folio} ($${d.impPagado}) ---`);
-    const facturaCfdi = await CFDI.findOne({ 'emisor.rfc': rfc, serie: d.serie, folio: String(d.folio) }).lean();
-    if (!facturaCfdi) {
-      console.log('No se encontró el CFDI de esta factura en Mongo.');
-      continue;
+    console.log(`\n--- Factura liquidada ${d.serie}-${d.folio} ($${d.impPagado}) — uuid en doctoRelacionado: ${d.idDocumento} ---`);
+    // d.idDocumento es el UUID REAL de la factura, ya viene en el propio Pago
+    // (SAT IdDocumento). Buscarla por serie/folio es un intento secundario
+    // (por si idDocumento viene vacío) — la fuente de verdad es idDocumento.
+    let facturaCfdi = d.idDocumento ? await CFDI.findOne({ uuid: new RegExp(`^${d.idDocumento}$`, 'i') }).lean() : null;
+    if (facturaCfdi) {
+      console.log('CFDI de la factura encontrado por idDocumento. serie-folio real:', facturaCfdi.serie, facturaCfdi.folio, 'estatus:', facturaCfdi.estatus ?? facturaCfdi.status ?? '?');
+    } else {
+      console.log(d.idDocumento ? 'No se encontró ningún CFDI con ese idDocumento en Mongo.' : 'El doctoRelacionado no trae idDocumento.');
+      facturaCfdi = await CFDI.findOne({ 'emisor.rfc': rfc, serie: d.serie, folio: String(d.folio) }).lean();
+      if (!facturaCfdi) {
+        console.log('Tampoco se encontró por serie-folio.');
+        continue;
+      }
     }
     console.log('uuid de la factura:', facturaCfdi.uuid);
     const movsFactura = await BankMovement.find({
@@ -154,7 +163,7 @@ async function main() {
           }
           if (String(cfdiLink.uuid).toUpperCase() !== String(cfdi.uuid).toUpperCase()) {
             const esRelacionadoDirecto = (Array.isArray(relacionados) ? relacionados : [])
-              .some(r => String(r.UUID || r.uuid || '').toUpperCase() === String(doctos[0]?.uuid || '').toUpperCase());
+              .some(r => String(r.UUID || r.uuid || '').toUpperCase() === String(doctos[0]?.idDocumento || '').toUpperCase());
             console.log(esRelacionadoDirecto ? '  -> SÍ referencia directamente a la factura buscada (sustituto confirmado).' : '  -> revisar manualmente si es sustituto de la factura buscada.');
           }
         }

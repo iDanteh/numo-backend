@@ -1577,7 +1577,46 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
           restanteLinea = parseFloat((restanteLinea - montoSFLinea).toFixed(2));
         }
         if (restanteLinea > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaCargo] ?? null, debe: restanteLinea, haber: 0, _esCargoPrincipal: true });
+          // Split del Cargo por forma de pago REAL de Cobranza (2026-09-01,
+          // exclusivo de Pagos, NO toca Ingreso): `d.desglosePagoReal` viene
+          // de `_prefetchDoctosPago` (`/desgloses-cobro/almacen`, ver ahí) —
+          // cuando trae 1+ formas de pago reales para ESTA factura, se
+          // reparte esta línea en una por cada una (Efectivo real → Caja,
+          // cualquier otra → la cuenta genérica de la regla, igual que
+          // siempre) en vez de un solo Cargo con el `formaPago` genérico que
+          // declara el CFDI de Pago completo — mismo criterio que
+          // `splitPorFormaPagoReal` (Ingreso, más arriba), simplificado: sin
+          // ticket/autorización de Tarjeta por línea (Cobranza no trae
+          // `bancoRealPorTicket` todavía, ver docstring de
+          // `anotarCargosPorFacturaSinAgrupar` en poliza.service.js) y sin
+          // forzar que la suma cierre exacto contra `restanteLinea` — el
+          // desglose real de cajas puede traer "ruido" de reclasificación del
+          // ERP (mismo motivo ya confirmado para Ingreso 2026-08-14/2026-08-19:
+          // se acepta desbalanceado en vez de mandar todo a una sola forma de
+          // pago genérica). Las líneas de Efectivo real quedan tagueadas
+          // `_formaPagoReal:'01'` para que `anotarCargosPorFacturaSinAgrupar`
+          // (poliza.service.js) las consolide en un solo bucket por sucursal,
+          // igual que hace Contado. Sin desglose encontrado: una sola línea
+          // con el `formaPago` de siempre (comportamiento sin cambios).
+          const desgloseFactura = Array.isArray(d.desglosePagoReal) ? d.desglosePagoReal : [];
+          const puedeSplitReal = CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
+            && desgloseFactura.length > 0
+            && !!cuentaMap[CODIGO_CUENTA_CAJA] && !!cuentaMap[CODIGO_CUENTA_BANCOS];
+          if (puedeSplitReal) {
+            desgloseFactura.forEach(fp => {
+              const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
+              if (montoLinea <= 0) return;
+              const esEfectivo = fp.claveSat === '01';
+              movs.push({
+                ...baseFactura,
+                cuentaId: esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : (cuentaMap[rule.cuentaCargo] ?? null),
+                debe: montoLinea, haber: 0, _esCargoPrincipal: true,
+                _formaPagoReal: fp.claveSat ?? null,
+              });
+            });
+          } else {
+            movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaCargo] ?? null, debe: restanteLinea, haber: 0, _esCargoPrincipal: true });
+          }
         }
       }
 

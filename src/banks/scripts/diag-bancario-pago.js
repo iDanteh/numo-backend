@@ -131,6 +131,20 @@ async function main() {
           const cfdiLink = await CFDI.findOne({ uuid: new RegExp(`^${uuidLink}$`, 'i') }).lean();
           if (!cfdiLink) {
             console.log(`UUID ${uuidLink}: no se encontró ningún CFDI con ese uuid en Mongo.`);
+            // El UUID del erpLinks no existe, pero el link también trae
+            // serie/folioExterno del ERP. Se busca si HOY existe un CFDI con
+            // esa misma serie+folio pero OTRO uuid — indicaría que la factura
+            // fue cancelada/sustituida y el registro se sobrescribió in-place.
+            for (const l of (m.erpLinks || [])) {
+              if (l.folioFiscal !== uuidLink) continue;
+              if (!l.serie || !l.folioExterno) continue;
+              const actual = await CFDI.findOne({ 'emisor.rfc': rfc, serie: l.serie, folio: String(l.folioExterno) }).lean();
+              if (actual) {
+                console.log(`  Hoy existe un CFDI con esa misma serie-folio (${l.serie}-${l.folioExterno}) pero uuid distinto: ${actual.uuid} (estatus=${actual.estatus ?? actual.status ?? '?'}) -> probable sustituto/reemplazo in-place.`);
+              } else {
+                console.log(`  Tampoco existe ningún CFDI con serie-folio ${l.serie}-${l.folioExterno} en Mongo.`);
+              }
+            }
             continue;
           }
           console.log(`UUID ${uuidLink} => CFDI ${cfdiLink.tipoDeComprobante} ${cfdiLink.serie}-${cfdiLink.folio}, estatus=${cfdiLink.estatus ?? cfdiLink.status ?? '?'}`);

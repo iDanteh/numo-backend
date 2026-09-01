@@ -214,6 +214,13 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
   `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (movimientos):', e.message));
 
+  // uuid real de la factura que un Pago (Cobranza) liquida — distinto del
+  // uuid del Pago (cfdi_uuid). Ver PolizaMovimiento.js / diag-bancario-pago.js.
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS factura_uuid VARCHAR(36)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN factura_uuid:', e.message));
+
   await Poliza.sequelize.query(`
     ALTER TABLE cfdi_mapping_rules
       ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)

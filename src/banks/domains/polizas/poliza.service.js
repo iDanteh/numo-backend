@@ -1243,7 +1243,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
         tipoOrigen: m.tipoOrigen, _subcodigo: 0,
       };
     }
-    const bancario = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
+    // Mismo criterio que al construir `verdadBancaria` arriba: `facturaUuid`
+    // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
+    // Pago) — ver comentario en el caller.
+    const bancario = verdadBancaria?.get((m.facturaUuid || m.cfdiUuid || '').toUpperCase());
     const esTransferenciaVerificada = bancario?.categoriaConocida
       ? bancario.esTransferencia
       : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
@@ -2698,7 +2701,13 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // VENDEDOR de una factura PPD (Clientes/cuenta puente), que comparte el
   // mismo `cfdiUuid` que el lado cobrador — confirmado con el usuario
   // 2026-08-04.
-  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.cfdiUuid, serie: m.serie })));
+  // En líneas de Cobranza partidas por factura, `facturaUuid` (uuid real de
+  // la factura liquidada) tiene prioridad sobre `cfdiUuid` (uuid del Pago) —
+  // bank_movements.erpLinks.folioFiscal se liga al uuid de la factura
+  // original, no al del Pago que la liquida (confirmado con datos reales
+  // 2026-09-01, ver diag-bancario-pago.js). Para Ingreso `facturaUuid` nunca
+  // se llena, así que este cambio no afecta ese flujo.
+  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })));
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
   // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.

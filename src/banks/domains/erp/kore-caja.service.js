@@ -22,6 +22,17 @@ async function _cajaUrl()     { return globalConfigService.getValue('kore', 'CAJ
 // Exportada (no con guión bajo) porque erp.routes.js también la necesita
 // directo para sus propias rutas /cobros/conceptos y /cobros/anticipos/*.
 async function obtenerCajaBaseUrl() { return globalConfigService.getValue('kore', 'CAJA_BASE_URL'); }
+// Token estático del ERP (Configuraciones Globales, sección `bancos`, clave
+// TOKEN) — MISMO token que usa erp-sync.service.js#_token() para
+// sincronizarCuentasPendientes. A diferencia del resto de las funciones de
+// este archivo (que usan un koreToken por usuario, obtenido vía
+// obtenerTokenKore/obtenerSesionCaja), buscarTransferenciasCajas es una
+// consulta de reporte a nivel sistema, no ligada a la sesión de caja de un
+// cajero — mismo criterio que sincronizarCuentasPendientes.
+async function _tokenEstatico() {
+  return globalConfigService.getValue('bancos', 'TOKEN');
+}
+
 // Catálogos de bancos y formas de pago — antes exclusivos de erp.routes.js
 // (GET /cobros/bancos, /formas-pago); se movieron acá 2026-07-28 para que
 // collection-request.service.js pueda resolver BancoID al aplicar un cobro
@@ -166,6 +177,36 @@ async function obtenerCuentasKore(koreToken, ids) {
       diasTolerancia: d.DiasTolerancia ?? 0,
     })),
   }));
+}
+
+// Transferencias internas entre cajas (sucursal → gerente, ver bitácora del
+// endpoint) — GET /transferencias/reportes/buscar. Solo trae los datos crudos
+// de Kore, sin ninguna lógica de matching/estatus/ficha contra BankMovement
+// (eso se implementa en una fase posterior, ver comentario en
+// collection-request.service.js si en el futuro se agrega ese cruce). Mismo
+// criterio que sincronizarCuentasPendientes en erp-sync.service.js: query
+// params opcionales, token estático de Configuraciones Globales.
+async function buscarTransferenciasCajas(params = {}) {
+  const queryParams = {};
+  if (params.fechaDesde) queryParams.fechaDesde = params.fechaDesde;
+  if (params.fechaHasta) queryParams.fechaHasta = params.fechaHasta;
+
+  let response;
+  try {
+    response = await axios.get(`${await obtenerCajaBaseUrl()}/transferencias/reportes/buscar`, {
+      params:  queryParams,
+      headers: { Authorization: `Bearer ${await _tokenEstatico()}` },
+      timeout: 15000,
+    });
+  } catch (axiosErr) {
+    if (!axiosErr.response) throw axiosErr; // error de red/timeout — dejar que asyncHandler lo maneje
+    const { msg, koreBody } = _mensajeErrorKore(axiosErr, `Error al consultar transferencias de cajas (${axiosErr.response.status})`);
+    console.warn(`[buscarTransferenciasCajas] Kore rechazó con ${axiosErr.response.status}:`, JSON.stringify(koreBody));
+    throw new KoreCajaError(msg, axiosErr.response.status, koreBody);
+  }
+
+  const raw = response.data?.Data?.transferencias || [];
+  return { raw };
 }
 
 // Catálogo de bancos de Kore — mismo mapeo que ya usaba GET /cobros/bancos en
@@ -372,6 +413,7 @@ module.exports = {
   obtenerTokenKore,
   obtenerSesionCaja,
   obtenerCuentasKore,
+  buscarTransferenciasCajas,
   listarBancos,
   listarFormasPago,
   aplicarCobroOperacion,

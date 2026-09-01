@@ -1143,16 +1143,60 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           serieOrigen: u.serieOrigen ?? null, folioOrigen: u.folioOrigen ?? null,
           monto: Math.abs(Number(u.montoUsado)) || 0,
           ventaSerie: u.serieVenta ?? null, ventaFolio: u.folioVenta ?? null,
-          // Saldo que le queda al cliente de ESTE origen después de este uso
-          // (autoritativo del ERP, mismo campo que ya usa el lado de
-          // GENERACIÓN para detectar `usoCompleto` — ver `_diaMx`/`usoCompleto`
-          // arriba). Puramente informativo: no afecta el `debe` real de la
-          // línea de Cargo (confirmado con el usuario 2026-09-01) — solo se
-          // usa para anotar "(saldo disponible: $X)" en el concepto cuando
-          // queda un remanente (ver `emitirLineaSF` en cfdi-mapping.service.js).
-          saldoSobrante: Number.isFinite(Number(u.montoSobrante)) ? Number(u.montoSobrante) : null,
+          // Venta CONSUMIDORA (ticket que usó el saldo, no el que lo generó) y
+          // fecha exacta del uso — sirven solo para encontrar el `uso` correcto
+          // dentro de `gen.usos[]` al consultar por la venta origen abajo
+          // (`saldoSobrante`). Nunca se exponen fuera de esta función.
+          _consumidoraSerie: cuenta.serieVenta ?? null, _consumidoraFolio: cuenta.folioVenta ?? null,
+          // Saldo que le queda al cliente de ESTE origen después de este uso.
+          // El ERP NO manda este dato en `saldosFavorUsados[]` (confirmado
+          // 2026-09-01 con datos reales) — solo viene en
+          // `saldosFavorGenerados[].usos[].montoSobrante` de la VENTA QUE
+          // GENERÓ el saldo. Se completa más abajo con una consulta extra por
+          // esa venta origen. Puramente informativo: no afecta el `debe` real
+          // de la línea de Cargo — solo se usa para anotar "(saldo disponible:
+          // $X)" en el concepto cuando queda un remanente (ver `emitirLineaSF`
+          // en cfdi-mapping.service.js).
+          saldoSobrante: null,
         }))],
       });
+    }
+
+    // Completar `saldoSobrante`: consulta extra por cada venta ORIGEN distinta
+    // encontrada arriba (no la consumidora) para leer `usos[].montoSobrante` —
+    // ver comentario en el bucle de arriba sobre por qué no viene directo en
+    // `saldosFavorUsados[]`.
+    const origenesAConsultar = new Map();
+    for (const { detalle } of saldoFavorUsado.values()) {
+      for (const d of detalle) {
+        if (d.ventaSerie && d.ventaFolio) {
+          origenesAConsultar.set(`${d.ventaSerie}|${d.ventaFolio}`, { serie: d.ventaSerie, folio: d.ventaFolio });
+        }
+      }
+    }
+    if (origenesAConsultar.size > 0) {
+      const paresOrigen = [...origenesAConsultar.values()];
+      const usosPorMarcador = new Map(); // "SERIEORIGEN|folioOrigen" -> usos[]
+      const LOTE_ORIGEN = 150;
+      for (let i = 0; i < paresOrigen.length; i += LOTE_ORIGEN) {
+        const lote = paresOrigen.slice(i, i + LOTE_ORIGEN);
+        const cuentasOrigen = await obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
+        for (const cuentaOrigen of cuentasOrigen) {
+          for (const gen of (cuentaOrigen.saldosFavorGenerados ?? [])) {
+            usosPorMarcador.set(`${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`, gen.usos ?? []);
+          }
+        }
+      }
+      for (const entry of saldoFavorUsado.values()) {
+        entry.detalle = entry.detalle.map((d) => {
+          const usosOrigen = usosPorMarcador.get(`${(d.serieOrigen ?? '').toUpperCase()}|${d.folioOrigen ?? ''}`);
+          if (!usosOrigen) return d;
+          const usoMatch = usosOrigen.find(u => u.serieVenta === d._consumidoraSerie && u.folioVenta === d._consumidoraFolio
+            && Math.abs((Math.abs(Number(u.montoUsado)) || 0) - d.monto) < 0.01);
+          if (!usoMatch) return d;
+          return { ...d, saldoSobrante: Number.isFinite(Number(usoMatch.montoSobrante)) ? Number(usoMatch.montoSobrante) : null };
+        });
+      }
     }
   }
 

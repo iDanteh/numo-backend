@@ -2895,12 +2895,21 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       // la etiqueta va en reglaNombre, no en serie -- `serie` es varchar(25) en
       // Postgres y no le cabe "COS-TRANSFERENCIA".
       const columnaC = /^COS\b/.test(m.reglaNombre || '') ? m.reglaNombre : (m.serie || '');
+      // `cuentaFaltante` (cuenta no encontrada en el catálogo, ej. código mal
+      // configurado en una regla): sin este resguardo, `Number(undefined)` =
+      // NaN se escribía literalmente en la celda (`<v>NaN</v>`, inválido en el
+      // XML de Excel) — Excel entero rechazaba el archivo con "se encontró un
+      // problema con el contenido" en vez de solo esa línea (confirmado con
+      // el usuario 2026-09-01). 0 dentro de un archivo que además marca
+      // `cuentaFaltante` es una señal clara de "corregir manualmente", nunca
+      // se confunde con una cuenta real (ningún código empieza en 0).
+      const _numOr0 = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
       const row = sheet.addRow([
         'M1',
-        Number(m.cuenta?.codigo),
+        _numOr0(m.cuenta?.codigo),
         columnaC,
         esCargo ? 0 : 1,
-        esCargo ? Number(m.debe) : Number(m.haber),
+        esCargo ? _numOr0(m.debe) : _numOr0(m.haber),
         m._subcodigo ?? 0,
         0,
         m.concepto || '',

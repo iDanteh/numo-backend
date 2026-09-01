@@ -1370,7 +1370,7 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         const ivaDoc = (dr.trasladosDR ?? [])
           .filter(t => (t.impuesto || t.Impuesto || '') === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
           .reduce((s, t) => s + Number(t.importe || t.importeDR || t.ImporteDR || 0), 0);
-        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc });
+        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc, desglosePagoReal: [] });
         paresVistos.set(`${serie}|${folio}`, { serie, folio });
       }
     }
@@ -1381,24 +1381,67 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 
   const pares = [...paresVistos.values()];
   const LOTE  = 150;
-  const saldoFavorPorFactura = new Map(); // `${serie}|${folio}` de la factura → monto usado
+  const saldoFavorPorFactura     = new Map(); // `${serie}|${folio}` de la factura → monto usado
+  // Desglose real de cobro en caja (Efectivo/Tarjeta/Transferencia) por
+  // factura liquidada — mismo endpoint que usa Ingreso vía
+  // `_prefetchAjustesFacturaPropia` (`/desgloses-cobro/almacen`), pero con un
+  // parseo deliberadamente más simple (2026-09-01, exclusivo de Pagos, NO
+  // toca nada de Ingreso): no filtra por día ni por centro del cobro — misma
+  // "simplificación consciente" ya documentada arriba para Saldo a Favor,
+  // porque un Pago PPD casi siempre ocurre días después de la venta que
+  // liquida. Solo se usa para poder identificar cuándo una factura se cobró
+  // ÍNTEGRAMENTE en Efectivo real (ver `cfdiToMovimientos`/`esSplitPagoPorFactura`
+  // en cfdi-mapping.service.js) y así sacarla de la cuenta genérica "por
+  // identificar" — nunca para partir proporcionalmente entre varias formas de
+  // pago (eso sí sería el camino completo de Ingreso, fuera de alcance aquí).
+  const desglosePagoRealPorFactura = new Map(); // `${serie}|${folio}` → [{ monto, claveSat }]
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
-    const resultado = await obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
-    for (const cuenta of resultado) {
+    const [resultadoSF, resultadoAlmacen] = await Promise.all([
+      obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) }),
+      obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) }),
+    ]);
+    for (const cuenta of resultadoSF) {
       const usados = cuenta.saldosFavorUsados ?? [];
       if (!usados.length) continue;
       const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
       if (monto > 0) saldoFavorPorFactura.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, monto);
     }
+    for (const cuenta of resultadoAlmacen) {
+      const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+      const formasPago = [];
+      for (const cobro of (cuenta.cobros ?? [])) {
+        const cobrosFormaPago = cobro.formasPago ?? [];
+        for (const fp of cobrosFormaPago) {
+          // Mismo criterio de texto que `_prefetchAjustesFacturaPropia`:
+          // Puntos/Saldo a favor/Anticipo no son dinero nuevo cobrado hoy —
+          // se excluyen para no confundirlos con Efectivo/Bancos real.
+          if (/puntos/i.test(fp.nombre ?? '')) continue;
+          if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+          if (/anticipo/i.test(fp.nombre ?? '')) continue;
+          // Mismo ajuste que `_prefetchAjustesFacturaPropia` (bug del ERP:
+          // `formasPago[].monto` repite el total del pago en cada ticket
+          // afectado cuando un cobro cierra varios tickets desiguales) —
+          // `cobro.monto` sí trae el monto real cuando solo hay una forma
+          // de pago en ese cobro.
+          const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
+            ? Math.abs(Number(cobro.monto) || 0)
+            : (Number(fp.monto) || 0);
+          if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null });
+        }
+      }
+      if (formasPago.length) {
+        const prev = desglosePagoRealPorFactura.get(key) ?? [];
+        desglosePagoRealPorFactura.set(key, [...prev, ...formasPago]);
+      }
+    }
   }
 
-  if (saldoFavorPorFactura.size > 0) {
-    for (const doctos of doctosPorUuid.values()) {
-      for (const d of doctos) {
-        const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
-        if (sf > 0) d.montoSF = sf;
-      }
+  for (const doctos of doctosPorUuid.values()) {
+    for (const d of doctos) {
+      const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
+      if (sf > 0) d.montoSF = sf;
+      d.desglosePagoReal = desglosePagoRealPorFactura.get(`${d.serie}|${d.folio}`) ?? [];
     }
   }
 

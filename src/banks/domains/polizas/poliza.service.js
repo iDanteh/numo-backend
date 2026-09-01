@@ -1349,6 +1349,17 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   }
 
   return consolidado.map(m => {
+    // Las líneas de Abono/IVA (debe=0) nunca pasaron por el primer `.map()`
+    // de arriba (que las regresa tal cual, `if (!(Number(m.debe) > 0)) return m;`)
+    // — siguen siendo la instancia de Sequelize original. NUNCA destructurar/
+    // spread una instancia de Sequelize (`{...m}` o `{...resto} = m`): no
+    // copia bien `debe`/`haber`/`concepto` (confirmado con datos reales
+    // 2026-08-11, y de nuevo 2026-09-01 con Cobranza — salían en $0.00 y
+    // concepto vacío en el Excel). Solo los objetos armados a mano en ese
+    // primer `.map()` (Cargo, debe>0) traen el campo `_referenciaBancoReal`
+    // — es la única señal segura de "esto ya es un objeto plano, se puede
+    // destructurar sin miedo".
+    if (!('_referenciaBancoReal' in m)) return m;
     if (!('_tickets' in m) || m._tickets == null) {
       const { _referenciaBancoReal, ...resto } = m;
       return resto;

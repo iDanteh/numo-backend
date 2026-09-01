@@ -1266,7 +1266,16 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
     // `armarIndividual` en `consolidarCargos`, se listan los campos a mano.
     return {
-      cuenta:         bancario?.cuentaBanco ?? m.cuenta,
+      // Solo se reemplaza por el banco real cuando SÍ hay transferencia
+      // verificada (2026-09-01, bug real de Cobranza) — antes se sobrescribía
+      // sin importar el resultado del gate: un Pago identificado como
+      // Efectivo real (`_formaPagoReal`/'01') podía coincidir por casualidad
+      // con OTRO movimiento bancario ligado al mismo `cfdiUuid` (folioFiscal
+      // del Pago completo, no de esta línea específica) y terminaba mostrando
+      // un banco real (BBVA/Banamex) en vez de Caja, con el concepto
+      // "EFECTIVO" — mezclando cuentas distintas bajo la misma etiqueta y
+      // evitando que el bucket de Efectivo (más abajo) las agrupara.
+      cuenta:         esTransferenciaVerificada ? (bancario?.cuentaBanco ?? m.cuenta) : m.cuenta,
       cuentaId:       m.cuentaId,
       serie:          referenciaBancoReal ?? m.serie,
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
@@ -1284,6 +1293,21 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     };
   });
 
+  // Separa el Cargo bancario (dinero recibido — Cargo real, ni SF ni Abono/
+  // IVA) del resto: en la póliza de Cobranza el Cargo va TODO junto al final,
+  // después de las líneas de Abono a Clientes/IVA reclasificado de cada
+  // factura (confirmado con el usuario 2026-09-01, ver ejemplo real
+  // "23 (1).xls" — bloque de asientos por factura primero, bloque de
+  // depósitos consolidados al final). Las de Saldo a Favor
+  // (`TIPO_ORIGEN_CARGO_ESPECIAL`) se quedan en su posición original junto a
+  // su factura — no son un depósito bancario real, no tiene sentido moverlas.
+  const otrasLineas = [];
+  const cargoLineas = [];
+  for (const m of anotados) {
+    const esCargoBancario = Number(m.debe) > 0 && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL;
+    (esCargoBancario ? cargoLineas : otrasLineas).push(m);
+  }
+
   // Fusiona el Cargo (dinero recibido) cuando dos o más facturas — del mismo
   // Complemento de Pago o de Pagos distintos — comparten el MISMO depósito
   // bancario real (misma cuenta + misma referencia/folio verificado): es
@@ -1297,8 +1321,8 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   // cada factura NO se tocan — solo el Cargo bancario.
   const grupos = new Map();
   const conReferenciaFusionada = [];
-  for (const m of anotados) {
-    if (!(Number(m.debe) > 0) || m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL || !m._referenciaBancoReal) {
+  for (const m of cargoLineas) {
+    if (!m._referenciaBancoReal) {
       conReferenciaFusionada.push(m);
       continue;
     }
@@ -1330,8 +1354,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   const bucketsEfectivo = new Map();
   const consolidado = [];
   for (const m of conReferenciaFusionada) {
-    const esEfectivoRealSinReferencia = Number(m.debe) > 0 && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL
-      && !m._referenciaBancoReal && m.formaPago === '01';
+    const esEfectivoRealSinReferencia = !m._referenciaBancoReal && m.formaPago === '01';
     if (!esEfectivoRealSinReferencia) {
       consolidado.push(m);
       continue;
@@ -1348,17 +1371,15 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     }
   }
 
-  return consolidado.map(m => {
-    // Las líneas de Abono/IVA (debe=0) nunca pasaron por el primer `.map()`
-    // de arriba (que las regresa tal cual, `if (!(Number(m.debe) > 0)) return m;`)
-    // — siguen siendo la instancia de Sequelize original. NUNCA destructurar/
-    // spread una instancia de Sequelize (`{...m}` o `{...resto} = m`): no
-    // copia bien `debe`/`haber`/`concepto` (confirmado con datos reales
-    // 2026-08-11, y de nuevo 2026-09-01 con Cobranza — salían en $0.00 y
-    // concepto vacío en el Excel). Solo los objetos armados a mano en ese
-    // primer `.map()` (Cargo, debe>0) traen el campo `_referenciaBancoReal`
-    // — es la única señal segura de "esto ya es un objeto plano, se puede
-    // destructurar sin miedo".
+  const cargoFinal = consolidado.map(m => {
+    // Objetos armados a mano en el primer `.map()` de arriba (Cargo, debe>0)
+    // — siempre traen `_referenciaBancoReal` (aunque sea null), así que esto
+    // nunca debería ejecutarse para nada dentro de `cargoLineas`; se deja
+    // como resguardo defensivo. NUNCA destructurar/spread una instancia de
+    // Sequelize (`{...m}` o `{...resto} = m`): no copia bien
+    // `debe`/`haber`/`concepto` (confirmado con datos reales 2026-08-11, y
+    // de nuevo 2026-09-01 con Cobranza — salían en $0.00 y concepto vacío en
+    // el Excel).
     if (!('_referenciaBancoReal' in m)) return m;
     if (!('_tickets' in m) || m._tickets == null) {
       const { _referenciaBancoReal, ...resto } = m;
@@ -1367,6 +1388,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     const { _nombreCliente, _tickets, _referenciaBancoReal, ...resto } = m;
     return { ...resto, concepto: [_nombreCliente, ..._tickets].filter(Boolean).join(' / ') };
   });
+
+  // Bloque de Abono/IVA/SF (orden original, por factura) primero, bloque de
+  // Cargo bancario consolidado (depósitos) al final — ver comentario arriba.
+  return [...otrasLineas, ...cargoFinal];
 }
 
 // Mismo literal que usa `_inyectarSaldoFavorGenerado` (cfdi-poliza-generator.

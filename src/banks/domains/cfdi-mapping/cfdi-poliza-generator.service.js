@@ -295,7 +295,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         return (marcador && venta) ? { marcador, venta, cfdiSerie: cfdi.serie ?? null } : null;
       })
       .filter(Boolean);
-    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [] };
     devolucionesConVenta.forEach(d => cfdiSeriePorVenta.set(`${d.venta.serie}|${d.venta.folio}`, d.cfdiSerie));
 
     const LOTE = 150;
@@ -312,7 +312,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         }
       }
     }
-    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [] };
 
     const paresGeneracion = [...new Map(
       generadosPorCuenta.map(({ cuenta }) => [`${cuenta.serieVenta}|${cuenta.folioVenta}`, { serie: cuenta.serieVenta, folio: cuenta.folioVenta }]),
@@ -1352,10 +1352,12 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
  */
 async function _prefetchDoctosPago(cfdiConRegla, rfc) {
   const pagos = cfdiConRegla.filter(({ cfdi }) => cfdi.tipoDeComprobante === 'P');
-  const doctosPorUuid = new Map(); // uuid del Pago → [{ serie, folio, monto }]
-  const paresVistos   = new Map(); // `${serie}|${folio}` → { serie, folio } (dedup entre Pagos)
+  const doctosPorUuid   = new Map(); // uuid del Pago → [{ serie, folio, monto }]
+  const paresVistos     = new Map(); // `${serie}|${folio}` → { serie, folio } (dedup entre Pagos)
+  const fechaPagoPorUuid = new Map(); // uuid del Pago → cfdi.fecha (para filtrar el desglose real por día)
 
   for (const { cfdi } of pagos) {
+    fechaPagoPorUuid.set(cfdi.uuid, cfdi.fecha ?? null);
     const doctos = [];
     for (const pago of (cfdi.complementoPago?.pagos ?? [])) {
       for (const dr of (pago.doctosRelacionados ?? [])) {
@@ -1381,20 +1383,18 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 
   const pares = [...paresVistos.values()];
   const LOTE  = 150;
-  const saldoFavorPorFactura     = new Map(); // `${serie}|${folio}` de la factura → monto usado
-  // Desglose real de cobro en caja (Efectivo/Tarjeta/Transferencia) por
-  // factura liquidada — mismo endpoint que usa Ingreso vía
-  // `_prefetchAjustesFacturaPropia` (`/desgloses-cobro/almacen`), pero con un
-  // parseo deliberadamente más simple (2026-09-01, exclusivo de Pagos, NO
-  // toca nada de Ingreso): no filtra por día ni por centro del cobro — misma
-  // "simplificación consciente" ya documentada arriba para Saldo a Favor,
-  // porque un Pago PPD casi siempre ocurre días después de la venta que
-  // liquida. Solo se usa para poder identificar cuándo una factura se cobró
-  // ÍNTEGRAMENTE en Efectivo real (ver `cfdiToMovimientos`/`esSplitPagoPorFactura`
-  // en cfdi-mapping.service.js) y así sacarla de la cuenta genérica "por
-  // identificar" — nunca para partir proporcionalmente entre varias formas de
-  // pago (eso sí sería el camino completo de Ingreso, fuera de alcance aquí).
-  const desglosePagoRealPorFactura = new Map(); // `${serie}|${folio}` → [{ monto, claveSat }]
+  const saldoFavorPorFactura = new Map(); // `${serie}|${folio}` de la factura → monto usado
+  // Cobros CRUDOS (sin sumar todavía) de `/desgloses-cobro/almacen` por
+  // factura — una misma factura PPD puede recibir VARIOS pagos parciales en
+  // fechas distintas, cada uno su propio Complemento de Pago; este endpoint
+  // se consulta por serie/folio de la FACTURA (no del Pago), así que devuelve
+  // el HISTORIAL COMPLETO de cobros de esa factura, no solo el de HOY. Filtrar
+  // por fecha (abajo, contra `cfdi.fecha` de CADA Pago) es obligatorio — sin
+  // esto, un Pago que liquida el remanente de una factura con pagos previos
+  // se queda con el desglose acumulado de TODOS los pagos anteriores también,
+  // desbalanceando el asiento (bug real 2026-09-01, detectado en testnumo:
+  // "ASIENTO DESBALANCEADO" con diferencias de hasta 8x el monto real).
+  const cobrosCrudosPorFactura = new Map(); // `${serie}|${folio}` → cobro[] (con su `fecha` propia)
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
     const [resultadoSF, resultadoAlmacen] = await Promise.all([
@@ -1409,39 +1409,52 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
     }
     for (const cuenta of resultadoAlmacen) {
       const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
-      const formasPago = [];
-      for (const cobro of (cuenta.cobros ?? [])) {
-        const cobrosFormaPago = cobro.formasPago ?? [];
-        for (const fp of cobrosFormaPago) {
-          // Mismo criterio de texto que `_prefetchAjustesFacturaPropia`:
-          // Puntos/Saldo a favor/Anticipo no son dinero nuevo cobrado hoy —
-          // se excluyen para no confundirlos con Efectivo/Bancos real.
-          if (/puntos/i.test(fp.nombre ?? '')) continue;
-          if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
-          if (/anticipo/i.test(fp.nombre ?? '')) continue;
-          // Mismo ajuste que `_prefetchAjustesFacturaPropia` (bug del ERP:
-          // `formasPago[].monto` repite el total del pago en cada ticket
-          // afectado cuando un cobro cierra varios tickets desiguales) —
-          // `cobro.monto` sí trae el monto real cuando solo hay una forma
-          // de pago en ese cobro.
-          const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
-            ? Math.abs(Number(cobro.monto) || 0)
-            : (Number(fp.monto) || 0);
-          if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null });
-        }
-      }
-      if (formasPago.length) {
-        const prev = desglosePagoRealPorFactura.get(key) ?? [];
-        desglosePagoRealPorFactura.set(key, [...prev, ...formasPago]);
-      }
+      const cobros = cuenta.cobros ?? [];
+      if (!cobros.length) continue;
+      cobrosCrudosPorFactura.set(key, [...(cobrosCrudosPorFactura.get(key) ?? []), ...cobros]);
     }
   }
 
-  for (const doctos of doctosPorUuid.values()) {
+  // Extrae `[{monto, claveSat}]` de los `cobros[]` de una factura, quedándose
+  // SOLO con los del mismo día calendario (México) que el Pago que se está
+  // procesando — mismo criterio de fecha que `_diaMx`/`_diferenciaDiasMx`
+  // (arriba, usadas por Ingreso), tolerancia 0 (a diferencia de Ingreso, que
+  // tolera ±1 día por facturación diferida: aquí no hay ese desfase, el cobro
+  // y el Pago son el mismo evento).
+  const extraerFormasPagoDelDia = (cobros, fechaPago) => {
+    const diaPago = _diaMx(fechaPago);
+    const formasPago = [];
+    for (const cobro of cobros) {
+      if (diaPago && _diferenciaDiasMx(cobro.fecha, diaPago) !== 0) continue;
+      const cobrosFormaPago = cobro.formasPago ?? [];
+      for (const fp of cobrosFormaPago) {
+        // Mismo criterio de texto que `_prefetchAjustesFacturaPropia`:
+        // Puntos/Saldo a favor/Anticipo no son dinero nuevo cobrado hoy — se
+        // excluyen para no confundirlos con Efectivo/Bancos real.
+        if (/puntos/i.test(fp.nombre ?? '')) continue;
+        if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+        if (/anticipo/i.test(fp.nombre ?? '')) continue;
+        // Mismo ajuste que `_prefetchAjustesFacturaPropia` (bug del ERP:
+        // `formasPago[].monto` repite el total del pago en cada ticket
+        // afectado cuando un cobro cierra varios tickets desiguales) —
+        // `cobro.monto` sí trae el monto real cuando solo hay una forma de
+        // pago en ese cobro.
+        const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
+          ? Math.abs(Number(cobro.monto) || 0)
+          : (Number(fp.monto) || 0);
+        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null });
+      }
+    }
+    return formasPago;
+  };
+
+  for (const [uuid, doctos] of doctosPorUuid.entries()) {
+    const fechaPago = fechaPagoPorUuid.get(uuid);
     for (const d of doctos) {
       const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
       if (sf > 0) d.montoSF = sf;
-      d.desglosePagoReal = desglosePagoRealPorFactura.get(`${d.serie}|${d.folio}`) ?? [];
+      const cobrosCrudos = cobrosCrudosPorFactura.get(`${d.serie}|${d.folio}`) ?? [];
+      d.desglosePagoReal = extraerFormasPagoDelDia(cobrosCrudos, fechaPago);
     }
   }
 

@@ -162,6 +162,28 @@ async function main() {
     }
   }
 
+  // Si las facturas referenciadas por erpLinks no existen ni por uuid ni por
+  // serie-folio, puede ser un hueco puntual o un hueco sistemático de
+  // sincronización. Se revisa qué folios de la serie A0 SÍ existen alrededor
+  // de la factura buscada y de la referenciada por el banco, para distinguir
+  // ambos casos.
+  console.log('\n--- Folios A0 existentes en Mongo cerca de 260701095 y 260703472 ---');
+  const foliosA0 = await CFDI.find({ 'emisor.rfc': rfc, serie: 'A0' })
+    .sort({ folio: 1 })
+    .select('folio fecha tipoDeComprobante')
+    .lean();
+  console.log(`Total CFDIs serie A0 para ${rfc} en Mongo:`, foliosA0.length);
+  if (foliosA0.length) {
+    console.log('Folio mínimo:', foliosA0[0].folio, foliosA0[0].fecha);
+    console.log('Folio máximo:', foliosA0[foliosA0.length - 1].folio, foliosA0[foliosA0.length - 1].fecha);
+    const cercaDe = (objetivo) => foliosA0
+      .map(c => ({ folio: c.folio, fecha: c.fecha, dist: Math.abs(Number(c.folio) - objetivo) }))
+      .sort((x, y) => x.dist - y.dist)
+      .slice(0, 5);
+    console.log('Folios más cercanos a 260701095:', JSON.stringify(cercaDe(260701095)));
+    console.log('Folios más cercanos a 260703472:', JSON.stringify(cercaDe(260703472)));
+  }
+
   await mongoose.disconnect();
 }
 

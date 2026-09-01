@@ -88,6 +88,16 @@ const PolizaMovimiento = sequelize.define('PolizaMovimiento', {
     type:      DataTypes.STRING(36),
     allowNull: true,
   },
+  // uuid real de la FACTURA que este Pago liquida (SAT IdDocumento del
+  // doctoRelacionado) — distinto de `cfdiUuid` (uuid del Pago/Complemento).
+  // Solo se llena en líneas de Cobranza partidas por factura (ver
+  // `cobranza-poliza-generator.service.js`): bank_movements.erpLinks.
+  // folioFiscal se liga al uuid de la factura original, no al del Pago
+  // (confirmado con datos reales 2026-09-01).
+  facturaUuid: {
+    type:      DataTypes.STRING(36),
+    allowNull: true,
+  },
   rfcTercero: {
     type:      DataTypes.STRING(13),
     allowNull: true,

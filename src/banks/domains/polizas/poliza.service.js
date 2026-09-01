@@ -1386,7 +1386,13 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     const key = `${m.cuenta?.codigo}|${claveCentro}`;
     const existente = bucketsEfectivo.get(key);
     if (!existente) {
-      const bucket = { ...m, concepto: `EFECTIVO ${claveCentro}`.trim(), cfdiUuid: null, _tickets: null };
+      // `serie` (columna C) se vacía a propósito: este renglón puede sumar
+      // Pagos DISTINTOS de la misma sucursal (bug real 2026-09-01— dejaba la
+      // referencia del PRIMER Pago que armaba el bucket, ej. "A0-260800101",
+      // como si todo el monto viniera de ahí, cuando en realidad mezclaba
+      // varios Pagos). Sin una referencia única que mostrar, se deja en
+      // blanco — mismo criterio que usa Contado para "Depósitos consolidados".
+      const bucket = { ...m, serie: '', concepto: `EFECTIVO ${claveCentro}`.trim(), cfdiUuid: null, _tickets: null };
       bucketsEfectivo.set(key, bucket);
       consolidado.push(bucket);
     } else {

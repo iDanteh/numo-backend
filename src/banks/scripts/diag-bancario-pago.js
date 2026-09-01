@@ -69,6 +69,55 @@ async function main() {
   const info = verdad.get(cfdi.uuid.toUpperCase());
   console.log(info ?? 'undefined (sin match en absoluto)');
 
+  // El match por erpLinks.folioFiscal se hace contra el UUID del PAGO — pero
+  // la conciliación bancaria se armó originalmente para Ingreso, así que el
+  // depósito real bien podría estar ligado al UUID de la FACTURA que este
+  // Pago liquida, no al del Pago mismo. Se revisa cada doctoRelacionado.
+  const doctos = (cfdi.complementoPago?.pagos ?? []).flatMap(p => p.doctosRelacionados ?? []);
+  for (const d of doctos) {
+    console.log(`\n--- Factura liquidada ${d.serie}-${d.folio} ($${d.impPagado}) ---`);
+    const facturaCfdi = await CFDI.findOne({ 'emisor.rfc': rfc, serie: d.serie, folio: String(d.folio) }).lean();
+    if (!facturaCfdi) {
+      console.log('No se encontró el CFDI de esta factura en Mongo.');
+      continue;
+    }
+    console.log('uuid de la factura:', facturaCfdi.uuid);
+    const movsFactura = await BankMovement.find({
+      'erpLinks.folioFiscal': new RegExp(`^${facturaCfdi.uuid}$`, 'i'),
+    }).lean();
+    if (!movsFactura.length) {
+      console.log('NINGUNO ligado al UUID de la factura tampoco.');
+    } else {
+      for (const m of movsFactura) {
+        console.log('¡ENCONTRADO ligado a la FACTURA, no al Pago!', JSON.stringify({
+          _id: m._id, banco: m.banco, fecha: m.fecha, deposito: m.deposito,
+          categoria: m.categoria, numeroAutorizacion: m.numeroAutorizacion,
+          referenciaNumerica: m.referenciaNumerica, erpLinks: m.erpLinks,
+        }, null, 2));
+      }
+    }
+  }
+
+  // Última red: cualquier BankMovement con depósito de monto muy similar al
+  // total del Pago, cerca de la fecha del CFDI — para descartar que el
+  // movimiento exista pero sin NINGÚN erpLinks poblado (ni al Pago ni a la
+  // factura), lo que apuntaría a un problema de sincronización más amplio.
+  const totalPago = Number(cfdi.complementoPago?.totales?.montoTotalPagos
+    ?? doctos.reduce((s, d) => s + Number(d.impPagado || 0), 0));
+  if (totalPago > 0) {
+    console.log(`\n--- BankMovement con depósito ≈ $${totalPago.toFixed(2)} (±$1), sin filtrar por erpLinks ---`);
+    const candidatos = await BankMovement.find({
+      deposito: { $gte: totalPago - 1, $lte: totalPago + 1 },
+    }).limit(10).lean();
+    if (!candidatos.length) {
+      console.log('NINGUNO — no existe ningún BankMovement con ese monto en absoluto.');
+    } else {
+      for (const m of candidatos) {
+        console.log(JSON.stringify({ _id: m._id, banco: m.banco, fecha: m.fecha, deposito: m.deposito, categoria: m.categoria, erpLinks: m.erpLinks }, null, 2));
+      }
+    }
+  }
+
   await mongoose.disconnect();
 }
 

@@ -2497,6 +2497,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   if (!periodo)   throw new BadRequestError('Periodo requerido');
   if (!tipoCfdi)  throw new BadRequestError('Debes seleccionar el tipo de CFDI a procesar (I, E o P)');
 
+  // Cobranza (Pagos, tipoCfdi='P'): generación TOTALMENTE independiente — ver
+  // cobranza-poliza-generator.service.js. Ni una sola línea de abajo (pensada
+  // para Ingreso/Egreso) se ejecuta para Pagos; el require es perezoso (no en
+  // el top del archivo) para evitar un ciclo, ya que ese módulo reutiliza
+  // utilidades de numeración de folio exportadas de aquí (2026-09-01,
+  // confirmado con el usuario: la generación de Cobranza no debe compartir
+  // código con la de Ingreso, solo utilería genérica sin lógica de negocio).
+  if (tipoCfdi === 'P') {
+    return require('./cobranza-poliza-generator.service').generarPropuestaCobranza({
+      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro,
+    });
+  }
+
   // 1. UUIDs ya contabilizados — solo los del RFC solicitado (JOIN con polizas)
   const yaContabilizados = await PolizaMovimiento.findAll({
     // tipoOrigen != 'Cobro Sucursal': esas líneas solo REFERENCIAN el CFDI
@@ -4078,6 +4091,17 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
   if (!tipoCfdi)  throw new BadRequestError('Debes seleccionar el tipo de CFDI a procesar (I, E o P)');
+
+  // Cobranza (Pagos, tipoCfdi='P'): generación TOTALMENTE independiente — ver
+  // comentario equivalente en generarPropuesta. `generarYGuardarPorSucursal`/
+  // `PorDia`/`PorSucursalYDia` llaman a esta misma función internamente, así
+  // que este único dispatch basta para las 4 rutas de generación de Cobranza
+  // sin duplicar la iteración por sucursal/día (esa parte SÍ es genérica).
+  if (tipoCfdi === 'P') {
+    return require('./cobranza-poliza-generator.service').generarYGuardarCobranza({
+      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro,
+    });
+  }
 
   // 1. UUIDs ya contabilizados (filtrado por RFC)
   const yaContabilizados = await PolizaMovimiento.findAll({
@@ -5703,4 +5727,11 @@ module.exports = {
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
   _prefetchAjustesFacturaPropia,
+  // Utilidades genéricas (numeración de folio, fechas) expuestas ÚNICAMENTE
+  // para que cobranza-poliza-generator.service.js las reutilice sin duplicar
+  // la numeración de folio (comparte el mismo contador/rango por sucursal que
+  // Ingreso — duplicarla arriesgaría folios chocados entre ambos). Ninguna de
+  // estas funciones tiene lógica de negocio de Ingreso: son utilería pura.
+  _folioSiguienteDisponible, _rangoFolioPorSucursal, _esCedisPorSucursal, FOLIOS_MAX_CEDIS,
+  _medianocheMx, _diaSiguiente,
 };

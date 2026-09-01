@@ -3131,27 +3131,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // sin importar en qué posición del arreglo venga la que no resolvió —
       // así nunca queda un guion doble en medio (bug real 2026-08-25: el no
       // resuelto venía primero y el join daba "OPA--00763").
-      //
-      // IMPORTANTE (2026-08-31, caso real MONSAN B0-260801098): SAT suele
-      // agrupar VARIOS anticipos distintos en una sola relación con varios
-      // `uuids` (en vez de una relación por anticipo, como sí hace el ERP) —
-      // el loop interno ANTES hacía `break` en cuanto CUALQUIER uuid resolvía
-      // algo (aunque fuera el folio crudo de fallback), así que con 2 uuids
-      // en el mismo array, el SEGUNDO (con folio real "OPA-00763" resuelto
-      // por monto) nunca se intentaba — se quedaba con el fallback crudo del
-      // primero ("OPA-260201994", el folio interno del anticipo, no un
-      // OPA-XXXXX real). Ahora se recorren TODOS los uuids de cada relación
-      // (no solo el primero que "resuelva" algo), tratando cada uno como un
-      // anticipo distinto a concatenar — mismo criterio que ya se usa entre
-      // relaciones separadas.
       const foliosResueltosProp = [];
       let faltaAlgunoProp = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
+        let refRel = null;
         for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
           const ref = anticipoFolioPorUuidProp[(u || '').toUpperCase()];
-          if (ref) foliosResueltosProp.push(ref.replace(/^OPA-/, '')); else faltaAlgunoProp = true;
+          if (ref) { refRel = ref.replace(/^OPA-/, ''); break; }
         }
+        if (refRel) foliosResueltosProp.push(refRel); else faltaAlgunoProp = true;
       }
       if (foliosResueltosProp.length) anticipoFolioRefProp = `OPA-${foliosResueltosProp.join('-')}${faltaAlgunoProp ? '-' : ''}`;
     }
@@ -4608,17 +4597,16 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
       // Ver comentario equivalente en generarPropuesta: el "-" colgante de las
       // relaciones sin resolver SIEMPRE va al final, nunca en medio.
-      // Ver comentario equivalente en generarPropuesta sobre por qué se
-      // recorren TODOS los uuids de cada relación (no solo el primero que
-      // "resuelva" algo) — bug real 2026-08-31, caso MONSAN B0-260801098.
       const foliosResueltosGuard = [];
       let faltaAlgunoGuard = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
+        let refRel = null;
         for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
           const ref = anticipoFolioPorUuidGuard[(u || '').toUpperCase()];
-          if (ref) foliosResueltosGuard.push(ref.replace(/^OPA-/, '')); else faltaAlgunoGuard = true;
+          if (ref) { refRel = ref.replace(/^OPA-/, ''); break; }
         }
+        if (refRel) foliosResueltosGuard.push(refRel); else faltaAlgunoGuard = true;
       }
       if (foliosResueltosGuard.length) anticipoFolioRefGuard = `OPA-${foliosResueltosGuard.join('-')}${faltaAlgunoGuard ? '-' : ''}`;
     }

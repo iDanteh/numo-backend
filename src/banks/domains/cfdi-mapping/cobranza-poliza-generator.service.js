@@ -138,7 +138,12 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         const ivaDoc = (dr.trasladosDR ?? [])
           .filter(t => (t.impuesto || t.Impuesto || '') === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
           .reduce((s, t) => s + Number(t.importe || t.importeDR || t.ImporteDR || 0), 0);
-        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc, desglosePagoReal: [] });
+        // uuid REAL de la factura (SAT IdDocumento, ver CFDI.js doctoRelacionadoSchema)
+        // — necesario para cruzar contra bank_movements.erpLinks.folioFiscal en el
+        // export: ese campo se liga al uuid de la FACTURA original, no al del Pago
+        // (confirmado con datos reales 2026-09-01, ver diag-bancario-pago.js).
+        const idDocumento = dr.idDocumento ? String(dr.idDocumento).toUpperCase() : null;
+        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc, desglosePagoReal: [], idDocumento });
         paresVistos.set(`${serie}|${folio}`, { serie, folio });
       }
     }
@@ -319,7 +324,11 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       const esUltimo = idx === context.doctosPago.length - 1;
       const share = totalDoctos > 0 ? d.monto / totalDoctos : 1 / context.doctosPago.length;
       const conceptoFactura = [nombreCliente, `${d.serie}-${d.folio}`].filter(Boolean).join(' / ');
-      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieCfdi, cfdiUuid: cfdi.uuid, rfcTercero };
+      // `facturaUuid` (uuid real de la factura, ver `_prefetchDoctosPago`) viaja
+      // en cada línea de esta factura para que el export (poliza.service.js,
+      // `anotarCargosPorFacturaSinAgrupar`) pueda cruzar el depósito bancario
+      // real por el uuid correcto en vez del uuid del Pago (`cfdiUuid`).
+      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieCfdi, cfdiUuid: cfdi.uuid, facturaUuid: d.idDocumento ?? null, rfcTercero };
 
       // Cobro de otra sucursal (2026-09-01): la factura que este Pago liquida
       // puede haber sido emitida por una sucursal DISTINTA a la que procesó

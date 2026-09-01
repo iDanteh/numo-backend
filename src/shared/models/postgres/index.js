@@ -26,6 +26,7 @@ const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
+const CobroSucursalPendienteCobranza = require('./CobroSucursalPendienteCobranza');
 const Notificacion      = require('./Notificacion');
 const ConfigSection     = require('./ConfigSection');
 const GlobalConfig      = require('./GlobalConfig');
@@ -109,6 +110,10 @@ async function syncModels() {
   // Cola de cobros cruzados de sucursal (ver CobroSucursalPendiente.js) —
   // tabla nueva, force:false para solo crearla si no existe.
   await CobroSucursalPendiente.sync({ force: false });
+
+  // Misma idea, exclusiva de Cobranza (ver CobroSucursalPendienteCobranza.js,
+  // 2026-09-01) — tabla independiente de la de Ingreso a propósito.
+  await CobroSucursalPendienteCobranza.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await syncAlter(AccountPlan);
@@ -386,4 +391,4 @@ async function syncModels() {
   await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

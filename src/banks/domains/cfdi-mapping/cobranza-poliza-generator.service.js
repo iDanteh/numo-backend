@@ -33,7 +33,7 @@
 
 const { Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
-const { Poliza, PolizaMovimiento, AccountPlan, CfdiMappingRule } = require('../../../shared/models/postgres');
+const { Poliza, PolizaMovimiento, AccountPlan, CfdiMappingRule, CobroSucursalPendienteCobranza } = require('../../../shared/models/postgres');
 const CFDI = require('../../../visor/models/CFDI');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const centrosSvc = require('../centros-costo/centros-costo.service');
@@ -49,6 +49,21 @@ const CODIGO_CUENTA_CAJA            = '1101010003';
 const CODIGO_CUENTA_BANCOS          = '1102011005';
 const CODIGO_CUENTA_SALDO_FAVOR     = '2103090001';
 const CODIGO_CUENTA_IVA_SALDO_FAVOR = '2104010002';
+// "Cobros De Sucursales Por Identificar" — mismo código que usa Ingreso
+// (cobros-sucursal-puente.service.js), duplicado a propósito. Es una cuenta
+// puente genérica del catálogo, no lógica de negocio de Ingreso: no hay
+// riesgo real en reutilizar el mismo código de cuenta contable aquí.
+const CODIGO_CUENTA_PUENTE_SUCURSALES = '2103040001';
+// Cuentas estándar de tasa 16% usadas para cerrar un cobro de otra sucursal
+// (ver `CobroSucursalPendienteCobranza`) — el registro encolado no conserva
+// qué regla/tasa usó la factura original, así que el cierre siempre usa las
+// cuentas estándar (estas mismas en TODOS los ejemplos reales vistos hasta
+// ahora). Si una factura a tasa 0%/mixta llega a cobrarse cruzada, quedaría
+// mal clasificada aquí — no hay caso real confirmado todavía de esa
+// combinación, se deja como limitación conocida.
+const CODIGO_CUENTA_IVA_POR_TRASLADAR = '2105010001';
+const CODIGO_CUENTA_IVA_TRASLADADO    = '2104010001';
+const CODIGO_CUENTA_CLIENTES          = '1103010001';
 const TASA_IVA_SALDO_FAVOR          = 0.16;
 const TIPO_ORIGEN_CARGO_ESPECIAL    = 'Cargo Especial';
 const CHUNK_SIZE                    = 200;
@@ -231,10 +246,13 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
   const serieCfdi   = [cfdi.serie, cfdi.folio].filter(Boolean).join('-').slice(0, 25) || null;
 
   if (!rule) {
-    return [
-      { cuentaId: null, concepto, centroCosto: '', debe: total, haber: 0,     cfdiUuid: cfdi.uuid, rfcTercero, _sinRegla: true },
-      { cuentaId: null, concepto, centroCosto: '', debe: 0,     haber: total, cfdiUuid: cfdi.uuid, rfcTercero, _sinRegla: true },
-    ];
+    return {
+      movs: [
+        { cuentaId: null, concepto, centroCosto: '', debe: total, haber: 0,     cfdiUuid: cfdi.uuid, rfcTercero, _sinRegla: true },
+        { cuentaId: null, concepto, centroCosto: '', debe: 0,     haber: total, cfdiUuid: cfdi.uuid, rfcTercero, _sinRegla: true },
+      ],
+      pendientesCruzados: [],
+    };
   }
 
   const movs = [];
@@ -290,6 +308,7 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     movs.push({ cuentaId: cuentaMap[rule.cuentaIsrRetenido] ?? null, concepto: `ISR ret. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: isrRet, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
+  const pendientesCruzados = [];
   if (esSplitPagoPorFactura) {
     const nombreCliente  = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
     const totalDoctos    = context.doctosPago.reduce((s, d) => s + d.monto, 0);
@@ -301,6 +320,21 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       const share = totalDoctos > 0 ? d.monto / totalDoctos : 1 / context.doctosPago.length;
       const conceptoFactura = [nombreCliente, `${d.serie}-${d.folio}`].filter(Boolean).join(' / ');
       const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieCfdi, cfdiUuid: cfdi.uuid, rfcTercero };
+
+      // Cobro de otra sucursal (2026-09-01): la factura que este Pago liquida
+      // puede haber sido emitida por una sucursal DISTINTA a la que procesó
+      // el cobro (`context.ccActual`, resuelta por la serie del propio Pago
+      // en `_procesarCobranza`) — mismo problema que ya resuelve Ingreso para
+      // ventas, pero aquí a nivel factura liquidada, no ticket. Cuando hay
+      // cruce: el Cargo real (banco/efectivo/SF) se queda en ESTA póliza (el
+      // dinero sí entró aquí), pero el cierre de la CxC (Abono Clientes + IVA
+      // reclasificado) NO — esa es responsabilidad de la sucursal vendedora,
+      // así que se reemplaza por un Abono a la cuenta puente (2103040001) y
+      // se encola en `pendientesCruzados` para que `_procesarCobranza` lo
+      // guarde en CobroSucursalPendienteCobranza; la vendedora lo consume al
+      // generar su propia póliza.
+      const ccVendedora = context.ccBySerieMap?.[d.serie] ?? null;
+      const esCruzada = !!(ccVendedora && context.ccActual && String(ccVendedora.id) !== String(context.ccActual.id));
 
       // 1. Cargo (+SF si esta factura se pagó con saldo a favor).
       const montoLineaCargo = esUltimo
@@ -344,22 +378,46 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
         }
       }
 
-      // 2. IVA cobrado (swap cuentaIvaPPD → cuentaIva) — IVA real de ESTA factura.
-      if (aplicaIvaCobrado) {
-        const ivaFactura = Number(d.ivaDoc) || 0;
-        if (ivaFactura > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
-        }
-      }
+      const ivaFactura = Number(d.ivaDoc) || 0;
 
-      // 3. Abono que cierra la CxC de esta factura.
+      // Se calcula SIEMPRE (cruzada o no) para que `acumuladoAbono` — y por
+      // tanto el residuo de la última factura — quede correcto sin importar
+      // si esta línea en particular termina como Abono local o como
+      // pendiente cruzado (ver debajo).
       const montoLineaAbono = esUltimo
         ? parseFloat((montoAbonoFinal - acumuladoAbono).toFixed(2))
         : parseFloat((montoAbonoFinal * share).toFixed(2));
       acumuladoAbono += montoLineaAbono;
-      if (montoLineaAbono > 0) {
-        movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
+
+      if (esCruzada) {
+        // Cierra LOCALMENTE contra el puente (por el monto completo de esta
+        // factura: incluye tanto la porción de SF como la de banco/efectivo
+        // ya cargadas arriba) en vez del Abono a Clientes normal.
+        if (montoLineaCargo > 0) {
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[CODIGO_CUENTA_PUENTE_SUCURSALES] ?? null, debe: 0, haber: montoLineaCargo, tipoOrigen: 'Cobro Sucursal', reglaNombre: 'COS-COBRANZA' });
+        }
+        pendientesCruzados.push({
+          centroCostoIdDestino: ccVendedora.id,
+          centroCostoIdOrigen:  context.ccActual?.id ?? null,
+          serieFolioFactura:    `${d.serie}-${d.folio}`,
+          nombreCliente,
+          montoSubtotal:        parseFloat((montoLineaCargo - ivaFactura).toFixed(2)),
+          montoIva:             ivaFactura,
+          fechaCobro:           cfdi.fecha ?? null,
+          cfdiUuidPago:         cfdi.uuid,
+          folioOrigen:          `${cfdi.uuid}|${d.serie}|${d.folio}`,
+        });
+      } else {
+        // 2. IVA cobrado (swap cuentaIvaPPD → cuentaIva) — IVA real de ESTA factura.
+        if (aplicaIvaCobrado && ivaFactura > 0) {
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
+        }
+
+        // 3. Abono que cierra la CxC de esta factura.
+        if (montoLineaAbono > 0) {
+          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
+        }
       }
     });
   } else {
@@ -396,12 +454,16 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     tipoOrigen:      cfdi.tipoOrigen ?? 'Pago',
   };
 
-  return movs.map(m => ({
-    ...m,
-    ...satMeta,
-    ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
-    ...(m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre } : {}),
-  }));
+  return {
+    movs: movs.map(m => ({
+      ...m,
+      ...satMeta,
+      ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
+      ...((m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL || m.tipoOrigen === 'Cobro Sucursal')
+        ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre } : {}),
+    })),
+    pendientesCruzados,
+  };
 }
 
 /**
@@ -505,7 +567,10 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     cfdiConRegla
       .filter(({ rule }) => rule)
       .flatMap(({ rule: r }) => [r.cuentaCargo, r.cuentaAbono, r.cuentaAbono2, r.cuentaIva, r.cuentaIvaPPD, r.cuentaIvaRetenido, r.cuentaIsrRetenido, r.cuentaIvaAnticipo].filter(Boolean))
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR]),
+      .concat([
+        CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR,
+        CODIGO_CUENTA_PUENTE_SUCURSALES, CODIGO_CUENTA_IVA_POR_TRASLADAR, CODIGO_CUENTA_IVA_TRASLADADO, CODIGO_CUENTA_CLIENTES,
+      ]),
   )];
   const cuentasRows = codigosNecesarios.length
     ? await AccountPlan.findAll({ where: { codigo: { [Op.in]: codigosNecesarios } }, attributes: ['id', 'codigo'], raw: true })
@@ -521,6 +586,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
   const advertencias = [];
   const ruleUsageCount = new Map();
   const muestrasSinRegla = [];
+  const pendientesCruzadosParaEncolar = [];
 
   for (const { cfdi, rule } of cfdiConRegla) {
     if (!rule) {
@@ -530,18 +596,23 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       }
       continue;
     }
-    const context = {};
+    // Sucursal COBRADORA (dueña de la serie del propio Pago) — se resuelve
+    // ANTES de armar los movimientos para que `cfdiToMovimientosCobranza`
+    // pueda comparar contra la sucursal VENDEDORA de cada factura liquidada
+    // y detectar un cobro cruzado (ver `context.ccActual`/`ccBySerieMap`).
+    const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
+    const context = { ccActual: cc, ccBySerieMap };
     const doctosPago = doctosPorUuid.get(cfdi.uuid);
     if (doctosPago) context.doctosPago = doctosPago;
 
-    const movs = cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context);
+    const { movs, pendientesCruzados } = cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
+    pendientesCruzadosParaEncolar.push(...pendientesCruzados.map(p => ({ ...p, rfc })));
 
     const tieneFaltante = movs.some(m => m.cuentaId == null);
     if (tieneFaltante) {
       advertencias.push(`CFDI ${cfdi.uuid?.slice(0, 8)} — una o más cuentas no encontradas en catálogo (regla: ${rule.nombre})`);
     }
-    const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
     for (const m of movs) {
       todosLosMovimientos.push({
         ...m,
@@ -549,6 +620,51 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
         centroCosto:    cc?.clave ?? m.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
       });
+    }
+  }
+
+  // 8. Cobros de otra sucursal PENDIENTES DE CONSUMIR — facturas de ESTA
+  // sucursal (centroCostoId, si se especificó una) que se cobraron en otra y
+  // ya están encoladas en CobroSucursalPendienteCobranza. Solo aplica cuando
+  // se genera acotado a una sucursal (sin ella no hay a quién atribuírselas).
+  const pendientesConsumidos = [];
+  if (centroCostoId) {
+    const pendientesRows = await CobroSucursalPendienteCobranza.findAll({
+      where: { rfc, centroCostoIdDestino: centroCostoId, consumido: false },
+      raw: true,
+    });
+    const ccDestino = Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId)) ?? null;
+    for (const p of pendientesRows) {
+      const baseFactura = {
+        concepto:      [p.nombreCliente, p.serieFolioFactura].filter(Boolean).join(' / '),
+        centroCosto:   ccDestino?.clave ?? null,
+        centroCostoId: Number(centroCostoId),
+        serie:         p.serieFolioFactura,
+        cfdiUuid:       p.cfdiUuidPago,
+        ventaFecha:    p.fechaCobro ? new Date(p.fechaCobro).toISOString().slice(0, 10) : null,
+        tipoComprobante: 'P', tipoOrigen: 'Cobro Sucursal', reglaNombre: 'COS-COBRANZA',
+      };
+      const montoSubtotal = Number(p.montoSubtotal) || 0;
+      const montoIva      = Number(p.montoIva) || 0;
+      const montoTotal    = parseFloat((montoSubtotal + montoIva).toFixed(2));
+      const cuentaPuenteId = cuentaMap[CODIGO_CUENTA_PUENTE_SUCURSALES]   ?? null;
+      const cuentaIvaPPDId = cuentaMap[CODIGO_CUENTA_IVA_POR_TRASLADAR]   ?? null;
+      const cuentaIvaId    = cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO]      ?? null;
+      const cuentaAbonoId  = cuentaMap[CODIGO_CUENTA_CLIENTES]            ?? null;
+      if (montoTotal > 0) {
+        todosLosMovimientos.push({ ...baseFactura, cuentaId: cuentaPuenteId, cuentaFaltante: cuentaPuenteId == null, debe: montoTotal, haber: 0 });
+      }
+      if (montoIva > 0 && cuentaIvaPPDId && cuentaIvaId) {
+        todosLosMovimientos.push({ ...baseFactura, cuentaId: cuentaIvaPPDId, cuentaFaltante: false, debe: montoIva, haber: 0, tipoOrigen: 'Pago', reglaNombre: null });
+        todosLosMovimientos.push({ ...baseFactura, cuentaId: cuentaIvaId,    cuentaFaltante: false, debe: 0, haber: montoIva, tipoOrigen: 'Pago', reglaNombre: null });
+      }
+      if (montoTotal > 0) {
+        todosLosMovimientos.push({ ...baseFactura, cuentaId: cuentaAbonoId, cuentaFaltante: cuentaAbonoId == null, debe: 0, haber: montoTotal, tipoOrigen: 'Pago', reglaNombre: null });
+      }
+      pendientesConsumidos.push(p.id);
+    }
+    if (pendientesRows.length) {
+      advertencias.push(`ℹ ${pendientesRows.length} factura(s) cobrada(s) en otra sucursal, cerradas aquí contra la cuenta puente`);
     }
   }
 
@@ -564,10 +680,14 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
   if (sustitutosMismoPeriodo.length) {
     advertencias.push(`ℹ ${sustitutosMismoPeriodo.length} cancelación(es) con sustitución del mismo periodo contabilizada(s) automático`);
   }
+  if (pendientesCruzadosParaEncolar.length) {
+    advertencias.push(`⚠ ${pendientesCruzadosParaEncolar.length} factura(s) de otra(s) sucursal(es) cobrada(s) aquí — se encolarán para que su sucursal cierre su CxC al generar su propia póliza`);
+  }
 
   return {
     cfdisSinPoliza: cfdisFiltrado, todosLosMovimientos, sinRegla, advertencias, ruleUsageCount,
     sustitutos: sustitutosExcluidos, ccBySerieMap, serieDelCentro,
+    pendientesCruzadosParaEncolar, pendientesConsumidos,
   };
 }
 
@@ -608,8 +728,10 @@ async function generarPropuestaCobranza({ rfc, ejercicio, periodo, tipoPropuesta
  * (Cobranza) sin póliza del periodo/sucursal indicados.
  */
 async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta = 'D', centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
-  const { todosLosMovimientos, sinRegla, advertencias, sustitutos, ccBySerieMap, cfdisSinPoliza, ruleUsageCount } =
-    await _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro });
+  const {
+    todosLosMovimientos, sinRegla, advertencias, sustitutos, ccBySerieMap, cfdisSinPoliza, ruleUsageCount,
+    pendientesCruzadosParaEncolar, pendientesConsumidos,
+  } = await _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro });
 
   // Numeración de folio: se reutiliza la utilería de cfdi-poliza-generator.
   // service.js (require perezoso — ver docstring del archivo) porque Ingreso
@@ -648,6 +770,20 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
       const chunk = todosLosMovimientos.slice(i, i + CHUNK_SIZE);
       const rows  = chunk.map((m, j) => ({ ...m, polizaId: polizaHeader.id, orden: i + j + 1 }));
       await PolizaMovimiento.bulkCreate(rows, { transaction: t });
+    }
+
+    // Cobro de otra sucursal: encola lo que la sucursal vendedora necesita
+    // (upsert por rfc+centroCostoIdDestino+folioOrigen — regenerar esta
+    // póliza no debe duplicar filas en la cola) y marca como consumidas las
+    // que esta misma póliza ya cerró contra el puente.
+    for (const p of pendientesCruzadosParaEncolar) {
+      await CobroSucursalPendienteCobranza.upsert({ ...p, consumido: false }, { transaction: t });
+    }
+    if (pendientesConsumidos.length) {
+      await CobroSucursalPendienteCobranza.update(
+        { consumido: true },
+        { where: { id: { [Op.in]: pendientesConsumidos } }, transaction: t },
+      );
     }
 
     return polizaHeader;

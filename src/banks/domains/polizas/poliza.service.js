@@ -1260,6 +1260,27 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // cuenta), no la serie-folio propia del CFDI de Pago. Guardada aparte
     // (`_referenciaBancoReal`) para poder fusionar más abajo las líneas que
     // comparten el mismo depósito real.
+    // Solo una cuenta de Caja (1101...) o Bancos (1102...) representa un
+    // depósito real que tiene sentido resolver a un banco verificado — CUALQUIER
+    // otra cuenta con debe>0 (ej. 2105010001, Cargo IVA por trasladar al
+    // reclasificar el IVA cobrado de una factura PPD) es una reclasificación
+    // contable, nunca un depósito: nunca se le cambia la cuenta, nunca se le
+    // pone subcódigo de transferencia, y nunca entra a la fusión/bucket de
+    // depósitos de más abajo (se deja tal cual, junto a su factura). Sin este
+    // resguardo, un Pago con transferencia verificada le cambiaba la cuenta
+    // de IVA por trasladar al banco real y esa línea terminaba fusionándose
+    // con el depósito real, perdiendo el Cargo IVA por completo (bug real
+    // 2026-09-01, caso real "039246": $21,041.66 = Clientes + IVA fusionados
+    // en una sola línea "banco" en vez de dos líneas separadas).
+    if (!/^110[12]/.test(m.cuenta?.codigo || '')) {
+      return {
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: m.serie, concepto: m.concepto,
+        centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
+        debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
+        rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
+        tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+      };
+    }
     const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
@@ -1304,8 +1325,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   const otrasLineas = [];
   const cargoLineas = [];
   for (const m of anotados) {
-    const esCargoBancario = Number(m.debe) > 0 && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL;
-    (esCargoBancario ? cargoLineas : otrasLineas).push(m);
+    // Solo las líneas que pasaron por la rama de Caja/Bancos de arriba traen
+    // `_referenciaBancoReal` (aunque sea null) — es la misma señal que ya usa
+    // el cleanup final para saber qué es un objeto plano de Cargo bancario.
+    (('_referenciaBancoReal' in m) ? cargoLineas : otrasLineas).push(m);
   }
 
   // Fusiona el Cargo (dinero recibido) cuando dos o más facturas — del mismo

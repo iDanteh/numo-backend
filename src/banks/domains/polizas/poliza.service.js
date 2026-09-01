@@ -1205,21 +1205,29 @@ function categorizarAjusteContado(m) {
  *   concatena (ver `aplanarCargosConsolidados` y `armarBloqueContado`).
  */
 /**
- * Variante de `consolidarCargos` para la póliza de Cobranza (Pagos) SIN
- * agrupar/mezclar líneas — anota cada Cargo (debe>0) con su cuenta bancaria
- * real y subcódigo (transferencia o no), pero conserva exactamente una línea
- * de salida por cada línea de entrada, en el mismo orden. A diferencia de
- * Contado/Crédito, aquí NO se quiere consolidar varias facturas del mismo
- * Pago en una sola línea: `cfdiToMovimientos` (cfdi-mapping.service.js,
- * `esSplitPagoPorFactura`) ya arma Cargo+IVA+Abono agrupados por factura
- * liquidada, y `consolidarCargos` los volvía a fusionar en una sola línea
- * porque agrupa por `cfdiUuid` cuando no hay referencia bancaria — todas las
- * líneas de un mismo Pago comparten el mismo `cfdiUuid` (confirmado con el
- * usuario 2026-08-11). Los Abono (haber>0) tampoco se separan aparte — se
- * dejan intercalados como ya vienen.
+ * Variante de `consolidarCargos` para la póliza de Cobranza (Pagos) — anota
+ * cada Cargo (debe>0) con su cuenta bancaria real y subcódigo (transferencia
+ * o no), y conserva una línea de salida por cada línea de entrada, EXCEPTO
+ * cuando dos o más comparten el mismo depósito bancario real ya identificado
+ * (misma cuenta + misma referencia/folio verificado en Bancos) — ahí se
+ * fusionan en una sola línea con el monto sumado y los folios de factura
+ * concatenados en el concepto (2026-09-01, ver ejemplo real "23 (1).xls").
+ *
+ * A diferencia de Contado/Crédito, aquí NUNCA se agrupa por `cfdiUuid`:
+ * `cfdiToMovimientos` (cfdi-mapping.service.js, `esSplitPagoPorFactura`) ya
+ * arma Cargo+IVA+Abono agrupados por factura liquidada dentro de un mismo
+ * Pago, y todas esas líneas comparten el `cfdiUuid` del Pago aunque
+ * correspondan a depósitos DISTINTOS — agrupar por ese campo (como hacía
+ * `consolidarCargos` cuando no había referencia bancaria) mezclaba facturas
+ * de depósitos diferentes (confirmado con el usuario 2026-08-11). La fusión
+ * de aquí solo ocurre con una referencia bancaria real verificada como
+ * llave — nunca por cfdiUuid ni por cliente. Sin esa referencia (efectivo o
+ * depósito sin identificar), cada línea se deja tal cual, en su posición
+ * original. Los Abono (haber>0) y la reclasificación de IVA de cada factura
+ * tampoco se tocan — se dejan intercalados como ya vienen.
  */
 function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null) {
-  return movs.map(m => {
+  const anotados = movs.map(m => {
     if (!(Number(m.debe) > 0)) return m;
     // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
     // SF no representan un depósito bancario — no se les debe cambiar la
@@ -1245,6 +1253,14 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // nombre del cliente, mismo criterio que antes hacía `consolidarCargos`.
     const nombre = nombresClientes?.get((m.cfdiUuid || '').toUpperCase()) || '';
     const yaEnriquecido = !nombre || m.concepto?.includes(nombre);
+    // Referencia bancaria real (folio/número de autorización, ver
+    // `construirVerdadBancaria`) — mismo criterio que `consolidarCargos`
+    // (Contado): cuando el depósito quedó identificado, la columna C debe
+    // mostrar ese folio real (para poder conciliar contra el estado de
+    // cuenta), no la serie-folio propia del CFDI de Pago. Guardada aparte
+    // (`_referenciaBancoReal`) para poder fusionar más abajo las líneas que
+    // comparten el mismo depósito real.
+    const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
@@ -1252,7 +1268,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     return {
       cuenta:         bancario?.cuentaBanco ?? m.cuenta,
       cuentaId:       m.cuentaId,
-      serie:          m.serie,
+      serie:          referenciaBancoReal ?? m.serie,
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
       centroCosto:    m.centroCosto,
       centroCostoObj: m.centroCostoObj,
@@ -1264,7 +1280,81 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       reglaNombre:    m.reglaNombre,
       tipoOrigen:     m.tipoOrigen,
       _subcodigo:     esTransferenciaVerificada ? subcodigoTransferencia : 0,
+      _referenciaBancoReal: referenciaBancoReal,
     };
+  });
+
+  // Fusiona el Cargo (dinero recibido) cuando dos o más facturas — del mismo
+  // Complemento de Pago o de Pagos distintos — comparten el MISMO depósito
+  // bancario real (misma cuenta + misma referencia/folio verificado): es
+  // literalmente el mismo depósito, mostrarlo repetido duplicaría la lectura
+  // del banco (caso real confirmado con este mismo tipo de póliza: un cliente
+  // paga 2-3 facturas con una sola transferencia). Nunca se agrupa por
+  // `cfdiUuid` compartido del Pago (ese fue el bug real corregido 2026-08-11
+  // — ver docstring de arriba) ni cuando no hay referencia real verificada
+  // (efectivo/depósito sin identificar): esas líneas se dejan tal cual, en su
+  // posición original. El Abono a Clientes y la reclasificación de IVA de
+  // cada factura NO se tocan — solo el Cargo bancario.
+  const grupos = new Map();
+  const conReferenciaFusionada = [];
+  for (const m of anotados) {
+    if (!(Number(m.debe) > 0) || m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL || !m._referenciaBancoReal) {
+      conReferenciaFusionada.push(m);
+      continue;
+    }
+    const key = `${m.cuenta?.codigo}|${m.centroCosto}|${m._referenciaBancoReal}`;
+    const existente = grupos.get(key);
+    if (!existente) {
+      const [nombreCliente, ...tickets] = (m.concepto || '').split(' / ');
+      const grupo = { ...m, _nombreCliente: nombreCliente || '', _tickets: tickets };
+      grupos.set(key, grupo);
+      conReferenciaFusionada.push(grupo);
+    } else {
+      existente.debe = parseFloat((Number(existente.debe) + Number(m.debe)).toFixed(2));
+      existente.cfdiUuid = null; // ya no representa un solo CFDI/factura
+      const [, ...tickets] = (m.concepto || '').split(' / ');
+      for (const t of tickets) if (t && !existente._tickets.includes(t)) existente._tickets.push(t);
+    }
+  }
+
+  // Consolida el Efectivo real (ver `_formaPagoReal`/'01' en
+  // cfdi-mapping.service.js, `esSplitPagoPorFactura`) en un solo bucket por
+  // cuenta+sucursal — mismo criterio visual que usa Contado con su bucket de
+  // Efectivo (`consolidarCargos`): el detalle por factura/cliente no aporta
+  // nada útil para conciliar caja y multiplicaría el número de líneas sin
+  // necesidad. Solo aplica a Cargo sin referencia bancaria real (si la
+  // tuviera, ya se fusionó arriba) y con `formaPago==='01'` (Efectivo real
+  // confirmado por `/desgloses-cobro/almacen`, nunca el `formaPago` genérico
+  // que declara el CFDI de Pago). Sin ese desglose (Efectivo no confirmado,
+  // u otra forma de pago sin match bancario) la línea se deja tal cual.
+  const bucketsEfectivo = new Map();
+  const consolidado = [];
+  for (const m of conReferenciaFusionada) {
+    const esEfectivoRealSinReferencia = Number(m.debe) > 0 && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL
+      && !m._referenciaBancoReal && m.formaPago === '01';
+    if (!esEfectivoRealSinReferencia) {
+      consolidado.push(m);
+      continue;
+    }
+    const claveCentro = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
+    const key = `${m.cuenta?.codigo}|${claveCentro}`;
+    const existente = bucketsEfectivo.get(key);
+    if (!existente) {
+      const bucket = { ...m, concepto: `EFECTIVO ${claveCentro}`.trim(), cfdiUuid: null, _tickets: null };
+      bucketsEfectivo.set(key, bucket);
+      consolidado.push(bucket);
+    } else {
+      existente.debe = parseFloat((Number(existente.debe) + Number(m.debe)).toFixed(2));
+    }
+  }
+
+  return consolidado.map(m => {
+    if (!('_tickets' in m) || m._tickets == null) {
+      const { _referenciaBancoReal, ...resto } = m;
+      return resto;
+    }
+    const { _nombreCliente, _tickets, _referenciaBancoReal, ...resto } = m;
+    return { ...resto, concepto: [_nombreCliente, ..._tickets].filter(Boolean).join(' / ') };
   });
 }
 

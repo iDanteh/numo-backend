@@ -1820,8 +1820,20 @@ async function updateErpIds(id, action, erpId, user) {
   // Antes había acá un candado adicional de "propio usuario" que dejaba sin efecto el
   // permiso para cualquiera que no fuera admin.
 
+  // 2026-09-01 (pedido explícito del usuario): snapshot del link ANTES de filtrarlo —
+  // una vez que sale de erpLinks no hay forma de reconstruirlo. Si no estaba vinculada
+  // (linkRemovido undefined, ej. reintento sobre algo ya desvinculado) no se registra
+  // nada — no hay ninguna acción real que auditar.
+  const linkRemovido = (mov.erpLinks || []).find(l => l.erpId === cleanId);
+
   mov.erpIds          = (mov.erpIds          || []).filter(x => x !== cleanId);
   mov.erpLinks        = (mov.erpLinks        || []).filter(l => l.erpId !== cleanId);
+  if (linkRemovido) {
+    mov.historialVinculacion = [...(mov.historialVinculacion || []), {
+      at: new Date(), accion: 'desvinculado', erpId: cleanId, origen: 'manual',
+      userId: user?._id ?? null, userNombre: user?.nombre ?? null, snapshot: linkRemovido,
+    }];
+  }
   // Eliminar las entradas de identificadoPor correspondientes a la CxC desvinculada.
   // Si ya no quedan CxCs vinculadas, limpiar por completo: cubre entradas sin erpId
   // (erpId: null) almacenadas por el motor automático, que el filtro exacto no elimina.
@@ -1846,6 +1858,7 @@ async function updateErpIds(id, action, erpId, user) {
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
+    historialVinculacion: mov.historialVinculacion,
     saldoErp: mov.saldoErp, uuidXML: mov.uuidXML, status: mov.status, identificadoPor: mov.identificadoPor,
   };
   emitToBanco(mov.banco, 'bank:movement:updated', updated);
@@ -1947,6 +1960,12 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
     throw new ForbiddenError('No tienes permiso para desvincular una CxC ya asociada a este movimiento.');
   }
 
+  // 2026-09-01 (pedido explícito del usuario): snapshot de erpLinks ANTES de
+  // reemplazarlo — este PUT sobrescribe el arreglo completo (ver comentario arriba,
+  // "REEMPLAZA el arreglo completo"), así que sin esto no hay forma de saber qué
+  // traía cada CxC dada de baja.
+  const erpLinksAntes = mov.erpLinks || [];
+
   mov.erpLinks = cleanLinks;
   mov.erpIds   = cleanLinks.map(l => l.erpId);
 
@@ -1967,6 +1986,24 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
     updatedIdPor.push({ userId: user?._id ?? null, nombre: displayName, fechaId: new Date(), erpId });
   }
   mov.identificadoPor = updatedIdPor;
+
+  // 2026-09-01 (pedido explícito del usuario) — mismo historial que updateErpIds():
+  // 'vinculado' por cada alta (snapshot = el link nuevo, ya en cleanLinks), 'desvinculado'
+  // por cada baja (snapshot = como estaba en erpLinksAntes). addedErpIds/removedErpIds ya
+  // estaban calculados arriba para identificadoPor — se reusan tal cual.
+  const nuevasEntradasHistorial = [
+    ...addedErpIds.map(erpId => ({
+      at: new Date(), accion: 'vinculado', erpId, origen: 'manual',
+      userId: user?._id ?? null, userNombre: displayName, snapshot: cleanLinks.find(l => l.erpId === erpId) ?? null,
+    })),
+    ...removedErpIds.map(erpId => ({
+      at: new Date(), accion: 'desvinculado', erpId, origen: 'manual',
+      userId: user?._id ?? null, userNombre: displayName, snapshot: erpLinksAntes.find(l => l.erpId === erpId) ?? null,
+    })),
+  ];
+  if (nuevasEntradasHistorial.length > 0) {
+    mov.historialVinculacion = [...(mov.historialVinculacion || []), ...nuevasEntradasHistorial];
+  }
 
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
   mov.saldoErp = saldoErp;
@@ -1999,6 +2036,7 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
+    historialVinculacion: mov.historialVinculacion,
     saldoErp: mov.saldoErp, uuidXML: mov.uuidXML, status: mov.status,
     identificadoPor: mov.identificadoPor,
   };

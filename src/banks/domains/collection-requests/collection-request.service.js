@@ -796,17 +796,30 @@ async function identificar(id, body, user) {
   }
 
   // 5. BancoID — igual criterio que _matchBancoDefault() en cobro-panel.component.ts
-  // (panel manual): solo las formas de pago con claveSAT '03' (transferencia) lo
-  // necesitan. Acá no hay un humano confirmando el banco en pantalla antes de
-  // aplicar (a diferencia del panel manual), pero el usuario confirmó (2026-07-28)
-  // que igual quiere el mismo fallback: si el banco del movimiento no matchea
-  // ningún banco del catálogo de Kore, se manda bancos[0] (el primero del
-  // catálogo) en vez de dejar el cobro sin BancoID. Con varios movimientos, cada
-  // uno puede corresponder a un banco distinto (ej. transferencia BBVA + otra
-  // Santander) — el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los
-  // catálogos (formasPagoKore/bancosKore) se piden UNA sola vez, no por
-  // movimiento. Todo o nada: si Kore rechaza cualquiera de los 2 catálogos, no
-  // se aplica el cobro (mismo criterio que el resto de la función).
+  // (panel manual): en un inicio solo se mandaba para claveSAT '03' (transferencia).
+  // Acá no hay un humano confirmando el banco en pantalla antes de aplicar (a
+  // diferencia del panel manual), pero el usuario confirmó (2026-07-28) que igual
+  // quiere el mismo fallback: si el banco del movimiento no matchea ningún banco
+  // del catálogo de Kore, se manda bancos[0] (el primero del catálogo) en vez de
+  // dejar el cobro sin BancoID. Con varios movimientos, cada uno puede
+  // corresponder a un banco distinto (ej. transferencia BBVA + otra Santander) —
+  // el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los catálogos
+  // (formasPagoKore/bancosKore) se piden UNA sola vez, no por movimiento. Todo o
+  // nada: si Kore rechaza cualquiera de los 2 catálogos, no se aplica el cobro
+  // (mismo criterio que el resto de la función).
+  //
+  // 2026-09-01 (pedido explícito del usuario, caso real: Cheque en Bancomer +
+  // Transferencia en Banco Azteca en la misma solicitud): bancoDefaultPorMovId ya
+  // se resolvía por movimiento para TODOS los movimientos de la solicitud (el
+  // `for` de abajo nunca filtró por tipo de forma de pago) — el dato correcto ya
+  // estaba disponible, solo no se aplicaba al payload de Cheque/Depósito en
+  // efectivo por el gate de abajo (ver datosAdicionalesPorFormaPago). Se extendió
+  // el gate para reusar el MISMO bancoDefaultPorMovId ya calculado en Cheque y
+  // Depósito en efectivo — ambos tienen un depósito bancario real detrás, igual
+  // que transferencia, así que la misma necesidad aplica. SIN CONFIRMAR todavía
+  // contra Kore real si su catálogo acepta BancoID para estos 2 tipos (mismo
+  // riesgo que ya se vio con "Num Recibo" para Cheque, rechazado en su momento) —
+  // probar antes de dar por buena esta extensión.
   const bancoDefaultPorMovId = new Map();
   const formaPagoRequiereBanco = new Map();
   // Depósito en efectivo no tiene claveSAT propia (Kore la reporta como Efectivo, '01'),
@@ -831,8 +844,12 @@ async function identificar(id, body, user) {
       formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
       formaPagoEsCheque.set(String(f.id), _esChequeKore(f.nombre));
     }
-    const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
-    if (algunaFormaRequiereBanco) {
+    // 2026-09-01: además de transferencia, Cheque y Depósito en efectivo también
+    // reusan bancoDefaultPorMovId ahora (ver comentario arriba) — el catálogo de
+    // bancos se pide si CUALQUIERA de los 3 tipos está presente en la solicitud.
+    const algunaFormaNecesitaBanco = cr.formasPago.some(f =>
+      formaPagoRequiereBanco.get(f.formaPagoId) || formaPagoEsCheque.get(f.formaPagoId) || formaPagoEsDepositoEfectivo.get(f.formaPagoId));
+    if (algunaFormaNecesitaBanco) {
       const bancosKore = await koreCaja.listarBancos(koreToken);
       for (const movDelGrupo of movsOrdenados) {
         bancoDefaultPorMovId.set(String(movDelGrupo._id), matchBancoDefault(bancosKore, movDelGrupo.banco));
@@ -923,8 +940,13 @@ async function identificar(id, body, user) {
     // vez de mandar un literal): cuando el depósito no trae autorización bancaria
     // (OCR no la detectó), se manda la leyenda "NULL" en vez de string vacío.
     const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || 'NULL').join(',');
+    // 2026-09-01: Cheque y Depósito en efectivo se suman a Transferencia acá —
+    // los 3 tienen un depósito bancario real detrás (bancoDefault ya se resolvió
+    // POR MOVIMIENTO arriba, sin importar el tipo). SIN CONFIRMAR contra Kore
+    // real todavía si su catálogo acepta BancoID para estos 2 tipos.
+    const necesitaBanco = esTransferencia || esCheque || esDepositoEfectivo;
     return {
-      ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
+      ...(necesitaBanco && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
       // fecha_real_pago del PRIMER depósito asignado — mismo criterio que
       // fechaRealPagoRaiz (abajo) para la ambigüedad de "varios movimientos,

@@ -230,8 +230,8 @@ describe('identificar() — 1 forma de pago repartida entre 2 depósitos (split,
   });
 });
 
-describe('identificar() — Depósito en efectivo manda "Num Recibo" vacío + "Numo"/"Aut" invertidos (sin BancoID)', () => {
-  test('DatosAdicionales trae Num Recibo vacío, Numo=folio, Aut=autorización bancaria, sin BancoID', async () => {
+describe('identificar() — Depósito en efectivo manda "Num Recibo" vacío + "Numo"/"Aut" invertidos', () => {
+  test('DatosAdicionales trae Num Recibo vacío, Numo=folio, Aut=autorización bancaria, CON BancoID', async () => {
     const f1 = formaPago('f1', 'Depósito en efectivo', 100000);
     const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
@@ -246,7 +246,11 @@ describe('identificar() — Depósito en efectivo manda "Num Recibo" vacío + "N
     expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
     const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
     expect(datosAdicionales).toHaveLength(1);
-    expect(datosAdicionales[0].BancoID).toBeUndefined();
+    // 2026-09-01 (pedido explícito del usuario, SIN CONFIRMAR todavía contra Kore
+    // real): Depósito en efectivo también manda BancoID ahora — mismo
+    // bancoDefaultPorMovId ya resuelto por movimiento que usa Transferencia,
+    // reusado en vez de duplicado (ver collection-request.service.js ~línea 933).
+    expect(datosAdicionales[0].BancoID).toBe('banco-bbva');
     // 2026-08-28: confirmado contra Kore real — "Num Recibo" siempre vacío,
     // "Numo" lleva el folio interno (autJuntos) y "Aut" la autorización
     // bancaria (numoJuntos). Semántica INVERTIDA a propósito respecto a
@@ -283,7 +287,7 @@ describe('identificar() — sin autorización bancaria (OCR no la detectó), se 
 });
 
 describe('identificar() — Cheque manda "Numo"/"Aut" (su catálogo no tiene "Num Recibo")', () => {
-  test('DatosAdicionales trae Numo=folio, Aut=autorización bancaria, sin BancoID', async () => {
+  test('DatosAdicionales trae Numo=folio, Aut=autorización bancaria, CON BancoID', async () => {
     const f1 = formaPago('f1', 'Cheque', 100000);
     const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
@@ -298,7 +302,12 @@ describe('identificar() — Cheque manda "Numo"/"Aut" (su catálogo no tiene "Nu
     expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
     const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
     expect(datosAdicionales).toHaveLength(1);
-    expect(datosAdicionales[0].BancoID).toBeUndefined();
+    // 2026-09-01 (pedido explícito del usuario, caso real: solicitud con Cheque +
+    // Transferencia en bancos distintos donde Kore devolvía el mismo banco para
+    // ambos — SIN CONFIRMAR todavía contra Kore real si acepta BancoID acá):
+    // Cheque también manda BancoID ahora, mismo bancoDefaultPorMovId resuelto
+    // por movimiento que ya usa Transferencia.
+    expect(datosAdicionales[0].BancoID).toBe('banco-bbva');
     // 2026-08-28: confirmado contra Kore real — Cheque no tiene "Num Recibo" en
     // su catálogo ("los campos configurados son: Numo"), manda Numo=folio y
     // Aut=autorización bancaria, mismos 2 campos que Depósito en efectivo.
@@ -308,6 +317,49 @@ describe('identificar() — Cheque manda "Numo"/"Aut" (su catálogo no tiene "Nu
     ]);
     expect(datosAdicionales[0].fecha_real_pago).toBe('2026-08-01T10:00:00Z');
     expect(fechaRealPagoRaiz).toBe('2026-08-01T10:00:00Z');
+  });
+});
+
+// 2026-09-01 — caso real reportado por el usuario: solicitud con Cheque
+// (depósito en Bancomer) + Transferencia (depósito en Banco Azteca), Kore
+// devolvía "BANCOMER" para AMBAS formas de pago. Causa: bancoDefaultPorMovId ya
+// se resolvía por movimiento para los 2, pero el payload solo aplicaba
+// BancoID a Transferencia — Cheque se quedaba sin mandar nada. Este test
+// confirma que, tras el fix, cada forma de pago manda el BancoID de SU PROPIO
+// movimiento, nunca el mismo para las 2.
+describe('identificar() — Cheque + Transferencia en bancos DISTINTOS: cada uno manda su propio BancoID', () => {
+  test('BancoID de Cheque ≠ BancoID de Transferencia cuando los movimientos son de bancos distintos', async () => {
+    const f1 = formaPago('f1', 'Cheque', 728.12);
+    const f2 = formaPago('f2', 'Transferencia', 55);
+    const cr = makeCr({ formasPago: [f1, f2], cxcs: [{ erpId: 'CXC-1', total: 783.12 }], monto: 783.12 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([
+      bankMovement('mov-cheque',        { banco: 'BANCOMER' }),
+      bankMovement('mov-transferencia', { banco: 'AZTECA' }),
+    ]);
+    setupHappyKore();
+    koreCaja.listarFormasPago.mockResolvedValue([
+      { id: 'fp-f1', claveSAT: '02', nombre: 'Cheque' },
+      { id: 'fp-f2', claveSAT: '03', nombre: 'Transferencia' },
+    ]);
+    koreCaja.listarBancos.mockResolvedValue([
+      { id: 'banco-bancomer', claveBanco: 'BANCOMER', descripcion: 'BANCOMER' },
+      { id: 'banco-azteca',   claveBanco: 'AZTECA',   descripcion: 'BANCO AZTECA' },
+    ]);
+
+    await service.identificar(
+      'cr-1',
+      { asignaciones: [{ formaPagoDocId: 'f1', bankMovementId: 'mov-cheque' }, { formaPagoDocId: 'f2', bankMovementId: 'mov-transferencia' }] },
+      { _id: 'user-1', nombre: 'Ana' },
+    );
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    const cheque        = datosAdicionales.find(d => d.FormaPagoID === 'fp-f1');
+    const transferencia = datosAdicionales.find(d => d.FormaPagoID === 'fp-f2');
+    expect(cheque.BancoID).toBe('banco-bancomer');
+    expect(transferencia.BancoID).toBe('banco-azteca');
+    expect(cheque.BancoID).not.toBe(transferencia.BancoID);
   });
 });
 

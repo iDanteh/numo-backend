@@ -115,6 +115,36 @@ async function main() {
       for (const m of candidatos) {
         console.log(JSON.stringify({ _id: m._id, banco: m.banco, fecha: m.fecha, deposito: m.deposito, categoria: m.categoria, erpLinks: m.erpLinks }, null, 2));
       }
+
+      // Cada candidato trae su propio erpLinks.folioFiscal, que puede NO ser
+      // ni el del Pago ni el de la factura buscada por serie/folio. Se resuelve
+      // qué CFDI es realmente ese UUID en Mongo (podría ser un SUSTITUTO de la
+      // factura original — misma operación, UUID distinto tras cancelación) y
+      // si trae cfdiRelacionados apuntando de vuelta a la factura original.
+      console.log('\n--- ¿A qué CFDI corresponde el erpLinks.folioFiscal de cada candidato? ---');
+      const uuidsVistos = new Set();
+      for (const m of candidatos) {
+        for (const link of (m.erpLinks || [])) {
+          const uuidLink = link.folioFiscal;
+          if (!uuidLink || uuidsVistos.has(uuidLink.toUpperCase())) continue;
+          uuidsVistos.add(uuidLink.toUpperCase());
+          const cfdiLink = await CFDI.findOne({ uuid: new RegExp(`^${uuidLink}$`, 'i') }).lean();
+          if (!cfdiLink) {
+            console.log(`UUID ${uuidLink}: no se encontró ningún CFDI con ese uuid en Mongo.`);
+            continue;
+          }
+          console.log(`UUID ${uuidLink} => CFDI ${cfdiLink.tipoDeComprobante} ${cfdiLink.serie}-${cfdiLink.folio}, estatus=${cfdiLink.estatus ?? cfdiLink.status ?? '?'}`);
+          const relacionados = cfdiLink.cfdiRelacionados ?? cfdiLink.CfdiRelacionados ?? [];
+          if (relacionados.length) {
+            console.log('  cfdiRelacionados:', JSON.stringify(relacionados));
+          }
+          if (String(cfdiLink.uuid).toUpperCase() !== String(cfdi.uuid).toUpperCase()) {
+            const esRelacionadoDirecto = (Array.isArray(relacionados) ? relacionados : [])
+              .some(r => String(r.UUID || r.uuid || '').toUpperCase() === String(doctos[0]?.uuid || '').toUpperCase());
+            console.log(esRelacionadoDirecto ? '  -> SÍ referencia directamente a la factura buscada (sustituto confirmado).' : '  -> revisar manualmente si es sustituto de la factura buscada.');
+          }
+        }
+      }
     }
   }
 

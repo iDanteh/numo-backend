@@ -1032,9 +1032,19 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
           // marcador como último recurso (mejor que dejarlo vacío).
           const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
             || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+          // Nota informativa del sobrante (confirmado con el usuario
+          // 2026-09-01): NO cambia el `debe` real de la línea (eso sigue
+          // siendo lo realmente usado, ver `emitirLineaSF` arriba) — solo se
+          // anota en el concepto cuánto le queda al cliente de este origen
+          // después de este uso, si es que queda algo (`saldoSobrante` viene
+          // del ERP, ver `_prefetchAjustesFacturaPropia`). Si el dato no vino
+          // (registro viejo) o ya cerró en $0, no se anota nada.
+          const notaSobrante = (Number.isFinite(d.saldoSobrante) && d.saldoSobrante > 0.01)
+            ? ` (saldo disponible: $${d.saldoSobrante.toFixed(2)})`
+            : '';
           emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF', {
             serie: referenciaVenta,
-            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / '),
+            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / ') + notaSobrante,
           });
         }
       } else {

@@ -58,6 +58,49 @@ function inicioFaseContador(crCreatedAt, movCreatedAt) {
   return movCreatedAt > crCreatedAt ? movCreatedAt : crCreatedAt;
 }
 
+// 2026-08-28 — Distribución por franjas de tiempo (pedido explícito del usuario): el
+// promedio/mediana no alcanzan para ver el problema real — una sola solicitud que tarda
+// mucho dispara el promedio sin que se note CUÁNTAS solicitudes están realmente
+// afectadas ni en qué proporción. El usuario pidió específicamente franjas de 30
+// minutos porque la carga de movimientos de estados de cuenta en Bancos se hace en 2
+// cortes de 30min — ese es el ritmo operativo real contra el que tiene sentido medir,
+// no un percentil abstracto sin referencia al negocio. Confirmado con el usuario
+// (AskUserQuestion, 2026-08-28): los buckets aplican sobre el tiempo TOTAL
+// (creada->resuelta), no sobre fase1/fase2 por separado — es la métrica que de verdad
+// reporta "cuánto tarda en identificarse un movimiento" de punta a punta.
+//
+// 2026-08-28 (mismo día, corrección de diseño /frontend-design): recortado de 4 cortes
+// (5 franjas: 30/60/90/120) a 3 cortes (4 franjas: 30/60/120) — el paso de 90min de la
+// versión original no representaba ningún límite operativo real, era un paso arbitrario
+// por simetría. Recalibrado para que cada franja responda una pregunta de negocio
+// concreta contra el ritmo real de 2 cortes de 30min: 0-30 = identificada dentro del
+// mismo corte de carga; 30-60 = dentro del segundo corte (todavía cadencia normal);
+// 60-120 = se pasó de los 2 cortes, demora real; >120 = caso atípico. De paso, esto deja
+// un mapeo 1:1 franja↔tono en distTone() del frontend (antes 2 franjas compartían
+// 'critical' sin necesidad).
+function distribucionPorMinutos(horasArr, cortesMinutos = [30, 60, 120]) {
+  const minutosArr = horasArr.map(h => h * 60);
+  const total = minutosArr.length;
+
+  const buckets = cortesMinutos.map((corte, i) => ({
+    desdeMin: i === 0 ? 0 : cortesMinutos[i - 1],
+    hastaMin: corte,
+  }));
+  buckets.push({ desdeMin: cortesMinutos[cortesMinutos.length - 1], hastaMin: null });
+
+  return buckets.map(({ desdeMin, hastaMin }) => {
+    const count = minutosArr.filter(m => m >= desdeMin && (hastaMin === null || m < hastaMin)).length;
+    return {
+      desdeMin,
+      hastaMin,
+      count,
+      // Redondeo a 1 decimal — evita NaN con total=0 (array vacío, ej. mes sin
+      // solicitudes resueltas todavía).
+      porcentaje: total === 0 ? 0 : Math.round((count / total) * 1000) / 10,
+    };
+  });
+}
+
 /**
  * @param {object} [filtros]
  * @param {string|number} [filtros.year]
@@ -147,8 +190,11 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
     total:         { promedioHoras: promedio(totalHorasArr), medianaHoras: mediana(totalHorasArr), count: totalHorasArr.length },
     fase1Banco:    { promedioHoras: promedio(fase1HorasArr), medianaHoras: mediana(fase1HorasArr), count: fase1HorasArr.length },
     fase2Contador: { promedioHoras: promedio(fase2HorasArr), medianaHoras: mediana(fase2HorasArr), count: fase2HorasArr.length },
+    distribucionTotal: distribucionPorMinutos(totalHorasArr),
     porUsuario,
   };
 }
 
-module.exports = { getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, INDICADORES_CR_DESDE };
+module.exports = {
+  getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, distribucionPorMinutos, INDICADORES_CR_DESDE,
+};

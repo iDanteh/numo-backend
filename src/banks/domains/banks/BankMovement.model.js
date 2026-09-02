@@ -259,6 +259,39 @@ const bankMovementSchema = new mongoose.Schema({
     }],
     default: [],
   },
+
+  // 2026-09-01 (pedido explícito del usuario) — historial de vinculación/desvinculación
+  // de CxC contra este movimiento: antes de este campo, desvincular (updateErpIds/
+  // setErpIds en bank.service.js) borraba la entrada de erpLinks[] sin dejar rastro —
+  // la trazabilidad se perdía apenas alguien desvinculaba. Distinto de `_changelog`
+  // (arriba, scopeado a import/enriquecimiento automático) y de ErpReversion
+  // (erp_reversiones, colección aparte que guarda snapshots para poder "revertir la
+  // reversión") — este es el registro PROPIO del movimiento, alimentado por los 3
+  // caminos que tocan erpLinks: updateErpIds/setErpIds (manual) y erp-reversion.service.js
+  // (avisos de Kore, que además siguen escribiendo su propio ErpReversion como ya
+  // hacían). Entradas inmutables, nunca se borran ni editan.
+  historialVinculacion: {
+    type: [{
+      at:         { type: Date,   required: true },
+      accion:     { type: String, enum: ['vinculado', 'desvinculado', 'ajustado'], required: true },
+      erpId:      { type: String, required: true },
+      // 'manual' = updateErpIds/setErpIds (usuario con banks:erp:unlink o quien vinculó);
+      // 'kore-reversion' = Kore avisó una reversión/cancelación (erp-reversion.service.js);
+      // 'transferencia-caja-reversion' = reservado para un futuro registro de auditoría
+      // cuando desvincular un erpId sintético CAJA-<koreId> revierte la CajaTransferencia
+      // asociada (ver caja-transferencia-revert.service.js) — hoy esa reversión ocurre en
+      // CajaTransferencia, no agrega una entrada propia acá todavía.
+      origen:     { type: String, enum: ['manual', 'kore-reversion', 'transferencia-caja-reversion'], required: true },
+      userId:     { type: String, default: null }, // null cuando origen es 'kore-reversion'
+      userNombre: { type: String, default: null },
+      motivo:     { type: String, default: null }, // ej. el motivo que mandó Kore en la reversión
+      // El erpLink completo tal cual estaba ANTES de esta acción (para 'desvinculado'/
+      // 'ajustado') o el link nuevo (para 'vinculado') — mismo espíritu que
+      // erpLinkRemovido/erpLinkAjustado en ErpReversion.model.js.
+      snapshot:   { type: mongoose.Schema.Types.Mixed, default: null },
+    }],
+    default: [],
+  },
 }, {
   timestamps: true,
   collection: 'bank_movements',

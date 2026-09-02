@@ -23,6 +23,12 @@ const { buildErpLinksParaCobro, tipoSaldoEspecial, matchBancoDefault } = require
 // puras de resolución de asignación {formaPago -> BankMovement} y reconciliación
 // de montos — ver collection-request-asignaciones.js.
 const { resolverAsignaciones, calcularReconciliacion, movimientosDe } = require('./collection-request-asignaciones');
+// horasReloj (2026-08-28): reusa el MISMO cálculo de tiempo total que ya usa el
+// dashboard (getIndicadoresSolicitudesCobro) para poblar las columnas "Minutos
+// totales"/"Franja" del reporte — nunca reimplementar esta fórmula acá.
+// collection-request-indicadores.service.js NO requiere este archivo (sin
+// dependencia circular).
+const { horasReloj }                                = require('./collection-request-indicadores.service');
 // conTransaccion (D5): N x setErpIds + cr.save() en una sola transacción Mongo
 // cuando la topología lo soporta, con fallback standalone documentado.
 const { conTransaccion }                            = require('../../shared/utils/mongo-tx');
@@ -790,17 +796,30 @@ async function identificar(id, body, user) {
   }
 
   // 5. BancoID — igual criterio que _matchBancoDefault() en cobro-panel.component.ts
-  // (panel manual): solo las formas de pago con claveSAT '03' (transferencia) lo
-  // necesitan. Acá no hay un humano confirmando el banco en pantalla antes de
-  // aplicar (a diferencia del panel manual), pero el usuario confirmó (2026-07-28)
-  // que igual quiere el mismo fallback: si el banco del movimiento no matchea
-  // ningún banco del catálogo de Kore, se manda bancos[0] (el primero del
-  // catálogo) en vez de dejar el cobro sin BancoID. Con varios movimientos, cada
-  // uno puede corresponder a un banco distinto (ej. transferencia BBVA + otra
-  // Santander) — el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los
-  // catálogos (formasPagoKore/bancosKore) se piden UNA sola vez, no por
-  // movimiento. Todo o nada: si Kore rechaza cualquiera de los 2 catálogos, no
-  // se aplica el cobro (mismo criterio que el resto de la función).
+  // (panel manual): en un inicio solo se mandaba para claveSAT '03' (transferencia).
+  // Acá no hay un humano confirmando el banco en pantalla antes de aplicar (a
+  // diferencia del panel manual), pero el usuario confirmó (2026-07-28) que igual
+  // quiere el mismo fallback: si el banco del movimiento no matchea ningún banco
+  // del catálogo de Kore, se manda bancos[0] (el primero del catálogo) en vez de
+  // dejar el cobro sin BancoID. Con varios movimientos, cada uno puede
+  // corresponder a un banco distinto (ej. transferencia BBVA + otra Santander) —
+  // el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los catálogos
+  // (formasPagoKore/bancosKore) se piden UNA sola vez, no por movimiento. Todo o
+  // nada: si Kore rechaza cualquiera de los 2 catálogos, no se aplica el cobro
+  // (mismo criterio que el resto de la función).
+  //
+  // 2026-09-01 (pedido explícito del usuario, caso real: Cheque en Bancomer +
+  // Transferencia en Banco Azteca en la misma solicitud): bancoDefaultPorMovId ya
+  // se resolvía por movimiento para TODOS los movimientos de la solicitud (el
+  // `for` de abajo nunca filtró por tipo de forma de pago) — el dato correcto ya
+  // estaba disponible, solo no se aplicaba al payload de Cheque/Depósito en
+  // efectivo por el gate de abajo (ver datosAdicionalesPorFormaPago). Se extendió
+  // el gate para reusar el MISMO bancoDefaultPorMovId ya calculado en Cheque y
+  // Depósito en efectivo — ambos tienen un depósito bancario real detrás, igual
+  // que transferencia, así que la misma necesidad aplica. SIN CONFIRMAR todavía
+  // contra Kore real si su catálogo acepta BancoID para estos 2 tipos (mismo
+  // riesgo que ya se vio con "Num Recibo" para Cheque, rechazado en su momento) —
+  // probar antes de dar por buena esta extensión.
   const bancoDefaultPorMovId = new Map();
   const formaPagoRequiereBanco = new Map();
   // Depósito en efectivo no tiene claveSAT propia (Kore la reporta como Efectivo, '01'),
@@ -810,14 +829,27 @@ async function identificar(id, body, user) {
   const _esDepositoEfectivoKore = (nombreFormaPago) => /DEPOSITO.*EFECTIVO/.test(
     String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
   );
+  // 2026-08-28 (pedido explícito del usuario) — Cheque, mismo criterio de detección por
+  // nombre que depósito en efectivo (tampoco tiene claveSAT propia distintiva). Regex
+  // amplio a propósito (sin anclar "NOMINATIVO" ni nada más) para tolerar variantes del
+  // nombre en el catálogo de Kore, mismo espíritu que el resto de estos matches.
+  const formaPagoEsCheque = new Map();
+  const _esChequeKore = (nombreFormaPago) => /CHEQUE/.test(
+    String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
+  );
   try {
     const formasPagoKore = await koreCaja.listarFormasPago(koreToken);
     for (const f of formasPagoKore) {
       formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
       formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
+      formaPagoEsCheque.set(String(f.id), _esChequeKore(f.nombre));
     }
-    const algunaFormaRequiereBanco = cr.formasPago.some(f => formaPagoRequiereBanco.get(f.formaPagoId));
-    if (algunaFormaRequiereBanco) {
+    // 2026-09-01: además de transferencia, Cheque y Depósito en efectivo también
+    // reusan bancoDefaultPorMovId ahora (ver comentario arriba) — el catálogo de
+    // bancos se pide si CUALQUIERA de los 3 tipos está presente en la solicitud.
+    const algunaFormaNecesitaBanco = cr.formasPago.some(f =>
+      formaPagoRequiereBanco.get(f.formaPagoId) || formaPagoEsCheque.get(f.formaPagoId) || formaPagoEsDepositoEfectivo.get(f.formaPagoId));
+    if (algunaFormaNecesitaBanco) {
       const bancosKore = await koreCaja.listarBancos(koreToken);
       for (const movDelGrupo of movsOrdenados) {
         bancoDefaultPorMovId.set(String(movDelGrupo._id), matchBancoDefault(bancosKore, movDelGrupo.banco));
@@ -901,10 +933,20 @@ async function identificar(id, body, user) {
     const bancoDefault      = bancoDefaultPorMovId.get(movIdsDeEstaForma[0]) ?? null;
     const esTransferencia     = formaPagoRequiereBanco.get(f.formaPagoId) === true;
     const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
+    const esCheque            = formaPagoEsCheque.get(f.formaPagoId) === true;
     const autJuntos  = movsDeEstaForma.map(m => m.folio || '').join(',');
-    const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || '').join(',');
+    // 2026-08-31 (pedido explícito del usuario, SOLO Solicitudes de Cobro — el cobro
+    // manual de cobro-panel.component.ts no manda este tag si no hay autorización, en
+    // vez de mandar un literal): cuando el depósito no trae autorización bancaria
+    // (OCR no la detectó), se manda la leyenda "NULL" en vez de string vacío.
+    const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || 'NULL').join(',');
+    // 2026-09-01: Cheque y Depósito en efectivo se suman a Transferencia acá —
+    // los 3 tienen un depósito bancario real detrás (bancoDefault ya se resolvió
+    // POR MOVIMIENTO arriba, sin importar el tipo). SIN CONFIRMAR contra Kore
+    // real todavía si su catálogo acepta BancoID para estos 2 tipos.
+    const necesitaBanco = esTransferencia || esCheque || esDepositoEfectivo;
     return {
-      ...(esTransferencia && bancoDefault ? { BancoID: bancoDefault.id } : {}),
+      ...(necesitaBanco && bancoDefault ? { BancoID: bancoDefault.id } : {}),
       FormaPagoID: f.formaPagoId,
       // fecha_real_pago del PRIMER depósito asignado — mismo criterio que
       // fechaRealPagoRaiz (abajo) para la ambigüedad de "varios movimientos,
@@ -916,17 +958,36 @@ async function identificar(id, body, user) {
           { Nombre: 'Numo', Valor: numoJuntos },
         ],
       } : {}),
-      // Depósito en efectivo: SOLO "Num Recibo" — es el único campo que su
-      // catálogo declara en CamposExtras. Se probó agregar también "Numo" (por
-      // el mensaje de Kore "el campo extra que empieza con numo"), pero Kore lo
-      // rechazó explícitamente: "el dato adicional 'Numo' no está configurado en
-      // la forma de pago DEPOSITO EN EFECTIVO... los campos configurados son:
-      // Num Recibo" (confirmado 2026-08-27 contra Kore real). No volver a
-      // agregar "Numo" aquí — el mensaje original de "campo que empieza con
-      // numo" se refería a otra cosa, no a este tag.
+      // 2026-08-28 — AJUSTE explícito del usuario, todavía SIN confirmar contra Kore
+      // (pendiente de la próxima prueba): "Num Recibo" vacío, "Numo" ahora lleva
+      // autJuntos (el folio — antes era "Num Recibo" quien lo llevaba) y un 3er campo
+      // nuevo "Aut" lleva numoJuntos (autorización bancaria — antes era "Numo"). Mismos
+      // 2 nombres de campo que transferencia ("Aut"/"Numo"), pero con la semántica
+      // INVERTIDA a propósito (acá "Numo"=folio, "Aut"=autorización; en transferencia,
+      // línea ~921 arriba, es al revés) — no unificar ambos bloques asumiendo que
+      // comparten semántica solo porque comparten nombres de campo. Sigue valiendo la
+      // regla de nunca concatenar 2 valores distintos en un mismo campo (ver
+      // project_kore_numo_catalog_contradiction.md).
       ...(esDepositoEfectivo ? {
         DatosAdicionales: [
-          { Nombre: 'Num Recibo', Valor: autJuntos },
+          { Nombre: 'Num Recibo', Valor: '' },
+          { Nombre: 'Numo', Valor: autJuntos },
+          { Nombre: 'Aut', Valor: numoJuntos },
+        ],
+      } : {}),
+      // 2026-08-28 (mismo día, rechazo real de Kore) — Cheque NO tiene "Num Recibo" en
+      // su catálogo en absoluto (a diferencia de depósito en efectivo): "el dato
+      // adicional 'Num Recibo' no está configurado en la forma de pago CHEQUE... los
+      // campos configurados son: Numo". Manda "Numo" con autJuntos (folio) — mismo
+      // valor/criterio que el primer experimento de depósito en efectivo cuando iba
+      // solo, ver memoria. 2026-08-28 (mismo día, ajuste explícito del usuario, SIN
+      // confirmar todavía contra Kore): se agrega "Aut" con numoJuntos (autorización
+      // bancaria) — mismos 2 campos que depósito en efectivo ahora (línea ~945 arriba),
+      // sin "Num Recibo" porque Cheque no lo tiene en su catálogo.
+      ...(esCheque ? {
+        DatosAdicionales: [
+          { Nombre: 'Numo', Valor: autJuntos },
+          { Nombre: 'Aut', Valor: numoJuntos },
         ],
       } : {}),
     };
@@ -1154,6 +1215,28 @@ async function cancelarPorErp(solicitudIdErp, { canceladoPorUserId, canceladoPor
 const XLSX_HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF6D28D9' } };
 const XLSX_HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
 
+// 2026-08-28 — Columnas "Minutos totales"/"Franja" (pedido explícito del usuario, tras
+// el histograma "Distribución por franja de tiempo" del dashboard): el promedio/mediana
+// no bastan para revisar CUÁLES solicitudes puntuales están demorando — este reporte
+// ahora expone, por fila, en cuál franja cayó cada solicitud identificada, para poder
+// filtrarlas/revisarlas una por una. Mismos cortes ([30,60,120] min) y mismo formato de
+// etiqueta que `distLabel()` en bank-indicadores-panel.component.ts — replicado acá como
+// función pura (no se importa del frontend, ni tiene sentido requerir Angular desde el
+// backend). Solo aplica a solicitudes `identificada` con `resueltoAt` — una `rechazada`
+// no tiene "tiempo de identificación", el concepto no existe para ese status.
+const FRANJA_CORTES_MIN = [30, 60, 120];
+
+function _franjaLabel(totalMin) {
+  for (let i = 0; i < FRANJA_CORTES_MIN.length; i++) {
+    const corte = FRANJA_CORTES_MIN[i];
+    if (totalMin < corte) {
+      const desde = i === 0 ? 0 : FRANJA_CORTES_MIN[i - 1];
+      return `${desde}-${corte} min`;
+    }
+  }
+  return `Más de ${FRANJA_CORTES_MIN[FRANJA_CORTES_MIN.length - 1]} min`;
+}
+
 function _xlsxFormatFecha(d) {
   if (!d) return '';
   const dt = d instanceof Date ? d : new Date(d);
@@ -1243,6 +1326,9 @@ function _columnasReporte(rico) {
     { header: 'Fecha cobro aplicado',    key: 'fechaCobroAplicado',  width: 16 },
     { header: 'CxC detalle',             key: 'cxcDetalle',          width: 40 },
     { header: 'Forma de pago detalle',   key: 'formaPagoDetalle',    width: 30 },
+    // 2026-08-28: ver comentario en FRANJA_CORTES_MIN/_franjaLabel más arriba.
+    { header: 'Minutos totales',         key: 'minutosTotales',      width: 16 },
+    { header: 'Franja',                  key: 'franja',              width: 16 },
   ];
 }
 
@@ -1262,6 +1348,10 @@ function _filaReporte(cr, rico) {
   // (post-backfill vía formasPago[].bankMovementId, o el campo raíz deprecado
   // como único fallback para documentos pre-backfill).
   const movs = movimientosDe(cr);
+  // 2026-08-28: solo aplica a identificada+resueltoAt — ver comentario en
+  // FRANJA_CORTES_MIN más arriba (una rechazada no tiene "tiempo de identificación").
+  const aplicaFranja = cr.status === 'identificada' && cr.resueltoAt && cr.createdAt;
+  const totalMin     = aplicaFranja ? Math.round(horasReloj(cr.createdAt, cr.resueltoAt) * 60) : null;
   return {
     ...fila,
     solicito:             cr.solicitanteNombre || '',
@@ -1276,6 +1366,8 @@ function _filaReporte(cr, rico) {
     fechaCobroAplicado:   _xlsxFormatFecha(cr.cobroAplicadoAt),
     cxcDetalle:           _cxcDetalle(cr.cxcs),
     formaPagoDetalle:     _formaPagoDetalle(cr.formasPago),
+    minutosTotales:       totalMin ?? '',
+    franja:               totalMin !== null ? _franjaLabel(totalMin) : '',
   };
 }
 
@@ -1314,17 +1406,38 @@ async function _generarExcelSolicitudes(data, { rico }) {
 // movimiento bancario vinculado y quién resolvió — información que tienda no
 // necesita ver de solicitudes ajenas.
 async function buildReport(filters) {
-  const { search, fechaInicio, fechaFin } = filters;
+  const { search, fechaInicio, fechaFin, desdeMin, hastaMin } = filters;
   const filter = {
     ..._buildBusquedaFilter({ search, fechaInicio, fechaFin }),
     status: { $in: ['identificada', 'rechazada'] },
   };
-  const data = await CollectionRequest.find(filter)
+  let data = await CollectionRequest.find(filter)
     .sort({ createdAt: 1 })
     .select('-comprobante.data')
     .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .lean();
+
+  // 2026-08-28 — Filtro opcional por franja (pedido explícito del usuario, botón
+  // "descargar esta franja" en el histograma del dashboard): se filtra en JS, no en
+  // Mongo — mismo criterio que ya usa getIndicadoresSolicitudesCobro para calcular la
+  // distribución, evita duplicar una agregación de Mongo para un volumen que hoy no la
+  // necesita. Si NO viene `desdeMin`, `data` queda EXACTAMENTE igual que antes (reporte
+  // general/concentrado, ambas hojas, sin recorte) — las columnas "Minutos totales"/
+  // "Franja" ya vienen pobladas en toda fila `identificada`, así que ese caso general
+  // sigue pudiéndose filtrar a mano con el autoFilter que el Excel ya trae.
+  if (desdeMin !== undefined && desdeMin !== null && desdeMin !== '') {
+    const desde = Number(desdeMin);
+    const hasta = (hastaMin !== undefined && hastaMin !== null && hastaMin !== '') ? Number(hastaMin) : null;
+    // Una rechazada no tiene "tiempo de identificación" — no aplica ninguna franja,
+    // se excluye por completo del reporte puntual (no solo se deja en blanco).
+    data = data.filter((cr) => {
+      if (cr.status !== 'identificada' || !cr.resueltoAt || !cr.createdAt) return false;
+      const totalMin = Math.round(horasReloj(cr.createdAt, cr.resueltoAt) * 60);
+      return totalMin >= desde && (hasta === null || totalMin < hasta);
+    });
+  }
+
   return _generarExcelSolicitudes(data, { rico: true });
 }
 

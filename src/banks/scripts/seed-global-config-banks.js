@@ -114,6 +114,9 @@ async function seedBancos(fallos) {
       'DATE_WINDOW_DAYS — Motor de coincidencia automática ERP↔movimientos bancarios (ventana de fecha, ±días)',
       'FORMASPAGO_BASE_URL — Catálogo de bancos/formas de pago: cobro manual (GET /cobros/bancos, /formas-pago) y aplicar cobro automático desde una Solicitud de Cobro (resolver BancoID)',
       'FACT_BASE_URL — Reporte "CFDIs con Pagos" (pagos-banco)',
+      'NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreTipoTransferencia esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
+      'NOMBRE_CAJA_DESTINO_PERMITIDAS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreCajaDestino esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
+      'TRANSFERENCIAS_DATE_WINDOW_DAYS — Ventana de fecha (± días) del matching de transferencias entre cajas contra Depósito en efectivo. Distinta de DATE_WINDOW_DAYS (esa es del motor ERP↔CxC).',
     ],
   });
 
@@ -186,6 +189,44 @@ async function seedBancos(fallos) {
       usuarioNombre: 'seed-script',
     });
     console.log(`[seed-banks] bancos.FACT_BASE_URL          = ${baseUrl} (tomado de ERP_FACT_BASE_URL en este .env)`);
+  });
+
+  // NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS / NOMBRE_CAJA_DESTINO_PERMITIDAS (Fase B, matching
+  // de transferencias entre cajas) — a diferencia de las claves de arriba, NO tienen un valor
+  // "correcto" derivable del .env (son listas de negocio que el usuario define desde la UI).
+  // Por eso, a diferencia del resto de este script, solo se siembran si la fila TODAVÍA NO
+  // EXISTE — un re-run de este seed nunca debe pisar un filtro que un admin ya configuró.
+  for (const clave of ['NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS', 'NOMBRE_CAJA_DESTINO_PERMITIDAS']) {
+    // eslint-disable-next-line no-await-in-loop
+    await _sembrarClave(fallos, 'bancos', clave, async () => {
+      const yaExiste = await svc.getValue('bancos', clave).then(() => true).catch(() => false);
+      if (yaExiste) {
+        console.log(`[seed-banks] bancos.${clave} ya existe — no se pisa (puede tener un filtro ya configurado).`);
+        return;
+      }
+      await svc.setValue('bancos', clave, '[]', {
+        esSecreto: false, tipo: 'lista',
+        descripcion: 'JSON array de strings — filtro de transferencias entre cajas (Fase B). Vacío = sin filtro, se sincroniza todo.',
+        usuarioNombre: 'seed-script',
+      });
+      console.log(`[seed-banks] bancos.${clave} = [] (default, sin filtro — configurar desde la UI de Configuraciones Globales)`);
+    });
+  }
+
+  // TRANSFERENCIAS_DATE_WINDOW_DAYS (Fase C) — mismo criterio "solo si no existe": es un
+  // valor de tuning que un admin puede ajustar, un re-run del seed no debe resetearlo.
+  await _sembrarClave(fallos, 'bancos', 'TRANSFERENCIAS_DATE_WINDOW_DAYS', async () => {
+    const yaExiste = await svc.getValue('bancos', 'TRANSFERENCIAS_DATE_WINDOW_DAYS').then(() => true).catch(() => false);
+    if (yaExiste) {
+      console.log('[seed-banks] bancos.TRANSFERENCIAS_DATE_WINDOW_DAYS ya existe — no se pisa.');
+      return;
+    }
+    await svc.setValue('bancos', 'TRANSFERENCIAS_DATE_WINDOW_DAYS', '5', {
+      esSecreto: false, tipo: 'numero',
+      descripcion: 'Ventana de fecha (± días) del matching de transferencias entre cajas contra Depósito en efectivo. Default de arranque, ajustable desde la UI.',
+      usuarioNombre: 'seed-script',
+    });
+    console.log('[seed-banks] bancos.TRANSFERENCIAS_DATE_WINDOW_DAYS = 5 (default de arranque — ajustable desde la UI)');
   });
 }
 

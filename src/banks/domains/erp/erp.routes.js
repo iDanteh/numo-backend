@@ -26,8 +26,22 @@ const globalConfigService                 = require('../../../shared/services/gl
 const {
   KoreCajaError, koreTokenCache, obtenerCajaBaseUrl,
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
-  listarBancos, listarFormasPago,
+  listarBancos, listarFormasPago, buscarTransferenciasCajas,
 }                                         = require('./kore-caja.service');
+const CajaTransferencia                  = require('./CajaTransferencia.model');
+const { buscarCandidatos }               = require('./caja-transferencia-match.service');
+const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
+const { sincronizarTransferenciasCajasManual }
+                                          = require('./caja-transferencia-sync.service');
+// Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
+// cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
+// se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
+require('./caja-transferencia-revert.service').init();
+// Registra en global-config.service.js el hook que reaplica el filtro de transferencias
+// de caja automáticamente cuando cambia NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS/
+// NOMBRE_CAJA_DESTINO_PERMITIDAS (ver caja-transferencia-sync.service.js#init) — pedido
+// explícito del usuario 2026-09-02: sin control manual, el endpoint HTTP se eliminó.
+require('./caja-transferencia-sync.service').init();
 
 const uploadCyc = multer({
   storage: multer.memoryStorage(),
@@ -232,6 +246,115 @@ router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFD
     esAnticipo:           raw0.esAnticipo           ?? false,
     origen:               raw0.origen               ?? null,
   });
+}));
+
+// GET /api/erp/transferencias-cajas — transferencias internas de efectivo entre cajas
+// (sucursal → gerente), endpoint /transferencias/reportes/buscar de Kore. Solo trae los
+// datos crudos, sin cruzarlos contra BankMovement — el matching contra Depósito en
+// efectivo/reclasificado se implementa en una fase posterior (pedido explícito del
+// usuario: "primero quiero que se sienten las bases").
+// Parámetros: fechaDesde, fechaHasta (opcionales, mismo formato ISO que Kore espera).
+router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
+  const { fechaDesde, fechaHasta } = req.query;
+
+  let raw = [];
+  try {
+    ({ raw } = await buscarTransferenciasCajas({ fechaDesde, fechaHasta }));
+  } catch (err) {
+    if (err.message?.includes('ERP no configurado') || err.message?.includes('No existe la configuración')) {
+      return res.status(503).json({ error: err.message });
+    }
+    if (err instanceof KoreCajaError) return res.status(err.statusCode).json({ error: err.message });
+    throw err;
+  }
+
+  const transferencias = raw.map(t => ({
+    id:                      t.id,
+    monto:                   t.monto,
+    estatus:                 t.estatus                 ?? null,
+    cajaOrigenId:            t.cajaOrigenId             ?? null,
+    nombreCajaOrigen:        t.nombreCajaOrigen         ?? null,
+    almacenCajaOrigen:       t.almacenCajaOrigen        ?? null,
+    cajaDestinoId:           t.cajaDestinoId            ?? null,
+    nombreCajaDestino:       t.nombreCajaDestino        ?? null,
+    almacenCajaDestino:      t.almacenCajaDestino       ?? null,
+    sessionOrigenId:         t.sessionOrigenId          ?? null,
+    sessionDestinoId:        t.sessionDestinoId         ?? null,
+    formaPago:               t.formaPago                ?? null,
+    nombreFormaPago:         t.nombreFormaPago          ?? null,
+    solicito:                t.solicito                 ?? null,
+    nombreSolicito:          t.nombreSolicito           ?? null,
+    recibio:                 t.recibio                  ?? null,
+    nombreRecibio:           t.nombreRecibio            ?? null,
+    autorizo:                t.autorizo                 ?? null,
+    nombreAutorizo:          t.nombreAutorizo           ?? null,
+    fechaSolicitud:          t.fechaSolicitud           ?? null,
+    fechaRecepcion:          t.fechaRecepcion           ?? null,
+    observacion:             t.observacion              ?? null,
+    idTipoTransferencia:     t.idTipoTransferencia      ?? null,
+    nombreTipoTransferencia: t.nombreTipoTransferencia  ?? null,
+  }));
+
+  res.json({ data: transferencias, total: transferencias.length });
+}));
+
+// POST /api/erp/transferencias-cajas/sincronizar-manual — pedido explícito del usuario
+// (2026-09-01): sincronización bajo demanda con fechaDesde/fechaHasta elegidas a mano, sin
+// esperar al cron diario ni quedar atada a VENTANA_MAX_DIAS (esa cota es solo del catch-up
+// automático). Mismo permiso que el sync manual ERP-Kore existente (POST /sync-erp-kore).
+router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const { fechaDesde, fechaHasta } = req.body;
+  try {
+    const resultado = await sincronizarTransferenciasCajasManual({ fechaDesde, fechaHasta });
+    res.json(resultado);
+  } catch (err) {
+    if (err.message?.includes('Se requieren fechaDesde y fechaHasta')) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (err.message?.includes('Ya hay una sincronización manual')) {
+      return res.status(409).json({ error: err.message });
+    }
+    if (err.message?.includes('ERP no configurado') || err.message?.includes('No existe la configuración')) {
+      return res.status(503).json({ error: err.message });
+    }
+    if (err instanceof KoreCajaError) return res.status(err.statusCode).json({ error: err.message });
+    throw err;
+  }
+}));
+
+// GET /api/erp/transferencias-cajas/bandeja — Fase D: transferencias 'pendiente' con sus
+// candidatos ya calculados (Fase C, en vivo — nunca cacheados) para que el usuario confirme
+// desde la UI, separadas de las 'huerfana' (apartado distinto, pedido explícito del usuario:
+// "que no se mezclen con las transferencias que sí logran hacer match").
+router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
+  const [pendientes, huerfanas] = await Promise.all([
+    CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
+      .sort({ fechaRecepcion: 1 }).lean(),
+    CajaTransferencia.find({ estatusMatch: 'huerfana' }).sort({ fechaRecepcion: -1 }).lean(),
+  ]);
+
+  const conCandidatos = await Promise.all(pendientes.map(async (t) => ({
+    transferencia: t,
+    candidatos: await buscarCandidatos(t),
+  })));
+
+  res.json({
+    pendientes: conCandidatos,
+    huerfanas,
+  });
+}));
+
+// POST /api/erp/transferencias-cajas/:id/confirmar — Fase D: confirma un match sugerido
+// contra 1 o 2 BankMovement elegidos por el usuario desde la bandeja. Re-valida
+// elegibilidad y suma de monto server-side (caja-transferencia-confirm.service.js) — nunca
+// confía en que el candidato que manda el cliente sigue siendo válido. Sin permit() propio
+// a propósito — mismo criterio que PUT .../erp-ids (bank.routes.js): setErpIds() ya exige
+// banks:erp:link O banks:cobro internamente, poner permit() acá lo duplicaría más estricto
+// y bloquearía a cobranza (banks:cobro) sin banks:erp:link — bug real ya corregido una vez.
+router.post('/transferencias-cajas/:id/confirmar', authenticate, asyncHandler(async (req, res) => {
+  const { movementIds } = req.body;
+  const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
+  res.json(resultado);
 }));
 
 // Resuelve el shape de "cuenta" que espera el frontend a partir de un CFDI local, para el
@@ -1016,14 +1139,41 @@ function _tieneTagIdentidadPropia(fp) {
   return (fp.adicionales ?? []).some(a => a.nombre === 'Numo' || a.nombre === 'Aut' || a.nombre === 'Num Recibo');
 }
 
+// 2026-09-01 (bug real, encontrado investigando una reversión con "atribución ambigua" que
+// no debería haber sido ambigua): esta función solo contemplaba la convención de
+// Transferencia (Numo=autorización bancaria, Aut=folio). Depósito en efectivo y Cheque usan
+// la convención INVERTIDA a propósito (Numo=folio, Aut=autorización bancaria — ver
+// collection-request.service.js, bloques `esDepositoEfectivo`/`esCheque`, ~línea 940 y 965:
+// "semántica INVERTIDA a propósito... no unificar los 2 bloques asumiendo que comparten
+// semántica solo porque comparten nombres de campo"). Sin esto, CUALQUIER abono de
+// efectivo/cheque nunca matcheaba su propio movimiento: `_tieneTagIdentidadPropia` daba
+// `true` (sí trae tags), pero ninguno de los 2 checks de abajo reconocía esos tags — el
+// abono quedaba clasificado como "de otro movimiento" (en `_montoSaldoLinkPorMovimiento`)
+// o simplemente descartado sin atribuir (en `_aportesPorErpIdCronologico`), rompiendo tanto
+// el saldo normal como la atribución de reversiones para las 3 formas de pago bancarias.
+// Se prueban las 2 lecturas para cada tag — no se puede saber de antemano qué forma de pago
+// originó este `fp` sin volver a consultar el catálogo de Kore. El criterio de tolerancia a
+// texto extra sigue atado al NOMBRE del tag (ver comentario arriba de _tieneTagIdentidadPropia
+// original): "Aut" tolera texto alrededor (ej. "037349-CRISTIAN", alguien autorizando a mano
+// en Kore), "Numo" siempre exacto — eso no depende de qué dato semántico traiga cada uno.
 function _perteneceAEsteMovimiento(fp, mov) {
   const autNormMov = _normalizarAutorizacion(mov.numeroAutorizacion);
-  const numoTag    = (fp.adicionales ?? []).find(a => a.nombre === 'Numo');
-  if (numoTag && autNormMov && _normalizarAutorizacion(numoTag.valor) === autNormMov) return true;
-  const folioMov = String(mov.folio ?? '').trim();
-  const autTag  = (fp.adicionales ?? []).find(a => a.nombre === 'Aut');
-  if (autTag && folioMov && String(autTag.valor ?? '').trim().includes(folioMov)) return true;
-  const numReciboTag = (fp.adicionales ?? []).find(a => a.nombre === 'Num Recibo');
+  const folioMov   = String(mov.folio ?? '').trim();
+  const ads = fp.adicionales ?? [];
+
+  const numoTag = ads.find(a => a.nombre === 'Numo');
+  if (numoTag) {
+    const valRaw = String(numoTag.valor ?? '').trim();
+    if (autNormMov && _normalizarAutorizacion(valRaw) === autNormMov) return true; // Transferencia: Numo = autorización bancaria
+    if (folioMov && valRaw === folioMov) return true;                              // Efectivo/Cheque: Numo = folio
+  }
+  const autTag = ads.find(a => a.nombre === 'Aut');
+  if (autTag) {
+    const valRaw = String(autTag.valor ?? '').trim();
+    if (folioMov && valRaw.includes(folioMov)) return true;                                // Transferencia: Aut = folio
+    if (autNormMov && _normalizarAutorizacion(valRaw) === autNormMov) return true;          // Efectivo/Cheque: Aut = autorización bancaria
+  }
+  const numReciboTag = ads.find(a => a.nombre === 'Num Recibo');
   if (numReciboTag && folioMov && String(numReciboTag.valor ?? '').trim() === folioMov) return true;
   return false;
 }

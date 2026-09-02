@@ -192,6 +192,7 @@ const startServer = async () => {
 
   require('./visor/jobs/satSyncJob');
   require('./banks/jobs/erpSyncCron');
+  require('./banks/jobs/cajaTransferenciaSyncCron');
   require('./visor/jobs/credencialesAlertJob');
   require('./visor/jobs/cfdiCanceladoNotificacionJob');
   try {

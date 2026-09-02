@@ -1341,8 +1341,15 @@ async function extractTextFromPdf(pdfBuffer) {
 /**
  * Renderiza las primeras N páginas de un PDF a buffers PNG de alta resolución.
  *
- * Usa pdfjs-dist (Motor JavaScript puro, sin Ghostscript ni ImageMagick) +
- * el módulo `canvas` que ya se encuentra disponible como dependencia transitiva.
+ * Usa pdfjs-dist (Motor JavaScript puro, sin Ghostscript ni ImageMagick) + `canvas`
+ * (dependencia directa, ver package.json).
+ *
+ * `canvas` fijado EXACTO en 2.11.2 (2026-08-31) — pdfjs-dist@3.11.174 declara
+ * `optionalDependencies: {"canvas": "^2.11.2"}`; con canvas@3.2.3 (versión previa)
+ * cualquier PDF con una imagen INLINE (paintInlineImageXObject) tira "Image or Canvas
+ * expected" al renderizar en Linux (reproducido con un comprobante real de producción,
+ * confirmado que canvas@2.11.2 lo resuelve). No subir de versión sin volver a probar
+ * ese caso puntual.
  *
  * Scale 2.5 ≈ 187 DPI sobre un PDF de 72 DPI base → suficiente para Tesseract LSTM.
  * Para PDFs de tamaño carta (8.5×11 in) produce ≈ 1590×2063 px, óptimo para OCR.

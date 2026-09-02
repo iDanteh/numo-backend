@@ -28,6 +28,20 @@ const {
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
   listarBancos, listarFormasPago, buscarTransferenciasCajas,
 }                                         = require('./kore-caja.service');
+const CajaTransferencia                  = require('./CajaTransferencia.model');
+const { buscarCandidatos }               = require('./caja-transferencia-match.service');
+const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
+const { sincronizarTransferenciasCajasManual }
+                                          = require('./caja-transferencia-sync.service');
+// Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
+// cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
+// se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
+require('./caja-transferencia-revert.service').init();
+// Registra en global-config.service.js el hook que reaplica el filtro de transferencias
+// de caja automáticamente cuando cambia NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS/
+// NOMBRE_CAJA_DESTINO_PERMITIDAS (ver caja-transferencia-sync.service.js#init) — pedido
+// explícito del usuario 2026-09-02: sin control manual, el endpoint HTTP se eliminó.
+require('./caja-transferencia-sync.service').init();
 
 const uploadCyc = multer({
   storage: multer.memoryStorage(),
@@ -282,6 +296,65 @@ router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_ERP_R
   }));
 
   res.json({ data: transferencias, total: transferencias.length });
+}));
+
+// POST /api/erp/transferencias-cajas/sincronizar-manual — pedido explícito del usuario
+// (2026-09-01): sincronización bajo demanda con fechaDesde/fechaHasta elegidas a mano, sin
+// esperar al cron diario ni quedar atada a VENTANA_MAX_DIAS (esa cota es solo del catch-up
+// automático). Mismo permiso que el sync manual ERP-Kore existente (POST /sync-erp-kore).
+router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  const { fechaDesde, fechaHasta } = req.body;
+  try {
+    const resultado = await sincronizarTransferenciasCajasManual({ fechaDesde, fechaHasta });
+    res.json(resultado);
+  } catch (err) {
+    if (err.message?.includes('Se requieren fechaDesde y fechaHasta')) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (err.message?.includes('Ya hay una sincronización manual')) {
+      return res.status(409).json({ error: err.message });
+    }
+    if (err.message?.includes('ERP no configurado') || err.message?.includes('No existe la configuración')) {
+      return res.status(503).json({ error: err.message });
+    }
+    if (err instanceof KoreCajaError) return res.status(err.statusCode).json({ error: err.message });
+    throw err;
+  }
+}));
+
+// GET /api/erp/transferencias-cajas/bandeja — Fase D: transferencias 'pendiente' con sus
+// candidatos ya calculados (Fase C, en vivo — nunca cacheados) para que el usuario confirme
+// desde la UI, separadas de las 'huerfana' (apartado distinto, pedido explícito del usuario:
+// "que no se mezclen con las transferencias que sí logran hacer match").
+router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
+  const [pendientes, huerfanas] = await Promise.all([
+    CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
+      .sort({ fechaRecepcion: 1 }).lean(),
+    CajaTransferencia.find({ estatusMatch: 'huerfana' }).sort({ fechaRecepcion: -1 }).lean(),
+  ]);
+
+  const conCandidatos = await Promise.all(pendientes.map(async (t) => ({
+    transferencia: t,
+    candidatos: await buscarCandidatos(t),
+  })));
+
+  res.json({
+    pendientes: conCandidatos,
+    huerfanas,
+  });
+}));
+
+// POST /api/erp/transferencias-cajas/:id/confirmar — Fase D: confirma un match sugerido
+// contra 1 o 2 BankMovement elegidos por el usuario desde la bandeja. Re-valida
+// elegibilidad y suma de monto server-side (caja-transferencia-confirm.service.js) — nunca
+// confía en que el candidato que manda el cliente sigue siendo válido. Sin permit() propio
+// a propósito — mismo criterio que PUT .../erp-ids (bank.routes.js): setErpIds() ya exige
+// banks:erp:link O banks:cobro internamente, poner permit() acá lo duplicaría más estricto
+// y bloquearía a cobranza (banks:cobro) sin banks:erp:link — bug real ya corregido una vez.
+router.post('/transferencias-cajas/:id/confirmar', authenticate, asyncHandler(async (req, res) => {
+  const { movementIds } = req.body;
+  const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
+  res.json(resultado);
 }));
 
 // Resuelve el shape de "cuenta" que espera el frontend a partir de un CFDI local, para el

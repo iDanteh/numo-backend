@@ -190,6 +190,11 @@ async function buscarTransferenciasCajas(params = {}) {
   const queryParams = {};
   if (params.fechaDesde) queryParams.fechaDesde = params.fechaDesde;
   if (params.fechaHasta) queryParams.fechaHasta = params.fechaHasta;
+  // Hardcodeado (pedido explícito del usuario, 2026-09-02): traer solo transferencias
+  // RECIBIDO — una CANCELADO nunca tiene fechaRecepcion, así que buscarCandidatos()
+  // (caja-transferencia-match.service.js) la descarta igual, pero de este lado ya no
+  // se persiste ni ensucia la bandeja con transferencias que jamás van a matchear.
+  queryParams.estatus = 'RECIBIDO';
 
   let response;
   try {

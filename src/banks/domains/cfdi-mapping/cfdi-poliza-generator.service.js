@@ -1500,8 +1500,24 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
   if (!generado?.monto) return [];
 
-  const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
-  const iva = Math.round((generado.monto - subtotal) * 100) / 100;
+  // El monto real de ESTA Cancelación/Devolución es `cfdi.total` — NUNCA
+  // `generado.monto` (bug real 2026-09-02, caso Hidalgo 11-ago, venta origen
+  // B0-260705994): cuando la MISMA venta origen se cancela repartida en 2+
+  // CFDIs tipo E distintos (ej. CAC-077523 dividido en 3 documentos por
+  // forma de pago, folios 260801211/212/213, $7,965.65+$10,566.23+$3,707.25),
+  // `mapaGenerados` solo guarda UN registro por marcador (Serie|Folio de la
+  // venta origen) con el monto TOTAL generado por esa venta — cada uno de
+  // los 3 CFDIs lo consultaba y se llevaba el monto COMPLETO ($22,239.13),
+  // restándolo del consolidado de Efectivo/Bancos 3 veces en vez de una
+  // (línea "Depósitos consolidados" en $0.00 por sobre-resta). `generado`
+  // sigue usándose para las banderas de clasificación (mismoFolio/oculto/
+  // formaPagoReal/centroProcesamiento), que sí son propiedades de la venta
+  // origen compartidas correctamente entre los CFDIs — solo el monto en
+  // pesos debe ser el de ESTE CFDI puntual.
+  const montoPropio = Number(cfdi.total) || 0;
+  if (montoPropio <= 0) return [];
+  const subtotal = Math.round((montoPropio / 1.16) * 100) / 100;
+  const iva = Math.round((montoPropio - subtotal) * 100) / 100;
   const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
   const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
   const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
@@ -1564,7 +1580,18 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
         cuentaId:    cuentaAjusteId,
         tipoOrigen:  'Ajuste Consolidado SF',
         reglaNombre: 'SF-MISMO-FOLIO',
-        formaPago:   generado.formaPagoReal ?? null,
+        // `formaPago` debe ser consistente con `cuentaAjusteId` (arriba), no
+        // el valor crudo `generado.formaPagoReal` — bug real 2026-09-02
+        // (caso Hidalgo 11-ago): cuando `formaPagoReal` no era exactamente
+        // '01' (ej. null, o Transferencia/'03'), la cuenta sí caía bien en
+        // Caja, pero la etiqueta no calzaba con 'EFECTIVO' en
+        // `LABEL_FORMA_PAGO_CONSOLIDADO` (poliza.service.js) — esto rompía
+        // el objetivo explícito del diseño original ("solo restarlo, SIN
+        // crear una fila propia en el export"): en vez de fusionarse en la
+        // línea normal de "Depósitos consolidados (Efectivo/Tarjeta)", el
+        // ajuste terminaba en su propio grupo aparte ("OTRA FORMA DE PAGO"),
+        // visible como una línea "Depósitos consolidados" sin etiqueta.
+        formaPago:   esTarjeta ? '04' : '01',
         debe:        -(subtotal + iva),
         haber:       0,
         _ajusteConsolidadoSF: true,

@@ -156,4 +156,48 @@ describe('global-config.service (integración Postgres)', () => {
     const section = await ConfigSection.findOne({ where: { clave: seccionInexistente } });
     expect(section).toBeNull();
   });
+
+  // registerConfigChangeHook (2026-09-02) — usado por caja-transferencia-sync.service.js#init
+  // para reaplicar el filtro automáticamente cuando cambian sus 2 claves de config, sin
+  // control manual del usuario. Los hooks corren fire-and-forget (no bloquean setValue) —
+  // cada test espera explícitamente el propio hook en vez de esperar la promesa de setValue.
+  describe('registerConfigChangeHook', () => {
+    test('setValue dispara los hooks registrados con sectionClave/clave/valor correctos', async () => {
+      let capturado;
+      let resolverEsperado;
+      const esperado = new Promise((resolve) => { resolverEsperado = resolve; });
+      svc.registerConfigChangeHook(({ sectionClave, clave, valor }) => {
+        if (clave !== 'HOOK_TEST_A') return;
+        capturado = { sectionClave, clave, valor };
+        resolverEsperado();
+      });
+
+      await svc.setValue(SECTION_CLAVE, 'HOOK_TEST_A', 'valor-hook', { usuarioNombre: 'Tester' });
+      await esperado;
+
+      expect(capturado).toEqual({ sectionClave: SECTION_CLAVE, clave: 'HOOK_TEST_A', valor: 'valor-hook' });
+    });
+
+    test('un hook que tira error no rompe setValue ni bloquea a los demás hooks registrados', async () => {
+      let otroHookCorrio = false;
+      let resolverEsperado;
+      const esperado = new Promise((resolve) => { resolverEsperado = resolve; });
+
+      svc.registerConfigChangeHook(({ clave }) => {
+        if (clave === 'HOOK_TEST_B') throw new Error('hook roto a propósito');
+      });
+      svc.registerConfigChangeHook(({ clave }) => {
+        if (clave !== 'HOOK_TEST_B') return;
+        otroHookCorrio = true;
+        resolverEsperado();
+      });
+
+      await expect(
+        svc.setValue(SECTION_CLAVE, 'HOOK_TEST_B', 'valor-hook-b', { usuarioNombre: 'Tester' }),
+      ).resolves.toBeDefined(); // setValue no debe rechazar aunque un hook registrado tire error
+
+      await esperado;
+      expect(otroHookCorrio).toBe(true);
+    });
+  });
 });

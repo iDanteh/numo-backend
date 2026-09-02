@@ -33,6 +33,14 @@ const { emitToAll }  = require('../../banks/shared/socket');
 
 const _cache = new Map(); // `${sectionClave}.${clave}` → valor ya resuelto (descifrado si aplica)
 
+// Hooks registrables sobre cambios de config — este módulo es GENÉRICO (lo usan muchos
+// dominios), así que no conoce a quién le importa qué clave: cada dominio se suscribe y
+// filtra adentro de su propio hook (mismo patrón "hook registrable" que
+// bank.service.js#registerErpUnlinkHook, evita imports circulares y mantiene este módulo
+// ciego a sus suscriptores).
+const configChangeHooks = [];
+function registerConfigChangeHook(fn) { configChangeHooks.push(fn); }
+
 function _cacheKey(sectionClave, clave) {
   return `${sectionClave}.${clave}`;
 }
@@ -176,6 +184,13 @@ async function setValue(sectionClave, clave, valor, { esSecreto = false, tipo = 
 
   _invalidar(sectionClave, clave);
   emitToAll('config:updated', { sectionClave, clave });
+  // Fire-and-forget: no bloquea la respuesta del guardado, y un hook que tira error no
+  // debe romper el guardado de config ni afectar a los demás hooks registrados.
+  for (const hook of configChangeHooks) {
+    Promise.resolve()
+      .then(() => hook({ sectionClave, clave, valor }))
+      .catch((err) => logger.error(`[GlobalConfig] hook de config:updated falló (${sectionClave}.${clave}): ${err.message}`));
+  }
   logger.info(`[GlobalConfig] ${accion}: ${sectionClave}.${clave} por ${userLabel({ nombre: usuarioNombre })}`);
 
   return configId;
@@ -262,6 +277,6 @@ async function listAuditLog(configId) {
 }
 
 module.exports = {
-  getValue, setValue, revealSecret,
+  getValue, setValue, revealSecret, registerConfigChangeHook,
   listSections, createSection, updateSection, listConfigsBySection, listAuditLog,
 };

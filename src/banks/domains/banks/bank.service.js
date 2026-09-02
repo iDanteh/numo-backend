@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID }    = require('crypto');
+const { conTransaccion } = require('../../shared/utils/mongo-tx');
 const BankMovement      = require('./BankMovement.model');
 const bankConfigRepo    = require('./repositories/bank-config.repository');
 const Counter           = require('../../shared/models/Counter');
@@ -1805,6 +1806,43 @@ async function updateCategoria(id, categoria, user) {
   return result;
 }
 
+// 2026-09-02 (pedido explícito del usuario) — registro de hooks para desvincular un
+// erpId: bank.service.js (dominio banks) no conoce ni le importa quién se registra acá.
+// El dominio erp (caja-transferencia-revert.service.js) se registra a sí mismo al
+// cargarse desde erp.routes.js — evita el require circular que crearía importar ese
+// archivo directamente desde acá (caja-transferencia-confirm.service.js YA importa
+// setErpIds de este módulo).
+const erpUnlinkHooks = [];
+function registerErpUnlinkHook(fn) { erpUnlinkHooks.push(fn); }
+// Solo para tests: erpUnlinkHooks es module-level y persiste entre test() dentro del
+// mismo archivo (Jest solo aísla el require cache POR ARCHIVO, no por test individual)
+// — sin esto, un hook registrado en un test queda registrado para todos los siguientes.
+function _clearErpUnlinkHooksParaTests() { erpUnlinkHooks.length = 0; }
+
+async function _ejecutarHooksDesvinculacion(erpId, movementId, session, user) {
+  for (const hook of erpUnlinkHooks) {
+    // eslint-disable-next-line no-await-in-loop
+    await hook({ erpId, movementId, session, user });
+  }
+}
+
+// Guarda un movimiento YA MUTADO en memoria + corre los hooks de desvinculación
+// (ej. revertir una CajaTransferencia) en UNA sola transacción Mongo — si un hook
+// falla, el save también se revierte, así nunca queda el movimiento desvinculado con
+// la transferencia asociada "resuelta" para siempre. Reusa conTransaccion() (banks/
+// shared/utils/mongo-tx.js) en vez de reimplementar la detección de topología y el
+// fallback a Mongo standalone (sin replica set) — mismo helper que ya usa
+// collection-request.service.js#identificar().
+async function _guardarConHooksDeDesvinculacion(mov, erpIdsRemovidos, user) {
+  await conTransaccion(async (session) => {
+    await mov.save(session ? { session } : undefined);
+    for (const erpId of erpIdsRemovidos) {
+      // eslint-disable-next-line no-await-in-loop
+      await _ejecutarHooksDesvinculacion(erpId, mov._id, session, user);
+    }
+  });
+}
+
 async function updateErpIds(id, action, erpId, user) {
   if (action !== 'remove') throw new BadRequestError('Solo se acepta action "remove"');
   if (!erpId || typeof erpId !== 'string' || !erpId.trim()) {
@@ -1854,7 +1892,16 @@ async function updateErpIds(id, action, erpId, user) {
   );
   mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
   mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
-  await mov.save();
+
+  // 2026-09-02 (pedido explícito del usuario): solo hay algo que revertir (ej. una
+  // CajaTransferencia matcheada con este erpId sintético) cuando de verdad se quitó un
+  // link — un reintento sobre algo ya desvinculado (linkRemovido undefined) se guarda
+  // igual que siempre, sin abrir transacción de más.
+  if (linkRemovido) {
+    await _guardarConHooksDeDesvinculacion(mov, [cleanId], user);
+  } else {
+    await mov.save();
+  }
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
@@ -2016,7 +2063,27 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   );
   mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
   mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
-  await mov.save(session ? { session } : undefined);
+
+  // 2026-09-02 (pedido explícito del usuario): mismo criterio que updateErpIds() —
+  // si el caller externo ya trae su propia session (identificar(), N x setErpIds
+  // dentro de conTransaccion), se usa esa tal cual, sin tocar su transacción (ni
+  // commit ni abort le pertenecen a este código). Sin session externa Y sin ninguna
+  // baja real (removedErpIds vacío) el guardado sigue exactamente igual que antes
+  // (mov.save(undefined), sin transacción de más — nada que revertir). Solo cuando
+  // hay una baja real Y nadie trajo session, este código abre su propia transacción
+  // para que guardar el movimiento y correr los hooks de desvinculación (ej. revertir
+  // una CajaTransferencia) sea atómico.
+  if (session) {
+    await mov.save({ session });
+    for (const erpId of removedErpIds) {
+      // eslint-disable-next-line no-await-in-loop
+      await _ejecutarHooksDesvinculacion(erpId, mov._id, session, user);
+    }
+  } else if (removedErpIds.length > 0) {
+    await _guardarConHooksDeDesvinculacion(mov, removedErpIds, user);
+  } else {
+    await mov.save(undefined);
+  }
 
   // Resuelve sola cualquier línea de póliza que seguía en cuenta puente para
   // los CFDIs que este movimiento acaba de identificar — no bloquea la
@@ -3352,6 +3419,7 @@ async function revertirConciliacion(runId, userId) {
 module.exports = {
   getCards, listMovements, getSummary, getStatusStats, getAvailableYears,
   importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
+  registerErpUnlinkHook, _clearErpUnlinkHooksParaTests,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, reclasifyMovements, bulkUpdateCategoria, updateMovement, updateCategoria, generateTemplate,
   findPotentialDuplicates,

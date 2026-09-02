@@ -16,6 +16,13 @@ const rbacStore      = require('../../../shared/services/rbac-store');
 const { emitToBanco } = require('../../shared/socket');
 const bankService    = require('./bank.service');
 
+// 2026-09-02: updateErpIds()/setErpIds() ahora corren dentro de conTransaccion() (banks/
+// shared/utils/mongo-tx.js) cuando hay una baja real de por medio (para correr los
+// hooks de desvinculación de forma atómica, ver bank.service.erpUnlinkHooks.test.js).
+// No hace falta mockear mongoose acá: sin una conexión real, conTransaccion() detecta
+// que no hay replica set y llama fn(null) directo (mismo comportamiento que prueba
+// mongo-tx.test.js) — este archivo no necesita saber nada de eso.
+
 function fakeQuery(mov) {
   const q = { session: jest.fn(() => q), then: (resolve) => resolve(mov) };
   return q;

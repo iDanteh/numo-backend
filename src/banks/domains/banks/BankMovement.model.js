@@ -276,8 +276,12 @@ const bankMovementSchema = new mongoose.Schema({
       accion:     { type: String, enum: ['vinculado', 'desvinculado', 'ajustado'], required: true },
       erpId:      { type: String, required: true },
       // 'manual' = updateErpIds/setErpIds (usuario con banks:erp:unlink o quien vinculó);
-      // 'kore-reversion' = Kore avisó una reversión/cancelación (erp-reversion.service.js).
-      origen:     { type: String, enum: ['manual', 'kore-reversion'], required: true },
+      // 'kore-reversion' = Kore avisó una reversión/cancelación (erp-reversion.service.js);
+      // 'transferencia-caja-reversion' = reservado para un futuro registro de auditoría
+      // cuando desvincular un erpId sintético CAJA-<koreId> revierte la CajaTransferencia
+      // asociada (ver caja-transferencia-revert.service.js) — hoy esa reversión ocurre en
+      // CajaTransferencia, no agrega una entrada propia acá todavía.
+      origen:     { type: String, enum: ['manual', 'kore-reversion', 'transferencia-caja-reversion'], required: true },
       userId:     { type: String, default: null }, // null cuando origen es 'kore-reversion'
       userNombre: { type: String, default: null },
       motivo:     { type: String, default: null }, // ej. el motivo que mandó Kore en la reversión

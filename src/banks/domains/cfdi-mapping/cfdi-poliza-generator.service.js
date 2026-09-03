@@ -437,10 +437,22 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     // venta generó Y consumió el saldo a favor (uso completo, sin sobrante).
     // Guard: solo si ambas ventas tienen serie+folio no nulos, para evitar
     // que dos saldos sin venta asociada se igualen falsamente por `null===null`.
+    // Además requiere MISMO DÍA (`diaGen === diaUso`, igual que `oculto` arriba)
+    // -- bug real 2026-09-03, caso Hidalgo, venta B0-260705994: el saldo se
+    // generó el 11-ago y no se consumió hasta el 1-sep (3 semanas y un periodo
+    // después, confirmado con la "Cuenta saldada" real del ERP: RET 260806905
+    // 11-ago -$22,239.13, RET 260900377 1-sep +$22,239.13) -- sin este guard,
+    // `mismoFolio` daba true solo por compartir serie+folio, tratándolo como
+    // "salida de caja que ya volvió a entrar" el mismo día y restándolo
+    // directo de Caja/Bancos en AGOSTO, cuando en realidad a cierre de agosto
+    // seguía siendo un pasivo real sin usar (el reporte real de Movimientos en
+    // Caja del 11-ago no tiene NINGÚN movimiento de este monto, confirmando
+    // que nunca fue una salida/entrada de efectivo real ese día).
     const mismoFolio = !!(usoUnico && usoCompleto
       && cuenta.serieVenta && cuenta.folioVenta
       && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
-      && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
+      && String(cuenta.folioVenta) === String(usoUnico.folioVenta)
+      && diaGen && diaUso && diaGen === diaUso);
 
     // Monto a EMITIR como Abono de Saldo a Favor:
     // - Si el día cierra en $0 (oculto, ver arriba) se usa `saldoRestanteSF`

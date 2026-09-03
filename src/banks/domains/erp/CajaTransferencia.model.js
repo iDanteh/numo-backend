@@ -6,7 +6,8 @@ const mongoose = require('mongoose');
 // GET /transferencias/reportes/buscar (ver kore-caja.service.js#buscarTransferenciasCajas).
 // Kore no guarda estado de matching de su lado — esta colección es la única
 // fuente de verdad para saber qué transferencia ya se cruzó contra qué
-// BankMovement, y cuáles quedaron huérfanas (Fase C/E, aún no implementadas).
+// BankMovement. (2026-09-02: se eliminó el concepto de 'huerfana' — pedido
+// explícito del usuario, va a reemplazarse por algo distinto todavía no definido.)
 const cajaTransferenciaSchema = new mongoose.Schema({
   // Id propio de Kore para esta transferencia — clave de upsert (ver
   // caja-transferencia-sync.service.js), evita duplicados si el job de sync
@@ -48,13 +49,13 @@ const cajaTransferenciaSchema = new mongoose.Schema({
   idTipoTransferencia:     { type: String, default: null },
   nombreTipoTransferencia: { type: String, default: null },
 
-  // Estado interno de Numo para el proceso de matching (Fase C/E, aún no
-  // implementadas) — nunca se toca desde el sync, solo se setea al insertar
-  // (ver $setOnInsert en caja-transferencia-sync.service.js) para que un
-  // re-sync no pise el resultado de un matching ya resuelto.
+  // Estado interno de Numo para el proceso de matching — nunca se toca desde el
+  // sync, solo se setea al insertar (ver $setOnInsert en
+  // caja-transferencia-sync.service.js) para que un re-sync no pise el resultado
+  // de un matching ya resuelto.
   estatusMatch: {
     type:    String,
-    enum:    ['pendiente', 'matcheada', 'huerfana'],
+    enum:    ['pendiente', 'matcheada'],
     default: 'pendiente',
     index:   true,
   },
@@ -75,7 +76,7 @@ const cajaTransferenciaSchema = new mongoose.Schema({
 
   // Exclusión por filtro de config (NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS/NOMBRE_CAJA_DESTINO_PERMITIDAS,
   // ver caja-transferencia-sync.service.js#reaplicarFiltro) — ortogonal a estatusMatch a propósito:
-  // estatusMatch sigue significando SOLO el resultado del matching (pendiente/matcheada/huerfana), esto
+  // estatusMatch sigue significando SOLO el resultado del matching (pendiente/matcheada), esto
   // es una capa aparte que dice "el admin no quiere ver esta transferencia" y es reversible (si la config
   // vuelve a permitirla, una futura corrida de reaplicarFiltro la reincluye sin tocar estatusMatch).
   excluidaPorFiltro: { type: Boolean, default: false, index: true },

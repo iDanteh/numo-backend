@@ -79,12 +79,26 @@ router.get('/mias/stats', authenticate, permit('collections:read'), asyncHandler
 }));
 
 // GET /api/collection-requests/indicadores — tiempo de identificación ACOTADO a
-// Solicitudes de Cobro (total + fase banco/Kore + fase contador), siempre de
-// TODO el equipo — ver collection-request-indicadores.service.js para el
-// criterio completo. Debe ir antes de /:id.
+// Solicitudes de Cobro (total + fase banco/Kore + fase contador). Admin ve TODO el
+// equipo; cualquier otro rol con collections:read (contadores) ve SOLO lo que él
+// mismo resolvió — mismo criterio que scopeUserId de abajo, pedido explícito del
+// usuario (2026-09-03). Debe ir antes de /:id.
 router.get('/indicadores', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
   const { year, month } = req.query;
-  res.json(await indicadoresService.getIndicadoresSolicitudesCobro({ year, month }));
+  const scopeUserId = req.user.role === 'admin' ? undefined : req.user._id;
+  res.json(await indicadoresService.getIndicadoresSolicitudesCobro({ year, month, scopeUserId }));
+}));
+
+// GET /api/collection-requests/indicadores/distribucion — distribución por franja de
+// tiempo del bloque "Distribución por franja de tiempo" del panel de arriba, ACOTADA
+// al día actual (hora de México) por defecto, o al rango fechaInicio/fechaFin cuando
+// el usuario usa el selector de rango — ver getDistribucionSolicitudesCobro() para el
+// criterio completo. Mismo scoping por rol que /indicadores (admin: todo el equipo;
+// resto: solo lo propio). Debe ir antes de /:id.
+router.get('/indicadores/distribucion', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  const { fechaInicio, fechaFin } = req.query;
+  const scopeUserId = req.user.role === 'admin' ? undefined : req.user._id;
+  res.json(await indicadoresService.getDistribucionSolicitudesCobro({ desde: fechaInicio, hasta: fechaFin, scopeUserId }));
 }));
 
 // GET /api/collection-requests/report — reporte Excel de TODAS las solicitudes

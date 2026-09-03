@@ -105,9 +105,15 @@ function distribucionPorMinutos(horasArr, cortesMinutos = [30, 60, 120]) {
  * @param {object} [filtros]
  * @param {string|number} [filtros.year]
  * @param {string|number} [filtros.month] (1-12, requiere year)
+ * @param {string} [filtros.scopeUserId] admin: undefined (ve todo el equipo). Cualquier
+ *   otro rol con collections:read: su propio _id — acota TODO el panel a lo que él mismo
+ *   resolvió (resueltoPorUserId), pedido explícito del usuario (2026-09-03).
  */
-async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
+async function getIndicadoresSolicitudesCobro({ year, month, scopeUserId } = {}) {
   const match = { status: 'identificada', resueltoAt: { $ne: null } };
+  if (scopeUserId) {
+    match.resueltoPorUserId = scopeUserId;
+  }
   if (year) {
     const y = parseInt(year, 10);
     const m = month != null ? parseInt(month, 10) - 1 : null;
@@ -122,7 +128,7 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
   }
 
   const solicitudes = await CollectionRequest.find(match)
-    .select('createdAt resueltoAt resueltoPorUserId resueltoPorNombre formasPago.bankMovementId bankMovementId')
+    .select('createdAt resueltoAt formasPago.bankMovementId bankMovementId')
     .populate('formasPago.bankMovementId', 'createdAt')
     .populate('bankMovementId', 'createdAt')
     .lean();
@@ -130,59 +136,26 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
   const totalHorasArr = [];
   const fase1HorasArr = [];
   const fase2HorasArr = [];
-  const porUsuarioMap = new Map();
   let sinMovimientoVinculado = 0;
 
   for (const cr of solicitudes) {
     const totalHoras = horasReloj(cr.createdAt, cr.resueltoAt);
     totalHorasArr.push(totalHoras);
 
-    // 2026-08-20 (fix real, reportado por el usuario): "Por contador" mostraba el
-    // promedio del TOTAL (creada->resuelta, reloj real) partido por resueltoPorUserId —
-    // eso mezclaba la demora de banco/Kore (fuera del control del contador) en la métrica
-    // "por contador", y explicaba el desfase real que el usuario vio (cada contador
-    // promediando ~4min de TOTAL, mientras el bucket "Fase Contador" de arriba —
-    // horasHabilesEntre del PRIMER movimiento a resueltoAt, para TODA la población —
-    // mostraba 3h33m). Ahora "Por contador" acumula fase2Horas (la misma fase-contador
-    // del bucket de arriba), NO totalHoras — así el desglose por persona es
-    // consistente con el agregado que está justo arriba, y aísla lo que cada contador
-    // realmente controla (nunca la demora del banco/Kore).
     const [primerMov] = movimientosDe(cr);
-    const key = cr.resueltoPorUserId ?? '__sin_usuario__';
-    if (!porUsuarioMap.has(key)) {
-      porUsuarioMap.set(key, {
-        userId: cr.resueltoPorUserId ?? null,
-        nombre: cr.resueltoPorNombre ?? null,
-        fase2Horas: [],
-      });
-    }
 
     if (primerMov?.createdAt) {
       fase1HorasArr.push(horasReloj(cr.createdAt, primerMov.createdAt));
       const fase2 = horasHabilesEntre(inicioFaseContador(cr.createdAt, primerMov.createdAt), cr.resueltoAt);
       fase2HorasArr.push(fase2);
-      porUsuarioMap.get(key).fase2Horas.push(fase2);
     } else {
       // No debería pasar para status:'identificada' (identificar() siempre asigna al
       // menos 1 movimiento) — se cubre por si acaso un dato histórico quedó inconsistente
       // (ej. documentos de antes del backfill de formasPago[].bankMovementId). Cuenta
-      // para el total, pero no aporta a fase1/fase2/por-contador (no hay con qué partir
-      // el rango).
+      // para el total, pero no aporta a fase1/fase2 (no hay con qué partir el rango).
       sinMovimientoVinculado++;
     }
   }
-
-  // Solo contadores con al menos 1 solicitud CON movimiento vinculado — sin eso no hay
-  // fase2 que promediar para esa persona (evita mostrar un promedio null/NaN en la tabla).
-  const porUsuario = [...porUsuarioMap.values()]
-    .filter(u => u.fase2Horas.length > 0)
-    .map(u => ({
-      userId: u.userId,
-      nombre: u.nombre,
-      promedioHoras: promedio(u.fase2Horas),
-      count: u.fase2Horas.length,
-    }))
-    .sort((a, b) => b.count - a.count);
 
   return {
     totalSolicitudesResueltas: solicitudes.length,
@@ -191,10 +164,65 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
     fase1Banco:    { promedioHoras: promedio(fase1HorasArr), medianaHoras: mediana(fase1HorasArr), count: fase1HorasArr.length },
     fase2Contador: { promedioHoras: promedio(fase2HorasArr), medianaHoras: mediana(fase2HorasArr), count: fase2HorasArr.length },
     distribucionTotal: distribucionPorMinutos(totalHorasArr),
-    porUsuario,
+  };
+}
+
+// Helpers de fecha MX — mismo criterio que _medianocheMx()/_inicioDeHoy() en
+// collection-request.service.js (duplicado a propósito: ese mismo patrón ya está
+// duplicado en cfdi-poliza-generator.service.js, no amerita centralizar una función
+// de 2 líneas — México sin DST desde 2022, offset fijo UTC-6).
+function _medianocheMx(fechaStr) {
+  return new Date(`${fechaStr}T06:00:00.000Z`);
+}
+function _hoyMxStr() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+}
+
+/**
+ * Distribución por franja de tiempo — ACOTADA por defecto al día actual (hora de
+ * México), a diferencia de getIndicadoresSolicitudesCobro() (agrega TODO el
+ * histórico desde INDICADORES_CR_DESDE). Pedido explícito del usuario (2026-09-03,
+ * alcance confirmado: SOLO este bloque, el resto del panel sigue con año/mes).
+ *
+ * `desde`/`hasta` son strings 'YYYY-MM-DD' (mismo formato que ya usa buildReport()/
+ * _buildBusquedaFilter en collection-request.service.js) — cuando vienen, filtran
+ * por createdAt con el MISMO criterio de medianoche MX que ya usa el reporte Excel
+ * de esta sección, así el gráfico y la descarga siempre muestran la misma
+ * población. Sin ellos, cae al día de hoy (desde === hasta === hoy).
+ *
+ * @param {string} [scopeUserId] mismo criterio que getIndicadoresSolicitudesCobro():
+ *   admin → undefined (todo el equipo); cualquier otro rol → su propio _id.
+ */
+async function getDistribucionSolicitudesCobro({ desde, hasta, scopeUserId } = {}) {
+  const desdeStr = desde || _hoyMxStr();
+  const hastaStr = hasta || desdeStr;
+
+  const gte = _medianocheMx(desdeStr);
+  const lt  = new Date(_medianocheMx(hastaStr).getTime() + 24 * 60 * 60 * 1000);
+
+  // Mismo criterio que getIndicadoresSolicitudesCobro(): el corte de frescura gana
+  // si alguien pidiera (a mano, vía API) un rango más viejo que INDICADORES_CR_DESDE.
+  const match = {
+    status: 'identificada',
+    resueltoAt: { $ne: null },
+    createdAt: { $gte: gte > INDICADORES_CR_DESDE ? gte : INDICADORES_CR_DESDE, $lt: lt },
+  };
+  if (scopeUserId) {
+    match.resueltoPorUserId = scopeUserId;
+  }
+
+  const solicitudes = await CollectionRequest.find(match).select('createdAt resueltoAt').lean();
+  const totalHorasArr = solicitudes.map(cr => horasReloj(cr.createdAt, cr.resueltoAt));
+
+  return {
+    desde: desdeStr,
+    hasta: hastaStr,
+    total: totalHorasArr.length,
+    distribucionTotal: distribucionPorMinutos(totalHorasArr),
   };
 }
 
 module.exports = {
   getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, distribucionPorMinutos, INDICADORES_CR_DESDE,
+  getDistribucionSolicitudesCobro,
 };

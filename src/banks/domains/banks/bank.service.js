@@ -9,7 +9,7 @@ const CollectionRequest = require('../collection-requests/CollectionRequest.mode
 const { parseBankFile, makeHash, TEMPLATE_SIGNATURE_SHEET, TEMPLATE_SIGNATURE_VALUE } = require('./bank.parser');
 const ExcelJS = require('exceljs');
 const { NotFoundError, BadRequestError, ConflictError, ForbiddenError } = require('../../shared/errors/AppError');
-const { emitToUser, emitToBanco } = require('../../shared/socket');
+const { emitToUser, emitToBanco, emitToAll } = require('../../shared/socket');
 const { matchRegla }   = require('./bank-rules.service');
 const bankRuleRepo     = require('./repositories/bank-rule.repository');
 const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
@@ -2599,6 +2599,16 @@ async function bulkUpdateCategoria(ids, categoria, user) {
   return { actualizados };
 }
 
+// 2026-09-03 (pedido explícito del usuario): setFicha/deleteFicha aplican a CUALQUIER
+// movimiento (cualquiera puede tener ficha), pero el evento 'bank:ficha-pendiente:changed'
+// solo le interesa a la bandeja de transferencias entre cajas — se emite SOLO cuando el
+// movimiento tiene un erpLink origen:'transferencia-caja' (ver
+// caja-transferencia-confirm.service.js), para no disparar refrescos irrelevantes en el
+// resto de los casos.
+function _calificaParaFichaPendiente(mov) {
+  return (mov.erpLinks || []).some(l => l.origen === 'transferencia-caja');
+}
+
 async function setFicha(id, ficha, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
@@ -2636,6 +2646,9 @@ async function setFicha(id, ficha, user) {
     fichaNombre: updated.fichaNombre,
     fichaAt:    updated.fichaAt,
   });
+  if (_calificaParaFichaPendiente(updated)) {
+    emitToAll('bank:ficha-pendiente:changed', { movementId: updated._id });
+  }
 
   return {
     _id:        updated._id,
@@ -2696,6 +2709,9 @@ async function deleteFicha(id, user) {
     fichaNombre: null,
     fichaAt:     null,
   });
+  if (_calificaParaFichaPendiente(updated)) {
+    emitToAll('bank:ficha-pendiente:changed', { movementId: updated._id });
+  }
 
   return {
     _id:         updated._id,

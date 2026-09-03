@@ -31,6 +31,7 @@ const {
 const CajaTransferencia                  = require('./CajaTransferencia.model');
 const { buscarCandidatos }               = require('./caja-transferencia-match.service');
 const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
+const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-pendiente.service');
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
@@ -324,14 +325,11 @@ router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('ba
 
 // GET /api/erp/transferencias-cajas/bandeja — Fase D: transferencias 'pendiente' con sus
 // candidatos ya calculados (Fase C, en vivo — nunca cacheados) para que el usuario confirme
-// desde la UI, separadas de las 'huerfana' (apartado distinto, pedido explícito del usuario:
-// "que no se mezclen con las transferencias que sí logran hacer match").
+// desde la UI. (2026-09-02: se eliminó el apartado de 'huerfana' — pedido explícito del
+// usuario, va a reemplazarse por algo distinto todavía no definido.)
 router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
-  const [pendientes, huerfanas] = await Promise.all([
-    CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
-      .sort({ fechaRecepcion: 1 }).lean(),
-    CajaTransferencia.find({ estatusMatch: 'huerfana' }).sort({ fechaRecepcion: -1 }).lean(),
-  ]);
+  const pendientes = await CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
+    .sort({ fechaRecepcion: 1 }).lean();
 
   const conCandidatos = await Promise.all(pendientes.map(async (t) => ({
     transferencia: t,
@@ -340,7 +338,6 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
 
   res.json({
     pendientes: conCandidatos,
-    huerfanas,
   });
 }));
 
@@ -354,6 +351,16 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
 router.post('/transferencias-cajas/:id/confirmar', authenticate, asyncHandler(async (req, res) => {
   const { movementIds } = req.body;
   const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
+  res.json(resultado);
+}));
+
+// GET /api/erp/transferencias-cajas/pendientes-ficha — total cross-banco de BankMovement
+// que quedaron 'identificado' por un match automático de transferencia de caja
+// (erpLinks.origen:'transferencia-caja') pero todavía no tienen `ficha` (folio del
+// comprobante físico) cargada — respaldo documental que el contador debe completar a mano.
+// Mismo permiso que PATCH /movements/:id/ficha (banks:ficha, bank.routes.js).
+router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMISSIONS.BANKS_FICHA), asyncHandler(async (req, res) => {
+  const resultado = await listarPendientesDeFicha();
   res.json(resultado);
 }));
 

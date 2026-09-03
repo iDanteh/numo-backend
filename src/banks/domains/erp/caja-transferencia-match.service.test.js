@@ -2,20 +2,17 @@
 
 // caja-transferencia-match.service.test.js — Fase C del proceso de matching de
 // transferencias entre cajas: buscarCandidatos() (1:1 y 1:2 por monto+ventana,
-// sin acotar por banco) y detectarHuerfanas() (huérfano completo si no aparece
-// NINGÚN candidato cuando la ventana ya cerró).
+// sin acotar por banco).
 //
 // bank.service.js NO se mockea — solo se usa para leer la constante real
 // ERP_TOLERANCE, sin tocar Mongo (requerir el módulo no hace I/O).
 jest.mock('../banks/BankMovement.model');
-jest.mock('./CajaTransferencia.model');
 jest.mock('../../../shared/services/global-config.service');
 
 const BankMovement       = require('../banks/BankMovement.model');
-const CajaTransferencia  = require('./CajaTransferencia.model');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const {
-  buscarCandidatos, detectarHuerfanas, _ventanaDias, _normalizarCategoria, VENTANA_DEFAULT_DIAS,
+  buscarCandidatos, _ventanaDias, _normalizarCategoria, VENTANA_DEFAULT_DIAS,
 } = require('./caja-transferencia-match.service');
 
 const CATEGORIA = 'Depósito en efectivo'; // forma "canónica" usada en los fixtures de este archivo
@@ -56,7 +53,12 @@ describe('buscarCandidatos', () => {
     expect(BankMovement.find).not.toHaveBeenCalled();
   });
 
-  test('consulta por erpLinks+fecha (categoria NO se filtra en Mongo — es texto libre, se normaliza en JS)', async () => {
+  // Bug real 2026-09-03 (reportado por el usuario): un movimiento puede quedar
+  // 'identificado' sin ningún erpLink — vía `ficha` (folio físico que carga un
+  // contador, ver bank.service.js#aplicarLogicaErp). Filtrar solo por erpLinks
+  // vacío no alcanza: la bandeja sugería como candidatos depósitos que un contador
+  // YA había resuelto a mano. La query debe excluir status:'identificado' también.
+  test('consulta por erpLinks+status+fecha (categoria NO se filtra en Mongo — es texto libre, se normaliza en JS)', async () => {
     BankMovement.find = jest.fn(() => fakeFind([]));
     await buscarCandidatos({ monto: 100, fechaRecepcion: new Date('2026-09-01T00:00:00Z') });
 
@@ -64,6 +66,7 @@ describe('buscarCandidatos', () => {
     const filtro = BankMovement.find.mock.calls[0][0];
     expect(filtro.categoria).toBeUndefined();
     expect(filtro.erpLinks).toEqual({ $size: 0 });
+    expect(filtro.status).toEqual({ $ne: 'identificado' });
     expect(filtro.fecha.$gte).toBeInstanceOf(Date);
     expect(filtro.fecha.$lte).toBeInstanceOf(Date);
   });
@@ -148,51 +151,5 @@ describe('_normalizarCategoria', () => {
   test('null/undefined no revientan, dan string vacío', () => {
     expect(_normalizarCategoria(null)).toBe('');
     expect(_normalizarCategoria(undefined)).toBe('');
-  });
-});
-
-describe('detectarHuerfanas', () => {
-  beforeEach(() => {
-    globalConfigService.getValue.mockResolvedValue('5');
-    CajaTransferencia.updateOne = jest.fn().mockResolvedValue({});
-  });
-
-  test('sin transferencias pendientes con ventana cerrada: no hace nada', async () => {
-    CajaTransferencia.find = jest.fn(() => fakeFind([]));
-
-    const res = await detectarHuerfanas();
-
-    expect(res).toEqual({ revisadas: 0, huerfanas: 0 });
-    expect(CajaTransferencia.updateOne).not.toHaveBeenCalled();
-  });
-
-  test('pendiente con ventana cerrada y SIN candidatos: se marca huerfana', async () => {
-    CajaTransferencia.find = jest.fn(() => fakeFind([{ _id: 't-1', monto: 999, fechaRecepcion: new Date('2020-01-01') }]));
-    BankMovement.find = jest.fn(() => fakeFind([])); // sin candidatos
-
-    const res = await detectarHuerfanas();
-
-    expect(res).toEqual({ revisadas: 1, huerfanas: 1 });
-    expect(CajaTransferencia.updateOne).toHaveBeenCalledWith({ _id: 't-1' }, { $set: { estatusMatch: 'huerfana' } });
-  });
-
-  test('pendiente con ventana cerrada pero SÍ hay candidatos: se deja pendiente (espera confirmación humana)', async () => {
-    CajaTransferencia.find = jest.fn(() => fakeFind([{ _id: 't-1', monto: 500, fechaRecepcion: new Date('2020-01-01') }]));
-    BankMovement.find = jest.fn(() => fakeFind([{ _id: 'mov-1', categoria: CATEGORIA, deposito: 500 }]));
-
-    const res = await detectarHuerfanas();
-
-    expect(res).toEqual({ revisadas: 1, huerfanas: 0 });
-    expect(CajaTransferencia.updateOne).not.toHaveBeenCalled();
-  });
-
-  test('el query excluye transferencias excluidaPorFiltro (reaplicarFiltro) — no deben pasar a huerfana', async () => {
-    CajaTransferencia.find = jest.fn(() => fakeFind([]));
-
-    await detectarHuerfanas();
-
-    expect(CajaTransferencia.find).toHaveBeenCalledWith(expect.objectContaining({
-      excluidaPorFiltro: { $ne: true },
-    }));
   });
 });

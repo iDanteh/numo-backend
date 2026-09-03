@@ -24,12 +24,13 @@
 
 const CajaTransferencia = require('./CajaTransferencia.model');
 const { registerErpUnlinkHook } = require('../banks/bank.service');
+const { emitToAll } = require('../../shared/socket');
 
 const PREFIJO_ERP_ID_SINTETICO = 'CAJA-';
 
 // erpId real de Kore -> retorna de inmediato, sin ninguna query (caso común, no le
 // agrega overhead a un desvincular que no tiene nada que ver con transferencias-caja).
-async function _revertirPorDesvinculacion({ erpId, session }) {
+async function _revertirPorDesvinculacion({ erpId, movementId, session }) {
   if (!erpId || !erpId.startsWith(PREFIJO_ERP_ID_SINTETICO)) return;
 
   const koreId = erpId.slice(PREFIJO_ERP_ID_SINTETICO.length);
@@ -51,6 +52,12 @@ async function _revertirPorDesvinculacion({ erpId, session }) {
     },
     { session },
   );
+
+  // Señal cross-banco (2026-09-03, pedido explícito del usuario): al revertir, el
+  // movimiento se desvincula (queda sin erpLinks de transferencia-caja) — deja de calificar
+  // para "pendientes de ficha", así que la bandeja debe refrescarse igual que al confirmar.
+  // Mismo criterio que caja-transferencia-confirm.service.js: emitToAll, no emitToBanco.
+  emitToAll('bank:ficha-pendiente:changed', { movementId });
 }
 
 function init() {

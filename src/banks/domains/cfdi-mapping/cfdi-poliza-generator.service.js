@@ -1555,7 +1555,21 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   if (montoPropio <= 0) return [];
   const subtotal = Math.round((montoPropio / 1.16) * 100) / 100;
   const iva = Math.round((montoPropio - subtotal) * 100) / 100;
-  const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+  // El nombre del cliente debe ser el de la VENTA ORIGEN (generado.ventaSerie/
+  // ventaFolio), NUNCA el receptor de la Devolución/NC misma (`cfdi`) — bug
+  // real 2026-09-03, caso JOSUE YAIR CARMONA NORIEGA / D0-260806293: la
+  // venta original SÍ tenía el cliente real capturado, pero la NC que generó
+  // el saldo a favor se capturó genérica como "PUBLICO EN GENERAL" en el
+  // POS, y el concepto (que muestra la referencia de la VENTA, no de la NC)
+  // terminaba con un nombre que no correspondía a esa venta. Si no se
+  // encuentra la venta origen, cae al receptor de la NC como antes.
+  const cfdiVentaOrigen = (generado.ventaSerie && generado.ventaFolio)
+    ? await CFDI.findOne(
+        { 'emisor.rfc': rfc, serie: generado.ventaSerie, folio: String(generado.ventaFolio) },
+        { 'receptor.nombre': 1 },
+      ).lean()
+    : null;
+  const nombreCliente = cfdiVentaOrigen?.receptor?.nombre ?? cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
   const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
   const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
 

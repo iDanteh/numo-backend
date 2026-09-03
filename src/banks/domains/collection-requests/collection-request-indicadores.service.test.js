@@ -12,7 +12,15 @@ jest.mock('./CollectionRequest.model');
 const CollectionRequest = require('./CollectionRequest.model');
 const {
   getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, distribucionPorMinutos, INDICADORES_CR_DESDE,
+  getDistribucionSolicitudesCobro,
 } = require('./collection-request-indicadores.service');
+
+// Mock de query encadenada find().select().lean() — getDistribucionSolicitudesCobro()
+// no popula nada (solo necesita createdAt/resueltoAt), a diferencia de
+// mockPopulatingQuery() de arriba (usada por getIndicadoresSolicitudesCobro()).
+function mockSimpleQuery(docs) {
+  return { select: jest.fn().mockReturnThis(), lean: jest.fn(() => Promise.resolve(docs)) };
+}
 
 function mockPopulatingQuery(docs, movimientosPorId) {
   const populatedPaths = new Set();
@@ -173,13 +181,6 @@ describe('getIndicadoresSolicitudesCobro()', () => {
     // fase2Contador: 15:00 10/08 -> 10:00 11/08, horas HÁBILES (8-20h, L-S) — no 19h de reloj.
     expect(res.fase2Contador.promedioHoras).toBeLessThan(19);
     expect(res.fase2Contador.promedioHoras).toBeGreaterThan(0);
-    // 2026-08-20 (fix real): porUsuario usa la FASE CONTADOR (horas hábiles), no el
-    // total (reloj real) — con N=1 debe coincidir EXACTO con fase2Contador.promedioHoras
-    // (25h de total vs. este valor, mucho menor, es justo el bug real que reportó el
-    // usuario: cada contador parecía "rápido" en total pero el bucket de fase contador
-    // mostraba horas — porque medían cosas distintas).
-    expect(res.porUsuario).toEqual([{ userId: 'user-1', nombre: 'Ana', promedioHoras: res.fase2Contador.promedioHoras, count: 1 }]);
-    expect(res.porUsuario[0].promedioHoras).not.toBeCloseTo(res.total.promedioHoras, 1);
   });
 
   test('sin movimiento vinculado: cuenta para el total pero NO para fase1/fase2', async () => {
@@ -192,9 +193,6 @@ describe('getIndicadoresSolicitudesCobro()', () => {
     expect(res.total.count).toBe(1);
     expect(res.fase1Banco.count).toBe(0);
     expect(res.fase2Contador.count).toBe(0);
-    // El contador que "resolvió" esta solicitud no debe aparecer en porUsuario — no hay
-    // fase2 que promediar para él a partir de este único registro sin movimiento.
-    expect(res.porUsuario).toEqual([]);
   });
 
   test('fallback al campo raíz bankMovementId cuando formasPago viene vacío (documentos pre-backfill)', async () => {
@@ -260,7 +258,6 @@ describe('getIndicadoresSolicitudesCobro()', () => {
     // (arranca en cr.createdAt, no en el depósito de 10 días atrás) — antes del fix esto
     // habría sido ~10 días de horas hábiles.
     expect(res.fase2Contador.promedioHoras).toBeCloseTo(5 / 60, 3);
-    expect(res.porUsuario[0].promedioHoras).toBeCloseTo(5 / 60, 3);
   });
 
   test('expone distribucionTotal calculada sobre totalHorasArr (25h -> bucket abierto >120min)', async () => {
@@ -277,19 +274,133 @@ describe('getIndicadoresSolicitudesCobro()', () => {
     expect(res.distribucionTotal.find(b => b.hastaMin === null)).toMatchObject({ count: 1, porcentaje: 100 });
   });
 
-  test('porUsuario agrupa por resueltoPorUserId y ordena por count desc', async () => {
+  test('scopeUserId ausente: trae todo el equipo (comportamiento actual, sin cambios) — match sin resueltoPorUserId', async () => {
     const docs = [
-      cr({ _id: 'cr-1', resueltoPorUserId: 'u1', resueltoPorNombre: 'Ana' }),
-      cr({ _id: 'cr-2', resueltoPorUserId: 'u2', resueltoPorNombre: 'Beto' }),
-      cr({ _id: 'cr-3', resueltoPorUserId: 'u1', resueltoPorNombre: 'Ana' }),
+      cr({ _id: 'cr-1', resueltoPorUserId: 'u1' }),
+      cr({ _id: 'cr-2', resueltoPorUserId: 'u2' }),
     ];
     const movimientosPorId = { 'mov-1': mov('mov-1', '2026-08-10T15:00:00Z') };
     CollectionRequest.find.mockReturnValue(mockPopulatingQuery(docs, movimientosPorId));
 
     const res = await getIndicadoresSolicitudesCobro({});
 
-    expect(res.porUsuario).toHaveLength(2);
-    expect(res.porUsuario[0]).toMatchObject({ userId: 'u1', nombre: 'Ana', count: 2 });
-    expect(res.porUsuario[1]).toMatchObject({ userId: 'u2', nombre: 'Beto', count: 1 });
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada', resueltoAt: { $ne: null }, createdAt: { $gte: INDICADORES_CR_DESDE },
+    });
+    expect(res.totalSolicitudesResueltas).toBe(2);
+  });
+
+  test('scopeUserId presente: acota el match a resueltoPorUserId, para que la query solo traiga lo de ese usuario', async () => {
+    // El filtrado real por usuario ocurre en el $match de Mongo, no en JS post-fetch —
+    // el mock de CollectionRequest.find() no filtra los docs devueltos (no simula Mongo),
+    // así que lo que se verifica acá es que el match pedido a la query incluya
+    // resueltoPorUserId con el scope pasado. Un segundo caso con 2 usuarios distintos
+    // en el fixture confirma que, si el filtro SÍ se aplicara (como en Mongo real), solo
+    // pasarían las de 'u1'.
+    const docs = [
+      cr({ _id: 'cr-1', resueltoPorUserId: 'u1' }),
+      cr({ _id: 'cr-2', resueltoPorUserId: 'u2' }),
+    ];
+    const movimientosPorId = { 'mov-1': mov('mov-1', '2026-08-10T15:00:00Z') };
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery(docs, movimientosPorId));
+
+    await getIndicadoresSolicitudesCobro({ scopeUserId: 'u1' });
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      resueltoPorUserId: 'u1',
+      createdAt: { $gte: INDICADORES_CR_DESDE },
+    });
+  });
+
+  test('scopeUserId se combina con year/month, no lo reemplaza', async () => {
+    CollectionRequest.find.mockReturnValue(mockPopulatingQuery([], {}));
+
+    await getIndicadoresSolicitudesCobro({ year: '2027', month: '3', scopeUserId: 'u1' });
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      resueltoPorUserId: 'u1',
+      createdAt: { $gte: new Date(2027, 2, 1), $lt: new Date(2027, 3, 1) },
+    });
+  });
+});
+
+describe('getDistribucionSolicitudesCobro() — pedido 2026-09-03: distribución acotada al día actual (o al rango elegido), independiente del año/mes del panel general', () => {
+  afterEach(() => jest.useRealTimers());
+
+  test('sin desde/hasta usa el día de hoy (hora de México)', async () => {
+    // 18:00 UTC = 12:00 hora de México (UTC-6) del MISMO día calendario — sin
+    // riesgo de cruzar medianoche MX al fijar la hora del sistema.
+    jest.useFakeTimers({ now: new Date('2026-09-03T18:00:00.000Z') });
+    CollectionRequest.find.mockReturnValue(mockSimpleQuery([]));
+
+    const res = await getDistribucionSolicitudesCobro({});
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      createdAt: { $gte: new Date('2026-09-03T06:00:00.000Z'), $lt: new Date('2026-09-04T06:00:00.000Z') },
+    });
+    expect(res.desde).toBe('2026-09-03');
+    expect(res.hasta).toBe('2026-09-03');
+    expect(res.total).toBe(0);
+  });
+
+  test('con desde/hasta explícitos filtra por ese rango', async () => {
+    CollectionRequest.find.mockReturnValue(mockSimpleQuery([
+      { createdAt: new Date('2026-08-26T10:00:00Z'), resueltoAt: new Date('2026-08-26T12:00:00Z') },
+    ]));
+
+    const res = await getDistribucionSolicitudesCobro({ desde: '2026-08-25', hasta: '2026-08-27' });
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      createdAt: { $gte: new Date('2026-08-25T06:00:00.000Z'), $lt: new Date('2026-08-28T06:00:00.000Z') },
+    });
+    expect(res.desde).toBe('2026-08-25');
+    expect(res.hasta).toBe('2026-08-27');
+    expect(res.total).toBe(1);
+    expect(res.distribucionTotal).toEqual(distribucionPorMinutos([2]));
+  });
+
+  test('desde/hasta fuera del corte INDICADORES_CR_DESDE no lo esquiva: el corte gana', async () => {
+    CollectionRequest.find.mockReturnValue(mockSimpleQuery([]));
+
+    await getDistribucionSolicitudesCobro({ desde: '2025-01-01', hasta: '2025-01-02' });
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      createdAt: { $gte: INDICADORES_CR_DESDE, $lt: new Date('2025-01-03T06:00:00.000Z') },
+    });
+  });
+
+  test('scopeUserId ausente: match sin resueltoPorUserId (comportamiento actual, todo el equipo)', async () => {
+    CollectionRequest.find.mockReturnValue(mockSimpleQuery([]));
+
+    await getDistribucionSolicitudesCobro({ desde: '2026-08-25', hasta: '2026-08-27' });
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      createdAt: { $gte: new Date('2026-08-25T06:00:00.000Z'), $lt: new Date('2026-08-28T06:00:00.000Z') },
+    });
+  });
+
+  test('scopeUserId presente: se agrega al match para acotar la distribución a ese usuario', async () => {
+    CollectionRequest.find.mockReturnValue(mockSimpleQuery([]));
+
+    await getDistribucionSolicitudesCobro({ desde: '2026-08-25', hasta: '2026-08-27', scopeUserId: 'u1' });
+
+    expect(CollectionRequest.find).toHaveBeenCalledWith({
+      status: 'identificada',
+      resueltoAt: { $ne: null },
+      resueltoPorUserId: 'u1',
+      createdAt: { $gte: new Date('2026-08-25T06:00:00.000Z'), $lt: new Date('2026-08-28T06:00:00.000Z') },
+    });
   });
 });

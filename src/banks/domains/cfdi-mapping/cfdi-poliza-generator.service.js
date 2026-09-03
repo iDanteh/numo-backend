@@ -2274,11 +2274,24 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   // el día que se timbre, sin duplicar el cargo (ese día no vuelve a
   // encontrar este cobro porque para entonces sí cae dentro de tolerancia
   // del lado del pipeline normal).
+  // `serieFactura`/`folioFactura` vienen VACÍOS en el ERP cuando la factura es
+  // 1-a-1 con el ticket (sin agrupar en una Factura Global) — solo se llenan
+  // cuando difieren de `serieVenta`/`folioVenta` (bug real 2026-09-03, caso
+  // Hidalgo B0-260900073/PEDRO YAIR ORTIZ LUCERO: el CFDI real existe con
+  // exactamente esa serie/folio, pero al venir `serieFactura`/`folioFactura`
+  // vacíos, `facturaKey` daba `null` y el chequeo de "ya cubierto por el
+  // pipeline normal" de abajo nunca se ejecutaba — el cobro se duplicaba acá
+  // como "SIN FACTURA" aunque el ticket SÍ tenía su factura). Cuando faltan,
+  // se usa `serieVenta`/`folioVenta` como factura candidata — es correcto en
+  // el caso 1-a-1, y en el caso agrupado (Factura Global) simplemente no
+  // encontrará ningún CFDI con esa serie/folio de ticket, sin efecto.
+  const _facturaKeyDe = (cuenta) => (cuenta.serieFactura && cuenta.folioFactura)
+    ? `${cuenta.serieFactura}|${cuenta.folioFactura}`
+    : (cuenta.serieVenta && cuenta.folioVenta) ? `${cuenta.serieVenta}|${cuenta.folioVenta}` : null;
   const foliosFacturaReferenciados = new Set();
   for (const cuenta of resultado) {
-    if (cuenta.serieFactura && cuenta.folioFactura) {
-      foliosFacturaReferenciados.add(`${cuenta.serieFactura}|${cuenta.folioFactura}`);
-    }
+    const key = _facturaKeyDe(cuenta);
+    if (key) foliosFacturaReferenciados.add(key);
   }
   const diaCfdiPorFolioFactura = new Map();
   if (foliosFacturaReferenciados.size) {
@@ -2302,7 +2315,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   const vistos = new Set();
   const porVenta = new Map(); // ventaKey -> [{ clave, monto }], mismo orden en que llegan los cobros
   for (const cuenta of resultado) {
-    const facturaKey = (cuenta.serieFactura && cuenta.folioFactura) ? `${cuenta.serieFactura}|${cuenta.folioFactura}` : null;
+    const facturaKey = _facturaKeyDe(cuenta);
     const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
     for (const cobro of (cuenta.cobros ?? [])) {
       if (cobro.claveCentro !== centro) continue;

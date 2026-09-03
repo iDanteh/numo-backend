@@ -1713,23 +1713,34 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   const UMBRAL_RESIDUO_CONSOLIDADO_SIN_ETIQUETA = 10;
   const consolidados = [...grupos.values()]
     .filter(g => !(g.label == null && Math.abs(g.debe) < UMBRAL_RESIDUO_CONSOLIDADO_SIN_ETIQUETA))
-    .map(g => ({
-      cuenta:      g.cuenta,
-      serie:       g.label ?? '',
-      concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
-                 : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
-                 : g.label === 'SF'       ? 'Depósitos consolidados (SF)'
-                 : g.label === 'PUNTOS'   ? 'Depósitos consolidados (Puntos)'
-                 : 'Depósitos consolidados',
-      centroCosto: g.centroCosto,
-      debe:        g.debe,
-      haber:       0,
-      cfdiUuid:    null,
-      _subcodigo:  0,
-      _detalle:    g.detalle,
-      _esTransferencia: false,
-      _esResto:    true,
-    }))
+    .map(g => {
+      // Bucket que neta en NEGATIVO (ej. ajustes SF-MISMO-FOLIO restando más
+      // de lo que hay cargos en el mismo bucket, ver
+      // `_inyectarSaldoFavorGenerado`): `esCargo = debe > 0` más abajo
+      // (`_construirWorkbookPoliza`) da falso, y como `haber` aquí siempre
+      // era 0, la celda de monto mostraba literalmente "0.00" -- el ajuste
+      // real quedaba fuera del total que lee CONTPAQ (ni como cargo ni como
+      // abono). Se voltea a Abono con el valor absoluto para que el importe
+      // sí llegue al archivo (confirmado con el usuario 2026-09-03).
+      const neto = Number(g.debe) || 0;
+      return {
+        cuenta:      g.cuenta,
+        serie:       g.label ?? '',
+        concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
+                   : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
+                   : g.label === 'SF'       ? 'Depósitos consolidados (SF)'
+                   : g.label === 'PUNTOS'   ? 'Depósitos consolidados (Puntos)'
+                   : 'Depósitos consolidados',
+        centroCosto: g.centroCosto,
+        debe:        neto > 0 ? neto : 0,
+        haber:       neto < 0 ? Math.abs(neto) : 0,
+        cfdiUuid:    null,
+        _subcodigo:  0,
+        _detalle:    g.detalle,
+        _esTransferencia: false,
+        _esResto:    true,
+      };
+    })
     .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 2) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 2));
 
   // Transferencia y Cheque detallados: una línea por CFDI, salvo cuando dos o
@@ -2978,32 +2989,42 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       // `cuentaFaltante` es una señal clara de "corregir manualmente", nunca
       // se confunde con una cuenta real (ningún código empieza en 0).
       const _numOr0 = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-      const row = sheet.addRow([
-        'M1',
-        _numOr0(m.cuenta?.codigo),
-        columnaC,
-        esCargo ? 0 : 1,
-        esCargo ? _numOr0(m.debe) : _numOr0(m.haber),
-        m._subcodigo ?? 0,
-        0,
-        m.concepto || '',
-        m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-      ]);
-      // Monto (columna E) siempre con 2 decimales — sin esto, $199.90 se ve
-      // como "199.9" en Excel (igual que ya se fuerza `numFmt` en la fecha
-      // del encabezado). No cambia el valor real de la celda que lee
-      // CONTPAQ, solo cómo se despliega (confirmado con el usuario 2026-08-07).
-      row.getCell(5).numFmt = '#,##0.00';
-      // Cada categoría de ajuste (Devolución, Descuento, Bonificación, Club
-      // Tuberos, Anticipo) lleva su propio color fijo — tanto en Contado
-      // (`consolidarCargos`) como en Crédito (`moverAjustesAlFinal`) — para
-      // distinguirlas a simple vista del resto de los movimientos del bloque.
-      const colorFila = m._categoria ? COLOR_CATEGORIA[m._categoria]
-        : m._esResto ? 'FFF2F2F2'
-        : FILL_ALTERNADO[colorIdx];
-      row.eachCell({ includeEmpty: true }, (cell) => {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colorFila } };
-      });
+      // Bucket consolidado (Depósitos consolidados, etc.) cuyo neto cae en
+      // $0.00 -- ej. un cargo cancelado exactamente por una NC/ajuste dentro
+      // del mismo bucket -- no aporta nada al balance de la póliza, solo
+      // ruido visual (confirmado con el usuario 2026-09-03, caso real cuentas
+      // 1101010003/1102012001). Se oculta SOLO de esta hoja; el detalle sigue
+      // intacto en "Desglose Consolidado" (más abajo) para poder auditarlo.
+      const esLineaCeroConsolidada = m._esResto
+        && Math.abs(_numOr0(m.debe)) < 0.005 && Math.abs(_numOr0(m.haber)) < 0.005;
+      if (!esLineaCeroConsolidada) {
+        const row = sheet.addRow([
+          'M1',
+          _numOr0(m.cuenta?.codigo),
+          columnaC,
+          esCargo ? 0 : 1,
+          esCargo ? _numOr0(m.debe) : _numOr0(m.haber),
+          m._subcodigo ?? 0,
+          0,
+          m.concepto || '',
+          m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        ]);
+        // Monto (columna E) siempre con 2 decimales — sin esto, $199.90 se ve
+        // como "199.9" en Excel (igual que ya se fuerza `numFmt` en la fecha
+        // del encabezado). No cambia el valor real de la celda que lee
+        // CONTPAQ, solo cómo se despliega (confirmado con el usuario 2026-08-07).
+        row.getCell(5).numFmt = '#,##0.00';
+        // Cada categoría de ajuste (Devolución, Descuento, Bonificación, Club
+        // Tuberos, Anticipo) lleva su propio color fijo — tanto en Contado
+        // (`consolidarCargos`) como en Crédito (`moverAjustesAlFinal`) — para
+        // distinguirlas a simple vista del resto de los movimientos del bloque.
+        const colorFila = m._categoria ? COLOR_CATEGORIA[m._categoria]
+          : m._esResto ? 'FFF2F2F2'
+          : FILL_ALTERNADO[colorIdx];
+        row.eachCell({ includeEmpty: true }, (cell) => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colorFila } };
+        });
+      }
 
       if (m._detalle) {
         for (const d of m._detalle) {

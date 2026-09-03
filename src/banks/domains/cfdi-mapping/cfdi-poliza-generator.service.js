@@ -1500,8 +1500,28 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
   if (!generado?.monto) return [];
 
-  const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
-  const iva = Math.round((generado.monto - subtotal) * 100) / 100;
+  // El monto real de ESTA Cancelación/Devolución es `cfdi.total` — NUNCA
+  // `generado.monto` (bug real, caso Hidalgo 11-ago, venta origen
+  // B0-260705994): cuando la MISMA venta origen se cancela repartida en 2+
+  // CFDIs tipo E distintos (folios 260801211/212/213), `mapaGenerados` solo
+  // guarda UN registro por marcador (Serie|Folio de la venta origen) con el
+  // monto TOTAL generado por esa venta — cada uno de los CFDIs lo consultaba
+  // y se llevaba el monto COMPLETO, restándolo (o en el caso "mismo folio"
+  // de abajo, generando una línea de ajuste) 3 veces en vez de una.
+  // `generado` sigue usándose para las banderas de clasificación
+  // (mismoFolio/oculto/formaPagoReal/centroProcesamiento), que sí son
+  // propiedades de la venta origen compartidas correctamente entre los
+  // CFDIs — solo el monto en pesos debe ser el de ESTE CFDI puntual.
+  // NOTA: a diferencia del intento de fix del 2026-09-02 (revertido por dar
+  // resultado incorrecto en testnumo), aquí NO se toca `formaPago` en el
+  // caso "mismo folio" más abajo — el usuario confirmó que Efectivo/Tarjeta
+  // consolidados ($256,295.27 / $114,363.62 en el caso real) NO deben
+  // moverse, así que este ajuste se queda en su línea separada, solo con el
+  // monto corregido.
+  const montoPropio = Number(cfdi.total) || 0;
+  if (montoPropio <= 0) return [];
+  const subtotal = Math.round((montoPropio / 1.16) * 100) / 100;
+  const iva = Math.round((montoPropio - subtotal) * 100) / 100;
   const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
   const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
   const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';

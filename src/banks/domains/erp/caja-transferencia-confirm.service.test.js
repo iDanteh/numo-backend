@@ -8,7 +8,7 @@
 // pero ERP_TOLERANCE se toma real (constante, sin I/O).
 jest.mock('../banks/BankMovement.model');
 jest.mock('./CajaTransferencia.model');
-jest.mock('../../shared/socket', () => ({ emitToBanco: jest.fn() }));
+jest.mock('../../shared/socket', () => ({ emitToBanco: jest.fn(), emitToAll: jest.fn() }));
 jest.mock('../banks/bank.service', () => {
   const real = jest.requireActual('../banks/bank.service');
   return { setErpIds: jest.fn(), ERP_TOLERANCE: real.ERP_TOLERANCE };
@@ -31,7 +31,7 @@ jest.mock('mongoose', () => {
 const mongoose         = require('mongoose');
 const BankMovement      = require('../banks/BankMovement.model');
 const CajaTransferencia = require('./CajaTransferencia.model');
-const { emitToBanco }   = require('../../shared/socket');
+const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { setErpIds }     = require('../banks/bank.service');
 const { confirmarMatch } = require('./caja-transferencia-confirm.service');
 
@@ -57,7 +57,7 @@ test('transferencia inexistente: NotFoundError', async () => {
 });
 
 test('transferencia ya no está pendiente: ConflictError', async () => {
-  CajaTransferencia.findById = jest.fn().mockResolvedValue(fakeTransferencia({ estatusMatch: 'huerfana' }));
+  CajaTransferencia.findById = jest.fn().mockResolvedValue(fakeTransferencia({ estatusMatch: 'matcheada' }));
   await expect(confirmarMatch('t-1', ['mov-1'], USER)).rejects.toThrow(/ya no está pendiente/);
 });
 
@@ -144,6 +144,9 @@ test('match 1:1 válido: llama setErpIds con erpId sintético y origen transfere
   );
   expect(mockSession.commitTransaction).toHaveBeenCalled();
   expect(emitToBanco).toHaveBeenCalledWith('BBVA', 'bank:movement:updated', updatedMov);
+  // 2026-09-03: señal cross-banco para que la bandeja de "pendientes de ficha" se
+  // autorefresque — emitToAll (no emitToBanco), un solo id por movimiento confirmado.
+  expect(emitToAll).toHaveBeenCalledWith('bank:ficha-pendiente:changed', { movementId: 'mov-1' });
   expect(res.movimientos).toEqual([updatedMov]);
 });
 
@@ -163,6 +166,10 @@ test('match 1:2 válido (split real): llama setErpIds una vez por movimiento, ca
   expect(setErpIds).toHaveBeenCalledTimes(2);
   expect(setErpIds.mock.calls[0][1][0]).toMatchObject({ saldoPagadoTotal: 1000, total: 1000 });
   expect(setErpIds.mock.calls[1][1][0]).toMatchObject({ saldoPagadoTotal: 500, total: 500 });
+  // Split 1:2: un evento cross-banco POR CADA movimiento actualizado, no uno solo.
+  expect(emitToAll).toHaveBeenCalledTimes(2);
+  expect(emitToAll).toHaveBeenCalledWith('bank:ficha-pendiente:changed', { movementId: 'mov-a' });
+  expect(emitToAll).toHaveBeenCalledWith('bank:ficha-pendiente:changed', { movementId: 'mov-b' });
 });
 
 test('Mongo sin soporte de transacciones (standalone, code 20): cae al camino sin sesión', async () => {

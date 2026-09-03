@@ -884,8 +884,8 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
   });
 });
 
-// GET /transferencias-cajas/bandeja — Fase D: pendientes con candidatos (Fase C, en vivo)
-// separados de huerfanas.
+// GET /transferencias-cajas/bandeja — Fase D: pendientes con candidatos (Fase C, en vivo).
+// (2026-09-02: se eliminó el apartado de huérfanas — pedido explícito del usuario.)
 describe('GET /transferencias-cajas/bandeja', () => {
   let app;
 
@@ -904,12 +904,11 @@ describe('GET /transferencias-cajas/bandeja', () => {
     expect(CajaTransferencia.find).not.toHaveBeenCalled();
   });
 
-  test('separa pendientes (con candidatos calculados) de huerfanas', async () => {
+  test('devuelve pendientes con sus candidatos calculados', async () => {
     const pendiente = { _id: 't-1', estatusMatch: 'pendiente', monto: 1500 };
-    const huerfana   = { _id: 't-2', estatusMatch: 'huerfana', monto: 999 };
-    CajaTransferencia.find = jest.fn((filtro) => ({
+    CajaTransferencia.find = jest.fn(() => ({
       sort: jest.fn(() => ({
-        lean: jest.fn().mockResolvedValue(filtro.estatusMatch === 'pendiente' ? [pendiente] : [huerfana]),
+        lean: jest.fn().mockResolvedValue([pendiente]),
       })),
     }));
     buscarCandidatos.mockResolvedValue([[{ _id: 'mov-1' }]]);
@@ -920,7 +919,7 @@ describe('GET /transferencias-cajas/bandeja', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [[{ _id: 'mov-1' }]] }]);
-    expect(res.body.huerfanas).toEqual([huerfana]);
+    expect(res.body.huerfanas).toBeUndefined();
   });
 });
 

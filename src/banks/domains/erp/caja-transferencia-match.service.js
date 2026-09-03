@@ -2,16 +2,27 @@
 
 // caja-transferencia-match.service.js — Fase C del proceso de matching de
 // transferencias entre cajas (ver plan acordado con el usuario 2026-09-01).
-// Encuentra candidatos (BankMovement) para una CajaTransferencia y detecta
-// huérfanas cuando la ventana de tiempo se cierra sin ningún candidato. NO
-// escribe erpLinks ni marca nada como 'identificado' — confirmar un match
-// (con rastreabilidad de quién lo autorizó) es Fase D, todavía no implementada.
+// Encuentra candidatos (BankMovement) para una CajaTransferencia. NO escribe
+// erpLinks ni marca nada como 'identificado' — confirmar un match (con
+// rastreabilidad de quién lo autorizó) es Fase D (caja-transferencia-confirm.service.js).
 //
-// Candidato = BankMovement con categoria "Depósito en efectivo" (confirmado con el
-// usuario: sin importar status, que varía según cómo esté configurada la regla de
-// categorización) y sin erpLinks (nunca se identificó por otra vía). Sin acotar por
-// banco (confirmado con el usuario: un mismo depósito puede caer en cualquiera de
-// los 4 bancos manejados — no hay forma confiable de acotar).
+// 2026-09-02: se eliminó detectarHuerfanas() (marcaba 'huerfana' una transferencia
+// pendiente sin candidatos tras cerrar su ventana) — pedido explícito del usuario,
+// van a reemplazar ese mecanismo por algo distinto todavía no definido.
+//
+// Candidato = BankMovement con categoria "Depósito en efectivo", sin erpLinks Y con
+// status !== 'identificado' (nunca se identificó por otra vía). Sin acotar por banco
+// (confirmado con el usuario: un mismo depósito puede caer en cualquiera de los 4
+// bancos manejados — no hay forma confiable de acotar).
+//
+// CORRECCIÓN 2026-09-03 (bug real reportado por el usuario): filtrar solo por erpLinks
+// vacío NO alcanza — un movimiento puede quedar 'identificado' sin ningún erpLink, vía
+// `ficha` (folio físico que carga un contador, aplicarLogicaErp lo fuerza a 'identificado'
+// aunque erpLinks siga vacío — ver bank.service.js). La bandeja estaba sugiriendo como
+// candidatos depósitos que un contador YA había resuelto a mano. Se agrega el filtro de
+// status explícito. (Reemplaza la decisión previa de "ignorar status" — esa hablaba de
+// que una regla de categorización puede pisar el status mostrado, no de identificaciones
+// reales ya hechas por un contador.)
 //
 // Bug real 2026-09-01 (reportado por el usuario, TODAS las transferencias mostraban
 // "Sin candidatos"): `categoria` es texto libre que define quien arma las reglas de
@@ -97,6 +108,7 @@ async function buscarCandidatos(transferencia) {
   // categoria normalizada en JS, abajo.
   const elegibles = await BankMovement.find({
     erpLinks: { $size: 0 },
+    status:   { $ne: 'identificado' },
     fecha:    { $gte: desde, $lte: hasta },
   }).lean();
   const candidatos = elegibles.filter(m => _normalizarCategoria(m.categoria) === CATEGORIA_DEPOSITO_EFECTIVO);
@@ -114,43 +126,8 @@ async function buscarCandidatos(transferencia) {
   return pares;
 }
 
-// Recorre las transferencias 'pendiente' cuya ventana YA CERRÓ (fechaRecepcion +
-// ventanaDias es pasado — ya no tiene sentido esperar un depósito más tardío) y las
-// marca 'huerfana' si buscarCandidatos() no encontró NINGÚN grupo. Si hay candidatos
-// se deja 'pendiente' (esperando confirmación humana desde la bandeja, Fase D) — un
-// huérfano queda huérfano COMPLETO (confirmado con el usuario): nunca se marca medio
-// resuelto ni se autoconfirma el candidato encontrado.
-async function detectarHuerfanas() {
-  const ventanaDias = await _ventanaDias();
-  const limite = new Date();
-  limite.setDate(limite.getDate() - ventanaDias);
-
-  const pendientes = await CajaTransferencia.find({
-    estatusMatch:       'pendiente',
-    // Excluidas por filtro (reaplicarFiltro, caja-transferencia-sync.service.js) no deben
-    // pasar a 'huerfana' — perderían la marca de exclusión sin que el admin lo haya pedido.
-    excluidaPorFiltro:  { $ne: true },
-    fechaRecepcion:     { $lte: limite },
-  }).lean();
-
-  let huerfanas = 0;
-  for (const t of pendientes) {
-    // eslint-disable-next-line no-await-in-loop
-    const candidatos = await buscarCandidatos(t);
-    if (candidatos.length === 0) {
-      // eslint-disable-next-line no-await-in-loop
-      await CajaTransferencia.updateOne({ _id: t._id }, { $set: { estatusMatch: 'huerfana' } });
-      huerfanas++;
-    }
-  }
-
-  console.log(`[CajaTransferenciaMatch] ${pendientes.length} transferencias con ventana cerrada revisadas, ${huerfanas} marcadas huérfanas.`);
-  return { revisadas: pendientes.length, huerfanas };
-}
-
 module.exports = {
   buscarCandidatos,
-  detectarHuerfanas,
   esCategoriaDepositoEfectivo,
   _ventanaDias,
   _normalizarCategoria,

@@ -24,7 +24,7 @@ const CajaTransferencia = require('./CajaTransferencia.model');
 const { setErpIds, ERP_TOLERANCE } = require('../banks/bank.service');
 const { esCategoriaDepositoEfectivo } = require('./caja-transferencia-match.service');
 const { NotFoundError, BadRequestError, ConflictError } = require('../../shared/errors/AppError');
-const { emitToBanco } = require('../../shared/socket');
+const { emitToBanco, emitToAll } = require('../../shared/socket');
 const mongoose = require('mongoose');
 
 function _erpIdSintetico(transferencia) {
@@ -121,7 +121,15 @@ async function confirmarMatch(transferenciaId, movementIds, user) {
     }
   }
 
-  for (const updated of actualizados) emitToBanco(updated.banco, 'bank:movement:updated', updated);
+  for (const updated of actualizados) {
+    emitToBanco(updated.banco, 'bank:movement:updated', updated);
+    // Señal cross-banco (2026-09-03, pedido explícito del usuario) para que la bandeja de
+    // "pendientes de ficha" se autorefresque — recién confirmado, el movimiento queda
+    // 'identificado' sin ficha, así que siempre califica. Mismo criterio que
+    // erp:reversion:created (erp-reversion.service.js): emitToAll, no emitToBanco, porque
+    // el conteo que consume este evento es cross-banco (GET .../pendientes-ficha).
+    emitToAll('bank:ficha-pendiente:changed', { movementId: updated._id });
+  }
 
   return { transferencia: { ...transferencia.toObject(), estatusMatch: 'matcheada' }, movimientos: actualizados };
 }

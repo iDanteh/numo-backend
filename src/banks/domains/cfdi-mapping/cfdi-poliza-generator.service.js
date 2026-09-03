@@ -10,7 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
-const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro } = require('../erp/erp-sync.service');
+const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -1730,6 +1730,87 @@ async function _resolverReferenciaOpaPorMonto(anticiposCfdi) {
   return mapa;
 }
 
+/**
+ * Consulta "Cuentas Pendientes" del ERP (CxC/Bancos, `/cuentas-pendientes` —
+ * distinto del endpoint de cajas usado en el resto de este archivo) para
+ * resolver Anticipos con más precisión que los 2 mecanismos anteriores:
+ *
+ * 1. Referencia OPA real: `_resolverReferenciaOpaPorMonto` busca un depósito
+ *    bancario (`BankMovement`) por monto+fecha del anticipo — si Bancos no
+ *    tiene ese movimiento conciliado, cae al folio crudo de la factura
+ *    ("OPA-260900026" en vez de "OPA-00837"). Cuentas Pendientes trae la
+ *    cuenta del anticipo con `serieExterna:'OPA'`/`folioExterno` — el
+ *    folio real, sin depender de Bancos.
+ * 2. Monto real aplicado a CADA venta: `context.montoAnticipoUsado` (desglose
+ *    de `/desgloses-cobro/almacen`) a veces no distingue la porción de
+ *    Anticipo — cuando eso pasa, el caller asume que el 100% de la venta se
+ *    cubrió con Anticipo, ignorando que esa venta pudo tener OTRO ajuste
+ *    (ej. una Bonificación) que ya redujo el saldo antes de aplicar el
+ *    Anticipo (bug real 2026-09-03, caso MARIA DE LOURDES SANCHEZ RIOS,
+ *    OPA-00837: 2 de 3 ventas mostraban el Anticipo aplicado por el TOTAL
+ *    completo de la venta —$1,722.65/$1,922.07— en vez del saldo real
+ *    después de su Bonificación de $60.60 —$1,662.04/$1,861.47—, confirmado
+ *    contra la cuenta saldada real de Kore). Cuentas Pendientes trae, por
+ *    cada venta, el movimiento de cierre con `formasPago[].nombreFormaPago
+ *    === 'ANTICIPO'` y su monto YA neto de cualquier otro ajuste.
+ *
+ * `fechas`: fechas de los CFDIs relevantes (anticipos Y ventas que los
+ * consumen) — se usa el mín/máx ±5 días (misma ventana que
+ * `_resolverReferenciaOpaPorMonto`) como rango de consulta, porque el
+ * endpoint exige `fechaDesde`/`fechaHasta` y no filtra por serie/folio de
+ * factura (solo por serie/folio INTERNO de ticket, que no conocemos aquí).
+ * Si el ERP falla o no hay fechas, regresa mapas vacíos — el caller sigue
+ * funcionando con los mecanismos anteriores como respaldo.
+ */
+async function _prefetchCuentasPendientesAnticipo(fechas) {
+  const montoAnticipoPorFactura = new Map();
+  const referenciaOpaPorFactura = new Map();
+  const fechasValidas = fechas.filter(Boolean).map(f => new Date(f)).filter(f => !isNaN(f.getTime()));
+  if (!fechasValidas.length) return { montoAnticipoPorFactura, referenciaOpaPorFactura };
+
+  const VENTANA_MS = 5 * 24 * 3600 * 1000;
+  const fechaDesde = new Date(Math.min(...fechasValidas.map(f => f.getTime())) - VENTANA_MS);
+  const fechaHasta = new Date(Math.max(...fechasValidas.map(f => f.getTime())) + VENTANA_MS);
+
+  let cuentas;
+  try {
+    const resultado = await sincronizarCuentasPendientes({
+      fechaDesde: fechaDesde.toISOString(),
+      fechaHasta: fechaHasta.toISOString(),
+    });
+    cuentas = resultado.raw ?? [];
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.error(`[PolizaGen] /cuentas-pendientes fallo, se usan los mecanismos de respaldo: ${err.message}`);
+    return { montoAnticipoPorFactura, referenciaOpaPorFactura };
+  }
+
+  for (const cuenta of cuentas) {
+    if (!cuenta.serieFactura || !cuenta.folioFactura) continue;
+    const keyFactura = `${cuenta.serieFactura}|${cuenta.folioFactura}`;
+    // La cuenta ES el anticipo (su propia factura, ej. D0-260900026) —
+    // `serieExterna`/`folioExterno` son el folio interno real de Kore
+    // (ej. "OPA"/"00837"), no el folio de la factura.
+    if ((cuenta.serieExterna || '').toUpperCase() === 'OPA' && cuenta.folioExterno) {
+      referenciaOpaPorFactura.set(keyFactura, `OPA-${cuenta.folioExterno}`);
+    }
+    // La cuenta ES una venta que consumió Anticipo — suma todas las
+    // formasPago 'ANTICIPO' de todos sus movimientos (normalmente un solo
+    // movimiento de cierre, pero por seguridad se suman todas por si el
+    // cierre se dio en 2+ pasos).
+    let montoAnticipo = 0;
+    for (const mov of (cuenta.movimientos ?? [])) {
+      for (const fp of (mov.formasPago ?? [])) {
+        if ((fp.nombreFormaPago || '').toUpperCase() === 'ANTICIPO') montoAnticipo += Number(fp.monto) || 0;
+      }
+    }
+    if (montoAnticipo > 0) {
+      montoAnticipoPorFactura.set(keyFactura, (montoAnticipoPorFactura.get(keyFactura) ?? 0) + montoAnticipo);
+    }
+  }
+  return { montoAnticipoPorFactura, referenciaOpaPorFactura };
+}
+
 // Egreso SAT que formaliza la aplicación del anticipo directamente contra la
 // VENTA (tipoRelacion='07' apuntando al UUID de la propia venta — al revés
 // de la relación que trae la venta hacia SU anticipo). Cuando existe, trae el
@@ -3073,12 +3154,6 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const anticipoCfdisProp = _rel07UuidsSinReglaProp.length
     ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaProp } }).select('uuid serie folio total fecha').lean()
     : [];
-  const anticipoFolioPorUuidProp = {
-    ...Object.fromEntries(
-      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
-    ),
-    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
-  };
   // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
   // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
   const ventaUuidsConAnticipoProp = cfdiConRegla
@@ -3087,6 +3162,32 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     .map(({ cfdi }) => cfdi.uuid)
     .filter(Boolean);
   const egresosAnticipoPorVentaProp = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoProp, rfc);
+  // Cuentas Pendientes (CxC/Bancos) — ver `_prefetchCuentasPendientesAnticipo`:
+  // fuente más confiable que `_resolverReferenciaOpaPorMonto` (referencia) y
+  // que `context.montoAnticipoUsado` (monto) para Anticipo. Rango de fechas
+  // cubre tanto los CFDIs de anticipo como las ventas que los consumen.
+  const { montoAnticipoPorFactura: montoAnticipoPorFacturaProp, referenciaOpaPorFactura: referenciaOpaPorFacturaProp } =
+    await _prefetchCuentasPendientesAnticipo([
+      ...anticipoCfdisProp.map(c => c.fecha),
+      ...cfdiConRegla
+        .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+          && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .map(({ cfdi }) => cfdi.fecha),
+    ]);
+  const anticipoFolioPorUuidProp = {
+    ...Object.fromEntries(
+      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
+    ),
+    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
+    // Cuentas Pendientes gana sobre ambos anteriores cuando trae el dato —
+    // folio real de Kore, sin depender de que Bancos ya haya conciliado el
+    // depósito (ver docstring de `_prefetchCuentasPendientesAnticipo`).
+    ...Object.fromEntries(
+      anticipoCfdisProp
+        .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaProp.get(`${c.serie}|${c.folio}`)])
+        .filter(([, ref]) => ref),
+    ),
+  };
 
   let saldoRestanteProp = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -3341,7 +3442,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // sincronizado en Mongo) — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
         if (egresoAnticipoProp.folioOpa) anticipoFolioRefProp = egresoAnticipoProp.folioOpa;
       } else {
-        montoAnticipoRealProp = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
+        // Cuentas Pendientes (ver `_prefetchCuentasPendientesAnticipo`) tiene
+        // prioridad sobre `context.montoAnticipoUsado` (desglose de almacén,
+        // que a veces no distingue la porción de Anticipo y hace que el
+        // caller asuma 100% de la venta, ignorando otros ajustes ya
+        // aplicados como una Bonificación — bug real 2026-09-03, caso
+        // MARIA DE LOURDES SANCHEZ RIOS/OPA-00837).
+        const montoCuentasPendientesProp = montoAnticipoPorFacturaProp.get(`${cfdi.serie}|${cfdi.folio}`);
+        montoAnticipoRealProp = (montoCuentasPendientesProp > 0)
+          ? Math.min(montoCuentasPendientesProp, totalVentaProp)
+          : Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
       }
     }
     // Cuánto de ese monto real queda por "consumir" contra las líneas de
@@ -4572,12 +4682,6 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const anticipoCfdisGuard = _rel07UuidsSinReglaGuard.length
     ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaGuard } }).select('uuid serie folio total fecha').lean()
     : [];
-  const anticipoFolioPorUuidGuard = {
-    ...Object.fromEntries(
-      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
-    ),
-    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
-  };
   // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
   // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta` (misma lógica que en
   // generarPropuesta).
@@ -4587,6 +4691,26 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     .map(({ cfdi }) => cfdi.uuid)
     .filter(Boolean);
   const egresosAnticipoPorVentaGuard = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoGuard, rfc);
+  // Cuentas Pendientes — ver comentario equivalente en generarPropuesta.
+  const { montoAnticipoPorFactura: montoAnticipoPorFacturaGuard, referenciaOpaPorFactura: referenciaOpaPorFacturaGuard } =
+    await _prefetchCuentasPendientesAnticipo([
+      ...anticipoCfdisGuard.map(c => c.fecha),
+      ...cfdiConRegla
+        .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+          && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .map(({ cfdi }) => cfdi.fecha),
+    ]);
+  const anticipoFolioPorUuidGuard = {
+    ...Object.fromEntries(
+      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
+    ),
+    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
+    ...Object.fromEntries(
+      anticipoCfdisGuard
+        .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaGuard.get(`${c.serie}|${c.folio}`)])
+        .filter(([, ref]) => ref),
+    ),
+  };
 
   let saldoRestanteGuard = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -4809,7 +4933,12 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         // Ver comentario equivalente en generarPropuesta.
         if (egresoAnticipoGuard.folioOpa) anticipoFolioRefGuard = egresoAnticipoGuard.folioOpa;
       } else {
-        montoAnticipoRealGuard = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
+        // Cuentas Pendientes tiene prioridad sobre `context.montoAnticipoUsado`
+        // — ver comentario equivalente en generarPropuesta.
+        const montoCuentasPendientesGuard = montoAnticipoPorFacturaGuard.get(`${cfdi.serie}|${cfdi.folio}`);
+        montoAnticipoRealGuard = (montoCuentasPendientesGuard > 0)
+          ? Math.min(montoCuentasPendientesGuard, totalVentaGuard)
+          : Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
       }
     }
     let montoAnticipoRestanteGuard = montoAnticipoRealGuard;
@@ -5800,7 +5929,7 @@ module.exports = {
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
-  _prefetchAjustesFacturaPropia,
+  _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
   // Utilidades genéricas (numeración de folio, fechas) expuestas ÚNICAMENTE
   // para que cobranza-poliza-generator.service.js las reutilice sin duplicar
   // la numeración de folio (comparte el mismo contador/rango por sucursal que

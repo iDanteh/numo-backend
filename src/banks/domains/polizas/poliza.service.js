@@ -2449,9 +2449,16 @@ function bloquesAjustesContado(movs) {
     // subcódigo, cayendo al 0 por defecto en la hoja de CONTPAQ.
     const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
+    // Bonificación (genérica, no Club Tuberos): SIEMPRE solo sus Cargos
+    // (Bonificación+IVA), nunca su Abono — mismo criterio que ya existía
+    // para Cancelación dentro de 'devolucion' (confirmado con el usuario
+    // 2026-09-03, caso real BON-314117/118/119: el Abono no debe mostrarse
+    // sin importar a qué cuenta apunte la regla, Clientes o Saldo a Favor).
     const abonosCandidatos = categoria === 'devolucion'
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
-      : grupo.filter(m => !(Number(m.debe) > 0));
+      : categoria === 'bonificacion'
+        ? []
+        : grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
     // Anticipo ESTÁNDAR (Reg 22C/23, con NC del SAT): el Cargo NUNCA se
     // muestra en este bloque — solo el Abono (Ingresos+IVA, o el SF liberado)

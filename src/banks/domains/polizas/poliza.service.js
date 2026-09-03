@@ -1920,8 +1920,9 @@ function compararSerieFolio(a, b) {
 // serie/folio visibles). Se sacan del pipeline normal ANTES de procesar y se
 // reinyectan después, ya armados, como línea individual — mismo principio que
 // Devolución/Descuento/Bonificación/Anticipo (nunca se consolidan).
-// Formato "COS-FORMADEPAGO" (ej. "COS-EFECTIVO") — confirmado con el usuario
-// 2026-08-07, reemplaza el formato anterior "Cobro de otra sucursal - X".
+// Formato "FORMADEPAGO-COS" (ej. "EFECTIVO-COS") — confirmado con el usuario
+// 2026-09-03, invierte el orden usado desde el 2026-08-07 ("COS-FORMADEPAGO"),
+// que a su vez reemplazó el formato original "Cobro de otra sucursal - X".
 const ETIQUETA_COBRO_SUCURSAL = 'COS';
 // Mismo texto que ETIQUETA_SALDO_FAVOR en cobros-sucursal-puente.service.js.
 const ETIQUETA_SALDO_FAVOR = 'SF';
@@ -2310,7 +2311,7 @@ function _extraerCobrosSucursal(movimientos) {
         ? f._referenciaBancoReal
         : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
           ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
-          : (f._formaPagoLabel ? `${ETIQUETA_COBRO_SUCURSAL}-${f._formaPagoLabel}` : ETIQUETA_COBRO_SUCURSAL);
+          : (f._formaPagoLabel ? `${f._formaPagoLabel}-${ETIQUETA_COBRO_SUCURSAL}` : ETIQUETA_COBRO_SUCURSAL);
     delete f._formaPagoLabel;
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;

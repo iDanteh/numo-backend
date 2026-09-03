@@ -108,15 +108,36 @@ const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
  * el usuario 2026-08-18, caso real Global 89CF6A7F: DEV-055991 aparecía dos
  * veces, $365.16+$58.42 cada vez, una como 'Cargo Especial' y otra como
  * 'Cobro Sucursal').
+ *
+ * El concepto YA NO basta tal cual para la clave (bug real 2026-09-03, caso
+ * PJ CONSTRUCCIONES/D0-260803703): desde el sobrante visible (2026-09-01),
+ * el mecanismo (1) le agrega " (saldo disponible: $X.XX)" al concepto (ver
+ * `emitirLineaSF` en cfdi-mapping.service.js), pero el mecanismo (2) sigue
+ * armando el suyo sin ese sufijo (`conceptoSF` en cobros-sucursal-puente.
+ * service.js) — mismo evento, conceptos ahora distintos, el dedup dejaba de
+ * verlos como duplicados y aparecía DOS veces en vez de una. Se normaliza
+ * quitando el sufijo antes de comparar, y entre dos líneas que solo difieren
+ * en eso se conserva la que SÍ trae el sobrante (más informativa).
  */
+const _SUFIJO_SOBRANTE_SF_RE = / \(saldo disponible: \$[\d,.]+\)$/;
 function _deduplicarSFRedundante(movs) {
-  const vistos = new Set();
+  const claveBase = (m) => {
+    const conceptoBase = (m.concepto || '').replace(_SUFIJO_SOBRANTE_SF_RE, '');
+    return `${conceptoBase}|${m.cuentaId}|${Number(m.debe).toFixed(2)}|${Number(m.haber).toFixed(2)}`;
+  };
+  const elegidoPorClave = new Map();
+  for (const m of movs) {
+    if (m.reglaNombre !== 'SF' && m.reglaNombre !== ETIQUETA_SALDO_FAVOR_OCULTO) continue;
+    const key = claveBase(m);
+    const actual = elegidoPorClave.get(key);
+    if (!actual || (_SUFIJO_SOBRANTE_SF_RE.test(m.concepto || '') && !_SUFIJO_SOBRANTE_SF_RE.test(actual.concepto || ''))) {
+      elegidoPorClave.set(key, m);
+    }
+  }
   const resultado = [];
   for (const m of movs) {
     if (m.reglaNombre !== 'SF' && m.reglaNombre !== ETIQUETA_SALDO_FAVOR_OCULTO) { resultado.push(m); continue; }
-    const key = `${m.concepto}|${m.cuentaId}|${Number(m.debe).toFixed(2)}|${Number(m.haber).toFixed(2)}`;
-    if (vistos.has(key)) continue;
-    vistos.add(key);
+    if (elegidoPorClave.get(claveBase(m)) !== m) continue;
     resultado.push(m);
   }
   return resultado;
@@ -3946,7 +3967,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         concepto:      _concepto.slice(0, 255) || 'Cobro Suc. Ajena',
         centroCosto:   _ccCobradora.clave ?? null,
         centroCostoId: _ccCobradora.id    ?? null,
-        reglaNombre:   'COS',
+        // NUNCA el literal 'COS' (bug real 2026-09-03, caso M0-260900018:
+        // `_extraerCobrosSucursal` en poliza.service.js arma la columna C
+        // como "COS-${reglaNombre}" -- con reglaNombre='COS' salía
+        // literalmente "COS-COS" en vez de "COS-EFECTIVO"/"COS-TARJETA".
+        // Mismo mapeo que `LABEL_FORMA_PAGO_CONSOLIDADO` (poliza.service.js).
+        reglaNombre:   esEfe ? 'EFECTIVO' : (claveSat === '04' || claveSat === '28') ? 'TARJETA' : null,
         formaPago:     claveSat || null,
       };
       // DEBE: Cargo a Caja/Bancos — cash físico recibido aquí de otra sucursal
@@ -5241,7 +5267,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         concepto:      _conceptoG.slice(0, 255) || 'Cobro Suc. Ajena',
         centroCosto:   _ccCobradoraGuard.clave ?? null,
         centroCostoId: _ccCobradoraGuard.id    ?? null,
-        reglaNombre:   'COS',
+        // Ver comentario equivalente en generarPropuesta -- nunca el literal
+        // 'COS' (salía "COS-COS" en vez de "COS-EFECTIVO"/"COS-TARJETA").
+        reglaNombre:   esEfe ? 'EFECTIVO' : (claveSat === '04' || claveSat === '28') ? 'TARJETA' : null,
         formaPago:     claveSat || null,
       };
       // Mismo criterio que en generarPropuesta (ver comentario allá): Efectivo

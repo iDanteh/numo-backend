@@ -80,6 +80,29 @@ async function sincronizarCuentasPendientes(params = {}) {
         headers: { Authorization: `Bearer ${token}` },
         timeout: 30000,
       });
+      // BUG CORREGIDO 2026-09-04 (caso real HORIZONTE HOTELERO B0-260900010/
+      // OPA-260900009): el ERP puede responder 200 con una lista PARCIAL bajo
+      // la carga real de una regeneración completa de póliza (docenas de
+      // llamadas concurrentes a distintos endpoints) — sin error, sin 429, sin
+      // timeout, solo menos registros de los que realmente hay. Confirmado
+      // con datos reales: la misma consulta (mismo rango de fechas) trajo 221
+      // cuentas bajo carga real vs 12,833 en una consulta aislada — el
+      // registro que necesitábamos (B0|260900009) faltaba en la respuesta
+      // parcial. El ERP SÍ manda `Data.totalCount` (el total real, sin
+      // truncar) junto con `Data.cuentas` — si no coinciden, la respuesta es
+      // incompleta y se reintenta igual que un timeout/429, en vez de
+      // confiar ciegamente en lo que haya llegado.
+      {
+        const totalCount = response.data?.Data?.totalCount;
+        const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
+        if (Number.isFinite(totalCount) && cuentasLen < totalCount && intento < MAX_INTENTOS) {
+          const { logger } = require('../../../shared/utils/logger');
+          const esperaSeg = 3 * intento;
+          logger.warn(`[ErpSync] /cuentas-pendientes respuesta incompleta (${cuentasLen}/${totalCount}), reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS})`);
+          await new Promise(r => setTimeout(r, esperaSeg * 1000));
+          continue;
+        }
+      }
       break;
     } catch (axErr) {
       const status    = axErr.response?.status;

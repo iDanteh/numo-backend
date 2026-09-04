@@ -189,6 +189,36 @@ async function _getConReintento(url, params, logLabel) {
   }
 }
 
+// BUG CORREGIDO 2026-09-04 (caso real Reforma/Hidalgo, cobro cruzado
+// B0-260900438 nunca capturado): confirmado con datos reales que las
+// consultas "por centro" (que traen TODAS las cuentas de un rango de fechas,
+// no una lista acotada de series/folios conocidos) pueden responder 200 OK
+// con una lista PARCIAL bajo la carga real de una regeneración completa de
+// póliza — sin 429 ni timeout que `_getConReintento` pueda detectar. Mismo
+// patrón ya confirmado y corregido en `sincronizarCuentasPendientes`
+// (221 cuentas bajo carga real vs 12,833 en consulta aislada). El ERP manda
+// `Data.totalCount` junto con `Data.cuentas` en AMBOS endpoints "por centro"
+// (confirmado con una consulta real a /desgloses-cobro/almacen) — si no
+// coinciden, se reintenta la llamada completa (con su propio backoff interno)
+// en vez de confiar en la lista incompleta.
+const MAX_INTENTOS_COMPLETO = 3;
+async function _getConReintentoCompleto(url, params, logLabel) {
+  let response;
+  for (let intento = 1; intento <= MAX_INTENTOS_COMPLETO; intento++) {
+    response = await _getConReintento(url, params, logLabel);
+    const totalCount = response.data?.Data?.totalCount;
+    const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
+    if (!Number.isFinite(totalCount) || cuentasLen >= totalCount || intento >= MAX_INTENTOS_COMPLETO) {
+      return response;
+    }
+    const { logger } = require('../../../shared/utils/logger');
+    const esperaSeg = 3 * intento;
+    logger.warn(`[ErpSync] ${logLabel} respuesta incompleta (${cuentasLen}/${totalCount}), reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS_COMPLETO})`);
+    await new Promise(r => setTimeout(r, esperaSeg * 1000));
+  }
+  return response;
+}
+
 // ── Caché en memoria por lote de serie/folio ────────────────────────────────
 // Generar las N sucursales de un mismo periodo repetía, para cada una, la
 // MISMA consulta al ERP (mismo universo de CFDIs company-wide, ver
@@ -342,7 +372,7 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
   const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
+    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/almacen`, {
       centro, fechaDesde, fechaHasta,
     }, '/desgloses-cobro/almacen (por centro)');
   } catch (axErr) {
@@ -371,7 +401,7 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
+    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/saldos-favor`, {
       centro, fechaDesde, fechaHasta,
     }, '/desgloses-cobro/saldos-favor (por centro)');
   } catch (axErr) {

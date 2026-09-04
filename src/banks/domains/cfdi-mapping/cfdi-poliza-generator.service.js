@@ -1772,6 +1772,9 @@ async function _prefetchCuentasPendientesAnticipo(fechas) {
   const fechaDesde = new Date(Math.min(...fechasValidas.map(f => f.getTime())) - VENTANA_MS);
   const fechaHasta = new Date(Math.max(...fechasValidas.map(f => f.getTime())) + VENTANA_MS);
 
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] fechaDesde=${fechaDesde.toISOString()} fechaHasta=${fechaHasta.toISOString()}`);
+  }
   let cuentas;
   try {
     const resultado = await sincronizarCuentasPendientes({
@@ -1779,9 +1782,15 @@ async function _prefetchCuentasPendientesAnticipo(fechas) {
       fechaHasta: fechaHasta.toISOString(),
     });
     cuentas = resultado.raw ?? [];
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] cuentas.length=${cuentas.length}`);
+    }
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
     logger.error(`[PolizaGen] /cuentas-pendientes fallo, se usan los mecanismos de respaldo: ${err.message}`);
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] FALLO: ${err.message}`);
+    }
     return { montoAnticipoPorFactura, referenciaOpaPorFactura };
   }
 
@@ -1807,6 +1816,10 @@ async function _prefetchCuentasPendientesAnticipo(fechas) {
     if (montoAnticipo > 0) {
       montoAnticipoPorFactura.set(keyFactura, (montoAnticipoPorFactura.get(keyFactura) ?? 0) + montoAnticipo);
     }
+  }
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] referenciaOpaPorFactura.size=${referenciaOpaPorFactura.size} `
+      + `B0|260900009=${referenciaOpaPorFactura.get('B0|260900009')}`);
   }
   return { montoAnticipoPorFactura, referenciaOpaPorFactura };
 }

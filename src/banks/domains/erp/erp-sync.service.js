@@ -95,6 +95,9 @@ async function sincronizarCuentasPendientes(params = {}) {
       {
         const totalCount = response.data?.Data?.totalCount;
         const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
+        if (process.env.DEBUG_OPA_UUID) {
+          console.warn(`[DEBUG_CUENTAS_PENDIENTES] intento=${intento} totalCount=${JSON.stringify(totalCount)} cuentasLen=${cuentasLen} Data.keys=${JSON.stringify(Object.keys(response.data?.Data ?? {}))}`);
+        }
         if (Number.isFinite(totalCount) && cuentasLen < totalCount && intento < MAX_INTENTOS) {
           const { logger } = require('../../../shared/utils/logger');
           const esperaSeg = 3 * intento;

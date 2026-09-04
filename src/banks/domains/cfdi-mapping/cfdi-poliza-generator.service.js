@@ -2906,70 +2906,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
 
-  // Cobros de sucursales (Caja/Bancos por identificar, ver
-  // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
-  // Se calcula ANTES del loop de reglas (más abajo) porque
-  // `facturasVendedorCubiertas` se usa ahí para omitir el Cargo normal de las
-  // facturas cuyo Cargo ya cubre este flujo — si no se omite, la póliza queda
-  // con doble Cargo (uno normal + uno de sucursal) contra un solo Abono.
-  // Usa cfdisSinPolizaFinal (SIN filtrar por centro) para poder detectar el
-  // cobro cruzado en cualquier dirección; el propio construirMovimientosPuente
-  // filtra las líneas según centroCostoId.
-  //
-  // Al generar POR DÍA (fechaInicio/fechaFin), el universo de CFDIs para
-  // resolver documentos relacionados se amplía a TODO el periodo (ver
-  // `_fetchCfdisParaPuenteAmplio`) — el cobro se filtra por su fecha REAL
-  // (fechaDesde/fechaHasta, dentro de construirMovimientosPuente), no por la
-  // fecha del CFDI que lo referencia.
-  let movsPuente = [];
-  let facturasVendedorCubiertas = new Map(); // uuid → monto ya cubierto (ver docstring en cobros-sucursal-puente.service.js)
-  let facturasPPDCubiertas = new Map();
-  let pendientesPorFacturarProp = [];
-  let cuentaSaldoFavorIdProp = null;
-  let cuentaIvaSaldoFavorIdProp = null;
-  if (tipoCfdi === 'I' && centroCostoId) {
-    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
-    cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
-    cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
-    if (cuentaCajaId && cuentaBancosId) {
-      // Acotado a la serie propia para ESTA consulta — el lado cobrador ya no
-      // depende SOLO de ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio`
-      // y la cola `CobroSucursalPendiente`): cuando se genera por día, además
-      // se consulta directo por centro+fecha vía `centroPropioClave` (ver
-      // comentario en `construirMovimientosPuente`).
-      const serieDelCentro = serieDelCentroProp;
-      const cfdisParaPuente = (fechaInicio && fechaFin)
-        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
-        : cfdisSinPolizaFinal;
-      const resultadoPuente = await construirMovimientosPuente({
-        cfdis: cfdisParaPuente,
-        centroCostoId,
-        ccBySerieMap: ccBySerieMapProp,
-        cuentaCajaId,
-        cuentaBancosId,
-        cuentaPuenteId,
-        cuentaSaldoFavorId,
-        cuentaIvaSaldoFavorId,
-        cuentaClubTuberosId,
-        rfc,
-        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
-        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
-        devsOcultosSF: devsOcultosSFProp,
-        centroPropioClave: serieDelCentro,
-      });
-      movsPuente = resultadoPuente.movimientos;
-      facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
-      facturasPPDCubiertas = resultadoPuente.facturasPPDCubiertas;
-      pendientesPorFacturarProp = resultadoPuente.pendientesPorFacturar ?? [];
-      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
-      // detectado hoy con lo ya cubierto en días previos.
-      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
-        facturasVendedorCubiertas.set(u, (facturasVendedorCubiertas.get(u) ?? 0) + monto);
-      }
-    }
-  }
-
-  // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
+  // Adelantado (2026-09-04, antes de `construirMovimientosPuente`): el
+  // mecanismo APA de ese bloque necesita `saldoFavorUsadoMapProp` para saber
+  // qué facturas ya va a cubrir `cfdiToMovimientos` (split por origen) más
+  // abajo en el loop principal, y así NO duplicar la misma línea de SF usado
+  // (caso real Ferrocarril 1-sep, factura F0-260800614: el split por origen
+  // ya emitía 2 líneas — una por cada devolución de origen — y el bloque APA
+  // agregaba una TERCERA línea con el monto total combinado, literal la suma
+  // de las otras dos). `_deduplicarSFRedundante` solo detecta duplicados de
+  // monto EXACTO, así que nunca cachaba este caso (2 líneas parciales vs. 1
+  // línea con el total). Se movió aquí (antes vivía después de
+  // `construirMovimientosPuente`) porque no depende de nada que ese bloque
+  // calcule — solo de `cfdisConNCProp`/`rules` (ya disponibles arriba) y
+  // `serieDelCentroProp`/fechaInicio/fechaFin (ya disponibles arriba).
   const cfdiConRegla = cfdisConNCProp.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
@@ -3023,6 +2972,79 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+
+  // Cobros de sucursales (Caja/Bancos por identificar, ver
+  // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
+  // Se calcula ANTES del loop de reglas (más abajo) porque
+  // `facturasVendedorCubiertas` se usa ahí para omitir el Cargo normal de las
+  // facturas cuyo Cargo ya cubre este flujo — si no se omite, la póliza queda
+  // con doble Cargo (uno normal + uno de sucursal) contra un solo Abono.
+  // Usa cfdisSinPolizaFinal (SIN filtrar por centro) para poder detectar el
+  // cobro cruzado en cualquier dirección; el propio construirMovimientosPuente
+  // filtra las líneas según centroCostoId.
+  //
+  // Al generar POR DÍA (fechaInicio/fechaFin), el universo de CFDIs para
+  // resolver documentos relacionados se amplía a TODO el periodo (ver
+  // `_fetchCfdisParaPuenteAmplio`) — el cobro se filtra por su fecha REAL
+  // (fechaDesde/fechaHasta, dentro de construirMovimientosPuente), no por la
+  // fecha del CFDI que lo referencia.
+  let movsPuente = [];
+  let facturasVendedorCubiertas = new Map(); // uuid → monto ya cubierto (ver docstring en cobros-sucursal-puente.service.js)
+  let facturasPPDCubiertas = new Map();
+  let pendientesPorFacturarProp = [];
+  let cuentaSaldoFavorIdProp = null;
+  let cuentaIvaSaldoFavorIdProp = null;
+  if (tipoCfdi === 'I' && centroCostoId) {
+    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
+    cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
+    cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
+    if (cuentaCajaId && cuentaBancosId) {
+      // Acotado a la serie propia para ESTA consulta — el lado cobrador ya no
+      // depende SOLO de ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio`
+      // y la cola `CobroSucursalPendiente`): cuando se genera por día, además
+      // se consulta directo por centro+fecha vía `centroPropioClave` (ver
+      // comentario en `construirMovimientosPuente`).
+      const serieDelCentro = serieDelCentroProp;
+      const cfdisParaPuente = (fechaInicio && fechaFin)
+        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
+        : cfdisSinPolizaFinal;
+      const resultadoPuente = await construirMovimientosPuente({
+        cfdis: cfdisParaPuente,
+        centroCostoId,
+        ccBySerieMap: ccBySerieMapProp,
+        cuentaCajaId,
+        cuentaBancosId,
+        cuentaPuenteId,
+        cuentaSaldoFavorId,
+        cuentaIvaSaldoFavorId,
+        cuentaClubTuberosId,
+        rfc,
+        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+        devsOcultosSF: devsOcultosSFProp,
+        centroPropioClave: serieDelCentro,
+        // Ver comentario arriba (adelantado 2026-09-04) — evita que el
+        // mecanismo APA duplique el SF que `cfdiToMovimientos` ya va a
+        // desglosar por origen para esta misma factura.
+        saldoFavorUsadoMap: saldoFavorUsadoMapProp,
+      });
+      movsPuente = resultadoPuente.movimientos;
+      facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
+      facturasPPDCubiertas = resultadoPuente.facturasPPDCubiertas;
+      pendientesPorFacturarProp = resultadoPuente.pendientesPorFacturar ?? [];
+      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
+      // detectado hoy con lo ya cubierto en días previos.
+      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
+        facturasVendedorCubiertas.set(u, (facturasVendedorCubiertas.get(u) ?? 0) + monto);
+      }
+    }
+  }
+
+  // cfdiConRegla / cuentaMap / saldoFavorUsadoMapProp se calculan ANTES de
+  // `construirMovimientosPuente` (más arriba, ver ese bloque) — necesarios
+  // ahí para que el mecanismo APA sepa qué facturas ya cubre el split por
+  // origen de `cfdiToMovimientos`, y evite duplicar (ver comentario en
+  // `_deduplicarSFRedundante` y el fix del 2026-09-04).
   // Documentos liquidados por cada Pago (asiento completo por factura,
   // incluyendo su propio saldo a favor si aplica) — ver `_prefetchDoctosPago`.
   const { doctosPorUuid: doctosPagoMapProp } = await _prefetchDoctosPago(cfdiConRegla, rfc);
@@ -4446,57 +4468,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
 
-  // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
-  // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
-  // poder omitir, ahí, el Cargo normal de las facturas cuyo Cargo ya cubre
-  // este flujo (si no, la póliza queda con doble Cargo contra un solo Abono).
-  //
-  // Universo ampliado + filtro por fecha real del cobro — ver comentario
-  // equivalente en generarPropuesta y `_fetchCfdisParaPuenteAmplio`.
-  let movsPuenteGuard = [];
-  let facturasVendedorCubiertasGuard = new Map(); // uuid → monto ya cubierto
-  let facturasPPDCubiertasGuard = new Map();
-  let pendientesPorFacturarGuard = [];
-  let cuentaSaldoFavorIdGuard = null;
-  let cuentaIvaSaldoFavorIdGuard = null;
-  if (tipoCfdi === 'I' && centroCostoId) {
-    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
-    cuentaSaldoFavorIdGuard = cuentaSaldoFavorId;
-    cuentaIvaSaldoFavorIdGuard = cuentaIvaSaldoFavorId;
-    if (cuentaCajaId && cuentaBancosId) {
-      // Acotado a la serie propia — ver comentario equivalente en generarPropuesta.
-      const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
-        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
-        : cfdisSinPolizaFinalGuard;
-      const resultadoPuenteGuard = await construirMovimientosPuente({
-        cfdis: cfdisParaPuenteGuard,
-        centroCostoId,
-        ccBySerieMap: ccBySerieMap,
-        cuentaCajaId,
-        cuentaBancosId,
-        cuentaPuenteId,
-        cuentaSaldoFavorId,
-        cuentaIvaSaldoFavorId,
-        cuentaClubTuberosId,
-        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
-        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
-        rfc,
-        devsOcultosSF: devsOcultosSFGuard,
-        centroPropioClave: serieDelCentroGuard,
-      });
-      movsPuenteGuard = resultadoPuenteGuard.movimientos;
-      facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
-      facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
-      pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
-      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
-      // detectado hoy con lo ya cubierto en días previos.
-      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
-        facturasVendedorCubiertasGuard.set(u, (facturasVendedorCubiertasGuard.get(u) ?? 0) + monto);
-      }
-    }
-  }
-
-  // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
+  // Adelantado (2026-09-04) — ver comentario equivalente en generarPropuesta.
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
@@ -4538,6 +4510,62 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+
+  // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
+  // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
+  // poder omitir, ahí, el Cargo normal de las facturas cuyo Cargo ya cubre
+  // este flujo (si no, la póliza queda con doble Cargo contra un solo Abono).
+  //
+  // Universo ampliado + filtro por fecha real del cobro — ver comentario
+  // equivalente en generarPropuesta y `_fetchCfdisParaPuenteAmplio`.
+  let movsPuenteGuard = [];
+  let facturasVendedorCubiertasGuard = new Map(); // uuid → monto ya cubierto
+  let facturasPPDCubiertasGuard = new Map();
+  let pendientesPorFacturarGuard = [];
+  let cuentaSaldoFavorIdGuard = null;
+  let cuentaIvaSaldoFavorIdGuard = null;
+  if (tipoCfdi === 'I' && centroCostoId) {
+    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
+    cuentaSaldoFavorIdGuard = cuentaSaldoFavorId;
+    cuentaIvaSaldoFavorIdGuard = cuentaIvaSaldoFavorId;
+    if (cuentaCajaId && cuentaBancosId) {
+      // Acotado a la serie propia — ver comentario equivalente en generarPropuesta.
+      const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
+        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
+        : cfdisSinPolizaFinalGuard;
+      const resultadoPuenteGuard = await construirMovimientosPuente({
+        cfdis: cfdisParaPuenteGuard,
+        centroCostoId,
+        ccBySerieMap: ccBySerieMap,
+        cuentaCajaId,
+        cuentaBancosId,
+        cuentaPuenteId,
+        cuentaSaldoFavorId,
+        cuentaIvaSaldoFavorId,
+        cuentaClubTuberosId,
+        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+        rfc,
+        devsOcultosSF: devsOcultosSFGuard,
+        centroPropioClave: serieDelCentroGuard,
+        // Ver comentario equivalente en generarPropuesta (fix 2026-09-04).
+        saldoFavorUsadoMap: saldoFavorUsadoMapGuard,
+      });
+      movsPuenteGuard = resultadoPuenteGuard.movimientos;
+      facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
+      facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
+      pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
+      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
+      // detectado hoy con lo ya cubierto en días previos.
+      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
+        facturasVendedorCubiertasGuard.set(u, (facturasVendedorCubiertasGuard.get(u) ?? 0) + monto);
+      }
+    }
+  }
+
+  // cfdiConRegla / cuentaMap / saldoFavorUsadoMapGuard se calculan ANTES de
+  // `construirMovimientosPuente` (más arriba) — ver comentario equivalente en
+  // generarPropuesta (fix 2026-09-04, dedup SF-APA vs split por origen).
   // Ver comentario equivalente en generarPropuesta.
   const { doctosPorUuid: doctosPagoMapGuard } = await _prefetchDoctosPago(cfdiConRegla, rfc);
   const puntosAcumuladosGuard = new Map(); // centroCostoId → { monto, centroCosto }

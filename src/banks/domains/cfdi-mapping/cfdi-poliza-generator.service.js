@@ -3966,13 +3966,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       };
       // DEBE: Cargo a Caja/Bancos — cash físico recibido aquí de otra sucursal
       // → SIEMPRE va al consolidado ("Depósitos consolidados") para su depósito.
-      // `cfdiUuid` solo se conserva para Efectivo (lo necesita el emparejado
-      // de abajo) — en Tarjeta/Transferencia se omite a propósito: si ESE
-      // MISMO ticket también tuviera una porción en Efectivo (mismo cfdiUuid),
-      // el emparejamiento de esa porción marcaría el uuid como "ya cobrado en
-      // otra sucursal" y arrastraría también esta línea de Tarjeta aunque su
-      // Abono no comparta cuenta ni uuid con ella.
-      movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: esEfe ? (cfdiUuid ?? null) : null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
+      // `cfdiUuid` se conserva SIEMPRE (2026-09-04, antes solo para Efectivo):
+      // `consolidarCargos` lo necesita para resolver el depósito bancario real
+      // (`verdadBancaria`/`bancoRealPorTicket`) y así mostrar el número de
+      // autorización/referencia real en Tarjeta/Transferencia — sin él, la
+      // línea caía anónima dentro de "Depósitos consolidados" (caso real
+      // Reforma 1-sep, $188,232.29/$226,990.18/$74,596.32 sin cliente ni
+      // referencia). El riesgo que esto evitaba antes (arrastrar por error
+      // esta línea junto con una porción Efectivo del mismo ticket, mismo
+      // uuid) ahora se resuelve en `_extraerCobrosSucursal`
+      // (`_cuentasCobradasPorSucursalPorUuid`, poliza.service.js), que exige
+      // TAMBIÉN la misma cuenta — la cuenta puente del Abono de Tarjeta/
+      // Transferencia (ver abajo) nunca coincide con la cuenta de banco real
+      // de este Cargo, así que nunca calificará para ese emparejamiento.
+      movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
       // HABER (contrapartida): Efectivo SÍ puede transferirse físicamente
       // entre sucursales, así que su Abono va a la MISMA cuenta (con el mismo
       // cfdiUuid, para que `_extraerCobrosSucursal` empareje y saque AMBAS
@@ -3980,11 +3987,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // sucursal vendedora, no se queda aquí). Tarjeta/Transferencia NUNCA se
       // pueden "mover" — el banco ya depositó en la cuenta de ESTA sucursal
       // sin importar quién facturó, así que su Abono va a la cuenta puente
-      // (2103040001, deuda con la sucursal vendedora) SIN cfdiUuid — para que
-      // el Cargo de arriba NO se empareje/extraiga y sí cuente en el
-      // consolidado de Tarjeta (confirmado con el usuario 2026-08-19, caso
-      // real CONSTRUCASA 13-ago: el corte de caja de Tarjeta cierra exacto
-      // contra el bruto sin excluir cruces, a diferencia de Efectivo).
+      // (2103040001, deuda con la sucursal vendedora) — para que el Cargo de
+      // arriba NO se empareje/extraiga y sí cuente en el consolidado de
+      // Tarjeta (confirmado con el usuario 2026-08-19, caso real CONSTRUCASA
+      // 13-ago: el corte de caja de Tarjeta cierra exacto contra el bruto sin
+      // excluir cruces, a diferencia de Efectivo) sigue sin cfdiUuid: no lo
+      // necesita (nunca se resuelve contra `verdadBancaria`) y así tampoco
+      // arriesga que el emparejador la use por error como si fuera un HABER
+      // en la cuenta real.
       if (esEfe) {
         movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto });
       } else {
@@ -5264,10 +5274,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // se puede mover entre sucursales (Abono a la misma cuenta, emparejado
       // por cfdiUuid, ambas líneas se sacan del consolidado). Tarjeta/
       // Transferencia NUNCA se mueven — el banco ya depositó aquí — así que su
-      // Abono va a la cuenta puente SIN cfdiUuid, para que el Cargo sí cuente
-      // en el consolidado.
-      // `cfdiUuid` solo se conserva para Efectivo — ver comentario equivalente en generarPropuesta.
-      todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: esEfe ? (cfdiUuid ?? null) : null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
+      // Abono va a la cuenta puente, para que el Cargo sí cuente en el
+      // consolidado.
+      // `cfdiUuid` se conserva SIEMPRE (2026-09-04) — ver comentario equivalente en generarPropuesta.
+      todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
       if (esEfe) {
         todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto });
       } else {

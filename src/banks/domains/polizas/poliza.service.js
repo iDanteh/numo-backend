@@ -2023,13 +2023,30 @@ function _extraerCobrosSucursal(movimientos) {
   // quedarse en consolidado (el monto fue cobrado aquí) — usarlas extraería
   // incorrectamente entradas que deben estar en "Depósitos consolidados"
   // (bug real: $127k de EFECTIVO/TARJETA removidos de más, 2026-08-15).
-  const _uuidsCobradosPorSucursal = new Set(
-    movimientos
-      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
-                && m.cfdiUuid != null)
-      .map(m => m.cfdiUuid)
-      .filter(Boolean),
-  );
+  //
+  // Mapea a un Set de cuentas (no un booleano) — 2026-09-04, confirmado con
+  // el usuario: un ticket puede tener porción Efectivo (Abono a la MISMA
+  // cuenta que su Cargo, ver más abajo) Y porción Tarjeta/Transferencia
+  // (Abono a la cuenta PUENTE, distinta de la cuenta del banco real) bajo el
+  // MISMO cfdiUuid. Antes, `cfdiUuid-poliza-generator.service.js` evitaba a
+  // propósito este cruce quitándole el cfdiUuid al Cargo de Tarjeta/
+  // Transferencia (para que el emparejamiento por uuid de abajo no lo
+  // arrastrara junto con la porción Efectivo) — pero eso también le quitaba
+  // la única llave que `consolidarCargos` necesita para resolver el depósito
+  // bancario real (número de autorización/referencia) de esa línea, dejándola
+  // anónima dentro de "Depósitos consolidados". Al exigir aquí MISMA cuenta
+  // (no solo mismo uuid), el cfdiUuid se puede restaurar sin riesgo: la
+  // cuenta puente del Abono de Tarjeta/Transferencia nunca coincide con la
+  // cuenta de banco real de su propio Cargo, así que nunca calificará para
+  // este emparejamiento (solo Efectivo, que sí comparte cuenta a propósito).
+  const _cuentasCobradasPorSucursalPorUuid = new Map();
+  for (const m of movimientos) {
+    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0) && m.cfdiUuid != null) {
+      const set = _cuentasCobradasPorSucursalPorUuid.get(m.cfdiUuid) ?? new Set();
+      set.add(m.cuenta?.codigo);
+      _cuentasCobradasPorSucursalPorUuid.set(m.cfdiUuid, set);
+    }
+  }
   // Fallback SOLO para pares sin cfdiUuid: un ticket "pendiente por facturar"
   // (sin factura todavía) cobrado en otra sucursal llega con AMBAS líneas del
   // par (Venta debe / Cobro Sucursal haber) con cfdiUuid null — ver
@@ -2104,12 +2121,16 @@ function _extraerCobrosSucursal(movimientos) {
     if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre)) { resto.push(m); continue; }
     // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
     // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
-    // Usa cfdiUuid para identificar el par de forma determinista: el mismo
-    // UUID que tiene la entrada 'Cobro Sucursal' DEBE de cobros-sucursal-puente
-    // identifica sin ambigüedad la 'Venta' DEBE de cfdiToMovimientos.
+    // Usa cfdiUuid + MISMA CUENTA para identificar el par de forma
+    // determinista: el mismo UUID que tiene la entrada 'Cobro Sucursal' DEBE
+    // de cobros-sucursal-puente identifica sin ambigüedad la 'Venta' DEBE de
+    // cfdiToMovimientos, pero exigir también la cuenta evita arrastrar la
+    // porción Tarjeta/Transferencia de un ticket mixto solo porque comparte
+    // uuid con su porción Efectivo (ver comentario en
+    // `_cuentasCobradasPorSucursalPorUuid` arriba).
     if (m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
         && (
-          (m.cfdiUuid != null && _uuidsCobradosPorSucursal.has(m.cfdiUuid))
+          (m.cfdiUuid != null && _cuentasCobradasPorSucursalPorUuid.get(m.cfdiUuid)?.has(m.cuenta?.codigo))
           || (m.cfdiUuid == null && _conceptosCobradosPorSucursalSinUuid.has(`${m.concepto || ''}|${Number(m.debe).toFixed(2)}`))
         )) {
       // Ver `_uuidsAutoCanceladosCOS` arriba — el par neta $0 en la misma

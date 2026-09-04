@@ -1303,6 +1303,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // mostrar el folio de factura llevaba a buscar un ticket equivocado en
           // Kore y comparar contra un saldo que no correspondía).
           const serFolTicket = `${cuenta.serieVenta || serie}-${cuenta.folioVenta ? String(cuenta.folioVenta) : folio}`;
+          if (process.env.DEBUG_COS_TICKET && serFolTicket.includes(process.env.DEBUG_COS_TICKET)) {
+            console.warn(`[DEBUG_COS_PUSH] claveFac=${k} serFolTicket=${serFolTicket} monto=${monto} claveSat=${fp.claveSat} folioOrigen=${cobro.folioOrigen}`);
+          }
           cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, serFolTicket, folioOrigen: cobro.folioOrigen ?? null });
         }
       }
@@ -4111,6 +4114,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Para PUE: Cargo a Caja/Bancos (el ingreso real) + Abono a la misma cuenta
   // (contrapartida que cuadra contra la póliza de la sucursal vendedora).
   const _ccCobradora = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+  if (process.env.DEBUG_COS_TICKET) {
+    console.warn(`[DEBUG_COS_GATE] serieDelCentroProp=${serieDelCentroProp} _ccCobradora=${JSON.stringify(_ccCobradora)} cobrosCobradoraDirectaProp.length=${cobrosCobradoraDirectaProp.length}`);
+  }
   if (cobrosCobradoraDirectaProp.length > 0 && _ccCobradora) {
     const cuentaCajaIdDir   = cuentaMap[CODIGO_CUENTA_CAJA]   ?? null;
     const cuentaBancosIdDir = cuentaMap[CODIGO_CUENTA_BANCOS] ?? null;
@@ -4141,12 +4147,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // Mongo). Mostrar el folio de factura llevaba a buscar un ticket
       // equivocado en Kore (confirmado con el usuario 2026-08-17).
       const _serFol = serFolTicket || (claveFac ?? '');
+      const _esDebug = process.env.DEBUG_COS_TICKET && serFolTicket && serFolTicket.includes(process.env.DEBUG_COS_TICKET);
       // Saltar si la cola ya tiene este cobro — el DEBE+HABER de cobradora
       // ya lo generó `construirMovimientosPuente` (en movsPuente arriba).
       // Incluirlo aquí también inflaría el consolidado por partida doble
       // (bug real: Hidalgo EFECTIVO $215k vs $147k esperado, 2026-08-15).
-      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) continue;
-      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) continue;
+      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) {
+        if (_esDebug) console.warn(`[DEBUG_COS_SKIP] saltado por _uuidsYaEnPuente cfdiUuid=${cfdiUuid}`);
+        continue;
+      }
+      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) {
+        if (_esDebug) console.warn(`[DEBUG_COS_SKIP] saltado por _foliosYaEnPuente folioOrigen=${folioOrigen}`);
+        continue;
+      }
+      if (_esDebug) console.warn(`[DEBUG_COS_OK] serFolTicket=${serFolTicket} monto=${monto} cuentaDir=${cuentaDir} cfdiUuid=${cfdiUuid} nombre=${nombre}`);
       const _concepto = nombre ? `${nombre} / ${_serFol}` : _serFol;
       const baseDir = {
         concepto:      _concepto.slice(0, 255) || 'Cobro Suc. Ajena',

@@ -523,20 +523,26 @@ async function construirMovimientosPuente({
   // `CobroSucursalPendiente`: si algo no llega por aquí (fuera del rango de
   // fechas, endpoint caído, etc.), la cola sigue siendo la red de seguridad.
   centroPropioClave,
-  // Map `${cfdi.serie}|${cfdi.folio}` → detalle de SF usado por esa factura
-  // (salida de `_prefetchAjustesFacturaPropia`, cfdi-poliza-generator.service.js)
-  // — si una factura YA aparece aquí, `cfdiToMovimientos` (loop principal, más
-  // abajo en el pipeline) ya va a emitir su propia línea de SF usado con el
-  // split por origen (una línea por cada devolución/generación distinta, ver
-  // `emitirLineaSF` en cfdi-mapping.service.js). El bloque APA de esta función
-  // (más abajo) debe OMITIRSE por completo para esas facturas — si no, agrega
-  // una línea extra con el monto TOTAL combinado, duplicando lo que el split
-  // por origen ya cubre línea por línea (bug real 2026-09-04, caso Ferrocarril
-  // 1-sep, factura F0-260800614: el split por origen ya emitía 2 líneas de SF,
-  // y este bloque agregaba una TERCERA con el total — literal la suma de las
-  // otras dos. `_deduplicarSFRedundante` no lo detecta porque solo compara
-  // montos EXACTOS, y aquí nunca coinciden: 2 líneas parciales vs. 1 total).
-  saldoFavorUsadoMap = new Map(),
+  // Set de `${ventaSerie}|${ventaFolio}` — la VENTA GENERADORA de saldo a
+  // favor (no la factura consumidora) que `cfdiToMovimientos` (loop
+  // principal, cfdi-poliza-generator.service.js) YA va a cubrir con su
+  // propia línea de SF usado, split por origen (una línea por cada
+  // devolución/generación distinta — ver `emitirLineaSF`/`d.ventaSerie`/
+  // `d.ventaFolio` en cfdi-mapping.service.js, y cómo se arma este set en
+  // `_prefetchAjustesFacturaPropia`). El bloque APA de esta función (más
+  // abajo) debe OMITIRSE por completo para esas ventas — si no, agrega una
+  // línea extra con el monto TOTAL combinado, duplicando lo que el split
+  // por origen ya cubre línea por línea (bug real 2026-09-04, caso
+  // Ferrocarril 1-sep, venta generadora F0-260800614: el split por origen ya
+  // emitía 2 líneas de SF —una por cada devolución de esa venta—, y este
+  // bloque agregaba una TERCERA con el total combinado, literal la suma de
+  // las otras dos. `_deduplicarSFRedundante` no lo detecta porque solo
+  // compara montos EXACTOS, y aquí nunca coinciden: 2 líneas parciales vs. 1
+  // total). OJO: correlacionar por la factura consumidora (`cfdiOriginal`,
+  // vía documentosRelacionados) NO sirve aquí — se intentó primero y dio
+  // folio distinto al esperado, porque F0-260800614 es la venta GENERADORA,
+  // no la consumidora.
+  ventasSFCubiertasPorSplit = new Set(),
 }) {
   const vacio = { movimientos: [], facturasVendedorCubiertas: new Map(), facturasPPDCubiertas: new Map(), pendientesPorFacturar: [] };
   if (!centroCostoId || !cuentaCajaId || !cuentaBancosId) return vacio;
@@ -1111,12 +1117,15 @@ async function construirMovimientosPuente({
     // (poblado desde saldosFavorGenerados[].usos[]). Política confirmada
     // 2026-08-17: si el SF se usó ese día, va en esa póliza sin importar
     // cuándo se generó ni el período de la venta original.
-    // Ver comentario en el parámetro `saldoFavorUsadoMap` (arriba, definición
-    // de la función): si `cfdiToMovimientos` YA va a cubrir el SF usado de
-    // esta factura (split por origen), este bloque completo se omite para
-    // no duplicar — confirmado con caso real 2026-09-04.
-    const _yaLoCubreSplitPorOrigen = !!cfdiOriginal
-      && saldoFavorUsadoMap.has(`${cfdiOriginal.serie}|${cfdiOriginal.folio}`);
+    // Ver comentario en el parámetro `ventasSFCubiertasPorSplit` (arriba,
+    // definición de la función): si `cfdiToMovimientos` YA va a cubrir el SF
+    // usado de esta VENTA GENERADORA (split por origen), este bloque completo
+    // se omite para no duplicar — confirmado con caso real 2026-09-04. Se usa
+    // `cuenta.serieVenta/folioVenta` (la venta generadora que este `cuenta`
+    // representa aquí, NO la factura consumidora — ver `usadosPorCuenta`,
+    // poblado desde `saldosFavorGenerados[].usos[]`), la MISMA referencia que
+    // `d.ventaSerie/d.ventaFolio` en `emitirLineaSF`/cfdi-mapping.service.js.
+    const _yaLoCubreSplitPorOrigen = ventasSFCubiertasPorSplit.has(`${cuenta.serieVenta}|${cuenta.folioVenta}`);
     if (!esPPD && !_yaLoCubreSplitPorOrigen && cuentaSaldoFavorId && cuentaIvaSaldoFavorId) {
       const sfUsadosVenta = (usadosPorCuenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
         .filter(u => {

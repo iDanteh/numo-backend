@@ -1309,6 +1309,16 @@ function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true) 
   return resultado;
 }
 
+// Un link `finalizadoManualmente` (vino de cobro-panel/Solicitudes de Cobro, con saldoErp
+// ya fijado por un humano en el momento de aplicar el cobro) NUNCA vuelve a recalcular su
+// aporte en _recomputeErpKoreJob — CORRECCIÓN 2026-09-04, pedido explícito del usuario: ese
+// saldoErp es la fuente de la verdad definitiva, no algo que este job deba corregir después.
+// El flujo tradicional (botón "Guardar", sin fechaAnclaAlterna — nunca cumple
+// finalizadoManualmente) sigue recalculando exactamente igual que antes, sin cambios.
+function _debeRecalcularAporte(esHumano, finalizadoManualmente) {
+  return esHumano && !finalizadoManualmente;
+}
+
 // Piso de aporte para un depósito bancario ya vinculado por un HUMANO: nunca debe bajar en
 // una corrida posterior de "Recalcular saldo ERP", sin importar la causa (retención,
 // cancelación, devolución — CAC/DEV/RET, o cualquier otro ajuste que Kore aplique después).
@@ -1982,10 +1992,12 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
 
           // Vínculo humano: recalcula el aporte con el criterio nuevo (todas las formas de
           // pago) — vínculo de motor: se deja intacto, solo recibe el backfill del snapshot.
+          // Ver _debeRecalcularAporte() arriba: un link finalizadoManualmente nunca entra
+          // acá — solo recibe el backfill de folioFiscal/trazabilidad, más abajo.
           const esHumano  = _erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId);
           let aporteNuevo = link.saldoErpAportado ?? null;
           let cambioAporte = false;
-          if (esHumano) {
+          if (_debeRecalcularAporte(esHumano, finalizadoManualmente)) {
             // calculado puede venir null (ninguna entrada de Kore trae el Aut/Numo de ESTE
             // movimiento) — _aporteConRatchet decide el piso a usar en ese caso. Generaliza
             // el fix 2026-07-29 (folio 036030, retención sin formasPago real) y agrega el
@@ -3026,6 +3038,7 @@ router._aportesPorErpIdCronologico  = _aportesPorErpIdCronologico;
 router._esFormaPagoBancariaKore     = _esFormaPagoBancariaKore;
 router._montoSaldoLinkPorAutorizacion = _montoSaldoLinkPorAutorizacion;
 router._aporteConRatchet            = _aporteConRatchet;
+router._debeRecalcularAporte        = _debeRecalcularAporte;
 router._FILTRO_LINK_ATRAPADO        = _FILTRO_LINK_ATRAPADO;
 router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;

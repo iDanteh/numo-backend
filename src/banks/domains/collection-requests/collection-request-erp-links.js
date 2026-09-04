@@ -61,10 +61,15 @@ function matchBancoDefault(bancos, movBanco) {
 
 // erpLinks[] a pasar a bankService.setErpIds() — mismo cálculo que
 // _buildCobroSaldosErp() en cobro-panel.component.ts:
-//   - saldoActual: saldo EN VIVO de Kore (antes de este cobro) menos lo pagado ahora.
+//   - saldoActual: saldo EN VIVO de Kore (antes de este cobro) menos lo pagado ahora,
+//     SIEMPRE con el total pagado sin importar la forma (es el saldo real en Kore).
 //   - saldoPagado: acumulado de formas BANCARIAS (transferencia/cheque/depósito) —
 //     alimenta el badge de la tabla de bancos.
-//   - saldoPagadoTotal: acumulado de CUALQUIER forma — alimenta saldoErp.
+//   - saldoPagadoTotal: CORRECCIÓN 2026-09-04 (pedido explícito del usuario) — antes
+//     acumulaba CUALQUIER forma; ahora es EXACTAMENTE igual a saldoPagado (solo
+//     bancario). Alimenta saldoErp (aplicarLogicaErp en bank.service.js, que suma
+//     saldoPagadoTotal de cada link) — otras formas (ej. Anticipos) ya no lo tocan,
+//     aunque siguen íntegras en desglosePorFormaPago para mostrarse como "Otros".
 //   - desglosePorFormaPago: bitácora de auditoría, una entrada por cada forma de pago
 //     usada en ESTE cobro — igual que hace cobro-panel.component.ts.
 // Los 3 acumulados/bitácora se suman sobre lo que ya tuviera el erpLink existente (por
@@ -134,8 +139,13 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks, opts = {}) {
     const totalPaid = formasPagoGrupo.reduce((s, f) => s + f.importe, 0);
     const bancoPaid = formasPagoGrupo.filter(esFormaBancaria).reduce((s, f) => s + f.importe, 0);
     const desglose  = formasPagoGrupo.flatMap(f => _desgloseDe(f, f.importe));
+    // saldoActualPagadoTotal SIGUE usando totalPaid (todas las formas) — es el saldo REAL
+    // de la CxC en Kore, que baja sin importar la forma de pago. Distinto de
+    // saldoPagadoTotal (abajo), que alimenta saldoErp y desde el 2026-09-04 (pedido
+    // explícito del usuario) es SOLO bancario — el resto (ej. Anticipos) sigue existiendo
+    // íntegro en desglosePorFormaPago, solo deja de sumar a saldoErp.
     const saldoActualPagadoTotal = pagadoTotalCxc ?? totalPaid;
-    nuevos = [_link(cr.cxcs[0], bancoPaid, totalPaid, desglose, saldoActualPagadoTotal)];
+    nuevos = [_link(cr.cxcs[0], bancoPaid, bancoPaid, desglose, saldoActualPagadoTotal)];
   } else {
     // Modo 2 — 1 sola forma de pago global, repartida entre N CxC: cada CxC recibe UNA
     // entrada de desglose con la misma forma de pago y el monto que le tocó (montoAsignado).
@@ -145,7 +155,10 @@ function buildErpLinksParaCobro(cr, cuentasKore, existingLinks, opts = {}) {
     nuevos = cr.cxcs.map(cxc => {
       const paid     = cxc.montoAsignado ?? 0;
       const desglose = _desgloseDe(cr.formasPago[0], paid);
-      return _link(cxc, esBancaria ? paid : 0, paid, desglose, paid);
+      // saldoActual (5to arg) sigue usando `paid` completo (saldo real en Kore); saldoPagado
+      // y saldoPagadoTotal (2do/3er arg) ahora son el mismo valor bancario-filtrado — ver
+      // comentario de Modo 1.
+      return _link(cxc, esBancaria ? paid : 0, esBancaria ? paid : 0, desglose, paid);
     });
   }
 

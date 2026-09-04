@@ -21,7 +21,10 @@ const bankService = require('./bank.service');
 
 function fakeMov(overrides = {}) {
   return {
-    _id: 'mov-1', banco: 'BBVA', ficha: null, fichaBy: null, fichaNombre: null, fichaAt: null,
+    // `folio` (consecutivo de NUMO, asignado por Counter) — base del nombre del
+    // documento en Drive desde el 2026-09-04. Distinto de `ficha` (folio físico
+    // que tipea el contador a mano).
+    _id: 'mov-1', banco: 'BBVA', folio: '00123', ficha: null, fichaBy: null, fichaNombre: null, fichaAt: null,
     fichaDriveFileId: null, fichaDriveWebViewLink: null, fichaDriveMimeType: null,
     status: 'no_identificado', erpLinks: [], primeraIdentificacionAt: null, primeraIdentificacionPor: null,
     save: jest.fn(function () { return Promise.resolve(this); }),
@@ -85,14 +88,14 @@ describe('adjuntarImagenFicha', () => {
   const IMAGEN = { buffer: Buffer.from('img'), mimetype: 'image/png', originalname: 'ficha.png' };
 
   test('sube bien y setea fichaDriveFileId/fichaDriveWebViewLink/fichaDriveMimeType', async () => {
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'user-1' });
+    const mov = fakeMov({ folio: '00123' });
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
     subirImagenFicha.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: 'https://drive/file-1' });
 
-    const result = await bankService.adjuntarImagenFicha('mov-1', IMAGEN, USER);
+    const result = await bankService.adjuntarImagenFicha('mov-1', IMAGEN);
 
-    // Pedido 2026-09-04: el nombre en Drive es "folio - banco.ext", no el nombre
-    // original del archivo subido — facilita rastrear el movimiento buscando en Drive.
+    // CORRECCIÓN 2026-09-04: el nombre en Drive usa mov.folio (consecutivo de NUMO,
+    // único y estable) + banco, NUNCA mov.ficha (texto libre, puede variar/repetirse).
     expect(subirImagenFicha).toHaveBeenCalledWith(IMAGEN.buffer, IMAGEN.mimetype, '00123 - BBVA.png');
     expect(mov.fichaDriveFileId).toBe('file-1');
     expect(mov.fichaDriveWebViewLink).toBe('https://drive/file-1');
@@ -108,53 +111,46 @@ describe('adjuntarImagenFicha', () => {
     });
   });
 
+  test('funciona aunque el movimiento NO tenga ficha registrada todavía (documento independiente)', async () => {
+    const mov = fakeMov({ folio: '00123', ficha: null, fichaBy: null });
+    BankMovement.findById = jest.fn().mockResolvedValue(mov);
+    subirImagenFicha.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: null });
+
+    const result = await bankService.adjuntarImagenFicha('mov-1', IMAGEN);
+
+    expect(subirImagenFicha).toHaveBeenCalledWith(IMAGEN.buffer, IMAGEN.mimetype, '00123 - BBVA.png');
+    expect(result.fichaDriveFileId).toBe('file-1');
+  });
+
+  test('movimiento legacy sin folio asignado: usa el _id como respaldo del nombre', async () => {
+    const mov = fakeMov({ folio: null });
+    BankMovement.findById = jest.fn().mockResolvedValue(mov);
+    subirImagenFicha.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: null });
+
+    await bankService.adjuntarImagenFicha('mov-1', IMAGEN);
+
+    expect(subirImagenFicha).toHaveBeenCalledWith(IMAGEN.buffer, IMAGEN.mimetype, 'mov-1 - BBVA.png');
+  });
+
   test('archivo sin extensión en el nombre original (ej. foto de cámara): usa la extensión del mimetype', async () => {
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'user-1', banco: 'Santander' });
+    const mov = fakeMov({ folio: '00123', banco: 'Santander' });
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
     subirImagenFicha.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: null });
     const imagenSinExtension = { buffer: Buffer.from('img'), mimetype: 'image/jpeg', originalname: 'IMG20260904' };
 
-    await bankService.adjuntarImagenFicha('mov-1', imagenSinExtension, USER);
+    await bankService.adjuntarImagenFicha('mov-1', imagenSinExtension);
 
     expect(subirImagenFicha).toHaveBeenCalledWith(imagenSinExtension.buffer, imagenSinExtension.mimetype, '00123 - Santander.jpg');
   });
 
   test('folio con caracteres inválidos para un nombre de archivo: los quita antes de armar el nombre', async () => {
-    const mov = fakeMov({ ficha: '00/123:00', fichaBy: 'user-1' });
+    const mov = fakeMov({ folio: '00/123:00' });
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
     subirImagenFicha.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: null });
 
-    await bankService.adjuntarImagenFicha('mov-1', IMAGEN, USER);
+    await bankService.adjuntarImagenFicha('mov-1', IMAGEN);
 
     expect(subirImagenFicha).toHaveBeenCalledWith(IMAGEN.buffer, IMAGEN.mimetype, '0012300 - BBVA.png');
-  });
-
-  test('movimiento sin ficha registrada: BadRequestError, no sube nada', async () => {
-    const mov = fakeMov({ ficha: null });
-    BankMovement.findById = jest.fn().mockResolvedValue(mov);
-
-    await expect(bankService.adjuntarImagenFicha('mov-1', IMAGEN, USER)).rejects.toThrow(/no tiene ficha registrada/);
-    expect(subirImagenFicha).not.toHaveBeenCalled();
-  });
-
-  test('usuario sin permiso (no admin, no autor): ForbiddenError, no sube nada', async () => {
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'otro-user' });
-    BankMovement.findById = jest.fn().mockResolvedValue(mov);
-
-    await expect(bankService.adjuntarImagenFicha('mov-1', IMAGEN, USER)).rejects.toThrow(/Solo el usuario/);
-    expect(subirImagenFicha).not.toHaveBeenCalled();
-  });
-
-  test('admin puede adjuntar aunque no sea el autor de la ficha', async () => {
-    const admin = { _id: 'admin-1', nombre: 'Root', role: 'admin' };
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'otro-user' });
-    BankMovement.findById = jest.fn().mockResolvedValue(mov);
-    subirImagenFicha.mockResolvedValue({ driveFileId: 'file-2', driveWebViewLink: null });
-
-    const result = await bankService.adjuntarImagenFicha('mov-1', IMAGEN, admin);
-
-    expect(subirImagenFicha).toHaveBeenCalledTimes(1);
-    expect(result.fichaDriveFileId).toBe('file-2');
   });
 });
 
@@ -198,48 +194,31 @@ describe('deleteFicha', () => {
     expect(emitToAll).not.toHaveBeenCalled();
   });
 
-  test('con fichaDriveFileId seteado: intenta borrar la imagen de Drive best-effort', async () => {
+  test('CORRECCIÓN 2026-09-04: con un documento ya adjuntado, deleteFicha() NO lo toca — el documento es independiente de la ficha', async () => {
     const mov = fakeMov({
       ficha: '00123', fichaBy: 'user-1', fichaDriveFileId: 'file-1',
       fichaDriveWebViewLink: 'https://drive/file-1', fichaDriveMimeType: 'image/png',
     });
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
-    eliminarImagenFicha.mockResolvedValue({});
 
     const result = await bankService.deleteFicha('mov-1', USER);
 
-    expect(eliminarImagenFicha).toHaveBeenCalledWith('file-1');
-    expect(mov.fichaDriveFileId).toBeNull();
-    expect(mov.fichaDriveWebViewLink).toBeNull();
-    expect(mov.fichaDriveMimeType).toBeNull();
-    // Bug real 2026-09-04: el modelo ya limpiaba estos campos, pero el return/emit
-    // no los incluía — el frontend usa esta forma para actualizar su copia local, y
-    // sin esto "ver documento" seguía apareciendo para un archivo ya borrado.
-    expect(result).toEqual(expect.objectContaining({
-      fichaDriveFileId: null, fichaDriveWebViewLink: null, fichaDriveMimeType: null,
-    }));
-    expect(emitToBanco).toHaveBeenCalledWith('BBVA', 'bank:movement:updated', expect.objectContaining({
-      fichaDriveFileId: null, fichaDriveWebViewLink: null, fichaDriveMimeType: null,
-    }));
-  });
-
-  test('si el borrado de Drive falla, deleteFicha() igual devuelve éxito (best-effort, no bloqueante)', async () => {
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'user-1', fichaDriveFileId: 'file-1' });
-    BankMovement.findById = jest.fn().mockResolvedValue(mov);
-    eliminarImagenFicha.mockRejectedValue(new Error('Drive no disponible'));
-
-    await expect(bankService.deleteFicha('mov-1', USER)).resolves.toEqual(
-      expect.objectContaining({ _id: 'mov-1', ficha: null }),
-    );
-
-    // Deja que el .catch() interno de la promesa best-effort corra antes de terminar el test.
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(eliminarImagenFicha).toHaveBeenCalledWith('file-1');
+    // El folio se borra (comportamiento de siempre), pero el documento SOBREVIVE —
+    // ya no depende del campo `ficha` (que puede ser variable/no confiable), sino
+    // de mov.folio (el consecutivo estable de NUMO).
+    expect(mov.ficha).toBeNull();
+    expect(mov.fichaDriveFileId).toBe('file-1');
+    expect(mov.fichaDriveWebViewLink).toBe('https://drive/file-1');
+    expect(mov.fichaDriveMimeType).toBe('image/png');
+    expect(eliminarImagenFicha).not.toHaveBeenCalled();
+    expect(result).not.toHaveProperty('fichaDriveFileId');
+    expect(emitToBanco).toHaveBeenCalledWith('BBVA', 'bank:movement:updated',
+      expect.not.objectContaining({ fichaDriveFileId: expect.anything() }));
   });
 });
 
 describe('quitarImagenFicha', () => {
-  test('quita el documento sin tocar el folio, borra la imagen de Drive best-effort', async () => {
+  test('quita el documento sin tocar el folio/ficha, borra la imagen de Drive best-effort', async () => {
     const mov = fakeMov({
       ficha: '00123', fichaBy: 'user-1', fichaDriveFileId: 'file-1',
       fichaDriveWebViewLink: 'https://drive/file-1', fichaDriveMimeType: 'image/png',
@@ -247,9 +226,9 @@ describe('quitarImagenFicha', () => {
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
     eliminarImagenFicha.mockResolvedValue({});
 
-    const result = await bankService.quitarImagenFicha('mov-1', USER);
+    const result = await bankService.quitarImagenFicha('mov-1');
 
-    // El folio y su autoría NO se tocan — es la diferencia clave con deleteFicha().
+    // El folio y su autoría NO se tocan.
     expect(mov.ficha).toBe('00123');
     expect(mov.fichaBy).toBe('user-1');
     expect(mov.fichaDriveFileId).toBeNull();
@@ -265,32 +244,23 @@ describe('quitarImagenFicha', () => {
     });
   });
 
+  test('funciona sin ficha registrada (documento adjuntado antes de tipear el folio físico, sin fichaBy con quién comparar)', async () => {
+    const mov = fakeMov({ ficha: null, fichaBy: null, fichaDriveFileId: 'file-1' });
+    BankMovement.findById = jest.fn().mockResolvedValue(mov);
+    eliminarImagenFicha.mockResolvedValue({});
+
+    const result = await bankService.quitarImagenFicha('mov-1');
+
+    expect(result.fichaDriveFileId).toBeNull();
+  });
+
   test('movimiento sin documento adjunto: BadRequestError, no borra nada', async () => {
     const mov = fakeMov({ ficha: '00123', fichaBy: 'user-1', fichaDriveFileId: null });
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
 
-    await expect(bankService.quitarImagenFicha('mov-1', USER)).rejects.toThrow(/no tiene ningún documento adjunto/);
+    await expect(bankService.quitarImagenFicha('mov-1')).rejects.toThrow(/no tiene ningún documento adjunto/);
     expect(eliminarImagenFicha).not.toHaveBeenCalled();
     expect(mov.save).not.toHaveBeenCalled();
-  });
-
-  test('usuario sin permiso (no admin, no autor): ForbiddenError, no borra nada', async () => {
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'otro-user', fichaDriveFileId: 'file-1' });
-    BankMovement.findById = jest.fn().mockResolvedValue(mov);
-
-    await expect(bankService.quitarImagenFicha('mov-1', USER)).rejects.toThrow(/Solo el usuario/);
-    expect(eliminarImagenFicha).not.toHaveBeenCalled();
-  });
-
-  test('admin puede quitar el documento aunque no sea el autor de la ficha', async () => {
-    const admin = { _id: 'admin-1', nombre: 'Root', role: 'admin' };
-    const mov = fakeMov({ ficha: '00123', fichaBy: 'otro-user', fichaDriveFileId: 'file-1' });
-    BankMovement.findById = jest.fn().mockResolvedValue(mov);
-    eliminarImagenFicha.mockResolvedValue({});
-
-    const result = await bankService.quitarImagenFicha('mov-1', admin);
-
-    expect(result.fichaDriveFileId).toBeNull();
   });
 
   test('si el borrado de Drive falla, igual devuelve éxito (best-effort, no bloqueante)', async () => {
@@ -298,7 +268,7 @@ describe('quitarImagenFicha', () => {
     BankMovement.findById = jest.fn().mockResolvedValue(mov);
     eliminarImagenFicha.mockRejectedValue(new Error('Drive no disponible'));
 
-    await expect(bankService.quitarImagenFicha('mov-1', USER)).resolves.toEqual(
+    await expect(bankService.quitarImagenFicha('mov-1')).resolves.toEqual(
       expect.objectContaining({ _id: 'mov-1', fichaDriveFileId: null }),
     );
 
@@ -309,7 +279,7 @@ describe('quitarImagenFicha', () => {
   test('movimiento inexistente: NotFoundError', async () => {
     BankMovement.findById = jest.fn().mockResolvedValue(null);
 
-    await expect(bankService.quitarImagenFicha('mov-x', USER)).rejects.toThrow('Movimiento');
+    await expect(bankService.quitarImagenFicha('mov-x')).rejects.toThrow('Movimiento');
     expect(eliminarImagenFicha).not.toHaveBeenCalled();
   });
 });

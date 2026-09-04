@@ -242,30 +242,29 @@ router.delete('/movements/:id/ficha',
   }),
 );
 
-// POST /api/banks/movements/:id/ficha/imagen — adjunta la foto/documento de respaldo de una
-// ficha YA registrada. Pedido explícito del usuario (2026-09-03): se sube en el mismo momento
-// de registrar la ficha desde el modal ERP, como un 2do request inmediato tras el PATCH de
-// arriba (no se combinó en un solo endpoint multipart para no tocar el contrato JSON ya
-// funcionando de PATCH .../ficha, y porque este endpoint también sirve para adjuntar/
-// reemplazar la imagen más adelante si hiciera falta).
+// POST /api/banks/movements/:id/ficha/imagen — adjunta la foto/documento de respaldo del
+// depósito a Drive. CORRECCIÓN 2026-09-04 (pedido explícito del usuario): independiente de
+// la ficha — ya no exige que exista una ficha registrada primero (el nombre en Drive usa
+// mov.folio, el consecutivo de NUMO, no el campo `ficha`), y ya no restringe por autoría de
+// ficha (no tendría sentido sin autor todavía). El permiso de ruta ya es el único candado.
 router.post('/movements/:id/ficha/imagen',
   authenticate,
   permit('banks:ficha'),
   uploadFichaImagen.single('imagen'),
   asyncHandler(async (req, res) => {
     if (!req.file) throw new BadRequestError('No se recibió ningún archivo.');
-    res.json(await service.adjuntarImagenFicha(req.params.id, req.file, req.user));
+    res.json(await service.adjuntarImagenFicha(req.params.id, req.file));
   }),
 );
 
-// DELETE /api/banks/movements/:id/ficha/imagen — quita SOLO el documento de respaldo, sin
-// tocar el folio (pedido explícito del usuario, 2026-09-04: corregir un archivo adjuntado
+// DELETE /api/banks/movements/:id/ficha/imagen — quita el documento de respaldo, sin tocar
+// el folio/ficha (pedido explícito del usuario, 2026-09-04: corregir un archivo adjuntado
 // por error no debería obligar a borrar y volver a registrar la ficha entera).
 router.delete('/movements/:id/ficha/imagen',
   authenticate,
   permit('banks:ficha'),
   asyncHandler(async (req, res) => {
-    res.json(await service.quitarImagenFicha(req.params.id, req.user));
+    res.json(await service.quitarImagenFicha(req.params.id));
   }),
 );
 

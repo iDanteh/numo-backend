@@ -3752,7 +3752,17 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     // Saldo a favor generado por esta Devolución (ver
     // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`).
-    const lineasSaldoFavorProp = await _inyectarSaldoFavorGenerado({
+    // BUG CORREGIDO 2026-09-04 (caso real Reforma, JOSE IRAN SUAREZ LINARES,
+    // DEV-057088 $976.23): cuando la propia regla de ESTA Devolución/
+    // Cancelación es de anticipo (`rule.cuentaIvaAnticipo`, ver `esAnticipo`
+    // en cfdi-mapping.service.js), `cfdiToMovimientos` YA contabilizó el
+    // crédito completo como pasivo de Anticipos (2103010001) en el Cargo/Abono
+    // normal de este mismo cfdi, arriba en este mismo loop — inyectar TAMBIÉN
+    // la línea de "SF generado" (2103090001) duplicaba el mismo crédito por
+    // partida doble (confirmado con el ERP real: `saldosFavorGenerados[0]
+    // .usos` vacío, un solo evento, nunca usado — la duplicación era 100%
+    // nuestra, no un cálculo distinto de dos usos reales).
+    const lineasSaldoFavorProp = rule?.cuentaIvaAnticipo ? [] : await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
       cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
@@ -5202,8 +5212,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     // Saldo a favor generado por esta Devolución — ver comentario
-    // equivalente en generarPropuesta.
-    const lineasSaldoFavorGuard = await _inyectarSaldoFavorGenerado({
+    // equivalente en generarPropuesta (bug de doble-contabilización con
+    // Anticipos, corregido 2026-09-04).
+    const lineasSaldoFavorGuard = rule?.cuentaIvaAnticipo ? [] : await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
       cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,

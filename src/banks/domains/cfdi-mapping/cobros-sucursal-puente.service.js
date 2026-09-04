@@ -730,17 +730,25 @@ async function construirMovimientosPuente({
       });
       for (const cuenta of resultadoDirecto) {
         const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
-        // En la consulta por centro+fecha el ERP devuelve el dato desde la
-        // perspectiva de la venta GEN: cuenta.serieVenta|folioVenta = GEN venta,
-        // y saldosFavorUsados[].serieVenta|folioVenta = USE venta (la que aplicó
-        // el saldo). Se indexa por USE venta para que el SF-APA fallback y el
-        // loop de cobros la encuentren (distinto al path por-folio, donde la
-        // cuenta misma ya es la USE venta y se indexa directamente por su clave).
+        // BUG CORREGIDO 2026-09-04 (caso real B0-260900253/257, confirmado
+        // contra el ERP con `obtenerSaldosFavorPorCentro`): el comentario
+        // original de este bloque asumía que en la consulta "por centro"
+        // `cuenta.serieVenta|folioVenta` = venta GEN y
+        // `saldosFavorUsados[].serieVenta|folioVenta` = venta USE — es AL
+        // REVÉS. Se verificó con datos reales: la cuenta de la venta
+        // CONSUMIDORA (B0-260900257) es la que trae el `saldosFavorUsados[]`
+        // no vacío, y cada `uso` dentro de él trae `serieVenta|folioVenta` de
+        // la venta que GENERÓ el saldo (B0-260900253, la ORIGEN) — exactamente
+        // el mismo significado que `d.ventaSerie/d.ventaFolio` en
+        // `_prefetchAjustesFacturaPropia` (cfdi-poliza-generator.service.js).
+        // Indexar por `usoKey` (antes) creaba una entrada FANTASMA bajo la
+        // venta GENERADORA como si ella misma hubiera consumido el saldo —
+        // la cuenta misma (`key`, igual que en el path por-folio de arriba)
+        // ya ES la venta consumidora, así que se indexa por ella.
         for (const uso of (cuenta.saldosFavorUsados ?? [])) {
-          const usoKey = `${uso.serieVenta}|${uso.folioVenta}`;
-          const existentesUso = usadosPorCuenta.get(usoKey) ?? [];
+          const existentesUso = usadosPorCuenta.get(key) ?? [];
           if (!existentesUso.some(e => e.serieOrigen === uso.serieOrigen && String(e.folioOrigen) === String(uso.folioOrigen))) {
-            usadosPorCuenta.set(usoKey, [...existentesUso, uso]);
+            usadosPorCuenta.set(key, [...existentesUso, uso]);
           }
         }
         // El ERP indexa los SF por la venta GEN (no por la venta USO), así

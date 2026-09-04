@@ -1525,11 +1525,17 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
  * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza — tampoco
  * hay Cargo de cierre que agregar en el caller, porque no hay líneas).
  */
-async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc }) {
+async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc, origenesConvertidosAAnticipo }) {
   if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
   const marcador = (cfdi.documentosRelacionados ?? [])
     .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
   if (!marcador) return [];
+  // Ver comentario en `_prefetchCuentasPendientesAnticipo` — si Kore ya
+  // convirtió este mismo saldo en un Anticipo (Cuentas Pendientes lo declara
+  // en `anotacion`), no se vuelve a inyectar como SF: sería el mismo dinero
+  // contado dos veces (caso real Reforma, JOSE IRAN SUAREZ LINARES,
+  // DEV-057088 $976.23).
+  if (origenesConvertidosAAnticipo?.has(`${(marcador.Serie ?? '').toUpperCase()}|${marcador.Folio}`)) return [];
   const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
   if (!generado?.monto) return [];
 
@@ -1714,6 +1720,120 @@ async function _resolverReferenciaOpaPorMonto(anticiposCfdi) {
     }
   }
   return mapa;
+}
+
+/**
+ * Consulta "Cuentas Pendientes" del ERP (CxC/Bancos, `/cuentas-pendientes` —
+ * distinto del endpoint de cajas usado en el resto de este archivo) para
+ * resolver Anticipos con más precisión que los 2 mecanismos anteriores:
+ *
+ * 1. Referencia OPA real: `_resolverReferenciaOpaPorMonto` busca un depósito
+ *    bancario (`BankMovement`) por monto+fecha del anticipo — si Bancos no
+ *    tiene ese movimiento conciliado, cae al folio crudo de la factura
+ *    ("OPA-260900026" en vez de "OPA-00837"). Cuentas Pendientes trae la
+ *    cuenta del anticipo con `serieExterna:'OPA'`/`folioExterno` — el
+ *    folio real, sin depender de Bancos.
+ * 2. Monto real aplicado a CADA venta: `context.montoAnticipoUsado` (desglose
+ *    de `/desgloses-cobro/almacen`) a veces no distingue la porción de
+ *    Anticipo — cuando eso pasa, el caller asume que el 100% de la venta se
+ *    cubrió con Anticipo, ignorando que esa venta pudo tener OTRO ajuste
+ *    (ej. una Bonificación) que ya redujo el saldo antes de aplicar el
+ *    Anticipo (bug real 2026-09-03, caso MARIA DE LOURDES SANCHEZ RIOS,
+ *    OPA-00837: 2 de 3 ventas mostraban el Anticipo aplicado por el TOTAL
+ *    completo de la venta —$1,722.65/$1,922.07— en vez del saldo real
+ *    después de su Bonificación de $60.60 —$1,662.04/$1,861.47—, confirmado
+ *    contra la cuenta saldada real de Kore). Cuentas Pendientes trae, por
+ *    cada venta, el movimiento de cierre con `formasPago[].nombreFormaPago
+ *    === 'ANTICIPO'` y su monto YA neto de cualquier otro ajuste.
+ *
+ * `fechas`: fechas de los CFDIs relevantes (anticipos Y ventas que los
+ * consumen) — se usa el mín/máx ±5 días (misma ventana que
+ * `_resolverReferenciaOpaPorMonto`) como rango de consulta, porque el
+ * endpoint exige `fechaDesde`/`fechaHasta` y no filtra por serie/folio de
+ * factura (solo por serie/folio INTERNO de ticket, que no conocemos aquí).
+ * Si el ERP falla o no hay fechas, regresa mapas vacíos — el caller sigue
+ * funcionando con los mecanismos anteriores como respaldo.
+ */
+async function _prefetchCuentasPendientesAnticipo(fechas) {
+  const montoAnticipoPorFactura = new Map();
+  const referenciaOpaPorFactura = new Map();
+  // BUG CORREGIDO 2026-09-04 (caso real Reforma, JOSE IRAN SUAREZ LINARES,
+  // DEV-057088 $976.23): confirmado con el usuario y con el propio ERP que
+  // cuando un Anticipo se genera a partir del saldo a favor de una
+  // Cancelación (Kore lo declara EXPLÍCITAMENTE en `anotacion`, ej. "Anticipo
+  // generado por el saldo a favor de la cancelación DEV-057088 de la venta
+  // D0-260900332"), ese saldo YA NO es un saldo a favor disponible — es el
+  // MISMO dinero, ahora representado como Anticipo. `_inyectarSaldoFavorGenerado`
+  // no tenía forma de saberlo (el CFDI del Anticipo, D0-260900064 en el caso
+  // real, no trae NINGUNA relación hacia la Cancelación en el propio CFDI —
+  // el vínculo solo existe en este texto libre de Cuentas Pendientes) y
+  // duplicaba el mismo crédito como pasivo de SF (2103090001) Y de Anticipos
+  // (2103010001) a la vez. Se parsea `anotacion` para armar el marcador
+  // (SERIE|FOLIO) de la cancelación ya "convertida" y excluirla más abajo.
+  const origenesConvertidosAAnticipo = new Set();
+  const fechasValidas = fechas.filter(Boolean).map(f => new Date(f)).filter(f => !isNaN(f.getTime()));
+  if (!fechasValidas.length) return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
+
+  const VENTANA_MS = 5 * 24 * 3600 * 1000;
+  const fechaDesde = new Date(Math.min(...fechasValidas.map(f => f.getTime())) - VENTANA_MS);
+  const fechaHasta = new Date(Math.max(...fechasValidas.map(f => f.getTime())) + VENTANA_MS);
+
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] fechaDesde=${fechaDesde.toISOString()} fechaHasta=${fechaHasta.toISOString()}`);
+  }
+  let cuentas;
+  try {
+    const resultado = await sincronizarCuentasPendientes({
+      fechaDesde: fechaDesde.toISOString(),
+      fechaHasta: fechaHasta.toISOString(),
+    });
+    cuentas = resultado.raw ?? [];
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] cuentas.length=${cuentas.length}`);
+    }
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.error(`[PolizaGen] /cuentas-pendientes fallo, se usan los mecanismos de respaldo: ${err.message}`);
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] FALLO: ${err.message}`);
+    }
+    return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
+  }
+
+  const _regexAnotacionCancelacion = /cancelaci[oó]n\s+([A-Z]+)-(\d+)/i;
+  for (const cuenta of cuentas) {
+    const matchAnotacion = _regexAnotacionCancelacion.exec(cuenta.anotacion ?? '');
+    if (matchAnotacion) {
+      origenesConvertidosAAnticipo.add(`${matchAnotacion[1].toUpperCase()}|${matchAnotacion[2]}`);
+    }
+    if (!cuenta.serieFactura || !cuenta.folioFactura) continue;
+    const keyFactura = `${cuenta.serieFactura}|${cuenta.folioFactura}`;
+    // La cuenta ES el anticipo (su propia factura, ej. D0-260900026) —
+    // `serieExterna`/`folioExterno` son el folio interno real de Kore
+    // (ej. "OPA"/"00837"), no el folio de la factura.
+    if ((cuenta.serieExterna || '').toUpperCase() === 'OPA' && cuenta.folioExterno) {
+      referenciaOpaPorFactura.set(keyFactura, `OPA-${cuenta.folioExterno}`);
+    }
+    // La cuenta ES una venta que consumió Anticipo — suma todas las
+    // formasPago 'ANTICIPO' de todos sus movimientos (normalmente un solo
+    // movimiento de cierre, pero por seguridad se suman todas por si el
+    // cierre se dio en 2+ pasos).
+    let montoAnticipo = 0;
+    for (const mov of (cuenta.movimientos ?? [])) {
+      for (const fp of (mov.formasPago ?? [])) {
+        if ((fp.nombreFormaPago || '').toUpperCase() === 'ANTICIPO') montoAnticipo += Number(fp.monto) || 0;
+      }
+    }
+    if (montoAnticipo > 0) {
+      montoAnticipoPorFactura.set(keyFactura, (montoAnticipoPorFactura.get(keyFactura) ?? 0) + montoAnticipo);
+    }
+  }
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] referenciaOpaPorFactura.size=${referenciaOpaPorFactura.size} `
+      + `B0|260900009=${referenciaOpaPorFactura.get('B0|260900009')} `
+      + `origenesConvertidosAAnticipo=${JSON.stringify([...origenesConvertidosAAnticipo])}`);
+  }
+  return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
 }
 
 // Egreso SAT que formaliza la aplicación del anticipo directamente contra la
@@ -3094,12 +3214,6 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const anticipoCfdisProp = _rel07UuidsSinReglaProp.length
     ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaProp } }).select('uuid serie folio total fecha').lean()
     : [];
-  const anticipoFolioPorUuidProp = {
-    ...Object.fromEntries(
-      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
-    ),
-    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
-  };
   // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
   // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
   const ventaUuidsConAnticipoProp = cfdiConRegla
@@ -3108,6 +3222,35 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     .map(({ cfdi }) => cfdi.uuid)
     .filter(Boolean);
   const egresosAnticipoPorVentaProp = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoProp, rfc);
+  // Cuentas Pendientes (CxC/Bancos) — ver `_prefetchCuentasPendientesAnticipo`:
+  // fuente más confiable que `_resolverReferenciaOpaPorMonto` (referencia) y
+  // que `context.montoAnticipoUsado` (monto) para Anticipo. Rango de fechas
+  // cubre tanto los CFDIs de anticipo como las ventas que los consumen.
+  const {
+    montoAnticipoPorFactura: montoAnticipoPorFacturaProp,
+    referenciaOpaPorFactura: referenciaOpaPorFacturaProp,
+    origenesConvertidosAAnticipo: origenesConvertidosAAnticipoProp,
+  } = await _prefetchCuentasPendientesAnticipo([
+      ...anticipoCfdisProp.map(c => c.fecha),
+      ...cfdiConRegla
+        .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+          && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .map(({ cfdi }) => cfdi.fecha),
+    ]);
+  const anticipoFolioPorUuidProp = {
+    ...Object.fromEntries(
+      anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
+    ),
+    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
+    // Cuentas Pendientes gana sobre ambos anteriores cuando trae el dato —
+    // folio real de Kore, sin depender de que Bancos ya haya conciliado el
+    // depósito (ver docstring de `_prefetchCuentasPendientesAnticipo`).
+    ...Object.fromEntries(
+      anticipoCfdisProp
+        .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaProp.get(`${c.serie}|${c.folio}`)])
+        .filter(([, ref]) => ref),
+    ),
+  };
 
   let saldoRestanteProp = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -3613,7 +3756,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
       cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
-      cc: ccProp, rfc,
+      cc: ccProp, rfc, origenesConvertidosAAnticipo: origenesConvertidosAAnticipoProp,
     });
     for (const linea of lineasSaldoFavorProp) {
       movimientosResult.push(linea);
@@ -4628,12 +4771,6 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const anticipoCfdisGuard = _rel07UuidsSinReglaGuard.length
     ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaGuard } }).select('uuid serie folio total fecha').lean()
     : [];
-  const anticipoFolioPorUuidGuard = {
-    ...Object.fromEntries(
-      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
-    ),
-    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
-  };
   // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
   // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta` (misma lógica que en
   // generarPropuesta).
@@ -4643,6 +4780,29 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     .map(({ cfdi }) => cfdi.uuid)
     .filter(Boolean);
   const egresosAnticipoPorVentaGuard = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoGuard, rfc);
+  // Cuentas Pendientes — ver comentario equivalente en generarPropuesta.
+  const {
+    montoAnticipoPorFactura: montoAnticipoPorFacturaGuard,
+    referenciaOpaPorFactura: referenciaOpaPorFacturaGuard,
+    origenesConvertidosAAnticipo: origenesConvertidosAAnticipoGuard,
+  } = await _prefetchCuentasPendientesAnticipo([
+      ...anticipoCfdisGuard.map(c => c.fecha),
+      ...cfdiConRegla
+        .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+          && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .map(({ cfdi }) => cfdi.fecha),
+    ]);
+  const anticipoFolioPorUuidGuard = {
+    ...Object.fromEntries(
+      anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
+    ),
+    ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
+    ...Object.fromEntries(
+      anticipoCfdisGuard
+        .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaGuard.get(`${c.serie}|${c.folio}`)])
+        .filter(([, ref]) => ref),
+    ),
+  };
 
   let saldoRestanteGuard = 0;
   if (cfdiConRegla.some(({ rule }) => rule?.esAplicacionSaldo)) {
@@ -5035,7 +5195,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
       cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
-      cc, rfc,
+      cc, rfc, origenesConvertidosAAnticipo: origenesConvertidosAAnticipoGuard,
     });
     for (const linea of lineasSaldoFavorGuard) {
       todosLosMovimientos.push(linea);

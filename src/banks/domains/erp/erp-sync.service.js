@@ -42,6 +42,22 @@ async function _tokenPolizas() {
   return globalConfigService.getValue('polizas', 'TOKEN');
 }
 
+// BUG CORREGIDO 2026-09-04 (caso real HORIZONTE HOTELERO B0-260900010/anticipo
+// B0-260900009): esta era la ÚNICA función de este archivo que llamaba al ERP
+// sin el reintento con backoff que ya usan `obtenerDesglosesCobroAlmacen`/
+// `obtenerSaldosFavor` (ver `_getConReintento` arriba) — y con un timeout más
+// corto (15s vs 30s). `/cuentas-pendientes` es además la consulta MÁS PESADA
+// de todas (12,833 cuentas en una prueba real con solo ±5 días de rango) —
+// bajo la carga real de una regeneración completa de póliza, un timeout aquí
+// se traga en silencio (el caller de `_prefetchCuentasPendientesAnticipo`
+// solo loguea y sigue con los mecanismos de respaldo, MENOS confiables), y
+// `anticipoFolioRefProp` termina usando el folio crudo del CFDI del anticipo
+// ("OPA-260900009") en vez del folio real de Kore ("OPA-00834") — se
+// confirmó con datos reales que el dato SÍ existe en el ERP y el único
+// factor no explicado era la fiabilidad de esta llamada. No se reutiliza
+// `_getConReintento` tal cual porque esa usa `_tokenPolizas()` (sección
+// `polizas`) — este endpoint es de la sección `bancos` (`_token()`), su
+// propio token/URL no se tocan, solo el reintento+timeout.
 async function sincronizarCuentasPendientes(params = {}) {
   const cuentasPendientesUrl = await _cuentasPendientesUrl();
 
@@ -54,19 +70,39 @@ async function sincronizarCuentasPendientes(params = {}) {
   if (params.nombrePersona) queryParams.nombrePersona = String(params.nombrePersona).trim();
   if (params.origen)        queryParams.origen        = String(params.origen).trim();
 
+  const token = await _token();
   let response;
-  try {
-    response = await axios.get(`${cuentasPendientesUrl}/cuentas-pendientes`, {
-      params:  queryParams,
-      headers: { Authorization: `Bearer ${await _token()}` },
-      timeout: 15000,
-    });
-  } catch (axErr) {
-    const status = axErr.response?.status;
-    const body   = JSON.stringify(axErr.response?.data ?? {});
-    const { logger } = require('../../../shared/utils/logger');
-    logger.error(`[ErpSync] ERP /cuentas-pendientes ${status}: ${body} | params=${JSON.stringify(queryParams)}`);
-    throw axErr;
+  const MAX_INTENTOS = 3;
+  for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
+    try {
+      response = await axios.get(`${cuentasPendientesUrl}/cuentas-pendientes`, {
+        params:  queryParams,
+        headers: { Authorization: `Bearer ${token}` },
+        timeout: 30000,
+      });
+      break;
+    } catch (axErr) {
+      const status    = axErr.response?.status;
+      const esTimeout = axErr.code === 'ECONNABORTED' || /timeout/i.test(axErr.message || '');
+      const { logger } = require('../../../shared/utils/logger');
+      if (status === 429 && intento < MAX_INTENTOS) {
+        const dataMsg   = String(axErr.response?.data?.Data ?? '');
+        const match     = /retry after:\s*([\d.]+)/i.exec(dataMsg);
+        const esperaSeg = Math.min((match ? Number(match[1]) : 10) + 1, 60);
+        logger.warn(`[ErpSync] 429 en /cuentas-pendientes, reintentando en ${esperaSeg.toFixed(1)}s (intento ${intento}/${MAX_INTENTOS})`);
+        await new Promise(r => setTimeout(r, esperaSeg * 1000));
+        continue;
+      }
+      if (esTimeout && intento < MAX_INTENTOS) {
+        const esperaSeg = 3 * intento;
+        logger.warn(`[ErpSync] timeout en /cuentas-pendientes, reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS})`);
+        await new Promise(r => setTimeout(r, esperaSeg * 1000));
+        continue;
+      }
+      const body = JSON.stringify(axErr.response?.data ?? {});
+      logger.error(`[ErpSync] ERP /cuentas-pendientes ${status}: ${body} | params=${JSON.stringify(queryParams)}`);
+      throw axErr;
+    }
   }
 
   const raw = response.data?.Data?.cuentas || [];

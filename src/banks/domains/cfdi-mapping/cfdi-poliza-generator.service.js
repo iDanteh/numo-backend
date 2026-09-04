@@ -3080,6 +3080,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+  // Ver comentario en el parámetro `ventasSFCubiertasPorSplit` de
+  // `construirMovimientosPuente` (cobros-sucursal-puente.service.js) — set de
+  // ventas GENERADORAS (`d.ventaSerie|d.ventaFolio`, no la factura
+  // consumidora) que el split por origen de `cfdiToMovimientos` ya va a
+  // cubrir, para que el bloque APA de ese archivo no las duplique.
+  const ventasSFCubiertasPorSplitProp = new Set();
+  for (const sfUsado of saldoFavorUsadoMapProp.values()) {
+    for (const d of (sfUsado.detalle ?? [])) {
+      const key = (d.ventaSerie && d.ventaFolio) ? `${d.ventaSerie}|${d.ventaFolio}`
+        : (d.serieOrigen && d.folioOrigen) ? `${d.serieOrigen}|${d.folioOrigen}` : null;
+      if (key) ventasSFCubiertasPorSplitProp.add(key);
+    }
+  }
 
   // Cobros de sucursales (Caja/Bancos por identificar, ver
   // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
@@ -3133,8 +3146,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         centroPropioClave: serieDelCentro,
         // Ver comentario arriba (adelantado 2026-09-04) — evita que el
         // mecanismo APA duplique el SF que `cfdiToMovimientos` ya va a
-        // desglosar por origen para esta misma factura.
-        saldoFavorUsadoMap: saldoFavorUsadoMapProp,
+        // desglosar por origen para esta misma venta generadora.
+        ventasSFCubiertasPorSplit: ventasSFCubiertasPorSplitProp,
       });
       movsPuente = resultadoPuente.movimientos;
       facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
@@ -4647,6 +4660,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+  // Ver comentario equivalente en generarPropuesta.
+  const ventasSFCubiertasPorSplitGuard = new Set();
+  for (const sfUsado of saldoFavorUsadoMapGuard.values()) {
+    for (const d of (sfUsado.detalle ?? [])) {
+      const key = (d.ventaSerie && d.ventaFolio) ? `${d.ventaSerie}|${d.ventaFolio}`
+        : (d.serieOrigen && d.folioOrigen) ? `${d.serieOrigen}|${d.folioOrigen}` : null;
+      if (key) ventasSFCubiertasPorSplitGuard.add(key);
+    }
+  }
 
   // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
   // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
@@ -4686,7 +4708,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         devsOcultosSF: devsOcultosSFGuard,
         centroPropioClave: serieDelCentroGuard,
         // Ver comentario equivalente en generarPropuesta (fix 2026-09-04).
-        saldoFavorUsadoMap: saldoFavorUsadoMapGuard,
+        ventasSFCubiertasPorSplit: ventasSFCubiertasPorSplitGuard,
       });
       movsPuenteGuard = resultadoPuenteGuard.movimientos;
       facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;

@@ -52,6 +52,7 @@ jest.mock('./bank-indicadores.service', () => ({
 const express = require('express');
 const request = require('supertest');
 const router  = require('./bank.routes');
+const service = require('./bank.service');
 const CFDI    = require('../../../visor/models/CFDI');
 const rbacStore = require('../../../shared/services/rbac-store');
 const indicadoresService = require('./bank-indicadores.service');
@@ -218,5 +219,98 @@ describe('GET /indicadores', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(FAKE_RESULT);
+  });
+});
+
+// POST /movements/:id/ficha/imagen (2026-09-03) — adjunta la foto/documento de respaldo de una
+// ficha ya registrada. `service.adjuntarImagenFicha` se mockea directo sobre el módulo real de
+// bank.service.js (no hay jest.mock('./bank.service') a nivel de archivo, mismo criterio que el
+// resto de este test file: requerir el service real es seguro, no pega a Mongo a nivel de módulo).
+describe('POST /movements/:id/ficha/imagen', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service.adjuntarImagenFicha = jest.fn();
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:ficha', async () => {
+    const res = await request(app)
+      .post('/movements/mov-1/ficha/imagen')
+      .attach('imagen', Buffer.from('fake-image'), { filename: 'ficha.png', contentType: 'image/png' })
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(service.adjuntarImagenFicha).not.toHaveBeenCalled();
+  });
+
+  test('responde 400 si no se envía ningún archivo', async () => {
+    const res = await request(app)
+      .post('/movements/mov-1/ficha/imagen')
+      .set('x-test-permissions', JSON.stringify(['banks:ficha']));
+
+    expect(res.status).toBe(400);
+    expect(service.adjuntarImagenFicha).not.toHaveBeenCalled();
+  });
+
+  test('con archivo y permiso, delega en service.adjuntarImagenFicha con el archivo recibido', async () => {
+    service.adjuntarImagenFicha.mockResolvedValue({
+      _id: 'mov-1', fichaDriveFileId: 'file-1', fichaDriveWebViewLink: 'https://drive/file-1',
+    });
+
+    const res = await request(app)
+      .post('/movements/mov-1/ficha/imagen')
+      .attach('imagen', Buffer.from('fake-image'), { filename: 'ficha.png', contentType: 'image/png' })
+      .set('x-test-permissions', JSON.stringify(['banks:ficha']));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      _id: 'mov-1', fichaDriveFileId: 'file-1', fichaDriveWebViewLink: 'https://drive/file-1',
+    });
+    expect(service.adjuntarImagenFicha).toHaveBeenCalledTimes(1);
+    const [id, file] = service.adjuntarImagenFicha.mock.calls[0];
+    expect(id).toBe('mov-1');
+    expect(file.originalname).toBe('ficha.png');
+    expect(file.mimetype).toBe('image/png');
+    expect(Buffer.isBuffer(file.buffer)).toBe(true);
+  });
+});
+
+// GET /movements/:id/ficha/imagen (2026-09-03) — proxy autenticado de la imagen/PDF de
+// respaldo de la ficha, permiso banks:read (no banks:ficha, ver comentario en bank.routes.js).
+describe('GET /movements/:id/ficha/imagen', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service.obtenerImagenFicha = jest.fn();
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/movements/mov-1/ficha/imagen')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(service.obtenerImagenFicha).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read, responde 200 con el Content-Type correcto y delega en el service', async () => {
+    service.obtenerImagenFicha.mockResolvedValue({ data: Buffer.from('contenido'), mimetype: 'image/png' });
+
+    const res = await request(app)
+      .get('/movements/mov-1/ficha/imagen')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(service.obtenerImagenFicha).toHaveBeenCalledWith('mov-1');
+    expect(res.body).toEqual(Buffer.from('contenido'));
   });
 });

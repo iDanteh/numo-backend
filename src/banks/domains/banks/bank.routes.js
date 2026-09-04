@@ -23,6 +23,7 @@ const {
   generarPolizasContpaqTraspasosPorRango,
 } = require('./traspasos-internos.service');
 const { emitToUser } = require('../../shared/socket');
+const { BadRequestError } = require('../../shared/errors/AppError');
 // erp.routes expone _sincronizarConRetry/_rangoDesdeFollo (mismo helper que ya usan los
 // scripts de backfill y collection-request.service.js) — sin ciclo: erp.routes.js requiere
 // bank.service.js, NUNCA bank.routes.js, así que esta ruta sí puede requerir erp.routes.
@@ -72,6 +73,17 @@ const upload = multer({
   fileFilter: (_req, file, cb) => {
     const ok = /\.(xlsx|xls)$/i.test(file.originalname);
     cb(ok ? null : new Error('Solo se aceptan archivos Excel (.xlsx, .xls)'), ok);
+  },
+});
+
+// Multer separado, específico para la imagen/PDF de respaldo de una ficha — el `upload`
+// de arriba solo acepta .xlsx/.xls, no sirve para este flujo.
+const uploadFichaImagen = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|png|webp)$/.test(file.mimetype) || file.mimetype === 'application/pdf';
+    cb(ok ? null : new Error('Solo se aceptan imágenes (jpg/png/webp) o PDF'), ok);
   },
 });
 
@@ -229,6 +241,44 @@ router.delete('/movements/:id/ficha',
     res.json(await service.deleteFicha(req.params.id, req.user));
   }),
 );
+
+// POST /api/banks/movements/:id/ficha/imagen — adjunta la foto/documento de respaldo de una
+// ficha YA registrada. Pedido explícito del usuario (2026-09-03): se sube en el mismo momento
+// de registrar la ficha desde el modal ERP, como un 2do request inmediato tras el PATCH de
+// arriba (no se combinó en un solo endpoint multipart para no tocar el contrato JSON ya
+// funcionando de PATCH .../ficha, y porque este endpoint también sirve para adjuntar/
+// reemplazar la imagen más adelante si hiciera falta).
+router.post('/movements/:id/ficha/imagen',
+  authenticate,
+  permit('banks:ficha'),
+  uploadFichaImagen.single('imagen'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw new BadRequestError('No se recibió ningún archivo.');
+    res.json(await service.adjuntarImagenFicha(req.params.id, req.file, req.user));
+  }),
+);
+
+// DELETE /api/banks/movements/:id/ficha/imagen — quita SOLO el documento de respaldo, sin
+// tocar el folio (pedido explícito del usuario, 2026-09-04: corregir un archivo adjuntado
+// por error no debería obligar a borrar y volver a registrar la ficha entera).
+router.delete('/movements/:id/ficha/imagen',
+  authenticate,
+  permit('banks:ficha'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.quitarImagenFicha(req.params.id, req.user));
+  }),
+);
+
+// GET /api/banks/movements/:id/ficha/imagen — imagen/PDF de respaldo de la ficha, proxy
+// autenticado (el archivo vive en Drive, nunca se expone un link público). Permiso
+// banks:read (no banks:ficha) — mismo criterio de visibilidad que el chip "Ficha X" en sí,
+// que ya se muestra a cualquiera que pueda ver el movimiento, tenga o no banks:ficha.
+router.get('/movements/:id/ficha/imagen', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { data, mimetype } = await service.obtenerImagenFicha(req.params.id);
+  res.set('Content-Type', mimetype || 'application/octet-stream');
+  res.set('Content-Disposition', 'inline; filename="ficha"');
+  res.send(data);
+}));
 
 // GET /api/banks/cfdis/buscar — busca CFDIs por serie/folio, SOLO source='ERP'
 // (colección `cfdis`, modelo del dominio visor — cross-domain, mismo patrón ya

@@ -255,7 +255,11 @@ router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFD
 // efectivo/reclasificado se implementa en una fase posterior (pedido explícito del
 // usuario: "primero quiero que se sienten las bases").
 // Parámetros: fechaDesde, fechaHasta (opcionales, mismo formato ISO que Kore espera).
-router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
+// 2026-09-03 (pedido explícito del usuario): la sección completa de Transferencias entre
+// cajas todavía no debe ser visible para nadie más que admin — permiso propio
+// banks:transferencias-caja (antes banks:erp:read, que también da acceso a otras cosas
+// del modal ERP ajenas a este feature).
+router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { fechaDesde, fechaHasta } = req.query;
 
   let raw = [];
@@ -302,8 +306,10 @@ router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_ERP_R
 // POST /api/erp/transferencias-cajas/sincronizar-manual — pedido explícito del usuario
 // (2026-09-01): sincronización bajo demanda con fechaDesde/fechaHasta elegidas a mano, sin
 // esperar al cron diario ni quedar atada a VENTANA_MAX_DIAS (esa cota es solo del catch-up
-// automático). Mismo permiso que el sync manual ERP-Kore existente (POST /sync-erp-kore).
-router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+// automático). 2026-09-03: pasó de banks:admin a banks:transferencias-caja — mismo permiso
+// que el resto de la sección (ver nota en GET /transferencias-cajas), admin-only por ahora
+// de cualquier forma (ninguno de los 2 permisos está asignado a otro rol todavía).
+router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { fechaDesde, fechaHasta } = req.body;
   try {
     const resultado = await sincronizarTransferenciasCajasManual({ fechaDesde, fechaHasta });
@@ -327,7 +333,9 @@ router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('ba
 // candidatos ya calculados (Fase C, en vivo — nunca cacheados) para que el usuario confirme
 // desde la UI. (2026-09-02: se eliminó el apartado de 'huerfana' — pedido explícito del
 // usuario, va a reemplazarse por algo distinto todavía no definido.)
-router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
+// 2026-09-03: banks:erp:read -> banks:transferencias-caja, mismo criterio que el resto de
+// la sección — ver nota en GET /transferencias-cajas.
+router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const pendientes = await CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
     .sort({ fechaRecepcion: 1 }).lean();
 
@@ -344,11 +352,15 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
 // POST /api/erp/transferencias-cajas/:id/confirmar — Fase D: confirma un match sugerido
 // contra 1 o 2 BankMovement elegidos por el usuario desde la bandeja. Re-valida
 // elegibilidad y suma de monto server-side (caja-transferencia-confirm.service.js) — nunca
-// confía en que el candidato que manda el cliente sigue siendo válido. Sin permit() propio
-// a propósito — mismo criterio que PUT .../erp-ids (bank.routes.js): setErpIds() ya exige
-// banks:erp:link O banks:cobro internamente, poner permit() acá lo duplicaría más estricto
-// y bloquearía a cobranza (banks:cobro) sin banks:erp:link — bug real ya corregido una vez.
-router.post('/transferencias-cajas/:id/confirmar', authenticate, asyncHandler(async (req, res) => {
+// confía en que el candidato que manda el cliente sigue siendo válido.
+// 2026-09-03 (pedido explícito del usuario, reemplaza la decisión anterior): esta ruta SÍ
+// lleva permit() propio ahora — banks:transferencias-caja, admin-only por ahora. Antes se
+// dejaba sin permit() a propósito porque setErpIds() ya exige banks:erp:link O banks:cobro
+// internamente (mismo criterio que PUT .../erp-ids en bank.routes.js) y agregar un permit()
+// más estricto acá bloqueaba a cobranza sin banks:erp:link — pero el usuario ahora pide
+// explícitamente que TODA la sección quede acotada a admin, así que ese bloqueo es el
+// comportamiento deseado, no un bug.
+router.post('/transferencias-cajas/:id/confirmar', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { movementIds } = req.body;
   const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
   res.json(resultado);

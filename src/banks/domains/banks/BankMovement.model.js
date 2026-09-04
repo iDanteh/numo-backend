@@ -211,6 +211,9 @@ const bankMovementSchema = new mongoose.Schema({
   fichaBy:     { type: String, default: null },   // userId que registró la ficha
   fichaNombre: { type: String, default: null },   // nombre display del usuario
   fichaAt:     { type: Date,   default: null },
+  fichaDriveFileId:      { type: String, default: null },
+  fichaDriveWebViewLink: { type: String, default: null },
+  fichaDriveMimeType:    { type: String, default: null },
 
   // Timestamp INMUTABLE: se setea una sola vez, la primera vez que status pasa de
   // no_identificado a identificado (ver resolvePrimeraIdentificacion(), llamado desde

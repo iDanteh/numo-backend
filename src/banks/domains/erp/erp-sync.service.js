@@ -71,42 +71,30 @@ async function sincronizarCuentasPendientes(params = {}) {
   if (params.origen)        queryParams.origen        = String(params.origen).trim();
 
   const token = await _token();
-  let response;
   const MAX_INTENTOS = 3;
+  // BUG CORREGIDO 2026-09-04 (caso real Reforma, JOSE IRAN SUAREZ LINARES):
+  // el fix anterior (comparar Data.totalCount contra Data.cuentas.length de
+  // UNA sola llamada) no basta — confirmado con datos reales que, bajo la
+  // carga real de una regeneración completa, el ERP puede responder
+  // `totalCount=214` (coincide exacto con las 214 cuentas que trae) cuando el
+  // universo real es 11,640 — el conteo mismo viene degradado junto con la
+  // lista, así que comparar la respuesta contra sí misma no detecta nada.
+  // Se hacen SIEMPRE al menos `MIN_INTENTOS_CRUZADOS` llamadas independientes
+  // (con backoff entre ellas) y se toma la que reporte el `totalCount` MÁS
+  // ALTO — una respuesta degradada nunca reporta de más, solo de menos, así
+  // que el máximo entre varias llamadas es siempre la mejor aproximación
+  // disponible al universo real.
+  const MIN_INTENTOS_CRUZADOS = 2;
+  let mejorResponse = null;
+  let mejorTotal = -1;
   for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
+    let response;
     try {
       response = await axios.get(`${cuentasPendientesUrl}/cuentas-pendientes`, {
         params:  queryParams,
         headers: { Authorization: `Bearer ${token}` },
         timeout: 30000,
       });
-      // BUG CORREGIDO 2026-09-04 (caso real HORIZONTE HOTELERO B0-260900010/
-      // OPA-260900009): el ERP puede responder 200 con una lista PARCIAL bajo
-      // la carga real de una regeneración completa de póliza (docenas de
-      // llamadas concurrentes a distintos endpoints) — sin error, sin 429, sin
-      // timeout, solo menos registros de los que realmente hay. Confirmado
-      // con datos reales: la misma consulta (mismo rango de fechas) trajo 221
-      // cuentas bajo carga real vs 12,833 en una consulta aislada — el
-      // registro que necesitábamos (B0|260900009) faltaba en la respuesta
-      // parcial. El ERP SÍ manda `Data.totalCount` (el total real, sin
-      // truncar) junto con `Data.cuentas` — si no coinciden, la respuesta es
-      // incompleta y se reintenta igual que un timeout/429, en vez de
-      // confiar ciegamente en lo que haya llegado.
-      {
-        const totalCount = response.data?.Data?.totalCount;
-        const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
-        if (process.env.DEBUG_OPA_UUID) {
-          console.warn(`[DEBUG_CUENTAS_PENDIENTES] intento=${intento} totalCount=${JSON.stringify(totalCount)} cuentasLen=${cuentasLen} Data.keys=${JSON.stringify(Object.keys(response.data?.Data ?? {}))}`);
-        }
-        if (Number.isFinite(totalCount) && cuentasLen < totalCount && intento < MAX_INTENTOS) {
-          const { logger } = require('../../../shared/utils/logger');
-          const esperaSeg = 3 * intento;
-          logger.warn(`[ErpSync] /cuentas-pendientes respuesta incompleta (${cuentasLen}/${totalCount}), reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS})`);
-          await new Promise(r => setTimeout(r, esperaSeg * 1000));
-          continue;
-        }
-      }
-      break;
     } catch (axErr) {
       const status    = axErr.response?.status;
       const esTimeout = axErr.code === 'ECONNABORTED' || /timeout/i.test(axErr.message || '');
@@ -125,13 +113,39 @@ async function sincronizarCuentasPendientes(params = {}) {
         await new Promise(r => setTimeout(r, esperaSeg * 1000));
         continue;
       }
+      if (mejorResponse) break; // ya hay al menos una respuesta buena, no tirar todo por un error tardio
       const body = JSON.stringify(axErr.response?.data ?? {});
       logger.error(`[ErpSync] ERP /cuentas-pendientes ${status}: ${body} | params=${JSON.stringify(queryParams)}`);
       throw axErr;
     }
+
+    const totalCount = response.data?.Data?.totalCount;
+    const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
+    const totalEfectivo = Number.isFinite(totalCount) ? totalCount : cuentasLen;
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] intento=${intento} totalCount=${JSON.stringify(totalCount)} cuentasLen=${cuentasLen} mejorTotal=${mejorTotal}`);
+    }
+    // Señal de convergencia real: esta llamada coincide con la MEJOR que ya
+    // teníamos (no solo "es consistente consigo misma", que un intento
+    // degradado también puede parecer serlo — confirmado con datos reales:
+    // 214/214 y 11,640/11,640 son AMBOS "consistentes consigo mismos", solo
+    // uno es real). Dos intentos independientes de acuerdo en el mismo
+    // número es la señal más fuerte disponible sin un oráculo externo.
+    const coincideConMejorAnterior = totalEfectivo === mejorTotal;
+    if (totalEfectivo > mejorTotal) { mejorTotal = totalEfectivo; mejorResponse = response; }
+
+    if (intento >= MIN_INTENTOS_CRUZADOS && coincideConMejorAnterior && cuentasLen >= totalEfectivo) {
+      break;
+    }
+    if (intento < MAX_INTENTOS) {
+      const { logger } = require('../../../shared/utils/logger');
+      const esperaSeg = 3 * intento;
+      logger.warn(`[ErpSync] /cuentas-pendientes verificando completitud cruzada (intento ${intento}/${MAX_INTENTOS}, totalCount=${totalEfectivo}), reintentando en ${esperaSeg}s`);
+      await new Promise(r => setTimeout(r, esperaSeg * 1000));
+    }
   }
 
-  const raw = response.data?.Data?.cuentas || [];
+  const raw = mejorResponse?.data?.Data?.cuentas || [];
   return { raw };
 }
 

@@ -279,6 +279,44 @@ describe('POST /movements/:id/ficha/imagen', () => {
   });
 });
 
+// DELETE /movements/:id/ficha/imagen (2026-09-04) — quita el documento sin tocar el folio.
+describe('DELETE /movements/:id/ficha/imagen', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service.quitarImagenFicha = jest.fn();
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:ficha', async () => {
+    const res = await request(app)
+      .delete('/movements/mov-1/ficha/imagen')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(service.quitarImagenFicha).not.toHaveBeenCalled();
+  });
+
+  test('con permiso, delega en service.quitarImagenFicha con el id del movimiento', async () => {
+    service.quitarImagenFicha.mockResolvedValue({
+      _id: 'mov-1', fichaDriveFileId: null, fichaDriveWebViewLink: null, fichaDriveMimeType: null,
+    });
+
+    const res = await request(app)
+      .delete('/movements/mov-1/ficha/imagen')
+      .set('x-test-permissions', JSON.stringify(['banks:ficha']));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      _id: 'mov-1', fichaDriveFileId: null, fichaDriveWebViewLink: null, fichaDriveMimeType: null,
+    });
+    expect(service.quitarImagenFicha).toHaveBeenCalledWith('mov-1');
+  });
+});
+
 // GET /movements/:id/ficha/imagen (2026-09-03) — proxy autenticado de la imagen/PDF de
 // respaldo de la ficha, permiso banks:read (no banks:ficha, ver comentario en bank.routes.js).
 describe('GET /movements/:id/ficha/imagen', () => {

@@ -160,6 +160,26 @@ describe('_aporteConRatchet', () => {
   });
 });
 
+// _debeRecalcularAporte — CORRECCIÓN 2026-09-04 (pedido explícito del usuario): un link
+// finalizadoManualmente (vino de cobro-panel/Solicitudes de Cobro, con saldoErp ya fijado
+// por un humano al aplicar el cobro) NUNCA vuelve a recalcular su aporte en
+// _recomputeErpKoreJob — ese saldoErp es la fuente de la verdad definitiva. El flujo
+// tradicional (nunca cumple finalizadoManualmente) sigue recalculando igual que siempre.
+describe('_debeRecalcularAporte', () => {
+  test('vínculo humano tradicional (finalizadoManualmente=false): SÍ recalcula', () => {
+    expect(router._debeRecalcularAporte(true, false)).toBe(true);
+  });
+
+  test('vínculo humano ya finalizado manualmente (cobro-panel/Solicitudes): NUNCA recalcula', () => {
+    expect(router._debeRecalcularAporte(true, true)).toBe(false);
+  });
+
+  test('vínculo de motor automático (esHumano=false): nunca recalcula acá, sin importar finalizadoManualmente', () => {
+    expect(router._debeRecalcularAporte(false, false)).toBe(false);
+    expect(router._debeRecalcularAporte(false, true)).toBe(false);
+  });
+});
+
 describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruzada entre movimientos)', () => {
   // Caso real simple, folioExterno 260800166: 2 movimientos pagan $100 cada uno a la misma
   // CxC, se revierte 1 sin Aut/Numo — la reversión canceló el abono MÁS RECIENTE (American

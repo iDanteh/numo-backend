@@ -148,8 +148,9 @@ const collectionRequestSchema = new mongoose.Schema({
   // Cada uno puede corresponder a un depósito bancario DISTINTO (ej. cliente
   // paga mitad por transferencia y mitad en efectivo, cada uno con su propio
   // comprobante) — por eso es un arreglo y no un objeto único como el legacy.
-  // El binario vive en la carpeta compartida de Drive (GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID,
-  // ver drive-comprobantes.service.js); aquí solo se guarda la referencia.
+  // El binario vive en la carpeta compartida de Drive (Configuraciones Globales,
+  // sección 'solicitudes', clave COMPROBANTES_IMAGEN_FOLDER_ID — ver
+  // drive-comprobantes.service.js); aquí solo se guarda la referencia.
   comprobantes: {
     type: [{
       driveFileId:      { type: String, required: true, trim: true },

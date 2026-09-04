@@ -769,13 +769,13 @@ describe('GET /transferencias-cajas', () => {
     app.use(router);
   });
 
-  test('responde 403 sin banks:erp:read', async () => {
+  test('responde 403 sin banks:transferencias-caja', async () => {
     const res = await request(app)
       .get('/transferencias-cajas')
       .set('x-test-permissions', JSON.stringify([]));
 
     expect(res.status).toBe(403);
-    expect(res.body.required).toEqual([PERMISSIONS.BANKS_ERP_READ]);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]);
     expect(koreCaja.buscarTransferenciasCajas).not.toHaveBeenCalled();
   });
 
@@ -799,7 +799,7 @@ describe('GET /transferencias-cajas', () => {
     const res = await request(app)
       .get('/transferencias-cajas')
       .query({ fechaDesde: '2026-09-01T00:00:00Z', fechaHasta: '2026-09-01T23:59:59Z' })
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_ERP_READ]));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(koreCaja.buscarTransferenciasCajas).toHaveBeenCalledWith({
@@ -818,14 +818,15 @@ describe('GET /transferencias-cajas', () => {
 
     const res = await request(app)
       .get('/transferencias-cajas')
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_ERP_READ]));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(503);
   });
 });
 
 // POST /transferencias-cajas/sincronizar-manual — pedido del usuario: sincronización con
-// fechaDesde/fechaHasta a mano, mismo permiso que el sync manual ERP-Kore ('banks:admin').
+// fechaDesde/fechaHasta a mano. 2026-09-03: banks:admin -> banks:transferencias-caja (mismo
+// permiso que el resto de la sección, admin-only por ahora de cualquier forma).
 describe('POST /transferencias-cajas/sincronizar-manual', () => {
   let app;
 
@@ -836,7 +837,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     app.use(router);
   });
 
-  test('responde 403 sin banks:admin', async () => {
+  test('responde 403 sin banks:transferencias-caja', async () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
@@ -852,7 +853,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
-      .set('x-test-permissions', JSON.stringify(['banks:admin']));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(sincronizarTransferenciasCajasManual).toHaveBeenCalledWith({
@@ -867,7 +868,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({})
-      .set('x-test-permissions', JSON.stringify(['banks:admin']));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(400);
   });
@@ -878,7 +879,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
-      .set('x-test-permissions', JSON.stringify(['banks:admin']));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);
   });
@@ -895,7 +896,7 @@ describe('GET /transferencias-cajas/bandeja', () => {
     app.use(router);
   });
 
-  test('responde 403 sin banks:erp:read', async () => {
+  test('responde 403 sin banks:transferencias-caja', async () => {
     const res = await request(app)
       .get('/transferencias-cajas/bandeja')
       .set('x-test-permissions', JSON.stringify([]));
@@ -915,7 +916,7 @@ describe('GET /transferencias-cajas/bandeja', () => {
 
     const res = await request(app)
       .get('/transferencias-cajas/bandeja')
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_ERP_READ]));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [[{ _id: 'mov-1' }]] }]);
@@ -923,8 +924,10 @@ describe('GET /transferencias-cajas/bandeja', () => {
   });
 });
 
-// POST /transferencias-cajas/:id/confirmar — Fase D: sin permit() propio a propósito (ver
-// comentario en erp.routes.js) — setErpIds() exige el permiso internamente.
+// POST /transferencias-cajas/:id/confirmar — Fase D. 2026-09-03: ahora SÍ lleva permit()
+// propio (banks:transferencias-caja) — antes se dejaba sin permit() a propósito porque
+// setErpIds() ya exige banks:erp:link/banks:cobro internamente, pero el usuario pidió
+// explícitamente acotar TODA la sección a admin (ver comentario en erp.routes.js).
 describe('POST /transferencias-cajas/:id/confirmar', () => {
   let app;
 
@@ -935,12 +938,23 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
     app.use(router);
   });
 
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/confirmar')
+      .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(confirmarMatch).not.toHaveBeenCalled();
+  });
+
   test('delega en confirmarMatch con los movementIds del body y el usuario autenticado', async () => {
     confirmarMatch.mockResolvedValue({ transferencia: { _id: 't-1', estatusMatch: 'matcheada' }, movimientos: [] });
 
     const res = await request(app)
       .post('/transferencias-cajas/t-1/confirmar')
-      .send({ movementIds: ['mov-1', 'mov-2'] });
+      .send({ movementIds: ['mov-1', 'mov-2'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(confirmarMatch).toHaveBeenCalledWith('t-1', ['mov-1', 'mov-2'], expect.objectContaining({ _id: 'user-test' }));
@@ -953,7 +967,8 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
 
     const res = await request(app)
       .post('/transferencias-cajas/t-1/confirmar')
-      .send({ movementIds: ['mov-1'] });
+      .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);
   });

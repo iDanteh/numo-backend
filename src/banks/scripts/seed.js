@@ -45,6 +45,10 @@ const PERM_META = {
   'banks:erp:read':     { label: 'Ver/buscar CxC pendientes del ERP',       module: 'Bancos' },
   'banks:erp:anticipos': { label: 'Filtrar CxC por anticipos en el modal ERP', module: 'Bancos' },
   'banks:cfdi:read':    { label: 'Buscar CFDIs por serie-folio en el modal ERP', module: 'Bancos' },
+  // 2026-09-03: faltaba en este catálogo — sin entrada acá caía al fallback module:'General'
+  // (ver perm.module abajo), aunque es un permiso de Bancos como cualquier otro de esta lista.
+  'banks:erp:reversiones': { label: 'Ver bandeja de reversiones de CxC (Kore)', module: 'Bancos' },
+  'banks:transferencias-caja': { label: 'Transferencias entre cajas (matching de depósitos)', module: 'Bancos' },
   'account-plan:read':  { label: 'Ver catálogo contable',           module: 'Contabilidad' },
   'account-plan:write': { label: 'Editar catálogo contable',        module: 'Contabilidad' },
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },

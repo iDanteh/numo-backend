@@ -1,6 +1,7 @@
 'use strict';
 
 const { randomUUID }    = require('crypto');
+const path               = require('path');
 const { conTransaccion } = require('../../shared/utils/mongo-tx');
 const BankMovement      = require('./BankMovement.model');
 const bankConfigRepo    = require('./repositories/bank-config.repository');
@@ -16,6 +17,7 @@ const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.uti
 const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 const rbacStore = require('../../../shared/services/rbac-store');
 const { logger }         = require('../../../shared/utils/logger');
+const { subirImagenFicha, eliminarImagenFicha, descargarImagenFicha } = require('./drive-fichas.service');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const BANCOS_VALIDOS = [
@@ -2660,6 +2662,101 @@ async function setFicha(id, ficha, user) {
   };
 }
 
+// Extensión de respaldo cuando el archivo llega sin una en el nombre original
+// (ej. una foto de cámara/celular sin extensión) — mismos 4 tipos que acepta
+// el multer dedicado de bank.routes.js (uploadFichaImagen).
+const FICHA_IMAGEN_MIME_EXT = {
+  'image/jpeg':     '.jpg',
+  'image/png':      '.png',
+  'image/webp':     '.webp',
+  'application/pdf': '.pdf',
+};
+
+// Quita caracteres inválidos en un nombre de archivo (Windows es el más estricto:
+// \ / : * ? " < > |) — folio y banco son datos cargados/elegidos por un humano,
+// nunca deberían traerlos, pero un folio escrito a mano no está garantizado.
+function _sanitizarNombreArchivo(texto) {
+  return String(texto ?? '').replace(/[\\/:*?"<>|]/g, '').trim();
+}
+
+/**
+ * Nombre con el que la imagen de respaldo se guarda en Drive — pedido explícito
+ * del usuario (2026-09-04): "folio de NUMO + banco al que se depositó", para que
+ * buscar por esos dos datos en Drive alcance para rastrear el movimiento en Numo,
+ * sin tener que abrir el sistema primero. NO usa el nombre original del archivo
+ * subido (una foto de celular no dice nada por sí sola).
+ */
+function _nombreArchivoFichaDrive(mov, imagen) {
+  const extension = path.extname(imagen.originalname || '') || FICHA_IMAGEN_MIME_EXT[imagen.mimetype] || '';
+  const folio = _sanitizarNombreArchivo(mov.ficha);
+  const banco = _sanitizarNombreArchivo(mov.banco);
+  return `${folio} - ${banco}${extension}`;
+}
+
+/**
+ * Adjunta la foto/documento de respaldo de una ficha YA registrada — acción
+ * SEPARADA de setFicha() a nivel de API (2026-09-03, pedido explícito del
+ * usuario, ver comentario en bank.routes.js sobre por qué no se combinó en un
+ * solo endpoint multipart). Sube a Drive vía drive-fichas.service.js y guarda
+ * la referencia (driveFileId + webViewLink) en el movimiento.
+ *
+ * `imagen` es el shape de req.file de multer: { buffer, mimetype, originalname }.
+ */
+async function adjuntarImagenFicha(id, imagen, user) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  if (!mov.ficha) {
+    throw new BadRequestError('Este movimiento no tiene ficha registrada — registrá la ficha antes de adjuntar la imagen');
+  }
+
+  // Mismo criterio de autoría que deleteFicha(): admin puede adjuntar sobre cualquier
+  // ficha; el autor puede adjuntar sobre la suya; el resto no.
+  const userId = user._id ?? user.auth0Sub ?? null;
+  const esAdmin = user?.role === 'admin';
+  const esAutor = mov.fichaBy && userId && mov.fichaBy === userId;
+
+  if (!esAdmin && !esAutor) {
+    throw new ForbiddenError('Solo el usuario que registró la ficha o un administrador puede adjuntar la imagen');
+  }
+
+  const nombreArchivo = _nombreArchivoFichaDrive(mov, imagen);
+  const { driveFileId, driveWebViewLink } = await subirImagenFicha(imagen.buffer, imagen.mimetype, nombreArchivo);
+
+  mov.fichaDriveFileId      = driveFileId;
+  mov.fichaDriveWebViewLink = driveWebViewLink;
+  mov.fichaDriveMimeType    = imagen.mimetype;
+  await mov.save();
+
+  emitToBanco(mov.banco, 'bank:movement:updated', {
+    _id:                   mov._id,
+    fichaDriveFileId:      mov.fichaDriveFileId,
+    fichaDriveWebViewLink: mov.fichaDriveWebViewLink,
+    fichaDriveMimeType:    mov.fichaDriveMimeType,
+  });
+
+  return {
+    _id:                   mov._id,
+    fichaDriveFileId:      mov.fichaDriveFileId,
+    fichaDriveWebViewLink: mov.fichaDriveWebViewLink,
+    fichaDriveMimeType:    mov.fichaDriveMimeType,
+  };
+}
+
+/**
+ * Descarga el binario de la imagen/PDF de respaldo de una ficha — proxy
+ * autenticado para el visor del modal ERP (nunca se expone un link público de
+ * Drive). Mismo patrón que collection-request.service.js#getComprobante().
+ */
+async function obtenerImagenFicha(id) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+  if (!mov.fichaDriveFileId) throw new NotFoundError('Este movimiento no tiene ninguna imagen de ficha adjunta');
+
+  const buffer = await descargarImagenFicha(mov.fichaDriveFileId);
+  return { data: buffer, mimetype: mov.fichaDriveMimeType };
+}
+
 async function deleteFicha(id, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
@@ -2675,10 +2772,15 @@ async function deleteFicha(id, user) {
     throw new ForbiddenError('Solo el usuario que registró la ficha o un administrador puede eliminarla');
   }
 
+  const fichaDriveFileIdPrevio = mov.fichaDriveFileId;
+
   mov.ficha       = null;
   mov.fichaBy     = null;
   mov.fichaNombre = null;
   mov.fichaAt     = null;
+  mov.fichaDriveFileId      = null;
+  mov.fichaDriveWebViewLink = null;
+  mov.fichaDriveMimeType    = null;
 
   // Recalcular status sin la ficha
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
@@ -2708,9 +2810,25 @@ async function deleteFicha(id, user) {
     fichaBy:     null,
     fichaNombre: null,
     fichaAt:     null,
+    // Bug real 2026-09-04: faltaban acá, aunque el modelo SÍ los limpia arriba —
+    // el frontend usa esta misma forma para actualizar su copia local del
+    // movimiento, así que sin esto quedaba mostrando "ver documento" de una
+    // imagen que ya no existe ni en Mongo ni en Drive (404 al intentar abrirla).
+    fichaDriveFileId:      null,
+    fichaDriveWebViewLink: null,
+    fichaDriveMimeType:    null,
   });
   if (_calificaParaFichaPendiente(updated)) {
     emitToAll('bank:ficha-pendiente:changed', { movementId: updated._id });
+  }
+
+  // Best-effort: borrar la imagen de Drive DESPUÉS de que el save() de Mongo ya
+  // confirmó. Nunca debe bloquear ni hacer fallar deleteFicha() si Drive falla —
+  // el registro en Mongo ya quedó consistente sin la ficha.
+  if (fichaDriveFileIdPrevio) {
+    eliminarImagenFicha(fichaDriveFileIdPrevio).catch((err) => {
+      logger.warn(`[banks] deleteFicha: no se pudo eliminar la imagen de Drive (fileId=${fichaDriveFileIdPrevio}): ${err.message}`);
+    });
   }
 
   return {
@@ -2720,6 +2838,58 @@ async function deleteFicha(id, user) {
     fichaBy:     null,
     fichaNombre: null,
     fichaAt:     null,
+    fichaDriveFileId:      null,
+    fichaDriveWebViewLink: null,
+    fichaDriveMimeType:    null,
+  };
+}
+
+/**
+ * Quita SOLO el documento de respaldo de una ficha, sin tocar el folio — para
+ * corregir un archivo adjuntado por error sin tener que borrar y volver a
+ * registrar la ficha entera (pedido explícito del usuario, 2026-09-04). Mismo
+ * criterio de autoría que adjuntarImagenFicha()/deleteFicha().
+ */
+async function quitarImagenFicha(id, user) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  if (!mov.fichaDriveFileId) {
+    throw new BadRequestError('Este movimiento no tiene ningún documento adjunto para quitar');
+  }
+
+  const userId = user._id ?? user.auth0Sub ?? null;
+  const esAdmin = user?.role === 'admin';
+  const esAutor = mov.fichaBy && userId && mov.fichaBy === userId;
+  if (!esAdmin && !esAutor) {
+    throw new ForbiddenError('Solo el usuario que registró la ficha o un administrador puede quitar el documento');
+  }
+
+  const fichaDriveFileIdPrevio = mov.fichaDriveFileId;
+
+  mov.fichaDriveFileId      = null;
+  mov.fichaDriveWebViewLink = null;
+  mov.fichaDriveMimeType    = null;
+  const updated = await mov.save();
+
+  emitToBanco(mov.banco, 'bank:movement:updated', {
+    _id:                   updated._id,
+    fichaDriveFileId:      null,
+    fichaDriveWebViewLink: null,
+    fichaDriveMimeType:    null,
+  });
+
+  // Best-effort, mismo criterio que deleteFicha(): el registro en Mongo ya quedó
+  // consistente sin el documento, un fallo de Drive acá no debe bloquear nada.
+  eliminarImagenFicha(fichaDriveFileIdPrevio).catch((err) => {
+    logger.warn(`[banks] quitarImagenFicha: no se pudo eliminar la imagen de Drive (fileId=${fichaDriveFileIdPrevio}): ${err.message}`);
+  });
+
+  return {
+    _id:                   updated._id,
+    fichaDriveFileId:      null,
+    fichaDriveWebViewLink: null,
+    fichaDriveMimeType:    null,
   };
 }
 
@@ -3434,7 +3604,8 @@ async function revertirConciliacion(runId, userId) {
 
 module.exports = {
   getCards, listMovements, getSummary, getStatusStats, getAvailableYears,
-  importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
+  importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha, adjuntarImagenFicha,
+  quitarImagenFicha, obtenerImagenFicha,
   registerErpUnlinkHook, _clearErpUnlinkHooksParaTests,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, reclasifyMovements, bulkUpdateCategoria, updateMovement, updateCategoria, generateTemplate,

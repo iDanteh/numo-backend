@@ -1840,9 +1840,30 @@ async function _prefetchCuentasPendientesAnticipo(fechas) {
   if (!fechasValidas.length) return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
 
   const VENTANA_MS = 5 * 24 * 3600 * 1000;
-  const fechaDesde = new Date(Math.min(...fechasValidas.map(f => f.getTime())) - VENTANA_MS);
+  let fechaDesde = new Date(Math.min(...fechasValidas.map(f => f.getTime())) - VENTANA_MS);
   const fechaHasta = new Date(Math.max(...fechasValidas.map(f => f.getTime())) + VENTANA_MS);
 
+  // BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA, 1-sep): el ERP rechaza
+  // con 400 CUALQUIER rango de fechas mayor a 31 días ("rango de fechas
+  // mayor a 31 días") — límite no documentado hasta hoy. Si el lote incluye
+  // fechas de CFDIs de Anticipo muy dispersas en el tiempo (normal: llegan de
+  // toda la ventana rel07-sin-regla, no solo del periodo actual), el
+  // min/max ±5 días puede superar fácilmente ese tope y tirar TODA la
+  // consulta (mapas vacíos para el lote completo, no solo para el caso
+  // disperso) — confirmado con `[DEBUG_CUENTAS_PENDIENTES] FALLO: ...400`.
+  // Se recorta `fechaDesde` para que el rango nunca exceda 30 días (1 de
+  // margen bajo el límite real), sacrificando cobertura de fechas viejas
+  // dispersas antes que fallar la consulta completa — `fechaHasta` se deja
+  // intacto porque el periodo que se está generando siempre es el extremo
+  // más reciente.
+  const MAX_VENTANA_MS = 30 * 24 * 3600 * 1000;
+  if (fechaHasta.getTime() - fechaDesde.getTime() > MAX_VENTANA_MS) {
+    fechaDesde = new Date(fechaHasta.getTime() - MAX_VENTANA_MS);
+  }
+
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] fechaDesde=${fechaDesde.toISOString()} fechaHasta=${fechaHasta.toISOString()}`);
+  }
   let cuentas;
   try {
     const resultado = await sincronizarCuentasPendientes({
@@ -3367,11 +3388,23 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Solo aplica cuando la factura final (formaPago=30) usa el modelo 2 asientos
   // (cuentaCargo=2103010001 Anticipos). En el modelo 3 asientos (cuentaCargo=1103010001
   // Clientes) la NC sí debe procesarse — cancela Anticipos vs Clientes en asiento 3.
-  const anticosCubiertosPorReg22C = new Set();
+  //
+  // BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA, venta C0-260900035/
+  // Egreso C0-260900036, AMBOS $3,827.37): el Set original no distinguía
+  // ENTRE "la NC cierra un remanente pequeño ya cubierto por el asiento de
+  // la Factura Final" (redundante, correcto omitirla) y "la NC cancela la
+  // venta COMPLETA" (un evento económico DISTINTO y posterior — confirmado
+  // con el usuario que este caso real es justo eso) — ambos casos tienen el
+  // mismo `tipoRelacion=07` apuntando a la misma venta, así que se
+  // omitían por igual, perdiendo en silencio el ingreso completo sin su
+  // reversión. Ahora se guarda también el `total` de la venta — el caller
+  // solo omite la NC cuando su monto es CLARAMENTE MENOR (remanente
+  // parcial); si es igual o mayor (reversión completa), se procesa normal.
+  const anticosCubiertosPorReg22C = new Map();
   for (const { cfdi: c, rule: r } of cfdiConRegla) {
     if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
     if (r?.cuentaCargo !== '2103010001') continue;
-    if (c.uuid) anticosCubiertosPorReg22C.add(c.uuid.toUpperCase());
+    if (c.uuid) anticosCubiertosPorReg22C.set(c.uuid.toUpperCase(), Number(c.total) || 0);
   }
 
   // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
@@ -3402,7 +3435,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           attributes: ['cfdiUuid'],
           include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
         });
-        for (const m of yaEnBD) anticosCubiertosPorReg22C.add(m.cfdiUuid.toUpperCase());
+        // Este camino (cross-batch, "Fix 5") no distingue remanente-parcial
+        // vs reversión-completa como el de arriba — se deja el criterio
+        // amount-blind que ya tenía (siempre omitir) hasta confirmar un caso
+        // real que amerite el mismo ajuste; `Infinity` conserva ese
+        // comportamiento anterior sin duplicar la comparación de montos.
+        for (const m of yaEnBD) anticosCubiertosPorReg22C.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
     }
   }
@@ -3412,12 +3450,17 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
   for (const { cfdi, rule } of cfdiConRegla) {
     // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo original ya fue procesado
-    // por una factura PUE formaPago=30 (Reg 22C) en este mismo batch.
+    // por una factura PUE formaPago=30 (Reg 22C) en este mismo batch — SOLO
+    // cuando el monto de la NC es CLARAMENTE MENOR al de la venta (remanente
+    // parcial, redundante con el asiento de Reg22C). Si es igual o mayor, es
+    // una reversión completa de la venta (evento distinto) y sí debe
+    // procesarse — ver comentario de `anticosCubiertosPorReg22C` arriba.
     if (cfdi.tipoDeComprobante === 'E' &&
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07 = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
       const uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
-      if (uuid07 && anticosCubiertosPorReg22C.has(uuid07)) continue;
+      const ventaTotal07 = uuid07 ? anticosCubiertosPorReg22C.get(uuid07) : undefined;
+      if (ventaTotal07 != null && (Number(cfdi.total) || 0) < ventaTotal07 - 0.01) continue;
     }
     const context = {};
     if (rule?.cuentaDeltaAnticipo && cfdi.cfdiRelacionados?.length) {
@@ -4933,12 +4976,16 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // (ccBySerieMap ya se resolvió arriba, antes del filtro por sucursal)
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Misma lógica que en generarPropuesta: si hay una factura PUE formaPago=30
-  // con tipoRelacion=07 en el batch, la NC tipo E del mismo anticipo se omite.
-  const anticosCubiertosPorReg22CGuard = new Set();
-  for (const { cfdi: c } of cfdiConRegla) {
+  // Misma lógica que en generarPropuesta (ver comentario completo ahí,
+  // incluido el fix 2026-09-07 de monto — remanente parcial vs reversión
+  // completa): si hay una factura PUE formaPago=30 con cuentaCargo=2103010001
+  // (modelo 2 asientos) en el batch, la NC tipo E del mismo anticipo se omite
+  // SOLO cuando su monto es claramente menor al de la venta.
+  const anticosCubiertosPorReg22CGuard = new Map();
+  for (const { cfdi: c, rule: r } of cfdiConRegla) {
     if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
-    if (c.uuid) anticosCubiertosPorReg22CGuard.add(c.uuid.toUpperCase());
+    if (r?.cuentaCargo !== '2103010001') continue;
+    if (c.uuid) anticosCubiertosPorReg22CGuard.set(c.uuid.toUpperCase(), Number(c.total) || 0);
   }
 
   // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
@@ -4967,7 +5014,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           attributes: ['cfdiUuid'],
           include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
         });
-        for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.add(m.cfdiUuid.toUpperCase());
+        // Ver comentario equivalente en generarPropuesta — camino cross-batch
+        // sin ajuste de monto todavía, `Infinity` conserva el comportamiento
+        // anterior (siempre omitir).
+        for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
     }
   }
@@ -4980,12 +5030,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const muestrasSinRegla = [];
 
   for (const { cfdi, rule } of cfdiConRegla) {
-    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo ya fue procesado por Reg 22C
+    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo ya fue procesado por
+    // Reg 22C — SOLO cuando el monto de la NC es claramente menor al de la
+    // venta (ver comentario equivalente en generarPropuesta).
     if (cfdi.tipoDeComprobante === 'E' &&
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07g = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
       const uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
-      if (uuid07 && anticosCubiertosPorReg22CGuard.has(uuid07)) continue;
+      const ventaTotal07g = uuid07 ? anticosCubiertosPorReg22CGuard.get(uuid07) : undefined;
+      if (ventaTotal07g != null && (Number(cfdi.total) || 0) < ventaTotal07g - 0.01) continue;
     }
 
     if (!rule) {

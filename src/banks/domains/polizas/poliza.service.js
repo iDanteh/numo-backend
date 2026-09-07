@@ -2006,7 +2006,12 @@ const ETIQUETA_VENTA_SIN_COBRO = 'SIN-COBRO';
 // serie/folio en vez de ir a una sección aparte — OPA (anticipo sin NC,
 // 2026-08-19): es una línea complementaria de una factura normal, no un
 // cruce de sucursal ni un ajuste de venta real.
-const REGLAS_MEZCLADAS_CON_VENTAS = new Set(['OPA']);
+// 'OPA-REVERSION' (2026-09-07): Cargo Devoluciones+IVA de un Egreso que
+// revierte una venta ya saldada 100% con Anticipo (ver
+// `_redirigirEgresoAnticipoSaldado` en cfdi-poliza-generator.service.js) —
+// misma necesidad de visibilidad que 'OPA', pero es una reversión, no la
+// recepción/aplicación original, por eso un valor distinto.
+const REGLAS_MEZCLADAS_CON_VENTAS = new Set(['OPA', 'OPA-REVERSION']);
 
 // Orden fijo del bloque de "Cobro de otra sucursal": Efectivo, Transferencia,
 // Saldo a favor, Cheque, Tarjeta (confirmado con el usuario 2026-08-05).

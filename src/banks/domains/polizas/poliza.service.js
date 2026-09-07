@@ -1075,7 +1075,14 @@ const esAbonoSaldoFavor = (m) => CUENTAS_SALDO_FAVOR.has(m.cuenta?.codigo) || CU
 // Descripción", etc.) y también aplicación/cierre ("Factura Final Anticipo",
 // Reg 22C/22C-0 con formaPago 30) — el usuario confirmó que el 22 va en todo
 // movimiento de anticipo aunque ya se haya aplicado/usado, no solo al recibirlo.
-const esReglaAnticipo = (reglaNombre) => /anticipo/i.test(reglaNombre || '');
+// BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA): "Reg TO-EGR-16/-0 — NC
+// Egreso ERP ... (cancela CxC)" es la MISMA familia de ajuste que Reg 23
+// (Aplicación de Anticipo, cancela Anticipos vs Clientes) — mismo `_fetchNotasCreditoParaFusion`
+// que ahora sí las trae al lote — pero su nombre dice "Egreso", no
+// "Anticipo", así que `esReglaAnticipo` no las reconocía y caían al bucket
+// genérico "Depósitos consolidados" en vez de su propia línea individual
+// (perdiendo la trazabilidad de a qué venta/anticipo pertenecen).
+const esReglaAnticipo = (reglaNombre) => /anticipo/i.test(reglaNombre || '') || /^reg to-egr/i.test(reglaNombre || '');
 
 // Distingue "Recepción" (aún no se ha usado — Reg 22, 22A, 22-0, 22C-DESC,
 // "Recepción Anticipo por Descripción") de "Factura Final"/aplicación/cierre

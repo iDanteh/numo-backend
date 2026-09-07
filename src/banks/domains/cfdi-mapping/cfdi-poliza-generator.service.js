@@ -1530,6 +1530,41 @@ function _esConversionAAnticipoPorMonto(cfdi, montoPropio, anticiposClasificados
 }
 
 /**
+ * Redirige las cuentas de una NC Egreso/Aplicación de Anticipo (Reg TO-EGR/
+ * Reg 23) cuando la venta que referencia ya se saldó 100% con Anticipo vía
+ * el mecanismo "cierre OPA" (ver `ventasConAnticipoRedirigido` en
+ * `generarPropuesta`/`generarYGuardar`) — en ese caso la venta NUNCA tuvo
+ * saldo en Clientes que cancelar (su Cargo se sustituyó por Cargo Anticipos
+ * +IVA-anticipo), así que las cuentas normales de la regla (Cargo Anticipos
+ * otra vez / Abono Clientes) duplicarían el Cargo a Anticipos y dejarían un
+ * Abono a Clientes sin ninguna contraparte (confirmado con datos reales de
+ * Postgres, caso CONSTRUCASA 2026-09-07: Anticipos debitada 2 veces por el
+ * mismo monto, Clientes con abono huérfano de $3,827.37).
+ *
+ * Se REVIERTE la venta en su lugar — confirmado con el usuario: Cargo
+ * Devoluciones s/Ventas (mismo monto que iba a Anticipos) / Abono Anticipos
+ * + IVA-anticipo (reinstala el MISMO pasivo que "cierre OPA" ya había
+ * cancelado). La línea de IVA de la regla (cuentaIva, ej. 2104010001) se
+ * deja intacta — sigue siendo la reversión correcta del IVA definitivo.
+ * Muta `movs` in-place; no-op si no encuentra las líneas esperadas (Cargo
+ * a `rule.cuentaCargo` + Abono a `rule.cuentaAbono`).
+ */
+function _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap) {
+  const cargoAnticipo = movs.find(m => m.cuentaId === cuentaMap[rule?.cuentaCargo] && Number(m.debe) > 0);
+  const abonoClientes = movs.find(m => m.cuentaId === cuentaMap[rule?.cuentaAbono] && Number(m.haber) > 0);
+  if (!cargoAnticipo || !abonoClientes) return;
+  const cargoIva = movs.find(m => m.cuentaId === cuentaMap[rule?.cuentaIva] && Number(m.debe) > 0);
+  const ivaMonto = Number(cargoIva?.debe) || 0;
+  const subtotalMonto = Math.round(((Number(abonoClientes.haber) || 0) - ivaMonto) * 100) / 100;
+  cargoAnticipo.cuentaId = cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? cargoAnticipo.cuentaId;
+  abonoClientes.cuentaId = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? abonoClientes.cuentaId;
+  abonoClientes.haber = subtotalMonto;
+  if (ivaMonto > 0) {
+    movs.push({ ...abonoClientes, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, haber: ivaMonto });
+  }
+}
+
+/**
  * Arma las 2 líneas (Abono subtotal + Abono IVA) del saldo a favor generado
  * por una Devolución — ver `_prefetchSaldosFavorGenerados` (el monto viene
  * confirmado por el ERP, no es especulativo). Hasta 2026-08-10 estas 2 líneas
@@ -1742,6 +1777,10 @@ const CODIGO_CUENTA_CLUB_TUBEROS      = '2103090002';
 // C0-260800064/065 contra el anticipo C0-260701665).
 const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
 const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
+// Devoluciones s/Ventas 16% — usada para revertir una venta que ya se saldó
+// 100% con Anticipo (ver `ventasConAnticipoRedirigido`, "Fix doble-
+// contabilización anticipo PUE" más abajo).
+const CODIGO_CUENTA_DEVOLUCIONES      = '4200010001';
 // Mismo split subtotal/IVA que usa Saldo a Favor (TASA_IVA_SALDO_FAVOR en
 // cfdi-mapping.service.js) para prorratear el monto REAL de anticipo
 // aplicado (ver `montoAnticipoRealProp` más abajo).
@@ -3159,12 +3198,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
   if (process.env.DEBUG_OPA_UUID) {
-    const _targets = [process.env.DEBUG_OPA_UUID.toUpperCase(), '7639BEF9-1C4B-4B9E-9E1E-D22D6D7E8070'];
-    for (const t of _targets) {
-      const enCfdisConNC = cfdisConNCProp.some(c => (c.uuid || '').toUpperCase() === t);
-      const enCfdiConRegla = cfdiConRegla.some(({ cfdi }) => (cfdi.uuid || '').toUpperCase() === t);
-      console.warn(`[DEBUG_EGR_BATCH] uuid=${t} enCfdisConNCProp=${enCfdisConNC} enCfdiConRegla=${enCfdiConRegla}`);
-    }
+    const _t = process.env.DEBUG_OPA_UUID.toUpperCase();
+    const enCfdisConNC = cfdisConNCProp.some(c => (c.uuid || '').toUpperCase() === _t);
+    const enCfdiConRegla = cfdiConRegla.some(({ cfdi }) => (cfdi.uuid || '').toUpperCase() === _t);
+    console.warn(`[DEBUG_EGR_BATCH] uuid=${_t} enCfdisConNCProp=${enCfdisConNC} enCfdiConRegla=${enCfdiConRegla}`);
   }
 
   // CFDIs que RECIBEN un Anticipo (Reg 22/22A — cuentaAbono=2103010001,
@@ -3414,32 +3451,43 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // 6. Generar movimientos usando cuentaMap pre-cargado
   // (ccBySerieMapProp ya se resolvió arriba, antes del filtro por sucursal)
 
-  // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Solo aplica cuando la factura final (formaPago=30) usa el modelo 2 asientos
-  // (cuentaCargo=2103010001 Anticipos). En el modelo 3 asientos (cuentaCargo=1103010001
-  // Clientes) la NC sí debe procesarse — cancela Anticipos vs Clientes en asiento 3.
-  //
-  // BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA, venta C0-260900035/
-  // Egreso C0-260900036, AMBOS $3,827.37): el Set original no distinguía
-  // ENTRE "la NC cierra un remanente pequeño ya cubierto por el asiento de
-  // la Factura Final" (redundante, correcto omitirla) y "la NC cancela la
-  // venta COMPLETA" (un evento económico DISTINTO y posterior — confirmado
-  // con el usuario que este caso real es justo eso) — ambos casos tienen el
-  // mismo `tipoRelacion=07` apuntando a la misma venta, así que se
-  // omitían por igual, perdiendo en silencio el ingreso completo sin su
-  // reversión. Ahora se guarda también el `total` de la venta — el caller
-  // solo omite la NC cuando su monto es CLARAMENTE MENOR (remanente
-  // parcial); si es igual o mayor (reversión completa), se procesa normal.
-  const anticosCubiertosPorReg22C = new Map();
-  for (const { cfdi: c, rule: r } of cfdiConRegla) {
-    if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
-    if (r?.cuentaCargo !== '2103010001') continue;
-    if (c.uuid) anticosCubiertosPorReg22C.set(c.uuid.toUpperCase(), Number(c.total) || 0);
+  // ── Fix doble-contabilización anticipo PUE (venta ya saldada 100% con
+  // Anticipo, luego cancelada por completo vía Egreso "Reg TO-EGR"/"Reg 23") ──
+  // BUG CORREGIDO 2026-09-07 (2do ajuste, caso real CONSTRUCASA, venta
+  // C0-260900035/Egreso C0-260900036, ambos $3,827.37): el primer intento
+  // aquí comparaba `rule.cuentaCargo === '2103010001'` para detectar el
+  // "modelo 2 asientos" — pero Reg 22C SIEMPRE usa cuentaCargo=1103010001
+  // (Clientes), ese chequeo nunca disparaba (dead code, confirmado con
+  // trazas en vivo). La señal real es el mecanismo "cierre OPA" (más abajo,
+  // `reglaNombre: 'OPA'`), que SUSTITUYE el Cargo-Clientes original de la
+  // venta por Cargo Anticipos+IVA-anticipo cuando `/desgloses-cobro`
+  // confirma que esa venta se saldó con Anticipo (`anticipoUsadoMapProp`,
+  // ya prefetched arriba). Cuando eso pasa, la venta NUNCA tuvo saldo en
+  // Clientes que cancelar — un Egreso con las cuentas normales de TO-EGR
+  // (Cargo Anticipos otra vez / Abono Clientes) duplicaría el Cargo a
+  // Anticipos Y dejaría un Abono a Clientes sin contraparte (confirmado
+  // con datos reales de Postgres: Anticipos debitada 2 veces por el mismo
+  // monto, Clientes con abono huérfano). Confirmado con el usuario: en ese
+  // caso el Egreso debe REVERTIR la venta (Cargo Devoluciones s/Ventas+IVA)
+  // reinstalando el MISMO pasivo que "cierre OPA" ya había cancelado
+  // (Abono Anticipos+IVA-anticipo) — nunca tocar Clientes. Aplicado más
+  // abajo, justo después de `cfdiToMovimientos`, sobre las líneas de la NC.
+  const ventasConAnticipoRedirigido = new Set();
+  for (const { cfdi: c } of cfdiConRegla) {
+    if (c.tipoDeComprobante !== 'I' || !c.serie || !c.folio || !c.uuid) continue;
+    if (Number(anticipoUsadoMapProp.get(`${c.serie}|${c.folio}`)) > 0) {
+      ventasConAnticipoRedirigido.add(c.uuid.toUpperCase());
+    }
   }
 
-  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
-  // Si el UUID relacionado tipo 07 de alguna NC ya tiene movimiento en una regla con cuentaIvaAnticipo
-  // en una póliza no cancelada, la NC está cubierta aunque no esté en el batch actual.
+  // Fix 5 (sin cambios): verificar también en BD — la NC y la factura final
+  // pueden venir en batches distintos. Si el UUID relacionado tipo 07 de
+  // alguna NC ya tiene movimiento en una regla con cuentaIvaAnticipo en una
+  // póliza no cancelada, la NC está cubierta aunque no esté en el batch
+  // actual — se sigue OMITIENDO por completo (criterio amount-blind
+  // anterior, sin el ajuste de redirección de cuentas de arriba, hasta
+  // confirmar un caso real cross-batch que lo amerite).
+  const anticosCubiertosPorReg22C = new Map();
   {
     const uuids07 = new Set(
       cfdiConRegla
@@ -3465,11 +3513,6 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           attributes: ['cfdiUuid'],
           include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
         });
-        // Este camino (cross-batch, "Fix 5") no distingue remanente-parcial
-        // vs reversión-completa como el de arriba — se deja el criterio
-        // amount-blind que ya tenía (siempre omitir) hasta confirmar un caso
-        // real que amerite el mismo ajuste; `Infinity` conserva ese
-        // comportamiento anterior sin duplicar la comparación de montos.
         for (const m of yaEnBD) anticosCubiertosPorReg22C.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
     }
@@ -3479,23 +3522,18 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   let sinRegla = 0;
 
   for (const { cfdi, rule } of cfdiConRegla) {
-    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo original ya fue procesado
-    // por una factura PUE formaPago=30 (Reg 22C) en este mismo batch — SOLO
-    // cuando el monto de la NC es CLARAMENTE MENOR al de la venta (remanente
-    // parcial, redundante con el asiento de Reg22C). Si es igual o mayor, es
-    // una reversión completa de la venta (evento distinto) y sí debe
-    // procesarse — ver comentario de `anticosCubiertosPorReg22C` arriba.
+    // uuid07: venta referenciada por esta NC tipo E vía tipoRelacion=07 (si
+    // aplica) — se usa tanto para el skip "Fix 5" (cross-batch, abajo) como
+    // para la redirección de cuentas cuando esa venta ya se saldó 100% con
+    // Anticipo (`ventasConAnticipoRedirigido`, ver comentario arriba).
+    let uuid07;
     if (cfdi.tipoDeComprobante === 'E' &&
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07 = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
-      const uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
-      const ventaTotal07 = uuid07 ? anticosCubiertosPorReg22C.get(uuid07) : undefined;
-      if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
-        console.warn(`[DEBUG_EGR_SKIP] cfdi=${cfdi.serie}-${cfdi.folio} rule=${rule?.nombre} rule.cuentaCargo=${rule?.cuentaCargo} `
-          + `uuid07=${uuid07} ventaTotal07=${ventaTotal07} cfdiTotal=${cfdi.total} `
-          + `enMapa=${anticosCubiertosPorReg22C.has(uuid07)}`);
-      }
-      if (ventaTotal07 != null && (Number(cfdi.total) || 0) < ventaTotal07 - 0.01) continue;
+      uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
+      // Fix 5 (cross-batch): omitir por completo si el anticipo ya se
+      // procesó en una póliza previa no cancelada (ver comentario arriba).
+      if (uuid07 && anticosCubiertosPorReg22C.get(uuid07) === Infinity) continue;
     }
     const context = {};
     if (rule?.cuentaDeltaAnticipo && cfdi.cfdiRelacionados?.length) {
@@ -3571,10 +3609,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
-    if (process.env.DEBUG_OPA_UUID && [process.env.DEBUG_OPA_UUID.toUpperCase(), '7639BEF9-1C4B-4B9E-9E1E-D22D6D7E8070'].includes((cfdi.uuid || '').toUpperCase())) {
-      console.warn(`[DEBUG_EGR_MOVS] cfdi=${cfdi.serie}-${cfdi.folio} uuid=${cfdi.uuid} tipoDeComprobante=${cfdi.tipoDeComprobante} `
-        + `formaPago=${cfdi.formaPago} rule=${rule?.nombre} rule.cuentaCargo=${rule?.cuentaCargo} movs.length=${movs.length} `
-        + `context=${JSON.stringify(context)}`);
+    if (uuid07 && ventasConAnticipoRedirigido.has(uuid07)) {
+      _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
+      if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
+        console.warn(`[DEBUG_EGR_REDIRECT] cfdi=${cfdi.serie}-${cfdi.folio} uuid07=${uuid07} movs=${JSON.stringify(movs)}`);
+      }
     }
 
     if (rule?.esAplicacionSaldo) {
@@ -5016,19 +5055,19 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // (ccBySerieMap ya se resolvió arriba, antes del filtro por sucursal)
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Misma lógica que en generarPropuesta (ver comentario completo ahí,
-  // incluido el fix 2026-09-07 de monto — remanente parcial vs reversión
-  // completa): si hay una factura PUE formaPago=30 con cuentaCargo=2103010001
-  // (modelo 2 asientos) en el batch, la NC tipo E del mismo anticipo se omite
-  // SOLO cuando su monto es claramente menor al de la venta.
-  const anticosCubiertosPorReg22CGuard = new Map();
-  for (const { cfdi: c, rule: r } of cfdiConRegla) {
-    if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
-    if (r?.cuentaCargo !== '2103010001') continue;
-    if (c.uuid) anticosCubiertosPorReg22CGuard.set(c.uuid.toUpperCase(), Number(c.total) || 0);
+  // Ver comentario completo en generarPropuesta (`ventasConAnticipoRedirigido`).
+  const ventasConAnticipoRedirigidoGuard = new Set();
+  for (const { cfdi: c } of cfdiConRegla) {
+    if (c.tipoDeComprobante !== 'I' || !c.serie || !c.folio || !c.uuid) continue;
+    if (Number(anticipoUsadoMapGuard.get(`${c.serie}|${c.folio}`)) > 0) {
+      ventasConAnticipoRedirigidoGuard.add(c.uuid.toUpperCase());
+    }
   }
 
-  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
+  // Fix 5 (sin cambios, ver comentario en generarPropuesta): verificar
+  // también en BD — la NC y la factura final pueden venir en batches
+  // distintos, se sigue OMITIENDO por completo (criterio amount-blind).
+  const anticosCubiertosPorReg22CGuard = new Map();
   {
     const uuids07g = new Set(
       cfdiConRegla
@@ -5070,15 +5109,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const muestrasSinRegla = [];
 
   for (const { cfdi, rule } of cfdiConRegla) {
-    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo ya fue procesado por
-    // Reg 22C — SOLO cuando el monto de la NC es claramente menor al de la
-    // venta (ver comentario equivalente en generarPropuesta).
+    // uuid07: ver comentario equivalente en generarPropuesta.
+    let uuid07;
     if (cfdi.tipoDeComprobante === 'E' &&
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07g = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
-      const uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
-      const ventaTotal07g = uuid07 ? anticosCubiertosPorReg22CGuard.get(uuid07) : undefined;
-      if (ventaTotal07g != null && (Number(cfdi.total) || 0) < ventaTotal07g - 0.01) continue;
+      uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
+      if (uuid07 && anticosCubiertosPorReg22CGuard.get(uuid07) === Infinity) continue;
     }
 
     if (!rule) {
@@ -5157,6 +5194,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
+    if (uuid07 && ventasConAnticipoRedirigidoGuard.has(uuid07)) {
+      _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
+    }
 
     if (rule?.esAplicacionSaldo) {
       const usado = movs.find(m => m._saldoUsado != null)?._saldoUsado ?? 0;

@@ -3795,11 +3795,21 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         if (egresoAnticipoProp.folioOpa) anticipoFolioRefProp = egresoAnticipoProp.folioOpa;
         // Ninguno de los 2 anteriores resolvió folio real (ni el CFDI del
         // anticipo, ni el folio por monto/Cuentas Pendientes del Egreso) —
-        // usar la serie-folio del propio Egreso como referencia de último
-        // recurso, para nunca dejar `anticipoFolioRefProp` null habiendo ya
-        // decidido entrar a este bloque (el cierre de abajo lo necesita).
+        // usar la serie-folio del propio Egreso, SIN el prefijo "OPA-", como
+        // referencia de último recurso (nunca dejar `anticipoFolioRefProp`
+        // null habiendo ya decidido entrar a este bloque — el cierre de abajo
+        // lo necesita). BUG CORREGIDO 2026-09-07 (caso real RAYMUNDO CUELLAR
+        // MENDOZA): el primer intento envolvía la serie-folio con "OPA-"
+        // (ej. "OPA-C0-260900022"), pero `_REFERENCIA_REGEX`
+        // (cfdi-mapping.service.js, `esConceptoMarcadorAjuste`) solo acepta
+        // segmentos NUMÉRICOS tras cada guion — "C0" (con letra) rompía el
+        // match, y `enriquecerConceptoConCliente` descartaba el concepto
+        // completo cayendo al folio plano sin ningún indicio de "OPA". Sin
+        // el prefijo, la serie-folio del Egreso SÍ matchea (mismo patrón que
+        // "DEV-054861"), igual que ya se decidió para el concepto propio de
+        // la NC (ver comentario en `_redirigirEgresoAnticipoSaldado`).
         if (!anticipoFolioRefProp) {
-          anticipoFolioRefProp = `OPA-${serieEgresoAnticipoProp ?? (cfdi.uuid || '').slice(0, 8)}`;
+          anticipoFolioRefProp = serieEgresoAnticipoProp ?? `OPA-${(cfdi.uuid || '').slice(0, 8)}`;
         }
       } else {
         // Cuentas Pendientes (ver `_prefetchCuentasPendientesAnticipo`) tiene
@@ -5366,11 +5376,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         }
         // Ver comentario equivalente en generarPropuesta.
         if (egresoAnticipoGuard.folioOpa) anticipoFolioRefGuard = egresoAnticipoGuard.folioOpa;
-        // Ver comentario equivalente en generarPropuesta: fallback de último
-        // recurso para nunca dejar `anticipoFolioRefGuard` null habiendo ya
-        // decidido entrar a este bloque.
+        // Ver comentario equivalente en generarPropuesta (bug real
+        // RAYMUNDO CUELLAR MENDOZA, sin prefijo "OPA-" para que la
+        // serie-folio pase `_REFERENCIA_REGEX`).
         if (!anticipoFolioRefGuard) {
-          anticipoFolioRefGuard = `OPA-${serieEgresoAnticipoGuard ?? (cfdi.uuid || '').slice(0, 8)}`;
+          anticipoFolioRefGuard = serieEgresoAnticipoGuard ?? `OPA-${(cfdi.uuid || '').slice(0, 8)}`;
         }
       } else {
         // Cuentas Pendientes tiene prioridad sobre `context.montoAnticipoUsado`

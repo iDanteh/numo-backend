@@ -1986,13 +1986,40 @@ async function _prefetchCuentasPendientesAnticipo(fechas) {
 async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
   if (!ventaUuids?.length) return new Map();
   const ventaSet = new Set(ventaUuids.map(u => (u || '').toUpperCase()));
+
+  // BUG CORREGIDO 2026-09-07 (mismo problema que `_fetchNotasCreditoParaFusion`
+  // — ver comentario ahí, caso real CONSTRUCASA C0-260900036): algunos
+  // Egresos de Aplicación de Anticipo traen `cfdiRelacionados` VACÍO a nivel
+  // SAT — la relación tipoRelacion=07 solo vive en el CFDI fuente ERP
+  // (`tipoOrigen: 'Egreso'`). Se resuelve primero qué venta referencia cada
+  // Egreso usando el ERP, y se usa como fallback cuando el SAT no la trae —
+  // sin esto, `serieCierreProp`/`serieCierreGuard` nunca encontraban el
+  // Egreso real y la columna C del cierre "OPA" caía siempre al placeholder
+  // "OPA-XXXXX" en vez del folio real del Egreso.
+  const erpEgresos07 = await CFDI.find({
+    'emisor.rfc': rfc, tipoDeComprobante: 'E', source: 'ERP',
+    $or: [{ tipoOrigen: 'Egreso' }, { 'cfdiRelacionados.tipoRelacion': '07' }],
+  }).select('uuid cfdiRelacionados').lean();
+  const ventaPorEgresoErp = new Map();
+  for (const eg of erpEgresos07) {
+    const uuidsRel = (eg.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .map(u => (u || '').toUpperCase());
+    const ventaMatch = uuidsRel.find(u => ventaSet.has(u));
+    if (ventaMatch) ventaPorEgresoErp.set(eg.uuid, ventaMatch);
+  }
+
   const egresos = await CFDI.find({
     'emisor.rfc':                     rfc,
     tipoDeComprobante:                'E',
     source:                           'SAT',
     satStatus:                        'Vigente',
     isActive:                         true,
-    'cfdiRelacionados.tipoRelacion':  '07',
+    $or: [
+      { 'cfdiRelacionados.tipoRelacion': '07' },
+      { uuid: { $in: [...ventaPorEgresoErp.keys()] } },
+    ],
   }).select('uuid serie folio subTotal total fecha cfdiRelacionados').lean();
 
   const matches = [];
@@ -2001,7 +2028,7 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
       .filter(r => r.tipoRelacion === '07')
       .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
       .map(u => (u || '').toUpperCase());
-    const ventaMatch = uuidsRel.find(u => ventaSet.has(u));
+    const ventaMatch = uuidsRel.find(u => ventaSet.has(u)) ?? ventaPorEgresoErp.get(eg.uuid);
     if (!ventaMatch) continue;
     const total = Number(eg.total) || 0;
     if (total <= 0) continue;

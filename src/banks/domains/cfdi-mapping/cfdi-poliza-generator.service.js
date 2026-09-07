@@ -3436,6 +3436,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const _rel07 = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
       const uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
       const ventaTotal07 = uuid07 ? anticosCubiertosPorReg22C.get(uuid07) : undefined;
+      if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
+        console.warn(`[DEBUG_EGR_SKIP] cfdi=${cfdi.serie}-${cfdi.folio} rule=${rule?.nombre} rule.cuentaCargo=${rule?.cuentaCargo} `
+          + `uuid07=${uuid07} ventaTotal07=${ventaTotal07} cfdiTotal=${cfdi.total} `
+          + `enMapa=${anticosCubiertosPorReg22C.has(uuid07)}`);
+      }
       if (ventaTotal07 != null && (Number(cfdi.total) || 0) < ventaTotal07 - 0.01) continue;
     }
     const context = {};
@@ -3512,6 +3517,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    if (process.env.DEBUG_OPA_UUID && [process.env.DEBUG_OPA_UUID.toUpperCase(), '7639BEF9-1C4B-4B9E-9E1E-D22D6D7E8070'].includes((cfdi.uuid || '').toUpperCase())) {
+      console.warn(`[DEBUG_EGR_MOVS] cfdi=${cfdi.serie}-${cfdi.folio} uuid=${cfdi.uuid} tipoDeComprobante=${cfdi.tipoDeComprobante} `
+        + `formaPago=${cfdi.formaPago} rule=${rule?.nombre} rule.cuentaCargo=${rule?.cuentaCargo} movs.length=${movs.length} `
+        + `context=${JSON.stringify(context)}`);
+    }
 
     if (rule?.esAplicacionSaldo) {
       const usado = movs.find(m => m._saldoUsado != null)?._saldoUsado ?? 0;

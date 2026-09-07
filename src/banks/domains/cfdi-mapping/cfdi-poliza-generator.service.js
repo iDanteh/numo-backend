@@ -2627,12 +2627,34 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     }).select('uuid').lean();
     const uuidsConIndicadorErp = erpConIndicador.map(d => d.uuid);
 
+    // BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA, venta C0-260900035/
+    // Egreso C0-260900036, cancelación COMPLETA de una Factura Final de
+    // Anticipo, ambos $3,827.37): mismo problema que el bloque de arriba,
+    // pero para NCs tipoRelacion='07' (Aplicación de Anticipo — "Reg 23"/
+    // "TO-EGR"). El ERP declara `tipoOrigen: 'Egreso'` y/o su propio
+    // `cfdiRelacionados.tipoRelacion='07'`, pero el SAT trae
+    // `cfdiRelacionados: []` — sin este indicador, esta función NUNCA las
+    // encontraba (ni por el filtro 01/03 ni por el indicador de arriba,
+    // pensado solo para BON/BCT/CANCELACION), así que jamás se fusionaban a
+    // la póliza de Ingreso de su venta — el ingreso quedaba reconocido sin
+    // su reversión, sin ningún error visible.
+    const erpConAnticipo07 = await CFDI.find({
+      uuid:   { $in: [...uuidsNcDelDia] },
+      source: 'ERP',
+      $or: [
+        { tipoOrigen: 'Egreso' },
+        { 'cfdiRelacionados.tipoRelacion': '07' },
+      ],
+    }).select('uuid').lean();
+    const uuidsConAnticipo07Erp = erpConAnticipo07.map(d => d.uuid);
+
     const ncsRaw = await CFDI.find({
       ...filtroBaseNc,
       uuid: { $in: [...uuidsNcDelDia] },
       $or: [
         { 'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] } },
         { uuid: { $in: uuidsConIndicadorErp } },
+        { uuid: { $in: uuidsConAnticipo07Erp } },
       ],
     })
       .select(selectNc)

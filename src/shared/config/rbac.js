@@ -123,6 +123,14 @@ const PERMISSIONS = Object.freeze({
   // BANKS_CFDI_READ: decisión pendiente del usuario, admin lo tiene por el wildcard '*'.
   BANKS_ERP_REVERSIONES: 'banks:erp:reversiones',
 
+  // Transferencias entre cajas — matching de "Depósito en efectivo" huérfanos contra
+  // transferencias internas de Kore (ver caja-transferencia-*.service.js). Permiso propio
+  // y exclusivo (2026-09-03, pedido explícito del usuario): la sección todavía no debe ser
+  // visible para nadie más que admin — sin asignar a contabilidad/cobranza todavía, admin
+  // lo tiene por el wildcard '*'. Gatea el botón/panel completo (listar, bandeja,
+  // sincronizar manual, confirmar match).
+  BANKS_TRANSFERENCIAS_CAJA: 'banks:transferencias-caja',
+
   // Configuraciones Globales (runtime, ver global-config.service.js) — dos niveles a propósito,
   // mismo patrón que banks:erp:read/link/unlink. CONFIG_MANAGE: ver/crear secciones, ver
   // valores (secretos enmascarados), editar cualquier valor. CONFIG_SECRETS_REVEAL: además,

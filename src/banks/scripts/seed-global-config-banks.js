@@ -117,6 +117,7 @@ async function seedBancos(fallos) {
       'NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreTipoTransferencia esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
       'NOMBRE_CAJA_DESTINO_PERMITIDAS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreCajaDestino esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
       'TRANSFERENCIAS_DATE_WINDOW_DAYS — Ventana de fecha (± días) del matching de transferencias entre cajas contra Depósito en efectivo. Distinta de DATE_WINDOW_DAYS (esa es del motor ERP↔CxC).',
+      'FICHAS_IMAGEN_FOLDER_ID — ID de la carpeta de Google Drive donde se guardará la imagen/documento de respaldo de una ficha bancaria (misma cuenta de servicio que COMPROBANTES_IMAGEN_FOLDER_ID en la sección Solicitudes de Cobro, GOOGLE_SERVICE_ACCOUNT_KEY2 — hay que compartirle esta carpeta también). El usuario la declara él mismo desde esta UI, no se siembra con un valor.',
     ],
   });
 
@@ -228,6 +229,12 @@ async function seedBancos(fallos) {
     });
     console.log('[seed-banks] bancos.TRANSFERENCIAS_DATE_WINDOW_DAYS = 5 (default de arranque — ajustable desde la UI)');
   });
+
+  // FICHAS_IMAGEN_FOLDER_ID (2026-09-03) — NO se siembra desde acá a propósito: el usuario
+  // la va a declarar él mismo desde la UI de Configuraciones Globales (corrección explícita
+  // sobre un primer intento que sí la sembraba, y que además incluía un interruptor
+  // FICHAS_IMAGEN_HABILITADA que no debía existir — se sacó por completo). Queda documentada
+  // en `modulos` de arriba para que se sepa qué representa cuando el usuario la cree.
 }
 
 // ── kore ──────────────────────────────────────────────────────────────────────
@@ -287,9 +294,14 @@ async function seedKore(fallos) {
 async function seedSolicitudes(fallos) {
   await _asegurarSeccion('solicitudes', {
     nombre:      'Solicitudes de Cobro',
-    descripcion: 'API key compartida para autenticar llamadas server-to-server que Kore hace HACIA Numo (sin JWT/Auth0).',
+    descripcion: 'API key compartida para autenticar llamadas server-to-server que Kore hace HACIA Numo (sin JWT/Auth0), más el folder de Drive de los comprobantes.',
     modulos: [
       'API_KEY — Autentica llamadas server-to-server que Kore hace hacia Numo: el webhook de reversión de CxC (POST /api/erp/cxc-reversiones) y los endpoints de Solicitudes de Cobro que el ERP llama directamente (crear, consultar por id, cancelar)',
+      // 2026-09-03: NO se siembra con un valor — hoy el folder real sigue viniendo de
+      // GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID en .env (drive-comprobantes.service.js); esta
+      // clave queda documentada acá para cuando el usuario declare el valor desde la UI y el
+      // código pase a leerla de Configuraciones Globales en vez de .env.
+      'COMPROBANTES_IMAGEN_FOLDER_ID — ID de la carpeta de Google Drive donde se guardan los comprobantes de las Solicitudes de Cobro (misma cuenta de servicio que FICHAS_IMAGEN_FOLDER_ID en la sección Bancos, GOOGLE_SERVICE_ACCOUNT_KEY2). El usuario la declara él mismo desde esta UI, no se siembra con un valor.',
     ],
   });
 

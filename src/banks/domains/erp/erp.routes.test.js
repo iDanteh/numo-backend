@@ -160,6 +160,26 @@ describe('_aporteConRatchet', () => {
   });
 });
 
+// _debeRecalcularAporte — CORRECCIÓN 2026-09-04 (pedido explícito del usuario): un link
+// finalizadoManualmente (vino de cobro-panel/Solicitudes de Cobro, con saldoErp ya fijado
+// por un humano al aplicar el cobro) NUNCA vuelve a recalcular su aporte en
+// _recomputeErpKoreJob — ese saldoErp es la fuente de la verdad definitiva. El flujo
+// tradicional (nunca cumple finalizadoManualmente) sigue recalculando igual que siempre.
+describe('_debeRecalcularAporte', () => {
+  test('vínculo humano tradicional (finalizadoManualmente=false): SÍ recalcula', () => {
+    expect(router._debeRecalcularAporte(true, false)).toBe(true);
+  });
+
+  test('vínculo humano ya finalizado manualmente (cobro-panel/Solicitudes): NUNCA recalcula', () => {
+    expect(router._debeRecalcularAporte(true, true)).toBe(false);
+  });
+
+  test('vínculo de motor automático (esHumano=false): nunca recalcula acá, sin importar finalizadoManualmente', () => {
+    expect(router._debeRecalcularAporte(false, false)).toBe(false);
+    expect(router._debeRecalcularAporte(false, true)).toBe(false);
+  });
+});
+
 describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruzada entre movimientos)', () => {
   // Caso real simple, folioExterno 260800166: 2 movimientos pagan $100 cada uno a la misma
   // CxC, se revierte 1 sin Aut/Numo — la reversión canceló el abono MÁS RECIENTE (American
@@ -769,13 +789,13 @@ describe('GET /transferencias-cajas', () => {
     app.use(router);
   });
 
-  test('responde 403 sin banks:erp:read', async () => {
+  test('responde 403 sin banks:transferencias-caja', async () => {
     const res = await request(app)
       .get('/transferencias-cajas')
       .set('x-test-permissions', JSON.stringify([]));
 
     expect(res.status).toBe(403);
-    expect(res.body.required).toEqual([PERMISSIONS.BANKS_ERP_READ]);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]);
     expect(koreCaja.buscarTransferenciasCajas).not.toHaveBeenCalled();
   });
 
@@ -799,7 +819,7 @@ describe('GET /transferencias-cajas', () => {
     const res = await request(app)
       .get('/transferencias-cajas')
       .query({ fechaDesde: '2026-09-01T00:00:00Z', fechaHasta: '2026-09-01T23:59:59Z' })
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_ERP_READ]));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(koreCaja.buscarTransferenciasCajas).toHaveBeenCalledWith({
@@ -818,14 +838,15 @@ describe('GET /transferencias-cajas', () => {
 
     const res = await request(app)
       .get('/transferencias-cajas')
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_ERP_READ]));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(503);
   });
 });
 
 // POST /transferencias-cajas/sincronizar-manual — pedido del usuario: sincronización con
-// fechaDesde/fechaHasta a mano, mismo permiso que el sync manual ERP-Kore ('banks:admin').
+// fechaDesde/fechaHasta a mano. 2026-09-03: banks:admin -> banks:transferencias-caja (mismo
+// permiso que el resto de la sección, admin-only por ahora de cualquier forma).
 describe('POST /transferencias-cajas/sincronizar-manual', () => {
   let app;
 
@@ -836,7 +857,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     app.use(router);
   });
 
-  test('responde 403 sin banks:admin', async () => {
+  test('responde 403 sin banks:transferencias-caja', async () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
@@ -852,7 +873,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
-      .set('x-test-permissions', JSON.stringify(['banks:admin']));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(sincronizarTransferenciasCajasManual).toHaveBeenCalledWith({
@@ -867,7 +888,7 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({})
-      .set('x-test-permissions', JSON.stringify(['banks:admin']));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(400);
   });
@@ -878,14 +899,14 @@ describe('POST /transferencias-cajas/sincronizar-manual', () => {
     const res = await request(app)
       .post('/transferencias-cajas/sincronizar-manual')
       .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
-      .set('x-test-permissions', JSON.stringify(['banks:admin']));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);
   });
 });
 
-// GET /transferencias-cajas/bandeja — Fase D: pendientes con candidatos (Fase C, en vivo)
-// separados de huerfanas.
+// GET /transferencias-cajas/bandeja — Fase D: pendientes con candidatos (Fase C, en vivo).
+// (2026-09-02: se eliminó el apartado de huérfanas — pedido explícito del usuario.)
 describe('GET /transferencias-cajas/bandeja', () => {
   let app;
 
@@ -895,7 +916,7 @@ describe('GET /transferencias-cajas/bandeja', () => {
     app.use(router);
   });
 
-  test('responde 403 sin banks:erp:read', async () => {
+  test('responde 403 sin banks:transferencias-caja', async () => {
     const res = await request(app)
       .get('/transferencias-cajas/bandeja')
       .set('x-test-permissions', JSON.stringify([]));
@@ -904,28 +925,29 @@ describe('GET /transferencias-cajas/bandeja', () => {
     expect(CajaTransferencia.find).not.toHaveBeenCalled();
   });
 
-  test('separa pendientes (con candidatos calculados) de huerfanas', async () => {
+  test('devuelve pendientes con sus candidatos calculados', async () => {
     const pendiente = { _id: 't-1', estatusMatch: 'pendiente', monto: 1500 };
-    const huerfana   = { _id: 't-2', estatusMatch: 'huerfana', monto: 999 };
-    CajaTransferencia.find = jest.fn((filtro) => ({
+    CajaTransferencia.find = jest.fn(() => ({
       sort: jest.fn(() => ({
-        lean: jest.fn().mockResolvedValue(filtro.estatusMatch === 'pendiente' ? [pendiente] : [huerfana]),
+        lean: jest.fn().mockResolvedValue([pendiente]),
       })),
     }));
     buscarCandidatos.mockResolvedValue([[{ _id: 'mov-1' }]]);
 
     const res = await request(app)
       .get('/transferencias-cajas/bandeja')
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_ERP_READ]));
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [[{ _id: 'mov-1' }]] }]);
-    expect(res.body.huerfanas).toEqual([huerfana]);
+    expect(res.body.huerfanas).toBeUndefined();
   });
 });
 
-// POST /transferencias-cajas/:id/confirmar — Fase D: sin permit() propio a propósito (ver
-// comentario en erp.routes.js) — setErpIds() exige el permiso internamente.
+// POST /transferencias-cajas/:id/confirmar — Fase D. 2026-09-03: ahora SÍ lleva permit()
+// propio (banks:transferencias-caja) — antes se dejaba sin permit() a propósito porque
+// setErpIds() ya exige banks:erp:link/banks:cobro internamente, pero el usuario pidió
+// explícitamente acotar TODA la sección a admin (ver comentario en erp.routes.js).
 describe('POST /transferencias-cajas/:id/confirmar', () => {
   let app;
 
@@ -936,12 +958,23 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
     app.use(router);
   });
 
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/confirmar')
+      .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(confirmarMatch).not.toHaveBeenCalled();
+  });
+
   test('delega en confirmarMatch con los movementIds del body y el usuario autenticado', async () => {
     confirmarMatch.mockResolvedValue({ transferencia: { _id: 't-1', estatusMatch: 'matcheada' }, movimientos: [] });
 
     const res = await request(app)
       .post('/transferencias-cajas/t-1/confirmar')
-      .send({ movementIds: ['mov-1', 'mov-2'] });
+      .send({ movementIds: ['mov-1', 'mov-2'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
     expect(confirmarMatch).toHaveBeenCalledWith('t-1', ['mov-1', 'mov-2'], expect.objectContaining({ _id: 'user-test' }));
@@ -954,7 +987,8 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
 
     const res = await request(app)
       .post('/transferencias-cajas/t-1/confirmar')
-      .send({ movementIds: ['mov-1'] });
+      .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);
   });

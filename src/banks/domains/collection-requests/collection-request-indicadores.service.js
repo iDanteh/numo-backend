@@ -25,6 +25,27 @@ const { horasHabilesEntre, promedio, mediana } = require('../banks/bank-indicado
 
 const MS_PER_HOUR = 3600000;
 
+// 2026-09-07 (pedido explícito del usuario): admin puede acotar el panel a uno o varios
+// contadores específicos (antes solo "todo el equipo" vs. "solo lo propio", fijo por
+// rol) — scopeUserId puede llegar como array además del escalar de siempre. Helper
+// compartido para no duplicar el `Array.isArray` en los 2 puntos donde se arma el match.
+//
+// Defensa en profundidad (hallazgo WARNING de la revisión de confiabilidad
+// independiente, 2026-09-07): un array VACÍO se trata explícitamente como "sin filtro"
+// (mismo resultado que scopeUserId undefined/null), nunca como `{ $in: [] }` (que
+// matchearía CERO documentos). Hoy la ruta HTTP (_resolveScopeUserId en
+// collection-request.routes.js) ya normaliza un array vacío a `undefined` antes de
+// llegar acá, así que este caso no es alcanzable en producción por ese camino — pero
+// esta función es exportada/reusable (getIndicadoresSolicitudesCobro/
+// getDistribucionSolicitudesCobro la llaman directo con lo que reciban), y no debe
+// depender de que el único caller existente la blindee por ella.
+function _matchScopeUserId(scopeUserId) {
+  if (Array.isArray(scopeUserId)) {
+    return scopeUserId.length ? { $in: scopeUserId } : undefined;
+  }
+  return scopeUserId;
+}
+
 // Fecha de corte del indicador — decisión explícita del usuario (2026-08-20, mismo
 // criterio que INDICADORES_DESDE en bank-indicadores.service.js): solo se miden
 // solicitudes creadas desde esta fecha en adelante, para no ensuciar el promedio con
@@ -105,9 +126,22 @@ function distribucionPorMinutos(horasArr, cortesMinutos = [30, 60, 120]) {
  * @param {object} [filtros]
  * @param {string|number} [filtros.year]
  * @param {string|number} [filtros.month] (1-12, requiere year)
+ * @param {string|string[]} [filtros.scopeUserId] admin: undefined (ve todo el equipo) o
+ *   un array de userIds para acotar a uno o varios contadores específicos (2026-09-07,
+ *   pedido explícito del usuario). Cualquier otro rol con collections:read: su propio
+ *   _id (escalar) — acota TODO el panel a lo que él mismo resolvió (resueltoPorUserId),
+ *   pedido explícito del usuario (2026-09-03). Un array VACÍO se trata igual que
+ *   undefined (sin filtro, todo el equipo) — nunca produce cero resultados.
  */
-async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
+async function getIndicadoresSolicitudesCobro({ year, month, scopeUserId } = {}) {
   const match = { status: 'identificada', resueltoAt: { $ne: null } };
+  // scopeUserId truthy pero resuelto a undefined (array vacío, ver _matchScopeUserId) no
+  // debe dejar la clave en el match — un `resueltoPorUserId: undefined` explícito no es lo
+  // mismo que "la clave no existe" de cara a Mongo, mejor no depender de esa equivalencia.
+  const matched = scopeUserId ? _matchScopeUserId(scopeUserId) : undefined;
+  if (matched !== undefined) {
+    match.resueltoPorUserId = matched;
+  }
   if (year) {
     const y = parseInt(year, 10);
     const m = month != null ? parseInt(month, 10) - 1 : null;
@@ -122,7 +156,7 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
   }
 
   const solicitudes = await CollectionRequest.find(match)
-    .select('createdAt resueltoAt resueltoPorUserId resueltoPorNombre formasPago.bankMovementId bankMovementId')
+    .select('createdAt resueltoAt formasPago.bankMovementId bankMovementId')
     .populate('formasPago.bankMovementId', 'createdAt')
     .populate('bankMovementId', 'createdAt')
     .lean();
@@ -130,59 +164,26 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
   const totalHorasArr = [];
   const fase1HorasArr = [];
   const fase2HorasArr = [];
-  const porUsuarioMap = new Map();
   let sinMovimientoVinculado = 0;
 
   for (const cr of solicitudes) {
     const totalHoras = horasReloj(cr.createdAt, cr.resueltoAt);
     totalHorasArr.push(totalHoras);
 
-    // 2026-08-20 (fix real, reportado por el usuario): "Por contador" mostraba el
-    // promedio del TOTAL (creada->resuelta, reloj real) partido por resueltoPorUserId —
-    // eso mezclaba la demora de banco/Kore (fuera del control del contador) en la métrica
-    // "por contador", y explicaba el desfase real que el usuario vio (cada contador
-    // promediando ~4min de TOTAL, mientras el bucket "Fase Contador" de arriba —
-    // horasHabilesEntre del PRIMER movimiento a resueltoAt, para TODA la población —
-    // mostraba 3h33m). Ahora "Por contador" acumula fase2Horas (la misma fase-contador
-    // del bucket de arriba), NO totalHoras — así el desglose por persona es
-    // consistente con el agregado que está justo arriba, y aísla lo que cada contador
-    // realmente controla (nunca la demora del banco/Kore).
     const [primerMov] = movimientosDe(cr);
-    const key = cr.resueltoPorUserId ?? '__sin_usuario__';
-    if (!porUsuarioMap.has(key)) {
-      porUsuarioMap.set(key, {
-        userId: cr.resueltoPorUserId ?? null,
-        nombre: cr.resueltoPorNombre ?? null,
-        fase2Horas: [],
-      });
-    }
 
     if (primerMov?.createdAt) {
       fase1HorasArr.push(horasReloj(cr.createdAt, primerMov.createdAt));
       const fase2 = horasHabilesEntre(inicioFaseContador(cr.createdAt, primerMov.createdAt), cr.resueltoAt);
       fase2HorasArr.push(fase2);
-      porUsuarioMap.get(key).fase2Horas.push(fase2);
     } else {
       // No debería pasar para status:'identificada' (identificar() siempre asigna al
       // menos 1 movimiento) — se cubre por si acaso un dato histórico quedó inconsistente
       // (ej. documentos de antes del backfill de formasPago[].bankMovementId). Cuenta
-      // para el total, pero no aporta a fase1/fase2/por-contador (no hay con qué partir
-      // el rango).
+      // para el total, pero no aporta a fase1/fase2 (no hay con qué partir el rango).
       sinMovimientoVinculado++;
     }
   }
-
-  // Solo contadores con al menos 1 solicitud CON movimiento vinculado — sin eso no hay
-  // fase2 que promediar para esa persona (evita mostrar un promedio null/NaN en la tabla).
-  const porUsuario = [...porUsuarioMap.values()]
-    .filter(u => u.fase2Horas.length > 0)
-    .map(u => ({
-      userId: u.userId,
-      nombre: u.nombre,
-      promedioHoras: promedio(u.fase2Horas),
-      count: u.fase2Horas.length,
-    }))
-    .sort((a, b) => b.count - a.count);
 
   return {
     totalSolicitudesResueltas: solicitudes.length,
@@ -191,10 +192,98 @@ async function getIndicadoresSolicitudesCobro({ year, month } = {}) {
     fase1Banco:    { promedioHoras: promedio(fase1HorasArr), medianaHoras: mediana(fase1HorasArr), count: fase1HorasArr.length },
     fase2Contador: { promedioHoras: promedio(fase2HorasArr), medianaHoras: mediana(fase2HorasArr), count: fase2HorasArr.length },
     distribucionTotal: distribucionPorMinutos(totalHorasArr),
-    porUsuario,
   };
+}
+
+// Helpers de fecha MX — mismo criterio que _medianocheMx()/_inicioDeHoy() en
+// collection-request.service.js (duplicado a propósito: ese mismo patrón ya está
+// duplicado en cfdi-poliza-generator.service.js, no amerita centralizar una función
+// de 2 líneas — México sin DST desde 2022, offset fijo UTC-6).
+function _medianocheMx(fechaStr) {
+  return new Date(`${fechaStr}T06:00:00.000Z`);
+}
+function _hoyMxStr() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' });
+}
+
+/**
+ * Distribución por franja de tiempo — ACOTADA por defecto al día actual (hora de
+ * México), a diferencia de getIndicadoresSolicitudesCobro() (agrega TODO el
+ * histórico desde INDICADORES_CR_DESDE). Pedido explícito del usuario (2026-09-03,
+ * alcance confirmado: SOLO este bloque, el resto del panel sigue con año/mes).
+ *
+ * `desde`/`hasta` son strings 'YYYY-MM-DD' (mismo formato que ya usa buildReport()/
+ * _buildBusquedaFilter en collection-request.service.js) — cuando vienen, filtran
+ * por createdAt con el MISMO criterio de medianoche MX que ya usa el reporte Excel
+ * de esta sección, así el gráfico y la descarga siempre muestran la misma
+ * población. Sin ellos, cae al día de hoy (desde === hasta === hoy).
+ *
+ * @param {string|string[]} [scopeUserId] mismo criterio que getIndicadoresSolicitudesCobro():
+ *   admin → undefined (todo el equipo) o array de userIds (contadores elegidos);
+ *   cualquier otro rol → su propio _id (escalar). Un array VACÍO se trata igual que
+ *   undefined (sin filtro, todo el equipo) — nunca produce cero resultados.
+ */
+async function getDistribucionSolicitudesCobro({ desde, hasta, scopeUserId } = {}) {
+  const desdeStr = desde || _hoyMxStr();
+  const hastaStr = hasta || desdeStr;
+
+  const gte = _medianocheMx(desdeStr);
+  const lt  = new Date(_medianocheMx(hastaStr).getTime() + 24 * 60 * 60 * 1000);
+
+  // Mismo criterio que getIndicadoresSolicitudesCobro(): el corte de frescura gana
+  // si alguien pidiera (a mano, vía API) un rango más viejo que INDICADORES_CR_DESDE.
+  const match = {
+    status: 'identificada',
+    resueltoAt: { $ne: null },
+    createdAt: { $gte: gte > INDICADORES_CR_DESDE ? gte : INDICADORES_CR_DESDE, $lt: lt },
+  };
+  // Mismo criterio que getIndicadoresSolicitudesCobro(): un array vacío nunca deja la
+  // clave resueltoPorUserId puesta en el match (ver _matchScopeUserId).
+  const matched = scopeUserId ? _matchScopeUserId(scopeUserId) : undefined;
+  if (matched !== undefined) {
+    match.resueltoPorUserId = matched;
+  }
+
+  const solicitudes = await CollectionRequest.find(match).select('createdAt resueltoAt').lean();
+  const totalHorasArr = solicitudes.map(cr => horasReloj(cr.createdAt, cr.resueltoAt));
+
+  return {
+    desde: desdeStr,
+    hasta: hastaStr,
+    total: totalHorasArr.length,
+    distribucionTotal: distribucionPorMinutos(totalHorasArr),
+  };
+}
+
+// 2026-09-07 (fix real, reportado por el admin en pruebas: el <select> del filtro de
+// contador ofrecía CUALQUIER usuario con rol contabilidad/cobranza, sin importar si
+// alguna vez resolvió algo — UserService.listUsers() trae TODOS los usuarios de esos
+// roles, dados de alta o no, activos o no). Esta función es la contraparte real: solo
+// los auth0Sub que de verdad aparecen en CollectionRequest.resueltoPorUserId (alguna
+// solicitud identificada). `.distinct()` sin populate — igual de barata que los usos ya
+// existentes de este patrón (ver bank.service.js#_buildFilter, BankMovement.distinct).
+// `.filter(Boolean)` descarta null (documentos históricos sin resueltoPorUserId, ver
+// CollectionRequest.model.js#resueltoPorUserId, default null).
+//
+// 2026-09-07 (WARNING de la revisión de confiabilidad independiente): esta función no
+// aplicaba el mismo corte de frescura INDICADORES_CR_DESDE que getIndicadoresSolicitudesCobro()
+// y getDistribucionSolicitudesCobro() ya aplican — un contador cuya única actividad es
+// anterior al corte aparecía como elegible en el <select> del admin, pero el panel
+// siempre iba a mostrarle "0 resultados" sin ninguna indicación de que era por el
+// corte de fecha y no por falta de datos reales. Este endpoint no recibe year/month
+// (ver GET /indicadores/contadores en collection-request.routes.js), así que alcanza
+// con el mismo `$gte` fijo que usa getIndicadoresSolicitudesCobro() cuando no se pide
+// year — no hace falta un `$lte` porque no hay un rango explícito que acotar.
+async function listContadoresConSolicitudesIdentificadas() {
+  const ids = await CollectionRequest.distinct('resueltoPorUserId', {
+    status: 'identificada',
+    resueltoAt: { $ne: null },
+    createdAt: { $gte: INDICADORES_CR_DESDE },
+  });
+  return ids.filter(Boolean);
 }
 
 module.exports = {
   getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, distribucionPorMinutos, INDICADORES_CR_DESDE,
+  getDistribucionSolicitudesCobro, listContadoresConSolicitudesIdentificadas,
 };

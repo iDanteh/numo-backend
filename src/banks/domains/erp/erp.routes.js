@@ -31,6 +31,7 @@ const {
 const CajaTransferencia                  = require('./CajaTransferencia.model');
 const { buscarCandidatos }               = require('./caja-transferencia-match.service');
 const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
+const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-pendiente.service');
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
@@ -254,7 +255,11 @@ router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFD
 // efectivo/reclasificado se implementa en una fase posterior (pedido explícito del
 // usuario: "primero quiero que se sienten las bases").
 // Parámetros: fechaDesde, fechaHasta (opcionales, mismo formato ISO que Kore espera).
-router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
+// 2026-09-03 (pedido explícito del usuario): la sección completa de Transferencias entre
+// cajas todavía no debe ser visible para nadie más que admin — permiso propio
+// banks:transferencias-caja (antes banks:erp:read, que también da acceso a otras cosas
+// del modal ERP ajenas a este feature).
+router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { fechaDesde, fechaHasta } = req.query;
 
   let raw = [];
@@ -301,8 +306,10 @@ router.get('/transferencias-cajas', authenticate, permit(PERMISSIONS.BANKS_ERP_R
 // POST /api/erp/transferencias-cajas/sincronizar-manual — pedido explícito del usuario
 // (2026-09-01): sincronización bajo demanda con fechaDesde/fechaHasta elegidas a mano, sin
 // esperar al cron diario ni quedar atada a VENTANA_MAX_DIAS (esa cota es solo del catch-up
-// automático). Mismo permiso que el sync manual ERP-Kore existente (POST /sync-erp-kore).
-router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+// automático). 2026-09-03: pasó de banks:admin a banks:transferencias-caja — mismo permiso
+// que el resto de la sección (ver nota en GET /transferencias-cajas), admin-only por ahora
+// de cualquier forma (ninguno de los 2 permisos está asignado a otro rol todavía).
+router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { fechaDesde, fechaHasta } = req.body;
   try {
     const resultado = await sincronizarTransferenciasCajasManual({ fechaDesde, fechaHasta });
@@ -324,14 +331,13 @@ router.post('/transferencias-cajas/sincronizar-manual', authenticate, permit('ba
 
 // GET /api/erp/transferencias-cajas/bandeja — Fase D: transferencias 'pendiente' con sus
 // candidatos ya calculados (Fase C, en vivo — nunca cacheados) para que el usuario confirme
-// desde la UI, separadas de las 'huerfana' (apartado distinto, pedido explícito del usuario:
-// "que no se mezclen con las transferencias que sí logran hacer match").
-router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_ERP_READ), asyncHandler(async (req, res) => {
-  const [pendientes, huerfanas] = await Promise.all([
-    CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
-      .sort({ fechaRecepcion: 1 }).lean(),
-    CajaTransferencia.find({ estatusMatch: 'huerfana' }).sort({ fechaRecepcion: -1 }).lean(),
-  ]);
+// desde la UI. (2026-09-02: se eliminó el apartado de 'huerfana' — pedido explícito del
+// usuario, va a reemplazarse por algo distinto todavía no definido.)
+// 2026-09-03: banks:erp:read -> banks:transferencias-caja, mismo criterio que el resto de
+// la sección — ver nota en GET /transferencias-cajas.
+router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
+  const pendientes = await CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
+    .sort({ fechaRecepcion: 1 }).lean();
 
   const conCandidatos = await Promise.all(pendientes.map(async (t) => ({
     transferencia: t,
@@ -340,20 +346,33 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
 
   res.json({
     pendientes: conCandidatos,
-    huerfanas,
   });
 }));
 
 // POST /api/erp/transferencias-cajas/:id/confirmar — Fase D: confirma un match sugerido
 // contra 1 o 2 BankMovement elegidos por el usuario desde la bandeja. Re-valida
 // elegibilidad y suma de monto server-side (caja-transferencia-confirm.service.js) — nunca
-// confía en que el candidato que manda el cliente sigue siendo válido. Sin permit() propio
-// a propósito — mismo criterio que PUT .../erp-ids (bank.routes.js): setErpIds() ya exige
-// banks:erp:link O banks:cobro internamente, poner permit() acá lo duplicaría más estricto
-// y bloquearía a cobranza (banks:cobro) sin banks:erp:link — bug real ya corregido una vez.
-router.post('/transferencias-cajas/:id/confirmar', authenticate, asyncHandler(async (req, res) => {
+// confía en que el candidato que manda el cliente sigue siendo válido.
+// 2026-09-03 (pedido explícito del usuario, reemplaza la decisión anterior): esta ruta SÍ
+// lleva permit() propio ahora — banks:transferencias-caja, admin-only por ahora. Antes se
+// dejaba sin permit() a propósito porque setErpIds() ya exige banks:erp:link O banks:cobro
+// internamente (mismo criterio que PUT .../erp-ids en bank.routes.js) y agregar un permit()
+// más estricto acá bloqueaba a cobranza sin banks:erp:link — pero el usuario ahora pide
+// explícitamente que TODA la sección quede acotada a admin, así que ese bloqueo es el
+// comportamiento deseado, no un bug.
+router.post('/transferencias-cajas/:id/confirmar', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { movementIds } = req.body;
   const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
+  res.json(resultado);
+}));
+
+// GET /api/erp/transferencias-cajas/pendientes-ficha — total cross-banco de BankMovement
+// que quedaron 'identificado' por un match automático de transferencia de caja
+// (erpLinks.origen:'transferencia-caja') pero todavía no tienen `ficha` (folio del
+// comprobante físico) cargada — respaldo documental que el contador debe completar a mano.
+// Mismo permiso que PATCH /movements/:id/ficha (banks:ficha, bank.routes.js).
+router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMISSIONS.BANKS_FICHA), asyncHandler(async (req, res) => {
+  const resultado = await listarPendientesDeFicha();
   res.json(resultado);
 }));
 
@@ -1290,6 +1309,16 @@ function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true) 
   return resultado;
 }
 
+// Un link `finalizadoManualmente` (vino de cobro-panel/Solicitudes de Cobro, con saldoErp
+// ya fijado por un humano en el momento de aplicar el cobro) NUNCA vuelve a recalcular su
+// aporte en _recomputeErpKoreJob — CORRECCIÓN 2026-09-04, pedido explícito del usuario: ese
+// saldoErp es la fuente de la verdad definitiva, no algo que este job deba corregir después.
+// El flujo tradicional (botón "Guardar", sin fechaAnclaAlterna — nunca cumple
+// finalizadoManualmente) sigue recalculando exactamente igual que antes, sin cambios.
+function _debeRecalcularAporte(esHumano, finalizadoManualmente) {
+  return esHumano && !finalizadoManualmente;
+}
+
 // Piso de aporte para un depósito bancario ya vinculado por un HUMANO: nunca debe bajar en
 // una corrida posterior de "Recalcular saldo ERP", sin importar la causa (retención,
 // cancelación, devolución — CAC/DEV/RET, o cualquier otro ajuste que Kore aplique después).
@@ -1963,10 +1992,12 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
 
           // Vínculo humano: recalcula el aporte con el criterio nuevo (todas las formas de
           // pago) — vínculo de motor: se deja intacto, solo recibe el backfill del snapshot.
+          // Ver _debeRecalcularAporte() arriba: un link finalizadoManualmente nunca entra
+          // acá — solo recibe el backfill de folioFiscal/trazabilidad, más abajo.
           const esHumano  = _erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId);
           let aporteNuevo = link.saldoErpAportado ?? null;
           let cambioAporte = false;
-          if (esHumano) {
+          if (_debeRecalcularAporte(esHumano, finalizadoManualmente)) {
             // calculado puede venir null (ninguna entrada de Kore trae el Aut/Numo de ESTE
             // movimiento) — _aporteConRatchet decide el piso a usar en ese caso. Generaliza
             // el fix 2026-07-29 (folio 036030, retención sin formasPago real) y agrega el
@@ -3007,6 +3038,7 @@ router._aportesPorErpIdCronologico  = _aportesPorErpIdCronologico;
 router._esFormaPagoBancariaKore     = _esFormaPagoBancariaKore;
 router._montoSaldoLinkPorAutorizacion = _montoSaldoLinkPorAutorizacion;
 router._aporteConRatchet            = _aporteConRatchet;
+router._debeRecalcularAporte        = _debeRecalcularAporte;
 router._FILTRO_LINK_ATRAPADO        = _FILTRO_LINK_ATRAPADO;
 router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;

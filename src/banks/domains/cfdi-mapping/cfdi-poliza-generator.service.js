@@ -10,7 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
-const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro } = require('../erp/erp-sync.service');
+const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -1303,6 +1303,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // mostrar el folio de factura llevaba a buscar un ticket equivocado en
           // Kore y comparar contra un saldo que no correspondía).
           const serFolTicket = `${cuenta.serieVenta || serie}-${cuenta.folioVenta ? String(cuenta.folioVenta) : folio}`;
+          if (process.env.DEBUG_COS_TICKET && serFolTicket.includes(process.env.DEBUG_COS_TICKET)) {
+            console.warn(`[DEBUG_COS_PUSH] claveFac=${k} serFolTicket=${serFolTicket} monto=${monto} claveSat=${fp.claveSat} folioOrigen=${cobro.folioOrigen}`);
+          }
           cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, serFolTicket, folioOrigen: cobro.folioOrigen ?? null });
         }
       }
@@ -1673,7 +1676,21 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   }
   const subtotal = Math.round((montoPropio / 1.16) * 100) / 100;
   const iva = Math.round((montoPropio - subtotal) * 100) / 100;
-  const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+  // El nombre del cliente debe ser el de la VENTA ORIGEN (generado.ventaSerie/
+  // ventaFolio), NUNCA el receptor de la Devolución/NC misma (`cfdi`) — bug
+  // real 2026-09-03, caso JOSUE YAIR CARMONA NORIEGA / D0-260806293: la
+  // venta original SÍ tenía el cliente real capturado, pero la NC que generó
+  // el saldo a favor se capturó genérica como "PUBLICO EN GENERAL" en el
+  // POS, y el concepto (que muestra la referencia de la VENTA, no de la NC)
+  // terminaba con un nombre que no correspondía a esa venta. Si no se
+  // encuentra la venta origen, cae al receptor de la NC como antes.
+  const cfdiVentaOrigen = (generado.ventaSerie && generado.ventaFolio)
+    ? await CFDI.findOne(
+        { 'emisor.rfc': rfc, serie: generado.ventaSerie, folio: String(generado.ventaFolio) },
+        { 'receptor.nombre': 1 },
+      ).lean()
+    : null;
+  const nombreCliente = cfdiVentaOrigen?.receptor?.nombre ?? cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
   const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
   const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
 
@@ -2460,11 +2477,24 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   // el día que se timbre, sin duplicar el cargo (ese día no vuelve a
   // encontrar este cobro porque para entonces sí cae dentro de tolerancia
   // del lado del pipeline normal).
+  // `serieFactura`/`folioFactura` vienen VACÍOS en el ERP cuando la factura es
+  // 1-a-1 con el ticket (sin agrupar en una Factura Global) — solo se llenan
+  // cuando difieren de `serieVenta`/`folioVenta` (bug real 2026-09-03, caso
+  // Hidalgo B0-260900073/PEDRO YAIR ORTIZ LUCERO: el CFDI real existe con
+  // exactamente esa serie/folio, pero al venir `serieFactura`/`folioFactura`
+  // vacíos, `facturaKey` daba `null` y el chequeo de "ya cubierto por el
+  // pipeline normal" de abajo nunca se ejecutaba — el cobro se duplicaba acá
+  // como "SIN FACTURA" aunque el ticket SÍ tenía su factura). Cuando faltan,
+  // se usa `serieVenta`/`folioVenta` como factura candidata — es correcto en
+  // el caso 1-a-1, y en el caso agrupado (Factura Global) simplemente no
+  // encontrará ningún CFDI con esa serie/folio de ticket, sin efecto.
+  const _facturaKeyDe = (cuenta) => (cuenta.serieFactura && cuenta.folioFactura)
+    ? `${cuenta.serieFactura}|${cuenta.folioFactura}`
+    : (cuenta.serieVenta && cuenta.folioVenta) ? `${cuenta.serieVenta}|${cuenta.folioVenta}` : null;
   const foliosFacturaReferenciados = new Set();
   for (const cuenta of resultado) {
-    if (cuenta.serieFactura && cuenta.folioFactura) {
-      foliosFacturaReferenciados.add(`${cuenta.serieFactura}|${cuenta.folioFactura}`);
-    }
+    const key = _facturaKeyDe(cuenta);
+    if (key) foliosFacturaReferenciados.add(key);
   }
   const diaCfdiPorFolioFactura = new Map();
   if (foliosFacturaReferenciados.size) {
@@ -2488,7 +2518,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   const vistos = new Set();
   const porVenta = new Map(); // ventaKey -> [{ clave, monto }], mismo orden en que llegan los cobros
   for (const cuenta of resultado) {
-    const facturaKey = (cuenta.serieFactura && cuenta.folioFactura) ? `${cuenta.serieFactura}|${cuenta.folioFactura}` : null;
+    const facturaKey = _facturaKeyDe(cuenta);
     const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
     for (const cobro of (cuenta.cobros ?? [])) {
       if (cobro.claveCentro !== centro) continue;
@@ -3751,7 +3781,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // sincronizado en Mongo) — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
         if (egresoAnticipoProp.folioOpa) anticipoFolioRefProp = egresoAnticipoProp.folioOpa;
       } else {
-        montoAnticipoRealProp = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
+        // Cuentas Pendientes (ver `_prefetchCuentasPendientesAnticipo`) tiene
+        // prioridad sobre `context.montoAnticipoUsado` (desglose de almacén,
+        // que a veces no distingue la porción de Anticipo y hace que el
+        // caller asuma 100% de la venta, ignorando otros ajustes ya
+        // aplicados como una Bonificación — bug real 2026-09-03, caso
+        // MARIA DE LOURDES SANCHEZ RIOS/OPA-00837).
+        const montoCuentasPendientesProp = montoAnticipoPorFacturaProp.get(`${cfdi.serie}|${cfdi.folio}`);
+        montoAnticipoRealProp = (montoCuentasPendientesProp > 0)
+          ? Math.min(montoCuentasPendientesProp, totalVentaProp)
+          : Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
       }
     }
     // Cuánto de ese monto real queda por "consumir" contra las líneas de
@@ -4361,6 +4400,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Para PUE: Cargo a Caja/Bancos (el ingreso real) + Abono a la misma cuenta
   // (contrapartida que cuadra contra la póliza de la sucursal vendedora).
   const _ccCobradora = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+  if (process.env.DEBUG_COS_TICKET) {
+    console.warn(`[DEBUG_COS_GATE] serieDelCentroProp=${serieDelCentroProp} _ccCobradora=${JSON.stringify(_ccCobradora)} cobrosCobradoraDirectaProp.length=${cobrosCobradoraDirectaProp.length}`);
+  }
   if (cobrosCobradoraDirectaProp.length > 0 && _ccCobradora) {
     const cuentaCajaIdDir   = cuentaMap[CODIGO_CUENTA_CAJA]   ?? null;
     const cuentaBancosIdDir = cuentaMap[CODIGO_CUENTA_BANCOS] ?? null;
@@ -4391,12 +4433,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // Mongo). Mostrar el folio de factura llevaba a buscar un ticket
       // equivocado en Kore (confirmado con el usuario 2026-08-17).
       const _serFol = serFolTicket || (claveFac ?? '');
+      const _esDebug = process.env.DEBUG_COS_TICKET && serFolTicket && serFolTicket.includes(process.env.DEBUG_COS_TICKET);
       // Saltar si la cola ya tiene este cobro — el DEBE+HABER de cobradora
       // ya lo generó `construirMovimientosPuente` (en movsPuente arriba).
       // Incluirlo aquí también inflaría el consolidado por partida doble
       // (bug real: Hidalgo EFECTIVO $215k vs $147k esperado, 2026-08-15).
-      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) continue;
-      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) continue;
+      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) {
+        if (_esDebug) console.warn(`[DEBUG_COS_SKIP] saltado por _uuidsYaEnPuente cfdiUuid=${cfdiUuid}`);
+        continue;
+      }
+      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) {
+        if (_esDebug) console.warn(`[DEBUG_COS_SKIP] saltado por _foliosYaEnPuente folioOrigen=${folioOrigen}`);
+        continue;
+      }
+      if (_esDebug) console.warn(`[DEBUG_COS_OK] serFolTicket=${serFolTicket} monto=${monto} cuentaDir=${cuentaDir} cfdiUuid=${cfdiUuid} nombre=${nombre}`);
       const _concepto = nombre ? `${nombre} / ${_serFol}` : _serFol;
       const baseDir = {
         concepto:      _concepto.slice(0, 255) || 'Cobro Suc. Ajena',
@@ -5290,7 +5340,12 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         // Ver comentario equivalente en generarPropuesta.
         if (egresoAnticipoGuard.folioOpa) anticipoFolioRefGuard = egresoAnticipoGuard.folioOpa;
       } else {
-        montoAnticipoRealGuard = Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
+        // Cuentas Pendientes tiene prioridad sobre `context.montoAnticipoUsado`
+        // — ver comentario equivalente en generarPropuesta.
+        const montoCuentasPendientesGuard = montoAnticipoPorFacturaGuard.get(`${cfdi.serie}|${cfdi.folio}`);
+        montoAnticipoRealGuard = (montoCuentasPendientesGuard > 0)
+          ? Math.min(montoCuentasPendientesGuard, totalVentaGuard)
+          : Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
       }
     }
     let montoAnticipoRestanteGuard = montoAnticipoRealGuard;
@@ -6283,7 +6338,7 @@ module.exports = {
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
-  _prefetchAjustesFacturaPropia,
+  _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
   // Utilidades genéricas (numeración de folio, fechas) expuestas ÚNICAMENTE
   // para que cobranza-poliza-generator.service.js las reutilice sin duplicar
   // la numeración de folio (comparte el mismo contador/rango por sucursal que

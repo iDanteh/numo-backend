@@ -8,9 +8,11 @@
 // hook tira) se cubre en bank.service.erpUnlinkHooks.test.js.
 jest.mock('./CajaTransferencia.model');
 jest.mock('../banks/bank.service', () => ({ registerErpUnlinkHook: jest.fn() }));
+jest.mock('../../shared/socket', () => ({ emitToAll: jest.fn() }));
 
 const CajaTransferencia = require('./CajaTransferencia.model');
 const { registerErpUnlinkHook } = require('../banks/bank.service');
+const { emitToAll } = require('../../shared/socket');
 const { init, _revertirPorDesvinculacion } = require('./caja-transferencia-revert.service');
 
 function fakeQuery(result) {
@@ -32,12 +34,14 @@ describe('_revertirPorDesvinculacion', () => {
     CajaTransferencia.findOne = jest.fn();
     await _revertirPorDesvinculacion({ erpId: 'CXC-123', movementId: 'mov-1', session: null, user: null });
     expect(CajaTransferencia.findOne).not.toHaveBeenCalled();
+    expect(emitToAll).not.toHaveBeenCalled();
   });
 
   test('erpId vacío/null: no dispara ninguna query', async () => {
     CajaTransferencia.findOne = jest.fn();
     await _revertirPorDesvinculacion({ erpId: null, movementId: 'mov-1', session: null, user: null });
     expect(CajaTransferencia.findOne).not.toHaveBeenCalled();
+    expect(emitToAll).not.toHaveBeenCalled();
   });
 
   test('erpId CAJA-<koreId> pero no hay transferencia matcheada con ese koreId: no hace nada', async () => {
@@ -48,6 +52,8 @@ describe('_revertirPorDesvinculacion', () => {
 
     expect(CajaTransferencia.findOne).toHaveBeenCalledWith({ koreId: 'abc123', estatusMatch: 'matcheada' });
     expect(CajaTransferencia.updateOne).not.toHaveBeenCalled();
+    // Nada que revertir -> no hay señal que emitir tampoco.
+    expect(emitToAll).not.toHaveBeenCalled();
   });
 
   test('erpId CAJA-<koreId> con transferencia matcheada: la revierte a pendiente y limpia confirmadoPor/confirmadoEn/movementIdsConfirmados', async () => {
@@ -64,6 +70,9 @@ describe('_revertirPorDesvinculacion', () => {
       } },
       { session: null },
     );
+    // 2026-09-03: señal cross-banco para que la bandeja de "pendientes de ficha" se
+    // autorefresque — el movimiento desvinculado deja de calificar para transferencia-caja.
+    expect(emitToAll).toHaveBeenCalledWith('bank:ficha-pendiente:changed', { movementId: 'mov-1' });
   });
 
   test('con session (llamado dentro de una transacción): se usa .session(session) en el find y en el update', async () => {
@@ -79,6 +88,8 @@ describe('_revertirPorDesvinculacion', () => {
     expect(CajaTransferencia.updateOne).toHaveBeenCalledWith(
       expect.any(Object), expect.any(Object), { session: sesionFalsa },
     );
+    // emitToAll no toma session (no es parte de la transacción Mongo) — se emite igual.
+    expect(emitToAll).toHaveBeenCalledWith('bank:ficha-pendiente:changed', { movementId: 'mov-1' });
   });
 
   // Split 1:2 (pedido explícito del usuario 2026-09-02): aunque la transferencia haya
@@ -102,5 +113,8 @@ describe('_revertirPorDesvinculacion', () => {
       { $set: expect.objectContaining({ estatusMatch: 'pendiente', movementIdsConfirmados: [] }) },
       { session: null },
     );
+    // El evento lleva el movementId del movimiento REALMENTE desvinculado (mov-a), no
+    // ambos — mov-b no pasó por este hook en absoluto.
+    expect(emitToAll).toHaveBeenCalledWith('bank:ficha-pendiente:changed', { movementId: 'mov-a' });
   });
 });

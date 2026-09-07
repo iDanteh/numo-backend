@@ -1577,6 +1577,14 @@ function _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap) {
   // reversión, no la recepción/aplicación original.
   cargoAnticipo.reglaNombre = 'OPA-REVERSION';
   if (cargoIva) cargoIva.reglaNombre = 'OPA-REVERSION';
+  // Las 4 líneas de la reversión (Cargo Devoluciones+IVA / Abono Anticipos+
+  // IVA-anticipo) deben quedar con el MISMO reglaNombre — antes solo se
+  // renombraban las 2 de Cargo, dejando las 2 de Abono con el nombre
+  // original de la regla TO-EGR ("Reg TO-EGR-16 — NC Egreso ERP 16%..."),
+  // confirmado con datos reales en Postgres 2026-09-07 (póliza 695). No
+  // afecta el export (el filtro de visibilidad solo mira líneas de Cargo),
+  // pero mezclaba el regla_nombre de las 4 líneas de un mismo asiento.
+  abonoClientes.reglaNombre = 'OPA-REVERSION';
   if (ivaMonto > 0) {
     movs.push({ ...abonoClientes, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, haber: ivaMonto });
   }

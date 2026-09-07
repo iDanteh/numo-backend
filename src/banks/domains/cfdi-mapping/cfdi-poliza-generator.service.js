@@ -3700,7 +3700,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // resolver su folio ni prorratear el monto entre ambos anticipos — por
     // ahora solo se refleja el/los que sí resuelven.
     let anticipoFolioRefProp = null;
-    if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
+    const _califica07Prop = cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo;
+    if (_califica07Prop) {
       // Solo los folios que SÍ resuelven se concatenan ("OPA-00763-00665");
       // si además hay alguna relación sin resolver (CFDI relacionado sin
       // sincronizar en Mongo), se agrega UN solo "-" al final ("OPA-00763-"),
@@ -3756,7 +3757,24 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // Serie-folio del Egreso real (columna C del cierre) cuando exista —
     // ver `_fetchEgresosAplicacionAnticipoPorVenta`.
     let serieEgresoAnticipoProp = null;
-    if (anticipoFolioRefProp) {
+    // Egreso SAT real (tipoRelacion=07 contra esta venta) — evidencia MÁS
+    // confiable que el CFDI del anticipo original (puede no estar
+    // sincronizado en Mongo, ver comentario de `anticipoFolioRefProp` arriba)
+    // — se evalúa SIEMPRE que la regla califique, sin exigir que
+    // `anticipoFolioRefProp` ya haya resuelto folio. BUG CORREGIDO
+    // 2026-09-07 (caso real RAYMUNDO CUELLAR MENDOZA C0-260900021/022): antes
+    // este chequeo vivía ANIDADO dentro de `if (anticipoFolioRefProp)` — si
+    // el CFDI del anticipo original no estaba sincronizado en Mongo,
+    // `anticipoFolioRefProp` se quedaba null y el cierre completo se saltaba
+    // por completo, aunque YA teníamos evidencia sólida e independiente (el
+    // propio Egreso apuntando directo a esta venta vía tipoRelacion=07). Esto
+    // dejaba el Cargo-Clientes de la venta oculto (categoría "anticipo" por
+    // el nombre de la regla) SIN ningún reemplazo visible — desbalance visual
+    // real en el export aunque Postgres cuadraba.
+    const egresoAnticipoProp = _califica07Prop
+      ? egresosAnticipoPorVentaProp.get((cfdi.uuid || '').toUpperCase())
+      : null;
+    if (anticipoFolioRefProp || egresoAnticipoProp) {
       movVentasAbonoProp = rule?.cuentaAbono
         ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
         : null;
@@ -3765,11 +3783,6 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
         .find(Boolean) ?? null;
       const totalVentaProp = Number(movVentasAbonoProp?.haber ?? 0) + Number(movIvaAbonoProp?.haber ?? 0);
-      // Egreso SAT real (tipoRelacion=07 contra esta venta) tiene prioridad
-      // sobre `context.montoAnticipoUsado` (desglose de Kore) — es el dato
-      // oficial y exacto, y cubre los casos donde Kore no distingue la
-      // porción de anticipo (ver `_fetchEgresosAplicacionAnticipoPorVenta`).
-      const egresoAnticipoProp = egresosAnticipoPorVentaProp.get((cfdi.uuid || '').toUpperCase());
       if (egresoAnticipoProp) {
         montoAnticipoRealProp = Math.min(egresoAnticipoProp.total, totalVentaProp);
         serieEgresoAnticipoProp = egresoAnticipoProp.serieFolio ?? null;
@@ -3780,6 +3793,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // sobre el resuelto por el CFDI del anticipo (puede no estar
         // sincronizado en Mongo) — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
         if (egresoAnticipoProp.folioOpa) anticipoFolioRefProp = egresoAnticipoProp.folioOpa;
+        // Ninguno de los 2 anteriores resolvió folio real (ni el CFDI del
+        // anticipo, ni el folio por monto/Cuentas Pendientes del Egreso) —
+        // usar la serie-folio del propio Egreso como referencia de último
+        // recurso, para nunca dejar `anticipoFolioRefProp` null habiendo ya
+        // decidido entrar a este bloque (el cierre de abajo lo necesita).
+        if (!anticipoFolioRefProp) {
+          anticipoFolioRefProp = `OPA-${serieEgresoAnticipoProp ?? (cfdi.uuid || '').slice(0, 8)}`;
+        }
       } else {
         // Cuentas Pendientes (ver `_prefetchCuentasPendientesAnticipo`) tiene
         // prioridad sobre `context.montoAnticipoUsado` (desglose de almacén,
@@ -5288,7 +5309,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // la primera. Mejora pendiente: si alguna relacionada no tiene su CFDI
     // sincronizado en Mongo, esa no se puede resolver ni prorratear.
     let anticipoFolioRefGuard = null;
-    if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
+    const _califica07Guard = cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo;
+    if (_califica07Guard) {
       // Ver comentario equivalente en generarPropuesta: el "-" colgante de las
       // relaciones sin resolver SIEMPRE va al final, nunca en medio.
       // Ver comentario equivalente en generarPropuesta sobre por qué se
@@ -5319,7 +5341,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     let tasaIvaAnticipoEfectivaGuard = TASA_IVA_ANTICIPO;
     // Ver comentario equivalente en generarPropuesta.
     let serieEgresoAnticipoGuard = null;
-    if (anticipoFolioRefGuard) {
+    // Ver comentario equivalente en generarPropuesta (BUG CORREGIDO
+    // 2026-09-07, caso real RAYMUNDO CUELLAR MENDOZA): se evalúa SIEMPRE que
+    // la regla califique, sin exigir que `anticipoFolioRefGuard` ya haya
+    // resuelto folio — el Egreso real es evidencia más confiable que el CFDI
+    // del anticipo original (puede no estar sincronizado en Mongo).
+    const egresoAnticipoGuard = _califica07Guard
+      ? egresosAnticipoPorVentaGuard.get((cfdi.uuid || '').toUpperCase())
+      : null;
+    if (anticipoFolioRefGuard || egresoAnticipoGuard) {
       movVentasAbonoGuard = rule?.cuentaAbono
         ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
         : null;
@@ -5328,9 +5358,6 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
         .find(Boolean) ?? null;
       const totalVentaGuard = Number(movVentasAbonoGuard?.haber ?? 0) + Number(movIvaAbonoGuard?.haber ?? 0);
-      // Egreso SAT real tiene prioridad sobre Kore — ver comentario
-      // equivalente en generarPropuesta.
-      const egresoAnticipoGuard = egresosAnticipoPorVentaGuard.get((cfdi.uuid || '').toUpperCase());
       if (egresoAnticipoGuard) {
         montoAnticipoRealGuard = Math.min(egresoAnticipoGuard.total, totalVentaGuard);
         serieEgresoAnticipoGuard = egresoAnticipoGuard.serieFolio ?? null;
@@ -5339,6 +5366,12 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         }
         // Ver comentario equivalente en generarPropuesta.
         if (egresoAnticipoGuard.folioOpa) anticipoFolioRefGuard = egresoAnticipoGuard.folioOpa;
+        // Ver comentario equivalente en generarPropuesta: fallback de último
+        // recurso para nunca dejar `anticipoFolioRefGuard` null habiendo ya
+        // decidido entrar a este bloque.
+        if (!anticipoFolioRefGuard) {
+          anticipoFolioRefGuard = `OPA-${serieEgresoAnticipoGuard ?? (cfdi.uuid || '').slice(0, 8)}`;
+        }
       } else {
         // Cuentas Pendientes tiene prioridad sobre `context.montoAnticipoUsado`
         // — ver comentario equivalente en generarPropuesta.

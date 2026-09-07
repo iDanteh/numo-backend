@@ -3,7 +3,7 @@
 const ExcelJS = require('exceljs');
 const repo = require('./repositories/poliza.repository');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
-const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza } = require('../../../shared/models/postgres');
+const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza, CentroCosto } = require('../../../shared/models/postgres');
 const { Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const BankMovement = require('../banks/BankMovement.model');
@@ -3816,6 +3816,81 @@ async function cancelarTodasCompensacionesIntereses({ rfc, polizaIds }, user, mo
   return { canceladas, errores, total: polizas.length };
 }
 
+// Base de numeración de folio CONTPAQ por sucursal (confirmado con el
+// usuario 2026-09-07, reemplaza cualquier convención anterior): cada
+// sucursal tiene su propio rango de 100 folios, y el conteo se reinicia
+// cada periodo/mes — la 1a póliza de Ingreso de Reforma en un mes es 501,
+// la 2a 502, etc. NUNCA se deriva de `poliza.numero` (consecutivo GLOBAL
+// compartido entre TODAS las sucursales para el mismo tipo/periodo, ver
+// `nextNumero` en poliza.repository.js — no tiene relación con el rango
+// esperado por sucursal). PROMOTORIA y LICITACION HIDALGO no tienen rango
+// asignado todavía — sin mapeo, `siguienteFolioContpaq` regresa `null` y el
+// caller cae al comportamiento anterior (folio manual / `poliza.numero`).
+const RANGO_FOLIO_CONTPAQ_POR_SUCURSAL = {
+  CEDIS:               100,
+  HIDALGO:             300,
+  CONSTRUCASA:         400,
+  REFORMA:             500,
+  ATZOMPA:             600,
+  FERROCARRIL:         700,
+  SIMBOLOS:            800,
+  TEHUANTEPEC:         900,
+  'SANTA ROSA':        1000,
+  VIGUERA:             1100,
+  'PUERTO ESCONDIDO':  1200,
+};
+
+/**
+ * Calcula el siguiente folio CONTPAQ sugerido para esta póliza, según la
+ * sucursal de sus movimientos (ver `RANGO_FOLIO_CONTPAQ_POR_SUCURSAL`) — solo
+ * el valor por DEFAULT que ve el usuario al abrir el formulario de export
+ * (`abrirExportContpaqForm` en poliza-list.component.ts); sigue siendo
+ * editable antes de exportar, igual que hoy. Si la sucursal no tiene rango
+ * asignado, regresa `{ folioContado: null, folioCredito: null }` (el caller
+ * cae al comportamiento anterior).
+ */
+async function siguienteFolioContpaq(id) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+
+  const movimiento = await PolizaMovimiento.findOne({
+    where:      { polizaId: id },
+    attributes: ['id', 'centroCostoId'],
+    include:    [{ model: CentroCosto, as: 'centroCostoObj', attributes: ['id', 'sucursal'] }],
+  });
+  const sucursal = (movimiento?.centroCostoObj?.sucursal || '').toUpperCase().trim();
+  const rangoBase = RANGO_FOLIO_CONTPAQ_POR_SUCURSAL[sucursal];
+  if (!rangoBase || !movimiento?.centroCostoObj?.id) {
+    return { folioContado: null, folioCredito: null };
+  }
+
+  // Todas las pólizas de la MISMA sucursal+tipo+rfc+ejercicio+periodo — el
+  // folio más alto ya asignado (Contado o Crédito) determina el siguiente;
+  // sin ninguna asignada todavía este periodo, se arranca en `rangoBase + 1`.
+  // `include`+`where` en la tabla asociada produce un JOIN — una póliza con
+  // varios movimientos del mismo centro puede repetirse en el resultado, pero
+  // solo importa el MAX, así que los duplicados son inofensivos (no hace
+  // falta GROUP BY).
+  const polizasDelPeriodo = await Poliza.findAll({
+    where:      { tipo: poliza.tipo, rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo },
+    attributes: ['id', 'contpaqFolioContado', 'contpaqFolioCredito'],
+    include:    [{
+      model:      PolizaMovimiento,
+      as:         'movimientos',
+      attributes: [],
+      where:      { centroCostoId: movimiento.centroCostoObj.id },
+      required:   true,
+    }],
+  });
+  let maxFolio = 0;
+  for (const p of polizasDelPeriodo) {
+    if (p.contpaqFolioContado != null) maxFolio = Math.max(maxFolio, p.contpaqFolioContado);
+    if (p.contpaqFolioCredito != null) maxFolio = Math.max(maxFolio, p.contpaqFolioCredito);
+  }
+  const folioContado = maxFolio > 0 ? maxFolio + 1 : rangoBase + 1;
+  return { folioContado, folioCredito: folioContado + 1 };
+}
+
 async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
@@ -3835,7 +3910,7 @@ async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
 
 module.exports = {
   list, getById, create, update, cancel, cancelarTodas, listBorradorCandidatas, contabilizar, revertir, generarXmlSat,
-  reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
+  reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, siguienteFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
   resolverCuentasPorCfdisIdentificados,
   // Pólizas Traspasos C.P. (2026-08-25)
   generarYGuardarTraspasos, exportContpaqTraspasosXlsx, resolverBankMovimientoDeTraspaso,

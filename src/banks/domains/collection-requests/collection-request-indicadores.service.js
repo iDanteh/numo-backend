@@ -25,6 +25,27 @@ const { horasHabilesEntre, promedio, mediana } = require('../banks/bank-indicado
 
 const MS_PER_HOUR = 3600000;
 
+// 2026-09-07 (pedido explícito del usuario): admin puede acotar el panel a uno o varios
+// contadores específicos (antes solo "todo el equipo" vs. "solo lo propio", fijo por
+// rol) — scopeUserId puede llegar como array además del escalar de siempre. Helper
+// compartido para no duplicar el `Array.isArray` en los 2 puntos donde se arma el match.
+//
+// Defensa en profundidad (hallazgo WARNING de la revisión de confiabilidad
+// independiente, 2026-09-07): un array VACÍO se trata explícitamente como "sin filtro"
+// (mismo resultado que scopeUserId undefined/null), nunca como `{ $in: [] }` (que
+// matchearía CERO documentos). Hoy la ruta HTTP (_resolveScopeUserId en
+// collection-request.routes.js) ya normaliza un array vacío a `undefined` antes de
+// llegar acá, así que este caso no es alcanzable en producción por ese camino — pero
+// esta función es exportada/reusable (getIndicadoresSolicitudesCobro/
+// getDistribucionSolicitudesCobro la llaman directo con lo que reciban), y no debe
+// depender de que el único caller existente la blindee por ella.
+function _matchScopeUserId(scopeUserId) {
+  if (Array.isArray(scopeUserId)) {
+    return scopeUserId.length ? { $in: scopeUserId } : undefined;
+  }
+  return scopeUserId;
+}
+
 // Fecha de corte del indicador — decisión explícita del usuario (2026-08-20, mismo
 // criterio que INDICADORES_DESDE en bank-indicadores.service.js): solo se miden
 // solicitudes creadas desde esta fecha en adelante, para no ensuciar el promedio con
@@ -105,14 +126,21 @@ function distribucionPorMinutos(horasArr, cortesMinutos = [30, 60, 120]) {
  * @param {object} [filtros]
  * @param {string|number} [filtros.year]
  * @param {string|number} [filtros.month] (1-12, requiere year)
- * @param {string} [filtros.scopeUserId] admin: undefined (ve todo el equipo). Cualquier
- *   otro rol con collections:read: su propio _id — acota TODO el panel a lo que él mismo
- *   resolvió (resueltoPorUserId), pedido explícito del usuario (2026-09-03).
+ * @param {string|string[]} [filtros.scopeUserId] admin: undefined (ve todo el equipo) o
+ *   un array de userIds para acotar a uno o varios contadores específicos (2026-09-07,
+ *   pedido explícito del usuario). Cualquier otro rol con collections:read: su propio
+ *   _id (escalar) — acota TODO el panel a lo que él mismo resolvió (resueltoPorUserId),
+ *   pedido explícito del usuario (2026-09-03). Un array VACÍO se trata igual que
+ *   undefined (sin filtro, todo el equipo) — nunca produce cero resultados.
  */
 async function getIndicadoresSolicitudesCobro({ year, month, scopeUserId } = {}) {
   const match = { status: 'identificada', resueltoAt: { $ne: null } };
-  if (scopeUserId) {
-    match.resueltoPorUserId = scopeUserId;
+  // scopeUserId truthy pero resuelto a undefined (array vacío, ver _matchScopeUserId) no
+  // debe dejar la clave en el match — un `resueltoPorUserId: undefined` explícito no es lo
+  // mismo que "la clave no existe" de cara a Mongo, mejor no depender de esa equivalencia.
+  const matched = scopeUserId ? _matchScopeUserId(scopeUserId) : undefined;
+  if (matched !== undefined) {
+    match.resueltoPorUserId = matched;
   }
   if (year) {
     const y = parseInt(year, 10);
@@ -190,8 +218,10 @@ function _hoyMxStr() {
  * de esta sección, así el gráfico y la descarga siempre muestran la misma
  * población. Sin ellos, cae al día de hoy (desde === hasta === hoy).
  *
- * @param {string} [scopeUserId] mismo criterio que getIndicadoresSolicitudesCobro():
- *   admin → undefined (todo el equipo); cualquier otro rol → su propio _id.
+ * @param {string|string[]} [scopeUserId] mismo criterio que getIndicadoresSolicitudesCobro():
+ *   admin → undefined (todo el equipo) o array de userIds (contadores elegidos);
+ *   cualquier otro rol → su propio _id (escalar). Un array VACÍO se trata igual que
+ *   undefined (sin filtro, todo el equipo) — nunca produce cero resultados.
  */
 async function getDistribucionSolicitudesCobro({ desde, hasta, scopeUserId } = {}) {
   const desdeStr = desde || _hoyMxStr();
@@ -207,8 +237,11 @@ async function getDistribucionSolicitudesCobro({ desde, hasta, scopeUserId } = {
     resueltoAt: { $ne: null },
     createdAt: { $gte: gte > INDICADORES_CR_DESDE ? gte : INDICADORES_CR_DESDE, $lt: lt },
   };
-  if (scopeUserId) {
-    match.resueltoPorUserId = scopeUserId;
+  // Mismo criterio que getIndicadoresSolicitudesCobro(): un array vacío nunca deja la
+  // clave resueltoPorUserId puesta en el match (ver _matchScopeUserId).
+  const matched = scopeUserId ? _matchScopeUserId(scopeUserId) : undefined;
+  if (matched !== undefined) {
+    match.resueltoPorUserId = matched;
   }
 
   const solicitudes = await CollectionRequest.find(match).select('createdAt resueltoAt').lean();
@@ -222,7 +255,35 @@ async function getDistribucionSolicitudesCobro({ desde, hasta, scopeUserId } = {
   };
 }
 
+// 2026-09-07 (fix real, reportado por el admin en pruebas: el <select> del filtro de
+// contador ofrecía CUALQUIER usuario con rol contabilidad/cobranza, sin importar si
+// alguna vez resolvió algo — UserService.listUsers() trae TODOS los usuarios de esos
+// roles, dados de alta o no, activos o no). Esta función es la contraparte real: solo
+// los auth0Sub que de verdad aparecen en CollectionRequest.resueltoPorUserId (alguna
+// solicitud identificada). `.distinct()` sin populate — igual de barata que los usos ya
+// existentes de este patrón (ver bank.service.js#_buildFilter, BankMovement.distinct).
+// `.filter(Boolean)` descarta null (documentos históricos sin resueltoPorUserId, ver
+// CollectionRequest.model.js#resueltoPorUserId, default null).
+//
+// 2026-09-07 (WARNING de la revisión de confiabilidad independiente): esta función no
+// aplicaba el mismo corte de frescura INDICADORES_CR_DESDE que getIndicadoresSolicitudesCobro()
+// y getDistribucionSolicitudesCobro() ya aplican — un contador cuya única actividad es
+// anterior al corte aparecía como elegible en el <select> del admin, pero el panel
+// siempre iba a mostrarle "0 resultados" sin ninguna indicación de que era por el
+// corte de fecha y no por falta de datos reales. Este endpoint no recibe year/month
+// (ver GET /indicadores/contadores en collection-request.routes.js), así que alcanza
+// con el mismo `$gte` fijo que usa getIndicadoresSolicitudesCobro() cuando no se pide
+// year — no hace falta un `$lte` porque no hay un rango explícito que acotar.
+async function listContadoresConSolicitudesIdentificadas() {
+  const ids = await CollectionRequest.distinct('resueltoPorUserId', {
+    status: 'identificada',
+    resueltoAt: { $ne: null },
+    createdAt: { $gte: INDICADORES_CR_DESDE },
+  });
+  return ids.filter(Boolean);
+}
+
 module.exports = {
   getIndicadoresSolicitudesCobro, horasReloj, inicioFaseContador, distribucionPorMinutos, INDICADORES_CR_DESDE,
-  getDistribucionSolicitudesCobro,
+  getDistribucionSolicitudesCobro, listContadoresConSolicitudesIdentificadas,
 };

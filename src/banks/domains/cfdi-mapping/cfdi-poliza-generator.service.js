@@ -1535,7 +1535,12 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   // en `anotacion`), no se vuelve a inyectar como SF: sería el mismo dinero
   // contado dos veces (caso real Reforma, JOSE IRAN SUAREZ LINARES,
   // DEV-057088 $976.23).
-  if (origenesConvertidosAAnticipo?.has(`${(marcador.Serie ?? '').toUpperCase()}|${marcador.Folio}`)) return [];
+  const _claveMarcadorSF = `${(marcador.Serie ?? '').toUpperCase()}|${marcador.Folio}`;
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_SF_ANTICIPO_GUARD] cfdi=${cfdi.serie}-${cfdi.folio} claveMarcador=${_claveMarcadorSF} `
+      + `enSet=${!!origenesConvertidosAAnticipo?.has(_claveMarcadorSF)} setSize=${origenesConvertidosAAnticipo?.size ?? 0}`);
+  }
+  if (origenesConvertidosAAnticipo?.has(_claveMarcadorSF)) return [];
   const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
   if (!generado?.monto) return [];
 
@@ -3252,6 +3257,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     referenciaOpaPorFactura: referenciaOpaPorFacturaProp,
     origenesConvertidosAAnticipo: origenesConvertidosAAnticipoProp,
   } = await _prefetchCuentasPendientesAnticipo([
+      // BUG CORREGIDO 2026-09-07: el arreglo de fechas ANTES solo traía fechas
+      // del mecanismo "Anticipo sin regla" (rel07) — nunca la fecha de la
+      // propia Cancelación/Devolución (CFDI tipo E que dispara
+      // `_inyectarSaldoFavorGenerado`, el que en realidad necesita el guard
+      // `origenesConvertidosAAnticipo`). Si ese mecanismo no aparecía en el
+      // lote, el arreglo llegaba VACÍO y `_prefetchCuentasPendientesAnticipo`
+      // regresaba de inmediato con los 3 mapas vacíos (ver su código) — el
+      // guard de 6eda690 quedaba siempre desactivado sin ningún error visible
+      // (caso real Reforma, JOSE IRAN SUAREZ LINARES, DEV-057088). Se agrega
+      // fechaInicio/fechaFin (todo el periodo que se está generando) para que
+      // la ventana SIEMPRE cubra las Cancelaciones/Devoluciones del lote,
+      // igual que ya hace `_prefetchSaldosFavorGenerados` arriba.
+      fechaInicio, fechaFin,
       ...anticipoCfdisProp.map(c => c.fecha),
       ...cfdiConRegla
         .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
@@ -4816,6 +4834,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     referenciaOpaPorFactura: referenciaOpaPorFacturaGuard,
     origenesConvertidosAAnticipo: origenesConvertidosAAnticipoGuard,
   } = await _prefetchCuentasPendientesAnticipo([
+      // Ver comentario equivalente en generarPropuesta (fix 2026-09-07).
+      fechaInicio, fechaFin,
       ...anticipoCfdisGuard.map(c => c.fecha),
       ...cfdiConRegla
         .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo

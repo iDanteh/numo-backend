@@ -1602,13 +1602,37 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // ticket de la misma factura). Sin dato por ticket (venta normal, no
       // partida), `bancario` sigue siendo correcto (un solo ticket por CFDI,
       // ambos coinciden).
-      const referencia = infoTicketTransfCheque?.referencia ?? bancario?.referencia ?? null;
+      //
+      // BUG CORREGIDO 2026-09-07 (caso real Reforma, Global 498068DC,
+      // tickets D0-260900390/D0-260900368 sin depósito bancario propio
+      // conciliado, pero D0-260900224 de la MISMA Global sí lo tenía,
+      // folio 044368/$8,220.93): el comentario de arriba ya explicaba que
+      // `bancario` no debe usarse cuando la línea pertenece a un ticket
+      // propio, pero el `??` de abajo SÍ lo usaba igual cuando
+      // `infoTicketTransfCheque` resultaba `null` (ticket sin match propio,
+      // NO "sin dato por ticket" — son casos distintos: este bloque solo
+      // debe caer a `bancario` cuando el CFDI NO es una venta partida en
+      // tickets en absoluto). El resultado: los 2 tickets sin depósito
+      // propio heredaban la referencia/monto del tercero, se agrupaban con
+      // él bajo la MISMA clave, y como `_debeFijoBanco` fija el total al
+      // depósito real en cuanto se conoce, sus $895.80+$1,864.96 quedaban
+      // fuera del `debe` de la póliza — visibles solo en "Desglose
+      // Consolidado", nunca en la línea real. `esTicketPropio` marca
+      // exactamente el mismo caso que ya usa el gate de arriba.
+      const esTicketPropio = !!(m.serieVentaTicket && m.folioVentaTicket);
+      const referencia = infoTicketTransfCheque?.referencia ?? (esTicketPropio ? null : bancario?.referencia) ?? null;
       // Cuenta real del banco donde cayó el depósito (ver
       // `BANCO_A_CODIGO_CUENTA`/`construirVerdadBancaria`) en vez de la
       // genérica "Bancos por identificar" que ya traía la línea — solo
       // cuando el banco tiene cuenta dedicada en el catálogo.
-      const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? bancario?.cuentaBanco ?? m.cuenta;
-      const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? `__cfdi_${m.cfdiUuid}`}`;
+      const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? (esTicketPropio ? null : bancario?.cuentaBanco) ?? m.cuenta;
+      // Sin referencia real: cada ticket propio queda en su propia línea por
+      // `serieVentaTicket|folioVentaTicket` (único por ticket) — usar
+      // `m.cfdiUuid` aquí (el de la Global completa, compartido por TODOS
+      // sus tickets) volvería a mezclarlos entre sí, solo que ahora sin
+      // ninguna referencia real, en vez de cada uno en su propia línea.
+      const sufijoSinReferencia = esTicketPropio ? `${m.serieVentaTicket}|${m.folioVentaTicket}` : `__cfdi_${m.cfdiUuid}`;
+      const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? sufijoSinReferencia}`;
       // Monto real depositado en el banco para esta Transferencia (2026-08-26,
       // confirmado con el usuario) — SOLO Transferencia, nunca Cheque/Tarjeta:
       // reemplaza la suma de cobros de caja/ERP atribuidos a esta referencia
@@ -1620,7 +1644,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // depósito real, no se sigue acumulando por cada CFDI que comparte la
       // misma referencia.
       const montoBancoReal = esTransferenciaVerificada
-        ? (infoTicketTransfCheque?.montoBancoReal ?? bancario?.montoBancoReal ?? null)
+        ? (infoTicketTransfCheque?.montoBancoReal ?? (esTicketPropio ? null : bancario?.montoBancoReal) ?? null)
         : null;
       if (!gruposDetallados.has(key)) {
         gruposDetallados.set(key, {

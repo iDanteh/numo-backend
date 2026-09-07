@@ -1562,6 +1562,24 @@ function _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap) {
   cargoAnticipo.cuentaId = cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? cargoAnticipo.cuentaId;
   abonoClientes.cuentaId = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? abonoClientes.cuentaId;
   abonoClientes.haber = subtotalMonto;
+  // poliza.service.js (`bloquesAjustesContado`/`moverAjustesAlFinal`) oculta
+  // por convención el Cargo de cualquier NC categoría "anticipo" (para no
+  // duplicar visualmente el Cargo de la venta, confirmado 2026-08-27) —
+  // excepto las líneas marcadas `REGLAS_MEZCLADAS_CON_VENTAS` (hoy 'OPA',
+  // ahora también 'OPA-REVERSION'). Sin este marcador, el Cargo Devoluciones
+  // +IVA de ESTE caso (una venta ya REVERSADA, no un anticipo estándar con
+  // Cargo-Clientes visible en otro lado) desaparecía por completo del export
+  // aunque quedó bien persistido en Postgres — confirmado con el usuario
+  // 2026-09-07, caso real CONSTRUCASA (bug encontrado DESPUÉS de verificar
+  // este mismo fix contra el export real, no solo contra la BD). Se usa un
+  // valor NUEVO en `reglaNombre`, no el `reglaNombre` original de la regla
+  // ni el literal 'OPA' — debe seguir siendo reconocible por
+  // `REGLAS_MEZCLADAS_CON_VENTAS` (poliza.service.js) para la visibilidad,
+  // y por `categorizarAjusteContado`/esa misma constante para la
+  // categorización ('anticipo'), sin perder trazabilidad de que es una
+  // reversión, no la recepción/aplicación original.
+  cargoAnticipo.reglaNombre = 'OPA-REVERSION';
+  if (cargoIva) cargoIva.reglaNombre = 'OPA-REVERSION';
   if (ivaMonto > 0) {
     movs.push({ ...abonoClientes, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, haber: ivaMonto });
   }

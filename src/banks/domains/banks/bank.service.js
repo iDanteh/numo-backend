@@ -2199,6 +2199,7 @@ async function exportMovements(filters) {
   const {
     banco, fechaInicio, fechaFin,
     fechaAplicacionInicio, fechaAplicacionFin,
+    fechaImportacionInicio, fechaImportacionFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
@@ -2275,6 +2276,12 @@ async function exportMovements(filters) {
       { fichaAt: df },
       { identificadoPor: { $elemMatch: { fechaId: df } } },
     ]});
+  }
+
+  if (fechaImportacionInicio || fechaImportacionFin) {
+    filter.createdAt = {};
+    if (fechaImportacionInicio) filter.createdAt.$gte = new Date(fechaImportacionInicio);
+    if (fechaImportacionFin)    filter.createdAt.$lte = new Date(`${fechaImportacionFin}T23:59:59.999Z`);
   }
 
   if (search) {
@@ -2389,10 +2396,11 @@ async function exportMovements(filters) {
     retencion:   { header: 'Retención',     key: 'retencionCol',   width: 12 },
     ficha:       { header: 'N° Ficha',      key: 'fichaCol',       width: 14 },
     regla:       { header: 'Regla aplicada', key: 'reglaCol',      width: 16 },
+    fechaImportacion: { header: 'Fecha de importación', key: 'fechaImportacionCol', width: 20 },
   };
 
   const activeCols = [...baseCols];
-  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha', 'regla']) {
+  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha', 'regla', 'fechaImportacion']) {
     if (colSet.has(key)) activeCols.push(addlColDefs[key]);
   }
   sheet.columns = activeCols;
@@ -2409,6 +2417,26 @@ async function exportMovements(filters) {
     if (!raw) return null;
     const d = new Date(raw);
     return `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${d.getUTCFullYear()}`;
+  };
+
+  // No existe un helper reusable de fecha+hora en numo-backend/src (verificado
+  // por búsqueda). A diferencia de formatUTCDate (fechas "de calendario" sin
+  // hora, donde UTC crudo casi nunca se nota), acá SÍ importa la hora real de
+  // pared — createdAt es el timestamp exacto de creación en Mongo, y el
+  // servidor guarda/opera en UTC. Se convierte a hora de México (mismo
+  // criterio ya usado en collection-request-indicadores.service.js#_hoyMxStr,
+  // vía Intl/timeZone en vez de un offset fijo -6, para no tener que tocar
+  // esto si algún día cambia la política de huso horario) para la columna
+  // opcional "Fecha de importación".
+  const formatFechaHoraMx = (raw) => {
+    if (!raw) return null;
+    const d = new Date(raw);
+    const partes = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Mexico_City',
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(d).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+    return `${partes.day}/${partes.month}/${partes.year} ${partes.hour}:${partes.minute}`;
   };
 
   // ── Filas ────────────────────────────────────────────────────────────────
@@ -2463,6 +2491,8 @@ async function exportMovements(filters) {
       rowData.fichaCol       = m.ficha ?? null;
     if (colSet.has('regla'))
       rowData.reglaCol = m.status === 'reclasificado' ? 'Manual' : (m.categoria ? 'Automática' : null);
+    if (colSet.has('fechaImportacion'))
+      rowData.fechaImportacionCol = formatFechaHoraMx(m.createdAt);
 
     sheet.addRow(rowData);
   }

@@ -78,14 +78,31 @@ router.get('/mias/stats', authenticate, permit('collections:read'), asyncHandler
   res.json(await service.statsMine(req.user._id));
 }));
 
+// Admin puede acotar /indicadores(/distribucion) a uno o varios contadores específicos
+// vía ?userIds=id1,id2 (coma-separado) — 2026-09-07, pedido explícito del usuario. Sin
+// ese query param, admin sigue viendo TODO el equipo (undefined), comportamiento de
+// siempre. Para cualquier otro rol se ignora (siempre su propio _id, sin importar qué
+// venga en la query). Los ids acá son el auth0 sub (resueltoPorUserId es String en
+// CollectionRequest.model.js, NO un ObjectId de Mongo ni el id entero de Postgres de
+// AppUserRecord) — mismo criterio que `identificadoPor` en bank.service.js#_buildFilter:
+// split(',') + trim + filter(Boolean), sin validar contra ObjectId (no aplica, el campo
+// nunca es de ese tipo, así que un id inválido no puede tirar CastError, simplemente no
+// matchea nada).
+function _resolveScopeUserId(req) {
+  if (req.user.role !== 'admin') return req.user._id;
+  const userIds = String(req.query.userIds || '').split(',').map(s => s.trim()).filter(Boolean);
+  return userIds.length ? userIds : undefined;
+}
+
 // GET /api/collection-requests/indicadores — tiempo de identificación ACOTADO a
 // Solicitudes de Cobro (total + fase banco/Kore + fase contador). Admin ve TODO el
-// equipo; cualquier otro rol con collections:read (contadores) ve SOLO lo que él
-// mismo resolvió — mismo criterio que scopeUserId de abajo, pedido explícito del
-// usuario (2026-09-03). Debe ir antes de /:id.
+// equipo (o solo los contadores elegidos vía ?userIds=); cualquier otro rol con
+// collections:read (contadores) ve SOLO lo que él mismo resolvió — mismo criterio que
+// scopeUserId de abajo, pedido explícito del usuario (2026-09-03, ampliado 2026-09-07).
+// Debe ir antes de /:id.
 router.get('/indicadores', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
   const { year, month } = req.query;
-  const scopeUserId = req.user.role === 'admin' ? undefined : req.user._id;
+  const scopeUserId = _resolveScopeUserId(req);
   res.json(await indicadoresService.getIndicadoresSolicitudesCobro({ year, month, scopeUserId }));
 }));
 
@@ -93,12 +110,24 @@ router.get('/indicadores', authenticate, permit('collections:read'), asyncHandle
 // tiempo del bloque "Distribución por franja de tiempo" del panel de arriba, ACOTADA
 // al día actual (hora de México) por defecto, o al rango fechaInicio/fechaFin cuando
 // el usuario usa el selector de rango — ver getDistribucionSolicitudesCobro() para el
-// criterio completo. Mismo scoping por rol que /indicadores (admin: todo el equipo;
-// resto: solo lo propio). Debe ir antes de /:id.
+// criterio completo. Mismo scoping por rol que /indicadores (admin: todo el equipo o
+// los contadores elegidos vía ?userIds=; resto: solo lo propio). Debe ir antes de /:id.
 router.get('/indicadores/distribucion', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
   const { fechaInicio, fechaFin } = req.query;
-  const scopeUserId = req.user.role === 'admin' ? undefined : req.user._id;
+  const scopeUserId = _resolveScopeUserId(req);
   res.json(await indicadoresService.getDistribucionSolicitudesCobro({ desde: fechaInicio, hasta: fechaFin, scopeUserId }));
+}));
+
+// GET /api/collection-requests/indicadores/contadores — auth0Subs de los usuarios que
+// alguna vez identificaron una solicitud de cobro (CollectionRequest.resueltoPorUserId
+// real), a diferencia de GET /api/users (UserService.listUsers()) que trae TODOS los
+// usuarios con rol contabilidad/cobranza sin importar si resolvieron algo. Fix real
+// (2026-09-07, reportado por el admin probando el filtro en el navegador): el <select>
+// del panel ofrecía usuarios que nunca habían resuelto nada. Mismo permiso que
+// /indicadores (collections:read) — no es un dato sensible propio de admin, cualquier
+// rol con acceso al panel puede pedirlo. Debe ir antes de /:id.
+router.get('/indicadores/contadores', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  res.json({ userIds: await indicadoresService.listContadoresConSolicitudesIdentificadas() });
 }));
 
 // GET /api/collection-requests/report — reporte Excel de TODAS las solicitudes

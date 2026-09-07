@@ -3142,6 +3142,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
+  if (process.env.DEBUG_OPA_UUID) {
+    const _targets = [process.env.DEBUG_OPA_UUID.toUpperCase(), '7639BEF9-1C4B-4B9E-9E1E-D22D6D7E8070'];
+    for (const t of _targets) {
+      const enCfdisConNC = cfdisConNCProp.some(c => (c.uuid || '').toUpperCase() === t);
+      const enCfdiConRegla = cfdiConRegla.some(({ cfdi }) => (cfdi.uuid || '').toUpperCase() === t);
+      console.warn(`[DEBUG_EGR_BATCH] uuid=${t} enCfdisConNCProp=${enCfdisConNC} enCfdiConRegla=${enCfdiConRegla}`);
+    }
+  }
 
   // CFDIs que RECIBEN un Anticipo (Reg 22/22A — cuentaAbono=2103010001,
   // claveProdServ 84111506) ya clasificados en este lote — ver

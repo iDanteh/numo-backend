@@ -1495,6 +1495,41 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 }
 
 /**
+ * Fallback estructural al guard de `origenesConvertidosAAnticipo` (ver
+ * `_prefetchCuentasPendientesAnticipo`): ese guard depende de que
+ * `/cuentas-pendientes` SIGA reportando la `anotacion` de conversión
+ * SF→Anticipo, pero ese endpoint solo lista saldos PENDIENTES — en cuanto
+ * Kore liquida el Anticipo (normalmente en pocos días), la `anotacion`
+ * desaparece de la API para siempre y el guard queda ciego (caso real
+ * confirmado 2026-09-07, Reforma, JOSE IRAN SUAREZ LINARES/DEV-057088: 5
+ * días después de detectado, `/cuentas-pendientes` con ventana amplia y
+ * completitud confirmada ya NO traía ningún registro con ese folio).
+ *
+ * Como respaldo, se compara el monto (tolerancia $0.01, igual que
+ * `_resolverReferenciaOpaPorMonto`) y la fecha (±5 días, misma ventana) de
+ * ESTA Cancelación/Devolución contra los CFDIs que RECIBEN un Anticipo
+ * (Reg 22/22A — `cuentaAbono === CODIGO_CUENTA_ANTICIPOS_CLIENTES`) ya
+ * clasificados en este mismo lote, del MISMO cliente (rfc) — estos datos
+ * salen de nuestra propia consulta de CFDIs (`cfdiConRegla`), nunca
+ * desaparecen del ERP como sí le pasa a `/cuentas-pendientes`.
+ */
+function _esConversionAAnticipoPorMonto(cfdi, montoPropio, anticiposClasificados) {
+  if (!montoPropio || !anticiposClasificados?.length) return false;
+  const rfcCliente = (cfdi.receptor?.rfc || '').toUpperCase();
+  const fechaCfdi = cfdi.fecha ? new Date(cfdi.fecha).getTime() : null;
+  const VENTANA_MS = 5 * 24 * 3600 * 1000;
+  return anticiposClasificados.some(a => {
+    if (Math.abs((Number(a.total) || 0) - montoPropio) >= 0.01) return false;
+    if (rfcCliente && (a.receptor?.rfc || '').toUpperCase() !== rfcCliente) return false;
+    if (fechaCfdi && a.fecha) {
+      const diff = Math.abs(new Date(a.fecha).getTime() - fechaCfdi);
+      if (diff > VENTANA_MS) return false;
+    }
+    return true;
+  });
+}
+
+/**
  * Arma las 2 líneas (Abono subtotal + Abono IVA) del saldo a favor generado
  * por una Devolución — ver `_prefetchSaldosFavorGenerados` (el monto viene
  * confirmado por el ERP, no es especulativo). Hasta 2026-08-10 estas 2 líneas
@@ -1525,7 +1560,7 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
  * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza — tampoco
  * hay Cargo de cierre que agregar en el caller, porque no hay líneas).
  */
-async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc, origenesConvertidosAAnticipo }) {
+async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc, origenesConvertidosAAnticipo, anticiposClasificados }) {
   if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
   const marcador = (cfdi.documentosRelacionados ?? [])
     .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
@@ -1564,6 +1599,17 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   // monto corregido.
   const montoPropio = Number(cfdi.total) || 0;
   if (montoPropio <= 0) return [];
+  // Respaldo de `_esConversionAAnticipoPorMonto` cuando `/cuentas-pendientes`
+  // ya no trae la `anotacion` (ver docstring de esa función) — mismo caso
+  // real que el guard de arriba, solo que detectado por monto+fecha+cliente
+  // en vez de por texto libre del ERP.
+  if (_esConversionAAnticipoPorMonto(cfdi, montoPropio, anticiposClasificados)) {
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_SF_ANTICIPO_GUARD_MONTO] cfdi=${cfdi.serie}-${cfdi.folio} monto=${montoPropio} `
+        + `suprimido por match de monto+fecha+cliente contra Anticipo clasificado`);
+    }
+    return [];
+  }
   const subtotal = Math.round((montoPropio / 1.16) * 100) / 100;
   const iva = Math.round((montoPropio - subtotal) * 100) / 100;
   // El nombre del cliente debe ser el de la VENTA ORIGEN (generado.ventaSerie/
@@ -3070,6 +3116,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
 
+  // CFDIs que RECIBEN un Anticipo (Reg 22/22A — cuentaAbono=2103010001,
+  // claveProdServ 84111506) ya clasificados en este lote — ver
+  // `_esConversionAAnticipoPorMonto` (respaldo del guard SF↔Anticipo cuando
+  // `/cuentas-pendientes` ya no trae la `anotacion`). OJO: `rule.cuentaIvaAnticipo`
+  // NO sirve aquí — esa propiedad solo la usan las reglas que CANCELAN un
+  // anticipo (Reg 22C/23), no la que lo recibe.
+  const anticiposClasificadosProp = cfdiConRegla
+    .filter(({ rule, cfdi: c }) => c.tipoDeComprobante === 'I' && rule?.cuentaAbono === CODIGO_CUENTA_ANTICIPOS_CLIENTES)
+    .map(({ cfdi: c }) => ({ total: c.total, fecha: c.fecha, receptor: c.receptor }));
+
   // Solo para que `_prefetchAjustesFacturaPropia` también resuelva el cobro
   // real de las canceladas-sin-compensar (ver bloque más abajo que las
   // convierte en línea de Efectivo/Bancos) — la regla-placeholder NUNCA se
@@ -3805,6 +3861,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
       cc: ccProp, rfc, origenesConvertidosAAnticipo: origenesConvertidosAAnticipoProp,
+      anticiposClasificados: anticiposClasificadosProp,
     });
     for (const linea of lineasSaldoFavorProp) {
       movimientosResult.push(linea);
@@ -4688,6 +4745,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
 
+  // Ver comentario equivalente en generarPropuesta (anticiposClasificados).
+  const anticiposClasificadosGuard = cfdiConRegla
+    .filter(({ rule, cfdi: c }) => c.tipoDeComprobante === 'I' && rule?.cuentaAbono === CODIGO_CUENTA_ANTICIPOS_CLIENTES)
+    .map(({ cfdi: c }) => ({ total: c.total, fecha: c.fecha, receptor: c.receptor }));
+
   // Ver comentario equivalente en generarPropuesta.
   const cfdiConReglaParaDesglose = cfdisCanceladasSinCompensarGuard.length
     ? [...cfdiConRegla, ...cfdisCanceladasSinCompensarGuard.map(cfdi => ({ cfdi, rule: { cuentaCargo: CODIGO_CUENTA_CAJA } }))]
@@ -5251,6 +5313,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
       cc, rfc, origenesConvertidosAAnticipo: origenesConvertidosAAnticipoGuard,
+      anticiposClasificados: anticiposClasificadosGuard,
     });
     for (const linea of lineasSaldoFavorGuard) {
       todosLosMovimientos.push(linea);

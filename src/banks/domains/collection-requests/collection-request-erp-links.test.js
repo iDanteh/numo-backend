@@ -15,7 +15,7 @@ function forma(descripcion, importe, extra = {}) {
   return { formaPagoId: 'fp-x', formaPagoDescripcion: descripcion, importe, ...extra };
 }
 
-describe('buildErpLinksParaCobro — approval tests (comportamiento actual, SIN cambios)', () => {
+describe('buildErpLinksParaCobro — approval tests', () => {
   test('Modo 1 (3 args): 1 CxC + N formasPago, saldoActual descuenta el total de ESTE cobro', () => {
     const cr = {
       cxcs: [cxc('CXC-1', 100000)],
@@ -26,9 +26,14 @@ describe('buildErpLinksParaCobro — approval tests (comportamiento actual, SIN 
     const [link] = buildErpLinksParaCobro(cr, cuentasKore, []);
 
     expect(link.erpId).toBe('CXC-1');
+    // saldoActual SIEMPRE descuenta el total real pagado en Kore, sin importar la forma.
     expect(link.saldoActual).toBe(0);
-    expect(link.saldoPagado).toBe(60000); // solo la forma bancaria (transferencia)
-    expect(link.saldoPagadoTotal).toBe(100000); // ambas formas
+    // CORRECCIÓN 2026-09-04 (pedido explícito del usuario): saldoPagadoTotal ahora es
+    // EXACTAMENTE igual a saldoPagado (solo formas bancarias) — antes sumaba las 2 formas
+    // (100000). El Efectivo sigue íntegro en desglosePorFormaPago, solo deja de alimentar
+    // saldoErp.
+    expect(link.saldoPagado).toBe(60000);
+    expect(link.saldoPagadoTotal).toBe(60000);
     expect(link.desglosePorFormaPago).toHaveLength(2);
   });
 
@@ -48,6 +53,43 @@ describe('buildErpLinksParaCobro — approval tests (comportamiento actual, SIN 
     expect(links.find(l => l.erpId === 'CXC-1').saldoActual).toBe(0);
     expect(links.find(l => l.erpId === 'CXC-2').saldoActual).toBe(0);
     expect(links.find(l => l.erpId === 'CXC-1').saldoPagado).toBe(30000);
+    expect(links.find(l => l.erpId === 'CXC-1').saldoPagadoTotal).toBe(30000);
+  });
+
+  // CORRECCIÓN 2026-09-04 (pedido explícito del usuario): saldoErp (alimentado por
+  // saldoPagadoTotal) debe reflejar solo Transferencia/Depósito en efectivo/Cheque —
+  // cualquier otra forma (ej. Anticipo) cierra la CxC en Kore igual, pero no debe
+  // sumar a saldoErp. Esa plata sigue viva en desglosePorFormaPago ("Otros" en el
+  // dropdown de CxC vinculadas, del lado del frontend).
+  test('Modo 1 con una forma NO bancaria (ej. Anticipo): saldoActual la descuenta igual, saldoPagadoTotal la ignora', () => {
+    const cr = {
+      cxcs: [cxc('CXC-1', 80000)],
+      formasPago: [forma('Anticipo', 80000)],
+    };
+    const cuentasKore = [{ id: 'CXC-1', saldoActual: 80000 }];
+
+    const [link] = buildErpLinksParaCobro(cr, cuentasKore, []);
+
+    expect(link.saldoActual).toBe(0); // la CxC sí queda saldada en Kore
+    expect(link.saldoPagado).toBe(0);
+    expect(link.saldoPagadoTotal).toBe(0); // pero no aporta a saldoErp
+    expect(link.desglosePorFormaPago).toEqual([
+      expect.objectContaining({ formaPagoDescripcion: 'Anticipo', monto: 80000 }),
+    ]);
+  });
+
+  test('Modo 2 con la forma global NO bancaria (ej. Anticipo): mismo criterio que Modo 1', () => {
+    const cr = {
+      cxcs: [{ ...cxc('CXC-1', 30000), montoAsignado: 30000 }],
+      formasPago: [forma('Anticipo', 30000)],
+    };
+    const cuentasKore = [{ id: 'CXC-1', saldoActual: 30000 }];
+
+    const [link] = buildErpLinksParaCobro(cr, cuentasKore, []);
+
+    expect(link.saldoActual).toBe(0);
+    expect(link.saldoPagado).toBe(0);
+    expect(link.saldoPagadoTotal).toBe(0);
   });
 });
 
@@ -82,13 +124,17 @@ describe('buildErpLinksParaCobro — opts (multi-bank-movement, PR1 inerte)', ()
       pagadoTotalCxc,
     });
 
-    // Sin pagadoTotalCxc, cada llamada vería solo su mitad (50000) y ambas
-    // quedarían en saldoActual=50000 en vez de 0 — exactamente el bug que D5 corrige.
+    // saldoActual SIEMPRE usa el total real (ambas formas) — sin pagadoTotalCxc, cada
+    // llamada vería solo su mitad (50000) y ambas quedarían en saldoActual=50000 en vez
+    // de 0 — exactamente el bug que D5 corrige.
     expect(linkGrupoA.saldoActual).toBe(0);
     expect(linkGrupoB.saldoActual).toBe(0);
-    // Pero cada uno sigue acumulando SOLO su propio saldoPagadoTotal (bitácora por movimiento).
+    // CORRECCIÓN 2026-09-04: saldoPagadoTotal ahora es bancario-only, por grupo. El grupo A
+    // (Transferencia) sigue sumando su monto; el grupo B (Efectivo, NO bancario) ahora
+    // acumula 0 — ese dinero sigue existiendo en desglosePorFormaPago, solo deja de
+    // alimentar saldoErp.
     expect(linkGrupoA.saldoPagadoTotal).toBe(50000);
-    expect(linkGrupoB.saldoPagadoTotal).toBe(50000);
+    expect(linkGrupoB.saldoPagadoTotal).toBe(0);
   });
 
   test('sin opts.pagadoTotalCxc (default null): saldoActual usa el totalPaid del propio grupo (comportamiento 3-arg)', () => {

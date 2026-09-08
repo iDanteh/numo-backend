@@ -22,6 +22,17 @@ async function _cajaUrl()     { return globalConfigService.getValue('kore', 'CAJ
 // Exportada (no con guión bajo) porque erp.routes.js también la necesita
 // directo para sus propias rutas /cobros/conceptos y /cobros/anticipos/*.
 async function obtenerCajaBaseUrl() { return globalConfigService.getValue('kore', 'CAJA_BASE_URL'); }
+// Token estático del ERP (Configuraciones Globales, sección `bancos`, clave
+// TOKEN) — MISMO token que usa erp-sync.service.js#_token() para
+// sincronizarCuentasPendientes. A diferencia del resto de las funciones de
+// este archivo (que usan un koreToken por usuario, obtenido vía
+// obtenerTokenKore/obtenerSesionCaja), buscarTransferenciasCajas es una
+// consulta de reporte a nivel sistema, no ligada a la sesión de caja de un
+// cajero — mismo criterio que sincronizarCuentasPendientes.
+async function _tokenEstatico() {
+  return globalConfigService.getValue('bancos', 'TOKEN');
+}
+
 // Catálogos de bancos y formas de pago — antes exclusivos de erp.routes.js
 // (GET /cobros/bancos, /formas-pago); se movieron acá 2026-07-28 para que
 // collection-request.service.js pueda resolver BancoID al aplicar un cobro
@@ -166,6 +177,86 @@ async function obtenerCuentasKore(koreToken, ids) {
       diasTolerancia: d.DiasTolerancia ?? 0,
     })),
   }));
+}
+
+// Transferencias internas entre cajas (sucursal → gerente, ver bitácora del
+// endpoint) — GET /transferencias/reportes/buscar. Solo trae los datos crudos
+// de Kore, sin ninguna lógica de matching/estatus/ficha contra BankMovement
+// (eso se implementa en una fase posterior, ver comentario en
+// collection-request.service.js si en el futuro se agrega ese cruce). Mismo
+// criterio que sincronizarCuentasPendientes en erp-sync.service.js: query
+// params opcionales, token estático de Configuraciones Globales.
+async function buscarTransferenciasCajas(params = {}) {
+  const queryParams = {};
+  if (params.fechaDesde) queryParams.fechaDesde = params.fechaDesde;
+  if (params.fechaHasta) queryParams.fechaHasta = params.fechaHasta;
+  // Hardcodeado (pedido explícito del usuario, 2026-09-02): traer solo transferencias
+  // RECIBIDO — una CANCELADO nunca tiene fechaRecepcion, así que buscarCandidatos()
+  // (caja-transferencia-match.service.js) la descarta igual, pero de este lado ya no
+  // se persiste ni ensucia la bandeja con transferencias que jamás van a matchear.
+  queryParams.estatus = 'RECIBIDO';
+
+  let response;
+  try {
+    response = await axios.get(`${await obtenerCajaBaseUrl()}/transferencias/reportes/buscar`, {
+      params:  queryParams,
+      headers: { Authorization: `Bearer ${await _tokenEstatico()}` },
+      timeout: 15000,
+    });
+  } catch (axiosErr) {
+    if (!axiosErr.response) throw axiosErr; // error de red/timeout — dejar que asyncHandler lo maneje
+    const { msg, koreBody } = _mensajeErrorKore(axiosErr, `Error al consultar transferencias de cajas (${axiosErr.response.status})`);
+    console.warn(`[buscarTransferenciasCajas] Kore rechazó con ${axiosErr.response.status}:`, JSON.stringify(koreBody));
+    throw new KoreCajaError(msg, axiosErr.response.status, koreBody);
+  }
+
+  const raw = response.data?.Data?.transferencias || [];
+  return { raw };
+}
+
+// Movimientos Netpay — mismo sistema de cajas de Kore, pero un endpoint DISTINTO:
+// GET /transactions/search (NO /transferencias/reportes/buscar — ese sigue siendo
+// exclusivo de transferencias entre cajas, ver caja-transferencia-*.service.js, no
+// tocar). Misma CAJA_BASE_URL (Configuraciones Globales, sección `kore`) y mismo
+// token estático que buscarTransferenciasCajas.
+//
+// SCAFFOLDING (2026-09-08): el usuario todavía está diseñando qué query params usan
+// para discriminar qué transacciones Netpay le sirven — por ahora solo pasa 2 a mano
+// (responseCode, almacenes) mientras explora el resto del catálogo de parámetros de
+// Kore. Devuelve el body crudo de Kore sin transformar — la forma final de la
+// respuesta, la lógica de negocio y la sección propia (permisos, UI) se definen en
+// una siguiente iteración, no adelantar diseño acá.
+async function buscarTransaccionesNetpay(params = {}) {
+  const queryParams = {};
+  if (params.responseCode) queryParams.responseCode = params.responseCode;
+  // CSV tal cual lo espera Kore (ej. "A0,N0") — quien llama arma el string, esta
+  // función no valida ni transforma la lista de almacenes.
+  if (params.almacenes) queryParams.almacenes = params.almacenes;
+  // Rango de fechas ISO completo (ej. "2026-09-04T00:00:00Z"/"...T23:59:59Z") — quien
+  // llama arma el string exacto (inicio/fin de día), esta función no lo calcula.
+  if (params.dateFrom) queryParams.dateFrom = params.dateFrom;
+  if (params.dateTo) queryParams.dateTo = params.dateTo;
+  // Paginación de Kore (2026-09-08, confirmado por el usuario: pageSize máximo real
+  // 100) — ver netpay-transacciones.service.js, que recorre todas las páginas
+  // necesarias antes de agregar totales, nunca agrega sobre una sola respuesta.
+  if (params.page) queryParams.page = params.page;
+  if (params.pageSize) queryParams.pageSize = params.pageSize;
+
+  let response;
+  try {
+    response = await axios.get(`${await obtenerCajaBaseUrl()}/transactions/search`, {
+      params:  queryParams,
+      headers: { Authorization: `Bearer ${await _tokenEstatico()}` },
+      timeout: 15000,
+    });
+  } catch (axiosErr) {
+    if (!axiosErr.response) throw axiosErr; // error de red/timeout — dejar que asyncHandler lo maneje
+    const { msg, koreBody } = _mensajeErrorKore(axiosErr, `Error al consultar transacciones Netpay (${axiosErr.response.status})`);
+    console.warn(`[buscarTransaccionesNetpay] Kore rechazó con ${axiosErr.response.status}:`, JSON.stringify(koreBody));
+    throw new KoreCajaError(msg, axiosErr.response.status, koreBody);
+  }
+
+  return { raw: response.data };
 }
 
 // Catálogo de bancos de Kore — mismo mapeo que ya usaba GET /cobros/bancos en
@@ -372,6 +463,8 @@ module.exports = {
   obtenerTokenKore,
   obtenerSesionCaja,
   obtenerCuentasKore,
+  buscarTransferenciasCajas,
+  buscarTransaccionesNetpay,
   listarBancos,
   listarFormasPago,
   aplicarCobroOperacion,

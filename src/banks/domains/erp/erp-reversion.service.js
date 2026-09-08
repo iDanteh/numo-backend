@@ -103,7 +103,7 @@ function _snapshot(value) {
 // (ceder ownership al humano que vincula a mano), pero no para esto: acá no hay ningún
 // humano tomando posesión, así que la limpieza debe ser puntual, solo la entrada del erpId
 // que se está removiendo.
-async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno } = {}) {
+async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno, motivo } = {}) {
   const link = (mov.erpLinks ?? []).find(l => l.erpId === erpId) ?? null;
   const erpLinkRemovido = _snapshot(link);
 
@@ -126,6 +126,17 @@ async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExtern
   mov.erpLinks        = (mov.erpLinks ?? []).filter(l => l.erpId !== erpId);
   mov.erpIds          = (mov.erpIds ?? []).filter(id => id !== erpId);
   mov.identificadoPor = (mov.identificadoPor ?? []).filter(e => e.erpId !== erpId);
+
+  // 2026-09-01 (pedido explícito del usuario) — mismo historialVinculacion que ya alimenta
+  // el flujo manual (bank.service.js), acá con origen:'kore-reversion' y sin userId (webhook
+  // server-to-server, sin sesión humana detrás). Si no había link (linkRemovido null, mismo
+  // caso de "no hay nada que auditar" de arriba) no se registra nada.
+  if (link) {
+    mov.historialVinculacion = [...(mov.historialVinculacion || []), {
+      at: new Date(), accion: 'desvinculado', erpId, origen: 'kore-reversion',
+      userId: null, userNombre: null, motivo: motivo ?? null, snapshot: erpLinkRemovido,
+    }];
+  }
 
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
   mov.saldoErp = saldoErp;
@@ -202,12 +213,12 @@ function _atribucionInconsistente(raw0, calculosPorMovimiento) {
   return Math.abs(sumaCalculada - totalPagadoSegunKore) > 1;
 }
 
-async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExterno, raw0, calculadoPrevio, calculadoBancarioPrevio } = {}) {
+async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExterno, raw0, calculadoPrevio, calculadoBancarioPrevio, motivo } = {}) {
   if (!raw0) {
     // Sin datos frescos de Kore (no se pudo reconsultar — ver procesarReversionKore) — cae
     // al comportamiento anterior en vez de dejar el link con un número potencialmente
     // incorrecto sin ninguna corrección.
-    return _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno });
+    return _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno, motivo });
   }
 
   const link      = mov.erpLinks.find(l => l.erpId === erpId) ?? null;
@@ -229,13 +240,13 @@ async function _aplicarReversionAMovimiento(mov, erpId, { serieExterna, folioExt
   logger.info(`[erp-reversion] erpId=${erpId} movementId=${mov._id}: aporte antes=${link?.saldoErpAportado ?? null}, recalculado tras reversión=${calculado} (esHumano=${esHumano}) -> ${(calculado == null || calculado === 0) ? 'DESVINCULADO' : 'AJUSTADO'}.`);
 
   if (calculado == null || calculado === 0) {
-    return _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno });
+    return _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExterno, motivo });
   }
 
-  return _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado, calculadoBancarioPrevio });
+  return _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado, calculadoBancarioPrevio, motivo });
 }
 
-async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado, calculadoBancarioPrevio }) {
+async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExterno, raw0, esHumano, calculado, calculadoBancarioPrevio, motivo }) {
   const link = mov.erpLinks.find(l => l.erpId === erpId);
 
   let mismatch = false;
@@ -262,6 +273,13 @@ async function _ajustarLinkTrasReversion(mov, erpId, { serieExterna, folioExtern
   link.tieneRetencion    = retencion.tieneRetencion;
   link.montoRetenido     = retencion.montoRetenido;
   link.saldoActual       = raw0.saldoActual ?? link.saldoActual ?? null;
+
+  // 2026-09-01 (pedido explícito del usuario): 'ajustado' también deja rastro en el
+  // historial propio del movimiento, mismo criterio que 'desvinculado' arriba.
+  mov.historialVinculacion = [...(mov.historialVinculacion || []), {
+    at: new Date(), accion: 'ajustado', erpId, origen: 'kore-reversion',
+    userId: null, userNombre: null, motivo: motivo ?? null, snapshot: erpLinkAntes,
+  }];
 
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
   mov.saldoErp = saldoErp;
@@ -392,7 +410,7 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
     for (let i = 0; i < movs.length; i++) {
       const calculadoPrevio         = calculosPorMovimiento ? calculosPorMovimiento[i] : undefined;
       const calculadoBancarioPrevio = calculosBancarioPorMovimiento ? calculosBancarioPorMovimiento[i] : undefined;
-      resultados.push(await _aplicarReversionAMovimiento(movs[i], erpId, { serieExterna, folioExterno, raw0, calculadoPrevio, calculadoBancarioPrevio }));
+      resultados.push(await _aplicarReversionAMovimiento(movs[i], erpId, { serieExterna, folioExterno, raw0, calculadoPrevio, calculadoBancarioPrevio, motivo }));
     }
   }
 

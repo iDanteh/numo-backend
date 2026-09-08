@@ -1,6 +1,8 @@
 'use strict';
 
 const { randomUUID }    = require('crypto');
+const path               = require('path');
+const { conTransaccion } = require('../../shared/utils/mongo-tx');
 const BankMovement      = require('./BankMovement.model');
 const bankConfigRepo    = require('./repositories/bank-config.repository');
 const Counter           = require('../../shared/models/Counter');
@@ -8,13 +10,14 @@ const CollectionRequest = require('../collection-requests/CollectionRequest.mode
 const { parseBankFile, makeHash, TEMPLATE_SIGNATURE_SHEET, TEMPLATE_SIGNATURE_VALUE } = require('./bank.parser');
 const ExcelJS = require('exceljs');
 const { NotFoundError, BadRequestError, ConflictError, ForbiddenError } = require('../../shared/errors/AppError');
-const { emitToUser, emitToBanco } = require('../../shared/socket');
+const { emitToUser, emitToBanco, emitToAll } = require('../../shared/socket');
 const { matchRegla }   = require('./bank-rules.service');
 const bankRuleRepo     = require('./repositories/bank-rule.repository');
 const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
 const { MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 const rbacStore = require('../../../shared/services/rbac-store');
 const { logger }         = require('../../../shared/utils/logger');
+const { subirImagenFicha, eliminarImagenFicha, descargarImagenFicha } = require('./drive-fichas.service');
 // ── Constantes ────────────────────────────────────────────────────────────────
 
 const BANCOS_VALIDOS = [
@@ -1805,6 +1808,43 @@ async function updateCategoria(id, categoria, user) {
   return result;
 }
 
+// 2026-09-02 (pedido explícito del usuario) — registro de hooks para desvincular un
+// erpId: bank.service.js (dominio banks) no conoce ni le importa quién se registra acá.
+// El dominio erp (caja-transferencia-revert.service.js) se registra a sí mismo al
+// cargarse desde erp.routes.js — evita el require circular que crearía importar ese
+// archivo directamente desde acá (caja-transferencia-confirm.service.js YA importa
+// setErpIds de este módulo).
+const erpUnlinkHooks = [];
+function registerErpUnlinkHook(fn) { erpUnlinkHooks.push(fn); }
+// Solo para tests: erpUnlinkHooks es module-level y persiste entre test() dentro del
+// mismo archivo (Jest solo aísla el require cache POR ARCHIVO, no por test individual)
+// — sin esto, un hook registrado en un test queda registrado para todos los siguientes.
+function _clearErpUnlinkHooksParaTests() { erpUnlinkHooks.length = 0; }
+
+async function _ejecutarHooksDesvinculacion(erpId, movementId, session, user) {
+  for (const hook of erpUnlinkHooks) {
+    // eslint-disable-next-line no-await-in-loop
+    await hook({ erpId, movementId, session, user });
+  }
+}
+
+// Guarda un movimiento YA MUTADO en memoria + corre los hooks de desvinculación
+// (ej. revertir una CajaTransferencia) en UNA sola transacción Mongo — si un hook
+// falla, el save también se revierte, así nunca queda el movimiento desvinculado con
+// la transferencia asociada "resuelta" para siempre. Reusa conTransaccion() (banks/
+// shared/utils/mongo-tx.js) en vez de reimplementar la detección de topología y el
+// fallback a Mongo standalone (sin replica set) — mismo helper que ya usa
+// collection-request.service.js#identificar().
+async function _guardarConHooksDeDesvinculacion(mov, erpIdsRemovidos, user) {
+  await conTransaccion(async (session) => {
+    await mov.save(session ? { session } : undefined);
+    for (const erpId of erpIdsRemovidos) {
+      // eslint-disable-next-line no-await-in-loop
+      await _ejecutarHooksDesvinculacion(erpId, mov._id, session, user);
+    }
+  });
+}
+
 async function updateErpIds(id, action, erpId, user) {
   if (action !== 'remove') throw new BadRequestError('Solo se acepta action "remove"');
   if (!erpId || typeof erpId !== 'string' || !erpId.trim()) {
@@ -1820,8 +1860,20 @@ async function updateErpIds(id, action, erpId, user) {
   // Antes había acá un candado adicional de "propio usuario" que dejaba sin efecto el
   // permiso para cualquiera que no fuera admin.
 
+  // 2026-09-01 (pedido explícito del usuario): snapshot del link ANTES de filtrarlo —
+  // una vez que sale de erpLinks no hay forma de reconstruirlo. Si no estaba vinculada
+  // (linkRemovido undefined, ej. reintento sobre algo ya desvinculado) no se registra
+  // nada — no hay ninguna acción real que auditar.
+  const linkRemovido = (mov.erpLinks || []).find(l => l.erpId === cleanId);
+
   mov.erpIds          = (mov.erpIds          || []).filter(x => x !== cleanId);
   mov.erpLinks        = (mov.erpLinks        || []).filter(l => l.erpId !== cleanId);
+  if (linkRemovido) {
+    mov.historialVinculacion = [...(mov.historialVinculacion || []), {
+      at: new Date(), accion: 'desvinculado', erpId: cleanId, origen: 'manual',
+      userId: user?._id ?? null, userNombre: user?.nombre ?? null, snapshot: linkRemovido,
+    }];
+  }
   // Eliminar las entradas de identificadoPor correspondientes a la CxC desvinculada.
   // Si ya no quedan CxCs vinculadas, limpiar por completo: cubre entradas sin erpId
   // (erpId: null) almacenadas por el motor automático, que el filtro exacto no elimina.
@@ -1842,10 +1894,20 @@ async function updateErpIds(id, action, erpId, user) {
   );
   mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
   mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
-  await mov.save();
+
+  // 2026-09-02 (pedido explícito del usuario): solo hay algo que revertir (ej. una
+  // CajaTransferencia matcheada con este erpId sintético) cuando de verdad se quitó un
+  // link — un reintento sobre algo ya desvinculado (linkRemovido undefined) se guarda
+  // igual que siempre, sin abrir transacción de más.
+  if (linkRemovido) {
+    await _guardarConHooksDeDesvinculacion(mov, [cleanId], user);
+  } else {
+    await mov.save();
+  }
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
+    historialVinculacion: mov.historialVinculacion,
     saldoErp: mov.saldoErp, uuidXML: mov.uuidXML, status: mov.status, identificadoPor: mov.identificadoPor,
   };
   emitToBanco(mov.banco, 'bank:movement:updated', updated);
@@ -1947,6 +2009,12 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
     throw new ForbiddenError('No tienes permiso para desvincular una CxC ya asociada a este movimiento.');
   }
 
+  // 2026-09-01 (pedido explícito del usuario): snapshot de erpLinks ANTES de
+  // reemplazarlo — este PUT sobrescribe el arreglo completo (ver comentario arriba,
+  // "REEMPLAZA el arreglo completo"), así que sin esto no hay forma de saber qué
+  // traía cada CxC dada de baja.
+  const erpLinksAntes = mov.erpLinks || [];
+
   mov.erpLinks = cleanLinks;
   mov.erpIds   = cleanLinks.map(l => l.erpId);
 
@@ -1968,6 +2036,24 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   }
   mov.identificadoPor = updatedIdPor;
 
+  // 2026-09-01 (pedido explícito del usuario) — mismo historial que updateErpIds():
+  // 'vinculado' por cada alta (snapshot = el link nuevo, ya en cleanLinks), 'desvinculado'
+  // por cada baja (snapshot = como estaba en erpLinksAntes). addedErpIds/removedErpIds ya
+  // estaban calculados arriba para identificadoPor — se reusan tal cual.
+  const nuevasEntradasHistorial = [
+    ...addedErpIds.map(erpId => ({
+      at: new Date(), accion: 'vinculado', erpId, origen: 'manual',
+      userId: user?._id ?? null, userNombre: displayName, snapshot: cleanLinks.find(l => l.erpId === erpId) ?? null,
+    })),
+    ...removedErpIds.map(erpId => ({
+      at: new Date(), accion: 'desvinculado', erpId, origen: 'manual',
+      userId: user?._id ?? null, userNombre: displayName, snapshot: erpLinksAntes.find(l => l.erpId === erpId) ?? null,
+    })),
+  ];
+  if (nuevasEntradasHistorial.length > 0) {
+    mov.historialVinculacion = [...(mov.historialVinculacion || []), ...nuevasEntradasHistorial];
+  }
+
   const { saldoErp, uuidXML, status } = aplicarLogicaErp(mov);
   mov.saldoErp = saldoErp;
   mov.uuidXML  = uuidXML;
@@ -1979,7 +2065,27 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   );
   mov.primeraIdentificacionAt  = primeraId.primeraIdentificacionAt;
   mov.primeraIdentificacionPor = primeraId.primeraIdentificacionPor;
-  await mov.save(session ? { session } : undefined);
+
+  // 2026-09-02 (pedido explícito del usuario): mismo criterio que updateErpIds() —
+  // si el caller externo ya trae su propia session (identificar(), N x setErpIds
+  // dentro de conTransaccion), se usa esa tal cual, sin tocar su transacción (ni
+  // commit ni abort le pertenecen a este código). Sin session externa Y sin ninguna
+  // baja real (removedErpIds vacío) el guardado sigue exactamente igual que antes
+  // (mov.save(undefined), sin transacción de más — nada que revertir). Solo cuando
+  // hay una baja real Y nadie trajo session, este código abre su propia transacción
+  // para que guardar el movimiento y correr los hooks de desvinculación (ej. revertir
+  // una CajaTransferencia) sea atómico.
+  if (session) {
+    await mov.save({ session });
+    for (const erpId of removedErpIds) {
+      // eslint-disable-next-line no-await-in-loop
+      await _ejecutarHooksDesvinculacion(erpId, mov._id, session, user);
+    }
+  } else if (removedErpIds.length > 0) {
+    await _guardarConHooksDeDesvinculacion(mov, removedErpIds, user);
+  } else {
+    await mov.save(undefined);
+  }
 
   // Resuelve sola cualquier línea de póliza que seguía en cuenta puente para
   // los CFDIs que este movimiento acaba de identificar — no bloquea la
@@ -1999,6 +2105,7 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
 
   const updated = {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
+    historialVinculacion: mov.historialVinculacion,
     saldoErp: mov.saldoErp, uuidXML: mov.uuidXML, status: mov.status,
     identificadoPor: mov.identificadoPor,
   };
@@ -2092,6 +2199,7 @@ async function exportMovements(filters) {
   const {
     banco, fechaInicio, fechaFin,
     fechaAplicacionInicio, fechaAplicacionFin,
+    fechaImportacionInicio, fechaImportacionFin,
     tipo, search, concepto,
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
@@ -2168,6 +2276,12 @@ async function exportMovements(filters) {
       { fichaAt: df },
       { identificadoPor: { $elemMatch: { fechaId: df } } },
     ]});
+  }
+
+  if (fechaImportacionInicio || fechaImportacionFin) {
+    filter.createdAt = {};
+    if (fechaImportacionInicio) filter.createdAt.$gte = new Date(fechaImportacionInicio);
+    if (fechaImportacionFin)    filter.createdAt.$lte = new Date(`${fechaImportacionFin}T23:59:59.999Z`);
   }
 
   if (search) {
@@ -2282,10 +2396,11 @@ async function exportMovements(filters) {
     retencion:   { header: 'Retención',     key: 'retencionCol',   width: 12 },
     ficha:       { header: 'N° Ficha',      key: 'fichaCol',       width: 14 },
     regla:       { header: 'Regla aplicada', key: 'reglaCol',      width: 16 },
+    fechaImportacion: { header: 'Fecha de importación', key: 'fechaImportacionCol', width: 20 },
   };
 
   const activeCols = [...baseCols];
-  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha', 'regla']) {
+  for (const key of ['folioFiscal', 'formaPago', 'retencion', 'ficha', 'regla', 'fechaImportacion']) {
     if (colSet.has(key)) activeCols.push(addlColDefs[key]);
   }
   sheet.columns = activeCols;
@@ -2302,6 +2417,26 @@ async function exportMovements(filters) {
     if (!raw) return null;
     const d = new Date(raw);
     return `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${d.getUTCFullYear()}`;
+  };
+
+  // No existe un helper reusable de fecha+hora en numo-backend/src (verificado
+  // por búsqueda). A diferencia de formatUTCDate (fechas "de calendario" sin
+  // hora, donde UTC crudo casi nunca se nota), acá SÍ importa la hora real de
+  // pared — createdAt es el timestamp exacto de creación en Mongo, y el
+  // servidor guarda/opera en UTC. Se convierte a hora de México (mismo
+  // criterio ya usado en collection-request-indicadores.service.js#_hoyMxStr,
+  // vía Intl/timeZone en vez de un offset fijo -6, para no tener que tocar
+  // esto si algún día cambia la política de huso horario) para la columna
+  // opcional "Fecha de importación".
+  const formatFechaHoraMx = (raw) => {
+    if (!raw) return null;
+    const d = new Date(raw);
+    const partes = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Mexico_City',
+      day: '2-digit', month: '2-digit', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).formatToParts(d).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+    return `${partes.day}/${partes.month}/${partes.year} ${partes.hour}:${partes.minute}`;
   };
 
   // ── Filas ────────────────────────────────────────────────────────────────
@@ -2356,6 +2491,8 @@ async function exportMovements(filters) {
       rowData.fichaCol       = m.ficha ?? null;
     if (colSet.has('regla'))
       rowData.reglaCol = m.status === 'reclasificado' ? 'Manual' : (m.categoria ? 'Automática' : null);
+    if (colSet.has('fechaImportacion'))
+      rowData.fechaImportacionCol = formatFechaHoraMx(m.createdAt);
 
     sheet.addRow(rowData);
   }
@@ -2494,6 +2631,16 @@ async function bulkUpdateCategoria(ids, categoria, user) {
   return { actualizados };
 }
 
+// 2026-09-03 (pedido explícito del usuario): setFicha/deleteFicha aplican a CUALQUIER
+// movimiento (cualquiera puede tener ficha), pero el evento 'bank:ficha-pendiente:changed'
+// solo le interesa a la bandeja de transferencias entre cajas — se emite SOLO cuando el
+// movimiento tiene un erpLink origen:'transferencia-caja' (ver
+// caja-transferencia-confirm.service.js), para no disparar refrescos irrelevantes en el
+// resto de los casos.
+function _calificaParaFichaPendiente(mov) {
+  return (mov.erpLinks || []).some(l => l.origen === 'transferencia-caja');
+}
+
 async function setFicha(id, ficha, user) {
   const mov = await BankMovement.findById(id);
   if (!mov) throw new NotFoundError('Movimiento');
@@ -2531,6 +2678,9 @@ async function setFicha(id, ficha, user) {
     fichaNombre: updated.fichaNombre,
     fichaAt:    updated.fichaAt,
   });
+  if (_calificaParaFichaPendiente(updated)) {
+    emitToAll('bank:ficha-pendiente:changed', { movementId: updated._id });
+  }
 
   return {
     _id:        updated._id,
@@ -2540,6 +2690,94 @@ async function setFicha(id, ficha, user) {
     fichaNombre: updated.fichaNombre,
     fichaAt:    updated.fichaAt,
   };
+}
+
+// Extensión de respaldo cuando el archivo llega sin una en el nombre original
+// (ej. una foto de cámara/celular sin extensión) — mismos 4 tipos que acepta
+// el multer dedicado de bank.routes.js (uploadFichaImagen).
+const FICHA_IMAGEN_MIME_EXT = {
+  'image/jpeg':     '.jpg',
+  'image/png':      '.png',
+  'image/webp':     '.webp',
+  'application/pdf': '.pdf',
+};
+
+// Quita caracteres inválidos en un nombre de archivo (Windows es el más estricto:
+// \ / : * ? " < > |) — folio y banco son datos cargados/elegidos por un humano,
+// nunca deberían traerlos, pero un folio escrito a mano no está garantizado.
+function _sanitizarNombreArchivo(texto) {
+  return String(texto ?? '').replace(/[\\/:*?"<>|]/g, '').trim();
+}
+
+/**
+ * Nombre con el que la imagen de respaldo se guarda en Drive — CORRECCIÓN
+ * 2026-09-04: usa `mov.folio` (el consecutivo interno de NUMO, asignado por
+ * Counter al crear/importar el movimiento — único y estable) en vez de
+ * `mov.ficha` (texto libre que el contador escribe a mano, puede variar o
+ * repetirse). "folio de NUMO + banco al que se depositó", pedido explícito del
+ * usuario, para poder rastrear el movimiento buscando esos 2 datos en Drive.
+ * Fallback a `mov._id` para movimientos legacy sin folio asignado (índice
+ * sparse — no todos lo tienen). NO usa el nombre original del archivo subido
+ * (una foto de celular no dice nada por sí sola).
+ */
+function _nombreArchivoFichaDrive(mov, imagen) {
+  const extension = path.extname(imagen.originalname || '') || FICHA_IMAGEN_MIME_EXT[imagen.mimetype] || '';
+  const folio = _sanitizarNombreArchivo(mov.folio || String(mov._id));
+  const banco = _sanitizarNombreArchivo(mov.banco);
+  return `${folio} - ${banco}${extension}`;
+}
+
+/**
+ * Adjunta la foto/documento de respaldo del depósito a Drive y guarda la
+ * referencia (driveFileId + webViewLink) en el movimiento.
+ *
+ * CORRECCIÓN 2026-09-04 (pedido explícito del usuario): el documento es
+ * INDEPENDIENTE de la ficha (folio físico que el contador tipea a mano) — ya
+ * no exige que exista una ficha registrada, y ya no restringe por autoría de
+ * ficha (no tendría sentido: puede no haber ningún autor todavía). El permiso
+ * de ruta `banks:ficha` ya es el único candado necesario.
+ *
+ * `imagen` es el shape de req.file de multer: { buffer, mimetype, originalname }.
+ */
+async function adjuntarImagenFicha(id, imagen) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  const nombreArchivo = _nombreArchivoFichaDrive(mov, imagen);
+  const { driveFileId, driveWebViewLink } = await subirImagenFicha(imagen.buffer, imagen.mimetype, nombreArchivo);
+
+  mov.fichaDriveFileId      = driveFileId;
+  mov.fichaDriveWebViewLink = driveWebViewLink;
+  mov.fichaDriveMimeType    = imagen.mimetype;
+  await mov.save();
+
+  emitToBanco(mov.banco, 'bank:movement:updated', {
+    _id:                   mov._id,
+    fichaDriveFileId:      mov.fichaDriveFileId,
+    fichaDriveWebViewLink: mov.fichaDriveWebViewLink,
+    fichaDriveMimeType:    mov.fichaDriveMimeType,
+  });
+
+  return {
+    _id:                   mov._id,
+    fichaDriveFileId:      mov.fichaDriveFileId,
+    fichaDriveWebViewLink: mov.fichaDriveWebViewLink,
+    fichaDriveMimeType:    mov.fichaDriveMimeType,
+  };
+}
+
+/**
+ * Descarga el binario de la imagen/PDF de respaldo de una ficha — proxy
+ * autenticado para el visor del modal ERP (nunca se expone un link público de
+ * Drive). Mismo patrón que collection-request.service.js#getComprobante().
+ */
+async function obtenerImagenFicha(id) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+  if (!mov.fichaDriveFileId) throw new NotFoundError('Este movimiento no tiene ninguna imagen de ficha adjunta');
+
+  const buffer = await descargarImagenFicha(mov.fichaDriveFileId);
+  return { data: buffer, mimetype: mov.fichaDriveMimeType };
 }
 
 async function deleteFicha(id, user) {
@@ -2557,6 +2795,12 @@ async function deleteFicha(id, user) {
     throw new ForbiddenError('Solo el usuario que registró la ficha o un administrador puede eliminarla');
   }
 
+  // CORRECCIÓN 2026-09-04 (pedido explícito del usuario): el documento adjunto
+  // ya NO se toca acá. Antes se borraba junto con la ficha porque el nombre en
+  // Drive dependía de `ficha` (texto variable/no confiable); ahora el nombre
+  // usa `mov.folio` (consecutivo estable de NUMO) y el documento vive
+  // independiente del folio físico — borrar/corregir la ficha no debe hacer
+  // desaparecer un comprobante ya adjuntado.
   mov.ficha       = null;
   mov.fichaBy     = null;
   mov.fichaNombre = null;
@@ -2591,6 +2835,9 @@ async function deleteFicha(id, user) {
     fichaNombre: null,
     fichaAt:     null,
   });
+  if (_calificaParaFichaPendiente(updated)) {
+    emitToAll('bank:ficha-pendiente:changed', { movementId: updated._id });
+  }
 
   return {
     _id:         updated._id,
@@ -2599,6 +2846,52 @@ async function deleteFicha(id, user) {
     fichaBy:     null,
     fichaNombre: null,
     fichaAt:     null,
+  };
+}
+
+/**
+ * Quita el documento de respaldo del depósito, sin tocar el folio/ficha — para
+ * corregir un archivo adjuntado por error sin tener que borrar y volver a
+ * registrar la ficha entera (pedido explícito del usuario, 2026-09-04).
+ *
+ * Sin restricción de autoría (a diferencia de deleteFicha()): el documento es
+ * independiente de quién registró la ficha — puede no haber ningún autor
+ * todavía si se adjuntó antes de registrarla. El permiso de ruta `banks:ficha`
+ * ya es el único candado necesario.
+ */
+async function quitarImagenFicha(id) {
+  const mov = await BankMovement.findById(id);
+  if (!mov) throw new NotFoundError('Movimiento');
+
+  if (!mov.fichaDriveFileId) {
+    throw new BadRequestError('Este movimiento no tiene ningún documento adjunto para quitar');
+  }
+
+  const fichaDriveFileIdPrevio = mov.fichaDriveFileId;
+
+  mov.fichaDriveFileId      = null;
+  mov.fichaDriveWebViewLink = null;
+  mov.fichaDriveMimeType    = null;
+  const updated = await mov.save();
+
+  emitToBanco(mov.banco, 'bank:movement:updated', {
+    _id:                   updated._id,
+    fichaDriveFileId:      null,
+    fichaDriveWebViewLink: null,
+    fichaDriveMimeType:    null,
+  });
+
+  // Best-effort, mismo criterio que deleteFicha(): el registro en Mongo ya quedó
+  // consistente sin el documento, un fallo de Drive acá no debe bloquear nada.
+  eliminarImagenFicha(fichaDriveFileIdPrevio).catch((err) => {
+    logger.warn(`[banks] quitarImagenFicha: no se pudo eliminar la imagen de Drive (fileId=${fichaDriveFileIdPrevio}): ${err.message}`);
+  });
+
+  return {
+    _id:                   updated._id,
+    fichaDriveFileId:      null,
+    fichaDriveWebViewLink: null,
+    fichaDriveMimeType:    null,
   };
 }
 
@@ -3313,7 +3606,9 @@ async function revertirConciliacion(runId, userId) {
 
 module.exports = {
   getCards, listMovements, getSummary, getStatusStats, getAvailableYears,
-  importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha,
+  importFile, updateStatus, updateErpIds, setErpIds, setFicha, deleteFicha, adjuntarImagenFicha,
+  quitarImagenFicha, obtenerImagenFicha,
+  registerErpUnlinkHook, _clearErpUnlinkHooksParaTests,
   getConfig, saveConfig, setSaldoInicial, listCategories, listIdentificadores, importIndividual,
   exportMovements, deleteMovements, reclasifyMovements, bulkUpdateCategoria, updateMovement, updateCategoria, generateTemplate,
   findPotentialDuplicates,

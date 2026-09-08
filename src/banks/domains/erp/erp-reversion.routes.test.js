@@ -292,6 +292,61 @@ describe('procesarReversionKore — procesa la reversión', () => {
   });
 });
 
+// 2026-09-01 (pedido explícito del usuario): además de ErpReversion (colección aparte, ya
+// existía), la reversión ahora también deja su propio rastro en historialVinculacion del
+// movimiento — mismo campo que ya alimentan updateErpIds/setErpIds (bank.service.js), acá
+// con origen:'kore-reversion' y sin userId (webhook server-to-server, sin sesión humana).
+describe('procesarReversionKore — historialVinculacion (rastro persistente en el propio movimiento)', () => {
+  test('desvinculado (comportamiento de respaldo, sin datos frescos de Kore): push con origen kore-reversion y el motivo que mandó Kore', async () => {
+    const linkOriginal = { erpId: 'CXC-1', saldoActual: 500, total: 500, serie: 'A0', folioExterno: '100' };
+    const mov = fakeMov({
+      erpIds: ['CXC-1'], erpLinks: [linkOriginal], deposito: 500, status: 'identificado',
+      historialVinculacion: [],
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-hist-1' });
+
+    await procesarReversionKore({ erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', motivo: 'Cancelación de factura' });
+
+    expect(mov.historialVinculacion).toHaveLength(1);
+    const entry = mov.historialVinculacion[0];
+    expect(entry.accion).toBe('desvinculado');
+    expect(entry.erpId).toBe('CXC-1');
+    expect(entry.origen).toBe('kore-reversion');
+    expect(entry.userId).toBeNull();
+    expect(entry.motivo).toBe('Cancelación de factura');
+    expect(entry.snapshot).toEqual(linkOriginal);
+  });
+
+  test('ajustado (queda un aporte vigente, solo se corrige el número): push "ajustado" con snapshot de ANTES del ajuste', async () => {
+    const mov = fakeMov({
+      _id: 'mov-A', erpIds: ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 100, total: 300, saldoErpAportado: 200, serie: 'A0', folioExterno: '100' }],
+      deposito: 100, historialVinculacion: [],
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-hist-2' });
+
+    erpRoutes._rangoDesdeFollo.mockReturnValue({ fechaDesde: '2026-08-01', fechaHasta: '2026-08-31' });
+    erpRoutes._sincronizarConRetry.mockResolvedValue({ raw: [{ saldoActual: 100, movimientos: [] }] });
+    erpRoutes._erpIdIdentificadoPorHumano.mockReturnValue(true);
+    erpRoutes._aportesPorErpIdCronologico.mockReturnValue(new Map([[0, 100]])); // bajó de 200 a 100 — sigue > 0, se AJUSTA
+    erpRoutes._backfillFormasPagoYFolioFiscal.mockReturnValue({ saldoPagadoTotal: 100, saldoPagado: 100, folioFiscal: null });
+    erpRoutes._movimientosKoreDesde.mockReturnValue([]);
+    erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: false, montoRetenido: null });
+
+    await procesarReversionKore({ erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', motivo: 'Abono parcial revertido' });
+
+    expect(mov.erpLinks).toHaveLength(1); // sigue vinculado, no se quitó
+    expect(mov.historialVinculacion).toHaveLength(1);
+    const entry = mov.historialVinculacion[0];
+    expect(entry.accion).toBe('ajustado');
+    expect(entry.origen).toBe('kore-reversion');
+    expect(entry.motivo).toBe('Abono parcial revertido');
+    expect(entry.snapshot.saldoErpAportado).toBe(200); // el valor ANTES del ajuste, no el 100 nuevo
+  });
+});
+
 describe('procesarReversionKore — fix real 2026-08-20: reconsulta a Kore en vivo, no desvincula abonos que siguen vigentes', () => {
   function mockRangoYSync(raw0) {
     erpRoutes._rangoDesdeFollo.mockReturnValue({ fechaDesde: '2026-08-01', fechaHasta: '2026-08-31' });

@@ -62,4 +62,9 @@ jobs:
           host: ${{ vars.STAGING_HOST }}
           username: ${{ vars.STAGING_USER }}
           key: ${{ secrets.STAGING_SSH_KEY }}
+          # Default de la action es 10m — el build de Docker en el servidor
+          # (deps del sistema + npm install + export de la imagen) puede
+          # tardar más que eso con caché frío y la action mata la conexión
+          # SSH a medias, dejando el deploy incompleto (confirmado 2026-09-01).
+          command_timeout: 30m
           script: echo "deploy trigger"

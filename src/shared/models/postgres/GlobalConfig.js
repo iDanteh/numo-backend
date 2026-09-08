@@ -44,7 +44,7 @@ const GlobalConfig = sequelize.define('GlobalConfig', {
     defaultValue: false,
   },
   tipo: {
-    type:         DataTypes.STRING(20), // 'url' | 'ruta' | 'texto' | 'numero' | 'booleano'
+    type:         DataTypes.STRING(20), // 'url' | 'ruta' | 'texto' | 'numero' | 'booleano' | 'lista' (JSON array de strings)
     allowNull:    false,
     defaultValue: 'texto',
   },

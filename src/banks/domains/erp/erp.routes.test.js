@@ -72,6 +72,9 @@ jest.mock('../../../visor/models/CFDI', () => ({
   })),
 }));
 
+// Netpay (Fase 1) — límite de I/O real de la ruta nueva.
+jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpay: jest.fn() }));
+
 const express      = require('express');
 const request      = require('supertest');
 const router       = require('./erp.routes');
@@ -79,6 +82,7 @@ const rbacStore    = require('../../../shared/services/rbac-store');
 const koreCaja     = require('./kore-caja.service');
 const { sincronizarCuentasPendientes } = require('./erp-sync.service');
 const CFDI         = require('../../../visor/models/CFDI');
+const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 describe('_aporteConRatchet', () => {
@@ -787,6 +791,265 @@ describe('GET /cuentas-pendientes', () => {
     expect(rbacStore.hasPermission).toHaveBeenCalledWith(
       'test-role', PERMISSIONS.BANKS_ERP_ANTICIPOS, [],
     );
+  });
+});
+
+// GET /transferencias-cajas — solo trae los datos crudos de Kore (transferencias internas
+// entre cajas), sin ninguna lógica de matching contra BankMovement (fase posterior).
+describe.skip('GET /transferencias-cajas', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .get('/transferencias-cajas')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]);
+    expect(koreCaja.buscarTransferenciasCajas).not.toHaveBeenCalled();
+  });
+
+  test('pasa fechaDesde/fechaHasta a buscarTransferenciasCajas y devuelve los datos crudos mapeados', async () => {
+    koreCaja.buscarTransferenciasCajas.mockResolvedValue({
+      raw: [{
+        id: '6a97291ab6007400011db828', monto: 1500, estatus: 'RECIBIDO',
+        cajaOrigenId: '62cdb5782d75cf00018309da', nombreCajaOrigen: 'CAJA SILVA', almacenCajaOrigen: 'A0',
+        cajaDestinoId: '6a7b7d115f9c490001f589a8', nombreCajaDestino: 'CAJA - HECTOR', almacenCajaDestino: 'A0',
+        sessionOrigenId: '6a831ed77a16ce000158fba5', sessionDestinoId: '6a972934b6007400011db834',
+        formaPago: '5f85d826acfcf300018a088a', nombreFormaPago: 'EFECTIVO',
+        solicito: '602ec3ccb0aeec0001a58200', nombreSolicito: 'CARLOS MARTINEZ SILVA',
+        recibio: '6a7a0e9cfe132d0001cfab40', nombreRecibio: 'ROBERTO HECTOR CORONA QUINTAS',
+        autorizo: '', nombreAutorizo: '',
+        fechaSolicitud: '2026-09-01T19:35:54.606037Z', fechaRecepcion: '2026-09-01T19:36:32.057614Z',
+        observacion: 'FONDO INICIAL 1500, dotación por traslado',
+        idTipoTransferencia: '6573be21a19c710001571324', nombreTipoTransferencia: 'INICIO DE SESIÓN',
+      }],
+    });
+
+    const res = await request(app)
+      .get('/transferencias-cajas')
+      .query({ fechaDesde: '2026-09-01T00:00:00Z', fechaHasta: '2026-09-01T23:59:59Z' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(koreCaja.buscarTransferenciasCajas).toHaveBeenCalledWith({
+      fechaDesde: '2026-09-01T00:00:00Z', fechaHasta: '2026-09-01T23:59:59Z',
+    });
+    expect(res.body.total).toBe(1);
+    expect(res.body.data[0]).toMatchObject({
+      id: '6a97291ab6007400011db828', monto: 1500, estatus: 'RECIBIDO',
+      nombreCajaOrigen: 'CAJA SILVA', nombreCajaDestino: 'CAJA - HECTOR',
+      nombreFormaPago: 'EFECTIVO', nombreTipoTransferencia: 'INICIO DE SESIÓN',
+    });
+  });
+
+  test('responde 503 si el ERP no está configurado en este ambiente', async () => {
+    koreCaja.buscarTransferenciasCajas.mockRejectedValue(new Error('No existe la configuración kore.CAJA_BASE_URL'));
+
+    const res = await request(app)
+      .get('/transferencias-cajas')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(503);
+  });
+});
+
+// POST /transferencias-cajas/sincronizar-manual — pedido del usuario: sincronización con
+// fechaDesde/fechaHasta a mano. 2026-09-03: banks:admin -> banks:transferencias-caja (mismo
+// permiso que el resto de la sección, admin-only por ahora de cualquier forma).
+describe.skip('POST /transferencias-cajas/sincronizar-manual', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .post('/transferencias-cajas/sincronizar-manual')
+      .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(sincronizarTransferenciasCajasManual).not.toHaveBeenCalled();
+  });
+
+  test('delega en sincronizarTransferenciasCajasManual con las fechas del body', async () => {
+    sincronizarTransferenciasCajasManual.mockResolvedValue({ sincronizadas: 3, descartadas: 1, rango: {} });
+
+    const res = await request(app)
+      .post('/transferencias-cajas/sincronizar-manual')
+      .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(sincronizarTransferenciasCajasManual).toHaveBeenCalledWith({
+      fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z',
+    });
+    expect(res.body.sincronizadas).toBe(3);
+  });
+
+  test('400 si faltan las fechas', async () => {
+    sincronizarTransferenciasCajasManual.mockRejectedValue(new Error('Se requieren fechaDesde y fechaHasta.'));
+
+    const res = await request(app)
+      .post('/transferencias-cajas/sincronizar-manual')
+      .send({})
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(400);
+  });
+
+  test('409 si ya hay una sincronización manual en curso', async () => {
+    sincronizarTransferenciasCajasManual.mockRejectedValue(new Error('Ya hay una sincronización manual de transferencias de caja en curso.'));
+
+    const res = await request(app)
+      .post('/transferencias-cajas/sincronizar-manual')
+      .send({ fechaDesde: '2020-01-01T00:00:00Z', fechaHasta: '2020-01-31T23:59:59Z' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// GET /transferencias-cajas/bandeja — Fase D: pendientes con candidatos (Fase C, en vivo).
+// (2026-09-02: se eliminó el apartado de huérfanas — pedido explícito del usuario.)
+describe.skip('GET /transferencias-cajas/bandeja', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .get('/transferencias-cajas/bandeja')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(CajaTransferencia.find).not.toHaveBeenCalled();
+  });
+
+  test('devuelve pendientes con sus candidatos calculados', async () => {
+    const pendiente = { _id: 't-1', estatusMatch: 'pendiente', monto: 1500 };
+    CajaTransferencia.find = jest.fn(() => ({
+      sort: jest.fn(() => ({
+        lean: jest.fn().mockResolvedValue([pendiente]),
+      })),
+    }));
+    buscarCandidatos.mockResolvedValue([[{ _id: 'mov-1' }]]);
+
+    const res = await request(app)
+      .get('/transferencias-cajas/bandeja')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [[{ _id: 'mov-1' }]] }]);
+    expect(res.body.huerfanas).toBeUndefined();
+  });
+});
+
+// POST /transferencias-cajas/:id/confirmar — Fase D. 2026-09-03: ahora SÍ lleva permit()
+// propio (banks:transferencias-caja) — antes se dejaba sin permit() a propósito porque
+// setErpIds() ya exige banks:erp:link/banks:cobro internamente, pero el usuario pidió
+// explícitamente acotar TODA la sección a admin (ver comentario en erp.routes.js).
+describe.skip('POST /transferencias-cajas/:id/confirmar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/confirmar')
+      .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(confirmarMatch).not.toHaveBeenCalled();
+  });
+
+  test('delega en confirmarMatch con los movementIds del body y el usuario autenticado', async () => {
+    confirmarMatch.mockResolvedValue({ transferencia: { _id: 't-1', estatusMatch: 'matcheada' }, movimientos: [] });
+
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/confirmar')
+      .send({ movementIds: ['mov-1', 'mov-2'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(confirmarMatch).toHaveBeenCalledWith('t-1', ['mov-1', 'mov-2'], expect.objectContaining({ _id: 'user-test' }));
+    expect(res.body.transferencia.estatusMatch).toBe('matcheada');
+  });
+
+  test('propaga el status code de un error de negocio (ej. ConflictError) a la respuesta', async () => {
+    const { ConflictError } = require('../../../shared/errors/AppError');
+    confirmarMatch.mockRejectedValue(new ConflictError('El movimiento ya tiene un ID ERP vinculado'));
+
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/confirmar')
+      .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// GET /netpay/transacciones — Fase 1 de la sección Netpay: solo cablea permiso/params,
+// la lógica de agregación (totales/porAlmacen) ya se cubre en
+// netpay-transacciones.service.test.js.
+describe('GET /netpay/transacciones', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/transacciones')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_NETPAY]);
+    expect(consultarTransaccionesNetpay).not.toHaveBeenCalled();
+  });
+
+  test('pasa responseCode/almacenes y devuelve el resultado del service tal cual', async () => {
+    const resultado = {
+      transacciones: [{ ID: 603, amount: 2495.44, commission: 28.65763296, almacen: 'A0' }],
+      totales: { monto: 2495.44, comision: 28.65763296, neto: 2466.78236704 },
+      porAlmacen: [{ almacen: 'A0', totalMonto: 2495.44, totalComision: 28.65763296, neto: 2466.78236704 }],
+    };
+    consultarTransaccionesNetpay.mockResolvedValue(resultado);
+
+    const res = await request(app)
+      .get('/netpay/transacciones')
+      .query({ responseCode: '00', almacenes: 'A0,N0', dateFrom: '2026-09-04T00:00:00Z', dateTo: '2026-09-04T23:59:59Z' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({
+      responseCode: '00', almacenes: 'A0,N0', dateFrom: '2026-09-04T00:00:00Z', dateTo: '2026-09-04T23:59:59Z',
+    });
+    expect(res.body).toEqual(resultado);
   });
 });
 

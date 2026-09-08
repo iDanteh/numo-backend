@@ -29,6 +29,7 @@ const {
   listarBancos, listarFormasPago,
 }                                         = require('./kore-caja.service');
 const { normalizarAuthLista }            = require('./erp-auth.utils');
+const { consultarTransaccionesNetpay }    = require('./netpay-transacciones.service');
 
 const uploadCyc = multer({
   storage: multer.memoryStorage(),
@@ -233,6 +234,18 @@ router.get('/cuenta-por-serie-folio', authenticate, permit(PERMISSIONS.BANKS_CFD
     esAnticipo:           raw0.esAnticipo           ?? false,
     origen:               raw0.origen               ?? null,
   });
+}));
+
+// GET /api/erp/netpay/transacciones — Fase 1 de la sección Netpay: consulta en vivo
+// (sin persistencia) de transacciones vía GET /transactions/search de Kore (dominio
+// DISTINTO de transferencias entre cajas — NO confundir con /transferencias/reportes/buscar
+// de arriba). Filtros manuales por ahora (responseCode, almacenes CSV); más filtros y
+// cualquier matching contra BankMovement quedan para una siguiente iteración. Permiso
+// propio banks:netpay, admin-only por ahora — mismo criterio que transferencias-caja.
+router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { responseCode, almacenes, dateFrom, dateTo } = req.query;
+  const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo });
+  res.json(resultado);
 }));
 
 // Resuelve el shape de "cuenta" que espera el frontend a partir de un CFDI local, para el

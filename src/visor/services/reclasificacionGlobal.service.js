@@ -22,7 +22,68 @@
 const CFDI       = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const { logger } = require('../../shared/utils/logger');
+const { obtenerDesglosesCobroAlmacen } = require('../../banks/domains/erp/erp-sync.service');
+const { derivarPeriodoDesdeFecha }     = require('./periodoFiscal.service');
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Excepción a la regla de InformacionGlobal (2026-09-08, caso real
+ * CONSTRUCASA C0-260900073, ticket C0-260806153): cuando la Global incluye
+ * un ticket cobrado por 'CCE' (Cobro Contra Entrega), esa factura se
+ * clasifica por su FECHA de timbrado, no por InformacionGlobal.Mes/Año — el
+ * cobro real ocurre (y se concilia contra el banco) el día del timbrado, sin
+ * importar el mes de las ventas que la Global consolida. Confirmado con el
+ * usuario: la regla general de InformacionGlobal sigue aplicando para
+ * cualquier otro origen de cobro.
+ *
+ * Extrae los folios de ticket (`conceptos[].noIdentificacion`) de cada CFDI
+ * Global candidato, agrupa por RFC+serie (misma serie que la propia
+ * factura — los tickets de una sucursal comparten su serie) y hace UNA sola
+ * consulta batched a `/desgloses-cobro/almacen` por grupo, para no golpear
+ * el ERP real una vez por CFDI.
+ *
+ * @param {Array<{uuid, serie, emisor: {rfc}, conceptos}>} cfdis
+ * @returns {Promise<Set<string>>} UUIDs (mayúsculas) con al menos un cobro CCE
+ */
+const _detectarUuidsConCCE = async (cfdis) => {
+  const uuidsConCCE = new Set();
+  const grupos = new Map(); // `${rfc}|${serie}` -> { rfc, serie, folios: Set, cfdisPorFolio: Map<folio, uuid[]> }
+
+  for (const cfdi of cfdis) {
+    const rfc   = cfdi.emisor?.rfc;
+    const serie = cfdi.serie;
+    if (!rfc || !serie || !Array.isArray(cfdi.conceptos)) continue;
+    const key = `${rfc}|${serie}`;
+    if (!grupos.has(key)) grupos.set(key, { rfc, serie, folios: new Set(), cfdisPorFolio: new Map() });
+    const grupo = grupos.get(key);
+    for (const c of cfdi.conceptos) {
+      const folio = (c.noIdentificacion ?? '').toString().trim();
+      if (!folio) continue;
+      grupo.folios.add(folio);
+      if (!grupo.cfdisPorFolio.has(folio)) grupo.cfdisPorFolio.set(folio, []);
+      grupo.cfdisPorFolio.get(folio).push(cfdi.uuid.toUpperCase());
+    }
+  }
+
+  for (const { rfc, serie, folios, cfdisPorFolio } of grupos.values()) {
+    if (folios.size === 0) continue;
+    let cuentas;
+    try {
+      cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: [serie], folios: [...folios] });
+    } catch (err) {
+      logger.warn(`[ReclasificacionGlobal] Consulta CCE falló para ${rfc}/${serie} (no crítico, se omite la excepción): ${err.message}`);
+      continue;
+    }
+    for (const cuenta of cuentas) {
+      const tieneCCE = (cuenta.cobros ?? []).some(c => (c.serieOrigen ?? '').toUpperCase() === 'CCE');
+      if (!tieneCCE) continue;
+      const folioVenta = (cuenta.folioVenta ?? '').toString().trim();
+      for (const uuid of (cfdisPorFolio.get(folioVenta) ?? [])) uuidsConCCE.add(uuid);
+    }
+  }
+
+  return uuidsConCCE;
+};
 
 /**
  * Extrae InformacionGlobal directamente del string XML (regex, sin parseo completo).
@@ -63,15 +124,27 @@ const _resolverInfoGlobal = (cfdi) => {
 
 /**
  * Analiza un documento CFDI y determina si requiere reclasificación.
- * Fuente de verdad: InformacionGlobal.Mes y InformacionGlobal.Anio.
+ * Fuente de verdad: InformacionGlobal.Mes y InformacionGlobal.Anio — EXCEPTO
+ * cuando la Global trae un ticket cobrado por 'CCE' (Cobro Contra Entrega,
+ * ver `_detectarUuidsConCCE`), en cuyo caso la fuente de verdad es la fecha
+ * de timbrado del propio CFDI (`cfdi.fecha`).
  * Se corrige `periodo` y `ejercicio` para que coincidan con esos valores.
+ * @param {boolean} tieneCCE — true si esta Global tiene al menos un ticket
+ *   cobrado por 'CCE' (ver `_detectarUuidsConCCE`).
  * @returns {object} Resultado del análisis para este CFDI.
  */
-const _analizarCFDI = (cfdi, infoGlobal) => {
+const _analizarCFDI = (cfdi, infoGlobal, tieneCCE = false) => {
   // InformacionGlobal.Mes es el mes contable al que realmente pertenece la factura global.
   // Es la fuente de verdad — se usa para corregir `periodo` y `ejercicio`.
-  const mesCorrecto = infoGlobal.mes  ? parseInt(infoGlobal.mes,  10) : null;
-  const anoCorrecto = infoGlobal.anio ? parseInt(infoGlobal.anio, 10) : null;
+  // Excepción CCE: se usa la fecha de timbrado en su lugar (ver comentario arriba).
+  const fechaTimbrado = cfdi.fecha ? new Date(cfdi.fecha) : null;
+  const derivadoDeFecha = fechaTimbrado ? derivarPeriodoDesdeFecha(fechaTimbrado) : null;
+  const mesCorrecto = tieneCCE
+    ? derivadoDeFecha?.periodo ?? null
+    : (infoGlobal.mes  ? parseInt(infoGlobal.mes,  10) : null);
+  const anoCorrecto = tieneCCE
+    ? derivadoDeFecha?.ejercicio ?? null
+    : (infoGlobal.anio ? parseInt(infoGlobal.anio, 10) : null);
 
   const mesERP = cfdi.periodo   ?? null;
   const anoERP = cfdi.ejercicio ?? null;
@@ -87,15 +160,16 @@ const _analizarCFDI = (cfdi, infoGlobal) => {
       anoCorrecto,
       mesERP,
       ejercicioERP:           anoERP,
+      tieneCCE,
       requiereReclasificacion: false,
-      motivo:                 'Sin InformacionGlobal.Mes o Anio — omitido',
+      motivo: tieneCCE ? 'CCE sin fecha de timbrado — omitido' : 'Sin InformacionGlobal.Mes o Anio — omitido',
       cambiosProyectados:     null,
     };
   }
 
   const motivos = [];
-  if (mesERP !== null && mesERP !== mesCorrecto) motivos.push('Mes ERP incorrecto');
-  if (anoERP !== null && anoERP !== anoCorrecto) motivos.push('Ejercicio ERP incorrecto');
+  if (mesERP !== null && mesERP !== mesCorrecto) motivos.push(tieneCCE ? 'CCE: Mes ERP no coincide con fecha de timbrado' : 'Mes ERP incorrecto');
+  if (anoERP !== null && anoERP !== anoCorrecto) motivos.push(tieneCCE ? 'CCE: Ejercicio ERP no coincide con fecha de timbrado' : 'Ejercicio ERP incorrecto');
 
   const requiereReclasificacion = motivos.length > 0;
 
@@ -111,6 +185,7 @@ const _analizarCFDI = (cfdi, infoGlobal) => {
     anoCorrecto,
     mesERP,
     ejercicioERP:           anoERP,
+    tieneCCE,
     requiereReclasificacion,
     motivo: requiereReclasificacion
       ? motivos.join('; ')
@@ -161,7 +236,7 @@ const generarPlan = async (filtros = {}) => {
     'informacionGlobal.mes': mesIGVals
       ? { $in: mesIGVals }
       : { $exists: true, $ne: null },
-  }, 'uuid source fecha periodo ejercicio informacionGlobal subTotal total').lean();
+  }, 'uuid source fecha periodo ejercicio informacionGlobal subTotal total serie emisor.rfc conceptos.noIdentificacion').lean();
 
   // ── Consulta 2: CFDIs SAT sin el campo pero con xmlContent que contenga InformacionGlobal
   //    (datos existentes antes de esta actualización)
@@ -170,7 +245,7 @@ const generarPlan = async (filtros = {}) => {
     ...filtroBase,
     'informacionGlobal.mes': { $exists: false },
     xmlContent:              { $regex: 'InformacionGlobal' },
-  }).select('uuid source fecha periodo ejercicio subTotal total +xmlContent').lean();
+  }).select('uuid source fecha periodo ejercicio subTotal total serie emisor.rfc conceptos.noIdentificacion +xmlContent').lean();
 
   const uuidsYaIncluidos = new Set(conCampo.map(c => c.uuid));
   const sinCampoFiltrado = sinCampo.filter(c => !uuidsYaIncluidos.has(c.uuid));
@@ -183,8 +258,17 @@ const generarPlan = async (filtros = {}) => {
   let correctas         = 0;
   let reclasificadas    = 0;
 
+  // Detectar de una sola vez (batched por RFC+serie) qué candidatas tienen
+  // al menos un ticket cobrado por 'CCE' — ver `_detectarUuidsConCCE`.
+  const candidatosParaCCE = [...conCampo, ...sinCampoFiltrado];
+  const uuidsConCCE = await _detectarUuidsConCCE(candidatosParaCCE);
+  if (uuidsConCCE.size > 0) {
+    logger.info(`[ReclasificacionGlobal] ${uuidsConCCE.size} CFDI(s) con cobro CCE — se clasifican por fecha de timbrado, no por InformacionGlobal.`);
+  }
+
   const analizar = (cfdi, infoGlobal) => {
-    const resultado = _analizarCFDI(cfdi, infoGlobal);
+    const tieneCCE = uuidsConCCE.has((cfdi.uuid || '').toUpperCase());
+    const resultado = _analizarCFDI(cfdi, infoGlobal, tieneCCE);
     if (resultado.requiereReclasificacion) {
       reclasificadas++;
       resultado.motivo.split('; ').forEach(m => {

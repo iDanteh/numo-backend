@@ -1036,8 +1036,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // maneja aparte `cobros-sucursal-puente.service.js` (cuenta puente +
         // encolado para la sucursal cobradora). Sin este filtro, se sumaba
         // por partida doble: como Cargo normal aquí Y como cruce allá.
-        if (centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
+        // 'CCE' (Cobro Contra Entrega, 2026-09-08, caso real CONSTRUCASA
+        // C0-260806153 / Global C0-260900073): el ERP marca estos cobros con
+        // el `claveCentro` de la sucursal/ruta que hizo la entrega física
+        // (ej. A0), no de la sucursal que vendió (C0) — a diferencia de
+        // cualquier otro origen, esto NUNCA debe tratarse como "cobro de
+        // otra sucursal" (confirmado con el usuario): el dinero se queda
+        // contabilizado en la sucursal vendedora sin importar `claveCentro`.
+        if (origen !== 'CCE' && centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         // 'CBT' NO es exclusivamente Puntos/Club Tuberos — confirmado con
         // datos reales 2026-08-06: un mismo cobro CBT puede traer
         // EFECTIVO/TARJETA/TRANSFERENCIA/SALDO A FAVOR mezclados (parece ser
@@ -1092,6 +1099,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // el reporte). Siempre 100% dinero real (nunca mezclado con saldo
           // a favor en los casos observados), así que se acepta igual que
           // ABO/CBT/CPF/CFC.
+        } else if (origen === 'CCE') {
+          // Ver comentario arriba (bypass del filtro de sucursal): dinero
+          // real de Cobro Contra Entrega, se acepta igual que MIS/APS/
+          // SERIES_CON_AUTH.
         } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }

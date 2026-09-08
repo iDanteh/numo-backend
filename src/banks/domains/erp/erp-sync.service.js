@@ -431,7 +431,67 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   return cuentas;
 }
 
+// Consulta, por ALMACÉN (misma clave de serie que "centro" en las funciones
+// de arriba) y rango de fechas, las SALIDAS de caja registradas por Kore —
+// endpoint nuevo confirmado 2026-09-08 (`/desgloses-salidas/caja`, requirió
+// que el usuario pidiera el permiso al rol de la integración, antes daba
+// 403). A diferencia de un retiro de saldo a favor de un cliente (que NO
+// aparece aquí, confirmado con datos reales), esto reporta movimientos de
+// MANEJO de la caja registradora en sí: depósitos de efectivo al banco
+// ("Salida por Transferencia"), cierres de turno ("CIERRE CAJA") y ajustes
+// por faltante ("RETIRO POR FALTANTE DE EFECTIVO") — útil para cruzar contra
+// el consolidado de Efectivo/Tarjeta, no para saldos a favor.
+//
+// Misma forma de respuesta "por centro+fecha" que puede venir PARCIAL bajo
+// carga (ver `_getConReintentoCompleto`), pero con una forma de datos
+// distinta (`Data.cajas[].salidas[]` en vez de `Data.cuentas[]`) — no se
+// reutiliza `_getConReintentoCompleto` tal cual, se cuenta `salidas` de
+// todas las cajas contra `Data.totalCount`.
+const MAX_INTENTOS_SALIDAS_CAJA = 3;
+const _cacheSalidasCajaPorAlmacen = new Map();
+async function obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen, fechaDesde, fechaHasta }) {
+  if (!rfc) throw new Error('obtenerDesglosesSalidasCajaPorAlmacen: rfc requerido (aísla la caché por empresa)');
+  if (!almacen || !fechaDesde || !fechaHasta) return [];
+
+  const clave = `${rfc}::${almacen}::${fechaDesde}::${fechaHasta}`;
+  const cacheado = _leerCache(_cacheSalidasCajaPorAlmacen, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  const baseUrl = await _cajaBaseUrlPolizas();
+  const { logger } = require('../../../shared/utils/logger');
+  let cajas = [];
+  for (let intento = 1; intento <= MAX_INTENTOS_SALIDAS_CAJA; intento++) {
+    let response;
+    try {
+      response = await _getConReintento(`${baseUrl}/desgloses-salidas/caja`, {
+        almacen, fechaDesde, fechaHasta,
+      }, '/desgloses-salidas/caja');
+    } catch (axErr) {
+      const status = axErr.response?.status;
+      const body   = JSON.stringify(axErr.response?.data ?? {});
+      logger.error(`[ErpSync] ERP /desgloses-salidas/caja ${status}: ${body} | almacen=${almacen} fechaDesde=${fechaDesde} fechaHasta=${fechaHasta}`);
+      throw axErr;
+    }
+    cajas = response.data?.Data?.cajas || [];
+    const totalCount = response.data?.Data?.totalCount;
+    const salidasLen = cajas.reduce((s, c) => s + (c.salidas ?? []).length, 0);
+    if (!Number.isFinite(totalCount) || salidasLen >= totalCount || intento >= MAX_INTENTOS_SALIDAS_CAJA) break;
+    const esperaSeg = 3 * intento;
+    logger.warn(`[ErpSync] /desgloses-salidas/caja respuesta incompleta (${salidasLen}/${totalCount}), reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS_SALIDAS_CAJA})`);
+    await new Promise(r => setTimeout(r, esperaSeg * 1000));
+  }
+
+  // Se aplana con cajaId/nombreCaja anotados en cada salida — más útil para
+  // el caller que la agrupación por caja, que ningún consumidor necesita hoy.
+  const salidas = cajas.flatMap(c => (c.salidas ?? []).map(s => ({
+    ...s, cajaId: c.cajaId, nombreCaja: c.nombreCaja, almacen: c.almacen,
+  })));
+  _cacheSalidasCajaPorAlmacen.set(clave, { data: salidas, ts: Date.now() });
+  return salidas;
+}
+
 module.exports = {
   sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
+  obtenerDesglosesSalidasCajaPorAlmacen,
 };

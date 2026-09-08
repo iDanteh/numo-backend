@@ -81,6 +81,7 @@ jest.mock('./CajaTransferencia.model');
 jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatos: jest.fn() }));
 jest.mock('./caja-transferencia-confirm.service', () => ({ confirmarMatch: jest.fn() }));
 jest.mock('./caja-transferencia-sync.service', () => ({ sincronizarTransferenciasCajasManual: jest.fn(), init: jest.fn() }));
+jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpay: jest.fn() }));
 
 const express      = require('express');
 const request      = require('supertest');
@@ -93,6 +94,7 @@ const CajaTransferencia = require('./CajaTransferencia.model');
 const { buscarCandidatos } = require('./caja-transferencia-match.service');
 const { confirmarMatch }   = require('./caja-transferencia-confirm.service');
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
+const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 describe('_aporteConRatchet', () => {
@@ -991,6 +993,49 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);
+  });
+});
+
+// GET /netpay/transacciones — Fase 1 de la sección Netpay: solo cablea permiso/params,
+// la lógica de agregación (totales/porAlmacen) ya se cubre en
+// netpay-transacciones.service.test.js.
+describe('GET /netpay/transacciones', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/transacciones')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_NETPAY]);
+    expect(consultarTransaccionesNetpay).not.toHaveBeenCalled();
+  });
+
+  test('pasa responseCode/almacenes y devuelve el resultado del service tal cual', async () => {
+    const resultado = {
+      transacciones: [{ ID: 603, amount: 2495.44, commission: 28.65763296, almacen: 'A0' }],
+      totales: { monto: 2495.44, comision: 28.65763296, neto: 2466.78236704 },
+      porAlmacen: [{ almacen: 'A0', totalMonto: 2495.44, totalComision: 28.65763296, neto: 2466.78236704 }],
+    };
+    consultarTransaccionesNetpay.mockResolvedValue(resultado);
+
+    const res = await request(app)
+      .get('/netpay/transacciones')
+      .query({ responseCode: '00', almacenes: 'A0,N0', dateFrom: '2026-09-04T00:00:00Z', dateTo: '2026-09-04T23:59:59Z' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({
+      responseCode: '00', almacenes: 'A0,N0', dateFrom: '2026-09-04T00:00:00Z', dateTo: '2026-09-04T23:59:59Z',
+    });
+    expect(res.body).toEqual(resultado);
   });
 });
 

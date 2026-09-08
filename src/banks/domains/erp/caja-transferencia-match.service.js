@@ -24,6 +24,30 @@
 // que una regla de categorización puede pisar el status mostrado, no de identificaciones
 // reales ya hechas por un contador.)
 //
+// CORRECCIÓN 2026-09-08 (pedido explícito del usuario, caso real de producción): se
+// quitó la búsqueda de combinaciones de 2 movimientos cuya suma matchea el monto. Caso
+// real que lo motivó: el depósito exacto de una transferencia ya estaba 'identificado'
+// (por eso quedaba excluido del pool), y el fallback de pares encontró 2 movimientos NO
+// relacionados (de bancos y fechas distintos) cuya suma coincidía por pura casualidad
+// numérica con el monto buscado — falso positivo, no correspondían a ninguna transferencia
+// real. El matching por pares no tiene ninguna señal de correlación más allá de "la suma
+// cierra dentro de tolerancia y ambos caen en la ventana de fechas", así que con
+// suficientes movimientos elegibles las coincidencias son inevitables. Por ahora se
+// limita a 1:1 exacto; retomar combinaciones (con más criterios de correlación) cuando
+// se decida escalar este panel — no reabrir sin decisión explícita del usuario.
+//
+// CORRECCIÓN 2026-09-08 (bug real, mismo día, reportado por el usuario): buscarCandidatos()
+// usaba `.find()` para el match 1:1 — con 2+ depósitos elegibles que empatan EXACTO en
+// monto (caso real: 3 depósitos de $1,200 para una transferencia de $1,200), `.find()`
+// devuelve SOLO el primero según el orden natural de Mongo (sin ningún `.sort()`, no hay
+// ninguna señal real de que sea el correcto) — los otros 2 candidatos igual de válidos
+// quedaban invisibles, silenciosamente. Se cambió a `.filter()`: TODAS las coincidencias
+// exactas se devuelven, cada una como su propio grupo de 1 movimiento — el modelo
+// `candidatos: BankMovement[][]` y el frontend YA estaban preparados para esto ("puede
+// haber más de un grupo si hay ambigüedad"), el bug era que este código nunca llegaba a
+// producir más de un grupo. Ahora un humano elige a mano cuál es el correcto (fecha/banco
+// visibles en cada tarjeta), en vez de que el sistema adivine.
+//
 // Bug real 2026-09-01 (reportado por el usuario, TODAS las transferencias mostraban
 // "Sin candidatos"): `categoria` es texto libre que define quien arma las reglas de
 // categorización (Reglas, dentro de Bancos) — en el ambiente real la regla se llama
@@ -88,12 +112,12 @@ function esCategoriaDepositoEfectivo(categoria) {
   return _normalizarCategoria(categoria) === CATEGORIA_DEPOSITO_EFECTIVO;
 }
 
-// Grupos candidatos para una transferencia: cada grupo es 1 o 2 BankMovement cuya
-// suma de `deposito` matchea `transferencia.monto` dentro de la tolerancia. Prueba
-// 1:1 primero (caso normal); si no hay match exacto de un solo movimiento, prueba
-// pares (caso real conocido: límite de depósito por banco obliga a partir el
-// efectivo en 2 depósitos). No prueba combinaciones de 3+ — fuera del caso real
-// que motivó este proceso, y crece combinatoriamente sin necesidad.
+// Grupos candidatos para una transferencia: TODOS los BankMovement elegibles cuyo
+// `deposito` matchea `transferencia.monto` dentro de la tolerancia (1:1 exacto),
+// cada uno como su propio grupo de 1 elemento — si hay 2+ que empatan en monto,
+// se devuelven TODOS (ambigüedad real, la resuelve un humano). Deliberadamente NO
+// se buscan combinaciones de 2+ movimientos que sumen el monto (ver corrección
+// 2026-09-08 arriba) — cada grupo tiene siempre exactamente 1 movimiento.
 async function buscarCandidatos(transferencia) {
   if (!transferencia.fechaRecepcion) return [];
 
@@ -113,17 +137,8 @@ async function buscarCandidatos(transferencia) {
   }).lean();
   const candidatos = elegibles.filter(m => _normalizarCategoria(m.categoria) === CATEGORIA_DEPOSITO_EFECTIVO);
 
-  const unico = candidatos.find(m => _montosIguales(m.deposito, transferencia.monto));
-  if (unico) return [[unico]];
-
-  const pares = [];
-  for (let i = 0; i < candidatos.length; i++) {
-    for (let j = i + 1; j < candidatos.length; j++) {
-      const suma = (candidatos[i].deposito ?? 0) + (candidatos[j].deposito ?? 0);
-      if (_montosIguales(suma, transferencia.monto)) pares.push([candidatos[i], candidatos[j]]);
-    }
-  }
-  return pares;
+  const coincidencias = candidatos.filter(m => _montosIguales(m.deposito, transferencia.monto));
+  return coincidencias.map(m => [m]);
 }
 
 module.exports = {

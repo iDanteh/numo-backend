@@ -1932,7 +1932,18 @@ function ordenarCargoAntesDeAbono(movs) {
       && o.cargos.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
     if (grupoEgreso) {
       usados.add(grupoEgreso.key);
-      resultado.push(...g.abonos, ...grupoEgreso.cargos, ...grupoEgreso.abonos, ...g.cargos);
+      // El Cargo Devoluciones+IVA del Egreso (`_redirigirEgresoAnticipoSaldado`)
+      // trae el concepto autorreferenciado del propio Egreso ("cliente /
+      // folio-del-egreso", igual a su propia columna de serie) — se homologa
+      // con la referencia OPA del cierre (mismo evento, confirmado con el
+      // usuario 2026-09-08, caso real RAYMUNDO CUELLAR MENDOZA), para que la
+      // columna H diga de qué anticipo viene en vez de repetir la serie.
+      const cargosEgresoConConceptoOPA = grupoEgreso.cargos.map(m => {
+        if (m.reglaNombre !== 'OPA-REVERSION') return m;
+        const plano = m.get ? m.get({ plain: true }) : m;
+        return { ...plano, concepto: cierreOPA.concepto };
+      });
+      resultado.push(...g.abonos, ...cargosEgresoConConceptoOPA, ...grupoEgreso.abonos, ...g.cargos);
       continue;
     }
     resultado.push(...g.cargos, ...g.abonos);

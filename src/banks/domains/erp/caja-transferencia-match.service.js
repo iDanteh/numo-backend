@@ -24,6 +24,18 @@
 // que una regla de categorización puede pisar el status mostrado, no de identificaciones
 // reales ya hechas por un contador.)
 //
+// CORRECCIÓN 2026-09-08 (pedido explícito del usuario, caso real de producción): se
+// quitó la búsqueda de combinaciones de 2 movimientos cuya suma matchea el monto. Caso
+// real que lo motivó: el depósito exacto de una transferencia ya estaba 'identificado'
+// (por eso quedaba excluido del pool), y el fallback de pares encontró 2 movimientos NO
+// relacionados (de bancos y fechas distintos) cuya suma coincidía por pura casualidad
+// numérica con el monto buscado — falso positivo, no correspondían a ninguna transferencia
+// real. El matching por pares no tiene ninguna señal de correlación más allá de "la suma
+// cierra dentro de tolerancia y ambos caen en la ventana de fechas", así que con
+// suficientes movimientos elegibles las coincidencias son inevitables. Por ahora se
+// limita a 1:1 exacto; retomar combinaciones (con más criterios de correlación) cuando
+// se decida escalar este panel — no reabrir sin decisión explícita del usuario.
+//
 // Bug real 2026-09-01 (reportado por el usuario, TODAS las transferencias mostraban
 // "Sin candidatos"): `categoria` es texto libre que define quien arma las reglas de
 // categorización (Reglas, dentro de Bancos) — en el ambiente real la regla se llama
@@ -88,12 +100,11 @@ function esCategoriaDepositoEfectivo(categoria) {
   return _normalizarCategoria(categoria) === CATEGORIA_DEPOSITO_EFECTIVO;
 }
 
-// Grupos candidatos para una transferencia: cada grupo es 1 o 2 BankMovement cuya
-// suma de `deposito` matchea `transferencia.monto` dentro de la tolerancia. Prueba
-// 1:1 primero (caso normal); si no hay match exacto de un solo movimiento, prueba
-// pares (caso real conocido: límite de depósito por banco obliga a partir el
-// efectivo en 2 depósitos). No prueba combinaciones de 3+ — fuera del caso real
-// que motivó este proceso, y crece combinatoriamente sin necesidad.
+// Grupo candidato para una transferencia: el ÚNICO BankMovement elegible cuyo
+// `deposito` matchea `transferencia.monto` dentro de la tolerancia (1:1 exacto).
+// Deliberadamente NO se buscan combinaciones de 2+ movimientos que sumen el monto
+// (ver corrección 2026-09-08 arriba) — devuelve como mucho un grupo de 1 elemento,
+// o [] si no hay match exacto.
 async function buscarCandidatos(transferencia) {
   if (!transferencia.fechaRecepcion) return [];
 
@@ -114,16 +125,7 @@ async function buscarCandidatos(transferencia) {
   const candidatos = elegibles.filter(m => _normalizarCategoria(m.categoria) === CATEGORIA_DEPOSITO_EFECTIVO);
 
   const unico = candidatos.find(m => _montosIguales(m.deposito, transferencia.monto));
-  if (unico) return [[unico]];
-
-  const pares = [];
-  for (let i = 0; i < candidatos.length; i++) {
-    for (let j = i + 1; j < candidatos.length; j++) {
-      const suma = (candidatos[i].deposito ?? 0) + (candidatos[j].deposito ?? 0);
-      if (_montosIguales(suma, transferencia.monto)) pares.push([candidatos[i], candidatos[j]]);
-    }
-  }
-  return pares;
+  return unico ? [[unico]] : [];
 }
 
 module.exports = {

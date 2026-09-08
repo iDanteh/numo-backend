@@ -1,8 +1,9 @@
 'use strict';
 
 // caja-transferencia-match.service.test.js — Fase C del proceso de matching de
-// transferencias entre cajas: buscarCandidatos() (1:1 y 1:2 por monto+ventana,
-// sin acotar por banco).
+// transferencias entre cajas: buscarCandidatos() (SOLO 1:1 exacto por monto+ventana,
+// sin acotar por banco — combinaciones de 2+ movimientos se quitaron el 2026-09-08,
+// ver comentario en el service).
 //
 // bank.service.js NO se mockea — solo se usa para leer la constante real
 // ERP_TOLERANCE, sin tocar Mongo (requerir el módulo no hace I/O).
@@ -89,18 +90,22 @@ describe('buscarCandidatos', () => {
     expect(candidatos).toEqual([[mov]]);
   });
 
-  test('sin match 1:1 pero sí un par cuya suma matchea (caso real: límite de depósito por banco)', async () => {
+  // CORRECCIÓN 2026-09-08 (caso real de producción reportado por el usuario): el monto
+  // exacto de una transferencia ya estaba 'identificado' (excluido del pool), y el
+  // fallback de pares encontró 2 movimientos NO relacionados cuya suma coincidía por
+  // pura casualidad numérica — falso positivo. Se quitó la búsqueda de pares: aunque
+  // exista una combinación de 2 que sume el monto, NO debe sugerirse.
+  test('sin match 1:1 pero existe un par cuya suma matchea: NO se sugiere (solo 1:1 por ahora)', async () => {
     const movA = { _id: 'mov-a', categoria: CATEGORIA, deposito: 1000 };
     const movB = { _id: 'mov-b', categoria: CATEGORIA, deposito: 500 };
-    const movC = { _id: 'mov-c', categoria: CATEGORIA, deposito: 200 }; // no participa de ningún match
-    BankMovement.find = jest.fn(() => fakeFind([movA, movB, movC]));
+    BankMovement.find = jest.fn(() => fakeFind([movA, movB]));
 
     const candidatos = await buscarCandidatos({ monto: 1500, fechaRecepcion: new Date() });
 
-    expect(candidatos).toEqual([[movA, movB]]);
+    expect(candidatos).toEqual([]);
   });
 
-  test('ningún movimiento ni combinación de 2 matchea: []', async () => {
+  test('ningún movimiento matchea: []', async () => {
     BankMovement.find = jest.fn(() => fakeFind([
       { _id: 'mov-1', categoria: CATEGORIA, deposito: 100 },
       { _id: 'mov-2', categoria: CATEGORIA, deposito: 50 },

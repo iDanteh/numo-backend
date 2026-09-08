@@ -311,15 +311,17 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    // BUG CORREGIDO 2026-09-08 (caso real VIGUERA, Factura Global
-    // N0-260900007/78 tickets): `_getConReintento` (abajo, catch) solo
-    // reintenta ante 429/timeout — bajo carga real el ERP puede responder
-    // 200 OK con MENOS `cuentas` que folios pedidos (mismo patrón ya
-    // confirmado y corregido en `_getConReintentoCompleto`/`sincronizarCuentasPendientes`
-    // para los endpoints "por centro"). Antes esto se cacheaba 20 minutos
-    // (TTL_CACHE_MS) tal cual venía, "contaminando" cualquier otra póliza
-    // que regenerara dentro de esa ventana con el mismo lote incompleto.
-    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/almacen`, {
+    // NO usar `_getConReintentoCompleto` aquí (intento real 2026-09-08,
+    // revertido el mismo día): esa función llama a `_getConReintento` —que
+    // YA reintenta hasta MAX_INTENTOS_429 veces ante 429/timeout— hasta
+    // MAX_INTENTOS_COMPLETO veces MÁS por fuera, multiplicando los intentos
+    // (y el tiempo de espera) contra un ERP que además ya está rate-limitado.
+    // Caso real: bajo carga, esto agotaba los reintentos y tiraba la
+    // generación de póliza por completo en vez de solo devolver datos
+    // incompletos. Se usa el mismo `_getConReintento` de siempre (un solo
+    // ciclo de reintentos) — la protección contra respuesta parcial (abajo)
+    // es NO CACHEARLA, no reintentar más de lo que ya se reintentaba.
+    response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
       series: series.join(','),
       folios: folios.join(','),
     }, '/desgloses-cobro/almacen');
@@ -332,10 +334,14 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   }
 
   const cuentas = response.data?.Data?.cuentas || [];
-  // No cachear si, tras agotar los reintentos, la respuesta sigue incompleta
-  // — sin esto, una respuesta parcial quedaba "congelada" 20 minutos y
-  // afectaba a cualquier otra póliza que compartiera este mismo lote de
-  // folios (confirmado con el usuario 2026-09-08, caso VIGUERA).
+  // BUG CORREGIDO 2026-09-08 (caso real VIGUERA, Factura Global
+  // N0-260900007/78 tickets): bajo carga real el ERP puede responder 200 OK
+  // con MENOS `cuentas` que folios pedidos, sin que `_getConReintento` lo
+  // detecte (no es un 429/timeout). Antes esto se cacheaba 20 minutos
+  // (TTL_CACHE_MS) tal cual venía, "contaminando" cualquier otra póliza que
+  // regenerara dentro de esa ventana con el mismo lote incompleto — sin
+  // reintentar más (eso fue lo que se revirtió arriba), simplemente no se
+  // guarda en caché para que la siguiente llamada lo intente fresco.
   const totalCount = response.data?.Data?.totalCount;
   const incompleta = Number.isFinite(totalCount) && cuentas.length < totalCount;
   if (!incompleta) _cacheAlmacen.set(clave, { data: cuentas, ts: Date.now() });
@@ -362,8 +368,10 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   let response;
   try {
     // Ver comentario equivalente en `obtenerDesglosesCobroAlmacen` (bug real
-    // 2026-09-08, VIGUERA) — mismo riesgo de respuesta parcial bajo carga.
-    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/saldos-favor`, {
+    // 2026-09-08, VIGUERA, y su revert el mismo día) — NO usar
+    // `_getConReintentoCompleto` aquí, multiplica los reintentos ante 429
+    // contra un ERP ya rate-limitado.
+    response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
       series: series.join(','),
       folios: folios.join(','),
     }, '/desgloses-cobro/saldos-favor');

@@ -12,6 +12,8 @@ const {
   extractHora,
   extractReferencia,
   extractFieldsFromLines,
+  extractNumeroAutorizacion,
+  extractMontoFromLines,
 } = require('./ocr-engine');
 
 describe('normalizeOcrText — centavos pegados a la moneda sin espacio (Mercado Pago)', () => {
@@ -139,5 +141,82 @@ describe('extractFieldsFromLines — encabezado combinado "Origen y destino" (Me
     const result = extractFieldsFromLines(lines);
     expect(result.titularOrigen).toBeUndefined();
     expect(result.titularDestino).toBeUndefined();
+  });
+});
+
+describe('Ticket físico BBVA depósito en efectivo (bug real 2026-09-07, monto "8")', () => {
+  // Texto REAL devuelto por PaddleOCR (motor primario, corrido contra la foto
+  // real del ticket — no es una transcripción limpia) tras normalizeOcrText().
+  // El comprobante trae $3,120.00 de IMPORTE, pero el OCR real NUNCA leyó esos
+  // dígitos (glare/mano tapando la zona en la foto): la única huella que queda
+  // es un "8" suelto pegado a "EFEC. DEPOSITADO" — antes del fix, extractMonto()
+  // lo devolvía con confianza como si fuera el monto real.
+  const clean = `CANN 25620 ULA 4
+S
+4
+** BBVa mEXICO, S.A, **
+RFc 88a830831lJ2
+04/09/26.17:23 FECHA MM 4639 CAJERO
+DEPOSITO EN EFECTIVO
+CLIENTE: CAR COMERCIALIZADORA SA D
+UBICADO EN:SUC TLAXIACO PC
+FECHA DE APLICACION: 04/09/26
+FOLIO NUMERO: 9785AUT: 796662
+CUENTA/TARJETA DE ABONO:*********1014
+IMPORTE:
+8 EFEC. DEPOSITADO CAMBIO ENTREGADO 80.00 CAMBIO EN RECIBO MOTIVO DE PAGO: PAGO BILMA
+UCCAEAT
+800226 2663`;
+
+  test('extractMonto NO confunde el "8" fusionado con EFEC. DEPOSITADO, ni el 80.00 de CAMBIO ENTREGADO, con IMPORTE — el monto real es irrecuperable de este OCR y debe dar null, nunca un valor falso', () => {
+    expect(extractMonto(clean)).toBeNull();
+  });
+
+  // rawLines REAL devuelto por PaddleOCR.recognize() (paddle-ocr.service.js) para
+  // este mismo ticket — capturado corriendo extractReceiptDataPaddle() contra la
+  // foto real (TicketBug.jpeg), NO reconstruido a mano a partir de `clean`. Es la
+  // forma que consume extractMontoFromLines(rawLines) en producción vía el `??`
+  // de extractReceiptDataPaddle (ocr-engine.js ~línea 1596) cuando extractMonto(clean)
+  // da null — el `clean` de arriba solo cubre extractMonto(), nunca esta ruta.
+  // Hallazgo de revisión de confiabilidad 2026-09-07: sin este test, un bug latente
+  // en extractMontoFromLines sobre la forma real de líneas (distinta al string
+  // aplanado) podía resucitar el "8" o el "80.00" en producción con los 23/23
+  // tests previos en verde, porque ninguno ejercitaba esta función.
+  const rawLines = [
+    { text: 'CANN 25620 ULA 4' },
+    { text: 'S' },
+    { text: '4' },
+    { text: '** BBVa mEXICO, S.A, **' },
+    { text: 'RFc 88a830831lJ2' },
+    { text: '04/09/26 17:23 FECHA MM 4639 CAJERO' },
+    { text: 'DEPOSITO EN EFECTIVO' },
+    { text: 'CLIENTE: CAR COMERCIALIZADORA SA D' },
+    { text: 'UBICADO EN:SUC TLAXIACO PC' },
+    { text: 'FECHA DE APLICACION: 04/09/26' },
+    { text: 'FOLIO NUMERO: 9785AUT: 796662' },
+    { text: 'CUENTA/TARJETA DE ABONO:*********1014' },
+    { text: 'IMPORTE:' },
+    { text: '8 EFEC. DEPOSITADO CAMBIO ENTREGADO 80.00 CAMBIO EN RECIBO MOTIVO DE PAGO: PAGO BILMA' },
+    { text: 'UCCAEAT' },
+    { text: '800 226 2663' },
+    { text: '' },
+    { text: '八' },
+  ];
+
+  test('extractMontoFromLines(rawLines REAL) — la ruta que en producción realmente decide el monto vía "??" — también da null, no resucita el "8" ni el "80.00"', () => {
+    expect(extractMontoFromLines(rawLines)).toBeNull();
+  });
+
+  test('extractReferencia extrae el folio pese a "FOLIO NUMERO:" (la palabra NUMERO ya no rompe el match)', () => {
+    expect(extractReferencia(clean)).toBe('9785');
+  });
+
+  test('extractNumeroAutorizacion reconoce la abreviatura "AUT:" pegada sin espacio al folio anterior', () => {
+    expect(extractNumeroAutorizacion(clean)).toBe('796662');
+  });
+
+  test('regresión: "AUT" no dispara falsos positivos dentro de "automático" ni pisa "autorización" ya soportada', () => {
+    expect(extractNumeroAutorizacion('Proceso automático, sin datos')).toBeNull();
+    expect(extractNumeroAutorizacion('Autorización: 1234567')).toBe('1234567');
   });
 });

@@ -312,6 +312,23 @@ function normalizeOcrText(raw) {
 
 // ── Parsers individuales (Tesseract) ─────────────────────────────────────────
 
+// Bug real 2026-09-07 (ticket físico BBVA de depósito en efectivo): un
+// comprobante de depósito puede traer 3 montos en la misma zona del recibo —
+// IMPORTE (el que se abona a la cuenta, el ÚNICO que importa para conciliar),
+// EFEC. DEPOSITADO (efectivo físico entregado en ventanilla) y CAMBIO
+// ENTREGADO / CAMBIO EN RECIBO (vuelto). Estos últimos NUNCA deben ganarle a
+// IMPORTE. Un candidato de monto que aparezca pegado (antes o después, dentro
+// de una ventana corta) a una de estas etiquetas se descarta — típico cuando
+// el OCR real fusiona varias líneas en un solo bloque de texto.
+const MONTO_EXCLUIDO_RE = /efec(?:tivo)?\.?\s*deposit(?:ado)?|cambio\s+entregado|cambio\s+en\s+recibo/i;
+const VENTANA_EXCLUSION_MONTO = 40; // caracteres a cada lado del candidato
+
+function _pegadoAEtiquetaExcluida(text, idx, len) {
+  const antes   = text.slice(Math.max(0, idx - VENTANA_EXCLUSION_MONTO), idx);
+  const despues = text.slice(idx + len, idx + len + VENTANA_EXCLUSION_MONTO);
+  return MONTO_EXCLUIDO_RE.test(antes) || MONTO_EXCLUIDO_RE.test(despues);
+}
+
 function extractMonto(text) {
   let m;
 
@@ -320,7 +337,12 @@ function extractMonto(text) {
   m = text.match(
     /(?:monto|importe|cantidad|total\s*(?:transferido|a\s*pagar|pagado|enviado|de\s*pago))\s*[:\-]?\s*\n?\s*\$?\s*([\d,]+(?:\.\d{1,2})?)/i
   );
-  if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
+  if (m) {
+    const idx = m.index + (m[0].length - m[1].length);
+    if (!_pegadoAEtiquetaExcluida(text, idx, m[1].length)) {
+      const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v;
+    }
+  }
 
   // E2: $ + número MXN (con o sin separador de miles)
   // `(?!\d)` en vez de `\b` final — entre el último dígito de los centavos y una
@@ -329,17 +351,29 @@ function extractMonto(text) {
   // (bug real, comprobante Mercado Pago 2026-08-17). `(?!\d)` da la misma garantía
   // de "no cortar un número más largo" sin bloquear un sufijo de letras.
   m = text.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d{1,9}(?:\.\d{1,2})?)(?!\d)/);
-  if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
+  if (m) {
+    const idx = m.index + (m[0].length - m[1].length);
+    if (!_pegadoAEtiquetaExcluida(text, idx, m[1].length)) {
+      const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v;
+    }
+  }
 
   // E3: prefijo MXN / MX$ / USD — solo en la misma línea (no cruzar \n)
   // Bug conocido: "8,165.99 MXN\n08 de mayo" matcheaba "MXN\n08" → monto=8
   m = text.match(/(?:MXN|MX\$|USD)[^\S\n]*([\d,]+(?:\.\d{1,2})?)\b/i);
-  if (m) { const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v; }
+  if (m) {
+    const idx = m.index + (m[0].length - m[1].length);
+    if (!_pegadoAEtiquetaExcluida(text, idx, m[1].length)) {
+      const v = parseFloat(m[1].replace(/,/g, '')); if (ok(v)) return v;
+    }
+  }
 
   // E4: número con coma como separador de miles: 15,000.00 (mismo fix de `\b`→`(?!\d)` que E2)
   const c4 = [];
   const r4 = /\b(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?)(?!\d)/g;
   while ((m = r4.exec(text)) !== null) {
+    const idx = m.index + (m[0].length - m[1].length);
+    if (_pegadoAEtiquetaExcluida(text, idx, m[1].length)) continue;
     const v = parseFloat(m[1].replace(/,/g, ''));
     if (ok(v)) c4.push(v);
   }
@@ -347,9 +381,15 @@ function extractMonto(text) {
 
   // E5: decimal sin separador de miles: 1500.00, 750.50 (mismo fix de `\b`→`(?!\d)` que E2)
   //     Mínimo 2 dígitos antes del punto; excluye años (2000-2099)
+  //     `(?!:)` — excluye fragmentos fecha+hora fusionados por normalizeOcrText
+  //     (bug real 2026-09-07: "04/09/26 17:23" → regla 3 de normalizeOcrText
+  //     confunde "26 17" con un decimal superíndice → "26.17", seguido de
+  //     ":23" — un monto real nunca queda pegado a un ":", una hora sí).
   const c5 = [];
-  const r5 = /\b(\d{2,7}\.\d{2})(?!\d)/g;
+  const r5 = /\b(\d{2,7}\.\d{2})(?!\d)(?!:)/g;
   while ((m = r5.exec(text)) !== null) {
+    const idx = m.index + (m[0].length - m[1].length);
+    if (_pegadoAEtiquetaExcluida(text, idx, m[1].length)) continue;
     const v = parseFloat(m[1]);
     if (v >= 10 && v < 100_000_000 && !(v >= 2000 && v <= 2099)) c5.push(v);
   }
@@ -376,7 +416,14 @@ function extractMontoFromLines(lines) {
   const isLabel  = t => /^(monto|importe|cantidad|total(\s*(transferido|pagado|enviado|de\s*pago))?)\s*[:\-]?$/i.test(t);
   const isCents  = t => /^(0\d|[1-9]\d)$/.test(t);          // exactamente 2 dígitos
   const parseCur = t => {
-    const v = parseFloat(t.replace(/^[$S]\s*/, '').replace(/^MXN\s*/i, '').replace(/,/g, ''));
+    const cleaned = t.replace(/^[$S]\s*/, '').replace(/^MXN\s*/i, '').trim();
+    // Exige que TODO el texto (tras quitar el prefijo de moneda) sea numérico —
+    // parseFloat() por sí solo solo mira los dígitos iniciales e ignora el
+    // resto ("8 EFEC. DEPOSITADO..." → parseFloat da 8), lo que colaba texto
+    // de otra etiqueta fusionada en la misma línea (bug real 2026-09-07,
+    // ticket BBVA de depósito en efectivo) como si fuera un monto válido.
+    if (!/^[\d,]+(?:\.\d{1,2})?$/.test(cleaned)) return null;
+    const v = parseFloat(cleaned.replace(/,/g, ''));
     return ok(v) ? v : null;
   };
 
@@ -648,6 +695,10 @@ function extractClaveRastreo(text) {
 function extractReferencia(text) {
   // "folio(?:\s+de\s+(?:la\s+)?operación)?" cubre "Folio: X", "Folio de operación\nX"
   // y "Folio de la operación\nX" (BBVA usa el artículo "la" en su formato estándar).
+  // "folio\s+n[uú]mero" cubre "Folio Numero: X" (ticket físico BBVA de depósito en
+  // efectivo, bug real 2026-09-07) — sin esto, la palabra "NUMERO" entre "folio" y
+  // los dígitos rompía el match: "folio" matcheaba, pero `[:\s#\n]*` no puede
+  // cruzar letras, así que nunca llegaba a los dígitos.
   // "referencia(?:\s+num[eé]rica)?" cubre "Referencia numérica: X" (Vault México), no solo
   // "Referencia" a secas.
   // "[:\s#\n]*" usa \n explícito para cruzar línea cuando el valor está en la siguiente
@@ -656,7 +707,7 @@ function extractReferencia(text) {
   // palabra sigue con letras ("de transferencia"), que rompen el `[:\s#\n]*` antes de
   // llegar a ningún dígito.
   const m = text.match(
-    /(?:referencia(?:\s+num[eé]rica)?|folio(?:\s+de\s+(?:la\s+)?operaci[oó]n)?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato|comprobante)[:\s#\n]*(\d{4,20})/i
+    /(?:referencia(?:\s+num[eé]rica)?|folio(?:\s+(?:de\s+(?:la\s+)?operaci[oó]n|n[uú]mero))?|folio\s+[úu]nico|n[úu]mero\s+(?:de\s+)?(?:operaci[oó]n|confirmaci[oó]n|transacci[oó]n)|no\.?\s*op(?:eraci[oó]n)?|confirmaci[oó]n|contrato|comprobante)[:\s#\n]*(\d{4,20})/i
   );
   return m ? m[1] : null;
 }
@@ -665,8 +716,19 @@ function extractNumeroAutorizacion(text) {
   // Permite un prefijo de una letra antes de los dígitos: "M01215390"
   // (visto en ticket físico de depósito Banco Azteca) — el prefijo se conserva
   // porque es parte del número real, no un artefacto de OCR.
+  // Abreviatura de 3 letras "AUT: 796662" (ticket físico BBVA de depósito en
+  // efectivo, bug real 2026-09-07) — en ese comprobante el OCR real la pega SIN
+  // espacio al folio anterior ("9785AUT: 796662"), así que un `\b` estricto antes
+  // de "aut" no sirve (dígito y letra son ambos \w, no hay límite de palabra
+  // entre ellos). Se usa un lookbehind/lookahead negativo de LETRA en vez de
+  // `\b`: bloquea que "aut" matchee dentro de otra palabra (ej. "automático",
+  // "autoriza..." — ahí sigue una letra) pero sí permite que venga pegado a un
+  // dígito. Va AL FINAL de la alternativa: si el texto trae la forma larga
+  // "autorización" ya la captura la primera alternativa (el motor de regex
+  // prueba las alternativas en orden en la MISMA posición y se queda con la
+  // primera que matchea), por lo que nunca hay doble-match ni conflicto.
   const m = text.match(
-    /(?:autorizaci[oó]n|auth(?:orization)?|aprobaci[oó]n|c[oó]digo\s+(?:de\s+)?auth)[:\s#]*([A-Z]?\d{6,15})/i
+    /(?:autorizaci[oó]n|auth(?:orization)?|aprobaci[oó]n|c[oó]digo\s+(?:de\s+)?auth|(?<![A-Za-zÁÉÍÓÚáéíóúÑñ])aut(?![A-Za-zÁÉÍÓÚáéíóúÑñ]))[:\s#]*([A-Z]?\d{6,15})/i
   );
   return m ? m[1].toUpperCase() : null;
 }
@@ -1626,7 +1688,15 @@ module.exports = {
   normalizeOcrText, extractMonto, extractReceiptDataPaddle, extractReceiptDataTesseract,
   renderPdfToImages,
   // Exportados para ocr-engine.test.js (2026-08-17, fixes de comprobante Mercado
-  // Pago) — permiten testear los extractores individuales sin depender de OCR
-  // real (Paddle no carga bajo Jest, ver receipt.service.test.js).
-  extractHora, extractReferencia, extractFieldsFromLines,
+  // Pago; 2026-09-07, fix de ticket físico BBVA depósito en efectivo) — permiten
+  // testear los extractores individuales sin depender de OCR real (Paddle no
+  // carga bajo Jest, ver receipt.service.test.js).
+  extractHora, extractReferencia, extractFieldsFromLines, extractNumeroAutorizacion,
+  // Exportado para ocr-engine.test.js (2026-09-07, hallazgo de revisión de
+  // confiabilidad sobre el fix del mismo día): en producción es
+  // extractMontoFromLines(rawLines) — no extractMonto(clean) — quien decide el
+  // `monto` final cuando extractMonto(clean) da null (ver el `??` en
+  // extractReceiptDataPaddle). Sin este export no había forma de testear esa
+  // ruta real contra el array de líneas crudo de PaddleOCR.
+  extractMontoFromLines,
 };

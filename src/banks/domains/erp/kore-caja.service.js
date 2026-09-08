@@ -214,6 +214,51 @@ async function buscarTransferenciasCajas(params = {}) {
   return { raw };
 }
 
+// Movimientos Netpay — mismo sistema de cajas de Kore, pero un endpoint DISTINTO:
+// GET /transactions/search (NO /transferencias/reportes/buscar — ese sigue siendo
+// exclusivo de transferencias entre cajas, ver caja-transferencia-*.service.js, no
+// tocar). Misma CAJA_BASE_URL (Configuraciones Globales, sección `kore`) y mismo
+// token estático que buscarTransferenciasCajas.
+//
+// SCAFFOLDING (2026-09-08): el usuario todavía está diseñando qué query params usan
+// para discriminar qué transacciones Netpay le sirven — por ahora solo pasa 2 a mano
+// (responseCode, almacenes) mientras explora el resto del catálogo de parámetros de
+// Kore. Devuelve el body crudo de Kore sin transformar — la forma final de la
+// respuesta, la lógica de negocio y la sección propia (permisos, UI) se definen en
+// una siguiente iteración, no adelantar diseño acá.
+async function buscarTransaccionesNetpay(params = {}) {
+  const queryParams = {};
+  if (params.responseCode) queryParams.responseCode = params.responseCode;
+  // CSV tal cual lo espera Kore (ej. "A0,N0") — quien llama arma el string, esta
+  // función no valida ni transforma la lista de almacenes.
+  if (params.almacenes) queryParams.almacenes = params.almacenes;
+  // Rango de fechas ISO completo (ej. "2026-09-04T00:00:00Z"/"...T23:59:59Z") — quien
+  // llama arma el string exacto (inicio/fin de día), esta función no lo calcula.
+  if (params.dateFrom) queryParams.dateFrom = params.dateFrom;
+  if (params.dateTo) queryParams.dateTo = params.dateTo;
+  // Paginación de Kore (2026-09-08, confirmado por el usuario: pageSize máximo real
+  // 100) — ver netpay-transacciones.service.js, que recorre todas las páginas
+  // necesarias antes de agregar totales, nunca agrega sobre una sola respuesta.
+  if (params.page) queryParams.page = params.page;
+  if (params.pageSize) queryParams.pageSize = params.pageSize;
+
+  let response;
+  try {
+    response = await axios.get(`${await obtenerCajaBaseUrl()}/transactions/search`, {
+      params:  queryParams,
+      headers: { Authorization: `Bearer ${await _tokenEstatico()}` },
+      timeout: 15000,
+    });
+  } catch (axiosErr) {
+    if (!axiosErr.response) throw axiosErr; // error de red/timeout — dejar que asyncHandler lo maneje
+    const { msg, koreBody } = _mensajeErrorKore(axiosErr, `Error al consultar transacciones Netpay (${axiosErr.response.status})`);
+    console.warn(`[buscarTransaccionesNetpay] Kore rechazó con ${axiosErr.response.status}:`, JSON.stringify(koreBody));
+    throw new KoreCajaError(msg, axiosErr.response.status, koreBody);
+  }
+
+  return { raw: response.data };
+}
+
 // Catálogo de bancos de Kore — mismo mapeo que ya usaba GET /cobros/bancos en
 // erp.routes.js (movido acá 2026-07-28 para compartirlo con
 // collection-request.service.js). Filtra bancos inactivos, igual que antes.
@@ -419,6 +464,7 @@ module.exports = {
   obtenerSesionCaja,
   obtenerCuentasKore,
   buscarTransferenciasCajas,
+  buscarTransaccionesNetpay,
   listarBancos,
   listarFormasPago,
   aplicarCobroOperacion,

@@ -65,14 +65,22 @@ const _detectarUuidsConCCE = async (cfdis) => {
     }
   }
 
+  // Chunks de 100 folios por request — un batch con cientos/miles de tickets
+  // (normal en un periodo completo) rebasa el límite de longitud de URL del
+  // ERP real (confirmado 2026-09-08: "414 Request-URI Too Large" con ~350
+  // folios en una sola llamada).
+  const TAMANO_LOTE_ERP = 100;
   for (const { rfc, serie, folios, cfdisPorFolio } of grupos.values()) {
     if (folios.size === 0) continue;
-    let cuentas;
-    try {
-      cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: [serie], folios: [...folios] });
-    } catch (err) {
-      logger.warn(`[ReclasificacionGlobal] Consulta CCE falló para ${rfc}/${serie} (no crítico, se omite la excepción): ${err.message}`);
-      continue;
+    const foliosArr = [...folios];
+    const cuentas = [];
+    for (let i = 0; i < foliosArr.length; i += TAMANO_LOTE_ERP) {
+      const lote = foliosArr.slice(i, i + TAMANO_LOTE_ERP);
+      try {
+        cuentas.push(...await obtenerDesglosesCobroAlmacen({ rfc, series: [serie], folios: lote }));
+      } catch (err) {
+        logger.warn(`[ReclasificacionGlobal] Consulta CCE falló para ${rfc}/${serie} (lote ${i}-${i + lote.length}, no crítico, se omite la excepción): ${err.message}`);
+      }
     }
     for (const cuenta of cuentas) {
       const tieneCCE = (cuenta.cobros ?? []).some(c => (c.serieOrigen ?? '').toUpperCase() === 'CCE');
@@ -258,9 +266,22 @@ const generarPlan = async (filtros = {}) => {
   let correctas         = 0;
   let reclasificadas    = 0;
 
-  // Detectar de una sola vez (batched por RFC+serie) qué candidatas tienen
-  // al menos un ticket cobrado por 'CCE' — ver `_detectarUuidsConCCE`.
-  const candidatosParaCCE = [...conCampo, ...sinCampoFiltrado];
+  // Solo se consulta el ERP (CCE) para los candidatos que YA se ven
+  // inconsistentes bajo la regla normal de InformacionGlobal — la inmensa
+  // mayoría de CFDIs Global están correctamente clasificados y no necesitan
+  // ningún dato adicional para confirmarlo. Esto evita golpear el ERP real
+  // en cada sync/upload con TODOS los Global del periodo (cientos/miles).
+  const _infoGlobalDe = (cfdi) => cfdi.informacionGlobal
+    ?? (cfdi.xmlContent ? _extraerDeXML(cfdi.xmlContent) : null);
+  const _requiereBajoReglaNormal = (cfdi, ig) => {
+    if (!ig) return false;
+    const mesIG = ig.mes  ? parseInt(ig.mes,  10) : null;
+    const anoIG = ig.anio ? parseInt(ig.anio, 10) : null;
+    if (mesIG === null || anoIG === null) return false;
+    return (cfdi.periodo ?? null) !== mesIG || (cfdi.ejercicio ?? null) !== anoIG;
+  };
+  const candidatosParaCCE = [...conCampo, ...sinCampoFiltrado]
+    .filter(cfdi => _requiereBajoReglaNormal(cfdi, _infoGlobalDe(cfdi)));
   const uuidsConCCE = await _detectarUuidsConCCE(candidatosParaCCE);
   if (uuidsConCCE.size > 0) {
     logger.info(`[ReclasificacionGlobal] ${uuidsConCCE.size} CFDI(s) con cobro CCE — se clasifican por fecha de timbrado, no por InformacionGlobal.`);

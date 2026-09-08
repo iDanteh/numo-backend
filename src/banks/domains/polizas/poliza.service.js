@@ -1892,7 +1892,19 @@ const TIPO_ORIGEN_BCT = 'Bonificación Club Tuberos';
  * Algunas NCs viejas (ej. Bonificación Club Tuberos) se generaron con una
  * versión del motor que empujaba el abono antes que el cargo; esto corrige
  * el orden de despliegue en el export sin tocar el `orden` guardado en BD.
- * Solo reordena DENTRO de cada CFDI, nunca entre CFDIs distintos.
+ *
+ * Excepción (confirmada con el usuario 2026-09-08, caso real RAYMUNDO
+ * CUELLAR MENDOZA): cuando el grupo es el cierre OPA de una venta
+ * (`reglaNombre='OPA'`) y esa venta fue luego revertida por un Egreso real
+ * (`_redirigirEgresoAnticipoSaldado`, `reglaNombre='OPA-REVERSION'`), el
+ * orden correcto de las 3 partes del mismo evento es Ingreso → Devolución/
+ * Egreso → cierre OPA — NO "cargo antes que abono" dentro del CFDI de la
+ * venta, y el grupo del Egreso (otro CFDI) se intercala en medio en vez de
+ * aparecer aparte más adelante. Se enlazan por `serie` (el folio del Egreso
+ * real queda guardado en las líneas de cierre OPA vía `serieCierreProp` —
+ * ver `_redirigirEgresoAnticipoSaldado`/`cfdi-poliza-generator.service.js`
+ * — y coincide exacto con el folio propio de las líneas del grupo Egreso).
+ * Fuera de este caso, sigue reordenando SOLO dentro de cada CFDI.
  */
 function ordenarCargoAntesDeAbono(movs) {
   const porCfdi   = new Map();
@@ -1903,12 +1915,27 @@ function ordenarCargoAntesDeAbono(movs) {
     porCfdi.get(key).push(m);
   }
 
-  const resultado = [];
-  for (const key of ordenCfdi) {
+  const grupos = ordenCfdi.map(key => {
     const grupo  = porCfdi.get(key);
     const cargos = grupo.filter(m => Number(m.debe) > 0);
     const abonos = grupo.filter(m => !(Number(m.debe) > 0));
-    resultado.push(...cargos, ...abonos);
+    return { key, cargos, abonos };
+  });
+
+  const usados = new Set();
+  const resultado = [];
+  for (const g of grupos) {
+    if (usados.has(g.key)) continue;
+    usados.add(g.key);
+    const cierreOPA = g.cargos.find(m => m.reglaNombre === 'OPA');
+    const grupoEgreso = cierreOPA && grupos.find(o => !usados.has(o.key)
+      && o.cargos.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
+    if (grupoEgreso) {
+      usados.add(grupoEgreso.key);
+      resultado.push(...g.abonos, ...grupoEgreso.cargos, ...grupoEgreso.abonos, ...g.cargos);
+      continue;
+    }
+    resultado.push(...g.cargos, ...g.abonos);
   }
   return resultado;
 }
@@ -2499,7 +2526,7 @@ function bloquesAjustesContado(movs) {
     porCfdi.get(key).movs.push(plano);
   }
 
-  return ordenCfdi.map(key => {
+  const grupos = ordenCfdi.map(key => {
     const { categoria, movs: grupo } = porCfdi.get(key);
     // Anticipo (recepción o aplicación/cierre) siempre lleva subcódigo 22,
     // sin importar cómo se cobró — confirmado con el usuario. Antes esta
@@ -2531,9 +2558,43 @@ function bloquesAjustesContado(movs) {
     // Cargo Anticipos/IVA-Anticipo desaparecían del export aunque estaban
     // correctamente marcadas como visibles en `_extraerCobrosSucursal`).
     const cargosOPA = cargos.filter(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
-    const bloque = categoria === 'anticipo' ? [...cargosOPA, ...abonos] : [...cargos, ...abonos];
-    return { categoria, bloque };
+    return { key, categoria, cargos, abonos, cargosOPA };
   });
+
+  // Orden Ingreso → Devolución/Egreso → cierre OPA (confirmado con el
+  // usuario 2026-09-08, caso real RAYMUNDO CUELLAR MENDOZA): cuando la
+  // venta que aplicó el anticipo (cargosOPA con reglaNombre='OPA') fue
+  // luego revertida por un Egreso real (`_redirigirEgresoAnticipoSaldado`,
+  // reglaNombre='OPA-REVERSION' — ver `REGLAS_MEZCLADAS_CON_VENTAS`), el
+  // grupo del Egreso se intercala ENTRE el Abono de Ingreso de la venta y
+  // el Cargo de cierre OPA, en vez de aparecer como bloque aparte después.
+  // Antes el orden salía "cierre OPA, Ingreso, Egreso" (cada grupo se arma
+  // con cargosOPA primero por el `bloque` de abajo, y los grupos van en el
+  // orden en que aparece su primer movimiento) — sin relación visible entre
+  // las 3 partes de un mismo evento. Se enlazan por `serie` (el folio del
+  // Egreso real, guardado en `cargosOPA[].serie` vía `serieCierreProp` —
+  // ver `_redirigirEgresoAnticipoSaldado`/`cfdi-poliza-generator.service.js`
+  // — coincide exacto con el folio propio de las líneas del grupo Egreso).
+  const usados = new Set();
+  const resultado = [];
+  for (const g of grupos) {
+    if (usados.has(g.key)) continue;
+    usados.add(g.key);
+    if (g.categoria === 'anticipo') {
+      const cierreOPA = g.cargosOPA.find(m => m.reglaNombre === 'OPA');
+      const grupoEgreso = cierreOPA && grupos.find(o => !usados.has(o.key)
+        && o.cargosOPA.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
+      if (grupoEgreso) {
+        usados.add(grupoEgreso.key);
+        resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...grupoEgreso.cargosOPA, ...grupoEgreso.abonos, ...g.cargosOPA] });
+        continue;
+      }
+      resultado.push({ categoria: g.categoria, bloque: [...g.cargosOPA, ...g.abonos] });
+      continue;
+    }
+    resultado.push({ categoria: g.categoria, bloque: [...g.cargos, ...g.abonos] });
+  }
+  return resultado;
 }
 
 /**

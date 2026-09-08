@@ -49,6 +49,7 @@ const PERM_META = {
   // (ver perm.module abajo), aunque es un permiso de Bancos como cualquier otro de esta lista.
   'banks:erp:reversiones': { label: 'Ver bandeja de reversiones de CxC (Kore)', module: 'Bancos' },
   'banks:transferencias-caja': { label: 'Transferencias entre cajas (matching de depósitos)', module: 'Bancos' },
+  'banks:netpay':        { label: 'Consultar transacciones Netpay',      module: 'Bancos' },
   'account-plan:read':  { label: 'Ver catálogo contable',           module: 'Contabilidad' },
   'account-plan:write': { label: 'Editar catálogo contable',        module: 'Contabilidad' },
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },

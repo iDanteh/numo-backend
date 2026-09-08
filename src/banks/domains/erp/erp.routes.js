@@ -34,6 +34,7 @@ const { confirmarMatch }                 = require('./caja-transferencia-confirm
 const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-pendiente.service');
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
+const { consultarTransaccionesNetpay }    = require('./netpay-transacciones.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
 // cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
 // se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
@@ -373,6 +374,18 @@ router.post('/transferencias-cajas/:id/confirmar', authenticate, permit(PERMISSI
 // Mismo permiso que PATCH /movements/:id/ficha (banks:ficha, bank.routes.js).
 router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMISSIONS.BANKS_FICHA), asyncHandler(async (req, res) => {
   const resultado = await listarPendientesDeFicha();
+  res.json(resultado);
+}));
+
+// GET /api/erp/netpay/transacciones — Fase 1 de la sección Netpay: consulta en vivo
+// (sin persistencia) de transacciones vía GET /transactions/search de Kore (dominio
+// DISTINTO de transferencias entre cajas — NO confundir con /transferencias/reportes/buscar
+// de arriba). Filtros manuales por ahora (responseCode, almacenes CSV); más filtros y
+// cualquier matching contra BankMovement quedan para una siguiente iteración. Permiso
+// propio banks:netpay, admin-only por ahora — mismo criterio que transferencias-caja.
+router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { responseCode, almacenes, dateFrom, dateTo } = req.query;
+  const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo });
   res.json(resultado);
 }));
 

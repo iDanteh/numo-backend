@@ -81,6 +81,22 @@ describe('buscarCandidatos', () => {
     expect(candidatos).toEqual([[mov]]);
   });
 
+  // CORRECCIÓN 2026-09-08 (bug real reportado por el usuario, caso real de producción):
+  // `.find()` devolvía solo el PRIMERO de varios candidatos empatados en monto (orden
+  // natural de Mongo, sin ninguna señal real de cuál es el correcto) — los otros
+  // quedaban invisibles. Ahora TODOS los que empatan se devuelven, cada uno como su
+  // propio grupo de 1 elemento, para que un humano elija.
+  test('varios movimientos empatan EXACTO en monto (caso real: 3 depósitos de $1,200): devuelve los 3, cada uno su propio grupo', async () => {
+    const movA = { _id: 'mov-a', categoria: CATEGORIA, deposito: 1200 };
+    const movB = { _id: 'mov-b', categoria: CATEGORIA, deposito: 1200 };
+    const movC = { _id: 'mov-c', categoria: CATEGORIA, deposito: 1200 };
+    BankMovement.find = jest.fn(() => fakeFind([movA, movB, movC]));
+
+    const candidatos = await buscarCandidatos({ monto: 1200, fechaRecepcion: new Date() });
+
+    expect(candidatos).toEqual([[movA], [movB], [movC]]);
+  });
+
   test('dentro de tolerancia ($1 MXN, ERP_TOLERANCE): cuenta como match exacto', async () => {
     const mov = { _id: 'mov-1', categoria: CATEGORIA, deposito: 1500.5 };
     BankMovement.find = jest.fn(() => fakeFind([mov]));

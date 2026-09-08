@@ -36,6 +36,18 @@
 // limita a 1:1 exacto; retomar combinaciones (con más criterios de correlación) cuando
 // se decida escalar este panel — no reabrir sin decisión explícita del usuario.
 //
+// CORRECCIÓN 2026-09-08 (bug real, mismo día, reportado por el usuario): buscarCandidatos()
+// usaba `.find()` para el match 1:1 — con 2+ depósitos elegibles que empatan EXACTO en
+// monto (caso real: 3 depósitos de $1,200 para una transferencia de $1,200), `.find()`
+// devuelve SOLO el primero según el orden natural de Mongo (sin ningún `.sort()`, no hay
+// ninguna señal real de que sea el correcto) — los otros 2 candidatos igual de válidos
+// quedaban invisibles, silenciosamente. Se cambió a `.filter()`: TODAS las coincidencias
+// exactas se devuelven, cada una como su propio grupo de 1 movimiento — el modelo
+// `candidatos: BankMovement[][]` y el frontend YA estaban preparados para esto ("puede
+// haber más de un grupo si hay ambigüedad"), el bug era que este código nunca llegaba a
+// producir más de un grupo. Ahora un humano elige a mano cuál es el correcto (fecha/banco
+// visibles en cada tarjeta), en vez de que el sistema adivine.
+//
 // Bug real 2026-09-01 (reportado por el usuario, TODAS las transferencias mostraban
 // "Sin candidatos"): `categoria` es texto libre que define quien arma las reglas de
 // categorización (Reglas, dentro de Bancos) — en el ambiente real la regla se llama
@@ -100,11 +112,12 @@ function esCategoriaDepositoEfectivo(categoria) {
   return _normalizarCategoria(categoria) === CATEGORIA_DEPOSITO_EFECTIVO;
 }
 
-// Grupo candidato para una transferencia: el ÚNICO BankMovement elegible cuyo
-// `deposito` matchea `transferencia.monto` dentro de la tolerancia (1:1 exacto).
-// Deliberadamente NO se buscan combinaciones de 2+ movimientos que sumen el monto
-// (ver corrección 2026-09-08 arriba) — devuelve como mucho un grupo de 1 elemento,
-// o [] si no hay match exacto.
+// Grupos candidatos para una transferencia: TODOS los BankMovement elegibles cuyo
+// `deposito` matchea `transferencia.monto` dentro de la tolerancia (1:1 exacto),
+// cada uno como su propio grupo de 1 elemento — si hay 2+ que empatan en monto,
+// se devuelven TODOS (ambigüedad real, la resuelve un humano). Deliberadamente NO
+// se buscan combinaciones de 2+ movimientos que sumen el monto (ver corrección
+// 2026-09-08 arriba) — cada grupo tiene siempre exactamente 1 movimiento.
 async function buscarCandidatos(transferencia) {
   if (!transferencia.fechaRecepcion) return [];
 
@@ -124,8 +137,8 @@ async function buscarCandidatos(transferencia) {
   }).lean();
   const candidatos = elegibles.filter(m => _normalizarCategoria(m.categoria) === CATEGORIA_DEPOSITO_EFECTIVO);
 
-  const unico = candidatos.find(m => _montosIguales(m.deposito, transferencia.monto));
-  return unico ? [[unico]] : [];
+  const coincidencias = candidatos.filter(m => _montosIguales(m.deposito, transferencia.monto));
+  return coincidencias.map(m => [m]);
 }
 
 module.exports = {

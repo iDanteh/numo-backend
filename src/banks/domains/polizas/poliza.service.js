@@ -2597,7 +2597,17 @@ function bloquesAjustesContado(movs) {
         && o.cargosOPA.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
       if (grupoEgreso) {
         usados.add(grupoEgreso.key);
-        resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...grupoEgreso.cargosOPA, ...grupoEgreso.abonos, ...g.cargosOPA] });
+        // Mismo fix que `ordenarCargoAntesDeAbono` (poliza de Egreso): el Cargo
+        // Devoluciones+IVA del Egreso trae el concepto autorreferenciado del
+        // propio Egreso — se homologa con la referencia OPA del cierre (mismo
+        // evento), confirmado con el usuario 2026-09-08, caso real RAYMUNDO
+        // CUELLAR MENDOZA.
+        const cargosEgresoConConceptoOPA = grupoEgreso.cargosOPA.map(m => {
+          if (m.reglaNombre !== 'OPA-REVERSION') return m;
+          const plano = m.get ? m.get({ plain: true }) : m;
+          return { ...plano, concepto: cierreOPA.concepto };
+        });
+        resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...cargosEgresoConConceptoOPA, ...grupoEgreso.abonos, ...g.cargosOPA] });
         continue;
       }
       resultado.push({ categoria: g.categoria, bloque: [...g.cargosOPA, ...g.abonos] });

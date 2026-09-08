@@ -411,19 +411,24 @@ async function _aplicarCobrosSucursalPendientes({ rfc, centroCostoId, centroCobr
       tipoOrigen:     'Cobro Sucursal',
       cfdiUuid:       p.cfdiUuid ?? null,
     };
+    // `formaPago: l.formaPago ?? null` en las líneas de Cargo (ver comentario
+    // en `lineas.push`/`candidatas.push` más arriba, bug real 2026-09-08) —
+    // necesario para que `_resolverCuentasBancoReal` (poliza.service.js) no
+    // remapee Efectivo/Tarjeta al banco real de otro ticket de la misma
+    // Factura Global.
     if (p.tratamiento === 'PUE') {
       lineas.forEach(l => {
-        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: l.monto, haber: 0, reglaNombre: l.reglaNombre });
-        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre });
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: l.monto, haber: 0, reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null });
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null });
       });
     } else if (p.tratamiento === 'HUERFANO' && cuentaPuenteId) {
       lineas.forEach(l => {
-        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: l.monto, haber: 0, reglaNombre: l.reglaNombre });
-        candidatas.push({ ...base, cuentaId: cuentaPuenteId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre });
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: l.monto, haber: 0, reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null });
+        candidatas.push({ ...base, cuentaId: cuentaPuenteId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null });
       });
     } else if (p.tratamiento === 'SF_GENERADO') {
       lineas.forEach(l => {
-        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre });
+        candidatas.push({ ...base, cuentaId: l.cuentaId, debe: 0, haber: l.monto, reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null });
       });
     }
   }
@@ -1040,6 +1045,14 @@ async function construirMovimientosPuente({
           reglaNombre: (idCuentaBancoReal && bancoReal?.referencia) ? bancoReal.referencia : (fp.autorizacion || fp.nombre || fp.claveSat || null),
           esSF: false,
           concepto: conceptoBase,
+          // Bug real 2026-09-08 (caso VIGUERA/PUBLICO EN GENERAL N0-260900042):
+          // sin `formaPago`, `_resolverCuentasBancoReal` (poliza.service.js) no
+          // puede distinguir esta línea de Efectivo/Tarjeta y la remapea al
+          // banco real de OTRO ticket de la misma Factura Global (comparten
+          // `cfdiUuid`) al exportar — su guard `['01','04','28'].includes(
+          // m.formaPago)` nunca disparaba porque este campo siempre llegaba
+          // `null`. Se propaga el claveSat real para que ese guard sí aplique.
+          formaPago:   (fp.claveSat ?? '').trim() || null,
         });
       });
       if (!lineas.length) continue;
@@ -1081,6 +1094,12 @@ async function construirMovimientosPuente({
             centroCostoId: centroVendedor.id,
             tipoOrigen:    'Cobro Sucursal',
             reglaNombre:   l.reglaNombre,
+            // Ver comentario en `lineas.push` de arriba (bug real 2026-09-08,
+            // VIGUERA/N0-260900042) — necesario para que el guard de
+            // `_resolverCuentasBancoReal` (poliza.service.js) proteja
+            // Efectivo/Tarjeta de remapearse al banco real de otro ticket de
+            // la misma Factura Global.
+            formaPago:     l.formaPago ?? null,
             // Sin esto, el diagnóstico de "asientos descuadrados" (que agrupa
             // por cfdiUuid) nunca encuentra este Cargo bajo la factura que
             // generó el Abono, y la marca como descuadrada aunque la póliza
@@ -1109,7 +1128,7 @@ async function construirMovimientosPuente({
             cfdiUuid:             cfdiOriginal?.uuid ?? null,
             nombreCliente,
             montoTotal:           lineas.reduce((s, l) => s + l.montoAsignado, 0),
-            lineas:               esCruzado ? lineas.map(l => ({ cuentaId: l.cuentaId, monto: l.montoAsignado, reglaNombre: l.reglaNombre })) : [],
+            lineas:               esCruzado ? lineas.map(l => ({ cuentaId: l.cuentaId, monto: l.montoAsignado, reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null })) : [],
             tratamiento:          'PUE',
             fechaCobro:           cobro.fecha ?? null,
           });

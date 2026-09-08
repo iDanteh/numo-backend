@@ -266,22 +266,20 @@ const generarPlan = async (filtros = {}) => {
   let correctas         = 0;
   let reclasificadas    = 0;
 
-  // Solo se consulta el ERP (CCE) para los candidatos que YA se ven
-  // inconsistentes bajo la regla normal de InformacionGlobal — la inmensa
-  // mayoría de CFDIs Global están correctamente clasificados y no necesitan
-  // ningún dato adicional para confirmarlo. Esto evita golpear el ERP real
-  // en cada sync/upload con TODOS los Global del periodo (cientos/miles).
-  const _infoGlobalDe = (cfdi) => cfdi.informacionGlobal
-    ?? (cfdi.xmlContent ? _extraerDeXML(cfdi.xmlContent) : null);
-  const _requiereBajoReglaNormal = (cfdi, ig) => {
-    if (!ig) return false;
-    const mesIG = ig.mes  ? parseInt(ig.mes,  10) : null;
-    const anoIG = ig.anio ? parseInt(ig.anio, 10) : null;
-    if (mesIG === null || anoIG === null) return false;
-    return (cfdi.periodo ?? null) !== mesIG || (cfdi.ejercicio ?? null) !== anoIG;
+  // Solo se consulta el ERP (CCE) para los candidatos donde el periodo ERP
+  // actual NO coincide con el mes/año de la FECHA de timbrado — si ya
+  // coincide, el resultado es el mismo sin importar cuál regla (normal o
+  // CCE) se use, así que no hace falta preguntarle nada al ERP. Esto evita
+  // golpearlo en cada sync/upload con TODOS los Global del periodo
+  // (cientos/miles), pero SIN perder el caso real que motivó este fix
+  // (periodo ya "correcto" según InformacionGlobal, pero incorrecto según
+  // fecha de timbrado — exactamente cuando debe aplicar la excepción CCE).
+  const _difiereDeFecha = (cfdi) => {
+    if (!cfdi.fecha) return false;
+    const { periodo, ejercicio } = derivarPeriodoDesdeFecha(new Date(cfdi.fecha));
+    return (cfdi.periodo ?? null) !== periodo || (cfdi.ejercicio ?? null) !== ejercicio;
   };
-  const candidatosParaCCE = [...conCampo, ...sinCampoFiltrado]
-    .filter(cfdi => _requiereBajoReglaNormal(cfdi, _infoGlobalDe(cfdi)));
+  const candidatosParaCCE = [...conCampo, ...sinCampoFiltrado].filter(_difiereDeFecha);
   const uuidsConCCE = await _detectarUuidsConCCE(candidatosParaCCE);
   if (uuidsConCCE.size > 0) {
     logger.info(`[ReclasificacionGlobal] ${uuidsConCCE.size} CFDI(s) con cobro CCE — se clasifican por fecha de timbrado, no por InformacionGlobal.`);

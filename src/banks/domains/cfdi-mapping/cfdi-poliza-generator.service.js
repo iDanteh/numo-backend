@@ -380,6 +380,50 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
 
   if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor };
 
+  // Descarta generaciones de SF cuyo documento origen (BON/DEV/CAC/BCT) está
+  // CANCELADO en el SAT sin sustituto — confirmado con el usuario 2026-09-08,
+  // caso real BON-314125 ($56.46, CONSTRUCASA): `/saldos-favor` lo sigue
+  // reportando como generado a pesar de que el CFDI (`DD129D7A-...`) tiene
+  // `satStatus:'Cancelado'` y no existe ningún CFDI que lo sustituya (SAT no
+  // lo retira del reporte del ERP con la cancelación). Un documento cancelado
+  // sin sustituto nunca tuvo efecto fiscal real, así que el saldo a favor que
+  // "generó" tampoco debería existir. Se busca por el marcador (Serie/Folio
+  // dentro de `documentosRelacionados`, no el serie/folio propio del CFDI —
+  // mismo criterio que usa el resto de este archivo para localizar NCs), y
+  // solo se descarta si se encuentra el CFDI Y ninguna copia (SAT/ERP) está
+  // Vigente — si no se encuentra nada, se deja pasar (no penalizar por falta
+  // de sincronización, mismo criterio que el resto de los guards de este
+  // archivo).
+  const marcadoresGen = [...new Map(
+    generadosPorCuenta
+      .filter(({ gen }) => gen.serieOrigen && gen.folioOrigen)
+      .map(({ gen }) => {
+        const serie = gen.serieOrigen.toUpperCase();
+        return [`${serie}|${gen.folioOrigen}`, { serie, folio: gen.folioOrigen }];
+      }),
+  ).values()];
+  const cfdisOrigenCancelados = new Set();
+  if (marcadoresGen.length) {
+    const cfdisOrigen = await CFDI.find({
+      $or: marcadoresGen.map(({ serie, folio }) => ({ documentosRelacionados: { $elemMatch: { Serie: serie, Folio: folio } } })),
+    }).select('documentosRelacionados satStatus').lean();
+    const vigentePorMarcador = new Map(); // clave -> boolean (true si al menos una copia esta Vigente)
+    for (const c of cfdisOrigen) {
+      for (const d of (c.documentosRelacionados ?? [])) {
+        const clave = `${(d.Serie ?? '').toUpperCase()}|${d.Folio}`;
+        if (!marcadoresGen.some(m => `${m.serie}|${m.folio}` === clave)) continue;
+        vigentePorMarcador.set(clave, (vigentePorMarcador.get(clave) ?? false) || c.satStatus === 'Vigente');
+      }
+    }
+    for (const { serie, folio } of marcadoresGen) {
+      const clave = `${serie}|${folio}`;
+      if (vigentePorMarcador.has(clave) && !vigentePorMarcador.get(clave)) cfdisOrigenCancelados.add(clave);
+    }
+  }
+  const generadosFiltrados = cfdisOrigenCancelados.size
+    ? generadosPorCuenta.filter(({ gen }) => !cfdisOrigenCancelados.has(`${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen}`))
+    : generadosPorCuenta;
+
   // Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
   const mapa = new Map();
   const devsOcultos = new Set();
@@ -403,7 +447,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
   // Cargo NEGATIVO, sin fila propia), SIEMPRE — sin importar si el saldo
   // generado terminó en $0 ese día o le quedó un remanente pendiente.
   const ajustesEfectivoRetiroSF = [];
-  for (const { cuenta, gen } of generadosPorCuenta) {
+  for (const { cuenta, gen } of generadosFiltrados) {
     const key = `${gen.serieOrigen}|${gen.folioOrigen}`;
     if (gen.anticipo?.anticipoReferencia) {
       anticiposConvertidos.push({

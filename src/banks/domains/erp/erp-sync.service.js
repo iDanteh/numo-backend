@@ -265,7 +265,15 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
+    // BUG CORREGIDO 2026-09-08 (caso real VIGUERA, Factura Global
+    // N0-260900007/78 tickets): `_getConReintento` (abajo, catch) solo
+    // reintenta ante 429/timeout — bajo carga real el ERP puede responder
+    // 200 OK con MENOS `cuentas` que folios pedidos (mismo patrón ya
+    // confirmado y corregido en `_getConReintentoCompleto`/`sincronizarCuentasPendientes`
+    // para los endpoints "por centro"). Antes esto se cacheaba 20 minutos
+    // (TTL_CACHE_MS) tal cual venía, "contaminando" cualquier otra póliza
+    // que regenerara dentro de esa ventana con el mismo lote incompleto.
+    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/almacen`, {
       series: series.join(','),
       folios: folios.join(','),
     }, '/desgloses-cobro/almacen');
@@ -278,7 +286,13 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   }
 
   const cuentas = response.data?.Data?.cuentas || [];
-  _cacheAlmacen.set(clave, { data: cuentas, ts: Date.now() });
+  // No cachear si, tras agotar los reintentos, la respuesta sigue incompleta
+  // — sin esto, una respuesta parcial quedaba "congelada" 20 minutos y
+  // afectaba a cualquier otra póliza que compartiera este mismo lote de
+  // folios (confirmado con el usuario 2026-09-08, caso VIGUERA).
+  const totalCount = response.data?.Data?.totalCount;
+  const incompleta = Number.isFinite(totalCount) && cuentas.length < totalCount;
+  if (!incompleta) _cacheAlmacen.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
 
@@ -301,7 +315,9 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
+    // Ver comentario equivalente en `obtenerDesglosesCobroAlmacen` (bug real
+    // 2026-09-08, VIGUERA) — mismo riesgo de respuesta parcial bajo carga.
+    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/saldos-favor`, {
       series: series.join(','),
       folios: folios.join(','),
     }, '/desgloses-cobro/saldos-favor');
@@ -314,7 +330,10 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   }
 
   const cuentas = response.data?.Data?.cuentas || [];
-  _cacheSaldosFavor.set(clave, { data: cuentas, ts: Date.now() });
+  // Ver comentario equivalente en `obtenerDesglosesCobroAlmacen`.
+  const totalCount = response.data?.Data?.totalCount;
+  const incompleta = Number.isFinite(totalCount) && cuentas.length < totalCount;
+  if (!incompleta) _cacheSaldosFavor.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
 

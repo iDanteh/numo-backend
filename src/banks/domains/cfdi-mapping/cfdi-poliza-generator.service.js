@@ -273,6 +273,17 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
   // Solo se popula en el camino fallback (sin centro+fecha), donde conocemos
   // los CFDIs del batch y podemos mapear venta → serie del CFDI de Devolución.
   const cfdiSeriePorVenta  = new Map();
+  // `cuenta.anticipos[]` (confirmado 2026-09-08): /saldos-favor ahora trae,
+  // por cada venta que aplicó un Anticipo, el UUID y folio REAL del Anticipo
+  // (`anticipoUuid`/`anticipoReferencia`) — a diferencia de
+  // `_resolverReferenciaOpaPorMonto` (Bancos, requiere depósito conciliado)
+  // y `_prefetchCuentasPendientesAnticipo` (`/cuentas-pendientes`, purga el
+  // registro al liquidarse), esta fuente da un match DIRECTO por UUID, sin
+  // heurístico de monto/fecha, y no depende de que el CFDI del Anticipo haya
+  // sincronizado en Mongo. Caso real que esto resuelve (2026-09-08): RAYMUNDO
+  // CUELLAR MENDOZA, anticipo `176AFBF3-...` nunca sincronizado — antes caía
+  // al fallback de serie-folio del Egreso, ahora resuelve "OPA-00175" real.
+  const anticipoFolioPorUuidDesdeSaldosFavor = {};
 
   if (centroPropioClave && fechaDesde && fechaHasta) {
     // Camino principal: consulta directa por centro+fecha — fuente única para
@@ -295,6 +306,11 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
         generadosPorCuenta.push({ cuenta, gen });
       }
+      for (const apl of (cuenta.anticipos ?? [])) {
+        if (apl?.anticipoUuid && apl?.anticipoReferencia) {
+          anticipoFolioPorUuidDesdeSaldosFavor[apl.anticipoUuid.toUpperCase()] = apl.anticipoReferencia;
+        }
+      }
     }
     for (const cuenta of cuentasAlm) {
       const k = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
@@ -316,7 +332,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         return (marcador && venta) ? { marcador, venta, cfdiSerie: cfdi.serie ?? null } : null;
       })
       .filter(Boolean);
-    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [] };
+    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor: {} };
     devolucionesConVenta.forEach(d => cfdiSeriePorVenta.set(`${d.venta.serie}|${d.venta.folio}`, d.cfdiSerie));
 
     const LOTE = 150;
@@ -331,9 +347,14 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
           generadosPorCuenta.push({ cuenta, gen });
         }
+        for (const apl of (cuenta.anticipos ?? [])) {
+          if (apl?.anticipoUuid && apl?.anticipoReferencia) {
+            anticipoFolioPorUuidDesdeSaldosFavor[apl.anticipoUuid.toUpperCase()] = apl.anticipoReferencia;
+          }
+        }
       }
     }
-    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [] };
+    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor };
 
     const paresGeneracion = [...new Map(
       generadosPorCuenta.map(({ cuenta }) => [`${cuenta.serieVenta}|${cuenta.folioVenta}`, { serie: cuenta.serieVenta, folio: cuenta.folioVenta }]),
@@ -357,7 +378,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     }
   }
 
-  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [] };
+  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor };
 
   // Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
   const mapa = new Map();
@@ -529,7 +550,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     });
   }
 
-  return { mapa, devsOcultos, ajustesEfectivoRetiroSF, anticiposConvertidos };
+  return { mapa, devsOcultos, ajustesEfectivoRetiroSF, anticiposConvertidos, anticipoFolioPorUuidDesdeSaldosFavor };
 }
 
 /**
@@ -3307,7 +3328,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `_prefetchSaldosFavorGenerados`) debe llegar a esa llamada, para que el
   // lado de "uso" también sepa marcar como oculto el mismo par
   // generación+uso "lavado" el mismo día en el mismo almacén.
-  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFProp, anticiposConvertidos: anticiposConvertidosProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
+  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFProp, anticiposConvertidos: anticiposConvertidosProp, anticipoFolioPorUuidDesdeSaldosFavor: anticipoFolioPorUuidDesdeSaldosFavorProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -3566,10 +3587,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaProp.get(`${c.serie}|${c.folio}`)])
         .filter(([, ref]) => ref),
     ),
-    // Última prioridad: /saldos-favor no purga la conversión SF→Anticipo
-    // (ver docstring de `_resolverReferenciaOpaDesdeSaldosFavor`) — cubre el
-    // caso donde Cuentas Pendientes ya perdió el registro.
+    // Prioridad alta: /saldos-favor no purga la conversión SF→Anticipo (ver
+    // docstring de `_resolverReferenciaOpaDesdeSaldosFavor`) — cubre el caso
+    // donde Cuentas Pendientes ya perdió el registro.
     ..._resolverReferenciaOpaDesdeSaldosFavor(anticipoCfdisProp, anticiposConvertidosProp),
+    // Máxima prioridad: match DIRECTO por UUID (`cuenta.anticipos[]` de
+    // /saldos-favor, confirmado 2026-09-08) — no depende de que el CFDI del
+    // Anticipo haya sincronizado en Mongo (caso real RAYMUNDO CUELLAR
+    // MENDOZA, anticipo `176AFBF3-...` nunca sincronizado, ver docstring de
+    // `anticipoFolioPorUuidDesdeSaldosFavor` en `_prefetchSaldosFavorGenerados`).
+    ...anticipoFolioPorUuidDesdeSaldosFavorProp,
   };
 
   let saldoRestanteProp = 0;
@@ -5034,7 +5061,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Saldos a favor generados por las Devoluciones de este batch — ANTES de
   // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
-  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard, anticiposConvertidos: anticiposConvertidosGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
+  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard, anticiposConvertidos: anticiposConvertidosGuard, anticipoFolioPorUuidDesdeSaldosFavor: anticipoFolioPorUuidDesdeSaldosFavorGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -5215,10 +5242,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaGuard.get(`${c.serie}|${c.folio}`)])
         .filter(([, ref]) => ref),
     ),
-    // Última prioridad: /saldos-favor no purga la conversión SF→Anticipo
-    // (ver docstring de `_resolverReferenciaOpaDesdeSaldosFavor`) — cubre el
-    // caso donde Cuentas Pendientes ya perdió el registro.
+    // Prioridad alta: /saldos-favor no purga la conversión SF→Anticipo (ver
+    // docstring de `_resolverReferenciaOpaDesdeSaldosFavor`) — cubre el caso
+    // donde Cuentas Pendientes ya perdió el registro.
     ..._resolverReferenciaOpaDesdeSaldosFavor(anticipoCfdisGuard, anticiposConvertidosGuard),
+    // Máxima prioridad: match DIRECTO por UUID (`cuenta.anticipos[]` de
+    // /saldos-favor, confirmado 2026-09-08) — ver docstring de
+    // `anticipoFolioPorUuidDesdeSaldosFavor` en `_prefetchSaldosFavorGenerados`.
+    ...anticipoFolioPorUuidDesdeSaldosFavorGuard,
   };
 
   let saldoRestanteGuard = 0;

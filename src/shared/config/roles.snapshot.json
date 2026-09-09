@@ -59,7 +59,9 @@
       "banks:cfdi:read",
       "banks:erp:anticipos",
       "banks:erp:read",
-      "banks:erp:unlink"
+      "banks:erp:unlink",
+      "banks:erp:reversiones",
+      "banks:transferencias-caja"
     ],
     "isSystem": true
   },

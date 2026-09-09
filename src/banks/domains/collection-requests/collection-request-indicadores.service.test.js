@@ -237,15 +237,17 @@ describe('getIndicadoresSolicitudesCobro()', () => {
     // hace días cuando la tienda creó la solicitud — sin el fix, fase2Contador arrancaba
     // en la fecha vieja del depósito y sumaba días de horas hábiles que nunca fueron una
     // espera real para el contador.
-    // horasHabilesEntre() lee horas de calendario LOCALES (new Date().getHours()/setHours()),
-    // igual que el resto del dashboard — se construyen estas fechas en hora LOCAL (sin 'Z')
-    // para que el ejemplo sea determinístico sin importar el timezone de quien corra el test.
+    // horasHabilesEntre() interpreta el instante como hora de MÉXICO vía offset fijo -06:00
+    // (2026-09-09: antes leía horas de calendario LOCALES DEL PROCESO — new Date(y,m,d,h) sin
+    // 'Z' solo daba un ejemplo determinístico si quien corría el test estaba en hora de México;
+    // bajo TZ=UTC, ej. el contenedor de producción, "9am local" eran las 3am México, antes de
+    // la ventana laboral, y el test daba 0 en vez de 5min). Se construyen en 'Z' explícito.
     const doc = cr({
-      createdAt:  new Date(2026, 7, 20, 9, 0, 0), // solicitud creada, jueves 09:00 local
-      resueltoAt: new Date(2026, 7, 20, 9, 5, 0), // identificada 5 minutos después
+      createdAt:  new Date('2026-08-20T15:00:00Z'), // solicitud creada, jueves 09:00 México
+      resueltoAt: new Date('2026-08-20T15:05:00Z'), // identificada 5 minutos después
     });
     const movimientosPorId = {
-      'mov-1': mov('mov-1', new Date(2026, 7, 10, 8, 0, 0)), // depósito importado 10 días antes
+      'mov-1': mov('mov-1', new Date('2026-08-10T14:00:00Z')), // depósito importado 10 días antes, 08:00 México
     };
     CollectionRequest.find.mockReturnValue(mockPopulatingQuery([doc], movimientosPorId));
 

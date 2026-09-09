@@ -7,7 +7,9 @@ const mongoose = require('mongoose');
 // Kore no guarda estado de matching de su lado — esta colección es la única
 // fuente de verdad para saber qué transferencia ya se cruzó contra qué
 // BankMovement. (2026-09-02: se eliminó el concepto de 'huerfana' — pedido
-// explícito del usuario, va a reemplazarse por algo distinto todavía no definido.)
+// explícito del usuario, va a reemplazarse por algo distinto todavía no definido.
+// 2026-09-09: el reemplazo es 'descartada', ver
+// caja-transferencia-match.service.js#reclasificarHistoricasDescartadas.)
 const cajaTransferenciaSchema = new mongoose.Schema({
   // Id propio de Kore para esta transferencia — clave de upsert (ver
   // caja-transferencia-sync.service.js), evita duplicados si el job de sync
@@ -53,9 +55,16 @@ const cajaTransferenciaSchema = new mongoose.Schema({
   // sync, solo se setea al insertar (ver $setOnInsert en
   // caja-transferencia-sync.service.js) para que un re-sync no pise el resultado
   // de un matching ya resuelto.
+  // 'descartada' (2026-09-09): transferencia anterior a FECHA_CORTE_LOGICA_HISTORICA
+  // (caja-transferencia-match.service.js) sin ningún candidato ACCIONABLE, pero cuyo
+  // depósito correspondiente ya fue identificado por otra vía (ficha, otro proceso ERP)
+  // antes de que existiera este panel — no hay nada que un humano pueda hacer acá, así
+  // que se saca de la bandeja para no llenarla de ruido histórico. Nunca se asigna a
+  // transferencias nuevas (fechaRecepcion >= el corte) — esas, sin candidato, siguen
+  // 'pendiente' (huérfanas reales).
   estatusMatch: {
     type:    String,
-    enum:    ['pendiente', 'matcheada'],
+    enum:    ['pendiente', 'matcheada', 'descartada'],
     default: 'pendiente',
     index:   true,
   },

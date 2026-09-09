@@ -9,11 +9,14 @@
 // ERP_TOLERANCE, sin tocar Mongo (requerir el módulo no hace I/O).
 jest.mock('../banks/BankMovement.model');
 jest.mock('../../../shared/services/global-config.service');
+jest.mock('./CajaTransferencia.model');
 
 const BankMovement       = require('../banks/BankMovement.model');
+const CajaTransferencia  = require('./CajaTransferencia.model');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const {
-  buscarCandidatos, _ventanaDias, _normalizarCategoria, VENTANA_DEFAULT_DIAS,
+  buscarCandidatos, reclasificarHistoricasDescartadas, _buscarCoincidenciasHistoricas,
+  FECHA_CORTE_LOGICA_HISTORICA, _ventanaDias, _normalizarCategoria, VENTANA_DEFAULT_DIAS,
 } = require('./caja-transferencia-match.service');
 
 const CATEGORIA = 'Depósito en efectivo'; // forma "canónica" usada en los fixtures de este archivo
@@ -159,6 +162,114 @@ describe('buscarCandidatos', () => {
     const candidatos = await buscarCandidatos({ monto: 1000, fechaRecepcion: new Date() });
 
     expect(candidatos).toEqual([]);
+  });
+});
+
+describe('_buscarCoincidenciasHistoricas', () => {
+  beforeEach(() => {
+    globalConfigService.getValue.mockResolvedValue('5');
+  });
+
+  test('consulta por fecha SOLAMENTE — a diferencia de buscarCandidatos, no excluye erpLinks/status', async () => {
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    await _buscarCoincidenciasHistoricas({ monto: 100, fechaRecepcion: new Date('2026-06-01T00:00:00Z') });
+
+    const filtro = BankMovement.find.mock.calls[0][0];
+    expect(filtro.erpLinks).toBeUndefined();
+    expect(filtro.status).toBeUndefined();
+    expect(filtro.fecha.$gte).toBeInstanceOf(Date);
+  });
+
+  test('encuentra un depósito ya identificado que calza exacto por monto', async () => {
+    const mov = { _id: 'mov-1', categoria: CATEGORIA, deposito: 1500, status: 'identificado' };
+    BankMovement.find = jest.fn(() => fakeFind([mov]));
+
+    const resultado = await _buscarCoincidenciasHistoricas({ monto: 1500, fechaRecepcion: new Date() });
+
+    expect(resultado).toEqual([mov]);
+  });
+
+  test('sin fechaRecepcion: no consulta Mongo, devuelve []', async () => {
+    const resultado = await _buscarCoincidenciasHistoricas({ monto: 100, fechaRecepcion: null });
+    expect(resultado).toEqual([]);
+    expect(BankMovement.find).not.toHaveBeenCalled();
+  });
+});
+
+describe('reclasificarHistoricasDescartadas', () => {
+  beforeEach(() => {
+    globalConfigService.getValue.mockResolvedValue('5');
+    CajaTransferencia.updateOne = jest.fn().mockResolvedValue({});
+  });
+
+  function fakeCajaFind(result) {
+    return { lean: jest.fn().mockResolvedValue(result) };
+  }
+
+  test('solo revisa pendientes anteriores a FECHA_CORTE_LOGICA_HISTORICA, no excluidas por filtro', async () => {
+    CajaTransferencia.find = jest.fn(() => fakeCajaFind([]));
+
+    await reclasificarHistoricasDescartadas();
+
+    expect(CajaTransferencia.find).toHaveBeenCalledWith({
+      estatusMatch: 'pendiente',
+      excluidaPorFiltro: { $ne: true },
+      fechaRecepcion: { $lt: FECHA_CORTE_LOGICA_HISTORICA },
+    });
+  });
+
+  test('tiene candidato accionable: no se toca, sigue pendiente', async () => {
+    const t = { _id: 't1', monto: 100, fechaRecepcion: new Date('2026-06-01T00:00:00Z') };
+    CajaTransferencia.find = jest.fn(() => fakeCajaFind([t]));
+    BankMovement.find = jest.fn(() => fakeFind([{ _id: 'mov-1', categoria: CATEGORIA, deposito: 100 }]));
+
+    const resultado = await reclasificarHistoricasDescartadas();
+
+    expect(CajaTransferencia.updateOne).not.toHaveBeenCalled();
+    expect(resultado).toEqual({ revisadas: 1, descartadas: 0 });
+  });
+
+  test('sin candidato accionable pero con match histórico ya identificado: se marca "descartada"', async () => {
+    const t = { _id: 't1', monto: 100, fechaRecepcion: new Date('2026-06-01T00:00:00Z') };
+    CajaTransferencia.find = jest.fn(() => fakeCajaFind([t]));
+    BankMovement.find = jest.fn()
+      .mockImplementationOnce(() => fakeFind([])) // buscarCandidatos: sin accionables
+      .mockImplementationOnce(() => fakeFind([{ _id: 'mov-1', categoria: CATEGORIA, deposito: 100, status: 'identificado' }]));
+
+    const resultado = await reclasificarHistoricasDescartadas();
+
+    expect(CajaTransferencia.updateOne).toHaveBeenCalledWith({ _id: 't1' }, { $set: { estatusMatch: 'descartada' } });
+    expect(resultado).toEqual({ revisadas: 1, descartadas: 1 });
+  });
+
+  // Decisión explícita del usuario 2026-09-09: un empate histórico donde TODOS los
+  // depósitos que calzan ya están identificado también se descarta — no hay nada
+  // accionable para un humano, sin importar si hay 1 o varios "atados".
+  test('empate histórico con 2 depósitos, AMBOS ya identificado: también se descarta', async () => {
+    const t = { _id: 't1', monto: 100, fechaRecepcion: new Date('2026-06-01T00:00:00Z') };
+    CajaTransferencia.find = jest.fn(() => fakeCajaFind([t]));
+    BankMovement.find = jest.fn()
+      .mockImplementationOnce(() => fakeFind([]))
+      .mockImplementationOnce(() => fakeFind([
+        { _id: 'mov-1', categoria: CATEGORIA, deposito: 100, status: 'identificado' },
+        { _id: 'mov-2', categoria: CATEGORIA, deposito: 100, status: 'identificado' },
+      ]));
+
+    const resultado = await reclasificarHistoricasDescartadas();
+
+    expect(CajaTransferencia.updateOne).toHaveBeenCalledWith({ _id: 't1' }, { $set: { estatusMatch: 'descartada' } });
+    expect(resultado).toEqual({ revisadas: 1, descartadas: 1 });
+  });
+
+  test('sin ningún match, ni siquiera histórico: queda pendiente (huérfana real)', async () => {
+    const t = { _id: 't1', monto: 100, fechaRecepcion: new Date('2026-06-01T00:00:00Z') };
+    CajaTransferencia.find = jest.fn(() => fakeCajaFind([t]));
+    BankMovement.find = jest.fn(() => fakeFind([]));
+
+    const resultado = await reclasificarHistoricasDescartadas();
+
+    expect(CajaTransferencia.updateOne).not.toHaveBeenCalled();
+    expect(resultado).toEqual({ revisadas: 1, descartadas: 0 });
   });
 });
 

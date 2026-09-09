@@ -103,6 +103,29 @@ function generarFolio(seq) {
   return seq.toString().padStart(longitud, '0');
 }
 
+// Rango $gte/$lt para filtrar BankMovement.fecha por año/mes en hora de MÉXICO, sin depender
+// del TZ del proceso (el contenedor de producción corre en UTC, sin `TZ` fijado). `new Date(y,
+// m-1, 1)` construye medianoche en la hora LOCAL del proceso — en un contenedor UTC eso corre
+// el límite de mes 6hs, pudiendo contar mal un movimiento de fin de mes. México tiene offset
+// FIJO (-06:00, sin horario de verano desde 2022), así que "medianoche en México" como instante
+// UTC real es simplemente ese mismo día calendario + 6 horas — construirlo con Date.UTC(...,
+// 6, 0, 0) es inmune al TZ del proceso. Usado por getCards() y getStatusStats() — mismo helper
+// en los dos para no repetir el fix en 2 lugares por separado.
+function _rangoAnioMesMexico(year, month) {
+  const y = parseInt(year, 10);
+  const m = month ? parseInt(month, 10) : null;
+  if (m && m >= 1 && m <= 12) {
+    return {
+      $gte: new Date(Date.UTC(y, m - 1, 1, 6, 0, 0)),
+      $lt:  new Date(Date.UTC(y, m, 1, 6, 0, 0)),
+    };
+  }
+  return {
+    $gte: new Date(Date.UTC(y, 0, 1, 6, 0, 0)),
+    $lt:  new Date(Date.UTC(y + 1, 0, 1, 6, 0, 0)),
+  };
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
 
 /**
@@ -134,13 +157,7 @@ async function getCards(restrictions = null, year = null, month = null) {
   // El join con la configuración se hace en la capa de aplicación.
   const match = { isActive: true, oculto: { $ne: true } };
   if (restrictions) match.status      = { $ne: 'otros' };
-  if (year) {
-    const y = parseInt(year, 10);
-    const m = month ? parseInt(month, 10) : null;
-    match.fecha = (m && m >= 1 && m <= 12)
-      ? { $gte: new Date(y, m - 1, 1), $lt: new Date(y, m, 1) }
-      : { $gte: new Date(y, 0, 1), $lt: new Date(y + 1, 0, 1) };
-  }
+  if (year) match.fecha = _rangoAnioMesMexico(year, month);
 
   // Igual que en getStatusStats() (el endpoint que este KPI fusionado reemplaza como fuente):
   // estas 4 categorías cuentan solo depósitos, nunca retiros — el dashboard de conciliación
@@ -451,15 +468,7 @@ async function getStatusStats(year, month, restrictions = null, rolActual = null
   if (restrictions) match.status      = { $ne: 'otros' };
   if (banco)        match.banco       = banco;
 
-  if (year) {
-    const y = parseInt(year, 10);
-    const m = month ? parseInt(month, 10) : null;
-    if (m && m >= 1 && m <= 12) {
-      match.fecha = { $gte: new Date(y, m - 1, 1), $lt: new Date(y, m, 1) };
-    } else {
-      match.fecha = { $gte: new Date(y, 0, 1), $lt: new Date(y + 1, 0, 1) };
-    }
-  }
+  if (year) match.fecha = _rangoAnioMesMexico(year, month);
 
   const ownUserId = restrictions?.scope === MOVEMENT_SCOPE.OWN ? restrictions.userId : null;
   const identificadoCond = {
@@ -3619,4 +3628,5 @@ module.exports = {
   // identificaciones humanas" que usa revertirConciliacion, replicado ahí para el
   // revert selectivo de traspasos entre cuentas propias.
   TODOS_MOTORES_HISTORICO,
+  _rangoAnioMesMexico,
 };

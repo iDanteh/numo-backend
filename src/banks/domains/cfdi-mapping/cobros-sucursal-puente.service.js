@@ -872,6 +872,11 @@ async function construirMovimientosPuente({
   // 2. Armar líneas candidatas (antes de filtrar por idempotencia).
   const candidatas = [];
   const facturasVendedorCubiertas = new Map(); // uuid → monto acumulado cubierto (ver docstring)
+  // folioOrigen ya resuelto DIRECTO como cobradora (ver bloque "Cobrador
+  // directo, sin factura" más abajo) — evita que `_aplicarCobrosSucursalPendientes`
+  // (la cola, poblada por la vendedora si algún día logra encolarlo por su
+  // cuenta vía `_detectarPendientesPorFacturar`) lo duplique.
+  const foliosResueltosDirecto = new Set();
   // folioVenta (numérico) de cobros REALES del día — usado abajo para acotar
   // el rango de folios a escanear en busca de tickets "por facturar" (ver
   // `_detectarPendientesPorFacturar`). Solo se llenan con folioVenta ya
@@ -1133,6 +1138,40 @@ async function construirMovimientosPuente({
             fechaCobro:           cobro.fecha ?? null,
           });
         }
+      } else if (!cuenta.serieFactura && centroPropioClave && cuenta.serieVenta
+          && cuenta.serieVenta !== centroPropioClave
+          && centroCobrador && String(centroCobrador.id) === String(centroCostoId)
+          && cuentaPuenteId) {
+        // Cobradora DIRECTA de un ticket "pendiente por facturar" (sin
+        // CFDI, `cuenta.serieFactura` vacío) vendido en OTRA sucursal —
+        // confirmado con el usuario 2026-09-09, caso real 4 tickets de A0
+        // (CEDIS) cobrados en efectivo en Puerto Escondido (O0). Sin
+        // factura, la vendedora no tiene ninguna forma de descubrir por su
+        // cuenta que esto se cobró en otro lado (ni por `documentosRelacionados`
+        // de un CFDI que no existe, ni por su propio `obtenerDesglosesCobroAlmacenPorCentro`,
+        // que solo ve cobros físicos EN su propio centro) — así que no se
+        // puede depender de la cola `CobroSucursalPendiente` (poblada solo
+        // por la vendedora). Se genera aquí mismo, directo, con el dato que
+        // el camino "por centro" YA trajo: Cargo Caja/Bancos + Abono a la
+        // cuenta puente, igual que el patrón 'HUERFANO' de
+        // `_aplicarCobrosSucursalPendientes`, pero sin pasar por la cola.
+        foliosResueltosDirecto.add(cobro.folioOrigen ?? null);
+        lineas.forEach(l => {
+          candidatas.push({
+            cuentaId: l.cuentaId, cuentaFaltante: false, concepto: l.concepto,
+            debe: l.montoAsignado, haber: 0, serie: serieFolioFactura,
+            folio: cobro.folioOrigen ?? null, centroCosto: centroCobrador.clave,
+            centroCostoId: centroCobrador.id, tipoOrigen: 'Cobro Sucursal',
+            reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null, cfdiUuid: null,
+          });
+          candidatas.push({
+            cuentaId: cuentaPuenteId, cuentaFaltante: false, concepto: l.concepto,
+            debe: 0, haber: l.montoAsignado, serie: serieFolioFactura,
+            folio: cobro.folioOrigen ?? null, centroCosto: centroCobrador.clave,
+            centroCostoId: centroCobrador.id, tipoOrigen: 'Cobro Sucursal',
+            reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null, cfdiUuid: null,
+          });
+        });
       }
     }
 
@@ -1403,7 +1442,11 @@ async function construirMovimientosPuente({
   const candidatasPendientes = await _aplicarCobrosSucursalPendientes({
     rfc, centroCostoId, centroCobradorClave: centroPropio?.clave ?? null, cuentaPuenteId, fechaDesde, fechaHasta,
   });
-  candidatas.push(...candidatasPendientes);
+  // Evita doble conteo con el bloque "Cobrador directo, sin factura" de
+  // arriba — si esta cuenta ya se resolvió directo vía el camino "por
+  // centro", no se vuelve a aplicar lo que la cola (poblada por la
+  // vendedora) pudiera traer para el mismo folioOrigen.
+  candidatas.push(...candidatasPendientes.filter(c => !foliosResueltosDirecto.has(c.folio)));
 
   if (!candidatas.length) return { movimientos: [], facturasVendedorCubiertas, facturasPPDCubiertas, pendientesPorFacturar };
 

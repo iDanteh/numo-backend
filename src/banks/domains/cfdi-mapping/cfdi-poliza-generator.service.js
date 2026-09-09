@@ -4374,6 +4374,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     for (const [key, generado] of mapaSaldosFavorGeneradosProp) {
       if (clavesConsumidas.has(key)) continue;
       if (!generado?.monto) continue;
+      // Mismo guard nativo que `_inyectarSaldoFavorGenerado` (ver ese
+      // comentario) — si Kore ya convirtió este saldo en Anticipo, no se
+      // inyecta como SF huérfano tampoco (mismo dinero contado dos veces).
+      // Caso real: JASIVE ARAGON ALDERETE, DEV-057045→OPA-00833, Puerto
+      // Escondido 1-sep — la Devolución nunca sincronizó, así que solo este
+      // camino (no el guard de `_inyectarSaldoFavorGenerado`) la emitía.
+      if (generado?.anticipoReferencia) continue;
       const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
       const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
       const iva      = Math.round((generado.monto - subtotal) * 100) / 100;
@@ -5803,6 +5810,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     for (const [key, generado] of mapaSaldosFavorGeneradosGuard) {
       if (clavesConsumidasGuard.has(key)) continue;
       if (!generado?.monto) continue;
+      // Ver comentario equivalente en generarPropuesta ("SF GEN-huérfanos").
+      if (generado?.anticipoReferencia) continue;
       const reglaSFG = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
       const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
       const ivaG      = Math.round((generado.monto - subtotalG) * 100) / 100;

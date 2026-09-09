@@ -6,10 +6,28 @@
 // horas hábiles en JS (ver comentario en el service sobre por qué). El backlog (Pipeline 2)
 // sigue siendo la única llamada a aggregate(). El gate de permiso + paso de query params
 // vive en bank.routes.test.js.
+//
+// bank-indicadores.service.js requiere bank.service.js (2026-09-09, para reusar
+// _rangoAnioMesMexico) — se mockean las mismas dependencias con I/O que ese módulo necesita
+// al cargarse (ver bank.service.ficha.test.js), aunque acá no se usen directamente.
 jest.mock('./BankMovement.model');
+jest.mock('../../shared/socket');
+jest.mock('./drive-fichas.service');
 
 const BankMovement = require('./BankMovement.model');
 const { getIndicadoresIdentificacion, horasHabilesEntre } = require('./bank-indicadores.service');
+
+// Todos los tests de este archivo construyen instantes como "hora de PARED en México" — mx(y,
+// mesIndex0, d, h, mi) devuelve el instante UTC real correspondiente, usando el offset fijo
+// -06:00 (México no tiene horario de verano desde 2022). Esto es a propósito, NO cosmético:
+// horasHabilesEntre()/_rangoAnioMesMexico() se blindaron el 2026-09-09 contra el TZ del proceso
+// (el contenedor de producción corre en UTC) — si estos tests siguieran construyendo con
+// `new Date(y, m, d, h)` (hora LOCAL DEL PROCESO que corre los tests), pasarían en esta máquina
+// (que da la casualidad de estar en America/Mexico_City) pero mentirían: confirmado que 13/24
+// tests de este archivo fallaban corriendo con `TZ=UTC npx jest ...` antes de este cambio.
+function mx(year, monthIndex0, day, hour = 0, minute = 0) {
+  return new Date(Date.UTC(year, monthIndex0, day, hour + 6, minute));
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -28,57 +46,77 @@ function mockBacklog(backlogAgg) {
   BankMovement.aggregate.mockResolvedValueOnce(backlogAgg);
 }
 
-describe('horasHabilesEntre — 8:00-20:00 lunes a sábado, domingo 0', () => {
+describe('horasHabilesEntre — 8:00-20:00 lunes a sábado, domingo 0 (hora de México)', () => {
   test('mismo día, dentro de la ventana', () => {
-    const h = horasHabilesEntre(new Date(2026, 7, 17, 10, 0), new Date(2026, 7, 17, 14, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 17, 10, 0), mx(2026, 7, 17, 14, 0));
     expect(h).toBe(4);
   });
 
   test('antes de las 8:00 se clampea al inicio de la ventana', () => {
-    const h = horasHabilesEntre(new Date(2026, 7, 17, 6, 0), new Date(2026, 7, 17, 9, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 17, 6, 0), mx(2026, 7, 17, 9, 0));
     expect(h).toBe(1); // 8:00-9:00, no 6:00-9:00
   });
 
   test('después de las 20:00 se clampea al fin de la ventana', () => {
-    const h = horasHabilesEntre(new Date(2026, 7, 17, 19, 0), new Date(2026, 7, 17, 22, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 17, 19, 0), mx(2026, 7, 17, 22, 0));
     expect(h).toBe(1); // 19:00-20:00, no 19:00-22:00
   });
 
   test('cruza un sábado completo (2026-08-22): suma sus 12h', () => {
     // Viernes 21 20:00 (fin de ventana, aporta 0) → domingo 23 00:00 (aporta 0) — solo
     // queda el sábado completo en el medio.
-    const h = horasHabilesEntre(new Date(2026, 7, 21, 20, 0), new Date(2026, 7, 23, 0, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 21, 20, 0), mx(2026, 7, 23, 0, 0));
     expect(h).toBe(12);
   });
 
   test('domingo completo (2026-08-23) no suma nada dentro de un tramo mixto', () => {
     // Sábado 8:00 (12h) + domingo (0h) + lunes 8:00-20:00 (12h) = 24h exactas —
     // si el domingo sumara algo, el total no daría un número redondo de 24.
-    const h = horasHabilesEntre(new Date(2026, 7, 22, 8, 0), new Date(2026, 7, 24, 20, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 22, 8, 0), mx(2026, 7, 24, 20, 0));
     expect(h).toBe(24);
   });
 
   test('viernes 19:00 → lunes 10:00: 1h viernes + 12h sábado + 0h domingo + 2h lunes = 15h', () => {
-    const h = horasHabilesEntre(new Date(2026, 7, 21, 19, 0), new Date(2026, 7, 24, 10, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 21, 19, 0), mx(2026, 7, 24, 10, 0));
     expect(h).toBe(15);
   });
 
   test('span de más de una semana: lunes 8:00 al lunes siguiente 8:00 = 6 días hábiles completos (72h)', () => {
     // 17(lun) 18(mar) 19(mié) 20(jue) 21(vie) 22(sáb) = 6 días × 12h; 23(dom) = 0h;
     // 24(lun) aporta 0 porque el tramo termina justo a las 8:00, sin adelantarse a la ventana.
-    const h = horasHabilesEntre(new Date(2026, 7, 17, 8, 0), new Date(2026, 7, 24, 8, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 17, 8, 0), mx(2026, 7, 24, 8, 0));
     expect(h).toBe(72);
   });
 
   test('borde exacto: un día completo 8:00-20:00 da exactamente 12h, sin off-by-one', () => {
-    const h = horasHabilesEntre(new Date(2026, 7, 17, 8, 0), new Date(2026, 7, 17, 20, 0));
+    const h = horasHabilesEntre(mx(2026, 7, 17, 8, 0), mx(2026, 7, 17, 20, 0));
     expect(h).toBe(12);
   });
 
   test('fin <= inicio devuelve 0 (guard, no lanza)', () => {
-    const mismoInstante = new Date(2026, 7, 17, 10, 0);
+    const mismoInstante = mx(2026, 7, 17, 10, 0);
     expect(horasHabilesEntre(mismoInstante, mismoInstante)).toBe(0);
-    expect(horasHabilesEntre(new Date(2026, 7, 17, 12, 0), new Date(2026, 7, 17, 10, 0))).toBe(0);
+    expect(horasHabilesEntre(mx(2026, 7, 17, 12, 0), mx(2026, 7, 17, 10, 0))).toBe(0);
+  });
+
+  // Caso real que el fix del 2026-09-09 blinda: bajo TZ del PROCESO = UTC (el contenedor de
+  // producción), 2pm México cae en el mismo día calendario UTC (20:00Z) pero 11pm México ya
+  // cruzó a las 05:00Z del día UTC siguiente — sin _comoRelojMexico(), el cálculo local hubiera
+  // usado el día/hora de UTC en vez del de México, corriendo la ventana laboral 6h.
+  test('inmune al TZ del proceso: mismo resultado corriendo bajo process.env.TZ = "UTC"', () => {
+    const originalTz = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      // 2pm México (14:00) → 20:00Z el mismo día calendario UTC.
+      const dosDeLaTarde = new Date('2026-08-17T20:00:00Z');
+      // 11pm México (23:00) del mismo día → 05:00Z del día calendario UTC SIGUIENTE.
+      const onceDeLaNoche = new Date('2026-08-18T05:00:00Z');
+      const h = horasHabilesEntre(dosDeLaTarde, onceDeLaNoche);
+      // 14:00→20:00 (fin de ventana) = 6h hábiles ese mismo día México; nada más suma.
+      expect(h).toBe(6);
+    } finally {
+      process.env.TZ = originalTz;
+    }
   });
 });
 
@@ -87,7 +125,7 @@ describe('getIndicadoresIdentificacion — promedio y mediana en horas hábiles'
     // Viernes 21 19:00 → lunes 24 10:00 = 15h hábiles (ver test de horasHabilesEntre) —
     // en tiempo de reloj serían ~63h. Si el service todavía calculara en reloj, este test fallaría.
     mockIdentificados([
-      { createdAt: new Date(2026, 7, 21, 19, 0), primeraIdentificacionAt: new Date(2026, 7, 24, 10, 0) },
+      { createdAt: mx(2026, 7, 21, 19, 0), primeraIdentificacionAt: mx(2026, 7, 24, 10, 0) },
     ]);
     mockBacklog([]);
 
@@ -100,8 +138,8 @@ describe('getIndicadoresIdentificacion — promedio y mediana en horas hábiles'
 
   test('la mediana resiste un outlier que sí infla el promedio', async () => {
     // 4 movimientos de 2h hábiles + 1 de 72h hábiles (lunes a lunes, ver test de arriba).
-    const rapido = () => ({ createdAt: new Date(2026, 7, 17, 8, 0), primeraIdentificacionAt: new Date(2026, 7, 17, 10, 0) }); // 2h
-    const lento  = { createdAt: new Date(2026, 7, 17, 8, 0), primeraIdentificacionAt: new Date(2026, 7, 24, 8, 0) }; // 72h
+    const rapido = () => ({ createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 10, 0) }); // 2h
+    const lento  = { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 24, 8, 0) }; // 72h
     mockIdentificados([rapido(), rapido(), rapido(), rapido(), lento]);
     mockBacklog([]);
 
@@ -127,9 +165,9 @@ describe('getIndicadoresIdentificacion — promedio y mediana en horas hábiles'
 describe('getIndicadoresIdentificacion — porUsuario (agrupado en JS, misma definición de horas)', () => {
   test('agrupa por userId, cuenta y promedia en horas hábiles; ordena por count desc', async () => {
     mockIdentificados([
-      { createdAt: new Date(2026, 7, 17, 8, 0), primeraIdentificacionAt: new Date(2026, 7, 17, 10, 0), primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' } }, // 2h
-      { createdAt: new Date(2026, 7, 17, 8, 0), primeraIdentificacionAt: new Date(2026, 7, 17, 12, 0), primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' } }, // 4h
-      { createdAt: new Date(2026, 7, 17, 8, 0), primeraIdentificacionAt: new Date(2026, 7, 17, 9, 0),  primeraIdentificacionPor: { userId: 'user-2', nombre: 'Luis' } }, // 1h
+      { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 10, 0), primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' } }, // 2h
+      { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 12, 0), primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' } }, // 4h
+      { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 9, 0),  primeraIdentificacionPor: { userId: 'user-2', nombre: 'Luis' } }, // 1h
     ]);
     mockBacklog([]);
 
@@ -216,7 +254,7 @@ describe('getIndicadoresIdentificacion — fecha de corte INDICADORES_DESDE (202
 
     await getIndicadoresIdentificacion({});
 
-    const cutoff = new Date(2026, 7, 17);
+    const cutoff = mx(2026, 7, 17, 0, 0);
     const findMatch = BankMovement.find.mock.calls[0][0];
     expect(findMatch.createdAt).toEqual({ $gte: cutoff });
 
@@ -236,8 +274,8 @@ describe('getIndicadoresIdentificacion — filtros', () => {
     expect(findMatch.banco).toBe('BBVA');
     expect(findMatch.categoria).toBe('Renta');
     expect(findMatch.fecha).toEqual({
-      $gte: new Date(2026, 7, 1),
-      $lt:  new Date(2026, 8, 1),
+      $gte: mx(2026, 7, 1, 0, 0),
+      $lt:  mx(2026, 8, 1, 0, 0),
     });
 
     // backlog: banco/categoria sí, pero SIN year/month (antigüedad se mide contra ahora).
@@ -254,8 +292,8 @@ describe('getIndicadoresIdentificacion — filtros', () => {
 
     const findMatch = BankMovement.find.mock.calls[0][0];
     expect(findMatch.fecha).toEqual({
-      $gte: new Date(2026, 0, 1),
-      $lt:  new Date(2027, 0, 1),
+      $gte: mx(2026, 0, 1, 0, 0),
+      $lt:  mx(2027, 0, 1, 0, 0),
     });
   });
 

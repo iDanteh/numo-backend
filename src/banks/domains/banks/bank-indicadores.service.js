@@ -1,6 +1,7 @@
 'use strict';
 
 const BankMovement = require('./BankMovement.model');
+const { _rangoAnioMesMexico } = require('./bank.service');
 
 const MS_PER_HOUR = 3600000;
 
@@ -11,10 +12,11 @@ const BACKLOG_BOUNDARIES = [0, 24, 72, 168, Number.MAX_SAFE_INTEGER];
 // (2026-08-17) de medir SOLO desde que se implementa este indicador en adelante, para no
 // ensuciar el promedio ni el backlog con historial viejo que nunca se pensó medir. Reemplaza
 // al anterior split histórico/nuevo vía `backlogPreExistente` (ver BankMovement.model.js y
-// scripts/migrate-backlog-preexistente.js, ahora sin uso). Mismo criterio de construcción
-// (hora local del servidor) que applyDateRange() más abajo. Si el deploy real de este cambio
-// ocurre en otra fecha, ACTUALIZAR este valor a mano antes de desplegar.
-const INDICADORES_DESDE = new Date(2026, 7, 17);
+// scripts/migrate-backlog-preexistente.js, ahora sin uso). Medianoche en MÉXICO como instante
+// UTC real (2026-09-09: antes usaba hora local del proceso, mismo bug de applyDateRange() más
+// abajo — corregido con el mismo criterio de offset fijo -06:00). Si el deploy real de este
+// cambio ocurre en otra fecha, ACTUALIZAR este valor a mano antes de desplegar.
+const INDICADORES_DESDE = new Date(Date.UTC(2026, 7, 17, 6, 0, 0));
 
 // Estatus que cuentan como "pendiente" para el backlog: no_identificado (nunca se tocó) y
 // reclasificado (se identificó mal y quedó otra vez esperando revisión) — ambos son trabajo
@@ -53,15 +55,12 @@ function buildBaseMatch({ banco, categoria } = {}) {
   return match;
 }
 
-// Mismo criterio EXACTO de rango de fecha que getCards() (bank.service.js) — evita
-// introducir una inconsistencia de zona horaria/rango distinta a la que ya existe ahí.
+// Mismo criterio EXACTO de rango de fecha que getCards() (bank.service.js) — reusa el MISMO
+// helper (_rangoAnioMesMexico, blindado 2026-09-09 contra el TZ del proceso) para no repetir
+// la lógica dos veces y arriesgar que quede desactualizada en un solo lugar.
 function applyDateRange(match, year, month) {
   if (!year) return match;
-  const y = parseInt(year, 10);
-  const m = month ? parseInt(month, 10) : null;
-  match.fecha = (m && m >= 1 && m <= 12)
-    ? { $gte: new Date(y, m - 1, 1), $lt: new Date(y, m, 1) }
-    : { $gte: new Date(y, 0, 1), $lt: new Date(y + 1, 0, 1) };
+  match.fecha = _rangoAnioMesMexico(year, month);
   return match;
 }
 
@@ -76,13 +75,25 @@ function mapBacklogBuckets(buckets) {
   return out;
 }
 
+// Offset fijo de México (UTC-6, sin horario de verano desde 2022) — mismo supuesto que ya
+// sostiene _rangoAnioMesMexico (bank.service.js). Envuelve un instante real en un Date corrido
+// -6h de modo que sus métodos getUTC*/setUTC* devuelvan directamente el reloj de pared en
+// México, sin importar el TZ del proceso (el contenedor de producción corre en UTC, sin `TZ`
+// fijado). Como el corrimiento es constante, las DIFERENCIAS entre 2 instantes así envueltos
+// siguen siendo la duración real — solo se usa para decidir "qué hora/día muestra el reloj",
+// nunca para reportar un instante absoluto hacia afuera.
+function _comoRelojMexico(fechaReal) {
+  return new Date(fechaReal.getTime() - 6 * MS_PER_HOUR);
+}
+
 /**
- * Horas hábiles entre 2 timestamps: lunes-sábado, 8:00-20:00 (hora local del servidor,
- * mismo criterio que applyDateRange() arriba). Domingo completo y las horas fuera de
- * 8-20 en cualquier día NO cuentan. Recorre día por día (acotado: la cantidad de días
- * entre inicio/fin de un caso real de identificación es chica, nunca miles) y suma el
- * solape de cada día con la ventana [inicio, fin] — así una franja que cruza varios
- * días (ej. viernes a la noche → lunes) se reparte bien entre los días que sí cuentan.
+ * Horas hábiles entre 2 timestamps: lunes-sábado, 8:00-20:00 EN HORA DE MÉXICO (ver
+ * _comoRelojMexico — 2026-09-09, antes usaba hora local del proceso, lo que rompía el cálculo
+ * si el contenedor corre en UTC). Domingo completo y las horas fuera de 8-20 en cualquier día
+ * NO cuentan. Recorre día por día (acotado: la cantidad de días entre inicio/fin de un caso
+ * real de identificación es chica, nunca miles) y suma el solape de cada día con la ventana
+ * [inicio, fin] — así una franja que cruza varios días (ej. viernes a la noche → lunes) se
+ * reparte bien entre los días que sí cuentan.
  *
  * No calculado en el pipeline de Mongo a propósito: esta lógica de calendario (saltar
  * domingos, recortar cada día a su ventana laboral) sería un `$reduce` de agregación
@@ -92,16 +103,18 @@ function mapBacklogBuckets(buckets) {
 function horasHabilesEntre(inicio, fin) {
   if (!(fin > inicio)) return 0;
   let totalMs = 0;
-  let cursor = new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate());
-  while (cursor < fin) {
-    if (cursor.getDay() !== DIA_DOMINGO) {
-      const ventanaInicio = new Date(cursor); ventanaInicio.setHours(HORA_INICIO_LABORAL, 0, 0, 0);
-      const ventanaFin    = new Date(cursor); ventanaFin.setHours(HORA_FIN_LABORAL, 0, 0, 0);
-      const solapeInicio = ventanaInicio > inicio ? ventanaInicio : inicio;
-      const solapeFin    = ventanaFin    < fin   ? ventanaFin    : fin;
+  const inicioMx = _comoRelojMexico(inicio);
+  const finMx    = _comoRelojMexico(fin);
+  let cursorMx = new Date(Date.UTC(inicioMx.getUTCFullYear(), inicioMx.getUTCMonth(), inicioMx.getUTCDate()));
+  while (cursorMx < finMx) {
+    if (cursorMx.getUTCDay() !== DIA_DOMINGO) {
+      const ventanaInicio = new Date(cursorMx); ventanaInicio.setUTCHours(HORA_INICIO_LABORAL, 0, 0, 0);
+      const ventanaFin    = new Date(cursorMx); ventanaFin.setUTCHours(HORA_FIN_LABORAL, 0, 0, 0);
+      const solapeInicio = ventanaInicio > inicioMx ? ventanaInicio : inicioMx;
+      const solapeFin    = ventanaFin    < finMx   ? ventanaFin    : finMx;
       if (solapeFin > solapeInicio) totalMs += solapeFin.getTime() - solapeInicio.getTime();
     }
-    cursor = new Date(cursor.getFullYear(), cursor.getMonth(), cursor.getDate() + 1);
+    cursorMx = new Date(Date.UTC(cursorMx.getUTCFullYear(), cursorMx.getUTCMonth(), cursorMx.getUTCDate() + 1));
   }
   return totalMs / MS_PER_HOUR;
 }

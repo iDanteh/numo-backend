@@ -141,10 +141,91 @@ async function buscarCandidatos(transferencia) {
   return coincidencias.map(m => [m]);
 }
 
+// FECHA_CORTE_LOGICA_HISTORICA (2026-09-09, pedido explícito del usuario): las
+// transferencias con fechaRecepcion >= este valor siguen el proceso normal de arriba
+// (buscarCandidatos ya excluye depósitos identificados a propósito — si no aparece
+// ninguno, es una huérfana real y debe seguir 'pendiente' en la bandeja). Antes de esta
+// fecha, el sync trae transferencias de meses atrás cuyo depósito correspondiente ya fue
+// identificado hace tiempo por OTRA vía (ficha, otro proceso ERP) — buscarCandidatos()
+// las deja perpetuamente sin candidatos, llenando la bandeja de ruido histórico sin nada
+// accionable. Ver reclasificarHistoricasDescartadas(). Constante fija en código (decisión
+// explícita del usuario: no amerita vivir en Configuraciones Globales).
+const FECHA_CORTE_LOGICA_HISTORICA = new Date('2026-09-07T00:00:00.000Z');
+
+// Igual que buscarCandidatos() pero SIN excluir depósitos con erpLinks/status:'identificado'
+// — usada solo para decidir si una transferencia histórica sin candidato ACCIONABLE tiene,
+// de todos modos, al menos un depósito que calza exacto por monto/ventana (ya resuelto por
+// otra vía). Nunca se usa para sugerir nada a un humano, solo para descartar ruido.
+async function _buscarCoincidenciasHistoricas(transferencia) {
+  if (!transferencia.fechaRecepcion) return [];
+
+  const ventanaDias = await _ventanaDias();
+  const desde = new Date(transferencia.fechaRecepcion);
+  desde.setDate(desde.getDate() - ventanaDias);
+  const hasta = new Date(transferencia.fechaRecepcion);
+  hasta.setDate(hasta.getDate() + ventanaDias);
+
+  const elegibles = await BankMovement.find({
+    fecha: { $gte: desde, $lte: hasta },
+  }).lean();
+  const candidatos = elegibles.filter(m => _normalizarCategoria(m.categoria) === CATEGORIA_DEPOSITO_EFECTIVO);
+
+  return candidatos.filter(m => _montosIguales(m.deposito, transferencia.monto));
+}
+
+// Corre encadenada al final del sync diario (ver cajaTransferenciaSyncCron.js). Reclasifica
+// como 'descartada' las transferencias 'pendiente' anteriores a FECHA_CORTE_LOGICA_HISTORICA
+// que:
+//   1. NO tienen ningún candidato ACCIONABLE (buscarCandidatos vacío), Y
+//   2. SÍ tienen al menos un depósito que calza exacto por monto/ventana ya resuelto por
+//      otra vía (identificado o con erpLinks) — sin importar si hay 1 o varios "atados": si
+//      ninguno queda pendiente, no hay nada accionable para un humano acá (decisión explícita
+//      del usuario 2026-09-09: un empate histórico donde TODOS ya están identificados también
+//      se descarta, igual que el caso 1:1).
+// Transferencias sin NINGÚN match, ni siquiera histórico, quedan 'pendiente' tal cual —
+// esas sí son huérfanas reales, no basura de otro proceso.
+//
+// `excluidaPorFiltro:{$ne:true}` (mismo criterio que la bandeja, erp.routes.js) es
+// obligatorio acá: reaplicarFiltro() y la bandeja solo tocan/leen 'pendiente' — si esta
+// función descartara una transferencia mientras el filtro de tipo/caja la tiene oculta,
+// esa decisión queda CONGELADA para siempre (ya no es 'pendiente', así que un futuro
+// ensanche del filtro nunca la vuelve a evaluar). Solo se reclasifican las que realmente
+// serían visibles en la bandeja hoy.
+async function reclasificarHistoricasDescartadas() {
+  const historicas = await CajaTransferencia.find({
+    estatusMatch:      'pendiente',
+    excluidaPorFiltro: { $ne: true },
+    fechaRecepcion:    { $lt: FECHA_CORTE_LOGICA_HISTORICA },
+  }).lean();
+
+  let descartadas = 0;
+  for (const t of historicas) {
+    // eslint-disable-next-line no-await-in-loop
+    const accionables = await buscarCandidatos(t);
+    if (accionables.length > 0) continue;
+
+    // eslint-disable-next-line no-await-in-loop
+    const coincidenciasHistoricas = await _buscarCoincidenciasHistoricas(t);
+    if (coincidenciasHistoricas.length === 0) continue;
+
+    // eslint-disable-next-line no-await-in-loop
+    await CajaTransferencia.updateOne({ _id: t._id }, { $set: { estatusMatch: 'descartada' } });
+    descartadas++;
+  }
+
+  if (descartadas > 0) {
+    console.log(`[CajaTransferenciaMatch] ${descartadas} transferencias históricas reclasificadas como 'descartada'.`);
+  }
+  return { revisadas: historicas.length, descartadas };
+}
+
 module.exports = {
   buscarCandidatos,
   esCategoriaDepositoEfectivo,
+  reclasificarHistoricasDescartadas,
   _ventanaDias,
   _normalizarCategoria,
+  _buscarCoincidenciasHistoricas,
+  FECHA_CORTE_LOGICA_HISTORICA,
   VENTANA_DEFAULT_DIAS,
 };

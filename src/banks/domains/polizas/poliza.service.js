@@ -1453,7 +1453,7 @@ const NOTA_AJUSTE_SIN_CFDI = {
   'COBRO-SIN-FACTURA':            'SIN FACTURA (cobro real, sin CFDI asociado)',
 };
 
-function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null) {
+function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
   const porCategoria = { devolucion: [], descuento: [], bonificacion: [], clubTuberos: [] };
@@ -1754,8 +1754,16 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // abono). Se voltea a Abono con el valor absoluto para que el importe
       // sí llegue al archivo (confirmado con el usuario 2026-09-03).
       const neto = Number(g.debe) || 0;
+      // Confirmado con el usuario 2026-09-10: "Depósitos consolidados
+      // (Efectivo)"/"(Tarjeta)" van SIEMPRE a la cuenta bancaria real
+      // (1102011001, BBVA), para todas las sucursales — default fijo por
+      // etiqueta, no depende de cfdiUuid ni de `verdadBancaria`. El resto de
+      // los buckets (SF, Puntos, sin etiqueta) conservan su cuenta genérica.
+      const cuentaFinal = (g.label === 'EFECTIVO' || g.label === 'TARJETA') && cuentaDepositosReal
+        ? cuentaDepositosReal
+        : g.cuenta;
       return {
-        cuenta:      g.cuenta,
+        cuenta:      cuentaFinal,
         serie:       g.label ?? '',
         concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
                    : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
@@ -2638,7 +2646,7 @@ function bloquesAjustesContado(movs) {
 // (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
-function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null } = {}) {
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null } = {}) {
   // REVERTIDO 2026-08-20: se intentó sumar Cancelación/Devolución en Efectivo
   // al consolidado, pero al cruzar contra el "Reporte de Movimientos en
   // Cajas" real (Hidalgo/B0 11-ago) se confirmó que NO hay ningún movimiento
@@ -2680,7 +2688,7 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   const bloquesAnticipos = [];
 
   const { consolidados, depositosIdentificados } =
-    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket);
+    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket, cuentaDepositosReal);
 
   const ventasYClubTuberos = enriquecerConceptoConCliente(
     [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
@@ -2897,6 +2905,16 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // 2026-09-01, ver diag-bancario-pago.js). Para Ingreso `facturaUuid` nunca
   // se llena, así que este cambio no afecta ese flujo.
   const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })));
+  // "Depósitos consolidados (Efectivo)"/"(Tarjeta)" — confirmado con el
+  // usuario 2026-09-10: para TODAS las sucursales, ambos van a la cuenta
+  // bancaria real 1102011001 (BBVA) en vez de las genéricas Caja/Bancos por
+  // identificar. Distinto de `verdadBancaria` (que resuelve por cfdiUuid,
+  // caso a caso): este es un default FIJO por etiqueta de consolidado, sin
+  // importar la factura — no toca "Cobro de otra sucursal" (`_extraerCobrosSucursal`
+  // ya lo saca de este pipeline antes de llegar a `consolidarCargos`).
+  const cuentaDepositosReal = await AccountPlan.findOne({
+    where: { codigo: '1102011001' }, attributes: ['id', 'codigo', 'nombre'], raw: true,
+  });
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
   // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.
@@ -2952,7 +2970,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // mismo principio que ya usa el resto de sucursales cuando falta
       // Contado o Crédito (folios consecutivos, sin huecos).
       const cSplit = contado.length > 0
-        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket })
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
@@ -2991,7 +3009,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
           // factura) — refleja el depósito real de caja/banco del periodo.
           {
             tipoVenta: 'Contado',
-            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket }),
+            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal }),
             folio:     overrides.folioContado   ?? poliza.numero,
             concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
@@ -3008,7 +3026,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       : [{
           tipoVenta: null,
           movs:      contado.length > 0
-            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket })
+            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal })
             : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
           folio:     overrides.folioContado   ?? poliza.numero,
           concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),

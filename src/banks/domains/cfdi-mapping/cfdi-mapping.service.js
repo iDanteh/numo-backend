@@ -72,6 +72,26 @@ const CODIGO_CUENTA_SALDO_FAVOR     = '2103090001';
 const CODIGO_CUENTA_CLUB_TUBEROS    = '2103090002';
 const CODIGO_CUENTA_IVA_SALDO_FAVOR = '2104010002';
 const TASA_IVA_SALDO_FAVOR = 0.16;
+
+// "DEPOSITO EN EFECTIVO" (confirmado con el usuario 2026-09-10, caso real
+// F0-260900349/factura F0-260900045, $4,619.96): dinero depositado directo
+// en sucursal bancaria (no en la caja de la tienda), pero SIN el número de
+// autorización/referencia que sí trae una Transferencia normal — a
+// diferencia del caso ya resuelto de GAS MILENIUM (2026-08-31,
+// `CATEGORIAS_TRANSFERENCIA_BANCO` en poliza.service.js), aquí no hay
+// ningún `BankMovement` que conciliar todavía. Reutiliza claveSat='01'
+// (Efectivo), igual que "PUNTOS" — solo el texto de `nombre` lo distingue.
+// El usuario confirmó explícitamente: NO debe sumar al consolidado de
+// Efectivo NI aparecer en ningún renglón de la póliza contable — solo
+// como informativo en la hoja "Desglose Consolidado", bajo su propio
+// apartado. Se descarta la línea de Cargo por completo (mismo criterio ya
+// aceptado para "Venta Sin Cobro": se acepta el asiento desbalanceado en
+// vez de inventar una cuenta/cargo que no corresponde) y se reporta vía
+// `context.depositosEfectivoDetectados` (ver `splitPorFormaPagoReal`) para
+// que el generador la adjunte a `poliza.depositosEfectivoNoConciliados`.
+function _esDepositoEfectivo(fp) {
+  return /dep[oó]sito\s*en\s*efectivo/i.test(fp?.nombre ?? '');
+}
 // NOTA (2026-08-06, corrección del mismo día): las funciones `_esSaldoAFavorReal`/
 // `_esPuntosReal` que escaneaban `formasPago` de /desgloses-cobro/almacen para
 // detectar SF/Puntos DENTRO del desglose de Efectivo/Tarjeta quedaron
@@ -945,6 +965,22 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       // real CONSTRUCASA 13-ago, ticket C0-260802371).
       const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
       if (montoLinea <= 0) return;
+
+      // "DEPOSITO EN EFECTIVO" sin conciliar (ver `_esDepositoEfectivo`,
+      // confirmado con el usuario 2026-09-10): no genera ningún Cargo en la
+      // póliza (se acepta el asiento desbalanceado, mismo criterio que
+      // "Venta Sin Cobro") — solo se reporta a `context.depositosEfectivoDetectados`
+      // para que el generador la adjunte como informativo aparte.
+      if (_esDepositoEfectivo(fp)) {
+        if (!Array.isArray(context.depositosEfectivoDetectados)) context.depositosEfectivoDetectados = [];
+        const referenciaTicket = (fp.serieVentaTicket && fp.folioVentaTicket)
+          ? `${fp.serieVentaTicket}-${fp.folioVentaTicket}` : serieCfdi;
+        context.depositosEfectivoDetectados.push({
+          monto: montoLinea, concepto, serie: referenciaTicket,
+          centroCosto, cfdiUuid: cfdi.uuid ?? null,
+        });
+        return;
+      }
 
       const esEfectivo = (fp.claveSat ?? '').trim() === '01';
       movs.push({

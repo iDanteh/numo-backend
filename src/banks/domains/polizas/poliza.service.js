@@ -3259,6 +3259,27 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     }
   }
 
+  // "DEPOSITO EN EFECTIVO" sin conciliar (confirmado con el usuario
+  // 2026-09-10): nunca se contabilizan en la póliza (ver `_esDepositoEfectivo`,
+  // cfdi-mapping.service.js) — solo aparecen aquí, en su propio apartado
+  // dentro de "Desglose Consolidado" (mismo mecanismo de encabezado por
+  // `formaPago` que ya separa Efectivo/Tarjeta más abajo).
+  if (poliza.depositosEfectivoNoConciliados?.length > 0) {
+    for (const d of poliza.depositosEfectivoNoConciliados) {
+      desgloseConsolidado.push({
+        cuenta:        null,
+        centroCosto:   d.centroCosto ?? '',
+        tipo:          'Depósito',
+        transferencia: 'No',
+        formaPago:     'DEPOSITOS EN EFECTIVO',
+        cfdiSerie:     d.serie ?? '',
+        cliente:       nombresClientes.get((d.cfdiUuid || '').toUpperCase()) || '',
+        monto:         d.monto,
+        nota:          'SIN CONCILIAR (no se contabiliza)',
+      });
+    }
+  }
+
   // Hoja de desglose: qué CFDIs componen cada línea consolidada de Depósitos/
   // Anticipos (esas líneas en la póliza no llevan serie/folio por ser un total
   // agregado — aquí se puede rastrear el detalle real detrás de cada monto).

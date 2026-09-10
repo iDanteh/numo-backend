@@ -3665,6 +3665,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   let facturasVendedorCubiertas = new Map(); // uuid → monto ya cubierto (ver docstring en cobros-sucursal-puente.service.js)
   let facturasPPDCubiertas = new Map();
   let pendientesPorFacturarProp = [];
+  // "DEPOSITO EN EFECTIVO" sin conciliar (ver `_esDepositoEfectivo`,
+  // cfdi-mapping.service.js) — informativo, nunca se contabiliza en la
+  // póliza (confirmado con el usuario 2026-09-10).
+  const depositosEfectivoProp = [];
   let cuentaSaldoFavorIdProp = null;
   let cuentaIvaSaldoFavorIdProp = null;
   if (tipoCfdi === 'I' && centroCostoId) {
@@ -3989,6 +3993,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
     if (uuid07 && ventasConAnticipoRedirigido.has(uuid07)) {
       _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
       if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
@@ -5009,6 +5014,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // Hoja aparte: tickets con cobro real sin factura ligada — ver comentario
     // arriba y `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
     pendientesPorFacturar: pendientesPorFacturarProp,
+    depositosEfectivoNoConciliados: depositosEfectivoProp,
     _meta: {
       totalCfdis:   cfdisSinPoliza.length,
       sinRegla,
@@ -5384,6 +5390,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   let facturasVendedorCubiertasGuard = new Map(); // uuid → monto ya cubierto
   let facturasPPDCubiertasGuard = new Map();
   let pendientesPorFacturarGuard = [];
+  // Ver comentario equivalente en generarPropuesta.
+  const depositosEfectivoGuard = [];
   let cuentaSaldoFavorIdGuard = null;
   let cuentaIvaSaldoFavorIdGuard = null;
   if (tipoCfdi === 'I' && centroCostoId) {
@@ -5656,6 +5664,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
     if (uuid07 && ventasConAnticipoRedirigidoGuard.has(uuid07)) {
       _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
@@ -6349,6 +6358,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       estado:    'borrador',
       sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
+      depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
     }, { transaction: t });
 
     const movimientosFinales = _deduplicarSFRedundante(todosLosMovimientos);

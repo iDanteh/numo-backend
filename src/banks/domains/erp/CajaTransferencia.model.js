@@ -62,9 +62,13 @@ const cajaTransferenciaSchema = new mongoose.Schema({
   // que se saca de la bandeja para no llenarla de ruido histórico. Nunca se asigna a
   // transferencias nuevas (fechaRecepcion >= el corte) — esas, sin candidato, siguen
   // 'pendiente' (huérfanas reales).
+  // 'descartada-manual' (2026-09-10): descarte MANUAL de un humano sobre una transferencia
+  // 'pendiente' SIN candidatos, que sabe (por fuera de este panel) que ya fue identificada —
+  // DISTINTO de 'descartada' (esa es exclusiva del job automático de arriba, nunca se
+  // mezclan). Ver caja-transferencia-descartar-manual.service.js.
   estatusMatch: {
     type:    String,
-    enum:    ['pendiente', 'matcheada', 'descartada'],
+    enum:    ['pendiente', 'matcheada', 'descartada', 'descartada-manual'],
     default: 'pendiente',
     index:   true,
   },
@@ -82,6 +86,17 @@ const cajaTransferenciaSchema = new mongoose.Schema({
   },
   confirmadoEn: { type: Date, default: null },
   movementIdsConfirmados: { type: [mongoose.Schema.Types.ObjectId], ref: 'BankMovement', default: [] },
+
+  // Trazabilidad del descarte manual (ver caja-transferencia-descartar-manual.service.js) —
+  // mismo patrón que confirmadoPor/confirmadoEn arriba, pero para 'descartada-manual'.
+  descartadoManualmentePor: {
+    type: {
+      userId: { type: String, default: null },
+      nombre: { type: String, default: null },
+    },
+    default: null,
+  },
+  descartadoManualmenteEn: { type: Date, default: null },
 
   // Exclusión por filtro de config (NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS/NOMBRE_CAJA_DESTINO_PERMITIDAS,
   // ver caja-transferencia-sync.service.js#reaplicarFiltro) — ortogonal a estatusMatch a propósito:

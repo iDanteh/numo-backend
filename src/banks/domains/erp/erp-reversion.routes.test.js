@@ -101,6 +101,10 @@ beforeEach(() => {
   // de respaldo) no necesitan mockear toda la cadena de reconsulta. Los tests nuevos de
   // "ajuste parcial" sobreescriben esto explícitamente.
   erpRoutes._rangoDesdeFollo.mockReturnValue(null);
+  // 2026-09-10: procesarReversionKore ahora consulta ErpReversion.find(...).distinct('referencia')
+  // para armar el Set de referencias ya conocidas de este erpId (ver _aportesPorErpIdCronologico) —
+  // default sin ninguna previa, los tests que la necesiten la sobreescriben explícitamente.
+  ErpReversion.find.mockReturnValue({ distinct: jest.fn().mockResolvedValue([]) });
 });
 
 afterEach(() => {
@@ -449,6 +453,80 @@ describe('procesarReversionKore — fix real 2026-08-20: reconsulta a Kore en vi
 
     expect(mov.erpIds).toEqual([]);
     expect(mov.erpLinks).toEqual([]);
+  });
+});
+
+// 2026-09-10 (Kore agregó `movimientos[].id` a su kardex, y `referencia` del webhook resultó
+// ser EXACTAMENTE ese `id` — caso real del usuario, erpId 6a977a40b0b61300017367f8): estos
+// tests verifican el WIRING (que procesarReversionKore arme y pase el Set correcto) — la
+// resolución real de la ambigüedad por identidad ya está probada a nivel unitario en
+// erp.routes.test.js (`_aportesPorErpIdCronologico`, que acá está mockeada).
+describe('procesarReversionKore — referenciasConocidas (2026-09-10, Kore ahora manda movimientos[].id)', () => {
+  function mockRangoYSync(raw0) {
+    erpRoutes._rangoDesdeFollo.mockReturnValue({ fechaDesde: '2026-09-01', fechaHasta: '2026-09-30' });
+    erpRoutes._sincronizarConRetry.mockResolvedValue({ raw: [raw0] });
+  }
+
+  function setupMovYCalculos() {
+    const mov = fakeMov({
+      _id: 'mov-1', erpIds: ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 0, total: 248.92, saldoErpAportado: 248.92, serie: 'A0', folioExterno: '260900024' }],
+      deposito: 248.92,
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-referencia-1' });
+    mockRangoYSync({ saldoActual: 0, total: 248.92, movimientos: [] }); // contenido real no importa, _aportesPorErpIdCronologico está mockeada
+    erpRoutes._erpIdIdentificadoPorHumano.mockReturnValue(true);
+    erpRoutes._aportesPorErpIdCronologico.mockReturnValue(new Map([[0, 248.92]]));
+    erpRoutes._backfillFormasPagoYFolioFiscal.mockReturnValue({ saldoPagadoTotal: 248.92, saldoPagado: 248.92, folioFiscal: null });
+    erpRoutes._movimientosKoreDesde.mockReturnValue([]);
+    erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: false, montoRetenido: null });
+    return mov;
+  }
+
+  test('con `referencia` en el evento actual: se agrega al Set pasado como 4to argumento a _aportesPorErpIdCronologico', async () => {
+    setupMovYCalculos();
+    ErpReversion.find.mockReturnValue({ distinct: jest.fn().mockResolvedValue([]) }); // sin previas
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '260900024',
+      referencia: '6a977cc1b0b6130001736837', monto: 248.92,
+    });
+
+    expect(ErpReversion.find).toHaveBeenCalledWith({ erpId: 'CXC-1', referencia: { $ne: null } });
+    const llamadas = erpRoutes._aportesPorErpIdCronologico.mock.calls;
+    expect(llamadas.length).toBeGreaterThanOrEqual(1);
+    for (const [, , , referenciasConocidas] of llamadas) {
+      expect(referenciasConocidas).toBeInstanceOf(Set);
+      expect(referenciasConocidas.has('6a977cc1b0b6130001736837')).toBe(true);
+    }
+  });
+
+  test('sin `referencia` en el evento actual, pero con una ErpReversion PREVIA del mismo erpId que sí la tenía: se usa el historial', async () => {
+    setupMovYCalculos();
+    ErpReversion.find.mockReturnValue({ distinct: jest.fn().mockResolvedValue(['referencia-historica-1']) });
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '260900024', monto: 100,
+      // sin `referencia` en este evento puntual
+    });
+
+    expect(ErpReversion.find).toHaveBeenCalledWith({ erpId: 'CXC-1', referencia: { $ne: null } });
+    const [, , , referenciasConocidas] = erpRoutes._aportesPorErpIdCronologico.mock.calls[0];
+    expect(referenciasConocidas.has('referencia-historica-1')).toBe(true);
+  });
+
+  test('sin ninguna `referencia` disponible (ni actual ni histórica): pasa un Set vacío, comportamiento viejo intacto', async () => {
+    setupMovYCalculos();
+    ErpReversion.find.mockReturnValue({ distinct: jest.fn().mockResolvedValue([]) });
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '260900024', monto: 100,
+    });
+
+    const [, , , referenciasConocidas] = erpRoutes._aportesPorErpIdCronologico.mock.calls[0];
+    expect(referenciasConocidas).toBeInstanceOf(Set);
+    expect(referenciasConocidas.size).toBe(0);
   });
 });
 

@@ -1271,8 +1271,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const diaCfdi = diaCfdiPorClave.get(key);
       const ventaConsumidora = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
       const usados = (cuenta.saldosFavorUsados ?? [])
-        // Mismo exento que en `resultadosAlmacen` — ver `_viaTicketPropio`.
-        .filter(u => cuenta._viaTicketPropio || !diaCfdi || _diaMx(u.fecha) === diaCfdi)
+        // A diferencia del filtro de `resultadosAlmacen` (línea ~1050), aquí
+        // NO se exime por `_viaTicketPropio` — confirmado con el usuario
+        // 2026-09-10: cuando el uso real cae en un día distinto al de la
+        // factura (factura tardía), el SF usado debe mostrarse en el día
+        // REAL del uso (ver `_sfUsadoAntesDeFacturarPorCentro`, mecanismo
+        // independiente, mismo patrón que `_cobrosSinFacturaPorCentro` para
+        // Efectivo), no en el día de la factura — mostrarlo aquí TAMBIÉN
+        // sería contarlo dos veces entre ambos días.
+        .filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi)
         // Excluir SOLO el autoconsumo real (mismo ticket genera y usa su
         // propio saldo) — ver comentario arriba. Si el marcador no se
         // encuentra (Devolución con su propio CFDI, caso normal) o el ticket
@@ -2766,6 +2773,128 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       if (r.monto <= 0) continue;
       detalle.push({ ventaSerie, ventaFolio, clave: r.clave, monto: Math.round(r.monto * 100) / 100 });
     }
+  }
+  return detalle;
+}
+
+// Saldo a favor USADO en el día real del cobro cuando la factura que lo
+// consume se timbra un día distinto (confirmado con el usuario 2026-09-10,
+// caso real SD SOLUTIONS/Ferrocarril: factura F0-260900061 timbrada 4-sep
+// 22:15, pero su ticket real F0-260900334 usó $2,689.72 de saldo a favor
+// (de 3 cuentas SF distintas) el 3-sep 18:50). Mismo principio que
+// `_cobrosSinFacturaPorCentro` para Efectivo ("el cobro debe caer el día
+// que se cobró, la factura saldrá cuando se timbre") aplicado a SF: el
+// mecanismo normal (`_prefetchAjustesFacturaPropia`/`emitirLineaSF`) solo
+// emite esta línea como parte de procesar la factura, en SU propio día —
+// si el uso real cae en un día distinto, se pierde sin importar qué día se
+// genere (ni el del cobro real, que no tiene la factura en su batch, ni el
+// de la factura, por el filtro de mismo-día). Esta función es el mecanismo
+// INDEPENDIENTE que la muestra en el día real, sin depender de que la
+// factura esté en el batch. Para NO duplicar cuando la factura SÍ cae en
+// este mismo rango (caso normal, sin desfase), `_prefetchAjustesFacturaPropia`
+// ya NO exime por `_viaTicketPropio` el filtro de mismo-día de SF (ver
+// comentario ahí) — cada mecanismo cubre exactamente un caso, sin solape.
+async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fechaFin }) {
+  if (!centro || !fechaInicio || !fechaFin) return [];
+
+  const fechaDesdeISO = new Date(`${fechaInicio}T00:00:00-06:00`).toISOString();
+  const fechaHastaISO = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
+
+  let resultadosSaldos = [];
+  try {
+    resultadosSaldos = await obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO });
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn(`[SFUsadoAntesDeFacturar] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
+    return [];
+  }
+
+  // SF-OCULTO (confirmado con el usuario, caso real F0-260900222→CAC-078425
+  // generado 08:09am, usado 09:00am por F0-260900236, mismo almacén F0,
+  // mismo día 3-sep, uso completo): la regla ya establecida de "se genera y
+  // se ocupa el mismo día y mismo almacén, completo → sigue oculto" aplica
+  // AQUÍ IGUAL — no importa que la FACTURA consumidora se timbre otro día,
+  // lo que decide oculto es el par generación/uso, no la factura. Sin este
+  // filtro, `_sfUsadoAntesDeFacturarPorCentro` mostraba como línea visible
+  // un SF que nunca debió verse en ningún lado (bug real 2026-09-10).
+  // `resultadosSaldos` (mismo centro+día que ya se consultó arriba) trae
+  // TODAS las generaciones de este almacén ese rango — no hace falta
+  // ninguna consulta extra.
+  const diaGenPorMarcador = new Map(); // `${serieOrigen}|${folioOrigen}` -> día (México) de la generación
+  for (const cuenta of resultadosSaldos) {
+    for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+      const marcador = `${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`;
+      diaGenPorMarcador.set(marcador, _diaMx(gen.fecha));
+    }
+  }
+
+  // Usos reales cuyo día cae en este rango — sin importar el día de la
+  // factura que los consume (eso se decide después).
+  const candidatosUso = [];
+  for (const cuenta of resultadosSaldos) {
+    for (const u of (cuenta.saldosFavorUsados ?? [])) {
+      const diaUso = _diaMx(u.fecha);
+      if (!diaUso || diaUso < fechaInicio || diaUso > fechaFin) continue;
+      const marcador = `${(u.serieOrigen ?? '').toUpperCase()}|${u.folioOrigen ?? ''}`;
+      const diaGen = diaGenPorMarcador.get(marcador);
+      if (diaGen && diaGen === diaUso) continue; // oculto: mismo día/almacén, no se muestra
+      candidatosUso.push({ cuenta, uso: u });
+    }
+  }
+  if (!candidatosUso.length) return [];
+
+  // Resolver el día real y el cliente de cada factura consumidora conocida
+  // — si su propio día CAE en este mismo rango, el mecanismo normal ya la
+  // muestra (no duplicar aquí); si no, o si el CFDI aún no sincronizó, se
+  // inyecta aquí.
+  const facturaKeys = [...new Set(
+    candidatosUso.map(({ cuenta }) => `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`),
+  )];
+  const orConditions = facturaKeys.map(k => {
+    const [serie, folio] = k.split('|');
+    return { serie, folio };
+  });
+  const cfdisFactura = orConditions.length
+    ? await CFDI.find({ 'emisor.rfc': rfc, $or: orConditions })
+        .select('serie folio fecha uuid receptor').lean()
+    : [];
+  // La colección CFDI puede tener MÁS DE UN documento para el mismo
+  // serie/folio (un "stub" incompleto sincronizado antes que el CFDI
+  // completo, mismo patrón confirmado 2026-08-17, caso real FILEMON
+  // A0-260801889) — bug real encontrado 2026-09-10, caso NOE ALAN FLORES
+  // SANCHEZ/F0-260900096: el stub sin `receptor.nombre` pisaba al documento
+  // completo, saliendo "CLIENTE NO IDENTIFICADO" aunque el CFDI real SÍ
+  // estaba sincronizado con su nombre. Se prefiere SIEMPRE el documento
+  // más completo (con `receptor.nombre`), y solo entre documentos
+  // igualmente completos se usa la fecha más temprana como desempate.
+  const datosFacturaPorKey = new Map(); // key -> { dia, uuid, nombreCliente, completo }
+  for (const c of cfdisFactura) {
+    const key = `${c.serie}|${c.folio}`;
+    const dia = _diaMx(c.fecha);
+    const completo = !!c.receptor?.nombre;
+    const actual = datosFacturaPorKey.get(key);
+    if (!actual || (completo && !actual.completo) || (completo === actual.completo && dia < actual.dia)) {
+      datosFacturaPorKey.set(key, { dia, uuid: c.uuid ?? null, nombreCliente: c.receptor?.nombre ?? null, completo });
+    }
+  }
+
+  const detalle = [];
+  const vistos = new Set();
+  for (const { cuenta, uso } of candidatosUso) {
+    const facturaKey = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
+    const datosFactura = datosFacturaPorKey.get(facturaKey);
+    if (datosFactura?.dia && datosFactura.dia >= fechaInicio && datosFactura.dia <= fechaFin) continue;
+    const dedupeKey = `${(uso.serieOrigen ?? '').toUpperCase()}|${uso.folioOrigen ?? ''}|${cuenta.serieVenta}|${cuenta.folioVenta}|${uso.fecha}`;
+    if (vistos.has(dedupeKey)) continue;
+    vistos.add(dedupeKey);
+    const monto = Math.abs(Number(uso.montoUsado) || 0);
+    if (monto <= 0) continue;
+    detalle.push({
+      ventaSerie: cuenta.serieVenta ?? null, ventaFolio: cuenta.folioVenta ?? null,
+      monto,
+      nombreCliente: datosFactura?.nombreCliente ?? 'CLIENTE NO IDENTIFICADO',
+      facturaUuid: datosFactura?.uuid ?? null,
+    });
   }
   return detalle;
 }
@@ -4545,6 +4674,32 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
   }
 
+  // Saldo a favor usado el día real cuando la factura que lo consume se
+  // timbra otro día (factura tardía) — ver `_sfUsadoAntesDeFacturarPorCentro`.
+  // Misma forma que una línea normal de SF (`emitirLineaSF` en
+  // cfdi-mapping.service.js): tipoOrigen/reglaNombre iguales para que
+  // `_extraerCobrosSucursal` (poliza.service.js) la trate exactamente igual
+  // (columna C = "SF", sin prefijo "Cobro de otra sucursal").
+  if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin
+      && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
+    const sfTardioProp = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
+    const ccSfTardioProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+    for (const d of sfTardioProp) {
+      const subtotal = Math.round((d.monto / 1.16) * 100) / 100;
+      const iva = Math.round((d.monto - subtotal) * 100) / 100;
+      const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
+      const conceptoSfTardio = [d.nombreCliente, referenciaVenta].filter(Boolean).join(' / ');
+      const baseSfTardio = {
+        concepto: conceptoSfTardio, serie: referenciaVenta,
+        centroCosto: ccSfTardioProp?.clave ?? null, centroCostoId: ccSfTardioProp?.id ?? null,
+        cfdiUuid: d.facturaUuid ?? null, cuentaFaltante: false,
+        tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+      };
+      movimientosResult.push({ ...baseSfTardio, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotal });
+      movimientosResult.push({ ...baseSfTardio, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
+    }
+  }
+
   // Puntos/Club Tuberos usados en el batch: UNA sola línea consolidada por
   // sucursal (no individual, a diferencia de Saldo a Favor — confirmado con
   // el usuario 2026-08-06, revirtió su decisión anterior sobre Puntos),
@@ -5950,6 +6105,28 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
   }
 
+  // Saldo a favor usado en otro día (factura tardía) — ver comentario
+  // equivalente en generarPropuesta.
+  if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin
+      && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
+    const sfTardioGuard = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
+    const ccSfTardioGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
+    for (const d of sfTardioGuard) {
+      const subtotalG = Math.round((d.monto / 1.16) * 100) / 100;
+      const ivaG = Math.round((d.monto - subtotalG) * 100) / 100;
+      const referenciaVentaG = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
+      const conceptoSfTardioG = [d.nombreCliente, referenciaVentaG].filter(Boolean).join(' / ');
+      const baseSfTardioG = {
+        concepto: conceptoSfTardioG, serie: referenciaVentaG,
+        centroCosto: ccSfTardioGuard?.clave ?? null, centroCostoId: ccSfTardioGuard?.id ?? null,
+        cfdiUuid: d.facturaUuid ?? null, cuentaFaltante: false,
+        tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+      };
+      todosLosMovimientos.push({ ...baseSfTardioG, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalG });
+      todosLosMovimientos.push({ ...baseSfTardioG, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaG });
+    }
+  }
+
   // Puntos/Club Tuberos consolidado del batch — ver comentario equivalente en
   // generarPropuesta.
   for (const { monto, centroCosto: ccPuntosGuard } of puntosAcumuladosGuard.values()) {
@@ -6591,6 +6768,7 @@ module.exports = {
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
   _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
+  _sfUsadoAntesDeFacturarPorCentro,
   // Utilidades genéricas (numeración de folio, fechas) expuestas ÚNICAMENTE
   // para que cobranza-poliza-generator.service.js las reutilice sin duplicar
   // la numeración de folio (comparte el mismo contador/rango por sucursal que

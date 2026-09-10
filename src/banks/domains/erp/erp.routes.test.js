@@ -80,6 +80,7 @@ jest.mock('../../../visor/models/CFDI', () => ({
 jest.mock('./CajaTransferencia.model');
 jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatos: jest.fn() }));
 jest.mock('./caja-transferencia-confirm.service', () => ({ confirmarMatch: jest.fn() }));
+jest.mock('./caja-transferencia-descartar-manual.service', () => ({ descartarManual: jest.fn() }));
 jest.mock('./caja-transferencia-sync.service', () => ({ sincronizarTransferenciasCajasManual: jest.fn(), init: jest.fn() }));
 jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpay: jest.fn() }));
 
@@ -93,6 +94,7 @@ const CFDI         = require('../../../visor/models/CFDI');
 const CajaTransferencia = require('./CajaTransferencia.model');
 const { buscarCandidatos } = require('./caja-transferencia-match.service');
 const { confirmarMatch }   = require('./caja-transferencia-confirm.service');
+const { descartarManual }  = require('./caja-transferencia-descartar-manual.service');
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
@@ -263,6 +265,47 @@ describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruza
     expect(resultado.get(1)).toBe(50);  // American Express: solo su última reaplicación (294) sigue vigente
     // Reconcilia exacto con Kore: total-saldoActual = 346.62-196.62 = 150 = 100+50.
     expect(resultado.get(0) + resultado.get(1)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  // 2026-09-10 (Kore agregó `movimientos[].id`, y `referencia` del webhook de reversión
+  // resultó ser EXACTAMENTE ese `id` — caso real del usuario, erpId 6a977a40b0b61300017367f8):
+  // sin `referenciasConocidas`, una reversa sin tag SIEMPRE cancela la entrada MÁS RECIENTE
+  // que empata en magnitud (ver test de folioExterno 260800166 arriba) — pero eso es una
+  // suposición, no una certeza. Este caso prueba que, cuando Kore SÍ nos dice con certeza cuál
+  // abono revirtió (por su `id` real, no por magnitud), el resultado es correcto aunque sea
+  // el abono MÁS VIEJO el que se revirtió — algo que la heurística de magnitud sola
+  // adivinaría MAL (cancelaría el más nuevo, BANCOMER quedaría en 0 en vez de AMEX).
+  test('con referenciasConocidas: resuelve por identidad real aunque 2 movimientos empaten en magnitud, incluso si el revertido es el MÁS VIEJO', () => {
+    const raw0 = {
+      total: 200, saldoActual: 100,
+      movimientos: [
+        { serie: 'ABO', folio: '1', id: 'abono-bancomer', fecha: '2026-09-10T10:00:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' }, { nombre: 'Banco', valor: 'BANCOMER' },
+          ] }] },
+        { serie: 'ABO', folio: '2', id: 'abono-amex', fecha: '2026-09-10T10:01:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '040727' }, { nombre: 'Numo', valor: '477911' }, { nombre: 'Banco', valor: 'American Express' },
+          ] }] },
+        { serie: 'REV ABO', folio: '3', fecha: '2026-09-10T10:05:00Z', total: 100, // sin adicionales — Kore nunca tagea las reversas
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100 }] },
+      ],
+    };
+    const movBancomer = { numeroAutorizacion: '18411758', folio: 'X' };
+    const movAmex      = { numeroAutorizacion: '477911',   folio: 'Y' };
+
+    // Sin referenciasConocidas: la heurística de magnitud cancela el MÁS RECIENTE (Amex) —
+    // en este caso sería la atribución EQUIVOCADA (el real revertido fue Bancomer).
+    const sinReferencia = router._aportesPorErpIdCronologico(raw0, [movBancomer, movAmex]);
+    expect(sinReferencia.get(0)).toBe(100); // Bancomer "sobrevive" por casualidad de orden
+    expect(sinReferencia.has(1)).toBe(false); // Amex cancelado — INCORRECTO en este escenario
+
+    // Con referenciasConocidas={'abono-bancomer'}: se sabe con certeza que Bancomer fue el
+    // revertido — el resultado ahora es el correcto, sin importar el orden cronológico.
+    const referenciasConocidas = new Set(['abono-bancomer']);
+    const conReferencia = router._aportesPorErpIdCronologico(raw0, [movBancomer, movAmex], () => true, referenciasConocidas);
+    expect(conReferencia.has(0)).toBe(false); // Bancomer: revertido, correctamente excluido
+    expect(conReferencia.get(1)).toBe(100);   // Amex: su abono nunca se tocó, sigue vigente
   });
 
   test('reversa cuyo monto no coincide con NINGUNA entrada de la pila se ignora (no se inventa a qué abono pertenece)', () => {
@@ -990,6 +1033,52 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
     const res = await request(app)
       .post('/transferencias-cajas/t-1/confirmar')
       .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// POST /transferencias-cajas/:id/descartar-manual — pedido explícito del usuario
+// 2026-09-10: descarta manualmente una transferencia 'pendiente' sin candidatos. Mismo
+// permiso que el resto de la sección (banks:transferencias-caja, admin-only por ahora).
+describe('POST /transferencias-cajas/:id/descartar-manual', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/descartar-manual')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(descartarManual).not.toHaveBeenCalled();
+  });
+
+  test('delega en descartarManual con el id y el usuario autenticado', async () => {
+    descartarManual.mockResolvedValue({ transferencia: { _id: 't-1', estatusMatch: 'descartada-manual' } });
+
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/descartar-manual')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(descartarManual).toHaveBeenCalledWith('t-1', expect.objectContaining({ _id: 'user-test' }));
+    expect(res.body.transferencia.estatusMatch).toBe('descartada-manual');
+  });
+
+  test('propaga el status code de un error de negocio (ej. ConflictError) a la respuesta', async () => {
+    const { ConflictError } = require('../../../shared/errors/AppError');
+    descartarManual.mockRejectedValue(new ConflictError('Esta transferencia ya tiene candidato(s) para revisar'));
+
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/descartar-manual')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);

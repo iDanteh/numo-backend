@@ -31,6 +31,7 @@ const {
 const CajaTransferencia                  = require('./CajaTransferencia.model');
 const { buscarCandidatos }               = require('./caja-transferencia-match.service');
 const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
+const { descartarManual }                = require('./caja-transferencia-descartar-manual.service');
 const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-pendiente.service');
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
@@ -364,6 +365,15 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
 router.post('/transferencias-cajas/:id/confirmar', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { movementIds } = req.body;
   const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
+  res.json(resultado);
+}));
+
+// POST /api/erp/transferencias-cajas/:id/descartar-manual — pedido explícito del usuario
+// 2026-09-10: descarta MANUALMENTE una transferencia 'pendiente' sin candidatos, cuando un
+// contador sabe (por fuera de este panel) que ya fue identificada. NUNCA vincula nada contra
+// Kore/CxC (a diferencia de /confirmar) — ver caja-transferencia-descartar-manual.service.js.
+router.post('/transferencias-cajas/:id/descartar-manual', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
+  const resultado = await descartarManual(req.params.id, req.user);
   res.json(resultado);
 }));
 
@@ -1288,10 +1298,45 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
 // propia (nunca apareció en la pila) o completamente revertido (su entrada fue cancelada)
 // simplemente no aparece en el mapa, equivalente al `null`/`0` de _montoSaldoLinkPorMovimiento
 // para efectos de sus llamadores (ambos casos llevan a desvincular).
-function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true) {
-  const conFormaPago = (raw0?.movimientos ?? []).filter(
+//
+// `referenciasConocidas` (2026-09-10, Kore agregó `movimientos[].id` a cada línea de su
+// kardex): Set de esos `id` que YA SABEMOS que corresponden a un abono revertido — viene de
+// `referencia` en el webhook de reversión (erp-reversion.service.js), que resultó ser
+// EXACTAMENTE el `id` de la línea de abono original que Kore revirtió (confirmado con caso
+// real del usuario, erpId 6a977a40b0b61300017367f8). Default Set vacío: preserva el
+// comportamiento viejo (cancelación por magnitud) para reversiones sin `referencia` conocido,
+// ya sea porque son anteriores a este cambio de Kore o porque no se pudo resolver.
+//
+// Por qué NO alcanza con solo "no apilar" el abono conocido: si se lo salta sin más, la
+// reversa sin tag que lo cancelaba sigue viva y, al no encontrar su pareja real en la pila,
+// puede terminar cancelando por CASUALIDAD DE MAGNITUD a otro abono legítimo con el mismo
+// monto (el mismo bug de fondo que este cambio busca eliminar, solo que desplazado). Por eso
+// la resolución por identidad pasa PRIMERO, en una pasada separada: el abono conocido Y la
+// primera reversa sin tag posterior que cancele exactamente su monto se excluyen los DOS del
+// pase cronológico principal — ninguno de los 2 llega a competir por la pila del resto.
+function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true, referenciasConocidas = new Set()) {
+  const todasLasLineas = (raw0?.movimientos ?? []).filter(
     m => Array.isArray(m.formasPago) && m.formasPago.some(incluirFormaPago),
   );
+
+  const excluidos = new Set(); // índices en `todasLasLineas` ya resueltos por identidad
+  for (let i = 0; i < todasLasLineas.length; i++) {
+    if (excluidos.has(i)) continue;
+    const m = todasLasLineas[i];
+    if (m?.id == null || !referenciasConocidas.has(String(m.id))) continue;
+    excluidos.add(i);
+    const monto = Math.abs(m.total ?? 0);
+    for (let j = i + 1; j < todasLasLineas.length; j++) {
+      if (excluidos.has(j)) continue;
+      const rev = todasLasLineas[j];
+      if (rev.formasPago.some(fp => _tieneTagIdentidadPropia(fp))) continue; // no es una reversa "libre"
+      if (Math.abs(Math.abs(rev.total ?? 0) - monto) < 0.01) {
+        excluidos.add(j);
+        break;
+      }
+    }
+  }
+  const conFormaPago = todasLasLineas.filter((_, i) => !excluidos.has(i));
 
   const pila = []; // { movIndex, monto } — monto siempre positivo, orden = orden de llegada
   for (const m of conFormaPago) {

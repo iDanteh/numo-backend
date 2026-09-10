@@ -2664,8 +2664,19 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   for (const cuenta of resultado) {
     const facturaKey = _facturaKeyDe(cuenta);
     const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+    // Ventas de OTRA sucursal (`cuenta.serieVenta !== centro`) cobradas aquí:
+    // desde 2026-09-09 ese caso lo cubre `construirMovimientosPuente`
+    // (bloque "Cobrador directo, sin factura" en cobros-sucursal-puente.service.js)
+    // como línea separada de "Cobro de otra sucursal" — no debe ADEMÁS
+    // fundirse aquí en el consolidado de Efectivo/Tarjeta como
+    // 'COBRO-SIN-FACTURA', o el mismo dinero se cuenta dos veces (caso real:
+    // 4 tickets de CEDIS/A0 cobrados en Puerto Escondido/O0, ver
+    // [[project_cobrador_directo_ppd_sin_factura_9sep]]). Esta función se
+    // queda solo con el caso genuino "vendido y cobrado en la MISMA
+    // sucursal, sin factura todavía".
     for (const cobro of (cuenta.cobros ?? [])) {
       if (cobro.claveCentro !== centro) continue;
+      if (cuenta.serieVenta && cuenta.serieVenta !== centro) continue;
       const fechaCobroMx = new Date(cobro.fecha);
       fechaCobroMx.setHours(fechaCobroMx.getHours() - 6);
       const diaCobro = fechaCobroMx.toISOString().slice(0, 10);

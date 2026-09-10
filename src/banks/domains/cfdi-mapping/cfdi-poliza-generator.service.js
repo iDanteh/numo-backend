@@ -2830,15 +2830,23 @@ async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fech
     ? await CFDI.find({ 'emisor.rfc': rfc, $or: orConditions })
         .select('serie folio fecha uuid receptor').lean()
     : [];
-  const datosFacturaPorKey = new Map(); // key -> { dia, uuid, nombreCliente }
+  // La colección CFDI puede tener MÁS DE UN documento para el mismo
+  // serie/folio (un "stub" incompleto sincronizado antes que el CFDI
+  // completo, mismo patrón confirmado 2026-08-17, caso real FILEMON
+  // A0-260801889) — bug real encontrado 2026-09-10, caso NOE ALAN FLORES
+  // SANCHEZ/F0-260900096: el stub sin `receptor.nombre` pisaba al documento
+  // completo, saliendo "CLIENTE NO IDENTIFICADO" aunque el CFDI real SÍ
+  // estaba sincronizado con su nombre. Se prefiere SIEMPRE el documento
+  // más completo (con `receptor.nombre`), y solo entre documentos
+  // igualmente completos se usa la fecha más temprana como desempate.
+  const datosFacturaPorKey = new Map(); // key -> { dia, uuid, nombreCliente, completo }
   for (const c of cfdisFactura) {
     const key = `${c.serie}|${c.folio}`;
     const dia = _diaMx(c.fecha);
+    const completo = !!c.receptor?.nombre;
     const actual = datosFacturaPorKey.get(key);
-    // Si hay más de un CFDI con el mismo serie/folio, se prefiere el de
-    // fecha más temprana (mismo criterio conservador que `_cobrosSinFacturaPorCentro`).
-    if (!actual || dia < actual.dia) {
-      datosFacturaPorKey.set(key, { dia, uuid: c.uuid ?? null, nombreCliente: c.receptor?.nombre ?? null });
+    if (!actual || (completo && !actual.completo) || (completo === actual.completo && dia < actual.dia)) {
+      datosFacturaPorKey.set(key, { dia, uuid: c.uuid ?? null, nombreCliente: c.receptor?.nombre ?? null, completo });
     }
   }
 

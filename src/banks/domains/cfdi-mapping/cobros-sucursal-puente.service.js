@@ -266,10 +266,58 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
     cuentasEscaneadas.push(...resultado);
   }
 
+  // Ventas canceladas cuyo saldo a favor ya se usó por completo en OTRO lado
+  // (confirmado con el usuario 2026-09-10, caso real Ferrocarril F0-260900757:
+  // se cobró $21.52, 5 min después se canceló completo vía CAC-078661
+  // generando un SF de $21.52, y 3 min después ese SF se usó completo
+  // — montoSobrante: 0 — en F0-260900760, que ya tiene su propia factura). El
+  // ticket cancelado no tiene nada que facturar — su dinero ya quedó
+  // atribuido a la venta que consumió el saldo — así que no debe aparecer en
+  // "pendientes por facturar". Mismo criterio que `devGeneradoPorVenta` en
+  // `_cobrosSinFacturaPorCentro` (cfdi-poliza-generator.service.js) pero
+  // INVERTIDO: aquí se descarta el monto que SÍ se resolvió por completo
+  // (disponible <= 0), no el que sigue disponible — para el consolidado de
+  // Efectivo el dinero sigue siendo real sin importar a qué venta se
+  // atribuya, pero para esta lista por-ticket sí importa cuál ticket
+  // específico necesita factura. `TIPO_MARCADORES` (BON/BCT/DEV/CAC) es el
+  // mismo marcador que usa el resto del archivo para este tipo de documento.
+  const canceladoResueltoPorVenta = new Map(); // ventaKey -> monto cancelado y ya usado en otro lado
+  if (cuentasEscaneadas.length) {
+    const paresVenta = [...new Map(
+      cuentasEscaneadas
+        .filter(c => c.serieVenta && c.folioVenta)
+        .map(c => [`${c.serieVenta}|${c.folioVenta}`, { serie: c.serieVenta, folio: c.folioVenta }]),
+    ).values()];
+    for (let i = 0; i < paresVenta.length; i += LOTE) {
+      const lote = paresVenta.slice(i, i + LOTE);
+      const resultadoSaldos = await obtenerSaldosFavor({
+        rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio),
+      });
+      for (const cuenta of resultadoSaldos) {
+        const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+        for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+          if (!TIPO_MARCADORES.includes((gen.serieOrigen ?? '').toUpperCase())) continue;
+          const montoUsado = (gen.usos ?? []).reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+          const disponible = Math.max(0, (Math.abs(Number(gen.monto)) || 0) - montoUsado);
+          if (disponible > 0.01) continue; // sigue como SF vivo, no se puede descartar todavía
+          const resuelto = Math.abs(Number(gen.monto)) || 0;
+          if (resuelto <= 0) continue;
+          canceladoResueltoPorVenta.set(ventaKey, (canceladoResueltoPorVenta.get(ventaKey) ?? 0) + resuelto);
+        }
+      }
+    }
+  }
+
   const pendientes = [];
   for (const cuenta of cuentasEscaneadas) {
     if (cuenta.serieFactura && cuenta.folioFactura) continue; // ya tiene factura — no es un pendiente
-    for (const cobro of (cuenta.cobros ?? [])) {
+    const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+    let cancelResRestante = canceladoResueltoPorVenta.get(ventaKey) ?? 0;
+    // Se resta empezando por el cobro MÁS RECIENTE (mismo criterio que
+    // `_cobrosSinFacturaPorCentro`) — el más reciente es normalmente el que
+    // la cancelación revirtió.
+    const cobrosOrdenados = [...(cuenta.cobros ?? [])].sort((a, b) => new Date(b.fecha ?? 0) - new Date(a.fecha ?? 0));
+    for (const cobro of cobrosOrdenados) {
       const origenPend = (cobro.serieOrigen ?? '').toUpperCase();
       // 'APS'/'MIS' se aceptan igual que en cfdi-poliza-generator.service.js
       // (2026-08-20, confirmado contra el Reporte de Movimientos en Cajas
@@ -278,10 +326,17 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
       if (origenPend !== 'APS' && origenPend !== 'MIS' && !SERIES_CON_AUTH.includes(origenPend)) continue;
       const fechaCobro = cobro.fecha ? new Date(cobro.fecha) : null;
       if (!fechaCobro || fechaCobro < fechaDesde || fechaCobro > fechaHasta) continue;
+      let monto = Math.abs(Number(cobro.monto) || 0);
+      if (cancelResRestante > 0) {
+        const reduccion = Math.min(monto, cancelResRestante);
+        monto -= reduccion;
+        cancelResRestante -= reduccion;
+      }
+      if (monto <= 0.01) continue; // se canceló por completo y ya se usó en otro lado
       pendientes.push({
         serie:       cuenta.serieVenta ?? serieDelDia,
         folio:       cuenta.folioVenta,
-        monto:       Math.abs(Number(cobro.monto) || 0),
+        monto,
         formasPago:  (cobro.formasPago ?? []).map(fp => ({ nombre: fp.nombre ?? fp.claveSat ?? null, claveSat: fp.claveSat ?? null, monto: Number(fp.monto) || 0 })),
         fecha:       cobro.fecha,
         folioOrigen: cobro.folioOrigen ?? null,
@@ -1499,4 +1554,4 @@ async function construirMovimientosPuente({
   };
 }
 
-module.exports = { construirMovimientosPuente, _extraerDocumentosRelacionados, _encolarCobroSucursalPendiente, _sincronizarCobroSucursalPendiente };
+module.exports = { construirMovimientosPuente, _extraerDocumentosRelacionados, _encolarCobroSucursalPendiente, _sincronizarCobroSucursalPendiente, _detectarPendientesPorFacturar };

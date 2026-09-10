@@ -831,6 +831,27 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // `TOLERANCIA_DIAS_FACTURACION_DIFERIDA` (el vínculo ya es exacto, no una
   // adivinanza por fecha).
   if (ticketsPropioPorClave.size) {
+    const ticketsPropioVentaKeys = new Set(
+      [...ticketsPropioPorClave.values()].map(t => `${t.serie}|${t.folio}`),
+    );
+    // Bug real 2026-09-10 (caso SD SOLUTIONS, F0-260900061 timbrada
+    // 04-sep pero su ticket F0-260900334 cobrado y con SF usado el 03-sep):
+    // `_viaTicketPropio` solo se marcaba en las cuentas traídas por el
+    // fallback de abajo (`faltantes`) — si el camino "por centro" YA había
+    // traído la cuenta del ticket (por pura coincidencia de rango de
+    // fechas, sin saber que es un "ticket propio"), esa cuenta se quedaba
+    // SIN la bandera, y el filtro de mismo-día (`diaCfdi === _diaMx(u.fecha)`
+    // más abajo) descartaba el uso de SF por completo — ni el día del
+    // cobro real (no tiene la factura) ni el día de la factura (el cobro
+    // real es de OTRO día) lo mostraban nunca. Se marca la bandera en
+    // CUALQUIER cuenta ya presente cuyo serie/folio sea un ticket propio
+    // conocido, sin importar qué camino la trajo.
+    for (const c of resultadosAlmacen) {
+      if (ticketsPropioVentaKeys.has(`${c.serieVenta}|${c.folioVenta}`)) c._viaTicketPropio = true;
+    }
+    for (const c of resultadosSaldos) {
+      if (ticketsPropioVentaKeys.has(`${c.serieVenta}|${c.folioVenta}`)) c._viaTicketPropio = true;
+    }
     const yaPresentes = new Set(resultadosAlmacen.map(c => `${c.serieVenta}|${c.folioVenta}`));
     const faltantes = [...ticketsPropioPorClave.values()]
       .filter(t => !yaPresentes.has(`${t.serie}|${t.folio}`));

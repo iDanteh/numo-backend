@@ -122,6 +122,18 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.JSONB,
     allowNull: true,
   },
+  // "DEPOSITO EN EFECTIVO" sin conciliar (dinero depositado directo en
+  // sucursal bancaria, pero sin número de autorización/referencia que
+  // permita ligarlo a un BankMovement real todavía) — confirmado con el
+  // usuario 2026-09-10: NO se contabiliza en ningún renglón de la póliza
+  // (se acepta el asiento desbalanceado, mismo criterio que "Venta Sin
+  // Cobro"), solo se muestra como informativo en la hoja "Desglose
+  // Consolidado", en su propio apartado. Ver `_esDepositoEfectivo`
+  // (cfdi-mapping.service.js) y `_construirWorkbookPoliza` (poliza.service.js).
+  depositosEfectivoNoConciliados: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
   // Snapshot de los pares BBVA/contraparte (banco, folio, fecha, monto) que originaron
   // esta póliza — SOLO tipo='T' (Traspasos entre cuentas propias). PolizaMovimiento
   // guarda cuentaId (FK opaca), no el nombre del banco, así que sin este snapshot no

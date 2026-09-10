@@ -7,6 +7,7 @@ const { asyncHandler }            = require('../../shared/middleware/error-handl
 const { verifyKoreApiKey }        = require('../../../shared/middleware/kore-api-key-auth');
 const service                     = require('./collection-request.service');
 const indicadoresService          = require('./collection-request-indicadores.service');
+const anticipoGeneradoService     = require('./anticipo-generado.service');
 
 const router = express.Router();
 
@@ -169,6 +170,26 @@ router.get('/erp/:solicitudIdErp', verifyKoreApiKey, asyncHandler(async (req, re
 // cancelación, para mostrar "Cancelado por el usuario X" en la bandeja.
 router.post('/erp/:solicitudIdErp/cancelar', verifyKoreApiKey, asyncHandler(async (req, res) => {
   res.json(await service.cancelarPorErp(req.params.solicitudIdErp, req.body));
+}));
+
+// POST /api/collection-requests/erp/anticipos-generados — Kore avisa que generó
+// un anticipo por sobrepago de una CxC cobrada vía Solicitudes de Cobro (proceso
+// asíncrono del lado de Kore). Mismo mecanismo de autenticación que el resto de
+// las llamadas de Kore en este router (API key). Body: el objeto "Cuenta" del
+// anticipo tal cual Kore ya lo arma (id, serie, folio, serieExterna,
+// folioExterno, total, fechaCreacion, personaId, nombrePersona, anotacion) MÁS
+// `origenCuentaId` — el `id` de la CxC que generó el excedente (Kore no conoce
+// el solicitudIdErp de Numo, pero SIEMPRE tiene a mano el id de esa CxC). Debe
+// ir antes de /:id para que Express no intente matchear "erp" como un _id.
+router.post('/erp/anticipos-generados', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  res.status(201).json(await anticipoGeneradoService.registrarAnticipoGenerado(req.body));
+}));
+
+// GET /api/collection-requests/anticipos-generados — historial/trazabilidad de
+// anticipos generados por sobrepago, para el tab "Anticipos" del panel. Mismo
+// permiso que la bandeja principal (collections:read). Debe ir antes de /:id.
+router.get('/anticipos-generados', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
+  res.json(await anticipoGeneradoService.listAnticiposGenerados(req.query));
 }));
 
 // GET /api/collection-requests — bandeja para revisión (cobranza/contabilidad/admin)

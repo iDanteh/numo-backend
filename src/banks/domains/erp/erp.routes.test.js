@@ -80,6 +80,7 @@ jest.mock('../../../visor/models/CFDI', () => ({
 jest.mock('./CajaTransferencia.model');
 jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatos: jest.fn() }));
 jest.mock('./caja-transferencia-confirm.service', () => ({ confirmarMatch: jest.fn() }));
+jest.mock('./caja-transferencia-descartar-manual.service', () => ({ descartarManual: jest.fn() }));
 jest.mock('./caja-transferencia-sync.service', () => ({ sincronizarTransferenciasCajasManual: jest.fn(), init: jest.fn() }));
 jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpay: jest.fn() }));
 
@@ -93,6 +94,7 @@ const CFDI         = require('../../../visor/models/CFDI');
 const CajaTransferencia = require('./CajaTransferencia.model');
 const { buscarCandidatos } = require('./caja-transferencia-match.service');
 const { confirmarMatch }   = require('./caja-transferencia-confirm.service');
+const { descartarManual }  = require('./caja-transferencia-descartar-manual.service');
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
@@ -990,6 +992,52 @@ describe('POST /transferencias-cajas/:id/confirmar', () => {
     const res = await request(app)
       .post('/transferencias-cajas/t-1/confirmar')
       .send({ movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// POST /transferencias-cajas/:id/descartar-manual — pedido explícito del usuario
+// 2026-09-10: descarta manualmente una transferencia 'pendiente' sin candidatos. Mismo
+// permiso que el resto de la sección (banks:transferencias-caja, admin-only por ahora).
+describe('POST /transferencias-cajas/:id/descartar-manual', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:transferencias-caja', async () => {
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/descartar-manual')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(descartarManual).not.toHaveBeenCalled();
+  });
+
+  test('delega en descartarManual con el id y el usuario autenticado', async () => {
+    descartarManual.mockResolvedValue({ transferencia: { _id: 't-1', estatusMatch: 'descartada-manual' } });
+
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/descartar-manual')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(descartarManual).toHaveBeenCalledWith('t-1', expect.objectContaining({ _id: 'user-test' }));
+    expect(res.body.transferencia.estatusMatch).toBe('descartada-manual');
+  });
+
+  test('propaga el status code de un error de negocio (ej. ConflictError) a la respuesta', async () => {
+    const { ConflictError } = require('../../../shared/errors/AppError');
+    descartarManual.mockRejectedValue(new ConflictError('Esta transferencia ya tiene candidato(s) para revisar'));
+
+    const res = await request(app)
+      .post('/transferencias-cajas/t-1/descartar-manual')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(409);

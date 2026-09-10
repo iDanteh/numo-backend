@@ -308,6 +308,20 @@ async function listarFormasPago(koreToken) {
 // espera corta antes de darlo por bloqueo real/definitivo.
 const CUENTA_BLOQUEADA_RETRY_DELAY_MS = 2000;
 
+// Caso real reportado por el usuario 2026-09-10: al aplicar una solicitud de cobro
+// "grande", Kore tardó más de 15s en responder al PUT de aplicar (el servidor de
+// Numo seguía atendiendo otras requests normalmente en el medio — no fue un
+// cuelgue de Numo, Kore tardó de verdad). Un timeout acá NUNCA se reintenta a
+// ciegas (ver INCONSISTENCIA-POST-KORE en collection-request.service.js — no hay
+// forma de saber si Kore ya aplicó el cobro antes de perder la respuesta), así que
+// cada timeout de este tipo cuesta una revisión manual completa. 15s era un valor
+// compartido con llamadas mucho más livianas (bancos, conceptos) — no pensado
+// específicamente para "aplicar", que es la operación irreversible más pesada de
+// todo el flujo. Se sube a 60s (pedido explícito del usuario, 2026-09-10) para dar
+// margen real antes de rendirse; sigue aplicando tanto al intento inicial como al
+// reintento por condición de carrera de abajo (mismo `intentar()`).
+const OPERACION_APLICAR_TIMEOUT_MS = 60000;
+
 function _delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -321,7 +335,7 @@ async function _operacionConReintento(method, url, payload, koreToken, logLabel,
   const intentar = () => axios({
     method, url, data: payload,
     headers: { Authorization: `Bearer ${koreToken}`, 'Content-Type': 'application/json' },
-    timeout: 15000,
+    timeout: OPERACION_APLICAR_TIMEOUT_MS,
   });
   try {
     const r = await intentar();

@@ -31,6 +31,7 @@ const {
 const CajaTransferencia                  = require('./CajaTransferencia.model');
 const { buscarCandidatos }               = require('./caja-transferencia-match.service');
 const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
+const { descartarManual }                = require('./caja-transferencia-descartar-manual.service');
 const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-pendiente.service');
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
@@ -364,6 +365,15 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
 router.post('/transferencias-cajas/:id/confirmar', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
   const { movementIds } = req.body;
   const resultado = await confirmarMatch(req.params.id, movementIds, req.user);
+  res.json(resultado);
+}));
+
+// POST /api/erp/transferencias-cajas/:id/descartar-manual — pedido explícito del usuario
+// 2026-09-10: descarta MANUALMENTE una transferencia 'pendiente' sin candidatos, cuando un
+// contador sabe (por fuera de este panel) que ya fue identificada. NUNCA vincula nada contra
+// Kore/CxC (a diferencia de /confirmar) — ver caja-transferencia-descartar-manual.service.js.
+router.post('/transferencias-cajas/:id/descartar-manual', authenticate, permit(PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA), asyncHandler(async (req, res) => {
+  const resultado = await descartarManual(req.params.id, req.user);
   res.json(resultado);
 }));
 

@@ -4007,8 +4007,14 @@ async function siguienteFolioContpaq(id) {
   // varios movimientos del mismo centro puede repetirse en el resultado, pero
   // solo importa el MAX, así que los duplicados son inofensivos (no hace
   // falta GROUP BY).
+  // Excluye 'cancelada' (confirmado con el usuario 2026-09-10): al cancelar
+  // la póliza más reciente de un folio, ese número queda libre — la
+  // siguiente póliza debe volver a sugerirlo en vez de saltárselo. Solo
+  // "libera" folios que quedaron al tope (si 1204/1205 ya existen vigentes y
+  // se cancela 1203, el máximo sigue siendo 1205 → siguiente 1206, 1203
+  // sigue siendo un hueco intermedio).
   const polizasDelPeriodo = await Poliza.findAll({
-    where:      { tipo: poliza.tipo, rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo },
+    where:      { tipo: poliza.tipo, rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo, estado: { [Op.ne]: 'cancelada' } },
     attributes: ['id', 'contpaqFolioContado', 'contpaqFolioCredito'],
     include:    [{
       model:      PolizaMovimiento,

@@ -372,15 +372,26 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
   let calculosPorMovimiento = null;
   let calculosBancarioPorMovimiento = null;
   if (raw0) {
+    // 2026-09-10 (Kore agregó `movimientos[].id` a su kardex): `referencia` del webhook actual,
+    // más el `referencia` de cualquier ErpReversion PREVIA de este mismo erpId, son `id`s de
+    // líneas de abono que YA SABEMOS que fueron revertidas — se le pasan a
+    // _aportesPorErpIdCronologico para que las salte por completo en vez de dejar que una
+    // reversa sin tag las cancele por coincidencia de magnitud (la fuente de la atribución
+    // cruzada/"Atribución ambigua"). Reversiones sin ningún `referencia` conocido (anteriores
+    // a este cambio de Kore) siguen con el comportamiento viejo, sin cambios.
+    const referenciasPrevias = await ErpReversion.find({ erpId, referencia: { $ne: null } }).distinct('referencia');
+    const referenciasConocidas = new Set(referenciasPrevias);
+    if (referencia) referenciasConocidas.add(referencia);
+
     const esHumanoPorMov = movs.map(mov => erpRoutes._erpIdIdentificadoPorHumano(mov.identificadoPor, erpId));
     const movsHumanos    = movs.filter((mov, i) => esHumanoPorMov[i]);
-    const aportesHumanos = erpRoutes._aportesPorErpIdCronologico(raw0, movsHumanos);
+    const aportesHumanos = erpRoutes._aportesPorErpIdCronologico(raw0, movsHumanos, () => true, referenciasConocidas);
     // 2026-08-21: mismo pase cronológico compartido, filtrado a formas de pago bancarias —
     // alimenta calculadoBancarioPrevio (ver _ajustarLinkTrasReversion) para que `saldoPagado`
     // (bancario-únicamente, lo que muestra el dropdown "CxC vinculadas") no vuelva a caer en
     // el cálculo aislado ambiguo.
     const aportesHumanosBancario = erpRoutes._aportesPorErpIdCronologico(
-      raw0, movsHumanos, fp => erpRoutes._esFormaPagoBancariaKore(fp.nombreFormaPago),
+      raw0, movsHumanos, fp => erpRoutes._esFormaPagoBancariaKore(fp.nombreFormaPago), referenciasConocidas,
     );
     calculosPorMovimiento = movs.map((mov, i) => {
       if (!esHumanoPorMov[i]) return erpRoutes._montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);

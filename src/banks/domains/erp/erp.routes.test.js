@@ -267,6 +267,47 @@ describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruza
     expect(resultado.get(0) + resultado.get(1)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
   });
 
+  // 2026-09-10 (Kore agregó `movimientos[].id`, y `referencia` del webhook de reversión
+  // resultó ser EXACTAMENTE ese `id` — caso real del usuario, erpId 6a977a40b0b61300017367f8):
+  // sin `referenciasConocidas`, una reversa sin tag SIEMPRE cancela la entrada MÁS RECIENTE
+  // que empata en magnitud (ver test de folioExterno 260800166 arriba) — pero eso es una
+  // suposición, no una certeza. Este caso prueba que, cuando Kore SÍ nos dice con certeza cuál
+  // abono revirtió (por su `id` real, no por magnitud), el resultado es correcto aunque sea
+  // el abono MÁS VIEJO el que se revirtió — algo que la heurística de magnitud sola
+  // adivinaría MAL (cancelaría el más nuevo, BANCOMER quedaría en 0 en vez de AMEX).
+  test('con referenciasConocidas: resuelve por identidad real aunque 2 movimientos empaten en magnitud, incluso si el revertido es el MÁS VIEJO', () => {
+    const raw0 = {
+      total: 200, saldoActual: 100,
+      movimientos: [
+        { serie: 'ABO', folio: '1', id: 'abono-bancomer', fecha: '2026-09-10T10:00:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '039033' }, { nombre: 'Numo', valor: '18411758' }, { nombre: 'Banco', valor: 'BANCOMER' },
+          ] }] },
+        { serie: 'ABO', folio: '2', id: 'abono-amex', fecha: '2026-09-10T10:01:00Z', total: -100,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100, adicionales: [
+            { nombre: 'Aut', valor: '040727' }, { nombre: 'Numo', valor: '477911' }, { nombre: 'Banco', valor: 'American Express' },
+          ] }] },
+        { serie: 'REV ABO', folio: '3', fecha: '2026-09-10T10:05:00Z', total: 100, // sin adicionales — Kore nunca tagea las reversas
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 100 }] },
+      ],
+    };
+    const movBancomer = { numeroAutorizacion: '18411758', folio: 'X' };
+    const movAmex      = { numeroAutorizacion: '477911',   folio: 'Y' };
+
+    // Sin referenciasConocidas: la heurística de magnitud cancela el MÁS RECIENTE (Amex) —
+    // en este caso sería la atribución EQUIVOCADA (el real revertido fue Bancomer).
+    const sinReferencia = router._aportesPorErpIdCronologico(raw0, [movBancomer, movAmex]);
+    expect(sinReferencia.get(0)).toBe(100); // Bancomer "sobrevive" por casualidad de orden
+    expect(sinReferencia.has(1)).toBe(false); // Amex cancelado — INCORRECTO en este escenario
+
+    // Con referenciasConocidas={'abono-bancomer'}: se sabe con certeza que Bancomer fue el
+    // revertido — el resultado ahora es el correcto, sin importar el orden cronológico.
+    const referenciasConocidas = new Set(['abono-bancomer']);
+    const conReferencia = router._aportesPorErpIdCronologico(raw0, [movBancomer, movAmex], () => true, referenciasConocidas);
+    expect(conReferencia.has(0)).toBe(false); // Bancomer: revertido, correctamente excluido
+    expect(conReferencia.get(1)).toBe(100);   // Amex: su abono nunca se tocó, sigue vigente
+  });
+
   test('reversa cuyo monto no coincide con NINGUNA entrada de la pila se ignora (no se inventa a qué abono pertenece)', () => {
     const raw0 = {
       total: 200, saldoActual: 100,

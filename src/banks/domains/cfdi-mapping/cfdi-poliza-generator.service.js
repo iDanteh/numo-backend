@@ -2809,6 +2809,25 @@ async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fech
     return [];
   }
 
+  // SF-OCULTO (confirmado con el usuario, caso real F0-260900222→CAC-078425
+  // generado 08:09am, usado 09:00am por F0-260900236, mismo almacén F0,
+  // mismo día 3-sep, uso completo): la regla ya establecida de "se genera y
+  // se ocupa el mismo día y mismo almacén, completo → sigue oculto" aplica
+  // AQUÍ IGUAL — no importa que la FACTURA consumidora se timbre otro día,
+  // lo que decide oculto es el par generación/uso, no la factura. Sin este
+  // filtro, `_sfUsadoAntesDeFacturarPorCentro` mostraba como línea visible
+  // un SF que nunca debió verse en ningún lado (bug real 2026-09-10).
+  // `resultadosSaldos` (mismo centro+día que ya se consultó arriba) trae
+  // TODAS las generaciones de este almacén ese rango — no hace falta
+  // ninguna consulta extra.
+  const diaGenPorMarcador = new Map(); // `${serieOrigen}|${folioOrigen}` -> día (México) de la generación
+  for (const cuenta of resultadosSaldos) {
+    for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+      const marcador = `${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`;
+      diaGenPorMarcador.set(marcador, _diaMx(gen.fecha));
+    }
+  }
+
   // Usos reales cuyo día cae en este rango — sin importar el día de la
   // factura que los consume (eso se decide después).
   const candidatosUso = [];
@@ -2816,6 +2835,9 @@ async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fech
     for (const u of (cuenta.saldosFavorUsados ?? [])) {
       const diaUso = _diaMx(u.fecha);
       if (!diaUso || diaUso < fechaInicio || diaUso > fechaFin) continue;
+      const marcador = `${(u.serieOrigen ?? '').toUpperCase()}|${u.folioOrigen ?? ''}`;
+      const diaGen = diaGenPorMarcador.get(marcador);
+      if (diaGen && diaGen === diaUso) continue; // oculto: mismo día/almacén, no se muestra
       candidatosUso.push({ cuenta, uso: u });
     }
   }

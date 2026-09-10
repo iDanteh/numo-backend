@@ -1484,6 +1484,14 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     const serieParaDetalle = (m.serieVentaTicket && m.folioVentaTicket)
       ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
       : (m.serie || '');
+    // Serie-folio del ticket dentro de la leyenda misma (confirmado con el
+    // usuario 2026-09-10, caso real Ferrocarril F0-260900757) — antes solo
+    // vivía en la columna aparte "CFDI (Serie-Folio)" de "Desglose
+    // Consolidado"; ahora también queda en el texto de la nota para no
+    // depender de esa columna al leerlo.
+    const notaConSerie = (notaAjusteSinCfdi && serieParaDetalle)
+      ? `${notaAjusteSinCfdi} - ${serieParaDetalle}`
+      : notaAjusteSinCfdi;
     const bancario    = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
     // Dato POR TICKET (bancoRealPorTicket) — se calcula ANTES del gate y se
     // reutiliza más abajo (ya no se recalcula dentro del bloque de detalle).
@@ -1661,7 +1669,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       if (!gt._debeFijoBanco) gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaAjusteSinCfdi });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaConSerie });
       continue;
     }
 
@@ -1707,7 +1715,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', nota: notaAjusteSinCfdi });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', nota: notaConSerie });
       continue;
     }
 
@@ -1726,7 +1734,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // Se guarda qué CFDI aportó cada monto — no va en la póliza de CONTPAQ
     // (esa línea sigue sin serie/folio, sigue siendo un total agregado), pero
     // permite armar la hoja de desglose para poder rastrear el detalle.
-    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, nota: notaAjusteSinCfdi });
+    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, nota: notaConSerie });
   }
 
   // Efectivo → Tarjeta → resto, siempre en ese orden dentro de los cargos

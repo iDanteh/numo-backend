@@ -45,28 +45,36 @@ beforeEach(() => {
 });
 
 describe('exportMovements — filtro "Fecha de importación" (fechaImportacionInicio/Fin -> createdAt)', () => {
-  test('con inicio Y fin: filter.createdAt.$gte/$lte quedan seteados (inicio = medianoche UTC, fin = 23:59:59.999Z)', async () => {
+  // FIX 2026-09-11 (bug real reportado por el usuario): antes estos límites eran UTC
+  // puro (`new Date('2026-09-01')` = medianoche UTC, `T23:59:59.999Z` = fin de día
+  // UTC) — un movimiento importado entre las 18:00 y 23:59 hora de México (que ya
+  // cae en las 00:00-05:59 UTC del día calendario SIGUIENTE) quedaba contado en el
+  // día equivocado. Ahora usan _inicioDiaMx/_finDiaMx (medianoche/fin de día de
+  // México, offset fijo UTC-6, mismo criterio que _medianocheMx en
+  // collection-request-indicadores.service.js): inicio = "T06:00:00.000Z" del día
+  // pedido, fin = "T05:59:59.999Z" del día SIGUIENTE.
+  test('con inicio Y fin: filter.createdAt.$gte/$lte quedan en medianoche/fin de día de México (no UTC puro)', async () => {
     await exportMovements({ fechaImportacionInicio: '2026-09-01', fechaImportacionFin: '2026-09-05' });
 
     const filtroUsado = BankMovement.find.mock.calls[0][0];
     expect(filtroUsado.createdAt).toEqual({
-      $gte: new Date('2026-09-01T00:00:00.000Z'),
-      $lte: new Date('2026-09-05T23:59:59.999Z'),
+      $gte: new Date('2026-09-01T06:00:00.000Z'),
+      $lte: new Date('2026-09-06T05:59:59.999Z'),
     });
   });
 
-  test('solo fechaImportacionInicio: únicamente $gte queda en el filtro (sin $lte)', async () => {
+  test('solo fechaImportacionInicio: únicamente $gte queda en el filtro (medianoche MX, sin $lte)', async () => {
     await exportMovements({ fechaImportacionInicio: '2026-09-01' });
 
     const filtroUsado = BankMovement.find.mock.calls[0][0];
-    expect(filtroUsado.createdAt).toEqual({ $gte: new Date('2026-09-01T00:00:00.000Z') });
+    expect(filtroUsado.createdAt).toEqual({ $gte: new Date('2026-09-01T06:00:00.000Z') });
   });
 
-  test('solo fechaImportacionFin: únicamente $lte queda en el filtro (sin $gte)', async () => {
+  test('solo fechaImportacionFin: únicamente $lte queda en el filtro (fin de día MX, sin $gte)', async () => {
     await exportMovements({ fechaImportacionFin: '2026-09-05' });
 
     const filtroUsado = BankMovement.find.mock.calls[0][0];
-    expect(filtroUsado.createdAt).toEqual({ $lte: new Date('2026-09-05T23:59:59.999Z') });
+    expect(filtroUsado.createdAt).toEqual({ $lte: new Date('2026-09-06T05:59:59.999Z') });
   });
 
   test('ambos como string vacío (\'\'): NO se agrega la llave createdAt al filtro (comportamiento real: \'\' es falsy, el bloque completo se salta)', async () => {
@@ -74,6 +82,24 @@ describe('exportMovements — filtro "Fecha de importación" (fechaImportacionIn
 
     const filtroUsado = BankMovement.find.mock.calls[0][0];
     expect(filtroUsado.createdAt).toBeUndefined();
+  });
+
+  test('REGRESIÓN bug real: movimiento importado a las 19:00 hora MX (2026-09-10) — createdAt UTC ya es 2026-09-11T01:00:00.000Z — cae en el día MX 10, NO en el 11', async () => {
+    // Con el bug viejo (UTC puro), un filtro de "10-sep" ($lte=2026-09-10T23:59:59.999Z)
+    // NO incluía este createdAt (2026-09-11T01:00:00.000Z queda fuera) — el movimiento
+    // solo aparecía si el usuario filtraba "11-sep", día calendario equivocado en MX.
+    const filtroDia10 = { fechaImportacionInicio: '2026-09-10', fechaImportacionFin: '2026-09-10' };
+    await exportMovements(filtroDia10);
+    const { $gte, $lte } = BankMovement.find.mock.calls[0][0].createdAt;
+
+    const createdAtReal = new Date('2026-09-11T01:00:00.000Z'); // 19:00 hora MX del 10-sep
+    expect(createdAtReal.getTime()).toBeGreaterThanOrEqual($gte.getTime());
+    expect(createdAtReal.getTime()).toBeLessThanOrEqual($lte.getTime());
+
+    // Y el día MX 11 (filtro siguiente) YA NO lo incluye — el rango no se solapa.
+    await exportMovements({ fechaImportacionInicio: '2026-09-11', fechaImportacionFin: '2026-09-11' });
+    const { $gte: gte11 } = BankMovement.find.mock.calls[1][0].createdAt;
+    expect(createdAtReal.getTime()).toBeLessThan(gte11.getTime());
   });
 });
 

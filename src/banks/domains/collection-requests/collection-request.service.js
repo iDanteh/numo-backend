@@ -778,16 +778,28 @@ async function identificar(id, body, user) {
   // resolver las solicitudes generadas anteriormente". Todo o nada: si Kore
   // rechaza este aviso, no se aplica el cobro (paso 5) ni se persiste nada en
   // Numo.
+  let yaAplicadoEnKore = false;
   try {
     const tokenRevisor = await koreCaja.obtenerTokenKore(user._id);
     const avisoResult = await koreCaja.actualizarEstatusSolicitud(tokenRevisor, cr.solicitudIdErp, 'APROBADO', 'Cobro conciliado y aplicado en Numo');
     console.log(`[collection-requests] identificar ${id}: Kore confirmó APROBADO para solicitudIdErp=${cr.solicitudIdErp} →`, JSON.stringify(avisoResult));
   } catch (err) {
-    if (koreCaja.esErrorYaEnEstatus(err, 'APROBADO')) {
+    const estatusReal = koreCaja.estatusActualDeErrorKore(err);
+    if (estatusReal === 'APROBADO') {
       // Reintento sobre una solicitud que un intento anterior ya dejó
       // APROBADO en Kore, pero que no se persistió en Numo porque el cobro
       // (paso 5) falló en ese intento previo — no es un error real, se sigue.
       console.warn(`[collection-requests] identificar ${id}: Kore ya tenía solicitudIdErp=${cr.solicitudIdErp} en APROBADO (reintento) — se continúa con el cobro.`);
+    } else if (estatusReal === 'APLICADO') {
+      // Kore YA aplicó el cobro real en un intento anterior — lo que falló
+      // fue el guardado posterior en Numo (o el propio aviso de este
+      // intento llegó tarde), no el cobro en sí. No hay que volver a avisar
+      // ni volver a aplicar (duplicaría el cobro del lado de Kore, que
+      // ACUMULA sobre saldos existentes) — solo reconciliar: persistir en
+      // Numo el/los movimiento(s) que el usuario ya eligió en esta llamada,
+      // saltando los pasos 5 y 6 (resolución de banco + aplicar cobro).
+      console.warn(`[collection-requests] identificar ${id}: Kore ya tiene solicitudIdErp=${cr.solicitudIdErp} en APLICADO — se reconcilia sin reaplicar el cobro.`);
+      yaAplicadoEnKore = true;
     } else if (err instanceof koreCaja.KoreCajaError) {
       throw new BadRequestError(`No se pudo notificar el estatus a Kore: ${err.message}`);
     } else {
@@ -795,237 +807,245 @@ async function identificar(id, body, user) {
     }
   }
 
-  // 5. BancoID — igual criterio que _matchBancoDefault() en cobro-panel.component.ts
-  // (panel manual): en un inicio solo se mandaba para claveSAT '03' (transferencia).
-  // Acá no hay un humano confirmando el banco en pantalla antes de aplicar (a
-  // diferencia del panel manual), pero el usuario confirmó (2026-07-28) que igual
-  // quiere el mismo fallback: si el banco del movimiento no matchea ningún banco
-  // del catálogo de Kore, se manda bancos[0] (el primero del catálogo) en vez de
-  // dejar el cobro sin BancoID. Con varios movimientos, cada uno puede
-  // corresponder a un banco distinto (ej. transferencia BBVA + otra Santander) —
-  // el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los catálogos
-  // (formasPagoKore/bancosKore) se piden UNA sola vez, no por movimiento. Todo o
-  // nada: si Kore rechaza cualquiera de los 2 catálogos, no se aplica el cobro
-  // (mismo criterio que el resto de la función).
-  //
-  // 2026-09-01 (pedido explícito del usuario, caso real: Cheque en Bancomer +
-  // Transferencia en Banco Azteca en la misma solicitud): bancoDefaultPorMovId ya
-  // se resolvía por movimiento para TODOS los movimientos de la solicitud (el
-  // `for` de abajo nunca filtró por tipo de forma de pago) — el dato correcto ya
-  // estaba disponible, solo no se aplicaba al payload de Cheque/Depósito en
-  // efectivo por el gate de abajo (ver datosAdicionalesPorFormaPago). Se extendió
-  // el gate para reusar el MISMO bancoDefaultPorMovId ya calculado en Cheque y
-  // Depósito en efectivo — ambos tienen un depósito bancario real detrás, igual
-  // que transferencia, así que la misma necesidad aplica. SIN CONFIRMAR todavía
-  // contra Kore real si su catálogo acepta BancoID para estos 2 tipos (mismo
-  // riesgo que ya se vio con "Num Recibo" para Cheque, rechazado en su momento) —
-  // probar antes de dar por buena esta extensión.
-  const bancoDefaultPorMovId = new Map();
-  const formaPagoRequiereBanco = new Map();
-  // Depósito en efectivo no tiene claveSAT propia (Kore la reporta como Efectivo, '01'),
-  // así que se identifica por NOMBRE — mismo criterio ya usado por
-  // _esFormaPagoBancariaKore() en formas-pago-cxc.service.js.
-  const formaPagoEsDepositoEfectivo = new Map();
-  const _esDepositoEfectivoKore = (nombreFormaPago) => /DEPOSITO.*EFECTIVO/.test(
-    String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
-  );
-  // 2026-08-28 (pedido explícito del usuario) — Cheque, mismo criterio de detección por
-  // nombre que depósito en efectivo (tampoco tiene claveSAT propia distintiva). Regex
-  // amplio a propósito (sin anclar "NOMINATIVO" ni nada más) para tolerar variantes del
-  // nombre en el catálogo de Kore, mismo espíritu que el resto de estos matches.
-  const formaPagoEsCheque = new Map();
-  const _esChequeKore = (nombreFormaPago) => /CHEQUE/.test(
-    String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
-  );
-  try {
-    const formasPagoKore = await koreCaja.listarFormasPago(koreToken);
-    for (const f of formasPagoKore) {
-      formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
-      formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
-      formaPagoEsCheque.set(String(f.id), _esChequeKore(f.nombre));
-    }
-    // 2026-09-01: además de transferencia, Cheque y Depósito en efectivo también
-    // reusan bancoDefaultPorMovId ahora (ver comentario arriba) — el catálogo de
-    // bancos se pide si CUALQUIERA de los 3 tipos está presente en la solicitud.
-    const algunaFormaNecesitaBanco = cr.formasPago.some(f =>
-      formaPagoRequiereBanco.get(f.formaPagoId) || formaPagoEsCheque.get(f.formaPagoId) || formaPagoEsDepositoEfectivo.get(f.formaPagoId));
-    if (algunaFormaNecesitaBanco) {
-      const bancosKore = await koreCaja.listarBancos(koreToken);
-      for (const movDelGrupo of movsOrdenados) {
-        bancoDefaultPorMovId.set(String(movDelGrupo._id), matchBancoDefault(bancosKore, movDelGrupo.banco));
-      }
-    }
-  } catch (err) {
-    if (err instanceof koreCaja.KoreCajaError) {
-      throw new BadRequestError(`No se pudo resolver el banco para aplicar el cobro: ${err.message}`);
-    }
-    throw err;
-  }
-
-  // 6. Aplicar el cobro — ahora que Kore ya aprobó la solicitud, este endpoint
-  // dedicado la aplica internamente con los datos que Kore ya tiene desde que
-  // ÉL creó la solicitud; lo único que se manda, por cada forma de pago, es su
-  // FormaPagoID, BancoID (solo si esa forma de pago lo requiere, ver arriba) y
-  // DOS datos del movimiento identificado: "Aut" (el folio interno de Numo,
-  // mismo folio que `referencia`, arriba) y "Numo" (el numeroAutorizacion
-  // bancario real, extraído por OCR) — ambos por separado, ninguno reemplaza al
-  // otro. Igual en Modo 1 y Modo 2 — un elemento del arreglo por cada forma de pago.
-  // Fix 2026-08-04: el nombre correcto es "Aut", no "Autorizacion" — confirmado
-  // contra el panel manual (cobro-panel.component.ts, ya funcionando en
-  // producción), que es la única otra parte del sistema que manda este mismo
-  // dato a Kore. El nombre equivocado provocaba errores del lado de Kore al
-  // aplicar cobros vía Solicitudes de Cobro.
-  // Fix 2026-08-04 (mismo día, después) — Kore actualizó su configuración: ahora
-  // rechaza la solicitud completa si CUALQUIER forma de pago que no sea
-  // transferencia (saldo a favor, cheque, depósito en efectivo) trae
-  // DatosAdicionales. Antes se mandaba Aut/Numo sin importar el tipo; ahora se
-  // exige el MISMO criterio que ya usa BancoID (`formaPagoRequiereBanco`,
-  // claveSAT==='03') — nunca se manda DatosAdicionales fuera de transferencia.
-  // Riesgo aceptado, no un descuido: una solicitud pagada 100% en efectivo/
-  // cheque/saldo a favor ya no deja ningún tag Aut en Kore, así que
-  // _montoSaldoLinkPorMovimiento (erp.routes.js) no podrá volver a matchearla
-  // contra Kore más adelante — es una restricción nueva del lado de Kore, no
-  // algo que Numo pueda evitar mientras la solicitud se siga aplicando.
-  //
-  // 2026-08-12 — Depósito en efectivo TAMBIÉN manda DatosAdicionales, a pedido
-  // explícito del usuario, pero con un contrato distinto al de transferencia:
-  // un solo tag `Num Recibo` (no el par Aut/Numo) con el folio consecutivo de
-  // Numo — confirmado contra el ejemplo real que Kore espera para esta forma
-  // de pago específica.
-  //
-  // 2026-08-14 - fechaRealPago se agrega como campo HERMANO de FormaPagoID/
-  // BancoID (no dentro de DatosAdicionales) para las TRES variantes de forma
-  // de pago, sin condicion de tipo (a diferencia de BancoID/DatosAdicionales)
-  // - a pedido explicito del usuario, ya validado contra Kore. Cada forma de
-  // pago manda la fecha de SU PROPIO movimiento (movDeEstaForma.fecha), no
-  // una fecha global de la solicitud - soporta el caso multi-movimiento donde
-  // 2 formas de pago estan asignadas a 2 depositos distintos con fechas
-  // distintas. Ver _fechaRealPagoKore() arriba para el ajuste de offset.
-  // 2026-08-20: Kore renombró el campo a snake_case ("fecha_real_pago") —
-  // confirmado por el usuario, este cambio es propio de Solicitudes de Cobro,
-  // el panel manual de cobros no usa este mismo objeto y no se toca.
-  //
-  // 2026-08-20 (mismo día, corrección real contra Kore): Kore además EXIGE
-  // fecha_real_pago A NIVEL RAÍZ del body (hermano de todo el arreglo
-  // DatosAdicionalesPorFormaPago, no solo dentro de cada elemento) — rechazo
-  // real confirmado por el usuario: "fecha_real_pago es obligatorio para
-  // solicitudes de Tipo=REVISION_CONTABLE". El de cada forma de pago (arriba)
-  // se conserva para el desglose real por depósito (pedido explícito del
-  // usuario); el de raíz usa la fecha del PRIMER movimiento asignado — solo
-  // para satisfacer el chequeo obligatorio de Kore, decisión confirmada con
-  // el usuario ante la ambigüedad de qué fecha única usar si hay varios
-  // movimientos con fechas distintas.
-  const fechaRealPagoRaiz = _fechaRealPagoKore(movsOrdenados[0].fecha);
-
-  // 2026-08-27 (CORREGIDO tras rechazo real de Kore): 1 SOLO elemento del arreglo
-  // por forma de pago — nunca uno repetido por depósito. Rechazo real: "la forma
-  // de pago X subió N comprobante(s)... debe indicar el dato adicional... con N
-  // valor(es) separados por coma" — Kore espera los N valores (uno por depósito)
-  // JUNTOS en el mismo campo, separados por coma, no N elementos con el mismo
-  // FormaPagoID repetido (lo que se había armado antes de esta corrección, sin
-  // probar). Con 1 solo depósito (caso común, sin split) el join() de un arreglo
-  // de 1 elemento da el mismo valor de siempre, sin coma — comportamiento
-  // idéntico al de antes de este cambio.
-  const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
-    const movIdsDeEstaForma = movIdsPorFormaPago.get(String(f._id));
-    const movsDeEstaForma   = movIdsDeEstaForma.map(movId => movPorId.get(movId));
-    const movPrincipal      = movsDeEstaForma[0];
-    const bancoDefault      = bancoDefaultPorMovId.get(movIdsDeEstaForma[0]) ?? null;
-    const esTransferencia     = formaPagoRequiereBanco.get(f.formaPagoId) === true;
-    const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
-    const esCheque            = formaPagoEsCheque.get(f.formaPagoId) === true;
-    const autJuntos  = movsDeEstaForma.map(m => m.folio || '').join(',');
-    // 2026-08-31 (pedido explícito del usuario, SOLO Solicitudes de Cobro — el cobro
-    // manual de cobro-panel.component.ts no manda este tag si no hay autorización, en
-    // vez de mandar un literal): cuando el depósito no trae autorización bancaria
-    // (OCR no la detectó), se manda la leyenda "NULL" en vez de string vacío.
-    const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || 'NULL').join(',');
-    // 2026-09-01: Cheque y Depósito en efectivo se suman a Transferencia acá —
-    // los 3 tienen un depósito bancario real detrás (bancoDefault ya se resolvió
-    // POR MOVIMIENTO arriba, sin importar el tipo). SIN CONFIRMAR contra Kore
-    // real todavía si su catálogo acepta BancoID para estos 2 tipos.
-    const necesitaBanco = esTransferencia || esCheque || esDepositoEfectivo;
-    return {
-      ...(necesitaBanco && bancoDefault ? { BancoID: bancoDefault.id } : {}),
-      FormaPagoID: f.formaPagoId,
-      // fecha_real_pago del PRIMER depósito asignado — mismo criterio que
-      // fechaRealPagoRaiz (abajo) para la ambigüedad de "varios movimientos,
-      // 1 sola fecha posible" cuando hay split.
-      fecha_real_pago: _fechaRealPagoKore(movPrincipal.fecha),
-      ...(esTransferencia ? {
-        DatosAdicionales: [
-          { Nombre: 'Aut',  Valor: autJuntos },
-          { Nombre: 'Numo', Valor: numoJuntos },
-        ],
-      } : {}),
-      // 2026-08-28 — AJUSTE explícito del usuario, todavía SIN confirmar contra Kore
-      // (pendiente de la próxima prueba): "Num Recibo" vacío, "Numo" ahora lleva
-      // autJuntos (el folio — antes era "Num Recibo" quien lo llevaba) y un 3er campo
-      // nuevo "Aut" lleva numoJuntos (autorización bancaria — antes era "Numo"). Mismos
-      // 2 nombres de campo que transferencia ("Aut"/"Numo"), pero con la semántica
-      // INVERTIDA a propósito (acá "Numo"=folio, "Aut"=autorización; en transferencia,
-      // línea ~921 arriba, es al revés) — no unificar ambos bloques asumiendo que
-      // comparten semántica solo porque comparten nombres de campo. Sigue valiendo la
-      // regla de nunca concatenar 2 valores distintos en un mismo campo (ver
-      // project_kore_numo_catalog_contradiction.md).
-      ...(esDepositoEfectivo ? {
-        DatosAdicionales: [
-          { Nombre: 'Num Recibo', Valor: '' },
-          { Nombre: 'Numo', Valor: autJuntos },
-          { Nombre: 'Aut', Valor: numoJuntos },
-        ],
-      } : {}),
-      // 2026-08-28 (mismo día, rechazo real de Kore) — Cheque NO tiene "Num Recibo" en
-      // su catálogo en absoluto (a diferencia de depósito en efectivo): "el dato
-      // adicional 'Num Recibo' no está configurado en la forma de pago CHEQUE... los
-      // campos configurados son: Numo". Manda "Numo" con autJuntos (folio) — mismo
-      // valor/criterio que el primer experimento de depósito en efectivo cuando iba
-      // solo, ver memoria. 2026-08-28 (mismo día, ajuste explícito del usuario, SIN
-      // confirmar todavía contra Kore): se agrega "Aut" con numoJuntos (autorización
-      // bancaria) — mismos 2 campos que depósito en efectivo ahora (línea ~945 arriba),
-      // sin "Num Recibo" porque Cheque no lo tiene en su catálogo.
-      ...(esCheque ? {
-        DatosAdicionales: [
-          { Nombre: 'Numo', Valor: autJuntos },
-          { Nombre: 'Aut', Valor: numoJuntos },
-        ],
-      } : {}),
-    };
-  });
-
   let koreResult;
-  try {
-    koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, datosAdicionalesPorFormaPago, fechaRealPagoRaiz);
-  } catch (err) {
-    if (err instanceof koreCaja.KoreCajaError) {
-      // aplicarSolicitudOperacion ya loguea el payload y el rechazo crudo de
-      // Kore por consola — este log adicional deja explícito con qué
-      // solicitud/CxC se relaciona ese rechazo, para no tener que cruzar logs.
-      console.warn(`[collection-requests] identificar ${id}: Kore rechazó el cobro (cxcs=${cr.cxcs.map(c => c.erpId).join(',')}, conceptoId=${cr.conceptoId}):`, err.message, err.koreBody ? JSON.stringify(err.koreBody) : '');
-      throw new BadRequestError(`Kore rechazó el cobro: ${err.message}`);
-    }
-    // Error de RED (sin respuesta HTTP: timeout, ECONNRESET, DNS, etc. — ver
-    // kore-caja.service.js#_operacionConReintento, que relanza el error de axios
-    // TAL CUAL cuando no hay `response`) — a diferencia de KoreCajaError (Kore
-    // respondió, aunque sea con un rechazo), acá NO hay forma de saber si Kore
-    // alcanzó a aplicar el cobro antes de que se perdiera la respuesta. Incidente
-    // real 2026-08-19: un corte de red justo acá dejó la CxC cobrada en Kore sin
-    // NINGÚN rastro en Numo (ni inconsistenciaPostKore, ni bankMovementId), porque
-    // este catch simplemente relanzaba el error crudo — la solicitud quedaba en
-    // 'pendiente' para siempre, y un segundo intento chocaba con Kore rechazando
-    // "ya aplicado" sin que Numo supiera qué había pasado. Mismo criterio de
-    // "nunca reintentar a ciegas" que ya usa el catch de la transacción más abajo
-    // (paso 7) — se marca inconsistenciaPostKore aunque acá todavía no haya
-    // `koreResult` (justamente porque no se sabe si lo hay del lado de Kore).
-    const mensaje = `Error de red al aplicar el cobro en Kore (solicitudIdErp=${cr.solicitudIdErp}) — no se pudo confirmar si Kore alcanzó a procesarlo: ${err.message}`;
-    await CollectionRequest.updateOne({ _id: cr._id }, {
-      inconsistenciaPostKore: { at: new Date(), mensaje, movimientosPendientes: movIds },
-    });
-    logger.error(`[collection-requests] INCONSISTENCIA-POST-KORE (red, aplicarSolicitudOperacion) id=${id} solicitudIdErp=${cr.solicitudIdErp}: ${err.message}`);
-    throw new BadRequestError(
-      `No se pudo confirmar si Kore aplicó el cobro (falla de red: ${err.message}). ` +
-      'Verificá manualmente en Kore antes de reintentar — la solicitud quedó marcada para revisión manual (inconsistenciaPostKore).',
+  if (!yaAplicadoEnKore) {
+    // 5. BancoID — igual criterio que _matchBancoDefault() en cobro-panel.component.ts
+    // (panel manual): en un inicio solo se mandaba para claveSAT '03' (transferencia).
+    // Acá no hay un humano confirmando el banco en pantalla antes de aplicar (a
+    // diferencia del panel manual), pero el usuario confirmó (2026-07-28) que igual
+    // quiere el mismo fallback: si el banco del movimiento no matchea ningún banco
+    // del catálogo de Kore, se manda bancos[0] (el primero del catálogo) en vez de
+    // dejar el cobro sin BancoID. Con varios movimientos, cada uno puede
+    // corresponder a un banco distinto (ej. transferencia BBVA + otra Santander) —
+    // el match se resuelve POR MOVIMIENTO (bancoDefaultPorMovId); los catálogos
+    // (formasPagoKore/bancosKore) se piden UNA sola vez, no por movimiento. Todo o
+    // nada: si Kore rechaza cualquiera de los 2 catálogos, no se aplica el cobro
+    // (mismo criterio que el resto de la función).
+    //
+    // 2026-09-01 (pedido explícito del usuario, caso real: Cheque en Bancomer +
+    // Transferencia en Banco Azteca en la misma solicitud): bancoDefaultPorMovId ya
+    // se resolvía por movimiento para TODOS los movimientos de la solicitud (el
+    // `for` de abajo nunca filtró por tipo de forma de pago) — el dato correcto ya
+    // estaba disponible, solo no se aplicaba al payload de Cheque/Depósito en
+    // efectivo por el gate de abajo (ver datosAdicionalesPorFormaPago). Se extendió
+    // el gate para reusar el MISMO bancoDefaultPorMovId ya calculado en Cheque y
+    // Depósito en efectivo — ambos tienen un depósito bancario real detrás, igual
+    // que transferencia, así que la misma necesidad aplica. SIN CONFIRMAR todavía
+    // contra Kore real si su catálogo acepta BancoID para estos 2 tipos (mismo
+    // riesgo que ya se vio con "Num Recibo" para Cheque, rechazado en su momento) —
+    // probar antes de dar por buena esta extensión.
+    const bancoDefaultPorMovId = new Map();
+    const formaPagoRequiereBanco = new Map();
+    // Depósito en efectivo no tiene claveSAT propia (Kore la reporta como Efectivo, '01'),
+    // así que se identifica por NOMBRE — mismo criterio ya usado por
+    // _esFormaPagoBancariaKore() en formas-pago-cxc.service.js.
+    const formaPagoEsDepositoEfectivo = new Map();
+    const _esDepositoEfectivoKore = (nombreFormaPago) => /DEPOSITO.*EFECTIVO/.test(
+      String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
     );
+    // 2026-08-28 (pedido explícito del usuario) — Cheque, mismo criterio de detección por
+    // nombre que depósito en efectivo (tampoco tiene claveSAT propia distintiva). Regex
+    // amplio a propósito (sin anclar "NOMINATIVO" ni nada más) para tolerar variantes del
+    // nombre en el catálogo de Kore, mismo espíritu que el resto de estos matches.
+    const formaPagoEsCheque = new Map();
+    const _esChequeKore = (nombreFormaPago) => /CHEQUE/.test(
+      String(nombreFormaPago ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toUpperCase(),
+    );
+    try {
+      const formasPagoKore = await koreCaja.listarFormasPago(koreToken);
+      for (const f of formasPagoKore) {
+        formaPagoRequiereBanco.set(String(f.id), f.claveSAT === '03');
+        formaPagoEsDepositoEfectivo.set(String(f.id), _esDepositoEfectivoKore(f.nombre));
+        formaPagoEsCheque.set(String(f.id), _esChequeKore(f.nombre));
+      }
+      // 2026-09-01: además de transferencia, Cheque y Depósito en efectivo también
+      // reusan bancoDefaultPorMovId ahora (ver comentario arriba) — el catálogo de
+      // bancos se pide si CUALQUIERA de los 3 tipos está presente en la solicitud.
+      const algunaFormaNecesitaBanco = cr.formasPago.some(f =>
+        formaPagoRequiereBanco.get(f.formaPagoId) || formaPagoEsCheque.get(f.formaPagoId) || formaPagoEsDepositoEfectivo.get(f.formaPagoId));
+      if (algunaFormaNecesitaBanco) {
+        const bancosKore = await koreCaja.listarBancos(koreToken);
+        for (const movDelGrupo of movsOrdenados) {
+          bancoDefaultPorMovId.set(String(movDelGrupo._id), matchBancoDefault(bancosKore, movDelGrupo.banco));
+        }
+      }
+    } catch (err) {
+      if (err instanceof koreCaja.KoreCajaError) {
+        throw new BadRequestError(`No se pudo resolver el banco para aplicar el cobro: ${err.message}`);
+      }
+      throw err;
+    }
+
+    // 6. Aplicar el cobro — ahora que Kore ya aprobó la solicitud, este endpoint
+    // dedicado la aplica internamente con los datos que Kore ya tiene desde que
+    // ÉL creó la solicitud; lo único que se manda, por cada forma de pago, es su
+    // FormaPagoID, BancoID (solo si esa forma de pago lo requiere, ver arriba) y
+    // DOS datos del movimiento identificado: "Aut" (el folio interno de Numo,
+    // mismo folio que `referencia`, arriba) y "Numo" (el numeroAutorizacion
+    // bancario real, extraído por OCR) — ambos por separado, ninguno reemplaza al
+    // otro. Igual en Modo 1 y Modo 2 — un elemento del arreglo por cada forma de pago.
+    // Fix 2026-08-04: el nombre correcto es "Aut", no "Autorizacion" — confirmado
+    // contra el panel manual (cobro-panel.component.ts, ya funcionando en
+    // producción), que es la única otra parte del sistema que manda este mismo
+    // dato a Kore. El nombre equivocado provocaba errores del lado de Kore al
+    // aplicar cobros vía Solicitudes de Cobro.
+    // Fix 2026-08-04 (mismo día, después) — Kore actualizó su configuración: ahora
+    // rechaza la solicitud completa si CUALQUIER forma de pago que no sea
+    // transferencia (saldo a favor, cheque, depósito en efectivo) trae
+    // DatosAdicionales. Antes se mandaba Aut/Numo sin importar el tipo; ahora se
+    // exige el MISMO criterio que ya usa BancoID (`formaPagoRequiereBanco`,
+    // claveSAT==='03') — nunca se manda DatosAdicionales fuera de transferencia.
+    // Riesgo aceptado, no un descuido: una solicitud pagada 100% en efectivo/
+    // cheque/saldo a favor ya no deja ningún tag Aut en Kore, así que
+    // _montoSaldoLinkPorMovimiento (erp.routes.js) no podrá volver a matchearla
+    // contra Kore más adelante — es una restricción nueva del lado de Kore, no
+    // algo que Numo pueda evitar mientras la solicitud se siga aplicando.
+    //
+    // 2026-08-12 — Depósito en efectivo TAMBIÉN manda DatosAdicionales, a pedido
+    // explícito del usuario, pero con un contrato distinto al de transferencia:
+    // un solo tag `Num Recibo` (no el par Aut/Numo) con el folio consecutivo de
+    // Numo — confirmado contra el ejemplo real que Kore espera para esta forma
+    // de pago específica.
+    //
+    // 2026-08-14 - fechaRealPago se agrega como campo HERMANO de FormaPagoID/
+    // BancoID (no dentro de DatosAdicionales) para las TRES variantes de forma
+    // de pago, sin condicion de tipo (a diferencia de BancoID/DatosAdicionales)
+    // - a pedido explicito del usuario, ya validado contra Kore. Cada forma de
+    // pago manda la fecha de SU PROPIO movimiento (movDeEstaForma.fecha), no
+    // una fecha global de la solicitud - soporta el caso multi-movimiento donde
+    // 2 formas de pago estan asignadas a 2 depositos distintos con fechas
+    // distintas. Ver _fechaRealPagoKore() arriba para el ajuste de offset.
+    // 2026-08-20: Kore renombró el campo a snake_case ("fecha_real_pago") —
+    // confirmado por el usuario, este cambio es propio de Solicitudes de Cobro,
+    // el panel manual de cobros no usa este mismo objeto y no se toca.
+    //
+    // 2026-08-20 (mismo día, corrección real contra Kore): Kore además EXIGE
+    // fecha_real_pago A NIVEL RAÍZ del body (hermano de todo el arreglo
+    // DatosAdicionalesPorFormaPago, no solo dentro de cada elemento) — rechazo
+    // real confirmado por el usuario: "fecha_real_pago es obligatorio para
+    // solicitudes de Tipo=REVISION_CONTABLE". El de cada forma de pago (arriba)
+    // se conserva para el desglose real por depósito (pedido explícito del
+    // usuario); el de raíz usa la fecha del PRIMER movimiento asignado — solo
+    // para satisfacer el chequeo obligatorio de Kore, decisión confirmada con
+    // el usuario ante la ambigüedad de qué fecha única usar si hay varios
+    // movimientos con fechas distintas.
+    const fechaRealPagoRaiz = _fechaRealPagoKore(movsOrdenados[0].fecha);
+
+    // 2026-08-27 (CORREGIDO tras rechazo real de Kore): 1 SOLO elemento del arreglo
+    // por forma de pago — nunca uno repetido por depósito. Rechazo real: "la forma
+    // de pago X subió N comprobante(s)... debe indicar el dato adicional... con N
+    // valor(es) separados por coma" — Kore espera los N valores (uno por depósito)
+    // JUNTOS en el mismo campo, separados por coma, no N elementos con el mismo
+    // FormaPagoID repetido (lo que se había armado antes de esta corrección, sin
+    // probar). Con 1 solo depósito (caso común, sin split) el join() de un arreglo
+    // de 1 elemento da el mismo valor de siempre, sin coma — comportamiento
+    // idéntico al de antes de este cambio.
+    const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
+      const movIdsDeEstaForma = movIdsPorFormaPago.get(String(f._id));
+      const movsDeEstaForma   = movIdsDeEstaForma.map(movId => movPorId.get(movId));
+      const movPrincipal      = movsDeEstaForma[0];
+      const bancoDefault      = bancoDefaultPorMovId.get(movIdsDeEstaForma[0]) ?? null;
+      const esTransferencia     = formaPagoRequiereBanco.get(f.formaPagoId) === true;
+      const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
+      const esCheque            = formaPagoEsCheque.get(f.formaPagoId) === true;
+      const autJuntos  = movsDeEstaForma.map(m => m.folio || '').join(',');
+      // 2026-08-31 (pedido explícito del usuario, SOLO Solicitudes de Cobro — el cobro
+      // manual de cobro-panel.component.ts no manda este tag si no hay autorización, en
+      // vez de mandar un literal): cuando el depósito no trae autorización bancaria
+      // (OCR no la detectó), se manda la leyenda "NULL" en vez de string vacío.
+      const numoJuntos  = movsDeEstaForma.map(m => m.numeroAutorizacion || 'NULL').join(',');
+      // 2026-09-01: Cheque y Depósito en efectivo se suman a Transferencia acá —
+      // los 3 tienen un depósito bancario real detrás (bancoDefault ya se resolvió
+      // POR MOVIMIENTO arriba, sin importar el tipo). SIN CONFIRMAR contra Kore
+      // real todavía si su catálogo acepta BancoID para estos 2 tipos.
+      const necesitaBanco = esTransferencia || esCheque || esDepositoEfectivo;
+      return {
+        ...(necesitaBanco && bancoDefault ? { BancoID: bancoDefault.id } : {}),
+        FormaPagoID: f.formaPagoId,
+        // fecha_real_pago del PRIMER depósito asignado — mismo criterio que
+        // fechaRealPagoRaiz (abajo) para la ambigüedad de "varios movimientos,
+        // 1 sola fecha posible" cuando hay split.
+        fecha_real_pago: _fechaRealPagoKore(movPrincipal.fecha),
+        ...(esTransferencia ? {
+          DatosAdicionales: [
+            { Nombre: 'Aut',  Valor: autJuntos },
+            { Nombre: 'Numo', Valor: numoJuntos },
+          ],
+        } : {}),
+        // 2026-08-28 — AJUSTE explícito del usuario, todavía SIN confirmar contra Kore
+        // (pendiente de la próxima prueba): "Num Recibo" vacío, "Numo" ahora lleva
+        // autJuntos (el folio — antes era "Num Recibo" quien lo llevaba) y un 3er campo
+        // nuevo "Aut" lleva numoJuntos (autorización bancaria — antes era "Numo"). Mismos
+        // 2 nombres de campo que transferencia ("Aut"/"Numo"), pero con la semántica
+        // INVERTIDA a propósito (acá "Numo"=folio, "Aut"=autorización; en transferencia,
+        // línea ~921 arriba, es al revés) — no unificar ambos bloques asumiendo que
+        // comparten semántica solo porque comparten nombres de campo. Sigue valiendo la
+        // regla de nunca concatenar 2 valores distintos en un mismo campo (ver
+        // project_kore_numo_catalog_contradiction.md).
+        ...(esDepositoEfectivo ? {
+          DatosAdicionales: [
+            { Nombre: 'Num Recibo', Valor: '' },
+            { Nombre: 'Numo', Valor: autJuntos },
+            { Nombre: 'Aut', Valor: numoJuntos },
+          ],
+        } : {}),
+        // 2026-08-28 (mismo día, rechazo real de Kore) — Cheque NO tiene "Num Recibo" en
+        // su catálogo en absoluto (a diferencia de depósito en efectivo): "el dato
+        // adicional 'Num Recibo' no está configurado en la forma de pago CHEQUE... los
+        // campos configurados son: Numo". Manda "Numo" con autJuntos (folio) — mismo
+        // valor/criterio que el primer experimento de depósito en efectivo cuando iba
+        // solo, ver memoria. 2026-08-28 (mismo día, ajuste explícito del usuario, SIN
+        // confirmar todavía contra Kore): se agrega "Aut" con numoJuntos (autorización
+        // bancaria) — mismos 2 campos que depósito en efectivo ahora (línea ~945 arriba),
+        // sin "Num Recibo" porque Cheque no lo tiene en su catálogo.
+        ...(esCheque ? {
+          DatosAdicionales: [
+            { Nombre: 'Numo', Valor: autJuntos },
+            { Nombre: 'Aut', Valor: numoJuntos },
+          ],
+        } : {}),
+      };
+    });
+
+    try {
+      koreResult = await koreCaja.aplicarSolicitudOperacion(sesionId, cr.solicitudIdErp, koreToken, datosAdicionalesPorFormaPago, fechaRealPagoRaiz);
+    } catch (err) {
+      if (err instanceof koreCaja.KoreCajaError) {
+        // aplicarSolicitudOperacion ya loguea el payload y el rechazo crudo de
+        // Kore por consola — este log adicional deja explícito con qué
+        // solicitud/CxC se relaciona ese rechazo, para no tener que cruzar logs.
+        console.warn(`[collection-requests] identificar ${id}: Kore rechazó el cobro (cxcs=${cr.cxcs.map(c => c.erpId).join(',')}, conceptoId=${cr.conceptoId}):`, err.message, err.koreBody ? JSON.stringify(err.koreBody) : '');
+        throw new BadRequestError(`Kore rechazó el cobro: ${err.message}`);
+      }
+      // Error de RED (sin respuesta HTTP: timeout, ECONNRESET, DNS, etc. — ver
+      // kore-caja.service.js#_operacionConReintento, que relanza el error de axios
+      // TAL CUAL cuando no hay `response`) — a diferencia de KoreCajaError (Kore
+      // respondió, aunque sea con un rechazo), acá NO hay forma de saber si Kore
+      // alcanzó a aplicar el cobro antes de que se perdiera la respuesta. Incidente
+      // real 2026-08-19: un corte de red justo acá dejó la CxC cobrada en Kore sin
+      // NINGÚN rastro en Numo (ni inconsistenciaPostKore, ni bankMovementId), porque
+      // este catch simplemente relanzaba el error crudo — la solicitud quedaba en
+      // 'pendiente' para siempre, y un segundo intento chocaba con Kore rechazando
+      // "ya aplicado" sin que Numo supiera qué había pasado. Mismo criterio de
+      // "nunca reintentar a ciegas" que ya usa el catch de la transacción más abajo
+      // (paso 7) — se marca inconsistenciaPostKore aunque acá todavía no haya
+      // `koreResult` (justamente porque no se sabe si lo hay del lado de Kore).
+      const mensaje = `Error de red al aplicar el cobro en Kore (solicitudIdErp=${cr.solicitudIdErp}) — no se pudo confirmar si Kore alcanzó a procesarlo: ${err.message}`;
+      await CollectionRequest.updateOne({ _id: cr._id }, {
+        inconsistenciaPostKore: { at: new Date(), mensaje, movimientosPendientes: movIds },
+      });
+      logger.error(`[collection-requests] INCONSISTENCIA-POST-KORE (red, aplicarSolicitudOperacion) id=${id} solicitudIdErp=${cr.solicitudIdErp}: ${err.message}`);
+      throw new BadRequestError(
+        `No se pudo confirmar si Kore aplicó el cobro (falla de red: ${err.message}). ` +
+        'Verificá manualmente en Kore antes de reintentar — la solicitud quedó marcada para revisión manual (inconsistenciaPostKore).',
+      );
+    }
+  } else {
+    koreResult = {
+      reconciliado: true,
+      mensaje: 'Kore ya tenía la solicitud en APLICADO antes de este intento — se omitió reaplicar el cobro, solo se reconcilió en Numo.',
+      at: new Date(),
+    };
   }
 
   // 7. Kore YA ACEPTÓ el cobro (paso irreversible desde Numo, D4) — vincular
@@ -1137,8 +1157,19 @@ async function rechazar(id, motivo, user) {
     const tokenRevisor = await koreCaja.obtenerTokenKore(user._id);
     await koreCaja.actualizarEstatusSolicitud(tokenRevisor, cr.solicitudIdErp, 'RECHAZADO', motivo || 'Solicitud rechazada en Numo');
   } catch (err) {
-    if (koreCaja.esErrorYaEnEstatus(err, 'RECHAZADO')) {
+    const estatusReal = koreCaja.estatusActualDeErrorKore(err);
+    if (estatusReal === 'RECHAZADO') {
       console.warn(`[collection-requests] rechazar ${id}: Kore ya tenía solicitudIdErp=${cr.solicitudIdErp} en RECHAZADO (reintento) — se continúa.`);
+    } else if (estatusReal === 'APLICADO') {
+      // Kore ya aplicó el cobro real de esta solicitud (en un intento previo,
+      // probablemente de identificar()) — no se puede rechazar algo que ya se
+      // cobró. rechazar() no recibe qué movimiento vincular (a diferencia de
+      // identificar()), así que no puede reconciliar acá: solo puede avisar y
+      // mandar al usuario al camino que sí reconcilia.
+      throw new BadRequestError(
+        'Esta solicitud ya fue aplicada en Kore (el cobro real ya se realizó) — no se puede rechazar. ' +
+        'Usá "Identificar" para vincular el movimiento bancario correspondiente y reflejarlo en Numo.',
+      );
     } else if (err instanceof koreCaja.KoreCajaError) {
       throw new BadRequestError(`No se pudo notificar el estatus a Kore: ${err.message}`);
     } else {

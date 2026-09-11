@@ -1031,11 +1031,23 @@ async function construirMovimientosPuente({
       // reales que `saldosFavorUsados[].fecha` coincide exacto con
       // `cobro.fecha` de /desgloses-cobro/almacen para el mismo evento
       // (confirmado con el usuario 2026-08-04).
-      const usadosDeEsteCobro = (usadosPorCuenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
+      const usadosDeEsteCobroTodos = (usadosPorCuenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
         .filter(u => u.fecha && cobro.fecha && new Date(u.fecha).getTime() === new Date(cobro.fecha).getTime());
+      // BUG CORREGIDO 2026-09-11 (caso real CATEDRAL RESTAURANTE BAR, Hidalgo
+      // 4-sep-2026): este bloque generaba su línea de SF de forma
+      // INDEPENDIENTE del guard `ventasSFCubiertasPorSplit` (ese guard solo
+      // vivía en el bloque APA de más abajo) — cuando la venta ORIGEN del
+      // saldo (`u.serieVenta/u.folioVenta`) ya la cubre el split por origen
+      // de `cfdiToMovimientos`, se excluye aquí también para no duplicar.
+      // Si TODO lo usado por este cobro ya está cubierto por el split,
+      // `montoSFReal` queda en 0 (no en `null`) para que NO caiga al
+      // heurístico de `formasPago[].monto` más abajo — eso resucitaría el
+      // duplicado con un monto adivinado en vez de omitir la línea.
+      const usadosDeEsteCobro = usadosDeEsteCobroTodos
+        .filter(u => !ventasSFCubiertasPorSplit.has(`${u.serieVenta}|${u.folioVenta}`));
       const montoSFReal = usadosDeEsteCobro.length
         ? Math.round(usadosDeEsteCobro.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0) * 100) / 100
-        : null;
+        : (usadosDeEsteCobroTodos.length ? 0 : null);
       // Columna H para la porción de SF: el documento relacionado de la
       // VENTA que USA el saldo (mismo `serieFolioFactura` que las líneas
       // normales, ej. "I0-260700210") — NO el origen del saldo ("DEV-055219",
@@ -1066,6 +1078,21 @@ async function construirMovimientosPuente({
         ? cobro.formasPago
         : [{ claveSat: null, nombre: 'SIN FORMA DE PAGO — REVISAR', monto: montoCobro }]);
       const totalFormasPago = formasPago.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+      // Monto de SF ya cubierto por el split por origen (excluido arriba de
+      // `usadosDeEsteCobro`) — se resta del total a repartir entre las DEMÁS
+      // formasPago de este cobro. Sin este ajuste, "el último absorbe el
+      // residuo" (más abajo) le reasignaría por error ese dinero suprimido a
+      // la última forma de pago no-SF (normalmente Tarjeta, ver
+      // `_ordenarFormasPago`) en vez de simplemente omitirlo (bug real
+      // detectado 2026-09-11 al corregir el duplicado CATEDRAL: sin este
+      // ajuste, el SF suprimido aquí reaparecía sumado a otra cuenta).
+      const montoSFYaCubiertoDeEsteCobro = usadosDeEsteCobroTodos.length > usadosDeEsteCobro.length
+        ? Math.round((
+            usadosDeEsteCobroTodos.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0)
+            - usadosDeEsteCobro.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0)
+          ) * 100) / 100
+        : 0;
+      const montoCobroRepartir = Math.round((montoCobro - montoSFYaCubiertoDeEsteCobro) * 100) / 100;
       let acumulado = 0;
       // `lineas`: cada forma de pago se convierte en 1 línea contable, EXCEPTO
       // "saldo a favor", que se parte en 2 (subtotal a cuentaSaldoFavorId, IVA
@@ -1076,10 +1103,10 @@ async function construirMovimientosPuente({
       formasPago.forEach((fp, idx) => {
         const esUltimo = idx === formasPago.length - 1;
         const share = totalFormasPago > 0 ? (Number(fp.monto) || 0) / totalFormasPago : 1 / formasPago.length;
-        // El último absorbe el residuo de redondeo para que la suma cuadre exacto con montoCobro.
+        // El último absorbe el residuo de redondeo para que la suma cuadre exacto con montoCobroRepartir.
         let montoAsignado = esUltimo
-          ? Math.round((montoCobro - acumulado) * 100) / 100
-          : Math.round(montoCobro * share * 100) / 100;
+          ? Math.round((montoCobroRepartir - acumulado) * 100) / 100
+          : Math.round(montoCobroRepartir * share * 100) / 100;
 
         // Si saldos-favor confirma el monto REAL usado, se usa ese en vez del
         // heurístico de arriba (ver `montoSFReal`) — mismo criterio de

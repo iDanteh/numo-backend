@@ -3142,28 +3142,37 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // duplicaría la resta) — confirmado con el usuario el mismo día.
   if (poliza.tipo === 'I') {
     const fechaYMD = fechaFinal.toISOString().slice(0, 10);
-    const centrosPropios = [...new Set(
-      movimientos.map(m => m.centroCostoObj?.clave ?? m.centroCosto ?? null).filter(Boolean),
-    )];
-    if (centrosPropios.length) {
-      const retirosPorCentro = new Map();
-      for (const centroClave of centrosPropios) {
+    // `centroCosto`/`centroCostoObj.clave` (ej. "111") es la clave NUMÉRICA
+    // que se muestra en columna/se usa para agrupar líneas — el ERP no la
+    // reconoce como "almacen". El endpoint espera `serieFacturacion` (ej.
+    // "B0"), un campo DISTINTO del mismo `CentroCosto` (bug real 2026-09-11:
+    // usar `clave` aquí hacía que /desgloses-salidas/caja nunca encontrara
+    // nada, sin lanzar error — la resta simplemente nunca se aplicaba).
+    const serieDeClave = new Map(); // clave (ej. "111") → serieFacturacion (ej. "B0")
+    for (const m of movimientos) {
+      const clave = m.centroCostoObj?.clave ?? m.centroCosto ?? null;
+      const serie = m.centroCostoObj?.serieFacturacion ?? null;
+      if (clave && serie && !serieDeClave.has(clave)) serieDeClave.set(clave, serie);
+    }
+    if (serieDeClave.size) {
+      const retirosPorCentro = new Map(); // clave → monto (para emparejar con mov.centroCosto)
+      for (const [claveCentro, serieAlmacen] of serieDeClave) {
         let salidas = [];
         try {
           salidas = await obtenerDesglosesSalidasCajaPorAlmacen({
-            rfc: poliza.rfc, almacen: centroClave,
+            rfc: poliza.rfc, almacen: serieAlmacen,
             fechaDesde: `${fechaYMD}T00:00:00-06:00`, fechaHasta: `${fechaYMD}T23:59:59-06:00`,
           });
         } catch (e) {
           // Solo-lectura/informativo — si el ERP falla, no debe tumbar el export completo.
           const { logger } = require('../../../shared/utils/logger');
-          logger.warn(`[exportContpaqXlsx] /desgloses-salidas/caja falló para ${centroClave} ${fechaYMD}: ${e.message}`);
+          logger.warn(`[exportContpaqXlsx] /desgloses-salidas/caja falló para ${serieAlmacen} ${fechaYMD}: ${e.message}`);
           continue;
         }
         const retiroEfectivo = salidas
           .filter(s => (s.tipoMovimiento?.nombre || '').toUpperCase() === 'RETIRO DE EFECTIVO')
           .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
-        if (retiroEfectivo > 0) retirosPorCentro.set(centroClave, Math.round(retiroEfectivo * 100) / 100);
+        if (retiroEfectivo > 0) retirosPorCentro.set(claveCentro, Math.round(retiroEfectivo * 100) / 100);
       }
 
       if (retirosPorCentro.size) {

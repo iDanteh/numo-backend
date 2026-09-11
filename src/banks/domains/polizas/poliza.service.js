@@ -3146,11 +3146,18 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // aparte (restarlo también duplicaría la resta), y ninguno de los dos
   // empieza con "RETIRO" así que el prefijo ya los excluye por sí solo.
   //
-  // Riesgo conocido, no resuelto: "RETIRO POR DEVOLUCION Y/O CANCELACION DE
-  // VENTA" podría solaparse con el mecanismo YA EXISTENTE `SF-RETIRO-EFECTIVO`
-  // (cfdi-poliza-generator.service.js, devolución que genera SF pagado en
-  // efectivo) — si ambos aplican al mismo caso, se restaría dos veces. No se
-  // investigó a fondo; el usuario pidió incluirlo de todas formas.
+  // "RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA" se EXCLUYE a propósito
+  // del match por prefijo — investigado y CONFIRMADO doble conteo real
+  // 2026-09-11 (Hidalgo 1-sep, póliza 755): el ERP ya reportaba este mismo
+  // retiro ($337.99, ticket B0-260900062) como ajuste `SF-RETIRO-EFECTIVO`
+  // DENTRO del consolidado de Venta/Efectivo (ver `ajustesEfectivoRetiroSF`
+  // en cfdi-poliza-generator.service.js — devolución que genera Saldo a Favor
+  // y el cliente lo retira en efectivo, mismo monto exacto). Restarlo TAMBIÉN
+  // aquí duplicaba la resta. Ambos mecanismos parten del mismo dato real
+  // (`usos[].serieOrigen==='ABO'` en `/saldos-favor`, que es el mismo evento
+  // que `/desgloses-salidas/caja` reporta con este tipoMovimiento) — por eso
+  // se excluye explícitamente, aunque SÍ empiece con "RETIRO".
+  const RETIRO_EXCLUIDO_DOBLE_CONTEO = 'RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA';
   if (poliza.tipo === 'I') {
     const fechaYMD = fechaFinal.toISOString().slice(0, 10);
     // `centroCosto`/`centroCostoObj.clave` (ej. "111") es la clave NUMÉRICA
@@ -3181,7 +3188,10 @@ async function exportContpaqXlsx(id, overrides = {}) {
           continue;
         }
         const retiroEfectivo = salidas
-          .filter(s => (s.tipoMovimiento?.nombre || '').trim().toUpperCase().startsWith('RETIRO'))
+          .filter(s => {
+            const nombre = (s.tipoMovimiento?.nombre || '').trim().toUpperCase();
+            return nombre.startsWith('RETIRO') && nombre !== RETIRO_EXCLUIDO_DOBLE_CONTEO;
+          })
           .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
         if (retiroEfectivo > 0) retirosPorCentro.set(claveCentro, Math.round(retiroEfectivo * 100) / 100);
       }

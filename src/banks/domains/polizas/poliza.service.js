@@ -3129,17 +3129,28 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
 
-  // Retiros de EFECTIVO de caja (/desgloses-salidas/caja, tipoMovimiento
-  // "RETIRO DE EFECTIVO") — se restan de "Depósitos consolidados (Efectivo)"
-  // y se anotan en el desglose (_detalle) para que quede visible de dónde
-  // salió el ajuste. Confirmado con el usuario 2026-09-11 (caso real Hidalgo
-  // 3-sep: Efectivo cobrado $421,640.79, RETIRO DE EFECTIVO real
-  // $253,965.64, resultado esperado $167,675.15 — sin esto el consolidado
-  // mostraba el bruto cobrado, no el neto real). Solo Ingreso (tipo 'I') —
-  // Pagos/Egresos no tienen esta línea. Solo "RETIRO DE EFECTIVO": "Salida
-  // por Transferencia" NO se resta — ese efectivo se convirtió en un
-  // depósito bancario real que ya se cuenta aparte (restarlo también
-  // duplicaría la resta) — confirmado con el usuario el mismo día.
+  // Retiros de EFECTIVO de caja (/desgloses-salidas/caja) — se restan de
+  // "Depósitos consolidados (Efectivo)" y se anotan en el desglose
+  // (_detalle) para que quede visible de dónde salió el ajuste. Confirmado
+  // con el usuario 2026-09-11 (caso real Hidalgo 3-sep: RETIRO DE EFECTIVO
+  // $253,965.64). Solo Ingreso (tipo 'I') — Pagos/Egresos no tienen esta línea.
+  //
+  // El nombre exacto de `tipoMovimiento` varía día a día (verificado con
+  // datos reales: 3-sep solo trae "RETIRO DE EFECTIVO"; 1-sep en cambio trae
+  // "RETIRO POR FALTANTE DE EFECTIVO EN EL CIERRE DE SESIÓN" y "RETIRO POR
+  // DEVOLUCION Y/O CANCELACION DE VENTA", pero NO "RETIRO DE EFECTIVO") — por
+  // eso se hace match por PREFIJO ("RETIRO...") en vez de una lista fija de
+  // nombres exactos, confirmado con el usuario el mismo día para estos 3
+  // casos. "Salida por Transferencia" y "CIERRE CAJA" NUNCA se restan — ese
+  // efectivo se convirtió en un depósito bancario real que ya se cuenta
+  // aparte (restarlo también duplicaría la resta), y ninguno de los dos
+  // empieza con "RETIRO" así que el prefijo ya los excluye por sí solo.
+  //
+  // Riesgo conocido, no resuelto: "RETIRO POR DEVOLUCION Y/O CANCELACION DE
+  // VENTA" podría solaparse con el mecanismo YA EXISTENTE `SF-RETIRO-EFECTIVO`
+  // (cfdi-poliza-generator.service.js, devolución que genera SF pagado en
+  // efectivo) — si ambos aplican al mismo caso, se restaría dos veces. No se
+  // investigó a fondo; el usuario pidió incluirlo de todas formas.
   if (poliza.tipo === 'I') {
     const fechaYMD = fechaFinal.toISOString().slice(0, 10);
     // `centroCosto`/`centroCostoObj.clave` (ej. "111") es la clave NUMÉRICA
@@ -3170,7 +3181,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
           continue;
         }
         const retiroEfectivo = salidas
-          .filter(s => (s.tipoMovimiento?.nombre || '').toUpperCase() === 'RETIRO DE EFECTIVO')
+          .filter(s => (s.tipoMovimiento?.nombre || '').trim().toUpperCase().startsWith('RETIRO'))
           .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
         if (retiroEfectivo > 0) retirosPorCentro.set(claveCentro, Math.round(retiroEfectivo * 100) / 100);
       }

@@ -62,7 +62,23 @@ const BANK_PREFIX = {
 const BBVA_PSEUDO_AUTH_RE = /^(BNET|REFBNTC|COMPENSACION|\*+\d+)$/i;
 
 function isBBVAPseudoAuth(banco, auth) {
-  return banco === 'BBVA' && !!auth && BBVA_PSEUDO_AUTH_RE.test(auth.trim());
+  if (banco !== 'BBVA' || !auth) return false;
+  const trimmed = auth.trim();
+  if (BBVA_PSEUDO_AUTH_RE.test(trimmed)) return true;
+  // Validación positiva (2026-09-11, bug real: "COMP SPEI / COMP SPEI 085907..." y
+  // "COMPENSACION POR RETRASO / COMP SPEI" hacían que bank.parser.js#parseBBVA
+  // extrajera "COMP" — el primer token tras "/" — como numeroAutorizacion, al no ser
+  // puramente numérico y caer en el fallback `numeroAutorizacion = firstToken`. Ese
+  // token NO estaba cubierto por la lista de palabras clave de arriba, así que dos
+  // compensaciones DISTINTAS del mismo día con el mismo monto colisionaban en Capa A
+  // del dedup intra-lote (banco+auth+monto) — se perdían movimientos reales aunque
+  // tuvieran saldo distinto. Un numeroAutorizacion real de BBVA siempre trae al menos
+  // un dígito (folio/rastreo numérico o alfanumérico con dígitos); si el token no
+  // tiene NINGÚN dígito es una palabra del concepto, no una autorización, sin importar
+  // cuál sea exactamente — evita tener que seguir agregando casos sueltos a la lista
+  // de arriba cada vez que aparezca una palabra genérica nueva. `\*+\d+` (cuenta
+  // enmascarada) sí tiene dígitos y sigue cubierto solo por el regex explícito arriba.
+  return !/\d/.test(trimmed);
 }
 
 // Compara dos números de autorización ignorando ceros iniciales en los numéricos
@@ -111,6 +127,21 @@ function generarFolio(seq) {
 // UTC real es simplemente ese mismo día calendario + 6 horas — construirlo con Date.UTC(...,
 // 6, 0, 0) es inmune al TZ del proceso. Usado por getCards() y getStatusStats() — mismo helper
 // en los dos para no repetir el fix en 2 lugares por separado.
+// Límites UTC de un día calendario de México (2026-09-11) — mismo criterio que
+// _medianocheMx (collection-request-indicadores.service.js / cfdi-poliza-generator.
+// service.js): México sin DST desde 2022, offset fijo UTC-6, no amerita Intl/timeZone
+// para esto. Usados por exportMovements() en sus 3 filtros de fecha (fecha,
+// fechaAplicacion, fechaImportacion) — antes armaban límites en UTC puro
+// (`new Date(fechaStr)` = medianoche UTC, `${fin}T23:59:59.999Z` = fin de día UTC),
+// así que un movimiento ocurrido entre las 18:00 y 23:59 hora MX (que ya cae en las
+// 00:00-05:59 UTC del día siguiente) quedaba contado en el día calendario equivocado.
+function _inicioDiaMx(fechaStr) {
+  return new Date(`${fechaStr}T06:00:00.000Z`);
+}
+function _finDiaMx(fechaStr) {
+  return new Date(_inicioDiaMx(fechaStr).getTime() + 24 * 60 * 60 * 1000 - 1);
+}
+
 function _rangoAnioMesMexico(year, month) {
   const y = parseInt(year, 10);
   const m = month ? parseInt(month, 10) : null;
@@ -2272,14 +2303,14 @@ async function exportMovements(filters) {
 
   if (fechaInicio || fechaFin) {
     filter.fecha = {};
-    if (fechaInicio) filter.fecha.$gte = new Date(fechaInicio);
-    if (fechaFin)    filter.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
+    if (fechaInicio) filter.fecha.$gte = _inicioDiaMx(fechaInicio);
+    if (fechaFin)    filter.fecha.$lte = _finDiaMx(fechaFin);
   }
 
   if (fechaAplicacionInicio || fechaAplicacionFin) {
     const df = {};
-    if (fechaAplicacionInicio) df.$gte = new Date(fechaAplicacionInicio);
-    if (fechaAplicacionFin)    df.$lte = new Date(`${fechaAplicacionFin}T23:59:59.999Z`);
+    if (fechaAplicacionInicio) df.$gte = _inicioDiaMx(fechaAplicacionInicio);
+    if (fechaAplicacionFin)    df.$lte = _finDiaMx(fechaAplicacionFin);
     filter.$and = filter.$and ?? [];
     filter.$and.push({ $or: [
       { fichaAt: df },
@@ -2289,8 +2320,8 @@ async function exportMovements(filters) {
 
   if (fechaImportacionInicio || fechaImportacionFin) {
     filter.createdAt = {};
-    if (fechaImportacionInicio) filter.createdAt.$gte = new Date(fechaImportacionInicio);
-    if (fechaImportacionFin)    filter.createdAt.$lte = new Date(`${fechaImportacionFin}T23:59:59.999Z`);
+    if (fechaImportacionInicio) filter.createdAt.$gte = _inicioDiaMx(fechaImportacionInicio);
+    if (fechaImportacionFin)    filter.createdAt.$lte = _finDiaMx(fechaImportacionFin);
   }
 
   if (search) {
@@ -2389,7 +2420,7 @@ async function exportMovements(filters) {
     { header: 'Fecha aplicación',  key: 'fechaAplicacion',    width: 17 },
     { header: 'Depósito',          key: 'deposito',           width: 16 },
     { header: 'Retiro',            key: 'retiro',             width: 16 },
-    { header: 'Serie-Folio ERP',   key: 'erpIds',             width: 30 },
+    { header: 'Serie-Folio Venta / Ficha',   key: 'erpIds',   width: 30 },
     { header: 'Saldo ERP',         key: 'saldoErp',           width: 16 },
     { header: 'Diferencia',        key: 'diferencia',         width: 14 },
     { header: 'Estado',            key: 'status',             width: 17 },
@@ -3629,4 +3660,9 @@ module.exports = {
   // revert selectivo de traspasos entre cuentas propias.
   TODOS_MOTORES_HISTORICO,
   _rangoAnioMesMexico,
+  // Exportado para test de regresión del bug de dedup por auth "COMP" (2026-09-11).
+  isBBVAPseudoAuth,
+  // Exportados para test de regresión del bug de huso horario en los filtros de
+  // fecha de exportMovements (2026-09-11).
+  _inicioDiaMx, _finDiaMx,
 };

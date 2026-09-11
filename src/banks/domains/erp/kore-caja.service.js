@@ -457,17 +457,27 @@ async function actualizarEstatusSolicitud(koreToken, solicitudIdErp, estatus, co
   }
 }
 
-// Kore rechaza actualizarEstatusSolicitud con 400 "No puede cambiar el
-// estatus de la solicitud con estatus: X" si la solicitud YA está en el
-// estatus que se le pide poner — pasa en un reintento después de que un paso
-// posterior (ej. aplicar el cobro) falló y dejó la solicitud sin persistir en
-// Numo, aunque Kore ya la haya aprobado/rechazado la vez anterior. Detectarlo
-// permite tratar el reintento como éxito en vez de trabar el flujo para
-// siempre en este paso.
+// Extrae, del mensaje de rechazo de Kore ("no puede cambiar el estatus de
+// la solicitud con estatus: X"), el estatus REAL en el que Kore tiene la
+// solicitud — null si el error no tiene esta forma. Generaliza lo que antes
+// hacía esErrorYaEnEstatus (que solo comparaba contra un estatus fijo
+// esperado): esto permite reaccionar también cuando Kore ya AVANZÓ más allá
+// del estatus que se le pidió (ej. Numo pide APROBADO pero Kore ya está en
+// APLICADO porque un intento anterior sí llegó a aplicar el cobro real,
+// solo falló guardarlo en Numo después).
+function estatusActualDeErrorKore(err) {
+  if (!(err instanceof KoreCajaError)) return null;
+  const texto = `${err.koreBody?.Data ?? ''} ${err.koreBody?.Mensaje ?? ''}`;
+  if (!/no puede cambiar el estatus/i.test(texto)) return null;
+  const m = texto.match(/con estatus:\s*([A-ZÁÉÍÓÚÑ_]+)/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// Reintento idempotente: Kore ya tenía la solicitud EXACTAMENTE en el
+// estatus que se le pidió poner (ver estatusActualDeErrorKore arriba para
+// el caso más general de "ya avanzó más allá").
 function esErrorYaEnEstatus(err, estatus) {
-  if (!(err instanceof KoreCajaError)) return false;
-  const texto = `${err.koreBody?.Data ?? ''} ${err.koreBody?.Mensaje ?? ''}`.toLowerCase();
-  return texto.includes('no puede cambiar el estatus') && texto.includes(`con estatus: ${estatus}`.toLowerCase());
+  return estatusActualDeErrorKore(err) === String(estatus ?? '').toUpperCase();
 }
 
 module.exports = {
@@ -486,4 +496,5 @@ module.exports = {
   aplicarCobroOperacionMultiple,
   actualizarEstatusSolicitud,
   esErrorYaEnEstatus,
+  estatusActualDeErrorKore,
 };

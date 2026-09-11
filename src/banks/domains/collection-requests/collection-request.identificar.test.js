@@ -35,7 +35,7 @@ const service = require('./collection-request.service');
 
 class KoreCajaError extends Error {}
 koreCaja.KoreCajaError = KoreCajaError;
-koreCaja.esErrorYaEnEstatus = jest.fn(() => false);
+koreCaja.estatusActualDeErrorKore = jest.fn(() => null);
 
 function formaPago(id, descripcion, importe, extra = {}) {
   return {
@@ -85,7 +85,7 @@ function setupHappyKore() {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  koreCaja.esErrorYaEnEstatus = jest.fn(() => false);
+  koreCaja.estatusActualDeErrorKore = jest.fn(() => null);
   conTransaccion.mockImplementation((fn) => fn(null)); // standalone: sin sesión real
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'warn').mockImplementation(() => {});
@@ -584,5 +584,60 @@ describe('identificar() — abort post-Kore (D4: inconsistenciaPostKore, NO rein
         }),
       }),
     );
+  });
+});
+
+// Caso real: un intento anterior de identificar() SÍ llegó a avisar APROBADO
+// y a aplicar el cobro (Kore ya en APLICADO), pero falló guardar el resultado
+// en Numo (ver describe de arriba, "abort post-Kore") — o el aviso de ESTE
+// intento llegó tarde y Kore ya había avanzado. Antes de este fix, un
+// reintento chocaba con "no puede cambiar el estatus... con estatus:
+// APLICADO" sin que Numo lo reconociera, y quedaba trabado para siempre
+// (ver memoria del bug). El fix: reconciliar en vez de reavisar/reaplicar.
+describe('identificar() — Kore ya en APLICADO (reintento tras falla post-Kore) — reconciliación', () => {
+  test('estatusActualDeErrorKore=APLICADO -> NO reavisa/reaplica, reconcilia el movimiento y marca koreOperacionResult.reconciliado', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.actualizarEstatusSolicitud.mockRejectedValue(
+      new KoreCajaError('No puede cambiar el estatus de la solicitud con estatus: APLICADO'),
+    );
+    koreCaja.estatusActualDeErrorKore.mockReturnValue('APLICADO');
+
+    const resultado = await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    // No se vuelve a resolver banco (paso 5) ni a aplicar el cobro (paso 6) —
+    // Kore YA lo aplicó, reaplicar lo duplicaría (acumula sobre saldos existentes).
+    expect(koreCaja.listarFormasPago).not.toHaveBeenCalled();
+    expect(koreCaja.listarBancos).not.toHaveBeenCalled();
+    expect(koreCaja.aplicarSolicitudOperacion).not.toHaveBeenCalled();
+
+    // Igual se reconcilia: el movimiento queda vinculado y la solicitud identificada.
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(1);
+    expect(cr.status).toBe('identificada');
+    expect(cr.cobroAplicado).toBe(true);
+    expect(cr.koreOperacionResult).toEqual(expect.objectContaining({ reconciliado: true }));
+    expect(resultado.reconciliacion).toBeDefined();
+    expect(emitToAll).toHaveBeenCalledWith('collection-request:updated', expect.objectContaining({ _id: 'cr-1' }));
+  });
+
+  test('estatusActualDeErrorKore=APROBADO (reintento normal, ya cubierto antes del fix) -> sigue aplicando el cobro, sin reconciliar', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.actualizarEstatusSolicitud.mockRejectedValue(
+      new KoreCajaError('No puede cambiar el estatus de la solicitud con estatus: APROBADO'),
+    );
+    koreCaja.estatusActualDeErrorKore.mockReturnValue('APROBADO');
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    expect(cr.status).toBe('identificada');
+    expect(cr.koreOperacionResult).not.toEqual(expect.objectContaining({ reconciliado: true }));
   });
 });

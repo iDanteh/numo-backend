@@ -348,6 +348,34 @@ function _elegirBancoRealPorMonto(candidatos, monto) {
   return exacto ?? candidatos[0];
 }
 
+// Complemento a `_elegirBancoRealPorMonto`: detecta cuando NINGÚN candidato
+// calza solo con el monto de la línea, pero la SUMA de TODOS los candidatos
+// del ticket sí lo hace — un mismo pago (Transferencia/Cheque) cubierto por
+// 2+ depósitos bancarios reales distintos (caso real 2026-09-11, Ferrocarril
+// F0-260900334/SD SOLUTIONS: transferencia $1,563.26 pagada con 2 depósitos
+// SPEI del mismo remitente, $1,483.32 + $79.94 — cada uno es un `BankMovement`
+// separado con su propio `numeroAutorizacion`).
+//
+// Sin esto, `_elegirBancoRealPorMonto` caía a `candidatos[0]` y el llamador
+// fijaba `debe` de la línea al depósito de ESE candidato solamente
+// (`_debeFijoBanco`) — el otro depósito se perdía sin dejar rastro en la
+// línea real de la póliza (seguía en Bancos/conciliación, solo no aquí).
+//
+// Requiere que TODOS los candidatos traigan `montoBancoReal` (si falta en
+// alguno no se puede repartir con confianza) y que la suma calce dentro de la
+// misma tolerancia generosa que `_elegirBancoRealPorMonto` (comisiones/
+// redondeo). Si ya hay un match único exacto, no aplica (ese caso lo resuelve
+// `_elegirBancoRealPorMonto` normalmente).
+function _elegirBancoRealMultiple(candidatos, monto) {
+  if (!candidatos || candidatos.length < 2) return null;
+  if (candidatos.some(c => c.montoBancoReal == null)) return null;
+  if (candidatos.some(c => Math.abs(c.montoBancoReal - monto) < 0.01)) return null;
+  const suma = candidatos.reduce((s, c) => s + c.montoBancoReal, 0);
+  const tolerancia = Math.max(10, monto * 0.05);
+  if (Math.abs(suma - monto) > tolerancia) return null;
+  return candidatos;
+}
+
 // Poliza.tipo interno (A,I,E,D,N,C,P) → TipoPol de CONTPAQi (1=Ingreso 2=Egreso 3=Diario)
 const TIPO_POL_MAP = { I: '1', E: '2' };
 const tipoPolContpaq = (tipo) => TIPO_POL_MAP[tipo] ?? '3';
@@ -1511,6 +1539,11 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
       ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
       : null;
+    // Ver `_elegirBancoRealMultiple` — caso 2+ depósitos reales que en
+    // conjunto (no uno solo) explican el monto de esta línea.
+    const multipleTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
+      ? _elegirBancoRealMultiple(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
+      : null;
     // Solo se confía en `esTransferencia` cuando el movimiento bancario SÍ
     // trae `categoria` (SPEI/TRASPASO/otra) — si el match existe pero la
     // categoría nunca se llenó (`categoriaConocida: false`, el caso más
@@ -1610,6 +1643,41 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     if ((esTransferenciaVerificada || esChequeDeclarado) && !esRemanenteMenor) {
       const tipoDetalle = esTransferenciaVerificada ? 'TRANSFERENCIA' : 'CHEQUE';
       const subcodigoDetalle = esTransferenciaVerificada ? subcodigoTransferencia : 0;
+
+      // 2+ depósitos bancarios reales que en conjunto explican el monto de
+      // esta línea (ver `_elegirBancoRealMultiple`) — una línea (grupo) por
+      // cada depósito, cada uno con su propio monto real, en vez de fijar el
+      // debe completo al primero y perder el resto (caso real 2026-09-11,
+      // Ferrocarril F0-260900334/SD SOLUTIONS: $1,483.32 + $79.94 = $1,563.26).
+      // El último absorbe el residuo de redondeo para que la suma cuadre
+      // exacto con `m.debe`, mismo criterio ya usado en otros repartos del
+      // export (formasPago, bancoPorVenta en cobros-sucursal-puente.service.js).
+      if (multipleTicketTransfCheque) {
+        let acumuladoMultiple = 0;
+        multipleTicketTransfCheque.forEach((cand, idx) => {
+          const esUltimoCand = idx === multipleTicketTransfCheque.length - 1;
+          const montoCand = esUltimoCand
+            ? Math.round((Number(m.debe) - acumuladoMultiple) * 100) / 100
+            : Math.round(cand.montoBancoReal * 100) / 100;
+          acumuladoMultiple += montoCand;
+          if (montoCand <= 0) return;
+          const cuentaLineaCand = cand.cuentaBanco ?? m.cuenta;
+          const referenciaCand  = cand.referencia ?? null;
+          const sufijoCand      = referenciaCand ?? `${m.serieVentaTicket}|${m.folioVentaTicket}|${idx}`;
+          const keyCand = `${cuentaLineaCand?.codigo}|${centroCosto}|${tipoDetalle}|${sufijoCand}`;
+          if (!gruposDetallados.has(keyCand)) {
+            gruposDetallados.set(keyCand, {
+              cuenta: cuentaLineaCand, centroCosto, referencia: referenciaCand, tipoDetalle, subcodigo: subcodigoDetalle,
+              debe: 0, detalle: [], primerMov: m, _debeFijoBanco: true,
+            });
+          }
+          const gtCand = gruposDetallados.get(keyCand);
+          gtCand.debe += montoCand;
+          gtCand.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: montoCand, formaPago: tipoDetalle, nota: notaConSerie });
+        });
+        continue;
+      }
+
       // `infoTicketTransfCheque` ya se calculó arriba (lo usa también el
       // gate `esTransferenciaVerificada`) — info por TICKET tiene prioridad
       // sobre `bancario` (CFDI completo): en una Factura Global, `bancario`

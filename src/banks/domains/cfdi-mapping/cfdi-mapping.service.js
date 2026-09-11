@@ -1407,6 +1407,25 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   if (esAnticipo && rule.cuentaDeltaAnticipo && context.totalRelacionado != null) {
     const delta = parseFloat((total - context.totalRelacionado).toFixed(2));
     if (delta > 0) {
+      // Forma de pago REAL del remanente (no la del CFDI, que para Reg 22C
+      // siempre es "30"/Anticipo) — sin esto esta línea hereda formaPago='30'
+      // vía el spread de `satMeta` al final de la función, aunque el
+      // remanente se haya cobrado en Efectivo/Tarjeta real. Caso real
+      // 2026-09-11 (Hidalgo 3-sep, tickets B0-260900608/634): $3.08/$26.21
+      // pagados en Efectivo real ($01), quedaban fuera de "Depósitos
+      // consolidados (Efectivo)" por llevar formaPago='30'. Mismo mecanismo
+      // `_formaPagoReal` ya usado arriba (línea ~996) para sobrevivir al
+      // spread de `satMeta`. Solo se aplica cuando hay EXACTAMENTE una forma
+      // de pago no-Anticipo en `desglosePagoReal` y su monto calza (±$0.02)
+      // con `delta` — si no calza o hay varias, se deja sin `_formaPagoReal`
+      // (comportamiento anterior) en vez de adivinar cuál corresponde.
+      const fpsNoAnticipo = Array.isArray(context.desglosePagoReal)
+        ? context.desglosePagoReal.filter(fp => (fp.claveSat ?? '').trim() !== '30')
+        : [];
+      const sumaNoAnticipo = fpsNoAnticipo.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+      const formaPagoRealDelta = fpsNoAnticipo.length === 1 && Math.abs(sumaNoAnticipo - delta) < 0.02
+        ? ((fpsNoAnticipo[0].claveSat ?? '').trim() || null)
+        : null;
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaDeltaAnticipo] ?? null,
         concepto:    `Saldo - ${concepto}`,
@@ -1415,6 +1434,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         haber:       0,
         cfdiUuid:    cfdi.uuid,
         rfcTercero,
+        ...(formaPagoRealDelta ? { _formaPagoReal: formaPagoRealDelta } : {}),
       });
     }
   }

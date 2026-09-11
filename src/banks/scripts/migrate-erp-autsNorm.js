@@ -9,10 +9,20 @@
  * A partir de este script, el campo se mantiene actualizado automáticamente
  * en cada sync (erp-sync.service.js → extraerAutsNorm).
  *
- * Es seguro ejecutarlo varias veces; solo toca documentos con _autsNorm vacío.
+ * Es seguro ejecutarlo varias veces; por defecto solo toca documentos con
+ * _autsNorm vacío.
  *
  * Uso:
  *   node src/banks/scripts/migrate-erp-autsNorm.js
+ *   node src/banks/scripts/migrate-erp-autsNorm.js --force   # recalcula TODOS
+ *
+ * --force: recalcula _autsNorm en TODOS los documentos con movimientos,
+ * incluso los que ya lo tenían poblado. Necesario tras el fix 2026-09-11
+ * (extraerAutsNorm ahora incluye TODOS los números de autorización de cada
+ * formaPago, no solo el primero — ver erp-auth.utils.js/normalizarAuthLista);
+ * sin --force, los documentos ya sincronizados antes del fix se quedarían
+ * con el _autsNorm viejo (incompleto) para siempre, porque el modo normal
+ * los salta.
  *
  * Variables de entorno requeridas: MONGODB_URI
  */
@@ -25,6 +35,7 @@ const { extraerAutsNorm } = require('../domains/erp/erp-auth.utils');
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const BATCH_SIZE  = 500;
+const FORCE       = process.argv.includes('--force');
 
 async function run() {
   if (!MONGODB_URI) {
@@ -33,19 +44,23 @@ async function run() {
   }
 
   await mongoose.connect(MONGODB_URI);
-  console.log('Conectado a MongoDB.');
+  console.log(`Conectado a MongoDB.${FORCE ? ' (--force: recalculando TODOS los documentos)' : ''}`);
 
-  // Solo documentos sin _autsNorm o con array vacío pero que sí tienen movimientos.
-  // Los que ya tienen _autsNorm poblado se omiten (idempotente).
+  // Modo normal: solo documentos sin _autsNorm o con array vacío (idempotente).
+  // Modo --force: TODOS los documentos con movimientos, sin importar si ya
+  // tenían _autsNorm poblado (necesario para aplicar el fix de multi-autorización).
+  const filtro = FORCE
+    ? { movimientos: { $exists: true, $ne: [] } }
+    : {
+        $or: [
+          { _autsNorm: { $exists: false } },
+          { _autsNorm: { $size: 0 } },
+        ],
+        movimientos: { $exists: true, $ne: [] },
+      };
+
   const cursor = ErpCuentaPendiente
-    .find({
-      $or: [
-        { _autsNorm: { $exists: false } },
-        { _autsNorm: { $size: 0 } },
-      ],
-      // Solo vale la pena procesar los que potencialmente tienen auths
-      movimientos: { $exists: true, $ne: [] },
-    })
+    .find(filtro)
     .select('_id movimientos')
     .lean()
     .cursor();

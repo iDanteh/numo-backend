@@ -1285,20 +1285,31 @@ async function construirMovimientosPuente({
     // cuándo se generó ni el período de la venta original.
     // Ver comentario en el parámetro `ventasSFCubiertasPorSplit` (arriba,
     // definición de la función): si `cfdiToMovimientos` YA va a cubrir el SF
-    // usado de esta VENTA GENERADORA (split por origen), este bloque completo
-    // se omite para no duplicar — confirmado con caso real 2026-09-04. Se usa
-    // `cuenta.serieVenta/folioVenta` (la venta generadora que este `cuenta`
-    // representa aquí, NO la factura consumidora — ver `usadosPorCuenta`,
-    // poblado desde `saldosFavorGenerados[].usos[]`), la MISMA referencia que
-    // `d.ventaSerie/d.ventaFolio` en `emitirLineaSF`/cfdi-mapping.service.js.
-    const _yaLoCubreSplitPorOrigen = ventasSFCubiertasPorSplit.has(`${cuenta.serieVenta}|${cuenta.folioVenta}`);
-    if (!esPPD && !_yaLoCubreSplitPorOrigen && cuentaSaldoFavorId && cuentaIvaSaldoFavorId) {
+    // usado de esta VENTA GENERADORA (split por origen), ese uso puntual se
+    // omite aquí para no duplicar — confirmado con caso real 2026-09-04.
+    //
+    // BUG CORREGIDO 2026-09-11 (caso real CATEDRAL RESTAURANTE BAR, Hidalgo
+    // 4-sep-2026, póliza 664): el guard anterior comparaba
+    // `cuenta.serieVenta/folioVenta` (la venta CONSUMIDORA — este `cuenta` es
+    // el ticket que USÓ el saldo, no el que lo generó, ver `usadosPorCuenta`
+    // más abajo) contra `ventasSFCubiertasPorSplit`, que está indexado por la
+    // venta ORIGEN (`d.ventaSerie/d.ventaFolio` en
+    // `emitirLineaSF`/cfdi-mapping.service.js). Como son claves de universos
+    // distintos, nunca coincidían y el guard jamás bloqueaba nada: un SF
+    // generado en junio y usado en 3 facturas de meses distintos (todas
+    // cobradas hoy) se contaba dos veces por cada uso — una vez aquí
+    // ('Cobro Sucursal') y otra vez vía el split por origen ('Cargo
+    // Especial'). Ahora se filtra CADA `uso` individualmente por SU PROPIA
+    // venta origen (`u.serieVenta/u.folioVenta`, el mismo campo crudo del ERP
+    // que alimenta `d.ventaSerie/d.ventaFolio`), no por la venta consumidora.
+    if (!esPPD && cuentaSaldoFavorId && cuentaIvaSaldoFavorId) {
       const sfUsadosVenta = (usadosPorCuenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
         .filter(u => {
           if (!fechaDesde || !fechaHasta) return true;
           const f = u.fecha ? new Date(u.fecha) : null;
           return f && f >= fechaDesde && f <= fechaHasta;
-        });
+        })
+        .filter(u => !ventasSFCubiertasPorSplit.has(`${u.serieVenta}|${u.folioVenta}`));
       const soloCobrosAPA = (cuenta.cobros ?? []).length > 0
         && (cuenta.cobros ?? []).every(cb => (cb.serieOrigen ?? '').toUpperCase() === 'APA');
       if (sfUsadosVenta.length > 0 && soloCobrosAPA

@@ -24,6 +24,7 @@ const Poliza            = require('./Poliza');
 const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
+const Terminal          = require('./Terminal');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
 const CobroSucursalPendienteCobranza = require('./CobroSucursalPendienteCobranza');
@@ -55,6 +56,10 @@ Poliza.hasMany(Notificacion,   { foreignKey: 'polizaId', as: 'notificaciones' })
 /** Centros de costo */
 PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
 CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movimientos' });
+
+/** Terminales — cada terminal pertenece a una sucursal (centro de costo) */
+Terminal.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCosto' });
+CentroCosto.hasMany(Terminal,   { foreignKey: 'centroCostoId', as: 'terminales' });
 
 /** Regla de mapeo CFDI usada al generar el movimiento */
 PolizaMovimiento.belongsTo(CfdiMappingRule, { foreignKey: 'reglaId', as: 'regla' });
@@ -106,6 +111,10 @@ async function syncModels() {
   // La columna centro_costo_id en poliza_movimientos se agrega vía raw SQL más abajo.
   await CentroCosto.sync({ force: false });
   await ClienteCatalogo.sync({ force: false });
+
+  // Terminal: force:false, misma razón. Depende de CentroCosto (FK centro_costo_id),
+  // por eso se sincroniza justo después.
+  await Terminal.sync({ force: false });
 
   // Cola de cobros cruzados de sucursal (ver CobroSucursalPendiente.js) —
   // tabla nueva, force:false para solo crearla si no existe.
@@ -411,4 +420,4 @@ async function syncModels() {
   await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

@@ -8,6 +8,7 @@ const {
   SERIES_CON_AUTH,
   normalizarAuth,
   normalizarAuthBloques,
+  normalizarAuthLista,
 } = require('../erp/erp-auth.utils');
 const { resolvePrimeraIdentificacion } = require('./identificacion-timestamp.util');
 const globalConfigService = require('../../../shared/services/global-config.service');
@@ -444,7 +445,14 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
   // Solo genera filas para CxC que tengan autorización en formasPago.
   // CxC sin auth en ningún formasPago son descartadas silenciosamente.
   // erpIdsIgnorar: Set de erpIds a omitir (evita duplicados en llamadas sucesivas).
-  const seenPairs = new Set();
+  const seenPairs     = new Set();
+  // CxC con 2+ autorizaciones en un solo formaPago (Tarjeta, 2+ swipes/terminales
+  // — ver normalizarAuthLista) se acumulan aparte, no como filas normales:
+  // fp.monto es el TOTAL del ticket, no la porción de cada swipe, así que no se
+  // puede tratar cada número como una fila independiente con ese mismo total
+  // (fallaría importeOk en ambas). Se resuelven en ejecutarFaseDeMatchMultiAuth.
+  const seenMultiKeys = new Set();
+  const multiRows     = [];
   function extraerRows(cxcs, erpIdsIgnorar) {
     const rows = [];
     for (const cxc of cxcs) {
@@ -452,11 +460,9 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
       for (const mov of (cxc.movimientos || [])) {
         if (!SERIES_CON_AUTH.includes(mov.serie)) continue;
         for (const fp of (mov.formasPago || [])) {
-          const autNorm = normalizarAuth(fp.autorizacion);
-          if (!autNorm) continue;
-          const pairKey = `${cxc.erpId}:${autNorm}`;
-          if (seenPairs.has(pairKey)) continue;
-          seenPairs.add(pairKey);
+          const autNorms = normalizarAuthLista(fp.autorizacion);
+          if (!autNorms.length) continue;
+
           // fp.monto es más preciso en pagos mixtos (ej. tarjeta + efectivo), donde
           // fp.monto es la porción cubierta por esta forma de pago específica.
           // EXCEPCIÓN: pago masivo (1 transferencia → N CxC). El ERP registra el monto
@@ -467,11 +473,87 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
           const movTotal    = fpMontoAbs > movTotalAbs && movTotalAbs > 0
             ? movTotalAbs
             : (fpMontoAbs || movTotalAbs);
+
+          if (autNorms.length > 1) {
+            const multiKey = `${cxc.erpId}:${autNorms.slice().sort().join(',')}`;
+            if (seenMultiKeys.has(multiKey)) continue;
+            seenMultiKeys.add(multiKey);
+            multiRows.push({ autNorms, movTotal, cxc });
+            continue;
+          }
+
+          const autNorm = autNorms[0];
+          const pairKey = `${cxc.erpId}:${autNorm}`;
+          if (seenPairs.has(pairKey)) continue;
+          seenPairs.add(pairKey);
           rows.push({ autNorm, movTotal, cxc });
         }
       }
     }
     return rows;
+  }
+
+  // Vincula un grupo de N movimientos bancarios (candidatos ya validados: su
+  // SUMA de depósitos calza con el total de esta CxC) a la MISMA CxC — caso
+  // inverso a pushGroupOp (ahí N CxC comparten 1 movimiento; aquí 1 CxC se
+  // reparte entre N movimientos, ej. Tarjeta con 2 swipes/terminales).
+  // Cada movimiento recibe su propio link con saldoActual = SU depósito real
+  // (no el total de la CxC) — cada uno queda 'identificado' de forma
+  // independiente sin necesidad de saber cuánto cubrió cada swipe.
+  function pushMultiOp(movs, cxc) {
+    const nuevosMovs = movs.filter(m => !(m.erpIds || []).includes(cxc.erpId));
+    if (!nuevosMovs.length) return; // ya vinculados en una corrida anterior
+
+    for (const mov of nuevosMovs) {
+      usedMovIds.add(mov._idStr);
+      matcheados++;
+
+      const saldoActual = mov.deposito ?? 0;
+      const newLinks = [...(mov.erpLinks || []), {
+        erpId:          cxc.erpId,
+        saldoActual,
+        folioFiscal:    cxc.folioFiscal    ?? null,
+        total:          cxc.total          ?? null,
+        serie:          cxc.serie          ?? null,
+        folioExterno:   cxc.folioExterno   ?? null,
+        tieneRetencion: cxc.tieneRetencion ?? false,
+        tipoPago:       cxc.tipoPago ? String(cxc.tipoPago).trim().toUpperCase() : null,
+      }];
+      const newIds = [...(mov.erpIds || []), cxc.erpId];
+
+      const saldoErp = newLinks.reduce(
+        (s, l) => s + (l.saldoActual != null ? l.saldoActual : (l.total ?? 0)),
+        0,
+      );
+      const newStatus = Math.abs((mov.deposito ?? 0) - saldoErp) <= ERP_TOLERANCE
+        ? 'identificado'
+        : 'no_identificado';
+      if (newStatus === 'identificado') identificados++;
+
+      const { primeraIdentificacionAt, primeraIdentificacionPor } =
+        resolvePrimeraIdentificacion(newStatus, mov, null);
+
+      ops.push({
+        updateOne: {
+          filter: {
+            _id:             mov._id,
+            status:          'no_identificado',
+            identificadoPor: { $not: { $elemMatch: { userId: { $nin: [...MOTOR_USERIDS, null] } } } },
+          },
+          update: {
+            $set: {
+              erpIds:   newIds,
+              erpLinks: newLinks,
+              saldoErp,
+              status:   newStatus,
+              identificadoPor: [{ userId: 'erp-auto', nombre: 'Motor ERP', fechaId: new Date() }],
+              primeraIdentificacionAt,
+              primeraIdentificacionPor,
+            },
+          },
+        },
+      });
+    }
   }
 
   // ── Búsqueda de movimiento bancario candidato ─────────────────────────────
@@ -570,6 +652,72 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     }
   }
 
+  // ── Fase multi-auth: Tarjeta con 2+ autorizaciones en un solo formaPago ─────
+  // El ERP no reporta cuánto cubrió cada swipe/terminal individualmente
+  // (fp.monto es el TOTAL del ticket) — así que en vez de exigir que UN
+  // movimiento calce con el total, se busca UN candidato libre por cada número
+  // de autorización y se exige que la SUMA de sus depósitos calce con el total
+  // (tolerancia proporcional al número de movimientos, por redondeos de centavos
+  // acumulados). Requiere EXACTAMENTE 1 candidato libre por número: si hay 0 o
+  // 2+, no se adivina — se reporta sin match (evita vincular el movimiento
+  // equivocado por ambigüedad).
+  async function ejecutarFaseDeMatchMultiAuth(rows, pctStart, pctEnd) {
+    if (!rows.length) return;
+    totalRows += rows.length;
+
+    let procesados = 0;
+    for (const { autNorms, movTotal, cxc } of rows) {
+      const reportarSinMatch = () => noMatcheados.push({
+        autorizacion:  autNorms.join(','),
+        importe:       movTotal,
+        banco:         bancoNorm,
+        erpId:         cxc.erpId         ?? null,
+        folioExterno:  cxc.folioExterno  ?? null,
+        serie:         cxc.serie         ?? null,
+        folioFiscal:   cxc.folioFiscal   ?? null,
+        fechaRealPago: cxc.fechaRealPago ?? null,
+      });
+
+      procesados++;
+      if (procesados % 500 === 0) {
+        onProgress?.({
+          phase: 'matching',
+          pct:   pctStart + Math.round(((pctEnd - pctStart) * procesados) / rows.length),
+          msg:   `Fase multi-auth: ${procesados} de ${rows.length}`,
+        });
+        await new Promise(r => setImmediate(r));
+      }
+
+      const vistos = new Set();
+      const candidatosPorAuth = autNorms.map(a => {
+        const cands = [...(byAuthNorm.get(a) || []), ...(byAuthNormAlt.get(a) || [])];
+        return cands.filter(m => {
+          if (usedMovIds.has(m._idStr) || vistos.has(m._idStr)) return false;
+          vistos.add(m._idStr);
+          return true;
+        });
+      });
+
+      if (candidatosPorAuth.some(list => list.length !== 1)) { reportarSinMatch(); continue; }
+      const candidatos = candidatosPorAuth.map(list => list[0]);
+
+      const cxcFechaMs = (() => {
+        const d = cxc.fechaRealPago ?? cxc.fechaAfectacion ?? null;
+        return d ? new Date(d).getTime() : null;
+      })();
+      const fueraDeVentana = cxcFechaMs !== null && candidatos.some(
+        m => m.fechaMs !== null && Math.abs(m.fechaMs - cxcFechaMs) > dateMatchWindowMs,
+      );
+      if (fueraDeVentana) { reportarSinMatch(); continue; }
+
+      const suma       = candidatos.reduce((s, m) => s + (m.deposito ?? 0), 0);
+      const tolerancia = ERP_TOLERANCE * candidatos.length;
+      if (Math.abs(suma - movTotal) > tolerancia) { reportarSinMatch(); continue; }
+
+      pushMultiOp(candidatos, cxc);
+    }
+  }
+
   onProgress?.({ phase: 'matching', pct: 55, msg: `Cruzando ${cxcsA.length} CxC contra ${movimientos.length} movimientos...` });
   await ejecutarFaseDeMatch(extraerRows(cxcsA, null), 55, 70, 'Fase A (auths explícitas)');
 
@@ -626,7 +774,16 @@ async function matchAutorizacionesDesdeErp({ banco, fechaDesde } = {}, { onProgr
     }
   }
 
-  onProgress?.({ phase: 'writing', pct: 85, msg: `Guardando ${ops.length} asociación(es) en la base de datos...` });
+  // ── Fase multi-auth: CxC con 2+ autorizaciones en un solo formaPago ─────────
+  // Se ejecuta al final, después de A/B, para que ambas hayan tenido oportunidad
+  // de poblar `multiRows` (ver extraerRows) y para no competir por movimientos
+  // que A/B ya hayan vinculado (usedMovIds ya refleja ambas fases aquí).
+  if (multiRows.length > 0) {
+    onProgress?.({ phase: 'matching', pct: 86, msg: `Fase multi-auth: cruzando ${multiRows.length} CxC con autorización múltiple (Tarjeta 2+ swipes)...` });
+    await ejecutarFaseDeMatchMultiAuth(multiRows, 86, 90);
+  }
+
+  onProgress?.({ phase: 'writing', pct: 90, msg: `Guardando ${ops.length} asociación(es) en la base de datos...` });
   // ── Escritura en bulk (con transacción si el entorno lo soporta) ─────────
   if (ops.length > 0) {
     await ejecutarBulkConTransaccion(ops);

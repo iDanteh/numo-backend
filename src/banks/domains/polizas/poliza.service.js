@@ -16,6 +16,7 @@ const { esConceptoMarcadorAjuste } = require('../cfdi-mapping/cfdi-mapping.servi
 const traspasosInternosService = require('../banks/traspasos-internos.service');
 const compensacionesInteresesService = require('../banks/compensaciones-intereses.service');
 const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
+const { obtenerDesglosesSalidasCajaPorAlmacen } = require('../erp/erp-sync.service');
 
 // Categorías de bank_movements que representan una transferencia electrónica
 // real. Incluye "DEPOSITO" (2026-08-31, confirmado con el usuario, caso real
@@ -3127,6 +3128,63 @@ async function exportContpaqXlsx(id, overrides = {}) {
   }
 
   _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
+
+  // Retiros de EFECTIVO de caja (/desgloses-salidas/caja, tipoMovimiento
+  // "RETIRO DE EFECTIVO") — se restan de "Depósitos consolidados (Efectivo)"
+  // y se anotan en el desglose (_detalle) para que quede visible de dónde
+  // salió el ajuste. Confirmado con el usuario 2026-09-11 (caso real Hidalgo
+  // 3-sep: Efectivo cobrado $421,640.79, RETIRO DE EFECTIVO real
+  // $253,965.64, resultado esperado $167,675.15 — sin esto el consolidado
+  // mostraba el bruto cobrado, no el neto real). Solo Ingreso (tipo 'I') —
+  // Pagos/Egresos no tienen esta línea. Solo "RETIRO DE EFECTIVO": "Salida
+  // por Transferencia" NO se resta — ese efectivo se convirtió en un
+  // depósito bancario real que ya se cuenta aparte (restarlo también
+  // duplicaría la resta) — confirmado con el usuario el mismo día.
+  if (poliza.tipo === 'I') {
+    const fechaYMD = fechaFinal.toISOString().slice(0, 10);
+    const centrosPropios = [...new Set(
+      movimientos.map(m => m.centroCostoObj?.clave ?? m.centroCosto ?? null).filter(Boolean),
+    )];
+    if (centrosPropios.length) {
+      const retirosPorCentro = new Map();
+      for (const centroClave of centrosPropios) {
+        let salidas = [];
+        try {
+          salidas = await obtenerDesglosesSalidasCajaPorAlmacen({
+            rfc: poliza.rfc, almacen: centroClave,
+            fechaDesde: `${fechaYMD}T00:00:00-06:00`, fechaHasta: `${fechaYMD}T23:59:59-06:00`,
+          });
+        } catch (e) {
+          // Solo-lectura/informativo — si el ERP falla, no debe tumbar el export completo.
+          const { logger } = require('../../../shared/utils/logger');
+          logger.warn(`[exportContpaqXlsx] /desgloses-salidas/caja falló para ${centroClave} ${fechaYMD}: ${e.message}`);
+          continue;
+        }
+        const retiroEfectivo = salidas
+          .filter(s => (s.tipoMovimiento?.nombre || '').toUpperCase() === 'RETIRO DE EFECTIVO')
+          .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
+        if (retiroEfectivo > 0) retirosPorCentro.set(centroClave, Math.round(retiroEfectivo * 100) / 100);
+      }
+
+      if (retirosPorCentro.size) {
+        for (const bloque of bloques) {
+          for (const mov of bloque.movs) {
+            if (mov.concepto !== 'Depósitos consolidados (Efectivo)') continue;
+            const retiro = retirosPorCentro.get(mov.centroCosto);
+            if (!retiro) continue;
+            const netoAjustado = Math.round((Number(mov.debe) - Number(mov.haber || 0) - retiro) * 100) / 100;
+            mov.debe  = netoAjustado > 0 ? netoAjustado : 0;
+            mov.haber = netoAjustado < 0 ? Math.abs(netoAjustado) : 0;
+            if (!Array.isArray(mov._detalle)) mov._detalle = [];
+            mov._detalle.push({
+              cfdiUuid: null, serie: null, monto: -retiro, formaPago: 'EFECTIVO',
+              nota: 'RETIRO DE EFECTIVO (salida de caja)',
+            });
+          }
+        }
+      }
+    }
+  }
 
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+

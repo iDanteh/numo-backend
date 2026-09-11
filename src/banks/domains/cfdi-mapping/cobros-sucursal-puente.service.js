@@ -892,13 +892,21 @@ async function construirMovimientosPuente({
   // el usuario 2026-08-04 con datos reales (RENIT/GRUPO CUBOOAX, banco
   // Banamex). Sin esto, estas líneas se quedan en la cuenta genérica
   // "Bancos por identificar" aunque sí haya un depósito real identificado.
-  const bancoPorVenta = new Map(); // `${serie}|${folioVenta}` → { banco, referencia }
+  // `${serie}|${folioVenta}` → [{ banco, referencia, monto }, ...]. Array y no
+  // un solo objeto: un ticket puede tener 2+ movimientos bancarios reales
+  // vinculados (Tarjeta con 2+ swipes/terminales en un solo formaPago, ver
+  // `normalizarAuthLista` en bank-autorizaciones.service.js) — un `.set()`
+  // simple perdía todos menos el último (mismo bug ya corregido para
+  // Transferencia en `construirBancoRealPorTicket`, poliza.service.js,
+  // 2026-08-31; aquí no se había replicado — caso real 2026-09-11, SD
+  // SOLUTIONS / F0-260900334).
+  const bancoPorVenta = new Map();
   if (docsUnicos.length) {
     const orCondiciones = docsUnicos.map(d => ({ 'erpLinks.serie': d.serie, 'erpLinks.folioExterno': d.folio }));
     for (let i = 0; i < orCondiciones.length; i += LOTE) {
       const lote = orCondiciones.slice(i, i + LOTE);
       const movsBanco = await BankMovement.find({ $or: lote }, {
-        banco: 1, folio: 1, erpLinks: 1,
+        banco: 1, folio: 1, erpLinks: 1, deposito: 1,
       }).lean();
       for (const mb of movsBanco) {
         // `folio` (el auto-incremental propio de Numo, ej. "034287") — NO
@@ -910,7 +918,15 @@ async function construirMovimientosPuente({
           if (!link.serie || !link.folioExterno) continue;
           const key = `${link.serie}|${link.folioExterno}`;
           if (!docsUnicos.some(d => `${d.serie}|${d.folio}` === key)) continue;
-          bancoPorVenta.set(key, { banco: mb.banco, referencia });
+          if (!bancoPorVenta.has(key)) bancoPorVenta.set(key, []);
+          // saldoActual = la porción de ESTE movimiento que corresponde a esta
+          // CxC (ver pushGroupOp/pushMultiOp en bank-autorizaciones.service.js);
+          // más preciso que mb.deposito cuando un movimiento cubre más de una CxC.
+          bancoPorVenta.get(key).push({
+            banco:      mb.banco,
+            referencia,
+            monto:      Math.abs(link.saldoActual ?? mb.deposito ?? 0),
+          });
         }
       }
     }
@@ -1095,9 +1111,38 @@ async function construirMovimientosPuente({
         // solo aplica a Transferencia/Tarjeta (nunca Efectivo, que no pasa
         // por banco). Cuenta real + número de depósito en vez de la genérica
         // "Bancos por identificar" + etiqueta "TRANSFERENCIA"/"TARJETA".
-        const bancoReal = !esEfectivo
+        const bancoRealArr = !esEfectivo
           ? bancoPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)
           : null;
+
+        // 2+ movimientos bancarios reales para este mismo ticket (Tarjeta con
+        // 2+ swipes/terminales) — una línea contable por movimiento, cada una
+        // con su propio monto real y su propia referencia. El último absorbe
+        // el residuo de redondeo, mismo criterio que el reparto de formasPago
+        // arriba, para que la suma cuadre exacto con `montoAsignado`.
+        if (bancoRealArr && bancoRealArr.length > 1) {
+          let acumuladoBanco = 0;
+          bancoRealArr.forEach((br, i) => {
+            const esUltimoBanco = i === bancoRealArr.length - 1;
+            const montoBr = esUltimoBanco
+              ? Math.round((montoAsignado - acumuladoBanco) * 100) / 100
+              : Math.round(br.monto * 100) / 100;
+            acumuladoBanco += montoBr;
+            if (montoBr <= 0) return;
+            const idCuentaBr = idCuentaBancoPorCodigo.get(BANCO_A_CODIGO_CUENTA[br.banco]);
+            lineas.push({
+              cuentaId:      idCuentaBr ?? cuentaBancosId,
+              montoAsignado: montoBr,
+              reglaNombre:   (idCuentaBr && br.referencia) ? br.referencia : (fp.autorizacion || fp.nombre || fp.claveSat || null),
+              esSF:          false,
+              concepto:      conceptoBase,
+              formaPago:     (fp.claveSat ?? '').trim() || null,
+            });
+          });
+          return;
+        }
+
+        const bancoReal = bancoRealArr ? bancoRealArr[0] : null;
         const idCuentaBancoReal = bancoReal ? idCuentaBancoPorCodigo.get(BANCO_A_CODIGO_CUENTA[bancoReal.banco]) : null;
         lineas.push({
           cuentaId:    esEfectivo ? cuentaCajaId : (idCuentaBancoReal ?? cuentaBancosId),

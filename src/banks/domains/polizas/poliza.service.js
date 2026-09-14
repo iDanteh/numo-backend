@@ -2237,6 +2237,28 @@ function _extraerCobrosSucursal(movimientos) {
       .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0))
       .map(m => m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.haber).toFixed(2)}`),
   );
+  // Cargos tipoOrigen='Venta' (cobrosCobradoraDirecta, cfdi-poliza-generator.service.js)
+  // — bug real 2026-09-14, caso real Santa Rosa C0-260902014 $12,050.22
+  // Tarjeta: a diferencia del par 'Cobro Sucursal'+'Cobro Sucursal' de arriba
+  // (Ferrocarril, Cargo se omite por completo), aquí el Cargo 'Venta' SÍ
+  // sigue su camino normal hacia `resto`/`consolidarCargos` cuando su cuenta
+  // no coincide con la del Abono (Tarjeta/Transferencia — ver
+  // `_cuentasCobradasPorSucursalPorUuid` arriba, que solo empareja/extrae
+  // Efectivo). Sin esto, `filasTarjetaCobroSucursal` (más abajo) no puede
+  // distinguir ambos casos y suma el mismo monto dos veces al consolidado de
+  // Tarjeta: una vez natural (el Cargo nunca se extrajo) y otra vez por la
+  // inyección manual de `_inyectarCobrosSucursal` (pensada solo para el
+  // caso Ferrocarril, donde el Cargo sí se descarta).
+  // NO se puede emparejar por cfdiUuid (el Abono de Tarjeta/Transferencia
+  // siempre lo trae null a propósito — ver comentario en
+  // cfdi-poliza-generator.service.js) — se empareja por concepto+monto: el
+  // Abono reusa el MISMO concepto del Cargo con el sufijo " (cruce sucursal)"
+  // agregado (ambos generadores, `generarPropuesta`/guardado, lo hacen igual).
+  const _ventaCargoKeys = new Set(
+    movimientos
+      .filter(m => m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0))
+      .map(m => `${m.concepto || ''}|${Number(m.debe).toFixed(2)}`),
+  );
   // Par 'Venta' Cargo + 'Cobro Sucursal' Abono a la MISMA cuenta (bug real
   // 2026-09-03, caso M0-260900018): en `cobrosCobradoraDirecta`
   // (cfdi-poliza-generator.service.js), el Efectivo cruzado de sucursal usa
@@ -2391,6 +2413,13 @@ function _extraerCobrosSucursal(movimientos) {
       _formaPagoLabel: m.reglaNombre || null,
       _referenciaBancoReal: esBancoReal ? (m.reglaNombre || null) : null,
       _esPendientePropio: m.tipoOrigen === TIPO_ORIGEN_PENDIENTE_PROPIO,
+      // Ver `_ventaCargoKeys` arriba — cuando el Abono está pareado con un
+      // Cargo 'Venta' (no 'Cobro Sucursal'), ese Cargo ya sigue su camino
+      // normal hacia el consolidado; `filasTarjetaCobroSucursal` no debe
+      // sumarlo otra vez. El Abono lleva el concepto del Cargo + sufijo
+      // " (cruce sucursal)" — se quita para poder comparar.
+      _cargoVentaYaEnConsolidado: m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
+        && _ventaCargoKeys.has(`${(m.concepto || '').replace(/ \(cruce sucursal\)$/, '')}|${Number(m.haber).toFixed(2)}`),
       // Ver `ETIQUETA_VENTA_SIN_COBRO` — no es un cruce de sucursal, así que
       // NUNCA debe llevar el prefijo "COS-" ni mostrar `reglaNombre` (que en
       // este caso es el nombre completo de la regla fiscal, no una forma de
@@ -2473,7 +2502,7 @@ function _extraerCobrosSucursal(movimientos) {
   // cuenta) — también excluye de paso al par 'Venta'+'Cobro Sucursal' de
   // arriba (esa fila siempre trae `haber: 0` hardcodeado).
   const filasTarjetaCobroSucursal = filas
-    .filter(f => !f._esVentaSinCobro && Number(f.haber) > 0 && (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA'))
+    .filter(f => !f._esVentaSinCobro && !f._cargoVentaYaEnConsolidado && Number(f.haber) > 0 && (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA'))
     .map(f => ({ concepto: f.concepto, monto: Number(f.haber) }));
 
   // `_referenciaBancoReal` a veces NO es un folio bancario real distinguible
@@ -2498,6 +2527,7 @@ function _extraerCobrosSucursal(movimientos) {
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;
     delete f._esVentaSinCobro;
+    delete f._cargoVentaYaEnConsolidado;
   }
   // Agregar los SF-OCULTO (mismo día + misma sucursal) a la hoja "Otros Ingresos" —
   // nunca suman a depósitos consolidados de efectivo/tarjeta.

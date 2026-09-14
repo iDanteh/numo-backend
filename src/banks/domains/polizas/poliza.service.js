@@ -2437,30 +2437,22 @@ function _extraerCobrosSucursal(movimientos) {
       .filter(m => m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0))
       .map(m => `${m.concepto || ''}|${Number(m.debe).toFixed(2)}`),
   );
-  // Par 'Venta' Cargo + 'Cobro Sucursal' Abono a la MISMA cuenta (bug real
-  // 2026-09-03, caso M0-260900018): en `cobrosCobradoraDirecta`
+  // Par 'Venta' Cargo + 'Cobro Sucursal' Abono a la MISMA cuenta (caso
+  // M0-260900018, 2026-09-03): en `cobrosCobradoraDirecta`
   // (cfdi-poliza-generator.service.js), el Efectivo cruzado de sucursal usa
   // la MISMA cuenta para el Cargo y su Abono (a propósito, porque el
-  // efectivo SÍ puede moverse físicamente) — el par neta $0 en esa cuenta,
-  // pero ambas líneas se mostraban por separado en "Cobro de otra sucursal"
-  // (ruido visual, sin efecto en el balance). Se detecta por cfdiUuid +
-  // mismo código de cuenta + mismo monto, y se ocultan AMBAS — mismo
-  // criterio que el bucket "Depósitos consolidados" en $0.00 (más abajo en
-  // este archivo).
-  const _cuentaCargoVentaPorUuid = new Map(
-    movimientos
-      .filter(m => m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0) && m.cfdiUuid)
-      .map(m => [m.cfdiUuid, { cuenta: m.cuenta?.codigo, monto: Number(m.debe) }]),
-  );
-  const _uuidsAutoCanceladosCOS = new Set(
-    movimientos
-      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0) && m.cfdiUuid)
-      .filter((m) => {
-        const cargo = _cuentaCargoVentaPorUuid.get(m.cfdiUuid);
-        return cargo && cargo.cuenta === m.cuenta?.codigo && Math.abs(cargo.monto - Number(m.haber)) < 0.005;
-      })
-      .map(m => m.cfdiUuid),
-  );
+  // efectivo SÍ puede moverse físicamente) — el par neta $0 en esa cuenta.
+  // REVERTIDO 2026-09-14 (caso real Ferrocarril→Atzompa 12-sep, $8,618.55):
+  // antes se ocultaban AMBAS líneas asumiendo que era ruido visual sin
+  // efecto real — pero esa suposición solo es cierta cuando la sucursal
+  // VENDEDORA ya generó su propia póliza (ahí sí queda registrado el
+  // "derecho de cobro" en otro lado). `cobrosCobradoraDirecta` es
+  // justamente el camino de RESPALDO que se usa cuando la vendedora NO ha
+  // generado todavía — en ese caso, ocultar este par deja la transacción
+  // completamente invisible en todo el sistema (confirmado con el usuario:
+  // no debe depender de que la otra sucursal ya haya generado). Mostrar
+  // ambas líneas siempre es más seguro que arriesgar dinero invisible,
+  // aunque a veces se vea "redundante" si la vendedora ya las tenía.
   for (const m of movimientos) {
     // Las líneas de Saldo a Favor de un Pago (tipoComprobante='P',
     // `esSplitPagoPorFactura` en cfdi-mapping.service.js) también llevan
@@ -2494,9 +2486,6 @@ function _extraerCobrosSucursal(movimientos) {
           (m.cfdiUuid != null && _cuentasCobradasPorSucursalPorUuid.get(m.cfdiUuid)?.has(m.cuenta?.codigo))
           || (m.cfdiUuid == null && _conceptosCobradosPorSucursalSinUuid.has(`${m.concepto || ''}|${Number(m.debe).toFixed(2)}`))
         )) {
-      // Ver `_uuidsAutoCanceladosCOS` arriba — el par neta $0 en la misma
-      // cuenta, se omiten ambas líneas (Cargo aquí, Abono más abajo).
-      if (m.cfdiUuid != null && _uuidsAutoCanceladosCOS.has(m.cfdiUuid)) continue;
       filas.push({
         cuenta:             m.cuenta,
         serie:              m.serie || '',
@@ -2528,10 +2517,6 @@ function _extraerCobrosSucursal(movimientos) {
       const _keyCargoPar = m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.debe).toFixed(2)}`;
       if (_cobroSucursalHaberKeys.has(_keyCargoPar)) continue;
     }
-    // Ver `_uuidsAutoCanceladosCOS` arriba — este es el lado Abono del par
-    // que neta $0 en la misma cuenta (su Cargo ya se omitió más arriba).
-    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
-        && m.cfdiUuid != null && _uuidsAutoCanceladosCOS.has(m.cfdiUuid)) continue;
     if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,

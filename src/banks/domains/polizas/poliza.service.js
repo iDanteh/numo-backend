@@ -1908,6 +1908,12 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       centroCosto: gt.centroCosto, debe: gt.debe, haber: 0,
       cfdiUuid: esGrupo ? null : m.cfdiUuid, _subcodigo: gt.subcodigo,
       _categoria: null,
+      // Sin número de autorización/referencia bancaria real ligado (columna C
+      // cayó al tipo genérico "TRANSFERENCIA"/"CHEQUE" en vez de mostrar el
+      // dato real) — se marca para pintar la fila de rojo en el export
+      // (`_construirWorkbookPoliza`, confirmado con el usuario 2026-09-14).
+      // Agrupada (esGrupo) nunca aplica: agrupar exige tener referencia real.
+      _sinAutorizacion: !esGrupo && !gt.referencia,
       ...(esGrupo ? { _detalle: gt.detalle, _esTransferencia: gt.tipoDetalle === 'TRANSFERENCIA', _esResto: true } : {}),
     });
   }
@@ -3410,11 +3416,16 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
         // Tuberos, Anticipo) lleva su propio color fijo — tanto en Contado
         // (`consolidarCargos`) como en Crédito (`moverAjustesAlFinal`) — para
         // distinguirlas a simple vista del resto de los movimientos del bloque.
-        const colorFila = m._categoria ? COLOR_CATEGORIA[m._categoria]
+        const colorFila = m._sinAutorizacion ? 'FFFFC7CE'
+          : m._categoria ? COLOR_CATEGORIA[m._categoria]
           : m._esResto ? 'FFF2F2F2'
           : FILL_ALTERNADO[colorIdx];
         row.eachCell({ includeEmpty: true }, (cell) => {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colorFila } };
+          // Rojo estándar de Excel (relleno claro + texto oscuro) para que la
+          // fila destaque de inmediato como "falta número de autorización" —
+          // confirmado con el usuario 2026-09-14.
+          if (m._sinAutorizacion) cell.font = { ...(cell.font ?? {}), color: { argb: 'FF9C0006' } };
         });
       }
 

@@ -2472,35 +2472,32 @@ function _extraerCobrosSucursal(movimientos) {
     // desglosarse en el bloque de "Cobro de otra sucursal" (confirmado con el
     // usuario: aparecía como "COS-Anticipo" separado de su factura).
     if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre)) { resto.push(m); continue; }
-    // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
-    // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
-    // Usa cfdiUuid + MISMA CUENTA para identificar el par de forma
-    // determinista: el mismo UUID que tiene la entrada 'Cobro Sucursal' DEBE
-    // de cobros-sucursal-puente identifica sin ambigüedad la 'Venta' DEBE de
-    // cfdiToMovimientos, pero exigir también la cuenta evita arrastrar la
-    // porción Tarjeta/Transferencia de un ticket mixto solo porque comparte
-    // uuid con su porción Efectivo (ver comentario en
-    // `_cuentasCobradasPorSucursalPorUuid` arriba).
+    // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se descarta aquí
+    // por completo (sin mostrarse, ni siquiera en "Cobro de otra sucursal")
+    // — no debe llegar a consolidarCargos (no infla "Depósitos consolidados")
+    // NI mostrarse como línea individual. Usa cfdiUuid + MISMA CUENTA para
+    // identificar el par de forma determinista: el mismo UUID que tiene la
+    // entrada 'Cobro Sucursal' DEBE de cobros-sucursal-puente identifica sin
+    // ambigüedad la 'Venta' DEBE de cfdiToMovimientos, pero exigir también la
+    // cuenta evita arrastrar la porción Tarjeta/Transferencia de un ticket
+    // mixto solo porque comparte uuid con su porción Efectivo (ver comentario
+    // en `_cuentasCobradasPorSucursalPorUuid` arriba).
+    //
+    // REVERTIDO 2026-09-14 (caso real Ferrocarril→Atzompa 12-sep, $8,618.55):
+    // este Cargo representa efectivo físicamente recibido en la sucursal
+    // COBRADORA (Atzompa), pero conceptualmente pertenece a la sucursal
+    // VENDEDORA (Ferrocarril, donde se hizo la venta) — confirmado con el
+    // usuario: el Cargo debe verse en la póliza de la vendedora (junto a su
+    // propio Abono de Ingresos+IVA), nunca en la de la cobradora. Solo el
+    // Abono (más abajo) se muestra aquí, en "Cobro de otra sucursal" — se
+    // acepta que esa línea quede desbalanceada dentro de ESTA póliza mientras
+    // la vendedora no haya generado la suya (mismo criterio que 'Venta Sin
+    // Cobro' un poco más abajo).
     if (m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
         && (
           (m.cfdiUuid != null && _cuentasCobradasPorSucursalPorUuid.get(m.cfdiUuid)?.has(m.cuenta?.codigo))
           || (m.cfdiUuid == null && _conceptosCobradosPorSucursalSinUuid.has(`${m.concepto || ''}|${Number(m.debe).toFixed(2)}`))
         )) {
-      filas.push({
-        cuenta:             m.cuenta,
-        serie:              m.serie || '',
-        concepto:           m.concepto || '',
-        centroCosto:        m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-        debe:               Number(m.debe),
-        haber:              0,
-        cfdiUuid:           null,
-        metodoPago:         m.metodoPago ?? null,
-        _subcodigo:         0,
-        _categoria:         null,
-        _formaPagoLabel:    m.reglaNombre || null,
-        _referenciaBancoReal: null,
-        _esPendientePropio: false,
-      });
       continue;
     }
     // 'Venta Sin Cobro' (2026-08-27, confirmado con el usuario): se quita por

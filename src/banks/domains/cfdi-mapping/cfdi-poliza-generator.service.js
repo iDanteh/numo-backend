@@ -1415,6 +1415,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         if (origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
         for (const fp of (cobro.formasPago ?? [])) {
           if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+          // "ANTICIPO" — mismo criterio que `desglosePagoReal` (línea ~1175)
+          // y `_cobrosSinFacturaPorCentro` (línea ~2793): claveSat='30' igual
+          // que "SALDO A FAVOR" pero texto distinto; sin este filtro, un
+          // cobro cruzado de sucursal pagado con aplicación de anticipo se
+          // contaría como Cargo real (Efectivo/Tarjeta) cuando el dinero ya
+          // se reconoció al crearse el anticipo.
+          if (/anticipo/i.test(fp.nombre ?? '')) continue;
           const monto = (cobro.formasPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
@@ -2727,6 +2734,15 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       const formasPago = cobro.formasPago ?? [];
       for (const fp of formasPago) {
         if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+        // "ANTICIPO" (bug real 2026-09-14, caso real Santa Rosa 10-sep,
+        // ticket M0-260901042 $628.41, claveSat='30'): mismo claveSat='30'
+        // que "SALDO A FAVOR" pero texto distinto — ver comentario
+        // equivalente en `desglosePagoReal` (línea ~1167) donde SÍ se filtra.
+        // Un ticket "sin factura" pagado con aplicación de anticipo no trajo
+        // dinero real nuevo a caja (el anticipo ya se reconoció como pasivo
+        // al crearse) — sin este filtro se contaba una segunda vez como si
+        // fuera efectivo/tarjeta real.
+        if (/anticipo/i.test(fp.nombre ?? '')) continue;
         const monto = (formasPago.length === 1 && cobro.monto != null)
           ? Math.abs(Number(cobro.monto) || 0)
           : (Number(fp.monto) || 0);

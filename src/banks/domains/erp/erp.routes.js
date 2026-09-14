@@ -1651,6 +1651,31 @@ async function _checkSyncControl() {
   return !syncControl.stopped;
 }
 
+// Aporte a usar en la rama de finalización de _syncErpKoreJob (2026-09-14, bug real
+// confirmado con 10 movimientos en producción — uno de $196,431.39, folio 038309).
+//
+// Antes, esta rama recalculaba el aporte de CUALQUIER vínculo humano en cuanto Kore
+// reportaba la CxC cerrada, sin preguntar si un cobro real en Numo (cobro-panel/
+// Solicitudes de Cobro) ya lo había resuelto bien — pisándolo con
+// _montoSaldoLinkPorMovimiento (acumulador plano por movimiento, sin saber de otros
+// depósitos de la misma CxC: si el kardex de Kore trae una reversión sin tag de identidad
+// cuyo monto coincide por casualidad con lo ya acumulado, neta a 0 exacto aunque el pago
+// sea real — mismo bug documentado 2026-08-21, folioExterno 260800164/260800166).
+//
+// _recomputeErpKoreJob YA respeta esto vía _debeRecalcularAporte (2026-09-04): un link
+// finalizadoManualmente (saldoPagadoTotal ya fijado por un cobro humano, con su propia
+// fecha de cierre vía identificadoPor) es la fuente de la verdad definitiva, no algo que
+// un job automático deba corregir después. Esta función aplica el MISMO criterio acá —
+// motor (no esHumano) sigue calculando por autorización bancaria sin cambios; humano SIN
+// finalizar manualmente sigue recalculando con _montoSaldoLinkPorMovimiento sin cambios
+// (ese es el trabajo real que le queda a este job); humano YA finalizado manualmente
+// preserva su saldoErpAportado tal cual, sin volver a calcularlo.
+function _aporteParaFinalizacionSync(esHumano, finalizadoManualmente, raw0, mov, link) {
+  if (!esHumano) return _montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
+  if (_debeRecalcularAporte(esHumano, finalizadoManualmente)) return _montoSaldoLinkPorMovimiento(raw0, mov);
+  return link.saldoErpAportado ?? null;
+}
+
 // fechaInicio/fechaFin son ajustables por corrida manual (ver POST /sync-erp-kore); si
 // vienen null (corrida automática del cron, o manual sin fechas) no se acota por fecha —
 // se revisa TODO lo aún no finalizado, sin importar su antigüedad (ver punto 4 del diseño:
@@ -1774,9 +1799,9 @@ async function _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin) {
             // matching para vincular). Si no hay coincidencia, el aporte queda `null`
             // ("no determinado", nunca "cero") para no pisar un saldoErp ya correcto.
             const esHumano = _erpIdIdentificadoPorHumano(mov.identificadoPor, link.erpId);
-            const aporte   = esHumano
-              ? _montoSaldoLinkPorMovimiento(raw0, mov)
-              : _montoSaldoLinkPorAutorizacion(raw0, mov.numeroAutorizacion);
+            const fechaAnclaAlterna     = mov.identificadoPor?.find(ip => ip.erpId === link.erpId)?.fechaId ?? null;
+            const finalizadoManualmente = link.saldoPagadoTotal != null && fechaAnclaAlterna != null;
+            const aporte = _aporteParaFinalizacionSync(esHumano, finalizadoManualmente, raw0, mov, link);
             if (aporte != null) linksActualizados[i].saldoErpAportado = aporte;
 
             // Backfill inmediato de saldoPagado/saldoPagadoTotal/folioFiscal AL FINALIZAR
@@ -3104,6 +3129,7 @@ router._esFormaPagoBancariaKore     = _esFormaPagoBancariaKore;
 router._montoSaldoLinkPorAutorizacion = _montoSaldoLinkPorAutorizacion;
 router._aporteConRatchet            = _aporteConRatchet;
 router._debeRecalcularAporte        = _debeRecalcularAporte;
+router._aporteParaFinalizacionSync  = _aporteParaFinalizacionSync;
 router._FILTRO_LINK_ATRAPADO        = _FILTRO_LINK_ATRAPADO;
 router._retencionVigente            = _retencionVigente;
 router._erpIdIdentificadoPorHumano  = _erpIdIdentificadoPorHumano;

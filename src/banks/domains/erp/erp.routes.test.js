@@ -78,7 +78,7 @@ jest.mock('../../../visor/models/CFDI', () => ({
 // (caja-transferencia-match.service.test.js / caja-transferencia-confirm.service.test.js);
 // acá solo se cubre el cableado HTTP (params, permisos, códigos de respuesta).
 jest.mock('./CajaTransferencia.model');
-jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatos: jest.fn() }));
+jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatosBatch: jest.fn() }));
 jest.mock('./caja-transferencia-confirm.service', () => ({ confirmarMatch: jest.fn() }));
 jest.mock('./caja-transferencia-descartar-manual.service', () => ({ descartarManual: jest.fn() }));
 jest.mock('./caja-transferencia-sync.service', () => ({ sincronizarTransferenciasCajasManual: jest.fn(), init: jest.fn() }));
@@ -92,7 +92,7 @@ const koreCaja     = require('./kore-caja.service');
 const { sincronizarCuentasPendientes } = require('./erp-sync.service');
 const CFDI         = require('../../../visor/models/CFDI');
 const CajaTransferencia = require('./CajaTransferencia.model');
-const { buscarCandidatos } = require('./caja-transferencia-match.service');
+const { buscarCandidatosBatch } = require('./caja-transferencia-match.service');
 const { confirmarMatch }   = require('./caja-transferencia-confirm.service');
 const { descartarManual }  = require('./caja-transferencia-descartar-manual.service');
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
@@ -970,22 +970,41 @@ describe('GET /transferencias-cajas/bandeja', () => {
     expect(CajaTransferencia.find).not.toHaveBeenCalled();
   });
 
-  test('devuelve pendientes con sus candidatos calculados', async () => {
+  test('devuelve pendientes con sus candidatos calculados (batch, 2026-09-14 — antes N llamadas a buscarCandidatos, ahora 1 sola a buscarCandidatosBatch)', async () => {
     const pendiente = { _id: 't-1', estatusMatch: 'pendiente', monto: 1500 };
     CajaTransferencia.find = jest.fn(() => ({
       sort: jest.fn(() => ({
         lean: jest.fn().mockResolvedValue([pendiente]),
       })),
     }));
-    buscarCandidatos.mockResolvedValue([[{ _id: 'mov-1' }]]);
+    buscarCandidatosBatch.mockResolvedValue(new Map([['t-1', [[{ _id: 'mov-1' }]]]]));
 
     const res = await request(app)
       .get('/transferencias-cajas/bandeja')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
+    expect(buscarCandidatosBatch).toHaveBeenCalledTimes(1);
+    expect(buscarCandidatosBatch).toHaveBeenCalledWith([pendiente]);
     expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [[{ _id: 'mov-1' }]] }]);
     expect(res.body.huerfanas).toBeUndefined();
+  });
+
+  test('transferencia sin entrada en el Map (defensivo): candidatos []', async () => {
+    const pendiente = { _id: 't-2', estatusMatch: 'pendiente', monto: 500 };
+    CajaTransferencia.find = jest.fn(() => ({
+      sort: jest.fn(() => ({
+        lean: jest.fn().mockResolvedValue([pendiente]),
+      })),
+    }));
+    buscarCandidatosBatch.mockResolvedValue(new Map());
+
+    const res = await request(app)
+      .get('/transferencias-cajas/bandeja')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [] }]);
   });
 });
 

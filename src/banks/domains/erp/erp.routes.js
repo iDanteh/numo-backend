@@ -29,7 +29,7 @@ const {
   listarBancos, listarFormasPago, buscarTransferenciasCajas,
 }                                         = require('./kore-caja.service');
 const CajaTransferencia                  = require('./CajaTransferencia.model');
-const { buscarCandidatos }               = require('./caja-transferencia-match.service');
+const { buscarCandidatosBatch }          = require('./caja-transferencia-match.service');
 const { confirmarMatch }                 = require('./caja-transferencia-confirm.service');
 const { descartarManual }                = require('./caja-transferencia-descartar-manual.service');
 const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-pendiente.service');
@@ -341,10 +341,17 @@ router.get('/transferencias-cajas/bandeja', authenticate, permit(PERMISSIONS.BAN
   const pendientes = await CajaTransferencia.find({ estatusMatch: 'pendiente', excluidaPorFiltro: { $ne: true } })
     .sort({ fechaRecepcion: 1 }).lean();
 
-  const conCandidatos = await Promise.all(pendientes.map(async (t) => ({
+  // 2026-09-14 (pedido explícito del usuario, mejora de velocidad de carga del panel):
+  // antes se llamaba buscarCandidatos() una vez POR CADA pendiente vía Promise.all — N
+  // consultas a Mongo + N lecturas de Configuraciones Globales para 1 sola carga del panel.
+  // buscarCandidatosBatch() hace lo mismo con 1 sola consulta (ver comentario en el
+  // service) — mismo resultado exacto, verificado con test de equivalencia contra
+  // buscarCandidatos().
+  const candidatosPorId = await buscarCandidatosBatch(pendientes);
+  const conCandidatos = pendientes.map((t) => ({
     transferencia: t,
-    candidatos: await buscarCandidatos(t),
-  })));
+    candidatos: candidatosPorId.get(String(t._id)) ?? [],
+  }));
 
   res.json({
     pendientes: conCandidatos,

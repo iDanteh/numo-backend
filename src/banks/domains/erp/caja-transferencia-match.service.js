@@ -141,6 +141,56 @@ async function buscarCandidatos(transferencia) {
   return coincidencias.map(m => [m]);
 }
 
+// Versión batch de buscarCandidatos() (2026-09-14, pedido explícito del usuario: mejorar
+// la velocidad de carga del panel "Transferencias entre cajas"). GET .../bandeja llamaba
+// buscarCandidatos() UNA VEZ POR CADA transferencia pendiente vía Promise.all — con N
+// pendientes, eso son N consultas a Mongo (`BankMovement.find`) más N lecturas de
+// Configuraciones Globales (`_ventanaDias()`, misma clave, mismo valor cada vez), todas en
+// paralelo pero cada una su propio round-trip. Acá se hace UNA sola vez cada cosa: se lee
+// la config una vez, se trae de Mongo el superset de candidatos elegibles que cubre TODAS
+// las ventanas individuales en una sola consulta, y se matchea cada transferencia en
+// memoria contra ese pool — mismo resultado exacto que llamar buscarCandidatos() N veces
+// (ver test de equivalencia), solo que con 1 query en vez de N. buscarCandidatos() en sí
+// NO se toca — sigue siendo la usada por reclasificarHistoricasDescartadas() (proceso de
+// cron nocturno, no sensible a latencia de usuario) y por cualquier otro llamado puntual.
+//
+// Nota de escala (a tener presente si el volumen de pendientes crece mucho en el futuro):
+// el rango de la consulta es la UNIÓN de todas las ventanas individuales (min fecha - N
+// días, max fecha + N días) — si las transferencias pendientes están muy dispersas en el
+// tiempo, ese rango único puede traer más de lo estrictamente necesario para una
+// transferencia en particular. Sigue siendo estrictamente mejor que N consultas separadas
+// (nunca peor que el peor caso de antes), pero no es el óptimo teórico para ese escenario.
+async function buscarCandidatosBatch(transferencias) {
+  const resultado = new Map(transferencias.map(t => [String(t._id), []]));
+  const conFecha = transferencias.filter(t => t.fechaRecepcion);
+  if (conFecha.length === 0) return resultado;
+
+  const ventanaDias = await _ventanaDias();
+  const msVentana = ventanaDias * 24 * 60 * 60 * 1000;
+
+  const fechasMs = conFecha.map(t => new Date(t.fechaRecepcion).getTime());
+  const desdeGlobal = new Date(Math.min(...fechasMs) - msVentana);
+  const hastaGlobal = new Date(Math.max(...fechasMs) + msVentana);
+
+  const elegibles = await BankMovement.find({
+    erpLinks: { $size: 0 },
+    status:   { $ne: 'identificado' },
+    fecha:    { $gte: desdeGlobal, $lte: hastaGlobal },
+  }).lean();
+  const pool = elegibles.filter(m => _normalizarCategoria(m.categoria) === CATEGORIA_DEPOSITO_EFECTIVO);
+
+  for (const t of conFecha) {
+    const desde = new Date(new Date(t.fechaRecepcion).getTime() - msVentana);
+    const hasta = new Date(new Date(t.fechaRecepcion).getTime() + msVentana);
+    const coincidencias = pool.filter(m => {
+      const fechaMov = new Date(m.fecha);
+      return fechaMov >= desde && fechaMov <= hasta && _montosIguales(m.deposito, t.monto);
+    });
+    resultado.set(String(t._id), coincidencias.map(m => [m]));
+  }
+  return resultado;
+}
+
 // FECHA_CORTE_LOGICA_HISTORICA (2026-09-09, pedido explícito del usuario): las
 // transferencias con fechaRecepcion >= este valor siguen el proceso normal de arriba
 // (buscarCandidatos ya excluye depósitos identificados a propósito — si no aparece
@@ -221,6 +271,7 @@ async function reclasificarHistoricasDescartadas() {
 
 module.exports = {
   buscarCandidatos,
+  buscarCandidatosBatch,
   esCategoriaDepositoEfectivo,
   reclasificarHistoricasDescartadas,
   _ventanaDias,

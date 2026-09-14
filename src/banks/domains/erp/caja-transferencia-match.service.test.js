@@ -15,7 +15,7 @@ const BankMovement       = require('../banks/BankMovement.model');
 const CajaTransferencia  = require('./CajaTransferencia.model');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const {
-  buscarCandidatos, reclasificarHistoricasDescartadas, _buscarCoincidenciasHistoricas,
+  buscarCandidatos, buscarCandidatosBatch, reclasificarHistoricasDescartadas, _buscarCoincidenciasHistoricas,
   FECHA_CORTE_LOGICA_HISTORICA, _ventanaDias, _normalizarCategoria, VENTANA_DEFAULT_DIAS,
 } = require('./caja-transferencia-match.service');
 
@@ -162,6 +162,137 @@ describe('buscarCandidatos', () => {
     const candidatos = await buscarCandidatos({ monto: 1000, fechaRecepcion: new Date() });
 
     expect(candidatos).toEqual([]);
+  });
+});
+
+// buscarCandidatosBatch (2026-09-14, pedido explícito del usuario: mejorar la velocidad de
+// carga del panel "Transferencias entre cajas"). GET .../bandeja llamaba buscarCandidatos()
+// una vez POR CADA transferencia pendiente (N consultas a Mongo + N lecturas de config) —
+// esta versión hace 1 sola consulta + 1 sola lectura de config para TODAS. La garantía real
+// es que el resultado por transferencia sea IDÉNTICO al de llamar buscarCandidatos() una por
+// una (ver 'equivalencia' más abajo) — el resto de los tests cubre la mecánica nueva propia
+// del batch (rango unión, filtrado de ventana individual en JS en vez de en la query Mongo).
+describe('buscarCandidatosBatch', () => {
+  beforeEach(() => {
+    globalConfigService.getValue.mockResolvedValue('5');
+  });
+
+  test('lista vacía: Map vacío, sin consultar Mongo ni la config', async () => {
+    const resultado = await buscarCandidatosBatch([]);
+    expect(resultado.size).toBe(0);
+    expect(BankMovement.find).not.toHaveBeenCalled();
+    expect(globalConfigService.getValue).not.toHaveBeenCalled();
+  });
+
+  test('ninguna transferencia tiene fechaRecepcion: Map con [] por cada una, sin consultar Mongo', async () => {
+    const resultado = await buscarCandidatosBatch([
+      { _id: 't-1', monto: 100, fechaRecepcion: null },
+      { _id: 't-2', monto: 200, fechaRecepcion: null },
+    ]);
+
+    expect(resultado.get('t-1')).toEqual([]);
+    expect(resultado.get('t-2')).toEqual([]);
+    expect(BankMovement.find).not.toHaveBeenCalled();
+  });
+
+  test('N transferencias -> UNA sola consulta a Mongo y UNA sola lectura de config (el punto de este cambio)', async () => {
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    await buscarCandidatosBatch([
+      { _id: 't-1', monto: 100, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+      { _id: 't-2', monto: 200, fechaRecepcion: new Date('2026-09-05T00:00:00Z') },
+      { _id: 't-3', monto: 300, fechaRecepcion: new Date('2026-09-10T00:00:00Z') },
+    ]);
+
+    expect(BankMovement.find).toHaveBeenCalledTimes(1);
+    expect(globalConfigService.getValue).toHaveBeenCalledTimes(1);
+  });
+
+  test('la consulta única cubre la UNIÓN de todas las ventanas individuales (mín-ventana a máx+ventana)', async () => {
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    await buscarCandidatosBatch([
+      { _id: 't-1', monto: 100, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+      { _id: 't-2', monto: 200, fechaRecepcion: new Date('2026-09-10T00:00:00Z') },
+    ]);
+
+    const filtro = BankMovement.find.mock.calls[0][0];
+    expect(filtro.erpLinks).toEqual({ $size: 0 });
+    expect(filtro.status).toEqual({ $ne: 'identificado' });
+    // ventana=5 días: mín (09-01) - 5 = 08-27, máx (09-10) + 5 = 09-15
+    expect(filtro.fecha.$gte.toISOString()).toBe(new Date('2026-08-27T00:00:00Z').toISOString());
+    expect(filtro.fecha.$lte.toISOString()).toBe(new Date('2026-09-15T00:00:00Z').toISOString());
+  });
+
+  test('match 1:1 exacto por transferencia, mismo resultado que buscarCandidatos', async () => {
+    const mov = { _id: 'mov-1', categoria: CATEGORIA, deposito: 1500, fecha: new Date('2026-09-01T00:00:00Z') };
+    BankMovement.find = jest.fn(() => fakeFind([mov]));
+
+    const resultado = await buscarCandidatosBatch([
+      { _id: 't-1', monto: 1500, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+    ]);
+
+    expect(resultado.get('t-1')).toEqual([[mov]]);
+  });
+
+  test('empate exacto en monto: TODOS los candidatos, cada uno su propio grupo (mismo criterio que buscarCandidatos)', async () => {
+    const movA = { _id: 'mov-a', categoria: CATEGORIA, deposito: 1200, fecha: new Date('2026-09-01T00:00:00Z') };
+    const movB = { _id: 'mov-b', categoria: CATEGORIA, deposito: 1200, fecha: new Date('2026-09-01T00:00:00Z') };
+    BankMovement.find = jest.fn(() => fakeFind([movA, movB]));
+
+    const resultado = await buscarCandidatosBatch([
+      { _id: 't-1', monto: 1200, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+    ]);
+
+    expect(resultado.get('t-1')).toEqual([[movA], [movB]]);
+  });
+
+  test('CRÍTICO: un movimiento dentro del rango unión pero FUERA de la ventana individual de una transferencia puntual se excluye para ESA transferencia', async () => {
+    // ventana=5 días. t-1 es del 09-01 (ventana 08-27..09-06), t-2 es del 09-20 (ventana
+    // 09-15..09-25) — el rango unión de la única consulta cubre 08-27..09-25. `movLejano`
+    // (09-20) cae DENTRO del rango unión, pero fuera de la ventana individual de t-1.
+    const movCercano = { _id: 'mov-cercano', categoria: CATEGORIA, deposito: 999, fecha: new Date('2026-09-02T00:00:00Z') };
+    const movLejano  = { _id: 'mov-lejano',  categoria: CATEGORIA, deposito: 999, fecha: new Date('2026-09-20T00:00:00Z') };
+    BankMovement.find = jest.fn(() => fakeFind([movCercano, movLejano]));
+
+    const resultado = await buscarCandidatosBatch([
+      { _id: 't-1', monto: 999, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+      { _id: 't-2', monto: 999, fechaRecepcion: new Date('2026-09-20T00:00:00Z') },
+    ]);
+
+    expect(resultado.get('t-1')).toEqual([[movCercano]]); // NO incluye movLejano
+    expect(resultado.get('t-2')).toEqual([[movLejano]]);  // NO incluye movCercano
+  });
+
+  test('cada transferencia matchea solo contra SU propio monto dentro del mismo pool compartido', async () => {
+    const mov1500 = { _id: 'mov-1500', categoria: CATEGORIA, deposito: 1500, fecha: new Date('2026-09-01T00:00:00Z') };
+    const mov300  = { _id: 'mov-300',  categoria: CATEGORIA, deposito: 300,  fecha: new Date('2026-09-01T00:00:00Z') };
+    BankMovement.find = jest.fn(() => fakeFind([mov1500, mov300]));
+
+    const resultado = await buscarCandidatosBatch([
+      { _id: 't-1', monto: 1500, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+      { _id: 't-2', monto: 300,  fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+    ]);
+
+    expect(resultado.get('t-1')).toEqual([[mov1500]]);
+    expect(resultado.get('t-2')).toEqual([[mov300]]);
+  });
+
+  test('equivalencia: para cada transferencia, buscarCandidatosBatch da el mismo resultado que llamar buscarCandidatos() una por una', async () => {
+    const movA = { _id: 'mov-a', categoria: CATEGORIA, deposito: 1500, fecha: new Date('2026-09-01T00:00:00Z') };
+    const movB = { _id: 'mov-b', categoria: 'Traspaso entre cuentas propias', deposito: 300, fecha: new Date('2026-09-01T00:00:00Z') };
+    const transferencias = [
+      { _id: 't-1', monto: 1500, fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+      { _id: 't-2', monto: 300,  fechaRecepcion: new Date('2026-09-01T00:00:00Z') },
+    ];
+
+    BankMovement.find = jest.fn(() => fakeFind([movA, movB]));
+    const batch = await buscarCandidatosBatch(transferencias);
+
+    for (const t of transferencias) {
+      BankMovement.find = jest.fn(() => fakeFind([movA, movB]));
+      // eslint-disable-next-line no-await-in-loop
+      const individual = await buscarCandidatos(t);
+      expect(batch.get(t._id)).toEqual(individual);
+    }
   });
 });
 

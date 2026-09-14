@@ -3,7 +3,7 @@
 const ExcelJS = require('exceljs');
 const repo = require('./repositories/poliza.repository');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
-const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza, CentroCosto } = require('../../../shared/models/postgres');
+const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza, CentroCosto, Terminal } = require('../../../shared/models/postgres');
 const { Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const BankMovement = require('../banks/BankMovement.model');
@@ -17,6 +17,7 @@ const traspasosInternosService = require('../banks/traspasos-internos.service');
 const compensacionesInteresesService = require('../banks/compensaciones-intereses.service');
 const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
 const { obtenerDesglosesSalidasCajaPorAlmacen } = require('../erp/erp-sync.service');
+const { consultarTransaccionesNetpay } = require('../erp/netpay-transacciones.service');
 
 // Categorías de bank_movements que representan una transferencia electrónica
 // real. Incluye "DEPOSITO" (2026-08-31, confirmado con el usuario, caso real
@@ -45,6 +46,16 @@ const BANCO_A_CODIGO_CUENTA = {
   'Scotiabank': '1102015001',
   'Azteca':     '1102016001',
 };
+
+// Cuentas fijas de la plantilla de comisión NetPay (ver `construirNetpayInfo`/
+// `_lineasNetpay` más abajo) — confirmadas con el usuario 2026-09-14. El
+// depósito neto (línea 1 de la plantilla) usa `cuentaDepositosReal`
+// (1102011001), la misma cuenta que ya usa todo el consolidado de Tarjeta —
+// no una cuenta nueva por terminal.
+const CUENTA_NETPAY_GASTO_COMISION      = '5201030001'; // Gasto de comisión bancaria
+const CUENTA_NETPAY_IVA_POR_ACREDITAR   = '1108010001'; // IVA por acreditar de la factura de comisión
+const CUENTA_NETPAY_PROVEEDOR           = '2102010001'; // Proveedor (NetPay SAPI de CV) — se reconoce y liquida en el mismo asiento
+const CUENTA_NETPAY_IVA_ACREDITABLE     = '1107010001'; // IVA ya acreditado/pagado (contrapartida de la línea de arriba)
 
 /**
  * Cruza los CFDIs de la póliza contra sus movimientos bancarios reales
@@ -305,6 +316,154 @@ async function construirBancoRealPorTicket(movimientos) {
     }
   }
   return mapa;
+}
+
+// NetPay (2026-09-14, confirmado con el usuario, caso real Santa Rosa
+// 4-sep): cuando un cobro de Tarjeta se procesó por una terminal NetPay
+// conocida (catálogo `Terminal`), el depósito real al banco NO es el bruto
+// de la venta — NetPay descuenta su comisión+IVA antes de depositar. Esas
+// líneas se sacan del consolidado genérico de Tarjeta (`consolidarCargos`)
+// y se reemplazan por el depósito neto real + su desglose de comisión
+// (plantilla fija de 7 líneas, ver `_lineasNetpay`).
+//
+// Match por MONTO contra las transacciones que reporta Kore
+// (`/transactions/search`, ver `netpay-transacciones.service.js`) para el
+// mismo día+centro — el ERP no liga terminal a nivel de ticket
+// (`formasPago[]` no lo trae), así que no existe una llave más confiable.
+// El catálogo de Terminales filtra qué `terminalID` son válidos/conocidos
+// para ese centro (evita atribuir a NetPay algo de una terminal no
+// registrada o de otra sucursal). Cualquier venta Tarjeta que no matchee
+// (terminal no registrada, sin transacción NetPay del monto exacto ese
+// día, o el endpoint de Kore falla) sigue su camino normal sin cambios —
+// nunca bloquea ni altera el resto de la póliza.
+async function construirNetpayInfo(movimientos, fechaFinal) {
+  const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
+
+  const candidatos = (movimientos ?? []).filter(m =>
+    m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
+    && LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA'
+    && m.centroCostoObj?.serieFacturacion && m.centroCostoObj?.id,
+  );
+  if (!candidatos.length) return vacio;
+
+  const porCentroClave = new Map(); // serieFacturacion ("M0") -> { centroCostoObj, filas: [...] }
+  for (const m of candidatos) {
+    const clave = m.centroCostoObj.serieFacturacion;
+    if (!porCentroClave.has(clave)) porCentroClave.set(clave, { centroCostoObj: m.centroCostoObj, filas: [] });
+    porCentroClave.get(clave).filas.push(m);
+  }
+
+  const codigosComision = [
+    CUENTA_NETPAY_GASTO_COMISION, CUENTA_NETPAY_IVA_POR_ACREDITAR,
+    CUENTA_NETPAY_PROVEEDOR, CUENTA_NETPAY_IVA_ACREDITABLE,
+  ];
+  const cuentasComisionRows = await AccountPlan.findAll({
+    where: { codigo: { [Op.in]: codigosComision } }, attributes: ['id', 'codigo', 'nombre'], raw: true,
+  });
+  const cuentasComisionPorCodigo = new Map(cuentasComisionRows.map(r => [r.codigo, r]));
+  const cuentasComision = {
+    gastoComision:    cuentasComisionPorCodigo.get(CUENTA_NETPAY_GASTO_COMISION)    ?? null,
+    ivaPorAcreditar:  cuentasComisionPorCodigo.get(CUENTA_NETPAY_IVA_POR_ACREDITAR) ?? null,
+    proveedor:        cuentasComisionPorCodigo.get(CUENTA_NETPAY_PROVEEDOR)         ?? null,
+    ivaAcreditable:   cuentasComisionPorCodigo.get(CUENTA_NETPAY_IVA_ACREDITABLE)   ?? null,
+  };
+  // Si falta alguna cuenta de la plantilla en el catálogo, no se puede armar
+  // el asiento de comisión de forma segura — se omite todo NetPay para esta
+  // generación (Tarjeta sigue en el consolidado genérico) en vez de generar
+  // una póliza con una cuenta faltante/0.
+  if (Object.values(cuentasComision).some(c => !c)) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn('[Poliza] Falta alguna cuenta de la plantilla de comisión NetPay en el catálogo — se omite NetPay en esta generación.');
+    return vacio;
+  }
+
+  const centroCostoIds = [...porCentroClave.values()].map(v => v.centroCostoObj.id);
+  const terminalesRows = await Terminal.findAll({
+    where: { isActive: true, centroCostoId: { [Op.in]: centroCostoIds } },
+    attributes: ['numeroSerie', 'centroCostoId'],
+    raw: true,
+  });
+  const terminalesPorCentro = new Map(); // centroCostoId -> Set(numeroSerie)
+  for (const t of terminalesRows) {
+    if (!terminalesPorCentro.has(t.centroCostoId)) terminalesPorCentro.set(t.centroCostoId, new Set());
+    terminalesPorCentro.get(t.centroCostoId).add(t.numeroSerie);
+  }
+
+  const dia      = fechaFinal.toISOString().slice(0, 10);
+  const dateFrom = `${dia}T00:00:00Z`;
+  const dateTo   = `${dia}T23:59:59Z`;
+
+  const matchedIds = new Set();
+  const porCentro  = new Map();
+
+  await Promise.all([...porCentroClave.entries()].map(async ([clave, { centroCostoObj, filas }]) => {
+    const terminalesValidas = terminalesPorCentro.get(centroCostoObj.id);
+    if (!terminalesValidas || !terminalesValidas.size) return; // sin terminales NetPay registradas en este centro
+
+    let resultado;
+    try {
+      resultado = await consultarTransaccionesNetpay({ responseCode: '00', almacenes: clave, dateFrom, dateTo });
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[Poliza] NetPay no disponible para ${clave} ${dia}, se omite (Tarjeta sigue en consolidado genérico): ${err.message}`);
+      return;
+    }
+
+    // Se consumen conforme matchean — nunca se usa el mismo ticket dos veces
+    // aunque 2 transacciones NetPay compartan monto ese día (mismo criterio
+    // que `_elegirBancoRealPorMonto`: primer match disponible gana).
+    const disponibles = [...filas];
+    let gross = 0, comision = 0;
+    for (const t of (resultado.transacciones ?? [])) {
+      if (!terminalesValidas.has(t.terminalID)) continue;
+      const monto = Number(t.amount) || 0;
+      if (monto <= 0) continue;
+      const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
+      if (idx === -1) continue; // sin ticket de ese monto exacto ese día -- se ignora
+      const fila = disponibles.splice(idx, 1)[0];
+      matchedIds.add(fila.id);
+      gross += Number(fila.debe);
+      comision += Number(t.commission) || 0;
+    }
+    if (gross > 0) {
+      porCentro.set(centroCostoObj.id, {
+        gross: Math.round(gross * 100) / 100,
+        comision: Math.round(comision * 100) / 100,
+        centroCostoObj,
+      });
+    }
+  }));
+
+  return { matchedIds, porCentro, cuentasComision };
+}
+
+// Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
+// un día/centro (ver `construirNetpayInfo`) — confirmada con el usuario
+// 2026-09-14. `gross`/`comision` ya vienen redondeados a centavos.
+function _lineasNetpay({ gross, comision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
+  const ivaComision   = Math.round(comision * 0.16 * 100) / 100;
+  const totalFactura  = Math.round((comision + ivaComision) * 100) / 100;
+  const neto          = Math.round((gross - totalFactura) * 100) / 100;
+  const centroCosto   = centroCostoObj.clave;
+  const conceptoDeposito = `VENTAS SUC.${centroCostoObj.sucursal}`;
+  const conceptoComision = 'NETPAY SAPI DE CV';
+
+  return [
+    // 1. Depósito neto real (lo que de verdad cae al banco).
+    { cuenta: cuentaDepositosReal, serie: 'NETPAY', concepto: conceptoDeposito, centroCosto, debe: neto, haber: 0, cfdiUuid: null, _subcodigo: 21, _categoria: null },
+    // 2. Gasto de comisión.
+    { cuenta: cuentasComision.gastoComision, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: comision, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 3. IVA por acreditar de la factura de comisión.
+    { cuenta: cuentasComision.ivaPorAcreditar, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: ivaComision, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 4. Se reconoce el pasivo con el proveedor (comisión + IVA)...
+    { cuenta: cuentasComision.proveedor, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: 0, haber: totalFactura, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 5. ...y se liquida en el mismo asiento (NetPay ya lo descontó del depósito, no queda pago pendiente real).
+    { cuenta: cuentasComision.proveedor, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: totalFactura, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 6. El IVA pasa de "por acreditar" a acreditado/pagado...
+    { cuenta: cuentasComision.ivaAcreditable, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: ivaComision, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 7. ...cerrando el saldo pendiente que abrió la línea 3.
+    { cuenta: cuentasComision.ivaPorAcreditar, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: 0, haber: ivaComision, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+  ];
 }
 
 // Elige, de las entradas bancarias reales ligadas a un ticket (ver
@@ -1482,7 +1641,7 @@ const NOTA_AJUSTE_SIN_CFDI = {
   'COBRO-SIN-FACTURA':            'SIN FACTURA (cobro real, sin CFDI asociado)',
 };
 
-function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null) {
+function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
   const porCategoria = { devolucion: [], descuento: [], bonificacion: [], clubTuberos: [] };
@@ -1490,6 +1649,10 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   const depositosIdentificados = []; // forma de pago sin mapear + depósito real ligado en Bancos — va al final
 
   for (const m of movs) {
+    // NetPay (ver `construirNetpayInfo`): esta línea ya se cuenta aparte, en
+    // el bloque de depósito neto + comisión que se agrega al final — no debe
+    // ADEMÁS sumar al consolidado genérico de Tarjeta.
+    if (netpayInfo?.matchedIds?.has(m.id)) continue;
     const esAjusteConsolidadoSF = m.tipoOrigen === TIPO_ORIGEN_AJUSTE_CONSOLIDADO_SF;
     if (!(Number(m.debe) > 0) && !esAjusteConsolidadoSF) continue;
     // Refacturación (factura que reemplaza una venta cancelada, ver
@@ -1916,6 +2079,15 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       _sinAutorizacion: !esGrupo && !gt.referencia,
       ...(esGrupo ? { _detalle: gt.detalle, _esTransferencia: gt.tipoDetalle === 'TRANSFERENCIA', _esResto: true } : {}),
     });
+  }
+
+  // NetPay: depósito neto + comisión por cada centro con ventas Tarjeta
+  // matcheadas (ver `construirNetpayInfo`/`_lineasNetpay`) — un bloque de 7
+  // líneas fijas por centro, agregado al final del consolidado.
+  if (netpayInfo?.porCentro?.size) {
+    for (const infoCentro of netpayInfo.porCentro.values()) {
+      depositosIdentificados.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision));
+    }
   }
 
   // Cada arreglo se ordena internamente por serie/folio ascendente — antes
@@ -2761,7 +2933,7 @@ function bloquesAjustesContado(movs) {
 // (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
-function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null } = {}) {
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null } = {}) {
   // REVERTIDO 2026-08-20: se intentó sumar Cancelación/Devolución en Efectivo
   // al consolidado, pero al cruzar contra el "Reporte de Movimientos en
   // Cajas" real (Hidalgo/B0 11-ago) se confirmó que NO hay ningún movimiento
@@ -2803,7 +2975,7 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   const bloquesAnticipos = [];
 
   const { consolidados, depositosIdentificados } =
-    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket, cuentaDepositosReal);
+    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket, cuentaDepositosReal, netpayInfo);
 
   const ventasYClubTuberos = enriquecerConceptoConCliente(
     [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
@@ -3030,6 +3202,11 @@ async function exportContpaqXlsx(id, overrides = {}) {
   const cuentaDepositosReal = await AccountPlan.findOne({
     where: { codigo: '1102011001' }, attributes: ['id', 'codigo', 'nombre'], raw: true,
   });
+  // NetPay: depósito neto real + comisión para las ventas Tarjeta cobradas
+  // por una terminal NetPay conocida (ver `construirNetpayInfo`) — sobre
+  // `movimientos` ya filtrado por `overrides.centroCostoIds` (arriba), así
+  // que respeta el mismo alcance de sucursales que el resto del export.
+  const netpayInfo = await construirNetpayInfo(movimientos, fechaFinal);
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
   // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.
@@ -3085,7 +3262,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // mismo principio que ya usa el resto de sucursales cuando falta
       // Contado o Crédito (folios consecutivos, sin huecos).
       const cSplit = contado.length > 0
-        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal })
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
@@ -3124,7 +3301,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
           // factura) — refleja el depósito real de caja/banco del periodo.
           {
             tipoVenta: 'Contado',
-            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal }),
+            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo }),
             folio:     overrides.folioContado   ?? poliza.numero,
             concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
@@ -3141,7 +3318,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       : [{
           tipoVenta: null,
           movs:      contado.length > 0
-            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal })
+            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
             : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
           folio:     overrides.folioContado   ?? poliza.numero,
           concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),

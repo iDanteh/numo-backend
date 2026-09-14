@@ -35,7 +35,8 @@ test('consulta por erpLinks.origen:transferencia-caja + ficha:null, ordenado por
   expect(BankMovement.find).toHaveBeenCalledWith({ 'erpLinks.origen': 'transferencia-caja', ficha: null });
   expect(query.sort).toHaveBeenCalledWith({ fecha: -1 });
   expect(query.limit).toHaveBeenCalledWith(200);
-  expect(query.select).toHaveBeenCalledWith('_id banco fecha concepto deposito folio erpLinks');
+  expect(query.select).toHaveBeenCalledWith('_id banco fecha concepto deposito retiro folio status erpIds erpLinks '
+    + 'ficha fichaAt fichaBy fichaNombre fichaDriveFileId fichaDriveWebViewLink fichaDriveMimeType');
 });
 
 test('sin movimientos pendientes: total 0, movimientos []', async () => {

@@ -78,7 +78,7 @@ jest.mock('../../../visor/models/CFDI', () => ({
 // (caja-transferencia-match.service.test.js / caja-transferencia-confirm.service.test.js);
 // acá solo se cubre el cableado HTTP (params, permisos, códigos de respuesta).
 jest.mock('./CajaTransferencia.model');
-jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatos: jest.fn() }));
+jest.mock('./caja-transferencia-match.service', () => ({ buscarCandidatosBatch: jest.fn() }));
 jest.mock('./caja-transferencia-confirm.service', () => ({ confirmarMatch: jest.fn() }));
 jest.mock('./caja-transferencia-descartar-manual.service', () => ({ descartarManual: jest.fn() }));
 jest.mock('./caja-transferencia-sync.service', () => ({ sincronizarTransferenciasCajasManual: jest.fn(), init: jest.fn() }));
@@ -92,7 +92,7 @@ const koreCaja     = require('./kore-caja.service');
 const { sincronizarCuentasPendientes } = require('./erp-sync.service');
 const CFDI         = require('../../../visor/models/CFDI');
 const CajaTransferencia = require('./CajaTransferencia.model');
-const { buscarCandidatos } = require('./caja-transferencia-match.service');
+const { buscarCandidatosBatch } = require('./caja-transferencia-match.service');
 const { confirmarMatch }   = require('./caja-transferencia-confirm.service');
 const { descartarManual }  = require('./caja-transferencia-descartar-manual.service');
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
@@ -181,6 +181,83 @@ describe('_debeRecalcularAporte', () => {
   test('vínculo de motor automático (esHumano=false): nunca recalcula acá, sin importar finalizadoManualmente', () => {
     expect(router._debeRecalcularAporte(false, false)).toBe(false);
     expect(router._debeRecalcularAporte(false, true)).toBe(false);
+  });
+});
+
+// _aporteParaFinalizacionSync — 2026-09-14, bug real confirmado con 10 movimientos en
+// producción (uno de $196,431.39, folio 038309): la rama de finalización de
+// _syncErpKoreJob recalculaba el aporte de CUALQUIER vínculo humano en cuanto Kore
+// reportaba la CxC cerrada, sin respetar finalizadoManualmente (a diferencia de
+// _recomputeErpKoreJob, que ya lo hacía vía _debeRecalcularAporte) — pisando un saldo ya
+// correcto (fijado por un cobro real en Numo) con el cálculo viejo y buggy de
+// _montoSaldoLinkPorMovimiento.
+describe('_aporteParaFinalizacionSync', () => {
+  const mov = { numeroAutorizacion: '039033', identificadoPor: [] };
+
+  test('vínculo de motor (esHumano=false): calcula por autorización bancaria, ignora finalizadoManualmente', () => {
+    const raw0 = {
+      saldoActual: 0,
+      movimientos: [
+        { serie: 'A0', total: 1000 },
+        { serie: 'ABO', total: -1000, formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', adicionales: [
+          { nombre: 'Aut', valor: '039033' },
+        ] }] },
+      ],
+    };
+    const link = { saldoErpAportado: null };
+
+    expect(router._aporteParaFinalizacionSync(false, false, raw0, mov, link)).toBe(1000);
+    expect(router._aporteParaFinalizacionSync(false, true, raw0, mov, link)).toBe(1000);
+  });
+
+  test('vínculo humano, SIN finalizar manualmente: recalcula con _montoSaldoLinkPorMovimiento (comportamiento de siempre, sin cambios)', () => {
+    const movHumano = { numeroAutorizacion: '040727', identificadoPor: [] };
+    const raw0 = {
+      saldoActual: 0,
+      movimientos: [
+        { serie: 'A0', total: 1500 },
+        { serie: 'ABO', total: -1500, formasPago: [{ nombreFormaPago: 'TRANSFERENCIA',
+          adicionales: [{ nombre: 'Aut', valor: '040727' }] }] },
+      ],
+    };
+    const link = { saldoErpAportado: 999 }; // valor viejo, distinto al que SÍ debe recalcularse
+
+    const resultado = router._aporteParaFinalizacionSync(true, false, raw0, movHumano, link);
+
+    expect(resultado).toBe(1500); // recalculado de verdad, no el valor viejo del link
+  });
+
+  test('CRÍTICO: vínculo humano YA finalizado manualmente (cobro real en Numo) — preserva saldoErpAportado tal cual, aunque el kardex de Kore traiga una reversión sin tag que haría netear a 0 (el bug real)', () => {
+    // Caso real simplificado (folio 038309, $196,431.39, D0-260802730): el pago bancario real
+    // ($196,431.71) queda tageado a este movimiento, pero el kardex trae además una reversión
+    // sin tag de identidad de la MISMA magnitud — _montoSaldoLinkPorMovimiento (acumulador
+    // plano) neta esto a 0 exacto, aunque el pago sea real y ya esté confirmado por un cobro
+    // humano en Numo.
+    const movReal = { numeroAutorizacion: 'AUT-196431', identificadoPor: [] };
+    const raw0 = {
+      saldoActual: 0,
+      movimientos: [
+        { serie: 'D0', total: 196431.71 },
+        { serie: 'ABO', total: -196431.71, formasPago: [{ nombreFormaPago: 'TRANSFERENCIA',
+          adicionales: [{ nombre: 'Aut', valor: 'AUT-196431' }] }] },
+        // Reversión SIN tag de identidad, signo opuesto y misma magnitud — la que causaba
+        // el neteo a 0 (mismo patrón que el caso real folioExterno 260800166 de más abajo).
+        { serie: 'REV ABO', total: 196431.71, formasPago: [{ nombreFormaPago: 'TRANSFERENCIA' }] },
+      ],
+    };
+    const link = { saldoErpAportado: 196431.71 }; // ya fijado por el cobro real en Numo
+
+    // Sin la corrección, esto habría llamado _montoSaldoLinkPorMovimiento y dado 0 (o algo
+    // distinto de 196431.71) — con la corrección, preserva el valor ya confirmado tal cual.
+    const resultado = router._aporteParaFinalizacionSync(true, true, raw0, movReal, link);
+
+    expect(resultado).toBe(196431.71);
+  });
+
+  test('vínculo humano finalizado manualmente pero saldoErpAportado nunca determinado: preserva null, no inventa un valor', () => {
+    const raw0 = { saldoActual: 0, movimientos: [] };
+    const link = { saldoErpAportado: null };
+    expect(router._aporteParaFinalizacionSync(true, true, raw0, mov, link)).toBeNull();
   });
 });
 
@@ -970,22 +1047,41 @@ describe('GET /transferencias-cajas/bandeja', () => {
     expect(CajaTransferencia.find).not.toHaveBeenCalled();
   });
 
-  test('devuelve pendientes con sus candidatos calculados', async () => {
+  test('devuelve pendientes con sus candidatos calculados (batch, 2026-09-14 — antes N llamadas a buscarCandidatos, ahora 1 sola a buscarCandidatosBatch)', async () => {
     const pendiente = { _id: 't-1', estatusMatch: 'pendiente', monto: 1500 };
     CajaTransferencia.find = jest.fn(() => ({
       sort: jest.fn(() => ({
         lean: jest.fn().mockResolvedValue([pendiente]),
       })),
     }));
-    buscarCandidatos.mockResolvedValue([[{ _id: 'mov-1' }]]);
+    buscarCandidatosBatch.mockResolvedValue(new Map([['t-1', [[{ _id: 'mov-1' }]]]]));
 
     const res = await request(app)
       .get('/transferencias-cajas/bandeja')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
 
     expect(res.status).toBe(200);
+    expect(buscarCandidatosBatch).toHaveBeenCalledTimes(1);
+    expect(buscarCandidatosBatch).toHaveBeenCalledWith([pendiente]);
     expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [[{ _id: 'mov-1' }]] }]);
     expect(res.body.huerfanas).toBeUndefined();
+  });
+
+  test('transferencia sin entrada en el Map (defensivo): candidatos []', async () => {
+    const pendiente = { _id: 't-2', estatusMatch: 'pendiente', monto: 500 };
+    CajaTransferencia.find = jest.fn(() => ({
+      sort: jest.fn(() => ({
+        lean: jest.fn().mockResolvedValue([pendiente]),
+      })),
+    }));
+    buscarCandidatosBatch.mockResolvedValue(new Map());
+
+    const res = await request(app)
+      .get('/transferencias-cajas/bandeja')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_TRANSFERENCIAS_CAJA]));
+
+    expect(res.status).toBe(200);
+    expect(res.body.pendientes).toEqual([{ transferencia: pendiente, candidatos: [] }]);
   });
 });
 

@@ -892,21 +892,30 @@ async function construirMovimientosPuente({
   // el usuario 2026-08-04 con datos reales (RENIT/GRUPO CUBOOAX, banco
   // Banamex). Sin esto, estas líneas se quedan en la cuenta genérica
   // "Bancos por identificar" aunque sí haya un depósito real identificado.
-  // `${serie}|${folioVenta}` → [{ banco, referencia, monto }, ...]. Array y no
-  // un solo objeto: un ticket puede tener 2+ movimientos bancarios reales
-  // vinculados (Tarjeta con 2+ swipes/terminales en un solo formaPago, ver
-  // `normalizarAuthLista` en bank-autorizaciones.service.js) — un `.set()`
+  // `${serie}|${folioVenta}` → [{ banco, referencia, monto, fecha }, ...].
+  // Array y no un solo objeto: un ticket puede tener 2+ movimientos bancarios
+  // reales vinculados (Tarjeta con 2+ swipes/terminales en un solo formaPago,
+  // ver `normalizarAuthLista` en bank-autorizaciones.service.js) — un `.set()`
   // simple perdía todos menos el último (mismo bug ya corregido para
   // Transferencia en `construirBancoRealPorTicket`, poliza.service.js,
   // 2026-08-31; aquí no se había replicado — caso real 2026-09-11, SD
   // SOLUTIONS / F0-260900334).
+  //
+  // `fecha` (2026-09-15, caso real CEDIS 12-sep, ticket A0-260704683): una
+  // venta PPD pagada en varias parcialidades puede tener 2+ `BankMovement`
+  // ligados al mismo ticket en fechas MUY distintas (ahí, $500 el 31-ago y
+  // $500 el 3-sep, para una cuenta cuyo remanente real se liquidó hasta el
+  // 12-sep). Sin la fecha de cada depósito, `_elegirBancoRealPorFecha` (más
+  // abajo) no puede distinguir cuál corresponde al `cobro` de ESTA línea —
+  // antes se usaba ciegamente el primero del arreglo (o se repartía por
+  // monto), pegando el depósito de un día equivocado a la línea de otro.
   const bancoPorVenta = new Map();
   if (docsUnicos.length) {
     const orCondiciones = docsUnicos.map(d => ({ 'erpLinks.serie': d.serie, 'erpLinks.folioExterno': d.folio }));
     for (let i = 0; i < orCondiciones.length; i += LOTE) {
       const lote = orCondiciones.slice(i, i + LOTE);
       const movsBanco = await BankMovement.find({ $or: lote }, {
-        banco: 1, folio: 1, erpLinks: 1, deposito: 1,
+        banco: 1, folio: 1, erpLinks: 1, deposito: 1, fecha: 1,
       }).lean();
       for (const mb of movsBanco) {
         // `folio` (el auto-incremental propio de Numo, ej. "034287") — NO
@@ -926,10 +935,41 @@ async function construirMovimientosPuente({
             banco:      mb.banco,
             referencia,
             monto:      Math.abs(link.saldoActual ?? mb.deposito ?? 0),
+            fecha:      mb.fecha ?? null,
           });
         }
       }
     }
+  }
+  // Elige, de los depósitos reales ligados a un ticket, cuáles corresponden a
+  // ESTE `cobro` específico por FECHA — cada `cobro` de `cuenta.cobros` ya es
+  // un evento puntual con su propia fecha (ver el loop principal más abajo),
+  // así que el depósito real que le toca es el de ESE día, nunca el de otro
+  // abono/parcialidad del mismo ticket en una fecha distinta.
+  // Devuelve SIEMPRE un array: si hay 1+ candidatos del MISMO día que
+  // `fechaCobro`, esos (soporta el caso real de 2+ swipes de Tarjeta el mismo
+  // día — ahí sí se reparte el monto entre ellos, ver uso más abajo). Si
+  // ninguno cae el mismo día, el más cercano en el tiempo — uno solo, nunca
+  // repartido entre depósitos de días distintos (2026-09-15, caso real CEDIS
+  // 12-sep, ticket A0-260704683: 2 depósitos de $500 en 31-ago y 3-sep no
+  // deben mezclarse ni repartirse en la línea de un cobro del 12-sep). `null`
+  // cuando no hay candidatos en absoluto.
+  function _elegirBancoRealPorFecha(candidatos, fechaCobro) {
+    if (!candidatos || candidatos.length === 0) return null;
+    if (candidatos.length === 1) return candidatos;
+    const diaCobro = fechaCobro ? new Date(fechaCobro).toISOString().slice(0, 10) : null;
+    if (!diaCobro) return candidatos;
+    const mismoDia = candidatos.filter(c => c.fecha && new Date(c.fecha).toISOString().slice(0, 10) === diaCobro);
+    if (mismoDia.length) return mismoDia;
+    const fechaCobroMs = new Date(fechaCobro).getTime();
+    let mejor = candidatos[0];
+    let mejorDistancia = Infinity;
+    for (const c of candidatos) {
+      if (!c.fecha) continue;
+      const distancia = Math.abs(new Date(c.fecha).getTime() - fechaCobroMs);
+      if (distancia < mejorDistancia) { mejorDistancia = distancia; mejor = c; }
+    }
+    return [mejor];
   }
   // Cuentas reales de banco (ver BANCO_A_CODIGO_CUENTA) — un solo query.
   const codigosBancoReal = Object.values(BANCO_A_CODIGO_CUENTA);
@@ -1138,9 +1178,14 @@ async function construirMovimientosPuente({
         // solo aplica a Transferencia/Tarjeta (nunca Efectivo, que no pasa
         // por banco). Cuenta real + número de depósito en vez de la genérica
         // "Bancos por identificar" + etiqueta "TRANSFERENCIA"/"TARJETA".
-        const bancoRealArr = !esEfectivo
+        // Filtrado por `_elegirBancoRealPorFecha` contra `cobro.fecha` — un
+        // ticket puede tener depósitos reales de OTROS días (parcialidades
+        // previas de la misma venta PPD); solo el/los del día de ESTE cobro
+        // aplican a esta línea (ver docstring de la función).
+        const bancoRealArrCrudo = !esEfectivo
           ? bancoPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)
           : null;
+        const bancoRealArr = bancoRealArrCrudo ? _elegirBancoRealPorFecha(bancoRealArrCrudo, cobro.fecha) : null;
 
         // 2+ movimientos bancarios reales para este mismo ticket (Tarjeta con
         // 2+ swipes/terminales) — una línea contable por movimiento, cada una

@@ -334,8 +334,6 @@ async function construirBancoRealPorTicket(movimientos) {
       const referencia = m.folio || null;
       const numeroAutorizacion = m.numeroAutorizacion || m.referenciaNumerica || null;
       if (!referencia && !numeroAutorizacion) continue;
-      // Ver comentario equivalente en `construirVerdadBancaria`.
-      const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
       for (const link of (m.erpLinks ?? [])) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
@@ -354,6 +352,25 @@ async function construirBancoRealPorTicket(movimientos) {
         // detalle de la hoja "Desglose Consolidado"). Ahora se acumulan TODAS
         // las entradas por ticket — `_elegirBancoRealPorMonto` elige la que
         // corresponde a cada línea por su monto exacto.
+        //
+        // BUG CORREGIDO 2026-09-15 (caso real CEDIS 12-sep, ticket
+        // A0-260704683 $492.87 vs A0-260704334 $1,007.13, ambos repartidos
+        // del MISMO depósito BBVA $1,500 del 7-sep, folio 045330): el monto
+        // usado para el match por `_elegirBancoRealPorMonto` era
+        // `BankMovement.deposito` — el BRUTO de TODO el depósito — en vez de
+        // `link.saldoPagadoTotal` — la porción EXACTA que ese depósito le
+        // aportó a ESTE ticket. Cuando un mismo depósito se reparte entre 2+
+        // tickets (como aquí: $1,007.13 + $492.87 = $1,500.00), ningún ticket
+        // calzaba nunca contra el bruto ($1,500), así que `_elegirBancoRealPorMonto`
+        // siempre caía al primer candidato por default — atribuyendo a veces
+        // un depósito de una fecha totalmente distinta (aquí, uno del 31-ago,
+        // 12 días antes del cierre real del 12-sep). `saldoPagadoTotal` por
+        // link YA trae el monto exacto por ticket — usarlo hace que el match
+        // por monto funcione como estaba pensado, sin tocar el caso de un
+        // solo candidato (ahí `saldoPagadoTotal` == `deposito`, sin cambio).
+        const montoBancoReal = typeof link.saldoPagadoTotal === 'number'
+          ? link.saldoPagadoTotal
+          : (typeof m.deposito === 'number' ? m.deposito : null);
         if (!mapa.has(key)) mapa.set(key, []);
         mapa.get(key).push({ esTransferencia, categoriaConocida, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }

@@ -1504,14 +1504,13 @@ async function construirMovimientosPuente({
       // flujo normal de arriba tomará este mismo folio como cualquier otro
       // documento relacionado.
       // Desglose por forma de pago (2026-09-14, confirmado con el usuario):
-      // Efectivo/Tarjeta van directo a Caja/Bancos por identificar (igual que
-      // el lado vendedor PUE normal), NO a la cuenta puente — la cuenta
+      // Efectivo Y Tarjeta van AMBOS directo a Caja por identificar (no a
+      // Bancos, corregido 2026-09-14), NO a la cuenta puente — la cuenta
       // puente (2103040001) se reserva para formas de pago que sí requieren
       // cuadrar contra la sucursal cobradora (Transferencia, Cheque, SF,
-      // Puntos), mismo criterio ya usado en el lado COBRADOR de este mismo
-      // bloque (`lineasCobrador` más abajo). Solo aplica a este camino
-      // (cobros de otra sucursal sin factura) — no tocar otros usos de
-      // `cuentaPuenteId` (PPD normal, cobranza-poliza-generator.service.js).
+      // Puntos). Solo aplica a este camino (cobros de otra sucursal sin
+      // factura) — no tocar otros usos de `cuentaPuenteId` (PPD normal,
+      // cobranza-poliza-generator.service.js).
       if (centroVendedor && String(centroVendedor.id) === String(centroCostoId) && p.monto > 0) {
         const totalFormasPagoVendedor = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
         let acumuladoVendedor = 0;
@@ -1524,9 +1523,9 @@ async function construirMovimientosPuente({
           acumuladoVendedor += montoAsignado;
           if (montoAsignado <= 0) return;
           const claveSatFp = (fp.claveSat ?? '').trim();
-          const cuentaVendedor = claveSatFp === CLAVE_SAT_EFECTIVO ? cuentaCajaId
-            : CLAVES_SAT_TARJETA.includes(claveSatFp) ? cuentaBancosId
-              : cuentaPuenteId;
+          const cuentaVendedor = (claveSatFp === CLAVE_SAT_EFECTIVO || CLAVES_SAT_TARJETA.includes(claveSatFp))
+            ? cuentaCajaId
+            : cuentaPuenteId;
           candidatas.push({
             cuentaId:      cuentaVendedor,
             cuentaFaltante: false,

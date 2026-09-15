@@ -2735,6 +2735,11 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   const _facturaKeyDe = (cuenta) => (cuenta.serieFactura && cuenta.folioFactura)
     ? `${cuenta.serieFactura}|${cuenta.folioFactura}`
     : (cuenta.serieVenta && cuenta.folioVenta) ? `${cuenta.serieVenta}|${cuenta.folioVenta}` : null;
+  // true solo cuando el ERP mandó `serieFactura`/`folioFactura` directo (link
+  // confirmado) — false cuando `_facturaKeyDe` tuvo que caer al respaldo
+  // `serieVenta`/`folioVenta` (el folio del propio ticket). Ver `facturasPPD`
+  // más abajo: esa distinción es la que evita el bug de 2026-09-15.
+  const _facturaConfirmada = (cuenta) => !!(cuenta.serieFactura && cuenta.folioFactura);
   const foliosFacturaReferenciados = new Set();
   for (const cuenta of resultado) {
     const key = _facturaKeyDe(cuenta);
@@ -2803,7 +2808,25 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       if (facturaKey) {
         // PPD: su cobro es de Cobranza (CFDI de Pago), sin importar cuánto
         // tiempo pasó desde la factura — ver docstring de `facturasPPD` arriba.
-        if (facturasPPD.has(facturaKey)) continue;
+        //
+        // BUG CORREGIDO 2026-09-15 (caso real centro A0, 45 tickets/$349,050
+        // en 1-15 sep, ej. A0-260704334/JOSE DIAZ MARTINEZ $1,007.13 y
+        // A0-260803149/CONCEPCION ESPINOSA MERLIN $5,000.00): este salto
+        // confiaba en `facturaKey` sin importar si vino del campo CONFIRMADO
+        // del ERP (`serieFactura`/`folioFactura`) o del respaldo por folio de
+        // TICKET (`_facturaKeyDe` cae a `serieVenta`/`folioVenta` cuando el
+        // ERP no trae los primeros — ver su docstring). El respaldo puede
+        // coincidir por pura casualidad de numeración con un CFDI PPD de OTRO
+        // cliente sin relación real (confirmado con datos reales: el folio
+        // "coincidente" resultaba ser de un cliente completamente distinto).
+        // Como el chequeo de tolerancia de abajo se salta a propósito para
+        // PPD, no había ninguna otra validación — el ticket se excluía y el
+        // dinero desaparecía del export por completo (ni aquí ni en Cobranza,
+        // que tampoco tiene ninguna relación real que procesar). Verificado
+        // que el caso real que motivó este guard (depósito 046510/046497)
+        // SIEMPRE usa el campo confirmado, nunca el respaldo — restringir el
+        // salto automático a solo ese campo no le quita nada a ese caso.
+        if (facturasPPD.has(facturaKey) && _facturaConfirmada(cuenta)) continue;
         const diaCfdi = diaCfdiPorFolioFactura.get(facturaKey);
         // CFDI existe Y su fecha está dentro de tolerancia del cobro → el
         // pipeline normal por CFDI ya lo cubre (o lo cubrirá) — no duplicar.

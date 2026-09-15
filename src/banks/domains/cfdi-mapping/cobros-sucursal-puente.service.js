@@ -1291,8 +1291,16 @@ async function construirMovimientosPuente({
             centroCostoId: centroCobrador.id, tipoOrigen: 'Cobro Sucursal',
             reglaNombre: l.reglaNombre, formaPago: l.formaPago ?? null, cfdiUuid: null,
           });
+          // Efectivo SÍ puede transferirse físicamente entre sucursales, así
+          // que su Abono va a la MISMA cuenta que el Cargo (Caja) — mismo
+          // criterio ya usado en el lado vendedor normal (ver comentario en
+          // cfdi-poliza-generator.service.js, `_extraerCobrosSucursal`).
+          // Tarjeta/Transferencia NUNCA se pueden "mover", su Abono se queda
+          // en la cuenta puente (corregido 2026-09-15, confirmado con el
+          // usuario, caso real Puerto Escondido A0-260901265).
+          const esEfectivoDirecto = (l.formaPago ?? '').trim() === CLAVE_SAT_EFECTIVO;
           candidatas.push({
-            cuentaId: cuentaPuenteId, cuentaFaltante: false, concepto: l.concepto,
+            cuentaId: esEfectivoDirecto ? l.cuentaId : cuentaPuenteId, cuentaFaltante: false, concepto: l.concepto,
             debe: 0, haber: l.montoAsignado, serie: serieFolioFactura,
             folio: cobro.folioOrigen ?? null, centroCosto: centroCobrador.clave,
             centroCostoId: centroCobrador.id, tipoOrigen: 'Cobro Sucursal',

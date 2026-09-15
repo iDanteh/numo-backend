@@ -2359,6 +2359,12 @@ const ETIQUETA_SALDO_FAVOR = 'SF';
 // mismo día en el mismo almacén: se omite del export (queda en BD intacto)
 // confirmado con el usuario 2026-08-04.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
+// Mismo texto que ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR en
+// cfdi-poliza-generator.service.js — saldo a favor generado, sin ningún uso
+// todavía, menor a $50 (2026-09-15, confirmado con el usuario): a diferencia
+// de SF-OCULTO (se omite del export por completo), este SÍ se muestra, pero
+// en "Otros Ingresos" en vez de mezclado con "Saldos a favor usados".
+const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
 // Mismo texto que ETIQUETA_COBRO_YA_CONTABILIZADO en cfdi-mapping.service.js
 // (2026-08-25) — Cargo de Efectivo/Tarjeta de una factura cuyo cobro real ya
 // se contabilizó otro día vía "Cobros sin factura" (facturación diferida
@@ -2608,7 +2614,8 @@ function _extraerCobrosSucursal(movimientos) {
       const _keyCargoPar = m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.debe).toFixed(2)}`;
       if (_cobroSucursalHaberKeys.has(_keyCargoPar)) continue;
     }
-    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO) {
+    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
+      || m.reglaNombre === ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,
         centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
@@ -2620,7 +2627,9 @@ function _extraerCobrosSucursal(movimientos) {
         // antes se mezclaban sin forma de saber cuál era cuál en el Excel.
         motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
           ? 'Oculto — cobro real ya contabilizado el día real del cobro'
-          : 'Oculto — generado y usado el mismo día/almacén',
+          : m.reglaNombre === ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
+            ? 'Saldo a favor generado, sin usar, menor a $50'
+            : 'Oculto — generado y usado el mismo día/almacén',
       });
       continue;
     }

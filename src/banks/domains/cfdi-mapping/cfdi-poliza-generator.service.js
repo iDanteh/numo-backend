@@ -92,6 +92,16 @@ const TIPO_MARCADORES_DEV = ['BON', 'BCT', 'DEV', 'CAC'];
 // cobros-sucursal-puente.service.js.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 
+// Saldo a favor GENERADO que sigue COMPLETAMENTE sin usar (ningún `uso`
+// registrado) y es menor a $50 (2026-09-15, confirmado con el usuario) — a
+// diferencia de SF-OCULTO (que se oculta del export por completo), este SÍ
+// debe verse, pero en la hoja "Otros Ingresos" en vez de mezclado con el
+// resto de "Saldos a favor usados"/la póliza principal — es dinero tan
+// pequeño que probablemente nunca se reclame, se trata como ingreso menor.
+// `_extraerCobrosSucursal` (poliza.service.js) lo detecta por este
+// reglaNombre y lo redirige, mismo patrón que SF-OCULTO/COBRO-DIA-REAL.
+const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
+
 /**
  * Deduplica líneas de Saldo a Favor (SF/SF-OCULTO) que DOS mecanismos
  * independientes pueden detectar por separado para el MISMO saldo usado,
@@ -1965,6 +1975,17 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     // registro por completo.
   }
 
+  // Sin usar en absoluto (ningún `uso` registrado todavía) y menor a $50 —
+  // ver `ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR`. `montoPropio` (no `generado.monto`)
+  // porque es el monto real de ESTA línea (ver comentario arriba sobre por
+  // qué nunca se usa `generado.monto` directo); el estado "sin usar" sí se
+  // revisa contra el saldo agregado completo (`generado.usos`), correcto
+  // incluso cuando la misma venta origen se dividió en 2+ CFDIs tipo E.
+  const montoUsadoTotal = (generado.usos ?? []).reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+  const reglaSFExport = (montoUsadoTotal < 0.01 && montoPropio < 50)
+    ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
+    : reglaSF;
+
   return [
     // tipoOrigen='Cobro Sucursal' (NO un tipo propio) — a propósito: solo así
     // pasa por `_extraerCobrosSucursal` (poliza.service.js), que arma columna
@@ -1976,8 +1997,10 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     // 'SF-OCULTO' cuando se generó y se consumió por completo el mismo día
     // en el mismo almacén — ver `_prefetchSaldosFavorGenerados` — para que
     // `_extraerCobrosSucursal` la omita del export (sigue en poliza_movimientos).
-    { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: subtotal },
-    { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: iva },
+    // 'SF-MENOR-SIN-USAR' cuando sigue sin usarse y es menor a $50 — se
+    // redirige a "Otros Ingresos" en vez de "Saldos a favor usados".
+    { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSFExport, debe: 0, haber: subtotal },
+    { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSFExport, debe: 0, haber: iva },
   ];
 }
 

@@ -56,6 +56,13 @@ const PERMISSIONS = Object.freeze({
   // Solicitudes de cobranza
   COLLECTIONS_READ:    'collections:read',
   COLLECTIONS_WRITE:   'collections:write',
+  // Acceso de solo lectura, ACOTADO a solicitudes en status 'identificada' — para un rol
+  // que necesita ver la bandeja de Solicitudes de Cobro sin poder gestionarla
+  // (collections:write) ni ver pendientes/rechazadas/canceladas. 2026-09-15, pedido
+  // explícito del usuario. Requiere SIEMPRE collections:read además (permit() en las
+  // rutas exige ambos) — este permiso por sí solo no habilita nada. Con
+  // collections:write, este permiso queda irrelevante (acceso completo gana).
+  COLLECTIONS_READ_IDENTIFICADAS: 'collections:read:identificadas',
 
   // Integración ERP
   ERP_MANAGE:          'erp:manage',

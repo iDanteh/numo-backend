@@ -236,6 +236,13 @@ async function buscarTransaccionesNetpay(params = {}) {
   // llama arma el string exacto (inicio/fin de día), esta función no lo calcula.
   if (params.dateFrom) queryParams.dateFrom = params.dateFrom;
   if (params.dateTo) queryParams.dateTo = params.dateTo;
+  // terminalID (2026-09-15, confirmado por el usuario contra Kore real vía Insomnia):
+  // filtra por la terminal física que procesó el cobro — primer paso para poder armar
+  // matching contra el depósito bancario correspondiente (cada terminal liquida a una
+  // cuenta/banco propio). Nombre EXACTO tal cual lo espera Kore — un query param que
+  // Kore no reconoce lo ignora en silencio, sin error, así que no vale la pena adivinar
+  // el casing.
+  if (params.terminalID) queryParams.terminalID = params.terminalID;
   // Paginación de Kore (2026-09-08, confirmado por el usuario: pageSize máximo real
   // 100) — ver netpay-transacciones.service.js, que recorre todas las páginas
   // necesarias antes de agregar totales, nunca agrega sobre una sola respuesta.

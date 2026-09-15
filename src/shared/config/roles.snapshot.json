@@ -24,7 +24,9 @@
       "banks:cfdi:read",
       "banks:erp:reversiones",
       "banks:erp:link",
-      "banks:erp:anticipos"
+      "banks:erp:anticipos",
+      "collections:read",
+      "collections:write"
     ],
     "isSystem": true
   },

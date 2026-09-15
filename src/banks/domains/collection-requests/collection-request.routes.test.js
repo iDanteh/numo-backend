@@ -22,6 +22,22 @@ jest.mock('../erp/erp.routes');
 jest.mock('../../shared/utils/mongo-tx');
 jest.mock('../../shared/socket');
 jest.mock('../../shared/utils/logger');
+// collection-request.service.js mockeado completo (2026-09-15, permiso
+// collections:read:identificadas) — ningún test de este archivo lo necesitaba real hasta
+// ahora (indicadores/anticipos-generados van por sus propios services); acá solo se prueba
+// el wiring de _resolverForceStatus() (permiso → forceStatus → args del service), no la
+// lógica interna de list()/getById()/etc. — esa ya tiene su propia cobertura en
+// collection-request.identificar.test.js y compañía.
+jest.mock('./collection-request.service');
+// rbac-store: _resolverForceStatus() lo llama inline (fuera de permit()), mismo criterio
+// de "mockear los límites de I/O" ya usado en erp.routes.test.js para banks:erp:anticipos.
+jest.mock('../../../shared/services/rbac-store', () => ({
+  hasPermission:     jest.fn(),
+  hasAllPermissions: jest.fn(),
+  invalidate:        jest.fn(),
+  getPermissions:    jest.fn(),
+  roleExists:        jest.fn(),
+}));
 jest.mock('./collection-request-indicadores.service', () => ({
   getIndicadoresSolicitudesCobro:  jest.fn(),
   getDistribucionSolicitudesCobro: jest.fn(),
@@ -71,6 +87,8 @@ jest.mock('../../shared/middleware/auth.real', () => ({
 const express = require('express');
 const request = require('supertest');
 const router  = require('./collection-request.routes');
+const service = require('./collection-request.service');
+const rbacStore = require('../../../shared/services/rbac-store');
 const indicadoresService = require('./collection-request-indicadores.service');
 const anticipoGeneradoService = require('./anticipo-generado.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
@@ -271,6 +289,113 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       const args = anticipoGeneradoService.listAnticiposGenerados.mock.calls[0][0];
       expect(args.page).toBe('2');
       expect(args.correlacionAutomatica).toBe('false');
+    });
+  });
+});
+
+// _resolverForceStatus() (2026-09-15, permiso collections:read:identificadas) — nuevo,
+// cubre la bandeja (GET /), el detalle (GET /:id) y las 3 rutas de comprobante/análisis.
+// Todas exigen collections:read (permit(), ya cubierto arriba en otras rutas) y ADEMÁS
+// resuelven collections:write/collections:read:identificadas inline vía rbacStore, fuera
+// de permit() — mismo patrón ya usado en bank.routes.js (hasFullAccess/hasAdminAccess).
+describe('_resolverForceStatus() — GET / y rutas de detalle/comprobante de una solicitud', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockReqUser = { _id: 'user-test', role: 'test-role', extraPermissions: [] };
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  // Permite simular exactamente qué permisos "extra" (más allá de collections:read, que
+  // ya viene fijo en el header x-test-permissions de cada request) devuelve rbacStore.
+  function mockAcceso({ write = false, soloIdentificadas = false } = {}) {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => {
+      if (perm === PERMISSIONS.COLLECTIONS_WRITE) return write;
+      if (perm === PERMISSIONS.COLLECTIONS_READ_IDENTIFICADAS) return soloIdentificadas;
+      return false;
+    });
+  }
+
+  describe('GET / (bandeja principal)', () => {
+    test('collections:write → forceStatus null (acceso completo), sin importar el status pedido', async () => {
+      mockAcceso({ write: true });
+      service.list.mockResolvedValue({ data: [], pagination: {} });
+
+      const res = await request(app)
+        .get('/')
+        .query({ status: 'pendiente' })
+        .set('x-test-permissions', ALLOWED);
+
+      expect(res.status).toBe(200);
+      expect(service.list).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'pendiente' }),
+        { forceStatus: null },
+      );
+    });
+
+    test('collections:read:identificadas (sin write) → fuerza forceStatus=identificada', async () => {
+      mockAcceso({ soloIdentificadas: true });
+      service.list.mockResolvedValue({ data: [], pagination: {} });
+
+      const res = await request(app)
+        .get('/')
+        .query({ status: 'pendiente' }) // intenta pedir otro status — igual debe forzarse
+        .set('x-test-permissions', ALLOWED);
+
+      expect(res.status).toBe(200);
+      expect(service.list).toHaveBeenCalledWith(
+        expect.objectContaining({ status: 'pendiente' }),
+        { forceStatus: 'identificada' },
+      );
+    });
+
+    test('ni collections:write ni collections:read:identificadas → 403, el service nunca se llama', async () => {
+      mockAcceso({});
+
+      const res = await request(app).get('/').set('x-test-permissions', ALLOWED);
+
+      expect(res.status).toBe(403);
+      expect(service.list).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /:id (detalle)', () => {
+    test('collections:read:identificadas pasa forceStatus=identificada al service', async () => {
+      mockAcceso({ soloIdentificadas: true });
+      service.getById.mockResolvedValue({ _id: 'cr1', status: 'identificada' });
+
+      const res = await request(app).get('/cr1').set('x-test-permissions', ALLOWED);
+
+      expect(res.status).toBe(200);
+      expect(service.getById).toHaveBeenCalledWith('cr1', { forceStatus: 'identificada' });
+    });
+
+    test('sin write ni el nuevo permiso → 403, ni siquiera intenta el service', async () => {
+      mockAcceso({});
+
+      const res = await request(app).get('/cr1').set('x-test-permissions', ALLOWED);
+
+      expect(res.status).toBe(403);
+      expect(service.getById).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GET /:id/comprobante, /:id/comprobantes/:index y /:id/analyze-comprobante', () => {
+    test('las 3 rutas propagan forceStatus=identificada al service', async () => {
+      mockAcceso({ soloIdentificadas: true });
+      service.getComprobante.mockResolvedValue({ data: Buffer.from('x'), mimetype: 'image/png', originalName: 'a.png' });
+      service.analyzeStoredComprobantes.mockResolvedValue([]);
+
+      await request(app).get('/cr1/comprobante').set('x-test-permissions', ALLOWED);
+      await request(app).get('/cr1/comprobantes/2').set('x-test-permissions', ALLOWED);
+      await request(app).get('/cr1/analyze-comprobante').set('x-test-permissions', ALLOWED);
+
+      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 0, { forceStatus: 'identificada' });
+      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 2, { forceStatus: 'identificada' });
+      expect(service.analyzeStoredComprobantes).toHaveBeenCalledWith('cr1', { forceStatus: 'identificada' });
     });
   });
 });

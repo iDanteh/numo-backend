@@ -3,7 +3,7 @@
 const ExcelJS = require('exceljs');
 const repo = require('./repositories/poliza.repository');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
-const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza } = require('../../../shared/models/postgres');
+const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza, CentroCosto, Terminal } = require('../../../shared/models/postgres');
 const { Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const BankMovement = require('../banks/BankMovement.model');
@@ -16,9 +16,19 @@ const { esConceptoMarcadorAjuste } = require('../cfdi-mapping/cfdi-mapping.servi
 const traspasosInternosService = require('../banks/traspasos-internos.service');
 const compensacionesInteresesService = require('../banks/compensaciones-intereses.service');
 const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
+const { obtenerDesglosesSalidasCajaPorAlmacen } = require('../erp/erp-sync.service');
+const { consultarTransaccionesNetpay } = require('../erp/netpay-transacciones.service');
 
-// Categorías de bank_movements que representan una transferencia electrónica real.
-const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO'];
+// Categorías de bank_movements que representan una transferencia electrónica
+// real. Incluye "DEPOSITO" (2026-08-31, confirmado con el usuario, caso real
+// GAS MILENIUM SA DE CV, ticket M0-260801312, Factura Global 06A72D7F):
+// categoria del banco "DEPOSITO EN EFECTIVO" (dinero depositado directo en
+// sucursal bancaria, no en la caja de la tienda) — el propio ERP (Kore) ya
+// trae esta misma línea clasificada como `formaPagoDescripcion:"TRANSFERENCIA"`
+// con su propio número de autorización real ("Aut"), así que para efectos
+// contables SÍ cuenta como transferencia identificada, aunque el banco la
+// etiquete genéricamente como "depósito" en vez de "SPEI"/"TRASPASO".
+const CATEGORIAS_TRANSFERENCIA_BANCO = ['SPEI', 'TRASPASO', 'DEPOSITO'];
 
 // `BankMovement.banco` (enum de conciliación) → código de cuenta bancaria
 // real del catálogo — confirmado con el usuario 2026-08-04. BBVA usa la
@@ -36,6 +46,16 @@ const BANCO_A_CODIGO_CUENTA = {
   'Scotiabank': '1102015001',
   'Azteca':     '1102016001',
 };
+
+// Cuentas fijas de la plantilla de comisión NetPay (ver `construirNetpayInfo`/
+// `_lineasNetpay` más abajo) — confirmadas con el usuario 2026-09-14. El
+// depósito neto (línea 1 de la plantilla) usa `cuentaDepositosReal`
+// (1102011001), la misma cuenta que ya usa todo el consolidado de Tarjeta —
+// no una cuenta nueva por terminal.
+const CUENTA_NETPAY_GASTO_COMISION      = '5201030001'; // Gasto de comisión bancaria
+const CUENTA_NETPAY_IVA_POR_ACREDITAR   = '1108010001'; // IVA por acreditar de la factura de comisión
+const CUENTA_NETPAY_PROVEEDOR           = '2102010001'; // Proveedor (NetPay SAPI de CV) — se reconoce y liquida en el mismo asiento
+const CUENTA_NETPAY_IVA_ACREDITABLE     = '1107010001'; // IVA ya acreditado/pagado (contrapartida de la línea de arriba)
 
 /**
  * Cruza los CFDIs de la póliza contra sus movimientos bancarios reales
@@ -81,15 +101,32 @@ const BANCO_A_CODIGO_CUENTA = {
  * folioVenta 260702455 → folioFactura 260701106) y "034315" ($5,462.21,
  * folioVenta 260702612 → folioFactura 260701171).
  *
+ * Desambiguación por fecha (2026-09-15, caso real CEDIS 12-sep, ticket
+ * A0-260704683): el fallback por `serie+folioExterno` matchea por TICKET, y
+ * una venta PPD pagada en varias parcialidades de Transferencia puede tener
+ * 2+ `BankMovement` distintos ligados al mismo ticket en fechas muy
+ * distintas (ahí, $500 el 31-ago y $500 el 3-sep, para un ticket cuyo cierre
+ * real fue hasta el 12-sep). Antes se quedaba con el PRIMERO que Mongo
+ * regresara (sin orden garantizado) y ya nunca lo soltaba — podía pegar el
+ * depósito de OTRO día/abono al día que se está exportando. Con
+ * `fechaReferencia` (la fecha de la póliza) disponible, se prefiere el
+ * candidato cuya `BankMovement.fecha` quede más cerca de esa fecha. Sin
+ * `fechaReferencia` (callers que no la pasan), se conserva el criterio
+ * anterior — sin regresión.
+ *
  * @param {{cfdiUuid: string, serie: string}[]} movimientos
  * @param {string} rfc
+ * @param {Date|string|null} [fechaReferencia] - Fecha de la póliza que se está
+ *   generando/exportando — usada para elegir, entre varios depósitos reales
+ *   ligados al mismo ticket, el más cercano a ese día.
  * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, cuentaBanco: {id:number,codigo:string,nombre:string}|null}>>}
  *   uuid (mayúsculas) → info bancaria. `cuentaBanco`: cuenta real del banco
  *   donde cayó el depósito (ver `BANCO_A_CODIGO_CUENTA`) — null cuando el
  *   banco no tiene cuenta dedicada en el catálogo, o no se pudo determinar.
  */
-async function construirVerdadBancaria(movimientos, rfc) {
+async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null) {
   const mapa = new Map();
+  const fechaRefMs = fechaReferencia ? new Date(fechaReferencia).getTime() : null;
   const uuidsUnicos = [...new Set(movimientos.map(m => m.cfdiUuid).filter(Boolean).map(u => u.toUpperCase()))];
   if (uuidsUnicos.length === 0) return mapa;
 
@@ -119,13 +156,13 @@ async function construirVerdadBancaria(movimientos, rfc) {
   const condicionFolioFiscal = { 'erpLinks.folioFiscal': { $in: uuidsUnicos.map(u => new RegExp(`^${u}$`, 'i')) } };
   movs.push(...await BankMovement.find(
     condicionFolioFiscal,
-    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
+    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1, fecha: 1 },
   ).lean());
   for (let i = 0; i < paresSerieFolio.length; i += LOTE) {
     const lote = paresSerieFolio.slice(i, i + LOTE);
     movs.push(...await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
+      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1, fecha: 1 },
     ).lean());
   }
 
@@ -178,6 +215,12 @@ async function construirVerdadBancaria(movimientos, rfc) {
     // desbalanceado contra el Abono/IVA en ese caso (mismo criterio que
     // otros "ruido" de reclasificación ya tolerados en el export).
     const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
+    // Distancia (en días) entre el depósito real y el día de la póliza que se
+    // está generando — ver docstring de la función. `null` cuando no hay
+    // `fechaReferencia` (comportamiento previo) o el movimiento no trae fecha.
+    const distanciaDias = (fechaRefMs != null && m.fecha)
+      ? Math.abs(new Date(m.fecha).getTime() - fechaRefMs) / 86400000
+      : null;
 
     for (const link of (m.erpLinks ?? [])) {
       const folioFiscalUpper = (link.folioFiscal || '').toUpperCase();
@@ -188,11 +231,32 @@ async function construirVerdadBancaria(movimientos, rfc) {
         ? folioFiscalUpper
         : (link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
       if (!uuidResuelto) continue;
-      // Un mismo CFDI puede tener varios movimientos ligados (varias
-      // parcialidades) — si alguno confirma transferencia, esa gana.
+      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, _distanciaDias: distanciaDias };
       const actual = mapa.get(uuidResuelto);
-      if (!actual || (!actual.esTransferencia && esTransferencia)) {
-        mapa.set(uuidResuelto, { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal });
+      if (!actual) {
+        mapa.set(uuidResuelto, candidato);
+        continue;
+      }
+      // Con `fechaReferencia`: entre 2+ depósitos ligados al mismo ticket
+      // (venta PPD pagada en varias parcialidades en fechas distintas), gana
+      // el más cercano al día de la póliza — nunca el primero que haya
+      // regresado Mongo. Transferencia confirmada sigue pesando más que la
+      // cercanía de fecha (un candidato que SÍ confirma transferencia gana
+      // sobre uno que no, sin importar la fecha).
+      if (distanciaDias != null) {
+        if (esTransferencia && !actual.esTransferencia) {
+          mapa.set(uuidResuelto, candidato);
+        } else if (esTransferencia === actual.esTransferencia
+          && (actual._distanciaDias == null || distanciaDias < actual._distanciaDias)) {
+          mapa.set(uuidResuelto, candidato);
+        }
+        continue;
+      }
+      // Sin `fechaReferencia` (caller que no la pasa): criterio original — un
+      // mismo CFDI puede tener varios movimientos ligados (varias
+      // parcialidades) — si alguno confirma transferencia, esa gana.
+      if (!actual.esTransferencia && esTransferencia) {
+        mapa.set(uuidResuelto, candidato);
       }
     }
   }
@@ -200,8 +264,9 @@ async function construirVerdadBancaria(movimientos, rfc) {
 }
 
 // Categorías de bank_movements que representan una transferencia electrónica
-// real — mismo criterio que `construirVerdadBancaria` (CATEGORIAS_TRANSFERENCIA_BANCO).
-const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO'];
+// real — mismo criterio que `construirVerdadBancaria` (CATEGORIAS_TRANSFERENCIA_BANCO,
+// ver comentario ahí sobre "DEPOSITO").
+const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO', 'DEPOSITO'];
 
 /**
  * Resuelve el depósito bancario REAL cruzando bank_movements por TICKET
@@ -221,8 +286,11 @@ const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO'];
  * cuando hay dato por ticket disponible).
  *
  * @param {{serieVentaTicket: string, folioVentaTicket: string}[]} movimientos
- * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null}>>}
- *   `serieVentaTicket|folioVentaTicket` → info bancaria del ticket.
+ * @returns {Promise<Map<string, {esTransferencia: boolean, categoriaConocida: boolean, referencia: string|null, numeroAutorizacion: string|null, banco: string|null, cuentaBanco: object|null, montoBancoReal: number|null}[]>>}
+ *   `serieVentaTicket|folioVentaTicket` → arreglo de depósitos bancarios reales
+ *   ligados a ese ticket (normalmente uno solo; puede haber más de uno cuando
+ *   el ticket se pagó en VARIAS parcialidades de Transferencia — ver
+ *   `_elegirBancoRealPorMonto`, que elige la entrada correcta por monto).
  *   `referencia`: folio propio de Numo (para Transferencia/Cheque).
  *   `numeroAutorizacion`: número de autorización real de terminal (para Tarjeta).
  */
@@ -256,22 +324,277 @@ async function construirBancoRealPorTicket(movimientos) {
       const cuentaBanco = codigoCuentaBanco ? (cuentaPorCodigo.get(codigoCuentaBanco) ?? null) : null;
       const cat = (m.categoria || '').toUpperCase();
       const esTransferencia = _CATEGORIAS_TRANSFERENCIA.some(c => cat.includes(c));
+      // Igual que en `construirVerdadBancaria`: la mayoría de los movimientos
+      // no traen `categoria` — sin esto, `esTransferencia` (arriba) daría
+      // `false` para casi todos y el gate de `consolidarCargos` los tomaría
+      // como "confirmado que NO es transferencia" en vez de "no se sabe".
+      const categoriaConocida = m.categoria != null;
       // Folio propio de Numo — referencia para Transferencia/Cheque (mismo
       // criterio que `construirVerdadBancaria`, ver comentario ahí).
       const referencia = m.folio || null;
       const numeroAutorizacion = m.numeroAutorizacion || m.referenciaNumerica || null;
       if (!referencia && !numeroAutorizacion) continue;
-      // Ver comentario equivalente en `construirVerdadBancaria`.
-      const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
       for (const link of (m.erpLinks ?? [])) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
         if (!paresSet.has(key)) continue;
-        if (!mapa.has(key)) mapa.set(key, { esTransferencia, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
+        // Un mismo ticket puede tener MÁS de un depósito bancario real
+        // (parcialidades de Transferencia — confirmado con el usuario
+        // 2026-08-31, caso real Santa Rosa/M0 27-ago: factura M0-260800752,
+        // ticket M0-260802850, pagada en 2 transferencias BBVA distintas,
+        // folios 043291 $227.86 y 043294 $23,127.65). Antes solo se guardaba
+        // la PRIMERA encontrada por ticket (`if (!mapa.has(key))`) — la
+        // segunda se perdía por completo, y como ambas líneas de la factura
+        // compartían la misma referencia resuelta, se fusionaban en una sola
+        // línea del export con el monto FIJO del banco (`_debeFijoBanco` en
+        // `consolidarCargos`) igual al del primer depósito, descartando el
+        // segundo sin dejar rastro visible en la póliza (solo quedaba en el
+        // detalle de la hoja "Desglose Consolidado"). Ahora se acumulan TODAS
+        // las entradas por ticket — `_elegirBancoRealPorMonto` elige la que
+        // corresponde a cada línea por su monto exacto.
+        //
+        // BUG CORREGIDO 2026-09-15 (caso real CEDIS 12-sep, ticket
+        // A0-260704683 $492.87 vs A0-260704334 $1,007.13, ambos repartidos
+        // del MISMO depósito BBVA $1,500 del 7-sep, folio 045330): el monto
+        // usado para el match por `_elegirBancoRealPorMonto` era
+        // `BankMovement.deposito` — el BRUTO de TODO el depósito — en vez de
+        // `link.saldoPagadoTotal` — la porción EXACTA que ese depósito le
+        // aportó a ESTE ticket. Cuando un mismo depósito se reparte entre 2+
+        // tickets (como aquí: $1,007.13 + $492.87 = $1,500.00), ningún ticket
+        // calzaba nunca contra el bruto ($1,500), así que `_elegirBancoRealPorMonto`
+        // siempre caía al primer candidato por default — atribuyendo a veces
+        // un depósito de una fecha totalmente distinta (aquí, uno del 31-ago,
+        // 12 días antes del cierre real del 12-sep). `saldoPagadoTotal` por
+        // link YA trae el monto exacto por ticket — usarlo hace que el match
+        // por monto funcione como estaba pensado, sin tocar el caso de un
+        // solo candidato (ahí `saldoPagadoTotal` == `deposito`, sin cambio).
+        const montoBancoReal = typeof link.saldoPagadoTotal === 'number'
+          ? link.saldoPagadoTotal
+          : (typeof m.deposito === 'number' ? m.deposito : null);
+        if (!mapa.has(key)) mapa.set(key, []);
+        mapa.get(key).push({ esTransferencia, categoriaConocida, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }
     }
   }
   return mapa;
+}
+
+// NetPay (2026-09-14, confirmado con el usuario, caso real Santa Rosa
+// 4-sep): cuando un cobro de Tarjeta se procesó por una terminal NetPay
+// conocida (catálogo `Terminal`), el depósito real al banco NO es el bruto
+// de la venta — NetPay descuenta su comisión+IVA antes de depositar. Esas
+// líneas se sacan del consolidado genérico de Tarjeta (`consolidarCargos`)
+// y se reemplazan por el depósito neto real + su desglose de comisión
+// (plantilla fija de 7 líneas, ver `_lineasNetpay`).
+//
+// Match por MONTO contra las transacciones que reporta Kore
+// (`/transactions/search`, ver `netpay-transacciones.service.js`) para el
+// mismo día+centro — el ERP no liga terminal a nivel de ticket
+// (`formasPago[]` no lo trae), así que no existe una llave más confiable.
+// El catálogo de Terminales filtra qué `terminalID` son válidos/conocidos
+// para ese centro (evita atribuir a NetPay algo de una terminal no
+// registrada o de otra sucursal). Cualquier venta Tarjeta que no matchee
+// (terminal no registrada, sin transacción NetPay del monto exacto ese
+// día, o el endpoint de Kore falla) sigue su camino normal sin cambios —
+// nunca bloquea ni altera el resto de la póliza.
+async function construirNetpayInfo(movimientos, fechaFinal) {
+  const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
+
+  const candidatos = (movimientos ?? []).filter(m =>
+    m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
+    && LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA'
+    && m.centroCostoObj?.serieFacturacion && m.centroCostoObj?.id,
+  );
+  if (!candidatos.length) return vacio;
+
+  const porCentroClave = new Map(); // serieFacturacion ("M0") -> { centroCostoObj, filas: [...] }
+  for (const m of candidatos) {
+    const clave = m.centroCostoObj.serieFacturacion;
+    if (!porCentroClave.has(clave)) porCentroClave.set(clave, { centroCostoObj: m.centroCostoObj, filas: [] });
+    porCentroClave.get(clave).filas.push(m);
+  }
+
+  const codigosComision = [
+    CUENTA_NETPAY_GASTO_COMISION, CUENTA_NETPAY_IVA_POR_ACREDITAR,
+    CUENTA_NETPAY_PROVEEDOR, CUENTA_NETPAY_IVA_ACREDITABLE,
+  ];
+  const cuentasComisionRows = await AccountPlan.findAll({
+    where: { codigo: { [Op.in]: codigosComision } }, attributes: ['id', 'codigo', 'nombre'], raw: true,
+  });
+  const cuentasComisionPorCodigo = new Map(cuentasComisionRows.map(r => [r.codigo, r]));
+  const cuentasComision = {
+    gastoComision:    cuentasComisionPorCodigo.get(CUENTA_NETPAY_GASTO_COMISION)    ?? null,
+    ivaPorAcreditar:  cuentasComisionPorCodigo.get(CUENTA_NETPAY_IVA_POR_ACREDITAR) ?? null,
+    proveedor:        cuentasComisionPorCodigo.get(CUENTA_NETPAY_PROVEEDOR)         ?? null,
+    ivaAcreditable:   cuentasComisionPorCodigo.get(CUENTA_NETPAY_IVA_ACREDITABLE)   ?? null,
+  };
+  // Si falta alguna cuenta de la plantilla en el catálogo, no se puede armar
+  // el asiento de comisión de forma segura — se omite todo NetPay para esta
+  // generación (Tarjeta sigue en el consolidado genérico) en vez de generar
+  // una póliza con una cuenta faltante/0.
+  if (Object.values(cuentasComision).some(c => !c)) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn('[Poliza] Falta alguna cuenta de la plantilla de comisión NetPay en el catálogo — se omite NetPay en esta generación.');
+    return vacio;
+  }
+
+  const centroCostoIds = [...porCentroClave.values()].map(v => v.centroCostoObj.id);
+  const terminalesRows = await Terminal.findAll({
+    where: { isActive: true, centroCostoId: { [Op.in]: centroCostoIds } },
+    attributes: ['numeroSerie', 'centroCostoId'],
+    raw: true,
+  });
+  const terminalesPorCentro = new Map(); // centroCostoId -> Set(numeroSerie)
+  for (const t of terminalesRows) {
+    if (!terminalesPorCentro.has(t.centroCostoId)) terminalesPorCentro.set(t.centroCostoId, new Set());
+    terminalesPorCentro.get(t.centroCostoId).add(t.numeroSerie);
+  }
+
+  const dia      = fechaFinal.toISOString().slice(0, 10);
+  const dateFrom = `${dia}T00:00:00Z`;
+  const dateTo   = `${dia}T23:59:59Z`;
+
+  const matchedIds = new Set();
+  const porCentro  = new Map();
+
+  await Promise.all([...porCentroClave.entries()].map(async ([clave, { centroCostoObj, filas }]) => {
+    const terminalesValidas = terminalesPorCentro.get(centroCostoObj.id);
+    if (!terminalesValidas || !terminalesValidas.size) return; // sin terminales NetPay registradas en este centro
+
+    let resultado;
+    try {
+      resultado = await consultarTransaccionesNetpay({ responseCode: '00', almacenes: clave, dateFrom, dateTo });
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[Poliza] NetPay no disponible para ${clave} ${dia}, se omite (Tarjeta sigue en consolidado genérico): ${err.message}`);
+      return;
+    }
+
+    // Se consumen conforme matchean — nunca se usa el mismo ticket dos veces
+    // aunque 2 transacciones NetPay compartan monto ese día (mismo criterio
+    // que `_elegirBancoRealPorMonto`: primer match disponible gana).
+    const disponibles = [...filas];
+    let gross = 0, comision = 0;
+    for (const t of (resultado.transacciones ?? [])) {
+      if (!terminalesValidas.has(t.terminalID)) continue;
+      const monto = Number(t.amount) || 0;
+      if (monto <= 0) continue;
+      const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
+      if (idx === -1) continue; // sin ticket de ese monto exacto ese día -- se ignora
+      const fila = disponibles.splice(idx, 1)[0];
+      matchedIds.add(fila.id);
+      gross += Number(fila.debe);
+      comision += Number(t.commission) || 0;
+    }
+    if (gross > 0) {
+      porCentro.set(centroCostoObj.id, {
+        gross: Math.round(gross * 100) / 100,
+        comision: Math.round(comision * 100) / 100,
+        centroCostoObj,
+      });
+    }
+  }));
+
+  return { matchedIds, porCentro, cuentasComision };
+}
+
+// Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
+// un día/centro (ver `construirNetpayInfo`) — confirmada con el usuario
+// 2026-09-14. `gross`/`comision` ya vienen redondeados a centavos.
+function _lineasNetpay({ gross, comision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
+  const ivaComision   = Math.round(comision * 0.16 * 100) / 100;
+  const totalFactura  = Math.round((comision + ivaComision) * 100) / 100;
+  const neto          = Math.round((gross - totalFactura) * 100) / 100;
+  const centroCosto   = centroCostoObj.clave;
+  const conceptoDeposito = `VENTAS SUC.${centroCostoObj.sucursal}`;
+  const conceptoComision = 'NETPAY SAPI DE CV';
+
+  return [
+    // 1. Depósito neto real (lo que de verdad cae al banco).
+    { cuenta: cuentaDepositosReal, serie: 'NETPAY', concepto: conceptoDeposito, centroCosto, debe: neto, haber: 0, cfdiUuid: null, _subcodigo: 21, _categoria: null },
+    // 2. Gasto de comisión.
+    { cuenta: cuentasComision.gastoComision, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: comision, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 3. IVA por acreditar de la factura de comisión.
+    { cuenta: cuentasComision.ivaPorAcreditar, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: ivaComision, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 4. Se reconoce el pasivo con el proveedor (comisión + IVA)...
+    { cuenta: cuentasComision.proveedor, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: 0, haber: totalFactura, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 5. ...y se liquida en el mismo asiento (NetPay ya lo descontó del depósito, no queda pago pendiente real).
+    { cuenta: cuentasComision.proveedor, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: totalFactura, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 6. El IVA pasa de "por acreditar" a acreditado/pagado...
+    { cuenta: cuentasComision.ivaAcreditable, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: ivaComision, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+    // 7. ...cerrando el saldo pendiente que abrió la línea 3.
+    { cuenta: cuentasComision.ivaPorAcreditar, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: 0, haber: ivaComision, cfdiUuid: null, _subcodigo: 0, _categoria: null },
+  ];
+}
+
+// Elige, de las entradas bancarias reales ligadas a un ticket (ver
+// `construirBancoRealPorTicket`), la que corresponde a una línea puntual por
+// su MONTO — normalmente hay una sola entrada y no hace falta elegir; cuando
+// hay varias (parcialidades), se prefiere la que calza exacto (±$0.01) con el
+// monto de esta línea, mismo criterio de match por monto que ya usa
+// `_resolverReferenciaOpaPorMonto` (cfdi-poliza-generator.service.js). Si
+// ninguna calza exacto (ruido de reclasificación, remanente repartido, etc.),
+// cae a la primera como antes — nunca peor que el comportamiento previo.
+function _elegirBancoRealPorMonto(candidatos, monto) {
+  if (!candidatos || candidatos.length === 0) return null;
+  if (candidatos.length === 1) {
+    const unico = candidatos[0];
+    // Si el único candidato SÍ trae su propio depósito real (`montoBancoReal`)
+    // y claramente NO corresponde al monto de esta línea, se rechaza en vez
+    // de usarlo a ciegas (2026-08-31, caso real Global 06A72D7F/M0-260801419,
+    // centro Santa Rosa: un ticket con Transferencia $5,805.27 + Tarjeta
+    // $10,000, pero solo se sincronizó UN BankMovement — el de la
+    // Transferencia — cuyo `numeroAutorizacion` terminaba prestándose para
+    // la línea de Tarjeta, monto completamente distinto). Mejor sin
+    // referencia (cae al bucket genérico de esa forma de pago) que con una
+    // referencia que en realidad pertenece a otro cargo del mismo ticket.
+    // Cuando `montoBancoReal` es null (dato no disponible, no se puede
+    // validar) se mantiene el comportamiento permisivo de siempre.
+    //
+    // Tolerancia GENEROSA a propósito (no ±$0.01, corregido el mismo
+    // 2026-08-31 al probar este fix): el depósito bancario real casi
+    // siempre difiere un poco del monto declarado en el CFDI (comisiones,
+    // redondeo) — caso real de la misma Global: ticket 260801312, CFDI
+    // $2,345.82 vs depósito real $2,346.00 (diferencia $0.18) — con ±$0.01
+    // se rechazaban TODOS los tickets legítimos de esa factura, no solo el
+    // caso realmente equivocado ($10,000 vs $5,805.27, diferencia ~$4,195).
+    // Umbral: más de $10 O más del 5% del monto (lo que sea mayor) — cubre
+    // holgado el margen de comisiones/redondeo sin dejar de detectar un
+    // monto de una forma de pago completamente distinta.
+    const diferenciaTolerable = Math.max(10, monto * 0.05);
+    if (unico.montoBancoReal != null && Math.abs(unico.montoBancoReal - monto) > diferenciaTolerable) return null;
+    return unico;
+  }
+  const exacto = candidatos.find(c => c.montoBancoReal != null && Math.abs(c.montoBancoReal - monto) < 0.01);
+  return exacto ?? candidatos[0];
+}
+
+// Complemento a `_elegirBancoRealPorMonto`: detecta cuando NINGÚN candidato
+// calza solo con el monto de la línea, pero la SUMA de TODOS los candidatos
+// del ticket sí lo hace — un mismo pago (Transferencia/Cheque) cubierto por
+// 2+ depósitos bancarios reales distintos (caso real 2026-09-11, Ferrocarril
+// F0-260900334/SD SOLUTIONS: transferencia $1,563.26 pagada con 2 depósitos
+// SPEI del mismo remitente, $1,483.32 + $79.94 — cada uno es un `BankMovement`
+// separado con su propio `numeroAutorizacion`).
+//
+// Sin esto, `_elegirBancoRealPorMonto` caía a `candidatos[0]` y el llamador
+// fijaba `debe` de la línea al depósito de ESE candidato solamente
+// (`_debeFijoBanco`) — el otro depósito se perdía sin dejar rastro en la
+// línea real de la póliza (seguía en Bancos/conciliación, solo no aquí).
+//
+// Requiere que TODOS los candidatos traigan `montoBancoReal` (si falta en
+// alguno no se puede repartir con confianza) y que la suma calce dentro de la
+// misma tolerancia generosa que `_elegirBancoRealPorMonto` (comisiones/
+// redondeo). Si ya hay un match único exacto, no aplica (ese caso lo resuelve
+// `_elegirBancoRealPorMonto` normalmente).
+function _elegirBancoRealMultiple(candidatos, monto) {
+  if (!candidatos || candidatos.length < 2) return null;
+  if (candidatos.some(c => c.montoBancoReal == null)) return null;
+  if (candidatos.some(c => Math.abs(c.montoBancoReal - monto) < 0.01)) return null;
+  const suma = candidatos.reduce((s, c) => s + c.montoBancoReal, 0);
+  const tolerancia = Math.max(10, monto * 0.05);
+  if (Math.abs(suma - monto) > tolerancia) return null;
+  return candidatos;
 }
 
 // Poliza.tipo interno (A,I,E,D,N,C,P) → TipoPol de CONTPAQi (1=Ingreso 2=Egreso 3=Diario)
@@ -579,6 +902,7 @@ async function _resolverCuentasBancoReal(poliza) {
   const verdadBancaria = await construirVerdadBancaria(
     poliza.movimientos.map(m => ({ cfdiUuid: m.cfdiUuid, serie: m.serie })),
     poliza.rfc,
+    poliza.fecha,
   );
   if (verdadBancaria.size === 0) return [];
 
@@ -1001,7 +1325,14 @@ const esAbonoSaldoFavor = (m) => CUENTAS_SALDO_FAVOR.has(m.cuenta?.codigo) || CU
 // Descripción", etc.) y también aplicación/cierre ("Factura Final Anticipo",
 // Reg 22C/22C-0 con formaPago 30) — el usuario confirmó que el 22 va en todo
 // movimiento de anticipo aunque ya se haya aplicado/usado, no solo al recibirlo.
-const esReglaAnticipo = (reglaNombre) => /anticipo/i.test(reglaNombre || '');
+// BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA): "Reg TO-EGR-16/-0 — NC
+// Egreso ERP ... (cancela CxC)" es la MISMA familia de ajuste que Reg 23
+// (Aplicación de Anticipo, cancela Anticipos vs Clientes) — mismo `_fetchNotasCreditoParaFusion`
+// que ahora sí las trae al lote — pero su nombre dice "Egreso", no
+// "Anticipo", así que `esReglaAnticipo` no las reconocía y caían al bucket
+// genérico "Depósitos consolidados" en vez de su propia línea individual
+// (perdiendo la trazabilidad de a qué venta/anticipo pertenecen).
+const esReglaAnticipo = (reglaNombre) => /anticipo/i.test(reglaNombre || '') || /^reg to-egr/i.test(reglaNombre || '');
 
 // Distingue "Recepción" (aún no se ha usado — Reg 22, 22A, 22-0, 22C-DESC,
 // "Recepción Anticipo por Descripción") de "Factura Final"/aplicación/cierre
@@ -1131,21 +1462,29 @@ function categorizarAjusteContado(m) {
  *   concatena (ver `aplanarCargosConsolidados` y `armarBloqueContado`).
  */
 /**
- * Variante de `consolidarCargos` para la póliza de Cobranza (Pagos) SIN
- * agrupar/mezclar líneas — anota cada Cargo (debe>0) con su cuenta bancaria
- * real y subcódigo (transferencia o no), pero conserva exactamente una línea
- * de salida por cada línea de entrada, en el mismo orden. A diferencia de
- * Contado/Crédito, aquí NO se quiere consolidar varias facturas del mismo
- * Pago en una sola línea: `cfdiToMovimientos` (cfdi-mapping.service.js,
- * `esSplitPagoPorFactura`) ya arma Cargo+IVA+Abono agrupados por factura
- * liquidada, y `consolidarCargos` los volvía a fusionar en una sola línea
- * porque agrupa por `cfdiUuid` cuando no hay referencia bancaria — todas las
- * líneas de un mismo Pago comparten el mismo `cfdiUuid` (confirmado con el
- * usuario 2026-08-11). Los Abono (haber>0) tampoco se separan aparte — se
- * dejan intercalados como ya vienen.
+ * Variante de `consolidarCargos` para la póliza de Cobranza (Pagos) — anota
+ * cada Cargo (debe>0) con su cuenta bancaria real y subcódigo (transferencia
+ * o no), y conserva una línea de salida por cada línea de entrada, EXCEPTO
+ * cuando dos o más comparten el mismo depósito bancario real ya identificado
+ * (misma cuenta + misma referencia/folio verificado en Bancos) — ahí se
+ * fusionan en una sola línea con el monto sumado y los folios de factura
+ * concatenados en el concepto (2026-09-01, ver ejemplo real "23 (1).xls").
+ *
+ * A diferencia de Contado/Crédito, aquí NUNCA se agrupa por `cfdiUuid`:
+ * `cfdiToMovimientos` (cfdi-mapping.service.js, `esSplitPagoPorFactura`) ya
+ * arma Cargo+IVA+Abono agrupados por factura liquidada dentro de un mismo
+ * Pago, y todas esas líneas comparten el `cfdiUuid` del Pago aunque
+ * correspondan a depósitos DISTINTOS — agrupar por ese campo (como hacía
+ * `consolidarCargos` cuando no había referencia bancaria) mezclaba facturas
+ * de depósitos diferentes (confirmado con el usuario 2026-08-11). La fusión
+ * de aquí solo ocurre con una referencia bancaria real verificada como
+ * llave — nunca por cfdiUuid ni por cliente. Sin esa referencia (efectivo o
+ * depósito sin identificar), cada línea se deja tal cual, en su posición
+ * original. Los Abono (haber>0) y la reclasificación de IVA de cada factura
+ * tampoco se tocan — se dejan intercalados como ya vienen.
  */
 function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null) {
-  return movs.map(m => {
+  const anotados = movs.map(m => {
     if (!(Number(m.debe) > 0)) return m;
     // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
     // SF no representan un depósito bancario — no se les debe cambiar la
@@ -1161,7 +1500,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
         tipoOrigen: m.tipoOrigen, _subcodigo: 0,
       };
     }
-    const bancario = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
+    // Mismo criterio que al construir `verdadBancaria` arriba: `facturaUuid`
+    // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
+    // Pago) — ver comentario en el caller.
+    const bancario = verdadBancaria?.get((m.facturaUuid || m.cfdiUuid || '').toUpperCase());
     const esTransferenciaVerificada = bancario?.categoriaConocida
       ? bancario.esTransferencia
       : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
@@ -1171,14 +1513,52 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // nombre del cliente, mismo criterio que antes hacía `consolidarCargos`.
     const nombre = nombresClientes?.get((m.cfdiUuid || '').toUpperCase()) || '';
     const yaEnriquecido = !nombre || m.concepto?.includes(nombre);
+    // Referencia bancaria real (folio/número de autorización, ver
+    // `construirVerdadBancaria`) — mismo criterio que `consolidarCargos`
+    // (Contado): cuando el depósito quedó identificado, la columna C debe
+    // mostrar ese folio real (para poder conciliar contra el estado de
+    // cuenta), no la serie-folio propia del CFDI de Pago. Guardada aparte
+    // (`_referenciaBancoReal`) para poder fusionar más abajo las líneas que
+    // comparten el mismo depósito real.
+    // Solo una cuenta de Caja (1101...) o Bancos (1102...) representa un
+    // depósito real que tiene sentido resolver a un banco verificado — CUALQUIER
+    // otra cuenta con debe>0 (ej. 2105010001, Cargo IVA por trasladar al
+    // reclasificar el IVA cobrado de una factura PPD) es una reclasificación
+    // contable, nunca un depósito: nunca se le cambia la cuenta, nunca se le
+    // pone subcódigo de transferencia, y nunca entra a la fusión/bucket de
+    // depósitos de más abajo (se deja tal cual, junto a su factura). Sin este
+    // resguardo, un Pago con transferencia verificada le cambiaba la cuenta
+    // de IVA por trasladar al banco real y esa línea terminaba fusionándose
+    // con el depósito real, perdiendo el Cargo IVA por completo (bug real
+    // 2026-09-01, caso real "039246": $21,041.66 = Clientes + IVA fusionados
+    // en una sola línea "banco" en vez de dos líneas separadas).
+    if (!/^110[12]/.test(m.cuenta?.codigo || '')) {
+      return {
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: m.serie, concepto: m.concepto,
+        centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
+        debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
+        rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
+        tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+      };
+    }
+    const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
     // `armarIndividual` en `consolidarCargos`, se listan los campos a mano.
     return {
-      cuenta:         bancario?.cuentaBanco ?? m.cuenta,
+      // Solo se reemplaza por el banco real cuando SÍ hay transferencia
+      // verificada (2026-09-01, bug real de Cobranza) — antes se sobrescribía
+      // sin importar el resultado del gate: un Pago identificado como
+      // Efectivo real (`_formaPagoReal`/'01') podía coincidir por casualidad
+      // con OTRO movimiento bancario ligado al mismo `cfdiUuid` (folioFiscal
+      // del Pago completo, no de esta línea específica) y terminaba mostrando
+      // un banco real (BBVA/Banamex) en vez de Caja, con el concepto
+      // "EFECTIVO" — mezclando cuentas distintas bajo la misma etiqueta y
+      // evitando que el bucket de Efectivo (más abajo) las agrupara.
+      cuenta:         esTransferenciaVerificada ? (bancario?.cuentaBanco ?? m.cuenta) : m.cuenta,
       cuentaId:       m.cuentaId,
-      serie:          m.serie,
+      serie:          referenciaBancoReal ?? m.serie,
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
       centroCosto:    m.centroCosto,
       centroCostoObj: m.centroCostoObj,
@@ -1190,8 +1570,117 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       reglaNombre:    m.reglaNombre,
       tipoOrigen:     m.tipoOrigen,
       _subcodigo:     esTransferenciaVerificada ? subcodigoTransferencia : 0,
+      _referenciaBancoReal: referenciaBancoReal,
     };
   });
+
+  // Separa el Cargo bancario (dinero recibido — Cargo real, ni SF ni Abono/
+  // IVA) del resto: en la póliza de Cobranza el Cargo va TODO junto al final,
+  // después de las líneas de Abono a Clientes/IVA reclasificado de cada
+  // factura (confirmado con el usuario 2026-09-01, ver ejemplo real
+  // "23 (1).xls" — bloque de asientos por factura primero, bloque de
+  // depósitos consolidados al final). Las de Saldo a Favor
+  // (`TIPO_ORIGEN_CARGO_ESPECIAL`) se quedan en su posición original junto a
+  // su factura — no son un depósito bancario real, no tiene sentido moverlas.
+  const otrasLineas = [];
+  const cargoLineas = [];
+  for (const m of anotados) {
+    // Solo las líneas que pasaron por la rama de Caja/Bancos de arriba traen
+    // `_referenciaBancoReal` (aunque sea null) — es la misma señal que ya usa
+    // el cleanup final para saber qué es un objeto plano de Cargo bancario.
+    (('_referenciaBancoReal' in m) ? cargoLineas : otrasLineas).push(m);
+  }
+
+  // Fusiona el Cargo (dinero recibido) cuando dos o más facturas — del mismo
+  // Complemento de Pago o de Pagos distintos — comparten el MISMO depósito
+  // bancario real (misma cuenta + misma referencia/folio verificado): es
+  // literalmente el mismo depósito, mostrarlo repetido duplicaría la lectura
+  // del banco (caso real confirmado con este mismo tipo de póliza: un cliente
+  // paga 2-3 facturas con una sola transferencia). Nunca se agrupa por
+  // `cfdiUuid` compartido del Pago (ese fue el bug real corregido 2026-08-11
+  // — ver docstring de arriba) ni cuando no hay referencia real verificada
+  // (efectivo/depósito sin identificar): esas líneas se dejan tal cual, en su
+  // posición original. El Abono a Clientes y la reclasificación de IVA de
+  // cada factura NO se tocan — solo el Cargo bancario.
+  const grupos = new Map();
+  const conReferenciaFusionada = [];
+  for (const m of cargoLineas) {
+    if (!m._referenciaBancoReal) {
+      conReferenciaFusionada.push(m);
+      continue;
+    }
+    const key = `${m.cuenta?.codigo}|${m.centroCosto}|${m._referenciaBancoReal}`;
+    const existente = grupos.get(key);
+    if (!existente) {
+      const [nombreCliente, ...tickets] = (m.concepto || '').split(' / ');
+      const grupo = { ...m, _nombreCliente: nombreCliente || '', _tickets: tickets };
+      grupos.set(key, grupo);
+      conReferenciaFusionada.push(grupo);
+    } else {
+      existente.debe = parseFloat((Number(existente.debe) + Number(m.debe)).toFixed(2));
+      existente.cfdiUuid = null; // ya no representa un solo CFDI/factura
+      const [, ...tickets] = (m.concepto || '').split(' / ');
+      for (const t of tickets) if (t && !existente._tickets.includes(t)) existente._tickets.push(t);
+    }
+  }
+
+  // Consolida el Efectivo real (ver `_formaPagoReal`/'01' en
+  // cfdi-mapping.service.js, `esSplitPagoPorFactura`) en un solo bucket por
+  // cuenta+sucursal — mismo criterio visual que usa Contado con su bucket de
+  // Efectivo (`consolidarCargos`): el detalle por factura/cliente no aporta
+  // nada útil para conciliar caja y multiplicaría el número de líneas sin
+  // necesidad. Solo aplica a Cargo sin referencia bancaria real (si la
+  // tuviera, ya se fusionó arriba) y con `formaPago==='01'` (Efectivo real
+  // confirmado por `/desgloses-cobro/almacen`, nunca el `formaPago` genérico
+  // que declara el CFDI de Pago). Sin ese desglose (Efectivo no confirmado,
+  // u otra forma de pago sin match bancario) la línea se deja tal cual.
+  const bucketsEfectivo = new Map();
+  const consolidado = [];
+  for (const m of conReferenciaFusionada) {
+    const esEfectivoRealSinReferencia = !m._referenciaBancoReal && m.formaPago === '01';
+    if (!esEfectivoRealSinReferencia) {
+      consolidado.push(m);
+      continue;
+    }
+    const claveCentro = m.centroCostoObj?.clave ?? m.centroCosto ?? '';
+    const key = `${m.cuenta?.codigo}|${claveCentro}`;
+    const existente = bucketsEfectivo.get(key);
+    if (!existente) {
+      // `serie` (columna C) se vacía a propósito: este renglón puede sumar
+      // Pagos DISTINTOS de la misma sucursal (bug real 2026-09-01— dejaba la
+      // referencia del PRIMER Pago que armaba el bucket, ej. "A0-260800101",
+      // como si todo el monto viniera de ahí, cuando en realidad mezclaba
+      // varios Pagos). Sin una referencia única que mostrar, se deja en
+      // blanco — mismo criterio que usa Contado para "Depósitos consolidados".
+      const bucket = { ...m, serie: '', concepto: `EFECTIVO ${claveCentro}`.trim(), cfdiUuid: null, _tickets: null };
+      bucketsEfectivo.set(key, bucket);
+      consolidado.push(bucket);
+    } else {
+      existente.debe = parseFloat((Number(existente.debe) + Number(m.debe)).toFixed(2));
+    }
+  }
+
+  const cargoFinal = consolidado.map(m => {
+    // Objetos armados a mano en el primer `.map()` de arriba (Cargo, debe>0)
+    // — siempre traen `_referenciaBancoReal` (aunque sea null), así que esto
+    // nunca debería ejecutarse para nada dentro de `cargoLineas`; se deja
+    // como resguardo defensivo. NUNCA destructurar/spread una instancia de
+    // Sequelize (`{...m}` o `{...resto} = m`): no copia bien
+    // `debe`/`haber`/`concepto` (confirmado con datos reales 2026-08-11, y
+    // de nuevo 2026-09-01 con Cobranza — salían en $0.00 y concepto vacío en
+    // el Excel).
+    if (!('_referenciaBancoReal' in m)) return m;
+    if (!('_tickets' in m) || m._tickets == null) {
+      const { _referenciaBancoReal, ...resto } = m;
+      return resto;
+    }
+    const { _nombreCliente, _tickets, _referenciaBancoReal, ...resto } = m;
+    return { ...resto, concepto: [_nombreCliente, ..._tickets].filter(Boolean).join(' / ') };
+  });
+
+  // Bloque de Abono/IVA/SF (orden original, por factura) primero, bloque de
+  // Cargo bancario consolidado (depósitos) al final — ver comentario arriba.
+  return [...otrasLineas, ...cargoFinal];
 }
 
 // Mismo literal que usa `_inyectarSaldoFavorGenerado` (cfdi-poliza-generator.
@@ -1214,7 +1703,7 @@ const NOTA_AJUSTE_SIN_CFDI = {
   'COBRO-SIN-FACTURA':            'SIN FACTURA (cobro real, sin CFDI asociado)',
 };
 
-function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null) {
+function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
   const porCategoria = { devolucion: [], descuento: [], bonificacion: [], clubTuberos: [] };
@@ -1222,6 +1711,10 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   const depositosIdentificados = []; // forma de pago sin mapear + depósito real ligado en Bancos — va al final
 
   for (const m of movs) {
+    // NetPay (ver `construirNetpayInfo`): esta línea ya se cuenta aparte, en
+    // el bloque de depósito neto + comisión que se agrega al final — no debe
+    // ADEMÁS sumar al consolidado genérico de Tarjeta.
+    if (netpayInfo?.matchedIds?.has(m.id)) continue;
     const esAjusteConsolidadoSF = m.tipoOrigen === TIPO_ORIGEN_AJUSTE_CONSOLIDADO_SF;
     if (!(Number(m.debe) > 0) && !esAjusteConsolidadoSF) continue;
     // Refacturación (factura que reemplaza una venta cancelada, ver
@@ -1245,17 +1738,67 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     const serieParaDetalle = (m.serieVentaTicket && m.folioVentaTicket)
       ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
       : (m.serie || '');
+    // Serie-folio del ticket dentro de la leyenda misma (confirmado con el
+    // usuario 2026-09-10, caso real Ferrocarril F0-260900757) — SOLO en el
+    // texto de la nota. La columna aparte "CFDI (Serie-Folio)" es para CFDIs
+    // reales; un ticket "sin factura"/cancelado no tiene ninguno, así que esa
+    // columna se queda vacía para estas líneas (aclarado por el usuario:
+    // "el serie y folio solo debe aparecer con la leyenda").
+    const notaConSerie = (notaAjusteSinCfdi && serieParaDetalle)
+      ? `${notaAjusteSinCfdi} - ${serieParaDetalle}`
+      : notaAjusteSinCfdi;
+    const serieColumnaDetalle = notaAjusteSinCfdi ? '' : serieParaDetalle;
     const bancario    = verdadBancaria?.get((m.cfdiUuid || '').toUpperCase());
-    // Solo se confía en `bancario.esTransferencia` cuando el movimiento
-    // bancario SÍ trae `categoria` (SPEI/TRASPASO/otra) — si el match existe
-    // pero la categoría nunca se llenó (`categoriaConocida: false`, el caso
-    // más común), no hay evidencia real de que NO sea transferencia, así que
-    // se usa el formaPago que el propio CFDI declaró. Confirmado con el
+    // Dato POR TICKET (bancoRealPorTicket) — se calcula ANTES del gate y se
+    // reutiliza más abajo (ya no se recalcula dentro del bloque de detalle).
+    // Tiene prioridad sobre `bancario` (CFDI completo) para decidir si ESTA
+    // línea es Transferencia: en una Factura Global, `bancario` resuelve por
+    // `folioFiscal` (toda la factura junta), así que la categoría de UN
+    // ticket cualquiera (ej. "DEPOSITO EN EFECTIVO") apagaba
+    // `esTransferenciaVerificada` para TODOS los demás tickets de la misma
+    // factura, aunque cada uno tuviera su propio depósito real perfectamente
+    // identificado (bug real 2026-08-31, caso real Global 06A72D7F: 5 líneas
+    // de Transferencia genuina, cada una con su propio BankMovement, caían al
+    // bucket genérico "Depósitos consolidados" solo por la categoría de un
+    // SEXTO ticket ajeno de la misma factura). Mismo patrón que ya se usaba
+    // para resolver referencia/monto — solo faltaba aplicarlo también al gate.
+    const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
+      ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
+      : null;
+    // Ver `_elegirBancoRealMultiple` — caso 2+ depósitos reales que en
+    // conjunto (no uno solo) explican el monto de esta línea.
+    const multipleTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
+      ? _elegirBancoRealMultiple(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
+      : null;
+    // Solo se confía en `esTransferencia` cuando el movimiento bancario SÍ
+    // trae `categoria` (SPEI/TRASPASO/otra) — si el match existe pero la
+    // categoría nunca se llenó (`categoriaConocida: false`, el caso más
+    // común), no hay evidencia real de que NO sea transferencia, así que se
+    // usa el formaPago que el propio CFDI declaró. Confirmado con el
     // usuario: sin esto se perdía el subcódigo 21 en transferencias reales
     // solo por falta de categoría en bank_movements.
-    const esTransferenciaVerificada = bancario?.categoriaConocida
-      ? bancario.esTransferencia
-      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
+    //
+    // IMPORTANTE (2026-08-31): en cuanto la línea pertenezca a un ticket
+    // propio (`serieVentaTicket`/`folioVentaTicket` — Factura Global o split
+    // por forma de pago real), NUNCA se consulta `bancario` (CFDI completo)
+    // — ni cuando ESE ticket no tiene ningún BankMovement ligado. `bancario`
+    // puede venir de OTRO ticket cualquiera de la misma Factura Global
+    // (mismo `folioFiscal`); usar ese dato para un ticket sin match propio
+    // reintroduce el mismo problema que se está corrigiendo, en cualquier
+    // dirección (tanto ocultando una transferencia real como, al revés,
+    // "prestándole" a una línea de Tarjeta sin match propio la confirmación
+    // de transferencia de un ticket ajeno — caso real 2026-08-31, ticket
+    // M0-260801437 formaPago Tarjeta sin BankMovement propio, agrupado por
+    // error con la transferencia real de OTRO ticket de la misma Global).
+    // Sin ticket propio (venta normal, un solo ticket = un solo CFDI),
+    // `bancario` sigue siendo correcto y es el único dato disponible.
+    const esTransferenciaVerificada = infoTicketTransfCheque
+      ? (infoTicketTransfCheque.categoriaConocida ? infoTicketTransfCheque.esTransferencia : (m.formaPago === FORMA_PAGO_TRANSFERENCIA))
+      : (m.serieVentaTicket && m.folioVentaTicket)
+        ? (m.formaPago === FORMA_PAGO_TRANSFERENCIA)
+        : (bancario?.categoriaConocida
+          ? bancario.esTransferencia
+          : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
     const esAnticipo        = detectarAnticipo && esReglaAnticipo(m.reglaNombre);
     const esAnticipoSinUsar = esAnticipo && esRecepcionAnticipo(m.reglaNombre);
 
@@ -1287,9 +1830,10 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // Cualquier anticipo (Recepción sin usar O Factura Final ya aplicada) —
     // nunca se suma al total agregado, siempre línea individual por CFDI con
     // su serie real, igual que las otras 4 categorías de ajuste. Subcódigo
-    // siempre 22, sin importar cómo se cobró (confirmado con el usuario).
+    // 0 (2026-09-15, confirmado con el usuario: ningún anticipo debe llevar
+    // el 22 — antes se usaba fijo sin importar cómo se cobró).
     if (esAnticipo) {
-      anticipos.push(armarIndividual(esAnticipoSinUsar ? 'Anticipo sin aplicar' : 'Anticipo Aplicado', 22, 'anticipo'));
+      anticipos.push(armarIndividual(esAnticipoSinUsar ? 'Anticipo sin aplicar' : 'Anticipo Aplicado', 0, 'anticipo'));
       continue;
     }
 
@@ -1326,24 +1870,81 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     if ((esTransferenciaVerificada || esChequeDeclarado) && !esRemanenteMenor) {
       const tipoDetalle = esTransferenciaVerificada ? 'TRANSFERENCIA' : 'CHEQUE';
       const subcodigoDetalle = esTransferenciaVerificada ? subcodigoTransferencia : 0;
-      // Info por TICKET (`bancoRealPorTicket`, ver docstring) tiene prioridad
-      // sobre `bancario` (`construirVerdadBancaria`, por CFDI completo): en
-      // una Factura Global, `bancario` puede traer el depósito de OTRO
-      // ticket de la misma factura — confirmado con datos reales 2026-08-18
-      // (Global O0-260800164, ticket 260800269 pagado por Banamex quedaba
-      // con la cuenta BBVA de otro ticket de la misma factura). Sin dato por
-      // ticket (venta normal, no partida), `bancario` sigue siendo correcto
-      // (un solo ticket por CFDI, ambos coinciden).
-      const infoTicketTransfCheque = (m.serieVentaTicket && m.folioVentaTicket)
-        ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
-        : null;
-      const referencia = infoTicketTransfCheque?.referencia ?? bancario?.referencia ?? null;
+
+      // 2+ depósitos bancarios reales que en conjunto explican el monto de
+      // esta línea (ver `_elegirBancoRealMultiple`) — una línea (grupo) por
+      // cada depósito, cada uno con su propio monto real, en vez de fijar el
+      // debe completo al primero y perder el resto (caso real 2026-09-11,
+      // Ferrocarril F0-260900334/SD SOLUTIONS: $1,483.32 + $79.94 = $1,563.26).
+      // El último absorbe el residuo de redondeo para que la suma cuadre
+      // exacto con `m.debe`, mismo criterio ya usado en otros repartos del
+      // export (formasPago, bancoPorVenta en cobros-sucursal-puente.service.js).
+      if (multipleTicketTransfCheque) {
+        let acumuladoMultiple = 0;
+        multipleTicketTransfCheque.forEach((cand, idx) => {
+          const esUltimoCand = idx === multipleTicketTransfCheque.length - 1;
+          const montoCand = esUltimoCand
+            ? Math.round((Number(m.debe) - acumuladoMultiple) * 100) / 100
+            : Math.round(cand.montoBancoReal * 100) / 100;
+          acumuladoMultiple += montoCand;
+          if (montoCand <= 0) return;
+          const cuentaLineaCand = cand.cuentaBanco ?? m.cuenta;
+          const referenciaCand  = cand.referencia ?? null;
+          const sufijoCand      = referenciaCand ?? `${m.serieVentaTicket}|${m.folioVentaTicket}|${idx}`;
+          const keyCand = `${cuentaLineaCand?.codigo}|${centroCosto}|${tipoDetalle}|${sufijoCand}`;
+          if (!gruposDetallados.has(keyCand)) {
+            gruposDetallados.set(keyCand, {
+              cuenta: cuentaLineaCand, centroCosto, referencia: referenciaCand, tipoDetalle, subcodigo: subcodigoDetalle,
+              debe: 0, detalle: [], primerMov: m, _debeFijoBanco: true,
+            });
+          }
+          const gtCand = gruposDetallados.get(keyCand);
+          gtCand.debe += montoCand;
+          gtCand.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: montoCand, formaPago: tipoDetalle, nota: notaConSerie });
+        });
+        continue;
+      }
+
+      // `infoTicketTransfCheque` ya se calculó arriba (lo usa también el
+      // gate `esTransferenciaVerificada`) — info por TICKET tiene prioridad
+      // sobre `bancario` (CFDI completo): en una Factura Global, `bancario`
+      // puede traer el depósito de OTRO ticket de la misma factura —
+      // confirmado con datos reales 2026-08-18 (Global O0-260800164, ticket
+      // 260800269 pagado por Banamex quedaba con la cuenta BBVA de otro
+      // ticket de la misma factura). Sin dato por ticket (venta normal, no
+      // partida), `bancario` sigue siendo correcto (un solo ticket por CFDI,
+      // ambos coinciden).
+      //
+      // BUG CORREGIDO 2026-09-07 (caso real Reforma, Global 498068DC,
+      // tickets D0-260900390/D0-260900368 sin depósito bancario propio
+      // conciliado, pero D0-260900224 de la MISMA Global sí lo tenía,
+      // folio 044368/$8,220.93): el comentario de arriba ya explicaba que
+      // `bancario` no debe usarse cuando la línea pertenece a un ticket
+      // propio, pero el `??` de abajo SÍ lo usaba igual cuando
+      // `infoTicketTransfCheque` resultaba `null` (ticket sin match propio,
+      // NO "sin dato por ticket" — son casos distintos: este bloque solo
+      // debe caer a `bancario` cuando el CFDI NO es una venta partida en
+      // tickets en absoluto). El resultado: los 2 tickets sin depósito
+      // propio heredaban la referencia/monto del tercero, se agrupaban con
+      // él bajo la MISMA clave, y como `_debeFijoBanco` fija el total al
+      // depósito real en cuanto se conoce, sus $895.80+$1,864.96 quedaban
+      // fuera del `debe` de la póliza — visibles solo en "Desglose
+      // Consolidado", nunca en la línea real. `esTicketPropio` marca
+      // exactamente el mismo caso que ya usa el gate de arriba.
+      const esTicketPropio = !!(m.serieVentaTicket && m.folioVentaTicket);
+      const referencia = infoTicketTransfCheque?.referencia ?? (esTicketPropio ? null : bancario?.referencia) ?? null;
       // Cuenta real del banco donde cayó el depósito (ver
       // `BANCO_A_CODIGO_CUENTA`/`construirVerdadBancaria`) en vez de la
       // genérica "Bancos por identificar" que ya traía la línea — solo
       // cuando el banco tiene cuenta dedicada en el catálogo.
-      const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? bancario?.cuentaBanco ?? m.cuenta;
-      const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? `__cfdi_${m.cfdiUuid}`}`;
+      const cuentaLinea = infoTicketTransfCheque?.cuentaBanco ?? (esTicketPropio ? null : bancario?.cuentaBanco) ?? m.cuenta;
+      // Sin referencia real: cada ticket propio queda en su propia línea por
+      // `serieVentaTicket|folioVentaTicket` (único por ticket) — usar
+      // `m.cfdiUuid` aquí (el de la Global completa, compartido por TODOS
+      // sus tickets) volvería a mezclarlos entre sí, solo que ahora sin
+      // ninguna referencia real, en vez de cada uno en su propia línea.
+      const sufijoSinReferencia = esTicketPropio ? `${m.serieVentaTicket}|${m.folioVentaTicket}` : `__cfdi_${m.cfdiUuid}`;
+      const key = `${cuentaLinea?.codigo}|${centroCosto}|${tipoDetalle}|${referencia ?? sufijoSinReferencia}`;
       // Monto real depositado en el banco para esta Transferencia (2026-08-26,
       // confirmado con el usuario) — SOLO Transferencia, nunca Cheque/Tarjeta:
       // reemplaza la suma de cobros de caja/ERP atribuidos a esta referencia
@@ -1355,17 +1956,45 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // depósito real, no se sigue acumulando por cada CFDI que comparte la
       // misma referencia.
       const montoBancoReal = esTransferenciaVerificada
-        ? (infoTicketTransfCheque?.montoBancoReal ?? bancario?.montoBancoReal ?? null)
+        ? (infoTicketTransfCheque?.montoBancoReal ?? (esTicketPropio ? null : bancario?.montoBancoReal) ?? null)
         : null;
+      // BUG CORREGIDO 2026-09-15 (caso real CEDIS 12-sep, depósito BBVA
+      // $1,500 folio 045330 repartido $492.87/A0-260704683 + $1,007.13/
+      // A0-260704334): `montoBancoReal` para tickets propios YA es la
+      // porción EXACTA que le tocó a ESTE ticket (`link.saldoPagadoTotal`,
+      // ver `construirBancoRealPorTicket`), no el bruto del depósito
+      // completo — a diferencia del caso `bancario`/CFDI (que sigue usando
+      // `BankMovement.deposito`, el bruto, porque ahí SÍ es un solo depósito
+      // real sin repartir). "Fijar" el `debe` del grupo al primer ticket que
+      // llega (comportamiento de siempre para el caso CFDI) perdía por
+      // completo la porción de cualquier OTRO ticket que comparta la misma
+      // referencia — su parte nunca se sumaba al total real de la póliza,
+      // solo quedaba visible en "Desglose Consolidado". Para tickets propios,
+      // cada porción exacta se ACUMULA (suman al depósito real completo); el
+      // caso CFDI/`bancario` sigue fijo como antes.
+      const _debeFijoBanco = montoBancoReal != null && !esTicketPropio;
       if (!gruposDetallados.has(key)) {
         gruposDetallados.set(key, {
           cuenta: cuentaLinea, centroCosto, referencia, tipoDetalle, subcodigo: subcodigoDetalle,
-          debe: montoBancoReal ?? 0, detalle: [], primerMov: m, _debeFijoBanco: montoBancoReal != null,
+          debe: 0, detalle: [], primerMov: m, _debeFijoBanco,
         });
       }
       const gt = gruposDetallados.get(key);
-      if (!gt._debeFijoBanco) gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaAjusteSinCfdi });
+      if (gt._debeFijoBanco) {
+        gt.debe = montoBancoReal;
+      } else if (esTicketPropio && montoBancoReal != null) {
+        gt.debe += montoBancoReal;
+      } else {
+        gt.debe += Number(m.debe);
+      }
+      // `ticketRef` (solo tickets propios): serie-folio del TICKET real, para
+      // poder listar en el concepto todos los tickets que comparten una
+      // misma referencia bancaria cuando se agrupan (ver más abajo, armado
+      // del concepto de `depositosIdentificados`) — antes, agrupar 2+
+      // tickets distintos bajo la misma referencia mostraba solo la etiqueta
+      // genérica ("TRANSFERENCIA"), perdiendo de vista a cuáles tickets
+      // pertenecía el depósito.
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaConSerie, ticketRef: esTicketPropio ? `${m.serieVentaTicket}-${m.folioVentaTicket}` : null });
       continue;
     }
 
@@ -1398,7 +2027,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // depósitos con autorización distinta, ej. Factura Global O0-260800164).
     const esTarjetaDeclarada = LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA';
     const infoTarjetaTicket = (esTarjetaDeclarada && m.serieVentaTicket && m.folioVentaTicket)
-      ? bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`)
+      ? _elegirBancoRealPorMonto(bancoRealPorTicket?.get(`${m.serieVentaTicket}|${m.folioVentaTicket}`), Number(m.debe))
       : null;
     if (esTarjetaDeclarada && infoTarjetaTicket?.numeroAutorizacion && !esRemanenteMenor) {
       const cuentaLineaTarjeta = infoTarjetaTicket.cuentaBanco ?? m.cuenta;
@@ -1411,7 +2040,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
       const gt = gruposDetallados.get(key);
       gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieParaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', nota: notaAjusteSinCfdi });
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: Number(m.debe), formaPago: 'TARJETA', nota: notaConSerie });
       continue;
     }
 
@@ -1430,7 +2059,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // Se guarda qué CFDI aportó cada monto — no va en la póliza de CONTPAQ
     // (esa línea sigue sin serie/folio, sigue siendo un total agregado), pero
     // permite armar la hoja de desglose para poder rastrear el detalle.
-    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, nota: notaAjusteSinCfdi });
+    g.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: Number(m.debe), formaPago: label ?? m.formaPago ?? null, nota: notaConSerie });
   }
 
   // Efectivo → Tarjeta → resto, siempre en ese orden dentro de los cargos
@@ -1438,24 +2067,52 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   // llegan a este bucket (ver arriba) — se arman aparte más abajo, dentro de
   // `depositosIdentificados` (bucle sobre `gruposDetallados`).
   const ORDEN_LABEL_CONSOLIDADO = { EFECTIVO: 0, TARJETA: 1 };
+  // Residuo sin etiqueta (2026-08-27, confirmado con el usuario, caso real
+  // B0-260801134 $0.01): cuando `g.label` es null (formaPago sin mapear en
+  // `LABEL_FORMA_PAGO_CONSOLIDADO`, ej. Transferencia '03' cayendo al bucket
+  // genérico en vez de a `gruposDetallados`) y el monto es un residuo chico,
+  // el resultado es una línea "Depósitos consolidados" sin ninguna etiqueta
+  // útil — se oculta, mismo criterio que otros residuos de redondeo ya
+  // establecidos en el export (umbral $10).
+  const UMBRAL_RESIDUO_CONSOLIDADO_SIN_ETIQUETA = 10;
   const consolidados = [...grupos.values()]
-    .map(g => ({
-      cuenta:      g.cuenta,
-      serie:       g.label ?? '',
-      concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
-                 : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
-                 : g.label === 'SF'       ? 'Depósitos consolidados (SF)'
-                 : g.label === 'PUNTOS'   ? 'Depósitos consolidados (Puntos)'
-                 : 'Depósitos consolidados',
-      centroCosto: g.centroCosto,
-      debe:        g.debe,
-      haber:       0,
-      cfdiUuid:    null,
-      _subcodigo:  0,
-      _detalle:    g.detalle,
-      _esTransferencia: false,
-      _esResto:    true,
-    }))
+    .filter(g => !(g.label == null && Math.abs(g.debe) < UMBRAL_RESIDUO_CONSOLIDADO_SIN_ETIQUETA))
+    .map(g => {
+      // Bucket que neta en NEGATIVO (ej. ajustes SF-MISMO-FOLIO restando más
+      // de lo que hay cargos en el mismo bucket, ver
+      // `_inyectarSaldoFavorGenerado`): `esCargo = debe > 0` más abajo
+      // (`_construirWorkbookPoliza`) da falso, y como `haber` aquí siempre
+      // era 0, la celda de monto mostraba literalmente "0.00" -- el ajuste
+      // real quedaba fuera del total que lee CONTPAQ (ni como cargo ni como
+      // abono). Se voltea a Abono con el valor absoluto para que el importe
+      // sí llegue al archivo (confirmado con el usuario 2026-09-03).
+      const neto = Number(g.debe) || 0;
+      // Confirmado con el usuario 2026-09-10: "Depósitos consolidados
+      // (Efectivo)"/"(Tarjeta)" van SIEMPRE a la cuenta bancaria real
+      // (1102011001, BBVA), para todas las sucursales — default fijo por
+      // etiqueta, no depende de cfdiUuid ni de `verdadBancaria`. El resto de
+      // los buckets (SF, Puntos, sin etiqueta) conservan su cuenta genérica.
+      const cuentaFinal = (g.label === 'EFECTIVO' || g.label === 'TARJETA') && cuentaDepositosReal
+        ? cuentaDepositosReal
+        : g.cuenta;
+      return {
+        cuenta:      cuentaFinal,
+        serie:       g.label ?? '',
+        concepto:    g.label === 'EFECTIVO' ? 'Depósitos consolidados (Efectivo)'
+                   : g.label === 'TARJETA'  ? 'Depósitos consolidados (Tarjeta)'
+                   : g.label === 'SF'       ? 'Depósitos consolidados (SF)'
+                   : g.label === 'PUNTOS'   ? 'Depósitos consolidados (Puntos)'
+                   : 'Depósitos consolidados',
+        centroCosto: g.centroCosto,
+        debe:        neto > 0 ? neto : 0,
+        haber:       neto < 0 ? Math.abs(neto) : 0,
+        cfdiUuid:    null,
+        _subcodigo:  0,
+        _detalle:    g.detalle,
+        _esTransferencia: false,
+        _esResto:    true,
+      };
+    })
     .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 2) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 2));
 
   // Transferencia y Cheque detallados: una línea por CFDI, salvo cuando dos o
@@ -1498,15 +2155,40 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
       : (m.serie || '');
     const serieFinal = gt.referencia ?? serFolReal;
-    const concepto = esGrupo ? etiqueta : ([nombre, serFolReal].filter(Boolean).join(' / ') || etiqueta);
+    // Agrupada por TICKETS propios (2+ tickets distintos que comparten un
+    // mismo depósito real, ej. una Transferencia partida entre 2 facturas —
+    // ver acumulación de `debe` arriba): a diferencia del caso CFDI/Global
+    // (mismo ticket con varias líneas), aquí SÍ hay algo útil que mostrar —
+    // los tickets reales detrás del depósito, no solo la etiqueta genérica
+    // (confirmado con el usuario 2026-09-15, caso real depósito 045330:
+    // A0-260704683 + A0-260704334).
+    const ticketRefsGrupo = esGrupo ? [...new Set(gt.detalle.map(d => d.ticketRef).filter(Boolean))] : [];
+    const concepto = esGrupo
+      ? (ticketRefsGrupo.length ? ticketRefsGrupo.join(', ') : etiqueta)
+      : ([nombre, serFolReal].filter(Boolean).join(' / ') || etiqueta);
     const serieColumnaC = esGrupo ? serieFinal : (gt.referencia ?? etiqueta);
     depositosIdentificados.push({
       cuenta: gt.cuenta, serie: serieColumnaC, concepto,
       centroCosto: gt.centroCosto, debe: gt.debe, haber: 0,
       cfdiUuid: esGrupo ? null : m.cfdiUuid, _subcodigo: gt.subcodigo,
       _categoria: null,
+      // Sin número de autorización/referencia bancaria real ligado (columna C
+      // cayó al tipo genérico "TRANSFERENCIA"/"CHEQUE" en vez de mostrar el
+      // dato real) — se marca para pintar la fila de rojo en el export
+      // (`_construirWorkbookPoliza`, confirmado con el usuario 2026-09-14).
+      // Agrupada (esGrupo) nunca aplica: agrupar exige tener referencia real.
+      _sinAutorizacion: !esGrupo && !gt.referencia,
       ...(esGrupo ? { _detalle: gt.detalle, _esTransferencia: gt.tipoDetalle === 'TRANSFERENCIA', _esResto: true } : {}),
     });
+  }
+
+  // NetPay: depósito neto + comisión por cada centro con ventas Tarjeta
+  // matcheadas (ver `construirNetpayInfo`/`_lineasNetpay`) — un bloque de 7
+  // líneas fijas por centro, agregado al final del consolidado.
+  if (netpayInfo?.porCentro?.size) {
+    for (const infoCentro of netpayInfo.porCentro.values()) {
+      depositosIdentificados.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision));
+    }
   }
 
   // Cada arreglo se ordena internamente por serie/folio ascendente — antes
@@ -1576,7 +2258,19 @@ const TIPO_ORIGEN_BCT = 'Bonificación Club Tuberos';
  * Algunas NCs viejas (ej. Bonificación Club Tuberos) se generaron con una
  * versión del motor que empujaba el abono antes que el cargo; esto corrige
  * el orden de despliegue en el export sin tocar el `orden` guardado en BD.
- * Solo reordena DENTRO de cada CFDI, nunca entre CFDIs distintos.
+ *
+ * Excepción (confirmada con el usuario 2026-09-08, caso real RAYMUNDO
+ * CUELLAR MENDOZA): cuando el grupo es el cierre OPA de una venta
+ * (`reglaNombre='OPA'`) y esa venta fue luego revertida por un Egreso real
+ * (`_redirigirEgresoAnticipoSaldado`, `reglaNombre='OPA-REVERSION'`), el
+ * orden correcto de las 3 partes del mismo evento es Ingreso → Devolución/
+ * Egreso → cierre OPA — NO "cargo antes que abono" dentro del CFDI de la
+ * venta, y el grupo del Egreso (otro CFDI) se intercala en medio en vez de
+ * aparecer aparte más adelante. Se enlazan por `serie` (el folio del Egreso
+ * real queda guardado en las líneas de cierre OPA vía `serieCierreProp` —
+ * ver `_redirigirEgresoAnticipoSaldado`/`cfdi-poliza-generator.service.js`
+ * — y coincide exacto con el folio propio de las líneas del grupo Egreso).
+ * Fuera de este caso, sigue reordenando SOLO dentro de cada CFDI.
  */
 function ordenarCargoAntesDeAbono(movs) {
   const porCfdi   = new Map();
@@ -1587,12 +2281,31 @@ function ordenarCargoAntesDeAbono(movs) {
     porCfdi.get(key).push(m);
   }
 
-  const resultado = [];
-  for (const key of ordenCfdi) {
+  const grupos = ordenCfdi.map(key => {
     const grupo  = porCfdi.get(key);
     const cargos = grupo.filter(m => Number(m.debe) > 0);
     const abonos = grupo.filter(m => !(Number(m.debe) > 0));
-    resultado.push(...cargos, ...abonos);
+    return { key, cargos, abonos };
+  });
+
+  const usados = new Set();
+  const resultado = [];
+  for (const g of grupos) {
+    if (usados.has(g.key)) continue;
+    usados.add(g.key);
+    const cierreOPA = g.cargos.find(m => m.reglaNombre === 'OPA');
+    const grupoEgreso = cierreOPA && grupos.find(o => !usados.has(o.key)
+      && o.cargos.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
+    if (grupoEgreso) {
+      usados.add(grupoEgreso.key);
+      // OPA-REVERSION se oculta del export por completo — ver comentario
+      // equivalente en `bloquesAjustesContado` (confirmado con el usuario
+      // 2026-09-15, caso real Puerto Escondido INMOBILIARIA ACROTY
+      // O0-260900344). Sigue persistido en Postgres, solo deja de mostrarse.
+      resultado.push(...g.abonos, ...g.cargos);
+      continue;
+    }
+    resultado.push(...g.cargos, ...g.abonos);
   }
   return resultado;
 }
@@ -1635,8 +2348,9 @@ function compararSerieFolio(a, b) {
 // serie/folio visibles). Se sacan del pipeline normal ANTES de procesar y se
 // reinyectan después, ya armados, como línea individual — mismo principio que
 // Devolución/Descuento/Bonificación/Anticipo (nunca se consolidan).
-// Formato "COS-FORMADEPAGO" (ej. "COS-EFECTIVO") — confirmado con el usuario
-// 2026-08-07, reemplaza el formato anterior "Cobro de otra sucursal - X".
+// Formato "FORMADEPAGO-COS" (ej. "EFECTIVO-COS") — confirmado con el usuario
+// 2026-09-03, invierte el orden usado desde el 2026-08-07 ("COS-FORMADEPAGO"),
+// que a su vez reemplazó el formato original "Cobro de otra sucursal - X".
 const ETIQUETA_COBRO_SUCURSAL = 'COS';
 // Mismo texto que ETIQUETA_SALDO_FAVOR en cobros-sucursal-puente.service.js.
 const ETIQUETA_SALDO_FAVOR = 'SF';
@@ -1645,6 +2359,12 @@ const ETIQUETA_SALDO_FAVOR = 'SF';
 // mismo día en el mismo almacén: se omite del export (queda en BD intacto)
 // confirmado con el usuario 2026-08-04.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
+// Mismo texto que ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR en
+// cfdi-poliza-generator.service.js — saldo a favor generado, sin ningún uso
+// todavía, menor a $50 (2026-09-15, confirmado con el usuario): a diferencia
+// de SF-OCULTO (se omite del export por completo), este SÍ se muestra, pero
+// en "Otros Ingresos" en vez de mezclado con "Saldos a favor usados".
+const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
 // Mismo texto que ETIQUETA_COBRO_YA_CONTABILIZADO en cfdi-mapping.service.js
 // (2026-08-25) — Cargo de Efectivo/Tarjeta de una factura cuyo cobro real ya
 // se contabilizó otro día vía "Cobros sin factura" (facturación diferida
@@ -1689,7 +2409,12 @@ const ETIQUETA_VENTA_SIN_COBRO = 'SIN-COBRO';
 // serie/folio en vez de ir a una sección aparte — OPA (anticipo sin NC,
 // 2026-08-19): es una línea complementaria de una factura normal, no un
 // cruce de sucursal ni un ajuste de venta real.
-const REGLAS_MEZCLADAS_CON_VENTAS = new Set(['OPA']);
+// 'OPA-REVERSION' (2026-09-07): Cargo Devoluciones+IVA de un Egreso que
+// revierte una venta ya saldada 100% con Anticipo (ver
+// `_redirigirEgresoAnticipoSaldado` en cfdi-poliza-generator.service.js) —
+// misma necesidad de visibilidad que 'OPA', pero es una reversión, no la
+// recepción/aplicación original, por eso un valor distinto.
+const REGLAS_MEZCLADAS_CON_VENTAS = new Set(['OPA', 'OPA-REVERSION']);
 
 // Orden fijo del bloque de "Cobro de otra sucursal": Efectivo, Transferencia,
 // Saldo a favor, Cheque, Tarjeta (confirmado con el usuario 2026-08-05).
@@ -1716,12 +2441,6 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
-// Mismo umbral que `UMBRAL_RESIDUO_VENTA_OTROS_INGRESOS` (25-ago, residuos SF)
-// pero para líneas 'Venta Sin Cobro' — confirmado con el usuario 2026-08-26,
-// caso real Hidalgo B0-260801157 ($0.01): un excedente de unos centavos es
-// ruido de redondeo, no dinero real sin explicar.
-const UMBRAL_RESIDUO_VENTA_SIN_COBRO = 10;
-
 function _extraerCobrosSucursal(movimientos) {
   const resto = [];
   const filas = [];
@@ -1743,13 +2462,30 @@ function _extraerCobrosSucursal(movimientos) {
   // quedarse en consolidado (el monto fue cobrado aquí) — usarlas extraería
   // incorrectamente entradas que deben estar en "Depósitos consolidados"
   // (bug real: $127k de EFECTIVO/TARJETA removidos de más, 2026-08-15).
-  const _uuidsCobradosPorSucursal = new Set(
-    movimientos
-      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
-                && m.cfdiUuid != null)
-      .map(m => m.cfdiUuid)
-      .filter(Boolean),
-  );
+  //
+  // Mapea a un Set de cuentas (no un booleano) — 2026-09-04, confirmado con
+  // el usuario: un ticket puede tener porción Efectivo (Abono a la MISMA
+  // cuenta que su Cargo, ver más abajo) Y porción Tarjeta/Transferencia
+  // (Abono a la cuenta PUENTE, distinta de la cuenta del banco real) bajo el
+  // MISMO cfdiUuid. Antes, `cfdiUuid-poliza-generator.service.js` evitaba a
+  // propósito este cruce quitándole el cfdiUuid al Cargo de Tarjeta/
+  // Transferencia (para que el emparejamiento por uuid de abajo no lo
+  // arrastrara junto con la porción Efectivo) — pero eso también le quitaba
+  // la única llave que `consolidarCargos` necesita para resolver el depósito
+  // bancario real (número de autorización/referencia) de esa línea, dejándola
+  // anónima dentro de "Depósitos consolidados". Al exigir aquí MISMA cuenta
+  // (no solo mismo uuid), el cfdiUuid se puede restaurar sin riesgo: la
+  // cuenta puente del Abono de Tarjeta/Transferencia nunca coincide con la
+  // cuenta de banco real de su propio Cargo, así que nunca calificará para
+  // este emparejamiento (solo Efectivo, que sí comparte cuenta a propósito).
+  const _cuentasCobradasPorSucursalPorUuid = new Map();
+  for (const m of movimientos) {
+    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0) && m.cfdiUuid != null) {
+      const set = _cuentasCobradasPorSucursalPorUuid.get(m.cfdiUuid) ?? new Set();
+      set.add(m.cuenta?.codigo);
+      _cuentasCobradasPorSucursalPorUuid.set(m.cfdiUuid, set);
+    }
+  }
   // Fallback SOLO para pares sin cfdiUuid: un ticket "pendiente por facturar"
   // (sin factura todavía) cobrado en otra sucursal llega con AMBAS líneas del
   // par (Venta debe / Cobro Sucursal haber) con cfdiUuid null — ver
@@ -1767,6 +2503,56 @@ function _extraerCobrosSucursal(movimientos) {
                 && m.cfdiUuid == null)
       .map(m => `${m.concepto || ''}|${Number(m.haber).toFixed(2)}`),
   );
+  // Par Cargo+Abono, AMBOS tipoOrigen='Cobro Sucursal' (2026-08-27, caso real
+  // Ferrocarril B0-260802776 $2,307.32 Tarjeta con depósito bancario
+  // identificado): a diferencia del par 'Venta'+'Cobro Sucursal' de arriba,
+  // este ocurre cuando cobros-sucursal-puente.service.js arma el Cargo
+  // (banco real) Y el Abono (cuenta puente) ambos con este mismo tipoOrigen —
+  // mismo criterio "solo Abono" que Anticipo (`bloquesAjustesContado`,
+  // confirmado con el usuario): el Cargo se omite aquí, sobrevive el Abono.
+  const _cobroSucursalHaberKeys = new Set(
+    movimientos
+      .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0))
+      .map(m => m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.haber).toFixed(2)}`),
+  );
+  // Cargos tipoOrigen='Venta' (cobrosCobradoraDirecta, cfdi-poliza-generator.service.js)
+  // — bug real 2026-09-14, caso real Santa Rosa C0-260902014 $12,050.22
+  // Tarjeta: a diferencia del par 'Cobro Sucursal'+'Cobro Sucursal' de arriba
+  // (Ferrocarril, Cargo se omite por completo), aquí el Cargo 'Venta' SÍ
+  // sigue su camino normal hacia `resto`/`consolidarCargos` cuando su cuenta
+  // no coincide con la del Abono (Tarjeta/Transferencia — ver
+  // `_cuentasCobradasPorSucursalPorUuid` arriba, que solo empareja/extrae
+  // Efectivo). Sin esto, `filasTarjetaCobroSucursal` (más abajo) no puede
+  // distinguir ambos casos y suma el mismo monto dos veces al consolidado de
+  // Tarjeta: una vez natural (el Cargo nunca se extrajo) y otra vez por la
+  // inyección manual de `_inyectarCobrosSucursal` (pensada solo para el
+  // caso Ferrocarril, donde el Cargo sí se descarta).
+  // NO se puede emparejar por cfdiUuid (el Abono de Tarjeta/Transferencia
+  // siempre lo trae null a propósito — ver comentario en
+  // cfdi-poliza-generator.service.js) — se empareja por concepto+monto: el
+  // Abono reusa el MISMO concepto del Cargo con el sufijo " (cruce sucursal)"
+  // agregado (ambos generadores, `generarPropuesta`/guardado, lo hacen igual).
+  const _ventaCargoKeys = new Set(
+    movimientos
+      .filter(m => m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0))
+      .map(m => `${m.concepto || ''}|${Number(m.debe).toFixed(2)}`),
+  );
+  // Par 'Venta' Cargo + 'Cobro Sucursal' Abono a la MISMA cuenta (caso
+  // M0-260900018, 2026-09-03): en `cobrosCobradoraDirecta`
+  // (cfdi-poliza-generator.service.js), el Efectivo cruzado de sucursal usa
+  // la MISMA cuenta para el Cargo y su Abono (a propósito, porque el
+  // efectivo SÍ puede moverse físicamente) — el par neta $0 en esa cuenta.
+  // REVERTIDO 2026-09-14 (caso real Ferrocarril→Atzompa 12-sep, $8,618.55):
+  // antes se ocultaban AMBAS líneas asumiendo que era ruido visual sin
+  // efecto real — pero esa suposición solo es cierta cuando la sucursal
+  // VENDEDORA ya generó su propia póliza (ahí sí queda registrado el
+  // "derecho de cobro" en otro lado). `cobrosCobradoraDirecta` es
+  // justamente el camino de RESPALDO que se usa cuando la vendedora NO ha
+  // generado todavía — en ese caso, ocultar este par deja la transacción
+  // completamente invisible en todo el sistema (confirmado con el usuario:
+  // no debe depender de que la otra sucursal ya haya generado). Mostrar
+  // ambas líneas siempre es más seguro que arriesgar dinero invisible,
+  // aunque a veces se vea "redundante" si la vendedora ya las tenía.
   for (const m of movimientos) {
     // Las líneas de Saldo a Favor de un Pago (tipoComprobante='P',
     // `esSplitPagoPorFactura` en cfdi-mapping.service.js) también llevan
@@ -1786,35 +2572,55 @@ function _extraerCobrosSucursal(movimientos) {
     // desglosarse en el bloque de "Cobro de otra sucursal" (confirmado con el
     // usuario: aparecía como "COS-Anticipo" separado de su factura).
     if (m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL && REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre)) { resto.push(m); continue; }
-    // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se extrae aquí para
-    // que no llegue a consolidarCargos y no infle "Depósitos consolidados".
-    // Usa cfdiUuid para identificar el par de forma determinista: el mismo
-    // UUID que tiene la entrada 'Cobro Sucursal' DEBE de cobros-sucursal-puente
-    // identifica sin ambigüedad la 'Venta' DEBE de cfdiToMovimientos.
+    // El DEBE del par cobro-sucursal (tipoOrigen='Venta') se descarta aquí
+    // por completo (sin mostrarse, ni siquiera en "Cobro de otra sucursal")
+    // — no debe llegar a consolidarCargos (no infla "Depósitos consolidados")
+    // NI mostrarse como línea individual. Usa cfdiUuid + MISMA CUENTA para
+    // identificar el par de forma determinista: el mismo UUID que tiene la
+    // entrada 'Cobro Sucursal' DEBE de cobros-sucursal-puente identifica sin
+    // ambigüedad la 'Venta' DEBE de cfdiToMovimientos, pero exigir también la
+    // cuenta evita arrastrar la porción Tarjeta/Transferencia de un ticket
+    // mixto solo porque comparte uuid con su porción Efectivo (ver comentario
+    // en `_cuentasCobradasPorSucursalPorUuid` arriba).
+    //
+    // REVERTIDO 2026-09-14 (caso real Ferrocarril→Atzompa 12-sep, $8,618.55):
+    // este Cargo representa efectivo físicamente recibido en la sucursal
+    // COBRADORA (Atzompa), pero conceptualmente pertenece a la sucursal
+    // VENDEDORA (Ferrocarril, donde se hizo la venta) — confirmado con el
+    // usuario: el Cargo debe verse en la póliza de la vendedora (junto a su
+    // propio Abono de Ingresos+IVA), nunca en la de la cobradora. Solo el
+    // Abono (más abajo) se muestra aquí, en "Cobro de otra sucursal" — se
+    // acepta que esa línea quede desbalanceada dentro de ESTA póliza mientras
+    // la vendedora no haya generado la suya (mismo criterio que 'Venta Sin
+    // Cobro' un poco más abajo).
     if (m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
         && (
-          (m.cfdiUuid != null && _uuidsCobradosPorSucursal.has(m.cfdiUuid))
+          (m.cfdiUuid != null && _cuentasCobradasPorSucursalPorUuid.get(m.cfdiUuid)?.has(m.cuenta?.codigo))
           || (m.cfdiUuid == null && _conceptosCobradosPorSucursalSinUuid.has(`${m.concepto || ''}|${Number(m.debe).toFixed(2)}`))
         )) {
-      filas.push({
-        cuenta:             m.cuenta,
-        serie:              m.serie || '',
-        concepto:           m.concepto || '',
-        centroCosto:        m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-        debe:               Number(m.debe),
-        haber:              0,
-        cfdiUuid:           null,
-        metodoPago:         m.metodoPago ?? null,
-        _subcodigo:         0,
-        _categoria:         null,
-        _formaPagoLabel:    m.reglaNombre || null,
-        _referenciaBancoReal: null,
-        _esPendientePropio: false,
-      });
       continue;
     }
-    if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== 'Venta Sin Cobro' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
-    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO) {
+    // 'Venta Sin Cobro' (2026-08-27, confirmado con el usuario): se quita por
+    // completo del export, sin dejar rastro en ningún lado (ni póliza
+    // principal ni "Otros Ingresos") — revierte la decisión previa de
+    // mostrarlo con la etiqueta corregida. Se acepta que el asiento quede
+    // desbalanceado contra el Abono de Ingresos/IVA de esa misma factura
+    // (mismo criterio que otros residuos ya ocultados hoy).
+    if (m.tipoOrigen === 'Venta Sin Cobro') continue;
+    if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
+    // Ver `_cobroSucursalHaberKeys` arriba — el Cargo del par se omite cuando
+    // ya existe su Abono correspondiente.
+    if (m.tipoOrigen === 'Cobro Sucursal' && Number(m.debe) > 0 && !(Number(m.haber) > 0)) {
+      const _keyCargoPar = m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.debe).toFixed(2)}`;
+      if (_cobroSucursalHaberKeys.has(_keyCargoPar)) continue;
+    }
+    // SF-OCULTO (2026-09-15, confirmado con el usuario): YA NO se oculta en
+    // "Otros Ingresos" — sigue siendo Saldo a Favor USADO (aunque el mismo
+    // día/almacén), así que debe verse en "Saldos a favor usados" como
+    // cualquier otro SF usado (más abajo, vía `_formaPagoLabel`). "Otros
+    // Ingresos" queda reservada solo para SF vivo/sin usar <$50
+    // (`ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR`) y COBRO-DIA-REAL.
+    if (m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO || m.reglaNombre === ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,
         centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
@@ -1826,24 +2632,7 @@ function _extraerCobrosSucursal(movimientos) {
         // antes se mezclaban sin forma de saber cuál era cuál en el Excel.
         motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
           ? 'Oculto — cobro real ya contabilizado el día real del cobro'
-          : 'Oculto — generado y usado el mismo día/almacén',
-      });
-      continue;
-    }
-    // Venta Sin Cobro de monto chico (< $UMBRAL_RESIDUO_VENTA_SIN_COBRO): mismo
-    // criterio que el residuo de redondeo SF de `armarBloqueContado`
-    // (confirmado con el usuario 2026-08-26) — un excedente de unos centavos
-    // no es dinero real sin explicar, es ruido de redondeo; no vale la pena
-    // mostrarlo como línea de "Venta Sin Cobro" en la póliza principal. Se
-    // reencamina a "Otros Ingresos oculto" igual que los casos de arriba.
-    if (m.tipoOrigen === 'Venta Sin Cobro' && Number(m.debe) + Number(m.haber) < UMBRAL_RESIDUO_VENTA_SIN_COBRO) {
-      filasOtrosIngresosOcultos.push({
-        cuenta:      m.cuenta,
-        centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-        concepto:    m.concepto || '',
-        debe:        Number(m.debe),
-        haber:       Number(m.haber),
-        motivo:      `Oculto — monto < $${UMBRAL_RESIDUO_VENTA_SIN_COBRO} (posible residuo de redondeo)`,
+          : 'Saldo a favor generado, sin usar, menor a $50',
       });
       continue;
     }
@@ -1890,6 +2679,13 @@ function _extraerCobrosSucursal(movimientos) {
       _formaPagoLabel: m.reglaNombre || null,
       _referenciaBancoReal: esBancoReal ? (m.reglaNombre || null) : null,
       _esPendientePropio: m.tipoOrigen === TIPO_ORIGEN_PENDIENTE_PROPIO,
+      // Ver `_ventaCargoKeys` arriba — cuando el Abono está pareado con un
+      // Cargo 'Venta' (no 'Cobro Sucursal'), ese Cargo ya sigue su camino
+      // normal hacia el consolidado; `filasTarjetaCobroSucursal` no debe
+      // sumarlo otra vez. El Abono lleva el concepto del Cargo + sufijo
+      // " (cruce sucursal)" — se quita para poder comparar.
+      _cargoVentaYaEnConsolidado: m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
+        && _ventaCargoKeys.has(`${(m.concepto || '').replace(/ \(cruce sucursal\)$/, '')}|${Number(m.haber).toFixed(2)}`),
       // Ver `ETIQUETA_VENTA_SIN_COBRO` — no es un cruce de sucursal, así que
       // NUNCA debe llevar el prefijo "COS-" ni mostrar `reglaNombre` (que en
       // este caso es el nombre completo de la regla fiscal, no una forma de
@@ -1903,30 +2699,26 @@ function _extraerCobrosSucursal(movimientos) {
   // orden en que llegaban los tickets (confirmado con el usuario 2026-08-05).
   filas.sort((a, b) => _categoriaCobroSucursal(a) - _categoriaCobroSucursal(b) || compararSerieFolio(a, b));
 
-  // Saldo a Favor por debajo de $50 va a una pestaña aparte "Otros Ingresos"
-  // en vez de la póliza (confirmado con el usuario 2026-08-07) — un SF de
-  // subtotal + IVA son 2 filas (2103090001 + 2104010002) con el MISMO
-  // `concepto` (cliente/serie-folio); se agrupan por ahí para decidir sobre
-  // el monto TOTAL de esa factura, no cada línea por separado (partirlas
-  // arbitrariamente entre las dos pestañas no tendría sentido).
-  const UMBRAL_SF_OTROS_INGRESOS = 50;
-  const totalPorConceptoSF = new Map();
-  for (const f of filas) {
-    if (f._formaPagoLabel !== ETIQUETA_SALDO_FAVOR) continue;
-    const monto = Number(f.debe) + Number(f.haber);
-    totalPorConceptoSF.set(f.concepto, (totalPorConceptoSF.get(f.concepto) ?? 0) + monto);
-  }
-  const filasOtrosIngresos = filas.filter(f =>
-    f._formaPagoLabel === ETIQUETA_SALDO_FAVOR && (totalPorConceptoSF.get(f.concepto) ?? 0) <= UMBRAL_SF_OTROS_INGRESOS,
-  );
-  // Columna "Motivo" — ver comentario equivalente en filasOtrosIngresosOcultos.
-  for (const f of filasOtrosIngresos) f.motivo = `Monto ≤ $${UMBRAL_SF_OTROS_INGRESOS}`;
-  if (filasOtrosIngresos.length) {
-    const idsOtrosIngresos = new Set(filasOtrosIngresos);
+  // Saldo a Favor USADO: sale por completo de "Cobro de otra sucursal" y va a
+  // su propia pestaña dedicada "Saldos a favor usados", SIN IMPORTAR EL MONTO
+  // (confirmado con el usuario 2026-09-15 — reemplaza el criterio anterior de
+  // 2026-08-07, que solo movía a "Otros Ingresos" los ≤$50 y dejaba el resto
+  // mezclado aquí). Un SF de subtotal + IVA son 2 filas (2103090001 +
+  // 2104010002) con el MISMO `concepto` (cliente/serie-folio).
+  // Incluye SF-OCULTO (2026-09-15, ver comentario en el loop de arriba) —
+  // sigue siendo SF usado, solo que el mismo día/almacén; ya no se oculta en
+  // "Otros Ingresos", se ve aquí como cualquier otro SF usado.
+  const filasSaldoFavorUsado = filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_SALDO_FAVOR_OCULTO);
+  if (filasSaldoFavorUsado.length) {
+    const idsSaldoFavorUsado = new Set(filasSaldoFavorUsado);
     for (let i = filas.length - 1; i >= 0; i--) {
-      if (idsOtrosIngresos.has(filas[i])) filas.splice(i, 1);
+      if (idsSaldoFavorUsado.has(filas[i])) filas.splice(i, 1);
     }
   }
+  // "Otros Ingresos" ya no recibe Saldo a Favor usado (ver arriba) — se deja
+  // declarada vacía; solo se llena más abajo con COBRO-DIA-REAL y SF vivo <$50
+  // (`filasOtrosIngresosOcultos`).
+  const filasOtrosIngresos = [];
 
   // Columna C debe decir "Cobro de otra sucursal" en vez del serie-folio —
   // mismo patrón que Transferencia/Cheque individual (línea ~825): el
@@ -1942,24 +2734,80 @@ function _extraerCobrosSucursal(movimientos) {
   // 'Pendiente Propio' (ticket sin factura de la PROPIA sucursal, sin cruce)
   // tampoco lleva el prefijo — confirmado con el usuario 2026-08-06, no es un
   // cruce real, decirlo sería una etiqueta falsa.
+  // Tarjeta de otra sucursal TAMBIÉN debe sumar al consolidado de Tarjeta de
+  // ESTA sucursal (2026-08-27, confirmado con el usuario, caso real
+  // Ferrocarril 11-ago B0-260802776 $2,307.32) — el dinero entró físicamente
+  // por la terminal de tarjeta de ESTA sucursal ese día, aunque pertenezca a
+  // la factura de otra. A diferencia de Efectivo (revertido 2026-08-20 por
+  // falta de respaldo: el reporte oficial de Hidalgo/B0 11-ago no distinguía
+  // ningún cobro de otra sucursal ese día), este caso SÍ se confirmó contra
+  // el monto exacto faltante. Se calcula ANTES de borrar los campos `_` de
+  // abajo — la línea individual en "Cobro de otra sucursal" se sigue
+  // mostrando aparte, sin cambios, esto solo ajusta el TOTAL consolidado
+  // (ver `_inyectarCobrosSucursal`).
+  //
+  // NO usar `_categoriaCobroSucursal` (esa función prioriza
+  // `_referenciaBancoReal` sobre el texto real de la forma de pago — cuando
+  // SÍ hay un depósito bancario identificado para una Tarjeta, la categoriza
+  // como "Transferencia" para efectos de ORDEN visual, aunque siga siendo
+  // Tarjeta en la realidad). Aquí se necesita saber si es Tarjeta DE VERDAD,
+  // sin importar si además tiene depósito bancario identificado — se revisa
+  // el texto crudo de `_formaPagoLabel`.
+  // Corrección 2026-08-27 (caso real B0-260801256/Ferrocarril): comparado
+  // contra datos reales, la póliza VENDEDORA (B0) trae una fila SOLA de Cargo
+  // (`haber=0` — reconoce el derecho de cobro contra la sucursal cobradora,
+  // sin Abono en ESTA póliza) mientras que la póliza COBRADORA real (F0) trae
+  // el PAR completo Cargo+Abono, reducido por el fix de "solo Abono" de
+  // arriba (`_cobroSucursalHaberKeys`) a una sola fila con `haber>0`. Exigir
+  // `haber>0` aquí es lo que distingue "cobrado físicamente en ESTA
+  // sucursal" (cuenta) de "venta de ESTA sucursal, cobrada en otra" (no
+  // cuenta) — también excluye de paso al par 'Venta'+'Cobro Sucursal' de
+  // arriba (esa fila siempre trae `haber: 0` hardcodeado).
+  const filasTarjetaCobroSucursal = filas
+    .filter(f => !f._esVentaSinCobro && !f._cargoVentaYaEnConsolidado && Number(f.haber) > 0 && (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA'))
+    .map(f => ({ concepto: f.concepto, monto: Number(f.haber) }));
+
+  // `_referenciaBancoReal` a veces NO es un folio bancario real distinguible
+  // (2026-08-27, caso real B0-260802776 Tarjeta): cuando `bancoReal.referencia`
+  // viene vacío pero SÍ se identificó la cuenta del banco, cobros-sucursal-
+  // puente.service.js cae a `fp.nombre` (ej. "TARJETA DE DEBITO" — el mismo
+  // texto genérico de la forma de pago, no una referencia real) — mostrarlo
+  // tal cual en columna C pierde el prefijo "COS-" sin aportar ningún dato
+  // nuevo. Un folio real de Numo es puramente numérico (ej. "034287") — si
+  // trae letras, es el nombre genérico, se trata como el caso normal (con
+  // prefijo COS-) en vez de como referencia bancaria real.
+  const _esReferenciaBancoRealGenuina = (ref) => !!ref && /^\d+$/.test(ref.trim());
   for (const f of filas) {
     f.serie = f._esVentaSinCobro
       ? ETIQUETA_VENTA_SIN_COBRO
-      : f._referenciaBancoReal
+      : _esReferenciaBancoRealGenuina(f._referenciaBancoReal)
         ? f._referenciaBancoReal
         : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
           ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
-          : (f._formaPagoLabel ? `${ETIQUETA_COBRO_SUCURSAL}-${f._formaPagoLabel}` : ETIQUETA_COBRO_SUCURSAL);
+          : (f._formaPagoLabel ? `${f._formaPagoLabel}-${ETIQUETA_COBRO_SUCURSAL}` : ETIQUETA_COBRO_SUCURSAL);
     delete f._formaPagoLabel;
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;
     delete f._esVentaSinCobro;
+    delete f._cargoVentaYaEnConsolidado;
   }
   // Agregar los SF-OCULTO (mismo día + misma sucursal) a la hoja "Otros Ingresos" —
   // nunca suman a depósitos consolidados de efectivo/tarjeta.
   if (filasOtrosIngresosOcultos.length) filasOtrosIngresos.push(...filasOtrosIngresosOcultos);
 
-  return { resto, filas, filasOtrosIngresos };
+  // Limpieza de campos internos para `filasSaldoFavorUsado` — mismo criterio
+  // que el loop de `filas` de arriba, pero separado porque estas filas ya
+  // salieron de `filas` antes de que ese loop corriera.
+  for (const f of filasSaldoFavorUsado) {
+    f.serie = ETIQUETA_SALDO_FAVOR;
+    delete f._formaPagoLabel;
+    delete f._referenciaBancoReal;
+    delete f._esPendientePropio;
+    delete f._esVentaSinCobro;
+    delete f._cargoVentaYaEnConsolidado;
+  }
+
+  return { resto, filas, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal };
 }
 
 // Inyecta las filas de cobro-sucursal en el bloque correspondiente — PUE en
@@ -1971,7 +2819,7 @@ function _extraerCobrosSucursal(movimientos) {
 // líneas hermanas por serie-folio. Nunca en Bonificaciones/Descuentos/
 // Devoluciones, que son categorías ajenas. Muta `bloques` in-place después de
 // que ya se calcularon todos sus `movs`.
-function _inyectarCobrosSucursal(bloques, filas) {
+function _inyectarCobrosSucursal(bloques, filas, filasTarjetaCobroSucursal = []) {
   if (!filas.length || !bloques.length) return;
   const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones) de/.test(t || '');
   // Discrimina por metodoPago (no por cuenta): el Cargo a la cuenta puente
@@ -1990,6 +2838,26 @@ function _inyectarCobrosSucursal(bloques, filas) {
       bloques.find(b => !esBonificacionODescuento(b.tipoVenta)) ??
       bloques[0];
     candidatoContado.movs.push(...filasPUE);
+    // Ver comentario en `_extraerCobrosSucursal` sobre `filasTarjetaCobroSucursal`
+    // — solo Tarjeta, ajusta el TOTAL de "Depósitos consolidados (Tarjeta)" sin
+    // tocar la línea individual que ya se agregó arriba. También se agrega a
+    // `_detalle` para que la hoja "Desglose Consolidado" muestre de dónde
+    // salió el ajuste — sin esto, el total subía pero el desglose no
+    // explicaba por qué.
+    if (filasTarjetaCobroSucursal.length) {
+      const sumaTarjeta = Math.round(filasTarjetaCobroSucursal.reduce((s, f) => s + f.monto, 0) * 100) / 100;
+      const lineaConsolidadoTarjeta = candidatoContado.movs.find(m => m.concepto === 'Depósitos consolidados (Tarjeta)');
+      if (lineaConsolidadoTarjeta && sumaTarjeta > 0) {
+        lineaConsolidadoTarjeta.debe = Math.round((Number(lineaConsolidadoTarjeta.debe) + sumaTarjeta) * 100) / 100;
+        if (!Array.isArray(lineaConsolidadoTarjeta._detalle)) lineaConsolidadoTarjeta._detalle = [];
+        for (const f of filasTarjetaCobroSucursal) {
+          lineaConsolidadoTarjeta._detalle.push({
+            cfdiUuid: null, serie: f.concepto, monto: f.monto, formaPago: 'TARJETA',
+            nota: 'Cobro de otra sucursal (también se muestra aparte)',
+          });
+        }
+      }
+    }
   }
 
   if (filasPPD.length) {
@@ -2060,26 +2928,81 @@ function bloquesAjustesContado(movs) {
     porCfdi.get(key).movs.push(plano);
   }
 
-  return ordenCfdi.map(key => {
+  const grupos = ordenCfdi.map(key => {
     const { categoria, movs: grupo } = porCfdi.get(key);
-    // Anticipo (recepción o aplicación/cierre) siempre lleva subcódigo 22,
-    // sin importar cómo se cobró — confirmado con el usuario. Antes esta
-    // función solo etiquetaba `_categoria: 'anticipo'` sin asignar el
-    // subcódigo, cayendo al 0 por defecto en la hoja de CONTPAQ.
-    const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
+    // Anticipo: ningún anticipo debe llevar el subcódigo 22 (2026-09-15,
+    // confirmado con el usuario — quitado por completo, ni recepción ni
+    // aplicación/cierre).
+    const extra = {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
+    // Bonificación (genérica, no Club Tuberos): SIEMPRE solo sus Cargos
+    // (Bonificación+IVA), nunca su Abono — mismo criterio que ya existía
+    // para Cancelación dentro de 'devolucion' (confirmado con el usuario
+    // 2026-09-03, caso real BON-314117/118/119: el Abono no debe mostrarse
+    // sin importar a qué cuenta apunte la regla, Clientes o Saldo a Favor).
     const abonosCandidatos = categoria === 'devolucion'
       ? grupo.filter(m => !(Number(m.debe) > 0) && esAbonoSaldoFavor(m))
-      : grupo.filter(m => !(Number(m.debe) > 0));
+      : categoria === 'bonificacion'
+        ? []
+        : grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    // OPA (anticipo sin NC, ver `categorizarAjusteContado`): a diferencia del
-    // anticipo estándar (Reg 22C/23, cargo primero), aquí el Ingreso (Abono)
-    // debe verse PRIMERO y la aplicación del anticipo (Cargo OPA) después,
-    // para trazabilidad — confirmado con el usuario 2026-08-19.
-    const esOpa = categoria === 'anticipo' && grupo.some(m => m.reglaNombre === 'OPA');
-    const bloque = esOpa ? [...abonos, ...cargos] : [...cargos, ...abonos];
-    return { categoria, bloque };
+    // Anticipo ESTÁNDAR (Reg 22C/23, con NC del SAT): el Cargo NUNCA se
+    // muestra en este bloque — solo el Abono (Ingresos+IVA, o el SF liberado)
+    // — confirmado con el usuario 2026-08-27 (caso real
+    // E0-260800110/E0-260801021). OPA (aplicación de anticipo SIN NC,
+    // `REGLAS_MEZCLADAS_CON_VENTAS`) es la EXCEPCIÓN: sus 2 líneas de Cargo
+    // (Anticipos/IVA-anticipo) SÍ deben verse — es la única evidencia visible
+    // de que el anticipo se aplicó, distinta del Cargo estándar (que
+    // duplicaría visualmente la venta, por eso se oculta). Sin esta
+    // excepción, la regla de 2026-08-27 se comía también las líneas OPA sin
+    // querer (bug real 2026-08-28, caso MONSAN B0-260801098: las 2 líneas
+    // Cargo Anticipos/IVA-Anticipo desaparecían del export aunque estaban
+    // correctamente marcadas como visibles en `_extraerCobrosSucursal`).
+    const cargosOPA = cargos.filter(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    return { key, categoria, cargos, abonos, cargosOPA };
   });
+
+  // Orden Ingreso → Devolución/Egreso → cierre OPA (confirmado con el
+  // usuario 2026-09-08, caso real RAYMUNDO CUELLAR MENDOZA): cuando la
+  // venta que aplicó el anticipo (cargosOPA con reglaNombre='OPA') fue
+  // luego revertida por un Egreso real (`_redirigirEgresoAnticipoSaldado`,
+  // reglaNombre='OPA-REVERSION' — ver `REGLAS_MEZCLADAS_CON_VENTAS`), el
+  // grupo del Egreso se intercala ENTRE el Abono de Ingreso de la venta y
+  // el Cargo de cierre OPA, en vez de aparecer como bloque aparte después.
+  // Antes el orden salía "cierre OPA, Ingreso, Egreso" (cada grupo se arma
+  // con cargosOPA primero por el `bloque` de abajo, y los grupos van en el
+  // orden en que aparece su primer movimiento) — sin relación visible entre
+  // las 3 partes de un mismo evento. Se enlazan por `serie` (el folio del
+  // Egreso real, guardado en `cargosOPA[].serie` vía `serieCierreProp` —
+  // ver `_redirigirEgresoAnticipoSaldado`/`cfdi-poliza-generator.service.js`
+  // — coincide exacto con el folio propio de las líneas del grupo Egreso).
+  const usados = new Set();
+  const resultado = [];
+  for (const g of grupos) {
+    if (usados.has(g.key)) continue;
+    usados.add(g.key);
+    if (g.categoria === 'anticipo') {
+      const cierreOPA = g.cargosOPA.find(m => m.reglaNombre === 'OPA');
+      const grupoEgreso = cierreOPA && grupos.find(o => !usados.has(o.key)
+        && o.cargosOPA.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
+      if (grupoEgreso) {
+        usados.add(grupoEgreso.key);
+        // OPA-REVERSION (Cargo Devoluciones+IVA del Egreso + Abono Anticipos+
+        // IVA-anticipo reinstalados) se OCULTA del export por completo
+        // (confirmado con el usuario 2026-09-15, caso real Puerto Escondido
+        // INMOBILIARIA ACROTY O0-260900344) — sigue persistido igual en
+        // Postgres (esta función solo arma el Excel), solo deja de mostrarse.
+        // Se conserva la detección de `grupoEgreso` (arriba) para marcarlo
+        // como usado y que no caiga al bloque genérico de abajo.
+        resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...g.cargosOPA] });
+        continue;
+      }
+      resultado.push({ categoria: g.categoria, bloque: [...g.cargosOPA, ...g.abonos] });
+      continue;
+    }
+    resultado.push({ categoria: g.categoria, bloque: [...g.cargos, ...g.abonos] });
+  }
+  return resultado;
 }
 
 /**
@@ -2102,7 +3025,7 @@ function bloquesAjustesContado(movs) {
 // (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
-function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null } = {}) {
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null } = {}) {
   // REVERTIDO 2026-08-20: se intentó sumar Cancelación/Devolución en Efectivo
   // al consolidado, pero al cruzar contra el "Reporte de Movimientos en
   // Cajas" real (Hidalgo/B0 11-ago) se confirmó que NO hay ningún movimiento
@@ -2144,7 +3067,7 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   const bloquesAnticipos = [];
 
   const { consolidados, depositosIdentificados } =
-    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket);
+    consolidarCargos(contadoNormal, 21, false, verdadBancaria, nombresClientes, bancoRealPorTicket, cuentaDepositosReal, netpayInfo);
 
   const ventasYClubTuberos = enriquecerConceptoConCliente(
     [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
@@ -2232,16 +3155,26 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     // real en banco o saldo a favor) — confirmado con el usuario 2026-07-23.
     // Dentro de cada lado, la cuenta de Ingresos/Devoluciones va antes que la
     // de IVA (`conImpuestoAlFinal`).
-    // Anticipo siempre lleva subcódigo 22, sin importar cómo se cobró —
-    // mismo fix que en `bloquesAjustesContado` (Contado); antes solo se
-    // etiquetaba `_categoria: 'anticipo'` sin asignar el subcódigo.
-    const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
+    // Anticipo: ningún anticipo debe llevar el subcódigo 22 (2026-09-15,
+    // confirmado con el usuario — mismo fix que en `bloquesAjustesContado`).
+    const extra = {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));
-    // OPA (anticipo sin NC) — ver comentario equivalente en `bloquesAjustesContado`.
-    const esOpa = categoria === 'anticipo' && grupo.some(m => m.reglaNombre === 'OPA');
-    const bloque = esOpa ? [...abonos, ...cargos] : [...cargos, ...abonos];
+    // Anticipo ESTÁNDAR: el Cargo NUNCA se muestra — ver comentario
+    // equivalente en `bloquesAjustesContado` (mismo fix, 2026-08-27, mismo
+    // criterio para Contado y Crédito). OPA es la excepción — ver comentario
+    // equivalente en `bloquesAjustesContado` (fix 2026-08-28).
+    const cargosOPA = cargos.filter(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    // OPA-REVERSION se oculta del export por completo — ver comentario
+    // equivalente en `bloquesAjustesContado` (confirmado con el usuario
+    // 2026-09-15). Un grupo cuyo único cargo-anticipo es la reversión (sin
+    // ningún 'OPA' de cierre en el mismo grupo) es exactamente el Egreso que
+    // revierte la venta; sigue persistido en Postgres, solo deja de mostrarse.
+    if (categoria === 'anticipo' && cargosOPA.length > 0 && cargosOPA.every(m => m.reglaNombre === 'OPA-REVERSION')) {
+      continue;
+    }
+    const bloque = categoria === 'anticipo' ? [...cargosOPA, ...abonos] : [...cargos, ...abonos];
     bloques.push({ categoria, bloque });
   }
 
@@ -2351,7 +3284,32 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // VENDEDOR de una factura PPD (Clientes/cuenta puente), que comparte el
   // mismo `cfdiUuid` que el lado cobrador — confirmado con el usuario
   // 2026-08-04.
-  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.cfdiUuid, serie: m.serie })));
+  // En líneas de Cobranza partidas por factura, `facturaUuid` (uuid real de
+  // la factura liquidada) tiene prioridad sobre `cfdiUuid` (uuid del Pago) —
+  // bank_movements.erpLinks.folioFiscal se liga al uuid de la factura
+  // original, no al del Pago que la liquida (confirmado con datos reales
+  // 2026-09-01, ver diag-bancario-pago.js). Para Ingreso `facturaUuid` nunca
+  // se llena, así que este cambio no afecta ese flujo.
+  // `fechaFinal` (el día de esta póliza) se pasa para desambiguar cuando el
+  // mismo ticket/factura tiene 2+ depósitos reales ligados en fechas
+  // distintas (ver docstring de `construirVerdadBancaria`, caso real CEDIS
+  // 12-sep).
+  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal);
+  // "Depósitos consolidados (Efectivo)"/"(Tarjeta)" — confirmado con el
+  // usuario 2026-09-10: para TODAS las sucursales, ambos van a la cuenta
+  // bancaria real 1102011001 (BBVA) en vez de las genéricas Caja/Bancos por
+  // identificar. Distinto de `verdadBancaria` (que resuelve por cfdiUuid,
+  // caso a caso): este es un default FIJO por etiqueta de consolidado, sin
+  // importar la factura — no toca "Cobro de otra sucursal" (`_extraerCobrosSucursal`
+  // ya lo saca de este pipeline antes de llegar a `consolidarCargos`).
+  const cuentaDepositosReal = await AccountPlan.findOne({
+    where: { codigo: '1102011001' }, attributes: ['id', 'codigo', 'nombre'], raw: true,
+  });
+  // NetPay: depósito neto real + comisión para las ventas Tarjeta cobradas
+  // por una terminal NetPay conocida (ver `construirNetpayInfo`) — sobre
+  // `movimientos` ya filtrado por `overrides.centroCostoIds` (arriba), así
+  // que respeta el mismo alcance de sucursales que el resto del export.
+  const netpayInfo = await construirNetpayInfo(movimientos, fechaFinal);
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
   // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.
@@ -2362,7 +3320,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // Cobros de sucursal: se sacan ANTES del pipeline de Contado/Crédito (nunca
   // deben pasar por consolidarCargos) y se reinyectan ya armados una vez que
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
-  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos } = _extraerCobrosSucursal(movimientos);
+  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(movimientos);
   movimientos = movimientosSinCobroSucursal;
 
   // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
@@ -2407,7 +3365,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // mismo principio que ya usa el resto de sucursales cuando falta
       // Contado o Crédito (folios consecutivos, sin huecos).
       const cSplit = contado.length > 0
-        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket })
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
@@ -2446,7 +3404,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
           // factura) — refleja el depósito real de caja/banco del periodo.
           {
             tipoVenta: 'Contado',
-            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket }),
+            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo }),
             folio:     overrides.folioContado   ?? poliza.numero,
             concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
@@ -2463,7 +3421,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       : [{
           tipoVenta: null,
           movs:      contado.length > 0
-            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket })
+            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
             : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
           folio:     overrides.folioContado   ?? poliza.numero,
           concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),
@@ -2485,7 +3443,94 @@ async function exportContpaqXlsx(id, overrides = {}) {
     }];
   }
 
-  _inyectarCobrosSucursal(bloques, filasCobroSucursal);
+  _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
+
+  // Retiros de EFECTIVO de caja (/desgloses-salidas/caja) — se restan de
+  // "Depósitos consolidados (Efectivo)" y se anotan en el desglose
+  // (_detalle) para que quede visible de dónde salió el ajuste. Confirmado
+  // con el usuario 2026-09-11 (caso real Hidalgo 3-sep: RETIRO DE EFECTIVO
+  // $253,965.64). Solo Ingreso (tipo 'I') — Pagos/Egresos no tienen esta línea.
+  //
+  // El nombre exacto de `tipoMovimiento` varía día a día (verificado con
+  // datos reales: 3-sep solo trae "RETIRO DE EFECTIVO"; 1-sep en cambio trae
+  // "RETIRO POR FALTANTE DE EFECTIVO EN EL CIERRE DE SESIÓN" y "RETIRO POR
+  // DEVOLUCION Y/O CANCELACION DE VENTA", pero NO "RETIRO DE EFECTIVO") — por
+  // eso se hace match por PREFIJO ("RETIRO...") en vez de una lista fija de
+  // nombres exactos, confirmado con el usuario el mismo día para estos 3
+  // casos. "Salida por Transferencia" y "CIERRE CAJA" NUNCA se restan — ese
+  // efectivo se convirtió en un depósito bancario real que ya se cuenta
+  // aparte (restarlo también duplicaría la resta), y ninguno de los dos
+  // empieza con "RETIRO" así que el prefijo ya los excluye por sí solo.
+  //
+  // "RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA" se EXCLUYE a propósito
+  // del match por prefijo — investigado y CONFIRMADO doble conteo real
+  // 2026-09-11 (Hidalgo 1-sep, póliza 755): el ERP ya reportaba este mismo
+  // retiro ($337.99, ticket B0-260900062) como ajuste `SF-RETIRO-EFECTIVO`
+  // DENTRO del consolidado de Venta/Efectivo (ver `ajustesEfectivoRetiroSF`
+  // en cfdi-poliza-generator.service.js — devolución que genera Saldo a Favor
+  // y el cliente lo retira en efectivo, mismo monto exacto). Restarlo TAMBIÉN
+  // aquí duplicaba la resta. Ambos mecanismos parten del mismo dato real
+  // (`usos[].serieOrigen==='ABO'` en `/saldos-favor`, que es el mismo evento
+  // que `/desgloses-salidas/caja` reporta con este tipoMovimiento) — por eso
+  // se excluye explícitamente, aunque SÍ empiece con "RETIRO".
+  const RETIRO_EXCLUIDO_DOBLE_CONTEO = 'RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA';
+  if (poliza.tipo === 'I') {
+    const fechaYMD = fechaFinal.toISOString().slice(0, 10);
+    // `centroCosto`/`centroCostoObj.clave` (ej. "111") es la clave NUMÉRICA
+    // que se muestra en columna/se usa para agrupar líneas — el ERP no la
+    // reconoce como "almacen". El endpoint espera `serieFacturacion` (ej.
+    // "B0"), un campo DISTINTO del mismo `CentroCosto` (bug real 2026-09-11:
+    // usar `clave` aquí hacía que /desgloses-salidas/caja nunca encontrara
+    // nada, sin lanzar error — la resta simplemente nunca se aplicaba).
+    const serieDeClave = new Map(); // clave (ej. "111") → serieFacturacion (ej. "B0")
+    for (const m of movimientos) {
+      const clave = m.centroCostoObj?.clave ?? m.centroCosto ?? null;
+      const serie = m.centroCostoObj?.serieFacturacion ?? null;
+      if (clave && serie && !serieDeClave.has(clave)) serieDeClave.set(clave, serie);
+    }
+    if (serieDeClave.size) {
+      const retirosPorCentro = new Map(); // clave → monto (para emparejar con mov.centroCosto)
+      for (const [claveCentro, serieAlmacen] of serieDeClave) {
+        let salidas = [];
+        try {
+          salidas = await obtenerDesglosesSalidasCajaPorAlmacen({
+            rfc: poliza.rfc, almacen: serieAlmacen,
+            fechaDesde: `${fechaYMD}T00:00:00-06:00`, fechaHasta: `${fechaYMD}T23:59:59-06:00`,
+          });
+        } catch (e) {
+          // Solo-lectura/informativo — si el ERP falla, no debe tumbar el export completo.
+          const { logger } = require('../../../shared/utils/logger');
+          logger.warn(`[exportContpaqXlsx] /desgloses-salidas/caja falló para ${serieAlmacen} ${fechaYMD}: ${e.message}`);
+          continue;
+        }
+        const retiroEfectivo = salidas
+          .filter(s => {
+            const nombre = (s.tipoMovimiento?.nombre || '').trim().toUpperCase();
+            return nombre.startsWith('RETIRO') && nombre !== RETIRO_EXCLUIDO_DOBLE_CONTEO;
+          })
+          .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
+        if (retiroEfectivo > 0) retirosPorCentro.set(claveCentro, Math.round(retiroEfectivo * 100) / 100);
+      }
+
+      if (retirosPorCentro.size) {
+        for (const bloque of bloques) {
+          for (const mov of bloque.movs) {
+            if (mov.concepto !== 'Depósitos consolidados (Efectivo)') continue;
+            const retiro = retirosPorCentro.get(mov.centroCosto);
+            if (!retiro) continue;
+            const netoAjustado = Math.round((Number(mov.debe) - Number(mov.haber || 0) - retiro) * 100) / 100;
+            mov.debe  = netoAjustado > 0 ? netoAjustado : 0;
+            mov.haber = netoAjustado < 0 ? Math.abs(netoAjustado) : 0;
+            if (!Array.isArray(mov._detalle)) mov._detalle = [];
+            mov._detalle.push({
+              cfdiUuid: null, serie: null, monto: -retiro, formaPago: 'EFECTIVO',
+              nota: 'RETIRO DE EFECTIVO (salida de caja)',
+            });
+          }
+        }
+      }
+    }
+  }
 
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
@@ -2509,19 +3554,21 @@ async function exportContpaqXlsx(id, overrides = {}) {
     for (const grupo of gruposOrdenados) {
       const bloquesGrupo = bloquesPorGrupo.get(grupo);
       if (bloquesGrupo.length === 0) continue;
-      // "Otros Ingresos" (SF ≤ $50) va solo en el archivo de Ventas — ahí es
-      // donde se inyectan los cobros de sucursal (_inyectarCobrosSucursal).
+      // "Otros Ingresos" y "Saldos a favor usados" van solo en el archivo de
+      // Ventas — ahí es donde se inyectan los cobros de sucursal
+      // (_inyectarCobrosSucursal).
       const otrosIngresosGrupo = grupo === 'Ventas' ? filasOtrosIngresos : [];
+      const saldoFavorUsadoGrupo = grupo === 'Ventas' ? filasSaldoFavorUsado : [];
       workbooks.push({
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo),
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo),
       });
     }
     return { poliza, workbooks };
   }
 
-  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos);
+  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado);
   return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
 }
 
@@ -2532,7 +3579,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = []) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = []) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -2613,32 +3660,56 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       // la etiqueta va en reglaNombre, no en serie -- `serie` es varchar(25) en
       // Postgres y no le cabe "COS-TRANSFERENCIA".
       const columnaC = /^COS\b/.test(m.reglaNombre || '') ? m.reglaNombre : (m.serie || '');
-      const row = sheet.addRow([
-        'M1',
-        Number(m.cuenta?.codigo),
-        columnaC,
-        esCargo ? 0 : 1,
-        esCargo ? Number(m.debe) : Number(m.haber),
-        m._subcodigo ?? 0,
-        0,
-        m.concepto || '',
-        m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-      ]);
-      // Monto (columna E) siempre con 2 decimales — sin esto, $199.90 se ve
-      // como "199.9" en Excel (igual que ya se fuerza `numFmt` en la fecha
-      // del encabezado). No cambia el valor real de la celda que lee
-      // CONTPAQ, solo cómo se despliega (confirmado con el usuario 2026-08-07).
-      row.getCell(5).numFmt = '#,##0.00';
-      // Cada categoría de ajuste (Devolución, Descuento, Bonificación, Club
-      // Tuberos, Anticipo) lleva su propio color fijo — tanto en Contado
-      // (`consolidarCargos`) como en Crédito (`moverAjustesAlFinal`) — para
-      // distinguirlas a simple vista del resto de los movimientos del bloque.
-      const colorFila = m._categoria ? COLOR_CATEGORIA[m._categoria]
-        : m._esResto ? 'FFF2F2F2'
-        : FILL_ALTERNADO[colorIdx];
-      row.eachCell({ includeEmpty: true }, (cell) => {
-        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colorFila } };
-      });
+      // `cuentaFaltante` (cuenta no encontrada en el catálogo, ej. código mal
+      // configurado en una regla): sin este resguardo, `Number(undefined)` =
+      // NaN se escribía literalmente en la celda (`<v>NaN</v>`, inválido en el
+      // XML de Excel) — Excel entero rechazaba el archivo con "se encontró un
+      // problema con el contenido" en vez de solo esa línea (confirmado con
+      // el usuario 2026-09-01). 0 dentro de un archivo que además marca
+      // `cuentaFaltante` es una señal clara de "corregir manualmente", nunca
+      // se confunde con una cuenta real (ningún código empieza en 0).
+      const _numOr0 = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+      // Bucket consolidado (Depósitos consolidados, etc.) cuyo neto cae en
+      // $0.00 -- ej. un cargo cancelado exactamente por una NC/ajuste dentro
+      // del mismo bucket -- no aporta nada al balance de la póliza, solo
+      // ruido visual (confirmado con el usuario 2026-09-03, caso real cuentas
+      // 1101010003/1102012001). Se oculta SOLO de esta hoja; el detalle sigue
+      // intacto en "Desglose Consolidado" (más abajo) para poder auditarlo.
+      const esLineaCeroConsolidada = m._esResto
+        && Math.abs(_numOr0(m.debe)) < 0.005 && Math.abs(_numOr0(m.haber)) < 0.005;
+      if (!esLineaCeroConsolidada) {
+        const row = sheet.addRow([
+          'M1',
+          _numOr0(m.cuenta?.codigo),
+          columnaC,
+          esCargo ? 0 : 1,
+          esCargo ? _numOr0(m.debe) : _numOr0(m.haber),
+          m._subcodigo ?? 0,
+          0,
+          m.concepto || '',
+          m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        ]);
+        // Monto (columna E) siempre con 2 decimales — sin esto, $199.90 se ve
+        // como "199.9" en Excel (igual que ya se fuerza `numFmt` en la fecha
+        // del encabezado). No cambia el valor real de la celda que lee
+        // CONTPAQ, solo cómo se despliega (confirmado con el usuario 2026-08-07).
+        row.getCell(5).numFmt = '#,##0.00';
+        // Cada categoría de ajuste (Devolución, Descuento, Bonificación, Club
+        // Tuberos, Anticipo) lleva su propio color fijo — tanto en Contado
+        // (`consolidarCargos`) como en Crédito (`moverAjustesAlFinal`) — para
+        // distinguirlas a simple vista del resto de los movimientos del bloque.
+        const colorFila = m._sinAutorizacion ? 'FFFFC7CE'
+          : m._categoria ? COLOR_CATEGORIA[m._categoria]
+          : m._esResto ? 'FFF2F2F2'
+          : FILL_ALTERNADO[colorIdx];
+        row.eachCell({ includeEmpty: true }, (cell) => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: colorFila } };
+          // Rojo estándar de Excel (relleno claro + texto oscuro) para que la
+          // fila destaque de inmediato como "falta número de autorización" —
+          // confirmado con el usuario 2026-09-14.
+          if (m._sinAutorizacion) cell.font = { ...(cell.font ?? {}), color: { argb: 'FF9C0006' } };
+        });
+      }
 
       if (m._detalle) {
         for (const d of m._detalle) {
@@ -2664,6 +3735,27 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
 
     for (const uuid of uuidsOrdenados) {
       sheet.addRow(['AD', uuid]);
+    }
+  }
+
+  // "DEPOSITO EN EFECTIVO" sin conciliar (confirmado con el usuario
+  // 2026-09-10): nunca se contabilizan en la póliza (ver `_esDepositoEfectivo`,
+  // cfdi-mapping.service.js) — solo aparecen aquí, en su propio apartado
+  // dentro de "Desglose Consolidado" (mismo mecanismo de encabezado por
+  // `formaPago` que ya separa Efectivo/Tarjeta más abajo).
+  if (poliza.depositosEfectivoNoConciliados?.length > 0) {
+    for (const d of poliza.depositosEfectivoNoConciliados) {
+      desgloseConsolidado.push({
+        cuenta:        null,
+        centroCosto:   d.centroCosto ?? '',
+        tipo:          'Depósito',
+        transferencia: 'No',
+        formaPago:     'DEPOSITOS EN EFECTIVO',
+        cfdiSerie:     d.serie ?? '',
+        cliente:       nombresClientes.get((d.cfdiUuid || '').toUpperCase()) || '',
+        monto:         d.monto,
+        nota:          'SIN CONCILIAR (no se contabiliza)',
+      });
     }
   }
 
@@ -2718,9 +3810,11 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     wsDesglose.autoFilter = { from: 'A1', to: 'G1' };
   }
 
-  // Hoja "Otros Ingresos": Saldo a Favor de $50 o menos — no se contabilizan
-  // en la póliza (ver `_extraerCobrosSucursal`/UMBRAL_SF_OTROS_INGRESOS),
-  // solo quedan aquí como informativo (confirmado con el usuario 2026-08-07).
+  // Hoja "Otros Ingresos": desde 2026-09-15 solo trae SF-OCULTO (generado y
+  // usado el mismo día/almacén, ver `ETIQUETA_SALDO_FAVOR_OCULTO`) — el SF
+  // usado normal (sin importar el monto) se movió por completo a su propia
+  // pestaña "Saldos a favor usados" (ver más abajo), reemplazando el criterio
+  // anterior de 2026-08-07 que solo movía aquí los ≤$50.
   if (filasOtrosIngresos.length > 0) {
     const wsOtrosIngresos = workbook.addWorksheet('Otros Ingresos');
     wsOtrosIngresos.columns = [
@@ -2745,6 +3839,34 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       row.getCell('monto').numFmt = '#,##0.00';
     }
     wsOtrosIngresos.autoFilter = { from: 'A1', to: 'E1' };
+  }
+
+  // Hoja "Saldos a favor usados": TODO el Saldo a Favor aplicado a una venta
+  // (sin importar el monto, confirmado con el usuario 2026-09-15) — sale por
+  // completo de "Cobro de otra sucursal" y de "Otros Ingresos" (donde antes
+  // solo aparecían los ≤$50) y se concentra únicamente aquí.
+  if (filasSaldoFavorUsado.length > 0) {
+    const wsSaldoFavorUsado = workbook.addWorksheet('Saldos a favor usados');
+    wsSaldoFavorUsado.columns = [
+      { header: 'Cuenta',        key: 'cuenta',      width: 14 },
+      { header: 'Sucursal',      key: 'centroCosto', width: 12 },
+      { header: 'Cliente / Serie-Folio', key: 'concepto', width: 40 },
+      { header: 'Monto',         key: 'monto',       width: 16 },
+    ];
+    wsSaldoFavorUsado.getRow(1).font = { bold: true };
+    wsSaldoFavorUsado.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    });
+    for (const f of filasSaldoFavorUsado) {
+      const row = wsSaldoFavorUsado.addRow({
+        cuenta:      f.cuenta?.codigo ?? '',
+        centroCosto: f.centroCosto ?? '',
+        concepto:    f.concepto ?? '',
+        monto:       Number(f.debe) || Number(f.haber) || 0,
+      });
+      row.getCell('monto').numFmt = '#,##0.00';
+    }
+    wsSaldoFavorUsado.autoFilter = { from: 'A1', to: 'D1' };
   }
 
   // Hoja de CFDIs sustitutos (tipoRelacion='04') excluidos automáticamente al
@@ -2828,6 +3950,46 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       row.getCell('monto').numFmt = '#,##0.00';
     }
     wsPorFacturar.autoFilter = { from: 'A1', to: 'I1' };
+  }
+
+  // Hoja de saldo a favor aplicado a una venta que sigue PPD/POR FACTURAR en
+  // Kore (2026-09-11, caso real CATEDRAL RESTAURANTE BAR, confirmado con el
+  // usuario) — informativo, NUNCA se contabilizó en esta póliza (mismo
+  // criterio que "Pendientes Por Facturar") — ver
+  // `_prefetchAjustesFacturaPropia` (cfdi-poliza-generator.service.js).
+  if (poliza.movimientosPpdPorFacturar?.length > 0) {
+    const wsPpd = workbook.addWorksheet('Movimientos PPD por facturar');
+    wsPpd.columns = [
+      { header: 'Cliente',              key: 'nombreCliente',    width: 28 },
+      { header: 'Serie',                key: 'serie',            width: 8 },
+      { header: 'Folio venta',          key: 'folio',            width: 16 },
+      { header: 'Monto SF aplicado',    key: 'montoSFAplicado',  width: 18 },
+      { header: 'Total de la venta',    key: 'totalVenta',       width: 18 },
+      { header: 'Fecha de la venta',    key: 'fechaVenta',       width: 16 },
+      { header: 'Fecha de aplicación',  key: 'fechaAplicacion',  width: 16 },
+      { header: 'Origen del saldo',     key: 'origenSaldo',      width: 20 },
+    ];
+    wsPpd.getRow(1).font = { bold: true };
+    wsPpd.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFE699' } };
+    });
+    for (const p of poliza.movimientosPpdPorFacturar) {
+      const row = wsPpd.addRow({
+        nombreCliente:   p.nombreCliente ?? 'CLIENTE NO IDENTIFICADO',
+        serie:           p.serie,
+        folio:           p.folio,
+        montoSFAplicado: p.montoSFAplicado,
+        totalVenta:      p.totalVenta,
+        fechaVenta:      p.fechaVenta ? new Date(p.fechaVenta) : null,
+        fechaAplicacion: p.fechaAplicacion ? new Date(p.fechaAplicacion) : null,
+        origenSaldo:     p.origenSaldo,
+      });
+      if (row.getCell('fechaVenta').value) row.getCell('fechaVenta').numFmt = 'm/d/yy hh:mm';
+      if (row.getCell('fechaAplicacion').value) row.getCell('fechaAplicacion').numFmt = 'm/d/yy hh:mm';
+      row.getCell('montoSFAplicado').numFmt = '#,##0.00';
+      if (row.getCell('totalVenta').value != null) row.getCell('totalVenta').numFmt = '#,##0.00';
+    }
+    wsPpd.autoFilter = { from: 'A1', to: 'H1' };
   }
 
   return workbook;
@@ -3370,6 +4532,87 @@ async function cancelarTodasCompensacionesIntereses({ rfc, polizaIds }, user, mo
   return { canceladas, errores, total: polizas.length };
 }
 
+// Base de numeración de folio CONTPAQ por sucursal (confirmado con el
+// usuario 2026-09-07, reemplaza cualquier convención anterior): cada
+// sucursal tiene su propio rango de 100 folios, y el conteo se reinicia
+// cada periodo/mes — la 1a póliza de Ingreso de Reforma en un mes es 501,
+// la 2a 502, etc. NUNCA se deriva de `poliza.numero` (consecutivo GLOBAL
+// compartido entre TODAS las sucursales para el mismo tipo/periodo, ver
+// `nextNumero` en poliza.repository.js — no tiene relación con el rango
+// esperado por sucursal). PROMOTORIA y LICITACION HIDALGO no tienen rango
+// asignado todavía — sin mapeo, `siguienteFolioContpaq` regresa `null` y el
+// caller cae al comportamiento anterior (folio manual / `poliza.numero`).
+const RANGO_FOLIO_CONTPAQ_POR_SUCURSAL = {
+  CEDIS:               100,
+  HIDALGO:             300,
+  CONSTRUCASA:         400,
+  REFORMA:             500,
+  ATZOMPA:             600,
+  FERROCARRIL:         700,
+  SIMBOLOS:            800,
+  TEHUANTEPEC:         900,
+  'SANTA ROSA':        1000,
+  VIGUERA:             1100,
+  'PUERTO ESCONDIDO':  1200,
+};
+
+/**
+ * Calcula el siguiente folio CONTPAQ sugerido para esta póliza, según la
+ * sucursal de sus movimientos (ver `RANGO_FOLIO_CONTPAQ_POR_SUCURSAL`) — solo
+ * el valor por DEFAULT que ve el usuario al abrir el formulario de export
+ * (`abrirExportContpaqForm` en poliza-list.component.ts); sigue siendo
+ * editable antes de exportar, igual que hoy. Si la sucursal no tiene rango
+ * asignado, regresa `{ folioContado: null, folioCredito: null }` (el caller
+ * cae al comportamiento anterior).
+ */
+async function siguienteFolioContpaq(id) {
+  const poliza = await repo.findByIdLight(id);
+  if (!poliza) throw new NotFoundError('Póliza');
+
+  const movimiento = await PolizaMovimiento.findOne({
+    where:      { polizaId: id },
+    attributes: ['id', 'centroCostoId'],
+    include:    [{ model: CentroCosto, as: 'centroCostoObj', attributes: ['id', 'sucursal'] }],
+  });
+  const sucursal = (movimiento?.centroCostoObj?.sucursal || '').toUpperCase().trim();
+  const rangoBase = RANGO_FOLIO_CONTPAQ_POR_SUCURSAL[sucursal];
+  if (!rangoBase || !movimiento?.centroCostoObj?.id) {
+    return { folioContado: null, folioCredito: null };
+  }
+
+  // Todas las pólizas de la MISMA sucursal+tipo+rfc+ejercicio+periodo — el
+  // folio más alto ya asignado (Contado o Crédito) determina el siguiente;
+  // sin ninguna asignada todavía este periodo, se arranca en `rangoBase + 1`.
+  // `include`+`where` en la tabla asociada produce un JOIN — una póliza con
+  // varios movimientos del mismo centro puede repetirse en el resultado, pero
+  // solo importa el MAX, así que los duplicados son inofensivos (no hace
+  // falta GROUP BY).
+  // Excluye 'cancelada' (confirmado con el usuario 2026-09-10): al cancelar
+  // la póliza más reciente de un folio, ese número queda libre — la
+  // siguiente póliza debe volver a sugerirlo en vez de saltárselo. Solo
+  // "libera" folios que quedaron al tope (si 1204/1205 ya existen vigentes y
+  // se cancela 1203, el máximo sigue siendo 1205 → siguiente 1206, 1203
+  // sigue siendo un hueco intermedio).
+  const polizasDelPeriodo = await Poliza.findAll({
+    where:      { tipo: poliza.tipo, rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo, estado: { [Op.ne]: 'cancelada' } },
+    attributes: ['id', 'contpaqFolioContado', 'contpaqFolioCredito'],
+    include:    [{
+      model:      PolizaMovimiento,
+      as:         'movimientos',
+      attributes: [],
+      where:      { centroCostoId: movimiento.centroCostoObj.id },
+      required:   true,
+    }],
+  });
+  let maxFolio = 0;
+  for (const p of polizasDelPeriodo) {
+    if (p.contpaqFolioContado != null) maxFolio = Math.max(maxFolio, p.contpaqFolioContado);
+    if (p.contpaqFolioCredito != null) maxFolio = Math.max(maxFolio, p.contpaqFolioCredito);
+  }
+  const folioContado = maxFolio > 0 ? maxFolio + 1 : rangoBase + 1;
+  return { folioContado, folioCredito: folioContado + 1 };
+}
+
 async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
@@ -3389,7 +4632,7 @@ async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
 
 module.exports = {
   list, getById, create, update, cancel, cancelarTodas, listBorradorCandidatas, contabilizar, revertir, generarXmlSat,
-  reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
+  reporteDescuadradas, generarCierreIVA, exportContpaqXlsx, asociarFolioContpaq, siguienteFolioContpaq, reemplazarCuenta, resolverCuentasBanco,
   resolverCuentasPorCfdisIdentificados,
   // Pólizas Traspasos C.P. (2026-08-25)
   generarYGuardarTraspasos, exportContpaqTraspasosXlsx, resolverBankMovimientoDeTraspaso,
@@ -3400,4 +4643,9 @@ module.exports = {
   listBorradorCandidatasCompensacionesIntereses, cancelarTodasCompensacionesIntereses,
   _consolidarCargos: consolidarCargos, _moverAjustesAlFinal: moverAjustesAlFinal,
   _categorizarAjusteContado: categorizarAjusteContado, _categoriaDeGrupoCredito: categoriaDeGrupoCredito,
+  // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
+  // — expone funciones ya existentes para poder reproducir el pipeline real de
+  // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
+  _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _extraerCobrosSucursal, _armarBloqueContado: armarBloqueContado,
 };

@@ -10,7 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
-const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro } = require('../erp/erp-sync.service');
+const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -24,6 +24,11 @@ const {
 // Extrae los uuids de CFDIs relacionados de un CFDI — soporta tanto `uuids`
 // (array, formato ERP) como `uuid` (singular, formato SAT), según el origen.
 const _uuidsRelacionados = (cfdi) => (cfdi.cfdiRelacionados || []).flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []));
+
+// Debug temporal (2026-08-31): imprime por qué anticipoFolioRef no resuelve
+// para un CFDI puntual — activar con DEBUG_OPA_UUID=<uuid> (mayúsculas o
+// minúsculas, se normaliza). Seguro quitar después.
+const _DEBUG_OPA_UUID = (process.env.DEBUG_OPA_UUID || '').toUpperCase() || null;
 
 // El pre-fetch de relMetodoPagoMap/relFacturaMetaMap (más abajo, `relTipoUuidsProp`/
 // `relTipoUuidsGuard`) se calcula ANTES del merge con ERP, a partir del
@@ -87,6 +92,16 @@ const TIPO_MARCADORES_DEV = ['BON', 'BCT', 'DEV', 'CAC'];
 // cobros-sucursal-puente.service.js.
 const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 
+// Saldo a favor GENERADO que sigue COMPLETAMENTE sin usar (ningún `uso`
+// registrado) y es menor a $50 (2026-09-15, confirmado con el usuario) — a
+// diferencia de SF-OCULTO (que se oculta del export por completo), este SÍ
+// debe verse, pero en la hoja "Otros Ingresos" en vez de mezclado con el
+// resto de "Saldos a favor usados"/la póliza principal — es dinero tan
+// pequeño que probablemente nunca se reclame, se trata como ingreso menor.
+// `_extraerCobrosSucursal` (poliza.service.js) lo detecta por este
+// reglaNombre y lo redirige, mismo patrón que SF-OCULTO/COBRO-DIA-REAL.
+const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
+
 /**
  * Deduplica líneas de Saldo a Favor (SF/SF-OCULTO) que DOS mecanismos
  * independientes pueden detectar por separado para el MISMO saldo usado,
@@ -103,15 +118,36 @@ const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
  * el usuario 2026-08-18, caso real Global 89CF6A7F: DEV-055991 aparecía dos
  * veces, $365.16+$58.42 cada vez, una como 'Cargo Especial' y otra como
  * 'Cobro Sucursal').
+ *
+ * El concepto YA NO basta tal cual para la clave (bug real 2026-09-03, caso
+ * PJ CONSTRUCCIONES/D0-260803703): desde el sobrante visible (2026-09-01),
+ * el mecanismo (1) le agrega " (saldo disponible: $X.XX)" al concepto (ver
+ * `emitirLineaSF` en cfdi-mapping.service.js), pero el mecanismo (2) sigue
+ * armando el suyo sin ese sufijo (`conceptoSF` en cobros-sucursal-puente.
+ * service.js) — mismo evento, conceptos ahora distintos, el dedup dejaba de
+ * verlos como duplicados y aparecía DOS veces en vez de una. Se normaliza
+ * quitando el sufijo antes de comparar, y entre dos líneas que solo difieren
+ * en eso se conserva la que SÍ trae el sobrante (más informativa).
  */
+const _SUFIJO_SOBRANTE_SF_RE = / \(saldo disponible: \$[\d,.]+\)$/;
 function _deduplicarSFRedundante(movs) {
-  const vistos = new Set();
+  const claveBase = (m) => {
+    const conceptoBase = (m.concepto || '').replace(_SUFIJO_SOBRANTE_SF_RE, '');
+    return `${conceptoBase}|${m.cuentaId}|${Number(m.debe).toFixed(2)}|${Number(m.haber).toFixed(2)}`;
+  };
+  const elegidoPorClave = new Map();
+  for (const m of movs) {
+    if (m.reglaNombre !== 'SF' && m.reglaNombre !== ETIQUETA_SALDO_FAVOR_OCULTO) continue;
+    const key = claveBase(m);
+    const actual = elegidoPorClave.get(key);
+    if (!actual || (_SUFIJO_SOBRANTE_SF_RE.test(m.concepto || '') && !_SUFIJO_SOBRANTE_SF_RE.test(actual.concepto || ''))) {
+      elegidoPorClave.set(key, m);
+    }
+  }
   const resultado = [];
   for (const m of movs) {
     if (m.reglaNombre !== 'SF' && m.reglaNombre !== ETIQUETA_SALDO_FAVOR_OCULTO) { resultado.push(m); continue; }
-    const key = `${m.concepto}|${m.cuentaId}|${Number(m.debe).toFixed(2)}|${Number(m.haber).toFixed(2)}`;
-    if (vistos.has(key)) continue;
-    vistos.add(key);
+    if (elegidoPorClave.get(claveBase(m)) !== m) continue;
     resultado.push(m);
   }
   return resultado;
@@ -247,6 +283,17 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
   // Solo se popula en el camino fallback (sin centro+fecha), donde conocemos
   // los CFDIs del batch y podemos mapear venta → serie del CFDI de Devolución.
   const cfdiSeriePorVenta  = new Map();
+  // `cuenta.anticipos[]` (confirmado 2026-09-08): /saldos-favor ahora trae,
+  // por cada venta que aplicó un Anticipo, el UUID y folio REAL del Anticipo
+  // (`anticipoUuid`/`anticipoReferencia`) — a diferencia de
+  // `_resolverReferenciaOpaPorMonto` (Bancos, requiere depósito conciliado)
+  // y `_prefetchCuentasPendientesAnticipo` (`/cuentas-pendientes`, purga el
+  // registro al liquidarse), esta fuente da un match DIRECTO por UUID, sin
+  // heurístico de monto/fecha, y no depende de que el CFDI del Anticipo haya
+  // sincronizado en Mongo. Caso real que esto resuelve (2026-09-08): RAYMUNDO
+  // CUELLAR MENDOZA, anticipo `176AFBF3-...` nunca sincronizado — antes caía
+  // al fallback de serie-folio del Egreso, ahora resuelve "OPA-00175" real.
+  const anticipoFolioPorUuidDesdeSaldosFavor = {};
 
   if (centroPropioClave && fechaDesde && fechaHasta) {
     // Camino principal: consulta directa por centro+fecha — fuente única para
@@ -269,6 +316,11 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
         generadosPorCuenta.push({ cuenta, gen });
       }
+      for (const apl of (cuenta.anticipos ?? [])) {
+        if (apl?.anticipoUuid && apl?.anticipoReferencia) {
+          anticipoFolioPorUuidDesdeSaldosFavor[apl.anticipoUuid.toUpperCase()] = apl.anticipoReferencia;
+        }
+      }
     }
     for (const cuenta of cuentasAlm) {
       const k = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
@@ -290,7 +342,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         return (marcador && venta) ? { marcador, venta, cfdiSerie: cfdi.serie ?? null } : null;
       })
       .filter(Boolean);
-    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+    if (!devolucionesConVenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor: {} };
     devolucionesConVenta.forEach(d => cfdiSeriePorVenta.set(`${d.venta.serie}|${d.venta.folio}`, d.cfdiSerie));
 
     const LOTE = 150;
@@ -305,9 +357,14 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
           generadosPorCuenta.push({ cuenta, gen });
         }
+        for (const apl of (cuenta.anticipos ?? [])) {
+          if (apl?.anticipoUuid && apl?.anticipoReferencia) {
+            anticipoFolioPorUuidDesdeSaldosFavor[apl.anticipoUuid.toUpperCase()] = apl.anticipoReferencia;
+          }
+        }
       }
     }
-    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set() };
+    if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor };
 
     const paresGeneracion = [...new Map(
       generadosPorCuenta.map(({ cuenta }) => [`${cuenta.serieVenta}|${cuenta.folioVenta}`, { serie: cuenta.serieVenta, folio: cuenta.folioVenta }]),
@@ -331,11 +388,67 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     }
   }
 
-  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [] };
+  if (!generadosPorCuenta.length) return { mapa: new Map(), devsOcultos: new Set(), ajustesEfectivoRetiroSF: [], anticiposConvertidos: [], anticipoFolioPorUuidDesdeSaldosFavor };
+
+  // Descarta generaciones de SF cuyo documento origen (BON/DEV/CAC/BCT) está
+  // CANCELADO en el SAT sin sustituto — confirmado con el usuario 2026-09-08,
+  // caso real BON-314125 ($56.46, CONSTRUCASA): `/saldos-favor` lo sigue
+  // reportando como generado a pesar de que el CFDI (`DD129D7A-...`) tiene
+  // `satStatus:'Cancelado'` y no existe ningún CFDI que lo sustituya (SAT no
+  // lo retira del reporte del ERP con la cancelación). Un documento cancelado
+  // sin sustituto nunca tuvo efecto fiscal real, así que el saldo a favor que
+  // "generó" tampoco debería existir. Se busca por el marcador (Serie/Folio
+  // dentro de `documentosRelacionados`, no el serie/folio propio del CFDI —
+  // mismo criterio que usa el resto de este archivo para localizar NCs), y
+  // solo se descarta si se encuentra el CFDI Y ninguna copia (SAT/ERP) está
+  // Vigente — si no se encuentra nada, se deja pasar (no penalizar por falta
+  // de sincronización, mismo criterio que el resto de los guards de este
+  // archivo).
+  const marcadoresGen = [...new Map(
+    generadosPorCuenta
+      .filter(({ gen }) => gen.serieOrigen && gen.folioOrigen)
+      .map(({ gen }) => {
+        const serie = gen.serieOrigen.toUpperCase();
+        return [`${serie}|${gen.folioOrigen}`, { serie, folio: gen.folioOrigen }];
+      }),
+  ).values()];
+  const cfdisOrigenCancelados = new Set();
+  if (marcadoresGen.length) {
+    const cfdisOrigen = await CFDI.find({
+      $or: marcadoresGen.map(({ serie, folio }) => ({ documentosRelacionados: { $elemMatch: { Serie: serie, Folio: folio } } })),
+    }).select('documentosRelacionados satStatus').lean();
+    const vigentePorMarcador = new Map(); // clave -> boolean (true si al menos una copia esta Vigente)
+    for (const c of cfdisOrigen) {
+      for (const d of (c.documentosRelacionados ?? [])) {
+        const clave = `${(d.Serie ?? '').toUpperCase()}|${d.Folio}`;
+        if (!marcadoresGen.some(m => `${m.serie}|${m.folio}` === clave)) continue;
+        vigentePorMarcador.set(clave, (vigentePorMarcador.get(clave) ?? false) || c.satStatus === 'Vigente');
+      }
+    }
+    for (const { serie, folio } of marcadoresGen) {
+      const clave = `${serie}|${folio}`;
+      if (vigentePorMarcador.has(clave) && !vigentePorMarcador.get(clave)) cfdisOrigenCancelados.add(clave);
+    }
+  }
+  const generadosFiltrados = cfdisOrigenCancelados.size
+    ? generadosPorCuenta.filter(({ gen }) => !cfdisOrigenCancelados.has(`${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen}`))
+    : generadosPorCuenta;
 
   // Armar `mapa`/`devsOcultos` ya con los dos lados resueltos.
   const mapa = new Map();
   const devsOcultos = new Set();
+  // Conversión SF→Anticipo reportada NATIVAMENTE por /saldos-favor (campo
+  // `gen.anticipo`, confirmado 2026-09-08) — a diferencia del guard viejo
+  // (`_esConversionAAnticipoPorMonto`/`_prefetchCuentasPendientesAnticipo`),
+  // esta señal sale del mismo endpoint que ya es la única fuente de verdad
+  // para SF (regla confirmada 2026-09-04), así que no depende de que
+  // `/cuentas-pendientes` siga listando el Anticipo como pendiente (ese
+  // endpoint purga el registro en cuanto se liquida, ver docstring de
+  // `_esConversionAAnticipoPorMonto`). Se usa en 2 lugares: (1) como guard
+  // primario en `_inyectarSaldoFavorGenerado` (vía `anticipoReferencia` en
+  // `mapa`), y (2) para recuperar el folio OPA real cuando ese Anticipo se
+  // consuma después (`_resolverReferenciaOpaDesdeSaldosFavor`).
+  const anticiposConvertidos = []; // [{ monto, fecha, anticipoReferencia }]
   // Retiros en EFECTIVO del saldo a favor (serieOrigen='ABO' dentro de
   // `usos`, confirmado con el usuario 2026-08-19: un "ABO" no es otra venta
   // que consume el saldo, es al cliente sacando su saldo en efectivo de
@@ -344,8 +457,15 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
   // Cargo NEGATIVO, sin fila propia), SIEMPRE — sin importar si el saldo
   // generado terminó en $0 ese día o le quedó un remanente pendiente.
   const ajustesEfectivoRetiroSF = [];
-  for (const { cuenta, gen } of generadosPorCuenta) {
+  for (const { cuenta, gen } of generadosFiltrados) {
     const key = `${gen.serieOrigen}|${gen.folioOrigen}`;
+    if (gen.anticipo?.anticipoReferencia) {
+      anticiposConvertidos.push({
+        monto: Number(gen.anticipo.monto ?? gen.monto) || 0,
+        fecha: gen.anticipo.fecha ?? gen.fecha ?? null,
+        anticipoReferencia: gen.anticipo.anticipoReferencia,
+      });
+    }
     const usos     = gen.usos ?? [];
     const usoUnico = usos.length === 1 ? usos[0] : null;
     // _diaMx: hora México (UTC-6) — sin esto, eventos después de las 6pm local
@@ -432,10 +552,22 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     // venta generó Y consumió el saldo a favor (uso completo, sin sobrante).
     // Guard: solo si ambas ventas tienen serie+folio no nulos, para evitar
     // que dos saldos sin venta asociada se igualen falsamente por `null===null`.
+    // Además requiere MISMO DÍA (`diaGen === diaUso`, igual que `oculto` arriba)
+    // -- bug real 2026-09-03, caso Hidalgo, venta B0-260705994: el saldo se
+    // generó el 11-ago y no se consumió hasta el 1-sep (3 semanas y un periodo
+    // después, confirmado con la "Cuenta saldada" real del ERP: RET 260806905
+    // 11-ago -$22,239.13, RET 260900377 1-sep +$22,239.13) -- sin este guard,
+    // `mismoFolio` daba true solo por compartir serie+folio, tratándolo como
+    // "salida de caja que ya volvió a entrar" el mismo día y restándolo
+    // directo de Caja/Bancos en AGOSTO, cuando en realidad a cierre de agosto
+    // seguía siendo un pasivo real sin usar (el reporte real de Movimientos en
+    // Caja del 11-ago no tiene NINGÚN movimiento de este monto, confirmando
+    // que nunca fue una salida/entrada de efectivo real ese día).
     const mismoFolio = !!(usoUnico && usoCompleto
       && cuenta.serieVenta && cuenta.folioVenta
       && String(cuenta.serieVenta) === String(usoUnico.serieVenta)
-      && String(cuenta.folioVenta) === String(usoUnico.folioVenta));
+      && String(cuenta.folioVenta) === String(usoUnico.folioVenta)
+      && diaGen && diaUso && diaGen === diaUso);
 
     // Monto a EMITIR como Abono de Saldo a Favor:
     // - Si el día cierra en $0 (oculto, ver arriba) se usa `saldoRestanteSF`
@@ -468,10 +600,11 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         ? (_formaPagoDominante(cobrosPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)) ?? prev?.formaPagoReal ?? null)
         : (prev?.formaPagoReal ?? null),
       centroProcesamiento: centro ?? prev?.centroProcesamiento ?? null,
+      anticipoReferencia: gen.anticipo?.anticipoReferencia ?? prev?.anticipoReferencia ?? null,
     });
   }
 
-  return { mapa, devsOcultos, ajustesEfectivoRetiroSF };
+  return { mapa, devsOcultos, ajustesEfectivoRetiroSF, anticiposConvertidos, anticipoFolioPorUuidDesdeSaldosFavor };
 }
 
 /**
@@ -577,7 +710,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     cfdi.tipoDeComprobante === 'I' && cfdi.serie && cfdi.folio &&
     rule?.cuentaCargo && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo),
   );
-  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map() };
+  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map(), movimientosPpdPorFacturar: [] };
   if (!candidatos.length) return vacio;
 
   // Día de CADA factura (México) — para filtrar cobros/usos que coinciden en
@@ -615,6 +748,25 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
+  // Saldo a favor usado en una venta CONSUMIDORA que, según /cuentas-pendientes,
+  // sigue tipoPago='PPD' y nombreTipoMovimiento='POR FACTURAR' (2026-09-11,
+  // caso real CATEDRAL RESTAURANTE BAR, Hidalgo 4-sep-2026, confirmado con el
+  // usuario) — informativo, NUNCA se contabiliza en la póliza (mismo criterio
+  // que `pendientesPorFacturar`): mientras esa venta no tenga su propia
+  // factura real, el Cargo Especial de SF no debe aparecer en el bloque
+  // normal — se lista aparte en la hoja "Movimientos PPD por facturar" (ver
+  // `_construirWorkbookPoliza`, poliza.service.js).
+  const movimientosPpdPorFacturar = [];
+  // Monto REAL de anticipo aplicado a esta venta, desde el desglose de Kore
+  // (formaPago nombre='ANTICIPO', mismo claveSat='30' que "SALDO A FAVOR" pero
+  // texto distinto — confirmado con el usuario 2026-08-28, caso real AIDA
+  // ISLAS ACEVEDO F0-260800426: $518.74 de anticipo + $18.24 Efectivo real).
+  // Usado por el cierre "Aplicación de anticipo sin NC" (`anticipoFolioRefProp`
+  // más abajo) para NO asumir que el anticipo cubre el 100% de la venta —
+  // antes de este fix, si además había un tipoRelacion='07' en el CFDI, se
+  // cerraba el Abono Ingresos+IVA COMPLETO contra Anticipos/IVA-anticipo, sin
+  // dejar rastro del Efectivo real que sí entró aparte.
+  const anticipoUsado = new Map();    // `${serie}|${folio}` → monto
 
   // Fuente de los cobros reales — confirmado con el usuario 2026-08-14:
   // reemplaza POR COMPLETO la consulta por serie/folio propio cuando se
@@ -698,6 +850,27 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // `TOLERANCIA_DIAS_FACTURACION_DIFERIDA` (el vínculo ya es exacto, no una
   // adivinanza por fecha).
   if (ticketsPropioPorClave.size) {
+    const ticketsPropioVentaKeys = new Set(
+      [...ticketsPropioPorClave.values()].map(t => `${t.serie}|${t.folio}`),
+    );
+    // Bug real 2026-09-10 (caso SD SOLUTIONS, F0-260900061 timbrada
+    // 04-sep pero su ticket F0-260900334 cobrado y con SF usado el 03-sep):
+    // `_viaTicketPropio` solo se marcaba en las cuentas traídas por el
+    // fallback de abajo (`faltantes`) — si el camino "por centro" YA había
+    // traído la cuenta del ticket (por pura coincidencia de rango de
+    // fechas, sin saber que es un "ticket propio"), esa cuenta se quedaba
+    // SIN la bandera, y el filtro de mismo-día (`diaCfdi === _diaMx(u.fecha)`
+    // más abajo) descartaba el uso de SF por completo — ni el día del
+    // cobro real (no tiene la factura) ni el día de la factura (el cobro
+    // real es de OTRO día) lo mostraban nunca. Se marca la bandera en
+    // CUALQUIER cuenta ya presente cuyo serie/folio sea un ticket propio
+    // conocido, sin importar qué camino la trajo.
+    for (const c of resultadosAlmacen) {
+      if (ticketsPropioVentaKeys.has(`${c.serieVenta}|${c.folioVenta}`)) c._viaTicketPropio = true;
+    }
+    for (const c of resultadosSaldos) {
+      if (ticketsPropioVentaKeys.has(`${c.serieVenta}|${c.folioVenta}`)) c._viaTicketPropio = true;
+    }
     const yaPresentes = new Set(resultadosAlmacen.map(c => `${c.serieVenta}|${c.folioVenta}`));
     const faltantes = [...ticketsPropioPorClave.values()]
       .filter(t => !yaPresentes.has(`${t.serie}|${t.folio}`));
@@ -878,6 +1051,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const diaCfdi = diaCfdiPorClave.get(key);
       const formasPago = [];
       let montoPuntos = 0;
+      let montoAnticipo = 0;
       for (const cobro of (cuenta.cobros ?? [])) {
         // El cobro debe haber ocurrido el MISMO día que la factura (con
         // tolerancia de ±1 día por facturación diferida — ver
@@ -902,8 +1076,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // maneja aparte `cobros-sucursal-puente.service.js` (cuenta puente +
         // encolado para la sucursal cobradora). Sin este filtro, se sumaba
         // por partida doble: como Cargo normal aquí Y como cruce allá.
-        if (centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
+        // 'CCE' (Cobro Contra Entrega, 2026-09-08, caso real CONSTRUCASA
+        // C0-260806153 / Global C0-260900073): el ERP marca estos cobros con
+        // el `claveCentro` de la sucursal/ruta que hizo la entrega física
+        // (ej. A0), no de la sucursal que vendió (C0) — a diferencia de
+        // cualquier otro origen, esto NUNCA debe tratarse como "cobro de
+        // otra sucursal" (confirmado con el usuario): el dinero se queda
+        // contabilizado en la sucursal vendedora sin importar `claveCentro`.
+        if (origen !== 'CCE' && centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         // 'CBT' NO es exclusivamente Puntos/Club Tuberos — confirmado con
         // datos reales 2026-08-06: un mismo cobro CBT puede traer
         // EFECTIVO/TARJETA/TRANSFERENCIA/SALDO A FAVOR mezclados (parece ser
@@ -958,6 +1139,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // el reporte). Siempre 100% dinero real (nunca mezclado con saldo
           // a favor en los casos observados), así que se acepta igual que
           // ABO/CBT/CPF/CFC.
+        } else if (origen === 'CCE') {
+          // Ver comentario arriba (bypass del filtro de sucursal): dinero
+          // real de Cobro Contra Entrega, se acepta igual que MIS/APS/
+          // SERIES_CON_AUTH.
         } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }
@@ -989,6 +1174,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // (`saldoFavorUsado`, ver abajo), no este texto — mezclarlo en
           // `formasPago` lo trataría como Efectivo/Bancos real.
           if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+          // "ANTICIPO" (2026-08-28, caso real AIDA ISLAS ACEVEDO F0-260800426):
+          // mismo claveSat='30' que "SALDO A FAVOR" pero texto distinto — sin
+          // este filtro caía sin distinguir al bucket genérico de Bancos "por
+          // identificar" en `splitPorFormaPagoReal` (cfdi-mapping.service.js),
+          // como si fuera un depósito bancario real. Se acumula aparte
+          // (`montoAnticipo`) para el cierre de Anticipos/IVA-anticipo más
+          // abajo, con el monto REAL aplicado en vez de asumir el 100% de la
+          // venta.
+          if (/anticipo/i.test(fp.nombre ?? '')) { montoAnticipo += Number(fp.monto) || 0; continue; }
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
@@ -1047,6 +1241,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           puntosUsado.set(t.facturaKey, (puntosUsado.get(t.facturaKey) ?? 0) + montoRepartido);
         }
       }
+      if (montoAnticipo > 0) {
+        for (const t of targets) {
+          const peso = (t.total || (totalPeso / targets.length)) / totalPeso;
+          const montoRepartido = targets.length > 1 ? montoAnticipo * peso : montoAnticipo;
+          anticipoUsado.set(t.facturaKey, (anticipoUsado.get(t.facturaKey) ?? 0) + montoRepartido);
+        }
+      }
     }
 
     // Saldo a favor generado y consumido DENTRO de la misma Factura Global
@@ -1089,8 +1290,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const diaCfdi = diaCfdiPorClave.get(key);
       const ventaConsumidora = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
       const usados = (cuenta.saldosFavorUsados ?? [])
-        // Mismo exento que en `resultadosAlmacen` — ver `_viaTicketPropio`.
-        .filter(u => cuenta._viaTicketPropio || !diaCfdi || _diaMx(u.fecha) === diaCfdi)
+        // A diferencia del filtro de `resultadosAlmacen` (línea ~1050), aquí
+        // NO se exime por `_viaTicketPropio` — confirmado con el usuario
+        // 2026-09-10: cuando el uso real cae en un día distinto al de la
+        // factura (factura tardía), el SF usado debe mostrarse en el día
+        // REAL del uso (ver `_sfUsadoAntesDeFacturarPorCentro`, mecanismo
+        // independiente, mismo patrón que `_cobrosSinFacturaPorCentro` para
+        // Efectivo), no en el día de la factura — mostrarlo aquí TAMBIÉN
+        // sería contarlo dos veces entre ambos días.
+        .filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi)
         // Excluir SOLO el autoconsumo real (mismo ticket genera y usa su
         // propio saldo) — ver comentario arriba. Si el marcador no se
         // encuentra (Devolución con su propio CFDI, caso normal) o el ticket
@@ -1099,6 +1307,53 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       if (!usados.length) continue;
       const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
       if (monto <= 0) continue;
+
+      // PPD y "por facturar" (2026-09-11, caso real CATEDRAL RESTAURANTE BAR,
+      // Hidalgo 4-sep-2026, confirmado con el usuario): si la venta
+      // CONSUMIDORA de este saldo (`cuenta.serieVenta/folioVenta`) sigue
+      // siendo, según /cuentas-pendientes, una cuenta tipoPago='PPD' con
+      // nombreTipoMovimiento='POR FACTURAR', esta porción del saldo a favor
+      // NO se contabiliza como Cargo Especial normal — se lista aparte
+      // (informativo) hasta que esa venta tenga su propia factura real.
+      // Consulta acotada a 30 días desde `cuenta.fechaCreacion` (límite del
+      // ERP es 31 días) — si falla, no hay fecha, o el ERP no regresa nada,
+      // se asume que NO aplica (nunca oculta una línea real por error, mismo
+      // criterio que el resto de las consultas opcionales de esta función).
+      let esPpdPorFacturar = false;
+      let cuentaPpdInfo = null;
+      if (cuenta.serieVenta && cuenta.folioVenta && cuenta.fechaCreacion) {
+        try {
+          const fCreacion = new Date(cuenta.fechaCreacion);
+          const fHastaPpd = new Date(fCreacion.getTime() + 30 * 24 * 3600 * 1000);
+          const resultadoPpd = await sincronizarCuentasPendientes({
+            serieExterna: cuenta.serieVenta, folioExterno: cuenta.folioVenta,
+            fechaDesde: fCreacion.toISOString(), fechaHasta: fHastaPpd.toISOString(),
+          });
+          cuentaPpdInfo = (resultadoPpd?.raw ?? []).find(
+            c => c.serieExterna === cuenta.serieVenta && String(c.folioExterno) === String(cuenta.folioVenta),
+          ) ?? null;
+          esPpdPorFacturar = !!(cuentaPpdInfo
+            && cuentaPpdInfo.tipoPago === 'PPD'
+            && cuentaPpdInfo.nombreTipoMovimiento === 'POR FACTURAR');
+        } catch (err) {
+          const { logger } = require('../../../shared/utils/logger');
+          logger.warn(`[PolizaGen] Consulta PPD-por-facturar (${cuenta.serieVenta}-${cuenta.folioVenta}) falló, se ignora: ${err.message}`);
+        }
+      }
+      if (esPpdPorFacturar) {
+        movimientosPpdPorFacturar.push({
+          nombreCliente:  (cuentaPpdInfo.nombrePersona ?? '').trim() || 'CLIENTE NO IDENTIFICADO',
+          serie:          cuenta.serieVenta,
+          folio:          cuenta.folioVenta,
+          montoSFAplicado: Math.round(monto * 100) / 100,
+          totalVenta:     cuentaPpdInfo.total ?? null,
+          fechaVenta:     cuentaPpdInfo.fechaCreacion ?? cuenta.fechaCreacion ?? null,
+          fechaAplicacion: usados[0]?.fecha ?? null,
+          origenSaldo:    usados.map(u => [u.serieOrigen, u.folioOrigen].filter(Boolean).join('-')).filter(Boolean).join(', ') || null,
+        });
+        continue;
+      }
+
       const prevSF = saldoFavorUsado.get(key);
       saldoFavorUsado.set(key, {
         monto: (prevSF?.monto ?? 0) + monto,
@@ -1111,8 +1366,60 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           serieOrigen: u.serieOrigen ?? null, folioOrigen: u.folioOrigen ?? null,
           monto: Math.abs(Number(u.montoUsado)) || 0,
           ventaSerie: u.serieVenta ?? null, ventaFolio: u.folioVenta ?? null,
+          // Venta CONSUMIDORA (ticket que usó el saldo, no el que lo generó) y
+          // fecha exacta del uso — sirven solo para encontrar el `uso` correcto
+          // dentro de `gen.usos[]` al consultar por la venta origen abajo
+          // (`saldoSobrante`). Nunca se exponen fuera de esta función.
+          _consumidoraSerie: cuenta.serieVenta ?? null, _consumidoraFolio: cuenta.folioVenta ?? null,
+          // Saldo que le queda al cliente de ESTE origen después de este uso.
+          // El ERP NO manda este dato en `saldosFavorUsados[]` (confirmado
+          // 2026-09-01 con datos reales) — solo viene en
+          // `saldosFavorGenerados[].usos[].montoSobrante` de la VENTA QUE
+          // GENERÓ el saldo. Se completa más abajo con una consulta extra por
+          // esa venta origen. Puramente informativo: no afecta el `debe` real
+          // de la línea de Cargo — solo se usa para anotar "(saldo disponible:
+          // $X)" en el concepto cuando queda un remanente (ver `emitirLineaSF`
+          // en cfdi-mapping.service.js).
+          saldoSobrante: null,
         }))],
       });
+    }
+
+    // Completar `saldoSobrante`: consulta extra por cada venta ORIGEN distinta
+    // encontrada arriba (no la consumidora) para leer `usos[].montoSobrante` —
+    // ver comentario en el bucle de arriba sobre por qué no viene directo en
+    // `saldosFavorUsados[]`.
+    const origenesAConsultar = new Map();
+    for (const { detalle } of saldoFavorUsado.values()) {
+      for (const d of detalle) {
+        if (d.ventaSerie && d.ventaFolio) {
+          origenesAConsultar.set(`${d.ventaSerie}|${d.ventaFolio}`, { serie: d.ventaSerie, folio: d.ventaFolio });
+        }
+      }
+    }
+    if (origenesAConsultar.size > 0) {
+      const paresOrigen = [...origenesAConsultar.values()];
+      const usosPorMarcador = new Map(); // "SERIEORIGEN|folioOrigen" -> usos[]
+      const LOTE_ORIGEN = 150;
+      for (let i = 0; i < paresOrigen.length; i += LOTE_ORIGEN) {
+        const lote = paresOrigen.slice(i, i + LOTE_ORIGEN);
+        const cuentasOrigen = await obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
+        for (const cuentaOrigen of cuentasOrigen) {
+          for (const gen of (cuentaOrigen.saldosFavorGenerados ?? [])) {
+            usosPorMarcador.set(`${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`, gen.usos ?? []);
+          }
+        }
+      }
+      for (const entry of saldoFavorUsado.values()) {
+        entry.detalle = entry.detalle.map((d) => {
+          const usosOrigen = usosPorMarcador.get(`${(d.serieOrigen ?? '').toUpperCase()}|${d.folioOrigen ?? ''}`);
+          if (!usosOrigen) return d;
+          const usoMatch = usosOrigen.find(u => u.serieVenta === d._consumidoraSerie && u.folioVenta === d._consumidoraFolio
+            && Math.abs((Math.abs(Number(u.montoUsado)) || 0) - d.monto) < 0.01);
+          if (!usoMatch) return d;
+          return { ...d, saldoSobrante: Number.isFinite(Number(usoMatch.montoSobrante)) ? Number(usoMatch.montoSobrante) : null };
+        });
+      }
     }
   }
 
@@ -1174,6 +1481,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         if (origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
         for (const fp of (cobro.formasPago ?? [])) {
           if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+          // "ANTICIPO" — mismo criterio que `desglosePagoReal` (línea ~1175)
+          // y `_cobrosSinFacturaPorCentro` (línea ~2793): claveSat='30' igual
+          // que "SALDO A FAVOR" pero texto distinto; sin este filtro, un
+          // cobro cruzado de sucursal pagado con aplicación de anticipo se
+          // contaría como Cargo real (Efectivo/Tarjeta) cuando el dinero ya
+          // se reconoció al crearse el anticipo.
+          if (/anticipo/i.test(fp.nombre ?? '')) continue;
           const monto = (cobro.formasPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);
@@ -1186,6 +1500,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // mostrar el folio de factura llevaba a buscar un ticket equivocado en
           // Kore y comparar contra un saldo que no correspondía).
           const serFolTicket = `${cuenta.serieVenta || serie}-${cuenta.folioVenta ? String(cuenta.folioVenta) : folio}`;
+          if (process.env.DEBUG_COS_TICKET && serFolTicket.includes(process.env.DEBUG_COS_TICKET)) {
+            console.warn(`[DEBUG_COS_PUSH] claveFac=${k} serFolTicket=${serFolTicket} monto=${monto} claveSat=${fp.claveSat} folioOrigen=${cobro.folioOrigen}`);
+          }
           cobrosCobradoraDirecta.push({ claveSat: (fp.claveSat ?? '').trim() || null, monto, claveFac: k, serFolTicket, folioOrigen: cobro.folioOrigen ?? null });
         }
       }
@@ -1235,7 +1552,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     }
   }
 
-  return { desglosePagoReal, puntosUsado, saldoFavorUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap };
+  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar };
 }
 
 /**
@@ -1268,10 +1585,12 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
  */
 async function _prefetchDoctosPago(cfdiConRegla, rfc) {
   const pagos = cfdiConRegla.filter(({ cfdi }) => cfdi.tipoDeComprobante === 'P');
-  const doctosPorUuid = new Map(); // uuid del Pago → [{ serie, folio, monto }]
-  const paresVistos   = new Map(); // `${serie}|${folio}` → { serie, folio } (dedup entre Pagos)
+  const doctosPorUuid   = new Map(); // uuid del Pago → [{ serie, folio, monto }]
+  const paresVistos     = new Map(); // `${serie}|${folio}` → { serie, folio } (dedup entre Pagos)
+  const fechaPagoPorUuid = new Map(); // uuid del Pago → cfdi.fecha (para filtrar el desglose real por día)
 
   for (const { cfdi } of pagos) {
+    fechaPagoPorUuid.set(cfdi.uuid, cfdi.fecha ?? null);
     const doctos = [];
     for (const pago of (cfdi.complementoPago?.pagos ?? [])) {
       for (const dr of (pago.doctosRelacionados ?? [])) {
@@ -1286,7 +1605,7 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         const ivaDoc = (dr.trasladosDR ?? [])
           .filter(t => (t.impuesto || t.Impuesto || '') === '002' && Number(t.tasaOCuota ?? t.TasaOCuota ?? 0) > 0)
           .reduce((s, t) => s + Number(t.importe || t.importeDR || t.ImporteDR || 0), 0);
-        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc });
+        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc, desglosePagoReal: [] });
         paresVistos.set(`${serie}|${folio}`, { serie, folio });
       }
     }
@@ -1298,27 +1617,177 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
   const pares = [...paresVistos.values()];
   const LOTE  = 150;
   const saldoFavorPorFactura = new Map(); // `${serie}|${folio}` de la factura → monto usado
+  // Cobros CRUDOS (sin sumar todavía) de `/desgloses-cobro/almacen` por
+  // factura — una misma factura PPD puede recibir VARIOS pagos parciales en
+  // fechas distintas, cada uno su propio Complemento de Pago; este endpoint
+  // se consulta por serie/folio de la FACTURA (no del Pago), así que devuelve
+  // el HISTORIAL COMPLETO de cobros de esa factura, no solo el de HOY. Filtrar
+  // por fecha (abajo, contra `cfdi.fecha` de CADA Pago) es obligatorio — sin
+  // esto, un Pago que liquida el remanente de una factura con pagos previos
+  // se queda con el desglose acumulado de TODOS los pagos anteriores también,
+  // desbalanceando el asiento (bug real 2026-09-01, detectado en testnumo:
+  // "ASIENTO DESBALANCEADO" con diferencias de hasta 8x el monto real).
+  const cobrosCrudosPorFactura = new Map(); // `${serie}|${folio}` → cobro[] (con su `fecha` propia)
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
-    const resultado = await obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) });
-    for (const cuenta of resultado) {
+    const [resultadoSF, resultadoAlmacen] = await Promise.all([
+      obtenerSaldosFavor({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) }),
+      obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(p => p.serie), folios: lote.map(p => p.folio) }),
+    ]);
+    for (const cuenta of resultadoSF) {
       const usados = cuenta.saldosFavorUsados ?? [];
       if (!usados.length) continue;
       const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
       if (monto > 0) saldoFavorPorFactura.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, monto);
     }
+    for (const cuenta of resultadoAlmacen) {
+      const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+      const cobros = cuenta.cobros ?? [];
+      if (!cobros.length) continue;
+      cobrosCrudosPorFactura.set(key, [...(cobrosCrudosPorFactura.get(key) ?? []), ...cobros]);
+    }
   }
 
-  if (saldoFavorPorFactura.size > 0) {
-    for (const doctos of doctosPorUuid.values()) {
-      for (const d of doctos) {
-        const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
-        if (sf > 0) d.montoSF = sf;
+  // Extrae `[{monto, claveSat}]` de los `cobros[]` de una factura, quedándose
+  // SOLO con los del mismo día calendario (México) que el Pago que se está
+  // procesando — mismo criterio de fecha que `_diaMx`/`_diferenciaDiasMx`
+  // (arriba, usadas por Ingreso), tolerancia 0 (a diferencia de Ingreso, que
+  // tolera ±1 día por facturación diferida: aquí no hay ese desfase, el cobro
+  // y el Pago son el mismo evento).
+  const extraerFormasPagoDelDia = (cobros, fechaPago) => {
+    const diaPago = _diaMx(fechaPago);
+    const formasPago = [];
+    for (const cobro of cobros) {
+      if (diaPago && _diferenciaDiasMx(cobro.fecha, diaPago) !== 0) continue;
+      const cobrosFormaPago = cobro.formasPago ?? [];
+      for (const fp of cobrosFormaPago) {
+        // Mismo criterio de texto que `_prefetchAjustesFacturaPropia`:
+        // Puntos/Saldo a favor/Anticipo no son dinero nuevo cobrado hoy — se
+        // excluyen para no confundirlos con Efectivo/Bancos real.
+        if (/puntos/i.test(fp.nombre ?? '')) continue;
+        if (/saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+        if (/anticipo/i.test(fp.nombre ?? '')) continue;
+        // Mismo ajuste que `_prefetchAjustesFacturaPropia` (bug del ERP:
+        // `formasPago[].monto` repite el total del pago en cada ticket
+        // afectado cuando un cobro cierra varios tickets desiguales) —
+        // `cobro.monto` sí trae el monto real cuando solo hay una forma de
+        // pago en ese cobro.
+        const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
+          ? Math.abs(Number(cobro.monto) || 0)
+          : (Number(fp.monto) || 0);
+        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null });
       }
+    }
+    return formasPago;
+  };
+
+  for (const [uuid, doctos] of doctosPorUuid.entries()) {
+    const fechaPago = fechaPagoPorUuid.get(uuid);
+    for (const d of doctos) {
+      const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
+      if (sf > 0) d.montoSF = sf;
+      const cobrosCrudos = cobrosCrudosPorFactura.get(`${d.serie}|${d.folio}`) ?? [];
+      d.desglosePagoReal = extraerFormasPagoDelDia(cobrosCrudos, fechaPago);
     }
   }
 
   return { doctosPorUuid };
+}
+
+/**
+ * Fallback estructural al guard de `origenesConvertidosAAnticipo` (ver
+ * `_prefetchCuentasPendientesAnticipo`): ese guard depende de que
+ * `/cuentas-pendientes` SIGA reportando la `anotacion` de conversión
+ * SF→Anticipo, pero ese endpoint solo lista saldos PENDIENTES — en cuanto
+ * Kore liquida el Anticipo (normalmente en pocos días), la `anotacion`
+ * desaparece de la API para siempre y el guard queda ciego (caso real
+ * confirmado 2026-09-07, Reforma, JOSE IRAN SUAREZ LINARES/DEV-057088: 5
+ * días después de detectado, `/cuentas-pendientes` con ventana amplia y
+ * completitud confirmada ya NO traía ningún registro con ese folio).
+ *
+ * Como respaldo, se compara el monto (tolerancia $0.01, igual que
+ * `_resolverReferenciaOpaPorMonto`) y la fecha (±5 días, misma ventana) de
+ * ESTA Cancelación/Devolución contra los CFDIs que RECIBEN un Anticipo
+ * (Reg 22/22A — `cuentaAbono === CODIGO_CUENTA_ANTICIPOS_CLIENTES`) ya
+ * clasificados en este mismo lote, del MISMO cliente (rfc) — estos datos
+ * salen de nuestra propia consulta de CFDIs (`cfdiConRegla`), nunca
+ * desaparecen del ERP como sí le pasa a `/cuentas-pendientes`.
+ */
+function _esConversionAAnticipoPorMonto(cfdi, montoPropio, anticiposClasificados) {
+  if (!montoPropio || !anticiposClasificados?.length) return false;
+  const rfcCliente = (cfdi.receptor?.rfc || '').toUpperCase();
+  const fechaCfdi = cfdi.fecha ? new Date(cfdi.fecha).getTime() : null;
+  const VENTANA_MS = 5 * 24 * 3600 * 1000;
+  return anticiposClasificados.some(a => {
+    if (Math.abs((Number(a.total) || 0) - montoPropio) >= 0.01) return false;
+    if (rfcCliente && (a.receptor?.rfc || '').toUpperCase() !== rfcCliente) return false;
+    if (fechaCfdi && a.fecha) {
+      const diff = Math.abs(new Date(a.fecha).getTime() - fechaCfdi);
+      if (diff > VENTANA_MS) return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * Redirige las cuentas de una NC Egreso/Aplicación de Anticipo (Reg TO-EGR/
+ * Reg 23) cuando la venta que referencia ya se saldó 100% con Anticipo vía
+ * el mecanismo "cierre OPA" (ver `ventasConAnticipoRedirigido` en
+ * `generarPropuesta`/`generarYGuardar`) — en ese caso la venta NUNCA tuvo
+ * saldo en Clientes que cancelar (su Cargo se sustituyó por Cargo Anticipos
+ * +IVA-anticipo), así que las cuentas normales de la regla (Cargo Anticipos
+ * otra vez / Abono Clientes) duplicarían el Cargo a Anticipos y dejarían un
+ * Abono a Clientes sin ninguna contraparte (confirmado con datos reales de
+ * Postgres, caso CONSTRUCASA 2026-09-07: Anticipos debitada 2 veces por el
+ * mismo monto, Clientes con abono huérfano de $3,827.37).
+ *
+ * Se REVIERTE la venta en su lugar — confirmado con el usuario: Cargo
+ * Devoluciones s/Ventas (mismo monto que iba a Anticipos) / Abono Anticipos
+ * + IVA-anticipo (reinstala el MISMO pasivo que "cierre OPA" ya había
+ * cancelado). La línea de IVA de la regla (cuentaIva, ej. 2104010001) se
+ * deja intacta — sigue siendo la reversión correcta del IVA definitivo.
+ * Muta `movs` in-place; no-op si no encuentra las líneas esperadas (Cargo
+ * a `rule.cuentaCargo` + Abono a `rule.cuentaAbono`).
+ */
+function _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap) {
+  const cargoAnticipo = movs.find(m => m.cuentaId === cuentaMap[rule?.cuentaCargo] && Number(m.debe) > 0);
+  const abonoClientes = movs.find(m => m.cuentaId === cuentaMap[rule?.cuentaAbono] && Number(m.haber) > 0);
+  if (!cargoAnticipo || !abonoClientes) return;
+  const cargoIva = movs.find(m => m.cuentaId === cuentaMap[rule?.cuentaIva] && Number(m.debe) > 0);
+  const ivaMonto = Number(cargoIva?.debe) || 0;
+  const subtotalMonto = Math.round(((Number(abonoClientes.haber) || 0) - ivaMonto) * 100) / 100;
+  cargoAnticipo.cuentaId = cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? cargoAnticipo.cuentaId;
+  abonoClientes.cuentaId = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? abonoClientes.cuentaId;
+  abonoClientes.haber = subtotalMonto;
+  // poliza.service.js (`bloquesAjustesContado`/`moverAjustesAlFinal`) oculta
+  // por convención el Cargo de cualquier NC categoría "anticipo" (para no
+  // duplicar visualmente el Cargo de la venta, confirmado 2026-08-27) —
+  // excepto las líneas marcadas `REGLAS_MEZCLADAS_CON_VENTAS` (hoy 'OPA',
+  // ahora también 'OPA-REVERSION'). Sin este marcador, el Cargo Devoluciones
+  // +IVA de ESTE caso (una venta ya REVERSADA, no un anticipo estándar con
+  // Cargo-Clientes visible en otro lado) desaparecía por completo del export
+  // aunque quedó bien persistido en Postgres — confirmado con el usuario
+  // 2026-09-07, caso real CONSTRUCASA (bug encontrado DESPUÉS de verificar
+  // este mismo fix contra el export real, no solo contra la BD). Se usa un
+  // valor NUEVO en `reglaNombre`, no el `reglaNombre` original de la regla
+  // ni el literal 'OPA' — debe seguir siendo reconocible por
+  // `REGLAS_MEZCLADAS_CON_VENTAS` (poliza.service.js) para la visibilidad,
+  // y por `categorizarAjusteContado`/esa misma constante para la
+  // categorización ('anticipo'), sin perder trazabilidad de que es una
+  // reversión, no la recepción/aplicación original.
+  cargoAnticipo.reglaNombre = 'OPA-REVERSION';
+  if (cargoIva) cargoIva.reglaNombre = 'OPA-REVERSION';
+  // Las 4 líneas de la reversión (Cargo Devoluciones+IVA / Abono Anticipos+
+  // IVA-anticipo) deben quedar con el MISMO reglaNombre — antes solo se
+  // renombraban las 2 de Cargo, dejando las 2 de Abono con el nombre
+  // original de la regla TO-EGR ("Reg TO-EGR-16 — NC Egreso ERP 16%..."),
+  // confirmado con datos reales en Postgres 2026-09-07 (póliza 695). No
+  // afecta el export (el filtro de visibilidad solo mira líneas de Cargo),
+  // pero mezclaba el regla_nombre de las 4 líneas de un mismo asiento.
+  abonoClientes.reglaNombre = 'OPA-REVERSION';
+  if (ivaMonto > 0) {
+    movs.push({ ...abonoClientes, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, haber: ivaMonto });
+  }
 }
 
 /**
@@ -1352,17 +1821,88 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
  * póliza, y regresa `[]` aquí (nada que inyectar en esta póliza — tampoco
  * hay Cargo de cierre que agregar en el caller, porque no hay líneas).
  */
-async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc }) {
+async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaCajaId, cuentaBancosId, cc, rfc, origenesConvertidosAAnticipo, anticiposClasificados }) {
   if (cfdi.tipoDeComprobante !== 'E' || !cuentaSaldoFavorId || !cuentaIvaSaldoFavorId) return [];
   const marcador = (cfdi.documentosRelacionados ?? [])
     .find(d => TIPO_MARCADORES_DEV.includes((d.Serie ?? '').toUpperCase()) && d.Folio);
   if (!marcador) return [];
+  // Si Kore ya convirtió este mismo saldo en un Anticipo, no se vuelve a
+  // inyectar como SF: sería el mismo dinero contado dos veces (caso real
+  // Reforma, JOSE IRAN SUAREZ LINARES, DEV-057088 $976.23). 3 señales, de
+  // más a menos confiable:
+  // 1. `generado.anticipoReferencia` — NATIVO de /saldos-favor (campo
+  //    `gen.anticipo`, confirmado 2026-09-08), no depende de que ningún
+  //    otro endpoint siga listando el Anticipo como pendiente.
+  // 2. `origenesConvertidosAAnticipo` — `anotacion` de `/cuentas-pendientes`
+  //    (ver `_prefetchCuentasPendientesAnticipo`); ese endpoint PURGA el
+  //    registro en cuanto se liquida, así que es una ventana de tiempo
+  //    limitada (días) desde que se detecta hasta que se pierde.
+  // 3. `_esConversionAAnticipoPorMonto` — heurístico monto+fecha+cliente,
+  //    último respaldo si ninguna de las 2 anteriores resolvió.
   const generado = mapaGenerados.get(`${marcador.Serie}|${marcador.Folio}`);
+  if (generado?.anticipoReferencia) {
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_SF_ANTICIPO_GUARD_NATIVO] cfdi=${cfdi.serie}-${cfdi.folio} `
+        + `suprimido, convertido a ${generado.anticipoReferencia} segun /saldos-favor`);
+    }
+    return [];
+  }
+  const _claveMarcadorSF = `${(marcador.Serie ?? '').toUpperCase()}|${marcador.Folio}`;
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_SF_ANTICIPO_GUARD] cfdi=${cfdi.serie}-${cfdi.folio} claveMarcador=${_claveMarcadorSF} `
+      + `enSet=${!!origenesConvertidosAAnticipo?.has(_claveMarcadorSF)} setSize=${origenesConvertidosAAnticipo?.size ?? 0}`);
+  }
+  if (origenesConvertidosAAnticipo?.has(_claveMarcadorSF)) return [];
   if (!generado?.monto) return [];
 
-  const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
-  const iva = Math.round((generado.monto - subtotal) * 100) / 100;
-  const nombreCliente = cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+  // El monto real de ESTA Cancelación/Devolución es `cfdi.total` — NUNCA
+  // `generado.monto` (bug real, caso Hidalgo 11-ago, venta origen
+  // B0-260705994): cuando la MISMA venta origen se cancela repartida en 2+
+  // CFDIs tipo E distintos (folios 260801211/212/213), `mapaGenerados` solo
+  // guarda UN registro por marcador (Serie|Folio de la venta origen) con el
+  // monto TOTAL generado por esa venta — cada uno de los CFDIs lo consultaba
+  // y se llevaba el monto COMPLETO, restándolo (o en el caso "mismo folio"
+  // de abajo, generando una línea de ajuste) 3 veces en vez de una.
+  // `generado` sigue usándose para las banderas de clasificación
+  // (mismoFolio/oculto/formaPagoReal/centroProcesamiento), que sí son
+  // propiedades de la venta origen compartidas correctamente entre los
+  // CFDIs — solo el monto en pesos debe ser el de ESTE CFDI puntual.
+  // NOTA: a diferencia del intento de fix del 2026-09-02 (revertido por dar
+  // resultado incorrecto en testnumo), aquí NO se toca `formaPago` en el
+  // caso "mismo folio" más abajo — el usuario confirmó que Efectivo/Tarjeta
+  // consolidados ($256,295.27 / $114,363.62 en el caso real) NO deben
+  // moverse, así que este ajuste se queda en su línea separada, solo con el
+  // monto corregido.
+  const montoPropio = Number(cfdi.total) || 0;
+  if (montoPropio <= 0) return [];
+  // Respaldo de `_esConversionAAnticipoPorMonto` cuando `/cuentas-pendientes`
+  // ya no trae la `anotacion` (ver docstring de esa función) — mismo caso
+  // real que el guard de arriba, solo que detectado por monto+fecha+cliente
+  // en vez de por texto libre del ERP.
+  if (_esConversionAAnticipoPorMonto(cfdi, montoPropio, anticiposClasificados)) {
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_SF_ANTICIPO_GUARD_MONTO] cfdi=${cfdi.serie}-${cfdi.folio} monto=${montoPropio} `
+        + `suprimido por match de monto+fecha+cliente contra Anticipo clasificado`);
+    }
+    return [];
+  }
+  const subtotal = Math.round((montoPropio / 1.16) * 100) / 100;
+  const iva = Math.round((montoPropio - subtotal) * 100) / 100;
+  // El nombre del cliente debe ser el de la VENTA ORIGEN (generado.ventaSerie/
+  // ventaFolio), NUNCA el receptor de la Devolución/NC misma (`cfdi`) — bug
+  // real 2026-09-03, caso JOSUE YAIR CARMONA NORIEGA / D0-260806293: la
+  // venta original SÍ tenía el cliente real capturado, pero la NC que generó
+  // el saldo a favor se capturó genérica como "PUBLICO EN GENERAL" en el
+  // POS, y el concepto (que muestra la referencia de la VENTA, no de la NC)
+  // terminaba con un nombre que no correspondía a esa venta. Si no se
+  // encuentra la venta origen, cae al receptor de la NC como antes.
+  const cfdiVentaOrigen = (generado.ventaSerie && generado.ventaFolio)
+    ? await CFDI.findOne(
+        { 'emisor.rfc': rfc, serie: generado.ventaSerie, folio: String(generado.ventaFolio) },
+        { 'receptor.nombre': 1 },
+      ).lean()
+    : null;
+  const nombreCliente = cfdiVentaOrigen?.receptor?.nombre ?? cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
   const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
   const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
 
@@ -1435,6 +1975,17 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     // registro por completo.
   }
 
+  // Sin usar en absoluto (ningún `uso` registrado todavía) y menor a $50 —
+  // ver `ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR`. `montoPropio` (no `generado.monto`)
+  // porque es el monto real de ESTA línea (ver comentario arriba sobre por
+  // qué nunca se usa `generado.monto` directo); el estado "sin usar" sí se
+  // revisa contra el saldo agregado completo (`generado.usos`), correcto
+  // incluso cuando la misma venta origen se dividió en 2+ CFDIs tipo E.
+  const montoUsadoTotal = (generado.usos ?? []).reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+  const reglaSFExport = (montoUsadoTotal < 0.01 && montoPropio < 50)
+    ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
+    : reglaSF;
+
   return [
     // tipoOrigen='Cobro Sucursal' (NO un tipo propio) — a propósito: solo así
     // pasa por `_extraerCobrosSucursal` (poliza.service.js), que arma columna
@@ -1446,8 +1997,10 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     // 'SF-OCULTO' cuando se generó y se consumió por completo el mismo día
     // en el mismo almacén — ver `_prefetchSaldosFavorGenerados` — para que
     // `_extraerCobrosSucursal` la omita del export (sigue en poliza_movimientos).
-    { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: subtotal },
-    { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSF, debe: 0, haber: iva },
+    // 'SF-MENOR-SIN-USAR' cuando sigue sin usarse y es menor a $50 — se
+    // redirige a "Otros Ingresos" en vez de "Saldos a favor usados".
+    { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSFExport, debe: 0, haber: subtotal },
+    { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSFExport, debe: 0, haber: iva },
   ];
 }
 
@@ -1478,6 +2031,17 @@ const CODIGO_CUENTA_CLUB_TUBEROS      = '2103090002';
 // C0-260800064/065 contra el anticipo C0-260701665).
 const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
 const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
+// Devoluciones s/Ventas 16% — usada para revertir una venta que ya se saldó
+// 100% con Anticipo (ver `ventasConAnticipoRedirigido`, "Fix doble-
+// contabilización anticipo PUE" más abajo).
+const CODIGO_CUENTA_DEVOLUCIONES      = '4200010001';
+// IVA Trasladado (definitivo, PUE) — usado por el combo especial de 2+
+// anticipos (ver `ventasConComboEspecialAnticipoProp`).
+const CODIGO_CUENTA_IVA_TRASLADADO    = '2104010001';
+// Mismo split subtotal/IVA que usa Saldo a Favor (TASA_IVA_SALDO_FAVOR en
+// cfdi-mapping.service.js) para prorratear el monto REAL de anticipo
+// aplicado (ver `montoAnticipoRealProp` más abajo).
+const TASA_IVA_ANTICIPO = 0.16;
 
 // Referencia real del RECIBO del anticipo (ej. "OPA-00766") — el ERP la
 // identifica con su propia serie/folio interno en `bank_movements.erpLinks`,
@@ -1514,6 +2078,280 @@ async function _resolverReferenciaOpaPorMonto(anticiposCfdi) {
     }
     if (link?.serie && link?.folioExterno) {
       mapa[c.uuid.toUpperCase()] = `${link.serie}-${link.folioExterno}`;
+    }
+  }
+  return mapa;
+}
+
+/**
+ * Resuelve el folio OPA real a partir de la conversión SF→Anticipo que el
+ * propio endpoint `/saldos-favor` reporta (`saldosFavorGenerados[].anticipo`,
+ * confirmado 2026-09-08) — `anticiposConvertidos` viene de
+ * `_prefetchSaldosFavorGenerados` (mismo fetch que ya se hace para el guard
+ * de duplicado, sin llamada ERP adicional).
+ *
+ * A diferencia de `_resolverReferenciaOpaPorMonto` (Bancos) y
+ * `_prefetchCuentasPendientesAnticipo` (`/cuentas-pendientes`, que PURGA el
+ * registro en cuanto el Anticipo se liquida — ver docstring de
+ * `_esConversionAAnticipoPorMonto`), esta fuente sigue disponible
+ * indefinidamente porque vive en el historial de generación del saldo a
+ * favor, no en una lista de "pendientes". Pensado como el respaldo final
+ * para el caso donde ambas fuentes anteriores ya no tienen el dato (caso
+ * real 2026-09-07, JOSE IRAN SUAREZ LINARES/DEV-057088: folio OPA-00844
+ * conocido por `anotacion` en su momento, mas tarde irrecuperable).
+ *
+ * `anticipoUuid` siempre llega vacío desde el ERP, así que se empareja por
+ * monto (tolerancia $0.01) + fecha (±5 días), mismo criterio que el resto de
+ * los resolutores de folio OPA de este archivo.
+ */
+function _resolverReferenciaOpaDesdeSaldosFavor(anticiposCfdi, anticiposConvertidos) {
+  const mapa = {};
+  if (!anticiposConvertidos?.length) return mapa;
+  const VENTANA_MS = 5 * 24 * 3600 * 1000;
+  for (const c of anticiposCfdi) {
+    const total = Number(c.total) || 0;
+    if (total <= 0 || !c.fecha || !c.uuid) continue;
+    const fechaCfdi = new Date(c.fecha).getTime();
+    const match = anticiposConvertidos.find(a => {
+      if (Math.abs((Number(a.monto) || 0) - total) >= 0.01) return false;
+      if (!a.fecha) return true;
+      return Math.abs(new Date(a.fecha).getTime() - fechaCfdi) <= VENTANA_MS;
+    });
+    if (match) mapa[c.uuid.toUpperCase()] = match.anticipoReferencia;
+  }
+  return mapa;
+}
+
+/**
+ * Consulta "Cuentas Pendientes" del ERP (CxC/Bancos, `/cuentas-pendientes` —
+ * distinto del endpoint de cajas usado en el resto de este archivo) para
+ * resolver Anticipos con más precisión que los 2 mecanismos anteriores:
+ *
+ * 1. Referencia OPA real: `_resolverReferenciaOpaPorMonto` busca un depósito
+ *    bancario (`BankMovement`) por monto+fecha del anticipo — si Bancos no
+ *    tiene ese movimiento conciliado, cae al folio crudo de la factura
+ *    ("OPA-260900026" en vez de "OPA-00837"). Cuentas Pendientes trae la
+ *    cuenta del anticipo con `serieExterna:'OPA'`/`folioExterno` — el
+ *    folio real, sin depender de Bancos.
+ * 2. Monto real aplicado a CADA venta: `context.montoAnticipoUsado` (desglose
+ *    de `/desgloses-cobro/almacen`) a veces no distingue la porción de
+ *    Anticipo — cuando eso pasa, el caller asume que el 100% de la venta se
+ *    cubrió con Anticipo, ignorando que esa venta pudo tener OTRO ajuste
+ *    (ej. una Bonificación) que ya redujo el saldo antes de aplicar el
+ *    Anticipo (bug real 2026-09-03, caso MARIA DE LOURDES SANCHEZ RIOS,
+ *    OPA-00837: 2 de 3 ventas mostraban el Anticipo aplicado por el TOTAL
+ *    completo de la venta —$1,722.65/$1,922.07— en vez del saldo real
+ *    después de su Bonificación de $60.60 —$1,662.04/$1,861.47—, confirmado
+ *    contra la cuenta saldada real de Kore). Cuentas Pendientes trae, por
+ *    cada venta, el movimiento de cierre con `formasPago[].nombreFormaPago
+ *    === 'ANTICIPO'` y su monto YA neto de cualquier otro ajuste.
+ *
+ * `fechas`: fechas de los CFDIs relevantes (anticipos Y ventas que los
+ * consumen) — se usa el mín/máx ±5 días (misma ventana que
+ * `_resolverReferenciaOpaPorMonto`) como rango de consulta, porque el
+ * endpoint exige `fechaDesde`/`fechaHasta` y no filtra por serie/folio de
+ * factura (solo por serie/folio INTERNO de ticket, que no conocemos aquí).
+ * Si el ERP falla o no hay fechas, regresa mapas vacíos — el caller sigue
+ * funcionando con los mecanismos anteriores como respaldo.
+ */
+async function _prefetchCuentasPendientesAnticipo(fechas) {
+  const montoAnticipoPorFactura = new Map();
+  const referenciaOpaPorFactura = new Map();
+  // BUG CORREGIDO 2026-09-04 (caso real Reforma, JOSE IRAN SUAREZ LINARES,
+  // DEV-057088 $976.23): confirmado con el usuario y con el propio ERP que
+  // cuando un Anticipo se genera a partir del saldo a favor de una
+  // Cancelación (Kore lo declara EXPLÍCITAMENTE en `anotacion`, ej. "Anticipo
+  // generado por el saldo a favor de la cancelación DEV-057088 de la venta
+  // D0-260900332"), ese saldo YA NO es un saldo a favor disponible — es el
+  // MISMO dinero, ahora representado como Anticipo. `_inyectarSaldoFavorGenerado`
+  // no tenía forma de saberlo (el CFDI del Anticipo, D0-260900064 en el caso
+  // real, no trae NINGUNA relación hacia la Cancelación en el propio CFDI —
+  // el vínculo solo existe en este texto libre de Cuentas Pendientes) y
+  // duplicaba el mismo crédito como pasivo de SF (2103090001) Y de Anticipos
+  // (2103010001) a la vez. Se parsea `anotacion` para armar el marcador
+  // (SERIE|FOLIO) de la cancelación ya "convertida" y excluirla más abajo.
+  const origenesConvertidosAAnticipo = new Set();
+  const fechasValidas = fechas.filter(Boolean).map(f => new Date(f)).filter(f => !isNaN(f.getTime()));
+  if (!fechasValidas.length) return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
+
+  const VENTANA_MS = 5 * 24 * 3600 * 1000;
+  let fechaDesde = new Date(Math.min(...fechasValidas.map(f => f.getTime())) - VENTANA_MS);
+  const fechaHasta = new Date(Math.max(...fechasValidas.map(f => f.getTime())) + VENTANA_MS);
+
+  // BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA, 1-sep): el ERP rechaza
+  // con 400 CUALQUIER rango de fechas mayor a 31 días ("rango de fechas
+  // mayor a 31 días") — límite no documentado hasta hoy. Si el lote incluye
+  // fechas de CFDIs de Anticipo muy dispersas en el tiempo (normal: llegan de
+  // toda la ventana rel07-sin-regla, no solo del periodo actual), el
+  // min/max ±5 días puede superar fácilmente ese tope y tirar TODA la
+  // consulta (mapas vacíos para el lote completo, no solo para el caso
+  // disperso) — confirmado con `[DEBUG_CUENTAS_PENDIENTES] FALLO: ...400`.
+  // Se recorta `fechaDesde` para que el rango nunca exceda 30 días (1 de
+  // margen bajo el límite real), sacrificando cobertura de fechas viejas
+  // dispersas antes que fallar la consulta completa — `fechaHasta` se deja
+  // intacto porque el periodo que se está generando siempre es el extremo
+  // más reciente.
+  const MAX_VENTANA_MS = 30 * 24 * 3600 * 1000;
+  if (fechaHasta.getTime() - fechaDesde.getTime() > MAX_VENTANA_MS) {
+    fechaDesde = new Date(fechaHasta.getTime() - MAX_VENTANA_MS);
+  }
+
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] fechaDesde=${fechaDesde.toISOString()} fechaHasta=${fechaHasta.toISOString()}`);
+  }
+  let cuentas;
+  try {
+    const resultado = await sincronizarCuentasPendientes({
+      fechaDesde: fechaDesde.toISOString(),
+      fechaHasta: fechaHasta.toISOString(),
+    });
+    cuentas = resultado.raw ?? [];
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] cuentas.length=${cuentas.length}`);
+    }
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.error(`[PolizaGen] /cuentas-pendientes fallo, se usan los mecanismos de respaldo: ${err.message}`);
+    if (process.env.DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_CUENTAS_PENDIENTES] FALLO: ${err.message}`);
+    }
+    return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
+  }
+
+  const _regexAnotacionCancelacion = /cancelaci[oó]n\s+([A-Z]+)-(\d+)/i;
+  for (const cuenta of cuentas) {
+    const matchAnotacion = _regexAnotacionCancelacion.exec(cuenta.anotacion ?? '');
+    if (matchAnotacion) {
+      origenesConvertidosAAnticipo.add(`${matchAnotacion[1].toUpperCase()}|${matchAnotacion[2]}`);
+    }
+    if (!cuenta.serieFactura || !cuenta.folioFactura) continue;
+    const keyFactura = `${cuenta.serieFactura}|${cuenta.folioFactura}`;
+    // La cuenta ES el anticipo (su propia factura, ej. D0-260900026) —
+    // `serieExterna`/`folioExterno` son el folio interno real de Kore
+    // (ej. "OPA"/"00837"), no el folio de la factura.
+    if ((cuenta.serieExterna || '').toUpperCase() === 'OPA' && cuenta.folioExterno) {
+      referenciaOpaPorFactura.set(keyFactura, `OPA-${cuenta.folioExterno}`);
+    }
+    // La cuenta ES una venta que consumió Anticipo — suma todas las
+    // formasPago 'ANTICIPO' de todos sus movimientos (normalmente un solo
+    // movimiento de cierre, pero por seguridad se suman todas por si el
+    // cierre se dio en 2+ pasos).
+    let montoAnticipo = 0;
+    for (const mov of (cuenta.movimientos ?? [])) {
+      for (const fp of (mov.formasPago ?? [])) {
+        if ((fp.nombreFormaPago || '').toUpperCase() === 'ANTICIPO') montoAnticipo += Number(fp.monto) || 0;
+      }
+    }
+    if (montoAnticipo > 0) {
+      montoAnticipoPorFactura.set(keyFactura, (montoAnticipoPorFactura.get(keyFactura) ?? 0) + montoAnticipo);
+    }
+  }
+  if (process.env.DEBUG_OPA_UUID) {
+    console.warn(`[DEBUG_CUENTAS_PENDIENTES] referenciaOpaPorFactura.size=${referenciaOpaPorFactura.size} `
+      + `B0|260900009=${referenciaOpaPorFactura.get('B0|260900009')} `
+      + `origenesConvertidosAAnticipo=${JSON.stringify([...origenesConvertidosAAnticipo])}`);
+  }
+  return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
+}
+
+// Egreso SAT que formaliza la aplicación del anticipo directamente contra la
+// VENTA (tipoRelacion='07' apuntando al UUID de la propia venta — al revés
+// de la relación que trae la venta hacia SU anticipo). Cuando existe, trae el
+// monto REAL y exacto (subTotal/total propios) de lo aplicado — más confiable
+// que `montoAnticipoUsado` (desglose de Kore) cuando ese desglose no logra
+// identificar la porción de anticipo de un ticket (caso real 2026-08-28,
+// AIDA ISLAS ACEVEDO F0-260800426/Egreso F0-260800428: Kore no traía el
+// forma-de-pago "ANTICIPO" para ese ticket y el cierre OPA cayó al fallback
+// de 100%, tapando los $18.24 de Efectivo real cobrados aparte). Se prefiere
+// SIEMPRE sobre el dato de Kore cuando está disponible.
+async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
+  if (!ventaUuids?.length) return new Map();
+  const ventaSet = new Set(ventaUuids.map(u => (u || '').toUpperCase()));
+
+  // BUG CORREGIDO 2026-09-07 (mismo problema que `_fetchNotasCreditoParaFusion`
+  // — ver comentario ahí, caso real CONSTRUCASA C0-260900036): algunos
+  // Egresos de Aplicación de Anticipo traen `cfdiRelacionados` VACÍO a nivel
+  // SAT — la relación tipoRelacion=07 solo vive en el CFDI fuente ERP
+  // (`tipoOrigen: 'Egreso'`). Se resuelve primero qué venta referencia cada
+  // Egreso usando el ERP, y se usa como fallback cuando el SAT no la trae —
+  // sin esto, `serieCierreProp`/`serieCierreGuard` nunca encontraban el
+  // Egreso real y la columna C del cierre "OPA" caía siempre al placeholder
+  // "OPA-XXXXX" en vez del folio real del Egreso.
+  const erpEgresos07 = await CFDI.find({
+    'emisor.rfc': rfc, tipoDeComprobante: 'E', source: 'ERP',
+    $or: [{ tipoOrigen: 'Egreso' }, { 'cfdiRelacionados.tipoRelacion': '07' }],
+  }).select('uuid cfdiRelacionados').lean();
+  const ventaPorEgresoErp = new Map();
+  for (const eg of erpEgresos07) {
+    const uuidsRel = (eg.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .map(u => (u || '').toUpperCase());
+    const ventaMatch = uuidsRel.find(u => ventaSet.has(u));
+    if (ventaMatch) ventaPorEgresoErp.set(eg.uuid, ventaMatch);
+  }
+
+  const egresos = await CFDI.find({
+    'emisor.rfc':                     rfc,
+    tipoDeComprobante:                'E',
+    source:                           'SAT',
+    satStatus:                        'Vigente',
+    isActive:                         true,
+    $or: [
+      { 'cfdiRelacionados.tipoRelacion': '07' },
+      { uuid: { $in: [...ventaPorEgresoErp.keys()] } },
+    ],
+  }).select('uuid serie folio subTotal total fecha cfdiRelacionados').lean();
+
+  const matches = [];
+  for (const eg of egresos) {
+    const uuidsRel = (eg.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .map(u => (u || '').toUpperCase());
+    const ventaMatch = uuidsRel.find(u => ventaSet.has(u)) ?? ventaPorEgresoErp.get(eg.uuid);
+    if (!ventaMatch) continue;
+    const total = Number(eg.total) || 0;
+    if (total <= 0) continue;
+    matches.push({
+      ventaUuid: ventaMatch,
+      uuid:      eg.uuid,
+      total,
+      subTotal:  Number(eg.subTotal) || total,
+      fecha:     eg.fecha,
+      // Serie-folio del propio Egreso — se usa como referencia trazable en la
+      // columna C (serie) del cierre, para que quede ligado al documento SAT
+      // real en vez de solo al placeholder "OPA-..." (confirmado con el
+      // usuario 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
+      serieFolio: [eg.serie, eg.folio].filter(Boolean).join('-') || null,
+    });
+  }
+  if (!matches.length) return new Map();
+
+  // Folio OPA real (BankMovement.erpLinks) resuelto con el monto/fecha del
+  // EGRESO en vez del CFDI del anticipo — encadenamiento pedido por el
+  // usuario 2026-08-28 ("para relacionarlo el ingreso busca al egreso y el
+  // egreso la opa"): más confiable porque no depende de que el CFDI del
+  // anticipo esté sincronizado en Mongo (caso pendiente real OPA-00665, ver
+  // memoria del proyecto — su CFDI nunca se sincronizó, pero el Egreso que
+  // aplica la venta sí puede existir).
+  const folioPorEgresoUuid = await _resolverReferenciaOpaPorMonto(
+    matches.map(m => ({ uuid: m.uuid, total: m.total, fecha: m.fecha })),
+  );
+
+  const mapa = new Map();
+  for (const m of matches) {
+    const folioOpa = folioPorEgresoUuid[m.uuid.toUpperCase()] ?? null;
+    const prev = mapa.get(m.ventaUuid);
+    // Más de un Egreso aplicando al mismo anticipo/venta no debería ser
+    // común, pero se suman para no perder datos si llegara a pasar.
+    if (prev) {
+      prev.total      = parseFloat((prev.total + m.total).toFixed(2));
+      prev.subTotal   = parseFloat((prev.subTotal + m.subTotal).toFixed(2));
+      prev.serieFolio = prev.serieFolio ?? m.serieFolio;
+      prev.folioOpa   = prev.folioOpa ?? folioOpa;
+    } else {
+      mapa.set(m.ventaUuid, { total: m.total, subTotal: m.subTotal, serieFolio: m.serieFolio, folioOpa });
     }
   }
   return mapa;
@@ -1833,8 +2671,7 @@ async function _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorF
 // Puntos/Saldo a Favor, usa `cobro.monto` cuando solo hay una formaPago).
 // Devuelve Map<claveSat, monto> para inyectar como línea aparte (sin CFDI).
 async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }) {
-  const porClave = new Map();
-  if (!centro || !fechaInicio || !fechaFin) return porClave;
+  if (!centro || !fechaInicio || !fechaFin) return [];
 
   const fechaDesdeISO = new Date(`${fechaInicio}T00:00:00-06:00`).toISOString();
   const fechaHastaISO = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
@@ -1849,7 +2686,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
     logger.warn(`[CobrosSinFactura] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
-    return porClave;
+    return [];
   }
 
   // Ventas canceladas/devueltas (2026-08-21, confirmado con el usuario contra
@@ -1907,21 +2744,57 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   // el día que se timbre, sin duplicar el cargo (ese día no vuelve a
   // encontrar este cobro porque para entonces sí cae dentro de tolerancia
   // del lado del pipeline normal).
+  // `serieFactura`/`folioFactura` vienen VACÍOS en el ERP cuando la factura es
+  // 1-a-1 con el ticket (sin agrupar en una Factura Global) — solo se llenan
+  // cuando difieren de `serieVenta`/`folioVenta` (bug real 2026-09-03, caso
+  // Hidalgo B0-260900073/PEDRO YAIR ORTIZ LUCERO: el CFDI real existe con
+  // exactamente esa serie/folio, pero al venir `serieFactura`/`folioFactura`
+  // vacíos, `facturaKey` daba `null` y el chequeo de "ya cubierto por el
+  // pipeline normal" de abajo nunca se ejecutaba — el cobro se duplicaba acá
+  // como "SIN FACTURA" aunque el ticket SÍ tenía su factura). Cuando faltan,
+  // se usa `serieVenta`/`folioVenta` como factura candidata — es correcto en
+  // el caso 1-a-1, y en el caso agrupado (Factura Global) simplemente no
+  // encontrará ningún CFDI con esa serie/folio de ticket, sin efecto.
+  const _facturaKeyDe = (cuenta) => (cuenta.serieFactura && cuenta.folioFactura)
+    ? `${cuenta.serieFactura}|${cuenta.folioFactura}`
+    : (cuenta.serieVenta && cuenta.folioVenta) ? `${cuenta.serieVenta}|${cuenta.folioVenta}` : null;
+  // true solo cuando el ERP mandó `serieFactura`/`folioFactura` directo (link
+  // confirmado) — false cuando `_facturaKeyDe` tuvo que caer al respaldo
+  // `serieVenta`/`folioVenta` (el folio del propio ticket). Ver `facturasPPD`
+  // más abajo: esa distinción es la que evita el bug de 2026-09-15.
+  const _facturaConfirmada = (cuenta) => !!(cuenta.serieFactura && cuenta.folioFactura);
   const foliosFacturaReferenciados = new Set();
   for (const cuenta of resultado) {
-    if (cuenta.serieFactura && cuenta.folioFactura) {
-      foliosFacturaReferenciados.add(`${cuenta.serieFactura}|${cuenta.folioFactura}`);
-    }
+    const key = _facturaKeyDe(cuenta);
+    if (key) foliosFacturaReferenciados.add(key);
   }
   const diaCfdiPorFolioFactura = new Map();
+  // Facturas PPD referenciadas — su cobro NUNCA es responsabilidad de este
+  // mecanismo (2026-09-15, caso real CEDIS 12-sep, depósito 046510: 3
+  // facturas PPD timbradas en junio/julio, cobradas por CFDI de Pago real
+  // el 12-sep — Cobranza ya las procesa correctamente, con cuenta bancaria
+  // real resuelta). El chequeo de tolerancia de abajo (`diaCfdiPorFolioFactura`
+  // + `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`) solo cubre el caso PUE de
+  // "factura timbrada 1 día después del cobro" — para PPD, el cobro puede
+  // caer semanas o meses después de la factura sin que eso signifique que
+  // "no tiene factura": ya tiene, y su cierre es 100% de Cobranza (CFDI de
+  // Pago), nunca de este consolidado. Sin este guard, cualquier pago PPD
+  // fuera de la ventana de 0-1 día se duplicaba aquí como "COBRO-SIN-FACTURA"
+  // además de la línea correcta que ya genera Cobranza — mismo dinero
+  // contado dos veces. Ver docstring del archivo: "los cobros de facturas
+  // viejas (varios días/semanas antes, cobranza de crédito) siguen excluidos
+  // de este mecanismo, esos los maneja Cobranza" — la intención ya estaba
+  // documentada, pero nunca se implementó.
+  const facturasPPD = new Set();
   if (foliosFacturaReferenciados.size) {
     const orConditions = [...foliosFacturaReferenciados].map(k => {
       const [serie, folio] = k.split('|');
       return { serie, folio };
     });
-    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha').lean();
+    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha metodoPago').lean();
     for (const c of cfdisReferenciados) {
       const key = `${c.serie}|${c.folio}`;
+      if (c.metodoPago === 'PPD') facturasPPD.add(key);
       const dia = _diaMx(c.fecha);
       // Si hay varios CFDIs con el mismo serie/folio (visto en producción,
       // registros duplicados), se queda con la fecha MÁS TEMPRANA — es la
@@ -1935,16 +2808,48 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   const vistos = new Set();
   const porVenta = new Map(); // ventaKey -> [{ clave, monto }], mismo orden en que llegan los cobros
   for (const cuenta of resultado) {
-    const facturaKey = (cuenta.serieFactura && cuenta.folioFactura) ? `${cuenta.serieFactura}|${cuenta.folioFactura}` : null;
+    const facturaKey = _facturaKeyDe(cuenta);
     const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+    // Ventas de OTRA sucursal (`cuenta.serieVenta !== centro`) cobradas aquí:
+    // desde 2026-09-09 ese caso lo cubre `construirMovimientosPuente`
+    // (bloque "Cobrador directo, sin factura" en cobros-sucursal-puente.service.js)
+    // como línea separada de "Cobro de otra sucursal" — no debe ADEMÁS
+    // fundirse aquí en el consolidado de Efectivo/Tarjeta como
+    // 'COBRO-SIN-FACTURA', o el mismo dinero se cuenta dos veces (caso real:
+    // 4 tickets de CEDIS/A0 cobrados en Puerto Escondido/O0, ver
+    // [[project_cobrador_directo_ppd_sin_factura_9sep]]). Esta función se
+    // queda solo con el caso genuino "vendido y cobrado en la MISMA
+    // sucursal, sin factura todavía".
     for (const cobro of (cuenta.cobros ?? [])) {
       if (cobro.claveCentro !== centro) continue;
+      if (cuenta.serieVenta && cuenta.serieVenta !== centro) continue;
       const fechaCobroMx = new Date(cobro.fecha);
       fechaCobroMx.setHours(fechaCobroMx.getHours() - 6);
       const diaCobro = fechaCobroMx.toISOString().slice(0, 10);
       if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
 
       if (facturaKey) {
+        // PPD: su cobro es de Cobranza (CFDI de Pago), sin importar cuánto
+        // tiempo pasó desde la factura — ver docstring de `facturasPPD` arriba.
+        //
+        // BUG CORREGIDO 2026-09-15 (caso real centro A0, 45 tickets/$349,050
+        // en 1-15 sep, ej. A0-260704334/JOSE DIAZ MARTINEZ $1,007.13 y
+        // A0-260803149/CONCEPCION ESPINOSA MERLIN $5,000.00): este salto
+        // confiaba en `facturaKey` sin importar si vino del campo CONFIRMADO
+        // del ERP (`serieFactura`/`folioFactura`) o del respaldo por folio de
+        // TICKET (`_facturaKeyDe` cae a `serieVenta`/`folioVenta` cuando el
+        // ERP no trae los primeros — ver su docstring). El respaldo puede
+        // coincidir por pura casualidad de numeración con un CFDI PPD de OTRO
+        // cliente sin relación real (confirmado con datos reales: el folio
+        // "coincidente" resultaba ser de un cliente completamente distinto).
+        // Como el chequeo de tolerancia de abajo se salta a propósito para
+        // PPD, no había ninguna otra validación — el ticket se excluía y el
+        // dinero desaparecía del export por completo (ni aquí ni en Cobranza,
+        // que tampoco tiene ninguna relación real que procesar). Verificado
+        // que el caso real que motivó este guard (depósito 046510/046497)
+        // SIEMPRE usa el campo confirmado, nunca el respaldo — restringir el
+        // salto automático a solo ese campo no le quita nada a ese caso.
+        if (facturasPPD.has(facturaKey) && _facturaConfirmada(cuenta)) continue;
         const diaCfdi = diaCfdiPorFolioFactura.get(facturaKey);
         // CFDI existe Y su fecha está dentro de tolerancia del cobro → el
         // pipeline normal por CFDI ya lo cubre (o lo cubrirá) — no duplicar.
@@ -1961,6 +2866,15 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       const formasPago = cobro.formasPago ?? [];
       for (const fp of formasPago) {
         if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
+        // "ANTICIPO" (bug real 2026-09-14, caso real Santa Rosa 10-sep,
+        // ticket M0-260901042 $628.41, claveSat='30'): mismo claveSat='30'
+        // que "SALDO A FAVOR" pero texto distinto — ver comentario
+        // equivalente en `desglosePagoReal` (línea ~1167) donde SÍ se filtra.
+        // Un ticket "sin factura" pagado con aplicación de anticipo no trajo
+        // dinero real nuevo a caja (el anticipo ya se reconoció como pasivo
+        // al crearse) — sin este filtro se contaba una segunda vez como si
+        // fuera efectivo/tarjeta real.
+        if (/anticipo/i.test(fp.nombre ?? '')) continue;
         const monto = (formasPago.length === 1 && cobro.monto != null)
           ? Math.abs(Number(cobro.monto) || 0)
           : (Number(fp.monto) || 0);
@@ -1974,7 +2888,20 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
 
   // Restar la Devolución de cada venta cancelada de sus propios renglones
   // (más recientes primero — la cancelación reversa el cobro más reciente de
-  // esa venta) antes de sumar al total por forma de pago.
+  // esa venta) antes de devolver el detalle POR TICKET.
+  //
+  // Corrección 2026-08-27 (confirmado con el usuario): antes se devolvía un
+  // solo total agregado por forma de pago (`porClave`), perdiendo a qué
+  // ticket pertenecía cada monto — para Transferencia/Tarjeta eso hacía
+  // imposible mostrar el número de autorización real (una sola línea de
+  // $168,731.13 no puede tener "un" número de autorización, es la suma de
+  // varios depósitos distintos). Ahora se devuelve el detalle por ticket
+  // (`ventaSerie`/`ventaFolio`/`clave`/`monto`) marcado con
+  // `serieVentaTicket`/`folioVentaTicket` al inyectarlo — el mecanismo que
+  // YA existe para resolver el banco real por ticket (`bancoRealPorTicket`,
+  // `construirBancoRealPorTicket`) lo recoge automáticamente, sin necesidad
+  // de una consulta bancaria nueva aquí.
+  const detalle = []; // [{ ventaSerie, ventaFolio, clave, monto }]
   for (const [ventaKey, renglones] of porVenta) {
     let devRestante = devGeneradoPorVenta.get(ventaKey) ?? 0;
     for (let i = renglones.length - 1; i >= 0 && devRestante > 0.01; i--) {
@@ -1983,12 +2910,135 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       r.monto -= reduccion;
       devRestante -= reduccion;
     }
+    const [ventaSerie, ventaFolio] = ventaKey.split('|');
     for (const r of renglones) {
       if (r.monto <= 0) continue;
-      porClave.set(r.clave, Math.round(((porClave.get(r.clave) ?? 0) + r.monto) * 100) / 100);
+      detalle.push({ ventaSerie, ventaFolio, clave: r.clave, monto: Math.round(r.monto * 100) / 100 });
     }
   }
-  return porClave;
+  return detalle;
+}
+
+// Saldo a favor USADO en el día real del cobro cuando la factura que lo
+// consume se timbra un día distinto (confirmado con el usuario 2026-09-10,
+// caso real SD SOLUTIONS/Ferrocarril: factura F0-260900061 timbrada 4-sep
+// 22:15, pero su ticket real F0-260900334 usó $2,689.72 de saldo a favor
+// (de 3 cuentas SF distintas) el 3-sep 18:50). Mismo principio que
+// `_cobrosSinFacturaPorCentro` para Efectivo ("el cobro debe caer el día
+// que se cobró, la factura saldrá cuando se timbre") aplicado a SF: el
+// mecanismo normal (`_prefetchAjustesFacturaPropia`/`emitirLineaSF`) solo
+// emite esta línea como parte de procesar la factura, en SU propio día —
+// si el uso real cae en un día distinto, se pierde sin importar qué día se
+// genere (ni el del cobro real, que no tiene la factura en su batch, ni el
+// de la factura, por el filtro de mismo-día). Esta función es el mecanismo
+// INDEPENDIENTE que la muestra en el día real, sin depender de que la
+// factura esté en el batch. Para NO duplicar cuando la factura SÍ cae en
+// este mismo rango (caso normal, sin desfase), `_prefetchAjustesFacturaPropia`
+// ya NO exime por `_viaTicketPropio` el filtro de mismo-día de SF (ver
+// comentario ahí) — cada mecanismo cubre exactamente un caso, sin solape.
+async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fechaFin }) {
+  if (!centro || !fechaInicio || !fechaFin) return [];
+
+  const fechaDesdeISO = new Date(`${fechaInicio}T00:00:00-06:00`).toISOString();
+  const fechaHastaISO = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
+
+  let resultadosSaldos = [];
+  try {
+    resultadosSaldos = await obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO });
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn(`[SFUsadoAntesDeFacturar] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
+    return [];
+  }
+
+  // SF-OCULTO (confirmado con el usuario, caso real F0-260900222→CAC-078425
+  // generado 08:09am, usado 09:00am por F0-260900236, mismo almacén F0,
+  // mismo día 3-sep, uso completo): la regla ya establecida de "se genera y
+  // se ocupa el mismo día y mismo almacén, completo → sigue oculto" aplica
+  // AQUÍ IGUAL — no importa que la FACTURA consumidora se timbre otro día,
+  // lo que decide oculto es el par generación/uso, no la factura. Sin este
+  // filtro, `_sfUsadoAntesDeFacturarPorCentro` mostraba como línea visible
+  // un SF que nunca debió verse en ningún lado (bug real 2026-09-10).
+  // `resultadosSaldos` (mismo centro+día que ya se consultó arriba) trae
+  // TODAS las generaciones de este almacén ese rango — no hace falta
+  // ninguna consulta extra.
+  const diaGenPorMarcador = new Map(); // `${serieOrigen}|${folioOrigen}` -> día (México) de la generación
+  for (const cuenta of resultadosSaldos) {
+    for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
+      const marcador = `${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen ?? ''}`;
+      diaGenPorMarcador.set(marcador, _diaMx(gen.fecha));
+    }
+  }
+
+  // Usos reales cuyo día cae en este rango — sin importar el día de la
+  // factura que los consume (eso se decide después).
+  const candidatosUso = [];
+  for (const cuenta of resultadosSaldos) {
+    for (const u of (cuenta.saldosFavorUsados ?? [])) {
+      const diaUso = _diaMx(u.fecha);
+      if (!diaUso || diaUso < fechaInicio || diaUso > fechaFin) continue;
+      const marcador = `${(u.serieOrigen ?? '').toUpperCase()}|${u.folioOrigen ?? ''}`;
+      const diaGen = diaGenPorMarcador.get(marcador);
+      if (diaGen && diaGen === diaUso) continue; // oculto: mismo día/almacén, no se muestra
+      candidatosUso.push({ cuenta, uso: u });
+    }
+  }
+  if (!candidatosUso.length) return [];
+
+  // Resolver el día real y el cliente de cada factura consumidora conocida
+  // — si su propio día CAE en este mismo rango, el mecanismo normal ya la
+  // muestra (no duplicar aquí); si no, o si el CFDI aún no sincronizó, se
+  // inyecta aquí.
+  const facturaKeys = [...new Set(
+    candidatosUso.map(({ cuenta }) => `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`),
+  )];
+  const orConditions = facturaKeys.map(k => {
+    const [serie, folio] = k.split('|');
+    return { serie, folio };
+  });
+  const cfdisFactura = orConditions.length
+    ? await CFDI.find({ 'emisor.rfc': rfc, $or: orConditions })
+        .select('serie folio fecha uuid receptor').lean()
+    : [];
+  // La colección CFDI puede tener MÁS DE UN documento para el mismo
+  // serie/folio (un "stub" incompleto sincronizado antes que el CFDI
+  // completo, mismo patrón confirmado 2026-08-17, caso real FILEMON
+  // A0-260801889) — bug real encontrado 2026-09-10, caso NOE ALAN FLORES
+  // SANCHEZ/F0-260900096: el stub sin `receptor.nombre` pisaba al documento
+  // completo, saliendo "CLIENTE NO IDENTIFICADO" aunque el CFDI real SÍ
+  // estaba sincronizado con su nombre. Se prefiere SIEMPRE el documento
+  // más completo (con `receptor.nombre`), y solo entre documentos
+  // igualmente completos se usa la fecha más temprana como desempate.
+  const datosFacturaPorKey = new Map(); // key -> { dia, uuid, nombreCliente, completo }
+  for (const c of cfdisFactura) {
+    const key = `${c.serie}|${c.folio}`;
+    const dia = _diaMx(c.fecha);
+    const completo = !!c.receptor?.nombre;
+    const actual = datosFacturaPorKey.get(key);
+    if (!actual || (completo && !actual.completo) || (completo === actual.completo && dia < actual.dia)) {
+      datosFacturaPorKey.set(key, { dia, uuid: c.uuid ?? null, nombreCliente: c.receptor?.nombre ?? null, completo });
+    }
+  }
+
+  const detalle = [];
+  const vistos = new Set();
+  for (const { cuenta, uso } of candidatosUso) {
+    const facturaKey = `${cuenta.serieFactura || cuenta.serieVenta}|${cuenta.folioFactura || cuenta.folioVenta}`;
+    const datosFactura = datosFacturaPorKey.get(facturaKey);
+    if (datosFactura?.dia && datosFactura.dia >= fechaInicio && datosFactura.dia <= fechaFin) continue;
+    const dedupeKey = `${(uso.serieOrigen ?? '').toUpperCase()}|${uso.folioOrigen ?? ''}|${cuenta.serieVenta}|${cuenta.folioVenta}|${uso.fecha}`;
+    if (vistos.has(dedupeKey)) continue;
+    vistos.add(dedupeKey);
+    const monto = Math.abs(Number(uso.montoUsado) || 0);
+    if (monto <= 0) continue;
+    detalle.push({
+      ventaSerie: cuenta.serieVenta ?? null, ventaFolio: cuenta.folioVenta ?? null,
+      monto,
+      nombreCliente: datosFactura?.nombreCliente ?? 'CLIENTE NO IDENTIFICADO',
+      facturaUuid: datosFactura?.uuid ?? null,
+    });
+  }
+  return detalle;
 }
 
 function _fmtDMY(fechaISO) {
@@ -2152,12 +3202,34 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
     }).select('uuid').lean();
     const uuidsConIndicadorErp = erpConIndicador.map(d => d.uuid);
 
+    // BUG CORREGIDO 2026-09-07 (caso real CONSTRUCASA, venta C0-260900035/
+    // Egreso C0-260900036, cancelación COMPLETA de una Factura Final de
+    // Anticipo, ambos $3,827.37): mismo problema que el bloque de arriba,
+    // pero para NCs tipoRelacion='07' (Aplicación de Anticipo — "Reg 23"/
+    // "TO-EGR"). El ERP declara `tipoOrigen: 'Egreso'` y/o su propio
+    // `cfdiRelacionados.tipoRelacion='07'`, pero el SAT trae
+    // `cfdiRelacionados: []` — sin este indicador, esta función NUNCA las
+    // encontraba (ni por el filtro 01/03 ni por el indicador de arriba,
+    // pensado solo para BON/BCT/CANCELACION), así que jamás se fusionaban a
+    // la póliza de Ingreso de su venta — el ingreso quedaba reconocido sin
+    // su reversión, sin ningún error visible.
+    const erpConAnticipo07 = await CFDI.find({
+      uuid:   { $in: [...uuidsNcDelDia] },
+      source: 'ERP',
+      $or: [
+        { tipoOrigen: 'Egreso' },
+        { 'cfdiRelacionados.tipoRelacion': '07' },
+      ],
+    }).select('uuid').lean();
+    const uuidsConAnticipo07Erp = erpConAnticipo07.map(d => d.uuid);
+
     const ncsRaw = await CFDI.find({
       ...filtroBaseNc,
       uuid: { $in: [...uuidsNcDelDia] },
       $or: [
         { 'cfdiRelacionados.tipoRelacion': { $in: ['01', '03'] } },
         { uuid: { $in: uuidsConIndicadorErp } },
+        { uuid: { $in: uuidsConAnticipo07Erp } },
       ],
     })
       .select(selectNc)
@@ -2263,6 +3335,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
   if (!tipoCfdi)  throw new BadRequestError('Debes seleccionar el tipo de CFDI a procesar (I, E o P)');
+
+  // Cobranza (Pagos, tipoCfdi='P'): generación TOTALMENTE independiente — ver
+  // cobranza-poliza-generator.service.js. Ni una sola línea de abajo (pensada
+  // para Ingreso/Egreso) se ejecuta para Pagos; el require es perezoso (no en
+  // el top del archivo) para evitar un ciclo, ya que ese módulo reutiliza
+  // utilidades de numeración de folio exportadas de aquí (2026-09-01,
+  // confirmado con el usuario: la generación de Cobranza no debe compartir
+  // código con la de Ingreso, solo utilería genérica sin lógica de negocio).
+  if (tipoCfdi === 'P') {
+    return require('./cobranza-poliza-generator.service').generarPropuestaCobranza({
+      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro,
+    });
+  }
 
   // 1. UUIDs ya contabilizados — solo los del RFC solicitado (JOIN con polizas)
   const yaContabilizados = await PolizaMovimiento.findAll({
@@ -2601,80 +3686,45 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `_prefetchSaldosFavorGenerados`) debe llegar a esa llamada, para que el
   // lado de "uso" también sepa marcar como oculto el mismo par
   // generación+uso "lavado" el mismo día en el mismo almacén.
-  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
+  const { mapa: mapaSaldosFavorGeneradosProp, devsOcultos: devsOcultosSFProp, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFProp, anticiposConvertidos: anticiposConvertidosProp, anticipoFolioPorUuidDesdeSaldosFavor: anticipoFolioPorUuidDesdeSaldosFavorProp } = await _prefetchSaldosFavorGenerados(cfdisConNCProp, rfc, ccBySerieMapProp, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
 
-  // Cobros de sucursales (Caja/Bancos por identificar, ver
-  // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
-  // Se calcula ANTES del loop de reglas (más abajo) porque
-  // `facturasVendedorCubiertas` se usa ahí para omitir el Cargo normal de las
-  // facturas cuyo Cargo ya cubre este flujo — si no se omite, la póliza queda
-  // con doble Cargo (uno normal + uno de sucursal) contra un solo Abono.
-  // Usa cfdisSinPolizaFinal (SIN filtrar por centro) para poder detectar el
-  // cobro cruzado en cualquier dirección; el propio construirMovimientosPuente
-  // filtra las líneas según centroCostoId.
-  //
-  // Al generar POR DÍA (fechaInicio/fechaFin), el universo de CFDIs para
-  // resolver documentos relacionados se amplía a TODO el periodo (ver
-  // `_fetchCfdisParaPuenteAmplio`) — el cobro se filtra por su fecha REAL
-  // (fechaDesde/fechaHasta, dentro de construirMovimientosPuente), no por la
-  // fecha del CFDI que lo referencia.
-  let movsPuente = [];
-  let facturasVendedorCubiertas = new Map(); // uuid → monto ya cubierto (ver docstring en cobros-sucursal-puente.service.js)
-  let facturasPPDCubiertas = new Map();
-  let pendientesPorFacturarProp = [];
-  let cuentaSaldoFavorIdProp = null;
-  let cuentaIvaSaldoFavorIdProp = null;
-  if (tipoCfdi === 'I' && centroCostoId) {
-    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
-    cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
-    cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
-    if (cuentaCajaId && cuentaBancosId) {
-      // Acotado a la serie propia para ESTA consulta — el lado cobrador ya no
-      // depende SOLO de ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio`
-      // y la cola `CobroSucursalPendiente`): cuando se genera por día, además
-      // se consulta directo por centro+fecha vía `centroPropioClave` (ver
-      // comentario en `construirMovimientosPuente`).
-      const serieDelCentro = serieDelCentroProp;
-      const cfdisParaPuente = (fechaInicio && fechaFin)
-        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
-        : cfdisSinPolizaFinal;
-      const resultadoPuente = await construirMovimientosPuente({
-        cfdis: cfdisParaPuente,
-        centroCostoId,
-        ccBySerieMap: ccBySerieMapProp,
-        cuentaCajaId,
-        cuentaBancosId,
-        cuentaPuenteId,
-        cuentaSaldoFavorId,
-        cuentaIvaSaldoFavorId,
-        cuentaClubTuberosId,
-        rfc,
-        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
-        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
-        devsOcultosSF: devsOcultosSFProp,
-        centroPropioClave: serieDelCentro,
-      });
-      movsPuente = resultadoPuente.movimientos;
-      facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
-      facturasPPDCubiertas = resultadoPuente.facturasPPDCubiertas;
-      pendientesPorFacturarProp = resultadoPuente.pendientesPorFacturar ?? [];
-      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
-      // detectado hoy con lo ya cubierto en días previos.
-      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
-        facturasVendedorCubiertas.set(u, (facturasVendedorCubiertas.get(u) ?? 0) + monto);
-      }
-    }
-  }
-
-  // 5. Precalcular regla por CFDI y recolectar todos los códigos de cuenta necesarios
+  // Adelantado (2026-09-04, antes de `construirMovimientosPuente`): el
+  // mecanismo APA de ese bloque necesita `saldoFavorUsadoMapProp` para saber
+  // qué facturas ya va a cubrir `cfdiToMovimientos` (split por origen) más
+  // abajo en el loop principal, y así NO duplicar la misma línea de SF usado
+  // (caso real Ferrocarril 1-sep, factura F0-260800614: el split por origen
+  // ya emitía 2 líneas — una por cada devolución de origen — y el bloque APA
+  // agregaba una TERCERA línea con el monto total combinado, literal la suma
+  // de las otras dos). `_deduplicarSFRedundante` solo detecta duplicados de
+  // monto EXACTO, así que nunca cachaba este caso (2 líneas parciales vs. 1
+  // línea con el total). Se movió aquí (antes vivía después de
+  // `construirMovimientosPuente`) porque no depende de nada que ese bloque
+  // calcule — solo de `cfdisConNCProp`/`rules` (ya disponibles arriba) y
+  // `serieDelCentroProp`/fechaInicio/fechaFin (ya disponibles arriba).
   const cfdiConRegla = cfdisConNCProp.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
+  if (process.env.DEBUG_OPA_UUID) {
+    const _t = process.env.DEBUG_OPA_UUID.toUpperCase();
+    const enCfdisConNC = cfdisConNCProp.some(c => (c.uuid || '').toUpperCase() === _t);
+    const enCfdiConRegla = cfdiConRegla.some(({ cfdi }) => (cfdi.uuid || '').toUpperCase() === _t);
+    console.warn(`[DEBUG_EGR_BATCH] uuid=${_t} enCfdisConNCProp=${enCfdisConNC} enCfdiConRegla=${enCfdiConRegla}`);
+  }
+
+  // CFDIs que RECIBEN un Anticipo (Reg 22/22A — cuentaAbono=2103010001,
+  // claveProdServ 84111506) ya clasificados en este lote — ver
+  // `_esConversionAAnticipoPorMonto` (respaldo del guard SF↔Anticipo cuando
+  // `/cuentas-pendientes` ya no trae la `anotacion`). OJO: `rule.cuentaIvaAnticipo`
+  // NO sirve aquí — esa propiedad solo la usan las reglas que CANCELAN un
+  // anticipo (Reg 22C/23), no la que lo recibe.
+  const anticiposClasificadosProp = cfdiConRegla
+    .filter(({ rule, cfdi: c }) => c.tipoDeComprobante === 'I' && rule?.cuentaAbono === CODIGO_CUENTA_ANTICIPOS_CLIENTES)
+    .map(({ cfdi: c }) => ({ total: c.total, fecha: c.fecha, receptor: c.receptor }));
 
   // Solo para que `_prefetchAjustesFacturaPropia` también resuelva el cobro
   // real de las canceladas-sin-compensar (ver bloque más abajo que las
@@ -2719,11 +3769,101 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+  // Ver comentario en el parámetro `ventasSFCubiertasPorSplit` de
+  // `construirMovimientosPuente` (cobros-sucursal-puente.service.js) — set de
+  // ventas GENERADORAS (`d.ventaSerie|d.ventaFolio`, no la factura
+  // consumidora) que el split por origen de `cfdiToMovimientos` ya va a
+  // cubrir, para que el bloque APA de ese archivo no las duplique.
+  const ventasSFCubiertasPorSplitProp = new Set();
+  for (const sfUsado of saldoFavorUsadoMapProp.values()) {
+    for (const d of (sfUsado.detalle ?? [])) {
+      const key = (d.ventaSerie && d.ventaFolio) ? `${d.ventaSerie}|${d.ventaFolio}`
+        : (d.serieOrigen && d.folioOrigen) ? `${d.serieOrigen}|${d.folioOrigen}` : null;
+      if (key) ventasSFCubiertasPorSplitProp.add(key);
+    }
+  }
+
+  // Cobros de sucursales (Caja/Bancos por identificar, ver
+  // cobros-sucursal-puente.service.js) — solo aplica a pólizas de Ingreso.
+  // Se calcula ANTES del loop de reglas (más abajo) porque
+  // `facturasVendedorCubiertas` se usa ahí para omitir el Cargo normal de las
+  // facturas cuyo Cargo ya cubre este flujo — si no se omite, la póliza queda
+  // con doble Cargo (uno normal + uno de sucursal) contra un solo Abono.
+  // Usa cfdisSinPolizaFinal (SIN filtrar por centro) para poder detectar el
+  // cobro cruzado en cualquier dirección; el propio construirMovimientosPuente
+  // filtra las líneas según centroCostoId.
+  //
+  // Al generar POR DÍA (fechaInicio/fechaFin), el universo de CFDIs para
+  // resolver documentos relacionados se amplía a TODO el periodo (ver
+  // `_fetchCfdisParaPuenteAmplio`) — el cobro se filtra por su fecha REAL
+  // (fechaDesde/fechaHasta, dentro de construirMovimientosPuente), no por la
+  // fecha del CFDI que lo referencia.
+  let movsPuente = [];
+  let facturasVendedorCubiertas = new Map(); // uuid → monto ya cubierto (ver docstring en cobros-sucursal-puente.service.js)
+  let facturasPPDCubiertas = new Map();
+  let pendientesPorFacturarProp = [];
+  // "DEPOSITO EN EFECTIVO" sin conciliar (ver `_esDepositoEfectivo`,
+  // cfdi-mapping.service.js) — informativo, nunca se contabiliza en la
+  // póliza (confirmado con el usuario 2026-09-10).
+  const depositosEfectivoProp = [];
+  let cuentaSaldoFavorIdProp = null;
+  let cuentaIvaSaldoFavorIdProp = null;
+  if (tipoCfdi === 'I' && centroCostoId) {
+    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
+    cuentaSaldoFavorIdProp = cuentaSaldoFavorId;
+    cuentaIvaSaldoFavorIdProp = cuentaIvaSaldoFavorId;
+    if (cuentaCajaId && cuentaBancosId) {
+      // Acotado a la serie propia para ESTA consulta — el lado cobrador ya no
+      // depende SOLO de ampliar esta consulta (ver `_fetchCfdisParaPuenteAmplio`
+      // y la cola `CobroSucursalPendiente`): cuando se genera por día, además
+      // se consulta directo por centro+fecha vía `centroPropioClave` (ver
+      // comentario en `construirMovimientosPuente`).
+      const serieDelCentro = serieDelCentroProp;
+      const cfdisParaPuente = (fechaInicio && fechaFin)
+        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentro })
+        : cfdisSinPolizaFinal;
+      const resultadoPuente = await construirMovimientosPuente({
+        cfdis: cfdisParaPuente,
+        centroCostoId,
+        ccBySerieMap: ccBySerieMapProp,
+        cuentaCajaId,
+        cuentaBancosId,
+        cuentaPuenteId,
+        cuentaSaldoFavorId,
+        cuentaIvaSaldoFavorId,
+        cuentaClubTuberosId,
+        rfc,
+        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+        devsOcultosSF: devsOcultosSFProp,
+        centroPropioClave: serieDelCentro,
+        // Ver comentario arriba (adelantado 2026-09-04) — evita que el
+        // mecanismo APA duplique el SF que `cfdiToMovimientos` ya va a
+        // desglosar por origen para esta misma venta generadora.
+        ventasSFCubiertasPorSplit: ventasSFCubiertasPorSplitProp,
+      });
+      movsPuente = resultadoPuente.movimientos;
+      facturasVendedorCubiertas = resultadoPuente.facturasVendedorCubiertas;
+      facturasPPDCubiertas = resultadoPuente.facturasPPDCubiertas;
+      pendientesPorFacturarProp = resultadoPuente.pendientesPorFacturar ?? [];
+      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
+      // detectado hoy con lo ya cubierto en días previos.
+      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
+        facturasVendedorCubiertas.set(u, (facturasVendedorCubiertas.get(u) ?? 0) + monto);
+      }
+    }
+  }
+
+  // cfdiConRegla / cuentaMap / saldoFavorUsadoMapProp se calculan ANTES de
+  // `construirMovimientosPuente` (más arriba, ver ese bloque) — necesarios
+  // ahí para que el mecanismo APA sepa qué facturas ya cubre el split por
+  // origen de `cfdiToMovimientos`, y evite duplicar (ver comentario en
+  // `_deduplicarSFRedundante` y el fix del 2026-09-04).
   // Documentos liquidados por cada Pago (asiento completo por factura,
   // incluyendo su propio saldo a favor si aplica) — ver `_prefetchDoctosPago`.
   const { doctosPorUuid: doctosPagoMapProp } = await _prefetchDoctosPago(cfdiConRegla, rfc);
@@ -2760,11 +3900,65 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const anticipoCfdisProp = _rel07UuidsSinReglaProp.length
     ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaProp } }).select('uuid serie folio total fecha').lean()
     : [];
+  // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
+  // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
+  const ventaUuidsConAnticipoProp = cfdiConRegla
+    .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+      && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+    .map(({ cfdi }) => cfdi.uuid)
+    .filter(Boolean);
+  const egresosAnticipoPorVentaProp = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoProp, rfc);
+  // Cuentas Pendientes (CxC/Bancos) — ver `_prefetchCuentasPendientesAnticipo`:
+  // fuente más confiable que `_resolverReferenciaOpaPorMonto` (referencia) y
+  // que `context.montoAnticipoUsado` (monto) para Anticipo. Rango de fechas
+  // cubre tanto los CFDIs de anticipo como las ventas que los consumen.
+  const {
+    montoAnticipoPorFactura: montoAnticipoPorFacturaProp,
+    referenciaOpaPorFactura: referenciaOpaPorFacturaProp,
+    origenesConvertidosAAnticipo: origenesConvertidosAAnticipoProp,
+  } = await _prefetchCuentasPendientesAnticipo([
+      // BUG CORREGIDO 2026-09-07: el arreglo de fechas ANTES solo traía fechas
+      // del mecanismo "Anticipo sin regla" (rel07) — nunca la fecha de la
+      // propia Cancelación/Devolución (CFDI tipo E que dispara
+      // `_inyectarSaldoFavorGenerado`, el que en realidad necesita el guard
+      // `origenesConvertidosAAnticipo`). Si ese mecanismo no aparecía en el
+      // lote, el arreglo llegaba VACÍO y `_prefetchCuentasPendientesAnticipo`
+      // regresaba de inmediato con los 3 mapas vacíos (ver su código) — el
+      // guard de 6eda690 quedaba siempre desactivado sin ningún error visible
+      // (caso real Reforma, JOSE IRAN SUAREZ LINARES, DEV-057088). Se agrega
+      // fechaInicio/fechaFin (todo el periodo que se está generando) para que
+      // la ventana SIEMPRE cubra las Cancelaciones/Devoluciones del lote,
+      // igual que ya hace `_prefetchSaldosFavorGenerados` arriba.
+      fechaInicio, fechaFin,
+      ...anticipoCfdisProp.map(c => c.fecha),
+      ...cfdiConRegla
+        .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+          && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .map(({ cfdi }) => cfdi.fecha),
+    ]);
   const anticipoFolioPorUuidProp = {
     ...Object.fromEntries(
       anticipoCfdisProp.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
     ),
     ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisProp)),
+    // Cuentas Pendientes gana sobre ambos anteriores cuando trae el dato —
+    // folio real de Kore, sin depender de que Bancos ya haya conciliado el
+    // depósito (ver docstring de `_prefetchCuentasPendientesAnticipo`).
+    ...Object.fromEntries(
+      anticipoCfdisProp
+        .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaProp.get(`${c.serie}|${c.folio}`)])
+        .filter(([, ref]) => ref),
+    ),
+    // Prioridad alta: /saldos-favor no purga la conversión SF→Anticipo (ver
+    // docstring de `_resolverReferenciaOpaDesdeSaldosFavor`) — cubre el caso
+    // donde Cuentas Pendientes ya perdió el registro.
+    ..._resolverReferenciaOpaDesdeSaldosFavor(anticipoCfdisProp, anticiposConvertidosProp),
+    // Máxima prioridad: match DIRECTO por UUID (`cuenta.anticipos[]` de
+    // /saldos-favor, confirmado 2026-09-08) — no depende de que el CFDI del
+    // Anticipo haya sincronizado en Mongo (caso real RAYMUNDO CUELLAR
+    // MENDOZA, anticipo `176AFBF3-...` nunca sincronizado, ver docstring de
+    // `anticipoFolioPorUuidDesdeSaldosFavor` en `_prefetchSaldosFavorGenerados`).
+    ...anticipoFolioPorUuidDesdeSaldosFavorProp,
   };
 
   let saldoRestanteProp = 0;
@@ -2783,20 +3977,64 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // 6. Generar movimientos usando cuentaMap pre-cargado
   // (ccBySerieMapProp ya se resolvió arriba, antes del filtro por sucursal)
 
-  // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Solo aplica cuando la factura final (formaPago=30) usa el modelo 2 asientos
-  // (cuentaCargo=2103010001 Anticipos). En el modelo 3 asientos (cuentaCargo=1103010001
-  // Clientes) la NC sí debe procesarse — cancela Anticipos vs Clientes en asiento 3.
-  const anticosCubiertosPorReg22C = new Set();
-  for (const { cfdi: c, rule: r } of cfdiConRegla) {
-    if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
-    if (r?.cuentaCargo !== '2103010001') continue;
-    if (c.uuid) anticosCubiertosPorReg22C.add(c.uuid.toUpperCase());
+  // ── Fix doble-contabilización anticipo PUE (venta ya saldada 100% con
+  // Anticipo, luego cancelada por completo vía Egreso "Reg TO-EGR"/"Reg 23") ──
+  // BUG CORREGIDO 2026-09-07 (2do ajuste, caso real CONSTRUCASA, venta
+  // C0-260900035/Egreso C0-260900036, ambos $3,827.37): el primer intento
+  // aquí comparaba `rule.cuentaCargo === '2103010001'` para detectar el
+  // "modelo 2 asientos" — pero Reg 22C SIEMPRE usa cuentaCargo=1103010001
+  // (Clientes), ese chequeo nunca disparaba (dead code, confirmado con
+  // trazas en vivo). La señal real es el mecanismo "cierre OPA" (más abajo,
+  // `reglaNombre: 'OPA'`), que SUSTITUYE el Cargo-Clientes original de la
+  // venta por Cargo Anticipos+IVA-anticipo cuando `/desgloses-cobro`
+  // confirma que esa venta se saldó con Anticipo (`anticipoUsadoMapProp`,
+  // ya prefetched arriba). Cuando eso pasa, la venta NUNCA tuvo saldo en
+  // Clientes que cancelar — un Egreso con las cuentas normales de TO-EGR
+  // (Cargo Anticipos otra vez / Abono Clientes) duplicaría el Cargo a
+  // Anticipos Y dejaría un Abono a Clientes sin contraparte (confirmado
+  // con datos reales de Postgres: Anticipos debitada 2 veces por el mismo
+  // monto, Clientes con abono huérfano). Confirmado con el usuario: en ese
+  // caso el Egreso debe REVERTIR la venta (Cargo Devoluciones s/Ventas+IVA)
+  // reinstalando el MISMO pasivo que "cierre OPA" ya había cancelado
+  // (Abono Anticipos+IVA-anticipo) — nunca tocar Clientes. Aplicado más
+  // abajo, justo después de `cfdiToMovimientos`, sobre las líneas de la NC.
+  const ventasConAnticipoRedirigido = new Set();
+  for (const { cfdi: c } of cfdiConRegla) {
+    if (c.tipoDeComprobante !== 'I' || !c.serie || !c.folio || !c.uuid) continue;
+    if (Number(anticipoUsadoMapProp.get(`${c.serie}|${c.folio}`)) > 0) {
+      ventasConAnticipoRedirigido.add(c.uuid.toUpperCase());
+    }
   }
+  // Ventas con 2+ anticipos combinados en un solo cierre OPA (ver
+  // `anticiposResueltosProp` más abajo) que ADEMÁS van a ser revertidas por un
+  // Egreso real en este mismo batch (`ventasConAnticipoRedirigido`) —
+  // confirmado con el usuario 2026-09-14/15, caso real Ferrocarril
+  // F0-260900139 (OPA-00908/00909): en vez de las 8 líneas normales (4 del
+  // cierre OPA por anticipo + 4 de OPA-REVERSION), este caso combinado se
+  // muestra en solo 4: TODOS los anticipos MENOS EL ÚLTIMO se cargan a
+  // Devoluciones+IVA normal (su monto propio completo, sumado si son 2+), y
+  // SOLO el ÚLTIMO se carga a Anticipos+IVA-anticipo (su monto propio
+  // completo) — regla confirmada explícitamente por el usuario, acepta que
+  // pueda quedar una diferencia de centavos contra el total real consumido/
+  // revertido (no se fuerza a cuadrar exacto).
+  // Mapa (no Set): uuid de la Factura → montos de la porción "previos" que el
+  // EGRESO (procesado más abajo, en este mismo batch) debe generar en SU
+  // PROPIO cfdiUuid con reglaNombre='OPA-REVERSION' — necesario para que
+  // `ordenarCargoAntesDeAbono`/`bloquesAjustesContado` (poliza.service.js)
+  // sigan intercalando "Ingreso → Egreso → cierre OPA" igual que el caso de
+  // 1 solo anticipo (esa lógica exige 2 grupos, uno 'OPA' y otro
+  // 'OPA-REVERSION', en cfdis distintos — bug real 2026-09-15, ver comentario
+  // completo más abajo donde se llena este mapa).
+  const ventasConComboEspecialAnticipoProp = new Map();
 
-  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
-  // Si el UUID relacionado tipo 07 de alguna NC ya tiene movimiento en una regla con cuentaIvaAnticipo
-  // en una póliza no cancelada, la NC está cubierta aunque no esté en el batch actual.
+  // Fix 5 (sin cambios): verificar también en BD — la NC y la factura final
+  // pueden venir en batches distintos. Si el UUID relacionado tipo 07 de
+  // alguna NC ya tiene movimiento en una regla con cuentaIvaAnticipo en una
+  // póliza no cancelada, la NC está cubierta aunque no esté en el batch
+  // actual — se sigue OMITIENDO por completo (criterio amount-blind
+  // anterior, sin el ajuste de redirección de cuentas de arriba, hasta
+  // confirmar un caso real cross-batch que lo amerite).
+  const anticosCubiertosPorReg22C = new Map();
   {
     const uuids07 = new Set(
       cfdiConRegla
@@ -2822,7 +4060,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           attributes: ['cfdiUuid'],
           include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
         });
-        for (const m of yaEnBD) anticosCubiertosPorReg22C.add(m.cfdiUuid.toUpperCase());
+        for (const m of yaEnBD) anticosCubiertosPorReg22C.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
     }
   }
@@ -2831,13 +4069,18 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   let sinRegla = 0;
 
   for (const { cfdi, rule } of cfdiConRegla) {
-    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo original ya fue procesado
-    // por una factura PUE formaPago=30 (Reg 22C) en este mismo batch.
+    // uuid07: venta referenciada por esta NC tipo E vía tipoRelacion=07 (si
+    // aplica) — se usa tanto para el skip "Fix 5" (cross-batch, abajo) como
+    // para la redirección de cuentas cuando esa venta ya se saldó 100% con
+    // Anticipo (`ventasConAnticipoRedirigido`, ver comentario arriba).
+    let uuid07;
     if (cfdi.tipoDeComprobante === 'E' &&
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07 = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
-      const uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
-      if (uuid07 && anticosCubiertosPorReg22C.has(uuid07)) continue;
+      uuid07 = (_rel07?.uuids?.[0] ?? _rel07?.uuid ?? '').toUpperCase() || undefined;
+      // Fix 5 (cross-batch): omitir por completo si el anticipo ya se
+      // procesó en una póliza previa no cancelada (ver comentario arriba).
+      if (uuid07 && anticosCubiertosPorReg22C.get(uuid07) === Infinity) continue;
     }
     const context = {};
     if (rule?.cuentaDeltaAnticipo && cfdi.cfdiRelacionados?.length) {
@@ -2904,6 +4147,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       }
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
+      const anticipoUsadoCfdi = anticipoUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
+      if (anticipoUsadoCfdi > 0) context.montoAnticipoUsado = anticipoUsadoCfdi;
     }
     if (cfdi.tipoDeComprobante === 'P') {
       const doctosPago = doctosPagoMapProp.get(cfdi.uuid);
@@ -2911,6 +4156,35 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
+    const comboEspecialProp = uuid07 ? ventasConComboEspecialAnticipoProp.get(uuid07) : null;
+    if (comboEspecialProp) {
+      // El combo especial de 2+ anticipos (ver `ventasConComboEspecialAnticipoProp`)
+      // ya generó la porción "último anticipo" (Anticipos+IVA-anticipo) al
+      // procesar la Factura Final — las líneas propias de ESTE Egreso (Cargo
+      // Anticipos otra vez/Abono Clientes de la regla TO-EGR) se DESCARTAN
+      // por completo y se reemplazan por la porción "previos" (Devoluciones+
+      // IVA-normal), tagueada 'OPA-REVERSION' en el cfdiUuid de este Egreso
+      // — mismo patrón de 2 grupos que el caso normal de 1 anticipo, para que
+      // el orden de despliegue (poliza.service.js) siga funcionando igual.
+      movs.length = 0;
+      const baseComboEgresoProp = {
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA-REVERSION',
+        concepto: comboEspecialProp.refCombo, serie: comboEspecialProp.serieCombo,
+        centroCosto: rule?.centroCosto ?? '',
+      };
+      if (comboEspecialProp.subtotalPrevios > 0) {
+        movs.push({ ...baseComboEgresoProp, cuentaId: cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null, debe: comboEspecialProp.subtotalPrevios, haber: 0 });
+      }
+      if (comboEspecialProp.ivaPrevios > 0) {
+        movs.push({ ...baseComboEgresoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null, debe: comboEspecialProp.ivaPrevios, haber: 0 });
+      }
+    } else if (uuid07 && ventasConAnticipoRedirigido.has(uuid07)) {
+      _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
+      if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
+        console.warn(`[DEBUG_EGR_REDIRECT] cfdi=${cfdi.serie}-${cfdi.folio} uuid07=${uuid07} movs=${JSON.stringify(movs)}`);
+      }
+    }
 
     if (rule?.esAplicacionSaldo) {
       const usado = movs.find(m => m._saldoUsado != null)?._saldoUsado ?? 0;
@@ -2937,25 +4211,155 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // resolver su folio ni prorratear el monto entre ambos anticipos — por
     // ahora solo se refleja el/los que sí resuelven.
     let anticipoFolioRefProp = null;
-    if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
+    // Declarado fuera del `if` (bug real 2026-09-15, ReferenceError en
+    // producción): se usa más abajo, fuera de este bloque, al armar el
+    // desglose por anticipo del cierre OPA.
+    const anticiposResueltosProp = [];
+    const _califica07Prop = cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo;
+    if (_califica07Prop) {
       // Solo los folios que SÍ resuelven se concatenan ("OPA-00763-00665");
       // si además hay alguna relación sin resolver (CFDI relacionado sin
       // sincronizar en Mongo), se agrega UN solo "-" al final ("OPA-00763-"),
       // sin importar en qué posición del arreglo venga la que no resolvió —
       // así nunca queda un guion doble en medio (bug real 2026-08-25: el no
       // resuelto venía primero y el join daba "OPA--00763").
+      //
+      // IMPORTANTE (2026-08-31, caso real MONSAN B0-260801098): SAT suele
+      // agrupar VARIOS anticipos distintos en una sola relación con varios
+      // `uuids` (en vez de una relación por anticipo, como sí hace el ERP) —
+      // el loop interno ANTES hacía `break` en cuanto CUALQUIER uuid resolvía
+      // algo (aunque fuera el folio crudo de fallback), así que con 2 uuids
+      // en el mismo array, el SEGUNDO (con folio real "OPA-00763" resuelto
+      // por monto) nunca se intentaba — se quedaba con el fallback crudo del
+      // primero ("OPA-260201994", el folio interno del anticipo, no un
+      // OPA-XXXXX real). Ahora se recorren TODOS los uuids de cada relación
+      // (no solo el primero que "resuelva" algo), tratando cada uno como un
+      // anticipo distinto a concatenar — mismo criterio que ya se usa entre
+      // relaciones separadas.
       const foliosResueltosProp = [];
+      // Desglose por anticipo individual (2026-09-14, caso real Ferrocarril
+      // F0-260900139/OPA-00908-00909, confirmado con el usuario): monto propio
+      // de CADA anticipo resuelto (de `anticipoCfdisProp`), en el mismo orden
+      // en que el SAT los lista — usado más abajo para repartir
+      // `montoAnticipoConsumidoProp` por anticipo en vez de una sola línea
+      // combinada. Con 0 o 1 anticipo resuelto (o si algún `total` no está
+      // disponible) se cae al comportamiento combinado de siempre.
       let faltaAlgunoProp = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
-        let refRel = null;
         for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
           const ref = anticipoFolioPorUuidProp[(u || '').toUpperCase()];
-          if (ref) { refRel = ref.replace(/^OPA-/, ''); break; }
+          if (ref) {
+            const folioLimpio = ref.replace(/^OPA-/, '');
+            foliosResueltosProp.push(folioLimpio);
+            const anticipoCfdi = anticipoCfdisProp.find(c => c.uuid.toUpperCase() === (u || '').toUpperCase());
+            if (Number(anticipoCfdi?.total) > 0) {
+              anticiposResueltosProp.push({ folio: folioLimpio, total: Number(anticipoCfdi.total) });
+            }
+          } else faltaAlgunoProp = true;
         }
-        if (refRel) foliosResueltosProp.push(refRel); else faltaAlgunoProp = true;
       }
       if (foliosResueltosProp.length) anticipoFolioRefProp = `OPA-${foliosResueltosProp.join('-')}${faltaAlgunoProp ? '-' : ''}`;
+    }
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_PROP] ${cfdi.serie}-${cfdi.folio} uuid=${cfdi.uuid} formaPago=${cfdi.formaPago} `
+        + `cuentaIvaAnticipo=${rule?.cuentaIvaAnticipo} cfdiRelacionados=${JSON.stringify(cfdi.cfdiRelacionados)} `
+        + `anticipoFolioPorUuidProp=${JSON.stringify(anticipoFolioPorUuidProp)} anticipoFolioRefProp=${anticipoFolioRefProp}`);
+    }
+    // Monto REAL de anticipo aplicado (ver `anticipoUsado`/`montoAnticipoUsado`
+    // en `_prefetchAjustesFacturaPropia`) — cuando está disponible (viene del
+    // desglose real de Kore, formaPago nombre='ANTICIPO'), evita asumir que el
+    // anticipo cubre el 100% del Abono Ingresos+IVA (caso real 2026-08-28,
+    // AIDA ISLAS ACEVEDO F0-260800426: anticipo $518.74 de una venta de
+    // $536.98, resto $18.24 Efectivo real aparte). Capado al total de la venta
+    // para nunca generar un Cargo Anticipos mayor a la venta misma. Si no hay
+    // dato real (`=== 0`), el cierre de más abajo cae al comportamiento viejo
+    // (asumir 100%, ocultar+revertir el Cargo completo) — mismo criterio ya
+    // confirmado para los casos sin desglose real disponible (ej. PPD).
+    let movVentasAbonoProp = null;
+    let movIvaAbonoProp    = null;
+    let montoAnticipoRealProp = 0;
+    // Tasa efectiva para prorratear subtotal/IVA del cierre — 16% fijo salvo
+    // que haya un Egreso real (ver abajo), cuyo propio subTotal/total da la
+    // tasa exacta en vez de asumirla.
+    let tasaIvaAnticipoEfectivaProp = TASA_IVA_ANTICIPO;
+    // Serie-folio del Egreso real (columna C del cierre) cuando exista —
+    // ver `_fetchEgresosAplicacionAnticipoPorVenta`.
+    let serieEgresoAnticipoProp = null;
+    // Egreso SAT real (tipoRelacion=07 contra esta venta) — evidencia MÁS
+    // confiable que el CFDI del anticipo original (puede no estar
+    // sincronizado en Mongo, ver comentario de `anticipoFolioRefProp` arriba)
+    // — se evalúa SIEMPRE que la regla califique, sin exigir que
+    // `anticipoFolioRefProp` ya haya resuelto folio. BUG CORREGIDO
+    // 2026-09-07 (caso real RAYMUNDO CUELLAR MENDOZA C0-260900021/022): antes
+    // este chequeo vivía ANIDADO dentro de `if (anticipoFolioRefProp)` — si
+    // el CFDI del anticipo original no estaba sincronizado en Mongo,
+    // `anticipoFolioRefProp` se quedaba null y el cierre completo se saltaba
+    // por completo, aunque YA teníamos evidencia sólida e independiente (el
+    // propio Egreso apuntando directo a esta venta vía tipoRelacion=07). Esto
+    // dejaba el Cargo-Clientes de la venta oculto (categoría "anticipo" por
+    // el nombre de la regla) SIN ningún reemplazo visible — desbalance visual
+    // real en el export aunque Postgres cuadraba.
+    const egresoAnticipoProp = _califica07Prop
+      ? egresosAnticipoPorVentaProp.get((cfdi.uuid || '').toUpperCase())
+      : null;
+    if (anticipoFolioRefProp || egresoAnticipoProp) {
+      movVentasAbonoProp = rule?.cuentaAbono
+        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
+        : null;
+      movIvaAbonoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+        .filter(Boolean)
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
+        .find(Boolean) ?? null;
+      const totalVentaProp = Number(movVentasAbonoProp?.haber ?? 0) + Number(movIvaAbonoProp?.haber ?? 0);
+      if (egresoAnticipoProp) {
+        montoAnticipoRealProp = Math.min(egresoAnticipoProp.total, totalVentaProp);
+        serieEgresoAnticipoProp = egresoAnticipoProp.serieFolio ?? null;
+        if (egresoAnticipoProp.subTotal > 0 && egresoAnticipoProp.total > egresoAnticipoProp.subTotal) {
+          tasaIvaAnticipoEfectivaProp = (egresoAnticipoProp.total - egresoAnticipoProp.subTotal) / egresoAnticipoProp.subTotal;
+        }
+        // Folio OPA resuelto con el monto/fecha del Egreso tiene prioridad
+        // sobre el resuelto por el CFDI del anticipo (puede no estar
+        // sincronizado en Mongo) — ver `_fetchEgresosAplicacionAnticipoPorVenta`.
+        if (egresoAnticipoProp.folioOpa) anticipoFolioRefProp = egresoAnticipoProp.folioOpa;
+        // Ninguno de los 2 anteriores resolvió folio real (ni el CFDI del
+        // anticipo, ni el folio por monto/Cuentas Pendientes del Egreso) —
+        // usar la serie-folio del propio Egreso, SIN el prefijo "OPA-", como
+        // referencia de último recurso (nunca dejar `anticipoFolioRefProp`
+        // null habiendo ya decidido entrar a este bloque — el cierre de abajo
+        // lo necesita). BUG CORREGIDO 2026-09-07 (caso real RAYMUNDO CUELLAR
+        // MENDOZA): el primer intento envolvía la serie-folio con "OPA-"
+        // (ej. "OPA-C0-260900022"), pero `_REFERENCIA_REGEX`
+        // (cfdi-mapping.service.js, `esConceptoMarcadorAjuste`) solo acepta
+        // segmentos NUMÉRICOS tras cada guion — "C0" (con letra) rompía el
+        // match, y `enriquecerConceptoConCliente` descartaba el concepto
+        // completo cayendo al folio plano sin ningún indicio de "OPA". Sin
+        // el prefijo, la serie-folio del Egreso SÍ matchea (mismo patrón que
+        // "DEV-054861"), igual que ya se decidió para el concepto propio de
+        // la NC (ver comentario en `_redirigirEgresoAnticipoSaldado`).
+        if (!anticipoFolioRefProp) {
+          anticipoFolioRefProp = serieEgresoAnticipoProp ?? `OPA-${(cfdi.uuid || '').slice(0, 8)}`;
+        }
+      } else {
+        // Cuentas Pendientes (ver `_prefetchCuentasPendientesAnticipo`) tiene
+        // prioridad sobre `context.montoAnticipoUsado` (desglose de almacén,
+        // que a veces no distingue la porción de Anticipo y hace que el
+        // caller asuma 100% de la venta, ignorando otros ajustes ya
+        // aplicados como una Bonificación — bug real 2026-09-03, caso
+        // MARIA DE LOURDES SANCHEZ RIOS/OPA-00837).
+        const montoCuentasPendientesProp = montoAnticipoPorFacturaProp.get(`${cfdi.serie}|${cfdi.folio}`);
+        montoAnticipoRealProp = (montoCuentasPendientesProp > 0)
+          ? Math.min(montoCuentasPendientesProp, totalVentaProp)
+          : Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaProp);
+      }
+    }
+    // Cuánto de ese monto real queda por "consumir" contra las líneas de
+    // Cargo principal del loop de abajo — se va reduciendo línea a línea.
+    let montoAnticipoRestanteProp = montoAnticipoRealProp;
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_PROP_MONTO] uuid=${cfdi.uuid} montoAnticipoUsadoContext=${context.montoAnticipoUsado} `
+        + `montoAnticipoRealProp=${montoAnticipoRealProp} rule.cuentaCargo=${rule?.cuentaCargo} `
+        + `cuentaCargoId=${cuentaMap[rule?.cuentaCargo]} CODIGO_CUENTA_CAJA_id=${cuentaMap[CODIGO_CUENTA_CAJA]} CODIGO_CUENTA_BANCOS_id=${cuentaMap[CODIGO_CUENTA_BANCOS]}`);
     }
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
@@ -2974,8 +4378,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // ticket cruzado de cientos NO cubre el total de la factura — tratarlo
     // como sí/no perdía el resto del cargo real, ver docstring de
     // `facturasVendedorCubiertas` en cobros-sucursal-puente.service.js).
-    const montoCubiertoPorSucursal = facturasVendedorCubiertas.get(cfdi.uuid?.toUpperCase() ?? '') ?? 0;
-    let montoCubiertoRestante = montoCubiertoPorSucursal;
+    // Por TICKET, no por la primera línea Caja/Bancos que aparezca — ver
+    // comentario equivalente en generarYGuardar (mismo bug real, mismo fix,
+    // 2026-08-27) y `facturasVendedorCubiertas.detalle` en
+    // cobros-sucursal-puente.service.js.
+    const cubiertoInfoProp = facturasVendedorCubiertas.get(cfdi.uuid?.toUpperCase() ?? '');
+    const montoCubiertoRestantePorTicketProp = new Map(
+      (cubiertoInfoProp?.detalle ?? []).map(d => [`${d.serieVenta}|${d.folioVenta}`, d.monto]),
+    );
     // Facturas PPD cobradas en otra sucursal: el Cargo a Clientes de la venta
     // sigue normal (sin tocar); se agrega ABAJO un asiento adicional (Abono a
     // Clientes + la línea de Cargo a la cuenta puente que ya viene en
@@ -2999,40 +4409,62 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // pero representan dinero que fue a Anticipos Otros/Club Tuberos, no
       // efectivo/tarjeta cobrado — un cruce de sucursal cubre esto último).
       const esLineaCajaOBancos = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
-      // Anticipo sin NC: el Cargo Clientes se queda en BD (necesario para el
-      // cuadre del asiento normal de la regla) pero se oculta del export — el
-      // cierre de abajo ya muestra lo relevante (Abono Anticipos/IVA-anticipo);
-      // mostrarlo también duplicaría visualmente la venta (confirmado con el
-      // usuario 2026-08-25, caso real MONSAN B0-260801098).
-      const ocultarPorAnticipo = anticipoFolioRefProp && esLineaCargoPrincipal;
-      if (montoCubiertoRestante > 0 && esLineaCargoPrincipal && esLineaCajaOBancos && Number(m.debe) > 0) {
-        const reduccion = Math.min(montoCubiertoRestante, Number(m.debe));
-        montoCubiertoRestante = parseFloat((montoCubiertoRestante - reduccion).toFixed(2));
-        const debeAjustado = parseFloat((Number(m.debe) - reduccion).toFixed(2));
-        if (debeAjustado <= 0) continue; // esta línea quedó totalmente cubierta
-        movimientosResult.push({
-          ...m,
-          debe:          debeAjustado,
-          centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
-          centroCostoId: ccProp?.id      ?? null,
-          ...(ocultarPorAnticipo ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
-          _cfdiInfo: {
-            uuid:              cfdi.uuid,
-            tipo:              cfdi.tipoDeComprobante,
-            emisor:            cfdi.emisor?.rfc,
-            total:             cfdi.total,
-            fecha:             cfdi.fecha,
-            sinRegla:          !!m._sinRegla,
-            comparisonStatus:  cfdi.lastComparisonStatus ?? null,
-          },
-        });
-        continue;
+      // Anticipo sin NC — dos modos:
+      //  - CON dato real (`montoAnticipoRealProp > 0`): el Cargo se REDUCE
+      //    línea a línea más abajo (nunca se oculta) por el monto real
+      //    aplicado — el resto (si lo hay, ej. Efectivo real) queda visible
+      //    tal cual. El cierre de más abajo ya no necesita revertir nada con
+      //    un Abono oculto: reducir el Cargo directamente ya deja el asiento
+      //    cuadrado (caso real 2026-08-28, AIDA ISLAS ACEVEDO F0-260800426).
+      //  - SIN dato real (`=== 0`, ej. PPD o desglose no disponible): cae al
+      //    comportamiento viejo confirmado 2026-08-25 (caso MONSAN
+      //    B0-260801098) — se asume 100% cubierto, se oculta el Cargo
+      //    completo y el cierre de abajo lo revierte con un Abono oculto.
+      const ocultarPorAnticipoTotal = anticipoFolioRefProp && montoAnticipoRealProp === 0 && esLineaCargoPrincipal;
+      if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+        console.warn(`[DEBUG_OPA_PROP_LINEA] cuentaId=${m.cuentaId} debe=${m.debe} _esCargoPrincipal=${m._esCargoPrincipal} `
+          + `esLineaCargoPrincipal=${esLineaCargoPrincipal} esLineaCajaOBancos=${esLineaCajaOBancos} ocultarPorAnticipoTotal=${ocultarPorAnticipoTotal}`);
       }
+      // Ver comentario equivalente en generarYGuardar sobre `ticketKeyLineaGuard`.
+      const ticketKeyLineaProp = m.folioVentaTicket != null
+        ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
+        : `${cfdi.serie}|${cfdi.folio}`;
+      const restanteTicketProp = montoCubiertoRestantePorTicketProp.get(ticketKeyLineaProp) ?? 0;
+      let debeFinalProp = Number(m.debe);
+      let huboReduccionProp = false;
+      if (esLineaCargoPrincipal && esLineaCajaOBancos && debeFinalProp > 0 && restanteTicketProp > 0) {
+        const reduccion = Math.min(restanteTicketProp, debeFinalProp);
+        montoCubiertoRestantePorTicketProp.set(ticketKeyLineaProp, parseFloat((restanteTicketProp - reduccion).toFixed(2)));
+        debeFinalProp = parseFloat((debeFinalProp - reduccion).toFixed(2));
+        huboReduccionProp = true;
+      }
+      // La reducción por ANTICIPO se separó del `if` de arriba (2026-08-31,
+      // caso real ESCUELA PRIMARIA VESPERTINA CARLOS A. CARRILLO H0-260800539):
+      // el cruce de sucursal SÍ debe limitarse a Caja/Bancos (nunca tocar
+      // SF/Puntos, ver comentario de `esLineaCajaOBancos` arriba), pero el
+      // anticipo puede aplicarse contra CUALQUIER cuenta que la regla use
+      // como `cuentaCargo` — incluida una cuenta de pasivo (Reg 22C —
+      // "Factura Final Anticipo", cuentaCargo=Anticipos de Clientes, NO
+      // Caja/Bancos). Antes, al estar anidada bajo `esLineaCajaOBancos`, la
+      // reducción nunca se aplicaba para este tipo de regla — el Cargo se
+      // quedaba íntegro (100% a Anticipos) sin dejar rastro del Efectivo
+      // real ($41.99 de $177.97) ni disparar el cierre OPA (`montoAnticipo
+      // Consumido` siempre daba 0).
+      const esLineaCargoDeLaReglaProp = m.cuentaId === (cuentaMap[rule?.cuentaCargo] ?? null);
+      if (esLineaCargoPrincipal && (esLineaCajaOBancos || esLineaCargoDeLaReglaProp)
+          && montoAnticipoRestanteProp > 0 && debeFinalProp > 0) {
+        const reduccionAnticipo = Math.min(montoAnticipoRestanteProp, debeFinalProp);
+        montoAnticipoRestanteProp = parseFloat((montoAnticipoRestanteProp - reduccionAnticipo).toFixed(2));
+        debeFinalProp = parseFloat((debeFinalProp - reduccionAnticipo).toFixed(2));
+        huboReduccionProp = true;
+      }
+      if (huboReduccionProp && debeFinalProp <= 0) continue; // línea totalmente cubierta
       movimientosResult.push({
         ...m,
+        ...(huboReduccionProp ? { debe: debeFinalProp } : {}),
         centroCosto:   ccProp?.clave   ?? m.centroCosto   ?? null,
         centroCostoId: ccProp?.id      ?? null,
-        ...(ocultarPorAnticipo ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
+        ...(ocultarPorAnticipoTotal ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         _cfdiInfo: {
           uuid:              cfdi.uuid,
           tipo:              cfdi.tipoDeComprobante,
@@ -3053,16 +4485,173 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // cero, es la misma cuenta) — confirmado con el usuario 2026-08-25, caso
     // real MONSAN B0-260801098/EDDCAB96 (Anticipos/IVA-anticipo van de CARGO,
     // no de abono — corrige un intento anterior con la polaridad invertida).
-    if (anticipoFolioRefProp) {
-      const movVentasAbonoProp = rule?.cuentaAbono
-        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
-        : null;
-      // Puede ser PPD (`rule.cuentaIvaPPD`, IVA por cobrar) o PUE (`rule.cuentaIva`) —
-      // se prueban ambas cuentas, la que traiga un haber real gana.
-      const movIvaAbonoProp = [rule?.cuentaIva, rule?.cuentaIvaPPD]
-        .filter(Boolean)
-        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
-        .find(Boolean) ?? null;
+    // Monto REALMENTE consumido en el loop de arriba (nunca el total "pedido"
+    // — si la regla no usa Caja/Bancos como cuentaCargo, o el Cargo real ya
+    // era menor al anticipo, la reducción no pudo aplicarse por completo).
+    // Usar esto en vez de `montoAnticipoRealProp` garantiza que el cierre
+    // NUNCA descuadre el asiento, sin importar la forma de la regla.
+    const montoAnticipoConsumidoProp = parseFloat((montoAnticipoRealProp - montoAnticipoRestanteProp).toFixed(2));
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_PROP_CIERRE] montoAnticipoRealProp=${montoAnticipoRealProp} montoAnticipoRestanteProp=${montoAnticipoRestanteProp} `
+        + `montoAnticipoConsumidoProp=${montoAnticipoConsumidoProp} anticipoFolioRefProp=${anticipoFolioRefProp}`);
+    }
+    if (anticipoFolioRefProp && montoAnticipoConsumidoProp > 0) {
+      // CON dato real: split subtotal/IVA proporcional (16%, mismo criterio
+      // que Saldo a Favor) del monto REALMENTE aplicado — el Cargo principal
+      // ya se redujo directo en el loop de arriba, así que el asiento ya
+      // cuadra sin ningún Abono de reversión (caso real 2026-08-28, AIDA
+      // ISLAS ACEVEDO F0-260800426: $518.74 de $536.98, resto Efectivo real).
+      const baseInfoProp = {
+        centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
+        _cfdiInfo: {
+          uuid: cfdi.uuid, tipo: cfdi.tipoDeComprobante, emisor: cfdi.emisor?.rfc,
+          total: cfdi.total, fecha: cfdi.fecha, sinRegla: false,
+          comparisonStatus: cfdi.lastComparisonStatus ?? null,
+        },
+      };
+      // Desglose por anticipo individual (2026-09-14, caso real Ferrocarril
+      // F0-260900139, 2 anticipos OPA-00908/00909, confirmado con el
+      // usuario): con 2+ anticipos resueltos con monto propio conocido
+      // (`anticiposResueltosProp`), se reparte `montoAnticipoConsumidoProp`
+      // secuencialmente entre ellos (cada uno hasta su propio total) en vez
+      // de una sola línea combinada — más trazable para saber cuánto de CADA
+      // anticipo se aplicó. Si el consumido no alcanza para cubrir la suma de
+      // todos, el desajuste se deja en el ÚLTIMO anticipo de la lista (el que
+      // queda con remanente sin aplicar), sin repartir ni forzar cuadre —
+      // decisión explícita del usuario, no un intento de reconciliar. Con 0 o
+      // 1 anticipo resuelto, cae al comportamiento combinado de siempre.
+      // Combo especial: 2+ anticipos combinados Y la venta va a ser revertida
+      // por un Egreso real en este mismo batch (confirmado con el usuario
+      // 2026-09-14/15, caso real Ferrocarril) — ver
+      // `ventasConComboEspecialAnticipoProp` arriba para la regla completa.
+      // Tiene PRIORIDAD sobre el desglose por anticipo normal de abajo.
+      // IMPORTANTE (bug real 2026-09-15, orden roto en el export): las líneas
+      // de "previos" (Devoluciones+IVA-normal) se dejan con `reglaNombre:
+      // 'OPA-REVERSION'` y `cfdiUuid` del EGRESO (no de esta Factura) — las
+      // de "último" (Anticipos+IVA-anticipo) se quedan con el `reglaNombre:
+      // 'OPA'` normal de `baseInfoProp` y `cfdiUuid` de esta Factura. Esto
+      // reproduce EXACTAMENTE la misma estructura de 2 grupos que el caso de
+      // 1 solo anticipo (cierre OPA / OPA-REVERSION en cfdis distintos), que
+      // es lo que `ordenarCargoAntesDeAbono`/`bloquesAjustesContado`
+      // (poliza.service.js) ya sabe intercalar como "Ingreso → Egreso →
+      // cierre OPA". Poner las 4 líneas en un solo grupo con un solo
+      // reglaNombre (intento anterior) rompía ese mecanismo — sin una línea
+      // 'OPA' que emparejar, el grupo entero caía al orden por defecto
+      // "cargo antes que abono", mostrando el combo ANTES que el Ingreso de
+      // la Factura Final.
+      const uuidVentaProp = (cfdi.uuid || '').toUpperCase();
+      // DESHABILITADO 2026-09-15 (caso real Ferrocarril F0-260900139/OPA-00908-
+      // 00909, confirmado con el usuario): este combo especial cargaba los
+      // anticipos "previos" (todos menos el último) a Devoluciones+IVA normal
+      // por su propio monto — nunca por el total de la Factura Final — así que
+      // NUNCA revertía el Ingreso/IVA normal completo de la venta cancelada
+      // (aquí: solo $1,659.08 de $11,613.40 quedaban revertidos, el resto se
+      // quedaba reconocido como ingreso real de una venta ya cancelada). El
+      // desglose individual por anticipo (OPA-00908/OPA-00909, ver
+      // `desglosePorAnticipoProp` más abajo) YA se genera sin este combo —
+      // pasa incondicional por el cierre normal. Lo único que hacía falta era
+      // que `_redirigirEgresoAnticipoSaldado` (el mecanismo de siempre, ya
+      // confirmado correcto para 1 anticipo) también se aplicara aquí — y ya
+      // lo hace en cuanto `esComboEspecialProp` es `false` (cae al `else if`
+      // de abajo). Verificado con datos reales: la póliza 706 de hoy (antes
+      // de este combo) ya mostraba el resultado correcto — desglose OPA-00908/
+      // OPA-00909 en el cierre + reversión completa (Devoluciones+IVA normal
+      // por el TOTAL + Abono Anticipos+IVA-anticipo por el TOTAL, restaurando
+      // AMBOS anticipos) — esto solo regresa a ese comportamiento.
+      const esComboEspecialProp = false && anticiposResueltosProp.length > 1 && ventasConAnticipoRedirigido.has(uuidVentaProp);
+      if (esComboEspecialProp) {
+        const previosProp = anticiposResueltosProp.slice(0, -1);
+        const ultimoProp  = anticiposResueltosProp[anticiposResueltosProp.length - 1];
+        const sumaPreviosProp = previosProp.reduce((s, a) => s + a.total, 0);
+        const subtotalPreviosProp = Math.round((sumaPreviosProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+        const ivaPreviosProp      = Math.round((sumaPreviosProp - subtotalPreviosProp) * 100) / 100;
+        const subtotalUltimoProp  = Math.round((ultimoProp.total / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+        const ivaUltimoProp       = Math.round((ultimoProp.total - subtotalUltimoProp) * 100) / 100;
+        const refComboProp   = `OPA-${anticiposResueltosProp.map(a => a.folio).join('-')}`;
+        const serieComboProp = serieEgresoAnticipoProp ?? refComboProp;
+        // Guardado para que el Egreso (procesado más abajo en este mismo
+        // batch) sepa qué 2 líneas de reversión generar en su propio cfdiUuid.
+        ventasConComboEspecialAnticipoProp.set(uuidVentaProp, {
+          subtotalPrevios: subtotalPreviosProp, ivaPrevios: ivaPreviosProp,
+          refCombo: refComboProp, serieCombo: serieComboProp,
+        });
+        const baseComboProp = { ...baseInfoProp, concepto: refComboProp, serie: serieComboProp };
+        if (subtotalUltimoProp > 0) {
+          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null, debe: subtotalUltimoProp, haber: 0 });
+        }
+        if (ivaUltimoProp > 0) {
+          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, debe: ivaUltimoProp, haber: 0 });
+        }
+      } else {
+      const desglosePorAnticipoProp = [];
+      if (anticiposResueltosProp.length > 1) {
+        let restanteProp = montoAnticipoConsumidoProp;
+        for (const a of anticiposResueltosProp) {
+          if (restanteProp <= 0.004) break;
+          const montoLinea = Math.round(Math.min(a.total, restanteProp) * 100) / 100;
+          if (montoLinea <= 0) continue;
+          restanteProp = parseFloat((restanteProp - montoLinea).toFixed(2));
+          desglosePorAnticipoProp.push({ folio: a.folio, monto: montoLinea });
+        }
+      }
+      if (desglosePorAnticipoProp.length > 1) {
+        for (const d of desglosePorAnticipoProp) {
+          const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+          const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
+          const refOpaD      = `OPA-${d.folio}`;
+          const serieCierreD = serieEgresoAnticipoProp ?? refOpaD;
+          if (subtotalD > 0) {
+            movimientosResult.push({
+              ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
+              concepto: refOpaD, serie: serieCierreD, debe: subtotalD, haber: 0,
+            });
+          }
+          if (ivaD > 0) {
+            movimientosResult.push({
+              ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
+              concepto: refOpaD, serie: serieCierreD, debe: ivaD, haber: 0,
+            });
+          }
+        }
+      } else {
+        const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+        const ivaAnticipoProp      = Math.round((montoAnticipoConsumidoProp - subtotalAnticipoProp) * 100) / 100;
+        const refOpaProp = anticipoFolioRefProp;
+        // Columna C (serie) = folio del Egreso real que cancela el anticipo
+        // cuando existe (trazable al documento SAT); columna H (concepto) =
+        // siempre la referencia "OPA-..." (confirmado con el usuario
+        // 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
+        const serieCierreProp = serieEgresoAnticipoProp ?? refOpaProp;
+        if (subtotalAnticipoProp > 0) {
+          movimientosResult.push({
+            ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
+            concepto: refOpaProp, serie: serieCierreProp, debe: subtotalAnticipoProp, haber: 0,
+          });
+        }
+        if (ivaAnticipoProp > 0) {
+          movimientosResult.push({
+            ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
+            concepto: refOpaProp, serie: serieCierreProp, debe: ivaAnticipoProp, haber: 0,
+          });
+        }
+      }
+      }
+    } else if (anticipoFolioRefProp && montoAnticipoRealProp === 0) {
+      // SIN dato real en absoluto (fallback, comportamiento viejo confirmado
+      // 2026-08-25, caso MONSAN B0-260801098/EDDCAB96): se asume que el
+      // anticipo cubre el 100% del Abono Ingresos+IVA de la regla — el Cargo
+      // principal se ocultó completo en el loop de arriba
+      // (`ocultarPorAnticipoTotal`, misma condición `=== 0`) y este bloque lo
+      // revierte con un Abono a Clientes oculto (neto cero).
+      //
+      // NOTA: si `montoAnticipoRealProp > 0` pero `montoAnticipoConsumidoProp`
+      // dio 0 (la regla no usa Caja/Bancos como cuentaCargo — no debería pasar
+      // en la práctica, ver `_prefetchAjustesFacturaPropia`), NINGUNA rama de
+      // este `if` aplica a propósito: el Cargo principal nunca se ocultó en el
+      // loop (esa condición también exige `=== 0`), así que revertirlo aquí
+      // duplicaría visualmente la venta en vez de corregirla — se prefiere no
+      // registrar el cierre a arriesgar un asiento incorrecto.
       const montoVentasAnticipoProp = movVentasAbonoProp?.haber ?? 0;
       const montoIvaAnticipoProp    = movIvaAbonoProp?.haber ?? 0;
       const refOpaProp = anticipoFolioRefProp; // ya viene armado como "OPA-..." (real o placeholder)
@@ -3105,11 +4694,22 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     // Saldo a favor generado por esta Devolución (ver
     // `_prefetchSaldosFavorGenerados`/`_inyectarSaldoFavorGenerado`).
-    const lineasSaldoFavorProp = await _inyectarSaldoFavorGenerado({
+    // BUG CORREGIDO 2026-09-04 (caso real Reforma, JOSE IRAN SUAREZ LINARES,
+    // DEV-057088 $976.23): cuando la propia regla de ESTA Devolución/
+    // Cancelación es de anticipo (`rule.cuentaIvaAnticipo`, ver `esAnticipo`
+    // en cfdi-mapping.service.js), `cfdiToMovimientos` YA contabilizó el
+    // crédito completo como pasivo de Anticipos (2103010001) en el Cargo/Abono
+    // normal de este mismo cfdi, arriba en este mismo loop — inyectar TAMBIÉN
+    // la línea de "SF generado" (2103090001) duplicaba el mismo crédito por
+    // partida doble (confirmado con el ERP real: `saldosFavorGenerados[0]
+    // .usos` vacío, un solo evento, nunca usado — la duplicación era 100%
+    // nuestra, no un cálculo distinto de dos usos reales).
+    const lineasSaldoFavorProp = rule?.cuentaIvaAnticipo ? [] : await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosProp,
       cuentaSaldoFavorId: cuentaSaldoFavorIdProp, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdProp,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
-      cc: ccProp, rfc,
+      cc: ccProp, rfc, origenesConvertidosAAnticipo: origenesConvertidosAAnticipoProp,
+      anticiposClasificados: anticiposClasificadosProp,
     });
     for (const linea of lineasSaldoFavorProp) {
       movimientosResult.push(linea);
@@ -3250,6 +4850,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     for (const [key, generado] of mapaSaldosFavorGeneradosProp) {
       if (clavesConsumidas.has(key)) continue;
       if (!generado?.monto) continue;
+      // Mismo guard nativo que `_inyectarSaldoFavorGenerado` (ver ese
+      // comentario) — si Kore ya convirtió este saldo en Anticipo, no se
+      // inyecta como SF huérfano tampoco (mismo dinero contado dos veces).
+      // Caso real: JASIVE ARAGON ALDERETE, DEV-057045→OPA-00833, Puerto
+      // Escondido 1-sep — la Devolución nunca sincronizó, así que solo este
+      // camino (no el guard de `_inyectarSaldoFavorGenerado`) la emitía.
+      if (generado?.anticipoReferencia) continue;
       const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
       const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
       const iva      = Math.round((generado.monto - subtotal) * 100) / 100;
@@ -3354,22 +4961,57 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin) {
     const cobrosSinFacturaProp = await _cobrosSinFacturaPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
     const ccSinFacturaProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
-    for (const [claveSatSF, montoSF] of cobrosSinFacturaProp) {
-      const cuentaDestinoSF = claveSatSF === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
-      if (!cuentaDestinoSF || montoSF <= 0) continue;
+    // Una línea POR TICKET (2026-08-27, confirmado con el usuario) — antes se
+    // consolidaba todo en una sola línea por forma de pago, imposibilitando
+    // mostrar el número de autorización real de Transferencia/Tarjeta (una
+    // suma de varios depósitos no puede tener "un" número). `serieVentaTicket`/
+    // `folioVentaTicket` deja que `bancoRealPorTicket`/`consolidarCargos`
+    // (poliza.service.js) resuelvan el banco real y agrupen por autorización
+    // exactamente igual que ya hacen para los tickets normales.
+    for (const t of cobrosSinFacturaProp) {
+      const cuentaDestinoSF = t.clave === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      if (!cuentaDestinoSF || t.monto <= 0) continue;
       movimientosResult.push({
-        concepto:      'Cobros sin factura',
+        concepto:      `Cobros sin factura / ${t.ventaSerie}-${t.ventaFolio}`,
         serie:         null,
         centroCosto:   ccSinFacturaProp?.clave ?? null,
         centroCostoId: ccSinFacturaProp?.id    ?? null,
         cfdiUuid:      null,
         cuentaId:      cuentaDestinoSF,
-        debe:          montoSF,
+        debe:          t.monto,
         haber:         0,
         tipoOrigen:    'Venta',
         reglaNombre:   'COBRO-SIN-FACTURA',
-        formaPago:     claveSatSF,
+        formaPago:     t.clave,
+        serieVentaTicket: t.ventaSerie,
+        folioVentaTicket: t.ventaFolio,
       });
+    }
+  }
+
+  // Saldo a favor usado el día real cuando la factura que lo consume se
+  // timbra otro día (factura tardía) — ver `_sfUsadoAntesDeFacturarPorCentro`.
+  // Misma forma que una línea normal de SF (`emitirLineaSF` en
+  // cfdi-mapping.service.js): tipoOrigen/reglaNombre iguales para que
+  // `_extraerCobrosSucursal` (poliza.service.js) la trate exactamente igual
+  // (columna C = "SF", sin prefijo "Cobro de otra sucursal").
+  if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin
+      && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
+    const sfTardioProp = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
+    const ccSfTardioProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+    for (const d of sfTardioProp) {
+      const subtotal = Math.round((d.monto / 1.16) * 100) / 100;
+      const iva = Math.round((d.monto - subtotal) * 100) / 100;
+      const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
+      const conceptoSfTardio = [d.nombreCliente, referenciaVenta].filter(Boolean).join(' / ');
+      const baseSfTardio = {
+        concepto: conceptoSfTardio, serie: referenciaVenta,
+        centroCosto: ccSfTardioProp?.clave ?? null, centroCostoId: ccSfTardioProp?.id ?? null,
+        cfdiUuid: d.facturaUuid ?? null, cuentaFaltante: false,
+        tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+      };
+      movimientosResult.push({ ...baseSfTardio, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotal });
+      movimientosResult.push({ ...baseSfTardio, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
     }
   }
 
@@ -3458,6 +5100,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // Para PUE: Cargo a Caja/Bancos (el ingreso real) + Abono a la misma cuenta
   // (contrapartida que cuadra contra la póliza de la sucursal vendedora).
   const _ccCobradora = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+  if (process.env.DEBUG_COS_TICKET) {
+    console.warn(`[DEBUG_COS_GATE] serieDelCentroProp=${serieDelCentroProp} _ccCobradora=${JSON.stringify(_ccCobradora)} cobrosCobradoraDirectaProp.length=${cobrosCobradoraDirectaProp.length}`);
+  }
   if (cobrosCobradoraDirectaProp.length > 0 && _ccCobradora) {
     const cuentaCajaIdDir   = cuentaMap[CODIGO_CUENTA_CAJA]   ?? null;
     const cuentaBancosIdDir = cuentaMap[CODIGO_CUENTA_BANCOS] ?? null;
@@ -3488,29 +5133,49 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // Mongo). Mostrar el folio de factura llevaba a buscar un ticket
       // equivocado en Kore (confirmado con el usuario 2026-08-17).
       const _serFol = serFolTicket || (claveFac ?? '');
+      const _esDebug = process.env.DEBUG_COS_TICKET && serFolTicket && serFolTicket.includes(process.env.DEBUG_COS_TICKET);
       // Saltar si la cola ya tiene este cobro — el DEBE+HABER de cobradora
       // ya lo generó `construirMovimientosPuente` (en movsPuente arriba).
       // Incluirlo aquí también inflaría el consolidado por partida doble
       // (bug real: Hidalgo EFECTIVO $215k vs $147k esperado, 2026-08-15).
-      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) continue;
-      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) continue;
+      if (cfdiUuid && _uuidsYaEnPuente.has(cfdiUuid.toUpperCase())) {
+        if (_esDebug) console.warn(`[DEBUG_COS_SKIP] saltado por _uuidsYaEnPuente cfdiUuid=${cfdiUuid}`);
+        continue;
+      }
+      if (folioOrigen != null && _foliosYaEnPuente.has(String(folioOrigen))) {
+        if (_esDebug) console.warn(`[DEBUG_COS_SKIP] saltado por _foliosYaEnPuente folioOrigen=${folioOrigen}`);
+        continue;
+      }
+      if (_esDebug) console.warn(`[DEBUG_COS_OK] serFolTicket=${serFolTicket} monto=${monto} cuentaDir=${cuentaDir} cfdiUuid=${cfdiUuid} nombre=${nombre}`);
       const _concepto = nombre ? `${nombre} / ${_serFol}` : _serFol;
       const baseDir = {
         concepto:      _concepto.slice(0, 255) || 'Cobro Suc. Ajena',
         centroCosto:   _ccCobradora.clave ?? null,
         centroCostoId: _ccCobradora.id    ?? null,
-        reglaNombre:   'COS',
+        // NUNCA el literal 'COS' (bug real 2026-09-03, caso M0-260900018:
+        // `_extraerCobrosSucursal` en poliza.service.js arma la columna C
+        // como "COS-${reglaNombre}" -- con reglaNombre='COS' salía
+        // literalmente "COS-COS" en vez de "COS-EFECTIVO"/"COS-TARJETA".
+        // Mismo mapeo que `LABEL_FORMA_PAGO_CONSOLIDADO` (poliza.service.js).
+        reglaNombre:   esEfe ? 'EFECTIVO' : (claveSat === '04' || claveSat === '28') ? 'TARJETA' : null,
         formaPago:     claveSat || null,
       };
       // DEBE: Cargo a Caja/Bancos — cash físico recibido aquí de otra sucursal
       // → SIEMPRE va al consolidado ("Depósitos consolidados") para su depósito.
-      // `cfdiUuid` solo se conserva para Efectivo (lo necesita el emparejado
-      // de abajo) — en Tarjeta/Transferencia se omite a propósito: si ESE
-      // MISMO ticket también tuviera una porción en Efectivo (mismo cfdiUuid),
-      // el emparejamiento de esa porción marcaría el uuid como "ya cobrado en
-      // otra sucursal" y arrastraría también esta línea de Tarjeta aunque su
-      // Abono no comparta cuenta ni uuid con ella.
-      movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: esEfe ? (cfdiUuid ?? null) : null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
+      // `cfdiUuid` se conserva SIEMPRE (2026-09-04, antes solo para Efectivo):
+      // `consolidarCargos` lo necesita para resolver el depósito bancario real
+      // (`verdadBancaria`/`bancoRealPorTicket`) y así mostrar el número de
+      // autorización/referencia real en Tarjeta/Transferencia — sin él, la
+      // línea caía anónima dentro de "Depósitos consolidados" (caso real
+      // Reforma 1-sep, $188,232.29/$226,990.18/$74,596.32 sin cliente ni
+      // referencia). El riesgo que esto evitaba antes (arrastrar por error
+      // esta línea junto con una porción Efectivo del mismo ticket, mismo
+      // uuid) ahora se resuelve en `_extraerCobrosSucursal`
+      // (`_cuentasCobradasPorSucursalPorUuid`, poliza.service.js), que exige
+      // TAMBIÉN la misma cuenta — la cuenta puente del Abono de Tarjeta/
+      // Transferencia (ver abajo) nunca coincide con la cuenta de banco real
+      // de este Cargo, así que nunca calificará para ese emparejamiento.
+      movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
       // HABER (contrapartida): Efectivo SÍ puede transferirse físicamente
       // entre sucursales, así que su Abono va a la MISMA cuenta (con el mismo
       // cfdiUuid, para que `_extraerCobrosSucursal` empareje y saque AMBAS
@@ -3518,11 +5183,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // sucursal vendedora, no se queda aquí). Tarjeta/Transferencia NUNCA se
       // pueden "mover" — el banco ya depositó en la cuenta de ESTA sucursal
       // sin importar quién facturó, así que su Abono va a la cuenta puente
-      // (2103040001, deuda con la sucursal vendedora) SIN cfdiUuid — para que
-      // el Cargo de arriba NO se empareje/extraiga y sí cuente en el
-      // consolidado de Tarjeta (confirmado con el usuario 2026-08-19, caso
-      // real CONSTRUCASA 13-ago: el corte de caja de Tarjeta cierra exacto
-      // contra el bruto sin excluir cruces, a diferencia de Efectivo).
+      // (2103040001, deuda con la sucursal vendedora) — para que el Cargo de
+      // arriba NO se empareje/extraiga y sí cuente en el consolidado de
+      // Tarjeta (confirmado con el usuario 2026-08-19, caso real CONSTRUCASA
+      // 13-ago: el corte de caja de Tarjeta cierra exacto contra el bruto sin
+      // excluir cruces, a diferencia de Efectivo) sigue sin cfdiUuid: no lo
+      // necesita (nunca se resuelve contra `verdadBancaria`) y así tampoco
+      // arriesga que el emparejador la use por error como si fuera un HABER
+      // en la cuenta real.
       if (esEfe) {
         movimientosResult.push({ ...baseDir, cuentaId: cuentaDir, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto });
       } else {
@@ -3656,6 +5324,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // Hoja aparte: tickets con cobro real sin factura ligada — ver comentario
     // arriba y `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
     pendientesPorFacturar: pendientesPorFacturarProp,
+    depositosEfectivoNoConciliados: depositosEfectivoProp,
+    // Hoja aparte: SF aplicado a una venta consumidora que sigue PPD/POR
+    // FACTURAR en /cuentas-pendientes — ver comentario en
+    // `_prefetchAjustesFacturaPropia`.
+    movimientosPpdPorFacturar: movimientosPpdPorFacturarProp,
     _meta: {
       totalCfdis:   cfdisSinPoliza.length,
       sinRegla,
@@ -3676,6 +5349,17 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
   if (!tipoCfdi)  throw new BadRequestError('Debes seleccionar el tipo de CFDI a procesar (I, E o P)');
+
+  // Cobranza (Pagos, tipoCfdi='P'): generación TOTALMENTE independiente — ver
+  // comentario equivalente en generarPropuesta. `generarYGuardarPorSucursal`/
+  // `PorDia`/`PorSucursalYDia` llaman a esta misma función internamente, así
+  // que este único dispatch basta para las 4 rutas de generación de Cobranza
+  // sin duplicar la iteración por sucursal/día (esa parte SÍ es genérica).
+  if (tipoCfdi === 'P') {
+    return require('./cobranza-poliza-generator.service').generarYGuardarCobranza({
+      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro,
+    });
+  }
 
   // 1. UUIDs ya contabilizados (filtrado por RFC)
   const yaContabilizados = await PolizaMovimiento.findAll({
@@ -3946,67 +5630,22 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Saldos a favor generados por las Devoluciones de este batch — ANTES de
   // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
-  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
+  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard, anticiposConvertidos: anticiposConvertidosGuard, anticipoFolioPorUuidDesdeSaldosFavor: anticipoFolioPorUuidDesdeSaldosFavorGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
 
-  // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
-  // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
-  // poder omitir, ahí, el Cargo normal de las facturas cuyo Cargo ya cubre
-  // este flujo (si no, la póliza queda con doble Cargo contra un solo Abono).
-  //
-  // Universo ampliado + filtro por fecha real del cobro — ver comentario
-  // equivalente en generarPropuesta y `_fetchCfdisParaPuenteAmplio`.
-  let movsPuenteGuard = [];
-  let facturasVendedorCubiertasGuard = new Map(); // uuid → monto ya cubierto
-  let facturasPPDCubiertasGuard = new Map();
-  let pendientesPorFacturarGuard = [];
-  let cuentaSaldoFavorIdGuard = null;
-  let cuentaIvaSaldoFavorIdGuard = null;
-  if (tipoCfdi === 'I' && centroCostoId) {
-    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
-    cuentaSaldoFavorIdGuard = cuentaSaldoFavorId;
-    cuentaIvaSaldoFavorIdGuard = cuentaIvaSaldoFavorId;
-    if (cuentaCajaId && cuentaBancosId) {
-      // Acotado a la serie propia — ver comentario equivalente en generarPropuesta.
-      const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
-        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
-        : cfdisSinPolizaFinalGuard;
-      const resultadoPuenteGuard = await construirMovimientosPuente({
-        cfdis: cfdisParaPuenteGuard,
-        centroCostoId,
-        ccBySerieMap: ccBySerieMap,
-        cuentaCajaId,
-        cuentaBancosId,
-        cuentaPuenteId,
-        cuentaSaldoFavorId,
-        cuentaIvaSaldoFavorId,
-        cuentaClubTuberosId,
-        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
-        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
-        rfc,
-        devsOcultosSF: devsOcultosSFGuard,
-        centroPropioClave: serieDelCentroGuard,
-      });
-      movsPuenteGuard = resultadoPuenteGuard.movimientos;
-      facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
-      facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
-      pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
-      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
-      // detectado hoy con lo ya cubierto en días previos.
-      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
-        facturasVendedorCubiertasGuard.set(u, (facturasVendedorCubiertasGuard.get(u) ?? 0) + monto);
-      }
-    }
-  }
-
-  // 5. Precalcular regla por CFDI y resolver cuentaMap en un solo query
+  // Adelantado (2026-09-04) — ver comentario equivalente en generarPropuesta.
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
     cfdi,
     rule: mappingSvc.findRuleInList(cfdi, rules),
   }));
+
+  // Ver comentario equivalente en generarPropuesta (anticiposClasificados).
+  const anticiposClasificadosGuard = cfdiConRegla
+    .filter(({ rule, cfdi: c }) => c.tipoDeComprobante === 'I' && rule?.cuentaAbono === CODIGO_CUENTA_ANTICIPOS_CLIENTES)
+    .map(({ cfdi: c }) => ({ total: c.total, fecha: c.fecha, receptor: c.receptor }));
 
   // Ver comentario equivalente en generarPropuesta.
   const cfdiConReglaParaDesglose = cfdisCanceladasSinCompensarGuard.length
@@ -4039,11 +5678,78 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+  // Ver comentario equivalente en generarPropuesta.
+  const ventasSFCubiertasPorSplitGuard = new Set();
+  for (const sfUsado of saldoFavorUsadoMapGuard.values()) {
+    for (const d of (sfUsado.detalle ?? [])) {
+      const key = (d.ventaSerie && d.ventaFolio) ? `${d.ventaSerie}|${d.ventaFolio}`
+        : (d.serieOrigen && d.folioOrigen) ? `${d.serieOrigen}|${d.folioOrigen}` : null;
+      if (key) ventasSFCubiertasPorSplitGuard.add(key);
+    }
+  }
+
+  // Cobros de sucursales (Caja/Bancos por identificar) — ver comentario
+  // equivalente en generarPropuesta. Se calcula ANTES del loop de reglas para
+  // poder omitir, ahí, el Cargo normal de las facturas cuyo Cargo ya cubre
+  // este flujo (si no, la póliza queda con doble Cargo contra un solo Abono).
+  //
+  // Universo ampliado + filtro por fecha real del cobro — ver comentario
+  // equivalente en generarPropuesta y `_fetchCfdisParaPuenteAmplio`.
+  let movsPuenteGuard = [];
+  let facturasVendedorCubiertasGuard = new Map(); // uuid → monto ya cubierto
+  let facturasPPDCubiertasGuard = new Map();
+  let pendientesPorFacturarGuard = [];
+  // Ver comentario equivalente en generarPropuesta.
+  const depositosEfectivoGuard = [];
+  let cuentaSaldoFavorIdGuard = null;
+  let cuentaIvaSaldoFavorIdGuard = null;
+  if (tipoCfdi === 'I' && centroCostoId) {
+    const { cuentaPuenteId, cuentaCajaId, cuentaBancosId, cuentaSaldoFavorId, cuentaIvaSaldoFavorId, cuentaClubTuberosId } = await _resolverCuentasPuenteSucursales();
+    cuentaSaldoFavorIdGuard = cuentaSaldoFavorId;
+    cuentaIvaSaldoFavorIdGuard = cuentaIvaSaldoFavorId;
+    if (cuentaCajaId && cuentaBancosId) {
+      // Acotado a la serie propia — ver comentario equivalente en generarPropuesta.
+      const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
+        ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
+        : cfdisSinPolizaFinalGuard;
+      const resultadoPuenteGuard = await construirMovimientosPuente({
+        cfdis: cfdisParaPuenteGuard,
+        centroCostoId,
+        ccBySerieMap: ccBySerieMap,
+        cuentaCajaId,
+        cuentaBancosId,
+        cuentaPuenteId,
+        cuentaSaldoFavorId,
+        cuentaIvaSaldoFavorId,
+        cuentaClubTuberosId,
+        fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+        fechaHasta: fechaFin ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+        rfc,
+        devsOcultosSF: devsOcultosSFGuard,
+        centroPropioClave: serieDelCentroGuard,
+        // Ver comentario equivalente en generarPropuesta (fix 2026-09-04).
+        ventasSFCubiertasPorSplit: ventasSFCubiertasPorSplitGuard,
+      });
+      movsPuenteGuard = resultadoPuenteGuard.movimientos;
+      facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
+      facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
+      pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
+      // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
+      // detectado hoy con lo ya cubierto en días previos.
+      for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
+        facturasVendedorCubiertasGuard.set(u, (facturasVendedorCubiertasGuard.get(u) ?? 0) + monto);
+      }
+    }
+  }
+
+  // cfdiConRegla / cuentaMap / saldoFavorUsadoMapGuard se calculan ANTES de
+  // `construirMovimientosPuente` (más arriba) — ver comentario equivalente en
+  // generarPropuesta (fix 2026-09-04, dedup SF-APA vs split por origen).
   // Ver comentario equivalente en generarPropuesta.
   const { doctosPorUuid: doctosPagoMapGuard } = await _prefetchDoctosPago(cfdiConRegla, rfc);
   const puntosAcumuladosGuard = new Map(); // centroCostoId → { monto, centroCosto }
@@ -4074,11 +5780,47 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const anticipoCfdisGuard = _rel07UuidsSinReglaGuard.length
     ? await CFDI.find({ uuid: { $in: _rel07UuidsSinReglaGuard } }).select('uuid serie folio total fecha').lean()
     : [];
+  // Egresos SAT que ya formalizan la aplicación de cada venta candidata a
+  // OPA — ver `_fetchEgresosAplicacionAnticipoPorVenta` (misma lógica que en
+  // generarPropuesta).
+  const ventaUuidsConAnticipoGuard = cfdiConRegla
+    .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+      && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+    .map(({ cfdi }) => cfdi.uuid)
+    .filter(Boolean);
+  const egresosAnticipoPorVentaGuard = await _fetchEgresosAplicacionAnticipoPorVenta(ventaUuidsConAnticipoGuard, rfc);
+  // Cuentas Pendientes — ver comentario equivalente en generarPropuesta.
+  const {
+    montoAnticipoPorFactura: montoAnticipoPorFacturaGuard,
+    referenciaOpaPorFactura: referenciaOpaPorFacturaGuard,
+    origenesConvertidosAAnticipo: origenesConvertidosAAnticipoGuard,
+  } = await _prefetchCuentasPendientesAnticipo([
+      // Ver comentario equivalente en generarPropuesta (fix 2026-09-07).
+      fechaInicio, fechaFin,
+      ...anticipoCfdisGuard.map(c => c.fecha),
+      ...cfdiConRegla
+        .filter(({ rule, cfdi }) => cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo
+          && cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07'))
+        .map(({ cfdi }) => cfdi.fecha),
+    ]);
   const anticipoFolioPorUuidGuard = {
     ...Object.fromEntries(
       anticipoCfdisGuard.map(c => [c.uuid.toUpperCase(), `OPA-${c.folio || c.serie || c.uuid}`]),
     ),
     ...(await _resolverReferenciaOpaPorMonto(anticipoCfdisGuard)),
+    ...Object.fromEntries(
+      anticipoCfdisGuard
+        .map(c => [c.uuid.toUpperCase(), referenciaOpaPorFacturaGuard.get(`${c.serie}|${c.folio}`)])
+        .filter(([, ref]) => ref),
+    ),
+    // Prioridad alta: /saldos-favor no purga la conversión SF→Anticipo (ver
+    // docstring de `_resolverReferenciaOpaDesdeSaldosFavor`) — cubre el caso
+    // donde Cuentas Pendientes ya perdió el registro.
+    ..._resolverReferenciaOpaDesdeSaldosFavor(anticipoCfdisGuard, anticiposConvertidosGuard),
+    // Máxima prioridad: match DIRECTO por UUID (`cuenta.anticipos[]` de
+    // /saldos-favor, confirmado 2026-09-08) — ver docstring de
+    // `anticipoFolioPorUuidDesdeSaldosFavor` en `_prefetchSaldosFavorGenerados`.
+    ...anticipoFolioPorUuidDesdeSaldosFavorGuard,
   };
 
   let saldoRestanteGuard = 0;
@@ -4098,15 +5840,21 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // (ccBySerieMap ya se resolvió arriba, antes del filtro por sucursal)
 
   // ── Fix doble-contabilización anticipo PUE ────────────────────────────────
-  // Misma lógica que en generarPropuesta: si hay una factura PUE formaPago=30
-  // con tipoRelacion=07 en el batch, la NC tipo E del mismo anticipo se omite.
-  const anticosCubiertosPorReg22CGuard = new Set();
+  // Ver comentario completo en generarPropuesta (`ventasConAnticipoRedirigido`).
+  const ventasConAnticipoRedirigidoGuard = new Set();
   for (const { cfdi: c } of cfdiConRegla) {
-    if (c.tipoDeComprobante !== 'I' || c.formaPago !== '30') continue;
-    if (c.uuid) anticosCubiertosPorReg22CGuard.add(c.uuid.toUpperCase());
+    if (c.tipoDeComprobante !== 'I' || !c.serie || !c.folio || !c.uuid) continue;
+    if (Number(anticipoUsadoMapGuard.get(`${c.serie}|${c.folio}`)) > 0) {
+      ventasConAnticipoRedirigidoGuard.add(c.uuid.toUpperCase());
+    }
   }
+  // Ver comentario equivalente en generarPropuesta (`ventasConComboEspecialAnticipoProp`).
+  const ventasConComboEspecialAnticipoGuard = new Map();
 
-  // Fix 5: verificar también en BD — la NC y la factura final pueden venir en batches distintos.
+  // Fix 5 (sin cambios, ver comentario en generarPropuesta): verificar
+  // también en BD — la NC y la factura final pueden venir en batches
+  // distintos, se sigue OMITIENDO por completo (criterio amount-blind).
+  const anticosCubiertosPorReg22CGuard = new Map();
   {
     const uuids07g = new Set(
       cfdiConRegla
@@ -4132,7 +5880,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           attributes: ['cfdiUuid'],
           include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
         });
-        for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.add(m.cfdiUuid.toUpperCase());
+        // Ver comentario equivalente en generarPropuesta — camino cross-batch
+        // sin ajuste de monto todavía, `Infinity` conserva el comportamiento
+        // anterior (siempre omitir).
+        for (const m of yaEnBDG) anticosCubiertosPorReg22CGuard.set(m.cfdiUuid.toUpperCase(), Infinity);
       }
     }
   }
@@ -4145,12 +5896,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const muestrasSinRegla = [];
 
   for (const { cfdi, rule } of cfdiConRegla) {
-    // Omitir NC tipo E (tipoRelacion=07) cuyo anticipo ya fue procesado por Reg 22C
+    // uuid07: ver comentario equivalente en generarPropuesta.
+    let uuid07;
     if (cfdi.tipoDeComprobante === 'E' &&
         cfdi.cfdiRelacionados?.some(r => r.tipoRelacion === '07')) {
       const _rel07g = (cfdi.cfdiRelacionados || []).find(r => r.tipoRelacion === '07');
-      const uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
-      if (uuid07 && anticosCubiertosPorReg22CGuard.has(uuid07)) continue;
+      uuid07 = (_rel07g?.uuids?.[0] ?? _rel07g?.uuid ?? '').toUpperCase() || undefined;
+      if (uuid07 && anticosCubiertosPorReg22CGuard.get(uuid07) === Infinity) continue;
     }
 
     if (!rule) {
@@ -4219,6 +5971,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       }
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
       if (puntosUsadoCfdi > 0) context.montoPuntosUsado = puntosUsadoCfdi;
+      const anticipoUsadoCfdi = anticipoUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
+      if (anticipoUsadoCfdi > 0) context.montoAnticipoUsado = anticipoUsadoCfdi;
     }
     if (cfdi.tipoDeComprobante === 'P') {
       const doctosPago = doctosPagoMapGuard.get(cfdi.uuid);
@@ -4226,7 +5980,26 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
+    const comboEspecialGuard = uuid07 ? ventasConComboEspecialAnticipoGuard.get(uuid07) : null;
+    if (comboEspecialGuard) {
+      // Ver comentario equivalente en generarPropuesta.
+      movs.length = 0;
+      const baseComboEgresoGuard = {
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA-REVERSION',
+        concepto: comboEspecialGuard.refCombo, serie: comboEspecialGuard.serieCombo,
+        centroCosto: rule?.centroCosto ?? '',
+      };
+      if (comboEspecialGuard.subtotalPrevios > 0) {
+        movs.push({ ...baseComboEgresoGuard, cuentaId: cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null, debe: comboEspecialGuard.subtotalPrevios, haber: 0 });
+      }
+      if (comboEspecialGuard.ivaPrevios > 0) {
+        movs.push({ ...baseComboEgresoGuard, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null, debe: comboEspecialGuard.ivaPrevios, haber: 0 });
+      }
+    } else if (uuid07 && ventasConAnticipoRedirigidoGuard.has(uuid07)) {
+      _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
+    }
 
     if (rule?.esAplicacionSaldo) {
       const usado = movs.find(m => m._saldoUsado != null)?._saldoUsado ?? 0;
@@ -4248,22 +6021,89 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // la primera. Mejora pendiente: si alguna relacionada no tiene su CFDI
     // sincronizado en Mongo, esa no se puede resolver ni prorratear.
     let anticipoFolioRefGuard = null;
-    if (cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo) {
+    // Declarado fuera del `if` (bug real 2026-09-15, ReferenceError en
+    // producción) — ver comentario equivalente en generarPropuesta.
+    const anticiposResueltosGuard = [];
+    const _califica07Guard = cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo;
+    if (_califica07Guard) {
       // Ver comentario equivalente en generarPropuesta: el "-" colgante de las
       // relaciones sin resolver SIEMPRE va al final, nunca en medio.
+      // Ver comentario equivalente en generarPropuesta sobre por qué se
+      // recorren TODOS los uuids de cada relación (no solo el primero que
+      // "resuelva" algo) — bug real 2026-08-31, caso MONSAN B0-260801098.
       const foliosResueltosGuard = [];
       let faltaAlgunoGuard = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
-        let refRel = null;
         for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
           const ref = anticipoFolioPorUuidGuard[(u || '').toUpperCase()];
-          if (ref) { refRel = ref.replace(/^OPA-/, ''); break; }
+          if (ref) {
+            const folioLimpio = ref.replace(/^OPA-/, '');
+            foliosResueltosGuard.push(folioLimpio);
+            const anticipoCfdi = anticipoCfdisGuard.find(c => c.uuid.toUpperCase() === (u || '').toUpperCase());
+            if (Number(anticipoCfdi?.total) > 0) {
+              anticiposResueltosGuard.push({ folio: folioLimpio, total: Number(anticipoCfdi.total) });
+            }
+          } else faltaAlgunoGuard = true;
         }
-        if (refRel) foliosResueltosGuard.push(refRel); else faltaAlgunoGuard = true;
       }
       if (foliosResueltosGuard.length) anticipoFolioRefGuard = `OPA-${foliosResueltosGuard.join('-')}${faltaAlgunoGuard ? '-' : ''}`;
     }
+    if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
+      console.warn(`[DEBUG_OPA_GUARD] ${cfdi.serie}-${cfdi.folio} uuid=${cfdi.uuid} formaPago=${cfdi.formaPago} `
+        + `cuentaIvaAnticipo=${rule?.cuentaIvaAnticipo} cfdiRelacionados=${JSON.stringify(cfdi.cfdiRelacionados)} `
+        + `anticipoFolioPorUuidGuard=${JSON.stringify(anticipoFolioPorUuidGuard)} anticipoFolioRefGuard=${anticipoFolioRefGuard}`);
+    }
+    // Monto REAL de anticipo aplicado — ver comentario equivalente en
+    // generarYGuardar (`montoAnticipoRealProp`).
+    let movVentasAbonoGuard = null;
+    let movIvaAbonoGuard    = null;
+    let montoAnticipoRealGuard = 0;
+    // Ver comentario equivalente en generarPropuesta.
+    let tasaIvaAnticipoEfectivaGuard = TASA_IVA_ANTICIPO;
+    // Ver comentario equivalente en generarPropuesta.
+    let serieEgresoAnticipoGuard = null;
+    // Ver comentario equivalente en generarPropuesta (BUG CORREGIDO
+    // 2026-09-07, caso real RAYMUNDO CUELLAR MENDOZA): se evalúa SIEMPRE que
+    // la regla califique, sin exigir que `anticipoFolioRefGuard` ya haya
+    // resuelto folio — el Egreso real es evidencia más confiable que el CFDI
+    // del anticipo original (puede no estar sincronizado en Mongo).
+    const egresoAnticipoGuard = _califica07Guard
+      ? egresosAnticipoPorVentaGuard.get((cfdi.uuid || '').toUpperCase())
+      : null;
+    if (anticipoFolioRefGuard || egresoAnticipoGuard) {
+      movVentasAbonoGuard = rule?.cuentaAbono
+        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
+        : null;
+      movIvaAbonoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
+        .filter(Boolean)
+        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
+        .find(Boolean) ?? null;
+      const totalVentaGuard = Number(movVentasAbonoGuard?.haber ?? 0) + Number(movIvaAbonoGuard?.haber ?? 0);
+      if (egresoAnticipoGuard) {
+        montoAnticipoRealGuard = Math.min(egresoAnticipoGuard.total, totalVentaGuard);
+        serieEgresoAnticipoGuard = egresoAnticipoGuard.serieFolio ?? null;
+        if (egresoAnticipoGuard.subTotal > 0 && egresoAnticipoGuard.total > egresoAnticipoGuard.subTotal) {
+          tasaIvaAnticipoEfectivaGuard = (egresoAnticipoGuard.total - egresoAnticipoGuard.subTotal) / egresoAnticipoGuard.subTotal;
+        }
+        // Ver comentario equivalente en generarPropuesta.
+        if (egresoAnticipoGuard.folioOpa) anticipoFolioRefGuard = egresoAnticipoGuard.folioOpa;
+        // Ver comentario equivalente en generarPropuesta (bug real
+        // RAYMUNDO CUELLAR MENDOZA, sin prefijo "OPA-" para que la
+        // serie-folio pase `_REFERENCIA_REGEX`).
+        if (!anticipoFolioRefGuard) {
+          anticipoFolioRefGuard = serieEgresoAnticipoGuard ?? `OPA-${(cfdi.uuid || '').slice(0, 8)}`;
+        }
+      } else {
+        // Cuentas Pendientes tiene prioridad sobre `context.montoAnticipoUsado`
+        // — ver comentario equivalente en generarPropuesta.
+        const montoCuentasPendientesGuard = montoAnticipoPorFacturaGuard.get(`${cfdi.serie}|${cfdi.folio}`);
+        montoAnticipoRealGuard = (montoCuentasPendientesGuard > 0)
+          ? Math.min(montoCuentasPendientesGuard, totalVentaGuard)
+          : Math.min(Number(context.montoAnticipoUsado ?? 0), totalVentaGuard);
+      }
+    }
+    let montoAnticipoRestanteGuard = montoAnticipoRealGuard;
 
     // Acumular Puntos usados por esta factura hacia el total de la sucursal
     // (ver comentario equivalente en generarPropuesta).
@@ -4278,8 +6118,18 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // recibió (parte de) su Cargo vía cobros-sucursal-puente.service.js, ese
     // monto se RESTA del Cargo normal de la regla (no se omite siempre por
     // completo — corrección 2026-08-06, Facturas Globales).
-    const montoCubiertoPorSucursalGuard = facturasVendedorCubiertasGuard.get(cfdi.uuid?.toUpperCase() ?? '') ?? 0;
-    let montoCubiertoRestanteGuard = montoCubiertoPorSucursalGuard;
+    //
+    // Por TICKET, no por la primera línea Caja/Bancos que aparezca (2026-08-27,
+    // bug real confirmado — Reforma 1-ago, Global D0-260800038: el ticket
+    // D0-260800176 se cubrió por $2,018.68 vía Tarjeta en otra sucursal, pero
+    // al restar de la primera línea encontrada en vez de la del ticket 176,
+    // la resta caía en el exceso "Venta Sin Cobro" y luego en el ticket
+    // D0-260800218 — ajenos al cruce, perdiendo $386.53 de efectivo genuino).
+    // Ver `facturasVendedorCubiertas.detalle` en cobros-sucursal-puente.service.js.
+    const cubiertoInfoGuard = facturasVendedorCubiertasGuard.get(cfdi.uuid?.toUpperCase() ?? '');
+    const montoCubiertoRestantePorTicketGuard = new Map(
+      (cubiertoInfoGuard?.detalle ?? []).map(d => [`${d.serieVenta}|${d.folioVenta}`, d.monto]),
+    );
     // Ver comentario equivalente en generarPropuesta: PPD cobrada en otra
     // sucursal — el Cargo a Clientes normal no se toca; se agrega abajo un
     // asiento adicional (Abono a Clientes + Cargo puente, que ya viene en movsPuenteGuard).
@@ -4294,44 +6144,154 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const esLineaCajaOBancosGuard = m.cuentaId === (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) || m.cuentaId === (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
       // eslint-disable-next-line no-unused-vars
       const { _saldoUsado, ...cleanM } = m;
-      // Ver comentario equivalente en generarPropuesta: oculta el Cargo
-      // Clientes cuando aplica el cierre de anticipo sin NC.
-      const ocultarPorAnticipoGuard = anticipoFolioRefGuard && esLineaCargoPrincipalGuard;
-      if (montoCubiertoRestanteGuard > 0 && esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && Number(m.debe) > 0) {
-        const reduccion = Math.min(montoCubiertoRestanteGuard, Number(m.debe));
-        montoCubiertoRestanteGuard = parseFloat((montoCubiertoRestanteGuard - reduccion).toFixed(2));
-        const debeAjustado = parseFloat((Number(m.debe) - reduccion).toFixed(2));
-        if (debeAjustado <= 0) continue; // esta línea quedó totalmente cubierta
-        todosLosMovimientos.push({
-          ...cleanM,
-          debe:           debeAjustado,
-          cuentaFaltante: cleanM.cuentaId == null,
-          centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
-          centroCostoId:  cc?.id    ?? null,
-          ...(ocultarPorAnticipoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
-        });
-        continue;
+      // Ver comentario equivalente en generarYGuardar (`ocultarPorAnticipoTotal`):
+      // CON dato real, el Cargo se reduce línea a línea (nunca se oculta);
+      // SIN dato real, cae al comportamiento viejo (ocultar el Cargo completo).
+      const ocultarPorAnticipoTotalGuard = anticipoFolioRefGuard && montoAnticipoRealGuard === 0 && esLineaCargoPrincipalGuard;
+      // Ticket real de esta línea (por ticket dentro de una Factura Global) o,
+      // si no trae uno (factura normal de un solo ticket, o el exceso "Venta
+      // Sin Cobro"), la propia factura — ver comentario arriba sobre por qué
+      // ya no se resta de la primera línea Caja/Bancos que aparezca.
+      const ticketKeyLineaGuard = m.folioVentaTicket != null
+        ? `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`
+        : `${cfdi.serie}|${cfdi.folio}`;
+      const restanteTicketGuard = montoCubiertoRestantePorTicketGuard.get(ticketKeyLineaGuard) ?? 0;
+      let debeFinalGuard = Number(m.debe);
+      let huboReduccionGuard = false;
+      if (esLineaCargoPrincipalGuard && esLineaCajaOBancosGuard && debeFinalGuard > 0 && restanteTicketGuard > 0) {
+        const reduccion = Math.min(restanteTicketGuard, debeFinalGuard);
+        montoCubiertoRestantePorTicketGuard.set(ticketKeyLineaGuard, parseFloat((restanteTicketGuard - reduccion).toFixed(2)));
+        debeFinalGuard = parseFloat((debeFinalGuard - reduccion).toFixed(2));
+        huboReduccionGuard = true;
       }
+      // Ver comentario equivalente en generarPropuesta sobre por qué la
+      // reducción por ANTICIPO se separó del cruce de sucursal (caso real
+      // H0-260800539, Reg 22C con cuentaCargo=Anticipos de Clientes).
+      const esLineaCargoDeLaReglaGuard = m.cuentaId === (cuentaMap[rule?.cuentaCargo] ?? null);
+      if (esLineaCargoPrincipalGuard && (esLineaCajaOBancosGuard || esLineaCargoDeLaReglaGuard)
+          && montoAnticipoRestanteGuard > 0 && debeFinalGuard > 0) {
+        const reduccionAnticipo = Math.min(montoAnticipoRestanteGuard, debeFinalGuard);
+        montoAnticipoRestanteGuard = parseFloat((montoAnticipoRestanteGuard - reduccionAnticipo).toFixed(2));
+        debeFinalGuard = parseFloat((debeFinalGuard - reduccionAnticipo).toFixed(2));
+        huboReduccionGuard = true;
+      }
+      if (huboReduccionGuard && debeFinalGuard <= 0) continue; // línea totalmente cubierta
       todosLosMovimientos.push({
         ...cleanM,
+        ...(huboReduccionGuard ? { debe: debeFinalGuard } : {}),
         cuentaFaltante: cleanM.cuentaId == null,
         centroCosto:    cc?.clave ?? cleanM.centroCosto ?? null,
         centroCostoId:  cc?.id    ?? null,
-        ...(ocultarPorAnticipoGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
+        ...(ocultarPorAnticipoTotalGuard ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
       });
     }
 
-    // Anticipo sin NC — ver comentario equivalente en generarPropuesta.
-    if (anticipoFolioRefGuard) {
-      const movVentasAbonoGuard = rule?.cuentaAbono
-        ? movs.find(m => m.cuentaId === (cuentaMap[rule.cuentaAbono] ?? null) && Number(m.haber) > 0)
-        : null;
-      // Puede ser PPD (`rule.cuentaIvaPPD`) o PUE (`rule.cuentaIva`) — ver
-      // comentario equivalente en generarPropuesta.
-      const movIvaAbonoGuard = [rule?.cuentaIva, rule?.cuentaIvaPPD]
-        .filter(Boolean)
-        .map(cod => movs.find(m => m.cuentaId === (cuentaMap[cod] ?? null) && Number(m.haber) > 0))
-        .find(Boolean) ?? null;
+    // Monto REALMENTE consumido en el loop — ver comentario equivalente en
+    // generarYGuardar (`montoAnticipoConsumidoProp`).
+    const montoAnticipoConsumidoGuard = parseFloat((montoAnticipoRealGuard - montoAnticipoRestanteGuard).toFixed(2));
+    // Anticipo sin NC — ver comentario equivalente en generarYGuardar.
+    if (anticipoFolioRefGuard && montoAnticipoConsumidoGuard > 0) {
+      // CON dato real — ver comentario equivalente en generarYGuardar.
+      const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
+      const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
+      const baseInfoGuard = {
+        centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
+      };
+      // Combo especial: 2+ anticipos combinados Y la venta va a ser revertida
+      // por un Egreso real — ver comentario equivalente en generarPropuesta
+      // (`ventasConComboEspecialAnticipoProp`). Prioridad sobre el desglose
+      // por anticipo normal de abajo.
+      const uuidVentaGuard = (cfdi.uuid || '').toUpperCase();
+      // DESHABILITADO 2026-09-15 — ver comentario equivalente en
+      // generarPropuesta (`esComboEspecialProp`).
+      const esComboEspecialGuard = false && anticiposResueltosGuard.length > 1 && ventasConAnticipoRedirigidoGuard.has(uuidVentaGuard);
+      if (esComboEspecialGuard) {
+        const previosGuard = anticiposResueltosGuard.slice(0, -1);
+        const ultimoGuard  = anticiposResueltosGuard[anticiposResueltosGuard.length - 1];
+        const sumaPreviosGuard = previosGuard.reduce((s, a) => s + a.total, 0);
+        const subtotalPreviosGuard = Math.round((sumaPreviosGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+        const ivaPreviosGuard      = Math.round((sumaPreviosGuard - subtotalPreviosGuard) * 100) / 100;
+        const subtotalUltimoGuard  = Math.round((ultimoGuard.total / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+        const ivaUltimoGuard       = Math.round((ultimoGuard.total - subtotalUltimoGuard) * 100) / 100;
+        const refComboGuard   = `OPA-${anticiposResueltosGuard.map(a => a.folio).join('-')}`;
+        const serieComboGuard = serieEgresoAnticipoGuard ?? refComboGuard;
+        // Ver comentario equivalente en generarPropuesta: se guarda la
+        // porción "previos" para que el Egreso la genere en SU propio
+        // cfdiUuid con reglaNombre='OPA-REVERSION' (2 grupos, no 1).
+        ventasConComboEspecialAnticipoGuard.set(uuidVentaGuard, {
+          subtotalPrevios: subtotalPreviosGuard, ivaPrevios: ivaPreviosGuard,
+          refCombo: refComboGuard, serieCombo: serieComboGuard,
+        });
+        const baseComboGuard = { ...baseInfoGuard, concepto: refComboGuard, serie: serieComboGuard };
+        if (subtotalUltimoGuard > 0) {
+          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaAnticiposIdGuard, debe: subtotalUltimoGuard, haber: 0, cuentaFaltante: cuentaAnticiposIdGuard == null });
+        }
+        if (ivaUltimoGuard > 0) {
+          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaIvaAnticipoIdGuard, debe: ivaUltimoGuard, haber: 0, cuentaFaltante: cuentaIvaAnticipoIdGuard == null });
+        }
+      } else {
+      const desglosePorAnticipoGuard = [];
+      if (anticiposResueltosGuard.length > 1) {
+        let restanteGuard = montoAnticipoConsumidoGuard;
+        for (const a of anticiposResueltosGuard) {
+          if (restanteGuard <= 0.004) break;
+          const montoLinea = Math.round(Math.min(a.total, restanteGuard) * 100) / 100;
+          if (montoLinea <= 0) continue;
+          restanteGuard = parseFloat((restanteGuard - montoLinea).toFixed(2));
+          desglosePorAnticipoGuard.push({ folio: a.folio, monto: montoLinea });
+        }
+      }
+      if (desglosePorAnticipoGuard.length > 1) {
+        for (const d of desglosePorAnticipoGuard) {
+          const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+          const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
+          const refOpaD      = `OPA-${d.folio}`;
+          const serieCierreD = serieEgresoAnticipoGuard ?? refOpaD;
+          if (subtotalD > 0) {
+            todosLosMovimientos.push({
+              ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
+              concepto: refOpaD, serie: serieCierreD, debe: subtotalD, haber: 0,
+              cuentaFaltante: cuentaAnticiposIdGuard == null,
+            });
+          }
+          if (ivaD > 0) {
+            todosLosMovimientos.push({
+              ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
+              concepto: refOpaD, serie: serieCierreD, debe: ivaD, haber: 0,
+              cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
+            });
+          }
+        }
+        // (bloque combinado de siempre omitido a propósito: ya se emitió arriba por anticipo)
+      } else {
+        const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+        const ivaAnticipoGuard      = Math.round((montoAnticipoConsumidoGuard - subtotalAnticipoGuard) * 100) / 100;
+        const refOpaGuard = anticipoFolioRefGuard;
+        // Columna C (serie) = folio del Egreso real cuando existe; columna H
+        // (concepto) = siempre "OPA-..." — ver comentario equivalente en
+        // generarPropuesta.
+        const serieCierreGuard = serieEgresoAnticipoGuard ?? refOpaGuard;
+        if (subtotalAnticipoGuard > 0) {
+          todosLosMovimientos.push({
+            ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
+            concepto: refOpaGuard, serie: serieCierreGuard, debe: subtotalAnticipoGuard, haber: 0,
+            cuentaFaltante: cuentaAnticiposIdGuard == null,
+          });
+        }
+        if (ivaAnticipoGuard > 0) {
+          todosLosMovimientos.push({
+            ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
+            concepto: refOpaGuard, serie: serieCierreGuard, debe: ivaAnticipoGuard, haber: 0,
+            cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
+          });
+        }
+      }
+      }
+    } else if (anticipoFolioRefGuard && montoAnticipoRealGuard === 0) {
+      // SIN dato real en absoluto (fallback) — ver comentario equivalente en
+      // generarYGuardar sobre por qué el caso "real>0 pero consumido=0" no
+      // entra a ninguna rama a propósito.
       const montoVentasAnticipoGuard = movVentasAbonoGuard?.haber ?? 0;
       const montoIvaAnticipoGuard    = movIvaAbonoGuard?.haber ?? 0;
       const refOpaGuard = anticipoFolioRefGuard; // ya viene armado como "OPA-..." (real o placeholder)
@@ -4373,12 +6333,14 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     // Saldo a favor generado por esta Devolución — ver comentario
-    // equivalente en generarPropuesta.
-    const lineasSaldoFavorGuard = await _inyectarSaldoFavorGenerado({
+    // equivalente en generarPropuesta (bug de doble-contabilización con
+    // Anticipos, corregido 2026-09-04).
+    const lineasSaldoFavorGuard = rule?.cuentaIvaAnticipo ? [] : await _inyectarSaldoFavorGenerado({
       cfdi, mapaGenerados: mapaSaldosFavorGeneradosGuard,
       cuentaSaldoFavorId: cuentaSaldoFavorIdGuard, cuentaIvaSaldoFavorId: cuentaIvaSaldoFavorIdGuard,
       cuentaCajaId: cuentaMap[CODIGO_CUENTA_CAJA] ?? null, cuentaBancosId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null,
-      cc, rfc,
+      cc, rfc, origenesConvertidosAAnticipo: origenesConvertidosAAnticipoGuard,
+      anticiposClasificados: anticiposClasificadosGuard,
     });
     for (const linea of lineasSaldoFavorGuard) {
       todosLosMovimientos.push(linea);
@@ -4454,6 +6416,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     for (const [key, generado] of mapaSaldosFavorGeneradosGuard) {
       if (clavesConsumidasGuard.has(key)) continue;
       if (!generado?.monto) continue;
+      // Ver comentario equivalente en generarPropuesta ("SF GEN-huérfanos").
+      if (generado?.anticipoReferencia) continue;
       const reglaSFG = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
       const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
       const ivaG      = Math.round((generado.monto - subtotalG) * 100) / 100;
@@ -4539,22 +6503,46 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin) {
     const cobrosSinFacturaGuard = await _cobrosSinFacturaPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
     const ccSinFacturaGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
-    for (const [claveSatSFG, montoSFG] of cobrosSinFacturaGuard) {
-      const cuentaDestinoSFG = claveSatSFG === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
-      if (!cuentaDestinoSFG || montoSFG <= 0) continue;
+    for (const t of cobrosSinFacturaGuard) {
+      const cuentaDestinoSFG = t.clave === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
+      if (!cuentaDestinoSFG || t.monto <= 0) continue;
       todosLosMovimientos.push({
-        concepto:      'Cobros sin factura',
+        concepto:      `Cobros sin factura / ${t.ventaSerie}-${t.ventaFolio}`,
         serie:         null,
         centroCosto:   ccSinFacturaGuard?.clave ?? null,
         centroCostoId: ccSinFacturaGuard?.id    ?? null,
         cfdiUuid:      null,
         cuentaId:      cuentaDestinoSFG,
-        debe:          montoSFG,
+        debe:          t.monto,
         haber:         0,
         tipoOrigen:    'Venta',
         reglaNombre:   'COBRO-SIN-FACTURA',
-        formaPago:     claveSatSFG,
+        formaPago:     t.clave,
+        serieVentaTicket: t.ventaSerie,
+        folioVentaTicket: t.ventaFolio,
       });
+    }
+  }
+
+  // Saldo a favor usado en otro día (factura tardía) — ver comentario
+  // equivalente en generarPropuesta.
+  if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin
+      && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
+    const sfTardioGuard = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
+    const ccSfTardioGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
+    for (const d of sfTardioGuard) {
+      const subtotalG = Math.round((d.monto / 1.16) * 100) / 100;
+      const ivaG = Math.round((d.monto - subtotalG) * 100) / 100;
+      const referenciaVentaG = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
+      const conceptoSfTardioG = [d.nombreCliente, referenciaVentaG].filter(Boolean).join(' / ');
+      const baseSfTardioG = {
+        concepto: conceptoSfTardioG, serie: referenciaVentaG,
+        centroCosto: ccSfTardioGuard?.clave ?? null, centroCostoId: ccSfTardioGuard?.id ?? null,
+        cfdiUuid: d.facturaUuid ?? null, cuentaFaltante: false,
+        tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+      };
+      todosLosMovimientos.push({ ...baseSfTardioG, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalG });
+      todosLosMovimientos.push({ ...baseSfTardioG, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaG });
     }
   }
 
@@ -4679,17 +6667,19 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         concepto:      _conceptoG.slice(0, 255) || 'Cobro Suc. Ajena',
         centroCosto:   _ccCobradoraGuard.clave ?? null,
         centroCostoId: _ccCobradoraGuard.id    ?? null,
-        reglaNombre:   'COS',
+        // Ver comentario equivalente en generarPropuesta -- nunca el literal
+        // 'COS' (salía "COS-COS" en vez de "COS-EFECTIVO"/"COS-TARJETA").
+        reglaNombre:   esEfe ? 'EFECTIVO' : (claveSat === '04' || claveSat === '28') ? 'TARJETA' : null,
         formaPago:     claveSat || null,
       };
       // Mismo criterio que en generarPropuesta (ver comentario allá): Efectivo
       // se puede mover entre sucursales (Abono a la misma cuenta, emparejado
       // por cfdiUuid, ambas líneas se sacan del consolidado). Tarjeta/
       // Transferencia NUNCA se mueven — el banco ya depositó aquí — así que su
-      // Abono va a la cuenta puente SIN cfdiUuid, para que el Cargo sí cuente
-      // en el consolidado.
-      // `cfdiUuid` solo se conserva para Efectivo — ver comentario equivalente en generarPropuesta.
-      todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: esEfe ? (cfdiUuid ?? null) : null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
+      // Abono va a la cuenta puente, para que el Cargo sí cuente en el
+      // consolidado.
+      // `cfdiUuid` se conserva SIEMPRE (2026-09-04) — ver comentario equivalente en generarPropuesta.
+      todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Venta', debe: monto, haber: 0 });
       if (esEfe) {
         todosLosMovimientos.push({ ...baseCos, cuentaId: cuentaCos, cfdiUuid: cfdiUuid ?? null, tipoOrigen: 'Cobro Sucursal', debe: 0, haber: monto });
       } else {
@@ -4778,6 +6768,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       estado:    'borrador',
       sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
+      depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
+      movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard.length ? movimientosPpdPorFacturarGuard : null,
     }, { transaction: t });
 
     const movimientosFinales = _deduplicarSFRedundante(todosLosMovimientos);
@@ -4850,6 +6842,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // Hoja aparte: tickets con cobro real sin factura ligada — ver
     // `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
     pendientesPorFacturar: pendientesPorFacturarGuard,
+    // Hoja aparte: SF aplicado a una venta consumidora que sigue PPD/POR
+    // FACTURAR — ver comentario en `_prefetchAjustesFacturaPropia`.
+    movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard,
   };
 }
 
@@ -5079,10 +7074,130 @@ async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPro
   return { resultados };
 }
 
+/**
+ * GET /api/cfdi-mapping/desglose-anticipos — reporte de SOLO LECTURA (no
+ * genera ni toca ninguna póliza): para cada venta (factura tipo I) que aplicó
+ * uno o más anticipos (`cfdiRelacionados.tipoRelacion === '07'`), devuelve el
+ * desglose de anticipos aplicados con su referencia OPA resuelta — mismo
+ * mecanismo que usa `generarYGuardar` para el cierre "Aplicación de anticipo
+ * sin NC" (ver `_resolverReferenciaOpaPorMonto` y el bloque `anticipoFolioRefProp`
+ * más arriba), expuesto acá para consulta sin tener que generar la póliza.
+ *
+ * Filtros: `rfc` (requerido) + al menos uno de (`series`+`folios`) o
+ * (`fechaInicio`+`fechaFin`) — para no escanear todo el historial de la
+ * empresa sin acotar.
+ *   - `series`/`folios`: arreglos PARALELOS (mismo índice = misma venta),
+ *     misma convención que `obtenerDesglosesCobroAlmacen({ series, folios })`
+ *     en erp-sync.service.js.
+ *   - `centroCostoId`: acota a un centro de costo, resuelto por la serie de
+ *     facturación de la venta contra `CentroCosto.serieFacturacion`.
+ *   - `fechaInicio`/`fechaFin`: ISO, inclusive, sobre la fecha de la VENTA
+ *     (no de los anticipos).
+ *
+ * Cada anticipo trae `resuelto: true` cuando la referencia "OPA-..." viene del
+ * recibo bancario real (`BankMovement.erpLinks`, por monto+fecha) y `false`
+ * cuando es el placeholder armado con serie/folio del propio CFDI de anticipo
+ * (mismo criterio de `anticipoFolioPorUuidProp` en `generarYGuardar`) —
+ * `encontrado: false` cuando el uuid relacionado todavía no está sincronizado
+ * en Mongo, y por lo tanto no se puede resolver en absoluto.
+ */
+async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, fechaInicio, fechaFin }) {
+  if (!rfc) throw new BadRequestError('rfc es requerido');
+
+  const tieneSeriesFolios = Array.isArray(series) && series.length > 0 && Array.isArray(folios) && folios.length > 0;
+  if (!tieneSeriesFolios && (!fechaInicio || !fechaFin)) {
+    throw new BadRequestError('Se requiere series+folios, o fechaInicio+fechaFin, para acotar la búsqueda');
+  }
+  if (tieneSeriesFolios && series.length !== folios.length) {
+    throw new BadRequestError('series y folios deben tener la misma longitud (son arreglos paralelos)');
+  }
+
+  const filtro = {
+    'emisor.rfc':                     rfc,
+    tipoDeComprobante:                'I',
+    satStatus:                        'Vigente',
+    source:                           'SAT',
+    isActive:                         true,
+    'cfdiRelacionados.tipoRelacion':  '07',
+  };
+  if (tieneSeriesFolios) {
+    filtro.$or = series.map((s, i) => ({ serie: s, folio: String(folios[i]) }));
+  }
+  if (fechaInicio || fechaFin) {
+    filtro.fecha = {};
+    if (fechaInicio) filtro.fecha.$gte = new Date(fechaInicio);
+    if (fechaFin)    filtro.fecha.$lte = new Date(fechaFin);
+  }
+
+  const ventas = await CFDI.find(filtro)
+    .select('uuid serie folio fecha total cfdiRelacionados receptor.rfc receptor.nombre')
+    .sort({ fecha: 1 })
+    .lean();
+
+  if (!ventas.length) return { total: 0, ventas: [] };
+
+  const bySerieMap = await centrosSvc.resolveBySerieMap();
+  let ventasFiltradas = ventas;
+  if (centroCostoId != null) {
+    ventasFiltradas = ventas.filter(v => bySerieMap[v.serie]?.id === Number(centroCostoId));
+  }
+
+  // Resuelve TODOS los CFDIs de anticipo referenciados en un solo lote (no uno
+  // por venta) — mismo criterio de prefetch que el resto del generador.
+  const uuidsAnticipos = [...new Set(
+    ventasFiltradas.flatMap(v => (v.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))),
+  )];
+  const anticipoCfdis = uuidsAnticipos.length
+    ? await CFDI.find({ uuid: { $in: uuidsAnticipos } }).select('uuid serie folio total fecha').lean()
+    : [];
+  const anticipoPorUuid = Object.fromEntries(anticipoCfdis.map(c => [c.uuid.toUpperCase(), c]));
+  const referenciasResueltas = await _resolverReferenciaOpaPorMonto(anticipoCfdis);
+
+  const ventasResultado = ventasFiltradas.map(v => {
+    const cc = bySerieMap[v.serie] ?? null;
+    const anticipos = (v.cfdiRelacionados ?? [])
+      .filter(r => r.tipoRelacion === '07')
+      .flatMap(r => r.uuids ?? (r.uuid ? [r.uuid] : []))
+      .map(uuid => {
+        const c = anticipoPorUuid[(uuid || '').toUpperCase()];
+        if (!c) return { uuid, encontrado: false };
+        const referenciaReal = referenciasResueltas[c.uuid.toUpperCase()] ?? null;
+        return {
+          uuid: c.uuid, serie: c.serie ?? '', folio: c.folio ?? '',
+          total: c.total, fecha: c.fecha,
+          referencia: referenciaReal ?? `OPA-${c.folio || c.serie || c.uuid}`,
+          resuelto:   !!referenciaReal,
+          encontrado: true,
+        };
+      });
+    return {
+      uuid: v.uuid, serie: v.serie ?? '', folio: v.folio ?? '',
+      fecha: v.fecha, total: v.total,
+      receptorRfc: v.receptor?.rfc ?? '', receptorNombre: v.receptor?.nombre ?? '',
+      centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
+      totalAnticiposAplicados: anticipos.length,
+      anticipos,
+    };
+  });
+
+  return { total: ventasResultado.length, ventas: ventasResultado };
+}
+
 module.exports = {
   generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
+  desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
-  _prefetchAjustesFacturaPropia,
+  _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
+  _sfUsadoAntesDeFacturarPorCentro,
+  // Utilidades genéricas (numeración de folio, fechas) expuestas ÚNICAMENTE
+  // para que cobranza-poliza-generator.service.js las reutilice sin duplicar
+  // la numeración de folio (comparte el mismo contador/rango por sucursal que
+  // Ingreso — duplicarla arriesgaría folios chocados entre ambos). Ninguna de
+  // estas funciones tiene lógica de negocio de Ingreso: son utilería pura.
+  _folioSiguienteDisponible, _rangoFolioPorSucursal, _esCedisPorSucursal, FOLIOS_MAX_CEDIS,
+  _medianocheMx, _diaSiguiente,
 };

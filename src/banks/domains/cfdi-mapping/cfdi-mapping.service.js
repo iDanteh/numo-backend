@@ -72,6 +72,26 @@ const CODIGO_CUENTA_SALDO_FAVOR     = '2103090001';
 const CODIGO_CUENTA_CLUB_TUBEROS    = '2103090002';
 const CODIGO_CUENTA_IVA_SALDO_FAVOR = '2104010002';
 const TASA_IVA_SALDO_FAVOR = 0.16;
+
+// "DEPOSITO EN EFECTIVO" (confirmado con el usuario 2026-09-10, caso real
+// F0-260900349/factura F0-260900045, $4,619.96): dinero depositado directo
+// en sucursal bancaria (no en la caja de la tienda), pero SIN el número de
+// autorización/referencia que sí trae una Transferencia normal — a
+// diferencia del caso ya resuelto de GAS MILENIUM (2026-08-31,
+// `CATEGORIAS_TRANSFERENCIA_BANCO` en poliza.service.js), aquí no hay
+// ningún `BankMovement` que conciliar todavía. Reutiliza claveSat='01'
+// (Efectivo), igual que "PUNTOS" — solo el texto de `nombre` lo distingue.
+// El usuario confirmó explícitamente: NO debe sumar al consolidado de
+// Efectivo NI aparecer en ningún renglón de la póliza contable — solo
+// como informativo en la hoja "Desglose Consolidado", bajo su propio
+// apartado. Se descarta la línea de Cargo por completo (mismo criterio ya
+// aceptado para "Venta Sin Cobro": se acepta el asiento desbalanceado en
+// vez de inventar una cuenta/cargo que no corresponde) y se reporta vía
+// `context.depositosEfectivoDetectados` (ver `splitPorFormaPagoReal`) para
+// que el generador la adjunte a `poliza.depositosEfectivoNoConciliados`.
+function _esDepositoEfectivo(fp) {
+  return /dep[oó]sito\s*en\s*efectivo/i.test(fp?.nombre ?? '');
+}
 // NOTA (2026-08-06, corrección del mismo día): las funciones `_esSaldoAFavorReal`/
 // `_esPuntosReal` que escaneaban `formasPago` de /desgloses-cobro/almacen para
 // detectar SF/Puntos DENTRO del desglose de Efectivo/Tarjeta quedaron
@@ -842,6 +862,11 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // referencia (serieOrigen-folioOrigen) — ver comentario en `emitirLineaSF`.
   const detalleSFVisible = context.saldoFavorUsadoPropio?.detalleVisible ?? [];
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
+  // Monto REAL de anticipo aplicado (ver `_prefetchAjustesFacturaPropia`,
+  // `context.montoAnticipoUsado`) — mismo dato que usa el cierre OPA en
+  // `cfdi-poliza-generator.service.js`, aquí se usa para separar el
+  // remanente real (ver `esCasoCargoAnticipoConRemanenteReal` abajo).
+  const montoAnticipoUsado = Number(context.montoAnticipoUsado) || 0;
 
   const esCasoAjusteSFPuntos = gateBase && (montoSFUsado > 0 || montoPuntosUsado > 0)
     && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_CLUB_TUBEROS];
@@ -861,6 +886,24 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   const esCasoCargoSFConRemanenteReal = !esAnticipo && !esAplicacionSaldo && !esPago
     && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
     && montoSFUsado > 0.01 && montoSFUsado < montoCargo - 0.01
+    && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
+    && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
+
+  // Caso espejo de `esCasoCargoSFConRemanenteReal`, pero para Anticipo en vez
+  // de Saldo a Favor (2026-08-31, confirmado con el usuario, caso real
+  // ESCUELA PRIMARIA VESPERTINA CARLOS A. CARRILLO H0-260800539: $177.97 =
+  // $135.98 anticipo + $41.99 efectivo real). Reg 22C — "Factura Final
+  // Anticipo" (formaPago=30) tiene `cuentaCargo` apuntando a Anticipos de
+  // Clientes (pasivo, fuera de `gateBase`), igual que el caso de SF — cuando
+  // el ticket se cubrió SOLO PARCIALMENTE con el anticipo, el remanente real
+  // (según `desglosePagoReal`) se separa hacia Caja/Bancos vía
+  // `splitPorFormaPagoReal`, dejando en `cuentaCargo` solo lo realmente
+  // aplicado del anticipo (el cierre OPA en `cfdi-poliza-generator.service.js`
+  // luego reduce esa porción a 0 y la reemplaza por sus propias líneas de
+  // Cargo Anticipos/IVA-Anticipo — ver `esLineaCargoDeLaReglaGuard/Prop` ahí).
+  const esCasoCargoAnticipoConRemanenteReal = !esAnticipo && !esAplicacionSaldo && !esPago
+    && !CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
+    && montoAnticipoUsado > 0.01 && montoAnticipoUsado < montoCargo - 0.01
     && Array.isArray(context.desglosePagoReal) && context.desglosePagoReal.length > 0
     && cuentaMap[CODIGO_CUENTA_CAJA] && cuentaMap[CODIGO_CUENTA_BANCOS];
 
@@ -922,6 +965,22 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
       // real CONSTRUCASA 13-ago, ticket C0-260802371).
       const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
       if (montoLinea <= 0) return;
+
+      // "DEPOSITO EN EFECTIVO" sin conciliar (ver `_esDepositoEfectivo`,
+      // confirmado con el usuario 2026-09-10): no genera ningún Cargo en la
+      // póliza (se acepta el asiento desbalanceado, mismo criterio que
+      // "Venta Sin Cobro") — solo se reporta a `context.depositosEfectivoDetectados`
+      // para que el generador la adjunte como informativo aparte.
+      if (_esDepositoEfectivo(fp)) {
+        if (!Array.isArray(context.depositosEfectivoDetectados)) context.depositosEfectivoDetectados = [];
+        const referenciaTicket = (fp.serieVentaTicket && fp.folioVentaTicket)
+          ? `${fp.serieVentaTicket}-${fp.folioVentaTicket}` : serieCfdi;
+        context.depositosEfectivoDetectados.push({
+          monto: montoLinea, concepto, serie: referenciaTicket,
+          centroCosto, cfdiUuid: cfdi.uuid ?? null,
+        });
+        return;
+      }
 
       const esEfectivo = (fp.claveSat ?? '').trim() === '01';
       movs.push({
@@ -1009,9 +1068,19 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
           // marcador como último recurso (mejor que dejarlo vacío).
           const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
             || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+          // Nota informativa del sobrante (confirmado con el usuario
+          // 2026-09-01): NO cambia el `debe` real de la línea (eso sigue
+          // siendo lo realmente usado, ver `emitirLineaSF` arriba) — solo se
+          // anota en el concepto cuánto le queda al cliente de este origen
+          // después de este uso, si es que queda algo (`saldoSobrante` viene
+          // del ERP, ver `_prefetchAjustesFacturaPropia`). Si el dato no vino
+          // (registro viejo) o ya cerró en $0, no se anota nada.
+          const notaSobrante = (Number.isFinite(d.saldoSobrante) && d.saldoSobrante > 0.01)
+            ? ` (saldo disponible: $${d.saldoSobrante.toFixed(2)})`
+            : '';
           emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF', {
             serie: referenciaVenta,
-            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / '),
+            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / ') + notaSobrante,
           });
         }
       } else {
@@ -1173,6 +1242,29 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     // porción al consolidado de Efectivo/Tarjeta en vez de sacarla como
     // ajuste individual — ver comentario en `splitPorFormaPagoReal`.
     splitPorFormaPagoReal(remanenteReal, {}, 'Venta — remanente real (no cubierto por saldo a favor)');
+  } else if (esCasoCargoAnticipoConRemanenteReal) {
+    // Ver comentario en `esCasoCargoAnticipoConRemanenteReal` — mismo patrón
+    // que el bloque de SF de arriba, con `montoAnticipoUsado` en vez de
+    // `montoSFUsado`. La porción que queda en `cuentaCargo` (Anticipos) la
+    // reduce/reemplaza después el cierre OPA en `cfdi-poliza-generator.service.js`.
+    const remanenteRealAnticipo = parseFloat((montoCargo - montoAnticipoUsado).toFixed(2));
+    movs.push({
+      cuentaId:    cuentaMap[rule.cuentaCargo] ?? null,
+      concepto, centroCosto, ventaFecha, serie: serieCfdi,
+      debe:        montoAnticipoUsado,
+      haber:       0,
+      cfdiUuid:    cfdi.uuid,
+      rfcTercero,
+      _esCargoPrincipal: true,
+    });
+    // Nombre neutro — mismo motivo que en el bloque de SF: `esReglaAnticipo`
+    // (poliza.service.js) es un match de texto simple (`/anticipo/i`), así
+    // que el override NUNCA debe contener la palabra "anticipo" o esta línea
+    // se saldría del consolidado de Efectivo/Tarjeta hacia el bloque de
+    // ajustes (bug real encontrado 2026-08-31 probando este mismo fix: el
+    // primer texto usado, "...no cubierto por anticipo", disparaba
+    // exactamente ese problema).
+    splitPorFormaPagoReal(remanenteRealAnticipo, {}, 'Venta — remanente real (no cubierto por OPA)');
   } else {
     // Cuando la regla apunta a Caja/Bancos puente (gateBase) pero no hay
     // cobros de esta sucursal en el ERP (desglosePagoReal vacío), la venta
@@ -1315,6 +1407,25 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   if (esAnticipo && rule.cuentaDeltaAnticipo && context.totalRelacionado != null) {
     const delta = parseFloat((total - context.totalRelacionado).toFixed(2));
     if (delta > 0) {
+      // Forma de pago REAL del remanente (no la del CFDI, que para Reg 22C
+      // siempre es "30"/Anticipo) — sin esto esta línea hereda formaPago='30'
+      // vía el spread de `satMeta` al final de la función, aunque el
+      // remanente se haya cobrado en Efectivo/Tarjeta real. Caso real
+      // 2026-09-11 (Hidalgo 3-sep, tickets B0-260900608/634): $3.08/$26.21
+      // pagados en Efectivo real ($01), quedaban fuera de "Depósitos
+      // consolidados (Efectivo)" por llevar formaPago='30'. Mismo mecanismo
+      // `_formaPagoReal` ya usado arriba (línea ~996) para sobrevivir al
+      // spread de `satMeta`. Solo se aplica cuando hay EXACTAMENTE una forma
+      // de pago no-Anticipo en `desglosePagoReal` y su monto calza (±$0.02)
+      // con `delta` — si no calza o hay varias, se deja sin `_formaPagoReal`
+      // (comportamiento anterior) en vez de adivinar cuál corresponde.
+      const fpsNoAnticipo = Array.isArray(context.desglosePagoReal)
+        ? context.desglosePagoReal.filter(fp => (fp.claveSat ?? '').trim() !== '30')
+        : [];
+      const sumaNoAnticipo = fpsNoAnticipo.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+      const formaPagoRealDelta = fpsNoAnticipo.length === 1 && Math.abs(sumaNoAnticipo - delta) < 0.02
+        ? ((fpsNoAnticipo[0].claveSat ?? '').trim() || null)
+        : null;
       movs.push({
         cuentaId:    cuentaMap[rule.cuentaDeltaAnticipo] ?? null,
         concepto:    `Saldo - ${concepto}`,
@@ -1323,6 +1434,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         haber:       0,
         cfdiUuid:    cfdi.uuid,
         rfcTercero,
+        ...(formaPagoRealDelta ? { _formaPagoReal: formaPagoRealDelta } : {}),
       });
     }
   }
@@ -1521,7 +1633,46 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
           restanteLinea = parseFloat((restanteLinea - montoSFLinea).toFixed(2));
         }
         if (restanteLinea > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaCargo] ?? null, debe: restanteLinea, haber: 0, _esCargoPrincipal: true });
+          // Split del Cargo por forma de pago REAL de Cobranza (2026-09-01,
+          // exclusivo de Pagos, NO toca Ingreso): `d.desglosePagoReal` viene
+          // de `_prefetchDoctosPago` (`/desgloses-cobro/almacen`, ver ahí) —
+          // cuando trae 1+ formas de pago reales para ESTA factura, se
+          // reparte esta línea en una por cada una (Efectivo real → Caja,
+          // cualquier otra → la cuenta genérica de la regla, igual que
+          // siempre) en vez de un solo Cargo con el `formaPago` genérico que
+          // declara el CFDI de Pago completo — mismo criterio que
+          // `splitPorFormaPagoReal` (Ingreso, más arriba), simplificado: sin
+          // ticket/autorización de Tarjeta por línea (Cobranza no trae
+          // `bancoRealPorTicket` todavía, ver docstring de
+          // `anotarCargosPorFacturaSinAgrupar` en poliza.service.js) y sin
+          // forzar que la suma cierre exacto contra `restanteLinea` — el
+          // desglose real de cajas puede traer "ruido" de reclasificación del
+          // ERP (mismo motivo ya confirmado para Ingreso 2026-08-14/2026-08-19:
+          // se acepta desbalanceado en vez de mandar todo a una sola forma de
+          // pago genérica). Las líneas de Efectivo real quedan tagueadas
+          // `_formaPagoReal:'01'` para que `anotarCargosPorFacturaSinAgrupar`
+          // (poliza.service.js) las consolide en un solo bucket por sucursal,
+          // igual que hace Contado. Sin desglose encontrado: una sola línea
+          // con el `formaPago` de siempre (comportamiento sin cambios).
+          const desgloseFactura = Array.isArray(d.desglosePagoReal) ? d.desglosePagoReal : [];
+          const puedeSplitReal = CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaCargo)
+            && desgloseFactura.length > 0
+            && !!cuentaMap[CODIGO_CUENTA_CAJA] && !!cuentaMap[CODIGO_CUENTA_BANCOS];
+          if (puedeSplitReal) {
+            desgloseFactura.forEach(fp => {
+              const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
+              if (montoLinea <= 0) return;
+              const esEfectivo = fp.claveSat === '01';
+              movs.push({
+                ...baseFactura,
+                cuentaId: esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : (cuentaMap[rule.cuentaCargo] ?? null),
+                debe: montoLinea, haber: 0, _esCargoPrincipal: true,
+                _formaPagoReal: fp.claveSat ?? null,
+              });
+            });
+          } else {
+            movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaCargo] ?? null, debe: restanteLinea, haber: 0, _esCargoPrincipal: true });
+          }
         }
       }
 

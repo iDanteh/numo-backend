@@ -29,12 +29,18 @@ async function _token() {
 
 // obtenerDesglosesCobroAlmacen/obtenerSaldosFavor/*PorCentro (más abajo) son EXCLUSIVAS
 // de Pólizas (cobros-sucursal-puente.service.js / cfdi-poliza-generator.service.js,
-// dominio cfdi-mapping/polizas) — fuera de alcance de Configuraciones Globales por
-// decisión explícita del usuario ("no quiero nada de pólizas por ahora"). Se quedan
-// leyendo el .env directo, tal cual estaban antes de que existiera Configuraciones
-// Globales — nunca deben pasar a `erp-caja` (esa sección es solo Bancos/Cobro/Reversiones).
-const ERP_CAJA_BASE_URL_POLIZAS = (process.env.ERP_CAJA_BASE_URL || '').replace(/\/$/, '');
-const ERP_TOKEN_POLIZAS         = process.env.ERP_TOKEN || '';
+// dominio cfdi-mapping/polizas). Migradas 2026-08-28 a Configuraciones Globales, sección
+// propia `polizas` (antes leían ERP_CAJA_BASE_URL/ERP_TOKEN del .env directo por decisión
+// explícita del usuario de dejarlas fuera — esa decisión ya no aplica: "no funciona nada
+// si no está ahí"). Nunca comparten sección con `bancos` (esa es solo Bancos/Cobro/Reversiones).
+async function _cajaBaseUrlPolizas() {
+  const valor = await globalConfigService.getValue('polizas', 'CAJA_BASE_URL');
+  return valor.replace(/\/$/, '');
+}
+
+async function _tokenPolizas() {
+  return globalConfigService.getValue('polizas', 'TOKEN');
+}
 
 // BUG CORREGIDO 2026-09-04 (caso real HORIZONTE HOTELERO B0-260900010/anticipo
 // B0-260900009): esta era la ÚNICA función de este archivo que llamaba al ERP
@@ -156,13 +162,22 @@ async function sincronizarCuentasPendientes(params = {}) {
 // caiga al camino viejo/menos preciso — primero vale la pena reintentar,
 // igual que ya se hace con 429, antes de darse por vencido. Backoff fijo (no
 // hay "retry after" para un timeout) con un pequeño incremento por intento.
+//
+// 2026-08-24: 30s tampoco alcanzaba contra el ERP REAL de producción —
+// medido con curl: /desgloses-cobro/saldos-favor (por centro) tardó 35.75s
+// en responder (caso real Viguera/Hidalgo, ~24 días de rango). Con 30s, las
+// 3 reintentos hacían timeout igual y el caller caía al camino "por
+// serie/folio" (incompleto), dejando cobros reales sin encontrar y
+// fragmentando la venta en líneas "Venta Sin Cobro" (caso real B0-260803791,
+// $24,981.27 cobrados en Efectivo, solo $1,462.89 se reconciliaban).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
+  const token = await _tokenPolizas();
   for (let intento = 1; intento <= MAX_INTENTOS_429; intento++) {
     try {
       return await axios.get(url, {
         params,
-        headers: { Authorization: `Bearer ${ERP_TOKEN_POLIZAS}` },
+        headers: { Authorization: `Bearer ${token}` },
         timeout: 30000,
       });
     } catch (axErr) {
@@ -186,6 +201,36 @@ async function _getConReintento(url, params, logLabel) {
       throw axErr;
     }
   }
+}
+
+// BUG CORREGIDO 2026-09-04 (caso real Reforma/Hidalgo, cobro cruzado
+// B0-260900438 nunca capturado): confirmado con datos reales que las
+// consultas "por centro" (que traen TODAS las cuentas de un rango de fechas,
+// no una lista acotada de series/folios conocidos) pueden responder 200 OK
+// con una lista PARCIAL bajo la carga real de una regeneración completa de
+// póliza — sin 429 ni timeout que `_getConReintento` pueda detectar. Mismo
+// patrón ya confirmado y corregido en `sincronizarCuentasPendientes`
+// (221 cuentas bajo carga real vs 12,833 en consulta aislada). El ERP manda
+// `Data.totalCount` junto con `Data.cuentas` en AMBOS endpoints "por centro"
+// (confirmado con una consulta real a /desgloses-cobro/almacen) — si no
+// coinciden, se reintenta la llamada completa (con su propio backoff interno)
+// en vez de confiar en la lista incompleta.
+const MAX_INTENTOS_COMPLETO = 3;
+async function _getConReintentoCompleto(url, params, logLabel) {
+  let response;
+  for (let intento = 1; intento <= MAX_INTENTOS_COMPLETO; intento++) {
+    response = await _getConReintento(url, params, logLabel);
+    const totalCount = response.data?.Data?.totalCount;
+    const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
+    if (!Number.isFinite(totalCount) || cuentasLen >= totalCount || intento >= MAX_INTENTOS_COMPLETO) {
+      return response;
+    }
+    const { logger } = require('../../../shared/utils/logger');
+    const esperaSeg = 3 * intento;
+    logger.warn(`[ErpSync] ${logLabel} respuesta incompleta (${cuentasLen}/${totalCount}), reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS_COMPLETO})`);
+    await new Promise(r => setTimeout(r, esperaSeg * 1000));
+  }
+  return response;
 }
 
 // ── Caché en memoria por lote de serie/folio ────────────────────────────────
@@ -217,6 +262,32 @@ function _claveLote(rfc, series, folios) {
   return `${rfc}::${pares.join(',')}`;
 }
 
+// El ERP rechaza con HTTP 400 "rango de fechas mayor a 31 días sin criterio
+// de factura" cualquier consulta "por centro" más amplia — y la generación
+// de pólizas amplía el período ±1 día de tolerancia
+// (TOLERANCIA_DIAS_FACTURACION_DIFERIDA en cfdi-poliza-generator.service.js),
+// así que CUALQUIER mes de 30 o 31 días ya excede el límite (confirmado
+// 2026-08-24, caso real Viguera/Hidalgo agosto: rango ampliado 31-jul a
+// 1-sep = 33 días → HTTP 400 → el catch de `_prefetchAjustesFacturaPropia`
+// lo trataba como falla genérica y caía en silencio al camino "por
+// serie/folio", incompleto — de ahí las líneas "Venta Sin Cobro" recurrentes
+// cada mes, no solo en agosto). Se trocea el rango en bloques ≤30 días y se
+// combinan los resultados — transparente para el caller.
+const MS_UN_DIA = 24 * 60 * 60 * 1000;
+const MAX_DIAS_RANGO_ERP = 30;
+function _trocearRango(fechaDesdeIso, fechaHastaIso) {
+  const desde = new Date(fechaDesdeIso);
+  const hasta = new Date(fechaHastaIso);
+  const bloques = [];
+  let cursor = desde;
+  while (cursor < hasta) {
+    const finBloque = new Date(Math.min(cursor.getTime() + MAX_DIAS_RANGO_ERP * MS_UN_DIA, hasta.getTime()));
+    bloques.push({ fechaDesde: cursor.toISOString(), fechaHasta: finBloque.toISOString() });
+    cursor = new Date(finBloque.getTime() + 1);
+  }
+  return bloques;
+}
+
 function _leerCache(cache, clave) {
   const entry = cache.get(clave);
   if (!entry) return undefined;
@@ -237,9 +308,19 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   const cacheado = _leerCache(_cacheAlmacen, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
+    // NO usar `_getConReintentoCompleto` aquí (intento real 2026-09-08,
+    // revertido el mismo día): esa función llama a `_getConReintento` —que
+    // YA reintenta hasta MAX_INTENTOS_429 veces ante 429/timeout— hasta
+    // MAX_INTENTOS_COMPLETO veces MÁS por fuera, multiplicando los intentos
+    // (y el tiempo de espera) contra un ERP que además ya está rate-limitado.
+    // Caso real: bajo carga, esto agotaba los reintentos y tiraba la
+    // generación de póliza por completo en vez de solo devolver datos
+    // incompletos. Se usa el mismo `_getConReintento` de siempre (un solo
+    // ciclo de reintentos) — la protección contra respuesta parcial (abajo)
+    // es NO CACHEARLA, no reintentar más de lo que ya se reintentaba.
     response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
       series: series.join(','),
       folios: folios.join(','),
@@ -253,7 +334,17 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   }
 
   const cuentas = response.data?.Data?.cuentas || [];
-  _cacheAlmacen.set(clave, { data: cuentas, ts: Date.now() });
+  // BUG CORREGIDO 2026-09-08 (caso real VIGUERA, Factura Global
+  // N0-260900007/78 tickets): bajo carga real el ERP puede responder 200 OK
+  // con MENOS `cuentas` que folios pedidos, sin que `_getConReintento` lo
+  // detecte (no es un 429/timeout). Antes esto se cacheaba 20 minutos
+  // (TTL_CACHE_MS) tal cual venía, "contaminando" cualquier otra póliza que
+  // regenerara dentro de esa ventana con el mismo lote incompleto — sin
+  // reintentar más (eso fue lo que se revirtió arriba), simplemente no se
+  // guarda en caché para que la siguiente llamada lo intente fresco.
+  const totalCount = response.data?.Data?.totalCount;
+  const incompleta = Number.isFinite(totalCount) && cuentas.length < totalCount;
+  if (!incompleta) _cacheAlmacen.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
 
@@ -273,9 +364,13 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   const cacheado = _leerCache(_cacheSaldosFavor, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
+    // Ver comentario equivalente en `obtenerDesglosesCobroAlmacen` (bug real
+    // 2026-09-08, VIGUERA, y su revert el mismo día) — NO usar
+    // `_getConReintentoCompleto` aquí, multiplica los reintentos ante 429
+    // contra un ERP ya rate-limitado.
     response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
       series: series.join(','),
       folios: folios.join(','),
@@ -289,7 +384,10 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
   }
 
   const cuentas = response.data?.Data?.cuentas || [];
-  _cacheSaldosFavor.set(clave, { data: cuentas, ts: Date.now() });
+  // Ver comentario equivalente en `obtenerDesglosesCobroAlmacen`.
+  const totalCount = response.data?.Data?.totalCount;
+  const incompleta = Number.isFinite(totalCount) && cuentas.length < totalCount;
+  if (!incompleta) _cacheSaldosFavor.set(clave, { data: cuentas, ts: Date.now() });
   return cuentas;
 }
 
@@ -302,7 +400,7 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
 // descubrir directamente lo que cobró de otras sucursales sin pasar por la
 // cola `CobroSucursalPendiente` (ver cobros-sucursal-puente.service.js).
 // Ya liberado en producción (confirmado con el usuario 2026-08-14) —
-// ERP_CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
+// polizas.CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
 // igual que el resto de los endpoints de este archivo.
 async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
   if (!rfc) throw new Error('obtenerDesglosesCobroAlmacenPorCentro: rfc requerido (aísla la caché por empresa)');
@@ -312,10 +410,10 @@ async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, 
   const cacheado = _leerCache(_cacheAlmacenPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
+    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/almacen`, {
       centro, fechaDesde, fechaHasta,
     }, '/desgloses-cobro/almacen (por centro)');
   } catch (axErr) {
@@ -341,10 +439,10 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   const cacheado = _leerCache(_cacheSaldosFavorPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
-  const baseUrl = ERP_CAJA_BASE_URL_POLIZAS;
+  const baseUrl = await _cajaBaseUrlPolizas();
   let response;
   try {
-    response = await _getConReintento(`${baseUrl}/desgloses-cobro/saldos-favor`, {
+    response = await _getConReintentoCompleto(`${baseUrl}/desgloses-cobro/saldos-favor`, {
       centro, fechaDesde, fechaHasta,
     }, '/desgloses-cobro/saldos-favor (por centro)');
   } catch (axErr) {
@@ -360,7 +458,67 @@ async function obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde, fechaHasta
   return cuentas;
 }
 
+// Consulta, por ALMACÉN (misma clave de serie que "centro" en las funciones
+// de arriba) y rango de fechas, las SALIDAS de caja registradas por Kore —
+// endpoint nuevo confirmado 2026-09-08 (`/desgloses-salidas/caja`, requirió
+// que el usuario pidiera el permiso al rol de la integración, antes daba
+// 403). A diferencia de un retiro de saldo a favor de un cliente (que NO
+// aparece aquí, confirmado con datos reales), esto reporta movimientos de
+// MANEJO de la caja registradora en sí: depósitos de efectivo al banco
+// ("Salida por Transferencia"), cierres de turno ("CIERRE CAJA") y ajustes
+// por faltante ("RETIRO POR FALTANTE DE EFECTIVO") — útil para cruzar contra
+// el consolidado de Efectivo/Tarjeta, no para saldos a favor.
+//
+// Misma forma de respuesta "por centro+fecha" que puede venir PARCIAL bajo
+// carga (ver `_getConReintentoCompleto`), pero con una forma de datos
+// distinta (`Data.cajas[].salidas[]` en vez de `Data.cuentas[]`) — no se
+// reutiliza `_getConReintentoCompleto` tal cual, se cuenta `salidas` de
+// todas las cajas contra `Data.totalCount`.
+const MAX_INTENTOS_SALIDAS_CAJA = 3;
+const _cacheSalidasCajaPorAlmacen = new Map();
+async function obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen, fechaDesde, fechaHasta }) {
+  if (!rfc) throw new Error('obtenerDesglosesSalidasCajaPorAlmacen: rfc requerido (aísla la caché por empresa)');
+  if (!almacen || !fechaDesde || !fechaHasta) return [];
+
+  const clave = `${rfc}::${almacen}::${fechaDesde}::${fechaHasta}`;
+  const cacheado = _leerCache(_cacheSalidasCajaPorAlmacen, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  const baseUrl = await _cajaBaseUrlPolizas();
+  const { logger } = require('../../../shared/utils/logger');
+  let cajas = [];
+  for (let intento = 1; intento <= MAX_INTENTOS_SALIDAS_CAJA; intento++) {
+    let response;
+    try {
+      response = await _getConReintento(`${baseUrl}/desgloses-salidas/caja`, {
+        almacen, fechaDesde, fechaHasta,
+      }, '/desgloses-salidas/caja');
+    } catch (axErr) {
+      const status = axErr.response?.status;
+      const body   = JSON.stringify(axErr.response?.data ?? {});
+      logger.error(`[ErpSync] ERP /desgloses-salidas/caja ${status}: ${body} | almacen=${almacen} fechaDesde=${fechaDesde} fechaHasta=${fechaHasta}`);
+      throw axErr;
+    }
+    cajas = response.data?.Data?.cajas || [];
+    const totalCount = response.data?.Data?.totalCount;
+    const salidasLen = cajas.reduce((s, c) => s + (c.salidas ?? []).length, 0);
+    if (!Number.isFinite(totalCount) || salidasLen >= totalCount || intento >= MAX_INTENTOS_SALIDAS_CAJA) break;
+    const esperaSeg = 3 * intento;
+    logger.warn(`[ErpSync] /desgloses-salidas/caja respuesta incompleta (${salidasLen}/${totalCount}), reintentando en ${esperaSeg}s (intento ${intento}/${MAX_INTENTOS_SALIDAS_CAJA})`);
+    await new Promise(r => setTimeout(r, esperaSeg * 1000));
+  }
+
+  // Se aplana con cajaId/nombreCaja anotados en cada salida — más útil para
+  // el caller que la agrupación por caja, que ningún consumidor necesita hoy.
+  const salidas = cajas.flatMap(c => (c.salidas ?? []).map(s => ({
+    ...s, cajaId: c.cajaId, nombreCaja: c.nombreCaja, almacen: c.almacen,
+  })));
+  _cacheSalidasCajaPorAlmacen.set(clave, { data: salidas, ts: Date.now() });
+  return salidas;
+}
+
 module.exports = {
   sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
+  obtenerDesglosesSalidasCajaPorAlmacen,
 };

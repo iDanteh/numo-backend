@@ -1,8 +1,8 @@
 'use strict';
 require('dotenv').config();
 
-const { sequelize } = require('./src/config/database.postgres');
-const { CfdiMappingRule } = require('./src/shared/models/postgres');
+const { sequelize } = require('../../config/database.postgres');
+const { CfdiMappingRule } = require('../../shared/models/postgres');
 
 // Fix (2026-08-25): reglas TO-BON-* con formaPago='99'/'15' (creadas fuera
 // del seed, edición manual del panel — mismo patrón ya corregido para

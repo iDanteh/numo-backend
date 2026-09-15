@@ -24,8 +24,10 @@ const Poliza            = require('./Poliza');
 const PolizaMovimiento  = require('./PolizaMovimiento');
 const CfdiMappingRule   = require('./CfdiMappingRule');
 const CentroCosto       = require('./CentroCosto');
+const Terminal          = require('./Terminal');
 const ClienteCatalogo   = require('./ClienteCatalogo');
 const CobroSucursalPendiente = require('./CobroSucursalPendiente');
+const CobroSucursalPendienteCobranza = require('./CobroSucursalPendienteCobranza');
 const Notificacion      = require('./Notificacion');
 const ConfigSection     = require('./ConfigSection');
 const GlobalConfig      = require('./GlobalConfig');
@@ -54,6 +56,10 @@ Poliza.hasMany(Notificacion,   { foreignKey: 'polizaId', as: 'notificaciones' })
 /** Centros de costo */
 PolizaMovimiento.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCostoObj' });
 CentroCosto.hasMany(PolizaMovimiento,   { foreignKey: 'centroCostoId', as: 'movimientos' });
+
+/** Terminales — cada terminal pertenece a una sucursal (centro de costo) */
+Terminal.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCosto' });
+CentroCosto.hasMany(Terminal,   { foreignKey: 'centroCostoId', as: 'terminales' });
 
 /** Regla de mapeo CFDI usada al generar el movimiento */
 PolizaMovimiento.belongsTo(CfdiMappingRule, { foreignKey: 'reglaId', as: 'regla' });
@@ -106,9 +112,17 @@ async function syncModels() {
   await CentroCosto.sync({ force: false });
   await ClienteCatalogo.sync({ force: false });
 
+  // Terminal: force:false, misma razón. Depende de CentroCosto (FK centro_costo_id),
+  // por eso se sincroniza justo después.
+  await Terminal.sync({ force: false });
+
   // Cola de cobros cruzados de sucursal (ver CobroSucursalPendiente.js) —
   // tabla nueva, force:false para solo crearla si no existe.
   await CobroSucursalPendiente.sync({ force: false });
+
+  // Misma idea, exclusiva de Cobranza (ver CobroSucursalPendienteCobranza.js,
+  // 2026-09-01) — tabla independiente de la de Ingreso a propósito.
+  await CobroSucursalPendienteCobranza.sync({ force: false });
 
   // AccountPlan se auto-referencia → debe existir antes de crear la FK
   await syncAlter(AccountPlan);
@@ -208,6 +222,13 @@ async function syncModels() {
     ALTER TABLE poliza_movimientos
       ADD COLUMN IF NOT EXISTS tipo_origen VARCHAR(100)
   `).catch(e => console.warn('[syncModels] ADD COLUMN tipo_origen (movimientos):', e.message));
+
+  // uuid real de la factura que un Pago (Cobranza) liquida — distinto del
+  // uuid del Pago (cfdi_uuid). Ver PolizaMovimiento.js / diag-bancario-pago.js.
+  await Poliza.sequelize.query(`
+    ALTER TABLE poliza_movimientos
+      ADD COLUMN IF NOT EXISTS factura_uuid VARCHAR(36)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN factura_uuid:', e.message));
 
   await Poliza.sequelize.query(`
     ALTER TABLE cfdi_mapping_rules
@@ -335,6 +356,19 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS pendientes_por_facturar JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN pendientes_por_facturar:', e.message));
 
+  // "DEPOSITO EN EFECTIVO" sin conciliar, detectado al generar la póliza —
+  // informativo, nunca se contabiliza (idempotente). BUG REAL 2026-09-10:
+  // se agregó el campo al modelo Poliza.js sin este ALTER — Poliza no está
+  // en la lista de `syncAlter` de arriba (solo User/BankConfig/BankRule/
+  // Entity/Permission/Role), así que cualquier columna nueva de Poliza
+  // necesita su propio ALTER explícito aquí o la tabla real nunca la
+  // recibe — causó un 500 en TODOS los listados de pólizas (`Poliza.findAll`
+  // referenciando una columna inexistente) hasta este fix.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS depositos_efectivo_no_conciliados JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN depositos_efectivo_no_conciliados:', e.message));
+
   // El índice único (tipo, numero, rfc, ejercicio, periodo) bloqueaba para
   // siempre el folio de una póliza cancelada (la fila sigue existiendo,
   // solo con estado='cancelada') — impedía reutilizar ese folio en una
@@ -386,4 +420,4 @@ async function syncModels() {
   await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, ClienteCatalogo, CobroSucursalPendiente, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

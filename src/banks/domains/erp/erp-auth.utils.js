@@ -36,20 +36,39 @@ function normalizarAuthBloques(val) {
   )];
 }
 
+// Extrae TODOS los números de autorización de un valor (primero + bloques
+// adicionales), en un solo array deduplicado. Cubre tanto el caso BBVA
+// "04711358/7607235" (un movimiento bancario, un token compuesto) como el
+// caso Tarjeta "044785,044571" (un ticket pagado con 2+ swipes/terminales
+// distintos, registrados por el ERP en un solo campo `formasPago[].autorizacion`
+// separado por coma) — confirmado con datos reales 2026-09-11 (caso SD
+// SOLUTIONS / F0-260900334: la segunda autorización "044571" nunca se
+// indexaba ni se cruzaba contra el banco).
+function normalizarAuthLista(val) {
+  const primero = normalizarAuth(val);
+  const extra   = normalizarAuthBloques(val);
+  return primero ? [primero, ...extra] : extra;
+}
+
 // Extrae el conjunto de autorizaciones normalizadas de un array de movimientos ERP.
 // Solo procesa movimientos de series SERIES_CON_AUTH; ignorar el resto.
 // Se usa durante el sync para pre-computar _autsNorm en ErpCuentaPendiente,
 // permitiendo la query inversa: movements → authNormSet → CxC por índice.
+// Incluye TODOS los números de autorización de cada formaPago (no solo el
+// primero) — necesario para que una CxC con 2+ autorizaciones (ver
+// normalizarAuthLista) sea encontrada sin importar cuál de los números
+// aparezca en el movimiento bancario real.
 function extraerAutsNorm(movimientos) {
   const autsSet = new Set();
   for (const mov of (movimientos || [])) {
     if (!SERIES_CON_AUTH.includes(mov.serie)) continue;
     for (const fp of (mov.formasPago || [])) {
-      const norm = normalizarAuth(fp.autorizacion);
-      if (norm) autsSet.add(norm);
+      for (const norm of normalizarAuthLista(fp.autorizacion)) autsSet.add(norm);
     }
   }
   return [...autsSet];
 }
 
-module.exports = { SERIES_CON_AUTH, normalizarAuth, normalizarAuthBloques, extraerAutsNorm };
+module.exports = {
+  SERIES_CON_AUTH, normalizarAuth, normalizarAuthBloques, normalizarAuthLista, extraerAutsNorm,
+};

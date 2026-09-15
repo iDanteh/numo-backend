@@ -1,8 +1,8 @@
 'use strict';
 require('dotenv').config();
 
-const { sequelize } = require('./src/config/database.postgres');
-const { CfdiMappingRule } = require('./src/shared/models/postgres');
+const { sequelize } = require('../../config/database.postgres');
+const { CfdiMappingRule } = require('../../shared/models/postgres');
 
 // Fix: NC tipoOrigen='Cancelación' (documentosRelacionados.Serie='CANCELACION')
 // deben quedar iguales sin importar formaPago:

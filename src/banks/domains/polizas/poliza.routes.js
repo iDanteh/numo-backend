@@ -243,6 +243,18 @@ router.get('/:id/export-contpaq-compensaciones-intereses',
   }),
 );
 
+// GET /api/polizas/:id/siguiente-folio-contpaq
+// Folio CONTPAQ sugerido por default según el rango de la sucursal (ver
+// `RANGO_FOLIO_CONTPAQ_POR_SUCURSAL` en poliza.service.js) — sigue siendo
+// editable en el formulario de export, esto solo calcula el valor inicial.
+router.get('/:id/siguiente-folio-contpaq',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    res.json(await service.siguienteFolioContpaq(req.params.id));
+  }),
+);
+
 // PATCH /api/polizas/:id/contpaq-folio
 // Body: { folioContado, folioCredito }
 router.patch('/:id/contpaq-folio',

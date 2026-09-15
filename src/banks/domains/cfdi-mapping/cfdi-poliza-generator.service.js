@@ -700,7 +700,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     cfdi.tipoDeComprobante === 'I' && cfdi.serie && cfdi.folio &&
     rule?.cuentaCargo && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo),
   );
-  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map() };
+  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map(), movimientosPpdPorFacturar: [] };
   if (!candidatos.length) return vacio;
 
   // Día de CADA factura (México) — para filtrar cobros/usos que coinciden en
@@ -738,6 +738,15 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   const desglosePagoReal = new Map(); // `${serie}|${folio}` → [{ nombre, claveSat, monto }] (ABO/CPF/CFC — pago real de la venta)
   const puntosUsado = new Map();      // `${serie}|${folio}` → monto (solo CBT — redención de Club Tuberos, evento aparte)
   const saldoFavorUsado = new Map();  // `${serie}|${folio}` → { monto, detalle: [...] }
+  // Saldo a favor usado en una venta CONSUMIDORA que, según /cuentas-pendientes,
+  // sigue tipoPago='PPD' y nombreTipoMovimiento='POR FACTURAR' (2026-09-11,
+  // caso real CATEDRAL RESTAURANTE BAR, Hidalgo 4-sep-2026, confirmado con el
+  // usuario) — informativo, NUNCA se contabiliza en la póliza (mismo criterio
+  // que `pendientesPorFacturar`): mientras esa venta no tenga su propia
+  // factura real, el Cargo Especial de SF no debe aparecer en el bloque
+  // normal — se lista aparte en la hoja "Movimientos PPD por facturar" (ver
+  // `_construirWorkbookPoliza`, poliza.service.js).
+  const movimientosPpdPorFacturar = [];
   // Monto REAL de anticipo aplicado a esta venta, desde el desglose de Kore
   // (formaPago nombre='ANTICIPO', mismo claveSat='30' que "SALDO A FAVOR" pero
   // texto distinto — confirmado con el usuario 2026-08-28, caso real AIDA
@@ -1288,6 +1297,53 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       if (!usados.length) continue;
       const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
       if (monto <= 0) continue;
+
+      // PPD y "por facturar" (2026-09-11, caso real CATEDRAL RESTAURANTE BAR,
+      // Hidalgo 4-sep-2026, confirmado con el usuario): si la venta
+      // CONSUMIDORA de este saldo (`cuenta.serieVenta/folioVenta`) sigue
+      // siendo, según /cuentas-pendientes, una cuenta tipoPago='PPD' con
+      // nombreTipoMovimiento='POR FACTURAR', esta porción del saldo a favor
+      // NO se contabiliza como Cargo Especial normal — se lista aparte
+      // (informativo) hasta que esa venta tenga su propia factura real.
+      // Consulta acotada a 30 días desde `cuenta.fechaCreacion` (límite del
+      // ERP es 31 días) — si falla, no hay fecha, o el ERP no regresa nada,
+      // se asume que NO aplica (nunca oculta una línea real por error, mismo
+      // criterio que el resto de las consultas opcionales de esta función).
+      let esPpdPorFacturar = false;
+      let cuentaPpdInfo = null;
+      if (cuenta.serieVenta && cuenta.folioVenta && cuenta.fechaCreacion) {
+        try {
+          const fCreacion = new Date(cuenta.fechaCreacion);
+          const fHastaPpd = new Date(fCreacion.getTime() + 30 * 24 * 3600 * 1000);
+          const resultadoPpd = await sincronizarCuentasPendientes({
+            serieExterna: cuenta.serieVenta, folioExterno: cuenta.folioVenta,
+            fechaDesde: fCreacion.toISOString(), fechaHasta: fHastaPpd.toISOString(),
+          });
+          cuentaPpdInfo = (resultadoPpd?.raw ?? []).find(
+            c => c.serieExterna === cuenta.serieVenta && String(c.folioExterno) === String(cuenta.folioVenta),
+          ) ?? null;
+          esPpdPorFacturar = !!(cuentaPpdInfo
+            && cuentaPpdInfo.tipoPago === 'PPD'
+            && cuentaPpdInfo.nombreTipoMovimiento === 'POR FACTURAR');
+        } catch (err) {
+          const { logger } = require('../../../shared/utils/logger');
+          logger.warn(`[PolizaGen] Consulta PPD-por-facturar (${cuenta.serieVenta}-${cuenta.folioVenta}) falló, se ignora: ${err.message}`);
+        }
+      }
+      if (esPpdPorFacturar) {
+        movimientosPpdPorFacturar.push({
+          nombreCliente:  (cuentaPpdInfo.nombrePersona ?? '').trim() || 'CLIENTE NO IDENTIFICADO',
+          serie:          cuenta.serieVenta,
+          folio:          cuenta.folioVenta,
+          montoSFAplicado: Math.round(monto * 100) / 100,
+          totalVenta:     cuentaPpdInfo.total ?? null,
+          fechaVenta:     cuentaPpdInfo.fechaCreacion ?? cuenta.fechaCreacion ?? null,
+          fechaAplicacion: usados[0]?.fecha ?? null,
+          origenSaldo:    usados.map(u => [u.serieOrigen, u.folioOrigen].filter(Boolean).join('-')).filter(Boolean).join(', ') || null,
+        });
+        continue;
+      }
+
       const prevSF = saldoFavorUsado.get(key);
       saldoFavorUsado.set(key, {
         monto: (prevSF?.monto ?? 0) + monto,
@@ -1486,7 +1542,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     }
   }
 
-  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap };
+  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar };
 }
 
 /**
@@ -3643,7 +3699,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -4064,12 +4120,27 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // anticipo distinto a concatenar — mismo criterio que ya se usa entre
       // relaciones separadas.
       const foliosResueltosProp = [];
+      // Desglose por anticipo individual (2026-09-14, caso real Ferrocarril
+      // F0-260900139/OPA-00908-00909, confirmado con el usuario): monto propio
+      // de CADA anticipo resuelto (de `anticipoCfdisProp`), en el mismo orden
+      // en que el SAT los lista — usado más abajo para repartir
+      // `montoAnticipoConsumidoProp` por anticipo en vez de una sola línea
+      // combinada. Con 0 o 1 anticipo resuelto (o si algún `total` no está
+      // disponible) se cae al comportamiento combinado de siempre.
+      const anticiposResueltosProp = [];
       let faltaAlgunoProp = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
         for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
           const ref = anticipoFolioPorUuidProp[(u || '').toUpperCase()];
-          if (ref) foliosResueltosProp.push(ref.replace(/^OPA-/, '')); else faltaAlgunoProp = true;
+          if (ref) {
+            const folioLimpio = ref.replace(/^OPA-/, '');
+            foliosResueltosProp.push(folioLimpio);
+            const anticipoCfdi = anticipoCfdisProp.find(c => c.uuid.toUpperCase() === (u || '').toUpperCase());
+            if (Number(anticipoCfdi?.total) > 0) {
+              anticiposResueltosProp.push({ folio: folioLimpio, total: Number(anticipoCfdi.total) });
+            }
+          } else faltaAlgunoProp = true;
         }
       }
       if (foliosResueltosProp.length) anticipoFolioRefProp = `OPA-${foliosResueltosProp.join('-')}${faltaAlgunoProp ? '-' : ''}`;
@@ -4314,14 +4385,6 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // ya se redujo directo en el loop de arriba, así que el asiento ya
       // cuadra sin ningún Abono de reversión (caso real 2026-08-28, AIDA
       // ISLAS ACEVEDO F0-260800426: $518.74 de $536.98, resto Efectivo real).
-      const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
-      const ivaAnticipoProp      = Math.round((montoAnticipoConsumidoProp - subtotalAnticipoProp) * 100) / 100;
-      const refOpaProp = anticipoFolioRefProp;
-      // Columna C (serie) = folio del Egreso real que cancela el anticipo
-      // cuando existe (trazable al documento SAT); columna H (concepto) =
-      // siempre la referencia "OPA-..." (confirmado con el usuario
-      // 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
-      const serieCierreProp = serieEgresoAnticipoProp ?? refOpaProp;
       const baseInfoProp = {
         centroCosto: ccProp?.clave ?? null, centroCostoId: ccProp?.id ?? null,
         cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
@@ -4331,17 +4394,68 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           comparisonStatus: cfdi.lastComparisonStatus ?? null,
         },
       };
-      if (subtotalAnticipoProp > 0) {
-        movimientosResult.push({
-          ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
-          concepto: refOpaProp, serie: serieCierreProp, debe: subtotalAnticipoProp, haber: 0,
-        });
+      // Desglose por anticipo individual (2026-09-14, caso real Ferrocarril
+      // F0-260900139, 2 anticipos OPA-00908/00909, confirmado con el
+      // usuario): con 2+ anticipos resueltos con monto propio conocido
+      // (`anticiposResueltosProp`), se reparte `montoAnticipoConsumidoProp`
+      // secuencialmente entre ellos (cada uno hasta su propio total) en vez
+      // de una sola línea combinada — más trazable para saber cuánto de CADA
+      // anticipo se aplicó. Si el consumido no alcanza para cubrir la suma de
+      // todos, el desajuste se deja en el ÚLTIMO anticipo de la lista (el que
+      // queda con remanente sin aplicar), sin repartir ni forzar cuadre —
+      // decisión explícita del usuario, no un intento de reconciliar. Con 0 o
+      // 1 anticipo resuelto, cae al comportamiento combinado de siempre.
+      const desglosePorAnticipoProp = [];
+      if (anticiposResueltosProp.length > 1) {
+        let restanteProp = montoAnticipoConsumidoProp;
+        for (const a of anticiposResueltosProp) {
+          if (restanteProp <= 0.004) break;
+          const montoLinea = Math.round(Math.min(a.total, restanteProp) * 100) / 100;
+          if (montoLinea <= 0) continue;
+          restanteProp = parseFloat((restanteProp - montoLinea).toFixed(2));
+          desglosePorAnticipoProp.push({ folio: a.folio, monto: montoLinea });
+        }
       }
-      if (ivaAnticipoProp > 0) {
-        movimientosResult.push({
-          ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
-          concepto: refOpaProp, serie: serieCierreProp, debe: ivaAnticipoProp, haber: 0,
-        });
+      if (desglosePorAnticipoProp.length > 1) {
+        for (const d of desglosePorAnticipoProp) {
+          const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+          const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
+          const refOpaD      = `OPA-${d.folio}`;
+          const serieCierreD = serieEgresoAnticipoProp ?? refOpaD;
+          if (subtotalD > 0) {
+            movimientosResult.push({
+              ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
+              concepto: refOpaD, serie: serieCierreD, debe: subtotalD, haber: 0,
+            });
+          }
+          if (ivaD > 0) {
+            movimientosResult.push({
+              ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
+              concepto: refOpaD, serie: serieCierreD, debe: ivaD, haber: 0,
+            });
+          }
+        }
+      } else {
+        const subtotalAnticipoProp = Math.round((montoAnticipoConsumidoProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+        const ivaAnticipoProp      = Math.round((montoAnticipoConsumidoProp - subtotalAnticipoProp) * 100) / 100;
+        const refOpaProp = anticipoFolioRefProp;
+        // Columna C (serie) = folio del Egreso real que cancela el anticipo
+        // cuando existe (trazable al documento SAT); columna H (concepto) =
+        // siempre la referencia "OPA-..." (confirmado con el usuario
+        // 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
+        const serieCierreProp = serieEgresoAnticipoProp ?? refOpaProp;
+        if (subtotalAnticipoProp > 0) {
+          movimientosResult.push({
+            ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
+            concepto: refOpaProp, serie: serieCierreProp, debe: subtotalAnticipoProp, haber: 0,
+          });
+        }
+        if (ivaAnticipoProp > 0) {
+          movimientosResult.push({
+            ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null,
+            concepto: refOpaProp, serie: serieCierreProp, debe: ivaAnticipoProp, haber: 0,
+          });
+        }
       }
     } else if (anticipoFolioRefProp && montoAnticipoRealProp === 0) {
       // SIN dato real en absoluto (fallback, comportamiento viejo confirmado
@@ -5031,6 +5145,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // arriba y `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
     pendientesPorFacturar: pendientesPorFacturarProp,
     depositosEfectivoNoConciliados: depositosEfectivoProp,
+    // Hoja aparte: SF aplicado a una venta consumidora que sigue PPD/POR
+    // FACTURAR en /cuentas-pendientes — ver comentario en
+    // `_prefetchAjustesFacturaPropia`.
+    movimientosPpdPorFacturar: movimientosPpdPorFacturarProp,
     _meta: {
       totalCfdis:   cfdisSinPoliza.length,
       sinRegla,
@@ -5380,7 +5498,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map() } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -5714,12 +5832,22 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // recorren TODOS los uuids de cada relación (no solo el primero que
       // "resuelva" algo) — bug real 2026-08-31, caso MONSAN B0-260801098.
       const foliosResueltosGuard = [];
+      // Desglose por anticipo individual — ver comentario equivalente en
+      // generarPropuesta (`anticiposResueltosProp`).
+      const anticiposResueltosGuard = [];
       let faltaAlgunoGuard = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
         for (const u of (rel.uuids ?? (rel.uuid ? [rel.uuid] : []))) {
           const ref = anticipoFolioPorUuidGuard[(u || '').toUpperCase()];
-          if (ref) foliosResueltosGuard.push(ref.replace(/^OPA-/, '')); else faltaAlgunoGuard = true;
+          if (ref) {
+            const folioLimpio = ref.replace(/^OPA-/, '');
+            foliosResueltosGuard.push(folioLimpio);
+            const anticipoCfdi = anticipoCfdisGuard.find(c => c.uuid.toUpperCase() === (u || '').toUpperCase());
+            if (Number(anticipoCfdi?.total) > 0) {
+              anticiposResueltosGuard.push({ folio: folioLimpio, total: Number(anticipoCfdi.total) });
+            }
+          } else faltaAlgunoGuard = true;
         }
       }
       if (foliosResueltosGuard.length) anticipoFolioRefGuard = `OPA-${foliosResueltosGuard.join('-')}${faltaAlgunoGuard ? '-' : ''}`;
@@ -5867,32 +5995,69 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // Anticipo sin NC — ver comentario equivalente en generarYGuardar.
     if (anticipoFolioRefGuard && montoAnticipoConsumidoGuard > 0) {
       // CON dato real — ver comentario equivalente en generarYGuardar.
-      const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
-      const ivaAnticipoGuard      = Math.round((montoAnticipoConsumidoGuard - subtotalAnticipoGuard) * 100) / 100;
-      const refOpaGuard = anticipoFolioRefGuard;
-      // Columna C (serie) = folio del Egreso real cuando existe; columna H
-      // (concepto) = siempre "OPA-..." — ver comentario equivalente en
-      // generarPropuesta.
-      const serieCierreGuard = serieEgresoAnticipoGuard ?? refOpaGuard;
       const cuentaAnticiposIdGuard = cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null;
       const cuentaIvaAnticipoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null;
       const baseInfoGuard = {
         centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
         cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
       };
-      if (subtotalAnticipoGuard > 0) {
-        todosLosMovimientos.push({
-          ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
-          concepto: refOpaGuard, serie: serieCierreGuard, debe: subtotalAnticipoGuard, haber: 0,
-          cuentaFaltante: cuentaAnticiposIdGuard == null,
-        });
+      // Desglose por anticipo individual — ver comentario equivalente en
+      // generarPropuesta (`desglosePorAnticipoProp`).
+      const desglosePorAnticipoGuard = [];
+      if (anticiposResueltosGuard.length > 1) {
+        let restanteGuard = montoAnticipoConsumidoGuard;
+        for (const a of anticiposResueltosGuard) {
+          if (restanteGuard <= 0.004) break;
+          const montoLinea = Math.round(Math.min(a.total, restanteGuard) * 100) / 100;
+          if (montoLinea <= 0) continue;
+          restanteGuard = parseFloat((restanteGuard - montoLinea).toFixed(2));
+          desglosePorAnticipoGuard.push({ folio: a.folio, monto: montoLinea });
+        }
       }
-      if (ivaAnticipoGuard > 0) {
-        todosLosMovimientos.push({
-          ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
-          concepto: refOpaGuard, serie: serieCierreGuard, debe: ivaAnticipoGuard, haber: 0,
-          cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
-        });
+      if (desglosePorAnticipoGuard.length > 1) {
+        for (const d of desglosePorAnticipoGuard) {
+          const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+          const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
+          const refOpaD      = `OPA-${d.folio}`;
+          const serieCierreD = serieEgresoAnticipoGuard ?? refOpaD;
+          if (subtotalD > 0) {
+            todosLosMovimientos.push({
+              ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
+              concepto: refOpaD, serie: serieCierreD, debe: subtotalD, haber: 0,
+              cuentaFaltante: cuentaAnticiposIdGuard == null,
+            });
+          }
+          if (ivaD > 0) {
+            todosLosMovimientos.push({
+              ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
+              concepto: refOpaD, serie: serieCierreD, debe: ivaD, haber: 0,
+              cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
+            });
+          }
+        }
+        // (bloque combinado de siempre omitido a propósito: ya se emitió arriba por anticipo)
+      } else {
+        const subtotalAnticipoGuard = Math.round((montoAnticipoConsumidoGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+        const ivaAnticipoGuard      = Math.round((montoAnticipoConsumidoGuard - subtotalAnticipoGuard) * 100) / 100;
+        const refOpaGuard = anticipoFolioRefGuard;
+        // Columna C (serie) = folio del Egreso real cuando existe; columna H
+        // (concepto) = siempre "OPA-..." — ver comentario equivalente en
+        // generarPropuesta.
+        const serieCierreGuard = serieEgresoAnticipoGuard ?? refOpaGuard;
+        if (subtotalAnticipoGuard > 0) {
+          todosLosMovimientos.push({
+            ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
+            concepto: refOpaGuard, serie: serieCierreGuard, debe: subtotalAnticipoGuard, haber: 0,
+            cuentaFaltante: cuentaAnticiposIdGuard == null,
+          });
+        }
+        if (ivaAnticipoGuard > 0) {
+          todosLosMovimientos.push({
+            ...baseInfoGuard, cuentaId: cuentaIvaAnticipoIdGuard,
+            concepto: refOpaGuard, serie: serieCierreGuard, debe: ivaAnticipoGuard, haber: 0,
+            cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
+          });
+        }
       }
     } else if (anticipoFolioRefGuard && montoAnticipoRealGuard === 0) {
       // SIN dato real en absoluto (fallback) — ver comentario equivalente en
@@ -6375,6 +6540,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
       depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
+      movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard.length ? movimientosPpdPorFacturarGuard : null,
     }, { transaction: t });
 
     const movimientosFinales = _deduplicarSFRedundante(todosLosMovimientos);
@@ -6447,6 +6613,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // Hoja aparte: tickets con cobro real sin factura ligada — ver
     // `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
     pendientesPorFacturar: pendientesPorFacturarGuard,
+    // Hoja aparte: SF aplicado a una venta consumidora que sigue PPD/POR
+    // FACTURAR — ver comentario en `_prefetchAjustesFacturaPropia`.
+    movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard,
   };
 }
 

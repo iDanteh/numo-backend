@@ -45,19 +45,21 @@ async function _tokenPolizas() {
 // BUG CORREGIDO 2026-09-04 (caso real HORIZONTE HOTELERO B0-260900010/anticipo
 // B0-260900009): esta era la ÚNICA función de este archivo que llamaba al ERP
 // sin el reintento con backoff que ya usan `obtenerDesglosesCobroAlmacen`/
-// `obtenerSaldosFavor` (ver `_getConReintento` arriba) — y con un timeout más
-// corto (15s vs 30s). `/cuentas-pendientes` es además la consulta MÁS PESADA
-// de todas (12,833 cuentas en una prueba real con solo ±5 días de rango) —
-// bajo la carga real de una regeneración completa de póliza, un timeout aquí
-// se traga en silencio (el caller de `_prefetchCuentasPendientesAnticipo`
-// solo loguea y sigue con los mecanismos de respaldo, MENOS confiables), y
-// `anticipoFolioRefProp` termina usando el folio crudo del CFDI del anticipo
-// ("OPA-260900009") en vez del folio real de Kore ("OPA-00834") — se
-// confirmó con datos reales que el dato SÍ existe en el ERP y el único
-// factor no explicado era la fiabilidad de esta llamada. No se reutiliza
-// `_getConReintento` tal cual porque esa usa `_tokenPolizas()` (sección
-// `polizas`) — este endpoint es de la sección `bancos` (`_token()`), su
-// propio token/URL no se tocan, solo el reintento+timeout.
+// `obtenerSaldosFavor` (ver `_getConReintento` más abajo) — y con un timeout
+// más corto (15s vs 30s). `/cuentas-pendientes` es además la consulta MÁS
+// PESADA de todas (12,833 cuentas en una prueba real con solo ±5 días de
+// rango) — bajo la carga real de una regeneración completa de póliza, un
+// timeout aquí se traga en silencio y el caller termina usando datos menos
+// confiables. No se reutiliza `_getConReintento` tal cual porque esa usa
+// `ERP_TOKEN_POLIZAS` — este endpoint es de la sección `bancos` (`_token()`),
+// su propio token/URL no se tocan, solo el reintento+timeout.
+//
+// Portado a `Lenin` 2026-09-15 desde `main` (donde ya estaba, confirmado que
+// el contenedor de producción corre esta versión — ver
+// project_sync_erp_kore_finalizado_manualmente_gap.md, el backfill de los 10
+// movimientos mostraba el log "verificando completitud cruzada" que no
+// existía en este archivo). Puramente un port de resiliencia contra Kore, sin
+// cambiar el contrato de la función (sigue devolviendo `{ raw }`).
 async function sincronizarCuentasPendientes(params = {}) {
   const cuentasPendientesUrl = await _cuentasPendientesUrl();
 
@@ -113,7 +115,7 @@ async function sincronizarCuentasPendientes(params = {}) {
         await new Promise(r => setTimeout(r, esperaSeg * 1000));
         continue;
       }
-      if (mejorResponse) break; // ya hay al menos una respuesta buena, no tirar todo por un error tardio
+      if (mejorResponse) break; // ya hay al menos una respuesta buena, no tirar todo por un error tardío
       const body = JSON.stringify(axErr.response?.data ?? {});
       logger.error(`[ErpSync] ERP /cuentas-pendientes ${status}: ${body} | params=${JSON.stringify(queryParams)}`);
       throw axErr;
@@ -122,9 +124,7 @@ async function sincronizarCuentasPendientes(params = {}) {
     const totalCount = response.data?.Data?.totalCount;
     const cuentasLen = (response.data?.Data?.cuentas ?? []).length;
     const totalEfectivo = Number.isFinite(totalCount) ? totalCount : cuentasLen;
-    if (process.env.DEBUG_OPA_UUID) {
-      console.warn(`[DEBUG_CUENTAS_PENDIENTES] intento=${intento} totalCount=${JSON.stringify(totalCount)} cuentasLen=${cuentasLen} mejorTotal=${mejorTotal}`);
-    }
+
     // Señal de convergencia real: esta llamada coincide con la MEJOR que ya
     // teníamos (no solo "es consistente consigo misma", que un intento
     // degradado también puede parecer serlo — confirmado con datos reales:

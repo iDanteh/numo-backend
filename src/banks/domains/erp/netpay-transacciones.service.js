@@ -7,9 +7,10 @@
 // crudos de Kore ni tocar nada de caja-transferencia-*.service.js (dominio distinto,
 // no relacionado).
 //
-// Filtros adicionales (más allá de responseCode/almacenes/dateFrom/dateTo) y cualquier
-// matching contra BankMovement quedan para una siguiente iteración — no adelantar
-// diseño acá.
+// Filtro terminalID agregado 2026-09-15 (confirmado por el usuario contra Kore real) —
+// primer paso hacia el matching contra BankMovement (cada terminal liquida a una cuenta
+// bancaria propia). Filtros adicionales más allá de estos 5 y el diseño del matching en
+// sí quedan para una siguiente iteración — no adelantar acá.
 //
 // CORRECCIÓN 2026-09-08 (hallazgo real del usuario contra Kore): el endpoint pagina
 // (default pageSize=20) — agregar totales solo sobre `Data.transactions` de UNA
@@ -26,14 +27,14 @@ const PAGE_SIZE_MAX = 100;
 // transacciones, muy por encima de cualquier volumen real esperado en esta vista.
 const MAX_PAGINAS = 50;
 
-async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo }) {
+async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, terminalID }) {
   const transacciones = [];
   let page = 1;
   let totalPages = 1;
 
   do {
     const { raw } = await buscarTransaccionesNetpay({
-      responseCode, almacenes, dateFrom, dateTo, page, pageSize: PAGE_SIZE_MAX,
+      responseCode, almacenes, dateFrom, dateTo, terminalID, page, pageSize: PAGE_SIZE_MAX,
     });
     const data = raw?.Data ?? {};
     transacciones.push(...(data.transactions ?? []));
@@ -49,8 +50,8 @@ async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo
 }
 
 async function consultarTransaccionesNetpay(params = {}) {
-  const { responseCode, almacenes, dateFrom, dateTo } = params;
-  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo });
+  const { responseCode, almacenes, dateFrom, dateTo, terminalID } = params;
+  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, terminalID });
 
   let totalMonto = 0;
   let totalComision = 0;

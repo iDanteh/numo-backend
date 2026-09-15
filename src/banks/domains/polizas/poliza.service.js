@@ -3846,12 +3846,19 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // completo de "Cobro de otra sucursal" y de "Otros Ingresos" (donde antes
   // solo aparecían los ≤$50) y se concentra únicamente aquí.
   if (filasSaldoFavorUsado.length > 0) {
-    const wsSaldoFavorUsado = workbook.addWorksheet('Saldos a favor usados');
+    // Nombre de hoja (2026-09-15, confirmado con el usuario): "Movimientos de
+    // Saldos a Favor" — antes "Saldos a favor usados".
+    const wsSaldoFavorUsado = workbook.addWorksheet('Movimientos de Saldos a Favor');
     wsSaldoFavorUsado.columns = [
       { header: 'Cuenta',        key: 'cuenta',      width: 14 },
       { header: 'Sucursal',      key: 'centroCosto', width: 12 },
       { header: 'Cliente / Serie-Folio', key: 'concepto', width: 40 },
       { header: 'Monto',         key: 'monto',       width: 16 },
+      // Columna "Motivo" (2026-09-15, confirmado con el usuario) — mismo
+      // patrón que la hoja "Otros Ingresos": distingue el SF-OCULTO (generado
+      // y usado el mismo día/almacén, ya NO se oculta desde el fix de hoy)
+      // del resto de SF usado normal, sin mezclarlos sin explicación.
+      { header: 'Motivo',        key: 'motivo',      width: 40 },
     ];
     wsSaldoFavorUsado.getRow(1).font = { bold: true };
     wsSaldoFavorUsado.getRow(1).eachCell(cell => {
@@ -3863,10 +3870,13 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
         centroCosto: f.centroCosto ?? '',
         concepto:    f.concepto ?? '',
         monto:       Number(f.debe) || Number(f.haber) || 0,
+        motivo:      f._formaPagoLabel === ETIQUETA_SALDO_FAVOR_OCULTO
+          ? 'Generado y usado el mismo día/almacén'
+          : '',
       });
       row.getCell('monto').numFmt = '#,##0.00';
     }
-    wsSaldoFavorUsado.autoFilter = { from: 'A1', to: 'D1' };
+    wsSaldoFavorUsado.autoFilter = { from: 'A1', to: 'E1' };
   }
 
   // Hoja de CFDIs sustitutos (tipoRelacion='04') excluidos automáticamente al

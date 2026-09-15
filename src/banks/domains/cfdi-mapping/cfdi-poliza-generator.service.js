@@ -2012,6 +2012,9 @@ const CODIGO_CUENTA_IVA_ANTICIPO       = '2104010002';
 // 100% con Anticipo (ver `ventasConAnticipoRedirigido`, "Fix doble-
 // contabilización anticipo PUE" más abajo).
 const CODIGO_CUENTA_DEVOLUCIONES      = '4200010001';
+// IVA Trasladado (definitivo, PUE) — usado por el combo especial de 2+
+// anticipos (ver `ventasConComboEspecialAnticipoProp`).
+const CODIGO_CUENTA_IVA_TRASLADADO    = '2104010001';
 // Mismo split subtotal/IVA que usa Saldo a Favor (TASA_IVA_SALDO_FAVOR en
 // cfdi-mapping.service.js) para prorratear el monto REAL de anticipo
 // aplicado (ver `montoAnticipoRealProp` más abajo).
@@ -3935,6 +3938,21 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       ventasConAnticipoRedirigido.add(c.uuid.toUpperCase());
     }
   }
+  // Ventas con 2+ anticipos combinados en un solo cierre OPA (ver
+  // `anticiposResueltosProp` más abajo) que ADEMÁS van a ser revertidas por un
+  // Egreso real en este mismo batch (`ventasConAnticipoRedirigido`) —
+  // confirmado con el usuario 2026-09-14/15, caso real Ferrocarril
+  // F0-260900139 (OPA-00908/00909): en vez de las 8 líneas normales (4 del
+  // cierre OPA por anticipo + 4 de OPA-REVERSION), este caso combinado se
+  // muestra en solo 4: TODOS los anticipos MENOS EL ÚLTIMO se cargan a
+  // Devoluciones+IVA normal (su monto propio completo, sumado si son 2+), y
+  // SOLO el ÚLTIMO se carga a Anticipos+IVA-anticipo (su monto propio
+  // completo) — regla confirmada explícitamente por el usuario, acepta que
+  // pueda quedar una diferencia de centavos contra el total real consumido/
+  // revertido (no se fuerza a cuadrar exacto). Se llena más abajo, al generar
+  // el cierre OPA de la Factura Final; se consulta al procesar el Egreso
+  // (`uuid07`) para suprimir sus líneas propias (ya representadas aquí).
+  const ventasConComboEspecialAnticipoProp = new Set();
 
   // Fix 5 (sin cambios): verificar también en BD — la NC y la factura final
   // pueden venir en batches distintos. Si el UUID relacionado tipo 07 de
@@ -4066,7 +4084,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
-    if (uuid07 && ventasConAnticipoRedirigido.has(uuid07)) {
+    if (uuid07 && ventasConComboEspecialAnticipoProp.has(uuid07)) {
+      // El combo especial de 2+ anticipos (ver `ventasConComboEspecialAnticipoProp`)
+      // ya generó las 4 líneas completas al procesar la Factura Final — las
+      // líneas propias de ESTE Egreso (Cargo Anticipos otra vez/Abono
+      // Clientes de la regla TO-EGR) se suprimen por completo, no solo se
+      // redirigen, para no duplicar el evento.
+      movs.length = 0;
+    } else if (uuid07 && ventasConAnticipoRedirigido.has(uuid07)) {
       _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
       if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
         console.warn(`[DEBUG_EGR_REDIRECT] cfdi=${cfdi.serie}-${cfdi.folio} uuid07=${uuid07} movs=${JSON.stringify(movs)}`);
@@ -4408,6 +4433,38 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // queda con remanente sin aplicar), sin repartir ni forzar cuadre —
       // decisión explícita del usuario, no un intento de reconciliar. Con 0 o
       // 1 anticipo resuelto, cae al comportamiento combinado de siempre.
+      // Combo especial: 2+ anticipos combinados Y la venta va a ser revertida
+      // por un Egreso real en este mismo batch (confirmado con el usuario
+      // 2026-09-14/15, caso real Ferrocarril) — ver
+      // `ventasConComboEspecialAnticipoProp` arriba para la regla completa.
+      // Tiene PRIORIDAD sobre el desglose por anticipo normal de abajo.
+      const uuidVentaProp = (cfdi.uuid || '').toUpperCase();
+      const esComboEspecialProp = anticiposResueltosProp.length > 1 && ventasConAnticipoRedirigido.has(uuidVentaProp);
+      if (esComboEspecialProp) {
+        ventasConComboEspecialAnticipoProp.add(uuidVentaProp);
+        const previosProp = anticiposResueltosProp.slice(0, -1);
+        const ultimoProp  = anticiposResueltosProp[anticiposResueltosProp.length - 1];
+        const sumaPreviosProp = previosProp.reduce((s, a) => s + a.total, 0);
+        const subtotalPreviosProp = Math.round((sumaPreviosProp / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+        const ivaPreviosProp      = Math.round((sumaPreviosProp - subtotalPreviosProp) * 100) / 100;
+        const subtotalUltimoProp  = Math.round((ultimoProp.total / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
+        const ivaUltimoProp       = Math.round((ultimoProp.total - subtotalUltimoProp) * 100) / 100;
+        const refComboProp   = `OPA-${anticiposResueltosProp.map(a => a.folio).join('-')}`;
+        const serieComboProp = serieEgresoAnticipoProp ?? refComboProp;
+        const baseComboProp  = { ...baseInfoProp, reglaNombre: 'OPA-REVERSION', concepto: refComboProp, serie: serieComboProp };
+        if (subtotalPreviosProp > 0) {
+          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null, debe: subtotalPreviosProp, haber: 0 });
+        }
+        if (ivaPreviosProp > 0) {
+          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null, debe: ivaPreviosProp, haber: 0 });
+        }
+        if (subtotalUltimoProp > 0) {
+          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null, debe: subtotalUltimoProp, haber: 0 });
+        }
+        if (ivaUltimoProp > 0) {
+          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_ANTICIPO] ?? null, debe: ivaUltimoProp, haber: 0 });
+        }
+      } else {
       const desglosePorAnticipoProp = [];
       if (anticiposResueltosProp.length > 1) {
         let restanteProp = montoAnticipoConsumidoProp;
@@ -4459,6 +4516,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
             concepto: refOpaProp, serie: serieCierreProp, debe: ivaAnticipoProp, haber: 0,
           });
         }
+      }
       }
     } else if (anticipoFolioRefProp && montoAnticipoRealProp === 0) {
       // SIN dato real en absoluto (fallback, comportamiento viejo confirmado
@@ -5671,6 +5729,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       ventasConAnticipoRedirigidoGuard.add(c.uuid.toUpperCase());
     }
   }
+  // Ver comentario equivalente en generarPropuesta (`ventasConComboEspecialAnticipoProp`).
+  const ventasConComboEspecialAnticipoGuard = new Set();
 
   // Fix 5 (sin cambios, ver comentario en generarPropuesta): verificar
   // también en BD — la NC y la factura final pueden venir en batches
@@ -5803,7 +5863,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
-    if (uuid07 && ventasConAnticipoRedirigidoGuard.has(uuid07)) {
+    if (uuid07 && ventasConComboEspecialAnticipoGuard.has(uuid07)) {
+      // Ver comentario equivalente en generarPropuesta.
+      movs.length = 0;
+    } else if (uuid07 && ventasConAnticipoRedirigidoGuard.has(uuid07)) {
       _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
     }
 
@@ -6004,8 +6067,39 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null,
         cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA',
       };
-      // Desglose por anticipo individual — ver comentario equivalente en
-      // generarPropuesta (`desglosePorAnticipoProp`).
+      // Combo especial: 2+ anticipos combinados Y la venta va a ser revertida
+      // por un Egreso real — ver comentario equivalente en generarPropuesta
+      // (`ventasConComboEspecialAnticipoProp`). Prioridad sobre el desglose
+      // por anticipo normal de abajo.
+      const uuidVentaGuard = (cfdi.uuid || '').toUpperCase();
+      const esComboEspecialGuard = anticiposResueltosGuard.length > 1 && ventasConAnticipoRedirigidoGuard.has(uuidVentaGuard);
+      if (esComboEspecialGuard) {
+        ventasConComboEspecialAnticipoGuard.add(uuidVentaGuard);
+        const previosGuard = anticiposResueltosGuard.slice(0, -1);
+        const ultimoGuard  = anticiposResueltosGuard[anticiposResueltosGuard.length - 1];
+        const sumaPreviosGuard = previosGuard.reduce((s, a) => s + a.total, 0);
+        const subtotalPreviosGuard = Math.round((sumaPreviosGuard / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+        const ivaPreviosGuard      = Math.round((sumaPreviosGuard - subtotalPreviosGuard) * 100) / 100;
+        const subtotalUltimoGuard  = Math.round((ultimoGuard.total / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
+        const ivaUltimoGuard       = Math.round((ultimoGuard.total - subtotalUltimoGuard) * 100) / 100;
+        const cuentaDevolucionesIdGuard = cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null;
+        const cuentaIvaTrasladadoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null;
+        const refComboGuard   = `OPA-${anticiposResueltosGuard.map(a => a.folio).join('-')}`;
+        const serieComboGuard = serieEgresoAnticipoGuard ?? refComboGuard;
+        const baseComboGuard  = { ...baseInfoGuard, reglaNombre: 'OPA-REVERSION', concepto: refComboGuard, serie: serieComboGuard };
+        if (subtotalPreviosGuard > 0) {
+          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaDevolucionesIdGuard, debe: subtotalPreviosGuard, haber: 0, cuentaFaltante: cuentaDevolucionesIdGuard == null });
+        }
+        if (ivaPreviosGuard > 0) {
+          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaIvaTrasladadoIdGuard, debe: ivaPreviosGuard, haber: 0, cuentaFaltante: cuentaIvaTrasladadoIdGuard == null });
+        }
+        if (subtotalUltimoGuard > 0) {
+          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaAnticiposIdGuard, debe: subtotalUltimoGuard, haber: 0, cuentaFaltante: cuentaAnticiposIdGuard == null });
+        }
+        if (ivaUltimoGuard > 0) {
+          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaIvaAnticipoIdGuard, debe: ivaUltimoGuard, haber: 0, cuentaFaltante: cuentaIvaAnticipoIdGuard == null });
+        }
+      } else {
       const desglosePorAnticipoGuard = [];
       if (anticiposResueltosGuard.length > 1) {
         let restanteGuard = montoAnticipoConsumidoGuard;
@@ -6061,6 +6155,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
             cuentaFaltante: cuentaIvaAnticipoIdGuard == null,
           });
         }
+      }
       }
     } else if (anticipoFolioRefGuard && montoAnticipoRealGuard === 0) {
       // SIN dato real en absoluto (fallback) — ver comentario equivalente en

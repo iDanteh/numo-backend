@@ -2025,18 +2025,11 @@ function ordenarCargoAntesDeAbono(movs) {
       && o.cargos.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
     if (grupoEgreso) {
       usados.add(grupoEgreso.key);
-      // El Cargo Devoluciones+IVA del Egreso (`_redirigirEgresoAnticipoSaldado`)
-      // trae el concepto autorreferenciado del propio Egreso ("cliente /
-      // folio-del-egreso", igual a su propia columna de serie) — se homologa
-      // con la referencia OPA del cierre (mismo evento, confirmado con el
-      // usuario 2026-09-08, caso real RAYMUNDO CUELLAR MENDOZA), para que la
-      // columna H diga de qué anticipo viene en vez de repetir la serie.
-      const cargosEgresoConConceptoOPA = grupoEgreso.cargos.map(m => {
-        if (m.reglaNombre !== 'OPA-REVERSION') return m;
-        const plano = m.get ? m.get({ plain: true }) : m;
-        return { ...plano, concepto: cierreOPA.concepto };
-      });
-      resultado.push(...g.abonos, ...cargosEgresoConConceptoOPA, ...grupoEgreso.abonos, ...g.cargos);
+      // OPA-REVERSION se oculta del export por completo — ver comentario
+      // equivalente en `bloquesAjustesContado` (confirmado con el usuario
+      // 2026-09-15, caso real Puerto Escondido INMOBILIARIA ACROTY
+      // O0-260900344). Sigue persistido en Postgres, solo deja de mostrarse.
+      resultado.push(...g.abonos, ...g.cargos);
       continue;
     }
     resultado.push(...g.cargos, ...g.abonos);
@@ -2709,17 +2702,14 @@ function bloquesAjustesContado(movs) {
         && o.cargosOPA.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
       if (grupoEgreso) {
         usados.add(grupoEgreso.key);
-        // Mismo fix que `ordenarCargoAntesDeAbono` (poliza de Egreso): el Cargo
-        // Devoluciones+IVA del Egreso trae el concepto autorreferenciado del
-        // propio Egreso — se homologa con la referencia OPA del cierre (mismo
-        // evento), confirmado con el usuario 2026-09-08, caso real RAYMUNDO
-        // CUELLAR MENDOZA.
-        const cargosEgresoConConceptoOPA = grupoEgreso.cargosOPA.map(m => {
-          if (m.reglaNombre !== 'OPA-REVERSION') return m;
-          const plano = m.get ? m.get({ plain: true }) : m;
-          return { ...plano, concepto: cierreOPA.concepto };
-        });
-        resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...cargosEgresoConConceptoOPA, ...grupoEgreso.abonos, ...g.cargosOPA] });
+        // OPA-REVERSION (Cargo Devoluciones+IVA del Egreso + Abono Anticipos+
+        // IVA-anticipo reinstalados) se OCULTA del export por completo
+        // (confirmado con el usuario 2026-09-15, caso real Puerto Escondido
+        // INMOBILIARIA ACROTY O0-260900344) — sigue persistido igual en
+        // Postgres (esta función solo arma el Excel), solo deja de mostrarse.
+        // Se conserva la detección de `grupoEgreso` (arriba) para marcarlo
+        // como usado y que no caiga al bloque genérico de abajo.
+        resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...g.cargosOPA] });
         continue;
       }
       resultado.push({ categoria: g.categoria, bloque: [...g.cargosOPA, ...g.abonos] });
@@ -2892,6 +2882,14 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     // criterio para Contado y Crédito). OPA es la excepción — ver comentario
     // equivalente en `bloquesAjustesContado` (fix 2026-08-28).
     const cargosOPA = cargos.filter(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    // OPA-REVERSION se oculta del export por completo — ver comentario
+    // equivalente en `bloquesAjustesContado` (confirmado con el usuario
+    // 2026-09-15). Un grupo cuyo único cargo-anticipo es la reversión (sin
+    // ningún 'OPA' de cierre en el mismo grupo) es exactamente el Egreso que
+    // revierte la venta; sigue persistido en Postgres, solo deja de mostrarse.
+    if (categoria === 'anticipo' && cargosOPA.length > 0 && cargosOPA.every(m => m.reglaNombre === 'OPA-REVERSION')) {
+      continue;
+    }
     const bloque = categoria === 'anticipo' ? [...cargosOPA, ...abonos] : [...cargos, ...abonos];
     bloques.push({ categoria, bloque });
   }

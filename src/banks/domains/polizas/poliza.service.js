@@ -1830,9 +1830,10 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     // Cualquier anticipo (Recepción sin usar O Factura Final ya aplicada) —
     // nunca se suma al total agregado, siempre línea individual por CFDI con
     // su serie real, igual que las otras 4 categorías de ajuste. Subcódigo
-    // siempre 22, sin importar cómo se cobró (confirmado con el usuario).
+    // 0 (2026-09-15, confirmado con el usuario: ningún anticipo debe llevar
+    // el 22 — antes se usaba fijo sin importar cómo se cobró).
     if (esAnticipo) {
-      anticipos.push(armarIndividual(esAnticipoSinUsar ? 'Anticipo sin aplicar' : 'Anticipo Aplicado', 22, 'anticipo'));
+      anticipos.push(armarIndividual(esAnticipoSinUsar ? 'Anticipo sin aplicar' : 'Anticipo Aplicado', 0, 'anticipo'));
       continue;
     }
 
@@ -2929,13 +2930,10 @@ function bloquesAjustesContado(movs) {
 
   const grupos = ordenCfdi.map(key => {
     const { categoria, movs: grupo } = porCfdi.get(key);
-    // Anticipo: el subcódigo 22 es SOLO para la recepción (reglaNombre de la
-    // propia regla fiscal, ej. "Anticipo") — la aplicación/cierre (OPA/
-    // OPA-REVERSION, ver `REGLAS_MEZCLADAS_CON_VENTAS`) NO debe llevarlo
-    // (corregido 2026-09-15, confirmado con el usuario: antes ambas
-    // situaciones llevaban 22 por igual).
-    const esAplicacionAnticipo = categoria === 'anticipo' && grupo.some(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
-    const extra = categoria === 'anticipo' && !esAplicacionAnticipo ? { _subcodigo: 22 } : {};
+    // Anticipo: ningún anticipo debe llevar el subcódigo 22 (2026-09-15,
+    // confirmado con el usuario — quitado por completo, ni recepción ni
+    // aplicación/cierre).
+    const extra = {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     // Bonificación (genérica, no Club Tuberos): SIEMPRE solo sus Cargos
     // (Bonificación+IVA), nunca su Abono — mismo criterio que ya existía
@@ -3157,10 +3155,9 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     // real en banco o saldo a favor) — confirmado con el usuario 2026-07-23.
     // Dentro de cada lado, la cuenta de Ingresos/Devoluciones va antes que la
     // de IVA (`conImpuestoAlFinal`).
-    // Anticipo: subcódigo 22 solo en la recepción, no en la aplicación/cierre
-    // — mismo fix que en `bloquesAjustesContado` (Contado, 2026-09-15).
-    const esAplicacionAnticipo = categoria === 'anticipo' && grupo.some(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
-    const extra = categoria === 'anticipo' && !esAplicacionAnticipo ? { _subcodigo: 22 } : {};
+    // Anticipo: ningún anticipo debe llevar el subcódigo 22 (2026-09-15,
+    // confirmado con el usuario — mismo fix que en `bloquesAjustesContado`).
+    const extra = {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));

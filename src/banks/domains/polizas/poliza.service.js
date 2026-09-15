@@ -1794,15 +1794,43 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       const montoBancoReal = esTransferenciaVerificada
         ? (infoTicketTransfCheque?.montoBancoReal ?? (esTicketPropio ? null : bancario?.montoBancoReal) ?? null)
         : null;
+      // BUG CORREGIDO 2026-09-15 (caso real CEDIS 12-sep, depósito BBVA
+      // $1,500 folio 045330 repartido $492.87/A0-260704683 + $1,007.13/
+      // A0-260704334): `montoBancoReal` para tickets propios YA es la
+      // porción EXACTA que le tocó a ESTE ticket (`link.saldoPagadoTotal`,
+      // ver `construirBancoRealPorTicket`), no el bruto del depósito
+      // completo — a diferencia del caso `bancario`/CFDI (que sigue usando
+      // `BankMovement.deposito`, el bruto, porque ahí SÍ es un solo depósito
+      // real sin repartir). "Fijar" el `debe` del grupo al primer ticket que
+      // llega (comportamiento de siempre para el caso CFDI) perdía por
+      // completo la porción de cualquier OTRO ticket que comparta la misma
+      // referencia — su parte nunca se sumaba al total real de la póliza,
+      // solo quedaba visible en "Desglose Consolidado". Para tickets propios,
+      // cada porción exacta se ACUMULA (suman al depósito real completo); el
+      // caso CFDI/`bancario` sigue fijo como antes.
+      const _debeFijoBanco = montoBancoReal != null && !esTicketPropio;
       if (!gruposDetallados.has(key)) {
         gruposDetallados.set(key, {
           cuenta: cuentaLinea, centroCosto, referencia, tipoDetalle, subcodigo: subcodigoDetalle,
-          debe: montoBancoReal ?? 0, detalle: [], primerMov: m, _debeFijoBanco: montoBancoReal != null,
+          debe: 0, detalle: [], primerMov: m, _debeFijoBanco,
         });
       }
       const gt = gruposDetallados.get(key);
-      if (!gt._debeFijoBanco) gt.debe += Number(m.debe);
-      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaConSerie });
+      if (gt._debeFijoBanco) {
+        gt.debe = montoBancoReal;
+      } else if (esTicketPropio && montoBancoReal != null) {
+        gt.debe += montoBancoReal;
+      } else {
+        gt.debe += Number(m.debe);
+      }
+      // `ticketRef` (solo tickets propios): serie-folio del TICKET real, para
+      // poder listar en el concepto todos los tickets que comparten una
+      // misma referencia bancaria cuando se agrupan (ver más abajo, armado
+      // del concepto de `depositosIdentificados`) — antes, agrupar 2+
+      // tickets distintos bajo la misma referencia mostraba solo la etiqueta
+      // genérica ("TRANSFERENCIA"), perdiendo de vista a cuáles tickets
+      // pertenecía el depósito.
+      gt.detalle.push({ cfdiUuid: m.cfdiUuid, serie: serieColumnaDetalle, monto: Number(m.debe), formaPago: tipoDetalle, nota: notaConSerie, ticketRef: esTicketPropio ? `${m.serieVentaTicket}-${m.folioVentaTicket}` : null });
       continue;
     }
 
@@ -1963,7 +1991,17 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       ? `${m.serieVentaTicket}-${m.folioVentaTicket}`
       : (m.serie || '');
     const serieFinal = gt.referencia ?? serFolReal;
-    const concepto = esGrupo ? etiqueta : ([nombre, serFolReal].filter(Boolean).join(' / ') || etiqueta);
+    // Agrupada por TICKETS propios (2+ tickets distintos que comparten un
+    // mismo depósito real, ej. una Transferencia partida entre 2 facturas —
+    // ver acumulación de `debe` arriba): a diferencia del caso CFDI/Global
+    // (mismo ticket con varias líneas), aquí SÍ hay algo útil que mostrar —
+    // los tickets reales detrás del depósito, no solo la etiqueta genérica
+    // (confirmado con el usuario 2026-09-15, caso real depósito 045330:
+    // A0-260704683 + A0-260704334).
+    const ticketRefsGrupo = esGrupo ? [...new Set(gt.detalle.map(d => d.ticketRef).filter(Boolean))] : [];
+    const concepto = esGrupo
+      ? (ticketRefsGrupo.length ? ticketRefsGrupo.join(', ') : etiqueta)
+      : ([nombre, serFolReal].filter(Boolean).join(' / ') || etiqueta);
     const serieColumnaC = esGrupo ? serieFinal : (gt.referencia ?? etiqueta);
     depositosIdentificados.push({
       cuenta: gt.cuenta, serie: serieColumnaC, concepto,

@@ -1498,27 +1498,49 @@ async function construirMovimientosPuente({
         continue;
       }
 
-      // ── Lado VENDEDOR: Cargo a la cuenta puente por el total cobrado —
-      // mismo principio que el lado vendedor PUE normal (Cargo Caja/Bancos
-      // sin contrapartida en esta póliza, se compensa al consolidar), solo
-      // que aquí no hay factura con la que cuadrar todavía, así que se usa
-      // la cuenta puente en vez de Caja/Bancos directo. Cuando el ticket se
-      // facture, el flujo normal de arriba tomará este mismo folio como
-      // cualquier otro documento relacionado.
+      // ── Lado VENDEDOR: Cargo por el total cobrado — mismo principio que el
+      // lado vendedor PUE normal (Cargo Caja/Bancos sin contrapartida en esta
+      // póliza, se compensa al consolidar). Cuando el ticket se facture, el
+      // flujo normal de arriba tomará este mismo folio como cualquier otro
+      // documento relacionado.
+      // Desglose por forma de pago (2026-09-14, confirmado con el usuario):
+      // Efectivo/Tarjeta van directo a Caja/Bancos por identificar (igual que
+      // el lado vendedor PUE normal), NO a la cuenta puente — la cuenta
+      // puente (2103040001) se reserva para formas de pago que sí requieren
+      // cuadrar contra la sucursal cobradora (Transferencia, Cheque, SF,
+      // Puntos), mismo criterio ya usado en el lado COBRADOR de este mismo
+      // bloque (`lineasCobrador` más abajo). Solo aplica a este camino
+      // (cobros de otra sucursal sin factura) — no tocar otros usos de
+      // `cuentaPuenteId` (PPD normal, cobranza-poliza-generator.service.js).
       if (centroVendedor && String(centroVendedor.id) === String(centroCostoId) && p.monto > 0) {
-        candidatas.push({
-          cuentaId:      cuentaPuenteId,
-          cuentaFaltante: false,
-          concepto:      conceptoTicket,
-          debe:          p.monto,
-          haber:         0,
-          serie:         serieFolioTicket,
-          folio:         p.folioOrigen,
-          centroCosto:   centroVendedor.clave,
-          centroCostoId: centroVendedor.id,
-          tipoOrigen:    'Cobro Sucursal',
-          reglaNombre:   formasPagoTicket.map(fp => fp.nombre).filter(Boolean).join('/') || null,
-          cfdiUuid:      null,
+        const totalFormasPagoVendedor = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
+        let acumuladoVendedor = 0;
+        formasPagoTicket.forEach((fp, idx) => {
+          const esUltimo = idx === formasPagoTicket.length - 1;
+          const share = totalFormasPagoVendedor > 0 ? (Number(fp.monto) || 0) / totalFormasPagoVendedor : 1 / formasPagoTicket.length;
+          const montoAsignado = esUltimo
+            ? Math.round((p.monto - acumuladoVendedor) * 100) / 100
+            : Math.round(p.monto * share * 100) / 100;
+          acumuladoVendedor += montoAsignado;
+          if (montoAsignado <= 0) return;
+          const claveSatFp = (fp.claveSat ?? '').trim();
+          const cuentaVendedor = claveSatFp === CLAVE_SAT_EFECTIVO ? cuentaCajaId
+            : CLAVES_SAT_TARJETA.includes(claveSatFp) ? cuentaBancosId
+              : cuentaPuenteId;
+          candidatas.push({
+            cuentaId:      cuentaVendedor,
+            cuentaFaltante: false,
+            concepto:      conceptoTicket,
+            debe:          montoAsignado,
+            haber:         0,
+            serie:         serieFolioTicket,
+            folio:         p.folioOrigen,
+            centroCosto:   centroVendedor.clave,
+            centroCostoId: centroVendedor.id,
+            tipoOrigen:    'Cobro Sucursal',
+            reglaNombre:   fp.nombre || null,
+            cfdiUuid:      null,
+          });
         });
 
         // Lado COBRADOR: se encola (ver nota de arquitectura en el

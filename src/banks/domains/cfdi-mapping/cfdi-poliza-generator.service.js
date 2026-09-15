@@ -3949,10 +3949,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // SOLO el ÚLTIMO se carga a Anticipos+IVA-anticipo (su monto propio
   // completo) — regla confirmada explícitamente por el usuario, acepta que
   // pueda quedar una diferencia de centavos contra el total real consumido/
-  // revertido (no se fuerza a cuadrar exacto). Se llena más abajo, al generar
-  // el cierre OPA de la Factura Final; se consulta al procesar el Egreso
-  // (`uuid07`) para suprimir sus líneas propias (ya representadas aquí).
-  const ventasConComboEspecialAnticipoProp = new Set();
+  // revertido (no se fuerza a cuadrar exacto).
+  // Mapa (no Set): uuid de la Factura → montos de la porción "previos" que el
+  // EGRESO (procesado más abajo, en este mismo batch) debe generar en SU
+  // PROPIO cfdiUuid con reglaNombre='OPA-REVERSION' — necesario para que
+  // `ordenarCargoAntesDeAbono`/`bloquesAjustesContado` (poliza.service.js)
+  // sigan intercalando "Ingreso → Egreso → cierre OPA" igual que el caso de
+  // 1 solo anticipo (esa lógica exige 2 grupos, uno 'OPA' y otro
+  // 'OPA-REVERSION', en cfdis distintos — bug real 2026-09-15, ver comentario
+  // completo más abajo donde se llena este mapa).
+  const ventasConComboEspecialAnticipoProp = new Map();
 
   // Fix 5 (sin cambios): verificar también en BD — la NC y la factura final
   // pueden venir en batches distintos. Si el UUID relacionado tipo 07 de
@@ -4084,13 +4090,28 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
-    if (uuid07 && ventasConComboEspecialAnticipoProp.has(uuid07)) {
+    const comboEspecialProp = uuid07 ? ventasConComboEspecialAnticipoProp.get(uuid07) : null;
+    if (comboEspecialProp) {
       // El combo especial de 2+ anticipos (ver `ventasConComboEspecialAnticipoProp`)
-      // ya generó las 4 líneas completas al procesar la Factura Final — las
-      // líneas propias de ESTE Egreso (Cargo Anticipos otra vez/Abono
-      // Clientes de la regla TO-EGR) se suprimen por completo, no solo se
-      // redirigen, para no duplicar el evento.
+      // ya generó la porción "último anticipo" (Anticipos+IVA-anticipo) al
+      // procesar la Factura Final — las líneas propias de ESTE Egreso (Cargo
+      // Anticipos otra vez/Abono Clientes de la regla TO-EGR) se DESCARTAN
+      // por completo y se reemplazan por la porción "previos" (Devoluciones+
+      // IVA-normal), tagueada 'OPA-REVERSION' en el cfdiUuid de este Egreso
+      // — mismo patrón de 2 grupos que el caso normal de 1 anticipo, para que
+      // el orden de despliegue (poliza.service.js) siga funcionando igual.
       movs.length = 0;
+      const baseComboEgresoProp = {
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA-REVERSION',
+        concepto: comboEspecialProp.refCombo, serie: comboEspecialProp.serieCombo,
+        centroCosto: rule?.centroCosto ?? '',
+      };
+      if (comboEspecialProp.subtotalPrevios > 0) {
+        movs.push({ ...baseComboEgresoProp, cuentaId: cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null, debe: comboEspecialProp.subtotalPrevios, haber: 0 });
+      }
+      if (comboEspecialProp.ivaPrevios > 0) {
+        movs.push({ ...baseComboEgresoProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null, debe: comboEspecialProp.ivaPrevios, haber: 0 });
+      }
     } else if (uuid07 && ventasConAnticipoRedirigido.has(uuid07)) {
       _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
       if (process.env.DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === process.env.DEBUG_OPA_UUID.toUpperCase()) {
@@ -4438,10 +4459,23 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // 2026-09-14/15, caso real Ferrocarril) — ver
       // `ventasConComboEspecialAnticipoProp` arriba para la regla completa.
       // Tiene PRIORIDAD sobre el desglose por anticipo normal de abajo.
+      // IMPORTANTE (bug real 2026-09-15, orden roto en el export): las líneas
+      // de "previos" (Devoluciones+IVA-normal) se dejan con `reglaNombre:
+      // 'OPA-REVERSION'` y `cfdiUuid` del EGRESO (no de esta Factura) — las
+      // de "último" (Anticipos+IVA-anticipo) se quedan con el `reglaNombre:
+      // 'OPA'` normal de `baseInfoProp` y `cfdiUuid` de esta Factura. Esto
+      // reproduce EXACTAMENTE la misma estructura de 2 grupos que el caso de
+      // 1 solo anticipo (cierre OPA / OPA-REVERSION en cfdis distintos), que
+      // es lo que `ordenarCargoAntesDeAbono`/`bloquesAjustesContado`
+      // (poliza.service.js) ya sabe intercalar como "Ingreso → Egreso →
+      // cierre OPA". Poner las 4 líneas en un solo grupo con un solo
+      // reglaNombre (intento anterior) rompía ese mecanismo — sin una línea
+      // 'OPA' que emparejar, el grupo entero caía al orden por defecto
+      // "cargo antes que abono", mostrando el combo ANTES que el Ingreso de
+      // la Factura Final.
       const uuidVentaProp = (cfdi.uuid || '').toUpperCase();
       const esComboEspecialProp = anticiposResueltosProp.length > 1 && ventasConAnticipoRedirigido.has(uuidVentaProp);
       if (esComboEspecialProp) {
-        ventasConComboEspecialAnticipoProp.add(uuidVentaProp);
         const previosProp = anticiposResueltosProp.slice(0, -1);
         const ultimoProp  = anticiposResueltosProp[anticiposResueltosProp.length - 1];
         const sumaPreviosProp = previosProp.reduce((s, a) => s + a.total, 0);
@@ -4451,13 +4485,13 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         const ivaUltimoProp       = Math.round((ultimoProp.total - subtotalUltimoProp) * 100) / 100;
         const refComboProp   = `OPA-${anticiposResueltosProp.map(a => a.folio).join('-')}`;
         const serieComboProp = serieEgresoAnticipoProp ?? refComboProp;
-        const baseComboProp  = { ...baseInfoProp, reglaNombre: 'OPA-REVERSION', concepto: refComboProp, serie: serieComboProp };
-        if (subtotalPreviosProp > 0) {
-          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null, debe: subtotalPreviosProp, haber: 0 });
-        }
-        if (ivaPreviosProp > 0) {
-          movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null, debe: ivaPreviosProp, haber: 0 });
-        }
+        // Guardado para que el Egreso (procesado más abajo en este mismo
+        // batch) sepa qué 2 líneas de reversión generar en su propio cfdiUuid.
+        ventasConComboEspecialAnticipoProp.set(uuidVentaProp, {
+          subtotalPrevios: subtotalPreviosProp, ivaPrevios: ivaPreviosProp,
+          refCombo: refComboProp, serieCombo: serieComboProp,
+        });
+        const baseComboProp = { ...baseInfoProp, concepto: refComboProp, serie: serieComboProp };
         if (subtotalUltimoProp > 0) {
           movimientosResult.push({ ...baseComboProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null, debe: subtotalUltimoProp, haber: 0 });
         }
@@ -5730,7 +5764,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
   }
   // Ver comentario equivalente en generarPropuesta (`ventasConComboEspecialAnticipoProp`).
-  const ventasConComboEspecialAnticipoGuard = new Set();
+  const ventasConComboEspecialAnticipoGuard = new Map();
 
   // Fix 5 (sin cambios, ver comentario en generarPropuesta): verificar
   // también en BD — la NC y la factura final pueden venir en batches
@@ -5863,9 +5897,21 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
-    if (uuid07 && ventasConComboEspecialAnticipoGuard.has(uuid07)) {
+    const comboEspecialGuard = uuid07 ? ventasConComboEspecialAnticipoGuard.get(uuid07) : null;
+    if (comboEspecialGuard) {
       // Ver comentario equivalente en generarPropuesta.
       movs.length = 0;
+      const baseComboEgresoGuard = {
+        cfdiUuid: cfdi.uuid, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'OPA-REVERSION',
+        concepto: comboEspecialGuard.refCombo, serie: comboEspecialGuard.serieCombo,
+        centroCosto: rule?.centroCosto ?? '',
+      };
+      if (comboEspecialGuard.subtotalPrevios > 0) {
+        movs.push({ ...baseComboEgresoGuard, cuentaId: cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null, debe: comboEspecialGuard.subtotalPrevios, haber: 0 });
+      }
+      if (comboEspecialGuard.ivaPrevios > 0) {
+        movs.push({ ...baseComboEgresoGuard, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null, debe: comboEspecialGuard.ivaPrevios, haber: 0 });
+      }
     } else if (uuid07 && ventasConAnticipoRedirigidoGuard.has(uuid07)) {
       _redirigirEgresoAnticipoSaldado(movs, rule, cuentaMap);
     }
@@ -6074,7 +6120,6 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const uuidVentaGuard = (cfdi.uuid || '').toUpperCase();
       const esComboEspecialGuard = anticiposResueltosGuard.length > 1 && ventasConAnticipoRedirigidoGuard.has(uuidVentaGuard);
       if (esComboEspecialGuard) {
-        ventasConComboEspecialAnticipoGuard.add(uuidVentaGuard);
         const previosGuard = anticiposResueltosGuard.slice(0, -1);
         const ultimoGuard  = anticiposResueltosGuard[anticiposResueltosGuard.length - 1];
         const sumaPreviosGuard = previosGuard.reduce((s, a) => s + a.total, 0);
@@ -6082,17 +6127,16 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         const ivaPreviosGuard      = Math.round((sumaPreviosGuard - subtotalPreviosGuard) * 100) / 100;
         const subtotalUltimoGuard  = Math.round((ultimoGuard.total / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
         const ivaUltimoGuard       = Math.round((ultimoGuard.total - subtotalUltimoGuard) * 100) / 100;
-        const cuentaDevolucionesIdGuard = cuentaMap[CODIGO_CUENTA_DEVOLUCIONES] ?? null;
-        const cuentaIvaTrasladadoIdGuard = cuentaMap[CODIGO_CUENTA_IVA_TRASLADADO] ?? null;
         const refComboGuard   = `OPA-${anticiposResueltosGuard.map(a => a.folio).join('-')}`;
         const serieComboGuard = serieEgresoAnticipoGuard ?? refComboGuard;
-        const baseComboGuard  = { ...baseInfoGuard, reglaNombre: 'OPA-REVERSION', concepto: refComboGuard, serie: serieComboGuard };
-        if (subtotalPreviosGuard > 0) {
-          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaDevolucionesIdGuard, debe: subtotalPreviosGuard, haber: 0, cuentaFaltante: cuentaDevolucionesIdGuard == null });
-        }
-        if (ivaPreviosGuard > 0) {
-          todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaIvaTrasladadoIdGuard, debe: ivaPreviosGuard, haber: 0, cuentaFaltante: cuentaIvaTrasladadoIdGuard == null });
-        }
+        // Ver comentario equivalente en generarPropuesta: se guarda la
+        // porción "previos" para que el Egreso la genere en SU propio
+        // cfdiUuid con reglaNombre='OPA-REVERSION' (2 grupos, no 1).
+        ventasConComboEspecialAnticipoGuard.set(uuidVentaGuard, {
+          subtotalPrevios: subtotalPreviosGuard, ivaPrevios: ivaPreviosGuard,
+          refCombo: refComboGuard, serieCombo: serieComboGuard,
+        });
+        const baseComboGuard = { ...baseInfoGuard, concepto: refComboGuard, serie: serieComboGuard };
         if (subtotalUltimoGuard > 0) {
           todosLosMovimientos.push({ ...baseComboGuard, cuentaId: cuentaAnticiposIdGuard, debe: subtotalUltimoGuard, haber: 0, cuentaFaltante: cuentaAnticiposIdGuard == null });
         }

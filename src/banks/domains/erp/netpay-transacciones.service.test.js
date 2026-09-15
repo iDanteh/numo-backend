@@ -120,6 +120,18 @@ test('responseCode/almacenes/dateFrom/dateTo se pasan tal cual, con page/pageSiz
   });
 });
 
+// 2026-09-15: terminalID agregado — primer paso hacia el matching contra
+// BankMovement (confirmado por el usuario contra Kore real vía Insomnia).
+test('terminalID se pasa tal cual, en cada página', async () => {
+  buscarTransaccionesNetpay.mockResolvedValue(fakePage([]));
+
+  await consultarTransaccionesNetpay({ terminalID: '2840403056' });
+
+  expect(buscarTransaccionesNetpay).toHaveBeenCalledWith(
+    expect.objectContaining({ terminalID: '2840403056' }),
+  );
+});
+
 // CORRECCIÓN 2026-09-08 (hallazgo real del usuario): Kore pagina — caso real
 // reportado (totalCount=59, pageSize=20 default, 3 páginas). consultarTransaccionesNetpay
 // debe recorrer TODAS las páginas antes de agregar, no solo la primera.

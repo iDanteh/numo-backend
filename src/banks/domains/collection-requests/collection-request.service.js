@@ -34,7 +34,7 @@ const { horasReloj }                                = require('./collection-requ
 const { conTransaccion }                            = require('../../shared/utils/mongo-tx');
 const { extractReceiptData, findMatchingMovements } = require('./receipt.service');
 const driveComprobantes                  = require('./drive-comprobantes.service');
-const { NotFoundError, BadRequestError } = require('../../shared/errors/AppError');
+const { NotFoundError, BadRequestError, ForbiddenError } = require('../../shared/errors/AppError');
 const { emitToAll, emitToBanco }         = require('../../shared/socket');
 const { logger }                         = require('../../shared/utils/logger');
 
@@ -348,17 +348,22 @@ function _buildBusquedaFilter({ search, fechaInicio, fechaFin }) {
   return filter;
 }
 
-async function list(filters) {
+// `forceStatus` (2026-09-15, permiso collections:read:identificadas): cuando el usuario
+// NO tiene collections:write y sí tiene el nuevo permiso, la ruta resuelve
+// forceStatus='identificada' y lo manda acá — SIEMPRE gana sobre `filters.status`, para
+// que no alcance con mandar `?status=pendiente` a mano para saltarse la restricción.
+async function list(filters, { forceStatus } = {}) {
   const { page = 1, limit = 50, status, search, fechaInicio, fechaFin } = filters;
   const filter = _buildBusquedaFilter({ search, fechaInicio, fechaFin });
-  if (status) filter.status = status;
+  const statusEfectivo = forceStatus || status;
+  if (statusEfectivo) filter.status = statusEfectivo;
 
   // Pendientes: más antigua primero — se atiende en el orden en que llegó (decisión
   // del usuario 2026-07-24). Identificadas/rechazadas/canceladas (2026-08-04, a pedido
   // del usuario): más reciente primero — son historial ya resuelto, lo último resuelto
   // es lo que interesa ver arriba. `status` siempre viaja como un único valor (el tab
   // activo, ver collection-request.component.ts#reload) — nunca una lista combinada acá.
-  const ordenAscendente = !status || status === 'pendiente';
+  const ordenAscendente = !statusEfectivo || statusEfectivo === 'pendiente';
   const skip = (parseInt(page) - 1) * parseInt(limit);
   const [data, total] = await Promise.all([
     // NO tocar listMine() (abajo, historial personal del solicitante en /mias) — sigue
@@ -457,13 +462,20 @@ async function statsMine(userId) {
   return _stats({ solicitanteUserId: userId });
 }
 
-async function getById(id) {
+// `forceStatus` (2026-09-15, ver nota en list()): un usuario restringido a
+// collections:read:identificadas no puede ver el detalle de una solicitud puntual que no
+// esté en ese status, aunque conozca/adivine su _id — ocultarla de la bandeja pero
+// dejarla accesible por id sería el mismo hueco que ya se cerró en otros dominios (ver
+// GET /cuenta-por-serie-folio, banks:erp:read). ForbiddenError (403), no NotFoundError
+// (404) — el registro SÍ existe, el usuario no tiene permiso para verlo.
+async function getById(id, { forceStatus } = {}) {
   const cr = await CollectionRequest.findById(id)
     .select('-comprobante.data')
     .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
+  if (forceStatus && cr.status !== forceStatus) throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
   return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: _tieneAlgunComprobante(cr) } };
 }
 
@@ -533,13 +545,16 @@ async function getByErpId(solicitudIdErp) {
 // `index` selecciona CUÁL comprobante de la lista unificada (legacy Mongo +
 // Drive) — por default el primero, que sigue funcionando igual que antes para
 // las solicitudes viejas de un solo comprobante.
-async function getComprobante(id, index = 0) {
+async function getComprobante(id, index = 0, { forceStatus } = {}) {
   // Sin .lean(): con lean() Mongoose no castea el campo Buffer legacy y regresa
   // el tipo BSON crudo (Binary), que Express NO sabe enviar como binario
   // (res.send lo trata como objeto plano y lo serializa mal) — hay que dejar
   // que Mongoose haga el cast normal a Buffer real.
-  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes');
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes status');
   if (!cr) throw new NotFoundError('Solicitud');
+  // Ver nota de getById() — mismo criterio, un usuario restringido no puede bajar el
+  // comprobante de una solicitud fuera de su status permitido.
+  if (forceStatus && cr.status !== forceStatus) throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
 
   const item = _comprobantesUnificados(cr)[index];
   if (!item) throw new NotFoundError('Comprobante');
@@ -556,9 +571,11 @@ async function getComprobante(id, index = 0) {
 // forma INDEPENDIENTE (nunca se combinan candidatos entre archivos — cada uno
 // puede corresponder a un depósito bancario distinto), y se regresa un
 // resultado por comprobante para que la búsqueda ayude a ubicar cada depósito.
-async function analyzeStoredComprobantes(id) {
-  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes');
+async function analyzeStoredComprobantes(id, { forceStatus } = {}) {
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes status');
   if (!cr) throw new NotFoundError('Solicitud');
+  // Ver nota de getById() — mismo criterio.
+  if (forceStatus && cr.status !== forceStatus) throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
 
   const lista = _comprobantesUnificados(cr);
   if (lista.length === 0) throw new NotFoundError('Comprobante');

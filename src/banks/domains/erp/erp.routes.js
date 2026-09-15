@@ -397,12 +397,12 @@ router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMIS
 // GET /api/erp/netpay/transacciones — Fase 1 de la sección Netpay: consulta en vivo
 // (sin persistencia) de transacciones vía GET /transactions/search de Kore (dominio
 // DISTINTO de transferencias entre cajas — NO confundir con /transferencias/reportes/buscar
-// de arriba). Filtros manuales por ahora (responseCode, almacenes CSV); más filtros y
-// cualquier matching contra BankMovement quedan para una siguiente iteración. Permiso
-// propio banks:netpay, admin-only por ahora — mismo criterio que transferencias-caja.
+// de arriba). Filtros manuales por ahora (responseCode, almacenes CSV, terminalID); más
+// filtros y cualquier matching contra BankMovement quedan para una siguiente iteración.
+// Permiso propio banks:netpay, admin-only por ahora — mismo criterio que transferencias-caja.
 router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { responseCode, almacenes, dateFrom, dateTo } = req.query;
-  const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo });
+  const { responseCode, almacenes, dateFrom, dateTo, terminalID } = req.query;
+  const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo, terminalID });
   res.json(resultado);
 }));
 

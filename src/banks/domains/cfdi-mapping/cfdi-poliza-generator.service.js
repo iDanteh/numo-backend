@@ -2741,14 +2741,32 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
     if (key) foliosFacturaReferenciados.add(key);
   }
   const diaCfdiPorFolioFactura = new Map();
+  // Facturas PPD referenciadas — su cobro NUNCA es responsabilidad de este
+  // mecanismo (2026-09-15, caso real CEDIS 12-sep, depósito 046510: 3
+  // facturas PPD timbradas en junio/julio, cobradas por CFDI de Pago real
+  // el 12-sep — Cobranza ya las procesa correctamente, con cuenta bancaria
+  // real resuelta). El chequeo de tolerancia de abajo (`diaCfdiPorFolioFactura`
+  // + `TOLERANCIA_DIAS_FACTURACION_DIFERIDA`) solo cubre el caso PUE de
+  // "factura timbrada 1 día después del cobro" — para PPD, el cobro puede
+  // caer semanas o meses después de la factura sin que eso signifique que
+  // "no tiene factura": ya tiene, y su cierre es 100% de Cobranza (CFDI de
+  // Pago), nunca de este consolidado. Sin este guard, cualquier pago PPD
+  // fuera de la ventana de 0-1 día se duplicaba aquí como "COBRO-SIN-FACTURA"
+  // además de la línea correcta que ya genera Cobranza — mismo dinero
+  // contado dos veces. Ver docstring del archivo: "los cobros de facturas
+  // viejas (varios días/semanas antes, cobranza de crédito) siguen excluidos
+  // de este mecanismo, esos los maneja Cobranza" — la intención ya estaba
+  // documentada, pero nunca se implementó.
+  const facturasPPD = new Set();
   if (foliosFacturaReferenciados.size) {
     const orConditions = [...foliosFacturaReferenciados].map(k => {
       const [serie, folio] = k.split('|');
       return { serie, folio };
     });
-    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha').lean();
+    const cfdisReferenciados = await CFDI.find({ $or: orConditions }).select('serie folio fecha metodoPago').lean();
     for (const c of cfdisReferenciados) {
       const key = `${c.serie}|${c.folio}`;
+      if (c.metodoPago === 'PPD') facturasPPD.add(key);
       const dia = _diaMx(c.fecha);
       // Si hay varios CFDIs con el mismo serie/folio (visto en producción,
       // registros duplicados), se queda con la fecha MÁS TEMPRANA — es la
@@ -2783,6 +2801,9 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
 
       if (facturaKey) {
+        // PPD: su cobro es de Cobranza (CFDI de Pago), sin importar cuánto
+        // tiempo pasó desde la factura — ver docstring de `facturasPPD` arriba.
+        if (facturasPPD.has(facturaKey)) continue;
         const diaCfdi = diaCfdiPorFolioFactura.get(facturaKey);
         // CFDI existe Y su fecha está dentro de tolerancia del cobro → el
         // pipeline normal por CFDI ya lo cubre (o lo cubrirá) — no duplicar.

@@ -4098,6 +4098,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // resolver su folio ni prorratear el monto entre ambos anticipos — por
     // ahora solo se refleja el/los que sí resuelven.
     let anticipoFolioRefProp = null;
+    // Declarado fuera del `if` (bug real 2026-09-15, ReferenceError en
+    // producción): se usa más abajo, fuera de este bloque, al armar el
+    // desglose por anticipo del cierre OPA.
+    const anticiposResueltosProp = [];
     const _califica07Prop = cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo;
     if (_califica07Prop) {
       // Solo los folios que SÍ resuelven se concatenan ("OPA-00763-00665");
@@ -4127,7 +4131,6 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // `montoAnticipoConsumidoProp` por anticipo en vez de una sola línea
       // combinada. Con 0 o 1 anticipo resuelto (o si algún `total` no está
       // disponible) se cae al comportamiento combinado de siempre.
-      const anticiposResueltosProp = [];
       let faltaAlgunoProp = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;
@@ -5824,6 +5827,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // la primera. Mejora pendiente: si alguna relacionada no tiene su CFDI
     // sincronizado en Mongo, esa no se puede resolver ni prorratear.
     let anticipoFolioRefGuard = null;
+    // Declarado fuera del `if` (bug real 2026-09-15, ReferenceError en
+    // producción) — ver comentario equivalente en generarPropuesta.
+    const anticiposResueltosGuard = [];
     const _califica07Guard = cfdi.tipoDeComprobante === 'I' && !rule?.cuentaIvaAnticipo;
     if (_califica07Guard) {
       // Ver comentario equivalente en generarPropuesta: el "-" colgante de las
@@ -5832,9 +5838,6 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // recorren TODOS los uuids de cada relación (no solo el primero que
       // "resuelva" algo) — bug real 2026-08-31, caso MONSAN B0-260801098.
       const foliosResueltosGuard = [];
-      // Desglose por anticipo individual — ver comentario equivalente en
-      // generarPropuesta (`anticiposResueltosProp`).
-      const anticiposResueltosGuard = [];
       let faltaAlgunoGuard = false;
       for (const rel of (cfdi.cfdiRelacionados ?? [])) {
         if (rel.tipoRelacion !== '07') continue;

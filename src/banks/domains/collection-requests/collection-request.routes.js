@@ -5,8 +5,28 @@ const multer  = require('multer');
 const { authenticate, permit }    = require('../../shared/middleware/auth.real');
 const { asyncHandler }            = require('../../shared/middleware/error-handler');
 const { verifyKoreApiKey }        = require('../../../shared/middleware/kore-api-key-auth');
+const { PERMISSIONS }             = require('../../../shared/config/rbac');
+const rbacStore                   = require('../../../shared/services/rbac-store');
+const { ForbiddenError }          = require('../../shared/errors/AppError');
 const service                     = require('./collection-request.service');
 const indicadoresService          = require('./collection-request-indicadores.service');
+
+// Resuelve el `forceStatus` a pasarle al service para las rutas de Solicitudes de Cobro
+// que muestran datos de una solicitud puntual (bandeja, detalle, comprobantes) — 2026-09-15,
+// permiso collections:read:identificadas. Todas estas rutas ya exigen collections:read
+// (permit(), antes de llegar acá); esto decide CUÁNTO ve dentro de ese universo:
+//   - collections:write → null (acceso completo, todos los status — comportamiento de siempre).
+//   - collections:read:identificadas (sin write) → 'identificada' (fuerza el filtro,
+//     ignora lo que pida la query/el id).
+//   - ninguno de los dos → 403 (el rol solo tiene collections:read "pelado", que hoy
+//     nadie usa contra estas rutas — Tienda, el único rol así, usa /mias).
+async function _resolverForceStatus(user) {
+  const tieneAccesoCompleto = await rbacStore.hasPermission(user.role, PERMISSIONS.COLLECTIONS_WRITE, user.extraPermissions);
+  if (tieneAccesoCompleto) return null;
+  const soloIdentificadas = await rbacStore.hasPermission(user.role, PERMISSIONS.COLLECTIONS_READ_IDENTIFICADAS, user.extraPermissions);
+  if (soloIdentificadas) return 'identificada';
+  throw new ForbiddenError('No tenés permiso suficiente para ver solicitudes de cobro.');
+}
 
 const router = express.Router();
 
@@ -130,18 +150,21 @@ router.post('/erp/:solicitudIdErp/cancelar', verifyKoreApiKey, asyncHandler(asyn
 
 // GET /api/collection-requests — bandeja para revisión (cobranza/contabilidad/admin)
 router.get('/', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  res.json(await service.list(req.query));
+  const forceStatus = await _resolverForceStatus(req.user);
+  res.json(await service.list(req.query, { forceStatus }));
 }));
 
 // GET /api/collection-requests/:id
 router.get('/:id', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  res.json(await service.getById(req.params.id));
+  const forceStatus = await _resolverForceStatus(req.user);
+  res.json(await service.getById(req.params.id, { forceStatus }));
 }));
 
 // GET /api/collection-requests/:id/comprobante — imagen/PDF del PRIMER
 // comprobante (compat con solicitudes de un solo archivo, viejas o nuevas).
 router.get('/:id/comprobante', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  const { data, mimetype, originalName } = await service.getComprobante(req.params.id, 0);
+  const forceStatus = await _resolverForceStatus(req.user);
+  const { data, mimetype, originalName } = await service.getComprobante(req.params.id, 0, { forceStatus });
   res.set('Content-Type', mimetype || 'application/octet-stream');
   res.set('Content-Disposition', `inline; filename="${originalName || 'comprobante'}"`);
   res.send(data);
@@ -151,7 +174,8 @@ router.get('/:id/comprobante', authenticate, permit('collections:read'), asyncHa
 // comprobante en esa posición (0-based) — para solicitudes con varios.
 // Proxy autenticado: el archivo vive en Drive, nunca se expone un link público.
 router.get('/:id/comprobantes/:index', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  const { data, mimetype, originalName } = await service.getComprobante(req.params.id, parseInt(req.params.index, 10) || 0);
+  const forceStatus = await _resolverForceStatus(req.user);
+  const { data, mimetype, originalName } = await service.getComprobante(req.params.id, parseInt(req.params.index, 10) || 0, { forceStatus });
   res.set('Content-Type', mimetype || 'application/octet-stream');
   res.set('Content-Disposition', `inline; filename="${originalName || 'comprobante'}"`);
   res.send(data);
@@ -162,7 +186,8 @@ router.get('/:id/comprobantes/:index', authenticate, permit('collections:read'),
 // subir los archivos) — regresa un resultado por comprobante, nunca combinados,
 // para ayudar a ubicar el movimiento bancario correspondiente a cada uno.
 router.get('/:id/analyze-comprobante', authenticate, permit('collections:read'), asyncHandler(async (req, res) => {
-  res.json(await service.analyzeStoredComprobantes(req.params.id));
+  const forceStatus = await _resolverForceStatus(req.user);
+  res.json(await service.analyzeStoredComprobantes(req.params.id, { forceStatus }));
 }));
 
 // PATCH /api/collection-requests/:id/identificar — vincula la solicitud a uno o

@@ -57,6 +57,7 @@ const PERM_META = {
   'polizas:admin':      { label: 'Administrar pólizas contabilizadas', module: 'Contabilidad' },
   'collections:read':   { label: 'Ver solicitudes de cobranza',     module: 'Cobranza' },
   'collections:write':  { label: 'Gestionar cobranza',              module: 'Cobranza' },
+  'collections:read:identificadas': { label: 'Ver solo solicitudes identificadas', module: 'Cobranza' },
   'erp:manage':         { label: 'Integración ERP',                 module: 'ERP' },
   'visor:read':         { label: 'Ver CFDIs',                       module: 'Visor' },
   'visor:write':        { label: 'Gestionar CFDIs',                 module: 'Visor' },

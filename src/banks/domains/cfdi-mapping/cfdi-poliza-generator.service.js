@@ -4518,7 +4518,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // "cargo antes que abono", mostrando el combo ANTES que el Ingreso de
       // la Factura Final.
       const uuidVentaProp = (cfdi.uuid || '').toUpperCase();
-      const esComboEspecialProp = anticiposResueltosProp.length > 1 && ventasConAnticipoRedirigido.has(uuidVentaProp);
+      // DESHABILITADO 2026-09-15 (caso real Ferrocarril F0-260900139/OPA-00908-
+      // 00909, confirmado con el usuario): este combo especial cargaba los
+      // anticipos "previos" (todos menos el último) a Devoluciones+IVA normal
+      // por su propio monto — nunca por el total de la Factura Final — así que
+      // NUNCA revertía el Ingreso/IVA normal completo de la venta cancelada
+      // (aquí: solo $1,659.08 de $11,613.40 quedaban revertidos, el resto se
+      // quedaba reconocido como ingreso real de una venta ya cancelada). El
+      // desglose individual por anticipo (OPA-00908/OPA-00909, ver
+      // `desglosePorAnticipoProp` más abajo) YA se genera sin este combo —
+      // pasa incondicional por el cierre normal. Lo único que hacía falta era
+      // que `_redirigirEgresoAnticipoSaldado` (el mecanismo de siempre, ya
+      // confirmado correcto para 1 anticipo) también se aplicara aquí — y ya
+      // lo hace en cuanto `esComboEspecialProp` es `false` (cae al `else if`
+      // de abajo). Verificado con datos reales: la póliza 706 de hoy (antes
+      // de este combo) ya mostraba el resultado correcto — desglose OPA-00908/
+      // OPA-00909 en el cierre + reversión completa (Devoluciones+IVA normal
+      // por el TOTAL + Abono Anticipos+IVA-anticipo por el TOTAL, restaurando
+      // AMBOS anticipos) — esto solo regresa a ese comportamiento.
+      const esComboEspecialProp = false && anticiposResueltosProp.length > 1 && ventasConAnticipoRedirigido.has(uuidVentaProp);
       if (esComboEspecialProp) {
         const previosProp = anticiposResueltosProp.slice(0, -1);
         const ultimoProp  = anticiposResueltosProp[anticiposResueltosProp.length - 1];
@@ -6162,7 +6180,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // (`ventasConComboEspecialAnticipoProp`). Prioridad sobre el desglose
       // por anticipo normal de abajo.
       const uuidVentaGuard = (cfdi.uuid || '').toUpperCase();
-      const esComboEspecialGuard = anticiposResueltosGuard.length > 1 && ventasConAnticipoRedirigidoGuard.has(uuidVentaGuard);
+      // DESHABILITADO 2026-09-15 — ver comentario equivalente en
+      // generarPropuesta (`esComboEspecialProp`).
+      const esComboEspecialGuard = false && anticiposResueltosGuard.length > 1 && ventasConAnticipoRedirigidoGuard.has(uuidVentaGuard);
       if (esComboEspecialGuard) {
         const previosGuard = anticiposResueltosGuard.slice(0, -1);
         const ultimoGuard  = anticiposResueltosGuard[anticiposResueltosGuard.length - 1];

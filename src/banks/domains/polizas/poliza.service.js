@@ -2593,30 +2593,23 @@ function _extraerCobrosSucursal(movimientos) {
   // orden en que llegaban los tickets (confirmado con el usuario 2026-08-05).
   filas.sort((a, b) => _categoriaCobroSucursal(a) - _categoriaCobroSucursal(b) || compararSerieFolio(a, b));
 
-  // Saldo a Favor por debajo de $50 va a una pestaña aparte "Otros Ingresos"
-  // en vez de la póliza (confirmado con el usuario 2026-08-07) — un SF de
-  // subtotal + IVA son 2 filas (2103090001 + 2104010002) con el MISMO
-  // `concepto` (cliente/serie-folio); se agrupan por ahí para decidir sobre
-  // el monto TOTAL de esa factura, no cada línea por separado (partirlas
-  // arbitrariamente entre las dos pestañas no tendría sentido).
-  const UMBRAL_SF_OTROS_INGRESOS = 50;
-  const totalPorConceptoSF = new Map();
-  for (const f of filas) {
-    if (f._formaPagoLabel !== ETIQUETA_SALDO_FAVOR) continue;
-    const monto = Number(f.debe) + Number(f.haber);
-    totalPorConceptoSF.set(f.concepto, (totalPorConceptoSF.get(f.concepto) ?? 0) + monto);
-  }
-  const filasOtrosIngresos = filas.filter(f =>
-    f._formaPagoLabel === ETIQUETA_SALDO_FAVOR && (totalPorConceptoSF.get(f.concepto) ?? 0) <= UMBRAL_SF_OTROS_INGRESOS,
-  );
-  // Columna "Motivo" — ver comentario equivalente en filasOtrosIngresosOcultos.
-  for (const f of filasOtrosIngresos) f.motivo = `Monto ≤ $${UMBRAL_SF_OTROS_INGRESOS}`;
-  if (filasOtrosIngresos.length) {
-    const idsOtrosIngresos = new Set(filasOtrosIngresos);
+  // Saldo a Favor USADO: sale por completo de "Cobro de otra sucursal" y va a
+  // su propia pestaña dedicada "Saldos a favor usados", SIN IMPORTAR EL MONTO
+  // (confirmado con el usuario 2026-09-15 — reemplaza el criterio anterior de
+  // 2026-08-07, que solo movía a "Otros Ingresos" los ≤$50 y dejaba el resto
+  // mezclado aquí). Un SF de subtotal + IVA son 2 filas (2103090001 +
+  // 2104010002) con el MISMO `concepto` (cliente/serie-folio).
+  const filasSaldoFavorUsado = filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR);
+  if (filasSaldoFavorUsado.length) {
+    const idsSaldoFavorUsado = new Set(filasSaldoFavorUsado);
     for (let i = filas.length - 1; i >= 0; i--) {
-      if (idsOtrosIngresos.has(filas[i])) filas.splice(i, 1);
+      if (idsSaldoFavorUsado.has(filas[i])) filas.splice(i, 1);
     }
   }
+  // "Otros Ingresos" ya no recibe Saldo a Favor usado (ver arriba) — se deja
+  // declarada vacía para que el SF-OCULTO (mismo día/almacén, más abajo) siga
+  // teniendo dónde caer, sin cambiar ese mecanismo.
+  const filasOtrosIngresos = [];
 
   // Columna C debe decir "Cobro de otra sucursal" en vez del serie-folio —
   // mismo patrón que Transferencia/Cheque individual (línea ~825): el
@@ -2693,7 +2686,19 @@ function _extraerCobrosSucursal(movimientos) {
   // nunca suman a depósitos consolidados de efectivo/tarjeta.
   if (filasOtrosIngresosOcultos.length) filasOtrosIngresos.push(...filasOtrosIngresosOcultos);
 
-  return { resto, filas, filasOtrosIngresos, filasTarjetaCobroSucursal };
+  // Limpieza de campos internos para `filasSaldoFavorUsado` — mismo criterio
+  // que el loop de `filas` de arriba, pero separado porque estas filas ya
+  // salieron de `filas` antes de que ese loop corriera.
+  for (const f of filasSaldoFavorUsado) {
+    f.serie = ETIQUETA_SALDO_FAVOR;
+    delete f._formaPagoLabel;
+    delete f._referenciaBancoReal;
+    delete f._esPendientePropio;
+    delete f._esVentaSinCobro;
+    delete f._cargoVentaYaEnConsolidado;
+  }
+
+  return { resto, filas, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal };
 }
 
 // Inyecta las filas de cobro-sucursal en el bloque correspondiente — PUE en
@@ -3201,7 +3206,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // Cobros de sucursal: se sacan ANTES del pipeline de Contado/Crédito (nunca
   // deben pasar por consolidarCargos) y se reinyectan ya armados una vez que
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
-  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(movimientos);
+  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(movimientos);
   movimientos = movimientosSinCobroSucursal;
 
   // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA
@@ -3435,19 +3440,21 @@ async function exportContpaqXlsx(id, overrides = {}) {
     for (const grupo of gruposOrdenados) {
       const bloquesGrupo = bloquesPorGrupo.get(grupo);
       if (bloquesGrupo.length === 0) continue;
-      // "Otros Ingresos" (SF ≤ $50) va solo en el archivo de Ventas — ahí es
-      // donde se inyectan los cobros de sucursal (_inyectarCobrosSucursal).
+      // "Otros Ingresos" y "Saldos a favor usados" van solo en el archivo de
+      // Ventas — ahí es donde se inyectan los cobros de sucursal
+      // (_inyectarCobrosSucursal).
       const otrosIngresosGrupo = grupo === 'Ventas' ? filasOtrosIngresos : [];
+      const saldoFavorUsadoGrupo = grupo === 'Ventas' ? filasSaldoFavorUsado : [];
       workbooks.push({
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo),
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo),
       });
     }
     return { poliza, workbooks };
   }
 
-  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos);
+  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado);
   return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
 }
 
@@ -3458,7 +3465,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = []) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = []) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -3689,9 +3696,11 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     wsDesglose.autoFilter = { from: 'A1', to: 'G1' };
   }
 
-  // Hoja "Otros Ingresos": Saldo a Favor de $50 o menos — no se contabilizan
-  // en la póliza (ver `_extraerCobrosSucursal`/UMBRAL_SF_OTROS_INGRESOS),
-  // solo quedan aquí como informativo (confirmado con el usuario 2026-08-07).
+  // Hoja "Otros Ingresos": desde 2026-09-15 solo trae SF-OCULTO (generado y
+  // usado el mismo día/almacén, ver `ETIQUETA_SALDO_FAVOR_OCULTO`) — el SF
+  // usado normal (sin importar el monto) se movió por completo a su propia
+  // pestaña "Saldos a favor usados" (ver más abajo), reemplazando el criterio
+  // anterior de 2026-08-07 que solo movía aquí los ≤$50.
   if (filasOtrosIngresos.length > 0) {
     const wsOtrosIngresos = workbook.addWorksheet('Otros Ingresos');
     wsOtrosIngresos.columns = [
@@ -3716,6 +3725,34 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       row.getCell('monto').numFmt = '#,##0.00';
     }
     wsOtrosIngresos.autoFilter = { from: 'A1', to: 'E1' };
+  }
+
+  // Hoja "Saldos a favor usados": TODO el Saldo a Favor aplicado a una venta
+  // (sin importar el monto, confirmado con el usuario 2026-09-15) — sale por
+  // completo de "Cobro de otra sucursal" y de "Otros Ingresos" (donde antes
+  // solo aparecían los ≤$50) y se concentra únicamente aquí.
+  if (filasSaldoFavorUsado.length > 0) {
+    const wsSaldoFavorUsado = workbook.addWorksheet('Saldos a favor usados');
+    wsSaldoFavorUsado.columns = [
+      { header: 'Cuenta',        key: 'cuenta',      width: 14 },
+      { header: 'Sucursal',      key: 'centroCosto', width: 12 },
+      { header: 'Cliente / Serie-Folio', key: 'concepto', width: 40 },
+      { header: 'Monto',         key: 'monto',       width: 16 },
+    ];
+    wsSaldoFavorUsado.getRow(1).font = { bold: true };
+    wsSaldoFavorUsado.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    });
+    for (const f of filasSaldoFavorUsado) {
+      const row = wsSaldoFavorUsado.addRow({
+        cuenta:      f.cuenta?.codigo ?? '',
+        centroCosto: f.centroCosto ?? '',
+        concepto:    f.concepto ?? '',
+        monto:       Number(f.debe) || Number(f.haber) || 0,
+      });
+      row.getCell('monto').numFmt = '#,##0.00';
+    }
+    wsSaldoFavorUsado.autoFilter = { from: 'A1', to: 'D1' };
   }
 
   // Hoja de CFDIs sustitutos (tipoRelacion='04') excluidos automáticamente al

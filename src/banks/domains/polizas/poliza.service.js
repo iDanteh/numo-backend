@@ -101,15 +101,32 @@ const CUENTA_NETPAY_IVA_ACREDITABLE     = '1107010001'; // IVA ya acreditado/pag
  * folioVenta 260702455 → folioFactura 260701106) y "034315" ($5,462.21,
  * folioVenta 260702612 → folioFactura 260701171).
  *
+ * Desambiguación por fecha (2026-09-15, caso real CEDIS 12-sep, ticket
+ * A0-260704683): el fallback por `serie+folioExterno` matchea por TICKET, y
+ * una venta PPD pagada en varias parcialidades de Transferencia puede tener
+ * 2+ `BankMovement` distintos ligados al mismo ticket en fechas muy
+ * distintas (ahí, $500 el 31-ago y $500 el 3-sep, para un ticket cuyo cierre
+ * real fue hasta el 12-sep). Antes se quedaba con el PRIMERO que Mongo
+ * regresara (sin orden garantizado) y ya nunca lo soltaba — podía pegar el
+ * depósito de OTRO día/abono al día que se está exportando. Con
+ * `fechaReferencia` (la fecha de la póliza) disponible, se prefiere el
+ * candidato cuya `BankMovement.fecha` quede más cerca de esa fecha. Sin
+ * `fechaReferencia` (callers que no la pasan), se conserva el criterio
+ * anterior — sin regresión.
+ *
  * @param {{cfdiUuid: string, serie: string}[]} movimientos
  * @param {string} rfc
+ * @param {Date|string|null} [fechaReferencia] - Fecha de la póliza que se está
+ *   generando/exportando — usada para elegir, entre varios depósitos reales
+ *   ligados al mismo ticket, el más cercano a ese día.
  * @returns {Promise<Map<string, {esTransferencia: boolean, referencia: string|null, cuentaBanco: {id:number,codigo:string,nombre:string}|null}>>}
  *   uuid (mayúsculas) → info bancaria. `cuentaBanco`: cuenta real del banco
  *   donde cayó el depósito (ver `BANCO_A_CODIGO_CUENTA`) — null cuando el
  *   banco no tiene cuenta dedicada en el catálogo, o no se pudo determinar.
  */
-async function construirVerdadBancaria(movimientos, rfc) {
+async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null) {
   const mapa = new Map();
+  const fechaRefMs = fechaReferencia ? new Date(fechaReferencia).getTime() : null;
   const uuidsUnicos = [...new Set(movimientos.map(m => m.cfdiUuid).filter(Boolean).map(u => u.toUpperCase()))];
   if (uuidsUnicos.length === 0) return mapa;
 
@@ -139,13 +156,13 @@ async function construirVerdadBancaria(movimientos, rfc) {
   const condicionFolioFiscal = { 'erpLinks.folioFiscal': { $in: uuidsUnicos.map(u => new RegExp(`^${u}$`, 'i')) } };
   movs.push(...await BankMovement.find(
     condicionFolioFiscal,
-    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
+    { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1, fecha: 1 },
   ).lean());
   for (let i = 0; i < paresSerieFolio.length; i += LOTE) {
     const lote = paresSerieFolio.slice(i, i + LOTE);
     movs.push(...await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1 },
+      { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1, fecha: 1 },
     ).lean());
   }
 
@@ -198,6 +215,12 @@ async function construirVerdadBancaria(movimientos, rfc) {
     // desbalanceado contra el Abono/IVA en ese caso (mismo criterio que
     // otros "ruido" de reclasificación ya tolerados en el export).
     const montoBancoReal = typeof m.deposito === 'number' ? m.deposito : null;
+    // Distancia (en días) entre el depósito real y el día de la póliza que se
+    // está generando — ver docstring de la función. `null` cuando no hay
+    // `fechaReferencia` (comportamiento previo) o el movimiento no trae fecha.
+    const distanciaDias = (fechaRefMs != null && m.fecha)
+      ? Math.abs(new Date(m.fecha).getTime() - fechaRefMs) / 86400000
+      : null;
 
     for (const link of (m.erpLinks ?? [])) {
       const folioFiscalUpper = (link.folioFiscal || '').toUpperCase();
@@ -208,11 +231,32 @@ async function construirVerdadBancaria(movimientos, rfc) {
         ? folioFiscalUpper
         : (link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
       if (!uuidResuelto) continue;
-      // Un mismo CFDI puede tener varios movimientos ligados (varias
-      // parcialidades) — si alguno confirma transferencia, esa gana.
+      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, _distanciaDias: distanciaDias };
       const actual = mapa.get(uuidResuelto);
-      if (!actual || (!actual.esTransferencia && esTransferencia)) {
-        mapa.set(uuidResuelto, { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal });
+      if (!actual) {
+        mapa.set(uuidResuelto, candidato);
+        continue;
+      }
+      // Con `fechaReferencia`: entre 2+ depósitos ligados al mismo ticket
+      // (venta PPD pagada en varias parcialidades en fechas distintas), gana
+      // el más cercano al día de la póliza — nunca el primero que haya
+      // regresado Mongo. Transferencia confirmada sigue pesando más que la
+      // cercanía de fecha (un candidato que SÍ confirma transferencia gana
+      // sobre uno que no, sin importar la fecha).
+      if (distanciaDias != null) {
+        if (esTransferencia && !actual.esTransferencia) {
+          mapa.set(uuidResuelto, candidato);
+        } else if (esTransferencia === actual.esTransferencia
+          && (actual._distanciaDias == null || distanciaDias < actual._distanciaDias)) {
+          mapa.set(uuidResuelto, candidato);
+        }
+        continue;
+      }
+      // Sin `fechaReferencia` (caller que no la pasa): criterio original — un
+      // mismo CFDI puede tener varios movimientos ligados (varias
+      // parcialidades) — si alguno confirma transferencia, esa gana.
+      if (!actual.esTransferencia && esTransferencia) {
+        mapa.set(uuidResuelto, candidato);
       }
     }
   }
@@ -841,6 +885,7 @@ async function _resolverCuentasBancoReal(poliza) {
   const verdadBancaria = await construirVerdadBancaria(
     poliza.movimientos.map(m => ({ cfdiUuid: m.cfdiUuid, serie: m.serie })),
     poliza.rfc,
+    poliza.fecha,
   );
   if (verdadBancaria.size === 0) return [];
 
@@ -3178,7 +3223,11 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // original, no al del Pago que la liquida (confirmado con datos reales
   // 2026-09-01, ver diag-bancario-pago.js). Para Ingreso `facturaUuid` nunca
   // se llena, así que este cambio no afecta ese flujo.
-  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })));
+  // `fechaFinal` (el día de esta póliza) se pasa para desambiguar cuando el
+  // mismo ticket/factura tiene 2+ depósitos reales ligados en fechas
+  // distintas (ver docstring de `construirVerdadBancaria`, caso real CEDIS
+  // 12-sep).
+  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal);
   // "Depósitos consolidados (Efectivo)"/"(Tarjeta)" — confirmado con el
   // usuario 2026-09-10: para TODAS las sucursales, ambos van a la cuenta
   // bancaria real 1102011001 (BBVA) en vez de las genéricas Caja/Bancos por
@@ -3834,6 +3883,46 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       row.getCell('monto').numFmt = '#,##0.00';
     }
     wsPorFacturar.autoFilter = { from: 'A1', to: 'I1' };
+  }
+
+  // Hoja de saldo a favor aplicado a una venta que sigue PPD/POR FACTURAR en
+  // Kore (2026-09-11, caso real CATEDRAL RESTAURANTE BAR, confirmado con el
+  // usuario) — informativo, NUNCA se contabilizó en esta póliza (mismo
+  // criterio que "Pendientes Por Facturar") — ver
+  // `_prefetchAjustesFacturaPropia` (cfdi-poliza-generator.service.js).
+  if (poliza.movimientosPpdPorFacturar?.length > 0) {
+    const wsPpd = workbook.addWorksheet('Movimientos PPD por facturar');
+    wsPpd.columns = [
+      { header: 'Cliente',              key: 'nombreCliente',    width: 28 },
+      { header: 'Serie',                key: 'serie',            width: 8 },
+      { header: 'Folio venta',          key: 'folio',            width: 16 },
+      { header: 'Monto SF aplicado',    key: 'montoSFAplicado',  width: 18 },
+      { header: 'Total de la venta',    key: 'totalVenta',       width: 18 },
+      { header: 'Fecha de la venta',    key: 'fechaVenta',       width: 16 },
+      { header: 'Fecha de aplicación',  key: 'fechaAplicacion',  width: 16 },
+      { header: 'Origen del saldo',     key: 'origenSaldo',      width: 20 },
+    ];
+    wsPpd.getRow(1).font = { bold: true };
+    wsPpd.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFE699' } };
+    });
+    for (const p of poliza.movimientosPpdPorFacturar) {
+      const row = wsPpd.addRow({
+        nombreCliente:   p.nombreCliente ?? 'CLIENTE NO IDENTIFICADO',
+        serie:           p.serie,
+        folio:           p.folio,
+        montoSFAplicado: p.montoSFAplicado,
+        totalVenta:      p.totalVenta,
+        fechaVenta:      p.fechaVenta ? new Date(p.fechaVenta) : null,
+        fechaAplicacion: p.fechaAplicacion ? new Date(p.fechaAplicacion) : null,
+        origenSaldo:     p.origenSaldo,
+      });
+      if (row.getCell('fechaVenta').value) row.getCell('fechaVenta').numFmt = 'm/d/yy hh:mm';
+      if (row.getCell('fechaAplicacion').value) row.getCell('fechaAplicacion').numFmt = 'm/d/yy hh:mm';
+      row.getCell('montoSFAplicado').numFmt = '#,##0.00';
+      if (row.getCell('totalVenta').value != null) row.getCell('totalVenta').numFmt = '#,##0.00';
+    }
+    wsPpd.autoFilter = { from: 'A1', to: 'H1' };
   }
 
   return workbook;

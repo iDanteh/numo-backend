@@ -2816,11 +2816,13 @@ function bloquesAjustesContado(movs) {
 
   const grupos = ordenCfdi.map(key => {
     const { categoria, movs: grupo } = porCfdi.get(key);
-    // Anticipo (recepción o aplicación/cierre) siempre lleva subcódigo 22,
-    // sin importar cómo se cobró — confirmado con el usuario. Antes esta
-    // función solo etiquetaba `_categoria: 'anticipo'` sin asignar el
-    // subcódigo, cayendo al 0 por defecto en la hoja de CONTPAQ.
-    const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
+    // Anticipo: el subcódigo 22 es SOLO para la recepción (reglaNombre de la
+    // propia regla fiscal, ej. "Anticipo") — la aplicación/cierre (OPA/
+    // OPA-REVERSION, ver `REGLAS_MEZCLADAS_CON_VENTAS`) NO debe llevarlo
+    // (corregido 2026-09-15, confirmado con el usuario: antes ambas
+    // situaciones llevaban 22 por igual).
+    const esAplicacionAnticipo = categoria === 'anticipo' && grupo.some(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    const extra = categoria === 'anticipo' && !esAplicacionAnticipo ? { _subcodigo: 22 } : {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     // Bonificación (genérica, no Club Tuberos): SIEMPRE solo sus Cargos
     // (Bonificación+IVA), nunca su Abono — mismo criterio que ya existía
@@ -3045,10 +3047,10 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
     // real en banco o saldo a favor) — confirmado con el usuario 2026-07-23.
     // Dentro de cada lado, la cuenta de Ingresos/Devoluciones va antes que la
     // de IVA (`conImpuestoAlFinal`).
-    // Anticipo siempre lleva subcódigo 22, sin importar cómo se cobró —
-    // mismo fix que en `bloquesAjustesContado` (Contado); antes solo se
-    // etiquetaba `_categoria: 'anticipo'` sin asignar el subcódigo.
-    const extra = categoria === 'anticipo' ? { _subcodigo: 22 } : {};
+    // Anticipo: subcódigo 22 solo en la recepción, no en la aplicación/cierre
+    // — mismo fix que en `bloquesAjustesContado` (Contado, 2026-09-15).
+    const esAplicacionAnticipo = categoria === 'anticipo' && grupo.some(m => REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre));
+    const extra = categoria === 'anticipo' && !esAplicacionAnticipo ? { _subcodigo: 22 } : {};
     const cargos = conImpuestoAlFinal(grupo.filter(m => Number(m.debe) > 0)).map(m => ({ ...m, _categoria: categoria, ...extra }));
     const abonosCandidatos = grupo.filter(m => !(Number(m.debe) > 0));
     const abonos = conImpuestoAlFinal(abonosCandidatos).map(m => ({ ...m, _categoria: categoria, ...extra }));

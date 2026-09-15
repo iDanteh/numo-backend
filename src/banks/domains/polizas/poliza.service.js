@@ -2614,8 +2614,13 @@ function _extraerCobrosSucursal(movimientos) {
       const _keyCargoPar = m.cfdiUuid ? `uuid:${m.cfdiUuid}` : `ck:${m.concepto || ''}|${Number(m.debe).toFixed(2)}`;
       if (_cobroSucursalHaberKeys.has(_keyCargoPar)) continue;
     }
-    if (m.reglaNombre === ETIQUETA_SALDO_FAVOR_OCULTO || m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
-      || m.reglaNombre === ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR) {
+    // SF-OCULTO (2026-09-15, confirmado con el usuario): YA NO se oculta en
+    // "Otros Ingresos" — sigue siendo Saldo a Favor USADO (aunque el mismo
+    // día/almacén), así que debe verse en "Saldos a favor usados" como
+    // cualquier otro SF usado (más abajo, vía `_formaPagoLabel`). "Otros
+    // Ingresos" queda reservada solo para SF vivo/sin usar <$50
+    // (`ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR`) y COBRO-DIA-REAL.
+    if (m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO || m.reglaNombre === ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR) {
       filasOtrosIngresosOcultos.push({
         cuenta:      m.cuenta,
         centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
@@ -2627,9 +2632,7 @@ function _extraerCobrosSucursal(movimientos) {
         // antes se mezclaban sin forma de saber cuál era cuál en el Excel.
         motivo:      m.reglaNombre === ETIQUETA_COBRO_YA_CONTABILIZADO
           ? 'Oculto — cobro real ya contabilizado el día real del cobro'
-          : m.reglaNombre === ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
-            ? 'Saldo a favor generado, sin usar, menor a $50'
-            : 'Oculto — generado y usado el mismo día/almacén',
+          : 'Saldo a favor generado, sin usar, menor a $50',
       });
       continue;
     }
@@ -2702,7 +2705,10 @@ function _extraerCobrosSucursal(movimientos) {
   // 2026-08-07, que solo movía a "Otros Ingresos" los ≤$50 y dejaba el resto
   // mezclado aquí). Un SF de subtotal + IVA son 2 filas (2103090001 +
   // 2104010002) con el MISMO `concepto` (cliente/serie-folio).
-  const filasSaldoFavorUsado = filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR);
+  // Incluye SF-OCULTO (2026-09-15, ver comentario en el loop de arriba) —
+  // sigue siendo SF usado, solo que el mismo día/almacén; ya no se oculta en
+  // "Otros Ingresos", se ve aquí como cualquier otro SF usado.
+  const filasSaldoFavorUsado = filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_SALDO_FAVOR_OCULTO);
   if (filasSaldoFavorUsado.length) {
     const idsSaldoFavorUsado = new Set(filasSaldoFavorUsado);
     for (let i = filas.length - 1; i >= 0; i--) {
@@ -2710,8 +2716,8 @@ function _extraerCobrosSucursal(movimientos) {
     }
   }
   // "Otros Ingresos" ya no recibe Saldo a Favor usado (ver arriba) — se deja
-  // declarada vacía para que el SF-OCULTO (mismo día/almacén, más abajo) siga
-  // teniendo dónde caer, sin cambiar ese mecanismo.
+  // declarada vacía; solo se llena más abajo con COBRO-DIA-REAL y SF vivo <$50
+  // (`filasOtrosIngresosOcultos`).
   const filasOtrosIngresos = [];
 
   // Columna C debe decir "Cobro de otra sucursal" en vez del serie-folio —

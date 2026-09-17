@@ -257,6 +257,17 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
 // ver comentario ahí sobre "DEPOSITO").
 const _CATEGORIAS_TRANSFERENCIA = ['SPEI', 'TRASPASO', 'DEPOSITO'];
 
+// Nombres de forma de pago de Kore (`desglosePorFormaPago[].formaPagoDescripcion`)
+// que representan dinero bancario real — mismo criterio que `_esFormaPagoBancariaKore`
+// en erp.routes.js (no se importa de ahí para no acoplar un módulo de pólizas a un
+// archivo de rutas; es la misma regla de negocio, duplicada a propósito).
+function _esFormaPagoDescripcionBancaria(nombre) {
+  const norm = String(nombre ?? '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .trim().toUpperCase();
+  return norm === 'TRANSFERENCIA' || norm === 'CHEQUE' || /DEPOSITO.*EFECTIVO/.test(norm);
+}
+
 /**
  * Resuelve el depósito bancario REAL cruzando bank_movements por TICKET
  * individual (`erpLinks.serie`+`erpLinks.folioExterno`, el mismo criterio ya
@@ -307,6 +318,9 @@ async function construirBancoRealPorTicket(movimientos) {
     const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
       { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1 },
+      // `desglosePorFormaPago` viene DENTRO de cada `erpLinks[i]` — el `find`
+      // de arriba ya trae erpLinks completo (`erpLinks: 1`), así que no hace
+      // falta proyectarlo aparte.
     ).lean();
     for (const m of movs) {
       const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[m.banco];
@@ -357,9 +371,27 @@ async function construirBancoRealPorTicket(movimientos) {
         // link YA trae el monto exacto por ticket — usarlo hace que el match
         // por monto funcione como estaba pensado, sin tocar el caso de un
         // solo candidato (ahí `saldoPagadoTotal` == `deposito`, sin cambio).
-        const montoBancoReal = typeof link.saldoPagadoTotal === 'number'
-          ? link.saldoPagadoTotal
-          : (typeof m.deposito === 'number' ? m.deposito : null);
+        //
+        // BUG CORREGIDO 2026-09-17 (casos reales Ferrocarril F0-260900334 y
+        // F0-260900236, 3-sep): `saldoPagadoTotal` puede venir inflado por 2
+        // bugs distintos del motor de sync ERP↔Banco (uno ya corregido en
+        // erp.routes.js, otro pendiente por su riesgo de regresión —
+        // "cobro mixto banco+Saldo a Favor" cuenta el total combinado en vez
+        // de solo la porción bancaria). En vez de confiar en ese campo ya
+        // calculado, se prefiere reconstruir el monto bancario REAL sumando
+        // solo las entradas bancarias de `desglosePorFormaPago` (bitácora
+        // cruda de Kore, nunca tocada por esos bugs) — sin modificar ningún
+        // dato en Mongo, solo cómo se lee al exportar. Se cae a
+        // `saldoPagadoTotal`/`deposito` cuando el link no trae desglose
+        // (links viejos, anteriores a que este campo existiera).
+        const desgloseBancario = Array.isArray(link.desglosePorFormaPago)
+          ? link.desglosePorFormaPago.filter(d => _esFormaPagoDescripcionBancaria(d.formaPagoDescripcion))
+          : [];
+        const montoBancoReal = desgloseBancario.length
+          ? desgloseBancario.reduce((s, d) => s + (Number(d.monto) || 0), 0)
+          : (typeof link.saldoPagadoTotal === 'number'
+            ? link.saldoPagadoTotal
+            : (typeof m.deposito === 'number' ? m.deposito : null));
         if (!mapa.has(key)) mapa.set(key, []);
         mapa.get(key).push({ esTransferencia, categoriaConocida, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
       }

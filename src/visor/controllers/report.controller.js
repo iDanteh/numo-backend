@@ -1406,7 +1406,7 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
  * Construye el workbook de conciliación completa. Extraído de `conciliacionExcel`
  * para poder reutilizarse también desde el reporte de Cierre de Mes.
  */
-async function buildConciliacionWorkbook(query) {
+async function buildConciliacionWorkbook(query, existingWorkbook) {
   const { ejercicio, periodo, rfcEmisor } = query;
   const periodoFilter = {};
   if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
@@ -1598,7 +1598,7 @@ async function buildConciliacionWorkbook(query) {
   const MXN       = '"$"#,##0.00';
   const colLetter = (n) => n <= 26 ? String.fromCharCode(64 + n) : 'Z';
 
-  const workbook = new ExcelJS.Workbook();
+  const workbook = existingWorkbook || new ExcelJS.Workbook();
   workbook.creator = 'NUMO'; workbook.created = new Date();
 
   const addTitle = (sheet, title, ncols) => {
@@ -2362,11 +2362,28 @@ async function buildConciliacionWorkbook(query) {
  * instante en que se cierra el período.
  */
 async function buildCierreMesWorkbook(query) {
-  const [dashboardData, conc] = await Promise.all([
+  const { ejercicio, periodo } = query;
+  const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+  const periodoLabel = ejercicio ? (periodo ? `${MESES[parseInt(periodo) - 1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
+
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'NUMO'; workbook.created = new Date();
+
+  // La hoja de resumen se crea AQUÍ, antes de pedirle a buildConciliacionWorkbook
+  // que agregue las suyas al mismo workbook — así queda con sheetId=1 (primera
+  // pestaña) de forma natural. Antes se creaba al final y se forzaba a la
+  // posición 1 con `sheet.orderNo = -1`, pero el sheetId interno de ExcelJS
+  // (usado tal cual en el XML) sigue el orden de INSERCIÓN, no el de orderNo:
+  // eso dejaba sheetId="10,1,2,...,9" en workbook.xml — técnicamente válido
+  // para el esquema OOXML, pero Excel lo rechaza con "encontramos un problema
+  // con el contenido" al abrir (confirmado 2026-09-17, reproducido con datos
+  // reales y corregido con este reordenamiento).
+  const sheet = workbook.addWorksheet('0. Resumen Dashboard');
+
+  const [dashboardData] = await Promise.all([
     computeDashboardData(query),
-    buildConciliacionWorkbook(query),
+    buildConciliacionWorkbook(query, workbook),
   ]);
-  const { workbook, periodoLabel } = conc;
   const k = dashboardData.kpis;
 
   const FG_SECTION = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF334E68' } };
@@ -2382,8 +2399,6 @@ async function buildCierreMesWorkbook(query) {
   const MXN = '"$"#,##0.00';
   const round2 = (v) => v != null ? Math.round(v * 100) / 100 : null;
 
-  const sheet = workbook.addWorksheet('0. Resumen Dashboard');
-  sheet.orderNo = -1; // primera hoja del workbook, antes de la conciliación
   sheet.views = [{ state: 'frozen', ySplit: 2 }];
   sheet.columns = [
     { key: 'a', width: 34 },

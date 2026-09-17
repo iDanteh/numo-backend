@@ -2426,15 +2426,31 @@ async function buildCierreMesWorkbook(query) {
     sheet.getRow(r).height = 22;
   };
 
-  /** Fila con hasta 2 pares indicador/valor, en formato tarjeta. */
+  /**
+   * Fila con hasta 2 pares indicador/valor, en formato tarjeta.
+   * Firma: (label1, value1, fmt1, fill1, label2, value2, fmt2, fill2) — los
+   * 8 parámetros son posicionales y casi todos opcionales (pasar `null`), así
+   * que UN SOLO argumento faltante en una llamada desalinea todos los que le
+   * siguen. Un `kpiPair(...)` con un argumento de menos pasó un STRING como
+   * `fill1` (ExcelJS no valida el tipo — lo "registra" incrementando el
+   * conteo de fills en styles.xml sin escribir el `<fill>` real), y Excel
+   * detecta ese desfase como archivo dañado al abrirlo ("Hemos encontrado un
+   * problema con el contenido..."), confirmado 2026-09-17 con Excel real vía
+   * automatización COM/UI Automation. Si se agrega una llamada nueva, contar
+   * los 8 argumentos con cuidado.
+   */
   const kpiPair = (label1, value1, fmt1, fill1, label2, value2, fmt2, fill2) => {
     r++;
     const row = sheet.getRow(r);
     row.getCell('a').value = label1;
     row.getCell('a').font  = FONT_LABEL;
+    row.getCell('a').fill  = FG_KPI;
     row.getCell('b').value = value1;
     row.getCell('b').font  = FONT_VALUE;
+    row.getCell('b').fill  = fill1 || FG_KPI;
     if (fmt1) row.getCell('b').numFmt = fmt1;
+    row.getCell('c').fill = FG_KPI;
+    row.getCell('d').fill = fill2 || FG_KPI;
     if (label2 !== undefined) {
       row.getCell('c').value = label2;
       row.getCell('c').font  = FONT_LABEL;
@@ -2442,9 +2458,6 @@ async function buildCierreMesWorkbook(query) {
       row.getCell('d').font  = FONT_VALUE;
       if (fmt2) row.getCell('d').numFmt = fmt2;
     }
-    row.eachCell({ includeEmpty: true }, (cell) => { cell.fill = FG_KPI; });
-    if (fill1) row.getCell('b').fill = fill1;
-    if (fill2) row.getCell('d').fill = fill2;
     row.height = 19;
   };
 
@@ -2452,8 +2465,8 @@ async function buildCierreMesWorkbook(query) {
 
   // ══ Totales generales ══
   sectionHeader('Totales generales');
-  kpiPair('Total CFDIs', k.totalCFDIs, null,
-          'Diferencia ERP − SAT', round2(k.diferencia), MXN, null, Math.abs(k.diferencia) > 0.01 ? FG_DANGER : FG_OK);
+  kpiPair('Total CFDIs', k.totalCFDIs, null, null,
+          'Diferencia ERP − SAT', round2(k.diferencia), MXN, Math.abs(k.diferencia) > 0.01 ? FG_DANGER : FG_OK);
   kpiPair('Total ERP', round2(k.totalERP), MXN, null, 'Total SAT', round2(k.totalSAT), MXN, null);
   kpiPair('CFDIs ERP (activos)', k.countERP, null, null, 'CFDIs SAT (activos)', k.countSAT, null, null);
 

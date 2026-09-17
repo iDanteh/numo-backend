@@ -62,6 +62,7 @@ const PERM_META = {
   'visor:write':        { label: 'Gestionar CFDIs',                 module: 'Visor' },
   'visor:sat':          { label: 'Descarga SAT',                    module: 'Visor' },
   'visor:reports':      { label: 'Reportes CFDI',                   module: 'Visor' },
+  'visor:cierre-mes:revertir': { label: 'Revertir cierre de mes',   module: 'Visor' },
   'drive:read':         { label: 'Google Drive (leer)',             module: 'Drive' },
   'drive:import':       { label: 'Google Drive (importar)',         module: 'Drive' },
   'entities:read':      { label: 'Ver entidades fiscales',          module: 'Entidades' },

@@ -19,6 +19,7 @@ const Comparison           = require('../models/Comparison');
 const Discrepancy          = require('../models/Discrepancy');
 const CFDI                 = require('../models/CFDI');
 const { asyncHandler }     = require('../../shared/middleware/error-handler');
+const { buildCierreMesWorkbook } = require('./report.controller');
 
 /**
  * GET /api/periodos-fiscales
@@ -174,4 +175,57 @@ const remove = asyncHandler(async (req, res) => {
   res.json({ message: 'Eliminado' });
 });
 
-module.exports = { list, listSimple, create, remove };
+/**
+ * POST /api/periodos-fiscales/:id/cerrar
+ * Cierre de mes: genera el reporte completo (dashboard + conciliación) con
+ * los datos al momento exacto del cierre, y marca el periodo como cerrado.
+ * No se puede volver a cerrar un periodo ya cerrado — solo revertirlo primero.
+ */
+const cerrar = asyncHandler(async (req, res) => {
+  const doc = await periodoRepo.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'Periodo no encontrado' });
+
+  if (doc.cerrado) {
+    return res.status(409).json({
+      error: 'Este periodo ya está cerrado. Para volver a cerrarlo, primero debe revertirse el cierre.',
+      code:  'PERIODO_YA_CERRADO',
+    });
+  }
+
+  const query = {
+    ejercicio: String(doc.ejercicio),
+    ...(doc.periodo != null ? { periodo: String(doc.periodo) } : {}),
+    ...(req.body?.rfcEmisor ? { rfcEmisor: req.body.rfcEmisor } : {}),
+  };
+
+  const { workbook, filename } = await buildCierreMesWorkbook(query);
+
+  const userId = req.user?.dbId ? parseInt(req.user.dbId, 10) : null;
+  await periodoRepo.cerrar(doc.id, userId);
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  await workbook.xlsx.write(res);
+  res.end();
+});
+
+/**
+ * POST /api/periodos-fiscales/:id/revertir-cierre
+ * Revierte el cierre de un periodo. Restringido a PERMISSIONS.VISOR_CIERRE_MES_REVERTIR
+ * (ver rbac.js) — a propósito distinto de VISOR_WRITE, para que solo se asigne
+ * a quien deba tener la capacidad de reabrir un mes ya cerrado.
+ */
+const revertirCierre = asyncHandler(async (req, res) => {
+  const doc = await periodoRepo.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'Periodo no encontrado' });
+
+  if (!doc.cerrado) {
+    return res.status(409).json({ error: 'Este periodo no está cerrado.', code: 'PERIODO_NO_CERRADO' });
+  }
+
+  const userId = req.user?.dbId ? parseInt(req.user.dbId, 10) : null;
+  const updated = await periodoRepo.revertirCierre(doc.id, userId);
+  res.json(updated);
+});
+
+module.exports = { list, listSimple, create, remove, cerrar, revertirCierre };

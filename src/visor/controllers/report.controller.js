@@ -451,12 +451,13 @@ const MONTO_EFECTIVO_EXPR = {
 /**
  * GET /api/reports/dashboard
  */
-const dashboard = asyncHandler(async (req, res) => {
-  const cacheKey = getCacheKey(req.query);
-  const cached = getFromCache(cacheKey);
-  if (cached) return res.json(cached);
-
-  const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
+/**
+ * Cálculo de los KPIs del dashboard, extraído para poder reutilizarse tanto
+ * desde el endpoint /dashboard (con caché) como desde el reporte de Cierre
+ * de Mes (sin caché, siempre datos frescos al momento del cierre).
+ */
+async function computeDashboardData(query) {
+  const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = query;
 
   // El dashboard solo debe contar Emitidos — nunca Recibidos (aunque compartan
   // source SAT/MANUAL/ERP). Si el frontend no manda rfcEmisor (ej. mientras
@@ -707,6 +708,16 @@ const dashboard = asyncHandler(async (req, res) => {
     topDiscrepancyTypes,
     recentDiscrepancies,
   };
+
+  return responseData;
+}
+
+const dashboard = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey(req.query);
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const responseData = await computeDashboardData(req.query);
 
   setCache(cacheKey, responseData);
   res.json(responseData);
@@ -1391,8 +1402,12 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
  *   - Tabla: todos los CFDIs ERP del tipo con sus contrapartes SAT,
  *     IVA, diferencia de monto y detalle campo a campo de por qué difieren.
  */
-const conciliacionExcel = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, rfcEmisor } = req.query;
+/**
+ * Construye el workbook de conciliación completa. Extraído de `conciliacionExcel`
+ * para poder reutilizarse también desde el reporte de Cierre de Mes.
+ */
+async function buildConciliacionWorkbook(query) {
+  const { ejercicio, periodo, rfcEmisor } = query;
   const periodoFilter = {};
   if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
   if (periodo)   periodoFilter.periodo   = parseInt(periodo);
@@ -2324,8 +2339,98 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     trSin.getCell('total').numFmt = MXN;
   }
 
-  // ── Respuesta ──────────────────────────────────────────────────────────────
   const filename = `conciliacion_${ejercicio || 'all'}_${periodo || 'all'}_${Date.now()}.xlsx`;
+  return { workbook, periodoLabel, filename };
+}
+
+/** Aplana un objeto anidado en pares [ruta, valor] para volcarlo como tabla clave/valor. */
+function flattenKpis(obj, prefix = '') {
+  const rows = [];
+  for (const [key, val] of Object.entries(obj || {})) {
+    const label = prefix ? `${prefix}.${key}` : key;
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      rows.push(...flattenKpis(val, label));
+    } else if (Array.isArray(val)) {
+      rows.push([label, JSON.stringify(val)]);
+    } else {
+      rows.push([label, val]);
+    }
+  }
+  return rows;
+}
+
+/**
+ * Reporte de Cierre de Mes: workbook combinado = Resumen del Dashboard
+ * (todos los KPIs, tal cual /reports/dashboard) + la conciliación completa
+ * de CFDIs (idéntica a /reports/conciliacion-excel), tomados en el mismo
+ * instante en que se cierra el período.
+ */
+async function buildCierreMesWorkbook(query) {
+  const [dashboardData, conc] = await Promise.all([
+    computeDashboardData(query),
+    buildConciliacionWorkbook(query),
+  ]);
+  const { workbook, periodoLabel } = conc;
+
+  const FG_HDR   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F3A5F' } };
+  const FG_TOTAL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F0FE' } };
+  const FONT_HDR = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+  const FONT_BOLD = { bold: true, size: 10 };
+
+  const sheet = workbook.addWorksheet('0. Resumen Dashboard');
+  sheet.orderNo = -1; // primera hoja del workbook, antes de la conciliación
+  sheet.views = [{ state: 'frozen', ySplit: 3 }];
+
+  sheet.mergeCells('A1:B1');
+  const title = sheet.getCell('A1');
+  title.value = `Cierre de Mes — Resumen Dashboard — ${periodoLabel}`;
+  title.font  = { bold: true, size: 13, color: { argb: 'FF1F3A5F' } };
+  title.alignment = { horizontal: 'center', vertical: 'middle' };
+  sheet.getRow(1).height = 26;
+
+  sheet.mergeCells('A2:B2');
+  const sub = sheet.getCell('A2');
+  sub.value = `Generado el ${new Date().toLocaleString('es-MX')}`;
+  sub.font  = { italic: true, size: 9, color: { argb: 'FF64748B' } };
+  sub.alignment = { horizontal: 'center' };
+
+  sheet.columns = [
+    { key: 'kpi',   header: 'Indicador', width: 45 },
+    { key: 'valor', header: 'Valor',     width: 30 },
+  ];
+  const hdr = sheet.getRow(3);
+  hdr.values = ['Indicador', 'Valor'];
+  hdr.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle' }; });
+  hdr.height = 20;
+
+  for (const [label, value] of flattenKpis(dashboardData.kpis)) {
+    sheet.addRow({ kpi: label, valor: value });
+  }
+
+  if (dashboardData.topDiscrepancyTypes?.length) {
+    sheet.addRow({});
+    const r = sheet.addRow({ kpi: 'Top tipos de discrepancia (abiertas)', valor: '' });
+    r.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+    for (const t of dashboardData.topDiscrepancyTypes) {
+      sheet.addRow({ kpi: `  ${t._id || 'Sin tipo'}`, valor: t.count });
+    }
+  }
+
+  if (dashboardData.recentDiscrepancies?.length) {
+    sheet.addRow({});
+    const r = sheet.addRow({ kpi: 'Discrepancias abiertas recientes (últimas 10)', valor: '' });
+    r.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+    for (const d of dashboardData.recentDiscrepancies) {
+      sheet.addRow({ kpi: `  ${d.uuid || ''} — ${d.type || ''}`, valor: d.description || '' });
+    }
+  }
+
+  const filename = `cierre_mes_${query.ejercicio || 'all'}_${query.periodo || 'all'}_${Date.now()}.xlsx`;
+  return { workbook, periodoLabel, filename };
+}
+
+const conciliacionExcel = asyncHandler(async (req, res) => {
+  const { workbook, filename } = await buildConciliacionWorkbook(req.query);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   await workbook.xlsx.write(res);
@@ -4437,4 +4542,4 @@ const depositosIngresosExport = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, pagosBancoSugerencias, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };
+module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, pagosBancoSugerencias, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport, computeDashboardData, buildConciliacionWorkbook, buildCierreMesWorkbook };

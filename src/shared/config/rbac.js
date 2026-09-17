@@ -72,6 +72,8 @@ const PERMISSIONS = Object.freeze({
   VISOR_WRITE:         'visor:write',
   VISOR_SAT:           'visor:sat',
   VISOR_REPORTS:       'visor:reports',
+  // Restringido — nadie más puede reabrir un mes ya cerrado sin este permiso explícito
+  VISOR_CIERRE_MES_REVERTIR: 'visor:cierre-mes:revertir',
 
   // Google Drive
   DRIVE_READ:          'drive:read',

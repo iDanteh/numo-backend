@@ -1129,6 +1129,37 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // Hidalgo 11-ago). La porción "saldo a favor" del texto de la
           // forma de pago se sigue filtrando abajo igual que en cualquier
           // otro origen — solo se deja pasar la porción de dinero real.
+        } else if (origen === 'APA') {
+          // 'APA' (2026-09-16, caso real Hidalgo B0-260900150 — $6,977
+          // Tarjeta + $1,323 Anticipo): normalmente es un espejo de
+          // atribución sin dinero nuevo (por eso NUNCA entra a
+          // SERIES_CON_AUTH). Pero el ERP también lo usa para cobros
+          // mixtos reales donde parte viene de dinero nuevo (Tarjeta/
+          // Efectivo) y parte de un anticipo ya capturado. En ese caso
+          // SÍ hay dinero real que falta en el corte de caja.
+          // La porción ANTICIPO ya se captura independientemente vía el
+          // path OPA — aquí solo se pasan las formasPago NO-anticipo.
+          //
+          // EXCLUSIÓN AGREGADA (2026-09-17, caso real Hidalgo B0-260900019/
+          // B0-260900024, B0-260900040/044, B0-260900073/077,
+          // B0-260900121/132, B0-260900167/185, B0-260900025/029): cuando
+          // el cobro mezcla Efectivo/Tarjeta CON "Saldo a favor" (no con
+          // Anticipo), es el mismo espejo de siempre — el ERP registra
+          // este mismo cobro EXACTO (mismo monto, misma hora) como 'APS'
+          // en la cuenta que sí generó/consumió el saldo. Contarlo aquí
+          // TAMBIÉN duplica esa porción de dinero real (verificado: 6
+          // pares de tickets en póliza 739, mismo monto Efectivo exacto en
+          // ambos lados, $472.52 duplicados en total). El chequeo anterior
+          // (`tieneFormaReal`) solo excluía Puntos/SF/Anticipo del CONTEO,
+          // pero no rechazaba el cobro COMPLETO cuando además de dinero
+          // real traía una porción de Saldo a favor — se agrega ese
+          // rechazo total aquí, antes de decidir si hay "forma real".
+          const tieneSaldoAFavorApa = (cobro.formasPago ?? []).some(fp =>
+            /saldo\s*a\s*favor/i.test(fp.nombre ?? ''));
+          if (tieneSaldoAFavorApa) continue;
+          const tieneFormaReal = (cobro.formasPago ?? []).some(fp =>
+            !/puntos|saldo\s*a\s*favor|anticipo/i.test(fp.nombre ?? ''));
+          if (!tieneFormaReal) continue;
         } else if (origen === 'MIS') {
           // 'MIS' (2026-08-20, confirmado con el usuario contra el "Reporte
           // de Movimientos en Cajas" real de Hidalgo/B0 11-ago): es "VENTA
@@ -1182,7 +1213,12 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // (`montoAnticipo`) para el cierre de Anticipos/IVA-anticipo más
           // abajo, con el monto REAL aplicado en vez de asumir el 100% de la
           // venta.
-          if (/anticipo/i.test(fp.nombre ?? '')) { montoAnticipo += Number(fp.monto) || 0; continue; }
+          if (/anticipo/i.test(fp.nombre ?? '')) {
+            // APA: la porción ANTICIPO ya se captura vía el path OPA — no
+            // acumular montoAnticipo aquí para evitar doble conteo.
+            if (origen !== 'APA') montoAnticipo += Number(fp.monto) || 0;
+            continue;
+          }
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);

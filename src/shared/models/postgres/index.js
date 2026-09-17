@@ -130,6 +130,16 @@ async function syncModels() {
   // PeriodoFiscal depende de users
   await syncAlter(PeriodoFiscal);
 
+  // Cierre de mes (idempotente, ver PeriodoFiscal.js)
+  await Poliza.sequelize.query(`
+    ALTER TABLE periodos_fiscales
+      ADD COLUMN IF NOT EXISTS cerrado          BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS cerrado_por_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS cerrado_en        TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS revertido_por_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS revertido_en      TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cierre de mes (periodos_fiscales):', e.message));
+
   // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
   await syncAlter(CfdiMappingRule);
 

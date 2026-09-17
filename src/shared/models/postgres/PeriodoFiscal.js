@@ -45,6 +45,32 @@ const PeriodoFiscal = sequelize.define('PeriodoFiscal', {
     references: { model: 'users', key: 'id' },
     onDelete:   'SET NULL',
   },
+  /** Cierre de mes: una vez cerrado no puede volver a cerrarse hasta revertir */
+  cerrado: {
+    type:         DataTypes.BOOLEAN,
+    allowNull:    false,
+    defaultValue: false,
+  },
+  cerradoPorId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'users', key: 'id' },
+    onDelete:   'SET NULL',
+  },
+  cerradoEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
+  revertidoPorId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'users', key: 'id' },
+    onDelete:   'SET NULL',
+  },
+  revertidoEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName:   'periodos_fiscales',
   underscored: true,

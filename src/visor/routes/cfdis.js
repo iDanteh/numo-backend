@@ -7,7 +7,7 @@ const rateLimit  = require('express-rate-limit');
 const {
   list, getById, getXml,
   upload, importExcel, importFromErpApi,
-  create, compare, remove, exportExcel, exportZipRecibidos,
+  create, compare, remove, exportExcel, exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
   repairXmlSubtotals,
 } = require('../controllers/cfdi.controller');
@@ -53,6 +53,7 @@ const handleXmlUpload = (req, res, next) => {
 router.get('/',       authenticate, listLimiter, list);
 router.get('/export', authenticate, exportExcel);
 router.get('/export-zip-recibidos', authenticate, exportZipRecibidos);
+router.get('/export-reporte-recibidos', authenticate, exportReporteRecibidos);
 
 router.get('/reclasificacion-global/plan',    authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
 router.post('/reclasificacion-global/aplicar', authenticate, permit('admin', 'contador'), aplicarReclasificacionGlobal);

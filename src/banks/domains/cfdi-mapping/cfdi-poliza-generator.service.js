@@ -492,12 +492,29 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     // 2026-08-19 ticket C0-260800403/431) — restarlo TAMBIÉN aquí sería una
     // doble resta (el caso que este comentario original advertía, pero que
     // solo aplicaba de verdad al retiro ABO, no a cualquier uso).
+    // EXCEPCIÓN (2026-09-17, caso real Hidalgo B0-260900062): cuando la
+    // VENTA que generó este saldo (la que se canceló) fue creada el MISMO
+    // día que la cancelación/generación (`diaGen`), el ciclo completo
+    // venta→cobro→cancelación→retiro cae ENTERO dentro de este mismo lote
+    // — la venta original ya queda excluida de "Depósitos consolidados"
+    // (se va al bucket de Devolución/Cancelación, que neta en $0 por su
+    // cuenta) y restar TAMBIÉN el retiro deja un -$337.99 "huérfano" sin
+    // nada que lo compense, aunque el efecto real de caja de todo el ciclo
+    // fue $0 (confirmado contra el ledger real del ERP: venta+cobro netos
+    // $0, cancelación+retiro netos $0). La regla "SIEMPRE restar" (arriba)
+    // sigue aplicando sin cambios cuando la venta es de un día ANTERIOR al
+    // de esta póliza — ahí la venta nunca apareció en el Efectivo de hoy,
+    // así que restar el retiro de hoy sigue siendo correcto.
+    const diaVentaOriginal = _diaMx(cuenta.fechaCreacion ?? null);
+    const ventaYCancelacionMismoDia = !!(diaVentaOriginal && diaGen && diaVentaOriginal === diaGen);
+
     let sumaABOMismoDia = 0;
     for (const u of usosMismoDia) {
       if ((u.serieOrigen ?? u.serieVenta ?? '').toUpperCase() !== 'ABO') continue;
       const montoRetiro = Math.abs(Number(u.montoUsado)) || 0;
       if (montoRetiro <= 0) continue;
       sumaABOMismoDia += montoRetiro;
+      if (ventaYCancelacionMismoDia) continue;
       ajustesEfectivoRetiroSF.push({
         monto: montoRetiro,
         centro: centroPropioClave ?? null,

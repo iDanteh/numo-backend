@@ -1600,6 +1600,10 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
 
   const workbook = existingWorkbook || new ExcelJS.Workbook();
   workbook.creator = 'NUMO'; workbook.created = new Date();
+  // Si el workbook ya trae hojas (ej. la de Resumen Dashboard del Cierre de
+  // Mes), la numeración dinámica de las hojas de este reporte debe ignorarlas
+  // — si no, "2. Egreso" se numeraría "3. Egreso" y así en cascada.
+  const sheetOffset = existingWorkbook ? existingWorkbook.worksheets.length : 0;
 
   const addTitle = (sheet, title, ncols) => {
     const lc = colLetter(ncols);
@@ -1700,7 +1704,7 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
   for (const tipo of tiposEnUso) {
     const cfdis = cfdisByTipo[tipo] || [];
     const label  = TIPO_LABEL[tipo] || tipo;
-    const sheetN = workbook.worksheets.length + 1;
+    const sheetN = (workbook.worksheets.length - sheetOffset) + 1;
     const sheet  = workbook.addWorksheet(`${sheetN}. ${label} (${tipo})`);
     sheet.views  = [{ state: 'frozen', ySplit: 5 }];
     addTitle(sheet, `${label} (Tipo ${tipo}) — ${periodoLabel}`, DETAIL_COLS.length);
@@ -1986,7 +1990,7 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
   // (fueron reclasificados manualmente a este periodo)
   // ══════════════════════════════════════════════════════════════════════════
   if (cfdisMigrados.length > 0) {
-    const sMig  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Facturas Migradas`);
+    const sMig  = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. Facturas Migradas`);
     sMig.views  = [{ state: 'frozen', ySplit: 3 }];
     const MIG_COLS = [
       { key: 'tipo',       header: 'Tipo',             width: 7  },
@@ -2050,7 +2054,7 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
 
   // Helper: escribe hoja de CFDIs inactivos agrupados por tipo
   const addInactiveSheet = async (cfdis, sheetLabel, title, fgColor, satByUuidMap) => {
-    const sheet = workbook.addWorksheet(`${workbook.worksheets.length + 1}. ${sheetLabel}`);
+    const sheet = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. ${sheetLabel}`);
     sheet.views = [{ state: 'frozen', ySplit: 5 }];
     addTitle(sheet, `${title} — ${periodoLabel}`, DETAIL_COLS.length);
 
@@ -2179,7 +2183,7 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
   // ══════════════════════════════════════════════════════════════════════════
   const totalMismatch = satCanceladoErpActivo.length + erpCanceladoSatVigente.length;
   if (totalMismatch > 0) {
-    const sMis = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Mismatch Estado`);
+    const sMis = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. Mismatch Estado`);
     sMis.views = [{ state: 'frozen', ySplit: 3 }];
     const MIS_COLS = [
       { key: 'tipo',       header: 'Tipo',           width: 7  },
@@ -2234,7 +2238,7 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
   // ══════════════════════════════════════════════════════════════════════════
   // Los que SÍ tienen tipo en ERP ya se agregaron al final de su hoja de tipo
   const soloSatSinTipo = soloSat.filter(c => !tiposEnUsoSet.has(c.tipoDeComprobante));
-  const sN   = workbook.worksheets.length + 1;
+  const sN   = (workbook.worksheets.length - sheetOffset) + 1;
   const sLast = workbook.addWorksheet(`${sN}. Solo en SAT`);
   sLast.views = [{ state: 'frozen', ySplit: 3 }];
   const SAT_COLS = [
@@ -2275,7 +2279,7 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
   // ══════════════════════════════════════════════════════════════════════════
   if (sinUuidCfdis.length > 0) {
     const FG_SIN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF8E1' } }; // amarillo suave
-    const sSin  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Pendientes Timbrado`);
+    const sSin  = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. Pendientes Timbrado`);
     sSin.views  = [{ state: 'frozen', ySplit: 4 }];
     const SIN_COLS = [
       { key: 'tipo',       header: 'Tipo',            width: 7  },

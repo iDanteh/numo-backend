@@ -1129,6 +1129,20 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // Hidalgo 11-ago). La porción "saldo a favor" del texto de la
           // forma de pago se sigue filtrando abajo igual que en cualquier
           // otro origen — solo se deja pasar la porción de dinero real.
+        } else if (origen === 'APA') {
+          // 'APA' (2026-09-16, caso real Hidalgo B0-260900150 — $6,977
+          // Tarjeta + $1,323 Anticipo): normalmente es un espejo de
+          // atribución sin dinero nuevo (por eso NUNCA entra a
+          // SERIES_CON_AUTH). Pero el ERP también lo usa para cobros
+          // mixtos reales donde parte viene de dinero nuevo (Tarjeta/
+          // Efectivo) y parte de un anticipo ya capturado. En ese caso
+          // SÍ hay dinero real que falta en el corte de caja.
+          // La porción ANTICIPO ya se captura independientemente vía el
+          // path OPA (línea ~1735) — aquí solo se pasan las formasPago
+          // NO-anticipo. Si todas son ANTICIPO, no hay dinero nuevo → skip.
+          const tieneFormaReal = (cobro.formasPago ?? []).some(fp =>
+            !/puntos|saldo\s*a\s*favor|anticipo/i.test(fp.nombre ?? ''));
+          if (!tieneFormaReal) continue;
         } else if (origen === 'MIS') {
           // 'MIS' (2026-08-20, confirmado con el usuario contra el "Reporte
           // de Movimientos en Cajas" real de Hidalgo/B0 11-ago): es "VENTA
@@ -1182,7 +1196,12 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // (`montoAnticipo`) para el cierre de Anticipos/IVA-anticipo más
           // abajo, con el monto REAL aplicado en vez de asumir el 100% de la
           // venta.
-          if (/anticipo/i.test(fp.nombre ?? '')) { montoAnticipo += Number(fp.monto) || 0; continue; }
+          if (/anticipo/i.test(fp.nombre ?? '')) {
+            // APA: la porción ANTICIPO ya se captura vía OPA — no acumular
+            // montoAnticipo aquí para evitar doble conteo.
+            if (origen !== 'APA') montoAnticipo += Number(fp.monto) || 0;
+            continue;
+          }
           const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
             ? Math.abs(Number(cobro.monto) || 0)
             : (Number(fp.monto) || 0);

@@ -331,6 +331,331 @@ describe('_aportesPorErpIdCronologico (2026-08-21, bug real de atribución cruza
   });
 });
 
+// 2026-09-01 — bug real encontrado investigando una reversión con "atribución ambigua" que no
+// debería haber sido ambigua (erpId 6a971dd5b6007400011db4de, folioExterno 260900009).
+// _perteneceAEsteMovimiento solo reconocía la convención de Transferencia (Numo=autorización,
+// Aut=folio) — desde el 2026-08-28, Depósito en efectivo y Cheque mandan DatosAdicionales con
+// la convención INVERTIDA (Numo=folio, Aut=autorización; "Num Recibo" queda vacío, ver
+// collection-request.service.js). Los tests de arriba ("Num Recibo") cubren el contrato VIEJO
+// (anterior al 28/08) — estos cubren el contrato REAL vigente hoy para las 3 formas de pago.
+describe('_aportesPorErpIdCronologico — convención invertida (Numo=folio, Aut=autorización) para Depósito en efectivo y Cheque', () => {
+  test('Depósito en efectivo (contrato vigente: Numo=folio, Aut=autorización, Num Recibo vacío) se atribuye a su propio movimiento', () => {
+    const raw0 = {
+      total: 500, saldoActual: 0,
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 500 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: '' },
+            { nombre: 'Numo', valor: 'F-EFECTIVO' },   // folio de Numo
+            { nombre: 'Aut', valor: '291441' },         // autorización bancaria
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '291441', folio: 'F-EFECTIVO' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500);
+  });
+
+  test('Cheque (mismo contrato invertido que Depósito en efectivo: Numo=folio, Aut=autorización) se atribuye a su propio movimiento', () => {
+    const raw0 = {
+      total: 728.12, saldoActual: 0,
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 728.12 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -728.12,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 728.12, adicionales: [
+            { nombre: 'Numo', valor: 'F-CHEQUE' },  // folio de Numo
+            { nombre: 'Aut', valor: '13280' },       // autorización bancaria
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '13280', folio: 'F-CHEQUE' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(728.12);
+  });
+
+  // Reproduce el caso real (sin el 4to movimiento artificial que el usuario aplicó a mano
+  // desde Kore solo para cerrar la CxC de prueba): UN SOLO BankMovement recibió 2 abonos —
+  // Efectivo $500 y Transferencia $691.26 — y Kore revirtió la parte de Transferencia. Antes
+  // del fix, el abono de efectivo nunca entraba a la pila (quedaba "de otro" / ignorado) y el
+  // resultado daba 0 en vez de 500, disparando la red de seguridad de atribución ambigua.
+  test('caso real: mismo movimiento con Efectivo + Transferencia, se revierte la Transferencia — queda el aporte de Efectivo', () => {
+    const raw0 = {
+      total: 1191.26, saldoActual: 691.26, // reversión ya aplicada, SIN el 3er abono de prueba
+      movimientos: [
+        { serie: 'A0', folio: '260900009', fecha: '2026-09-01T18:47:49Z', total: 1191.26 },
+        { serie: 'ABO', folio: '260900022', fecha: '2026-09-01T18:49:23Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: '' },
+            { nombre: 'Numo', valor: '040443' },
+            { nombre: 'Aut', valor: '291441' },
+          ] }] },
+        { serie: 'ABO', folio: '260900024', fecha: '2026-09-01T18:50:33Z', total: -691.26,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 691.26, adicionales: [
+            { nombre: 'Aut', valor: '040443' },
+            { nombre: 'Numo', valor: '291441' },
+          ] }] },
+        { serie: 'REV ABO', folio: '260900003', fecha: '2026-09-01T18:51:35Z', total: 691.26,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 691.26 }] }, // sin adicionales, como toda REV ABO
+      ],
+    };
+    const mov = { numeroAutorizacion: '291441', folio: '040443' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500);
+    expect(resultado.get(0)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  // 2026-09-01 — caso real CONFIRMADO por el usuario contra Kore real (erpId
+  // 6a9724fdb6007400011db6df, folioExterno 260900011): mismo movimiento con Transferencia
+  // $500 + Depósito en efectivo $660, se revierte la parte de Efectivo. Resultado real en
+  // producción: "Ajustado (siguió vinculado)", aporte 1160 -> 500. Fijado acá como regresión.
+  test('caso real CONFIRMADO: mismo movimiento con Transferencia + Efectivo, se revierte el Efectivo — queda el aporte de Transferencia', () => {
+    const raw0 = {
+      total: 1160, saldoActual: 660,
+      movimientos: [
+        { serie: 'A0', folio: '260900011', fecha: '2026-09-01T19:18:21Z', total: 1160 },
+        { serie: 'ABO', folio: '260900028', fecha: '2026-09-01T19:19:44Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 500, adicionales: [
+            { nombre: 'Aut', valor: '040443' },
+            { nombre: 'Numo', valor: '291441' },
+          ] }] },
+        { serie: 'ABO', folio: '260900030', fecha: '2026-09-01T19:20:42Z', total: -660,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 660, adicionales: [
+            { nombre: 'Num Recibo', valor: '' },
+            { nombre: 'Numo', valor: '040443' },
+            { nombre: 'Aut', valor: '291441' },
+          ] }] },
+        { serie: 'REV ABO', folio: '260900004', fecha: '2026-09-01T19:21:04Z', total: 660,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 660 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '291441', folio: '040443' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500);
+    expect(resultado.get(0)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  test('mismo movimiento con Cheque + Transferencia, se revierte el Cheque — queda el aporte de Transferencia', () => {
+    const raw0 = {
+      total: 1000, saldoActual: 700, // se revirtieron los $700 del cheque, quedan los $300 de transferencia como deuda cubierta y $700 pendiente
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 1000 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -300,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 300, adicionales: [
+            { nombre: 'Aut', valor: 'F-1' }, { nombre: 'Numo', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: -700,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 700, adicionales: [
+            { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'REV ABO', folio: '4', fecha: '2026-01-01T00:03:00Z', total: 700,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 700 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: 'AUT-1', folio: 'F-1' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(300);
+    expect(resultado.get(0)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  test('mismo movimiento con Cheque + Efectivo (los 2 con la convención invertida), se revierte el Efectivo — queda el aporte del Cheque', () => {
+    const raw0 = {
+      total: 900, saldoActual: 400,
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 900 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 500, adicionales: [
+            { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: -400,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 400, adicionales: [
+            { nombre: 'Num Recibo', valor: '' }, { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'REV ABO', folio: '4', fecha: '2026-01-01T00:03:00Z', total: 400,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 400 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: 'AUT-1', folio: 'F-1' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500);
+    expect(resultado.get(0)).toBeCloseTo(raw0.total - raw0.saldoActual, 2);
+  });
+
+  // Riesgo real introducido por el fix: al probar las 2 lecturas (Numo/Aut) para CUALQUIER
+  // tag, ¿un abono de Efectivo/Cheque de UN movimiento podría "contaminar" a OTRO movimiento
+  // de la misma CxC si sus folios/autorizaciones cruzan por coincidencia? Este test fija 2
+  // movimientos SEPARADOS, cada uno pagado con una forma de pago de convención invertida
+  // distinta, con folios/autorizaciones que NO se repiten entre sí — confirma que cada aporte
+  // sigue cayendo exclusivamente en su propio movimiento.
+  test('2 movimientos separados, cada uno con una forma de pago de convención invertida distinta — sin contaminación cruzada', () => {
+    const raw0 = {
+      total: 1200, saldoActual: 0,
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 1200 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: '' }, { nombre: 'Numo', valor: 'F-EFECTIVO' }, { nombre: 'Aut', valor: 'AUT-EFECTIVO' },
+          ] }] },
+        { serie: 'ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: -700,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 700, adicionales: [
+            { nombre: 'Numo', valor: 'F-CHEQUE' }, { nombre: 'Aut', valor: 'AUT-CHEQUE' },
+          ] }] },
+      ],
+    };
+    const movEfectivo = { numeroAutorizacion: 'AUT-EFECTIVO', folio: 'F-EFECTIVO' };
+    const movCheque    = { numeroAutorizacion: 'AUT-CHEQUE',  folio: 'F-CHEQUE' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [movEfectivo, movCheque]);
+
+    expect(resultado.get(0)).toBe(500); // efectivo: solo lo suyo
+    expect(resultado.get(1)).toBe(700); // cheque: solo lo suyo
+  });
+
+  // Ciclo aplicar -> revertir -> reaplicar con Cheque (convención invertida): el neteo con
+  // signo debe seguir quedando en el último valor vigente, sin triplicar ni perder el aporte.
+  test('ciclo aplicar -> revertir -> reaplicar con Cheque: neteo con signo, sin triplicar', () => {
+    const raw0 = {
+      total: 500, saldoActual: 0,
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 500 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 500, adicionales: [
+            { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'REV ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: 500,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 500 }] },
+        { serie: 'ABO', folio: '4', fecha: '2026-01-01T00:03:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 500, adicionales: [
+            { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: 'AUT-1', folio: 'F-1' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500); // no 1000 (triplicado) ni 0 (perdido)
+  });
+
+  // Reversa cuyo monto no coincide con NADA en la pila (ej. Kore manda un monto raro, o el
+  // reversal pertenece a un abono fuera de este grupo) — con tags de convención invertida de
+  // por medio, sigue sin inventarse a qué abono pertenece.
+  test('reversa de Efectivo cuyo monto no coincide con ninguna entrada de la pila se ignora, no se resta de cualquier cosa', () => {
+    const raw0 = {
+      total: 500, saldoActual: 500,
+      movimientos: [
+        { serie: 'A0', folio: '1', fecha: '2026-01-01T00:00:00Z', total: 500 },
+        { serie: 'ABO', folio: '2', fecha: '2026-01-01T00:01:00Z', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: '' }, { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'REV ABO', folio: '3', fecha: '2026-01-01T00:02:00Z', total: 999, // monto que no cancela nada
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 999 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: 'AUT-1', folio: 'F-1' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(500); // el abono de $500 sigue intacto, la reversa de $999 se ignoró
+  });
+});
+
+describe('_montoSaldoLinkPorMovimiento — convención invertida (Numo=folio, Aut=autorización) para Depósito en efectivo y Cheque', () => {
+  test('Depósito en efectivo (contrato vigente) se atribuye a "mío", no a "de otro"', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -500,
+          formasPago: [{ nombreFormaPago: 'DEPOSITO EN EFECTIVO', monto: 500, adicionales: [
+            { nombre: 'Num Recibo', valor: '' },
+            { nombre: 'Numo', valor: 'F-EFECTIVO' },
+            { nombre: 'Aut', valor: '291441' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '291441', folio: 'F-EFECTIVO' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    expect(resultado).toBe(500);
+  });
+
+  test('Cheque (contrato vigente) se atribuye a "mío", no a "de otro"', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -728.12,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 728.12, adicionales: [
+            { nombre: 'Numo', valor: 'F-CHEQUE' },
+            { nombre: 'Aut', valor: '13280' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '13280', folio: 'F-CHEQUE' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    expect(resultado).toBe(728.12);
+  });
+});
+
+describe('_montoSaldoLinkPorMovimiento — línea combinada de Kore con 2+ depósitos reales (caso real 2026-09-17, Ferrocarril F0-260900334/SD SOLUTIONS)', () => {
+  // Kore reportó un solo `total` ($1,563.26) para 2 depósitos bancarios reales
+  // distintos ($1,483.32 + $79.94), con "Aut"/"Numo" listando AMBOS folios
+  // separados por coma — el bug real: cada movimiento se atribuía el total
+  // combinado completo (dos veces $1,563.26) en vez de su propia porción.
+  const raw0 = {
+    movimientos: [
+      { serie: 'CBT', folio: '260909894', total: -1563.26,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 1563.26, adicionales: [
+          { nombre: 'Numo', valor: '1114920,1108956' },
+          { nombre: 'Aut', valor: '044785,044571' },
+        ] }] },
+    ],
+  };
+
+  test('movimiento 044571 ($1,483.32) se topa a su propio depósito, no al total combinado', () => {
+    const mov = { numeroAutorizacion: '1108956', folio: '044571', deposito: 1483.32 };
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(1483.32);
+  });
+
+  test('movimiento 044785 ($79.94) se topa a su propio depósito, no al total combinado', () => {
+    const mov = { numeroAutorizacion: '1114920', folio: '044785', deposito: 79.94 };
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(79.94);
+  });
+
+  test('sin depósito propio conocido (null), se conserva el comportamiento anterior (total completo) en vez de forzar 0', () => {
+    const mov = { numeroAutorizacion: '1108956', folio: '044571', deposito: null };
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(1563.26);
+  });
+
+  test('línea con un solo folio (caso normal, sin coma) NO se topa — comportamiento sin cambios', () => {
+    const raw0Simple = {
+      movimientos: [
+        { serie: 'CBT', folio: '1', total: -1000,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 1000, adicionales: [
+            { nombre: 'Aut', valor: '999888' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '999888', folio: '999888', deposito: 500 };
+    // Aunque el depósito propio (500) sea menor al total (1000), NO es línea
+    // multi-depósito (un solo número en "Aut") — se respeta el total, como siempre.
+    expect(router._montoSaldoLinkPorMovimiento(raw0Simple, mov)).toBe(1000);
+  });
+});
+
 describe('_montoSaldoLinkPorMovimiento — reconoce "Num Recibo" (Depósito en efectivo, caso real 2026-08-24)', () => {
   test('abono propio tageado con Num Recibo se atribuye a este movimiento (no cae en el neteo de "reversa sin tag")', () => {
     const raw0 = {

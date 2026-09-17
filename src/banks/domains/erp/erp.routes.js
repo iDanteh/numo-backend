@@ -28,6 +28,7 @@ const {
   obtenerSesionCaja, obtenerCuentasKore, aplicarCobroOperacion, aplicarCobroOperacionMultiple,
   listarBancos, listarFormasPago,
 }                                         = require('./kore-caja.service');
+const { normalizarAuthLista }            = require('./erp-auth.utils');
 
 const uploadCyc = multer({
   storage: multer.memoryStorage(),
@@ -1047,6 +1048,26 @@ function _perteneceAEsteMovimiento(fp, mov) {
 // hace que un ciclo aplicar→revertir→reaplicar quede en el último valor vigente, sin
 // triplicar. Devuelve null (nunca 0) si nunca hubo una coincidencia propia — "no
 // determinado" evita pisar un saldoErp ya correcto con un cero falso.
+// BUG CORREGIDO (2026-09-17, caso real Ferrocarril F0-260900334/SD SOLUTIONS,
+// $1,483.32 + $79.94 = $1,563.26 combinados): cuando Kore reporta 2+ depósitos
+// bancarios reales de ESTA CxC en una sola línea de `movimientos[]` (un solo
+// `total`, un "Aut"/"Numo" con AMBOS folios separados por coma — visto en el
+// campo real "Aut: 044785,044571"), `_perteneceAEsteMovimiento` (match por
+// `.includes()`) reconoce a los 2 `BankMovement` como "míos" contra esa MISMA
+// línea combinada — cada uno se atribuía el `total` COMBINADO completo en vez
+// de su propia porción, y el ratchet de más abajo (`_aporteConRatchet`, "nunca
+// bajar") deja ese valor inflado pegado para siempre en corridas futuras.
+// Kore no dice cómo se parte el total entre los 2 depósitos — el único dato
+// confiable de "cuánto aportó ESTE movimiento" en ese caso es su propio
+// `deposito`/`retiro` bancario. Se detecta la línea combinada contando cuántos
+// números trae el tag de identidad que matcheó (`normalizarAuthLista`, ya
+// usada por el motor de matching para el mismo problema) — con 2+, se topa la
+// atribución al monto propio de `mov` en vez de aceptar el total de la línea.
+function _esLineaMultiDeposito(fp) {
+  return (fp.adicionales ?? []).some(a =>
+    (a.nombre === 'Numo' || a.nombre === 'Aut') && normalizarAuthLista(a.valor).length > 1);
+}
+
 function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) {
   if (!raw0) return null;
   const conFormaPago = (raw0.movimientos ?? []).filter(
@@ -1058,11 +1079,18 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
   let huboCoincidenciaPropia = false;
 
   for (const m of conFormaPago) {
-    const esMio    = m.formasPago.some(fp => _perteneceAEsteMovimiento(fp, mov));
+    const fpPropio = m.formasPago.find(fp => _perteneceAEsteMovimiento(fp, mov));
+    const esMio    = !!fpPropio;
     const esDeOtro = !esMio && m.formasPago.some(fp => _tieneTagIdentidadPropia(fp));
-    const total = m.total ?? 0;
+    let total = m.total ?? 0;
 
     if (esMio) {
+      if (_esLineaMultiDeposito(fpPropio)) {
+        const propio = Math.abs(mov.deposito ?? mov.retiro ?? 0);
+        if (propio > 0 && propio < Math.abs(total)) {
+          total = (total < 0 ? -1 : 1) * propio;
+        }
+      }
       miNeto += total;
       huboCoincidenciaPropia = true;
     } else if (esDeOtro) {

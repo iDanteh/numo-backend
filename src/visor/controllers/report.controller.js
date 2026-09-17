@@ -2343,22 +2343,6 @@ async function buildConciliacionWorkbook(query) {
   return { workbook, periodoLabel, filename };
 }
 
-/** Aplana un objeto anidado en pares [ruta, valor] para volcarlo como tabla clave/valor. */
-function flattenKpis(obj, prefix = '') {
-  const rows = [];
-  for (const [key, val] of Object.entries(obj || {})) {
-    const label = prefix ? `${prefix}.${key}` : key;
-    if (val && typeof val === 'object' && !Array.isArray(val)) {
-      rows.push(...flattenKpis(val, label));
-    } else if (Array.isArray(val)) {
-      rows.push([label, JSON.stringify(val)]);
-    } else {
-      rows.push([label, val]);
-    }
-  }
-  return rows;
-}
-
 /**
  * Reporte de Cierre de Mes: workbook combinado = Resumen del Dashboard
  * (todos los KPIs, tal cual /reports/dashboard) + la conciliación completa
@@ -2371,57 +2355,176 @@ async function buildCierreMesWorkbook(query) {
     buildConciliacionWorkbook(query),
   ]);
   const { workbook, periodoLabel } = conc;
+  const k = dashboardData.kpis;
 
-  const FG_HDR   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F3A5F' } };
-  const FG_TOTAL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F0FE' } };
-  const FONT_HDR = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
-  const FONT_BOLD = { bold: true, size: 10 };
+  const FG_SECTION = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF334E68' } };
+  const FG_HDR     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F3A5F' } };
+  const FG_KPI      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0F4FF' } };
+  const FG_WARN     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3CD' } };
+  const FG_DANGER   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8D7DA' } };
+  const FG_OK       = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
+  const FONT_SECTION = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+  const FONT_HDR      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+  const FONT_LABEL    = { size: 10, color: { argb: 'FF475569' } };
+  const FONT_VALUE    = { bold: true, size: 11, color: { argb: 'FF0F172A' } };
+  const MXN = '"$"#,##0.00';
+  const round2 = (v) => v != null ? Math.round(v * 100) / 100 : null;
 
   const sheet = workbook.addWorksheet('0. Resumen Dashboard');
   sheet.orderNo = -1; // primera hoja del workbook, antes de la conciliación
-  sheet.views = [{ state: 'frozen', ySplit: 3 }];
+  sheet.views = [{ state: 'frozen', ySplit: 2 }];
+  sheet.columns = [
+    { key: 'a', width: 34 },
+    { key: 'b', width: 20 },
+    { key: 'c', width: 34 },
+    { key: 'd', width: 22 },
+  ];
 
-  sheet.mergeCells('A1:B1');
+  sheet.mergeCells('A1:D1');
   const title = sheet.getCell('A1');
-  title.value = `Cierre de Mes — Resumen Dashboard — ${periodoLabel}`;
-  title.font  = { bold: true, size: 13, color: { argb: 'FF1F3A5F' } };
+  title.value = `🔒 Cierre de Mes — ${periodoLabel}`;
+  title.font  = { bold: true, size: 15, color: { argb: 'FF1F3A5F' } };
   title.alignment = { horizontal: 'center', vertical: 'middle' };
-  sheet.getRow(1).height = 26;
+  sheet.getRow(1).height = 30;
 
-  sheet.mergeCells('A2:B2');
+  sheet.mergeCells('A2:D2');
   const sub = sheet.getCell('A2');
-  sub.value = `Generado el ${new Date().toLocaleString('es-MX')}`;
+  sub.value = `Generado el ${new Date().toLocaleString('es-MX')} — resumen del dashboard al momento del cierre (ver hojas siguientes para la conciliación completa)`;
   sub.font  = { italic: true, size: 9, color: { argb: 'FF64748B' } };
   sub.alignment = { horizontal: 'center' };
+  sheet.getRow(2).height = 16;
 
-  sheet.columns = [
-    { key: 'kpi',   header: 'Indicador', width: 45 },
-    { key: 'valor', header: 'Valor',     width: 30 },
-  ];
-  const hdr = sheet.getRow(3);
-  hdr.values = ['Indicador', 'Valor'];
-  hdr.eachCell(c => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'center', vertical: 'middle' }; });
-  hdr.height = 20;
+  let r = 2;
 
-  for (const [label, value] of flattenKpis(dashboardData.kpis)) {
-    sheet.addRow({ kpi: label, valor: value });
-  }
+  const sectionHeader = (titleTxt) => {
+    r++;
+    sheet.mergeCells(`A${r}:D${r}`);
+    const c = sheet.getCell(`A${r}`);
+    c.value = titleTxt;
+    c.font = FONT_SECTION;
+    c.fill = FG_SECTION;
+    c.alignment = { horizontal: 'left', vertical: 'middle' };
+    sheet.getRow(r).height = 22;
+  };
 
-  if (dashboardData.topDiscrepancyTypes?.length) {
-    sheet.addRow({});
-    const r = sheet.addRow({ kpi: 'Top tipos de discrepancia (abiertas)', valor: '' });
-    r.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
-    for (const t of dashboardData.topDiscrepancyTypes) {
-      sheet.addRow({ kpi: `  ${t._id || 'Sin tipo'}`, valor: t.count });
+  /** Fila con hasta 2 pares indicador/valor, en formato tarjeta. */
+  const kpiPair = (label1, value1, fmt1, fill1, label2, value2, fmt2, fill2) => {
+    r++;
+    const row = sheet.getRow(r);
+    row.getCell('a').value = label1;
+    row.getCell('a').font  = FONT_LABEL;
+    row.getCell('b').value = value1;
+    row.getCell('b').font  = FONT_VALUE;
+    if (fmt1) row.getCell('b').numFmt = fmt1;
+    if (label2 !== undefined) {
+      row.getCell('c').value = label2;
+      row.getCell('c').font  = FONT_LABEL;
+      row.getCell('d').value = value2;
+      row.getCell('d').font  = FONT_VALUE;
+      if (fmt2) row.getCell('d').numFmt = fmt2;
+    }
+    row.eachCell({ includeEmpty: true }, (cell) => { cell.fill = FG_KPI; });
+    if (fill1) row.getCell('b').fill = fill1;
+    if (fill2) row.getCell('d').fill = fill2;
+    row.height = 19;
+  };
+
+  const blankRow = () => { r++; };
+
+  // ══ Totales generales ══
+  sectionHeader('Totales generales');
+  kpiPair('Total CFDIs', k.totalCFDIs, null,
+          'Diferencia ERP − SAT', round2(k.diferencia), MXN, null, Math.abs(k.diferencia) > 0.01 ? FG_DANGER : FG_OK);
+  kpiPair('Total ERP', round2(k.totalERP), MXN, null, 'Total SAT', round2(k.totalSAT), MXN, null);
+  kpiPair('CFDIs ERP (activos)', k.countERP, null, null, 'CFDIs SAT (activos)', k.countSAT, null, null);
+
+  // ══ Estado de conciliación ══
+  blankRow();
+  sectionHeader('Estado de conciliación');
+  kpiPair('Conciliados', k.conciliados, null, k.conciliados > 0 ? FG_OK : null,
+          'Con discrepancia', k.conDiscrepancia, null, k.conDiscrepancia > 0 ? FG_WARN : null);
+  kpiPair('Sin conciliar', k.sinConciliar, null, k.sinConciliar > 0 ? FG_WARN : null,
+          'No en ERP (solo SAT)', k.notInErp, null, k.notInErp > 0 ? FG_DANGER : null);
+  kpiPair('No en SAT (solo ERP)', k.notInSat, null, k.notInSat > 0 ? FG_DANGER : null,
+          'Cancelado ERP, coincide SAT', k.cancelledMatch, null, null);
+
+  // ══ Cancelados y sin UUID ══
+  blankRow();
+  sectionHeader('Cancelados y sin UUID fiscal');
+  kpiPair('ERP cancelados (cant.)', k.erpCancelados.count, null, null, 'ERP cancelados (monto)', round2(k.erpCancelados.total), MXN, null);
+  kpiPair('SAT cancelados (cant.)', k.satCancelados.count, null, null, 'SAT cancelados (monto)', round2(k.satCancelados.total), MXN, null);
+  kpiPair('ERP sin UUID real (cant.)', k.erpSinUuid.count, null, null, 'ERP sin UUID real (monto)', round2(k.erpSinUuid.total), MXN, null);
+  kpiPair('Vigente en SAT y en ERP (cant.)', k.vigenteErpSat.count, null, null, 'Vigente en SAT y en ERP (monto)', round2(k.vigenteErpSat.total), MXN, null);
+
+  // ══ IVA ══
+  blankRow();
+  sectionHeader('IVA (CFDIs activos)');
+  kpiPair('IVA Trasladado ERP', round2(k.ivaStats.erp.ivaTrasladadoTotal), MXN, null, 'IVA Trasladado SAT', round2(k.ivaStats.sat.ivaTrasladadoTotal), MXN, null);
+  kpiPair('IVA Retenido ERP', round2(k.ivaStats.erp.ivaRetenidoTotal), MXN, null, 'IVA Retenido SAT', round2(k.ivaStats.sat.ivaRetenidoTotal), MXN, null);
+  kpiPair('IVA Neto ERP', round2(k.ivaStats.erp.ivaNeto), MXN, null, 'IVA Neto SAT', round2(k.ivaStats.sat.ivaNeto), MXN, null);
+
+  // ══ CFDIs por estatus SAT ══
+  if (k.cfdisBySatStatus?.length) {
+    blankRow();
+    sectionHeader('CFDIs ERP por estatus SAT');
+    r++;
+    const h = sheet.getRow(r);
+    h.getCell('a').value = 'Estatus SAT';
+    h.getCell('b').value = 'Cantidad';
+    sheet.mergeCells(`C${r}:D${r}`);
+    h.getCell('c').value = 'Monto';
+    h.eachCell({ includeEmpty: true }, (c) => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'left', vertical: 'middle' }; });
+    h.height = 18;
+    for (const s of k.cfdisBySatStatus) {
+      r++;
+      const row = sheet.getRow(r);
+      row.getCell('a').value = s._id || 'Sin verificar';
+      row.getCell('b').value = s.count;
+      sheet.mergeCells(`C${r}:D${r}`);
+      row.getCell('c').value = round2(s.totalAmount);
+      row.getCell('c').numFmt = MXN;
     }
   }
 
+  // ══ Top tipos de discrepancia abiertas ══
+  if (dashboardData.topDiscrepancyTypes?.length) {
+    blankRow();
+    sectionHeader('Top tipos de discrepancia (abiertas)');
+    r++;
+    const h = sheet.getRow(r);
+    h.getCell('a').value = 'Tipo';
+    h.getCell('b').value = 'Cantidad';
+    h.eachCell({ includeEmpty: true }, (c) => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'left', vertical: 'middle' }; });
+    h.height = 18;
+    for (const t of dashboardData.topDiscrepancyTypes) {
+      r++;
+      const row = sheet.getRow(r);
+      row.getCell('a').value = t._id || 'Sin tipo';
+      row.getCell('b').value = t.count;
+    }
+  }
+
+  // ══ Discrepancias abiertas recientes ══
   if (dashboardData.recentDiscrepancies?.length) {
-    sheet.addRow({});
-    const r = sheet.addRow({ kpi: 'Discrepancias abiertas recientes (últimas 10)', valor: '' });
-    r.eachCell(c => { c.font = FONT_BOLD; c.fill = FG_TOTAL; });
+    blankRow();
+    sectionHeader('Discrepancias abiertas recientes (últimas 10)');
+    r++;
+    const h = sheet.getRow(r);
+    h.getCell('a').value = 'UUID';
+    h.getCell('b').value = 'Tipo';
+    sheet.mergeCells(`C${r}:D${r}`);
+    h.getCell('c').value = 'Severidad / Descripción';
+    h.eachCell({ includeEmpty: true }, (c) => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'left', vertical: 'middle' }; });
+    h.height = 18;
     for (const d of dashboardData.recentDiscrepancies) {
-      sheet.addRow({ kpi: `  ${d.uuid || ''} — ${d.type || ''}`, valor: d.description || '' });
+      r++;
+      const row = sheet.getRow(r);
+      row.getCell('a').value = d.uuid || '';
+      row.getCell('a').font  = { size: 9 };
+      row.getCell('b').value = d.type || '';
+      sheet.mergeCells(`C${r}:D${r}`);
+      row.getCell('c').value = `[${d.severity || ''}] ${d.description || ''}`;
+      row.getCell('c').font  = { size: 9 };
     }
   }
 

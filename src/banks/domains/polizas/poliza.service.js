@@ -2699,25 +2699,21 @@ function _extraerCobrosSucursal(movimientos) {
   // orden en que llegaban los tickets (confirmado con el usuario 2026-08-05).
   filas.sort((a, b) => _categoriaCobroSucursal(a) - _categoriaCobroSucursal(b) || compararSerieFolio(a, b));
 
-  // Saldo a Favor USADO: sale por completo de "Cobro de otra sucursal" y va a
-  // su propia pestaña dedicada "Saldos a favor usados", SIN IMPORTAR EL MONTO
-  // (confirmado con el usuario 2026-09-15 — reemplaza el criterio anterior de
-  // 2026-08-07, que solo movía a "Otros Ingresos" los ≤$50 y dejaba el resto
-  // mezclado aquí). Un SF de subtotal + IVA son 2 filas (2103090001 +
-  // 2104010002) con el MISMO `concepto` (cliente/serie-folio).
-  // Incluye SF-OCULTO (2026-09-15, ver comentario en el loop de arriba) —
-  // sigue siendo SF usado, solo que el mismo día/almacén; ya no se oculta en
-  // "Otros Ingresos", se ve aquí como cualquier otro SF usado.
-  const filasSaldoFavorUsado = filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_SALDO_FAVOR_OCULTO);
+  // SF-OCULTO: generado y usado el mismo día/almacén — sale de "Cobro de otra
+  // sucursal" y va a la pestaña "Movimientos de Saldos a Favor" (2026-09-15).
+  // El SF usado normal (ETIQUETA_SALDO_FAVOR) se queda en `filas` y aparece
+  // en la póliza principal como siempre (columna C = "SF", sin prefijo COS-).
+  // Un SF de subtotal + IVA son 2 filas (2103090001 + 2104010002) con el
+  // MISMO `concepto` (cliente/serie-folio).
+  const filasSaldoFavorUsado = filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR_OCULTO);
   if (filasSaldoFavorUsado.length) {
     const idsSaldoFavorUsado = new Set(filasSaldoFavorUsado);
     for (let i = filas.length - 1; i >= 0; i--) {
       if (idsSaldoFavorUsado.has(filas[i])) filas.splice(i, 1);
     }
   }
-  // "Otros Ingresos" ya no recibe Saldo a Favor usado (ver arriba) — se deja
-  // declarada vacía; solo se llena más abajo con COBRO-DIA-REAL y SF vivo <$50
-  // (`filasOtrosIngresosOcultos`).
+  // "Otros Ingresos" recibe solo COBRO-DIA-REAL y SF-MENOR-SIN-USAR — se deja
+  // declarada vacía aquí; se llena más abajo vía `filasOtrosIngresosOcultos`.
   const filasOtrosIngresos = [];
 
   // Columna C debe decir "Cobro de otra sucursal" en vez del serie-folio —
@@ -3810,11 +3806,9 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     wsDesglose.autoFilter = { from: 'A1', to: 'G1' };
   }
 
-  // Hoja "Otros Ingresos": desde 2026-09-15 solo trae SF-OCULTO (generado y
-  // usado el mismo día/almacén, ver `ETIQUETA_SALDO_FAVOR_OCULTO`) — el SF
-  // usado normal (sin importar el monto) se movió por completo a su propia
-  // pestaña "Saldos a favor usados" (ver más abajo), reemplazando el criterio
-  // anterior de 2026-08-07 que solo movía aquí los ≤$50.
+  // Hoja "Otros Ingresos": trae COBRO-DIA-REAL y SF-MENOR-SIN-USAR (SF
+  // generado sin usar y menor a $50). SF-OCULTO ya NO va aquí (2026-09-15) —
+  // va a "Movimientos de Saldos a Favor". El SF usado normal tampoco va aquí.
   if (filasOtrosIngresos.length > 0) {
     const wsOtrosIngresos = workbook.addWorksheet('Otros Ingresos');
     wsOtrosIngresos.columns = [

@@ -1,7 +1,8 @@
 const express = require('express');
 const { body } = require('express-validator');
-const { authenticate } = require('../../shared/middleware/auth');
-const { list, listSimple, create, remove } = require('../controllers/periodoFiscal.controller');
+const { authenticate, permit } = require('../../shared/middleware/auth');
+const { PERMISSIONS } = require('../../shared/config/rbac');
+const { list, listSimple, create, remove, cerrar, revertirCierre } = require('../controllers/periodoFiscal.controller');
 
 const router = express.Router();
 
@@ -17,6 +18,9 @@ router.post('/',
   ],
   create,
 );
+
+router.post('/:id/cerrar',           authenticate, cerrar);
+router.post('/:id/revertir-cierre',  authenticate, permit(PERMISSIONS.VISOR_CIERRE_MES_REVERTIR), revertirCierre);
 
 router.delete('/:id', authenticate, remove);
 

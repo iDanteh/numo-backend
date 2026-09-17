@@ -646,6 +646,52 @@ describe('_montoSaldoLinkPorMovimiento — convención invertida (Numo=folio, Au
   });
 });
 
+describe('_montoSaldoLinkPorMovimiento — línea combinada de Kore con 2+ depósitos reales (caso real 2026-09-17, Ferrocarril F0-260900334/SD SOLUTIONS)', () => {
+  // Kore reportó un solo `total` ($1,563.26) para 2 depósitos bancarios reales
+  // distintos ($1,483.32 + $79.94), con "Aut"/"Numo" listando AMBOS folios
+  // separados por coma — el bug real: cada movimiento se atribuía el total
+  // combinado completo (dos veces $1,563.26) en vez de su propia porción.
+  const raw0 = {
+    movimientos: [
+      { serie: 'CBT', folio: '260909894', total: -1563.26,
+        formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 1563.26, adicionales: [
+          { nombre: 'Numo', valor: '1114920,1108956' },
+          { nombre: 'Aut', valor: '044785,044571' },
+        ] }] },
+    ],
+  };
+
+  test('movimiento 044571 ($1,483.32) se topa a su propio depósito, no al total combinado', () => {
+    const mov = { numeroAutorizacion: '1108956', folio: '044571', deposito: 1483.32 };
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(1483.32);
+  });
+
+  test('movimiento 044785 ($79.94) se topa a su propio depósito, no al total combinado', () => {
+    const mov = { numeroAutorizacion: '1114920', folio: '044785', deposito: 79.94 };
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(79.94);
+  });
+
+  test('sin depósito propio conocido (null), se conserva el comportamiento anterior (total completo) en vez de forzar 0', () => {
+    const mov = { numeroAutorizacion: '1108956', folio: '044571', deposito: null };
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(1563.26);
+  });
+
+  test('línea con un solo folio (caso normal, sin coma) NO se topa — comportamiento sin cambios', () => {
+    const raw0Simple = {
+      movimientos: [
+        { serie: 'CBT', folio: '1', total: -1000,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 1000, adicionales: [
+            { nombre: 'Aut', valor: '999888' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '999888', folio: '999888', deposito: 500 };
+    // Aunque el depósito propio (500) sea menor al total (1000), NO es línea
+    // multi-depósito (un solo número en "Aut") — se respeta el total, como siempre.
+    expect(router._montoSaldoLinkPorMovimiento(raw0Simple, mov)).toBe(1000);
+  });
+});
+
 describe('_montoSaldoLinkPorMovimiento — reconoce "Num Recibo" (Depósito en efectivo, caso real 2026-08-24)', () => {
   test('abono propio tageado con Num Recibo se atribuye a este movimiento (no cae en el neteo de "reversa sin tag")', () => {
     const raw0 = {

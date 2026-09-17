@@ -1160,6 +1160,17 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }
+        // ABO con monto negativo (2026-09-17, caso real Hidalgo B0-260900266
+        // $132.80): serieOrigen='ABO' y cobro.monto < 0 significa que el
+        // cliente retiró su saldo a favor en efectivo (dinero SALE de caja,
+        // no entra). El evento ya se contabiliza vía SF-RETIRO-EFECTIVO
+        // cuando el SF fue generado por un CFDI del mismo lote. Cuando el SF
+        // viene de un día anterior (no está en el lote actual),
+        // SF-RETIRO-EFECTIVO no lo captura — pero el ERP tampoco lo incluye
+        // en su corte de efectivo de este día, así que el neto correcto es
+        // $0 (ni suma ni resta aquí). Math.abs() más abajo convertiría el
+        // -132.80 en +132.80, inflando el consolidado de Efectivo.
+        if (origen === 'ABO' && (Number(cobro.monto) || 0) < 0) continue;
         // Bug del ERP (2026-08-14, confirmado con el usuario contra el
         // corte de caja real de Atzompa 09/07 y contra la consulta directa
         // por serie/folio): cuando UN pago real cierra varios tickets con

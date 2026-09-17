@@ -1140,6 +1140,27 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // La porción ANTICIPO ya se captura independientemente vía el
           // path OPA (línea ~1735) — aquí solo se pasan las formasPago
           // NO-anticipo. Si todas son ANTICIPO, no hay dinero nuevo → skip.
+          //
+          // EXCLUSIÓN AGREGADA (2026-09-17, caso real Hidalgo B0-260900019/
+          // B0-260900024, B0-260900040/044, B0-260900073/077,
+          // B0-260900121/132, B0-260900167/185, B0-260900025/029): cuando
+          // el cobro mezcla dinero real CON "Saldo a favor" (no con
+          // Anticipo), es el mismo espejo de siempre — el ERP registra
+          // este mismo cobro EXACTO (mismo monto, misma hora) como 'APS'
+          // en la cuenta que sí generó/consumió el saldo. Contarlo aquí
+          // TAMBIÉN duplica esa porción de dinero real (verificado: 6
+          // pares de tickets en póliza 739 de Hidalgo 1-sep, mismo monto
+          // Efectivo exacto en ambos lados, $472.52 duplicados en total).
+          // El chequeo `tieneFormaReal` de abajo solo excluía Puntos/SF/
+          // Anticipo del CONTEO, pero no rechazaba el cobro COMPLETO
+          // cuando además de dinero real traía una porción de Saldo a
+          // favor — se agrega ese rechazo total aquí, antes de decidir si
+          // hay "forma real". El caso legítimo original de este fix
+          // (B0-260900150, Tarjeta+Anticipo, SIN Saldo a favor) no tiene
+          // este componente, así que sigue aceptándose sin cambios.
+          const tieneSaldoAFavorApa = (cobro.formasPago ?? []).some(fp =>
+            /saldo\s*a\s*favor/i.test(fp.nombre ?? ''));
+          if (tieneSaldoAFavorApa) continue;
           const tieneFormaReal = (cobro.formasPago ?? []).some(fp =>
             !/puntos|saldo\s*a\s*favor|anticipo/i.test(fp.nombre ?? ''));
           if (!tieneFormaReal) continue;

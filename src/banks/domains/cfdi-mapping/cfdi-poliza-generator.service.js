@@ -673,6 +673,23 @@ function _diaMx(fechaIso) {
   return new Date(new Date(fechaIso).getTime() - 6 * 3600 * 1000).toISOString().slice(0, 10);
 }
 
+// Día calendario de un CFDI a partir de SU PROPIO campo `fecha` — a
+// diferencia de `_diaMx` (pensada para timestamps REALES de eventos en UTC,
+// ej. un cobro del ERP), el `fecha` de un CFDI ya viene en hora LOCAL de
+// México aunque Mongo lo guarde con sufijo "Z" — restarle 6h de más (como
+// hace `_diaMx`) rueda al día ANTERIOR cuando la factura se timbra entre
+// 00:00 y 05:59 (bug real confirmado 2026-09-18, Factura Global
+// H0-260900441, `fecha`="2026-09-17T00:00:00.000Z" resolvía a "2026-09-16"
+// en vez de "2026-09-17" — el SF usado real de esa factura, con hora real
+// de uso sí correcta vía `_diaMx`, nunca coincidía con el día de la factura
+// y se descartaba en silencio). Usar SIEMPRE esta función (no `_diaMx`) para
+// el `fecha` propio de un CFDI; `_diaMx` sigue siendo correcta para
+// timestamps de eventos reales (cobros, usos de SF, etc.).
+function _diaCfdi(fechaIso) {
+  if (!fechaIso) return null;
+  return new Date(fechaIso).toISOString().slice(0, 10);
+}
+
 // Diferencia en días calendario (México) entre una fecha/hora ISO (ej. un
 // cobro) y un día ya resuelto en formato 'YYYY-MM-DD' (ej. `_diaMx` de un
 // CFDI) — usada para la tolerancia de ±1 día de facturación diferida (ver
@@ -740,8 +757,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   if (!candidatos.length) return vacio;
 
   // Día de CADA factura (México) — para filtrar cobros/usos que coinciden en
-  // serie/folio pero son de un día distinto (ver `_diaMx`).
-  const diaCfdiPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, _diaMx(cfdi.fecha)]));
+  // serie/folio pero son de un día distinto (ver `_diaCfdi`, NO `_diaMx` —
+  // esto es el `fecha` propio del CFDI, no un timestamp de evento real).
+  const diaCfdiPorClave = new Map(candidatos.map(({ cfdi }) => [`${cfdi.serie}|${cfdi.folio}`, _diaCfdi(cfdi.fecha)]));
 
   // Ticket real de la venta (misma sucursal, factura PUE facturada días
   // después de que ya se cobró) — el CFDI ya declara esa relación en
@@ -2899,7 +2917,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
     for (const c of cfdisReferenciados) {
       const key = `${c.serie}|${c.folio}`;
       if (c.metodoPago === 'PPD') facturasPPD.add(key);
-      const dia = _diaMx(c.fecha);
+      const dia = _diaCfdi(c.fecha); // `fecha` propio del CFDI — ver `_diaCfdi`, no `_diaMx`
       // Si hay varios CFDIs con el mismo serie/folio (visto en producción,
       // registros duplicados), se queda con la fecha MÁS TEMPRANA — es la
       // interpretación más conservadora (más probabilidad de estar dentro
@@ -3116,7 +3134,7 @@ async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fech
   const datosFacturaPorKey = new Map(); // key -> { dia, uuid, nombreCliente, completo }
   for (const c of cfdisFactura) {
     const key = `${c.serie}|${c.folio}`;
-    const dia = _diaMx(c.fecha);
+    const dia = _diaCfdi(c.fecha); // `fecha` propio del CFDI — ver `_diaCfdi`, no `_diaMx`
     const completo = !!c.receptor?.nombre;
     const actual = datosFacturaPorKey.get(key);
     if (!actual || (completo && !actual.completo) || (completo === actual.completo && dia < actual.dia)) {

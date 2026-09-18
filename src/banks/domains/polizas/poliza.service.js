@@ -509,6 +509,11 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     let gross = 0, comision = 0;
     for (const t of (resultado.transacciones ?? [])) {
       if (!terminalesValidas.has(t.terminalID)) continue;
+      // Solo transacciones con status='completed' (confirmado por el usuario
+      // 2026-09-18) — responseCode='00' del query a Kore no garantiza por sí
+      // solo que la transacción siga vigente (podría estar revertida/anulada
+      // después con el mismo responseCode original).
+      if (t.status !== 'completed') continue;
       const monto = Number(t.amount) || 0;
       if (monto <= 0) continue;
       const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);

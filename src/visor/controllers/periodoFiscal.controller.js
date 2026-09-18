@@ -15,6 +15,7 @@
 
 const { validationResult } = require('express-validator');
 const periodoRepo          = require('../repositories/periodo-fiscal.repository');
+const cierreMesRepo        = require('../repositories/cierre-mes-historico.repository');
 const Comparison           = require('../models/Comparison');
 const Discrepancy          = require('../models/Discrepancy');
 const CFDI                 = require('../models/CFDI');
@@ -198,15 +199,53 @@ const cerrar = asyncHandler(async (req, res) => {
     ...(req.body?.rfcEmisor ? { rfcEmisor: req.body.rfcEmisor } : {}),
   };
 
-  const { workbook, filename } = await buildCierreMesWorkbook(query);
+  const { workbook, filename, periodoLabel } = await buildCierreMesWorkbook(query);
+  const fileData = Buffer.from(await workbook.xlsx.writeBuffer());
 
   const userId = req.user?.dbId ? parseInt(req.user.dbId, 10) : null;
   await periodoRepo.cerrar(doc.id, userId);
 
+  // Se guarda el reporte generado en este cierre para poder redescargarlo
+  // después desde Reportes → Cierre de Mes, aunque el período se reabra y
+  // se vuelva a cerrar (cada cierre queda como un registro histórico aparte).
+  await cierreMesRepo.create({
+    periodoFiscalId: doc.id,
+    ejercicio:       doc.ejercicio,
+    periodo:         doc.periodo,
+    periodoLabel:    periodoLabel ?? doc.label ?? null,
+    rfcEmisor:       req.body?.rfcEmisor || null,
+    filename,
+    fileData,
+    fileSize:        fileData.length,
+    cerradoPorId:    userId,
+  });
+
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  await workbook.xlsx.write(res);
-  res.end();
+  res.send(fileData);
+});
+
+/**
+ * GET /api/periodos-fiscales/cierres
+ * Historial de reportes de Cierre de Mes generados (sin el binario del archivo).
+ */
+const listCierres = asyncHandler(async (_req, res) => {
+  const cierres = await cierreMesRepo.findAll();
+  res.json({ data: cierres });
+});
+
+/**
+ * GET /api/periodos-fiscales/cierres/:id/descargar
+ * Redescarga el .xlsx generado en un cierre de mes anterior, tal cual quedó
+ * en ese momento (no se regenera con datos actuales).
+ */
+const descargarCierre = asyncHandler(async (req, res) => {
+  const cierre = await cierreMesRepo.findById(req.params.id);
+  if (!cierre) return res.status(404).json({ error: 'Cierre no encontrado' });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${cierre.filename}"`);
+  res.send(cierre.fileData);
 });
 
 /**
@@ -228,4 +267,4 @@ const revertirCierre = asyncHandler(async (req, res) => {
   res.json(updated);
 });
 
-module.exports = { list, listSimple, create, remove, cerrar, revertirCierre };
+module.exports = { list, listSimple, create, remove, cerrar, revertirCierre, listCierres, descargarCierre };

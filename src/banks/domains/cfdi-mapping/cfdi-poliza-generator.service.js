@@ -727,7 +727,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     cfdi.tipoDeComprobante === 'I' && cfdi.serie && cfdi.folio &&
     rule?.cuentaCargo && [CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS].includes(rule.cuentaCargo),
   );
-  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map(), movimientosPpdPorFacturar: [] };
+  // Facturas REALMENTE presentes en este batch (sincronizadas en Mongo,
+  // cualquiera sea su regla) — usado más abajo para detectar `saldoFavorUsado`
+  // huérfano: un saldo a favor cuyo uso SÍ confirma el ERP, pero cuya factura
+  // consumidora (normalmente una Factura Global) todavía no sincronizó. Sin
+  // esto, ese uso real se pierde en silencio (el loop principal solo consulta
+  // `saldoFavorUsado` iterando `cfdis`, nunca visita una factura que no está
+  // ahí) aunque el dato ya viniera completo desde `/saldos-favor` (confirmado
+  // con el usuario 2026-09-18, caso real H0-260900441/Tehuantepec).
+  const clavesConCfdi = new Set(cfdiConRegla.map(({ cfdi }) => `${cfdi.serie}|${cfdi.folio}`));
+  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map(), movimientosPpdPorFacturar: [], saldoFavorUsadoSinFactura: [] };
   if (!candidatos.length) return vacio;
 
   // Día de CADA factura (México) — para filtrar cobros/usos que coinciden en
@@ -1606,7 +1615,17 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     }
   }
 
-  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar };
+  // Saldo a favor usado, confirmado por el ERP, cuya factura consumidora
+  // (`facturaKey`) no está en este batch — ver comentario en `clavesConCfdi`
+  // arriba. Se expone aparte (nunca se mezcla en `saldoFavorUsado`, que sigue
+  // siendo SOLO lo que el loop por-factura puede consultar) para que el
+  // caller decida cómo mostrarlo sin un CFDI real detrás (solo serie/folio,
+  // sin nombre de cliente ni UUID).
+  const saldoFavorUsadoSinFactura = [...saldoFavorUsado.entries()]
+    .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey))
+    .map(([facturaKey, { monto, detalle }]) => ({ facturaKey, monto, detalle }));
+
+  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar, saldoFavorUsadoSinFactura };
 }
 
 /**
@@ -3820,7 +3839,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaProp = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -5036,9 +5055,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // cfdi-mapping.service.js): tipoOrigen/reglaNombre iguales para que
   // `_extraerCobrosSucursal` (poliza.service.js) la trate exactamente igual
   // (columna C = "SF", sin prefijo "Cobro de otra sucursal").
+  let sfTardioProp = [];
   if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin
       && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
-    const sfTardioProp = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
+    sfTardioProp = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroProp, fechaInicio, fechaFin });
     const ccSfTardioProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
     for (const d of sfTardioProp) {
       const subtotal = Math.round((d.monto / 1.16) * 100) / 100;
@@ -5053,6 +5073,44 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       };
       movimientosResult.push({ ...baseSfTardio, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotal });
       movimientosResult.push({ ...baseSfTardio, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
+    }
+  }
+
+  // Saldo a favor usado (confirmado por el ERP) cuya factura consumidora
+  // todavía no sincronizó en Mongo — ver `saldoFavorUsadoSinFactura` en
+  // `_prefetchAjustesFacturaPropia`. Sin CFDI real no hay cliente ni UUID
+  // confiables, así que se muestra solo con la referencia de la venta que
+  // generó el saldo (serie-folio, auditable en cajas) — igual que el resto
+  // de líneas de SF, pero sin nombre de cliente (confirmado con el usuario
+  // 2026-09-18: mejor mostrarlo así que perderlo en silencio).
+  if (tipoCfdi === 'I' && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
+    const ccSinFacturaProp = serieDelCentroProp ? (ccBySerieMapProp[serieDelCentroProp] ?? null) : null;
+    // Evita duplicar con `sfTardioProp` (arriba) en el caso borde donde AMBOS
+    // aplicarían (factura tardía Y sin sincronizar a la vez): esa función ya
+    // identifica cada uso por la venta CONSUMIDORA (`d.ventaSerie/ventaFolio`
+    // ahí es la cuenta que USÓ el saldo, no la que lo generó) + monto.
+    const yaCubiertoPorSfTardio = new Set(
+      sfTardioProp.map(d => `${d.ventaSerie}|${d.ventaFolio}|${(Math.round((Number(d.monto) || 0) * 100) / 100).toFixed(2)}`),
+    );
+    for (const { detalle } of saldoFavorUsadoSinFacturaProp) {
+      for (const d of (detalle ?? [])) {
+        const monto = Math.abs(Number(d.monto) || 0);
+        if (monto <= 0) continue;
+        const dedupeKeySinFactura = `${d._consumidoraSerie}|${d._consumidoraFolio}|${monto.toFixed(2)}`;
+        if (yaCubiertoPorSfTardio.has(dedupeKeySinFactura)) continue;
+        const subtotalSF = Math.round((monto / 1.16) * 100) / 100;
+        const ivaSF = Math.round((monto - subtotalSF) * 100) / 100;
+        const referenciaVentaSF = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
+          || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+        const baseSinFacturaProp = {
+          concepto: referenciaVentaSF, serie: referenciaVentaSF,
+          centroCosto: ccSinFacturaProp?.clave ?? null, centroCostoId: ccSinFacturaProp?.id ?? null,
+          cfdiUuid: null, cuentaFaltante: false,
+          tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+        };
+        movimientosResult.push({ ...baseSinFacturaProp, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSF });
+        movimientosResult.push({ ...baseSinFacturaProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF });
+      }
     }
   }
 
@@ -5708,7 +5766,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -6556,9 +6614,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Saldo a favor usado en otro día (factura tardía) — ver comentario
   // equivalente en generarPropuesta.
+  let sfTardioGuard = [];
   if (tipoCfdi === 'I' && centroCostoId && fechaInicio && fechaFin
       && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
-    const sfTardioGuard = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
+    sfTardioGuard = await _sfUsadoAntesDeFacturarPorCentro({ rfc, centro: serieDelCentroGuard, fechaInicio, fechaFin });
     const ccSfTardioGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
     for (const d of sfTardioGuard) {
       const subtotalG = Math.round((d.monto / 1.16) * 100) / 100;
@@ -6573,6 +6632,37 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       };
       todosLosMovimientos.push({ ...baseSfTardioG, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalG });
       todosLosMovimientos.push({ ...baseSfTardioG, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaG });
+    }
+  }
+
+  // Saldo a favor usado sin factura sincronizada — ver comentario equivalente
+  // en generarPropuesta (`saldoFavorUsadoSinFacturaProp`).
+  if (tipoCfdi === 'I' && cuentaMap[CODIGO_CUENTA_SALDO_FAVOR] && cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) {
+    const ccSinFacturaGuard = serieDelCentroGuard ? (ccBySerieMap[serieDelCentroGuard] ?? null) : null;
+    // Evita duplicar con `sfTardioGuard` — ver comentario equivalente en
+    // generarPropuesta.
+    const yaCubiertoPorSfTardioGuard = new Set(
+      sfTardioGuard.map(d => `${d.ventaSerie}|${d.ventaFolio}|${(Math.round((Number(d.monto) || 0) * 100) / 100).toFixed(2)}`),
+    );
+    for (const { detalle } of saldoFavorUsadoSinFacturaGuard) {
+      for (const d of (detalle ?? [])) {
+        const monto = Math.abs(Number(d.monto) || 0);
+        if (monto <= 0) continue;
+        const dedupeKeySinFacturaGuard = `${d._consumidoraSerie}|${d._consumidoraFolio}|${monto.toFixed(2)}`;
+        if (yaCubiertoPorSfTardioGuard.has(dedupeKeySinFacturaGuard)) continue;
+        const subtotalSFG = Math.round((monto / 1.16) * 100) / 100;
+        const ivaSFG = Math.round((monto - subtotalSFG) * 100) / 100;
+        const referenciaVentaSFG = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
+          || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+        const baseSinFacturaGuard = {
+          concepto: referenciaVentaSFG, serie: referenciaVentaSFG,
+          centroCosto: ccSinFacturaGuard?.clave ?? null, centroCostoId: ccSinFacturaGuard?.id ?? null,
+          cfdiUuid: null, cuentaFaltante: false,
+          tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+        };
+        todosLosMovimientos.push({ ...baseSinFacturaGuard, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSFG });
+        todosLosMovimientos.push({ ...baseSinFacturaGuard, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSFG });
+      }
     }
   }
 

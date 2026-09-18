@@ -105,6 +105,11 @@ beforeEach(() => {
   // para armar el Set de referencias ya conocidas de este erpId (ver _aportesPorErpIdCronologico) —
   // default sin ninguna previa, los tests que la necesiten la sobreescriben explícitamente.
   ErpReversion.find.mockReturnValue({ distinct: jest.fn().mockResolvedValue([]) });
+  // 2026-09-18: _atribucionInconsistente (llamada interna, no exportada) ahora también
+  // consulta erpRoutes._retencionVigente(raw0) — default "sin retención" acá para que los
+  // tests preexistentes que nunca se preocuparon por esto (y no la mockeaban) no truenen al
+  // desestructurar `undefined`. Los tests de retención de abajo la sobreescriben explícitamente.
+  erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: false, montoRetenido: null });
 });
 
 afterEach(() => {
@@ -603,6 +608,98 @@ describe('procesarReversionKore — red de seguridad de atribución (2026-08-21,
     });
 
     expect(mov.save).toHaveBeenCalledTimes(1);
+    expect(mov.erpLinks[0].saldoErpAportado).toBe(200);
+    expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({ atribucionConfiable: true }));
+  });
+});
+
+describe('procesarReversionKore — atribución ambigua en falso por retención vigente (2026-09-18, caso real erpId 6a623ad30c57b7000171373b / A0-260703646)', () => {
+  function mockRangoYSync(raw0) {
+    erpRoutes._rangoDesdeFollo.mockReturnValue({ fechaDesde: '2026-09-01', fechaHasta: '2026-09-30' });
+    erpRoutes._sincronizarConRetry.mockResolvedValue({ raw: [raw0] });
+  }
+
+  test('caso real: pago revertido a $0 exacto contra una CxC con retención de $91.98 — ya NO se marca ambiguo, se desvincula normal', async () => {
+    const mov = fakeMov({
+      _id: 'mov-1', erpIds: ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 10024.57, total: 10116.55, saldoErpAportado: 10024.57, serie: 'A0', folioExterno: '260703646' }],
+      deposito: 14556.89,
+      status: 'identificado',
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-retencion-1' });
+
+    // raw0.total - raw0.saldoActual = 91.98 (la retención vieja, nada que ver con el reverso
+    // de hoy) — mismos números exactos del caso real.
+    mockRangoYSync({ total: 10116.55, saldoActual: 10024.57, movimientos: [] });
+    erpRoutes._erpIdIdentificadoPorHumano.mockReturnValue(true);
+    // El abono conocido (referencia) y su reversa quedan excluidos por identidad — a este
+    // movimiento ya no le queda NADA atribuible (ausente del Map, no un 0 explícito).
+    erpRoutes._aportesPorErpIdCronologico.mockReturnValue(new Map());
+    erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: true, montoRetenido: 91.98 });
+
+    await procesarReversionKore({
+      erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '260703646',
+      referencia: '6aac451e8faa5c000173e53a', motivo: 'DALI',
+    });
+
+    // Ya NO queda "sin_tocar" — se desvincula normal, como cualquier reversión resuelta.
+    expect(mov.erpIds).toEqual([]);
+    expect(mov.erpLinks).toEqual([]);
+    expect(mov.status).toBe('no_identificado');
+    expect(mov.save).toHaveBeenCalledTimes(1);
+    expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({
+      atribucionConfiable: true,
+      movimientosAfectados: [expect.objectContaining({ movementId: 'mov-1', tipo: 'desvinculado' })],
+    }));
+  });
+
+  test('retención + pago parcial real correctamente calculado: reconcilia con el fix (sin él, hubiera dado falso ambiguo)', async () => {
+    const mov = fakeMov({
+      _id: 'mov-1', erpIds: ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 0, total: 1000, saldoErpAportado: 900, serie: 'A0', folioExterno: '500' }],
+      deposito: 900,
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-retencion-2' });
+
+    // raw0.total - raw0.saldoActual = 1000 (incluye $100 de retención + $900 de pago real).
+    // sumaCalculada (solo el aporte bancario real, ya sin la retención) = 900 — sin restar la
+    // retención, 900 vs 1000 dispararía "ambiguo" en falso.
+    mockRangoYSync({ total: 1000, saldoActual: 0, movimientos: [] });
+    erpRoutes._erpIdIdentificadoPorHumano.mockReturnValue(true);
+    erpRoutes._aportesPorErpIdCronologico.mockReturnValue(new Map([[0, 900]]));
+    erpRoutes._backfillFormasPagoYFolioFiscal.mockReturnValue({ saldoPagadoTotal: 900, saldoPagado: 900, folioFiscal: null });
+    erpRoutes._movimientosKoreDesde.mockReturnValue([]);
+    erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: true, montoRetenido: 100 });
+
+    await procesarReversionKore({ erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '500' });
+
+    expect(mov.erpLinks).toHaveLength(1); // sigue vinculado — se AJUSTÓ, no se desvinculó
+    expect(mov.erpLinks[0].saldoErpAportado).toBe(900);
+    expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({
+      atribucionConfiable: true,
+      movimientosAfectados: [expect.objectContaining({ movementId: 'mov-1', tipo: 'ajustado' })],
+    }));
+  });
+
+  test('sin retención (montoRetenido:null): comportamiento idéntico a antes del fix', async () => {
+    const mov = fakeMov({
+      _id: 'mov-1', erpIds: ['CXC-1'],
+      erpLinks: [{ erpId: 'CXC-1', saldoActual: 100, total: 300, saldoErpAportado: 300, serie: 'A0', folioExterno: '100' }],
+      deposito: 100,
+    });
+    BankMovement.find.mockResolvedValue([mov]);
+    ErpReversion.create.mockResolvedValue({ _id: 'rev-sin-retencion' });
+    mockRangoYSync({ total: 300, saldoActual: 100, movimientos: [{ fecha: '2026-09-01T00:00:00Z', total: 100 }] });
+    erpRoutes._erpIdIdentificadoPorHumano.mockReturnValue(true);
+    erpRoutes._aportesPorErpIdCronologico.mockReturnValue(new Map([[0, 200]])); // reconcilia: 300-100-0=200
+    erpRoutes._backfillFormasPagoYFolioFiscal.mockReturnValue({ saldoPagadoTotal: 200, saldoPagado: 200, folioFiscal: null });
+    erpRoutes._movimientosKoreDesde.mockReturnValue([]);
+    erpRoutes._retencionVigente.mockReturnValue({ tieneRetencion: false, montoRetenido: null });
+
+    await procesarReversionKore({ erpId: 'CXC-1', serieExterna: 'A0', folioExterno: '100', fecha: '2026-09-01T00:00:00Z' });
+
     expect(mov.erpLinks[0].saldoErpAportado).toBe(200);
     expect(ErpReversion.create).toHaveBeenCalledWith(expect.objectContaining({ atribucionConfiable: true }));
   });

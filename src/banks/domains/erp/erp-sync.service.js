@@ -154,6 +154,14 @@ async function sincronizarCuentasPendientes(params = {}) {
 // serie/folio" (incompleto), dejando cobros reales sin encontrar y
 // fragmentando la venta en líneas "Venta Sin Cobro" (caso real B0-260803791,
 // $24,981.27 cobrados en Efectivo, solo $1,462.89 se reconciliaban).
+//
+// 2026-09-18: el hallazgo de arriba nunca se tradujo en cambiar el timeout
+// real — seguía en 30000. Confirmado que sigue insuficiente para consultas
+// "por centro" de un día completo en sucursales grandes (D0/Hidalgo,
+// H0/Tehuantepec): 3 intentos de 30s agotados igual, generarYGuardar
+// terminaba en 500. Subido a 45000 (un intento aislado SÍ respondió en ~47s
+// totales incluyendo backoff, probado en vivo contra el ERP real ese mismo
+// día).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   const token = await _tokenPolizas();
@@ -162,7 +170,7 @@ async function _getConReintento(url, params, logLabel) {
       return await axios.get(url, {
         params,
         headers: { Authorization: `Bearer ${token}` },
-        timeout: 30000,
+        timeout: 45000,
       });
     } catch (axErr) {
       const status    = axErr.response?.status;

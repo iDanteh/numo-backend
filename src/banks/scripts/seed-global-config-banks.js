@@ -117,6 +117,7 @@ async function seedBancos(fallos) {
       'NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreTipoTransferencia esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
       'NOMBRE_CAJA_DESTINO_PERMITIDAS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreCajaDestino esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
       'TRANSFERENCIAS_DATE_WINDOW_DAYS — Ventana de fecha (± días) del matching de transferencias entre cajas contra Depósito en efectivo. Distinta de DATE_WINDOW_DAYS (esa es del motor ERP↔CxC).',
+      'NETPAY_DATE_WINDOW_DAYS — Ventana de fecha (± días) del matching Netpay↔BBVA (liquidación de terminal contra depósito bancario). Distinta de TRANSFERENCIAS_DATE_WINDOW_DAYS (ese matching es contra Depósito en efectivo, este contra BBVA).',
       'FICHAS_IMAGEN_FOLDER_ID — ID de la carpeta de Google Drive donde se guardará la imagen/documento de respaldo de una ficha bancaria (misma cuenta de servicio que COMPROBANTES_IMAGEN_FOLDER_ID en la sección Solicitudes de Cobro, GOOGLE_SERVICE_ACCOUNT_KEY2 — hay que compartirle esta carpeta también). El usuario la declara él mismo desde esta UI, no se siembra con un valor.',
     ],
   });
@@ -228,6 +229,23 @@ async function seedBancos(fallos) {
       usuarioNombre: 'seed-script',
     });
     console.log('[seed-banks] bancos.TRANSFERENCIAS_DATE_WINDOW_DAYS = 5 (default de arranque — ajustable desde la UI)');
+  });
+
+  // NETPAY_DATE_WINDOW_DAYS (Fase C del matching Netpay↔BBVA) — mismo criterio "solo si no
+  // existe" que TRANSFERENCIAS_DATE_WINDOW_DAYS: valor de tuning ajustable por un admin, un
+  // re-run del seed no debe resetearlo.
+  await _sembrarClave(fallos, 'bancos', 'NETPAY_DATE_WINDOW_DAYS', async () => {
+    const yaExiste = await svc.getValue('bancos', 'NETPAY_DATE_WINDOW_DAYS').then(() => true).catch(() => false);
+    if (yaExiste) {
+      console.log('[seed-banks] bancos.NETPAY_DATE_WINDOW_DAYS ya existe — no se pisa.');
+      return;
+    }
+    await svc.setValue('bancos', 'NETPAY_DATE_WINDOW_DAYS', '2', {
+      esSecreto: false, tipo: 'numero',
+      descripcion: 'Ventana de fecha (± días) del matching Netpay↔BBVA (liquidación de terminal contra depósito bancario). Default de arranque, ajustable desde la UI.',
+      usuarioNombre: 'seed-script',
+    });
+    console.log('[seed-banks] bancos.NETPAY_DATE_WINDOW_DAYS = 2 (default de arranque — ajustable desde la UI)');
   });
 
   // FICHAS_IMAGEN_FOLDER_ID (2026-09-03) — NO se siembra desde acá a propósito: el usuario

@@ -21,30 +21,15 @@
 
 const CollectionRequest = require('./CollectionRequest.model');
 const { movimientosDe } = require('./collection-request-asignaciones');
-const { horasHabilesEntre, promedio, mediana } = require('../banks/bank-indicadores.service');
+const { horasHabilesEntre, promedio, mediana, _matchScopeUserId } = require('../banks/bank-indicadores.service');
 
 const MS_PER_HOUR = 3600000;
 
-// 2026-09-07 (pedido explícito del usuario): admin puede acotar el panel a uno o varios
-// contadores específicos (antes solo "todo el equipo" vs. "solo lo propio", fijo por
-// rol) — scopeUserId puede llegar como array además del escalar de siempre. Helper
-// compartido para no duplicar el `Array.isArray` en los 2 puntos donde se arma el match.
-//
-// Defensa en profundidad (hallazgo WARNING de la revisión de confiabilidad
-// independiente, 2026-09-07): un array VACÍO se trata explícitamente como "sin filtro"
-// (mismo resultado que scopeUserId undefined/null), nunca como `{ $in: [] }` (que
-// matchearía CERO documentos). Hoy la ruta HTTP (_resolveScopeUserId en
-// collection-request.routes.js) ya normaliza un array vacío a `undefined` antes de
-// llegar acá, así que este caso no es alcanzable en producción por ese camino — pero
-// esta función es exportada/reusable (getIndicadoresSolicitudesCobro/
-// getDistribucionSolicitudesCobro la llaman directo con lo que reciban), y no debe
-// depender de que el único caller existente la blindee por ella.
-function _matchScopeUserId(scopeUserId) {
-  if (Array.isArray(scopeUserId)) {
-    return scopeUserId.length ? { $in: scopeUserId } : undefined;
-  }
-  return scopeUserId;
-}
+// _matchScopeUserId reubicada a bank-indicadores.service.js (2026-09-17) — el dashboard de
+// Cobranza necesita EXACTAMENTE el mismo criterio de scoping (admin acota a uno/varios
+// usuarios vía array, array vacío = sin filtro, nunca `$in:[]`) para acotar
+// getIndicadoresIdentificacion(), así que se centralizó en vez de mantener 2 copias
+// idénticas. Comportamiento sin cambios — ver ese archivo para el detalle completo.
 
 // Fecha de corte del indicador — decisión explícita del usuario (2026-08-20, mismo
 // criterio que INDICADORES_DESDE en bank-indicadores.service.js): solo se miden

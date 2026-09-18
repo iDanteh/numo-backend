@@ -1,7 +1,8 @@
 'use strict';
 
+const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
-const { _rangoAnioMesMexico } = require('./bank.service');
+const { _rangoAnioMesMexico, _inicioDiaMx, _finDiaMx } = require('./bank.service');
 
 const MS_PER_HOUR = 3600000;
 
@@ -86,6 +87,19 @@ function _comoRelojMexico(fechaReal) {
   return new Date(fechaReal.getTime() - 6 * MS_PER_HOUR);
 }
 
+// "Hoy" en horario de México como string YYYY-MM-DD — insumo de _inicioDiaMx/_finDiaMx
+// (bank.service.js, ya usados por exportMovements para sus propios filtros de fecha), que
+// resuelven el offset fijo -06:00 a instantes UTC reales. Reusa _comoRelojMexico (mismo
+// criterio que el resto de este archivo) para no depender del TZ del proceso (el
+// contenedor de producción corre en UTC, sin TZ fijado).
+function _hoyMexicoStr() {
+  const mx = _comoRelojMexico(new Date());
+  const yyyy = mx.getUTCFullYear();
+  const mm   = String(mx.getUTCMonth() + 1).padStart(2, '0');
+  const dd   = String(mx.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
 /**
  * Horas hábiles entre 2 timestamps: lunes-sábado, 8:00-20:00 EN HORA DE MÉXICO (ver
  * _comoRelojMexico — 2026-09-09, antes usaba hora local del proceso, lo que rompía el cálculo
@@ -119,6 +133,21 @@ function horasHabilesEntre(inicio, fin) {
   return totalMs / MS_PER_HOUR;
 }
 
+// Reubicada acá 2026-09-17 (antes vivía solo en collection-request-indicadores.service.js,
+// que la usaba para acotar Solicitudes de Cobro a uno/varios contadores elegidos por un
+// admin) — el dashboard de Cobranza necesita EXACTAMENTE el mismo criterio para acotar
+// getIndicadoresIdentificacion() a uno o varios integrantes del equipo, así que se centraliza
+// acá (el archivo "base" que ya exporta promedio/mediana/horasHabilesEntre para ambos
+// dominios) en vez de mantener 2 copias idénticas. Comportamiento sin cambios: escalar →
+// filtro exacto; array → `$in`; array VACÍO → `undefined` (sin filtro, nunca `$in:[]`, que
+// matchearía cero documentos).
+function _matchScopeUserId(scopeUserId) {
+  if (Array.isArray(scopeUserId)) {
+    return scopeUserId.length ? { $in: scopeUserId } : undefined;
+  }
+  return scopeUserId;
+}
+
 function promedio(valores) {
   if (!valores.length) return null;
   return valores.reduce((a, b) => a + b, 0) / valores.length;
@@ -137,34 +166,100 @@ function mediana(valores) {
 }
 
 /**
- * Indicadores de tiempo de identificación de movimientos bancarios — cuánto tarda un
- * usuario en marcar un depósito como `identificado` desde que se cargó en Numo
- * (`primeraIdentificacionAt - createdAt`, en HORAS HÁBILES — ver horasHabilesEntre()).
- * Acotado a depósitos (deposito > 0, sin oculto), igual criterio que getCards() — ver
- * buildBaseMatch().
+ * Arma el $match completo de "tiempo/porUsuario" (find() sobre BankMovement) — extraído
+ * 2026-09-18 para que getIndicadoresIdentificacion() Y el reporte descargable
+ * (buildReporteIdentificacion()) usen EXACTAMENTE el mismo criterio de filtro. Cero margen
+ * de que la pantalla y el Excel descargado diverjan.
  *
  * @param {object} [opts]
  * @param {string} [opts.banco]
  * @param {string} [opts.categoria]
- * @param {string|number} [opts.year]  - limita el promedio/mediana general y el desglose
- *   por usuario a ese año (y mes, si también viene). El backlog NO se acota por year/month:
- *   la antigüedad de un pendiente se mide contra AHORA, no contra un periodo pasado (y
- *   sigue en tiempo de RELOJ, no horas hábiles — ver Pipeline 2 abajo).
- *   El backlog cuenta status no_identificado + reclasificado (BACKLOG_STATUSES) — ambos
- *   son trabajo real sin cerrar; "otros" queda afuera por ser un estatus terminal.
+ * @param {string|number} [opts.year]  - filtra por `fecha` (la fecha de la transacción
+ *   bancaria) vía `_rangoAnioMesMexico`. Ignorado por completo si viene `fechaInicio`+
+ *   `fechaFin` (ver abajo) — el rango explícito SIEMPRE gana.
+ * @param {string|number} [opts.month]
+ * @param {string} [opts.fechaInicio] `YYYY-MM-DD` (hora de México) — junto con `fechaFin`,
+ *   acota `primeraIdentificacionAt` a ese rango de DÍAS completos (inicio/fin de día en
+ *   México, vía `_inicioDiaMx`/`_finDiaMx`). Mismo criterio de precedencia que
+ *   `rangoFechas()` del panel hermano (Solicitudes de Cobro): un rango explícito gana
+ *   sobre `year`/`month` y sobre el default "hoy" — se ignora `year`/`month` por completo
+ *   en ese caso (ni `matchConFecha` se acota por `fecha`).
+ * @param {string} [opts.fechaFin] Ver `fechaInicio`. Ambos deben venir juntos para activar
+ *   el rango explícito — si falta uno de los dos, se ignoran los dos y se cae al
+ *   comportamiento de `year`/`month`/default-hoy de siempre.
+ *
+ *   **Sin rango explícito y sin `year` (default, 2026-09-18)**: el indicador NO promedia
+ *   todo el histórico desde INDICADORES_DESDE sin tope — se acota a HOY en horario de
+ *   México, anclado por `primeraIdentificacionAt` (identificados HOY), NO por
+ *   `fecha`/`createdAt` (creados hoy). Motivo: un depósito creado hoy normalmente todavía
+ *   no se identificó (tarda horas/días), así que anclar por creación dejaría el indicador
+ *   casi vacío la mayor parte del día y sesgaría el promedio hacia los casos más rápidos
+ *   (survivorship bias). Anclar por identificación da "cuánto tardaron los que el equipo
+ *   cerró hoy, sin importar cuándo llegaron" — la foto diaria correcta. Ver `_hoyMexicoStr()`.
+ *
+ *   El backlog NO se acota por year/month, rango explícito, NI por el default de "hoy" —
+ *   sigue siendo siempre la antigüedad de TODOS los pendientes actuales: la antigüedad de
+ *   un pendiente se mide contra AHORA, no contra un periodo pasado (y sigue en tiempo de
+ *   RELOJ, no horas hábiles — ver Pipeline 2 en getIndicadoresIdentificacion). El backlog
+ *   cuenta status no_identificado + reclasificado (BACKLOG_STATUSES) — ambos son trabajo
+ *   real sin cerrar; "otros" queda afuera por ser un estatus terminal.
  *   Tanto el promedio como el backlog están acotados además a `createdAt >= INDICADORES_DESDE`
  *   (ver constante arriba) — el dashboard completo mide solo desde su propia implementación.
- * @param {string|number} [opts.month]
+ * @param {string|string[]} [opts.scopeUserId] Dashboard de Cobranza (2026-09-17): acota
+ *   promedio/mediana/porUsuario a quien IDENTIFICÓ el movimiento
+ *   (`primeraIdentificacionPor.userId`) — escalar (ej. un no-admin viendo solo lo suyo) o
+ *   array (admin acotando a uno o varios integrantes del equipo elegidos a mano). Mismo
+ *   criterio que `_matchScopeUserId` (ver arriba): un array VACÍO se trata como "sin
+ *   filtro" (equipo completo), nunca como `$in:[]`.
  */
-async function getIndicadoresIdentificacion({ banco, categoria, year, month } = {}) {
-  const matchConFecha = applyDateRange(buildBaseMatch({ banco, categoria }), year, month);
-  const matchSoloBancoCategoria = { ...buildBaseMatch({ banco, categoria }), createdAt: { $gte: INDICADORES_DESDE } };
+function _resolverMatchTiempo({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId } = {}) {
+  const rangoExplicito = !!(fechaInicio && fechaFin);
+
+  // Rango explícito gana por completo: ni year/month se aplican a `fecha`, ni el default
+  // "hoy" entra en juego — mismo criterio de precedencia que rangoFechas() del hermano.
+  const matchConFecha = rangoExplicito
+    ? buildBaseMatch({ banco, categoria })
+    : applyDateRange(buildBaseMatch({ banco, categoria }), year, month);
+
+  let primeraIdentificacionAtMatch;
+  if (rangoExplicito) {
+    primeraIdentificacionAtMatch = { $ne: null, $gte: _inicioDiaMx(fechaInicio), $lte: _finDiaMx(fechaFin) };
+  } else if (year) {
+    primeraIdentificacionAtMatch = { $ne: null };
+  } else {
+    // Default "hoy" (2026-09-18, ver JSDoc arriba).
+    primeraIdentificacionAtMatch = { $ne: null, $gte: _inicioDiaMx(_hoyMexicoStr()), $lte: _finDiaMx(_hoyMexicoStr()) };
+  }
+
   const matchTiempo = {
     ...matchConFecha,
     status: 'identificado',
-    primeraIdentificacionAt: { $ne: null },
+    primeraIdentificacionAt: primeraIdentificacionAtMatch,
     createdAt: { $gte: INDICADORES_DESDE },
   };
+  // scopeUserId truthy pero resuelto a undefined (array vacío) no debe dejar la clave en el
+  // match — mismo cuidado que collection-request-indicadores.service.js#getIndicadoresSolicitudesCobro.
+  const scopedUserId = scopeUserId ? _matchScopeUserId(scopeUserId) : undefined;
+  if (scopedUserId !== undefined) {
+    matchTiempo['primeraIdentificacionPor.userId'] = scopedUserId;
+  }
+  return matchTiempo;
+}
+
+/**
+ * Indicadores de tiempo de identificación de movimientos bancarios — cuánto tarda un
+ * usuario en marcar un depósito como `identificado` desde que se cargó en Numo
+ * (`primeraIdentificacionAt - createdAt`, en HORAS HÁBILES — ver horasHabilesEntre()).
+ * Acotado a depósitos (deposito > 0, sin oculto), igual criterio que getCards() — ver
+ * buildBaseMatch(). Ver `_resolverMatchTiempo()` para el detalle completo de filtros
+ * (`year`/`month`/`fechaInicio`/`fechaFin`/`scopeUserId` y su precedencia).
+ *
+ * @param {object} [opts] Ver `_resolverMatchTiempo()`.
+ */
+async function getIndicadoresIdentificacion(opts = {}) {
+  const { banco, categoria } = opts;
+  const matchTiempo = _resolverMatchTiempo(opts);
+  const matchSoloBancoCategoria = { ...buildBaseMatch({ banco, categoria }), createdAt: { $gte: INDICADORES_DESDE } };
 
   const [identificados, backlogAgg] = await Promise.all([
     // Trae los documentos ya identificados (equipo completo, desde INDICADORES_DESDE) para
@@ -223,7 +318,98 @@ async function getIndicadoresIdentificacion({ banco, categoria, year, month } = 
   };
 }
 
-// promedio/mediana también se exportan para collection-request-indicadores.service.js
-// (mismo dominio conceptual — tiempo de identificación — pero acotado a Solicitudes de
-// Cobro, ver ese archivo).
-module.exports = { getIndicadoresIdentificacion, horasHabilesEntre, promedio, mediana };
+/**
+ * Reporte Excel descargable del dashboard de Cobranza (2026-09-18, pedido explícito del
+ * usuario: "el rango de fechas que ya tiene Solicitudes de Cobro, para medir el día o días
+ * que se deseen y poder descargar esta información") — mismos `opts` que
+ * `getIndicadoresIdentificacion()` (reusa `_resolverMatchTiempo()`, así que el Excel
+ * descargado SIEMPRE refleja exactamente lo mismo que está en pantalla, cero margen de
+ * divergencia). Un solo worksheet (a diferencia del reporte de Solicitudes de Cobro, acá
+ * TODO lo que entra ya es `status:'identificado'` — no hay "Autorizadas"/"Rechazadas" que
+ * separar).
+ */
+async function buildReporteIdentificacion(opts = {}) {
+  const matchTiempo = _resolverMatchTiempo(opts);
+
+  const movimientos = await BankMovement.find(matchTiempo)
+    .select('banco fecha concepto deposito categoria createdAt primeraIdentificacionAt primeraIdentificacionPor')
+    .sort({ primeraIdentificacionAt: 1 })
+    .lean();
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Cobranza';
+  wb.created = new Date();
+  const sheet = wb.addWorksheet('Identificación');
+
+  sheet.columns = [
+    { header: 'Banco',                   key: 'banco',               width: 13 },
+    { header: 'Fecha depósito',          key: 'fecha',               width: 18 },
+    { header: 'Concepto',                key: 'concepto',            width: 45 },
+    { header: 'Depósito',                key: 'deposito',            width: 15 },
+    { header: 'Categoría',               key: 'categoria',           width: 18 },
+    { header: 'Identificado por',        key: 'identificadoPor',     width: 22 },
+    { header: 'Fecha de identificación', key: 'identificadoAt',      width: 18 },
+    { header: 'Horas hábiles',           key: 'horasHabiles',        width: 14 },
+    { header: 'Creado en Numo',          key: 'createdAt',           width: 18 },
+  ];
+
+  for (const m of movimientos) {
+    sheet.addRow({
+      banco:           m.banco ?? null,
+      fecha:           m.fecha ?? null,
+      concepto:        m.concepto ?? null,
+      deposito:        m.deposito ?? null,
+      categoria:       m.categoria ?? null,
+      identificadoPor: m.primeraIdentificacionPor?.nombre ?? m.primeraIdentificacionPor?.userId ?? null,
+      identificadoAt:  m.primeraIdentificacionAt ?? null,
+      horasHabiles:    Math.round(horasHabilesEntre(m.createdAt, m.primeraIdentificacionAt) * 10) / 10,
+      createdAt:       m.createdAt ?? null,
+    });
+  }
+
+  const dateFmt = 'dd/mm/yyyy hh:mm';
+  ['fecha', 'identificadoAt', 'createdAt'].forEach(key => { sheet.getColumn(key).numFmt = dateFmt; });
+  sheet.getColumn('deposito').numFmt = '#,##0.00';
+
+  const headerRow = sheet.getRow(1);
+  headerRow.height = 22;
+  headerRow.font   = { bold: true, color: { argb: 'FFE0E7FF' }, size: 10 };
+  headerRow.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+
+  if (sheet.lastColumn) sheet.autoFilter = { from: 'A1', to: sheet.lastColumn.letter + '1' };
+  sheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+  return wb.xlsx.writeBuffer();
+}
+
+// Contraparte de listContadoresConSolicitudesIdentificadas() (collection-request-indicadores
+// .service.js) pero sobre BankMovement.primeraIdentificacionPor.userId — auth0Subs con
+// actividad REAL de identificación (cualquier vía), para poblar un filtro de "elegí a quién
+// ver" (dashboard de Cobranza) sin ofrecer usuarios que nunca identificaron nada.
+// Deliberadamente SIN cruzar contra el rol actual del usuario (mismo criterio ya corregido
+// una vez en el archivo hermano, 2026-09-07): alguien pudo identificar movimientos mientras
+// tenía rol 'cobranza' y cambiar de rol después — filtrar por rol ACTUAL excluiría ese
+// trabajo histórico real. El caller (frontend) decide cómo cruzar esta lista contra el
+// catálogo de usuarios/roles para armar sus chips sugeridos.
+async function listUsuariosConIdentificaciones() {
+  const ids = await BankMovement.distinct('primeraIdentificacionPor.userId', {
+    status: 'identificado',
+    primeraIdentificacionPor: { $ne: null },
+    createdAt: { $gte: INDICADORES_DESDE },
+  });
+  return ids.filter(Boolean);
+}
+
+// promedio/mediana/_matchScopeUserId también se exportan para
+// collection-request-indicadores.service.js (mismo dominio conceptual — tiempo de
+// identificación — pero acotado a Solicitudes de Cobro, ver ese archivo).
+module.exports = {
+  getIndicadoresIdentificacion,
+  buildReporteIdentificacion,
+  listUsuariosConIdentificaciones,
+  horasHabilesEntre,
+  promedio,
+  mediana,
+  _matchScopeUserId,
+};

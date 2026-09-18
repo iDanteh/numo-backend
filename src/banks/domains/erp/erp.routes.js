@@ -36,10 +36,15 @@ const { listarPendientesDeFicha }        = require('./caja-transferencia-ficha-p
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay }    = require('./netpay-transacciones.service');
+const { obtenerBandejaNetpay }            = require('./netpay-match.service');
+const { confirmarMatchNetpay, descartarMatchNetpay } = require('./netpay-match-confirm.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
 // cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
 // se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
 require('./caja-transferencia-revert.service').init();
+// Mismo mecanismo, para el matching Netpay↔BBVA (ver netpay-match-revert.service.js) —
+// borra el NetpayMatch al desvincular su erpId sintético NETPAY-<terminalID>-<día>.
+require('./netpay-match-revert.service').init();
 // Registra en global-config.service.js el hook que reaplica el filtro de transferencias
 // de caja automáticamente cuando cambia NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS/
 // NOMBRE_CAJA_DESTINO_PERMITIDAS (ver caja-transferencia-sync.service.js#init) — pedido
@@ -403,6 +408,36 @@ router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMIS
 router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
   const { responseCode, almacenes, dateFrom, dateTo, terminalID } = req.query;
   const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo, terminalID });
+  res.json(resultado);
+}));
+
+// GET /api/erp/netpay/bandeja — matching Netpay↔BBVA (ver netpay-match.service.js): agrupa
+// las transacciones del rango por almacen+terminalID+día y busca candidatos BBVA para cada
+// grupo sin resolver todavía. TODO EN VIVO (sin sync/cron) — dateFrom/dateTo acotan el rango
+// de Kore a consultar, mismos parámetros que /netpay/transacciones. Mismo permiso que el
+// resto de la sección.
+router.get('/netpay/bandeja', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { dateFrom, dateTo, terminalID } = req.query;
+  const resultado = await obtenerBandejaNetpay({ dateFrom, dateTo, terminalID });
+  res.json(resultado);
+}));
+
+// POST /api/erp/netpay/bandeja/confirmar — confirma un grupo (terminalID+día) contra 1 o 2
+// BankMovement elegidos por el usuario. Re-valida elegibilidad y neto recalculado EN VIVO
+// server-side (netpay-match-confirm.service.js) — nunca confía en que el candidato que
+// manda el cliente sigue siendo válido.
+router.post('/netpay/bandeja/confirmar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { terminalID, almacen, dia, movementIds } = req.body;
+  const resultado = await confirmarMatchNetpay({ terminalID, almacen, dia, movementIds, user: req.user });
+  res.json(resultado);
+}));
+
+// POST /api/erp/netpay/bandeja/descartar — descarta MANUALMENTE un grupo 'pendiente' sin
+// candidatos, cuando un contador sabe (por fuera de este panel) que ya fue identificado.
+// NUNCA vincula nada contra Kore/CxC — ver netpay-match-confirm.service.js#descartarMatchNetpay.
+router.post('/netpay/bandeja/descartar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { terminalID, almacen, dia } = req.body;
+  const resultado = await descartarMatchNetpay({ terminalID, almacen, dia, user: req.user });
   res.json(resultado);
 }));
 

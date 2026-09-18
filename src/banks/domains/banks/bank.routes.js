@@ -100,12 +100,55 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   res.json(await service.getCards(restrictions, year, month));
 }));
 
-// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos). Siempre de
-// TODO el equipo, sin distinción de scope por rol — ver
-// bank-indicadores.service.js#getIndicadoresIdentificacion para el criterio completo.
+// Dashboard de Cobranza (2026-09-17): mismo criterio de scope que
+// collection-request.routes.js#_resolveScopeUserId (admin ve todo el equipo o acota vía
+// ?userIds=, cualquier otro rol queda forzado a lo propio), pero resuelto vía PERMISO
+// (BANKS_CONFIG) en vez de comparar `req.user.role === 'admin'` a mano — este archivo YA usa
+// exactamente ese permiso para la misma distinción "equipo completo vs. scope propio" en
+// /cards, /stats y /years (ver hasFullAccess ahí), así que se reusa el mismo criterio en vez
+// de introducir un chequeo de rol literal que no existe en ningún otro lado de este router.
+// `String(...)` antes de `.split(',')` neutraliza una posible inyección de objeto de
+// Express/qs (`?userIds[a]=x`), mismo cuidado que el helper equivalente de collection-requests.
+function _resolverScopeUserIdBancos(req, hasFullAccess) {
+  if (!hasFullAccess) return req.user._id;
+  const userIds = String(req.query.userIds || '').split(',').map(s => s.trim()).filter(Boolean);
+  return userIds.length ? userIds : undefined;
+}
+
+// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos). Con
+// BANKS_CONFIG (equipo completo, o acotado a ?userIds= elegidos a mano — dashboard de
+// Cobranza); sin BANKS_CONFIG, forzado al propio usuario — ver
+// bank-indicadores.service.js#getIndicadoresIdentificacion para el criterio completo del
+// scope y por qué el backlog nunca se acota.
 router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const { banco, categoria, year, month } = req.query;
-  res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month }));
+  const { banco, categoria, year, month, fechaInicio, fechaFin } = req.query;
+  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const scopeUserId = _resolverScopeUserIdBancos(req, hasFullAccess);
+  res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId }));
+}));
+
+// GET /api/banks/indicadores/reporte — Excel descargable del dashboard de Cobranza
+// (2026-09-18). Mismo permiso que /indicadores (BANKS_READ), NO BANKS_EXPORT ni un permiso
+// nuevo: es la MISMA data que ya se ve en pantalla, respetando el MISMO scope
+// (_resolverScopeUserIdBancos) — solo en formato descargable, no un dump nuevo de
+// información sensible que amerite un permiso más alto.
+router.get('/indicadores/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, categoria, year, month, fechaInicio, fechaFin } = req.query;
+  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const scopeUserId = _resolverScopeUserIdBancos(req, hasFullAccess);
+  const buffer = await indicadoresService.buildReporteIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId });
+  const fecha = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Cobranza-Identificacion-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
+// GET /api/banks/indicadores/usuarios-con-identificaciones — auth0Subs de usuarios con
+// actividad REAL de identificación (cualquier vía), para poblar el filtro de "elegí a quién
+// ver" del dashboard de Cobranza — mismo permiso que /indicadores, no es un dato sensible
+// propio de admin.
+router.get('/indicadores/usuarios-con-identificaciones', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  res.json({ userIds: await indicadoresService.listUsuariosConIdentificaciones() });
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)

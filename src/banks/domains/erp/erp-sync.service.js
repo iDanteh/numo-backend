@@ -177,7 +177,8 @@ async function sincronizarCuentasPendientes(params = {}) {
 // H0/Tehuantepec): 3 intentos de 30s agotados igual, generarYGuardar
 // terminaba en 500. Subido a 45000 (un intento aislado SÍ respondió en ~47s
 // totales incluyendo backoff, probado en vivo contra el ERP real ese mismo
-// día).
+// día) y luego a 60000 (confirmado con el usuario, mismo día, tras seguir
+// viendo timeouts con 45000).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   const token = await _tokenPolizas();
@@ -186,7 +187,7 @@ async function _getConReintento(url, params, logLabel) {
       return await axios.get(url, {
         params,
         headers: { Authorization: `Bearer ${token}` },
-        timeout: 45000,
+        timeout: 60000,
       });
     } catch (axErr) {
       const status    = axErr.response?.status;

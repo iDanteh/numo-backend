@@ -810,6 +810,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // así que cubre ese hueco. Sigue filtrando por día de CADA factura
   // (`diaCfdiPorClave`/`_diaMx`) exactamente igual que antes.
   const { centroPropioClave, fechaDesde, fechaHasta } = opciones;
+  // Día(s) de ESTA generación (México) — único sustituto disponible de
+  // `diaCfdi` para una factura huérfana (sin CFDI sincronizado, ver
+  // `clavesConCfdi`): sin esto, el filtro de "mismo día" de abajo se
+  // desactiva por completo para esas facturas (`!diaCfdi` siempre pasa),
+  // arrastrando cobros/usos de CUALQUIER día dentro de la ventana ampliada
+  // ±1 día del ERP hacia la póliza de este día (bug real 2026-09-18: SF de
+  // H0-260901772/H0-260901550, del 16-sep, apareciendo en la póliza del
+  // 17-sep).
+  const diaGenDesde = fechaDesde ? _diaMx(fechaDesde) : null;
+  const diaGenHasta = fechaHasta ? _diaMx(fechaHasta) : null;
   let resultadosAlmacen = [];
   let resultadosSaldos  = [];
   let usoCaminoPorCentro = false;
@@ -1093,6 +1103,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // 2026-08-21).
         const diffDias = _diferenciaDiasMx(cobro.fecha, diaCfdi);
         if (diaCfdi && !cuenta._viaTicketPropio && (diffDias === null || diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA)) continue;
+        // Factura huérfana (`!diaCfdi`, ver comentario en `diaGenDesde`
+        // arriba): usa el rango de ESTA generación en vez de dejar pasar
+        // cualquier día.
+        if (!diaCfdi) {
+          const diaCobro = _diaMx(cobro.fecha);
+          if (!diaCobro || (diaGenDesde && diaCobro < diaGenDesde) || (diaGenHasta && diaCobro > diaGenHasta)) continue;
+        }
         // Cobro cruzado de sucursal (2026-08-14, caso real Ferrocarril
         // 09/07/2026): un ticket de la Factura Global de ESTA sucursal puede
         // haberse cobrado FÍSICAMENTE en otra (`cobro.claveCentro` distinto
@@ -1364,7 +1381,13 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // independiente, mismo patrón que `_cobrosSinFacturaPorCentro` para
         // Efectivo), no en el día de la factura — mostrarlo aquí TAMBIÉN
         // sería contarlo dos veces entre ambos días.
-        .filter(u => !diaCfdi || _diaMx(u.fecha) === diaCfdi)
+        .filter(u => {
+          if (diaCfdi) return _diaMx(u.fecha) === diaCfdi;
+          // Factura huérfana — ver comentario en `diaGenDesde` arriba: usa el
+          // rango de esta generación en vez de dejar pasar cualquier día.
+          const diaUso = _diaMx(u.fecha);
+          return !!diaUso && (!diaGenDesde || diaUso >= diaGenDesde) && (!diaGenHasta || diaUso <= diaGenHasta);
+        })
         // Excluir SOLO el autoconsumo real (mismo ticket genera y usa su
         // propio saldo) — ver comentario arriba. Si el marcador no se
         // encuentra (Devolución con su propio CFDI, caso normal) o el ticket

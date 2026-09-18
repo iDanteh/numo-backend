@@ -1301,6 +1301,9 @@ function _montoSaldoLinkPorMovimiento(raw0, mov, incluirFormaPago = () => true) 
       huboCoincidenciaPropia = true;
     } else if (esDeOtro) {
       otroNeto += total;
+    } else if (_esResolucionDeRetencionGenuina(total, raw0.movimientos)) {
+      // Resolución de una retención (ver _esResolucionDeRetencionGenuina más abajo), no una
+      // reversión real — no participa de ningún acumulador.
     } else if (miNeto !== 0 && Math.abs(miNeto + total) < 0.01) {
       miNeto += total; // reversa sin tag — cancela lo que ya llevaba "mío"
     } else if (otroNeto !== 0 && Math.abs(otroNeto + total) < 0.01) {
@@ -1387,6 +1390,9 @@ function _aportesPorErpIdCronologico(raw0, movs, incluirFormaPago = () => true, 
 
     if (movIndex !== -1) {
       pila.push({ movIndex, monto: Math.abs(m.total ?? 0) });
+    } else if (!tieneTagPropio && _esResolucionDeRetencionGenuina(m.total ?? 0, raw0?.movimientos)) {
+      // Resolución de una retención (ver _esResolucionDeRetencionGenuina más abajo), no una
+      // reversión real — no toca la pila.
     } else if (!tieneTagPropio) {
       // Reversa sin identidad propia — cancela la entrada más reciente que coincide en monto.
       const montoRev = Math.abs(m.total ?? 0);
@@ -1541,6 +1547,25 @@ function _retencionVigente(raw0) {
   const tieneRetencion = Math.abs(neto) > 0.01;
   const montoRetenido  = tieneRetencion ? Math.abs(neto) : null;
   return { tieneRetencion, montoRetenido };
+}
+
+// Una línea sin tag de identidad cuyo monto coincide con una línea de retención GENUINA
+// (formasPago vacío, mismo criterio que _retencionVigente arriba — incluido el `.slice(1)`
+// para no contar el cargo original) del mismo kardex es la resolución de esa retención, no
+// una reversión real de un pago — no debe cancelar nada (bug real, folio 038309,
+// $196,431.71: una línea "SALDO A FAVOR" sin tag, exactamente del monto de la retención,
+// cancelaba por coincidencia de magnitud el abono real tageado en
+// _montoSaldoLinkPorMovimiento/_aportesPorErpIdCronologico).
+//
+// Deliberadamente NO se excluye por nombre de forma de pago ("SALDO A FAVOR") — confirmado
+// con el usuario que ese nombre también tiene un uso legítimo como reversión real de un
+// pago; la única señal segura es la coincidencia estructural con una retención genuina
+// (una línea SIN NINGUNA forma de pago) del mismo kardex, no el nombre de la forma de pago.
+function _esResolucionDeRetencionGenuina(total, todosLosMovimientos) {
+  const lineasRetencion = (todosLosMovimientos ?? []).slice(1).filter(
+    m => !Array.isArray(m.formasPago) || m.formasPago.length === 0,
+  );
+  return lineasRetencion.some(m => Math.abs(Math.abs(m.total ?? 0) - Math.abs(total)) < 0.01);
 }
 
 // Deja solo dígitos y quita ceros a la izquierda — Kore antepone "REF " a algunas

@@ -206,9 +206,21 @@ async function _removerErpIdDeMovimiento(mov, erpId, { serieExterna, folioExtern
 // NINGÚN link (ni desvincular ni ajustar) antes que desvincular algo que puede seguir
 // vigente. Devuelve false (confiable) cuando no se puede verificar (raw0 sin total/saldoActual
 // numéricos) — no se bloquea por falta de dato, solo ante evidencia concreta de que está mal.
+// 2026-09-18 (bug real, caso ancla: erpId 6a623ad30c57b7000171373b / A0-260703646):
+// `raw0.total - raw0.saldoActual` mide TODO lo que movió el saldo de la CxC, incluida
+// cualquier retención vigente (_retencionVigente) — un ajuste de Kore que no es aporte de
+// NINGÚN movimiento bancario y que `calculosPorMovimiento` correctamente nunca cuenta. Sin
+// restarla, cualquier CxC con retención dispara "atribución ambigua" en falso en cuanto la
+// suma calculada (sin la retención) deja de coincidir con ese delta crudo — pasó con un pago
+// de $10,024.57 tageado que se revirtió por completo (referencia conocida, sumaCalculada=0
+// correcto) contra una CxC con $91.98 de retención vieja (ajena al reverso de hoy):
+// totalPagadoSegunKore daba 91.98 sin restar, autoenganchando "ambiguo" pese a que el caso
+// era perfectamente claro. Con la retención restada: 91.98-91.98=0, coincide con
+// sumaCalculada=0, deja de dispararse.
 function _atribucionInconsistente(raw0, calculosPorMovimiento) {
   if (!raw0 || typeof raw0.total !== 'number' || typeof raw0.saldoActual !== 'number') return false;
-  const totalPagadoSegunKore = raw0.total - raw0.saldoActual;
+  const { montoRetenido } = erpRoutes._retencionVigente(raw0);
+  const totalPagadoSegunKore = raw0.total - raw0.saldoActual - (montoRetenido ?? 0);
   const sumaCalculada = calculosPorMovimiento.reduce((a, b) => a + (b ?? 0), 0);
   return Math.abs(sumaCalculada - totalPagadoSegunKore) > 1;
 }
@@ -412,8 +424,9 @@ async function procesarReversionKore({ erpId, motivo, fecha, serieExterna, folio
   if (calculosPorMovimiento && _atribucionInconsistente(raw0, calculosPorMovimiento)) {
     atribucionConfiable = false;
     const sumaCalculada = calculosPorMovimiento.reduce((a, b) => a + (b ?? 0), 0);
-    const totalPagadoSegunKore = raw0.total - raw0.saldoActual;
-    logger.error(`[erp-reversion] erpId=${erpId}: atribución ambigua entre ${movs.length} movimientos vinculados — suma calculada=${sumaCalculada}, Kore reporta pagado (total-saldoActual)=${totalPagadoSegunKore}. NO se toca ningún link (ni se desvincula ni se ajusta) — queda para revisión manual.`);
+    const { montoRetenido } = erpRoutes._retencionVigente(raw0);
+    const totalPagadoSegunKore = raw0.total - raw0.saldoActual - (montoRetenido ?? 0);
+    logger.error(`[erp-reversion] erpId=${erpId}: atribución ambigua entre ${movs.length} movimientos vinculados — suma calculada=${sumaCalculada}, Kore reporta pagado (total-saldoActual-retencion)=${totalPagadoSegunKore}. NO se toca ningún link (ni se desvincula ni se ajusta) — queda para revisión manual.`);
     for (const mov of movs) {
       resultados.push({ movementId: mov._id, tipo: 'sin_tocar', mismatch: false });
     }

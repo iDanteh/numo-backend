@@ -18,6 +18,7 @@ const BankRule          = require('./BankRule');
 const AccountPlan       = require('./AccountPlan');
 const Entity            = require('./Entity');
 const PeriodoFiscal     = require('./PeriodoFiscal');
+const CierreMesHistorico = require('./CierreMesHistorico');
 const Permission        = require('./Permission');
 const Role              = require('./Role');
 const Poliza            = require('./Poliza');
@@ -42,6 +43,12 @@ AccountPlan.hasMany  (AccountPlan, { foreignKey: 'parentId', as: 'children' });
 /** Períodos fiscales creados por usuarios */
 PeriodoFiscal.belongsTo(User, { foreignKey: 'createdBy', as: 'creator' });
 User.hasMany(PeriodoFiscal,  { foreignKey: 'createdBy', as: 'periodos' });
+
+/** Historial de cierres de mes (uno por cada vez que se cierra un período) */
+CierreMesHistorico.belongsTo(PeriodoFiscal, { foreignKey: 'periodoFiscalId', as: 'periodoFiscal' });
+PeriodoFiscal.hasMany(CierreMesHistorico,   { foreignKey: 'periodoFiscalId', as: 'cierres' });
+CierreMesHistorico.belongsTo(User, { foreignKey: 'cerradoPorId', as: 'cerradoPor' });
+User.hasMany(CierreMesHistorico,   { foreignKey: 'cerradoPorId', as: 'cierresMesRealizados' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -139,6 +146,9 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS revertido_por_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
       ADD COLUMN IF NOT EXISTS revertido_en      TIMESTAMPTZ
   `).catch(e => console.warn('[syncModels] ADD COLUMN cierre de mes (periodos_fiscales):', e.message));
+
+  // Historial de cierres de mes — tabla nueva, depende de periodos_fiscales y users.
+  await CierreMesHistorico.sync({ force: false });
 
   // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
   await syncAlter(CfdiMappingRule);
@@ -430,4 +440,4 @@ async function syncModels() {
   await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

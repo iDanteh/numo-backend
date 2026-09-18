@@ -2,12 +2,17 @@ const express = require('express');
 const { body } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const { PERMISSIONS } = require('../../shared/config/rbac');
-const { list, listSimple, create, remove, cerrar, revertirCierre } = require('../controllers/periodoFiscal.controller');
+const { list, listSimple, create, remove, cerrar, revertirCierre, listCierres, descargarCierre } = require('../controllers/periodoFiscal.controller');
 
 const router = express.Router();
 
 router.get('/', authenticate, list);
 router.get('/simple', authenticate, listSimple);
+
+// Historial de Cierre de Mes (Reportes → Cierre de Mes) — antes de '/:id/...'
+// para no chocar con esos patrones.
+router.get('/cierres',                 authenticate, permit(PERMISSIONS.VISOR_REPORTS), listCierres);
+router.get('/cierres/:id/descargar',   authenticate, permit(PERMISSIONS.VISOR_REPORTS), descargarCierre);
 
 router.post('/',
   authenticate,

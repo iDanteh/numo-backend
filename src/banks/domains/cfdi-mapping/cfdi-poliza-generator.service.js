@@ -736,7 +736,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // ahí) aunque el dato ya viniera completo desde `/saldos-favor` (confirmado
   // con el usuario 2026-09-18, caso real H0-260900441/Tehuantepec).
   const clavesConCfdi = new Set(cfdiConRegla.map(({ cfdi }) => `${cfdi.serie}|${cfdi.folio}`));
-  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map(), movimientosPpdPorFacturar: [], saldoFavorUsadoSinFactura: [] };
+  const vacio = { desglosePagoReal: new Map(), puntosUsado: new Map(), saldoFavorUsado: new Map(), anticipoUsado: new Map(), movimientosPpdPorFacturar: [], saldoFavorUsadoSinFactura: [], puntosUsadoSinFactura: 0 };
   if (!candidatos.length) return vacio;
 
   // Día de CADA factura (México) — para filtrar cobros/usos que coinciden en
@@ -1625,7 +1625,18 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey))
     .map(([facturaKey, { monto, detalle }]) => ({ facturaKey, monto, detalle }));
 
-  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar, saldoFavorUsadoSinFactura };
+  // Mismo hueco que `saldoFavorUsadoSinFactura`, pero para Puntos/Club
+  // Tuberos: la línea consolidada de Puntos (ver `puntosAcumuladosProp`/
+  // `Guard`) ya no necesita nombre de cliente ni UUID (usa un concepto
+  // genérico por sucursal, "CLIENTE DE MOSTRADOR SUC. X"), así que aquí basta
+  // con el monto total — el caller lo suma directo al acumulado de su propio
+  // centro (confirmado con el usuario 2026-09-18, mismo caso real
+  // H0-260900441/Tehuantepec).
+  const puntosUsadoSinFactura = [...puntosUsado.entries()]
+    .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey))
+    .reduce((s, [, monto]) => s + (Number(monto) || 0), 0);
+
+  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar, saldoFavorUsadoSinFactura, puntosUsadoSinFactura };
 }
 
 /**
@@ -3839,7 +3850,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaProp = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaProp = [], puntosUsadoSinFactura: puntosUsadoSinFacturaProp = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -5112,6 +5123,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         movimientosResult.push({ ...baseSinFacturaProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF });
       }
     }
+    // Puntos/Club Tuberos con el mismo hueco (factura consumidora sin
+    // sincronizar) — se suma directo al acumulado de la sucursal; la línea
+    // consolidada ya es genérica ("CLIENTE DE MOSTRADOR SUC. X"), así que no
+    // necesita nada adicional del CFDI para mostrarse (ver `puntosUsadoSinFactura`
+    // en `_prefetchAjustesFacturaPropia`).
+    if (puntosUsadoSinFacturaProp > 0 && ccSinFacturaProp) {
+      const prevPuntos = puntosAcumuladosProp.get(ccSinFacturaProp.id) ?? { monto: 0, centroCosto: ccSinFacturaProp };
+      prevPuntos.monto = parseFloat((prevPuntos.monto + puntosUsadoSinFacturaProp).toFixed(2));
+      puntosAcumuladosProp.set(ccSinFacturaProp.id, prevPuntos);
+    }
   }
 
   // Puntos/Club Tuberos usados en el batch: UNA sola línea consolidada por
@@ -5766,7 +5787,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [] } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [], puntosUsadoSinFactura: puntosUsadoSinFacturaGuard = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -6663,6 +6684,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         todosLosMovimientos.push({ ...baseSinFacturaGuard, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSFG });
         todosLosMovimientos.push({ ...baseSinFacturaGuard, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSFG });
       }
+    }
+    // Puntos/Club Tuberos con el mismo hueco — ver comentario equivalente en
+    // generarPropuesta.
+    if (puntosUsadoSinFacturaGuard > 0 && ccSinFacturaGuard) {
+      const prevPuntosGuard = puntosAcumuladosGuard.get(ccSinFacturaGuard.id) ?? { monto: 0, centroCosto: ccSinFacturaGuard };
+      prevPuntosGuard.monto = parseFloat((prevPuntosGuard.monto + puntosUsadoSinFacturaGuard).toFixed(2));
+      puntosAcumuladosGuard.set(ccSinFacturaGuard.id, prevPuntosGuard);
     }
   }
 

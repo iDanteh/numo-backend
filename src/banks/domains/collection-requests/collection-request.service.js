@@ -951,7 +951,7 @@ async function identificar(id, body, user) {
     // para satisfacer el chequeo obligatorio de Kore, decisión confirmada con
     // el usuario ante la ambigüedad de qué fecha única usar si hay varios
     // movimientos con fechas distintas.
-    const fechaRealPagoRaiz = _fechaRealPagoKore(movsOrdenados[0].fecha);
+    const fechaRealPagoRaiz = _fechaRealPagoKore(movsOrdenados[0]?.fecha ?? new Date());
 
     // 2026-08-27 (CORREGIDO tras rechazo real de Kore): 1 SOLO elemento del arreglo
     // por forma de pago — nunca uno repetido por depósito. Rechazo real: "la forma
@@ -1128,7 +1128,7 @@ async function identificar(id, body, user) {
       }
 
       cr.formasPago          = formasPagoConRef;
-      cr.bankMovementId      = movsOrdenados[0]._id; // D1: raíz deprecada = primer movimiento asignado
+      cr.bankMovementId      = movsOrdenados[0]?._id ?? null; // D1: raíz deprecada = primer movimiento asignado (null si 0 movimientos, ej. solo Efectivo)
       cr.status              = 'identificada';
       cr.resueltoPorUserId   = user._id;
       cr.resueltoPorNombre   = user.nombre ?? null;

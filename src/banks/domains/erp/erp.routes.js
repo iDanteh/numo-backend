@@ -106,6 +106,14 @@ router.get('/cuentas-pendientes', authenticate, permit(PERMISSIONS.BANKS_ERP_REA
     }
   }
 
+  // El ERP exige serieExterna y folioExterno juntos o ninguno — validar antes de
+  // llamarlo para devolver un 400 propio claro en vez de propagar el error de Kore.
+  const tieneSerieExterna  = !!serieExterna?.toString().trim();
+  const tieneFolioExterno  = !!folioExterno?.toString().trim();
+  if (tieneSerieExterna !== tieneFolioExterno) {
+    return res.status(400).json({ error: 'Debes indicar serieExterna y folioExterno juntos, o ninguno.' });
+  }
+
   // sincronizarCuentasPendientes llama al ERP, upserta en el caché y devuelve los
   // datos crudos para que este endpoint pueda construir la respuesta paginada.
   let raw = [];

@@ -772,12 +772,17 @@ async function identificar(id, body, user) {
   // (bankMovementId, igual que siempre) y el resto se persisten en
   // depositosAdicionales con su propio monto real depositado.
   const formasPagoConRef = cr.formasPago.map(f => {
-    const [movIdPrincipal, ...movIdsExtra] = movIdsPorFormaPago.get(String(f._id));
-    const movDeEstaForma = movPorId.get(movIdPrincipal);
+    // Formas no bancarias (efectivo de caja, etc.) pueden no tener movimiento
+    // asignado — en ese caso referencia/bankMovementId quedan en blanco, igual
+    // que estaban antes de identificar. Ver resolverAsignaciones() que exime a
+    // estas formas del guard todo-o-nada.
+    const movIdsDeEsta = movIdsPorFormaPago.get(String(f._id)) ?? [];
+    const [movIdPrincipal, ...movIdsExtra] = movIdsDeEsta;
+    const movDeEstaForma = movIdPrincipal ? movPorId.get(movIdPrincipal) : null;
     return {
       ...f.toObject(),
-      referencia:     String(movDeEstaForma.folio ?? ''),
-      bankMovementId: movDeEstaForma._id,
+      referencia:     String(movDeEstaForma?.folio ?? ''),
+      bankMovementId: movDeEstaForma?._id ?? null,
       depositosAdicionales: movIdsExtra.map(movId => ({
         bankMovementId: movPorId.get(movId)._id,
         montoEfectivo:  montoEfectivo(f, movId),
@@ -958,10 +963,12 @@ async function identificar(id, body, user) {
     // de 1 elemento da el mismo valor de siempre, sin coma — comportamiento
     // idéntico al de antes de este cambio.
     const datosAdicionalesPorFormaPago = cr.formasPago.map(f => {
-      const movIdsDeEstaForma = movIdsPorFormaPago.get(String(f._id));
-      const movsDeEstaForma   = movIdsDeEstaForma.map(movId => movPorId.get(movId));
-      const movPrincipal      = movsDeEstaForma[0];
-      const bancoDefault      = bancoDefaultPorMovId.get(movIdsDeEstaForma[0]) ?? null;
+      // Formas no bancarias (efectivo de caja, etc.) pueden no tener movimiento
+      // asignado — ver resolverAsignaciones() que las exime del guard.
+      const movIdsDeEstaForma = movIdsPorFormaPago.get(String(f._id)) ?? [];
+      const movsDeEstaForma   = movIdsDeEstaForma.map(movId => movPorId.get(movId)).filter(Boolean);
+      const movPrincipal      = movsDeEstaForma[0] ?? null;
+      const bancoDefault      = movIdsDeEstaForma[0] ? (bancoDefaultPorMovId.get(movIdsDeEstaForma[0]) ?? null) : null;
       const esTransferencia     = formaPagoRequiereBanco.get(f.formaPagoId) === true;
       const esDepositoEfectivo  = formaPagoEsDepositoEfectivo.get(f.formaPagoId) === true;
       const esCheque            = formaPagoEsCheque.get(f.formaPagoId) === true;
@@ -982,7 +989,10 @@ async function identificar(id, body, user) {
         // fecha_real_pago del PRIMER depósito asignado — mismo criterio que
         // fechaRealPagoRaiz (abajo) para la ambigüedad de "varios movimientos,
         // 1 sola fecha posible" cuando hay split.
-        fecha_real_pago: _fechaRealPagoKore(movPrincipal.fecha),
+        // Para formas no bancarias sin movimiento, se usa hoy como fallback —
+        // Kore exige fecha_real_pago en todos los elementos, pero no tiene
+        // sentido derivarla de un depósito que no existe.
+        fecha_real_pago: _fechaRealPagoKore(movPrincipal?.fecha ?? new Date()),
         ...(esTransferencia ? {
           DatosAdicionales: [
             { Nombre: 'Aut',  Valor: autJuntos },

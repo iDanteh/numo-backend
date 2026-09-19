@@ -847,6 +847,127 @@ describe('_montoSaldoLinkPorMovimiento — reconoce "Num Recibo" (Depósito en e
   });
 });
 
+// 2026-09-18 (bug real de producción, folio 038309, $196,431.71 — reportado por el usuario:
+// un movimiento vinculado manualmente volvía a "no_identificado"/saldoErp:0 en CADA corrida
+// de _syncErpKoreJob). Causa: una línea "SALDO A FAVOR" del kardex de Kore, SIN ningún tag
+// de identidad, resuelve una retención previa — su monto coincide EXACTO con la retención, y
+// por casualidad también coincide con el abono real tageado, así que tanto
+// _montoSaldoLinkPorMovimiento como _aportesPorErpIdCronologico la trataban como "reversa sin
+// tag que cancela el abono real" y daban 0/null pese a que el pago sí ocurrió.
+//
+// El fix (_esResolucionDeRetencionGenuina) NO excluye por NOMBRE de forma de pago — "SALDO A
+// FAVOR" también tiene un uso legítimo como reversión real de un pago (confirmado con el
+// usuario) — excluye SOLO cuando el monto de la línea sin tag coincide con una línea de
+// retención GENUINA (formasPago vacío) del mismo kardex, la misma señal que ya usa
+// _retencionVigente.
+describe('_esResolucionDeRetencionGenuina — fix del falso cero por retención (caso real folio 038309, $196,431.71)', () => {
+  test('SALDO A FAVOR sin tag que coincide con una retención genuina del kardex NO cancela el abono real — _montoSaldoLinkPorMovimiento', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'A0', folio: '1', total: 196431.71 },
+        { serie: 'CBT', folio: '2', total: -196431.71,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 196431.71, adicionales: [
+            { nombre: 'Numo', valor: '1306685' }, { nombre: 'Aut', valor: '038309' }, { nombre: 'Banco', valor: 'BANAMEX 6971' },
+          ] }] },
+        { serie: 'RET', folio: '3', total: -196431.71 }, // retención genuina, sin formasPago
+        { serie: 'APA', folio: '4', total: 196431.71,
+          formasPago: [{ nombreFormaPago: 'SALDO A FAVOR', monto: 196431.71 }] }, // sin adicionales — sin tag
+      ],
+    };
+    const mov = { numeroAutorizacion: '1306685', folio: '038309' };
+
+    const resultado = router._montoSaldoLinkPorMovimiento(raw0, mov);
+
+    expect(resultado).toBe(196431.71); // antes del fix: 0
+  });
+
+  test('SALDO A FAVOR sin tag que coincide con una retención genuina del kardex NO cancela el abono real — _aportesPorErpIdCronologico', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'A0', folio: '1', total: 196431.71 },
+        { serie: 'CBT', folio: '2', total: -196431.71,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 196431.71, adicionales: [
+            { nombre: 'Numo', valor: '1306685' }, { nombre: 'Aut', valor: '038309' }, { nombre: 'Banco', valor: 'BANAMEX 6971' },
+          ] }] },
+        { serie: 'RET', folio: '3', total: -196431.71 },
+        { serie: 'APA', folio: '4', total: 196431.71,
+          formasPago: [{ nombreFormaPago: 'SALDO A FAVOR', monto: 196431.71 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '1306685', folio: '038309' };
+
+    const resultado = router._aportesPorErpIdCronologico(raw0, [mov]);
+
+    expect(resultado.get(0)).toBe(196431.71); // antes del fix: ausente del Map (null)
+  });
+
+  // CRÍTICO — protege el uso LEGÍTIMO de "SALDO A FAVOR" que el usuario confirmó que existe:
+  // sin ninguna línea de retención genuina en el kardex, una reversa sin tag de igual
+  // magnitud sigue cancelando exactamente como antes del fix. El fix es específico a la
+  // coincidencia estructural con una retención, no una exclusión general por nombre.
+  test('CRÍTICO — sin retención genuina en el kardex, SALDO A FAVOR sin tag sigue cancelando el abono (comportamiento sin cambios)', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'A0', folio: '1', total: 500 },
+        { serie: 'CBT', folio: '2', total: -500,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 500, adicionales: [
+            { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'APA', folio: '3', total: 500,
+          formasPago: [{ nombreFormaPago: 'SALDO A FAVOR', monto: 500 }] }, // sin tag, sin retención que lo respalde
+      ],
+    };
+    const mov = { numeroAutorizacion: 'AUT-1', folio: 'F-1' };
+
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(0);
+    expect(router._aportesPorErpIdCronologico(raw0, [mov]).has(0)).toBe(false);
+  });
+
+  // CRÍTICO — no tocar el ciclo real ABO→RAB→ABO (folios 042623/041140/042622, verificados
+  // contra datos reales de producción): la línea RAB sin tag NO coincide con ninguna
+  // retención del kardex (coincide con el propio abono, que es un caso distinto: una
+  // reversión real seguida de reaplicación por otro medio de pago) — debe seguir cancelando.
+  test('CRÍTICO — ciclo real ABO→RAB→ABO (folio 041140): RAB sin tag no coincide con ninguna retención, sigue cancelando', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'ABO', folio: '1', total: -16801.23,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 16801.23, adicionales: [
+            { nombre: 'Numo', valor: '850543' }, { nombre: 'Aut', valor: '041140' }, { nombre: 'Banco', valor: 'BANAMEX 6971' },
+          ] }] },
+        { serie: 'RAB', folio: '2', total: 16801.23,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 16801.23 }] }, // sin tag, sin retención en el kardex
+        { serie: 'ABO', folio: '3', total: -16801.23,
+          formasPago: [{ nombreFormaPago: 'CHEQUE', monto: 16801.23, adicionales: [
+            { nombre: 'Banco', valor: 'BANAMEX 6971' },
+          ] }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: '041140', folio: '041140' };
+
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(0);
+  });
+
+  // Retención genuina presente en el kardex, pero de OTRO monto — la exclusión es específica
+  // por coincidencia de magnitud, no "cualquier retención presente excluye todo".
+  test('retención genuina presente pero de monto distinto al de la reversa sin tag — sigue cancelando normal', () => {
+    const raw0 = {
+      movimientos: [
+        { serie: 'A0', folio: '1', total: 1000 },
+        { serie: 'CBT', folio: '2', total: -1000,
+          formasPago: [{ nombreFormaPago: 'TRANSFERENCIA', monto: 1000, adicionales: [
+            { nombre: 'Numo', valor: 'F-1' }, { nombre: 'Aut', valor: 'AUT-1' },
+          ] }] },
+        { serie: 'RET', folio: '3', total: -50 }, // retención genuina, pero de $50 — NO coincide con la reversa de $1000
+        { serie: 'APA', folio: '4', total: 1000,
+          formasPago: [{ nombreFormaPago: 'SALDO A FAVOR', monto: 1000 }] },
+      ],
+    };
+    const mov = { numeroAutorizacion: 'AUT-1', folio: 'F-1' };
+
+    expect(router._montoSaldoLinkPorMovimiento(raw0, mov)).toBe(0);
+  });
+});
+
 describe('_backfillFormasPagoYFolioFiscal — aporteBancarioPrevio (2026-08-21, bug real: saldoPagado quedaba en $0 en el dropdown "CxC vinculadas")', () => {
   // Reproduce el caso real folioExterno 260800166: BANCOMER debía terminar en $150
   // (saldoErpAportado ya viene corregido por fuera vía _aportesPorErpIdCronologico), pero

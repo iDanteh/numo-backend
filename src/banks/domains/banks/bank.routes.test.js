@@ -47,6 +47,8 @@ jest.mock('../../../visor/models/CFDI', () => ({
 jest.mock('../../../shared/services/rbac-store');
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
+  buildReporteIdentificacion: jest.fn(),
+  listUsuariosConIdentificaciones: jest.fn(),
 }));
 
 const express = require('express');
@@ -202,14 +204,42 @@ describe('GET /indicadores', () => {
     expect(args.month).toBe('8');
   });
 
-  test('no distingue scope por rol: la ruta nunca pasa restrictions al service (siempre equipo completo)', async () => {
+  // 2026-09-17 (dashboard de Cobranza): reemplaza al viejo "no distingue scope por rol" — el
+  // scope ahora se resuelve vía BANKS_CONFIG, mismo criterio que /cards, /stats, /years.
+  test('sin BANKS_CONFIG: scopeUserId se fuerza al propio usuario, ignorando ?userIds= si lo manda', async () => {
+    rbacStore.hasPermission.mockResolvedValue(false);
+
+    await request(app)
+      .get('/indicadores')
+      .query({ userIds: 'otro-user' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(rbacStore.hasPermission).toHaveBeenCalledWith('test-role', PERMISSIONS.BANKS_CONFIG, []);
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toBe('user-test');
+  });
+
+  test('con BANKS_CONFIG y sin ?userIds=: scopeUserId undefined (ve todo el equipo, comportamiento previo)', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
     await request(app)
       .get('/indicadores')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
-    expect(args.restrictions).toBeUndefined();
-    expect(rbacStore.hasPermission).not.toHaveBeenCalled();
+    expect(args.scopeUserId).toBeUndefined();
+  });
+
+  test('con BANKS_CONFIG y ?userIds=id1,id2: pasa el array al service', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
+    await request(app)
+      .get('/indicadores')
+      .query({ userIds: 'id1,id2' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toEqual(['id1', 'id2']);
   });
 
   test('devuelve el shape básico del resultado del service tal cual', async () => {
@@ -219,6 +249,108 @@ describe('GET /indicadores', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(FAKE_RESULT);
+  });
+
+  // 2026-09-18 (rango de días del dashboard de Cobranza): fechaInicio/fechaFin viajan
+  // igual que banco/categoria/year/month, tal cual, sin transformar.
+  test('con banks:read pasa fechaInicio/fechaFin tal cual al service', async () => {
+    await request(app)
+      .get('/indicadores')
+      .query({ fechaInicio: '2026-09-10', fechaFin: '2026-09-12' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.fechaInicio).toBe('2026-09-10');
+    expect(args.fechaFin).toBe('2026-09-12');
+  });
+});
+
+describe('GET /indicadores/reporte', () => {
+  let app;
+  const FAKE_BUFFER = Buffer.from('fake-xlsx');
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false);
+    indicadoresService.buildReporteIdentificacion.mockResolvedValue(FAKE_BUFFER);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/indicadores/reporte')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_READ]);
+    expect(indicadoresService.buildReporteIdentificacion).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa todos los filtros (incluido fechaInicio/fechaFin) tal cual al service', async () => {
+    await request(app)
+      .get('/indicadores/reporte')
+      .query({ banco: 'BBVA', categoria: 'Renta', fechaInicio: '2026-09-10', fechaFin: '2026-09-12' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.buildReporteIdentificacion.mock.calls[0][0];
+    expect(args.banco).toBe('BBVA');
+    expect(args.categoria).toBe('Renta');
+    expect(args.fechaInicio).toBe('2026-09-10');
+    expect(args.fechaFin).toBe('2026-09-12');
+  });
+
+  test('sin BANKS_CONFIG: scopeUserId se fuerza al propio usuario, mismo criterio que /indicadores', async () => {
+    rbacStore.hasPermission.mockResolvedValue(false);
+
+    await request(app)
+      .get('/indicadores/reporte')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.buildReporteIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toBe('user-test');
+  });
+
+  test('responde con headers de descarga (superagent no parsea este content-type a Buffer por default, no se testea el body binario acá)', async () => {
+    const res = await request(app)
+      .get('/indicadores/reporte')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Cobranza-Identificacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
+    expect(indicadoresService.buildReporteIdentificacion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GET /indicadores/usuarios-con-identificaciones', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.listUsuariosConIdentificaciones.mockResolvedValue(['user-1', 'user-2']);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/indicadores/usuarios-con-identificaciones')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.listUsuariosConIdentificaciones).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read devuelve { userIds } tal cual el service', async () => {
+    const res = await request(app)
+      .get('/indicadores/usuarios-con-identificaciones')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ userIds: ['user-1', 'user-2'] });
   });
 });
 

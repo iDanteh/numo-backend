@@ -38,4 +38,26 @@ async function remove(id) {
   return doc;
 }
 
-module.exports = { findAll, findById, findByEjercicioPeriodo, create, remove };
+/** Marca el período como cerrado. No valida estado previo — eso lo hace el controller. */
+async function cerrar(id, userId) {
+  const doc = await PeriodoFiscal.findByPk(id);
+  if (!doc) return null;
+  doc.cerrado       = true;
+  doc.cerradoPorId  = userId ?? null;
+  doc.cerradoEn     = new Date();
+  await doc.save();
+  return doc;
+}
+
+/** Revierte el cierre de un período. */
+async function revertirCierre(id, userId) {
+  const doc = await PeriodoFiscal.findByPk(id);
+  if (!doc) return null;
+  doc.cerrado         = false;
+  doc.revertidoPorId  = userId ?? null;
+  doc.revertidoEn     = new Date();
+  await doc.save();
+  return doc;
+}
+
+module.exports = { findAll, findById, findByEjercicioPeriodo, create, remove, cerrar, revertirCierre };

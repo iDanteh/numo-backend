@@ -14,8 +14,11 @@ jest.mock('./BankMovement.model');
 jest.mock('../../shared/socket');
 jest.mock('./drive-fichas.service');
 
+const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
-const { getIndicadoresIdentificacion, horasHabilesEntre } = require('./bank-indicadores.service');
+const {
+  getIndicadoresIdentificacion, buildReporteIdentificacion, listUsuariosConIdentificaciones, horasHabilesEntre,
+} = require('./bank-indicadores.service');
 
 // Todos los tests de este archivo construyen instantes como "hora de PARED en México" — mx(y,
 // mesIndex0, d, h, mi) devuelve el instante UTC real correspondiente, usando el offset fijo
@@ -320,5 +323,285 @@ describe('getIndicadoresIdentificacion — filtros', () => {
     const backlogCall = BankMovement.aggregate.mock.calls[0];
     expect(backlogCall[0][0].$match.deposito).toEqual({ $gt: 0 });
     expect(backlogCall[0][0].$match.oculto).toEqual({ $ne: true });
+  });
+});
+
+describe('getIndicadoresIdentificacion — default "hoy" sin year/month (2026-09-18, dashboard de Cobranza)', () => {
+  // Congela "ahora" en un instante conocido de MÉXICO (usando el mismo helper mx() que ya
+  // arma el resto del archivo) para poder predecir exactamente los boundaries de
+  // _inicioDiaMx/_finDiaMx sin acoplar el test a la fecha real de ejecución.
+  const HOY_MX = mx(2026, 8, 18, 15, 30); // 2026-09-18 15:30 hora de México
+
+  beforeEach(() => {
+    jest.useFakeTimers({ doNotFake: ['nextTick'] });
+    jest.setSystemTime(HOY_MX);
+  });
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('sin year: primeraIdentificacionAt se acota a HOY en México (inicio/fin del día)', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({});
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch.primeraIdentificacionAt).toEqual({
+      $ne:  null,
+      $gte: mx(2026, 8, 18, 0, 0),                                   // 2026-09-18 00:00 MX
+      $lte: new Date(mx(2026, 8, 19, 0, 0).getTime() - 1),           // 2026-09-18 23:59:59.999 MX
+    });
+  });
+
+  test('con year: primeraIdentificacionAt NO se acota por día, sigue siendo solo $ne:null (comportamiento sin cambios)', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ year: '2026', month: '8' });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch.primeraIdentificacionAt).toEqual({ $ne: null });
+  });
+
+  test('el BACKLOG no se ve afectado por el default "hoy" — sigue siendo de todos los pendientes actuales', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({});
+
+    const backlogCall = BankMovement.aggregate.mock.calls[0];
+    expect(backlogCall[0][0].$match.createdAt).toEqual({ $gte: mx(2026, 7, 17, 0, 0) });
+    expect('primeraIdentificacionAt' in backlogCall[0][0].$match).toBe(false);
+  });
+});
+
+describe('getIndicadoresIdentificacion — fechaInicio/fechaFin explícito (2026-09-18, rango de días del dashboard de Cobranza)', () => {
+  test('rango explícito acota primeraIdentificacionAt a esos días (inicio/fin en México)', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ fechaInicio: '2026-09-10', fechaFin: '2026-09-12' });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch.primeraIdentificacionAt).toEqual({
+      $ne:  null,
+      $gte: mx(2026, 8, 10, 0, 0),                                    // 2026-09-10 00:00 MX
+      $lte: new Date(mx(2026, 8, 13, 0, 0).getTime() - 1),            // 2026-09-12 23:59:59.999 MX
+    });
+  });
+
+  test('rango explícito gana sobre year/month: ignora fecha (transacción) y no aplica el bucket de year', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({
+      year: '2025', month: '3', fechaInicio: '2026-09-10', fechaFin: '2026-09-10',
+    });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch.fecha).toBeUndefined();
+    expect(findMatch.primeraIdentificacionAt.$gte).toEqual(mx(2026, 8, 10, 0, 0));
+  });
+
+  test('solo fechaInicio sin fechaFin (o viceversa): se ignoran los dos, cae al default de siempre', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ fechaInicio: '2026-09-10' });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    // Sin year y sin rango completo -> default "hoy", no el rango parcial.
+    expect(findMatch.primeraIdentificacionAt.$gte).not.toEqual(mx(2026, 8, 10, 0, 0));
+  });
+
+  test('el BACKLOG no se ve afectado por el rango explícito', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ fechaInicio: '2026-09-10', fechaFin: '2026-09-12' });
+
+    const backlogCall = BankMovement.aggregate.mock.calls[0];
+    expect('primeraIdentificacionAt' in backlogCall[0][0].$match).toBe(false);
+  });
+});
+
+describe('buildReporteIdentificacion — Excel descargable (2026-09-18)', () => {
+  function mockIdentificadosParaReporte(docs) {
+    const lean = jest.fn().mockResolvedValue(docs);
+    const sort = jest.fn().mockReturnValue({ lean });
+    const select = jest.fn().mockReturnValue({ sort });
+    BankMovement.find.mockReturnValue({ select });
+    return { select, sort, lean };
+  }
+
+  test('genera un .xlsx válido con una fila por movimiento identificado, ordenado por fecha de identificación', async () => {
+    mockIdentificadosParaReporte([
+      {
+        banco: 'BBVA', fecha: new Date('2026-09-10T12:00:00Z'), concepto: 'Depósito 1', deposito: 1000,
+        categoria: 'Renta', createdAt: mx(2026, 8, 10, 8, 0), primeraIdentificacionAt: mx(2026, 8, 10, 10, 0),
+        primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' },
+      },
+      {
+        banco: 'Santander', fecha: new Date('2026-09-11T12:00:00Z'), concepto: 'Depósito 2', deposito: 2000,
+        categoria: null, createdAt: mx(2026, 8, 11, 8, 0), primeraIdentificacionAt: mx(2026, 8, 11, 9, 0),
+        primeraIdentificacionPor: null,
+      },
+    ]);
+
+    const buffer = await buildReporteIdentificacion({ fechaInicio: '2026-09-10', fechaFin: '2026-09-11' });
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet('Identificación');
+    expect(ws.rowCount).toBe(3); // header + 2 filas
+
+    const headerVals = ws.getRow(1).values.slice(1);
+    expect(headerVals).toEqual([
+      'Banco', 'Fecha depósito', 'Concepto', 'Depósito', 'Categoría',
+      'Identificado por', 'Fecha de identificación', 'Horas hábiles', 'Creado en Numo',
+    ]);
+
+    const fila1 = ws.getRow(2).values.slice(1);
+    expect(fila1[0]).toBe('BBVA');
+    expect(fila1[3]).toBe(1000);
+    expect(fila1[5]).toBe('Ana');
+    expect(fila1[7]).toBe(2); // horasHabilesEntre(8:00, 10:00) = 2
+
+    // sin primeraIdentificacionPor -> celda vacía, no revienta (ExcelJS puede devolver
+    // null o simplemente omitir la celda del array sparse de .values, según el caso).
+    expect(ws.getRow(3).getCell(6).value).toBeFalsy();
+  });
+
+  test('sin movimientos: .xlsx válido con solo el header', async () => {
+    mockIdentificadosParaReporte([]);
+
+    const buffer = await buildReporteIdentificacion({ fechaInicio: '2026-09-10', fechaFin: '2026-09-10' });
+
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet('Identificación');
+    expect(ws.rowCount).toBe(1);
+  });
+
+  test('usa el mismo criterio de filtro que getIndicadoresIdentificacion (_resolverMatchTiempo compartido)', async () => {
+    mockIdentificadosParaReporte([]);
+
+    await buildReporteIdentificacion({ banco: 'BBVA', scopeUserId: 'user-1', fechaInicio: '2026-09-10', fechaFin: '2026-09-10' });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch.banco).toBe('BBVA');
+    expect(findMatch['primeraIdentificacionPor.userId']).toBe('user-1');
+    expect(findMatch.primeraIdentificacionAt.$gte).toEqual(mx(2026, 8, 10, 0, 0));
+  });
+});
+
+describe('getIndicadoresIdentificacion — scopeUserId (dashboard de Cobranza, 2026-09-17)', () => {
+  test('scopeUserId escalar: filtra find() por primeraIdentificacionPor.userId exacto', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ scopeUserId: 'user-1' });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch['primeraIdentificacionPor.userId']).toBe('user-1');
+  });
+
+  test('scopeUserId como array de 2: usa $in', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ scopeUserId: ['user-1', 'user-2'] });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch['primeraIdentificacionPor.userId']).toEqual({ $in: ['user-1', 'user-2'] });
+  });
+
+  test('scopeUserId como array VACÍO: se trata como sin filtro, nunca $in:[]', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ scopeUserId: [] });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect('primeraIdentificacionPor.userId' in findMatch).toBe(false);
+  });
+
+  test('sin scopeUserId: no se agrega la clave al match (equipo completo, comportamiento actual sin cambios)', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({});
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect('primeraIdentificacionPor.userId' in findMatch).toBe(false);
+  });
+
+  test('combinado con year/month: ambos filtros conviven en el mismo match', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ scopeUserId: 'user-1', year: '2026', month: '8' });
+
+    const findMatch = BankMovement.find.mock.calls[0][0];
+    expect(findMatch['primeraIdentificacionPor.userId']).toBe('user-1');
+    expect(findMatch.fecha).toEqual({ $gte: mx(2026, 7, 1, 0, 0), $lt: mx(2026, 8, 1, 0, 0) });
+  });
+
+  test('el BACKLOG nunca se acota por scopeUserId — sigue siendo de TODO el equipo', async () => {
+    mockIdentificados([]);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ scopeUserId: ['user-1', 'user-2'] });
+
+    const backlogCall = BankMovement.aggregate.mock.calls[0];
+    expect('primeraIdentificacionPor.userId' in backlogCall[0][0].$match).toBe(false);
+  });
+
+  test('scopeUserId sí filtra qué entra a promedio/mediana/porUsuario (no solo el match pedido a Mongo)', async () => {
+    // El mock de find().select().lean() no simula el filtrado real de Mongo (devuelve los
+    // docs tal cual) — este test confirma que, si Mongo SÍ aplicara el match (como en
+    // producción), el resultado sería el esperado: acá se simula ese filtrado ya hecho,
+    // pasando solo los docs de 'user-1' como si el $match ya los hubiera acotado.
+    mockIdentificados([
+      { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 10, 0), primeraIdentificacionPor: { userId: 'user-1', nombre: 'Ana' } },
+    ]);
+    mockBacklog([]);
+
+    const result = await getIndicadoresIdentificacion({ scopeUserId: 'user-1' });
+
+    expect(result.promedioHoras).toBe(2);
+    expect(result.porUsuario).toEqual([{ userId: 'user-1', nombre: 'Ana', promedioHoras: 2, count: 1 }]);
+  });
+});
+
+describe('listUsuariosConIdentificaciones — actividad real, sin filtrar por rol actual (dashboard de Cobranza)', () => {
+  test('devuelve los userIds distintos que identificaron algo, filtrando null/undefined', async () => {
+    BankMovement.distinct.mockResolvedValue(['user-1', 'user-2', null]);
+
+    const ids = await listUsuariosConIdentificaciones();
+
+    expect(ids).toEqual(['user-1', 'user-2']);
+  });
+
+  test('consulta con el criterio correcto: identificado + primeraIdentificacionPor real + cutoff INDICADORES_DESDE', async () => {
+    BankMovement.distinct.mockResolvedValue([]);
+
+    await listUsuariosConIdentificaciones();
+
+    expect(BankMovement.distinct).toHaveBeenCalledWith('primeraIdentificacionPor.userId', {
+      status: 'identificado',
+      primeraIdentificacionPor: { $ne: null },
+      createdAt: { $gte: mx(2026, 7, 17, 0, 0) },
+    });
+  });
+
+  test('sin actividad: devuelve array vacío', async () => {
+    BankMovement.distinct.mockResolvedValue([]);
+
+    const ids = await listUsuariosConIdentificaciones();
+
+    expect(ids).toEqual([]);
   });
 });

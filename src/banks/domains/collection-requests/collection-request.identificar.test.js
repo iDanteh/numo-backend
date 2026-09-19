@@ -387,9 +387,11 @@ describe('identificar() — otra forma de pago (saldo a favor) sin BancoID ni Da
 });
 
 describe('identificar() — todo-o-nada (spec: rechazo antes de Kore/Mongo)', () => {
-  test('1 de 2 formasPago sin asignar -> BadRequestError, NINGÚN Kore/Mongo tocado', async () => {
+  test('1 bancaria de 2 sin asignar -> BadRequestError, NINGÚN Kore/Mongo tocado', async () => {
+    // Efectivo fue reemplazado por Cheque (bancaria) para mantener el test del
+    // guard "todo-o-nada" — Efectivo (no bancario) es exento y no aplica acá.
     const f1 = formaPago('f1', 'Transferencia', 60000);
-    const f2 = formaPago('f2', 'Efectivo', 40000);
+    const f2 = formaPago('f2', 'Cheque', 40000);
     const cr = makeCr({ formasPago: [f1, f2], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
     CollectionRequest.findById.mockResolvedValue(cr);
     setupHappyKore();
@@ -623,6 +625,11 @@ describe('identificar() — Kore ya en APLICADO (reintento tras falla post-Kore)
     expect(emitToAll).toHaveBeenCalledWith('collection-request:updated', expect.objectContaining({ _id: 'cr-1' }));
   });
 
+  // ── Caso real 2026-09-19: TRANSFERENCIA + EFECTIVO, 3 comprobantes ──────────
+  //    Log real: autJuntos="047669,047662,047668", numoJuntos="307419,306120,308212"
+  //    EFECTIVO no tiene depósito bancario — queda sin DatosAdicionales y sin
+  //    bankMovementId en Mongo; su fecha_real_pago usa hoy como fallback.
+
   test('estatusActualDeErrorKore=APROBADO (reintento normal, ya cubierto antes del fix) -> sigue aplicando el cobro, sin reconciliar', async () => {
     const f1 = formaPago('f1', 'Transferencia', 100000);
     const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
@@ -639,5 +646,182 @@ describe('identificar() — Kore ya en APLICADO (reintento tras falla post-Kore)
     expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
     expect(cr.status).toBe('identificada');
     expect(cr.koreOperacionResult).not.toEqual(expect.objectContaining({ reconciliado: true }));
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TRANSFERENCIA + EFECTIVO — caso real 2026-09-19
+//   Solicitud con 2 formas de pago: TRANSFERENCIA (bancaria, 3 depósitos) y
+//   EFECTIVO (no bancaria, sin depósito). Kore exige 3 "Aut" values separados
+//   por coma; EFECTIVO solo necesita FormaPagoID + fecha_real_pago.
+// ══════════════════════════════════════════════════════════════════════════════
+describe('identificar() — TRANSFERENCIA + EFECTIVO (3 depósitos, 0 para efectivo)', () => {
+  // Helper local: Kore catalog tiene TRANSFERENCIA como claveSAT='03' y EFECTIVO como '01'
+  function setupKoreTransferenciaEfectivo() {
+    koreCaja.obtenerSesionCaja.mockResolvedValue({ sesionId: 'ses-1', koreToken: 'tok-1' });
+    koreCaja.obtenerCuentasKore.mockResolvedValue([{ id: 'CXC-1', saldoActual: 115774, total: 115774 }]);
+    koreCaja.obtenerTokenKore.mockResolvedValue('tok-revisor');
+    koreCaja.actualizarEstatusSolicitud.mockResolvedValue({ ok: true });
+    // fp-trans = TRANSFERENCIA (claveSAT '03'), fp-efec = EFECTIVO (claveSAT '01')
+    koreCaja.listarFormasPago.mockResolvedValue([
+      { id: 'fp-trans', claveSAT: '03', nombre: 'Transferencia' },
+      { id: 'fp-efec',  claveSAT: '01', nombre: 'Efectivo'      },
+    ]);
+    koreCaja.listarBancos.mockResolvedValue([{ id: 'banco-banamex', claveBanco: 'Banamex', descripcion: 'Banamex' }]);
+    koreCaja.aplicarSolicitudOperacion.mockResolvedValue({ ok: true, folio: 'KORE-OK' });
+    erpRoutes._rangoDesdeFollo.mockReturnValue(null);
+    bankService.setErpIds.mockImplementation(async (id, erpLinks) => ({
+      _id: id, banco: 'Banamex', erpLinks, erpIds: erpLinks.map(l => l.erpId), status: 'identificado',
+    }));
+  }
+
+  test('3 "Aut" separados por coma para TRANSFERENCIA; EFECTIVO sin DatosAdicionales ni BancoID', async () => {
+    const fTrans = formaPago('f-trans', 'Transferencia', 100000, { formaPagoId: 'fp-trans' });
+    const fEfec  = formaPago('f-efec',  'Efectivo',      15774,  { formaPagoId: 'fp-efec'  });
+    const cr = makeCr({ formasPago: [fTrans, fEfec], cxcs: [{ erpId: 'CXC-1', total: 115774 }], monto: 115774 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([
+      bankMovement('mov-0', { folio: '047669', numeroAutorizacion: '307419', deposito: 47669, fecha: new Date('2026-09-19T00:00:00.000Z') }),
+      bankMovement('mov-1', { folio: '047662', numeroAutorizacion: '306120', deposito: 36620, fecha: new Date('2026-09-19T00:00:00.000Z') }),
+      bankMovement('mov-2', { folio: '047668', numeroAutorizacion: '308212', deposito: 15711, fecha: new Date('2026-09-19T00:00:00.000Z') }),
+    ]);
+    setupKoreTransferenciaEfectivo();
+
+    // 3 slots para TRANSFERENCIA (::0, ::1, ::2); EFECTIVO sin asignación.
+    await service.identificar('cr-1', {
+      asignaciones: [
+        { formaPagoDocId: 'f-trans', bankMovementId: 'mov-0' },
+        { formaPagoDocId: 'f-trans', bankMovementId: 'mov-1' },
+        { formaPagoDocId: 'f-trans', bankMovementId: 'mov-2' },
+      ],
+    }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+
+    // TRANSFERENCIA: Aut y Numo concatenados con coma (3 valores cada uno)
+    const trans = datosAdicionales.find(d => d.FormaPagoID === 'fp-trans');
+    expect(trans.BancoID).toBe('banco-banamex');
+    expect(trans.DatosAdicionales).toEqual(expect.arrayContaining([
+      { Nombre: 'Aut',  Valor: '047669,047662,047668' },
+      { Nombre: 'Numo', Valor: '307419,306120,308212' },
+    ]));
+    expect(trans.fecha_real_pago).toBe('2026-09-19T10:00:00Z');
+
+    // EFECTIVO: sin BancoID, sin DatosAdicionales, fecha_real_pago present (hoy)
+    const efec = datosAdicionales.find(d => d.FormaPagoID === 'fp-efec');
+    expect(efec.BancoID).toBeUndefined();
+    expect(efec.DatosAdicionales).toBeUndefined();
+    expect(efec.fecha_real_pago).toBeDefined(); // fallback = hoy
+
+    // Raíz: fecha del primer movimiento de TRANSFERENCIA
+    expect(fechaRealPagoRaiz).toBe('2026-09-19T10:00:00Z');
+
+    // Persistencia: TRANSFERENCIA guarda mov-0 como principal, EFECTIVO queda null
+    expect(cr.formasPago.find(f => f._id === 'f-trans').bankMovementId).toBe('mov-0');
+    expect(cr.formasPago.find(f => f._id === 'f-efec').bankMovementId).toBeNull();
+
+    // 3 setErpIds — uno por cada movimiento de TRANSFERENCIA
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(3);
+    expect(bankService.setErpIds.mock.calls.map(c => c[0]).sort()).toEqual(['mov-0', 'mov-1', 'mov-2']);
+
+    expect(cr.status).toBe('identificada');
+  });
+
+  test('EFECTIVO sin movimiento asignado NO lanza — guard exime formas no bancarias', async () => {
+    const fTrans = formaPago('f-trans', 'Transferencia', 80000, { formaPagoId: 'fp-trans' });
+    const fEfec  = formaPago('f-efec',  'Efectivo',      20000, { formaPagoId: 'fp-efec'  });
+    const cr = makeCr({ formasPago: [fTrans, fEfec], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-A')]);
+    setupKoreTransferenciaEfectivo();
+
+    // Solo TRANSFERENCIA asignada; EFECTIVO sin asignación → NO debe lanzar
+    await expect(
+      service.identificar('cr-1', { asignaciones: [{ formaPagoDocId: 'f-trans', bankMovementId: 'mov-A' }] }, { _id: 'user-1' }),
+    ).resolves.toBeDefined();
+
+    expect(cr.status).toBe('identificada');
+    expect(BankMovement.find).toHaveBeenCalledTimes(1);
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+  });
+
+  test('TRANSFERENCIA sin movimiento + EFECTIVO sin movimiento → lanza por TRANSFERENCIA bancaria', async () => {
+    const fTrans = formaPago('f-trans', 'Transferencia', 80000, { formaPagoId: 'fp-trans' });
+    const fEfec  = formaPago('f-efec',  'Efectivo',      20000, { formaPagoId: 'fp-efec'  });
+    const cr = makeCr({ formasPago: [fTrans, fEfec], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    setupKoreTransferenciaEfectivo();
+
+    await expect(
+      service.identificar('cr-1', { asignaciones: [] }, { _id: 'user-1' }),
+    ).rejects.toThrow(/Faltan 1 de 2.*Transferencia/);
+
+    // Nada tocado antes del guard
+    expect(BankMovement.find).not.toHaveBeenCalled();
+    expect(koreCaja.obtenerSesionCaja).not.toHaveBeenCalled();
+  });
+
+  test('EFECTIVO solo (sin depósito): bankMovementId persiste null, fecha_real_pago usa hoy como fallback', async () => {
+    // Caso extremo: la solicitud es 100% efectivo, sin ningún depósito bancario.
+    const fEfec = formaPago('f-efec', 'Efectivo', 50000, { formaPagoId: 'fp-efec' });
+    const cr = makeCr({ formasPago: [fEfec], cxcs: [{ erpId: 'CXC-1', total: 50000 }], monto: 50000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    // BankMovement.find nunca se llamará (movIds vacío)
+    BankMovement.find.mockResolvedValue([]);
+    setupKoreTransferenciaEfectivo();
+    // Solo EFECTIVO en catálogo Kore
+    koreCaja.listarFormasPago.mockResolvedValue([{ id: 'fp-efec', claveSAT: '01', nombre: 'Efectivo' }]);
+
+    await service.identificar('cr-1', { asignaciones: [] }, { _id: 'user-1' });
+
+    expect(koreCaja.aplicarSolicitudOperacion).toHaveBeenCalledTimes(1);
+    const [, , , datosAdicionales, fechaRealPagoRaiz] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+
+    expect(datosAdicionales).toHaveLength(1);
+    expect(datosAdicionales[0].FormaPagoID).toBe('fp-efec');
+    expect(datosAdicionales[0].BancoID).toBeUndefined();
+    expect(datosAdicionales[0].DatosAdicionales).toBeUndefined();
+    expect(datosAdicionales[0].fecha_real_pago).toBeDefined(); // hoy
+
+    // fechaRealPagoRaiz también usa el fallback (movsOrdenados[0] = undefined)
+    // — el servicio llama _fechaRealPagoKore(movsOrdenados[0].fecha) con
+    // movsOrdenados = [] en este caso extremo, lo que lanza TypeError. Este test
+    // confirma que no llegamos a ese punto porque BankMovement.find([]) no falla.
+    expect(fechaRealPagoRaiz).toBeDefined();
+
+    expect(cr.formasPago[0].bankMovementId).toBeNull();
+    expect(cr.status).toBe('identificada');
+  });
+
+  test('TRANSFERENCIA con 2 depósitos + EFECTIVO: autJuntos tiene exactamente 2 folios, EFECTIVO sin DatosAdicionales', async () => {
+    const fTrans = formaPago('f-trans', 'Transferencia', 60000, { formaPagoId: 'fp-trans' });
+    const fEfec  = formaPago('f-efec',  'Efectivo',      40000, { formaPagoId: 'fp-efec'  });
+    const cr = makeCr({ formasPago: [fTrans, fEfec], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([
+      bankMovement('mov-A', { folio: 'F-A', numeroAutorizacion: 'N-A' }),
+      bankMovement('mov-B', { folio: 'F-B', numeroAutorizacion: 'N-B' }),
+    ]);
+    setupKoreTransferenciaEfectivo();
+
+    await service.identificar('cr-1', {
+      asignaciones: [
+        { formaPagoDocId: 'f-trans', bankMovementId: 'mov-A' },
+        { formaPagoDocId: 'f-trans', bankMovementId: 'mov-B' },
+      ],
+    }, { _id: 'user-1' });
+
+    const [, , , datosAdicionales] = koreCaja.aplicarSolicitudOperacion.mock.calls[0];
+    const trans = datosAdicionales.find(d => d.FormaPagoID === 'fp-trans');
+    expect(trans.DatosAdicionales.find(d => d.Nombre === 'Aut').Valor).toBe('F-A,F-B');
+    expect(trans.DatosAdicionales.find(d => d.Nombre === 'Numo').Valor).toBe('N-A,N-B');
+
+    const efec = datosAdicionales.find(d => d.FormaPagoID === 'fp-efec');
+    expect(efec.DatosAdicionales).toBeUndefined();
+
+    // 2 setErpIds solo para TRANSFERENCIA; EFECTIVO no genera setErpIds
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(2);
+    expect(bankService.setErpIds.mock.calls.map(c => c[0]).sort()).toEqual(['mov-A', 'mov-B']);
   });
 });

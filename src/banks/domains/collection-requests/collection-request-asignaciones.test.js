@@ -109,14 +109,29 @@ describe('resolverAsignaciones', () => {
     );
   });
 
-  test('todo-o-nada: 0 de 3 asignadas -> BadRequestError lista las 3 descripciones', () => {
+  test('todo-o-nada: Cheque y Transferencia sin asignar -> BadRequestError (Efectivo es exento)', () => {
+    // Efectivo (caja) NO es forma bancaria — no requiere bankMovementId.
+    // Solo Cheque y Transferencia deben aparecer en el error.
     const cr = {
       formasPago: [forma('f1', 'Efectivo'), forma('f2', 'Cheque'), forma('f3', 'Transferencia')],
     };
 
     expect(() => resolverAsignaciones(cr, {})).toThrow(
-      /Faltan 3 de 3 formas de pago sin movimiento bancario asignado \(Efectivo, Cheque, Transferencia\)/,
+      /Faltan 2 de 3 formas de pago sin movimiento bancario asignado \(Cheque, Transferencia\)/,
     );
+  });
+
+  test('todo-o-nada: Efectivo exento — si solo Efectivo sin asignar, no lanza', () => {
+    const cr = {
+      formasPago: [forma('f1', 'Efectivo'), forma('f2', 'Transferencia')],
+    };
+    const body = { asignaciones: [{ formaPagoDocId: 'f2', bankMovementId: 'm1' }] };
+
+    // No debe lanzar: Efectivo no tiene asignación y está exento del guard
+    expect(() => resolverAsignaciones(cr, body)).not.toThrow();
+    const { porMovId } = resolverAsignaciones(cr, body);
+    // Solo Transferencia agrupa bajo m1
+    expect(porMovId.get('m1').map(f => f.formaPagoDescripcion)).toEqual(['Transferencia']);
   });
 });
 

@@ -388,6 +388,14 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS pendientes_por_facturar JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN pendientes_por_facturar:', e.message));
 
+  // Saldo a favor aplicado a una venta consumidora que sigue PPD/POR
+  // FACTURAR en Kore, detectado al generar la póliza — informativo, nunca
+  // se contabiliza (idempotente, mismo patrón que pendientes_por_facturar).
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS movimientos_ppd_por_facturar JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_ppd_por_facturar:', e.message));
+
   // "DEPOSITO EN EFECTIVO" sin conciliar, detectado al generar la póliza —
   // informativo, nunca se contabiliza (idempotente). BUG REAL 2026-09-10:
   // se agregó el campo al modelo Poliza.js sin este ALTER — Poliza no está

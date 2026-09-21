@@ -122,6 +122,18 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.JSONB,
     allowNull: true,
   },
+  // Saldo a favor aplicado a una venta consumidora que, según
+  // /cuentas-pendientes de Kore, sigue tipoPago='PPD' con
+  // nombreTipoMovimiento='POR FACTURAR' (2026-09-11, caso real CATEDRAL
+  // RESTAURANTE BAR, confirmado con el usuario) — informativo, NUNCA se
+  // contabiliza en esta póliza (mismo criterio que pendientesPorFacturar):
+  // ver `_prefetchAjustesFacturaPropia` (cfdi-poliza-generator.service.js) y
+  // la hoja "Movimientos PPD por facturar" en `_construirWorkbookPoliza`
+  // (poliza.service.js).
+  movimientosPpdPorFacturar: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
   // "DEPOSITO EN EFECTIVO" sin conciliar (dinero depositado directo en
   // sucursal bancaria, pero sin número de autorización/referencia que
   // permita ligarlo a un BankMovement real todavía) — confirmado con el

@@ -429,6 +429,43 @@ async function construirBancoRealPorTicket(movimientos) {
 // (terminal no registrada, sin transacción NetPay del monto exacto ese
 // día, o el endpoint de Kore falla) sigue su camino normal sin cambios —
 // nunca bloquea ni altera el resto de la póliza.
+// Busca un subconjunto de `indices` (índices sobre `disponibles`) cuya suma
+// de `debe` explique `monto` dentro de tolerancia — generalización del
+// fallback de "2 tickets" a "hasta N tickets" (2026-09-21, pedido explícito
+// del usuario: casos reales con 3+ tickets de la misma Factura Global
+// pagados con una sola pasada de tarjeta). Prueba tamaños de combinación en
+// orden CRECIENTE (2, 3, 4...) para preferir siempre la explicación más
+// chica/conservadora si hay varias posibles — con montos reales a 2
+// decimales, una coincidencia ambigua entre combinaciones de tamaño
+// distinto es prácticamente imposible.
+// `maxTickets` acota el tamaño del grupo para evitar explosión combinatoria
+// (2^n combinaciones) si una sola factura tuviera un número absurdo de
+// tickets Tarjeta ese día — nunca debería pasar en la práctica, pero es
+// un resguardo defensivo, no una limitación real del caso de negocio.
+const MAX_TICKETS_COMBINACION_NETPAY = 8;
+
+function _buscarCombinacionQueSuma(indices, disponibles, monto) {
+  const n = indices.length;
+  if (n > MAX_TICKETS_COMBINACION_NETPAY) return null;
+  const combo = [];
+  for (let k = 2; k <= n; k++) {
+    const encontrada = (function rec(start, sumaAcumulada) {
+      if (combo.length === k) {
+        return Math.abs(sumaAcumulada - monto) < 0.02 ? [...combo] : null;
+      }
+      for (let i = start; i < n; i++) {
+        combo.push(indices[i]);
+        const r = rec(i + 1, sumaAcumulada + Number(disponibles[indices[i]].debe));
+        combo.pop();
+        if (r) return r;
+      }
+      return null;
+    })(0, 0);
+    if (encontrada) return encontrada;
+  }
+  return null;
+}
+
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
@@ -532,37 +569,41 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
         continue;
       }
-      // Fallback: 2 tickets de la MISMA factura (Factura Global dividida en
-      // varios tickets) que en conjunto explican el monto — caso real
+      // Fallback: 2+ tickets de la MISMA factura (Factura Global dividida en
+      // varios tickets) que EN CONJUNTO explican el monto — caso real
       // confirmado 2026-09-21 (Hidalgo/B0, $7,914.13 = suma de 2 tickets de
-      // una misma Global pagados con una sola pasada de tarjeta). Acotado a
-      // la MISMA factura (nunca combina tickets sin relación solo porque su
-      // suma coincida por casualidad) — mismo principio que
-      // `_elegirBancoRealMultiple` ya usa para Transferencia/Cheque.
-      let par = null;
-      for (let a = 0; a < disponibles.length && !par; a++) {
-        for (let b = a + 1; b < disponibles.length; b++) {
-          const fa = disponibles[a], fb = disponibles[b];
-          if (!fa.cfdiUuid || fa.cfdiUuid !== fb.cfdiUuid) continue;
-          if (Math.abs((Number(fa.debe) + Number(fb.debe)) - monto) < 0.02) { par = [a, b]; break; }
-        }
+      // una misma Global; generalizado el mismo día a "hasta N tickets" por
+      // otro caso real con 3+). Acotado a la MISMA factura (nunca combina
+      // tickets sin relación solo porque su suma coincida por casualidad) —
+      // mismo principio que `_elegirBancoRealMultiple` ya usa para
+      // Transferencia/Cheque. Ver `_buscarCombinacionQueSuma`.
+      const gruposPorFactura = new Map(); // cfdiUuid -> [índices sobre `disponibles`]
+      disponibles.forEach((f, i) => {
+        if (!f.cfdiUuid) return;
+        if (!gruposPorFactura.has(f.cfdiUuid)) gruposPorFactura.set(f.cfdiUuid, []);
+        gruposPorFactura.get(f.cfdiUuid).push(i);
+      });
+      let combinacion = null;
+      for (const indicesGrupo of gruposPorFactura.values()) {
+        if (indicesGrupo.length < 2) continue;
+        combinacion = _buscarCombinacionQueSuma(indicesGrupo, disponibles, monto);
+        if (combinacion) break;
       }
-      if (!par) continue; // sin ticket ni par de la misma factura que expliquen el monto -- se ignora
-      const [ia, ib] = par;
-      const filaB = disponibles.splice(ib, 1)[0]; // splice del índice mayor primero
-      const filaA = disponibles.splice(ia, 1)[0];
-      matchedIds.add(filaA.id);
-      matchedIds.add(filaB.id);
-      gross += Number(filaA.debe) + Number(filaB.debe);
+      if (!combinacion) continue; // sin ticket ni combinación de la misma factura que expliquen el monto -- se ignora
+      // Splice de mayor a menor índice para no invalidar los índices restantes.
+      const filasCombinadas = [...combinacion].sort((a, b) => b - a).map(i => disponibles.splice(i, 1)[0]);
+      const sumaCombinada = filasCombinadas.reduce((s, f) => s + Number(f.debe), 0);
+      gross += sumaCombinada;
       comision += comisionTransaccion;
-      // Comisión repartida proporcional al monto de cada ticket, solo para
-      // que el desglose informativo sea legible por línea — el total que sí
-      // importa contablemente (`comision` de arriba) ya suma la comisión
-      // completa de la transacción una sola vez, sin importar este reparto.
-      const comisionA = Math.round(comisionTransaccion * (Number(filaA.debe) / monto) * 100) / 100;
-      const comisionB = Math.round((comisionTransaccion - comisionA) * 100) / 100;
-      detalle.push({ fila: filaA, terminalID: t.terminalID, monto: Number(filaA.debe), comision: comisionA });
-      detalle.push({ fila: filaB, terminalID: t.terminalID, monto: Number(filaB.debe), comision: comisionB });
+      for (const fila of filasCombinadas) {
+        matchedIds.add(fila.id);
+        // Comisión repartida proporcional al monto de cada ticket, solo para
+        // que el desglose informativo sea legible por línea — el total que sí
+        // importa contablemente (`comision` de arriba) ya suma la comisión
+        // completa de la transacción una sola vez, sin importar este reparto.
+        const comisionFila = Math.round(comisionTransaccion * (Number(fila.debe) / sumaCombinada) * 100) / 100;
+        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila });
+      }
     }
     if (gross > 0) {
       porCentro.set(centroCostoObj.id, {

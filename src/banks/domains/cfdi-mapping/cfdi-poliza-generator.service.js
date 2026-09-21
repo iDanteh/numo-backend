@@ -5514,14 +5514,28 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   };
 }
 
+// Mismo criterio que userLabel() en poliza.service.js (create() manual) —
+// duplicado aquí en vez de importar para no crear una dependencia cruzada
+// entre ambos servicios de pólizas.
+function _userLabel(user) {
+  return user?.nombre || user?.email || String(user?.dbId ?? 'sistema');
+}
+
 /**
  * Procesa los CFDIs vigentes del periodo y guarda la póliza directamente
  * como borrador en PostgreSQL. Útil cuando el volumen es demasiado grande
  * para devolver al frontend (>500 CFDIs).
  *
+ * `user` (2026-09-21, pedido explícito del usuario): quién generó esta
+ * póliza vía este flujo automático — antes `creadoPor` siempre quedaba
+ * vacío aquí (a diferencia de poliza.service.js#create, el alta manual, que
+ * sí lo guardaba), dando la falsa impresión de que era un proceso
+ * desatendido cuando en realidad SIEMPRE lo dispara un usuario real desde
+ * la UI (no existe ningún cron que llame a esta función).
+ *
  * Devuelve: { polizaId, totalCfdis, sinRegla, advertencias }
  */
-async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
+async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -6982,6 +6996,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       periodo:   Number(periodo),
       rfc,
       estado:    'borrador',
+      creadoPor: _userLabel(user),
       sustitutosExcluidos: sustitutosGuard.length ? sustitutosGuard : null,
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
       depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
@@ -7071,7 +7086,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
  *
  * Devuelve: { resultados: [{ centroCosto, centroCostoId, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, formaPagoFiltro }) {
+async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, formaPagoFiltro, user }) {
   const centros = await centrosSvc.list();
   const centrosConSerie = centros.filter(c => c.serieFacturacion);
 
@@ -7081,7 +7096,7 @@ async function generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropues
 
   const resultados = await _conLimite(centrosConSerie, CONCURRENCIA_GENERACION, async (cc) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, formaPagoFiltro });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, formaPagoFiltro, user });
       return { centroCosto: cc.sucursal, centroCostoId: cc.id, ...r };
     } catch (err) {
       // "No hay CFDIs para esta sucursal" es esperado (no toda sucursal tiene
@@ -7230,7 +7245,7 @@ const CONCURRENCIA_GENERACION = 4;
  *
  * Devuelve: { resultados: [{ fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
+async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
@@ -7239,7 +7254,7 @@ async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 
 
   const resultados = await _conLimite(dias, CONCURRENCIA_GENERACION, async (dia) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia, formaPagoFiltro });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId, fechaInicio: dia, fechaFin: dia, formaPagoFiltro, user });
       return { fecha: dia, ...r };
     } catch (err) {
       // "No hay CFDIs para este día" es esperado (no todos los días tienen
@@ -7259,7 +7274,7 @@ async function generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta = 
  *
  * Devuelve: { resultados: [{ centroCosto, centroCostoId, fecha, polizaId?, totalCfdis?, sinRegla?, error? }] }
  */
-async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro }) {
+async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
 
@@ -7278,7 +7293,7 @@ async function generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPro
 
   const resultados = await _conLimite(combinaciones, CONCURRENCIA_GENERACION, async ({ cc, dia }) => {
     try {
-      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia, formaPagoFiltro });
+      const r = await generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, centroCostoId: cc.id, fechaInicio: dia, fechaFin: dia, formaPagoFiltro, user });
       return { centroCosto: cc.sucursal, centroCostoId: cc.id, fecha: dia, ...r };
     } catch (err) {
       // "No hay CFDIs para esta sucursal/día" es esperado — se reporta sin

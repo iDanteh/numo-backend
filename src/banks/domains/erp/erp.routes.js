@@ -411,12 +411,12 @@ router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMIS
 // GET /api/erp/netpay/transacciones — Fase 1 de la sección Netpay: consulta en vivo
 // (sin persistencia) de transacciones vía GET /transactions/search de Kore (dominio
 // DISTINTO de transferencias entre cajas — NO confundir con /transferencias/reportes/buscar
-// de arriba). Filtros manuales por ahora (responseCode, almacenes CSV, terminalID); más
+// de arriba). Filtros manuales por ahora (responseCode, almacenes CSV, terminalID, status); más
 // filtros y cualquier matching contra BankMovement quedan para una siguiente iteración.
 // Permiso propio banks:netpay, admin-only por ahora — mismo criterio que transferencias-caja.
 router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { responseCode, almacenes, dateFrom, dateTo, terminalID } = req.query;
-  const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo, terminalID });
+  const { responseCode, almacenes, dateFrom, dateTo, terminalID, status } = req.query;
+  const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo, terminalID, status });
   res.json(resultado);
 }));
 
@@ -2347,6 +2347,160 @@ async function _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryR
   }
 }
 
+// ── Job "Recuperar folio fiscal" (2026-09-21) ─────────────────────────────────────────────
+// Reemplaza a _syncErpKoreJob/_recomputeErpKoreJob como corrida automática diaria — decisión
+// explícita del usuario: ningún job automático debe volver a tocar saldoErp/status/
+// erpLinks[].saldoErpAportado/saldoPagadoTotal/saldoPagado/saldoActual/tieneRetencion/
+// montoRetenido de NINGÚN movimiento (motivo: el bug de retención-cancela-aporte y varios
+// otros a lo largo de semanas, ver [[project_sync_erp_kore_finalizado_manualmente_gap]] y
+// [[project_reversion_atribucion_ambigua_retencion]], mostraron que este job entrelazado es
+// demasiado fácil de romper en producción). _syncErpKoreJob/_recomputeErpKoreJob NO se
+// borraron (quedan disponibles para consulta/diagnóstico puntual si hiciera falta), pero ya
+// no se disparan desde ningún lado — ver el guard 409 en POST /sync-erp-kore y
+// /sync-erp-kore/recompute más abajo, y el cron nuevo en banks/jobs/erpSyncCron.js.
+//
+// Alcance, deliberadamente angosto:
+// - Movimientos NO `identificado` (no_identificado/reclasificado/otros): se ignoran por
+//   completo — cero consultas a Kore, cero escritura. Ya no hay ningún camino automático
+//   para que un movimiento se identifique solo; identificar sigue siendo 100% una acción
+//   humana (UI, cobro-panel, Solicitudes de Cobro).
+// - Movimientos YA `identificado` (cobrados/aplicados): se les recupera ÚNICAMENTE
+//   erpLinks[].folioFiscal si sigue null y sigue dentro de la ventana de 60 días
+//   (_folioFiscalDentroDeVentanaReintento, sin cambios) — nada más se toca. Ni siquiera
+//   movimientosKore/tieneRetencion/saldoActual se refrescan.
+async function _recuperarFolioFiscalJob(auth0Sub, jobId, fechaInicio, fechaFin) {
+  syncCurrentJobId = jobId;
+  try {
+    const filter = {
+      status: 'identificado',
+      erpLinks: { $elemMatch: { serie: { $ne: null }, folioExterno: { $ne: null }, folioFiscal: null } },
+    };
+    if (fechaInicio && fechaFin) filter.fecha = { $gte: fechaInicio, $lte: fechaFin };
+
+    const movements = await BankMovement.find(filter)
+      .select('_id folio banco concepto deposito retiro fecha erpLinks identificadoPor')
+      .lean();
+
+    let procesados = 0, actualizados = 0, pendientes = 0, errores = 0;
+    const total    = movements.length;
+    let stopped    = false;
+    const detalles = [];
+
+    emitToUser(auth0Sub, 'bank:erp:sync:progress',
+      { jobId, procesados, total, actualizados, pendientes, errores, pct: 0 });
+
+    for (const mov of movements) {
+      if (!await _checkSyncControl()) { stopped = true; break; }
+
+      const links = mov.erpLinks ?? [];
+      let huboRecuperado = false;
+      let huboErrorMov   = false;
+      const linksDetalle = [];
+
+      for (const link of links) {
+        if (!link.serie || !link.folioExterno || link.folioFiscal) continue;
+
+        const fechaAnclaAlterna = mov.identificadoPor?.find(ip => ip.erpId === link.erpId)?.fechaId ?? null;
+        if (!_folioFiscalDentroDeVentanaReintento(link.conciliacionFinalizadaAt, fechaAnclaAlterna)) {
+          linksDetalle.push({ erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno, estado: 'fuera_de_ventana' });
+          continue;
+        }
+
+        const rango = _rangoDesdeFollo(link.folioExterno);
+        if (!rango) continue;
+
+        try {
+          let { raw } = await _sincronizarConRetry({
+            serieExterna: link.serie,
+            folioExterno: String(link.folioExterno),
+            fechaDesde:   rango.fechaDesde,
+            fechaHasta:   rango.fechaHasta,
+          });
+
+          if (raw.length === 0) {
+            const spillover = _rangoSpilloverSiguienteMes(link.folioExterno);
+            if (spillover) {
+              await _sleep(SYNC_DELAY_MS);
+              const retryRes = await _sincronizarConRetry({
+                serieExterna: link.serie,
+                folioExterno: String(link.folioExterno),
+                fechaDesde:   spillover.fechaDesde,
+                fechaHasta:   spillover.fechaHasta,
+              });
+              if (retryRes.raw.length > 0) raw = retryRes.raw;
+            }
+          }
+
+          const raw0 = raw[0];
+          const folioFiscal = (raw0?.folioFiscal || null) ?? null;
+
+          if (folioFiscal) {
+            await BankMovement.updateOne(
+              { _id: mov._id, 'erpLinks.erpId': link.erpId },
+              {
+                $set: { 'erpLinks.$.folioFiscal': folioFiscal },
+                $push: {
+                  _changelog: {
+                    at: new Date(), via: 'recuperar-folio-fiscal', campo: 'erpLinks.folioFiscal',
+                    campos: [], importFile: null,
+                    de: { folioFiscal: null }, a: { folioFiscal },
+                    runId: jobId, revertedAt: null,
+                  },
+                },
+              },
+            );
+            huboRecuperado = true;
+            linksDetalle.push({ erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno, estado: 'recuperado', folioFiscal });
+          } else {
+            linksDetalle.push({ erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno, estado: 'sigue_pendiente' });
+          }
+          await _sleep(SYNC_DELAY_MS);
+        } catch (err) {
+          errores++;
+          huboErrorMov = true;
+          linksDetalle.push({
+            erpId: link.erpId, serie: link.serie, folioExterno: link.folioExterno,
+            estado: 'error', error: err.message || 'Error al consultar Kore',
+          });
+        }
+      }
+
+      const estado = huboErrorMov ? 'error' : (huboRecuperado ? 'actualizado' : 'pendiente');
+      if (estado === 'actualizado') actualizados++;
+      if (estado === 'pendiente')   pendientes++;
+
+      detalles.push({
+        movementId: mov._id, folio: mov.folio, banco: mov.banco, concepto: mov.concepto,
+        fecha: mov.fecha, deposito: mov.deposito, estado, links: linksDetalle,
+      });
+
+      procesados++;
+      emitToUser(auth0Sub, 'bank:erp:sync:progress', {
+        jobId, procesados, total, actualizados, pendientes, errores,
+        pct: Math.round((procesados / total) * 100),
+      });
+    }
+
+    if (stopped) {
+      const result = { procesados, total, actualizados, pendientes, errores };
+      SYNC_JOBS.set(jobId, { status: 'stopped', auth0Sub, result, detalles, kind: 'folio-fiscal' });
+      emitToUser(auth0Sub, 'bank:erp:sync:stopped', { jobId, ...result });
+    } else {
+      const result = { total, actualizados, pendientes, errores };
+      SYNC_JOBS.set(jobId, { status: 'done', auth0Sub, result, detalles, kind: 'folio-fiscal' });
+      emitToUser(auth0Sub, 'bank:erp:sync:done', { jobId, ...result });
+    }
+  } catch (err) {
+    const error = err.message || 'Error al recuperar folio fiscal';
+    SYNC_JOBS.set(jobId, { status: 'error', auth0Sub, error, kind: 'folio-fiscal' });
+    emitToUser(auth0Sub, 'bank:erp:sync:error', { jobId, error });
+  } finally {
+    syncRunning      = false;
+    syncCurrentJobId = null;
+    setTimeout(() => SYNC_JOBS.delete(jobId), SYNC_JOB_TTL);
+  }
+}
+
 // ── Reporte Excel del job "Recalcular saldo ERP" ──────────────────────────────────────────
 // 5 hojas: Saldo actualizado (cambió saldoErp/status) · Backfill sin cambio (checkpoint
 // avanzó, snapshot refrescado, aporte igual o vínculo de motor) · Folio fiscal pendiente
@@ -2551,46 +2705,31 @@ router.post('/erp-links/:erpId/refrescar', authenticate, asyncHandler(async (req
   });
 }));
 
+// DESHABILITADO 2026-09-21 (decisión explícita del usuario): ningún job debe volver a
+// recalcular saldoErp/status — ver _recuperarFolioFiscalJob más arriba y POST
+// /sync-erp-kore/recuperar-folio-fiscal más abajo, su reemplazo. _syncErpKoreJob no se borró
+// (queda para consulta/diagnóstico), solo se le quitó el disparador.
 router.post('/sync-erp-kore', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
-  if (syncRunning) {
-    return res.status(409).json({ error: 'Ya hay una sincronización ERP-Kore en curso.' });
-  }
-
-  // Rango de fechas OPCIONAL — sin acotar por defecto (procesa todo lo aún no finalizado,
-  // igual que la corrida automática). El admin puede escribir un rango para acotar una
-  // corrida puntual (ej. reprocesar solo un mes específico).
-  let fechaInicio = null;
-  let fechaFin    = null;
-  if (req.body.fechaDesde) {
-    fechaInicio = new Date(req.body.fechaDesde);
-    if (isNaN(fechaInicio.getTime())) return res.status(400).json({ error: 'fechaDesde inválida' });
-  }
-  if (req.body.fechaHasta) {
-    fechaFin = new Date(req.body.fechaHasta);
-    if (isNaN(fechaFin.getTime())) return res.status(400).json({ error: 'fechaHasta inválida' });
-  }
-  if (fechaInicio && fechaFin && fechaInicio > fechaFin) {
-    return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
-  }
-
-  // Resetear control antes de cada job nuevo
-  syncControl.paused       = false;
-  syncControl.stopped      = false;
-  syncControl.pauseResolve = null;
-
-  syncRunning = true;
-  const jobId    = `erp-sync-${Date.now()}`;
-  const auth0Sub = req.user._id;
-
-  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'sync' });
-  res.status(202).json({ jobId });
-
-  _syncErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
+  return res.status(409).json({
+    error: 'Deshabilitado: ya no se recalcula saldoErp/status automáticamente ni a mano. '
+         + 'Usá POST /api/erp/sync-erp-kore/recuperar-folio-fiscal para recuperar folios fiscales pendientes.',
+  });
 }));
 
-// POST recalcular saldo ERP (backfill unificado) — mismo guard/control que el sync normal,
-// mutuamente excluyentes (comparten syncRunning/syncControl, ver _recomputeErpKoreJob).
+// DESHABILITADO 2026-09-21 (mismo motivo que /sync-erp-kore arriba). _recomputeErpKoreJob no
+// se borró (queda para consulta/diagnóstico), solo se le quitó el disparador.
 router.post('/sync-erp-kore/recompute', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
+  return res.status(409).json({
+    error: 'Deshabilitado: ya no se recalcula saldoErp/status automáticamente ni a mano. '
+         + 'Usá POST /api/erp/sync-erp-kore/recuperar-folio-fiscal para recuperar folios fiscales pendientes.',
+  });
+}));
+
+// POST recuperar folio fiscal (2026-09-21) — reemplazo angosto de /sync-erp-kore y
+// /sync-erp-kore/recompute (ambas deshabilitadas arriba). Mismo guard/control
+// (syncRunning/syncControl) que los jobs viejos, mutuamente excluyente con ellos por si
+// alguien los reactivara manualmente alguna vez.
+router.post('/sync-erp-kore/recuperar-folio-fiscal', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
   if (syncRunning) {
     return res.status(409).json({ error: 'Ya hay una sincronización ERP-Kore en curso.' });
   }
@@ -2609,20 +2748,18 @@ router.post('/sync-erp-kore/recompute', authenticate, permit('banks:admin'), asy
     return res.status(400).json({ error: 'fechaDesde debe ser anterior o igual a fechaHasta' });
   }
 
-  const dryRun = req.body.dryRun === true;
-
   syncControl.paused       = false;
   syncControl.stopped      = false;
   syncControl.pauseResolve = null;
 
   syncRunning = true;
-  const jobId    = `erp-recompute-${Date.now()}`;
+  const jobId    = `folio-fiscal-${Date.now()}`;
   const auth0Sub = req.user._id;
 
-  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'recompute', dryRun });
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'folio-fiscal' });
   res.status(202).json({ jobId });
 
-  _recomputeErpKoreJob(auth0Sub, jobId, fechaInicio, fechaFin, dryRun); // sin await — corre en background
+  _recuperarFolioFiscalJob(auth0Sub, jobId, fechaInicio, fechaFin); // sin await — corre en background
 }));
 
 router.post('/sync-erp-kore/pause', authenticate, permit('banks:admin'), asyncHandler(async (req, res) => {
@@ -3206,6 +3343,40 @@ async function runErpSyncAutomatico() {
 }
 
 router.runErpSyncAutomatico = runErpSyncAutomatico;
+
+// Corrida automática diaria — reemplaza a runErpSyncAutomatico() como lo que dispara el cron
+// (2026-09-21, decisión explícita del usuario, ver _recuperarFolioFiscalJob arriba para el
+// motivo completo). runErpSyncAutomatico queda arriba sin usarse desde el cron — solo
+// disponible para invocación manual/diagnóstico si hiciera falta.
+async function runRecuperarFolioFiscalAutomatico() {
+  if (syncRunning) {
+    console.warn('[CronErpSync] Ya hay una corrida en curso — se omite la corrida automática de hoy.');
+    return;
+  }
+
+  const auth0Sub = null;
+  console.log('[CronErpSync] Iniciando recuperación automática de folio fiscal...');
+  syncControl.paused       = false;
+  syncControl.stopped      = false;
+  syncControl.pauseResolve = null;
+  syncRunning = true;
+  const jobId = `folio-fiscal-${Date.now()}`;
+  SYNC_JOBS.set(jobId, { status: 'running', auth0Sub, kind: 'folio-fiscal' });
+
+  await _recuperarFolioFiscalJob(auth0Sub, jobId, null, null);
+  const job = SYNC_JOBS.get(jobId);
+  console.log(`[CronErpSync] Recuperación de folio fiscal automática completada — status=${job?.status}.`);
+
+  const ok = job?.status === 'done';
+  const resumen = {
+    fecha: new Date().toISOString(),
+    jobId, status: job?.status ?? null, result: job?.result ?? null,
+  };
+  console.log(`[CronErpSync][RESUMEN][${ok ? 'OK' : 'REVISAR'}] ${JSON.stringify(resumen)}`);
+}
+
+router.runRecuperarFolioFiscalAutomatico = runRecuperarFolioFiscalAutomatico;
+router._recuperarFolioFiscalJob          = _recuperarFolioFiscalJob;
 
 // obtenerSesionCaja/aplicarCobroOperacion(Multiple)/obtenerCuentasKore/KoreCajaError
 // ya NO se re-exportan aquí — collection-request.service.js las importa

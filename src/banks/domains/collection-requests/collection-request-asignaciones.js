@@ -61,7 +61,22 @@ function resolverAsignaciones(cr, body) {
     }
   }
 
-  const sinAsignar = formasPago.filter(f => !movIdsPorFormaPagoDocId.has(String(f._id)));
+  // Formas bancarias (transferencia, cheque, depósito en efectivo) REQUIEREN
+  // un bankMovementId — tienen un depósito real que referir. Formas no bancarias
+  // (efectivo de caja, saldo a favor, compensación, etc.) no tienen un depósito
+  // bancario verificable y quedan exentas del guard. Mismo criterio que
+  // esFormaBancaria() en collection-request-erp-links.js, duplicado acá para
+  // no crear una dependencia circular entre módulos puros.
+  const _norm = (s) => String(s ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  const _esFormaBancaria = (formaPagoDescripcion) => {
+    const d = String(formaPagoDescripcion ?? '');
+    if (/transferencia/i.test(d)) return true;
+    if (/cheque/i.test(d)) return true;
+    return /deposito.*efectivo/.test(_norm(d));
+  };
+
+  const sinAsignar = formasPago.filter(f =>
+    !movIdsPorFormaPagoDocId.has(String(f._id)) && _esFormaBancaria(f.formaPagoDescripcion));
   if (sinAsignar.length > 0) {
     const descripciones = sinAsignar.map(f => f.formaPagoDescripcion).join(', ');
     throw new BadRequestError(
@@ -73,7 +88,7 @@ function resolverAsignaciones(cr, body) {
 
   const porMovId = new Map();
   for (const f of formasPago) {
-    const movIds = movIdsPorFormaPagoDocId.get(String(f._id));
+    const movIds = movIdsPorFormaPagoDocId.get(String(f._id)) ?? [];
     for (const movId of movIds) {
       if (!porMovId.has(movId)) porMovId.set(movId, []);
       porMovId.get(movId).push(f);

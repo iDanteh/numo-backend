@@ -1229,17 +1229,21 @@ const exportReporteRecibidos = asyncHandler(async (req, res) => {
 
   const workbook = new ExcelJS.Workbook();
   const columnas = [
-    { header: 'UUID',            key: 'uuid',           width: 38 },
-    { header: 'RFC Emisor',      key: 'rfcEmisor',      width: 16 },
-    { header: 'Nombre Emisor',   key: 'nombreEmisor',   width: 30 },
-    { header: 'RFC Receptor',    key: 'rfcReceptor',    width: 16 },
-    { header: 'Nombre Receptor', key: 'nombreReceptor', width: 30 },
-    { header: 'Serie',           key: 'serie',          width: 8  },
-    { header: 'Folio',           key: 'folio',          width: 14 },
-    { header: 'Fecha',           key: 'fecha',          width: 12 },
-    { header: 'Subtotal',        key: 'subTotal',       width: 14 },
-    { header: 'Total',           key: 'total',          width: 14 },
-    { header: 'Moneda',          key: 'moneda',         width: 8  },
+    { header: 'UUID',                    key: 'uuid',              width: 38 },
+    { header: 'RFC Emisor',              key: 'rfcEmisor',         width: 16 },
+    { header: 'Nombre Emisor',           key: 'nombreEmisor',      width: 30 },
+    { header: 'Régimen Fiscal Emisor',   key: 'regimenFiscalEmisor',   width: 18 },
+    { header: 'RFC Receptor',            key: 'rfcReceptor',       width: 16 },
+    { header: 'Nombre Receptor',         key: 'nombreReceptor',    width: 30 },
+    { header: 'Régimen Fiscal Receptor', key: 'regimenFiscalReceptor', width: 18 },
+    { header: 'Uso de CFDI',             key: 'usoCFDI',           width: 14 },
+    { header: 'Serie',                   key: 'serie',             width: 8  },
+    { header: 'Folio',                   key: 'folio',             width: 14 },
+    { header: 'Fecha',                   key: 'fecha',             width: 12 },
+    { header: 'Forma de Pago',           key: 'formaPago',         width: 14 },
+    { header: 'Subtotal',                key: 'subTotal',          width: 14 },
+    { header: 'Total',                   key: 'total',             width: 14 },
+    { header: 'Moneda',                  key: 'moneda',            width: 8  },
   ];
 
   // Orden fijo (Ingresos primero) en vez del orden en que aparezcan los datos.
@@ -1271,17 +1275,21 @@ const exportReporteRecibidos = asyncHandler(async (req, res) => {
              ?? c.total;
       }
       sheet.addRow({
-        uuid:          c.uuid,
-        rfcEmisor:     c.emisor?.rfc      ?? '',
-        nombreEmisor:  c.emisor?.nombre   ?? '',
-        rfcReceptor:   c.receptor?.rfc    ?? '',
-        nombreReceptor:c.receptor?.nombre ?? '',
-        serie:         c.serie  ?? '',
-        folio:         c.folio  ?? '',
-        fecha:         c.fecha  ? new Date(c.fecha) : '',
-        subTotal:      c.subTotal ?? 0,
-        total:         total      ?? 0,
-        moneda:        c.moneda   ?? '',
+        uuid:                  c.uuid,
+        rfcEmisor:             c.emisor?.rfc            ?? '',
+        nombreEmisor:          c.emisor?.nombre         ?? '',
+        regimenFiscalEmisor:   c.emisor?.regimenFiscal   ?? '',
+        rfcReceptor:           c.receptor?.rfc          ?? '',
+        nombreReceptor:        c.receptor?.nombre       ?? '',
+        regimenFiscalReceptor: c.receptor?.regimenFiscal ?? '',
+        usoCFDI:               c.receptor?.usoCFDI       ?? '',
+        serie:                 c.serie  ?? '',
+        folio:                 c.folio  ?? '',
+        fecha:                 c.fecha  ? new Date(c.fecha) : '',
+        formaPago:             c.formaPago ?? '',
+        subTotal:              c.subTotal ?? 0,
+        total:                 total      ?? 0,
+        moneda:                c.moneda   ?? '',
       });
     }
 

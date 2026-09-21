@@ -1690,7 +1690,19 @@ async function buildConciliacionWorkbook(query, existingWorkbook) {
   ];
   const MONEY_KEYS = ['descuento','subERP','ivaTraERP','ivaRetERP','totalERP','descuentoSAT','subSAT','ivaTraSAT','totalSAT','diferencia'];
 
-  const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))].sort();
+  // Orden de hojas fijo (Ingreso, Egreso, Pago, Traslado, Nómina — el mismo
+  // orden de TIPO_LABEL), NO alfabético: alfabético pondría Egreso antes que
+  // Ingreso (códigos SAT 'E' < 'I'), pedido explícito del usuario 21-sep.
+  // Un tipo fuera del catálogo (no debería pasar) cae al final, alfabético.
+  const TIPO_ORDEN = Object.keys(TIPO_LABEL);
+  const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))]
+    .sort((a, b) => {
+      const ia = TIPO_ORDEN.indexOf(a), ib = TIPO_ORDEN.indexOf(b);
+      if (ia === -1 && ib === -1) return a.localeCompare(b);
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    });
   const tiposEnUsoSet = new Set(tiposEnUso);
 
   // Agrupar soloSat por tipo para insertarlos al final de cada hoja de tipo

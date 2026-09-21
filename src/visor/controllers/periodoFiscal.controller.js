@@ -264,6 +264,10 @@ const revertirCierre = asyncHandler(async (req, res) => {
 
   const userId = req.user?.dbId ? parseInt(req.user.dbId, 10) : null;
   const updated = await periodoRepo.revertirCierre(doc.id, userId);
+  // Refleja quién revirtió también en el historial de Reportes > Cierre de
+  // Mes (2026-09-21) — marca el cierre vigente de este período, no el estado
+  // de PeriodoFiscal (que ya lo guarda, pero se sobrescribe en el próximo cierre).
+  await cierreMesRepo.marcarRevertido(doc.id, userId);
   res.json(updated);
 });
 

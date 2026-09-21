@@ -132,6 +132,16 @@ test('terminalID se pasa tal cual, en cada página', async () => {
   );
 });
 
+test('status se pasa tal cual, en cada página', async () => {
+  buscarTransaccionesNetpay.mockResolvedValue(fakePage([]));
+
+  await consultarTransaccionesNetpay({ status: 'completed' });
+
+  expect(buscarTransaccionesNetpay).toHaveBeenCalledWith(
+    expect.objectContaining({ status: 'completed' }),
+  );
+});
+
 // CORRECCIÓN 2026-09-08 (hallazgo real del usuario): Kore pagina — caso real
 // reportado (totalCount=59, pageSize=20 default, 3 páginas). consultarTransaccionesNetpay
 // debe recorrer TODAS las páginas antes de agregar, no solo la primera.

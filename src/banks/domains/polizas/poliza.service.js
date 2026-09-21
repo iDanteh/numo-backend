@@ -522,14 +522,47 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
       if (t.status !== 'completed') continue;
       const monto = Number(t.amount) || 0;
       if (monto <= 0) continue;
-      const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
-      if (idx === -1) continue; // sin ticket de ese monto exacto ese día -- se ignora
-      const fila = disponibles.splice(idx, 1)[0];
-      matchedIds.add(fila.id);
       const comisionTransaccion = Number(t.commission) || 0;
-      gross += Number(fila.debe);
+      const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
+      if (idx !== -1) {
+        const fila = disponibles.splice(idx, 1)[0];
+        matchedIds.add(fila.id);
+        gross += Number(fila.debe);
+        comision += comisionTransaccion;
+        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
+        continue;
+      }
+      // Fallback: 2 tickets de la MISMA factura (Factura Global dividida en
+      // varios tickets) que en conjunto explican el monto — caso real
+      // confirmado 2026-09-21 (Hidalgo/B0, $7,914.13 = suma de 2 tickets de
+      // una misma Global pagados con una sola pasada de tarjeta). Acotado a
+      // la MISMA factura (nunca combina tickets sin relación solo porque su
+      // suma coincida por casualidad) — mismo principio que
+      // `_elegirBancoRealMultiple` ya usa para Transferencia/Cheque.
+      let par = null;
+      for (let a = 0; a < disponibles.length && !par; a++) {
+        for (let b = a + 1; b < disponibles.length; b++) {
+          const fa = disponibles[a], fb = disponibles[b];
+          if (!fa.cfdiUuid || fa.cfdiUuid !== fb.cfdiUuid) continue;
+          if (Math.abs((Number(fa.debe) + Number(fb.debe)) - monto) < 0.02) { par = [a, b]; break; }
+        }
+      }
+      if (!par) continue; // sin ticket ni par de la misma factura que expliquen el monto -- se ignora
+      const [ia, ib] = par;
+      const filaB = disponibles.splice(ib, 1)[0]; // splice del índice mayor primero
+      const filaA = disponibles.splice(ia, 1)[0];
+      matchedIds.add(filaA.id);
+      matchedIds.add(filaB.id);
+      gross += Number(filaA.debe) + Number(filaB.debe);
       comision += comisionTransaccion;
-      detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
+      // Comisión repartida proporcional al monto de cada ticket, solo para
+      // que el desglose informativo sea legible por línea — el total que sí
+      // importa contablemente (`comision` de arriba) ya suma la comisión
+      // completa de la transacción una sola vez, sin importar este reparto.
+      const comisionA = Math.round(comisionTransaccion * (Number(filaA.debe) / monto) * 100) / 100;
+      const comisionB = Math.round((comisionTransaccion - comisionA) * 100) / 100;
+      detalle.push({ fila: filaA, terminalID: t.terminalID, monto: Number(filaA.debe), comision: comisionA });
+      detalle.push({ fila: filaB, terminalID: t.terminalID, monto: Number(filaB.debe), comision: comisionB });
     }
     if (gross > 0) {
       porCentro.set(centroCostoObj.id, {

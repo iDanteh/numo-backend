@@ -1657,9 +1657,16 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     }
     const key = `${m.cuenta?.codigo}|${m.centroCosto}|${m._referenciaBancoReal}`;
     const existente = grupos.get(key);
+    // `_detalle` (2026-09-21, pedido explícito del usuario) — mismo mecanismo
+    // que ya usa `consolidarCargos` (Ingreso) para que la hoja "Desglose
+    // Consolidado" pueda rastrear qué facturas componen cada depósito
+    // fusionado, en vez de perder la trazabilidad al fusionar 2+ líneas.
     if (!existente) {
       const [nombreCliente, ...tickets] = (m.concepto || '').split(' / ');
-      const grupo = { ...m, _nombreCliente: nombreCliente || '', _tickets: tickets };
+      const grupo = {
+        ...m, _nombreCliente: nombreCliente || '', _tickets: tickets, _esTransferencia: true,
+        _detalle: [{ cfdiUuid: m.cfdiUuid, serie: m.serie, formaPago: m.formaPago, monto: Number(m.debe) }],
+      };
       grupos.set(key, grupo);
       conReferenciaFusionada.push(grupo);
     } else {
@@ -1667,6 +1674,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       existente.cfdiUuid = null; // ya no representa un solo CFDI/factura
       const [, ...tickets] = (m.concepto || '').split(' / ');
       for (const t of tickets) if (t && !existente._tickets.includes(t)) existente._tickets.push(t);
+      existente._detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, formaPago: m.formaPago, monto: Number(m.debe) });
     }
   }
 
@@ -1698,11 +1706,15 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       // como si todo el monto viniera de ahí, cuando en realidad mezclaba
       // varios Pagos). Sin una referencia única que mostrar, se deja en
       // blanco — mismo criterio que usa Contado para "Depósitos consolidados".
-      const bucket = { ...m, serie: '', concepto: `EFECTIVO ${claveCentro}`.trim(), cfdiUuid: null, _tickets: null };
+      const bucket = {
+        ...m, serie: '', concepto: `EFECTIVO ${claveCentro}`.trim(), cfdiUuid: null, _tickets: null,
+        _detalle: [{ cfdiUuid: m.cfdiUuid, serie: m.serie, formaPago: m.formaPago, monto: Number(m.debe) }],
+      };
       bucketsEfectivo.set(key, bucket);
       consolidado.push(bucket);
     } else {
       existente.debe = parseFloat((Number(existente.debe) + Number(m.debe)).toFixed(2));
+      existente._detalle.push({ cfdiUuid: m.cfdiUuid, serie: m.serie, formaPago: m.formaPago, monto: Number(m.debe) });
     }
   }
 
@@ -3385,7 +3397,14 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // por una terminal NetPay conocida (ver `construirNetpayInfo`) — sobre
   // `movimientos` ya filtrado por `overrides.centroCostoIds` (arriba), así
   // que respeta el mismo alcance de sucursales que el resto del export.
-  const netpayInfo = await construirNetpayInfo(movimientos, fechaFinal);
+  // Solo aplica a pólizas de Ingreso (tipo 'I') — Cobranza/Pago nunca trae
+  // movimientos con tipoOrigen='Venta' (el único candidato que acepta
+  // `construirNetpayInfo`), así que esta consulta nunca aportaba nada ahí;
+  // se condiciona para no pagar el costo de las queries a AccountPlan/Terminal
+  // en cada export de Cobranza (2026-09-21, pedido explícito del usuario).
+  const netpayInfo = poliza.tipo === 'I'
+    ? await construirNetpayInfo(movimientos, fechaFinal)
+    : { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
   // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.

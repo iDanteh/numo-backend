@@ -87,7 +87,7 @@ router.post('/generar-propuesta',
 router.post('/generar-y-guardar',
   authenticate,
   permit('polizas:write'),
-  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardar(req.body))),
+  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardar({ ...req.body, user: req.user }))),
 );
 
 // POST /api/cfdi-mapping/generar-y-guardar-por-sucursal
@@ -98,7 +98,7 @@ router.post('/generar-y-guardar',
 router.post('/generar-y-guardar-por-sucursal',
   authenticate,
   permit('polizas:write'),
-  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardarPorSucursal(req.body))),
+  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardarPorSucursal({ ...req.body, user: req.user }))),
 );
 
 // POST /api/cfdi-mapping/generar-y-guardar-por-dia
@@ -109,7 +109,7 @@ router.post('/generar-y-guardar-por-sucursal',
 router.post('/generar-y-guardar-por-dia',
   authenticate,
   permit('polizas:write'),
-  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardarPorDia(req.body))),
+  asyncHandler(async (req, res) => res.status(201).json(await generator.generarYGuardarPorDia({ ...req.body, user: req.user }))),
 );
 
 // POST /api/cfdi-mapping/exportar-contpaq-zip
@@ -122,7 +122,7 @@ router.post('/exportar-contpaq-zip',
   authenticate,
   permit('polizas:write'),
   asyncHandler(async (req, res) => {
-    const { buffer, nombreZip } = await polizaExportZip.exportarContpaqZip(req.body);
+    const { buffer, nombreZip } = await polizaExportZip.exportarContpaqZip({ ...req.body, user: req.user });
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${nombreZip}"`);
     res.setHeader('Content-Length', buffer.length);

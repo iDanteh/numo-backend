@@ -507,6 +507,12 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // que `_elegirBancoRealPorMonto`: primer match disponible gana).
     const disponibles = [...filas];
     let gross = 0, comision = 0;
+    // Detalle venta-por-venta (2026-09-21, pedido explícito del usuario) —
+    // alimenta la sección "NETPAY" de la hoja "Desglose Consolidado" en
+    // `_construirWorkbookPoliza`, para poder ver qué ticket exacto se cobró
+    // por esta terminal y cuánto se llevó NetPay de comisión en ESA venta
+    // (no solo el total del día/centro que ya traía `gross`/`comision`).
+    const detalle = [];
     for (const t of (resultado.transacciones ?? [])) {
       if (!terminalesValidas.has(t.terminalID)) continue;
       // Solo transacciones con status='completed' (confirmado por el usuario
@@ -520,14 +526,17 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
       if (idx === -1) continue; // sin ticket de ese monto exacto ese día -- se ignora
       const fila = disponibles.splice(idx, 1)[0];
       matchedIds.add(fila.id);
+      const comisionTransaccion = Number(t.commission) || 0;
       gross += Number(fila.debe);
-      comision += Number(t.commission) || 0;
+      comision += comisionTransaccion;
+      detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
     }
     if (gross > 0) {
       porCentro.set(centroCostoObj.id, {
         gross: Math.round(gross * 100) / 100,
         comision: Math.round(comision * 100) / 100,
         centroCostoObj,
+        detalle,
       });
     }
   }));
@@ -3626,16 +3635,20 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // (_inyectarCobrosSucursal).
       const otrosIngresosGrupo = grupo === 'Ventas' ? filasOtrosIngresos : [];
       const saldoFavorUsadoGrupo = grupo === 'Ventas' ? filasSaldoFavorUsado : [];
+      // NetPay (igual que Otros Ingresos/Saldos a favor arriba): solo tiene
+      // sentido en el archivo de Ventas — ahí viven las ventas Contado con
+      // Tarjeta que pudieron matchear con una terminal.
+      const netpayInfoGrupo = grupo === 'Ventas' ? netpayInfo : null;
       workbooks.push({
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo),
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo),
       });
     }
     return { poliza, workbooks };
   }
 
-  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado);
+  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado, netpayInfo);
   return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
 }
 
@@ -3646,7 +3659,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = []) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -3826,6 +3839,53 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     }
   }
 
+  // Sección NETPAY (2026-09-21, pedido explícito del usuario): qué ventas
+  // exactas se cobraron por una terminal NetPay conocida y cuánto se llevó
+  // NetPay de comisión en CADA una — ver `construirNetpayInfo`. Antes de esto
+  // solo se veía el resultado ya consolidado (depósito neto + comisión total
+  // del día en la póliza, `_lineasNetpay`); esta sección deja rastrear el
+  // detalle venta por venta detrás de esos totales, igual que ya se hace para
+  // Depósitos/Anticipos arriba.
+  if (netpayInfo?.porCentro?.size) {
+    for (const infoCentro of netpayInfo.porCentro.values()) {
+      const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
+      for (const d of (infoCentro.detalle ?? [])) {
+        const fila = d.fila;
+        const cfdiSerie = (fila.serieVentaTicket && fila.folioVentaTicket)
+          ? `${fila.serieVentaTicket}-${fila.folioVentaTicket}`
+          : (fila.serie || '');
+        desgloseConsolidado.push({
+          cuenta:        null,
+          centroCosto,
+          tipo:          'Venta',
+          transferencia: 'No',
+          formaPago:     'NETPAY',
+          cfdiSerie,
+          cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
+          monto:         d.monto,
+          nota:          `Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}`,
+        });
+      }
+      // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto
+      // real descuenta la comisión Y su IVA, no solo la comisión) para poder
+      // cuadrar rápido contra el asiento contable de la póliza.
+      const ivaComisionCentro  = Math.round(infoCentro.comision * 0.16 * 100) / 100;
+      const totalFacturaCentro = Math.round((infoCentro.comision + ivaComisionCentro) * 100) / 100;
+      const netoCentro         = Math.round((infoCentro.gross - totalFacturaCentro) * 100) / 100;
+      desgloseConsolidado.push({
+        cuenta:        null,
+        centroCosto,
+        tipo:          'Resumen',
+        transferencia: 'No',
+        formaPago:     'NETPAY',
+        cfdiSerie:     '',
+        cliente:       '',
+        monto:         infoCentro.gross,
+        nota:          `TOTAL del día: bruto $${infoCentro.gross.toFixed(2)} − comisión $${infoCentro.comision.toFixed(2)} − IVA comisión $${ivaComisionCentro.toFixed(2)} = neto depositado $${netoCentro.toFixed(2)}`,
+      });
+    }
+  }
+
   // Hoja de desglose: qué CFDIs componen cada línea consolidada de Depósitos/
   // Anticipos (esas líneas en la póliza no llevan serie/folio por ser un total
   // agregado — aquí se puede rastrear el detalle real detrás de cada monto).
@@ -3853,10 +3913,10 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     // cambia la forma de pago. Transferencia/Cheque agrupados (cuando
     // comparten referencia bancaria real) y cualquier forma de pago sin
     // mapear caen después, en el orden en que ya llegan.
-    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1 };
-    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6' };
+    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1, NETPAY: 2 };
+    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6', NETPAY: 'FFE2D9F3' };
     desgloseConsolidado.sort((a, b) =>
-      (ORDEN_FORMA_PAGO_DESGLOSE[a.formaPago] ?? 2) - (ORDEN_FORMA_PAGO_DESGLOSE[b.formaPago] ?? 2)
+      (ORDEN_FORMA_PAGO_DESGLOSE[a.formaPago] ?? 3) - (ORDEN_FORMA_PAGO_DESGLOSE[b.formaPago] ?? 3)
       || (a.cuenta - b.cuenta) || a.centroCosto.localeCompare(b.centroCosto),
     );
 

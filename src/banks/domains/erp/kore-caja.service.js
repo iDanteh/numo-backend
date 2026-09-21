@@ -243,6 +243,11 @@ async function buscarTransaccionesNetpay(params = {}) {
   // Kore no reconoce lo ignora en silencio, sin error, así que no vale la pena adivinar
   // el casing.
   if (params.terminalID) queryParams.terminalID = params.terminalID;
+  // status (2026-09-21, pedido explícito del usuario): filtra por el estatus de la
+  // transacción — valores esperados completed/canceled/rejected (los mismos 3 que ya
+  // muestra la UI en esta columna). Nombre EXACTO tal cual lo espera Kore — no se valida
+  // server-side, un valor que Kore no reconoce lo ignora en silencio, sin error.
+  if (params.status) queryParams.status = params.status;
   // Paginación de Kore (2026-09-08, confirmado por el usuario: pageSize máximo real
   // 100) — ver netpay-transacciones.service.js, que recorre todas las páginas
   // necesarias antes de agregar totales, nunca agrega sobre una sola respuesta.

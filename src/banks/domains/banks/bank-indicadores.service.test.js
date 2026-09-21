@@ -18,6 +18,8 @@ const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
 const {
   getIndicadoresIdentificacion, buildReporteIdentificacion, listUsuariosConIdentificaciones, horasHabilesEntre,
+  _calificaPorSaldoRestanteBajo, _masRecienteIdentificadoPor, _proxyFechaEnRango, _enScopeUserId,
+  _resolverCasiIdentificadosPorSaldoBajo, SALDO_RESTANTE_TOLERANCIA,
 } = require('./bank-indicadores.service');
 
 // Todos los tests de este archivo construyen instantes como "hora de PARED en México" — mx(y,
@@ -47,6 +49,21 @@ function mockIdentificados(docs) {
 
 function mockBacklog(backlogAgg) {
   BankMovement.aggregate.mockResolvedValueOnce(backlogAgg);
+}
+
+// getIndicadoresIdentificacion() ahora llama BankMovement.find() DOS veces en el mismo
+// Promise.all (identificados reales, luego candidatos crudos de saldo-restante-bajo) — a
+// diferencia de mockIdentificados() (que responde lo mismo a cualquier llamada), este helper
+// encadena mockReturnValueOnce en el mismo orden en que el service arma el array del
+// Promise.all, así cada find() devuelve la data que le corresponde.
+function mockIdentificadosYCandidatos(identificadosDocs, candidatosDocs) {
+  const leanIdentificados = jest.fn().mockResolvedValue(identificadosDocs);
+  const selectIdentificados = jest.fn().mockReturnValue({ lean: leanIdentificados });
+  const leanCandidatos = jest.fn().mockResolvedValue(candidatosDocs);
+  const selectCandidatos = jest.fn().mockReturnValue({ lean: leanCandidatos });
+  BankMovement.find
+    .mockReturnValueOnce({ select: selectIdentificados })
+    .mockReturnValueOnce({ select: selectCandidatos });
 }
 
 describe('horasHabilesEntre — 8:00-20:00 lunes a sábado, domingo 0 (hora de México)', () => {
@@ -573,6 +590,264 @@ describe('getIndicadoresIdentificacion — scopeUserId (dashboard de Cobranza, 2
 
     expect(result.promedioHoras).toBe(2);
     expect(result.porUsuario).toEqual([{ userId: 'user-1', nombre: 'Ana', promedioHoras: 2, count: 1 }]);
+  });
+});
+
+describe('_calificaPorSaldoRestanteBajo — tolerancia <= 20% (2026-09-21, decisión explícita del usuario)', () => {
+  test('califica cuando el saldo restante es exactamente 20% del total (borde inclusivo)', () => {
+    expect(_calificaPorSaldoRestanteBajo([{ saldoActual: 100, total: 500 }])).toBe(true);
+  });
+
+  test('no califica cuando el saldo restante supera el 20%', () => {
+    expect(_calificaPorSaldoRestanteBajo([{ saldoActual: 150, total: 500 }])).toBe(false);
+  });
+
+  test('CxC de 500 cobrando 400 (100 de saldo restante) califica — caso real del usuario', () => {
+    expect(_calificaPorSaldoRestanteBajo([{ saldoActual: 100, total: 500 }])).toBe(true);
+  });
+
+  test('suma TODAS las erpLinks antes de sacar el %, no CxC por CxC (decisión explícita del usuario)', () => {
+    // Individualmente el 2do link tiene 40% restante (no calificaría solo), pero el conjunto
+    // (120/1000 = 12%) sí califica.
+    const links = [{ saldoActual: 20, total: 500 }, { saldoActual: 100, total: 500 }];
+    expect(_calificaPorSaldoRestanteBajo(links)).toBe(true);
+  });
+
+  test('no califica si a cualquier link le falta `total` (dato incompleto, no se adivina)', () => {
+    const links = [{ saldoActual: 10, total: 500 }, { saldoActual: 5, total: null }];
+    expect(_calificaPorSaldoRestanteBajo(links)).toBe(false);
+  });
+
+  test('no califica si `total` es 0 o negativo en cualquier link', () => {
+    expect(_calificaPorSaldoRestanteBajo([{ saldoActual: 0, total: 0 }])).toBe(false);
+  });
+
+  test('sin erpLinks (vacío o no-array): no califica', () => {
+    expect(_calificaPorSaldoRestanteBajo([])).toBe(false);
+    expect(_calificaPorSaldoRestanteBajo(null)).toBe(false);
+    expect(_calificaPorSaldoRestanteBajo(undefined)).toBe(false);
+  });
+
+  test('SALDO_RESTANTE_TOLERANCIA está fijada en 0.20', () => {
+    expect(SALDO_RESTANTE_TOLERANCIA).toBe(0.20);
+  });
+});
+
+describe('_masRecienteIdentificadoPor — fecha/usuario proxy', () => {
+  test('elige la entrada con fechaId más reciente entre varias', () => {
+    const entry = _masRecienteIdentificadoPor([
+      { userId: 'user-1', nombre: 'Ana',  fechaId: new Date('2026-09-01T10:00:00Z') },
+      { userId: 'user-2', nombre: 'Luis', fechaId: new Date('2026-09-05T10:00:00Z') },
+      { userId: 'user-3', nombre: 'Eva',  fechaId: new Date('2026-09-03T10:00:00Z') },
+    ]);
+    expect(entry).toEqual({ userId: 'user-2', nombre: 'Luis', fechaId: new Date('2026-09-05T10:00:00Z') });
+  });
+
+  test('ignora entradas sin fechaId al elegir', () => {
+    const entry = _masRecienteIdentificadoPor([
+      { userId: 'user-1', nombre: 'Ana', fechaId: null },
+      { userId: 'user-2', nombre: 'Luis', fechaId: new Date('2026-09-05T10:00:00Z') },
+    ]);
+    expect(entry.userId).toBe('user-2');
+  });
+
+  test('devuelve null si ninguna entrada tiene fechaId (se deja fuera, no se inventa fecha)', () => {
+    expect(_masRecienteIdentificadoPor([{ userId: 'user-1', fechaId: null }])).toBeNull();
+    expect(_masRecienteIdentificadoPor([])).toBeNull();
+    expect(_masRecienteIdentificadoPor(undefined)).toBeNull();
+  });
+});
+
+describe('_proxyFechaEnRango — mismo criterio de precedencia que primeraIdentificacionAtMatch', () => {
+  test('rango explícito: dentro de fechaInicio/fechaFin', () => {
+    const proxy = mx(2026, 8, 11, 12, 0); // 2026-09-11 mediodía MX
+    expect(_proxyFechaEnRango({ fechaInicio: '2026-09-10', fechaFin: '2026-09-12' }, proxy)).toBe(true);
+  });
+
+  test('rango explícito: fuera de fechaInicio/fechaFin', () => {
+    const proxy = mx(2026, 8, 20, 12, 0);
+    expect(_proxyFechaEnRango({ fechaInicio: '2026-09-10', fechaFin: '2026-09-12' }, proxy)).toBe(false);
+  });
+
+  test('year sin rango explícito: cualquier fecha vale (mismo criterio que $ne:null)', () => {
+    expect(_proxyFechaEnRango({ year: '2020' }, mx(2026, 8, 18, 12, 0))).toBe(true);
+  });
+
+  test('default (sin year, sin rango explícito): solo cuenta si la fecha proxy es HOY en México', () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick'] });
+    jest.setSystemTime(mx(2026, 8, 18, 15, 30));
+    try {
+      expect(_proxyFechaEnRango({}, mx(2026, 8, 18, 9, 0))).toBe(true);
+      expect(_proxyFechaEnRango({}, mx(2026, 8, 17, 9, 0))).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe('_enScopeUserId — equivalente en JS de _matchScopeUserId', () => {
+  test('sin scope (null/undefined): siempre true', () => {
+    expect(_enScopeUserId(null, 'user-1')).toBe(true);
+    expect(_enScopeUserId(undefined, 'user-1')).toBe(true);
+  });
+
+  test('array vacío: siempre true (nunca "nadie")', () => {
+    expect(_enScopeUserId([], 'user-1')).toBe(true);
+  });
+
+  test('array con elementos: debe estar incluido', () => {
+    expect(_enScopeUserId(['user-1', 'user-2'], 'user-1')).toBe(true);
+    expect(_enScopeUserId(['user-1', 'user-2'], 'user-3')).toBe(false);
+  });
+
+  test('escalar: igualdad exacta', () => {
+    expect(_enScopeUserId('user-1', 'user-1')).toBe(true);
+    expect(_enScopeUserId('user-1', 'user-2')).toBe(false);
+  });
+});
+
+describe('_resolverCasiIdentificadosPorSaldoBajo — integra calificación + fecha proxy + scope', () => {
+  test('resuelve _id/createdAt/proxyFecha/userId/nombre de un candidato que califica', () => {
+    const fechaId = new Date('2026-09-18T12:00:00Z');
+    const candidatos = [{
+      _id: 'mov-1', createdAt: new Date('2026-09-15T08:00:00Z'),
+      erpLinks: [{ saldoActual: 100, total: 500 }],
+      identificadoPor: [{ userId: 'user-1', nombre: 'Ana', fechaId }],
+    }];
+
+    const resultado = _resolverCasiIdentificadosPorSaldoBajo(candidatos, { year: '2026' });
+
+    expect(resultado).toEqual([
+      { _id: 'mov-1', createdAt: candidatos[0].createdAt, proxyFecha: fechaId, userId: 'user-1', nombre: 'Ana' },
+    ]);
+  });
+
+  test('descarta un candidato que no califica por saldo restante', () => {
+    const candidatos = [{
+      _id: 'mov-1', createdAt: new Date(),
+      erpLinks: [{ saldoActual: 300, total: 500 }],
+      identificadoPor: [{ userId: 'user-1', fechaId: new Date() }],
+    }];
+    expect(_resolverCasiIdentificadosPorSaldoBajo(candidatos, { year: '2026' })).toEqual([]);
+  });
+
+  test('descarta un candidato sin ningún identificadoPor con fecha', () => {
+    const candidatos = [{
+      _id: 'mov-1', createdAt: new Date(),
+      erpLinks: [{ saldoActual: 50, total: 500 }],
+      identificadoPor: [{ userId: 'user-1', fechaId: null }],
+    }];
+    expect(_resolverCasiIdentificadosPorSaldoBajo(candidatos, { year: '2026' })).toEqual([]);
+  });
+
+  test('descarta un candidato fuera del rango de fecha resuelto', () => {
+    const candidatos = [{
+      _id: 'mov-1', createdAt: new Date('2026-09-15T08:00:00Z'),
+      erpLinks: [{ saldoActual: 50, total: 500 }],
+      identificadoPor: [{ userId: 'user-1', fechaId: new Date('2026-09-15T08:00:00Z') }],
+    }];
+    const resultado = _resolverCasiIdentificadosPorSaldoBajo(
+      candidatos, { fechaInicio: '2026-09-20', fechaFin: '2026-09-21' },
+    );
+    expect(resultado).toEqual([]);
+  });
+
+  test('descarta un candidato fuera del scopeUserId', () => {
+    const candidatos = [{
+      _id: 'mov-1', createdAt: new Date(),
+      erpLinks: [{ saldoActual: 50, total: 500 }],
+      identificadoPor: [{ userId: 'user-1', fechaId: new Date() }],
+    }];
+    expect(_resolverCasiIdentificadosPorSaldoBajo(candidatos, { year: '2026', scopeUserId: 'user-2' })).toEqual([]);
+  });
+});
+
+describe('getIndicadoresIdentificacion — saldo restante bajo (2026-09-21, SOLO para este dashboard)', () => {
+  test('un candidato que califica se suma a promedio/mediana usando la fecha proxy, y sale del backlog', async () => {
+    const createdAt   = mx(2026, 7, 17, 8, 0);
+    const fechaProxy  = mx(2026, 7, 17, 12, 0); // 4h hábiles después
+    mockIdentificadosYCandidatos(
+      [], // sin identificados reales
+      [{
+        _id: 'mov-casi-1', createdAt,
+        erpLinks: [{ saldoActual: 100, total: 500 }], // 20% restante, califica
+        identificadoPor: [{ userId: 'user-1', nombre: 'Ana', fechaId: fechaProxy }],
+      }],
+    );
+    mockBacklog([]);
+
+    const result = await getIndicadoresIdentificacion({ year: '2026' });
+
+    expect(result.promedioHoras).toBe(4);
+    expect(result.totalIdentificadosConDato).toBe(1);
+    expect(result.porUsuario).toEqual([{ userId: 'user-1', nombre: 'Ana', promedioHoras: 4, count: 1 }]);
+
+    // El backlog debe excluir explícitamente ese _id — ya no debe contarse como pendiente.
+    const backlogCall = BankMovement.aggregate.mock.calls[0];
+    expect(backlogCall[0][0].$match._id).toEqual({ $nin: ['mov-casi-1'] });
+  });
+
+  test('un candidato que NO califica (saldo restante > 20%) no se suma y sigue en backlog (sin excluir)', async () => {
+    mockIdentificadosYCandidatos(
+      [],
+      [{
+        _id: 'mov-no-1', createdAt: mx(2026, 7, 17, 8, 0),
+        erpLinks: [{ saldoActual: 300, total: 500 }], // 60% restante, no califica
+        identificadoPor: [{ userId: 'user-1', nombre: 'Ana', fechaId: mx(2026, 7, 17, 12, 0) }],
+      }],
+    );
+    mockBacklog([]);
+
+    const result = await getIndicadoresIdentificacion({ year: '2026' });
+
+    expect(result.totalIdentificadosConDato).toBe(0);
+    const backlogCall = BankMovement.aggregate.mock.calls[0];
+    expect(backlogCall[0][0].$match._id).toEqual({ $nin: [] });
+  });
+
+  test('scopeUserId también filtra a los candidatos por saldo restante bajo', async () => {
+    mockIdentificadosYCandidatos(
+      [],
+      [{
+        _id: 'mov-casi-2', createdAt: mx(2026, 7, 17, 8, 0),
+        erpLinks: [{ saldoActual: 0, total: 500 }],
+        identificadoPor: [{ userId: 'user-1', nombre: 'Ana', fechaId: mx(2026, 7, 17, 12, 0) }],
+      }],
+    );
+    mockBacklog([]);
+
+    const result = await getIndicadoresIdentificacion({ year: '2026', scopeUserId: 'user-2' });
+
+    expect(result.totalIdentificadosConDato).toBe(0);
+  });
+
+  test('sin candidatos crudos de erpLinks no vacío: comportamiento idéntico al de antes (sin regresión)', async () => {
+    mockIdentificadosYCandidatos(
+      [{ createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 10, 0) }],
+      [],
+    );
+    mockBacklog([]);
+
+    const result = await getIndicadoresIdentificacion({ year: '2026' });
+
+    expect(result.promedioHoras).toBe(2);
+    expect(result.totalIdentificadosConDato).toBe(1);
+    const backlogCall = BankMovement.aggregate.mock.calls[0];
+    expect(backlogCall[0][0].$match._id).toEqual({ $nin: [] });
+  });
+
+  test('el segundo find() pide status pendiente + erpLinks no vacío, mismo banco/categoria/cutoff que el backlog', async () => {
+    mockIdentificadosYCandidatos([], []);
+    mockBacklog([]);
+
+    await getIndicadoresIdentificacion({ banco: 'BBVA', categoria: 'Renta' });
+
+    const candidatosMatch = BankMovement.find.mock.calls[1][0];
+    expect(candidatosMatch.status).toEqual({ $in: ['no_identificado', 'reclasificado'] });
+    expect(candidatosMatch['erpLinks.0']).toEqual({ $exists: true });
+    expect(candidatosMatch.banco).toBe('BBVA');
+    expect(candidatosMatch.categoria).toBe('Renta');
+    expect(candidatosMatch.createdAt).toEqual({ $gte: mx(2026, 7, 17, 0, 0) });
   });
 });
 

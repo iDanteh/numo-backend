@@ -148,6 +148,85 @@ function _matchScopeUserId(scopeUserId) {
   return scopeUserId;
 }
 
+// Tolerancia de "saldo restante bajo" — decisión explícita del usuario (2026-09-21): un
+// movimiento cuya(s) CxC vinculada(s) ya quedaron con saldo restante <= 20% de su total
+// cuenta como "identificado" para las MÉTRICAS de ESTE dashboard (promedio/mediana/porUsuario/
+// backlog), aunque su `status` real siga en no_identificado/reclasificado — el depósito
+// bancario en sí puede seguir sin cubrirse al 100% (ver aplicarLogicaErp, bank.service.js,
+// que sigue intacto). Cero cambios en `status`, bloqueo de sobrepago, permisos, ni ningún
+// otro flujo — vive 100% acá, solo para lo que se reporta en pantalla/Excel de Cobranza.
+const SALDO_RESTANTE_TOLERANCIA = 0.20;
+
+// Suma saldoActual/total de TODAS las erpLinks del movimiento (decisión explícita del
+// usuario: el 20% se evalúa sobre el conjunto de CxC vinculadas, no CxC por CxC) y decide si
+// entra en la tolerancia de arriba. Si a cualquier link le falta `total` (dato incompleto —
+// CxC vinculada sin snapshot completo) o no hay erpLinks, NO califica: no se adivina el %
+// con datos parciales, se prefiere dejarlo fuera (mismo criterio que el resto de este ajuste).
+function _calificaPorSaldoRestanteBajo(erpLinks) {
+  if (!Array.isArray(erpLinks) || erpLinks.length === 0) return false;
+  let sumaSaldoActual = 0;
+  let sumaTotal = 0;
+  for (const l of erpLinks) {
+    if (l.total == null || l.total <= 0) return false;
+    sumaSaldoActual += l.saldoActual ?? 0;
+    sumaTotal += l.total;
+  }
+  return sumaSaldoActual / sumaTotal <= SALDO_RESTANTE_TOLERANCIA;
+}
+
+// Entre las entradas de identificadoPor de un movimiento, la más reciente por fechaId — es
+// quien "cerró" el residual dentro de la tolerancia; su fecha se usa como proxy de
+// identificación (mismo criterio que fechaAplicacion en bank.service.js#exportMovements,
+// que también toma el MÁXIMO de fechas de actividad) y su usuario para porUsuario. Devuelve
+// null si ninguna entrada tiene fechaId — decisión explícita del usuario: sin fecha real, el
+// movimiento se deja FUERA del cálculo en vez de inventar una.
+function _masRecienteIdentificadoPor(identificadoPor) {
+  const conFecha = (identificadoPor || []).filter(e => e.fechaId);
+  if (!conFecha.length) return null;
+  return conFecha.reduce((a, b) => (new Date(b.fechaId) > new Date(a.fechaId) ? b : a));
+}
+
+// Mismo criterio de precedencia que primeraIdentificacionAtMatch en _resolverMatchTiempo
+// (rango explícito > year sin acotar > default "hoy"), pero evaluado en JS contra una fecha
+// ya conocida (proxyFecha) en vez de armar un filtro de Mongo — los candidatos de saldo-
+// restante-bajo no tienen un campo real de fecha de identificación que Mongo pueda filtrar,
+// se resuelven aparte con la misma fecha proxy usada para horasHabilesEntre.
+function _proxyFechaEnRango({ fechaInicio, fechaFin, year }, proxyFecha) {
+  if (fechaInicio && fechaFin) {
+    return proxyFecha >= _inicioDiaMx(fechaInicio) && proxyFecha <= _finDiaMx(fechaFin);
+  }
+  if (year) return true; // mismo criterio que $ne:null: cualquier fecha vale, no se acota por día
+  const hoy = _hoyMexicoStr();
+  return proxyFecha >= _inicioDiaMx(hoy) && proxyFecha <= _finDiaMx(hoy);
+}
+
+// Equivalente en JS de _matchScopeUserId, pero para comparar un userId ya resuelto (no para
+// armar un filtro de Mongo) — mismo criterio: sin scope = todos entran; array vacío = todos
+// entran (nunca "nadie"); array con elementos = debe estar incluido; escalar = igualdad exacta.
+function _enScopeUserId(scopeUserId, userId) {
+  if (scopeUserId == null) return true;
+  if (Array.isArray(scopeUserId)) return scopeUserId.length === 0 || scopeUserId.includes(userId);
+  return scopeUserId === userId;
+}
+
+// Filtra+resuelve los candidatos crudos (find con status pendiente + erpLinks no vacío) a
+// los que de verdad califican por saldo restante bajo, ya con su fecha/usuario proxy y ya
+// acotados al mismo rango de fecha/scope que el resto del dashboard. Ver
+// SALDO_RESTANTE_TOLERANCIA arriba para el porqué completo de este ajuste.
+function _resolverCasiIdentificadosPorSaldoBajo(candidatos, { fechaInicio, fechaFin, year, scopeUserId }) {
+  const resultado = [];
+  for (const mov of candidatos) {
+    if (!_calificaPorSaldoRestanteBajo(mov.erpLinks)) continue;
+    const entry = _masRecienteIdentificadoPor(mov.identificadoPor);
+    if (!entry) continue;
+    const proxyFecha = new Date(entry.fechaId);
+    if (!_proxyFechaEnRango({ fechaInicio, fechaFin, year }, proxyFecha)) continue;
+    if (!_enScopeUserId(scopeUserId, entry.userId)) continue;
+    resultado.push({ _id: mov._id, createdAt: mov.createdAt, proxyFecha, userId: entry.userId ?? null, nombre: entry.nombre ?? null });
+  }
+  return resultado;
+}
+
 function promedio(valores) {
   if (!valores.length) return null;
   return valores.reduce((a, b) => a + b, 0) / valores.length;
@@ -254,14 +333,21 @@ function _resolverMatchTiempo({ banco, categoria, year, month, fechaInicio, fech
  * buildBaseMatch(). Ver `_resolverMatchTiempo()` para el detalle completo de filtros
  * (`year`/`month`/`fechaInicio`/`fechaFin`/`scopeUserId` y su precedencia).
  *
+ * Desde 2026-09-21 (decisión explícita del usuario, SOLO para este dashboard): un
+ * movimiento todavía `no_identificado`/`reclasificado` cuya(s) CxC vinculada(s) ya quedaron
+ * con saldo restante <= 20% de su total también entra al promedio/mediana/porUsuario (con
+ * la fecha del último `identificadoPor` como proxy de identificación) y SALE del backlog —
+ * ver SALDO_RESTANTE_TOLERANCIA/`_resolverCasiIdentificadosPorSaldoBajo` arriba. El `status`
+ * real del documento y `aplicarLogicaErp()` (bank.service.js) no se tocan.
+ *
  * @param {object} [opts] Ver `_resolverMatchTiempo()`.
  */
 async function getIndicadoresIdentificacion(opts = {}) {
-  const { banco, categoria } = opts;
+  const { banco, categoria, fechaInicio, fechaFin, year, scopeUserId } = opts;
   const matchTiempo = _resolverMatchTiempo(opts);
   const matchSoloBancoCategoria = { ...buildBaseMatch({ banco, categoria }), createdAt: { $gte: INDICADORES_DESDE } };
 
-  const [identificados, backlogAgg] = await Promise.all([
+  const [identificados, candidatosSaldoBajoRaw] = await Promise.all([
     // Trae los documentos ya identificados (equipo completo, desde INDICADORES_DESDE) para
     // calcular horas hábiles en JS — ver horasHabilesEntre() arriba sobre por qué esto no
     // se hace dentro de la agregación de Mongo. Con los volúmenes actuales (cientos/pocos
@@ -271,22 +357,42 @@ async function getIndicadoresIdentificacion(opts = {}) {
     BankMovement.find(matchTiempo)
       .select('createdAt primeraIdentificacionAt primeraIdentificacionPor')
       .lean(),
-    // Pipeline 2 — backlog de pendientes (no_identificado + reclasificado, BACKLOG_STATUSES)
-    // por antigüedad (sin year/month; equipo completo), desde INDICADORES_DESDE. Sigue en
-    // tiempo de RELOJ a propósito — el usuario pidió horas hábiles para los promedios, no
-    // para la antigüedad del backlog (decisión de alcance explícita, no un olvido).
-    BankMovement.aggregate([
-      { $match: { ...matchSoloBancoCategoria, status: { $in: BACKLOG_STATUSES } } },
-      { $project: { horas: { $divide: [{ $subtract: ['$$NOW', '$createdAt'] }, MS_PER_HOUR] } } },
-      { $bucket: { groupBy: '$horas', boundaries: BACKLOG_BOUNDARIES, default: 'otro', output: { count: { $sum: 1 } } } },
-    ], { allowDiskUse: true }),
+    // Candidatos crudos para la tolerancia de saldo restante bajo (ver arriba): mismo
+    // universo del backlog (status pendiente, banco/categoria, cutoff) pero con erpLinks
+    // real ('erpLinks.0' = idioma estándar de Mongo para "array no vacío") — se filtra/
+    // resuelve el % y la fecha/scope proxy en JS, ver _resolverCasiIdentificadosPorSaldoBajo.
+    BankMovement.find({
+      ...matchSoloBancoCategoria,
+      status: { $in: BACKLOG_STATUSES },
+      'erpLinks.0': { $exists: true },
+    }).select('createdAt erpLinks identificadoPor').lean(),
   ]);
+
+  const casiIdentificados = _resolverCasiIdentificadosPorSaldoBajo(
+    candidatosSaldoBajoRaw, { fechaInicio, fechaFin, year, scopeUserId },
+  );
+  const idsCasiIdentificados = casiIdentificados.map(c => c._id);
+
+  // Pipeline 2 — backlog de pendientes (no_identificado + reclasificado, BACKLOG_STATUSES)
+  // por antigüedad (sin year/month; equipo completo), desde INDICADORES_DESDE. Sigue en
+  // tiempo de RELOJ a propósito — el usuario pidió horas hábiles para los promedios, no
+  // para la antigüedad del backlog (decisión de alcance explícita, no un olvido). Excluye
+  // los casi-identificados por saldo restante bajo — ya se cuentan como identificados arriba,
+  // no deben aparecer TAMBIÉN como pendientes.
+  const backlogAgg = await BankMovement.aggregate([
+    { $match: { ...matchSoloBancoCategoria, status: { $in: BACKLOG_STATUSES }, _id: { $nin: idsCasiIdentificados } } },
+    { $project: { horas: { $divide: [{ $subtract: ['$$NOW', '$createdAt'] }, MS_PER_HOUR] } } },
+    { $bucket: { groupBy: '$horas', boundaries: BACKLOG_BOUNDARIES, default: 'otro', output: { count: { $sum: 1 } } } },
+  ], { allowDiskUse: true });
 
   const conHoras = identificados.map(d => ({
     horas:  horasHabilesEntre(d.createdAt, d.primeraIdentificacionAt),
     userId: d.primeraIdentificacionPor?.userId ?? null,
     nombre: d.primeraIdentificacionPor?.nombre ?? null,
   }));
+  for (const c of casiIdentificados) {
+    conHoras.push({ horas: horasHabilesEntre(c.createdAt, c.proxyFecha), userId: c.userId, nombre: c.nombre });
+  }
   const todasLasHoras = conHoras.map(d => d.horas);
 
   // Desglose por usuario — agrupado en JS sobre las mismas horas hábiles ya calculadas
@@ -327,6 +433,14 @@ async function getIndicadoresIdentificacion(opts = {}) {
  * divergencia). Un solo worksheet (a diferencia del reporte de Solicitudes de Cobro, acá
  * TODO lo que entra ya es `status:'identificado'` — no hay "Autorizadas"/"Rechazadas" que
  * separar).
+ *
+ * GAP CONOCIDO (2026-09-21): a diferencia de `getIndicadoresIdentificacion()`, este reporte
+ * TODAVÍA NO incluye los "casi identificados por saldo restante bajo" (ver
+ * SALDO_RESTANTE_TOLERANCIA arriba) — solo trae `status:'identificado'` real. Se dejó fuera
+ * a propósito en esta iteración (alcance explícito: solo el dashboard en pantalla); si se
+ * pide extenderlo, agregar esas filas acá rompería la invariante de "un solo criterio de
+ * filtro" de este JSDoc y requiere decidir cómo representarlas (no tienen `primeraIdentificacionAt`
+ * real ni `folio` de la misma forma).
  */
 async function buildReporteIdentificacion(opts = {}) {
   const matchTiempo = _resolverMatchTiempo(opts);
@@ -412,4 +526,12 @@ module.exports = {
   promedio,
   mediana,
   _matchScopeUserId,
+  // Tolerancia de saldo restante bajo (2026-09-21, dashboard de Cobranza) — exportadas para
+  // poder testearlas directo, mismo criterio que el resto de funciones puras de este archivo.
+  _calificaPorSaldoRestanteBajo,
+  _masRecienteIdentificadoPor,
+  _proxyFechaEnRango,
+  _enScopeUserId,
+  _resolverCasiIdentificadosPorSaldoBajo,
+  SALDO_RESTANTE_TOLERANCIA,
 };

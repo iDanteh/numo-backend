@@ -1405,6 +1405,20 @@ describe('GET /netpay/transacciones', () => {
       expect.objectContaining({ terminalID: '2840403056' }),
     );
   });
+
+  test('pasa status al service', async () => {
+    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [], totales: { monto: 0, comision: 0, neto: 0 }, porAlmacen: [] });
+
+    const res = await request(app)
+      .get('/netpay/transacciones')
+      .query({ status: 'completed' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'completed' }),
+    );
+  });
 });
 
 // GET /cuenta-por-serie-folio — segunda parte del buscador de CFDI (2026-08-07): resuelve

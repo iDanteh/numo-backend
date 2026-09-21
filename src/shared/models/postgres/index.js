@@ -49,6 +49,8 @@ CierreMesHistorico.belongsTo(PeriodoFiscal, { foreignKey: 'periodoFiscalId', as:
 PeriodoFiscal.hasMany(CierreMesHistorico,   { foreignKey: 'periodoFiscalId', as: 'cierres' });
 CierreMesHistorico.belongsTo(User, { foreignKey: 'cerradoPorId', as: 'cerradoPor' });
 User.hasMany(CierreMesHistorico,   { foreignKey: 'cerradoPorId', as: 'cierresMesRealizados' });
+CierreMesHistorico.belongsTo(User, { foreignKey: 'revertidoPorId', as: 'revertidoPor' });
+User.hasMany(CierreMesHistorico,   { foreignKey: 'revertidoPorId', as: 'cierresMesRevertidos' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -149,6 +151,16 @@ async function syncModels() {
 
   // Historial de cierres de mes — tabla nueva, depende de periodos_fiscales y users.
   await CierreMesHistorico.sync({ force: false });
+
+  // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
+  // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla
+  // que ya existe, así que la columna nueva necesita su propio ALTER TABLE
+  // explícito (mismo bug ya visto con pendientes_por_facturar en Poliza).
+  await CierreMesHistorico.sequelize.query(`
+    ALTER TABLE cierres_mes_historico
+      ADD COLUMN IF NOT EXISTS revertido_por_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS revertido_en      TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN revertido_por_id/revertido_en (cierres_mes_historico):', e.message));
 
   // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
   await syncAlter(CfdiMappingRule);

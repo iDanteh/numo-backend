@@ -64,6 +64,25 @@ const CierreMesHistorico = sequelize.define('CierreMesHistorico', {
     references: { model: 'users', key: 'id' },
     onDelete:   'SET NULL',
   },
+  /**
+   * FK al usuario que revirtió ESTE cierre en particular (2026-09-21, pedido
+   * explícito del usuario). Se completa junto con `revertidoEn` cuando se
+   * llama a POST /periodos-fiscales/:id/revertir-cierre — ver
+   * `cierre-mes-historico.repository.js` `marcarRevertido()`, que ubica el
+   * cierre más reciente sin revertir de ese período (no basta con el estado
+   * de PeriodoFiscal: un período puede cerrarse/revertirse varias veces y
+   * cada cierre queda como fila separada en esta tabla).
+   */
+  revertidoPorId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'users', key: 'id' },
+    onDelete:   'SET NULL',
+  },
+  revertidoEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName:   'cierres_mes_historico',
   underscored: true,

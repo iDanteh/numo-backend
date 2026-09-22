@@ -12,7 +12,7 @@ const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
-const { BadRequestError }          = require('../../shared/errors/AppError');
+const { BadRequestError, ConflictError } = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
 const {
   _splitUuids,
@@ -5535,7 +5535,40 @@ function _userLabel(user) {
  *
  * Devuelve: { polizaId, totalCfdis, sinRegla, advertencias }
  */
-async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
+// Candado en memoria (2026-09-22, pedido explícito del usuario): evita que
+// la MISMA póliza (rfc+tipo+ejercicio/periodo+sucursal+rango de fechas) se
+// dispare dos veces en paralelo -- el riesgo real no es que un usuario le dé
+// doble clic, es que dos personas distintas (o la misma en dos pestañas)
+// generen la póliza de la misma sucursal/día al mismo tiempo: folios
+// chocados, o el mismo Saldo a Favor marcándose "usado" dos veces si ambos
+// procesos lo leen antes de que el primero termine de guardar. Vive en
+// memoria del proceso (no en BD) -- si el servidor se reinicia a medio
+// camino, el candado se limpia solo (no hace falta un TTL/staleness aparte).
+// `generarYGuardarPorSucursal`/`PorDia`/`PorSucursalYDia` llaman a esta
+// función internamente por cada sucursal/día, así que este único candado
+// cubre las 4 rutas de generación sin duplicar lógica. Cobranza (tipoCfdi='P')
+// delega a otro módulo (cobranza-poliza-generator.service.js) y NO pasa por
+// acá -- fuera de alcance de este pedido puntual.
+const _generacionesEnCurso = new Set();
+
+function _claveGeneracion({ rfc, tipoCfdi, ejercicio, periodo, centroCostoId, fechaInicio, fechaFin }) {
+  return [rfc, tipoCfdi, ejercicio, periodo, centroCostoId ?? 'todas', fechaInicio ?? '', fechaFin ?? ''].join('|');
+}
+
+async function generarYGuardar(params) {
+  const clave = _claveGeneracion(params);
+  if (_generacionesEnCurso.has(clave)) {
+    throw new ConflictError('Ya se está generando esta póliza (misma sucursal y fecha) — espera a que termine antes de intentar de nuevo.');
+  }
+  _generacionesEnCurso.add(clave);
+  try {
+    return await _generarYGuardarCore(params);
+  } finally {
+    _generacionesEnCurso.delete(clave);
+  }
+}
+
+async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');

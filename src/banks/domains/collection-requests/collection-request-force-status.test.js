@@ -9,6 +9,12 @@
 // comprobantes.service/receipt.service, para confirmar que el guard corta ANTES de
 // llegar a descargar el comprobante o correr OCR — mismo criterio de "mockear los
 // límites de I/O" que collection-request-get-by-erp-id.test.js.
+//
+// ownerOnly/requestUserId (2026-09-22, bug real: rol Tienda, solo collections:read,
+// quedaba bloqueado con 403 al ver su PROPIO detalle/comprobante/análisis) — getById()/
+// getComprobante()/analyzeStoredComprobantes() ahora aceptan también { ownerOnly,
+// requestUserId } vía _checkAccesoSolicitud(): sin restricción de status, pero solo si
+// cr.solicitanteUserId === requestUserId. Ver describe()s "ownerOnly" de cada función.
 jest.mock('./CollectionRequest.model');
 jest.mock('./drive-comprobantes.service');
 jest.mock('./receipt.service');
@@ -93,6 +99,22 @@ describe('getById() — forceStatus bloquea el detalle de una solicitud fuera de
       name: 'ForbiddenError', statusCode: 403,
     });
   });
+
+  test('ownerOnly + dueño real (mismo solicitanteUserId): pasa, sin importar el status', async () => {
+    CollectionRequest.findById.mockReturnValue(mockLeanQuery({ _id: 'cr1', status: 'pendiente', solicitanteUserId: 'tienda-1', comprobante: {} }));
+
+    const resultado = await getById('cr1', { ownerOnly: true, requestUserId: 'tienda-1' });
+
+    expect(resultado._id).toBe('cr1');
+  });
+
+  test('ownerOnly + solicitud ajena: ForbiddenError (403), no NotFoundError', async () => {
+    CollectionRequest.findById.mockReturnValue(mockLeanQuery({ _id: 'cr1', status: 'pendiente', solicitanteUserId: 'tienda-1', comprobante: {} }));
+
+    await expect(getById('cr1', { ownerOnly: true, requestUserId: 'otra-tienda' })).rejects.toMatchObject({
+      name: 'ForbiddenError', statusCode: 403,
+    });
+  });
 });
 
 describe('getComprobante() — mismo guard, corta ANTES de descargar el archivo de Drive', () => {
@@ -104,6 +126,26 @@ describe('getComprobante() — mismo guard, corta ANTES de descargar el archivo 
     });
     expect(driveComprobantes.descargarComprobante).not.toHaveBeenCalled();
   });
+
+  test('ownerOnly + solicitud ajena: ForbiddenError, driveComprobantes.descargarComprobante NUNCA se llama', async () => {
+    CollectionRequest.findById.mockReturnValue(mockSelectOnlyQuery({ status: 'pendiente', solicitanteUserId: 'tienda-1', comprobantes: [] }));
+
+    await expect(getComprobante('cr1', 0, { ownerOnly: true, requestUserId: 'otra-tienda' })).rejects.toMatchObject({
+      name: 'ForbiddenError', statusCode: 403,
+    });
+    expect(driveComprobantes.descargarComprobante).not.toHaveBeenCalled();
+  });
+
+  test('ownerOnly + dueño real: pasa, sin importar el status (mismo alcance que ya tenía por /mias)', async () => {
+    CollectionRequest.findById.mockReturnValue(mockSelectOnlyQuery({
+      status: 'pendiente', solicitanteUserId: 'tienda-1',
+      comprobantes: [{ storage: 'drive', driveFileId: 'f1', mimetype: 'image/png', originalName: 'a.png' }],
+    }));
+
+    const resultado = await getComprobante('cr1', 0, { ownerOnly: true, requestUserId: 'tienda-1' });
+
+    expect(resultado.mimetype).toBe('image/png');
+  });
 });
 
 describe('analyzeStoredComprobantes() — mismo guard, corta ANTES de correr OCR', () => {
@@ -111,6 +153,16 @@ describe('analyzeStoredComprobantes() — mismo guard, corta ANTES de correr OCR
     CollectionRequest.findById.mockReturnValue(mockSelectOnlyQuery({ status: 'pendiente', comprobantes: [] }));
 
     await expect(analyzeStoredComprobantes('cr1', { forceStatus: 'identificada' })).rejects.toMatchObject({
+      name: 'ForbiddenError', statusCode: 403,
+    });
+    expect(extractReceiptData).not.toHaveBeenCalled();
+    expect(findMatchingMovements).not.toHaveBeenCalled();
+  });
+
+  test('ownerOnly + solicitud ajena: ForbiddenError, ni extractReceiptData ni findMatchingMovements se llaman', async () => {
+    CollectionRequest.findById.mockReturnValue(mockSelectOnlyQuery({ status: 'pendiente', solicitanteUserId: 'tienda-1', comprobantes: [] }));
+
+    await expect(analyzeStoredComprobantes('cr1', { ownerOnly: true, requestUserId: 'otra-tienda' })).rejects.toMatchObject({
       name: 'ForbiddenError', statusCode: 403,
     });
     expect(extractReceiptData).not.toHaveBeenCalled();

@@ -414,6 +414,9 @@ router.get('/transferencias-cajas/pendientes-ficha', authenticate, permit(PERMIS
 // de arriba). Filtros manuales por ahora (responseCode, almacenes CSV, terminalID, status); más
 // filtros y cualquier matching contra BankMovement quedan para una siguiente iteración.
 // Permiso propio banks:netpay, admin-only por ahora — mismo criterio que transferencias-caja.
+// dateFrom/dateTo viajan PELADOS (YYYY-MM-DD, 2026-09-22) — consultarTransaccionesNetpay()
+// arma el instante UTC real de inicio/fin de día en hora MX (antes: el frontend armaba el
+// ISO completo en UTC puro, perdiendo movimientos de las 6pm+ hora MX).
 router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
   const { responseCode, almacenes, dateFrom, dateTo, terminalID, status } = req.query;
   const resultado = await consultarTransaccionesNetpay({ responseCode, almacenes, dateFrom, dateTo, terminalID, status });
@@ -422,9 +425,9 @@ router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPA
 
 // GET /api/erp/netpay/bandeja — matching Netpay↔BBVA (ver netpay-match.service.js): agrupa
 // las transacciones del rango por almacen+terminalID+día y busca candidatos BBVA para cada
-// grupo sin resolver todavía. TODO EN VIVO (sin sync/cron) — dateFrom/dateTo acotan el rango
-// de Kore a consultar, mismos parámetros que /netpay/transacciones. Mismo permiso que el
-// resto de la sección.
+// grupo sin resolver todavía. TODO EN VIVO (sin sync/cron) — dateFrom/dateTo (pelados,
+// YYYY-MM-DD, ver nota arriba) acotan el rango de Kore a consultar, mismos parámetros que
+// /netpay/transacciones. Mismo permiso que el resto de la sección.
 router.get('/netpay/bandeja', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
   const { dateFrom, dateTo, terminalID } = req.query;
   const resultado = await obtenerBandejaNetpay({ dateFrom, dateTo, terminalID });

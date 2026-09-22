@@ -7010,6 +7010,15 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         ...m,
         polizaId: polizaHeader.id,
         orden:    i + j + 1,
+        // cfdiUuid = cfdi_uuid varchar(36) — cuando el ERP no trae UUID real,
+        // erp-transformer.service.js genera un sintético "SINUUID-<rfc>-<serie>-
+        // <folio>-<importe>" para deduplicar SU lado (factura sin timbrar), pero
+        // ese string casi siempre excede 36 caracteres y tronaba el bulkInsert
+        // completo (caso real 2026-09-22: Puerto Escondido/O0, factura
+        // A0-260911611, "SINUUID-CCO011113663-A0-260911611-1114.9299999999998").
+        // Nunca es un UUID real de cualquier forma, así que se descarta aquí en
+        // vez de perseguir cada punto del archivo que copia cfdi.uuid.
+        cfdiUuid: (m.cfdiUuid && m.cfdiUuid.length <= 36) ? m.cfdiUuid : null,
       }));
       await PolizaMovimiento.bulkCreate(rows, { transaction: t });
     }

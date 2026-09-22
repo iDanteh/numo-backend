@@ -9,7 +9,7 @@
 jest.mock('./kore-caja.service');
 
 const { buscarTransaccionesNetpay } = require('./kore-caja.service');
-const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
+const { consultarTransaccionesNetpay, _medianocheMx, _finDiaMx } = require('./netpay-transacciones.service');
 
 function fakePage(transactions, { page = 1, totalPages = 1 } = {}) {
   return {
@@ -107,16 +107,55 @@ test('almacen null/undefined agrupa bajo "(sin almacén)"', async () => {
   ]);
 });
 
-test('responseCode/almacenes/dateFrom/dateTo se pasan tal cual, con page/pageSize agregados', async () => {
+test('responseCode/almacenes se pasan tal cual, con page/pageSize agregados', async () => {
   buscarTransaccionesNetpay.mockResolvedValue(fakePage([]));
 
-  await consultarTransaccionesNetpay({
-    responseCode: '00', almacenes: 'A0,N0', dateFrom: '2026-09-04T00:00:00Z', dateTo: '2026-09-04T23:59:59Z',
-  });
+  await consultarTransaccionesNetpay({ responseCode: '00', almacenes: 'A0,N0' });
 
   expect(buscarTransaccionesNetpay).toHaveBeenCalledWith({
-    responseCode: '00', almacenes: 'A0,N0', dateFrom: '2026-09-04T00:00:00Z', dateTo: '2026-09-04T23:59:59Z',
+    responseCode: '00', almacenes: 'A0,N0', dateFrom: undefined, dateTo: undefined,
     page: 1, pageSize: 100,
+  });
+});
+
+// CORRECCIÓN 2026-09-22 (bug real reportado por el usuario: movimientos de las 6pm+
+// hora MX desaparecían de la consulta) — dateFrom/dateTo dejan de ser un ISO completo
+// armado por el caller (antes: el frontend armaba T00:00:00Z/T23:59:59Z, UTC PURO). Ahora
+// llegan pelados (YYYY-MM-DD) y este service arma el instante UTC real de inicio/fin de
+// día en hora MX (offset fijo UTC-6) ANTES de pedirle nada a Kore.
+describe('dateFrom/dateTo — se convierten de fecha pelada a instante UTC real en hora MX', () => {
+  test('_medianocheMx: medianoche MX = 06:00:00.000Z (no 00:00:00Z)', () => {
+    expect(_medianocheMx('2026-09-04')).toBe('2026-09-04T06:00:00.000Z');
+  });
+
+  test('_finDiaMx: fin de día MX = 05:59:59.999Z del día SIGUIENTE (no 23:59:59Z del mismo día)', () => {
+    expect(_finDiaMx('2026-09-04')).toBe('2026-09-05T05:59:59.999Z');
+  });
+
+  test('un movimiento de las 18:00 hora MX (=00:00Z del día siguiente) cae DENTRO del rango de ese día', () => {
+    const dentroDelRango = new Date('2026-09-04T18:00:00.000-06:00'); // 2026-09-05T00:00:00.000Z
+    expect(dentroDelRango.getTime()).toBeGreaterThanOrEqual(new Date(_medianocheMx('2026-09-04')).getTime());
+    expect(dentroDelRango.getTime()).toBeLessThanOrEqual(new Date(_finDiaMx('2026-09-04')).getTime());
+  });
+
+  test('consultarTransaccionesNetpay convierte dateFrom/dateTo antes de llamar a buscarTransaccionesNetpay', async () => {
+    buscarTransaccionesNetpay.mockResolvedValue(fakePage([]));
+
+    await consultarTransaccionesNetpay({ dateFrom: '2026-09-04', dateTo: '2026-09-04' });
+
+    expect(buscarTransaccionesNetpay).toHaveBeenCalledWith(expect.objectContaining({
+      dateFrom: '2026-09-04T06:00:00.000Z', dateTo: '2026-09-05T05:59:59.999Z',
+    }));
+  });
+
+  test('solo dateFrom (sin dateTo): dateTo queda undefined, no se inventa un fin de rango', async () => {
+    buscarTransaccionesNetpay.mockResolvedValue(fakePage([]));
+
+    await consultarTransaccionesNetpay({ dateFrom: '2026-09-04' });
+
+    expect(buscarTransaccionesNetpay).toHaveBeenCalledWith(expect.objectContaining({
+      dateFrom: '2026-09-04T06:00:00.000Z', dateTo: undefined,
+    }));
   });
 });
 

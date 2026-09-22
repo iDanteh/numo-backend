@@ -42,28 +42,51 @@ async function _ventanaDiasNetpay() {
   return Number.isFinite(dias) && dias > 0 ? dias : VENTANA_DEFAULT_DIAS;
 }
 
-// Trunca a medianoche UTC — mismo criterio de "solo fecha" que el resto del dominio ERP
-// (ver _rangoDesdeFollo en erp.routes.js). transactionDate de Kore viaja como string ISO.
-function _diaUTC(fechaISO) {
-  const d = new Date(fechaISO);
+// Bucketiza el timestamp REAL de una transacción de Kore a su día calendario en hora de
+// MÉXICO (offset fijo UTC-6, sin horario de verano desde 2022) — CORRECCIÓN 2026-09-22
+// (mismo bug de fondo ya corregido en la ventana de consulta, ver
+// netpay-transacciones.service.js#_medianocheMx/_finDiaMx): la versión anterior de esta
+// función (llamada _diaUTC) truncaba a medianoche UTC SIN desplazar — cualquier
+// transacción de las 18:00-23:59 hora MX (que cae en 00:00-05:59 UTC del día calendario
+// SIGUIENTE) quedaba agrupada bajo el día equivocado. Verificado que no había ningún
+// NetpayMatch confirmado en producción antes de este cambio (confirmado por el usuario
+// 2026-09-22) — no hace falta migrar datos existentes.
+//
+// IMPORTANTE — NUNCA usar esta función sobre un `dia` que YA es un marcador bucketizado
+// (ej. el que confirmarMatchNetpay/descartarMatchNetpay reciben de vuelta desde el
+// frontend, que a su vez salió de acá mismo) — el desplazamiento de -6h lo correría un
+// día para atrás por error. Para normalizar un marcador ya calculado, usar
+// _normalizarMarcadorDia() en su lugar (ver netpay-match-confirm.service.js).
+function _diaMx(fechaISO) {
+  const instanteMx = new Date(new Date(fechaISO).getTime() - 6 * 60 * 60 * 1000);
+  return new Date(Date.UTC(instanteMx.getUTCFullYear(), instanteMx.getUTCMonth(), instanteMx.getUTCDate()));
+}
+
+// Normaliza un marcador de día YA bucketizado (Date u ISO con T00:00:00.000Z, ej.
+// grupo.dia que vuelve del frontend al confirmar/descartar) — trunca a medianoche UTC
+// SIN desplazar, a diferencia de _diaMx(). Un marcador no tiene una "hora real" que
+// convertir a MX, así que aplicarle el desplazamiento de _diaMx lo movería un día para
+// atrás por error.
+function _normalizarMarcadorDia(dia) {
+  const d = new Date(dia);
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
-function _claveGrupo(terminalID, diaUTC) {
-  return `${terminalID}|${diaUTC.toISOString()}`;
+function _claveGrupo(terminalID, diaMx) {
+  return `${terminalID}|${diaMx.toISOString()}`;
 }
 
-// Agrupa transacciones por (almacen, terminalID, día) sumando monto/comisión — la unidad
-// que se espera que corresponda a UN depósito general de la terminal (dato de los
+// Agrupa transacciones por (almacen, terminalID, día MX) sumando monto/comisión — la
+// unidad que se espera que corresponda a UN depósito general de la terminal (dato de los
 // contadores, sin confirmar todavía con datos reales — este panel es justamente para
 // probarlo).
 function _agruparPorTerminalYDia(transacciones) {
   const grupos = new Map();
   for (const t of transacciones) {
-    const diaUTC = _diaUTC(t.transactionDate);
-    const clave = _claveGrupo(t.terminalID, diaUTC);
+    const diaMx = _diaMx(t.transactionDate);
+    const clave = _claveGrupo(t.terminalID, diaMx);
     const g = grupos.get(clave) ?? {
-      terminalID: t.terminalID, almacen: t.almacen, dia: diaUTC,
+      terminalID: t.terminalID, almacen: t.almacen, dia: diaMx,
       montoBruto: 0, comision: 0, cantidadTransacciones: 0,
     };
     g.montoBruto += t.amount ?? 0;
@@ -153,7 +176,8 @@ module.exports = {
   _buscarCandidatosParaGrupo,
   _ventanaDiasNetpay,
   _agruparPorTerminalYDia,
-  _diaUTC,
+  _diaMx,
+  _normalizarMarcadorDia,
   _claveGrupo,
   _montosIguales,
   VENTANA_DEFAULT_DIAS,

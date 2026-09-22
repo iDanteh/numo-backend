@@ -5,8 +5,8 @@
 // RECALCULANDO el neto en vivo contra Kore (consultarTransaccionesNetpay, mockeada acá) en
 // vez de confiar en lo que trae el cliente. bank.service.js NO se mockea completo — solo
 // setErpIds, ERP_TOLERANCE se toma real. netpay-match.service.js tampoco se mockea (se usan
-// sus funciones reales: _diaUTC, _buscarCandidatosParaGrupo, _montosIguales) — solo sus
-// dependencias (BankMovement, global-config) están mockeadas.
+// sus funciones reales: _diaMx, _normalizarMarcadorDia, _buscarCandidatosParaGrupo,
+// _montosIguales) — solo sus dependencias (BankMovement, global-config) están mockeadas.
 jest.mock('../banks/BankMovement.model');
 jest.mock('./NetpayMatch.model');
 jest.mock('./netpay-transacciones.service');
@@ -101,6 +101,41 @@ describe('confirmarMatchNetpay', () => {
     BankMovement.find = jest.fn().mockResolvedValue([{ _id: 'm1', banco: 'BBVA', erpLinks: [], deposito: 999 }]);
     await expect(confirmarMatchNetpay({ terminalID: TERMINAL, dia: DIA, movementIds: ['m1'], user: USER }))
       .rejects.toThrow(/no coincide con el neto recalculado en vivo/);
+  });
+
+  // CORRECCIÓN 2026-09-22 (bug real reportado por el usuario, el mismo del panel de
+  // Netpay: movimientos de las 6pm+ hora MX desaparecían de la consulta) — antes
+  // _recalcularNetoEnVivo armaba dateFrom/dateTo con diaUTC.toISOString()/+24h-1ms
+  // (ISO completo en UTC PURO). Ahora manda la fecha PELADA (YYYY-MM-DD) — es
+  // consultarTransaccionesNetpay quien arma el instante UTC real en hora MX.
+  test('recalcula el neto EN VIVO mandando la fecha pelada (YYYY-MM-DD) a consultarTransaccionesNetpay, no un ISO completo en UTC', async () => {
+    BankMovement.find = jest.fn().mockResolvedValue([{ _id: 'm1', banco: 'BBVA', erpLinks: [], deposito: 280 }]);
+    setErpIds.mockResolvedValue({ _id: 'm1', banco: 'BBVA' });
+    NetpayMatch.create = jest.fn().mockResolvedValue([{}]);
+
+    await confirmarMatchNetpay({ terminalID: TERMINAL, dia: DIA, movementIds: ['m1'], user: USER });
+
+    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({ dateFrom: '2026-09-10', dateTo: '2026-09-10', terminalID: TERMINAL });
+  });
+
+  // CORRECCIÓN 2026-09-22 — trampa de idempotencia real encontrada al corregir el bug de
+  // fondo (_diaUTC → _diaMx en netpay-match.service.js): `dia` acá es el MARCADOR que la
+  // propia bandeja ya calculó (grupo.dia, round-trip desde el frontend), nunca un
+  // timestamp real de transacción. Si se le aplicara _diaMx (que desplaza -6h) en vez de
+  // _normalizarMarcadorDia (que solo trunca), un marcador de medianoche UTC se correría
+  // un día para atrás por error — este test prueba que el erpId sintético y el NetpayMatch
+  // creado usan la fecha CORRECTA (10, no 09) cuando `dia` ya viene como marcador completo.
+  test('dia como marcador completo (T00:00:00.000Z): NO se corre un día para atrás (guard contra la trampa de idempotencia)', async () => {
+    BankMovement.find = jest.fn().mockResolvedValue([{ _id: 'm1', banco: 'BBVA', erpLinks: [], deposito: 280 }]);
+    setErpIds.mockResolvedValue({ _id: 'm1', banco: 'BBVA' });
+    NetpayMatch.create = jest.fn().mockResolvedValue([{}]);
+
+    await confirmarMatchNetpay({ terminalID: TERMINAL, dia: '2026-09-10T00:00:00.000Z', movementIds: ['m1'], user: USER });
+
+    expect(setErpIds.mock.calls[0][1][0].erpId).toBe(`NETPAY-${TERMINAL}-2026-09-10`);
+    expect(NetpayMatch.create).toHaveBeenCalledWith([expect.objectContaining({
+      dia: new Date('2026-09-10T00:00:00.000Z'),
+    })], { session: mockSession });
   });
 
   test('match 1 movimiento válido: setErpIds con erpId sintético NETPAY-, crea NetpayMatch, emite sockets', async () => {

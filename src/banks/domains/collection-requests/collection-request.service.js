@@ -462,20 +462,37 @@ async function statsMine(userId) {
   return _stats({ solicitanteUserId: userId });
 }
 
-// `forceStatus` (2026-09-15, ver nota en list()): un usuario restringido a
-// collections:read:identificadas no puede ver el detalle de una solicitud puntual que no
-// esté en ese status, aunque conozca/adivine su _id — ocultarla de la bandeja pero
-// dejarla accesible por id sería el mismo hueco que ya se cerró en otros dominios (ver
-// GET /cuenta-por-serie-folio, banks:erp:read). ForbiddenError (403), no NotFoundError
-// (404) — el registro SÍ existe, el usuario no tiene permiso para verlo.
-async function getById(id, { forceStatus } = {}) {
+// Verifica el acceso de un usuario restringido a UNA solicitud puntual (detalle/
+// comprobante/análisis) — usado por getById/getComprobante/analyzeStoredComprobantes.
+// 3 niveles, resueltos en collection-request.routes.js#_resolverAccesoSolicitud:
+//   - collections:write → sin restricción (forceStatus/ownerOnly ambos null/false).
+//   - collections:read:identificadas (sin write) → cualquier dueño, pero acotado a
+//     status='identificada' (2026-09-15) — ocultarla de la bandeja pero dejarla
+//     accesible por id sería el mismo hueco que ya se cerró en otros dominios (ver
+//     GET /cuenta-por-serie-folio, banks:erp:read).
+//   - ninguno de los dos (rol tienda, solo collections:read) → sin restricción de
+//     status, pero SOLO si la solicitud es la suya (mismo alcance que ya tenía por
+//     GET /mias — 2026-09-22, bug real: la tienda quedaba bloqueada de su propio
+//     detalle/comprobante porque antes caía directo a 403 sin este chequeo de dueño).
+// ForbiddenError (403), no NotFoundError (404) — el registro SÍ existe, el usuario
+// no tiene permiso para verlo.
+function _checkAccesoSolicitud(cr, { forceStatus, ownerOnly, requestUserId } = {}) {
+  if (ownerOnly && String(cr.solicitanteUserId) !== String(requestUserId)) {
+    throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
+  }
+  if (forceStatus && cr.status !== forceStatus) {
+    throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
+  }
+}
+
+async function getById(id, { forceStatus, ownerOnly, requestUserId } = {}) {
   const cr = await CollectionRequest.findById(id)
     .select('-comprobante.data')
     .populate('bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .populate('formasPago.bankMovementId', 'banco fecha concepto deposito retiro numeroAutorizacion referenciaNumerica')
     .lean();
   if (!cr) throw new NotFoundError('Solicitud');
-  if (forceStatus && cr.status !== forceStatus) throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
+  _checkAccesoSolicitud(cr, { forceStatus, ownerOnly, requestUserId });
   return { ...cr, comprobante: { ...cr.comprobante, tieneComprobante: _tieneAlgunComprobante(cr) } };
 }
 
@@ -545,16 +562,15 @@ async function getByErpId(solicitudIdErp) {
 // `index` selecciona CUÁL comprobante de la lista unificada (legacy Mongo +
 // Drive) — por default el primero, que sigue funcionando igual que antes para
 // las solicitudes viejas de un solo comprobante.
-async function getComprobante(id, index = 0, { forceStatus } = {}) {
+async function getComprobante(id, index = 0, { forceStatus, ownerOnly, requestUserId } = {}) {
   // Sin .lean(): con lean() Mongoose no castea el campo Buffer legacy y regresa
   // el tipo BSON crudo (Binary), que Express NO sabe enviar como binario
   // (res.send lo trata como objeto plano y lo serializa mal) — hay que dejar
   // que Mongoose haga el cast normal a Buffer real.
-  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes status');
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes status solicitanteUserId');
   if (!cr) throw new NotFoundError('Solicitud');
-  // Ver nota de getById() — mismo criterio, un usuario restringido no puede bajar el
-  // comprobante de una solicitud fuera de su status permitido.
-  if (forceStatus && cr.status !== forceStatus) throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
+  // Ver nota de getById()/_checkAccesoSolicitud() — mismo criterio.
+  _checkAccesoSolicitud(cr, { forceStatus, ownerOnly, requestUserId });
 
   const item = _comprobantesUnificados(cr)[index];
   if (!item) throw new NotFoundError('Comprobante');
@@ -571,11 +587,11 @@ async function getComprobante(id, index = 0, { forceStatus } = {}) {
 // forma INDEPENDIENTE (nunca se combinan candidatos entre archivos — cada uno
 // puede corresponder a un depósito bancario distinto), y se regresa un
 // resultado por comprobante para que la búsqueda ayude a ubicar cada depósito.
-async function analyzeStoredComprobantes(id, { forceStatus } = {}) {
-  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes status');
+async function analyzeStoredComprobantes(id, { forceStatus, ownerOnly, requestUserId } = {}) {
+  const cr = await CollectionRequest.findById(id).select('comprobante comprobantes status solicitanteUserId');
   if (!cr) throw new NotFoundError('Solicitud');
-  // Ver nota de getById() — mismo criterio.
-  if (forceStatus && cr.status !== forceStatus) throw new ForbiddenError('No tenés permiso para ver esta solicitud.');
+  // Ver nota de getById()/_checkAccesoSolicitud() — mismo criterio.
+  _checkAccesoSolicitud(cr, { forceStatus, ownerOnly, requestUserId });
 
   const lista = _comprobantesUnificados(cr);
   if (lista.length === 0) throw new NotFoundError('Comprobante');

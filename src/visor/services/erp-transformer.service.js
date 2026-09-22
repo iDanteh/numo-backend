@@ -93,6 +93,22 @@ const parseDate = (v) => {
   return isNaN(d.getTime()) ? null : d;
 };
 
+// Kore ERP entrega Fecha/FechaGeneracion/FechaEmision como instante UTC REAL
+// (con Z, ej. "2026-09-22T02:43:01.221Z") -- a diferencia del atributo Fecha
+// del XML CFDI del SAT, que siempre es hora LOCAL de México SIN offset (lo
+// que el resto del sistema trata como "hora local pintada con Z", ver
+// _diaCfdi en cfdi-poliza-generator.service.js). Sin esta conversión, una
+// factura generada después de las 18:00 hora local aparecía un día
+// adelantada en toda la app (bug real confirmado 2026-09-22: folio
+// M0-260900533, FechaGeneracion="2026-09-22T02:43:01.221Z" en Kore = 21-sep
+// 20:43 hora MX real -- se mostraba como 22-sep en todas las vistas).
+// Offset fijo UTC-6 (México no tiene horario de verano desde 2022, mismo
+// criterio que _diaMx).
+const parseFechaFacturaERP = (v) => {
+  const d = parseDate(v);
+  return d ? new Date(d.getTime() - 6 * 60 * 60 * 1000) : null;
+};
+
 // ─── Extractor de Complemento de Pago ────────────────────────────────────────
 
 /**
@@ -299,7 +315,7 @@ const transformar = (factura, { ejercicio, periodo, uploadedBy }) => {
   // ── Fecha ──────────────────────────────────────────────────────────────────
   // El ERP puede devolver el campo con distintos nombres según la versión.
   const fechaRaw = factura.Fecha ?? factura.FechaGeneracion ?? factura.FechaEmision ?? null;
-  const fecha    = parseDate(fechaRaw);
+  const fecha    = parseFechaFacturaERP(fechaRaw);
   if (!fecha) {
     logger.warn(`[ERPTransformer] UUID ${uuid} — Fecha inválida: "${fechaRaw}"`);
     throw new Error(`Fecha inválida: "${fechaRaw}"`);
@@ -478,7 +494,7 @@ const transformarTolerante = (factura, { ejercicio, periodo, uploadedBy }) => {
 
   // ── Fecha ──────────────────────────────────────────────────────────────────
   const fechaRaw = factura?.Fecha ?? factura?.FechaGeneracion ?? factura?.FechaEmision ?? null;
-  let fecha      = parseDate(fechaRaw);
+  let fecha      = parseFechaFacturaERP(fechaRaw);
   if (!fecha) {
     errores.push(`Fecha inválida: "${fechaRaw}" — se usó la fecha actual`);
     fecha = new Date();

@@ -9,7 +9,7 @@ const {
   registerCredentials, getCredentialStatus, patchKey,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, testKey, exportXml,
-  downloadByUUID, resetCheckpoint, getCheckpointsSalud,
+  downloadByUUID, resetCheckpoint, getCheckpointsSalud, recuperarErp,
 } = require('../controllers/sat.controller');
 
 const router = express.Router();
@@ -76,6 +76,8 @@ router.get('/descarga-manual/status/:jobId', authenticate, getDownloadStatus);
 router.get('/limites/:rfc',                  authenticate, getLimitesEstado);
 router.get('/historial',                     authenticate, getHistory);
 router.get('/historial/:rfc',                authenticate, getHistory);
+// Botón "Recuperar de Kore ERP" en una fila con estado 'error' del historial.
+router.post('/recuperar-erp', authenticate, permit('visor:sat'), recuperarErp);
 router.get('/ultimo-erp',                    authenticate, getUltimoErp);
 
 // ── Salud de checkpoints (errores, incompletos, cuota del día) ────────────────

@@ -519,19 +519,18 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     terminalesPorCentro.get(t.centroCostoId).add(t.numeroSerie);
   }
 
-  // Ventana en UTC del día calendario MEXICANO (UTC-6, sin DST desde 2022) —
-  // NO usar "${dia}T00:00:00Z".."${dia}T23:59:59Z" a secas: transactionDate de
-  // Kore es un timestamp UTC real, y cualquier venta con tarjeta después de
-  // las 18:00 hora local cae en el día UTC SIGUIENTE, quedando fuera de esa
-  // ventana y sin matchear jamás (bug real confirmado 2026-09-22, Puerto
-  // Escondido/O0: 2 tickets de las 18:09/18:34 hora local del 19-sep
-  // aparecían en Kore como 2026-09-20T00:09/00:34Z). Mismo patrón que
-  // `_diaMx` en cfdi-poliza-generator.service.js/cobranza-poliza-generator.service.js,
-  // reusado aquí en vez de importado por ser el único uso en este archivo.
-  const dia          = fechaFinal.toISOString().slice(0, 10);
-  const diaSiguiente = new Date(new Date(`${dia}T00:00:00Z`).getTime() + 24 * 3600 * 1000).toISOString().slice(0, 10);
-  const dateFrom = `${dia}T06:00:00Z`;
-  const dateTo   = `${diaSiguiente}T05:59:59Z`;
+  // dateFrom/dateTo van PELADOS (YYYY-MM-DD) — consultarTransaccionesNetpay()
+  // (netpay-transacciones.service.js) arma el instante UTC real de inicio/fin
+  // de día en hora MX internamente (_medianocheMx/_finDiaMx, fix 2026-09-22 de
+  // Daniel en netpay-transacciones.service.js). Antes de ese fix compartido,
+  // esta función armaba su propio ISO con offset a mano — bug real confirmado
+  // 2026-09-22 (Puerto Escondido/O0: 2 tickets de las 18:09/18:34 hora local
+  // del 19-sep aparecían en Kore como 2026-09-20T00:09/00:34Z y quedaban fuera
+  // de la ventana UTC pura del día). Ahora se delega al contrato compartido en
+  // vez de duplicar el cálculo del offset acá.
+  const dia = fechaFinal.toISOString().slice(0, 10);
+  const dateFrom = dia;
+  const dateTo   = dia;
 
   const matchedIds = new Set();
   const porCentro  = new Map();

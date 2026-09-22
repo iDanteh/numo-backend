@@ -17,32 +17,41 @@ const BankMovement = require('../banks/BankMovement.model');
 const NetpayMatch = require('./NetpayMatch.model');
 const { setErpIds, ERP_TOLERANCE } = require('../banks/bank.service');
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
-const { _diaUTC, _buscarCandidatosParaGrupo, _montosIguales } = require('./netpay-match.service');
+const { _diaMx, _normalizarMarcadorDia, _buscarCandidatosParaGrupo, _montosIguales } = require('./netpay-match.service');
 const { NotFoundError, BadRequestError, ConflictError } = require('../../shared/errors/AppError');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
 const mongoose = require('mongoose');
 
-function _erpIdSintetico(terminalID, diaUTC) {
-  return `NETPAY-${terminalID}-${diaUTC.toISOString().slice(0, 10)}`;
+function _erpIdSintetico(terminalID, diaMarcador) {
+  return `NETPAY-${terminalID}-${diaMarcador.toISOString().slice(0, 10)}`;
 }
 
 // Recalcula el neto EN VIVO para un terminalID+día exacto — acotado a ese único día
-// (dateFrom/dateTo del mismo día), y se vuelve a filtrar por _diaUTC en memoria por si
+// (dateFrom/dateTo del mismo día), y se vuelve a filtrar por _diaMx en memoria por si
 // Kore devolviera algo fuera de rango por algún desfase de huso horario (mismo criterio
 // defensivo que el resto del dominio ERP con fechas de Kore).
-async function _recalcularNetoEnVivo(terminalID, diaUTC) {
-  const dateFrom = diaUTC.toISOString();
-  const dateTo = new Date(diaUTC.getTime() + 24 * 60 * 60 * 1000 - 1).toISOString();
-  const { transacciones } = await consultarTransaccionesNetpay({ dateFrom, dateTo, terminalID });
+//
+// CORRECCIÓN 2026-09-22: antes se armaba dateFrom/dateTo acá mismo con
+// diaMarcador.toISOString()/+24h-1ms — un ISO completo en UTC PURO, el mismo bug ya
+// corregido en el panel de Netpay (movimientos de las 6pm+ hora MX quedaban fuera).
+// Ahora se manda la fecha PELADA (YYYY-MM-DD) — consultarTransaccionesNetpay ya arma
+// el instante UTC real de inicio/fin de día en hora MX (ver _medianocheMx/_finDiaMx en
+// netpay-transacciones.service.js). El filtro en memoria pasó de _diaUTC (bucketing sin
+// desplazar, bug de fondo) a _diaMx (bucketing real por día calendario MX) — mismo
+// criterio que _agruparPorTerminalYDia en netpay-match.service.js, para que el recálculo
+// en vivo agrupe EXACTAMENTE igual que la bandeja que originó esta confirmación.
+async function _recalcularNetoEnVivo(terminalID, diaMarcador) {
+  const diaStr = diaMarcador.toISOString().slice(0, 10);
+  const { transacciones } = await consultarTransaccionesNetpay({ dateFrom: diaStr, dateTo: diaStr, terminalID });
 
-  const delDia = transacciones.filter(t => _diaUTC(t.transactionDate).getTime() === diaUTC.getTime());
+  const delDia = transacciones.filter(t => _diaMx(t.transactionDate).getTime() === diaMarcador.getTime());
   const montoBruto = delDia.reduce((acc, t) => acc + (t.amount ?? 0), 0);
   const comision = delDia.reduce((acc, t) => acc + (t.commission ?? 0), 0);
   return { netoEsperado: montoBruto - comision, cantidadTransacciones: delDia.length };
 }
 
-async function _confirmarConSesion(terminalID, almacen, diaUTC, netoEsperado, movimientos, user, session) {
-  const erpId = _erpIdSintetico(terminalID, diaUTC);
+async function _confirmarConSesion(terminalID, almacen, diaMarcador, netoEsperado, movimientos, user, session) {
+  const erpId = _erpIdSintetico(terminalID, diaMarcador);
   const actualizados = [];
 
   for (const mov of movimientos) {
@@ -58,7 +67,7 @@ async function _confirmarConSesion(terminalID, almacen, diaUTC, netoEsperado, mo
   }
 
   await NetpayMatch.create([{
-    terminalID, almacen: almacen ?? null, dia: diaUTC, netoEsperado, estatusMatch: 'matcheada',
+    terminalID, almacen: almacen ?? null, dia: diaMarcador, netoEsperado, estatusMatch: 'matcheada',
     movementIdsConfirmados: movimientos.map(m => m._id),
     confirmadoPor: { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null },
     confirmadoEn: new Date(),
@@ -77,13 +86,17 @@ async function confirmarMatchNetpay({ terminalID, almacen, dia, movementIds, use
     throw new BadRequestError('Se requiere 1 o 2 movementIds.');
   }
 
-  const diaUTC = _diaUTC(dia);
-  const yaResuelto = await NetpayMatch.findOne({ terminalID, dia: diaUTC });
+  // `dia` llega como el MARCADOR que la propia bandeja ya calculó (grupo.dia), nunca un
+  // timestamp real de transacción — se normaliza (trunca), NO se bucketiza con _diaMx
+  // (que desplazaría -6h y correría el día para atrás por error, ver comentario en
+  // netpay-match.service.js#_diaMx).
+  const diaMarcador = _normalizarMarcadorDia(dia);
+  const yaResuelto = await NetpayMatch.findOne({ terminalID, dia: diaMarcador });
   if (yaResuelto) {
     throw new ConflictError(`Este grupo ya no está pendiente (estatusMatch=${yaResuelto.estatusMatch}).`);
   }
 
-  const { netoEsperado } = await _recalcularNetoEnVivo(terminalID, diaUTC);
+  const { netoEsperado } = await _recalcularNetoEnVivo(terminalID, diaMarcador);
 
   const movimientos = await BankMovement.find({ _id: { $in: ids } });
   if (movimientos.length !== ids.length) {
@@ -110,7 +123,7 @@ async function confirmarMatchNetpay({ terminalID, almacen, dia, movementIds, use
   try {
     session = await mongoose.connection.startSession();
     session.startTransaction();
-    actualizados = await _confirmarConSesion(terminalID, almacen, diaUTC, netoEsperado, movimientos, user, session);
+    actualizados = await _confirmarConSesion(terminalID, almacen, diaMarcador, netoEsperado, movimientos, user, session);
     await session.commitTransaction();
   } catch (err) {
     if (session?.inTransaction?.()) {
@@ -120,7 +133,7 @@ async function confirmarMatchNetpay({ terminalID, almacen, dia, movementIds, use
       || /transaction numbers are only allowed/i.test(err.message);
     if (!sinSoporteTransacciones) throw err;
     // Mongo standalone (sin replica set) — mismo fallback que caja-transferencia-confirm.service.js.
-    actualizados = await _confirmarConSesion(terminalID, almacen, diaUTC, netoEsperado, movimientos, user, null);
+    actualizados = await _confirmarConSesion(terminalID, almacen, diaMarcador, netoEsperado, movimientos, user, null);
   } finally {
     if (session) {
       try { await session.endSession(); } catch (_) { /* ignorar */ }
@@ -142,25 +155,27 @@ async function confirmarMatchNetpay({ terminalID, almacen, dia, movementIds, use
 async function descartarMatchNetpay({ terminalID, almacen, dia, user }) {
   if (!terminalID || !dia) throw new BadRequestError('Se requieren terminalID y dia.');
 
-  const diaUTC = _diaUTC(dia);
-  const yaResuelto = await NetpayMatch.findOne({ terminalID, dia: diaUTC });
+  // Ver comentario en confirmarMatchNetpay: `dia` es el marcador ya calculado por la
+  // bandeja, se normaliza (trunca), NO se bucketiza con _diaMx.
+  const diaMarcador = _normalizarMarcadorDia(dia);
+  const yaResuelto = await NetpayMatch.findOne({ terminalID, dia: diaMarcador });
   if (yaResuelto) {
     throw new ConflictError(`Este grupo ya no está pendiente (estatusMatch=${yaResuelto.estatusMatch}).`);
   }
 
-  const { netoEsperado } = await _recalcularNetoEnVivo(terminalID, diaUTC);
-  const candidatos = await _buscarCandidatosParaGrupo({ terminalID, dia: diaUTC, netoEsperado });
+  const { netoEsperado } = await _recalcularNetoEnVivo(terminalID, diaMarcador);
+  const candidatos = await _buscarCandidatosParaGrupo({ terminalID, dia: diaMarcador, netoEsperado });
   if (candidatos.length > 0) {
     throw new ConflictError('Este grupo ya tiene candidato(s) para revisar, no se puede descartar manualmente sin revisarlos primero.');
   }
 
   await NetpayMatch.create({
-    terminalID, almacen: almacen ?? null, dia: diaUTC, netoEsperado, estatusMatch: 'descartada-manual',
+    terminalID, almacen: almacen ?? null, dia: diaMarcador, netoEsperado, estatusMatch: 'descartada-manual',
     descartadoManualmentePor: { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null },
     descartadoManualmenteEn: new Date(),
   });
 
-  return { terminalID, dia: diaUTC, estatusMatch: 'descartada-manual' };
+  return { terminalID, dia: diaMarcador, estatusMatch: 'descartada-manual' };
 }
 
 module.exports = { confirmarMatchNetpay, descartarMatchNetpay };

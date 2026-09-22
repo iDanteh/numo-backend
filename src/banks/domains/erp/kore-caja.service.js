@@ -232,8 +232,10 @@ async function buscarTransaccionesNetpay(params = {}) {
   // CSV tal cual lo espera Kore (ej. "A0,N0") — quien llama arma el string, esta
   // función no valida ni transforma la lista de almacenes.
   if (params.almacenes) queryParams.almacenes = params.almacenes;
-  // Rango de fechas ISO completo (ej. "2026-09-04T00:00:00Z"/"...T23:59:59Z") — quien
-  // llama arma el string exacto (inicio/fin de día), esta función no lo calcula.
+  // Rango de fechas ISO completo (ej. "2026-09-04T06:00:00.000Z"/"2026-09-05T05:59:59.999Z")
+  // — quien llama arma el string exacto (inicio/fin de día en hora MX, ver
+  // _medianocheMx/_finDiaMx en netpay-transacciones.service.js), esta función no lo calcula
+  // ni conoce la noción de "día calendario", solo reenvía el string tal cual.
   if (params.dateFrom) queryParams.dateFrom = params.dateFrom;
   if (params.dateTo) queryParams.dateTo = params.dateTo;
   // terminalID (2026-09-15, confirmado por el usuario contra Kore real vía Insomnia):

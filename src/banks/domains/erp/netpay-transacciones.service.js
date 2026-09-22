@@ -18,6 +18,24 @@
 // transacciones). Se pide siempre con PAGE_SIZE_MAX (100, el máximo real que acepta
 // Kore, confirmado por el usuario) y se recorren todas las páginas (`Data.totalPages`)
 // ANTES de calcular ningún total — nunca agregar sobre una sola página.
+//
+// CORRECCIÓN 2026-09-22 (bug real reportado por el usuario, movimientos de las 6pm+
+// hora MX desaparecían de la consulta): dateFrom/dateTo dejan de ser un ISO completo
+// armado por el caller — ahora son fecha PELADA (YYYY-MM-DD) y este service arma el
+// instante UTC real de inicio/fin de día en hora de MÉXICO (offset fijo UTC-6, sin
+// horario de verano desde 2022). Antes, quien llamaba (el frontend) armaba
+// `${fecha}T00:00:00Z`/`T23:59:59Z` — medianoche/fin de día en UTC PURO, así que un
+// movimiento de las 18:00+ hora MX (que ya cae en el día calendario SIGUIENTE en UTC)
+// quedaba fuera de la ventana. Mismo criterio ya usado en bank.service.js
+// (_inicioDiaMx/_finDiaMx), collection-request.service.js (_medianocheMx) y
+// cfdi-poliza-generator.service.js — se duplica acá en vez de extraerlo a un util
+// compartido para no tocar esos 3 archivos ya probados y estables sin necesidad.
+function _medianocheMx(fechaStr) {
+  return `${fechaStr}T06:00:00.000Z`;
+}
+function _finDiaMx(fechaStr) {
+  return new Date(new Date(_medianocheMx(fechaStr)).getTime() + 24 * 60 * 60 * 1000 - 1).toISOString();
+}
 
 const { buscarTransaccionesNetpay } = require('./kore-caja.service');
 
@@ -51,7 +69,11 @@ async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo
 
 async function consultarTransaccionesNetpay(params = {}) {
   const { responseCode, almacenes, dateFrom, dateTo, terminalID, status } = params;
-  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, terminalID, status });
+  // dateFrom/dateTo llegan pelados (YYYY-MM-DD) — se convierten UNA sola vez acá al
+  // instante UTC real de inicio/fin de día en hora MX, antes de pedir ninguna página.
+  const dateFromMx = dateFrom ? _medianocheMx(dateFrom) : undefined;
+  const dateToMx   = dateTo   ? _finDiaMx(dateTo)       : undefined;
+  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom: dateFromMx, dateTo: dateToMx, terminalID, status });
 
   let totalMonto = 0;
   let totalComision = 0;
@@ -81,4 +103,4 @@ async function consultarTransaccionesNetpay(params = {}) {
   };
 }
 
-module.exports = { consultarTransaccionesNetpay };
+module.exports = { consultarTransaccionesNetpay, _medianocheMx, _finDiaMx };

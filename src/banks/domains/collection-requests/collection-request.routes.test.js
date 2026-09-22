@@ -25,12 +25,14 @@ jest.mock('../../shared/utils/logger');
 // collection-request.service.js mockeado completo (2026-09-15, permiso
 // collections:read:identificadas) — ningún test de este archivo lo necesitaba real hasta
 // ahora (indicadores/anticipos-generados van por sus propios services); acá solo se prueba
-// el wiring de _resolverForceStatus() (permiso → forceStatus → args del service), no la
-// lógica interna de list()/getById()/etc. — esa ya tiene su propia cobertura en
-// collection-request.identificar.test.js y compañía.
+// el wiring de _resolverAccesoSolicitud() (permiso → forceStatus/ownerOnly → args del
+// service), no la lógica interna de list()/getById()/etc. — esa ya tiene su propia
+// cobertura en collection-request.identificar.test.js y collection-request-force-
+// status.test.js (incluido el chequeo real de ownerOnly contra solicitanteUserId).
 jest.mock('./collection-request.service');
-// rbac-store: _resolverForceStatus() lo llama inline (fuera de permit()), mismo criterio
-// de "mockear los límites de I/O" ya usado en erp.routes.test.js para banks:erp:anticipos.
+// rbac-store: _resolverAccesoSolicitud() lo llama inline (fuera de permit()), mismo
+// criterio de "mockear los límites de I/O" ya usado en erp.routes.test.js para
+// banks:erp:anticipos.
 jest.mock('../../../shared/services/rbac-store', () => ({
   hasPermission:     jest.fn(),
   hasAllPermissions: jest.fn(),
@@ -293,12 +295,17 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
   });
 });
 
-// _resolverForceStatus() (2026-09-15, permiso collections:read:identificadas) — nuevo,
-// cubre la bandeja (GET /), el detalle (GET /:id) y las 3 rutas de comprobante/análisis.
-// Todas exigen collections:read (permit(), ya cubierto arriba en otras rutas) y ADEMÁS
-// resuelven collections:write/collections:read:identificadas inline vía rbacStore, fuera
-// de permit() — mismo patrón ya usado en bank.routes.js (hasFullAccess/hasAdminAccess).
-describe('_resolverForceStatus() — GET / y rutas de detalle/comprobante de una solicitud', () => {
+// _resolverAccesoSolicitud() (2026-09-15, permiso collections:read:identificadas;
+// ampliado 2026-09-22 con ownerOnly — ver bug real más abajo) — cubre la bandeja
+// (GET /), el detalle (GET /:id) y las 3 rutas de comprobante/análisis. Todas exigen
+// collections:read (permit(), ya cubierto arriba en otras rutas) y ADEMÁS resuelven
+// collections:write/collections:read:identificadas inline vía rbacStore, fuera de
+// permit() — mismo patrón ya usado en bank.routes.js (hasFullAccess/hasAdminAccess).
+//
+// Estos tests solo verifican el WIRING (qué args le llegan al service mockeado) — el
+// chequeo real de ownerOnly contra solicitanteUserId vive en
+// collection-request-force-status.test.js, contra el service real.
+describe('_resolverAccesoSolicitud() — GET / y rutas de detalle/comprobante de una solicitud', () => {
   let app;
 
   beforeEach(() => {
@@ -352,6 +359,9 @@ describe('_resolverForceStatus() — GET / y rutas de detalle/comprobante de una
       );
     });
 
+    // 2026-09-22: ownerOnly (rol Tienda, solo collections:read) sigue dando 403 EN ESTA
+    // ruta puntual — list() no sabe filtrar por dueño, y la bandeja general no es su vía
+    // (usa /mias). Esto es justamente lo que NO debía cambiar con el fix de ownerOnly.
     test('ni collections:write ni collections:read:identificadas → 403, el service nunca se llama', async () => {
       mockAcceso({});
 
@@ -363,28 +373,33 @@ describe('_resolverForceStatus() — GET / y rutas de detalle/comprobante de una
   });
 
   describe('GET /:id (detalle)', () => {
-    test('collections:read:identificadas pasa forceStatus=identificada al service', async () => {
+    test('collections:read:identificadas pasa forceStatus=identificada, ownerOnly=false al service', async () => {
       mockAcceso({ soloIdentificadas: true });
       service.getById.mockResolvedValue({ _id: 'cr1', status: 'identificada' });
 
       const res = await request(app).get('/cr1').set('x-test-permissions', ALLOWED);
 
       expect(res.status).toBe(200);
-      expect(service.getById).toHaveBeenCalledWith('cr1', { forceStatus: 'identificada' });
+      expect(service.getById).toHaveBeenCalledWith('cr1', { forceStatus: 'identificada', ownerOnly: false, requestUserId: 'user-test' });
     });
 
-    test('sin write ni el nuevo permiso → 403, ni siquiera intenta el service', async () => {
+    // 2026-09-22, bug real corregido: antes esta combinación tiraba 403 siempre (rol
+    // Tienda bloqueado de su PROPIO detalle). Ahora la ruta SÍ llama al service —
+    // ownerOnly:true delega en _checkAccesoSolicitud() (service) decidir si esta
+    // solicitud puntual es del usuario o no.
+    test('sin write ni el nuevo permiso → llama al service con ownerOnly:true (ya no 403 de entrada)', async () => {
       mockAcceso({});
+      service.getById.mockResolvedValue({ _id: 'cr1', status: 'pendiente', solicitanteUserId: 'user-test' });
 
       const res = await request(app).get('/cr1').set('x-test-permissions', ALLOWED);
 
-      expect(res.status).toBe(403);
-      expect(service.getById).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(service.getById).toHaveBeenCalledWith('cr1', { forceStatus: null, ownerOnly: true, requestUserId: 'user-test' });
     });
   });
 
   describe('GET /:id/comprobante, /:id/comprobantes/:index y /:id/analyze-comprobante', () => {
-    test('las 3 rutas propagan forceStatus=identificada al service', async () => {
+    test('las 3 rutas propagan forceStatus=identificada, ownerOnly=false al service', async () => {
       mockAcceso({ soloIdentificadas: true });
       service.getComprobante.mockResolvedValue({ data: Buffer.from('x'), mimetype: 'image/png', originalName: 'a.png' });
       service.analyzeStoredComprobantes.mockResolvedValue([]);
@@ -393,9 +408,21 @@ describe('_resolverForceStatus() — GET / y rutas de detalle/comprobante de una
       await request(app).get('/cr1/comprobantes/2').set('x-test-permissions', ALLOWED);
       await request(app).get('/cr1/analyze-comprobante').set('x-test-permissions', ALLOWED);
 
-      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 0, { forceStatus: 'identificada' });
-      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 2, { forceStatus: 'identificada' });
-      expect(service.analyzeStoredComprobantes).toHaveBeenCalledWith('cr1', { forceStatus: 'identificada' });
+      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 0, { forceStatus: 'identificada', ownerOnly: false, requestUserId: 'user-test' });
+      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 2, { forceStatus: 'identificada', ownerOnly: false, requestUserId: 'user-test' });
+      expect(service.analyzeStoredComprobantes).toHaveBeenCalledWith('cr1', { forceStatus: 'identificada', ownerOnly: false, requestUserId: 'user-test' });
+    });
+
+    // 2026-09-22, bug real corregido: mismo caso que GET /:id — Tienda viendo SU
+    // comprobante ahora llega al service (ownerOnly:true), en vez de 403 de entrada.
+    test('sin write ni el nuevo permiso → las 3 rutas propagan ownerOnly:true al service', async () => {
+      mockAcceso({});
+      service.getComprobante.mockResolvedValue({ data: Buffer.from('x'), mimetype: 'image/png', originalName: 'a.png' });
+      service.analyzeStoredComprobantes.mockResolvedValue([]);
+
+      await request(app).get('/cr1/comprobante').set('x-test-permissions', ALLOWED);
+
+      expect(service.getComprobante).toHaveBeenCalledWith('cr1', 0, { forceStatus: null, ownerOnly: true, requestUserId: 'user-test' });
     });
   });
 });

@@ -519,9 +519,19 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     terminalesPorCentro.get(t.centroCostoId).add(t.numeroSerie);
   }
 
-  const dia      = fechaFinal.toISOString().slice(0, 10);
-  const dateFrom = `${dia}T00:00:00Z`;
-  const dateTo   = `${dia}T23:59:59Z`;
+  // Ventana en UTC del día calendario MEXICANO (UTC-6, sin DST desde 2022) —
+  // NO usar "${dia}T00:00:00Z".."${dia}T23:59:59Z" a secas: transactionDate de
+  // Kore es un timestamp UTC real, y cualquier venta con tarjeta después de
+  // las 18:00 hora local cae en el día UTC SIGUIENTE, quedando fuera de esa
+  // ventana y sin matchear jamás (bug real confirmado 2026-09-22, Puerto
+  // Escondido/O0: 2 tickets de las 18:09/18:34 hora local del 19-sep
+  // aparecían en Kore como 2026-09-20T00:09/00:34Z). Mismo patrón que
+  // `_diaMx` en cfdi-poliza-generator.service.js/cobranza-poliza-generator.service.js,
+  // reusado aquí en vez de importado por ser el único uso en este archivo.
+  const dia          = fechaFinal.toISOString().slice(0, 10);
+  const diaSiguiente = new Date(new Date(`${dia}T00:00:00Z`).getTime() + 24 * 3600 * 1000).toISOString().slice(0, 10);
+  const dateFrom = `${dia}T06:00:00Z`;
+  const dateTo   = `${diaSiguiente}T05:59:59Z`;
 
   const matchedIds = new Set();
   const porCentro  = new Map();

@@ -267,7 +267,7 @@ const solicitar = async (params) => {
   const resultTag = `${operacion}Result`;
 
   let envelope   = await buildEnvelope(rfcFirma);
-  let xmlResp    = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, token, 120000);
+  let xmlResp    = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, token, 180000);
 
   let idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') || extraerValor(xmlResp, 'IdSolicitud');
   let codEstatus  = extraerAtributo(xmlResp, resultTag, 'CodEstatus');
@@ -282,7 +282,7 @@ const solicitar = async (params) => {
     logger.info(`[SatDownload] rfcFirma en retry: ${rfcFirmaFresh}`);
 
     envelope    = await buildEnvelope(rfcFirmaFresh);
-    xmlResp     = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, fresh.token, 120000);
+    xmlResp     = await soapCallBearer(SOLICITUD_URL, soapAction, envelope, fresh.token, 180000);
     idSolicitud = extraerAtributo(xmlResp, resultTag, 'IdSolicitud') || extraerValor(xmlResp, 'IdSolicitud');
     codEstatus  = extraerAtributo(xmlResp, resultTag, 'CodEstatus');
     mensaje     = extraerAtributo(xmlResp, resultTag, 'Mensaje');
@@ -409,7 +409,7 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
       'http://DescargaMasivaTerceros.sat.gob.mx/IVerificaSolicitudDescargaService/VerificaSolicitudDescarga',
       envelope,
       token,
-      120000
+      180000
     );
 
     const estadoSolicitud = extraerAtributo(xmlResp, 'VerificaSolicitudDescargaResult', 'EstadoSolicitud') ||
@@ -553,7 +553,7 @@ const _descargarZipBuffer = async (idPaquete, rfcSolicitante, creds) => {
         'http://DescargaMasivaTerceros.sat.gob.mx/IDescargaMasivaTercerosService/Descargar',
         envelope,
         token,
-        120000, // 2 min — paquetes grandes pueden superar 15 MB
+        180000, // 3 min — paquetes grandes pueden superar 15 MB
       );
 
       const paqueteMatch = xmlResp.match(/<[^:]*:?Paquete[^>]*>([\s\S]+?)<\/[^:]*:?Paquete>/);

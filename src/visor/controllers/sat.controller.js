@@ -1,6 +1,6 @@
 const { validationResult } = require('express-validator');
 const { verifyCFDIWithSAT } = require('../services/satVerification');
-const { procesarDescarga } = require('../jobs/satSyncJob');
+const { procesarDescarga, ejecutarDescargaERP } = require('../jobs/satSyncJob');
 const { resolverPeriodo } = require('../services/periodoFiscal.service');
 const { guardar, tieneCredenciales, obtener, eliminar, limpiarBuffers, actualizarKey } = require('../sat/credenciales');
 const { puedeIniciar, registrarInicio, registrarFin, getEstado } = require('../sat/rateLimiter');
@@ -853,11 +853,33 @@ const resetCheckpoint = asyncHandler(async (req, res) => {
   });
 });
 
+// POST /api/sat/recuperar-erp — botón manual "Recuperar de Kore ERP" en
+// Historial > Descarga SAT (fila con estado 'error'). Reusa exactamente la
+// misma función que corre automático a la 1am (ejecutarDescargaERP) — no
+// duplica la lógica de traer/transformar/guardar facturas del ERP, solo la
+// expone bajo demanda para el mes de la fila que falló. Fire-and-forget
+// (mismo patrón que startDownload): el historial ya refleja el resultado
+// como una entrada 'erp_automatica' nueva cuando termine.
+const recuperarErp = asyncHandler(async (req, res) => {
+  const ejercicio = parseInt(req.body.ejercicio, 10);
+  const periodo   = parseInt(req.body.periodo, 10);
+  if (!Number.isFinite(ejercicio) || !Number.isFinite(periodo)) {
+    return res.status(400).json({ error: 'ejercicio y periodo son requeridos.' });
+  }
+
+  logger.info(`[SAT] Recuperación manual de ERP disparada por ${req.user?.email ?? req.user?._id} | ${ejercicio}/${periodo}`);
+  res.status(202).json({ message: 'Recuperación desde Kore ERP iniciada.' });
+
+  ejecutarDescargaERP({ ejercicioParam: ejercicio, periodoParam: periodo }).catch(err => {
+    logger.error(`[SAT] Error en recuperación manual de ERP: ${err.message}`);
+  });
+});
+
 module.exports = {
   verify, verifyBatch, getStatus,
   registerCredentials, getCredentialStatus,
   startDownload, getDownloadStatus,
-  getLimitesEstado, getHistory, getUltimoErp,
+  getLimitesEstado, getHistory, getUltimoErp, recuperarErp,
   cleanupActiveJobs, testKey, patchKey, exportXml,
   downloadByUUID, resetCheckpoint, getCheckpointsSalud,
 };

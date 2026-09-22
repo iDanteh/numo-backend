@@ -197,6 +197,7 @@ const startServer = async () => {
   require('./banks/jobs/cajaTransferenciaSyncCron');
   require('./visor/jobs/credencialesAlertJob');
   require('./visor/jobs/cfdiCanceladoNotificacionJob');
+  require('./visor/jobs/cfdisNoRecuperadosAlertJob');
   try {
     await seed();
   } catch (err) {

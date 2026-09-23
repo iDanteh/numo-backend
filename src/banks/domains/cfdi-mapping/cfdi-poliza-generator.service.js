@@ -3502,7 +3502,19 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     where: {
       cfdiUuid:   { [Op.ne]: null },
       tipoOrigen: { [Op.ne]: 'Cobro Sucursal' },
-      [Op.or]:    [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }],
+      [Op.and]: [
+        { [Op.or]: [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }] },
+        // Cargo de "cobrosCobradoraDirecta" (tipoOrigen='Venta'): desde
+        // 2026-09-03 su reglaNombre ya no es 'COS' sino 'EFECTIVO'/'TARJETA'/
+        // null (fix "COS-COS"), así que el filtro de arriba dejó de excluirlo
+        // y la factura de la sucursal VENDEDORA quedaba "ya contabilizada"
+        // sin su Venta (caso real 2026-09-23: Promotoría 21-sep, 10 facturas
+        // cobradas en caja de CEDIS; CONSTRUCASA 18-sep, Global C0-260901076).
+        // Esa línea es la única con tipoOrigen='Venta' y `serie` vacía
+        // (verificado en producción: 392 líneas así, 0 ventas reales sin
+        // serie) -- `[Op.ne]: ''` también descarta NULL.
+        { [Op.or]: [{ tipoOrigen: { [Op.ne]: 'Venta' } }, { serie: { [Op.ne]: '' } }] },
+      ],
     },
     attributes: ['cfdiUuid'],
     include: [{
@@ -5568,7 +5580,19 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     where: {
       cfdiUuid:   { [Op.ne]: null },
       tipoOrigen: { [Op.ne]: 'Cobro Sucursal' },
-      [Op.or]:    [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }],
+      [Op.and]: [
+        { [Op.or]: [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }] },
+        // Cargo de "cobrosCobradoraDirecta" (tipoOrigen='Venta'): desde
+        // 2026-09-03 su reglaNombre ya no es 'COS' sino 'EFECTIVO'/'TARJETA'/
+        // null (fix "COS-COS"), así que el filtro de arriba dejó de excluirlo
+        // y la factura de la sucursal VENDEDORA quedaba "ya contabilizada"
+        // sin su Venta (caso real 2026-09-23: Promotoría 21-sep, 10 facturas
+        // cobradas en caja de CEDIS; CONSTRUCASA 18-sep, Global C0-260901076).
+        // Esa línea es la única con tipoOrigen='Venta' y `serie` vacía
+        // (verificado en producción: 392 líneas así, 0 ventas reales sin
+        // serie) -- `[Op.ne]: ''` también descarta NULL.
+        { [Op.or]: [{ tipoOrigen: { [Op.ne]: 'Venta' } }, { serie: { [Op.ne]: '' } }] },
+      ],
     },
     attributes: ['cfdiUuid'],
     include: [{

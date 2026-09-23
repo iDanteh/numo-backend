@@ -560,25 +560,38 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // por esta terminal y cuánto se llevó NetPay de comisión en ESA venta
     // (no solo el total del día/centro que ya traía `gross`/`comision`).
     const detalle = [];
-    for (const t of (resultado.transacciones ?? [])) {
-      if (!terminalesValidas.has(t.terminalID)) continue;
-      // Solo transacciones con status='completed' (confirmado por el usuario
-      // 2026-09-18) — responseCode='00' del query a Kore no garantiza por sí
-      // solo que la transacción siga vigente (podría estar revertida/anulada
-      // después con el mismo responseCode original).
-      if (t.status !== 'completed') continue;
+    // Solo transacciones con status='completed' (confirmado por el usuario
+    // 2026-09-18) — responseCode='00' del query a Kore no garantiza por sí
+    // solo que la transacción siga vigente (podría estar revertida/anulada
+    // después con el mismo responseCode original).
+    const transaccionesValidas = (resultado.transacciones ?? []).filter(t =>
+      terminalesValidas.has(t.terminalID) && t.status === 'completed' && (Number(t.amount) || 0) > 0);
+    // Dos pasadas (2026-09-23, confirmado con el usuario, caso real
+    // Ferrocarril 21-sep, póliza 888: una pasada de $1,026.90 =
+    // F0-260902052 $11.44 + F0-260902050 $1,015.46 de la Global
+    // F0-260900313, que tenía 18 tickets Tarjeta ese día). Antes cada
+    // transacción intentaba su match exacto Y su combinación en el mismo
+    // recorrido: cuando le tocaba a la de $1,026.90 todavía quedaban 11
+    // tickets de esa Global sin ligar (> MAX_TICKETS_COMBINACION_NETPAY) y
+    // la combinación ni se intentaba. Ahora primero se ligan TODOS los
+    // matches exactos 1-a-1 y solo después se buscan combinaciones sobre lo
+    // que sobra — el grupo queda chico y una combinación nunca se lleva un
+    // ticket que era el match exacto de otra transacción.
+    const sinMatchExacto = [];
+    for (const t of transaccionesValidas) {
       const monto = Number(t.amount) || 0;
-      if (monto <= 0) continue;
       const comisionTransaccion = Number(t.commission) || 0;
       const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
-      if (idx !== -1) {
-        const fila = disponibles.splice(idx, 1)[0];
-        matchedIds.add(fila.id);
-        gross += Number(fila.debe);
-        comision += comisionTransaccion;
-        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
-        continue;
-      }
+      if (idx === -1) { sinMatchExacto.push(t); continue; }
+      const fila = disponibles.splice(idx, 1)[0];
+      matchedIds.add(fila.id);
+      gross += Number(fila.debe);
+      comision += comisionTransaccion;
+      detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
+    }
+    for (const t of sinMatchExacto) {
+      const monto = Number(t.amount) || 0;
+      const comisionTransaccion = Number(t.commission) || 0;
       // Fallback: 2+ tickets de la MISMA factura (Factura Global dividida en
       // varios tickets) que EN CONJUNTO explican el monto — caso real
       // confirmado 2026-09-21 (Hidalgo/B0, $7,914.13 = suma de 2 tickets de

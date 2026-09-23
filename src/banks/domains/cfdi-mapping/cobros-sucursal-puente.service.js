@@ -372,7 +372,10 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
       // (2026-08-20, confirmado contra el Reporte de Movimientos en Cajas
       // real de Hidalgo/B0) — dinero real (pago mixto con SF, o venta
       // miscelánea), no espejos como 'APA'.
-      if (origenPend !== 'APS' && origenPend !== 'MIS' && !SERIES_CON_AUTH.includes(origenPend)) continue;
+      // 'CCE' (Cobro Contra Entrega) — dinero real, se trata según la caja
+      // donde se cobró como cualquier otro origen (2026-09-23, confirmado con
+      // el usuario, ver `_prefetchAjustesFacturaPropia` en cfdi-poliza-generator).
+      if (origenPend !== 'APS' && origenPend !== 'MIS' && origenPend !== 'CCE' && !SERIES_CON_AUTH.includes(origenPend)) continue;
       const fechaCobro = cobro.fecha ? new Date(cobro.fecha) : null;
       if (!fechaCobro || fechaCobro < fechaDesde || fechaCobro > fechaHasta) continue;
       let monto = Math.abs(Number(cobro.monto) || 0);
@@ -1102,7 +1105,9 @@ async function construirMovimientosPuente({
       // (2026-08-20, confirmado contra el Reporte de Movimientos en Cajas
       // real de Hidalgo/B0 11-ago) — dinero real (pago mixto con SF, o
       // venta miscelánea), a diferencia de 'APA' que es solo un espejo.
-      if (origenPuente !== 'APS' && origenPuente !== 'MIS' && !SERIES_CON_AUTH.includes(origenPuente)) continue;
+      // 'CCE' (Cobro Contra Entrega) — ídem (2026-09-23): un CCE cobrado en
+      // la caja de otra sucursal es cobro de otra sucursal como cualquier otro.
+      if (origenPuente !== 'APS' && origenPuente !== 'MIS' && origenPuente !== 'CCE' && !SERIES_CON_AUTH.includes(origenPuente)) continue;
 
       // Filtro por día real del cobro (ver comentario en la firma de la función).
       if (fechaDesde && fechaHasta) {

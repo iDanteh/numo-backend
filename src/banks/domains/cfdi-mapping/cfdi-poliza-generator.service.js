@@ -3012,9 +3012,12 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       }
 
       const origen = (cobro.serieOrigen ?? '').toUpperCase();
-      // 'CCE' (Cobro Contra Entrega) — dinero real, ver comentario 2026-09-23
-      // en `_prefetchAjustesFacturaPropia`.
-      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
+      // 'CCE' NO se agrega aquí (2026-09-23): esta función es solo para
+      // cobros en la PROPIA caja; el cambio de ese día fue únicamente para
+      // CCE cobrado en OTRA caja. Agregarlo aquí sumaba $140,928.60 de
+      // "Cobros sin factura" a CEDIS 18-sep (tickets A0 cobrados por CCE en
+      // A0) sin haber verificado que no se dupliquen el día de la factura.
+      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
 
       const dedupeKey = `${cobro.serieOrigen}|${cobro.folioOrigen}|${cuenta.serieVenta}|${cuenta.folioVenta}`;
       if (vistos.has(dedupeKey)) continue;

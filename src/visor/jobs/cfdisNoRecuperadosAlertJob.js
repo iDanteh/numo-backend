@@ -24,10 +24,15 @@ const { logger } = require('../../shared/utils/logger');
 const SatJobCheckpoint = require('../models/SatJobCheckpoint');
 const emailSvc = require('../../shared/services/email.service');
 
-const DESTINATARIO = 'programador6@tubosyconexiones.mx';
-// Cubre la corrida nocturna completa (arranca ~1:00 am) con margen de sobra
-// para checkpoints que quedaron reintentando hasta tarde.
-const VENTANA_HORAS = 30;
+// 2026-09-23, pedido explícito del usuario: agregar sistemas4 además de
+// programador6.
+const DESTINATARIOS = ['programador6@tubosyconexiones.mx', 'sistemas4@tubosyconexiones.mx'];
+// 2026-09-23, pedido explícito del usuario: solo los "más actuales" — el
+// checkpoint (`fecha`, el DÍA que describe, no cuándo se tocó por última
+// vez) debe caer en los últimos 2 días. Antes se filtraba por `updatedAt`
+// (cuándo se tocó), lo que hacía que un checkpoint viejo sin resolver
+// reapareciera cada noche indefinidamente si algo lo seguía re-tocando.
+const DIAS_ATRAS = 2;
 
 function construirCorreo(pendientes) {
   const filas = pendientes.map(p => `
@@ -71,10 +76,17 @@ function construirCorreo(pendientes) {
 }
 
 async function verificarCfdisNoRecuperados() {
-  const desde = new Date(Date.now() - VENTANA_HORAS * 60 * 60 * 1000);
+  // `fecha` es un string 'YYYY-MM-DD' en día calendario MX (mismo criterio
+  // que el resto del dominio SAT) — comparación lexicográfica de strings
+  // funciona igual que comparación de fechas en este formato.
+  const fmtMX = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const hoyMX = new Date();
+  hoyMX.setDate(hoyMX.getDate() - DIAS_ATRAS);
+  const desdeFecha = fmtMX.format(hoyMX);
+
   const pendientes = await SatJobCheckpoint.find({
-    status:    { $in: ['error', 'incompleto'] },
-    updatedAt: { $gte: desde },
+    status: { $in: ['error', 'incompleto'] },
+    fecha:  { $gte: desdeFecha },
   }).select('rfc fecha tipoComprobante status error updatedAt').sort({ rfc: 1, fecha: 1 }).lean();
 
   if (pendientes.length === 0) {
@@ -83,9 +95,9 @@ async function verificarCfdisNoRecuperados() {
   }
 
   const { subject, html } = construirCorreo(pendientes);
-  const enviado = await emailSvc.enviarCorreo({ to: DESTINATARIO, subject, html });
+  const enviado = await emailSvc.enviarCorreo({ to: DESTINATARIOS, subject, html });
   if (enviado) {
-    logger.info(`[CfdisNoRecuperadosAlert] Aviso enviado a ${DESTINATARIO} — ${pendientes.length} caso(s).`);
+    logger.info(`[CfdisNoRecuperadosAlert] Aviso enviado a ${DESTINATARIOS.join(', ')} — ${pendientes.length} caso(s).`);
   }
 }
 

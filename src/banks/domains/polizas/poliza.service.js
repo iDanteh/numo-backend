@@ -2823,7 +2823,13 @@ function _extraerCobrosSucursal(movimientos) {
       centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
       debe:        Number(m.debe),
       haber:       Number(m.haber),
-      cfdiUuid:    null,
+      // UUID real de la factura cobrada -- antes iba fijo en null y el export
+      // CONTPAQ nunca generaba su línea 'AD' (caso real 2026-09-23:
+      // Promotoría/21-sep, 10 de 16 facturas sin 'AD' por venir como
+      // EFECTIVO-COS/TRANSFERENCIA-COS). Estas filas se inyectan ya armadas
+      // en los bloques (`_inyectarCobrosSucursal`), así que el uuid solo
+      // afecta la línea 'AD' y el color alternado por factura.
+      cfdiUuid:    m.cfdiUuid ?? null,
       // Discrimina PPD (bloque Crédito) de PUE (bloque Contado) en
       // _inyectarCobrosSucursal — ver `metodoPago` en cobros-sucursal-puente.service.js.
       metodoPago:  m.metodoPago ?? null,

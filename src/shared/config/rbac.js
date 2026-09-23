@@ -44,6 +44,12 @@ const PERMISSIONS = Object.freeze({
   BANKS_CONFIG:        'banks:config',
   BANKS_RULES:         'banks:rules',
 
+  // Ver métricas de TODO el equipo en el dashboard de Cobranza (banks:indicadores), no solo
+  // las propias — igual que banks:config, pero sin desbloquear el resto de lo que banks:config
+  // permite (configurar bancos, reglas, etc.). Permiso nuevo, sin asignar a ningún rol todavía
+  // — el usuario lo asigna por persona vía extraPermissions (pantalla Usuarios).
+  BANKS_COBRANZA_ALL:  'banks:cobranza:all',
+
   // Catálogo de cuentas contables
   ACCOUNT_PLAN_READ:   'account-plan:read',
   ACCOUNT_PLAN_WRITE:  'account-plan:write',
@@ -63,6 +69,13 @@ const PERMISSIONS = Object.freeze({
   // rutas exige ambos) — este permiso por sí solo no habilita nada. Con
   // collections:write, este permiso queda irrelevante (acceso completo gana).
   COLLECTIONS_READ_IDENTIFICADAS: 'collections:read:identificadas',
+
+  // Ver métricas de TODO el equipo en el dashboard "Solicitudes de Cobro" (indicadores de
+  // tiempo de identificación), no solo las propias. Reemplaza un chequeo que hoy está
+  // hardcodeado a role==='admin' en _resolveScopeUserId (collection-request.routes.js) — con
+  // este permiso, cualquier usuario puede desbloquearlo vía extraPermissions, sin depender de
+  // tener el rol admin literal. Permiso nuevo, sin asignar a ningún rol todavía.
+  COLLECTIONS_INDICADORES_ALL: 'collections:indicadores:all',
 
   // Integración ERP
   ERP_MANAGE:          'erp:manage',

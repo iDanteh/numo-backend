@@ -204,34 +204,10 @@ function _extraerDocumentosRelacionados(cfdi) {
 // por almacén, así que los folios de un mismo día quedan cerca entre sí.
 const PADDING_ESCANEO_POR_FACTURAR = 15;
 
-/**
- * Detecta tickets de cajas con cobro real (mismo día, mismas series que
- * SERIES_CON_AUTH) que NO tienen ninguna factura ligada (`serieFactura`/
- * `folioFactura` ausentes) — ej. I0-260700183 (CLIENTE MOSTRADOR, $184.89,
- * cobrado el 10/07 pero nunca facturado, confirmado con el usuario
- * 2026-08-04). El motor normal nunca los ve porque solo consulta folios que
- * ya conoce vía `documentosRelacionados` de algún CFDI — un ticket sin
- * factura no está referenciado por nada.
- *
- * No hay endpoint en cajas para "listar" tickets por día/almacén — la única
- * vía es adivinar el folioVenta y consultar uno por uno (confirmado con el
- * usuario 2026-08-04). Se infiere el rango a partir de los folios YA
- * conocidos de este mismo día (`foliosConocidos`) ± `PADDING_ESCANEO_POR_FACTURAR`
- * — es un heurístico, no garantiza encontrar el 100% (ej. si todos los
- * tickets del día cayeran fuera del padding).
- *
- * Devuelve una lista informativa para mostrar aparte como "pendientes por
- * facturar" (esta función en sí NO arma movimientos contables). Si además el
- * cobro resulta cruzado de sucursal, el CALLER (`construirMovimientosPuente`,
- * justo después de invocar esta función) SÍ le genera su asiento de "Cobro
- * de otra sucursal" (Cargo Caja/Bancos + Abono a la cuenta puente) aparte —
- * confirmado con el usuario 2026-08-05: el ticket debe aparecer en AMBOS
- * lados (pendiente por facturar + asiento real), el dinero ya se cobró de
- * verdad aunque falte la factura.
- */
-async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta }) {
-  if (!fechaDesde || !fechaHasta || !serieDelDia || !foliosDelDiaNumericos.length) return [];
-
+// Escaneo heurístico de folios cercanos a los ya conocidos del día (ver
+// docstring de `_detectarPendientesPorFacturar`). Devuelve las cuentas del
+// ERP encontradas, sin filtrar.
+async function _escanearFoliosCercanos({ rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos }) {
   // Descartar outliers antes de sacar min/max: un solo folioVenta de otra
   // época (ej. un "documento relacionado" viejo de junio colándose entre los
   // de julio) dispara un rango de miles de folios y satura el ERP (429 Too
@@ -265,6 +241,53 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
     });
     cuentasEscaneadas.push(...resultado);
   }
+  return cuentasEscaneadas;
+}
+
+/**
+ * Detecta tickets de cajas con cobro real (mismo día, mismas series que
+ * SERIES_CON_AUTH) que NO tienen ninguna factura ligada (`serieFactura`/
+ * `folioFactura` ausentes) — ej. I0-260700183 (CLIENTE MOSTRADOR, $184.89,
+ * cobrado el 10/07 pero nunca facturado, confirmado con el usuario
+ * 2026-08-04). El motor normal nunca los ve porque solo consulta folios que
+ * ya conoce vía `documentosRelacionados` de algún CFDI — un ticket sin
+ * factura no está referenciado por nada.
+ *
+ * No hay endpoint en cajas para "listar" tickets por día/almacén — la única
+ * vía es adivinar el folioVenta y consultar uno por uno (confirmado con el
+ * usuario 2026-08-04). Se infiere el rango a partir de los folios YA
+ * conocidos de este mismo día (`foliosConocidos`) ± `PADDING_ESCANEO_POR_FACTURAR`
+ * — es un heurístico, no garantiza encontrar el 100% (ej. si todos los
+ * tickets del día cayeran fuera del padding).
+ *
+ * Devuelve una lista informativa para mostrar aparte como "pendientes por
+ * facturar" (esta función en sí NO arma movimientos contables). Si además el
+ * cobro resulta cruzado de sucursal, el CALLER (`construirMovimientosPuente`,
+ * justo después de invocar esta función) SÍ le genera su asiento de "Cobro
+ * de otra sucursal" (Cargo Caja/Bancos + Abono a la cuenta puente) aparte —
+ * confirmado con el usuario 2026-08-05: el ticket debe aparecer en AMBOS
+ * lados (pendiente por facturar + asiento real), el dinero ya se cobró de
+ * verdad aunque falte la factura.
+ */
+async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta, cuentasExtra = [] }) {
+  if (!fechaDesde || !fechaHasta) return [];
+  const cuentasEscaneadas = serieDelDia && foliosDelDiaNumericos.length
+    ? await _escanearFoliosCercanos({ rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos })
+    : [];
+  // Tickets sin factura que la consulta "por centro" de la sucursal
+  // vendedora ya trajo (ver `cuentasSinFacturaOtraCaja` en
+  // construirMovimientosPuente) -- el escaneo de folios cercanos no ve
+  // tickets viejos (caso real 2026-09-23: I0-260400001, ticket de abril
+  // con abono de $2,500 en caja de CEDIS el 18-sep, muy fuera del rango de
+  // folios del día). Dedup por cuentaId contra lo ya escaneado.
+  const idsEscaneados = new Set(cuentasEscaneadas.map(c => c.cuentaId).filter(Boolean));
+  for (const c of cuentasExtra) {
+    if (c.cuentaId && idsEscaneados.has(c.cuentaId)) continue;
+    cuentasEscaneadas.push(c);
+    if (c.cuentaId) idsEscaneados.add(c.cuentaId);
+  }
+  if (!cuentasEscaneadas.length) return [];
+  const LOTE = 150;
 
   // Ventas canceladas cuyo saldo a favor ya se usó por completo en OTRO lado
   // (confirmado con el usuario 2026-09-10, caso real Ferrocarril F0-260900757:
@@ -654,6 +677,9 @@ async function construirMovimientosPuente({
   // `CobroSucursalPendiente`. Solo aplica generando por día (necesita
   // fechaDesde/fechaHasta acotados a un único día — no tiene sentido pedirle
   // al ERP "todo lo cobrado en este centro en el mes completo").
+  // Tickets de ESTA sucursal, sin factura, cobrados en la caja de OTRA
+  // sucursal ese día -- ver `cuentasExtra` en `_detectarPendientesPorFacturar`.
+  let cuentasSinFacturaOtraCaja = [];
   if (centroPropioClave && fechaDesde && fechaHasta) {
     // Ya liberado en producción (confirmado con el usuario 2026-08-14) — el
     // try/catch se deja de todos modos: si falla por cualquier otra razón
@@ -679,6 +705,14 @@ async function construirMovimientosPuente({
       const cuentasDirecto = await obtenerDesglosesCobroAlmacenPorCentro({
         rfc, centro: centroPropioClave, fechaDesde: fechaDesdeIso, fechaHasta: fechaHastaIso,
       });
+      // El filtro `cobrosFiltrados` de abajo descarta estos cobros (no son de
+      // esta caja) -- para un ticket SIN factura, esta consulta es la única
+      // fuente que los ve sin depender de que la sucursal cobradora genere
+      // primero (el escaneo de folios cercanos solo alcanza tickets recientes).
+      cuentasSinFacturaOtraCaja = cuentasDirecto
+        .filter(c => !c.serieFactura && c.serieVenta === centroPropioClave)
+        .map(c => ({ ...c, cobros: (c.cobros ?? []).filter(cobro => cobro.claveCentro && cobro.claveCentro !== centroPropioClave) }))
+        .filter(c => c.cobros.length);
       for (const c of cuentasDirecto) {
         if (c.cuentaId && cuentasIdsConocidas.has(c.cuentaId)) continue;
         // Omitir entradas cuya sucursal VENDEDORA es esta misma sucursal Y
@@ -756,7 +790,7 @@ async function construirMovimientosPuente({
     }
   }
 
-  if (!cuentas.length) return vacio;
+  if (!cuentas.length && !cuentasSinFacturaOtraCaja.length) return vacio;
 
   // 1b. Saldos a favor USADOS por estas mismas ventas — mismo lote de
   // series/folios que /desgloses-cobro/almacen. Reemplaza la detección
@@ -1473,6 +1507,7 @@ async function construirMovimientosPuente({
   const centroDelDia = serieDelDia ? (ccBySerieMap[serieDelDia] ?? null) : null;
   const pendientesDetectados = await _detectarPendientesPorFacturar({
     rfc, foliosDelDiaNumericos, serieDelDia, foliosConocidos, fechaDesde, fechaHasta,
+    cuentasExtra: cuentasSinFacturaOtraCaja,
   });
 
   if (cuentaPuenteId) {

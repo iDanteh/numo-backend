@@ -2570,6 +2570,29 @@ async function _resolverCuentasPuenteSucursales() {
 // `construirMovimientosPuente` detecta el cobro cruzado, encola lo que la
 // sucursal cobradora necesita para su asiento — sin volver a tocar el ERP
 // cuando esa sucursal genere su propia póliza.
+// Tickets cubiertos por otra sucursal SIN renglón propio de Caja/Bancos en
+// esta factura (2026-09-23, confirmado con el usuario, caso real Global
+// I0-260900267/Promotoría 21-sep, póliza 876): cuando TODOS los tickets de
+// una Factura Global se cobraron en otra caja, el generador deja un solo
+// renglón "Venta Sin Cobro" por la factura (sin `folioVentaTicket`) y la
+// reducción por ticket nunca encontraba dónde aplicarse — el Cargo salía
+// doble ($77,639.66 + los "Cobro Sucursal" de sus tickets). Se pasa el monto
+// de esos tickets a la clave de la factura, que es la del renglón excedente.
+// Los tickets que SÍ tienen renglón propio no se tocan (ver bug 2026-08-27,
+// Reforma D0-260800038: la resta no debe caer en el excedente de otro ticket).
+function _reasignarCubiertoSinLineaPropia(mapaPorTicket, movs, cfdi, idsCajaBancos) {
+  if (!mapaPorTicket.size) return;
+  const facturaKey = `${cfdi.serie}|${cfdi.folio}`;
+  const ticketsConLinea = new Set(movs
+    .filter(m => m.folioVentaTicket != null && Number(m.debe) > 0 && idsCajaBancos.includes(m.cuentaId))
+    .map(m => `${m.serieVentaTicket ?? cfdi.serie}|${m.folioVentaTicket}`));
+  for (const [k, monto] of [...mapaPorTicket]) {
+    if (k === facturaKey || ticketsConLinea.has(k) || !(monto > 0)) continue;
+    mapaPorTicket.delete(k);
+    mapaPorTicket.set(facturaKey, parseFloat(((mapaPorTicket.get(facturaKey) ?? 0) + monto).toFixed(2)));
+  }
+}
+
 async function _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie }) {
   const satCfdis = await CFDI.find({
     'emisor.rfc':      rfc,
@@ -4526,6 +4549,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     const montoCubiertoRestantePorTicketProp = new Map(
       (cubiertoInfoProp?.detalle ?? []).map(d => [`${d.serieVenta}|${d.folioVenta}`, d.monto]),
     );
+    _reasignarCubiertoSinLineaPropia(montoCubiertoRestantePorTicketProp, movs, cfdi,
+      [cuentaMap[CODIGO_CUENTA_CAJA], cuentaMap[CODIGO_CUENTA_BANCOS]].filter(Boolean));
     // Facturas PPD cobradas en otra sucursal: el Cargo a Clientes de la venta
     // sigue normal (sin tocar); se agrega ABAJO un asiento adicional (Abono a
     // Clientes + la línea de Cargo a la cuenta puente que ya viene en
@@ -6345,6 +6370,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     const montoCubiertoRestantePorTicketGuard = new Map(
       (cubiertoInfoGuard?.detalle ?? []).map(d => [`${d.serieVenta}|${d.folioVenta}`, d.monto]),
     );
+    _reasignarCubiertoSinLineaPropia(montoCubiertoRestantePorTicketGuard, movs, cfdi,
+      [cuentaMap[CODIGO_CUENTA_CAJA], cuentaMap[CODIGO_CUENTA_BANCOS]].filter(Boolean));
     // Ver comentario equivalente en generarPropuesta: PPD cobrada en otra
     // sucursal — el Cargo a Clientes normal no se toca; se agrega abajo un
     // asiento adicional (Abono a Clientes + Cargo puente, que ya viene en movsPuenteGuard).

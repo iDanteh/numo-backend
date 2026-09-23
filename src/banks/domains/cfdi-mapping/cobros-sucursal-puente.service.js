@@ -70,7 +70,7 @@ const BankMovement = require('../banks/BankMovement.model');
 const CFDI = require('../../../visor/models/CFDI');
 const {
   obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
-  obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
+  obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, obtenerNombrePersonaTicket,
 } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 
@@ -203,6 +203,32 @@ function _extraerDocumentosRelacionados(cfdi) {
 // del día — heurístico: el numerador de cajas es aproximadamente secuencial
 // por almacén, así que los folios de un mismo día quedan cerca entre sí.
 const PADDING_ESCANEO_POR_FACTURAR = 15;
+
+// Nombre real del cliente para tickets SIN factura (no hay CFDI de dónde
+// sacar el receptor) — ver `obtenerNombrePersonaTicket`. Devuelve
+// Map<'serieVenta|folioVenta', nombre>; los que no se resuelvan simplemente
+// no aparecen (el caller conserva "CLIENTE NO IDENTIFICADO"). Máximo 4
+// consultas en vuelo para no saturar el ERP.
+async function _nombresClienteSinFactura(rfc, cuentasSinFactura) {
+  const porVenta = new Map();
+  for (const c of cuentasSinFactura) {
+    if (!c?.serieVenta || !c?.folioVenta || !c.fechaCreacion) continue;
+    const k = `${c.serieVenta}|${c.folioVenta}`;
+    if (!porVenta.has(k)) porVenta.set(k, c);
+  }
+  const pendientes = [...porVenta.entries()];
+  const nombres = new Map();
+  let idx = 0;
+  const trabajador = async () => {
+    while (idx < pendientes.length) {
+      const [k, c] = pendientes[idx++];
+      const nombre = await obtenerNombrePersonaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion });
+      if (nombre) nombres.set(k, nombre);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, pendientes.length) }, trabajador));
+  return nombres;
+}
 
 // Escaneo heurístico de folios cercanos a los ya conocidos del día (ver
 // docstring de `_detectarPendientesPorFacturar`). Devuelve las cuentas del
@@ -373,6 +399,12 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
         nombreCliente: 'CLIENTE NO IDENTIFICADO',
       });
     }
+  }
+  if (pendientes.length) {
+    const clavesPendientes = new Set(pendientes.map(p => `${p.serie}|${p.folio}`));
+    const nombres = await _nombresClienteSinFactura(rfc,
+      cuentasEscaneadas.filter(c => clavesPendientes.has(`${c.serieVenta}|${c.folioVenta}`)));
+    for (const p of pendientes) p.nombreCliente = nombres.get(`${p.serie}|${p.folio}`) ?? p.nombreCliente;
   }
   return pendientes;
 }
@@ -1030,10 +1062,17 @@ async function construirMovimientosPuente({
   const foliosDelDiaNumericos = [];
   let serieDelDia = null;
 
+  // Tickets sin factura (sin CFDI de dónde sacar el receptor) — ver
+  // `_nombresClienteSinFactura`.
+  const nombresSinFactura = await _nombresClienteSinFactura(rfc,
+    cuentas.filter(c => !c.serieFactura && !cfdiPorDoc.has(`${c.serieVenta}|${c.folioVenta}`)));
+
   for (const cuenta of cuentas) {
     const centroVendedor = cuenta.serieFactura ? ccBySerieMap[cuenta.serieFactura] : null;
     const cfdiOriginal = cfdiPorDoc.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? null;
-    const nombreCliente = cfdiOriginal?.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+    const nombreCliente = cfdiOriginal?.receptor?.nombre
+      ?? nombresSinFactura.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)
+      ?? 'CLIENTE NO IDENTIFICADO';
     const esPPD = cfdiOriginal?.metodoPago === 'PPD';
 
     // Serie-folio del DOCUMENTO RELACIONADO (cuenta.serieVenta/folioVenta) —

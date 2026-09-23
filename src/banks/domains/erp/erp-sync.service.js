@@ -480,8 +480,50 @@ async function obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen, fechaDesde,
   return salidas;
 }
 
+// Nombre del cliente de UN ticket SIN factura (2026-09-23, confirmado con el
+// usuario: caso real I0-260400001, salía "CLIENTE NO IDENTIFICADO" en vez de
+// DIEGO MARTIN ALEJANDRO ALVAREZ ROMO DE VIVAR). `/desgloses-cobro/almacen`
+// no trae el cliente; `/cuentas-pendientes` sí (`nombrePersona`), filtrando
+// por el folio del ticket y un rango de ±1 día sobre su `fechaCreacion`.
+// Una sola llamada (sin la verificación cruzada de `sincronizarCuentasPendientes`,
+// pensada para descargas masivas): es solo el nombre para el concepto — si
+// falla o no viene, el caller conserva "CLIENTE NO IDENTIFICADO". Las fallas
+// no se cachean, así una regeneración posterior lo vuelve a intentar.
+const _cacheNombrePersona = new Map();
+async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) {
+  if (!rfc || !serie || !folio || !fechaCreacion) return null;
+  const creada = new Date(fechaCreacion);
+  if (Number.isNaN(creada.getTime())) return null;
+  const clave = `${rfc}::${serie}|${folio}`;
+  const cacheado = _leerCache(_cacheNombrePersona, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  let nombre = null;
+  try {
+    const response = await axios.get(`${await _cuentasPendientesUrl()}/cuentas-pendientes`, {
+      params: {
+        fechaDesde:   new Date(creada.getTime() - MS_UN_DIA).toISOString(),
+        fechaHasta:   new Date(creada.getTime() + MS_UN_DIA).toISOString(),
+        serieExterna: String(serie).trim(),
+        folioExterno: String(folio).trim(),
+      },
+      headers: { Authorization: `Bearer ${await _token()}` },
+      timeout: 15000,
+    });
+    const cuenta = (response.data?.Data?.cuentas ?? [])
+      .find(c => c.serieExterna === serie && String(c.folioExterno) === String(folio));
+    nombre = (cuenta?.nombrePersona ?? '').trim() || null;
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn(`[ErpSync] nombre de cliente para ${serie}-${folio} no disponible (${err.response?.status ?? err.message})`);
+    return null;
+  }
+  _cacheNombrePersona.set(clave, { data: nombre, ts: Date.now() });
+  return nombre;
+}
+
 module.exports = {
-  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
+  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor, obtenerNombrePersonaTicket,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
   obtenerDesglosesSalidasCajaPorAlmacen,
 };

@@ -96,8 +96,8 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   // No se calcula/pasa rolActual (2026-07-31): el dashboard ya no excluye por ocultar-por-rol,
   // ver comentario en bank.service.js#getCards().
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
-  const { year, month } = req.query;
-  res.json(await service.getCards(restrictions, year, month));
+  const { year, month, fechaInicio, fechaFin } = req.query;
+  res.json(await service.getCards(restrictions, year, month, fechaInicio, fechaFin));
 }));
 
 // Dashboard de Cobranza (2026-09-17): mismo criterio de scope que
@@ -115,14 +115,17 @@ function _resolverScopeUserIdBancos(req, hasFullAccess) {
   return userIds.length ? userIds : undefined;
 }
 
-// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos). Con
-// BANKS_CONFIG (equipo completo, o acotado a ?userIds= elegidos a mano — dashboard de
-// Cobranza); sin BANKS_CONFIG, forzado al propio usuario — ver
+// GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos). Acceso
+// completo (equipo entero, o acotado a ?userIds= elegidos a mano — dashboard de Cobranza)
+// con BANKS_CONFIG O con BANKS_COBRANZA_ALL (2026-09-23, permiso nuevo — pensado para dar
+// esta visibilidad puntual, vía extraPermissions, sin desbloquear el resto de lo que
+// BANKS_CONFIG permite). Sin ninguno de los dos, forzado al propio usuario — ver
 // bank-indicadores.service.js#getIndicadoresIdentificacion para el criterio completo del
 // scope y por qué el backlog nunca se acota.
 router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco, categoria, year, month, fechaInicio, fechaFin } = req.query;
-  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasFullAccess = (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions))
+    || (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions));
   const scopeUserId = _resolverScopeUserIdBancos(req, hasFullAccess);
   res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId }));
 }));
@@ -130,11 +133,13 @@ router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHa
 // GET /api/banks/indicadores/reporte — Excel descargable del dashboard de Cobranza
 // (2026-09-18). Mismo permiso que /indicadores (BANKS_READ), NO BANKS_EXPORT ni un permiso
 // nuevo: es la MISMA data que ya se ve en pantalla, respetando el MISMO scope
-// (_resolverScopeUserIdBancos) — solo en formato descargable, no un dump nuevo de
-// información sensible que amerite un permiso más alto.
+// (_resolverScopeUserIdBancos, ahora también desbloqueable con BANKS_COBRANZA_ALL además de
+// BANKS_CONFIG) — solo en formato descargable, no un dump nuevo de información sensible que
+// amerite un permiso más alto.
 router.get('/indicadores/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco, categoria, year, month, fechaInicio, fechaFin } = req.query;
-  const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasFullAccess = (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions))
+    || (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions));
   const scopeUserId = _resolverScopeUserIdBancos(req, hasFullAccess);
   const buffer = await indicadoresService.buildReporteIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId });
   const fecha = new Date().toISOString().slice(0, 10);

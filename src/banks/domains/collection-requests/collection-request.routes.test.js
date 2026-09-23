@@ -97,7 +97,7 @@ const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 const ALLOWED = JSON.stringify([PERMISSIONS.COLLECTIONS_READ]);
 
-describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distribucion (2026-09-07)', () => {
+describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distribucion (2026-09-07, ampliado 2026-09-23 con COLLECTIONS_INDICADORES_ALL)', () => {
   let app;
 
   beforeEach(() => {
@@ -106,6 +106,12 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
     indicadoresService.getIndicadoresSolicitudesCobro.mockResolvedValue({});
     indicadoresService.getDistribucionSolicitudesCobro.mockResolvedValue({});
     indicadoresService.listContadoresConSolicitudesIdentificadas.mockResolvedValue([]);
+    // `_resolveScopeUserId()` ahora es async y decide TODO vía rbacStore.hasPermission
+    // (COLLECTIONS_INDICADORES_ALL) — ya no hay ningún atajo hardcodeado por role==='admin'.
+    // rbacStore está mockeado a nivel de módulo (jest.clearAllMocks() lo deja sin
+    // implementación, `undefined` = falsy), así que cada test debe fijar explícitamente
+    // qué devuelve, incluidos los que antes "funcionaban solo" por tener role: 'admin'.
+    rbacStore.hasPermission.mockResolvedValue(false);
     app = express();
     app.use(express.json());
     app.use('/', router);
@@ -120,8 +126,14 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       expect(indicadoresService.getIndicadoresSolicitudesCobro).not.toHaveBeenCalled();
     });
 
-    test('admin con ?userIds=id1,id2 -> el service se llama con scopeUserId: [\'id1\',\'id2\']', async () => {
+    // "admin" simula el caso real: en producción, rbacStore.hasPermission('admin', ...)
+    // devuelve true por el wildcard '*' sin importar el permiso pedido (ver
+    // rbac-store.js#hasPermission) — acá rbacStore está mockeado, así que ese wildcard se
+    // simula explícitamente con mockResolvedValue(true), no se prueba el wildcard en sí
+    // (eso es cobertura de rbac-store.test.js).
+    test('con acceso completo (admin) y ?userIds=id1,id2 -> el service se llama con scopeUserId: [\'id1\',\'id2\']', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       const res = await request(app)
         .get('/indicadores')
@@ -134,8 +146,9 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       expect(args.scopeUserId).toEqual(['id1', 'id2']);
     });
 
-    test('admin sin ?userIds -> el service se llama con scopeUserId: undefined (todo el equipo)', async () => {
+    test('con acceso completo (admin) y sin ?userIds -> el service se llama con scopeUserId: undefined (todo el equipo)', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       await request(app).get('/indicadores').set('x-test-permissions', ALLOWED);
 
@@ -143,8 +156,29 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       expect(args.scopeUserId).toBeUndefined();
     });
 
-    test('no-admin con ?userIds=algo -> se ignora, el service se llama con scopeUserId: req.user._id (su propio id), NO con el query param', async () => {
+    // Caso nuevo (2026-09-23): un rol que NO es admin, pero tiene COLLECTIONS_INDICADORES_ALL
+    // vía extraPermissions, debe ver todo el equipo igual que admin — es justo el permiso
+    // nuevo, pensado exactamente para este caso.
+    test('no-admin CON collections:indicadores:all (extraPermissions) -> ve todo el equipo igual que admin', async () => {
+      mockReqUser = { _id: 'contador-1', role: 'contabilidad', extraPermissions: ['collections:indicadores:all'] };
+      rbacStore.hasPermission.mockResolvedValue(true);
+
+      await request(app)
+        .get('/indicadores')
+        .query({ userIds: 'id1,id2' })
+        .set('x-test-permissions', ALLOWED);
+
+      expect(rbacStore.hasPermission).toHaveBeenCalledWith(
+        'contabilidad', PERMISSIONS.COLLECTIONS_INDICADORES_ALL, ['collections:indicadores:all'],
+      );
+      const args = indicadoresService.getIndicadoresSolicitudesCobro.mock.calls[0][0];
+      expect(args.scopeUserId).toEqual(['id1', 'id2']);
+    });
+
+    test('no-admin SIN collections:indicadores:all con ?userIds=algo -> se ignora, el service se llama con scopeUserId: req.user._id (su propio id), NO con el query param', async () => {
       mockReqUser = { _id: 'contador-1', role: 'contabilidad', extraPermissions: [] };
+      // rbacStore.hasPermission ya vuelve false por el beforeEach — explícito igual, por claridad.
+      rbacStore.hasPermission.mockResolvedValue(false);
 
       await request(app)
         .get('/indicadores')
@@ -157,6 +191,7 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
 
     test('?userIds= vacío cae a undefined (no un array vacío)', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       await request(app)
         .get('/indicadores')
@@ -169,6 +204,7 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
 
     test('?userIds= solo comas/espacios cae a undefined (no un array vacío)', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       await request(app)
         .get('/indicadores')
@@ -190,8 +226,9 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       expect(indicadoresService.getDistribucionSolicitudesCobro).not.toHaveBeenCalled();
     });
 
-    test('admin con ?userIds=id1,id2 -> el service se llama con scopeUserId: [\'id1\',\'id2\']', async () => {
+    test('con acceso completo (admin) y ?userIds=id1,id2 -> el service se llama con scopeUserId: [\'id1\',\'id2\']', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       await request(app)
         .get('/indicadores/distribucion')
@@ -202,8 +239,9 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       expect(args.scopeUserId).toEqual(['id1', 'id2']);
     });
 
-    test('admin sin ?userIds -> el service se llama con scopeUserId: undefined', async () => {
+    test('con acceso completo (admin) y sin ?userIds -> el service se llama con scopeUserId: undefined', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       await request(app).get('/indicadores/distribucion').set('x-test-permissions', ALLOWED);
 
@@ -211,8 +249,21 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
       expect(args.scopeUserId).toBeUndefined();
     });
 
-    test('no-admin con ?userIds=algo -> se ignora, el service se llama con scopeUserId: req.user._id (su propio id)', async () => {
+    test('no-admin CON collections:indicadores:all (extraPermissions) -> ve todo el equipo igual que admin', async () => {
+      mockReqUser = { _id: 'cobranza-1', role: 'cobranza', extraPermissions: ['collections:indicadores:all'] };
+      rbacStore.hasPermission.mockResolvedValue(true);
+
+      await request(app)
+        .get('/indicadores/distribucion')
+        .set('x-test-permissions', ALLOWED);
+
+      const args = indicadoresService.getDistribucionSolicitudesCobro.mock.calls[0][0];
+      expect(args.scopeUserId).toBeUndefined();
+    });
+
+    test('no-admin SIN collections:indicadores:all con ?userIds=algo -> se ignora, el service se llama con scopeUserId: req.user._id (su propio id)', async () => {
       mockReqUser = { _id: 'contador-1', role: 'cobranza', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(false);
 
       await request(app)
         .get('/indicadores/distribucion')
@@ -225,6 +276,7 @@ describe('_resolveScopeUserId() vía GET /indicadores y GET /indicadores/distrib
 
     test('?userIds= vacío o solo comas/espacios cae a undefined (no un array vacío)', async () => {
       mockReqUser = { _id: 'admin-1', role: 'admin', extraPermissions: [] };
+      rbacStore.hasPermission.mockResolvedValue(true);
 
       await request(app)
         .get('/indicadores/distribucion')

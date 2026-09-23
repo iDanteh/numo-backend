@@ -171,8 +171,15 @@ function _rangoAnioMesMexico(year, month) {
  *   permiso en el frontend; esa es una exposición aparte, pendiente de decidir por separado.
  * @param {string|number} [year] - si viene, limita movimientos/porStatus/porCategoria a ese año
  *   (y mes, si también viene). `saldoActualizado` NO se afecta: es el saldo real vigente, no
- *   tiene sentido acotarlo a un periodo pasado.
+ *   tiene sentido acotarlo a un periodo pasado. Ignorado por completo si viene `fechaInicio`+
+ *   `fechaFin` (ver abajo) — el rango explícito SIEMPRE gana, mismo criterio de precedencia
+ *   que `_resolverMatchTiempo()` en `bank-indicadores.service.js`.
  * @param {string|number} [month]
+ * @param {string} [fechaInicio] `YYYY-MM-DD` (hora de México) — junto con `fechaFin`, acota
+ *   `fecha` a ese rango de DÍAS completos (inicio/fin de día en México, vía
+ *   `_inicioDiaMx`/`_finDiaMx`). Ambos deben venir juntos para activar el rango explícito —
+ *   si falta uno de los dos, se ignoran los dos y se cae al comportamiento de `year`/`month`.
+ * @param {string} [fechaFin] Ver `fechaInicio`.
  *
  * 2026-07-31: a diferencia de listMovements()/exportMovements() (que sí excluyen por
  * `ocultoRoles`, ocultando las FILAS de un movimiento al rol correspondiente), este endpoint ya
@@ -182,13 +189,18 @@ function _rangoAnioMesMexico(year, month) {
  * para cualquier rol — permite "consultar la información" agregada sin exponer el detalle fila
  * por fila. Aplica a cualquier categoría que use ocultar-por-rol, no solo a una en particular.
  */
-async function getCards(restrictions = null, year = null, month = null) {
+async function getCards(restrictions = null, year = null, month = null, fechaInicio = null, fechaFin = null) {
   // Agregación MongoDB: estadísticas de movimientos por banco.
   // BankConfig ya no está en MongoDB → el $lookup se eliminó.
   // El join con la configuración se hace en la capa de aplicación.
   const match = { isActive: true, oculto: { $ne: true } };
   if (restrictions) match.status      = { $ne: 'otros' };
-  if (year) match.fecha = _rangoAnioMesMexico(year, month);
+  // Rango explícito gana por completo sobre year/month — ni se evalúa _rangoAnioMesMexico.
+  if (fechaInicio && fechaFin) {
+    match.fecha = { $gte: _inicioDiaMx(fechaInicio), $lte: _finDiaMx(fechaFin) };
+  } else if (year) {
+    match.fecha = _rangoAnioMesMexico(year, month);
+  }
 
   // Igual que en getStatusStats() (el endpoint que este KPI fusionado reemplaza como fuente):
   // estas 4 categorías cuentan solo depósitos, nunca retiros — el dashboard de conciliación
@@ -204,6 +216,16 @@ async function getCards(restrictions = null, year = null, month = null) {
       { $eq: ['$status', 'identificado'] },
       depositoCond,
       ...(ownUserId ? [{ $in: [ownUserId, { $ifNull: ['$identificadoPor.userId', []] }] }] : []),
+    ],
+  };
+  // Remanente sin cubrir por CxC — con saldoErp vinculado, solo la diferencia (nunca negativa);
+  // sin CxC vinculada, el depósito completo. Aplica a no_identificado/otros/reclasificado — NO a
+  // identificado, que por definición ya está 100% cubierto (aplicar esto ahí daría siempre 0).
+  const saldoRestanteCxC = {
+    $cond: [
+      { $ne: ['$saldoErp', null] },
+      { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] },
+      { $ifNull: ['$deposito', 0] },
     ],
   };
 
@@ -237,31 +259,19 @@ async function getCards(restrictions = null, year = null, month = null) {
           otros:           { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'otros'] },          depositoCond] }, 1, 0] } },
           reclasificado:   { $sum: { $cond: [{ $and: [{ $eq:  ['$status', 'reclasificado'] },  depositoCond] }, 1, 0] } },
           saldoPendiente: {
-            // Σ de no_identificados ponderada por CxC vinculadas:
-            // · Con saldoErp: se suma solo la diferencia (deposito - saldoErp), mínimo 0.
-            // · Sin saldoErp: se suma el depósito completo.
+            // Σ de no_identificados ponderada por CxC vinculadas — ver saldoRestanteCxC arriba.
             $sum: {
               $cond: [
                 { $in: ['$status', ['no_identificado', null]] },
-                {
-                  $cond: [
-                    { $ne: ['$saldoErp', null] },
-                    { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] },
-                    { $ifNull: ['$deposito', 0] },
-                  ],
-                },
+                saldoRestanteCxC,
                 0,
               ],
             },
           },
+          // Identificado ya está 100% cubierto por su CxC — se cuenta el depósito completo, sin
+          // restar retiro (estas 4 categorías son solo depósitos, ver comentario línea ~205).
           saldoIdentificado: {
-            $sum: {
-              $cond: [
-                identificadoCond,
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-                0,
-              ],
-            },
+            $sum: { $cond: [identificadoCond, { $ifNull: ['$deposito', 0] }, 0] },
           },
           saldoOtros: {
             $sum: {
@@ -275,23 +285,14 @@ async function getCards(restrictions = null, year = null, month = null) {
           // Aditivos: `saldoOtros` (arriba) mezcla 'otros'+'reclasificado' y algo más podría
           // depender de ese valor combinado, así que se deja intacto. Estos dos separan el monto
           // para poder mostrar "Por conciliar" con su propia cifra en el KPI, en vez de agruparlo.
+          // Mismo remanente-tras-CxC que saldoPendiente — 'otros'/'reclasificado' son estatus
+          // asignados por una regla de categorización, independientes de la vinculación ERP, así
+          // que pueden tener una CxC parcialmente vinculada igual que un no_identificado.
           saldoOtrosSolo: {
-            $sum: {
-              $cond: [
-                { $eq: ['$status', 'otros'] },
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-                0,
-              ],
-            },
+            $sum: { $cond: [{ $eq: ['$status', 'otros'] }, saldoRestanteCxC, 0] },
           },
           saldoReclasificado: {
-            $sum: {
-              $cond: [
-                { $eq: ['$status', 'reclasificado'] },
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-                0,
-              ],
-            },
+            $sum: { $cond: [{ $eq: ['$status', 'reclasificado'] }, saldoRestanteCxC, 0] },
           },
         },
       },
@@ -320,43 +321,19 @@ async function getCards(restrictions = null, year = null, month = null) {
             $sum: {
               $cond: [
                 { $in: ['$status', ['no_identificado', null]] },
-                {
-                  $cond: [
-                    { $ne: ['$saldoErp', null] },
-                    { $max: [0, { $subtract: [{ $ifNull: ['$deposito', 0] }, '$saldoErp'] }] },
-                    { $ifNull: ['$deposito', 0] },
-                  ],
-                },
+                saldoRestanteCxC,
                 0,
               ],
             },
           },
           saldoIdentificado: {
-            $sum: {
-              $cond: [
-                identificadoCond,
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-                0,
-              ],
-            },
+            $sum: { $cond: [identificadoCond, { $ifNull: ['$deposito', 0] }, 0] },
           },
           saldoOtrosSolo: {
-            $sum: {
-              $cond: [
-                { $eq: ['$status', 'otros'] },
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-                0,
-              ],
-            },
+            $sum: { $cond: [{ $eq: ['$status', 'otros'] }, saldoRestanteCxC, 0] },
           },
           saldoReclasificado: {
-            $sum: {
-              $cond: [
-                { $eq: ['$status', 'reclasificado'] },
-                { $subtract: [{ $ifNull: ['$deposito', 0] }, { $ifNull: ['$retiro', 0] }] },
-                0,
-              ],
-            },
+            $sum: { $cond: [{ $eq: ['$status', 'reclasificado'] }, saldoRestanteCxC, 0] },
           },
         },
       },

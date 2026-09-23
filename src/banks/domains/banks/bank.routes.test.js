@@ -242,6 +242,34 @@ describe('GET /indicadores', () => {
     expect(args.scopeUserId).toEqual(['id1', 'id2']);
   });
 
+  // 2026-09-23 (permiso nuevo): BANKS_COBRANZA_ALL desbloquea el mismo acceso completo que
+  // BANKS_CONFIG, sin necesitar este último — pensado para asignarlo por persona vía
+  // extraPermissions. mockImplementation distingue por permiso (a diferencia del
+  // mockResolvedValue(true) de arriba, que no puede probar "solo UNO de los dos está OK").
+  test('sin BANKS_CONFIG pero con BANKS_COBRANZA_ALL: scopeUserId undefined (ve todo el equipo)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+
+    await request(app)
+      .get('/indicadores')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(rbacStore.hasPermission).toHaveBeenCalledWith('test-role', PERMISSIONS.BANKS_COBRANZA_ALL, []);
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toBeUndefined();
+  });
+
+  test('sin BANKS_CONFIG ni BANKS_COBRANZA_ALL: scopeUserId se fuerza al propio usuario', async () => {
+    rbacStore.hasPermission.mockResolvedValue(false);
+
+    await request(app)
+      .get('/indicadores')
+      .query({ userIds: 'id1,id2' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toBe('user-test');
+  });
+
   test('devuelve el shape básico del resultado del service tal cual', async () => {
     const res = await request(app)
       .get('/indicadores')
@@ -312,6 +340,19 @@ describe('GET /indicadores/reporte', () => {
     expect(args.scopeUserId).toBe('user-test');
   });
 
+  // 2026-09-23 (permiso nuevo): mismo criterio que /indicadores — BANKS_COBRANZA_ALL
+  // desbloquea el reporte descargable igual que BANKS_CONFIG.
+  test('sin BANKS_CONFIG pero con BANKS_COBRANZA_ALL: scopeUserId undefined (ve todo el equipo)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+
+    await request(app)
+      .get('/indicadores/reporte')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.buildReporteIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toBeUndefined();
+  });
+
   test('responde con headers de descarga (superagent no parsea este content-type a Buffer por default, no se testea el body binario acá)', async () => {
     const res = await request(app)
       .get('/indicadores/reporte')
@@ -351,6 +392,60 @@ describe('GET /indicadores/usuarios-con-identificaciones', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ userIds: ['user-1', 'user-2'] });
+  });
+});
+
+// GET /cards (2026-09-23, rango continuo del dashboard "Estatus" — combinar meses): igual
+// criterio de test que GET /indicadores (líneas arriba), pero mockeando `service.getCards`
+// directo sobre el módulo real (mismo patrón que service.adjuntarImagenFicha más abajo) en vez
+// de un módulo aparte — bank.service.js no está mockeado a nivel de archivo.
+describe('GET /cards', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config por defecto
+    service.getCards = jest.fn().mockResolvedValue([]);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cards')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(res.body.required).toEqual([PERMISSIONS.BANKS_READ]);
+    expect(service.getCards).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa year/month tal cual al service, sin fechaInicio/fechaFin (comportamiento previo intacto)', async () => {
+    await request(app)
+      .get('/cards')
+      .query({ year: '2026', month: '8' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(service.getCards).toHaveBeenCalledTimes(1);
+    const [, year, month, fechaInicio, fechaFin] = service.getCards.mock.calls[0];
+    expect(year).toBe('2026');
+    expect(month).toBe('8');
+    expect(fechaInicio).toBeUndefined();
+    expect(fechaFin).toBeUndefined();
+  });
+
+  test('con fechaInicio/fechaFin, se pasan al service tal cual junto con year/month (la precedencia la resuelve getCards, no la ruta)', async () => {
+    await request(app)
+      .get('/cards')
+      .query({ year: '2026', month: '2', fechaInicio: '2026-01-01', fechaFin: '2026-03-31' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const [, year, month, fechaInicio, fechaFin] = service.getCards.mock.calls[0];
+    expect(year).toBe('2026');
+    expect(month).toBe('2');
+    expect(fechaInicio).toBe('2026-01-01');
+    expect(fechaFin).toBe('2026-03-31');
   });
 });
 

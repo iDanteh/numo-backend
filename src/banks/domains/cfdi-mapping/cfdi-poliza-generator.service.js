@@ -1138,14 +1138,16 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // encolado para la sucursal cobradora). Sin este filtro, se sumaba
         // por partida doble: como Cargo normal aquí Y como cruce allá.
         const origen = (cobro.serieOrigen ?? '').toUpperCase();
-        // 'CCE' (Cobro Contra Entrega, 2026-09-08, caso real CONSTRUCASA
-        // C0-260806153 / Global C0-260900073): el ERP marca estos cobros con
-        // el `claveCentro` de la sucursal/ruta que hizo la entrega física
-        // (ej. A0), no de la sucursal que vendió (C0) — a diferencia de
-        // cualquier otro origen, esto NUNCA debe tratarse como "cobro de
-        // otra sucursal" (confirmado con el usuario): el dinero se queda
-        // contabilizado en la sucursal vendedora sin importar `claveCentro`.
-        if (origen !== 'CCE' && centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
+        // 'CCE' (Cobro Contra Entrega): hasta 2026-09-23 se exceptuaba de este
+        // filtro (fix 2026-09-08, caso CONSTRUCASA C0-260806153) porque el
+        // mecanismo de "cobro de otra sucursal" no reconocía 'CCE' y el cobro
+        // se perdía. Revertido 2026-09-23 (confirmado con el usuario, caso
+        // real Promotoría I0-260900290/291, CCE cobrado en caja A0): el
+        // `claveCentro` del endpoint de cobros es la caja donde se cobró, así
+        // que un CCE en otra caja ES cobro de otra sucursal como cualquier
+        // otro origen — ahora 'CCE' se acepta también en ese mecanismo
+        // (cobrosCobradoraDirecta, cobros-sucursal-puente.service.js).
+        if (centroPropioClave && cobro.claveCentro && cobro.claveCentro !== centroPropioClave) continue;
         // 'CBT' NO es exclusivamente Puntos/Club Tuberos — confirmado con
         // datos reales 2026-08-06: un mismo cobro CBT puede traer
         // EFECTIVO/TARJETA/TRANSFERENCIA/SALDO A FAVOR mezclados (parece ser
@@ -1236,9 +1238,8 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           // a favor en los casos observados), así que se acepta igual que
           // ABO/CBT/CPF/CFC.
         } else if (origen === 'CCE') {
-          // Ver comentario arriba (bypass del filtro de sucursal): dinero
-          // real de Cobro Contra Entrega, se acepta igual que MIS/APS/
-          // SERIES_CON_AUTH.
+          // Dinero real de Cobro Contra Entrega cobrado en ESTA caja — se
+          // acepta igual que MIS/APS/SERIES_CON_AUTH (ver comentario arriba).
         } else if (!SERIES_CON_AUTH.includes(origen)) {
           continue;
         }
@@ -1585,7 +1586,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // 2026-08-20 en el loop de `desglosePagoReal`) — dinero real
         // (mixto con SF en el caso de APS, venta miscelánea en el caso de
         // MIS), a diferencia de 'APA' que es solo un espejo.
-        if (origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
+        // 'CCE' (Cobro Contra Entrega): dinero real, se trata igual que cualquier
+        // otro cobro según la caja donde se hizo (`claveCentro`) — ver
+        // comentario 2026-09-23 en `_prefetchAjustesFacturaPropia`.
+        if (origen !== 'APS' && origen !== 'MIS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
         for (const fp of (cobro.formasPago ?? [])) {
           if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
           // "ANTICIPO" — mismo criterio que `desglosePagoReal` (línea ~1175)
@@ -3002,7 +3006,9 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       }
 
       const origen = (cobro.serieOrigen ?? '').toUpperCase();
-      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
+      // 'CCE' (Cobro Contra Entrega) — dinero real, ver comentario 2026-09-23
+      // en `_prefetchAjustesFacturaPropia`.
+      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
 
       const dedupeKey = `${cobro.serieOrigen}|${cobro.folioOrigen}|${cuenta.serieVenta}|${cuenta.folioVenta}`;
       if (vistos.has(dedupeKey)) continue;

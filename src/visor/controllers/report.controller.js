@@ -918,8 +918,12 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
 
   const cfdiSelect = 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda';
 
-  // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito
-  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint };
+  // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito.
+  // Excluye UUID sintético (SINUUID-...): sin UUID real nunca iba a poder
+  // verificarse contra el SAT de todas formas, el bloqueo real no es el "&"
+  // (pedido explícito del usuario 2026-09-23, mismo criterio que discrepancias
+  // de montos arriba).
+  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID-/ }, 'emisor.rfc': emisorConstraint };
   if (tipoDeComprobante) pendienteFiltro.tipoDeComprobante = tipoDeComprobante;
   if (ejercicio && periodo) {
     const ej = parseInt(ejercicio), pe = parseInt(periodo);

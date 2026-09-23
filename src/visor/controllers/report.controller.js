@@ -883,10 +883,16 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
   // Solo incluir CFDIs ERP que aún tienen discrepancia en su ÚLTIMA comparación.
   // lastComparisonStatus es actualizado cada vez que se corre la comparación,
   // por lo que garantiza que solo aparecen registros actuales, no históricos.
+  // Excluye CFDIs con UUID sintético ("SINUUID-...", ver erp-transformer.service.js
+  // #parseFechaFacturaERP/transformarTolerante) -- pedido explícito del usuario
+  // 2026-09-23: una factura sin UUID real del ERP no es un CFDI identificable de
+  // verdad, así que "discrepancia de monto" contra ella es ruido, no un caso real
+  // para revisar.
   const erpConDiscrepanciaIds = await CFDI.find({
     source: 'ERP',
     erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] },
     lastComparisonStatus: { $in: ['discrepancy', 'warning'] },
+    uuid: { $not: /^SINUUID-/ },
     'emisor.rfc': emisorConstraint,
     ...periodoFiltro,
   }).select('_id').lean().then(docs => docs.map(d => d._id));

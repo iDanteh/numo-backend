@@ -3051,12 +3051,15 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       }
 
       const origen = (cobro.serieOrigen ?? '').toUpperCase();
-      // 'CCE' NO se agrega aquí (2026-09-23): esta función es solo para
-      // cobros en la PROPIA caja; el cambio de ese día fue únicamente para
-      // CCE cobrado en OTRA caja. Agregarlo aquí sumaba $140,928.60 de
-      // "Cobros sin factura" a CEDIS 18-sep (tickets A0 cobrados por CCE en
-      // A0) sin haber verificado que no se dupliquen el día de la factura.
-      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && !SERIES_CON_AUTH.includes(origen)) continue;
+      // 'CCE' (Cobro Contra Entrega) cobrado en la PROPIA caja SÍ cuenta
+      // (confirmado con el usuario 2026-09-24, caso real CONSTRUCASA 22-sep
+      // C0-260904218 $849.63, ticket sin factura, el reporte de caja lo suma
+      // como efectivo del día). No se duplica con la factura: si ésta existe
+      // dentro de tolerancia se salta arriba, y si se timbra después el lado
+      // factura lo marca `yaContabilizadoOtroDia` (acepta 'CCE' igual que
+      // 'CBT'). Revierte 3e154b2 (2026-09-23), que lo había quitado por
+      // precaución (CEDIS 18-sep, $140,928.60) — re-verificado antes de subir.
+      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
 
       const dedupeKey = `${cobro.serieOrigen}|${cobro.folioOrigen}|${cuenta.serieVenta}|${cuenta.folioVenta}`;
       if (vistos.has(dedupeKey)) continue;

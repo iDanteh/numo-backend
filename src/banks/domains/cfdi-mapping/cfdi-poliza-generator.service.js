@@ -101,6 +101,11 @@ const ETIQUETA_SALDO_FAVOR_OCULTO = 'SF-OCULTO';
 // `_extraerCobrosSucursal` (poliza.service.js) lo detecta por este
 // reglaNombre y lo redirige, mismo patrón que SF-OCULTO/COBRO-DIA-REAL.
 const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
+// SF generado y usado el mismo día/almacén con un sobrante MENOR a esto: se
+// oculta igual que un uso completo (SF-OCULTO) y el sobrante va a "Otros
+// Ingresos" (SF-MENOR-SIN-USAR) — confirmado con el usuario 2026-09-24, mismo
+// umbral que "SF sin usar menor a $50". Sobrante >= $50 = uso parcial, se muestra.
+const SOBRANTE_MAX_SF_OCULTO = 50;
 
 /**
  * Deduplica líneas de Saldo a Favor (SF/SF-OCULTO) que DOS mecanismos
@@ -473,6 +478,11 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     const diaGen = _diaMx(gen.fecha);
     const diaUso = _diaMx(usoUnico?.fecha ?? null);
     const usoCompleto = usoUnico && Math.abs(Number(usoUnico.montoSobrante) || 0) < 0.01;
+    // Para ocultar basta sobrante < $50 (ver `SOBRANTE_MAX_SF_OCULTO`); el
+    // sobrante se emite aparte a "Otros Ingresos" (`_inyectarSaldoFavorGenerado`).
+    // `usoCompleto` (exacto) se sigue usando para `mismoFolio`.
+    const usoOcultable = usoUnico && (Number(usoUnico.montoSobrante) || 0) > -0.01
+      && (Number(usoUnico.montoSobrante) || 0) < SOBRANTE_MAX_SF_OCULTO;
 
     // Multi-uso el mismo día (2026-08-19, caso real CAC-077160: $97.36
     // aplicados a otra venta + $195.54 retirados en efectivo vía ABO, ambos
@@ -560,8 +570,8 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     // por uso individual (a diferencia del caso de un solo uso) porque un
     // retiro en efectivo (ABO) no necesariamente ocurre en el mismo almacén
     // que la generación, y eso no lo hace menos "resuelto el mismo día".
-    const ocultoMultiUso = usosMismoDia.length > 1 && Math.abs(saldoRestanteSF) < 0.01;
-    const oculto = ocultoMultiUso || (!esCruzado && !!(usoUnico && usoCompleto && diaGen && diaGen === diaUso
+    const ocultoMultiUso = usosMismoDia.length > 1 && saldoRestanteSF > -0.01 && saldoRestanteSF < SOBRANTE_MAX_SF_OCULTO;
+    const oculto = ocultoMultiUso || (!esCruzado && !!(usoUnico && usoOcultable && diaGen && diaGen === diaUso
       && claveCentroGen && claveCentroUso && claveCentroGen === claveCentroUso));
     if (oculto) devsOcultos.add(key);
 
@@ -2127,6 +2137,31 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   const reglaSFExport = (montoUsadoTotal < 0.01 && montoPropio < 50)
     ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
     : reglaSF;
+
+  // Oculto con sobrante (< $50, ver `SOBRANTE_MAX_SF_OCULTO`): lo usado el
+  // mismo día/almacén se oculta (SF-OCULTO) y el sobrante va a "Otros
+  // Ingresos" (SF-MENOR-SIN-USAR) — confirmado con el usuario 2026-09-24,
+  // caso real Ferrocarril 18-sep DEV-057586: $151.15 generado, $151.14
+  // usado, $0.01 sobrante. `generado.monto` ya es el remanente del día
+  // cuando `oculto` (ver `montoAEmitir` en `_prefetchSaldosFavorGenerados`).
+  const sobranteOculto = generado.oculto
+    ? Math.min(Math.max(Math.round((Number(generado.monto) || 0) * 100) / 100, 0), montoPropio)
+    : 0;
+  if (sobranteOculto >= 0.01) {
+    const montoOculto = Math.round((montoPropio - sobranteOculto) * 100) / 100;
+    const subOculto  = Math.round((montoOculto / 1.16) * 100) / 100;
+    const ivaOculto  = Math.round((montoOculto - subOculto) * 100) / 100;
+    const subSobra   = Math.round((subtotal - subOculto) * 100) / 100;
+    const ivaSobra   = Math.round((iva - ivaOculto) * 100) / 100;
+    return [
+      ...(montoOculto >= 0.01 ? [
+        { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO, debe: 0, haber: subOculto },
+        { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO, debe: 0, haber: ivaOculto },
+      ] : []),
+      { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR, debe: 0, haber: subSobra },
+      { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR, debe: 0, haber: ivaSobra },
+    ].filter(l => l.haber > 0);
+  }
 
   return [
     // tipoOrigen='Cobro Sucursal' (NO un tipo propio) — a propósito: solo así
@@ -5041,7 +5076,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // Escondido 1-sep — la Devolución nunca sincronizó, así que solo este
       // camino (no el guard de `_inyectarSaldoFavorGenerado`) la emitía.
       if (generado?.anticipoReferencia) continue;
-      const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
+      // Huérfano oculto: `generado.monto` es el sobrante (< $50) del día → "Otros Ingresos"
+      // (ver `SOBRANTE_MAX_SF_OCULTO`), igual que en `_inyectarSaldoFavorGenerado`.
+      const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR : 'SF';
       const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
       const iva      = Math.round((generado.monto - subtotal) * 100) / 100;
       const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
@@ -6712,7 +6749,9 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       if (!generado?.monto) continue;
       // Ver comentario equivalente en generarPropuesta ("SF GEN-huérfanos").
       if (generado?.anticipoReferencia) continue;
-      const reglaSFG = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
+      // Huérfano oculto: `generado.monto` es el sobrante (< $50) del día → "Otros Ingresos"
+      // (ver `SOBRANTE_MAX_SF_OCULTO`), igual que en `_inyectarSaldoFavorGenerado`.
+      const reglaSFG = generado.oculto ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR : 'SF';
       const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
       const ivaG      = Math.round((generado.monto - subtotalG) * 100) / 100;
       const serieFolioVentaG = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;

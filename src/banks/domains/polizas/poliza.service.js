@@ -573,7 +573,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
 
     let resultado;
     try {
-      resultado = await consultarTransaccionesNetpay({ responseCode: '00', almacenes: clave, dateFrom, dateTo });
+      resultado = await consultarTransaccionesNetpay({ responseCode: '00', almacenes: clave, dateFrom, dateTo, withAccountInfo: true });
     } catch (err) {
       const { logger } = require('../../../shared/utils/logger');
       logger.warn(`[Poliza] NetPay no disponible para ${clave} ${dia}, se omite (Tarjeta sigue en consolidado genérico): ${err.message}`);
@@ -608,8 +608,70 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // matches exactos 1-a-1 y solo después se buscan combinaciones sobre lo
     // que sobra — el grupo queda chico y una combinación nunca se lleva un
     // ticket que era el match exacto de otra transacción.
-    const sinMatchExacto = [];
+    //
+    // Liga EXACTA por ticket (2026-09-24, confirmado con el usuario): con
+    // `withAccountInfo=true` cada transacción trae `cuentas[]` con los tickets
+    // que cubre (`SerieExterna`/`FolioExterno`) — ej. Ferrocarril 21-sep,
+    // F20260921-00190 $1,026.90 → F0-260902050 + F0-260902052. Se ligan TODAS
+    // las líneas Tarjeta de esos tickets (sin adivinar por monto ni límite de
+    // combinaciones). El monto de cada ticket es el de NUESTRA línea (un ticket
+    // pudo pagarse en parte con efectivo; `Total` de Kore es el del ticket
+    // completo). Un ticket pagado con 2+ pasadas: su línea ya trae el total de
+    // tarjeta, así que la 2a pasada solo suma su comisión. Transacciones sin
+    // `cuentas` o cuyos tickets no están en esta póliza caen al match por monto
+    // de abajo (exacto → combinación), igual que antes.
+    const claveTicketDe = (f) => {
+      if (f.serieVentaTicket && f.folioVentaTicket) return `${f.serieVentaTicket}-${f.folioVentaTicket}`;
+      const enConcepto = String(f.concepto || '').match(/([A-Z]\d)-(\d{6,})/g);
+      if (f._cobroOtraSucursal && enConcepto?.length) return enConcepto[enConcepto.length - 1];
+      return null;
+    };
+    const filasPorTicket = new Map(); // ticket → filas
+    for (const f of disponibles) {
+      const k = claveTicketDe(f);
+      if (!k) continue;
+      if (!filasPorTicket.has(k)) filasPorTicket.set(k, []);
+      filasPorTicket.get(k).push(f);
+    }
+    const ticketsYaLigados = new Set();
+    const pendientesPorMonto = [];
     for (const t of transaccionesValidas) {
+      const monto = Number(t.amount) || 0;
+      const comisionTransaccion = Number(t.commission) || 0;
+      const tickets = [...new Set((t.cuentas ?? [])
+        .filter(c => c.SerieExterna && c.FolioExterno)
+        .map(c => `${c.SerieExterna}-${c.FolioExterno}`))];
+      const ticketsEnPoliza = tickets.filter(k => filasPorTicket.has(k) || ticketsYaLigados.has(k));
+      if (!ticketsEnPoliza.length) { pendientesPorMonto.push(t); continue; }
+      const filasTx = [];
+      for (const k of ticketsEnPoliza) {
+        if (!filasPorTicket.has(k)) continue; // ya ligado por otra pasada (mismo ticket)
+        filasTx.push(...filasPorTicket.get(k));
+        filasPorTicket.delete(k);
+        ticketsYaLigados.add(k);
+      }
+      comision += comisionTransaccion;
+      if (!filasTx.length) {
+        // Segunda pasada de un ticket ya ligado: su monto ya está en la línea.
+        detalle.push({ fila: { concepto: ticketsEnPoliza.join(', '), serie: ticketsEnPoliza[0] }, terminalID: t.terminalID, monto: 0,
+          comision: comisionTransaccion, nota: `pasada adicional (${t.folio}, $${monto.toFixed(2)}) de ticket ya ligado` });
+        continue;
+      }
+      const suma = filasTx.reduce((acc, f) => acc + Number(f.debe), 0);
+      gross += suma;
+      const diferencia = Math.round((suma - monto) * 100) / 100;
+      for (const fila of filasTx) {
+        const idxD = disponibles.indexOf(fila);
+        if (idxD !== -1) disponibles.splice(idxD, 1);
+        matchedIds.add(fila.id);
+        const comisionFila = suma > 0 ? Math.round(comisionTransaccion * (Number(fila.debe) / suma) * 100) / 100 : 0;
+        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila,
+          nota: Math.abs(diferencia) > 1 ? `pasada ${t.folio} $${monto.toFixed(2)} vs líneas $${suma.toFixed(2)} (dif ${diferencia.toFixed(2)})` : null });
+      }
+    }
+
+    const sinMatchExacto = [];
+    for (const t of pendientesPorMonto) {
       const monto = Number(t.amount) || 0;
       const comisionTransaccion = Number(t.commission) || 0;
       const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
@@ -4229,7 +4291,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           cfdiSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
-          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}`,
+          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
         });
       }
       // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto

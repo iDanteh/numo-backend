@@ -45,14 +45,14 @@ const PAGE_SIZE_MAX = 100;
 // transacciones, muy por encima de cualquier volumen real esperado en esta vista.
 const MAX_PAGINAS = 50;
 
-async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, terminalID, status }) {
+async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, terminalID, status, withAccountInfo }) {
   const transacciones = [];
   let page = 1;
   let totalPages = 1;
 
   do {
     const { raw } = await buscarTransaccionesNetpay({
-      responseCode, almacenes, dateFrom, dateTo, terminalID, status, page, pageSize: PAGE_SIZE_MAX,
+      responseCode, almacenes, dateFrom, dateTo, terminalID, status, withAccountInfo, page, pageSize: PAGE_SIZE_MAX,
     });
     const data = raw?.Data ?? {};
     transacciones.push(...(data.transactions ?? []));
@@ -68,12 +68,12 @@ async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo
 }
 
 async function consultarTransaccionesNetpay(params = {}) {
-  const { responseCode, almacenes, dateFrom, dateTo, terminalID, status } = params;
+  const { responseCode, almacenes, dateFrom, dateTo, terminalID, status, withAccountInfo } = params;
   // dateFrom/dateTo llegan pelados (YYYY-MM-DD) — se convierten UNA sola vez acá al
   // instante UTC real de inicio/fin de día en hora MX, antes de pedir ninguna página.
   const dateFromMx = dateFrom ? _medianocheMx(dateFrom) : undefined;
   const dateToMx   = dateTo   ? _finDiaMx(dateTo)       : undefined;
-  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom: dateFromMx, dateTo: dateToMx, terminalID, status });
+  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom: dateFromMx, dateTo: dateToMx, terminalID, status, withAccountInfo });
 
   let totalMonto = 0;
   let totalComision = 0;

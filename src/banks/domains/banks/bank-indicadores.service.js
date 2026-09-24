@@ -28,12 +28,14 @@ const BACKLOG_KEY_BY_BOUNDARY = { 0: 'menos24h', 24: 'de1a3d', 72: 'de3a7d', 168
 const BACKLOG_DEFAULT = Object.freeze({ menos24h: 0, de1a3d: 0, de3a7d: 0, mas7d: 0 });
 
 // Horario laboral usado para "horas hábiles" del promedio/mediana de identificación —
-// decisión explícita del usuario (2026-08-17): 8:00-20:00, lunes a SÁBADO (el sábado
-// cuenta como día laboral completo — el usuario dijo "excluye noches y domingos", no
-// "fines de semana"). Domingo completo = 0 horas hábiles sin importar el horario.
-const HORA_INICIO_LABORAL = 8;
-const HORA_FIN_LABORAL    = 20;
-const DIA_DOMINGO         = 0; // Date#getDay()
+// actualizado 2026-09-24 a pedido del usuario: L-V 8:00-20:00, sábado 8:00-15:00 (antes el
+// sábado tenía la misma ventana completa que L-V). Domingo completo = 0 horas hábiles sin
+// importar el horario.
+const HORA_INICIO_LABORAL        = 8;
+const HORA_FIN_LABORAL           = 20;
+const HORA_FIN_LABORAL_SABADO    = 15;
+const DIA_DOMINGO                = 0; // Date#getDay()
+const DIA_SABADO                 = 6; // Date#getDay()
 
 /**
  * Filtro plano banco/categoria compartido por las 3 agregaciones. A diferencia de
@@ -101,13 +103,13 @@ function _hoyMexicoStr() {
 }
 
 /**
- * Horas hábiles entre 2 timestamps: lunes-sábado, 8:00-20:00 EN HORA DE MÉXICO (ver
- * _comoRelojMexico — 2026-09-09, antes usaba hora local del proceso, lo que rompía el cálculo
- * si el contenedor corre en UTC). Domingo completo y las horas fuera de 8-20 en cualquier día
- * NO cuentan. Recorre día por día (acotado: la cantidad de días entre inicio/fin de un caso
- * real de identificación es chica, nunca miles) y suma el solape de cada día con la ventana
- * [inicio, fin] — así una franja que cruza varios días (ej. viernes a la noche → lunes) se
- * reparte bien entre los días que sí cuentan.
+ * Horas hábiles entre 2 timestamps EN HORA DE MÉXICO (ver _comoRelojMexico — 2026-09-09,
+ * antes usaba hora local del proceso, lo que rompía el cálculo si el contenedor corre en
+ * UTC): lunes-viernes 8:00-20:00, sábado 8:00-15:00. Domingo completo y las horas fuera de
+ * la ventana de cada día NO cuentan. Recorre día por día (acotado: la cantidad de días entre
+ * inicio/fin de un caso real de identificación es chica, nunca miles) y suma el solape de
+ * cada día con la ventana [inicio, fin] — así una franja que cruza varios días (ej. viernes
+ * a la noche → lunes) se reparte bien entre los días que sí cuentan.
  *
  * No calculado en el pipeline de Mongo a propósito: esta lógica de calendario (saltar
  * domingos, recortar cada día a su ventana laboral) sería un `$reduce` de agregación
@@ -121,9 +123,11 @@ function horasHabilesEntre(inicio, fin) {
   const finMx    = _comoRelojMexico(fin);
   let cursorMx = new Date(Date.UTC(inicioMx.getUTCFullYear(), inicioMx.getUTCMonth(), inicioMx.getUTCDate()));
   while (cursorMx < finMx) {
-    if (cursorMx.getUTCDay() !== DIA_DOMINGO) {
+    const diaSemana = cursorMx.getUTCDay();
+    if (diaSemana !== DIA_DOMINGO) {
+      const horaFin = diaSemana === DIA_SABADO ? HORA_FIN_LABORAL_SABADO : HORA_FIN_LABORAL;
       const ventanaInicio = new Date(cursorMx); ventanaInicio.setUTCHours(HORA_INICIO_LABORAL, 0, 0, 0);
-      const ventanaFin    = new Date(cursorMx); ventanaFin.setUTCHours(HORA_FIN_LABORAL, 0, 0, 0);
+      const ventanaFin    = new Date(cursorMx); ventanaFin.setUTCHours(horaFin, 0, 0, 0);
       const solapeInicio = ventanaInicio > inicioMx ? ventanaInicio : inicioMx;
       const solapeFin    = ventanaFin    < finMx   ? ventanaFin    : finMx;
       if (solapeFin > solapeInicio) totalMs += solapeFin.getTime() - solapeInicio.getTime();

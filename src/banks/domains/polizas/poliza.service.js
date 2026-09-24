@@ -3776,6 +3776,9 @@ async function exportContpaqXlsx(id, overrides = {}) {
     }
   }
 
+  _conservarAdDeEgresosOcultos(bloques, movimientos);
+  if (poliza.tipo === 'I') await _unificarRenglonesPorDepositoBancario(bloques);
+
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
     // Crédito) y Descuentos y Devoluciones (Contado+Crédito). Cada archivo
@@ -3818,6 +3821,110 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado, netpayInfo);
   return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
+}
+
+/**
+ * Las líneas OPA-REVERSION (Egreso "Aplicación de anticipo") se ocultan del
+ * export desde 2026-09-15 — pero su UUID SÍ debe seguir en las filas 'AD'
+ * (confirmado con el usuario 2026-09-24, caso real Santa Rosa 18-sep póliza
+ * 906, Egreso M0-260900431 / 230311FE). Al ocultar las líneas se perdía
+ * también el 'AD', porque las 'AD' salen de los movimientos que sí se
+ * muestran. Se cuelga el UUID del cierre OPA de su venta (misma `serie`, ver
+ * `emparejarCierreOpaConReversion`); sin cierre visible, del primer
+ * movimiento del primer bloque.
+ */
+function _conservarAdDeEgresosOcultos(bloques, movimientos) {
+  const visibles = new Set(bloques.flatMap(b => b.movs.map(m => m.cfdiUuid)).filter(Boolean));
+  const ocultos = new Map(); // uuid → serie del Egreso
+  for (const m of movimientos) {
+    if (m.reglaNombre !== 'OPA-REVERSION' || !m.cfdiUuid || visibles.has(m.cfdiUuid)) continue;
+    if (!ocultos.has(m.cfdiUuid)) ocultos.set(m.cfdiUuid, m.serie);
+  }
+  if (!ocultos.size) return;
+  const todos = bloques.flatMap(b => b.movs);
+  for (const [uuid, serie] of ocultos) {
+    const destino = todos.find(m => m.reglaNombre === 'OPA' && m.serie === serie) ?? todos[0];
+    if (!destino) continue;
+    destino._cfdiUuidsExtra = [...(destino._cfdiUuidsExtra ?? []), uuid];
+  }
+}
+
+/**
+ * Un depósito bancario = UN renglón en la póliza (confirmado con el usuario
+ * 2026-09-24): columna C el folio/número de autorización, importe el depósito
+ * COMPLETO de Bancos (`BankMovement.deposito`) y en el concepto los serie-folio
+ * de TODOS los tickets ligados a ese depósito — aunque parte de ellos caiga en
+ * otra póliza (otro día/sucursal) o sea un anticipo (OPA), decisión explícita
+ * del usuario aceptando el riesgo de que el mismo depósito aparezca en 2
+ * pólizas.
+ *
+ * Antes un mismo depósito podía salir en varios renglones — uno por ticket en
+ * Crédito/Cobranza (caso real 045901: 5 renglones de $6,036.97 + $515.34 +
+ * $377.85 + $4,205.57 + $969.09 = depósito $12,104.82) — o con solo la porción
+ * de esta póliza (caso real 048471: $1,048.19 de un depósito de $12,870.92
+ * repartido en 3 tickets; 045604: $3,404.24 de $4,191.17, el resto anticipo
+ * OPA-00899).
+ *
+ * Solo BankMovement con status 'identificado': en 'no_identificado' el resto
+ * del depósito aún no está ligado a nadie (ver `montoDeposito` en
+ * `construirBancoRealPorTicket`). Se ignoran folios repetidos entre bancos
+ * (ambiguos). Muta `bloques` en sitio: el renglón unificado se queda donde
+ * aparecía el primero y los demás se quitan de su bloque.
+ */
+async function _unificarRenglonesPorDepositoBancario(bloques) {
+  const esRenglonBanco = m => Number(m.debe) > 0 && !(Number(m.haber) > 0)
+    && /^\d{6}$/.test(m.serie || '') && String(m.cuenta?.codigo || '').startsWith('1102');
+
+  const porFolio = new Map(); // folio → [{ bloque, mov }]
+  for (const bloque of bloques) {
+    for (const mov of bloque.movs) {
+      if (!esRenglonBanco(mov)) continue;
+      if (!porFolio.has(mov.serie)) porFolio.set(mov.serie, []);
+      porFolio.get(mov.serie).push({ bloque, mov });
+    }
+  }
+  if (!porFolio.size) return;
+
+  const movsBanco = await BankMovement.find(
+    { folio: { $in: [...porFolio.keys()] }, isActive: { $ne: false } },
+    { folio: 1, deposito: 1, status: 1, 'erpLinks.serie': 1, 'erpLinks.folioExterno': 1 },
+  ).lean();
+  const bancoPorFolio = new Map();
+  const repetidos = new Set();
+  for (const b of movsBanco) {
+    if (bancoPorFolio.has(b.folio)) repetidos.add(b.folio);
+    bancoPorFolio.set(b.folio, b);
+  }
+
+  const aQuitar = new Set();
+  for (const [folio, ocurrencias] of porFolio) {
+    const banco = bancoPorFolio.get(folio);
+    if (!banco || repetidos.has(folio) || banco.status !== 'identificado' || typeof banco.deposito !== 'number') continue;
+
+    const tickets = [...new Set((banco.erpLinks ?? [])
+      .filter(l => l.serie && l.folioExterno)
+      .map(l => `${l.serie}-${l.folioExterno}`))];
+    const deposito = Math.round(banco.deposito * 100) / 100;
+    const [{ mov: principal }, ...resto] = ocurrencias;
+    const yaCuadra = resto.length === 0 && Math.abs(Number(principal.debe) - deposito) < 0.005;
+    if (yaCuadra && tickets.length <= 1) continue;
+
+    const todos = ocurrencias.map(o => o.mov);
+    principal.debe = deposito;
+    // Con 1 solo ticket se conserva el concepto de siempre ("Cliente / Serie-Folio").
+    if (tickets.length > 1) principal.concepto = tickets.join(', ');
+    principal._detalle = todos.flatMap(m => m._detalle ?? [{
+      cfdiUuid: m.cfdiUuid ?? null, serie: m.serieVentaTicket && m.folioVentaTicket ? `${m.serieVentaTicket}-${m.folioVentaTicket}` : (m.serie || null),
+      monto: Number(m.debe), formaPago: 'TRANSFERENCIA', nota: m.concepto || null,
+    }]);
+    // Conservar los 'AD' de los renglones que se quitan (ver `_construirWorkbookPoliza`).
+    principal._cfdiUuidsExtra = [...new Set([...todos.map(m => m.cfdiUuid), ...todos.flatMap(m => m._cfdiUuidsExtra ?? [])].filter(Boolean))];
+    for (const { mov } of resto) aQuitar.add(mov);
+  }
+
+  if (aQuitar.size) {
+    for (const bloque of bloques) bloque.movs = bloque.movs.filter(m => !aQuitar.has(m));
+  }
 }
 
 /**
@@ -3975,9 +4082,10 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
         }
       }
 
-      if (m.cfdiUuid && !uuidsVistos.has(m.cfdiUuid)) {
-        uuidsVistos.add(m.cfdiUuid);
-        uuidsOrdenados.push(m.cfdiUuid);
+      for (const uuid of [m.cfdiUuid, ...(m._cfdiUuidsExtra ?? [])]) {
+        if (!uuid || uuidsVistos.has(uuid)) continue;
+        uuidsVistos.add(uuid);
+        uuidsOrdenados.push(uuid);
       }
     }
 

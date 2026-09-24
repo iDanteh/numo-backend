@@ -9,6 +9,16 @@ const CollectionRequest = require('./CollectionRequest.model');
 const { movimientosDe } = require('./collection-request-asignaciones');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const { emitToAll } = require('../../shared/socket');
+const { logger } = require('../../shared/utils/logger');
+
+// Fase 2 (2026-09-24) — ver comentario original en _resolverCorrelacion sobre por
+// qué no se anticipó un job de reconciliación desde el día 1: se confirmó con
+// datos reales de Test que el webhook de Kore (POST /erp/anticipos-generados)
+// puede llegar ANTES de que Numo termine su propio identificar() — el caso real
+// tardó ~7.5s en resolverse solo. 24h da margen de sobra para esa carrera sin
+// reprocesar para siempre algo genuinamente huérfano/ambiguo (eso es trabajo de
+// revisión manual desde el historial, no de este job).
+const VENTANA_RECONCILIACION_MS = 24 * 60 * 60 * 1000;
 
 function _toDate(v) {
   if (!v) return null;
@@ -141,4 +151,62 @@ async function listAnticiposGenerados(filters = {}) {
   };
 }
 
-module.exports = { registrarAnticipoGenerado, listAnticiposGenerados, _resolverCorrelacion };
+/** Reconcilia UN documento pendiente — separado de reconciliarAnticiposPendientes()
+ *  para que el try/catch por documento (allá abajo) quede claro y testeable. */
+async function _reconciliarUno(anticipo) {
+  const { cr, motivoSinCorrelacion } = await _resolverCorrelacion(anticipo.origenCuentaIdErp, anticipo.fechaCreacionKore);
+
+  if (cr) {
+    await AnticipoGenerado.updateOne(
+      { _id: anticipo._id },
+      {
+        $set: {
+          solicitudCobroId: cr._id,
+          bankMovementIds: movimientosDe(cr),
+          correlacionAutomatica: true,
+          motivoSinCorrelacion: null,
+        },
+      },
+    );
+    emitToAll('collection-request:anticipo-generado', { anticipoId: String(anticipo._id) });
+    return;
+  }
+
+  // Sigue sin match, pero el motivo pudo haber cambiado de texto (ej. pasó de "no
+  // encontrada" a "ambiguo" porque ahora sí apareció alguna candidata) — se
+  // actualiza para que el historial quede preciso, pero SIN emitir el socket:
+  // nada cambió para quien está mirando la bandeja, sigue sin correlación.
+  if (motivoSinCorrelacion !== anticipo.motivoSinCorrelacion) {
+    await AnticipoGenerado.updateOne({ _id: anticipo._id }, { $set: { motivoSinCorrelacion } });
+  }
+}
+
+/**
+ * Job de respaldo (Fase 2) — reintenta la correlación de los anticipos que
+ * quedaron sin resolver la primera vez, dentro de la ventana de reconciliación.
+ * Corrido por cron cada 5 minutos (ver banks/jobs/anticipoGeneradoReconciliacionCron.js).
+ * Cada documento se procesa AISLADO: un error puntual en uno (ej. Mongo con un
+ * hipo) no debe frenar la reconciliación de los demás del mismo batch.
+ */
+async function reconciliarAnticiposPendientes() {
+  const cutoff = new Date(Date.now() - VENTANA_RECONCILIACION_MS);
+  const pendientes = await AnticipoGenerado.find({
+    correlacionAutomatica: false,
+    solicitudCobroId: null,
+    createdAt: { $gte: cutoff },
+  }).lean();
+
+  for (const anticipo of pendientes) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      await _reconciliarUno(anticipo);
+    } catch (err) {
+      logger.error(`[anticipo-generado] Error reconciliando anticipo ${anticipo._id}: ${err.message}`);
+    }
+  }
+}
+
+module.exports = {
+  registrarAnticipoGenerado, listAnticiposGenerados, reconciliarAnticiposPendientes,
+  _resolverCorrelacion,
+};

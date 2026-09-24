@@ -66,7 +66,7 @@ function mockIdentificadosYCandidatos(identificadosDocs, candidatosDocs) {
     .mockReturnValueOnce({ select: selectCandidatos });
 }
 
-describe('horasHabilesEntre — 8:00-20:00 lunes a sábado, domingo 0 (hora de México)', () => {
+describe('horasHabilesEntre — L-V 8:00-20:00, sábado 8:00-15:00, domingo 0 (hora de México)', () => {
   test('mismo día, dentro de la ventana', () => {
     const h = horasHabilesEntre(mx(2026, 7, 17, 10, 0), mx(2026, 7, 17, 14, 0));
     expect(h).toBe(4);
@@ -82,35 +82,46 @@ describe('horasHabilesEntre — 8:00-20:00 lunes a sábado, domingo 0 (hora de M
     expect(h).toBe(1); // 19:00-20:00, no 19:00-22:00
   });
 
-  test('cruza un sábado completo (2026-08-22): suma sus 12h', () => {
+  test('cruza un sábado completo (2026-08-22): suma sus 7h (8:00-15:00)', () => {
     // Viernes 21 20:00 (fin de ventana, aporta 0) → domingo 23 00:00 (aporta 0) — solo
-    // queda el sábado completo en el medio.
+    // queda el sábado completo en el medio, acotado a 8:00-15:00.
     const h = horasHabilesEntre(mx(2026, 7, 21, 20, 0), mx(2026, 7, 23, 0, 0));
-    expect(h).toBe(12);
+    expect(h).toBe(7);
   });
 
   test('domingo completo (2026-08-23) no suma nada dentro de un tramo mixto', () => {
-    // Sábado 8:00 (12h) + domingo (0h) + lunes 8:00-20:00 (12h) = 24h exactas —
-    // si el domingo sumara algo, el total no daría un número redondo de 24.
+    // Sábado 8:00-15:00 (7h) + domingo (0h) + lunes 8:00-20:00 (12h) = 19h —
+    // si el domingo sumara algo, el total no daría este número.
     const h = horasHabilesEntre(mx(2026, 7, 22, 8, 0), mx(2026, 7, 24, 20, 0));
-    expect(h).toBe(24);
+    expect(h).toBe(19);
   });
 
-  test('viernes 19:00 → lunes 10:00: 1h viernes + 12h sábado + 0h domingo + 2h lunes = 15h', () => {
+  test('viernes 19:00 → lunes 10:00: 1h viernes + 7h sábado + 0h domingo + 2h lunes = 10h', () => {
     const h = horasHabilesEntre(mx(2026, 7, 21, 19, 0), mx(2026, 7, 24, 10, 0));
-    expect(h).toBe(15);
+    expect(h).toBe(10);
   });
 
-  test('span de más de una semana: lunes 8:00 al lunes siguiente 8:00 = 6 días hábiles completos (72h)', () => {
-    // 17(lun) 18(mar) 19(mié) 20(jue) 21(vie) 22(sáb) = 6 días × 12h; 23(dom) = 0h;
-    // 24(lun) aporta 0 porque el tramo termina justo a las 8:00, sin adelantarse a la ventana.
+  test('span de más de una semana: lunes 8:00 al lunes siguiente 8:00 = 67h hábiles', () => {
+    // 17(lun) 18(mar) 19(mié) 20(jue) 21(vie) = 5 días × 12h = 60h; 22(sáb) = 7h (8:00-15:00);
+    // 23(dom) = 0h; 24(lun) aporta 0 porque el tramo termina justo a las 8:00, sin
+    // adelantarse a la ventana. Total: 60 + 7 = 67h.
     const h = horasHabilesEntre(mx(2026, 7, 17, 8, 0), mx(2026, 7, 24, 8, 0));
-    expect(h).toBe(72);
+    expect(h).toBe(67);
   });
 
   test('borde exacto: un día completo 8:00-20:00 da exactamente 12h, sin off-by-one', () => {
     const h = horasHabilesEntre(mx(2026, 7, 17, 8, 0), mx(2026, 7, 17, 20, 0));
     expect(h).toBe(12);
+  });
+
+  test('sábado después de las 15:00 se clampea al fin de su ventana (2026-08-22)', () => {
+    const h = horasHabilesEntre(mx(2026, 7, 22, 14, 0), mx(2026, 7, 22, 19, 0));
+    expect(h).toBe(1); // 14:00-15:00, no 14:00-19:00
+  });
+
+  test('sábado completo 8:00-15:00 da exactamente 7h, sin off-by-one', () => {
+    const h = horasHabilesEntre(mx(2026, 7, 22, 8, 0), mx(2026, 7, 22, 15, 0));
+    expect(h).toBe(7);
   });
 
   test('fin <= inicio devuelve 0 (guard, no lanza)', () => {
@@ -142,7 +153,7 @@ describe('horasHabilesEntre — 8:00-20:00 lunes a sábado, domingo 0 (hora de M
 
 describe('getIndicadoresIdentificacion — promedio y mediana en horas hábiles', () => {
   test('un movimiento identificado durante un fin de semana usa horas hábiles, no de reloj', async () => {
-    // Viernes 21 19:00 → lunes 24 10:00 = 15h hábiles (ver test de horasHabilesEntre) —
+    // Viernes 21 19:00 → lunes 24 10:00 = 10h hábiles (ver test de horasHabilesEntre) —
     // en tiempo de reloj serían ~63h. Si el service todavía calculara en reloj, este test fallaría.
     mockIdentificados([
       { createdAt: mx(2026, 7, 21, 19, 0), primeraIdentificacionAt: mx(2026, 7, 24, 10, 0) },
@@ -151,22 +162,22 @@ describe('getIndicadoresIdentificacion — promedio y mediana en horas hábiles'
 
     const result = await getIndicadoresIdentificacion({});
 
-    expect(result.promedioHoras).toBe(15);
-    expect(result.medianaHoras).toBe(15);
+    expect(result.promedioHoras).toBe(10);
+    expect(result.medianaHoras).toBe(10);
     expect(result.totalIdentificadosConDato).toBe(1);
   });
 
   test('la mediana resiste un outlier que sí infla el promedio', async () => {
-    // 4 movimientos de 2h hábiles + 1 de 72h hábiles (lunes a lunes, ver test de arriba).
+    // 4 movimientos de 2h hábiles + 1 de 67h hábiles (lunes a lunes, ver test de arriba).
     const rapido = () => ({ createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 17, 10, 0) }); // 2h
-    const lento  = { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 24, 8, 0) }; // 72h
+    const lento  = { createdAt: mx(2026, 7, 17, 8, 0), primeraIdentificacionAt: mx(2026, 7, 24, 8, 0) }; // 67h
     mockIdentificados([rapido(), rapido(), rapido(), rapido(), lento]);
     mockBacklog([]);
 
     const result = await getIndicadoresIdentificacion({});
 
-    expect(result.promedioHoras).toBe(16);  // (2+2+2+2+72)/5
-    expect(result.medianaHoras).toBe(2);    // valor central de [2,2,2,2,72]
+    expect(result.promedioHoras).toBe(15);  // (2+2+2+2+67)/5
+    expect(result.medianaHoras).toBe(2);    // valor central de [2,2,2,2,67]
     expect(result.promedioHoras).not.toBe(result.medianaHoras);
   });
 

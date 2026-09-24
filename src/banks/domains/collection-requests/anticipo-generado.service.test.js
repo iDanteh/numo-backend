@@ -10,12 +10,14 @@ jest.mock('./AnticipoGenerado.model');
 jest.mock('./CollectionRequest.model');
 jest.mock('./collection-request-asignaciones', () => ({ movimientosDe: jest.fn() }));
 jest.mock('../../shared/socket', () => ({ emitToAll: jest.fn() }));
+jest.mock('../../shared/utils/logger', () => ({ logger: { error: jest.fn() } }));
 
 const AnticipoGenerado  = require('./AnticipoGenerado.model');
 const CollectionRequest = require('./CollectionRequest.model');
 const { movimientosDe } = require('./collection-request-asignaciones');
 const { emitToAll }     = require('../../shared/socket');
-const { registrarAnticipoGenerado } = require('./anticipo-generado.service');
+const { logger }        = require('../../shared/utils/logger');
+const { registrarAnticipoGenerado, reconciliarAnticiposPendientes } = require('./anticipo-generado.service');
 
 const PAYLOAD_BASE = {
   id: 'kore-anticipo-1',
@@ -146,5 +148,106 @@ describe('registrarAnticipoGenerado — correlación', () => {
     expect(args.solicitudCobroId).toBeNull();
     expect(args.correlacionAutomatica).toBe(false);
     expect(args.motivoSinCorrelacion).toMatch(/ambiguo/i);
+  });
+});
+
+// reconciliarAnticiposPendientes — Fase 2 (2026-09-24): job de respaldo para la
+// carrera de tiempos real (webhook de Kore llega antes que Numo termine su
+// propio identificar()) confirmada con datos de Test. _resolverCorrelacion() se
+// reusa TAL CUAL (ya probada arriba) — acá solo se prueba el reintento sobre
+// AnticipoGenerado y el aislamiento por documento.
+describe('reconciliarAnticiposPendientes', () => {
+  function anticipoPendiente(overrides = {}) {
+    return {
+      _id: 'ant-1',
+      origenCuentaIdErp: PAYLOAD_BASE.origenCuentaId,
+      fechaCreacionKore: new Date('2026-09-10T15:23:10.675Z'),
+      motivoSinCorrelacion: `No se encontró ninguna solicitud de cobro identificada con cxcs.erpId=${PAYLOAD_BASE.origenCuentaId}.`,
+      ...overrides,
+    };
+  }
+
+  function mockPendientesChain(result) {
+    AnticipoGenerado.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(result) });
+  }
+
+  beforeEach(() => {
+    AnticipoGenerado.updateOne.mockResolvedValue({});
+  });
+
+  test('consulta con correlacionAutomatica:false, solicitudCobroId:null y createdAt >= ahora-24h', async () => {
+    mockPendientesChain([]);
+    const antesMs = Date.now();
+
+    await reconciliarAnticiposPendientes();
+
+    const filtro = AnticipoGenerado.find.mock.calls[0][0];
+    expect(filtro.correlacionAutomatica).toBe(false);
+    expect(filtro.solicitudCobroId).toBeNull();
+    const cutoffEsperado = antesMs - 24 * 60 * 60 * 1000;
+    expect(Math.abs(filtro.createdAt.$gte.getTime() - cutoffEsperado)).toBeLessThan(1000);
+  });
+
+  test('ahora SÍ encuentra match: actualiza el documento (solicitud, movimientos, correlacionAutomatica) y emite el socket', async () => {
+    mockPendientesChain([anticipoPendiente()]);
+    mockFindChain([fakeCR()]);
+    movimientosDe.mockReturnValue(['mov-1']);
+
+    await reconciliarAnticiposPendientes();
+
+    expect(AnticipoGenerado.updateOne).toHaveBeenCalledWith(
+      { _id: 'ant-1' },
+      { $set: { solicitudCobroId: 'cr-1', bankMovementIds: ['mov-1'], correlacionAutomatica: true, motivoSinCorrelacion: null } },
+    );
+    expect(emitToAll).toHaveBeenCalledWith('collection-request:anticipo-generado', { anticipoId: 'ant-1' });
+  });
+
+  test('sigue sin match (mismo motivo): no toca el documento ni emite', async () => {
+    mockPendientesChain([anticipoPendiente()]);
+    mockFindChain([]); // 0 candidatas -> mismo texto de motivo que ya tenía guardado
+
+    await reconciliarAnticiposPendientes();
+
+    expect(AnticipoGenerado.updateOne).not.toHaveBeenCalled();
+    expect(emitToAll).not.toHaveBeenCalled();
+  });
+
+  test('el motivo cambia de "no encontrada" a "ambiguo": actualiza SOLO motivoSinCorrelacion, sin emitir', async () => {
+    mockPendientesChain([anticipoPendiente()]); // motivo guardado: "No se encontró..."
+    const c1 = fakeCR({ _id: 'cr-1', resueltoAt: '2026-09-10T16:00:00.000Z' });
+    const c2 = fakeCR({ _id: 'cr-2', resueltoAt: '2026-09-10T17:00:00.000Z' });
+    mockFindChain([c2, c1]); // 2 candidatas, ambas posteriores al anticipo -> ambiguo
+
+    await reconciliarAnticiposPendientes();
+
+    expect(AnticipoGenerado.updateOne).toHaveBeenCalledWith(
+      { _id: 'ant-1' },
+      { $set: { motivoSinCorrelacion: expect.stringMatching(/ambiguo/i) } },
+    );
+    expect(emitToAll).not.toHaveBeenCalled();
+  });
+
+  test('un documento que falla no frena el procesamiento de los demás del mismo batch', async () => {
+    mockPendientesChain([anticipoPendiente({ _id: 'ant-1' }), anticipoPendiente({ _id: 'ant-2' })]);
+    movimientosDe.mockReturnValue(['mov-x']);
+
+    let llamada = 0;
+    CollectionRequest.find.mockImplementation(() => {
+      llamada += 1;
+      if (llamada === 1) {
+        return { sort: jest.fn().mockReturnThis(), lean: jest.fn().mockRejectedValue(new Error('Mongo caído')) };
+      }
+      return { sort: jest.fn().mockReturnThis(), lean: jest.fn().mockResolvedValue([fakeCR({ _id: 'cr-2' })]) };
+    });
+
+    await expect(reconciliarAnticiposPendientes()).resolves.not.toThrow();
+
+    expect(AnticipoGenerado.updateOne).toHaveBeenCalledTimes(1);
+    expect(AnticipoGenerado.updateOne).toHaveBeenCalledWith(
+      { _id: 'ant-2' },
+      expect.objectContaining({ $set: expect.objectContaining({ solicitudCobroId: 'cr-2' }) }),
+    );
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0]).toContain('ant-1');
   });
 });

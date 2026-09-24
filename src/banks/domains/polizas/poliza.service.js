@@ -2275,7 +2275,9 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
         debe:        neto > 0 ? neto : 0,
         haber:       neto < 0 ? Math.abs(neto) : 0,
         cfdiUuid:    null,
-        _subcodigo:  0,
+        // Efectivo lleva el subcódigo de Contado (21, columna F) — confirmado
+        // con el usuario 2026-09-24. Los demás consolidados siguen en 0.
+        _subcodigo:  g.label === 'EFECTIVO' ? subcodigoTransferencia : 0,
         _detalle:    g.detalle,
         _esTransferencia: false,
         _esResto:    true,

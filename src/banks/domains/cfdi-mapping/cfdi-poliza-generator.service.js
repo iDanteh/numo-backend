@@ -5140,7 +5140,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       if ((Number(generado.monto) || 0) >= 0.01) {
         movimientosResult.push({ ...base, cuentaId: cuentaSaldoFavorIdProp,    haber: subtotal });
         movimientosResult.push({ ...base, cuentaId: cuentaIvaSaldoFavorIdProp, haber: iva     });
-      }
+      }
       // Generación sin CFDI oculta (generada y usada el mismo día/almacén):
       // lo USADO también se registra, como SF-OCULTO, para que la generación
       // completa aparezca en "Movimientos de Saldos a Favor" (confirmado con el
@@ -6842,7 +6842,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       if ((Number(generado.monto) || 0) >= 0.01) {
         todosLosMovimientos.push({ ...baseG, cuentaId: cuentaSaldoFavorIdGuard,    haber: subtotalG });
         todosLosMovimientos.push({ ...baseG, cuentaId: cuentaIvaSaldoFavorIdGuard, haber: ivaG     });
-      }
+      }
       // Generación sin CFDI oculta (generada y usada el mismo día/almacén):
       // lo USADO también se registra, como SF-OCULTO, para que la generación
       // completa aparezca en "Movimientos de Saldos a Favor" (confirmado con el

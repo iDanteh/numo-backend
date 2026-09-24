@@ -2363,10 +2363,15 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
 
   // NetPay: depósito neto + comisión por cada centro con ventas Tarjeta
   // matcheadas (ver `construirNetpayInfo`/`_lineasNetpay`) — un bloque de 7
-  // líneas fijas por centro, agregado al final del consolidado.
+  // líneas fijas por centro, agregado al final del consolidado. Va APARTE de
+  // `depositosIdentificados` y sin pasar por `porSerieFolio`: ese orden por
+  // columna C ponía las 6 líneas "COMISION" antes de la de "NETPAY" (orden
+  // alfabético) — el depósito NetPay va primero y después sus comisiones, tal
+  // cual la plantilla de `_lineasNetpay` (confirmado con el usuario 2026-09-24).
+  const lineasNetpay = [];
   if (netpayInfo?.porCentro?.size) {
     for (const infoCentro of netpayInfo.porCentro.values()) {
-      depositosIdentificados.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision));
+      lineasNetpay.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision));
     }
   }
 
@@ -2383,7 +2388,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
     },
     anticipos: porSerieFolio(anticipos),
     consolidados,
-    depositosIdentificados: porSerieFolio(depositosIdentificados),
+    depositosIdentificados: [...porSerieFolio(depositosIdentificados), ...lineasNetpay],
   };
 }
 

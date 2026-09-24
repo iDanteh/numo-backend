@@ -485,11 +485,27 @@ function _buscarCombinacionQueSuma(indices, disponibles, monto) {
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
-  const candidatos = (movimientos ?? []).filter(m =>
-    m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
-    && LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA'
-    && m.centroCostoObj?.serieFacturacion && m.centroCostoObj?.id,
-  );
+  const esTarjetaConCentro = m => LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA'
+    && m.centroCostoObj?.serieFacturacion && m.centroCostoObj?.id;
+  const ventasTarjeta = (movimientos ?? []).filter(m =>
+    m.tipoOrigen === 'Venta' && Number(m.debe) > 0 && !(Number(m.haber) > 0) && esTarjetaConCentro(m));
+  // Tarjeta de una venta de OTRA sucursal cobrada en la terminal de ESTA
+  // (lado cobrador del "Cobro de otra sucursal": Abono con `haber>0`, mismo
+  // criterio que `filasTarjetaCobroSucursal` en `_extraerCobrosSucursal`) —
+  // el dinero sí pasó por la terminal NetPay de esta sucursal (confirmado con
+  // el usuario 2026-09-24, caso real Ferrocarril 18-sep: B0-260904776
+  // $16,869.05 + C0-260903510 $8,023.99 quedaban fuera, NetPay solo ligaba
+  // $9,000.25 de $33,893.29). Se excluye el Abono pareado con un Cargo
+  // 'Venta' (`_ventaCargoKeys` en `_extraerCobrosSucursal`) porque ese Cargo
+  // ya es candidato arriba. Se normaliza a un Cargo (`debe` = monto) solo
+  // para el match; `id` se conserva para `matchedIds`.
+  const ventaCargoKeys = new Set(ventasTarjeta.map(m => `${m.concepto || ''}|${Number(m.debe).toFixed(2)}`));
+  const cobrosOtraSucursalTarjeta = (movimientos ?? [])
+    .filter(m => m.tipoOrigen === 'Cobro Sucursal' && Number(m.haber) > 0 && !(Number(m.debe) > 0)
+      && esTarjetaConCentro(m)
+      && !ventaCargoKeys.has(`${(m.concepto || '').replace(/ \(cruce sucursal\)$/, '')}|${Number(m.haber).toFixed(2)}`))
+    .map(m => ({ ...(m.get ? m.get({ plain: true }) : m), id: m.id, debe: Number(m.haber), haber: 0, _cobroOtraSucursal: true }));
+  const candidatos = [...ventasTarjeta, ...cobrosOtraSucursalTarjeta];
   if (!candidatos.length) return vacio;
 
   const porCentroClave = new Map(); // serieFacturacion ("M0") -> { centroCostoObj, filas: [...] }
@@ -2254,7 +2270,8 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // real quedaba fuera del total que lee CONTPAQ (ni como cargo ni como
       // abono). Se voltea a Abono con el valor absoluto para que el importe
       // sí llegue al archivo (confirmado con el usuario 2026-09-03).
-      const neto = Number(g.debe) || 0;
+      // Redondeado a centavos: la suma de muchas líneas deja residuos de punto flotante (ej. 3243.7799999999997).
+      const neto = Math.round((Number(g.debe) || 0) * 100) / 100;
       // Confirmado con el usuario 2026-09-10: "Depósitos consolidados
       // (Efectivo)"/"(Tarjeta)" van SIEMPRE a la cuenta bancaria real
       // (1102011001, BBVA), para todas las sucursales — default fijo por
@@ -2641,7 +2658,7 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
-function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null) {
+function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, netpayMatchedIds = null) {
   const resto = [];
   const filas = [];
   // SF-OCULTO: generados y usados el mismo día en la misma sucursal — no van
@@ -2913,6 +2930,10 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null) {
       // este caso es el nombre completo de la regla fiscal, no una forma de
       // pago, ej. "Reg 1C — Venta PUE Cheque 16%" — mostrarlo confundiría más).
       _esVentaSinCobro: m.tipoOrigen === 'Venta Sin Cobro',
+      // Ya ligado a una transacción NetPay (ver `cobrosOtraSucursalTarjeta` en
+      // `construirNetpayInfo`): su dinero ya va en la línea NETPAY, no debe
+      // sumarse también a "Depósitos consolidados (Tarjeta)".
+      _netpayLigado: !!(netpayMatchedIds && m.id != null && netpayMatchedIds.has(m.id)),
     });
   }
   // Primero por categoría de forma de pago (Efectivo → Transferencia → SF →
@@ -2989,7 +3010,7 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null) {
   // cuenta) — también excluye de paso al par 'Venta'+'Cobro Sucursal' de
   // arriba (esa fila siempre trae `haber: 0` hardcodeado).
   const filasTarjetaCobroSucursal = filas
-    .filter(f => !f._esVentaSinCobro && !f._cargoVentaYaEnConsolidado && Number(f.haber) > 0 && (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA'))
+    .filter(f => !f._esVentaSinCobro && !f._cargoVentaYaEnConsolidado && !f._netpayLigado && Number(f.haber) > 0 && (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA'))
     .map(f => ({ concepto: f.concepto, monto: Number(f.haber) }));
 
   // `_referenciaBancoReal` a veces NO es un folio bancario real distinguible
@@ -3025,6 +3046,7 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null) {
     delete f._esPendientePropio;
     delete f._esVentaSinCobro;
     delete f._cargoVentaYaEnConsolidado;
+    delete f._netpayLigado;
   }
   // Agregar los SF-OCULTO (mismo día + misma sucursal) a la hoja "Otros Ingresos" —
   // nunca suman a depósitos consolidados de efectivo/tarjeta.
@@ -3569,6 +3591,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
   const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(
     movimientos,
     await AccountPlan.findOne({ where: { codigo: '1101010003' }, attributes: ['id', 'codigo', 'nombre'], raw: true }),
+    netpayInfo.matchedIds,
   );
   movimientos = movimientosSinCobroSucursal;
 
@@ -4138,13 +4161,16 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
         desgloseConsolidado.push({
           cuenta:        null,
           centroCosto,
-          tipo:          'Venta',
+          // Cobro de otra sucursal en la terminal de esta (ver
+          // `cobrosOtraSucursalTarjeta` en `construirNetpayInfo`) — se marca
+          // aparte en el desglose (confirmado con el usuario 2026-09-24).
+          tipo:          fila._cobroOtraSucursal ? 'Cobro de otra sucursal' : 'Venta',
           transferencia: 'No',
           formaPago:     'NETPAY',
           cfdiSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
-          nota:          `Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}`,
+          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}`,
         });
       }
       // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto

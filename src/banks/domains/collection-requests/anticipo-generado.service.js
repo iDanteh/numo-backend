@@ -6,10 +6,22 @@
 
 const AnticipoGenerado  = require('./AnticipoGenerado.model');
 const CollectionRequest = require('./CollectionRequest.model');
+const BankMovement      = require('../banks/BankMovement.model');
+const bankService       = require('../banks/bank.service'); // setErpIds — mismo mecanismo que usa el panel de cobros
 const { movimientosDe } = require('./collection-request-asignaciones');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const { emitToAll } = require('../../shared/socket');
 const { logger } = require('../../shared/utils/logger');
+
+// Usuario sintético para las escrituras automáticas de _vincularAnticipoAlDeposito
+// — no hay un humano detrás de este flujo (webhook de Kore / job de
+// reconciliación). setErpIds() SÍ exige un `user` real con permiso
+// banks:erp:link/banks:cobro (a diferencia del motor de autorizaciones
+// automáticas, bank-autorizaciones.service.js, que escribe el movimiento directo
+// sin pasar por setErpIds y por eso no lo necesita). role:'admin' resuelve el
+// permiso vía el wildcard '*' ya sembrado en Postgres, sin tener que replicar
+// esa lógica acá.
+const USUARIO_MOTOR_ANTICIPO = Object.freeze({ _id: 'motor-anticipo', role: 'admin', nombre: 'Motor de Anticipos (automático)' });
 
 // Fase 2 (2026-09-24) — ver comentario original en _resolverCorrelacion sobre por
 // qué no se anticipó un job de reconciliación desde el día 1: se confirmó con
@@ -65,6 +77,58 @@ async function _resolverCorrelacion(origenCuentaId, fechaCreacionAnticipo) {
   };
 }
 
+/**
+ * Vincula el anticipo a CADA movimiento bancario de la solicitud correlacionada
+ * — agrega un erpLink nuevo, ADITIVO (preserva todos los demás que el movimiento
+ * ya tenía; setErpIds() reemplaza el arreglo completo, así que el resultado final
+ * se arma acá, no ahí). Mismo shape que confirmErp() (erp-modal.component.ts) — no
+ * se inventan campos nuevos. Reusa aplicarLogicaErp()/setErpIds() ya existentes,
+ * cero cálculo nuevo: el mismo camino que ya usa un humano vinculando a mano
+ * desde el modal ERP.
+ *
+ * Aislado por movimiento (una solicitud puede tener 2+ vía multi-bank-movement)
+ * Y no relanza — un fallo acá (ej. Mongo con un hipo) nunca debe hacer perder la
+ * trazabilidad del propio AnticipoGenerado, que el caller ya guardó/actualizó con
+ * correlacionAutomatica:true antes de llamar a esto.
+ */
+async function _vincularAnticipoAlDeposito(anticipo, cr) {
+  const erpLinkAnticipo = {
+    erpId:               anticipo.anticipoIdErp,
+    saldoActual:         anticipo.monto,
+    saldoPagado:         null,
+    // Fijo al monto que ESTE depósito aportó — no el saldoActual "vivo" que Kore
+    // reportaría después si el anticipo se consume en una compra futura; ese
+    // consumo es una operación DISTINTA que no debe alterar retroactivamente lo
+    // que ya se identificó acá.
+    saldoPagadoTotal:    anticipo.monto,
+    folioFiscal:         null,
+    total:               anticipo.monto,
+    serie:               anticipo.anticipoSerieExterna,
+    folioExterno:        anticipo.anticipoFolioExterno,
+    tipoPago:            null,
+    desglosePorFormaPago: [],
+    origen:              'anticipo',
+  };
+
+  for (const movId of movimientosDe(cr)) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const mov = await BankMovement.findById(movId).select('erpLinks').lean();
+      if (!mov) continue; // no debería pasar, pero un movimiento borrado no debe tumbar el resto
+
+      // Upsert por erpId — reemplaza la entrada si ya existía (reintento desde
+      // la reconciliación), preserva TODAS las demás tal cual.
+      const existentes = (mov.erpLinks || []).filter(l => l.erpId !== erpLinkAnticipo.erpId);
+      const erpLinksFinales = [...existentes, erpLinkAnticipo];
+
+      // eslint-disable-next-line no-await-in-loop
+      await bankService.setErpIds(movId, erpLinksFinales, USUARIO_MOTOR_ANTICIPO);
+    } catch (err) {
+      logger.error(`[anticipo-generado] Error vinculando erpLink del anticipo ${anticipo.anticipoIdErp} al movimiento ${movId}: ${err.message}`);
+    }
+  }
+}
+
 async function registrarAnticipoGenerado(payload) {
   const anticipoIdErp = payload?.id != null ? String(payload.id).trim() : '';
   if (!anticipoIdErp) throw new BadRequestError('id (Cuenta.id del anticipo en Kore) es requerido');
@@ -113,6 +177,10 @@ async function registrarAnticipoGenerado(payload) {
     }
     throw err;
   }
+
+  // No relanza (ver comentario del helper) — un fallo acá no debe impedir que
+  // este mismo registro ya se haya guardado con correlacionAutomatica:true.
+  if (cr) await _vincularAnticipoAlDeposito(doc, cr);
 
   const safe = doc.toObject();
   emitToAll('collection-request:anticipo-generado', { anticipoId: String(doc._id) });
@@ -168,6 +236,9 @@ async function _reconciliarUno(anticipo) {
         },
       },
     );
+    // No relanza (ver comentario del helper) — un fallo acá no debe impedir que
+    // este AnticipoGenerado ya haya quedado correlacionado.
+    await _vincularAnticipoAlDeposito(anticipo, cr);
     emitToAll('collection-request:anticipo-generado', { anticipoId: String(anticipo._id) });
     return;
   }
@@ -208,5 +279,5 @@ async function reconciliarAnticiposPendientes() {
 
 module.exports = {
   registrarAnticipoGenerado, listAnticiposGenerados, reconciliarAnticiposPendientes,
-  _resolverCorrelacion,
+  _resolverCorrelacion, _vincularAnticipoAlDeposito,
 };

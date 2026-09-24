@@ -8,16 +8,31 @@
 
 jest.mock('./AnticipoGenerado.model');
 jest.mock('./CollectionRequest.model');
+jest.mock('../banks/BankMovement.model');
+jest.mock('../banks/bank.service', () => ({ setErpIds: jest.fn() }));
 jest.mock('./collection-request-asignaciones', () => ({ movimientosDe: jest.fn() }));
 jest.mock('../../shared/socket', () => ({ emitToAll: jest.fn() }));
 jest.mock('../../shared/utils/logger', () => ({ logger: { error: jest.fn() } }));
 
 const AnticipoGenerado  = require('./AnticipoGenerado.model');
 const CollectionRequest = require('./CollectionRequest.model');
+const BankMovement      = require('../banks/BankMovement.model');
+const bankService       = require('../banks/bank.service');
 const { movimientosDe } = require('./collection-request-asignaciones');
 const { emitToAll }     = require('../../shared/socket');
 const { logger }        = require('../../shared/utils/logger');
-const { registrarAnticipoGenerado, reconciliarAnticiposPendientes } = require('./anticipo-generado.service');
+const {
+  registrarAnticipoGenerado, reconciliarAnticiposPendientes, _vincularAnticipoAlDeposito,
+} = require('./anticipo-generado.service');
+
+// Cadena por default (mov sin ningún erpLink previo) — los tests que necesiten
+// preservar entradas existentes la pisan explícitamente con su propio mock.
+function mockBankMovementFindById(erpLinksExistentes = []) {
+  BankMovement.findById.mockReturnValue({
+    select: jest.fn().mockReturnThis(),
+    lean: jest.fn().mockResolvedValue({ erpLinks: erpLinksExistentes }),
+  });
+}
 
 const PAYLOAD_BASE = {
   id: 'kore-anticipo-1',
@@ -44,6 +59,8 @@ beforeEach(() => {
   jest.clearAllMocks();
   AnticipoGenerado.findOne.mockResolvedValue(null);
   movimientosDe.mockReturnValue(['mov-1']);
+  mockBankMovementFindById([]); // sin erpLinks previos por default
+  bankService.setErpIds.mockResolvedValue({});
 });
 
 describe('registrarAnticipoGenerado — validación de campos', () => {
@@ -106,6 +123,43 @@ describe('registrarAnticipoGenerado — correlación', () => {
     expect(emitToAll).toHaveBeenCalledWith('collection-request:anticipo-generado', { anticipoId: 'a1' });
   });
 
+  test('correlación exitosa también vincula el erpLink del anticipo en el/los BankMovement (bankService.setErpIds)', async () => {
+    mockFindChain([fakeCR()]);
+    movimientosDe.mockReturnValue(['mov-1']);
+    mockBankMovementFindById([{ erpId: 'CXC-ORIGINAL', total: 1000 }]); // link de la CxC ya presente
+    const creado = {
+      _id: 'a1', anticipoIdErp: PAYLOAD_BASE.id, monto: PAYLOAD_BASE.total,
+      anticipoSerieExterna: PAYLOAD_BASE.serieExterna, anticipoFolioExterno: PAYLOAD_BASE.folioExterno,
+      toObject: () => ({ _id: 'a1', correlacionAutomatica: true }),
+    };
+    AnticipoGenerado.create.mockResolvedValue(creado);
+
+    await registrarAnticipoGenerado(PAYLOAD_BASE);
+
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(1);
+    const [movId, erpLinksFinales] = bankService.setErpIds.mock.calls[0];
+    expect(movId).toBe('mov-1');
+    expect(erpLinksFinales).toContainEqual({ erpId: 'CXC-ORIGINAL', total: 1000 }); // NO se tocó
+    expect(erpLinksFinales.find(l => l.erpId === PAYLOAD_BASE.id)).toMatchObject({
+      saldoActual: PAYLOAD_BASE.total, saldoPagadoTotal: PAYLOAD_BASE.total, origen: 'anticipo',
+    });
+  });
+
+  test('un fallo al vincular el erpLink NO impide que el AnticipoGenerado quede creado con correlacionAutomatica:true', async () => {
+    mockFindChain([fakeCR()]);
+    bankService.setErpIds.mockRejectedValue(new Error('Mongo caído'));
+    const creado = {
+      _id: 'a1', anticipoIdErp: PAYLOAD_BASE.id, monto: PAYLOAD_BASE.total,
+      toObject: () => ({ _id: 'a1', correlacionAutomatica: true }),
+    };
+    AnticipoGenerado.create.mockResolvedValue(creado);
+
+    const resultado = await registrarAnticipoGenerado(PAYLOAD_BASE);
+
+    expect(resultado.correlacionAutomatica).toBe(true);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
   test('0 candidatas -> correlacionAutomatica:false, motivoSinCorrelacion descriptivo, sin bankMovementIds', async () => {
     mockFindChain([]);
     const creado = { _id: 'a1', toObject: () => ({ _id: 'a1' }) };
@@ -160,6 +214,10 @@ describe('reconciliarAnticiposPendientes', () => {
   function anticipoPendiente(overrides = {}) {
     return {
       _id: 'ant-1',
+      anticipoIdErp: 'kore-anticipo-pend-1',
+      monto: 250,
+      anticipoSerieExterna: 'OPA',
+      anticipoFolioExterno: '00370',
       origenCuentaIdErp: PAYLOAD_BASE.origenCuentaId,
       fechaCreacionKore: new Date('2026-09-10T15:23:10.675Z'),
       motivoSinCorrelacion: `No se encontró ninguna solicitud de cobro identificada con cxcs.erpId=${PAYLOAD_BASE.origenCuentaId}.`,
@@ -200,6 +258,22 @@ describe('reconciliarAnticiposPendientes', () => {
       { $set: { solicitudCobroId: 'cr-1', bankMovementIds: ['mov-1'], correlacionAutomatica: true, motivoSinCorrelacion: null } },
     );
     expect(emitToAll).toHaveBeenCalledWith('collection-request:anticipo-generado', { anticipoId: 'ant-1' });
+  });
+
+  test('ahora SÍ encuentra match: también vincula el erpLink del anticipo en el/los BankMovement (bankService.setErpIds)', async () => {
+    mockPendientesChain([anticipoPendiente()]);
+    mockFindChain([fakeCR()]);
+    movimientosDe.mockReturnValue(['mov-1']);
+    mockBankMovementFindById([{ erpId: 'CXC-ORIGINAL', total: 1000 }]);
+
+    await reconciliarAnticiposPendientes();
+
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(1);
+    const erpLinksFinales = bankService.setErpIds.mock.calls[0][1];
+    expect(erpLinksFinales).toContainEqual({ erpId: 'CXC-ORIGINAL', total: 1000 }); // link de la CxC, intacto
+    expect(erpLinksFinales.find(l => l.erpId === 'kore-anticipo-pend-1')).toMatchObject({
+      saldoActual: 250, saldoPagadoTotal: 250, total: 250, origen: 'anticipo',
+    });
   });
 
   test('sigue sin match (mismo motivo): no toca el documento ni emite', async () => {
@@ -249,5 +323,102 @@ describe('reconciliarAnticiposPendientes', () => {
     );
     expect(logger.error).toHaveBeenCalledTimes(1);
     expect(logger.error.mock.calls[0][0]).toContain('ant-1');
+  });
+});
+
+// _vincularAnticipoAlDeposito — helper compartido (2026-09-24): agrega un erpLink
+// automático al depósito bancario cuando un anticipo se correlaciona (recién
+// registrado o vía reconciliación), reusando setErpIds()/aplicarLogicaErp() ya
+// existentes. Mismo camino que un humano vinculando a mano desde el modal ERP.
+describe('_vincularAnticipoAlDeposito', () => {
+  function anticipoDoc(overrides = {}) {
+    return {
+      anticipoIdErp: 'kore-anticipo-1',
+      anticipoSerieExterna: 'OPA',
+      anticipoFolioExterno: '00362',
+      monto: 536.17,
+      ...overrides,
+    };
+  }
+
+  test('agrega el erpLink del anticipo SIN tocar el link de la CxC ya existente', async () => {
+    movimientosDe.mockReturnValue(['mov-1']);
+    mockBankMovementFindById([{ erpId: 'CXC-ORIGINAL', total: 1000 }]);
+
+    await _vincularAnticipoAlDeposito(anticipoDoc(), fakeCR());
+
+    expect(BankMovement.findById).toHaveBeenCalledWith('mov-1');
+    const [movId, erpLinksFinales, user] = bankService.setErpIds.mock.calls[0];
+    expect(movId).toBe('mov-1');
+    expect(erpLinksFinales).toHaveLength(2);
+    expect(erpLinksFinales[0]).toEqual({ erpId: 'CXC-ORIGINAL', total: 1000 }); // preservado byte a byte
+    expect(erpLinksFinales[1]).toEqual({
+      erpId: 'kore-anticipo-1',
+      saldoActual: 536.17,
+      saldoPagado: null,
+      saldoPagadoTotal: 536.17,
+      folioFiscal: null,
+      total: 536.17,
+      serie: 'OPA',
+      folioExterno: '00362',
+      tipoPago: null,
+      desglosePorFormaPago: [],
+      origen: 'anticipo',
+    });
+    expect(user).toMatchObject({ role: 'admin' }); // resuelve el permiso de setErpIds vía el wildcard
+  });
+
+  test('upsert por erpId: llamarlo de nuevo para el MISMO anticipo reemplaza la entrada, no la duplica', async () => {
+    movimientosDe.mockReturnValue(['mov-1']);
+    mockBankMovementFindById([
+      { erpId: 'CXC-ORIGINAL', total: 1000 },
+      { erpId: 'kore-anticipo-1', total: 999, saldoActual: 999 }, // entrada vieja del mismo anticipo
+    ]);
+
+    await _vincularAnticipoAlDeposito(anticipoDoc(), fakeCR());
+
+    const erpLinksFinales = bankService.setErpIds.mock.calls[0][1];
+    const delAnticipo = erpLinksFinales.filter(l => l.erpId === 'kore-anticipo-1');
+    expect(delAnticipo).toHaveLength(1); // no duplicó
+    expect(delAnticipo[0].saldoActual).toBe(536.17); // ganó la versión nueva, no la vieja (999)
+    expect(erpLinksFinales.some(l => l.erpId === 'CXC-ORIGINAL')).toBe(true); // preservado
+  });
+
+  test('multi-bank-movement: vincula el erpLink en CADA movimiento de la solicitud', async () => {
+    movimientosDe.mockReturnValue(['mov-1', 'mov-2']);
+    mockBankMovementFindById([]);
+
+    await _vincularAnticipoAlDeposito(anticipoDoc(), fakeCR());
+
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(2);
+    expect(bankService.setErpIds.mock.calls[0][0]).toBe('mov-1');
+    expect(bankService.setErpIds.mock.calls[1][0]).toBe('mov-2');
+  });
+
+  test('un fallo en setErpIds se loguea y NO propaga', async () => {
+    movimientosDe.mockReturnValue(['mov-1']);
+    bankService.setErpIds.mockRejectedValue(new Error('Mongo caído'));
+
+    await expect(_vincularAnticipoAlDeposito(anticipoDoc(), fakeCR())).resolves.not.toThrow();
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0]).toContain('kore-anticipo-1');
+  });
+
+  test('un movimiento roto (findById falla) no impide vincular los demás del mismo anticipo', async () => {
+    movimientosDe.mockReturnValue(['mov-1', 'mov-2']);
+    let llamada = 0;
+    BankMovement.findById.mockImplementation(() => {
+      llamada += 1;
+      if (llamada === 1) {
+        return { select: jest.fn().mockReturnThis(), lean: jest.fn().mockRejectedValue(new Error('boom')) };
+      }
+      return { select: jest.fn().mockReturnThis(), lean: jest.fn().mockResolvedValue({ erpLinks: [] }) };
+    });
+
+    await _vincularAnticipoAlDeposito(anticipoDoc(), fakeCR());
+
+    expect(bankService.setErpIds).toHaveBeenCalledTimes(1);
+    expect(bankService.setErpIds.mock.calls[0][0]).toBe('mov-2');
+    expect(logger.error).toHaveBeenCalledTimes(1);
   });
 });

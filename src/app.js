@@ -8,10 +8,10 @@ const morgan      = require('morgan');
 const compression = require('compression');
 const rateLimit   = require('express-rate-limit');
 const socketMgr   = require('./banks/shared/socket');
+const { trafficTracker } = require('./system-monitor/traffic-tracker.middleware');
 
-const mongoose         = require('mongoose');
-const { sequelize }    = require('./config/database.postgres');
 const { connectDB, disconnectDB } = require('./config/database');
+const { checkMongoOk, checkPostgresOk } = require('./shared/utils/db-health');
 const seed             = require('./banks/scripts/seed');
 const { logger }   = require('./shared/utils/logger');
 const errorHandler = require('./shared/middleware/error-handler');
@@ -30,6 +30,7 @@ const polizaRoutes            = require('./banks/domains/polizas/poliza.routes')
 const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mapping.routes');
 const notificacionRoutes      = require('./banks/domains/notificaciones/notificacion.routes');
 const configRoutes            = require('./shared/routes/config.routes');
+const systemMonitorRoutes     = require('./system-monitor/system-monitor.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -49,6 +50,12 @@ const app = express();
 // Confiar en el proxy inverso (nginx) para leer X-Forwarded-For correctamente.
 // Sin esto, express-rate-limit lanza ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 app.set('trust proxy', 1);
+
+// Tracker de tráfico (panel de Tráfico del Sistema, admin-only) — montado ANTES que
+// helmet/cors/rate-limit a propósito: así también cuenta las requests que el
+// rate-limiter corta con 429, que son justo la señal más importante en un pico de
+// problemas. No depende de body parsing, así que puede ir primero sin riesgo.
+app.use(trafficTracker);
 
 // ── Security ──────────────────────────────────────────────────────────────────
 app.use(helmet());
@@ -92,15 +99,8 @@ app.use(morgan('combined', {
 // Verifica el estado real de las conexiones a MongoDB y PostgreSQL.
 // Docker usa este endpoint para marcar el contenedor como healthy/unhealthy.
 app.get('/health', async (_req, res) => {
-  const mongoOk = mongoose.connection.readyState === 1; // 1 = connected
-
-  let pgOk = false;
-  try {
-    await sequelize.authenticate();
-    pgOk = true;
-  } catch {
-    pgOk = false;
-  }
+  const mongoOk = checkMongoOk();
+  const pgOk    = await checkPostgresOk();
 
   const allOk  = mongoOk && pgOk;
   const status = allOk ? 'ok' : 'degraded';
@@ -139,6 +139,7 @@ app.use('/api/polizas',              polizaRoutes);
 app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
 app.use('/api/notificaciones',       notificacionRoutes);
 app.use('/api/config',               configRoutes);
+app.use('/api/system-monitor',       systemMonitorRoutes);
 
 // Visor module
 app.use('/api/auth',              authRoutes);
@@ -197,6 +198,7 @@ const startServer = async () => {
   require('./banks/jobs/cajaTransferenciaSyncCron');
   require('./visor/jobs/credencialesAlertJob');
   require('./visor/jobs/cfdiCanceladoNotificacionJob');
+  require('./system-monitor/system-monitor.cron');
   try {
     await seed();
   } catch (err) {

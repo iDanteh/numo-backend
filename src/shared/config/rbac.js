@@ -167,6 +167,13 @@ const PERMISSIONS = Object.freeze({
   // rol todavía — admin los tiene por el wildcard '*'.
   CONFIG_MANAGE:         'config:manage',
   CONFIG_SECRETS_REVEAL: 'config:secrets:reveal',
+
+  // Panel de Tráfico del Sistema (ver src/system-monitor/) — requests/min, tasa de
+  // error, tiempo de respuesta, salud de Mongo/Postgres, alerta de caída. Exclusivo
+  // de admin por diseño (2026-09-24, pedido explícito del usuario) — sin asignar a
+  // ningún otro rol, admin lo tiene por el wildcard '*', mismo criterio que
+  // BANKS_TRANSFERENCIAS_CAJA/BANKS_NETPAY.
+  SYSTEM_MONITOR_READ: 'system:monitor:read',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

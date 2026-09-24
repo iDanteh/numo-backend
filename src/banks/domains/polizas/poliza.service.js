@@ -3020,6 +3020,18 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
       if (idsSaldoFavorUsado.has(filas[i])) filas.splice(i, 1);
     }
   }
+  // Generación oculta con sobrante < $50: en esta hoja se muestra COMPLETA
+  // (lo usado + el sobrante), tal cual lo generó Kore (confirmado con el
+  // usuario 2026-09-24, caso real Puerto Escondido DEV-057750: $6,715.84 +
+  // $1,074.53 = $7,790.37). Solo es presentación: el sobrante sigue yendo a
+  // "Otros Ingresos" (SF-MENOR-SIN-USAR) y la póliza no cambia. Se empareja
+  // por concepto + cuenta (mismo renglón de generación partido en dos).
+  for (const menor of filasOtrosIngresosOcultos) {
+    if (!(Number(menor.haber) > 0)) continue;
+    const gen = filasSaldoFavorUsado.find(f => Number(f.haber) > 0 && f.concepto === menor.concepto
+      && f.cuenta?.codigo === menor.cuenta?.codigo);
+    if (gen) gen.haber = Math.round((Number(gen.haber) + Number(menor.haber)) * 100) / 100;
+  }
   // COBRO-DIA-REAL (2026-09-17): se une aquí, no viene de `filas` (nunca pasó
   // por ahí, se desvió arriba antes del `filas.push`), así que no necesita
   // limpieza de `filas` como el SF de arriba.

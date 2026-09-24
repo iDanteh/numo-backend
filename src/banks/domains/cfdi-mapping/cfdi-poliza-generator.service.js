@@ -10,7 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
-const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes } = require('../erp/erp-sync.service');
+const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 const { BadRequestError }          = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -106,6 +106,33 @@ const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
 // Ingresos" (SF-MENOR-SIN-USAR) — confirmado con el usuario 2026-09-24, mismo
 // umbral que "SF sin usar menor a $50". Sobrante >= $50 = uso parcial, se muestra.
 const SOBRANTE_MAX_SF_OCULTO = 50;
+
+// Nombre del cliente de la VENTA QUE GENERÓ un saldo a favor — todo renglón
+// de SF (generado o usado, visible u oculto) lleva "cliente de la venta
+// origen / esa venta" (confirmado con el usuario 2026-09-24, caso real Puerto
+// Escondido 23-sep: SF de O0-260900036/CAYETANO GARCIA SANTIAGO usado por
+// otra venta salía como "CLIENTE NO IDENTIFICADO / O0-260900916", y el SF de
+// O0-260900916 usado por INMOBILIARIA UNMA salía con el cliente consumidor).
+// Fuente: Kore `/cuentas-pendientes` (nombrePersona del ticket, necesita su
+// fechaCreacion — se obtiene de `/saldos-favor` del mismo ticket). El folio de
+// ticket NO es el de la factura, así que buscar el CFDI por ese folio no es
+// confiable. Caché en memoria por proceso (el nombre de un ticket no cambia).
+const _cacheNombreVentaOrigen = new Map(); // `${rfc}|${serie}-${folio}` → Promise<string|null>
+function _nombreClienteVentaOrigen(rfc, serie, folio) {
+  if (!rfc || !serie || !folio) return Promise.resolve(null);
+  const clave = `${rfc}|${serie}-${folio}`;
+  if (!_cacheNombreVentaOrigen.has(clave)) {
+    _cacheNombreVentaOrigen.set(clave, (async () => {
+      try {
+        const cuentas = await obtenerSaldosFavor({ rfc, series: [serie], folios: [String(folio)] });
+        const cuenta = (cuentas ?? []).find(c => c.serieVenta === serie && String(c.folioVenta) === String(folio));
+        if (!cuenta?.fechaCreacion) return null;
+        return await obtenerNombrePersonaTicket({ rfc, serie, folio: String(folio), fechaCreacion: cuenta.fechaCreacion });
+      } catch (err) { return null; }
+    })());
+  }
+  return _cacheNombreVentaOrigen.get(clave);
+}
 
 /**
  * Deduplica líneas de Saldo a Favor (SF/SF-OCULTO) que DOS mecanismos
@@ -619,6 +646,9 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     const prev = mapa.get(key);
     mapa.set(key, {
       monto:      (prev?.monto ?? 0) + montoAEmitir,
+      // Monto BRUTO generado (sin restar usos) — la generación oculta sin CFDI
+      // se muestra completa en "Movimientos de Saldos a Favor" (2026-09-24).
+      montoGenerado: (prev?.montoGenerado ?? 0) + (Number(gen.monto) || 0),
       ventaSerie: cuenta.serieVenta,
       ventaFolio: cuenta.folioVenta,
       oculto,
@@ -2051,7 +2081,8 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
         { 'receptor.nombre': 1 },
       ).lean()
     : null;
-  const nombreCliente = cfdiVentaOrigen?.receptor?.nombre ?? cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
+  const nombreCliente = (await _nombreClienteVentaOrigen(rfc, generado.ventaSerie, generado.ventaFolio))
+    ?? cfdiVentaOrigen?.receptor?.nombre ?? cfdi.receptor?.nombre ?? 'CLIENTE NO IDENTIFICADO';
   const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
   const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_OCULTO : 'SF';
 
@@ -3235,6 +3266,8 @@ async function _sfUsadoAntesDeFacturarPorCentro({ rfc, centro, fechaInicio, fech
     if (monto <= 0) continue;
     detalle.push({
       ventaSerie: cuenta.serieVenta ?? null, ventaFolio: cuenta.folioVenta ?? null,
+      // Venta que GENERÓ el saldo (para el concepto, ver `_nombreClienteVentaOrigen`).
+      origenSerie: uso.serieVenta ?? null, origenFolio: uso.folioVenta ?? null,
       monto,
       nombreCliente: datosFactura?.nombreCliente ?? 'CLIENTE NO IDENTIFICADO',
       facturaUuid: datosFactura?.uuid ?? null,
@@ -4349,14 +4382,20 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // DEV-055991 de julio + CAC-075406 de junio, combinados como un solo
         // "$523.91 SF" sin poder rastrear el origen de cada uno).
         const detalleVisible = detalle.filter(d => !devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`));
-        const montoOculto = Math.round(detalle
-          .filter(d => devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`))
+        // Oculto también POR ORIGEN (2026-09-24): antes se sumaba todo en una
+        // sola línea con el concepto del CFDI consumidor.
+        const detalleOculto = detalle.filter(d => devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`));
+        for (const d of [...detalleVisible, ...detalleOculto]) {
+          d.nombreClienteOrigen = await _nombreClienteVentaOrigen(rfc, d.ventaSerie, d.ventaFolio);
+        }
+        const montoOculto = Math.round(detalleOculto
           .reduce((s, d) => s + (Number(d.monto) || 0), 0) * 100) / 100;
         context.saldoFavorUsadoPropio = {
           ...sfUsado,
           montoOculto,
           montoVisible: Math.round((sfUsado.monto - montoOculto) * 100) / 100,
           detalleVisible,
+          detalleOculto,
         };
       }
       const puntosUsadoCfdi = puntosUsadoMapProp.get(`${cfdi.serie}|${cfdi.folio}`);
@@ -5055,7 +5094,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     );
     for (const [key, generado] of mapaSaldosFavorGeneradosProp) {
       if (clavesConsumidas.has(key)) continue;
-      if (!generado?.monto) continue;
+      if (!generado?.monto && !(generado?.oculto && generado?.montoGenerado)) continue;
       // Mismo guard nativo que `_inyectarSaldoFavorGenerado` (ver ese
       // comentario) — si Kore ya convirtió este saldo en Anticipo, no se
       // inyecta como SF huérfano tampoco (mismo dinero contado dos veces).
@@ -5069,8 +5108,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
       const iva      = Math.round((generado.monto - subtotal) * 100) / 100;
       const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
+      const nombreOrigenGenProp = await _nombreClienteVentaOrigen(rfc, generado.ventaSerie, generado.ventaFolio);
+      const conceptoGenProp = [nombreOrigenGenProp, serieFolioVenta].filter(Boolean).join(' / ') || key;
       const base = {
-        concepto:       serieFolioVenta ?? key,
+        concepto:       conceptoGenProp,
         serie:          serieFolioVenta,
         centroCosto:    ccOrfanos?.clave ?? null,
         centroCostoId:  ccOrfanos?.id    ?? null,
@@ -5080,8 +5121,25 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         reglaNombre:    reglaSF,
         debe:           0,
       };
-      movimientosResult.push({ ...base, cuentaId: cuentaSaldoFavorIdProp,    haber: subtotal });
-      movimientosResult.push({ ...base, cuentaId: cuentaIvaSaldoFavorIdProp, haber: iva     });
+      if ((Number(generado.monto) || 0) >= 0.01) {
+        movimientosResult.push({ ...base, cuentaId: cuentaSaldoFavorIdProp,    haber: subtotal });
+        movimientosResult.push({ ...base, cuentaId: cuentaIvaSaldoFavorIdProp, haber: iva     });
+      }
+      // Generación sin CFDI oculta (generada y usada el mismo día/almacén):
+      // lo USADO también se registra, como SF-OCULTO, para que la generación
+      // completa aparezca en "Movimientos de Saldos a Favor" (confirmado con el
+      // usuario 2026-09-24, caso real Puerto Escondido DEV-057750 $7,790.37);
+      // el sobrante (arriba, SF-MENOR-SIN-USAR) sigue yendo a Otros Ingresos.
+      // Partido por cuenta como diferencia contra el total, para que sumado al
+      // sobrante dé exacto el subtotal/IVA de lo generado.
+      if (generado.oculto && (Number(generado.montoGenerado) || 0) - (Number(generado.monto) || 0) >= 0.01) {
+        const totalGenProp = Math.round((Number(generado.montoGenerado) || 0) * 100) / 100;
+        const subTotalGenProp = Math.round((totalGenProp / 1.16) * 100) / 100;
+        const ivaTotalGenProp = Math.round((totalGenProp - subTotalGenProp) * 100) / 100;
+        const baseOculto = { ...base, reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO };
+        movimientosResult.push({ ...baseOculto, cuentaId: cuentaSaldoFavorIdProp,    haber: Math.round((subTotalGenProp - subtotal) * 100) / 100 });
+        movimientosResult.push({ ...baseOculto, cuentaId: cuentaIvaSaldoFavorIdProp, haber: Math.round((ivaTotalGenProp - iva) * 100) / 100 });
+      }
     }
   }
 
@@ -5211,8 +5269,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     for (const d of sfTardioProp) {
       const subtotal = Math.round((d.monto / 1.16) * 100) / 100;
       const iva = Math.round((d.monto - subtotal) * 100) / 100;
-      const referenciaVenta = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
-      const conceptoSfTardio = [d.nombreCliente, referenciaVenta].filter(Boolean).join(' / ');
+      // Concepto: cliente y venta que GENERÓ el saldo (2026-09-24), no la consumidora.
+      const referenciaVenta = [d.origenSerie, d.origenFolio].filter(Boolean).join('-')
+        || [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
+      const nombreOrigenTardio = await _nombreClienteVentaOrigen(rfc, d.origenSerie, d.origenFolio);
+      const conceptoSfTardio = [nombreOrigenTardio ?? d.nombreCliente, referenciaVenta].filter(Boolean).join(' / ');
       const baseSfTardio = {
         concepto: conceptoSfTardio, serie: referenciaVenta,
         centroCosto: ccSfTardioProp?.clave ?? null, centroCostoId: ccSfTardioProp?.id ?? null,
@@ -5250,8 +5311,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         const ivaSF = Math.round((monto - subtotalSF) * 100) / 100;
         const referenciaVentaSF = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
           || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+        const nombreOrigenSF = await _nombreClienteVentaOrigen(rfc, d.ventaSerie, d.ventaFolio);
         const baseSinFacturaProp = {
-          concepto: referenciaVentaSF, serie: referenciaVentaSF,
+          concepto: [nombreOrigenSF, referenciaVentaSF].filter(Boolean).join(' / ') || referenciaVentaSF, serie: referenciaVentaSF,
           centroCosto: ccSinFacturaProp?.clave ?? null, centroCostoId: ccSinFacturaProp?.id ?? null,
           cfdiUuid: null, cuentaFaltante: false,
           tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
@@ -6231,14 +6293,20 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         const detalle = sfUsado.detalle ?? [];
         // Ver comentario equivalente en generarPropuesta sobre `detalleVisible`.
         const detalleVisible = detalle.filter(d => !devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`));
-        const montoOculto = Math.round(detalle
-          .filter(d => devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`))
+        // Oculto también POR ORIGEN (2026-09-24): antes se sumaba todo en una
+        // sola línea con el concepto del CFDI consumidor.
+        const detalleOculto = detalle.filter(d => devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`));
+        for (const d of [...detalleVisible, ...detalleOculto]) {
+          d.nombreClienteOrigen = await _nombreClienteVentaOrigen(rfc, d.ventaSerie, d.ventaFolio);
+        }
+        const montoOculto = Math.round(detalleOculto
           .reduce((s, d) => s + (Number(d.monto) || 0), 0) * 100) / 100;
         context.saldoFavorUsadoPropio = {
           ...sfUsado,
           montoOculto,
           montoVisible: Math.round((sfUsado.monto - montoOculto) * 100) / 100,
           detalleVisible,
+          detalleOculto,
         };
       }
       const puntosUsadoCfdi = puntosUsadoMapGuard.get(`${cfdi.serie}|${cfdi.folio}`);
@@ -6689,7 +6757,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     );
     for (const [key, generado] of mapaSaldosFavorGeneradosGuard) {
       if (clavesConsumidasGuard.has(key)) continue;
-      if (!generado?.monto) continue;
+      if (!generado?.monto && !(generado?.oculto && generado?.montoGenerado)) continue;
       // Ver comentario equivalente en generarPropuesta ("SF GEN-huérfanos").
       if (generado?.anticipoReferencia) continue;
       // Huérfano oculto: `generado.monto` es el sobrante (< $50) del día → "Otros Ingresos"
@@ -6698,8 +6766,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
       const ivaG      = Math.round((generado.monto - subtotalG) * 100) / 100;
       const serieFolioVentaG = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
+      const nombreOrigenGenGuard = await _nombreClienteVentaOrigen(rfc, generado.ventaSerie, generado.ventaFolio);
+      const conceptoGenGuard = [nombreOrigenGenGuard, serieFolioVentaG].filter(Boolean).join(' / ') || key;
       const baseG = {
-        concepto:       serieFolioVentaG ?? key,
+        concepto:       conceptoGenGuard,
         serie:          serieFolioVentaG,
         centroCosto:    ccOrfanosGuard?.clave ?? null,
         centroCostoId:  ccOrfanosGuard?.id    ?? null,
@@ -6709,8 +6779,25 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         reglaNombre:    reglaSFG,
         debe:           0,
       };
-      todosLosMovimientos.push({ ...baseG, cuentaId: cuentaSaldoFavorIdGuard,    haber: subtotalG });
-      todosLosMovimientos.push({ ...baseG, cuentaId: cuentaIvaSaldoFavorIdGuard, haber: ivaG     });
+      if ((Number(generado.monto) || 0) >= 0.01) {
+        todosLosMovimientos.push({ ...baseG, cuentaId: cuentaSaldoFavorIdGuard,    haber: subtotalG });
+        todosLosMovimientos.push({ ...baseG, cuentaId: cuentaIvaSaldoFavorIdGuard, haber: ivaG     });
+      }
+      // Generación sin CFDI oculta (generada y usada el mismo día/almacén):
+      // lo USADO también se registra, como SF-OCULTO, para que la generación
+      // completa aparezca en "Movimientos de Saldos a Favor" (confirmado con el
+      // usuario 2026-09-24, caso real Puerto Escondido DEV-057750 $7,790.37);
+      // el sobrante (arriba, SF-MENOR-SIN-USAR) sigue yendo a Otros Ingresos.
+      // Partido por cuenta como diferencia contra el total, para que sumado al
+      // sobrante dé exacto el subtotal/IVA de lo generado.
+      if (generado.oculto && (Number(generado.montoGenerado) || 0) - (Number(generado.monto) || 0) >= 0.01) {
+        const totalGenGuard = Math.round((Number(generado.montoGenerado) || 0) * 100) / 100;
+        const subTotalGenGuard = Math.round((totalGenGuard / 1.16) * 100) / 100;
+        const ivaTotalGenGuard = Math.round((totalGenGuard - subTotalGenGuard) * 100) / 100;
+        const baseGOculto = { ...baseG, reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO };
+        todosLosMovimientos.push({ ...baseGOculto, cuentaId: cuentaSaldoFavorIdGuard,    haber: Math.round((subTotalGenGuard - subtotalG) * 100) / 100 });
+        todosLosMovimientos.push({ ...baseGOculto, cuentaId: cuentaIvaSaldoFavorIdGuard, haber: Math.round((ivaTotalGenGuard - ivaG) * 100) / 100 });
+      }
     }
   }
 
@@ -6810,8 +6897,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     for (const d of sfTardioGuard) {
       const subtotalG = Math.round((d.monto / 1.16) * 100) / 100;
       const ivaG = Math.round((d.monto - subtotalG) * 100) / 100;
-      const referenciaVentaG = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
-      const conceptoSfTardioG = [d.nombreCliente, referenciaVentaG].filter(Boolean).join(' / ');
+      // Ver comentario equivalente en generarPropuesta (venta que generó el saldo).
+      const referenciaVentaG = [d.origenSerie, d.origenFolio].filter(Boolean).join('-')
+        || [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-') || null;
+      const nombreOrigenTardioG = await _nombreClienteVentaOrigen(rfc, d.origenSerie, d.origenFolio);
+      const conceptoSfTardioG = [nombreOrigenTardioG ?? d.nombreCliente, referenciaVentaG].filter(Boolean).join(' / ');
       const baseSfTardioG = {
         concepto: conceptoSfTardioG, serie: referenciaVentaG,
         centroCosto: ccSfTardioGuard?.clave ?? null, centroCostoId: ccSfTardioGuard?.id ?? null,
@@ -6842,8 +6932,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         const ivaSFG = Math.round((monto - subtotalSFG) * 100) / 100;
         const referenciaVentaSFG = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
           || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+        const nombreOrigenSFG = await _nombreClienteVentaOrigen(rfc, d.ventaSerie, d.ventaFolio);
         const baseSinFacturaGuard = {
-          concepto: referenciaVentaSFG, serie: referenciaVentaSFG,
+          concepto: [nombreOrigenSFG, referenciaVentaSFG].filter(Boolean).join(' / ') || referenciaVentaSFG, serie: referenciaVentaSFG,
           centroCosto: ccSinFacturaGuard?.clave ?? null, centroCostoId: ccSinFacturaGuard?.id ?? null,
           cfdiUuid: null, cuentaFaltante: false,
           tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,

@@ -255,6 +255,11 @@ async function buscarTransaccionesNetpay(params = {}) {
   // necesarias antes de agregar totales, nunca agrega sobre una sola respuesta.
   if (params.page) queryParams.page = params.page;
   if (params.pageSize) queryParams.pageSize = params.pageSize;
+  // withAccountInfo (2026-09-24, confirmado con el usuario contra Swagger/
+  // producción): cada transacción trae `cuentas[]` con los tickets que cubre
+  // (`SerieExterna`/`FolioExterno`, `SerieFactura`/`FolioFactura`, `Total`) —
+  // la liga exacta NetPay↔venta que usa `construirNetpayInfo`.
+  if (params.withAccountInfo) queryParams.withAccountInfo = true;
 
   let response;
   try {

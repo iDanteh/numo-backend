@@ -2407,6 +2407,36 @@ async function construirNombresClientes(cfdiUuids) {
 const TIPO_ORIGEN_BCT = 'Bonificación Club Tuberos';
 
 /**
+ * Empareja cada grupo (CFDI) con cierre OPA (`reglaNombre='OPA'`) con el grupo
+ * del Egreso que lo revierte (`reglaNombre='OPA-REVERSION'`, misma `serie`),
+ * SIN depender del orden en que lleguen los grupos. Antes el emparejamiento
+ * se hacía dentro del mismo recorrido y solo funcionaba si la venta llegaba
+ * ANTES que su Egreso — cuando el Egreso llegaba primero se mostraba completo
+ * y la venta salía "cierre OPA → Ingreso" (bug real 2026-09-24, póliza 880
+ * CONSTRUCASA 22-sep: C0-260901280/282 y
+ * C0-260901305/310; en la misma póliza C0-260901253/255 sí salía bien porque
+ * su venta llegaba antes).
+ *
+ * @param {object[]} grupos — cada uno con `key`
+ * @param {(g: object) => object[]} cargosDe — los cargos del grupo donde buscar OPA/OPA-REVERSION
+ * @returns {{ egresosOcultos: Set, cierresConReversion: Set }} — keys de grupos
+ */
+function emparejarCierreOpaConReversion(grupos, cargosDe) {
+  const egresosOcultos      = new Set();
+  const cierresConReversion = new Set();
+  for (const g of grupos) {
+    const cierreOPA = cargosDe(g).find(m => m.reglaNombre === 'OPA');
+    if (!cierreOPA) continue;
+    const grupoEgreso = grupos.find(o => o.key !== g.key && !egresosOcultos.has(o.key)
+      && cargosDe(o).some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
+    if (!grupoEgreso) continue;
+    egresosOcultos.add(grupoEgreso.key);
+    cierresConReversion.add(g.key);
+  }
+  return { egresosOcultos, cierresConReversion };
+}
+
+/**
  * Reordena las líneas de cada CFDI para que los cargos (debe > 0) queden
  * antes que los abonos (haber > 0) — usado en pólizas de Egreso (NC), donde
  * `movimientos` llega tal cual se guardó (sin pasar por `consolidarCargos`).
@@ -2443,20 +2473,15 @@ function ordenarCargoAntesDeAbono(movs) {
     return { key, cargos, abonos };
   });
 
-  const usados = new Set();
+  const { egresosOcultos, cierresConReversion } = emparejarCierreOpaConReversion(grupos, g => g.cargos);
   const resultado = [];
   for (const g of grupos) {
-    if (usados.has(g.key)) continue;
-    usados.add(g.key);
-    const cierreOPA = g.cargos.find(m => m.reglaNombre === 'OPA');
-    const grupoEgreso = cierreOPA && grupos.find(o => !usados.has(o.key)
-      && o.cargos.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
-    if (grupoEgreso) {
-      usados.add(grupoEgreso.key);
-      // OPA-REVERSION se oculta del export por completo — ver comentario
-      // equivalente en `bloquesAjustesContado` (confirmado con el usuario
-      // 2026-09-15, caso real Puerto Escondido INMOBILIARIA ACROTY
-      // O0-260900344). Sigue persistido en Postgres, solo deja de mostrarse.
+    // OPA-REVERSION se oculta del export por completo — ver comentario
+    // equivalente en `bloquesAjustesContado` (confirmado con el usuario
+    // 2026-09-15, caso real Puerto Escondido INMOBILIARIA ACROTY
+    // O0-260900344). Sigue persistido en Postgres, solo deja de mostrarse.
+    if (egresosOcultos.has(g.key)) continue;
+    if (cierresConReversion.has(g.key)) {
       resultado.push(...g.abonos, ...g.cargos);
       continue;
     }
@@ -3170,24 +3195,21 @@ function bloquesAjustesContado(movs) {
   // Egreso real, guardado en `cargosOPA[].serie` vía `serieCierreProp` —
   // ver `_redirigirEgresoAnticipoSaldado`/`cfdi-poliza-generator.service.js`
   // — coincide exacto con el folio propio de las líneas del grupo Egreso).
-  const usados = new Set();
+  // El emparejamiento se hace ANTES de recorrer (ver
+  // `emparejarCierreOpaConReversion`) para no depender de si la venta o su
+  // Egreso llega primero.
+  const { egresosOcultos, cierresConReversion } = emparejarCierreOpaConReversion(
+    grupos, g => g.cargosOPA);
   const resultado = [];
   for (const g of grupos) {
-    if (usados.has(g.key)) continue;
-    usados.add(g.key);
+    // OPA-REVERSION (Cargo Devoluciones+IVA del Egreso + Abono Anticipos+
+    // IVA-anticipo reinstalados) se OCULTA del export por completo
+    // (confirmado con el usuario 2026-09-15, caso real Puerto Escondido
+    // INMOBILIARIA ACROTY O0-260900344) — sigue persistido igual en
+    // Postgres (esta función solo arma el Excel), solo deja de mostrarse.
+    if (egresosOcultos.has(g.key)) continue;
     if (g.categoria === 'anticipo') {
-      const cierreOPA = g.cargosOPA.find(m => m.reglaNombre === 'OPA');
-      const grupoEgreso = cierreOPA && grupos.find(o => !usados.has(o.key)
-        && o.cargosOPA.some(m => m.reglaNombre === 'OPA-REVERSION' && m.serie === cierreOPA.serie));
-      if (grupoEgreso) {
-        usados.add(grupoEgreso.key);
-        // OPA-REVERSION (Cargo Devoluciones+IVA del Egreso + Abono Anticipos+
-        // IVA-anticipo reinstalados) se OCULTA del export por completo
-        // (confirmado con el usuario 2026-09-15, caso real Puerto Escondido
-        // INMOBILIARIA ACROTY O0-260900344) — sigue persistido igual en
-        // Postgres (esta función solo arma el Excel), solo deja de mostrarse.
-        // Se conserva la detección de `grupoEgreso` (arriba) para marcarlo
-        // como usado y que no caiga al bloque genérico de abajo.
+      if (cierresConReversion.has(g.key)) {
         resultado.push({ categoria: g.categoria, bloque: [...g.abonos, ...g.cargosOPA] });
         continue;
       }

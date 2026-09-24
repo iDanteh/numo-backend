@@ -432,10 +432,16 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
   } else {
     // Sin doctosPago (CFDI sin detalle de complemento, ej. Descarga Metadata):
     // una sola línea de Cargo + una sola línea de Abono para todo el Pago.
+    // Concepto "cliente / serie-folio" (2026-09-21, pedido explícito del
+    // usuario, columna H del export) — mismo criterio que el camino con
+    // doctosPago (`conceptoFactura` arriba), usando el serie-folio del propio
+    // Pago porque aquí no hay detalle de factura individual que mostrar.
+    const nombreClientePago = cfdi.receptor?.nombre ?? '';
+    const conceptoPago = [nombreClientePago, serieCfdi].filter(Boolean).join(' / ') || concepto;
     const esEfectivoCfdi = (cfdi.formaPago ?? '') === '01';
     const cuentaCargoFallback = (esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS]) ?? cuentaMap[rule.cuentaCargo] ?? null;
-    movs.push({ cuentaId: cuentaCargoFallback, concepto, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
-    movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
   if (!esSplitPagoPorFactura) {

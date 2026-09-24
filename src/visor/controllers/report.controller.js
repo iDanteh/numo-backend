@@ -451,12 +451,13 @@ const MONTO_EFECTIVO_EXPR = {
 /**
  * GET /api/reports/dashboard
  */
-const dashboard = asyncHandler(async (req, res) => {
-  const cacheKey = getCacheKey(req.query);
-  const cached = getFromCache(cacheKey);
-  if (cached) return res.json(cached);
-
-  const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = req.query;
+/**
+ * Cálculo de los KPIs del dashboard, extraído para poder reutilizarse tanto
+ * desde el endpoint /dashboard (con caché) como desde el reporte de Cierre
+ * de Mes (sin caché, siempre datos frescos al momento del cierre).
+ */
+async function computeDashboardData(query) {
+  const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = query;
 
   // El dashboard solo debe contar Emitidos — nunca Recibidos (aunque compartan
   // source SAT/MANUAL/ERP). Si el frontend no manda rfcEmisor (ej. mientras
@@ -708,6 +709,16 @@ const dashboard = asyncHandler(async (req, res) => {
     recentDiscrepancies,
   };
 
+  return responseData;
+}
+
+const dashboard = asyncHandler(async (req, res) => {
+  const cacheKey = getCacheKey(req.query);
+  const cached = getFromCache(cacheKey);
+  if (cached) return res.json(cached);
+
+  const responseData = await computeDashboardData(req.query);
+
   setCache(cacheKey, responseData);
   res.json(responseData);
 });
@@ -872,10 +883,16 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
   // Solo incluir CFDIs ERP que aún tienen discrepancia en su ÚLTIMA comparación.
   // lastComparisonStatus es actualizado cada vez que se corre la comparación,
   // por lo que garantiza que solo aparecen registros actuales, no históricos.
+  // Excluye CFDIs con UUID sintético ("SINUUID-...", ver erp-transformer.service.js
+  // #parseFechaFacturaERP/transformarTolerante) -- pedido explícito del usuario
+  // 2026-09-23: una factura sin UUID real del ERP no es un CFDI identificable de
+  // verdad, así que "discrepancia de monto" contra ella es ruido, no un caso real
+  // para revisar.
   const erpConDiscrepanciaIds = await CFDI.find({
     source: 'ERP',
     erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] },
     lastComparisonStatus: { $in: ['discrepancy', 'warning'] },
+    uuid: { $not: /^SINUUID-/ },
     'emisor.rfc': emisorConstraint,
     ...periodoFiltro,
   }).select('_id').lean().then(docs => docs.map(d => d._id));
@@ -901,8 +918,12 @@ const discrepanciasMontos = asyncHandler(async (req, res) => {
 
   const cfdiSelect = 'uuid serie folio fecha total subTotal impuestos tipoDeComprobante emisor receptor erpStatus satStatus moneda';
 
-  // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito
-  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, 'emisor.rfc': emisorConstraint };
+  // Filtro para CFDIs con RFC & — cubre documentos con y sin campo ejercicio/periodo explícito.
+  // Excluye UUID sintético (SINUUID-...): sin UUID real nunca iba a poder
+  // verificarse contra el SAT de todas formas, el bloqueo real no es el "&"
+  // (pedido explícito del usuario 2026-09-23, mismo criterio que discrepancias
+  // de montos arriba).
+  const pendienteFiltro = { source: 'ERP', isActive: { $ne: false }, satStatus: 'Pendiente', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] }, uuid: { $not: /^SINUUID-/ }, 'emisor.rfc': emisorConstraint };
   if (tipoDeComprobante) pendienteFiltro.tipoDeComprobante = tipoDeComprobante;
   if (ejercicio && periodo) {
     const ej = parseInt(ejercicio), pe = parseInt(periodo);
@@ -1391,8 +1412,12 @@ const pagosRelacionados = asyncHandler(async (req, res) => {
  *   - Tabla: todos los CFDIs ERP del tipo con sus contrapartes SAT,
  *     IVA, diferencia de monto y detalle campo a campo de por qué difieren.
  */
-const conciliacionExcel = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, rfcEmisor } = req.query;
+/**
+ * Construye el workbook de conciliación completa. Extraído de `conciliacionExcel`
+ * para poder reutilizarse también desde el reporte de Cierre de Mes.
+ */
+async function buildConciliacionWorkbook(query, existingWorkbook) {
+  const { ejercicio, periodo, rfcEmisor } = query;
   const periodoFilter = {};
   if (ejercicio) periodoFilter.ejercicio = parseInt(ejercicio);
   if (periodo)   periodoFilter.periodo   = parseInt(periodo);
@@ -1583,8 +1608,12 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   const MXN       = '"$"#,##0.00';
   const colLetter = (n) => n <= 26 ? String.fromCharCode(64 + n) : 'Z';
 
-  const workbook = new ExcelJS.Workbook();
+  const workbook = existingWorkbook || new ExcelJS.Workbook();
   workbook.creator = 'NUMO'; workbook.created = new Date();
+  // Si el workbook ya trae hojas (ej. la de Resumen Dashboard del Cierre de
+  // Mes), la numeración dinámica de las hojas de este reporte debe ignorarlas
+  // — si no, "2. Egreso" se numeraría "3. Egreso" y así en cascada.
+  const sheetOffset = existingWorkbook ? existingWorkbook.worksheets.length : 0;
 
   const addTitle = (sheet, title, ncols) => {
     const lc = colLetter(ncols);
@@ -1671,7 +1700,19 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   ];
   const MONEY_KEYS = ['descuento','subERP','ivaTraERP','ivaRetERP','totalERP','descuentoSAT','subSAT','ivaTraSAT','totalSAT','diferencia'];
 
-  const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))].sort();
+  // Orden de hojas fijo (Ingreso, Egreso, Pago, Traslado, Nómina — el mismo
+  // orden de TIPO_LABEL), NO alfabético: alfabético pondría Egreso antes que
+  // Ingreso (códigos SAT 'E' < 'I'), pedido explícito del usuario 21-sep.
+  // Un tipo fuera del catálogo (no debería pasar) cae al final, alfabético.
+  const TIPO_ORDEN = Object.keys(TIPO_LABEL);
+  const tiposEnUso = [...new Set(allErpCfdis.map(c => c.tipoDeComprobante).filter(Boolean))]
+    .sort((a, b) => {
+      const ia = TIPO_ORDEN.indexOf(a), ib = TIPO_ORDEN.indexOf(b);
+      if (ia === -1 && ib === -1) return a.localeCompare(b);
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    });
   const tiposEnUsoSet = new Set(tiposEnUso);
 
   // Agrupar soloSat por tipo para insertarlos al final de cada hoja de tipo
@@ -1685,7 +1726,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   for (const tipo of tiposEnUso) {
     const cfdis = cfdisByTipo[tipo] || [];
     const label  = TIPO_LABEL[tipo] || tipo;
-    const sheetN = workbook.worksheets.length + 1;
+    const sheetN = (workbook.worksheets.length - sheetOffset) + 1;
     const sheet  = workbook.addWorksheet(`${sheetN}. ${label} (${tipo})`);
     sheet.views  = [{ state: 'frozen', ySplit: 5 }];
     addTitle(sheet, `${label} (Tipo ${tipo}) — ${periodoLabel}`, DETAIL_COLS.length);
@@ -1971,7 +2012,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // (fueron reclasificados manualmente a este periodo)
   // ══════════════════════════════════════════════════════════════════════════
   if (cfdisMigrados.length > 0) {
-    const sMig  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Facturas Migradas`);
+    const sMig  = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. Facturas Migradas`);
     sMig.views  = [{ state: 'frozen', ySplit: 3 }];
     const MIG_COLS = [
       { key: 'tipo',       header: 'Tipo',             width: 7  },
@@ -2035,7 +2076,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
 
   // Helper: escribe hoja de CFDIs inactivos agrupados por tipo
   const addInactiveSheet = async (cfdis, sheetLabel, title, fgColor, satByUuidMap) => {
-    const sheet = workbook.addWorksheet(`${workbook.worksheets.length + 1}. ${sheetLabel}`);
+    const sheet = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. ${sheetLabel}`);
     sheet.views = [{ state: 'frozen', ySplit: 5 }];
     addTitle(sheet, `${title} — ${periodoLabel}`, DETAIL_COLS.length);
 
@@ -2164,7 +2205,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // ══════════════════════════════════════════════════════════════════════════
   const totalMismatch = satCanceladoErpActivo.length + erpCanceladoSatVigente.length;
   if (totalMismatch > 0) {
-    const sMis = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Mismatch Estado`);
+    const sMis = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. Mismatch Estado`);
     sMis.views = [{ state: 'frozen', ySplit: 3 }];
     const MIS_COLS = [
       { key: 'tipo',       header: 'Tipo',           width: 7  },
@@ -2219,7 +2260,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // ══════════════════════════════════════════════════════════════════════════
   // Los que SÍ tienen tipo en ERP ya se agregaron al final de su hoja de tipo
   const soloSatSinTipo = soloSat.filter(c => !tiposEnUsoSet.has(c.tipoDeComprobante));
-  const sN   = workbook.worksheets.length + 1;
+  const sN   = (workbook.worksheets.length - sheetOffset) + 1;
   const sLast = workbook.addWorksheet(`${sN}. Solo en SAT`);
   sLast.views = [{ state: 'frozen', ySplit: 3 }];
   const SAT_COLS = [
@@ -2260,7 +2301,7 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
   // ══════════════════════════════════════════════════════════════════════════
   if (sinUuidCfdis.length > 0) {
     const FG_SIN = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF8E1' } }; // amarillo suave
-    const sSin  = workbook.addWorksheet(`${workbook.worksheets.length + 1}. Pendientes Timbrado`);
+    const sSin  = workbook.addWorksheet(`${(workbook.worksheets.length - sheetOffset) + 1}. Pendientes Timbrado`);
     sSin.views  = [{ state: 'frozen', ySplit: 4 }];
     const SIN_COLS = [
       { key: 'tipo',       header: 'Tipo',            width: 7  },
@@ -2324,8 +2365,229 @@ const conciliacionExcel = asyncHandler(async (req, res) => {
     trSin.getCell('total').numFmt = MXN;
   }
 
-  // ── Respuesta ──────────────────────────────────────────────────────────────
   const filename = `conciliacion_${ejercicio || 'all'}_${periodo || 'all'}_${Date.now()}.xlsx`;
+  return { workbook, periodoLabel, filename };
+}
+
+/**
+ * Reporte de Cierre de Mes: workbook combinado = Resumen del Dashboard
+ * (todos los KPIs, tal cual /reports/dashboard) + la conciliación completa
+ * de CFDIs (idéntica a /reports/conciliacion-excel), tomados en el mismo
+ * instante en que se cierra el período.
+ */
+async function buildCierreMesWorkbook(query) {
+  const { ejercicio, periodo } = query;
+  const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+  const periodoLabel = ejercicio ? (periodo ? `${MESES[parseInt(periodo) - 1]} ${ejercicio}` : `Año ${ejercicio}`) : 'Todos los periodos';
+
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'NUMO'; workbook.created = new Date();
+
+  // La hoja de resumen se crea AQUÍ, antes de pedirle a buildConciliacionWorkbook
+  // que agregue las suyas al mismo workbook — así queda con sheetId=1 (primera
+  // pestaña) de forma natural. Antes se creaba al final y se forzaba a la
+  // posición 1 con `sheet.orderNo = -1`, pero el sheetId interno de ExcelJS
+  // (usado tal cual en el XML) sigue el orden de INSERCIÓN, no el de orderNo:
+  // eso dejaba sheetId="10,1,2,...,9" en workbook.xml — técnicamente válido
+  // para el esquema OOXML, pero Excel lo rechaza con "encontramos un problema
+  // con el contenido" al abrir (confirmado 2026-09-17, reproducido con datos
+  // reales y corregido con este reordenamiento).
+  const sheet = workbook.addWorksheet('0. Resumen Dashboard');
+
+  const [dashboardData] = await Promise.all([
+    computeDashboardData(query),
+    buildConciliacionWorkbook(query, workbook),
+  ]);
+  const k = dashboardData.kpis;
+
+  const FG_SECTION = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF334E68' } };
+  const FG_HDR     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F3A5F' } };
+  const FG_KPI      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF0F4FF' } };
+  const FG_WARN     = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF3CD' } };
+  const FG_DANGER   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8D7DA' } };
+  const FG_OK       = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1FAE5' } };
+  const FONT_SECTION = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+  const FONT_HDR      = { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 };
+  const FONT_LABEL    = { size: 10, color: { argb: 'FF475569' } };
+  const FONT_VALUE    = { bold: true, size: 11, color: { argb: 'FF0F172A' } };
+  const MXN = '"$"#,##0.00';
+  const round2 = (v) => v != null ? Math.round(v * 100) / 100 : null;
+
+  sheet.views = [{ state: 'frozen', ySplit: 2 }];
+  sheet.columns = [
+    { key: 'a', width: 34 },
+    { key: 'b', width: 20 },
+    { key: 'c', width: 34 },
+    { key: 'd', width: 22 },
+  ];
+
+  sheet.mergeCells('A1:D1');
+  const title = sheet.getCell('A1');
+  title.value = `🔒 Cierre de Mes — ${periodoLabel}`;
+  title.font  = { bold: true, size: 15, color: { argb: 'FF1F3A5F' } };
+  title.alignment = { horizontal: 'center', vertical: 'middle' };
+  sheet.getRow(1).height = 30;
+
+  sheet.mergeCells('A2:D2');
+  const sub = sheet.getCell('A2');
+  sub.value = `Generado el ${new Date().toLocaleString('es-MX')} — resumen del dashboard al momento del cierre (ver hojas siguientes para la conciliación completa)`;
+  sub.font  = { italic: true, size: 9, color: { argb: 'FF64748B' } };
+  sub.alignment = { horizontal: 'center' };
+  sheet.getRow(2).height = 16;
+
+  let r = 2;
+
+  const sectionHeader = (titleTxt) => {
+    r++;
+    sheet.mergeCells(`A${r}:D${r}`);
+    const c = sheet.getCell(`A${r}`);
+    c.value = titleTxt;
+    c.font = FONT_SECTION;
+    c.fill = FG_SECTION;
+    c.alignment = { horizontal: 'left', vertical: 'middle' };
+    sheet.getRow(r).height = 22;
+  };
+
+  /**
+   * Fila con hasta 2 pares indicador/valor, en formato tarjeta.
+   * Firma: (label1, value1, fmt1, fill1, label2, value2, fmt2, fill2) — los
+   * 8 parámetros son posicionales y casi todos opcionales (pasar `null`), así
+   * que UN SOLO argumento faltante en una llamada desalinea todos los que le
+   * siguen. Un `kpiPair(...)` con un argumento de menos pasó un STRING como
+   * `fill1` (ExcelJS no valida el tipo — lo "registra" incrementando el
+   * conteo de fills en styles.xml sin escribir el `<fill>` real), y Excel
+   * detecta ese desfase como archivo dañado al abrirlo ("Hemos encontrado un
+   * problema con el contenido..."), confirmado 2026-09-17 con Excel real vía
+   * automatización COM/UI Automation. Si se agrega una llamada nueva, contar
+   * los 8 argumentos con cuidado.
+   */
+  const kpiPair = (label1, value1, fmt1, fill1, label2, value2, fmt2, fill2) => {
+    r++;
+    const row = sheet.getRow(r);
+    row.getCell('a').value = label1;
+    row.getCell('a').font  = FONT_LABEL;
+    row.getCell('a').fill  = FG_KPI;
+    row.getCell('b').value = value1;
+    row.getCell('b').font  = FONT_VALUE;
+    row.getCell('b').fill  = fill1 || FG_KPI;
+    if (fmt1) row.getCell('b').numFmt = fmt1;
+    row.getCell('c').fill = FG_KPI;
+    row.getCell('d').fill = fill2 || FG_KPI;
+    if (label2 !== undefined) {
+      row.getCell('c').value = label2;
+      row.getCell('c').font  = FONT_LABEL;
+      row.getCell('d').value = value2;
+      row.getCell('d').font  = FONT_VALUE;
+      if (fmt2) row.getCell('d').numFmt = fmt2;
+    }
+    row.height = 19;
+  };
+
+  const blankRow = () => { r++; };
+
+  // ══ Totales generales ══
+  sectionHeader('Totales generales');
+  kpiPair('Total CFDIs', k.totalCFDIs, null, null,
+          'Diferencia ERP − SAT', round2(k.diferencia), MXN, Math.abs(k.diferencia) > 0.01 ? FG_DANGER : FG_OK);
+  kpiPair('Total ERP', round2(k.totalERP), MXN, null, 'Total SAT', round2(k.totalSAT), MXN, null);
+  kpiPair('CFDIs ERP (activos)', k.countERP, null, null, 'CFDIs SAT (activos)', k.countSAT, null, null);
+
+  // ══ Estado de conciliación ══
+  blankRow();
+  sectionHeader('Estado de conciliación');
+  kpiPair('Conciliados', k.conciliados, null, k.conciliados > 0 ? FG_OK : null,
+          'Con discrepancia', k.conDiscrepancia, null, k.conDiscrepancia > 0 ? FG_WARN : null);
+  kpiPair('Sin conciliar', k.sinConciliar, null, k.sinConciliar > 0 ? FG_WARN : null,
+          'No en ERP (solo SAT)', k.notInErp, null, k.notInErp > 0 ? FG_DANGER : null);
+  kpiPair('No en SAT (solo ERP)', k.notInSat, null, k.notInSat > 0 ? FG_DANGER : null,
+          'Cancelado ERP, coincide SAT', k.cancelledMatch, null, null);
+
+  // ══ Cancelados y sin UUID ══
+  blankRow();
+  sectionHeader('Cancelados y sin UUID fiscal');
+  kpiPair('ERP cancelados (cant.)', k.erpCancelados.count, null, null, 'ERP cancelados (monto)', round2(k.erpCancelados.total), MXN, null);
+  kpiPair('SAT cancelados (cant.)', k.satCancelados.count, null, null, 'SAT cancelados (monto)', round2(k.satCancelados.total), MXN, null);
+  kpiPair('ERP sin UUID real (cant.)', k.erpSinUuid.count, null, null, 'ERP sin UUID real (monto)', round2(k.erpSinUuid.total), MXN, null);
+  kpiPair('Vigente en SAT y en ERP (cant.)', k.vigenteErpSat.count, null, null, 'Vigente en SAT y en ERP (monto)', round2(k.vigenteErpSat.total), MXN, null);
+
+  // ══ IVA ══
+  blankRow();
+  sectionHeader('IVA (CFDIs activos)');
+  kpiPair('IVA Trasladado ERP', round2(k.ivaStats.erp.ivaTrasladadoTotal), MXN, null, 'IVA Trasladado SAT', round2(k.ivaStats.sat.ivaTrasladadoTotal), MXN, null);
+  kpiPair('IVA Retenido ERP', round2(k.ivaStats.erp.ivaRetenidoTotal), MXN, null, 'IVA Retenido SAT', round2(k.ivaStats.sat.ivaRetenidoTotal), MXN, null);
+  kpiPair('IVA Neto ERP', round2(k.ivaStats.erp.ivaNeto), MXN, null, 'IVA Neto SAT', round2(k.ivaStats.sat.ivaNeto), MXN, null);
+
+  // ══ CFDIs por estatus SAT ══
+  if (k.cfdisBySatStatus?.length) {
+    blankRow();
+    sectionHeader('CFDIs ERP por estatus SAT');
+    r++;
+    const h = sheet.getRow(r);
+    h.getCell('a').value = 'Estatus SAT';
+    h.getCell('b').value = 'Cantidad';
+    sheet.mergeCells(`C${r}:D${r}`);
+    h.getCell('c').value = 'Monto';
+    h.eachCell({ includeEmpty: true }, (c) => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'left', vertical: 'middle' }; });
+    h.height = 18;
+    for (const s of k.cfdisBySatStatus) {
+      r++;
+      const row = sheet.getRow(r);
+      row.getCell('a').value = s._id || 'Sin verificar';
+      row.getCell('b').value = s.count;
+      sheet.mergeCells(`C${r}:D${r}`);
+      row.getCell('c').value = round2(s.totalAmount);
+      row.getCell('c').numFmt = MXN;
+    }
+  }
+
+  // ══ Top tipos de discrepancia abiertas ══
+  if (dashboardData.topDiscrepancyTypes?.length) {
+    blankRow();
+    sectionHeader('Top tipos de discrepancia (abiertas)');
+    r++;
+    const h = sheet.getRow(r);
+    h.getCell('a').value = 'Tipo';
+    h.getCell('b').value = 'Cantidad';
+    h.eachCell({ includeEmpty: true }, (c) => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'left', vertical: 'middle' }; });
+    h.height = 18;
+    for (const t of dashboardData.topDiscrepancyTypes) {
+      r++;
+      const row = sheet.getRow(r);
+      row.getCell('a').value = t._id || 'Sin tipo';
+      row.getCell('b').value = t.count;
+    }
+  }
+
+  // ══ Discrepancias abiertas recientes ══
+  if (dashboardData.recentDiscrepancies?.length) {
+    blankRow();
+    sectionHeader('Discrepancias abiertas recientes (últimas 10)');
+    r++;
+    const h = sheet.getRow(r);
+    h.getCell('a').value = 'UUID';
+    h.getCell('b').value = 'Tipo';
+    sheet.mergeCells(`C${r}:D${r}`);
+    h.getCell('c').value = 'Severidad / Descripción';
+    h.eachCell({ includeEmpty: true }, (c) => { c.font = FONT_HDR; c.fill = FG_HDR; c.alignment = { horizontal: 'left', vertical: 'middle' }; });
+    h.height = 18;
+    for (const d of dashboardData.recentDiscrepancies) {
+      r++;
+      const row = sheet.getRow(r);
+      row.getCell('a').value = d.uuid || '';
+      row.getCell('a').font  = { size: 9 };
+      row.getCell('b').value = d.type || '';
+      sheet.mergeCells(`C${r}:D${r}`);
+      row.getCell('c').value = `[${d.severity || ''}] ${d.description || ''}`;
+      row.getCell('c').font  = { size: 9 };
+    }
+  }
+
+  const filename = `cierre_mes_${query.ejercicio || 'all'}_${query.periodo || 'all'}_${Date.now()}.xlsx`;
+  return { workbook, periodoLabel, filename };
+}
+
+const conciliacionExcel = asyncHandler(async (req, res) => {
+  const { workbook, filename } = await buildConciliacionWorkbook(req.query);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   await workbook.xlsx.write(res);
@@ -4437,4 +4699,4 @@ const depositosIngresosExport = asyncHandler(async (req, res) => {
   res.end();
 });
 
-module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, pagosBancoSugerencias, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport };
+module.exports = { dashboard, dashboardRecibidos, resumenCfdis, exportExcel, discrepanciasMontos, satVigenteErpInactivo, discrepanciasCriticas, notInErp, pagosRelacionados, conciliacionExcel, clearDashboardCache, pagosBanco, pagosBancoDetalle, pagosBancoExport, pagosBancosDistintos, pagosBancoContextoBanco, pagosBancoSugerencias, depositosIngresos, depositosIngresosDetalle, depositosIngresosExport, computeDashboardData, buildConciliacionWorkbook, buildCierreMesWorkbook };

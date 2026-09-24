@@ -1194,6 +1194,117 @@ const exportZipRecibidos = asyncHandler(async (req, res) => {
   res.send(buffer);
 });
 
+/**
+ * GET /api/cfdis/export-reporte-recibidos
+ * Genera un .xlsx con la info principal (fiscal, no de reconciliación Numo)
+ * de TODOS los CFDIs Recibidos (source='SAT') de un RFC receptor y mes
+ * (ejercicio/periodo) dados — mismo filtro que `exportZipRecibidos`, sin
+ * necesidad de seleccionar nada. Una hoja por tipo de comprobante (Ingresos/
+ * Egresos/Pagos/Traslados/Nómina) — se omiten las hojas sin CFDIs de ese tipo.
+ * Query: rfcReceptor, ejercicio, periodo
+ */
+const HOJA_POR_TIPO_COMPROBANTE = {
+  I: 'Ingresos', E: 'Egresos', P: 'Pagos', T: 'Traslados', N: 'Nómina',
+};
+
+const exportReporteRecibidos = asyncHandler(async (req, res) => {
+  const { rfcReceptor, ejercicio, periodo } = req.query;
+  if (!rfcReceptor) return res.status(400).json({ error: 'rfcReceptor es requerido' });
+  if (!ejercicio || !periodo) return res.status(400).json({ error: 'ejercicio y periodo son requeridos' });
+
+  const ej = parseInt(ejercicio);
+  const pe = parseInt(periodo);
+
+  const cfdis = await CFDI.find({
+    isActive:        true,
+    source:          'SAT',
+    'receptor.rfc':  rfcReceptor.toUpperCase(),
+    ejercicio:       ej,
+    periodo:         pe,
+  }, { xmlContent: 0 }).sort({ fecha: -1 }).lean();
+
+  if (!cfdis.length) {
+    return res.status(404).json({ error: 'No hay CFDIs recibidos para ese RFC y periodo.' });
+  }
+
+  const workbook = new ExcelJS.Workbook();
+  const columnas = [
+    { header: 'UUID',                    key: 'uuid',              width: 38 },
+    { header: 'RFC Emisor',              key: 'rfcEmisor',         width: 16 },
+    { header: 'Nombre Emisor',           key: 'nombreEmisor',      width: 30 },
+    { header: 'Régimen Fiscal Emisor',   key: 'regimenFiscalEmisor',   width: 18 },
+    { header: 'RFC Receptor',            key: 'rfcReceptor',       width: 16 },
+    { header: 'Nombre Receptor',         key: 'nombreReceptor',    width: 30 },
+    { header: 'Régimen Fiscal Receptor', key: 'regimenFiscalReceptor', width: 18 },
+    { header: 'Uso de CFDI',             key: 'usoCFDI',           width: 14 },
+    { header: 'Serie',                   key: 'serie',             width: 8  },
+    { header: 'Folio',                   key: 'folio',             width: 14 },
+    { header: 'Fecha',                   key: 'fecha',             width: 12 },
+    { header: 'Forma de Pago',           key: 'formaPago',         width: 14 },
+    { header: 'Subtotal',                key: 'subTotal',          width: 14 },
+    { header: 'Total',                   key: 'total',             width: 14 },
+    { header: 'Moneda',                  key: 'moneda',            width: 8  },
+  ];
+
+  // Orden fijo (Ingresos primero) en vez del orden en que aparezcan los datos.
+  const cfdisPorTipo = new Map(); // 'I'|'E'|'P'|'T'|'N' -> cfdis[]
+  for (const c of cfdis) {
+    const tipo = c.tipoDeComprobante;
+    if (!cfdisPorTipo.has(tipo)) cfdisPorTipo.set(tipo, []);
+    cfdisPorTipo.get(tipo).push(c);
+  }
+
+  for (const tipo of ['I', 'E', 'P', 'T', 'N']) {
+    const cfdisDelTipo = cfdisPorTipo.get(tipo);
+    if (!cfdisDelTipo?.length) continue;
+
+    const sheet = workbook.addWorksheet(HOJA_POR_TIPO_COMPROBANTE[tipo]);
+    sheet.columns = columnas;
+
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true, color: { argb: 'FF1F3864' } };
+    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } };
+    headerRow.alignment = { vertical: 'middle' };
+    headerRow.commit();
+
+    for (const c of cfdisDelTipo) {
+      let total = c.total;
+      if (tipo === 'P' && c.complementoPago) {
+        total = c.complementoPago.totales?.montoTotalPagos
+             ?? c.complementoPago.pagos?.[0]?.monto
+             ?? c.total;
+      }
+      sheet.addRow({
+        uuid:                  c.uuid,
+        rfcEmisor:             c.emisor?.rfc            ?? '',
+        nombreEmisor:          c.emisor?.nombre         ?? '',
+        regimenFiscalEmisor:   c.emisor?.regimenFiscal   ?? '',
+        rfcReceptor:           c.receptor?.rfc          ?? '',
+        nombreReceptor:        c.receptor?.nombre       ?? '',
+        regimenFiscalReceptor: c.receptor?.regimenFiscal ?? '',
+        usoCFDI:               c.receptor?.usoCFDI       ?? '',
+        serie:                 c.serie  ?? '',
+        folio:                 c.folio  ?? '',
+        fecha:                 c.fecha  ? new Date(c.fecha) : '',
+        formaPago:             c.formaPago ?? '',
+        subTotal:              c.subTotal ?? 0,
+        total:                 total      ?? 0,
+        moneda:                c.moneda   ?? '',
+      });
+    }
+
+    sheet.getColumn('fecha').numFmt    = 'dd/mm/yyyy';
+    sheet.getColumn('subTotal').numFmt = '#,##0.00';
+    sheet.getColumn('total').numFmt    = '#,##0.00';
+  }
+
+  const nombreArchivo = `Reporte_Recibidos_${rfcReceptor.toUpperCase()}_${ej}${String(pe).padStart(2, '0')}.xlsx`;
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${nombreArchivo}"`);
+  await workbook.xlsx.write(res);
+  res.end();
+});
+
 // ── Reclasificación Global ────────────────────────────────────────────────────
 
 /**
@@ -1531,7 +1642,7 @@ const repairXmlSubtotals = asyncHandler(async (req, res) => {
 
 module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
-  exportZipRecibidos,
+  exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
   repairXmlSubtotals,
 };

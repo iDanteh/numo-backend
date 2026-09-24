@@ -669,6 +669,17 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
   const fecha  = fechaInicio.slice(0, 10);
   let checkpoint = await SatJobCheckpoint.findOne({ rfc: rfc.toUpperCase(), fecha, tipoComprobante: cpTipo });
 
+  // Los paquetes SAT caducan a las 72 horas. Si el checkpoint tiene más de 72 horas,
+  // se descarta y se hace una nueva solicitud para evitar descargar un paquete ya expirado.
+  // BUG CORREGIDO (2026-09-17, caso real: "Todos los tipos de comprobante
+  // fallaron" con ReferenceError "Cannot access 'CHECKPOINT_MAX_AGE_MS' before
+  // initialization"): esta constante se usaba mas abajo (chequeo `enVuelo`)
+  // ANTES de esta declaracion — `node --check` no lo detecta (solo valida
+  // sintaxis), pero en runtime `const` no se puede leer antes de su propia
+  // linea de declaracion (temporal dead zone). Se sube la declaracion antes
+  // del primer uso.
+  const CHECKPOINT_MAX_AGE_MS = 72 * 60 * 60 * 1000; // 72 horas
+
   // Si ya hay una solicitud en vuelo (no completada ni con error), no duplicar
   const enVuelo = checkpoint?.status === 'solicitando' || checkpoint?.status === 'verificando';
   if (enVuelo && (Date.now() - new Date(checkpoint.updatedAt).getTime()) < CHECKPOINT_MAX_AGE_MS) {
@@ -678,9 +689,6 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
 
   let idSolicitud, idsPaquetes;
 
-  // Los paquetes SAT caducan a las 72 horas. Si el checkpoint tiene más de 72 horas,
-  // se descarta y se hace una nueva solicitud para evitar descargar un paquete ya expirado.
-  const CHECKPOINT_MAX_AGE_MS = 72 * 60 * 60 * 1000; // 72 horas
   const checkpointVigente =
     checkpoint?.status === 'descargando' &&
     checkpoint.idsPaquetes?.length > 0 &&

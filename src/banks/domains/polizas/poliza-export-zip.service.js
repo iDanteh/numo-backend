@@ -19,7 +19,7 @@ const sanitize = (s) => String(s ?? '').replace(/[^\w-]+/g, '_');
  *
  * Devuelve: { buffer: Buffer, nombreZip: string }
  */
-async function exportarContpaqZip({ rfc, ejercicio, periodo, tipoCfdi, tipoPropuesta, modo, fechaInicio, fechaFin, formaPagoFiltro }) {
+async function exportarContpaqZip({ rfc, ejercicio, periodo, tipoCfdi, tipoPropuesta, modo, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -27,11 +27,11 @@ async function exportarContpaqZip({ rfc, ejercicio, periodo, tipoCfdi, tipoPropu
 
   let resultados;
   if (modo === 'porSucursal') {
-    ({ resultados } = await generator.generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro }));
+    ({ resultados } = await generator.generarYGuardarPorSucursal({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro, user }));
   } else if (modo === 'porDia') {
-    ({ resultados } = await generator.generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro }));
+    ({ resultados } = await generator.generarYGuardarPorDia({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro, user }));
   } else if (modo === 'porDiaYSucursal') {
-    ({ resultados } = await generator.generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro }));
+    ({ resultados } = await generator.generarYGuardarPorSucursalYDia({ rfc, ejercicio, periodo, tipoPropuesta, tipoCfdi, fechaInicio, fechaFin, formaPagoFiltro, user }));
   } else {
     throw new BadRequestError(`modo inválido: "${modo}" (debe ser porSucursal, porDia o porDiaYSucursal)`);
   }

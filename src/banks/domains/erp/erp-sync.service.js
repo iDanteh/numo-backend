@@ -170,6 +170,15 @@ async function sincronizarCuentasPendientes(params = {}) {
 // serie/folio" (incompleto), dejando cobros reales sin encontrar y
 // fragmentando la venta en líneas "Venta Sin Cobro" (caso real B0-260803791,
 // $24,981.27 cobrados en Efectivo, solo $1,462.89 se reconciliaban).
+//
+// 2026-09-18: el hallazgo de arriba nunca se tradujo en cambiar el timeout
+// real — seguía en 30000. Confirmado que sigue insuficiente para consultas
+// "por centro" de un día completo en sucursales grandes (D0/Hidalgo,
+// H0/Tehuantepec): 3 intentos de 30s agotados igual, generarYGuardar
+// terminaba en 500. Subido a 45000 (un intento aislado SÍ respondió en ~47s
+// totales incluyendo backoff, probado en vivo contra el ERP real ese mismo
+// día) y luego a 60000 (confirmado con el usuario, mismo día, tras seguir
+// viendo timeouts con 45000).
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   const token = await _tokenPolizas();
@@ -178,7 +187,7 @@ async function _getConReintento(url, params, logLabel) {
       return await axios.get(url, {
         params,
         headers: { Authorization: `Bearer ${token}` },
-        timeout: 30000,
+        timeout: 60000,
       });
     } catch (axErr) {
       const status    = axErr.response?.status;
@@ -517,8 +526,50 @@ async function obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen, fechaDesde,
   return salidas;
 }
 
+// Nombre del cliente de UN ticket SIN factura (2026-09-23, confirmado con el
+// usuario: caso real I0-260400001, salía "CLIENTE NO IDENTIFICADO" en vez de
+// DIEGO MARTIN ALEJANDRO ALVAREZ ROMO DE VIVAR). `/desgloses-cobro/almacen`
+// no trae el cliente; `/cuentas-pendientes` sí (`nombrePersona`), filtrando
+// por el folio del ticket y un rango de ±1 día sobre su `fechaCreacion`.
+// Una sola llamada (sin la verificación cruzada de `sincronizarCuentasPendientes`,
+// pensada para descargas masivas): es solo el nombre para el concepto — si
+// falla o no viene, el caller conserva "CLIENTE NO IDENTIFICADO". Las fallas
+// no se cachean, así una regeneración posterior lo vuelve a intentar.
+const _cacheNombrePersona = new Map();
+async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) {
+  if (!rfc || !serie || !folio || !fechaCreacion) return null;
+  const creada = new Date(fechaCreacion);
+  if (Number.isNaN(creada.getTime())) return null;
+  const clave = `${rfc}::${serie}|${folio}`;
+  const cacheado = _leerCache(_cacheNombrePersona, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  let nombre = null;
+  try {
+    const response = await axios.get(`${await _cuentasPendientesUrl()}/cuentas-pendientes`, {
+      params: {
+        fechaDesde:   new Date(creada.getTime() - MS_UN_DIA).toISOString(),
+        fechaHasta:   new Date(creada.getTime() + MS_UN_DIA).toISOString(),
+        serieExterna: String(serie).trim(),
+        folioExterno: String(folio).trim(),
+      },
+      headers: { Authorization: `Bearer ${await _token()}` },
+      timeout: 15000,
+    });
+    const cuenta = (response.data?.Data?.cuentas ?? [])
+      .find(c => c.serieExterna === serie && String(c.folioExterno) === String(folio));
+    nombre = (cuenta?.nombrePersona ?? '').trim() || null;
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn(`[ErpSync] nombre de cliente para ${serie}-${folio} no disponible (${err.response?.status ?? err.message})`);
+    return null;
+  }
+  _cacheNombrePersona.set(clave, { data: nombre, ts: Date.now() });
+  return nombre;
+}
+
 module.exports = {
-  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor,
+  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor, obtenerNombrePersonaTicket,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
   obtenerDesglosesSalidasCajaPorAlmacen,
 };

@@ -200,6 +200,7 @@ const startServer = async () => {
   require('./visor/jobs/credencialesAlertJob');
   require('./visor/jobs/cfdiCanceladoNotificacionJob');
   require('./system-monitor/system-monitor.cron');
+  require('./visor/jobs/cfdisNoRecuperadosAlertJob');
   try {
     await seed();
   } catch (err) {

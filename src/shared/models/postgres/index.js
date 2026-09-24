@@ -18,6 +18,7 @@ const BankRule          = require('./BankRule');
 const AccountPlan       = require('./AccountPlan');
 const Entity            = require('./Entity');
 const PeriodoFiscal     = require('./PeriodoFiscal');
+const CierreMesHistorico = require('./CierreMesHistorico');
 const Permission        = require('./Permission');
 const Role              = require('./Role');
 const Poliza            = require('./Poliza');
@@ -42,6 +43,14 @@ AccountPlan.hasMany  (AccountPlan, { foreignKey: 'parentId', as: 'children' });
 /** Períodos fiscales creados por usuarios */
 PeriodoFiscal.belongsTo(User, { foreignKey: 'createdBy', as: 'creator' });
 User.hasMany(PeriodoFiscal,  { foreignKey: 'createdBy', as: 'periodos' });
+
+/** Historial de cierres de mes (uno por cada vez que se cierra un período) */
+CierreMesHistorico.belongsTo(PeriodoFiscal, { foreignKey: 'periodoFiscalId', as: 'periodoFiscal' });
+PeriodoFiscal.hasMany(CierreMesHistorico,   { foreignKey: 'periodoFiscalId', as: 'cierres' });
+CierreMesHistorico.belongsTo(User, { foreignKey: 'cerradoPorId', as: 'cerradoPor' });
+User.hasMany(CierreMesHistorico,   { foreignKey: 'cerradoPorId', as: 'cierresMesRealizados' });
+CierreMesHistorico.belongsTo(User, { foreignKey: 'revertidoPorId', as: 'revertidoPor' });
+User.hasMany(CierreMesHistorico,   { foreignKey: 'revertidoPorId', as: 'cierresMesRevertidos' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -129,6 +138,29 @@ async function syncModels() {
 
   // PeriodoFiscal depende de users
   await syncAlter(PeriodoFiscal);
+
+  // Cierre de mes (idempotente, ver PeriodoFiscal.js)
+  await Poliza.sequelize.query(`
+    ALTER TABLE periodos_fiscales
+      ADD COLUMN IF NOT EXISTS cerrado          BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS cerrado_por_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS cerrado_en        TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS revertido_por_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS revertido_en      TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN cierre de mes (periodos_fiscales):', e.message));
+
+  // Historial de cierres de mes — tabla nueva, depende de periodos_fiscales y users.
+  await CierreMesHistorico.sync({ force: false });
+
+  // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
+  // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla
+  // que ya existe, así que la columna nueva necesita su propio ALTER TABLE
+  // explícito (mismo bug ya visto con pendientes_por_facturar en Poliza).
+  await CierreMesHistorico.sequelize.query(`
+    ALTER TABLE cierres_mes_historico
+      ADD COLUMN IF NOT EXISTS revertido_por_id  INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS revertido_en      TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN revertido_por_id/revertido_en (cierres_mes_historico):', e.message));
 
   // Reglas de mapeo CFDI deben existir antes de poliza_movimientos (FK regla_id)
   await syncAlter(CfdiMappingRule);
@@ -356,6 +388,14 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS pendientes_por_facturar JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN pendientes_por_facturar:', e.message));
 
+  // Saldo a favor aplicado a una venta consumidora que sigue PPD/POR
+  // FACTURAR en Kore, detectado al generar la póliza — informativo, nunca
+  // se contabiliza (idempotente, mismo patrón que pendientes_por_facturar).
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS movimientos_ppd_por_facturar JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_ppd_por_facturar:', e.message));
+
   // "DEPOSITO EN EFECTIVO" sin conciliar, detectado al generar la póliza —
   // informativo, nunca se contabiliza (idempotente). BUG REAL 2026-09-10:
   // se agregó el campo al modelo Poliza.js sin este ALTER — Poliza no está
@@ -420,4 +460,4 @@ async function syncModels() {
   await ConfigAuditLog.sync({ force: false });
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };

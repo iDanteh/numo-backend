@@ -15,10 +15,12 @@
 
 const { validationResult } = require('express-validator');
 const periodoRepo          = require('../repositories/periodo-fiscal.repository');
+const cierreMesRepo        = require('../repositories/cierre-mes-historico.repository');
 const Comparison           = require('../models/Comparison');
 const Discrepancy          = require('../models/Discrepancy');
 const CFDI                 = require('../models/CFDI');
 const { asyncHandler }     = require('../../shared/middleware/error-handler');
+const { buildCierreMesWorkbook } = require('./report.controller');
 
 /**
  * GET /api/periodos-fiscales
@@ -174,4 +176,99 @@ const remove = asyncHandler(async (req, res) => {
   res.json({ message: 'Eliminado' });
 });
 
-module.exports = { list, listSimple, create, remove };
+/**
+ * POST /api/periodos-fiscales/:id/cerrar
+ * Cierre de mes: genera el reporte completo (dashboard + conciliación) con
+ * los datos al momento exacto del cierre, y marca el periodo como cerrado.
+ * No se puede volver a cerrar un periodo ya cerrado — solo revertirlo primero.
+ */
+const cerrar = asyncHandler(async (req, res) => {
+  const doc = await periodoRepo.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'Periodo no encontrado' });
+
+  if (doc.cerrado) {
+    return res.status(409).json({
+      error: 'Este periodo ya está cerrado. Para volver a cerrarlo, primero debe revertirse el cierre.',
+      code:  'PERIODO_YA_CERRADO',
+    });
+  }
+
+  const query = {
+    ejercicio: String(doc.ejercicio),
+    ...(doc.periodo != null ? { periodo: String(doc.periodo) } : {}),
+    ...(req.body?.rfcEmisor ? { rfcEmisor: req.body.rfcEmisor } : {}),
+  };
+
+  const { workbook, filename, periodoLabel } = await buildCierreMesWorkbook(query);
+  const fileData = Buffer.from(await workbook.xlsx.writeBuffer());
+
+  const userId = req.user?.dbId ? parseInt(req.user.dbId, 10) : null;
+  await periodoRepo.cerrar(doc.id, userId);
+
+  // Se guarda el reporte generado en este cierre para poder redescargarlo
+  // después desde Reportes → Cierre de Mes, aunque el período se reabra y
+  // se vuelva a cerrar (cada cierre queda como un registro histórico aparte).
+  await cierreMesRepo.create({
+    periodoFiscalId: doc.id,
+    ejercicio:       doc.ejercicio,
+    periodo:         doc.periodo,
+    periodoLabel:    periodoLabel ?? doc.label ?? null,
+    rfcEmisor:       req.body?.rfcEmisor || null,
+    filename,
+    fileData,
+    fileSize:        fileData.length,
+    cerradoPorId:    userId,
+  });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(fileData);
+});
+
+/**
+ * GET /api/periodos-fiscales/cierres
+ * Historial de reportes de Cierre de Mes generados (sin el binario del archivo).
+ */
+const listCierres = asyncHandler(async (_req, res) => {
+  const cierres = await cierreMesRepo.findAll();
+  res.json({ data: cierres });
+});
+
+/**
+ * GET /api/periodos-fiscales/cierres/:id/descargar
+ * Redescarga el .xlsx generado en un cierre de mes anterior, tal cual quedó
+ * en ese momento (no se regenera con datos actuales).
+ */
+const descargarCierre = asyncHandler(async (req, res) => {
+  const cierre = await cierreMesRepo.findById(req.params.id);
+  if (!cierre) return res.status(404).json({ error: 'Cierre no encontrado' });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${cierre.filename}"`);
+  res.send(cierre.fileData);
+});
+
+/**
+ * POST /api/periodos-fiscales/:id/revertir-cierre
+ * Revierte el cierre de un periodo. Restringido a PERMISSIONS.VISOR_CIERRE_MES_REVERTIR
+ * (ver rbac.js) — a propósito distinto de VISOR_WRITE, para que solo se asigne
+ * a quien deba tener la capacidad de reabrir un mes ya cerrado.
+ */
+const revertirCierre = asyncHandler(async (req, res) => {
+  const doc = await periodoRepo.findById(req.params.id);
+  if (!doc) return res.status(404).json({ error: 'Periodo no encontrado' });
+
+  if (!doc.cerrado) {
+    return res.status(409).json({ error: 'Este periodo no está cerrado.', code: 'PERIODO_NO_CERRADO' });
+  }
+
+  const userId = req.user?.dbId ? parseInt(req.user.dbId, 10) : null;
+  const updated = await periodoRepo.revertirCierre(doc.id, userId);
+  // Refleja quién revirtió también en el historial de Reportes > Cierre de
+  // Mes (2026-09-21) — marca el cierre vigente de este período, no el estado
+  // de PeriodoFiscal (que ya lo guarda, pero se sobrescribe en el próximo cierre).
+  await cierreMesRepo.marcarRevertido(doc.id, userId);
+  res.json(updated);
+});
+
+module.exports = { list, listSimple, create, remove, cerrar, revertirCierre, listCierres, descargarCierre };

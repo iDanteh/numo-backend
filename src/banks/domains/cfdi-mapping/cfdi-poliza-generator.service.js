@@ -1669,8 +1669,18 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // siendo SOLO lo que el loop por-factura puede consultar) para que el
   // caller decida cómo mostrarlo sin un CFDI real detrás (solo serie/folio,
   // sin nombre de cliente ni UUID).
+  //
+  // Solo facturas consumidoras de ESTA sucursal (serie de `facturaKey` =
+  // `centroPropioClave`): `/saldos-favor` por centro también regresa usos
+  // del saldo en OTRA sucursal, cuya factura nunca va a estar en este batch
+  // aunque sí esté sincronizada — se contaba dos veces, en la póliza de la
+  // sucursal que cobró (correcto) y aquí sin contrapartida (bug real
+  // 2026-09-24, Ferrocarril 18-sep póliza 909: saldos de F0-260800614 y
+  // F0-251100167 usados en Atzompa E0-260901756/751, ya en la póliza 764).
+  const esFacturaDeEsteCentro = (facturaKey) =>
+    !centroPropioClave || String(facturaKey).split('|')[0] === centroPropioClave;
   const saldoFavorUsadoSinFactura = [...saldoFavorUsado.entries()]
-    .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey))
+    .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey) && esFacturaDeEsteCentro(facturaKey))
     .map(([facturaKey, { monto, detalle }]) => ({ facturaKey, monto, detalle }));
 
   // Mismo hueco que `saldoFavorUsadoSinFactura`, pero para Puntos/Club
@@ -1681,7 +1691,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // centro (confirmado con el usuario 2026-09-18, mismo caso real
   // H0-260900441/Tehuantepec).
   const puntosUsadoSinFactura = [...puntosUsado.entries()]
-    .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey))
+    .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey) && esFacturaDeEsteCentro(facturaKey))
     .reduce((s, [, monto]) => s + (Number(monto) || 0), 0);
 
   return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar, saldoFavorUsadoSinFactura, puntosUsadoSinFactura };

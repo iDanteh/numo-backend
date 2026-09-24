@@ -3780,7 +3780,29 @@ async function exportContpaqXlsx(id, overrides = {}) {
       if (clave && serie && !serieDeClave.has(clave)) serieDeClave.set(clave, serie);
     }
     if (serieDeClave.size) {
-      const retirosPorCentro = new Map(); // clave → monto (para emparejar con mov.centroCosto)
+      // RETD ("RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA") se resta
+      // SOLO cuando devuelve un "Cobro sin factura" del mismo día (confirmado
+      // con el usuario 2026-09-24, caso real CONSTRUCASA 22-sep: tickets sin
+      // factura C0-260904264 $115.16 y C0-260904353 $16.27, cobrados y
+      // devueltos el mismo día — el reporte de caja los netea en $0 y la
+      // póliza dejaba contado el cobro sin nada que descontara la salida).
+      // En cualquier otro caso el RETD ya está representado: ticket con
+      // factura → su Devolución/Cancelación (CFDI) ya abona Caja en su propio
+      // renglón; saldo a favor retirado → `SF-RETIRO-EFECTIVO`; venta y
+      // cancelación el mismo día → el cobro ni entra al consolidado (restarlo
+      // dejaba de menos, ej. Hidalgo 1-sep póliza 742, $337.99 — el doble
+      // conteo que motivó la exclusión de 2026-09-11). La salida no trae el
+      // ticket, así que se empareja por centro + monto (±$0.01), consumiendo
+      // cada "Cobro sin factura" una sola vez.
+      const cobrosSinFacturaPorCentro = new Map(); // clave → [montos COBRO-SIN-FACTURA]
+      for (const m of movimientos) {
+        if (m.reglaNombre !== 'COBRO-SIN-FACTURA' || !(Number(m.debe) > 0)) continue;
+        const clave = m.centroCostoObj?.clave ?? m.centroCosto ?? null;
+        if (!clave) continue;
+        if (!cobrosSinFacturaPorCentro.has(clave)) cobrosSinFacturaPorCentro.set(clave, []);
+        cobrosSinFacturaPorCentro.get(clave).push(Number(m.debe));
+      }
+      const retirosPorCentro = new Map(); // clave → { monto, montoRetd } (para emparejar con mov.centroCosto)
       for (const [claveCentro, serieAlmacen] of serieDeClave) {
         let salidas = [];
         try {
@@ -3800,23 +3822,45 @@ async function exportContpaqXlsx(id, overrides = {}) {
             return nombre.startsWith('RETIRO') && nombre !== RETIRO_EXCLUIDO_DOBLE_CONTEO;
           })
           .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
-        if (retiroEfectivo > 0) retirosPorCentro.set(claveCentro, Math.round(retiroEfectivo * 100) / 100);
+        const cobrosSinFacturaDisponibles = [...(cobrosSinFacturaPorCentro.get(claveCentro) ?? [])];
+        let retiroRetd = 0;
+        for (const s of salidas) {
+          if ((s.tipoMovimiento?.nombre || '').trim().toUpperCase() !== RETIRO_EXCLUIDO_DOBLE_CONTEO) continue;
+          const monto = Number(s.montoRetirado) || 0;
+          if (monto <= 0) continue;
+          const idx = cobrosSinFacturaDisponibles.findIndex(x => Math.abs(x - monto) < 0.015);
+          if (idx === -1) continue; // ya representado por otro lado (ver comentario arriba)
+          cobrosSinFacturaDisponibles.splice(idx, 1);
+          retiroRetd += monto;
+        }
+        const total = Math.round((retiroEfectivo + retiroRetd) * 100) / 100;
+        if (total > 0) retirosPorCentro.set(claveCentro, { monto: total, montoRetd: Math.round(retiroRetd * 100) / 100 });
       }
 
       if (retirosPorCentro.size) {
         for (const bloque of bloques) {
           for (const mov of bloque.movs) {
             if (mov.concepto !== 'Depósitos consolidados (Efectivo)') continue;
-            const retiro = retirosPorCentro.get(mov.centroCosto);
-            if (!retiro) continue;
+            const infoRetiro = retirosPorCentro.get(mov.centroCosto);
+            if (!infoRetiro) continue;
+            const retiro = infoRetiro.monto;
             const netoAjustado = Math.round((Number(mov.debe) - Number(mov.haber || 0) - retiro) * 100) / 100;
             mov.debe  = netoAjustado > 0 ? netoAjustado : 0;
             mov.haber = netoAjustado < 0 ? Math.abs(netoAjustado) : 0;
             if (!Array.isArray(mov._detalle)) mov._detalle = [];
-            mov._detalle.push({
-              cfdiUuid: null, serie: null, monto: -retiro, formaPago: 'EFECTIVO',
-              nota: 'RETIRO DE EFECTIVO (salida de caja)',
-            });
+            const retiroSinRetd = Math.round((retiro - infoRetiro.montoRetd) * 100) / 100;
+            if (retiroSinRetd > 0) {
+              mov._detalle.push({
+                cfdiUuid: null, serie: null, monto: -retiroSinRetd, formaPago: 'EFECTIVO',
+                nota: 'RETIRO DE EFECTIVO (salida de caja)',
+              });
+            }
+            if (infoRetiro.montoRetd > 0) {
+              mov._detalle.push({
+                cfdiUuid: null, serie: null, monto: -infoRetiro.montoRetd, formaPago: 'EFECTIVO',
+                nota: 'RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA (salida de caja)',
+              });
+            }
           }
         }
       }

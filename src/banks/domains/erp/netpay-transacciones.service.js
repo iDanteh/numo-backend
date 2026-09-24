@@ -26,14 +26,14 @@ const PAGE_SIZE_MAX = 100;
 // transacciones, muy por encima de cualquier volumen real esperado en esta vista.
 const MAX_PAGINAS = 50;
 
-async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo }) {
+async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, withAccountInfo }) {
   const transacciones = [];
   let page = 1;
   let totalPages = 1;
 
   do {
     const { raw } = await buscarTransaccionesNetpay({
-      responseCode, almacenes, dateFrom, dateTo, page, pageSize: PAGE_SIZE_MAX,
+      responseCode, almacenes, dateFrom, dateTo, withAccountInfo, page, pageSize: PAGE_SIZE_MAX,
     });
     const data = raw?.Data ?? {};
     transacciones.push(...(data.transactions ?? []));
@@ -49,8 +49,8 @@ async function _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo
 }
 
 async function consultarTransaccionesNetpay(params = {}) {
-  const { responseCode, almacenes, dateFrom, dateTo } = params;
-  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo });
+  const { responseCode, almacenes, dateFrom, dateTo, withAccountInfo } = params;
+  const transacciones = await _traerTodasLasPaginas({ responseCode, almacenes, dateFrom, dateTo, withAccountInfo });
 
   let totalMonto = 0;
   let totalComision = 0;

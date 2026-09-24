@@ -328,7 +328,7 @@ async function construirBancoRealPorTicket(movimientos) {
     const lote = pares.slice(i, i + LOTE);
     const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
-      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1 },
+      { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1, status: 1 },
       // `desglosePorFormaPago` viene DENTRO de cada `erpLinks[i]` — el `find`
       // de arriba ya trae erpLinks completo (`erpLinks: 1`), así que no hace
       // falta proyectarlo aparte.
@@ -348,6 +348,22 @@ async function construirBancoRealPorTicket(movimientos) {
       const referencia = m.folio || null;
       const numeroAutorizacion = m.numeroAutorizacion || m.referenciaNumerica || null;
       if (!referencia && !numeroAutorizacion) continue;
+      // Depósito ligado a UN SOLO ticket: el importe del renglón es el
+      // depósito real de Bancos (`m.deposito`), no lo que Kore aplicó al
+      // ticket — confirmado con el usuario 2026-09-24 (caso real 044377:
+      // depósito $7,628.00, Kore aplicó $7,627.29 = importe del CFDI). Mismo
+      // criterio que ya usaba el caso CFDI/`bancario` (26-ago). Con 2+ ligas
+      // (depósito repartido entre tickets, o parte a un anticipo OPA) se
+      // sigue usando la porción de cada ticket (`montoBancoReal`) para no
+      // contar el mismo depósito dos veces. Solo cambia el importe; el match
+      // por monto (`_elegirBancoRealPorMonto`) sigue usando `montoBancoReal`.
+      // Solo con status 'identificado': en 'no_identificado' el resto del
+      // depósito todavía no se liga a nadie y se podría contar dos veces
+      // cuando se ligue (caso real 048075: depósito $5,386.97, ligado solo
+      // $4,404.97).
+      const ligasValidas = (m.erpLinks ?? []).filter(l => l.serie && l.folioExterno);
+      const montoDeposito = ligasValidas.length === 1 && m.status === 'identificado' && typeof m.deposito === 'number'
+        ? m.deposito : null;
       for (const link of (m.erpLinks ?? [])) {
         if (!link.serie || !link.folioExterno) continue;
         const key = `${link.serie}|${link.folioExterno}`;
@@ -404,7 +420,7 @@ async function construirBancoRealPorTicket(movimientos) {
             ? link.saldoPagadoTotal
             : (typeof m.deposito === 'number' ? m.deposito : null));
         if (!mapa.has(key)) mapa.set(key, []);
-        mapa.get(key).push({ esTransferencia, categoriaConocida, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal });
+        mapa.get(key).push({ esTransferencia, categoriaConocida, referencia, numeroAutorizacion, banco: m.banco ?? null, cuentaBanco, montoBancoReal, montoDeposito });
       }
     }
   }
@@ -2137,7 +2153,16 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       if (gt._debeFijoBanco) {
         gt.debe = montoBancoReal;
       } else if (esTicketPropio && montoBancoReal != null) {
-        gt.debe += montoBancoReal;
+        // Depósito de un solo ticket: su importe real de Bancos, una sola vez
+        // por grupo aunque el ticket traiga 2+ líneas (ver `montoDeposito` en
+        // `construirBancoRealPorTicket`).
+        const montoDeposito = infoTicketTransfCheque?.montoDeposito ?? null;
+        if (montoDeposito == null) {
+          gt.debe += montoBancoReal;
+        } else if (!gt._depositoUnicoSumado) {
+          gt.debe += montoDeposito;
+          gt._depositoUnicoSumado = true;
+        }
       } else {
         gt.debe += Number(m.debe);
       }

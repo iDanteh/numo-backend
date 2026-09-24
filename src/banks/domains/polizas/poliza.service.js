@@ -2652,7 +2652,7 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
-function _extraerCobrosSucursal(movimientos) {
+function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null) {
   const resto = [];
   const filas = [];
   // SF-OCULTO: generados y usados el mismo día en la misma sucursal — no van
@@ -3010,7 +3010,17 @@ function _extraerCobrosSucursal(movimientos) {
   // trae letras, es el nombre genérico, se trata como el caso normal (con
   // prefijo COS-) en vez de como referencia bancaria real.
   const _esReferenciaBancoRealGenuina = (ref) => !!ref && /^\d+$/.test(ref.trim());
+  // Cobros de otra sucursal SIN depósito bancario real ligado (Tarjeta en
+  // "Bancos por identificar" 1102011005 y la cuenta puente 2103040001) van a
+  // Caja por identificar (1101010003), igual que Efectivo — confirmado con el
+  // usuario 2026-09-24. Los que SÍ traen folio/autorización de un depósito
+  // real conservan su cuenta de banco (BBVA/Banamex). SF/Puntos no se tocan.
+  const CUENTAS_COS_A_CAJA = new Set(['1102011005', '2103040001']);
   for (const f of filas) {
+    if (cuentaCajaCobroSucursal && CUENTAS_COS_A_CAJA.has(f.cuenta?.codigo)
+        && !_esReferenciaBancoRealGenuina(f._referenciaBancoReal)) {
+      f.cuenta = cuentaCajaCobroSucursal;
+    }
     f.serie = f._esVentaSinCobro
       ? ETIQUETA_VENTA_SIN_COBRO
       : _esReferenciaBancoRealGenuina(f._referenciaBancoReal)
@@ -3571,7 +3581,10 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // Cobros de sucursal: se sacan ANTES del pipeline de Contado/Crédito (nunca
   // deben pasar por consolidarCargos) y se reinyectan ya armados una vez que
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
-  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(movimientos);
+  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(
+    movimientos,
+    await AccountPlan.findOne({ where: { codigo: '1101010003' }, attributes: ['id', 'codigo', 'nombre'], raw: true }),
+  );
   movimientos = movimientosSinCobroSucursal;
 
   // MEDIDA TEMPORAL (2026-08-25, pedida por el usuario, caso real ELECTRICA

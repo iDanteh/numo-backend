@@ -84,6 +84,24 @@ jest.mock('./caja-transferencia-descartar-manual.service', () => ({ descartarMan
 jest.mock('./caja-transferencia-sync.service', () => ({ sincronizarTransferenciasCajasManual: jest.fn(), init: jest.fn() }));
 jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpay: jest.fn() }));
 
+// Netpay: carga manual del reporte (Implementación 1) — límite de I/O real de las nuevas
+// rutas. netpay-reporte.service tiene sus propios tests unitarios
+// (netpay-reporte.service.test.js); acá solo se cubre el cableado HTTP (multer, permisos,
+// params, códigos de respuesta) — mismo criterio que caja-transferencia-confirm.service
+// arriba.
+jest.mock('./netpay-reporte.service', () => ({
+  cargarReporte:              jest.fn(),
+  listar:                     jest.fn(),
+  obtenerDetalle:             jest.fn(),
+  obtenerPorMovimiento:       jest.fn(),
+  buscarCandidatos:           jest.fn(),
+  confirmarReporte:           jest.fn(),
+  descartarReporte:           jest.fn(),
+  consultarFolioKore:         jest.fn(),
+  consultarFoliosPendientes:  jest.fn(),
+}));
+jest.mock('./netpay-reporte-export.service', () => ({ generarExcelReporteNetpay: jest.fn() }));
+
 const express      = require('express');
 const request      = require('supertest');
 const router       = require('./erp.routes');
@@ -97,6 +115,13 @@ const { confirmarMatch }   = require('./caja-transferencia-confirm.service');
 const { descartarManual }  = require('./caja-transferencia-descartar-manual.service');
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
+const {
+  cargarReporte, listar: listarNetpayReportes, obtenerDetalle: obtenerDetalleNetpayReporte,
+  obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
+  buscarCandidatos: buscarCandidatosNetpayReporte,
+  confirmarReporte, descartarReporte, consultarFolioKore, consultarFoliosPendientes,
+} = require('./netpay-reporte.service');
+const { generarExcelReporteNetpay } = require('./netpay-reporte-export.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 describe('_aporteConRatchet', () => {
@@ -1668,5 +1693,422 @@ describe('_resolverCuentaDesdeCfdiLiquidado', () => {
         personaId: null, esAnticipo: false, origen: 'cfdi_liquidado',
       },
     });
+  });
+});
+
+// ── Netpay: carga manual del reporte (Implementación 1) ─────────────────────────────────
+// Solo cableado HTTP — la lógica real de parseo/matching/confirmación está cubierta en
+// netpay-reporte-parser.service.test.js y netpay-reporte.service.test.js.
+describe('POST /netpay/reporte/upload', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/upload')
+      .set('x-test-permissions', JSON.stringify([]))
+      .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
+
+    expect(res.status).toBe(403);
+    expect(cargarReporte).not.toHaveBeenCalled();
+  });
+
+  test('sin archivo adjunto: 400', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/upload')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(400);
+    expect(cargarReporte).not.toHaveBeenCalled();
+  });
+
+  test('archivo con extensión no permitida: rechazado por el fileFilter de multer, nunca llega a cargarReporte', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/upload')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
+      .attach('excelFile', Buffer.from('dummy'), 'reporte.pdf');
+
+    // El fileFilter de `uploadCyc` rechaza con un Error plano (no MulterError) — el
+    // error-handler genérico solo reconoce err.name==='MulterError' para dar 400, así que
+    // este camino cae a su branch AppError con status 500 (comportamiento YA existente,
+    // idéntico al de los demás uploads .../cyc/upload de este mismo archivo — no forma
+    // parte del alcance de esta feature). Lo que sí es responsabilidad de esta ruta: NUNCA
+    // debe llegar a llamar a cargarReporte con un archivo rechazado.
+    expect(res.status).toBe(500);
+    expect(cargarReporte).not.toHaveBeenCalled();
+  });
+
+  test('archivo válido: llama a cargarReporte con el buffer, el nombre original y el usuario', async () => {
+    cargarReporte.mockResolvedValue({ reporte: { _id: 'rep-1' }, candidatos: [] });
+
+    const res = await request(app)
+      .post('/netpay/reporte/upload')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
+      .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
+
+    expect(res.status).toBe(200);
+    expect(cargarReporte).toHaveBeenCalledTimes(1);
+    const [buffer, nombreArchivo, user] = cargarReporte.mock.calls[0];
+    expect(Buffer.isBuffer(buffer)).toBe(true);
+    expect(nombreArchivo).toBe('reporte.xlsx');
+    expect(user._id).toBe('user-test');
+    expect(res.body).toEqual({ reporte: { _id: 'rep-1' }, candidatos: [] });
+  });
+
+  test('propaga el status code de un error de negocio (ej. ConflictError por claveRastreo duplicado)', async () => {
+    const { ConflictError } = require('../../shared/errors/AppError');
+    cargarReporte.mockRejectedValue(new ConflictError('Ya existe un reporte cargado para este depósito'));
+
+    const res = await request(app)
+      .post('/netpay/reporte/upload')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
+      .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
+
+    expect(res.status).toBe(409);
+  });
+});
+
+describe('GET /netpay/reporte', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app).get('/netpay/reporte').set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+  });
+
+  test('pasa el filtro estatus al service y devuelve el resultado tal cual', async () => {
+    listarNetpayReportes.mockResolvedValue({ reportes: [{ _id: 'r1' }] });
+
+    const res = await request(app)
+      .get('/netpay/reporte')
+      .query({ estatus: 'pendiente' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(listarNetpayReportes).toHaveBeenCalledWith({ estatus: 'pendiente' });
+    expect(res.body).toEqual({ reportes: [{ _id: 'r1' }] });
+  });
+});
+
+describe('GET /netpay/reporte/:id', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app).get('/netpay/reporte/r1').set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+  });
+
+  test('no existe: propaga 404', async () => {
+    const { NotFoundError } = require('../../shared/errors/AppError');
+    obtenerDetalleNetpayReporte.mockRejectedValue(new NotFoundError('Reporte Netpay'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
+  });
+
+  test('existe: devuelve el detalle', async () => {
+    obtenerDetalleNetpayReporte.mockResolvedValue({ reporte: { _id: 'r1', folios: [] } });
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(obtenerDetalleNetpayReporte).toHaveBeenCalledWith('r1');
+    expect(res.body).toEqual({ reporte: { _id: 'r1', folios: [] } });
+  });
+});
+
+describe('GET /netpay/reporte/:id/candidatos', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/reporte/r1/candidatos')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(buscarCandidatosNetpayReporte).not.toHaveBeenCalled();
+  });
+
+  test('no existe: propaga 404', async () => {
+    const { NotFoundError } = require('../../shared/errors/AppError');
+    buscarCandidatosNetpayReporte.mockRejectedValue(new NotFoundError('Reporte Netpay'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/candidatos')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
+  });
+
+  test('pasa el id y devuelve los candidatos recalculados tal cual', async () => {
+    buscarCandidatosNetpayReporte.mockResolvedValue({ candidatos: [{ _id: 'mov-1', banco: 'BBVA', deposito: 1000 }] });
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/candidatos')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(buscarCandidatosNetpayReporte).toHaveBeenCalledWith('r1');
+    expect(res.body).toEqual({ candidatos: [{ _id: 'mov-1', banco: 'BBVA', deposito: 1000 }] });
+  });
+});
+
+describe('POST /netpay/reporte/:id/confirmar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/r1/confirmar')
+      .send({ movementId: 'mov-1' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(confirmarReporte).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + movementId + usuario al service', async () => {
+    confirmarReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'confirmado' }, movimiento: { _id: 'mov-1' } });
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/confirmar')
+      .send({ movementId: 'mov-1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(confirmarReporte).toHaveBeenCalledWith('r1', 'mov-1', expect.objectContaining({ _id: 'user-test' }));
+    expect(res.body).toEqual({ reporte: { _id: 'r1', estatus: 'confirmado' }, movimiento: { _id: 'mov-1' } });
+  });
+
+  test('propaga 409 de un conflicto de negocio (ej. monto no coincide)', async () => {
+    const { ConflictError } = require('../../shared/errors/AppError');
+    confirmarReporte.mockRejectedValue(new ConflictError('El monto del movimiento no coincide con el depósito del reporte'));
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/confirmar')
+      .send({ movementId: 'mov-1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+describe('POST /netpay/reporte/:id/descartar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/r1/descartar')
+      .send({ motivo: 'ya identificado a mano' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(descartarReporte).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + motivo + usuario al service', async () => {
+    descartarReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'descartado' } });
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/descartar')
+      .send({ motivo: 'ya identificado a mano' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(descartarReporte).toHaveBeenCalledWith('r1', 'ya identificado a mano', expect.objectContaining({ _id: 'user-test' }));
+  });
+});
+
+describe('GET /netpay/reporte/:id/folio/:referencia/kore', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/reporte/r1/folio/F20260924-00311/kore')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(consultarFolioKore).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + referencia (con guiones) tal cual al service', async () => {
+    consultarFolioKore.mockResolvedValue({ cuenta: { SerieExterna: 'H0' }, consultadoEn: new Date().toISOString() });
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/folio/F20260924-00311/kore')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(consultarFolioKore).toHaveBeenCalledWith('r1', 'F20260924-00311');
+    expect(res.body.cuenta).toEqual({ SerieExterna: 'H0' });
+  });
+
+  test('folio sin match en Kore: propaga 404 legible (no cachea nada falso)', async () => {
+    const { NotFoundError } = require('../../shared/errors/AppError');
+    consultarFolioKore.mockRejectedValue(new NotFoundError('No se encontró la cuenta en Kore para el folio F1'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/folio/F1/kore')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('GET /netpay/reporte/:id/export', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/reporte/r1/export')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(generarExcelReporteNetpay).not.toHaveBeenCalled();
+    expect(consultarFoliosPendientes).not.toHaveBeenCalled();
+  });
+
+  test('genera el Excel y lo manda como attachment con el claveRastreo en el nombre', async () => {
+    consultarFoliosPendientes.mockResolvedValue({ consultados: 0, fallos: [] });
+    obtenerDetalleNetpayReporte.mockResolvedValue({ reporte: { _id: 'r1', claveRastreo: 'CLAVE-1' } });
+    generarExcelReporteNetpay.mockResolvedValue(Buffer.from('excel-fake'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/export')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(generarExcelReporteNetpay).toHaveBeenCalledWith({ _id: 'r1', claveRastreo: 'CLAVE-1' });
+    expect(res.headers['content-disposition']).toContain('netpay-reporte-CLAVE-1.xlsx');
+  });
+
+  // Fix 2a (2026-09-25): antes de generar el Excel, la ruta consulta Kore para los folios
+  // pendientes (consultarFoliosPendientes) — SIEMPRE, y ANTES de leer el detalle para
+  // generar el Excel (así el Excel exportado refleja el koreCache recién actualizado).
+  test('llama a consultarFoliosPendientes con el id del reporte ANTES de generar el Excel', async () => {
+    const orden = [];
+    consultarFoliosPendientes.mockImplementation(async (id) => {
+      orden.push(`consultarFoliosPendientes:${id}`);
+      return { consultados: 2, fallos: [] };
+    });
+    obtenerDetalleNetpayReporte.mockImplementation(async () => {
+      orden.push('obtenerDetalle');
+      return { reporte: { _id: 'r1', claveRastreo: 'CLAVE-1' } };
+    });
+    generarExcelReporteNetpay.mockResolvedValue(Buffer.from('excel-fake'));
+
+    await request(app)
+      .get('/netpay/reporte/r1/export')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(orden).toEqual(['consultarFoliosPendientes:r1', 'obtenerDetalle']);
+  });
+
+  // Un fallo PARCIAL de Kore en algunos folios (consultarFoliosPendientes nunca lanza, ver
+  // netpay-reporte.service.test.js) nunca debe convertir el export en un 500 — el Excel se
+  // genera igual con lo que sí se pudo resolver.
+  test('fallos parciales al consultar Kore no abortan el export', async () => {
+    consultarFoliosPendientes.mockResolvedValue({ consultados: 1, fallos: [{ referencia: 'F2', error: 'boom' }] });
+    obtenerDetalleNetpayReporte.mockResolvedValue({ reporte: { _id: 'r1', claveRastreo: 'CLAVE-1' } });
+    generarExcelReporteNetpay.mockResolvedValue(Buffer.from('excel-fake'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/export')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+  });
+});
+
+// Fix 3 (2026-09-25): ver folios relacionados desde el modal ERP de Bancos sin depender de
+// abrir el panel de Netpay ni de exportar el Excel — mismo criterio de "solo cablea el HTTP"
+// que el resto de este archivo (obtenerPorMovimiento tiene sus propios tests unitarios en
+// netpay-reporte.service.test.js).
+describe('GET /netpay/reporte/by-movement/:movementId', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/reporte/by-movement/mov-1')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(obtenerNetpayReportePorMovimiento).not.toHaveBeenCalled();
+  });
+
+  test('200: devuelve el reporte encontrado para ese movimiento', async () => {
+    obtenerNetpayReportePorMovimiento.mockResolvedValue({ reporte: { _id: 'r1', movementIdConfirmado: 'mov-1' } });
+
+    const res = await request(app)
+      .get('/netpay/reporte/by-movement/mov-1')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(obtenerNetpayReportePorMovimiento).toHaveBeenCalledWith('mov-1');
+    expect(res.body).toEqual({ reporte: { _id: 'r1', movementIdConfirmado: 'mov-1' } });
+  });
+
+  test('404 legible cuando no hay ningún reporte para este movimiento', async () => {
+    const { NotFoundError } = require('../../shared/errors/AppError');
+    obtenerNetpayReportePorMovimiento.mockRejectedValue(new NotFoundError('Reporte Netpay para este movimiento'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/by-movement/mov-sin-reporte')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
   });
 });

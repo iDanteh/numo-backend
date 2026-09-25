@@ -39,6 +39,13 @@ const { sincronizarTransferenciasCajasManual }
 const { consultarTransaccionesNetpay }    = require('./netpay-transacciones.service');
 const { obtenerBandejaNetpay }            = require('./netpay-match.service');
 const { confirmarMatchNetpay, descartarMatchNetpay } = require('./netpay-match-confirm.service');
+const {
+  cargarReporte, listar: listarNetpayReportes, obtenerDetalle: obtenerDetalleNetpayReporte,
+  obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
+  buscarCandidatos: buscarCandidatosNetpayReporte,
+  confirmarReporte, descartarReporte, consultarFolioKore, consultarFoliosPendientes,
+}                                          = require('./netpay-reporte.service');
+const { generarExcelReporteNetpay }       = require('./netpay-reporte-export.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
 // cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
 // se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
@@ -46,6 +53,10 @@ require('./caja-transferencia-revert.service').init();
 // Mismo mecanismo, para el matching Netpay↔BBVA (ver netpay-match-revert.service.js) —
 // borra el NetpayMatch al desvincular su erpId sintético NETPAY-<terminalID>-<día>.
 require('./netpay-match-revert.service').init();
+// Mismo mecanismo, para el reporte Netpay cargado a mano (Implementación 1, ver
+// netpay-reporte-revert.service.js) — a diferencia de NetpayMatch, NO borra el documento al
+// desvincular su erpId sintético NETPAYRPT-<claveRastreo>, solo lo vuelve a 'pendiente'.
+require('./netpay-reporte-revert.service').init();
 // Registra en global-config.service.js el hook que reaplica el filtro de transferencias
 // de caja automáticamente cuando cambia NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS/
 // NOMBRE_CAJA_DESTINO_PERMITIDAS (ver caja-transferencia-sync.service.js#init) — pedido
@@ -450,6 +461,95 @@ router.post('/netpay/bandeja/confirmar', authenticate, permit(PERMISSIONS.BANKS_
 router.post('/netpay/bandeja/descartar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
   const { terminalID, almacen, dia } = req.body;
   const resultado = await descartarMatchNetpay({ terminalID, almacen, dia, user: req.user });
+  res.json(resultado);
+}));
+
+// ── Netpay: carga manual del reporte como fuente de verdad (Implementación 1) ──────────────
+// Coexiste con el matching automático de arriba (netpay-match.service.js) — NO lo
+// reemplaza. El endpoint de Kore reporta una comisión con tasa FIJA por tipo de tarjeta en
+// vez de la tasa real negociada por almacén (evidencia real: hasta 2.36x de sobrecobro), así
+// que el matching automático falla sistemáticamente para esos almacenes. Acá se carga el
+// Excel real de Netpay (fuente de verdad de comisión/IVA/neto) para conciliar manualmente.
+// Mismo permiso que el resto de la sección Netpay (admin-only, decisión confirmada con el
+// usuario — no se abre a contabilidad en esta fase). Reusa `uploadCyc` (memoryStorage,
+// .xlsx/.xls, ya definido arriba en este mismo archivo) — mismo config que bank.routes.js.
+router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NETPAY), uploadCyc.single('excelFile'), asyncHandler(async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
+  const resultado = await cargarReporte(req.file.buffer, req.file.originalname, req.user);
+  res.json(resultado);
+}));
+
+router.get('/netpay/reporte', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { estatus } = req.query;
+  const resultado = await listarNetpayReportes({ estatus });
+  res.json(resultado);
+}));
+
+router.get('/netpay/reporte/:id', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await obtenerDetalleNetpayReporte(req.params.id);
+  res.json(resultado);
+}));
+
+// Recalcula EN VIVO los mismos candidatos BBVA que ya calculó cargarReporte al momento de la
+// carga — para que un reporte 'pendiente' reabierto en una sesión posterior (sin los
+// candidatos originales en memoria del frontend) pueda ofrecer la misma UX de selección por
+// radio buttons, en vez de pegar un _id a mano. Funciona para cualquier estatus, pero solo
+// tiene sentido real con 'pendiente'.
+router.get('/netpay/reporte/:id/candidatos', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await buscarCandidatosNetpayReporte(req.params.id);
+  res.json(resultado);
+}));
+
+router.post('/netpay/reporte/:id/confirmar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { movementId } = req.body;
+  const resultado = await confirmarReporte(req.params.id, movementId, req.user);
+  res.json(resultado);
+}));
+
+router.post('/netpay/reporte/:id/descartar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { motivo } = req.body;
+  const resultado = await descartarReporte(req.params.id, motivo, req.user);
+  res.json(resultado);
+}));
+
+// Consulta puntual e informativa de la CxC asociada a un folio (withAccountInfo=true) —
+// NUNCA aplica cobro. `referencia` viaja en el path (no query) porque puede contener
+// caracteres como '-' propios de un path param sin ambigüedad (ej. 'F20260924-00311').
+router.get('/netpay/reporte/:id/folio/:referencia/kore', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await consultarFolioKore(req.params.id, req.params.referencia);
+  res.json(resultado);
+}));
+
+// Fix 2a (2026-09-25, pedido explícito del usuario): antes de generar el Excel, consulta
+// contra Kore los folios que todavía no tienen koreCache.cuenta (consultarFoliosPendientes —
+// secuencial, con pausa entre llamadas, ver netpay-reporte.service.js) para que el reporte
+// exportado incluya el dato de Kore aunque el usuario nunca haya consultado cada folio a
+// mano. Timeout de esta ruta específica subido (Node por default corta requests "colgadas"
+// mucho antes) — con 20 folios × ~1s c/u + la pausa fija, esto puede tardar bastante más que
+// cualquier otra ruta de este archivo. Fallo parcial: consultarFoliosPendientes nunca lanza
+// por un folio individual que falle, así que esto no puede convertir el export en un 500 por
+// culpa de Kore — el Excel se genera igual con lo que sí se pudo resolver.
+router.get('/netpay/reporte/:id/export', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
+  await consultarFoliosPendientes(req.params.id);
+  const { reporte } = await obtenerDetalleNetpayReporte(req.params.id);
+  const buffer = await generarExcelReporteNetpay(reporte);
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="netpay-reporte-${reporte.claveRastreo}.xlsx"`);
+  res.send(buffer);
+}));
+
+// GET /api/erp/netpay/reporte/by-movement/:movementId — Fix 3 (2026-09-25, pedido explícito
+// del usuario): ver los folios de un reporte Netpay ya confirmado directamente desde el modal
+// ERP de Bancos (erp-modal.component.ts#esErpIdNetpayReporte), sin depender de abrir el panel
+// de Netpay ni de exportar el Excel. Mismo permiso que el resto de la sección (banks:netpay).
+// 404 legible cuando no hay ningún reporte para este movimiento — el frontend lo maneja en
+// silencio (simplemente no muestra la sección), no como un error visible.
+router.get('/netpay/reporte/by-movement/:movementId', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await obtenerNetpayReportePorMovimiento(req.params.movementId);
   res.json(resultado);
 }));
 

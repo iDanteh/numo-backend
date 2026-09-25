@@ -865,6 +865,14 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
   // cerraba el Abono Ingresos+IVA COMPLETO contra Anticipos/IVA-anticipo, sin
   // dejar rastro del Efectivo real que sí entró aparte.
   const anticipoUsado = new Map();    // `${serie}|${folio}` → monto
+  // Porción ANTICIPO de cobros 'APA' (2026-09-25): NO entra a `anticipoUsado`
+  // (el cierre OPA ya la captura, ver fix 1fd7f81 del 16-sep) — SOLO se usa
+  // para decidir si el Egreso "Aplicación de anticipo" de esa venta se
+  // convierte en OPA-REVERSION (`ventasConAnticipoRedirigido`). Sin esto, con
+  // el anticipo dentro de un APA la NC quedaba normal: Anticipos cargado 2
+  // veces + Abono a Clientes huérfano (caso real NC D0-260900931, Reforma
+  // 23-sep; 12 NCs así en septiembre, todas con cobro APA).
+  const anticipoApaUsado = new Map(); // `${serie}|${folio}` → monto
 
   // Fuente de los cobros reales — confirmado con el usuario 2026-08-14:
   // reemplaza POR COMPLETO la consulta por serie/folio propio cuando se
@@ -1160,6 +1168,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
       const formasPago = [];
       let montoPuntos = 0;
       let montoAnticipo = 0;
+      let montoAnticipoApa = 0; // ver `anticipoApaUsado`
       for (const cobro of (cuenta.cobros ?? [])) {
         // El cobro debe haber ocurrido el MISMO día que la factura (con
         // tolerancia de ±1 día por facturación diferida — ver
@@ -1278,6 +1287,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           const tieneSaldoAFavorApa = (cobro.formasPago ?? []).some(fp =>
             /saldo\s*a\s*favor/i.test(fp.nombre ?? ''));
           if (tieneSaldoAFavorApa) continue;
+          // Solo registro para `anticipoApaUsado` (no es dinero cobrado).
+          montoAnticipoApa += (cobro.formasPago ?? [])
+            .filter(fp => /anticipo/i.test(fp.nombre ?? ''))
+            .reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
           const tieneFormaReal = (cobro.formasPago ?? []).some(fp =>
             !/puntos|saldo\s*a\s*favor|anticipo/i.test(fp.nombre ?? ''));
           if (!tieneFormaReal) continue;
@@ -1403,6 +1416,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           const montoRepartido = targets.length > 1 ? montoAnticipo * peso : montoAnticipo;
           anticipoUsado.set(t.facturaKey, (anticipoUsado.get(t.facturaKey) ?? 0) + montoRepartido);
         }
+      }
+      if (montoAnticipoApa > 0) {
+        for (const t of targets) anticipoApaUsado.set(t.facturaKey, (anticipoApaUsado.get(t.facturaKey) ?? 0) + montoAnticipoApa);
       }
     }
 
@@ -1748,7 +1764,7 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
     .filter(([facturaKey]) => !clavesConCfdi.has(facturaKey) && esFacturaDeEsteCentro(facturaKey))
     .reduce((s, [, monto]) => s + (Number(monto) || 0), 0);
 
-  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar, saldoFavorUsadoSinFactura, puntosUsadoSinFactura };
+  return { desglosePagoReal, puntosUsado, saldoFavorUsado, anticipoUsado, anticipoApaUsado, cobrosCobradoraDirecta, usoCaminoPorCentro, atribuidoOtraFacturaMap, movimientosPpdPorFacturar, saldoFavorUsadoSinFactura, puntosUsadoSinFactura };
 }
 
 /**
@@ -4038,7 +4054,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // `centroPropioClave`/fechaDesde/fechaHasta (2026-08-14): consulta por
   // centro+rango de fechas en vez de por serie/folio propio — ver docstring
   // en `_prefetchAjustesFacturaPropia`.
-  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaProp = [], puntosUsadoSinFactura: puntosUsadoSinFacturaProp = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapProp, puntosUsado: puntosUsadoMapProp, saldoFavorUsado: saldoFavorUsadoMapProp, anticipoUsado: anticipoUsadoMapProp = new Map(), anticipoApaUsado: anticipoApaUsadoMapProp = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaProp = [], usoCaminoPorCentro: usoCaminoPorCentroProp = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapProp = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarProp = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaProp = [], puntosUsadoSinFactura: puntosUsadoSinFacturaProp = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroProp,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -4278,7 +4294,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const ventasConAnticipoRedirigido = new Set();
   for (const { cfdi: c } of cfdiConRegla) {
     if (c.tipoDeComprobante !== 'I' || !c.serie || !c.folio || !c.uuid) continue;
-    if (Number(anticipoUsadoMapProp.get(`${c.serie}|${c.folio}`)) > 0) {
+    // `anticipoApaUsadoMapProp`: anticipo dentro de un cobro APA (ver `anticipoApaUsado`).
+    if (Number(anticipoUsadoMapProp.get(`${c.serie}|${c.folio}`)) > 0
+        || Number(anticipoApaUsadoMapProp.get(`${c.serie}|${c.folio}`)) > 0) {
       ventasConAnticipoRedirigido.add(c.uuid.toUpperCase());
     }
   }
@@ -6068,7 +6086,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [], puntosUsadoSinFactura: puntosUsadoSinFacturaGuard = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), anticipoApaUsado: anticipoApaUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [], puntosUsadoSinFactura: puntosUsadoSinFacturaGuard = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
     centroPropioClave: serieDelCentroGuard,
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
@@ -6237,7 +6255,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   const ventasConAnticipoRedirigidoGuard = new Set();
   for (const { cfdi: c } of cfdiConRegla) {
     if (c.tipoDeComprobante !== 'I' || !c.serie || !c.folio || !c.uuid) continue;
-    if (Number(anticipoUsadoMapGuard.get(`${c.serie}|${c.folio}`)) > 0) {
+    if (Number(anticipoUsadoMapGuard.get(`${c.serie}|${c.folio}`)) > 0
+        || Number(anticipoApaUsadoMapGuard.get(`${c.serie}|${c.folio}`)) > 0) {
       ventasConAnticipoRedirigidoGuard.add(c.uuid.toUpperCase());
     }
   }

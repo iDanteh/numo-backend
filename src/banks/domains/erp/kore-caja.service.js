@@ -250,6 +250,14 @@ async function buscarTransaccionesNetpay(params = {}) {
   // muestra la UI en esta columna). Nombre EXACTO tal cual lo espera Kore — no se valida
   // server-side, un valor que Kore no reconoce lo ignora en silencio, sin error.
   if (params.status) queryParams.status = params.status;
+  // folio + withAccountInfo (2026-09-25, netpay-reporte.service.js#consultarFolioKore):
+  // consulta puntual de UNA transacción por folio, pidiendo que Kore incluya la CxC
+  // asociada (`cuentas[]`) en la respuesta — informativo, para mostrarla en el detalle del
+  // reporte cargado a mano; NUNCA aplica cobro ni decide ningún matching. Mismo patrón
+  // aditivo que el resto de los params de esta función — no cambia ningún llamado existente
+  // que no los mande.
+  if (params.folio) queryParams.folio = params.folio;
+  if (params.withAccountInfo) queryParams.withAccountInfo = params.withAccountInfo;
   // Paginación de Kore (2026-09-08, confirmado por el usuario: pageSize máximo real
   // 100) — ver netpay-transacciones.service.js, que recorre todas las páginas
   // necesarias antes de agregar totales, nunca agrega sobre una sola respuesta.

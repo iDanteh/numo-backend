@@ -2163,9 +2163,11 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   // ver `ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR`. `montoPropio` (no `generado.monto`)
   // porque es el monto real de ESTA línea (ver comentario arriba sobre por
   // qué nunca se usa `generado.monto` directo); el estado "sin usar" sí se
-  // revisa contra el saldo agregado completo (`generado.usos`), correcto
-  // incluso cuando la misma venta origen se dividió en 2+ CFDIs tipo E.
-  const montoUsadoTotal = (generado.usos ?? []).reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
+  // revisa contra el saldo agregado completo (`generado.montoUsadoKore`),
+  // correcto incluso cuando la misma venta origen se dividió en 2+ CFDIs tipo E.
+  // OJO: el mapa NO guarda `usos` — antes se leía `generado.usos` y siempre
+  // daba 0, así que un SF < $50 usado otro día se iba a Otros Ingresos (2026-09-25).
+  const montoUsadoTotal = Number(generado.montoUsadoKore) || 0;
   const reglaSFExport = (montoUsadoTotal < 0.01 && montoPropio < 50)
     ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
     : reglaSF;

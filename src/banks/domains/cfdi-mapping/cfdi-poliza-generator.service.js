@@ -4106,8 +4106,16 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       pendientesPorFacturarProp = resultadoPuente.pendientesPorFacturar ?? [];
       // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
       // detectado hoy con lo ya cubierto en días previos.
+      // Si el puente ya trae `{ monto, detalle }` para esta factura, NO se le
+      // suma el número de BD: `objeto + número` lo convertía en texto
+      // ("[object Object]0"), se perdía `detalle` y la reducción por ticket no
+      // se aplicaba — Cargo doble cuando la sucursal cobradora se guardaba
+      // ANTES que la vendedora (caso real Global I0-260900317, Promotoría
+      // 24-sep, póliza 140: cobrada toda en CEDIS, póliza 134). 2026-09-25.
       for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
-        facturasVendedorCubiertas.set(u, (facturasVendedorCubiertas.get(u) ?? 0) + monto);
+        const prevCubierto = facturasVendedorCubiertas.get(u);
+        if (prevCubierto && typeof prevCubierto === 'object') continue;
+        facturasVendedorCubiertas.set(u, (prevCubierto ?? 0) + monto);
       }
     }
   }
@@ -6086,8 +6094,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
       // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
       // detectado hoy con lo ya cubierto en días previos.
+      // Ver comentario equivalente en generarPropuesta (objeto + número).
       for (const [u, monto] of await _uuidsConCargoCubiertoEnBD({ rfc })) {
-        facturasVendedorCubiertasGuard.set(u, (facturasVendedorCubiertasGuard.get(u) ?? 0) + monto);
+        const prevCubiertoGuard = facturasVendedorCubiertasGuard.get(u);
+        if (prevCubiertoGuard && typeof prevCubiertoGuard === 'object') continue;
+        facturasVendedorCubiertasGuard.set(u, (prevCubiertoGuard ?? 0) + monto);
       }
     }
   }

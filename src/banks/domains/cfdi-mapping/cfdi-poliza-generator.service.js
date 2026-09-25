@@ -649,6 +649,10 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       // Monto BRUTO generado (sin restar usos) — la generación oculta sin CFDI
       // se muestra completa en "Movimientos de Saldos a Favor" (2026-09-24).
       montoGenerado: (prev?.montoGenerado ?? 0) + (Number(gen.monto) || 0),
+      // Total usado según Kore (cualquier día/almacén) — solo lo leen los
+      // SF GEN-huérfanos para el caso "sin usar y < $50" → Otros Ingresos.
+      montoUsadoKore: (prev?.montoUsadoKore ?? 0)
+        + (gen.usos ?? []).reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0),
       ventaSerie: cuenta.serieVenta,
       ventaFolio: cuenta.folioVenta,
       oculto,
@@ -5120,7 +5124,12 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       if (generado?.anticipoReferencia) continue;
       // Huérfano oculto: `generado.monto` es el sobrante (< $50) del día → "Otros Ingresos"
       // (ver `SOBRANTE_MAX_SF_OCULTO`), igual que en `_inyectarSaldoFavorGenerado`.
-      const reglaSF = generado.oculto ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR : 'SF';
+      // Sin usar en absoluto y menor a $50 → también "Otros Ingresos" (mismo
+      // criterio que `reglaSFExport` en `_inyectarSaldoFavorGenerado`) — caso
+      // real D0-260904439 (CAC-079379, $0.01), centro 112 24-sep, póliza 511.
+      const reglaSF = (generado.oculto || ((Number(generado.montoUsadoKore) || 0) < 0.01 && (Number(generado.monto) || 0) < 50))
+        ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
+        : 'SF';
       const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
       const iva      = Math.round((generado.monto - subtotal) * 100) / 100;
       const serieFolioVenta = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;
@@ -6789,7 +6798,11 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       if (generado?.anticipoReferencia) continue;
       // Huérfano oculto: `generado.monto` es el sobrante (< $50) del día → "Otros Ingresos"
       // (ver `SOBRANTE_MAX_SF_OCULTO`), igual que en `_inyectarSaldoFavorGenerado`.
-      const reglaSFG = generado.oculto ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR : 'SF';
+      // Sin usar en absoluto y menor a $50 → también "Otros Ingresos" (ver
+      // comentario equivalente en generarPropuesta).
+      const reglaSFG = (generado.oculto || ((Number(generado.montoUsadoKore) || 0) < 0.01 && (Number(generado.monto) || 0) < 50))
+        ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
+        : 'SF';
       const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
       const ivaG      = Math.round((generado.monto - subtotalG) * 100) / 100;
       const serieFolioVentaG = [generado.ventaSerie, generado.ventaFolio].filter(Boolean).join('-') || null;

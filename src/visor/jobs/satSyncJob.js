@@ -1186,6 +1186,11 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                         xmlHash:              c.xmlHash,
                         timbreFiscalDigital:  c.timbreFiscalDigital,
                         complementoPago:      c.complementoPago,
+                        // Faltaba desde el fix del parser (f407d2a, 28-ago): parseCFDI
+                        // ya extraía CfdiRelacionados pero esta lista fija no lo
+                        // guardaba — 7,110 CFDIs SAT desde el 30-ago sin relaciones
+                        // (caso real NC D0-260900931, aplicación de anticipo). 2026-09-25.
+                        cfdiRelacionados:     c.cfdiRelacionados ?? [],
                         lastComparisonStatus: esRecibidos ? null : 'not_in_erp',
                         lastComparisonAt:     new Date(),
                       },
@@ -1234,6 +1239,8 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                           impuestos:           c.impuestos,
                           timbreFiscalDigital: c.timbreFiscalDigital,
                           complementoPago:     c.complementoPago,
+                          // Ver comentario equivalente arriba (cfdiNuevos).
+                          cfdiRelacionados:    c.cfdiRelacionados ?? [],
                         },
                       },
                     },

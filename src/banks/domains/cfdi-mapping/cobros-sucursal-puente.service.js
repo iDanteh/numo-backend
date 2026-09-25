@@ -331,6 +331,15 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
   // específico necesita factura. `TIPO_MARCADORES` (BON/BCT/DEV/CAC) es el
   // mismo marcador que usa el resto del archivo para este tipo de documento.
   const canceladoResueltoPorVenta = new Map(); // ventaKey -> monto cancelado y ya usado en otro lado
+  // Excepción (2026-09-25, confirmado con el usuario, caso real DEV-057798
+  // UBALDO HERNANDEZ ALONSO $698.09, Promotoría 24-sep): si el saldo se usó
+  // COMPLETO el MISMO día (hora México) en OTRA venta de la MISMA sucursal,
+  // ese par se oculta como SF-OCULTO (`usoMismaSucursalPorVenta`,
+  // cfdi-poliza-generator.service.js) — el dinero real es el cobro ORIGINAL de
+  // esta venta, así que NO se descuenta: sale como "cobro de otra sucursal"
+  // (si se cobró en otra caja). No va a la lista informativa ni a la cola.
+  const ventasSFOcultoMismoDia = new Set(); // ventaKey
+  const _diaMxPend = (iso) => (iso ? new Date(new Date(iso).getTime() - 6 * 3600 * 1000).toISOString().slice(0, 10) : null);
   if (cuentasEscaneadas.length) {
     const paresVenta = [...new Map(
       cuentasEscaneadas
@@ -351,6 +360,13 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
           if (disponible > 0.01) continue; // sigue como SF vivo, no se puede descartar todavía
           const resuelto = Math.abs(Number(gen.monto)) || 0;
           if (resuelto <= 0) continue;
+          const usosGen = gen.usos ?? [];
+          const usoUnicoGen = usosGen.length === 1 ? usosGen[0] : null;
+          if (usoUnicoGen && cuenta.serieVenta && usoUnicoGen.serieVenta === cuenta.serieVenta
+              && _diaMxPend(gen.fecha) && _diaMxPend(gen.fecha) === _diaMxPend(usoUnicoGen.fecha)) {
+            ventasSFOcultoMismoDia.add(ventaKey);
+            continue;
+          }
           canceladoResueltoPorVenta.set(ventaKey, (canceladoResueltoPorVenta.get(ventaKey) ?? 0) + resuelto);
         }
       }
@@ -463,6 +479,8 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
         // arriba): genera su "cobro de otra sucursal" pero NO va a la lista
         // informativa de "Pendientes por facturar".
         ...(facturaKeyCuenta ? { facturaPosterior: facturaKeyCuenta.replace('|', '-') } : {}),
+        // Ver `ventasSFOcultoMismoDia` arriba — mismo trato que `facturaPosterior`.
+        ...(ventasSFOcultoMismoDia.has(ventaKey) ? { sfOcultoMismoDia: true } : {}),
       });
     }
   }
@@ -1649,7 +1667,7 @@ async function construirMovimientosPuente({
         if (String(centroVendedor.id) !== String(centroCostoId) || !p.folioOrigen) continue;
         // Nunca debería llegar aquí (solo se aceptan cobros en OTRA caja), pero
         // la caja propia ya la cubre `_cobrosSinFacturaPorCentro` — no duplicar.
-        if (p.facturaPosterior) continue;
+        if (p.facturaPosterior || p.sfOcultoMismoDia) continue;
 
         // Limpieza defensiva: si este folio había quedado mal encolado como
         // cruzado en una corrida anterior (antes de este fix, o por un dato
@@ -1756,7 +1774,7 @@ async function construirMovimientosPuente({
         // por su cuenta (`cobrosCobradoraDirecta`, cfdi-poliza-generator) —
         // NO se toca la cola, para que su póliza quede exactamente igual que
         // antes (2026-09-25). Solo se agrega arriba el lado vendedor.
-        if (p.folioOrigen && !p.facturaPosterior) {
+        if (p.folioOrigen && !p.facturaPosterior && !p.sfOcultoMismoDia) {
           const totalFormasPagoTicket = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
           let acumuladoTicket = 0;
           const lineasCobrador = [];
@@ -1798,7 +1816,7 @@ async function construirMovimientosPuente({
     }
   }
 
-  const pendientesPorFacturar = pendientesDetectados.filter(p => !p.facturaPosterior).map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
+  const pendientesPorFacturar = pendientesDetectados.filter(p => !p.facturaPosterior && !p.sfOcultoMismoDia).map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
 
   // Cola de cobros cruzados encolados por OTRA sucursal (cuando ESTA fue la
   // vendedora) — ver nota de arquitectura en el encabezado del archivo. Se

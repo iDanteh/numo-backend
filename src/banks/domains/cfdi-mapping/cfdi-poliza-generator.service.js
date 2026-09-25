@@ -598,8 +598,18 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     // retiro en efectivo (ABO) no necesariamente ocurre en el mismo almacén
     // que la generación, y eso no lo hace menos "resuelto el mismo día".
     const ocultoMultiUso = usosMismoDia.length > 1 && saldoRestanteSF > -0.01 && saldoRestanteSF < SOBRANTE_MAX_SF_OCULTO;
+    // Mismo almacén por VENTA (2026-09-25, confirmado con el usuario, caso
+    // real DEV-057798 UBALDO HERNANDEZ ALONSO $698.09, Promotoría 24-sep):
+    // la venta que generó el saldo y la que lo usó son AMBAS de esta sucursal,
+    // aunque el cobro que lo consumió se hiciera en la caja de OTRA
+    // (`claveCentroUso` = esa caja, por eso la comparación de abajo fallaba).
+    // Solo camino por centro. El cobro original de la venta generadora sale
+    // entonces como "cobro de otra sucursal" (ver `_detectarPendientesPorFacturar`,
+    // cobros-sucursal-puente.service.js) — mismo criterio en ambos lados.
+    const usoMismaSucursalPorVenta = !!(centroPropioClave && usoUnico
+      && usoUnico.serieVenta === centroPropioClave && cuenta.serieVenta === centroPropioClave);
     const oculto = ocultoMultiUso || (!esCruzado && !!(usoUnico && usoOcultable && diaGen && diaGen === diaUso
-      && claveCentroGen && claveCentroUso && claveCentroGen === claveCentroUso));
+      && claveCentroGen && ((claveCentroUso && claveCentroGen === claveCentroUso) || usoMismaSucursalPorVenta)));
     if (oculto) devsOcultos.add(key);
 
     // Caso "mismo folio" (confirmado con el usuario 2026-08-13): la MISMA

@@ -445,6 +445,9 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       }),
   ).values()];
   const cfdisOrigenCancelados = new Set();
+  // Marcadores (DEV/CAC/…) que SÍ tienen su nota de crédito vigente en BD —
+  // ver excepción `ventaYCancelacionMismoDia` más abajo (2026-09-25).
+  const marcadoresConNcVigente = new Set();
   if (marcadoresGen.length) {
     const cfdisOrigen = await CFDI.find({
       $or: marcadoresGen.map(({ serie, folio }) => ({ documentosRelacionados: { $elemMatch: { Serie: serie, Folio: folio } } })),
@@ -455,6 +458,7 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
         const clave = `${(d.Serie ?? '').toUpperCase()}|${d.Folio}`;
         if (!marcadoresGen.some(m => `${m.serie}|${m.folio}` === clave)) continue;
         vigentePorMarcador.set(clave, (vigentePorMarcador.get(clave) ?? false) || c.satStatus === 'Vigente');
+        if (c.satStatus === 'Vigente') marcadoresConNcVigente.add(clave);
       }
     }
     for (const { serie, folio } of marcadoresGen) {
@@ -551,7 +555,23 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       const montoRetiro = Math.abs(Number(u.montoUsado)) || 0;
       if (montoRetiro <= 0) continue;
       sumaABOMismoDia += montoRetiro;
-      if (ventaYCancelacionMismoDia) continue;
+      // Excepción NO aplica (sí se resta) cuando el ticket YA está facturado
+      // y la cancelación NO tiene nota de crédito (2026-09-25, confirmado con
+      // el usuario, caso real CONSTRUCASA 24-sep, 5 RETD por $456.16, ej.
+      // C0-260904868/CAC-079425): cancelado en parte ANTES de facturar, la
+      // Factura Global C0-260901486 cobra el ticket COMPLETO en Efectivo y
+      // nada compensa el retiro. Ticket sin factura (caso Hidalgo
+      // B0-260900062: su cobro nunca entra al consolidado; o "Cobro sin
+      // factura", que ya resta la regla RETD del export) o cancelación con
+      // NC (la NC ya abona Caja): se salta como antes.
+      // Además el cobro del ticket debe ser en la caja PROPIA: cobrado en otra
+      // (ej. F0-260902381 cobrado en caja B0) ese efectivo nunca entra al
+      // consolidado de esta sucursal (sale como cobro de otra sucursal).
+      const ticketFacturado = !!(cuenta.serieFactura && cuenta.folioFactura);
+      const cancelacionConNc = marcadoresConNcVigente.has(`${(gen.serieOrigen ?? '').toUpperCase()}|${gen.folioOrigen}`);
+      const cobradoEnCajaPropia = !!centroPropioClave && (cobrosPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? [])
+        .some(cb => cb.claveCentro === centroPropioClave && Number(cb.monto) < 0);
+      if (ventaYCancelacionMismoDia && (!ticketFacturado || cancelacionConNc || !cobradoEnCajaPropia)) continue;
       ajustesEfectivoRetiroSF.push({
         monto: montoRetiro,
         centro: centroPropioClave ?? null,

@@ -2514,6 +2514,21 @@ async function _prefetchCuentasPendientesAnticipo(fechas) {
   return { montoAnticipoPorFactura, referenciaOpaPorFactura, origenesConvertidosAAnticipo };
 }
 
+// Recepción de anticipo (la factura ES la cuenta OPA en Kore, ver
+// `referenciaOpaPorFactura`): sus renglones llevan el folio OPA como concepto
+// (confirmado con el usuario 2026-09-28, caso real Hidalgo 25-sep
+// B0-260903049 ALTURATH → OPA-01045). Antes decían "Anticipo" (descripción del
+// CFDI) o la factura de un ticket con el mismo número que el folio del CFDI
+// (ej. B0-260901463, coincidencia sin relación). Solo cambia el concepto.
+function _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFactura) {
+  if (cfdi.tipoDeComprobante !== 'I' || !cfdi.serie || !cfdi.folio) return;
+  const refOpa = referenciaOpaPorFactura?.get(`${cfdi.serie}|${cfdi.folio}`);
+  if (!refOpa) return;
+  for (const m of movs) {
+    if (m.cfdiUuid === cfdi.uuid) m.concepto = refOpa;
+  }
+}
+
 // Egreso SAT que formaliza la aplicación del anticipo directamente contra la
 // VENTA (tipoRelacion='07' apuntando al UUID de la propia venta — al revés
 // de la relación que trae la venta hacia SU anticipo). Cuando existe, trae el
@@ -4464,6 +4479,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFacturaProp);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
     const comboEspecialProp = uuid07 ? ventasConComboEspecialAnticipoProp.get(uuid07) : null;
     if (comboEspecialProp) {
@@ -6405,6 +6421,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     }
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
+    _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFacturaGuard);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
     const comboEspecialGuard = uuid07 ? ventasConComboEspecialAnticipoGuard.get(uuid07) : null;

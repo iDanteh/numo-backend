@@ -2960,12 +2960,8 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   const fechaHastaISO = new Date(`${fechaFin}T23:59:59.999-06:00`).toISOString();
 
   let resultado = [];
-  let resultadosSaldos = [];
   try {
-    [resultado, resultadosSaldos] = await Promise.all([
-      obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO }),
-      obtenerSaldosFavorPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO }),
-    ]);
+    resultado = await obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde: fechaDesdeISO, fechaHasta: fechaHastaISO });
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
     logger.warn(`[CobrosSinFactura] Consulta "por centro" falló (${err.message}), se omite este ajuste.`);
@@ -2994,21 +2990,19 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   // el monto completo de la venta que lo generó lo hacía desaparecer sin que
   // ninguna otra venta lo "recuperara" (el filtro de texto "SALDO A FAVOR" en
   // el split de abajo ya evita que se cuente de más en la venta que lo usó).
-  // Solo se resta la porción que SIGUE sin usarse (`gen.monto` menos la suma
-  // de `usos[].montoUsado`) — esa sí representa dinero que pudo haber salido
-  // en efectivo el mismo día, igual que el caso original que motivó este
-  // ajuste.
-  const devGeneradoPorVenta = new Map(); // `${serieVenta}|${folioVenta}` -> monto DEV disponible (sin usar)
-  for (const cuenta of resultadosSaldos) {
-    const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
-    for (const gen of (cuenta.saldosFavorGenerados ?? [])) {
-      if ((gen.serieOrigen ?? '').toUpperCase() !== 'DEV') continue;
-      const montoUsado = (gen.usos ?? []).reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
-      const disponible = Math.max(0, (Math.abs(Number(gen.monto)) || 0) - montoUsado);
-      if (disponible <= 0) continue;
-      devGeneradoPorVenta.set(ventaKey, (devGeneradoPorVenta.get(ventaKey) ?? 0) + disponible);
-    }
-  }
+  //
+  // Corrección 2026-09-28 (confirmado con el usuario, caso real Hidalgo
+  // 25-sep, B0-260906772 CLIENTE MOSTRADOR: $188.27 con tarjeta de débito,
+  // DEV-057834 por $188.27, $120.08 usados en B0-260906791, sobrante $68.19):
+  // ya NO se resta nada aquí. Antes se restaba la porción sin usar, pero un
+  // reembolso real en caja SÍ aparece en `usos[]` (uso cuya venta es
+  // "ABO-…", verificado en B0-260802634 y CONSTRUCASA 22-sep C0-260904264),
+  // así que lo "disponible" es siempre saldo que se QUEDÓ con el cliente
+  // (como SF visible o convertido en Anticipo OPA) — el dinero sigue cobrado
+  // y restarlo dejaba Bancos/Caja de menos contra un pasivo que sí se
+  // registra. El reembolso real ya se descuenta por su lado: la regla RETD
+  // del export (empareja contra este mismo "Cobro sin factura") o
+  // `SF-RETIRO-EFECTIVO`.
 
   // Cobranza de facturas que aún no existen el día del cobro (2026-08-21,
   // confirmado con el usuario: "el cobro debe caer el día que se cobró y la
@@ -3194,13 +3188,6 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
   // de una consulta bancaria nueva aquí.
   const detalle = []; // [{ ventaSerie, ventaFolio, clave, monto }]
   for (const [ventaKey, renglones] of porVenta) {
-    let devRestante = devGeneradoPorVenta.get(ventaKey) ?? 0;
-    for (let i = renglones.length - 1; i >= 0 && devRestante > 0.01; i--) {
-      const r = renglones[i];
-      const reduccion = Math.min(r.monto, devRestante);
-      r.monto -= reduccion;
-      devRestante -= reduccion;
-    }
     const [ventaSerie, ventaFolio] = ventaKey.split('|');
     for (const r of renglones) {
       if (r.monto <= 0) continue;

@@ -3235,6 +3235,54 @@ function _inyectarCobrosSucursal(bloques, filas, filasTarjetaCobroSucursal = [])
   }
 }
 
+// Total de la pestaña "Otros Ingresos" como renglón consolidado de la póliza
+// (2026-09-28, confirmado con el usuario): un Abono por sucursal a la cuenta
+// "Otros Ingresos" (subtotal + IVA juntos), igual que "Depósitos consolidados
+// (Efectivo/Tarjeta)", con el detalle de cada renglón de la pestaña en
+// "Desglose Consolidado". La pestaña se sigue generando igual.
+const CUENTA_OTROS_INGRESOS_CONSOLIDADO = '5204990001';
+
+function _inyectarOtrosIngresos(bloques, filasOtrosIngresos, cuentaOtrosIngresos) {
+  if (!filasOtrosIngresos.length || !bloques.length || !cuentaOtrosIngresos) return;
+  const porCentro = new Map(); // centroCosto -> { total, detalle }
+  for (const f of filasOtrosIngresos) {
+    const monto = Math.round(((Number(f.haber) || 0) - (Number(f.debe) || 0)) * 100) / 100;
+    if (Math.abs(monto) < 0.005) continue;
+    const centro = f.centroCosto ?? '';
+    if (!porCentro.has(centro)) porCentro.set(centro, { total: 0, detalle: [] });
+    const g = porCentro.get(centro);
+    g.total += monto;
+    g.detalle.push({
+      cfdiUuid: null, serie: f.concepto || '', monto, formaPago: 'OTROS INGRESOS',
+      nota: [f.motivo, f.cuenta?.codigo ? `cuenta ${f.cuenta.codigo}` : null].filter(Boolean).join(' — '),
+    });
+  }
+  if (!porCentro.size) return;
+  const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones) de/.test(t || '');
+  const candidatoContado =
+    bloques.find(b => b.tipoVenta === 'Contado') ??
+    bloques.find(b => b.tipoVenta == null) ??
+    bloques.find(b => !esBonificacionODescuento(b.tipoVenta)) ??
+    bloques[0];
+  for (const [centroCosto, g] of porCentro) {
+    const neto = Math.round(g.total * 100) / 100;
+    candidatoContado.movs.push({
+      cuenta:      cuentaOtrosIngresos,
+      serie:       'OTROS INGRESOS',
+      concepto:    'Otros Ingresos',
+      centroCosto,
+      debe:        neto < 0 ? Math.abs(neto) : 0,
+      haber:       neto > 0 ? neto : 0,
+      cfdiUuid:    null,
+      _subcodigo:  0,
+      _detalle:    g.detalle,
+      _tipoDesglose: 'Otros Ingresos',
+      _esTransferencia: false,
+      _esResto:    true,
+    });
+  }
+}
+
 /**
  * Bloques (uno por CFDI) de los abonos normales de venta (Ingreso+IVA,
  * Contado) — dentro de cada bloque, Ingresos antes de IVA
@@ -3816,6 +3864,12 @@ async function exportContpaqXlsx(id, overrides = {}) {
   }
 
   _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
+  if (poliza.tipo === 'I' && filasOtrosIngresos.length) {
+    const cuentaOtrosIngresos = await AccountPlan.findOne({
+      where: { codigo: CUENTA_OTROS_INGRESOS_CONSOLIDADO }, attributes: ['id', 'codigo', 'nombre'], raw: true,
+    });
+    _inyectarOtrosIngresos(bloques, filasOtrosIngresos, cuentaOtrosIngresos);
+  }
 
   // Retiros de EFECTIVO de caja (/desgloses-salidas/caja) — se restan de
   // "Depósitos consolidados (Efectivo)" y se anotan en el desglose
@@ -4243,7 +4297,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           desgloseConsolidado.push({
             cuenta:           m.cuenta?.codigo,
             centroCosto:      m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-            tipo:             m._esAnticipo ? 'Anticipo' : 'Depósito',
+            tipo:             m._tipoDesglose ?? (m._esAnticipo ? 'Anticipo' : 'Depósito'),
             transferencia:    m._esTransferencia ? 'Sí' : 'No',
             formaPago:        d.formaPago || '',
             cfdiSerie:        d.serie || '',

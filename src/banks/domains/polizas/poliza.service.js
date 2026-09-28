@@ -482,6 +482,8 @@ function _buscarCombinacionQueSuma(indices, disponibles, monto) {
   return null;
 }
 
+const _esTransaccionAmex = t => (t.cardTypeName ?? '').trim().toUpperCase() === 'AMEX';
+
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
@@ -595,8 +597,13 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // 2026-09-18) — responseCode='00' del query a Kore no garantiza por sí
     // solo que la transacción siga vigente (podría estar revertida/anulada
     // después con el mismo responseCode original).
+    // AMEX fuera de NetPay (2026-09-28, pedido explícito del usuario): la
+    // transacción no liga con ninguna venta, así que su venta se queda en
+    // "Depósitos consolidados (Tarjeta)" y ni su monto ni su comisión (ni el
+    // IVA de esa comisión) entran al asiento NetPay.
     const transaccionesValidas = (resultado.transacciones ?? []).filter(t =>
-      terminalesValidas.has(t.terminalID) && t.status === 'completed' && (Number(t.amount) || 0) > 0);
+      terminalesValidas.has(t.terminalID) && t.status === 'completed' && (Number(t.amount) || 0) > 0
+      && !_esTransaccionAmex(t));
     // Dos pasadas (2026-09-23, confirmado con el usuario, caso real
     // Ferrocarril 21-sep, póliza 888: una pasada de $1,026.90 =
     // F0-260902052 $11.44 + F0-260902050 $1,015.46 de la Global

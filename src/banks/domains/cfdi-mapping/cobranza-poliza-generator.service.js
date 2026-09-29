@@ -64,6 +64,14 @@ const CODIGO_CUENTA_PUENTE_SUCURSALES = '2103040001';
 const CODIGO_CUENTA_IVA_POR_TRASLADAR = '2105010001';
 const CODIGO_CUENTA_IVA_TRASLADADO    = '2104010001';
 const CODIGO_CUENTA_CLIENTES          = '1103010001';
+// Cobro de un mes ANTERIOR al del complemento (2026-09-29, pedido del usuario,
+// ejemplo real "9 (4).xls" — ERIK WILVER TORRES HERNANDEZ, cobro 28-jun,
+// complemento A0-260704498 del 10-jul): ese depósito ya quedó al cierre de su
+// mes como no identificado, así que el Cargo del cobro va contra "Depósitos No
+// Identificados" (subtotal) + "IVA Trasladado - Anticipos" (IVA, columna C
+// "NI") en vez de al banco.
+const CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS = '2103030001';
+const REGLA_NO_IDENTIFICADO = 'NI';
 const TASA_IVA_SALDO_FAVOR          = 0.16;
 const TIPO_ORIGEN_CARGO_ESPECIAL    = 'Cargo Especial';
 const CHUNK_SIZE                    = 200;
@@ -143,7 +151,7 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         // export: ese campo se liga al uuid de la FACTURA original, no al del Pago
         // (confirmado con datos reales 2026-09-01, ver diag-bancario-pago.js).
         const idDocumento = dr.idDocumento ? String(dr.idDocumento).toUpperCase() : null;
-        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc, desglosePagoReal: [], idDocumento });
+        doctos.push({ serie, folio, monto, montoSF: 0, ivaDoc, desglosePagoReal: [], idDocumento, fechaPagoReal: pago.fechaPago ?? null });
         paresVistos.set(`${serie}|${folio}`, { serie, folio });
       }
     }
@@ -362,7 +370,26 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
           movs.push({ ...baseFactura, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF,      haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
           restanteLinea = parseFloat((restanteLinea - montoSFLinea).toFixed(2));
         }
-        if (restanteLinea > 0) {
+        // Cobro de un mes anterior al del complemento — ver
+        // `CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS`. Fechas del SAT: hora
+        // local guardada como UTC, así que el mes sale directo del ISO.
+        const mesDe = f => (f ? new Date(f).toISOString().slice(0, 7) : null);
+        const mesCobro = mesDe(d.fechaPagoReal);
+        const mesComplemento = mesDe(cfdi.fecha);
+        const esNoIdentificado = restanteLinea > 0 && mesCobro && mesComplemento && mesCobro < mesComplemento
+          && !!cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS] && !!cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR];
+        if (esNoIdentificado) {
+          // IVA real de esta factura (proporcional si parte se pagó con SF);
+          // sin él, 16% del cobro.
+          const ivaDocto = Number(d.ivaDoc) || 0;
+          const ivaNI = ivaDocto > 0
+            ? Math.min(Math.round(ivaDocto * (restanteLinea / montoLineaCargo) * 100) / 100, restanteLinea)
+            : Math.round((restanteLinea - restanteLinea / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+          const subtotalNI = parseFloat((restanteLinea - ivaNI).toFixed(2));
+          const baseNI = { ...baseFactura, haber: 0, reglaNombre: REGLA_NO_IDENTIFICADO, _preservarRegla: true };
+          if (subtotalNI > 0) movs.push({ ...baseNI, cuentaId: cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS], debe: subtotalNI, _esSubtotalNI: true });
+          if (ivaNI > 0)      movs.push({ ...baseNI, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR],            debe: ivaNI });
+        } else if (restanteLinea > 0) {
           // Split del Cargo por forma de pago REAL — ver `_prefetchDoctosPago`.
           // Efectivo real → Caja; cualquier otra → la cuenta genérica de la
           // regla (la consolidación por depósito real/sucursal ocurre después,
@@ -470,6 +497,7 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       ...(m._formaPagoReal != null ? { formaPago: m._formaPagoReal } : {}),
       ...((m.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL || m.tipoOrigen === 'Cobro Sucursal')
         ? { tipoOrigen: m.tipoOrigen, reglaNombre: m.reglaNombre } : {}),
+      ...(m._preservarRegla ? { reglaNombre: m.reglaNombre } : {}),
     })),
     pendientesCruzados,
   };
@@ -579,6 +607,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       .concat([
         CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR,
         CODIGO_CUENTA_PUENTE_SUCURSALES, CODIGO_CUENTA_IVA_POR_TRASLADAR, CODIGO_CUENTA_IVA_TRASLADADO, CODIGO_CUENTA_CLIENTES,
+        CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS,
       ]),
   )];
   const cuentasRows = codigosNecesarios.length

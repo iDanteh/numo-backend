@@ -16,7 +16,7 @@ const globalConfigService = require('../../../shared/services/global-config.serv
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const {
   obtenerBandejaNetpay, _ventanaDiasNetpay, _agruparPorTerminalYDia, _diaMx, _normalizarMarcadorDia,
-  VENTANA_DEFAULT_DIAS,
+  VENTANA_DEFAULT_DIAS, _agruparPorTerminalDiaYMarca, _marcasDiferidas, MARCAS_DIFERIDAS_DEFAULT,
 } = require('./netpay-match.service');
 
 function fakeFind(result) {
@@ -99,6 +99,98 @@ describe('_normalizarMarcadorDia — trunca un marcador YA bucketizado, sin desp
   test('acepta también un Date ya truncado, idempotente', () => {
     const marcador = _diaMx('2026-09-10T22:00:00Z'); // => 2026-09-10T00:00:00.000Z
     expect(_normalizarMarcadorDia(marcador).getTime()).toBe(marcador.getTime());
+  });
+});
+
+// _marcasDiferidas — netpay-matching-v2 (design.md "Lagging brand list"): config global
+// bancos.NETPAY_MARCAS_DIFERIDAS (CSV), mismo patrón que _ventanaDiasNetpay. Default AMEX
+// cuando la config no está sembrada.
+describe('_marcasDiferidas', () => {
+  test('config sin sembrar: usa el default interno (AMEX)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('No existe la configuración bancos.X'));
+    expect(await _marcasDiferidas()).toEqual(MARCAS_DIFERIDAS_DEFAULT);
+    expect(MARCAS_DIFERIDAS_DEFAULT).toEqual(['AMEX']);
+  });
+
+  test('config con una sola marca: la usa en mayúsculas', async () => {
+    globalConfigService.getValue.mockResolvedValue('amex');
+    expect(await _marcasDiferidas()).toEqual(['AMEX']);
+  });
+
+  test('config con varias marcas separadas por coma: arreglo con las 3, normalizado', async () => {
+    globalConfigService.getValue.mockResolvedValue('AMEX, diners , JCB');
+    expect(await _marcasDiferidas()).toEqual(['AMEX', 'DINERS', 'JCB']);
+  });
+
+  test('config vacía/basura: usa el default interno', async () => {
+    globalConfigService.getValue.mockResolvedValue('   ');
+    expect(await _marcasDiferidas()).toEqual(MARCAS_DIFERIDAS_DEFAULT);
+  });
+});
+
+// _agruparPorTerminalDiaYMarca — netpay-matching-v2 (design.md): la unidad de decisión
+// pasa a ser (terminalID, dia, bucket). bucket='general' salvo que cardTypeName EMPIECE
+// con una de las marcas diferidas configuradas (NUNCA cardType, ese campo se ignora a
+// propósito — proposal: "split each terminal-day by cardTypeName, not cardType").
+describe('_agruparPorTerminalDiaYMarca', () => {
+  test('día sin ninguna marca diferida: 1 solo bucket general, mismos valores que la función legacy _agruparPorTerminalYDia (regresión)', () => {
+    const transacciones = [
+      t({ amount: 100, commission: 10, cardTypeName: 'VISA' }),
+      t({ amount: 200, commission: 20, cardTypeName: 'MASTERCARD' }),
+    ];
+    const legacy = _agruparPorTerminalYDia(transacciones);
+    const nuevo = _agruparPorTerminalDiaYMarca(transacciones, ['AMEX']);
+
+    expect(nuevo).toHaveLength(1);
+    expect(nuevo[0].bucket).toBe('general');
+    expect(nuevo[0].montoBruto).toBe(legacy[0].montoBruto);
+    expect(nuevo[0].comision).toBe(legacy[0].comision);
+    expect(nuevo[0].netoEsperado).toBe(legacy[0].netoEsperado);
+    expect(nuevo[0].dia).toEqual(legacy[0].dia);
+  });
+
+  test('cardTypeName ausente (undefined/null): cae en general', () => {
+    const nuevo = _agruparPorTerminalDiaYMarca([t({ cardTypeName: undefined }), t({ cardTypeName: null })], ['AMEX']);
+    expect(nuevo).toHaveLength(1);
+    expect(nuevo[0].bucket).toBe('general');
+  });
+
+  // Proposal + spec: "split each terminal-day by cardTypeName, not cardType" — cardType
+  // (un campo DISTINTO, código legacy de Kore) NUNCA debe decidir el bucket.
+  test('cardType (campo distinto de cardTypeName) se ignora por completo', () => {
+    const nuevo = _agruparPorTerminalDiaYMarca([t({ cardTypeName: 'VISA', cardType: 'AMEX' })], ['AMEX']);
+    expect(nuevo).toHaveLength(1);
+    expect(nuevo[0].bucket).toBe('general');
+  });
+
+  // $60,758.23 fixture (proposal): un AMEX entre Visa/Mastercard del mismo terminal+día ->
+  // 2 buckets separados, AMEX aparte del general.
+  test('una venta AMEX entre Visa/Mastercard del mismo terminal+día: 2 buckets separados (general y AMEX)', () => {
+    const transacciones = [
+      t({ amount: 48099.79, commission: 418.39, cardTypeName: 'VISA' }),
+      t({ amount: 12658.44, commission: 513.932664, cardTypeName: 'AMEX' }),
+    ];
+    const grupos = _agruparPorTerminalDiaYMarca(transacciones, ['AMEX']);
+
+    expect(grupos).toHaveLength(2);
+    const general = grupos.find(g => g.bucket === 'general');
+    const amex = grupos.find(g => g.bucket === 'AMEX');
+    expect(general.netoEsperado).toBeCloseTo(48099.79 - 418.39);
+    expect(amex.netoEsperado).toBeCloseTo(12658.44 - 513.932664);
+  });
+
+  test('cardTypeName que EMPIEZA con una marca diferida configurada (no coincidencia exacta): va a ese bucket', () => {
+    const grupos = _agruparPorTerminalDiaYMarca([t({ cardTypeName: 'AMEX CREDITO' })], ['AMEX']);
+    expect(grupos[0].bucket).toBe('AMEX');
+  });
+
+  test('terminales o días distintos siguen separando grupos igual que antes, ahora también por bucket', () => {
+    const grupos = _agruparPorTerminalDiaYMarca([
+      t({ terminalID: 'T1', cardTypeName: 'VISA' }),
+      t({ terminalID: 'T1', cardTypeName: 'AMEX' }),
+      t({ terminalID: 'T2', cardTypeName: 'VISA' }),
+    ], ['AMEX']);
+    expect(grupos.length).toBe(3);
   });
 });
 

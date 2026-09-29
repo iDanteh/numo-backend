@@ -101,6 +101,72 @@ function _montosIguales(a, b) {
   return Math.abs((a ?? 0) - (b ?? 0)) <= ERP_TOLERANCE;
 }
 
+// netpay-matching-v2 (design.md "Lagging brand list"): Configuraciones Globales, sección
+// `bancos`, clave NETPAY_MARCAS_DIFERIDAS (CSV, ej. "AMEX,DINERS") — mismo patrón EXACTO
+// que _ventanaDiasNetpay(). Default ['AMEX'] cuando la config no está sembrada.
+const MARCAS_DIFERIDAS_DEFAULT = ['AMEX'];
+
+async function _marcasDiferidas() {
+  let valor;
+  try {
+    valor = await globalConfigService.getValue('bancos', 'NETPAY_MARCAS_DIFERIDAS');
+  } catch (err) {
+    if (err.message?.includes('No existe la configuración')) return MARCAS_DIFERIDAS_DEFAULT;
+    throw err;
+  }
+  const marcas = String(valor ?? '')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+  return marcas.length > 0 ? marcas : MARCAS_DIFERIDAS_DEFAULT;
+}
+
+// Bucket de una transacción: 'general' salvo que `cardTypeName` EMPIECE con una de las
+// marcas diferidas configuradas — NUNCA `cardType` (proposal: "split each terminal-day by
+// cardTypeName, not cardType"). "Empieza con" en vez de igualdad exacta: Kore no siempre
+// manda el nombre de marca pelado (ej. "AMEX CREDITO"), y la lista de marcas diferidas es
+// un prefijo estable configurado por el usuario.
+function _bucketDeTransaccion(cardTypeName, marcasDiferidas) {
+  const marca = String(cardTypeName ?? '').trim().toUpperCase();
+  if (!marca) return 'general';
+  const encontrada = marcasDiferidas.find(m => marca.startsWith(m));
+  return encontrada ?? 'general';
+}
+
+// Agrupa por (terminalID, día MX, bucket) — la unidad de decisión de netpay-matching-v2
+// (ver design.md "Technical Approach"). A diferencia de _agruparPorTerminalYDia (que
+// nunca separa por marca), acá una venta de una marca diferida (ej. AMEX) queda en SU
+// PROPIO bucket, separado del resto del día — para que una venta AMEX pendiente no
+// bloquee la confirmación automática del resto. `marcasDiferidas` se recibe YA resuelto
+// (ver _marcasDiferidas) para que el caller la lea de Configuraciones Globales UNA sola
+// vez para toda la corrida, no una vez por transacción.
+function _agruparPorTerminalDiaYMarca(transacciones, marcasDiferidas) {
+  const grupos = new Map();
+  for (const t of transacciones) {
+    const diaMx = _diaMx(t.transactionDate);
+    const bucket = _bucketDeTransaccion(t.cardTypeName, marcasDiferidas);
+    const clave = `${t.terminalID}|${diaMx.toISOString()}|${bucket}`;
+    const g = grupos.get(clave) ?? {
+      terminalID: t.terminalID, almacen: t.almacen, dia: diaMx, bucket,
+      montoBruto: 0, comision: 0, cantidadTransacciones: 0, folios: [],
+    };
+    g.montoBruto += t.amount ?? 0;
+    g.comision += t.commission ?? 0;
+    g.cantidadTransacciones += 1;
+    // Detalle por transacción (orderID/folio crudos de Kore, sin remapear — mismo criterio
+    // que netpay-transacciones.service.js) — netpay-evaluacion.service.js lo persiste en
+    // NetpayMatch.snapshot.folios (design.md "Data Model"), y netpay-reporte.service.js lo
+    // usa para saber si un reporte cubre TODOS los folios de un bucket
+    // pendiente_por_marca/discrepancia antes de cerrarlo (design.md "(a) Report present").
+    g.folios.push({
+      orderId: t.orderID ?? null, referencia: t.folio ?? null, marca: t.cardTypeName ?? null,
+      monto: t.amount ?? 0, comision: t.commission ?? 0,
+    });
+    grupos.set(clave, g);
+  }
+  return [...grupos.values()].map(g => ({ ...g, netoEsperado: g.montoBruto - g.comision }));
+}
+
 // Núcleo puro del filtrado (sin I/O): dado un `ventanaDias` YA resuelto, filtra `pool`
 // (universo de BankMovement BBVA elegibles) contra la ventana/monto de un grupo puntual.
 // Separado de _buscarCandidatosParaGrupo para que obtenerBandejaNetpay pueda leer
@@ -176,9 +242,12 @@ module.exports = {
   _buscarCandidatosParaGrupo,
   _ventanaDiasNetpay,
   _agruparPorTerminalYDia,
+  _agruparPorTerminalDiaYMarca,
+  _marcasDiferidas,
   _diaMx,
   _normalizarMarcadorDia,
   _claveGrupo,
   _montosIguales,
   VENTANA_DEFAULT_DIAS,
+  MARCAS_DIFERIDAS_DEFAULT,
 };

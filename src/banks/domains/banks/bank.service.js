@@ -1940,7 +1940,7 @@ async function updateErpIds(id, action, erpId, user) {
 // callers de hoy, ej. PUT /movements/:id/erp-ids), el guardado ya es definitivo
 // aquí mismo, así que se emite de inmediato — comportamiento sin cambios.
 async function setErpIds(id, erpLinks, user, opts = {}) {
-  const { session = null } = opts;
+  const { session = null, guardSinVinculos = false } = opts;
   if (!Array.isArray(erpLinks)) throw new BadRequestError('erpLinks debe ser un arreglo');
 
   const cleanLinks = erpLinks
@@ -1969,9 +1969,34 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
     }))
     .filter(l => l.erpId);
 
-  const movQuery = BankMovement.findById(id);
-  const mov = await (session ? movQuery.session(session) : movQuery);
-  if (!mov) throw new NotFoundError('Movimiento');
+  // opts.guardSinVinculos (netpay-matching-v2, design.md "Concurrent link guard"): usado
+  // SOLO por la evaluación automática de Netpay (netpay-evaluacion.service.js) — dos
+  // evaluaciones concurrentes pueden leer el MISMO BankMovement sin erpLinks ("candidato
+  // libre") antes de que cualquiera escriba; un check-then-write (leer, comprobar
+  // longitud, recién después llamar setErpIds) deja esa ventana abierta. Este modo cierra
+  // la ventana con UN solo findOneAndUpdate atómico cuya condición YA exige erpLinks
+  // vacío y cuya propia actualización escribe el arreglo final: si dos llamadas
+  // concurrentes reclaman el mismo movimiento, Mongo deja pasar UNA sola (la segunda ya
+  // no matchea `erpLinks:{$size:0}`, porque la primera ya lo modificó). Ningún otro
+  // caller existente pasa este flag — el find-then-save de siempre sigue exactamente
+  // igual para todos los demás (transferencias-caja, collection-requests, cobro manual,
+  // etc.), cero cambio de comportamiento fuera de este opt-in.
+  let mov;
+  if (guardSinVinculos) {
+    const claimQuery = BankMovement.findOneAndUpdate(
+      { _id: id, erpLinks: { $size: 0 } },
+      { $set: { erpLinks: cleanLinks, erpIds: cleanLinks.map(l => l.erpId) } },
+      { new: true },
+    );
+    mov = await (session ? claimQuery.session(session) : claimQuery);
+    if (!mov) {
+      throw new ConflictError(`El movimiento ${id} ya fue vinculado por otro proceso concurrente.`);
+    }
+  } else {
+    const movQuery = BankMovement.findById(id);
+    mov = await (session ? movQuery.session(session) : movQuery);
+    if (!mov) throw new NotFoundError('Movimiento');
+  }
 
   // Bug real 2026-07-30 (mismo hallazgo que el PATCH .../erp-ids de arriba): este endpoint
   // REEMPLAZA el arreglo completo de erpLinks, así que un solo PUT puede representar un alta
@@ -1980,7 +2005,12 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   // o ambas a la vez. La ruta ya NO trae permit() propio — el alta y la baja se resuelven
   // acá porque solo aquí se conoce el estado ANTERIOR (mov.erpIds) para comparar contra el
   // arreglo entrante y saber qué representa este PUT en concreto.
-  const erpIdsAntes = mov.erpIds ?? [];
+  // guardSinVinculos ya reescribió mov.erpIds/erpLinks atómicamente arriba (mov acá es el
+  // documento POST-escritura, con `new:true`) — el "antes" real para el diff de
+  // auditoría/permisos NO puede leerse de mov (ya está actualizado); lo sabemos igual sin
+  // leer nada más: la propia condición del findOneAndUpdate (`erpLinks:{$size:0}`) ya
+  // probó que estaba vacío antes de que esta llamada lo reclamara.
+  const erpIdsAntes = guardSinVinculos ? [] : (mov.erpIds ?? []);
   const erpIdsNuevos = cleanLinks.map(l => l.erpId);
   const seAgregaAlgo = erpIdsNuevos.some(eid => !erpIdsAntes.includes(eid));
   const seQuitaAlgo = erpIdsAntes.some(eid => !erpIdsNuevos.includes(eid));
@@ -2030,7 +2060,7 @@ async function setErpIds(id, erpLinks, user, opts = {}) {
   // reemplazarlo — este PUT sobrescribe el arreglo completo (ver comentario arriba,
   // "REEMPLAZA el arreglo completo"), así que sin esto no hay forma de saber qué
   // traía cada CxC dada de baja.
-  const erpLinksAntes = mov.erpLinks || [];
+  const erpLinksAntes = guardSinVinculos ? [] : (mov.erpLinks || []);
 
   mov.erpLinks = cleanLinks;
   mov.erpIds   = cleanLinks.map(l => l.erpId);

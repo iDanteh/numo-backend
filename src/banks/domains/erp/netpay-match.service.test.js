@@ -1,27 +1,21 @@
 'use strict';
 
-// netpay-match.service.test.js — Fase C del matching Netpay↔BBVA: obtenerBandejaNetpay()
-// agrupa transacciones (ya traídas por consultarTransaccionesNetpay, mockeada acá) por
-// almacen+terminalID+día, descarta lo ya resuelto (NetpayMatch) y busca candidatos BBVA
-// dentro de tolerancia/ventana. bank.service.js NO se mockea — solo se usa para leer la
-// constante real ERP_TOLERANCE, sin tocar Mongo.
-jest.mock('../banks/BankMovement.model');
+// netpay-match.service.test.js — Fase C del matching Netpay↔BBVA: agrupamiento de
+// transacciones (por terminal+día, y por terminal+día+marca en netpay-matching-v2) dentro
+// de tolerancia/ventana. bank.service.js NO se mockea — solo se usa para leer la constante
+// real ERP_TOLERANCE, sin tocar Mongo.
+//
+// netpay-matching-v2 (PR4, dead-code cleanup): el describe `obtenerBandejaNetpay` (bandeja
+// v1, candidate picker manual) fue ELIMINADO junto con la función misma — ver
+// netpay-match.service.js. Sus mocks de BankMovement/NetpayMatch/netpay-transacciones.service
+// ya no se usan en este archivo.
 jest.mock('../../../shared/services/global-config.service');
-jest.mock('./NetpayMatch.model');
-jest.mock('./netpay-transacciones.service');
 
-const BankMovement = require('../banks/BankMovement.model');
-const NetpayMatch = require('./NetpayMatch.model');
 const globalConfigService = require('../../../shared/services/global-config.service');
-const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const {
-  obtenerBandejaNetpay, _ventanaDiasNetpay, _agruparPorTerminalYDia, _diaMx, _normalizarMarcadorDia,
-  VENTANA_DEFAULT_DIAS,
+  _ventanaDiasNetpay, _agruparPorTerminalYDia, _diaMx, _normalizarMarcadorDia,
+  VENTANA_DEFAULT_DIAS, _agruparPorTerminalDiaYMarca, _marcasDiferidas, MARCAS_DIFERIDAS_DEFAULT,
 } = require('./netpay-match.service');
-
-function fakeFind(result) {
-  return { lean: jest.fn().mockResolvedValue(result) };
-}
 
 function t(overrides = {}) {
   return {
@@ -34,7 +28,6 @@ function t(overrides = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   globalConfigService.getValue.mockResolvedValue('2');
-  NetpayMatch.find = jest.fn(() => fakeFind([]));
 });
 
 describe('_ventanaDiasNetpay', () => {
@@ -102,78 +95,94 @@ describe('_normalizarMarcadorDia — trunca un marcador YA bucketizado, sin desp
   });
 });
 
-describe('obtenerBandejaNetpay', () => {
-  test('sin transacciones: pendientes []', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [] });
-    const resultado = await obtenerBandejaNetpay({});
-    expect(resultado).toEqual({ pendientes: [] });
-    expect(BankMovement.find).not.toHaveBeenCalled();
+// _marcasDiferidas — netpay-matching-v2 (design.md "Lagging brand list"): config global
+// bancos.NETPAY_MARCAS_DIFERIDAS (CSV), mismo patrón que _ventanaDiasNetpay. Default AMEX
+// cuando la config no está sembrada.
+describe('_marcasDiferidas', () => {
+  test('config sin sembrar: usa el default interno (AMEX)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('No existe la configuración bancos.X'));
+    expect(await _marcasDiferidas()).toEqual(MARCAS_DIFERIDAS_DEFAULT);
+    expect(MARCAS_DIFERIDAS_DEFAULT).toEqual(['AMEX']);
   });
 
-  test('1 candidato BBVA exacto dentro de tolerancia: aparece en pendientes', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t({ amount: 300, commission: 20 })] });
-    const mov = { _id: 'mov-1', banco: 'BBVA', deposito: 280, fecha: new Date('2026-09-10T00:00:00Z') };
-    BankMovement.find = jest.fn(() => fakeFind([mov]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes.length).toBe(1);
-    expect(resultado.pendientes[0].grupo.netoEsperado).toBe(280);
-    expect(resultado.pendientes[0].candidatos).toEqual([[mov]]);
+  test('config con una sola marca: la usa en mayúsculas', async () => {
+    globalConfigService.getValue.mockResolvedValue('amex');
+    expect(await _marcasDiferidas()).toEqual(['AMEX']);
   });
 
-  test('candidato fuera de tolerancia ($1 MXN): no aparece', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t({ amount: 300, commission: 20 })] });
-    const mov = { _id: 'mov-1', banco: 'BBVA', deposito: 275, fecha: new Date('2026-09-10T00:00:00Z') };
-    BankMovement.find = jest.fn(() => fakeFind([mov]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes[0].candidatos).toEqual([]);
+  test('config con varias marcas separadas por coma: arreglo con las 3, normalizado', async () => {
+    globalConfigService.getValue.mockResolvedValue('AMEX, diners , JCB');
+    expect(await _marcasDiferidas()).toEqual(['AMEX', 'DINERS', 'JCB']);
   });
 
-  test('sin ningún BankMovement BBVA elegible: grupo pendiente sin candidatos', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t()] });
-    BankMovement.find = jest.fn(() => fakeFind([]));
+  test('config vacía/basura: usa el default interno', async () => {
+    globalConfigService.getValue.mockResolvedValue('   ');
+    expect(await _marcasDiferidas()).toEqual(MARCAS_DIFERIDAS_DEFAULT);
+  });
+});
 
-    const resultado = await obtenerBandejaNetpay({});
+// _agruparPorTerminalDiaYMarca — netpay-matching-v2 (design.md): la unidad de decisión
+// pasa a ser (terminalID, dia, bucket). bucket='general' salvo que cardTypeName EMPIECE
+// con una de las marcas diferidas configuradas (NUNCA cardType, ese campo se ignora a
+// propósito — proposal: "split each terminal-day by cardTypeName, not cardType").
+describe('_agruparPorTerminalDiaYMarca', () => {
+  test('día sin ninguna marca diferida: 1 solo bucket general, mismos valores que la función legacy _agruparPorTerminalYDia (regresión)', () => {
+    const transacciones = [
+      t({ amount: 100, commission: 10, cardTypeName: 'VISA' }),
+      t({ amount: 200, commission: 20, cardTypeName: 'MASTERCARD' }),
+    ];
+    const legacy = _agruparPorTerminalYDia(transacciones);
+    const nuevo = _agruparPorTerminalDiaYMarca(transacciones, ['AMEX']);
 
-    expect(resultado.pendientes.length).toBe(1);
-    expect(resultado.pendientes[0].candidatos).toEqual([]);
+    expect(nuevo).toHaveLength(1);
+    expect(nuevo[0].bucket).toBe('general');
+    expect(nuevo[0].montoBruto).toBe(legacy[0].montoBruto);
+    expect(nuevo[0].comision).toBe(legacy[0].comision);
+    expect(nuevo[0].netoEsperado).toBe(legacy[0].netoEsperado);
+    expect(nuevo[0].dia).toEqual(legacy[0].dia);
   });
 
-  test('grupo YA resuelto (existe NetpayMatch para terminalID+día): no aparece en pendientes', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t()] });
-    NetpayMatch.find = jest.fn(() => fakeFind([
-      { terminalID: '2840403056', dia: _diaMx('2026-09-10T14:00:00Z') },
-    ]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes).toEqual([]);
-    expect(BankMovement.find).not.toHaveBeenCalled();
+  test('cardTypeName ausente (undefined/null): cae en general', () => {
+    const nuevo = _agruparPorTerminalDiaYMarca([t({ cardTypeName: undefined }), t({ cardTypeName: null })], ['AMEX']);
+    expect(nuevo).toHaveLength(1);
+    expect(nuevo[0].bucket).toBe('general');
   });
 
-  test('consulta BankMovement por banco BBVA, erpLinks vacío, status distinto de identificado', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t()] });
-    BankMovement.find = jest.fn(() => fakeFind([]));
-
-    await obtenerBandejaNetpay({});
-
-    const filtro = BankMovement.find.mock.calls[0][0];
-    expect(filtro.banco).toBe('BBVA');
-    expect(filtro.erpLinks).toEqual({ $size: 0 });
-    expect(filtro.status).toEqual({ $ne: 'identificado' });
+  // Proposal + spec: "split each terminal-day by cardTypeName, not cardType" — cardType
+  // (un campo DISTINTO, código legacy de Kore) NUNCA debe decidir el bucket.
+  test('cardType (campo distinto de cardTypeName) se ignora por completo', () => {
+    const nuevo = _agruparPorTerminalDiaYMarca([t({ cardTypeName: 'VISA', cardType: 'AMEX' })], ['AMEX']);
+    expect(nuevo).toHaveLength(1);
+    expect(nuevo[0].bucket).toBe('general');
   });
 
-  // dateFrom/dateTo viajan pelados (YYYY-MM-DD, 2026-09-22) — es consultarTransaccionesNetpay
-  // (mockeada acá) quien arma el instante UTC real en hora MX, no esta función.
-  test('pasa dateFrom/dateTo/terminalID tal cual a consultarTransaccionesNetpay', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [] });
-    await obtenerBandejaNetpay({ dateFrom: '2026-09-01', dateTo: '2026-09-15', terminalID: '2840403056' });
+  // $60,758.23 fixture (proposal): un AMEX entre Visa/Mastercard del mismo terminal+día ->
+  // 2 buckets separados, AMEX aparte del general.
+  test('una venta AMEX entre Visa/Mastercard del mismo terminal+día: 2 buckets separados (general y AMEX)', () => {
+    const transacciones = [
+      t({ amount: 48099.79, commission: 418.39, cardTypeName: 'VISA' }),
+      t({ amount: 12658.44, commission: 513.932664, cardTypeName: 'AMEX' }),
+    ];
+    const grupos = _agruparPorTerminalDiaYMarca(transacciones, ['AMEX']);
 
-    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({
-      dateFrom: '2026-09-01', dateTo: '2026-09-15', terminalID: '2840403056',
-    });
+    expect(grupos).toHaveLength(2);
+    const general = grupos.find(g => g.bucket === 'general');
+    const amex = grupos.find(g => g.bucket === 'AMEX');
+    expect(general.netoEsperado).toBeCloseTo(48099.79 - 418.39);
+    expect(amex.netoEsperado).toBeCloseTo(12658.44 - 513.932664);
+  });
+
+  test('cardTypeName que EMPIEZA con una marca diferida configurada (no coincidencia exacta): va a ese bucket', () => {
+    const grupos = _agruparPorTerminalDiaYMarca([t({ cardTypeName: 'AMEX CREDITO' })], ['AMEX']);
+    expect(grupos[0].bucket).toBe('AMEX');
+  });
+
+  test('terminales o días distintos siguen separando grupos igual que antes, ahora también por bucket', () => {
+    const grupos = _agruparPorTerminalDiaYMarca([
+      t({ terminalID: 'T1', cardTypeName: 'VISA' }),
+      t({ terminalID: 'T1', cardTypeName: 'AMEX' }),
+      t({ terminalID: 'T2', cardTypeName: 'VISA' }),
+    ], ['AMEX']);
+    expect(grupos.length).toBe(3);
   });
 });

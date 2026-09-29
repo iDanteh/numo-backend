@@ -37,13 +37,23 @@ const { normalizarAuthLista }            = require('./erp-auth.utils');
 const { sincronizarTransferenciasCajasManual }
                                           = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay }    = require('./netpay-transacciones.service');
-const { obtenerBandejaNetpay }            = require('./netpay-match.service');
-const { confirmarMatchNetpay, descartarMatchNetpay } = require('./netpay-match-confirm.service');
+// netpay-matching-v2 (Fase 3, route wiring): obtenerBandejaNetpay (candidate picker en vivo,
+// netpay-match.service.js) y confirmarMatchNetpay/descartarMatchNetpay (ya eliminados del
+// service en PR2) ya NO se usan acá — GET /netpay/bandeja pasa a leer NetpayMatch
+// directamente (ver más abajo, mismo patrón que GET /transferencias-cajas/bandeja), y
+// evaluar/resolver/rechazar/candidatos viven en netpay-evaluacion.service.js /
+// netpay-resolver.service.js.
+const NetpayMatch                         = require('./NetpayMatch.model');
+const { evaluarRango }                    = require('./netpay-evaluacion.service');
+const {
+  resolver: resolverNetpayMatch, rechazar: rechazarNetpayMatch, candidatos: candidatosNetpayMatch,
+}                                          = require('./netpay-resolver.service');
 const {
   cargarReporte, listar: listarNetpayReportes, obtenerDetalle: obtenerDetalleNetpayReporte,
   obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
   buscarCandidatos: buscarCandidatosNetpayReporte,
-  confirmarReporte, descartarReporte, consultarFolioKore, consultarFoliosPendientes,
+  evaluarReporte, resolverReporte, rechazarReporte, eliminarReporte, restaurarReporte,
+  consultarFolioKore, consultarFoliosPendientes,
 }                                          = require('./netpay-reporte.service');
 const { generarExcelReporteNetpay }       = require('./netpay-reporte-export.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
@@ -434,33 +444,64 @@ router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPA
   res.json(resultado);
 }));
 
-// GET /api/erp/netpay/bandeja — matching Netpay↔BBVA (ver netpay-match.service.js): agrupa
-// las transacciones del rango por almacen+terminalID+día y busca candidatos BBVA para cada
-// grupo sin resolver todavía. TODO EN VIVO (sin sync/cron) — dateFrom/dateTo (pelados,
-// YYYY-MM-DD, ver nota arriba) acotan el rango de Kore a consultar, mismos parámetros que
-// /netpay/transacciones. Mismo permiso que el resto de la sección.
+// GET /api/erp/netpay/bandeja — netpay-matching-v2 (design.md API table: "Modified: reads
+// persisted buckets only, no call to Kore"): ya NO agrupa transacciones en vivo (esa era la
+// bandeja v1, candidate picker manual, ver netpay-match.service.js#obtenerBandejaNetpay,
+// que queda sin uso desde acá) — ahora solo lista los buckets NetpayMatch YA evaluados por
+// POST .../evaluar (netpay-evaluacion.service.js), filtrando por dateFrom/dateTo/terminalID/
+// estatus. Mismo criterio de "consulta directa al modelo desde la ruta" que
+// GET /transferencias-cajas/bandeja (arriba en este mismo archivo) — no amerita un service
+// propio para un simple find+sort.
 router.get('/netpay/bandeja', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { dateFrom, dateTo, terminalID } = req.query;
-  const resultado = await obtenerBandejaNetpay({ dateFrom, dateTo, terminalID });
+  const { dateFrom, dateTo, terminalID, estatus } = req.query;
+  const filtro = {};
+  if (dateFrom) filtro.dia = { ...(filtro.dia ?? {}), $gte: new Date(`${dateFrom}T00:00:00.000Z`) };
+  if (dateTo)   filtro.dia = { ...(filtro.dia ?? {}), $lte: new Date(`${dateTo}T00:00:00.000Z`) };
+  if (terminalID) filtro.terminalID = terminalID;
+  if (estatus)    filtro.estatusMatch = estatus;
+
+  const buckets = await NetpayMatch.find(filtro).sort({ dia: -1 }).lean();
+  res.json({ buckets });
+}));
+
+// POST /api/erp/netpay/bandeja/evaluar — netpay-matching-v2 (design.md API table: New;
+// "When evaluation runs": "Explicit POST /netpay/bandeja/evaluar, plus on report upload/
+// re-evaluation" — nunca side effects en el GET). Dispara evaluarRango
+// (netpay-evaluacion.service.js) sobre el rango/terminal pedido — persiste una decisión
+// (incluida discrepancia) por cada bucket (terminalID, dia, bucket) todavía reevaluable.
+router.post('/netpay/bandeja/evaluar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  // Fix (2026-09-29, pedido explícito del usuario): responseCode/almacenes/status —
+  // mismos filtros crudos de Kore que ya usa el tab "Consulta" — reenviados a evaluarRango().
+  const { dateFrom, dateTo, terminalID, responseCode, almacenes, status } = req.body;
+  const resultado = await evaluarRango({ dateFrom, dateTo, terminalID, responseCode, almacenes, status });
   res.json(resultado);
 }));
 
-// POST /api/erp/netpay/bandeja/confirmar — confirma un grupo (terminalID+día) contra 1 o 2
-// BankMovement elegidos por el usuario. Re-valida elegibilidad y neto recalculado EN VIVO
-// server-side (netpay-match-confirm.service.js) — nunca confía en que el candidato que
-// manda el cliente sigue siendo válido.
-router.post('/netpay/bandeja/confirmar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { terminalID, almacen, dia, movementIds } = req.body;
-  const resultado = await confirmarMatchNetpay({ terminalID, almacen, dia, movementIds, user: req.user });
+// POST /api/erp/netpay/bandeja/:id/resolver — netpay-matching-v2 (design.md API table: New).
+// Reemplaza el candidate picker manual (POST .../confirmar, eliminado) — cierra un bucket
+// 'discrepancia' con justificación humana obligatoria, opcionalmente vinculando 1-2
+// BankMovement (netpay-resolver.service.js#resolver, con sus propios tests unitarios).
+router.post('/netpay/bandeja/:id/resolver', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { justificacion, movementIds } = req.body;
+  const resultado = await resolverNetpayMatch(req.params.id, { justificacion, movementIds }, req.user);
   res.json(resultado);
 }));
 
-// POST /api/erp/netpay/bandeja/descartar — descarta MANUALMENTE un grupo 'pendiente' sin
-// candidatos, cuando un contador sabe (por fuera de este panel) que ya fue identificado.
-// NUNCA vincula nada contra Kore/CxC — ver netpay-match-confirm.service.js#descartarMatchNetpay.
-router.post('/netpay/bandeja/descartar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { terminalID, almacen, dia } = req.body;
-  const resultado = await descartarMatchNetpay({ terminalID, almacen, dia, user: req.user });
+// POST /api/erp/netpay/bandeja/:id/rechazar — netpay-matching-v2 (design.md API table:
+// "Replaces /bandeja/descartar"). A diferencia del viejo /bandeja/descartar (terminalID+
+// almacen+dia en el body, eliminado), identifica el bucket por :id — mismo criterio que el
+// resto de la migración a rutas por id (netpay-resolver.service.js#rechazar).
+router.post('/netpay/bandeja/:id/rechazar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { motivo } = req.body;
+  const resultado = await rechazarNetpayMatch(req.params.id, { motivo }, req.user);
+  res.json(resultado);
+}));
+
+// GET /api/erp/netpay/bandeja/:id/candidatos — netpay-matching-v2 (design.md API table:
+// "New: all eligible movements in the window, sorted by |diff| (resolve dialog only)").
+// Exclusivo del diálogo de resolver manual — netpay-resolver.service.js#candidatos.
+router.get('/netpay/bandeja/:id/candidatos', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await candidatosNetpayMatch(req.params.id);
   res.json(resultado);
 }));
 
@@ -479,9 +520,12 @@ router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NET
   res.json(resultado);
 }));
 
+// netpay-matching-v2 (design.md API table: "GET /netpay/reporte?estatus&incluirEliminados |
+// Hides eliminado by default"): incluirEliminados viaja como string en query — se normaliza
+// a boolean acá, netpay-reporte.service.js#listar ya lo espera así.
 router.get('/netpay/reporte', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { estatus } = req.query;
-  const resultado = await listarNetpayReportes({ estatus });
+  const { estatus, incluirEliminados } = req.query;
+  const resultado = await listarNetpayReportes({ estatus, incluirEliminados: incluirEliminados === 'true' });
   res.json(resultado);
 }));
 
@@ -495,20 +539,60 @@ router.get('/netpay/reporte/:id', authenticate, permit(PERMISSIONS.BANKS_NETPAY)
 // candidatos originales en memoria del frontend) pueda ofrecer la misma UX de selección por
 // radio buttons, en vez de pegar un _id a mano. Funciona para cualquier estatus, pero solo
 // tiene sentido real con 'pendiente'.
+// netpay-matching-v2 (design.md API table: "GET /netpay/reporte/:id/candidatos?modo=ventana
+// | Adds the window mode"): modo=undefined conserva el comportamiento default (filtra por
+// _montosIguales); modo='ventana' devuelve TODOS los elegibles de la ventana sin filtrar por
+// monto, ordenados por |diferencia| — para el diálogo de resolver manual de un reporte en
+// discrepancia (netpay-reporte.service.js#buscarCandidatos).
 router.get('/netpay/reporte/:id/candidatos', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const resultado = await buscarCandidatosNetpayReporte(req.params.id);
+  const resultado = await buscarCandidatosNetpayReporte(req.params.id, req.query.modo);
   res.json(resultado);
 }));
 
-router.post('/netpay/reporte/:id/confirmar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { movementId } = req.body;
-  const resultado = await confirmarReporte(req.params.id, movementId, req.user);
+// POST /api/erp/netpay/reporte/:id/confirmar fue ELIMINADO (design.md API table: "Removed
+// (candidate picker removed)") — confirmarReporte (v1) también fue eliminado del service,
+// ver netpay-reporte.service.js.
+
+// POST /api/erp/netpay/reporte/:id/reevaluar — netpay-matching-v2 (design.md API table:
+// New). Re-dispara evaluarReporte() para un reporte ya persistido.
+router.post('/netpay/reporte/:id/reevaluar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await evaluarReporte(req.params.id);
   res.json(resultado);
 }));
 
+// POST /api/erp/netpay/reporte/:id/resolver — netpay-matching-v2 (design.md API table: New;
+// addición explícita de esta batch de apply — PR2 solo implementó el resolver a nivel
+// bucket). Mismas reglas de validación que el bucket-level resolver
+// (netpay-reporte.service.js#resolverReporte, con sus propios tests unitarios).
+router.post('/netpay/reporte/:id/resolver', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { justificacion, movementIds } = req.body;
+  const resultado = await resolverReporte(req.params.id, { justificacion, movementIds }, req.user);
+  res.json(resultado);
+}));
+
+// POST /api/erp/netpay/reporte/:id/descartar — netpay-matching-v2 (design.md API table:
+// "Maps to rechazado, also allowed from discrepancia"). Reemplaza descartarReporte (v1,
+// ELIMINADO — su guardia `estatus !== 'pendiente'` nunca podía calzar contra un documento v2
+// real) — ahora delega en rechazarReporte.
 router.post('/netpay/reporte/:id/descartar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
   const { motivo } = req.body;
-  const resultado = await descartarReporte(req.params.id, motivo, req.user);
+  const resultado = await rechazarReporte(req.params.id, { motivo }, req.user);
+  res.json(resultado);
+}));
+
+// POST /api/erp/netpay/reporte/:id/eliminar — netpay-matching-v2 (design.md API table: New;
+// "Report Soft-Delete" — "Ocultar" en el frontend). NUNCA cambia estatus/links.
+router.post('/netpay/reporte/:id/eliminar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const { motivo } = req.body;
+  const resultado = await eliminarReporte(req.params.id, motivo, req.user);
+  res.json(resultado);
+}));
+
+// POST /api/erp/netpay/reporte/:id/restaurar — netpay-matching-v2 (design.md API table: New;
+// "Restoring a hidden report": "clears eliminado and its audit fields only" — nunca toca
+// estatus ni links).
+router.post('/netpay/reporte/:id/restaurar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await restaurarReporte(req.params.id);
   res.json(resultado);
 }));
 

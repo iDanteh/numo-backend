@@ -1771,6 +1771,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+        _grupoCobro: m.reglaNombre === ETIQUETA_PUNTOS ? ORDEN_COBRO.PUNTOS : ORDEN_COBRO.SF,
       };
     }
     // Mismo criterio que al construir `verdadBancaria` arriba: `facturaUuid`
@@ -1805,6 +1806,20 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // con el depósito real, perdiendo el Cargo IVA por completo (bug real
     // 2026-09-01, caso real "039246": $21,041.66 = Clientes + IVA fusionados
     // en una sola línea "banco" en vez de dos líneas separadas).
+    // Cobro de un mes anterior (reglaNombre 'NI', ver cobranza-poliza-generator):
+    // va al bloque de cobros; el subtotal (Depósitos No Identificados) lleva en
+    // columna C la autorización real del depósito si Bancos la tiene, y el
+    // IVA siempre "NI" (2026-09-29, ejemplo real del usuario "9 (4).xls").
+    if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
+      const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
+      return {
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && bancario?.referencia) || REGLA_COBRANZA_NO_IDENTIFICADO,
+        concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
+        debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
+        rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
+        tipoOrigen: m.tipoOrigen, _subcodigo: 0, _grupoCobro: ORDEN_COBRO.NO_IDENTIFICADO,
+      };
+    }
     if (!/^110[12]/.test(m.cuenta?.codigo || '')) {
       return {
         cuenta: m.cuenta, cuentaId: m.cuentaId, serie: m.serie, concepto: m.concepto,
@@ -1812,6 +1827,9 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+        // Cargo a la cuenta puente de un cobro hecho en otra sucursal: va con
+        // los cobros (al final), no junto a la factura.
+        ...(m.tipoOrigen === 'Cobro Sucursal' ? { _grupoCobro: ORDEN_COBRO.COBRO_OTRA_SUCURSAL } : {}),
       };
     }
     const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
@@ -1857,11 +1875,14 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   // su factura — no son un depósito bancario real, no tiene sentido moverlas.
   const otrasLineas = [];
   const cargoLineas = [];
+  const cobrosNoBancarios = []; // SF / Puntos / NI / cobro de otra sucursal (Cargo) — ver `_grupoCobro`
   for (const m of anotados) {
     // Solo las líneas que pasaron por la rama de Caja/Bancos de arriba traen
     // `_referenciaBancoReal` (aunque sea null) — es la misma señal que ya usa
     // el cleanup final para saber qué es un objeto plano de Cargo bancario.
-    (('_referenciaBancoReal' in m) ? cargoLineas : otrasLineas).push(m);
+    if ('_referenciaBancoReal' in m) { cargoLineas.push(m); continue; }
+    if (m._grupoCobro != null && Number(m.debe) > 0) { cobrosNoBancarios.push(m); continue; }
+    otrasLineas.push(m);
   }
 
   // Fusiona el Cargo (dinero recibido) cuando dos o más facturas — del mismo
@@ -1963,9 +1984,22 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     return { ...resto, concepto: [_nombreCliente, ..._tickets].filter(Boolean).join(' / ') };
   });
 
-  // Bloque de Abono/IVA/SF (orden original, por factura) primero, bloque de
-  // Cargo bancario consolidado (depósitos) al final — ver comentario arriba.
-  return [...otrasLineas, ...cargoFinal];
+  // Bloque de Abono/IVA (orden original, por factura) primero, bloque de
+  // cobros al final — ver comentario arriba. Los cobros van en el mismo orden
+  // que en Ingreso (2026-09-29, pedido del usuario, ver `ORDEN_COBRO`):
+  // Puntos → Efectivo → Tarjeta → transferencias/cheques → NI → SF → cobros
+  // de otra sucursal. Orden estable dentro de cada grupo.
+  const grupoDeCargo = m => (m.formaPago === '01' ? ORDEN_COBRO.EFECTIVO
+    : (m.formaPago === '04' || m.formaPago === '28') ? ORDEN_COBRO.TARJETA
+    : ORDEN_COBRO.TRANSFERENCIA);
+  const cobros = [
+    ...cargoFinal.map(m => ({ m, g: grupoDeCargo(m) })),
+    ...cobrosNoBancarios.map(({ _grupoCobro, ...m }) => ({ m, g: _grupoCobro })),
+  ].map((x, i) => ({ ...x, i }))
+    .sort((a, b) => a.g - b.g || a.i - b.i)
+    .map(x => x.m);
+  // `otrasLineas` puede traer instancias de Sequelize: nunca spread/destructuring aquí.
+  return [...otrasLineas, ...cobros];
 }
 
 // Mismo literal que usa `_inyectarSaldoFavorGenerado` (cfdi-poliza-generator.
@@ -1994,9 +2028,12 @@ const NOTA_AJUSTE_SIN_CFDI = {
 // sucursal → cobros sin factura → Otros Ingresos. Cada renglón de cobro lleva
 // su grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
 const ORDEN_COBRO = {
-  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, SF: 7,
+  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NO_IDENTIFICADO: 4.5, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, SF: 7,
   COBRO_OTRA_SUCURSAL: 8, COBRO_SIN_FACTURA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
 };
+// Cobranza: cobro de un mes anterior al complemento (ver cobranza-poliza-generator.service.js).
+const REGLA_COBRANZA_NO_IDENTIFICADO     = 'NI';
+const CUENTA_DEPOSITOS_NO_IDENTIFICADOS  = '2103030001';
 const ORDEN_COBRO_POR_LABEL_CONSOLIDADO = { EFECTIVO: ORDEN_COBRO.EFECTIVO, TARJETA: ORDEN_COBRO.TARJETA, SF: ORDEN_COBRO.SF, PUNTOS: ORDEN_COBRO.PUNTOS };
 
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null) {

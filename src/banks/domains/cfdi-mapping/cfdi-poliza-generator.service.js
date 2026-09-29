@@ -1371,7 +1371,17 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // cual para ese caso.
         const cobrosFormaPago = cobro.formasPago ?? [];
         for (const fp of cobrosFormaPago) {
-          if (/puntos/i.test(fp.nombre ?? '')) { montoPuntos += Number(fp.monto) || 0; continue; }
+          // Mismo bug del ERP descrito arriba (total del pago repetido en cada
+          // ticket): con un solo formaPago, el monto real de ESTE ticket es
+          // `|cobro.monto|` (2026-09-29, caso real Tehuantepec 28-sep: un ABO
+          // de $152.14 en Puntos para H0-260902853 $94.15 + H0-260902852
+          // $57.99 se contaba 2 veces → Puntos $869.15 en vez de $717.01).
+          if (/puntos/i.test(fp.nombre ?? '')) {
+            montoPuntos += (cobrosFormaPago.length === 1 && cobro.monto != null)
+              ? Math.abs(Number(cobro.monto) || 0)
+              : (Number(fp.monto) || 0);
+            continue;
+          }
           // "Saldo a favor" en el texto de la forma de pago se ignora aquí —
           // la fuente autoritativa para SF usado es `/saldos-favor`
           // (`saldoFavorUsado`, ver abajo), no este texto — mezclarlo en

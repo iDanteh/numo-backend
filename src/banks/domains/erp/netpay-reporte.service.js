@@ -12,10 +12,13 @@ const NetpayReporte = require('./NetpayReporte.model');
 const NetpayMatch = require('./NetpayMatch.model');
 const NetpayFolioRegistro = require('./NetpayFolioRegistro.model');
 const { setErpIds, ERP_TOLERANCE } = require('../banks/bank.service');
-const { conTransaccion } = require('../../shared/utils/mongo-tx');
 const { buscarTransaccionesNetpay } = require('./kore-caja.service');
 const { _ventanaDiasNetpay, _montosIguales: _montosIgualesCompartido } = require('./netpay-match.service');
 const { NotFoundError, BadRequestError, ConflictError } = require('../../shared/errors/AppError');
+// Estados desde los que rechazarReporte YA NO puede actuar — mismo criterio EXACTO que
+// netpay-resolver.service.js#ESTATUS_TERMINALES ("any active state -> rechazado",
+// spec.md), aplicado a NetpayReporte.
+const ESTATUS_TERMINALES = new Set(['rechazado', 'resuelto_manual']);
 const { parseNetpayReporte } = require('./netpay-reporte-parser.service');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { logger } = require('../../../shared/utils/logger');
@@ -67,6 +70,29 @@ async function _buscarCandidatosParaReporte(reporte) {
   }).lean();
 
   return pool.filter(m => _montosIguales(m.deposito, reporte.montoDepositoTotal));
+}
+
+// _buscarCandidatosEnVentana — GET /netpay/reporte/:id/candidatos?modo=ventana (design.md
+// API table: "Adds the window mode"). A diferencia de _buscarCandidatosParaReporte (que
+// filtra por _montosIguales), acá el reporte YA está en discrepancia — el diálogo de
+// resolver manual necesita ver TODOS los elegibles de la ventana, aunque su monto no
+// calce, ordenados por |diferencia| ascendente. Mismo criterio EXACTO que
+// netpay-resolver.service.js#candidatos (equivalente a nivel bucket).
+async function _buscarCandidatosEnVentana(reporte) {
+  const ventanaDias = await _ventanaDiasNetpay();
+  const msVentana = ventanaDias * 24 * 60 * 60 * 1000;
+  const fechaMovimiento = new Date(reporte.fechaMovimiento);
+  const desde = new Date(fechaMovimiento.getTime() - msVentana);
+  const hasta = new Date(fechaMovimiento.getTime() + msVentana);
+
+  const pool = await BankMovement.find({
+    banco: 'BBVA', erpLinks: { $size: 0 }, status: { $ne: 'identificado' },
+    fecha: { $gte: desde, $lte: hasta },
+  }).lean();
+
+  return pool
+    .map(m => ({ ...m, diferencia: (m.deposito ?? 0) - (reporte.montoDepositoTotal ?? 0) }))
+    .sort((a, b) => Math.abs(a.diferencia) - Math.abs(b.diferencia));
 }
 
 // _clave — clave determinística de idempotencia de un folio (design.md
@@ -175,77 +201,96 @@ async function obtenerDetalle(id) {
 // paso atrás respecto al resto del flujo. Funciona para un reporte en cualquier estatus (no
 // se valida acá), pero solo tiene sentido real cuando estatus:'pendiente' — un reporte ya
 // 'confirmado'/'descartado' no tiene nada que vincular.
-async function buscarCandidatos(reporteId) {
+async function buscarCandidatos(reporteId, modo) {
   const reporte = await NetpayReporte.findById(reporteId).lean();
   if (!reporte) throw new NotFoundError('Reporte Netpay');
 
-  const candidatos = await _buscarCandidatosParaReporte(reporte);
+  const candidatos = modo === 'ventana'
+    ? await _buscarCandidatosEnVentana(reporte)
+    : await _buscarCandidatosParaReporte(reporte);
   return { candidatos };
 }
 
-// confirmarReporte — vincula el reporte a UN BankMovement de BBVA elegido por el usuario
-// (candidato de la bandeja o cualquier otro _id, se RE-VALIDA server-side sin confiar en lo
-// que manda el cliente). Usa el MISMO erpId sintético NETPAYRPT-<claveRastreo> para
-// setErpIds + para que netpay-reporte-revert.service.js pueda reconocerlo al desvincular.
-async function confirmarReporte(id, movementId, user) {
-  if (!movementId) throw new BadRequestError('Se requiere movementId.');
+// resolverReporte — netpay-matching-v2 (design.md API table: "POST /netpay/reporte/:id/
+// resolver": New; "Manual Resolve of Discrepancies" applies equally to NetpayReporte).
+// Reemplaza confirmarReporte (Implementación 1, ELIMINADO — su guardia
+// `estatus !== 'pendiente'` nunca puede calzar contra un documento v2 real). Cierra un
+// reporte 'discrepancia' con justificación humana OBLIGATORIA, opcionalmente vinculando UN
+// BankMovement — mismas reglas de validación que netpay-resolver.service.js#resolver
+// (bucket-level), salvo la cardinalidad: el modelo NetpayReporte solo tiene UN campo
+// movementIdConfirmado (1 reporte == a lo sumo 1 depósito), a diferencia de
+// NetpayMatch.movementIdsConfirmados[] — se acepta como mucho 1 movementId acá.
+//
+// GUARD DE DISEÑO NO NEGOCIABLE (spec.md "Manual action cannot force auto-confirmed"): este
+// camino JAMÁS escribe estatus:'confirmado_automatico' ni 'resuelto_por_reporte' — el único
+// resultado posible es 'resuelto_manual'.
+async function resolverReporte(id, { justificacion, movementIds } = {}, user) {
+  const justificacionLimpia = justificacion ? String(justificacion).trim() : '';
+  if (!justificacionLimpia) throw new BadRequestError('Se requiere una justificación.');
+
+  const ids = [...new Set((movementIds ?? []).map(String))];
+  if (ids.length > 1) throw new BadRequestError('Se permite a lo sumo 1 movementId para un reporte.');
 
   const reporte = await NetpayReporte.findById(id);
   if (!reporte) throw new NotFoundError('Reporte Netpay');
-  if (reporte.estatus !== 'pendiente') {
-    throw new ConflictError(`Este reporte ya no está pendiente (estatus=${reporte.estatus}).`);
+  if (reporte.estatus !== 'discrepancia') {
+    throw new ConflictError(`Este reporte no está en discrepancia (estatus=${reporte.estatus}).`);
   }
 
-  const mov = await BankMovement.findById(movementId);
-  if (!mov) throw new NotFoundError('Movimiento bancario');
-  if (mov.banco !== 'BBVA') {
-    throw new ConflictError(`El movimiento ${mov._id} no es de BBVA.`);
+  const actualizados = [];
+  if (ids.length > 0) {
+    const movimientos = await BankMovement.find({ _id: { $in: ids } }).lean();
+    if (movimientos.length !== ids.length) throw new NotFoundError('Uno o más movimientos bancarios');
+    for (const mov of movimientos) {
+      if (mov.banco !== 'BBVA') throw new ConflictError(`El movimiento ${mov._id} no es de BBVA.`);
+      if ((mov.erpLinks ?? []).length > 0) {
+        throw new ConflictError(`El movimiento ${mov._id} ya tiene un ID ERP vinculado — puede que otro usuario ya lo haya usado.`);
+      }
+    }
+    const erpId = `${_erpIdReporte(reporte.claveRastreo)}-MANUAL`;
+    for (const mov of movimientos) {
+      // eslint-disable-next-line no-await-in-loop
+      const actualizado = await setErpIds(mov._id, [{
+        erpId, origen: 'netpay-reporte-manual',
+        saldoPagadoTotal: mov.deposito, saldoPagado: mov.deposito, total: mov.deposito,
+      }], user);
+      actualizados.push(actualizado);
+    }
   }
-  if ((mov.erpLinks ?? []).length > 0) {
-    throw new ConflictError(`El movimiento ${mov._id} ya tiene un ID ERP vinculado — puede que otro usuario ya lo haya usado.`);
+
+  reporte.estatus = 'resuelto_manual';
+  reporte.motivoDiscrepancia = null;
+  reporte.justificacion = justificacionLimpia;
+  reporte.resueltoManualPor = { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null };
+  reporte.resueltoManualEn = new Date();
+  if (ids.length > 0) reporte.movementIdConfirmado = ids[0];
+  await reporte.save();
+
+  for (const actualizado of actualizados) {
+    emitToBanco(actualizado.banco, 'bank:movement:updated', actualizado);
+    emitToAll('bank:ficha-pendiente:changed', { movementId: actualizado._id });
   }
-  if (!_montosIguales(mov.deposito, reporte.montoDepositoTotal)) {
-    throw new ConflictError(
-      `El monto del movimiento (${mov.deposito}) no coincide con el depósito del reporte (${reporte.montoDepositoTotal}).`,
-    );
-  }
 
-  const erpId = _erpIdReporte(reporte.claveRastreo);
-  const movActualizado = await conTransaccion(async (session) => {
-    const actualizado = await setErpIds(mov._id, [{
-      erpId, origen: 'netpay-reporte',
-      saldoPagadoTotal: mov.deposito, saldoPagado: mov.deposito, total: mov.deposito,
-    }], user, { session });
-
-    reporte.estatus = 'confirmado';
-    reporte.movementIdConfirmado = mov._id;
-    reporte.confirmadoPor = { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null };
-    reporte.confirmadoEn = new Date();
-    await reporte.save(session ? { session } : undefined);
-
-    return actualizado;
-  });
-
-  emitToBanco(movActualizado.banco, 'bank:movement:updated', movActualizado);
-  emitToAll('bank:ficha-pendiente:changed', { movementId: mov._id });
-
-  return { reporte: reporte.toObject(), movimiento: movActualizado };
+  return { reporte: reporte.toObject(), movimientos: actualizados };
 }
 
-// descartarReporte — el usuario decide que este reporte NO se va a conciliar (ej. ya se
-// identificó por fuera de este flujo). NUNCA vincula nada contra BankMovement — a
-// diferencia de confirmarReporte.
-async function descartarReporte(id, motivo, user) {
+// rechazarReporte — netpay-matching-v2 (design.md API table: "POST /netpay/reporte/:id/
+// descartar": "Maps to rechazado, also allowed from discrepancia"). Reemplaza
+// descartarReporte (Implementación 1, ELIMINADO — misma razón que confirmarReporte
+// arriba). NUNCA vincula nada contra BankMovement, mismo criterio EXACTO que
+// netpay-resolver.service.js#rechazar (bucket-level): permitido desde cualquier estado NO
+// terminal ("any active state -> rechazado", spec.md).
+async function rechazarReporte(id, { motivo } = {}, user) {
   const reporte = await NetpayReporte.findById(id);
   if (!reporte) throw new NotFoundError('Reporte Netpay');
-  if (reporte.estatus !== 'pendiente') {
-    throw new ConflictError(`Este reporte ya no está pendiente (estatus=${reporte.estatus}).`);
+  if (ESTATUS_TERMINALES.has(reporte.estatus)) {
+    throw new ConflictError(`Este reporte ya está en un estado terminal (estatus=${reporte.estatus}).`);
   }
 
-  reporte.estatus = 'descartado';
+  reporte.estatus = 'rechazado';
+  reporte.descartadoMotivo = motivo ? String(motivo).trim() || null : null;
   reporte.descartadoPor = { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null };
   reporte.descartadoEn = new Date();
-  reporte.descartadoMotivo = motivo ? String(motivo).trim() || null : null;
   await reporte.save();
 
   return { reporte: reporte.toObject() };
@@ -532,8 +577,8 @@ module.exports = {
   obtenerDetalle,
   obtenerPorMovimiento,
   buscarCandidatos,
-  confirmarReporte,
-  descartarReporte,
+  resolverReporte,
+  rechazarReporte,
   consultarFolioKore,
   consultarFoliosPendientes,
   evaluarReporte,

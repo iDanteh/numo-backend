@@ -628,7 +628,23 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
     // cobros-sucursal-puente.service.js) — mismo criterio en ambos lados.
     const usoMismaSucursalPorVenta = !!(centroPropioClave && usoUnico
       && usoUnico.serieVenta === centroPropioClave && cuenta.serieVenta === centroPropioClave);
-    const oculto = ocultoMultiUso || (!esCruzado && !!(usoUnico && usoOcultable && diaGen && diaGen === diaUso
+    // Uso parcial el mismo día con sobrante >= $50 (2026-09-29, confirmado con
+    // el usuario: "tengo un saldo a favor de 100 y ocupo 80, me sobran 20"):
+    // la póliza muestra SOLO el sobrante (Abono SF visible por $20, ver
+    // `_inyectarSaldoFavorGenerado`), y la generación y los usos del día van a
+    // "Movimientos de Saldos a Favor" (SF-OCULTO). Solo camino por centro y
+    // solo si TODOS los usos del día son de esta sucursal (o retiros ABO):
+    // un uso en otra sucursal sale visible en SU póliza y ocultarlo aquí
+    // dejaría ese Cargo sin su Abono. También con sobrante < $50 si ese
+    // sobrante se usó OTRO día: sigue siendo saldo del cliente (SF visible),
+    // no va a "Otros Ingresos" — ver `sobranteSFVisible`.
+    const hayUsosOtroDia = usos.length > usosMismoDia.length;
+    const ocultoParcialMismoDia = !!(centroPropioClave && !esCruzado && usosMismoDia.length > 0
+      && (saldoRestanteSF >= SOBRANTE_MAX_SF_OCULTO || (hayUsosOtroDia && saldoRestanteSF >= 0.01))
+      && usosMismoDia.every(u => (u.serieOrigen ?? u.serieVenta ?? '').toUpperCase() === 'ABO'
+        || u.serieVenta === centroPropioClave
+        || _claveCentroPorMonto(cobrosPorVentaUso, u.serieVenta, u.folioVenta, u.montoUsado, u.fecha) === claveCentroGen));
+    const oculto = ocultoMultiUso || ocultoParcialMismoDia || (!esCruzado && !!(usoUnico && usoOcultable && diaGen && diaGen === diaUso
       && claveCentroGen && ((claveCentroUso && claveCentroGen === claveCentroUso) || usoMismaSucursalPorVenta)));
     if (oculto) devsOcultos.add(key);
 
@@ -686,6 +702,9 @@ async function _prefetchSaldosFavorGenerados(cfdis, rfc, ccBySerieMap, opciones 
       ventaSerie: cuenta.serieVenta,
       ventaFolio: cuenta.folioVenta,
       oculto,
+      // Sobrante del día que se queda como SF visible (no "Otros Ingresos"),
+      // ver `ocultoParcialMismoDia`.
+      sobranteSFVisible: ocultoParcialMismoDia || prev?.sobranteSFVisible || false,
       mismoFolio: mismoFolio || prev?.mismoFolio || false,
       formaPagoReal: mismoFolio
         ? (_formaPagoDominante(cobrosPorVenta.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)) ?? prev?.formaPagoReal ?? null)
@@ -2233,13 +2252,16 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
     const ivaOculto  = Math.round((montoOculto - subOculto) * 100) / 100;
     const subSobra   = Math.round((subtotal - subOculto) * 100) / 100;
     const ivaSobra   = Math.round((iva - ivaOculto) * 100) / 100;
+    // Uso parcial mismo día (ver `ocultoParcialMismoDia`): el sobrante queda
+    // como SF visible en la póliza en vez de "Otros Ingresos".
+    const reglaSobrante = generado.sobranteSFVisible ? 'SF' : ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR;
     return [
       ...(montoOculto >= 0.01 ? [
         { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO, debe: 0, haber: subOculto },
         { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO, debe: 0, haber: ivaOculto },
       ] : []),
-      { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR, debe: 0, haber: subSobra },
-      { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR, debe: 0, haber: ivaSobra },
+      { ...base, cuentaId: cuentaSaldoFavorId,    tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSobrante, debe: 0, haber: subSobra },
+      { ...base, cuentaId: cuentaIvaSaldoFavorId, tipoOrigen: 'Cobro Sucursal', reglaNombre: reglaSobrante, debe: 0, haber: ivaSobra },
     ].filter(l => l.haber > 0);
   }
 
@@ -5172,7 +5194,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // Sin usar en absoluto y menor a $50 → también "Otros Ingresos" (mismo
       // criterio que `reglaSFExport` en `_inyectarSaldoFavorGenerado`) — caso
       // real D0-260904439 (CAC-079379, $0.01), centro 112 24-sep, póliza 511.
-      const reglaSF = (generado.oculto || ((Number(generado.montoUsadoKore) || 0) < 0.01 && (Number(generado.monto) || 0) < 50))
+      // Oculto con sobrante que queda como SF (ver `ocultoParcialMismoDia`) → SF visible.
+      const reglaSF = ((generado.oculto && !generado.sobranteSFVisible) || ((Number(generado.montoUsadoKore) || 0) < 0.01 && (Number(generado.monto) || 0) < 50))
         ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
         : 'SF';
       const subtotal = Math.round((generado.monto / 1.16) * 100) / 100;
@@ -5387,6 +5410,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           centroCosto: ccSinFacturaProp?.clave ?? null, centroCostoId: ccSinFacturaProp?.id ?? null,
           cfdiUuid: null, cuentaFaltante: false,
           tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+          // Origen oculto (generado y usado el mismo día, ver `devsOcultos`):
+          // mismo trato que el uso con factura (`detalleOculto`) — sin esto el
+          // Cargo quedaba visible mientras la generación ya salía neta.
+          ...(devsOcultosSFProp.has(`${d.serieOrigen}|${d.folioOrigen}`)
+            ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         };
         movimientosResult.push({ ...baseSinFacturaProp, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSF });
         movimientosResult.push({ ...baseSinFacturaProp, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF });
@@ -6839,7 +6867,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       // (ver `SOBRANTE_MAX_SF_OCULTO`), igual que en `_inyectarSaldoFavorGenerado`.
       // Sin usar en absoluto y menor a $50 → también "Otros Ingresos" (ver
       // comentario equivalente en generarPropuesta).
-      const reglaSFG = (generado.oculto || ((Number(generado.montoUsadoKore) || 0) < 0.01 && (Number(generado.monto) || 0) < 50))
+      // Oculto con sobrante que queda como SF (ver `ocultoParcialMismoDia`) → SF visible.
+      const reglaSFG = ((generado.oculto && !generado.sobranteSFVisible) || ((Number(generado.montoUsadoKore) || 0) < 0.01 && (Number(generado.monto) || 0) < 50))
         ? ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR
         : 'SF';
       const subtotalG = Math.round((generado.monto / 1.16) * 100) / 100;
@@ -7017,6 +7046,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           centroCosto: ccSinFacturaGuard?.clave ?? null, centroCostoId: ccSinFacturaGuard?.id ?? null,
           cfdiUuid: null, cuentaFaltante: false,
           tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF', haber: 0,
+          // Origen oculto — ver comentario equivalente en generarPropuesta.
+          ...(devsOcultosSFGuard.has(`${d.serieOrigen}|${d.folioOrigen}`)
+            ? { tipoOrigen: 'Cobro Sucursal', reglaNombre: ETIQUETA_SALDO_FAVOR_OCULTO } : {}),
         };
         todosLosMovimientos.push({ ...baseSinFacturaGuard, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSFG });
         todosLosMovimientos.push({ ...baseSinFacturaGuard, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSFG });

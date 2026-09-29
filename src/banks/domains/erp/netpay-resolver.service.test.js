@@ -10,13 +10,18 @@ jest.mock('../banks/BankMovement.model');
 jest.mock('./NetpayMatch.model');
 jest.mock('../../shared/socket', () => ({ emitToBanco: jest.fn(), emitToAll: jest.fn() }));
 jest.mock('../banks/bank.service', () => ({ setErpIds: jest.fn() }));
+// GET .../bandeja/:id/candidatos (design.md API table: "New: all eligible movements in the
+// window, sorted by |diff| (resolve dialog only)") reusa la misma ventana de días que el
+// resto del dominio Netpay — mismo patrón de mock que netpay-reporte.service.test.js.
+jest.mock('./netpay-match.service', () => ({ _ventanaDiasNetpay: jest.fn() }));
 
 const BankMovement = require('../banks/BankMovement.model');
 const NetpayMatch = require('./NetpayMatch.model');
 const { setErpIds } = require('../banks/bank.service');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
+const { _ventanaDiasNetpay } = require('./netpay-match.service');
 const { NotFoundError, ConflictError } = require('../../shared/errors/AppError');
-const { resolver, rechazar } = require('./netpay-resolver.service');
+const { resolver, rechazar, candidatos } = require('./netpay-resolver.service');
 
 const USER = { _id: 'user-1', nombre: 'Ana' };
 
@@ -36,6 +41,7 @@ function fakeBucketDoc(overrides = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   BankMovement.find = jest.fn().mockResolvedValue([]);
+  _ventanaDiasNetpay.mockResolvedValue(2);
 });
 
 describe('resolver', () => {
@@ -191,5 +197,51 @@ describe('rechazar', () => {
     await rechazar('nm-1', {}, USER);
 
     expect(bucket.rechazoMotivo).toBeNull();
+  });
+});
+
+// candidatos — GET /netpay/bandeja/:id/candidatos (design.md API table: "New: all eligible
+// movements in the window, sorted by |diff| (resolve dialog only)"). A diferencia del
+// evaluador automático (netpay-evaluacion.service.js, que solo busca EXACTOS dentro de
+// ERP_TOLERANCE), acá el bucket YA está en discrepancia — el diálogo de resolver necesita
+// ver TODOS los elegibles de la ventana, aunque no calcen, para que el humano pueda elegir
+// el más cercano con justificación.
+describe('candidatos', () => {
+  test('bucket no existe: NotFoundError', async () => {
+    NetpayMatch.findById = jest.fn(() => ({ lean: jest.fn().mockResolvedValue(null) }));
+    await expect(candidatos('nm-1')).rejects.toThrow(NotFoundError);
+  });
+
+  test('acota la búsqueda a la ventana de días (_ventanaDiasNetpay) alrededor de bucket.dia', async () => {
+    const dia = new Date('2026-09-10T00:00:00.000Z');
+    NetpayMatch.findById = jest.fn(() => ({ lean: jest.fn().mockResolvedValue({ _id: 'nm-1', dia, netoEsperado: 280 }) }));
+    _ventanaDiasNetpay.mockResolvedValue(3);
+    BankMovement.find = jest.fn(() => ({ lean: jest.fn().mockResolvedValue([]) }));
+
+    await candidatos('nm-1');
+
+    const filtro = BankMovement.find.mock.calls[0][0];
+    const msVentana = 3 * 24 * 60 * 60 * 1000;
+    expect(filtro.banco).toBe('BBVA');
+    expect(filtro.fecha.$gte).toEqual(new Date(dia.getTime() - msVentana));
+    expect(filtro.fecha.$lte).toEqual(new Date(dia.getTime() + msVentana));
+  });
+
+  test('devuelve TODOS los elegibles de la ventana (no solo los que calzan exacto), ordenados por |diferencia| ascendente', async () => {
+    NetpayMatch.findById = jest.fn(() => ({
+      lean: jest.fn().mockResolvedValue({ _id: 'nm-1', dia: new Date('2026-09-10T00:00:00.000Z'), netoEsperado: 280 }),
+    }));
+    BankMovement.find = jest.fn(() => ({
+      lean: jest.fn().mockResolvedValue([
+        { _id: 'mov-lejano', banco: 'BBVA', deposito: 400 },   // diferencia 120
+        { _id: 'mov-cercano', banco: 'BBVA', deposito: 290 },  // diferencia 10
+        { _id: 'mov-medio', banco: 'BBVA', deposito: 300 },    // diferencia 20
+      ]),
+    }));
+
+    const { candidatos: resultado } = await candidatos('nm-1');
+
+    expect(resultado.map(c => c._id)).toEqual(['mov-cercano', 'mov-medio', 'mov-lejano']);
+    expect(resultado.find(c => c._id === 'mov-cercano').diferencia).toBe(10);
   });
 });

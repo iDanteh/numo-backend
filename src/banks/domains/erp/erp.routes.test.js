@@ -88,19 +88,35 @@ jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpa
 // rutas. netpay-reporte.service tiene sus propios tests unitarios
 // (netpay-reporte.service.test.js); acá solo se cubre el cableado HTTP (multer, permisos,
 // params, códigos de respuesta) — mismo criterio que caja-transferencia-confirm.service
-// arriba.
+// arriba. netpay-matching-v2 (Fase 3, route wiring): confirmarReporte/descartarReporte
+// fueron ELIMINADOS (dead code v1, ver netpay-reporte.service.js) — reemplazados por
+// evaluarReporte/resolverReporte/rechazarReporte/eliminarReporte/restaurarReporte.
 jest.mock('./netpay-reporte.service', () => ({
   cargarReporte:              jest.fn(),
   listar:                     jest.fn(),
   obtenerDetalle:             jest.fn(),
   obtenerPorMovimiento:       jest.fn(),
   buscarCandidatos:           jest.fn(),
-  confirmarReporte:           jest.fn(),
-  descartarReporte:           jest.fn(),
+  evaluarReporte:             jest.fn(),
+  resolverReporte:            jest.fn(),
+  rechazarReporte:            jest.fn(),
+  eliminarReporte:            jest.fn(),
+  restaurarReporte:           jest.fn(),
   consultarFolioKore:         jest.fn(),
   consultarFoliosPendientes:  jest.fn(),
 }));
 jest.mock('./netpay-reporte-export.service', () => ({ generarExcelReporteNetpay: jest.fn() }));
+
+// netpay-matching-v2 (Fase 3, route wiring): GET /netpay/bandeja pasa a leer directamente
+// los buckets YA persistidos (NetpayMatch) — ya no llama a Kore en vivo (design.md API
+// table: "Modified: reads persisted buckets only, no call to Kore"). Mismo criterio de mock
+// que CajaTransferencia.model arriba (find().sort().lean()).
+jest.mock('./NetpayMatch.model');
+// netpay-evaluacion.service / netpay-resolver.service — límite de I/O real de las rutas
+// nuevas de la bandeja (evaluar/resolver/rechazar/candidatos); ambos tienen sus propios
+// tests unitarios (netpay-evaluacion.service.test.js / netpay-resolver.service.test.js).
+jest.mock('./netpay-evaluacion.service', () => ({ evaluarRango: jest.fn() }));
+jest.mock('./netpay-resolver.service', () => ({ resolver: jest.fn(), rechazar: jest.fn(), candidatos: jest.fn() }));
 
 const express      = require('express');
 const request      = require('supertest');
@@ -119,9 +135,15 @@ const {
   cargarReporte, listar: listarNetpayReportes, obtenerDetalle: obtenerDetalleNetpayReporte,
   obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
   buscarCandidatos: buscarCandidatosNetpayReporte,
-  confirmarReporte, descartarReporte, consultarFolioKore, consultarFoliosPendientes,
+  evaluarReporte, resolverReporte, rechazarReporte, eliminarReporte, restaurarReporte,
+  consultarFolioKore, consultarFoliosPendientes,
 } = require('./netpay-reporte.service');
 const { generarExcelReporteNetpay } = require('./netpay-reporte-export.service');
+const NetpayMatch = require('./NetpayMatch.model');
+const { evaluarRango } = require('./netpay-evaluacion.service');
+const {
+  resolver: resolverNetpayMatch, rechazar: rechazarNetpayMatch, candidatos: candidatosNetpayMatch,
+} = require('./netpay-resolver.service');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 
 describe('_aporteConRatchet', () => {
@@ -1446,6 +1468,272 @@ describe('GET /netpay/transacciones', () => {
   });
 });
 
+// GET /netpay/bandeja — netpay-matching-v2 (design.md API table: "Modified: reads persisted
+// buckets only, no call to Kore"). Ya NO agrupa transacciones en vivo (netpay-match.service.js
+// #obtenerBandejaNetpay, ya no se llama desde acá) — solo lista los NetpayMatch YA evaluados
+// por POST .../evaluar, filtrando por dateFrom/dateTo/terminalID/estatus.
+describe('GET /netpay/bandeja', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+    NetpayMatch.find = jest.fn(() => ({ sort: jest.fn(() => ({ lean: jest.fn().mockResolvedValue([]) })) }));
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app).get('/netpay/bandeja').set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(NetpayMatch.find).not.toHaveBeenCalled();
+    expect(consultarTransaccionesNetpay).not.toHaveBeenCalled();
+  });
+
+  test('sin filtros: lista todos los buckets persistidos, NUNCA llama a Kore', async () => {
+    const bucket = { _id: 'nm-1', terminalID: 'T1', estatusMatch: 'discrepancia' };
+    NetpayMatch.find = jest.fn(() => ({ sort: jest.fn(() => ({ lean: jest.fn().mockResolvedValue([bucket]) })) }));
+
+    const res = await request(app)
+      .get('/netpay/bandeja')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ buckets: [bucket] });
+    expect(consultarTransaccionesNetpay).not.toHaveBeenCalled();
+  });
+
+  test('filtra por dateFrom/dateTo/terminalID/estatus', async () => {
+    const res = await request(app)
+      .get('/netpay/bandeja')
+      .query({ dateFrom: '2026-09-01', dateTo: '2026-09-10', terminalID: 'T1', estatus: 'discrepancia' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    const filtro = NetpayMatch.find.mock.calls[0][0];
+    expect(filtro.terminalID).toBe('T1');
+    expect(filtro.estatusMatch).toBe('discrepancia');
+    expect(filtro.dia.$gte).toEqual(new Date('2026-09-01T00:00:00.000Z'));
+    expect(filtro.dia.$lte).toEqual(new Date('2026-09-10T00:00:00.000Z'));
+  });
+});
+
+// POST /netpay/bandeja/evaluar — netpay-matching-v2 (design.md API table: New; "When
+// evaluation runs": "Explicit POST ... A GET must stay read-only"). Dispara
+// netpay-evaluacion.service.js#evaluarRango sobre el rango/terminal pedido.
+describe('POST /netpay/bandeja/evaluar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/bandeja/evaluar')
+      .send({ dateFrom: '2026-09-01', dateTo: '2026-09-10' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(evaluarRango).not.toHaveBeenCalled();
+  });
+
+  test('pasa dateFrom/dateTo/terminalID al service y devuelve el resultado tal cual', async () => {
+    evaluarRango.mockResolvedValue({ evaluados: [{ _id: 'nm-1' }] });
+
+    const res = await request(app)
+      .post('/netpay/bandeja/evaluar')
+      .send({ dateFrom: '2026-09-01', dateTo: '2026-09-10', terminalID: 'T1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(evaluarRango).toHaveBeenCalledWith({ dateFrom: '2026-09-01', dateTo: '2026-09-10', terminalID: 'T1' });
+    expect(res.body).toEqual({ evaluados: [{ _id: 'nm-1' }] });
+  });
+});
+
+// POST /netpay/bandeja/:id/resolver — netpay-matching-v2 (design.md API table: New).
+// Delegación pura al service (netpay-resolver.service.js#resolver tiene sus propios tests
+// unitarios) — acá solo se cubre el cableado HTTP.
+describe('POST /netpay/bandeja/:id/resolver', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/bandeja/nm-1/resolver')
+      .send({ justificacion: 'ok' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(resolverNetpayMatch).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + justificacion + movementIds + usuario al service', async () => {
+    resolverNetpayMatch.mockResolvedValue({ bucket: { _id: 'nm-1', estatusMatch: 'resuelto_manual' }, movimientos: [] });
+
+    const res = await request(app)
+      .post('/netpay/bandeja/nm-1/resolver')
+      .send({ justificacion: 'ok', movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(resolverNetpayMatch).toHaveBeenCalledWith(
+      'nm-1', { justificacion: 'ok', movementIds: ['mov-1'] }, expect.objectContaining({ _id: 'user-test' }),
+    );
+    expect(res.body.bucket.estatusMatch).toBe('resuelto_manual');
+  });
+
+  test('propaga 400 de una justificación vacía (BadRequestError del service)', async () => {
+    const { BadRequestError } = require('../../shared/errors/AppError');
+    resolverNetpayMatch.mockRejectedValue(new BadRequestError('Se requiere una justificación.'));
+
+    const res = await request(app)
+      .post('/netpay/bandeja/nm-1/resolver')
+      .send({ justificacion: '' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(400);
+  });
+
+  test('propaga 409 de un conflicto de negocio (ej. bucket no está en discrepancia)', async () => {
+    const { ConflictError } = require('../../shared/errors/AppError');
+    resolverNetpayMatch.mockRejectedValue(new ConflictError('Este bucket no está en discrepancia'));
+
+    const res = await request(app)
+      .post('/netpay/bandeja/nm-1/resolver')
+      .send({ justificacion: 'ok' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// POST /netpay/bandeja/:id/rechazar — netpay-matching-v2 (design.md API table: "Replaces
+// /bandeja/descartar"). A diferencia del viejo /bandeja/descartar (terminalID+almacen+dia en
+// el body), ahora identifica el bucket por :id, mismo criterio que el resto de la migración.
+describe('POST /netpay/bandeja/:id/rechazar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/bandeja/nm-1/rechazar')
+      .send({ motivo: 'ya identificado a mano' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(rechazarNetpayMatch).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + motivo + usuario al service', async () => {
+    rechazarNetpayMatch.mockResolvedValue({ bucket: { _id: 'nm-1', estatusMatch: 'rechazado' } });
+
+    const res = await request(app)
+      .post('/netpay/bandeja/nm-1/rechazar')
+      .send({ motivo: 'ya identificado a mano' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(rechazarNetpayMatch).toHaveBeenCalledWith(
+      'nm-1', { motivo: 'ya identificado a mano' }, expect.objectContaining({ _id: 'user-test' }),
+    );
+  });
+});
+
+// GET /netpay/bandeja/:id/candidatos — netpay-matching-v2 (design.md API table: "New: all
+// eligible movements in the window, sorted by |diff| (resolve dialog only)").
+describe('GET /netpay/bandeja/:id/candidatos', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/bandeja/nm-1/candidatos')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(candidatosNetpayMatch).not.toHaveBeenCalled();
+  });
+
+  test('no existe: propaga 404', async () => {
+    const { NotFoundError } = require('../../shared/errors/AppError');
+    candidatosNetpayMatch.mockRejectedValue(new NotFoundError('Bucket Netpay'));
+
+    const res = await request(app)
+      .get('/netpay/bandeja/nm-1/candidatos')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
+  });
+
+  test('pasa el id y devuelve los candidatos tal cual', async () => {
+    candidatosNetpayMatch.mockResolvedValue({ candidatos: [{ _id: 'mov-1', diferencia: 10 }] });
+
+    const res = await request(app)
+      .get('/netpay/bandeja/nm-1/candidatos')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(candidatosNetpayMatch).toHaveBeenCalledWith('nm-1');
+    expect(res.body).toEqual({ candidatos: [{ _id: 'mov-1', diferencia: 10 }] });
+  });
+});
+
+// Rutas ELIMINADAS (design.md API table: "POST /netpay/bandeja/confirmar,
+// POST /netpay/reporte/:id/confirmar | Removed (candidate picker removed)"; "POST
+// /netpay/bandeja/:id/rechazar | Replaces /bandeja/descartar") — el candidate picker manual
+// (netpay-match-confirm.service.js#confirmarMatchNetpay/descartarMatchNetpay, ya removidos
+// del service en PR2) ya no tiene ruta HTTP.
+describe('rutas Netpay eliminadas (candidate picker manual, v1)', () => {
+  let app;
+
+  beforeEach(() => {
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('POST /netpay/bandeja/confirmar ya no existe (404)', async () => {
+    const res = await request(app)
+      .post('/netpay/bandeja/confirmar')
+      .send({ terminalID: 'T1', dia: '2026-09-10', movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+    expect(res.status).toBe(404);
+  });
+
+  test('POST /netpay/bandeja/descartar ya no existe (404)', async () => {
+    const res = await request(app)
+      .post('/netpay/bandeja/descartar')
+      .send({ terminalID: 'T1', dia: '2026-09-10' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+    expect(res.status).toBe(404);
+  });
+
+  test('POST /netpay/reporte/:id/confirmar ya no existe (404)', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/r1/confirmar')
+      .send({ movementId: 'mov-1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+    expect(res.status).toBe(404);
+  });
+});
+
 // GET /cuenta-por-serie-folio — segunda parte del buscador de CFDI (2026-08-07): resuelve
 // la CxC real de Kore por serie-folio antes de vincularla, en vez de confiar en el `total`
 // del CFDI (que no refleja pagos parciales).
@@ -1796,8 +2084,21 @@ describe('GET /netpay/reporte', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(200);
-    expect(listarNetpayReportes).toHaveBeenCalledWith({ estatus: 'pendiente' });
+    expect(listarNetpayReportes).toHaveBeenCalledWith({ estatus: 'pendiente', incluirEliminados: false });
     expect(res.body).toEqual({ reportes: [{ _id: 'r1' }] });
+  });
+
+  // design.md API table: "GET /netpay/reporte?estatus&incluirEliminados | Hides eliminado by default"
+  test('incluirEliminados=true: lo pasa al service como boolean', async () => {
+    listarNetpayReportes.mockResolvedValue({ reportes: [] });
+
+    const res = await request(app)
+      .get('/netpay/reporte')
+      .query({ incluirEliminados: 'true' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(listarNetpayReportes).toHaveBeenCalledWith({ estatus: undefined, incluirEliminados: true });
   });
 });
 
@@ -1875,12 +2176,31 @@ describe('GET /netpay/reporte/:id/candidatos', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(200);
-    expect(buscarCandidatosNetpayReporte).toHaveBeenCalledWith('r1');
+    expect(buscarCandidatosNetpayReporte).toHaveBeenCalledWith('r1', undefined);
     expect(res.body).toEqual({ candidatos: [{ _id: 'mov-1', banco: 'BBVA', deposito: 1000 }] });
+  });
+
+  // design.md API table: "GET /netpay/reporte/:id/candidatos?modo=ventana | Adds the window mode"
+  test('modo=ventana: lo pasa al service', async () => {
+    buscarCandidatosNetpayReporte.mockResolvedValue({ candidatos: [] });
+
+    const res = await request(app)
+      .get('/netpay/reporte/r1/candidatos')
+      .query({ modo: 'ventana' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(buscarCandidatosNetpayReporte).toHaveBeenCalledWith('r1', 'ventana');
   });
 });
 
-describe('POST /netpay/reporte/:id/confirmar', () => {
+// POST /netpay/reporte/:id/confirmar fue ELIMINADO — ver describe('rutas Netpay eliminadas
+// (candidate picker manual, v1)') más arriba (junto a las 2 rutas eliminadas de /bandeja).
+
+// POST /netpay/reporte/:id/reevaluar — netpay-matching-v2 (design.md API table: New).
+// Re-dispara evaluarReporte() para un reporte ya persistido (ej. tras un ajuste manual de
+// datos que no cambia el archivo original).
+describe('POST /netpay/reporte/:id/reevaluar', () => {
   let app;
 
   beforeEach(() => {
@@ -1892,39 +2212,91 @@ describe('POST /netpay/reporte/:id/confirmar', () => {
 
   test('responde 403 sin banks:netpay', async () => {
     const res = await request(app)
-      .post('/netpay/reporte/r1/confirmar')
-      .send({ movementId: 'mov-1' })
+      .post('/netpay/reporte/r1/reevaluar')
       .set('x-test-permissions', JSON.stringify([]));
     expect(res.status).toBe(403);
-    expect(confirmarReporte).not.toHaveBeenCalled();
+    expect(evaluarReporte).not.toHaveBeenCalled();
   });
 
-  test('pasa id + movementId + usuario al service', async () => {
-    confirmarReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'confirmado' }, movimiento: { _id: 'mov-1' } });
+  test('pasa el id al service y devuelve el resultado tal cual', async () => {
+    evaluarReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'resuelto_por_reporte' }, candidatos: [] });
 
     const res = await request(app)
-      .post('/netpay/reporte/r1/confirmar')
-      .send({ movementId: 'mov-1' })
+      .post('/netpay/reporte/r1/reevaluar')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(200);
-    expect(confirmarReporte).toHaveBeenCalledWith('r1', 'mov-1', expect.objectContaining({ _id: 'user-test' }));
-    expect(res.body).toEqual({ reporte: { _id: 'r1', estatus: 'confirmado' }, movimiento: { _id: 'mov-1' } });
+    expect(evaluarReporte).toHaveBeenCalledWith('r1');
+    expect(res.body.reporte.estatus).toBe('resuelto_por_reporte');
+  });
+});
+
+// POST /netpay/reporte/:id/resolver — netpay-matching-v2 (design.md API table: New; addición
+// explícita de esta batch de apply — PR2 solo implementó el resolver a nivel bucket). Mismas
+// reglas de validación que el bucket-level resolver (netpay-resolver.service.js), acá
+// delegadas a netpay-reporte.service.js#resolverReporte (con sus propios tests unitarios).
+describe('POST /netpay/reporte/:id/resolver', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
   });
 
-  test('propaga 409 de un conflicto de negocio (ej. monto no coincide)', async () => {
-    const { ConflictError } = require('../../shared/errors/AppError');
-    confirmarReporte.mockRejectedValue(new ConflictError('El monto del movimiento no coincide con el depósito del reporte'));
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/r1/resolver')
+      .send({ justificacion: 'ok' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(resolverReporte).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + justificacion + movementIds + usuario al service', async () => {
+    resolverReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'resuelto_manual' }, movimientos: [] });
 
     const res = await request(app)
-      .post('/netpay/reporte/r1/confirmar')
-      .send({ movementId: 'mov-1' })
+      .post('/netpay/reporte/r1/resolver')
+      .send({ justificacion: 'ok', movementIds: ['mov-1'] })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(resolverReporte).toHaveBeenCalledWith(
+      'r1', { justificacion: 'ok', movementIds: ['mov-1'] }, expect.objectContaining({ _id: 'user-test' }),
+    );
+    expect(res.body.reporte.estatus).toBe('resuelto_manual');
+  });
+
+  test('propaga 400 de una justificación vacía (BadRequestError del service)', async () => {
+    const { BadRequestError } = require('../../shared/errors/AppError');
+    resolverReporte.mockRejectedValue(new BadRequestError('Se requiere una justificación.'));
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/resolver')
+      .send({ justificacion: '' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(400);
+  });
+
+  test('propaga 409 de un conflicto de negocio (ej. reporte no está en discrepancia)', async () => {
+    const { ConflictError } = require('../../shared/errors/AppError');
+    resolverReporte.mockRejectedValue(new ConflictError('Este reporte no está en discrepancia'));
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/resolver')
+      .send({ justificacion: 'ok' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(409);
   });
 });
 
+// POST /netpay/reporte/:id/descartar — netpay-matching-v2 (design.md API table: "Maps to
+// rechazado, also allowed from discrepancia"). Reemplaza descartarReporte (v1, ELIMINADO) —
+// ahora delega en rechazarReporte.
 describe('POST /netpay/reporte/:id/descartar', () => {
   let app;
 
@@ -1941,11 +2313,11 @@ describe('POST /netpay/reporte/:id/descartar', () => {
       .send({ motivo: 'ya identificado a mano' })
       .set('x-test-permissions', JSON.stringify([]));
     expect(res.status).toBe(403);
-    expect(descartarReporte).not.toHaveBeenCalled();
+    expect(rechazarReporte).not.toHaveBeenCalled();
   });
 
   test('pasa id + motivo + usuario al service', async () => {
-    descartarReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'descartado' } });
+    rechazarReporte.mockResolvedValue({ reporte: { _id: 'r1', estatus: 'rechazado' } });
 
     const res = await request(app)
       .post('/netpay/reporte/r1/descartar')
@@ -1953,7 +2325,89 @@ describe('POST /netpay/reporte/:id/descartar', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(200);
-    expect(descartarReporte).toHaveBeenCalledWith('r1', 'ya identificado a mano', expect.objectContaining({ _id: 'user-test' }));
+    expect(rechazarReporte).toHaveBeenCalledWith(
+      'r1', { motivo: 'ya identificado a mano' }, expect.objectContaining({ _id: 'user-test' }),
+    );
+  });
+
+  test('propaga 409 desde un estado terminal (ej. ya rechazado)', async () => {
+    const { ConflictError } = require('../../shared/errors/AppError');
+    rechazarReporte.mockRejectedValue(new ConflictError('Este reporte ya está en un estado terminal'));
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/descartar')
+      .send({ motivo: 'x' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// POST /netpay/reporte/:id/eliminar — netpay-matching-v2 (design.md API table: New;
+// "Report Soft-Delete", "Ocultar" en el frontend).
+describe('POST /netpay/reporte/:id/eliminar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/r1/eliminar')
+      .send({ motivo: 'cargado por error' })
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(eliminarReporte).not.toHaveBeenCalled();
+  });
+
+  test('pasa id + motivo + usuario al service', async () => {
+    eliminarReporte.mockResolvedValue({ reporte: { _id: 'r1', eliminado: true } });
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/eliminar')
+      .send({ motivo: 'cargado por error' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(eliminarReporte).toHaveBeenCalledWith('r1', 'cargado por error', expect.objectContaining({ _id: 'user-test' }));
+    expect(res.body.reporte.eliminado).toBe(true);
+  });
+});
+
+// POST /netpay/reporte/:id/restaurar — netpay-matching-v2 (design.md API table: New;
+// "Restoring a hidden report": "clears eliminado and its audit fields only").
+describe('POST /netpay/reporte/:id/restaurar', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .post('/netpay/reporte/r1/restaurar')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(restaurarReporte).not.toHaveBeenCalled();
+  });
+
+  test('pasa el id al service', async () => {
+    restaurarReporte.mockResolvedValue({ reporte: { _id: 'r1', eliminado: false } });
+
+    const res = await request(app)
+      .post('/netpay/reporte/r1/restaurar')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(restaurarReporte).toHaveBeenCalledWith('r1');
+    expect(res.body.reporte.eliminado).toBe(false);
   });
 });
 

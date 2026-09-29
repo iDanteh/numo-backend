@@ -15,6 +15,7 @@
 const BankMovement = require('../banks/BankMovement.model');
 const NetpayMatch = require('./NetpayMatch.model');
 const { setErpIds } = require('../banks/bank.service');
+const { _ventanaDiasNetpay } = require('./netpay-match.service');
 const { NotFoundError, BadRequestError, ConflictError } = require('../../shared/errors/AppError');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
 
@@ -98,4 +99,33 @@ async function rechazar(id, { motivo } = {}, user) {
   return { bucket: bucket.toObject() };
 }
 
-module.exports = { resolver, rechazar };
+// candidatos — GET /netpay/bandeja/:id/candidatos (design.md API table: "New: all eligible
+// movements in the window, sorted by |diff| (resolve dialog only)"). A diferencia del
+// evaluador automático (netpay-evaluacion.service.js, que solo busca EXACTOS dentro de
+// ERP_TOLERANCE), un bucket 'discrepancia' YA falló ese criterio — el diálogo de resolver
+// necesita ver TODOS los BankMovement elegibles de la ventana, aunque su monto no calce, para
+// que el humano elija el más parecido con una justificación. Nunca filtra por monto: solo
+// reusa la misma ventana de días y el mismo universo elegible (BBVA, sin erpLinks, no
+// identificado) que el resto del dominio Netpay.
+async function candidatos(id) {
+  const bucket = await NetpayMatch.findById(id).lean();
+  if (!bucket) throw new NotFoundError('Bucket Netpay');
+
+  const ventanaDias = await _ventanaDiasNetpay();
+  const msVentana = ventanaDias * 24 * 60 * 60 * 1000;
+  const desde = new Date(bucket.dia.getTime() - msVentana);
+  const hasta = new Date(bucket.dia.getTime() + msVentana);
+
+  const pool = await BankMovement.find({
+    banco: 'BBVA', erpLinks: { $size: 0 }, status: { $ne: 'identificado' },
+    fecha: { $gte: desde, $lte: hasta },
+  }).lean();
+
+  const candidatosOrdenados = pool
+    .map(m => ({ ...m, diferencia: (m.deposito ?? 0) - (bucket.netoEsperado ?? 0) }))
+    .sort((a, b) => Math.abs(a.diferencia) - Math.abs(b.diferencia));
+
+  return { candidatos: candidatosOrdenados };
+}
+
+module.exports = { resolver, rechazar, candidatos };

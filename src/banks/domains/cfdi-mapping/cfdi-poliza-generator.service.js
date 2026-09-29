@@ -3682,9 +3682,17 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // `reglaNombre: null` porque `!=` en SQL no matchea NULL — sin esto,
     // cualquier Venta normal con reglaNombre NULL se excluiría por error de
     // "ya contabilizados" (nunca se marcaría como ya usada).
+    // tipoOrigen != 'Cargo Especial' (2026-09-29): SF/Puntos usados solo
+    // REFERENCIAN la factura consumidora (ej. `_sfUsadoAntesDeFacturarPorCentro`
+    // pone la UUID de la factura en el SF del día real del uso) — sin esto,
+    // si la póliza del día del uso se generaba antes que la del día de la
+    // factura, la factura quedaba "ya contabilizada" y su Venta nunca salía
+    // (caso real: Global CEDIS A0-260916986 $219,253.77 del 28-sep, excluida
+    // por el SF de YANELI PEREZ TOLEDO en la póliza del 26-sep). La venta
+    // propia de una factura siempre trae renglones 'Venta', que sí marcan.
     where: {
       cfdiUuid:   { [Op.ne]: null },
-      tipoOrigen: { [Op.ne]: 'Cobro Sucursal' },
+      tipoOrigen: { [Op.notIn]: ['Cobro Sucursal', TIPO_ORIGEN_CARGO_ESPECIAL] },
       [Op.and]: [
         { [Op.or]: [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }] },
         // Cargo de "cobrosCobradoraDirecta" (tipoOrigen='Venta'): desde
@@ -5794,9 +5802,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // mismo problema con el Cargo de "cobrosCobradoraDirecta" etiquetado
     // tipoOrigen='Venta' (caso real VIGUERA N0-260800019, 2026-08-17).
     // `[Op.or]` con reglaNombre: null porque `!=` en SQL no matchea NULL.
+    // tipoOrigen != 'Cargo Especial': ver comentario equivalente en generarPropuesta.
     where: {
       cfdiUuid:   { [Op.ne]: null },
-      tipoOrigen: { [Op.ne]: 'Cobro Sucursal' },
+      tipoOrigen: { [Op.notIn]: ['Cobro Sucursal', TIPO_ORIGEN_CARGO_ESPECIAL] },
       [Op.and]: [
         { [Op.or]: [{ reglaNombre: { [Op.ne]: 'COS' } }, { reglaNombre: null }] },
         // Cargo de "cobrosCobradoraDirecta" (tipoOrigen='Venta'): desde

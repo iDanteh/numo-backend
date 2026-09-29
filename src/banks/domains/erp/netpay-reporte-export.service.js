@@ -109,7 +109,7 @@ async function generarExcelReporteNetpay(reporte) {
     // Desglose de folios[].koreCache (fix 2026-09-29, pedido del usuario): solo se
     // llena para folios YA consultados manualmente en el panel (consultarFolioKore) —
     // nunca se pega a Kore al exportar, ver _koreCacheColumnas().
-    { header: 'Serie / Folio (Kore)',    key: 'serieFolioKore',   width: 16 },
+    { header: 'Pedido (Kore)',           key: 'serieFolioKore',   width: 16 },
     { header: 'Folio Fiscal (Kore)',     key: 'folioFiscalKore',  width: 18 },
     { header: 'Tipo de Pago (Kore)',     key: 'tipoPagoKore',     width: 14 },
     { header: 'Subtotal (Kore)',         key: 'subtotalKore',     width: 14 },

@@ -48,7 +48,7 @@ async function leerWorkbook(buffer) {
 // es solo un helper de escritura, no forma parte del xlsx real) — mapeamos por texto
 // de encabezado en la fila 1 en su lugar.
 const HEADERS_A_KEYS = {
-  'Serie / Folio (Kore)':  'serieFolioKore',
+  'Pedido (Kore)':         'serieFolioKore',
   'Folio Fiscal (Kore)':   'folioFiscalKore',
   'Tipo de Pago (Kore)':   'tipoPagoKore',
   'Subtotal (Kore)':       'subtotalKore',

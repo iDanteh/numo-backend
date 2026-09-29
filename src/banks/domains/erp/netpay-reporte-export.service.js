@@ -7,10 +7,17 @@
 
 const ExcelJS = require('exceljs');
 
+// v2 (fix 2026-09-29): reemplaza el viejo ['pendiente','confirmado','descartado'] —
+// este archivo no formaba parte de netpay-matching-v2 (no está en tasks.md ni en el
+// File Changes de design.md) y quedó mostrando el valor crudo del enum nuevo sin
+// mapear. Mismo enum que NetpayReporte.model.js#estatus.
 const STATUS_LABELS = {
-  pendiente:  'Pendiente',
-  confirmado: 'Confirmado',
-  descartado: 'Descartado',
+  confirmado_automatico: 'Confirmado automático',
+  pendiente_por_marca:   'Pendiente por marca',
+  discrepancia:           'Discrepancia',
+  resuelto_por_reporte:   'Resuelto por reporte',
+  rechazado:              'Rechazado',
+  resuelto_manual:        'Resuelto manual',
 };
 
 function _formatFecha(raw) {
@@ -18,6 +25,31 @@ function _formatFecha(raw) {
   const d = new Date(raw);
   if (isNaN(d.getTime())) return null;
   return `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${d.getUTCFullYear()}`;
+}
+
+// _koreCacheColumnas — mismos campos crudos que el panel muestra en el dropdown de
+// desglose (netpay-reporte-panel.component.html: SerieExterna/FolioExterno,
+// FolioFiscal, TipoPago, Subtotal, Impuesto, Total, Almacen). Si el folio nunca se
+// consultó (koreCache:null), devuelve todo en null — nunca pega a Kore acá.
+function _koreCacheColumnas(f) {
+  const cuenta = f.koreCache?.cuenta;
+  if (!cuenta) {
+    return {
+      serieFolioKore: null, folioFiscalKore: null, tipoPagoKore: null,
+      subtotalKore: null, impuestoKore: null, totalKore: null, almacenKore: null,
+    };
+  }
+  const serie = cuenta.SerieExterna || null;
+  const folioExt = cuenta.FolioExterno || null;
+  return {
+    serieFolioKore: (serie || folioExt) ? `${serie ?? '—'}-${folioExt ?? '—'}` : null,
+    folioFiscalKore: cuenta.FolioFiscal ?? null,
+    tipoPagoKore: cuenta.TipoPago ?? null,
+    subtotalKore: cuenta.Subtotal ?? null,
+    impuestoKore: cuenta.Impuesto ?? null,
+    totalKore: cuenta.Total ?? null,
+    almacenKore: cuenta.Almacen ?? null,
+  };
 }
 
 async function generarExcelReporteNetpay(reporte) {
@@ -74,6 +106,16 @@ async function generarExcelReporteNetpay(reporte) {
     { header: 'Tipo de Tarjeta',       key: 'tipoTarjeta',        width: 14 },
     { header: 'Código Autorización',   key: 'codigoAutorizacion', width: 18 },
     { header: 'Order ID',              key: 'orderId',            width: 30 },
+    // Desglose de folios[].koreCache (fix 2026-09-29, pedido del usuario): solo se
+    // llena para folios YA consultados manualmente en el panel (consultarFolioKore) —
+    // nunca se pega a Kore al exportar, ver _koreCacheColumnas().
+    { header: 'Serie / Folio (Kore)',    key: 'serieFolioKore',   width: 16 },
+    { header: 'Folio Fiscal (Kore)',     key: 'folioFiscalKore',  width: 18 },
+    { header: 'Tipo de Pago (Kore)',     key: 'tipoPagoKore',     width: 14 },
+    { header: 'Subtotal (Kore)',         key: 'subtotalKore',     width: 14 },
+    { header: 'Impuesto (Kore)',         key: 'impuestoKore',     width: 14 },
+    { header: 'Total (Kore)',            key: 'totalKore',        width: 14 },
+    { header: 'Almacén (Kore)',          key: 'almacenKore',      width: 14 },
   ];
   sheet.columns = columnas;
 
@@ -96,6 +138,7 @@ async function generarExcelReporteNetpay(reporte) {
       tipoTarjeta:        f.tipoTarjeta,
       codigoAutorizacion: f.codigoAutorizacion,
       orderId:            f.orderId,
+      ..._koreCacheColumnas(f),
     });
   }
 
@@ -105,6 +148,7 @@ async function generarExcelReporteNetpay(reporte) {
 
   const numColKeys = new Set([
     'montoTrx', 'comisionBaseMonto', 'ivaComision', 'comisionMasIva', 'montoDeposito',
+    'subtotalKore', 'impuestoKore', 'totalKore',
   ]);
   const evenFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFF' } };
   sheet.eachRow((row, rowNumber) => {

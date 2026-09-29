@@ -540,15 +540,21 @@ async function _consultarFolioConReintento(reporteId, referencia) {
 // Fix 2a (2026-09-25, pedido explícito del usuario): antes de generar el Excel de un reporte
 // (GET .../export), consulta contra Kore los folios que TODAVÍA no tienen koreCache.cuenta —
 // para que el Excel exportado incluya el dato de Kore aunque el usuario nunca haya abierto
-// cada folio a mano en el panel. SECUENCIAL (no Promise.all/paralelo) con una pausa fija
-// entre llamadas — mismo espíritu que pagos-cyc/formas-pago-cxc (pausa de 1s entre llamadas
-// a Kore, ver erp.routes.js) para no saturarlo; acá 400ms porque withAccountInfo=true es una
-// consulta puntual por folio (mucho más liviana que un "por centro"), no 20 sucursales.
+// cada folio a mano en el panel.
+// Fix perf (2026-09-29, pedido explícito del usuario — "es normal que demore la bandeja de
+// Netpay - Reporte manual"): el recorrido era 100% secuencial (un folio a la vez, 400ms de
+// pausa entre CADA llamada) — con reportes de 30-50 folios sin consultar, minutos de espera.
+// Se paraleliza en LOTES de tamaño fijo (Promise.allSettled por lote) — mismo espíritu que
+// pagos-cyc/formas-pago-cxc (pausa entre llamadas a Kore, ver erp.routes.js) para no saturarlo,
+// pero ahora la pausa de 400ms es ENTRE LOTES, no entre cada folio individual. El reintento
+// ante 429 (_consultarFolioConReintento) NO cambia — sigue siendo por folio, con su propio
+// backoff; si Kore devuelve 429 bajo carga concurrente, cada folio lo absorbe por su cuenta.
 // Fallo parcial, NO todo-o-nada (mismo criterio que otros importadores del proyecto, ej.
 // pagos-cyc): un folio individual que falle (404 sin match, red, 429 agotado) se loguea y se
 // acumula en `fallos`, sin abortar el resto — el Excel se genera igual con lo que sí se pudo
-// resolver.
+// resolver. Sin librería nueva (ej. p-limit) — no existe en este proyecto.
 const CONSULTAR_FOLIOS_PAUSA_MS = 400;
+const CONSULTAR_FOLIOS_CONCURRENCIA = 5;
 async function consultarFoliosPendientes(reporteId) {
   const reporte = await NetpayReporte.findById(reporteId).lean();
   if (!reporte) throw new NotFoundError('Reporte Netpay');
@@ -556,16 +562,21 @@ async function consultarFoliosPendientes(reporteId) {
   const pendientes = (reporte.folios ?? []).filter(f => f.referencia && !f.koreCache?.cuenta);
   const fallos = [];
 
-  for (let i = 0; i < pendientes.length; i++) {
-    const folio = pendientes[i];
-    try {
-      await _consultarFolioConReintento(reporteId, folio.referencia);
-    } catch (err) {
-      logger.warn(`[NetpayReporte] no se pudo consultar Kore para el folio ${folio.referencia} (reporte=${reporteId}): ${err.message}`);
-      fallos.push({ referencia: folio.referencia, error: err.message });
-    }
-    // Sin pausa después del último folio — no hay una llamada siguiente que proteger.
-    if (i < pendientes.length - 1) await _sleep(CONSULTAR_FOLIOS_PAUSA_MS);
+  for (let i = 0; i < pendientes.length; i += CONSULTAR_FOLIOS_CONCURRENCIA) {
+    const lote = pendientes.slice(i, i + CONSULTAR_FOLIOS_CONCURRENCIA);
+    const resultadosLote = await Promise.allSettled(
+      lote.map(folio => _consultarFolioConReintento(reporteId, folio.referencia)),
+    );
+    resultadosLote.forEach((r, idx) => {
+      if (r.status === 'rejected') {
+        const folio = lote[idx];
+        logger.warn(`[NetpayReporte] no se pudo consultar Kore para el folio ${folio.referencia} (reporte=${reporteId}): ${r.reason.message}`);
+        fallos.push({ referencia: folio.referencia, error: r.reason.message });
+      }
+    });
+    // Sin pausa después del último lote — no hay un lote siguiente que proteger.
+    const esUltimoLote = i + CONSULTAR_FOLIOS_CONCURRENCIA >= pendientes.length;
+    if (!esUltimoLote) await _sleep(CONSULTAR_FOLIOS_PAUSA_MS);
   }
 
   return { consultados: pendientes.length - fallos.length, fallos };

@@ -923,6 +923,58 @@ describe('consultarFoliosPendientes', () => {
     expect(docState.folios.find(f => f.referencia === 'F3').koreCache.cuenta).toEqual({ Total: 300 });
   });
 
+  // Fix perf (2026-09-29, pedido explícito del usuario — "es normal que demore la bandeja de
+  // Netpay - Reporte manual"): el recorrido SECUENCIAL de un folio a la vez (con 400ms de
+  // pausa entre cada uno) es un diseño consciente para no saturar Kore, pero con reportes de
+  // 30-50 folios sin consultar hace que el export tarde varios minutos. Se paraleliza en lotes
+  // de tamaño fijo (CONSULTAR_FOLIOS_CONCURRENCIA=5, ver comentario en la función real) usando
+  // Promise.allSettled por lote — la pausa de 400ms pasa a ser ENTRE LOTES, no entre cada
+  // llamada individual. Mantiene el mismo contrato: reintento 429 por folio (sin cambios),
+  // fallo parcial sin abortar el resto.
+  test('respeta el límite de concurrencia por lotes: nunca dispara más de N llamadas a Kore en simultáneo', async () => {
+    const CONCURRENCIA = 5; // debe matchear CONSULTAR_FOLIOS_CONCURRENCIA en netpay-reporte.service.js
+    jest.useFakeTimers();
+
+    const referencias = Array.from({ length: 7 }, (_, i) => `F${i + 1}`);
+    const docState = {
+      _id: 'rep-1',
+      folios: referencias.map(referencia => ({ referencia, koreCache: null })),
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    NetpayReporte.findById = jest.fn(() => fakeQuery(docState));
+
+    const resolvers = {};
+    buscarTransaccionesNetpay.mockImplementation(({ folio }) => new Promise((resolve) => {
+      resolvers[folio] = () => resolve({ raw: { Data: { transactions: [{ folio, cuentas: [{ Total: 1 }] }] } } });
+    }));
+
+    const promise = consultarFoliosPendientes('rep-1');
+
+    // Flush de microtasks para que el PRIMER lote llegue a disparar sus llamadas a Kore
+    // (findById externo -> por cada folio: findById interno de consultarFolioKore ->
+    // buscarTransaccionesNetpay), sin resolver ninguna todavía. Cadena de awaits más profunda
+    // que un simple Promise.resolve() único, por eso se repite varias veces.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    const llamadasPrimerLote = Object.keys(resolvers).length;
+    expect(llamadasPrimerLote).toBe(CONCURRENCIA); // exactamente 5 de 7, no las 7 de una — prueba el límite real
+    expect(referencias.slice(CONCURRENCIA)).not.toContain(Object.keys(resolvers)[CONCURRENCIA]); // F6/F7 todavía no llamados
+
+    // Resolvemos el primer lote completo y avanzamos la pausa entre lotes (fake timer).
+    Object.values(resolvers).forEach(r => r());
+    await jest.advanceTimersByTimeAsync(400);
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    expect(Object.keys(resolvers).length).toBe(7); // el 2do lote (F6, F7) ya se disparó
+
+    Object.values(resolvers).forEach(r => r());
+    await jest.runAllTimersAsync();
+    const resultado = await promise;
+
+    expect(buscarTransaccionesNetpay).toHaveBeenCalledTimes(7);
+    expect(resultado).toEqual({ consultados: 7, fallos: [] });
+  });
+
   test('sin folios pendientes (todos ya cacheados): no consulta Kore, 0 fallos', async () => {
     const docState = {
       _id: 'rep-1',

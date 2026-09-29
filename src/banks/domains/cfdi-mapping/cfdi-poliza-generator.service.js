@@ -6,7 +6,7 @@ const centrosSvc = require('../centros-costo/centros-costo.service');
 const { Op, QueryTypes }   = require('sequelize');
 const { sequelize }        = require('../../../config/database.postgres');
 const mappingSvc           = require('./cfdi-mapping.service');
-const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada } = require('./balanza-preliminar.service');
+const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada, _metaFacturasRelacionadas } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
@@ -3618,17 +3618,20 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
   // metodoPagoPorFactura (solo metodoPago) alimenta _normalizarEgresoCondonacion
   // (formaPago=15); facturaRelacionadaMeta (metodoPago+formaPago) alimenta
   // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
-  const metodoPagoPorFactura   = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), c.metodoPago]));
-  const facturaRelacionadaMeta = Object.fromEntries(facturasI.map(c => [(c.uuid || '').toUpperCase(), { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
+  // Sin depender del orden de las copias SAT/ERP — ver `_metaFacturasRelacionadas`.
+  const { metodoPago: metodoPagoPorFactura, meta: facturaRelacionadaMeta } = _metaFacturasRelacionadas(facturasI, { mayusculas: true });
   const faltantes = [...new Set(ncsEnriquecidas.flatMap(relUuidsDe))]
     .map(u => (u || '').toUpperCase())
-    .filter(u => !(u in metodoPagoPorFactura));
+    .filter(u => metodoPagoPorFactura[u] == null);
   if (faltantes.length) {
-    const extra = await CFDI.find({ uuid: { $in: faltantes } }).select('uuid metodoPago formaPago').lean();
-    for (const f of extra) {
-      const uuidUp = (f.uuid || '').toUpperCase();
-      metodoPagoPorFactura[uuidUp]   = f.metodoPago;
-      facturaRelacionadaMeta[uuidUp] = { metodoPago: f.metodoPago, formaPago: f.formaPago };
+    const extra = await CFDI.find({ uuid: { $in: faltantes } }).select('uuid source metodoPago formaPago').lean();
+    const { metodoPago: mpExtra, meta: metaExtra } = _metaFacturasRelacionadas(extra, { mayusculas: true });
+    for (const k of Object.keys(mpExtra)) {
+      if (mpExtra[k] != null || metodoPagoPorFactura[k] == null) metodoPagoPorFactura[k] = mpExtra[k] ?? metodoPagoPorFactura[k];
+      facturaRelacionadaMeta[k] = {
+        metodoPago: facturaRelacionadaMeta[k]?.metodoPago ?? metaExtra[k].metodoPago,
+        formaPago:  facturaRelacionadaMeta[k]?.formaPago  ?? metaExtra[k].formaPago,
+      };
     }
   }
   _normalizarEgresoCondonacion(ncsEnriquecidas, metodoPagoPorFactura);
@@ -3808,15 +3811,14 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   )];
   const relTipoCfdisArr = relTipoUuidsProp.length
     ? await CFDI.find({ uuid: { $in: relTipoUuidsProp } })
-        .select('uuid tipoDeComprobante metodoPago formaPago').lean()
+        .select('uuid source tipoDeComprobante metodoPago formaPago').lean()
     : [];
   const relTipoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.tipoDeComprobante]));
-  // uuid de factura → su metodoPago — usado por _normalizarEgresoCondonacion
-  // para resolver el metodoPago real de NCs formaPago=15 (Condonación).
-  const relMetodoPagoMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, c.metodoPago]));
-  // uuid de factura → metodoPago+formaPago — usado por
-  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
-  const relFacturaMetaMap = Object.fromEntries(relTipoCfdisArr.map(c => [c.uuid, { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
+  // uuid de factura → su metodoPago (para _normalizarEgresoCondonacion, NCs
+  // formaPago=15) y → metodoPago+formaPago (para
+  // _normalizarEgresoSegunFacturaRelacionada) — sin depender del orden de las
+  // copias SAT/ERP, ver `_metaFacturasRelacionadas`.
+  const { metodoPago: relMetodoPagoMap, meta: relFacturaMetaMap } = _metaFacturasRelacionadas(relTipoCfdisArr);
 
   // Inyectar _relacionadoTipo en cada CFDI antes del matching
   const cfdisSinPolizaEnriquecidos = cfdisSinPoliza.map(cfdi => {
@@ -5924,17 +5926,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   )];
   const relTipoCfdisGuard = relTipoUuidsGuard.length
     ? await CFDI.find({ uuid: { $in: relTipoUuidsGuard } })
-        .select('uuid tipoDeComprobante metodoPago formaPago').lean()
+        .select('uuid source tipoDeComprobante metodoPago formaPago').lean()
     : [];
   const relTipoMapGuard = Object.fromEntries(
     relTipoCfdisGuard.map(c => [c.uuid, c.tipoDeComprobante]),
   );
-  // uuid de factura → su metodoPago — usado por _normalizarEgresoCondonacion
-  // para resolver el metodoPago real de NCs formaPago=15 (Condonación).
-  const relMetodoPagoMapGuard = Object.fromEntries(relTipoCfdisGuard.map(c => [c.uuid, c.metodoPago]));
-  // uuid de factura → metodoPago+formaPago — usado por
-  // _normalizarEgresoSegunFacturaRelacionada (medios de pago reales).
-  const relFacturaMetaMapGuard = Object.fromEntries(relTipoCfdisGuard.map(c => [c.uuid, { metodoPago: c.metodoPago, formaPago: c.formaPago }]));
+  // Ver comentario equivalente en generarPropuesta (`_metaFacturasRelacionadas`).
+  const { metodoPago: relMetodoPagoMapGuard, meta: relFacturaMetaMapGuard } = _metaFacturasRelacionadas(relTipoCfdisGuard);
 
   const cfdisSinPolizaEnriquecidosGuard = cfdisSinPoliza.map(cfdi => {
     const primerUuid = (cfdi.cfdiRelacionados || [])[0]?.uuid;

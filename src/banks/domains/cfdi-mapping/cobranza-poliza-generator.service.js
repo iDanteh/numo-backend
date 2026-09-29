@@ -160,6 +160,29 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 
   if (paresVistos.size === 0) return { doctosPorUuid };
 
+  // Ticket(s) de cada factura liquidada (2026-09-29, pedido del usuario,
+  // ejemplo real "9 (4).xls"): la columna H de Cobranza lleva
+  // "cliente / ticket" (ej. ERIK WILVER TORRES HERNANDEZ / A0-260604681), no
+  // la factura. Kore relaciona los tickets en `documentosRelacionados` de SU
+  // copia (source ERP) — serie de almacén (A0, B0, G1…), nunca las marcas de
+  // ajuste (BON, DEV, CANCELACION…).
+  const uuidsFactura = [...new Set([...doctosPorUuid.values()].flat().map(d => d.idDocumento).filter(Boolean))];
+  if (uuidsFactura.length) {
+    const facturasErp = await CFDI.find({ uuid: { $in: uuidsFactura.flatMap(u => [u, u.toLowerCase()]) }, source: 'ERP' })
+      .select('uuid documentosRelacionados').lean();
+    const ticketsPorFactura = new Map();
+    for (const f of facturasErp) {
+      const tickets = (f.documentosRelacionados ?? [])
+        .filter(r => /^[A-Z]\d$/.test(String(r.Serie ?? '').toUpperCase()) && r.Folio)
+        .map(r => `${String(r.Serie).toUpperCase()}-${r.Folio}`);
+      if (tickets.length) ticketsPorFactura.set(String(f.uuid).toUpperCase(), [...new Set(tickets)]);
+    }
+    for (const d of [...doctosPorUuid.values()].flat()) {
+      const t = d.idDocumento ? ticketsPorFactura.get(d.idDocumento) : null;
+      if (t) d.tickets = t;
+    }
+  }
+
   const pares = [...paresVistos.values()];
   const LOTE  = 150;
   const saldoFavorPorFactura      = new Map(); // `${serie}|${folio}` → monto usado
@@ -331,12 +354,15 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     context.doctosPago.forEach((d, idx) => {
       const esUltimo = idx === context.doctosPago.length - 1;
       const share = totalDoctos > 0 ? d.monto / totalDoctos : 1 / context.doctosPago.length;
-      const conceptoFactura = [nombreCliente, `${d.serie}-${d.folio}`].filter(Boolean).join(' / ');
+      // Columna H = "cliente / ticket(s)" y columna C = la factura (2026-09-29,
+      // ver `_prefetchDoctosPago`); sin ticket conocido, la factura como antes.
+      const serieFolioFactura = `${d.serie}-${d.folio}`;
+      const conceptoFactura = [nombreCliente, ...(d.tickets?.length ? d.tickets : [serieFolioFactura])].filter(Boolean).join(' / ').slice(0, 500);
       // `facturaUuid` (uuid real de la factura, ver `_prefetchDoctosPago`) viaja
       // en cada línea de esta factura para que el export (poliza.service.js,
       // `anotarCargosPorFacturaSinAgrupar`) pueda cruzar el depósito bancario
       // real por el uuid correcto en vez del uuid del Pago (`cfdiUuid`).
-      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieCfdi, cfdiUuid: cfdi.uuid, facturaUuid: d.idDocumento ?? null, rfcTercero };
+      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieFolioFactura.slice(0, 25), cfdiUuid: cfdi.uuid, facturaUuid: d.idDocumento ?? null, rfcTercero };
 
       // Cobro de otra sucursal (2026-09-01): la factura que este Pago liquida
       // puede haber sido emitida por una sucursal DISTINTA a la que procesó

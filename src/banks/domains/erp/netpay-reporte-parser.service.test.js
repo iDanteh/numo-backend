@@ -126,6 +126,68 @@ describe('parseNetpayReporte — edge cases (workbooks sintéticos)', () => {
   });
 });
 
+// netpay-matching-v2 (design.md "Data Model"): folios[].marca — columna "Marca" (AD),
+// OPCIONAL (Kore no siempre expone cardTypeName por folio). Se usa un workbook sintético
+// completo (no los 2 archivos reales, que no dependemos tener presentes en cualquier
+// checkout) para no acoplar este caso a la disponibilidad de esos 2 archivos en el repo.
+describe('parseNetpayReporte — columna "Marca" (AD), opcional', () => {
+  function _headerFolios(conMarca) {
+    const base = [
+      null,
+      'Fecha de Depósito', 'Clave Rastreo', 'Cuenta Depósito', 'Nombre Empresa', 'Sucursal', 'Store ID',
+      'Monto Depósito', 'Fecha Trx', 'Hora de Trx', 'Monto de Trx', 'Comisión Base (%)', 'Comisión Base ($)',
+      'Comisiones + IVA', 'Banco', 'Tipo de Tarjeta', 'Código de Autorización', 'Order ID', 'Referencia',
+    ];
+    if (conMarca) base.push('Marca');
+    return base;
+  }
+
+  function _dataFolios(conMarca) {
+    const base = [
+      null,
+      '25-09-2026', 'CLAVE-1', '012610001090310145', 'CAR COMERCIALIZADORA', 'AV FERROCARRIL 802', '1650292',
+      815.71, '24-09-2026', '18:16', 822.87, 0.0075, 6.17,
+      7.16, 'SANTANDER', 'Débito', '062788', '260924181626-2840746396783601', 'F20260924-00311',
+    ];
+    if (conMarca) base.push('AMEX');
+    return base;
+  }
+
+  async function _bufferConFolios(conMarca) {
+    const wb = new ExcelJS.Workbook();
+    const s1 = wb.addWorksheet('Resumen');
+    s1.getRow(1).values = [null, null, 'Fecha de Movimiento', 'Clave Rastreo', 'Cuenta Depósito', 'Descripción', 'Monto Depósito'];
+    s1.getRow(2).values = [null, null, '25-09-2026', 'CLAVE-1', '012610001090310145', 'PAGO', 815.71];
+
+    const s2 = wb.addWorksheet('Ventas Tarjeta Presente');
+    s2.getRow(1).values = [null, null, 'Monto transaccionado', null, 822.87];
+    s2.getRow(2).values = [null, null, 'Comisiones', null, 6.17];
+    s2.getRow(3).values = [null, null, 'Iva', null, 0.99];
+    s2.getRow(4).values = [null, null, 'Monto depositado', null, 815.71];
+    s2.getRow(6).values = _headerFolios(conMarca);
+    s2.getRow(7).values = _dataFolios(conMarca);
+
+    return wb.xlsx.writeBuffer();
+  }
+
+  test('columna "Marca" presente: folios[].marca se parsea tal cual', async () => {
+    const buffer = await _bufferConFolios(true);
+    const r = await parseNetpayReporte(buffer);
+    expect(r.folios).toHaveLength(1);
+    expect(r.folios[0].marca).toBe('AMEX');
+    // El resto de las columnas siguen parseándose igual, sin que Marca las corra.
+    expect(r.folios[0].referencia).toBe('F20260924-00311');
+    expect(r.folios[0].orderId).toBe('260924181626-2840746396783601');
+  });
+
+  test('columna "Marca" ausente: folios[].marca es null (no undefined, no rompe el parseo)', async () => {
+    const buffer = await _bufferConFolios(false);
+    const r = await parseNetpayReporte(buffer);
+    expect(r.folios).toHaveLength(1);
+    expect(r.folios[0].marca).toBeNull();
+  });
+});
+
 describe('_normalizarHeader', () => {
   test('acentos, espacios y mayúsculas se normalizan igual', () => {
     expect(_normalizarHeader('Fecha de depósito')).toBe('fecha_de_deposito');

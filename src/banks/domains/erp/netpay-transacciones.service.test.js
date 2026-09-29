@@ -171,6 +171,22 @@ test('terminalID se pasa tal cual, en cada página', async () => {
   );
 });
 
+// netpay-matching-v2 (design.md): el evaluador (netpay-evaluacion.service.js) necesita
+// cardTypeName por transacción para separar buckets ('general' vs marca diferida, ej.
+// AMEX) — consultarTransaccionesNetpay NUNCA remapea los campos crudos de Kore (ver
+// comentario de archivo), así que cardTypeName YA sobrevive tal cual en cada elemento de
+// `transacciones` — esta es una prueba de REGRESIÓN explícita para que un futuro cambio de
+// este archivo nunca empiece a filtrar/remapear campos sin querer.
+test('cardTypeName (y cardType, campo DISTINTO) sobreviven sin remapear en cada transacción', async () => {
+  const tx = { ID: 1, amount: 100, commission: 10, almacen: 'A0', cardTypeName: 'AMEX', cardType: '03' };
+  buscarTransaccionesNetpay.mockResolvedValue(fakePage([tx]));
+
+  const resultado = await consultarTransaccionesNetpay({});
+
+  expect(resultado.transacciones[0].cardTypeName).toBe('AMEX');
+  expect(resultado.transacciones[0].cardType).toBe('03');
+});
+
 test('status se pasa tal cual, en cada página', async () => {
   buscarTransaccionesNetpay.mockResolvedValue(fakePage([]));
 

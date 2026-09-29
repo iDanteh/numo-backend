@@ -5,11 +5,13 @@
 // almacen+terminalID+día y busca, para cada grupo sin resolver todavía, el BankMovement
 // de BBVA cuyo depósito se acerca al neto (monto - comisión) de ese grupo.
 //
-// TODO EN VIVO, sin sync/cron (decisión explícita del usuario): la bandeja se calcula
-// contra Kore en cada request, reusando consultarTransaccionesNetpay() (ya pagina
-// completo, ver netpay-transacciones.service.js). Solo se persiste lo YA RESUELTO
-// (NetpayMatch.model.js) — un grupo pendiente no tiene documento propio, es la ausencia
-// de uno para esa clave (terminalID, dia).
+// netpay-matching-v2 (PR4, dead-code cleanup): `obtenerBandejaNetpay` (bandeja v1, EN VIVO
+// contra Kore en cada request, candidate picker manual) fue ELIMINADA de este archivo —
+// `GET /netpay/bandeja` ya no la llama desde PR3 (lee `NetpayMatch` directamente, ver
+// erp.routes.js), y `netpay-evaluacion.service.js` reimplementa su propio orquestador
+// (`evaluarRango`) sin depender de esta función. Sus tests fueron eliminados junto con ella
+// (ver netpay-match.service.test.js). `_buscarCandidatosParaGrupo` (usada por
+// netpay-resolver.service.js) y las funciones de agrupamiento siguen vivas abajo.
 //
 // A diferencia de caja-transferencia-match.service.js (Fase C de Transferencias entre
 // cajas), acá NO se filtra por categoria "Depósito en efectivo" — un depósito de
@@ -20,8 +22,6 @@
 
 const BankMovement = require('../banks/BankMovement.model');
 const { ERP_TOLERANCE } = require('../banks/bank.service');
-const NetpayMatch = require('./NetpayMatch.model');
-const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const globalConfigService = require('../../../shared/services/global-config.service');
 
 // Configuraciones Globales, sección `bancos`, clave NETPAY_DATE_WINDOW_DAYS — distinta de
@@ -101,6 +101,72 @@ function _montosIguales(a, b) {
   return Math.abs((a ?? 0) - (b ?? 0)) <= ERP_TOLERANCE;
 }
 
+// netpay-matching-v2 (design.md "Lagging brand list"): Configuraciones Globales, sección
+// `bancos`, clave NETPAY_MARCAS_DIFERIDAS (CSV, ej. "AMEX,DINERS") — mismo patrón EXACTO
+// que _ventanaDiasNetpay(). Default ['AMEX'] cuando la config no está sembrada.
+const MARCAS_DIFERIDAS_DEFAULT = ['AMEX'];
+
+async function _marcasDiferidas() {
+  let valor;
+  try {
+    valor = await globalConfigService.getValue('bancos', 'NETPAY_MARCAS_DIFERIDAS');
+  } catch (err) {
+    if (err.message?.includes('No existe la configuración')) return MARCAS_DIFERIDAS_DEFAULT;
+    throw err;
+  }
+  const marcas = String(valor ?? '')
+    .split(',')
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+  return marcas.length > 0 ? marcas : MARCAS_DIFERIDAS_DEFAULT;
+}
+
+// Bucket de una transacción: 'general' salvo que `cardTypeName` EMPIECE con una de las
+// marcas diferidas configuradas — NUNCA `cardType` (proposal: "split each terminal-day by
+// cardTypeName, not cardType"). "Empieza con" en vez de igualdad exacta: Kore no siempre
+// manda el nombre de marca pelado (ej. "AMEX CREDITO"), y la lista de marcas diferidas es
+// un prefijo estable configurado por el usuario.
+function _bucketDeTransaccion(cardTypeName, marcasDiferidas) {
+  const marca = String(cardTypeName ?? '').trim().toUpperCase();
+  if (!marca) return 'general';
+  const encontrada = marcasDiferidas.find(m => marca.startsWith(m));
+  return encontrada ?? 'general';
+}
+
+// Agrupa por (terminalID, día MX, bucket) — la unidad de decisión de netpay-matching-v2
+// (ver design.md "Technical Approach"). A diferencia de _agruparPorTerminalYDia (que
+// nunca separa por marca), acá una venta de una marca diferida (ej. AMEX) queda en SU
+// PROPIO bucket, separado del resto del día — para que una venta AMEX pendiente no
+// bloquee la confirmación automática del resto. `marcasDiferidas` se recibe YA resuelto
+// (ver _marcasDiferidas) para que el caller la lea de Configuraciones Globales UNA sola
+// vez para toda la corrida, no una vez por transacción.
+function _agruparPorTerminalDiaYMarca(transacciones, marcasDiferidas) {
+  const grupos = new Map();
+  for (const t of transacciones) {
+    const diaMx = _diaMx(t.transactionDate);
+    const bucket = _bucketDeTransaccion(t.cardTypeName, marcasDiferidas);
+    const clave = `${t.terminalID}|${diaMx.toISOString()}|${bucket}`;
+    const g = grupos.get(clave) ?? {
+      terminalID: t.terminalID, almacen: t.almacen, dia: diaMx, bucket,
+      montoBruto: 0, comision: 0, cantidadTransacciones: 0, folios: [],
+    };
+    g.montoBruto += t.amount ?? 0;
+    g.comision += t.commission ?? 0;
+    g.cantidadTransacciones += 1;
+    // Detalle por transacción (orderID/folio crudos de Kore, sin remapear — mismo criterio
+    // que netpay-transacciones.service.js) — netpay-evaluacion.service.js lo persiste en
+    // NetpayMatch.snapshot.folios (design.md "Data Model"), y netpay-reporte.service.js lo
+    // usa para saber si un reporte cubre TODOS los folios de un bucket
+    // pendiente_por_marca/discrepancia antes de cerrarlo (design.md "(a) Report present").
+    g.folios.push({
+      orderId: t.orderID ?? null, referencia: t.folio ?? null, marca: t.cardTypeName ?? null,
+      monto: t.amount ?? 0, comision: t.commission ?? 0,
+    });
+    grupos.set(clave, g);
+  }
+  return [...grupos.values()].map(g => ({ ...g, netoEsperado: g.montoBruto - g.comision }));
+}
+
 // Núcleo puro del filtrado (sin I/O): dado un `ventanaDias` YA resuelto, filtra `pool`
 // (universo de BankMovement BBVA elegibles) contra la ventana/monto de un grupo puntual.
 // Separado de _buscarCandidatosParaGrupo para que obtenerBandejaNetpay pueda leer
@@ -137,48 +203,16 @@ async function _buscarCandidatosParaGrupo(grupo) {
   return _filtrarCandidatosEnPool(grupo, pool, ventanaDias);
 }
 
-// Bandeja: trae transacciones en vivo, agrupa, descarta lo ya resuelto (NetpayMatch) y
-// busca candidatos BBVA para cada grupo pendiente. UNA sola consulta a BankMovement para
-// TODOS los grupos (mismo criterio de optimización que buscarCandidatosBatch en
-// caja-transferencia-match.service.js), filtrando en memoria por grupo.
-async function obtenerBandejaNetpay({ dateFrom, dateTo, terminalID } = {}) {
-  const { transacciones } = await consultarTransaccionesNetpay({ dateFrom, dateTo, terminalID });
-  const grupos = _agruparPorTerminalYDia(transacciones);
-  if (grupos.length === 0) return { pendientes: [] };
-
-  const resueltos = await NetpayMatch.find({
-    $or: grupos.map(g => ({ terminalID: g.terminalID, dia: g.dia })),
-  }).lean();
-  const clavesResueltas = new Set(resueltos.map(r => _claveGrupo(r.terminalID, new Date(r.dia))));
-
-  const gruposPendientes = grupos.filter(g => !clavesResueltas.has(_claveGrupo(g.terminalID, g.dia)));
-  if (gruposPendientes.length === 0) return { pendientes: [] };
-
-  const ventanaDias = await _ventanaDiasNetpay();
-  const msVentana = ventanaDias * 24 * 60 * 60 * 1000;
-  const diasMs = gruposPendientes.map(g => g.dia.getTime());
-  const desdeGlobal = new Date(Math.min(...diasMs) - msVentana);
-  const hastaGlobal = new Date(Math.max(...diasMs) + msVentana);
-
-  const pool = await BankMovement.find({
-    banco: 'BBVA', erpLinks: { $size: 0 }, status: { $ne: 'identificado' },
-    fecha: { $gte: desdeGlobal, $lte: hastaGlobal },
-  }).lean();
-
-  const pendientes = gruposPendientes.map(grupo => ({
-    grupo, candidatos: _filtrarCandidatosEnPool(grupo, pool, ventanaDias),
-  }));
-  return { pendientes };
-}
-
 module.exports = {
-  obtenerBandejaNetpay,
   _buscarCandidatosParaGrupo,
   _ventanaDiasNetpay,
   _agruparPorTerminalYDia,
+  _agruparPorTerminalDiaYMarca,
+  _marcasDiferidas,
   _diaMx,
   _normalizarMarcadorDia,
   _claveGrupo,
   _montosIguales,
   VENTANA_DEFAULT_DIAS,
+  MARCAS_DIFERIDAS_DEFAULT,
 };

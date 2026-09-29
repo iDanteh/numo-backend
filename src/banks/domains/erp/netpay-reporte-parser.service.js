@@ -288,6 +288,10 @@ function _parseFolios(sheet) {
       tipoTarjeta:         _texto(obj['tipo_de_tarjeta']),
       codigoAutorizacion: _texto(obj['codigo_de_autorizacion']),
       orderId,
+      // v2 (netpay-matching-v2): columna "Marca" (AD) — OPCIONAL, Kore no siempre expone
+      // cardTypeName por folio. No está en COLUMNAS_FOLIO_REQUERIDAS a propósito: su
+      // ausencia nunca debe tirar el reporte entero (ver NetpayReporte.model.js#folios.marca).
+      marca: _texto(obj['marca']),
     });
   }
 

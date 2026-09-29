@@ -68,6 +68,18 @@ const netpayReporteSchema = new mongoose.Schema({
     codigoAutorizacion: { type: String, default: null },
     orderId:            { type: String, default: null },
 
+    // v2 (netpay-matching-v2): columna "Marca" (AD) — opcional, null si el reporte no la
+    // trae (Kore no siempre expone cardTypeName por folio). Usada para cerrar buckets
+    // 'pendiente_por_marca' cuando el folio de una marca diferida aparece en este reporte.
+    marca: { type: String, default: null },
+
+    // v2: seteado por el upload cuando este folio (mismo orderId, o 'REF:'+referencia si
+    // orderId está ausente) ya estaba registrado en NetpayFolioRegistro por OTRO reporte
+    // (E11000 al insertar) — ver netpay-reporte.service.js#cargarReporte. La fila queda
+    // marcada pero el reporte entero NO se descarta solo por esto (ver
+    // motivoDiscrepancia:'folio_duplicado' abajo).
+    duplicadoDeReporteId: { type: mongoose.Schema.Types.ObjectId, ref: 'NetpayReporte', default: null },
+
     // Cache de la consulta puntual a Kore por folio (withAccountInfo=true) — Mixed a
     // propósito: se guarda tal cual viene de Kore (PascalCase, sin remapear), mismo
     // criterio que netpay-transacciones.service.js ("sin remapear los campos crudos de
@@ -78,15 +90,56 @@ const netpayReporteSchema = new mongoose.Schema({
     },
   }],
 
+  // v2: mismo enum de 6 estados que NetpayMatch.estatusMatch (ver design.md "Data Model":
+  // "estatus: same enum. A report never takes pendiente_por_marca" — un reporte SIEMPRE
+  // representa un depósito completo, así que en la práctica nunca toma ese valor, pero el
+  // enum se mantiene idéntico entre ambas colecciones a propósito). Reemplaza el viejo
+  // ['pendiente','confirmado','descartado'] — la migración (scripts/migrate-netpay-v2.js)
+  // reescribe cada documento existente antes de que el índice/enum nuevo entre en vigor.
   estatus: {
     type: String,
-    enum: ['pendiente', 'confirmado', 'descartado'],
-    default: 'pendiente',
+    enum: [
+      'confirmado_automatico',
+      'pendiente_por_marca',
+      'discrepancia',
+      'resuelto_por_reporte',
+      'rechazado',
+      'resuelto_manual',
+    ],
+    default: 'discrepancia',
     required: true,
   },
 
-  // Trazabilidad de confirmación (solo si estatus:'confirmado') — mismo patrón que
-  // NetpayMatch.confirmadoPor/confirmadoEn.
+  // Por qué este reporte quedó en discrepancia (o cómo llegó a un revertido) — agrega
+  // 'folio_duplicado' (exclusivo de NetpayReporte, ver folios[].duplicadoDeReporteId
+  // arriba) al set que comparte con NetpayMatch.motivoDiscrepancia.
+  motivoDiscrepancia: {
+    type: String,
+    enum: [
+      'sin_candidato',
+      'multiples_candidatos',
+      'candidato_en_conflicto',
+      'cobertura_parcial',
+      'revertido',
+      'reporte_revertido',
+      'vinculo_huerfano',
+      'folio_duplicado',
+    ],
+    default: null,
+  },
+
+  // Cómo se llegó a resuelto_por_reporte — 'erp-link' cuando este reporte generó el link
+  // NETPAYRPT- directamente; 'corroborado' cuando solo confirmó un bucket ya
+  // confirmado_automatico con el mismo monto, sin crear un link nuevo (ver design.md
+  // "Report present" flow). null en cualquier otro estatus.
+  vinculo: {
+    type: String,
+    enum: ['erp-link', 'corroborado'],
+    default: null,
+  },
+
+  // Trazabilidad de confirmación (solo si estatus:'confirmado_automatico'|'resuelto_por_reporte')
+  // — mismo patrón que NetpayMatch.confirmadoPor/confirmadoEn.
   movementIdConfirmado: { type: mongoose.Schema.Types.ObjectId, ref: 'BankMovement', default: null },
   confirmadoPor: {
     type: {
@@ -97,7 +150,7 @@ const netpayReporteSchema = new mongoose.Schema({
   },
   confirmadoEn: { type: Date, default: null },
 
-  // Trazabilidad de descarte (solo si estatus:'descartado').
+  // Trazabilidad de descarte (solo si estatus:'rechazado').
   descartadoPor: {
     type: {
       userId: { type: String, default: null },
@@ -110,6 +163,48 @@ const netpayReporteSchema = new mongoose.Schema({
   // `motivo` en el body (mismo patrón que ErpReversion.motivo) y descartarlo sin
   // persistirlo perdería el único dato humano de por qué se descartó.
   descartadoMotivo: { type: String, default: null },
+
+  // v2: trazabilidad de resolución manual (solo si estatus:'resuelto_manual') — mismo
+  // patrón que NetpayMatch.resueltoManualPor/En/justificacion (ver netpay-resolver.service.js).
+  resueltoManualPor: {
+    type: {
+      userId: { type: String, default: null },
+      nombre: { type: String, default: null },
+    },
+    default: null,
+  },
+  resueltoManualEn: { type: Date, default: null },
+  justificacion: { type: String, default: null },
+
+  // v2: marcado por el unlink hook 'NETPAYRPT-' (ver netpay-reporte-revert.service.js) —
+  // el reporte vuelve a discrepancia/revertido y nunca se vuelve a subir automáticamente
+  // (mismo patrón que NetpayMatch.revertido).
+  revertido: {
+    type: {
+      en:          { type: Date, default: null },
+      movementIds: { type: [mongoose.Schema.Types.ObjectId], ref: 'BankMovement', default: [] },
+    },
+    default: null,
+  },
+
+  // v2: valor original preservado por la migración (scripts/migrate-netpay-v2.js) para
+  // poder revertir con --revert. null en cualquier documento cargado ya en v2.
+  estatusLegacy: { type: String, default: null },
+
+  // v2 (soft-delete): oculta el reporte de las listas/cierres por default sin borrar nada
+  // — ver netpay-reporte.service.js#eliminarReporte/restaurarReporte. Nunca revierte un
+  // match ya resuelto (confirmado_automatico/resuelto_por_reporte/resuelto_manual) ni
+  // revive un rechazado (ver design.md "Report Soft-Delete").
+  eliminado: { type: Boolean, default: false },
+  eliminadoPor: {
+    type: {
+      userId: { type: String, default: null },
+      nombre: { type: String, default: null },
+    },
+    default: null,
+  },
+  eliminadoEn: { type: Date, default: null },
+  eliminadoMotivo: { type: String, default: null },
 
   cargadoPor: {
     type: {

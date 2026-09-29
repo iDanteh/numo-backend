@@ -1958,6 +1958,17 @@ const NOTA_AJUSTE_SIN_CFDI = {
   'COBRO-SIN-FACTURA':            'SIN FACTURA (cobro real, sin CFDI asociado)',
 };
 
+// Orden de los renglones de cobro en la póliza de Ingreso (2026-09-29,
+// confirmado con el usuario): Puntos (PAGO) → Efectivo → Tarjeta → NetPay →
+// comisiones NetPay → SF → cobros de otra sucursal → cobros sin factura →
+// transferencias/cheques → Otros Ingresos. Cada renglón de cobro lleva su
+// grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
+const ORDEN_COBRO = {
+  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, NETPAY: 4, COMISION_NETPAY: 5, SF: 6,
+  COBRO_OTRA_SUCURSAL: 7, COBRO_SIN_FACTURA: 8, TRANSFERENCIA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
+};
+const ORDEN_COBRO_POR_LABEL_CONSOLIDADO = { EFECTIVO: ORDEN_COBRO.EFECTIVO, TARJETA: ORDEN_COBRO.TARJETA, SF: ORDEN_COBRO.SF, PUNTOS: ORDEN_COBRO.PUNTOS };
+
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null) {
   const grupos = new Map();
   const gruposDetallados = new Map(); // Transferencia y Cheque: agrupan SOLO por mismo número de autorización real
@@ -2378,6 +2389,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
         _detalle:    g.detalle,
         _esTransferencia: false,
         _esResto:    true,
+        _ordenCobro: ORDEN_COBRO_POR_LABEL_CONSOLIDADO[g.label] ?? ORDEN_COBRO.TRANSFERENCIA,
       };
     })
     .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 2) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 2));
@@ -2445,6 +2457,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // (`_construirWorkbookPoliza`, confirmado con el usuario 2026-09-14).
       // Agrupada (esGrupo) nunca aplica: agrupar exige tener referencia real.
       _sinAutorizacion: !esGrupo && !gt.referencia,
+      _ordenCobro: gt.tipoDetalle === 'TARJETA' ? ORDEN_COBRO.TARJETA : ORDEN_COBRO.TRANSFERENCIA,
       ...(esGrupo ? { _detalle: gt.detalle, _esTransferencia: gt.tipoDetalle === 'TRANSFERENCIA', _esResto: true } : {}),
     });
   }
@@ -2459,7 +2472,8 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   const lineasNetpay = [];
   if (netpayInfo?.porCentro?.size) {
     for (const infoCentro of netpayInfo.porCentro.values()) {
-      lineasNetpay.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision));
+      lineasNetpay.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision)
+        .map(l => ({ ...l, _ordenCobro: l.serie === 'NETPAY' ? ORDEN_COBRO.NETPAY : ORDEN_COBRO.COMISION_NETPAY })));
     }
   }
 
@@ -3136,6 +3150,10 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
         : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
           ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
           : (f._formaPagoLabel ? `${f._formaPagoLabel}-${ETIQUETA_COBRO_SUCURSAL}` : ETIQUETA_COBRO_SUCURSAL);
+    f._ordenCobro = f._formaPagoLabel === ETIQUETA_SALDO_FAVOR ? ORDEN_COBRO.SF
+      : f._formaPagoLabel === ETIQUETA_PUNTOS ? ORDEN_COBRO.PUNTOS
+      : f._esPendientePropio ? ORDEN_COBRO.COBRO_SIN_FACTURA
+      : ORDEN_COBRO.COBRO_OTRA_SUCURSAL;
     delete f._formaPagoLabel;
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;
@@ -3281,7 +3299,24 @@ function _inyectarOtrosIngresos(bloques, filasOtrosIngresos, cuentaOtrosIngresos
       _tipoDesglose: 'Otros Ingresos',
       _esTransferencia: false,
       _esResto:    true,
+      _ordenCobro: ORDEN_COBRO.OTROS_INGRESOS,
     });
+  }
+}
+
+// Ver `ORDEN_COBRO`. Orden estable: las ventas (sin `_ordenCobro`, antes del
+// primer cobro) se quedan arriba tal cual; dentro de cada grupo se conserva
+// el orden previo. Un renglón sin grupo que ya venía entre los cobros queda
+// antes de Otros Ingresos (`ORDEN_COBRO.OTRO`).
+function _ordenarCobrosIngreso(bloques) {
+  for (const bloque of bloques) {
+    const primerCobro = bloque.movs.findIndex(m => m._ordenCobro != null);
+    if (primerCobro < 0) continue;
+    const rango = (m, i) => m._ordenCobro ?? (i < primerCobro ? 0 : ORDEN_COBRO.OTRO);
+    bloque.movs = bloque.movs
+      .map((m, i) => ({ m, r: rango(m, i), i }))
+      .sort((a, b) => a.r - b.r || a.i - b.i)
+      .map(x => x.m);
   }
 }
 
@@ -4006,6 +4041,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   _conservarAdDeEgresosOcultos(bloques, movimientos);
   if (poliza.tipo === 'I') await _unificarRenglonesPorDepositoBancario(bloques);
+  if (poliza.tipo === 'I') _ordenarCobrosIngreso(bloques);
 
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
@@ -5290,5 +5326,5 @@ module.exports = {
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
   _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
-  _extraerCobrosSucursal, _armarBloqueContado: armarBloqueContado,
+  _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
 };

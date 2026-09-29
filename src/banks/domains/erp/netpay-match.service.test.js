@@ -1,27 +1,21 @@
 'use strict';
 
-// netpay-match.service.test.js — Fase C del matching Netpay↔BBVA: obtenerBandejaNetpay()
-// agrupa transacciones (ya traídas por consultarTransaccionesNetpay, mockeada acá) por
-// almacen+terminalID+día, descarta lo ya resuelto (NetpayMatch) y busca candidatos BBVA
-// dentro de tolerancia/ventana. bank.service.js NO se mockea — solo se usa para leer la
-// constante real ERP_TOLERANCE, sin tocar Mongo.
-jest.mock('../banks/BankMovement.model');
+// netpay-match.service.test.js — Fase C del matching Netpay↔BBVA: agrupamiento de
+// transacciones (por terminal+día, y por terminal+día+marca en netpay-matching-v2) dentro
+// de tolerancia/ventana. bank.service.js NO se mockea — solo se usa para leer la constante
+// real ERP_TOLERANCE, sin tocar Mongo.
+//
+// netpay-matching-v2 (PR4, dead-code cleanup): el describe `obtenerBandejaNetpay` (bandeja
+// v1, candidate picker manual) fue ELIMINADO junto con la función misma — ver
+// netpay-match.service.js. Sus mocks de BankMovement/NetpayMatch/netpay-transacciones.service
+// ya no se usan en este archivo.
 jest.mock('../../../shared/services/global-config.service');
-jest.mock('./NetpayMatch.model');
-jest.mock('./netpay-transacciones.service');
 
-const BankMovement = require('../banks/BankMovement.model');
-const NetpayMatch = require('./NetpayMatch.model');
 const globalConfigService = require('../../../shared/services/global-config.service');
-const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const {
-  obtenerBandejaNetpay, _ventanaDiasNetpay, _agruparPorTerminalYDia, _diaMx, _normalizarMarcadorDia,
+  _ventanaDiasNetpay, _agruparPorTerminalYDia, _diaMx, _normalizarMarcadorDia,
   VENTANA_DEFAULT_DIAS, _agruparPorTerminalDiaYMarca, _marcasDiferidas, MARCAS_DIFERIDAS_DEFAULT,
 } = require('./netpay-match.service');
-
-function fakeFind(result) {
-  return { lean: jest.fn().mockResolvedValue(result) };
-}
 
 function t(overrides = {}) {
   return {
@@ -34,7 +28,6 @@ function t(overrides = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   globalConfigService.getValue.mockResolvedValue('2');
-  NetpayMatch.find = jest.fn(() => fakeFind([]));
 });
 
 describe('_ventanaDiasNetpay', () => {
@@ -191,81 +184,5 @@ describe('_agruparPorTerminalDiaYMarca', () => {
       t({ terminalID: 'T2', cardTypeName: 'VISA' }),
     ], ['AMEX']);
     expect(grupos.length).toBe(3);
-  });
-});
-
-describe('obtenerBandejaNetpay', () => {
-  test('sin transacciones: pendientes []', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [] });
-    const resultado = await obtenerBandejaNetpay({});
-    expect(resultado).toEqual({ pendientes: [] });
-    expect(BankMovement.find).not.toHaveBeenCalled();
-  });
-
-  test('1 candidato BBVA exacto dentro de tolerancia: aparece en pendientes', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t({ amount: 300, commission: 20 })] });
-    const mov = { _id: 'mov-1', banco: 'BBVA', deposito: 280, fecha: new Date('2026-09-10T00:00:00Z') };
-    BankMovement.find = jest.fn(() => fakeFind([mov]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes.length).toBe(1);
-    expect(resultado.pendientes[0].grupo.netoEsperado).toBe(280);
-    expect(resultado.pendientes[0].candidatos).toEqual([[mov]]);
-  });
-
-  test('candidato fuera de tolerancia ($1 MXN): no aparece', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t({ amount: 300, commission: 20 })] });
-    const mov = { _id: 'mov-1', banco: 'BBVA', deposito: 275, fecha: new Date('2026-09-10T00:00:00Z') };
-    BankMovement.find = jest.fn(() => fakeFind([mov]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes[0].candidatos).toEqual([]);
-  });
-
-  test('sin ningún BankMovement BBVA elegible: grupo pendiente sin candidatos', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t()] });
-    BankMovement.find = jest.fn(() => fakeFind([]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes.length).toBe(1);
-    expect(resultado.pendientes[0].candidatos).toEqual([]);
-  });
-
-  test('grupo YA resuelto (existe NetpayMatch para terminalID+día): no aparece en pendientes', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t()] });
-    NetpayMatch.find = jest.fn(() => fakeFind([
-      { terminalID: '2840403056', dia: _diaMx('2026-09-10T14:00:00Z') },
-    ]));
-
-    const resultado = await obtenerBandejaNetpay({});
-
-    expect(resultado.pendientes).toEqual([]);
-    expect(BankMovement.find).not.toHaveBeenCalled();
-  });
-
-  test('consulta BankMovement por banco BBVA, erpLinks vacío, status distinto de identificado', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [t()] });
-    BankMovement.find = jest.fn(() => fakeFind([]));
-
-    await obtenerBandejaNetpay({});
-
-    const filtro = BankMovement.find.mock.calls[0][0];
-    expect(filtro.banco).toBe('BBVA');
-    expect(filtro.erpLinks).toEqual({ $size: 0 });
-    expect(filtro.status).toEqual({ $ne: 'identificado' });
-  });
-
-  // dateFrom/dateTo viajan pelados (YYYY-MM-DD, 2026-09-22) — es consultarTransaccionesNetpay
-  // (mockeada acá) quien arma el instante UTC real en hora MX, no esta función.
-  test('pasa dateFrom/dateTo/terminalID tal cual a consultarTransaccionesNetpay', async () => {
-    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [] });
-    await obtenerBandejaNetpay({ dateFrom: '2026-09-01', dateTo: '2026-09-15', terminalID: '2840403056' });
-
-    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({
-      dateFrom: '2026-09-01', dateTo: '2026-09-15', terminalID: '2840403056',
-    });
   });
 });

@@ -1948,13 +1948,13 @@ const NOTA_AJUSTE_SIN_CFDI = {
 };
 
 // Orden de los renglones de cobro en la póliza de Ingreso (2026-09-29,
-// confirmado con el usuario): Puntos (PAGO) → Efectivo → Tarjeta → NetPay →
-// comisiones NetPay → SF → cobros de otra sucursal → cobros sin factura →
-// transferencias/cheques → Otros Ingresos. Cada renglón de cobro lleva su
-// grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
+// confirmado con el usuario): Puntos (PAGO) → Efectivo → Tarjeta →
+// transferencias/cheques → NetPay → comisiones NetPay → SF → cobros de otra
+// sucursal → cobros sin factura → Otros Ingresos. Cada renglón de cobro lleva
+// su grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
 const ORDEN_COBRO = {
-  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, NETPAY: 4, COMISION_NETPAY: 5, SF: 6,
-  COBRO_OTRA_SUCURSAL: 7, COBRO_SIN_FACTURA: 8, TRANSFERENCIA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
+  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NETPAY: 5, COMISION_NETPAY: 6, SF: 7,
+  COBRO_OTRA_SUCURSAL: 8, COBRO_SIN_FACTURA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
 };
 const ORDEN_COBRO_POR_LABEL_CONSOLIDADO = { EFECTIVO: ORDEN_COBRO.EFECTIVO, TARJETA: ORDEN_COBRO.TARJETA, SF: ORDEN_COBRO.SF, PUNTOS: ORDEN_COBRO.PUNTOS };
 

@@ -3041,7 +3041,13 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
   // $1,074.53 = $7,790.37). Solo es presentación: el sobrante sigue yendo a
   // "Otros Ingresos" (SF-MENOR-SIN-USAR) y la póliza no cambia. Se empareja
   // por concepto + cuenta (mismo renglón de generación partido en dos).
-  for (const menor of filasOtrosIngresosOcultos) {
+  // Igual con el sobrante de un uso parcial el mismo día (2026-09-29,
+  // `ocultoParcialMismoDia` en cfdi-poliza-generator): ese sobrante SÍ se
+  // queda en la póliza como SF visible, aquí solo se suma a la generación.
+  const filasSobranteSFVisible = filasSaldoFavorUsado.length
+    ? filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR && Number(f.haber) > 0)
+    : [];
+  for (const menor of [...filasOtrosIngresosOcultos, ...filasSobranteSFVisible]) {
     if (!(Number(menor.haber) > 0)) continue;
     const gen = filasSaldoFavorUsado.find(f => Number(f.haber) > 0 && f.concepto === menor.concepto
       && f.cuenta?.codigo === menor.cuenta?.codigo);

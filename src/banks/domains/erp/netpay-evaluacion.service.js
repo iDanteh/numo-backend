@@ -165,9 +165,13 @@ async function _confirmarYGuardar(grupo, mov) {
 // estado no-reevaluable, busca candidatos BBVA UNA sola vez para todos los buckets
 // pendientes (mismo criterio de optimización que obtenerBandejaNetpay), resuelve
 // ambigüedad entre buckets de esta misma corrida, y persiste cada decisión.
-async function evaluarRango({ dateFrom, dateTo, terminalID } = {}) {
+// Fix (2026-09-29, pedido explícito del usuario): responseCode/almacenes/status —
+// mismos filtros crudos de Kore que ya usa el tab "Consulta" (netpay-transacciones.service.js
+// #consultarTransaccionesNetpay ya los acepta) — antes se ignoraban acá aunque se pasaran,
+// así que el tab "Matching" no podía acotar qué transacciones entran a la evaluación.
+async function evaluarRango({ dateFrom, dateTo, terminalID, responseCode, almacenes, status } = {}) {
   const [{ transacciones }, marcasDiferidas, ventanaDias] = await Promise.all([
-    consultarTransaccionesNetpay({ dateFrom, dateTo, terminalID }),
+    consultarTransaccionesNetpay({ dateFrom, dateTo, terminalID, responseCode, almacenes, status }),
     _marcasDiferidas(),
     _ventanaDiasNetpay(),
   ]);

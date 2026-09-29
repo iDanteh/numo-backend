@@ -1551,6 +1551,26 @@ describe('POST /netpay/bandeja/evaluar', () => {
     expect(evaluarRango).toHaveBeenCalledWith({ dateFrom: '2026-09-01', dateTo: '2026-09-10', terminalID: 'T1' });
     expect(res.body).toEqual({ evaluados: [{ _id: 'nm-1' }] });
   });
+
+  // Fix (2026-09-29, pedido explícito del usuario): el tab "Matching" ahora comparte
+  // responseCode/almacenes/status con "Consulta" — la ruta tiene que reenviarlos al service.
+  test('pasa también responseCode/almacenes/status al service cuando vienen en el body', async () => {
+    evaluarRango.mockResolvedValue({ evaluados: [] });
+
+    const res = await request(app)
+      .post('/netpay/bandeja/evaluar')
+      .send({
+        dateFrom: '2026-09-01', dateTo: '2026-09-10', terminalID: 'T1',
+        responseCode: '00', almacenes: 'A0,N0', status: 'completed',
+      })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(evaluarRango).toHaveBeenCalledWith({
+      dateFrom: '2026-09-01', dateTo: '2026-09-10', terminalID: 'T1',
+      responseCode: '00', almacenes: 'A0,N0', status: 'completed',
+    });
+  });
 });
 
 // POST /netpay/bandeja/:id/resolver — netpay-matching-v2 (design.md API table: New).

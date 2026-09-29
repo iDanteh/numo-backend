@@ -470,8 +470,10 @@ router.get('/netpay/bandeja', authenticate, permit(PERMISSIONS.BANKS_NETPAY), as
 // (netpay-evaluacion.service.js) sobre el rango/terminal pedido — persiste una decisión
 // (incluida discrepancia) por cada bucket (terminalID, dia, bucket) todavía reevaluable.
 router.post('/netpay/bandeja/evaluar', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { dateFrom, dateTo, terminalID } = req.body;
-  const resultado = await evaluarRango({ dateFrom, dateTo, terminalID });
+  // Fix (2026-09-29, pedido explícito del usuario): responseCode/almacenes/status —
+  // mismos filtros crudos de Kore que ya usa el tab "Consulta" — reenviados a evaluarRango().
+  const { dateFrom, dateTo, terminalID, responseCode, almacenes, status } = req.body;
+  const resultado = await evaluarRango({ dateFrom, dateTo, terminalID, responseCode, almacenes, status });
   res.json(resultado);
 }));
 

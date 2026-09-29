@@ -311,4 +311,33 @@ describe('evaluarRango (integración, dependencias mockeadas)', () => {
     expect(NetpayMatch.find).not.toHaveBeenCalled();
     expect(BankMovement.find).not.toHaveBeenCalled();
   });
+
+  // Fix (2026-09-29, pedido explícito del usuario): el tab "Matching" comparte
+  // dateFrom/dateTo/terminalID con "Consulta", pero evaluarRango() ignoraba
+  // responseCode/almacenes/status aunque se los pasaran — consultarTransaccionesNetpay()
+  // (netpay-transacciones.service.js) SÍ los acepta, la misma función que usa Consulta.
+  test('reenvía responseCode/almacenes/status a consultarTransaccionesNetpay cuando se pasan', async () => {
+    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [] });
+
+    await evaluarRango({
+      dateFrom: '2026-09-10', dateTo: '2026-09-10', terminalID: TERMINAL,
+      responseCode: '00', almacenes: 'A0,N0', status: 'completed',
+    });
+
+    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({
+      dateFrom: '2026-09-10', dateTo: '2026-09-10', terminalID: TERMINAL,
+      responseCode: '00', almacenes: 'A0,N0', status: 'completed',
+    });
+  });
+
+  test('responseCode/almacenes/status ausentes: se reenvían como undefined, no rompe la llamada', async () => {
+    consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [] });
+
+    await evaluarRango({ dateFrom: '2026-09-10', dateTo: '2026-09-10', terminalID: TERMINAL });
+
+    expect(consultarTransaccionesNetpay).toHaveBeenCalledWith({
+      dateFrom: '2026-09-10', dateTo: '2026-09-10', terminalID: TERMINAL,
+      responseCode: undefined, almacenes: undefined, status: undefined,
+    });
+  });
 });

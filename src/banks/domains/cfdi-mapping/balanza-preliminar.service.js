@@ -279,8 +279,8 @@ async function _enrichAndFilterCfdis(cfdis, tipo, { excluirPagosSustitutos, uuid
   )];
   if (relCondonacionUuids.length) {
     const facturasRelacionadas = await CFDI.find({ uuid: { $in: relCondonacionUuids } })
-      .select('uuid metodoPago').lean();
-    const metodoPagoRelacionado = Object.fromEntries(facturasRelacionadas.map(f => [f.uuid, f.metodoPago]));
+      .select('uuid source metodoPago').lean();
+    const metodoPagoRelacionado = _metaFacturasRelacionadas(facturasRelacionadas).metodoPago;
     _normalizarEgresoCondonacion(cfdisEnriquecidos, metodoPagoRelacionado);
   }
 
@@ -298,8 +298,8 @@ async function _enrichAndFilterCfdis(cfdis, tipo, { excluirPagosSustitutos, uuid
   )];
   if (relPagoRealUuids.length) {
     const facturasPagoReal = await CFDI.find({ uuid: { $in: relPagoRealUuids } })
-      .select('uuid metodoPago formaPago').lean();
-    const facturaRelacionada = Object.fromEntries(facturasPagoReal.map(f => [f.uuid, { metodoPago: f.metodoPago, formaPago: f.formaPago }]));
+      .select('uuid source metodoPago formaPago').lean();
+    const facturaRelacionada = _metaFacturasRelacionadas(facturasPagoReal).meta;
     _normalizarEgresoSegunFacturaRelacionada(cfdisEnriquecidos, facturaRelacionada);
   }
 
@@ -708,6 +708,29 @@ function _normalizarEgresoPue99(cfdis) {
  * @param {Array} cfdis
  * @param {Object<string,string>} metodoPagoRelacionado - uuid de factura → su metodoPago
  */
+/**
+ * Mapas uuid → metodoPago / {metodoPago, formaPago} de las facturas
+ * relacionadas a partir de TODAS sus copias (SAT y ERP), sin depender del
+ * orden en que las regrese Mongo (2026-09-29, caso real CEDIS 28-sep: 10 NC
+ * de bonificación fP15 cuya factura era PPD cayeron en TO-BON-16 fP15 →
+ * abono a Anticipos Otros en vez de Clientes). La copia SAT de Descarga
+ * Masiva no trae metodoPago; con `Object.fromEntries` ganaba la ÚLTIMA copia
+ * y, si era la SAT, la NC se quedaba con su propio PUE. Se prefiere el dato
+ * de la copia SAT cuando existe y, si no, el de la ERP.
+ */
+function _metaFacturasRelacionadas(docs, { mayusculas = false } = {}) {
+  const ordenados = [...(docs ?? [])].sort((a, b) => (a.source === 'SAT' ? 0 : 1) - (b.source === 'SAT' ? 0 : 1));
+  const metodoPago = {};
+  const meta = {};
+  for (const d of ordenados) {
+    const k = mayusculas ? String(d.uuid || '').toUpperCase() : d.uuid;
+    if (!k) continue;
+    metodoPago[k] = metodoPago[k] ?? d.metodoPago;
+    meta[k] = { metodoPago: meta[k]?.metodoPago ?? d.metodoPago, formaPago: meta[k]?.formaPago ?? d.formaPago };
+  }
+  return { metodoPago, meta };
+}
+
 function _normalizarEgresoCondonacion(cfdis, metodoPagoRelacionado) {
   if (!metodoPagoRelacionado) return;
   for (const cfdi of cfdis) {
@@ -1316,4 +1339,4 @@ async function generarDetalleExport({ rfc, ejercicio, periodo, tipoCfdi,
   return { entradas, sinRegla, sustitutos: sustitutosExcluidosExport };
 }
 
-module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, generarDetalleExport, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada };
+module.exports = { generarBalanzaPreliminar, generarDetalleCuenta, generarDetalleExport, _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada, _metaFacturasRelacionadas };

@@ -56,6 +56,7 @@ const CUENTA_NETPAY_GASTO_COMISION      = '5201030001'; // Gasto de comisión ba
 const CUENTA_NETPAY_IVA_POR_ACREDITAR   = '1108010001'; // IVA por acreditar de la factura de comisión
 const CUENTA_NETPAY_PROVEEDOR           = '2102010001'; // Proveedor (NetPay SAPI de CV) — se reconoce y liquida en el mismo asiento
 const CUENTA_NETPAY_IVA_ACREDITABLE     = '1107010001'; // IVA ya acreditado/pagado (contrapartida de la línea de arriba)
+const CUENTA_NETPAY_AMEX                = '1101010001'; // Renglón "NETPAY AE" (ventas AMEX, sin comisión) — 2026-09-29
 
 /**
  * Cruza los CFDIs de la póliza contra sus movimientos bancarios reales
@@ -482,6 +483,8 @@ function _buscarCombinacionQueSuma(indices, disponibles, monto) {
   return null;
 }
 
+const _esTransaccionAmex = t => (t.cardTypeName ?? '').trim().toUpperCase() === 'AMEX';
+
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
@@ -523,6 +526,9 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     where: { codigo: { [Op.in]: codigosComision } }, attributes: ['id', 'codigo', 'nombre'], raw: true,
   });
   const cuentasComisionPorCodigo = new Map(cuentasComisionRows.map(r => [r.codigo, r]));
+  // Cuenta del renglón "NETPAY AE" (ventas AMEX, ver `ligar` abajo). Si no
+  // existe en el catálogo, AMEX se queda en el consolidado de Tarjeta.
+  const cuentaAmex = await AccountPlan.findOne({ where: { codigo: CUENTA_NETPAY_AMEX }, attributes: ['id', 'codigo', 'nombre'], raw: true });
   const cuentasComision = {
     gastoComision:    cuentasComisionPorCodigo.get(CUENTA_NETPAY_GASTO_COMISION)    ?? null,
     ivaPorAcreditar:  cuentasComisionPorCodigo.get(CUENTA_NETPAY_IVA_POR_ACREDITAR) ?? null,
@@ -573,7 +579,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
 
     let resultado;
     try {
-      resultado = await consultarTransaccionesNetpay({ responseCode: '00', almacenes: clave, dateFrom, dateTo });
+      resultado = await consultarTransaccionesNetpay({ responseCode: '00', almacenes: clave, dateFrom, dateTo, withAccountInfo: true });
     } catch (err) {
       const { logger } = require('../../../shared/utils/logger');
       logger.warn(`[Poliza] NetPay no disponible para ${clave} ${dia}, se omite (Tarjeta sigue en consolidado genérico): ${err.message}`);
@@ -584,7 +590,6 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // aunque 2 transacciones NetPay compartan monto ese día (mismo criterio
     // que `_elegirBancoRealPorMonto`: primer match disponible gana).
     const disponibles = [...filas];
-    let gross = 0, comision = 0;
     // Detalle venta-por-venta (2026-09-21, pedido explícito del usuario) —
     // alimenta la sección "NETPAY" de la hoja "Desglose Consolidado" en
     // `_construirWorkbookPoliza`, para poder ver qué ticket exacto se cobró
@@ -595,8 +600,17 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // 2026-09-18) — responseCode='00' del query a Kore no garantiza por sí
     // solo que la transacción siga vigente (podría estar revertida/anulada
     // después con el mismo responseCode original).
-    const transaccionesValidas = (resultado.transacciones ?? []).filter(t =>
-      terminalesValidas.has(t.terminalID) && t.status === 'completed' && (Number(t.amount) || 0) > 0);
+    // AMEX fuera del asiento NetPay (2026-09-28, pedido explícito del usuario):
+    // ni su monto ni su comisión (ni el IVA de esa comisión) entran al asiento
+    // de 7 líneas. Desde 2026-09-29 (pedido del usuario) sus ventas tampoco se
+    // quedan en "Depósitos consolidados (Tarjeta)": se ligan igual que NetPay
+    // (segunda pasada, después de todas las demás) y salen en UN renglón
+    // "NETPAY AE" por centro, sin comisión — ver `_lineaNetpayAmex`.
+    const esTransaccionValida = t => terminalesValidas.has(t.terminalID) && t.status === 'completed' && (Number(t.amount) || 0) > 0;
+    const transaccionesValidas = (resultado.transacciones ?? []).filter(t => esTransaccionValida(t) && !_esTransaccionAmex(t));
+    const transaccionesAmex = cuentaAmex
+      ? (resultado.transacciones ?? []).filter(t => esTransaccionValida(t) && _esTransaccionAmex(t))
+      : [];
     // Dos pasadas (2026-09-23, confirmado con el usuario, caso real
     // Ferrocarril 21-sep, póliza 888: una pasada de $1,026.90 =
     // F0-260902052 $11.44 + F0-260902050 $1,015.46 de la Global
@@ -608,68 +622,144 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // matches exactos 1-a-1 y solo después se buscan combinaciones sobre lo
     // que sobra — el grupo queda chico y una combinación nunca se lleva un
     // ticket que era el match exacto de otra transacción.
-    const sinMatchExacto = [];
-    for (const t of transaccionesValidas) {
-      const monto = Number(t.amount) || 0;
-      const comisionTransaccion = Number(t.commission) || 0;
-      const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
-      if (idx === -1) { sinMatchExacto.push(t); continue; }
-      const fila = disponibles.splice(idx, 1)[0];
-      matchedIds.add(fila.id);
-      gross += Number(fila.debe);
-      comision += comisionTransaccion;
-      detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
+    //
+    // Liga EXACTA por ticket (2026-09-24, confirmado con el usuario): con
+    // `withAccountInfo=true` cada transacción trae `cuentas[]` con los tickets
+    // que cubre (`SerieExterna`/`FolioExterno`) — ej. Ferrocarril 21-sep,
+    // F20260921-00190 $1,026.90 → F0-260902050 + F0-260902052. Se ligan TODAS
+    // las líneas Tarjeta de esos tickets (sin adivinar por monto ni límite de
+    // combinaciones). El monto de cada ticket es el de NUESTRA línea (un ticket
+    // pudo pagarse en parte con efectivo; `Total` de Kore es el del ticket
+    // completo). Un ticket pagado con 2+ pasadas: su línea ya trae el total de
+    // tarjeta, así que la 2a pasada solo suma su comisión. Transacciones sin
+    // `cuentas` o cuyos tickets no están en esta póliza caen al match por monto
+    // de abajo (exacto → combinación), igual que antes.
+    const claveTicketDe = (f) => {
+      if (f.serieVentaTicket && f.folioVentaTicket) return `${f.serieVentaTicket}-${f.folioVentaTicket}`;
+      const enConcepto = String(f.concepto || '').match(/([A-Z]\d)-(\d{6,})/g);
+      if (f._cobroOtraSucursal && enConcepto?.length) return enConcepto[enConcepto.length - 1];
+      return null;
+    };
+    const filasPorTicket = new Map(); // ticket → filas
+    for (const f of disponibles) {
+      const k = claveTicketDe(f);
+      if (!k) continue;
+      if (!filasPorTicket.has(k)) filasPorTicket.set(k, []);
+      filasPorTicket.get(k).push(f);
     }
-    for (const t of sinMatchExacto) {
-      const monto = Number(t.amount) || 0;
-      const comisionTransaccion = Number(t.commission) || 0;
-      // Fallback: 2+ tickets de la MISMA factura (Factura Global dividida en
-      // varios tickets) que EN CONJUNTO explican el monto — caso real
-      // confirmado 2026-09-21 (Hidalgo/B0, $7,914.13 = suma de 2 tickets de
-      // una misma Global; generalizado el mismo día a "hasta N tickets" por
-      // otro caso real con 3+). Acotado a la MISMA factura (nunca combina
-      // tickets sin relación solo porque su suma coincida por casualidad) —
-      // mismo principio que `_elegirBancoRealMultiple` ya usa para
-      // Transferencia/Cheque. Ver `_buscarCombinacionQueSuma`.
-      const gruposPorFactura = new Map(); // cfdiUuid -> [índices sobre `disponibles`]
-      disponibles.forEach((f, i) => {
-        if (!f.cfdiUuid) return;
-        if (!gruposPorFactura.has(f.cfdiUuid)) gruposPorFactura.set(f.cfdiUuid, []);
-        gruposPorFactura.get(f.cfdiUuid).push(i);
-      });
-      let combinacion = null;
-      for (const indicesGrupo of gruposPorFactura.values()) {
-        if (indicesGrupo.length < 2) continue;
-        combinacion = _buscarCombinacionQueSuma(indicesGrupo, disponibles, monto);
-        if (combinacion) break;
+    const ticketsYaLigados = new Set();
+    // Liga un grupo de transacciones contra las líneas Tarjeta que quedan
+    // (`disponibles`/`filasPorTicket` compartidos: una línea ligada por NetPay
+    // ya no la toma AMEX). `esAmex`: solo junta el monto, sin comisión.
+    const ligar = (transacciones, esAmex) => {
+      let gross = 0, comision = 0;
+      const detalle = [];
+      const pendientesPorMonto = [];
+      for (const t of transacciones) {
+        const monto = Number(t.amount) || 0;
+        const comisionTransaccion = Number(t.commission) || 0;
+        const tickets = [...new Set((t.cuentas ?? [])
+          .filter(c => c.SerieExterna && c.FolioExterno)
+          .map(c => `${c.SerieExterna}-${c.FolioExterno}`))];
+        const ticketsEnPoliza = tickets.filter(k => filasPorTicket.has(k) || ticketsYaLigados.has(k));
+        if (!ticketsEnPoliza.length) { pendientesPorMonto.push(t); continue; }
+        const filasTx = [];
+        for (const k of ticketsEnPoliza) {
+          if (!filasPorTicket.has(k)) continue; // ya ligado por otra pasada (mismo ticket)
+          filasTx.push(...filasPorTicket.get(k));
+          filasPorTicket.delete(k);
+          ticketsYaLigados.add(k);
+        }
+        if (!filasTx.length) {
+          // Segunda pasada de un ticket ya ligado: su monto ya está en la línea.
+          // AMEX no lleva comisión, así que no hay nada que sumar.
+          if (esAmex) continue;
+          comision += comisionTransaccion;
+          detalle.push({ fila: { concepto: ticketsEnPoliza.join(', '), serie: ticketsEnPoliza[0] }, terminalID: t.terminalID, monto: 0,
+            comision: comisionTransaccion, nota: `pasada adicional (${t.folio}, $${monto.toFixed(2)}) de ticket ya ligado` });
+          continue;
+        }
+        comision += comisionTransaccion;
+        const suma = filasTx.reduce((acc, f) => acc + Number(f.debe), 0);
+        gross += suma;
+        const diferencia = Math.round((suma - monto) * 100) / 100;
+        for (const fila of filasTx) {
+          const idxD = disponibles.indexOf(fila);
+          if (idxD !== -1) disponibles.splice(idxD, 1);
+          matchedIds.add(fila.id);
+          const comisionFila = suma > 0 ? Math.round(comisionTransaccion * (Number(fila.debe) / suma) * 100) / 100 : 0;
+          detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila,
+            nota: Math.abs(diferencia) > 1 ? `pasada ${t.folio} $${monto.toFixed(2)} vs líneas $${suma.toFixed(2)} (dif ${diferencia.toFixed(2)})` : null });
+        }
       }
-      if (!combinacion) continue; // sin ticket ni combinación de la misma factura que expliquen el monto -- se ignora
-      // Splice de mayor a menor índice para no invalidar los índices restantes.
-      const filasCombinadas = [...combinacion].sort((a, b) => b - a).map(i => disponibles.splice(i, 1)[0]);
-      const sumaCombinada = filasCombinadas.reduce((s, f) => s + Number(f.debe), 0);
-      gross += sumaCombinada;
-      comision += comisionTransaccion;
-      for (const fila of filasCombinadas) {
+
+      const sinMatchExacto = [];
+      for (const t of pendientesPorMonto) {
+        const monto = Number(t.amount) || 0;
+        const comisionTransaccion = Number(t.commission) || 0;
+        const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
+        if (idx === -1) { sinMatchExacto.push(t); continue; }
+        const fila = disponibles.splice(idx, 1)[0];
         matchedIds.add(fila.id);
-        // Comisión repartida proporcional al monto de cada ticket, solo para
-        // que el desglose informativo sea legible por línea — el total que sí
-        // importa contablemente (`comision` de arriba) ya suma la comisión
-        // completa de la transacción una sola vez, sin importar este reparto.
-        const comisionFila = Math.round(comisionTransaccion * (Number(fila.debe) / sumaCombinada) * 100) / 100;
-        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila });
+        gross += Number(fila.debe);
+        comision += comisionTransaccion;
+        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
       }
-    }
-    if (gross > 0) {
+      for (const t of sinMatchExacto) {
+        const monto = Number(t.amount) || 0;
+        const comisionTransaccion = Number(t.commission) || 0;
+        // Fallback: 2+ tickets de la MISMA factura (Factura Global dividida en
+        // varios tickets) que EN CONJUNTO explican el monto — caso real
+        // confirmado 2026-09-21 (Hidalgo/B0, $7,914.13 = suma de 2 tickets de
+        // una misma Global; generalizado el mismo día a "hasta N tickets" por
+        // otro caso real con 3+). Acotado a la MISMA factura (nunca combina
+        // tickets sin relación solo porque su suma coincida por casualidad) —
+        // mismo principio que `_elegirBancoRealMultiple` ya usa para
+        // Transferencia/Cheque. Ver `_buscarCombinacionQueSuma`.
+        const gruposPorFactura = new Map(); // cfdiUuid -> [índices sobre `disponibles`]
+        disponibles.forEach((f, i) => {
+          if (!f.cfdiUuid) return;
+          if (!gruposPorFactura.has(f.cfdiUuid)) gruposPorFactura.set(f.cfdiUuid, []);
+          gruposPorFactura.get(f.cfdiUuid).push(i);
+        });
+        let combinacion = null;
+        for (const indicesGrupo of gruposPorFactura.values()) {
+          if (indicesGrupo.length < 2) continue;
+          combinacion = _buscarCombinacionQueSuma(indicesGrupo, disponibles, monto);
+          if (combinacion) break;
+        }
+        if (!combinacion) continue; // sin ticket ni combinación de la misma factura que expliquen el monto -- se ignora
+        // Splice de mayor a menor índice para no invalidar los índices restantes.
+        const filasCombinadas = [...combinacion].sort((a, b) => b - a).map(i => disponibles.splice(i, 1)[0]);
+        const sumaCombinada = filasCombinadas.reduce((s, f) => s + Number(f.debe), 0);
+        gross += sumaCombinada;
+        comision += comisionTransaccion;
+        for (const fila of filasCombinadas) {
+          matchedIds.add(fila.id);
+          // Comisión repartida proporcional al monto de cada ticket, solo para
+          // que el desglose informativo sea legible por línea — el total que sí
+          // importa contablemente (`comision` de arriba) ya suma la comisión
+          // completa de la transacción una sola vez, sin importar este reparto.
+          const comisionFila = Math.round(comisionTransaccion * (Number(fila.debe) / sumaCombinada) * 100) / 100;
+          detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila });
+        }
+      }
+      return { gross, comision, detalle };
+    };
+    const netpay = ligar(transaccionesValidas, false);
+    const amex   = ligar(transaccionesAmex, true);
+    if (netpay.gross > 0 || amex.gross > 0) {
       porCentro.set(centroCostoObj.id, {
-        gross: Math.round(gross * 100) / 100,
-        comision: Math.round(comision * 100) / 100,
+        gross: Math.round(netpay.gross * 100) / 100,
+        comision: Math.round(netpay.comision * 100) / 100,
         centroCostoObj,
-        detalle,
+        detalle: netpay.detalle,
+        grossAmex: Math.round(amex.gross * 100) / 100,
       });
     }
   }));
 
-  return { matchedIds, porCentro, cuentasComision };
+  return { matchedIds, porCentro, cuentasComision, cuentaAmex };
 }
 
 // Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
@@ -699,6 +789,14 @@ function _lineasNetpay({ gross, comision, centroCostoObj }, cuentaDepositosReal,
     // 7. ...cerrando el saldo pendiente que abrió la línea 3.
     { cuenta: cuentasComision.ivaPorAcreditar, serie: 'COMISION', concepto: conceptoComision, centroCosto, debe: 0, haber: ivaComision, cfdiUuid: null, _subcodigo: 0, _categoria: null },
   ];
+}
+
+// Ventas AMEX por terminal NetPay (2026-09-29, pedido del usuario): UN solo
+// renglón por centro, tal cual, sin comisión ni IVA — ej.
+// "M1 1101010001 NETPAY AE 0 1,394.22 0 0 VENTAS SUC. SANTA ROSA 117".
+function _lineaNetpayAmex({ grossAmex, centroCostoObj }, cuentaAmex) {
+  return { cuenta: cuentaAmex, serie: 'NETPAY AE', concepto: `VENTAS SUC. ${centroCostoObj.sucursal}`, centroCosto: centroCostoObj.clave,
+    debe: grossAmex, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null };
 }
 
 // Elige, de las entradas bancarias reales ligadas a un ticket (ver
@@ -1672,6 +1770,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+        _grupoCobro: m.reglaNombre === ETIQUETA_PUNTOS ? ORDEN_COBRO.PUNTOS : ORDEN_COBRO.SF,
       };
     }
     // Mismo criterio que al construir `verdadBancaria` arriba: `facturaUuid`
@@ -1706,6 +1805,20 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // con el depósito real, perdiendo el Cargo IVA por completo (bug real
     // 2026-09-01, caso real "039246": $21,041.66 = Clientes + IVA fusionados
     // en una sola línea "banco" en vez de dos líneas separadas).
+    // Cobro de un mes anterior (reglaNombre 'NI', ver cobranza-poliza-generator):
+    // va al bloque de cobros; el subtotal (Depósitos No Identificados) lleva en
+    // columna C la autorización real del depósito si Bancos la tiene, y el
+    // IVA siempre "NI" (2026-09-29, ejemplo real del usuario "9 (4).xls").
+    if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
+      const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
+      return {
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && bancario?.referencia) || REGLA_COBRANZA_NO_IDENTIFICADO,
+        concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
+        debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
+        rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
+        tipoOrigen: m.tipoOrigen, _subcodigo: 0, _grupoCobro: ORDEN_COBRO.NO_IDENTIFICADO,
+      };
+    }
     if (!/^110[12]/.test(m.cuenta?.codigo || '')) {
       return {
         cuenta: m.cuenta, cuentaId: m.cuentaId, serie: m.serie, concepto: m.concepto,
@@ -1713,6 +1826,9 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0,
+        // Cargo a la cuenta puente de un cobro hecho en otra sucursal: va con
+        // los cobros (al final), no junto a la factura.
+        ...(m.tipoOrigen === 'Cobro Sucursal' ? { _grupoCobro: ORDEN_COBRO.COBRO_OTRA_SUCURSAL } : {}),
       };
     }
     const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
@@ -1758,11 +1874,14 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   // su factura — no son un depósito bancario real, no tiene sentido moverlas.
   const otrasLineas = [];
   const cargoLineas = [];
+  const cobrosNoBancarios = []; // SF / Puntos / NI / cobro de otra sucursal (Cargo) — ver `_grupoCobro`
   for (const m of anotados) {
     // Solo las líneas que pasaron por la rama de Caja/Bancos de arriba traen
     // `_referenciaBancoReal` (aunque sea null) — es la misma señal que ya usa
     // el cleanup final para saber qué es un objeto plano de Cargo bancario.
-    (('_referenciaBancoReal' in m) ? cargoLineas : otrasLineas).push(m);
+    if ('_referenciaBancoReal' in m) { cargoLineas.push(m); continue; }
+    if (m._grupoCobro != null && Number(m.debe) > 0) { cobrosNoBancarios.push(m); continue; }
+    otrasLineas.push(m);
   }
 
   // Fusiona el Cargo (dinero recibido) cuando dos o más facturas — del mismo
@@ -1864,9 +1983,22 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     return { ...resto, concepto: [_nombreCliente, ..._tickets].filter(Boolean).join(' / ') };
   });
 
-  // Bloque de Abono/IVA/SF (orden original, por factura) primero, bloque de
-  // Cargo bancario consolidado (depósitos) al final — ver comentario arriba.
-  return [...otrasLineas, ...cargoFinal];
+  // Bloque de Abono/IVA (orden original, por factura) primero, bloque de
+  // cobros al final — ver comentario arriba. Los cobros van en el mismo orden
+  // que en Ingreso (2026-09-29, pedido del usuario, ver `ORDEN_COBRO`):
+  // Puntos → Efectivo → Tarjeta → transferencias/cheques → NI → SF → cobros
+  // de otra sucursal. Orden estable dentro de cada grupo.
+  const grupoDeCargo = m => (m.formaPago === '01' ? ORDEN_COBRO.EFECTIVO
+    : (m.formaPago === '04' || m.formaPago === '28') ? ORDEN_COBRO.TARJETA
+    : ORDEN_COBRO.TRANSFERENCIA);
+  const cobros = [
+    ...cargoFinal.map(m => ({ m, g: grupoDeCargo(m) })),
+    ...cobrosNoBancarios.map(({ _grupoCobro, ...m }) => ({ m, g: _grupoCobro })),
+  ].map((x, i) => ({ ...x, i }))
+    .sort((a, b) => a.g - b.g || a.i - b.i)
+    .map(x => x.m);
+  // `otrasLineas` puede traer instancias de Sequelize: nunca spread/destructuring aquí.
+  return [...otrasLineas, ...cobros];
 }
 
 // Mismo literal que usa `_inyectarSaldoFavorGenerado` (cfdi-poliza-generator.
@@ -1888,6 +2020,20 @@ const NOTA_AJUSTE_SIN_CFDI = {
   'FACTURA-CANCELADA-COBRO-REAL': 'CANCELADA (cobro real, sin efecto fiscal)',
   'COBRO-SIN-FACTURA':            'SIN FACTURA (cobro real, sin CFDI asociado)',
 };
+
+// Orden de los renglones de cobro en la póliza de Ingreso (2026-09-29,
+// confirmado con el usuario): Puntos (PAGO) → Efectivo → Tarjeta →
+// transferencias/cheques → NetPay → comisiones NetPay → SF → cobros de otra
+// sucursal → cobros sin factura → Otros Ingresos. Cada renglón de cobro lleva
+// su grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
+const ORDEN_COBRO = {
+  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NO_IDENTIFICADO: 4.5, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, SF: 7,
+  COBRO_OTRA_SUCURSAL: 8, COBRO_SIN_FACTURA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
+};
+// Cobranza: cobro de un mes anterior al complemento (ver cobranza-poliza-generator.service.js).
+const REGLA_COBRANZA_NO_IDENTIFICADO     = 'NI';
+const CUENTA_DEPOSITOS_NO_IDENTIFICADOS  = '2103030001';
+const ORDEN_COBRO_POR_LABEL_CONSOLIDADO = { EFECTIVO: ORDEN_COBRO.EFECTIVO, TARJETA: ORDEN_COBRO.TARJETA, SF: ORDEN_COBRO.SF, PUNTOS: ORDEN_COBRO.PUNTOS };
 
 function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false, verdadBancaria = null, nombresClientes = null, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null) {
   const grupos = new Map();
@@ -2309,6 +2455,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
         _detalle:    g.detalle,
         _esTransferencia: false,
         _esResto:    true,
+        _ordenCobro: ORDEN_COBRO_POR_LABEL_CONSOLIDADO[g.label] ?? ORDEN_COBRO.TRANSFERENCIA,
       };
     })
     .sort((a, b) => (ORDEN_LABEL_CONSOLIDADO[a.serie] ?? 2) - (ORDEN_LABEL_CONSOLIDADO[b.serie] ?? 2));
@@ -2376,6 +2523,7 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       // (`_construirWorkbookPoliza`, confirmado con el usuario 2026-09-14).
       // Agrupada (esGrupo) nunca aplica: agrupar exige tener referencia real.
       _sinAutorizacion: !esGrupo && !gt.referencia,
+      _ordenCobro: gt.tipoDetalle === 'TARJETA' ? ORDEN_COBRO.TARJETA : ORDEN_COBRO.TRANSFERENCIA,
       ...(esGrupo ? { _detalle: gt.detalle, _esTransferencia: gt.tipoDetalle === 'TRANSFERENCIA', _esResto: true } : {}),
     });
   }
@@ -2390,7 +2538,16 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
   const lineasNetpay = [];
   if (netpayInfo?.porCentro?.size) {
     for (const infoCentro of netpayInfo.porCentro.values()) {
-      lineasNetpay.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision));
+      if (infoCentro.gross > 0) {
+        lineasNetpay.push(..._lineasNetpay(infoCentro, cuentaDepositosReal, netpayInfo.cuentasComision)
+          .map(l => ({ ...l, _ordenCobro: l.serie === 'NETPAY' ? ORDEN_COBRO.NETPAY : ORDEN_COBRO.COMISION_NETPAY })));
+      }
+    }
+    // NETPAY AE (AMEX) después de las comisiones de NetPay.
+    for (const infoCentro of netpayInfo.porCentro.values()) {
+      if (infoCentro.grossAmex > 0 && netpayInfo.cuentaAmex) {
+        lineasNetpay.push({ ..._lineaNetpayAmex(infoCentro, netpayInfo.cuentaAmex), _ordenCobro: ORDEN_COBRO.NETPAY_AMEX });
+      }
     }
   }
 
@@ -2966,6 +3123,24 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
       if (idsSaldoFavorUsado.has(filas[i])) filas.splice(i, 1);
     }
   }
+  // Generación oculta con sobrante < $50: en esta hoja se muestra COMPLETA
+  // (lo usado + el sobrante), tal cual lo generó Kore (confirmado con el
+  // usuario 2026-09-24, caso real Puerto Escondido DEV-057750: $6,715.84 +
+  // $1,074.53 = $7,790.37). Solo es presentación: el sobrante sigue yendo a
+  // "Otros Ingresos" (SF-MENOR-SIN-USAR) y la póliza no cambia. Se empareja
+  // por concepto + cuenta (mismo renglón de generación partido en dos).
+  // Igual con el sobrante de un uso parcial el mismo día (2026-09-29,
+  // `ocultoParcialMismoDia` en cfdi-poliza-generator): ese sobrante SÍ se
+  // queda en la póliza como SF visible, aquí solo se suma a la generación.
+  const filasSobranteSFVisible = filasSaldoFavorUsado.length
+    ? filas.filter(f => f._formaPagoLabel === ETIQUETA_SALDO_FAVOR && Number(f.haber) > 0)
+    : [];
+  for (const menor of [...filasOtrosIngresosOcultos, ...filasSobranteSFVisible]) {
+    if (!(Number(menor.haber) > 0)) continue;
+    const gen = filasSaldoFavorUsado.find(f => Number(f.haber) > 0 && f.concepto === menor.concepto
+      && f.cuenta?.codigo === menor.cuenta?.codigo);
+    if (gen) gen.haber = Math.round((Number(gen.haber) + Number(menor.haber)) * 100) / 100;
+  }
   // COBRO-DIA-REAL (2026-09-17): se une aquí, no viene de `filas` (nunca pasó
   // por ahí, se desvió arriba antes del `filas.push`), así que no necesita
   // limpieza de `filas` como el SF-OCULTO de arriba.
@@ -3049,6 +3224,10 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
         : (f._formaPagoLabel === ETIQUETA_SALDO_FAVOR || f._formaPagoLabel === ETIQUETA_PUNTOS || f._esPendientePropio)
           ? (f._formaPagoLabel || ETIQUETA_COBRO_SUCURSAL)
           : (f._formaPagoLabel ? `${f._formaPagoLabel}-${ETIQUETA_COBRO_SUCURSAL}` : ETIQUETA_COBRO_SUCURSAL);
+    f._ordenCobro = f._formaPagoLabel === ETIQUETA_SALDO_FAVOR ? ORDEN_COBRO.SF
+      : f._formaPagoLabel === ETIQUETA_PUNTOS ? ORDEN_COBRO.PUNTOS
+      : f._esPendientePropio ? ORDEN_COBRO.COBRO_SIN_FACTURA
+      : ORDEN_COBRO.COBRO_OTRA_SUCURSAL;
     delete f._formaPagoLabel;
     delete f._referenciaBancoReal;
     delete f._esPendientePropio;
@@ -3147,6 +3326,71 @@ function _inyectarCobrosSucursal(bloques, filas, filasTarjetaCobroSucursal = [])
       bloques.find(b => !esBonificacionODescuento(b.tipoVenta)) ??
       bloques[0];
     candidatoCredito.movs.push(...filasPPD);
+  }
+}
+
+// Total de la pestaña "Otros Ingresos" como renglón consolidado de la póliza
+// (2026-09-28, confirmado con el usuario): un Abono por sucursal a la cuenta
+// "Otros Ingresos" (subtotal + IVA juntos), igual que "Depósitos consolidados
+// (Efectivo/Tarjeta)", con el detalle de cada renglón de la pestaña en
+// "Desglose Consolidado". La pestaña se sigue generando igual.
+const CUENTA_OTROS_INGRESOS_CONSOLIDADO = '5204990001';
+
+function _inyectarOtrosIngresos(bloques, filasOtrosIngresos, cuentaOtrosIngresos) {
+  if (!filasOtrosIngresos.length || !bloques.length || !cuentaOtrosIngresos) return;
+  const porCentro = new Map(); // centroCosto -> { total, detalle }
+  for (const f of filasOtrosIngresos) {
+    const monto = Math.round(((Number(f.haber) || 0) - (Number(f.debe) || 0)) * 100) / 100;
+    if (Math.abs(monto) < 0.005) continue;
+    const centro = f.centroCosto ?? '';
+    if (!porCentro.has(centro)) porCentro.set(centro, { total: 0, detalle: [] });
+    const g = porCentro.get(centro);
+    g.total += monto;
+    g.detalle.push({
+      cfdiUuid: null, serie: f.concepto || '', monto, formaPago: 'OTROS INGRESOS',
+      nota: [f.motivo, f.cuenta?.codigo ? `cuenta ${f.cuenta.codigo}` : null].filter(Boolean).join(' — '),
+    });
+  }
+  if (!porCentro.size) return;
+  const esBonificacionODescuento = (t) => /^(Bonificaciones|Descuentos y Devoluciones) de/.test(t || '');
+  const candidatoContado =
+    bloques.find(b => b.tipoVenta === 'Contado') ??
+    bloques.find(b => b.tipoVenta == null) ??
+    bloques.find(b => !esBonificacionODescuento(b.tipoVenta)) ??
+    bloques[0];
+  for (const [centroCosto, g] of porCentro) {
+    const neto = Math.round(g.total * 100) / 100;
+    candidatoContado.movs.push({
+      cuenta:      cuentaOtrosIngresos,
+      serie:       'OTROS INGRESOS',
+      concepto:    'Otros Ingresos',
+      centroCosto,
+      debe:        neto < 0 ? Math.abs(neto) : 0,
+      haber:       neto > 0 ? neto : 0,
+      cfdiUuid:    null,
+      _subcodigo:  0,
+      _detalle:    g.detalle,
+      _tipoDesglose: 'Otros Ingresos',
+      _esTransferencia: false,
+      _esResto:    true,
+      _ordenCobro: ORDEN_COBRO.OTROS_INGRESOS,
+    });
+  }
+}
+
+// Ver `ORDEN_COBRO`. Orden estable: las ventas (sin `_ordenCobro`, antes del
+// primer cobro) se quedan arriba tal cual; dentro de cada grupo se conserva
+// el orden previo. Un renglón sin grupo que ya venía entre los cobros queda
+// antes de Otros Ingresos (`ORDEN_COBRO.OTRO`).
+function _ordenarCobrosIngreso(bloques) {
+  for (const bloque of bloques) {
+    const primerCobro = bloque.movs.findIndex(m => m._ordenCobro != null);
+    if (primerCobro < 0) continue;
+    const rango = (m, i) => m._ordenCobro ?? (i < primerCobro ? 0 : ORDEN_COBRO.OTRO);
+    bloque.movs = bloque.movs
+      .map((m, i) => ({ m, r: rango(m, i), i }))
+      .sort((a, b) => a.r - b.r || a.i - b.i)
+      .map(x => x.m);
   }
 }
 
@@ -3731,6 +3975,12 @@ async function exportContpaqXlsx(id, overrides = {}) {
   }
 
   _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
+  if (poliza.tipo === 'I' && filasOtrosIngresos.length) {
+    const cuentaOtrosIngresos = await AccountPlan.findOne({
+      where: { codigo: CUENTA_OTROS_INGRESOS_CONSOLIDADO }, attributes: ['id', 'codigo', 'nombre'], raw: true,
+    });
+    _inyectarOtrosIngresos(bloques, filasOtrosIngresos, cuentaOtrosIngresos);
+  }
 
   // Retiros de EFECTIVO de caja (/desgloses-salidas/caja) — se restan de
   // "Depósitos consolidados (Efectivo)" y se anotan en el desglose
@@ -3776,7 +4026,29 @@ async function exportContpaqXlsx(id, overrides = {}) {
       if (clave && serie && !serieDeClave.has(clave)) serieDeClave.set(clave, serie);
     }
     if (serieDeClave.size) {
-      const retirosPorCentro = new Map(); // clave → monto (para emparejar con mov.centroCosto)
+      // RETD ("RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA") se resta
+      // SOLO cuando devuelve un "Cobro sin factura" del mismo día (confirmado
+      // con el usuario 2026-09-24, caso real CONSTRUCASA 22-sep: tickets sin
+      // factura C0-260904264 $115.16 y C0-260904353 $16.27, cobrados y
+      // devueltos el mismo día — el reporte de caja los netea en $0 y la
+      // póliza dejaba contado el cobro sin nada que descontara la salida).
+      // En cualquier otro caso el RETD ya está representado: ticket con
+      // factura → su Devolución/Cancelación (CFDI) ya abona Caja en su propio
+      // renglón; saldo a favor retirado → `SF-RETIRO-EFECTIVO`; venta y
+      // cancelación el mismo día → el cobro ni entra al consolidado (restarlo
+      // dejaba de menos, ej. Hidalgo 1-sep póliza 742, $337.99 — el doble
+      // conteo que motivó la exclusión de 2026-09-11). La salida no trae el
+      // ticket, así que se empareja por centro + monto (±$0.01), consumiendo
+      // cada "Cobro sin factura" una sola vez.
+      const cobrosSinFacturaPorCentro = new Map(); // clave → [montos COBRO-SIN-FACTURA]
+      for (const m of movimientos) {
+        if (m.reglaNombre !== 'COBRO-SIN-FACTURA' || !(Number(m.debe) > 0)) continue;
+        const clave = m.centroCostoObj?.clave ?? m.centroCosto ?? null;
+        if (!clave) continue;
+        if (!cobrosSinFacturaPorCentro.has(clave)) cobrosSinFacturaPorCentro.set(clave, []);
+        cobrosSinFacturaPorCentro.get(clave).push(Number(m.debe));
+      }
+      const retirosPorCentro = new Map(); // clave → { monto, montoRetd } (para emparejar con mov.centroCosto)
       for (const [claveCentro, serieAlmacen] of serieDeClave) {
         let salidas = [];
         try {
@@ -3796,23 +4068,45 @@ async function exportContpaqXlsx(id, overrides = {}) {
             return nombre.startsWith('RETIRO') && nombre !== RETIRO_EXCLUIDO_DOBLE_CONTEO;
           })
           .reduce((sum, s) => sum + (Number(s.montoRetirado) || 0), 0);
-        if (retiroEfectivo > 0) retirosPorCentro.set(claveCentro, Math.round(retiroEfectivo * 100) / 100);
+        const cobrosSinFacturaDisponibles = [...(cobrosSinFacturaPorCentro.get(claveCentro) ?? [])];
+        let retiroRetd = 0;
+        for (const s of salidas) {
+          if ((s.tipoMovimiento?.nombre || '').trim().toUpperCase() !== RETIRO_EXCLUIDO_DOBLE_CONTEO) continue;
+          const monto = Number(s.montoRetirado) || 0;
+          if (monto <= 0) continue;
+          const idx = cobrosSinFacturaDisponibles.findIndex(x => Math.abs(x - monto) < 0.015);
+          if (idx === -1) continue; // ya representado por otro lado (ver comentario arriba)
+          cobrosSinFacturaDisponibles.splice(idx, 1);
+          retiroRetd += monto;
+        }
+        const total = Math.round((retiroEfectivo + retiroRetd) * 100) / 100;
+        if (total > 0) retirosPorCentro.set(claveCentro, { monto: total, montoRetd: Math.round(retiroRetd * 100) / 100 });
       }
 
       if (retirosPorCentro.size) {
         for (const bloque of bloques) {
           for (const mov of bloque.movs) {
             if (mov.concepto !== 'Depósitos consolidados (Efectivo)') continue;
-            const retiro = retirosPorCentro.get(mov.centroCosto);
-            if (!retiro) continue;
+            const infoRetiro = retirosPorCentro.get(mov.centroCosto);
+            if (!infoRetiro) continue;
+            const retiro = infoRetiro.monto;
             const netoAjustado = Math.round((Number(mov.debe) - Number(mov.haber || 0) - retiro) * 100) / 100;
             mov.debe  = netoAjustado > 0 ? netoAjustado : 0;
             mov.haber = netoAjustado < 0 ? Math.abs(netoAjustado) : 0;
             if (!Array.isArray(mov._detalle)) mov._detalle = [];
-            mov._detalle.push({
-              cfdiUuid: null, serie: null, monto: -retiro, formaPago: 'EFECTIVO',
-              nota: 'RETIRO DE EFECTIVO (salida de caja)',
-            });
+            const retiroSinRetd = Math.round((retiro - infoRetiro.montoRetd) * 100) / 100;
+            if (retiroSinRetd > 0) {
+              mov._detalle.push({
+                cfdiUuid: null, serie: null, monto: -retiroSinRetd, formaPago: 'EFECTIVO',
+                nota: 'RETIRO DE EFECTIVO (salida de caja)',
+              });
+            }
+            if (infoRetiro.montoRetd > 0) {
+              mov._detalle.push({
+                cfdiUuid: null, serie: null, monto: -infoRetiro.montoRetd, formaPago: 'EFECTIVO',
+                nota: 'RETIRO POR DEVOLUCION Y/O CANCELACION DE VENTA (salida de caja)',
+              });
+            }
           }
         }
       }
@@ -3821,6 +4115,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   _conservarAdDeEgresosOcultos(bloques, movimientos);
   if (poliza.tipo === 'I') await _unificarRenglonesPorDepositoBancario(bloques);
+  if (poliza.tipo === 'I') _ordenarCobrosIngreso(bloques);
 
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
@@ -4114,7 +4409,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           desgloseConsolidado.push({
             cuenta:           m.cuenta?.codigo,
             centroCosto:      m.centroCostoObj?.clave ?? m.centroCosto ?? '',
-            tipo:             m._esAnticipo ? 'Anticipo' : 'Depósito',
+            tipo:             m._tipoDesglose ?? (m._esAnticipo ? 'Anticipo' : 'Depósito'),
             transferencia:    m._esTransferencia ? 'Sí' : 'No',
             formaPago:        d.formaPago || '',
             cfdiSerie:        d.serie || '',
@@ -4167,6 +4462,8 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // Depósitos/Anticipos arriba.
   if (netpayInfo?.porCentro?.size) {
     for (const infoCentro of netpayInfo.porCentro.values()) {
+      // Centro con solo AMEX (sin NetPay normal): no hay asiento de 7 líneas que desglosar.
+      if (!(infoCentro.gross > 0)) continue;
       const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
       for (const d of (infoCentro.detalle ?? [])) {
         const fila = d.fila;
@@ -4185,7 +4482,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           cfdiSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
-          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}`,
+          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
         });
       }
       // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto
@@ -5105,5 +5402,5 @@ module.exports = {
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
   _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
-  _extraerCobrosSucursal, _armarBloqueContado: armarBloqueContado,
+  _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
 };

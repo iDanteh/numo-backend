@@ -331,6 +331,15 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
   // específico necesita factura. `TIPO_MARCADORES` (BON/BCT/DEV/CAC) es el
   // mismo marcador que usa el resto del archivo para este tipo de documento.
   const canceladoResueltoPorVenta = new Map(); // ventaKey -> monto cancelado y ya usado en otro lado
+  // Excepción (2026-09-25, confirmado con el usuario, caso real DEV-057798
+  // UBALDO HERNANDEZ ALONSO $698.09, Promotoría 24-sep): si el saldo se usó
+  // COMPLETO el MISMO día (hora México) en OTRA venta de la MISMA sucursal,
+  // ese par se oculta como SF-OCULTO (`usoMismaSucursalPorVenta`,
+  // cfdi-poliza-generator.service.js) — el dinero real es el cobro ORIGINAL de
+  // esta venta, así que NO se descuenta: sale como "cobro de otra sucursal"
+  // (si se cobró en otra caja). No va a la lista informativa ni a la cola.
+  const ventasSFOcultoMismoDia = new Set(); // ventaKey
+  const _diaMxPend = (iso) => (iso ? new Date(new Date(iso).getTime() - 6 * 3600 * 1000).toISOString().slice(0, 10) : null);
   if (cuentasEscaneadas.length) {
     const paresVenta = [...new Map(
       cuentasEscaneadas
@@ -351,15 +360,65 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
           if (disponible > 0.01) continue; // sigue como SF vivo, no se puede descartar todavía
           const resuelto = Math.abs(Number(gen.monto)) || 0;
           if (resuelto <= 0) continue;
+          const usosGen = gen.usos ?? [];
+          const usoUnicoGen = usosGen.length === 1 ? usosGen[0] : null;
+          if (usoUnicoGen && cuenta.serieVenta && usoUnicoGen.serieVenta === cuenta.serieVenta
+              && _diaMxPend(gen.fecha) && _diaMxPend(gen.fecha) === _diaMxPend(usoUnicoGen.fecha)) {
+            ventasSFOcultoMismoDia.add(ventaKey);
+            continue;
+          }
           canceladoResueltoPorVenta.set(ventaKey, (canceladoResueltoPorVenta.get(ventaKey) ?? 0) + resuelto);
         }
       }
     }
   }
 
+  // Tickets YA facturados en Kore pero cobrados en la caja de OTRA sucursal
+  // (2026-09-25, confirmado con el usuario, caso real D0-260904472 / MAURO
+  // ANTONIO CRUZ PEREZ $2,471.30: Reforma 24-sep, cobrado en CEDIS el 24,
+  // factura D0-260901032 timbrada el 25). El cobro sigue siendo "cobro de
+  // otra sucursal" del día REAL del cobro si su factura NO está en BD o es de
+  // un día POSTERIOR — antes, en cuanto Kore ligaba la factura, el ticket se
+  // descartaba y el dinero no quedaba en ninguna póliza (el día de la factura
+  // su Cargo sale como 'Venta Sin Cobro', oculto del export). Mismo criterio
+  // que `_cobrosSinFacturaPorCentro` (cfdi-poliza-generator.service.js) usa
+  // para la caja propia, pero SOLO para cobros en otra caja (la caja propia
+  // ya la cubre ese mecanismo — incluirla aquí duplicaría). Factura PPD en BD
+  // → sigue excluida (es de Cobranza).
+  const diaFacturaPorKey = new Map(); // `serie|folio` → día más temprano del CFDI tipo I
+  const facturasPPDKeys = new Set();
+  {
+    const keysPorVerificar = new Map();
+    for (const cuenta of cuentasEscaneadas) {
+      if (!(cuenta.serieFactura && cuenta.folioFactura)) continue;
+      const cobradaEnOtraCaja = (cuenta.cobros ?? []).some(cb => cb.claveCentro && cuenta.serieVenta && cb.claveCentro !== cuenta.serieVenta);
+      if (!cobradaEnOtraCaja) continue;
+      keysPorVerificar.set(`${cuenta.serieFactura}|${cuenta.folioFactura}`, { serie: cuenta.serieFactura, folio: String(cuenta.folioFactura) });
+    }
+    if (keysPorVerificar.size) {
+      const cfdisFactura = await CFDI.find({ $or: [...keysPorVerificar.values()] })
+        .select('serie folio fecha metodoPago tipoDeComprobante').lean();
+      for (const c of cfdisFactura) {
+        if (c.tipoDeComprobante && c.tipoDeComprobante !== 'I') continue;
+        const key = `${c.serie}|${c.folio}`;
+        if (c.metodoPago === 'PPD') facturasPPDKeys.add(key);
+        if (!c.fecha) continue;
+        // `fecha` propio del CFDI (hora local guardada como Z) — mismo criterio que `_diaCfdi`.
+        const dia = new Date(c.fecha).toISOString().slice(0, 10);
+        const actual = diaFacturaPorKey.get(key);
+        if (!actual || dia < actual) diaFacturaPorKey.set(key, dia);
+      }
+    }
+  }
+
   const pendientes = [];
   for (const cuenta of cuentasEscaneadas) {
-    if (cuenta.serieFactura && cuenta.folioFactura) continue; // ya tiene factura — no es un pendiente
+    // Ya tiene factura — no es un pendiente, salvo el caso de arriba (cobro en
+    // otra caja con factura posterior o todavía sin sincronizar).
+    const facturaKeyCuenta = (cuenta.serieFactura && cuenta.folioFactura)
+      ? `${cuenta.serieFactura}|${cuenta.folioFactura}` : null;
+    if (facturaKeyCuenta && facturasPPDKeys.has(facturaKeyCuenta)) continue;
+    const diaFacturaCuenta = facturaKeyCuenta ? (diaFacturaPorKey.get(facturaKeyCuenta) ?? null) : null;
     const ventaKey = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
     let cancelResRestante = canceladoResueltoPorVenta.get(ventaKey) ?? 0;
     // Se resta empezando por el cobro MÁS RECIENTE (mismo criterio que
@@ -378,6 +437,22 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
       if (origenPend !== 'APS' && origenPend !== 'MIS' && origenPend !== 'CCE' && !SERIES_CON_AUTH.includes(origenPend)) continue;
       const fechaCobro = cobro.fecha ? new Date(cobro.fecha) : null;
       if (!fechaCobro || fechaCobro < fechaDesde || fechaCobro > fechaHasta) continue;
+      if (facturaKeyCuenta) {
+        // Ticket facturado: solo cuenta el cobro hecho en OTRA caja, y solo si
+        // la factura no está en BD o es de un día posterior al del cobro.
+        if (!cobro.claveCentro || !cuenta.serieVenta || cobro.claveCentro === cuenta.serieVenta) continue;
+        const diaCobroMx = new Date(fechaCobro.getTime() - 6 * 3600 * 1000).toISOString().slice(0, 10);
+        if (diaFacturaCuenta && diaFacturaCuenta <= diaCobroMx) continue;
+        // Factura todavía no en BD: solo si su folio es del MISMO mes que el
+        // cobro (folio 'AAMM…', ej. 260901032 = sep-2026) — recién timbrada,
+        // aún sin sincronizar. Folios de meses/años anteriores (ej. facturas
+        // de dic-2025 pagadas en sep, crédito de Cobranza) quedan fuera, como
+        // antes (verificado 2026-09-25 contra todo septiembre en producción).
+        if (!diaFacturaCuenta) {
+          const aammCobro = diaCobroMx.slice(2, 4) + diaCobroMx.slice(5, 7);
+          if (String(cuenta.folioFactura).slice(0, 4) !== aammCobro) continue;
+        }
+      }
       let monto = Math.abs(Number(cobro.monto) || 0);
       if (cancelResRestante > 0) {
         const reduccion = Math.min(monto, cancelResRestante);
@@ -400,6 +475,12 @@ async function _detectarPendientesPorFacturar({ rfc, foliosDelDiaNumericos, seri
         // no tienen documentoRelacionado que permita resolverlo) — mismo
         // fallback que usa `nombreCliente` arriba para cuentas normales.
         nombreCliente: 'CLIENTE NO IDENTIFICADO',
+        // Ya facturado en Kore (factura posterior o aún sin sincronizar, ver
+        // arriba): genera su "cobro de otra sucursal" pero NO va a la lista
+        // informativa de "Pendientes por facturar".
+        ...(facturaKeyCuenta ? { facturaPosterior: facturaKeyCuenta.replace('|', '-') } : {}),
+        // Ver `ventasSFOcultoMismoDia` arriba — mismo trato que `facturaPosterior`.
+        ...(ventasSFOcultoMismoDia.has(ventaKey) ? { sfOcultoMismoDia: true } : {}),
       });
     }
   }
@@ -744,8 +825,13 @@ async function construirMovimientosPuente({
       // esta caja) -- para un ticket SIN factura, esta consulta es la única
       // fuente que los ve sin depender de que la sucursal cobradora genere
       // primero (el escaneo de folios cercanos solo alcanza tickets recientes).
+      // También las YA facturadas en Kore (2026-09-25): si su factura no está
+      // en BD o es de un día posterior al cobro, siguen siendo "cobro de otra
+      // sucursal" del día del cobro — `_detectarPendientesPorFacturar` decide
+      // (caso real D0-260904472, Reforma 24-sep, cobrado en CEDIS, facturado
+      // el 25 en D0-260901032: al regenerar después de timbrar desaparecía).
       cuentasSinFacturaOtraCaja = cuentasDirecto
-        .filter(c => !c.serieFactura && c.serieVenta === centroPropioClave)
+        .filter(c => c.serieVenta === centroPropioClave)
         .map(c => ({ ...c, cobros: (c.cobros ?? []).filter(cobro => cobro.claveCentro && cobro.claveCentro !== centroPropioClave) }))
         .filter(c => c.cobros.length);
       for (const c of cuentasDirecto) {
@@ -1579,6 +1665,9 @@ async function construirMovimientosPuente({
         // otra sucursal -" (ver `_extraerCobrosSucursal`, poliza.service.js:
         // no es un cruce real, sería una etiqueta falsa).
         if (String(centroVendedor.id) !== String(centroCostoId) || !p.folioOrigen) continue;
+        // Nunca debería llegar aquí (solo se aceptan cobros en OTRA caja), pero
+        // la caja propia ya la cubre `_cobrosSinFacturaPorCentro` — no duplicar.
+        if (p.facturaPosterior || p.sfOcultoMismoDia) continue;
 
         // Limpieza defensiva: si este folio había quedado mal encolado como
         // cruzado en una corrida anterior (antes de este fix, o por un dato
@@ -1681,7 +1770,11 @@ async function construirMovimientosPuente({
         // solo cuando hay cruce) para que la cola se limpie sola si deja de
         // serlo (ver `_sincronizarCobroSucursalPendiente`).
         const esCruzadoHuerfano = String(centroCobrador.id) !== String(centroVendedor.id);
-        if (p.folioOrigen) {
+        // Ya facturado en Kore (`facturaPosterior`): la cobradora lo registra
+        // por su cuenta (`cobrosCobradoraDirecta`, cfdi-poliza-generator) —
+        // NO se toca la cola, para que su póliza quede exactamente igual que
+        // antes (2026-09-25). Solo se agrega arriba el lado vendedor.
+        if (p.folioOrigen && !p.facturaPosterior && !p.sfOcultoMismoDia) {
           const totalFormasPagoTicket = formasPagoTicket.reduce((s, fp) => s + (Number(fp.monto) || 0), 0);
           let acumuladoTicket = 0;
           const lineasCobrador = [];
@@ -1723,7 +1816,7 @@ async function construirMovimientosPuente({
     }
   }
 
-  const pendientesPorFacturar = pendientesDetectados.map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
+  const pendientesPorFacturar = pendientesDetectados.filter(p => !p.facturaPosterior && !p.sfOcultoMismoDia).map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
 
   // Cola de cobros cruzados encolados por OTRA sucursal (cuando ESTA fue la
   // vendedora) — ver nota de arquitectura en el encabezado del archivo. Se

@@ -861,6 +861,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // Cada origen NO ocultable (periodo anterior) por separado, con su propia
   // referencia (serieOrigen-folioOrigen) — ver comentario en `emitirLineaSF`.
   const detalleSFVisible = context.saldoFavorUsadoPropio?.detalleVisible ?? [];
+  // Oculto por origen (2026-09-24) — ver `detalleOculto` en cfdi-poliza-generator.service.js.
+  const detalleSFOculto  = context.saldoFavorUsadoPropio?.detalleOculto ?? [];
   const montoPuntosUsado = Number(context.montoPuntosUsado) || 0;
   // Monto REAL de anticipo aplicado (ver `_prefetchAjustesFacturaPropia`,
   // `context.montoAnticipoUsado`) — mismo dato que usa el cierre OPA en
@@ -1049,7 +1051,24 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
         movs.push({ ...baseSF, ...overrides, reglaNombre, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva });
         restante = parseFloat((restante - monto).toFixed(2));
       };
-      emitirLineaSF(montoSFOculto, 'SF-OCULTO');
+      // Oculto: una línea POR ORIGEN con "cliente de la venta que generó el
+      // saldo / esa venta" (confirmado con el usuario 2026-09-24, caso real
+      // Puerto Escondido 23-sep: la Global O0-260900693 juntaba en una sola
+      // línea el SF de CAYETANO GARCIA SANTIAGO con el de otros clientes, bajo
+      // el cliente/folio de la factura consumidora). Sin detalle (dato viejo)
+      // cae a la línea única de antes.
+      if (detalleSFOculto.length > 0) {
+        for (const d of detalleSFOculto) {
+          const referenciaOrigen = [d.ventaSerie, d.ventaFolio].filter(Boolean).join('-')
+            || [d.serieOrigen, d.folioOrigen].filter(Boolean).join('-') || null;
+          emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF-OCULTO', {
+            serie: referenciaOrigen,
+            concepto: [d.nombreClienteOrigen ?? nombreCliente, referenciaOrigen].filter(Boolean).join(' / '),
+          });
+        }
+      } else {
+        emitirLineaSF(montoSFOculto, 'SF-OCULTO');
+      }
       // Visible (de periodo anterior): una línea POR ORIGEN, con su propia
       // referencia (serieOrigen-folioOrigen, ej. "DEV-055991") en vez de
       // combinar todo bajo el concepto del CFDI actual — sin esto, dos
@@ -1080,7 +1099,8 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
             : '';
           emitirLineaSF(Math.abs(Number(d.monto) || 0), 'SF', {
             serie: referenciaVenta,
-            concepto: [nombreCliente, referenciaVenta].filter(Boolean).join(' / ') + notaSobrante,
+            // Cliente de la venta que GENERÓ el saldo (2026-09-24), no el consumidor.
+            concepto: [d.nombreClienteOrigen ?? nombreCliente, referenciaVenta].filter(Boolean).join(' / ') + notaSobrante,
           });
         }
       } else {

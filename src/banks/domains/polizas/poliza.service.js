@@ -1809,10 +1809,14 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // va al bloque de cobros; el subtotal (Depósitos No Identificados) lleva en
     // columna C la autorización real del depósito si Bancos la tiene, y el
     // IVA siempre "NI" (2026-09-29, ejemplo real del usuario "9 (4).xls").
+    // Formato "AUT. <numeroAutorizacion>" del banco, no el folio de Numo
+    // (2026-09-30, ERIK WILVER: ejemplo "AUT. 3547888", Numo ponía "032147");
+    // sin autorización cae al folio de Numo.
     if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
       const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
+      const referenciaNI = bancario?.numeroAutorizacion ? `AUT. ${bancario.numeroAutorizacion}` : bancario?.referencia;
       return {
-        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && bancario?.referencia) || REGLA_COBRANZA_NO_IDENTIFICADO,
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && referenciaNI) || REGLA_COBRANZA_NO_IDENTIFICADO,
         concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,

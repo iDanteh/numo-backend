@@ -192,7 +192,12 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
   let query = { ...req.query };
   const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
   if (!hasFullAccess && !query.movId) {
-    const scope = getMovementScope(req.user.role);
+    // banks:cobranza:identificados:all (2026-09-30, permiso nuevo, separado de
+    // banks:cobranza:all a propósito): sube el scope de identificado a ALL por persona, sin
+    // pasar por banks:config completo ni por movementScope del rol (que sigue fijo en rbac.js
+    // para retrocompatibilidad de roles que no reciban este permiso).
+    const hasIdentificadosAll = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL, req.user.extraPermissions);
+    const scope = hasIdentificadosAll ? MOVEMENT_SCOPE.ALL : getMovementScope(req.user.role);
     const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id, { scope });
     if (empty) {
       return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });

@@ -51,6 +51,10 @@ const PERM_META = {
   'banks:transferencias-caja': { label: 'Transferencias entre cajas (matching de depósitos)', module: 'Bancos' },
   'banks:netpay':        { label: 'Consultar transacciones Netpay',      module: 'Bancos' },
   'banks:cobranza:all':  { label: 'Ver métricas de todo el equipo (dashboard Cobranza)', module: 'Bancos' },
+  // Separado a propósito de banks:cobranza:all (2026-09-30, pedido explícito del usuario:
+  // "todo debe estar descentralizado") — ese controla el dashboard de indicadores, este la
+  // tabla de movimientos. Alguien puede tener uno sin el otro.
+  'banks:cobranza:identificados:all': { label: 'Ver todos los movimientos identificados (tabla de Bancos)', module: 'Bancos' },
   'account-plan:read':  { label: 'Ver catálogo contable',           module: 'Contabilidad' },
   'account-plan:write': { label: 'Editar catálogo contable',        module: 'Contabilidad' },
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },

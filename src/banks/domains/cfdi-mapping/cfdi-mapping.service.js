@@ -272,7 +272,12 @@ function _detectTasaIva(cfdi) {
         const base16  = Number(totales.totalTrasladosBaseIVA16 || 0);
         const monto   = Number(totales.montoTotalPagos || 0);
         const monto16 = base16 + iva16 + Number(totales.totalTrasladosImpuestoIVA8 || 0);
-        if (monto > monto16 + 0.01) return 'mixto';
+        // Comparar en centavos enteros: con flotantes 275.53 + 0.01 da
+        // 275.5399… y un Pago 100% 16% cuyo IVA el SAT redondeó 1 centavo
+        // abajo (base 237.53 + IVA 38.00 vs pagado 275.54, MINI ABASTOS
+        // B0-260701190, 2026-09-30) caía como 'mixto' y perdía el split por
+        // factura y el depósito real de Bancos.
+        if (Math.round(monto * 100) - Math.round(monto16 * 100) > 1) return 'mixto';
         return '16';
       }
       const montoTotal = Number(totales.montoTotalPagos || 0);

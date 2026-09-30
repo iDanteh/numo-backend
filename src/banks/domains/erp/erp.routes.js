@@ -56,6 +56,9 @@ const {
   consultarFolioKore, consultarFoliosPendientes,
 }                                          = require('./netpay-reporte.service');
 const { generarExcelReporteNetpay }       = require('./netpay-reporte-export.service');
+const {
+  consultarFoliosPendientesDeBandeja, generarExcelBandejaNetpay,
+}                                          = require('./netpay-match-export.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
 // cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
 // se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
@@ -460,8 +463,53 @@ router.get('/netpay/bandeja', authenticate, permit(PERMISSIONS.BANKS_NETPAY), as
   if (terminalID) filtro.terminalID = terminalID;
   if (estatus)    filtro.estatusMatch = estatus;
 
-  const buckets = await NetpayMatch.find(filtro).sort({ dia: -1 }).lean();
+  // Punto (c) de las mejoras a Netpay-matching-v2 (pedido explícito del usuario,
+  // 2026-09-30): poblar los movimientos vinculados para mostrar su detalle real en la
+  // tabla (antes solo se mostraba un conteo) — mismo shape reducido que ya usa
+  // NetpayCandidatoMovimiento en el diálogo de Resolver, para no traer el documento
+  // completo de BankMovement.
+  const buckets = await NetpayMatch.find(filtro)
+    .populate('movementIdsConfirmados', 'banco fecha concepto deposito numeroAutorizacion')
+    .sort({ dia: -1 }).lean();
   res.json({ buckets });
+}));
+
+// GET /api/erp/netpay/bandeja/export — pedido explícito del usuario (2026-09-30): export a
+// Excel de la bandeja de matching, respetando los MISMOS filtros que GET /netpay/bandeja,
+// y enriqueciendo los folios con datos de Kore igual que ya lo hace GET
+// /netpay/reporte/:id/export (ver netpay-match-export.service.js). Timeout extendido por el
+// mismo motivo que ese export: la consulta a Kore puede tardar. A diferencia de ese, acá
+// consultarFoliosPendientesDeBandeja puede rechazar el request ANTES de tocar Kore si hay
+// demasiados folios pendientes en el rango filtrado (ver MAX_FOLIOS_PENDIENTES_EXPORT) — el
+// usuario eligió explícitamente "que avise en vez de arriesgarse a colgar".
+router.get('/netpay/bandeja/export', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
+  const { dateFrom, dateTo, terminalID, estatus } = req.query;
+  const filtro = {};
+  if (dateFrom) filtro.dia = { ...(filtro.dia ?? {}), $gte: new Date(`${dateFrom}T00:00:00.000Z`) };
+  if (dateTo)   filtro.dia = { ...(filtro.dia ?? {}), $lte: new Date(`${dateTo}T00:00:00.000Z`) };
+  if (terminalID) filtro.terminalID = terminalID;
+  if (estatus)    filtro.estatusMatch = estatus;
+
+  const { fallos, omitidosPorTiempo } = await consultarFoliosPendientesDeBandeja(filtro);
+  const buckets = await NetpayMatch.find(filtro).populate('movementIdsConfirmados').sort({ dia: -1 }).lean();
+  const buffer = await generarExcelBandejaNetpay(buckets);
+
+  // Fallos reales de Kore + folios que ni se intentaron por el corte de presupuesto de
+  // tiempo (ver PRESUPUESTO_TIEMPO_MS) — el Excel se genera igual con lo que sí se pudo
+  // resolver, pero el frontend necesita saber que algo quedó incompleto para avisar (no hay
+  // otro lugar donde llevar esta metadata en una respuesta binaria). Mismo mecanismo que
+  // X-Traspasos-Run-Id en bank.routes.js.
+  const incompletos = fallos.length + omitidosPorTiempo.length;
+
+  const hoy = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="netpay-bandeja-${hoy}.xlsx"`);
+  res.setHeader('X-Netpay-Export-Incompleto', String(incompletos));
+  res.setHeader('Access-Control-Expose-Headers', 'X-Netpay-Export-Incompleto');
+  res.send(buffer);
 }));
 
 // POST /api/erp/netpay/bandeja/evaluar — netpay-matching-v2 (design.md API table: New;

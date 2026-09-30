@@ -77,6 +77,15 @@ const netpayMatchSchema = new mongoose.Schema({
         marca:      { type: String, default: null },
         monto:      { type: Number, default: null },
         comision:   { type: Number, default: null },
+
+        // Cache de la consulta puntual a Kore por folio (withAccountInfo=true) — mismo
+        // shape EXACTO que NetpayReporte.model.js#folios[].koreCache, para el export de la
+        // bandeja (netpay-match-export.service.js). Puramente informativo, NUNCA aplica
+        // cobro ni decide matching.
+        koreCache: {
+          consultadoEn: { type: Date, default: null },
+          cuenta:       { type: mongoose.Schema.Types.Mixed, default: null },
+        },
       }],
       reporteIdOrigen:      { type: mongoose.Schema.Types.ObjectId, ref: 'NetpayReporte', default: null },
       claveRastreoOrigen:   { type: String, default: null },

@@ -164,4 +164,7 @@ async function generarExcelReporteNetpay(reporte) {
   return workbook.xlsx.writeBuffer();
 }
 
-module.exports = { generarExcelReporteNetpay };
+// STATUS_LABELS/_formatFecha/_koreCacheColumnas también los usa
+// netpay-match-export.service.js (export de la bandeja de matching) — mismo enum/shape de
+// koreCache, no vale la pena duplicarlos.
+module.exports = { generarExcelReporteNetpay, STATUS_LABELS, _formatFecha, _koreCacheColumnas };

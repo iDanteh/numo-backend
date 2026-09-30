@@ -485,6 +485,19 @@ function _buscarCombinacionQueSuma(indices, disponibles, monto) {
 
 const _esTransaccionAmex = t => (t.cardTypeName ?? '').trim().toUpperCase() === 'AMEX';
 
+// `commission` de NetPay YA incluye el IVA (ej. $133.26 = $114.88 + $18.38 en
+// una venta de $7,225.26). Se desglosa por transacción igual que el reporte
+// "Detalle de Depósitos" de NetPay: comisión = commission/1.16 truncada a 2
+// decimales, IVA = 16% de esa comisión redondeado (2026-09-30, Construcasa
+// 29-sep: cuadra exacto $1,691.57 + $270.71 = neto $99,184.84; antes se le
+// sumaba OTRO 16% y el neto salía $314.15 abajo).
+function _desglosarComisionNetpay(commission) {
+  const total = Number(commission) || 0;
+  const base = Math.floor(total / 1.16 * 100 + 1e-6) / 100;
+  const iva  = Math.round(base * 0.16 * 100 + 1e-9) / 100;
+  return { base, iva };
+}
+
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
@@ -653,7 +666,8 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // (`disponibles`/`filasPorTicket` compartidos: una línea ligada por NetPay
     // ya no la toma AMEX). `esAmex`: solo junta el monto, sin comisión.
     const ligar = (transacciones, esAmex) => {
-      let gross = 0, comision = 0;
+      let gross = 0, comision = 0, ivaComision = 0;
+      const sumarComision = (c) => { const { base, iva } = _desglosarComisionNetpay(c); comision += base; ivaComision += iva; };
       const detalle = [];
       const pendientesPorMonto = [];
       for (const t of transacciones) {
@@ -675,12 +689,12 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           // Segunda pasada de un ticket ya ligado: su monto ya está en la línea.
           // AMEX no lleva comisión, así que no hay nada que sumar.
           if (esAmex) continue;
-          comision += comisionTransaccion;
+          sumarComision(comisionTransaccion);
           detalle.push({ fila: { concepto: ticketsEnPoliza.join(', '), serie: ticketsEnPoliza[0] }, terminalID: t.terminalID, monto: 0,
             comision: comisionTransaccion, nota: `pasada adicional (${t.folio}, $${monto.toFixed(2)}) de ticket ya ligado` });
           continue;
         }
-        comision += comisionTransaccion;
+        sumarComision(comisionTransaccion);
         const suma = filasTx.reduce((acc, f) => acc + Number(f.debe), 0);
         gross += suma;
         const diferencia = Math.round((suma - monto) * 100) / 100;
@@ -703,7 +717,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         const fila = disponibles.splice(idx, 1)[0];
         matchedIds.add(fila.id);
         gross += Number(fila.debe);
-        comision += comisionTransaccion;
+        sumarComision(comisionTransaccion);
         detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
       }
       for (const t of sinMatchExacto) {
@@ -734,7 +748,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         const filasCombinadas = [...combinacion].sort((a, b) => b - a).map(i => disponibles.splice(i, 1)[0]);
         const sumaCombinada = filasCombinadas.reduce((s, f) => s + Number(f.debe), 0);
         gross += sumaCombinada;
-        comision += comisionTransaccion;
+        sumarComision(comisionTransaccion);
         for (const fila of filasCombinadas) {
           matchedIds.add(fila.id);
           // Comisión repartida proporcional al monto de cada ticket, solo para
@@ -745,7 +759,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila });
         }
       }
-      return { gross, comision, detalle };
+      return { gross, comision, ivaComision, detalle };
     };
     const netpay = ligar(transaccionesValidas, false);
     const amex   = ligar(transaccionesAmex, true);
@@ -753,6 +767,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
       porCentro.set(centroCostoObj.id, {
         gross: Math.round(netpay.gross * 100) / 100,
         comision: Math.round(netpay.comision * 100) / 100,
+        ivaComision: Math.round(netpay.ivaComision * 100) / 100,
         centroCostoObj,
         detalle: netpay.detalle,
         grossAmex: Math.round(amex.gross * 100) / 100,
@@ -766,8 +781,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
 // Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
 // un día/centro (ver `construirNetpayInfo`) — confirmada con el usuario
 // 2026-09-14. `gross`/`comision` ya vienen redondeados a centavos.
-function _lineasNetpay({ gross, comision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
-  const ivaComision   = Math.round(comision * 0.16 * 100) / 100;
+function _lineasNetpay({ gross, comision, ivaComision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
   const totalFactura  = Math.round((comision + ivaComision) * 100) / 100;
   const neto          = Math.round((gross - totalFactura) * 100) / 100;
   const centroCosto   = centroCostoObj.clave;
@@ -4496,13 +4510,13 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           cfdiSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
-          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
+          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión + IVA de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
         });
       }
       // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto
       // real descuenta la comisión Y su IVA, no solo la comisión) para poder
       // cuadrar rápido contra el asiento contable de la póliza.
-      const ivaComisionCentro  = Math.round(infoCentro.comision * 0.16 * 100) / 100;
+      const ivaComisionCentro  = infoCentro.ivaComision;
       const totalFacturaCentro = Math.round((infoCentro.comision + ivaComisionCentro) * 100) / 100;
       const netoCentro         = Math.round((infoCentro.gross - totalFacturaCentro) * 100) / 100;
       desgloseConsolidado.push({

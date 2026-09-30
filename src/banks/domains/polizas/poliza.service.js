@@ -1837,6 +1837,12 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       };
     }
     const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
+    // Columna C en Cobranza: "AUT.<numeroAutorizacion>" del banco, como el
+    // ejemplo real "9 (4).xls" (2026-09-30: CARLOS HERRERA 034139 →
+    // AUT.132916686); sin autorización, el folio de Numo. La fusión de abajo
+    // sigue agrupando por `_referenciaBancoReal` (folio), no por este texto.
+    const serieBancoReal = referenciaBancoReal && bancario?.numeroAutorizacion
+      ? `AUT.${bancario.numeroAutorizacion}` : referenciaBancoReal;
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
@@ -1853,7 +1859,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       // evitando que el bucket de Efectivo (más abajo) las agrupara.
       cuenta:         esTransferenciaVerificada ? (bancario?.cuentaBanco ?? m.cuenta) : m.cuenta,
       cuentaId:       m.cuentaId,
-      serie:          referenciaBancoReal ?? m.serie,
+      serie:          serieBancoReal ?? m.serie,
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
       centroCosto:    m.centroCosto,
       centroCostoObj: m.centroCostoObj,

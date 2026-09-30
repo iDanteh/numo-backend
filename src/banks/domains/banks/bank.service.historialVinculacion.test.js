@@ -59,15 +59,22 @@ describe('updateErpIds() — desvincular manual, 1 CxC', () => {
     expect(entry.userNombre).toBe('Ana');
     expect(entry.snapshot).toEqual(linkOriginal);
     expect(updated.historialVinculacion).toBe(mov.historialVinculacion);
+    // vinculoRemovido — contrato del que depende netpay-panel.component.ts#revertir()
+    // para distinguir un revert real de un no-op silencioso (ver review-reliability,
+    // hallazgo CRÍTICO original: "revert silencioso sin efecto").
+    expect(updated.vinculoRemovido).toBe(true);
   });
 
   test('CxC ya NO estaba vinculada (reintento): no se registra nada — no hay ninguna acción real', async () => {
     const mov = fakeMov({ erpIds: [], erpLinks: [] });
     BankMovement.findById.mockResolvedValue(mov);
 
-    await bankService.updateErpIds('mov-1', 'remove', 'CXC-1', { _id: 'user-1', nombre: 'Ana' });
+    const updated = await bankService.updateErpIds('mov-1', 'remove', 'CXC-1', { _id: 'user-1', nombre: 'Ana' });
 
     expect(mov.historialVinculacion).toHaveLength(0);
+    // vinculoRemovido:false es la señal que usa netpay-panel.component.ts#revertir()
+    // para avisar en vez de creer que revirtió algo que no existía.
+    expect(updated.vinculoRemovido).toBe(false);
   });
 
   test('entradas previas del historial se conservan (append, nunca se pisan)', async () => {

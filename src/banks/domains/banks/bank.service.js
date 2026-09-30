@@ -1926,6 +1926,12 @@ async function updateErpIds(id, action, erpId, user) {
     _id: mov._id, banco: mov.banco, erpIds: mov.erpIds, erpLinks: mov.erpLinks,
     historialVinculacion: mov.historialVinculacion,
     saldoErp: mov.saldoErp, uuidXML: mov.uuidXML, status: mov.status, identificadoPor: mov.identificadoPor,
+    // Punto (b) de las mejoras a Netpay-matching-v2 (pedido explícito del usuario,
+    // 2026-09-30): aditivo, no rompe a consumidores existentes (netpay-reporte-panel) que
+    // ignoran este campo — permite distinguir "se quitó un vínculo real" de "reintento sobre
+    // algo ya desvinculado" (ver comentario 2026-09-01 arriba, linkRemovido undefined) para
+    // que el frontend no crea haber revertido algo cuando en realidad no había nada que quitar.
+    vinculoRemovido: Boolean(linkRemovido),
   };
   emitToBanco(mov.banco, 'bank:movement:updated', updated);
 

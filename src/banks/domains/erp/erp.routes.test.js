@@ -1479,7 +1479,11 @@ describe('GET /netpay/bandeja', () => {
     jest.clearAllMocks();
     app = express();
     app.use(router);
-    NetpayMatch.find = jest.fn(() => ({ sort: jest.fn(() => ({ lean: jest.fn().mockResolvedValue([]) })) }));
+    // Cadena real del handler: .populate().sort().lean() (ver erp.routes.js, punto (c) de
+    // las mejoras a Netpay-matching-v2) — el mock debe encadenar los 3 métodos en ese orden.
+    NetpayMatch.find = jest.fn(() => ({
+      populate: jest.fn(() => ({ sort: jest.fn(() => ({ lean: jest.fn().mockResolvedValue([]) })) })),
+    }));
   });
 
   test('responde 403 sin banks:netpay', async () => {
@@ -1491,7 +1495,9 @@ describe('GET /netpay/bandeja', () => {
 
   test('sin filtros: lista todos los buckets persistidos, NUNCA llama a Kore', async () => {
     const bucket = { _id: 'nm-1', terminalID: 'T1', estatusMatch: 'discrepancia' };
-    NetpayMatch.find = jest.fn(() => ({ sort: jest.fn(() => ({ lean: jest.fn().mockResolvedValue([bucket]) })) }));
+    NetpayMatch.find = jest.fn(() => ({
+      populate: jest.fn(() => ({ sort: jest.fn(() => ({ lean: jest.fn().mockResolvedValue([bucket]) })) })),
+    }));
 
     const res = await request(app)
       .get('/netpay/bandeja')

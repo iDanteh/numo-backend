@@ -50,6 +50,14 @@ const PERMISSIONS = Object.freeze({
   // — el usuario lo asigna por persona vía extraPermissions (pantalla Usuarios).
   BANKS_COBRANZA_ALL:  'banks:cobranza:all',
 
+  // Ver TODOS los movimientos con status 'identificado' en la tabla de Bancos (scope ALL en
+  // vez de OWN), sin tocar 'otros' (sigue bloqueado salvo banks:config) ni desbloquear el
+  // resto de banks:config. Deliberadamente SEPARADO de BANKS_COBRANZA_ALL (decisión explícita
+  // del usuario, 2026-09-30: "todo debe estar descentralizado") — alguien puede tener uno sin
+  // el otro. Permiso nuevo, sin asignar a ningún rol todavía — se asigna por persona vía
+  // extraPermissions (pantalla Usuarios), mismo mecanismo que BANKS_COBRANZA_ALL.
+  BANKS_COBRANZA_IDENTIFICADOS_ALL: 'banks:cobranza:identificados:all',
+
   // Catálogo de cuentas contables
   ACCOUNT_PLAN_READ:   'account-plan:read',
   ACCOUNT_PLAN_WRITE:  'account-plan:write',

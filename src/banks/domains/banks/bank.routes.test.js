@@ -449,6 +449,71 @@ describe('GET /cards', () => {
   });
 });
 
+// GET /movements (2026-09-30, permiso nuevo banks:cobranza:identificados:all) — primer test
+// de esta ruta (no existía ninguno). Cobertura acotada al scope de 'identificado'/'otros', que
+// es lo que cambia con el permiso nuevo — no repite cobertura de otros query params, eso ya lo
+// cubre bank.service.test.js sobre listMovements() directo.
+describe('GET /movements', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config ni permiso nuevo por defecto
+    service.listMovements = jest.fn().mockResolvedValue({ data: [], pagination: { total: 0, page: 1, limit: 50, pages: 0 } });
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('con banks:config: no aplica restricciones, pasa el query tal cual (incluido status=otros)', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
+    await request(app)
+      .get('/movements')
+      .query({ status: 'otros' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('otros');
+    expect(args.identificadoPorUsuario).toBeUndefined();
+  });
+
+  test('sin banks:config ni el permiso nuevo: status=identificado fuerza identificadoPorUsuario al propio usuario', async () => {
+    await request(app)
+      .get('/movements')
+      .query({ status: 'identificado' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('identificado');
+    expect(args.identificadoPorUsuario).toBe('user-test');
+  });
+
+  // El permiso nuevo es el punto central de esta cobertura: separado de BANKS_COBRANZA_ALL
+  // (decisión explícita del usuario, "todo debe estar descentralizado") — mockImplementation
+  // distingue por permiso para probar que SOLO este habilita el scope ALL acá.
+  test('sin banks:config pero con banks:cobranza:identificados:all: status=identificado NO fuerza identificadoPorUsuario (ve todos)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL);
+
+    await request(app)
+      .get('/movements')
+      .query({ status: 'identificado' });
+
+    expect(rbacStore.hasPermission).toHaveBeenCalledWith('test-role', PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL, []);
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.identificadoPorUsuario).toBeUndefined();
+  });
+
+  test('con banks:cobranza:identificados:all pero status=otros: sigue vacío (el permiso nuevo NO desbloquea otros)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL);
+
+    const res = await request(app)
+      .get('/movements')
+      .query({ status: 'otros' });
+
+    expect(res.body).toEqual({ data: [], pagination: { total: 0, page: 1, limit: 50, pages: 0 } });
+    expect(service.listMovements).not.toHaveBeenCalled();
+  });
+});
+
 // POST /movements/:id/ficha/imagen (2026-09-03) — adjunta la foto/documento de respaldo de una
 // ficha ya registrada. `service.adjuntarImagenFicha` se mockea directo sobre el módulo real de
 // bank.service.js (no hay jest.mock('./bank.service') a nivel de archivo, mismo criterio que el

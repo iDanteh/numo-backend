@@ -239,6 +239,28 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
     return formasPago;
   };
 
+  // Un ticket liquidado por 2+ complementos el mismo día (2026-10-01, GERARDO
+  // SEUL VEGA ORTEGA, Cobranza 29-sep: factura A0-260917036 pagada con
+  // A0-260917747 $478.83 y A0-260917748 $186.44): cada complemento tomaba
+  // TODOS los cobros del día del ticket y el Cargo a banco salía doble
+  // ($1,330.54 en vez de $665.27). Ahora cada complemento toma solo los
+  // cobros que suman lo que él paga, y un cobro ya tomado no lo repite otro.
+  const cobrosYaAsignados = new Set();
+  const montoCobro = (cobro, fechaPago) => extraerFormasPagoDelDia([cobro], fechaPago).reduce((s, fp) => s + fp.monto, 0);
+  const elegirCobrosDelPago = (cobros, objetivo, fechaPago) => {
+    const conMonto = cobros.map(c => ({ c, monto: montoCobro(c, fechaPago) })).filter(x => x.monto > 0);
+    const total = conMonto.reduce((s, x) => s + x.monto, 0);
+    // Solo los cobros del día (monto > 0) cuentan como tomados por este Pago.
+    if (Math.abs(total - objetivo) < 0.02) return { cobros: conMonto.map(x => x.c), exacto: true };
+    if (conMonto.length <= 1 || conMonto.length > 10) return { cobros, exacto: false };
+    for (let mask = 1; mask < (1 << conMonto.length); mask++) {
+      let suma = 0;
+      for (let i = 0; i < conMonto.length; i++) if (mask & (1 << i)) suma += conMonto[i].monto;
+      if (Math.abs(suma - objetivo) < 0.02) return { cobros: conMonto.filter((_, i) => mask & (1 << i)).map(x => x.c), exacto: true };
+    }
+    return { cobros, exacto: false }; // ninguna combinación explica el monto: comportamiento previo
+  };
+
   for (const [uuid, doctos] of doctosPorUuid.entries()) {
     const fechaPago = fechaPagoPorUuid.get(uuid);
     const diaPago = _diaMx(fechaPago);
@@ -264,7 +286,11 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         d.montoSF = Math.round(sf * 100) / 100;
         d.sfOrigenes = [...porOrigen.entries()].map(([origen, monto]) => ({ origen, monto: Math.round(monto * 100) / 100 }));
       }
-      d.desglosePagoReal = extraerFormasPagoDelDia(ventas.flatMap(k => cobrosCrudosPorFactura.get(k) ?? []), fechaPago);
+      const cobrosDisponibles = ventas.flatMap(k => cobrosCrudosPorFactura.get(k) ?? []).filter(c => !cobrosYaAsignados.has(c));
+      const objetivo = Math.round((d.monto - (d.montoSF || 0)) * 100) / 100;
+      const { cobros: cobrosDelPago, exacto } = elegirCobrosDelPago(cobrosDisponibles, objetivo, fechaPago);
+      if (exacto) cobrosDelPago.forEach(c => cobrosYaAsignados.add(c));
+      d.desglosePagoReal = extraerFormasPagoDelDia(cobrosDelPago, fechaPago);
     }
   }
 

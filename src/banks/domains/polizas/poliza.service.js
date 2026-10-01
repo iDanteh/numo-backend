@@ -3804,8 +3804,16 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // CEDIS es la única sucursal donde, además de Contado/Crédito, se piden
   // Bonificaciones y Descuentos/Devoluciones/Cancelaciones como pólizas propias
   // (ver rama `esCedis` más abajo) — el resto de sucursales sigue igual.
-  const esCedis = movimientos.length > 0 &&
-    movimientos.every(m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS');
+  // Basta con que la MAYORÍA de renglones sea de CEDIS (2026-10-01, póliza
+  // 1058 CEDIS 2-sep): un solo renglón con centro de otra sucursal
+  // (C0-260900073 "factura cancelada, cobro real", centro CONSTRUCASA) hacía
+  // que los 11,710 renglones salieran en un solo archivo, sin separar
+  // Bonificaciones ni Descuentos y Devoluciones. Solo Ingreso: Cobranza y el
+  // resto conservan la regla de "todos los renglones".
+  const esMovCedis = m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS';
+  const esCedis = movimientos.length > 0 && (poliza.tipo === 'I'
+    ? movimientos.filter(esMovCedis).length * 2 > movimientos.length
+    : movimientos.every(esMovCedis));
 
   const sinCuenta = movimientos.filter(m => m.cuentaFaltante || m.cuentaId == null);
   if (sinCuenta.length > 0) {

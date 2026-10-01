@@ -137,10 +137,120 @@ async function _registrarFoliosIdempotente(reporte) {
   await reporte.save();
 }
 
-// cargarReporte — parsea el Excel, valida que el depósito (claveRastreo) no esté cargado
-// todavía, registra sus folios (idempotencia) y llama evaluarReporte() para decidir su
-// estatus automáticamente en el mismo paso. Ya NO deja el reporte en 'pendiente' — ese
-// valor no existe en el enum v2 (ver NetpayReporte.model.js#estatus).
+// _poblarMovimientoVinculado — feature "navegación al movimiento bancario" (2026-10-01,
+// pedido explícito del usuario): agrega un resumen liviano (banco/fecha/monto) del
+// BankMovement vinculado a CUALQUIER reporte que se devuelva al frontend, para que el
+// detalle lo muestre sin tener que navegar a Bancos primero y habilite el botón "Ver
+// movimiento bancario" (banco/movId ya alcanzan para el deep-link existente de Bancos,
+// ver banks.component.ts#openBank). null si no hay movementIdConfirmado, o si el
+// movimiento referenciado ya no existe (NUNCA lanza — es informativo, no debe romper el
+// detalle de un reporte por esto).
+async function _poblarMovimientoVinculado(reporte) {
+  if (!reporte) return reporte;
+  if (!reporte.movementIdConfirmado) return { ...reporte, movimientoVinculado: null };
+  const mov = await BankMovement.findById(reporte.movementIdConfirmado).lean();
+  return {
+    ...reporte,
+    movimientoVinculado: mov ? { banco: mov.banco, fecha: mov.fecha, monto: mov.deposito } : null,
+  };
+}
+
+// _derivarSucursales — netpay-reporte-global (design.md "Interfaces/Contracts"): sucursal y
+// terminalID viven por FOLIO (pueden variar dentro del mismo depósito si el depósito agrupa
+// varias cajas/terminales de la misma tienda) — para el listado de resultados del upload se
+// necesita un resumen a nivel depósito: los valores ÚNICOS y no-nulos vistos en sus folios.
+function _derivarSucursales(folios) {
+  const sucursales = [...new Set((folios ?? []).map(f => f.sucursal).filter(Boolean))];
+  const terminalIDs = [...new Set((folios ?? []).map(f => f.terminalID).filter(Boolean))];
+  return { sucursales, terminalIDs };
+}
+
+// _itemBase — campos comunes a CUALQUIER entrada de `reportes[]` (netpay-reporte-global,
+// design.md "Interfaces/Contracts"), sin importar en qué `estatusCarga` haya terminado.
+function _itemBase(unit) {
+  const { sucursales, terminalIDs } = _derivarSucursales(unit.folios);
+  return {
+    claveRastreo: unit.claveRastreo,
+    fechaMovimiento: unit.fechaMovimiento,
+    montoDepositoTotal: unit.montoDepositoTotal,
+    sucursales,
+    terminalIDs,
+  };
+}
+
+// _crearYEvaluar — create -> _registrarFoliosIdempotente -> evaluarReporte, SIN capturar
+// errores (los propaga tal cual) — reusada tanto por el camino N=1 (que necesita
+// distinguir 409/rethrow de "ya existe") como por _procesarDeposito (N>1, que clasifica el
+// resultado en vez de lanzar).
+async function _crearYEvaluar(unit, nombreArchivo, user) {
+  const reporte = await NetpayReporte.create({
+    ...unit,
+    estatus: 'discrepancia',
+    cargadoPor: { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null },
+    cargadoEn: new Date(),
+    nombreArchivoOriginal: nombreArchivo ?? null,
+  });
+
+  await _registrarFoliosIdempotente(reporte);
+  const { reporte: reporteEvaluado, candidatos } = await evaluarReporte(reporte._id);
+  return { reporte: reporteEvaluado, candidatos, reporteId: reporte._id };
+}
+
+// _procesarDeposito — netpay-matching-v2 Fase netpay-reporte-global (design.md
+// "Per-deposit failure" + "Duplicate" + "Deposit with 0 folios"): versión N>1 de la lógica
+// de arriba, pero clasificando el resultado en vez de lanzar — una falla acá NUNCA aborta el
+// resto del archivo (ver cargarReporte, bucle secuencial).
+//   0 folios          -> estatusCarga:'error' (zero writes, ni busca duplicado — nada que
+//                        pudiera estar duplicado)
+//   ya existe          -> estatusCarga:'ya_cargado', reporteId del documento existente
+//   create() E11000    -> carrera con otra carga casi simultánea -> 'ya_cargado' igual,
+//                        resuelto con un 2do findOne para obtener el _id real
+//   cualquier otro error (create, registrar folios, o evaluar) -> estatusCarga:'error' con
+//                        el mensaje; si el create ya había tenido éxito, el reporte QUEDA
+//                        creado (discrepancia, re-evaluable) y se incluye su reporteId.
+async function _procesarDeposito(unit, nombreArchivo, user) {
+  const base = _itemBase(unit);
+
+  if ((unit.folios ?? []).length === 0) {
+    return { ...base, estatusCarga: 'error', error: 'El depósito no tiene folios asociados — no se puede cargar.' };
+  }
+
+  const existente = await NetpayReporte.findOne({ claveRastreo: unit.claveRastreo }).lean();
+  if (existente) {
+    return { ...base, estatusCarga: 'ya_cargado', reporteId: existente._id };
+  }
+
+  let creado;
+  try {
+    creado = await _crearYEvaluar(unit, nombreArchivo, user);
+  } catch (err) {
+    if (err.code === 11000) {
+      const original = await NetpayReporte.findOne({ claveRastreo: unit.claveRastreo }).lean();
+      return { ...base, estatusCarga: 'ya_cargado', reporteId: original?._id ?? null };
+    }
+    return { ...base, estatusCarga: 'error', error: err.message };
+  }
+
+  return {
+    ...base, estatusCarga: 'creado', reporte: creado.reporte, candidatos: creado.candidatos, reporteId: creado.reporteId,
+  };
+}
+
+// cargarReporte — parsea el Excel (ahora SIEMPRE `{ depositos: Parsed[] }`, ver
+// netpay-reporte-parser.service.js) y procesa cada depósito. Ya NO deja ningún reporte en
+// 'pendiente' — ese valor no existe en el enum v2 (ver NetpayReporte.model.js#estatus).
+//
+// N=1 (spec.md "Backward-compatible response shape"): comportamiento IDÉNTICO al de hoy —
+// duplicado -> ConflictError (409), cualquier otro error -> se propaga tal cual (nunca se
+// "atrapa" para convertirlo en un item de lista), éxito -> `{reporte, candidatos}` como
+// siempre, MÁS `reportes:[...]` con la misma forma que usa el caso N>1 (para que un cliente
+// ya migrado a la forma nueva funcione igual con archivos de un solo depósito).
+//
+// N>1 (design.md "Loop"): SECUENCIAL (`for...of`, nunca `Promise.all`) — dos depósitos con
+// el mismo monto en la misma ventana podrían disputar el mismo BankMovement si corrieran en
+// paralelo; al procesar en orden, el depósito #2 ya ve el erpLink que dejó el #1 (vía el
+// filtro `erpLinks:{$size:0}` de _buscarCandidatosParaReporte). Cada depósito es
+// independiente (un error en uno nunca bloquea a los demás) y la respuesta es SIEMPRE 200.
 async function cargarReporte(buffer, nombreArchivo, user) {
   let parsed;
   try {
@@ -150,33 +260,45 @@ async function cargarReporte(buffer, nombreArchivo, user) {
     throw new BadRequestError(`Error al leer el archivo: ${err.message}`);
   }
 
-  const existente = await NetpayReporte.findOne({ claveRastreo: parsed.claveRastreo }).lean();
-  if (existente) {
-    throw new ConflictError(`Ya existe un reporte cargado para este depósito (claveRastreo=${parsed.claveRastreo}).`);
-  }
+  const { depositos } = parsed;
 
-  let reporte;
-  try {
-    reporte = await NetpayReporte.create({
-      ...parsed,
-      estatus: 'discrepancia',
-      cargadoPor: { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null },
-      cargadoEn: new Date(),
-      nombreArchivoOriginal: nombreArchivo ?? null,
-    });
-  } catch (err) {
-    // Última línea de defensa (índice único claveRastreo) — condición de carrera entre el
-    // findOne de arriba y este create, dos cargas casi simultáneas del mismo depósito.
-    if (err.code === 11000) {
-      throw new ConflictError(`Ya existe un reporte cargado para este depósito (claveRastreo=${parsed.claveRastreo}).`);
+  if (depositos.length === 1) {
+    const [unit] = depositos;
+    const existente = await NetpayReporte.findOne({ claveRastreo: unit.claveRastreo }).lean();
+    if (existente) {
+      throw new ConflictError(`Ya existe un reporte cargado para este depósito (claveRastreo=${unit.claveRastreo}).`);
     }
-    throw err;
+
+    let creado;
+    try {
+      creado = await _crearYEvaluar(unit, nombreArchivo, user);
+    } catch (err) {
+      if (err.code === 11000) {
+        throw new ConflictError(`Ya existe un reporte cargado para este depósito (claveRastreo=${unit.claveRastreo}).`);
+      }
+      throw err;
+    }
+
+    const item = {
+      ..._itemBase(unit), estatusCarga: 'creado', reporte: creado.reporte, candidatos: creado.candidatos, reporteId: creado.reporteId,
+    };
+    return { reporte: creado.reporte, candidatos: creado.candidatos, reportes: [item] };
   }
 
-  await _registrarFoliosIdempotente(reporte);
+  const reportes = [];
+  for (const unit of depositos) {
+    // eslint-disable-next-line no-await-in-loop
+    reportes.push(await _procesarDeposito(unit, nombreArchivo, user));
+  }
 
-  const { reporte: reporteEvaluado, candidatos } = await evaluarReporte(reporte._id);
-  return { reporte: reporteEvaluado, candidatos };
+  const resumen = {
+    total: reportes.length,
+    creados: reportes.filter(r => r.estatusCarga === 'creado').length,
+    yaCargados: reportes.filter(r => r.estatusCarga === 'ya_cargado').length,
+    errores: reportes.filter(r => r.estatusCarga === 'error').length,
+  };
+
+  return { reportes, resumen };
 }
 
 async function listar({ estatus, incluirEliminados = false } = {}) {
@@ -190,7 +312,7 @@ async function listar({ estatus, incluirEliminados = false } = {}) {
 async function obtenerDetalle(id) {
   const reporte = await NetpayReporte.findById(id).lean();
   if (!reporte) throw new NotFoundError('Reporte Netpay');
-  return { reporte };
+  return { reporte: await _poblarMovimientoVinculado(reporte) };
 }
 
 // buscarCandidatos — recalcula EN VIVO los mismos candidatos que cargarReporte ya calculó al
@@ -271,7 +393,7 @@ async function resolverReporte(id, { justificacion, movementIds } = {}, user) {
     emitToAll('bank:ficha-pendiente:changed', { movementId: actualizado._id });
   }
 
-  return { reporte: reporte.toObject(), movimientos: actualizados };
+  return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), movimientos: actualizados };
 }
 
 // rechazarReporte — netpay-matching-v2 (design.md API table: "POST /netpay/reporte/:id/
@@ -293,7 +415,7 @@ async function rechazarReporte(id, { motivo } = {}, user) {
   reporte.descartadoEn = new Date();
   await reporte.save();
 
-  return { reporte: reporte.toObject() };
+  return { reporte: await _poblarMovimientoVinculado(reporte.toObject()) };
 }
 
 // _buscarBucketCorroborable — netpay-matching-v2 (design.md "(a) Report present"): cuando
@@ -376,7 +498,7 @@ async function _cerrarBucketsCubiertos(reporte) {
 async function evaluarReporte(reporteId) {
   const reporte = await NetpayReporte.findById(reporteId);
   if (!reporte) throw new NotFoundError('Reporte Netpay');
-  if (reporte.eliminado) return { reporte: reporte.toObject(), candidatos: [] };
+  if (reporte.eliminado) return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos: [] };
 
   const candidatos = await _buscarCandidatosParaReporte(reporte);
 
@@ -400,7 +522,7 @@ async function evaluarReporte(reporteId) {
     emitToAll('bank:ficha-pendiente:changed', { movementId: mov._id });
 
     await _cerrarBucketsCubiertos(reporte);
-    return { reporte: reporte.toObject(), candidatos };
+    return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos };
   }
 
   if (candidatos.length === 0) {
@@ -415,19 +537,19 @@ async function evaluarReporte(reporteId) {
       await reporte.save();
 
       await _cerrarBucketsCubiertos(reporte);
-      return { reporte: reporte.toObject(), candidatos };
+      return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos };
     }
 
     reporte.estatus = 'discrepancia';
     reporte.motivoDiscrepancia = 'sin_candidato';
     await reporte.save();
-    return { reporte: reporte.toObject(), candidatos };
+    return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos };
   }
 
   reporte.estatus = 'discrepancia';
   reporte.motivoDiscrepancia = 'multiples_candidatos';
   await reporte.save();
-  return { reporte: reporte.toObject(), candidatos };
+  return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos };
 }
 
 // eliminarReporte — soft-delete (design.md "Report Soft-Delete and Snapshot Integrity"):
@@ -444,7 +566,7 @@ async function eliminarReporte(id, motivo, user) {
   reporte.eliminadoMotivo = motivo ? String(motivo).trim() || null : null;
   await reporte.save();
 
-  return { reporte: reporte.toObject() };
+  return { reporte: await _poblarMovimientoVinculado(reporte.toObject()) };
 }
 
 // restaurarReporte — design.md "Restoring a hidden report": "clears eliminado/
@@ -459,7 +581,7 @@ async function restaurarReporte(id) {
   reporte.eliminadoMotivo = null;
   await reporte.save();
 
-  return { reporte: reporte.toObject() };
+  return { reporte: await _poblarMovimientoVinculado(reporte.toObject()) };
 }
 
 // consultarFolioKore — consulta puntual e informativa (withAccountInfo=true) de la CxC
@@ -600,4 +722,6 @@ module.exports = {
   _montosIguales,
   _buscarCandidatosParaReporte,
   _clave,
+  _derivarSucursales,
+  _poblarMovimientoVinculado,
 };

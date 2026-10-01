@@ -2085,6 +2085,30 @@ describe('POST /netpay/reporte/upload', () => {
 
     expect(res.status).toBe(409);
   });
+
+  // netpay-reporte-global (design.md "Interfaces/Contracts"): un archivo con N>1 depósitos
+  // SIEMPRE responde 200 con `reportes[]`+`resumen` — la ruta no tiene lógica propia para
+  // esto, solo pasa tal cual lo que devuelve cargarReporte (igual que el test de arriba para
+  // el shape N=1), así que este test cubre el passthrough completo del shape nuevo.
+  test('archivo con N>1 depósitos: pasa tal cual reportes[]/resumen (sin reporte/candidatos top-level)', async () => {
+    const resultadoServicio = {
+      reportes: [
+        { claveRastreo: 'C1', estatusCarga: 'creado', sucursales: ['SUC-1'], terminalIDs: ['T1'] },
+        { claveRastreo: 'C2', estatusCarga: 'ya_cargado', sucursales: ['SUC-2'], terminalIDs: ['T2'], reporteId: 'rep-2' },
+      ],
+      resumen: { total: 2, creados: 1, yaCargados: 1, errores: 0 },
+    };
+    cargarReporte.mockResolvedValue(resultadoServicio);
+
+    const res = await request(app)
+      .post('/netpay/reporte/upload')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
+      .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultadoServicio);
+    expect(res.body.reporte).toBeUndefined();
+  });
 });
 
 describe('GET /netpay/reporte', () => {

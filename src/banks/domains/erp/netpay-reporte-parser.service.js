@@ -78,6 +78,13 @@ function _texto(raw) {
   return s || null;
 }
 
+// netpay-reporte-global (design.md "resumenVentas"): redondea a 2 decimales (centavos) una
+// suma acumulada de floats — sin esto, sumar 20-40 folios puede dejar basura de precisión
+// binaria (ej. 1798.6699999999998) que nunca calzaría con el monto real a nivel centavo.
+function _redondear2(n) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
 // Busca, dentro de las primeras `maxFilas` filas de la hoja, la primera fila que contenga
 // TODAS las claves normalizadas de `clavesEsperadas` — esa es la fila de encabezados real de
 // una tabla (la posición exacta varía según branding/título previo del reporte).
@@ -156,6 +163,12 @@ function _extraerTerminalID(orderId) {
 }
 
 // ── Hoja "Resumen" — tabla "Depósitos y cargos del periodo" + rango "Periodo:" ─────────────
+// netpay-reporte-global (design.md "_parseResumen"): devuelve TODAS las filas de depósito
+// (antes se tiraba BadRequestError si había más de una — ya NO, un archivo global trae un
+// depósito por terminal/fila). El rango de "Periodo:" se lee UNA sola vez y se comparte
+// entre todas las filas (es el mismo rango para todo el archivo). La validación de "clave
+// faltante"/"clave duplicada" se movió a _agruparPorDeposito, que ya necesita recorrer todas
+// las filas de todos modos para agrupar folios.
 function _parseResumen(sheet) {
   const encontrado = _buscarFilaHeader(sheet, ['fecha_de_movimiento', 'clave_rastreo', 'cuenta_deposito', 'monto_deposito']);
   if (!encontrado) {
@@ -192,15 +205,6 @@ function _parseResumen(sheet) {
   if (depositos.length === 0) {
     throw new BadRequestError('La hoja "Resumen" no contiene ninguna fila de depósito bajo "Depósitos y cargos del periodo".');
   }
-  if (depositos.length > 1) {
-    throw new BadRequestError(
-      'El reporte contiene más de un depósito en la hoja "Resumen" — cada carga debe representar un solo depósito (claveRastreo único).',
-    );
-  }
-  const [deposito] = depositos;
-  if (!deposito.claveRastreo) {
-    throw new BadRequestError('La fila de depósito no trae Clave Rastreo — no se puede identificar el reporte.');
-  }
 
   const periodoTexto = _buscarTextoPorEtiqueta(sheet, 'periodo');
   let periodoDesde = null;
@@ -213,7 +217,7 @@ function _parseResumen(sheet) {
     }
   }
 
-  return { ...deposito, periodoDesde, periodoHasta };
+  return depositos.map(d => ({ ...d, periodoDesde, periodoHasta }));
 }
 
 // ── Hoja "Ventas Tarjeta Presente" — "Resumen de ventas" + tabla "Ventas pagadas durante
@@ -271,6 +275,13 @@ function _parseFolios(sheet) {
 
     const orderId = _texto(obj['order_id']);
     folios.push({
+      // netpay-reporte-global (design.md "Folio grouping"): clave de parseo PURA, usada
+      // solo por _agruparPorDeposito para saber a qué depósito pertenece esta fila — NUNCA
+      // se persiste (se quita antes de guardar, NetpayReporte.model.js#folios no tiene este
+      // campo). Antes se leía y se descartaba (un archivo de un solo depósito no la
+      // necesitaba); ahora un archivo global trae N depósitos y esta es la única forma de
+      // saber cuáles folios son de cuál.
+      claveRastreo:       _texto(obj['clave_rastreo']),
       referencia:         _texto(obj['referencia']),
       terminalID:         _extraerTerminalID(orderId),
       storeId:            _texto(obj['store_id']),
@@ -301,6 +312,91 @@ function _parseFolios(sheet) {
   return folios;
 }
 
+// netpay-reporte-global (design.md "Folio grouping" + "Integrity"): agrupa los folios de
+// TODO el archivo por `claveRastreo` (normalizada: String().trim(), para tolerar espacios
+// de más que Excel a veces agrega) contra las filas de depósito de "Resumen" — un archivo
+// global trae N depósitos (uno por fila de Resumen), cada uno con sus propios folios.
+//
+// Integridad DE ARCHIVO (zero writes, BadRequestError — nunca una creación parcial):
+//   (a) una fila de Resumen sin Clave Rastreo no se puede identificar -> rechaza el archivo
+//   (b) la misma Clave Rastreo repetida en Resumen -> ambigua, rechaza el archivo
+//   (c) un folio cuya Clave Rastreo no matchea NINGUNA fila de Resumen (huérfano) -> rechaza
+//       el archivo entero (decisión de usuario: ver spec.md "Orphan folio rejects the whole
+//       file") — el mensaje lista las claves huérfanas para que se pueda diagnosticar.
+//
+// Leniencia N=1 (design.md "N=1 leniency"): si Resumen trae UNA sola fila, los folios con
+// Clave Rastreo en blanco se asignan a ese único depósito (mantiene archivos de un solo
+// depósito funcionando aunque alguna fila de folio no traiga la clave) — pero una Clave
+// Rastreo NO vacía y DISTINTA a la del único depósito sigue siendo huérfana.
+//
+// Un depósito con CERO folios asignados NO es un error de archivo acá — es un resultado
+// válido de la agrupación (design.md "Deposit with 0 folios": error POR DEPÓSITO, decidido
+// más arriba en netpay-reporte.service.js#_procesarDeposito, nunca rechazo de archivo).
+function _agruparPorDeposito(rows, folios) {
+  rows.forEach((d, idx) => {
+    if (!d.claveRastreo) {
+      throw new BadRequestError(
+        `La fila de depósito #${idx + 1} de la hoja "Resumen" no trae Clave Rastreo — no se puede identificar ese depósito.`,
+      );
+    }
+  });
+
+  const vistos = new Set();
+  for (const d of rows) {
+    const norm = String(d.claveRastreo).trim();
+    if (vistos.has(norm)) {
+      throw new BadRequestError(
+        `La hoja "Resumen" tiene la Clave Rastreo "${d.claveRastreo}" repetida en más de una fila — cada depósito debe ser único.`,
+      );
+    }
+    vistos.add(norm);
+  }
+
+  const porClave = new Map(rows.map(d => [String(d.claveRastreo).trim(), { ...d, folios: [] }]));
+  const esLenienteN1 = rows.length === 1;
+  const claveUnica = esLenienteN1 ? String(rows[0].claveRastreo).trim() : null;
+  const huerfanas = new Set();
+
+  for (const folio of folios) {
+    const { claveRastreo, ...folioSinClave } = folio; // nunca se persiste, ver _parseFolios
+    const claveFolio = claveRastreo ? String(claveRastreo).trim() : '';
+
+    if (!claveFolio && esLenienteN1) {
+      porClave.get(claveUnica).folios.push(folioSinClave);
+      continue;
+    }
+
+    const grupo = porClave.get(claveFolio);
+    if (!grupo) {
+      huerfanas.add(claveRastreo || '(en blanco)');
+      continue;
+    }
+    grupo.folios.push(folioSinClave);
+  }
+
+  if (huerfanas.size > 0) {
+    throw new BadRequestError(
+      `El archivo contiene folios cuya Clave Rastreo no corresponde a ningún depósito de la hoja "Resumen": ${[...huerfanas].join(', ')}.`,
+    );
+  }
+
+  return [...porClave.values()];
+}
+
+// netpay-reporte-global (design.md "resumenVentas", N>1): el bloque "Resumen de ventas" de
+// la hoja "Ventas Tarjeta Presente" es un TOTAL DE ARCHIVO (una sola etiqueta, no repite por
+// depósito) — para N>1 no sirve copiarlo tal cual en cada documento (sería el total del
+// archivo completo, no el de ESE depósito). Se recalcula sumando los folios YA agrupados de
+// ese depósito. montoDepositado usa el Monto Depósito de la propia fila de Resumen (no una
+// suma de folios) — verificado exacto al centavo contra el archivo real
+// (Global_DetalleDepositos.xlsx, 16/16 depósitos).
+function _resumenVentasPorDeposito(folios, montoDepositoResumen) {
+  const montoTransaccionado = _redondear2(folios.reduce((acc, f) => acc + (f.montoTrx ?? 0), 0));
+  const comisiones          = _redondear2(folios.reduce((acc, f) => acc + (f.comisionBaseMonto ?? 0), 0));
+  const iva                 = _redondear2(folios.reduce((acc, f) => acc + (f.ivaComision ?? 0), 0));
+  return { montoTransaccionado, comisiones, iva, montoDepositado: montoDepositoResumen };
+}
+
 async function parseNetpayReporte(buffer) {
   const workbook = new ExcelJS.Workbook();
   try {
@@ -314,20 +410,28 @@ async function parseNetpayReporte(buffer) {
   if (!sheetResumen) throw new BadRequestError('El archivo no contiene la hoja "Resumen" — verifica que sea el reporte real de Netpay.');
   if (!sheetVentas)  throw new BadRequestError('El archivo no contiene la hoja "Ventas Tarjeta Presente" — verifica que sea el reporte real de Netpay.');
 
-  const resumen       = _parseResumen(sheetResumen);
-  const resumenVentas = _parseResumenVentas(sheetVentas);
-  const folios        = _parseFolios(sheetVentas);
+  const filasResumen         = _parseResumen(sheetResumen);
+  const resumenVentasArchivo = _parseResumenVentas(sheetVentas);
+  const folios               = _parseFolios(sheetVentas);
 
-  return {
-    claveRastreo:       resumen.claveRastreo,
-    cuentaDeposito:     resumen.cuentaDeposito,
-    fechaMovimiento:    resumen.fechaMovimiento,
-    periodoDesde:       resumen.periodoDesde,
-    periodoHasta:       resumen.periodoHasta,
-    montoDepositoTotal: resumen.montoDeposito,
-    resumenVentas,
-    folios,
-  };
+  const unidades = _agruparPorDeposito(filasResumen, folios);
+  const esN1 = unidades.length === 1;
+
+  const depositos = unidades.map(u => ({
+    claveRastreo:       u.claveRastreo,
+    cuentaDeposito:     u.cuentaDeposito,
+    fechaMovimiento:    u.fechaMovimiento,
+    periodoDesde:       u.periodoDesde,
+    periodoHasta:       u.periodoHasta,
+    montoDepositoTotal: u.montoDeposito,
+    // N=1: se conserva el bloque de la hoja (comportamiento idéntico al de hoy). N>1: se
+    // recalcula por depósito (ver _resumenVentasPorDeposito) — el bloque de la hoja es un
+    // total de archivo, no corresponde a UN depósito en particular.
+    resumenVentas:      esN1 ? resumenVentasArchivo : _resumenVentasPorDeposito(u.folios, u.montoDeposito),
+    folios:             u.folios,
+  }));
+
+  return { depositos };
 }
 
 module.exports = {
@@ -338,4 +442,7 @@ module.exports = {
   _parseFechaDDMMYYYY,
   _parseFechaMesEs,
   _extraerTerminalID,
+  // netpay-reporte-global: exportado para tests unitarios directos del agrupador/integridad
+  // (design.md "Testing Strategy") sin tener que armar un workbook completo para cada caso.
+  _agruparPorDeposito,
 };

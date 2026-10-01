@@ -562,6 +562,13 @@ router.get('/netpay/bandeja/:id/candidatos', authenticate, permit(PERMISSIONS.BA
 // Mismo permiso que el resto de la sección Netpay (admin-only, decisión confirmada con el
 // usuario — no se abre a contabilidad en esta fase). Reusa `uploadCyc` (memoryStorage,
 // .xlsx/.xls, ya definido arriba en este mismo archivo) — mismo config que bank.routes.js.
+//
+// netpay-reporte-global (design.md "Data Flow" + "Interfaces/Contracts"): un archivo global
+// puede traer N depósitos (uno por fila de la hoja "Resumen", cada uno con sus propios
+// folios) — cargarReporte() ya decide todo esto por dentro (agrupación, N=1 vs N>1, loop
+// secuencial) y siempre devuelve 200 salvo errores de archivo/negocio que siguen
+// propagándose tal cual (ver error-handler genérico de este router). Sin cambio de lógica
+// acá: sigue siendo "parsear, delegar, responder tal cual".
 router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NETPAY), uploadCyc.single('excelFile'), asyncHandler(async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
   const resultado = await cargarReporte(req.file.buffer, req.file.originalname, req.user);

@@ -36,7 +36,7 @@ const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/
 const {
   cargarReporte, listar, obtenerDetalle, obtenerPorMovimiento, buscarCandidatos,
   resolverReporte, rechazarReporte, consultarFolioKore, consultarFoliosPendientes, evaluarReporte,
-  eliminarReporte, restaurarReporte,
+  eliminarReporte, restaurarReporte, _poblarMovimientoVinculado,
 } = require('./netpay-reporte.service');
 
 const USER = { _id: 'user-1', nombre: 'Ana' };
@@ -54,9 +54,16 @@ function parsedFixture(overrides = {}) {
     periodoHasta: new Date('2026-09-25T00:00:00.000Z'),
     montoDepositoTotal: 1000,
     resumenVentas: { montoTransaccionado: 1050, comisiones: 40, iva: 6.4, montoDepositado: 1000 },
-    folios: [{ referencia: 'F1', terminalID: 'T1' }],
+    folios: [{ referencia: 'F1', terminalID: 'T1', sucursal: 'SUC-1' }],
     ...overrides,
   };
+}
+
+// netpay-reporte-global (design.md): parseNetpayReporte ahora devuelve SIEMPRE
+// `{ depositos: [...] }` — este helper arma el caso N=1 (compat), el más usado por los
+// tests YA existentes de cargarReporte (ver describe de abajo).
+function parsedN1(overrides = {}) {
+  return { depositos: [parsedFixture(overrides)] };
 }
 
 function fakeReporteRecienCreado(overrides = {}) {
@@ -75,6 +82,11 @@ beforeEach(() => {
   jest.clearAllMocks();
   _ventanaDiasNetpay.mockResolvedValue(2);
   BankMovement.find = jest.fn(() => fakeFind([]));
+  // default: ningún test se preocupa por el movimiento vinculado salvo que lo pisen —
+  // _poblarMovimientoVinculado(reporte) llama findById SIEMPRE que haya
+  // movementIdConfirmado, así que sin esto cualquier fixture con ese campo poblado
+  // rompería con "Cannot read properties of undefined (reading 'lean')".
+  BankMovement.findById = jest.fn(() => fakeFind(null));
   NetpayMatch.find = jest.fn(() => fakeFind([]));
   NetpayFolioRegistro.insertMany = jest.fn().mockResolvedValue([]);
 });
@@ -95,7 +107,7 @@ describe('cargarReporte', () => {
   });
 
   test('claveRastreo ya existe: ConflictError, no llega a crear', async () => {
-    parseNetpayReporte.mockResolvedValue(parsedFixture());
+    parseNetpayReporte.mockResolvedValue(parsedN1());
     NetpayReporte.findOne = jest.fn(() => fakeFind({ _id: 'existente' }));
     NetpayReporte.create = jest.fn();
 
@@ -104,7 +116,7 @@ describe('cargarReporte', () => {
   });
 
   test('condición de carrera (índice único choca en el create pese al findOne previo): ConflictError, no un 500 crudo', async () => {
-    parseNetpayReporte.mockResolvedValue(parsedFixture());
+    parseNetpayReporte.mockResolvedValue(parsedN1());
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const err = new Error('E11000 duplicate key');
     err.code = 11000;
@@ -114,7 +126,7 @@ describe('cargarReporte', () => {
   });
 
   test('creado en discrepancia (nunca pendiente — ese valor ya no existe en el enum v2), luego evaluarReporte decide', async () => {
-    parseNetpayReporte.mockResolvedValue(parsedFixture());
+    parseNetpayReporte.mockResolvedValue(parsedN1());
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     BankMovement.find = jest.fn(() => fakeFind([]));
     const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
@@ -133,7 +145,7 @@ describe('cargarReporte', () => {
   });
 
   test('1 candidato BBVA cuyo monto cuadra dentro de tolerancia: auto-vincula (resuelto_por_reporte, vinculo:erp-link)', async () => {
-    parseNetpayReporte.mockResolvedValue(parsedFixture({ montoDepositoTotal: 1000 }));
+    parseNetpayReporte.mockResolvedValue(parsedN1({ montoDepositoTotal: 1000 }));
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const mov = { _id: 'mov-1', banco: 'BBVA', deposito: 1000.5 };
     BankMovement.find = jest.fn(() => fakeFind([mov]));
@@ -157,7 +169,7 @@ describe('cargarReporte', () => {
 
   test('3 folios (mismo depósito, distintas transacciones): se persisten los 3 en el arreglo folios y se registran en NetpayFolioRegistro', async () => {
     const folios = [{ referencia: 'F1', orderId: null }, { referencia: 'F2', orderId: null }, { referencia: 'F3', orderId: null }];
-    parseNetpayReporte.mockResolvedValue(parsedFixture({ folios }));
+    parseNetpayReporte.mockResolvedValue(parsedN1({ folios }));
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado({ folios: folios.map(f => ({ ...f, duplicadoDeReporteId: null })) });
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
@@ -182,7 +194,7 @@ describe('cargarReporte', () => {
   // normal (nunca se descarta el reporte entero solo por esto).
   test('folio duplicado (E11000 en insertMany): marca folios[i].duplicadoDeReporteId, NO aborta el resto', async () => {
     const folios = [{ referencia: 'F1', orderId: 'ORD-1' }, { referencia: 'F2', orderId: 'ORD-2' }];
-    parseNetpayReporte.mockResolvedValue(parsedFixture({ folios }));
+    parseNetpayReporte.mockResolvedValue(parsedN1({ folios }));
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado({
       folios: folios.map(f => ({ ...f, duplicadoDeReporteId: null })),
@@ -203,7 +215,7 @@ describe('cargarReporte', () => {
   });
 
   test('insertMany falla con un error NO relacionado a duplicados (ej. de red): se propaga, nunca se absorbe en silencio', async () => {
-    parseNetpayReporte.mockResolvedValue(parsedFixture());
+    parseNetpayReporte.mockResolvedValue(parsedN1());
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado();
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
@@ -213,6 +225,214 @@ describe('cargarReporte', () => {
     NetpayFolioRegistro.insertMany = jest.fn().mockRejectedValue(err);
 
     await expect(cargarReporte(Buffer.from(''), 'archivo.xlsx', USER)).rejects.toThrow('conexión perdida a Mongo');
+  });
+
+  // spec.md "Backward-compatible response shape for N=1": el `reporte` top-level se
+  // mantiene para no romper consumidores existentes, PERO además viaja `reportes[]` con la
+  // MISMA forma que usa el caso N>1 (un solo elemento, estatusCarga:'creado').
+  test('N=1: la respuesta incluye TANTO reporte/candidatos (legacy) COMO reportes[] (forma nueva, 1 elemento)', async () => {
+    parseNetpayReporte.mockResolvedValue(parsedN1());
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creado = fakeReporteRecienCreado();
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+
+    const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(resultado.reporte).toBeDefined();
+    expect(resultado.reportes).toHaveLength(1);
+    expect(resultado.reportes[0]).toEqual(expect.objectContaining({
+      claveRastreo: 'CLAVE-1', estatusCarga: 'creado', sucursales: ['SUC-1'],
+    }));
+  });
+});
+
+// netpay-reporte-global (design.md "Loop" + "Duplicate" + "Per-deposit failure"):
+// cargarReporte con N>1 depósitos — procesamiento SECUENCIAL e independiente por depósito,
+// nunca 409/rethrow a nivel archivo (eso es exclusivo del camino N=1 de arriba).
+describe('cargarReporte — múltiples depósitos (N>1)', () => {
+  function unidad(overrides = {}) {
+    return parsedFixture({
+      claveRastreo: 'C1',
+      folios: [{ referencia: 'F1', orderId: 'ORD-1', terminalID: 'T1', sucursal: 'SUC-1' }],
+      ...overrides,
+    });
+  }
+
+  test('mezcla creado/ya_cargado/error en una sola carga: cada depósito se clasifica independientemente, SIEMPRE 200 (nunca lanza)', async () => {
+    const u1 = unidad({ claveRastreo: 'C1', montoDepositoTotal: 100 });
+    const u2 = unidad({ claveRastreo: 'C2', montoDepositoTotal: 200 });
+    const u3 = unidad({ claveRastreo: 'C3', montoDepositoTotal: 300 });
+    parseNetpayReporte.mockResolvedValue({ depositos: [u1, u2, u3] });
+
+    // C1: no existe, se crea con éxito.
+    // C2: ya existe (ya_cargado).
+    // C3: no existe, pero create() revienta con un error de negocio NO relacionado a duplicados.
+    NetpayReporte.findOne = jest.fn(({ claveRastreo }) => {
+      if (claveRastreo === 'C2') return fakeFind({ _id: 'rep-C2-existente' });
+      return fakeFind(null);
+    });
+    const creadoC1 = fakeReporteRecienCreado({ _id: 'rep-C1', claveRastreo: 'C1' });
+    NetpayReporte.create = jest.fn(async (doc) => {
+      if (doc.claveRastreo === 'C3') throw new Error('validación de Mongo falló');
+      return creadoC1;
+    });
+    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoC1);
+
+    const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(resultado.reportes).toHaveLength(3);
+    const porClave = Object.fromEntries(resultado.reportes.map(r => [r.claveRastreo, r]));
+    expect(porClave.C1.estatusCarga).toBe('creado');
+    expect(porClave.C1.reporte).toBeDefined();
+    expect(porClave.C2.estatusCarga).toBe('ya_cargado');
+    expect(porClave.C2.reporteId).toBe('rep-C2-existente');
+    expect(porClave.C3.estatusCarga).toBe('error');
+    expect(porClave.C3.error).toMatch(/validación de Mongo falló/);
+
+    expect(resultado.resumen).toEqual({ total: 3, creados: 1, yaCargados: 1, errores: 1 });
+    // N>1 nunca expone el shape legacy de 1 solo reporte.
+    expect(resultado.reporte).toBeUndefined();
+    expect(resultado.candidatos).toBeUndefined();
+  });
+
+  test('una falla en el depósito #2 NO bloquea al #3 — cada uno sigue su propio try/catch', async () => {
+    const u1 = unidad({ claveRastreo: 'C1' });
+    const u2 = unidad({ claveRastreo: 'C2' });
+    const u3 = unidad({ claveRastreo: 'C3' });
+    parseNetpayReporte.mockResolvedValue({ depositos: [u1, u2, u3] });
+
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creadoOk = fakeReporteRecienCreado({ _id: 'rep-ok' });
+    NetpayReporte.create = jest.fn(async (doc) => {
+      if (doc.claveRastreo === 'C2') throw new Error('boom en C2');
+      return creadoOk;
+    });
+    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoOk);
+
+    const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(resultado.reportes.map(r => r.estatusCarga)).toEqual(['creado', 'error', 'creado']);
+    expect(NetpayReporte.create).toHaveBeenCalledTimes(3); // C3 SÍ se intentó pese a la falla de C2
+  });
+
+  // design.md "Duplicate": findOne primero; si no encuentra nada pero el create choca con
+  // el índice único (carrera entre dos cargas casi simultáneas), se reclasifica a
+  // ya_cargado en vez de abortar ese depósito.
+  test('condición de carrera (E11000 en create pese al findOne previo): se reclasifica a ya_cargado con el _id real', async () => {
+    // 2 depósitos para forzar el camino N>1 — con N=1 esta misma carrera da 409 (ver
+    // describe de arriba, test "condición de carrera" dentro de cargarReporte N=1).
+    parseNetpayReporte.mockResolvedValue({ depositos: [unidad({ claveRastreo: 'C1' }), unidad({ claveRastreo: 'C2' })] });
+
+    let primeraLlamadaC1 = true;
+    NetpayReporte.findOne = jest.fn(({ claveRastreo }) => {
+      if (claveRastreo === 'C2') return fakeFind(null);
+      if (primeraLlamadaC1) { primeraLlamadaC1 = false; return fakeFind(null); }
+      return fakeFind({ _id: 'rep-GANADOR-DE-LA-CARRERA' }); // 2da llamada para C1: tras el E11000
+    });
+    const creadoC2 = fakeReporteRecienCreado({ _id: 'rep-C2', claveRastreo: 'C2' });
+    NetpayReporte.create = jest.fn(async (doc) => {
+      if (doc.claveRastreo === 'C1') {
+        const err = new Error('E11000 duplicate key');
+        err.code = 11000;
+        throw err;
+      }
+      return creadoC2;
+    });
+    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoC2);
+
+    const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    const c1 = resultado.reportes.find(r => r.claveRastreo === 'C1');
+    expect(c1.estatusCarga).toBe('ya_cargado');
+    expect(c1.reporteId).toBe('rep-GANADOR-DE-LA-CARRERA');
+  });
+
+  // design.md "Deposit with 0 folios": error POR DEPÓSITO ("sin folios"), zero writes para
+  // ESE depósito — nunca rechazo de archivo (eso ya lo decide el parser para huérfanos, no
+  // acá) y nunca bloquea al resto.
+  test('depósito sin folios: error "sin folios", NUNCA llega a NetpayReporte.create', async () => {
+    // 2 depósitos para forzar el camino N>1 (con N=1 el archivo completo ni siquiera tiene
+    // folios que parsear, es un caso de error distinto cubierto por el parser).
+    const sinFolios = unidad({ claveRastreo: 'C-VACIO', folios: [] });
+    const otro = unidad({ claveRastreo: 'C-OK' });
+    parseNetpayReporte.mockResolvedValue({ depositos: [sinFolios, otro] });
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creadoOk = fakeReporteRecienCreado({ _id: 'rep-ok', claveRastreo: 'C-OK' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creadoOk);
+    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoOk);
+
+    const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    const vacio = resultado.reportes.find(r => r.claveRastreo === 'C-VACIO');
+    expect(vacio.estatusCarga).toBe('error');
+    expect(vacio.error).toMatch(/folios/i);
+    expect(NetpayReporte.create).toHaveBeenCalledTimes(1); // solo por C-OK, nunca por C-VACIO
+    expect(NetpayReporte.findOne).toHaveBeenCalledTimes(1); // solo por C-OK — C-VACIO ni busca duplicado
+  });
+
+  test('sucursales/terminalIDs derivados de los folios del depósito, únicos y sin null', async () => {
+    const u = unidad({
+      claveRastreo: 'C1',
+      folios: [
+        { referencia: 'F1', terminalID: 'T1', sucursal: 'SUC-A' },
+        { referencia: 'F2', terminalID: 'T1', sucursal: 'SUC-A' },
+        { referencia: 'F3', terminalID: 'T2', sucursal: null },
+      ],
+    });
+    parseNetpayReporte.mockResolvedValue({ depositos: [u] });
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creado = fakeReporteRecienCreado({ _id: 'rep-1' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+
+    const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(resultado.reportes[0].sucursales).toEqual(['SUC-A']);
+    expect(resultado.reportes[0].terminalIDs).toEqual(['T1', 'T2']);
+  });
+
+  // design.md "Loop": Sequential for...of, NUNCA Promise.all — "two deposits with the same
+  // amount in the same window could both claim the same BankMovement" si corrieran en
+  // paralelo. Se prueba dejando colgado el procesamiento del #1 (create() nunca resuelve
+  // hasta que se libera a mano) y confirmando que el #2 NUNCA arranca mientras tanto.
+  test('procesa los depósitos en orden SECUENCIAL — el #2 nunca arranca mientras el #1 sigue pendiente', async () => {
+    const u1 = unidad({ claveRastreo: 'C1' });
+    const u2 = unidad({ claveRastreo: 'C2' });
+    parseNetpayReporte.mockResolvedValue({ depositos: [u1, u2] });
+
+    const orden = [];
+    NetpayReporte.findOne = jest.fn(({ claveRastreo }) => {
+      orden.push(`findOne-${claveRastreo}`);
+      return fakeFind(null);
+    });
+
+    let liberarC1;
+    const creadoC1 = fakeReporteRecienCreado({ _id: 'rep-C1', claveRastreo: 'C1' });
+    const creadoC2 = fakeReporteRecienCreado({ _id: 'rep-C2', claveRastreo: 'C2' });
+    NetpayReporte.create = jest.fn(async (doc) => {
+      orden.push(`create-start-${doc.claveRastreo}`);
+      if (doc.claveRastreo === 'C1') {
+        await new Promise((resolve) => { liberarC1 = resolve; });
+      }
+      orden.push(`create-end-${doc.claveRastreo}`);
+      return doc.claveRastreo === 'C1' ? creadoC1 : creadoC2;
+    });
+    NetpayReporte.findById = jest.fn((id) => Promise.resolve(id === 'rep-C1' ? creadoC1 : creadoC2));
+
+    const promise = cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    // Deja correr microtasks suficientes para que arranque el procesamiento del #1 y quede
+    // colgado esperando `liberarC1` — sin que el #2 haya arrancado todavía.
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(orden).toContain('create-start-C1');
+    expect(orden).not.toContain('findOne-C2'); // la prueba real: Promise.all ya lo habría disparado acá
+
+    liberarC1();
+    const resultado = await promise;
+
+    expect(orden.indexOf('create-end-C1')).toBeLessThan(orden.indexOf('findOne-C2'));
+    expect(resultado.reportes.map(r => r.claveRastreo)).toEqual(['C1', 'C2']);
   });
 });
 
@@ -506,10 +726,42 @@ describe('obtenerDetalle', () => {
     await expect(obtenerDetalle('x')).rejects.toThrow(NotFoundError);
   });
 
-  test('existe: lo devuelve', async () => {
-    NetpayReporte.findById = jest.fn(() => fakeFind({ _id: 'r1' }));
+  test('existe, sin movimiento vinculado: lo devuelve con movimientoVinculado:null', async () => {
+    NetpayReporte.findById = jest.fn(() => fakeFind({ _id: 'r1', movementIdConfirmado: null }));
     const { reporte } = await obtenerDetalle('r1');
-    expect(reporte).toEqual({ _id: 'r1' });
+    expect(reporte).toEqual({ _id: 'r1', movementIdConfirmado: null, movimientoVinculado: null });
+  });
+
+  test('existe, con movimiento vinculado: lo devuelve con movimientoVinculado poblado (banco/fecha/monto)', async () => {
+    NetpayReporte.findById = jest.fn(() => fakeFind({ _id: 'r1', movementIdConfirmado: 'mov-1' }));
+    BankMovement.findById = jest.fn(() => fakeFind({
+      _id: 'mov-1', banco: 'BBVA', fecha: new Date('2026-09-29T00:00:00.000Z'), deposito: 503646.17,
+    }));
+    const { reporte } = await obtenerDetalle('r1');
+    expect(BankMovement.findById).toHaveBeenCalledWith('mov-1');
+    expect(reporte.movimientoVinculado).toEqual({
+      banco: 'BBVA', fecha: new Date('2026-09-29T00:00:00.000Z'), monto: 503646.17,
+    });
+  });
+
+  test('movimiento vinculado ya no existe: movimientoVinculado:null, nunca lanza', async () => {
+    NetpayReporte.findById = jest.fn(() => fakeFind({ _id: 'r1', movementIdConfirmado: 'mov-borrado' }));
+    BankMovement.findById = jest.fn(() => fakeFind(null));
+    const { reporte } = await obtenerDetalle('r1');
+    expect(reporte.movimientoVinculado).toBeNull();
+  });
+});
+
+describe('_poblarMovimientoVinculado', () => {
+  test('reporte null/undefined: lo devuelve tal cual, sin llamar a BankMovement', async () => {
+    expect(await _poblarMovimientoVinculado(null)).toBeNull();
+    expect(BankMovement.findById).not.toHaveBeenCalled();
+  });
+
+  test('sin movementIdConfirmado: movimientoVinculado:null, sin llamar a BankMovement', async () => {
+    const resultado = await _poblarMovimientoVinculado({ _id: 'r1', movementIdConfirmado: null });
+    expect(resultado).toEqual({ _id: 'r1', movementIdConfirmado: null, movimientoVinculado: null });
+    expect(BankMovement.findById).not.toHaveBeenCalled();
   });
 });
 

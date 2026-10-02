@@ -53,6 +53,17 @@ const router = express.Router();
  */
 const RESTRICTED_DEFAULT_STATUSES = 'no_identificado,reclasificado';
 
+/**
+ * Ve movimientos ocultos-por-rol (regla 'ocultar' con ocultarRoles) sin necesitar
+ * banks:admin completo — banks:ocultar-roles:bypass es angosto a propósito, no
+ * habilita ninguna otra operación admin de bancos.
+ */
+async function hasOcultoRolesBypass(user) {
+  const hasAdmin = await rbacStore.hasPermission(user.role, PERMISSIONS.BANKS_ADMIN, user.extraPermissions);
+  if (hasAdmin) return true;
+  return rbacStore.hasPermission(user.role, PERMISSIONS.BANKS_OCULTAR_ROLES_BYPASS, user.extraPermissions);
+}
+
 function applyMovementRestrictions(query, userId, { scope = MOVEMENT_SCOPE.OWN, forExport = false } = {}) {
   const q = { ...query };
   if (q.status === 'otros') {
@@ -173,9 +184,10 @@ router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), 
   // identificadoPor de cualquier usuario) disponibles sin restricción por rol —
   // a diferencia del listado principal (GET /movements), que sigue restringido.
   // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
-  // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
-  // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
+  // — solo banks:admin o banks:ocultar-roles:bypass ven movimientos ocultos para otros
+  // roles. Se sobreescribe siempre para que el cliente no pueda mandar su propio
+  // rolActual y saltarse el filtro.
+  const hasAdminAccess = await hasOcultoRolesBypass(req.user);
   query.rolActual = hasAdminAccess ? null : req.user.role;
   const buffer = await service.exportMovements(query);
   const banco  = req.query.banco || 'movimientos';
@@ -205,9 +217,10 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
     query = restricted;
   }
   // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
-  // — solo banks:admin ve movimientos ocultos para otros roles. Se sobreescribe siempre
-  // para que el cliente no pueda mandar su propio rolActual y saltarse el filtro.
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
+  // — solo banks:admin o banks:ocultar-roles:bypass ven movimientos ocultos para otros
+  // roles. Se sobreescribe siempre para que el cliente no pueda mandar su propio
+  // rolActual y saltarse el filtro.
+  const hasAdminAccess = await hasOcultoRolesBypass(req.user);
   query.rolActual = hasAdminAccess ? null : req.user.role;
   res.json(await service.listMovements(query));
 }));
@@ -222,7 +235,7 @@ router.get('/summary', authenticate, asyncHandler(async (req, res) => {
 router.get('/stats', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { year, month, banco } = req.query;
   const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
+  const hasAdminAccess = await hasOcultoRolesBypass(req.user);
   // Mismo criterio que /cards: "Identificados" del dashboard es de todo el equipo, no solo del
   // usuario logueado, aunque su rol tenga scope OWN en la tabla de movimientos.
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
@@ -236,7 +249,7 @@ router.get('/stats', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
 router.get('/years', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco } = req.query;
   const hasFullAccess  = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
-  const hasAdminAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_ADMIN, req.user.extraPermissions);
+  const hasAdminAccess = await hasOcultoRolesBypass(req.user);
   const restrictions = hasFullAccess ? null : { scope: MOVEMENT_SCOPE.ALL, userId: req.user._id };
   const rolActual     = hasAdminAccess ? null : req.user.role;
   res.json({ years: await service.getAvailableYears(banco || null, rolActual, restrictions) });

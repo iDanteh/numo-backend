@@ -25,8 +25,22 @@ const PATH_TRES_FOLIOS = path.join(REPO_ROOT, '20260925_DetalleDepósitos.xlsx')
 // Monto Depósito de esa misma fila en Resumen, 16/16.
 const PATH_GLOBAL = path.join(REPO_ROOT, 'Global_DetalleDepositos.xlsx');
 
+// Estos 3 Excel reales viven FUERA de este repo git (carpeta NUMO/ local, nunca commiteada —
+// contienen datos reales de clientes). En CI (GitHub Actions clona solo numo-backend) esa ruta
+// no puede existir nunca, así que estos tests se saltean ahí en vez de fallar el deploy.
+// Localmente, con los archivos presentes, siguen corriendo y verificando contra datos reales.
+function testSiExiste(filePath, nombre, fn) {
+  if (!fs.existsSync(filePath)) {
+    // eslint-disable-next-line no-console
+    console.warn(`[netpay-reporte-parser.service.test.js] saltado: falta fixture real ${filePath}`);
+    test.skip(nombre, fn);
+    return;
+  }
+  test(nombre, fn);
+}
+
 describe('parseNetpayReporte — archivos reales del repo (N=1, un solo depósito)', () => {
-  test('F0-Netpay.xlsx (1 folio): depositos[0] con claveRastreo, montoDepositoTotal, resumenVentas y folio parseados correctamente', async () => {
+  testSiExiste(PATH_UN_FOLIO, 'F0-Netpay.xlsx (1 folio): depositos[0] con claveRastreo, montoDepositoTotal, resumenVentas y folio parseados correctamente', async () => {
     const buffer = fs.readFileSync(PATH_UN_FOLIO);
     const { depositos } = await parseNetpayReporte(buffer);
 
@@ -67,7 +81,7 @@ describe('parseNetpayReporte — archivos reales del repo (N=1, un solo depósit
     expect(r.folios[0]).not.toHaveProperty('claveRastreo');
   });
 
-  test('20260925_DetalleDepósitos.xlsx (3 folios): mismo depósito para las 3 filas, terminalID estable', async () => {
+  testSiExiste(PATH_TRES_FOLIOS, '20260925_DetalleDepósitos.xlsx (3 folios): mismo depósito para las 3 filas, terminalID estable', async () => {
     const buffer = fs.readFileSync(PATH_TRES_FOLIOS);
     const { depositos } = await parseNetpayReporte(buffer);
 
@@ -84,7 +98,7 @@ describe('parseNetpayReporte — archivos reales del repo (N=1, un solo depósit
 });
 
 describe('parseNetpayReporte — archivo global real (N=16 depósitos, Global_DetalleDepositos.xlsx)', () => {
-  test('16 depósitos agrupados, 316 folios repartidos SIN huérfanos, cada uno con su propio resumenVentas recalculado', async () => {
+  testSiExiste(PATH_GLOBAL, '16 depósitos agrupados, 316 folios repartidos SIN huérfanos, cada uno con su propio resumenVentas recalculado', async () => {
     const buffer = fs.readFileSync(PATH_GLOBAL);
     const { depositos } = await parseNetpayReporte(buffer);
 

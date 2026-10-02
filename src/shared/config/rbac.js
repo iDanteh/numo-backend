@@ -112,6 +112,13 @@ const PERMISSIONS = Object.freeze({
   // Operaciones exclusivas de administrador en bancos
   BANKS_ADMIN:         'banks:admin',
 
+  // Ver movimientos ocultos-por-rol (regla 'ocultar' con ocultarRoles, ej. categoría
+  // "SOLO COBRANZA" oculta para contabilidad), SIN el resto de banks:admin (CRUD de
+  // reglas, operaciones de sync ERP-Kore, desvincular CxC, etc.). Permiso angosto
+  // (2026-10-02, pedido explícito del usuario) para asignar por persona vía
+  // extraPermissions sin regalar control operativo que no pidió.
+  BANKS_OCULTAR_ROLES_BYPASS: 'banks:ocultar-roles:bypass',
+
   // Registro y eliminación de fichas bancarias (solo contabilidad y admin)
   BANKS_FICHA:         'banks:ficha',
 

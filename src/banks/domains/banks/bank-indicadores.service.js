@@ -102,6 +102,31 @@ function _hoyMexicoStr() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// Inicio del mes EN CURSO en México (medianoche del día 1), como instante UTC real — insumo
+// de getCorteConciliacion(). Reusa _rangoAnioMesMexico (bank.service.js) para no repetir el
+// cálculo de offset fijo -06:00; solo toma su `$gte` (el `$lt` no aplica, el corte es
+// siempre "desde el inicio del periodo hasta AHORA", sin límite superior).
+function _inicioMesMexico() {
+  const mx = _comoRelojMexico(new Date());
+  return _rangoAnioMesMexico(mx.getUTCFullYear(), mx.getUTCMonth() + 1).$gte;
+}
+
+// Inicio de la semana EN CURSO (lunes) en México, como instante UTC real. getUTCDay() de
+// _comoRelojMexico ya devuelve el día de la semana correcto en hora de pared México (el
+// corrimiento fijo de -6h nunca cruza un límite de día que cambie el resultado salvo en la
+// franja 00:00-06:00 UTC, que es justamente la que _comoRelojMexico existe para corregir).
+// Domingo (getUTCDay()===0) retrocede 6 días al lunes anterior, no 0.
+function _inicioSemanaMexico() {
+  const mx = _comoRelojMexico(new Date());
+  const diaSemana = mx.getUTCDay(); // 0=domingo .. 6=sábado
+  const diasDesdeLunes = diaSemana === 0 ? 6 : diaSemana - 1;
+  const lunes = new Date(Date.UTC(mx.getUTCFullYear(), mx.getUTCMonth(), mx.getUTCDate() - diasDesdeLunes));
+  const yyyy = lunes.getUTCFullYear();
+  const mm   = String(lunes.getUTCMonth() + 1).padStart(2, '0');
+  const dd   = String(lunes.getUTCDate()).padStart(2, '0');
+  return _inicioDiaMx(`${yyyy}-${mm}-${dd}`);
+}
+
 /**
  * Horas hábiles entre 2 timestamps EN HORA DE MÉXICO (ver _comoRelojMexico — 2026-09-09,
  * antes usaba hora local del proceso, lo que rompía el cálculo si el contenedor corre en
@@ -519,11 +544,78 @@ async function listUsuariosConIdentificaciones() {
   return ids.filter(Boolean);
 }
 
+/**
+ * "Corte" de conciliación (2026-10-02, pedido explícito del usuario) — control periódico
+ * para que cobranza (semanal) y contabilidad (mensual) vean, del periodo EN CURSO (lunes /
+ * día 1 del mes corriente → ahora, sin navegación a periodos pasados — decisión explícita
+ * del usuario, mismo espíritu que el default "hoy" de getIndicadoresIdentificacion):
+ *
+ *   1. `rezagados` — depósitos con `fecha` ANTERIOR al inicio del periodo que SIGUEN
+ *      no_identificado/reclasificado AHORA MISMO (el número baja a medida que el equipo
+ *      los identifica, sin esperar a que cierre el periodo).
+ *   2. `nuevos` — depósitos con `fecha` DENTRO del periodo, por su estatus actual.
+ *   3. `identificadosEnPeriodo` — depósitos identificados (`primeraIdentificacionAt`) DENTRO
+ *      del periodo, separados según si el depósito en sí era rezago viejo o del lote nuevo —
+ *      pedido explícito del usuario de no mezclar ambos en un solo número.
+ *
+ * Mismo criterio de "depósito" que el resto de este dashboard (buildBaseMatch: isActive,
+ * no oculto, deposito>0) — un retiro no tiene este ciclo de vida. Sin scope por usuario a
+ * propósito (mismo motivo que el backlog de getIndicadoresIdentificacion: "rezagado"/"nuevo"
+ * son propiedades del movimiento, no de quién lo identificó) — es un control de EQUIPO.
+ *
+ * @param {object} [opts]
+ * @param {'semanal'|'mensual'} [opts.periodo='semanal']
+ * @param {string} [opts.banco]
+ */
+async function getCorteConciliacion({ periodo = 'semanal', banco = null } = {}) {
+  const inicio = periodo === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
+  const baseMatch = buildBaseMatch({ banco });
+
+  const agruparPorStatus = (extraMatch) => BankMovement.aggregate([
+    { $match: { ...baseMatch, ...extraMatch } },
+    { $group: { _id: '$status', count: { $sum: 1 } } },
+  ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count])));
+
+  const [rezagadosPorStatus, nuevosPorStatus, identificadosPorOrigen] = await Promise.all([
+    agruparPorStatus({ fecha: { $lt: inicio }, status: { $in: BACKLOG_STATUSES } }),
+    agruparPorStatus({ fecha: { $gte: inicio } }),
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, status: 'identificado', primeraIdentificacionAt: { $gte: inicio } } },
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
+    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+  ]);
+
+  const rezagados = {
+    no_identificado: rezagadosPorStatus.no_identificado ?? 0,
+    reclasificado:    rezagadosPorStatus.reclasificado    ?? 0,
+  };
+  rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+
+  const nuevosTotal = Object.values(nuevosPorStatus).reduce((a, b) => a + b, 0);
+  const nuevos = {
+    no_identificado: nuevosPorStatus.no_identificado ?? 0,
+    reclasificado:    nuevosPorStatus.reclasificado    ?? 0,
+    identificado:     nuevosPorStatus.identificado     ?? 0,
+  };
+  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - nuevos.identificado;
+  nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
+  nuevos.total = nuevosTotal;
+
+  const identificadosEnPeriodo = {
+    deRezagados: identificadosPorOrigen.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.nuevo     ?? 0,
+  };
+  identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+
+  return { periodo, inicio, rezagados, nuevos, identificadosEnPeriodo };
+}
+
 // promedio/mediana/_matchScopeUserId también se exportan para
 // collection-request-indicadores.service.js (mismo dominio conceptual — tiempo de
 // identificación — pero acotado a Solicitudes de Cobro, ver ese archivo).
 module.exports = {
   getIndicadoresIdentificacion,
+  getCorteConciliacion,
   buildReporteIdentificacion,
   listUsuariosConIdentificaciones,
   horasHabilesEntre,

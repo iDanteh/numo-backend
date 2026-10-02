@@ -795,6 +795,21 @@ function parseBBVA(sheet) {
       numeroAutorizacion = null;
     }
 
+    // Caso real 2026-10-02: "FUNDACION BBVA MEXIC08323 / FBB921214 9F3 0000034984..."
+    // — débito periódico (programa de redondeo/donación de BBVA). El token tras '/'
+    // ("FBB921214") NO es un identificador de transacción: es un código de programa
+    // FIJO que se repite IDÉNTICO en cada cargo recurrente (confirmado: mismo token en
+    // cargos de marzo y 3 cargos distintos el mismo día de junio, con montos y saldos
+    // distintos). Sin este guard, Capa 1b del dedup (bank.service.js, por
+    // numeroAutorizacion+monto, SIN ventana de fecha) trataba cada cargo nuevo como
+    // reimport de uno viejo con el mismo monto — se perdió un retiro real de $4000 el
+    // 2026-10-01 porque ya existía un cargo de $4000 con el mismo token en junio. Mismo
+    // guard que el de cuenta enmascarada de arriba: null es más honesto que un "auth"
+    // que en realidad es un código de programa compartido entre transacciones distintas.
+    if (/\bFUNDACION\s+BBVA\s+MEXIC/i.test(concepto)) {
+      numeroAutorizacion = null;
+    }
+
     // Extraer clave de rastreo SPEI para MORA SPEI NORMABANXICO.
     // BBVA incrusta el ID único de la transacción tras "COMPENSACION DE ":
     //   "MORA SPEI NORMABANXICO / COMPENSACION DE 8846APR1202605085280762645"

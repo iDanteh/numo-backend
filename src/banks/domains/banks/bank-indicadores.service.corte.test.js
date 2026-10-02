@@ -8,8 +8,9 @@ jest.mock('./BankMovement.model');
 jest.mock('../../shared/socket');
 jest.mock('./drive-fichas.service');
 
+const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
-const { getCorteConciliacion } = require('./bank-indicadores.service');
+const { getCorteConciliacion, buildReporteCorte } = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
 // (21:00 UTC). Semana en curso → lunes 2026-10-05 00:00 México. Mes en curso → 2026-10-01
@@ -20,7 +21,12 @@ const INICIO_MES_ESPERADO    = new Date(Date.UTC(2026, 9, 1, 6, 0, 0));
 
 beforeEach(() => {
   jest.clearAllMocks();
-  jest.useFakeTimers().setSystemTime(AHORA_MX);
+  // Solo se mockea Date — dejar los timers reales (setTimeout/setImmediate/nextTick) sin
+  // fakear: ExcelJS (buildReporteCorte) los usa internamente para escribir el .xlsx, y con
+  // fake timers completos esa promesa nunca resuelve (timeout del test, no un bug real).
+  jest.useFakeTimers({
+    doNotFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'setImmediate', 'clearImmediate', 'nextTick', 'hrtime', 'queueMicrotask', 'performance'],
+  }).setSystemTime(AHORA_MX);
 });
 
 afterEach(() => {
@@ -32,6 +38,25 @@ function mockAggregates({ rezagados = [], nuevos = [], identificados = [] }) {
     .mockResolvedValueOnce(rezagados)
     .mockResolvedValueOnce(nuevos)
     .mockResolvedValueOnce(identificados);
+}
+
+// buildReporteCorte() llama primero getCorteConciliacion() (3 aggregate) y DESPUÉS
+// BankMovement.find().select().lean() dos veces (antesDelCorte, nuevos) — los mocks de
+// find deben encolarse en ESE orden.
+function mockFinds(antesDelCorteDocs, nuevosDocs) {
+  const leanAntes   = jest.fn().mockResolvedValue(antesDelCorteDocs);
+  const selectAntes = jest.fn().mockReturnValue({ lean: leanAntes });
+  const leanNuevos   = jest.fn().mockResolvedValue(nuevosDocs);
+  const selectNuevos = jest.fn().mockReturnValue({ lean: leanNuevos });
+  BankMovement.find
+    .mockReturnValueOnce({ select: selectAntes })
+    .mockReturnValueOnce({ select: selectNuevos });
+}
+
+async function leerWorkbook(buffer) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  return wb;
 }
 
 describe('getCorteConciliacion', () => {
@@ -114,5 +139,66 @@ describe('getCorteConciliacion', () => {
       expect(call[0][0].$match.banco).toBe('BBVA');
       expect(call[0][0].$match.deposito).toEqual({ $gt: 0 }); // buildBaseMatch — solo depósitos
     }
+  });
+});
+
+describe('buildReporteCorte', () => {
+  test('hoja "Resumen": refleja exactamente los mismos números que getCorteConciliacion()', async () => {
+    mockAggregates({
+      rezagados: [{ _id: 'no_identificado', count: 2 }],
+      nuevos:    [{ _id: 'identificado', count: 7 }],
+      identificados: [{ _id: 'nuevo', count: 7 }],
+    });
+    mockFinds([], []);
+
+    const buffer = await buildReporteCorte({ periodo: 'semanal' });
+    const wb = await leerWorkbook(buffer);
+    const resumen = wb.getWorksheet('Resumen');
+
+    const filas = [];
+    resumen.eachRow((row) => filas.push([row.getCell(1).value, row.getCell(2).value]));
+
+    expect(filas).toEqual(expect.arrayContaining([
+      ['Rezagados — total', 2],
+      ['Nuevos del periodo — total', 7],
+      ['Identificados en el periodo — total', 7],
+    ]));
+  });
+
+  test('hoja "Detalle": una fila por movimiento, con Origen correcto (Rezagado/Nuevo)', async () => {
+    mockAggregates({});
+    mockFinds(
+      [{ banco: 'BBVA', fecha: new Date('2026-09-20'), concepto: 'Viejo', deposito: 100, categoria: null, status: 'no_identificado' }],
+      [{ banco: 'BBVA', fecha: new Date('2026-10-06'), concepto: 'Nuevo', deposito: 200, categoria: null, status: 'no_identificado' }],
+    );
+
+    const buffer = await buildReporteCorte({});
+    const wb = await leerWorkbook(buffer);
+    const detalle = wb.getWorksheet('Detalle');
+
+    expect(detalle.getRow(2).getCell(1).value).toBe('Rezagado'); // fila 1 = header
+    expect(detalle.getRow(2).getCell(4).value).toBe('Viejo');
+    expect(detalle.getRow(3).getCell(1).value).toBe('Nuevo');
+    expect(detalle.getRow(3).getCell(4).value).toBe('Nuevo');
+  });
+
+  test('"Identificado en el periodo" = Sí solo si status=identificado Y primeraIdentificacionAt >= inicio', async () => {
+    mockAggregates({});
+    mockFinds([], [
+      // Identificado DENTRO del periodo → Sí
+      { banco: 'BBVA', fecha: new Date('2026-10-06'), concepto: 'A', deposito: 1, status: 'identificado', primeraIdentificacionAt: new Date('2026-10-06T12:00:00Z') },
+      // Status identificado pero sin fecha de identificación (dato inconsistente) → No, no explota
+      { banco: 'BBVA', fecha: new Date('2026-10-06'), concepto: 'B', deposito: 1, status: 'identificado', primeraIdentificacionAt: null },
+      // Todavía no identificado → No
+      { banco: 'BBVA', fecha: new Date('2026-10-06'), concepto: 'C', deposito: 1, status: 'no_identificado' },
+    ]);
+
+    const buffer = await buildReporteCorte({});
+    const wb = await leerWorkbook(buffer);
+    const detalle = wb.getWorksheet('Detalle');
+
+    expect(detalle.getRow(2).getCell(8).value).toBe('Sí');
+    expect(detalle.getRow(3).getCell(8).value).toBe('No');
+    expect(detalle.getRow(4).getCell(8).value).toBe('No');
   });
 });

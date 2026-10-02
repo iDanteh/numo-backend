@@ -610,12 +610,132 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null } = {}) 
   return { periodo, inicio, rezagados, nuevos, identificadosEnPeriodo };
 }
 
+/**
+ * Excel descargable del corte de conciliación (2026-10-02, pedido explícito del usuario:
+ * "que también traiga el detallado de los movimientos involucrados con su clasificación").
+ * Reusa getCorteConciliacion() para la hoja "Resumen" — el Excel SIEMPRE coincide con lo que
+ * está en pantalla en ese momento, mismo criterio que buildReporteIdentificacion().
+ *
+ * Hoja "Detalle": un movimiento puede estar "involucrado" en el corte por 2 vías
+ * independientes, nunca ambas (las queries no se superponen):
+ *   - `fecha < inicio` Y (sigue pendiente AHORA O se identificó DENTRO del periodo) —
+ *     "Origen: Rezagado". Backlog ya resuelto hace tiempo (identificado antes del periodo)
+ *     queda afuera a propósito: no es parte de la historia de ESTE corte.
+ *   - `fecha >= inicio` — "Origen: Nuevo", cualquier estatus (a diferencia de rezagados, acá
+ *     SÍ se listan los ya identificados, para que la columna "Identificado en el periodo"
+ *     tenga sentido completo sobre el lote nuevo).
+ * La columna "Identificado en el periodo" (Sí/No) es la misma condición que usa
+ * `identificadosEnPeriodo` del resumen — permite filtrar en Excel y que la suma de "Sí"
+ * coincida exactamente con `identificadosEnPeriodo.total`.
+ */
+async function buildReporteCorte({ periodo = 'semanal', banco = null } = {}) {
+  const corte = await getCorteConciliacion({ periodo, banco });
+  const inicio = corte.inicio;
+  const baseMatch = buildBaseMatch({ banco });
+  const campos = 'banco fecha concepto deposito categoria status primeraIdentificacionAt primeraIdentificacionPor';
+
+  const [antesDelCorte, nuevos] = await Promise.all([
+    BankMovement.find({
+      ...baseMatch,
+      fecha: { $lt: inicio },
+      $or: [
+        { status: { $in: BACKLOG_STATUSES } },
+        { status: 'identificado', primeraIdentificacionAt: { $gte: inicio } },
+      ],
+    }).select(campos).lean(),
+    BankMovement.find({ ...baseMatch, fecha: { $gte: inicio } }).select(campos).lean(),
+  ]);
+
+  const filas = [
+    ...antesDelCorte.map(m => ({ ...m, origen: 'Rezagado' })),
+    ...nuevos.map(m => ({ ...m, origen: 'Nuevo' })),
+  ].sort((a, b) => new Date(a.fecha) - new Date(b.fecha));
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Cortes de conciliación';
+  wb.created = new Date();
+
+  const resumen = wb.addWorksheet('Resumen');
+  resumen.columns = [
+    { header: 'Indicador', key: 'k', width: 42 },
+    { header: 'Valor',     key: 'v', width: 18 },
+  ];
+  resumen.addRows([
+    { k: 'Periodo',                              v: periodo === 'mensual' ? 'Mensual' : 'Semanal' },
+    { k: 'Desde',                                 v: inicio },
+    { k: 'Banco',                                 v: banco || 'Todos' },
+    { k: '',                                      v: '' },
+    { k: 'Rezagados — no identificados',          v: corte.rezagados.no_identificado },
+    { k: 'Rezagados — reclasificados',            v: corte.rezagados.reclasificado },
+    { k: 'Rezagados — total',                     v: corte.rezagados.total },
+    { k: '',                                      v: '' },
+    { k: 'Nuevos del periodo — no identificados', v: corte.nuevos.no_identificado },
+    { k: 'Nuevos del periodo — reclasificados',   v: corte.nuevos.reclasificado },
+    { k: 'Nuevos del periodo — identificados',    v: corte.nuevos.identificado },
+    { k: 'Nuevos del periodo — total',            v: corte.nuevos.total },
+    { k: '',                                      v: '' },
+    { k: 'Identificados en el periodo — de rezago', v: corte.identificadosEnPeriodo.deRezagados },
+    { k: 'Identificados en el periodo — de nuevos', v: corte.identificadosEnPeriodo.deNuevos },
+    { k: 'Identificados en el periodo — total',     v: corte.identificadosEnPeriodo.total },
+  ]);
+  resumen.getCell('B2').numFmt = 'dd/mm/yyyy hh:mm';
+  resumen.getRow(1).font = { bold: true };
+
+  const detalle = wb.addWorksheet('Detalle');
+  detalle.columns = [
+    { header: 'Origen',                     key: 'origen',                width: 12 },
+    { header: 'Banco',                      key: 'banco',                 width: 13 },
+    { header: 'Fecha depósito',             key: 'fecha',                 width: 18 },
+    { header: 'Concepto',                   key: 'concepto',              width: 45 },
+    { header: 'Depósito',                   key: 'deposito',              width: 15 },
+    { header: 'Categoría',                  key: 'categoria',             width: 18 },
+    { header: 'Estatus',                    key: 'status',                width: 16 },
+    { header: 'Identificado en el periodo', key: 'identificadoEnPeriodo', width: 20 },
+    { header: 'Identificado por',           key: 'identificadoPor',       width: 22 },
+    { header: 'Fecha de identificación',    key: 'identificadoAt',        width: 18 },
+  ];
+
+  for (const m of filas) {
+    const identificadoEnPeriodo = m.status === 'identificado'
+      && m.primeraIdentificacionAt != null
+      && new Date(m.primeraIdentificacionAt) >= inicio;
+    detalle.addRow({
+      origen:                m.origen,
+      banco:                 m.banco ?? null,
+      fecha:                 m.fecha ?? null,
+      concepto:              m.concepto ?? null,
+      deposito:              m.deposito ?? null,
+      categoria:             m.categoria ?? null,
+      status:                m.status ?? null,
+      identificadoEnPeriodo: identificadoEnPeriodo ? 'Sí' : 'No',
+      identificadoPor:       m.primeraIdentificacionPor?.nombre ?? m.primeraIdentificacionPor?.userId ?? null,
+      identificadoAt:        m.primeraIdentificacionAt ?? null,
+    });
+  }
+
+  const dateFmt = 'dd/mm/yyyy hh:mm';
+  ['fecha', 'identificadoAt'].forEach(key => { detalle.getColumn(key).numFmt = dateFmt; });
+  detalle.getColumn('deposito').numFmt = '#,##0.00';
+
+  const headerRow = detalle.getRow(1);
+  headerRow.height = 22;
+  headerRow.font   = { bold: true, color: { argb: 'FFE0E7FF' }, size: 10 };
+  headerRow.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+
+  if (detalle.lastColumn) detalle.autoFilter = { from: 'A1', to: detalle.lastColumn.letter + '1' };
+  detalle.views = [{ state: 'frozen', ySplit: 1 }];
+
+  return wb.xlsx.writeBuffer();
+}
+
 // promedio/mediana/_matchScopeUserId también se exportan para
 // collection-request-indicadores.service.js (mismo dominio conceptual — tiempo de
 // identificación — pero acotado a Solicitudes de Cobro, ver ese archivo).
 module.exports = {
   getIndicadoresIdentificacion,
   getCorteConciliacion,
+  buildReporteCorte,
   buildReporteIdentificacion,
   listUsuariosConIdentificaciones,
   horasHabilesEntre,

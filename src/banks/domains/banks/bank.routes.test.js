@@ -512,6 +512,24 @@ describe('GET /movements', () => {
     expect(res.body).toEqual({ data: [], pagination: { total: 0, page: 1, limit: 50, pages: 0 } });
     expect(service.listMovements).not.toHaveBeenCalled();
   });
+
+  // banks:ocultar-roles:bypass (2026-10-02): bypass angosto de ocultamiento-por-rol,
+  // separado de banks:admin a propósito — no debe depender de ningún otro permiso.
+  test('sin ningún permiso: rolActual va con el rol del usuario (sigue restringido por ocultarRoles)', async () => {
+    await request(app).get('/movements');
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.rolActual).toBe('test-role');
+  });
+
+  test('con banks:ocultar-roles:bypass (sin banks:admin): rolActual viaja null (ve movimientos ocultos-por-rol)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_OCULTAR_ROLES_BYPASS);
+
+    await request(app).get('/movements');
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.rolActual).toBeNull();
+  });
 });
 
 // POST /movements/:id/ficha/imagen (2026-09-03) — adjunta la foto/documento de respaldo de una

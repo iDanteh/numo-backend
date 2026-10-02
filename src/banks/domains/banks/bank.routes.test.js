@@ -47,6 +47,7 @@ jest.mock('../../../visor/models/CFDI', () => ({
 jest.mock('../../../shared/services/rbac-store');
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
+  getCorteConciliacion: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
   listUsuariosConIdentificaciones: jest.fn(),
 }));
@@ -362,6 +363,58 @@ describe('GET /indicadores/reporte', () => {
     expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Cobranza-Identificacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
     expect(indicadoresService.buildReporteIdentificacion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GET /cortes', () => {
+  let app;
+
+  const FAKE_CORTE = {
+    periodo: 'semanal',
+    inicio:  new Date('2026-10-05T06:00:00.000Z'),
+    rezagados: { no_identificado: 1, reclasificado: 0, total: 1 },
+    nuevos: { no_identificado: 2, reclasificado: 0, identificado: 3, otros: 0, pendientes: 2, total: 5 },
+    identificadosEnPeriodo: { deRezagados: 1, deNuevos: 3, total: 4 },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getCorteConciliacion.mockResolvedValue(FAKE_CORTE);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getCorteConciliacion).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa periodo y banco tal cual al service, y devuelve el resultado', async () => {
+    const res = await request(app)
+      .get('/cortes')
+      .query({ periodo: 'mensual', banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ...FAKE_CORTE,
+      inicio: FAKE_CORTE.inicio.toISOString(), // serializado a JSON
+    });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
+  });
+
+  test('sin ?banco: se pasa null (no el string vacío)', async () => {
+    await request(app)
+      .get('/cortes')
+      .query({ periodo: 'semanal' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null });
   });
 });
 

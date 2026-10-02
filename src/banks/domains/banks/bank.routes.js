@@ -141,6 +141,19 @@ router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHa
   res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId }));
 }));
 
+// GET /api/banks/cortes — control periódico de conciliación (2026-10-02): rezagados,
+// nuevos depósitos del periodo e identificados en el periodo (separados por origen).
+// Sin scope de usuario (es un control de equipo, no de desempeño individual — ver
+// bank-indicadores.service.js#getCorteConciliacion). `periodo` lo decide el FRONTEND según
+// el rol (semanal para cobranza, mensual para contabilidad) — mismo criterio ya usado para
+// la visibilidad de pestañas del carousel de Bancos: es una decisión de UX, no de permisos,
+// así que el backend no la fuerza por rol (cualquiera con BANKS_READ puede pedir cualquier
+// periodo explícitamente).
+router.get('/cortes', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { periodo, banco } = req.query;
+  res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null }));
+}));
+
 // GET /api/banks/indicadores/reporte — Excel descargable del dashboard de Cobranza
 // (2026-09-18). Mismo permiso que /indicadores (BANKS_READ), NO BANKS_EXPORT ni un permiso
 // nuevo: es la MISMA data que ya se ve en pantalla, respetando el MISMO scope

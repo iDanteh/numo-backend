@@ -37,6 +37,7 @@ const PERM_META = {
   'banks:rules':        { label: 'Reglas de clasificación',         module: 'Bancos' },
   'banks:ficha':        { label: 'Registrar/eliminar fichas',       module: 'Bancos' },
   'banks:admin':        { label: 'Operaciones admin de bancos',     module: 'Bancos' },
+  'banks:ocultar-roles:bypass': { label: 'Ver movimientos ocultos para su rol', module: 'Bancos' },
   'banks:export':       { label: 'Exportar movimientos a Excel',    module: 'Bancos' },
   'banks:export:all':   { label: 'Exportar movimientos de cualquier usuario', module: 'Bancos' },
   'banks:erp:link':     { label: 'Vincular CxC del ERP directamente',        module: 'Bancos' },

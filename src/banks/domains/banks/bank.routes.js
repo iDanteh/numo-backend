@@ -154,6 +154,18 @@ router.get('/cortes', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler
   res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null }));
 }));
 
+// GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle
+// de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
+// data ya visible en pantalla, solo en formato descargable.
+router.get('/cortes/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { periodo, banco } = req.query;
+  const buffer = await indicadoresService.buildReporteCorte({ periodo, banco: banco || null });
+  const fecha = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Corte-Conciliacion-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
 // GET /api/banks/indicadores/reporte — Excel descargable del dashboard de Cobranza
 // (2026-09-18). Mismo permiso que /indicadores (BANKS_READ), NO BANKS_EXPORT ni un permiso
 // nuevo: es la MISMA data que ya se ve en pantalla, respetando el MISMO scope

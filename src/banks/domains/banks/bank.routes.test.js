@@ -48,6 +48,7 @@ jest.mock('../../../shared/services/rbac-store');
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
   getCorteConciliacion: jest.fn(),
+  buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
   listUsuariosConIdentificaciones: jest.fn(),
 }));
@@ -415,6 +416,39 @@ describe('GET /cortes', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null });
+  });
+});
+
+describe('GET /cortes/reporte', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.buildReporteCorte.mockResolvedValue(Buffer.from('fake-xlsx'));
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/reporte')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.buildReporteCorte).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa periodo/banco y responde con headers de descarga', async () => {
+    const res = await request(app)
+      .get('/cortes/reporte')
+      .query({ periodo: 'mensual', banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Corte-Conciliacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
   });
 });
 

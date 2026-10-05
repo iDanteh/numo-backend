@@ -118,7 +118,8 @@ async function seedBancos(fallos) {
       'NOMBRE_CAJA_DESTINO_PERMITIDAS — Filtro de transferencias entre cajas (JSON array de strings): solo se sincronizan transferencias cuyo nombreCajaDestino esté en esta lista. Vacío/[] = sin filtro (se sincroniza todo).',
       'TRANSFERENCIAS_DATE_WINDOW_DAYS — Ventana de fecha (± días) del matching de transferencias entre cajas contra Depósito en efectivo. Distinta de DATE_WINDOW_DAYS (esa es del motor ERP↔CxC).',
       'NETPAY_DATE_WINDOW_DAYS — Ventana de fecha (± días) del matching Netpay↔BBVA (liquidación de terminal contra depósito bancario). Distinta de TRANSFERENCIAS_DATE_WINDOW_DAYS (ese matching es contra Depósito en efectivo, este contra BBVA).',
-      'FICHAS_IMAGEN_FOLDER_ID — ID de la carpeta de Google Drive donde se guardará la imagen/documento de respaldo de una ficha bancaria (misma cuenta de servicio que COMPROBANTES_IMAGEN_FOLDER_ID en la sección Solicitudes de Cobro, GOOGLE_SERVICE_ACCOUNT_KEY2 — hay que compartirle esta carpeta también). El usuario la declara él mismo desde esta UI, no se siembra con un valor.',
+      'FICHAS_IMAGEN_FOLDER_ID — Carpeta de Drive para el respaldo de una ficha bancaria (misma cuenta que COMPROBANTES_IMAGEN_FOLDER_ID en Solicitudes de Cobro, GOOGLE_SERVICE_ACCOUNT_KEY2 — compartirle esta carpeta). Declarado desde la UI.',
+      'CORTE_PERIODO_COBRANZA / CORTE_PERIODO_CONTABILIDAD — Periodo ("semanal"/"mensual") del slide "Corte de conciliación" que ve cada rol (ver bank-indicadores.service.js#getPeriodoCortePorRol). Antes hardcodeado en el frontend.',
     ],
   });
 
@@ -253,6 +254,27 @@ async function seedBancos(fallos) {
   // sobre un primer intento que sí la sembraba, y que además incluía un interruptor
   // FICHAS_IMAGEN_HABILITADA que no debía existir — se sacó por completo). Queda documentada
   // en `modulos` de arriba para que se sepa qué representa cuando el usuario la cree.
+
+  // CORTE_PERIODO_COBRANZA / CORTE_PERIODO_CONTABILIDAD (2026-10-05) — mismo criterio "solo
+  // si no existe" que TRANSFERENCIAS_DATE_WINDOW_DAYS/NETPAY_DATE_WINDOW_DAYS: son valores de
+  // negocio ajustables por un admin, un re-run del seed no debe resetearlos. Default = el
+  // hardcode que ya tenía bank-corte-panel.component.ts antes de este cambio.
+  for (const [clave, valorDefault] of Object.entries({ CORTE_PERIODO_COBRANZA: 'semanal', CORTE_PERIODO_CONTABILIDAD: 'mensual' })) {
+    // eslint-disable-next-line no-await-in-loop
+    await _sembrarClave(fallos, 'bancos', clave, async () => {
+      const yaExiste = await svc.getValue('bancos', clave).then(() => true).catch(() => false);
+      if (yaExiste) {
+        console.log(`[seed-banks] bancos.${clave} ya existe — no se pisa.`);
+        return;
+      }
+      await svc.setValue('bancos', clave, valorDefault, {
+        esSecreto: false, tipo: 'texto',
+        descripcion: 'Periodo ("semanal" o "mensual") del slide "Corte de conciliación" para este rol.',
+        usuarioNombre: 'seed-script',
+      });
+      console.log(`[seed-banks] bancos.${clave} = ${valorDefault} (default de arranque — ajustable desde la UI)`);
+    });
+  }
 }
 
 // ── kore ──────────────────────────────────────────────────────────────────────
@@ -319,7 +341,7 @@ async function seedSolicitudes(fallos) {
       // GOOGLE_DRIVE_COMPROBANTES_FOLDER_ID en .env (drive-comprobantes.service.js); esta
       // clave queda documentada acá para cuando el usuario declare el valor desde la UI y el
       // código pase a leerla de Configuraciones Globales en vez de .env.
-      'COMPROBANTES_IMAGEN_FOLDER_ID — ID de la carpeta de Google Drive donde se guardan los comprobantes de las Solicitudes de Cobro (misma cuenta de servicio que FICHAS_IMAGEN_FOLDER_ID en la sección Bancos, GOOGLE_SERVICE_ACCOUNT_KEY2). El usuario la declara él mismo desde esta UI, no se siembra con un valor.',
+      'COMPROBANTES_IMAGEN_FOLDER_ID — Carpeta de Drive para los comprobantes de Solicitudes de Cobro (misma cuenta que FICHAS_IMAGEN_FOLDER_ID en Bancos, GOOGLE_SERVICE_ACCOUNT_KEY2). Declarado desde la UI.',
     ],
   });
 

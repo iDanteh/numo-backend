@@ -12,7 +12,7 @@ jest.mock('../../shared/middleware/auth.real', () => ({
   authenticate: (req, _res, next) => {
     req.user = {
       _id:  'user-test',
-      role: 'test-role',
+      role: req.headers['x-test-role'] || 'test-role',
       extraPermissions: [],
     };
     next();
@@ -48,6 +48,7 @@ jest.mock('../../../shared/services/rbac-store');
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
   getCorteConciliacion: jest.fn(),
+  getPeriodoCortePorRol: jest.fn(),
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
   listUsuariosConIdentificaciones: jest.fn(),
@@ -416,6 +417,38 @@ describe('GET /cortes', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null });
+  });
+});
+
+describe('GET /cortes/periodo-rol', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getPeriodoCortePorRol.mockResolvedValue({ periodo: 'semanal', puedeAlternar: false });
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/periodo-rol')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getPeriodoCortePorRol).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa el rol del usuario autenticado al service y devuelve el resultado', async () => {
+    const res = await request(app)
+      .get('/cortes/periodo-rol')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]))
+      .set('x-test-role', 'contabilidad');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ periodo: 'semanal', puedeAlternar: false });
+    expect(indicadoresService.getPeriodoCortePorRol).toHaveBeenCalledWith('contabilidad');
   });
 });
 

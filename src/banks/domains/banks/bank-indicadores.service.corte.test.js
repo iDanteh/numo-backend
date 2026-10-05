@@ -7,10 +7,12 @@
 jest.mock('./BankMovement.model');
 jest.mock('../../shared/socket');
 jest.mock('./drive-fichas.service');
+jest.mock('../../../shared/services/global-config.service');
 
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
-const { getCorteConciliacion, buildReporteCorte } = require('./bank-indicadores.service');
+const globalConfigService = require('../../../shared/services/global-config.service');
+const { getCorteConciliacion, buildReporteCorte, getPeriodoCortePorRol } = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
 // (21:00 UTC). Semana en curso → lunes 2026-10-05 00:00 México. Mes en curso → 2026-10-01
@@ -200,5 +202,49 @@ describe('buildReporteCorte', () => {
     expect(detalle.getRow(2).getCell(8).value).toBe('Sí');
     expect(detalle.getRow(3).getCell(8).value).toBe('No');
     expect(detalle.getRow(4).getCell(8).value).toBe('No');
+  });
+});
+
+describe('getPeriodoCortePorRol', () => {
+  test('cobranza: lee CORTE_PERIODO_COBRANZA de Configuraciones Globales, no puede alternar', async () => {
+    globalConfigService.getValue.mockResolvedValue('semanal');
+    const result = await getPeriodoCortePorRol('cobranza');
+
+    expect(result).toEqual({ periodo: 'semanal', puedeAlternar: false });
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('bancos', 'CORTE_PERIODO_COBRANZA');
+  });
+
+  test('contabilidad: lee CORTE_PERIODO_CONTABILIDAD, no puede alternar', async () => {
+    globalConfigService.getValue.mockResolvedValue('mensual');
+    const result = await getPeriodoCortePorRol('contabilidad');
+
+    expect(result).toEqual({ periodo: 'mensual', puedeAlternar: false });
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('bancos', 'CORTE_PERIODO_CONTABILIDAD');
+  });
+
+  test('config todavía no sembrada: cae al default anterior (cobranza=semanal)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error("No existe la configuración 'bancos.CORTE_PERIODO_COBRANZA' — cargala desde Configuraciones Globales."));
+    const result = await getPeriodoCortePorRol('cobranza');
+
+    expect(result).toEqual({ periodo: 'semanal', puedeAlternar: false });
+  });
+
+  test('config todavía no sembrada: cae al default anterior (contabilidad=mensual)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error("No existe la configuración 'bancos.CORTE_PERIODO_CONTABILIDAD' — cargala desde Configuraciones Globales."));
+    const result = await getPeriodoCortePorRol('contabilidad');
+
+    expect(result).toEqual({ periodo: 'mensual', puedeAlternar: false });
+  });
+
+  test('error real (no de "no existe") se propaga, no se confunde con config faltante', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('CONFIG_MASTER_KEY no está definida'));
+    await expect(getPeriodoCortePorRol('cobranza')).rejects.toThrow('CONFIG_MASTER_KEY no está definida');
+  });
+
+  test('otro rol (ej. admin): semanal por default, puede alternar, sin leer configuración', async () => {
+    const result = await getPeriodoCortePorRol('admin');
+
+    expect(result).toEqual({ periodo: 'semanal', puedeAlternar: true });
+    expect(globalConfigService.getValue).not.toHaveBeenCalled();
   });
 });

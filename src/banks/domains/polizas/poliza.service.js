@@ -1955,7 +1955,11 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   const bucketsEfectivo = new Map();
   const consolidado = [];
   for (const m of conReferenciaFusionada) {
-    const esEfectivoRealSinReferencia = !m._referenciaBancoReal && m.formaPago === '01';
+    // Los cobros en la caja de otra sucursal ("DEP. PTO", "EFECTIVO-COS", ver
+    // cobranza-poliza-generator.service.js) van un renglón por factura, como
+    // en las pólizas manuales — no se juntan en el bucket.
+    const esEfectivoRealSinReferencia = !m._referenciaBancoReal && m.formaPago === '01'
+      && !(m.serie === 'EFECTIVO-COS' || String(m.serie ?? '').startsWith('DEP. '));
     if (!esEfectivoRealSinReferencia) {
       consolidado.push(m);
       continue;

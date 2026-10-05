@@ -568,6 +568,10 @@ async function computeDashboardData(query) {
         // Sin UUID real (SINUUID): bucket propio, no afecta totales de conciliación
         totalSinUuid:    { $sum: { $cond: ['$esSinUuid', MONTO_EFECTIVO_EXPR, 0] } },
         countSinUuid:    { $sum: { $cond: ['$esSinUuid', 1, 0] } },
+        // Activos conciliados manualmente (SAT sin contraparte ERP, conciliarNotInErp):
+        // explican la parte de la diferencia ERP − SAT que ya se revisó
+        totalConciliadoManual: { $sum: { $cond: [{ $and: [{ $not: [{ $or: ['$excluir', '$esSinUuid'] }] }, { $eq: ['$lastComparisonStatus', 'conciliado'] }] }, MONTO_EFECTIVO_EXPR, 0] } },
+        countConciliadoManual: { $sum: { $cond: [{ $and: [{ $not: [{ $or: ['$excluir', '$esSinUuid'] }] }, { $eq: ['$lastComparisonStatus', 'conciliado'] }] }, 1, 0] } },
       }},
     ]),
 
@@ -645,6 +649,11 @@ async function computeDashboardData(query) {
   const totalSAT = Math.round((satRow.total ?? 0) * 100) / 100;  // 2 decimales
   const countERP = erpRow.count;           // solo activos
   const countSAT = satRow.count;           // solo activos
+  // Lo conciliado manualmente está en totalSAT sin contraparte ERP: si se descuenta,
+  // queda la diferencia que sigue sin explicar
+  const totalConciliadoManual = Math.round((satRow.totalConciliadoManual ?? 0) * 100) / 100;
+  const countConciliadoManual = satRow.countConciliadoManual ?? 0;
+  const diferenciaPendiente   = Math.round((totalERP - totalSAT + totalConciliadoManual) * 100) / 100;
 
   const ivaRowERP = ivaAggregate.find(r => r._id === 'ERP')     ?? { ivaTrasladadoTotal: 0, ivaRetenidoTotal: 0 };
   const ivaRowSAT = ivaAggregate.find(r => r._id === 'SAT')     ?? { ivaTrasladadoTotal: 0, ivaRetenidoTotal: 0 };
@@ -697,6 +706,8 @@ async function computeDashboardData(query) {
       vigenteErpSat: { count: vigenteErpSatRow.count, total: vigenteErpSatRow.total },
       totalERP, totalSAT, diferencia: totalERP - totalSAT,
       countERP, countSAT,
+      conciliadoManual: { total: totalConciliadoManual, count: countConciliadoManual },
+      diferenciaPendiente,
       // Cancelados y deshabilitados separados del total principal
       erpCancelados: { total: erpRow.totalCancelados, count: erpRow.countCancelados },
       satCancelados: { total: satRow.totalCancelados, count: satRow.countCancelados },

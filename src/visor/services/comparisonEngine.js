@@ -2,6 +2,7 @@ const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const ComparisonSession = require('../models/ComparisonSession');
 const Discrepancy = require('../models/Discrepancy');
+const { comentariosPorTipo, repartirComentarios } = require('./discrepancy-comentarios.util');
 const { verifyCFDIWithSAT } = require('./satVerification');
 const { logger } = require('../../shared/utils/logger');
 
@@ -311,7 +312,10 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
   // temporales (inofensivos) en lugar de cero discrepancias (falso estado limpio).
   let newDiscrepancyIds = [];
   if (differences.length > 0) {
-    const newDocs = await Promise.all(differences.map(diff => {
+    // Comentarios de las abiertas que se borran abajo — pasan a las nuevas.
+    const comentariosPrevios = await comentariosPorTipo({ uuid: erpCfdi.uuid, status: { $nin: ['resolved', 'ignored', 'accepted'] } });
+    const comentariosNuevas = repartirComentarios(comentariosPrevios, differences.map(diff => diff.type || mapDiffToType(diff.field)));
+    const newDocs = await Promise.all(differences.map((diff, iDiff) => {
       const type = diff.type || mapDiffToType(diff.field);
       const erpVal = String(diff.erpValue ?? '');
       const satVal = String(diff.satValue ?? '');
@@ -333,6 +337,7 @@ const compareCFDI = async (erpCfdiId, options = {}) => {
         periodo,
         tipoDeComprobante: erpCfdi.tipoDeComprobante ?? undefined,
         satStatus: erpCfdi.satStatus ?? undefined,
+        ...(comentariosNuevas[iDiff].length && { comentarios: comentariosNuevas[iDiff] }),
         // Heredar resolución previa si la diferencia exacta ya fue atendida
         ...(prev && {
           status: prev.status,
@@ -709,11 +714,10 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
   );
 
   // Eliminar discrepancias abiertas previas del mismo UUID para evitar duplicados
-  await Discrepancy.deleteMany({
-    uuid: satCfdi.uuid,
-    type: 'MISSING_IN_ERP',
-    status: { $nin: ['resolved', 'ignored', 'accepted'] },
-  });
+  // (sus comentarios pasan a la nueva).
+  const filtroAbiertas = { uuid: satCfdi.uuid, type: 'MISSING_IN_ERP', status: { $nin: ['resolved', 'ignored', 'accepted'] } };
+  const [comentariosMissing] = repartirComentarios(await comentariosPorTipo(filtroAbiertas), ['MISSING_IN_ERP']);
+  await Discrepancy.deleteMany(filtroAbiertas);
 
   // Solo guardar discrepancia si no está cancelado (cancelado sin ERP no es problema fiscal)
   if (!esCanceladoSinERP) {
@@ -729,6 +733,7 @@ const compareSATOnlyCFDI = async (satCfdiId, options = {}) => {
       rfcReceptor:  satCfdi.receptor?.rfc ?? '',
       ejercicio,
       periodo,
+      ...(comentariosMissing.length && { comentarios: comentariosMissing }),
     });
   }
 

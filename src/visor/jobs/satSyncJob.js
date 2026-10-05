@@ -3,6 +3,7 @@ const config = require('../../config/env');
 const CFDI = require('../models/CFDI');
 const Comparison = require('../models/Comparison');
 const Discrepancy = require('../models/Discrepancy');
+const { comentariosPorTipo, repartirComentarios } = require('../services/discrepancy-comentarios.util');
 const ComparisonSession = require('../models/ComparisonSession');
 const { batchCompareCFDIs, formatSessionName } = require('../services/comparisonEngine');
 const entityRepo = require('../repositories/entity.repository');
@@ -1608,8 +1609,10 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
       { upsert: true, new: true }
     );
 
+    // Los comentarios de las que se borran pasan a las nuevas del mismo tipo.
+    const comentariosNuevas = repartirComentarios(await comentariosPorTipo({ comparisonId: comp._id }), diferencias.map(d => mapCampoToType(d.campo)));
     await Discrepancy.deleteMany({ comparisonId: comp._id });
-    await Promise.all(diferencias.map(d => Discrepancy.create({
+    await Promise.all(diferencias.map((d, iDif) => Discrepancy.create({
       comparisonId: comp._id,
       uuid:         sat.uuid,
       type:         mapCampoToType(d.campo),
@@ -1620,6 +1623,7 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
       rfcEmisor:    sat.rfcEmisor,
       rfcReceptor:  sat.rfcReceptor,
       status:       'open',
+      ...(comentariosNuevas[iDif].length && { comentarios: comentariosNuevas[iDif] }),
       ...fp,
     })));
 

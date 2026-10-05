@@ -1851,12 +1851,12 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       };
     }
     const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
-    // Columna C en Cobranza: "AUT.<numeroAutorizacion>" del banco, como el
-    // ejemplo real "9 (4).xls" (2026-09-30: CARLOS HERRERA 034139 →
-    // AUT.132916686); sin autorización, el folio de Numo. La fusión de abajo
-    // sigue agrupando por `_referenciaBancoReal` (folio), no por este texto.
-    const serieBancoReal = referenciaBancoReal && bancario?.numeroAutorizacion
-      ? `AUT.${bancario.numeroAutorizacion}` : referenciaBancoReal;
+    // Columna C en Cobranza: el folio de Numo del depósito (2026-10-05,
+    // confirmado con el usuario con sus pólizas de 19 a 29-sep: "47487",
+    // "49703"…). El 30-sep se había cambiado a "AUT.<numeroAutorizacion>" por
+    // el ejemplo "9 (4).xls" del 10-jul; el "AUT." se queda solo en NI y en el
+    // EFECTIVO de una ficha Banamex.
+    const serieBancoReal = referenciaBancoReal;
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que

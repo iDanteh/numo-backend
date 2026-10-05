@@ -40,6 +40,9 @@ const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
 // `esCasoNormalParaSplit` en `cfdiToMovimientos`.
 const CODIGO_CUENTA_CAJA   = '1101010003';
 const CODIGO_CUENTA_BANCOS = '1102011005';
+// Clientes Nacionales General 16% / 0% (CxC de ventas a crédito).
+const CODIGO_CUENTA_CLIENTES_16 = '1103010001';
+const CODIGO_CUENTA_CLIENTES_0  = '1103010002';
 // Cuentas bancarias específicas (igual que `BANCO_A_CODIGO_CUENTA` en
 // poliza.service.js — duplicado a propósito). Una regla que apunte a
 // cualquiera de estas cuentas se trata igual que si apuntara a la cuenta
@@ -731,10 +734,29 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ];
   }
 
+  // NC (tipo E) que ajusta una venta a CRÉDITO (PPD): la venta nunca entró a
+  // Caja/Bancos, así que la devolución reduce la CxC (Clientes 16%/0%), no
+  // sale de Caja/Bancos por identificar — la regla se elige por la formaPago
+  // de la propia NC (ej. 03 → Bancos) y esa cuenta no aplica aquí. Mismo
+  // criterio que las reglas "fP99"/"fP15" (fix-nc-ppd-clientes-abono.js), que
+  // solo cubrían NCs con formaPago 99/15. Caso real CONSTRUCASA 30-sep-2026:
+  // CONSTRUCCIONES Y SERVICIOS LUKMAN C0-260901807/808/811 abonaban
+  // $86,903.87 a 1102011005. Se excluyen las NC de cancelación-refacturación
+  // (Serie=CANCELACION), que tienen su propio tratamiento con Caja puente.
+  const _esNcCancelacion = (cfdi.documentosRelacionados || [])
+    .some(d => (d.Serie ?? '').toUpperCase() === 'CANCELACION');
+  const esNcVentaCredito = tipo === 'E' && context.metodoPagoRelacionado === 'PPD'
+    && !_esNcCancelacion && CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaAbono);
+  const cuentaAbonoPrincipal = !esNcVentaCredito
+    ? rule.cuentaAbono
+    : (rule.tasaIva === '0' || (!rule.tasaIva && !(iva > 0)))
+      ? CODIGO_CUENTA_CLIENTES_0
+      : CODIGO_CUENTA_CLIENTES_16;
+
   // Resolver cuentaId a partir del código
   const codigos = [
     rule.cuentaCargo,
-    rule.cuentaAbono,
+    cuentaAbonoPrincipal,
     rule.cuentaAbono2,
     rule.cuentaIva,
     rule.cuentaIvaPPD,
@@ -1722,7 +1744,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     });
   } else {
     movs.push({
-      cuentaId:    cuentaMap[rule.cuentaAbono] ?? null,
+      cuentaId:    cuentaMap[cuentaAbonoPrincipal] ?? null,
       concepto,
       centroCosto,
       ventaFecha,

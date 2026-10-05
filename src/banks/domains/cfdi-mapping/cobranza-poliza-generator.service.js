@@ -38,6 +38,7 @@ const CFDI = require('../../../visor/models/CFDI');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const centrosSvc = require('../centros-costo/centros-costo.service');
 const mappingSvc = require('./cfdi-mapping.service');
+const fichaEfectivoSvc = require('./cobranza-ficha-efectivo.service');
 const { _getRulesActive } = require('./balanza-preliminar.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
 const {
@@ -233,7 +234,11 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
           ? Math.abs(Number(cobro.monto) || 0)
           : (Number(fp.monto) || 0);
-        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null });
+        // Caja donde se cobró + identidad del pago completo (un pago en caja
+        // puede liquidar varios tickets: Kore repite el total del pago en
+        // `fp.monto` de cada uno) — ver cobranza-ficha-efectivo.service.js.
+        const grupoPago = `${cobro.claveCentro ?? ''}|${String(cobro.fecha ?? '').slice(0, 16)}|${(Number(fp.monto) || 0).toFixed(2)}`;
+        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null, claveCentro: cobro.claveCentro ?? null, grupoPago });
       }
     }
     return formasPago;
@@ -295,6 +300,35 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
   }
 
   return { doctosPorUuid };
+}
+
+// Cobro hecho en la caja de una sucursal que no es CEDIS (2026-10-05, pólizas
+// manuales del usuario 19-29/sep): el Cargo va con el centro de la sucursal
+// donde se cobró, según cómo se mueve ese dinero:
+//   - efectivo en Puerto (O0): se deposita → 1102011001 "DEP. PTO" (centro 120)
+//   - efectivo en otra caja (C0, F0…): se queda ahí → 1101010003 "EFECTIVO-COS"
+//   - tarjeta: 1101010001 "TARJETA DE CREDITO"/"TARJETA DE DEBITO"
+const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'DEP. PTO' };
+const CODIGO_CUENTA_BANCO_DEPOSITO_CAJA = '1102011001';
+const CODIGO_CUENTA_CAJA_GENERAL        = '1101010001';
+const ETIQUETA_EFECTIVO_OTRA_CAJA       = 'EFECTIVO-COS';
+const ETIQUETA_TARJETA = { '04': 'TARJETA DE CREDITO', '28': 'TARJETA DE DEBITO' };
+function _cargoCobroOtraCaja(fp, cuentaMap, ccBySerieMap) {
+  const caja = fp.claveCentro;
+  if (!caja || caja === fichaEfectivoSvc.CAJA_COBRANZA_CEDIS) return null;
+  const ccCaja = ccBySerieMap?.[caja] ?? null;
+  const centro = ccCaja ? { _centroCostoFijo: ccCaja } : {};
+  if (fp.claveSat === '01') {
+    const etiquetaDeposito = ETIQUETA_DEPOSITO_POR_CAJA[caja];
+    if (etiquetaDeposito && cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA]) {
+      return { cuentaId: cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA], serie: etiquetaDeposito, ...centro };
+    }
+    return { serie: ETIQUETA_EFECTIVO_OTRA_CAJA, ...centro };
+  }
+  if (ETIQUETA_TARJETA[fp.claveSat] && cuentaMap[CODIGO_CUENTA_CAJA_GENERAL]) {
+    return { cuentaId: cuentaMap[CODIGO_CUENTA_CAJA_GENERAL], serie: ETIQUETA_TARJETA[fp.claveSat], ...centro };
+  }
+  return null;
 }
 
 /**
@@ -502,11 +536,14 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
               const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
               if (montoLinea <= 0) return;
               const esEfectivo = fp.claveSat === '01';
+              const otraCaja = _cargoCobroOtraCaja(fp, cuentaMap, context.ccBySerieMap);
               movs.push({
                 ...baseFactura,
                 cuentaId: esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : (cuentaMap[rule.cuentaCargo] ?? null),
                 debe: montoLinea, haber: 0, _esCargoPrincipal: true,
                 _formaPagoReal: fp.claveSat ?? null,
+                _claveCentroCobro: fp.claveCentro ?? null, _grupoPago: fp.grupoPago ?? null,
+                ...(otraCaja ?? {}),
               });
             });
           } else {
@@ -717,7 +754,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       .concat([
         CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR,
         CODIGO_CUENTA_PUENTE_SUCURSALES, CODIGO_CUENTA_IVA_POR_TRASLADAR, CODIGO_CUENTA_IVA_TRASLADADO, CODIGO_CUENTA_CLIENTES,
-        CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS,
+        CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS, CODIGO_CUENTA_BANCO_DEPOSITO_CAJA, CODIGO_CUENTA_CAJA_GENERAL,
       ]),
   )];
   const cuentasRows = codigosNecesarios.length
@@ -765,10 +802,20 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       todosLosMovimientos.push({
         ...m,
         cuentaFaltante: m.cuentaId == null,
-        centroCosto:    cc?.clave ?? m.centroCosto ?? null,
-        centroCostoId:  cc?.id    ?? null,
+        // Cobro en la caja de otra sucursal: el centro de esa caja (ver `_cargoCobroOtraCaja`).
+        centroCosto:    m._centroCostoFijo?.clave ?? cc?.clave ?? m.centroCosto ?? null,
+        centroCostoId:  m._centroCostoFijo?.id    ?? cc?.id    ?? null,
       });
     }
+  }
+
+  // 7b. Efectivo cobrado en la caja de CEDIS contra la ficha "dd/mm COBRANZA"
+  // (cargo al banco + PXA) — solo por día y cuando la póliza incluye CEDIS.
+  if (fechaInicio && fechaInicio === fechaFin && (!centroCostoId || serieDelCentro === fichaEfectivoSvc.CAJA_COBRANZA_CEDIS)) {
+    advertencias.push(...await fichaEfectivoSvc.aplicarFichaEfectivoCobranza({
+      movs: todosLosMovimientos, rfc, dia: fechaInicio, cuentaMap,
+      centroCostoCedis: ccBySerieMap[fichaEfectivoSvc.CAJA_COBRANZA_CEDIS]?.clave ?? null,
+    }));
   }
 
   // 8. Cobros de otra sucursal PENDIENTES DE CONSUMIR — facturas de ESTA

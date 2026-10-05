@@ -48,7 +48,8 @@ async function findWithAutoSync() {
       isActive:   true,
       syncConfig: { [Op.contains]: { autoSync: true } },
     },
-    attributes: ['id', 'rfc', 'nombre', 'syncConfig'],
+    // emailsAlerta: lo usa credencialesAlertJob (aviso de credenciales SAT faltantes)
+    attributes: ['id', 'rfc', 'nombre', 'syncConfig', 'emailsAlerta'],
   });
 }
 

@@ -119,22 +119,26 @@ async function verificarVencimientoCredenciales() {
       { tipo: 'horas', umbral: config.alertasSat.horasAntes,   urgente: true  },
     ];
 
-    for (const { tipo, umbral, urgente } of umbrales) {
-      if (cred.alertasEnviadas?.[tipo]) continue;
-      if (horas > umbral) continue;
+    // Si varios umbrales quedaron pendientes a la vez (servidor caído, credenciales
+    // subidas con poco TTL, horasAntes >= 24) se manda UN solo correo — el más
+    // urgente — y se marcan todos, en vez de mandar 2-3 correos en la misma corrida.
+    const pendientes = umbrales.filter(({ tipo, umbral }) => !cred.alertasEnviadas?.[tipo] && horas <= umbral);
+    if (pendientes.length === 0) continue;
+    const { urgente } = pendientes.reduce((a, b) => (b.umbral < a.umbral ? b : a));
 
-      const entity = await entityRepo.findByRfc(cred.rfc);
-      if (!entity || !entity.isActive) continue;
+    const entity = await entityRepo.findByRfc(cred.rfc);
+    if (!entity || !entity.isActive) continue;
 
-      const emails = (entity.emailsAlerta || []).filter(Boolean);
-      if (emails.length === 0) {
-        logger.warn(`[credencialesAlertJob] ${cred.rfc} sin credenciales por vencer sin emailsAlerta configurado — se omite aviso`);
-        continue;
-      }
+    const emails = (entity.emailsAlerta || []).filter(Boolean);
+    if (emails.length === 0) {
+      logger.warn(`[credencialesAlertJob] ${cred.rfc} credenciales por vencer sin emailsAlerta configurado — se omite aviso`);
+      continue;
+    }
 
-      const { subject, html } = construirCorreo({ nombre: entity.nombre, rfc: cred.rfc, horas, urgente });
-      const enviado = await emailSvc.enviarCorreo({ to: emails, subject, html });
-      if (enviado) await credencialesSvc.marcarAlertaEnviada(cred.rfc, tipo);
+    const { subject, html } = construirCorreo({ nombre: entity.nombre, rfc: cred.rfc, horas, urgente });
+    const enviado = await emailSvc.enviarCorreo({ to: emails, subject, html });
+    if (enviado) {
+      for (const { tipo } of pendientes) await credencialesSvc.marcarAlertaEnviada(cred.rfc, tipo);
     }
   }
 }

@@ -3,6 +3,7 @@
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
 const { _rangoAnioMesMexico, _inicioDiaMx, _finDiaMx } = require('./bank.service');
+const globalConfigService = require('../../../shared/services/global-config.service');
 
 const MS_PER_HOUR = 3600000;
 
@@ -610,6 +611,40 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null } = {}) 
   return { periodo, inicio, rezagados, nuevos, identificadosEnPeriodo };
 }
 
+// Periodo de corte por rol (2026-10-05): antes hardcodeado en el frontend
+// (bank-corte-panel.component.ts), movido acá porque el backend YA conoce el rol autenticado
+// (req.user.role) y porque Configuraciones Globales no expone sus rutas de administración a
+// roles que no sean config:manage — exponerlo como un endpoint propio con banks:read evita ese
+// problema de permisos. Fallback a los valores que ya eran el hardcode anterior si la config
+// todavía no existe (ambiente recién desplegado, antes de correr el seed).
+const PERIODO_ROL_DEFAULT = {
+  cobranza:     'semanal',
+  contabilidad: 'mensual',
+};
+
+async function _periodoConfigurado(role) {
+  try {
+    return await globalConfigService.getValue('bancos', `CORTE_PERIODO_${role.toUpperCase()}`);
+  } catch (err) {
+    if (err.message?.includes('No existe la configuración')) return PERIODO_ROL_DEFAULT[role];
+    throw err;
+  }
+}
+
+/**
+ * Qué periodo de corte ve un rol, y si puede alternar entre semanal/mensual — gate de
+ * presentación (mismo criterio ya documentado en bank.routes.js#GET /cortes: el backend no
+ * fuerza el periodo por permisos, cualquiera con banks:read puede pedir cualquiera
+ * explícitamente). cobranza/contabilidad quedan fijos al periodo configurado; cualquier otro
+ * rol puede alternar, con 'semanal' como default.
+ */
+async function getPeriodoCortePorRol(role) {
+  if (role === 'cobranza' || role === 'contabilidad') {
+    return { periodo: await _periodoConfigurado(role), puedeAlternar: false };
+  }
+  return { periodo: 'semanal', puedeAlternar: true };
+}
+
 /**
  * Excel descargable del corte de conciliación (2026-10-02, pedido explícito del usuario:
  * "que también traiga el detallado de los movimientos involucrados con su clasificación").
@@ -735,6 +770,7 @@ async function buildReporteCorte({ periodo = 'semanal', banco = null } = {}) {
 module.exports = {
   getIndicadoresIdentificacion,
   getCorteConciliacion,
+  getPeriodoCortePorRol,
   buildReporteCorte,
   buildReporteIdentificacion,
   listUsuariosConIdentificaciones,

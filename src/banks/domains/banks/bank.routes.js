@@ -154,6 +154,14 @@ router.get('/cortes', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler
   res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null }));
 }));
 
+// GET /api/banks/cortes/periodo-rol — qué periodo ve el usuario autenticado y si puede
+// alternar (2026-10-05, configurable desde Configuraciones Globales — ver
+// bank-indicadores.service.js#getPeriodoCortePorRol). Mismo permiso que /cortes: esto decide
+// la UX del toggle, no un acceso distinto a la data.
+router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  res.json(await indicadoresService.getPeriodoCortePorRol(req.user.role));
+}));
+
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle
 // de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
 // data ya visible en pantalla, solo en formato descargable.

@@ -418,6 +418,17 @@ describe('GET /cortes', () => {
 
     expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null });
   });
+
+  test('con fechaInicio/fechaFin: se pasan tal cual al service (corte histórico)', async () => {
+    await request(app)
+      .get('/cortes')
+      .query({ periodo: 'semanal', fechaInicio: '2026-09-14', fechaFin: '2026-09-20' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({
+      periodo: 'semanal', banco: null, fechaInicio: '2026-09-14', fechaFin: '2026-09-20',
+    });
+  });
 });
 
 describe('GET /cortes/periodo-rol', () => {
@@ -482,6 +493,17 @@ describe('GET /cortes/reporte', () => {
     expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Corte-Conciliacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
     expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
+  });
+
+  test('con fechaInicio/fechaFin: se pasan tal cual al service (reporte de corte histórico)', async () => {
+    await request(app)
+      .get('/cortes/reporte')
+      .query({ periodo: 'mensual', banco: 'BBVA', fechaInicio: '2026-09-01', fechaFin: '2026-09-30' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({
+      periodo: 'mensual', banco: 'BBVA', fechaInicio: '2026-09-01', fechaFin: '2026-09-30',
+    });
   });
 });
 

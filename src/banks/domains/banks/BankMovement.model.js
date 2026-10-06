@@ -230,6 +230,17 @@ const bankMovementSchema = new mongoose.Schema({
     default: null,
   },
 
+  // Timestamp del ÚLTIMO cambio de status hecho por los 2 caminos que NO dejan rastro en
+  // historialVinculacion (abajo) ni en _changelog: updateStatus() (override manual/admin) y
+  // reclasifyMovements() (reclasificación masiva, bank.service.js). NO es un historial
+  // completo — solo la marca de tiempo del último cambio — pensado para que
+  // getCorteConciliacion() (bank-indicadores.service.js) pueda detectar, en un corte
+  // histórico personalizado, que un movimiento tuvo un cambio de status DESPUÉS del cierre
+  // elegido y por lo tanto su estatus reconstruido es una aproximación, no un hecho certero.
+  // null = sin cambios registrados por estos 2 caminos todavía (doc preexistente al deploy
+  // de esta feature, o nunca tocado por ellos).
+  ultimoCambioStatusAt: { type: Date, default: null },
+
   // Dejó de leerse en bank-indicadores.service.js desde el cutoff de fecha (2026-08-17,
   // INDICADORES_DESDE) — el dashboard ahora filtra directo por `createdAt`, sin distinguir
   // histórico/nuevo. Campo conservado por compatibilidad con documentos existentes; pendiente

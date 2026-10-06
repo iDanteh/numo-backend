@@ -150,8 +150,8 @@ router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHa
 // así que el backend no la fuerza por rol (cualquiera con BANKS_READ puede pedir cualquier
 // periodo explícitamente).
 router.get('/cortes', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const { periodo, banco } = req.query;
-  res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null }));
+  const { periodo, banco, fechaInicio, fechaFin } = req.query;
+  res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null, fechaInicio, fechaFin }));
 }));
 
 // GET /api/banks/cortes/periodo-rol — qué periodo ve el usuario autenticado y si puede
@@ -166,8 +166,8 @@ router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), 
 // de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
 // data ya visible en pantalla, solo en formato descargable.
 router.get('/cortes/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const { periodo, banco } = req.query;
-  const buffer = await indicadoresService.buildReporteCorte({ periodo, banco: banco || null });
+  const { periodo, banco, fechaInicio, fechaFin } = req.query;
+  const buffer = await indicadoresService.buildReporteCorte({ periodo, banco: banco || null, fechaInicio, fechaFin });
   const fecha = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="Corte-Conciliacion-${fecha}.xlsx"`);

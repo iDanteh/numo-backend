@@ -178,10 +178,24 @@ function _itemBase(unit) {
   };
 }
 
-// _crearYEvaluar — create -> _registrarFoliosIdempotente -> evaluarReporte, SIN capturar
-// errores (los propaga tal cual) — reusada tanto por el camino N=1 (que necesita
-// distinguir 409/rethrow de "ya existe") como por _procesarDeposito (N>1, que clasifica el
-// resultado en vez de lanzar).
+// _crearYEvaluar — create -> _registrarFoliosIdempotente -> consultarFoliosPendientes ->
+// evaluarReporte, SIN capturar errores de create/registrar/evaluar (los propaga tal cual) —
+// reusada tanto por el camino N=1 (que necesita distinguir 409/rethrow de "ya existe") como
+// por _procesarDeposito (N>1, que clasifica el resultado en vez de lanzar).
+//
+// koreCache completo desde la carga (2026-10-06, pedido explícito del usuario): antes
+// koreCache solo se llenaba al abrir un folio a mano o al exportar el Excel — "incompleto por
+// default" hasta que alguien lo pidiera. Consultarlo ACÁ, apenas se crea el reporte, aprovecha
+// que la venta todavía está fresca en Kore (evita el riesgo real de folios viejos que Kore ya
+// no tiene, ver scripts/backfill-netpay-kore-cache.js, que sigue existiendo para el historial
+// previo a este cambio). Va ANTES de evaluarReporte() a propósito: esa función siempre
+// re-lee el documento con `findById` (nunca reusa el `reporte` en memoria de arriba), así que
+// el `reporteEvaluado` que devolvemos ya sale con los folios completos, sin necesidad de un
+// segundo fetch.
+//
+// Best-effort, nunca aborta la carga: un fallo acá (Kore caído, 429 agotado) no debe impedir
+// que el reporte quede creado y evaluado — mismo criterio de fallo parcial que
+// consultarFoliosPendientes ya aplica folio por folio puertas adentro.
 async function _crearYEvaluar(unit, nombreArchivo, user) {
   const reporte = await NetpayReporte.create({
     ...unit,
@@ -192,6 +206,13 @@ async function _crearYEvaluar(unit, nombreArchivo, user) {
   });
 
   await _registrarFoliosIdempotente(reporte);
+
+  try {
+    await consultarFoliosPendientes(reporte._id);
+  } catch (err) {
+    logger.warn(`[NetpayReporte] no se pudo completar koreCache al cargar el reporte ${reporte._id}: ${err.message}`);
+  }
+
   const { reporte: reporteEvaluado, candidatos } = await evaluarReporte(reporte._id);
   return { reporte: reporteEvaluado, candidatos, reporteId: reporte._id };
 }

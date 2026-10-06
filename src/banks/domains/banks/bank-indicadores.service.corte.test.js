@@ -12,6 +12,7 @@ jest.mock('../../../shared/services/global-config.service');
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
 const globalConfigService = require('../../../shared/services/global-config.service');
+const { BadRequestError } = require('../../shared/errors/AppError');
 const { getCorteConciliacion, buildReporteCorte, getPeriodoCortePorRol } = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
@@ -53,6 +54,19 @@ function mockFinds(antesDelCorteDocs, nuevosDocs) {
   BankMovement.find
     .mockReturnValueOnce({ select: selectAntes })
     .mockReturnValueOnce({ select: selectNuevos });
+}
+
+// Modo histórico (_getCorteHistorico): Promise.all([find(rezagados), find(nuevos),
+// aggregate(identificadosPorOrigen)]) — los 2 find().select().lean() deben encolarse en ESE
+// orden, el aggregate se mockea aparte con mockResolvedValueOnce.
+function mockFindsHistorico(rezagadosDocs, nuevosDocs) {
+  const leanRez   = jest.fn().mockResolvedValue(rezagadosDocs);
+  const selectRez = jest.fn().mockReturnValue({ lean: leanRez });
+  const leanNue   = jest.fn().mockResolvedValue(nuevosDocs);
+  const selectNue = jest.fn().mockReturnValue({ lean: leanNue });
+  BankMovement.find
+    .mockReturnValueOnce({ select: selectRez })
+    .mockReturnValueOnce({ select: selectNue });
 }
 
 async function leerWorkbook(buffer) {
@@ -141,6 +155,82 @@ describe('getCorteConciliacion', () => {
       expect(call[0][0].$match.banco).toBe('BBVA');
       expect(call[0][0].$match.deposito).toEqual({ $gt: 0 }); // buildBaseMatch — solo depósitos
     }
+  });
+});
+
+describe('getCorteConciliacion — corte histórico (fechaInicio/fechaFin)', () => {
+  // Rango histórico fijo para todos los casos: semana lunes 2026-09-14 a domingo 2026-09-20
+  // (hora de México) — bien antes de AHORA_MX (miércoles 2026-10-07), así que no se confunde
+  // con el periodo en curso.
+  const FECHA_INICIO = '2026-09-14';
+  const FECHA_FIN    = '2026-09-20';
+  const INICIO_ESPERADO = new Date(Date.UTC(2026, 8, 14, 6, 0, 0));
+  const FIN_ESPERADO    = new Date(Date.UTC(2026, 8, 21, 5, 59, 59, 999));
+
+  test('(a) identificado antes de fin, sin reversión: cuenta como identificado', async () => {
+    mockFindsHistorico([], [{
+      _id: 'm1', status: 'identificado',
+      primeraIdentificacionAt: new Date(Date.UTC(2026, 8, 16, 12, 0, 0)),
+      ultimoCambioStatusAt: null,
+      historialVinculacion: [],
+    }]);
+    BankMovement.aggregate.mockResolvedValueOnce([]); // identificadosPorOrigen
+
+    const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN });
+
+    expect(result.historico).toBe(true);
+    expect(result.inicio).toEqual(INICIO_ESPERADO);
+    expect(result.fin).toEqual(FIN_ESPERADO);
+    expect(result.nuevos.identificado).toBe(1);
+    expect(result.nuevos.no_identificado).toBe(0);
+    expect(result.advertencia).toBeUndefined();
+  });
+
+  test('(b) identificado pero con historialVinculacion "desvinculado" antes del cierre: cuenta como pendiente, NO identificado', async () => {
+    const pid = new Date(Date.UTC(2026, 8, 16, 12, 0, 0));
+    mockFindsHistorico([], [{
+      _id: 'm2', status: 'no_identificado', // ya refleja la reversión real
+      primeraIdentificacionAt: pid,
+      ultimoCambioStatusAt: null,
+      historialVinculacion: [
+        { at: new Date(Date.UTC(2026, 8, 17, 9, 0, 0)), accion: 'desvinculado', erpId: 'CXC-1', origen: 'manual' },
+      ],
+    }]);
+    BankMovement.aggregate.mockResolvedValueOnce([]);
+
+    const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN });
+
+    expect(result.nuevos.identificado).toBe(0);
+    expect(result.nuevos.no_identificado).toBe(1);
+    expect(result.nuevos.pendientes).toBe(1);
+  });
+
+  test('(c) ultimoCambioStatusAt posterior a fin: aparece en advertencia.registrosConCambioPosteriorAlCierre', async () => {
+    mockFindsHistorico([{
+      _id: 'm3', status: 'no_identificado',
+      primeraIdentificacionAt: null,
+      ultimoCambioStatusAt: new Date(Date.UTC(2026, 9, 1, 0, 0, 0)), // después de FIN_ESPERADO
+      historialVinculacion: [],
+    }], []);
+    BankMovement.aggregate.mockResolvedValueOnce([]);
+
+    const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN });
+
+    expect(result.advertencia).toEqual({ registrosConCambioPosteriorAlCierre: 1 });
+  });
+
+  test('(d) fechaFin anterior a fechaInicio: BadRequestError', async () => {
+    await expect(getCorteConciliacion({ fechaInicio: '2026-09-20', fechaFin: '2026-09-14' }))
+      .rejects.toThrow(BadRequestError);
+  });
+
+  test('(e) sin fechaInicio/fechaFin: sigue devolviendo historico:false y el comportamiento de siempre', async () => {
+    mockAggregates({});
+    const result = await getCorteConciliacion({});
+
+    expect(result.historico).toBe(false);
+    expect(result.fin).toBeUndefined();
+    expect(BankMovement.find).not.toHaveBeenCalled();
   });
 });
 

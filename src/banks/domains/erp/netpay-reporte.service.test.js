@@ -45,6 +45,19 @@ function fakeFind(result) {
   return { lean: jest.fn().mockResolvedValue(result) };
 }
 
+// 2026-10-06: dentro de cargarReporte, _crearYEvaluar ahora llama a NetpayReporte.findById en
+// 2 estilos en el mismo flujo — evaluarReporte() lo usa directo, sin .lean() (necesita el
+// documento Mongoose real para poder reporte.save()), y consultarFoliosPendientes() lo usa
+// encadenado con .lean() (solo lectura, ver netpay-reporte.service.js). Un mock que sea
+// thenable Y tenga .lean() cubre ambos estilos con el mismo fixture, sin duplicar nada por
+// test (mismo helper que ya usa, más abajo, el describe de consultarFoliosPendientes).
+function fakeQuery(result) {
+  return {
+    lean: jest.fn().mockResolvedValue(result),
+    then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+  };
+}
+
 function parsedFixture(overrides = {}) {
   return {
     claveRastreo: 'CLAVE-1',
@@ -89,6 +102,13 @@ beforeEach(() => {
   BankMovement.findById = jest.fn(() => fakeFind(null));
   NetpayMatch.find = jest.fn(() => fakeFind([]));
   NetpayFolioRegistro.insertMany = jest.fn().mockResolvedValue([]);
+  // Default (2026-10-06): _crearYEvaluar ahora llama a consultarFoliosPendientes() para TODO
+  // reporte recién creado (ver netpay-reporte.service.js) — sin este default, cualquier test
+  // de cargarReporte que no mockee Kore explícitamente revienta la destructuración de `raw`
+  // dentro de consultarFolioKore (best-effort, no rompe el test, pero ensucia los logs). Forma
+  // realista de "sin transacciones" en vez de `undefined` — cae al mismo NotFoundError ya
+  // manejado ("puede que ya no esté disponible") que un test explícito usaría a propósito.
+  buscarTransaccionesNetpay.mockResolvedValue({ raw: { Data: { transactions: [] } } });
 });
 
 // cargarReporte — netpay-matching-v2 (design.md "(a) Report present"): ya NO deja el
@@ -131,7 +151,7 @@ describe('cargarReporte', () => {
     BankMovement.find = jest.fn(() => fakeFind([]));
     const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
 
     const { reporte, candidatos } = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -144,6 +164,44 @@ describe('cargarReporte', () => {
     }));
   });
 
+  // 2026-10-06, pedido explícito del usuario: koreCache ya NO depende de que alguien abra un
+  // folio a mano o exporte el Excel — se completa acá mismo, durante la carga.
+  test('completa koreCache de los folios durante la carga, antes de responder', async () => {
+    parseNetpayReporte.mockResolvedValue(parsedN1());
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+    const cuentaKore = { Id: 'CXC-1', Nombre: 'Cliente X' };
+    buscarTransaccionesNetpay.mockResolvedValue({
+      raw: { Data: { transactions: [{ folio: 'F1', cuentas: [cuentaKore] }] } },
+    });
+
+    await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(buscarTransaccionesNetpay).toHaveBeenCalledWith(
+      expect.objectContaining({ folio: 'F1', withAccountInfo: true, status: 'completed' }),
+    );
+    expect(creado.folios[0].koreCache.cuenta).toEqual(cuentaKore);
+    expect(creado.save).toHaveBeenCalled();
+  });
+
+  test('si Kore falla al completar koreCache durante la carga, la carga sigue siendo exitosa (best-effort)', async () => {
+    parseNetpayReporte.mockResolvedValue(parsedN1());
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+    buscarTransaccionesNetpay.mockRejectedValue(new Error('Kore caído'));
+
+    const { reporte } = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(reporte.estatus).toBe('discrepancia');
+    expect(creado.folios[0].koreCache?.cuenta).toBeFalsy();
+  });
+
   test('1 candidato BBVA cuyo monto cuadra dentro de tolerancia: auto-vincula (resuelto_por_reporte, vinculo:erp-link)', async () => {
     parseNetpayReporte.mockResolvedValue(parsedN1({ montoDepositoTotal: 1000 }));
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
@@ -151,7 +209,7 @@ describe('cargarReporte', () => {
     BankMovement.find = jest.fn(() => fakeFind([mov]));
     const creado = fakeReporteRecienCreado({ montoDepositoTotal: 1000 });
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
     setErpIds.mockResolvedValue({ _id: 'mov-1', banco: 'BBVA' });
 
     const { reporte, candidatos } = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
@@ -173,7 +231,7 @@ describe('cargarReporte', () => {
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado({ folios: folios.map(f => ({ ...f, duplicadoDeReporteId: null })) });
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
 
     await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -200,7 +258,7 @@ describe('cargarReporte', () => {
       folios: folios.map(f => ({ ...f, duplicadoDeReporteId: null })),
     });
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
 
     const err = new Error('E11000 duplicate key on folio_registros');
     err.writeErrors = [{ index: 0, code: 11000 }];
@@ -219,7 +277,7 @@ describe('cargarReporte', () => {
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado();
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
 
     const err = new Error('conexión perdida a Mongo');
     NetpayFolioRegistro.insertMany = jest.fn().mockRejectedValue(err);
@@ -235,7 +293,7 @@ describe('cargarReporte', () => {
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado();
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
 
     const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -277,7 +335,7 @@ describe('cargarReporte — múltiples depósitos (N>1)', () => {
       if (doc.claveRastreo === 'C3') throw new Error('validación de Mongo falló');
       return creadoC1;
     });
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoC1);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creadoC1));
 
     const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -308,7 +366,7 @@ describe('cargarReporte — múltiples depósitos (N>1)', () => {
       if (doc.claveRastreo === 'C2') throw new Error('boom en C2');
       return creadoOk;
     });
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoOk);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creadoOk));
 
     const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -339,7 +397,7 @@ describe('cargarReporte — múltiples depósitos (N>1)', () => {
       }
       return creadoC2;
     });
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoC2);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creadoC2));
 
     const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -360,7 +418,7 @@ describe('cargarReporte — múltiples depósitos (N>1)', () => {
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creadoOk = fakeReporteRecienCreado({ _id: 'rep-ok', claveRastreo: 'C-OK' });
     NetpayReporte.create = jest.fn().mockResolvedValue(creadoOk);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creadoOk);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creadoOk));
 
     const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -384,7 +442,7 @@ describe('cargarReporte — múltiples depósitos (N>1)', () => {
     NetpayReporte.findOne = jest.fn(() => fakeFind(null));
     const creado = fakeReporteRecienCreado({ _id: 'rep-1' });
     NetpayReporte.create = jest.fn().mockResolvedValue(creado);
-    NetpayReporte.findById = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
 
     const resultado = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 
@@ -418,7 +476,7 @@ describe('cargarReporte — múltiples depósitos (N>1)', () => {
       orden.push(`create-end-${doc.claveRastreo}`);
       return doc.claveRastreo === 'C1' ? creadoC1 : creadoC2;
     });
-    NetpayReporte.findById = jest.fn((id) => Promise.resolve(id === 'rep-C1' ? creadoC1 : creadoC2));
+    NetpayReporte.findById = jest.fn((id) => fakeQuery(id === 'rep-C1' ? creadoC1 : creadoC2));
 
     const promise = cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
 

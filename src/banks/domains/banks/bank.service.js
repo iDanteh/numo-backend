@@ -1713,7 +1713,13 @@ async function updateStatus(id, status, user) {
       }
     }
   }
+  const statusAnterior = mov.status;
   mov.status = status;
+  // Marca de "último cambio de status" (2026-10-06, ver ultimoCambioStatusAt en
+  // BankMovement.model.js) — este call-site es uno de los 2 caminos que NO dejan rastro en
+  // historialVinculacion, necesario para que un corte histórico personalizado pueda detectar
+  // que el estatus reconstruido es solo una aproximación.
+  if (statusAnterior !== status) mov.ultimoCambioStatusAt = new Date();
   // identificadoPor es gestionado exclusivamente al vincular/desvincular CxCs — no se toca aquí
   const primeraId = resolvePrimeraIdentificacion(
     mov.status,
@@ -2626,9 +2632,11 @@ async function deleteMovements(ids) {
 
 async function reclasifyMovements(ids) {
   if (!Array.isArray(ids) || ids.length === 0) throw new BadRequestError('Se requiere al menos un ID');
+  // Otro de los 2 caminos sin rastro en historialVinculacion — ver ultimoCambioStatusAt
+  // en BankMovement.model.js.
   const result = await BankMovement.updateMany(
     { _id: { $in: ids } },
-    { $set: { status: 'reclasificado' } }
+    { $set: { status: 'reclasificado', ultimoCambioStatusAt: new Date() } }
   );
   return { reclasified: result.modifiedCount };
 }

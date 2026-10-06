@@ -1863,6 +1863,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // el ejemplo "9 (4).xls" del 10-jul; el "AUT." se queda solo en NI y en el
     // EFECTIVO de una ficha Banamex.
     const serieBancoReal = referenciaBancoReal;
+    // Efectivo cobrado en la caja de Puerto y depositado a BBVA ("EFECTIVO-COS"
+    // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
+    // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
+    const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
@@ -1890,7 +1894,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       formaPago:      m.formaPago,
       reglaNombre:    m.reglaNombre,
       tipoOrigen:     m.tipoOrigen,
-      _subcodigo:     esTransferenciaVerificada ? subcodigoTransferencia : 0,
+      _subcodigo:     (esTransferenciaVerificada || esEfectivoCosDepositado) ? subcodigoTransferencia : 0,
       _referenciaBancoReal: referenciaBancoReal,
     };
   });

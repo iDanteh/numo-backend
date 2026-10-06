@@ -305,10 +305,11 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 // Cobro hecho en la caja de una sucursal que no es CEDIS (2026-10-05, pólizas
 // manuales del usuario 19-29/sep): el Cargo va con el centro de la sucursal
 // donde se cobró, según cómo se mueve ese dinero:
-//   - efectivo en Puerto (O0): se deposita → 1102011001 "DEP. PTO" (centro 120)
+//   - efectivo en Puerto (O0): se deposita → 1102011001 "EFECTIVO-COS" (centro
+//     120; antes "DEP. PTO", el usuario pidió EFECTIVO-COS el 2026-10-06)
 //   - efectivo en otra caja (C0, F0…): se queda ahí → 1101010003 "EFECTIVO-COS"
 //   - tarjeta: 1101010001 "TARJETA DE CREDITO"/"TARJETA DE DEBITO"
-const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'DEP. PTO' };
+const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'EFECTIVO-COS' };
 const CODIGO_CUENTA_BANCO_DEPOSITO_CAJA = '1102011001';
 const CODIGO_CUENTA_CAJA_GENERAL        = '1101010001';
 const ETIQUETA_EFECTIVO_OTRA_CAJA       = 'EFECTIVO-COS';

@@ -232,7 +232,13 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
         ? folioFiscalUpper
         : (link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
       if (!uuidResuelto) continue;
-      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, _distanciaDias: distanciaDias };
+      // Kore registró este cobro como "DEPOSITO EN EFECTIVO" en este mismo
+      // depósito: efectivo que el cliente depositó directo al banco (ver
+      // `anotarCargosPorFacturaSinAgrupar`). Solo por folioFiscal, nunca por
+      // serie-folio (el folio del Pago puede coincidir con otra factura).
+      const esDepositoEfectivoKore = uuidsSet.has(folioFiscalUpper) && (link.desglosePorFormaPago ?? [])
+        .some(d => /DEPOSITO.*EFECTIVO/.test(String(d.formaPagoDescripcion ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()));
+      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, esDepositoEfectivoKore, _distanciaDias: distanciaDias };
       const actual = mapa.get(uuidResuelto);
       if (!actual) {
         mapa.set(uuidResuelto, candidato);
@@ -1797,7 +1803,15 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // "49685" ALEJANDRO HIDALGO, 10-jul "034324" FERRETERIAS MEDINA). Sin
     // depósito ligado se queda como estaba.
     const esChequeConDeposito = m.formaPago === FORMA_PAGO_CHEQUE && !!bancario;
-    const esTransferenciaVerificada = esChequeConDeposito || (bancario?.categoriaConocida
+    // Efectivo que el cliente depositó directo al banco ("Depósito de
+    // efectivo"/"DEPOSITO EN EFECTIVO" ligado en Bancos a la factura, nunca
+    // una ficha de caja): mismo trato que el cheque (2026-10-06, pólizas
+    // manuales: 25-sep "46217" TERESA MINERVA, 29-sep "49263" CAROLINA DIAZ).
+    // Los cobros en otra caja (EFECTIVO-COS/DEP. PTO) y PXA no entran.
+    const esEfectivoDepositadoPorCliente = m.formaPago === '01' && !!bancario?.esDepositoEfectivoKore
+      && /^1101/.test(m.cuenta?.codigo || '')
+      && !(m.serie === 'EFECTIVO-COS' || m.serie === 'PXA' || String(m.serie ?? '').startsWith('DEP. '));
+    const esTransferenciaVerificada = esChequeConDeposito || esEfectivoDepositadoPorCliente || (bancario?.categoriaConocida
       ? bancario.esTransferencia
       : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
     // El concepto por-factura que arma `cfdiToMovimientos` ("cliente /

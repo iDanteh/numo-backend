@@ -569,7 +569,15 @@ router.get('/netpay/bandeja/:id/candidatos', authenticate, permit(PERMISSIONS.BA
 // secuencial) y siempre devuelve 200 salvo errores de archivo/negocio que siguen
 // propagándose tal cual (ver error-handler genérico de este router). Sin cambio de lógica
 // acá: sigue siendo "parsear, delegar, responder tal cual".
+// Timeout extendido (2026-10-06, pedido explícito del usuario — ver netpay-reporte.service.js
+// #_crearYEvaluar): cargarReporte() ahora también completa koreCache de cada folio contra Kore
+// ANTES de responder (antes solo pasaba al exportar, con el mismo timeout ya extendido acá
+// abajo en /export). Un archivo con varios depósitos (loop secuencial) y folios por decenas
+// puede tardar bastante más que antes — mismo criterio que /export, para no repetir el
+// incidente real ya documentado de un timeout corto rompiendo una operación grande contra Kore.
 router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NETPAY), uploadCyc.single('excelFile'), asyncHandler(async (req, res) => {
+  req.setTimeout(300000);
+  res.setTimeout(300000);
   if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
   const resultado = await cargarReporte(req.file.buffer, req.file.originalname, req.user);
   res.json(resultado);

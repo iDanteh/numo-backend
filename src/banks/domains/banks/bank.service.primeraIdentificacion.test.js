@@ -63,6 +63,47 @@ describe('updateStatus — primeraIdentificacionAt/primeraIdentificacionPor', ()
   });
 });
 
+describe('updateStatus — ultimoCambioStatusAt (2026-10-06, corte histórico personalizado)', () => {
+  test('el status SÍ cambia: se setea a la fecha actual', async () => {
+    const mov = fakeMov({ status: 'no_identificado', ultimoCambioStatusAt: null });
+    BankMovement.findById.mockResolvedValue(mov);
+
+    await bankService.updateStatus('mov-1', 'identificado', { _id: 'user-1', nombre: 'Usuario Uno', role: 'admin' });
+
+    expect(mov.ultimoCambioStatusAt).toBeInstanceOf(Date);
+  });
+
+  test('el status pedido es igual al actual: NO se toca ultimoCambioStatusAt', async () => {
+    const mov = fakeMov({ status: 'identificado', ultimoCambioStatusAt: null, erpIds: ['CXC-1'] });
+    BankMovement.findById.mockResolvedValue(mov);
+
+    await bankService.updateStatus('mov-1', 'identificado', { _id: 'user-1', nombre: 'Usuario Uno', role: 'admin' });
+
+    expect(mov.ultimoCambioStatusAt).toBeNull();
+  });
+});
+
+describe('reclasifyMovements — ultimoCambioStatusAt (2026-10-06)', () => {
+  test('el $set del updateMany incluye ultimoCambioStatusAt además de status', async () => {
+    BankMovement.updateMany = jest.fn().mockResolvedValue({ modifiedCount: 2 });
+
+    const result = await bankService.reclasifyMovements(['mov-1', 'mov-2']);
+
+    expect(result).toEqual({ reclasified: 2 });
+    expect(BankMovement.updateMany).toHaveBeenCalledTimes(1);
+    const [filter, update] = BankMovement.updateMany.mock.calls[0];
+    expect(filter).toEqual({ _id: { $in: ['mov-1', 'mov-2'] } });
+    expect(update.$set.status).toBe('reclasificado');
+    expect(update.$set.ultimoCambioStatusAt).toBeInstanceOf(Date);
+  });
+
+  test('sin ids: BadRequestError, no llama a updateMany', async () => {
+    BankMovement.updateMany = jest.fn();
+    await expect(bankService.reclasifyMovements([])).rejects.toThrow();
+    expect(BankMovement.updateMany).not.toHaveBeenCalled();
+  });
+});
+
 describe('updateCategoria — primeraIdentificacionAt/primeraIdentificacionPor', () => {
   test('categoría cuya regla resuelve a "identificado" (status ya era identificado): agrega los campos al $set sin pisar valor existente', async () => {
     const fechaOriginal = new Date('2026-01-01T00:00:00.000Z');

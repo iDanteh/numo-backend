@@ -1792,9 +1792,15 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
     // Pago) — ver comentario en el caller.
     const bancario = verdadBancaria?.get((m.facturaUuid || m.cfdiUuid || '').toUpperCase());
-    const esTransferenciaVerificada = bancario?.categoriaConocida
+    // Cheque con depósito real ligado en Bancos ("Depósito S.B.C.", "DEP
+    // CHEQUE BNM") va igual que una transferencia: banco real, folio de Numo
+    // en columna C, subcódigo 20 (2026-10-06, pólizas manuales: 29-sep
+    // "49685" ALEJANDRO HIDALGO, 10-jul "034324" FERRETERIAS MEDINA). Sin
+    // depósito ligado se queda como estaba.
+    const esChequeConDeposito = m.formaPago === FORMA_PAGO_CHEQUE && !!bancario;
+    const esTransferenciaVerificada = esChequeConDeposito || (bancario?.categoriaConocida
       ? bancario.esTransferencia
-      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
+      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
     // El concepto por-factura que arma `cfdiToMovimientos` ("cliente /
     // serie-folio") ya viene completo — se deja tal cual. Si no lo tiene
     // (caso viejo/`tasaIva==='mixto'` sin split), se enriquece aquí con el

@@ -90,6 +90,16 @@ const extractEntries = (file) => {
 /**
  * GET /api/cfdis
  */
+// Filtro por RFC (columnas Emisor/Receptor y buscador general): RFC completo
+// (12-13 caracteres) = igual que antes; incompleto = "empieza con", para que
+// encuentre mientras se escribe (2026-10-06, el usuario no encontraba nada con
+// el RFC a medias). Anclado al inicio y sin 'i' para que use el índice.
+const filtroRfc = (rfc) => {
+  const r = String(rfc).trim().toUpperCase();
+  if (r.length >= 12) return r;
+  return { $regex: `^${r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` };
+};
+
 const list = asyncHandler(async (req, res) => {
   const {
     page = 1, limit = 20, source, tipoDeComprobante,
@@ -119,8 +129,8 @@ const list = asyncHandler(async (req, res) => {
     const serieFolioMatch = term.match(/^([A-Za-z0-9]{1,10})-(.+)$/);
     const orConds = [
       { uuid:          { $regex: term, $options: 'i' } },
-      { 'emisor.rfc':  termUpper },
-      { 'receptor.rfc': termUpper },
+      { 'emisor.rfc':  filtroRfc(termUpper) },
+      { 'receptor.rfc': filtroRfc(termUpper) },
       { folio:         { $regex: term, $options: 'i' } },   // búsqueda solo por folio
     ];
     if (serieFolioMatch) {
@@ -137,8 +147,8 @@ const list = asyncHandler(async (req, res) => {
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };
   }
   if (tipoDeComprobante)  filter.tipoDeComprobante   = tipoDeComprobante;
-  if (rfcEmisor)          filter['emisor.rfc']        = rfcEmisor.toUpperCase();
-  if (rfcReceptor)        filter['receptor.rfc']      = rfcReceptor.toUpperCase();
+  if (rfcEmisor)          filter['emisor.rfc']        = filtroRfc(rfcEmisor);
+  if (rfcReceptor)        filter['receptor.rfc']      = filtroRfc(rfcReceptor);
   if (satStatus)          filter.satStatus            = satStatus;
   if (erpStatus)          filter.erpStatus            = erpStatus;
   if (fechaInicio || fechaFin) {
@@ -1048,8 +1058,8 @@ const exportExcel = asyncHandler(async (req, res) => {
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };
   }
   if (tipoDeComprobante) filter.tipoDeComprobante  = tipoDeComprobante;
-  if (rfcEmisor)         filter['emisor.rfc']       = rfcEmisor.toUpperCase();
-  if (rfcReceptor)       filter['receptor.rfc']     = rfcReceptor.toUpperCase();
+  if (rfcEmisor)         filter['emisor.rfc']       = filtroRfc(rfcEmisor);
+  if (rfcReceptor)       filter['receptor.rfc']     = filtroRfc(rfcReceptor);
   if (satStatus)  filter.satStatus = satStatus;
   if (erpStatus) {
     const valores = erpStatus.split(',').map(v => v.trim()).filter(Boolean);

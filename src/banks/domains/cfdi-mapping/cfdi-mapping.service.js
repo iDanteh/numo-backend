@@ -260,6 +260,22 @@ function findRuleInList(cfdi, rules) {
 /** Detecta la tasa IVA dominante en los conceptos del CFDI.
  *  Tipo P (complemento de pago) siempre devuelve null — no tiene conceptos con tasa.
  *  Fallback: si los conceptos no tienen desglose de tasa, lee del header (cfdi.impuestos). */
+// Pago cuyos documentos relacionados llevan TODOS IVA con tasa > 0 y en cada
+// uno lo pagado = base + IVA con a lo más 1 centavo de diferencia: la
+// diferencia del total es redondeo acumulado, no una porción al 0%
+// (2026-10-06, GUILLERMO HERIBERTO A0-260917242: 13 facturas al 16%, 3 con
+// 1 centavo de redondeo → $0.03 en el total y caía como 'mixto').
+function _pagoTodoGravadoConRedondeo(cfdi) {
+  const doctos = (cfdi.complementoPago?.pagos ?? []).flatMap(p => p.doctosRelacionados ?? []);
+  if (doctos.length === 0) return false;
+  return doctos.every(dr => {
+    const iva = (dr.trasladosDR ?? []).filter(t => (t.impuesto || '') === '002');
+    if (iva.length === 0 || iva.some(t => !(Number(t.tasaOCuota) > 0))) return false;
+    const gravado = iva.reduce((s, t) => s + Number(t.base || 0) + Number(t.importe || 0), 0);
+    return Math.abs(Math.round(Number(dr.impPagado || 0) * 100) - Math.round(gravado * 100)) <= 1;
+  });
+}
+
 function _detectTasaIva(cfdi) {
   if (cfdi.tipoDeComprobante === 'P') {
     // El complemento de pago no tiene conceptos propios; detectar tasa desde los
@@ -280,7 +296,7 @@ function _detectTasaIva(cfdi) {
         // abajo (base 237.53 + IVA 38.00 vs pagado 275.54, MINI ABASTOS
         // B0-260701190, 2026-09-30) caía como 'mixto' y perdía el split por
         // factura y el depósito real de Bancos.
-        if (Math.round(monto * 100) - Math.round(monto16 * 100) > 1) return 'mixto';
+        if (Math.round(monto * 100) - Math.round(monto16 * 100) > 1 && !_pagoTodoGravadoConRedondeo(cfdi)) return 'mixto';
         return '16';
       }
       const montoTotal = Number(totales.montoTotalPagos || 0);

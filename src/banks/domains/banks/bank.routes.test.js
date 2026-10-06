@@ -12,7 +12,7 @@ jest.mock('../../shared/middleware/auth.real', () => ({
   authenticate: (req, _res, next) => {
     req.user = {
       _id:  'user-test',
-      role: 'test-role',
+      role: req.headers['x-test-role'] || 'test-role',
       extraPermissions: [],
     };
     next();
@@ -47,6 +47,9 @@ jest.mock('../../../visor/models/CFDI', () => ({
 jest.mock('../../../shared/services/rbac-store');
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
+  getCorteConciliacion: jest.fn(),
+  getPeriodoCortePorRol: jest.fn(),
+  buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
   listUsuariosConIdentificaciones: jest.fn(),
 }));
@@ -362,6 +365,145 @@ describe('GET /indicadores/reporte', () => {
     expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Cobranza-Identificacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
     expect(indicadoresService.buildReporteIdentificacion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GET /cortes', () => {
+  let app;
+
+  const FAKE_CORTE = {
+    periodo: 'semanal',
+    inicio:  new Date('2026-10-05T06:00:00.000Z'),
+    rezagados: { no_identificado: 1, reclasificado: 0, total: 1 },
+    nuevos: { no_identificado: 2, reclasificado: 0, identificado: 3, otros: 0, pendientes: 2, total: 5 },
+    identificadosEnPeriodo: { deRezagados: 1, deNuevos: 3, total: 4 },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getCorteConciliacion.mockResolvedValue(FAKE_CORTE);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getCorteConciliacion).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa periodo y banco tal cual al service, y devuelve el resultado', async () => {
+    const res = await request(app)
+      .get('/cortes')
+      .query({ periodo: 'mensual', banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ...FAKE_CORTE,
+      inicio: FAKE_CORTE.inicio.toISOString(), // serializado a JSON
+    });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
+  });
+
+  test('sin ?banco: se pasa null (no el string vacío)', async () => {
+    await request(app)
+      .get('/cortes')
+      .query({ periodo: 'semanal' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null });
+  });
+
+  test('con fechaInicio/fechaFin: se pasan tal cual al service (corte histórico)', async () => {
+    await request(app)
+      .get('/cortes')
+      .query({ periodo: 'semanal', fechaInicio: '2026-09-14', fechaFin: '2026-09-20' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({
+      periodo: 'semanal', banco: null, fechaInicio: '2026-09-14', fechaFin: '2026-09-20',
+    });
+  });
+});
+
+describe('GET /cortes/periodo-rol', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getPeriodoCortePorRol.mockResolvedValue({ periodo: 'semanal', puedeAlternar: false });
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/periodo-rol')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getPeriodoCortePorRol).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa el rol del usuario autenticado al service y devuelve el resultado', async () => {
+    const res = await request(app)
+      .get('/cortes/periodo-rol')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]))
+      .set('x-test-role', 'contabilidad');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ periodo: 'semanal', puedeAlternar: false });
+    expect(indicadoresService.getPeriodoCortePorRol).toHaveBeenCalledWith('contabilidad');
+  });
+});
+
+describe('GET /cortes/reporte', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.buildReporteCorte.mockResolvedValue(Buffer.from('fake-xlsx'));
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/reporte')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.buildReporteCorte).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa periodo/banco y responde con headers de descarga', async () => {
+    const res = await request(app)
+      .get('/cortes/reporte')
+      .query({ periodo: 'mensual', banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Corte-Conciliacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
+  });
+
+  test('con fechaInicio/fechaFin: se pasan tal cual al service (reporte de corte histórico)', async () => {
+    await request(app)
+      .get('/cortes/reporte')
+      .query({ periodo: 'mensual', banco: 'BBVA', fechaInicio: '2026-09-01', fechaFin: '2026-09-30' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({
+      periodo: 'mensual', banco: 'BBVA', fechaInicio: '2026-09-01', fechaFin: '2026-09-30',
+    });
   });
 });
 

@@ -3,6 +3,8 @@
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
 const { _rangoAnioMesMexico, _inicioDiaMx, _finDiaMx } = require('./bank.service');
+const globalConfigService = require('../../../shared/services/global-config.service');
+const { BadRequestError } = require('../../shared/errors/AppError');
 
 const MS_PER_HOUR = 3600000;
 
@@ -100,6 +102,31 @@ function _hoyMexicoStr() {
   const mm   = String(mx.getUTCMonth() + 1).padStart(2, '0');
   const dd   = String(mx.getUTCDate()).padStart(2, '0');
   return `${yyyy}-${mm}-${dd}`;
+}
+
+// Inicio del mes EN CURSO en México (medianoche del día 1), como instante UTC real — insumo
+// de getCorteConciliacion(). Reusa _rangoAnioMesMexico (bank.service.js) para no repetir el
+// cálculo de offset fijo -06:00; solo toma su `$gte` (el `$lt` no aplica, el corte es
+// siempre "desde el inicio del periodo hasta AHORA", sin límite superior).
+function _inicioMesMexico() {
+  const mx = _comoRelojMexico(new Date());
+  return _rangoAnioMesMexico(mx.getUTCFullYear(), mx.getUTCMonth() + 1).$gte;
+}
+
+// Inicio de la semana EN CURSO (lunes) en México, como instante UTC real. getUTCDay() de
+// _comoRelojMexico ya devuelve el día de la semana correcto en hora de pared México (el
+// corrimiento fijo de -6h nunca cruza un límite de día que cambie el resultado salvo en la
+// franja 00:00-06:00 UTC, que es justamente la que _comoRelojMexico existe para corregir).
+// Domingo (getUTCDay()===0) retrocede 6 días al lunes anterior, no 0.
+function _inicioSemanaMexico() {
+  const mx = _comoRelojMexico(new Date());
+  const diaSemana = mx.getUTCDay(); // 0=domingo .. 6=sábado
+  const diasDesdeLunes = diaSemana === 0 ? 6 : diaSemana - 1;
+  const lunes = new Date(Date.UTC(mx.getUTCFullYear(), mx.getUTCMonth(), mx.getUTCDate() - diasDesdeLunes));
+  const yyyy = lunes.getUTCFullYear();
+  const mm   = String(lunes.getUTCMonth() + 1).padStart(2, '0');
+  const dd   = String(lunes.getUTCDate()).padStart(2, '0');
+  return _inicioDiaMx(`${yyyy}-${mm}-${dd}`);
 }
 
 /**
@@ -519,11 +546,424 @@ async function listUsuariosConIdentificaciones() {
   return ids.filter(Boolean);
 }
 
+/**
+ * "Corte" de conciliación (2026-10-02, pedido explícito del usuario) — control periódico
+ * para que cobranza (semanal) y contabilidad (mensual) vean, del periodo EN CURSO (lunes /
+ * día 1 del mes corriente → ahora, sin navegación a periodos pasados — decisión explícita
+ * del usuario, mismo espíritu que el default "hoy" de getIndicadoresIdentificacion):
+ *
+ *   1. `rezagados` — depósitos con `fecha` ANTERIOR al inicio del periodo que SIGUEN
+ *      no_identificado/reclasificado AHORA MISMO (el número baja a medida que el equipo
+ *      los identifica, sin esperar a que cierre el periodo).
+ *   2. `nuevos` — depósitos con `fecha` DENTRO del periodo, por su estatus actual.
+ *   3. `identificadosEnPeriodo` — depósitos identificados (`primeraIdentificacionAt`) DENTRO
+ *      del periodo, separados según si el depósito en sí era rezago viejo o del lote nuevo —
+ *      pedido explícito del usuario de no mezclar ambos en un solo número.
+ *
+ * Mismo criterio de "depósito" que el resto de este dashboard (buildBaseMatch: isActive,
+ * no oculto, deposito>0) — un retiro no tiene este ciclo de vida. Sin scope por usuario a
+ * propósito (mismo motivo que el backlog de getIndicadoresIdentificacion: "rezagado"/"nuevo"
+ * son propiedades del movimiento, no de quién lo identificó) — es un control de EQUIPO.
+ *
+ * **Corte histórico personalizado** (2026-10-06, pedido explícito del usuario): si vienen
+ * `fechaInicio` Y `fechaFin` (`YYYY-MM-DD`, mismo nombre/convención que `_resolverMatchTiempo`
+ * arriba), el corte se congela a esa fecha de cierre pasada en vez de "ahora". `BankMovement`
+ * no tiene un log genérico de cambios de `status` (limitación real, discutida y aceptada con
+ * el usuario) — se reconstruye el estatus "al cierre" con `primeraIdentificacionAt` (forward-
+ * only, confiable) + `historialVinculacion[]` (ya trackea desvinculaciones con timestamp
+ * exacto) + `ultimoCambioStatusAt` (marca mínima agregada para los 2 caminos que no dejan
+ * rastro — `updateStatus()`/`reclasifyMovements()`, ver BankMovement.model.js). Lo que no se
+ * puede reconstruir con certeza se EXPONE como `advertencia`, nunca se oculta. Ver
+ * `_getCorteHistorico`/`_estadoAlCierre` abajo para el detalle completo.
+ *
+ * @param {object} [opts]
+ * @param {'semanal'|'mensual'} [opts.periodo='semanal']
+ * @param {string} [opts.banco]
+ * @param {string} [opts.fechaInicio] `YYYY-MM-DD` — junto con `fechaFin`, activa el modo
+ *   histórico. Si falta uno de los dos, se ignoran ambos y se usa el modo tiempo real de
+ *   siempre (comportamiento IDÉNTICO, cero regresión).
+ * @param {string} [opts.fechaFin] Ver `fechaInicio`.
+ */
+async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaInicio = null, fechaFin = null } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+
+  if (fechaInicio && fechaFin) {
+    const inicio = _inicioDiaMx(fechaInicio);
+    const fin    = _finDiaMx(fechaFin);
+    if (fin < inicio) {
+      throw new BadRequestError('fechaFin no puede ser anterior a fechaInicio');
+    }
+    const { rezagados, nuevos, identificadosEnPeriodo, posibleCambioPosterior } =
+      await _getCorteHistorico({ baseMatch, inicio, fin });
+
+    return {
+      periodo, inicio, fin, historico: true,
+      rezagados, nuevos, identificadosEnPeriodo,
+      ...(posibleCambioPosterior > 0 ? { advertencia: { registrosConCambioPosteriorAlCierre: posibleCambioPosterior } } : {}),
+    };
+  }
+
+  const inicio = periodo === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
+
+  const agruparPorStatus = (extraMatch) => BankMovement.aggregate([
+    { $match: { ...baseMatch, ...extraMatch } },
+    { $group: { _id: '$status', count: { $sum: 1 } } },
+  ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count])));
+
+  const [rezagadosPorStatus, nuevosPorStatus, identificadosPorOrigen] = await Promise.all([
+    agruparPorStatus({ fecha: { $lt: inicio }, status: { $in: BACKLOG_STATUSES } }),
+    agruparPorStatus({ fecha: { $gte: inicio } }),
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, status: 'identificado', primeraIdentificacionAt: { $gte: inicio } } },
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
+    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+  ]);
+
+  const rezagados = {
+    no_identificado: rezagadosPorStatus.no_identificado ?? 0,
+    reclasificado:    rezagadosPorStatus.reclasificado    ?? 0,
+  };
+  rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+
+  const nuevosTotal = Object.values(nuevosPorStatus).reduce((a, b) => a + b, 0);
+  const nuevos = {
+    no_identificado: nuevosPorStatus.no_identificado ?? 0,
+    reclasificado:    nuevosPorStatus.reclasificado    ?? 0,
+    identificado:     nuevosPorStatus.identificado     ?? 0,
+  };
+  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - nuevos.identificado;
+  nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
+  nuevos.total = nuevosTotal;
+
+  const identificadosEnPeriodo = {
+    deRezagados: identificadosPorOrigen.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.nuevo     ?? 0,
+  };
+  identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+
+  return { periodo, inicio, historico: false, rezagados, nuevos, identificadosEnPeriodo };
+}
+
+/**
+ * Rama histórica de getCorteConciliacion() — NO usa aggregate para rezagados/nuevos (necesita
+ * reconstrucción por documento vía _estadoAlCierre), sí sigue usando aggregate para
+ * `identificadosEnPeriodo` (ese cálculo es 100% preciso siempre, con `primeraIdentificacionAt`
+ * acotado `{ $gte: inicio, $lte: fin }` — la única diferencia con el modo live es agregar el
+ * `$lte: fin`).
+ */
+async function _getCorteHistorico({ baseMatch, inicio, fin }) {
+  const [candidatosRezagados, candidatosNuevos, identificadosPorOrigen] = await Promise.all([
+    BankMovement.find({
+      ...baseMatch,
+      fecha: { $lt: inicio },
+      $or: [
+        { status: { $in: BACKLOG_STATUSES } },
+        { primeraIdentificacionAt: { $ne: null } },
+      ],
+    }).select('status primeraIdentificacionAt ultimoCambioStatusAt historialVinculacion').lean(),
+
+    BankMovement.find({ ...baseMatch, fecha: { $gte: inicio, $lte: fin } })
+      .select('status primeraIdentificacionAt ultimoCambioStatusAt historialVinculacion').lean(),
+
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, status: 'identificado', primeraIdentificacionAt: { $gte: inicio, $lte: fin } } },
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
+    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+  ]);
+
+  let posibleCambioPosterior = 0;
+
+  const rezagados = { no_identificado: 0, reclasificado: 0 };
+  for (const mov of candidatosRezagados) {
+    const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
+    if (posibleCambio) posibleCambioPosterior++;
+    if (!identificado) {
+      const key = mov.status === 'reclasificado' ? 'reclasificado' : 'no_identificado';
+      rezagados[key]++;
+    }
+  }
+  rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+
+  const nuevos = { no_identificado: 0, reclasificado: 0, identificado: 0, otros: 0 };
+  for (const mov of candidatosNuevos) {
+    const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
+    if (posibleCambio) posibleCambioPosterior++;
+    if (identificado)                        nuevos.identificado++;
+    else if (mov.status === 'reclasificado') nuevos.reclasificado++;
+    else if (mov.status === 'otros')         nuevos.otros++;
+    else                                      nuevos.no_identificado++;
+  }
+  nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
+  nuevos.total = nuevos.no_identificado + nuevos.reclasificado + nuevos.identificado + nuevos.otros;
+
+  const identificadosEnPeriodo = {
+    deRezagados: identificadosPorOrigen.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.nuevo ?? 0,
+  };
+  identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+
+  return { rezagados, nuevos, identificadosEnPeriodo, posibleCambioPosterior };
+}
+
+// Reconstrucción de "¿estaba identificado al cierre `fin` de un corte histórico?" — de 1 solo
+// salto (no un replay completo de eventos, ver limitación documentada en BankMovement.model.js
+// #ultimoCambioStatusAt). `primeraIdentificacionAt` es confiable y forward-only: si existe y es
+// <= fin, el movimiento SE IDENTIFICÓ por primera vez a tiempo. Pero pudo haberse revertido
+// después (desvinculación de CxC) y ANTES del cierre — eso sí lo sabemos con certeza via
+// historialVinculacion (timestamp exacto de 'desvinculado'/'ajustado'). Lo que NO podemos saber
+// con certeza es si hubo un cambio manual (updateStatus/reclasifyMovements) después de `fin`
+// que alteró el estatus actual respecto al de `fin` — eso se expone como `posibleCambio`, nunca
+// se oculta ni se asume silenciosamente que el dato es exacto.
+function _estadoAlCierre(mov, fin) {
+  const pid = mov.primeraIdentificacionAt;
+  const identificadoBase = !!(pid && pid <= fin);
+  const revertidoAntesDeCierre = identificadoBase && (mov.historialVinculacion || []).some(h =>
+    (h.accion === 'desvinculado' || h.accion === 'ajustado') && h.at > pid && h.at <= fin
+  );
+  const identificado  = identificadoBase && !revertidoAntesDeCierre;
+  const posibleCambio = !!(mov.ultimoCambioStatusAt && mov.ultimoCambioStatusAt > fin);
+  return { identificado, posibleCambio };
+}
+
+// Periodo de corte por rol (2026-10-05): antes hardcodeado en el frontend
+// (bank-corte-panel.component.ts), movido acá porque el backend YA conoce el rol autenticado
+// (req.user.role) y porque Configuraciones Globales no expone sus rutas de administración a
+// roles que no sean config:manage — exponerlo como un endpoint propio con banks:read evita ese
+// problema de permisos. Fallback a los valores que ya eran el hardcode anterior si la config
+// todavía no existe (ambiente recién desplegado, antes de correr el seed).
+const PERIODO_ROL_DEFAULT = {
+  cobranza:     'semanal',
+  contabilidad: 'mensual',
+};
+
+async function _periodoConfigurado(role) {
+  try {
+    return await globalConfigService.getValue('bancos', `CORTE_PERIODO_${role.toUpperCase()}`);
+  } catch (err) {
+    if (err.message?.includes('No existe la configuración')) return PERIODO_ROL_DEFAULT[role];
+    throw err;
+  }
+}
+
+/**
+ * Qué periodo de corte ve un rol, y si puede alternar entre semanal/mensual — gate de
+ * presentación (mismo criterio ya documentado en bank.routes.js#GET /cortes: el backend no
+ * fuerza el periodo por permisos, cualquiera con banks:read puede pedir cualquiera
+ * explícitamente). cobranza/contabilidad quedan fijos al periodo configurado; cualquier otro
+ * rol puede alternar, con 'semanal' como default.
+ */
+async function getPeriodoCortePorRol(role) {
+  if (role === 'cobranza' || role === 'contabilidad') {
+    return { periodo: await _periodoConfigurado(role), puedeAlternar: false };
+  }
+  return { periodo: 'semanal', puedeAlternar: true };
+}
+
+/**
+ * Excel descargable del corte de conciliación (2026-10-02, pedido explícito del usuario:
+ * "que también traiga el detallado de los movimientos involucrados con su clasificación").
+ * Reusa getCorteConciliacion() para la hoja "Resumen" — el Excel SIEMPRE coincide con lo que
+ * está en pantalla en ese momento, mismo criterio que buildReporteIdentificacion().
+ *
+ * Hoja "Detalle": un movimiento puede estar "involucrado" en el corte por 2 vías
+ * independientes, nunca ambas (las queries no se superponen):
+ *   - `fecha < inicio` Y (sigue pendiente AHORA O se identificó DENTRO del periodo) —
+ *     "Origen: Rezagado". Backlog ya resuelto hace tiempo (identificado antes del periodo)
+ *     queda afuera a propósito: no es parte de la historia de ESTE corte.
+ *   - `fecha >= inicio` — "Origen: Nuevo", cualquier estatus (a diferencia de rezagados, acá
+ *     SÍ se listan los ya identificados, para que la columna "Identificado en el periodo"
+ *     tenga sentido completo sobre el lote nuevo).
+ * La columna "Identificado en el periodo" (Sí/No) es la misma condición que usa
+ * `identificadosEnPeriodo` del resumen — permite filtrar en Excel y que la suma de "Sí"
+ * coincida exactamente con `identificadosEnPeriodo.total`.
+ */
+async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInicio = null, fechaFin = null } = {}) {
+  const corte = await getCorteConciliacion({ periodo, banco, fechaInicio, fechaFin });
+  const inicio = corte.inicio;
+  // null en modo tiempo real, Date en histórico — acota las queries de Detalle con $lte
+  // cuando exista (mismo criterio de corte que _getCorteHistorico) y habilita la columna
+  // "Posible cambio posterior al corte".
+  const fin = corte.fin ?? null;
+  const baseMatch = buildBaseMatch({ banco });
+  const campos = 'banco fecha concepto deposito categoria status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion';
+
+  const [antesDelCorte, nuevos] = await Promise.all([
+    BankMovement.find({
+      ...baseMatch,
+      fecha: { $lt: inicio },
+      $or: [
+        { status: { $in: BACKLOG_STATUSES } },
+        { status: 'identificado', primeraIdentificacionAt: { $gte: inicio, ...(fin ? { $lte: fin } : {}) } },
+      ],
+    }).select(campos).lean(),
+    BankMovement.find({ ...baseMatch, fecha: { $gte: inicio, ...(fin ? { $lte: fin } : {}) } }).select(campos).lean(),
+  ]);
+
+  const filas = [
+    ...antesDelCorte.map(m => ({ ...m, origen: 'Rezagado' })),
+    ...nuevos.map(m => ({ ...m, origen: 'Nuevo' })),
+  ].sort((a, b) => new Date(a.fecha) - new Date(b.fecha));
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Cortes de conciliación';
+  wb.created = new Date();
+
+  const resumen = wb.addWorksheet('Resumen');
+  resumen.columns = [
+    { header: 'Indicador', key: 'k', width: 46 },
+    { header: 'Valor',     key: 'v', width: 18 },
+  ];
+
+  const resumenHeader = resumen.getRow(1);
+  resumenHeader.height = 22;
+  resumenHeader.font   = { bold: true, color: { argb: 'FFE0E7FF' }, size: 10 };
+  resumenHeader.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
+  resumenHeader.alignment = { vertical: 'middle', horizontal: 'center' };
+
+  resumen.addRow({ k: 'Periodo', v: periodo === 'mensual' ? 'Mensual' : 'Semanal' });
+  const desdeRow = resumen.addRow({ k: 'Desde', v: inicio });
+  desdeRow.getCell('v').numFmt = 'dd/mm/yyyy hh:mm';
+  if (corte.historico) {
+    // Corte histórico (2026-10-06): rango de cierre elegido, no "ahora" — mismo numFmt que
+    // "Desde" para que ambas fechas se lean igual.
+    const hastaRow = resumen.addRow({ k: 'Hasta', v: corte.fin });
+    hastaRow.getCell('v').numFmt = 'dd/mm/yyyy hh:mm';
+  }
+  resumen.addRow({ k: 'Banco', v: banco || 'Todos' });
+
+  // Misma paleta semántica que el hero del panel en pantalla (bank-corte-panel.component.css:
+  // rezagados = alerta/ámbar, identificados = positivo/verde; "nuevos" queda neutro porque ahí
+  // no hay alarma, solo información del lote del periodo).
+  const SECCION_ESTILO = {
+    rezagados:     { fill: 'FFFCEFD8', font: 'FF8A5A0C' },
+    nuevos:        { fill: 'FFF3F4F6', font: 'FF374151' },
+    identificados: { fill: 'FFDFF5EA', font: 'FF0E6B4E' },
+  };
+
+  function addSeccionResumen(tipo, titulo, filas) {
+    resumen.addRow({});
+    const tituloRowNum = resumen.rowCount + 1;
+    resumen.addRow({ k: titulo, v: '' });
+    resumen.mergeCells(`A${tituloRowNum}:B${tituloRowNum}`);
+    const tituloRow = resumen.getRow(tituloRowNum);
+    tituloRow.height = 20;
+    tituloRow.font = { bold: true, color: { argb: SECCION_ESTILO[tipo].font }, size: 11 };
+    tituloRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SECCION_ESTILO[tipo].fill } };
+
+    filas.forEach(({ label, value, esTotal }) => {
+      const row = resumen.addRow({ k: label, v: value });
+      const celdaK = row.getCell('k');
+      const celdaV = row.getCell('v');
+      celdaK.alignment = { indent: 1 };
+      celdaV.numFmt = '#,##0';
+      celdaV.alignment = { horizontal: 'right' };
+      if (esTotal) {
+        row.font = { bold: true };
+        const borde = { top: { style: 'thin', color: { argb: 'FFD1D5DB' } } };
+        celdaK.border = borde;
+        celdaV.border = borde;
+      }
+    });
+  }
+
+  addSeccionResumen('rezagados', 'Rezagados', [
+    { label: 'Rezagados — no identificados', value: corte.rezagados.no_identificado },
+    { label: 'Rezagados — por conciliar',    value: corte.rezagados.reclasificado },
+    { label: 'Rezagados — total',            value: corte.rezagados.total, esTotal: true },
+  ]);
+  addSeccionResumen('nuevos', 'Nuevos del periodo', [
+    { label: 'Nuevos del periodo — no identificados', value: corte.nuevos.no_identificado },
+    { label: 'Nuevos del periodo — por conciliar',    value: corte.nuevos.reclasificado },
+    { label: 'Nuevos del periodo — identificados',    value: corte.nuevos.identificado },
+    { label: 'Nuevos del periodo — total',            value: corte.nuevos.total, esTotal: true },
+  ]);
+  addSeccionResumen('identificados', 'Identificados en el periodo', [
+    { label: 'Identificados en el periodo — de rezago', value: corte.identificadosEnPeriodo.deRezagados },
+    { label: 'Identificados en el periodo — de nuevos', value: corte.identificadosEnPeriodo.deNuevos },
+    { label: 'Identificados en el periodo — total',     value: corte.identificadosEnPeriodo.total, esTotal: true },
+  ]);
+
+  // Corte histórico con hallazgos que no se pueden reconstruir con certeza (ver
+  // _estadoAlCierre/ultimoCambioStatusAt) — EXPUESTO siempre de forma visible, nunca oculto,
+  // con la MISMA banda de color ámbar que la sección "Rezagados" de arriba.
+  if (corte.advertencia) {
+    resumen.addRow({});
+    const advRow = resumen.addRow({
+      k: '⚠ Registros con cambio posterior al corte (revisar manualmente)',
+      v: corte.advertencia.registrosConCambioPosteriorAlCierre,
+    });
+    advRow.height = 20;
+    advRow.font = { bold: true, color: { argb: SECCION_ESTILO.rezagados.font }, size: 11 };
+    advRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: SECCION_ESTILO.rezagados.fill } };
+    advRow.getCell('v').numFmt = '#,##0';
+    advRow.getCell('v').alignment = { horizontal: 'right' };
+  }
+
+  resumen.views = [{ state: 'frozen', ySplit: 1 }];
+
+  const detalle = wb.addWorksheet('Detalle');
+  detalle.columns = [
+    { header: 'Origen',                     key: 'origen',                width: 12 },
+    { header: 'Banco',                      key: 'banco',                 width: 13 },
+    { header: 'Fecha depósito',             key: 'fecha',                 width: 18 },
+    { header: 'Concepto',                   key: 'concepto',              width: 45 },
+    { header: 'Depósito',                   key: 'deposito',              width: 15 },
+    { header: 'Categoría',                  key: 'categoria',             width: 18 },
+    { header: 'Estatus',                    key: 'status',                width: 16 },
+    { header: 'Identificado en el periodo', key: 'identificadoEnPeriodo', width: 20 },
+    { header: 'Identificado por',           key: 'identificadoPor',       width: 22 },
+    { header: 'Fecha de identificación',    key: 'identificadoAt',        width: 18 },
+    { header: 'Posible cambio posterior al corte', key: 'cambioPosterior', width: 26 },
+  ];
+
+  for (const m of filas) {
+    const identificadoEnPeriodo = m.status === 'identificado'
+      && m.primeraIdentificacionAt != null
+      && new Date(m.primeraIdentificacionAt) >= inicio;
+    detalle.addRow({
+      origen:                m.origen,
+      banco:                 m.banco ?? null,
+      fecha:                 m.fecha ?? null,
+      concepto:              m.concepto ?? null,
+      deposito:              m.deposito ?? null,
+      categoria:             m.categoria ?? null,
+      // "reclasificado" se muestra como "Por conciliar" (rename de UI, 2026-10-06, pedido
+      // explícito del usuario — el valor interno del campo `status` en Mongo NO cambia, solo
+      // el texto que ve el usuario en este Excel y en el panel de Cortes).
+      status:                m.status === 'reclasificado' ? 'Por conciliar' : (m.status ?? null),
+      identificadoEnPeriodo: identificadoEnPeriodo ? 'Sí' : 'No',
+      identificadoPor:       m.primeraIdentificacionPor?.nombre ?? m.primeraIdentificacionPor?.userId ?? null,
+      identificadoAt:        m.primeraIdentificacionAt ?? null,
+      // Modo tiempo real: el concepto no aplica (no hay "cierre" congelado) — guion, no un
+      // 'No' que insinúe certeza que no existe. Modo histórico: ver _estadoAlCierre arriba.
+      cambioPosterior:       fin ? (_estadoAlCierre(m, fin).posibleCambio ? 'Sí' : 'No') : '—',
+    });
+  }
+
+  const dateFmt = 'dd/mm/yyyy hh:mm';
+  ['fecha', 'identificadoAt'].forEach(key => { detalle.getColumn(key).numFmt = dateFmt; });
+  detalle.getColumn('deposito').numFmt = '#,##0.00';
+
+  const headerRow = detalle.getRow(1);
+  headerRow.height = 22;
+  headerRow.font   = { bold: true, color: { argb: 'FFE0E7FF' }, size: 10 };
+  headerRow.fill   = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+
+  if (detalle.lastColumn) detalle.autoFilter = { from: 'A1', to: detalle.lastColumn.letter + '1' };
+  detalle.views = [{ state: 'frozen', ySplit: 1 }];
+
+  return wb.xlsx.writeBuffer();
+}
+
 // promedio/mediana/_matchScopeUserId también se exportan para
 // collection-request-indicadores.service.js (mismo dominio conceptual — tiempo de
 // identificación — pero acotado a Solicitudes de Cobro, ver ese archivo).
 module.exports = {
   getIndicadoresIdentificacion,
+  getCorteConciliacion,
+  getPeriodoCortePorRol,
+  buildReporteCorte,
   buildReporteIdentificacion,
   listUsuariosConIdentificaciones,
   horasHabilesEntre,

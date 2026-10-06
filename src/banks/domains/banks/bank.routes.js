@@ -141,6 +141,39 @@ router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHa
   res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId }));
 }));
 
+// GET /api/banks/cortes — control periódico de conciliación (2026-10-02): rezagados,
+// nuevos depósitos del periodo e identificados en el periodo (separados por origen).
+// Sin scope de usuario (es un control de equipo, no de desempeño individual — ver
+// bank-indicadores.service.js#getCorteConciliacion). `periodo` lo decide el FRONTEND según
+// el rol (semanal para cobranza, mensual para contabilidad) — mismo criterio ya usado para
+// la visibilidad de pestañas del carousel de Bancos: es una decisión de UX, no de permisos,
+// así que el backend no la fuerza por rol (cualquiera con BANKS_READ puede pedir cualquier
+// periodo explícitamente).
+router.get('/cortes', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { periodo, banco, fechaInicio, fechaFin } = req.query;
+  res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null, fechaInicio, fechaFin }));
+}));
+
+// GET /api/banks/cortes/periodo-rol — qué periodo ve el usuario autenticado y si puede
+// alternar (2026-10-05, configurable desde Configuraciones Globales — ver
+// bank-indicadores.service.js#getPeriodoCortePorRol). Mismo permiso que /cortes: esto decide
+// la UX del toggle, no un acceso distinto a la data.
+router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  res.json(await indicadoresService.getPeriodoCortePorRol(req.user.role));
+}));
+
+// GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle
+// de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
+// data ya visible en pantalla, solo en formato descargable.
+router.get('/cortes/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { periodo, banco, fechaInicio, fechaFin } = req.query;
+  const buffer = await indicadoresService.buildReporteCorte({ periodo, banco: banco || null, fechaInicio, fechaFin });
+  const fecha = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Corte-Conciliacion-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
 // GET /api/banks/indicadores/reporte — Excel descargable del dashboard de Cobranza
 // (2026-09-18). Mismo permiso que /indicadores (BANKS_READ), NO BANKS_EXPORT ni un permiso
 // nuevo: es la MISMA data que ya se ve en pantalla, respetando el MISMO scope

@@ -16,7 +16,7 @@ const { buscarTransaccionesNetpay } = require('./kore-caja.service');
 const { UnprocessableError, ConflictError } = require('../../shared/errors/AppError');
 const { logger } = require('../../../shared/utils/logger');
 const {
-  STATUS_LABELS, _formatFecha, _koreCacheColumnas,
+  STATUS_LABELS, _formatFecha, _koreCacheColumnas, _estilizarHoja,
 } = require('./netpay-reporte-export.service');
 
 // Mismo patrón de lotes/pausa/reintento-ante-429 que
@@ -215,25 +215,6 @@ function _movimientosVinculados(movimientos) {
     const monto = m.deposito != null ? Number(m.deposito).toFixed(2) : '—';
     return `${fecha} · $${monto} · ${m.banco ?? '—'} · ${m.numeroAutorizacion ?? '—'}`;
   }).join('; ');
-}
-
-// Mismo estilo institucional que netpay-reporte-export.service.js (header oscuro, filas
-// pares, formato numérico) — factorizado acá porque este archivo tiene 2 hojas, no 1.
-function _estilizarHoja(sheet, columnas, numColKeys) {
-  const headerRow = sheet.getRow(1);
-  headerRow.font = { bold: true, color: { argb: 'FFE0E7FF' } };
-  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
-
-  const evenFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFF' } };
-  sheet.eachRow((row, rowNumber) => {
-    if (rowNumber === 1) return;
-    const isEven = rowNumber % 2 === 0;
-    columnas.forEach((col, idx) => {
-      const cell = row.getCell(idx + 1);
-      if (isEven) cell.fill = evenFill;
-      if (numColKeys.has(col.key) && cell.value != null) cell.numFmt = '#,##0.00';
-    });
-  });
 }
 
 async function generarExcelBandejaNetpay(buckets) {

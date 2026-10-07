@@ -92,20 +92,28 @@ jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpa
 // fueron ELIMINADOS (dead code v1, ver netpay-reporte.service.js) — reemplazados por
 // evaluarReporte/resolverReporte/rechazarReporte/eliminarReporte/restaurarReporte.
 jest.mock('./netpay-reporte.service', () => ({
-  cargarReporte:              jest.fn(),
-  listar:                     jest.fn(),
-  obtenerDetalle:             jest.fn(),
-  obtenerPorMovimiento:       jest.fn(),
-  buscarCandidatos:           jest.fn(),
-  evaluarReporte:             jest.fn(),
-  resolverReporte:            jest.fn(),
-  rechazarReporte:            jest.fn(),
-  eliminarReporte:            jest.fn(),
-  restaurarReporte:           jest.fn(),
-  consultarFolioKore:         jest.fn(),
-  consultarFoliosPendientes:  jest.fn(),
+  cargarReporte:                    jest.fn(),
+  listar:                           jest.fn(),
+  obtenerDetalle:                   jest.fn(),
+  obtenerPorMovimiento:             jest.fn(),
+  buscarCandidatos:                 jest.fn(),
+  evaluarReporte:                   jest.fn(),
+  resolverReporte:                  jest.fn(),
+  rechazarReporte:                  jest.fn(),
+  eliminarReporte:                  jest.fn(),
+  restaurarReporte:                 jest.fn(),
+  consultarFolioKore:               jest.fn(),
+  consultarFoliosPendientes:        jest.fn(),
+  consultarFoliosPendientesDeLote:  jest.fn(),
+  obtenerReportesPorIds:            jest.fn(),
 }));
-jest.mock('./netpay-reporte-export.service', () => ({ generarExcelReporteNetpay: jest.fn() }));
+jest.mock('./netpay-reporte-export.service', () => ({
+  generarExcelReporteNetpay: jest.fn(), generarExcelReportesNetpay: jest.fn(),
+}));
+// netpay-comisiones (pedido explícito del usuario, 2026-10-07): detectar variación de tasa de
+// comisión por almacén — límite de I/O real de la ruta, la agregación en sí no se testea acá
+// (netpay-comision.service.test.js).
+jest.mock('./netpay-comision.service', () => ({ obtenerVariacionComisiones: jest.fn() }));
 
 // netpay-matching-v2 (Fase 3, route wiring): GET /netpay/bandeja pasa a leer directamente
 // los buckets YA persistidos (NetpayMatch) — ya no llama a Kore en vivo (design.md API
@@ -137,8 +145,10 @@ const {
   buscarCandidatos: buscarCandidatosNetpayReporte,
   evaluarReporte, resolverReporte, rechazarReporte, eliminarReporte, restaurarReporte,
   consultarFolioKore, consultarFoliosPendientes,
+  consultarFoliosPendientesDeLote, obtenerReportesPorIds,
 } = require('./netpay-reporte.service');
-const { generarExcelReporteNetpay } = require('./netpay-reporte-export.service');
+const { generarExcelReporteNetpay, generarExcelReportesNetpay } = require('./netpay-reporte-export.service');
+const { obtenerVariacionComisiones } = require('./netpay-comision.service');
 const NetpayMatch = require('./NetpayMatch.model');
 const { evaluarRango } = require('./netpay-evaluacion.service');
 const {
@@ -1521,6 +1531,18 @@ describe('GET /netpay/bandeja', () => {
     expect(filtro.dia.$gte).toEqual(new Date('2026-09-01T00:00:00.000Z'));
     expect(filtro.dia.$lte).toEqual(new Date('2026-09-10T00:00:00.000Z'));
   });
+
+  // Fix de revisión de riesgo (2026-10-07): antes un dateFrom/dateTo no parseable pasaba como
+  // Invalid Date directo al filtro Mongo, sin aviso.
+  test('dateFrom inválido: 400, nunca llega a Mongo', async () => {
+    const res = await request(app)
+      .get('/netpay/bandeja')
+      .query({ dateFrom: 'no-es-una-fecha' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(400);
+    expect(NetpayMatch.find).not.toHaveBeenCalled();
+  });
 });
 
 // POST /netpay/bandeja/evaluar — netpay-matching-v2 (design.md API table: New; "When
@@ -2149,6 +2171,160 @@ describe('GET /netpay/reporte', () => {
 
     expect(res.status).toBe(200);
     expect(listarNetpayReportes).toHaveBeenCalledWith({ estatus: undefined, incluirEliminados: true });
+  });
+
+  // dateFrom/dateTo (pedido explícito del usuario, 2026-10-07): filtro de rango sobre
+  // fechaMovimiento, para no tener que scrollear toda la lista buscando un depósito de una
+  // fecha puntual — la lógica del filtro en sí se cubre en netpay-reporte.service.test.js,
+  // acá solo el cableado HTTP.
+  test('pasa dateFrom/dateTo al service', async () => {
+    listarNetpayReportes.mockResolvedValue({ reportes: [] });
+
+    const res = await request(app)
+      .get('/netpay/reporte')
+      .query({ dateFrom: '2026-09-01', dateTo: '2026-09-30' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(listarNetpayReportes).toHaveBeenCalledWith(
+      expect.objectContaining({ dateFrom: '2026-09-01', dateTo: '2026-09-30' }),
+    );
+  });
+
+  // propaga el BadRequestError que listar() lanza ante una fecha inválida (asyncHandler ->
+  // error-handler.js lo mapea a 400).
+  test('dateFrom inválido: propaga 400 del service', async () => {
+    const { BadRequestError } = require('../../shared/errors/AppError');
+    listarNetpayReportes.mockRejectedValue(new BadRequestError('dateFrom inválido: x'));
+
+    const res = await request(app)
+      .get('/netpay/reporte')
+      .query({ dateFrom: 'x' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(400);
+  });
+});
+
+// GET /netpay/reporte/export-lote — pedido explícito del usuario (2026-10-07): "excel general"
+// de TODOS los depósitos de un archivo recién cargado. DEBE registrarse ANTES de
+// GET /netpay/reporte/:id (si no, Express matchearía "export-lote" como si fuera un :id) — este
+// describe existe específicamente para blindar ese orden contra una reordenación futura
+// (hallazgo de revisión de confiabilidad, 2026-10-07: el fix original no tenía ningún test).
+describe('GET /netpay/reporte/export-lote', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app)
+      .get('/netpay/reporte/export-lote')
+      .query({ ids: 'r1,r2' })
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(consultarFoliosPendientesDeLote).not.toHaveBeenCalled();
+  });
+
+  test('responde 400 si no se manda ningún id', async () => {
+    const res = await request(app)
+      .get('/netpay/reporte/export-lote')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(400);
+    expect(consultarFoliosPendientesDeLote).not.toHaveBeenCalled();
+  });
+
+  // Regresión de orden de rutas: "export-lote" NUNCA debe caer en el handler de
+  // GET /netpay/reporte/:id (que llamaría a obtenerDetalleNetpayReporte con el string literal
+  // "export-lote" como si fuera un _id de Mongo).
+  test('el path literal "export-lote" NUNCA cae en el handler de GET /netpay/reporte/:id', async () => {
+    consultarFoliosPendientesDeLote.mockResolvedValue({ fallos: [], omitidosPorTiempo: [], reportesFallidos: [] });
+    obtenerReportesPorIds.mockResolvedValue([{ _id: 'r1', claveRastreo: 'C1', folios: [] }]);
+    generarExcelReportesNetpay.mockResolvedValue(Buffer.from('xlsx'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/export-lote')
+      .query({ ids: 'r1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(obtenerDetalleNetpayReporte).not.toHaveBeenCalled();
+    expect(consultarFoliosPendientesDeLote).toHaveBeenCalledWith(['r1']);
+  });
+
+  test('arma el Excel y expone X-Netpay-Export-Incompleto sumando fallos, omitidos, reportes fallidos e ids no encontrados', async () => {
+    consultarFoliosPendientesDeLote.mockResolvedValue({
+      fallos: [{ reporteId: 'r1', referencia: 'F1', error: 'x' }],
+      omitidosPorTiempo: ['r2'],
+      reportesFallidos: [{ reporteId: 'r3', error: 'y' }],
+    });
+    // Solo r1 "existe" -> r2, r3 y r4 cuentan como ids no encontrados.
+    obtenerReportesPorIds.mockResolvedValue([{ _id: 'r1', claveRastreo: 'C1', folios: [] }]);
+    generarExcelReportesNetpay.mockResolvedValue(Buffer.from('xlsx'));
+
+    const res = await request(app)
+      .get('/netpay/reporte/export-lote')
+      .query({ ids: 'r1,r2,r3,r4' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('spreadsheetml');
+    // 1 fallo + 1 omitido + 1 reporte fallido + 3 ids no encontrados (r2, r3, r4) = 6
+    expect(res.headers['x-netpay-export-incompleto']).toBe('6');
+    expect(res.headers['x-netpay-export-ids-no-encontrados']).toBe('3');
+  });
+
+  test('ningún reporte encontrado: 404, nunca genera el Excel', async () => {
+    consultarFoliosPendientesDeLote.mockResolvedValue({ fallos: [], omitidosPorTiempo: [], reportesFallidos: [] });
+    obtenerReportesPorIds.mockResolvedValue([]);
+
+    const res = await request(app)
+      .get('/netpay/reporte/export-lote')
+      .query({ ids: 'r1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
+    expect(generarExcelReportesNetpay).not.toHaveBeenCalled();
+  });
+});
+
+// GET /netpay/comisiones — pedido explícito del usuario (2026-10-07): detectar variación de
+// tasa de comisión base por almacén. Límite de I/O real de la ruta — la agregación en sí tiene
+// sus propios tests unitarios (netpay-comision.service.test.js).
+describe('GET /netpay/comisiones', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app).get('/netpay/comisiones').set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(obtenerVariacionComisiones).not.toHaveBeenCalled();
+  });
+
+  test('devuelve el resultado del service tal cual', async () => {
+    const resultado = {
+      almacenes: [{ storeId: 'S1', sucursal: 'Oaxaca 02', variacion: true, tasas: [] }],
+      foliosSinAlmacenIdentificado: 2,
+    };
+    obtenerVariacionComisiones.mockResolvedValue(resultado);
+
+    const res = await request(app)
+      .get('/netpay/comisiones')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultado);
   });
 });
 

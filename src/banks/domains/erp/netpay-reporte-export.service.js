@@ -88,68 +88,89 @@ async function generarExcelReporteNetpay(reporte) {
 
   // ── Hoja "Folios" ──────────────────────────────────────────────────────────
   const sheet = workbook.addWorksheet('Folios');
-  const columnas = [
-    { header: 'Referencia',            key: 'referencia',         width: 18 },
-    { header: 'Terminal ID',           key: 'terminalID',         width: 16 },
-    { header: 'Store ID',              key: 'storeId',            width: 14 },
-    { header: 'Sucursal',              key: 'sucursal',           width: 26 },
-    { header: 'Nombre Empresa',        key: 'nombreEmpresa',      width: 26 },
-    { header: 'Fecha Trx',             key: 'fechaTrx',           width: 13 },
-    { header: 'Hora Trx',              key: 'horaTrx',            width: 10 },
-    { header: 'Monto Trx',             key: 'montoTrx',           width: 14 },
-    { header: 'Comisión Base %',       key: 'comisionBasePct',    width: 15 },
-    { header: 'Comisión Base $',       key: 'comisionBaseMonto',  width: 15 },
-    { header: 'IVA Comisión',          key: 'ivaComision',        width: 14 },
-    { header: 'Comisión + IVA',        key: 'comisionMasIva',     width: 15 },
-    { header: 'Monto Depósito',        key: 'montoDeposito',      width: 15 },
-    { header: 'Banco',                 key: 'banco',              width: 16 },
-    { header: 'Tipo de Tarjeta',       key: 'tipoTarjeta',        width: 14 },
-    { header: 'Código Autorización',   key: 'codigoAutorizacion', width: 18 },
-    { header: 'Order ID',              key: 'orderId',            width: 30 },
-    // Desglose de folios[].koreCache (fix 2026-09-29, pedido del usuario): solo se
-    // llena para folios YA consultados manualmente en el panel (consultarFolioKore) —
-    // nunca se pega a Kore al exportar, ver _koreCacheColumnas().
-    { header: 'Pedido (Kore)',           key: 'serieFolioKore',   width: 16 },
-    { header: 'Folio Fiscal (Kore)',     key: 'folioFiscalKore',  width: 18 },
-    { header: 'Tipo de Pago (Kore)',     key: 'tipoPagoKore',     width: 14 },
-    { header: 'Subtotal (Kore)',         key: 'subtotalKore',     width: 14 },
-    { header: 'Impuesto (Kore)',         key: 'impuestoKore',     width: 14 },
-    { header: 'Total (Kore)',            key: 'totalKore',        width: 14 },
-    { header: 'Almacén (Kore)',          key: 'almacenKore',      width: 14 },
-  ];
-  sheet.columns = columnas;
+  sheet.columns = COLUMNAS_FOLIOS;
+  for (const f of (reporte.folios ?? [])) sheet.addRow(_filaFolio(f));
+  _estilizarHoja(sheet, COLUMNAS_FOLIOS, NUM_COL_KEYS_FOLIOS);
 
-  for (const f of (reporte.folios ?? [])) {
-    sheet.addRow({
-      referencia:         f.referencia,
-      terminalID:         f.terminalID,
-      storeId:            f.storeId,
-      sucursal:           f.sucursal,
-      nombreEmpresa:      f.nombreEmpresa,
-      fechaTrx:           _formatFecha(f.fechaTrx),
-      horaTrx:            f.horaTrx,
-      montoTrx:           f.montoTrx,
-      comisionBasePct:    f.comisionBasePct,
-      comisionBaseMonto:  f.comisionBaseMonto,
-      ivaComision:        f.ivaComision,
-      comisionMasIva:     f.comisionMasIva,
-      montoDeposito:      f.montoDeposito,
-      banco:              f.banco,
-      tipoTarjeta:        f.tipoTarjeta,
-      codigoAutorizacion: f.codigoAutorizacion,
-      orderId:            f.orderId,
-      ..._koreCacheColumnas(f),
-    });
-  }
+  return workbook.xlsx.writeBuffer();
+}
 
+// Columnas + mapeo de fila de la hoja "Folios", compartidos entre generarExcelReporteNetpay
+// (1 reporte) y generarExcelReportesNetpay (N reportes, ver abajo) — antes vivían duplicados
+// casi íntegros en ambas funciones (~70 líneas idénticas, incluido el desglose de
+// folios[].koreCache del fix 2026-09-29); factorizado acá tras hallazgo de revisión de
+// legibilidad (2026-10-07). generarExcelReportesNetpay solo necesita anteponer su propia
+// columna extra "Clave Rastreo (Depósito)".
+const COLUMNAS_FOLIOS = [
+  { header: 'Referencia',            key: 'referencia',         width: 18 },
+  { header: 'Terminal ID',           key: 'terminalID',         width: 16 },
+  { header: 'Store ID',              key: 'storeId',            width: 14 },
+  { header: 'Sucursal',              key: 'sucursal',           width: 26 },
+  { header: 'Nombre Empresa',        key: 'nombreEmpresa',      width: 26 },
+  { header: 'Fecha Trx',             key: 'fechaTrx',           width: 13 },
+  { header: 'Hora Trx',              key: 'horaTrx',            width: 10 },
+  { header: 'Monto Trx',             key: 'montoTrx',           width: 14 },
+  { header: 'Comisión Base %',       key: 'comisionBasePct',    width: 15 },
+  { header: 'Comisión Base $',       key: 'comisionBaseMonto',  width: 15 },
+  { header: 'IVA Comisión',          key: 'ivaComision',        width: 14 },
+  { header: 'Comisión + IVA',        key: 'comisionMasIva',     width: 15 },
+  { header: 'Monto Depósito',        key: 'montoDeposito',      width: 15 },
+  { header: 'Banco',                 key: 'banco',              width: 16 },
+  { header: 'Tipo de Tarjeta',       key: 'tipoTarjeta',        width: 14 },
+  { header: 'Código Autorización',   key: 'codigoAutorizacion', width: 18 },
+  { header: 'Order ID',              key: 'orderId',            width: 30 },
+  // Desglose de folios[].koreCache (fix 2026-09-29, pedido del usuario): solo se
+  // llena para folios YA consultados manualmente en el panel (consultarFolioKore) —
+  // nunca se pega a Kore al exportar, ver _koreCacheColumnas().
+  { header: 'Pedido (Kore)',           key: 'serieFolioKore',   width: 16 },
+  { header: 'Folio Fiscal (Kore)',     key: 'folioFiscalKore',  width: 18 },
+  { header: 'Tipo de Pago (Kore)',     key: 'tipoPagoKore',     width: 14 },
+  { header: 'Subtotal (Kore)',         key: 'subtotalKore',     width: 14 },
+  { header: 'Impuesto (Kore)',         key: 'impuestoKore',     width: 14 },
+  { header: 'Total (Kore)',            key: 'totalKore',        width: 14 },
+  { header: 'Almacén (Kore)',          key: 'almacenKore',      width: 14 },
+];
+
+const NUM_COL_KEYS_FOLIOS = new Set([
+  'montoTrx', 'comisionBaseMonto', 'ivaComision', 'comisionMasIva', 'montoDeposito',
+  'subtotalKore', 'impuestoKore', 'totalKore',
+]);
+
+function _filaFolio(f) {
+  return {
+    referencia:         f.referencia,
+    terminalID:         f.terminalID,
+    storeId:            f.storeId,
+    sucursal:           f.sucursal,
+    nombreEmpresa:      f.nombreEmpresa,
+    fechaTrx:           _formatFecha(f.fechaTrx),
+    horaTrx:            f.horaTrx,
+    montoTrx:           f.montoTrx,
+    comisionBasePct:    f.comisionBasePct,
+    comisionBaseMonto:  f.comisionBaseMonto,
+    ivaComision:        f.ivaComision,
+    comisionMasIva:     f.comisionMasIva,
+    montoDeposito:      f.montoDeposito,
+    banco:              f.banco,
+    tipoTarjeta:        f.tipoTarjeta,
+    codigoAutorizacion: f.codigoAutorizacion,
+    orderId:            f.orderId,
+    ..._koreCacheColumnas(f),
+  };
+}
+
+// Mismo estilo institucional (header oscuro, filas pares, formato numérico) que usa
+// netpay-match-export.service.js#generarExcelBandejaNetpay — ESA es la única definición
+// (se exporta de acá, netpay-match-export.service.js la reusa) en vez de mantener 2 copias
+// idénticas; no al revés, porque ese archivo ya depende de este (STATUS_LABELS/_formatFecha/
+// _koreCacheColumnas) y la dirección opuesta crearía un require circular (corrección de
+// revisión de legibilidad, 2026-10-07 — la copia duplicada original decía, incorrectamente,
+// que no se podía reusar por no ser "dependencia de este archivo").
+function _estilizarHoja(sheet, columnas, numColKeys) {
   const headerRow = sheet.getRow(1);
   headerRow.font = { bold: true, color: { argb: 'FFE0E7FF' } };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
 
-  const numColKeys = new Set([
-    'montoTrx', 'comisionBaseMonto', 'ivaComision', 'comisionMasIva', 'montoDeposito',
-    'subtotalKore', 'impuestoKore', 'totalKore',
-  ]);
   const evenFill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFF' } };
   sheet.eachRow((row, rowNumber) => {
     if (rowNumber === 1) return;
@@ -160,11 +181,72 @@ async function generarExcelReporteNetpay(reporte) {
       if (numColKeys.has(col.key) && cell.value != null) cell.numFmt = '#,##0.00';
     });
   });
+}
+
+// generarExcelReportesNetpay — netpay-reporte export-lote (2026-10-07, pedido explícito del
+// usuario): "excel general" con TODOS los depósitos de UN MISMO archivo recién cargado (no
+// toda la colección NetpayReporte) — mismo criterio de 2 hojas que
+// netpay-match-export.service.js#generarExcelBandejaNetpay (ahí la unidad es un bucket
+// NetpayMatch, acá un NetpayReporte completo), reusando las mismas columnas/estilo que
+// generarExcelReporteNetpay ya usa para UN solo reporte.
+async function generarExcelReportesNetpay(reportes) {
+  const workbook = new ExcelJS.Workbook();
+
+  // ── Hoja "Depósitos" — versión tabular de la hoja "Resumen" individual, 1 fila por reporte ──
+  const sheetDepositos = workbook.addWorksheet('Depósitos');
+  const columnasDepositos = [
+    { header: 'Clave Rastreo',             key: 'claveRastreo',        width: 20 },
+    { header: 'Cuenta Depósito',           key: 'cuentaDeposito',      width: 18 },
+    { header: 'Fecha de movimiento',       key: 'fechaMovimiento',     width: 16 },
+    { header: 'Monto Depósito Total',      key: 'montoDepositoTotal',  width: 18 },
+    { header: 'Monto Transaccionado',      key: 'montoTransaccionado', width: 18 },
+    { header: 'Comisiones',                key: 'comisiones',          width: 14 },
+    { header: 'IVA',                       key: 'iva',                 width: 12 },
+    { header: 'Monto Depositado (Ventas)', key: 'montoDepositado',     width: 18 },
+    { header: 'Estatus',                   key: 'estatus',             width: 20 },
+    { header: 'Archivo original',          key: 'archivo',             width: 26 },
+  ];
+  sheetDepositos.columns = columnasDepositos;
+  for (const r of reportes) {
+    sheetDepositos.addRow({
+      claveRastreo:        r.claveRastreo,
+      cuentaDeposito:      r.cuentaDeposito,
+      fechaMovimiento:     _formatFecha(r.fechaMovimiento),
+      montoDepositoTotal:  r.montoDepositoTotal,
+      montoTransaccionado: r.resumenVentas?.montoTransaccionado ?? null,
+      comisiones:          r.resumenVentas?.comisiones ?? null,
+      iva:                 r.resumenVentas?.iva ?? null,
+      montoDepositado:     r.resumenVentas?.montoDepositado ?? null,
+      estatus:             STATUS_LABELS[r.estatus] ?? r.estatus,
+      archivo:             r.nombreArchivoOriginal ?? null,
+    });
+  }
+  _estilizarHoja(sheetDepositos, columnasDepositos, new Set(['montoDepositoTotal', 'montoTransaccionado', 'comisiones', 'iva', 'montoDepositado']));
+
+  // ── Hoja "Folios" — aplanado de folios[] de TODOS los reportes, con columna de depósito ──
+  // Mismas columnas/mapeo que generarExcelReporteNetpay (COLUMNAS_FOLIOS/_filaFolio arriba),
+  // solo se antepone la columna "Clave Rastreo (Depósito)" para distinguir de qué reporte es
+  // cada folio.
+  const sheetFolios = workbook.addWorksheet('Folios');
+  const columnasFolios = [
+    { header: 'Clave Rastreo (Depósito)', key: 'claveRastreo', width: 20 },
+    ...COLUMNAS_FOLIOS,
+  ];
+  sheetFolios.columns = columnasFolios;
+  for (const r of reportes) {
+    for (const f of (r.folios ?? [])) {
+      sheetFolios.addRow({ claveRastreo: r.claveRastreo, ..._filaFolio(f) });
+    }
+  }
+  _estilizarHoja(sheetFolios, columnasFolios, NUM_COL_KEYS_FOLIOS);
 
   return workbook.xlsx.writeBuffer();
 }
 
-// STATUS_LABELS/_formatFecha/_koreCacheColumnas también los usa
+// STATUS_LABELS/_formatFecha/_koreCacheColumnas/_estilizarHoja también los usa
 // netpay-match-export.service.js (export de la bandeja de matching) — mismo enum/shape de
-// koreCache, no vale la pena duplicarlos.
-module.exports = { generarExcelReporteNetpay, STATUS_LABELS, _formatFecha, _koreCacheColumnas };
+// koreCache y mismo estilo institucional, no vale la pena duplicarlos.
+module.exports = {
+  generarExcelReporteNetpay, generarExcelReportesNetpay,
+  STATUS_LABELS, _formatFecha, _koreCacheColumnas, _estilizarHoja,
+};

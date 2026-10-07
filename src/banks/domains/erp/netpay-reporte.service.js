@@ -14,7 +14,7 @@ const NetpayFolioRegistro = require('./NetpayFolioRegistro.model');
 const { setErpIds, ERP_TOLERANCE } = require('../banks/bank.service');
 const { buscarTransaccionesNetpay } = require('./kore-caja.service');
 const { _ventanaDiasNetpay, _montosIguales: _montosIgualesCompartido } = require('./netpay-match.service');
-const { NotFoundError, BadRequestError, ConflictError } = require('../../shared/errors/AppError');
+const { NotFoundError, BadRequestError, ConflictError, UnprocessableError } = require('../../shared/errors/AppError');
 // Estados desde los que rechazarReporte YA NO puede actuar — mismo criterio EXACTO que
 // netpay-resolver.service.js#ESTATUS_TERMINALES ("any active state -> rechazado",
 // spec.md), aplicado a NetpayReporte.
@@ -322,10 +322,26 @@ async function cargarReporte(buffer, nombreArchivo, user) {
   return { reportes, resumen };
 }
 
-async function listar({ estatus, incluirEliminados = false } = {}) {
+// dateFrom/dateTo (pedido explícito del usuario, 2026-10-07): filtra por fechaMovimiento
+// (fecha real del depósito) — para no tener que scrollear la lista completa buscando un
+// depósito de una fecha puntual. A diferencia del filtro `dia` que ya usa GET /netpay/bandeja
+// (erp.routes.js, $lte a medianoche), acá $lte se arma a FIN de día: fechaMovimiento es un
+// Date con posible componente de hora real (no un bucket de día ya truncado a medianoche como
+// `dia`), así que cortar a las 00:00:00 excluiría depósitos del propio día de corte.
+async function listar({ estatus, incluirEliminados = false, dateFrom, dateTo } = {}) {
   const filter = {};
   if (estatus) filter.estatus = estatus;
   if (!incluirEliminados) filter.eliminado = { $ne: true };
+  if (dateFrom) {
+    const desde = new Date(`${dateFrom}T00:00:00.000Z`);
+    if (isNaN(desde.getTime())) throw new BadRequestError(`dateFrom inválido: ${dateFrom}`);
+    filter.fechaMovimiento = { ...(filter.fechaMovimiento ?? {}), $gte: desde };
+  }
+  if (dateTo) {
+    const hasta = new Date(`${dateTo}T23:59:59.999Z`);
+    if (isNaN(hasta.getTime())) throw new BadRequestError(`dateTo inválido: ${dateTo}`);
+    filter.fechaMovimiento = { ...(filter.fechaMovimiento ?? {}), $lte: hasta };
+  }
   const reportes = await NetpayReporte.find(filter).sort({ fechaMovimiento: -1 }).lean();
   return { reportes };
 }
@@ -520,6 +536,19 @@ async function evaluarReporte(reporteId) {
   const reporte = await NetpayReporte.findById(reporteId);
   if (!reporte) throw new NotFoundError('Reporte Netpay');
   if (reporte.eliminado) return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos: [] };
+
+  // Bug real 2026-10-07 (reportado por el usuario: "Reevaluar" tumbaba a discrepancia un
+  // reporte que ya estaba resuelto_por_reporte). El movimiento que un reporte YA resolvió
+  // queda con erpLinks NO vacío (setErpIds lo escribe) — pero _buscarCandidatosParaReporte de
+  // abajo filtra justo `erpLinks:{$size:0}`, así que ese movimiento (el único candidato
+  // "correcto" posible) se vuelve invisible para su propia re-evaluación; al no haber tampoco
+  // un bucket confirmado_automatico que lo corrobore, caía a discrepancia/sin_candidato sin
+  // ningún motivo real. "Reevaluar" existe para RE-decidir un reporte en discrepancia, no para
+  // re-litigar uno ya resuelto — mismo criterio que ya aplica resolverReporte (solo actúa si
+  // estatus==='discrepancia', ver más abajo).
+  if (['resuelto_por_reporte', 'resuelto_manual'].includes(reporte.estatus)) {
+    return { reporte: await _poblarMovimientoVinculado(reporte.toObject()), candidatos: [] };
+  }
 
   const candidatos = await _buscarCandidatosParaReporte(reporte);
 
@@ -725,6 +754,100 @@ async function consultarFoliosPendientes(reporteId) {
   return { consultados: pendientes.length - fallos.length, fallos };
 }
 
+// ── Export de un LOTE de reportes (N depósitos de UN MISMO archivo recién cargado) ────────
+// netpay-reporte export-lote (2026-10-07, pedido explícito del usuario): "excel general" tras
+// cargar un archivo global — la unidad acá es el CONJUNTO de depósitos que ese archivo generó
+// (normalmente ya vienen con koreCache lleno, porque cargarReporte() consulta Kore ANTES de
+// responder al upload — ver POST .../upload en erp.routes.js), pero un folio puede haber
+// quedado pendiente por un fallo parcial de esa carga. Mismo techo/guard anti-doble-disparo
+// que netpay-match-export.service.js#consultarFoliosPendientesDeBandeja — acá la unidad
+// contada es un REPORTE completo (que internamente ya hace su propio lote de 5 folios), no un
+// folio suelto dentro de un bucket.
+const MAX_FOLIOS_PENDIENTES_EXPORT_LOTE = 300;
+// Deja margen bajo el req.setTimeout(300000)/res.setTimeout(300000) de la ruta para lo que
+// viene después (armar el Excel + enviar el buffer) — mismo criterio que
+// netpay-match-export.service.js#PRESUPUESTO_TIEMPO_MS.
+const PRESUPUESTO_TIEMPO_MS_LOTE = 240000;
+// Peor caso de agotar los 3 intentos de UN LOTE de 5 folios (misma fórmula que
+// netpay-match-export.service.js#PEOR_CASO_UN_LOTE_MS) — a diferencia de la versión anterior
+// de este archivo, esto YA NO se compara tal cual contra cada reporte: se multiplica por la
+// cantidad REAL de lotes de 5 que ESE reporte va a correr (ver _peorCasoReporte abajo).
+// BLOCKER de revisión de resiliencia (2026-10-07): el comentario original de este archivo
+// afirmaba que el presupuesto por lotes "ya lo maneja consultarFoliosPendientes puertas
+// adentro" — eso era falso, esa función no tiene ningún control de tiempo interno, así que un
+// reporte con muchos folios pendientes (varios lotes de 5) podía tardar muchas veces el peor
+// caso de UN SOLO lote que este archivo evaluaba antes de arrancarlo, superando el
+// req.setTimeout/res.setTimeout de la ruta sin que nada lo cortara.
+const PEOR_CASO_UN_LOTE_DE_FOLIOS_MS =
+  (CONSULTAR_FOLIOS_MAX_INTENTOS_429 - 1) * 60000 + CONSULTAR_FOLIOS_MAX_INTENTOS_429 * 5000;
+
+function _peorCasoReporte(cantidadPendientes) {
+  return Math.ceil(cantidadPendientes / CONSULTAR_FOLIOS_CONCURRENCIA) * PEOR_CASO_UN_LOTE_DE_FOLIOS_MS;
+}
+
+const _exportacionesLoteEnCurso = new Set();
+
+async function consultarFoliosPendientesDeLote(ids) {
+  const clave = [...ids].map(String).sort().join('|');
+  if (_exportacionesLoteEnCurso.has(clave)) {
+    throw new ConflictError('Ya hay una exportación en curso para este lote, esperá a que termine.');
+  }
+  _exportacionesLoteEnCurso.add(clave);
+
+  try {
+    const reportes = await NetpayReporte.find({ _id: { $in: ids } }).select('folios').lean();
+
+    const pendientesPorReporte = new Map(
+      reportes.map(r => [String(r._id), (r.folios ?? []).filter(f => f.referencia && !f.koreCache?.cuenta).length]),
+    );
+    const totalPendientes = [...pendientesPorReporte.values()].reduce((sum, n) => sum + n, 0);
+    if (totalPendientes > MAX_FOLIOS_PENDIENTES_EXPORT_LOTE) {
+      throw new UnprocessableError(
+        `Hay ${totalPendientes} folios sin consultar en Kore dentro de este lote (máximo ${MAX_FOLIOS_PENDIENTES_EXPORT_LOTE}).`,
+      );
+    }
+
+    const fallos = [];
+    const omitidosPorTiempo = [];
+    const reportesFallidos = [];
+    const inicio = Date.now();
+    for (const reporte of reportes) {
+      const reporteId = String(reporte._id);
+      const peorCaso = _peorCasoReporte(pendientesPorReporte.get(reporteId) ?? 0);
+      if (Date.now() - inicio + peorCaso > PRESUPUESTO_TIEMPO_MS_LOTE) {
+        omitidosPorTiempo.push(reporteId);
+        continue;
+      }
+      // CRITICAL de revisión de resiliencia (2026-10-07): antes, un error de
+      // consultarFoliosPendientes para UN reporte (ej. borrado concurrente por otro usuario a
+      // mitad de la corrida -> NotFoundError) abortaba TODO el lote sin try/catch, perdiendo
+      // el trabajo ya hecho de los reportes anteriores y sin generar ningún Excel. Ahora se
+      // registra en reportesFallidos y se sigue con el resto — mismo criterio de fallo
+      // parcial que ya aplica a nivel de folio individual dentro de esa función.
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const resultado = await consultarFoliosPendientes(reporteId);
+        resultado.fallos.forEach(f => fallos.push({ reporteId, ...f }));
+      } catch (err) {
+        logger.warn(`[NetpayReporte] no se pudo consultar Kore para el reporte ${reporteId} dentro del lote: ${err.message}`);
+        reportesFallidos.push({ reporteId, error: err.message });
+      }
+    }
+
+    return { fallos, omitidosPorTiempo, reportesFallidos };
+  } finally {
+    // SIEMPRE libera la marca — éxito, error (incluido el 422 del techo), o corte por
+    // presupuesto de tiempo caen todos acá.
+    _exportacionesLoteEnCurso.delete(clave);
+  }
+}
+
+// Reportes frescos (post-enriquecimiento de Kore) para armar el Excel del lote — find simple
+// por _id, sin populate (generarExcelReportesNetpay no usa movementIdConfirmado poblado).
+async function obtenerReportesPorIds(ids) {
+  return NetpayReporte.find({ _id: { $in: ids } }).lean();
+}
+
 module.exports = {
   cargarReporte,
   listar,
@@ -735,6 +858,8 @@ module.exports = {
   rechazarReporte,
   consultarFolioKore,
   consultarFoliosPendientes,
+  consultarFoliosPendientesDeLote,
+  obtenerReportesPorIds,
   evaluarReporte,
   eliminarReporte,
   restaurarReporte,

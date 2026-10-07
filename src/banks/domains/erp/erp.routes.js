@@ -54,11 +54,15 @@ const {
   buscarCandidatos: buscarCandidatosNetpayReporte,
   evaluarReporte, resolverReporte, rechazarReporte, eliminarReporte, restaurarReporte,
   consultarFolioKore, consultarFoliosPendientes,
+  consultarFoliosPendientesDeLote, obtenerReportesPorIds,
 }                                          = require('./netpay-reporte.service');
-const { generarExcelReporteNetpay }       = require('./netpay-reporte-export.service');
+const {
+  generarExcelReporteNetpay, generarExcelReportesNetpay,
+}                                          = require('./netpay-reporte-export.service');
 const {
   consultarFoliosPendientesDeBandeja, generarExcelBandejaNetpay,
 }                                          = require('./netpay-match-export.service');
+const { obtenerVariacionComisiones }      = require('./netpay-comision.service');
 // Registra en bank.service.js el hook que revierte una CajaTransferencia a 'pendiente'
 // cuando se desvincula su erpId sintético (ver caja-transferencia-revert.service.js) —
 // se ejecuta al cargar este archivo, único lugar que conoce ambos dominios.
@@ -458,8 +462,18 @@ router.get('/netpay/transacciones', authenticate, permit(PERMISSIONS.BANKS_NETPA
 router.get('/netpay/bandeja', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
   const { dateFrom, dateTo, terminalID, estatus } = req.query;
   const filtro = {};
-  if (dateFrom) filtro.dia = { ...(filtro.dia ?? {}), $gte: new Date(`${dateFrom}T00:00:00.000Z`) };
-  if (dateTo)   filtro.dia = { ...(filtro.dia ?? {}), $lte: new Date(`${dateTo}T00:00:00.000Z`) };
+  // Valida ANTES de tocar Mongo — un dateFrom/dateTo no parseable como fecha pasaba antes
+  // como Invalid Date al filtro, sin aviso (hallazgo de revisión de riesgo, 2026-10-07).
+  if (dateFrom) {
+    const desde = new Date(`${dateFrom}T00:00:00.000Z`);
+    if (isNaN(desde.getTime())) return res.status(400).json({ error: `dateFrom inválido: ${dateFrom}` });
+    filtro.dia = { ...(filtro.dia ?? {}), $gte: desde };
+  }
+  if (dateTo) {
+    const hasta = new Date(`${dateTo}T00:00:00.000Z`);
+    if (isNaN(hasta.getTime())) return res.status(400).json({ error: `dateTo inválido: ${dateTo}` });
+    filtro.dia = { ...(filtro.dia ?? {}), $lte: hasta };
+  }
   if (terminalID) filtro.terminalID = terminalID;
   if (estatus)    filtro.estatusMatch = estatus;
 
@@ -488,8 +502,16 @@ router.get('/netpay/bandeja/export', authenticate, permit(PERMISSIONS.BANKS_NETP
 
   const { dateFrom, dateTo, terminalID, estatus } = req.query;
   const filtro = {};
-  if (dateFrom) filtro.dia = { ...(filtro.dia ?? {}), $gte: new Date(`${dateFrom}T00:00:00.000Z`) };
-  if (dateTo)   filtro.dia = { ...(filtro.dia ?? {}), $lte: new Date(`${dateTo}T00:00:00.000Z`) };
+  if (dateFrom) {
+    const desde = new Date(`${dateFrom}T00:00:00.000Z`);
+    if (isNaN(desde.getTime())) return res.status(400).json({ error: `dateFrom inválido: ${dateFrom}` });
+    filtro.dia = { ...(filtro.dia ?? {}), $gte: desde };
+  }
+  if (dateTo) {
+    const hasta = new Date(`${dateTo}T00:00:00.000Z`);
+    if (isNaN(hasta.getTime())) return res.status(400).json({ error: `dateTo inválido: ${dateTo}` });
+    filtro.dia = { ...(filtro.dia ?? {}), $lte: hasta };
+  }
   if (terminalID) filtro.terminalID = terminalID;
   if (estatus)    filtro.estatusMatch = estatus;
 
@@ -586,10 +608,64 @@ router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NET
 // netpay-matching-v2 (design.md API table: "GET /netpay/reporte?estatus&incluirEliminados |
 // Hides eliminado by default"): incluirEliminados viaja como string en query — se normaliza
 // a boolean acá, netpay-reporte.service.js#listar ya lo espera así.
+// dateFrom/dateTo (pedido explícito del usuario, 2026-10-07): filtro de rango sobre
+// fechaMovimiento, para no tener que scrollear toda la lista buscando un depósito de una
+// fecha puntual (ver netpay-reporte.service.js#listar).
 router.get('/netpay/reporte', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { estatus, incluirEliminados } = req.query;
-  const resultado = await listarNetpayReportes({ estatus, incluirEliminados: incluirEliminados === 'true' });
+  const { estatus, incluirEliminados, dateFrom, dateTo } = req.query;
+  const resultado = await listarNetpayReportes({
+    estatus, incluirEliminados: incluirEliminados === 'true', dateFrom, dateTo,
+  });
   res.json(resultado);
+}));
+
+// GET /api/erp/netpay/reporte/export-lote — pedido explícito del usuario (2026-10-07): tras
+// cargar un archivo global con N>1 depósitos, exportar TODOS los depósitos de ESE archivo en
+// un solo Excel, enriquecido con Kore igual que el export individual (ver más abajo). `ids`
+// viaja como query param separado por comas. El BACKEND no valida que esos ids pertenezcan al
+// mismo lote recién cargado — solo el frontend restringe esto (ver
+// netpay-reporte-panel.component.ts#idsExportablesDelLote); acá se confía en el mismo permiso
+// banks:netpay que ya permite leer/exportar cualquier reporte individual uno por uno vía
+// GET /netpay/reporte/:id o .../:id/export, así que pedir varios ids arbitrarios en una sola
+// llamada no abre ninguna puerta nueva (corrección de revisión de riesgo, 2026-10-07: el
+// comentario anterior afirmaba una garantía de scoping que no existía en runtime). Ver
+// netpay-reporte.service.js#consultarFoliosPendientesDeLote para el guard de presupuesto de
+// tiempo/techo de folios, mismo criterio que /netpay/bandeja/export. DEBE registrarse ANTES
+// de GET /netpay/reporte/:id — si no, Express matchearía "export-lote" como si fuera un :id.
+router.get('/netpay/reporte/export-lote', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
+  const ids = (req.query.ids ?? '').toString().split(',').map(s => s.trim()).filter(Boolean);
+  if (ids.length === 0) {
+    return res.status(400).json({ error: 'Se requiere al menos un id de reporte (ids=id1,id2,...).' });
+  }
+
+  const { fallos, omitidosPorTiempo, reportesFallidos } = await consultarFoliosPendientesDeLote(ids);
+  const reportes = await obtenerReportesPorIds(ids);
+  if (reportes.length === 0) {
+    return res.status(404).json({ error: 'No se encontró ningún reporte para los ids indicados.' });
+  }
+  // Ids pedidos que no aparecieron entre los reportes encontrados (borrados entre medio, o un
+  // id simplemente inválido) — antes se perdían en silencio, el Excel salía con menos
+  // depósitos de los pedidos sin ningún aviso (hallazgo de revisión de confiabilidad,
+  // 2026-10-07).
+  const idsEncontrados = new Set(reportes.map(r => String(r._id)));
+  const idsNoEncontrados = ids.filter(id => !idsEncontrados.has(id));
+  const buffer = await generarExcelReportesNetpay(reportes);
+
+  // Mismo mecanismo que X-Netpay-Export-Incompleto de /bandeja/export — avisa al frontend si
+  // algo quedó sin resolver contra Kore, o algún id no se encontró/falló, sin bloquear la
+  // descarga (el Excel se genera igual con lo que sí se pudo resolver).
+  const incompletos = fallos.length + omitidosPorTiempo.length + reportesFallidos.length + idsNoEncontrados.length;
+
+  const hoy = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="netpay-reportes-lote-${hoy}.xlsx"`);
+  res.setHeader('X-Netpay-Export-Incompleto', String(incompletos));
+  res.setHeader('X-Netpay-Export-Ids-No-Encontrados', String(idsNoEncontrados.length));
+  res.setHeader('Access-Control-Expose-Headers', 'X-Netpay-Export-Incompleto, X-Netpay-Export-Ids-No-Encontrados');
+  res.send(buffer);
 }));
 
 router.get('/netpay/reporte/:id', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
@@ -687,6 +763,17 @@ router.get('/netpay/reporte/:id/export', authenticate, permit(PERMISSIONS.BANKS_
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="netpay-reporte-${reporte.claveRastreo}.xlsx"`);
   res.send(buffer);
+}));
+
+// GET /api/erp/netpay/comisiones — pedido explícito del usuario (2026-10-07): detectar si
+// Netpay aplicó más de una tasa de comisión base para el mismo almacén a lo largo del tiempo
+// — agrupado por storeId+sucursal, NO por terminalID (ver NetpayReporte.model.js: la tasa se
+// negocia por almacén, ya hay evidencia real de sobrecobro 2.36x en una sucursal). Lee TODOS
+// los NetpayReporte sin filtrar por estatus/eliminado — la comisión aplicada es un hecho
+// factual, independiente del estado de matching de ese depósito.
+router.get('/netpay/comisiones', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await obtenerVariacionComisiones();
+  res.json(resultado);
 }));
 
 // GET /api/erp/netpay/reporte/by-movement/:movementId — Fix 3 (2026-09-25, pedido explícito

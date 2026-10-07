@@ -40,6 +40,9 @@ const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
 // `esCasoNormalParaSplit` en `cfdiToMovimientos`.
 const CODIGO_CUENTA_CAJA   = '1101010003';
 const CODIGO_CUENTA_BANCOS = '1102011005';
+// Clientes Nacionales General 16% / 0% (CxC de ventas a crédito).
+const CODIGO_CUENTA_CLIENTES_16 = '1103010001';
+const CODIGO_CUENTA_CLIENTES_0  = '1103010002';
 // Cuentas bancarias específicas (igual que `BANCO_A_CODIGO_CUENTA` en
 // poliza.service.js — duplicado a propósito). Una regla que apunte a
 // cualquiera de estas cuentas se trata igual que si apuntara a la cuenta
@@ -257,6 +260,22 @@ function findRuleInList(cfdi, rules) {
 /** Detecta la tasa IVA dominante en los conceptos del CFDI.
  *  Tipo P (complemento de pago) siempre devuelve null — no tiene conceptos con tasa.
  *  Fallback: si los conceptos no tienen desglose de tasa, lee del header (cfdi.impuestos). */
+// Pago cuyos documentos relacionados llevan TODOS IVA con tasa > 0 y en cada
+// uno lo pagado = base + IVA con a lo más 1 centavo de diferencia: la
+// diferencia del total es redondeo acumulado, no una porción al 0%
+// (2026-10-06, GUILLERMO HERIBERTO A0-260917242: 13 facturas al 16%, 3 con
+// 1 centavo de redondeo → $0.03 en el total y caía como 'mixto').
+function _pagoTodoGravadoConRedondeo(cfdi) {
+  const doctos = (cfdi.complementoPago?.pagos ?? []).flatMap(p => p.doctosRelacionados ?? []);
+  if (doctos.length === 0) return false;
+  return doctos.every(dr => {
+    const iva = (dr.trasladosDR ?? []).filter(t => (t.impuesto || '') === '002');
+    if (iva.length === 0 || iva.some(t => !(Number(t.tasaOCuota) > 0))) return false;
+    const gravado = iva.reduce((s, t) => s + Number(t.base || 0) + Number(t.importe || 0), 0);
+    return Math.abs(Math.round(Number(dr.impPagado || 0) * 100) - Math.round(gravado * 100)) <= 1;
+  });
+}
+
 function _detectTasaIva(cfdi) {
   if (cfdi.tipoDeComprobante === 'P') {
     // El complemento de pago no tiene conceptos propios; detectar tasa desde los
@@ -272,7 +291,12 @@ function _detectTasaIva(cfdi) {
         const base16  = Number(totales.totalTrasladosBaseIVA16 || 0);
         const monto   = Number(totales.montoTotalPagos || 0);
         const monto16 = base16 + iva16 + Number(totales.totalTrasladosImpuestoIVA8 || 0);
-        if (monto > monto16 + 0.01) return 'mixto';
+        // Comparar en centavos enteros: con flotantes 275.53 + 0.01 da
+        // 275.5399… y un Pago 100% 16% cuyo IVA el SAT redondeó 1 centavo
+        // abajo (base 237.53 + IVA 38.00 vs pagado 275.54, MINI ABASTOS
+        // B0-260701190, 2026-09-30) caía como 'mixto' y perdía el split por
+        // factura y el depósito real de Bancos.
+        if (Math.round(monto * 100) - Math.round(monto16 * 100) > 1 && !_pagoTodoGravadoConRedondeo(cfdi)) return 'mixto';
         return '16';
       }
       const montoTotal = Number(totales.montoTotalPagos || 0);
@@ -726,10 +750,29 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     ];
   }
 
+  // NC (tipo E) que ajusta una venta a CRÉDITO (PPD): la venta nunca entró a
+  // Caja/Bancos, así que la devolución reduce la CxC (Clientes 16%/0%), no
+  // sale de Caja/Bancos por identificar — la regla se elige por la formaPago
+  // de la propia NC (ej. 03 → Bancos) y esa cuenta no aplica aquí. Mismo
+  // criterio que las reglas "fP99"/"fP15" (fix-nc-ppd-clientes-abono.js), que
+  // solo cubrían NCs con formaPago 99/15. Caso real CONSTRUCASA 30-sep-2026:
+  // CONSTRUCCIONES Y SERVICIOS LUKMAN C0-260901807/808/811 abonaban
+  // $86,903.87 a 1102011005. Se excluyen las NC de cancelación-refacturación
+  // (Serie=CANCELACION), que tienen su propio tratamiento con Caja puente.
+  const _esNcCancelacion = (cfdi.documentosRelacionados || [])
+    .some(d => (d.Serie ?? '').toUpperCase() === 'CANCELACION');
+  const esNcVentaCredito = tipo === 'E' && context.metodoPagoRelacionado === 'PPD'
+    && !_esNcCancelacion && CODIGOS_CUENTAS_CAJA_O_BANCO.has(rule.cuentaAbono);
+  const cuentaAbonoPrincipal = !esNcVentaCredito
+    ? rule.cuentaAbono
+    : (rule.tasaIva === '0' || (!rule.tasaIva && !(iva > 0)))
+      ? CODIGO_CUENTA_CLIENTES_0
+      : CODIGO_CUENTA_CLIENTES_16;
+
   // Resolver cuentaId a partir del código
   const codigos = [
     rule.cuentaCargo,
-    rule.cuentaAbono,
+    cuentaAbonoPrincipal,
     rule.cuentaAbono2,
     rule.cuentaIva,
     rule.cuentaIvaPPD,
@@ -1717,7 +1760,7 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
     });
   } else {
     movs.push({
-      cuentaId:    cuentaMap[rule.cuentaAbono] ?? null,
+      cuentaId:    cuentaMap[cuentaAbonoPrincipal] ?? null,
       concepto,
       centroCosto,
       ventaFecha,

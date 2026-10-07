@@ -38,6 +38,7 @@ const CFDI = require('../../../visor/models/CFDI');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const centrosSvc = require('../centros-costo/centros-costo.service');
 const mappingSvc = require('./cfdi-mapping.service');
+const fichaEfectivoSvc = require('./cobranza-ficha-efectivo.service');
 const { _getRulesActive } = require('./balanza-preliminar.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
 const {
@@ -160,10 +161,46 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 
   if (paresVistos.size === 0) return { doctosPorUuid };
 
-  const pares = [...paresVistos.values()];
+  // Ticket(s) de cada factura liquidada (2026-09-29, pedido del usuario,
+  // ejemplo real "9 (4).xls"): la columna H de Cobranza lleva
+  // "cliente / ticket" (ej. ERIK WILVER TORRES HERNANDEZ / A0-260604681), no
+  // la factura. Kore relaciona los tickets en `documentosRelacionados` de SU
+  // copia (source ERP) — serie de almacén (A0, B0, G1…), nunca las marcas de
+  // ajuste (BON, DEV, CANCELACION…).
+  const uuidsFactura = [...new Set([...doctosPorUuid.values()].flat().map(d => d.idDocumento).filter(Boolean))];
+  if (uuidsFactura.length) {
+    const facturasErp = await CFDI.find({ uuid: { $in: uuidsFactura.flatMap(u => [u, u.toLowerCase()]) }, source: 'ERP' })
+      .select('uuid documentosRelacionados').lean();
+    const ticketsPorFactura = new Map();
+    for (const f of facturasErp) {
+      const tickets = (f.documentosRelacionados ?? [])
+        .filter(r => /^[A-Z]\d$/.test(String(r.Serie ?? '').toUpperCase()) && r.Folio)
+        .map(r => `${String(r.Serie).toUpperCase()}-${r.Folio}`);
+      if (tickets.length) ticketsPorFactura.set(String(f.uuid).toUpperCase(), [...new Set(tickets)]);
+    }
+    for (const d of [...doctosPorUuid.values()].flat()) {
+      const t = d.idDocumento ? ticketsPorFactura.get(d.idDocumento) : null;
+      if (t) d.tickets = t;
+    }
+  }
+
+  // Kore responde `/saldos-favor` y `/desgloses-cobro/almacen` por VENTA
+  // (ticket), no por factura (2026-09-29, confirmado con datos reales, póliza
+  // Cobranza CEDIS 10-jul vs ejemplo del usuario "9 (4).xls"): consultar con
+  // el serie-folio de la FACTURA traía el TICKET que casualmente tiene ese
+  // mismo número — otra venta (ej. factura I0-260700127 → ticket
+  // I0-260700127 de otra venta, con $2,714.05 de SF del 16-jul). Se consulta
+  // por los tickets de la factura (`d.tickets`); sin ticket conocido, por la
+  // factura como antes.
+  const ventasDe = d => (d.tickets?.length
+    ? d.tickets.map(t => { const i = t.indexOf('-'); return { serie: t.slice(0, i), folio: t.slice(i + 1) }; })
+    : [{ serie: d.serie, folio: d.folio }]);
+  const paresVenta = new Map();
+  for (const d of [...doctosPorUuid.values()].flat()) for (const v of ventasDe(d)) paresVenta.set(`${v.serie}|${v.folio}`, v);
+  const pares = [...paresVenta.values()];
   const LOTE  = 150;
-  const saldoFavorPorFactura      = new Map(); // `${serie}|${folio}` → monto usado
-  const cobrosCrudosPorFactura    = new Map(); // `${serie}|${folio}` → cobro[] crudos (con su `fecha`)
+  const saldosFavorUsadosPorVenta = new Map(); // `${serie}|${folio}` (venta) → usos[] crudos (con su `fecha`)
+  const cobrosCrudosPorFactura    = new Map(); // `${serie}|${folio}` (venta) → cobro[] crudos (con su `fecha`)
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
     const [resultadoSF, resultadoAlmacen] = await Promise.all([
@@ -173,8 +210,8 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
     for (const cuenta of resultadoSF) {
       const usados = cuenta.saldosFavorUsados ?? [];
       if (!usados.length) continue;
-      const monto = usados.reduce((s, u) => s + (Math.abs(Number(u.montoUsado)) || 0), 0);
-      if (monto > 0) saldoFavorPorFactura.set(`${cuenta.serieVenta}|${cuenta.folioVenta}`, monto);
+      const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+      saldosFavorUsadosPorVenta.set(key, [...(saldosFavorUsadosPorVenta.get(key) ?? []), ...usados]);
     }
     for (const cuenta of resultadoAlmacen) {
       const key = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
@@ -197,23 +234,102 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
           ? Math.abs(Number(cobro.monto) || 0)
           : (Number(fp.monto) || 0);
-        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null });
+        // Caja donde se cobró + identidad del pago completo (un pago en caja
+        // puede liquidar varios tickets: Kore repite el total del pago en
+        // `fp.monto` de cada uno) — ver cobranza-ficha-efectivo.service.js.
+        const grupoPago = `${cobro.claveCentro ?? ''}|${String(cobro.fecha ?? '').slice(0, 16)}|${(Number(fp.monto) || 0).toFixed(2)}`;
+        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null, claveCentro: cobro.claveCentro ?? null, grupoPago });
       }
     }
     return formasPago;
   };
 
+  // Un ticket liquidado por 2+ complementos el mismo día (2026-10-01, GERARDO
+  // SEUL VEGA ORTEGA, Cobranza 29-sep: factura A0-260917036 pagada con
+  // A0-260917747 $478.83 y A0-260917748 $186.44): cada complemento tomaba
+  // TODOS los cobros del día del ticket y el Cargo a banco salía doble
+  // ($1,330.54 en vez de $665.27). Ahora cada complemento toma solo los
+  // cobros que suman lo que él paga, y un cobro ya tomado no lo repite otro.
+  const cobrosYaAsignados = new Set();
+  const montoCobro = (cobro, fechaPago) => extraerFormasPagoDelDia([cobro], fechaPago).reduce((s, fp) => s + fp.monto, 0);
+  const elegirCobrosDelPago = (cobros, objetivo, fechaPago) => {
+    const conMonto = cobros.map(c => ({ c, monto: montoCobro(c, fechaPago) })).filter(x => x.monto > 0);
+    const total = conMonto.reduce((s, x) => s + x.monto, 0);
+    // Solo los cobros del día (monto > 0) cuentan como tomados por este Pago.
+    if (Math.abs(total - objetivo) < 0.02) return { cobros: conMonto.map(x => x.c), exacto: true };
+    if (conMonto.length <= 1 || conMonto.length > 10) return { cobros, exacto: false };
+    for (let mask = 1; mask < (1 << conMonto.length); mask++) {
+      let suma = 0;
+      for (let i = 0; i < conMonto.length; i++) if (mask & (1 << i)) suma += conMonto[i].monto;
+      if (Math.abs(suma - objetivo) < 0.02) return { cobros: conMonto.filter((_, i) => mask & (1 << i)).map(x => x.c), exacto: true };
+    }
+    return { cobros, exacto: false }; // ninguna combinación explica el monto: comportamiento previo
+  };
+
   for (const [uuid, doctos] of doctosPorUuid.entries()) {
     const fechaPago = fechaPagoPorUuid.get(uuid);
+    const diaPago = _diaMx(fechaPago);
     for (const d of doctos) {
-      const sf = saldoFavorPorFactura.get(`${d.serie}|${d.folio}`);
-      if (sf > 0) d.montoSF = sf;
-      const cobrosCrudos = cobrosCrudosPorFactura.get(`${d.serie}|${d.folio}`) ?? [];
-      d.desglosePagoReal = extraerFormasPagoDelDia(cobrosCrudos, fechaPago);
+      const ventas = ventasDe(d).map(v => `${v.serie}|${v.folio}`);
+      // Solo el SF usado el MISMO día del Pago (mismo filtro que el desglose
+      // de abajo) — antes se sumaba el de cualquier fecha. Agrupado por la
+      // venta que GENERÓ el saldo (`serieVenta/folioVenta` del uso = origen):
+      // el concepto del SF lleva esa venta, mismo criterio que Ingreso
+      // (2026-09-24) y que el ejemplo del usuario.
+      const usos = ventas.flatMap(k => saldosFavorUsadosPorVenta.get(k) ?? [])
+        .filter(u => !diaPago || _diferenciaDiasMx(u.fecha, diaPago) === 0);
+      const porOrigen = new Map();
+      for (const u of usos) {
+        const monto = Math.abs(Number(u.montoUsado)) || 0;
+        if (monto <= 0) continue;
+        const origen = [u.serieVenta, u.folioVenta].filter(Boolean).join('-')
+          || [u.serieOrigen, u.folioOrigen].filter(Boolean).join('-');
+        porOrigen.set(origen, (porOrigen.get(origen) ?? 0) + monto);
+      }
+      const sf = [...porOrigen.values()].reduce((a, b) => a + b, 0);
+      if (sf > 0) {
+        d.montoSF = Math.round(sf * 100) / 100;
+        d.sfOrigenes = [...porOrigen.entries()].map(([origen, monto]) => ({ origen, monto: Math.round(monto * 100) / 100 }));
+      }
+      const cobrosDisponibles = ventas.flatMap(k => cobrosCrudosPorFactura.get(k) ?? []).filter(c => !cobrosYaAsignados.has(c));
+      const objetivo = Math.round((d.monto - (d.montoSF || 0)) * 100) / 100;
+      const { cobros: cobrosDelPago, exacto } = elegirCobrosDelPago(cobrosDisponibles, objetivo, fechaPago);
+      if (exacto) cobrosDelPago.forEach(c => cobrosYaAsignados.add(c));
+      d.desglosePagoReal = extraerFormasPagoDelDia(cobrosDelPago, fechaPago);
     }
   }
 
   return { doctosPorUuid };
+}
+
+// Cobro hecho en la caja de una sucursal que no es CEDIS (2026-10-05, pólizas
+// manuales del usuario 19-29/sep): el Cargo va con el centro de la sucursal
+// donde se cobró, según cómo se mueve ese dinero:
+//   - efectivo en Puerto (O0): se deposita → 1102011001 "EFECTIVO-COS" (centro
+//     120; antes "DEP. PTO", el usuario pidió EFECTIVO-COS el 2026-10-06)
+//   - efectivo en otra caja (C0, F0…): se queda ahí → 1101010003 "EFECTIVO-COS"
+//   - tarjeta: 1101010001 "TARJETA DE CREDITO"/"TARJETA DE DEBITO"
+const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'EFECTIVO-COS' };
+const CODIGO_CUENTA_BANCO_DEPOSITO_CAJA = '1102011001';
+const CODIGO_CUENTA_CAJA_GENERAL        = '1101010001';
+const ETIQUETA_EFECTIVO_OTRA_CAJA       = 'EFECTIVO-COS';
+const ETIQUETA_TARJETA = { '04': 'TARJETA DE CREDITO', '28': 'TARJETA DE DEBITO' };
+function _cargoCobroOtraCaja(fp, cuentaMap, ccBySerieMap) {
+  const caja = fp.claveCentro;
+  if (!caja || caja === fichaEfectivoSvc.CAJA_COBRANZA_CEDIS) return null;
+  const ccCaja = ccBySerieMap?.[caja] ?? null;
+  const centro = ccCaja ? { _centroCostoFijo: ccCaja } : {};
+  if (fp.claveSat === '01') {
+    const etiquetaDeposito = ETIQUETA_DEPOSITO_POR_CAJA[caja];
+    if (etiquetaDeposito && cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA]) {
+      return { cuentaId: cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA], serie: etiquetaDeposito, ...centro };
+    }
+    return { serie: ETIQUETA_EFECTIVO_OTRA_CAJA, ...centro };
+  }
+  if (ETIQUETA_TARJETA[fp.claveSat] && cuentaMap[CODIGO_CUENTA_CAJA_GENERAL]) {
+    return { cuentaId: cuentaMap[CODIGO_CUENTA_CAJA_GENERAL], serie: ETIQUETA_TARJETA[fp.claveSat], ...centro };
+  }
+  return null;
 }
 
 /**
@@ -331,12 +447,15 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     context.doctosPago.forEach((d, idx) => {
       const esUltimo = idx === context.doctosPago.length - 1;
       const share = totalDoctos > 0 ? d.monto / totalDoctos : 1 / context.doctosPago.length;
-      const conceptoFactura = [nombreCliente, `${d.serie}-${d.folio}`].filter(Boolean).join(' / ');
+      // Columna H = "cliente / ticket(s)" y columna C = la factura (2026-09-29,
+      // ver `_prefetchDoctosPago`); sin ticket conocido, la factura como antes.
+      const serieFolioFactura = `${d.serie}-${d.folio}`;
+      const conceptoFactura = [nombreCliente, ...(d.tickets?.length ? d.tickets : [serieFolioFactura])].filter(Boolean).join(' / ').slice(0, 500);
       // `facturaUuid` (uuid real de la factura, ver `_prefetchDoctosPago`) viaja
       // en cada línea de esta factura para que el export (poliza.service.js,
       // `anotarCargosPorFacturaSinAgrupar`) pueda cruzar el depósito bancario
       // real por el uuid correcto en vez del uuid del Pago (`cfdiUuid`).
-      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieCfdi, cfdiUuid: cfdi.uuid, facturaUuid: d.idDocumento ?? null, rfcTercero };
+      const baseFactura = { concepto: conceptoFactura, centroCosto, ventaFecha, serie: serieFolioFactura.slice(0, 25), cfdiUuid: cfdi.uuid, facturaUuid: d.idDocumento ?? null, rfcTercero };
 
       // Cobro de otra sucursal (2026-09-01): la factura que este Pago liquida
       // puede haber sido emitida por una sucursal DISTINTA a la que procesó
@@ -364,10 +483,27 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
           : 0;
         let restanteLinea = montoLineaCargo;
         if (montoSFLinea > 0) {
-          const subtotalSF = Math.round((montoSFLinea / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
-          const ivaSF      = Math.round((montoSFLinea - subtotalSF) * 100) / 100;
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSF, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF,      haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
+          // Un par de renglones POR venta que generó el saldo: columna C "SF"
+          // y columna H "cliente / venta origen" (2026-09-29, ejemplo del
+          // usuario: "2103090001 | SF | 90.29 | JONATAN JUAREZ MENDOZA /
+          // I0-260700186"). Sin origen conocido, un solo par como antes.
+          const origenes = d.sfOrigenes?.length ? d.sfOrigenes : [{ origen: null, monto: montoSFLinea }];
+          const totalOrigenes = origenes.reduce((a, o) => a + o.monto, 0) || montoSFLinea;
+          let acumuladoSF = 0;
+          origenes.forEach((o, iO) => {
+            const montoO = iO === origenes.length - 1
+              ? parseFloat((montoSFLinea - acumuladoSF).toFixed(2))
+              : Math.round(montoSFLinea * (o.monto / totalOrigenes) * 100) / 100;
+            acumuladoSF += montoO;
+            if (montoO <= 0) return;
+            const subtotalSF = Math.round((montoO / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+            const ivaSF      = Math.round((montoO - subtotalSF) * 100) / 100;
+            const baseSF = o.origen
+              ? { ...baseFactura, serie: 'SF', concepto: [nombreCliente, o.origen].filter(Boolean).join(' / ') }
+              : baseFactura;
+            movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_SALDO_FAVOR],    debe: subtotalSF, haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
+            movs.push({ ...baseSF, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: ivaSF,      haber: 0, tipoOrigen: TIPO_ORIGEN_CARGO_ESPECIAL, reglaNombre: 'SF' });
+          });
           restanteLinea = parseFloat((restanteLinea - montoSFLinea).toFixed(2));
         }
         // Cobro de un mes anterior al del complemento — ver
@@ -401,11 +537,14 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
               const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
               if (montoLinea <= 0) return;
               const esEfectivo = fp.claveSat === '01';
+              const otraCaja = _cargoCobroOtraCaja(fp, cuentaMap, context.ccBySerieMap);
               movs.push({
                 ...baseFactura,
                 cuentaId: esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : (cuentaMap[rule.cuentaCargo] ?? null),
                 debe: montoLinea, haber: 0, _esCargoPrincipal: true,
                 _formaPagoReal: fp.claveSat ?? null,
+                _claveCentroCobro: fp.claveCentro ?? null, _grupoPago: fp.grupoPago ?? null,
+                ...(otraCaja ?? {}),
               });
             });
           } else {
@@ -465,7 +604,10 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     // Pago porque aquí no hay detalle de factura individual que mostrar.
     const nombreClientePago = cfdi.receptor?.nombre ?? '';
     const conceptoPago = [nombreClientePago, serieCfdi].filter(Boolean).join(' / ') || concepto;
-    const esEfectivoCfdi = (cfdi.formaPago ?? '') === '01';
+    // En el complemento del SAT la forma de pago viene en `pagos[].formaDePagoP`,
+    // no en el encabezado (2026-09-29: Pagos con regla "mixto" en efectivo
+    // caían a Bancos por identificar en vez de Caja).
+    const esEfectivoCfdi = (cfdi.formaPago ?? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? '') === '01';
     const cuentaCargoFallback = (esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS]) ?? cuentaMap[rule.cuentaCargo] ?? null;
     movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
     movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
@@ -613,7 +755,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       .concat([
         CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR,
         CODIGO_CUENTA_PUENTE_SUCURSALES, CODIGO_CUENTA_IVA_POR_TRASLADAR, CODIGO_CUENTA_IVA_TRASLADADO, CODIGO_CUENTA_CLIENTES,
-        CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS,
+        CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS, CODIGO_CUENTA_BANCO_DEPOSITO_CAJA, CODIGO_CUENTA_CAJA_GENERAL,
       ]),
   )];
   const cuentasRows = codigosNecesarios.length
@@ -661,10 +803,20 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       todosLosMovimientos.push({
         ...m,
         cuentaFaltante: m.cuentaId == null,
-        centroCosto:    cc?.clave ?? m.centroCosto ?? null,
-        centroCostoId:  cc?.id    ?? null,
+        // Cobro en la caja de otra sucursal: el centro de esa caja (ver `_cargoCobroOtraCaja`).
+        centroCosto:    m._centroCostoFijo?.clave ?? cc?.clave ?? m.centroCosto ?? null,
+        centroCostoId:  m._centroCostoFijo?.id    ?? cc?.id    ?? null,
       });
     }
+  }
+
+  // 7b. Efectivo cobrado en la caja de CEDIS contra la ficha "dd/mm COBRANZA"
+  // (cargo al banco + PXA) — solo por día y cuando la póliza incluye CEDIS.
+  if (fechaInicio && fechaInicio === fechaFin && (!centroCostoId || serieDelCentro === fichaEfectivoSvc.CAJA_COBRANZA_CEDIS)) {
+    advertencias.push(...await fichaEfectivoSvc.aplicarFichaEfectivoCobranza({
+      movs: todosLosMovimientos, rfc, dia: fechaInicio, cuentaMap,
+      centroCostoCedis: ccBySerieMap[fichaEfectivoSvc.CAJA_COBRANZA_CEDIS]?.clave ?? null,
+    }));
   }
 
   // 8. Cobros de otra sucursal PENDIENTES DE CONSUMIR — facturas de ESTA

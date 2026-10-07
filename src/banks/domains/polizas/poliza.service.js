@@ -232,7 +232,13 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
         ? folioFiscalUpper
         : (link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
       if (!uuidResuelto) continue;
-      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, _distanciaDias: distanciaDias };
+      // Kore registró este cobro como "DEPOSITO EN EFECTIVO" en este mismo
+      // depósito: efectivo que el cliente depositó directo al banco (ver
+      // `anotarCargosPorFacturaSinAgrupar`). Solo por folioFiscal, nunca por
+      // serie-folio (el folio del Pago puede coincidir con otra factura).
+      const esDepositoEfectivoKore = uuidsSet.has(folioFiscalUpper) && (link.desglosePorFormaPago ?? [])
+        .some(d => /DEPOSITO.*EFECTIVO/.test(String(d.formaPagoDescripcion ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()));
+      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, esDepositoEfectivoKore, _distanciaDias: distanciaDias };
       const actual = mapa.get(uuidResuelto);
       if (!actual) {
         mapa.set(uuidResuelto, candidato);
@@ -485,6 +491,19 @@ function _buscarCombinacionQueSuma(indices, disponibles, monto) {
 
 const _esTransaccionAmex = t => (t.cardTypeName ?? '').trim().toUpperCase() === 'AMEX';
 
+// `commission` de NetPay YA incluye el IVA (ej. $133.26 = $114.88 + $18.38 en
+// una venta de $7,225.26). Se desglosa por transacción igual que el reporte
+// "Detalle de Depósitos" de NetPay: comisión = commission/1.16 truncada a 2
+// decimales, IVA = 16% de esa comisión redondeado (2026-09-30, Construcasa
+// 29-sep: cuadra exacto $1,691.57 + $270.71 = neto $99,184.84; antes se le
+// sumaba OTRO 16% y el neto salía $314.15 abajo).
+function _desglosarComisionNetpay(commission) {
+  const total = Number(commission) || 0;
+  const base = Math.floor(total / 1.16 * 100 + 1e-6) / 100;
+  const iva  = Math.round(base * 0.16 * 100 + 1e-9) / 100;
+  return { base, iva };
+}
+
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
@@ -652,7 +671,8 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // (`disponibles`/`filasPorTicket` compartidos: una línea ligada por NetPay
     // ya no la toma AMEX). `esAmex`: solo junta el monto, sin comisión.
     const ligar = (transacciones, esAmex) => {
-      let gross = 0, comision = 0;
+      let gross = 0, comision = 0, ivaComision = 0;
+      const sumarComision = (c) => { const { base, iva } = _desglosarComisionNetpay(c); comision += base; ivaComision += iva; };
       const detalle = [];
       const pendientesPorMonto = [];
       for (const t of transacciones) {
@@ -674,12 +694,12 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           // Segunda pasada de un ticket ya ligado: su monto ya está en la línea.
           // AMEX no lleva comisión, así que no hay nada que sumar.
           if (esAmex) continue;
-          comision += comisionTransaccion;
+          sumarComision(comisionTransaccion);
           detalle.push({ fila: { concepto: ticketsEnPoliza.join(', '), serie: ticketsEnPoliza[0] }, terminalID: t.terminalID, monto: 0,
             comision: comisionTransaccion, nota: `pasada adicional (${t.folio}, $${monto.toFixed(2)}) de ticket ya ligado` });
           continue;
         }
-        comision += comisionTransaccion;
+        sumarComision(comisionTransaccion);
         const suma = filasTx.reduce((acc, f) => acc + Number(f.debe), 0);
         gross += suma;
         const diferencia = Math.round((suma - monto) * 100) / 100;
@@ -702,7 +722,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         const fila = disponibles.splice(idx, 1)[0];
         matchedIds.add(fila.id);
         gross += Number(fila.debe);
-        comision += comisionTransaccion;
+        sumarComision(comisionTransaccion);
         detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
       }
       for (const t of sinMatchExacto) {
@@ -733,7 +753,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         const filasCombinadas = [...combinacion].sort((a, b) => b - a).map(i => disponibles.splice(i, 1)[0]);
         const sumaCombinada = filasCombinadas.reduce((s, f) => s + Number(f.debe), 0);
         gross += sumaCombinada;
-        comision += comisionTransaccion;
+        sumarComision(comisionTransaccion);
         for (const fila of filasCombinadas) {
           matchedIds.add(fila.id);
           // Comisión repartida proporcional al monto de cada ticket, solo para
@@ -744,7 +764,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila });
         }
       }
-      return { gross, comision, detalle };
+      return { gross, comision, ivaComision, detalle };
     };
     const netpay = ligar(transaccionesValidas, false);
     const amex   = ligar(transaccionesAmex, true);
@@ -752,6 +772,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
       porCentro.set(centroCostoObj.id, {
         gross: Math.round(netpay.gross * 100) / 100,
         comision: Math.round(netpay.comision * 100) / 100,
+        ivaComision: Math.round(netpay.ivaComision * 100) / 100,
         centroCostoObj,
         detalle: netpay.detalle,
         grossAmex: Math.round(amex.gross * 100) / 100,
@@ -765,8 +786,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
 // Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
 // un día/centro (ver `construirNetpayInfo`) — confirmada con el usuario
 // 2026-09-14. `gross`/`comision` ya vienen redondeados a centavos.
-function _lineasNetpay({ gross, comision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
-  const ivaComision   = Math.round(comision * 0.16 * 100) / 100;
+function _lineasNetpay({ gross, comision, ivaComision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
   const totalFactura  = Math.round((comision + ivaComision) * 100) / 100;
   const neto          = Math.round((gross - totalFactura) * 100) / 100;
   const centroCosto   = centroCostoObj.clave;
@@ -1777,9 +1797,23 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
     // Pago) — ver comentario en el caller.
     const bancario = verdadBancaria?.get((m.facturaUuid || m.cfdiUuid || '').toUpperCase());
-    const esTransferenciaVerificada = bancario?.categoriaConocida
+    // Cheque con depósito real ligado en Bancos ("Depósito S.B.C.", "DEP
+    // CHEQUE BNM") va igual que una transferencia: banco real, folio de Numo
+    // en columna C, subcódigo 20 (2026-10-06, pólizas manuales: 29-sep
+    // "49685" ALEJANDRO HIDALGO, 10-jul "034324" FERRETERIAS MEDINA). Sin
+    // depósito ligado se queda como estaba.
+    const esChequeConDeposito = m.formaPago === FORMA_PAGO_CHEQUE && !!bancario;
+    // Efectivo que el cliente depositó directo al banco ("Depósito de
+    // efectivo"/"DEPOSITO EN EFECTIVO" ligado en Bancos a la factura, nunca
+    // una ficha de caja): mismo trato que el cheque (2026-10-06, pólizas
+    // manuales: 25-sep "46217" TERESA MINERVA, 29-sep "49263" CAROLINA DIAZ).
+    // Los cobros en otra caja (EFECTIVO-COS/DEP. PTO) y PXA no entran.
+    const esEfectivoDepositadoPorCliente = m.formaPago === '01' && !!bancario?.esDepositoEfectivoKore
+      && /^1101/.test(m.cuenta?.codigo || '')
+      && !(m.serie === 'EFECTIVO-COS' || m.serie === 'PXA' || String(m.serie ?? '').startsWith('DEP. '));
+    const esTransferenciaVerificada = esChequeConDeposito || esEfectivoDepositadoPorCliente || (bancario?.categoriaConocida
       ? bancario.esTransferencia
-      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA);
+      : (m.formaPago === FORMA_PAGO_TRANSFERENCIA));
     // El concepto por-factura que arma `cfdiToMovimientos` ("cliente /
     // serie-folio") ya viene completo — se deja tal cual. Si no lo tiene
     // (caso viejo/`tasaIva==='mixto'` sin split), se enriquece aquí con el
@@ -1809,10 +1843,14 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // va al bloque de cobros; el subtotal (Depósitos No Identificados) lleva en
     // columna C la autorización real del depósito si Bancos la tiene, y el
     // IVA siempre "NI" (2026-09-29, ejemplo real del usuario "9 (4).xls").
+    // Formato "AUT. <numeroAutorizacion>" del banco, no el folio de Numo
+    // (2026-09-30, ERIK WILVER: ejemplo "AUT. 3547888", Numo ponía "032147");
+    // sin autorización cae al folio de Numo.
     if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
       const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
+      const referenciaNI = bancario?.numeroAutorizacion ? `AUT. ${bancario.numeroAutorizacion}` : bancario?.referencia;
       return {
-        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && bancario?.referencia) || REGLA_COBRANZA_NO_IDENTIFICADO,
+        cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && referenciaNI) || REGLA_COBRANZA_NO_IDENTIFICADO,
         concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
@@ -1832,6 +1870,16 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       };
     }
     const referenciaBancoReal = esTransferenciaVerificada ? (bancario?.referencia ?? null) : null;
+    // Columna C en Cobranza: el folio de Numo del depósito (2026-10-05,
+    // confirmado con el usuario con sus pólizas de 19 a 29-sep: "47487",
+    // "49703"…). El 30-sep se había cambiado a "AUT.<numeroAutorizacion>" por
+    // el ejemplo "9 (4).xls" del 10-jul; el "AUT." se queda solo en NI y en el
+    // EFECTIVO de una ficha Banamex.
+    const serieBancoReal = referenciaBancoReal;
+    // Efectivo cobrado en la caja de Puerto y depositado a BBVA ("EFECTIVO-COS"
+    // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
+    // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
+    const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
@@ -1848,7 +1896,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       // evitando que el bucket de Efectivo (más abajo) las agrupara.
       cuenta:         esTransferenciaVerificada ? (bancario?.cuentaBanco ?? m.cuenta) : m.cuenta,
       cuentaId:       m.cuentaId,
-      serie:          referenciaBancoReal ?? m.serie,
+      serie:          serieBancoReal ?? m.serie,
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
       centroCosto:    m.centroCosto,
       centroCostoObj: m.centroCostoObj,
@@ -1859,7 +1907,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       formaPago:      m.formaPago,
       reglaNombre:    m.reglaNombre,
       tipoOrigen:     m.tipoOrigen,
-      _subcodigo:     esTransferenciaVerificada ? subcodigoTransferencia : 0,
+      _subcodigo:     (esTransferenciaVerificada || esEfectivoCosDepositado) ? subcodigoTransferencia : 0,
       _referenciaBancoReal: referenciaBancoReal,
     };
   });
@@ -1938,7 +1986,11 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   const bucketsEfectivo = new Map();
   const consolidado = [];
   for (const m of conReferenciaFusionada) {
-    const esEfectivoRealSinReferencia = !m._referenciaBancoReal && m.formaPago === '01';
+    // Los cobros en la caja de otra sucursal ("DEP. PTO", "EFECTIVO-COS", ver
+    // cobranza-poliza-generator.service.js) van un renglón por factura, como
+    // en las pólizas manuales — no se juntan en el bucket.
+    const esEfectivoRealSinReferencia = !m._referenciaBancoReal && m.formaPago === '01'
+      && !(m.serie === 'EFECTIVO-COS' || String(m.serie ?? '').startsWith('DEP. '));
     if (!esEfectivoRealSinReferencia) {
       consolidado.push(m);
       continue;
@@ -3780,8 +3832,16 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // CEDIS es la única sucursal donde, además de Contado/Crédito, se piden
   // Bonificaciones y Descuentos/Devoluciones/Cancelaciones como pólizas propias
   // (ver rama `esCedis` más abajo) — el resto de sucursales sigue igual.
-  const esCedis = movimientos.length > 0 &&
-    movimientos.every(m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS');
+  // Basta con que la MAYORÍA de renglones sea de CEDIS (2026-10-01, póliza
+  // 1058 CEDIS 2-sep): un solo renglón con centro de otra sucursal
+  // (C0-260900073 "factura cancelada, cobro real", centro CONSTRUCASA) hacía
+  // que los 11,710 renglones salieran en un solo archivo, sin separar
+  // Bonificaciones ni Descuentos y Devoluciones. Solo Ingreso: Cobranza y el
+  // resto conservan la regla de "todos los renglones".
+  const esMovCedis = m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS';
+  const esCedis = movimientos.length > 0 && (poliza.tipo === 'I'
+    ? movimientos.filter(esMovCedis).length * 2 > movimientos.length
+    : movimientos.every(esMovCedis));
 
   const sinCuenta = movimientos.filter(m => m.cuentaFaltante || m.cuentaId == null);
   if (sinCuenta.length > 0) {
@@ -4482,13 +4542,13 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           cfdiSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
-          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
+          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión + IVA de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
         });
       }
       // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto
       // real descuenta la comisión Y su IVA, no solo la comisión) para poder
       // cuadrar rápido contra el asiento contable de la póliza.
-      const ivaComisionCentro  = Math.round(infoCentro.comision * 0.16 * 100) / 100;
+      const ivaComisionCentro  = infoCentro.ivaComision;
       const totalFacturaCentro = Math.round((infoCentro.comision + ivaComisionCentro) * 100) / 100;
       const netoCentro         = Math.round((infoCentro.gross - totalFacturaCentro) * 100) / 100;
       desgloseConsolidado.push({

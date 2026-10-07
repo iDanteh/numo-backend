@@ -1370,8 +1370,39 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // la suma de todos, no de uno solo), así que se deja `fp.monto` tal
         // cual para ese caso.
         const cobrosFormaPago = cobro.formasPago ?? [];
+        // Con 2+ formasPago el mismo bug también repite en cada ticket el
+        // TOTAL de cada forma (2026-09-29, pedido del usuario "checa para que
+        // esto no pase"): si la suma de las formas excede `|cobro.monto|` (el
+        // monto real de ESTE ticket), cada forma se escala proporcionalmente
+        // (forma × monto del ticket / suma de formas). Sumado sobre todos los
+        // tickets del pago, cada forma vuelve a dar exacto su total real.
+        // Sin exceso (caso normal) el factor es 1 y nada cambia; con un solo
+        // formaPago se sigue usando `|cobro.monto|` como antes.
+        // EXCEPTO APA: ahí `cobro.monto` es solo la porción de saldo a favor
+        // (ej. I0-260900408: TARJETA $80.07 + SALDO A FAVOR $698.09, monto
+        // $698.09) — la suma de formas siempre lo excede sin que nada esté
+        // repetido; escalar rebajaría el dinero real (medido sept: los 676
+        // cobros mixtos con exceso son APA, ninguno de otro origen).
+        const montoRealCobro = cobro.monto != null ? Math.abs(Number(cobro.monto) || 0) : null;
+        const sumaFormasCobro = cobrosFormaPago.reduce((s, f) => s + (Number(f.monto) || 0), 0);
+        const factorRepetido = (origen !== 'APA' && cobrosFormaPago.length > 1 && montoRealCobro != null && sumaFormasCobro > montoRealCobro + 0.05)
+          ? montoRealCobro / sumaFormasCobro
+          : 1;
+        const montoDeForma = (f) => ((cobrosFormaPago.length === 1 && montoRealCobro != null)
+          ? montoRealCobro
+          : factorRepetido === 1
+            ? (Number(f.monto) || 0)
+            : Math.round((Number(f.monto) || 0) * factorRepetido * 100) / 100);
         for (const fp of cobrosFormaPago) {
-          if (/puntos/i.test(fp.nombre ?? '')) { montoPuntos += Number(fp.monto) || 0; continue; }
+          // Mismo bug del ERP descrito arriba (total del pago repetido en cada
+          // ticket): con un solo formaPago, el monto real de ESTE ticket es
+          // `|cobro.monto|` (2026-09-29, caso real Tehuantepec 28-sep: un ABO
+          // de $152.14 en Puntos para H0-260902853 $94.15 + H0-260902852
+          // $57.99 se contaba 2 veces → Puntos $869.15 en vez de $717.01).
+          if (/puntos/i.test(fp.nombre ?? '')) {
+            montoPuntos += montoDeForma(fp);
+            continue;
+          }
           // "Saldo a favor" en el texto de la forma de pago se ignora aquí —
           // la fuente autoritativa para SF usado es `/saldos-favor`
           // (`saldoFavorUsado`, ver abajo), no este texto — mezclarlo en
@@ -1388,12 +1419,10 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
           if (/anticipo/i.test(fp.nombre ?? '')) {
             // APA: la porción ANTICIPO ya se captura vía OPA — no acumular
             // montoAnticipo aquí para evitar doble conteo.
-            if (origen !== 'APA') montoAnticipo += Number(fp.monto) || 0;
+            if (origen !== 'APA') montoAnticipo += montoDeForma(fp);
             continue;
           }
-          const monto = (cobrosFormaPago.length === 1 && cobro.monto != null)
-            ? Math.abs(Number(cobro.monto) || 0)
-            : (Number(fp.monto) || 0);
+          const monto = montoDeForma(fp);
           // `serieVentaTicket`/`folioVentaTicket`: ticket real de cajas al que
           // pertenece ESTA porción del cobro (no la Factura Global que lo
           // agrupa) — confirmado con el usuario 2026-08-18 que cajas NO manda
@@ -4091,7 +4120,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       // matcheó Efectivo/Caja, pero el desglose real trae una porción de
       // Tarjeta, o de Saldo a Favor/Puntos) — sin esto, `cuentaMap[...]`
       // saldría undefined y esa porción del split se saltaría en silencio.
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_PUENTE_SUCURSALES]),
+      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_PUENTE_SUCURSALES,
+        // Clientes 16%/0%: abono de NC que ajusta una venta a crédito (ver `esNcVentaCredito` en cfdiToMovimientos).
+        '1103010001', '1103010002']),
   )];
 
   const cuentasRows = codigosNecesarios.length
@@ -6163,7 +6194,9 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       ].filter(Boolean))
       // Caja/Bancos/Saldo a Favor/Club Tuberos SIEMPRE — ver comentario
       // equivalente en generarPropuesta.
-      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_PUENTE_SUCURSALES]),
+      .concat([CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_CLUB_TUBEROS, CODIGO_CUENTA_IVA_SALDO_FAVOR, CODIGO_CUENTA_ANTICIPOS_CLIENTES, CODIGO_CUENTA_IVA_ANTICIPO, CODIGO_CUENTA_PUENTE_SUCURSALES,
+        // Clientes 16%/0%: abono de NC que ajusta una venta a crédito (ver `esNcVentaCredito` en cfdiToMovimientos).
+        '1103010001', '1103010002']),
   )];
 
   const cuentasRows = codigosNecesarios.length

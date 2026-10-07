@@ -90,12 +90,35 @@ const extractEntries = (file) => {
 /**
  * GET /api/cfdis
  */
+// Filtro por RFC (columnas Emisor/Receptor y buscador general): RFC completo
+// (12-13 caracteres) = igual que antes; incompleto = "empieza con", para que
+// encuentre mientras se escribe (2026-10-06, el usuario no encontraba nada con
+// el RFC a medias). Anclado al inicio y sin 'i' para que use el índice.
+const filtroRfc = (rfc) => {
+  const r = String(rfc).trim().toUpperCase();
+  if (r.length >= 12) return r;
+  return { $regex: `^${r.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` };
+};
+
+// Mes de emisión (1-12) del año `anio`: rango de `fecha` según la fuente. El
+// SAT/MANUAL guarda la hora local como si fuera UTC; el ERP guarda UTC real
+// (hora de México = UTC-6), por eso su rango se corre 6 horas.
+const filtroMesEmision = (mes, anio) => {
+  const m = parseInt(mes), y = parseInt(anio) || new Date().getUTCFullYear();
+  if (!(m >= 1 && m <= 12)) return null;
+  const ini = Date.UTC(y, m - 1, 1), fin = Date.UTC(y, m, 1), H6 = 6 * 3600 * 1000;
+  return { $or: [
+    { source: 'ERP',           fecha: { $gte: new Date(ini + H6), $lt: new Date(fin + H6) } },
+    { source: { $ne: 'ERP' }, fecha: { $gte: new Date(ini),      $lt: new Date(fin) } },
+  ] };
+};
+
 const list = asyncHandler(async (req, res) => {
   const {
     page = 1, limit = 20, source, tipoDeComprobante,
     rfcEmisor, rfcReceptor, satStatus, erpStatus, lastComparisonStatus,
     fechaInicio, fechaFin, search, uuids, uuid,
-    ejercicio, periodo,
+    ejercicio, periodo, mesEmision,
     subTotalMin, subTotalMax, totalMin, totalMax,
   } = req.query;
 
@@ -119,8 +142,8 @@ const list = asyncHandler(async (req, res) => {
     const serieFolioMatch = term.match(/^([A-Za-z0-9]{1,10})-(.+)$/);
     const orConds = [
       { uuid:          { $regex: term, $options: 'i' } },
-      { 'emisor.rfc':  termUpper },
-      { 'receptor.rfc': termUpper },
+      { 'emisor.rfc':  filtroRfc(termUpper) },
+      { 'receptor.rfc': filtroRfc(termUpper) },
       { folio:         { $regex: term, $options: 'i' } },   // búsqueda solo por folio
     ];
     if (serieFolioMatch) {
@@ -137,8 +160,8 @@ const list = asyncHandler(async (req, res) => {
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };
   }
   if (tipoDeComprobante)  filter.tipoDeComprobante   = tipoDeComprobante;
-  if (rfcEmisor)          filter['emisor.rfc']        = rfcEmisor.toUpperCase();
-  if (rfcReceptor)        filter['receptor.rfc']      = rfcReceptor.toUpperCase();
+  if (rfcEmisor)          filter['emisor.rfc']        = filtroRfc(rfcEmisor);
+  if (rfcReceptor)        filter['receptor.rfc']      = filtroRfc(rfcReceptor);
   if (satStatus)          filter.satStatus            = satStatus;
   if (erpStatus)          filter.erpStatus            = erpStatus;
   if (fechaInicio || fechaFin) {
@@ -158,6 +181,10 @@ const list = asyncHandler(async (req, res) => {
   const pe = periodo   ? parseInt(periodo)   : null;
   if (ej) filter.ejercicio = ej;
   if (pe) filter.periodo   = pe;
+  // Mes de emisión: independiente del periodo donde quedó guardado (un CFDI
+  // reclasificado se emite en un mes y se guarda en otro).
+  const fMes = mesEmision ? filtroMesEmision(mesEmision, ej) : null;
+  if (fMes) filter.$and = [...(filter.$and || []), fMes];
   if (subTotalMin || subTotalMax) {
     filter.subTotal = {};
     if (subTotalMin) filter.subTotal.$gte = parseFloat(subTotalMin);
@@ -253,6 +280,90 @@ const list = asyncHandler(async (req, res) => {
   totales.sumaTotal    = Math.round(totales.sumaTotal    * 100) / 100;
 
   res.json({ ...paginate(cfdis, total, pg, lm), totales });
+});
+
+/**
+ * GET /api/cfdis/reclasificados
+ * Emitidos timbrados (SAT/MANUAL) cuyo mes "no cuadra" — pestaña
+ * "Reclasificados" de Ver CFDIs (2026-10-06). Motivos:
+ *   - reclasificado:  periodo en Numo ≠ mes de emisión (ej. globales que se
+ *                     movieron al mes de su InformacionGlobal).
+ *   - global_otro_mes: global cuyo `Meses` ≠ periodo en Numo (falta moverla;
+ *                     el SAT la cuenta en el mes de `Meses`).
+ *   - pago_otro_mes:  complemento cuya FechaPago cae en otro mes (el SAT
+ *                     toma el IVA cobrado en el mes del pago).
+ * Query: rfcEmisor (requerido), ejercicio (requerido), periodo (opcional:
+ * cualquier fila donde ese mes sea el de emisión, el de Numo o el del SAT),
+ * mesEmision, motivo, page, limit.
+ */
+const reclasificados = asyncHandler(async (req, res) => {
+  const { rfcEmisor, ejercicio, periodo, mesEmision, motivo, page = 1, limit = 50 } = req.query;
+  const ej = parseInt(ejercicio);
+  if (!rfcEmisor || !ej) return res.status(400).json({ error: 'rfcEmisor y ejercicio son requeridos' });
+  const pg = Math.max(1, parseInt(page) || 1);
+  const lm = Math.min(200, Math.max(1, parseInt(limit) || 50));
+  const per = parseInt(periodo) || null;
+  const mesE = parseInt(mesEmision) || null;
+
+  const ini = new Date(Date.UTC(ej, 0, 1)), fin = new Date(Date.UTC(ej + 1, 0, 1));
+  // El año de la global se deduce: `Meses` mayor que el mes de emisión = año anterior.
+  const mesGlobalExpr = { $toInt: { $arrayElemAt: [{ $ifNull: [{ $getField: { field: 'captures', input: { $regexFind: { input: '$xmlContent', regex: /Meses="(\d{1,2})"/ } } } }, [null]] }, 0] } };
+  const esGlobal = { $and: [{ $eq: ['$receptor.rfc', 'XAXX010101000'] }, { $eq: ['$tipoDeComprobante', 'I'] }] };
+  const fechaPago = { $min: '$complementoPago.pagos.fechaPago' };
+
+  const pipeline = [
+    { $match: {
+      'emisor.rfc': String(rfcEmisor).toUpperCase(),
+      source: { $in: ['SAT', 'MANUAL'] },
+      isActive: { $ne: false },
+      $or: [{ ejercicio: ej }, { fecha: { $gte: ini, $lt: fin } }],
+    } },
+    { $project: {
+      uuid: 1, serie: 1, folio: 1, tipoDeComprobante: 1, total: 1, subTotal: 1, fecha: 1,
+      ejercicio: 1, periodo: 1, satStatus: 1, 'receptor.rfc': 1, 'receptor.nombre': 1,
+      mesEmi: { $month: '$fecha' }, anioEmi: { $year: '$fecha' },
+      mesGlobal: { $cond: [esGlobal, mesGlobalExpr, null] },
+      fechaPago: { $cond: [{ $eq: ['$tipoDeComprobante', 'P'] }, fechaPago, null] },
+    } },
+    { $addFields: {
+      anioGlobal: { $cond: [{ $eq: ['$mesGlobal', null] }, null,
+        { $cond: [{ $gt: ['$mesGlobal', '$mesEmi'] }, { $subtract: ['$anioEmi', 1] }, '$anioEmi'] }] },
+      mesPago: { $cond: [{ $eq: ['$fechaPago', null] }, null, { $month: '$fechaPago' }] },
+      anioPago: { $cond: [{ $eq: ['$fechaPago', null] }, null, { $year: '$fechaPago' }] },
+    } },
+    { $addFields: {
+      motivos: { $concatArrays: [
+        { $cond: [{ $or: [{ $ne: ['$mesEmi', '$periodo'] }, { $ne: ['$anioEmi', '$ejercicio'] }] }, ['reclasificado'], []] },
+        { $cond: [{ $and: [{ $ne: ['$mesGlobal', null] },
+          { $or: [{ $ne: ['$mesGlobal', '$periodo'] }, { $ne: ['$anioGlobal', '$ejercicio'] }] }] }, ['global_otro_mes'], []] },
+        { $cond: [{ $and: [{ $ne: ['$mesPago', null] },
+          { $or: [{ $ne: ['$mesPago', '$periodo'] }, { $ne: ['$anioPago', '$ejercicio'] }] }] }, ['pago_otro_mes'], []] },
+      ] },
+      // Mes en que lo cuenta el SAT: global → `Meses`; pago → FechaPago; resto → emisión.
+      mesSat:  { $ifNull: ['$mesGlobal', { $ifNull: ['$mesPago', '$mesEmi'] }] },
+      anioSat: { $ifNull: ['$anioGlobal', { $ifNull: ['$anioPago', '$anioEmi'] }] },
+    } },
+    { $match: { 'motivos.0': { $exists: true } } },
+    { $match: { $or: [{ ejercicio: ej }, { anioEmi: ej }, { anioSat: ej }] } },
+  ];
+  if (per) pipeline.push({ $match: { $or: [
+    { ejercicio: ej, periodo: per }, { anioEmi: ej, mesEmi: per }, { anioSat: ej, mesSat: per },
+  ] } });
+  if (mesE) pipeline.push({ $match: { anioEmi: ej, mesEmi: mesE } });
+  const conteoPipeline = [...pipeline, { $unwind: '$motivos' }, { $group: { _id: '$motivos', n: { $sum: 1 }, total: { $sum: '$total' } } }];
+  if (motivo) pipeline.push({ $match: { motivos: motivo } });
+
+  const [resultado, conteos] = await Promise.all([
+    CFDI.aggregate([...pipeline, { $sort: { fecha: -1 } }, { $facet: {
+      data: [{ $skip: (pg - 1) * lm }, { $limit: lm }],
+      total: [{ $count: 'n' }],
+    } }]).allowDiskUse(true),
+    CFDI.aggregate(conteoPipeline).allowDiskUse(true),
+  ]);
+  const data = resultado[0]?.data ?? [];
+  const total = resultado[0]?.total?.[0]?.n ?? 0;
+  const porMotivo = Object.fromEntries(conteos.map(c => [c._id, { count: c.n, total: Math.round(c.total * 100) / 100 }]));
+  res.json({ ...paginate(data, total, pg, lm), porMotivo });
 });
 
 /**
@@ -1039,7 +1150,7 @@ const exportExcel = asyncHandler(async (req, res) => {
   const {
     source, tipoDeComprobante, rfcEmisor, rfcReceptor,
     satStatus, erpStatus, lastComparisonStatus, fechaInicio, fechaFin,
-    search, ejercicio, periodo,
+    search, ejercicio, periodo, mesEmision,
   } = req.query;
 
   const filter = { isActive: { $ne: false } };
@@ -1048,8 +1159,8 @@ const exportExcel = asyncHandler(async (req, res) => {
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };
   }
   if (tipoDeComprobante) filter.tipoDeComprobante  = tipoDeComprobante;
-  if (rfcEmisor)         filter['emisor.rfc']       = rfcEmisor.toUpperCase();
-  if (rfcReceptor)       filter['receptor.rfc']     = rfcReceptor.toUpperCase();
+  if (rfcEmisor)         filter['emisor.rfc']       = filtroRfc(rfcEmisor);
+  if (rfcReceptor)       filter['receptor.rfc']     = filtroRfc(rfcReceptor);
   if (satStatus)  filter.satStatus = satStatus;
   if (erpStatus) {
     const valores = erpStatus.split(',').map(v => v.trim()).filter(Boolean);
@@ -1070,6 +1181,8 @@ const exportExcel = asyncHandler(async (req, res) => {
   }
   if (ejercicio)            filter.ejercicio            = parseInt(ejercicio);
   if (periodo)              filter.periodo              = parseInt(periodo);
+  const fMesExport = mesEmision ? filtroMesEmision(mesEmision, ejercicio) : null;
+  if (fMesExport) filter.$and = [...(filter.$and || []), fMesExport];
   if (lastComparisonStatus) filter.lastComparisonStatus = lastComparisonStatus;
   if (search) filter.$text = { $search: search };
 
@@ -1644,5 +1757,5 @@ module.exports = {
   list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
   exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
-  repairXmlSubtotals,
+  repairXmlSubtotals, reclasificados,
 };

@@ -9,7 +9,7 @@ const {
   upload, importExcel, importFromErpApi,
   create, compare, remove, exportExcel, exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
-  repairXmlSubtotals,
+  repairXmlSubtotals, reclasificados,
 } = require('../controllers/cfdi.controller');
 
 const router = express.Router();
@@ -52,6 +52,7 @@ const handleXmlUpload = (req, res, next) => {
 // ── Rutas estáticas — deben ir ANTES de /:id ─────────────────────────────────
 router.get('/',       authenticate, listLimiter, list);
 router.get('/export', authenticate, exportExcel);
+router.get('/reclasificados', authenticate, listLimiter, reclasificados);
 router.get('/export-zip-recibidos', authenticate, exportZipRecibidos);
 router.get('/export-reporte-recibidos', authenticate, exportReporteRecibidos);
 

@@ -35,7 +35,8 @@ const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 const {
   cargarReporte, listar, obtenerDetalle, obtenerPorMovimiento, buscarCandidatos,
-  resolverReporte, rechazarReporte, consultarFolioKore, consultarFoliosPendientes, evaluarReporte,
+  resolverReporte, rechazarReporte, consultarFolioKore, consultarFoliosPendientes,
+  consultarFoliosPendientesDeLote, evaluarReporte,
   eliminarReporte, restaurarReporte, _poblarMovimientoVinculado,
 } = require('./netpay-reporte.service');
 
@@ -515,6 +516,39 @@ describe('evaluarReporte', () => {
     expect(reporte.save).not.toHaveBeenCalled();
   });
 
+  // Fix 2026-10-07: antes de este fix, un reporte ya resuelto se tumbaba a discrepancia al
+  // reevaluarlo porque su propio movimiento vinculado (erpLinks ya no vacío) quedaba fuera del
+  // pool de "candidatos libres" de _buscarCandidatosParaReporte.
+  test('reporte ya resuelto_por_reporte: Reevaluar es un no-op, no vuelve a buscar candidatos ni toca el estatus', async () => {
+    const reporte = fakeReporteRecienCreado({
+      estatus: 'resuelto_por_reporte', vinculo: 'erp-link', movementIdConfirmado: 'mov-1',
+    });
+    NetpayReporte.findById = jest.fn().mockResolvedValue(reporte);
+    BankMovement.findById = jest.fn(() => fakeFind({ _id: 'mov-1', banco: 'BBVA', deposito: 1000 }));
+
+    const { candidatos } = await evaluarReporte('rep-1');
+
+    expect(candidatos).toEqual([]);
+    expect(BankMovement.find).not.toHaveBeenCalled(); // nunca llega a _buscarCandidatosParaReporte
+    expect(reporte.save).not.toHaveBeenCalled();
+    expect(reporte.estatus).toBe('resuelto_por_reporte'); // intacto
+    expect(reporte.movementIdConfirmado).toBe('mov-1'); // intacto
+  });
+
+  test('reporte ya resuelto_manual: Reevaluar también es un no-op', async () => {
+    const reporte = fakeReporteRecienCreado({
+      estatus: 'resuelto_manual', movementIdConfirmado: 'mov-1', justificacion: 'ya resuelto a mano',
+    });
+    NetpayReporte.findById = jest.fn().mockResolvedValue(reporte);
+    BankMovement.findById = jest.fn(() => fakeFind({ _id: 'mov-1', banco: 'BBVA', deposito: 1000 }));
+
+    await evaluarReporte('rep-1');
+
+    expect(BankMovement.find).not.toHaveBeenCalled();
+    expect(reporte.save).not.toHaveBeenCalled();
+    expect(reporte.estatus).toBe('resuelto_manual');
+  });
+
   test('0 candidatos libres y ningún bucket corroborable: discrepancia/sin_candidato', async () => {
     const reporte = fakeReporteRecienCreado();
     NetpayReporte.findById = jest.fn().mockResolvedValue(reporte);
@@ -775,6 +809,41 @@ describe('listar', () => {
     await listar({ incluirEliminados: true });
 
     expect(NetpayReporte.find).toHaveBeenCalledWith({});
+  });
+
+  // dateFrom/dateTo (pedido explícito del usuario, 2026-10-07): filtra por fechaMovimiento,
+  // $lte a FIN de día (no medianoche) porque fechaMovimiento puede traer hora real.
+  test('dateFrom/dateTo: filtra por fechaMovimiento, combinado con estatus/incluirEliminados', async () => {
+    const sortFn = jest.fn(() => fakeFind([]));
+    NetpayReporte.find = jest.fn(() => ({ sort: sortFn }));
+
+    await listar({
+      estatus: 'resuelto_por_reporte', incluirEliminados: true, dateFrom: '2026-09-01', dateTo: '2026-09-30',
+    });
+
+    expect(NetpayReporte.find).toHaveBeenCalledWith({
+      estatus: 'resuelto_por_reporte',
+      fechaMovimiento: {
+        $gte: new Date('2026-09-01T00:00:00.000Z'),
+        $lte: new Date('2026-09-30T23:59:59.999Z'),
+      },
+    });
+  });
+
+  // Fix de revisión de riesgo (2026-10-07): antes un dateFrom/dateTo no parseable pasaba como
+  // Invalid Date directo al filtro Mongo, sin aviso.
+  test('dateFrom inválido: BadRequestError, nunca llega a tocar Mongo', async () => {
+    NetpayReporte.find = jest.fn();
+
+    await expect(listar({ dateFrom: 'no-es-una-fecha' })).rejects.toThrow(BadRequestError);
+    expect(NetpayReporte.find).not.toHaveBeenCalled();
+  });
+
+  test('dateTo inválido: BadRequestError, nunca llega a tocar Mongo', async () => {
+    NetpayReporte.find = jest.fn();
+
+    await expect(listar({ dateTo: 'tampoco-una-fecha' })).rejects.toThrow(BadRequestError);
+    expect(NetpayReporte.find).not.toHaveBeenCalled();
   });
 });
 
@@ -1297,5 +1366,100 @@ describe('consultarFoliosPendientes', () => {
 
     expect(buscarTransaccionesNetpay).not.toHaveBeenCalled();
     expect(resultado).toEqual({ consultados: 0, fallos: [] });
+  });
+});
+
+// consultarFoliosPendientesDeLote — export-lote (pedido explícito del usuario, 2026-10-07):
+// versión "N reportes" de consultarFoliosPendientes de arriba, usada por GET
+// .../reporte/export-lote. 2 correcciones de revisión de resiliencia (2026-10-07) cubiertas
+// acá: (1) el presupuesto de tiempo escala con la cantidad REAL de lotes de folios pendientes
+// de cada reporte (no asume 1 lote fijo), (2) un reporte que falla individualmente NUNCA
+// aborta el resto del lote.
+describe('consultarFoliosPendientesDeLote', () => {
+  function fakeQuery(result) {
+    return {
+      lean: jest.fn().mockResolvedValue(result),
+      then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+    };
+  }
+
+  test('caso feliz: reportes sin pendientes se consultan sin omitirse ni fallar', async () => {
+    const reporteA = { _id: 'rep-a', folios: [{ referencia: 'A1', koreCache: { cuenta: { Total: 1 } } }] };
+    const reporteB = { _id: 'rep-b', folios: [{ referencia: 'B1', koreCache: { cuenta: { Total: 1 } } }] };
+    NetpayReporte.find = jest.fn(() => ({ select: () => fakeFind([reporteA, reporteB]) }));
+    NetpayReporte.findById = jest.fn(id => fakeQuery(id === 'rep-a' ? reporteA : reporteB));
+
+    const resultado = await consultarFoliosPendientesDeLote(['rep-a', 'rep-b']);
+
+    expect(resultado).toEqual({ fallos: [], omitidosPorTiempo: [], reportesFallidos: [] });
+    expect(buscarTransaccionesNetpay).not.toHaveBeenCalled();
+  });
+
+  test('ids vacío: no toca Mongo, devuelve todo vacío', async () => {
+    NetpayReporte.find = jest.fn(() => ({ select: () => fakeFind([]) }));
+
+    const resultado = await consultarFoliosPendientesDeLote([]);
+
+    expect(resultado).toEqual({ fallos: [], omitidosPorTiempo: [], reportesFallidos: [] });
+  });
+
+  // Fix 1 (BLOCKER, revisión de resiliencia 2026-10-07): un reporte con 6 folios pendientes
+  // necesita 2 lotes de 5 (CONSULTAR_FOLIOS_CONCURRENCIA) — su peor caso teórico (2 lotes)
+  // YA excede por sí solo el presupuesto del lote completo, así que debe omitirse por tiempo
+  // ANTES de intentarlo siquiera (nunca llega a NetpayReporte.findById con su id). Esto es
+  // determinístico sin fake timers: el check compara contra el peor caso teórico escalado por
+  // cantidad de lotes, no contra tiempo real transcurrido. Antes del fix, la fórmula vieja
+  // comparaba solo el peor caso de UN lote (que SÍ entra en el presupuesto), así que este
+  // reporte habría arrancado igual y corrido sin ningún control de tiempo interno.
+  test('un reporte con muchos folios pendientes (2+ lotes) se omite por presupuesto de tiempo, uno con 0 pendientes nunca se omite', async () => {
+    const reporteGrande = {
+      _id: 'rep-grande',
+      folios: Array.from({ length: 6 }, (_, i) => ({ referencia: `G${i}`, koreCache: null })),
+    };
+    const reporteChico = {
+      _id: 'rep-chico',
+      folios: [{ referencia: 'C1', koreCache: { cuenta: { Total: 1 } } }],
+    };
+    NetpayReporte.find = jest.fn(() => ({ select: () => fakeFind([reporteGrande, reporteChico]) }));
+    NetpayReporte.findById = jest.fn(() => fakeQuery(reporteChico));
+
+    const resultado = await consultarFoliosPendientesDeLote(['rep-grande', 'rep-chico']);
+
+    expect(resultado.omitidosPorTiempo).toEqual(['rep-grande']);
+    expect(resultado.reportesFallidos).toEqual([]);
+    expect(NetpayReporte.findById).not.toHaveBeenCalledWith('rep-grande');
+  });
+
+  // Fix 2 (CRITICAL, revisión de resiliencia 2026-10-07): antes, un error de
+  // consultarFoliosPendientes para UN reporte (acá simulado como "ya no existe" — ej. borrado
+  // concurrente por otro usuario a mitad de la corrida) abortaba TODO el lote sin try/catch,
+  // perdiendo el trabajo ya hecho de los reportes anteriores.
+  test('un reporte que falla individualmente se registra en reportesFallidos, sin abortar el resto del lote', async () => {
+    const reporteB = {
+      _id: 'rep-b', folios: [{ referencia: 'B1', koreCache: null }], save: jest.fn().mockResolvedValue(undefined),
+    };
+    NetpayReporte.find = jest.fn(() => ({ select: () => fakeFind([{ _id: 'rep-a', folios: [] }, reporteB]) }));
+    NetpayReporte.findById = jest.fn(id => (id === 'rep-a' ? fakeQuery(null) : fakeQuery(reporteB)));
+    buscarTransaccionesNetpay.mockResolvedValue({ raw: { Data: { transactions: [{ folio: 'B1', cuentas: [{ Total: 1 }] }] } } });
+
+    const resultado = await consultarFoliosPendientesDeLote(['rep-a', 'rep-b']);
+
+    expect(resultado.reportesFallidos).toEqual([{ reporteId: 'rep-a', error: expect.stringContaining('Reporte Netpay') }]);
+    expect(resultado.omitidosPorTiempo).toEqual([]);
+    // rep-b SÍ se procesó pese a que rep-a falló antes en el loop.
+    expect(buscarTransaccionesNetpay).toHaveBeenCalledWith(expect.objectContaining({ folio: 'B1' }));
+  });
+
+  test('techo de folios pendientes del lote completo: UnprocessableError, nunca llega a consultar nada', async () => {
+    const { UnprocessableError } = require('../../shared/errors/AppError');
+    const reporteEnorme = {
+      _id: 'rep-enorme',
+      folios: Array.from({ length: 301 }, (_, i) => ({ referencia: `E${i}`, koreCache: null })),
+    };
+    NetpayReporte.find = jest.fn(() => ({ select: () => fakeFind([reporteEnorme]) }));
+    NetpayReporte.findById = jest.fn();
+
+    await expect(consultarFoliosPendientesDeLote(['rep-enorme'])).rejects.toThrow(UnprocessableError);
+    expect(NetpayReporte.findById).not.toHaveBeenCalled();
   });
 });

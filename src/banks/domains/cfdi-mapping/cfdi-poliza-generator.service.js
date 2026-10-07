@@ -7516,12 +7516,6 @@ function _diaSiguiente(fechaYMD) {
   return `${y}-${m}-${dd}`;
 }
 
-function _esMedianocheUtc(fecha) {
-  if (!fecha) return false;
-  const d = new Date(fecha);
-  return d.getUTCHours() === 0 && d.getUTCMinutes() === 0 && d.getUTCSeconds() === 0 && d.getUTCMilliseconds() === 0;
-}
-
 /**
  * Resuelve qué UUIDs de CFDI (tipo `tipoCfdi`, del RFC dado) tienen su fecha
  * EFECTIVA dentro de [fechaInicio, fechaFin] — usado para separar pólizas por
@@ -7562,23 +7556,18 @@ async function _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fecha
 
   // 2. De esos (no de TODO el histórico ERP del rfc), cuáles tienen homólogo
   //    ERP — para saber a cuáles no aplicarles el fallback de su fecha SAT.
-  //    Un homólogo ERP a medianoche UTC exacta no cuenta: es un documento
-  //    capturado con fecha anterior (solo fecha, sin hora real — ej.
-  //    complemento con Fecha 30-sep 00:00 timbrado el 2-oct); restarle el
-  //    huso de México lo pasaba al día anterior. Ese se queda con su fecha SAT.
   const erpDeEsosSat = uuidsSatNaive.length
-    ? await CFDI.find({ uuid: { $in: uuidsSatNaive }, source: 'ERP' }).select('uuid fecha').lean()
+    ? await CFDI.find({ uuid: { $in: uuidsSatNaive }, source: 'ERP' }).select('uuid').lean()
     : [];
-  const uuidsConErp = new Set(erpDeEsosSat.filter(c => !_esMedianocheUtc(c.fecha)).map(c => c.uuid.toUpperCase()));
+  const uuidsConErp = new Set(erpDeEsosSat.map(c => c.uuid.toUpperCase()));
 
   // 3. UUIDs cuyo homólogo ERP cae en el rango (huso horario real de México)
   //    — acotado al rango de días, no a todo el histórico. Esto también
   //    reclasifica hacia este día CFDIs cuyo fecha SAT ingenuo cayó en OTRO
-  //    día pero cuya fecha ERP real sí es este. Los ERP a medianoche UTC
-  //    exacta se ignoran aquí (los decide su fecha SAT, ver paso 2).
+  //    día pero cuya fecha ERP real sí es este.
   const erpEnRango = await CFDI.find({ ...filtroComun, source: 'ERP', fecha: { $gte: mxInicio, $lte: mxFin } })
-    .select('uuid fecha').lean();
-  const resultado = new Set(erpEnRango.filter(c => !_esMedianocheUtc(c.fecha)).map(c => c.uuid.toUpperCase()));
+    .select('uuid').lean();
+  const resultado = new Set(erpEnRango.map(c => c.uuid.toUpperCase()));
 
   // 4. SAT sin homólogo ERP → fallback a su propio fecha (ya está en rango,
   //    viene del paso 1). Los que SÍ tienen homólogo se descartan aquí: su

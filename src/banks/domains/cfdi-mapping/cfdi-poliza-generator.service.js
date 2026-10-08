@@ -5852,20 +5852,51 @@ function _claveGeneracion({ rfc, tipoCfdi, ejercicio, periodo, centroCostoId, fe
   return [rfc, tipoCfdi, ejercicio, periodo, centroCostoId ?? 'todas', fechaInicio ?? '', fechaFin ?? ''].join('|');
 }
 
+// Tiempos por fase de la generación (solo log, no cambia la póliza) — para
+// ubicar qué parte hace lenta la póliza de Ingreso antes de optimizar
+// (pedido por el usuario 2026-10-08). Una línea `[PolizaTiempos]` por póliza.
+function _crearMedidorFases() {
+  const inicio = Date.now();
+  let ultimo = inicio;
+  const fases = [];
+  return {
+    marca(nombre) {
+      const ahora = Date.now();
+      fases.push(`${nombre} ${((ahora - ultimo) / 1000).toFixed(1)}s`);
+      ultimo = ahora;
+    },
+    resumen() {
+      return `total ${((Date.now() - inicio) / 1000).toFixed(1)}s | ${fases.join(' · ')}`;
+    },
+  };
+}
+
 async function generarYGuardar(params) {
   const clave = _claveGeneracion(params);
   if (_generacionesEnCurso.has(clave)) {
     throw new ConflictError('Ya se está generando esta póliza (misma sucursal y fecha) — espera a que termine antes de intentar de nuevo.');
   }
   _generacionesEnCurso.add(clave);
+  const medidor = params.tipoCfdi === 'P' ? null : _crearMedidorFases();
+  let resultadoLog = 'ok';
   try {
-    return await _generarYGuardarCore(params);
+    return await _generarYGuardarCore({ ...params, _medidor: medidor });
+  } catch (err) {
+    resultadoLog = `error: ${err.message}`;
+    throw err;
   } finally {
     _generacionesEnCurso.delete(clave);
+    if (medidor) {
+      const { logger } = require('../../../shared/utils/logger');
+      const { tipoCfdi, centroCostoId, fechaInicio, fechaFin } = params;
+      const dias = fechaInicio ? (fechaInicio === fechaFin ? fechaInicio : `${fechaInicio}..${fechaFin}`) : 'periodo';
+      logger.info(`[PolizaTiempos] tipo=${tipoCfdi} centro=${centroCostoId ?? 'todos'} dia=${dias} ${resultadoLog} | ${medidor.resumen()}`);
+    }
   }
 }
 
-async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
+async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user, _medidor = null }) {
+  const _fase = (nombre) => _medidor?.marca(nombre);
   if (!rfc)       throw new BadRequestError('RFC requerido');
   if (!ejercicio) throw new BadRequestError('Ejercicio requerido');
   if (!periodo)   throw new BadRequestError('Periodo requerido');
@@ -5924,6 +5955,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     raw: true,
   });
   const uuidsYaUsados = new Set(yaContabilizados.map(m => m.cfdiUuid));
+  _fase('yaContabilizados');
 
   // 2. CFDIs vigentes del periodo (sin límite)
   // fechaInicio/fechaFin (opcionales): ver misma nota en `generarPropuesta`
@@ -5958,6 +5990,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     : [];
 
   await repararSubtotalDesdeXml(cfdis);
+  _fase(`cfdisDelDia(${cfdis.length})`);
 
   // Filtro por forma de pago (solo Cobranza/Pagos) — ver `FORMA_PAGO_A_CATEGORIA`.
   const cfdisSinPoliza = cfdis.filter(c =>
@@ -6098,6 +6131,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   const sustitutosEnriquecidosGuard = await _enriquecerSustitutosConPeriodoOriginal(_extraerSustitutos(cfdisSinPolizaFinalGuard));
   const { excluidos: sustitutosClasificadosGuard } = _particionarSustitutosPorRiesgo(sustitutosEnriquecidosGuard, { uuidsYaUsados, ejercicio, periodo });
   const sustitutosMismoPeriodoGuard = sustitutosClasificadosGuard.filter(s => s.mismoPeriodo);
+  _fase('relacionados+tasaIva+sustitutos');
   const sustitutosGuard = sustitutosClasificadosGuard.filter(s => !s.mismoPeriodo);
   const _uuidsSustitutosExcluidosGuard = new Set(sustitutosGuard.map(s => s.uuid?.toUpperCase()).filter(Boolean));
 
@@ -6153,6 +6187,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   // en generarPropuesta.
   await _completarRelacionadosPostMerge(cfdisConNCGuard, relMetodoPagoMapGuard, relFacturaMetaMapGuard);
 
+  _fase('notasCredito');
+
   // Serie propia de esta sucursal — ver comentario equivalente en generarPropuesta.
   let serieDelCentroGuard = centroCostoId
     ? Object.entries(ccBySerieMap).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0]
@@ -6165,6 +6201,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+
+  _fase('erpSaldosFavor');
 
   // Adelantado (2026-09-04) — ver comentario equivalente en generarPropuesta.
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
@@ -6215,6 +6253,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
     fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
   });
+  _fase('erpCobros(desglosePagoReal)');
   // Ver comentario equivalente en generarPropuesta.
   const ventasSFCubiertasPorSplitGuard = new Set();
   for (const sfUsado of saldoFavorUsadoMapGuard.values()) {
@@ -6281,6 +6320,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       }
     }
   }
+
+  _fase('puenteSucursales');
 
   // cfdiConRegla / cuentaMap / saldoFavorUsadoMapGuard se calculan ANTES de
   // `construirMovimientosPuente` (más arriba) — ver comentario equivalente en
@@ -6370,6 +6411,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     );
     saldoRestanteGuard = Number(rows[0]?.saldo || 0);
   }
+
+  _fase('doctosPago+anticipos');
 
   // 6. Generar movimientos en memoria
   // (ccBySerieMap ya se resolvió arriba, antes del filtro por sucursal)
@@ -7033,6 +7076,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     }
   }
 
+  _fase(`mapeoCfdis(${cfdiConRegla.length})`);
+
   // Facturas tipo I canceladas en SAT sin NC/sustituto que las compense, con
   // cobro real encontrado en cajas — ver comentario equivalente en
   // generarPropuesta.
@@ -7162,6 +7207,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       puntosAcumuladosGuard.set(ccSinFacturaGuard.id, prevPuntosGuard);
     }
   }
+
+  _fase('canceladas+erpCobrosSinFactura+sfTardio');
 
   // Puntos/Club Tuberos consolidado del batch — ver comentario equivalente en
   // generarPropuesta.
@@ -7327,6 +7374,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     todosLosMovimientos.push(...reversionesGuard);
   }
 
+  _fase('puntos+ppdOrfanos+reversiones');
+
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
   // Si se generó para un día específico (fechaInicio), el encabezado debe
   // mostrar ESE día, no la fecha en la que se corrió la generación.
@@ -7448,6 +7497,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   advertenciasFinal.push(...advertencias);
   // Tickets de cajas con cobro real pero sin ninguna factura ligada — hoja
   // aparte, ver comentario equivalente en generarPropuesta.
+  _fase('guardar');
   if (pendientesPorFacturarGuard.length) {
     const totalPendienteGuard = pendientesPorFacturarGuard.reduce((s, p) => s + p.monto, 0);
     advertenciasFinal.push(

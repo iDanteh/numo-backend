@@ -183,12 +183,21 @@ const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   const token = await _tokenPolizas();
   for (let intento = 1; intento <= MAX_INTENTOS_429; intento++) {
+    const inicioLlamada = Date.now();
     try {
-      return await axios.get(url, {
+      const resp = await axios.get(url, {
         params,
         headers: { Authorization: `Bearer ${token}` },
         timeout: 60000,
       });
+      // Solo log (2026-10-08): llamadas lentas al ERP, para medir qué hace
+      // lenta la generación de pólizas — ver `[PolizaTiempos]`.
+      const segLlamada = (Date.now() - inicioLlamada) / 1000;
+      if (segLlamada >= 2) {
+        const { logger } = require('../../../shared/utils/logger');
+        logger.info(`[ErpTiempos] ${logLabel} ${segLlamada.toFixed(1)}s (intento ${intento}) ${params?.centro ? `centro=${params.centro}` : ''}`.trim());
+      }
+      return resp;
     } catch (axErr) {
       const status    = axErr.response?.status;
       const esTimeout = axErr.code === 'ECONNABORTED' || /timeout/i.test(axErr.message || '');

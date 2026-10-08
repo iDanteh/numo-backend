@@ -17,6 +17,7 @@ jest.mock('./netpay-match.service', () => ({
   _montosIguales: jest.requireActual('./netpay-match.service')._montosIguales,
 }));
 jest.mock('../../../shared/services/global-config.service');
+jest.mock('./netpay-comision-sync.service');
 jest.mock('../../shared/socket', () => ({ emitToBanco: jest.fn(), emitToAll: jest.fn() }));
 jest.mock('../banks/bank.service', () => {
   const real = jest.requireActual('../banks/bank.service');
@@ -31,6 +32,7 @@ const { parseNetpayReporte } = require('./netpay-reporte-parser.service');
 const { buscarTransaccionesNetpay } = require('./kore-caja.service');
 const { _ventanaDiasNetpay } = require('./netpay-match.service');
 const { setErpIds } = require('../banks/bank.service');
+const { sincronizarComisiones } = require('./netpay-comision-sync.service');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 const {
@@ -201,6 +203,36 @@ describe('cargarReporte', () => {
 
     expect(reporte.estatus).toBe('discrepancia');
     expect(creado.folios[0].koreCache?.cuenta).toBeFalsy();
+  });
+
+  // 2026-10-07, pedido explícito del usuario: sincroniza la comisión detectada hacia
+  // Configuraciones Globales (netpay-comision-sync.service.js) — va ANTES de consultar Kore,
+  // con el documento recién creado tal cual sale de NetpayReporte.create().
+  test('sincroniza comisiones hacia Configuraciones Globales con el reporte recién creado', async () => {
+    parseNetpayReporte.mockResolvedValue(parsedN1());
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+
+    await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(sincronizarComisiones).toHaveBeenCalledWith(creado);
+  });
+
+  test('si sincronizarComisiones falla, la carga del reporte sigue siendo exitosa (best-effort)', async () => {
+    parseNetpayReporte.mockResolvedValue(parsedN1());
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    BankMovement.find = jest.fn(() => fakeFind([]));
+    const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+    sincronizarComisiones.mockRejectedValueOnce(new Error('Postgres caído'));
+
+    const { reporte } = await cargarReporte(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(reporte.estatus).toBe('discrepancia');
   });
 
   test('1 candidato BBVA cuyo monto cuadra dentro de tolerancia: auto-vincula (resuelto_por_reporte, vinculo:erp-link)', async () => {

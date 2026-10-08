@@ -22,6 +22,7 @@ const ESTATUS_TERMINALES = new Set(['rechazado', 'resuelto_manual']);
 const { parseNetpayReporte } = require('./netpay-reporte-parser.service');
 const { emitToBanco, emitToAll } = require('../../shared/socket');
 const { logger } = require('../../../shared/utils/logger');
+const { sincronizarComisiones } = require('./netpay-comision-sync.service');
 
 const PREFIJO_ERP_ID_REPORTE = 'NETPAYRPT-';
 
@@ -206,6 +207,17 @@ async function _crearYEvaluar(unit, nombreArchivo, user) {
   });
 
   await _registrarFoliosIdempotente(reporte);
+
+  // Sincronización de comisiones hacia Configuraciones Globales (2026-10-07, pedido explícito
+  // del usuario) — va ANTES de consultarFoliosPendientes/evaluarReporte a propósito: la
+  // comisión por folio ya está completa desde el parseo del Excel, no depende de Kore ni del
+  // resultado del matching. sincronizarComisiones() ya es best-effort puertas adentro (nunca
+  // tira), este try/catch es defensa en profundidad, mismo patrón que el resto de la función.
+  try {
+    await sincronizarComisiones(reporte);
+  } catch (err) {
+    logger.warn(`[NetpayReporte] no se pudo sincronizar comisiones a Configuraciones Globales para el reporte ${reporte._id}: ${err.message}`);
+  }
 
   try {
     await consultarFoliosPendientes(reporte._id);

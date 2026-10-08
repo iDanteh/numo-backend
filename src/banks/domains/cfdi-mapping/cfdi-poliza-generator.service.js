@@ -6206,6 +6206,16 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     ? Object.entries(ccBySerieMap).find(([, cc]) => String(cc.id) === String(centroCostoId))?.[0]
     : null;
 
+  // Saldos a favor generados por las Devoluciones de este batch — ANTES de
+  // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
+  const { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard, anticiposConvertidos: anticiposConvertidosGuard, anticipoFolioPorUuidDesdeSaldosFavor: anticipoFolioPorUuidDesdeSaldosFavorGuard } = await _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
+    centroPropioClave: serieDelCentroGuard,
+    fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+    fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+  });
+
+  _fase('erpSaldosFavor');
+
   // Adelantado (2026-09-04) — ver comentario equivalente en generarPropuesta.
   const cfdiConRegla = cfdisConNCGuard.map(cfdi => ({
     cfdi,
@@ -6248,31 +6258,14 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     : [];
   const cuentaMap = Object.fromEntries(cuentasRows.map(c => [c.codigo, c.id]));
 
-  // Saldos a favor generados por las Devoluciones de este batch — ANTES de
-  // construirMovimientosPuente, ver comentario equivalente en generarPropuesta.
   // Desglose real de forma de pago — ver `_prefetchDesglosePagoReal`.
   // Ver comentario equivalente en generarPropuesta sobre centroPropioClave/fechaDesde/fechaHasta.
-  //
-  // En paralelo (2026-10-08, medido: ~11 s menos por póliza): ninguna de las
-  // dos usa el resultado de la otra ni modifica datos que la otra lea (la
-  // única mutación compartida es `_viaTicketPropio` en las cuentas del ERP,
-  // que solo lee `_prefetchAjustesFacturaPropia`). Antes corrían una tras otra.
-  const [
-    { mapa: mapaSaldosFavorGeneradosGuard, devsOcultos: devsOcultosSFGuard, ajustesEfectivoRetiroSF: ajustesEfectivoRetiroSFGuard, anticiposConvertidos: anticiposConvertidosGuard, anticipoFolioPorUuidDesdeSaldosFavor: anticipoFolioPorUuidDesdeSaldosFavorGuard },
-    { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), anticipoApaUsado: anticipoApaUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [], puntosUsadoSinFactura: puntosUsadoSinFacturaGuard = 0 },
-  ] = await Promise.all([
-    _prefetchSaldosFavorGenerados(cfdisConNCGuard, rfc, ccBySerieMap, {
-      centroPropioClave: serieDelCentroGuard,
-      fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
-      fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
-    }),
-    _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
-      centroPropioClave: serieDelCentroGuard,
-      fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
-      fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
-    }),
-  ]);
-  _fase('erpSaldosFavor+erpCobros(paralelo)');
+  const { desglosePagoReal: desglosePagoRealMapGuard, puntosUsado: puntosUsadoMapGuard, saldoFavorUsado: saldoFavorUsadoMapGuard, anticipoUsado: anticipoUsadoMapGuard = new Map(), anticipoApaUsado: anticipoApaUsadoMapGuard = new Map(), cobrosCobradoraDirecta: cobrosCobradoraDirectaGuard = [], usoCaminoPorCentro: usoCaminoPorCentroGuard = false, atribuidoOtraFacturaMap: atribuidoOtraFacturaMapGuard = new Map(), movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard = [], saldoFavorUsadoSinFactura: saldoFavorUsadoSinFacturaGuard = [], puntosUsadoSinFactura: puntosUsadoSinFacturaGuard = 0 } = await _prefetchAjustesFacturaPropia(cfdiConReglaParaDesglose, rfc, {
+    centroPropioClave: serieDelCentroGuard,
+    fechaDesde: fechaInicio ? _medianocheMx(fechaInicio) : null,
+    fechaHasta: fechaFin   ? new Date(_medianocheMx(_diaSiguiente(fechaFin)).getTime() - 1) : null,
+  });
+  _fase('erpCobros(desglosePagoReal)');
   // Ver comentario equivalente en generarPropuesta.
   const ventasSFCubiertasPorSplitGuard = new Set();
   for (const sfUsado of saldoFavorUsadoMapGuard.values()) {
@@ -6325,13 +6318,12 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
         centroPropioClave: serieDelCentroGuard,
         // Ver comentario equivalente en generarPropuesta (fix 2026-09-04).
         ventasSFCubiertasPorSplit: ventasSFCubiertasPorSplitGuard,
-        medirFase: (nombre) => _fase(`puente:${nombre}`),
       });
       movsPuenteGuard = resultadoPuenteGuard.movimientos;
       facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
       facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
       pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
-      _fase('puente:final');
+      _fase('puente:construir');
       // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
       // detectado hoy con lo ya cubierto en días previos.
       // Ver comentario equivalente en generarPropuesta (objeto + número).

@@ -742,10 +742,7 @@ async function construirMovimientosPuente({
   // folio distinto al esperado, porque F0-260800614 es la venta GENERADORA,
   // no la consumidora.
   ventasSFCubiertasPorSplit = new Set(),
-  // Solo para el log `[PolizaTiempos]` (2026-10-08): callback que marca sub-fases.
-  medirFase = null,
 }) {
-  const _fasePuente = (nombre) => medirFase?.(nombre);
   const vacio = { movimientos: [], facturasVendedorCubiertas: new Map(), facturasPPDCubiertas: new Map(), pendientesPorFacturar: [] };
   if (!centroCostoId || !cuentaCajaId || !cuentaBancosId) return vacio;
 
@@ -798,7 +795,6 @@ async function construirMovimientosPuente({
   // al ERP "todo lo cobrado en este centro en el mes completo").
   // Tickets de ESTA sucursal, sin factura, cobrados en la caja de OTRA
   // sucursal ese día -- ver `cuentasExtra` en `_detectarPendientesPorFacturar`.
-  _fasePuente('almacenPorSerie');
   let cuentasSinFacturaOtraCaja = [];
   if (centroPropioClave && fechaDesde && fechaHasta) {
     // Ya liberado en producción (confirmado con el usuario 2026-08-14) — el
@@ -915,7 +911,6 @@ async function construirMovimientosPuente({
     }
   }
 
-  _fasePuente('cobrosOtraCaja');
   if (!cuentas.length && !cuentasSinFacturaOtraCaja.length) return vacio;
 
   // 1b. Saldos a favor USADOS por estas mismas ventas — mismo lote de
@@ -1014,7 +1009,6 @@ async function construirMovimientosPuente({
   // directamente la cuenta de origen y aplicar el mismo criterio (uso único,
   // sin sobrante, mismo día, mismo almacén) — confirmado con el usuario
   // 2026-08-04.
-  _fasePuente('saldosFavor');
   const devsOcultosHuerfanos = new Set();
   const origenesUnicos = [...new Map(
     [...usadosPorCuenta.values()].flat()
@@ -1044,7 +1038,6 @@ async function construirMovimientosPuente({
     }
   }
   // Unión con lo ya detectado vía CFDI — cualquiera de los dos criterios oculta el par.
-  _fasePuente('origenesSF');
   const devsOcultosCombinado = new Set([...(devsOcultosSF ?? []), ...devsOcultosHuerfanos]);
 
   // 1c. Depósito bancario real de estas mismas ventas — para cobros cruzados
@@ -1116,7 +1109,6 @@ async function construirMovimientosPuente({
   // 12-sep, ticket A0-260704683: 2 depósitos de $500 en 31-ago y 3-sep no
   // deben mezclarse ni repartirse en la línea de un cobro del 12-sep). `null`
   // cuando no hay candidatos en absoluto.
-  _fasePuente('bankMovements');
   function _elegirBancoRealPorFecha(candidatos, fechaCobro) {
     if (!candidatos || candidatos.length === 0) return null;
     if (candidatos.length === 1) return candidatos;
@@ -1164,7 +1156,6 @@ async function construirMovimientosPuente({
   const nombresSinFactura = await _nombresClienteSinFactura(rfc,
     cuentas.filter(c => !c.serieFactura && !cfdiPorDoc.has(`${c.serieVenta}|${c.folioVenta}`)));
 
-  _fasePuente('cuentasBanco+nombres');
   for (const cuenta of cuentas) {
     const centroVendedor = cuenta.serieFactura ? ccBySerieMap[cuenta.serieFactura] : null;
     const cfdiOriginal = cfdiPorDoc.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`) ?? null;
@@ -1599,7 +1590,6 @@ async function construirMovimientosPuente({
   // mantiene el Map vacío en el retorno porque cfdi-poliza-generator.service.js
   // sigue consultándolo (`facturasPPDCubiertas.get(...)`); con el Map siempre
   // vacío esos bloques quedan inertes sin tocar ese archivo.
-  _fasePuente(`loopCuentas(${cuentas.length})`);
   const facturasPPDCubiertas = new Map();
 
   // Tickets con cobro real pero sin ninguna factura ligada (ver
@@ -1650,7 +1640,6 @@ async function construirMovimientosPuente({
     cuentasExtra: cuentasSinFacturaOtraCaja,
   });
 
-  _fasePuente('detectarPendientesPorFacturar');
   if (cuentaPuenteId) {
     for (const p of pendientesDetectados) {
       const centroVendedor = p.serie ? (ccBySerieMap[p.serie] ?? null) : null;
@@ -1827,7 +1816,6 @@ async function construirMovimientosPuente({
     }
   }
 
-  _fasePuente('sincronizarPendientes');
   const pendientesPorFacturar = pendientesDetectados.filter(p => !p.facturaPosterior && !p.sfOcultoMismoDia).map(p => ({ ...p, centroCosto: centroDelDia?.clave ?? null, centroCostoId: centroDelDia?.id ?? null, sucursal: centroDelDia?.sucursal ?? null }));
 
   // Cola de cobros cruzados encolados por OTRA sucursal (cuando ESTA fue la
@@ -1844,7 +1832,6 @@ async function construirMovimientosPuente({
   // vendedora) pudiera traer para el mismo folioOrigen.
   candidatas.push(...candidatasPendientes.filter(c => !foliosResueltosDirecto.has(c.folio)));
 
-  _fasePuente('aplicarPendientes');
   if (!candidatas.length) return { movimientos: [], facturasVendedorCubiertas, facturasPPDCubiertas, pendientesPorFacturar };
 
   // 3. Idempotencia: solo contra movimientos YA existentes en la cuenta
@@ -1884,7 +1871,6 @@ async function construirMovimientosPuente({
   // cuando SÍ hay cruce, líneas ~1035 y ~849) siguen intactas — esas cuadran
   // contra la cuenta puente 2103040001 en la póliza cobradora y deben seguir
   // contabilizándose de verdad.
-  _fasePuente('yaRegistrados');
   const movimientos = candidatas.filter(c =>
     !foliosYaRegistrados.has(c.folio) && c.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO
   );

@@ -10,7 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
-const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket } = require('../erp/erp-sync.service');
+const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket, fotoEstadisticasErp } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
 const { BadRequestError, ConflictError } = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
@@ -5859,6 +5859,7 @@ function _crearMedidorFases() {
   const inicio = Date.now();
   let ultimo = inicio;
   const fases = [];
+  const erpAntes = fotoEstadisticasErp();
   return {
     marca(nombre) {
       const ahora = Date.now();
@@ -5866,7 +5867,14 @@ function _crearMedidorFases() {
       ultimo = ahora;
     },
     resumen() {
-      return `total ${((Date.now() - inicio) / 1000).toFixed(1)}s | ${fases.join(' · ')}`;
+      // Llamadas reales al ERP durante esta póliza (si se generan varias en
+      // paralelo, se mezclan las de las demás — para medir, generar una a la vez).
+      const erp = [...fotoEstadisticasErp()]
+        .map(([k, v]) => ({ k, n: v.n - (erpAntes.get(k)?.n ?? 0), ms: v.ms - (erpAntes.get(k)?.ms ?? 0) }))
+        .filter(e => e.n > 0)
+        .sort((a, b) => b.ms - a.ms)
+        .map(e => `${e.k} ${e.n}× ${(e.ms / 1000).toFixed(1)}s`);
+      return `total ${((Date.now() - inicio) / 1000).toFixed(1)}s | ${fases.join(' · ')} | ERP: ${erp.join(' · ') || 'ninguna'}`;
     },
   };
 }
@@ -5963,7 +5971,9 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   const uuidsPorFechaGuard = (fechaInicio && fechaFin)
     ? await _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fechaInicio, fechaFin })
     : null;
+  _fase('dia:uuidsPorFecha');
   const foliosCancelacionGuard = await _foliosCancelacionDelDia({ rfc, ejercicio, periodo, fechaInicio, fechaFin });
+  _fase('dia:foliosCancelacion');
   // Solo CFDIs EMITIDOS por esta entidad — ver comentario equivalente en
   // generarPropuesta (mismo fix, mismo motivo: receptor.rfc colaba compras
   // ajenas dentro de la póliza de Ingresos).
@@ -5981,6 +5991,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   const cfdis = await CFDI.find(filtroBase)
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida')
     .lean();
+  _fase(`dia:cfdis.find(${cfdis.length})`);
 
   // Ver comentario equivalente en generarPropuesta / _cfdisCanceladasSinCompensar.
   // NO se unen a `cfdis` (eso les aplicaría la regla normal, reconociendo
@@ -5988,9 +5999,10 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   const cfdisCanceladasSinCompensarGuard = tipoCfdi === 'I'
     ? await _cfdisCanceladasSinCompensar({ rfc, ejercicio, periodo, uuidsPorFecha: uuidsPorFechaGuard })
     : [];
+  _fase('dia:canceladasSinCompensar');
 
   await repararSubtotalDesdeXml(cfdis);
-  _fase(`cfdisDelDia(${cfdis.length})`);
+  _fase('dia:repararSubtotal');
 
   // Filtro por forma de pago (solo Cobranza/Pagos) — ver `FORMA_PAGO_A_CATEGORIA`.
   const cfdisSinPoliza = cfdis.filter(c =>
@@ -6288,6 +6300,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       const cfdisParaPuenteGuard = (fechaInicio && fechaFin)
         ? await _fetchCfdisParaPuenteAmplio({ rfc, ejercicio, periodo, tipoCfdi, serie: serieDelCentroGuard })
         : cfdisSinPolizaFinalGuard;
+      _fase(`puente:cfdisAmplio(${cfdisParaPuenteGuard.length})`);
       const resultadoPuenteGuard = await construirMovimientosPuente({
         cfdis: cfdisParaPuenteGuard,
         centroCostoId,
@@ -6310,6 +6323,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       facturasVendedorCubiertasGuard = resultadoPuenteGuard.facturasVendedorCubiertas;
       facturasPPDCubiertasGuard = resultadoPuenteGuard.facturasPPDCubiertas;
       pendientesPorFacturarGuard = resultadoPuenteGuard.pendientesPorFacturar ?? [];
+      _fase('puente:construir');
       // Ver comentario en `_uuidsConCargoCubiertoEnBD` — complementa lo
       // detectado hoy con lo ya cubierto en días previos.
       // Ver comentario equivalente en generarPropuesta (objeto + número).
@@ -6321,7 +6335,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     }
   }
 
-  _fase('puenteSucursales');
+  _fase('puente:cubiertoEnBD');
 
   // cfdiConRegla / cuentaMap / saldoFavorUsadoMapGuard se calculan ANTES de
   // `construirMovimientosPuente` (más arriba) — ver comentario equivalente en

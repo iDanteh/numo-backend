@@ -91,13 +91,16 @@ async function sincronizarCuentasPendientes(params = {}) {
   let mejorTotal = -1;
   for (let intento = 1; intento <= MAX_INTENTOS; intento++) {
     let response;
+    const inicioCp = Date.now();
     try {
       response = await axios.get(`${cuentasPendientesUrl}/cuentas-pendientes`, {
         params:  queryParams,
         headers: { Authorization: `Bearer ${token}` },
         timeout: 30000,
       });
+      _registrarLlamadaErp('/cuentas-pendientes', Date.now() - inicioCp);
     } catch (axErr) {
+      _registrarLlamadaErp('/cuentas-pendientes (falló)', Date.now() - inicioCp);
       const status    = axErr.response?.status;
       const esTimeout = axErr.code === 'ECONNABORTED' || /timeout/i.test(axErr.message || '');
       const { logger } = require('../../../shared/utils/logger');
@@ -179,6 +182,19 @@ async function sincronizarCuentasPendientes(params = {}) {
 // totales incluyendo backoff, probado en vivo contra el ERP real ese mismo
 // día) y luego a 60000 (confirmado con el usuario, mismo día, tras seguir
 // viendo timeouts con 45000).
+// Acumulado de llamadas reales al ERP (no cuenta aciertos de caché) por
+// endpoint — solo para el log `[PolizaTiempos]` (2026-10-08): la póliza toma
+// una foto antes y después y reporta la diferencia.
+const _estadisticasErp = new Map(); // etiqueta → { n, ms }
+function _registrarLlamadaErp(etiqueta, ms) {
+  const e = _estadisticasErp.get(etiqueta) ?? { n: 0, ms: 0 };
+  e.n += 1; e.ms += ms;
+  _estadisticasErp.set(etiqueta, e);
+}
+function fotoEstadisticasErp() {
+  return new Map([..._estadisticasErp].map(([k, v]) => [k, { ...v }]));
+}
+
 const MAX_INTENTOS_429 = 3;
 async function _getConReintento(url, params, logLabel) {
   const token = await _tokenPolizas();
@@ -193,12 +209,14 @@ async function _getConReintento(url, params, logLabel) {
       // Solo log (2026-10-08): llamadas lentas al ERP, para medir qué hace
       // lenta la generación de pólizas — ver `[PolizaTiempos]`.
       const segLlamada = (Date.now() - inicioLlamada) / 1000;
+      _registrarLlamadaErp(logLabel, Date.now() - inicioLlamada);
       if (segLlamada >= 2) {
         const { logger } = require('../../../shared/utils/logger');
         logger.info(`[ErpTiempos] ${logLabel} ${segLlamada.toFixed(1)}s (intento ${intento}) ${params?.centro ? `centro=${params.centro}` : ''}`.trim());
       }
       return resp;
     } catch (axErr) {
+      _registrarLlamadaErp(`${logLabel} (falló)`, Date.now() - inicioLlamada);
       const status    = axErr.response?.status;
       const esTimeout = axErr.code === 'ECONNABORTED' || /timeout/i.test(axErr.message || '');
       const { logger } = require('../../../shared/utils/logger');
@@ -554,6 +572,7 @@ async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) 
   if (cacheado !== undefined) return cacheado;
 
   let nombre = null;
+  const inicioNombre = Date.now();
   try {
     const response = await axios.get(`${await _cuentasPendientesUrl()}/cuentas-pendientes`, {
       params: {
@@ -565,6 +584,7 @@ async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) 
       headers: { Authorization: `Bearer ${await _token()}` },
       timeout: 15000,
     });
+    _registrarLlamadaErp('/cuentas-pendientes (nombre cliente)', Date.now() - inicioNombre);
     const cuenta = (response.data?.Data?.cuentas ?? [])
       .find(c => c.serieExterna === serie && String(c.folioExterno) === String(folio));
     nombre = (cuenta?.nombrePersona ?? '').trim() || null;
@@ -581,4 +601,5 @@ module.exports = {
   sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor, obtenerNombrePersonaTicket,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
   obtenerDesglosesSalidasCajaPorAlmacen,
+  fotoEstadisticasErp,
 };

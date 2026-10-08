@@ -284,6 +284,19 @@ async function _procesarDeposito(unit, nombreArchivo, user) {
 // paralelo; al procesar en orden, el depósito #2 ya ve el erpLink que dejó el #1 (vía el
 // filtro `erpLinks:{$size:0}` de _buscarCandidatosParaReporte). Cada depósito es
 // independiente (un error en uno nunca bloquea a los demás) y la respuesta es SIEMPRE 200.
+// Recordatorio de carga (pedido explícito del usuario, 2026-10-08): avisa EN VIVO a quien
+// tenga Bancos abierto que el reporte del día ya se cargó — sin esto, un contador que ya
+// tiene el recordatorio en pantalla solo se enteraría al recargar la página. Un solo emit por
+// archivo subido (no uno por depósito) — a este evento no le importa cuántos depósitos trajo,
+// solo que "alguien ya cargó hoy".
+function _emitirReporteCargado(nombreArchivo, user) {
+  emitToAll('netpay-reporte:cargado', {
+    cargadoPor: { userId: user?._id ?? null, nombre: user?.nombre || user?.email || null },
+    cargadoEn: new Date(),
+    nombreArchivoOriginal: nombreArchivo ?? null,
+  });
+}
+
 async function cargarReporte(buffer, nombreArchivo, user) {
   let parsed;
   try {
@@ -315,6 +328,7 @@ async function cargarReporte(buffer, nombreArchivo, user) {
     const item = {
       ..._itemBase(unit), estatusCarga: 'creado', reporte: creado.reporte, candidatos: creado.candidatos, reporteId: creado.reporteId,
     };
+    _emitirReporteCargado(nombreArchivo, user);
     return { reporte: creado.reporte, candidatos: creado.candidatos, reportes: [item] };
   }
 
@@ -331,6 +345,7 @@ async function cargarReporte(buffer, nombreArchivo, user) {
     errores: reportes.filter(r => r.estatusCarga === 'error').length,
   };
 
+  _emitirReporteCargado(nombreArchivo, user);
   return { reportes, resumen };
 }
 
@@ -340,7 +355,30 @@ async function cargarReporte(buffer, nombreArchivo, user) {
 // (erp.routes.js, $lte a medianoche), acá $lte se arma a FIN de día: fechaMovimiento es un
 // Date con posible componente de hora real (no un bucket de día ya truncado a medianoche como
 // `dia`), así que cortar a las 00:00:00 excluiría depósitos del propio día de corte.
-async function listar({ estatus, incluirEliminados = false, dateFrom, dateTo } = {}) {
+// Buscador por clave de rastreo o importe (pedido explícito del usuario, 2026-10-08) —
+// mismo criterio de tolerancia por monto ya usado en collection-request.service.js#
+// _buildBusquedaFilter: sin decimales -> ±1 peso; 1 decimal -> ±0.05; 2+ decimales -> ±0.005.
+// Agrupar por archivo (ver frontend) hace que la clave de rastreo sola ya no alcance para
+// ubicar un depósito puntual entre varios del mismo archivo — este buscador es el mecanismo
+// para eso.
+function _buildBusquedaFilter(search) {
+  if (!search) return null;
+  const esc = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re  = new RegExp(esc, 'i');
+  const orClauses = [{ claveRastreo: re }];
+
+  const cleanNum = search.replace(/[$,\s]/g, '');
+  const num = parseFloat(cleanNum);
+  if (!isNaN(num) && num > 0) {
+    const decimalPlaces = (cleanNum.split('.')[1] || '').length;
+    const tolerance = decimalPlaces === 0 ? 1 : decimalPlaces === 1 ? 0.05 : 0.005;
+    orClauses.push({ montoDepositoTotal: { $gte: num - tolerance, $lte: num + tolerance } });
+  }
+
+  return { $or: orClauses };
+}
+
+async function listar({ estatus, incluirEliminados = false, dateFrom, dateTo, search } = {}) {
   const filter = {};
   if (estatus) filter.estatus = estatus;
   if (!incluirEliminados) filter.eliminado = { $ne: true };
@@ -354,8 +392,34 @@ async function listar({ estatus, incluirEliminados = false, dateFrom, dateTo } =
     if (isNaN(hasta.getTime())) throw new BadRequestError(`dateTo inválido: ${dateTo}`);
     filter.fechaMovimiento = { ...(filter.fechaMovimiento ?? {}), $lte: hasta };
   }
+  const busqueda = _buildBusquedaFilter(search);
+  if (busqueda) Object.assign(filter, busqueda);
+
   const reportes = await NetpayReporte.find(filter).sort({ fechaMovimiento: -1 }).lean();
   return { reportes };
+}
+
+// obtenerUltimaCarga — pedido explícito del usuario (2026-10-08): mensaje en el panel de carga
+// con la fecha y la persona de la última vez que se subió un reporte de Netpay, para que quien
+// va a cargar hoy sepa de un vistazo si ya se hizo. cargadoPor/cargadoEn ya se persisten por
+// documento desde _crearYEvaluar/_procesarDeposito (más abajo) — sin campo nuevo, sin
+// migración: un archivo global con N depósitos crea N documentos con el MISMO cargadoPor y
+// cargadoEn a milisegundos de diferencia (mismo loop secuencial), así que el más reciente de
+// CUALQUIERA de ellos identifica correctamente la última carga. No filtra por eliminado: un
+// reporte ocultado sigue habiendo sido "cargado" en ese momento.
+async function obtenerUltimaCarga() {
+  const ultimo = await NetpayReporte.findOne({})
+    .sort({ cargadoEn: -1 })
+    .select('cargadoEn cargadoPor nombreArchivoOriginal')
+    .lean();
+  if (!ultimo) return { ultimaCarga: null };
+  return {
+    ultimaCarga: {
+      cargadoEn: ultimo.cargadoEn,
+      cargadoPor: ultimo.cargadoPor ?? null,
+      nombreArchivoOriginal: ultimo.nombreArchivoOriginal ?? null,
+    },
+  };
 }
 
 async function obtenerDetalle(id) {
@@ -567,10 +631,23 @@ async function evaluarReporte(reporteId) {
   if (candidatos.length === 1) {
     const mov = candidatos[0];
     const erpId = _erpIdReporte(reporte.claveRastreo);
+    // "Identificado por" en Bancos (pedido explícito del usuario, 2026-10-08): el nombre
+    // sintético del motor no le dice nada a nadie en la bandeja — quien debe aparecer ahí es
+    // la persona real que subió el reporte (reporte.cargadoPor). role:'admin' se CONSERVA
+    // a propósito (nunca el rol real del uploader): setErpIds lo usa para el bypass de
+    // permisos de esta escritura interna/automática — si en vez de eso viajara el rol real
+    // del uploader, un rol sin banks:erp:link/banks:cobro rompería el matching automático en
+    // silencio. reporte.confirmadoPor (abajo) NO cambia — sigue documentando que esto lo
+    // resolvió el motor automático, que es un hecho distinto a "quién aparece en Bancos".
+    const usuarioParaIdentificar = {
+      _id: reporte.cargadoPor?.userId ?? USUARIO_MOTOR_REPORTE._id,
+      role: 'admin',
+      nombre: reporte.cargadoPor?.nombre || USUARIO_MOTOR_REPORTE.nombre,
+    };
     const movActualizado = await setErpIds(mov._id, [{
       erpId, origen: 'netpay-reporte',
       saldoPagadoTotal: mov.deposito, saldoPagado: mov.deposito, total: mov.deposito,
-    }], USUARIO_MOTOR_REPORTE, { guardSinVinculos: true });
+    }], usuarioParaIdentificar, { guardSinVinculos: true });
 
     reporte.estatus = 'resuelto_por_reporte';
     reporte.vinculo = 'erp-link';
@@ -863,6 +940,8 @@ async function obtenerReportesPorIds(ids) {
 module.exports = {
   cargarReporte,
   listar,
+  _buildBusquedaFilter,
+  obtenerUltimaCarga,
   obtenerDetalle,
   obtenerPorMovimiento,
   buscarCandidatos,

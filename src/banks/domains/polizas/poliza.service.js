@@ -161,11 +161,10 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
   ).lean());
   for (let i = 0; i < paresSerieFolio.length; i += LOTE) {
     const lote = paresSerieFolio.slice(i, i + LOTE);
-    // Mismo orden que antes del índice de erpLinks — ver `findLeanOrdenNatural`.
-    movs.push(...await BankMovement.findLeanOrdenNatural(
+    movs.push(...await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
       { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1, fecha: 1 },
-    ));
+    ).sort({ _id: 1 }).lean()); // orden de antes del índice de erpLinks — ver BankMovement.model.js
   }
 
   // Cuentas reales de banco (ver BANCO_A_CODIGO_CUENTA) — un solo query para
@@ -334,14 +333,13 @@ async function construirBancoRealPorTicket(movimientos) {
   const LOTE = 150;
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
-    // Mismo orden que antes del índice de erpLinks — ver `findLeanOrdenNatural`.
-    const movs = await BankMovement.findLeanOrdenNatural(
+    const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
       { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1, status: 1 },
       // `desglosePorFormaPago` viene DENTRO de cada `erpLinks[i]` — el `find`
       // de arriba ya trae erpLinks completo (`erpLinks: 1`), así que no hace
       // falta proyectarlo aparte.
-    );
+    ).sort({ _id: 1 }).lean(); // orden de antes del índice de erpLinks — ver BankMovement.model.js
     for (const m of movs) {
       const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[m.banco];
       const cuentaBanco = codigoCuentaBanco ? (cuentaPorCodigo.get(codigoCuentaBanco) ?? null) : null;

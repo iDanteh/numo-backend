@@ -337,21 +337,10 @@ bankMovementSchema.index({ erpIds: 1, isActive: 1 });
 // Búsqueda de depósitos por ticket (`erpLinks.serie` + `erpLinks.folioExterno`)
 // en pólizas — sin índice cada lote de 150 revisaba toda la colección (medido
 // 2026-10-08: 47 s en una póliza de Ingreso de Reforma). folioExterno primero:
-// es el campo selectivo (la serie se repite en miles de movimientos).
+// es el campo selectivo (la serie se repite en miles de movimientos). Las
+// consultas que lo usan ordenan por `_id` para conservar el orden de antes
+// (orden de inserción), que decide desempates entre depósitos del mismo ticket.
 bankMovementSchema.index({ 'erpLinks.folioExterno': 1, 'erpLinks.serie': 1 });
-
-// `find(...).lean()` con el resultado en el MISMO orden que daba la colección
-// sin índice (recorrido natural = orden de `$recordId`). Con el índice de
-// erpLinks Mongo regresaría los documentos en orden de folio, y ese orden
-// decide desempates entre depósitos del mismo ticket en pólizas. `_id` no
-// sirve: en producción 147 de 43,048 movimientos no siguen el orden de `_id`
-// (medido 2026-10-08).
-bankMovementSchema.statics.findLeanOrdenNatural = async function (filtro, proyeccion) {
-  const docs = await this.find(filtro, proyeccion).setOptions({ showRecordId: true }).lean();
-  return docs
-    .sort((a, b) => a.$recordId - b.$recordId)
-    .map(({ $recordId, ...doc }) => doc);
-};
 
 // Índice de texto para el buscador
 bankMovementSchema.index({

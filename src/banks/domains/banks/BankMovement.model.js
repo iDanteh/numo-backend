@@ -334,13 +334,6 @@ bankMovementSchema.index({ status: 1, primeraIdentificacionAt: 1 });
 // (tiempo y backlog) ahora filtran status + createdAt >= INDICADORES_DESDE.
 bankMovementSchema.index({ status: 1, createdAt: 1 });
 bankMovementSchema.index({ erpIds: 1, isActive: 1 });
-// Búsqueda de depósitos por ticket (`erpLinks.serie` + `erpLinks.folioExterno`)
-// en pólizas — sin índice cada lote de 150 revisaba toda la colección (medido
-// 2026-10-08: 47 s en una póliza de Ingreso de Reforma). folioExterno primero:
-// es el campo selectivo (la serie se repite en miles de movimientos). Las
-// consultas que lo usan ordenan por `_id` para conservar el orden de antes
-// (orden de inserción), que decide desempates entre depósitos del mismo ticket.
-bankMovementSchema.index({ 'erpLinks.folioExterno': 1, 'erpLinks.serie': 1 });
 
 // Índice de texto para el buscador
 bankMovementSchema.index({

@@ -1076,11 +1076,9 @@ async function construirMovimientosPuente({
     const orCondiciones = docsUnicos.map(d => ({ 'erpLinks.serie': d.serie, 'erpLinks.folioExterno': d.folio }));
     for (let i = 0; i < orCondiciones.length; i += LOTE) {
       const lote = orCondiciones.slice(i, i + LOTE);
-      // `.sort({ _id: 1 })`: mismo orden que antes del índice de erpLinks
-      // (orden de inserción) — ver BankMovement.model.js.
       const movsBanco = await BankMovement.find({ $or: lote }, {
         banco: 1, folio: 1, erpLinks: 1, deposito: 1, fecha: 1,
-      }).sort({ _id: 1 }).lean();
+      }).lean();
       for (const mb of movsBanco) {
         // `folio` (el auto-incremental propio de Numo, ej. "034287") — NO
         // `numeroAutorizacion`/`referenciaNumerica` (esos son del banco, no

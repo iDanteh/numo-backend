@@ -94,6 +94,7 @@ jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpa
 jest.mock('./netpay-reporte.service', () => ({
   cargarReporte:                    jest.fn(),
   listar:                           jest.fn(),
+  obtenerUltimaCarga:               jest.fn(),
   obtenerDetalle:                   jest.fn(),
   obtenerPorMovimiento:             jest.fn(),
   buscarCandidatos:                 jest.fn(),
@@ -140,7 +141,8 @@ const { descartarManual }  = require('./caja-transferencia-descartar-manual.serv
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const {
-  cargarReporte, listar: listarNetpayReportes, obtenerDetalle: obtenerDetalleNetpayReporte,
+  cargarReporte, listar: listarNetpayReportes, obtenerUltimaCarga: obtenerUltimaCargaNetpayReporte,
+  obtenerDetalle: obtenerDetalleNetpayReporte,
   obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
   buscarCandidatos: buscarCandidatosNetpayReporte,
   evaluarReporte, resolverReporte, rechazarReporte, eliminarReporte, restaurarReporte,
@@ -2191,6 +2193,20 @@ describe('GET /netpay/reporte', () => {
     );
   });
 
+  // search (pedido explícito del usuario, 2026-10-08): clave de rastreo o importe — la
+  // lógica del filtro en sí se cubre en netpay-reporte.service.test.js, acá solo el cableado HTTP.
+  test('pasa search al service', async () => {
+    listarNetpayReportes.mockResolvedValue({ reportes: [] });
+
+    const res = await request(app)
+      .get('/netpay/reporte')
+      .query({ search: 'A0-123' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(listarNetpayReportes).toHaveBeenCalledWith(expect.objectContaining({ search: 'A0-123' }));
+  });
+
   // propaga el BadRequestError que listar() lanza ante una fecha inválida (asyncHandler ->
   // error-handler.js lo mapea a 400).
   test('dateFrom inválido: propaga 400 del service', async () => {
@@ -2321,6 +2337,49 @@ describe('GET /netpay/comisiones', () => {
 
     const res = await request(app)
       .get('/netpay/comisiones')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(resultado);
+  });
+});
+
+// GET /netpay/reporte/ultima-carga — pedido explícito del usuario (2026-10-08): fecha y
+// persona de la última carga, para el mensaje del panel. DEBE registrarse ANTES de
+// GET /netpay/reporte/:id (mismo motivo que /export-lote más arriba) — este describe existe
+// específicamente para blindar ese orden contra una reordenación futura.
+describe('GET /netpay/reporte/ultima-carga', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
+  });
+
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app).get('/netpay/reporte/ultima-carga').set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(obtenerUltimaCargaNetpayReporte).not.toHaveBeenCalled();
+  });
+
+  test('NO se interpreta como GET /netpay/reporte/:id — nunca llama a obtenerDetalle', async () => {
+    obtenerUltimaCargaNetpayReporte.mockResolvedValue({ ultimaCarga: null });
+
+    await request(app).get('/netpay/reporte/ultima-carga').set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(obtenerDetalleNetpayReporte).not.toHaveBeenCalled();
+  });
+
+  test('devuelve el resultado del service tal cual', async () => {
+    const resultado = {
+      ultimaCarga: { cargadoEn: '2026-10-08T15:04:52.999Z', cargadoPor: { userId: 'u1', nombre: 'jesuscruz' }, nombreArchivoOriginal: 'archivo.xlsx' },
+    };
+    obtenerUltimaCargaNetpayReporte.mockResolvedValue(resultado);
+
+    const res = await request(app)
+      .get('/netpay/reporte/ultima-carga')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(200);

@@ -1058,6 +1058,26 @@ async function identificar(id, body, user) {
         // Kore por consola — este log adicional deja explícito con qué
         // solicitud/CxC se relaciona ese rechazo, para no tener que cruzar logs.
         console.warn(`[collection-requests] identificar ${id}: Kore rechazó el cobro (cxcs=${cr.cxcs.map(c => c.erpId).join(',')}, conceptoId=${cr.conceptoId}):`, err.message, err.koreBody ? JSON.stringify(err.koreBody) : '');
+        // 2026-10-07 — Caso real: Kore dice "forma de pago del anticipo" aunque
+        // formasPago de Numo no tenga ningún anticipo. Causa confirmada: el cajero
+        // registró la solicitud en Kore incluyendo una forma de pago extra (anticipo
+        // u otra) que NO quedó en el registro de Numo — hay un mismatch. Kore no
+        // expone GET para leer las formasPago de una solicitud-operacion (todos los
+        // endpoints probados devuelven 403/500/vacío), por lo que este guard reactivo
+        // es la única defensa posible desde Numo hasta que Kore exponga ese GET.
+        // El mensaje le dice al usuario exactamente qué hacer sin tener que leer el
+        // error crudo de Kore ni escalar a soporte técnico.
+        const esMismatchAnticipo = /cat.logo de anticipos|forma de pago del anticipo|forma de pago identificable/i.test(err.message);
+        if (esMismatchAnticipo) {
+          throw new BadRequestError(
+            'Kore rechazó el cobro porque la solicitud contiene una forma de pago (probablemente un anticipo) ' +
+            'que no está registrada en Numo. Esto ocurre cuando el cajero incluyó formas de pago extra al crear ' +
+            'la solicitud en Kore que no se reflejaron aquí. ' +
+            'Solución: el cajero debe cancelar la solicitud en Kore y recrearla usando SOLO las formas de pago ' +
+            `que coincidan con este registro (${cr.formasPago.map(f => f.formaPagoDescripcion).join(', ')}), ` +
+            'luego actualizar el solicitudIdErp en Numo.',
+          );
+        }
         throw new BadRequestError(`Kore rechazó el cobro: ${err.message}`);
       }
       // Error de RED (sin respuesta HTTP: timeout, ECONNRESET, DNS, etc. — ver

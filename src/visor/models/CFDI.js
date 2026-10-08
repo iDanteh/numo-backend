@@ -304,6 +304,13 @@ cfdiSchema.index({ source: 1, satStatus: 1 });
 cfdiSchema.index({ tipoDeComprobante: 1, fecha: -1 });
 cfdiSchema.index({ total: 1, 'emisor.rfc': 1 });
 
+// Búsqueda de CFDIs que relacionan a otro (NC/sustituto de una factura) —
+// `_cfdisCanceladasSinCompensar` y la fusión de NC en pólizas filtran por
+// `cfdiRelacionados.uuid`/`.uuids` con `$or`; sin estos índices Mongo revisaba
+// todos los CFDIs del RFC (medido 2026-10-08: ~15 s por póliza de Ingreso).
+cfdiSchema.index({ 'cfdiRelacionados.uuid': 1 });
+cfdiSchema.index({ 'cfdiRelacionados.uuids': 1 });
+
 // Índice para deduplicación de facturas ERP sin UUID (serie+folio+emisor.rfc+total)
 cfdiSchema.index({ serie: 1, folio: 1, 'emisor.rfc': 1, total: 1, source: 1 });
 

@@ -15,6 +15,10 @@ const { generarSugerencias: generarSugerenciasConciliacion } = require('../servi
 const DASHBOARD_CACHE_TTL_MS = 30_000;
 const dashboardCache = new Map(); // key → { data, expiresAt }
 
+// Tipos de comprobante que cuenta la tabla "Tipos de discrepancia" del
+// dashboard: Ingresos, Egresos y Pagos (sin Nómina ni Traslados).
+const TIPOS_DISCREPANCIA_DASHBOARD = ['I', 'E', 'P'];
+
 // El ERP sí manda `fecha` por movimiento del kardex — antes se perdía porque
 // `movimientoSchema` (ErpCuentaPendiente.model.js) no la declaraba y Mongoose
 // la recortaba silenciosamente al guardar. Ya está corregida ahí; de aquí en
@@ -642,6 +646,21 @@ async function computeDashboardData(query) {
     ]),
   ]);
 
+  // Tabla "Tipos de discrepancia" del dashboard con filtro por tipo de
+  // comprobante (2026-10-08, pedido del usuario): solo Ingresos, Egresos y
+  // Pagos — sin Nómina ni Traslados. Aparte de `topDiscrepancyTypes`, que
+  // sigue igual porque también lo usa el reporte de Cierre de Mes.
+  const discrepancyTypesPorTipo = await Discrepancy.aggregate([
+    { $match: {
+      status: 'open',
+      tipoDeComprobante: { $in: TIPOS_DISCREPANCIA_DASHBOARD },
+      ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }),
+      ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }),
+    } },
+    { $group: { _id: { type: '$type', tipoDeComprobante: '$tipoDeComprobante' }, count: { $sum: 1 } } },
+    { $project: { _id: 0, type: '$_id.type', tipoDeComprobante: '$_id.tipoDeComprobante', count: 1 } },
+  ]);
+
   const vigenteErpSatRow = vigenteErpSatCount[0] ?? { count: 0, total: 0 };
   const erpRow = montosAggregate.find(m => m._id === 'ERP') ?? { total: 0, count: 0, totalCancelados: 0, countCancelados: 0 };
   const satRow = montosAggregate.find(m => m._id === 'SAT') ?? { total: 0, count: 0, totalCancelados: 0, countCancelados: 0 };
@@ -717,6 +736,7 @@ async function computeDashboardData(query) {
       ivaStats,
     },
     topDiscrepancyTypes,
+    discrepancyTypesPorTipo,
     recentDiscrepancies,
   };
 

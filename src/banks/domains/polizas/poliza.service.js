@@ -161,11 +161,13 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
   ).lean());
   for (let i = 0; i < paresSerieFolio.length; i += LOTE) {
     const lote = paresSerieFolio.slice(i, i + LOTE);
-    // Mismo orden que antes del índice de erpLinks — ver `findLeanOrdenNatural`.
-    movs.push(...await BankMovement.findLeanOrdenNatural(
+    // `hint($natural)`: esta consulta (export/Cobranza) NO usa el índice de
+    // erpLinks — mismo recorrido, resultado y orden que antes de crearlo
+    // (decisión del usuario 2026-10-08: no tocar Cobranza). Ver BankMovement.model.js.
+    movs.push(...await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
       { erpLinks: 1, categoria: 1, folio: 1, banco: 1, numeroAutorizacion: 1, deposito: 1, fecha: 1 },
-    ));
+    ).hint({ $natural: 1 }).lean());
   }
 
   // Cuentas reales de banco (ver BANCO_A_CODIGO_CUENTA) — un solo query para
@@ -334,14 +336,15 @@ async function construirBancoRealPorTicket(movimientos) {
   const LOTE = 150;
   for (let i = 0; i < pares.length; i += LOTE) {
     const lote = pares.slice(i, i + LOTE);
-    // Mismo orden que antes del índice de erpLinks — ver `findLeanOrdenNatural`.
-    const movs = await BankMovement.findLeanOrdenNatural(
+    // `hint($natural)`: sin el índice de erpLinks, igual que antes — ver
+    // comentario equivalente en `construirVerdadBancaria`.
+    const movs = await BankMovement.find(
       { $or: lote.map(p => ({ 'erpLinks.serie': p.serie, 'erpLinks.folioExterno': p.folio })) },
       { erpLinks: 1, banco: 1, categoria: 1, folio: 1, numeroAutorizacion: 1, referenciaNumerica: 1, deposito: 1, status: 1 },
       // `desglosePorFormaPago` viene DENTRO de cada `erpLinks[i]` — el `find`
       // de arriba ya trae erpLinks completo (`erpLinks: 1`), así que no hace
       // falta proyectarlo aparte.
-    );
+    ).hint({ $natural: 1 }).lean();
     for (const m of movs) {
       const codigoCuentaBanco = BANCO_A_CODIGO_CUENTA[m.banco];
       const cuentaBanco = codigoCuentaBanco ? (cuentaPorCodigo.get(codigoCuentaBanco) ?? null) : null;

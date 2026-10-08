@@ -226,7 +226,7 @@ async function buscarNotasCreditoPorFacturasBatch(facturaUuids) {
   const docs = await CFDI.find(
     { tipoDeComprobante: 'E', isActive: true, satStatus: 'Vigente', 'cfdiRelacionados.uuids': { $in: uuidsUnicos } },
     'uuid source cfdiRelacionados documentosRelacionados total',
-  ).lean();
+  ).hint({ $natural: 1 }).lean(); // sin el índice de cfdiRelacionados: mismo resultado y orden que antes (ver CFDI.js)
 
   // Preferir la copia ERP si hay duplicado del mismo UUID (mismo criterio que
   // buscarEgresosRelacionados: la copia ERP trae documentosRelacionados).
@@ -268,7 +268,7 @@ async function buscarEgresosRelacionados(facturaUuid) {
   const docs = await CFDI.find(
     { tipoDeComprobante: 'E', isActive: true, 'cfdiRelacionados.uuids': facturaUuid },
     'uuid satStatus source serie folio fecha total documentosRelacionados',
-  ).lean();
+  ).hint({ $natural: 1 }).lean(); // sin el índice de cfdiRelacionados: mismo resultado y orden que antes (ver CFDI.js)
 
   // Puede haber copia SAT y ERP del mismo UUID; se prefiere la de ERP porque
   // trae documentosRelacionados (necesario para clasificar y para cxcRef).

@@ -18,6 +18,11 @@ const dashboardCache = new Map(); // key → { data, expiresAt }
 // Tipos de comprobante que cuenta la tabla "Tipos de discrepancia" del
 // dashboard: Ingresos, Egresos y Pagos (sin Nómina ni Traslados).
 const TIPOS_DISCREPANCIA_DASHBOARD = ['I', 'E', 'P'];
+// Tipos que la pantalla del dashboard no cuenta cuando no se elige un tipo
+// (2026-10-08, pedido del usuario): Nómina y Traslados. Los traslados nunca
+// existen en el ERP y salían como miles de "en SAT sin ERP" sin ser un
+// problema real.
+const TIPOS_FUERA_DASHBOARD = ['N', 'T'];
 
 // El ERP sí manda `fecha` por movimiento del kardex — antes se perdía porque
 // `movimientoSchema` (ErpCuentaPendiente.model.js) no la declaraba y Mongoose
@@ -460,7 +465,7 @@ const MONTO_EFECTIVO_EXPR = {
  * desde el endpoint /dashboard (con caché) como desde el reporte de Cierre
  * de Mes (sin caché, siempre datos frescos al momento del cierre).
  */
-async function computeDashboardData(query) {
+async function computeDashboardData(query, { excluirTraslados = false } = {}) {
   const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = query;
 
   // El dashboard solo debe contar Emitidos — nunca Recibidos (aunque compartan
@@ -489,7 +494,10 @@ async function computeDashboardData(query) {
   if (ejercicio)         periodoFilter.ejercicio         = parseInt(ejercicio);
   if (periodo)           periodoFilter.periodo           = parseInt(periodo);
   if (tipoDeComprobante) periodoFilter.tipoDeComprobante = tipoDeComprobante;
-  else                   periodoFilter.tipoDeComprobante = { $ne: 'N' }; // nómina no suma en "todos los tipos"
+  // Nómina no suma en "todos los tipos"; la pantalla del dashboard tampoco
+  // cuenta Traslados (`excluirTraslados`). El reporte de Cierre de Mes llama
+  // sin la opción y conserva el criterio anterior (solo sin Nómina).
+  else                   periodoFilter.tipoDeComprobante = excluirTraslados ? { $nin: TIPOS_FUERA_DASHBOARD } : { $ne: 'N' };
 
   // Filtro base para KPIs de conciliación (solo ERP activos, sin cancelados ni deshabilitados)
   // Debe coincidir con los mismos criterios que countERP del aggregate de montos.
@@ -748,7 +756,7 @@ const dashboard = asyncHandler(async (req, res) => {
   const cached = getFromCache(cacheKey);
   if (cached) return res.json(cached);
 
-  const responseData = await computeDashboardData(req.query);
+  const responseData = await computeDashboardData(req.query, { excluirTraslados: true });
 
   setCache(cacheKey, responseData);
   res.json(responseData);
@@ -1137,6 +1145,8 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   if (ejercicio)         { cfdiErp.ejercicio = parseInt(ejercicio); cfdiSat.ejercicio = parseInt(ejercicio); }
   if (periodo)           { cfdiErp.periodo   = parseInt(periodo);   cfdiSat.periodo   = parseInt(periodo);   }
   if (tipoDeComprobante) { cfdiErp.tipoDeComprobante = tipoDeComprobante; cfdiSat.tipoDeComprobante = tipoDeComprobante; }
+  // Sin tipo elegido: sin Nómina ni Traslados, igual que el resto del dashboard.
+  else { cfdiErp.tipoDeComprobante = { $nin: TIPOS_FUERA_DASHBOARD }; cfdiSat.tipoDeComprobante = { $nin: TIPOS_FUERA_DASHBOARD }; }
 
   const cfdiSel    = 'uuid serie folio fecha total tipoDeComprobante emisor receptor erpStatus satStatus';
   const cfdiSelSat = 'uuid serie folio fecha total tipoDeComprobante emisor receptor satStatus';
@@ -1150,10 +1160,17 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
     { $sort: { comparedAt: -1 } },
     { $group: { _id: '$uuid', doc: { $first: '$$ROOT' } } },
     { $replaceRoot: { newRoot: '$doc' } },
-    { $match: { $or: [
-      { criticalCount: { $gt: 0 } },
-      { status: { $in: ['discrepancy', 'not_in_sat', 'cancelled'] } },
-    ]}},
+    { $match: {
+      // "En SAT, no en ERP" sale SOLO de la colección CFDI (`lastComparisonStatus`,
+      // consulta de abajo) — las Comparison con ese status pueden ser históricas
+      // (el CFDI ya se emparejó después) y además inflaban el conteo de la
+      // tarjeta (2026-10-08: julio 2,694 contra 478 reales).
+      status: { $ne: 'not_in_erp' },
+      $or: [
+        { criticalCount: { $gt: 0 } },
+        { status: { $in: ['discrepancy', 'not_in_sat', 'cancelled'] } },
+      ],
+    }},
     { $sort:  { criticalCount: -1, comparedAt: -1 } },
     { $lookup: { from: 'cfdis', localField: 'erpCfdiId', foreignField: '_id', as: 'erpCfdiId', pipeline: [{ $project: erpProjection }] } },
     { $unwind: { path: '$erpCfdiId', preserveNullAndEmptyArrays: true } },
@@ -1167,12 +1184,27 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
     ...(tipoDeComprobante ? [{ $match: { 'erpCfdiId.tipoDeComprobante': tipoDeComprobante } }] : []),
     { $lookup: { from: 'cfdis', localField: 'satCfdiId', foreignField: '_id', as: 'satCfdiId', pipeline: [{ $project: satProjection }] } },
     { $unwind: { path: '$satCfdiId', preserveNullAndEmptyArrays: true } },
+    // Sin tipo elegido: fuera Nómina y Traslados. Tipo del CFDI ERP; si no hay,
+    // el del SAT; si la Comparison no trae ninguno de los dos ligados (las que
+    // crea la descarga del SAT en bulk no guardan erpCfdiId/satCfdiId), el del
+    // CFDI con su mismo uuid.
+    ...(tipoDeComprobante ? [] : [
+      { $lookup: { from: 'cfdis', localField: 'uuid', foreignField: 'uuid', as: '_tipoPorUuid', pipeline: [{ $project: { _id: 0, tipoDeComprobante: 1 } }, { $limit: 1 }] } },
+      { $match: { $nor: [
+        { 'erpCfdiId.tipoDeComprobante': { $in: TIPOS_FUERA_DASHBOARD } },
+        { 'erpCfdiId.tipoDeComprobante': { $exists: false }, 'satCfdiId.tipoDeComprobante': { $in: TIPOS_FUERA_DASHBOARD } },
+        { 'erpCfdiId.tipoDeComprobante': { $exists: false }, 'satCfdiId.tipoDeComprobante': { $exists: false }, '_tipoPorUuid.tipoDeComprobante': { $in: TIPOS_FUERA_DASHBOARD } },
+      ] } },
+      { $project: { _tipoPorUuid: 0 } },
+    ]),
     { $limit: lm },
   ];
 
   // Casos adicionales leídos directo de CFDI (no dependen de Comparison.ejercicio/periodo)
-  const [compItems, notInErpCfdis, satCanceladoErpActivo, erpNotInSat, erpDeshabilitadosCfdis, erpCanceladosCfdis] = await Promise.all([
-    Comparison.aggregate(pipeline),
+  // Una sola corrida sin tope: la lista usa los primeros `lm` y los conteos
+  // reales de abajo usan todas (antes se cortaba en `lm` y se contaba lo cortado).
+  const [compTodosDocs, notInErpCfdis, satCanceladoErpActivo, erpNotInSat, erpDeshabilitadosCfdis, erpCanceladosCfdis] = await Promise.all([
+    Comparison.aggregate(pipeline.slice(0, -1)),
     CFDI.find({ ...cfdiSat, lastComparisonStatus: 'not_in_erp' }).select(cfdiSelSat).sort({ total: -1 }).limit(lm).lean(),
     CFDI.find({ ...cfdiErp, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } }).select(cfdiSel).sort({ total: -1 }).limit(lm).lean(),
     CFDI.find({ ...cfdiErp, erpStatus: { $nin: ['Cancelado', 'Cancelacion Pendiente', 'Deshabilitado'] }, lastComparisonStatus: 'not_in_sat' }).select(cfdiSel).sort({ total: -1 }).limit(lm).lean(),
@@ -1181,6 +1213,7 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   ]);
 
   // UUIDs ya cubiertos por el pipeline para no duplicar
+  const compItems = compTodosDocs.slice(0, lm);
   const compUuids = new Set(compItems.map(c => (c.uuid || '').toUpperCase()));
 
   const notInErpItems = notInErpCfdis
@@ -1231,12 +1264,30 @@ const discrepanciasCriticas = asyncHandler(async (req, res) => {
   const items           = allItems.filter(i => i.status !== 'cancelled');
   const deshabilitados  = deshabilitadosItems;
 
-  const porStatus = [...allItems, ...deshabilitados].reduce((acc, c) => {
-    acc[c.status] = (acc[c.status] || 0) + 1;
-    return acc;
-  }, {});
+  // Conteos REALES para la tarjeta del dashboard (2026-10-08): antes `total` y
+  // `porStatus` se sacaban de las listas de arriba, que se cortan en `limit`
+  // (500) cada una — el total salía menor que una sola de sus partes (ej. 782
+  // contra 1,904 "en SAT sin ERP"). Mismas consultas y misma regla de
+  // duplicados, pero solo con el uuid y sin tope.
+  const compTodos = compTodosDocs;
+  const [notInErpTodos, satCanceladoTodos, notInSatTodos, deshabilitadosTodos] = await Promise.all([
+    CFDI.find({ ...cfdiSat, lastComparisonStatus: 'not_in_erp' }).select('uuid').lean(),
+    CFDI.find({ ...cfdiErp, satStatus: 'Cancelado', erpStatus: { $nin: ['Cancelado', 'Deshabilitado', 'Cancelacion Pendiente'] } }).select('uuid').lean(),
+    CFDI.find({ ...cfdiErp, erpStatus: { $nin: ['Cancelado', 'Cancelacion Pendiente', 'Deshabilitado'] }, lastComparisonStatus: 'not_in_sat' }).select('uuid').lean(),
+    CFDI.find({ ...cfdiErp, erpStatus: 'Deshabilitado' }).select('uuid').lean(),
+  ]);
+  const compUuidsTodos = new Set(compTodos.map(c => (c.uuid || '').toUpperCase()));
+  const fueraDeComp = (arr) => arr.filter(c => !compUuidsTodos.has((c.uuid || '').toUpperCase())).length;
+  const porStatus = {};
+  for (const c of compTodos) porStatus[c.status] = (porStatus[c.status] || 0) + 1;
+  const sumar = (status, n) => { if (n > 0) porStatus[status] = (porStatus[status] || 0) + n; };
+  sumar('not_in_erp',    fueraDeComp(notInErpTodos));
+  sumar('sat_cancelado', fueraDeComp(satCanceladoTodos));
+  sumar('not_in_sat',    fueraDeComp(notInSatTodos));
+  sumar('deshabilitado', fueraDeComp(deshabilitadosTodos));
+  const total = Object.values(porStatus).reduce((s, n) => s + n, 0);
 
-  res.json({ items, cancelados, deshabilitados, total: allItems.length + deshabilitados.length, porStatus });
+  res.json({ items, cancelados, deshabilitados, total, porStatus });
 });
 
 /**

@@ -49,7 +49,8 @@ const {
   resolver: resolverNetpayMatch, rechazar: rechazarNetpayMatch, candidatos: candidatosNetpayMatch,
 }                                          = require('./netpay-resolver.service');
 const {
-  cargarReporte, listar: listarNetpayReportes, obtenerDetalle: obtenerDetalleNetpayReporte,
+  cargarReporte, listar: listarNetpayReportes, obtenerUltimaCarga: obtenerUltimaCargaNetpayReporte,
+  obtenerDetalle: obtenerDetalleNetpayReporte,
   obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
   buscarCandidatos: buscarCandidatosNetpayReporte,
   evaluarReporte, resolverReporte, rechazarReporte, eliminarReporte, restaurarReporte,
@@ -611,10 +612,13 @@ router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NET
 // dateFrom/dateTo (pedido explícito del usuario, 2026-10-07): filtro de rango sobre
 // fechaMovimiento, para no tener que scrollear toda la lista buscando un depósito de una
 // fecha puntual (ver netpay-reporte.service.js#listar).
+// search (pedido explícito del usuario, 2026-10-08): clave de rastreo o importe — necesario
+// una vez que la lista se agrupa por archivo cargado en el frontend (ver
+// netpay-reporte.service.js#_buildBusquedaFilter para el criterio de tolerancia por monto).
 router.get('/netpay/reporte', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
-  const { estatus, incluirEliminados, dateFrom, dateTo } = req.query;
+  const { estatus, incluirEliminados, dateFrom, dateTo, search } = req.query;
   const resultado = await listarNetpayReportes({
-    estatus, incluirEliminados: incluirEliminados === 'true', dateFrom, dateTo,
+    estatus, incluirEliminados: incluirEliminados === 'true', dateFrom, dateTo, search,
   });
   res.json(resultado);
 }));
@@ -666,6 +670,15 @@ router.get('/netpay/reporte/export-lote', authenticate, permit(PERMISSIONS.BANKS
   res.setHeader('X-Netpay-Export-Ids-No-Encontrados', String(idsNoEncontrados.length));
   res.setHeader('Access-Control-Expose-Headers', 'X-Netpay-Export-Incompleto, X-Netpay-Export-Ids-No-Encontrados');
   res.send(buffer);
+}));
+
+// GET /api/erp/netpay/reporte/ultima-carga — pedido explícito del usuario (2026-10-08): fecha
+// y persona de la última vez que se subió un reporte de Netpay, para el mensaje del panel de
+// carga. DEBE registrarse ANTES de GET /netpay/reporte/:id (mismo motivo que /export-lote más
+// arriba) — si no, Express matchearía "ultima-carga" como si fuera un :id.
+router.get('/netpay/reporte/ultima-carga', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const resultado = await obtenerUltimaCargaNetpayReporte();
+  res.json(resultado);
 }));
 
 router.get('/netpay/reporte/:id', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {

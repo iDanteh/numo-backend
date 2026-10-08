@@ -1059,23 +1059,32 @@ async function identificar(id, body, user) {
         // solicitud/CxC se relaciona ese rechazo, para no tener que cruzar logs.
         console.warn(`[collection-requests] identificar ${id}: Kore rechazó el cobro (cxcs=${cr.cxcs.map(c => c.erpId).join(',')}, conceptoId=${cr.conceptoId}):`, err.message, err.koreBody ? JSON.stringify(err.koreBody) : '');
         // 2026-10-07 — Caso real: Kore dice "forma de pago del anticipo" aunque
-        // formasPago de Numo no tenga ningún anticipo. Causa confirmada: el cajero
-        // registró la solicitud en Kore incluyendo una forma de pago extra (anticipo
-        // u otra) que NO quedó en el registro de Numo — hay un mismatch. Kore no
-        // expone GET para leer las formasPago de una solicitud-operacion (todos los
-        // endpoints probados devuelven 403/500/vacío), por lo que este guard reactivo
-        // es la única defensa posible desde Numo hasta que Kore exponga ese GET.
-        // El mensaje le dice al usuario exactamente qué hacer sin tener que leer el
-        // error crudo de Kore ni escalar a soporte técnico.
+        // formasPago de Numo no tenga ningún anticipo. Causa confirmada: el webhook
+        // con el que Kore crea la solicitud en Numo (create(), más arriba) no incluyó
+        // una forma de pago extra (anticipo) que el cajero sí tiene registrada del
+        // lado de Kore — gap en la integración de Kore hacia Numo, no en el parseo de
+        // Numo (parseFormasPago/saldosAplicados sí sabe representar un anticipo si
+        // Kore lo manda). Kore no expone GET para leer las formasPago de una
+        // solicitud-operacion (todos los endpoints probados devuelven 403/500/vacío),
+        // por lo que este guard reactivo es la única defensa posible desde Numo hasta
+        // que Kore exponga ese GET.
+        // 2026-10-08 — CONFIRMADO contra un caso real: para cuando este error ocurre,
+        // Kore YA aceptó el aviso APROBADO (paso anterior) y NO ofrece ninguna forma
+        // de revertirlo desde su API — ni reintentando Identificar, ni con Rechazar
+        // (ver rama estatusReal==='APROBADO' en rechazar(), abajo). La única vía que
+        // desatascó el caso real fue una corrección manual directa en la base de
+        // datos de Kore, hecha por quien la administra. "Cancelar y recrear desde la
+        // caja" (mensaje anterior de este guard) es FALSO — no es una opción una vez
+        // que se llega a este punto.
         const esMismatchAnticipo = /cat.logo de anticipos|forma de pago del anticipo|forma de pago identificable/i.test(err.message);
         if (esMismatchAnticipo) {
           throw new BadRequestError(
-            'Kore rechazó el cobro porque la solicitud contiene una forma de pago (probablemente un anticipo) ' +
-            'que no está registrada en Numo. Esto ocurre cuando el cajero incluyó formas de pago extra al crear ' +
-            'la solicitud en Kore que no se reflejaron aquí. ' +
-            'Solución: el cajero debe cancelar la solicitud en Kore y recrearla usando SOLO las formas de pago ' +
-            `que coincidan con este registro (${cr.formasPago.map(f => f.formaPagoDescripcion).join(', ')}), ` +
-            'luego actualizar el solicitudIdErp en Numo.',
+            'Kore rechazó el cobro porque la solicitud tiene registrada una forma de pago (probablemente un ' +
+            `anticipo) que nunca llegó al registro de Numo (formasPago en Numo: ${cr.formasPago.map(f => f.formaPagoDescripcion).join(', ')}). ` +
+            'IMPORTANTE: Kore ya marcó esta solicitud como APROBADO y no permite revertir ese estatus desde la ' +
+            'API — reintentar "Identificar" no va a funcionar, y "Rechazar" tampoco mientras siga en APROBADO. ' +
+            'Hay que escalar con quien administra la base de datos de Kore: es la única vía confirmada para ' +
+            'desbloquear este tipo de caso.',
           );
         }
         throw new BadRequestError(`Kore rechazó el cobro: ${err.message}`);
@@ -1232,6 +1241,21 @@ async function rechazar(id, motivo, user) {
       throw new BadRequestError(
         'Esta solicitud ya fue aplicada en Kore (el cobro real ya se realizó) — no se puede rechazar. ' +
         'Usá "Identificar" para vincular el movimiento bancario correspondiente y reflejarlo en Numo.',
+      );
+    } else if (estatusReal === 'APROBADO') {
+      // 2026-10-08 — Caso real: identificar() avisó APROBADO pero después falló al
+      // aplicar el cobro (ej. forma de pago/anticipo que Kore tiene registrada y
+      // Numo no, ver guard esMismatchAnticipo en identificar()) — la solicitud queda
+      // atascada en APROBADO. Confirmado contra Kore real: ni este endpoint ni la
+      // caja del propio cajero ofrecen ninguna forma de revertir un APROBADO. La
+      // única vía que desatascó un caso real fue una corrección manual directa en
+      // la base de datos de Kore, hecha por quien la administra — no hay ninguna
+      // acción que Numo pueda tomar de este lado.
+      throw new BadRequestError(
+        'Esta solicitud quedó en estatus APROBADO en Kore (el aviso de revisión contable se confirmó, pero el ' +
+        'cobro nunca llegó a aplicarse) y Kore no permite revertir ese estatus desde la API — ni "Identificar" ' +
+        'ni "Rechazar" van a funcionar mientras siga así. Hay que escalar con quien administra la base de ' +
+        'datos de Kore para que corrija el estatus manualmente antes de poder continuar.',
       );
     } else if (err instanceof koreCaja.KoreCajaError) {
       throw new BadRequestError(`No se pudo notificar el estatus a Kore: ${err.message}`);

@@ -17,8 +17,19 @@
 
 const NetpayReporte = require('./NetpayReporte.model');
 
+// BUG REAL encontrado 2026-10-08 contra un documento de producción real: comisionBasePct se
+// persiste como FRACCIÓN (0.0075 = 0.75%, ver netpay-reporte-parser.service.js — ExcelJS
+// devuelve el valor crudo de una celda con formato de porcentaje, no el número ya multiplicado
+// por 100), no como número de porcentaje (2.36). El redondeo anterior (Math.round(pct*100)/100)
+// asumía lo segundo y redondeaba al PUNTO PORCENTUAL ENTERO más cercano — con tasas reales en el
+// rango 0.5%-3% (0.005-0.03 en fracción), eso colapsaba tasas genuinamente distintas (ej. 0.75%
+// y 1.25%, que SON dos comisiones diferentes) en el mismo bucket "0.01", escondiendo variaciones
+// reales en vez de detectarlas (que es el propósito completo de esta función). Redondear a 4
+// decimales de la fracción equivale a redondear a 2 decimales del porcentaje (0.0075 -> 0.0075,
+// preserva 0.75%) y sigue absorbiendo el drift de precisión de parseFloat que esto existía para
+// resolver (ej. 0.0159 vs 0.015900000000000001 -> ambos 0.0159).
 function _redondear(pct) {
-  return Math.round(pct * 100) / 100;
+  return Math.round(pct * 10000) / 10000;
 }
 
 async function obtenerVariacionComisiones() {

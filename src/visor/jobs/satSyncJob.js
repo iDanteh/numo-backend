@@ -1483,6 +1483,15 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
  * registros queden vinculados al periodo fiscal correcto (seleccionado por el
  * usuario o derivado de la fecha del job automático).
  */
+// Tipo de comprobante del CFDI para guardarlo en su Discrepancy (2026-10-08):
+// antes no se guardaba y el dashboard no podía separar Ingresos/Egresos/Pagos
+// de Nómina y Traslados. Solo letras válidas del enum del modelo.
+const TIPOS_DISCREPANCIA_VALIDOS = ['I', 'E', 'T', 'N', 'P'];
+const tipoParaDiscrepancia = (cfdi) => {
+  const t = String(cfdi?.tipoDeComprobante || cfdi?.tipoComprobante || '').trim().toUpperCase();
+  return TIPOS_DISCREPANCIA_VALIDOS.includes(t) ? { tipoDeComprobante: t } : {};
+};
+
 const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid = [], ejercicio, periodo }) => {
   const ahora = new Date();
   const fp    = { ejercicio, periodo };
@@ -1535,7 +1544,7 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
     await Discrepancy.bulkWrite(soloEnSAT.map(cfdi => ({
       updateOne: {
         filter: { uuid: cfdi.uuid, type: 'MISSING_IN_ERP' },
-        update: { $set: { uuid: cfdi.uuid, type: 'MISSING_IN_ERP', severity: 'critical', description: `CFDI ${cfdi.uuid} existe en SAT pero no en ERP`, status: 'open', rfcEmisor: cfdi.rfcEmisor, rfcReceptor: cfdi.rfcReceptor, ...fp } },
+        update: { $set: { uuid: cfdi.uuid, type: 'MISSING_IN_ERP', severity: 'critical', description: `CFDI ${cfdi.uuid} existe en SAT pero no en ERP`, status: 'open', rfcEmisor: cfdi.rfcEmisor, rfcReceptor: cfdi.rfcReceptor, ...tipoParaDiscrepancia(cfdi), ...fp } },
         upsert: true,
       },
     })));
@@ -1623,6 +1632,7 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
       rfcEmisor:    sat.rfcEmisor,
       rfcReceptor:  sat.rfcReceptor,
       status:       'open',
+      ...tipoParaDiscrepancia(sat.tipoDeComprobante || sat.tipoComprobante ? sat : erp),
       ...(comentariosNuevas[iDif].length && { comentarios: comentariosNuevas[iDif] }),
       ...fp,
     })));

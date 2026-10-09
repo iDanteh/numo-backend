@@ -18,6 +18,7 @@ const compensacionesInteresesService = require('../banks/compensaciones-interese
 const { ejecutarBulkConTransaccion } = require('../banks/bank-autorizaciones.service');
 const { obtenerDesglosesSalidasCajaPorAlmacen } = require('../erp/erp-sync.service');
 const { consultarTransaccionesNetpay } = require('../erp/netpay-transacciones.service');
+const NetpayReporte = require('../erp/NetpayReporte.model');
 
 // Categorías de bank_movements que representan una transferencia electrónica
 // real. Incluye "DEPOSITO" (2026-08-31, confirmado con el usuario, caso real
@@ -504,6 +505,36 @@ function _desglosarComisionNetpay(commission) {
   return { base, iva };
 }
 
+// Comisión REAL de NetPay por venta (2026-10-09, pedido del usuario): antes de
+// usar `commission` de Kore (tasa fija débito 1.59%/crédito 1.77%) se busca la
+// venta en `netpay_reportes` (reporte "Detalle de Depósitos" cargado por los
+// contadores, tasa negociada por almacén — ej. Oaxaca D0 6-oct: 0.75%, Kore
+// $1,229.81 vs reporte $830.27). Liga por `referencia` del reporte = `folio`
+// de la transacción de Kore (F20261006-00393). Total = `comisionMasIva`, IVA =
+// `ivaComision`, comisión = total − IVA: en meses sin intereses el reporte trae
+// un cargo extra que solo aparece en el total (F20261006-00092: 16.67 + 68.45
+// pero total 496.28 → comisión 427.83 + IVA 68.45, confirmado con el usuario).
+// Solo depósitos con fecha >= día de la venta (NetPay nunca deposita antes) y
+// sin reportes eliminados. Mapa referencia → { base, iva, total }.
+async function _cargarComisionesReporteNetpay(referencias, dia) {
+  const mapa = new Map();
+  if (!referencias.length) return mapa;
+  const docs = await NetpayReporte.aggregate([
+    { $match: { eliminado: { $ne: true }, fechaMovimiento: { $gte: new Date(`${dia}T00:00:00.000Z`) }, 'folios.referencia': { $in: referencias } } },
+    { $unwind: '$folios' },
+    { $match: { 'folios.referencia': { $in: referencias } } },
+    { $sort: { fechaMovimiento: 1, _id: 1 } },
+    { $project: { _id: 0, referencia: '$folios.referencia', comisionMasIva: '$folios.comisionMasIva', ivaComision: '$folios.ivaComision' } },
+  ]);
+  for (const d of docs) {
+    if (mapa.has(d.referencia) || d.comisionMasIva == null || d.ivaComision == null) continue;
+    const total = Math.round(Number(d.comisionMasIva) * 100) / 100;
+    const iva   = Math.round(Number(d.ivaComision) * 100) / 100;
+    mapa.set(d.referencia, { base: Math.round((total - iva) * 100) / 100, iva, total });
+  }
+  return mapa;
+}
+
 async function construirNetpayInfo(movimientos, fechaFinal) {
   const vacio = { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
 
@@ -630,6 +661,22 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     const transaccionesAmex = cuentaAmex
       ? (resultado.transacciones ?? []).filter(t => esTransaccionValida(t) && _esTransaccionAmex(t))
       : [];
+    // Comisión real del reporte de NetPay (ver `_cargarComisionesReporteNetpay`);
+    // la venta que no esté en un reporte cargado usa `commission` de Kore y
+    // queda como PROVISIONAL. Si Mongo falla, todo el día queda provisional.
+    let comisionesReporte = new Map();
+    try {
+      comisionesReporte = await _cargarComisionesReporteNetpay(transaccionesValidas.map(t => t.folio).filter(Boolean), dia);
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[Poliza] No se pudo leer netpay_reportes para ${clave} ${dia}, comisiones de Kore (provisionales): ${err.message}`);
+    }
+    const comisionDe = (t) => {
+      const delReporte = comisionesReporte.get(t.folio);
+      if (delReporte) return { ...delReporte, provisional: false };
+      const total = Number(t.commission) || 0;
+      return { ..._desglosarComisionNetpay(total), total, provisional: true };
+    };
     // Dos pasadas (2026-09-23, confirmado con el usuario, caso real
     // Ferrocarril 21-sep, póliza 888: una pasada de $1,026.90 =
     // F0-260902052 $11.44 + F0-260902050 $1,015.46 de la Global
@@ -672,12 +719,14 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // ya no la toma AMEX). `esAmex`: solo junta el monto, sin comisión.
     const ligar = (transacciones, esAmex) => {
       let gross = 0, comision = 0, ivaComision = 0;
-      const sumarComision = (c) => { const { base, iva } = _desglosarComisionNetpay(c); comision += base; ivaComision += iva; };
+      let conReporte = 0, provisionales = 0;
+      const sumarComision = (c) => { comision += c.base; ivaComision += c.iva; if (c.provisional) provisionales++; else conReporte++; };
       const detalle = [];
       const pendientesPorMonto = [];
       for (const t of transacciones) {
         const monto = Number(t.amount) || 0;
-        const comisionTransaccion = Number(t.commission) || 0;
+        const com = comisionDe(t);
+        const comisionTransaccion = com.total;
         const tickets = [...new Set((t.cuentas ?? [])
           .filter(c => c.SerieExterna && c.FolioExterno)
           .map(c => `${c.SerieExterna}-${c.FolioExterno}`))];
@@ -694,12 +743,12 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           // Segunda pasada de un ticket ya ligado: su monto ya está en la línea.
           // AMEX no lleva comisión, así que no hay nada que sumar.
           if (esAmex) continue;
-          sumarComision(comisionTransaccion);
+          sumarComision(com);
           detalle.push({ fila: { concepto: ticketsEnPoliza.join(', '), serie: ticketsEnPoliza[0] }, terminalID: t.terminalID, monto: 0,
-            comision: comisionTransaccion, nota: `pasada adicional (${t.folio}, $${monto.toFixed(2)}) de ticket ya ligado` });
+            comision: comisionTransaccion, provisional: com.provisional, nota: `pasada adicional (${t.folio}, $${monto.toFixed(2)}) de ticket ya ligado` });
           continue;
         }
-        sumarComision(comisionTransaccion);
+        sumarComision(com);
         const suma = filasTx.reduce((acc, f) => acc + Number(f.debe), 0);
         gross += suma;
         const diferencia = Math.round((suma - monto) * 100) / 100;
@@ -708,7 +757,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           if (idxD !== -1) disponibles.splice(idxD, 1);
           matchedIds.add(fila.id);
           const comisionFila = suma > 0 ? Math.round(comisionTransaccion * (Number(fila.debe) / suma) * 100) / 100 : 0;
-          detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila,
+          detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila, provisional: com.provisional,
             nota: Math.abs(diferencia) > 1 ? `pasada ${t.folio} $${monto.toFixed(2)} vs líneas $${suma.toFixed(2)} (dif ${diferencia.toFixed(2)})` : null });
         }
       }
@@ -716,18 +765,20 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
       const sinMatchExacto = [];
       for (const t of pendientesPorMonto) {
         const monto = Number(t.amount) || 0;
-        const comisionTransaccion = Number(t.commission) || 0;
+        const com = comisionDe(t);
+        const comisionTransaccion = com.total;
         const idx = disponibles.findIndex(f => Math.abs(Number(f.debe) - monto) < 0.02);
         if (idx === -1) { sinMatchExacto.push(t); continue; }
         const fila = disponibles.splice(idx, 1)[0];
         matchedIds.add(fila.id);
         gross += Number(fila.debe);
-        sumarComision(comisionTransaccion);
-        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion });
+        sumarComision(com);
+        detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionTransaccion, provisional: com.provisional });
       }
       for (const t of sinMatchExacto) {
         const monto = Number(t.amount) || 0;
-        const comisionTransaccion = Number(t.commission) || 0;
+        const com = comisionDe(t);
+        const comisionTransaccion = com.total;
         // Fallback: 2+ tickets de la MISMA factura (Factura Global dividida en
         // varios tickets) que EN CONJUNTO explican el monto — caso real
         // confirmado 2026-09-21 (Hidalgo/B0, $7,914.13 = suma de 2 tickets de
@@ -753,7 +804,7 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         const filasCombinadas = [...combinacion].sort((a, b) => b - a).map(i => disponibles.splice(i, 1)[0]);
         const sumaCombinada = filasCombinadas.reduce((s, f) => s + Number(f.debe), 0);
         gross += sumaCombinada;
-        sumarComision(comisionTransaccion);
+        sumarComision(com);
         for (const fila of filasCombinadas) {
           matchedIds.add(fila.id);
           // Comisión repartida proporcional al monto de cada ticket, solo para
@@ -761,10 +812,10 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
           // importa contablemente (`comision` de arriba) ya suma la comisión
           // completa de la transacción una sola vez, sin importar este reparto.
           const comisionFila = Math.round(comisionTransaccion * (Number(fila.debe) / sumaCombinada) * 100) / 100;
-          detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila });
+          detalle.push({ fila, terminalID: t.terminalID, monto: Number(fila.debe), comision: comisionFila, provisional: com.provisional });
         }
       }
-      return { gross, comision, ivaComision, detalle };
+      return { gross, comision, ivaComision, detalle, conReporte, provisionales };
     };
     const netpay = ligar(transaccionesValidas, false);
     const amex   = ligar(transaccionesAmex, true);
@@ -776,6 +827,11 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         centroCostoObj,
         detalle: netpay.detalle,
         grossAmex: Math.round(amex.gross * 100) / 100,
+        // Ventas NetPay cuya comisión salió del reporte vs de Kore (provisional).
+        // Con UNA sola provisional el asiento lleva la leyenda (pedido del usuario
+        // 2026-10-09: también con reporte parcial) — ver `_lineasNetpay`.
+        comisionesConReporte: netpay.conReporte,
+        comisionesProvisionales: netpay.provisionales,
       });
     }
   }));
@@ -783,15 +839,23 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
   return { matchedIds, porCentro, cuentasComision, cuentaAmex };
 }
 
+// Leyenda de comisión provisional (2026-10-09, pedido del usuario): si alguna
+// venta del día/centro no está en `netpay_reportes`, su comisión es la de Kore
+// y el asiento lo avisa — también con reporte parcial. Al cargar el reporte y
+// re-exportar, la comisión pasa a la real y la leyenda desaparece.
+const LEYENDA_COMISION_PROVISIONAL = 'COMISIONES PROVISIONALES';
+
 // Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
 // un día/centro (ver `construirNetpayInfo`) — confirmada con el usuario
 // 2026-09-14. `gross`/`comision` ya vienen redondeados a centavos.
-function _lineasNetpay({ gross, comision, ivaComision, centroCostoObj }, cuentaDepositosReal, cuentasComision) {
+function _lineasNetpay({ gross, comision, ivaComision, centroCostoObj, comisionesProvisionales = 0 }, cuentaDepositosReal, cuentasComision) {
   const totalFactura  = Math.round((comision + ivaComision) * 100) / 100;
   const neto          = Math.round((gross - totalFactura) * 100) / 100;
   const centroCosto   = centroCostoObj.clave;
   const conceptoDeposito = `VENTAS SUC.${centroCostoObj.sucursal}`;
-  const conceptoComision = 'NETPAY SAPI DE CV';
+  const conceptoComision = comisionesProvisionales > 0
+    ? `NETPAY SAPI DE CV - ${LEYENDA_COMISION_PROVISIONAL}`
+    : 'NETPAY SAPI DE CV';
 
   return [
     // 1. Depósito neto real (lo que de verdad cae al banco).
@@ -4542,7 +4606,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           cfdiSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
-          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión + IVA de esta venta: $${d.comision.toFixed(2)}${d.nota ? ` — ${d.nota}` : ''}`,
+          nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión + IVA de esta venta: $${d.comision.toFixed(2)}${d.provisional ? ' (PROVISIONAL: sin reporte NetPay, comisión de Kore)' : ''}${d.nota ? ` — ${d.nota}` : ''}`,
         });
       }
       // Resumen del día/centro — mismo cálculo que `_lineasNetpay` (el neto
@@ -4551,6 +4615,11 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       const ivaComisionCentro  = infoCentro.ivaComision;
       const totalFacturaCentro = Math.round((infoCentro.comision + ivaComisionCentro) * 100) / 100;
       const netoCentro         = Math.round((infoCentro.gross - totalFacturaCentro) * 100) / 100;
+      const provisionalesCentro = infoCentro.comisionesProvisionales ?? 0;
+      const totalVentasCentro   = provisionalesCentro + (infoCentro.comisionesConReporte ?? 0);
+      const leyendaCentro = provisionalesCentro > 0
+        ? ` — ${LEYENDA_COMISION_PROVISIONAL}: ${provisionalesCentro} de ${totalVentasCentro} ventas sin reporte NetPay (comisión de Kore)`
+        : '';
       desgloseConsolidado.push({
         cuenta:        null,
         centroCosto,
@@ -4560,7 +4629,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
         cfdiSerie:     '',
         cliente:       '',
         monto:         infoCentro.gross,
-        nota:          `TOTAL del día: bruto $${infoCentro.gross.toFixed(2)} − comisión $${infoCentro.comision.toFixed(2)} − IVA comisión $${ivaComisionCentro.toFixed(2)} = neto depositado $${netoCentro.toFixed(2)}`,
+        nota:          `TOTAL del día: bruto $${infoCentro.gross.toFixed(2)} − comisión $${infoCentro.comision.toFixed(2)} − IVA comisión $${ivaComisionCentro.toFixed(2)} = neto depositado $${netoCentro.toFixed(2)}${leyendaCentro}`,
       });
     }
   }
@@ -5463,4 +5532,5 @@ module.exports = {
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
   _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
+  _construirNetpayInfo: construirNetpayInfo, _lineasNetpay,
 };

@@ -23,6 +23,10 @@ function buildApp() {
   app.get('/ok', (req, res) => res.status(200).json({ ok: true }));
   app.get('/redirect', (req, res) => res.status(302).end());
   app.get('/bad', (req, res) => res.status(400).json({ error: 'bad' }));
+  app.get('/conflict', (req, res) => res.status(409).json({ error: 'conflict' }));
+  app.get('/unprocessable', (req, res) => res.status(422).json({ error: 'unprocessable' }));
+  app.get('/forbidden', (req, res) => res.status(403).json({ error: 'forbidden' }));
+  app.get('/notfound', (req, res) => res.status(404).json({ error: 'notfound' }));
   app.get('/boom', (req, res) => res.status(500).json({ error: 'boom' }));
   return app;
 }
@@ -87,13 +91,35 @@ describe('trafficTracker middleware', () => {
     expect(doc.status).toBe(500);
   });
 
-  test('una request 2xx/4xx NO llama a guardarError', async () => {
+  test('un 2xx/3xx NO llama a guardarError', async () => {
     const app = buildApp();
     await request(app).get('/ok');
-    await request(app).get('/bad');
+    await request(app).get('/redirect');
     await flushMicrotasks();
 
     expect(historialSvc.guardarError).not.toHaveBeenCalled();
+  });
+
+  test('403/404 (ruido normal de uso, no negocio) NO llaman a guardarError', async () => {
+    const app = buildApp();
+    await request(app).get('/forbidden');
+    await request(app).get('/notfound');
+    await flushMicrotasks();
+
+    expect(historialSvc.guardarError).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['/bad', 400],
+    ['/conflict', 409],
+    ['/unprocessable', 422],
+  ])('un error de negocio (%s, %i) SÍ llama a guardarError', async (path, status) => {
+    const app = buildApp();
+    await request(app).get(path);
+    await flushMicrotasks();
+
+    expect(historialSvc.guardarError).toHaveBeenCalledTimes(1);
+    expect(historialSvc.guardarError.mock.calls[0][0]).toMatchObject({ metodo: 'GET', path, status });
   });
 
   test('si guardarError() rechaza (Mongo caído), solo se loguea — no propaga ni afecta la respuesta ya enviada', async () => {
@@ -105,7 +131,7 @@ describe('trafficTracker middleware', () => {
 
     await flushMicrotasks();
     expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining('[system-monitor] Error persistiendo error 5xx en Mongo'),
+      expect.stringContaining('[system-monitor] Error persistiendo error en Mongo'),
       'mongo caído',
     );
   });

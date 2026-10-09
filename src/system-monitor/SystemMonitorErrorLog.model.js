@@ -3,8 +3,9 @@
 const mongoose = require('mongoose');
 
 /**
- * SystemMonitorErrorLog.model.js — persistencia de los errores 5xx que
- * traffic-tracker.middleware.js ya captura en memoria (`erroresRecientes`, tope 20).
+ * SystemMonitorErrorLog.model.js — persistencia de los errores (5xx + negocio:
+ * BadRequestError/ConflictError/UnprocessableError, ver CODIGOS_NEGOCIO_A_REGISTRAR
+ * en traffic-tracker.middleware.js) que ya captura en memoria (`erroresRecientes`, tope 20).
  * Ese array es un singleton EN MEMORIA de un solo proceso: no sobrevive un reinicio
  * del contenedor (ocurre cada noche vía auto-update.sh). Este modelo guarda el mismo
  * documento (ts/metodo/path/status) para que el panel pueda mostrar un histórico real

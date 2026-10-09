@@ -15,6 +15,16 @@ const VENTANA_SEGUNDOS = 60;
 const VENTANA_MINUTOS = 60;
 const MAX_ERRORES_RECIENTES = 20;
 
+// Códigos de negocio (AppError: BadRequestError/ConflictError/UnprocessableError)
+// que SÍ interesa poder consultar en el panel, además de cualquier 5xx. Deja afuera
+// a propósito 401/403/404 (ForbiddenError, tokens, recursos no encontrados) — son
+// ruido normal de uso, no incidentes a investigar (decisión del usuario, 2026-10-09).
+const CODIGOS_NEGOCIO_A_REGISTRAR = new Set([400, 409, 422]);
+
+function _esErrorARegistrar(statusCode) {
+  return statusCode >= 500 || CODIGOS_NEGOCIO_A_REGISTRAR.has(statusCode);
+}
+
 function _bucketVacio() {
   return { ts: null, total: 0, c2xx: 0, c3xx: 0, c4xx: 0, c5xx: 0, sumaDuracionMs: 0, muestrasDuracion: 0 };
 }
@@ -76,7 +86,7 @@ function trafficTracker(req, res, next) {
       _registrar(segundos, VENTANA_SEGUNDOS, tsSeg, res.statusCode, duracionMs);
       _registrar(minutos, VENTANA_MINUTOS, tsMin, res.statusCode, duracionMs);
 
-      if (res.statusCode >= 500) {
+      if (_esErrorARegistrar(res.statusCode)) {
         const metodo = req.method;
         const path = req.originalUrl || req.path;
         const status = res.statusCode;
@@ -91,7 +101,7 @@ function trafficTracker(req, res, next) {
         // solo atrapa errores síncronos, no el rechazo de esta promesa).
         historialSvc.guardarError({ ts: new Date(ahoraMs), metodo, path, status })
           .catch((err) => {
-            logger.error('[system-monitor] Error persistiendo error 5xx en Mongo (no bloqueante):', err.message);
+            logger.error('[system-monitor] Error persistiendo error en Mongo (no bloqueante):', err.message);
           });
       }
     } catch (err) {

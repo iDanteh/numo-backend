@@ -17,7 +17,7 @@ const { authenticate, permit } = require('../shared/middleware/auth');
 const { asyncHandler } = require('../shared/middleware/error-handler');
 const { PERMISSIONS } = require('../shared/config/rbac');
 const { getSnapshot } = require('./system-monitor.service');
-const { getHistorial } = require('./system-monitor-historial.service');
+const { getHistorial, getErroresHistorial } = require('./system-monitor-historial.service');
 
 const router = express.Router();
 
@@ -33,6 +33,15 @@ router.get('/snapshot', authenticate, permit(PERMISSIONS.SYSTEM_MONITOR_READ), a
 router.get('/historial', authenticate, permit(PERMISSIONS.SYSTEM_MONITOR_READ), asyncHandler(async (req, res) => {
   const { fechaInicio, fechaFin } = req.query;
   const historial = await getHistorial({ fechaInicio, fechaFin });
+  res.json(historial);
+}));
+
+// GET /api/system-monitor/errores-historial?fechaInicio=&fechaFin= — mismo
+// criterio que /historial (mismos nombres de query param, mismo default de 24h,
+// mismo permiso: es la misma data de system-monitor, solo persistida).
+router.get('/errores-historial', authenticate, permit(PERMISSIONS.SYSTEM_MONITOR_READ), asyncHandler(async (req, res) => {
+  const { fechaInicio, fechaFin } = req.query;
+  const historial = await getErroresHistorial({ fechaInicio, fechaFin });
   res.json(historial);
 }));
 

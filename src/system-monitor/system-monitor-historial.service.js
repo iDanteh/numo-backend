@@ -1,6 +1,9 @@
 'use strict';
 
 const SystemMonitorSnapshot = require('./SystemMonitorSnapshot.model');
+const SystemMonitorErrorLog = require('./SystemMonitorErrorLog.model');
+const { checkMongoOk } = require('../shared/utils/db-health');
+const { logger } = require('../shared/utils/logger');
 
 // Mismo criterio EXACTO que _inicioDiaMx/_finDiaMx (banks/domains/banks/bank.service.js)
 // y _medianocheMx (collection-request-indicadores.service.js): México sin horario de
@@ -61,4 +64,55 @@ async function getHistorial({ fechaInicio, fechaFin } = {}) {
     .lean();
 }
 
-module.exports = { guardarSnapshot, getHistorial };
+const CAMPOS_ERRORES_HISTORIAL = '-_id ts metodo path status';
+
+/**
+ * Guarda UN error 5xx — llamado fire-and-forget desde traffic-tracker.middleware.js
+ * (nunca awaited en el camino de la respuesta). No lleva try/catch propio: el mismo
+ * criterio que guardarSnapshot() — quien la llama decide cómo tratar el fallo (acá,
+ * el middleware solo loguea con logger.error y sigue, nunca bloquea ni tumba el
+ * proceso; un 5xx puede ser justo PORQUE Mongo está caído).
+ *
+ * Guard de `checkMongoOk()` ANTES de escribir: sin esto, con Mongo caído cada
+ * intento queda buffereado por Mongoose hasta `bufferTimeoutMS` (5 min, ver
+ * database.mongo.js) antes de rechazar — bajo una ráfaga real de 5xx, eso amontona
+ * escrituras en vuelo compitiendo por el mismo pool de conexiones (maxPoolSize: 20)
+ * que necesitan los flujos de negocio para recuperarse. Fail-fast: si Mongo ya está
+ * caído, ni se intenta.
+ */
+async function guardarError({ ts, metodo, path, status }) {
+  if (!checkMongoOk()) {
+    logger.error(`[system-monitor] Mongo no disponible, se omite persistencia de error 5xx: ${metodo} ${path} ${status}`);
+    return;
+  }
+  await SystemMonitorErrorLog.create({ ts, metodo, path, status });
+}
+
+const MAX_ERRORES_HISTORIAL = 2000;
+
+/**
+ * Serie de errores 5xx en el rango [fechaInicio, fechaFin] (yyyy-mm-dd, día
+ * calendario completo en hora de México), orden cronológico ascendente. Mismo
+ * criterio de default que getHistorial(): sin rango explícito, últimas 24 horas
+ * reales.
+ *
+ * A diferencia de SystemMonitorSnapshot (un documento cada 5 min por cron, acotado
+ * por diseño), este log crece 1:1 con el volumen real de 5xx — sin tope, un rango
+ * amplio pedido justo después de un incidente real podría devolver un array
+ * arbitrariamente grande. Se corta a los MAX_ERRORES_HISTORIAL más recientes del
+ * rango (ordenando desc, limitando, y revirtiendo a asc para el consumidor).
+ */
+async function getErroresHistorial({ fechaInicio, fechaFin } = {}) {
+  const gte = fechaInicio ? _inicioDiaMx(fechaInicio) : new Date(Date.now() - HORAS_DEFAULT_MS);
+  const lte = fechaFin ? _finDiaMx(fechaFin) : new Date();
+
+  const docs = await SystemMonitorErrorLog.find({ ts: { $gte: gte, $lte: lte } })
+    .select(CAMPOS_ERRORES_HISTORIAL)
+    .sort({ ts: -1 })
+    .limit(MAX_ERRORES_HISTORIAL)
+    .lean();
+
+  return docs.reverse();
+}
+
+module.exports = { guardarSnapshot, getHistorial, guardarError, getErroresHistorial };

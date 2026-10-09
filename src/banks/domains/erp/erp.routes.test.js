@@ -93,6 +93,8 @@ jest.mock('./netpay-transacciones.service', () => ({ consultarTransaccionesNetpa
 // evaluarReporte/resolverReporte/rechazarReporte/eliminarReporte/restaurarReporte.
 jest.mock('./netpay-reporte.service', () => ({
   cargarReporte:                    jest.fn(),
+  iniciarCargaReporteJob:           jest.fn(),
+  obtenerEstadoJobCarga:            jest.fn(),
   listar:                           jest.fn(),
   obtenerUltimaCarga:               jest.fn(),
   obtenerDetalle:                   jest.fn(),
@@ -141,7 +143,8 @@ const { descartarManual }  = require('./caja-transferencia-descartar-manual.serv
 const { sincronizarTransferenciasCajasManual } = require('./caja-transferencia-sync.service');
 const { consultarTransaccionesNetpay } = require('./netpay-transacciones.service');
 const {
-  cargarReporte, listar: listarNetpayReportes, obtenerUltimaCarga: obtenerUltimaCargaNetpayReporte,
+  cargarReporte, iniciarCargaReporteJob, obtenerEstadoJobCarga,
+  listar: listarNetpayReportes, obtenerUltimaCarga: obtenerUltimaCargaNetpayReporte,
   obtenerDetalle: obtenerDetalleNetpayReporte,
   obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
   buscarCandidatos: buscarCandidatosNetpayReporte,
@@ -2053,7 +2056,7 @@ describe('POST /netpay/reporte/upload', () => {
       .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
 
     expect(res.status).toBe(403);
-    expect(cargarReporte).not.toHaveBeenCalled();
+    expect(iniciarCargaReporteJob).not.toHaveBeenCalled();
   });
 
   test('sin archivo adjunto: 400', async () => {
@@ -2062,10 +2065,10 @@ describe('POST /netpay/reporte/upload', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(400);
-    expect(cargarReporte).not.toHaveBeenCalled();
+    expect(iniciarCargaReporteJob).not.toHaveBeenCalled();
   });
 
-  test('archivo con extensión no permitida: rechazado por el fileFilter de multer, nunca llega a cargarReporte', async () => {
+  test('archivo con extensión no permitida: rechazado por el fileFilter de multer, nunca llega a iniciarCargaReporteJob', async () => {
     const res = await request(app)
       .post('/netpay/reporte/upload')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
@@ -2076,62 +2079,91 @@ describe('POST /netpay/reporte/upload', () => {
     // este camino cae a su branch AppError con status 500 (comportamiento YA existente,
     // idéntico al de los demás uploads .../cyc/upload de este mismo archivo — no forma
     // parte del alcance de esta feature). Lo que sí es responsabilidad de esta ruta: NUNCA
-    // debe llegar a llamar a cargarReporte con un archivo rechazado.
+    // debe llegar a arrancar un job con un archivo rechazado.
     expect(res.status).toBe(500);
-    expect(cargarReporte).not.toHaveBeenCalled();
+    expect(iniciarCargaReporteJob).not.toHaveBeenCalled();
   });
 
-  test('archivo válido: llama a cargarReporte con el buffer, el nombre original y el usuario', async () => {
-    cargarReporte.mockResolvedValue({ reporte: { _id: 'rep-1' }, candidatos: [] });
+  // EN BACKGROUND (pedido explícito del usuario, 2026-10-08): la ruta ya NO espera a que
+  // termine de procesar — responde 202+jobId de inmediato (ver incidente real documentado
+  // en netpay-reporte.service.js#iniciarCargaReporteJob). El procesamiento en sí (parseo,
+  // matching, progreso) está cubierto en netpay-reporte.service.test.js — acá solo el
+  // cableado HTTP.
+  test('archivo válido: arranca el job con el buffer, el nombre original y el usuario, responde 202+jobId', async () => {
+    iniciarCargaReporteJob.mockResolvedValue({ jobId: 'netpay-upload-123-abc', total: 3 });
 
     const res = await request(app)
       .post('/netpay/reporte/upload')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
       .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
 
-    expect(res.status).toBe(200);
-    expect(cargarReporte).toHaveBeenCalledTimes(1);
-    const [buffer, nombreArchivo, user] = cargarReporte.mock.calls[0];
+    expect(res.status).toBe(202);
+    expect(iniciarCargaReporteJob).toHaveBeenCalledTimes(1);
+    const [buffer, nombreArchivo, user] = iniciarCargaReporteJob.mock.calls[0];
     expect(Buffer.isBuffer(buffer)).toBe(true);
     expect(nombreArchivo).toBe('reporte.xlsx');
     expect(user._id).toBe('user-test');
-    expect(res.body).toEqual({ reporte: { _id: 'rep-1' }, candidatos: [] });
+    expect(res.body).toEqual({ jobId: 'netpay-upload-123-abc', total: 3 });
   });
 
-  test('propaga el status code de un error de negocio (ej. ConflictError por claveRastreo duplicado)', async () => {
-    const { ConflictError } = require('../../shared/errors/AppError');
-    cargarReporte.mockRejectedValue(new ConflictError('Ya existe un reporte cargado para este depósito'));
+  // El parseo (y SOLO el parseo) sigue siendo síncrono dentro de iniciarCargaReporteJob — un
+  // Excel inválido sigue fallando al instante, con el código HTTP correcto, sin pasar por el
+  // job. El procesamiento posterior (duplicados, etc.) ya no puede fallar la respuesta HTTP
+  // porque corre después de que esta ya se mandó — eso se emite por socket, cubierto en
+  // netpay-reporte.service.test.js.
+  test('el archivo no se puede leer: propaga el status code tal cual (ej. 400 de un Excel corrupto)', async () => {
+    const { BadRequestError } = require('../../shared/errors/AppError');
+    iniciarCargaReporteJob.mockRejectedValue(new BadRequestError('El archivo no es un Excel válido'));
 
     const res = await request(app)
       .post('/netpay/reporte/upload')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
       .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
 
-    expect(res.status).toBe(409);
+    expect(res.status).toBe(400);
+  });
+});
+
+// GET /netpay/reporte/upload-job/:jobId — fallback de recuperación tras un reload de página
+// (mismo criterio que GET /sync-erp-kore/:jobId/status, pero CON chequeo de dueño: acá
+// conviven jobs de distintas personas en el mismo Map — ver
+// netpay-reporte.service.js#obtenerEstadoJobCarga).
+describe('GET /netpay/reporte/upload-job/:jobId', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(router);
   });
 
-  // netpay-reporte-global (design.md "Interfaces/Contracts"): un archivo con N>1 depósitos
-  // SIEMPRE responde 200 con `reportes[]`+`resumen` — la ruta no tiene lógica propia para
-  // esto, solo pasa tal cual lo que devuelve cargarReporte (igual que el test de arriba para
-  // el shape N=1), así que este test cubre el passthrough completo del shape nuevo.
-  test('archivo con N>1 depósitos: pasa tal cual reportes[]/resumen (sin reporte/candidatos top-level)', async () => {
-    const resultadoServicio = {
-      reportes: [
-        { claveRastreo: 'C1', estatusCarga: 'creado', sucursales: ['SUC-1'], terminalIDs: ['T1'] },
-        { claveRastreo: 'C2', estatusCarga: 'ya_cargado', sucursales: ['SUC-2'], terminalIDs: ['T2'], reporteId: 'rep-2' },
-      ],
-      resumen: { total: 2, creados: 1, yaCargados: 1, errores: 0 },
-    };
-    cargarReporte.mockResolvedValue(resultadoServicio);
+  test('responde 403 sin banks:netpay', async () => {
+    const res = await request(app).get('/netpay/reporte/upload-job/job-1').set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(obtenerEstadoJobCarga).not.toHaveBeenCalled();
+  });
+
+  test('job inexistente, expirado, o de otro usuario: 404 (obtenerEstadoJobCarga ya filtra por dueño)', async () => {
+    obtenerEstadoJobCarga.mockReturnValue(null);
 
     const res = await request(app)
-      .post('/netpay/reporte/upload')
-      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]))
-      .attach('excelFile', Buffer.from('dummy'), 'reporte.xlsx');
+      .get('/netpay/reporte/upload-job/job-ajeno')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
+
+    expect(res.status).toBe(404);
+    expect(obtenerEstadoJobCarga).toHaveBeenCalledWith('job-ajeno', 'user-test');
+  });
+
+  test('job propio en curso: devuelve el estado tal cual', async () => {
+    obtenerEstadoJobCarga.mockReturnValue({ status: 'running', nombreArchivo: 'x.xlsx', procesados: 5, total: 10 });
+
+    const res = await request(app)
+      .get('/netpay/reporte/upload-job/job-1')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_NETPAY]));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(resultadoServicio);
-    expect(res.body.reporte).toBeUndefined();
+    expect(res.body).toEqual({ status: 'running', nombreArchivo: 'x.xlsx', procesados: 5, total: 10 });
   });
 });
 

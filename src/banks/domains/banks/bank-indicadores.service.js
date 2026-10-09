@@ -6,6 +6,12 @@ const { _rangoAnioMesMexico, _inicioDiaMx, _finDiaMx } = require('./bank.service
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
 
+// Importación deferida (mismo patrón que users/role.service.js#db y bank.routes.js
+// #_postgresModels) para evitar dependencia circular durante el bootstrap.
+function _postgresModels() {
+  return require('../../../shared/models/postgres');
+}
+
 const MS_PER_HOUR = 3600000;
 
 // Boundaries del $bucket de backlog: [0,24) < 24h, [24,72) 1-3d, [72,168) 3-7d, [168,∞) 7d+.
@@ -561,9 +567,23 @@ async function listUsuariosConIdentificaciones() {
  *      pedido explícito del usuario de no mezclar ambos en un solo número.
  *
  * Mismo criterio de "depósito" que el resto de este dashboard (buildBaseMatch: isActive,
- * no oculto, deposito>0) — un retiro no tiene este ciclo de vida. Sin scope por usuario a
- * propósito (mismo motivo que el backlog de getIndicadoresIdentificacion: "rezagado"/"nuevo"
- * son propiedades del movimiento, no de quién lo identificó) — es un control de EQUIPO.
+ * no oculto, deposito>0) — un retiro no tiene este ciclo de vida. `rezagados`/`nuevos.total`/
+ * `nuevos.pendientes`/`nuevos.otros` siguen SIN scope por usuario a propósito (mismo motivo de
+ * siempre: "rezagado"/"nuevo"/"pendiente" son propiedades del movimiento, no de quién lo
+ * identificó — es un control de EQUIPO completo, cuántos depósitos hay y cuántos faltan).
+ *
+ * **Scope por ROL para "identificado"** (2026-10-09, pedido explícito del usuario): `banco`
+ * aparte, el corte es "de un rol" (cobranza ve semanal, contabilidad ve mensual — ver
+ * `getPeriodoCortePorRol`), y antes de esto `nuevos.identificado` e `identificadosEnPeriodo`
+ * mezclaban identificaciones de CUALQUIER rol — un corte de cobranza mostraba también lo que
+ * identificó contabilidad, y viceversa. Con `rolEquipo` (el rol del usuario autenticado, o
+ * `null` para `banks:config`/admin = sin acotar, ve el total real de todos los roles): estos
+ * 2 números se acotan a auth0Subs con ese rol ACTUAL (mismo criterio/helper que
+ * `banks:cobranza:all`, ver bank.routes.js#_cobranzaTeamAuth0Subs — "equipo HOY", no
+ * historial). `nuevos.total`/`pendientes`/`otros` NO cambian: siguen siendo el total real del
+ * equipo completo — la aritmética de los 4 buckets de `nuevos` puede dejar de sumar exacto al
+ * total cuando hay scope (la diferencia es "identificado por otro rol", a propósito no se
+ * expone como bucket nuevo, nadie lo pidió).
  *
  * **Corte histórico personalizado** (2026-10-06, pedido explícito del usuario): si vienen
  * `fechaInicio` Y `fechaFin` (`YYYY-MM-DD`, mismo nombre/convención que `_resolverMatchTiempo`
@@ -583,9 +603,42 @@ async function listUsuariosConIdentificaciones() {
  *   histórico. Si falta uno de los dos, se ignoran ambos y se usa el modo tiempo real de
  *   siempre (comportamiento IDÉNTICO, cero regresión).
  * @param {string} [opts.fechaFin] Ver `fechaInicio`.
+ * @param {string|null} [opts.rolEquipo] Rol al que acotar "identificado" (ver arriba). `null`
+ *   = sin acotar (admin/banks:config).
  */
-async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaInicio = null, fechaFin = null } = {}) {
-  const baseMatch = buildBaseMatch({ banco });
+// Valor que nunca matchea un auth0Sub real — mismo gotcha y misma solución que
+// bank.routes.js#SIN_COINCIDENCIA: un array vacío en `$in` no es "no matchea nada", así que si
+// el rol pedido no tiene NINGÚN usuario, hay que forzar un `$in` que de verdad no matchee en
+// vez de dejar el array vacío (que algunas rutas de este archivo tratarían como "sin filtro").
+const SIN_COINCIDENCIA_ROL_CORTE = '__sin-coincidencia-rol-corte__';
+
+/**
+ * auth0Subs con rol `rol` ACTUAL, o `null` si `rol` es falsy (sin scope — admin/banks:config).
+ * Mismo criterio/patrón que bank.routes.js#_cobranzaTeamAuth0Subs: rol HOY, no historial (ver
+ * comentario grande de getCorteConciliacion arriba).
+ */
+async function _equipoAuth0SubsParaRol(rol) {
+  if (!rol) return null;
+  const { User } = _postgresModels();
+  const rows = await User.findAll({ where: { role: rol }, attributes: ['auth0Sub'], raw: true });
+  const ids = rows.map((u) => u.auth0Sub ?? u.auth0_sub).filter(Boolean);
+  return ids.length ? ids : [SIN_COINCIDENCIA_ROL_CORTE];
+}
+
+// `equipoIds` null = sin scope (todo cuenta). Para el `$match` de Mongo (agregaciones).
+function _matchIdentificadoEquipo(equipoIds) {
+  return equipoIds ? { 'primeraIdentificacionPor.userId': { $in: equipoIds } } : {};
+}
+
+// Para el loop en JS sobre documentos ya traídos (rama histórica / Excel detalle).
+function _enEquipoRol(userId, equipoIds) {
+  return !equipoIds || (!!userId && equipoIds.includes(userId));
+}
+
+async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaInicio = null, fechaFin = null, rolEquipo = null } = {}) {
+  const baseMatch  = buildBaseMatch({ banco });
+  const equipoIds  = await _equipoAuth0SubsParaRol(rolEquipo);
+  const matchEquipo = _matchIdentificadoEquipo(equipoIds);
 
   if (fechaInicio && fechaFin) {
     const inicio = _inicioDiaMx(fechaInicio);
@@ -594,7 +647,7 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
       throw new BadRequestError('fechaFin no puede ser anterior a fechaInicio');
     }
     const { rezagados, nuevos, identificadosEnPeriodo, posibleCambioPosterior } =
-      await _getCorteHistorico({ baseMatch, inicio, fin });
+      await _getCorteHistorico({ baseMatch, inicio, fin, equipoIds, matchEquipo });
 
     return {
       periodo, inicio, fin, historico: true,
@@ -610,11 +663,17 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
     { $group: { _id: '$status', count: { $sum: 1 } } },
   ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count])));
 
-  const [rezagadosPorStatus, nuevosPorStatus, identificadosPorOrigen] = await Promise.all([
+  const [rezagadosPorStatus, nuevosPorStatus, nuevosIdentificadoEquipo, identificadosPorOrigen] = await Promise.all([
     agruparPorStatus({ fecha: { $lt: inicio }, status: { $in: BACKLOG_STATUSES } }),
+    // SIN scope a propósito: esta cuenta los 4 estatus juntos para sacar el total real y
+    // 'otros' (ver abajo) — aplicarle matchEquipo acá excluiría de TODO el group-by a los
+    // no_identificado/reclasificado (que no tienen primeraIdentificacionPor), no solo a los
+    // identificados de otro rol.
     agruparPorStatus({ fecha: { $gte: inicio } }),
+    // Conteo de 'identificado' YA acotado al rol — este es el que se expone en `nuevos`.
+    BankMovement.countDocuments({ ...baseMatch, ...matchEquipo, fecha: { $gte: inicio }, status: 'identificado' }),
     BankMovement.aggregate([
-      { $match: { ...baseMatch, status: 'identificado', primeraIdentificacionAt: { $gte: inicio } } },
+      { $match: { ...baseMatch, ...matchEquipo, status: 'identificado', primeraIdentificacionAt: { $gte: inicio } } },
       { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
     ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
   ]);
@@ -625,13 +684,17 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
   };
   rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
 
+  // Total/otros se calculan con el identificado SIN scope (nuevosPorStatus.identificado) —
+  // son propiedades del lote completo, no de "mi equipo". Ver comentario grande arriba: la
+  // suma de los 4 buckets expuestos puede no coincidir exacto con `nuevos.total` cuando hay
+  // scope (la diferencia es "identificado por otro rol", a propósito no se expone).
   const nuevosTotal = Object.values(nuevosPorStatus).reduce((a, b) => a + b, 0);
   const nuevos = {
     no_identificado: nuevosPorStatus.no_identificado ?? 0,
     reclasificado:    nuevosPorStatus.reclasificado    ?? 0,
-    identificado:     nuevosPorStatus.identificado     ?? 0,
+    identificado:     nuevosIdentificadoEquipo,
   };
-  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - nuevos.identificado;
+  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - (nuevosPorStatus.identificado ?? 0);
   nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
   nuevos.total = nuevosTotal;
 
@@ -650,8 +713,12 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
  * `identificadosEnPeriodo` (ese cálculo es 100% preciso siempre, con `primeraIdentificacionAt`
  * acotado `{ $gte: inicio, $lte: fin }` — la única diferencia con el modo live es agregar el
  * `$lte: fin`).
+ *
+ * `equipoIds`/`matchEquipo` (2026-10-09): mismo criterio que la rama live — `nuevos.identificado`
+ * se acota al rol, `nuevos.total`/`pendientes`/`otros` se calculan con el identificado SIN
+ * acotar (`identificadoTotalSinScope`), para no reducir el total real por scope.
  */
-async function _getCorteHistorico({ baseMatch, inicio, fin }) {
+async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, matchEquipo = {} }) {
   const [candidatosRezagados, candidatosNuevos, identificadosPorOrigen] = await Promise.all([
     BankMovement.find({
       ...baseMatch,
@@ -660,13 +727,13 @@ async function _getCorteHistorico({ baseMatch, inicio, fin }) {
         { status: { $in: BACKLOG_STATUSES } },
         { primeraIdentificacionAt: { $ne: null } },
       ],
-    }).select('status primeraIdentificacionAt ultimoCambioStatusAt historialVinculacion').lean(),
+    }).select('status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion').lean(),
 
     BankMovement.find({ ...baseMatch, fecha: { $gte: inicio, $lte: fin } })
-      .select('status primeraIdentificacionAt ultimoCambioStatusAt historialVinculacion').lean(),
+      .select('status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion').lean(),
 
     BankMovement.aggregate([
-      { $match: { ...baseMatch, status: 'identificado', primeraIdentificacionAt: { $gte: inicio, $lte: fin } } },
+      { $match: { ...baseMatch, ...matchEquipo, status: 'identificado', primeraIdentificacionAt: { $gte: inicio, $lte: fin } } },
       { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
     ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
   ]);
@@ -685,16 +752,22 @@ async function _getCorteHistorico({ baseMatch, inicio, fin }) {
   rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
 
   const nuevos = { no_identificado: 0, reclasificado: 0, identificado: 0, otros: 0 };
+  let identificadoTotalSinScope = 0;
+  let identificadoDelEquipo     = 0;
   for (const mov of candidatosNuevos) {
     const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
     if (posibleCambio) posibleCambioPosterior++;
-    if (identificado)                        nuevos.identificado++;
+    if (identificado) {
+      identificadoTotalSinScope++;
+      if (_enEquipoRol(mov.primeraIdentificacionPor?.userId, equipoIds)) identificadoDelEquipo++;
+    }
     else if (mov.status === 'reclasificado') nuevos.reclasificado++;
     else if (mov.status === 'otros')         nuevos.otros++;
     else                                      nuevos.no_identificado++;
   }
+  nuevos.identificado = identificadoDelEquipo;
   nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
-  nuevos.total = nuevos.no_identificado + nuevos.reclasificado + nuevos.identificado + nuevos.otros;
+  nuevos.total = nuevos.no_identificado + nuevos.reclasificado + identificadoTotalSinScope + nuevos.otros;
 
   const identificadosEnPeriodo = {
     deRezagados: identificadosPorOrigen.rezagado ?? 0,
@@ -774,11 +847,13 @@ async function getPeriodoCortePorRol(role) {
  *     SÍ se listan los ya identificados, para que la columna "Identificado en el periodo"
  *     tenga sentido completo sobre el lote nuevo).
  * La columna "Identificado en el periodo" (Sí/No) es la misma condición que usa
- * `identificadosEnPeriodo` del resumen — permite filtrar en Excel y que la suma de "Sí"
+ * `identificadosEnPeriodo` del resumen (incluido el scope por `rolEquipo`, 2026-10-09 — ver
+ * comentario grande de getCorteConciliacion) — permite filtrar en Excel y que la suma de "Sí"
  * coincida exactamente con `identificadosEnPeriodo.total`.
  */
-async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInicio = null, fechaFin = null } = {}) {
-  const corte = await getCorteConciliacion({ periodo, banco, fechaInicio, fechaFin });
+async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInicio = null, fechaFin = null, rolEquipo = null } = {}) {
+  const corte = await getCorteConciliacion({ periodo, banco, fechaInicio, fechaFin, rolEquipo });
+  const equipoIds = await _equipoAuth0SubsParaRol(rolEquipo);
   const inicio = corte.inicio;
   // null en modo tiempo real, Date en histórico — acota las queries de Detalle con $lte
   // cuando exista (mismo criterio de corte que _getCorteHistorico) y habilita la columna
@@ -919,7 +994,8 @@ async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInici
   for (const m of filas) {
     const identificadoEnPeriodo = m.status === 'identificado'
       && m.primeraIdentificacionAt != null
-      && new Date(m.primeraIdentificacionAt) >= inicio;
+      && new Date(m.primeraIdentificacionAt) >= inicio
+      && _enEquipoRol(m.primeraIdentificacionPor?.userId, equipoIds);
     detalle.addRow({
       origen:                m.origen,
       banco:                 m.banco ?? null,

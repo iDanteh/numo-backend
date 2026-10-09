@@ -8,9 +8,15 @@ jest.mock('./BankMovement.model');
 jest.mock('../../shared/socket');
 jest.mock('./drive-fichas.service');
 jest.mock('../../../shared/services/global-config.service');
+// Scope por rol (2026-10-09): getCorteConciliacion consulta Postgres solo cuando se pasa
+// `rolEquipo` — mismo patrón/mock que bank.routes.test.js.
+jest.mock('../../../shared/models/postgres', () => ({
+  User: { findAll: jest.fn() },
+}));
 
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
+const { User: PgUser } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const { getCorteConciliacion, buildReporteCorte, getPeriodoCortePorRol } = require('./bank-indicadores.service');
@@ -36,11 +42,17 @@ afterEach(() => {
   jest.useRealTimers();
 });
 
-function mockAggregates({ rezagados = [], nuevos = [], identificados = [] }) {
+// `nuevosIdentificadoCount` (2026-10-09): getCorteConciliacion ahora saca el 'identificado' de
+// `nuevos` vía un `countDocuments()` APARTE (acotable por rol), no del aggregate por status.
+// Sin pasarlo explícito, default = el mismo count que ya viene en `nuevos` (_id:'identificado')
+// — mantiene el comportamiento de siempre para los tests que no les importa el scope por rol.
+function mockAggregates({ rezagados = [], nuevos = [], identificados = [], nuevosIdentificadoCount = null } = {}) {
   BankMovement.aggregate
     .mockResolvedValueOnce(rezagados)
     .mockResolvedValueOnce(nuevos)
     .mockResolvedValueOnce(identificados);
+  const defaultCount = nuevos.find((r) => r._id === 'identificado')?.count ?? 0;
+  BankMovement.countDocuments = jest.fn().mockResolvedValue(nuevosIdentificadoCount ?? defaultCount);
 }
 
 // buildReporteCorte() llama primero getCorteConciliacion() (3 aggregate) y DESPUÉS
@@ -147,6 +159,62 @@ describe('getCorteConciliacion', () => {
     expect(identificadosEnPeriodo).toEqual({ deRezagados: 5, deNuevos: 30, total: 35 });
   });
 
+  // 2026-10-09 — pedido explícito del usuario: el corte mezclaba identificaciones de
+  // CUALQUIER rol (si el corte era de cobranza, igual contaba lo identificado por
+  // contabilidad). `rolEquipo` acota 'identificado' al rol dado — total/otros/pendientes NO
+  // cambian (siguen siendo el real, sin scope).
+  describe('scope por rol (rolEquipo)', () => {
+    test('sin rolEquipo: no consulta Postgres, comportamiento idéntico a siempre', async () => {
+      mockAggregates({ nuevos: [{ _id: 'identificado', count: 30 }] });
+      const { nuevos } = await getCorteConciliacion({});
+
+      expect(PgUser.findAll).not.toHaveBeenCalled();
+      expect(nuevos.identificado).toBe(30);
+    });
+
+    test('con rolEquipo: nuevos.identificado se acota al count scoped, total/otros usan el real sin acotar', async () => {
+      PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }]);
+      mockAggregates({
+        nuevos: [
+          { _id: 'no_identificado', count: 10 },
+          { _id: 'identificado',    count: 30 }, // real, de CUALQUIER rol
+        ],
+        nuevosIdentificadoCount: 18, // scoped: solo lo que identificó el equipo 'cobranza'
+      });
+
+      const { nuevos } = await getCorteConciliacion({ rolEquipo: 'cobranza' });
+
+      expect(PgUser.findAll).toHaveBeenCalledWith({ where: { role: 'cobranza' }, attributes: ['auth0Sub'], raw: true });
+      expect(nuevos.identificado).toBe(18);   // acotado
+      expect(nuevos.no_identificado).toBe(10); // sin cambios
+      expect(nuevos.total).toBe(40);           // sigue siendo el real (10 + 30), no 10+18
+      expect(nuevos.pendientes).toBe(10);
+    });
+
+    test('con rolEquipo: el $match de identificadosEnPeriodo incluye primeraIdentificacionPor.userId del equipo', async () => {
+      PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }, { auth0Sub: 'cobranza-2' }]);
+      mockAggregates({});
+
+      await getCorteConciliacion({ rolEquipo: 'cobranza' });
+
+      const identificadosCall = BankMovement.aggregate.mock.calls[2]; // 3er aggregate: identificadosPorOrigen
+      expect(identificadosCall[0][0].$match['primeraIdentificacionPor.userId']).toEqual({ $in: ['cobranza-1', 'cobranza-2'] });
+    });
+
+    test('con rolEquipo y equipo vacío: usa un sentinel que no matchea nada, NUNCA deja el filtro vacío (evita "ver todo")', async () => {
+      PgUser.findAll.mockResolvedValue([]);
+      mockAggregates({});
+
+      await getCorteConciliacion({ rolEquipo: 'cobranza' });
+
+      const identificadosCall = BankMovement.aggregate.mock.calls[2];
+      const filtro = identificadosCall[0][0].$match['primeraIdentificacionPor.userId'].$in;
+      expect(Array.isArray(filtro)).toBe(true);
+      expect(filtro.length).toBeGreaterThan(0);
+      expect(filtro).not.toEqual(['cobranza-1']); // no es un id real, es el sentinel
+    });
+  });
+
   test('banco: se pasa al $match de las 3 agregaciones', async () => {
     mockAggregates({});
     await getCorteConciliacion({ banco: 'BBVA' });
@@ -217,6 +285,25 @@ describe('getCorteConciliacion — corte histórico (fechaInicio/fechaFin)', () 
     const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN });
 
     expect(result.advertencia).toEqual({ registrosConCambioPosteriorAlCierre: 1 });
+  });
+
+  // 2026-10-09: mismo criterio de scope que la rama live, acá reconstruido en el loop JS
+  // (vía primeraIdentificacionPor.userId) en vez de un $match de Mongo.
+  test('(f) con rolEquipo: identificado por OTRO rol cuenta en total pero NO en el bucket identificado', async () => {
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }]);
+    mockFindsHistorico([], [
+      { _id: 'm1', status: 'identificado', primeraIdentificacionAt: new Date(Date.UTC(2026, 8, 16, 12, 0, 0)),
+        primeraIdentificacionPor: { userId: 'cobranza-1' }, ultimoCambioStatusAt: null, historialVinculacion: [] },
+      { _id: 'm2', status: 'identificado', primeraIdentificacionAt: new Date(Date.UTC(2026, 8, 16, 12, 0, 0)),
+        primeraIdentificacionPor: { userId: 'contabilidad-1' }, ultimoCambioStatusAt: null, historialVinculacion: [] },
+    ]);
+    BankMovement.aggregate.mockResolvedValueOnce([]); // identificadosPorOrigen
+
+    const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN, rolEquipo: 'cobranza' });
+
+    expect(result.nuevos.identificado).toBe(1);        // solo el de cobranza-1
+    expect(result.nuevos.total).toBe(2);                // ambos siguen contando en el total real
+    expect(result.nuevos.no_identificado).toBe(0);      // el de contabilidad-1 NO cae a pendiente
   });
 
   test('(d) fechaFin anterior a fechaInicio: BadRequestError', async () => {
@@ -292,6 +379,26 @@ describe('buildReporteCorte', () => {
     expect(detalle.getRow(2).getCell(8).value).toBe('Sí');
     expect(detalle.getRow(3).getCell(8).value).toBe('No');
     expect(detalle.getRow(4).getCell(8).value).toBe('No');
+  });
+
+  // 2026-10-09: invariante documentado en el JSDoc de buildReporteCorte — la suma de "Sí" debe
+  // coincidir con identificadosEnPeriodo.total, así que la columna respeta el mismo rolEquipo.
+  test('"Identificado en el periodo" respeta rolEquipo: No para quien identificó alguien de otro rol', async () => {
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }]);
+    mockAggregates({});
+    mockFinds([], [
+      { banco: 'BBVA', fecha: new Date('2026-10-06'), concepto: 'A', deposito: 1, status: 'identificado',
+        primeraIdentificacionAt: new Date('2026-10-06T12:00:00Z'), primeraIdentificacionPor: { userId: 'cobranza-1' } },
+      { banco: 'BBVA', fecha: new Date('2026-10-06'), concepto: 'B', deposito: 1, status: 'identificado',
+        primeraIdentificacionAt: new Date('2026-10-06T12:00:00Z'), primeraIdentificacionPor: { userId: 'contabilidad-1' } },
+    ]);
+
+    const buffer = await buildReporteCorte({ rolEquipo: 'cobranza' });
+    const wb = await leerWorkbook(buffer);
+    const detalle = wb.getWorksheet('Detalle');
+
+    expect(detalle.getRow(2).getCell(8).value).toBe('Sí'); // cobranza-1
+    expect(detalle.getRow(3).getCell(8).value).toBe('No'); // contabilidad-1
   });
 });
 

@@ -664,9 +664,11 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
     // Comisión real del reporte de NetPay (ver `_cargarComisionesReporteNetpay`);
     // la venta que no esté en un reporte cargado usa `commission` de Kore y
     // queda como PROVISIONAL. Si Mongo falla, todo el día queda provisional.
+    // AMEX también se busca: no lleva comisión en la póliza, pero si su venta
+    // aún no está en un reporte se avisa de revisar su depósito (ver `_lineaNetpayAmex`).
     let comisionesReporte = new Map();
     try {
-      comisionesReporte = await _cargarComisionesReporteNetpay(transaccionesValidas.map(t => t.folio).filter(Boolean), dia);
+      comisionesReporte = await _cargarComisionesReporteNetpay([...transaccionesValidas, ...transaccionesAmex].map(t => t.folio).filter(Boolean), dia);
     } catch (err) {
       const { logger } = require('../../../shared/utils/logger');
       logger.warn(`[Poliza] No se pudo leer netpay_reportes para ${clave} ${dia}, comisiones de Kore (provisionales): ${err.message}`);
@@ -832,6 +834,8 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
         // 2026-10-09: también con reporte parcial) — ver `_lineasNetpay`.
         comisionesConReporte: netpay.conReporte,
         comisionesProvisionales: netpay.provisionales,
+        // Ventas AMEX ligadas que todavía no aparecen en un reporte NetPay.
+        amexSinReporte: amex.provisionales,
       });
     }
   }));
@@ -839,23 +843,35 @@ async function construirNetpayInfo(movimientos, fechaFinal) {
   return { matchedIds, porCentro, cuentasComision, cuentaAmex };
 }
 
-// Leyenda de comisión provisional (2026-10-09, pedido del usuario): si alguna
+// Leyendas de comisión provisional (2026-10-09, pedido del usuario): si alguna
 // venta del día/centro no está en `netpay_reportes`, su comisión es la de Kore
-// y el asiento lo avisa — también con reporte parcial. Al cargar el reporte y
+// y el asiento lo avisa. "REPORTE INCOMPLETO" = parte del reporte y parte de
+// Kore; "KORE" = ninguna venta en el reporte. Al cargar el reporte y
 // re-exportar, la comisión pasa a la real y la leyenda desaparece.
-const LEYENDA_COMISION_PROVISIONAL = 'COMISIONES PROVISIONALES';
+const LEYENDA_COMISION_REPORTE_INCOMPLETO = 'COMISIONES PROVISIONALES REPORTE INCOMPLETO';
+const LEYENDA_COMISION_SOLO_KORE          = 'COMISIONES PROVISIONALES KORE';
+// AMEX (sin comisión, ver `_lineaNetpayAmex`): sí viene en el reporte NetPay,
+// pero su depósito llega 1–5 días después que el resto (datos reales oct-2026).
+// Mientras alguna venta AMEX del día no esté en un reporte se avisa de revisar
+// su depósito (pedido del usuario 2026-10-09).
+const LEYENDA_AMEX_REVISAR_DEPOSITO = 'REVISAR QUE EL DEPOSITO AMEX CAIGA EN LAS PROXIMAS 72 HRS';
+
+function _leyendaComisionNetpay({ comisionesConReporte = 0, comisionesProvisionales = 0 }) {
+  if (!(comisionesProvisionales > 0)) return null;
+  return comisionesConReporte > 0 ? LEYENDA_COMISION_REPORTE_INCOMPLETO : LEYENDA_COMISION_SOLO_KORE;
+}
 
 // Plantilla fija de 7 líneas para el depósito neto + comisión de NetPay de
 // un día/centro (ver `construirNetpayInfo`) — confirmada con el usuario
 // 2026-09-14. `gross`/`comision` ya vienen redondeados a centavos.
-function _lineasNetpay({ gross, comision, ivaComision, centroCostoObj, comisionesProvisionales = 0 }, cuentaDepositosReal, cuentasComision) {
+function _lineasNetpay(infoCentro, cuentaDepositosReal, cuentasComision) {
+  const { gross, comision, ivaComision, centroCostoObj } = infoCentro;
   const totalFactura  = Math.round((comision + ivaComision) * 100) / 100;
   const neto          = Math.round((gross - totalFactura) * 100) / 100;
   const centroCosto   = centroCostoObj.clave;
   const conceptoDeposito = `VENTAS SUC.${centroCostoObj.sucursal}`;
-  const conceptoComision = comisionesProvisionales > 0
-    ? `NETPAY SAPI DE CV - ${LEYENDA_COMISION_PROVISIONAL}`
-    : 'NETPAY SAPI DE CV';
+  const leyenda          = _leyendaComisionNetpay(infoCentro);
+  const conceptoComision = leyenda ? `NETPAY SAPI DE CV - ${leyenda}` : 'NETPAY SAPI DE CV';
 
   return [
     // 1. Depósito neto real (lo que de verdad cae al banco).
@@ -878,8 +894,9 @@ function _lineasNetpay({ gross, comision, ivaComision, centroCostoObj, comisione
 // Ventas AMEX por terminal NetPay (2026-09-29, pedido del usuario): UN solo
 // renglón por centro, tal cual, sin comisión ni IVA — ej.
 // "M1 1101010001 NETPAY AE 0 1,394.22 0 0 VENTAS SUC. SANTA ROSA 117".
-function _lineaNetpayAmex({ grossAmex, centroCostoObj }, cuentaAmex) {
-  return { cuenta: cuentaAmex, serie: 'NETPAY AE', concepto: `VENTAS SUC. ${centroCostoObj.sucursal}`, centroCosto: centroCostoObj.clave,
+function _lineaNetpayAmex({ grossAmex, centroCostoObj, amexSinReporte = 0 }, cuentaAmex) {
+  const concepto = `VENTAS SUC. ${centroCostoObj.sucursal}${amexSinReporte > 0 ? ` - ${LEYENDA_AMEX_REVISAR_DEPOSITO}` : ''}`;
+  return { cuenta: cuentaAmex, serie: 'NETPAY AE', concepto, centroCosto: centroCostoObj.clave,
     debe: grossAmex, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null };
 }
 
@@ -4586,9 +4603,18 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // Depósitos/Anticipos arriba.
   if (netpayInfo?.porCentro?.size) {
     for (const infoCentro of netpayInfo.porCentro.values()) {
+      const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
+      if (infoCentro.grossAmex > 0) {
+        desgloseConsolidado.push({
+          cuenta: null, centroCosto, tipo: 'Resumen', transferencia: 'No', formaPago: 'NETPAY', cfdiSerie: '', cliente: '',
+          monto: infoCentro.grossAmex,
+          nota:  `AMEX del día: $${infoCentro.grossAmex.toFixed(2)} sin comisión${infoCentro.amexSinReporte > 0
+            ? ` — ${LEYENDA_AMEX_REVISAR_DEPOSITO} (${infoCentro.amexSinReporte} sin reporte NetPay)`
+            : ' — ya en reporte NetPay'}`,
+        });
+      }
       // Centro con solo AMEX (sin NetPay normal): no hay asiento de 7 líneas que desglosar.
       if (!(infoCentro.gross > 0)) continue;
-      const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
       for (const d of (infoCentro.detalle ?? [])) {
         const fila = d.fila;
         const cfdiSerie = (fila.serieVentaTicket && fila.folioVentaTicket)
@@ -4617,8 +4643,9 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       const netoCentro         = Math.round((infoCentro.gross - totalFacturaCentro) * 100) / 100;
       const provisionalesCentro = infoCentro.comisionesProvisionales ?? 0;
       const totalVentasCentro   = provisionalesCentro + (infoCentro.comisionesConReporte ?? 0);
-      const leyendaCentro = provisionalesCentro > 0
-        ? ` — ${LEYENDA_COMISION_PROVISIONAL}: ${provisionalesCentro} de ${totalVentasCentro} ventas sin reporte NetPay (comisión de Kore)`
+      const leyendaComision = _leyendaComisionNetpay(infoCentro);
+      const leyendaCentro = leyendaComision
+        ? ` — ${leyendaComision}: ${provisionalesCentro} de ${totalVentasCentro} ventas sin reporte NetPay (comisión de Kore)`
         : '';
       desgloseConsolidado.push({
         cuenta:        null,
@@ -5532,5 +5559,5 @@ module.exports = {
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
   _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
-  _construirNetpayInfo: construirNetpayInfo, _lineasNetpay,
+  _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
 };

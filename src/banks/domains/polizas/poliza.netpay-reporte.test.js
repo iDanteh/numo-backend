@@ -2,8 +2,9 @@
 
 // Comisión NetPay desde `netpay_reportes` (2026-10-09): la venta que está en un
 // reporte cargado usa su comisión real; la que no, la de Kore y el asiento lleva
-// la leyenda "COMISIONES PROVISIONALES" (también con reporte parcial). Datos
-// reales de producción: Oaxaca D0 6-oct, terminal 2840401820.
+// leyenda: "REPORTE INCOMPLETO" si solo parte está en el reporte, "KORE" si
+// ninguna. AMEX lleva aviso de revisar su depósito. Datos reales de
+// producción: Oaxaca D0 6-oct, terminal 2840401820.
 jest.mock('../../../shared/models/postgres', () => ({
   AccountPlan: {
     findAll: jest.fn(async () => ['5201030001', '1108010001', '2102010001', '1107010001'].map((codigo, i) => ({ id: i + 1, codigo }))),
@@ -17,7 +18,8 @@ jest.mock('../erp/NetpayReporte.model', () => ({ aggregate: jest.fn() }));
 
 const { consultarTransaccionesNetpay } = require('../erp/netpay-transacciones.service');
 const NetpayReporte = require('../erp/NetpayReporte.model');
-const { _construirNetpayInfo, _lineasNetpay } = require('./poliza.service');
+const { AccountPlan } = require('../../../shared/models/postgres');
+const { _construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex } = require('./poliza.service');
 
 const centroCostoObj = { id: 7, clave: '107', serieFacturacion: 'D0', sucursal: 'OAXACA' };
 const venta = (id, folio, monto) => ({
@@ -61,7 +63,7 @@ test('todas las ventas en reporte: comisión real (meses sin intereses = total �
   expect(lineas[1].concepto).toBe('NETPAY SAPI DE CV');
 });
 
-test('reporte parcial: la venta sin reporte usa Kore y el asiento lleva la leyenda', async () => {
+test('reporte parcial: la venta sin reporte usa Kore y el asiento dice REPORTE INCOMPLETO', async () => {
   NetpayReporte.aggregate.mockResolvedValue([
     { referencia: 'F20261006-00253', comisionMasIva: 46.47, ivaComision: 6.41 },
   ]);
@@ -77,15 +79,15 @@ test('reporte parcial: la venta sin reporte usa Kore y el asiento lleva la leyen
   expect(c.detalle.find(d => d.fila.id === 2).provisional).toBe(true);
 
   const lineas = _lineasNetpay(c, { id: 99 }, info.cuentasComision);
-  expect(lineas.slice(1).every(l => l.concepto === 'NETPAY SAPI DE CV - COMISIONES PROVISIONALES')).toBe(true);
+  expect(lineas.slice(1).every(l => l.concepto === 'NETPAY SAPI DE CV - COMISIONES PROVISIONALES REPORTE INCOMPLETO')).toBe(true);
   expect(lineas[0].concepto).toBe('VENTAS SUC.OAXACA');
 });
 
-test('sin reporte del día: todo con Kore y leyenda; si Mongo falla, igual', async () => {
+test('sin reporte del día: todo con Kore y el asiento dice KORE; si Mongo falla, igual', async () => {
   NetpayReporte.aggregate.mockResolvedValue([]);
   let c = (await _construirNetpayInfo(movimientos, fecha)).porCentro.get(7);
   expect(c.comisionesProvisionales).toBe(2);
-  expect(_lineasNetpay(c, { id: 99 }, {})[1].concepto).toMatch(/COMISIONES PROVISIONALES$/);
+  expect(_lineasNetpay(c, { id: 99 }, {})[1].concepto).toBe('NETPAY SAPI DE CV - COMISIONES PROVISIONALES KORE');
 
   NetpayReporte.aggregate.mockRejectedValue(new Error('mongo caído'));
   c = (await _construirNetpayInfo(movimientos, fecha)).porCentro.get(7);
@@ -101,4 +103,30 @@ test('busca solo depósitos desde el día de la venta y sin reportes eliminados'
     fechaMovimiento: { $gte: new Date('2026-10-06T00:00:00.000Z') },
     'folios.referencia': { $in: ['F20261006-00253', 'F20261006-00092'] },
   });
+});
+
+test('AMEX: renglón NETPAY AE sin comisión; aviso de 72 hrs solo si aún no está en el reporte', async () => {
+  AccountPlan.findOne.mockResolvedValue({ id: 50, codigo: '1101010001' });
+  consultarTransaccionesNetpay.mockResolvedValue({ transacciones: [
+    ...transacciones,
+    { ...tx('F20261006-00500', '261000003', 1394.22, 30.5), cardTypeName: 'AMEX' },
+  ] });
+  const movs = [...movimientos, venta(3, '261000003', 1394.22)];
+
+  NetpayReporte.aggregate.mockResolvedValue([]);
+  let info = await _construirNetpayInfo(movs, fecha);
+  let c = info.porCentro.get(7);
+  expect(c.grossAmex).toBe(1394.22);
+  expect(c.amexSinReporte).toBe(1);
+  expect(_lineaNetpayAmex(c, info.cuentaAmex).concepto).toBe('VENTAS SUC. OAXACA - REVISAR QUE EL DEPOSITO AMEX CAIGA EN LAS PROXIMAS 72 HRS');
+  expect(NetpayReporte.aggregate.mock.calls[0][0][0].$match['folios.referencia'].$in).toContain('F20261006-00500');
+
+  NetpayReporte.aggregate.mockResolvedValue([{ referencia: 'F20261006-00500', comisionMasIva: 56.6, ivaComision: 7.81 }]);
+  info = await _construirNetpayInfo(movs, fecha);
+  c = info.porCentro.get(7);
+  expect(c.amexSinReporte).toBe(0);
+  const linea = _lineaNetpayAmex(c, info.cuentaAmex);
+  expect(linea.concepto).toBe('VENTAS SUC. OAXACA');
+  expect(linea.debe).toBe(1394.22);
+  AccountPlan.findOne.mockResolvedValue(null);
 });

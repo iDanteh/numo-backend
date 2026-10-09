@@ -18,7 +18,7 @@ jest.mock('./netpay-match.service', () => ({
 }));
 jest.mock('../../../shared/services/global-config.service');
 jest.mock('./netpay-comision-sync.service');
-jest.mock('../../shared/socket', () => ({ emitToBanco: jest.fn(), emitToAll: jest.fn() }));
+jest.mock('../../shared/socket', () => ({ emitToBanco: jest.fn(), emitToAll: jest.fn(), emitToUser: jest.fn() }));
 jest.mock('../banks/bank.service', () => {
   const real = jest.requireActual('../banks/bank.service');
   return { setErpIds: jest.fn(), ERP_TOLERANCE: real.ERP_TOLERANCE, registerErpUnlinkHook: jest.fn() };
@@ -33,10 +33,12 @@ const { buscarTransaccionesNetpay } = require('./kore-caja.service');
 const { _ventanaDiasNetpay } = require('./netpay-match.service');
 const { setErpIds } = require('../banks/bank.service');
 const { sincronizarComisiones } = require('./netpay-comision-sync.service');
-const { emitToBanco, emitToAll } = require('../../shared/socket');
+const { emitToBanco, emitToAll, emitToUser } = require('../../shared/socket');
+const { logger } = require('../../../shared/utils/logger');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 const {
-  cargarReporte, listar, obtenerUltimaCarga, obtenerDetalle, obtenerPorMovimiento, buscarCandidatos,
+  cargarReporte, iniciarCargaReporteJob, obtenerEstadoJobCarga, _correrCargaReporteJob,
+  listar, obtenerUltimaCarga, obtenerDetalle, obtenerPorMovimiento, buscarCandidatos,
   resolverReporte, rechazarReporte, consultarFolioKore, consultarFoliosPendientes,
   consultarFoliosPendientesDeLote, evaluarReporte,
   eliminarReporte, restaurarReporte, _poblarMovimientoVinculado,
@@ -353,6 +355,137 @@ describe('cargarReporte', () => {
     expect(resultado.reportes[0]).toEqual(expect.objectContaining({
       claveRastreo: 'CLAVE-1', estatusCarga: 'creado', sucursales: ['SUC-1'],
     }));
+  });
+});
+
+// Carga en BACKGROUND (pedido explícito del usuario, 2026-10-08) — ver incidente real: un
+// archivo de 33 depósitos/897 folios se cortó a los 5 minutos por el timeout de la ruta de
+// upload, sin dejar ningún rastro de error (la conexión murió a nivel de socket). Mismo patrón
+// ya establecido en este proyecto para Sync ERP-Kore: la ruta responde jobId de inmediato, el
+// trabajo pesado corre sin bloquear, y el progreso/resultado se emite por socket al usuario
+// que inició la carga (emitToUser).
+describe('iniciarCargaReporteJob / _correrCargaReporteJob / obtenerEstadoJobCarga', () => {
+  // SIN fake timers a propósito: el TTL del job (setTimeout real de 2h) deja un handle real
+  // colgado al terminar la suite ("Jest did not exit...", ya visto en otros archivos de este
+  // proyecto — inofensivo, exit code 0) — PERO fakear timers acá fakearía TAMBIÉN el _sleep()
+  // real que usa consultarFoliosPendientes para el backoff de reintento ante un 429 de Kore,
+  // colgando el test de verdad (un await que nunca se resuelve sin avanzar el timer a mano).
+  // Preferible el warning cosmético a un test roto.
+
+  test('parser tira BadRequestError: se propaga tal cual, SIN crear ningún job', async () => {
+    parseNetpayReporte.mockRejectedValue(new BadRequestError('El archivo no contiene la hoja "Resumen"'));
+
+    await expect(iniciarCargaReporteJob(Buffer.from(''), 'x.xlsx', USER)).rejects.toThrow(/hoja "Resumen"/);
+  });
+
+  test('archivo válido: devuelve jobId + total de inmediato, sin esperar a que termine de procesar', async () => {
+    parseNetpayReporte.mockResolvedValue(parsedN1());
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+
+    const { jobId, total } = await iniciarCargaReporteJob(Buffer.from(''), 'archivo.xlsx', USER);
+
+    expect(jobId).toMatch(/^netpay-upload-/);
+    expect(total).toBe(1);
+  });
+
+  test('N=1 exitoso: el job termina en "done", con el MISMO resultado que cargarReporte(), y emite progreso + evento final por socket al usuario que la subió', async () => {
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creado = fakeReporteRecienCreado({ estatus: 'discrepancia' });
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+
+    await _correrCargaReporteJob('job-1', parsedN1().depositos, 'archivo.xlsx', USER);
+
+    const estado = obtenerEstadoJobCarga('job-1', USER._id);
+    expect(estado.status).toBe('done');
+    expect(estado.resultado.reporte.estatus).toBe('discrepancia');
+    expect(estado.resultado.reportes).toHaveLength(1);
+
+    expect(emitToUser).toHaveBeenCalledWith(USER._id, 'netpay-reporte:upload:progress', { jobId: 'job-1', procesados: 1, total: 1, pct: 100 });
+    expect(emitToUser).toHaveBeenCalledWith(USER._id, 'netpay-reporte:upload:done', { jobId: 'job-1', resultado: estado.resultado });
+  });
+
+  test('N>1 exitoso: emite UN progreso por depósito procesado, terminando en 100%', async () => {
+    const u1 = parsedFixture({ claveRastreo: 'C1' });
+    const u2 = parsedFixture({ claveRastreo: 'C2' });
+    const u3 = parsedFixture({ claveRastreo: 'C3' });
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    const creado = fakeReporteRecienCreado();
+    NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+    NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+
+    await _correrCargaReporteJob('job-n', [u1, u2, u3], 'archivo.xlsx', USER);
+
+    const progresos = emitToUser.mock.calls
+      .filter(c => c[1] === 'netpay-reporte:upload:progress')
+      .map(c => c[2]);
+    expect(progresos).toEqual([
+      { jobId: 'job-n', procesados: 1, total: 3, pct: 33 },
+      { jobId: 'job-n', procesados: 2, total: 3, pct: 67 },
+      { jobId: 'job-n', procesados: 3, total: 3, pct: 100 },
+    ]);
+
+    const estado = obtenerEstadoJobCarga('job-n', USER._id);
+    expect(estado.status).toBe('done');
+    expect(estado.resultado.resumen).toEqual({ total: 3, creados: 3, yaCargados: 0, errores: 0 });
+  });
+
+  test('error de negocio (ej. ConflictError, claveRastreo ya existente en N=1): status "error" con el mensaje tal cual, emite el evento de error', async () => {
+    jest.spyOn(logger, 'error').mockImplementation(() => {});
+    NetpayReporte.findOne = jest.fn(() => fakeFind({ _id: 'existente' }));
+
+    await _correrCargaReporteJob('job-err', parsedN1().depositos, 'archivo.xlsx', USER);
+
+    const estado = obtenerEstadoJobCarga('job-err', USER._id);
+    expect(estado.status).toBe('error');
+    expect(estado.error).toMatch(/Ya existe un reporte cargado/);
+    expect(emitToUser).toHaveBeenCalledWith(USER._id, 'netpay-reporte:upload:error', { jobId: 'job-err', error: estado.error });
+    // Un error de NEGOCIO esperado (no un bug) no debe ensuciar el log de errores.
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  test('error inesperado (no BadRequestError/ConflictError): se envuelve el mensaje y SÍ se loguea', async () => {
+    jest.spyOn(logger, 'error').mockImplementation(() => {});
+    NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+    NetpayReporte.create = jest.fn().mockRejectedValue(new Error('Mongo se cayó'));
+
+    await _correrCargaReporteJob('job-boom', parsedN1().depositos, 'archivo.xlsx', USER);
+
+    const estado = obtenerEstadoJobCarga('job-boom', USER._id);
+    expect(estado.status).toBe('error');
+    expect(estado.error).toMatch(/Error inesperado al procesar el archivo: Mongo se cayó/);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  describe('obtenerEstadoJobCarga', () => {
+    test('jobId inexistente: null', () => {
+      expect(obtenerEstadoJobCarga('no-existe', USER._id)).toBeNull();
+    });
+
+    test('jobId de OTRO usuario: null (nunca expone el job de alguien más)', async () => {
+      NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+      const creado = fakeReporteRecienCreado();
+      NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+      NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+
+      await _correrCargaReporteJob('job-ajeno', parsedN1().depositos, 'archivo.xlsx', USER);
+
+      expect(obtenerEstadoJobCarga('job-ajeno', 'otro-usuario-distinto')).toBeNull();
+    });
+
+    test('el estado nunca expone userId', async () => {
+      NetpayReporte.findOne = jest.fn(() => fakeFind(null));
+      const creado = fakeReporteRecienCreado();
+      NetpayReporte.create = jest.fn().mockResolvedValue(creado);
+      NetpayReporte.findById = jest.fn(() => fakeQuery(creado));
+
+      await _correrCargaReporteJob('job-sin-userid', parsedN1().depositos, 'archivo.xlsx', USER);
+
+      expect(obtenerEstadoJobCarga('job-sin-userid', USER._id).userId).toBeUndefined();
+    });
   });
 });
 

@@ -1,12 +1,21 @@
 'use strict';
 
 jest.mock('../shared/utils/logger', () => ({ logger: { error: jest.fn() } }));
+jest.mock('./system-monitor-historial.service', () => ({ guardarError: jest.fn() }));
 
 const EventEmitter = require('events');
 const express = require('express');
 const request = require('supertest');
 const { trafficTracker, getEstadoCrudo, _resetParaTests } = require('./traffic-tracker.middleware');
 const { logger } = require('../shared/utils/logger');
+const historialSvc = require('./system-monitor-historial.service');
+
+// Deja el microtask queue drenar — guardarError() se llama sin await (fire-and-forget)
+// desde el handler de 'finish', así que su .then/.catch corre en un microtask aparte.
+async function flushMicrotasks() {
+  await Promise.resolve();
+  await Promise.resolve();
+}
 
 function buildApp() {
   const app = express();
@@ -14,6 +23,10 @@ function buildApp() {
   app.get('/ok', (req, res) => res.status(200).json({ ok: true }));
   app.get('/redirect', (req, res) => res.status(302).end());
   app.get('/bad', (req, res) => res.status(400).json({ error: 'bad' }));
+  app.get('/conflict', (req, res) => res.status(409).json({ error: 'conflict' }));
+  app.get('/unprocessable', (req, res) => res.status(422).json({ error: 'unprocessable' }));
+  app.get('/forbidden', (req, res) => res.status(403).json({ error: 'forbidden' }));
+  app.get('/notfound', (req, res) => res.status(404).json({ error: 'notfound' }));
   app.get('/boom', (req, res) => res.status(500).json({ error: 'boom' }));
   return app;
 }
@@ -21,6 +34,7 @@ function buildApp() {
 describe('trafficTracker middleware', () => {
   beforeEach(() => {
     _resetParaTests();
+    historialSvc.guardarError.mockReset().mockResolvedValue(undefined);
   });
 
   test('cuenta una request 2xx en los buckets de segundo y minuto', async () => {
@@ -62,6 +76,64 @@ describe('trafficTracker middleware', () => {
     const estado = getEstadoCrudo();
     expect(estado.erroresRecientes).toHaveLength(1);
     expect(estado.erroresRecientes[0]).toMatchObject({ metodo: 'GET', path: '/boom', status: 500 });
+  });
+
+  test('un 5xx dispara guardarError() fire-and-forget con ts (Date)/metodo/path/status', async () => {
+    const app = buildApp();
+    await request(app).get('/boom');
+    await flushMicrotasks();
+
+    expect(historialSvc.guardarError).toHaveBeenCalledTimes(1);
+    const doc = historialSvc.guardarError.mock.calls[0][0];
+    expect(doc.ts).toBeInstanceOf(Date);
+    expect(doc.metodo).toBe('GET');
+    expect(doc.path).toBe('/boom');
+    expect(doc.status).toBe(500);
+  });
+
+  test('un 2xx/3xx NO llama a guardarError', async () => {
+    const app = buildApp();
+    await request(app).get('/ok');
+    await request(app).get('/redirect');
+    await flushMicrotasks();
+
+    expect(historialSvc.guardarError).not.toHaveBeenCalled();
+  });
+
+  test('403/404 (ruido normal de uso, no negocio) NO llaman a guardarError', async () => {
+    const app = buildApp();
+    await request(app).get('/forbidden');
+    await request(app).get('/notfound');
+    await flushMicrotasks();
+
+    expect(historialSvc.guardarError).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['/bad', 400],
+    ['/conflict', 409],
+    ['/unprocessable', 422],
+  ])('un error de negocio (%s, %i) SÍ llama a guardarError', async (path, status) => {
+    const app = buildApp();
+    await request(app).get(path);
+    await flushMicrotasks();
+
+    expect(historialSvc.guardarError).toHaveBeenCalledTimes(1);
+    expect(historialSvc.guardarError.mock.calls[0][0]).toMatchObject({ metodo: 'GET', path, status });
+  });
+
+  test('si guardarError() rechaza (Mongo caído), solo se loguea — no propaga ni afecta la respuesta ya enviada', async () => {
+    historialSvc.guardarError.mockRejectedValueOnce(new Error('mongo caído'));
+    const app = buildApp();
+
+    const res = await request(app).get('/boom');
+    expect(res.status).toBe(500); // la respuesta ya se mandó, no se ve afectada
+
+    await flushMicrotasks();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.stringContaining('[system-monitor] Error persistiendo error en Mongo'),
+      'mongo caído',
+    );
   });
 
   test('erroresRecientes se recorta a los últimos 20 (descarta los más viejos)', async () => {

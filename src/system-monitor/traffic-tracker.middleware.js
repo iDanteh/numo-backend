@@ -9,10 +9,21 @@
 // vez que le toca turno de nuevo con un `ts` distinto al que tenía guardado.
 
 const { logger } = require('../shared/utils/logger');
+const historialSvc = require('./system-monitor-historial.service');
 
 const VENTANA_SEGUNDOS = 60;
 const VENTANA_MINUTOS = 60;
 const MAX_ERRORES_RECIENTES = 20;
+
+// Códigos de negocio (AppError: BadRequestError/ConflictError/UnprocessableError)
+// que SÍ interesa poder consultar en el panel, además de cualquier 5xx. Deja afuera
+// a propósito 401/403/404 (ForbiddenError, tokens, recursos no encontrados) — son
+// ruido normal de uso, no incidentes a investigar (decisión del usuario, 2026-10-09).
+const CODIGOS_NEGOCIO_A_REGISTRAR = new Set([400, 409, 422]);
+
+function _esErrorARegistrar(statusCode) {
+  return statusCode >= 500 || CODIGOS_NEGOCIO_A_REGISTRAR.has(statusCode);
+}
 
 function _bucketVacio() {
   return { ts: null, total: 0, c2xx: 0, c3xx: 0, c4xx: 0, c5xx: 0, sumaDuracionMs: 0, muestrasDuracion: 0 };
@@ -75,14 +86,23 @@ function trafficTracker(req, res, next) {
       _registrar(segundos, VENTANA_SEGUNDOS, tsSeg, res.statusCode, duracionMs);
       _registrar(minutos, VENTANA_MINUTOS, tsMin, res.statusCode, duracionMs);
 
-      if (res.statusCode >= 500) {
-        erroresRecientes.push({
-          ts: ahoraMs,
-          metodo: req.method,
-          path: req.originalUrl || req.path,
-          status: res.statusCode,
-        });
+      if (_esErrorARegistrar(res.statusCode)) {
+        const metodo = req.method;
+        const path = req.originalUrl || req.path;
+        const status = res.statusCode;
+
+        erroresRecientes.push({ ts: ahoraMs, metodo, path, status });
         if (erroresRecientes.length > MAX_ERRORES_RECIENTES) erroresRecientes.shift();
+
+        // Persistencia fire-and-forget: la respuesta ya se mandó (estamos en
+        // 'finish'), así que esto NUNCA debe bloquearla ni, si falla, tumbar el
+        // proceso — el mismo 5xx puede ser justo PORQUE Mongo está caído. Sin
+        // await, con .catch() propio (no alcanza con el try/catch de afuera: ese
+        // solo atrapa errores síncronos, no el rechazo de esta promesa).
+        historialSvc.guardarError({ ts: new Date(ahoraMs), metodo, path, status })
+          .catch((err) => {
+            logger.error('[system-monitor] Error persistiendo error en Mongo (no bloqueante):', err.message);
+          });
       }
     } catch (err) {
       logger.error('[system-monitor] Error registrando métricas de tráfico (request de negocio no afectada):', err.message);

@@ -23,13 +23,14 @@ jest.mock('./system-monitor.service', () => ({
 }));
 jest.mock('./system-monitor-historial.service', () => ({
   getHistorial: jest.fn(),
+  getErroresHistorial: jest.fn(),
 }));
 
 const express = require('express');
 const request = require('supertest');
 const router = require('./system-monitor.routes');
 const { getSnapshot } = require('./system-monitor.service');
-const { getHistorial } = require('./system-monitor-historial.service');
+const { getHistorial, getErroresHistorial } = require('./system-monitor-historial.service');
 const { PERMISSIONS } = require('../shared/config/rbac');
 
 describe('GET /snapshot', () => {
@@ -96,5 +97,43 @@ describe('GET /historial', () => {
     await request(app).get('/historial').set('x-test-permissions', JSON.stringify([PERMISSIONS.SYSTEM_MONITOR_READ]));
 
     expect(getHistorial).toHaveBeenCalledWith({ fechaInicio: undefined, fechaFin: undefined });
+  });
+});
+
+describe('GET /errores-historial', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use('/', router);
+  });
+
+  test('responde 403 sin system:monitor:read', async () => {
+    const res = await request(app).get('/errores-historial').set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(getErroresHistorial).not.toHaveBeenCalled();
+  });
+
+  test('responde 200 y pasa fechaInicio/fechaFin tal cual al service', async () => {
+    getErroresHistorial.mockResolvedValue([{ ts: '2026-10-08T12:00:00.000Z', metodo: 'GET', path: '/api/x', status: 503 }]);
+
+    const res = await request(app)
+      .get('/errores-historial')
+      .query({ fechaInicio: '2026-09-20', fechaFin: '2026-09-24' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.SYSTEM_MONITOR_READ]));
+
+    expect(res.status).toBe(200);
+    expect(getErroresHistorial).toHaveBeenCalledWith({ fechaInicio: '2026-09-20', fechaFin: '2026-09-24' });
+    expect(res.body).toEqual([{ ts: '2026-10-08T12:00:00.000Z', metodo: 'GET', path: '/api/x', status: 503 }]);
+  });
+
+  test('sin query params: los pasa como undefined (el service decide el default)', async () => {
+    getErroresHistorial.mockResolvedValue([]);
+
+    await request(app).get('/errores-historial').set('x-test-permissions', JSON.stringify([PERMISSIONS.SYSTEM_MONITOR_READ]));
+
+    expect(getErroresHistorial).toHaveBeenCalledWith({ fechaInicio: undefined, fechaFin: undefined });
   });
 });

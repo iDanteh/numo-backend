@@ -73,7 +73,22 @@ function applyMovementRestrictions(query, userId, { scope = MOVEMENT_SCOPE.OWN, 
   if (q.status === 'identificado' && scope === MOVEMENT_SCOPE.OWN) {
     q.identificadoPorUsuario = userId;
   }
-  if (!q.status) q.status = RESTRICTED_DEFAULT_STATUSES;
+  if (!q.status) {
+    // Bug real (2026-10-09, reportado por el usuario): este default se aplicaba SIEMPRE que
+    // no viniera `status` explícito, sin importar `scope` — el buscador global de movimientos
+    // (banks.component.ts#_wireGlobalSearch, que busca por importe/concepto en TODOS los
+    // bancos y nunca manda `status`) quedaba atado a 'no_identificado,reclasificado' incluso
+    // para alguien con scope ALL (banks:cobranza:identificados:all), así que nunca encontraba
+    // un depósito ya identificado por importe — había que ir banco por banco, filtrar
+    // "Identificados" a mano (ESE camino sí funcionaba: manda status='identificado' explícito,
+    // que ya respeta scope arriba) y recién ahí buscar el importe.
+    // Acotado a `q.search` (no a cualquier request con scope ALL) para no tocar el default de
+    // la bandeja de pendientes cuando no hay una búsqueda activa — ver sin `search`, sigue
+    // mostrando solo no_identificado/reclasificado como siempre.
+    q.status = (scope === MOVEMENT_SCOPE.ALL && q.search)
+      ? `${RESTRICTED_DEFAULT_STATUSES},identificado`
+      : RESTRICTED_DEFAULT_STATUSES;
+  }
   q.tipo = 'deposito';
   return { query: q, empty: false };
 }
@@ -111,6 +126,37 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
   res.json(await service.getCards(restrictions, year, month, fechaInicio, fechaFin));
 }));
 
+// Importación deferida (mismo patrón que users/role.service.js#db) para evitar
+// dependencia circular durante el bootstrap.
+function _postgresModels() {
+  return require('../../../shared/models/postgres');
+}
+
+// auth0Subs de usuarios con rol 'cobranza' ACTUAL — usado para acotar BANKS_COBRANZA_ALL
+// a "mi equipo" (2026-10-09, pedido explícito del usuario: con el permiso tal cual estaba,
+// alguien de cobranza veía también las identificaciones de contabilidad, porque el permiso
+// nunca tuvo noción de equipo — ver [[project_permisos_metricas_equipo]]).
+//
+// A propósito usa rol ACTUAL (a diferencia de
+// bank-indicadores.service.js#listUsuariosConIdentificaciones, que deliberadamente NO
+// filtra por rol actual para no perder trabajo histórico de alguien que cambió de rol):
+// acá la pregunta es "quién es mi equipo HOY", no un historial — si alguien se fue de
+// cobranza, deja de contar como "mi equipo" de ahora en más, igual que si alguien se suma.
+// Mismo patrón de consulta que users/role.service.js#updateRoleDefinition.
+async function _cobranzaTeamAuth0Subs() {
+  const { User } = _postgresModels();
+  const rows = await User.findAll({ where: { role: 'cobranza' }, attributes: ['auth0Sub'], raw: true });
+  return rows.map((u) => u.auth0Sub ?? u.auth0_sub).filter(Boolean);
+}
+
+// Valor que nunca matchea un auth0Sub real — se usa cuando BANKS_COBRANZA_ALL debe
+// restringir a "mi equipo" pero ese equipo (o la intersección con ?userIds= pedido a
+// mano) da vacío. CRÍTICO: un array vacío NO sirve para esto — _matchScopeUserId()
+// (bank-indicadores.service.js) trata `[]` como "sin filtro" (longitud 0 → undefined),
+// o sea que un array vacío abriría la vista a TODOS en vez de a NADIE. Con este sentinel,
+// el `$in` de Mongo no matchea ningún documento real, logrando el "nadie" que sí se busca.
+const SIN_COINCIDENCIA = '__sin-coincidencia-cobranza-team__';
+
 // Dashboard de Cobranza (2026-09-17): mismo criterio de scope que
 // collection-request.routes.js#_resolveScopeUserId (admin ve todo el equipo o acota vía
 // ?userIds=, cualquier otro rol queda forzado a lo propio), pero resuelto vía PERMISO
@@ -120,10 +166,22 @@ router.get('/cards', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(
 // de introducir un chequeo de rol literal que no existe en ningún otro lado de este router.
 // `String(...)` antes de `.split(',')` neutraliza una posible inyección de objeto de
 // Express/qs (`?userIds[a]=x`), mismo cuidado que el helper equivalente de collection-requests.
-function _resolverScopeUserIdBancos(req, hasFullAccess) {
-  if (!hasFullAccess) return req.user._id;
+//
+// `hasConfigAccess` = acceso total sin fronteras (admin real, vía BANKS_CONFIG): respeta
+// ?userIds= tal cual, sin cruzar contra ningún rol — esto NO cambió.
+// `hasCobranzaAllAccess` (sin config) = acotado SIEMPRE a `_cobranzaTeamAuth0Subs()`, incluso
+// si ?userIds= pide a alguien fuera de ese equipo (no hay forma de saltarse la frontera
+// pidiendo el id a mano).
+async function _resolverScopeUserIdBancos(req, hasConfigAccess, hasCobranzaAllAccess) {
+  if (!hasConfigAccess && !hasCobranzaAllAccess) return req.user._id;
+
   const userIds = String(req.query.userIds || '').split(',').map(s => s.trim()).filter(Boolean);
-  return userIds.length ? userIds : undefined;
+
+  if (hasConfigAccess) return userIds.length ? userIds : undefined;
+
+  const equipo = await _cobranzaTeamAuth0Subs();
+  const scope = userIds.length ? userIds.filter((id) => equipo.includes(id)) : equipo;
+  return scope.length ? scope : [SIN_COINCIDENCIA];
 }
 
 // GET /api/banks/indicadores — tiempo de identificación (dashboard de Bancos). Acceso
@@ -135,23 +193,31 @@ function _resolverScopeUserIdBancos(req, hasFullAccess) {
 // scope y por qué el backlog nunca se acota.
 router.get('/indicadores', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco, categoria, year, month, fechaInicio, fechaFin } = req.query;
-  const hasFullAccess = (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions))
-    || (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions));
-  const scopeUserId = _resolverScopeUserIdBancos(req, hasFullAccess);
+  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasCobranzaAllAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions);
+  const scopeUserId = await _resolverScopeUserIdBancos(req, hasConfigAccess, hasCobranzaAllAccess);
   res.json(await indicadoresService.getIndicadoresIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId }));
 }));
 
 // GET /api/banks/cortes — control periódico de conciliación (2026-10-02): rezagados,
 // nuevos depósitos del periodo e identificados en el periodo (separados por origen).
-// Sin scope de usuario (es un control de equipo, no de desempeño individual — ver
-// bank-indicadores.service.js#getCorteConciliacion). `periodo` lo decide el FRONTEND según
-// el rol (semanal para cobranza, mensual para contabilidad) — mismo criterio ya usado para
-// la visibilidad de pestañas del carousel de Bancos: es una decisión de UX, no de permisos,
-// así que el backend no la fuerza por rol (cualquiera con BANKS_READ puede pedir cualquier
+// `rezagados`/`nuevos.total`/`pendientes`/`otros` siguen sin scope de usuario (control de
+// EQUIPO completo, no de desempeño individual). `periodo` lo decide el FRONTEND según el rol
+// (semanal para cobranza, mensual para contabilidad) — mismo criterio ya usado para la
+// visibilidad de pestañas del carousel de Bancos: es una decisión de UX, no de permisos, así
+// que el backend no la fuerza por rol (cualquiera con BANKS_READ puede pedir cualquier
 // periodo explícitamente).
+//
+// `nuevos.identificado` e `identificadosEnPeriodo` SÍ se acotan por rol (2026-10-09, pedido
+// explícito del usuario: el corte de cobranza mezclaba identificaciones de contabilidad y
+// viceversa) — `rolEquipo` viaja al service como `req.user.role`, o `null` para BANKS_CONFIG
+// (admin ve el total real cruzando todos los roles, mismo criterio que el resto de este
+// router). Ver bank-indicadores.service.js#getCorteConciliacion para el detalle completo.
 router.get('/cortes', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { periodo, banco, fechaInicio, fechaFin } = req.query;
-  res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null, fechaInicio, fechaFin }));
+  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const rolEquipo = hasConfigAccess ? null : req.user.role;
+  res.json(await indicadoresService.getCorteConciliacion({ periodo, banco: banco || null, fechaInicio, fechaFin, rolEquipo }));
 }));
 
 // GET /api/banks/cortes/periodo-rol — qué periodo ve el usuario autenticado y si puede
@@ -164,10 +230,13 @@ router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), 
 
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle
 // de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
-// data ya visible en pantalla, solo en formato descargable.
+// data ya visible en pantalla (incluido el scope por rol de /cortes, 2026-10-09), solo en
+// formato descargable.
 router.get('/cortes/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { periodo, banco, fechaInicio, fechaFin } = req.query;
-  const buffer = await indicadoresService.buildReporteCorte({ periodo, banco: banco || null, fechaInicio, fechaFin });
+  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const rolEquipo = hasConfigAccess ? null : req.user.role;
+  const buffer = await indicadoresService.buildReporteCorte({ periodo, banco: banco || null, fechaInicio, fechaFin, rolEquipo });
   const fecha = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="Corte-Conciliacion-${fecha}.xlsx"`);
@@ -182,9 +251,9 @@ router.get('/cortes/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyn
 // amerite un permiso más alto.
 router.get('/indicadores/reporte', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco, categoria, year, month, fechaInicio, fechaFin } = req.query;
-  const hasFullAccess = (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions))
-    || (await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions));
-  const scopeUserId = _resolverScopeUserIdBancos(req, hasFullAccess);
+  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const hasCobranzaAllAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions);
+  const scopeUserId = await _resolverScopeUserIdBancos(req, hasConfigAccess, hasCobranzaAllAccess);
   const buffer = await indicadoresService.buildReporteIdentificacion({ banco, categoria, year, month, fechaInicio, fechaFin, scopeUserId });
   const fecha = new Date().toISOString().slice(0, 10);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -196,8 +265,24 @@ router.get('/indicadores/reporte', authenticate, permit(PERMISSIONS.BANKS_READ),
 // actividad REAL de identificación (cualquier vía), para poblar el filtro de "elegí a quién
 // ver" del dashboard de Cobranza — mismo permiso que /indicadores, no es un dato sensible
 // propio de admin.
+//
+// Con BANKS_CONFIG: lista completa sin filtrar por rol (igual que siempre — admin ve el
+// historial real completo, incluyendo gente que cambió de rol, ver
+// bank-indicadores.service.js#listUsuariosConIdentificaciones).
+// Con BANKS_COBRANZA_ALL sin config (2026-10-09): se cruza contra `_cobranzaTeamAuth0Subs()`
+// para que el <select> no ofrezca gente de otros roles que después el scope igual bloquearía
+// — si no se cruzara acá, alguien podría elegir manualmente a un usuario de contabilidad en
+// el dropdown y ver "0 resultados" sin entender por qué.
 router.get('/indicadores/usuarios-con-identificaciones', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  res.json({ userIds: await indicadoresService.listUsuariosConIdentificaciones() });
+  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const todos = await indicadoresService.listUsuariosConIdentificaciones();
+  if (hasConfigAccess) return res.json({ userIds: todos });
+
+  const hasCobranzaAllAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_ALL, req.user.extraPermissions);
+  if (!hasCobranzaAllAccess) return res.json({ userIds: todos });
+
+  const equipo = await _cobranzaTeamAuth0Subs();
+  res.json({ userIds: todos.filter((id) => equipo.includes(id)) });
 }));
 
 // GET /api/banks/categories?banco=BBVA  (banco opcional; sin banco → todos)

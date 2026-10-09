@@ -45,6 +45,11 @@ jest.mock('../../../visor/models/CFDI', () => ({
 // prueba a nivel de gate de permiso + paso de query params, no de agregación (esa lógica
 // tiene su propio test: bank-indicadores.service.test.js).
 jest.mock('../../../shared/services/rbac-store');
+// Users en Postgres (2026-10-09): bank.routes.js consulta role='cobranza' para acotar
+// BANKS_COBRANZA_ALL a "mi equipo" — ver _cobranzaTeamAuth0Subs().
+jest.mock('../../../shared/models/postgres', () => ({
+  User: { findAll: jest.fn() },
+}));
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
   getCorteConciliacion: jest.fn(),
@@ -61,6 +66,7 @@ const service = require('./bank.service');
 const CFDI    = require('../../../visor/models/CFDI');
 const rbacStore = require('../../../shared/services/rbac-store');
 const indicadoresService = require('./bank-indicadores.service');
+const { User: PgUser } = require('../../../shared/models/postgres');
 const { PERMISSIONS, MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 
 describe('GET /cfdis/buscar', () => {
@@ -245,20 +251,54 @@ describe('GET /indicadores', () => {
     expect(args.scopeUserId).toEqual(['id1', 'id2']);
   });
 
-  // 2026-09-23 (permiso nuevo): BANKS_COBRANZA_ALL desbloquea el mismo acceso completo que
-  // BANKS_CONFIG, sin necesitar este último — pensado para asignarlo por persona vía
-  // extraPermissions. mockImplementation distingue por permiso (a diferencia del
-  // mockResolvedValue(true) de arriba, que no puede probar "solo UNO de los dos está OK").
-  test('sin BANKS_CONFIG pero con BANKS_COBRANZA_ALL: scopeUserId undefined (ve todo el equipo)', async () => {
+  // 2026-10-09 (corrección: antes "veía todo el equipo" literal, incluyendo roles como
+  // contabilidad — pedido explícito del usuario tras encontrarlo en producción). Ahora
+  // BANKS_COBRANZA_ALL sin BANKS_CONFIG acota a auth0Subs con rol 'cobranza' ACTUAL
+  // (_cobranzaTeamAuth0Subs), nunca a todos. mockImplementation distingue por permiso (a
+  // diferencia del mockResolvedValue(true) de arriba, que no puede probar "solo UNO de los
+  // dos está OK").
+  test('sin BANKS_CONFIG pero con BANKS_COBRANZA_ALL: scopeUserId acotado al equipo de rol cobranza, no a todos', async () => {
     rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }, { auth0Sub: 'cobranza-2' }]);
 
     await request(app)
       .get('/indicadores')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(rbacStore.hasPermission).toHaveBeenCalledWith('test-role', PERMISSIONS.BANKS_COBRANZA_ALL, []);
+    expect(PgUser.findAll).toHaveBeenCalledWith({ where: { role: 'cobranza' }, attributes: ['auth0Sub'], raw: true });
     const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
-    expect(args.scopeUserId).toBeUndefined();
+    expect(args.scopeUserId).toEqual(['cobranza-1', 'cobranza-2']);
+  });
+
+  test('con BANKS_COBRANZA_ALL y ?userIds= pidiendo a alguien fuera del equipo: se excluye (intersección, no se puede saltar la frontera a mano)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }, { auth0Sub: 'cobranza-2' }]);
+
+    await request(app)
+      .get('/indicadores')
+      .query({ userIds: 'cobranza-1,contabilidad-1' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(args.scopeUserId).toEqual(['cobranza-1']);
+  });
+
+  // Gotcha real que evita esta prueba: _matchScopeUserId() (bank-indicadores.service.js)
+  // trata un array VACÍO como "sin filtro" → mostraría TODO en vez de NADA. Si el equipo
+  // cobranza queda vacío (o la intersección con ?userIds= no matchea a nadie del equipo),
+  // el scope resultante nunca debe quedar en un array vacío.
+  test('con BANKS_COBRANZA_ALL y equipo cobranza vacío: scopeUserId NO queda en array vacío (evita el bug de "sin filtro" = ver todo)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+    PgUser.findAll.mockResolvedValue([]);
+
+    await request(app)
+      .get('/indicadores')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = indicadoresService.getIndicadoresIdentificacion.mock.calls[0][0];
+    expect(Array.isArray(args.scopeUserId)).toBe(true);
+    expect(args.scopeUserId.length).toBeGreaterThan(0);
   });
 
   test('sin BANKS_CONFIG ni BANKS_COBRANZA_ALL: scopeUserId se fuerza al propio usuario', async () => {
@@ -343,17 +383,18 @@ describe('GET /indicadores/reporte', () => {
     expect(args.scopeUserId).toBe('user-test');
   });
 
-  // 2026-09-23 (permiso nuevo): mismo criterio que /indicadores — BANKS_COBRANZA_ALL
-  // desbloquea el reporte descargable igual que BANKS_CONFIG.
-  test('sin BANKS_CONFIG pero con BANKS_COBRANZA_ALL: scopeUserId undefined (ve todo el equipo)', async () => {
+  // 2026-10-09: mismo criterio que /indicadores — BANKS_COBRANZA_ALL sin BANKS_CONFIG acota
+  // al equipo de rol cobranza, nunca a todos (ver test equivalente en GET /indicadores).
+  test('sin BANKS_CONFIG pero con BANKS_COBRANZA_ALL: scopeUserId acotado al equipo de rol cobranza', async () => {
     rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }]);
 
     await request(app)
       .get('/indicadores/reporte')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     const args = indicadoresService.buildReporteIdentificacion.mock.calls[0][0];
-    expect(args.scopeUserId).toBeUndefined();
+    expect(args.scopeUserId).toEqual(['cobranza-1']);
   });
 
   test('responde con headers de descarga (superagent no parsea este content-type a Buffer por default, no se testea el body binario acá)', async () => {
@@ -381,6 +422,7 @@ describe('GET /cortes', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config por defecto
     indicadoresService.getCorteConciliacion.mockResolvedValue(FAKE_CORTE);
     app = express();
     app.use(express.json());
@@ -407,7 +449,7 @@ describe('GET /cortes', () => {
       ...FAKE_CORTE,
       inicio: FAKE_CORTE.inicio.toISOString(), // serializado a JSON
     });
-    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', rolEquipo: 'test-role' });
   });
 
   test('sin ?banco: se pasa null (no el string vacío)', async () => {
@@ -416,7 +458,7 @@ describe('GET /cortes', () => {
       .query({ periodo: 'semanal' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null, rolEquipo: 'test-role' });
   });
 
   test('con fechaInicio/fechaFin: se pasan tal cual al service (corte histórico)', async () => {
@@ -426,8 +468,20 @@ describe('GET /cortes', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({
-      periodo: 'semanal', banco: null, fechaInicio: '2026-09-14', fechaFin: '2026-09-20',
+      periodo: 'semanal', banco: null, fechaInicio: '2026-09-14', fechaFin: '2026-09-20', rolEquipo: 'test-role',
     });
+  });
+
+  // 2026-10-09: con BANKS_CONFIG, rolEquipo viaja null (admin ve el total real, sin acotar por rol).
+  test('con BANKS_CONFIG: rolEquipo viaja null (sin acotar por rol)', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
+    await request(app)
+      .get('/cortes')
+      .query({ periodo: 'semanal' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null, rolEquipo: null });
   });
 });
 
@@ -468,6 +522,7 @@ describe('GET /cortes/reporte', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config por defecto
     indicadoresService.buildReporteCorte.mockResolvedValue(Buffer.from('fake-xlsx'));
     app = express();
     app.use(express.json());
@@ -492,7 +547,7 @@ describe('GET /cortes/reporte', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Corte-Conciliacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
-    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA' });
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', rolEquipo: 'test-role' });
   });
 
   test('con fechaInicio/fechaFin: se pasan tal cual al service (reporte de corte histórico)', async () => {
@@ -502,8 +557,19 @@ describe('GET /cortes/reporte', () => {
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({
-      periodo: 'mensual', banco: 'BBVA', fechaInicio: '2026-09-01', fechaFin: '2026-09-30',
+      periodo: 'mensual', banco: 'BBVA', fechaInicio: '2026-09-01', fechaFin: '2026-09-30', rolEquipo: 'test-role',
     });
+  });
+
+  test('con BANKS_CONFIG: rolEquipo viaja null (sin acotar por rol)', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
+    await request(app)
+      .get('/cortes/reporte')
+      .query({ periodo: 'mensual', banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', rolEquipo: null });
   });
 });
 
@@ -512,7 +578,8 @@ describe('GET /indicadores/usuarios-con-identificaciones', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
-    indicadoresService.listUsuariosConIdentificaciones.mockResolvedValue(['user-1', 'user-2']);
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false);
+    indicadoresService.listUsuariosConIdentificaciones.mockResolvedValue(['cobranza-1', 'contabilidad-1']);
     app = express();
     app.use(express.json());
     app.use('/', router);
@@ -527,13 +594,38 @@ describe('GET /indicadores/usuarios-con-identificaciones', () => {
     expect(indicadoresService.listUsuariosConIdentificaciones).not.toHaveBeenCalled();
   });
 
-  test('con banks:read devuelve { userIds } tal cual el service', async () => {
+  test('sin BANKS_CONFIG ni BANKS_COBRANZA_ALL: devuelve { userIds } tal cual el service (comportamiento previo, sin cambios)', async () => {
     const res = await request(app)
       .get('/indicadores/usuarios-con-identificaciones')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ userIds: ['user-1', 'user-2'] });
+    expect(res.body).toEqual({ userIds: ['cobranza-1', 'contabilidad-1'] });
+  });
+
+  test('con BANKS_CONFIG: lista completa sin filtrar por rol (admin ve el historial real completo)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_CONFIG);
+
+    const res = await request(app)
+      .get('/indicadores/usuarios-con-identificaciones')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.body).toEqual({ userIds: ['cobranza-1', 'contabilidad-1'] });
+    expect(PgUser.findAll).not.toHaveBeenCalled();
+  });
+
+  // 2026-10-09: sin esto, el <select> ofrecía elegir a alguien de contabilidad que el
+  // scope de /indicadores igual iba a bloquear después — confuso ("0 resultados" sin
+  // explicación). Se cruza contra el equipo de rol cobranza ACTUAL.
+  test('con BANKS_COBRANZA_ALL sin BANKS_CONFIG: filtra la lista al equipo de rol cobranza', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_ALL);
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'cobranza-1' }]);
+
+    const res = await request(app)
+      .get('/indicadores/usuarios-con-identificaciones')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.body).toEqual({ userIds: ['cobranza-1'] });
   });
 });
 
@@ -642,6 +734,43 @@ describe('GET /movements', () => {
     expect(rbacStore.hasPermission).toHaveBeenCalledWith('test-role', PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL, []);
     const args = service.listMovements.mock.calls[0][0];
     expect(args.identificadoPorUsuario).toBeUndefined();
+  });
+
+  // 2026-10-09 — bug real reportado por el usuario: el buscador global de movimientos
+  // (banks.component.ts#_wireGlobalSearch, busca por importe en TODOS los bancos) nunca manda
+  // `status`, así que caía siempre en el default 'no_identificado,reclasificado' sin importar
+  // el scope — alguien con banks:cobranza:identificados:all nunca podía encontrar por importe
+  // un depósito YA identificado desde el buscador global, aunque sí podía verlo filtrando
+  // "Identificados" a mano dentro de un banco puntual (ese camino manda status='identificado'
+  // explícito, que ya funcionaba). Fix: con scope ALL y una búsqueda (`search`) activa, el
+  // default también incluye 'identificado'.
+  test('sin status pero CON search y banks:cobranza:identificados:all: el default también incluye identificado', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL);
+
+    await request(app)
+      .get('/movements')
+      .query({ search: '1234' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('no_identificado,reclasificado,identificado');
+  });
+
+  test('sin status NI search, con banks:cobranza:identificados:all: el default NO cambia (sigue sin identificado)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL);
+
+    await request(app).get('/movements');
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('no_identificado,reclasificado');
+  });
+
+  test('sin el permiso nuevo (scope OWN), con search: el default NO se ensancha (sigue sin identificado)', async () => {
+    await request(app)
+      .get('/movements')
+      .query({ search: '1234' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('no_identificado,reclasificado');
   });
 
   test('con banks:cobranza:identificados:all pero status=otros: sigue vacío (el permiso nuevo NO desbloquea otros)', async () => {

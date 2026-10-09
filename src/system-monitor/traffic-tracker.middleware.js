@@ -9,6 +9,7 @@
 // vez que le toca turno de nuevo con un `ts` distinto al que tenía guardado.
 
 const { logger } = require('../shared/utils/logger');
+const historialSvc = require('./system-monitor-historial.service');
 
 const VENTANA_SEGUNDOS = 60;
 const VENTANA_MINUTOS = 60;
@@ -76,13 +77,22 @@ function trafficTracker(req, res, next) {
       _registrar(minutos, VENTANA_MINUTOS, tsMin, res.statusCode, duracionMs);
 
       if (res.statusCode >= 500) {
-        erroresRecientes.push({
-          ts: ahoraMs,
-          metodo: req.method,
-          path: req.originalUrl || req.path,
-          status: res.statusCode,
-        });
+        const metodo = req.method;
+        const path = req.originalUrl || req.path;
+        const status = res.statusCode;
+
+        erroresRecientes.push({ ts: ahoraMs, metodo, path, status });
         if (erroresRecientes.length > MAX_ERRORES_RECIENTES) erroresRecientes.shift();
+
+        // Persistencia fire-and-forget: la respuesta ya se mandó (estamos en
+        // 'finish'), así que esto NUNCA debe bloquearla ni, si falla, tumbar el
+        // proceso — el mismo 5xx puede ser justo PORQUE Mongo está caído. Sin
+        // await, con .catch() propio (no alcanza con el try/catch de afuera: ese
+        // solo atrapa errores síncronos, no el rechazo de esta promesa).
+        historialSvc.guardarError({ ts: new Date(ahoraMs), metodo, path, status })
+          .catch((err) => {
+            logger.error('[system-monitor] Error persistiendo error 5xx en Mongo (no bloqueante):', err.message);
+          });
       }
     } catch (err) {
       logger.error('[system-monitor] Error registrando métricas de tráfico (request de negocio no afectada):', err.message);

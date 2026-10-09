@@ -20,7 +20,7 @@ const { NotFoundError, BadRequestError, ConflictError, UnprocessableError } = re
 // spec.md), aplicado a NetpayReporte.
 const ESTATUS_TERMINALES = new Set(['rechazado', 'resuelto_manual']);
 const { parseNetpayReporte } = require('./netpay-reporte-parser.service');
-const { emitToBanco, emitToAll } = require('../../shared/socket');
+const { emitToBanco, emitToAll, emitToUser } = require('../../shared/socket');
 const { logger } = require('../../../shared/utils/logger');
 const { sincronizarComisiones } = require('./netpay-comision-sync.service');
 
@@ -297,17 +297,14 @@ function _emitirReporteCargado(nombreArchivo, user) {
   });
 }
 
-async function cargarReporte(buffer, nombreArchivo, user) {
-  let parsed;
-  try {
-    parsed = await parseNetpayReporte(buffer);
-  } catch (err) {
-    if (err instanceof BadRequestError) throw err;
-    throw new BadRequestError(`Error al leer el archivo: ${err.message}`);
-  }
-
-  const { depositos } = parsed;
-
+// _procesarDepositosParseados — núcleo real de cargarReporte(), extraído tal cual (sin
+// cambios de comportamiento) para que la carga EN BACKGROUND (iniciarCargaReporteJob, más
+// abajo) pueda reusarlo con un callback de progreso — cargarReporte() sigue siendo la versión
+// síncrona de siempre, usada tal cual por los tests existentes y por cualquier otro llamador
+// que no necesite progreso. `onProgress` es opcional (null en el camino síncrono de toda la
+// vida) — se invoca UNA vez para N=1 (no hay progreso intermedio posible: es un solo
+// depósito) y una vez POR DEPÓSITO en N>1.
+async function _procesarDepositosParseados(depositos, nombreArchivo, user, onProgress) {
   if (depositos.length === 1) {
     const [unit] = depositos;
     const existente = await NetpayReporte.findOne({ claveRastreo: unit.claveRastreo }).lean();
@@ -325,6 +322,7 @@ async function cargarReporte(buffer, nombreArchivo, user) {
       throw err;
     }
 
+    onProgress?.({ procesados: 1, total: 1 });
     const item = {
       ..._itemBase(unit), estatusCarga: 'creado', reporte: creado.reporte, candidatos: creado.candidatos, reporteId: creado.reporteId,
     };
@@ -333,9 +331,10 @@ async function cargarReporte(buffer, nombreArchivo, user) {
   }
 
   const reportes = [];
-  for (const unit of depositos) {
+  for (const [idx, unit] of depositos.entries()) {
     // eslint-disable-next-line no-await-in-loop
     reportes.push(await _procesarDeposito(unit, nombreArchivo, user));
+    onProgress?.({ procesados: idx + 1, total: depositos.length });
   }
 
   const resumen = {
@@ -347,6 +346,112 @@ async function cargarReporte(buffer, nombreArchivo, user) {
 
   _emitirReporteCargado(nombreArchivo, user);
   return { reportes, resumen };
+}
+
+async function cargarReporte(buffer, nombreArchivo, user) {
+  let parsed;
+  try {
+    parsed = await parseNetpayReporte(buffer);
+  } catch (err) {
+    if (err instanceof BadRequestError) throw err;
+    throw new BadRequestError(`Error al leer el archivo: ${err.message}`);
+  }
+
+  return _procesarDepositosParseados(parsed.depositos, nombreArchivo, user, null);
+}
+
+// ── Carga en BACKGROUND (pedido explícito del usuario, 2026-10-08) ──────────────────────
+// Incidente real: un archivo de 33 depósitos/897 folios se cortó a los 5 minutos por el
+// req.setTimeout/res.setTimeout explícito de la ruta de upload — Node destruye el socket solo
+// cuando nadie escucha su evento 'timeout', sin que quede NINGÚN rastro en los logs de la
+// aplicación (no fue una excepción, fue la conexión muriendo a nivel de transporte). La carga
+// de reportes grandes (muchos depósitos, cada uno con su propia tanda de consultas a Kore) va
+// a seguir siendo recurrente, así que esto deja de depender de que una sola conexión HTTP
+// aguante varios minutos sin cortarse.
+//
+// Mismo patrón YA establecido en este proyecto para trabajos largos (ver Sync ERP-Kore en
+// erp.routes.js): la ruta responde 202+jobId de inmediato (después de parsear el archivo, que
+// es rápido y 100% local — un Excel inválido sigue fallando al instante, sin pasar por el
+// job), el trabajo pesado corre sin bloquear la respuesta, y el progreso/resultado final se
+// emite por socket a QUIEN LO SUBIÓ (emitToUser, no emitToAll — es una acción personal, nadie
+// más necesita ver el progreso de la carga de otra persona).
+//
+// A diferencia de Sync ERP-Kore (un solo job global a la vez, guard de un booleano a nivel de
+// módulo), una carga de Netpay es una acción personal de quien la sube — varias personas (o la
+// misma, con archivos distintos) pueden tener su propia carga corriendo en simultáneo sin
+// pisarse, así que NO hay guard de exclusión mutua acá: el peor caso de una doble carga
+// accidental es trabajo duplicado, nunca corrupción (cada depósito ya es idempotente por
+// claveRastreo, ver _procesarDeposito/cargarReporte de arriba).
+const NETPAY_UPLOAD_JOBS = new Map(); // jobId -> { status, userId, nombreArchivo, procesados, total, resultado?, error? }
+const NETPAY_UPLOAD_JOB_TTL = 2 * 60 * 60 * 1000; // 2h — mismo criterio que SYNC_JOB_TTL (erp.routes.js)
+
+function _nuevoJobIdCarga() {
+  return `netpay-upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function iniciarCargaReporteJob(buffer, nombreArchivo, user) {
+  let parsed;
+  try {
+    parsed = await parseNetpayReporte(buffer);
+  } catch (err) {
+    if (err instanceof BadRequestError) throw err;
+    throw new BadRequestError(`Error al leer el archivo: ${err.message}`);
+  }
+
+  const jobId = _nuevoJobIdCarga();
+  const total = parsed.depositos.length;
+  NETPAY_UPLOAD_JOBS.set(jobId, {
+    status: 'running', userId: user?._id ?? null, nombreArchivo, procesados: 0, total,
+  });
+
+  // Sin await a propósito — es justo lo que permite responder 202 de inmediato sin bloquear
+  // la request mientras esto corre.
+  _correrCargaReporteJob(jobId, parsed.depositos, nombreArchivo, user);
+
+  return { jobId, total };
+}
+
+async function _correrCargaReporteJob(jobId, depositos, nombreArchivo, user) {
+  const onProgress = ({ procesados, total }) => {
+    const job = NETPAY_UPLOAD_JOBS.get(jobId);
+    if (job) { job.procesados = procesados; job.total = total; }
+    emitToUser(user?._id, 'netpay-reporte:upload:progress', {
+      jobId, procesados, total, pct: Math.round((procesados / total) * 100),
+    });
+  };
+
+  try {
+    const resultado = await _procesarDepositosParseados(depositos, nombreArchivo, user, onProgress);
+    NETPAY_UPLOAD_JOBS.set(jobId, {
+      status: 'done', userId: user?._id ?? null, nombreArchivo, procesados: depositos.length, total: depositos.length, resultado,
+    });
+    emitToUser(user?._id, 'netpay-reporte:upload:done', { jobId, resultado });
+  } catch (err) {
+    // ConflictError/BadRequestError (claveRastreo duplicado en N=1, o un Excel que pasó el
+    // parseo inicial pero falló después) traen un mensaje ya pensado para mostrarse tal
+    // cual; cualquier otro error es inesperado y se envuelve para no filtrar detalles internos.
+    const esErrorDeNegocio = err instanceof BadRequestError || err instanceof ConflictError;
+    const mensaje = esErrorDeNegocio ? err.message : `Error inesperado al procesar el archivo: ${err.message}`;
+    NETPAY_UPLOAD_JOBS.set(jobId, {
+      status: 'error', userId: user?._id ?? null, nombreArchivo, procesados: 0, total: depositos.length, error: mensaje,
+    });
+    emitToUser(user?._id, 'netpay-reporte:upload:error', { jobId, error: mensaje });
+    if (!esErrorDeNegocio) logger.error(`[NetpayReporte] job de carga ${jobId} falló de forma inesperada: ${err.message}`);
+  } finally {
+    setTimeout(() => NETPAY_UPLOAD_JOBS.delete(jobId), NETPAY_UPLOAD_JOB_TTL);
+  }
+}
+
+// Fallback de recuperación tras un reload de página (mismo criterio que GET
+// /sync-erp-kore/:jobId/status) — el socket es la vía normal para enterarse del progreso;
+// esto es solo para cuando alguien recarga a mitad del job y pierde la suscripción en memoria.
+// A diferencia del job global de Sync ERP-Kore, acá SÍ hay chequeo de dueño (userId) — varias
+// cargas de distintas personas conviven en el mismo Map.
+function obtenerEstadoJobCarga(jobId, userId) {
+  const job = NETPAY_UPLOAD_JOBS.get(jobId);
+  if (!job || String(job.userId) !== String(userId)) return null;
+  const { userId: _userId, ...estado } = job;
+  return estado;
 }
 
 // dateFrom/dateTo (pedido explícito del usuario, 2026-10-07): filtra por fechaMovimiento
@@ -939,6 +1044,10 @@ async function obtenerReportesPorIds(ids) {
 
 module.exports = {
   cargarReporte,
+  iniciarCargaReporteJob,
+  obtenerEstadoJobCarga,
+  _procesarDepositosParseados,
+  _correrCargaReporteJob,
   listar,
   _buildBusquedaFilter,
   obtenerUltimaCarga,

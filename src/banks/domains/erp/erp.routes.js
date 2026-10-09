@@ -49,7 +49,8 @@ const {
   resolver: resolverNetpayMatch, rechazar: rechazarNetpayMatch, candidatos: candidatosNetpayMatch,
 }                                          = require('./netpay-resolver.service');
 const {
-  cargarReporte, listar: listarNetpayReportes, obtenerUltimaCarga: obtenerUltimaCargaNetpayReporte,
+  cargarReporte, iniciarCargaReporteJob, obtenerEstadoJobCarga,
+  listar: listarNetpayReportes, obtenerUltimaCarga: obtenerUltimaCargaNetpayReporte,
   obtenerDetalle: obtenerDetalleNetpayReporte,
   obtenerPorMovimiento: obtenerNetpayReportePorMovimiento,
   buscarCandidatos: buscarCandidatosNetpayReporte,
@@ -589,21 +590,36 @@ router.get('/netpay/bandeja/:id/candidatos', authenticate, permit(PERMISSIONS.BA
 // netpay-reporte-global (design.md "Data Flow" + "Interfaces/Contracts"): un archivo global
 // puede traer N depósitos (uno por fila de la hoja "Resumen", cada uno con sus propios
 // folios) — cargarReporte() ya decide todo esto por dentro (agrupación, N=1 vs N>1, loop
-// secuencial) y siempre devuelve 200 salvo errores de archivo/negocio que siguen
-// propagándose tal cual (ver error-handler genérico de este router). Sin cambio de lógica
-// acá: sigue siendo "parsear, delegar, responder tal cual".
-// Timeout extendido (2026-10-06, pedido explícito del usuario — ver netpay-reporte.service.js
-// #_crearYEvaluar): cargarReporte() ahora también completa koreCache de cada folio contra Kore
-// ANTES de responder (antes solo pasaba al exportar, con el mismo timeout ya extendido acá
-// abajo en /export). Un archivo con varios depósitos (loop secuencial) y folios por decenas
-// puede tardar bastante más que antes — mismo criterio que /export, para no repetir el
-// incidente real ya documentado de un timeout corto rompiendo una operación grande contra Kore.
+// secuencial).
+//
+// EN BACKGROUND (pedido explícito del usuario, 2026-10-08) — ver incidente real: un archivo
+// de 33 depósitos/897 folios se cortó a los 5 minutos por el req.setTimeout/res.setTimeout que
+// esta ruta tenía puesto, sin dejar NINGÚN rastro en los logs — Node destruye el socket solo
+// cuando nadie escucha su evento 'timeout', así que no fue una excepción, fue la conexión
+// muriendo a nivel de transporte. La carga de archivos grandes (muchos depósitos, cada uno con
+// su propia tanda de consultas a Kore) es recurrente, así que esto ya no depende de que una
+// sola conexión HTTP aguante varios minutos sin cortarse — responde 202+jobId de inmediato
+// (después de parsear el archivo, que es rápido y 100% local: un Excel inválido sigue
+// fallando al instante, con 400, SIN pasar por el job) y el progreso/resultado final se
+// emite por socket a quien lo subió (ver netpay-reporte.service.js#iniciarCargaReporteJob).
+// Ya NO hace falta el timeout extendido que tenía esta ruta — la respuesta HTTP es casi
+// instantánea ahora, todo el trabajo pesado corre después, sin bloquearla.
 router.post('/netpay/reporte/upload', authenticate, permit(PERMISSIONS.BANKS_NETPAY), uploadCyc.single('excelFile'), asyncHandler(async (req, res) => {
-  req.setTimeout(300000);
-  res.setTimeout(300000);
   if (!req.file) return res.status(400).json({ error: 'No se envió ningún archivo Excel' });
-  const resultado = await cargarReporte(req.file.buffer, req.file.originalname, req.user);
-  res.json(resultado);
+  const { jobId, total } = await iniciarCargaReporteJob(req.file.buffer, req.file.originalname, req.user);
+  res.status(202).json({ jobId, total });
+}));
+
+// GET fallback de recuperación tras un reload de página (mismo criterio que
+// GET /sync-erp-kore/:jobId/status) — el socket es la vía normal para enterarse del
+// progreso/resultado; esto es solo para cuando alguien recarga a mitad del job y pierde la
+// suscripción en memoria. A diferencia del job global de Sync ERP-Kore, acá SÍ hay chequeo de
+// dueño — varias cargas de distintas personas conviven en el mismo Map (ver
+// netpay-reporte.service.js#obtenerEstadoJobCarga).
+router.get('/netpay/reporte/upload-job/:jobId', authenticate, permit(PERMISSIONS.BANKS_NETPAY), asyncHandler(async (req, res) => {
+  const estado = obtenerEstadoJobCarga(req.params.jobId, req.user._id);
+  if (!estado) return res.status(404).json({ error: 'Job de carga no encontrado o expirado' });
+  res.json(estado);
 }));
 
 // netpay-matching-v2 (design.md API table: "GET /netpay/reporte?estatus&incluirEliminados |

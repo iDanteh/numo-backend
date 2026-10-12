@@ -2670,12 +2670,34 @@ async function _fetchEgresosAplicacionAnticipoPorVenta(ventaUuids, rfc) {
       prev.subTotal   = parseFloat((prev.subTotal + m.subTotal).toFixed(2));
       prev.serieFolio = prev.serieFolio ?? m.serieFolio;
       prev.folioOpa   = prev.folioOpa ?? folioOpa;
+      prev.uuids.push(m.uuid);
     } else {
-      mapa.set(m.ventaUuid, { total: m.total, subTotal: m.subTotal, serieFolio: m.serieFolio, folioOpa });
+      mapa.set(m.ventaUuid, { total: m.total, subTotal: m.subTotal, serieFolio: m.serieFolio, folioOpa, uuids: [m.uuid] });
     }
   }
   return mapa;
 }
+// Egreso de Aplicación de Anticipo (tipoRelacion=07) cuya Factura Final ya
+// trae el cierre "OPA" en este mismo batch: ese cierre (Cargo Anticipos +
+// IVA-anticipo, con la serie-folio del Egreso en la columna C) YA es la
+// aplicación del anticipo — las líneas propias del Egreso la duplicaban con
+// otras cuentas (OPA-REVERSION: Devoluciones/Abono Anticipos, o TO-BON:
+// Bonificaciones/Abono Bancos). Confirmado con el usuario 2026-10-12, caso
+// real Puerto O0-261000074/Egreso O0-261000173/OPA-01081 (póliza 1189). Se
+// quitan del resultado; mismo criterio que el "Fix 5" cross-batch (Egreso
+// sin líneas propias). También cuando el anticipo cubre el 100% de la venta
+// (Egreso por el total): ya no se trata como "cancelación completa" con
+// OPA-REVERSION (criterio del 2026-09-07, caso CONSTRUCASA), confirmado con
+// el usuario 2026-10-12 — una cancelación real llega como CFDI cancelado o NC
+// tipoRelacion 01/03, no como Egreso 07.
+function _quitarEgresosAplicadosEnCierre(movs, uuidsEgresos) {
+  if (!uuidsEgresos.size) return;
+  for (let i = movs.length - 1; i >= 0; i--) {
+    const uuid = (movs[i].cfdiUuid ?? movs[i]._cfdiInfo?.uuid ?? '').toUpperCase();
+    if (uuidsEgresos.has(uuid)) movs.splice(i, 1);
+  }
+}
+
 // Mismo texto que TIPO_ORIGEN_CARGO_ESPECIAL en cfdi-mapping.service.js/
 // poliza.service.js (duplicado a propósito) — usado aquí solo para la línea
 // consolidada de Puntos del batch (ver `puntosAcumuladosProp` más abajo).
@@ -4440,6 +4462,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   }
 
   const movimientosResult = [];
+  // Ver `_quitarEgresosAplicadosEnCierre`.
+  const egresosAplicadosEnCierreProp = new Set();
   let sinRegla = 0;
 
   for (const { cfdi, rule } of cfdiConRegla) {
@@ -4864,6 +4888,10 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     // Usar esto en vez de `montoAnticipoRealProp` garantiza que el cierre
     // NUNCA descuadre el asiento, sin importar la forma de la regla.
     const montoAnticipoConsumidoProp = parseFloat((montoAnticipoRealProp - montoAnticipoRestanteProp).toFixed(2));
+    // Ver `_quitarEgresosAplicadosEnCierre`.
+    if (egresoAnticipoProp && montoAnticipoConsumidoProp > 0) {
+      for (const u of egresoAnticipoProp.uuids ?? []) egresosAplicadosEnCierreProp.add((u || '').toUpperCase());
+    }
     if (_DEBUG_OPA_UUID && (cfdi.uuid || '').toUpperCase() === _DEBUG_OPA_UUID) {
       console.warn(`[DEBUG_OPA_PROP_CIERRE] montoAnticipoRealProp=${montoAnticipoRealProp} montoAnticipoRestanteProp=${montoAnticipoRestanteProp} `
         + `montoAnticipoConsumidoProp=${montoAnticipoConsumidoProp} anticipoFolioRefProp=${anticipoFolioRefProp}`);
@@ -5196,6 +5224,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     }
     if (!rule) sinRegla++;
   }
+  _quitarEgresosAplicadosEnCierre(movimientosResult, egresosAplicadosEnCierreProp);
 
   // Saldos a favor GEN-huérfanos: entradas del mapa cuya Devolución no pasó
   // por el loop de CFDIs (ej. su CFDI tiene fecha distinta, serie de otra
@@ -6365,6 +6394,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   }
 
   const todosLosMovimientos = [];
+  // Ver `_quitarEgresosAplicadosEnCierre`.
+  const egresosAplicadosEnCierreGuard = new Set();
   let sinRegla = 0;
   const advertencias = [];
   const ruleUsageCount = new Map();
@@ -6674,6 +6705,10 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     // Monto REALMENTE consumido en el loop — ver comentario equivalente en
     // generarYGuardar (`montoAnticipoConsumidoProp`).
     const montoAnticipoConsumidoGuard = parseFloat((montoAnticipoRealGuard - montoAnticipoRestanteGuard).toFixed(2));
+    // Ver `_quitarEgresosAplicadosEnCierre`.
+    if (egresoAnticipoGuard && montoAnticipoConsumidoGuard > 0) {
+      for (const u of egresoAnticipoGuard.uuids ?? []) egresosAplicadosEnCierreGuard.add((u || '').toUpperCase());
+    }
     // Anticipo sin NC — ver comentario equivalente en generarYGuardar.
     if (anticipoFolioRefGuard && montoAnticipoConsumidoGuard > 0) {
       // CON dato real — ver comentario equivalente en generarYGuardar.
@@ -6884,6 +6919,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       });
     }
   }
+  _quitarEgresosAplicadosEnCierre(todosLosMovimientos, egresosAplicadosEnCierreGuard);
 
   // SF GEN-huérfanos — ver comentario equivalente en generarPropuesta.
   if (cuentaSaldoFavorIdGuard && cuentaIvaSaldoFavorIdGuard) {

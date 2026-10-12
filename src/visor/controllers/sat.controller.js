@@ -839,6 +839,7 @@ const resetCheckpoint = asyncHandler(async (req, res) => {
       status:          'error',
       error:           'Reseteado manualmente por el administrador',
       alertaPendiente: false,
+      solicitudPendiente: false,
       reintentos:      0,
       updatedAt:       new Date(),
     },

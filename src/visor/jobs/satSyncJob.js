@@ -473,6 +473,26 @@ const SOLICITUD_VIGENCIA_MS = 72 * 60 * 60 * 1000;
 const MAX_POLLS_RECUPERACION = 3;
 
 /**
+ * ¿Se puede reutilizar la solicitud pendiente del checkpoint para el rango que se
+ * pide ahora? La solicitud es una foto del SAT al momento de pedirla, así que solo
+ * sirve si termina el mismo día que lo pedido y se pidió cuando ese rango ya había
+ * terminado (si no, le faltarían los CFDIs posteriores).
+ * @param {string} fechaFin — fin del rango pedido ('YYYY-MM-DD' o 'YYYY-MM-DDTHH:mm:ss', hora de México)
+ */
+const solicitudPendienteReutilizable = (checkpoint, fechaFin, esMetadata) => {
+  if (esMetadata || !checkpoint || checkpoint.status !== 'error' || !checkpoint.solicitudPendiente) return false;
+  if (!checkpoint.idSolicitud || !checkpoint.solicitadaEn) return false;
+  const solicitada = new Date(checkpoint.solicitadaEn).getTime();
+  if (Date.now() - solicitada >= SOLICITUD_VIGENCIA_MS) return false;
+  if (!fechaFin || checkpoint.fechaFin !== String(fechaFin).slice(0, 10)) return false;
+  // México sin horario de verano desde 2022 → UTC-6 fijo
+  const fin = String(fechaFin);
+  const conHora = fin.length > 10 ? fin : `${fin}T23:59:59`;
+  const finMs = new Date(/(Z|[+-]\d\d:\d\d)$/.test(conHora) ? conHora : `${conHora}-06:00`).getTime();
+  return Number.isFinite(finMs) && solicitada > finMs;
+};
+
+/**
  * Retoma las solicitudes SAT que vencieron el polling de 60 min (checkpoint en
  * 'error' con solicitudPendiente). Si el SAT ya la terminó, pasa el checkpoint a
  * 'descargando' y procesarDescarga() baja sus paquetes por la ruta de reanudación
@@ -859,7 +879,58 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
     }
   }
 
-  if (!checkpointVerificando || rechazadaCheckpointVerif) {
+  // Solicitud que venció el polling de 60 min (solicitudPendiente) y se vuelve a pedir
+  // el MISMO rango (ej. descarga manual): se reutiliza en vez de pedir otra, pero solo
+  // si su "foto" ya cubre todo lo que se pide hoy — mismo fin de rango y pedida
+  // después de que ese rango terminó. Si no, se pide una nueva normalmente.
+  let reusoPendiente = false;
+  if (!checkpointVerificando && !checkpointVigente && solicitudPendienteReutilizable(checkpoint, fechaFin, esMetadata)) {
+    const reclamado = await SatJobCheckpoint.findOneAndUpdate(
+      { _id: checkpoint._id, solicitudPendiente: true },
+      { $set: { solicitudPendiente: false } },
+    );
+    if (reclamado) {
+      const etiqueta = `${tipoComprobante} ${fecha} (solicitud ${checkpoint.idSolicitud})`;
+      logger.info(`[SatSyncJob] ${etiqueta}: mismo rango que la solicitud pendiente — consultándola en vez de pedir otra...`);
+      try {
+        const { idsPaquetes: ids, totalCfdis } = await verificar(checkpoint.idSolicitud, rfc, creds, { maxIntentos: MAX_POLLS_RECUPERACION });
+        if (ids.length === 0) {
+          await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', totalReportadoSAT: totalCfdis, error: null, updatedAt: new Date() } });
+          return { rows: [], paquetes: 0, totalReportado: totalCfdis, esMetadata };
+        }
+        await SatJobCheckpoint.updateOne(
+          { _id: checkpoint._id },
+          { $set: {
+            status: 'descargando', idsPaquetes: ids, totalReportadoSAT: totalCfdis,
+            paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0,
+            error: null, updatedAt: new Date(),
+          } },
+        );
+        idSolicitud = checkpoint.idSolicitud;
+        idsPaquetes = ids;
+        checkpoint.totalReportadoSAT = totalCfdis;
+        checkpoint.paquetesProcesados = [];
+        reusoPendiente = true;
+        logger.info(`[SatSyncJob] ${etiqueta}: el SAT ya la terminó — ${ids.length} paquete(s), sin solicitud nueva.`);
+      } catch (err) {
+        // Igual que recuperarSolicitudesPendientes(): solo una respuesta definitiva del
+        // SAT la descarta (y se pide una nueva abajo); si sigue en proceso o falla la
+        // red, se conserva y se avisa en vez de duplicarla.
+        const definitivo = err.code !== 'SAT_TIMEOUT_POLLING' && /^SAT/.test(err.message);
+        if (!definitivo) {
+          await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { solicitudPendiente: true } }).catch(() => {});
+          const pedida = new Date(checkpoint.solicitadaEn).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+          throw new Error(
+            `El SAT aún está procesando la solicitud ${checkpoint.idSolicitud} de ${tipoComprobante} (pedida el ${pedida}) para este mismo rango ` +
+            `(${err.message}). No se pidió otra para no duplicarla; se descargará sola en la siguiente corrida o reintenta más tarde.`
+          );
+        }
+        logger.warn(`[SatSyncJob] ${etiqueta} no recuperable: ${err.message} — se pide una nueva.`);
+      }
+    }
+  }
+
+  if (!reusoPendiente && (!checkpointVerificando || rechazadaCheckpointVerif)) {
     if (checkpointVigente && !rechazadaCheckpointVerif) {
     idSolicitud = checkpoint.idSolicitud;
     // ── Re-verificar con el SAT para asegurar que tenemos TODOS los IDs de paquetes.

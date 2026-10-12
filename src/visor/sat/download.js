@@ -362,7 +362,7 @@ const MAX_POLLING_INTENTOS = 60; // máximo 60 minutos de espera
 
 const INITIAL_POLLING_DELAY_MS = 15_000; // 15s — el SAT tarda en propagar la solicitud
 
-const verificar = async (idSolicitud, rfcSolicitante, creds) => {
+const verificar = async (idSolicitud, rfcSolicitante, creds, { maxIntentos = MAX_POLLING_INTENTOS } = {}) => {
   logger.info(`[SatDownload] Iniciando polling para solicitud ${idSolicitud}...`);
   logger.info(`[SatDownload] Esperando ${INITIAL_POLLING_DELAY_MS / 1000}s antes del primer intento (propagación SAT)...`);
   await new Promise(r => setTimeout(r, INITIAL_POLLING_DELAY_MS));
@@ -370,7 +370,7 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
   const esperar = () => new Promise(r => setTimeout(r, POLLING_INTERVAL_MS));
   let intentos = 0;
 
-  while (intentos < MAX_POLLING_INTENTOS) {
+  while (intentos < maxIntentos) {
     intentos++;
     // Si el token expiró durante el polling, reintentar autenticación una vez
     let token, rfcCertificado;
@@ -503,11 +503,17 @@ const verificar = async (idSolicitud, rfcSolicitante, creds) => {
     }
 
     // Estados 1 (Aceptada) y 2 (En Proceso): esperar exactamente 60 segundos
-    logger.info(`[SatDownload] Intento ${intentos}/${MAX_POLLING_INTENTOS} — esperando 60s...`);
+    logger.info(`[SatDownload] Intento ${intentos}/${maxIntentos} — esperando 60s...`);
     await esperar();
   }
 
-  throw new Error(`Timeout: solicitud ${idSolicitud} no terminó después de ${MAX_POLLING_INTENTOS} minutos`);
+  // El SAT aceptó la solicitud pero sigue "En Proceso": no es un rechazo. Se marca
+  // con code para que el caller conserve el IdSolicitud y la retome después en vez
+  // de pedir una nueva (que gastaría cuota y volvería a esperar desde cero).
+  const timeoutErr = new Error(`Timeout: solicitud ${idSolicitud} no terminó después de ${maxIntentos} minutos`);
+  timeoutErr.code = 'SAT_TIMEOUT_POLLING';
+  timeoutErr.idSolicitud = idSolicitud;
+  throw timeoutErr;
 };
 
 /**

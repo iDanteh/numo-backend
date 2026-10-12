@@ -138,3 +138,65 @@ describe('al vencer el polling de 60 min', () => {
     expect(final.solicitudPendiente).toBe(false);
   });
 });
+
+describe('descarga del mismo rango con una solicitud pendiente', () => {
+  // Pedida el 12-oct 10:00 MX: el rango 9→11 ya había terminado → su foto está completa
+  const pedida = new Date('2026-10-12T16:00:00Z');
+  const cpPendiente = (extra = {}) => ({ ...pendiente({ solicitadaEn: pedida }), paquetesProcesados: [], updatedAt: pedida, ...extra });
+  const correr = (fechaFin = '2026-10-11T23:59:59') => procesarDescarga({
+    rfc: 'CCO011113663', fechaInicio: '2026-10-09T00:00:00', fechaFin,
+    tipoComprobante: 'Ingresos', tipoSolicitud: 'CFDI', creds: {}, ejercicio: 2026, periodo: 10, tipo: 'manual',
+  });
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: new Date('2026-10-12T20:00:00Z'), doNotFake: ['setTimeout', 'setImmediate', 'nextTick'] });
+    SatJobCheckpoint.findOne.mockResolvedValue(cpPendiente());
+    SatJobCheckpoint.findOneAndUpdate.mockResolvedValue({ _id: 'cp1' });
+    SatJobCheckpoint.findById.mockReturnValue({ lean: async () => ({ paquetesProcesados: ['P1'], paquetesFallidos: [] }) });
+    solicitar.mockResolvedValue('nueva01');
+  });
+  afterEach(() => jest.useRealTimers());
+
+  test('el SAT ya la terminó → baja SUS paquetes sin pedir otra', async () => {
+    verificar.mockResolvedValue({ idsPaquetes: ['P1'], totalCfdis: 0 });
+    await correr().catch(() => {});
+    expect(verificar).toHaveBeenCalledWith('60826a79', 'CCO011113663', expect.anything(), { maxIntentos: 3 });
+    expect(setsDe(SatJobCheckpoint.updateOne)).toContainEqual(expect.objectContaining({ status: 'descargando', idsPaquetes: ['P1'] }));
+    expect(solicitar).not.toHaveBeenCalled();
+  });
+
+  test('sigue en proceso → avisa, la conserva y no pide otra', async () => {
+    verificar.mockRejectedValue(timeoutErr());
+    await expect(correr()).rejects.toThrow(/aún está procesando la solicitud 60826a79/);
+    expect(setsDe(SatJobCheckpoint.updateOne)).toContainEqual({ solicitudPendiente: true });
+    expect(solicitar).not.toHaveBeenCalled();
+  });
+
+  test('el SAT la rechazó → pide una nueva', async () => {
+    verificar.mockRejectedValueOnce(new Error('SAT: La solicitud 60826a79 venció (72 horas).'))
+      .mockResolvedValue({ idsPaquetes: [], totalCfdis: 0 });
+    await correr().catch(() => {});
+    expect(solicitar).toHaveBeenCalledTimes(1);
+  });
+
+  test('se pide hasta otra fecha (lo nuevo) → solicitud nueva, no toca la vieja', async () => {
+    verificar.mockResolvedValue({ idsPaquetes: [], totalCfdis: 0 });
+    await correr('2026-10-12T23:59:59').catch(() => {});
+    expect(solicitar).toHaveBeenCalledTimes(1);
+    expect(verificar).not.toHaveBeenCalledWith('60826a79', expect.anything(), expect.anything(), expect.anything());
+  });
+
+  test('mismo rango pero pedida antes de que terminara → foto incompleta, solicitud nueva', async () => {
+    SatJobCheckpoint.findOne.mockResolvedValue(cpPendiente({ solicitadaEn: new Date('2026-10-11T20:00:00Z') }));
+    verificar.mockResolvedValue({ idsPaquetes: [], totalCfdis: 0 });
+    await correr().catch(() => {});
+    expect(solicitar).toHaveBeenCalledTimes(1);
+  });
+
+  test('más de 72 h → solicitud nueva', async () => {
+    jest.setSystemTime(new Date('2026-10-15T17:00:00Z'));
+    verificar.mockResolvedValue({ idsPaquetes: [], totalCfdis: 0 });
+    await correr().catch(() => {});
+    expect(solicitar).toHaveBeenCalledTimes(1);
+  });
+});

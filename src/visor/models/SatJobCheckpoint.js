@@ -23,6 +23,11 @@ const satJobCheckpointSchema = new mongoose.Schema({
   cfdisDescargados:    { type: Number, default: 0 },     // CFDIs realmente descargados
   reintentos:          { type: Number, default: 0 },     // veces que se reintentó esta descarga
   alertaPendiente:     { type: Boolean, default: false }, // true cuando se agotaron reintentos sin éxito
+  // Timeout de 60 min esperando al SAT: la solicitud sigue "En Proceso" del lado del SAT.
+  // Se conserva idSolicitud y recuperarSolicitudesPendientes() la retoma (hasta 72 h
+  // desde solicitadaEn) sin pedir una nueva.
+  solicitudPendiente:  { type: Boolean, default: false },
+  solicitadaEn:        { type: Date, default: null },
 
   status: {
     type: String,

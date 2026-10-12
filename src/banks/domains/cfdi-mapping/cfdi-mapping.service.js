@@ -397,6 +397,11 @@ function _derivarTipoOrigen(cfdi) {
     if (concepto.includes('CANCELAC')) return 'Cancelación';
     if (rel === '03' || concepto.includes('DEVOLUCI')) return 'Devolución';
     if (rel === '01') return 'Nota de Crédito';
+    // Aplicación de Anticipo: el ERP la declara 'Egreso' (reglas TO-EGR). Antes
+    // caía en 'Bonificación' y tomaba TO-BON (Abono a Bancos) cuando el CFDI
+    // SAT no se enriquecía con el ERP — caso real 2026-10-12, Puerto
+    // O0-261000173 (póliza 1189).
+    if (rel === '07') return 'Egreso';
     return 'Bonificación';
   }
   if (tipo === 'P') return 'Pago';

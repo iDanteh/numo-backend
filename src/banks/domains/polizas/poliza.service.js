@@ -4617,9 +4617,14 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       if (!(infoCentro.gross > 0)) continue;
       for (const d of (infoCentro.detalle ?? [])) {
         const fila = d.fila;
-        const cfdiSerie = (fila.serieVentaTicket && fila.folioVentaTicket)
+        // CFDI y venta en columnas separadas (2026-10-12, caso real Puerto
+        // 3-oct): antes "CFDI (Serie-Folio)" mostraba el folio de la VENTA
+        // (O0-261000099) y no el de la factura (O0-261000082) — en Puerto la
+        // serie O0 numera ventas y facturas por separado, así que ese número
+        // también era el de otra factura distinta.
+        const ventaSerie = (fila.serieVentaTicket && fila.folioVentaTicket)
           ? `${fila.serieVentaTicket}-${fila.folioVentaTicket}`
-          : (fila.serie || '');
+          : '';
         desgloseConsolidado.push({
           cuenta:        null,
           centroCosto,
@@ -4629,7 +4634,8 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
           tipo:          fila._cobroOtraSucursal ? 'Cobro de otra sucursal' : 'Venta',
           transferencia: 'No',
           formaPago:     'NETPAY',
-          cfdiSerie,
+          cfdiSerie:     fila.serie || '',
+          ventaSerie,
           cliente:       nombresClientes.get((fila.cfdiUuid || '').toUpperCase()) || '',
           monto:         d.monto,
           nota:          `${fila._cobroOtraSucursal ? 'Cobro de otra sucursal — ' : ''}Terminal ${d.terminalID} — comisión + IVA de esta venta: $${d.comision.toFixed(2)}${d.provisional ? ' (PROVISIONAL: sin reporte NetPay, comisión de Kore)' : ''}${d.nota ? ` — ${d.nota}` : ''}`,
@@ -4673,6 +4679,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       { header: 'Transferencia', key: 'transferencia',  width: 14 },
       { header: 'Forma de pago', key: 'formaPago',      width: 14 },
       { header: 'CFDI (Serie-Folio)', key: 'cfdiSerie', width: 20 },
+      { header: 'Venta (Serie-Folio)', key: 'ventaSerie', width: 20 },
       { header: 'Cliente',       key: 'cliente',        width: 34 },
       { header: 'Monto',         key: 'monto',          width: 16 },
       { header: 'Nota',          key: 'nota',           width: 34 },
@@ -4699,7 +4706,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     for (const d of desgloseConsolidado) {
       if (d.formaPago !== formaPagoAnterior) {
         const rowHeader = wsDesglose.addRow([d.formaPago || 'OTRA FORMA DE PAGO']);
-        wsDesglose.mergeCells(`A${rowHeader.number}:H${rowHeader.number}`);
+        wsDesglose.mergeCells(`A${rowHeader.number}:I${rowHeader.number}`);
         rowHeader.font = { bold: true };
         rowHeader.eachCell({ includeEmpty: true }, cell => {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: FILL_HEADER_FORMA_PAGO[d.formaPago] ?? 'FFE2E2E2' } };
@@ -4709,7 +4716,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       const row = wsDesglose.addRow(d);
       row.getCell('monto').numFmt = '#,##0.00';
     }
-    wsDesglose.autoFilter = { from: 'A1', to: 'G1' };
+    wsDesglose.autoFilter = { from: 'A1', to: 'H1' };
   }
 
   // Hoja "Otros Ingresos": trae SOLO SF-MENOR-SIN-USAR (SF generado sin usar

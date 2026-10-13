@@ -9,6 +9,7 @@ const mappingSvc           = require('./cfdi-mapping.service');
 const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada, _metaFacturasRelacionadas } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
+const opaCobranzaSvc       = require('./opa-cobranza.service');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -2580,6 +2581,21 @@ function _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFactura) {
   }
 }
 
+// Recepción de anticipo cuya OPA salió del sobrante de un depósito de cobranza
+// (cuentas PPD con complemento): va en la póliza de Cobranza, no aquí (regla
+// del usuario 2026-10-13, ver opa-cobranza.service.js). Vacía `movs` y regresa
+// el texto para la advertencia; null si el anticipo se queda en Ingreso.
+async function _desviarAnticipoACobranza(cfdi, movs, cuentaMap, referenciaOpaPorFactura, cache) {
+  if (cfdi.tipoDeComprobante !== 'I') return null;
+  const idAnticipos = cuentaMap?.[CODIGO_CUENTA_ANTICIPOS_CLIENTES];
+  if (!idAnticipos || !movs.some(m => m.cuentaId === idAnticipos && Number(m.haber) > 0)) return null;
+  const refOpa = referenciaOpaPorFactura?.get(`${cfdi.serie}|${cfdi.folio}`) ?? null;
+  const ref = await opaCobranzaSvc.referenciaOpaDeCobranza(cfdi, refOpa, cache);
+  if (!ref) return null;
+  movs.length = 0;
+  return `${ref} (${cfdi.serie}-${cfdi.folio} $${Number(cfdi.total).toFixed(2)})`;
+}
+
 // Egreso SAT que formaliza la aplicación del anticipo directamente contra la
 // VENTA (tipoRelacion='07' apuntando al UUID de la propia venta — al revés
 // de la relación que trae la venta hacia SU anticipo). Cuando existe, trae el
@@ -4494,6 +4510,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const egresosAplicadosEnCierreProp = new Set();
   let sinRegla = 0;
 
+  // Anticipos cuya OPA salió de un depósito de cobranza — ver `_desviarAnticipoACobranza`.
+  const anticiposACobranzaProp = [];
+  const cacheOpaCobranzaProp = new Map();
   for (const { cfdi, rule } of cfdiConRegla) {
     // uuid07: venta referenciada por esta NC tipo E vía tipoRelacion=07 (si
     // aplica) — se usa tanto para el skip "Fix 5" (cross-batch, abajo) como
@@ -4589,6 +4608,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFacturaProp);
+    const desviadoProp = await _desviarAnticipoACobranza(cfdi, movs, cuentaMap, referenciaOpaPorFacturaProp, cacheOpaCobranzaProp);
+    if (desviadoProp) anticiposACobranzaProp.push(desviadoProp);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
     const comboEspecialProp = uuid07 ? ventasConComboEspecialAnticipoProp.get(uuid07) : null;
     if (comboEspecialProp) {
@@ -5782,6 +5803,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     });
 
   const advertencias = [];
+  if (anticiposACobranzaProp.length) {
+    advertencias.push(`ℹ ${anticiposACobranzaProp.length} anticipo(s) que salieron del sobrante de un depósito de cobranza (cuentas PPD con complemento) no se registran aquí: van en la póliza de Cobranza — ${anticiposACobranzaProp.join(', ')}`);
+  }
   const _ncFusionadasProp = cfdisConNCSinReversionProp.length - cfdisSinPolizaFinalFiltrado.length;
   if (_ncFusionadasProp > 0) {
     advertencias.push(`${_ncFusionadasProp} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
@@ -6451,6 +6475,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // Diagnóstico: acumular los primeros 5 CFDIs sin regla para dar info útil
   const muestrasSinRegla = [];
 
+  // Anticipos cuya OPA salió de un depósito de cobranza — ver `_desviarAnticipoACobranza`.
+  const anticiposACobranzaGuard = [];
+  const cacheOpaCobranzaGuard = new Map();
   for (const { cfdi, rule } of cfdiConRegla) {
     // uuid07: ver comentario equivalente en generarPropuesta.
     let uuid07;
@@ -6543,6 +6570,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFacturaGuard);
+    const desviadoGuard = await _desviarAnticipoACobranza(cfdi, movs, cuentaMap, referenciaOpaPorFacturaGuard, cacheOpaCobranzaGuard);
+    if (desviadoGuard) anticiposACobranzaGuard.push(desviadoGuard);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
     const comboEspecialGuard = uuid07 ? ventasConComboEspecialAnticipoGuard.get(uuid07) : null;
@@ -7255,6 +7284,9 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
   // Sustitutos excluidos automáticamente por riesgo de doble conteo — ver
   // _particionarSustitutosPorRiesgo. Los "normales" (sin riesgo detectado) no
   // generan advertencia: ya están contabilizados igual que cualquier CFDI.
+  if (anticiposACobranzaGuard.length) {
+    advertencias.push(`ℹ ${anticiposACobranzaGuard.length} anticipo(s) que salieron del sobrante de un depósito de cobranza (cuentas PPD con complemento) no se registran aquí: van en la póliza de Cobranza — ${anticiposACobranzaGuard.join(', ')}`);
+  }
   if (sustitutosGuard.length) {
     advertencias.push(
       `⚠ ${sustitutosGuard.length} CFDI(s) sustituto(s) excluido(s) automáticamente de esta póliza por riesgo de doble conteo — revisa "sustitutosExcluidos" antes de incorporarlos manualmente`,

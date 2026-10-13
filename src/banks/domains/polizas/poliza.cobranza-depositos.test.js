@@ -117,3 +117,34 @@ test('NI: un subtotal y un IVA por depósito, con folio de Numo y todas las vent
   ]);
   expect(out[0].concepto).toBe('MINI ABASTOS / B0-260803365 / B0-260803238 / B0-260803492');
 });
+
+test('NI con OPA del sobrante: el depósito 046486 sale completo ($7,479.42)', () => {
+  const DNI = { codigo: '2103030001' };
+  const IVA_NI = { codigo: '2104010002' };
+  const ANT = { codigo: '2103010001' };
+  const base = { cfdiUuid: 'P7', formaPago: '03', centroCosto: '111' };
+  const ni = (fact, venta, sub, iva) => [
+    { ...base, facturaUuid: fact, serie: 'B0-1', concepto: `MINI ABASTOS / ${venta}`, reglaNombre: 'NI', cuenta: DNI, debe: sub, haber: 0 },
+    { ...base, facturaUuid: fact, serie: 'B0-1', concepto: `MINI ABASTOS / ${venta}`, reglaNombre: 'NI', cuenta: IVA_NI, debe: iva, haber: 0 },
+  ];
+  const opa = { ...base, facturaUuid: null, serie: 'OPA-01106', concepto: 'MINI ABASTOS / OPA-01106' };
+  const movs = [
+    ...ni('F1', 'B0-260803365', 423.58, 67.77), ...ni('F2', 'B0-260803238', 494.52, 79.12), ...ni('F3', 'B0-260803492', 5470.28, 875.24),
+    { ...opa, reglaNombre: 'NI', cuenta: DNI, debe: 59.41, haber: 0 },
+    { ...opa, reglaNombre: 'NI', cuenta: IVA_NI, debe: 9.5, haber: 0 },
+    { ...opa, reglaNombre: 'OPA-COBRANZA', cuenta: ANT, debe: 0, haber: 59.41 },
+    { ...opa, reglaNombre: 'OPA-COBRANZA', cuenta: IVA_NI, debe: 0, haber: 9.5 },
+  ];
+  const d = deposito('x', '046486', 7479.42, 4);
+  const verdad = new Map([['F1', d], ['F2', d], ['F3', d], ['P7', d]]);
+
+  const out = anotar(movs, 20, verdad);
+  const niOut = out.filter(l => l.reglaNombre === 'NI');
+  expect(niOut.map(l => [l.cuenta.codigo, l.serie, l.debe])).toEqual([
+    ['2103030001', '046486', 6447.79],
+    ['2104010002', 'NI', 1031.63],
+  ]);
+  expect(Math.round(niOut.reduce((s, l) => s + l.debe, 0) * 100) / 100).toBe(7479.42);
+  expect(niOut[0].concepto).toBe('MINI ABASTOS / B0-260803365 / B0-260803238 / B0-260803492 / OPA-01106');
+  expect(out.filter(l => l.reglaNombre === 'OPA-COBRANZA').map(l => [l.cuenta.codigo, l.haber])).toEqual([['2103010001', 59.41], ['2104010002', 9.5]]);
+});

@@ -250,6 +250,9 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
         // Facturas que paga este depósito (ligas ERP) — Cobranza solo ajusta
         // centavos contra el depósito cuando paga una sola.
         _facturasDeposito: (m.erpLinks ?? []).length,
+        // Lo que este depósito aplicó a ESTA factura (CxC vinculada) — una
+        // factura pagada con porciones de varios depósitos se reparte por aquí.
+        _montoAplicado: typeof link.saldoPagado === 'number' ? link.saldoPagado : null,
       };
       if (!todosPorUuid.has(uuidResuelto)) todosPorUuid.set(uuidResuelto, new Map());
       todosPorUuid.get(uuidResuelto).set(candidato._idDeposito, { ...candidato });
@@ -1802,6 +1805,49 @@ function categorizarAjusteContado(m) {
  * original. Los Abono (haber>0) y la reclasificación de IVA de cada factura
  * tampoco se tocan — se dejan intercalados como ya vienen.
  */
+/**
+ * Cobranza — cobros de meses anteriores (NI): junta en un solo subtotal
+ * (2103030001) y un solo IVA (2104010002) todas las ventas pagadas con el
+ * MISMO depósito, como en la póliza manual de Kore (2026-10-13, caso real
+ * MINI ABASTOS dep 046486: B0-260803365 $491.35 + B0-260803238 $573.64 +
+ * B0-260803492 $6,345.52 salían en 3 pares de líneas). Concepto "Cliente /
+ * venta / venta…". Lo que no es NI o no tiene depósito identificado se deja igual.
+ */
+function agruparNoIdentificadosPorDeposito(lineas) {
+  const salida = [];
+  const grupos = new Map();
+  for (const m of lineas) {
+    if (m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO || !m._depositoNI) {
+      if ('_depositoNI' in m) {
+        const { _depositoNI, ...resto } = m;
+        salida.push(resto);
+      } else {
+        salida.push(m);
+      }
+      continue;
+    }
+    const key = `${m._depositoNI}|${m.cuenta?.codigo}|${m.centroCosto}`;
+    const existente = grupos.get(key);
+    const [cliente, ...ventas] = (m.concepto || '').split(' / ');
+    if (!existente) {
+      const { _depositoNI, ...resto } = m;
+      const grupo = { ...resto, _cliente: cliente, _ventas: [...ventas] };
+      grupos.set(key, grupo);
+      salida.push(grupo);
+    } else {
+      existente.debe = Math.round((Number(existente.debe) + Number(m.debe)) * 100) / 100;
+      existente.haber = Math.round((Number(existente.haber) + Number(m.haber)) * 100) / 100;
+      existente.cfdiUuid = null;
+      for (const v of ventas) if (v && !existente._ventas.includes(v)) existente._ventas.push(v);
+    }
+  }
+  return salida.map(m => {
+    if (!('_ventas' in m)) return m;
+    const { _cliente, _ventas, ...resto } = m;
+    return { ...resto, concepto: [_cliente, ..._ventas].filter(Boolean).join(' / ') };
+  });
+}
+
 // Diferencia máxima entre el depósito y el cobro que se trata como "centavos"
 // (redondeo del complemento) en Cobranza — más que esto es otro depósito.
 const TOLERANCIA_CENTAVOS_DEPOSITO = 0.10;
@@ -1812,10 +1858,22 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   // toma el depósito de SU monto, sin repetir — antes ambos tomaban el único
   // depósito guardado por factura y se fusionaban en un solo banco de $8,062.26.
   // Sin depósito de ese monto se queda el de siempre.
+  // Primero por lo que cada depósito aplicó a la factura (CxC vinculada en
+  // Bancos): caso real 8-oct ALDARA ITZEL SANTIAGO JARQUIN A0-260900892,
+  // $1,123.28 en dep 051243 y $739.64 en dep 050674 — ambos cobros tomaban
+  // 051243 ($7,764.94 en vez de $7,025.30) y 050674 quedaba en $3,210.36 en
+  // vez de $3,950. Mismo caso AIRAM CECILIA FERNANDEZ VASQUEZ (050310, 051427,
+  // 051633). Luego por el monto total del depósito.
   const depositosUsados = new Set();
   const _depositoPorMonto = (base, llave, monto) => {
     if (!base?._candidatos) return base;
-    const libres = base._candidatos.filter(c => c.montoBancoReal != null && !depositosUsados.has(`${llave}|${c._idDeposito}`));
+    const libresTodos = base._candidatos.filter(c => !depositosUsados.has(`${llave}|${c._idDeposito}`));
+    const porAplicado = libresTodos.find(c => c._montoAplicado != null && Math.abs(c._montoAplicado - monto) < 0.005);
+    if (porAplicado) {
+      depositosUsados.add(`${llave}|${porAplicado._idDeposito}`);
+      return porAplicado;
+    }
+    const libres = libresTodos.filter(c => c.montoBancoReal != null);
     const elegido = libres.find(c => Math.abs(c.montoBancoReal - monto) < 0.005)
       ?? libres
         .filter(c => Math.abs(c.montoBancoReal - monto) <= TOLERANCIA_CENTAVOS_DEPOSITO)
@@ -1901,15 +1959,20 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // Formato "AUT. <numeroAutorizacion>" del banco, no el folio de Numo
     // (2026-09-30, ERIK WILVER: ejemplo "AUT. 3547888", Numo ponía "032147");
     // sin autorización cae al folio de Numo.
+    // 2026-10-13 (PDF "incidencias cobranza 2da parte", como Kore): columna C
+    // con el folio de Numo del depósito (ej. "041498"), no "AUT. 29" — con el
+    // folio se encuentra directo en Numo Bancos. Las líneas NI de un mismo
+    // depósito se juntan en un solo subtotal + un solo IVA (ver abajo).
     if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
       const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
-      const referenciaNI = bancario?.numeroAutorizacion ? `AUT. ${bancario.numeroAutorizacion}` : bancario?.referencia;
+      const referenciaNI = bancario?.referencia ?? (bancario?.numeroAutorizacion ? `AUT. ${bancario.numeroAutorizacion}` : null);
       return {
         cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && referenciaNI) || REGLA_COBRANZA_NO_IDENTIFICADO,
         concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0, _grupoCobro: ORDEN_COBRO.NO_IDENTIFICADO,
+        _depositoNI: bancario?.referencia ?? null,
       };
     }
     if (!/^110[12]/.test(m.cuenta?.codigo || '')) {
@@ -2124,7 +2187,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     : ORDEN_COBRO.TRANSFERENCIA);
   const cobros = [
     ...cargoFinal.map(m => ({ m, g: grupoDeCargo(m) })),
-    ...cobrosNoBancarios.map(({ _grupoCobro, ...m }) => ({ m, g: _grupoCobro })),
+    ...agruparNoIdentificadosPorDeposito(cobrosNoBancarios).map(({ _grupoCobro, ...m }) => ({ m, g: _grupoCobro })),
   ].map((x, i) => ({ ...x, i }))
     .sort((a, b) => a.g - b.g || a.i - b.i)
     .map(x => x.m);

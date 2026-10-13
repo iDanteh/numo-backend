@@ -416,6 +416,10 @@ const verificar = async (idSolicitud, rfcSolicitante, creds, { maxIntentos = MAX
                             extraerValor(xmlResp, 'EstadoSolicitud');
     const codEstatus      = extraerAtributo(xmlResp, 'VerificaSolicitudDescargaResult', 'CodEstatus');
     const mensaje         = extraerAtributo(xmlResp, 'VerificaSolicitudDescargaResult', 'Mensaje');
+    // CodEstatus/Mensaje son del llamado SOAP; el motivo real de un rechazo/error
+    // de la solicitud viene en CodigoEstadoSolicitud (5002, 5003, 5004, 5005…).
+    const codEstadoSol    = extraerAtributo(xmlResp, 'VerificaSolicitudDescargaResult', 'CodigoEstadoSolicitud') ||
+                            extraerValor(xmlResp, 'CodigoEstadoSolicitud');
     const totalCfdis      = parseInt(extraerAtributo(xmlResp, 'VerificaSolicitudDescargaResult', 'NumeroCFDIs') || '0', 10);
 
     logger.info(`[SatDownload] Estado solicitud ${idSolicitud}: ${estadoSolicitud} (${descripcionEstado(estadoSolicitud)})`);
@@ -472,17 +476,18 @@ const verificar = async (idSolicitud, rfcSolicitante, creds, { maxIntentos = MAX
     if (estadoSolicitud === ESTADO_RECHAZADA) {
       // EstadoSolicitud=5 significa que el SAT rechazó la solicitud (no el call SOAP).
       // CodEstatus/Mensaje son del response SOAP y pueden ser engañosos (ej. "5000 Solicitud Aceptada").
-      // Causas frecuentes: solicitud activa previa para el mismo RFC, límite diario alcanzado,
-      // o parámetros duplicados. Se lanza un error con el tag SAT_RECHAZADA para que el
-      // caller pueda detectarlo y hacer retry.
+      // El motivo real viene en CodigoEstadoSolicitud. Se lanza un error con el tag
+      // SAT_RECHAZADA para que el caller pueda detectarlo y hacer retry.
+      logger.warn(`[SatDownload] Solicitud ${idSolicitud} rechazada. Respuesta SAT:\n${xmlResp.slice(0, 2000)}`);
       throw new Error(
         `SAT_RECHAZADA: El SAT rechazó la solicitud (EstadoSolicitud=5). ` +
-        `Causa probable: solicitud activa previa para este RFC o límite diario de solicitudes alcanzado. ` +
-        `(CodEstatus=${codEstatus}, Mensaje="${mensaje}")`
+        `Motivo: ${descripcionCodigoEstadoSolicitud(codEstadoSol)} ` +
+        `(CodigoEstadoSolicitud=${codEstadoSol || 'no informado'}, CodEstatus=${codEstatus}, Mensaje="${mensaje}")`
       );
     }
     if (estadoSolicitud === ESTADO_ERROR) {
-      throw new Error(`SAT [${codEstatus}]: ${mensaje}`);
+      const motivo = codEstadoSol ? ` — ${descripcionCodigoEstadoSolicitud(codEstadoSol)} (CodigoEstadoSolicitud=${codEstadoSol})` : '';
+      throw new Error(`SAT [${codEstatus}]: ${mensaje}${motivo}`);
     }
 
     if (estadoSolicitud === ESTADO_VENCIDA) {
@@ -753,6 +758,22 @@ const descargarPaqueteMetadata = async (idPaquete, rfcSolicitante, creds) => {
 const descripcionEstado = (estado) => {
   const map = { '1': 'Aceptada', '2': 'En Proceso', '3': 'Terminada', '4': 'Error', '5': 'Rechazada', '6': 'Vencida' };
   return map[estado] || 'Desconocido';
+};
+
+// Códigos de CodigoEstadoSolicitud documentados por el SAT (Descarga Masiva v1.5).
+const descripcionCodigoEstadoSolicitud = (codigo) => {
+  const map = {
+    '5000': 'solicitud recibida con éxito',
+    '5002': 'se agotaron las solicitudes de por vida con los mismos parámetros (mismo RFC, rango y tipo)',
+    '5003': 'tope máximo: la solicitud supera los 200,000 CFDIs (Metadata: 1,000,000)',
+    '5004': 'no se encontró información para los parámetros solicitados',
+    '5005': 'ya existe una solicitud vigente con los mismos parámetros (duplicada)',
+    '5006': 'error interno del SAT',
+    '5011': 'límite de descargas por folio por día alcanzado',
+    '404':  'error no controlado del SAT',
+  };
+  if (!codigo) return 'el SAT no informó el motivo';
+  return map[codigo] || `código no documentado`;
 };
 
 module.exports = { solicitar, verificar, descargarPaquete, descargarPaqueteMetadata, invalidarToken };

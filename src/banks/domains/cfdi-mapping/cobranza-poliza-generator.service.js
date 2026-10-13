@@ -696,8 +696,21 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida')
     .lean();
 
+  // Cobro revertido en Kore: el ERP ya pidió cancelar su complemento
+  // ("Cancelacion Pendiente") pero el SAT aún lo da Vigente — contarlo junto
+  // con el cobro que lo reemplaza duplicaba las facturas (2026-10-13, caso real
+  // JULIO CESAR MORALES LUIS 8-oct: Pago A0-261003800 efectivo $6,852.18
+  // revertido y vuelto a cobrar por transferencia en A0-261003895).
+  const ERP_STATUS_CANCELANDO = ['Cancelacion Pendiente', 'Cancelado'];
+  const enCancelacionErp = cfdis.length
+    ? await CFDI.find({ uuid: { $in: cfdis.map(c => c.uuid) }, source: 'ERP', erpStatus: { $in: ERP_STATUS_CANCELANDO } })
+      .select('uuid serie folio total erpStatus').lean()
+    : [];
+  const uuidsEnCancelacion = new Set(enCancelacionErp.map(c => c.uuid.toUpperCase()));
+
   const cfdisSinPoliza = cfdis.filter(c =>
     !uuidsYaUsados.has(c.uuid) &&
+    !uuidsEnCancelacion.has((c.uuid || '').toUpperCase()) &&
     (!formaPagoFiltro || FORMA_PAGO_A_CATEGORIA[_formaPagoResuelta(c)] === formaPagoFiltro),
   );
 
@@ -873,6 +886,13 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
   if (pendientesCruzadosParaEncolar.length) {
     advertencias.push(`⚠ ${pendientesCruzadosParaEncolar.length} factura(s) de otra(s) sucursal(es) cobrada(s) aquí — se encolarán para que su sucursal cierre su CxC al generar su propia póliza`);
   }
+  const enCancelacionDelCentro = centroCostoId
+    ? enCancelacionErp.filter(c => String(ccBySerieMap[c.serie]?.id ?? '') === String(centroCostoId))
+    : enCancelacionErp;
+  if (enCancelacionDelCentro.length) {
+    const lista = enCancelacionDelCentro.map(c => `${c.serie}-${c.folio} $${Number(c.total).toFixed(2)} (${c.erpStatus})`).join(', ');
+    advertencias.push(`⚠ ${enCancelacionDelCentro.length} complemento(s) de pago excluido(s): cobro revertido en Kore, el ERP pidió cancelarlo pero el SAT aún lo da Vigente — confirmar su cancelación ante el SAT: ${lista}`);
+  }
 
   return {
     cfdisSinPoliza: cfdisFiltrado, todosLosMovimientos, sinRegla, advertencias, ruleUsageCount,
@@ -924,8 +944,9 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
   } = await _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro });
 
   // Numeración de folio: se reutiliza la utilería de cfdi-poliza-generator.
-  // service.js (require perezoso — ver docstring del archivo) porque Ingreso
-  // y Cobranza comparten el mismo contador/rango por sucursal.
+  // service.js (require perezoso — ver docstring del archivo), pero con el
+  // rango propio de Cobranza (01–99 por mes, uno solo para todas las
+  // sucursales, ver RANGO_FOLIO_COBRANZA) — ya no el rango por sucursal de Ingreso.
   const generatorUtils = require('./cfdi-poliza-generator.service');
   const fecha = fechaInicio ? new Date(`${fechaInicio}T12:00:00.000Z`) : new Date();
   const concepto = _construirConceptoCobranza({ fechaInicio, fechaFin, ejercicio, periodo });
@@ -936,17 +957,13 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
       { replacements: { key: `poliza-${tipoPropuesta}-${rfc}-${ejercicio}-${periodo}` }, transaction: t },
     );
 
-    const centroFolio = centroCostoId
-      ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))
-      : null;
-    const rangoFolio = generatorUtils._rangoFolioPorSucursal(centroFolio?.sucursal);
-    const foliosNecesarios = generatorUtils._esCedisPorSucursal(centroFolio?.sucursal) ? generatorUtils.FOLIOS_MAX_CEDIS : 1;
-
+    const rangoFolio = generatorUtils.RANGO_FOLIO_COBRANZA;
     const { numero, agotado } = await generatorUtils._folioSiguienteDisponible({
-      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t,
+      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios: 1, ccBySerieMap, transaction: t,
+      unFolioPorPoliza: true,
     });
     if (agotado) {
-      throw new BadRequestError(`Se agotó el rango de folios de ${centroFolio.sucursal} para este periodo (${rangoFolio.desde}-${rangoFolio.hasta}).`);
+      throw new BadRequestError(`Se agotó el rango de folios de Cobranza para este periodo (${rangoFolio.desde}-${rangoFolio.hasta}).`);
     }
 
     const polizaHeader = await Poliza.create({

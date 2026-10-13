@@ -2895,7 +2895,13 @@ function _esCedisPorSucursal(sucursal) {
   return (sucursal || '').trim().toUpperCase() === 'CEDIS';
 }
 
-async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction }) {
+// Cobranza: contador propio 01–99 por mes, uno solo para todas las sucursales
+// (confirmado con el usuario 2026-10-13, PDF "incidencia numo cobranza") —
+// ya no comparte el rango por sucursal de Ingreso. Cada póliza de Cobranza
+// ocupa un solo folio en el export (un bloque, ver exportContpaqXlsx).
+const RANGO_FOLIO_COBRANZA = { desde: 1, hasta: 99 };
+
+async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction, unFolioPorPoliza = false }) {
   if (!rangoFolio) {
     const max = await Poliza.max('numero', {
       where: { tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo) },
@@ -2919,6 +2925,7 @@ async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, period
 
   const ocupados = new Set();
   for (const p of activas) {
+    if (unFolioPorPoliza) { ocupados.add(p.numero); continue; }
     const movs = p.movimientos ?? [];
     const esCedisPast = movs.length > 0 && movs.every(m => _esCedisPorSucursal(sucursalDeCentro(m.centroCostoId)));
     if (esCedisPast) {
@@ -7816,6 +7823,6 @@ module.exports = {
   // la numeración de folio (comparte el mismo contador/rango por sucursal que
   // Ingreso — duplicarla arriesgaría folios chocados entre ambos). Ninguna de
   // estas funciones tiene lógica de negocio de Ingreso: son utilería pura.
-  _folioSiguienteDisponible, _rangoFolioPorSucursal, _esCedisPorSucursal, FOLIOS_MAX_CEDIS,
+  _folioSiguienteDisponible, _rangoFolioPorSucursal, _esCedisPorSucursal, FOLIOS_MAX_CEDIS, RANGO_FOLIO_COBRANZA,
   _medianocheMx, _diaSiguiente,
 };

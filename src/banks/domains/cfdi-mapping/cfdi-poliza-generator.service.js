@@ -2581,6 +2581,30 @@ function _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFactura) {
   }
 }
 
+// Originales cancelados-con-sustitución del mismo periodo que entran al batch:
+// solo los de la sucursal que se está generando (por la serie del sustituto) y
+// UNA copia por uuid (la SAT si existe). Antes entraban los de TODAS las
+// sucursales del día y las dos copias (SAT y ERP), cada una con su propia
+// regla (2026-10-13, Ferrocarril 12-oct: C0-261000641 y M0-261000375 de otras
+// sucursales, con Reg 1C/1D y Reg 22C a la vez, por una relación 04 falsa).
+async function _originalesSustituidosDelCentro(sustitutos, { centroCostoId, ccBySerieMap }) {
+  const delCentro = centroCostoId
+    ? sustitutos.filter(s => String(ccBySerieMap?.[s.serie]?.id ?? '') === String(centroCostoId))
+    : sustitutos;
+  const uuids = [...new Set(delCentro.flatMap(s => s.sustituyeA))];
+  if (!uuids.length) return [];
+  const docs = await CFDI.find({ uuid: { $in: uuids } })
+    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida source')
+    .lean();
+  const porUuid = new Map();
+  for (const d of docs) {
+    const k = String(d.uuid).toUpperCase();
+    const previo = porUuid.get(k);
+    if (!previo || (previo.source !== 'SAT' && d.source === 'SAT')) porUuid.set(k, d);
+  }
+  return [...porUuid.values()];
+}
+
 // Recepción de anticipo cuya OPA salió del sobrante de un depósito de cobranza
 // (cuentas PPD con complemento): va en la póliza de Cobranza, no aquí (regla
 // del usuario 2026-10-13, ver opa-cobranza.service.js). Vacía `movs` y regresa
@@ -4079,11 +4103,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // asiento de reversión que lo cancela se agrega después de generar todos
   // los movimientos (ver `sustitutosMismoPeriodoProp` más abajo, tras el
   // loop principal).
-  const cfdisOriginalesCanceladosProp = sustitutosMismoPeriodoProp.length
-    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoProp.flatMap(s => s.sustituyeA) } })
-        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
-        .lean()
-    : [];
+  const cfdisOriginalesCanceladosProp = await _originalesSustituidosDelCentro(sustitutosMismoPeriodoProp, { centroCostoId, ccBySerieMap: ccBySerieMapProp });
   const cfdisConNCProp = [...cfdisConNCSinReversionProp, ...cfdisOriginalesCanceladosProp];
 
   // Póliza de Pagos (Cobranza): ordenar por folio del Pago ascendente — sin
@@ -6178,11 +6198,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
 
   // Originales cancelados-con-sustitución del mismo periodo — ver comentario
   // equivalente en generarPropuesta.
-  const cfdisOriginalesCanceladosGuard = sustitutosMismoPeriodoGuard.length
-    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoGuard.flatMap(s => s.sustituyeA) } })
-        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
-        .lean()
-    : [];
+  const cfdisOriginalesCanceladosGuard = await _originalesSustituidosDelCentro(sustitutosMismoPeriodoGuard, { centroCostoId, ccBySerieMap });
   const cfdisConNCGuard = [...cfdisConNCSinReversionGuard, ...cfdisOriginalesCanceladosGuard];
 
   // Ver comentario equivalente en generarPropuesta.

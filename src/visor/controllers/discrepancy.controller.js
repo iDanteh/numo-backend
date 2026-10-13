@@ -21,7 +21,12 @@ const list = asyncHandler(async (req, res) => {
   if (rfcEmisor) filter.rfcEmisor = rfcEmisor.toUpperCase();
   if (ejercicio)          filter.ejercicio          = parseInt(ejercicio);
   if (periodo)            filter.periodo            = parseInt(periodo);
-  if (tipoDeComprobante)  filter.tipoDeComprobante  = tipoDeComprobante;
+  // Uno solo ('I') o varios separados por coma ('I,E,P' — tabla "Tipos de
+  // discrepancia" del dashboard, sin Nómina).
+  if (tipoDeComprobante) {
+    const tipos = String(tipoDeComprobante).split(',').map(t => t.trim()).filter(Boolean);
+    filter.tipoDeComprobante = tipos.length > 1 ? { $in: tipos } : tipos[0];
+  }
   if (uuid)               filter.uuid               = uuid.toUpperCase();
 
   const [discrepancies, total] = await Promise.all([

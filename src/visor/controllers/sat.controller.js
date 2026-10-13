@@ -381,6 +381,19 @@ const startDownload = asyncHandler(async (req, res) => {
 
   // ── Verificar que no haya solicitudes activas en el SAT para este RFC ──────
   const SatJobCheckpoint = require('../models/SatJobCheckpoint');
+  // Un checkpoint activo se actualiza al menos cada ~60 min (polling de verificar o
+  // re-verificación de paquetes). Si lleva más sin moverse, el proceso que lo llevaba
+  // murió (ej. reinicio del contenedor por un deploy) y bloquearía las descargas
+  // manuales para siempre: se marca 'error' y no cuenta como "en proceso".
+  const CHECKPOINT_ATORADO_MS = 2 * 60 * 60 * 1000;
+  const limiteAtorado = new Date(Date.now() - CHECKPOINT_ATORADO_MS);
+  const atorados = await SatJobCheckpoint.updateMany(
+    { rfc: rfcNorm, status: { $in: ['solicitando', 'verificando', 'descargando'] }, updatedAt: { $lt: limiteAtorado } },
+    { $set: { status: 'error', error: 'Atorado: más de 2 h sin avance (el proceso que lo descargaba se interrumpió)', updatedAt: new Date() } },
+  );
+  if (atorados.modifiedCount > 0) {
+    logger.warn(`[SAT] ${atorados.modifiedCount} checkpoint(s) atorado(s) de ${rfcNorm} marcados como error antes de la descarga manual.`);
+  }
   const checkpointActivo = await SatJobCheckpoint.findOne({
     rfc:    rfcNorm,
     status: { $in: ['solicitando', 'verificando', 'descargando'] },
@@ -839,6 +852,7 @@ const resetCheckpoint = asyncHandler(async (req, res) => {
       status:          'error',
       error:           'Reseteado manualmente por el administrador',
       alertaPendiente: false,
+      solicitudPendiente: false,
       reintentos:      0,
       updatedAt:       new Date(),
     },

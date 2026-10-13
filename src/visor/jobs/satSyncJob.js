@@ -466,6 +466,142 @@ const reintentarIncompletos = async () => {
   }
 };
 
+// Vigencia de una solicitud SAT: después de 72 h sus paquetes ya no se pueden descargar.
+const SOLICITUD_VIGENCIA_MS = 72 * 60 * 60 * 1000;
+// Polls (1/min) al retomar una solicitud pendiente: si sigue "En Proceso" se deja
+// para la siguiente corrida en vez de bloquear el job otra hora.
+const MAX_POLLS_RECUPERACION = 3;
+
+/**
+ * ¿Se puede reutilizar la solicitud pendiente del checkpoint para el rango que se
+ * pide ahora? La solicitud es una foto del SAT al momento de pedirla, así que solo
+ * sirve si termina el mismo día que lo pedido y se pidió cuando ese rango ya había
+ * terminado (si no, le faltarían los CFDIs posteriores).
+ * @param {string} fechaFin — fin del rango pedido ('YYYY-MM-DD' o 'YYYY-MM-DDTHH:mm:ss', hora de México)
+ */
+const solicitudPendienteReutilizable = (checkpoint, fechaFin, esMetadata) => {
+  if (esMetadata || !checkpoint || checkpoint.status !== 'error' || !checkpoint.solicitudPendiente) return false;
+  if (!checkpoint.idSolicitud || !checkpoint.solicitadaEn) return false;
+  const solicitada = new Date(checkpoint.solicitadaEn).getTime();
+  if (Date.now() - solicitada >= SOLICITUD_VIGENCIA_MS) return false;
+  if (!fechaFin || checkpoint.fechaFin !== String(fechaFin).slice(0, 10)) return false;
+  // México sin horario de verano desde 2022 → UTC-6 fijo
+  const fin = String(fechaFin);
+  const conHora = fin.length > 10 ? fin : `${fin}T23:59:59`;
+  const finMs = new Date(/(Z|[+-]\d\d:\d\d)$/.test(conHora) ? conHora : `${conHora}-06:00`).getTime();
+  return Number.isFinite(finMs) && solicitada > finMs;
+};
+
+/**
+ * Retoma las solicitudes SAT que vencieron el polling de 60 min (checkpoint en
+ * 'error' con solicitudPendiente). Si el SAT ya la terminó, pasa el checkpoint a
+ * 'descargando' y procesarDescarga() baja sus paquetes por la ruta de reanudación
+ * normal, sin pedir una solicitud nueva.
+ * @param {{ recibidos: boolean }} opts — Emitidos y Recibidos corren en jobs
+ *   distintos; cada uno retoma solo sus propios checkpoints.
+ */
+const recuperarSolicitudesPendientes = async ({ recibidos = false } = {}) => {
+  const limite = new Date(Date.now() - SOLICITUD_VIGENCIA_MS);
+  const filtroTipo = recibidos ? { $regex: /^Recibidos/ } : { $not: /^Recibidos/ };
+
+  // Las que ya pasaron 72 h no tienen remedio: se dejan como error normal.
+  await SatJobCheckpoint.updateMany(
+    { status: 'error', solicitudPendiente: true, tipoComprobante: filtroTipo,
+      $or: [{ solicitadaEn: null }, { solicitadaEn: { $lt: limite } }] },
+    { $set: { solicitudPendiente: false } },
+  );
+
+  const pendientes = await SatJobCheckpoint.find({
+    status: 'error', solicitudPendiente: true, tipoComprobante: filtroTipo,
+    idSolicitud: { $ne: null }, solicitadaEn: { $gte: limite },
+  }).lean();
+
+  if (pendientes.length === 0) return;
+  logger.info(`[SatSyncJob] recuperarSolicitudesPendientes: ${pendientes.length} solicitud(es) pendiente(s) del SAT — retomando...`);
+
+  for (const cp of pendientes) {
+    const { rfc, fecha, tipoComprobante, idSolicitud, ejercicio, periodo } = cp;
+    const etiqueta = `${rfc} ${tipoComprobante} ${fecha} (solicitud ${idSolicitud})`;
+
+    // Reclamar el checkpoint para que otra corrida simultánea no lo procese doble.
+    const reclamado = await SatJobCheckpoint.findOneAndUpdate(
+      { _id: cp._id, solicitudPendiente: true },
+      { $set: { solicitudPendiente: false } },
+    );
+    if (!reclamado) continue;
+
+    let creds = null;
+    try { creds = await obtener(rfc); } catch { /* se maneja abajo */ }
+    if (!creds) {
+      logger.warn(`[SatSyncJob] recuperarSolicitudesPendientes: sin credenciales para ${etiqueta} — se deja pendiente.`);
+      await SatJobCheckpoint.updateOne({ _id: cp._id }, { $set: { solicitudPendiente: true } }).catch(() => {});
+      continue;
+    }
+
+    let idsPaquetes, totalCfdis;
+    try {
+      ({ idsPaquetes, totalCfdis } = await verificar(idSolicitud, rfc, creds, { maxIntentos: MAX_POLLS_RECUPERACION }));
+    } catch (err) {
+      // Solo una respuesta definitiva del SAT (rechazada, error, vencida, 5004)
+      // descarta la solicitud; timeouts y fallas de red la dejan para después.
+      const definitivo = err.code !== 'SAT_TIMEOUT_POLLING' && /^SAT/.test(err.message);
+      if (definitivo) {
+        logger.warn(`[SatSyncJob] recuperarSolicitudesPendientes: ${etiqueta} no recuperable — ${err.message}`);
+        await SatJobCheckpoint.updateOne(
+          { _id: cp._id },
+          { $set: { error: `Solicitud pendiente no recuperable: ${err.message}`, updatedAt: new Date() } },
+        ).catch(() => {});
+      } else {
+        logger.info(`[SatSyncJob] recuperarSolicitudesPendientes: ${etiqueta} sigue sin terminar (${err.message}) — se reintenta en la siguiente corrida.`);
+        await SatJobCheckpoint.updateOne({ _id: cp._id }, { $set: { solicitudPendiente: true } }).catch(() => {});
+      }
+      continue;
+    }
+
+    if (idsPaquetes.length === 0) {
+      logger.info(`[SatSyncJob] recuperarSolicitudesPendientes: ${etiqueta} terminó sin paquetes (${totalCfdis} CFDIs reportados).`);
+      await SatJobCheckpoint.updateOne(
+        { _id: cp._id },
+        { $set: { status: 'completado', totalReportadoSAT: totalCfdis, error: null, updatedAt: new Date() } },
+      ).catch(() => {});
+      continue;
+    }
+
+    // Con status 'descargando' + idsPaquetes, descargarPorSubtipo() reanuda esta
+    // misma solicitud (checkpointVigente) en vez de pedir otra.
+    await SatJobCheckpoint.updateOne(
+      { _id: cp._id },
+      { $set: {
+        status: 'descargando', idsPaquetes, totalReportadoSAT: totalCfdis,
+        paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0,
+        error: null, updatedAt: new Date(),
+      } },
+    );
+    logger.info(`[SatSyncJob] recuperarSolicitudesPendientes: ${etiqueta} terminada — ${idsPaquetes.length} paquete(s), descargando...`);
+
+    const tipoBase = tipoComprobante.replace(/_M[12]$/, '');
+    const cpSufijo = tipoComprobante.slice(tipoBase.length);
+    const horaIni  = cpSufijo === '_M2' ? '12:00:00' : '00:00:00';
+    const horaFin  = cpSufijo === '_M1' ? '11:59:59' : '23:59:59';
+    try {
+      await procesarDescarga({
+        rfc,
+        fechaInicio:     `${fecha}T${horaIni}`,
+        fechaFin:        `${cp.fechaFin ?? fecha}T${horaFin}`,
+        tipoSolicitud:   'CFDI',
+        tipoComprobante: tipoBase,
+        cpSufijo,
+        creds,
+        ejercicio,
+        periodo,
+        tipo:            'automatica',
+      });
+    } catch (err) {
+      logger.error(`[SatSyncJob] recuperarSolicitudesPendientes: error descargando ${etiqueta}: ${err.message}`);
+    }
+  }
+};
+
 const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = {}) => {
   logger.info(`[SatSyncJob] Iniciando descarga masiva nocturna (${tiposObjetivo.join(', ')})...`);
 
@@ -609,6 +745,12 @@ const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = 
     // Las credenciales expiran automáticamente a las 8 horas via TTL de MongoDB.
   }
 
+  // Retomar solicitudes que vencieron el polling de 60 min en corridas anteriores
+  // (no gasta cuota: reutiliza el IdSolicitud que el SAT ya aceptó).
+  await recuperarSolicitudesPendientes({ recibidos: tiposObjetivo.includes('Recibidos') }).catch(err =>
+    logger.error(`[SatSyncJob] recuperarSolicitudesPendientes falló: ${err.message}`)
+  );
+
   // Reintentar checkpoints incompletos de días anteriores — se hace AL FINAL
   // para no comprometer la cuota SAT del día actual.
   await reintentarIncompletos().catch(err =>
@@ -737,7 +879,58 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
     }
   }
 
-  if (!checkpointVerificando || rechazadaCheckpointVerif) {
+  // Solicitud que venció el polling de 60 min (solicitudPendiente) y se vuelve a pedir
+  // el MISMO rango (ej. descarga manual): se reutiliza en vez de pedir otra, pero solo
+  // si su "foto" ya cubre todo lo que se pide hoy — mismo fin de rango y pedida
+  // después de que ese rango terminó. Si no, se pide una nueva normalmente.
+  let reusoPendiente = false;
+  if (!checkpointVerificando && !checkpointVigente && solicitudPendienteReutilizable(checkpoint, fechaFin, esMetadata)) {
+    const reclamado = await SatJobCheckpoint.findOneAndUpdate(
+      { _id: checkpoint._id, solicitudPendiente: true },
+      { $set: { solicitudPendiente: false } },
+    );
+    if (reclamado) {
+      const etiqueta = `${tipoComprobante} ${fecha} (solicitud ${checkpoint.idSolicitud})`;
+      logger.info(`[SatSyncJob] ${etiqueta}: mismo rango que la solicitud pendiente — consultándola en vez de pedir otra...`);
+      try {
+        const { idsPaquetes: ids, totalCfdis } = await verificar(checkpoint.idSolicitud, rfc, creds, { maxIntentos: MAX_POLLS_RECUPERACION });
+        if (ids.length === 0) {
+          await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { status: 'completado', totalReportadoSAT: totalCfdis, error: null, updatedAt: new Date() } });
+          return { rows: [], paquetes: 0, totalReportado: totalCfdis, esMetadata };
+        }
+        await SatJobCheckpoint.updateOne(
+          { _id: checkpoint._id },
+          { $set: {
+            status: 'descargando', idsPaquetes: ids, totalReportadoSAT: totalCfdis,
+            paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0,
+            error: null, updatedAt: new Date(),
+          } },
+        );
+        idSolicitud = checkpoint.idSolicitud;
+        idsPaquetes = ids;
+        checkpoint.totalReportadoSAT = totalCfdis;
+        checkpoint.paquetesProcesados = [];
+        reusoPendiente = true;
+        logger.info(`[SatSyncJob] ${etiqueta}: el SAT ya la terminó — ${ids.length} paquete(s), sin solicitud nueva.`);
+      } catch (err) {
+        // Igual que recuperarSolicitudesPendientes(): solo una respuesta definitiva del
+        // SAT la descarta (y se pide una nueva abajo); si sigue en proceso o falla la
+        // red, se conserva y se avisa en vez de duplicarla.
+        const definitivo = err.code !== 'SAT_TIMEOUT_POLLING' && /^SAT/.test(err.message);
+        if (!definitivo) {
+          await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { solicitudPendiente: true } }).catch(() => {});
+          const pedida = new Date(checkpoint.solicitadaEn).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' });
+          throw new Error(
+            `El SAT aún está procesando la solicitud ${checkpoint.idSolicitud} de ${tipoComprobante} (pedida el ${pedida}) para este mismo rango ` +
+            `(${err.message}). No se pidió otra para no duplicarla; se descargará sola en la siguiente corrida o reintenta más tarde.`
+          );
+        }
+        logger.warn(`[SatSyncJob] ${etiqueta} no recuperable: ${err.message} — se pide una nueva.`);
+      }
+    }
+  }
+
+  if (!reusoPendiente && (!checkpointVerificando || rechazadaCheckpointVerif)) {
     if (checkpointVigente && !rechazadaCheckpointVerif) {
     idSolicitud = checkpoint.idSolicitud;
     // ── Re-verificar con el SAT para asegurar que tenemos TODOS los IDs de paquetes.
@@ -783,12 +976,12 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
     for (let intento = 1; intento <= MAX_REINTENTOS_RECHAZADA; intento++) {
       checkpoint = await SatJobCheckpoint.findOneAndUpdate(
         { rfc: rfc.toUpperCase(), fecha, tipoComprobante: cpTipo },
-        { $set: { ejercicio, periodo, fechaFin: fechaFin.slice(0, 10), status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0, error: null, updatedAt: new Date() } },
+        { $set: { ejercicio, periodo, fechaFin: fechaFin.slice(0, 10), status: 'solicitando', idSolicitud: null, idsPaquetes: [], paquetesProcesados: [], paquetesFallidos: [], cfdisDescargados: 0, error: null, solicitudPendiente: false, solicitadaEn: null, updatedAt: new Date() } },
         { upsert: true, new: true },
       );
       try {
         idSolicitud = await solicitar({ rfcSolicitante: rfc, fechaInicio, fechaFin, tipoComprobante, tipoSolicitud, creds, folioFiscalUUID });
-        await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', updatedAt: new Date() } });
+        await SatJobCheckpoint.updateOne({ _id: checkpoint._id }, { $set: { idSolicitud, status: 'verificando', solicitadaEn: new Date(), updatedAt: new Date() } });
 
         ({ idsPaquetes, totalCfdis: totalReportadoSATLocal } = await verificar(idSolicitud, rfc, creds));
         break; // solicitud aceptada y terminada — salir del loop de reintentos
@@ -803,12 +996,22 @@ const descargarPorSubtipo = async ({ rfc, fechaInicio, fechaFin, ejercicio, peri
           await new Promise(r => setTimeout(r, ESPERA_RECHAZADA_MS));
           continue;
         }
+        // Timeout de polling: el SAT aceptó la solicitud y la sigue procesando. Se deja
+        // en 'error' (no bloquea descargas nuevas ni cuenta como "en proceso") pero se
+        // conserva el idSolicitud para que recuperarSolicitudesPendientes() la retome.
+        // Solo XML: el fallback de Metadata es secundario y no se recupera.
+        const esTimeoutSat = rechazadaErr.code === 'SAT_TIMEOUT_POLLING' && !esMetadata;
         // Reintentos agotados o error distinto a Rechazada.
         // Marcar checkpoint como 'error' para que el siguiente run del job
         // no intente re-verificar este idSolicitud (que ya está rechazado).
         await SatJobCheckpoint.updateOne(
           { _id: checkpoint._id },
-          { $set: { status: 'error', error: rechazadaErr.message, updatedAt: new Date() } }
+          { $set: {
+            status: 'error',
+            error: esTimeoutSat ? `${rechazadaErr.message} — el SAT sigue procesándola; se retomará en la siguiente descarga` : rechazadaErr.message,
+            solicitudPendiente: esTimeoutSat,
+            updatedAt: new Date(),
+          } }
         ).catch(() => {});
         throw rechazadaErr;
       }
@@ -1483,6 +1686,15 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
  * registros queden vinculados al periodo fiscal correcto (seleccionado por el
  * usuario o derivado de la fecha del job automático).
  */
+// Tipo de comprobante del CFDI para guardarlo en su Discrepancy (2026-10-08):
+// antes no se guardaba y el dashboard no podía separar Ingresos/Egresos/Pagos
+// de Nómina y Traslados. Solo letras válidas del enum del modelo.
+const TIPOS_DISCREPANCIA_VALIDOS = ['I', 'E', 'T', 'N', 'P'];
+const tipoParaDiscrepancia = (cfdi) => {
+  const t = String(cfdi?.tipoDeComprobante || cfdi?.tipoComprobante || '').trim().toUpperCase();
+  return TIPOS_DISCREPANCIA_VALIDOS.includes(t) ? { tipoDeComprobante: t } : {};
+};
+
 const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, soloEnERP, conDiferencia, sinUuid = [], ejercicio, periodo }) => {
   const ahora = new Date();
   const fp    = { ejercicio, periodo };
@@ -1535,7 +1747,7 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
     await Discrepancy.bulkWrite(soloEnSAT.map(cfdi => ({
       updateOne: {
         filter: { uuid: cfdi.uuid, type: 'MISSING_IN_ERP' },
-        update: { $set: { uuid: cfdi.uuid, type: 'MISSING_IN_ERP', severity: 'critical', description: `CFDI ${cfdi.uuid} existe en SAT pero no en ERP`, status: 'open', rfcEmisor: cfdi.rfcEmisor, rfcReceptor: cfdi.rfcReceptor, ...fp } },
+        update: { $set: { uuid: cfdi.uuid, type: 'MISSING_IN_ERP', severity: 'critical', description: `CFDI ${cfdi.uuid} existe en SAT pero no en ERP`, status: 'open', rfcEmisor: cfdi.rfcEmisor, rfcReceptor: cfdi.rfcReceptor, ...tipoParaDiscrepancia(cfdi), ...fp } },
         upsert: true,
       },
     })));
@@ -1623,6 +1835,7 @@ const guardarResultados = async ({ rfc, tipoComprobante, coinciden, soloEnSAT, s
       rfcEmisor:    sat.rfcEmisor,
       rfcReceptor:  sat.rfcReceptor,
       status:       'open',
+      ...tipoParaDiscrepancia(sat.tipoDeComprobante || sat.tipoComprobante ? sat : erp),
       ...(comentariosNuevas[iDif].length && { comentarios: comentariosNuevas[iDif] }),
       ...fp,
     })));
@@ -2084,4 +2297,4 @@ const reprogramarJobs = ({
   }
 })();
 
-module.exports = { ejecutarDescargaMasiva, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs, _uuidsConciliadosPrevios, _restaurarConciliados };
+module.exports = { ejecutarDescargaMasiva, recuperarSolicitudesPendientes, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs, _uuidsConciliadosPrevios, _restaurarConciliados };

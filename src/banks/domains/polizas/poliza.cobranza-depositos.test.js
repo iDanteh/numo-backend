@@ -77,3 +77,43 @@ test('depósito que paga varias facturas → no se ajustan centavos', () => {
   expect(bancos(out)[0].debe).toBe(1602.92);
   expect(out.find(l => l.cuenta.codigo === '1103010001').haber).toBe(1602.92);
 });
+
+// 2da parte (8-oct): factura pagada con porciones de varios depósitos — cada
+// cobro toma el depósito que le aplicó ese monto (CxC vinculada en Bancos).
+test('ALDARA 8-oct: 051243 = $7,025.30 y 050674 = $3,950 (por monto aplicado)', () => {
+  const dep = (id, ref, total, aplicado, n) => ({ ...deposito(id, ref, total, n), _montoAplicado: aplicado });
+  const movs = [
+    ...factura({ pago: 'P1', fact: 'F892', monto: 1123.28, iva: 154.93, concepto: 'ALDARA / A0-260900892' }),
+    ...factura({ pago: 'P1', fact: 'F1025', monto: 5902.02, iva: 814.07, concepto: 'ALDARA / A0-260901025' }),
+    ...factura({ pago: 'P2', fact: 'F825', monto: 3210.36, iva: 442.81, concepto: 'ALDARA / A0-260900825' }),
+    ...factura({ pago: 'P2', fact: 'F892', monto: 739.64, iva: 102.02, concepto: 'ALDARA / A0-260900892' }),
+  ];
+  const d892a = dep('a', '051243', 7025.30, 1123.28, 2);
+  const d892b = dep('b', '050674', 3950, 739.64, 2);
+  const verdad = new Map([
+    ['F892', { ...d892a, _candidatos: [d892a, d892b] }],
+    ['F1025', dep('a', '051243', 7025.30, 5902.02, 2)],
+    ['F825', dep('b', '050674', 3950, 3210.36, 2)],
+  ]);
+  const b = bancos(anotar(movs, 20, verdad));
+  expect(b.map(l => [l.serie, l.debe]).sort()).toEqual([['050674', 3950], ['051243', 7025.3]]);
+});
+
+test('NI: un subtotal y un IVA por depósito, con folio de Numo y todas las ventas', () => {
+  const DNI = { codigo: '2103030001' };
+  const IVA_NI = { codigo: '2104010002' };
+  const ni = (fact, venta, sub, iva) => [
+    { cfdiUuid: 'P7', facturaUuid: fact, formaPago: '03', serie: 'B0-1', concepto: `MINI ABASTOS / ${venta}`, centroCosto: '111', reglaNombre: 'NI', cuenta: DNI, debe: sub, haber: 0 },
+    { cfdiUuid: 'P7', facturaUuid: fact, formaPago: '03', serie: 'B0-1', concepto: `MINI ABASTOS / ${venta}`, centroCosto: '111', reglaNombre: 'NI', cuenta: IVA_NI, debe: iva, haber: 0 },
+  ];
+  const movs = [...ni('F1', 'B0-260803365', 423.58, 67.77), ...ni('F2', 'B0-260803238', 494.52, 79.12), ...ni('F3', 'B0-260803492', 5470.28, 875.24)];
+  const d = { ...deposito('x', '046486', 7479.42, 4), numeroAutorizacion: '29' };
+  const verdad = new Map([['F1', d], ['F2', d], ['F3', d]]);
+
+  const out = anotar(movs, 20, verdad).filter(l => l.reglaNombre === 'NI');
+  expect(out.map(l => [l.cuenta.codigo, l.serie, l.debe])).toEqual([
+    ['2103030001', '046486', 6388.38],
+    ['2104010002', 'NI', 1022.13],
+  ]);
+  expect(out[0].concepto).toBe('MINI ABASTOS / B0-260803365 / B0-260803238 / B0-260803492');
+});

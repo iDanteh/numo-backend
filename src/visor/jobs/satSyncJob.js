@@ -1419,40 +1419,68 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
                 }
               }
 
-              // ── Upgrade metadata→xml para coinciden ──────────────────────
-              // CFDIs que ya coinciden con ERP pero fueron guardados como metadata
-              // en una descarga anterior: promover a XML con los datos completos.
-              if (coinciden.length > 0) {
-                const coincidenUuids = new Set(coinciden.map(c => (c.uuid || '').toUpperCase()));
-                const xmlParaCoinc   = r.filter(c => coincidenUuids.has((c.uuid || '').toUpperCase()));
-                if (xmlParaCoinc.length > 0) {
-                  const upgResult = await CFDI.bulkWrite(xmlParaCoinc.map(c => ({
-                    updateOne: {
-                      filter: { uuid: c.uuid.toUpperCase(), source: 'SAT', origenDescarga: 'metadata' },
-                      update: {
-                        $set: {
-                          origenDescarga:      'xml',
-                          xmlContent:          c.xmlContent,
-                          xmlHash:             c.xmlHash,
-                          serie:               c.serie,
-                          folio:               c.folio,
-                          subTotal:            c.subTotal,
-                          total:               c.total,
-                          moneda:              c.moneda,
-                          conceptos:           c.conceptos,
-                          impuestos:           c.impuestos,
-                          timbreFiscalDigital: c.timbreFiscalDigital,
-                          complementoPago:     c.complementoPago,
-                          // Ver comentario equivalente arriba (cfdiNuevos).
-                          cfdiRelacionados:    c.cfdiRelacionados ?? [],
-                        },
+            }
+          }
+
+          // ── 4b. XML para la copia SAT de los que coinciden / tienen diferencias ──
+          // (2026-10-13) Antes solo se promovía metadata→xml, y solo si en el
+          // mismo tipo había además CFDIs "solo en SAT": la copia SAT que no
+          // existía, o la que creó la carga del reporte Excel (sin XML, fecha sin
+          // hora, relación supuesta), se quedaba así para siempre aunque la
+          // descarga trajera su XML — y el ERP quedaba en 'match' sin contraparte
+          // SAT (caso real 12-oct: 190 Ingresos; C0-261000642/M0-261000376 con
+          // relación 04 falsa). Ahora toda copia SAT sin XML recibe el del SAT, o
+          // se crea si no existe. No toca satStatus de una copia existente.
+          if (!esMetadata) {
+            const uuidsCoinc = new Set([...coinciden, ...conDiferencia.map(d => d.sat)]
+              .map(c => (c?.uuid || '').toUpperCase()).filter(Boolean));
+            const xmlCoinc = r.filter(c => uuidsCoinc.has((c.uuid || '').toUpperCase()));
+            if (xmlCoinc.length > 0) {
+              const conXml = new Set((await CFDI.find({
+                uuid: { $in: xmlCoinc.map(c => c.uuid.toUpperCase()) },
+                source: 'SAT',
+                xmlContent: { $exists: true, $nin: [null, ''] },
+              }).select('uuid').lean()).map(d => String(d.uuid).toUpperCase()));
+              const sinXml = xmlCoinc.filter(c => !conXml.has(c.uuid.toUpperCase()));
+              if (sinXml.length > 0) {
+                const _conciliadosPreviosCoinc = await _uuidsConciliadosPrevios(sinXml.map(c => c.uuid.toUpperCase()));
+                const res = await CFDI.bulkWrite(sinXml.map(c => ({
+                  updateOne: {
+                    filter: { uuid: c.uuid.toUpperCase(), source: 'SAT' },
+                    update: {
+                      $set: {
+                        uuid:                c.uuid.toUpperCase(),
+                        source:              'SAT',
+                        origenDescarga:      'xml',
+                        isActive:            true,
+                        version:             c.version,
+                        serie:               c.serie,
+                        folio:               c.folio,
+                        fecha:               c.fecha,
+                        subTotal:            c.subTotal,
+                        total:               c.total,
+                        moneda:              c.moneda,
+                        tipoDeComprobante:   c.tipoDeComprobante,
+                        emisor:              c.emisor,
+                        receptor:            c.receptor,
+                        conceptos:           c.conceptos,
+                        impuestos:           c.impuestos,
+                        xmlContent:          c.xmlContent,
+                        xmlHash:             c.xmlHash,
+                        timbreFiscalDigital: c.timbreFiscalDigital,
+                        complementoPago:     c.complementoPago,
+                        cfdiRelacionados:    c.cfdiRelacionados ?? [],
                       },
+                      // ejercicio/periodo solo en inserción — preserva reclasificaciones previas
+                      $setOnInsert: { ejercicio, periodo, satStatus: 'Vigente' },
                     },
-                  })));
-                  const upgraded = upgResult.modifiedCount ?? 0;
-                  if (upgraded > 0) {
-                    logger.info(`[SatSyncJob] ✓ Tipo ${tipoActual}: ${upgraded} CFDIs promovidos de metadata→xml.`);
-                  }
+                    upsert: true,
+                  },
+                })));
+                await _restaurarConciliados(_conciliadosPreviosCoinc);
+                const guardados = (res.modifiedCount ?? 0) + (res.upsertedCount ?? 0);
+                if (guardados > 0) {
+                  logger.info(`[SatSyncJob] ✓ Tipo ${tipoActual}: ${guardados} copia(s) SAT con XML guardada(s) para CFDIs que ya estaban en ERP.`);
                 }
               }
             }

@@ -1771,6 +1771,27 @@ const esDevolucionOCancelacion = (m) =>
 const esBonificacionGenerica = (m) =>
   /bonificaci[oó]n/i.test(m.tipoOrigen || '') || /bonificaci[oó]n/i.test(m.concepto || '');
 
+// Categoría por el marcador del ajuste en el concepto de una NC (tipo E):
+// "BCT", "BON-314117", "IVA - DEV-058354"… Desde 2026-10-13 una NC SAT
+// completa lleva en el concepto el marcador del ERP (ver
+// `documentosRelacionadosConcepto` en cfdi-mapping.service.js) en vez de la
+// descripción del producto, y sin `tipoOrigen` propio — sin esto el export ya
+// no la reconocía como Club Tuberos/Bonificación/Devolución (casos reales 12-oct
+// Puerto O0-261000319 y Ferrocarril F0-261000208: sus Cargos Bonificación+IVA
+// desaparecían del Excel). Solo NC: las líneas de SF usado también llevan
+// "DEV-…"/"CAC-…" como origen y no son un ajuste.
+const MARCADORES_CATEGORIA_NC = {
+  BCT: 'clubTuberos',
+  BON: 'bonificacion', BEP: 'bonificacion', BXC: 'bonificacion', BN: 'bonificacion',
+  DEV: 'devolucion', DVE: 'devolucion', CAC: 'devolucion', CANCELACION: 'devolucion', ANN: 'devolucion', CES: 'devolucion',
+};
+function categoriaPorMarcadorNC(m) {
+  if (m.tipoComprobante !== 'E') return null;
+  const nucleo = String(m.concepto || '').replace(/^IVA[^-]*-\s*/i, '').trim();
+  const serie = /^([A-Z]+)(?:-\d*)?(?:\s*\(0%\))?$/i.exec(nucleo)?.[1]?.toUpperCase();
+  return (serie && MARCADORES_CATEGORIA_NC[serie]) || null;
+}
+
 // Colores fijos por categoría en el export a CONTPAQi (confirmado con el
 // usuario) — reemplazan el alternado blanco/gris por factura para que cada
 // bloque (Devolución, Descuento, Bonificación, Club Tuberos, Anticipo) se
@@ -1797,10 +1818,11 @@ const ETIQUETA_CATEGORIA = {
  * (venta de contado real), se consolida como siempre.
  */
 function categorizarAjusteContado(m) {
-  if (m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto)) return 'clubTuberos';
+  const porMarcador = categoriaPorMarcadorNC(m);
+  if (m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto) || porMarcador === 'clubTuberos') return 'clubTuberos';
   if (esVentaConDescuento(m.reglaNombre)) return 'descuento';
-  if (esDevolucionOCancelacion(m)) return 'devolucion';
-  if (esBonificacionGenerica(m)) return 'bonificacion';
+  if (esDevolucionOCancelacion(m) || porMarcador === 'devolucion') return 'devolucion';
+  if (esBonificacionGenerica(m) || porMarcador === 'bonificacion') return 'bonificacion';
   // OPA (ver `REGLAS_MEZCLADAS_CON_VENTAS`): mismo tratamiento de categoría
   // que `esReglaAnticipo` (se mezcla con Ventas normales por folio), pero con
   // `reglaNombre` propio en vez del nombre de la regla, para poder distinguir
@@ -3891,10 +3913,10 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
 // se agrega aquí como quinta categoría (confirmado con el usuario: mismas 5
 // categorías y mismo orden que en Contado).
 function categoriaDeGrupoCredito(movs) {
-  if (movs.some(m => m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto))) return 'clubTuberos';
+  if (movs.some(m => m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto) || categoriaPorMarcadorNC(m) === 'clubTuberos')) return 'clubTuberos';
   if (movs.some(m => esVentaConDescuento(m.reglaNombre))) return 'descuento';
-  if (movs.some(esDevolucionOCancelacion)) return 'devolucion';
-  if (movs.some(esBonificacionGenerica)) return 'bonificacion';
+  if (movs.some(m => esDevolucionOCancelacion(m) || categoriaPorMarcadorNC(m) === 'devolucion')) return 'devolucion';
+  if (movs.some(m => esBonificacionGenerica(m) || categoriaPorMarcadorNC(m) === 'bonificacion')) return 'bonificacion';
   if (movs.some(m => esReglaAnticipo(m.reglaNombre) || REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre))) return 'anticipo';
   return null;
 }
@@ -5711,7 +5733,7 @@ module.exports = {
   // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
-  _construirVerdadBancaria: construirVerdadBancaria, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
 };

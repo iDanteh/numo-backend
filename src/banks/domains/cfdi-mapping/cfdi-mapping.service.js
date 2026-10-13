@@ -716,7 +716,12 @@ async function cfdiToMovimientos(cfdi, rule, cuentaMapExterno = null, context = 
   // Cancelación en cualquiera de sus variantes -- o cualquier otra referencia
   // del ERP a otro documento): el concepto (columna H) muestra esa referencia
   // en vez de la descripción de producto -- ver `_referenciaDocRelacionado`.
-  const marcadorAjuste = _referenciaDocRelacionado(cfdi.documentosRelacionados, cfdi.serie);
+  // `documentosRelacionadosConcepto`: los del ERP de una NC SAT que ya venía
+  // completa (ver `_fetchNotasCreditoParaFusion`), solo para este marcador.
+  const marcadorAjuste = _referenciaDocRelacionado(
+    cfdi.documentosRelacionados?.length ? cfdi.documentosRelacionados : cfdi.documentosRelacionadosConcepto,
+    cfdi.serie,
+  );
   const concepto    = marcadorAjuste
     ?? (descRaw.trim() ? descRaw.trim().slice(0, 200) : `CFDI ${tipo} ${cfdi.uuid?.slice(0, 8)}`);
   // Ticket real único (mismo criterio que `_referenciaDocRelacionado`: un solo

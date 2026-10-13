@@ -3640,9 +3640,24 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
       .select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
+  // NC SAT ya completa (no pasa por el enriquecimiento de arriba): solo se toma
+  // del ERP su documentosRelacionados para el marcador del concepto (columna H,
+  // "Cliente / CAC-079958" en vez de "Cliente / H0-261000130") — en un campo
+  // aparte para no alterar nada más que lea documentosRelacionados (SF
+  // generado, etc.). Caso real Tehuantepec 7-oct, H0-261000130 / CAC-079958.
+  const uuidsCompletas = ncs.map(c => c.uuid).filter(u => u && !erpMetaMap[u]);
+  const docsRelErpPorUuid = {};
+  if (uuidsCompletas.length) {
+    const erpDocs = await CFDI.find({ uuid: { $in: uuidsCompletas }, source: 'ERP', 'documentosRelacionados.0': { $exists: true } })
+      .select('uuid documentosRelacionados').lean();
+    for (const d of erpDocs) docsRelErpPorUuid[d.uuid] = d.documentosRelacionados;
+  }
   const ncsEnriquecidas = ncs.map(cfdi => {
     const erp = erpMetaMap[cfdi.uuid];
-    if (!erp) return cfdi;
+    if (!erp) {
+      const docsRelErp = docsRelErpPorUuid[cfdi.uuid];
+      return docsRelErp ? { ...cfdi, documentosRelacionadosConcepto: docsRelErp } : cfdi;
+    }
     const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
     const relSAT     = cfdi.cfdiRelacionados ?? [];
     const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));

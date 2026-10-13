@@ -178,6 +178,11 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
   });
   const cuentaPorCodigo = new Map(cuentasBancoRows.map(r => [r.codigo, { id: r.id, codigo: r.codigo, nombre: r.nombre }]));
 
+  // Todos los depósitos ligados a cada uuid (no solo el elegido) — Cobranza los
+  // reparte por monto cuando una misma factura se pagó con 2+ transferencias
+  // (ver `_depositoPorMonto` en anotarCargosPorFacturaSinAgrupar).
+  const todosPorUuid = new Map();
+
   for (const m of movs) {
     const cat = (m.categoria || '').toUpperCase();
     const esTransferencia = CATEGORIAS_TRANSFERENCIA_BANCO.some(c => cat.includes(c));
@@ -239,7 +244,16 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
       // serie-folio (el folio del Pago puede coincidir con otra factura).
       const esDepositoEfectivoKore = uuidsSet.has(folioFiscalUpper) && (link.desglosePorFormaPago ?? [])
         .some(d => /DEPOSITO.*EFECTIVO/.test(String(d.formaPagoDescripcion ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()));
-      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, esDepositoEfectivoKore, _distanciaDias: distanciaDias };
+      const candidato = {
+        esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, esDepositoEfectivoKore,
+        _distanciaDias: distanciaDias,
+        _idDeposito: String(m._id ?? ''),
+        // Facturas que paga este depósito (ligas ERP) — Cobranza solo ajusta
+        // centavos contra el depósito cuando paga una sola.
+        _facturasDeposito: (m.erpLinks ?? []).length,
+      };
+      if (!todosPorUuid.has(uuidResuelto)) todosPorUuid.set(uuidResuelto, new Map());
+      todosPorUuid.get(uuidResuelto).set(candidato._idDeposito, { ...candidato });
       const actual = mapa.get(uuidResuelto);
       if (!actual) {
         mapa.set(uuidResuelto, candidato);
@@ -267,6 +281,11 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
         mapa.set(uuidResuelto, candidato);
       }
     }
+  }
+  // Copias planas (sin `_candidatos` propio) para no crear una referencia circular.
+  for (const [uuid, elegido] of mapa) {
+    const todos = [...(todosPorUuid.get(uuid)?.values() ?? [])];
+    if (todos.length > 1) elegido._candidatos = todos;
   }
   return mapa;
 }
@@ -973,6 +992,13 @@ function _elegirBancoRealMultiple(candidatos, monto) {
 // Poliza.tipo interno (A,I,E,D,N,C,P) → TipoPol de CONTPAQi (1=Ingreso 2=Egreso 3=Diario)
 const TIPO_POL_MAP = { I: '1', E: '2' };
 const tipoPolContpaq = (tipo) => TIPO_POL_MAP[tipo] ?? '3';
+
+// Póliza de Cobranza (tipo 'D' interno, concepto de `_construirConceptoCobranza`):
+// en CONTPAQi va como Ingreso (columna C = 1) y su folio es el contador propio
+// 01–99 (confirmado con el usuario 2026-10-13). Otras 'D' (Cierre IVA) siguen
+// como Diario.
+const esPolizaCobranza = (poliza) => poliza?.tipo === 'D' && /^Ingresos por Cobranza/.test(poliza.concepto || '');
+const tipoPolExport = (poliza) => (esPolizaCobranza(poliza) ? '1' : tipoPolContpaq(poliza.tipo));
 
 function userLabel(user) {
   return user?.nombre || user?.email || String(user?.dbId ?? 'sistema');
@@ -1856,7 +1882,32 @@ function categorizarAjusteContado(m) {
  * original. Los Abono (haber>0) y la reclasificación de IVA de cada factura
  * tampoco se tocan — se dejan intercalados como ya vienen.
  */
+// Diferencia máxima entre el depósito y el cobro que se trata como "centavos"
+// (redondeo del complemento) en Cobranza — más que esto es otro depósito.
+const TOLERANCIA_CENTAVOS_DEPOSITO = 0.10;
+
 function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null) {
+  // Factura pagada con 2+ depósitos (caso real HERRAMIENTAS CANANEA
+  // A0-260907729, 7-oct: $4,062.26 dep 51168 + $4,000 dep 5416): cada Cargo
+  // toma el depósito de SU monto, sin repetir — antes ambos tomaban el único
+  // depósito guardado por factura y se fusionaban en un solo banco de $8,062.26.
+  // Sin depósito de ese monto se queda el de siempre.
+  const depositosUsados = new Set();
+  const _depositoPorMonto = (base, llave, monto) => {
+    if (!base?._candidatos) return base;
+    const libres = base._candidatos.filter(c => c.montoBancoReal != null && !depositosUsados.has(`${llave}|${c._idDeposito}`));
+    const elegido = libres.find(c => Math.abs(c.montoBancoReal - monto) < 0.005)
+      ?? libres
+        .filter(c => Math.abs(c.montoBancoReal - monto) <= TOLERANCIA_CENTAVOS_DEPOSITO)
+        .sort((a, b) => Math.abs(a.montoBancoReal - monto) - Math.abs(b.montoBancoReal - monto))[0];
+    if (!elegido) return base;
+    depositosUsados.add(`${llave}|${elegido._idDeposito}`);
+    return elegido;
+  };
+  // Cargo bancario llevado al monto exacto del depósito (centavos) → su Abono a
+  // Clientes se ajusta igual para que la factura cuadre (ver abajo).
+  const ajustesCentavos = [];
+
   const anotados = movs.map(m => {
     if (!(Number(m.debe) > 0)) return m;
     // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
@@ -1877,7 +1928,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // Mismo criterio que al construir `verdadBancaria` arriba: `facturaUuid`
     // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
     // Pago) — ver comentario en el caller.
-    const bancario = verdadBancaria?.get((m.facturaUuid || m.cfdiUuid || '').toUpperCase());
+    const llaveBancaria = (m.facturaUuid || m.cfdiUuid || '').toUpperCase();
+    const bancarioBase = verdadBancaria?.get(llaveBancaria);
+    const esCargoCajaBanco = /^110[12]/.test(m.cuenta?.codigo || '') && m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO;
+    const bancario = esCargoCajaBanco ? _depositoPorMonto(bancarioBase, llaveBancaria, Number(m.debe)) : bancarioBase;
     // Cheque con depósito real ligado en Bancos ("Depósito S.B.C.", "DEP
     // CHEQUE BNM") va igual que una transferencia: banco real, folio de Numo
     // en columna C, subcódigo 20 (2026-10-06, pólizas manuales: 29-sep
@@ -1961,6 +2015,18 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
     // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
     const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
+    // Depósito que paga solo esta factura y difiere por centavos del
+    // complemento: el banco va por el monto exacto del depósito (2026-10-13,
+    // caso real JAVIER DIAZ RODRIGUEZ dep 051726: complemento $1,602.92,
+    // banco $1,602.93 — "pon el monto tal cual esté en el depósito").
+    let debeCargo = Number(m.debe);
+    if (esTransferenciaVerificada && bancario?.montoBancoReal != null && bancario._facturasDeposito === 1) {
+      const diferencia = Math.round((bancario.montoBancoReal - debeCargo) * 100) / 100;
+      if (diferencia !== 0 && Math.abs(diferencia) <= TOLERANCIA_CENTAVOS_DEPOSITO) {
+        ajustesCentavos.push({ facturaUuid: m.facturaUuid ?? null, cfdiUuid: m.cfdiUuid ?? null, antes: debeCargo, despues: bancario.montoBancoReal });
+        debeCargo = bancario.montoBancoReal;
+      }
+    }
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
@@ -1981,7 +2047,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
       centroCosto:    m.centroCosto,
       centroCostoObj: m.centroCostoObj,
-      debe:           Number(m.debe),
+      debe:           debeCargo,
       haber:          Number(m.haber),
       cfdiUuid:       m.cfdiUuid,
       rfcTercero:     m.rfcTercero,
@@ -1992,6 +2058,18 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       _referenciaBancoReal: referenciaBancoReal,
     };
   });
+
+  // Abono a Clientes de la misma factura/Pago por el mismo monto que tenía su
+  // Cargo → al monto del depósito, para que la factura siga cuadrando.
+  for (const aj of ajustesCentavos) {
+    const i = anotados.findIndex(x => /^1103/.test(x.cuenta?.codigo || '')
+      && (x.facturaUuid ?? null) === aj.facturaUuid && (x.cfdiUuid ?? null) === aj.cfdiUuid
+      && Math.abs(Number(x.haber) - aj.antes) < 0.005);
+    if (i === -1) continue;
+    const x = anotados[i];
+    const plano = x.get ? x.get({ plain: true }) : x;
+    anotados[i] = { ...plano, haber: aj.despues };
+  }
 
   // Separa el Cargo bancario (dinero recibido — Cargo real, ni SF ni Abono/
   // IVA) del resto: en la póliza de Cobranza el Cargo va TODO junto al final,
@@ -4458,7 +4536,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     const headerRow = sheet.addRow([
       'P',
       fechaFinal,
-      tipoPolContpaq(poliza.tipo),
+      tipoPolExport(poliza),
       bloque.folio,
       '1',
       '0',
@@ -5487,6 +5565,12 @@ async function siguienteFolioContpaq(id) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
 
+  // Cobranza: su folio ya es el contador propio 01–99 que asignó la
+  // generación (RANGO_FOLIO_COBRANZA) — no el rango por sucursal de Ingreso.
+  if (esPolizaCobranza(poliza)) {
+    return { folioContado: poliza.numero ?? null, folioCredito: null };
+  }
+
   const movimiento = await PolizaMovimiento.findOne({
     where:      { polizaId: id },
     attributes: ['id', 'centroCostoId'],
@@ -5564,7 +5648,7 @@ module.exports = {
   // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
-  _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _construirVerdadBancaria: construirVerdadBancaria, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
 };

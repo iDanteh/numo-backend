@@ -5080,7 +5080,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
           const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
           const refOpaD      = `OPA-${d.folio}`;
-          const serieCierreD = serieEgresoAnticipoProp ?? refOpaD;
+          const serieCierreD = serieEgresoAnticipoProp ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaD;
           if (subtotalD > 0) {
             movimientosResult.push({
               ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
@@ -5102,7 +5102,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // cuando existe (trazable al documento SAT); columna H (concepto) =
         // siempre la referencia "OPA-..." (confirmado con el usuario
         // 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
-        const serieCierreProp = serieEgresoAnticipoProp ?? refOpaProp;
+        // Sin Egreso: la serie-folio de la factura que aplica el anticipo, no
+        // la OPA (2026-10-13, confirmado con el usuario, caso real Ferrocarril
+        // 12-oct JUAN CARLOS DEL VILLAR LLANDERAL: columna C "OPA-01142" →
+        // "F0-261000199"; la OPA sigue en la columna H).
+        const serieCierreProp = serieEgresoAnticipoProp ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaProp;
         if (subtotalAnticipoProp > 0) {
           movimientosResult.push({
             ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
@@ -6861,7 +6865,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
           const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
           const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
           const refOpaD      = `OPA-${d.folio}`;
-          const serieCierreD = serieEgresoAnticipoGuard ?? refOpaD;
+          const serieCierreD = serieEgresoAnticipoGuard ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaD;
           if (subtotalD > 0) {
             todosLosMovimientos.push({
               ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
@@ -6885,7 +6889,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         // Columna C (serie) = folio del Egreso real cuando existe; columna H
         // (concepto) = siempre "OPA-..." — ver comentario equivalente en
         // generarPropuesta.
-        const serieCierreGuard = serieEgresoAnticipoGuard ?? refOpaGuard;
+        const serieCierreGuard = serieEgresoAnticipoGuard ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaGuard;
         if (subtotalAnticipoGuard > 0) {
           todosLosMovimientos.push({
             ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,

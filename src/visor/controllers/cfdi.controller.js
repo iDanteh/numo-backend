@@ -648,8 +648,10 @@ const importExcel = asyncHandler(async (req, res) => {
       // Para tipo P el UUIDRel viene del DoctoRelacionado del complemento (facturas cobradas),
       // no del CfdiRelacionados del header. Solo hay tipoRelacion en el header cuando el CFDI P
       // sustituye a otro pago cancelado (04) — en ese caso el SAT lo reporta explícitamente.
-      const tipoRelacion    = getCell(row, 'TipoRelacion', 'Tipo Relacion', 'Tipo Relación')
-        ?? (tipo === 'P' ? null : '04');
+      // Sin columna TipoRelacion se deja null (desconocido): antes se suponía '04'
+      // (sustitución) y una NC de devolución (03) quedaba como sustitución
+      // (2026-10-13, E587E3C2 H0-261000130; 1,255 Egresos con 04 falso).
+      const tipoRelacion    = getCell(row, 'TipoRelacion', 'Tipo Relacion', 'Tipo Relación') ?? null;
 
       // Acumular para tasaIvaInferida (tipo P puede tener N filas, una por factura relacionada)
       if (tipo === 'P' && uuidRelacion) {
@@ -716,9 +718,36 @@ const importExcel = asyncHandler(async (req, res) => {
         }),
         ...(uuidRelacion && {
           // extraerCodigo: "03 - Devolución de mercancía..." → "03"
-          cfdiRelacionados: [{ tipoRelacion: extraerCodigo(tipoRelacion) ?? '04', uuids: [uuidRelacion] }],
+          cfdiRelacionados: [{ tipoRelacion: extraerCodigo(tipoRelacion) ?? null, uuids: [uuidRelacion] }],
         }),
       };
+
+      // Copia que ya tiene su XML real (descarga SAT o XML subido): el reporte
+      // Excel NO la pisa — sus conceptos (sin impuestos), impuestos, relación,
+      // fecha (sin hora) y timbre son un resumen pobre del XML. Solo se toman
+      // el estatus SAT y los datos que el XML no trae (2026-10-13: miles de
+      // copias XML quedaron con conceptos sin impuestos y relación 04 falsa).
+      const soloExcel = Object.fromEntries(Object.entries({
+        satStatus, numCtaPago, estadoPago, fechaPago, complementoTipo,
+      }).filter(([, v]) => v !== undefined && v !== null));
+      const prevConXml = await CFDI.findOneAndUpdate(
+        { uuid: cfdiData.uuid, source, xmlContent: { $exists: true, $nin: [null, ''] } },
+        { $set: { ...soloExcel, uploadedBy: req.user._id } },
+        { new: false, projection: { lastComparisonStatus: 1 } },
+      );
+      if (prevConXml) {
+        actualizados++;
+        duplicados.push({ uuid: cfdiData.uuid, filename: `Fila ${row.number}` });
+        success.push({
+          uuid: cfdiData.uuid,
+          filename: `Fila ${row.number}`,
+          nuevo: false,
+          satStatus: soloExcel.satStatus ?? null,
+          lastComparisonStatus: prevConXml.lastComparisonStatus ?? null,
+        });
+        verificarSATBackground(cfdiData);
+        continue;
+      }
 
       // ejercicio/periodo solo en $setOnInsert para preservar reclasificaciones previas
       const { ejercicio: _ej, periodo: _pe, ...cfdiSetData } = cfdiData;

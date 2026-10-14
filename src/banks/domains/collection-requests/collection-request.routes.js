@@ -60,8 +60,13 @@ const uploadComprobante = multer({
 });
 
 // POST /api/collection-requests/analyze
+// Fix de seguridad (CVE-2024-4367, pdfjs-dist): antes solo exigía sesión iniciada, sin
+// ningún permiso de bancos — el único caller real de este endpoint es OcrModalComponent,
+// montado exclusivamente dentro de Bancos (banks.component.html), mismo universo de
+// usuarios que ya necesita banks:read para ver esa pantalla.
 router.post('/analyze',
   authenticate,
+  permit(PERMISSIONS.BANKS_READ),
   upload.single('comprobante'),
   asyncHandler(async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Se requiere una imagen en el campo "comprobante"' });

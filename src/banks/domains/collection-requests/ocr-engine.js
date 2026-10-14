@@ -1436,7 +1436,8 @@ async function renderPdfToImages(pdfBuffer, maxPages = 2) {
     require.resolve('pdfjs-dist/legacy/build/pdf.worker.js');
 
   const data = new Uint8Array(pdfBuffer);
-  const pdf  = await pdfjsLib.getDocument({ data, verbosity: 0 }).promise;
+  // isEvalSupported:false (defensa en profundidad, CVE-2024-4367): desactiva el intérprete JS de fuentes de pdfjs.
+  const pdf  = await pdfjsLib.getDocument({ data, verbosity: 0, isEvalSupported: false }).promise;
   const pagesToRender = Math.min(pdf.numPages, maxPages);
 
   const images = [];

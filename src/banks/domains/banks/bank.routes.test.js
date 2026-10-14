@@ -58,6 +58,16 @@ jest.mock('./bank-indicadores.service', () => ({
   buildReporteIdentificacion: jest.fn(),
   listUsuariosConIdentificaciones: jest.fn(),
 }));
+// GET /auxiliar/movimientos y /auxiliar/clientes (2026-10-14, fix de permiso + filtros de
+// ocultamiento): bank.routes.js importa estas funciones por DESTRUCTURING, así que hace falta
+// jest.mock del módulo entero (parchear el objeto exportado después de requerirlo no alcanza,
+// bank.routes.js ya tiene su propia copia de la referencia).
+jest.mock('./bank-auxiliary.parser', () => ({
+  parseAuxiliaryFile: jest.fn(),
+  applyAuxiliaryMatching: jest.fn(),
+  resumenAuxiliarClientes: jest.fn(),
+  listMovimientosAuxiliar: jest.fn(),
+}));
 
 const express = require('express');
 const request = require('supertest');
@@ -66,6 +76,7 @@ const service = require('./bank.service');
 const CFDI    = require('../../../visor/models/CFDI');
 const rbacStore = require('../../../shared/services/rbac-store');
 const indicadoresService = require('./bank-indicadores.service');
+const auxiliaryParser = require('./bank-auxiliary.parser');
 const { User: PgUser } = require('../../../shared/models/postgres');
 const { PERMISSIONS, MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
 
@@ -931,5 +942,145 @@ describe('GET /movements/:id/ficha/imagen', () => {
     expect(res.headers['content-type']).toBe('image/png');
     expect(service.obtenerImagenFicha).toHaveBeenCalledWith('mov-1');
     expect(res.body).toEqual(Buffer.from('contenido'));
+  });
+});
+
+// Fix de seguridad 2026-10-14 (auditoría real): estas 4 rutas solo pedían `authenticate`,
+// sin ningún `permit()` — cualquier usuario logueado (cualquier rol) podía pegarles directo.
+describe('GET /summary — gate de permiso', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service.getSummary = jest.fn().mockResolvedValue({});
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/summary')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(service.getSummary).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read, delega en el service', async () => {
+    const res = await request(app)
+      .get('/summary')
+      .query({ fechaInicio: '2026-10-01', fechaFin: '2026-10-31' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(service.getSummary).toHaveBeenCalledWith('2026-10-01', '2026-10-31');
+  });
+});
+
+describe('GET /config/:banco — gate de permiso', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service.getConfig = jest.fn().mockResolvedValue({});
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/config/BBVA')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(service.getConfig).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read, delega en el service', async () => {
+    const res = await request(app)
+      .get('/config/BBVA')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(service.getConfig).toHaveBeenCalledWith('BBVA');
+  });
+});
+
+describe('GET /auxiliar/clientes — gate de permiso', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    auxiliaryParser.resumenAuxiliarClientes.mockResolvedValue({});
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/auxiliar/clientes')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(auxiliaryParser.resumenAuxiliarClientes).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read, delega en el service', async () => {
+    const res = await request(app)
+      .get('/auxiliar/clientes')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(auxiliaryParser.resumenAuxiliarClientes).toHaveBeenCalled();
+  });
+});
+
+// GET /auxiliar/movimientos: además del gate de permiso, rolActual se calcula SIEMPRE del
+// lado del servidor (hasOcultoRolesBypass) — mismo criterio que /movements — nunca se confía
+// en un valor que mande el cliente.
+describe('GET /auxiliar/movimientos', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin bypass por defecto
+    auxiliaryParser.listMovimientosAuxiliar.mockResolvedValue({ data: [], pagination: { total: 0, page: 1, limit: 50, pages: 0 } });
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/auxiliar/movimientos')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(auxiliaryParser.listMovimientosAuxiliar).not.toHaveBeenCalled();
+  });
+
+  test('sin bypass de ocultar-roles: rolActual viaja con el rol del usuario', async () => {
+    await request(app)
+      .get('/auxiliar/movimientos')
+      .set('x-test-role', 'contabilidad')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = auxiliaryParser.listMovimientosAuxiliar.mock.calls[0][0];
+    expect(args.rolActual).toBe('contabilidad');
+  });
+
+  test('con banks:ocultar-roles:bypass: rolActual viaja null (ignora cualquier rolActual que mande el cliente)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_OCULTAR_ROLES_BYPASS);
+
+    await request(app)
+      .get('/auxiliar/movimientos')
+      .query({ rolActual: 'tienda' }) // intento de bypass desde el cliente — se ignora
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    const args = auxiliaryParser.listMovimientosAuxiliar.mock.calls[0][0];
+    expect(args.rolActual).toBeNull();
   });
 });

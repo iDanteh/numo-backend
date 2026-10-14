@@ -7772,9 +7772,22 @@ async function _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fecha
   //    — acotado al rango de días, no a todo el histórico. Esto también
   //    reclasifica hacia este día CFDIs cuyo fecha SAT ingenuo cayó en OTRO
   //    día pero cuya fecha ERP real sí es este.
-  const erpEnRango = await CFDI.find({ ...filtroComun, source: 'ERP', fecha: { $gte: mxInicio, $lte: mxFin } })
-    .select('uuid').lean();
-  const resultado = new Set(erpEnRango.map(c => c.uuid.toUpperCase()));
+  //    Excepción: fecha ERP justo a medianoche (T00:00:00.000Z) = factura con
+  //    fecha de día sin hora (Kore FechaGeneracion "…T06:00:00Z", ya pasada a
+  //    hora local por `parseFechaFacturaERP`) — va a SU día, no al anterior
+  //    (2026-10-14, caso real Puerto: O0-261000076 con fecha 12-oct 00:00,
+  //    timbrada el 13, quedaba en el 11-oct y no salía en ninguna póliza;
+  //    9 facturas así el 12-oct). Una hora UTC real nunca cae exacta en
+  //    00:00:00.000, así que el resto (copias viejas aún en UTC real) no cambia.
+  const medianochesDelRango = _diasDelRango({ fechaInicio, fechaFin }).map(d => new Date(`${d}T00:00:00.000Z`));
+  const erpEnRango = await CFDI.find({
+    ...filtroComun, source: 'ERP',
+    $or: [{ fecha: { $gte: mxInicio, $lte: mxFin } }, { fecha: { $in: medianochesDelRango } }],
+  }).select('uuid fecha').lean();
+  const esMedianocheExacta = f => f instanceof Date && f.getTime() % 86400000 === 0;
+  const resultado = new Set(erpEnRango
+    .filter(c => !esMedianocheExacta(c.fecha) || (c.fecha >= naiveInicio && c.fecha <= naiveFin))
+    .map(c => c.uuid.toUpperCase()));
 
   // 4. SAT sin homólogo ERP → fallback a su propio fecha (ya está en rango,
   //    viene del paso 1). Los que SÍ tienen homólogo se descartan aquí: su

@@ -3774,7 +3774,7 @@ function bloquesAjustesContado(movs) {
 // (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
-function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null } = {}) {
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null, ticketsPorFactura = null } = {}) {
   // REVERTIDO 2026-08-20: se intentó sumar Cancelación/Devolución en Efectivo
   // al consolidado, pero al cruzar contra el "Reporte de Movimientos en
   // Cajas" real (Hidalgo/B0 11-ago) se confirmó que NO hay ningún movimiento
@@ -3821,6 +3821,7 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   const ventasYClubTuberos = enriquecerConceptoConCliente(
     [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
     nombresClientes,
+    ticketsPorFactura,
   );
   const anticiposEnriquecidos = enriquecerConceptoConCliente(bloquesAnticipos.flat(), nombresClientes);
 
@@ -3957,7 +3958,7 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
  * `esConceptoMarcadorAjuste` y se preserva en vez de usar la serie-folio de
  * la factura, para que la columna H siga mostrando el marcador del ajuste.
  */
-function enriquecerConceptoConCliente(movs, nombresClientes) {
+function enriquecerConceptoConCliente(movs, nombresClientes, ticketsPorFactura = null) {
   return movs.map(m => {
     // `m` es una instancia de Sequelize — sus campos reales viven detrás de
     // getters, no como propiedades propias. Un spread directo ({...m}) los
@@ -3965,10 +3966,56 @@ function enriquecerConceptoConCliente(movs, nombresClientes) {
     // escribir la celda, lo que corrompe el .xlsx). Hay que aplanar primero.
     const plano  = m.get ? m.get({ plain: true }) : m;
     const nombre = nombresClientes.get((plano.cfdiUuid || '').toUpperCase()) || '';
-    const refSerieOMarcador = esConceptoMarcadorAjuste(plano.concepto) ? plano.concepto : plano.serie;
-    const partes = [nombre, refSerieOMarcador].filter(Boolean);
+    const esMarcador = esConceptoMarcadorAjuste(plano.concepto);
+    const tickets = ticketsPorFactura && !esMarcador ? _ticketsDeVentaIngreso(plano, ticketsPorFactura) : [];
+    const refSerieOMarcador = esMarcador ? plano.concepto : plano.serie;
+    const partes = [nombre, ...(tickets.length ? tickets : [refSerieOMarcador])].filter(Boolean);
     return { ...plano, concepto: partes.join(' / ') };
   });
+}
+
+// Más tickets que esto (factura que junta muchas ventas sin desglose por
+// renglón) deja la factura en la columna H en vez de una lista enorme.
+const MAX_TICKETS_CONCEPTO_INGRESO = 3;
+
+/**
+ * Ingreso, columna H de un renglón de VENTA: "cliente / venta" en vez de
+ * "cliente / factura" (2026-10-14, pedido del usuario, caso real Puerto
+ * 12-oct póliza 1242: factura O0-261000076 de la venta O0-261000087 del
+ * 3-oct). La columna C sigue con la factura. Ticket del renglón
+ * (`serieVentaTicket`/`folioVentaTicket`) o, si no lo trae, los de
+ * `documentosRelacionados` de la factura en el ERP. Ajustes (`_categoria`),
+ * anticipos/OPA, saldos a favor y Egresos se quedan como estaban.
+ */
+function _ticketsDeVentaIngreso(plano, ticketsPorFactura) {
+  if (plano._categoria || plano.tipoComprobante === 'E' || plano.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL) return [];
+  if (esReglaAnticipo(plano.reglaNombre) || REGLAS_MEZCLADAS_CON_VENTAS.has(plano.reglaNombre)) return [];
+  if (plano.serieVentaTicket && plano.folioVentaTicket) return [`${plano.serieVentaTicket}-${plano.folioVentaTicket}`];
+  const tickets = ticketsPorFactura.get((plano.cfdiUuid || '').toUpperCase()) ?? [];
+  return tickets.length <= MAX_TICKETS_CONCEPTO_INGRESO ? tickets : [];
+}
+
+/**
+ * Ventas (tickets) de cada factura según su copia del ERP
+ * (`documentosRelacionados`, serie de almacén A0/B0/G1… — nunca las marcas de
+ * ajuste BON/DEV/CANCELACION…), mismo criterio que Cobranza
+ * (`_prefetchDoctosPago`). uuid (mayúsculas) → ['O0-261000087', …].
+ */
+async function construirTicketsPorFactura(cfdiUuids) {
+  const mapa = new Map();
+  const uuidsUnicos = [...new Set(cfdiUuids.filter(Boolean).map(u => u.toUpperCase()))];
+  if (uuidsUnicos.length === 0) return mapa;
+  const facturas = await CFDI.find(
+    { uuid: { $in: uuidsUnicos.flatMap(u => [u, u.toLowerCase()]) }, source: 'ERP' },
+    { uuid: 1, documentosRelacionados: 1 },
+  ).lean();
+  for (const f of facturas) {
+    const tickets = (f.documentosRelacionados ?? [])
+      .filter(r => /^[A-Z]\d$/.test(String(r.Serie ?? '').toUpperCase()) && r.Folio)
+      .map(r => `${String(r.Serie).toUpperCase()}-${r.Folio}`);
+    if (tickets.length) mapa.set(String(f.uuid).toUpperCase(), [...new Set(tickets)]);
+  }
+  return mapa;
 }
 
 /**
@@ -4098,6 +4145,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // línea) y también para la hoja de desglose de los consolidados de Contado
   // (ahí cada CFDI se resume en un total, pero el desglose sí lista cada uno).
   const nombresClientes = await construirNombresClientes(movimientos.map(m => m.cfdiUuid));
+  // Ingreso: columna H de las ventas con el ticket, no la factura (ver `_ticketsDeVentaIngreso`).
+  const ticketsPorFactura = poliza.tipo === 'I' ? await construirTicketsPorFactura(movimientos.map(m => m.cfdiUuid)) : null;
 
   // Las pólizas de Ingresos con movimientos de Contado y de Crédito mezclados se
   // exportan como DOS pólizas de CONTPAQi (folios consecutivos) dentro del mismo
@@ -4126,7 +4175,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // mismo principio que ya usa el resto de sucursales cuando falta
       // Contado o Crédito (folios consecutivos, sin huecos).
       const cSplit = contado.length > 0
-        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal, netpayInfo, ticketsPorFactura })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
@@ -4147,7 +4196,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // `moverAjustesAlFinal` (Crédito) no lo hace — mismo patrón que el
       // camino legado (línea de abajo: `enriquecerConceptoConCliente(moverAjustesAlFinal(credito), ...)`).
       push('Contado',                              cSplit.ventas,                                                         overrides.folioContado);
-      push('Credito',                              enriquecerConceptoConCliente(rSplit.ventas, nombresClientes),          overrides.folioCredito);
+      push('Credito',                              enriquecerConceptoConCliente(rSplit.ventas, nombresClientes, ticketsPorFactura), overrides.folioCredito);
       push('Bonificaciones de Contado',             cSplit.bonificaciones);
       push('Bonificaciones de Crédito',             enriquecerConceptoConCliente(rSplit.bonificaciones, nombresClientes));
       push('Descuentos y Devoluciones de Contado',  cSplit.descuentosDevoluciones);
@@ -4165,13 +4214,13 @@ async function exportContpaqXlsx(id, overrides = {}) {
           // factura) — refleja el depósito real de caja/banco del periodo.
           {
             tipoVenta: 'Contado',
-            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo }),
+            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo, ticketsPorFactura }),
             folio:     overrides.folioContado   ?? poliza.numero,
             concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
           {
             tipoVenta: 'Credito',
-            movs:      enriquecerConceptoConCliente(moverAjustesAlFinal(credito), nombresClientes),
+            movs:      enriquecerConceptoConCliente(moverAjustesAlFinal(credito), nombresClientes, ticketsPorFactura),
             folio:     overrides.folioCredito   ?? (poliza.numero + 1),
             concepto:  overrides.conceptoCredito ?? _conceptoConTipoVenta('Credito', `${poliza.concepto} - Ventas de Crédito`),
           },
@@ -4182,8 +4231,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
       : [{
           tipoVenta: null,
           movs:      contado.length > 0
-            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
-            : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
+            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo, ticketsPorFactura })
+            : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes, ticketsPorFactura),
           folio:     overrides.folioContado   ?? poliza.numero,
           concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),
         }];
@@ -5643,6 +5692,6 @@ module.exports = {
   // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
-  _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
 };

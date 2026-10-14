@@ -163,6 +163,9 @@ const getSession = asyncHandler(async (req, res) => {
   const session = await ComparisonSession.findById(req.params.id)
     .lean();
   if (!session) return res.status(404).json({ error: 'Sesión no encontrada' });
+  // Usuario con empresas asignadas: solo el estado de la sesión, sin el detalle
+  // de comparaciones (mezcla todas las empresas).
+  if (req.empresasPermitidas) return res.json({ session, comparisons: paginate([], 0, pg, lm) });
 
   const [comparisons, total] = await Promise.all([
     Comparison.find({ sessionId: req.params.id }, { satRawResponse: 0 })

@@ -19,6 +19,8 @@ const list = asyncHandler(async (req, res) => {
   if (severity)  filter.severity  = severity;
   if (status)    filter.status    = status;
   if (rfcEmisor) filter.rfcEmisor = rfcEmisor.toUpperCase();
+  // Usuario con empresas asignadas: solo discrepancias de ellas.
+  if (req.empresasPermitidas && !req.empresasPermitidas.includes(filter.rfcEmisor)) filter.rfcEmisor = { $in: req.empresasPermitidas };
   if (ejercicio)          filter.ejercicio          = parseInt(ejercicio);
   if (periodo)            filter.periodo            = parseInt(periodo);
   // Uno solo ('I') o varios separados por coma ('I,E,P' — tabla "Tipos de

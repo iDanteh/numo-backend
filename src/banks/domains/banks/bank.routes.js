@@ -344,7 +344,7 @@ router.get('/movements', authenticate, asyncHandler(async (req, res) => {
 }));
 
 // GET /api/banks/summary
-router.get('/summary', authenticate, asyncHandler(async (req, res) => {
+router.get('/summary', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { fechaInicio, fechaFin } = req.query;
   res.json(await service.getSummary(fechaInicio, fechaFin));
 }));
@@ -673,23 +673,31 @@ router.post('/auxiliar/aplicar',
 // GET /api/banks/auxiliar/clientes  — resumen agrupado por cliente
 router.get('/auxiliar/clientes',
   authenticate,
+  permit(PERMISSIONS.BANKS_READ),
   asyncHandler(async (req, res) => {
     const result = await resumenAuxiliarClientes(req.query);
     res.json(result);
   }),
 );
 
-// GET /api/banks/auxiliar/movimientos  — lista paginada de movimientos identificados
+// GET /api/banks/auxiliar/movimientos  — lista paginada de movimientos identificados.
+// Vista de conciliación contable: cruza TODOS los usuarios a propósito (mismo criterio
+// que /stats, ver comentario más abajo) — no se restringe por "solo lo mío", pero sí se
+// le aplican los mismos filtros de ocultamiento que /movements (oculto + ocultoRoles),
+// calculados siempre del lado del servidor para que el cliente no pueda saltárselos.
 router.get('/auxiliar/movimientos',
   authenticate,
+  permit(PERMISSIONS.BANKS_READ),
   asyncHandler(async (req, res) => {
-    const result = await listMovimientosAuxiliar(req.query);
+    const hasAdminAccess = await hasOcultoRolesBypass(req.user);
+    const rolActual = hasAdminAccess ? null : req.user.role;
+    const result = await listMovimientosAuxiliar({ ...req.query, rolActual });
     res.json(result);
   }),
 );
 
 // GET /api/banks/config/:banco
-router.get('/config/:banco', authenticate, asyncHandler(async (req, res) => {
+router.get('/config/:banco', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   res.json(await service.getConfig(req.params.banco));
 }));
 

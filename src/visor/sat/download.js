@@ -235,7 +235,13 @@ const solicitar = async (params) => {
       RfcSolicitante: rfcFirmaUsado,
       TipoSolicitud:  tipoSolicitud,
     };
-    if (tipoDeComprobante)  solicitudAttrs.TipoDeComprobante = tipoDeComprobante;
+    // El atributo del servicio es `TipoComprobante` (2026-10-14). Con el nombre
+    // anterior (`TipoDeComprobante`) el SAT lo ignoraba sin error: Ingresos,
+    // Egresos y Pagos bajaban el día completo (9→11 oct: 1,848 CFDIs cada uno)
+    // y, al ser la misma solicitud, la tercera agotaba el límite de por vida
+    // (5002) — por eso Pagos salía rechazada casi a diario. Probado en prod:
+    // Pagos 5-oct con `TipoComprobante="P"` → 54 XML, todos tipo P.
+    if (tipoDeComprobante)  solicitudAttrs.TipoComprobante = tipoDeComprobante;
     if (esRecibidosReq)     solicitudAttrs.EstadoComprobante = 'Vigente';
     if (folioFiscalUUID)    solicitudAttrs.FolioFiscalUUID   = folioFiscalUUID.toUpperCase();
 
@@ -247,7 +253,7 @@ const solicitar = async (params) => {
     const pwdCopy = Buffer.from(creds.passwordBuffer);
     const firma   = await crearFirmaSolicitud(cerCopy, keyCopy, pwdCopy, canonical);
 
-    const tipoAttr   = tipoDeComprobante ? ` TipoDeComprobante="${tipoDeComprobante}"` : '';
+    const tipoAttr   = tipoDeComprobante ? ` TipoComprobante="${tipoDeComprobante}"` : '';
     const estadoAttr = esRecibidosReq ? ' EstadoComprobante="Vigente"' : '';
     const uuidAttr   = folioFiscalUUID ? ` FolioFiscalUUID="${folioFiscalUUID.toUpperCase()}"` : '';
 

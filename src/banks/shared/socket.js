@@ -20,6 +20,15 @@ function _authenticateSocket(socket, next) {
   const req = {
     headers: { authorization: token ? `Bearer ${token}` : '' },
     get(name) { return this.headers[String(name).toLowerCase()] || ''; },
+    // express-oauth2-jwt-bearer llama req.is('urlencoded') para decidir si busca
+    // el token también en el body (fallback de RFC 6750) — el handshake de
+    // Socket.IO nunca manda un body url-encoded, así que `false` es la respuesta
+    // correcta, no solo un stub para evitar el crash (bug real 2026-10-14,
+    // reproducido en consola local: "TypeError: req.is is not a function").
+    is() { return false; },
+    // También valida req.method ("Invalid HTTP method received in request" si
+    // falta) — el handshake de Socket.IO es, en los hechos, un GET.
+    method: 'GET',
   };
   const res = {
     statusCode: 200,

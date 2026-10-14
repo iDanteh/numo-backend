@@ -667,8 +667,11 @@ const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = 
 
   logger.info(`[SatSyncJob] Procesando ${entidades.length} entidad(es)...`);
 
-  // Tipos del diario: Ingresos, Egresos, Pagos y Nómina
-  const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos' /*, 'Nomina' */];
+  // Tipos del diario: Ingresos, Egresos, Pagos y Nómina. Nómina se vuelve a
+  // pedir aparte (2026-10-14, pedido del usuario): mientras el SAT ignoraba el
+  // filtro por tipo llegaba junto con Ingresos; ya con `TipoComprobante` solo
+  // baja si se pide.
+  const TIPOS_DIARIO = ['Ingresos', 'Egresos', 'Pagos', 'Nomina'];
 
   for (const entidad of entidades) {
     const rfc = entidad.rfc;

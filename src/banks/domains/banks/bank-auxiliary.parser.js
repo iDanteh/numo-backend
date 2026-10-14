@@ -149,13 +149,30 @@ async function resumenAuxiliarClientes(filters = {}) {
  * Lista movimientos identificados por auxiliar, con paginación.
  * @param {object} filters - { auxNombre?, banco?, fechaInicio?, fechaFin?, tipo?, page?, limit? }
  */
+// Tope duro del `limit` que puede pedir el cliente — sin esto, limit=100000 se llevaba
+// todos los movimientos identificados de una sola vez (hallazgo real de auditoría,
+// 2026-10-14). 200 es generoso para cualquier uso de paginación real.
+const MAX_LIMIT_AUXILIAR = 200;
+
 async function listMovimientosAuxiliar(filters = {}) {
   const {
     auxNombre, banco, fechaInicio, fechaFin,
     tipo, page = 1, limit = 50,
+    // Calculado SIEMPRE del lado del servidor (ver bank.routes.js, hasOcultoRolesBypass) —
+    // null = sin restricción (banks:admin o banks:ocultar-roles:bypass), nunca se confía
+    // en un valor que mande el cliente.
+    rolActual,
   } = filters;
 
-  const match = { isActive: true, auxNombre: { $ne: null } };
+  const limitCapped = Math.min(parseInt(limit) || 50, MAX_LIMIT_AUXILIAR);
+
+  // Vista de conciliación contable (auxiliar): cruza TODOS los usuarios a propósito, mismo
+  // criterio que /stats (bank.routes.js) — "no es una vista personal, es del equipo". Por
+  // eso NO se filtra por identificadoPorUsuario/"solo lo mío". Sí se aplican los mismos 2
+  // filtros de ocultamiento que ya usa /movements sobre esta misma colección BankMovement
+  // (hallazgo real de auditoría, 2026-10-14: antes no se aplicaba ninguno de los dos).
+  const match = { isActive: true, auxNombre: { $ne: null }, oculto: { $ne: true } };
+  if (rolActual) match.ocultoRoles = { $ne: rolActual };
   if (auxNombre) match.auxNombre = auxNombre;
   if (banco)     match.banco     = banco;
   if (tipo === 'deposito') match.deposito = { $gt: 0 };
@@ -166,12 +183,12 @@ async function listMovimientosAuxiliar(filters = {}) {
     if (fechaFin)    match.fecha.$lte = new Date(`${fechaFin}T23:59:59.999Z`);
   }
 
-  const skip = (parseInt(page) - 1) * parseInt(limit);
+  const skip = (parseInt(page) - 1) * limitCapped;
   const [data, total] = await Promise.all([
     BankMovement.find(match)
       .sort({ fecha: -1, _id: 1 })
       .skip(skip)
-      .limit(parseInt(limit))
+      .limit(limitCapped)
       .lean(),
     BankMovement.countDocuments(match),
   ]);
@@ -181,8 +198,8 @@ async function listMovimientosAuxiliar(filters = {}) {
     pagination: {
       total,
       page:  parseInt(page),
-      limit: parseInt(limit),
-      pages: Math.ceil(total / parseInt(limit)),
+      limit: limitCapped,
+      pages: Math.ceil(total / limitCapped),
     },
   };
 }

@@ -63,27 +63,67 @@ const verificarSATBackground = (cfdiData) => {
 
 // ── Helpers internos ──────────────────────────────────────────────────────────
 
+// Límites de un ZIP de XMLs (2026-10-14): antes se descomprimía todo de golpe
+// en memoria y un ZIP armado a propósito ("bomba ZIP": pocos MB que se abren
+// en decenas de GB) tumbaba el proceso. Ahora se revisa el tamaño declarado
+// antes de abrir y se descomprime un XML a la vez. adm-zip no deja que un XML
+// salga más grande de lo que declara; con tamaño 0 no tiene tope, por eso se
+// rechaza (un XML vacío tampoco es un CFDI).
+const ZIP_MAX_XML         = 50000;
+const ZIP_MAX_XML_BYTES   = 50 * 1024 * 1024;        // un XML ya descomprimido
+const ZIP_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;  // todo el ZIP descomprimido
+const MB = n => `${Math.round(n / 1024 / 1024)} MB`;
+
 /**
- * Extrae entradas XML de un archivo (directo o dentro de un ZIP).
+ * Extrae entradas XML de un archivo (directo o dentro de un ZIP), una a la vez.
  * @param {{ originalname: string, buffer: Buffer }} file
- * @returns {{ name: string, buffer: Buffer|null, error?: string }[]}
+ * @returns {Generator<{ name: string, buffer: Buffer|null, error?: string }>}
  */
-const extractEntries = (file) => {
-  if (file.originalname.toLowerCase().endsWith('.zip')) {
-    try {
-      const zip = new AdmZip(file.buffer);
-      const xmlEntries = zip.getEntries()
-        .filter(e => e.entryName.toLowerCase().endsWith('.xml') && !e.isDirectory);
-      if (xmlEntries.length === 0) {
-        return [{ name: file.originalname, buffer: null, error: 'El ZIP no contiene archivos XML' }];
-      }
-      return xmlEntries.map(e => ({ name: e.entryName, buffer: e.getData() }));
-    } catch (err) {
-      return [{ name: file.originalname, buffer: null, error: `Error al descomprimir ZIP: ${err.message}` }];
-    }
+function* extractEntries(file) {
+  if (!file.originalname.toLowerCase().endsWith('.zip')) {
+    yield { name: file.originalname, buffer: file.buffer };
+    return;
   }
-  return [{ name: file.originalname, buffer: file.buffer }];
-};
+  let xmlEntries;
+  try {
+    xmlEntries = new AdmZip(file.buffer).getEntries()
+      .filter(e => e.entryName.toLowerCase().endsWith('.xml') && !e.isDirectory);
+  } catch (err) {
+    yield { name: file.originalname, buffer: null, error: `Error al descomprimir ZIP: ${err.message}` };
+    return;
+  }
+  if (xmlEntries.length === 0) {
+    yield { name: file.originalname, buffer: null, error: 'El ZIP no contiene archivos XML' };
+    return;
+  }
+  if (xmlEntries.length > ZIP_MAX_XML) {
+    yield { name: file.originalname, buffer: null, error: `El ZIP trae ${xmlEntries.length} XML (máximo ${ZIP_MAX_XML}). Divídelo en varios ZIP.` };
+    return;
+  }
+  const totalDescomprimido = xmlEntries.reduce((s, e) => s + (e.header.size || 0), 0);
+  if (totalDescomprimido > ZIP_MAX_TOTAL_BYTES) {
+    yield { name: file.originalname, buffer: null, error: `El ZIP descomprimido pesa ${MB(totalDescomprimido)} (máximo ${MB(ZIP_MAX_TOTAL_BYTES)}). Divídelo en varios ZIP.` };
+    return;
+  }
+  for (const e of xmlEntries) {
+    const size = e.header.size || 0;
+    if (size === 0) {
+      yield { name: e.entryName, buffer: null, error: 'XML vacío' };
+      continue;
+    }
+    if (size > ZIP_MAX_XML_BYTES) {
+      yield { name: e.entryName, buffer: null, error: `XML demasiado grande (${MB(size)}, máximo ${MB(ZIP_MAX_XML_BYTES)})` };
+      continue;
+    }
+    let buffer = null, error;
+    try {
+      buffer = e.getData();
+    } catch (err) {
+      error = `Error al descomprimir: ${err.message}`;
+    }
+    yield buffer ? { name: e.entryName, buffer } : { name: e.entryName, buffer: null, error };
+  }
+}
 
 // ── Controladores ─────────────────────────────────────────────────────────────
 
@@ -1503,4 +1543,5 @@ module.exports = {
   exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
   repairXmlSubtotals,
+  _extractEntries: extractEntries,
 };

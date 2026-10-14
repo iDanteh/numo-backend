@@ -1988,6 +1988,21 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
   // Clientes se ajusta igual para que la factura cuadre (ver abajo).
   const ajustesCentavos = [];
 
+  // Cobro NI (mes anterior) de una factura pagada con 2+ transferencias: cada
+  // complemento toma el depósito de SU monto (subtotal + IVA NI), igual que los
+  // bancos de arriba (2026-10-14, caso real AUTOOBRA A0-260904617, Cobranza
+  // 13-oct: $429.99 dep 048657 + $195.37 dep 050112 — ambos tomaban 050112 y
+  // se juntaban en un solo NI de $625.36). Subtotal e IVA del mismo cobro
+  // comparten el depósito elegido.
+  const llaveCobroNI = m => `${(m.facturaUuid || m.cfdiUuid || '').toUpperCase()}|${(m.cfdiUuid || '').toUpperCase()}`;
+  const totalNIPorCobro = new Map();
+  for (const m of movs) {
+    if (m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO || !(Number(m.debe) > 0)) continue;
+    const k = llaveCobroNI(m);
+    totalNIPorCobro.set(k, Math.round(((totalNIPorCobro.get(k) ?? 0) + Number(m.debe)) * 100) / 100);
+  }
+  const depositoNIPorCobro = new Map();
+
   const anotados = movs.map(m => {
     if (!(Number(m.debe) > 0)) return m;
     // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
@@ -2066,15 +2081,20 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // folio se encuentra directo en Numo Bancos. Las líneas NI de un mismo
     // depósito se juntan en un solo subtotal + un solo IVA (ver abajo).
     if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
+      const kNI = llaveCobroNI(m);
+      if (!depositoNIPorCobro.has(kNI)) {
+        depositoNIPorCobro.set(kNI, _depositoPorMonto(bancarioBase, llaveBancaria, totalNIPorCobro.get(kNI) ?? Number(m.debe)));
+      }
+      const bancarioNI = depositoNIPorCobro.get(kNI);
       const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
-      const referenciaNI = bancario?.referencia ?? (bancario?.numeroAutorizacion ? `AUT. ${bancario.numeroAutorizacion}` : null);
+      const referenciaNI = bancarioNI?.referencia ?? (bancarioNI?.numeroAutorizacion ? `AUT. ${bancarioNI.numeroAutorizacion}` : null);
       return {
         cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && referenciaNI) || REGLA_COBRANZA_NO_IDENTIFICADO,
         concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0, _grupoCobro: ORDEN_COBRO.NO_IDENTIFICADO,
-        _depositoNI: bancario?.referencia ?? null,
+        _depositoNI: bancarioNI?.referencia ?? null,
       };
     }
     if (!/^110[12]/.test(m.cuenta?.codigo || '')) {

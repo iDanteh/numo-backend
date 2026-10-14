@@ -1,12 +1,13 @@
 'use strict';
 const { authenticate, permit } = require('../../shared/middleware/auth');
+const { limitarAEmpresasDelUsuario: empresas } = require('../../shared/middleware/empresas-usuario');
 const express    = require('express');
 const multer     = require('multer');
 const { body }   = require('express-validator');
 const rateLimit  = require('express-rate-limit');
 const {
   list, getById, getXml,
-  upload, importExcel, importFromErpApi,
+  upload, importExcel,
   create, compare, remove, exportExcel, exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
   repairXmlSubtotals, reclasificados,
@@ -50,11 +51,11 @@ const handleXmlUpload = (req, res, next) => {
 };
 
 // ── Rutas estáticas — deben ir ANTES de /:id ─────────────────────────────────
-router.get('/',       authenticate, listLimiter, list);
-router.get('/export', authenticate, exportExcel);
-router.get('/reclasificados', authenticate, listLimiter, reclasificados);
-router.get('/export-zip-recibidos', authenticate, exportZipRecibidos);
-router.get('/export-reporte-recibidos', authenticate, exportReporteRecibidos);
+router.get('/',       authenticate, permit('visor:read'), empresas(), listLimiter, list);
+router.get('/export', authenticate, permit('visor:read'), empresas(), exportExcel);
+router.get('/reclasificados', authenticate, permit('visor:read'), empresas({ campos: ['rfcEmisor'] }), listLimiter, reclasificados);
+router.get('/export-zip-recibidos', authenticate, permit('visor:read'), empresas({ campos: ['rfcReceptor'] }), exportZipRecibidos);
+router.get('/export-reporte-recibidos', authenticate, permit('visor:read'), empresas({ campos: ['rfcReceptor'] }), exportReporteRecibidos);
 
 router.get('/reclasificacion-global/plan',    authenticate, permit('admin', 'contador'), planReclasificacionGlobal);
 router.post('/reclasificacion-global/aplicar', authenticate, permit('admin', 'contador'), aplicarReclasificacionGlobal);
@@ -63,7 +64,6 @@ router.post('/migrar-periodo-bulk',        authenticate, permit('admin', 'contad
 router.post('/repair-xml',                 authenticate, permit('admin', 'contador'), repairXmlSubtotals);
 router.post('/upload',                     authenticate, permit('visor:write'), handleXmlUpload, upload);
 router.post('/import-excel',               authenticate, permit('visor:write'), excelUpload.single('excelFile'), importExcel);
-router.post('/import-erp-api',             authenticate, permit('visor:write'), importFromErpApi);
 router.post('/',
   authenticate,
   permit('visor:write'),
@@ -79,9 +79,9 @@ router.post('/',
 );
 
 // ── Rutas con parámetro :id — al final para no capturar rutas estáticas ──────
-router.get('/:id/xml',               authenticate, getXml);
-router.get('/:id/erp-contraparte',   authenticate, erpContraparte);
-router.get('/:id',                   authenticate, getById);
+router.get('/:id/xml',               authenticate, permit('visor:read'), empresas(), getXml);
+router.get('/:id/erp-contraparte',   authenticate, permit('visor:read'), empresas(), erpContraparte);
+router.get('/:id',                   authenticate, permit('visor:read'), empresas(), getById);
 router.patch('/:id/migrar-periodo',  authenticate, permit('admin', 'contador'), migrarPeriodo);
 router.post('/:id/compare',     authenticate, permit('visor:write'), compare);
 router.delete('/:id',           authenticate, permit('users:manage'), remove);

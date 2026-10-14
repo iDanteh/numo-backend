@@ -465,7 +465,7 @@ const MONTO_EFECTIVO_EXPR = {
  * desde el endpoint /dashboard (con caché) como desde el reporte de Cierre
  * de Mes (sin caché, siempre datos frescos al momento del cierre).
  */
-async function computeDashboardData(query, { excluirTraslados = false } = {}) {
+async function computeDashboardData(query, { excluirTraslados = false, soloEmpresa = false } = {}) {
   const { rfcEmisor, fechaInicio, fechaFin, ejercicio, periodo, tipoDeComprobante } = query;
 
   // El dashboard solo debe contar Emitidos — nunca Recibidos (aunque compartan
@@ -477,6 +477,10 @@ async function computeDashboardData(query, { excluirTraslados = false } = {}) {
     const entidadesRfcs = (await entityRepo.findAll()).map(e => e.rfc?.toUpperCase()).filter(Boolean);
     emisorConstraint = { $in: entidadesRfcs };
   }
+  // Usuario con empresas asignadas: estas secciones (estados de comparación y
+  // discrepancias) no filtraban por empresa; para él, solo la suya.
+  const filtroEmpresaCfdi = soloEmpresa ? { 'emisor.rfc': emisorConstraint } : {};
+  const filtroEmpresaDisc = soloEmpresa ? { rfcEmisor: emisorConstraint } : {};
 
   const dateFilter = {};
   if (fechaInicio) {
@@ -598,20 +602,20 @@ async function computeDashboardData(query, { excluirTraslados = false } = {}) {
     // IMPORTANTE: filtrar source='ERP' para evitar contar doble — el engine escribe
     // lastComparisonStatus en AMBOS documentos (ERP y SAT) del mismo UUID.
     CFDI.aggregate([
-      { $match: { source: 'ERP', isActive: { $ne: false }, uuid: { $not: /^SINUUID/ }, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }), ...(periodoFilter.tipoDeComprobante && { tipoDeComprobante: periodoFilter.tipoDeComprobante }) } },
+      { $match: { source: 'ERP', isActive: { $ne: false }, uuid: { $not: /^SINUUID/ }, ...filtroEmpresaCfdi, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }), ...(periodoFilter.tipoDeComprobante && { tipoDeComprobante: periodoFilter.tipoDeComprobante }) } },
       { $group: { _id: '$lastComparisonStatus', count: { $sum: 1 } } },
     ]),
     Discrepancy.aggregate([
-      { $match: { ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) } },
+      { $match: { ...filtroEmpresaDisc, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) } },
       { $group: { _id: '$severity', count: { $sum: 1 }, fiscalImpact: { $sum: '$fiscalImpact.amount' } } },
     ]),
     Discrepancy.aggregate([
-      { $match: { status: 'open', ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) } },
+      { $match: { status: 'open', ...filtroEmpresaDisc, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) } },
       { $group: { _id: '$type', count: { $sum: 1 } } },
       { $sort: { count: -1 } },
       { $limit: 5 },
     ]),
-    Discrepancy.find({ status: 'open', ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) }).sort({ createdAt: -1 }).limit(10).lean(),
+    Discrepancy.find({ status: 'open', ...filtroEmpresaDisc, ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }), ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }) }).sort({ createdAt: -1 }).limit(10).lean(),
 
     // IVA por fuente:
     //   ERP      → erpStatus no Cancelado/Deshabilitado, excluye SINUUID
@@ -661,6 +665,7 @@ async function computeDashboardData(query, { excluirTraslados = false } = {}) {
   const discrepancyTypesPorTipo = await Discrepancy.aggregate([
     { $match: {
       status: 'open',
+      ...filtroEmpresaDisc,
       tipoDeComprobante: { $in: TIPOS_DISCREPANCIA_DASHBOARD },
       ...(periodoFilter.ejercicio && { ejercicio: periodoFilter.ejercicio }),
       ...(periodoFilter.periodo && { periodo: periodoFilter.periodo }),
@@ -752,11 +757,14 @@ async function computeDashboardData(query, { excluirTraslados = false } = {}) {
 }
 
 const dashboard = asyncHandler(async (req, res) => {
-  const cacheKey = getCacheKey(req.query);
+  // Usuario con empresas asignadas: discrepancias y estados solo de su empresa,
+  // con caché aparte para no mezclarse con la de los demás.
+  const soloEmpresa = !!req.empresasPermitidas;
+  const cacheKey = getCacheKey(soloEmpresa ? { ...req.query, soloEmpresa } : req.query);
   const cached = getFromCache(cacheKey);
   if (cached) return res.json(cached);
 
-  const responseData = await computeDashboardData(req.query, { excluirTraslados: true });
+  const responseData = await computeDashboardData(req.query, { excluirTraslados: true, soloEmpresa });
 
   setCache(cacheKey, responseData);
   res.json(responseData);
@@ -1095,6 +1103,8 @@ const exportExcel = asyncHandler(async (req, res) => {
 const satVigenteErpInactivo = asyncHandler(async (req, res) => {
   const { ejercicio, periodo, tipoDeComprobante } = req.query;
   const periodoFiltro = {};
+  // Usuario con empresas asignadas: solo su empresa (el middleware ya validó rfcEmisor).
+  if (req.empresasPermitidas) periodoFiltro['emisor.rfc'] = String(req.query.rfcEmisor).toUpperCase();
   if (ejercicio)         periodoFiltro.ejercicio         = parseInt(ejercicio);
   if (periodo)           periodoFiltro.periodo           = parseInt(periodo);
   if (tipoDeComprobante) periodoFiltro.tipoDeComprobante = tipoDeComprobante;

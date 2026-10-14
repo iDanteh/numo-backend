@@ -4,6 +4,7 @@ const express    = require('express');
 const { body }   = require('express-validator');
 const rateLimit  = require('express-rate-limit');
 const { authenticate, permit } = require('../../shared/middleware/auth');
+const { limitarAEmpresasDelUsuario: empresas, soloSinEmpresasAsignadas } = require('../../shared/middleware/empresas-usuario');
 const {
   ejerciciosResumen, periodos, list, stats,
   listSessions, getSession, getById, batch, resolve, conciliarNotInErp,
@@ -24,13 +25,13 @@ const listLimiter = rateLimit({
   }),
 });
 
-router.get('/ejercicios/resumen', authenticate, ejerciciosResumen);
-router.get('/periodos',           authenticate, periodos);
-router.get('/stats',              authenticate, stats);
-router.get('/sessions',           authenticate, listSessions);
-router.get('/sessions/:id',       authenticate, getSession);
-router.get('/',                   authenticate, listLimiter, list);
-router.get('/:id',                authenticate, getById);
+router.get('/ejercicios/resumen', authenticate, permit('visor:read'), soloSinEmpresasAsignadas, ejerciciosResumen);
+router.get('/periodos',           authenticate, permit('visor:read'), soloSinEmpresasAsignadas, periodos);
+router.get('/stats',              authenticate, permit('visor:read'), soloSinEmpresasAsignadas, stats);
+router.get('/sessions',           authenticate, permit('visor:read'), soloSinEmpresasAsignadas, listSessions);
+router.get('/sessions/:id',       authenticate, permit('visor:read'), empresas(), getSession);
+router.get('/',                   authenticate, permit('visor:read'), soloSinEmpresasAsignadas, listLimiter, list);
+router.get('/:id',                authenticate, permit('visor:read'), soloSinEmpresasAsignadas, getById);
 
 router.post('/batch',
   authenticate,

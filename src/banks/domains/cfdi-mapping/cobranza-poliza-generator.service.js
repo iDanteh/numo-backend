@@ -314,7 +314,8 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 // donde se cobró, según cómo se mueve ese dinero:
 //   - efectivo en Puerto (O0): se deposita → 1102011001 "EFECTIVO-COS" (centro
 //     120; antes "DEP. PTO", el usuario pidió EFECTIVO-COS el 2026-10-06)
-//   - efectivo en otra caja (C0, F0…): se queda ahí → 1101010003 "EFECTIVO-COS"
+//   - efectivo en otra caja (C0, F0…): "EFECTIVO-COS" en Caja aquí; desde
+//     2026-10-14 `_efectivoABanco` lo pasa a 1102011001 como todo el efectivo
 //   - tarjeta: 1101010001 "TARJETA DE CREDITO"/"TARJETA DE DEBITO"
 const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'EFECTIVO-COS' };
 const CODIGO_CUENTA_BANCO_DEPOSITO_CAJA = '1102011001';
@@ -337,6 +338,23 @@ function _cargoCobroOtraCaja(fp, cuentaMap, ccBySerieMap) {
     return { cuentaId: cuentaMap[CODIGO_CUENTA_CAJA_GENERAL], serie: ETIQUETA_TARJETA[fp.claveSat], ...centro };
   }
   return null;
+}
+
+// Todo el efectivo de Cobranza va a BBVA 1102011001 (2026-10-14, pedido del
+// usuario, póliza 1247 del 13-oct): el de la caja A0 que no se pudo cuadrar
+// con una ficha (o sin ficha capturada aún), el de cada sucursal ("EFECTIVO
+// 111") y el EFECTIVO-COS de cualquier caja — antes se quedaban en Caja
+// 1101010003 y solo Puerto iba a BBVA. Muta `movs`.
+function _efectivoABanco(movs, cuentaMap) {
+  const idCaja = cuentaMap[CODIGO_CUENTA_CAJA];
+  const idBanco = cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA];
+  if (!idCaja || !idBanco) return;
+  for (const m of movs) {
+    // Con desglose real solo el efectivo (una tarjeta puede caer en la cuenta
+    // de la regla, que para Reg 7A es esta misma Caja).
+    const esEfectivo = m._formaPagoReal == null || m._formaPagoReal === '01';
+    if (m.cuentaId === idCaja && Number(m.debe) > 0 && esEfectivo) m.cuentaId = idBanco;
+  }
 }
 
 /**
@@ -841,6 +859,10 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     }));
   }
 
+  // 7c. Efectivo que siga en Caja → BBVA (ver `_efectivoABanco`). Va después
+  // de 7b porque la ficha toma sus candidatos de la Caja.
+  _efectivoABanco(todosLosMovimientos, cuentaMap);
+
   // 8. Cobros de otra sucursal PENDIENTES DE CONSUMIR — facturas de ESTA
   // sucursal (centroCostoId, si se especificó una) que se cobraron en otra y
   // ya están encoladas en CobroSucursalPendienteCobranza. Solo aplica cuando
@@ -1100,5 +1122,5 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
 
 module.exports = {
   generarPropuestaCobranza, generarYGuardarCobranza,
-  cfdiToMovimientosCobranza, _prefetchDoctosPago, _movimientosOpaDeCobranza,
+  cfdiToMovimientosCobranza, _prefetchDoctosPago, _movimientosOpaDeCobranza, _efectivoABanco,
 };

@@ -264,7 +264,10 @@ const startServer = async () => {
     shutdown('uncaughtException');
   });
   process.on('unhandledRejection', (reason) => {
-    logger.error(`[unhandledRejection] ${reason}`);
+    // Antes se interpolaba `reason` directo en el string, perdiendo el .stack — el
+    // logger sí lo soporta (mismo mecanismo que ya usa error-handler.js) si se lo
+    // pasamos como meta en vez de stringificarlo de entrada.
+    logger.error(`[unhandledRejection] ${reason?.message || reason}`, { stack: reason?.stack });
   });
 };
 

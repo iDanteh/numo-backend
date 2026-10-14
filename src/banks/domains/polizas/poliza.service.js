@@ -1958,8 +1958,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // una ficha de caja): mismo trato que el cheque (2026-10-06, pólizas
     // manuales: 25-sep "46217" TERESA MINERVA, 29-sep "49263" CAROLINA DIAZ).
     // Los cobros en otra caja (EFECTIVO-COS/DEP. PTO) y PXA no entran.
+    // Desde 2026-10-14 el efectivo de Cobranza ya llega en BBVA 1102011001 (ver
+    // cobranza-poliza-generator, paso 7c), no en Caja — se aceptan ambas.
     const esEfectivoDepositadoPorCliente = m.formaPago === '01' && !!bancario?.esDepositoEfectivoKore
-      && /^1101/.test(m.cuenta?.codigo || '')
+      && /^110[12]/.test(m.cuenta?.codigo || '')
       && !(m.serie === 'EFECTIVO-COS' || m.serie === 'PXA' || String(m.serie ?? '').startsWith('DEP. '));
     const esTransferenciaVerificada = esChequeConDeposito || esEfectivoDepositadoPorCliente || (bancario?.categoriaConocida
       ? bancario.esTransferencia

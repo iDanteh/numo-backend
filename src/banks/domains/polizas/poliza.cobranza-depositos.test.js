@@ -148,3 +148,24 @@ test('NI con OPA del sobrante: el depósito 046486 sale completo ($7,479.42)', (
   expect(niOut[0].concepto).toBe('MINI ABASTOS / B0-260803365 / B0-260803238 / B0-260803492 / OPA-01106');
   expect(out.filter(l => l.reglaNombre === 'OPA-COBRANZA').map(l => [l.cuenta.codigo, l.haber])).toEqual([['2103010001', 59.41], ['2104010002', 9.5]]);
 });
+
+test('NI de una factura pagada con 2 transferencias → cada cobro con su depósito (AUTOOBRA 13-oct)', () => {
+  const DNI = { codigo: '2103030001' };
+  const IVA_NI = { codigo: '2104010002' };
+  const ni = (pago, sub, iva) => [
+    { cfdiUuid: pago, facturaUuid: 'F1', formaPago: '03', serie: 'A0-260916515', concepto: 'AUTOOBRA SISTEMAS CONSTRUCTIVOS / A0-260904617', centroCosto: '300', reglaNombre: 'NI', cuenta: DNI, debe: sub, haber: 0 },
+    { cfdiUuid: pago, facturaUuid: 'F1', formaPago: '03', serie: 'A0-260916515', concepto: 'AUTOOBRA SISTEMAS CONSTRUCTIVOS / A0-260904617', centroCosto: '300', reglaNombre: 'NI', cuenta: IVA_NI, debe: iva, haber: 0 },
+  ];
+  const movs = [...ni('P1', 370.68, 59.31), ...ni('P2', 168.42, 26.95)];
+  const d1 = { ...deposito('a', '048657', 429.99), _montoAplicado: 429.99 };
+  const d2 = { ...deposito('b', '050112', 195.37), _montoAplicado: 195.37 };
+  const verdad = new Map([['F1', { ...d2, _candidatos: [d1, d2] }]]);
+
+  const out = anotar(movs, 20, verdad).filter(l => l.reglaNombre === 'NI');
+  expect(out.map(l => [l.cuenta.codigo, l.serie, l.debe])).toEqual([
+    ['2103030001', '048657', 370.68],
+    ['2104010002', 'NI', 59.31],
+    ['2103030001', '050112', 168.42],
+    ['2104010002', 'NI', 26.95],
+  ]);
+});

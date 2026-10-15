@@ -33,6 +33,7 @@ const Notificacion      = require('./Notificacion');
 const ConfigSection     = require('./ConfigSection');
 const GlobalConfig      = require('./GlobalConfig');
 const ConfigAuditLog    = require('./ConfigAuditLog');
+const PolizaAuditLog    = require('./PolizaAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
 
@@ -450,6 +451,41 @@ async function syncModels() {
   await ConfigSection.sync({ force: false });
   await GlobalConfig.sync({ force: false });
   await ConfigAuditLog.sync({ force: false });
+
+  // Bitácora de pólizas (ver PolizaAuditLog.js) — tabla nueva, sin FK a polizas.
+  await PolizaAuditLog.sync({ force: false });
+
+  // Carga inicial ÚNICA (solo con la tabla vacía): reconstruye lo que ya existe en
+  // las columnas *Por de `polizas` como origen='historico'. Ojo: esas columnas
+  // solo guardan el último actor, así que el histórico previo es parcial; lo de
+  // aquí en adelante sí queda completo (una fila por acción).
+  await Poliza.sequelize.query(`
+    INSERT INTO poliza_audit_logs
+      (poliza_id, accion, usuario_nombre, rfc, poliza_tipo, poliza_numero, poliza_fecha,
+       poliza_concepto, ejercicio, periodo, estado_nuevo, motivo, origen, fecha)
+    SELECT h.* FROM (
+      SELECT id, 'creada', creado_por, rfc, tipo::text, numero, fecha, LEFT(concepto, 500),
+             ejercicio, periodo, 'borrador', NULL::text, 'historico', created_at
+        FROM polizas WHERE created_at IS NOT NULL
+      UNION ALL
+      SELECT id, 'contabilizada', contabilizado_por, rfc, tipo::text, numero, fecha, LEFT(concepto, 500),
+             ejercicio, periodo, 'contabilizada', NULL::text, 'historico', contabilizada_at
+        FROM polizas WHERE contabilizada_at IS NOT NULL
+      UNION ALL
+      SELECT id, 'revertida', revertido_por, rfc, tipo::text, numero, fecha, LEFT(concepto, 500),
+             ejercicio, periodo, 'borrador', motivo_reversion, 'historico', revertida_at
+        FROM polizas WHERE revertida_at IS NOT NULL
+      UNION ALL
+      SELECT id, 'cancelada', cancelado_por, rfc, tipo::text, numero, fecha, LEFT(concepto, 500),
+             ejercicio, periodo, 'cancelada', motivo_cancelacion, 'historico', cancelada_at
+        FROM polizas WHERE cancelada_at IS NOT NULL
+      UNION ALL
+      SELECT id, 'folio_contpaq', contpaq_asociado_por, rfc, tipo::text, numero, fecha, LEFT(concepto, 500),
+             ejercicio, periodo, NULL, NULL::text, 'historico', contpaq_asociado_en
+        FROM polizas WHERE contpaq_asociado_en IS NOT NULL
+    ) h
+    WHERE NOT EXISTS (SELECT 1 FROM poliza_audit_logs)
+  `).catch(e => console.warn('[syncModels] carga inicial poliza_audit_logs:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, syncModels };

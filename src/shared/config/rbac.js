@@ -156,6 +156,11 @@ const PERMISSIONS = Object.freeze({
   // rol todavía — admin los tiene por el wildcard '*'.
   CONFIG_MANAGE:         'config:manage',
   CONFIG_SECRETS_REVEAL: 'config:secrets:reveal',
+
+  // Monitor de pólizas (ver banks/domains/polizas/poliza-audit.*) — quién crea,
+  // contabiliza, cancela, revierte y exporta. Exclusivo de admin (2026-10-15, pedido
+  // explícito del usuario): sin asignar a ningún rol, admin lo tiene por el wildcard '*'.
+  POLIZAS_AUDIT_READ:  'polizas:audit:read',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

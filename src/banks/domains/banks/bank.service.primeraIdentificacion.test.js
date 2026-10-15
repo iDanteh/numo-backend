@@ -84,23 +84,71 @@ describe('updateStatus — ultimoCambioStatusAt (2026-10-06, corte histórico pe
 });
 
 describe('reclasifyMovements — ultimoCambioStatusAt (2026-10-06)', () => {
-  test('el $set del updateMany incluye ultimoCambioStatusAt además de status', async () => {
-    BankMovement.updateMany = jest.fn().mockResolvedValue({ modifiedCount: 2 });
+  test('el $set de cada updateOne incluye ultimoCambioStatusAt además de status', async () => {
+    BankMovement.find = jest.fn().mockResolvedValue([
+      { _id: 'mov-1', status: 'no_identificado' },
+      { _id: 'mov-2', status: 'otros' },
+    ]);
+    BankMovement.bulkWrite = jest.fn().mockResolvedValue({});
 
-    const result = await bankService.reclasifyMovements(['mov-1', 'mov-2']);
+    const result = await bankService.reclasifyMovements(['mov-1', 'mov-2'], { _id: 'user-1' });
 
-    expect(result).toEqual({ reclasified: 2 });
-    expect(BankMovement.updateMany).toHaveBeenCalledTimes(1);
-    const [filter, update] = BankMovement.updateMany.mock.calls[0];
-    expect(filter).toEqual({ _id: { $in: ['mov-1', 'mov-2'] } });
-    expect(update.$set.status).toBe('reclasificado');
-    expect(update.$set.ultimoCambioStatusAt).toBeInstanceOf(Date);
+    expect(result).toEqual({ reclasified: 2, omitidos: 0 });
+    expect(BankMovement.find).toHaveBeenCalledWith(
+      { _id: { $in: ['mov-1', 'mov-2'] }, status: { $ne: 'identificado' } },
+      '_id status'
+    );
+    expect(BankMovement.bulkWrite).toHaveBeenCalledTimes(1);
+    const ops = BankMovement.bulkWrite.mock.calls[0][0];
+    expect(ops).toHaveLength(2);
+    const [{ updateOne }] = ops;
+    expect(updateOne.update.$set.status).toBe('reclasificado');
+    expect(updateOne.update.$set.ultimoCambioStatusAt).toBeInstanceOf(Date);
   });
 
-  test('sin ids: BadRequestError, no llama a updateMany', async () => {
-    BankMovement.updateMany = jest.fn();
+  test('sin ids: BadRequestError, no llama a find/bulkWrite', async () => {
+    BankMovement.find = jest.fn();
+    BankMovement.bulkWrite = jest.fn();
     await expect(bankService.reclasifyMovements([])).rejects.toThrow();
-    expect(BankMovement.updateMany).not.toHaveBeenCalled();
+    expect(BankMovement.find).not.toHaveBeenCalled();
+    expect(BankMovement.bulkWrite).not.toHaveBeenCalled();
+  });
+
+  test('bug real (2026-10-15): un movimiento ya identificado (ficha o erpLinks) queda excluido, no se pisa', async () => {
+    BankMovement.find = jest.fn().mockResolvedValue([{ _id: 'mov-2', status: 'otros' }]);
+    BankMovement.bulkWrite = jest.fn().mockResolvedValue({});
+
+    const result = await bankService.reclasifyMovements(['mov-1', 'mov-2'], { _id: 'user-1' });
+
+    expect(result).toEqual({ reclasified: 1, omitidos: 1 });
+    const ops = BankMovement.bulkWrite.mock.calls[0][0];
+    expect(ops).toHaveLength(1);
+    expect(ops[0].updateOne.filter._id).toBe('mov-2');
+  });
+
+  test('registra autoría y status anterior en _changelog', async () => {
+    BankMovement.find = jest.fn().mockResolvedValue([{ _id: 'mov-1', status: 'no_identificado' }]);
+    BankMovement.bulkWrite = jest.fn().mockResolvedValue({});
+
+    await bankService.reclasifyMovements(['mov-1'], { _id: 'user-1' });
+
+    const [{ updateOne }] = BankMovement.bulkWrite.mock.calls[0][0];
+    const entry = updateOne.update.$push._changelog;
+    expect(entry.via).toBe('reclasificacion-masiva:user-1');
+    expect(entry.campo).toBe('status');
+    expect(entry.de).toBe('no_identificado');
+    expect(entry.a).toBe('reclasificado');
+    expect(entry.at).toBeInstanceOf(Date);
+  });
+
+  test('todos los movimientos ya están identificados: no llama a bulkWrite', async () => {
+    BankMovement.find = jest.fn().mockResolvedValue([]);
+    BankMovement.bulkWrite = jest.fn();
+
+    const result = await bankService.reclasifyMovements(['mov-1'], { _id: 'user-1' });
+
+    expect(result).toEqual({ reclasified: 0, omitidos: 1 });
+    expect(BankMovement.bulkWrite).not.toHaveBeenCalled();
   });
 });
 

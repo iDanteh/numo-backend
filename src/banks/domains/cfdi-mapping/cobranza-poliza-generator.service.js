@@ -1050,7 +1050,7 @@ async function generarPropuestaCobranza({ rfc, ejercicio, periodo, tipoPropuesta
  * Genera y persiste (como póliza en estado 'borrador') los CFDIs tipo P
  * (Cobranza) sin póliza del periodo/sucursal indicados.
  */
-async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta = 'D', centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
+async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta = 'D', centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   const {
     todosLosMovimientos, sinRegla, advertencias, sustitutos, ccBySerieMap, cfdisSinPoliza, ruleUsageCount,
     pendientesCruzadosParaEncolar, pendientesConsumidos,
@@ -1082,6 +1082,8 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
     const polizaHeader = await Poliza.create({
       tipo: tipoPropuesta, numero, fecha: fecha.toISOString().slice(0, 10), concepto,
       ejercicio: Number(ejercicio), periodo: Number(periodo), rfc, estado: 'borrador',
+      // Antes no se guardaba (Cobranza quedaba con creadoPor NULL) — mismo criterio que userLabel().
+      creadoPor: user?.nombre || user?.email || String(user?.dbId ?? 'sistema'),
       sustitutosExcluidos: sustitutos.length ? sustitutos : null,
       pendientesPorFacturar: null,
     }, { transaction: t });

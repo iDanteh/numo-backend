@@ -10,15 +10,12 @@
  * `registrar` NUNCA lanza: una falla de la bitácora no debe tumbar la acción
  * real (contabilizar, cancelar, exportar...). Solo deja un warning en el log.
  *
- * Creación: se registra con un hook `afterCreate` sobre Poliza en vez de tocar
- * cada generador (manual, Ingreso/Egreso, Cobranza, Traspasos, Comp./Int.,
- * Cierre IVA). Si la creación va en transacción, se registra al hacer commit
- * para no dejar filas de pólizas que nunca existieron.
+ * Creación: se registra con un hook `afterCreate` definido en el modelo Poliza
+ * (shared/models/postgres/Poliza.js) en vez de tocar cada generador.
  */
 
 const { QueryTypes } = require('sequelize');
 const { sequelize }  = require('../../../config/database.postgres');
-const Poliza         = require('../../../shared/models/postgres/Poliza');
 const PolizaAuditLog = require('../../../shared/models/postgres/PolizaAuditLog');
 const { logger }     = require('../../../shared/utils/logger');
 
@@ -77,13 +74,6 @@ async function registrar(accion, poliza, user, extra = {}) {
     logger.warn(`[PolizaAudit] No se pudo registrar "${accion}" (póliza ${poliza?.id ?? '-'}): ${e.message}`);
   }
 }
-
-Poliza.addHook('afterCreate', 'polizaAuditCreada', (poliza, options) => {
-  const plain = poliza.get({ plain: true });
-  const run = () => registrar('creada', plain, plain.creadoPor || null, { estadoNuevo: plain.estado });
-  if (options?.transaction?.afterCommit) options.transaction.afterCommit(run);
-  else run();
-});
 
 // ── Consultas del monitor ──────────────────────────────────────────────────────
 

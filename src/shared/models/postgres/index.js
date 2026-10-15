@@ -33,6 +33,10 @@ const Notificacion      = require('./Notificacion');
 const ConfigSection     = require('./ConfigSection');
 const GlobalConfig      = require('./GlobalConfig');
 const ConfigAuditLog    = require('./ConfigAuditLog');
+const LoyaltyCard             = require('./LoyaltyCard');
+const LoyaltyPointsLedger     = require('./LoyaltyPointsLedger');
+const LoyaltyTierHistory      = require('./LoyaltyTierHistory');
+const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 const PolizaAuditLog    = require('./PolizaAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
@@ -80,6 +84,15 @@ ConfigSection.hasMany(GlobalConfig,     { foreignKey: 'sectionId', as: 'configs'
 GlobalConfig.belongsTo(ConfigSection,   { foreignKey: 'sectionId', as: 'section' });
 GlobalConfig.hasMany(ConfigAuditLog,    { foreignKey: 'configId', as: 'auditLog', onDelete: 'CASCADE' });
 ConfigAuditLog.belongsTo(GlobalConfig,  { foreignKey: 'configId', as: 'config' });
+
+// Asociaciones — Lealtad (RESTRICT: el ledger/historial nunca se borra en cascada)
+LoyaltyCard.hasMany(LoyaltyPointsLedger,   { foreignKey: 'cardId', as: 'movimientos', onDelete: 'RESTRICT' });
+LoyaltyPointsLedger.belongsTo(LoyaltyCard, { foreignKey: 'cardId', as: 'card' });
+LoyaltyCard.hasMany(LoyaltyTierHistory,    { foreignKey: 'cardId', as: 'historialNiveles', onDelete: 'RESTRICT' });
+LoyaltyTierHistory.belongsTo(LoyaltyCard,  { foreignKey: 'cardId', as: 'card' });
+LoyaltyPointsLedger.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCosto' });
+CentroCosto.hasMany(LoyaltyPointsLedger,   { foreignKey: 'centroCostoId', as: 'movimientosLealtad' });
+LoyaltyPointsLedger.belongsTo(LoyaltyAdjustmentReason, { foreignKey: 'reasonId', as: 'reason' });
 
 // ── Sincronización ────────────────────────────────────────────────────────────
 
@@ -494,6 +507,34 @@ async function syncModels() {
     ) h
     WHERE NOT EXISTS (SELECT 1 FROM poliza_audit_logs)
   `).catch(e => console.warn('[syncModels] carga inicial poliza_audit_logs:', e.message));
+
+  // Sistema de Lealtad — columnas aditivas en centros_costo (idempotente, ver
+  // CentroCosto.js). Independientes entre sí: una sucursal puede acumular sin
+  // permitir canje, o viceversa.
+  await CentroCosto.sequelize.query(`
+    ALTER TABLE centros_costo
+      ADD COLUMN IF NOT EXISTS participa_lealtad     BOOLEAN NOT NULL DEFAULT TRUE,
+      ADD COLUMN IF NOT EXISTS permite_canje_lealtad BOOLEAN NOT NULL DEFAULT TRUE
+  `).catch(e => console.warn('[syncModels] ADD COLUMN participa_lealtad/permite_canje_lealtad:', e.message));
+
+  // Sistema de Lealtad — tablas nuevas (ver LoyaltyCard/LoyaltyPointsLedger/
+  // LoyaltyTierHistory/LoyaltyAdjustmentReason.js), force:false para solo
+  // crearlas si no existen. Orden por FK: cards y reasons antes que
+  // ledger/historial (ambos referencian loyalty_cards; ledger también
+  // referencia loyalty_adjustment_reasons y centros_costo).
+  await LoyaltyCard.sync({ force: false });
+  await LoyaltyAdjustmentReason.sync({ force: false });
+  await LoyaltyPointsLedger.sync({ force: false });
+  await LoyaltyTierHistory.sync({ force: false });
+
+  // Respaldo de BD para D4 (consistencia de saldo): ningún script o bug futuro
+  // puede dejar saldo_puntos negativo, incluso si algún día alguien escribe
+  // fuera de _aplicarMovimiento. Idempotente vía bloque DO + catch duplicate_object.
+  await LoyaltyCard.sequelize.query(`
+    DO $$ BEGIN
+      ALTER TABLE loyalty_cards ADD CONSTRAINT loyalty_cards_saldo_no_negativo CHECK (saldo_puntos >= 0);
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$
+  `).catch(e => console.warn('[syncModels] CHECK loyalty_cards_saldo_no_negativo:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, syncModels };

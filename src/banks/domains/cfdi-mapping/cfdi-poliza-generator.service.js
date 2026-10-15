@@ -6016,7 +6016,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   // sin duplicar la iteración por sucursal/día (esa parte SÍ es genérica).
   if (tipoCfdi === 'P') {
     return require('./cobranza-poliza-generator.service').generarYGuardarCobranza({
-      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro,
+      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user,
     });
   }
 

@@ -5,6 +5,7 @@ const AdmZip  = require('adm-zip');
 const { authenticate, permit } = require('../../shared/middleware/auth.real');
 const { asyncHandler }         = require('../../shared/middleware/error-handler');
 const service                  = require('./poliza.service');
+const audit                    = require('./poliza-audit.service');
 
 // Sin caracteres fuera de [A-Za-z0-9_-] en nombres de archivo dentro del ZIP —
 // mismo criterio que poliza-export-zip.service.js.
@@ -62,6 +63,7 @@ router.get('/xml-sat',
   asyncHandler(async (req, res) => {
     const { rfc, ejercicio, periodo, tipoSolicitud, numOrden, numTramite } = req.query;
     const xml = await service.generarXmlSat({ rfc, ejercicio, periodo, tipoSolicitud, numOrden, numTramite });
+    await audit.registrar('exportada_xml_sat', null, req.user, { rfc, ejercicio, periodo, detalle: { tipoSolicitud: tipoSolicitud || 'AF' } });
     const mes = String(Number(periodo)).padStart(2, '0');
     res.setHeader('Content-Type', 'application/xml; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="Polizas_${ejercicio}_${mes}_${rfc}.xml"`);
@@ -176,6 +178,7 @@ router.get('/:id/export-contpaq',
         : undefined,
     };
     const { workbooks, poliza } = await service.exportContpaqXlsx(req.params.id, overrides);
+    await audit.registrar('exportada', poliza, req.user, { detalle: { formato: 'contpaq', archivos: workbooks.length } });
     const mes = String(poliza.periodo).padStart(2, '0');
 
     if (workbooks.length === 1) {
@@ -214,6 +217,7 @@ router.get('/:id/export-contpaq-traspasos',
   permit('polizas:read'),
   asyncHandler(async (req, res) => {
     const { buffer, poliza } = await service.exportContpaqTraspasosXlsx(req.params.id);
+    await audit.registrar('exportada', poliza, req.user, { detalle: { formato: 'contpaq-traspasos' } });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="Poliza_T${poliza.numero}_${poliza.fecha}_CONTPAQ.xlsx"`);
     res.send(buffer);
@@ -237,6 +241,7 @@ router.get('/:id/export-contpaq-compensaciones-intereses',
   permit('polizas:read'),
   asyncHandler(async (req, res) => {
     const { buffer, poliza } = await service.exportContpaqCompensacionesInteresesXlsx(req.params.id);
+    await audit.registrar('exportada', poliza, req.user, { detalle: { formato: 'contpaq-compensaciones-intereses' } });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="Poliza_${poliza.tipo}${poliza.numero}_${poliza.fecha}_CONTPAQ.xlsx"`);
     res.send(buffer);

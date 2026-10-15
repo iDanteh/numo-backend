@@ -2630,15 +2630,41 @@ async function deleteMovements(ids) {
   return { deleted: result.deletedCount };
 }
 
-async function reclasifyMovements(ids) {
+/**
+ * Bug real reportado por el usuario (2026-10-15): un movimiento con `ficha` registrada
+ * (o con erpLinks que cuadran) ya es una identificación real — status='identificado'. El
+ * `updateMany` crudo de antes lo pisaba a 'reclasificado' sin mirar el status actual,
+ * destruyendo esa identificación sin dejar rastro. Mismo criterio que ya aplica
+ * resolveCategoriaEffects() para los cambios de categoría: un 'identificado' YA GUARDADO
+ * se preserva SIEMPRE, nunca se recalcula ni se pisa.
+ *
+ * Deja de ser uno de los 2 caminos "sin rastro" documentados en ultimoCambioStatusAt
+ * (BankMovement.model.js) — ahora también empuja a `_changelog`, a pedido explícito del
+ * usuario, para poder auditar quién reclasificó cada movimiento.
+ */
+async function reclasifyMovements(ids, user) {
   if (!Array.isArray(ids) || ids.length === 0) throw new BadRequestError('Se requiere al menos un ID');
-  // Otro de los 2 caminos sin rastro en historialVinculacion — ver ultimoCambioStatusAt
-  // en BankMovement.model.js.
-  const result = await BankMovement.updateMany(
-    { _id: { $in: ids } },
-    { $set: { status: 'reclasificado', ultimoCambioStatusAt: new Date() } }
+
+  const movs = await BankMovement.find(
+    { _id: { $in: ids }, status: { $ne: 'identificado' } },
+    '_id status'
   );
-  return { reclasified: result.modifiedCount };
+  if (movs.length === 0) return { reclasified: 0, omitidos: ids.length };
+
+  const now = new Date();
+  const via = user ? `reclasificacion-masiva:${user._id}` : 'reclasificacion-masiva';
+
+  await BankMovement.bulkWrite(movs.map(mov => ({
+    updateOne: {
+      filter: { _id: mov._id },
+      update: {
+        $set:  { status: 'reclasificado', ultimoCambioStatusAt: now },
+        $push: { _changelog: { at: now, via, campo: 'status', de: mov.status, a: 'reclasificado', importFile: null } },
+      },
+    },
+  })));
+
+  return { reclasified: movs.length, omitidos: ids.length - movs.length };
 }
 
 async function bulkUpdateCategoria(ids, categoria, user) {

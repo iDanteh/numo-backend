@@ -95,6 +95,11 @@ COPY --from=deps /app/.cache ./.cache
 # Se copia DESPUÉS de node_modules para aprovechar el cache de Docker:
 # cambios en src/ no invalidan el layer de dependencias.
 COPY src/ ./src/
+# scripts/ (migraciones/backfills one-shot, ej. migrate-netpay-v2.js) — sin esto nunca
+# llegan a /app/scripts dentro del contenedor y `docker exec ... node scripts/x.js` falla
+# con MODULE_NOT_FOUND aunque el archivo ya esté mergeado a main (bug real encontrado
+# 2026-10-15 corriendo migrate-netpay-v2.js en producción).
+COPY scripts/ ./scripts/
 COPY package.json ./
 
 # Crear directorios necesarios en runtime con los permisos correctos

@@ -54,4 +54,26 @@ describe('_authenticateSocket', () => {
     expect(errArg).toBeInstanceOf(Error);
     expect(errArg.message).toBe('Token inválido');
   });
+
+  // Bug real 2026-10-14 (reproducido en consola, fuera de este mock): el shim
+  // no tenía `req.is()` ni `req.method` — authenticate() en sí pasó el mock de
+  // arriba, pero la librería REAL de Auth0 (express-oauth2-jwt-bearer) los usa
+  // internamente y tiraba "TypeError: req.is is not a function" /
+  // "Invalid HTTP method received in request". Este mock no llama a la
+  // librería real, así que no lo detecta por sí solo — por eso se afirma acá
+  // el contrato completo del shim en vez de solo lo que authenticate() toca.
+  test('el req shim expone is()/method/get() — contrato que exige express-oauth2-jwt-bearer, no solo authenticate()', () => {
+    authenticate.mockImplementation((req, _res, next) => {
+      expect(typeof req.is).toBe('function');
+      expect(req.is('urlencoded')).toBe(false);
+      expect(typeof req.method).toBe('string');
+      expect(req.method.length).toBeGreaterThan(0);
+      expect(typeof req.get).toBe('function');
+      req.user = { _id: 'auth0|123', role: 'cobranza', extraPermissions: [] };
+      next();
+    });
+
+    _authenticateSocket(buildSocket('token-valido'), jest.fn());
+    expect(authenticate).toHaveBeenCalled();
+  });
 });

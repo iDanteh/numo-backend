@@ -191,6 +191,11 @@ const PERMISSIONS = Object.freeze({
   // ningún otro rol, admin lo tiene por el wildcard '*', mismo criterio que
   // BANKS_TRANSFERENCIAS_CAJA/BANKS_NETPAY.
   SYSTEM_MONITOR_READ: 'system:monitor:read',
+
+  // Monitor de pólizas (ver banks/domains/polizas/poliza-audit.*) — quién crea,
+  // contabiliza, cancela, revierte y exporta. Exclusivo de admin (2026-10-15, pedido
+  // explícito del usuario), mismo criterio que SYSTEM_MONITOR_READ: sin rol asignado.
+  POLIZAS_AUDIT_READ:  'polizas:audit:read',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

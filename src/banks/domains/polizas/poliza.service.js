@@ -2,6 +2,8 @@
 
 const ExcelJS = require('exceljs');
 const repo = require('./repositories/poliza.repository');
+// Bitácora del monitor de pólizas (solo admin) — `registrar` nunca lanza.
+const audit = require('./poliza-audit.service');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
 const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza, CentroCosto, Terminal } = require('../../../shared/models/postgres');
 const { Op } = require('sequelize');
@@ -1084,6 +1086,9 @@ async function update(id, data, user) {
 
   const updated = await repo.update(id, data);
   if (!updated) throw new NotFoundError('Póliza');
+  await audit.registrar('editada', poliza, user, {
+    detalle: { campos: Object.keys(data || {}), movimientos: Array.isArray(data?.movimientos) ? data.movimientos.length : undefined },
+  });
   return updated;
 }
 
@@ -1116,6 +1121,9 @@ async function cancel(id, user, motivo) {
     motivoCancelacion:  motivo || null,
   });
   if (!result) throw new NotFoundError('Póliza');
+  await audit.registrar('cancelada', poliza, user, {
+    estadoAnterior: poliza.estado, estadoNuevo: 'cancelada', motivo: motivo || null,
+  });
 
   // Advertir si la póliza tenía movimientos de IVA PPD (IVA por cobrar/pagar).
   // Cancelar la póliza deja saldo fantasma en esa cuenta — se requiere asiento de reversa.
@@ -1473,6 +1481,10 @@ async function contabilizar(id, user) {
     contabilizadoPor: userLabel(user),
     contabilizadaAt:  new Date(),
   });
+  await audit.registrar('contabilizada', poliza, user, {
+    estadoAnterior: 'borrador', estadoNuevo: 'contabilizada',
+    detalle: actualizacionesCuenta.length ? { cuentasBancoResueltas: actualizacionesCuenta.length } : null,
+  });
   return updated;
 }
 
@@ -1497,6 +1509,9 @@ async function reemplazarCuenta(id, { cuentaPuenteId, cuentaDestinoId }, user) {
   if (!destino) throw new ValidationError('Cuenta destino no encontrada en el catálogo');
 
   const afectados = await repo.reemplazarCuentaEnPoliza(id, cuentaPuenteId, cuentaDestinoId);
+  await audit.registrar('cuenta_reemplazada', poliza, user, {
+    detalle: { cuentaPuenteId: Number(cuentaPuenteId), cuentaDestinoId: Number(cuentaDestinoId), cuentaDestino: destino.codigo, afectados },
+  });
   return { afectados, poliza: await repo.findByIdLight(id) };
 }
 
@@ -1517,6 +1532,10 @@ async function revertir(id, user, motivo, revertirCuentas = true) {
     revertidoPor:    userLabel(user),
     revertidaAt:     new Date(),
     motivoReversion: motivo || null,
+  });
+  await audit.registrar('revertida', poliza, user, {
+    estadoAnterior: 'contabilizada', estadoNuevo: 'borrador', motivo: motivo || null,
+    detalle: { revertirCuentas },
   });
   return updated;
 }
@@ -5784,6 +5803,9 @@ async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
     },
     { where: { id } },
   );
+  await audit.registrar('folio_contpaq', poliza, user, {
+    detalle: { folioContado: folioContado ?? null, folioCredito: folioCredito ?? null },
+  });
 
   return repo.findByIdLight(id);
 }

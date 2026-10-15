@@ -79,6 +79,21 @@ const PERM_META = {
   'entities:edit':      { label: 'Editar entidades fiscales',       module: 'Entidades' },
   'entities:message':   { label: 'Enviar alerta de credenciales SAT', module: 'Entidades' },
   'users:manage':       { label: 'Administrar usuarios y roles',    module: 'Administración' },
+  // Sistema de Lealtad — ver src/shared/config/rbac.js para el detalle de cada
+  // permiso. Nota (sistema-lealtad/design.md): estos permisos nuevos NO se
+  // sincronizan a roles ya existentes en Postgres (seedRbac solo hace
+  // bulkCreate con ON CONFLICT DO NOTHING sobre la tabla de permisos, y
+  // Role.update solo toca label/isSystem) — en un deploy sobre una base ya
+  // poblada, contabilidad/cobranza quedan con 403 hasta asignarlos a mano vía
+  // /users → Roles. En una base nueva (findOrCreate), los roles ya nacen con
+  // estos permisos porque rbac.js ya los declara en su arreglo `permissions`.
+  'loyalty:read':            { label: 'Ver tarjetas y movimientos de Lealtad', module: 'Lealtad' },
+  'loyalty:tarjetas:crear':  { label: 'Crear tarjetas de Lealtad',             module: 'Lealtad' },
+  'loyalty:tarjetas:editar': { label: 'Editar/desactivar tarjetas de Lealtad', module: 'Lealtad' },
+  'loyalty:movimientos':     { label: 'Registrar acumulación y canje',        module: 'Lealtad' },
+  'loyalty:ajustes':         { label: 'Crear ajustes discrecionales',         module: 'Lealtad' },
+  'loyalty:tarjetas:nivel':  { label: 'Cambiar nivel de una tarjeta',         module: 'Lealtad' },
+  'loyalty:config':          { label: 'Configurar % por nivel, motivos y sucursales', module: 'Lealtad' },
 };
 
 async function seedRbac() {

@@ -33,6 +33,10 @@ const notificacionRoutes      = require('./banks/domains/notificaciones/notifica
 const configRoutes            = require('./shared/routes/config.routes');
 const systemMonitorRoutes     = require('./system-monitor/system-monitor.routes');
 
+// Domain routers — Loyalty module (Sistema de Lealtad, PR4/8 sistema-lealtad)
+const loyaltyPublicRoutes     = require('./loyalty/loyalty-public.routes');
+const loyaltyRoutes           = require('./loyalty/loyalty.routes');
+
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
 const cfdiRoutes             = require('./visor/routes/cfdis');
@@ -156,6 +160,14 @@ app.use('/api/periodos-fiscales', periodosFiscalesRoutes);
 // Rutas ERP del módulo visor: carga/previsualización de facturas y enriquecimiento de pagos.
 app.use('/api/erp',               visorErpRoutes);
 app.use('/api/schedule',          scheduleRoutes);
+
+// Loyalty module (Sistema de Lealtad) — la rama pública va SIEMPRE antes que la
+// de staff (D9, design.md): ningún middleware de autenticación puede quedar
+// interpuesto por accidente delante del lookup anónimo. Ambas comparten el
+// limiter global `/api/` ya montado arriba; el router público además apila su
+// propio `express-rate-limit` dedicado (ver loyalty-public.routes.js).
+app.use('/api/loyalty/public',    loyaltyPublicRoutes);
+app.use('/api/loyalty',           loyaltyRoutes);
 
 // Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se
 // registra en producción, ni siquiera si TEST_AUTH_SECRET quedó puesta por error.

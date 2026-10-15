@@ -176,4 +176,17 @@ const Poliza = sequelize.define('Poliza', {
   ],
 });
 
+// Bitácora del monitor de pólizas (ver banks/domains/polizas/poliza-audit.service.js):
+// toda creación queda registrada, venga del generador que venga. Va aquí (y no en
+// el servicio) para que funcione aunque nadie haya cargado poliza.service.js antes.
+// require perezoso: el servicio importa este modelo. Con transacción se registra
+// al hacer commit, para no dejar filas de pólizas que nunca existieron.
+Poliza.addHook('afterCreate', 'polizaAuditCreada', (poliza, options) => {
+  const { registrar } = require('../../../banks/domains/polizas/poliza-audit.service');
+  const plain = poliza.get({ plain: true });
+  const run = () => registrar('creada', plain, plain.creadoPor || null, { estadoNuevo: plain.estado });
+  if (options?.transaction?.afterCommit) options.transaction.afterCommit(run);
+  else run();
+});
+
 module.exports = Poliza;

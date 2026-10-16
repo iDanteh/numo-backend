@@ -250,7 +250,7 @@ router.get('/:id/export-contpaq-compensaciones-intereses',
 
 // GET /api/polizas/:id/siguiente-folio-contpaq
 // Folio CONTPAQ sugerido por default según el rango de la sucursal (ver
-// `RANGO_FOLIO_CONTPAQ_POR_SUCURSAL` en poliza.service.js) — sigue siendo
+// `RANGOS_FOLIO_CONTPAQ_INGRESO` en poliza.service.js) — sigue siendo
 // editable en el formulario de export, esto solo calcula el valor inicial.
 router.get('/:id/siguiente-folio-contpaq',
   authenticate,

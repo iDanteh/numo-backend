@@ -97,6 +97,13 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.INTEGER,
     allowNull: true,
   },
+  // Folios CONTPAQi (201–299) de las pólizas de notas de crédito que exporta
+  // CEDIS aparte (Bonificaciones, Descuentos/Devoluciones) — ver
+  // `_aplicarFoliosContpaqIngreso` en poliza.service.js.
+  contpaqFoliosNc: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
   contpaqAsociadoPor: {
     type:      DataTypes.STRING(150),
     allowNull: true,

@@ -4061,6 +4061,15 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   let movimientos = poliza.movimientos ?? [];
 
+  // Folio CONTPAQi de Ingreso: nunca fuera del rango de la sucursal (ver
+  // RANGOS_FOLIO_CONTPAQ_INGRESO). Con la póliza completa, antes del filtro
+  // por sucursal de abajo.
+  const rangoContpaq = _rangoFolioContpaqIngreso(poliza);
+  if (rangoContpaq) {
+    _validarFolioEnRango(overrides.folioContado ?? null, rangoContpaq, 'de Contado');
+    _validarFolioEnRango(overrides.folioCredito ?? null, rangoContpaq, 'de Crédito');
+  }
+
   // Filtro opcional por sucursal (centro de costo). Cuando `centroCostoIds` viene
   // definido, sólo se exportan los movimientos de esas sucursales; de lo contrario
   // se exporta la póliza completa (todas las sucursales) como siempre.
@@ -4271,6 +4280,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
       concepto:  overrides.conceptoContado ?? poliza.concepto,
     }];
   }
+
+  if (rangoContpaq) await _aplicarFoliosContpaqIngreso(poliza, bloques, rangoContpaq, overrides);
 
   _inyectarCobrosSucursal(bloques, filasCobroSucursal, filasTarjetaCobroSucursal);
   if (poliza.tipo === 'I' && filasOtrosIngresos.length) {
@@ -4625,6 +4636,10 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       '0',
     ]);
     headerRow.getCell(2).numFmt = 'dd/mm/yyyy';
+    // Cobranza: folio con dos dígitos (01, 02… — pedido del usuario
+    // 2026-10-16). Solo formato de despliegue: el valor sigue numérico, como
+    // la fecha de arriba.
+    if (esPolizaCobranza(poliza)) headerRow.getCell(4).numFmt = '00';
     headerRow.eachCell({ includeEmpty: true }, (cell) => {
       cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF000000' } };
@@ -5591,38 +5606,175 @@ async function cancelarTodasCompensacionesIntereses({ rfc, polizaIds }, user, mo
   return { canceladas, errores, total: polizas.length };
 }
 
-// Base de numeración de folio CONTPAQ por sucursal (confirmado con el
-// usuario 2026-09-07, reemplaza cualquier convención anterior): cada
-// sucursal tiene su propio rango de 100 folios, y el conteo se reinicia
-// cada periodo/mes — la 1a póliza de Ingreso de Reforma en un mes es 501,
-// la 2a 502, etc. NUNCA se deriva de `poliza.numero` (consecutivo GLOBAL
-// compartido entre TODAS las sucursales para el mismo tipo/periodo, ver
-// `nextNumero` en poliza.repository.js — no tiene relación con el rango
-// esperado por sucursal). PROMOTORIA y LICITACION HIDALGO no tienen rango
-// asignado todavía — sin mapeo, `siguienteFolioContpaq` regresa `null` y el
-// caller cae al comportamiento anterior (folio manual / `poliza.numero`).
-const RANGO_FOLIO_CONTPAQ_POR_SUCURSAL = {
-  CEDIS:               100,
-  HIDALGO:             300,
-  CONSTRUCASA:         400,
-  REFORMA:             500,
-  ATZOMPA:             600,
-  FERROCARRIL:         700,
-  SIMBOLOS:            800,
-  TEHUANTEPEC:         900,
-  'SANTA ROSA':        1000,
-  VIGUERA:             1100,
-  'PUERTO ESCONDIDO':  1200,
-};
+// Folio CONTPAQi de las pólizas de INGRESO (tabla del usuario 2026-10-16,
+// "NUMERACION DE SUCURSALES PARA POLIZAS TIPO INGRESOS" — reemplaza la del
+// 2026-09-07): cada sucursal tiene su rango, arranca en X01, NUNCA sale de él
+// y se reinicia cada mes (ejercicio+periodo). PROMOTORIA comparte el de CEDIS
+// y LICITACION HIDALGO el de HIDALGO (confirmado el mismo día). Solo el folio
+// que va a CONTPAQi — `poliza.numero` de NUMO tiene su propio rango (ver
+// RANGOS_FOLIO_POR_SUCURSAL en cfdi-poliza-generator.service.js). Cobranza y
+// el resto de tipos no usan esta tabla.
+const RANGOS_FOLIO_CONTPAQ_INGRESO = [
+  { sucursales: ['CEDIS', 'PROMOTORIA'],           desde: 101,  hasta: 199 },
+  { sucursales: ['HIDALGO', 'LICITACION HIDALGO'], desde: 301,  hasta: 399 },
+  { sucursales: ['CONSTRUCASA'],                   desde: 401,  hasta: 499 },
+  { sucursales: ['REFORMA'],                       desde: 501,  hasta: 599 },
+  { sucursales: ['ATZOMPA'],                       desde: 601,  hasta: 699 },
+  { sucursales: ['FERROCARRIL'],                   desde: 701,  hasta: 799 },
+  { sucursales: ['SIMBOLOS'],                      desde: 801,  hasta: 899 },
+  { sucursales: ['TEHUANTEPEC'],                   desde: 901,  hasta: 999 },
+  { sucursales: ['SANTA ROSA'],                    desde: 1001, hasta: 1099 },
+  { sucursales: ['VIGUERA'],                       desde: 1101, hasta: 1199 },
+  { sucursales: ['PUERTO ESCONDIDO'],              desde: 1201, hasta: 1299 },
+];
+// Notas de crédito (BON/DEV/CAC): las pólizas propias de Bonificaciones y
+// Descuentos/Devoluciones que exporta CEDIS (ver rama `esCedis` de
+// exportContpaqXlsx). Las demás sucursales llevan sus NC dentro de su póliza.
+const RANGO_FOLIO_CONTPAQ_NC = { desde: 201, hasta: 299 };
+
+// Sucursal de la póliza = la de la MAYORÍA de sus renglones (mismo criterio
+// que `esCedis` en exportContpaqXlsx): un renglón suelto de otra sucursal
+// (cobro cruzado) no debe cambiarle el rango.
+function _sucursalMayoritaria(movimientos) {
+  const conteo = new Map();
+  for (const m of movimientos ?? []) {
+    const suc = (m.centroCostoObj?.sucursal || '').trim().toUpperCase();
+    if (suc) conteo.set(suc, (conteo.get(suc) ?? 0) + 1);
+  }
+  let mejor = null;
+  for (const [suc, n] of conteo) if (!mejor || n > mejor.n) mejor = { suc, n };
+  return mejor?.suc ?? null;
+}
+
+function _rangoFolioContpaqIngreso(poliza) {
+  if (poliza?.tipo !== 'I') return null;
+  const suc = _sucursalMayoritaria(poliza.movimientos);
+  return RANGOS_FOLIO_CONTPAQ_INGRESO.find(r => r.sucursales.includes(suc)) ?? null;
+}
+
+const _enRango = (f, rango) => Number.isInteger(f) && f >= rango.desde && f <= rango.hasta;
+
+// Folios CONTPAQi ya usados dentro de `rango` por las demás pólizas de
+// Ingreso vigentes del mismo mes. Se filtra por el NÚMERO (cada rango es de
+// una sola sucursal), no por los centros de costo de sus renglones: antes
+// una póliza con renglones de varias sucursales "contagiaba" su folio a las
+// otras (caso real oct-2026: Reforma/Construcasa/Santa Rosa en 1113–1119,
+// dentro del rango de Viguera). Si otra póliza POSTERIOR (id mayor) repite
+// un folio de esta, el folio se queda con esta (la primera que lo tuvo) y
+// es la otra la que cambia al re-exportarse.
+async function _foliosContpaqOcupados(poliza, rango) {
+  const otras = await Poliza.findAll({
+    where: {
+      tipo: 'I', rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo,
+      estado: { [Op.ne]: 'cancelada' }, id: { [Op.ne]: poliza.id },
+    },
+    attributes: ['id', 'contpaqFolioContado', 'contpaqFolioCredito', 'contpaqFoliosNc'],
+    raw: true,
+  });
+  const foliosDe = p => [p.contpaqFolioContado, p.contpaqFolioCredito, ...(Array.isArray(p.contpaqFoliosNc) ? p.contpaqFoliosNc : [])];
+  const propios = new Set(foliosDe(poliza));
+  const ocupados = new Set();
+  for (const p of otras) {
+    for (const f of foliosDe(p)) {
+      if (!_enRango(f, rango)) continue;
+      if (propios.has(f) && p.id > poliza.id) continue;
+      ocupados.add(f);
+    }
+  }
+  return ocupados;
+}
+
+// `n` folios SEGUIDOS para esta póliza (Contado 101 → Crédito 102, pedido
+// del usuario 2026-10-16). Los que ya tiene (re-export) se conservan si
+// siguen en el rango, seguidos y libres; si no, el primer bloque libre desde
+// el inicio del rango — el folio de una póliza cancelada se reutiliza aunque
+// quede en medio (antes solo se liberaba el del tope).
+function _asignarFolios(propios, ocupados, rango, n, etiqueta = '') {
+  if (n <= 0) return [];
+  const bloqueLibre = inicio => {
+    const bloque = Array.from({ length: n }, (_, i) => inicio + i);
+    return bloque.every(f => _enRango(f, rango) && !ocupados.has(f)) ? bloque : null;
+  };
+  if (propios[0] != null) {
+    const propio = bloqueLibre(propios[0]);
+    if (propio) return propio;
+  }
+  for (let f = rango.desde; f + n - 1 <= rango.hasta; f++) {
+    const bloque = bloqueLibre(f);
+    if (bloque) return bloque;
+  }
+  throw new ValidationError(`Se agotó el rango de folios CONTPAQi${etiqueta} (${rango.desde}–${rango.hasta}) para este mes.`);
+}
+
+// Contado 101 → Crédito 102: el de Crédito siempre es el que sigue.
+function _validarCreditoConsecutivo(folioContado, folioCredito) {
+  if (folioContado != null && folioCredito != null && folioCredito !== folioContado + 1) {
+    throw new ValidationError(`El folio CONTPAQi de Crédito debe ser el consecutivo del de Contado (${folioContado} → ${folioContado + 1}), no ${folioCredito}.`);
+  }
+}
+
+// Mismo criterio que exportContpaqXlsx: Contado = todo lo que no es PPD.
+function _esIngresoMixto(poliza) {
+  const movs = poliza.movimientos ?? [];
+  return movs.some(m => m.metodoPago === 'PPD') && movs.some(m => m.metodoPago !== 'PPD');
+}
+
+function _validarFolioEnRango(folio, rango, campo) {
+  if (folio == null) return;
+  if (!_enRango(folio, rango)) {
+    throw new ValidationError(`El folio CONTPAQi ${campo} ${folio} está fuera del rango de la sucursal (${rango.desde}–${rango.hasta}).`);
+  }
+}
+
+// Pone el folio CONTPAQi a cada bloque del export de una póliza de Ingreso:
+// Contado/Crédito en el rango de la sucursal (el del formulario si vino, si
+// no el que toca — así el ZIP multi-póliza, que no manda folios, tampoco sale
+// del rango) y las NC de CEDIS en 201–299. Se guardan en la póliza para que
+// la siguiente exportación del mes continúe después de ellos; con export
+// parcial (`centroCostoIds`) no se guardan, porque no son todos los bloques.
+async function _aplicarFoliosContpaqIngreso(poliza, bloques, rango, overrides) {
+  const esVentas = b => b.tipoVenta == null || b.tipoVenta === 'Contado' || b.tipoVenta === 'Credito';
+  const ventas = bloques.filter(esVentas);
+  const nc     = bloques.filter(b => !esVentas(b));
+
+  let foliosVentas;
+  if (overrides.folioContado != null) {
+    _validarCreditoConsecutivo(overrides.folioContado, overrides.folioCredito ?? null);
+    foliosVentas = [overrides.folioContado, overrides.folioContado + 1].slice(0, ventas.length);
+    foliosVentas.forEach(f => _validarFolioEnRango(f, rango, ''));
+  } else {
+    const ocupados = await _foliosContpaqOcupados(poliza, rango);
+    const propios  = [poliza.contpaqFolioContado, poliza.contpaqFolioCredito].filter(f => f != null);
+    foliosVentas = _asignarFolios(propios, ocupados, rango, ventas.length);
+  }
+  ventas.forEach((b, i) => { b.folio = foliosVentas[i]; });
+
+  let foliosNc = [];
+  if (nc.length) {
+    const ocupadosNc = await _foliosContpaqOcupados(poliza, RANGO_FOLIO_CONTPAQ_NC);
+    const propiosNc  = Array.isArray(poliza.contpaqFoliosNc) ? poliza.contpaqFoliosNc : [];
+    foliosNc = _asignarFolios(propiosNc, ocupadosNc, RANGO_FOLIO_CONTPAQ_NC, nc.length, ' de notas de crédito');
+    nc.forEach((b, i) => { b.folio = foliosNc[i]; });
+  }
+
+  if (poliza.estado === 'cancelada' || overrides.centroCostoIds?.length) return;
+  const cambios = {
+    contpaqFolioContado: foliosVentas[0] ?? null,
+    contpaqFolioCredito: foliosVentas[1] ?? null,
+    contpaqFoliosNc:     foliosNc.length ? foliosNc : null,
+  };
+  const igual = cambios.contpaqFolioContado === (poliza.contpaqFolioContado ?? null)
+    && cambios.contpaqFolioCredito === (poliza.contpaqFolioCredito ?? null)
+    && JSON.stringify(cambios.contpaqFoliosNc) === JSON.stringify(poliza.contpaqFoliosNc ?? null);
+  if (!igual) await Poliza.update(cambios, { where: { id: poliza.id } });
+}
 
 /**
- * Calcula el siguiente folio CONTPAQ sugerido para esta póliza, según la
- * sucursal de sus movimientos (ver `RANGO_FOLIO_CONTPAQ_POR_SUCURSAL`) — solo
- * el valor por DEFAULT que ve el usuario al abrir el formulario de export
- * (`abrirExportContpaqForm` en poliza-list.component.ts); sigue siendo
- * editable antes de exportar, igual que hoy. Si la sucursal no tiene rango
- * asignado, regresa `{ folioContado: null, folioCredito: null }` (el caller
- * cae al comportamiento anterior).
+ * Folio CONTPAQ sugerido para esta póliza — el valor que usa el export de la
+ * pantalla de pólizas (`abrirExportContpaqForm` en poliza-list.component.ts).
+ * Solo Ingreso (ver `RANGOS_FOLIO_CONTPAQ_INGRESO`) y Cobranza; cualquier
+ * otro tipo, o una sucursal sin rango, regresa nulls (el caller cae al
+ * comportamiento anterior).
  */
 async function siguienteFolioContpaq(id) {
   const poliza = await repo.findByIdLight(id);
@@ -5634,53 +5786,25 @@ async function siguienteFolioContpaq(id) {
     return { folioContado: poliza.numero ?? null, folioCredito: null };
   }
 
-  const movimiento = await PolizaMovimiento.findOne({
-    where:      { polizaId: id },
-    attributes: ['id', 'centroCostoId'],
-    include:    [{ model: CentroCosto, as: 'centroCostoObj', attributes: ['id', 'sucursal'] }],
-  });
-  const sucursal = (movimiento?.centroCostoObj?.sucursal || '').toUpperCase().trim();
-  const rangoBase = RANGO_FOLIO_CONTPAQ_POR_SUCURSAL[sucursal];
-  if (!rangoBase || !movimiento?.centroCostoObj?.id) {
-    return { folioContado: null, folioCredito: null };
-  }
+  const rango = _rangoFolioContpaqIngreso(poliza);
+  if (!rango) return { folioContado: null, folioCredito: null };
 
-  // Todas las pólizas de la MISMA sucursal+tipo+rfc+ejercicio+periodo — el
-  // folio más alto ya asignado (Contado o Crédito) determina el siguiente;
-  // sin ninguna asignada todavía este periodo, se arranca en `rangoBase + 1`.
-  // `include`+`where` en la tabla asociada produce un JOIN — una póliza con
-  // varios movimientos del mismo centro puede repetirse en el resultado, pero
-  // solo importa el MAX, así que los duplicados son inofensivos (no hace
-  // falta GROUP BY).
-  // Excluye 'cancelada' (confirmado con el usuario 2026-09-10): al cancelar
-  // la póliza más reciente de un folio, ese número queda libre — la
-  // siguiente póliza debe volver a sugerirlo en vez de saltárselo. Solo
-  // "libera" folios que quedaron al tope (si 1204/1205 ya existen vigentes y
-  // se cancela 1203, el máximo sigue siendo 1205 → siguiente 1206, 1203
-  // sigue siendo un hueco intermedio).
-  const polizasDelPeriodo = await Poliza.findAll({
-    where:      { tipo: poliza.tipo, rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo, estado: { [Op.ne]: 'cancelada' } },
-    attributes: ['id', 'contpaqFolioContado', 'contpaqFolioCredito'],
-    include:    [{
-      model:      PolizaMovimiento,
-      as:         'movimientos',
-      attributes: [],
-      where:      { centroCostoId: movimiento.centroCostoObj.id },
-      required:   true,
-    }],
-  });
-  let maxFolio = 0;
-  for (const p of polizasDelPeriodo) {
-    if (p.contpaqFolioContado != null) maxFolio = Math.max(maxFolio, p.contpaqFolioContado);
-    if (p.contpaqFolioCredito != null) maxFolio = Math.max(maxFolio, p.contpaqFolioCredito);
-  }
-  const folioContado = maxFolio > 0 ? maxFolio + 1 : rangoBase + 1;
-  return { folioContado, folioCredito: folioContado + 1 };
+  const ocupados = await _foliosContpaqOcupados(poliza, rango);
+  const propios  = [poliza.contpaqFolioContado, poliza.contpaqFolioCredito].filter(f => f != null);
+  const folios   = _asignarFolios(propios, ocupados, rango, _esIngresoMixto(poliza) ? 2 : 1);
+  return { folioContado: folios[0], folioCredito: folios[1] ?? null };
 }
 
 async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
+
+  const rango = _rangoFolioContpaqIngreso(poliza);
+  if (rango) {
+    _validarFolioEnRango(folioContado ?? null, rango, 'de Contado');
+    _validarFolioEnRango(folioCredito ?? null, rango, 'de Crédito');
+    _validarCreditoConsecutivo(folioContado ?? null, folioCredito ?? null);
+  }
 
   await Poliza.update(
     {

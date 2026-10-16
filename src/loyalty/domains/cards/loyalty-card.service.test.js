@@ -108,6 +108,34 @@ describe('crearTarjeta', () => {
       cardService.crearTarjeta({ telefono: '5512345678', nombre: 'Juan Pérez' }, USER),
     ).rejects.toMatchObject({ statusCode: 409 });
   });
+
+  // PR8 (migración): crearTarjeta se reutiliza dentro de la transacción única del
+  // script de migración (design.md "Apply. One Postgres transaction for all ok rows") —
+  // necesita poder recibir y propagar esa transacción externa a findOne/create en vez
+  // de abrir su propio connection slot implícito, igual que cambiarNivel ya hace con su
+  // propia transacción interna.
+  test('con transaction explícito (3er argumento), la propaga a findOne y create', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+    const fakeT = { fake: true };
+
+    await cardService.crearTarjeta(
+      { telefono: '5512345678', nombre: 'Juan Pérez' },
+      USER,
+      { transaction: fakeT },
+    );
+
+    expect(LoyaltyCard.findOne).toHaveBeenCalledWith({ where: { telefono: '5512345678' }, transaction: fakeT });
+    expect(LoyaltyCard.create).toHaveBeenCalledWith(expect.objectContaining({ telefono: '5512345678' }), { transaction: fakeT });
+  });
+
+  test('sin transaction explícito, el llamado a rutas existente sigue invocando findOne/create con un solo argumento', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await cardService.crearTarjeta({ telefono: '5512345678', nombre: 'Juan Pérez' }, USER);
+
+    expect(LoyaltyCard.findOne.mock.calls[0]).toHaveLength(1);
+    expect(LoyaltyCard.create.mock.calls[0]).toHaveLength(1);
+  });
 });
 
 describe('editarTarjeta', () => {

@@ -34,7 +34,7 @@ function _esDuplicadoUnico(err) {
  * validar unicidad — rechaza duplicados contra tarjetas activas E inactivas
  * (un teléfono inactivo sigue siendo "la misma persona" para el programa).
  */
-async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user) {
+async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user, { transaction } = {}) {
   const telefonoNorm = normalizarTelefono(telefono);
   const nombreTrim = String(nombre ?? '').trim();
   if (!nombreTrim) {
@@ -44,7 +44,13 @@ async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user) {
     throw new BadRequestError(`nivel inválido: "${nivel}".`);
   }
 
-  const existente = await LoyaltyCard.findOne({ where: { telefono: telefonoNorm } });
+  // `transaction` es opcional (PR8: el script de migración reutiliza este servicio dentro
+  // de UNA sola transacción para todo el lote, design.md "Apply. One Postgres transaction
+  // for all ok rows"). Se pasa condicionalmente (nunca como `undefined` explícito) para no
+  // alterar la cantidad de argumentos de las llamadas existentes desde las rutas (PR4).
+  const existente = transaction
+    ? await LoyaltyCard.findOne({ where: { telefono: telefonoNorm }, transaction })
+    : await LoyaltyCard.findOne({ where: { telefono: telefonoNorm } });
   if (existente) {
     throw new ConflictError('Ya existe una tarjeta registrada con ese teléfono.');
   }
@@ -53,18 +59,22 @@ async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user) {
   const nipHash = await hashNip(nip);
   const { usuarioId, usuarioNombre } = _userLabel(user);
 
+  const datosCard = {
+    telefono: telefonoNorm,
+    nombre:   nombreTrim,
+    nivel,
+    nipHash,
+    saldoPuntos: 0,
+    activa: true,
+    createdById:     usuarioId,
+    createdByNombre: usuarioNombre,
+  };
+
   let card;
   try {
-    card = await LoyaltyCard.create({
-      telefono: telefonoNorm,
-      nombre:   nombreTrim,
-      nivel,
-      nipHash,
-      saldoPuntos: 0,
-      activa: true,
-      createdById:     usuarioId,
-      createdByNombre: usuarioNombre,
-    });
+    card = transaction
+      ? await LoyaltyCard.create(datosCard, { transaction })
+      : await LoyaltyCard.create(datosCard);
   } catch (err) {
     if (_esDuplicadoUnico(err)) {
       throw new ConflictError('Ya existe una tarjeta registrada con ese teléfono.');

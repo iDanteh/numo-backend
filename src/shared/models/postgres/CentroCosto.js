@@ -38,6 +38,18 @@ const CentroCosto = sequelize.define('CentroCosto', {
     type:         DataTypes.BOOLEAN,
     defaultValue: true,
   },
+  participaLealtad: {
+    type:         DataTypes.BOOLEAN,
+    allowNull:    false,
+    defaultValue: true,
+    comment:      'Sistema de Lealtad: si esta sucursal acumula puntos en sus ventas (independiente de permiteCanjeLealtad)',
+  },
+  permiteCanjeLealtad: {
+    type:         DataTypes.BOOLEAN,
+    allowNull:    false,
+    defaultValue: true,
+    comment:      'Sistema de Lealtad: si esta sucursal permite canjear puntos (independiente de participaLealtad)',
+  },
 }, {
   tableName:   'centros_costo',
   underscored: true,

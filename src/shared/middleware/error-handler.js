@@ -85,6 +85,11 @@ const errorHandler = (err, req, res, next) => { // eslint-disable-line no-unused
 
   const body = { error: message };
   if (err.errors) body.errors = err.errors;
+  // Código de negocio opcional (ej. LOYALTY_LOOKUP_FAILED) — mismo criterio que
+  // los `code:` ya devueltos a mano en otros controllers (erp.controller.js,
+  // cfdi.controller.js), pero centralizado acá para errores que ya pasan por
+  // asyncHandler + este handler, sin necesitar un catch propio en la ruta.
+  if (err.code) body.code = err.code;
 
   res.status(status).json(body);
 };

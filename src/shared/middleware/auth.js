@@ -23,7 +23,6 @@
 const { auth }    = require('express-oauth2-jwt-bearer');
 const jwt         = require('jsonwebtoken');
 const config      = require('../../config/env');
-const userSvc     = require('../../banks/domains/users/user.service');
 const rbacStore   = require('../services/rbac-store');
 const { logger }  = require('../utils/logger');
 
@@ -51,6 +50,15 @@ if (TEST_AUTH_ENABLED) {
  * de pruebas) consultando/creando el usuario correspondiente en PostgreSQL.
  */
 async function resolveUser(payload, req, res, next) {
+  // Require perezoso: socket.js → auth.js → user.service.js → socket.js
+  // formaba un ciclo de módulos CommonJS (socket.js se carga primero en
+  // app.js). Si user.service se requería acá arriba, a mitad del ciclo
+  // `require('../../shared/socket')` en user.service.js devolvía el
+  // `module.exports` todavía vacío de socket.js, y `getIo` quedaba
+  // `undefined` para siempre dentro de user.service.js (bug real
+  // 2026-10-16: "TypeError: getIo is not a function"). Requerirlo acá
+  // adentro, en vez de al tope del archivo, rompe el ciclo.
+  const userSvc = require('../../banks/domains/users/user.service');
   try {
     const userDoc = await userSvc.findOrCreate({
       auth0Sub: payload.sub,

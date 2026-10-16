@@ -2,6 +2,8 @@
 
 const ExcelJS = require('exceljs');
 const repo = require('./repositories/poliza.repository');
+// Bitácora del monitor de pólizas (solo admin) — `registrar` nunca lanza.
+const audit = require('./poliza-audit.service');
 const { NotFoundError, BadRequestError: ValidationError, ForbiddenError } = require('../../shared/errors/AppError');
 const { AccountPlan, CfdiMappingRule, PolizaMovimiento, Poliza, CentroCosto, Terminal } = require('../../../shared/models/postgres');
 const { Op } = require('sequelize');
@@ -178,6 +180,11 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
   });
   const cuentaPorCodigo = new Map(cuentasBancoRows.map(r => [r.codigo, { id: r.id, codigo: r.codigo, nombre: r.nombre }]));
 
+  // Todos los depósitos ligados a cada uuid (no solo el elegido) — Cobranza los
+  // reparte por monto cuando una misma factura se pagó con 2+ transferencias
+  // (ver `_depositoPorMonto` en anotarCargosPorFacturaSinAgrupar).
+  const todosPorUuid = new Map();
+
   for (const m of movs) {
     const cat = (m.categoria || '').toUpperCase();
     const esTransferencia = CATEGORIAS_TRANSFERENCIA_BANCO.some(c => cat.includes(c));
@@ -239,7 +246,19 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
       // serie-folio (el folio del Pago puede coincidir con otra factura).
       const esDepositoEfectivoKore = uuidsSet.has(folioFiscalUpper) && (link.desglosePorFormaPago ?? [])
         .some(d => /DEPOSITO.*EFECTIVO/.test(String(d.formaPagoDescripcion ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()));
-      const candidato = { esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, esDepositoEfectivoKore, _distanciaDias: distanciaDias };
+      const candidato = {
+        esTransferencia, referencia, categoriaConocida, cuentaBanco, numeroAutorizacion, montoBancoReal, esDepositoEfectivoKore,
+        _distanciaDias: distanciaDias,
+        _idDeposito: String(m._id ?? ''),
+        // Facturas que paga este depósito (ligas ERP) — Cobranza solo ajusta
+        // centavos contra el depósito cuando paga una sola.
+        _facturasDeposito: (m.erpLinks ?? []).length,
+        // Lo que este depósito aplicó a ESTA factura (CxC vinculada) — una
+        // factura pagada con porciones de varios depósitos se reparte por aquí.
+        _montoAplicado: typeof link.saldoPagado === 'number' ? link.saldoPagado : null,
+      };
+      if (!todosPorUuid.has(uuidResuelto)) todosPorUuid.set(uuidResuelto, new Map());
+      todosPorUuid.get(uuidResuelto).set(candidato._idDeposito, { ...candidato });
       const actual = mapa.get(uuidResuelto);
       if (!actual) {
         mapa.set(uuidResuelto, candidato);
@@ -267,6 +286,11 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
         mapa.set(uuidResuelto, candidato);
       }
     }
+  }
+  // Copias planas (sin `_candidatos` propio) para no crear una referencia circular.
+  for (const [uuid, elegido] of mapa) {
+    const todos = [...(todosPorUuid.get(uuid)?.values() ?? [])];
+    if (todos.length > 1) elegido._candidatos = todos;
   }
   return mapa;
 }
@@ -974,6 +998,13 @@ function _elegirBancoRealMultiple(candidatos, monto) {
 const TIPO_POL_MAP = { I: '1', E: '2' };
 const tipoPolContpaq = (tipo) => TIPO_POL_MAP[tipo] ?? '3';
 
+// Póliza de Cobranza (tipo 'D' interno, concepto de `_construirConceptoCobranza`):
+// en CONTPAQi va como Ingreso (columna C = 1) y su folio es el contador propio
+// 01–99 (confirmado con el usuario 2026-10-13). Otras 'D' (Cierre IVA) siguen
+// como Diario.
+const esPolizaCobranza = (poliza) => poliza?.tipo === 'D' && /^Ingresos por Cobranza/.test(poliza.concepto || '');
+const tipoPolExport = (poliza) => (esPolizaCobranza(poliza) ? '1' : tipoPolContpaq(poliza.tipo));
+
 function userLabel(user) {
   return user?.nombre || user?.email || String(user?.dbId ?? 'sistema');
 }
@@ -1055,6 +1086,9 @@ async function update(id, data, user) {
 
   const updated = await repo.update(id, data);
   if (!updated) throw new NotFoundError('Póliza');
+  await audit.registrar('editada', poliza, user, {
+    detalle: { campos: Object.keys(data || {}), movimientos: Array.isArray(data?.movimientos) ? data.movimientos.length : undefined },
+  });
   return updated;
 }
 
@@ -1087,6 +1121,9 @@ async function cancel(id, user, motivo) {
     motivoCancelacion:  motivo || null,
   });
   if (!result) throw new NotFoundError('Póliza');
+  await audit.registrar('cancelada', poliza, user, {
+    estadoAnterior: poliza.estado, estadoNuevo: 'cancelada', motivo: motivo || null,
+  });
 
   // Advertir si la póliza tenía movimientos de IVA PPD (IVA por cobrar/pagar).
   // Cancelar la póliza deja saldo fantasma en esa cuenta — se requiere asiento de reversa.
@@ -1444,6 +1481,10 @@ async function contabilizar(id, user) {
     contabilizadoPor: userLabel(user),
     contabilizadaAt:  new Date(),
   });
+  await audit.registrar('contabilizada', poliza, user, {
+    estadoAnterior: 'borrador', estadoNuevo: 'contabilizada',
+    detalle: actualizacionesCuenta.length ? { cuentasBancoResueltas: actualizacionesCuenta.length } : null,
+  });
   return updated;
 }
 
@@ -1468,6 +1509,9 @@ async function reemplazarCuenta(id, { cuentaPuenteId, cuentaDestinoId }, user) {
   if (!destino) throw new ValidationError('Cuenta destino no encontrada en el catálogo');
 
   const afectados = await repo.reemplazarCuentaEnPoliza(id, cuentaPuenteId, cuentaDestinoId);
+  await audit.registrar('cuenta_reemplazada', poliza, user, {
+    detalle: { cuentaPuenteId: Number(cuentaPuenteId), cuentaDestinoId: Number(cuentaDestinoId), cuentaDestino: destino.codigo, afectados },
+  });
   return { afectados, poliza: await repo.findByIdLight(id) };
 }
 
@@ -1488,6 +1532,10 @@ async function revertir(id, user, motivo, revertirCuentas = true) {
     revertidoPor:    userLabel(user),
     revertidaAt:     new Date(),
     motivoReversion: motivo || null,
+  });
+  await audit.registrar('revertida', poliza, user, {
+    estadoAnterior: 'contabilizada', estadoNuevo: 'borrador', motivo: motivo || null,
+    detalle: { revertirCuentas },
   });
   return updated;
 }
@@ -1742,6 +1790,27 @@ const esDevolucionOCancelacion = (m) =>
 const esBonificacionGenerica = (m) =>
   /bonificaci[oó]n/i.test(m.tipoOrigen || '') || /bonificaci[oó]n/i.test(m.concepto || '');
 
+// Categoría por el marcador del ajuste en el concepto de una NC (tipo E):
+// "BCT", "BON-314117", "IVA - DEV-058354"… Desde 2026-10-13 una NC SAT
+// completa lleva en el concepto el marcador del ERP (ver
+// `documentosRelacionadosConcepto` en cfdi-mapping.service.js) en vez de la
+// descripción del producto, y sin `tipoOrigen` propio — sin esto el export ya
+// no la reconocía como Club Tuberos/Bonificación/Devolución (casos reales 12-oct
+// Puerto O0-261000319 y Ferrocarril F0-261000208: sus Cargos Bonificación+IVA
+// desaparecían del Excel). Solo NC: las líneas de SF usado también llevan
+// "DEV-…"/"CAC-…" como origen y no son un ajuste.
+const MARCADORES_CATEGORIA_NC = {
+  BCT: 'clubTuberos',
+  BON: 'bonificacion', BEP: 'bonificacion', BXC: 'bonificacion', BN: 'bonificacion',
+  DEV: 'devolucion', DVE: 'devolucion', CAC: 'devolucion', CANCELACION: 'devolucion', ANN: 'devolucion', CES: 'devolucion',
+};
+function categoriaPorMarcadorNC(m) {
+  if (m.tipoComprobante !== 'E') return null;
+  const nucleo = String(m.concepto || '').replace(/^IVA[^-]*-\s*/i, '').trim();
+  const serie = /^([A-Z]+)(?:-\d*)?(?:\s*\(0%\))?$/i.exec(nucleo)?.[1]?.toUpperCase();
+  return (serie && MARCADORES_CATEGORIA_NC[serie]) || null;
+}
+
 // Colores fijos por categoría en el export a CONTPAQi (confirmado con el
 // usuario) — reemplazan el alternado blanco/gris por factura para que cada
 // bloque (Devolución, Descuento, Bonificación, Club Tuberos, Anticipo) se
@@ -1768,10 +1837,11 @@ const ETIQUETA_CATEGORIA = {
  * (venta de contado real), se consolida como siempre.
  */
 function categorizarAjusteContado(m) {
-  if (m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto)) return 'clubTuberos';
+  const porMarcador = categoriaPorMarcadorNC(m);
+  if (m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto) || porMarcador === 'clubTuberos') return 'clubTuberos';
   if (esVentaConDescuento(m.reglaNombre)) return 'descuento';
-  if (esDevolucionOCancelacion(m)) return 'devolucion';
-  if (esBonificacionGenerica(m)) return 'bonificacion';
+  if (esDevolucionOCancelacion(m) || porMarcador === 'devolucion') return 'devolucion';
+  if (esBonificacionGenerica(m) || porMarcador === 'bonificacion') return 'bonificacion';
   // OPA (ver `REGLAS_MEZCLADAS_CON_VENTAS`): mismo tratamiento de categoría
   // que `esReglaAnticipo` (se mezcla con Ventas normales por folio), pero con
   // `reglaNombre` propio en vez del nombre de la regla, para poder distinguir
@@ -1856,7 +1926,102 @@ function categorizarAjusteContado(m) {
  * original. Los Abono (haber>0) y la reclasificación de IVA de cada factura
  * tampoco se tocan — se dejan intercalados como ya vienen.
  */
+/**
+ * Cobranza — cobros de meses anteriores (NI): junta en un solo subtotal
+ * (2103030001) y un solo IVA (2104010002) todas las ventas pagadas con el
+ * MISMO depósito, como en la póliza manual de Kore (2026-10-13, caso real
+ * MINI ABASTOS dep 046486: B0-260803365 $491.35 + B0-260803238 $573.64 +
+ * B0-260803492 $6,345.52 salían en 3 pares de líneas). Concepto "Cliente /
+ * venta / venta…". Lo que no es NI o no tiene depósito identificado se deja igual.
+ */
+function agruparNoIdentificadosPorDeposito(lineas) {
+  const salida = [];
+  const grupos = new Map();
+  for (const m of lineas) {
+    if (m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO || !m._depositoNI) {
+      if ('_depositoNI' in m) {
+        const { _depositoNI, ...resto } = m;
+        salida.push(resto);
+      } else {
+        salida.push(m);
+      }
+      continue;
+    }
+    const key = `${m._depositoNI}|${m.cuenta?.codigo}|${m.centroCosto}`;
+    const existente = grupos.get(key);
+    const [cliente, ...ventas] = (m.concepto || '').split(' / ');
+    if (!existente) {
+      const { _depositoNI, ...resto } = m;
+      const grupo = { ...resto, _cliente: cliente, _ventas: [...ventas] };
+      grupos.set(key, grupo);
+      salida.push(grupo);
+    } else {
+      existente.debe = Math.round((Number(existente.debe) + Number(m.debe)) * 100) / 100;
+      existente.haber = Math.round((Number(existente.haber) + Number(m.haber)) * 100) / 100;
+      existente.cfdiUuid = null;
+      for (const v of ventas) if (v && !existente._ventas.includes(v)) existente._ventas.push(v);
+    }
+  }
+  return salida.map(m => {
+    if (!('_ventas' in m)) return m;
+    const { _cliente, _ventas, ...resto } = m;
+    return { ...resto, concepto: [_cliente, ..._ventas].filter(Boolean).join(' / ') };
+  });
+}
+
+// Diferencia máxima entre el depósito y el cobro que se trata como "centavos"
+// (redondeo del complemento) en Cobranza — más que esto es otro depósito.
+const TOLERANCIA_CENTAVOS_DEPOSITO = 0.10;
+
 function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBancaria, nombresClientes = null) {
+  // Factura pagada con 2+ depósitos (caso real HERRAMIENTAS CANANEA
+  // A0-260907729, 7-oct: $4,062.26 dep 51168 + $4,000 dep 5416): cada Cargo
+  // toma el depósito de SU monto, sin repetir — antes ambos tomaban el único
+  // depósito guardado por factura y se fusionaban en un solo banco de $8,062.26.
+  // Sin depósito de ese monto se queda el de siempre.
+  // Primero por lo que cada depósito aplicó a la factura (CxC vinculada en
+  // Bancos): caso real 8-oct ALDARA ITZEL SANTIAGO JARQUIN A0-260900892,
+  // $1,123.28 en dep 051243 y $739.64 en dep 050674 — ambos cobros tomaban
+  // 051243 ($7,764.94 en vez de $7,025.30) y 050674 quedaba en $3,210.36 en
+  // vez de $3,950. Mismo caso AIRAM CECILIA FERNANDEZ VASQUEZ (050310, 051427,
+  // 051633). Luego por el monto total del depósito.
+  const depositosUsados = new Set();
+  const _depositoPorMonto = (base, llave, monto) => {
+    if (!base?._candidatos) return base;
+    const libresTodos = base._candidatos.filter(c => !depositosUsados.has(`${llave}|${c._idDeposito}`));
+    const porAplicado = libresTodos.find(c => c._montoAplicado != null && Math.abs(c._montoAplicado - monto) < 0.005);
+    if (porAplicado) {
+      depositosUsados.add(`${llave}|${porAplicado._idDeposito}`);
+      return porAplicado;
+    }
+    const libres = libresTodos.filter(c => c.montoBancoReal != null);
+    const elegido = libres.find(c => Math.abs(c.montoBancoReal - monto) < 0.005)
+      ?? libres
+        .filter(c => Math.abs(c.montoBancoReal - monto) <= TOLERANCIA_CENTAVOS_DEPOSITO)
+        .sort((a, b) => Math.abs(a.montoBancoReal - monto) - Math.abs(b.montoBancoReal - monto))[0];
+    if (!elegido) return base;
+    depositosUsados.add(`${llave}|${elegido._idDeposito}`);
+    return elegido;
+  };
+  // Cargo bancario llevado al monto exacto del depósito (centavos) → su Abono a
+  // Clientes se ajusta igual para que la factura cuadre (ver abajo).
+  const ajustesCentavos = [];
+
+  // Cobro NI (mes anterior) de una factura pagada con 2+ transferencias: cada
+  // complemento toma el depósito de SU monto (subtotal + IVA NI), igual que los
+  // bancos de arriba (2026-10-14, caso real AUTOOBRA A0-260904617, Cobranza
+  // 13-oct: $429.99 dep 048657 + $195.37 dep 050112 — ambos tomaban 050112 y
+  // se juntaban en un solo NI de $625.36). Subtotal e IVA del mismo cobro
+  // comparten el depósito elegido.
+  const llaveCobroNI = m => `${(m.facturaUuid || m.cfdiUuid || '').toUpperCase()}|${(m.cfdiUuid || '').toUpperCase()}`;
+  const totalNIPorCobro = new Map();
+  for (const m of movs) {
+    if (m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO || !(Number(m.debe) > 0)) continue;
+    const k = llaveCobroNI(m);
+    totalNIPorCobro.set(k, Math.round(((totalNIPorCobro.get(k) ?? 0) + Number(m.debe)) * 100) / 100);
+  }
+  const depositoNIPorCobro = new Map();
+
   const anotados = movs.map(m => {
     if (!(Number(m.debe) > 0)) return m;
     // Las líneas de Saldo a Favor (Anticipos Otros) de una factura pagada con
@@ -1877,7 +2042,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // Mismo criterio que al construir `verdadBancaria` arriba: `facturaUuid`
     // (uuid real de la factura) tiene prioridad sobre `cfdiUuid` (uuid del
     // Pago) — ver comentario en el caller.
-    const bancario = verdadBancaria?.get((m.facturaUuid || m.cfdiUuid || '').toUpperCase());
+    const llaveBancaria = (m.facturaUuid || m.cfdiUuid || '').toUpperCase();
+    const bancarioBase = verdadBancaria?.get(llaveBancaria);
+    const esCargoCajaBanco = /^110[12]/.test(m.cuenta?.codigo || '') && m.reglaNombre !== REGLA_COBRANZA_NO_IDENTIFICADO;
+    const bancario = esCargoCajaBanco ? _depositoPorMonto(bancarioBase, llaveBancaria, Number(m.debe)) : bancarioBase;
     // Cheque con depósito real ligado en Bancos ("Depósito S.B.C.", "DEP
     // CHEQUE BNM") va igual que una transferencia: banco real, folio de Numo
     // en columna C, subcódigo 20 (2026-10-06, pólizas manuales: 29-sep
@@ -1889,8 +2057,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // una ficha de caja): mismo trato que el cheque (2026-10-06, pólizas
     // manuales: 25-sep "46217" TERESA MINERVA, 29-sep "49263" CAROLINA DIAZ).
     // Los cobros en otra caja (EFECTIVO-COS/DEP. PTO) y PXA no entran.
+    // Desde 2026-10-14 el efectivo de Cobranza ya llega en BBVA 1102011001 (ver
+    // cobranza-poliza-generator, paso 7c), no en Caja — se aceptan ambas.
     const esEfectivoDepositadoPorCliente = m.formaPago === '01' && !!bancario?.esDepositoEfectivoKore
-      && /^1101/.test(m.cuenta?.codigo || '')
+      && /^110[12]/.test(m.cuenta?.codigo || '')
       && !(m.serie === 'EFECTIVO-COS' || m.serie === 'PXA' || String(m.serie ?? '').startsWith('DEP. '));
     const esTransferenciaVerificada = esChequeConDeposito || esEfectivoDepositadoPorCliente || (bancario?.categoriaConocida
       ? bancario.esTransferencia
@@ -1927,15 +2097,25 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // Formato "AUT. <numeroAutorizacion>" del banco, no el folio de Numo
     // (2026-09-30, ERIK WILVER: ejemplo "AUT. 3547888", Numo ponía "032147");
     // sin autorización cae al folio de Numo.
+    // 2026-10-13 (PDF "incidencias cobranza 2da parte", como Kore): columna C
+    // con el folio de Numo del depósito (ej. "041498"), no "AUT. 29" — con el
+    // folio se encuentra directo en Numo Bancos. Las líneas NI de un mismo
+    // depósito se juntan en un solo subtotal + un solo IVA (ver abajo).
     if (m.reglaNombre === REGLA_COBRANZA_NO_IDENTIFICADO) {
+      const kNI = llaveCobroNI(m);
+      if (!depositoNIPorCobro.has(kNI)) {
+        depositoNIPorCobro.set(kNI, _depositoPorMonto(bancarioBase, llaveBancaria, totalNIPorCobro.get(kNI) ?? Number(m.debe)));
+      }
+      const bancarioNI = depositoNIPorCobro.get(kNI);
       const esSubtotalNI = m.cuenta?.codigo === CUENTA_DEPOSITOS_NO_IDENTIFICADOS;
-      const referenciaNI = bancario?.numeroAutorizacion ? `AUT. ${bancario.numeroAutorizacion}` : bancario?.referencia;
+      const referenciaNI = bancarioNI?.referencia ?? (bancarioNI?.numeroAutorizacion ? `AUT. ${bancarioNI.numeroAutorizacion}` : null);
       return {
         cuenta: m.cuenta, cuentaId: m.cuentaId, serie: (esSubtotalNI && referenciaNI) || REGLA_COBRANZA_NO_IDENTIFICADO,
         concepto: m.concepto, centroCosto: m.centroCosto, centroCostoObj: m.centroCostoObj,
         debe: Number(m.debe), haber: Number(m.haber), cfdiUuid: m.cfdiUuid,
         rfcTercero: m.rfcTercero, formaPago: m.formaPago, reglaNombre: m.reglaNombre,
         tipoOrigen: m.tipoOrigen, _subcodigo: 0, _grupoCobro: ORDEN_COBRO.NO_IDENTIFICADO,
+        _depositoNI: bancarioNI?.referencia ?? null,
       };
     }
     if (!/^110[12]/.test(m.cuenta?.codigo || '')) {
@@ -1961,6 +2141,18 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
     // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
     const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
+    // Depósito que paga solo esta factura y difiere por centavos del
+    // complemento: el banco va por el monto exacto del depósito (2026-10-13,
+    // caso real JAVIER DIAZ RODRIGUEZ dep 051726: complemento $1,602.92,
+    // banco $1,602.93 — "pon el monto tal cual esté en el depósito").
+    let debeCargo = Number(m.debe);
+    if (esTransferenciaVerificada && bancario?.montoBancoReal != null && bancario._facturasDeposito === 1) {
+      const diferencia = Math.round((bancario.montoBancoReal - debeCargo) * 100) / 100;
+      if (diferencia !== 0 && Math.abs(diferencia) <= TOLERANCIA_CENTAVOS_DEPOSITO) {
+        ajustesCentavos.push({ facturaUuid: m.facturaUuid ?? null, cfdiUuid: m.cfdiUuid ?? null, antes: debeCargo, despues: bancario.montoBancoReal });
+        debeCargo = bancario.montoBancoReal;
+      }
+    }
     // NUNCA copiar `m` con spread (`{...m}`) — `m` es una instancia de
     // Sequelize y el spread no copia bien `debe`/`haber` (salían NaN en el
     // Excel, confirmado con datos reales 2026-08-11). Por eso, igual que
@@ -1981,7 +2173,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       concepto:       yaEnriquecido ? m.concepto : [nombre, m.serie || ''].filter(Boolean).join(' / '),
       centroCosto:    m.centroCosto,
       centroCostoObj: m.centroCostoObj,
-      debe:           Number(m.debe),
+      debe:           debeCargo,
       haber:          Number(m.haber),
       cfdiUuid:       m.cfdiUuid,
       rfcTercero:     m.rfcTercero,
@@ -1992,6 +2184,18 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       _referenciaBancoReal: referenciaBancoReal,
     };
   });
+
+  // Abono a Clientes de la misma factura/Pago por el mismo monto que tenía su
+  // Cargo → al monto del depósito, para que la factura siga cuadrando.
+  for (const aj of ajustesCentavos) {
+    const i = anotados.findIndex(x => /^1103/.test(x.cuenta?.codigo || '')
+      && (x.facturaUuid ?? null) === aj.facturaUuid && (x.cfdiUuid ?? null) === aj.cfdiUuid
+      && Math.abs(Number(x.haber) - aj.antes) < 0.005);
+    if (i === -1) continue;
+    const x = anotados[i];
+    const plano = x.get ? x.get({ plain: true }) : x;
+    anotados[i] = { ...plano, haber: aj.despues };
+  }
 
   // Separa el Cargo bancario (dinero recibido — Cargo real, ni SF ni Abono/
   // IVA) del resto: en la póliza de Cobranza el Cargo va TODO junto al final,
@@ -2126,7 +2330,7 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     : ORDEN_COBRO.TRANSFERENCIA);
   const cobros = [
     ...cargoFinal.map(m => ({ m, g: grupoDeCargo(m) })),
-    ...cobrosNoBancarios.map(({ _grupoCobro, ...m }) => ({ m, g: _grupoCobro })),
+    ...agruparNoIdentificadosPorDeposito(cobrosNoBancarios).map(({ _grupoCobro, ...m }) => ({ m, g: _grupoCobro })),
   ].map((x, i) => ({ ...x, i }))
     .sort((a, b) => a.g - b.g || a.i - b.i)
     .map(x => x.m);
@@ -3678,7 +3882,7 @@ function bloquesAjustesContado(movs) {
 // (incluye Cancelación) NO se meten a `ventas` — se devuelven aparte para que el
 // caller las arme como sus propias pólizas. Anticipos y depósitos identificados
 // no cambian, siguen dentro de `ventas` igual que siempre.
-function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null } = {}) {
+function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias = false, bancoRealPorTicket = null, cuentaDepositosReal = null, netpayInfo = null, ticketsPorFactura = null } = {}) {
   // REVERTIDO 2026-08-20: se intentó sumar Cancelación/Devolución en Efectivo
   // al consolidado, pero al cruzar contra el "Reporte de Movimientos en
   // Cajas" real (Hidalgo/B0 11-ago) se confirmó que NO hay ningún movimiento
@@ -3725,6 +3929,7 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
   const ventasYClubTuberos = enriquecerConceptoConCliente(
     [...bloquesVentas.flat(), ...bloquesClubTuberos.flat()],
     nombresClientes,
+    ticketsPorFactura,
   );
   const anticiposEnriquecidos = enriquecerConceptoConCliente(bloquesAnticipos.flat(), nombresClientes);
 
@@ -3750,10 +3955,10 @@ function armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarC
 // se agrega aquí como quinta categoría (confirmado con el usuario: mismas 5
 // categorías y mismo orden que en Contado).
 function categoriaDeGrupoCredito(movs) {
-  if (movs.some(m => m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto))) return 'clubTuberos';
+  if (movs.some(m => m.tipoOrigen === TIPO_ORIGEN_BCT || esClubTuberosPorDescripcion(m.concepto) || categoriaPorMarcadorNC(m) === 'clubTuberos')) return 'clubTuberos';
   if (movs.some(m => esVentaConDescuento(m.reglaNombre))) return 'descuento';
-  if (movs.some(esDevolucionOCancelacion)) return 'devolucion';
-  if (movs.some(esBonificacionGenerica)) return 'bonificacion';
+  if (movs.some(m => esDevolucionOCancelacion(m) || categoriaPorMarcadorNC(m) === 'devolucion')) return 'devolucion';
+  if (movs.some(m => esBonificacionGenerica(m) || categoriaPorMarcadorNC(m) === 'bonificacion')) return 'bonificacion';
   if (movs.some(m => esReglaAnticipo(m.reglaNombre) || REGLAS_MEZCLADAS_CON_VENTAS.has(m.reglaNombre))) return 'anticipo';
   return null;
 }
@@ -3861,7 +4066,7 @@ function moverAjustesAlFinal(movs, { separarCategorias = false } = {}) {
  * `esConceptoMarcadorAjuste` y se preserva en vez de usar la serie-folio de
  * la factura, para que la columna H siga mostrando el marcador del ajuste.
  */
-function enriquecerConceptoConCliente(movs, nombresClientes) {
+function enriquecerConceptoConCliente(movs, nombresClientes, ticketsPorFactura = null) {
   return movs.map(m => {
     // `m` es una instancia de Sequelize — sus campos reales viven detrás de
     // getters, no como propiedades propias. Un spread directo ({...m}) los
@@ -3869,10 +4074,56 @@ function enriquecerConceptoConCliente(movs, nombresClientes) {
     // escribir la celda, lo que corrompe el .xlsx). Hay que aplanar primero.
     const plano  = m.get ? m.get({ plain: true }) : m;
     const nombre = nombresClientes.get((plano.cfdiUuid || '').toUpperCase()) || '';
-    const refSerieOMarcador = esConceptoMarcadorAjuste(plano.concepto) ? plano.concepto : plano.serie;
-    const partes = [nombre, refSerieOMarcador].filter(Boolean);
+    const esMarcador = esConceptoMarcadorAjuste(plano.concepto);
+    const tickets = ticketsPorFactura && !esMarcador ? _ticketsDeVentaIngreso(plano, ticketsPorFactura) : [];
+    const refSerieOMarcador = esMarcador ? plano.concepto : plano.serie;
+    const partes = [nombre, ...(tickets.length ? tickets : [refSerieOMarcador])].filter(Boolean);
     return { ...plano, concepto: partes.join(' / ') };
   });
+}
+
+// Más tickets que esto (factura que junta muchas ventas sin desglose por
+// renglón) deja la factura en la columna H en vez de una lista enorme.
+const MAX_TICKETS_CONCEPTO_INGRESO = 3;
+
+/**
+ * Ingreso, columna H de un renglón de VENTA: "cliente / venta" en vez de
+ * "cliente / factura" (2026-10-14, pedido del usuario, caso real Puerto
+ * 12-oct póliza 1242: factura O0-261000076 de la venta O0-261000087 del
+ * 3-oct). La columna C sigue con la factura. Ticket del renglón
+ * (`serieVentaTicket`/`folioVentaTicket`) o, si no lo trae, los de
+ * `documentosRelacionados` de la factura en el ERP. Ajustes (`_categoria`),
+ * anticipos/OPA, saldos a favor y Egresos se quedan como estaban.
+ */
+function _ticketsDeVentaIngreso(plano, ticketsPorFactura) {
+  if (plano._categoria || plano.tipoComprobante === 'E' || plano.tipoOrigen === TIPO_ORIGEN_CARGO_ESPECIAL) return [];
+  if (esReglaAnticipo(plano.reglaNombre) || REGLAS_MEZCLADAS_CON_VENTAS.has(plano.reglaNombre)) return [];
+  if (plano.serieVentaTicket && plano.folioVentaTicket) return [`${plano.serieVentaTicket}-${plano.folioVentaTicket}`];
+  const tickets = ticketsPorFactura.get((plano.cfdiUuid || '').toUpperCase()) ?? [];
+  return tickets.length <= MAX_TICKETS_CONCEPTO_INGRESO ? tickets : [];
+}
+
+/**
+ * Ventas (tickets) de cada factura según su copia del ERP
+ * (`documentosRelacionados`, serie de almacén A0/B0/G1… — nunca las marcas de
+ * ajuste BON/DEV/CANCELACION…), mismo criterio que Cobranza
+ * (`_prefetchDoctosPago`). uuid (mayúsculas) → ['O0-261000087', …].
+ */
+async function construirTicketsPorFactura(cfdiUuids) {
+  const mapa = new Map();
+  const uuidsUnicos = [...new Set(cfdiUuids.filter(Boolean).map(u => u.toUpperCase()))];
+  if (uuidsUnicos.length === 0) return mapa;
+  const facturas = await CFDI.find(
+    { uuid: { $in: uuidsUnicos.flatMap(u => [u, u.toLowerCase()]) }, source: 'ERP' },
+    { uuid: 1, documentosRelacionados: 1 },
+  ).lean();
+  for (const f of facturas) {
+    const tickets = (f.documentosRelacionados ?? [])
+      .filter(r => /^[A-Z]\d$/.test(String(r.Serie ?? '').toUpperCase()) && r.Folio)
+      .map(r => `${String(r.Serie).toUpperCase()}-${r.Folio}`);
+    if (tickets.length) mapa.set(String(f.uuid).toUpperCase(), [...new Set(tickets)]);
+  }
+  return mapa;
 }
 
 /**
@@ -4009,6 +4260,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // línea) y también para la hoja de desglose de los consolidados de Contado
   // (ahí cada CFDI se resume en un total, pero el desglose sí lista cada uno).
   const nombresClientes = await construirNombresClientes(movimientos.map(m => m.cfdiUuid));
+  // Ingreso: columna H de las ventas con el ticket, no la factura (ver `_ticketsDeVentaIngreso`).
+  const ticketsPorFactura = poliza.tipo === 'I' ? await construirTicketsPorFactura(movimientos.map(m => m.cfdiUuid)) : null;
 
   // Las pólizas de Ingresos con movimientos de Contado y de Crédito mezclados se
   // exportan como DOS pólizas de CONTPAQi (folios consecutivos) dentro del mismo
@@ -4037,7 +4290,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // mismo principio que ya usa el resto de sucursales cuando falta
       // Contado o Crédito (folios consecutivos, sin huecos).
       const cSplit = contado.length > 0
-        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
+        ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { separarCategorias: true, bancoRealPorTicket, cuentaDepositosReal, netpayInfo, ticketsPorFactura })
         : { ventas: [], bonificaciones: [], descuentosDevoluciones: [] };
       const rSplit = credito.length > 0
         ? moverAjustesAlFinal(credito, { separarCategorias: true })
@@ -4058,7 +4311,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
       // `moverAjustesAlFinal` (Crédito) no lo hace — mismo patrón que el
       // camino legado (línea de abajo: `enriquecerConceptoConCliente(moverAjustesAlFinal(credito), ...)`).
       push('Contado',                              cSplit.ventas,                                                         overrides.folioContado);
-      push('Credito',                              enriquecerConceptoConCliente(rSplit.ventas, nombresClientes),          overrides.folioCredito);
+      push('Credito',                              enriquecerConceptoConCliente(rSplit.ventas, nombresClientes, ticketsPorFactura), overrides.folioCredito);
       push('Bonificaciones de Contado',             cSplit.bonificaciones);
       push('Bonificaciones de Crédito',             enriquecerConceptoConCliente(rSplit.bonificaciones, nombresClientes));
       push('Descuentos y Devoluciones de Contado',  cSplit.descuentosDevoluciones);
@@ -4076,13 +4329,13 @@ async function exportContpaqXlsx(id, overrides = {}) {
           // factura) — refleja el depósito real de caja/banco del periodo.
           {
             tipoVenta: 'Contado',
-            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo }),
+            movs:      armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo, ticketsPorFactura }),
             folio:     overrides.folioContado   ?? poliza.numero,
             concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta('Contado', `${poliza.concepto} - Ventas de Contado`),
           },
           {
             tipoVenta: 'Credito',
-            movs:      enriquecerConceptoConCliente(moverAjustesAlFinal(credito), nombresClientes),
+            movs:      enriquecerConceptoConCliente(moverAjustesAlFinal(credito), nombresClientes, ticketsPorFactura),
             folio:     overrides.folioCredito   ?? (poliza.numero + 1),
             concepto:  overrides.conceptoCredito ?? _conceptoConTipoVenta('Credito', `${poliza.concepto} - Ventas de Crédito`),
           },
@@ -4093,8 +4346,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
       : [{
           tipoVenta: null,
           movs:      contado.length > 0
-            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo })
-            : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes),
+            ? armarBloqueContado(contado, verdadBancaria, nombresClientes, { bancoRealPorTicket, cuentaDepositosReal, netpayInfo, ticketsPorFactura })
+            : enriquecerConceptoConCliente(moverAjustesAlFinal(movimientos), nombresClientes, ticketsPorFactura),
           folio:     overrides.folioContado   ?? poliza.numero,
           concepto:  overrides.conceptoContado ?? _conceptoConTipoVenta(contado.length > 0 ? 'Contado' : 'Credito', poliza.concepto),
         }];
@@ -4458,7 +4711,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     const headerRow = sheet.addRow([
       'P',
       fechaFinal,
-      tipoPolContpaq(poliza.tipo),
+      tipoPolExport(poliza),
       bloque.folio,
       '1',
       '0',
@@ -5487,6 +5740,12 @@ async function siguienteFolioContpaq(id) {
   const poliza = await repo.findByIdLight(id);
   if (!poliza) throw new NotFoundError('Póliza');
 
+  // Cobranza: su folio ya es el contador propio 01–99 que asignó la
+  // generación (RANGO_FOLIO_COBRANZA) — no el rango por sucursal de Ingreso.
+  if (esPolizaCobranza(poliza)) {
+    return { folioContado: poliza.numero ?? null, folioCredito: null };
+  }
+
   const movimiento = await PolizaMovimiento.findOne({
     where:      { polizaId: id },
     attributes: ['id', 'centroCostoId'],
@@ -5544,6 +5803,9 @@ async function asociarFolioContpaq(id, { folioContado, folioCredito }, user) {
     },
     { where: { id } },
   );
+  await audit.registrar('folio_contpaq', poliza, user, {
+    detalle: { folioContado: folioContado ?? null, folioCredito: folioCredito ?? null },
+  });
 
   return repo.findByIdLight(id);
 }
@@ -5564,7 +5826,7 @@ module.exports = {
   // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
-  _construirVerdadBancaria: construirVerdadBancaria, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
 };

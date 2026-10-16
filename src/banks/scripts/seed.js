@@ -61,6 +61,7 @@ const PERM_META = {
   'polizas:read':       { label: 'Ver pólizas contables',           module: 'Contabilidad' },
   'polizas:write':      { label: 'Crear y editar pólizas',          module: 'Contabilidad' },
   'polizas:admin':      { label: 'Administrar pólizas contabilizadas', module: 'Contabilidad' },
+  'polizas:audit:read': { label: 'Monitor de pólizas (bitácora por usuario)', module: 'Contabilidad' },
   'collections:read':   { label: 'Ver solicitudes de cobranza',     module: 'Cobranza' },
   'collections:write':  { label: 'Gestionar cobranza',              module: 'Cobranza' },
   'collections:read:identificadas': { label: 'Ver solo solicitudes identificadas', module: 'Cobranza' },

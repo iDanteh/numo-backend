@@ -4,6 +4,7 @@ const AdmZip = require('adm-zip');
 const { BadRequestError } = require('../../../shared/errors/AppError');
 const generator = require('../cfdi-mapping/cfdi-poliza-generator.service');
 const polizaSvc = require('./poliza.service');
+const audit     = require('./poliza-audit.service');
 
 // Caracteres fuera de [A-Za-z0-9_-] no son seguros/portables en nombres de
 // archivo o carpeta dentro de un ZIP (espacios sí funcionan, pero se
@@ -53,6 +54,7 @@ async function exportarContpaqZip({ rfc, ejercicio, periodo, tipoCfdi, tipoPropu
 
   for (const entry of exitosos) {
     const { workbooks, poliza } = await polizaSvc.exportContpaqXlsx(entry.polizaId, {});
+    await audit.registrar('exportada', poliza, user, { detalle: { formato: 'contpaq-zip', modo } });
     const mesPeriodo = String(poliza.periodo).padStart(2, '0');
     // CEDIS trae 3 workbooks (Ventas, Bonificaciones, Descuentos y
     // Devoluciones — cada uno con su par Contado/Crédito adentro) — cada uno

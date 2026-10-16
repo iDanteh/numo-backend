@@ -1,7 +1,6 @@
 const { validationResult } = require('express-validator');
 const AdmZip = require('adm-zip');
 const ExcelJS = require('exceljs');
-const axios = require('axios');
 const CFDI = require('../models/CFDI');
 const { parseCFDI } = require('../services/cfdiParser');
 const { compareCFDI } = require('../services/comparisonEngine');
@@ -13,6 +12,7 @@ const { generarPlan, aplicarReclasificacion } = require('../services/reclasifica
 const Comparison = require('../models/Comparison');
 const { logger } = require('../../shared/utils/logger');
 const { repararSubtotalDesdeXml } = require('../services/cfdiSubtotalRepair');
+const { cfdiDeEmpresasPermitidas, filtroCfdiEmpresas } = require('../../shared/middleware/empresas-usuario');
 
 const MONTO_EFECTIVO_EXPR = {
   $round: [{
@@ -63,27 +63,67 @@ const verificarSATBackground = (cfdiData) => {
 
 // ── Helpers internos ──────────────────────────────────────────────────────────
 
+// Límites de un ZIP de XMLs (2026-10-14): antes se descomprimía todo de golpe
+// en memoria y un ZIP armado a propósito ("bomba ZIP": pocos MB que se abren
+// en decenas de GB) tumbaba el proceso. Ahora se revisa el tamaño declarado
+// antes de abrir y se descomprime un XML a la vez. adm-zip no deja que un XML
+// salga más grande de lo que declara; con tamaño 0 no tiene tope, por eso se
+// rechaza (un XML vacío tampoco es un CFDI).
+const ZIP_MAX_XML         = 50000;
+const ZIP_MAX_XML_BYTES   = 50 * 1024 * 1024;        // un XML ya descomprimido
+const ZIP_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;  // todo el ZIP descomprimido
+const MB = n => `${Math.round(n / 1024 / 1024)} MB`;
+
 /**
- * Extrae entradas XML de un archivo (directo o dentro de un ZIP).
+ * Extrae entradas XML de un archivo (directo o dentro de un ZIP), una a la vez.
  * @param {{ originalname: string, buffer: Buffer }} file
- * @returns {{ name: string, buffer: Buffer|null, error?: string }[]}
+ * @returns {Generator<{ name: string, buffer: Buffer|null, error?: string }>}
  */
-const extractEntries = (file) => {
-  if (file.originalname.toLowerCase().endsWith('.zip')) {
-    try {
-      const zip = new AdmZip(file.buffer);
-      const xmlEntries = zip.getEntries()
-        .filter(e => e.entryName.toLowerCase().endsWith('.xml') && !e.isDirectory);
-      if (xmlEntries.length === 0) {
-        return [{ name: file.originalname, buffer: null, error: 'El ZIP no contiene archivos XML' }];
-      }
-      return xmlEntries.map(e => ({ name: e.entryName, buffer: e.getData() }));
-    } catch (err) {
-      return [{ name: file.originalname, buffer: null, error: `Error al descomprimir ZIP: ${err.message}` }];
-    }
+function* extractEntries(file) {
+  if (!file.originalname.toLowerCase().endsWith('.zip')) {
+    yield { name: file.originalname, buffer: file.buffer };
+    return;
   }
-  return [{ name: file.originalname, buffer: file.buffer }];
-};
+  let xmlEntries;
+  try {
+    xmlEntries = new AdmZip(file.buffer).getEntries()
+      .filter(e => e.entryName.toLowerCase().endsWith('.xml') && !e.isDirectory);
+  } catch (err) {
+    yield { name: file.originalname, buffer: null, error: `Error al descomprimir ZIP: ${err.message}` };
+    return;
+  }
+  if (xmlEntries.length === 0) {
+    yield { name: file.originalname, buffer: null, error: 'El ZIP no contiene archivos XML' };
+    return;
+  }
+  if (xmlEntries.length > ZIP_MAX_XML) {
+    yield { name: file.originalname, buffer: null, error: `El ZIP trae ${xmlEntries.length} XML (máximo ${ZIP_MAX_XML}). Divídelo en varios ZIP.` };
+    return;
+  }
+  const totalDescomprimido = xmlEntries.reduce((s, e) => s + (e.header.size || 0), 0);
+  if (totalDescomprimido > ZIP_MAX_TOTAL_BYTES) {
+    yield { name: file.originalname, buffer: null, error: `El ZIP descomprimido pesa ${MB(totalDescomprimido)} (máximo ${MB(ZIP_MAX_TOTAL_BYTES)}). Divídelo en varios ZIP.` };
+    return;
+  }
+  for (const e of xmlEntries) {
+    const size = e.header.size || 0;
+    if (size === 0) {
+      yield { name: e.entryName, buffer: null, error: 'XML vacío' };
+      continue;
+    }
+    if (size > ZIP_MAX_XML_BYTES) {
+      yield { name: e.entryName, buffer: null, error: `XML demasiado grande (${MB(size)}, máximo ${MB(ZIP_MAX_XML_BYTES)})` };
+      continue;
+    }
+    let buffer = null, error;
+    try {
+      buffer = e.getData();
+    } catch (err) {
+      error = `Error al descomprimir: ${err.message}`;
+    }
+    yield buffer ? { name: e.entryName, buffer } : { name: e.entryName, buffer: null, error };
+  }
+}
 
 // ── Controladores ─────────────────────────────────────────────────────────────
 
@@ -126,6 +166,8 @@ const list = asyncHandler(async (req, res) => {
   const lm = parseInt(limit);
 
   const filter = { isActive: true };
+  // Usuario con empresas asignadas: solo CFDIs emitidos o recibidos por ellas.
+  if (req.empresasPermitidas) filter.$and = [filtroCfdiEmpresas(req.empresasPermitidas)];
   if (uuids && uuid) {
     return res.status(400).json({
       error: 'Los parámetros "uuids" y "uuid" son mutuamente excluyentes.',
@@ -371,7 +413,7 @@ const reclasificados = asyncHandler(async (req, res) => {
  */
 const getById = asyncHandler(async (req, res) => {
   const cfdi = await CFDI.findById(req.params.id, { xmlContent: 0 }).lean();
-  if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado' });
+  if (!cfdi || !cfdiDeEmpresasPermitidas(cfdi, req.empresasPermitidas)) return res.status(404).json({ error: 'CFDI no encontrado' });
   await repararSubtotalDesdeXml([cfdi]);
   res.json(cfdi);
 });
@@ -381,7 +423,7 @@ const getById = asyncHandler(async (req, res) => {
  */
 const getXml = asyncHandler(async (req, res) => {
   const cfdi = await CFDI.findById(req.params.id).select('+xmlContent');
-  if (!cfdi || !cfdi.xmlContent) return res.status(404).json({ error: 'XML no disponible' });
+  if (!cfdi || !cfdi.xmlContent || !cfdiDeEmpresasPermitidas(cfdi, req.empresasPermitidas)) return res.status(404).json({ error: 'XML no disponible' });
   res.setHeader('Content-Type', 'application/xml');
   res.setHeader('Content-Disposition', `attachment; filename="${cfdi.uuid}.xml"`);
   res.send(cfdi.xmlContent);
@@ -749,8 +791,10 @@ const importExcel = asyncHandler(async (req, res) => {
       // Para tipo P el UUIDRel viene del DoctoRelacionado del complemento (facturas cobradas),
       // no del CfdiRelacionados del header. Solo hay tipoRelacion en el header cuando el CFDI P
       // sustituye a otro pago cancelado (04) — en ese caso el SAT lo reporta explícitamente.
-      const tipoRelacion    = getCell(row, 'TipoRelacion', 'Tipo Relacion', 'Tipo Relación')
-        ?? (tipo === 'P' ? null : '04');
+      // Sin columna TipoRelacion se deja null (desconocido): antes se suponía '04'
+      // (sustitución) y una NC de devolución (03) quedaba como sustitución
+      // (2026-10-13, E587E3C2 H0-261000130; 1,255 Egresos con 04 falso).
+      const tipoRelacion    = getCell(row, 'TipoRelacion', 'Tipo Relacion', 'Tipo Relación') ?? null;
 
       // Acumular para tasaIvaInferida (tipo P puede tener N filas, una por factura relacionada)
       if (tipo === 'P' && uuidRelacion) {
@@ -817,9 +861,36 @@ const importExcel = asyncHandler(async (req, res) => {
         }),
         ...(uuidRelacion && {
           // extraerCodigo: "03 - Devolución de mercancía..." → "03"
-          cfdiRelacionados: [{ tipoRelacion: extraerCodigo(tipoRelacion) ?? '04', uuids: [uuidRelacion] }],
+          cfdiRelacionados: [{ tipoRelacion: extraerCodigo(tipoRelacion) ?? null, uuids: [uuidRelacion] }],
         }),
       };
+
+      // Copia que ya tiene su XML real (descarga SAT o XML subido): el reporte
+      // Excel NO la pisa — sus conceptos (sin impuestos), impuestos, relación,
+      // fecha (sin hora) y timbre son un resumen pobre del XML. Solo se toman
+      // el estatus SAT y los datos que el XML no trae (2026-10-13: miles de
+      // copias XML quedaron con conceptos sin impuestos y relación 04 falsa).
+      const soloExcel = Object.fromEntries(Object.entries({
+        satStatus, numCtaPago, estadoPago, fechaPago, complementoTipo,
+      }).filter(([, v]) => v !== undefined && v !== null));
+      const prevConXml = await CFDI.findOneAndUpdate(
+        { uuid: cfdiData.uuid, source, xmlContent: { $exists: true, $nin: [null, ''] } },
+        { $set: { ...soloExcel, uploadedBy: req.user._id } },
+        { new: false, projection: { lastComparisonStatus: 1 } },
+      );
+      if (prevConXml) {
+        actualizados++;
+        duplicados.push({ uuid: cfdiData.uuid, filename: `Fila ${row.number}` });
+        success.push({
+          uuid: cfdiData.uuid,
+          filename: `Fila ${row.number}`,
+          nuevo: false,
+          satStatus: soloExcel.satStatus ?? null,
+          lastComparisonStatus: prevConXml.lastComparisonStatus ?? null,
+        });
+        verificarSATBackground(cfdiData);
+        continue;
+      }
 
       // ejercicio/periodo solo en $setOnInsert para preservar reclasificaciones previas
       const { ejercicio: _ej, periodo: _pe, ...cfdiSetData } = cfdiData;
@@ -958,190 +1029,6 @@ const remove = asyncHandler(async (req, res) => {
 });
 
 /**
- * POST /api/cfdis/import-erp-api
- * Recupera CFDIs directamente desde el endpoint REST del ERP del cliente.
- * El frontend pasa { ejercicio, periodo, erpUrl } en el body.
- * El backend hace el llamado al ERP (evitando CORS) y procesa la respuesta.
- *
- * Campos esperados del ERP:
- *   ID, UUID, TipoComprobante, FechaGeneracion, Serie, Folio, UUIDRelacion,
- *   RFCEmisor, RFCReceptor, NombreReceptor, UsoCfdi, Subtotal, Descuento, TotalIVA,
- *   TotalRetenciones, Importe, Moneda, TipoCambio, FormaPago, MetodoPago,
- *   FechaPago, SelloCFD, SelloSAT, NoCertificado, NoCertificadoSAT,
- *   FechaTimbrado, RfcProvCertif, Estatus, EstatusSAT, FechaCancelacion,
- *   TipoRelacion
- */
-const importFromErpApi = asyncHandler(async (req, res) => {
-  const { ejercicio, periodo, erpUrl } = req.body;
-
-  if (!ejercicio || !periodo) {
-    return res.status(400).json({ error: 'El ejercicio y periodo son obligatorios', code: 'PERIODO_REQUERIDO' });
-  }
-  if (!erpUrl) {
-    return res.status(400).json({ error: 'La URL del endpoint ERP es obligatoria', code: 'ERP_URL_REQUERIDA' });
-  }
-
-  const ejercicioNum = parseInt(ejercicio);
-  const periodoNum   = parseInt(periodo);
-  if (periodoNum < 1 || periodoNum > 12) {
-    return res.status(400).json({ error: 'El periodo debe ser entre 1 y 12', code: 'PERIODO_INVALIDO' });
-  }
-
-  // ── Llamar al ERP ──────────────────────────────────────────────────────────
-  let erpData;
-  try {
-    const response = await axios.get(erpUrl, {
-      timeout: 30000,
-      headers: {
-        'Accept': 'application/json',
-        // Si el ERP requiere auth básica o token, se pueden pasar como headers extra
-        // desde el body: req.body.erpHeaders
-        ...(req.body.erpHeaders || {}),
-      },
-    });
-    // El ERP puede devolver { data: [...] } o directamente un arreglo
-    erpData = Array.isArray(response.data)
-      ? response.data
-      : (response.data?.data ?? response.data?.cfdis ?? response.data?.cfdi ?? []);
-  } catch (err) {
-    return res.status(502).json({
-      error: `No se pudo conectar al ERP: ${err.message}`,
-      code: 'ERP_CONNECTION_ERROR',
-    });
-  }
-
-  if (!Array.isArray(erpData) || erpData.length === 0) {
-    return res.status(200).json({
-      message: 'El ERP no devolvió registros para este periodo.',
-      procesados: 0, nuevos: 0, actualizados: 0,
-      duplicados: [], errores: [], success: [],
-    });
-  }
-
-  // ── Procesar cada registro ──────────────────────────────────────────────────
-  const parseNum = (v) => { if (v == null) return null; const n = parseFloat(String(v).replace(/,/g, '')); return isNaN(n) ? null : n; };
-  const parseDate = (v) => { if (!v) return null; const d = new Date(v); return isNaN(d.getTime()) ? null : d; };
-
-  let nuevos = 0, actualizados = 0;
-  const success = [], failed = [], duplicados = [];
-
-  for (let i = 0; i < erpData.length; i++) {
-    const row = erpData[i];
-    const rowLabel = `Registro ${i + 1}`;
-
-    const uuid = (row.UUID || row.uuid || '').toString().trim().toUpperCase();
-    if (!uuid) { failed.push({ filename: rowLabel, error: 'UUID vacío' }); continue; }
-
-    try {
-      const tipoRaw = (row.TipoComprobante || row.tipoComprobante || '').toString().toLowerCase();
-      const tipo = TIPOS_COMPROBANTE[tipoRaw];
-      if (!tipo) throw new Error(`TipoComprobante inválido: "${row.TipoComprobante}"`);
-
-      const fecha = parseDate(row.FechaGeneracion || row.fechaGeneracion);
-      if (!fecha) throw new Error('FechaGeneracion inválida o vacía');
-
-      const importe = parseNum(row.Importe || row.importe);
-      if (importe === null) throw new Error('Importe inválido o vacío');
-
-      const rfcReceptor = (row.RFCReceptor || row.rfcReceptor || '').toString().trim().toUpperCase();
-      if (!rfcReceptor) throw new Error('RFCReceptor vacío');
-
-      const rfcEmisor = (row.RFCEmisor || row.rfcEmisor || 'DESCONOCIDO').toString().trim().toUpperCase();
-
-      const estatusRaw = row.EstatusSAT || row.estatusSAT || null;
-      const satStatus  = SAT_STATUS_VALIDOS.has(estatusRaw) ? estatusRaw : null;
-      const erpStatus  = row.Estatus || row.estatus || null;
-
-      const uuidRelacion = (row.UUIDRelacion || row.uuidRelacion || '').toString().trim().toUpperCase() || null;
-      const tipoRelacion = (row.TipoRelacion || row.tipoRelacion || '04').toString().trim();
-
-      const totalIVA        = parseNum(row.TotalIVA        || row.totalIVA)        ?? 0;
-      const totalRetenciones = parseNum(row.TotalRetenciones || row.totalRetenciones) ?? 0;
-
-      // Campos que se actualizan siempre (no sobreescriben periodo/ejercicio reclasificado)
-      const cfdiSet = {
-        uuid,
-        source: 'ERP',
-        fecha,
-        tipoDeComprobante: tipo,
-        serie:      row.Serie      || row.serie      || undefined,
-        folio:      row.Folio      || row.folio      || undefined,
-        formaPago:  row.FormaPago  || row.formaPago  || undefined,
-        metodoPago: row.MetodoPago || row.metodoPago || undefined,
-        moneda:     row.Moneda     || row.moneda     || 'MXN',
-        tipoCambio: parseNum(row.TipoCambio || row.tipoCambio) ?? undefined,
-        subTotal:   parseNum(row.Subtotal   || row.subtotal)   ?? importe,
-        descuento:  parseNum(row.Descuento  || row.descuento)  ?? 0,
-        total:      importe,
-        emisor:   { rfc: rfcEmisor },
-        receptor: {
-          rfc:     rfcReceptor,
-          nombre:  row.NombreReceptor || row.nombreReceptor || undefined,
-          usoCFDI: row.UsoCfdi        || row.usoCfdi        || undefined,
-        },
-        uploadedBy: req.user._id,
-        ...(row.ID     && { erpId: String(row.ID) }),
-        ...(satStatus  && { satStatus }),
-        ...(erpStatus  && { erpStatus }),
-        ...(row.NoCertificado && { noCertificado: String(row.NoCertificado) }),
-        ...(uuidRelacion && {
-          cfdiRelacionados: [{ tipoRelacion, uuids: [uuidRelacion] }],
-        }),
-        impuestos: {
-          totalImpuestosTrasladados: totalIVA,
-          totalImpuestosRetenidos:   totalRetenciones,
-        },
-        ...(row.SelloCFD && { sello: row.SelloCFD }),
-        timbreFiscalDigital: {
-          ...(row.FechaTimbrado    && { fechaTimbrado:    parseDate(row.FechaTimbrado) }),
-          ...(row.SelloSAT         && { selloSAT:         row.SelloSAT }),
-          ...(row.NoCertificadoSAT && { noCertificadoSAT: String(row.NoCertificadoSAT) }),
-          ...(row.RfcProvCertif    && { rfcProvCertif:    row.RfcProvCertif }),
-        },
-      };
-
-      const prev = await CFDI.findOneAndUpdate(
-        { uuid, source: 'ERP' },
-        {
-          $set:         cfdiSet,
-          // periodo y ejercicio solo se asignan en documentos nuevos.
-          // Si el documento ya existe (fue reclasificado), se respeta su periodo actual.
-          $setOnInsert: { periodo: periodoNum, ejercicio: ejercicioNum },
-        },
-        { upsert: true, new: false, setDefaultsOnInsert: true },
-      );
-
-      prev === null ? nuevos++ : actualizados++;
-      if (prev !== null) duplicados.push({ uuid, filename: rowLabel });
-      success.push({
-        uuid, filename: rowLabel,
-        nuevo: prev === null,
-        satStatus: prev?.satStatus ?? satStatus ?? null,
-        lastComparisonStatus: prev?.lastComparisonStatus ?? null,
-      });
-    } catch (err) {
-      failed.push({ filename: rowLabel, error: err.message });
-    }
-  }
-
-  const procesados = nuevos + actualizados;
-  res.status(207).json({
-    message: `${procesados} CFDIs procesados (${nuevos} nuevos, ${actualizados} duplicados), ${failed.length} con error`,
-    procesados, nuevos, actualizados, duplicados,
-    errores: failed, success,
-  });
-
-  // Reclasificación automática en background: busca CFDIs SAT del mismo ejercicio
-  // con InformacionGlobal.Mes y alinea también los ERP recién importados.
-  if (procesados > 0) {
-    setImmediate(() => {
-      aplicarReclasificacion({ ejercicio: ejercicioNum, source: 'SAT' })
-        .catch(err => logger.warn(`[importFromErpApi] reclasificación background falló: ${err.message}`));
-    });
-  }
-});
-
-/**
  * GET /api/cfdis/export
  * Genera y descarga un .xlsx con los CFDIs que coincidan con los filtros.
  * Acepta los mismos query params que GET /api/cfdis.
@@ -1154,6 +1041,7 @@ const exportExcel = asyncHandler(async (req, res) => {
   } = req.query;
 
   const filter = { isActive: { $ne: false } };
+  if (req.empresasPermitidas) filter.$and = [filtroCfdiEmpresas(req.empresasPermitidas)];
   if (source) {
     const sources = source.toUpperCase().split(',').map(s => s.trim()).filter(Boolean);
     filter.source = sources.length === 1 ? sources[0] : { $in: sources };
@@ -1581,8 +1469,8 @@ const migrarPeriodoBulk = asyncHandler(async (req, res) => {
  * Usado por el frontend para sugerir el periodo destino antes de migrar.
  */
 const erpContraparte = asyncHandler(async (req, res) => {
-  const cfdi = await CFDI.findById(req.params.id).select('uuid source ejercicio periodo');
-  if (!cfdi) return res.status(404).json({ error: 'CFDI no encontrado.' });
+  const cfdi = await CFDI.findById(req.params.id).select('uuid source ejercicio periodo emisor receptor');
+  if (!cfdi || !cfdiDeEmpresasPermitidas(cfdi, req.empresasPermitidas)) return res.status(404).json({ error: 'CFDI no encontrado.' });
   if (!['SAT', 'MANUAL'].includes(cfdi.source)) {
     return res.status(400).json({ error: 'Solo aplica a CFDIs SAT o MANUAL.' });
   }
@@ -1754,8 +1642,9 @@ const repairXmlSubtotals = asyncHandler(async (req, res) => {
 });
 
 module.exports = {
-  list, getById, getXml, upload, importExcel, importFromErpApi, create, compare, remove, exportExcel,
+  list, getById, getXml, upload, importExcel, create, compare, remove, exportExcel,
   exportZipRecibidos, exportReporteRecibidos,
   planReclasificacionGlobal, aplicarReclasificacionGlobal, migrarPeriodo, migrarPeriodoBulk, erpContraparte,
   repairXmlSubtotals, reclasificados,
+  _extractEntries: extractEntries,
 };

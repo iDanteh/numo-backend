@@ -9,6 +9,7 @@ const mappingSvc           = require('./cfdi-mapping.service');
 const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99, _normalizarEgresoCondonacion, _normalizarEgresoSegunFacturaRelacionada, _metaFacturasRelacionadas } = require('./balanza-preliminar.service');
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
+const opaCobranzaSvc       = require('./opa-cobranza.service');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket, fotoEstadisticasErp } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -2580,6 +2581,45 @@ function _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFactura) {
   }
 }
 
+// Originales cancelados-con-sustitución del mismo periodo que entran al batch:
+// solo los de la sucursal que se está generando (por la serie del sustituto) y
+// UNA copia por uuid (la SAT si existe). Antes entraban los de TODAS las
+// sucursales del día y las dos copias (SAT y ERP), cada una con su propia
+// regla (2026-10-13, Ferrocarril 12-oct: C0-261000641 y M0-261000375 de otras
+// sucursales, con Reg 1C/1D y Reg 22C a la vez, por una relación 04 falsa).
+async function _originalesSustituidosDelCentro(sustitutos, { centroCostoId, ccBySerieMap }) {
+  const delCentro = centroCostoId
+    ? sustitutos.filter(s => String(ccBySerieMap?.[s.serie]?.id ?? '') === String(centroCostoId))
+    : sustitutos;
+  const uuids = [...new Set(delCentro.flatMap(s => s.sustituyeA))];
+  if (!uuids.length) return [];
+  const docs = await CFDI.find({ uuid: { $in: uuids } })
+    .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida source')
+    .lean();
+  const porUuid = new Map();
+  for (const d of docs) {
+    const k = String(d.uuid).toUpperCase();
+    const previo = porUuid.get(k);
+    if (!previo || (previo.source !== 'SAT' && d.source === 'SAT')) porUuid.set(k, d);
+  }
+  return [...porUuid.values()];
+}
+
+// Recepción de anticipo cuya OPA salió del sobrante de un depósito de cobranza
+// (cuentas PPD con complemento): va en la póliza de Cobranza, no aquí (regla
+// del usuario 2026-10-13, ver opa-cobranza.service.js). Vacía `movs` y regresa
+// el texto para la advertencia; null si el anticipo se queda en Ingreso.
+async function _desviarAnticipoACobranza(cfdi, movs, cuentaMap, referenciaOpaPorFactura, cache) {
+  if (cfdi.tipoDeComprobante !== 'I') return null;
+  const idAnticipos = cuentaMap?.[CODIGO_CUENTA_ANTICIPOS_CLIENTES];
+  if (!idAnticipos || !movs.some(m => m.cuentaId === idAnticipos && Number(m.haber) > 0)) return null;
+  const refOpa = referenciaOpaPorFactura?.get(`${cfdi.serie}|${cfdi.folio}`) ?? null;
+  const ref = await opaCobranzaSvc.referenciaOpaDeCobranza(cfdi, refOpa, cache);
+  if (!ref) return null;
+  movs.length = 0;
+  return `${ref} (${cfdi.serie}-${cfdi.folio} $${Number(cfdi.total).toFixed(2)})`;
+}
+
 // Egreso SAT que formaliza la aplicación del anticipo directamente contra la
 // VENTA (tipoRelacion='07' apuntando al UUID de la propia venta — al revés
 // de la relación que trae la venta hacia SU anticipo). Cuando existe, trae el
@@ -2901,7 +2941,13 @@ function _esCedisPorSucursal(sucursal) {
   return (sucursal || '').trim().toUpperCase() === 'CEDIS';
 }
 
-async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction }) {
+// Cobranza: contador propio 01–99 por mes, uno solo para todas las sucursales
+// (confirmado con el usuario 2026-10-13, PDF "incidencia numo cobranza") —
+// ya no comparte el rango por sucursal de Ingreso. Cada póliza de Cobranza
+// ocupa un solo folio en el export (un bloque, ver exportContpaqXlsx).
+const RANGO_FOLIO_COBRANZA = { desde: 1, hasta: 99 };
+
+async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction, unFolioPorPoliza = false }) {
   if (!rangoFolio) {
     const max = await Poliza.max('numero', {
       where: { tipo: tipoPropuesta, rfc, ejercicio: Number(ejercicio), periodo: Number(periodo) },
@@ -2925,6 +2971,7 @@ async function _folioSiguienteDisponible({ tipoPropuesta, rfc, ejercicio, period
 
   const ocupados = new Set();
   for (const p of activas) {
+    if (unFolioPorPoliza) { ocupados.add(p.numero); continue; }
     const movs = p.movimientos ?? [];
     const esCedisPast = movs.length > 0 && movs.every(m => _esCedisPorSucursal(sucursalDeCentro(m.centroCostoId)));
     if (esCedisPast) {
@@ -3640,9 +3687,24 @@ async function _fetchNotasCreditoParaFusion(facturasI, rfc, uuidsYaUsados, opts 
       .select('uuid formaPago metodoPago conceptos impuestos tipoOrigen cfdiRelacionados documentosRelacionados').lean();
     erpMetaMap = Object.fromEntries(erpCfdis.map(c => [c.uuid, c]));
   }
+  // NC SAT ya completa (no pasa por el enriquecimiento de arriba): solo se toma
+  // del ERP su documentosRelacionados para el marcador del concepto (columna H,
+  // "Cliente / CAC-079958" en vez de "Cliente / H0-261000130") — en un campo
+  // aparte para no alterar nada más que lea documentosRelacionados (SF
+  // generado, etc.). Caso real Tehuantepec 7-oct, H0-261000130 / CAC-079958.
+  const uuidsCompletas = ncs.map(c => c.uuid).filter(u => u && !erpMetaMap[u]);
+  const docsRelErpPorUuid = {};
+  if (uuidsCompletas.length) {
+    const erpDocs = await CFDI.find({ uuid: { $in: uuidsCompletas }, source: 'ERP', 'documentosRelacionados.0': { $exists: true } })
+      .select('uuid documentosRelacionados').lean();
+    for (const d of erpDocs) docsRelErpPorUuid[d.uuid] = d.documentosRelacionados;
+  }
   const ncsEnriquecidas = ncs.map(cfdi => {
     const erp = erpMetaMap[cfdi.uuid];
-    if (!erp) return cfdi;
+    if (!erp) {
+      const docsRelErp = docsRelErpPorUuid[cfdi.uuid];
+      return docsRelErp ? { ...cfdi, documentosRelacionadosConcepto: docsRelErp } : cfdi;
+    }
     const satHasTraslados = cfdi.conceptos?.some(con => con.impuestos?.traslados?.length);
     const relSAT     = cfdi.cfdiRelacionados ?? [];
     const tiposEnSAT = new Set(relSAT.map(r => r.tipoRelacion));
@@ -4041,11 +4103,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   // asiento de reversión que lo cancela se agrega después de generar todos
   // los movimientos (ver `sustitutosMismoPeriodoProp` más abajo, tras el
   // loop principal).
-  const cfdisOriginalesCanceladosProp = sustitutosMismoPeriodoProp.length
-    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoProp.flatMap(s => s.sustituyeA) } })
-        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
-        .lean()
-    : [];
+  const cfdisOriginalesCanceladosProp = await _originalesSustituidosDelCentro(sustitutosMismoPeriodoProp, { centroCostoId, ccBySerieMap: ccBySerieMapProp });
   const cfdisConNCProp = [...cfdisConNCSinReversionProp, ...cfdisOriginalesCanceladosProp];
 
   // Póliza de Pagos (Cobranza): ordenar por folio del Pago ascendente — sin
@@ -4472,6 +4530,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
   const egresosAplicadosEnCierreProp = new Set();
   let sinRegla = 0;
 
+  // Anticipos cuya OPA salió de un depósito de cobranza — ver `_desviarAnticipoACobranza`.
+  const anticiposACobranzaProp = [];
+  const cacheOpaCobranzaProp = new Map();
   for (const { cfdi, rule } of cfdiConRegla) {
     // uuid07: venta referenciada por esta NC tipo E vía tipoRelacion=07 (si
     // aplica) — se usa tanto para el skip "Fix 5" (cross-batch, abajo) como
@@ -4567,6 +4628,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFacturaProp);
+    const desviadoProp = await _desviarAnticipoACobranza(cfdi, movs, cuentaMap, referenciaOpaPorFacturaProp, cacheOpaCobranzaProp);
+    if (desviadoProp) anticiposACobranzaProp.push(desviadoProp);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoProp.push(...context.depositosEfectivoDetectados);
     const comboEspecialProp = uuid07 ? ventasConComboEspecialAnticipoProp.get(uuid07) : null;
     if (comboEspecialProp) {
@@ -5017,7 +5080,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
           const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaProp)) * 100) / 100;
           const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
           const refOpaD      = `OPA-${d.folio}`;
-          const serieCierreD = serieEgresoAnticipoProp ?? refOpaD;
+          const serieCierreD = serieEgresoAnticipoProp ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaD;
           if (subtotalD > 0) {
             movimientosResult.push({
               ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
@@ -5039,7 +5102,11 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         // cuando existe (trazable al documento SAT); columna H (concepto) =
         // siempre la referencia "OPA-..." (confirmado con el usuario
         // 2026-08-28, caso real MONSAN B0-260801098/Egreso B0-260801103).
-        const serieCierreProp = serieEgresoAnticipoProp ?? refOpaProp;
+        // Sin Egreso: la serie-folio de la factura que aplica el anticipo, no
+        // la OPA (2026-10-13, confirmado con el usuario, caso real Ferrocarril
+        // 12-oct JUAN CARLOS DEL VILLAR LLANDERAL: columna C "OPA-01142" →
+        // "F0-261000199"; la OPA sigue en la columna H).
+        const serieCierreProp = serieEgresoAnticipoProp ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaProp;
         if (subtotalAnticipoProp > 0) {
           movimientosResult.push({
             ...baseInfoProp, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] ?? null,
@@ -5760,6 +5827,9 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
     });
 
   const advertencias = [];
+  if (anticiposACobranzaProp.length) {
+    advertencias.push(`ℹ ${anticiposACobranzaProp.length} anticipo(s) que salieron del sobrante de un depósito de cobranza (cuentas PPD con complemento) no se registran aquí: van en la póliza de Cobranza — ${anticiposACobranzaProp.join(', ')}`);
+  }
   const _ncFusionadasProp = cfdisConNCSinReversionProp.length - cfdisSinPolizaFinalFiltrado.length;
   if (_ncFusionadasProp > 0) {
     advertencias.push(`${_ncFusionadasProp} Nota(s) de Crédito fusionada(s) en esta póliza de Ingreso (devoluciones/descuentos/bonificaciones/anticipos relacionados)`);
@@ -5946,7 +6016,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   // sin duplicar la iteración por sucursal/día (esa parte SÍ es genérica).
   if (tipoCfdi === 'P') {
     return require('./cobranza-poliza-generator.service').generarYGuardarCobranza({
-      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro,
+      rfc, ejercicio, periodo, tipoPropuesta, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user,
     });
   }
 
@@ -6211,11 +6281,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
 
   // Originales cancelados-con-sustitución del mismo periodo — ver comentario
   // equivalente en generarPropuesta.
-  const cfdisOriginalesCanceladosGuard = sustitutosMismoPeriodoGuard.length
-    ? await CFDI.find({ uuid: { $in: sustitutosMismoPeriodoGuard.flatMap(s => s.sustituyeA) } })
-        .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados lastComparisonStatus tasaIvaInferida')
-        .lean()
-    : [];
+  const cfdisOriginalesCanceladosGuard = await _originalesSustituidosDelCentro(sustitutosMismoPeriodoGuard, { centroCostoId, ccBySerieMap });
   const cfdisConNCGuard = [...cfdisConNCSinReversionGuard, ...cfdisOriginalesCanceladosGuard];
 
   // Ver comentario equivalente en generarPropuesta.
@@ -6519,6 +6585,9 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   // Diagnóstico: acumular los primeros 5 CFDIs sin regla para dar info útil
   const muestrasSinRegla = [];
 
+  // Anticipos cuya OPA salió de un depósito de cobranza — ver `_desviarAnticipoACobranza`.
+  const anticiposACobranzaGuard = [];
+  const cacheOpaCobranzaGuard = new Map();
   for (const { cfdi, rule } of cfdiConRegla) {
     // uuid07: ver comentario equivalente en generarPropuesta.
     let uuid07;
@@ -6611,6 +6680,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
 
     const movs = await mappingSvc.cfdiToMovimientos(cfdi, rule, cuentaMap, context);
     _conceptoOpaRecepcionAnticipo(cfdi, movs, referenciaOpaPorFacturaGuard);
+    const desviadoGuard = await _desviarAnticipoACobranza(cfdi, movs, cuentaMap, referenciaOpaPorFacturaGuard, cacheOpaCobranzaGuard);
+    if (desviadoGuard) anticiposACobranzaGuard.push(desviadoGuard);
     if (context.depositosEfectivoDetectados?.length) depositosEfectivoGuard.push(...context.depositosEfectivoDetectados);
     ruleUsageCount.set(rule.id, (ruleUsageCount.get(rule.id) || 0) + 1);
     const comboEspecialGuard = uuid07 ? ventasConComboEspecialAnticipoGuard.get(uuid07) : null;
@@ -6884,7 +6955,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
           const subtotalD = Math.round((d.monto / (1 + tasaIvaAnticipoEfectivaGuard)) * 100) / 100;
           const ivaD      = Math.round((d.monto - subtotalD) * 100) / 100;
           const refOpaD      = `OPA-${d.folio}`;
-          const serieCierreD = serieEgresoAnticipoGuard ?? refOpaD;
+          const serieCierreD = serieEgresoAnticipoGuard ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaD;
           if (subtotalD > 0) {
             todosLosMovimientos.push({
               ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
@@ -6908,7 +6979,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
         // Columna C (serie) = folio del Egreso real cuando existe; columna H
         // (concepto) = siempre "OPA-..." — ver comentario equivalente en
         // generarPropuesta.
-        const serieCierreGuard = serieEgresoAnticipoGuard ?? refOpaGuard;
+        const serieCierreGuard = serieEgresoAnticipoGuard ?? (cfdi.serie && cfdi.folio ? `${cfdi.serie}-${cfdi.folio}`.slice(0, 25) : null) ?? refOpaGuard;
         if (subtotalAnticipoGuard > 0) {
           todosLosMovimientos.push({
             ...baseInfoGuard, cuentaId: cuentaAnticiposIdGuard,
@@ -7327,6 +7398,9 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
   // Sustitutos excluidos automáticamente por riesgo de doble conteo — ver
   // _particionarSustitutosPorRiesgo. Los "normales" (sin riesgo detectado) no
   // generan advertencia: ya están contabilizados igual que cualquier CFDI.
+  if (anticiposACobranzaGuard.length) {
+    advertencias.push(`ℹ ${anticiposACobranzaGuard.length} anticipo(s) que salieron del sobrante de un depósito de cobranza (cuentas PPD con complemento) no se registran aquí: van en la póliza de Cobranza — ${anticiposACobranzaGuard.join(', ')}`);
+  }
   if (sustitutosGuard.length) {
     advertencias.push(
       `⚠ ${sustitutosGuard.length} CFDI(s) sustituto(s) excluido(s) automáticamente de esta póliza por riesgo de doble conteo — revisa "sustitutosExcluidos" antes de incorporarlos manualmente`,
@@ -7698,9 +7772,22 @@ async function _uuidsPorFechaEfectiva({ rfc, ejercicio, periodo, tipoCfdi, fecha
   //    — acotado al rango de días, no a todo el histórico. Esto también
   //    reclasifica hacia este día CFDIs cuyo fecha SAT ingenuo cayó en OTRO
   //    día pero cuya fecha ERP real sí es este.
-  const erpEnRango = await CFDI.find({ ...filtroComun, source: 'ERP', fecha: { $gte: mxInicio, $lte: mxFin } })
-    .select('uuid').lean();
-  const resultado = new Set(erpEnRango.map(c => c.uuid.toUpperCase()));
+  //    Excepción: fecha ERP justo a medianoche (T00:00:00.000Z) = factura con
+  //    fecha de día sin hora (Kore FechaGeneracion "…T06:00:00Z", ya pasada a
+  //    hora local por `parseFechaFacturaERP`) — va a SU día, no al anterior
+  //    (2026-10-14, caso real Puerto: O0-261000076 con fecha 12-oct 00:00,
+  //    timbrada el 13, quedaba en el 11-oct y no salía en ninguna póliza;
+  //    9 facturas así el 12-oct). Una hora UTC real nunca cae exacta en
+  //    00:00:00.000, así que el resto (copias viejas aún en UTC real) no cambia.
+  const medianochesDelRango = _diasDelRango({ fechaInicio, fechaFin }).map(d => new Date(`${d}T00:00:00.000Z`));
+  const erpEnRango = await CFDI.find({
+    ...filtroComun, source: 'ERP',
+    $or: [{ fecha: { $gte: mxInicio, $lte: mxFin } }, { fecha: { $in: medianochesDelRango } }],
+  }).select('uuid fecha').lean();
+  const esMedianocheExacta = f => f instanceof Date && f.getTime() % 86400000 === 0;
+  const resultado = new Set(erpEnRango
+    .filter(c => !esMedianocheExacta(c.fecha) || (c.fecha >= naiveInicio && c.fecha <= naiveFin))
+    .map(c => c.uuid.toUpperCase()));
 
   // 4. SAT sin homólogo ERP → fallback a su propio fecha (ya está en rango,
   //    viene del paso 1). Los que SÍ tienen homólogo se descartan aquí: su
@@ -7925,6 +8012,6 @@ module.exports = {
   // la numeración de folio (comparte el mismo contador/rango por sucursal que
   // Ingreso — duplicarla arriesgaría folios chocados entre ambos). Ninguna de
   // estas funciones tiene lógica de negocio de Ingreso: son utilería pura.
-  _folioSiguienteDisponible, _rangoFolioPorSucursal, _esCedisPorSucursal, FOLIOS_MAX_CEDIS,
+  _folioSiguienteDisponible, _rangoFolioPorSucursal, _esCedisPorSucursal, FOLIOS_MAX_CEDIS, RANGO_FOLIO_COBRANZA,
   _medianocheMx, _diaSiguiente,
 };

@@ -39,6 +39,7 @@ const { BadRequestError } = require('../../shared/errors/AppError');
 const centrosSvc = require('../centros-costo/centros-costo.service');
 const mappingSvc = require('./cfdi-mapping.service');
 const fichaEfectivoSvc = require('./cobranza-ficha-efectivo.service');
+const opaCobranzaSvc = require('./opa-cobranza.service');
 const { _getRulesActive } = require('./balanza-preliminar.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
 const {
@@ -73,6 +74,12 @@ const CODIGO_CUENTA_CLIENTES          = '1103010001';
 // "NI") en vez de al banco.
 const CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS = '2103030001';
 const REGLA_NO_IDENTIFICADO = 'NI';
+// OPA nacida del sobrante de un depósito de cobranza (ver opa-cobranza.service.js):
+// se registra en Cobranza con el complemento que liquida las cuentas de ese
+// depósito — Cargo por su monto (banco o NI, igual que el resto del depósito)
+// y Abono a Anticipos de Clientes + IVA de anticipos. Ingreso ya no la registra.
+const CODIGO_CUENTA_ANTICIPOS_CLIENTES = '2103010001';
+const REGLA_OPA_COBRANZA = 'OPA-COBRANZA';
 const TASA_IVA_SALDO_FAVOR          = 0.16;
 const TIPO_ORIGEN_CARGO_ESPECIAL    = 'Cargo Especial';
 const CHUNK_SIZE                    = 200;
@@ -307,7 +314,8 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 // donde se cobró, según cómo se mueve ese dinero:
 //   - efectivo en Puerto (O0): se deposita → 1102011001 "EFECTIVO-COS" (centro
 //     120; antes "DEP. PTO", el usuario pidió EFECTIVO-COS el 2026-10-06)
-//   - efectivo en otra caja (C0, F0…): se queda ahí → 1101010003 "EFECTIVO-COS"
+//   - efectivo en otra caja (C0, F0…): "EFECTIVO-COS" en Caja aquí; desde
+//     2026-10-14 `_efectivoABanco` lo pasa a 1102011001 como todo el efectivo
 //   - tarjeta: 1101010001 "TARJETA DE CREDITO"/"TARJETA DE DEBITO"
 const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'EFECTIVO-COS' };
 const CODIGO_CUENTA_BANCO_DEPOSITO_CAJA = '1102011001';
@@ -330,6 +338,23 @@ function _cargoCobroOtraCaja(fp, cuentaMap, ccBySerieMap) {
     return { cuentaId: cuentaMap[CODIGO_CUENTA_CAJA_GENERAL], serie: ETIQUETA_TARJETA[fp.claveSat], ...centro };
   }
   return null;
+}
+
+// Todo el efectivo de Cobranza va a BBVA 1102011001 (2026-10-14, pedido del
+// usuario, póliza 1247 del 13-oct): el de la caja A0 que no se pudo cuadrar
+// con una ficha (o sin ficha capturada aún), el de cada sucursal ("EFECTIVO
+// 111") y el EFECTIVO-COS de cualquier caja — antes se quedaban en Caja
+// 1101010003 y solo Puerto iba a BBVA. Muta `movs`.
+function _efectivoABanco(movs, cuentaMap) {
+  const idCaja = cuentaMap[CODIGO_CUENTA_CAJA];
+  const idBanco = cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA];
+  if (!idCaja || !idBanco) return;
+  for (const m of movs) {
+    // Con desglose real solo el efectivo (una tarjeta puede caer en la cuenta
+    // de la regla, que para Reg 7A es esta misma Caja).
+    const esEfectivo = m._formaPagoReal == null || m._formaPagoReal === '01';
+    if (m.cuentaId === idCaja && Number(m.debe) > 0 && esEfectivo) m.cuentaId = idBanco;
+  }
 }
 
 /**
@@ -702,8 +727,21 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     .select('uuid tipoDeComprobante metodoPago formaPago fecha folio serie emisor receptor subTotal total descuento impuestos complementoPago conceptos cfdiRelacionados tasaIvaInferida')
     .lean();
 
+  // Cobro revertido en Kore: el ERP ya pidió cancelar su complemento
+  // ("Cancelacion Pendiente") pero el SAT aún lo da Vigente — contarlo junto
+  // con el cobro que lo reemplaza duplicaba las facturas (2026-10-13, caso real
+  // JULIO CESAR MORALES LUIS 8-oct: Pago A0-261003800 efectivo $6,852.18
+  // revertido y vuelto a cobrar por transferencia en A0-261003895).
+  const ERP_STATUS_CANCELANDO = ['Cancelacion Pendiente', 'Cancelado'];
+  const enCancelacionErp = cfdis.length
+    ? await CFDI.find({ uuid: { $in: cfdis.map(c => c.uuid) }, source: 'ERP', erpStatus: { $in: ERP_STATUS_CANCELANDO } })
+      .select('uuid serie folio total erpStatus').lean()
+    : [];
+  const uuidsEnCancelacion = new Set(enCancelacionErp.map(c => c.uuid.toUpperCase()));
+
   const cfdisSinPoliza = cfdis.filter(c =>
     !uuidsYaUsados.has(c.uuid) &&
+    !uuidsEnCancelacion.has((c.uuid || '').toUpperCase()) &&
     (!formaPagoFiltro || FORMA_PAGO_A_CATEGORIA[_formaPagoResuelta(c)] === formaPagoFiltro),
   );
 
@@ -756,6 +794,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
         CODIGO_CUENTA_CAJA, CODIGO_CUENTA_BANCOS, CODIGO_CUENTA_SALDO_FAVOR, CODIGO_CUENTA_IVA_SALDO_FAVOR,
         CODIGO_CUENTA_PUENTE_SUCURSALES, CODIGO_CUENTA_IVA_POR_TRASLADAR, CODIGO_CUENTA_IVA_TRASLADADO, CODIGO_CUENTA_CLIENTES,
         CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS, CODIGO_CUENTA_BANCO_DEPOSITO_CAJA, CODIGO_CUENTA_CAJA_GENERAL,
+        CODIGO_CUENTA_ANTICIPOS_CLIENTES,
       ]),
   )];
   const cuentasRows = codigosNecesarios.length
@@ -810,6 +849,13 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     }
   }
 
+  // 7a. OPA del sobrante de los depósitos de estos complementos — ver `_movimientosOpaDeCobranza`.
+  const opaCobranza = await _movimientosOpaDeCobranza({ cfdiConRegla, doctosPorUuid, cuentaMap, ccBySerieMap, rfc });
+  todosLosMovimientos.push(...opaCobranza.movs);
+  if (opaCobranza.agregadas.length) {
+    advertencias.push(`ℹ ${opaCobranza.agregadas.length} anticipo(s) (OPA) del sobrante de un depósito de cobranza registrado(s) aquí, no en Ingreso: ${opaCobranza.agregadas.join(', ')}`);
+  }
+
   // 7b. Efectivo cobrado en la caja de CEDIS contra la ficha "dd/mm COBRANZA"
   // (cargo al banco + PXA) — solo por día y cuando la póliza incluye CEDIS.
   if (fechaInicio && fechaInicio === fechaFin && (!centroCostoId || serieDelCentro === fichaEfectivoSvc.CAJA_COBRANZA_CEDIS)) {
@@ -818,6 +864,10 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
       centroCostoCedis: ccBySerieMap[fichaEfectivoSvc.CAJA_COBRANZA_CEDIS]?.clave ?? null,
     }));
   }
+
+  // 7c. Efectivo que siga en Caja → BBVA (ver `_efectivoABanco`). Va después
+  // de 7b porque la ficha toma sus candidatos de la Caja.
+  _efectivoABanco(todosLosMovimientos, cuentaMap);
 
   // 8. Cobros de otra sucursal PENDIENTES DE CONSUMIR — facturas de ESTA
   // sucursal (centroCostoId, si se especificó una) que se cobraron en otra y
@@ -879,12 +929,89 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
   if (pendientesCruzadosParaEncolar.length) {
     advertencias.push(`⚠ ${pendientesCruzadosParaEncolar.length} factura(s) de otra(s) sucursal(es) cobrada(s) aquí — se encolarán para que su sucursal cierre su CxC al generar su propia póliza`);
   }
+  const enCancelacionDelCentro = centroCostoId
+    ? enCancelacionErp.filter(c => String(ccBySerieMap[c.serie]?.id ?? '') === String(centroCostoId))
+    : enCancelacionErp;
+  if (enCancelacionDelCentro.length) {
+    const lista = enCancelacionDelCentro.map(c => `${c.serie}-${c.folio} $${Number(c.total).toFixed(2)} (${c.erpStatus})`).join(', ');
+    advertencias.push(`⚠ ${enCancelacionDelCentro.length} complemento(s) de pago excluido(s): cobro revertido en Kore, el ERP pidió cancelarlo pero el SAT aún lo da Vigente — confirmar su cancelación ante el SAT: ${lista}`);
+  }
 
   return {
     cfdisSinPoliza: cfdisFiltrado, todosLosMovimientos, sinRegla, advertencias, ruleUsageCount,
     sustitutos: sustitutosExcluidos, ccBySerieMap, serieDelCentro,
     pendientesCruzadosParaEncolar, pendientesConsumidos,
   };
+}
+
+/**
+ * Movimientos de la OPA que nació del sobrante de un depósito de cobranza (caso
+ * real MINI ABASTOS dep 046486: 3 cuentas PPD $7,410.51 + OPA-01106 $68.91).
+ * Va con el primer complemento del lote que liquida una cuenta de ese depósito,
+ * para que el depósito salga completo: Cargo por el monto de la OPA (al banco;
+ * si el depósito es de un mes anterior al complemento, a Depósitos No
+ * Identificados + IVA "NI", igual que el resto de ese depósito) y Abono a
+ * Anticipos de Clientes + IVA de anticipos. Una OPA ya registrada en otra
+ * póliza de Cobranza vigente no se repite.
+ */
+async function _movimientosOpaDeCobranza({ cfdiConRegla, doctosPorUuid, cuentaMap, ccBySerieMap, rfc }) {
+  const vacio = { movs: [], agregadas: [] };
+  if (!cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES] || !cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR]) return vacio;
+
+  const pagoPorFactura = new Map(); // uuid de factura → primer Pago del lote que la liquida
+  for (const { cfdi, rule } of cfdiConRegla) {
+    if (!rule) continue;
+    for (const d of (doctosPorUuid.get(cfdi.uuid) ?? [])) {
+      if (d.idDocumento && !pagoPorFactura.has(d.idDocumento)) pagoPorFactura.set(d.idDocumento, cfdi);
+    }
+  }
+  const depositos = await opaCobranzaSvc.depositosConOpaPorFacturas([...pagoPorFactura.keys()]);
+  if (!depositos.length) return vacio;
+
+  const referencias = [...new Set(depositos.flatMap(d => d.opas.map(o => o.referencia)))];
+  const yaRegistradas = new Set((await PolizaMovimiento.findAll({
+    where: { serie: { [Op.in]: referencias }, reglaNombre: REGLA_OPA_COBRANZA },
+    attributes: ['serie'],
+    include: [{ model: Poliza, as: 'poliza', attributes: [], where: { rfc, estado: { [Op.ne]: 'cancelada' } }, required: true }],
+    raw: true,
+  })).map(r => r.serie));
+
+  const movs = [];
+  const agregadas = [];
+  const vistas = new Set();
+  const r2 = n => Math.round(n * 100) / 100;
+  for (const dep of depositos) {
+    const pago = [...dep.facturasPpd].map(u => pagoPorFactura.get(u)).find(Boolean);
+    if (!pago) continue;
+    const cc = pago.serie ? (ccBySerieMap[pago.serie] ?? null) : null;
+    const mesDeposito = dep.fecha ? new Date(dep.fecha).toISOString().slice(0, 7) : null;
+    const mesComplemento = pago.fecha ? new Date(pago.fecha).toISOString().slice(0, 7) : null;
+    const esNoIdentificado = !!(mesDeposito && mesComplemento && mesDeposito < mesComplemento && cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS]);
+    for (const opa of dep.opas) {
+      if (yaRegistradas.has(opa.referencia) || vistas.has(opa.referencia)) continue;
+      vistas.add(opa.referencia);
+      const subtotal = r2(opa.monto / (1 + TASA_IVA_SALDO_FAVOR));
+      const iva = r2(opa.monto - subtotal);
+      const base = {
+        concepto: [pago.receptor?.nombre, opa.referencia].filter(Boolean).join(' / ').slice(0, 500),
+        serie: opa.referencia, cfdiUuid: pago.uuid, facturaUuid: null,
+        rfcTercero: pago.receptor?.rfc ?? null, ventaFecha: pago.fecha ? new Date(pago.fecha).toISOString().slice(0, 10) : null,
+        centroCosto: cc?.clave ?? null, centroCostoId: cc?.id ?? null, cuentaFaltante: false,
+        tipoComprobante: 'P', metodoPago: pago.metodoPago ?? null, formaPago: '03', folio: pago.folio ?? null,
+        rfcEmisor: pago.emisor?.rfc ?? null, rfcReceptor: pago.receptor?.rfc ?? null, tipoOrigen: 'Pago',
+      };
+      if (esNoIdentificado) {
+        movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS], debe: subtotal, haber: 0, reglaNombre: REGLA_NO_IDENTIFICADO });
+        movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: iva, haber: 0, reglaNombre: REGLA_NO_IDENTIFICADO });
+      } else {
+        movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_BANCOS] ?? null, cuentaFaltante: !cuentaMap[CODIGO_CUENTA_BANCOS], debe: opa.monto, haber: 0, reglaNombre: REGLA_OPA_COBRANZA });
+      }
+      movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_ANTICIPOS_CLIENTES], debe: 0, haber: subtotal, reglaNombre: REGLA_OPA_COBRANZA });
+      movs.push({ ...base, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR], debe: 0, haber: iva, reglaNombre: REGLA_OPA_COBRANZA });
+      agregadas.push(`${opa.referencia} $${opa.monto.toFixed(2)}`);
+    }
+  }
+  return { movs, agregadas };
 }
 
 // Mismas categorías/códigos que usa el export CONTPAQ (poliza.service.js) —
@@ -923,15 +1050,16 @@ async function generarPropuestaCobranza({ rfc, ejercicio, periodo, tipoPropuesta
  * Genera y persiste (como póliza en estado 'borrador') los CFDIs tipo P
  * (Cobranza) sin póliza del periodo/sucursal indicados.
  */
-async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta = 'D', centroCostoId, fechaInicio, fechaFin, formaPagoFiltro }) {
+async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta = 'D', centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user }) {
   const {
     todosLosMovimientos, sinRegla, advertencias, sustitutos, ccBySerieMap, cfdisSinPoliza, ruleUsageCount,
     pendientesCruzadosParaEncolar, pendientesConsumidos,
   } = await _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro });
 
   // Numeración de folio: se reutiliza la utilería de cfdi-poliza-generator.
-  // service.js (require perezoso — ver docstring del archivo) porque Ingreso
-  // y Cobranza comparten el mismo contador/rango por sucursal.
+  // service.js (require perezoso — ver docstring del archivo), pero con el
+  // rango propio de Cobranza (01–99 por mes, uno solo para todas las
+  // sucursales, ver RANGO_FOLIO_COBRANZA) — ya no el rango por sucursal de Ingreso.
   const generatorUtils = require('./cfdi-poliza-generator.service');
   const fecha = fechaInicio ? new Date(`${fechaInicio}T12:00:00.000Z`) : new Date();
   const concepto = _construirConceptoCobranza({ fechaInicio, fechaFin, ejercicio, periodo });
@@ -942,22 +1070,20 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
       { replacements: { key: `poliza-${tipoPropuesta}-${rfc}-${ejercicio}-${periodo}` }, transaction: t },
     );
 
-    const centroFolio = centroCostoId
-      ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))
-      : null;
-    const rangoFolio = generatorUtils._rangoFolioPorSucursal(centroFolio?.sucursal);
-    const foliosNecesarios = generatorUtils._esCedisPorSucursal(centroFolio?.sucursal) ? generatorUtils.FOLIOS_MAX_CEDIS : 1;
-
+    const rangoFolio = generatorUtils.RANGO_FOLIO_COBRANZA;
     const { numero, agotado } = await generatorUtils._folioSiguienteDisponible({
-      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t,
+      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios: 1, ccBySerieMap, transaction: t,
+      unFolioPorPoliza: true,
     });
     if (agotado) {
-      throw new BadRequestError(`Se agotó el rango de folios de ${centroFolio.sucursal} para este periodo (${rangoFolio.desde}-${rangoFolio.hasta}).`);
+      throw new BadRequestError(`Se agotó el rango de folios de Cobranza para este periodo (${rangoFolio.desde}-${rangoFolio.hasta}).`);
     }
 
     const polizaHeader = await Poliza.create({
       tipo: tipoPropuesta, numero, fecha: fecha.toISOString().slice(0, 10), concepto,
       ejercicio: Number(ejercicio), periodo: Number(periodo), rfc, estado: 'borrador',
+      // Antes no se guardaba (Cobranza quedaba con creadoPor NULL) — mismo criterio que userLabel().
+      creadoPor: user?.nombre || user?.email || String(user?.dbId ?? 'sistema'),
       sustitutosExcluidos: sustitutos.length ? sustitutos : null,
       pendientesPorFacturar: null,
     }, { transaction: t });
@@ -1004,5 +1130,5 @@ async function generarYGuardarCobranza({ rfc, ejercicio, periodo, tipoPropuesta 
 
 module.exports = {
   generarPropuestaCobranza, generarYGuardarCobranza,
-  cfdiToMovimientosCobranza, _prefetchDoctosPago,
+  cfdiToMovimientosCobranza, _prefetchDoctosPago, _movimientosOpaDeCobranza, _efectivoABanco,
 };

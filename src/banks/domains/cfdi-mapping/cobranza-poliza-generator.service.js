@@ -494,8 +494,16 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       // se encola en `pendientesCruzados` para que `_procesarCobranza` lo
       // guarde en CobroSucursalPendienteCobranza; la vendedora lo consume al
       // generar su propia póliza.
+      // Póliza única del día con TODAS las sucursales (`context.porSucursal`
+      // false, la forma normal desde oct-2026): no hay otra póliza que vaya a
+      // cerrar la CxC, así que la factura de otra sucursal cierra aquí igual
+      // que una propia (IVA + Clientes), solo con el centro de costo de la
+      // vendedora (caso real QUELONIA 15-oct, Pago E0-261000191 con facturas
+      // I0 de Promotoria que se quedaban en el puente).
       const ccVendedora = context.ccBySerieMap?.[d.serie] ?? null;
-      const esCruzada = !!(ccVendedora && context.ccActual && String(ccVendedora.id) !== String(context.ccActual.id));
+      const deOtraSucursal = !!(ccVendedora && context.ccActual && String(ccVendedora.id) !== String(context.ccActual.id));
+      const esCruzada = deOtraSucursal && context.porSucursal !== false;
+      const centroFactura = deOtraSucursal && !esCruzada ? { _centroCostoFijo: ccVendedora } : {};
 
       // 1. Cargo (+SF si esta factura se pagó con saldo a favor).
       const montoLineaCargo = esUltimo
@@ -610,13 +618,13 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       } else {
         // 2. IVA cobrado (swap cuentaIvaPPD → cuentaIva) — IVA real de ESTA factura.
         if (aplicaIvaCobrado && ivaFactura > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
+          movs.push({ ...baseFactura, ...centroFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
+          movs.push({ ...baseFactura, ...centroFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
         }
 
         // 3. Abono que cierra la CxC de esta factura.
         if (montoLineaAbono > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
+          movs.push({ ...baseFactura, ...centroFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
         }
       }
     });
@@ -820,7 +828,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     // pueda comparar contra la sucursal VENDEDORA de cada factura liquidada
     // y detectar un cobro cruzado (ver `context.ccActual`/`ccBySerieMap`).
     const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
-    const context = { ccActual: cc, ccBySerieMap };
+    const context = { ccActual: cc, ccBySerieMap, porSucursal: !!centroCostoId };
     const doctosPago = doctosPorUuid.get(cfdi.uuid);
     if (doctosPago) context.doctosPago = doctosPago;
 

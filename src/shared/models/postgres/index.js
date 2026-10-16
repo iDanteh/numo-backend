@@ -410,6 +410,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS depositos_efectivo_no_conciliados JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN depositos_efectivo_no_conciliados:', e.message));
 
+  // Folios CONTPAQi de las NC de CEDIS (201–299) — ver Poliza.contpaqFoliosNc.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS contpaq_folios_nc JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN contpaq_folios_nc:', e.message));
+
   // El índice único (tipo, numero, rfc, ejercicio, periodo) bloqueaba para
   // siempre el folio de una póliza cancelada (la fila sigue existiendo,
   // solo con estado='cancelada') — impedía reutilizar ese folio en una

@@ -79,6 +79,7 @@ const indicadoresService = require('./bank-indicadores.service');
 const auxiliaryParser = require('./bank-auxiliary.parser');
 const { User: PgUser } = require('../../../shared/models/postgres');
 const { PERMISSIONS, MOVEMENT_SCOPE } = require('../../../shared/config/rbac');
+const OKPERMS = JSON.stringify([PERMISSIONS.BANKS_READ]); // header de permisos para GET /movements (ahora exige banks:read)
 
 describe('GET /cfdis/buscar', () => {
   let app;
@@ -715,6 +716,7 @@ describe('GET /movements', () => {
 
     await request(app)
       .get('/movements')
+      .set('x-test-permissions', OKPERMS)
       .query({ status: 'otros' });
 
     const args = service.listMovements.mock.calls[0][0];
@@ -722,9 +724,74 @@ describe('GET /movements', () => {
     expect(args.identificadoPorUsuario).toBeUndefined();
   });
 
+  test('sin banks:read: 403 (antes cualquier usuario logueado veía movimientos)', async () => {
+    const res = await request(app).get('/movements'); // sin x-test-permissions
+    expect(res.status).toBe(403);
+    expect(service.listMovements).not.toHaveBeenCalled();
+  });
+
+  test('movId sin banks:config (scope OWN): aplica excluirOtros y soloPropioONoIdentificado (cierra el IDOR)', async () => {
+    await request(app)
+      .get('/movements')
+      .set('x-test-permissions', OKPERMS)
+      .query({ movId: 'aaaaaaaaaaaaaaaaaaaaaaaa' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.movId).toBe('aaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(args.excluirOtros).toBe('1');
+    expect(args.soloPropioONoIdentificado).toBe('user-test');
+  });
+
+  test('movId con banks:cobranza:identificados:all (scope ALL): excluirOtros sí, soloPropio no (ve todos los identificados)', async () => {
+    rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL);
+    await request(app)
+      .get('/movements')
+      .set('x-test-permissions', OKPERMS)
+      .query({ movId: 'aaaaaaaaaaaaaaaaaaaaaaaa' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.excluirOtros).toBe('1');
+    expect(args.soloPropioONoIdentificado).toBeUndefined();
+  });
+
+  test('movId con banks:config: pasa tal cual, sin restricciones de movId', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+    await request(app)
+      .get('/movements')
+      .set('x-test-permissions', OKPERMS)
+      .query({ movId: 'aaaaaaaaaaaaaaaaaaaaaaaa' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.excluirOtros).toBeUndefined();
+    expect(args.soloPropioONoIdentificado).toBeUndefined();
+  });
+
+  test('status=identificado,otros (scope OWN): se descarta otros y se acota identificado al dueño (cierra el bypass por coma)', async () => {
+    await request(app)
+      .get('/movements')
+      .set('x-test-permissions', OKPERMS)
+      .query({ status: 'identificado,otros' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('identificado');
+    expect(args.identificadoPorUsuario).toBe('user-test');
+  });
+
+  test('status=" identificado " con espacios (scope OWN): se normaliza y se acota al dueño', async () => {
+    await request(app)
+      .get('/movements')
+      .set('x-test-permissions', OKPERMS)
+      .query({ status: ' identificado ' });
+
+    const args = service.listMovements.mock.calls[0][0];
+    expect(args.status).toBe('identificado');
+    expect(args.identificadoPorUsuario).toBe('user-test');
+  });
+
   test('sin banks:config ni el permiso nuevo: status=identificado fuerza identificadoPorUsuario al propio usuario', async () => {
     await request(app)
       .get('/movements')
+      .set('x-test-permissions', OKPERMS)
       .query({ status: 'identificado' });
 
     const args = service.listMovements.mock.calls[0][0];
@@ -740,6 +807,7 @@ describe('GET /movements', () => {
 
     await request(app)
       .get('/movements')
+      .set('x-test-permissions', OKPERMS)
       .query({ status: 'identificado' });
 
     expect(rbacStore.hasPermission).toHaveBeenCalledWith('test-role', PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL, []);
@@ -760,6 +828,7 @@ describe('GET /movements', () => {
 
     await request(app)
       .get('/movements')
+      .set('x-test-permissions', OKPERMS)
       .query({ search: '1234' });
 
     const args = service.listMovements.mock.calls[0][0];
@@ -769,7 +838,7 @@ describe('GET /movements', () => {
   test('sin status NI search, con banks:cobranza:identificados:all: el default NO cambia (sigue sin identificado)', async () => {
     rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL);
 
-    await request(app).get('/movements');
+    await request(app).get('/movements').set('x-test-permissions', OKPERMS);
 
     const args = service.listMovements.mock.calls[0][0];
     expect(args.status).toBe('no_identificado,reclasificado');
@@ -778,6 +847,7 @@ describe('GET /movements', () => {
   test('sin el permiso nuevo (scope OWN), con search: el default NO se ensancha (sigue sin identificado)', async () => {
     await request(app)
       .get('/movements')
+      .set('x-test-permissions', OKPERMS)
       .query({ search: '1234' });
 
     const args = service.listMovements.mock.calls[0][0];
@@ -789,6 +859,7 @@ describe('GET /movements', () => {
 
     const res = await request(app)
       .get('/movements')
+      .set('x-test-permissions', OKPERMS)
       .query({ status: 'otros' });
 
     expect(res.body).toEqual({ data: [], pagination: { total: 0, page: 1, limit: 50, pages: 0 } });
@@ -798,7 +869,7 @@ describe('GET /movements', () => {
   // banks:ocultar-roles:bypass (2026-10-02): bypass angosto de ocultamiento-por-rol,
   // separado de banks:admin a propósito — no debe depender de ningún otro permiso.
   test('sin ningún permiso: rolActual va con el rol del usuario (sigue restringido por ocultarRoles)', async () => {
-    await request(app).get('/movements');
+    await request(app).get('/movements').set('x-test-permissions', OKPERMS);
 
     const args = service.listMovements.mock.calls[0][0];
     expect(args.rolActual).toBe('test-role');
@@ -807,7 +878,7 @@ describe('GET /movements', () => {
   test('con banks:ocultar-roles:bypass (sin banks:admin): rolActual viaja null (ve movimientos ocultos-por-rol)', async () => {
     rbacStore.hasPermission.mockImplementation(async (_role, perm) => perm === PERMISSIONS.BANKS_OCULTAR_ROLES_BYPASS);
 
-    await request(app).get('/movements');
+    await request(app).get('/movements').set('x-test-permissions', OKPERMS);
 
     const args = service.listMovements.mock.calls[0][0];
     expect(args.rolActual).toBeNull();

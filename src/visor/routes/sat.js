@@ -21,8 +21,12 @@ const credUpload = multer({
 });
 
 // ── Verificación ──────────────────────────────────────────────────────────────
+// verify escribe satStatus en el CFDI (updateMany): exige visor:sat, igual que
+// verify-batch (2026-10-19, auditoría — antes solo authenticate, cualquier
+// usuario podía marcar un CFDI como "No Encontrado").
 router.post('/verify',
   authenticate,
+  permit('visor:sat'),
   [
     body('uuid').isUUID().withMessage('UUID inválido'),
     body('rfcEmisor').notEmpty().withMessage('RFC Emisor requerido'),

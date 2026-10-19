@@ -204,6 +204,7 @@ const startServer = async () => {
   require('./system-monitor/system-monitor.cron');
   require('./visor/jobs/cfdisNoRecuperadosAlertJob');
   await require('./visor/sat/credenciales').asegurarTtlIndice();
+  await require('./visor/jobs/satSyncJob').liberarVerificandoHuerfanos();
   await require('./visor/jobs/backendCaidoAlertJob').revisarCaidaAlArrancar();
   try {
     await seed();

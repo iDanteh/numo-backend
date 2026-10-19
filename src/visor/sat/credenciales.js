@@ -266,7 +266,34 @@ const marcarAlertaEnviada = async (rfc, tipo) => {
   );
 };
 
+/**
+ * Alinea el índice TTL de Mongo con la duración que declara el modelo
+ * (`expires` de `createdAt` en SATCredencial.js). Mongoose crea el índice la
+ * primera vez pero NUNCA lo modifica si después cambia `expires` — en prod se
+ * quedó en 3 días (herencia de mayo, 12 h → 3 días → 5 días) mientras el
+ * código asumía 5: Mongo borraba las credenciales justo cuando faltaban
+ * "48 h" y los avisos de 2 días / 1 día / N horas nunca salían (2026-10-19).
+ * Se llama al arrancar el servidor; nunca lanza.
+ */
+const asegurarTtlIndice = async () => {
+  try {
+    const esperado = SATCredencial.schema.path('createdAt').options.expires;
+    const indices  = await SATCredencial.collection.indexes();
+    const ttl = indices.find(i => i.key?.createdAt === 1 && i.expireAfterSeconds != null);
+    if (!ttl || ttl.expireAfterSeconds === esperado) return;
+    await SATCredencial.db.db.command({
+      collMod: SATCredencial.collection.collectionName,
+      index:   { keyPattern: { createdAt: 1 }, expireAfterSeconds: esperado },
+    });
+    logger.warn(`[Credenciales] Índice TTL corregido: ${ttl.expireAfterSeconds}s → ${esperado}s`);
+  } catch (err) {
+    // Colección todavía inexistente (instalación nueva): Mongoose crea el índice bien.
+    if (err.codeName === 'NamespaceNotFound') return;
+    logger.error(`[Credenciales] No se pudo verificar el índice TTL: ${err.message}`);
+  }
+};
+
 module.exports = {
   guardar, obtener, eliminar, limpiarBuffers, tieneCredenciales, actualizarKey,
-  listarParaAlertas, marcarAlertaEnviada,
+  listarParaAlertas, marcarAlertaEnviada, asegurarTtlIndice,
 };

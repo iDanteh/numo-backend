@@ -197,6 +197,16 @@ describe('cambiarNip', () => {
     expect(card.nipIntentosFallidos).toBe(0);
     expect(card.nipBloqueadoHasta).toBeNull();
   });
+
+  test('bug real corregido (2026-10-19): registra quién hizo el cambio (updatedById/updatedByNombre)', async () => {
+    const card = makeCard({ updatedById: null, updatedByNombre: null });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await cardService.cambiarNip(1, USER);
+
+    expect(card.updatedById).toBe(String(USER.dbId));
+    expect(card.updatedByNombre).toBe(USER.nombre);
+  });
 });
 
 describe('cambiarNivel', () => {

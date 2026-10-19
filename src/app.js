@@ -36,6 +36,7 @@ const systemMonitorRoutes     = require('./system-monitor/system-monitor.routes'
 // Domain routers — Loyalty module (Sistema de Lealtad, PR4/8 sistema-lealtad)
 const loyaltyPublicRoutes     = require('./loyalty/loyalty-public.routes');
 const loyaltyRoutes           = require('./loyalty/loyalty.routes');
+const loyaltyImportRoutes     = require('./loyalty/domains/import/loyalty-import.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -167,6 +168,9 @@ app.use('/api/schedule',          scheduleRoutes);
 // limiter global `/api/` ya montado arriba; el router público además apila su
 // propio `express-rate-limit` dedicado (ver loyalty-public.routes.js).
 app.use('/api/loyalty/public',    loyaltyPublicRoutes);
+// Más específica que '/api/loyalty' — se monta antes para no depender del
+// fallthrough del router genérico (que no conoce esta subruta de todos modos).
+app.use('/api/loyalty/import',    loyaltyImportRoutes);
 app.use('/api/loyalty',           loyaltyRoutes);
 
 // Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se

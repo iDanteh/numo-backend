@@ -518,6 +518,12 @@ async function listMovements(filters) {
     sortBy = 'fecha', sortDir = 'desc',
     status, categorias, identificadoPor,
     identificadoPorUsuario,
+    // excluirOtros / soloPropioONoIdentificado: restricciones para la
+    // navegación por `movId` de usuarios no-config (2026-10-19, auditoría) — ver
+    // bank.routes.js GET /movements. excluirOtros oculta los 'otros';
+    // soloPropioONoIdentificado (userId) deja ver solo lo aún no identificado o
+    // lo identificado por ese mismo usuario.
+    excluirOtros, soloPropioONoIdentificado,
     movId, rolActual,
     // 'amplia' (2026-07-31, pedido explícito para el buscador manual de "Conciliación
     // bancaria" en Solicitudes de Cobro — collection-request.component.ts): opt-in, no cambia
@@ -570,6 +576,23 @@ async function listMovements(filters) {
   if (identificadoPorUsuario) {
     filter.$and = filter.$and ?? [];
     filter.$and.push({ 'identificadoPor.userId': identificadoPorUsuario });
+  }
+
+  // Restricciones de la navegación por `movId` (usuarios no-config, auditoría 2026-10-19).
+  if (excluirOtros) {
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ status: { $ne: 'otros' } });
+  }
+  if (soloPropioONoIdentificado) {
+    // Visible solo si aún no está identificado por nadie, o si lo identificó
+    // este mismo usuario — así la navegación OCR a un depósito pendiente sigue
+    // funcionando sin exponer los depósitos identificados por otros.
+    filter.$and = filter.$and ?? [];
+    filter.$and.push({ $or: [
+      { identificadoPor: { $exists: false } },
+      { identificadoPor: { $size: 0 } },
+      { 'identificadoPor.userId': soloPropioONoIdentificado },
+    ]});
   }
 
   if (fechaInicio || fechaFin) {

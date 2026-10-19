@@ -15,6 +15,10 @@
 const entityRepo = require('../repositories/entity.repository');
 const { tieneCredenciales } = require('./credenciales');
 
+// Roles que ven el banner — mismo arreglo que ROLES_CON_AVISO en
+// numo-frontend core/services/aviso-credenciales.service.ts.
+const ROLES_CON_AVISO = ['admin', 'contabilidad'];
+
 // Mismo umbral que el primer correo de vencimiento (UMBRAL_D2_H en
 // credencialesAlertJob.js) — si cambia uno, cambiar el otro.
 const HORAS_ANTES = 48;
@@ -49,4 +53,4 @@ async function avisosVigentes(ahora = new Date()) {
   return avisos;
 }
 
-module.exports = { avisosVigentes, inicioAviso };
+module.exports = { avisosVigentes, inicioAviso, ROLES_CON_AVISO };

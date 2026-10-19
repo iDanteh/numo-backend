@@ -4,9 +4,10 @@
  * visor/sat/avisoVencimiento.js
  * ─────────────────────────────────────────────────────────────────────────────
  * Banner de credenciales SAT en todas las vistas del frontend (2026-10-19,
- * pedido del usuario): aparece a partir de las 12:00 del día ANTERIOR al
- * vencimiento (hora de México) y no se quita hasta que se vuelvan a subir —
- * si ya vencieron (o nunca se subieron) sigue apareciendo como "faltan".
+ * pedido del usuario): aparece en cuanto empiezan los avisos de vencimiento
+ * — 48 h antes, el mismo momento que el correo "vencen en 2 días" de
+ * credencialesAlertJob.js — y no se quita hasta que se vuelvan a subir; si
+ * ya vencieron (o nunca se subieron) sigue apareciendo como "faltan".
  * Solo entidades activas con descarga automática, igual que el aviso por
  * correo de credenciales faltantes (credencialesAlertJob.js).
  */
@@ -14,20 +15,16 @@
 const entityRepo = require('../repositories/entity.repository');
 const { tieneCredenciales } = require('./credenciales');
 
-const fmtDiaMX = new Intl.DateTimeFormat('en-CA', {
-  timeZone: 'America/Mexico_City', year: 'numeric', month: '2-digit', day: '2-digit',
-});
+// Mismo umbral que el primer correo de vencimiento (UMBRAL_D2_H en
+// credencialesAlertJob.js) — si cambia uno, cambiar el otro.
+const HORAS_ANTES = 48;
 
 /**
- * 12:00 hora de México del día anterior al día (MX) en que vencen.
- * México no tiene horario de verano desde oct-2022 → 12:00 MX = 18:00 UTC.
- *
  * @param {Date} expiraEn
- * @returns {Date}
+ * @returns {Date} desde cuándo se muestra el aviso
  */
 function inicioAviso(expiraEn) {
-  const [y, m, d] = fmtDiaMX.format(expiraEn).split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d - 1, 18, 0, 0));
+  return new Date(expiraEn.getTime() - HORAS_ANTES * 60 * 60 * 1000);
 }
 
 /**

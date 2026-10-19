@@ -60,4 +60,35 @@ describe('parseBankFile — BBVA', () => {
     expect(movements).toHaveLength(1);
     expect(movements[0].numeroAutorizacion).toBe('1234567');
   });
+
+  test('comisiones/IVA/ventas de TERMINALES PUNTO DE VENTA: numeroAutorizacion sale null', async () => {
+    const buffer = await bufferConFilasBBVA([
+      [
+        new Date('2026-10-19T00:00:00.000Z'),
+        'IVA TASA DE DESC CREDITO / 175092773 TERMINALES PUNTO DE VENTA',
+        21.96, null, 8559242.66,
+      ],
+      [
+        new Date('2026-10-19T00:00:00.000Z'),
+        'APLI TASA DE DES CREDITO / 175092773 TERMINALES PUNTO DE VENTA',
+        137.24, null, 8559264.62,
+      ],
+      [
+        new Date('2026-10-19T00:00:00.000Z'),
+        'VENTAS CREDITO / 145092773 TERMINALES PUNTO DE VENTA',
+        null, 8911.73, 8559401.86,
+      ],
+      [
+        new Date('2026-10-19T00:00:00.000Z'),
+        'APLI TASA DE DES CREDITO / 175092781 TERMINALES PUNTO DE VENTA',
+        1.70, null, 8550490.40,
+      ],
+    ]);
+    const { movements } = await parseBankFile(buffer, 'BBVA');
+
+    expect(movements).toHaveLength(4);
+    for (const m of movements) {
+      expect(m.numeroAutorizacion).toBeNull();
+    }
+  });
 });

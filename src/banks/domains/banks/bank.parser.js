@@ -810,6 +810,19 @@ function parseBBVA(sheet) {
       numeroAutorizacion = null;
     }
 
+    // Caso real 2026-10-19: "APLI TASA DE DES CREDITO / 175092781 TERMINALES PUNTO DE
+    // VENTA" e "IVA TASA DE DESC CREDITO / 175092773 TERMINALES PUNTO DE VENTA" — comisiones,
+    // IVA y ventas de terminal punto de venta (TPV). El token tras '/' NO es un folio de
+    // transacción: es un número de terminal/lote que puede repetirse junto con el mismo monto
+    // en registros de otras fechas. Sin este guard, Capa 1b del dedup (bank.service.js, por
+    // numeroAutorizacion+monto, SIN ventana de fecha) reportó 6 movimientos reales de un mismo
+    // archivo como "ya existían" y ninguno se insertó, aunque no estaban en la base. Mismo
+    // guard que los de arriba: null es más honesto que un "auth" que en realidad identifica
+    // la terminal, no la transacción.
+    if (/\bTERMINALES\s+PUNTO\s+DE\s+VENTA\b/i.test(concepto)) {
+      numeroAutorizacion = null;
+    }
+
     // Extraer clave de rastreo SPEI para MORA SPEI NORMABANXICO.
     // BBVA incrusta el ID único de la transacción tras "COMPENSACION DE ":
     //   "MORA SPEI NORMABANXICO / COMPENSACION DE 8846APR1202605085280762645"

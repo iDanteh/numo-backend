@@ -6,7 +6,7 @@ const { body } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   verify, verifyBatch, getStatus,
-  registerCredentials, getCredentialStatus, patchKey,
+  registerCredentials, getCredentialStatus, getAvisosCredenciales, patchKey,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, testKey, exportXml,
   downloadByUUID, resetCheckpoint, getCheckpointsSalud, recuperarErp,
@@ -48,6 +48,9 @@ router.post('/credenciales',
 );
 
 router.get('/credenciales/estado/:rfc',   authenticate, getCredentialStatus);
+// Banner global (todas las vistas, cualquier usuario autenticado): solo RFC,
+// nombre y fecha de vencimiento — nada de las credenciales en sí.
+router.get('/credenciales/avisos',        authenticate, getAvisosCredenciales);
 router.patch('/credenciales/key/:rfc',
   authenticate,
   permit('visor:sat'),

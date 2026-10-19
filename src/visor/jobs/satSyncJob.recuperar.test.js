@@ -27,7 +27,7 @@ jest.mock('../sat/rateLimiter', () => ({ puedeIniciar: jest.fn(async () => ({ pu
 
 const SatJobCheckpoint = require('../models/SatJobCheckpoint');
 const { solicitar, verificar } = require('../sat/download');
-const { recuperarSolicitudesPendientes, procesarDescarga } = require('./satSyncJob');
+const { recuperarSolicitudesPendientes, procesarDescarga, liberarVerificandoHuerfanos } = require('./satSyncJob');
 
 const pendiente = (extra = {}) => ({
   _id: 'cp1', rfc: 'CCO011113663', fecha: '2026-10-09', fechaFin: '2026-10-11',
@@ -198,5 +198,46 @@ describe('descarga del mismo rango con una solicitud pendiente', () => {
     verificar.mockResolvedValue({ idsPaquetes: [], totalCfdis: 0 });
     await correr().catch(() => {});
     expect(solicitar).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('liberarVerificandoHuerfanos (arranque del servidor)', () => {
+  test('pasa los verificando con IdSolicitud vigente (no Metadata) a error + solicitudPendiente', async () => {
+    SatJobCheckpoint.updateMany.mockResolvedValueOnce({ modifiedCount: 1 });
+    await liberarVerificandoHuerfanos();
+
+    expect(SatJobCheckpoint.updateMany).toHaveBeenCalledTimes(1);
+    const [filtro, upd] = SatJobCheckpoint.updateMany.mock.calls[0];
+    expect(filtro.status).toBe('verificando');
+    expect(filtro.idSolicitud).toEqual({ $ne: null });
+    expect(filtro.tipoComprobante.$not.test('Ingresos_Metadata')).toBe(true);
+    expect(filtro.tipoComprobante.$not.test('Recibidos')).toBe(false);
+    // Solo las de las últimas 72 h (después ya no hay paquete que bajar)
+    const horas = (Date.now() - filtro.solicitadaEn.$gte.getTime()) / 36e5;
+    expect(Math.round(horas)).toBe(72);
+    expect(upd.$set).toMatchObject({ status: 'error', solicitudPendiente: true });
+  });
+
+  test('lo que libera lo retoma recuperarSolicitudesPendientes con el mismo IdSolicitud', async () => {
+    // El filtro de recuperarSolicitudesPendientes acepta exactamente lo que deja liberarVerificandoHuerfanos
+    SatJobCheckpoint.updateMany.mockResolvedValueOnce({ modifiedCount: 1 });
+    await liberarVerificandoHuerfanos();
+    const { $set } = SatJobCheckpoint.updateMany.mock.calls[0][1];
+
+    const cp = pendiente({ tipoComprobante: 'Recibidos', ...$set, idSolicitud: '4f861719' });
+    SatJobCheckpoint.find.mockReturnValue({ lean: async () => [cp] });
+    SatJobCheckpoint.findOneAndUpdate.mockResolvedValue(cp);
+    verificar.mockResolvedValue({ idsPaquetes: [], totalCfdis: 0 });
+    await recuperarSolicitudesPendientes({ recibidos: true });
+
+    const filtroRecuperar = SatJobCheckpoint.find.mock.calls[0][0];
+    expect(filtroRecuperar).toMatchObject({ status: $set.status, solicitudPendiente: $set.solicitudPendiente });
+    expect(verificar.mock.calls[0][0]).toBe('4f861719');
+    expect(solicitar).not.toHaveBeenCalled();
+  });
+
+  test('si Mongo falla no lanza (no debe tumbar el arranque)', async () => {
+    SatJobCheckpoint.updateMany.mockRejectedValueOnce(new Error('sin conexión'));
+    await expect(liberarVerificandoHuerfanos()).resolves.toBeUndefined();
   });
 });

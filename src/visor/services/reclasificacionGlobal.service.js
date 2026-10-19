@@ -77,7 +77,9 @@ const _detectarUuidsConCCE = async (cfdis) => {
     for (let i = 0; i < foliosArr.length; i += TAMANO_LOTE_ERP) {
       const lote = foliosArr.slice(i, i + TAMANO_LOTE_ERP);
       try {
-        cuentas.push(...await obtenerDesglosesCobroAlmacen({ rfc, series: [serie], folios: lote }));
+        // Una serie POR folio: Kore exige listas de la misma longitud ("series y
+        // folios de distinta longitud", 400 — 2026-10-19, en log desde 7-oct).
+        cuentas.push(...await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(() => serie), folios: lote }));
       } catch (err) {
         logger.warn(`[ReclasificacionGlobal] Consulta CCE falló para ${rfc}/${serie} (lote ${i}-${i + lote.length}, no crítico, se omite la excepción): ${err.message}`);
       }
@@ -454,4 +456,4 @@ const aplicarReclasificacion = async (filtros = {}, itemsExplicitos = null) => {
   };
 };
 
-module.exports = { generarPlan, aplicarReclasificacion };
+module.exports = { generarPlan, aplicarReclasificacion, _detectarUuidsConCCE };

@@ -426,10 +426,21 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
   const esSplitPagoPorFactura = !esAnticipo && rule.tasaIva !== 'mixto'
     && Array.isArray(context.doctosPago) && context.doctosPago.length > 0;
 
+  // Columna H de las líneas que NO van por factura (IVA cobrado, 0% de tasa
+  // mixta, retenciones, Cargo/Abono del Pago completo): "cliente / ticket(s)"
+  // como en el split por factura (2026-10-19, pedido del usuario: FRIDA SOFIA
+  // FERRER ORTEGA, regla mixto, salía "IVA cobrado - Pago" / "Pago (0%)" y
+  // debía ser "FRIDA SOFIA FERRER ORTEGA / A0-261001422"). Factura sin ticket
+  // conocido → su serie-folio; sin doctosPago → serie-folio del propio Pago.
+  const refsPago = Array.isArray(context.doctosPago) && context.doctosPago.length > 0
+    ? [...new Set(context.doctosPago.flatMap(d => (d.tickets?.length ? d.tickets : [`${d.serie}-${d.folio}`])))]
+    : [serieCfdi];
+  const conceptoPago = [cfdi.receptor?.nombre ?? '', ...refsPago].filter(Boolean).join(' / ').slice(0, 500) || concepto;
+
   if (esAnticipo) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaAnticipo] ?? null, concepto: `IVA ant. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaAnticipo] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
     if (rule.cuentaIva) {
-      movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: `IVA ant. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
+      movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
     }
   }
 
@@ -445,21 +456,21 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     const monto0   = parseFloat((montoAbonoFinal - monto16).toFixed(2));
     if (monto0 > 0.01) {
       montoAbonoFinal = monto16;
-      movs.push({ cuentaId: cuentaMap[rule.cuentaAbono2] ?? null, concepto: `${concepto} (0%)`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: monto0, cfdiUuid: cfdi.uuid, rfcTercero });
+      movs.push({ cuentaId: cuentaMap[rule.cuentaAbono2] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: monto0, cfdiUuid: cfdi.uuid, rfcTercero });
     }
   }
 
   // IVA cobrado sin split por factura (fallback cuando no hay doctosPago).
   if (!esAnticipo && iva > 0 && rule.cuentaIvaPPD && rule.cuentaIva && !esSplitPagoPorFactura) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, concepto: `IVA cobrado - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: `IVA cobrado - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
   if (rule.cuentaIvaRetenido && ivaRet > 0) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaRetenido] ?? null, concepto: `IVA ret. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: ivaRet, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaRetenido] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: ivaRet, cfdiUuid: cfdi.uuid, rfcTercero });
   }
   if (rule.cuentaIsrRetenido && isrRet > 0) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIsrRetenido] ?? null, concepto: `ISR ret. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: isrRet, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIsrRetenido] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: isrRet, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
   const pendientesCruzados = [];
@@ -636,8 +647,8 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     // caían a Bancos por identificar en vez de Caja).
     const esEfectivoCfdi = (cfdi.formaPago ?? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? '') === '01';
     const cuentaCargoFallback = (esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS]) ?? cuentaMap[rule.cuentaCargo] ?? null;
-    movs.push({ cuentaId: cuentaCargoFallback, concepto, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
-    movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
   if (!esSplitPagoPorFactura) {

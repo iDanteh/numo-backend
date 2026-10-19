@@ -201,6 +201,7 @@ const startServer = async () => {
   require('./visor/jobs/cfdiCanceladoNotificacionJob');
   require('./visor/jobs/cfdisNoRecuperadosAlertJob');
   await require('./visor/sat/credenciales').asegurarTtlIndice();
+  await require('./visor/jobs/satSyncJob').liberarVerificandoHuerfanos();
   await require('./visor/jobs/backendCaidoAlertJob').revisarCaidaAlArrancar();
   try {
     await seed();

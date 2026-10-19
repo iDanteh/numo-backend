@@ -602,6 +602,42 @@ const recuperarSolicitudesPendientes = async ({ recibidos = false } = {}) => {
   }
 };
 
+/**
+ * Al arrancar el servidor: un checkpoint en 'verificando' quedó huérfano por
+ * definición (el polling vivía en el proceso anterior). Sin esto se quedaba
+ * así hasta 72 h — el chequeo `enVuelo` de descargarPorSubtipo() además
+ * bloqueaba volver a pedir ese día, y la reanudación `checkpointVerificando`
+ * nunca se alcanza por ese mismo `return` (casos reales: 15-oct y 19-oct,
+ * reinicio por deploy a media verificación de Recibidos). Se pasa a 'error' +
+ * solicitudPendiente para que recuperarSolicitudesPendientes() la retome con
+ * el MISMO IdSolicitud al inicio de la siguiente descarga programada.
+ * Metadata queda fuera: recuperarSolicitudesPendientes() solo baja paquetes
+ * CFDI. Nunca lanza.
+ */
+const liberarVerificandoHuerfanos = async () => {
+  try {
+    const r = await SatJobCheckpoint.updateMany(
+      {
+        status:          'verificando',
+        idSolicitud:     { $ne: null },
+        solicitadaEn:    { $gte: new Date(Date.now() - SOLICITUD_VIGENCIA_MS) },
+        tipoComprobante: { $not: /Metadata/ },
+      },
+      { $set: {
+        status:             'error',
+        solicitudPendiente: true,
+        error:              'El servidor se reinició mientras se verificaba la solicitud — se retoma en la siguiente descarga',
+        updatedAt:          new Date(),
+      } },
+    );
+    if (r.modifiedCount > 0) {
+      logger.warn(`[SatSyncJob] Arranque: ${r.modifiedCount} solicitud(es) SAT en 'verificando' sin proceso — marcadas para retomarse en la siguiente descarga.`);
+    }
+  } catch (err) {
+    logger.error(`[SatSyncJob] Arranque: no se pudieron liberar solicitudes en 'verificando': ${err.message}`);
+  }
+};
+
 const ejecutarDescargaMasiva = async ({ tipos: tiposObjetivo = ['Emitidos'] } = {}) => {
   logger.info(`[SatSyncJob] Iniciando descarga masiva nocturna (${tiposObjetivo.join(', ')})...`);
 
@@ -2328,4 +2364,4 @@ const reprogramarJobs = ({
   }
 })();
 
-module.exports = { ejecutarDescargaMasiva, recuperarSolicitudesPendientes, ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs, _uuidsConciliadosPrevios, _restaurarConciliados };
+module.exports = { ejecutarDescargaMasiva, recuperarSolicitudesPendientes, liberarVerificandoHuerfanos,ejecutarDescargaERP, ejecutarComparacionAuto, ejecutarVerificacionPeriodo, ejecutarVerificacionEstadosCriticos, procesarDescarga, reprogramarJobs, _uuidsConciliadosPrevios, _restaurarConciliados };

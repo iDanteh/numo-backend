@@ -37,6 +37,7 @@ const LoyaltyCard             = require('./LoyaltyCard');
 const LoyaltyPointsLedger     = require('./LoyaltyPointsLedger');
 const LoyaltyTierHistory      = require('./LoyaltyTierHistory');
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
+const LoyaltyPendingEnrollment = require('./LoyaltyPendingEnrollment');
 const PolizaAuditLog    = require('./PolizaAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
@@ -93,6 +94,10 @@ LoyaltyTierHistory.belongsTo(LoyaltyCard,  { foreignKey: 'cardId', as: 'card' })
 LoyaltyPointsLedger.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCosto' });
 CentroCosto.hasMany(LoyaltyPointsLedger,   { foreignKey: 'centroCostoId', as: 'movimientosLealtad' });
 LoyaltyPointsLedger.belongsTo(LoyaltyAdjustmentReason, { foreignKey: 'reasonId', as: 'reason' });
+// Registros en espera (clientes legados sin teléfono, ver LoyaltyPendingEnrollment.js) —
+// se resuelven en una LoyaltyCard real al completar el registro (SET NULL si esa
+// tarjeta se llegara a borrar, nunca arrastra el pendiente consigo).
+LoyaltyPendingEnrollment.belongsTo(LoyaltyCard, { foreignKey: 'cardIdResultante', as: 'card' });
 
 // ── Sincronización ────────────────────────────────────────────────────────────
 
@@ -533,6 +538,22 @@ async function syncModels() {
   await LoyaltyPointsLedger.sync({ force: false });
   await LoyaltyTierHistory.sync({ force: false });
 
+  // Registros en espera de clientes legados sin teléfono (ver
+  // LoyaltyPendingEnrollment.js) — tabla nueva, force:false. Tiene FK a
+  // loyalty_cards (cardIdResultante), así que debe sincronizarse después de
+  // que esa tabla ya exista.
+  await LoyaltyPendingEnrollment.sync({ force: false });
+
+  // Columnas nuevas sobre una tabla que YA existía (2026-10-19, rechazo de pendientes) —
+  // .sync({force:false}) nunca altera una tabla existente, mismo patrón idempotente que el
+  // resto de este archivo (ver comentario de depositos_efectivo_no_conciliados más arriba).
+  await LoyaltyPendingEnrollment.sequelize.query(`
+    ALTER TABLE loyalty_pending_enrollments
+      ADD COLUMN IF NOT EXISTS resuelto_por_id     VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS resuelto_por_nombre VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS resuelto_at         TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN resuelto_por_id/resuelto_por_nombre/resuelto_at (loyalty_pending_enrollments):', e.message));
+
   // Respaldo de BD para D4 (consistencia de saldo): ningún script o bug futuro
   // puede dejar saldo_puntos negativo, incluso si algún día alguien escribe
   // fuera de _aplicarMovimiento. Idempotente vía bloque DO + catch duplicate_object.
@@ -543,4 +564,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] CHECK loyalty_cards_saldo_no_negativo:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, syncModels };

@@ -135,10 +135,17 @@ async function editarReason(id, { nombre, signoPermitido, activo } = {}) {
   return reason;
 }
 
-/** Sucursales con sus dos flags de lealtad, para la pantalla de configuración. */
+/**
+ * Sucursales con sus dos flags de lealtad, para la pantalla de configuración.
+ *
+ * `serieFacturacion` (2026-10-19, pedido explícito del usuario): se expone para mostrar
+ * "Sucursal → CEDIS (A0)" en la UI — no se usa todavía para ninguna regla de Lealtad, pero el
+ * dato ya existe en `centros_costo` (serie de facturación real de esa sucursal en Kore) y es
+ * valioso tenerlo visible de cara a una regla futura (ver centros-costo.service.js#mapaPorSerie).
+ */
 async function listarSucursales() {
   return CentroCosto.findAll({
-    attributes: ['id', 'clave', 'sucursal', 'isActive', 'participaLealtad', 'permiteCanjeLealtad'],
+    attributes: ['id', 'clave', 'sucursal', 'isActive', 'participaLealtad', 'permiteCanjeLealtad', 'serieFacturacion'],
     order: [['sucursal', 'ASC']],
   });
 }

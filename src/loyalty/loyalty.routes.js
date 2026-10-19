@@ -55,7 +55,7 @@ router.patch('/cards/:id', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDI
 }));
 
 router.post('/cards/:id/nip', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR), asyncHandler(async (req, res) => {
-  res.json(await cardService.cambiarNip(req.params.id));
+  res.json(await cardService.cambiarNip(req.params.id, req.user));
 }));
 
 router.put('/cards/:id/nivel', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_NIVEL), asyncHandler(async (req, res) => {

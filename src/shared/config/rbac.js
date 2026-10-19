@@ -197,7 +197,7 @@ const PERMISSIONS = Object.freeze({
   // explícito del usuario), mismo criterio que SYSTEM_MONITOR_READ: sin rol asignado.
   POLIZAS_AUDIT_READ:  'polizas:audit:read',
 
-  // Sistema de Lealtad (ver src/loyalty/) — siete permisos finos, cada uno gatea
+  // Sistema de Lealtad (ver src/loyalty/) — ocho permisos finos, cada uno gatea
   // SOLO su propia acción (openspec/changes/sistema-lealtad/specs/loyalty-permissions).
   // El split sigue el riesgo: trabajo rutinario de mostrador (crear, editar, acumular,
   // canjear) está separado de acciones que crean valor o cambian tarifa (ajustes,
@@ -212,6 +212,13 @@ const PERMISSIONS = Object.freeze({
   LOYALTY_AJUSTES:         'loyalty:ajustes',
   LOYALTY_TARJETAS_NIVEL:  'loyalty:tarjetas:nivel',
   LOYALTY_CONFIG:          'loyalty:config',
+  // Migración de clientes legados ("Club Tuberos") — subir clientes.csv/puntos.pdf y
+  // generar el concentrado de revisión (cruce por Tarjeta). Exclusivo de admin a
+  // propósito (2026-10-19, mismo criterio que LOYALTY_AJUSTES/LOYALTY_CONFIG): es
+  // lectura pura (ningún dato se escribe en base de datos todavía), pero expone datos
+  // sensibles (teléfonos/saldos de TODA la cartera legada) sin acotar por rol. No se
+  // asigna a contabilidad/cobranza/tienda.
+  LOYALTY_IMPORTAR:        'loyalty:importar',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

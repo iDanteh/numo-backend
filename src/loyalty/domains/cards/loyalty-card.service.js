@@ -157,14 +157,28 @@ async function editarTarjeta(id, { nombre, telefono, activa } = {}, user) {
   return card;
 }
 
-/** Genera un NIP nuevo y resetea el lockout (D7) — el anterior deja de autenticar de inmediato. */
-async function cambiarNip(cardId) {
+/**
+ * Genera un NIP nuevo y resetea el lockout (D7) — el anterior deja de autenticar de inmediato.
+ *
+ * Bug real corregido (2026-10-19, pedido explícito del usuario — "agrega solo el quién y
+ * cuándo"): esta función nunca tocaba `updatedById`/`updatedByNombre` pese a que `LoyaltyCard`
+ * ya tiene esas columnas y `editarTarjeta`/`cambiarNivel` sí las setean — cambiar el NIP de una
+ * tarjeta no dejaba NINGÚN rastro de quién lo hizo. `updatedAt` ya se actualizaba solo (Sequelize
+ * lo maneja automático en cualquier `.update()`), pero sin saber QUIÉN eso no sirve para
+ * trazabilidad real. No se agrega un historial completo (ver discovery sobre
+ * PolizaAuditLog/ConfigAuditLog) — decisión explícita del usuario de ir con el mínimo.
+ */
+async function cambiarNip(cardId, user) {
   const card = await LoyaltyCard.findByPk(cardId);
   if (!card) throw new NotFoundError('Tarjeta');
 
   const nip = generarNip();
   const nipHash = await hashNip(nip);
-  await card.update({ nipHash, nipIntentosFallidos: 0, nipBloqueadoHasta: null });
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  await card.update({
+    nipHash, nipIntentosFallidos: 0, nipBloqueadoHasta: null,
+    updatedById: usuarioId, updatedByNombre: usuarioNombre,
+  });
 
   return { nip };
 }

@@ -187,6 +187,18 @@ describe('listarSucursales', () => {
       }),
     );
   });
+
+  test('incluye serieFacturacion (2026-10-19, pedido explícito del usuario — "Sucursal → CEDIS (A0)")', async () => {
+    CentroCosto.findAll.mockResolvedValue([]);
+
+    await configService.listarSucursales();
+
+    expect(CentroCosto.findAll).toHaveBeenCalledWith(
+      expect.objectContaining({
+        attributes: expect.arrayContaining(['serieFacturacion']),
+      }),
+    );
+  });
 });
 
 describe('actualizarSucursal', () => {

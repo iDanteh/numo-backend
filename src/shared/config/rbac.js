@@ -196,6 +196,29 @@ const PERMISSIONS = Object.freeze({
   // contabiliza, cancela, revierte y exporta. Exclusivo de admin (2026-10-15, pedido
   // explícito del usuario), mismo criterio que SYSTEM_MONITOR_READ: sin rol asignado.
   POLIZAS_AUDIT_READ:  'polizas:audit:read',
+
+  // Sistema de Lealtad (ver src/loyalty/) — ocho permisos finos, cada uno gatea
+  // SOLO su propia acción (openspec/changes/sistema-lealtad/specs/loyalty-permissions).
+  // El split sigue el riesgo: trabajo rutinario de mostrador (crear, editar, acumular,
+  // canjear) está separado de acciones que crean valor o cambian tarifa (ajustes,
+  // cambio de nivel, configuración) — mismo criterio que banks:erp:link/cobro/unlink.
+  LOYALTY_READ:            'loyalty:read',
+  LOYALTY_TARJETAS_CREAR:  'loyalty:tarjetas:crear',
+  LOYALTY_TARJETAS_EDITAR: 'loyalty:tarjetas:editar',
+  LOYALTY_MOVIMIENTOS:     'loyalty:movimientos',
+  // Ajustes discrecionales (crean/quitan valor) y cambio manual de nivel (cambia la
+  // tarifa de acumulación) quedan exclusivos de admin — extendibles por persona vía
+  // extraPermissions (pantalla Usuarios), nunca por rol completo.
+  LOYALTY_AJUSTES:         'loyalty:ajustes',
+  LOYALTY_TARJETAS_NIVEL:  'loyalty:tarjetas:nivel',
+  LOYALTY_CONFIG:          'loyalty:config',
+  // Migración de clientes legados ("Club Tuberos") — subir clientes.csv/puntos.pdf y
+  // generar el concentrado de revisión (cruce por Tarjeta). Exclusivo de admin a
+  // propósito (2026-10-19, mismo criterio que LOYALTY_AJUSTES/LOYALTY_CONFIG): es
+  // lectura pura (ningún dato se escribe en base de datos todavía), pero expone datos
+  // sensibles (teléfonos/saldos de TODA la cartera legada) sin acotar por rol. No se
+  // asigna a contabilidad/cobranza/tienda.
+  LOYALTY_IMPORTAR:        'loyalty:importar',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────
@@ -239,6 +262,12 @@ const ROLES = Object.freeze({
       PERMISSIONS.DRIVE_READ,
       PERMISSIONS.DRIVE_IMPORT,
       PERMISSIONS.ENTITIES_READ,
+      // Lealtad — trabajo rutinario (sistema-lealtad/specs/loyalty-permissions: Default
+      // Role Assignment). ajustes/tarjetas:nivel/config quedan exclusivos de admin.
+      PERMISSIONS.LOYALTY_READ,
+      PERMISSIONS.LOYALTY_TARJETAS_CREAR,
+      PERMISSIONS.LOYALTY_TARJETAS_EDITAR,
+      PERMISSIONS.LOYALTY_MOVIMIENTOS,
     ],
   },
 
@@ -259,6 +288,12 @@ const ROLES = Object.freeze({
       PERMISSIONS.BANKS_ERP_ANTICIPOS,
       PERMISSIONS.COLLECTIONS_READ,
       PERMISSIONS.COLLECTIONS_WRITE,
+      // Lealtad — trabajo rutinario (sistema-lealtad/specs/loyalty-permissions: Default
+      // Role Assignment). ajustes/tarjetas:nivel/config quedan exclusivos de admin.
+      PERMISSIONS.LOYALTY_READ,
+      PERMISSIONS.LOYALTY_TARJETAS_CREAR,
+      PERMISSIONS.LOYALTY_TARJETAS_EDITAR,
+      PERMISSIONS.LOYALTY_MOVIMIENTOS,
     ],
   },
 

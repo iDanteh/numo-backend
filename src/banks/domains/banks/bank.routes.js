@@ -846,7 +846,7 @@ router.patch('/movements/reclasify',
     if (!Array.isArray(ids) || ids.length === 0) {
       return res.status(400).json({ error: 'Se requiere un array de IDs en body.ids' });
     }
-    res.json(await service.reclasifyMovements(ids));
+    res.json(await service.reclasifyMovements(ids, req.user));
   }),
 );
 

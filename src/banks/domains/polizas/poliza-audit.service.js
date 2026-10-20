@@ -14,6 +14,7 @@
  * (shared/models/postgres/Poliza.js) en vez de tocar cada generador.
  */
 
+const ExcelJS        = require('exceljs');
 const { QueryTypes } = require('sequelize');
 const { sequelize }  = require('../../../config/database.postgres');
 const PolizaAuditLog = require('../../../shared/models/postgres/PolizaAuditLog');
@@ -198,7 +199,149 @@ async function usuarios() {
   return rows.map(r => r.u);
 }
 
+// Bitácora completa (sin paginar), para el reporte — mismos filtros y columnas
+// que `bitacora`, con un tope duro para no cargar millones de filas a memoria.
+async function _bitacoraFull(filtros, cap = 20000) {
+  const { sql, repl } = _filtros(filtros);
+  return sequelize.query(`
+    SELECT id, poliza_id AS "polizaId", accion, usuario_nombre AS "usuarioNombre", usuario_rol AS "usuarioRol",
+           rfc, poliza_tipo AS "polizaTipo", poliza_numero AS "polizaNumero", poliza_fecha AS "polizaFecha",
+           poliza_concepto AS "polizaConcepto", ejercicio, periodo, estado_anterior AS "estadoAnterior",
+           estado_nuevo AS "estadoNuevo", motivo, detalle, origen, fecha
+      FROM poliza_audit_logs ${sql}
+     ORDER BY fecha DESC, id DESC
+     LIMIT :cap
+  `, { replacements: { ...repl, cap }, type: QueryTypes.SELECT });
+}
+
+/**
+ * Reporte del Monitor de Pólizas: un .xlsx con TODO lo que muestra la vista —
+ * Resumen por usuario (uso), Actividad diaria, Bitácora completa, Cancelaciones
+ * (con su regeneración) y Exportaciones — respetando los filtros activos
+ * (desde/hasta/rfc/usuario/accion/tipo/q). (2026-10-20, pedido del usuario.)
+ */
+async function construirReporteXlsx(filtros = {}) {
+  const [resumen, actividad, cancels, bitFull] = await Promise.all([
+    resumenPorUsuario(filtros),
+    actividadDiaria(filtros),
+    cancelaciones(filtros),
+    _bitacoraFull(filtros),
+  ]);
+
+  const fmt = f => (f ? new Date(f).toLocaleString('es-MX', { timeZone: 'America/Mexico_City', hour12: false }) : '');
+  const header = (ws) => {
+    ws.getRow(1).font = { bold: true };
+    ws.getRow(1).eachCell(c => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } }; });
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+  };
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'NUMO — Monitor de Pólizas';
+  wb.created = new Date();
+
+  // 1. Resumen por usuario (uso) — una columna por acción.
+  const wsR = wb.addWorksheet('Resumen por usuario');
+  wsR.columns = [
+    { header: 'Usuario', key: 'usuario', width: 34 },
+    { header: 'Rol', key: 'rol', width: 16 },
+    { header: 'Total', key: 'total', width: 10 },
+    { header: 'Última actividad', key: 'ultima', width: 22 },
+    ...ACCIONES.map(a => ({ header: a, key: a, width: 15 })),
+  ];
+  for (const u of resumen) {
+    wsR.addRow({
+      usuario: u.usuario, rol: u.rol || '', total: u.total, ultima: fmt(u.ultimaActividad),
+      ...Object.fromEntries(ACCIONES.map(a => [a, u.acciones[a] || 0])),
+    });
+  }
+  header(wsR);
+
+  // 2. Actividad diaria.
+  const wsA = wb.addWorksheet('Actividad diaria');
+  wsA.columns = [
+    { header: 'Día', key: 'dia', width: 14 },
+    { header: 'Acción', key: 'accion', width: 20 },
+    { header: 'Total', key: 'total', width: 10 },
+  ];
+  for (const r of actividad) wsA.addRow({ dia: r.dia, accion: r.accion, total: r.total });
+  header(wsA);
+
+  // 3. Bitácora completa.
+  const wsB = wb.addWorksheet('Bitácora');
+  wsB.columns = [
+    { header: 'Fecha', key: 'fecha', width: 22 },
+    { header: 'Usuario', key: 'usuario', width: 28 },
+    { header: 'Rol', key: 'rol', width: 14 },
+    { header: 'Acción', key: 'accion', width: 18 },
+    { header: 'Tipo', key: 'tipo', width: 8 },
+    { header: 'Número', key: 'numero', width: 10 },
+    { header: 'RFC', key: 'rfc', width: 16 },
+    { header: 'Concepto', key: 'concepto', width: 48 },
+    { header: 'Estado', key: 'estado', width: 22 },
+    { header: 'Motivo', key: 'motivo', width: 30 },
+    { header: 'Origen', key: 'origen', width: 12 },
+  ];
+  for (const r of bitFull) {
+    wsB.addRow({
+      fecha: fmt(r.fecha), usuario: r.usuarioNombre || '(sin registro)', rol: r.usuarioRol || '',
+      accion: r.accion, tipo: r.polizaTipo || '', numero: r.polizaNumero ?? '', rfc: r.rfc || '',
+      concepto: r.polizaConcepto || '', estado: [r.estadoAnterior, r.estadoNuevo].filter(Boolean).join(' → '),
+      motivo: r.motivo || '', origen: r.origen || '',
+    });
+  }
+  header(wsB);
+
+  // 4. Cancelaciones (con su regeneración).
+  const wsC = wb.addWorksheet('Cancelaciones');
+  wsC.columns = [
+    { header: 'Fecha cancelación', key: 'fecha', width: 22 },
+    { header: 'Usuario', key: 'usuario', width: 28 },
+    { header: 'Tipo', key: 'tipo', width: 8 },
+    { header: 'Número', key: 'numero', width: 10 },
+    { header: 'RFC', key: 'rfc', width: 16 },
+    { header: 'Concepto', key: 'concepto', width: 44 },
+    { header: 'Estado previo', key: 'previo', width: 14 },
+    { header: 'Motivo', key: 'motivo', width: 30 },
+    { header: 'Regenerada (número)', key: 'regNum', width: 18 },
+    { header: 'Regenerada estado', key: 'regEstado', width: 18 },
+    { header: 'Regenerada por', key: 'regPor', width: 22 },
+    { header: 'Regenerada en', key: 'regEn', width: 22 },
+  ];
+  for (const r of cancels) {
+    wsC.addRow({
+      fecha: fmt(r.fecha), usuario: r.usuarioNombre || '', tipo: r.polizaTipo || '', numero: r.polizaNumero ?? '',
+      rfc: r.rfc || '', concepto: r.polizaConcepto || '', previo: r.estadoAnterior || '', motivo: r.motivo || '',
+      regNum: r.regeneradaNumero ?? '(no regenerada)', regEstado: r.regeneradaEstado || '',
+      regPor: r.regeneradaPor || '', regEn: fmt(r.regeneradaEn),
+    });
+  }
+  header(wsC);
+
+  // 5. Exportaciones (CONTPAQ, traspasos, comp/int, XML SAT).
+  const wsE = wb.addWorksheet('Exportaciones');
+  wsE.columns = [
+    { header: 'Fecha', key: 'fecha', width: 22 },
+    { header: 'Usuario', key: 'usuario', width: 28 },
+    { header: 'Acción', key: 'accion', width: 20 },
+    { header: 'Tipo', key: 'tipo', width: 8 },
+    { header: 'Número', key: 'numero', width: 10 },
+    { header: 'RFC', key: 'rfc', width: 16 },
+    { header: 'Concepto', key: 'concepto', width: 48 },
+    { header: 'Detalle', key: 'detalle', width: 40 },
+  ];
+  for (const r of bitFull.filter(x => x.accion === 'exportada' || x.accion === 'exportada_xml_sat')) {
+    wsE.addRow({
+      fecha: fmt(r.fecha), usuario: r.usuarioNombre || '', accion: r.accion, tipo: r.polizaTipo || '',
+      numero: r.polizaNumero ?? '', rfc: r.rfc || '', concepto: r.polizaConcepto || '', detalle: r.detalle || '',
+    });
+  }
+  header(wsE);
+
+  return wb.xlsx.writeBuffer();
+}
+
 module.exports = {
   ACCIONES, registrar,
   resumenPorUsuario, actividadDiaria, bitacora, cancelaciones, usuarios,
+  construirReporteXlsx,
 };

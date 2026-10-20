@@ -532,6 +532,18 @@ async function syncModels() {
   await LoyaltyPointsLedger.sync({ force: false });
   await LoyaltyTierHistory.sync({ force: false });
 
+  // Columnas nuevas sobre loyalty_cards, que YA existía con datos reales
+  // (2026-10-20, recuperación de NIP en 2 pasos) — mismo motivo que el bloque
+  // de loyalty_pending_enrollments de abajo: .sync({force:false}) nunca altera
+  // una tabla existente.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS recuperacion_codigo_hash        VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS recuperacion_expira_en          TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS recuperacion_intentos_fallidos  INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS recuperacion_bloqueada_hasta    TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN recuperacion_* (loyalty_cards):', e.message));
+
   // Registros en espera de clientes legados sin teléfono (ver
   // LoyaltyPendingEnrollment.js) — tabla nueva, force:false. Tiene FK a
   // loyalty_cards (cardIdResultante), así que debe sincronizarse después de

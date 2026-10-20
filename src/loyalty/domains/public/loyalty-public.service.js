@@ -26,11 +26,8 @@
 
 const { LoyaltyCard } = require('../../../shared/models/postgres');
 const { UnprocessableError } = require('../../../shared/errors/AppError');
-const { compararNip, DUMMY_HASH } = require('../../shared/nip.util');
+const { compararNip, DUMMY_HASH, MAX_INTENTOS_FALLIDOS, LOCKOUT_MS } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
-
-const MAX_INTENTOS_FALLIDOS = 5;
-const LOCKOUT_MS = 15 * 60 * 1000;
 
 const TELEFONO_RE = /^\d{10}$/;
 const NIP_RE = /^\d{4}$/;

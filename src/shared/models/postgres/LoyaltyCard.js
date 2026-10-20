@@ -63,6 +63,27 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     allowNull: true,
     comment:   'Bloqueo temporal tras 5 intentos fallidos (D7): 15 min desde el 5to fallo.',
   },
+  recuperacionCodigoHash: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Hash bcrypt del código de verificación de 6 dígitos (recuperación de NIP en 2 pasos). El texto plano nunca se persiste. Null cuando no hay recuperación en curso.',
+  },
+  recuperacionExpiraEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Vencimiento del código de recuperación (10 min desde que se solicitó).',
+  },
+  recuperacionIntentosFallidos: {
+    type:         DataTypes.INTEGER,
+    allowNull:    false,
+    defaultValue: 0,
+    comment:      'Contador de intentos fallidos consecutivos del código de recuperación. Independiente del contador de NIP.',
+  },
+  recuperacionBloqueadaHasta: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Bloqueo temporal tras 5 intentos fallidos del código de recuperación: 15 min desde el 5to fallo.',
+  },
   createdById: {
     type:      DataTypes.STRING(200),
     allowNull: true,
@@ -84,11 +105,14 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
   tableName:   'loyalty_cards',
   underscored: true,
   defaultScope: {
-    attributes: { exclude: ['nipHash'] },
+    attributes: { exclude: ['nipHash', 'recuperacionCodigoHash'] },
   },
   scopes: {
     withNipHash: {
       attributes: { include: ['nipHash'] },
+    },
+    withRecuperacionCodigoHash: {
+      attributes: { include: ['recuperacionCodigoHash'] },
     },
   },
 });

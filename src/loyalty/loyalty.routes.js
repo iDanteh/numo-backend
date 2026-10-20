@@ -25,8 +25,8 @@ const router = express.Router();
 
 // ── Tarjetas ──────────────────────────────────────────────────────────────────
 router.get('/cards', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
-  const { search, nivel, activa, page, limit } = req.query;
-  res.json(await cardService.listar({ search, nivel, activa, page, limit }));
+  const { search, nivel, activa, page, limit, sort, sortDir } = req.query;
+  res.json(await cardService.listar({ search, nivel, activa, page, limit, sort, sortDir }));
 }));
 
 router.post('/cards', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_CREAR), asyncHandler(async (req, res) => {

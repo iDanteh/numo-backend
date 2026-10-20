@@ -6,7 +6,7 @@ const { body } = require('express-validator');
 const { authenticate, permit } = require('../../shared/middleware/auth');
 const {
   verify, verifyBatch, getStatus,
-  registerCredentials, getCredentialStatus, patchKey,
+  registerCredentials, getCredentialStatus, getAvisosCredenciales, patchKey,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, testKey, exportXml,
   downloadByUUID, resetCheckpoint, getCheckpointsSalud, recuperarErp,
@@ -21,8 +21,12 @@ const credUpload = multer({
 });
 
 // ── Verificación ──────────────────────────────────────────────────────────────
+// verify escribe satStatus en el CFDI (updateMany): exige visor:sat, igual que
+// verify-batch (2026-10-19, auditoría — antes solo authenticate, cualquier
+// usuario podía marcar un CFDI como "No Encontrado").
 router.post('/verify',
   authenticate,
+  permit('visor:sat'),
   [
     body('uuid').isUUID().withMessage('UUID inválido'),
     body('rfcEmisor').notEmpty().withMessage('RFC Emisor requerido'),
@@ -48,6 +52,9 @@ router.post('/credenciales',
 );
 
 router.get('/credenciales/estado/:rfc',   authenticate, getCredentialStatus);
+// Banner global (todas las vistas, cualquier usuario autenticado): solo RFC,
+// nombre y fecha de vencimiento — nada de las credenciales en sí.
+router.get('/credenciales/avisos',        authenticate, getAvisosCredenciales);
 router.patch('/credenciales/key/:rfc',
   authenticate,
   permit('visor:sat'),

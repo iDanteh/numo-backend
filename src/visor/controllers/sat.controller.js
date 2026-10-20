@@ -290,6 +290,18 @@ const testKey = asyncHandler(async (req, res) => {
 });
 
 /**
+ * GET /api/sat/credenciales/avisos — banner global de credenciales por vencer
+ * o faltantes (ver visor/sat/avisoVencimiento.js).
+ */
+const getAvisosCredenciales = asyncHandler(async (req, res) => {
+  const { avisosVigentes, ROLES_CON_AVISO } = require('../sat/avisoVencimiento');
+  // Solo admin y contabilidad (2026-10-19, pedido del usuario) — el frontend
+  // ya no consulta para otros roles; esto lo garantiza del lado del servidor.
+  if (!ROLES_CON_AVISO.includes(req.user?.role)) return res.json({ avisos: [] });
+  res.json({ avisos: await avisosVigentes() });
+});
+
+/**
  * GET /api/sat/credenciales/estado/:rfc
  */
 const getCredentialStatus = asyncHandler(async (req, res) => {
@@ -891,7 +903,7 @@ const recuperarErp = asyncHandler(async (req, res) => {
 
 module.exports = {
   verify, verifyBatch, getStatus,
-  registerCredentials, getCredentialStatus,
+  registerCredentials, getCredentialStatus, getAvisosCredenciales,
   startDownload, getDownloadStatus,
   getLimitesEstado, getHistory, getUltimoErp, recuperarErp,
   cleanupActiveJobs, testKey, patchKey, exportXml,

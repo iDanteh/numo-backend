@@ -30,4 +30,15 @@ router.get('/bitacora', authenticate, permit(PERM),
 router.get('/cancelaciones', authenticate, permit(PERM),
   asyncHandler(async (req, res) => res.json(await audit.cancelaciones(req.query))));
 
+// Reporte .xlsx con TODO lo del monitor (resumen/uso, actividad diaria,
+// bitácora, cancelaciones, exportaciones), respetando los filtros activos.
+router.get('/reporte.xlsx', authenticate, permit(PERM),
+  asyncHandler(async (req, res) => {
+    const buffer = await audit.construirReporteXlsx(req.query);
+    const hoy = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' }); // YYYY-MM-DD
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="Monitor_Polizas_${hoy}.xlsx"`);
+    res.send(Buffer.from(buffer));
+  }));
+
 module.exports = router;

@@ -66,12 +66,21 @@ async function hasOcultoRolesBypass(user) {
 
 function applyMovementRestrictions(query, userId, { scope = MOVEMENT_SCOPE.OWN, forExport = false } = {}) {
   const q = { ...query };
-  if (q.status === 'otros') {
-    if (!forExport) return { query: q, empty: true };
-    q.status = undefined; // en export: cae en el default a continuación
-  }
-  if (q.status === 'identificado' && scope === MOVEMENT_SCOPE.OWN) {
-    q.identificadoPorUsuario = userId;
+  // Normalizar `status` a una lista limpia ANTES de aplicar las reglas: un
+  // `status=identificado,otros` o `status=identificado ` (con espacio sobrante)
+  // no hacía match exacto y saltaba TANTO el bloqueo de 'otros' COMO el
+  // acotamiento de 'identificado' al dueño — luego listMovements lo separaba por
+  // coma y lo aplicaba igual (2026-10-19, auditoría).
+  const statuses = typeof q.status === 'string'
+    ? q.status.split(',').map(s => s.trim()).filter(Boolean)
+    : Array.isArray(q.status) ? q.status.map(s => String(s).trim()).filter(Boolean) : [];
+  if (statuses.length > 0) {
+    const sinOtros = statuses.filter(s => s !== 'otros'); // 'otros' nunca es visible para restringidos
+    if (sinOtros.length === 0 && !forExport) return { query: q, empty: true };
+    if (sinOtros.includes('identificado') && scope === MOVEMENT_SCOPE.OWN) {
+      q.identificadoPorUsuario = userId;
+    }
+    q.status = sinOtros.length > 0 ? sinOtros.join(',') : undefined; // en export, solo-'otros' cae al default
   }
   if (!q.status) {
     // Bug real (2026-10-09, reportado por el usuario): este default se aplicaba SIEMPRE que
@@ -316,23 +325,32 @@ router.get('/movements/export', authenticate, permit(PERMISSIONS.BANKS_EXPORT), 
 }));
 
 // GET /api/banks/movements
-router.get('/movements', authenticate, asyncHandler(async (req, res) => {
-  // Cuando viene movId (navegación desde OCR) el usuario puede ver ese movimiento
-  // sin restricciones de status/tipo para que la navegación funcione correctamente.
+router.get('/movements', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   let query = { ...req.query };
   const hasFullAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
-  if (!hasFullAccess && !query.movId) {
+  if (!hasFullAccess) {
     // banks:cobranza:identificados:all (2026-09-30, permiso nuevo, separado de
     // banks:cobranza:all a propósito): sube el scope de identificado a ALL por persona, sin
     // pasar por banks:config completo ni por movementScope del rol (que sigue fijo en rbac.js
     // para retrocompatibilidad de roles que no reciban este permiso).
     const hasIdentificadosAll = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_COBRANZA_IDENTIFICADOS_ALL, req.user.extraPermissions);
     const scope = hasIdentificadosAll ? MOVEMENT_SCOPE.ALL : getMovementScope(req.user.role);
-    const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id, { scope });
-    if (empty) {
-      return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
+    if (query.movId) {
+      // Navegación directa por ID (OCR → depósito): se respeta el scope sin
+      // forzar el default de status/tipo, para no ocultar depósitos que aún no
+      // se han identificado. 'otros' nunca es visible; con scope OWN, un
+      // movimiento identificado solo se ve si es PROPIO (los ajenos quedan
+      // fuera). Antes `movId` saltaba TODA restricción — era un IDOR: con el
+      // ObjectId se leía cualquier movimiento (2026-10-19, auditoría).
+      query.excluirOtros = '1';
+      if (scope === MOVEMENT_SCOPE.OWN) query.soloPropioONoIdentificado = req.user._id;
+    } else {
+      const { query: restricted, empty } = applyMovementRestrictions(query, req.user._id, { scope });
+      if (empty) {
+        return res.json({ data: [], pagination: { total: 0, page: 1, limit: Number(query.limit) || 50, pages: 0 } });
+      }
+      query = restricted;
     }
-    query = restricted;
   }
   // Ocultamiento por rol (regla 'ocultar' con ocultarRoles): independiente de banks:config
   // — solo banks:admin o banks:ocultar-roles:bypass ven movimientos ocultos para otros

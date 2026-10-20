@@ -426,10 +426,21 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
   const esSplitPagoPorFactura = !esAnticipo && rule.tasaIva !== 'mixto'
     && Array.isArray(context.doctosPago) && context.doctosPago.length > 0;
 
+  // Columna H de las líneas que NO van por factura (IVA cobrado, 0% de tasa
+  // mixta, retenciones, Cargo/Abono del Pago completo): "cliente / ticket(s)"
+  // como en el split por factura (2026-10-19, pedido del usuario: FRIDA SOFIA
+  // FERRER ORTEGA, regla mixto, salía "IVA cobrado - Pago" / "Pago (0%)" y
+  // debía ser "FRIDA SOFIA FERRER ORTEGA / A0-261001422"). Factura sin ticket
+  // conocido → su serie-folio; sin doctosPago → serie-folio del propio Pago.
+  const refsPago = Array.isArray(context.doctosPago) && context.doctosPago.length > 0
+    ? [...new Set(context.doctosPago.flatMap(d => (d.tickets?.length ? d.tickets : [`${d.serie}-${d.folio}`])))]
+    : [serieCfdi];
+  const conceptoPago = [cfdi.receptor?.nombre ?? '', ...refsPago].filter(Boolean).join(' / ').slice(0, 500) || concepto;
+
   if (esAnticipo) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaAnticipo] ?? null, concepto: `IVA ant. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaAnticipo] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
     if (rule.cuentaIva) {
-      movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: `IVA ant. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
+      movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
     }
   }
 
@@ -445,21 +456,21 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     const monto0   = parseFloat((montoAbonoFinal - monto16).toFixed(2));
     if (monto0 > 0.01) {
       montoAbonoFinal = monto16;
-      movs.push({ cuentaId: cuentaMap[rule.cuentaAbono2] ?? null, concepto: `${concepto} (0%)`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: monto0, cfdiUuid: cfdi.uuid, rfcTercero });
+      movs.push({ cuentaId: cuentaMap[rule.cuentaAbono2] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: monto0, cfdiUuid: cfdi.uuid, rfcTercero });
     }
   }
 
   // IVA cobrado sin split por factura (fallback cuando no hay doctosPago).
   if (!esAnticipo && iva > 0 && rule.cuentaIvaPPD && rule.cuentaIva && !esSplitPagoPorFactura) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, concepto: `IVA cobrado - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: `IVA cobrado - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: iva, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIva] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: iva, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
   if (rule.cuentaIvaRetenido && ivaRet > 0) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaRetenido] ?? null, concepto: `IVA ret. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: ivaRet, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIvaRetenido] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: ivaRet, cfdiUuid: cfdi.uuid, rfcTercero });
   }
   if (rule.cuentaIsrRetenido && isrRet > 0) {
-    movs.push({ cuentaId: cuentaMap[rule.cuentaIsrRetenido] ?? null, concepto: `ISR ret. - ${concepto}`, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: isrRet, cfdiUuid: cfdi.uuid, rfcTercero });
+    movs.push({ cuentaId: cuentaMap[rule.cuentaIsrRetenido] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: isrRet, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 
   const pendientesCruzados = [];
@@ -494,8 +505,16 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       // se encola en `pendientesCruzados` para que `_procesarCobranza` lo
       // guarde en CobroSucursalPendienteCobranza; la vendedora lo consume al
       // generar su propia póliza.
+      // Póliza única del día con TODAS las sucursales (`context.porSucursal`
+      // false, la forma normal desde oct-2026): no hay otra póliza que vaya a
+      // cerrar la CxC, así que la factura de otra sucursal cierra aquí igual
+      // que una propia (IVA + Clientes), solo con el centro de costo de la
+      // vendedora (caso real QUELONIA 15-oct, Pago E0-261000191 con facturas
+      // I0 de Promotoria que se quedaban en el puente).
       const ccVendedora = context.ccBySerieMap?.[d.serie] ?? null;
-      const esCruzada = !!(ccVendedora && context.ccActual && String(ccVendedora.id) !== String(context.ccActual.id));
+      const deOtraSucursal = !!(ccVendedora && context.ccActual && String(ccVendedora.id) !== String(context.ccActual.id));
+      const esCruzada = deOtraSucursal && context.porSucursal !== false;
+      const centroFactura = deOtraSucursal && !esCruzada ? { _centroCostoFijo: ccVendedora } : {};
 
       // 1. Cargo (+SF si esta factura se pagó con saldo a favor).
       const montoLineaCargo = esUltimo
@@ -610,13 +629,13 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
       } else {
         // 2. IVA cobrado (swap cuentaIvaPPD → cuentaIva) — IVA real de ESTA factura.
         if (aplicaIvaCobrado && ivaFactura > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
+          movs.push({ ...baseFactura, ...centroFactura, cuentaId: cuentaMap[rule.cuentaIvaPPD] ?? null, debe: ivaFactura, haber: 0 });
+          movs.push({ ...baseFactura, ...centroFactura, cuentaId: cuentaMap[rule.cuentaIva]    ?? null, debe: 0, haber: ivaFactura });
         }
 
         // 3. Abono que cierra la CxC de esta factura.
         if (montoLineaAbono > 0) {
-          movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
+          movs.push({ ...baseFactura, ...centroFactura, cuentaId: cuentaMap[rule.cuentaAbono] ?? null, debe: 0, haber: montoLineaAbono });
         }
       }
     });
@@ -627,8 +646,6 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     // usuario, columna H del export) — mismo criterio que el camino con
     // doctosPago (`conceptoFactura` arriba), usando el serie-folio del propio
     // Pago porque aquí no hay detalle de factura individual que mostrar.
-    const nombreClientePago = cfdi.receptor?.nombre ?? '';
-    const conceptoPago = [nombreClientePago, serieCfdi].filter(Boolean).join(' / ') || concepto;
     // En el complemento del SAT la forma de pago viene en `pagos[].formaDePagoP`,
     // no en el encabezado (2026-09-29: Pagos con regla "mixto" en efectivo
     // caían a Bancos por identificar en vez de Caja).
@@ -826,7 +843,7 @@ async function _procesarCobranza({ rfc, ejercicio, periodo, centroCostoId, fecha
     // pueda comparar contra la sucursal VENDEDORA de cada factura liquidada
     // y detectar un cobro cruzado (ver `context.ccActual`/`ccBySerieMap`).
     const cc = cfdi.serie ? (ccBySerieMap[cfdi.serie] ?? null) : null;
-    const context = { ccActual: cc, ccBySerieMap };
+    const context = { ccActual: cc, ccBySerieMap, porSucursal: !!centroCostoId };
     const doctosPago = doctosPorUuid.get(cfdi.uuid);
     if (doctosPago) context.doctosPago = doctosPago;
 

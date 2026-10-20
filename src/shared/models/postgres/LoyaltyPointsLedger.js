@@ -58,6 +58,16 @@ const LoyaltyPointsLedger = sequelize.define('LoyaltyPointsLedger', {
     allowNull: true,
     comment:   'Snapshot del nivel al acumular',
   },
+  promocionNombre: {
+    type:      DataTypes.STRING(150),
+    allowNull: true,
+    comment:   'Snapshot del nombre de la promoción vigente al acumular (null si no hubo)',
+  },
+  promocionPorcentaje: {
+    type:      DataTypes.DECIMAL(5, 2),
+    allowNull: true,
+    comment:   'Snapshot del % de bono de la promoción vigente al acumular (null si no hubo)',
+  },
   centroCostoId: {
     type:       DataTypes.INTEGER,
     allowNull:  true,

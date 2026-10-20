@@ -14,6 +14,8 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('../../shared/nip.util', () => ({
   compararNip: jest.fn(),
   DUMMY_HASH: '$2a$10$dummyHashModuleLevelXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+  MAX_INTENTOS_FALLIDOS: 5,
+  LOCKOUT_MS: 15 * 60 * 1000,
 }));
 jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },

@@ -12,16 +12,18 @@
 // cualquier lógica de negocio, y las fallas de negocio son 422 con el `code`
 // que `error-handler.js` ahora propaga desde `err.code`.
 jest.mock('./domains/public/loyalty-public.service');
+jest.mock('./domains/public/loyalty-recovery.service');
 
 const express = require('express');
 const request = require('supertest');
 const errorHandler = require('../shared/middleware/error-handler');
 
-/** Re-requiere el router (y su service mockeado) en un registro de módulos
+/** Re-requiere el router (y sus services mockeados) en un registro de módulos
  * limpio, para que cada test tenga su propia `MemoryStore` de rate limiting. */
 function freshApp() {
   jest.resetModules();
   const publicService = require('./domains/public/loyalty-public.service');
+  const recoveryService = require('./domains/public/loyalty-recovery.service');
   const loyaltyPublicRoutes = require('./loyalty-public.routes');
 
   const app = express();
@@ -29,7 +31,7 @@ function freshApp() {
   app.use('/api/loyalty/public', loyaltyPublicRoutes);
   app.use(errorHandler);
 
-  return { app, publicService, loyaltyPublicRoutes };
+  return { app, publicService, recoveryService, loyaltyPublicRoutes };
 }
 
 test('no hay authenticate en la cadena: sin Authorization igual llega al service', async () => {
@@ -104,4 +106,86 @@ test('crearLimitersConsulta() exporta una factory (MemoryStore fresca por llamad
   expect(Array.isArray(par1)).toBe(true);
   expect(par1).toHaveLength(2);
   expect(par1[0]).not.toBe(par2[0]);
+});
+
+describe('recuperación de NIP en 2 pasos — mismo router público, sin authenticate', () => {
+  test('POST /recuperacion/solicitar llega al service sin Authorization', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.solicitarCodigo.mockResolvedValue({ mensaje: 'Si el teléfono está registrado…' });
+
+    const res = await request(app).post('/api/loyalty/public/recuperacion/solicitar').send({ telefono: '5512345678' });
+
+    expect(res.status).toBe(200);
+    expect(recoveryService.solicitarCodigo).toHaveBeenCalledWith('5512345678', expect.objectContaining({ ip: expect.anything() }));
+  });
+
+  test('GET /recuperacion/solicitar no existe (solo POST)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/recuperacion/solicitar').query({ telefono: '5512345678' });
+    expect(res.status).toBe(404);
+  });
+
+  test('POST /recuperacion/confirmar llega al service sin Authorization', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.confirmarCodigo.mockResolvedValue({ nip: '4821' });
+
+    const res = await request(app).post('/api/loyalty/public/recuperacion/confirmar')
+      .send({ telefono: '5512345678', codigo: '654321' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ nip: '4821' });
+    expect(recoveryService.confirmarCodigo).toHaveBeenCalledWith('5512345678', '654321', expect.objectContaining({ ip: expect.anything() }));
+  });
+
+  test('GET /recuperacion/confirmar no existe (solo POST, D8: el código nunca en una URL)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/recuperacion/confirmar').query({ telefono: '5512345678', codigo: '654321' });
+    expect(res.status).toBe(404);
+  });
+
+  test('falla de negocio en /confirmar (422 LOYALTY_RECOVERY_FAILED) se propaga con el mismo código', async () => {
+    const { app, recoveryService } = freshApp();
+    const err = Object.assign(new Error('El código no es válido o expiró.'), {
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    recoveryService.confirmarCodigo.mockRejectedValue(err);
+
+    const res = await request(app).post('/api/loyalty/public/recuperacion/confirmar')
+      .send({ telefono: '5512345678', codigo: '000000' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('LOYALTY_RECOVERY_FAILED');
+  });
+
+  test('rate limit de /recuperacion/solicitar es independiente del de /consulta', async () => {
+    const { app, publicService, recoveryService } = freshApp();
+    publicService.consultaPublica.mockResolvedValue({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: '10.00' });
+    recoveryService.solicitarCodigo.mockResolvedValue({ mensaje: 'ok' });
+
+    for (let i = 0; i < 5; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await request(app).post('/api/loyalty/public/consulta').send({ telefono: '5512345678', nip: '1234' });
+    }
+    const consultaBloqueada = await request(app).post('/api/loyalty/public/consulta').send({ telefono: '5512345678', nip: '1234' });
+    expect(consultaBloqueada.status).toBe(429);
+
+    // /recuperacion/solicitar tiene su propio limiter (3/15min) — no debería
+    // verse afectado por haber agotado el de /consulta.
+    const solicitar = await request(app).post('/api/loyalty/public/recuperacion/solicitar').send({ telefono: '5512345678' });
+    expect(solicitar.status).toBe(200);
+  });
+
+  test('el 4to request a /recuperacion/solicitar en 15min → 429 (límite más estricto por "enviar" algo)', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.solicitarCodigo.mockResolvedValue({ mensaje: 'ok' });
+
+    for (let i = 0; i < 3; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await request(app).post('/api/loyalty/public/recuperacion/solicitar').send({ telefono: '5512345678' });
+      expect(r.status).toBe(200);
+    }
+    const cuarto = await request(app).post('/api/loyalty/public/recuperacion/solicitar').send({ telefono: '5512345678' });
+    expect(cuarto.status).toBe(429);
+    expect(recoveryService.solicitarCodigo).toHaveBeenCalledTimes(3);
+  });
 });

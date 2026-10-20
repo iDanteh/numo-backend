@@ -85,8 +85,26 @@ async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user, { tran
   return { card, nip };
 }
 
+// Whitelist de columnas ordenables — nunca interpolar `sort` directo en el
+// `order` de Sequelize (inyección de SQL vía nombre de columna/dirección).
+// Cualquier `sort` fuera de este mapa cae al default (`nombre` ASC).
+const SORT_COLUMNAS = {
+  telefono: 'telefono',
+  nombre:   'nombre',
+  nivel:    'nivel',
+  saldo:    'saldoPuntos',
+  activa:   'activa',
+};
+
+function _resolverOrden(sort, sortDir) {
+  const columna = SORT_COLUMNAS[String(sort ?? '').trim()];
+  if (!columna) return [['nombre', 'ASC']];
+  const dir = String(sortDir ?? '').trim().toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+  return [[columna, dir]];
+}
+
 /** `search` matchea prefijo de teléfono o ILIKE sobre nombre. */
-async function listar({ search, nivel, activa, page = 1, limit = 50 } = {}) {
+async function listar({ search, nivel, activa, page = 1, limit = 50, sort, sortDir } = {}) {
   const where = {};
   if (nivel) where.nivel = nivel;
   if (activa !== undefined && activa !== null && activa !== '') {
@@ -104,7 +122,7 @@ async function listar({ search, nivel, activa, page = 1, limit = 50 } = {}) {
   const l = Math.min(100, Number(limit) || 50);
   const { count, rows } = await LoyaltyCard.findAndCountAll({
     where,
-    order:  [['nombre', 'ASC']],
+    order:  _resolverOrden(sort, sortDir),
     limit:  l,
     offset: (p - 1) * l,
   });

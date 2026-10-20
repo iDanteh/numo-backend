@@ -38,6 +38,7 @@ const LoyaltyPointsLedger     = require('./LoyaltyPointsLedger');
 const LoyaltyTierHistory      = require('./LoyaltyTierHistory');
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 const LoyaltyPendingEnrollment = require('./LoyaltyPendingEnrollment');
+const LoyaltyPromotion        = require('./LoyaltyPromotion');
 const PolizaAuditLog    = require('./PolizaAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
@@ -537,6 +538,37 @@ async function syncModels() {
   await LoyaltyAdjustmentReason.sync({ force: false });
   await LoyaltyPointsLedger.sync({ force: false });
   await LoyaltyTierHistory.sync({ force: false });
+  // Catálogo de promociones (bono extra por periodo) — tabla nueva sin FKs,
+  // no importa el orden respecto a las demás de Lealtad.
+  await LoyaltyPromotion.sync({ force: false });
+
+  // Motivos de ajuste con % de cálculo automático (2026-10-20) — columna nueva
+  // sobre loyalty_adjustment_reasons, que YA existía: .sync({force:false})
+  // nunca altera una tabla existente.
+  await LoyaltyAdjustmentReason.sequelize.query(`
+    ALTER TABLE loyalty_adjustment_reasons
+      ADD COLUMN IF NOT EXISTS porcentaje DECIMAL(5,2)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN porcentaje (loyalty_adjustment_reasons):', e.message));
+
+  // Snapshot de la promoción aplicada en cada acumulación (2026-10-20) —
+  // columnas nuevas sobre loyalty_points_ledger, que YA existía: idempotente.
+  await LoyaltyPointsLedger.sequelize.query(`
+    ALTER TABLE loyalty_points_ledger
+      ADD COLUMN IF NOT EXISTS promocion_nombre     VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS promocion_porcentaje  DECIMAL(5,2)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN promocion_nombre/promocion_porcentaje (loyalty_points_ledger):', e.message));
+
+  // Columnas nuevas sobre loyalty_cards, que YA existía con datos reales
+  // (2026-10-20, recuperación de NIP en 2 pasos) — mismo motivo que el bloque
+  // de loyalty_pending_enrollments de abajo: .sync({force:false}) nunca altera
+  // una tabla existente.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS recuperacion_codigo_hash        VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS recuperacion_expira_en          TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS recuperacion_intentos_fallidos  INTEGER NOT NULL DEFAULT 0,
+      ADD COLUMN IF NOT EXISTS recuperacion_bloqueada_hasta    TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN recuperacion_* (loyalty_cards):', e.message));
 
   // Registros en espera de clientes legados sin teléfono (ver
   // LoyaltyPendingEnrollment.js) — tabla nueva, force:false. Tiene FK a
@@ -564,4 +596,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] CHECK loyalty_cards_saldo_no_negativo:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, syncModels };

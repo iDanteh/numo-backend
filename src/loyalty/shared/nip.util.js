@@ -43,4 +43,34 @@ function compararNip(nip, hash) {
 // calculado una sola vez al cargar el módulo (costo 10, rápido en el boot).
 const DUMMY_HASH = bcrypt.hashSync('no-such-card-nip', BCRYPT_COST);
 
-module.exports = { generarNip, hashNip, compararNip, DUMMY_HASH, NIPS_DEBILES };
+// Umbral de intentos/lockout compartido entre la consulta pública
+// (loyalty-public.service.js) y la recuperación de NIP en 2 pasos
+// (loyalty-recovery.service.js) — un solo lugar para estos números mágicos,
+// antes vivían hardcodeados solo en loyalty-public.service.js.
+const MAX_INTENTOS_FALLIDOS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
+
+/** Código de verificación de 6 dígitos para recuperación de NIP. Generado
+ * 100% por el sistema (nunca elegido por un usuario), por eso no hace falta
+ * filtrar valores "débiles" como sí se hace con generarNip(). */
+function generarCodigoRecuperacion() {
+  return String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+}
+
+function hashCodigo(codigo) {
+  return bcrypt.hash(codigo, BCRYPT_COST);
+}
+
+function compararCodigo(codigo, hash) {
+  return bcrypt.compare(codigo, hash);
+}
+
+// Mismo criterio que DUMMY_HASH: un hash que nunca se asigna a ninguna
+// tarjeta real, usado para igualar tiempos cuando el teléfono no existe.
+const DUMMY_CODIGO_HASH = bcrypt.hashSync('no-such-recovery-code', BCRYPT_COST);
+
+module.exports = {
+  generarNip, hashNip, compararNip, DUMMY_HASH, NIPS_DEBILES,
+  MAX_INTENTOS_FALLIDOS, LOCKOUT_MS,
+  generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
+};

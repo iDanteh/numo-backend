@@ -11,7 +11,7 @@
 const { Transaction } = require('sequelize');
 
 jest.mock('../../../shared/models/postgres', () => ({
-  LoyaltyCard:        { findOne: jest.fn(), findByPk: jest.fn(), create: jest.fn() },
+  LoyaltyCard:        { findOne: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findAndCountAll: jest.fn() },
   LoyaltyTierHistory: { create: jest.fn() },
 }));
 jest.mock('../../../config/database.postgres', () => ({
@@ -254,5 +254,59 @@ describe('cambiarNivel', () => {
     await cardService.cambiarNivel(1, 'Plata', {}, USER);
 
     expect(LoyaltyCard.findByPk).toHaveBeenCalledWith(1, expect.objectContaining({ lock: Transaction.LOCK.UPDATE }));
+  });
+});
+
+describe('listar — orden (sort/sortDir)', () => {
+  beforeEach(() => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });
+  });
+
+  test('sin sort → default nombre ASC (comportamiento previo intacto)', async () => {
+    await cardService.listar({});
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['nombre', 'ASC']] }),
+    );
+  });
+
+  test('sort="saldo" → ordena por la columna real saldoPuntos, no por "saldo"', async () => {
+    await cardService.listar({ sort: 'saldo', sortDir: 'desc' });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['saldoPuntos', 'DESC']] }),
+    );
+  });
+
+  test.each(['telefono', 'nombre', 'nivel', 'activa'])('sort="%s" es una columna permitida, ASC por default', async (col) => {
+    await cardService.listar({ sort: col });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [[col, 'ASC']] }),
+    );
+  });
+
+  test('sortDir inválido/ausente con sort válido → ASC, nunca se cuela un valor crudo', async () => {
+    await cardService.listar({ sort: 'nombre', sortDir: 'xyz' });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['nombre', 'ASC']] }),
+    );
+  });
+
+  test('columna no permitida (fuera de whitelist) → cae al default, nunca se interpola directo', async () => {
+    await cardService.listar({ sort: 'nipHash', sortDir: 'DESC' });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['nombre', 'ASC']] }),
+    );
+  });
+
+  test('intento de inyección vía sort (nombre de columna con SQL crudo) → ignorado, cae al default', async () => {
+    await cardService.listar({ sort: "nombre; DROP TABLE loyalty_cards;--", sortDir: 'ASC' });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['nombre', 'ASC']] }),
+    );
   });
 });

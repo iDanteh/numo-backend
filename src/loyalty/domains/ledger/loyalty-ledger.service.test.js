@@ -26,12 +26,19 @@ jest.mock('../../../config/database.postgres', () => ({
 jest.mock('../../../shared/services/global-config.service', () => ({
   getValue: jest.fn(),
 }));
+// loyalty-config.service.js se mockea completo (no hay require circular real:
+// config no importa nada de ledger, verificado en el código — se mockea igual
+// que global-config.service para no acoplar este test al modelo LoyaltyPromotion).
+jest.mock('../config/loyalty-config.service', () => ({
+  obtenerPromocionVigente: jest.fn(),
+}));
 
 const {
   LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, CentroCosto,
 } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
+const configService = require('../config/loyalty-config.service');
 const ledgerService = require('./loyalty-ledger.service');
 
 /** Simula una instancia Sequelize mínima: estado mutable + `.update()`. */
@@ -63,6 +70,9 @@ beforeEach(() => {
   // con un objeto distinto de undefined, nada lo inspecciona en estos mocks.
   sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data }));
+  // Sin promo vigente por default — mismo comportamiento que hoy en todos los
+  // tests existentes que no la mencionan explícitamente.
+  configService.obtenerPromocionVigente.mockResolvedValue(null);
 });
 
 describe('registrarAcumulacion', () => {
@@ -166,6 +176,42 @@ describe('registrarAcumulacion', () => {
     await expect(
       ledgerService.registrarAcumulacion({ cardId: 1, montoVenta: '0.01', centroCostoId: 10 }, USER),
     ).rejects.toMatchObject({ statusCode: 400 });
+  });
+});
+
+describe('registrarAcumulacion con promoción vigente', () => {
+  test('sin promo vigente se comporta exactamente igual que hoy (regresión)', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPromocionVigente.mockResolvedValue(null);
+
+    const { movimiento } = await ledgerService.registrarAcumulacion(
+      { cardId: 1, montoVenta: '1000.00', centroCostoId: 10 }, USER,
+    );
+
+    expect(movimiento.porcentajeAplicado).toBe(5);
+    expect(movimiento.puntos).toBe('50.00');
+    expect(movimiento.promocionNombre).toBeNull();
+    expect(movimiento.promocionPorcentaje).toBeNull();
+  });
+
+  test('con promo vigente suma el % de bono al % del nivel y lo audita en el movimiento', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '3' });
+
+    const { movimiento } = await ledgerService.registrarAcumulacion(
+      { cardId: 1, montoVenta: '1000.00', centroCostoId: 10 }, USER,
+    );
+
+    expect(movimiento.porcentajeAplicado).toBe(8);
+    expect(movimiento.puntos).toBe('80.00');
+    expect(movimiento.promocionNombre).toBe('Buen Fin');
+    expect(movimiento.promocionPorcentaje).toBe('3');
   });
 });
 
@@ -275,6 +321,102 @@ describe('registrarAjuste', () => {
       ledgerService.registrarAjuste({ cardId: 1, puntos: '-20.00', reasonId: 3, justificacion: 'corrección de saldo' }, USER),
     ).rejects.toMatchObject({ statusCode: 409 });
 
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('registrarAjuste — motivo SIN % (regresión del flujo manual existente)', () => {
+  test('sigue calculando los puntos directo del body, sin tocar montoBase', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', signoPermitido: 'POSITIVO', activo: true });
+    const card = makeCard({ saldoPuntos: '10.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
+      { cardId: 1, puntos: '20.00', reasonId: 1, justificacion: 'bono de cumpleaños' }, USER,
+    );
+
+    expect(movimiento.tipo).toBe('AJUSTE');
+    expect(movimiento.puntos).toBe('20.00');
+    expect(movimiento.montoVenta).toBeNull();
+    expect(movimiento.porcentajeAplicado).toBeNull();
+    expect(saldoPuntos).toBe('30.00');
+  });
+});
+
+describe('registrarAjuste — motivo CON % de cálculo automático', () => {
+  function makeReasonPct(overrides = {}) {
+    return { id: 10, nombre: 'comision', signoPermitido: 'POSITIVO', activo: true, porcentaje: '5.00', ...overrides };
+  }
+
+  test('montoBase faltante → 400, no escribe nada', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct());
+
+    await expect(
+      ledgerService.registrarAjuste({ cardId: 1, reasonId: 10, justificacion: 'ajuste automático' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  test('montoBase = 0 → 400', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct());
+
+    await expect(
+      ledgerService.registrarAjuste({ cardId: 1, montoBase: '0', reasonId: 10, justificacion: 'ajuste automático' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  test('motivo POSITIVO calcula puntos positivos desde montoBase y audita montoVenta/porcentajeAplicado', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'POSITIVO' }));
+    const card = makeCard({ saldoPuntos: '0.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
+      { cardId: 1, montoBase: '1000.00', reasonId: 10, justificacion: 'ajuste automático' }, USER,
+    );
+
+    expect(movimiento.puntos).toBe('50.00');
+    expect(movimiento.montoVenta).toBe('1000.00');
+    expect(movimiento.porcentajeAplicado).toBe('5.00');
+    expect(saldoPuntos).toBe('50.00');
+  });
+
+  test('motivo NEGATIVO calcula puntos negativos desde montoBase', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'NEGATIVO' }));
+    const card = makeCard({ saldoPuntos: '100.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
+      { cardId: 1, montoBase: '1000.00', reasonId: 10, justificacion: 'ajuste automático' }, USER,
+    );
+
+    expect(movimiento.puntos).toBe('-50.00');
+    expect(saldoPuntos).toBe('50.00');
+  });
+
+  test('el monto no genera puntos con el % configurado → 400', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ porcentaje: '0.01' }));
+
+    await expect(
+      ledgerService.registrarAjuste({ cardId: 1, montoBase: '0.01', reasonId: 10, justificacion: 'ajuste automático' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  test('datos legados: motivo con % y signoPermitido AMBOS → 400 (estado inválido, no se asume que nunca pasa)', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'AMBOS' }));
+
+    await expect(
+      ledgerService.registrarAjuste({ cardId: 1, montoBase: '100.00', reasonId: 10, justificacion: 'caso legado' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  test('el ajuste automático no puede dejar el saldo en negativo (NEGATIVO mayor al saldo)', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'NEGATIVO', porcentaje: '50.00' }));
+    const card = makeCard({ saldoPuntos: '10.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await expect(
+      ledgerService.registrarAjuste({ cardId: 1, montoBase: '1000.00', reasonId: 10, justificacion: 'ajuste automático' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
 });

@@ -19,6 +19,7 @@
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyAdjustmentReason: { findAll: jest.fn(), findByPk: jest.fn(), create: jest.fn() },
+  LoyaltyPromotion:        { findAll: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findOne: jest.fn() },
   CentroCosto:             { findAll: jest.fn(), findByPk: jest.fn() },
 }));
 jest.mock('../../../shared/services/global-config.service', () => ({
@@ -26,7 +27,7 @@ jest.mock('../../../shared/services/global-config.service', () => ({
   setValue: jest.fn(),
 }));
 
-const { LoyaltyAdjustmentReason, CentroCosto } = require('../../../shared/models/postgres');
+const { LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const configService = require('./loyalty-config.service');
 
@@ -129,13 +130,41 @@ describe('crearReason', () => {
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('signoPermitido válido → crea con activo=true', async () => {
+  test('signoPermitido válido → crea con activo=true, porcentaje:null (sin % en el payload)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 1 });
 
     await configService.crearReason({ clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO' });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO', activo: true,
+      clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO', activo: true, porcentaje: null,
+    });
+  });
+
+  test('porcentaje + signoPermitido AMBOS → 400, no inserta (el signo del % automático no puede ser ambiguo)', async () => {
+    await expect(
+      configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'AMBOS', porcentaje: '5' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['0'], ['-1'], ['100.01'], ['101'], ['3.456'], ['abc'],
+  ])('porcentaje con formato/rango inválido (%s) → 400, no inserta', async (valor) => {
+    await expect(
+      configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', porcentaje: valor }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
+  });
+
+  test('porcentaje válido + signo POSITIVO → crea con el % guardado', async () => {
+    LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 5 });
+
+    await configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', porcentaje: '7.5' });
+
+    expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
+      clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', activo: true, porcentaje: '7.5',
     });
   });
 });
@@ -172,6 +201,161 @@ describe('editarReason', () => {
       configService.editarReason(1, { signoPermitido: 'RARO' }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(reason.update).not.toHaveBeenCalled();
+  });
+
+  test('porcentaje con signoPermitido AMBOS ya guardado (no viene en el payload) → 400', async () => {
+    const reason = makeReason({ signoPermitido: 'AMBOS' });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await expect(
+      configService.editarReason(1, { porcentaje: '5' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(reason.update).not.toHaveBeenCalled();
+  });
+
+  test('porcentaje válido junto con signoPermitido POSITIVO en el mismo payload → actualiza ambos', async () => {
+    const reason = makeReason({ signoPermitido: 'AMBOS' });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    const resultado = await configService.editarReason(1, { porcentaje: '5', signoPermitido: 'POSITIVO' });
+
+    expect(reason.update).toHaveBeenCalledWith({ signoPermitido: 'POSITIVO', porcentaje: '5' });
+    expect(resultado.porcentaje).toBe('5');
+  });
+
+  test('porcentaje: null explícito quita el % (vuelve el motivo manual)', async () => {
+    const reason = makeReason({ porcentaje: '5.00' });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await configService.editarReason(1, { porcentaje: null });
+
+    expect(reason.update).toHaveBeenCalledWith({ porcentaje: null });
+  });
+
+  test('porcentaje inválido en edición → 400, no actualiza', async () => {
+    const reason = makeReason();
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await expect(
+      configService.editarReason(1, { porcentaje: '200' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(reason.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('listarPromociones / crearPromocion / editarPromocion / obtenerPromocionVigente', () => {
+  function makePromo(overrides = {}) {
+    const promo = {
+      id: 1, nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17',
+      porcentajeBono: '5.00', activa: true, ...overrides,
+    };
+    promo.update = jest.fn(async (changes) => { Object.assign(promo, changes); return promo; });
+    return promo;
+  }
+
+  test('listarPromociones soloActivas filtra por activa:true', async () => {
+    LoyaltyPromotion.findAll.mockResolvedValue([]);
+
+    await configService.listarPromociones({ soloActivas: true });
+
+    expect(LoyaltyPromotion.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: { activa: true } }));
+  });
+
+  test('listarPromociones sin soloActivas trae todas (incluye inactivas, para histórico)', async () => {
+    LoyaltyPromotion.findAll.mockResolvedValue([]);
+
+    await configService.listarPromociones();
+
+    expect(LoyaltyPromotion.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: {} }));
+  });
+
+  test('crearPromocion: nombre vacío → 400, no inserta', async () => {
+    await expect(
+      configService.crearPromocion({ nombre: '   ', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: '5' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPromotion.create).not.toHaveBeenCalled();
+  });
+
+  test('crearPromocion: fechaFin < fechaInicio → 400, no inserta', async () => {
+    await expect(
+      configService.crearPromocion({ nombre: 'Buen Fin', fechaInicio: '2026-11-17', fechaFin: '2026-11-01', porcentajeBono: '5' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPromotion.create).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ['0'], ['-1'], ['100.01'], ['abc'],
+  ])('crearPromocion: porcentajeBono inválido (%s) → 400, no inserta', async (valor) => {
+    await expect(
+      configService.crearPromocion({ nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: valor }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPromotion.create).not.toHaveBeenCalled();
+  });
+
+  test('crearPromocion válida → crea con activa:true', async () => {
+    LoyaltyPromotion.create.mockResolvedValue({ id: 1 });
+
+    await configService.crearPromocion({ nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: '5' });
+
+    expect(LoyaltyPromotion.create).toHaveBeenCalledWith({
+      nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: '5', activa: true,
+    });
+  });
+
+  test('editarPromocion: 404 si no existe', async () => {
+    LoyaltyPromotion.findByPk.mockResolvedValue(null);
+
+    await expect(configService.editarPromocion(999, { activa: false })).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  test('editarPromocion: cambiar solo fechaFin valida contra la fechaInicio ya guardada', async () => {
+    const promo = makePromo({ fechaInicio: '2026-11-01', fechaFin: '2026-11-17' });
+    LoyaltyPromotion.findByPk.mockResolvedValue(promo);
+
+    await expect(
+      configService.editarPromocion(1, { fechaFin: '2026-10-01' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(promo.update).not.toHaveBeenCalled();
+  });
+
+  test('editarPromocion: cambiar solo fechaInicio valida contra la fechaFin ya guardada', async () => {
+    const promo = makePromo({ fechaInicio: '2026-11-01', fechaFin: '2026-11-17' });
+    LoyaltyPromotion.findByPk.mockResolvedValue(promo);
+
+    await expect(
+      configService.editarPromocion(1, { fechaInicio: '2026-12-01' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(promo.update).not.toHaveBeenCalled();
+  });
+
+  test('editarPromocion: activa:false solo cambia el flag (nunca borra la fila)', async () => {
+    const promo = makePromo();
+    LoyaltyPromotion.findByPk.mockResolvedValue(promo);
+
+    const resultado = await configService.editarPromocion(1, { activa: false });
+
+    expect(promo.update).toHaveBeenCalledWith({ activa: false });
+    expect(resultado.activa).toBe(false);
+  });
+
+  test('obtenerPromocionVigente: sin promos → null', async () => {
+    LoyaltyPromotion.findOne.mockResolvedValue(null);
+
+    const resultado = await configService.obtenerPromocionVigente(new Date('2026-11-05'));
+
+    expect(resultado).toBeNull();
+  });
+
+  test('obtenerPromocionVigente: filtra por rango activa y ordena por % descendente (gana la mayor si hay solape)', async () => {
+    LoyaltyPromotion.findOne.mockResolvedValue(makePromo());
+
+    const resultado = await configService.obtenerPromocionVigente(new Date('2026-11-05'));
+
+    expect(resultado.nombre).toBe('Buen Fin');
+    expect(LoyaltyPromotion.findOne).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({ activa: true }),
+      order: [['porcentajeBono', 'DESC']],
+    }));
   });
 });
 

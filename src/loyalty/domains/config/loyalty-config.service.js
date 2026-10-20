@@ -18,7 +18,8 @@
  * es responsabilidad de la ruta (PR4) — este servicio no conoce permisos.
  */
 
-const { LoyaltyAdjustmentReason, CentroCosto } = require('../../../shared/models/postgres');
+const { Op } = require('sequelize');
+const { LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto } = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
 const globalConfigService = require('../../../shared/services/global-config.service');
 
@@ -42,18 +43,25 @@ function _capitalizar(nivel) {
   return nivel.charAt(0) + nivel.slice(1).toLowerCase();
 }
 
-function _validarPorcentaje(nivel, valor) {
+/**
+ * Validador genérico de % (0 < n <= 100, máx 2 decimales), reusado por el %
+ * de nivel, el % de motivos de ajuste y el % de bono de promociones — misma
+ * regla, distinta etiqueta en el mensaje de error.
+ */
+function _validarPorcentajeGenerico(valor, etiqueta) {
   const str = String(valor ?? '').trim();
   if (!PORCENTAJE_RE.test(str)) {
-    throw new BadRequestError(
-      `El % de ${_capitalizar(nivel)} debe ser un número mayor a 0, con máximo 2 decimales.`,
-    );
+    throw new BadRequestError(`${etiqueta} debe ser un número mayor a 0, con máximo 2 decimales.`);
   }
   const n = Number(str);
   if (n <= 0 || n > 100) {
-    throw new BadRequestError(`El % de ${_capitalizar(nivel)} debe ser mayor a 0 y menor o igual a 100.`);
+    throw new BadRequestError(`${etiqueta} debe ser mayor a 0 y menor o igual a 100.`);
   }
   return str;
+}
+
+function _validarPorcentaje(nivel, valor) {
+  return _validarPorcentajeGenerico(valor, `El % de ${_capitalizar(nivel)}`);
 }
 
 /**
@@ -105,11 +113,31 @@ async function listarReasons({ soloActivos = false } = {}) {
   return LoyaltyAdjustmentReason.findAll({ where, order: [['nombre', 'ASC']] });
 }
 
-async function crearReason({ clave, nombre, signoPermitido }) {
+/**
+ * `porcentaje` (2026-10-20): si viene definido, el motivo pasa a calcular sus
+ * puntos automáticamente desde `montoBase` al registrar un AJUSTE (ver
+ * loyalty-ledger.service.js#registrarAjuste) — un motivo así NUNCA puede
+ * tener signoPermitido:'AMBOS', porque el signo de los puntos resultantes
+ * depende directamente de él (POSITIVO → tal cual, NEGATIVO → se niega).
+ */
+async function crearReason({ clave, nombre, signoPermitido, porcentaje } = {}) {
   if (!SIGNOS_VALIDOS.includes(signoPermitido)) {
     throw new BadRequestError(`signoPermitido debe ser uno de: ${SIGNOS_VALIDOS.join(', ')}.`);
   }
-  return LoyaltyAdjustmentReason.create({ clave, nombre, signoPermitido, activo: true });
+
+  let porcentajeValidado = null;
+  if (porcentaje !== undefined && porcentaje !== null) {
+    porcentajeValidado = _validarPorcentajeGenerico(porcentaje, 'El % del motivo');
+    if (signoPermitido === 'AMBOS') {
+      throw new BadRequestError(
+        'Un motivo con % de cálculo automático no puede tener signo AMBOS — definí si es POSITIVO o NEGATIVO.',
+      );
+    }
+  }
+
+  return LoyaltyAdjustmentReason.create({
+    clave, nombre, signoPermitido, activo: true, porcentaje: porcentajeValidado,
+  });
 }
 
 /**
@@ -118,7 +146,7 @@ async function crearReason({ clave, nombre, signoPermitido }) {
  * referenciándola en entradas históricas (requisito del spec: "Historical
  * entries keep their original reason").
  */
-async function editarReason(id, { nombre, signoPermitido, activo } = {}) {
+async function editarReason(id, { nombre, signoPermitido, activo, porcentaje } = {}) {
   const reason = await LoyaltyAdjustmentReason.findByPk(id);
   if (!reason) throw new NotFoundError('Motivo de ajuste');
 
@@ -126,10 +154,30 @@ async function editarReason(id, { nombre, signoPermitido, activo } = {}) {
     throw new BadRequestError(`signoPermitido debe ser uno de: ${SIGNOS_VALIDOS.join(', ')}.`);
   }
 
+  // `porcentaje: null` explícito es válido (quita el % y vuelve el motivo
+  // manual) — se distingue de `undefined` (campo no tocado). Cuando viene un
+  // valor, se valida contra el signoPermitido RESULTANTE: el del payload si
+  // vino, si no el que ya tiene guardado la fila (nunca asumir que viene).
+  let porcentajeValidado;
+  if (porcentaje !== undefined) {
+    if (porcentaje === null) {
+      porcentajeValidado = null;
+    } else {
+      porcentajeValidado = _validarPorcentajeGenerico(porcentaje, 'El % del motivo');
+      const signoResultante = signoPermitido !== undefined ? signoPermitido : reason.signoPermitido;
+      if (signoResultante === 'AMBOS') {
+        throw new BadRequestError(
+          'Un motivo con % de cálculo automático no puede tener signo AMBOS — definí si es POSITIVO o NEGATIVO.',
+        );
+      }
+    }
+  }
+
   const cambios = {};
   if (nombre !== undefined) cambios.nombre = nombre;
   if (signoPermitido !== undefined) cambios.signoPermitido = signoPermitido;
   if (activo !== undefined) cambios.activo = activo;
+  if (porcentaje !== undefined) cambios.porcentaje = porcentajeValidado;
 
   await reason.update(cambios);
   return reason;
@@ -170,6 +218,104 @@ async function actualizarSucursal(id, { participaLealtad, permiteCanjeLealtad } 
   return centro;
 }
 
+/**
+ * Catálogo de promociones (bono extra sobre la acumulación normal, por
+ * periodo — ej. "Buen Fin"). `soloActivas` sigue el mismo criterio que
+ * `listarReasons`: la pantalla de administración trae todo (incluye
+ * inactivas, para histórico); un selector operativo solo las activas.
+ */
+async function listarPromociones({ soloActivas = false } = {}) {
+  const where = soloActivas ? { activa: true } : {};
+  return LoyaltyPromotion.findAll({ where, order: [['fechaInicio', 'DESC']] });
+}
+
+function _validarRangoFechas(fechaInicio, fechaFin) {
+  const inicio = new Date(fechaInicio);
+  const fin = new Date(fechaFin);
+  if (Number.isNaN(inicio.getTime()) || Number.isNaN(fin.getTime())) {
+    throw new BadRequestError('fechaInicio/fechaFin deben ser fechas válidas.');
+  }
+  if (fin < inicio) {
+    throw new BadRequestError('fechaFin debe ser mayor o igual a fechaInicio.');
+  }
+}
+
+async function crearPromocion({ nombre, fechaInicio, fechaFin, porcentajeBono } = {}) {
+  const nombreTrim = String(nombre ?? '').trim();
+  if (!nombreTrim) {
+    throw new BadRequestError('nombre es requerido.');
+  }
+  _validarRangoFechas(fechaInicio, fechaFin);
+  const porcentajeValidado = _validarPorcentajeGenerico(porcentajeBono, 'El % de bono de la promoción');
+
+  return LoyaltyPromotion.create({
+    nombre: nombreTrim, fechaInicio, fechaFin, porcentajeBono: porcentajeValidado, activa: true,
+  });
+}
+
+/**
+ * Edita una promoción existente. Patch parcial igual que `editarReason`: solo
+ * pisa los campos presentes. Si solo cambia fechaInicio O fechaFin (no
+ * ambas), el rango resultante se valida contra el valor YA GUARDADO del otro
+ * campo (nunca asumir que ambos vienen juntos en el payload).
+ */
+async function editarPromocion(id, { nombre, fechaInicio, fechaFin, porcentajeBono, activa } = {}) {
+  const promocion = await LoyaltyPromotion.findByPk(id);
+  if (!promocion) throw new NotFoundError('Promoción');
+
+  const cambios = {};
+
+  if (nombre !== undefined) {
+    const nombreTrim = String(nombre ?? '').trim();
+    if (!nombreTrim) throw new BadRequestError('nombre es requerido.');
+    cambios.nombre = nombreTrim;
+  }
+
+  if (porcentajeBono !== undefined) {
+    cambios.porcentajeBono = _validarPorcentajeGenerico(porcentajeBono, 'El % de bono de la promoción');
+  }
+
+  if (fechaInicio !== undefined || fechaFin !== undefined) {
+    const inicioResultante = fechaInicio !== undefined ? fechaInicio : promocion.fechaInicio;
+    const finResultante = fechaFin !== undefined ? fechaFin : promocion.fechaFin;
+    _validarRangoFechas(inicioResultante, finResultante);
+    if (fechaInicio !== undefined) cambios.fechaInicio = fechaInicio;
+    if (fechaFin !== undefined) cambios.fechaFin = fechaFin;
+  }
+
+  if (activa !== undefined) cambios.activa = !!activa;
+
+  await promocion.update(cambios);
+  return promocion;
+}
+
+/**
+ * Promoción vigente en `fecha` (default: ahora), la de mayor
+ * `porcentajeBono` si hay dos solapadas (confirmado con el usuario: gana la
+ * mayor). `null` si ninguna aplica. Comparación por DÍA (fechaInicio/fechaFin
+ * son DATEONLY) — se normaliza `fecha` a 'YYYY-MM-DD' en hora de México, NO
+ * `toISOString()` (UTC): un server en UTC desfasaría hasta 6h el día real en
+ * México, prendiendo o cortando la promo antes/después de lo esperado — mismo
+ * bug de huso horario ya visto y corregido en erp-modal/Kore.
+ */
+function _hoyMexico(fecha) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Mexico_City', day: '2-digit', month: '2-digit', year: 'numeric',
+  }).format(fecha instanceof Date ? fecha : new Date(fecha));
+}
+
+async function obtenerPromocionVigente(fecha = new Date()) {
+  const fechaStr = _hoyMexico(fecha);
+  return LoyaltyPromotion.findOne({
+    where: {
+      activa:      true,
+      fechaInicio: { [Op.lte]: fechaStr },
+      fechaFin:    { [Op.gte]: fechaStr },
+    },
+    order: [['porcentajeBono', 'DESC']],
+  });
+}
+
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
@@ -178,4 +324,8 @@ module.exports = {
   editarReason,
   listarSucursales,
   actualizarSucursal,
+  listarPromociones,
+  crearPromocion,
+  editarPromocion,
+  obtenerPromocionVigente,
 };

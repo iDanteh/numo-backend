@@ -44,6 +44,9 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   editarReason: jest.fn(),
   listarSucursales: jest.fn(),
   actualizarSucursal: jest.fn(),
+  listarPromociones: jest.fn(),
+  crearPromocion: jest.fn(),
+  editarPromocion: jest.fn(),
 }));
 
 const express = require('express');
@@ -87,6 +90,9 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'patch', ruta: '/reasons/1',                  permiso: PERMISSIONS.LOYALTY_CONFIG, body: { activo: false } },
     { metodo: 'get',   ruta: '/sucursales',                 permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/sucursales/1',                permiso: PERMISSIONS.LOYALTY_CONFIG, body: { participaLealtad: false } },
+    { metodo: 'get',   ruta: '/promociones',                 permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'post',  ruta: '/promociones',                 permiso: PERMISSIONS.LOYALTY_CONFIG, body: { nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: 5 } },
+    { metodo: 'patch', ruta: '/promociones/1',                permiso: PERMISSIONS.LOYALTY_CONFIG, body: { activa: false } },
   ];
 
   const TODOS = Object.values(PERMISSIONS).filter((p) => p.startsWith('loyalty:'));
@@ -176,5 +182,44 @@ describe('wiring hacia los servicios (happy path)', () => {
       .send({ Bronce: 1 });
     expect(res.status).toBe(200);
     expect(configService.guardarPorcentajes).toHaveBeenCalledWith({ Bronce: 1 }, expect.any(Object));
+  });
+
+  test('POST /cards/:id/ajustes pasa montoBase al servicio', async () => {
+    ledgerService.registrarAjuste.mockResolvedValue({ movimiento: { id: 1 } });
+    const res = await request(app).post('/cards/1/ajustes')
+      .set(perms(PERMISSIONS.LOYALTY_AJUSTES))
+      .send({ montoBase: '100.00', reasonId: 10, justificacion: 'ajuste automático' });
+    expect(res.status).toBe(201);
+    expect(ledgerService.registrarAjuste).toHaveBeenCalledWith(
+      { cardId: '1', puntos: undefined, montoBase: '100.00', reasonId: 10, justificacion: 'ajuste automático' },
+      expect.any(Object),
+    );
+  });
+
+  test('GET /promociones llama a listarPromociones con soloActivas', async () => {
+    configService.listarPromociones.mockResolvedValue([]);
+    const res = await request(app).get('/promociones?soloActivas=true').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(configService.listarPromociones).toHaveBeenCalledWith({ soloActivas: true });
+  });
+
+  test('POST /promociones llama a crearPromocion y devuelve 201', async () => {
+    configService.crearPromocion.mockResolvedValue({ id: 1 });
+    const res = await request(app).post('/promociones')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: 5 });
+    expect(res.status).toBe(201);
+    expect(configService.crearPromocion).toHaveBeenCalledWith(
+      expect.objectContaining({ nombre: 'Buen Fin' }),
+    );
+  });
+
+  test('PATCH /promociones/:id llama a editarPromocion', async () => {
+    configService.editarPromocion.mockResolvedValue({ id: 1, activa: false });
+    const res = await request(app).patch('/promociones/1')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ activa: false });
+    expect(res.status).toBe(200);
+    expect(configService.editarPromocion).toHaveBeenCalledWith('1', { activa: false });
   });
 });

@@ -21,6 +21,10 @@ const {
 const { BadRequestError, ConflictError, UnprocessableError, NotFoundError } = require('../../../shared/errors/AppError');
 const { toCents, fromCents, calcularPuntos } = require('../../shared/puntos.util');
 const globalConfigService = require('../../../shared/services/global-config.service');
+// Sin require circular: loyalty-config.service.js no importa nada de este
+// archivo (verificado), así que un require normal al tope basta — no hace
+// falta el patrón de require perezoso que usa p.ej. shared/middleware/auth.js.
+const configService = require('../config/loyalty-config.service');
 
 function _userLabel(user) {
   return {
@@ -49,9 +53,11 @@ async function _aplicarMovimiento(t, card, mov) {
     tipo:               mov.tipo,
     puntos:             fromCents(puntosCents),
     saldoResultante:    fromCents(saldoResultanteCents),
-    montoVenta:         mov.montoVenta ?? null,
-    porcentajeAplicado: mov.porcentajeAplicado ?? null,
-    nivelAplicado:      mov.nivelAplicado ?? null,
+    montoVenta:          mov.montoVenta ?? null,
+    porcentajeAplicado:  mov.porcentajeAplicado ?? null,
+    nivelAplicado:       mov.nivelAplicado ?? null,
+    promocionNombre:     mov.promocionNombre ?? null,
+    promocionPorcentaje: mov.promocionPorcentaje ?? null,
     centroCostoId:      mov.centroCostoId ?? null,
     reasonId:           mov.reasonId ?? null,
     justificacion:      mov.justificacion ?? null,
@@ -104,19 +110,26 @@ async function registrarAcumulacion({ cardId, montoVenta, centroCostoId }, user)
     }
     const pct = Number(pctRaw);
 
+    // Promoción vigente (2026-10-20): su % de bono se SUMA al % del nivel —
+    // sin promo vigente, pctTotal === pct (comportamiento idéntico a hoy).
+    const promoVigente = await configService.obtenerPromocionVigente();
+    const pctTotal = promoVigente ? pct + Number(promoVigente.porcentajeBono) : pct;
+
     const montoCents = toCents(montoVenta);
-    const puntosCents = calcularPuntos(montoCents, pct);
+    const puntosCents = calcularPuntos(montoCents, pctTotal);
     if (puntosCents === 0) {
       throw new BadRequestError('El monto de venta no genera puntos con el % configurado.');
     }
 
     const { usuarioId, usuarioNombre } = _userLabel(user);
     const entry = await _aplicarMovimiento(t, card, {
-      tipo:               'ACUMULACION',
-      puntos:             fromCents(puntosCents),
+      tipo:                'ACUMULACION',
+      puntos:              fromCents(puntosCents),
       montoVenta,
-      porcentajeAplicado: pct,
-      nivelAplicado:      card.nivel,
+      porcentajeAplicado:  pctTotal,
+      nivelAplicado:       card.nivel,
+      promocionNombre:     promoVigente?.nombre ?? null,
+      promocionPorcentaje: promoVigente?.porcentajeBono ?? null,
       centroCostoId,
       origen: 'manual',
       usuarioId,
@@ -169,13 +182,14 @@ async function registrarCanje({ cardId, puntos, centroCostoId }, user) {
 /**
  * AJUSTE: requiere un motivo activo cuyo `signoPermitido` concuerde con el
  * signo del movimiento, y una justificación no trivial.
+ *
+ * Motivos con `reason.porcentaje` configurado (2026-10-20) calculan los
+ * puntos automáticamente desde `montoBase` (igual criterio D5/D3 que
+ * ACUMULACION: snapshot de % + aritmética en centavos) en vez de tomar
+ * `puntos` directo del body — ese es el camino manual de siempre, intacto
+ * cuando el motivo no tiene % configurado.
  */
-async function registrarAjuste({ cardId, puntos, reasonId, justificacion }, user) {
-  const puntosNum = Number(puntos);
-  if (!Number.isFinite(puntosNum) || puntosNum === 0) {
-    throw new BadRequestError('puntos debe ser un número distinto de 0.');
-  }
-
+async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificacion }, user) {
   const justificacionTrim = String(justificacion ?? '').trim();
   if (justificacionTrim.length < 5) {
     throw new BadRequestError('justificacion es requerida (mínimo 5 caracteres).');
@@ -186,7 +200,44 @@ async function registrarAjuste({ cardId, puntos, reasonId, justificacion }, user
     throw new BadRequestError('El motivo de ajuste no existe o está inactivo.');
   }
 
-  const signo = puntosNum > 0 ? 'POSITIVO' : 'NEGATIVO';
+  let puntosCents;
+  let montoBaseAplicado = null;
+  let porcentajeAplicado = null;
+
+  if (reason.porcentaje != null) {
+    // Camino automático: el signo ya NO se decide por el valor de `puntos`
+    // del body — lo decide `reason.signoPermitido` (bloqueado a POSITIVO o
+    // NEGATIVO al crear/editar el motivo con %, nunca AMBOS).
+    if (!(Number(montoBase) > 0)) {
+      throw new BadRequestError('montoBase debe ser mayor a 0 para un motivo con % de cálculo automático.');
+    }
+    if (reason.signoPermitido !== 'POSITIVO' && reason.signoPermitido !== 'NEGATIVO') {
+      // Defensivo: no debería pasar (crearReason/editarReason lo bloquean),
+      // pero datos legados podrían tener AMBOS + porcentaje configurado.
+      throw new BadRequestError(
+        `El motivo "${reason.nombre}" tiene % de cálculo automático configurado con un signoPermitido inválido (${reason.signoPermitido}); debe ser POSITIVO o NEGATIVO.`,
+      );
+    }
+
+    const montoCents = toCents(montoBase);
+    const puntosCalculados = calcularPuntos(montoCents, reason.porcentaje);
+    puntosCents = reason.signoPermitido === 'NEGATIVO' ? -puntosCalculados : puntosCalculados;
+    if (puntosCents === 0) {
+      throw new BadRequestError('El monto no genera puntos con el % configurado para este motivo.');
+    }
+
+    montoBaseAplicado = montoBase;
+    porcentajeAplicado = reason.porcentaje;
+  } else {
+    // Camino manual, igual que siempre: `puntos` viene directo del body.
+    const puntosNum = Number(puntos);
+    if (!Number.isFinite(puntosNum) || puntosNum === 0) {
+      throw new BadRequestError('puntos debe ser un número distinto de 0.');
+    }
+    puntosCents = toCents(puntosNum);
+  }
+
+  const signo = puntosCents > 0 ? 'POSITIVO' : 'NEGATIVO';
   if (reason.signoPermitido !== 'AMBOS' && reason.signoPermitido !== signo) {
     throw new BadRequestError(
       `El motivo "${reason.nombre}" no permite ajustes de signo ${signo === 'POSITIVO' ? 'positivo' : 'negativo'}.`,
@@ -198,16 +249,17 @@ async function registrarAjuste({ cardId, puntos, reasonId, justificacion }, user
     if (!card) throw new NotFoundError('Tarjeta');
     if (!card.activa) throw new UnprocessableError('La tarjeta está inactiva.');
 
-    const puntosCents = toCents(puntosNum);
-    const saldoCents  = toCents(card.saldoPuntos);
+    const saldoCents = toCents(card.saldoPuntos);
     if (saldoCents + puntosCents < 0) {
       throw new ConflictError('El ajuste dejaría el saldo de puntos en negativo.');
     }
 
     const { usuarioId, usuarioNombre } = _userLabel(user);
     const entry = await _aplicarMovimiento(t, card, {
-      tipo:   'AJUSTE',
-      puntos: fromCents(puntosCents),
+      tipo:               'AJUSTE',
+      puntos:             fromCents(puntosCents),
+      montoVenta:         montoBaseAplicado,
+      porcentajeAplicado,
       reasonId,
       justificacion: justificacionTrim,
       origen: 'manual',

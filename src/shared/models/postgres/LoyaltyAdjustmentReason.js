@@ -37,6 +37,11 @@ const LoyaltyAdjustmentReason = sequelize.define('LoyaltyAdjustmentReason', {
     allowNull:    false,
     defaultValue: true,
   },
+  porcentaje: {
+    type:      DataTypes.DECIMAL(5, 2),
+    allowNull: true,
+    comment:   'null = motivo manual (sin %). Con valor: AJUSTE calcula puntos automáticamente desde montoBase (PR-lealtad-promos).',
+  },
 }, {
   tableName:   'loyalty_adjustment_reasons',
   underscored: true,

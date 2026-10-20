@@ -80,8 +80,8 @@ router.post('/cards/:id/canjes', authenticate, permit(PERMISSIONS.LOYALTY_MOVIMI
 // "Ajustes and Tarjetas:Nivel Do Not Imply Each Other") — ninguno de los dos
 // sustituye al otro, cada uno gatea exclusivamente su propia ruta.
 router.post('/cards/:id/ajustes', authenticate, permit(PERMISSIONS.LOYALTY_AJUSTES), asyncHandler(async (req, res) => {
-  const { puntos, reasonId, justificacion } = req.body ?? {};
-  const resultado = await ledgerService.registrarAjuste({ cardId: req.params.id, puntos, reasonId, justificacion }, req.user);
+  const { puntos, montoBase, reasonId, justificacion } = req.body ?? {};
+  const resultado = await ledgerService.registrarAjuste({ cardId: req.params.id, puntos, montoBase, reasonId, justificacion }, req.user);
   res.status(201).json(resultado);
 }));
 
@@ -115,6 +115,19 @@ router.get('/sucursales', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncH
 
 router.patch('/sucursales/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json(await configService.actualizarSucursal(req.params.id, req.body ?? {}));
+}));
+
+// Promociones (bono extra sobre acumulación, por periodo — ej. "Buen Fin").
+router.get('/promociones', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await configService.listarPromociones({ soloActivas: req.query.soloActivas === 'true' }));
+}));
+
+router.post('/promociones', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.status(201).json(await configService.crearPromocion(req.body ?? {}));
+}));
+
+router.patch('/promociones/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.editarPromocion(req.params.id, req.body ?? {}));
 }));
 
 module.exports = router;

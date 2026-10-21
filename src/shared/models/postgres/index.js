@@ -416,6 +416,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS movimientos_ppd_por_facturar JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_ppd_por_facturar:', e.message));
 
+  // Hoja "MOSTRADOR" de la póliza de Ingreso (2026-10-21) — ver mostrador.service.js.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS movimientos_mostrador JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_mostrador:', e.message));
+
   // "DEPOSITO EN EFECTIVO" sin conciliar, detectado al generar la póliza —
   // informativo, nunca se contabiliza (idempotente). BUG REAL 2026-09-10:
   // se agregó el campo al modelo Poliza.js sin este ALTER — Poliza no está

@@ -4556,7 +4556,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
       workbooks.push({
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo),
+        // MOSTRADOR también solo en Ventas (las facturas de mostrador son ventas).
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo, grupo === 'Ventas'),
       });
     }
     return { poliza, workbooks };
@@ -4677,7 +4678,7 @@ async function _unificarRenglonesPorDepositoBancario(bloques) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null, incluirMostrador = true) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -5176,6 +5177,71 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       if (row.getCell('totalVenta').value != null) row.getCell('totalVenta').numFmt = '#,##0.00';
     }
     wsPpd.autoFilter = { from: 'A1', to: 'H1' };
+  }
+
+  // Hoja "MOSTRADOR" (2026-10-21, formato del PDF del usuario "MOSTRADOR 20
+  // OCT 2026"): depósitos de Bancos de cada factura de mostrador que quedó
+  // "Venta Sin Cobro" — informativo, NUNCA se contabilizó en esta póliza. Ver
+  // mostrador.service.js.
+  if (incluirMostrador && poliza.movimientosMostrador?.length > 0) {
+    const wsMos = workbook.addWorksheet('MOSTRADOR');
+    wsMos.columns = [
+      { key: 'fecha',       width: 11 },
+      { key: 'descripcion', width: 44 },
+      { key: 'importe',     width: 15 },
+      { key: 'aplicado',    width: 15 },
+      { key: 'banco',       width: 12 },
+      { key: 'rem',         width: 16 },
+      { key: 'cliente',     width: 30 },
+      { key: 'idNumo',      width: 11 },
+      { key: 'estatus',     width: 15 },
+    ];
+    const relleno = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+    const encabezado = (row, argb) => row.eachCell(cell => {
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.fill = relleno(argb);
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+    });
+    for (const f of poliza.movimientosMostrador) {
+      const fechaFactura = f.fechaFactura ? new Date(f.fechaFactura) : null;
+      const titulo = wsMos.addRow([
+        fechaFactura ? fechaFactura.toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City' }) : '',
+        '', '', '', '', f.serie ?? '', `${f.serie ?? ''}-${f.folio ?? ''}`, '', '',
+      ]);
+      wsMos.mergeCells(titulo.number, 1, titulo.number, 5);
+      encabezado(titulo, 'FF8E7CC3');
+      encabezado(wsMos.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'APLICADO A FACTURA', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO', 'ESTATUS']), 'FF8E7CC3');
+      for (const d of f.depositos ?? []) {
+        const row = wsMos.addRow({
+          fecha:       d.fecha ? new Date(d.fecha) : null,
+          descripcion: d.descripcion,
+          importe:     d.importe,
+          aplicado:    d.aplicado,
+          banco:       d.banco,
+          rem:         (d.remisiones ?? []).join('\n'),
+          cliente:     d.cliente || 'CLIENTE NO IDENTIFICADO',
+          idNumo:      d.idNumo,
+          estatus:     d.estatus,
+        });
+        row.alignment = { vertical: 'middle', wrapText: true };
+        if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'd/m/yy';
+        row.getCell('importe').numFmt = '$#,##0.00';
+        row.getCell('aplicado').numFmt = '$#,##0.00';
+      }
+      const total = wsMos.addRow({
+        descripcion: 'TOTAL',
+        importe:     (f.depositos ?? []).reduce((s, d) => s + (Number(d.importe) || 0), 0),
+        aplicado:    f.totalAplicado,
+        rem:         'Total factura',
+        cliente:     f.totalFactura,
+      });
+      total.font = { bold: true };
+      total.getCell('descripcion').alignment = { horizontal: 'right' };
+      total.getCell('importe').numFmt = '$#,##0.00';
+      total.getCell('aplicado').numFmt = '$#,##0.00';
+      total.getCell('cliente').numFmt = '$#,##0.00';
+      wsMos.addRow([]);
+    }
   }
 
   return workbook;
@@ -5953,4 +6019,5 @@ module.exports = {
   _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
+  _construirWorkbookPoliza,
 };

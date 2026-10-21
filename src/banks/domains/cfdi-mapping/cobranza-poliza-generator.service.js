@@ -314,8 +314,9 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
 // donde se cobró, según cómo se mueve ese dinero:
 //   - efectivo en Puerto (O0): se deposita → 1102011001 "EFECTIVO-COS" (centro
 //     120; antes "DEP. PTO", el usuario pidió EFECTIVO-COS el 2026-10-06)
-//   - efectivo en otra caja (C0, F0…): "EFECTIVO-COS" en Caja aquí; desde
-//     2026-10-14 `_efectivoABanco` lo pasa a 1102011001 como todo el efectivo
+//   - efectivo en otra caja (C0, F0…): "EFECTIVO-COS" en Caja 1101010003,
+//     subcódigo 0 (2026-10-21, póliza del 20-oct C0-261001704; del 14 al
+//     21-oct `_efectivoABanco` lo pasaba a BBVA 1102011001 con subcódigo 20)
 //   - tarjeta: 1101010001 "TARJETA DE CREDITO"/"TARJETA DE DEBITO"
 const ETIQUETA_DEPOSITO_POR_CAJA = { O0: 'EFECTIVO-COS' };
 const CODIGO_CUENTA_BANCO_DEPOSITO_CAJA = '1102011001';
@@ -343,8 +344,9 @@ function _cargoCobroOtraCaja(fp, cuentaMap, ccBySerieMap) {
 // Todo el efectivo de Cobranza va a BBVA 1102011001 (2026-10-14, pedido del
 // usuario, póliza 1247 del 13-oct): el de la caja A0 que no se pudo cuadrar
 // con una ficha (o sin ficha capturada aún), el de cada sucursal ("EFECTIVO
-// 111") y el EFECTIVO-COS de cualquier caja — antes se quedaban en Caja
-// 1101010003 y solo Puerto iba a BBVA. Muta `movs`.
+// 111") — antes se quedaban en Caja 1101010003 y solo Puerto iba a BBVA.
+// El EFECTIVO-COS de otra caja no: se queda en Caja (2026-10-21, ver
+// `_cargoCobroOtraCaja`; el de Puerto ya trae BBVA desde ahí). Muta `movs`.
 function _efectivoABanco(movs, cuentaMap) {
   const idCaja = cuentaMap[CODIGO_CUENTA_CAJA];
   const idBanco = cuentaMap[CODIGO_CUENTA_BANCO_DEPOSITO_CAJA];
@@ -353,6 +355,7 @@ function _efectivoABanco(movs, cuentaMap) {
     // Con desglose real solo el efectivo (una tarjeta puede caer en la cuenta
     // de la regla, que para Reg 7A es esta misma Caja).
     const esEfectivo = m._formaPagoReal == null || m._formaPagoReal === '01';
+    if (m.serie === ETIQUETA_EFECTIVO_OTRA_CAJA) continue;
     if (m.cuentaId === idCaja && Number(m.debe) > 0 && esEfectivo) m.cuentaId = idBanco;
   }
 }

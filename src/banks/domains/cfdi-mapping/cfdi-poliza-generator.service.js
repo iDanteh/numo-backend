@@ -10,6 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const opaCobranzaSvc       = require('./opa-cobranza.service');
+const { detectarMovimientosMostrador } = require('./mostrador.service');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket, fotoEstadisticasErp } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -7500,6 +7501,22 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
 
   _fase('puntos+ppdOrfanos+reversiones');
 
+  // Hoja "MOSTRADOR": depósitos de Bancos de las facturas que quedaron como
+  // "Venta Sin Cobro" (remisiones cobradas días antes) — informativo, ver
+  // mostrador.service.js. Si falla, la póliza se guarda igual sin la hoja.
+  let movimientosMostradorGuard = [];
+  if (tipoCfdi === 'I') {
+    try {
+      movimientosMostradorGuard = await detectarMovimientosMostrador({ rfc, cfdis: cfdisSinPolizaFinalGuardFiltrado, movimientos: todosLosMovimientos });
+    } catch (err) {
+      advertencias.push(`⚠ No se pudo armar la hoja MOSTRADOR: ${err.message}`);
+    }
+    if (movimientosMostradorGuard.length) {
+      advertencias.push(`ℹ ${movimientosMostradorGuard.length} factura(s) de mostrador con depósitos de días anteriores — ver hoja "MOSTRADOR" (no se contabilizan).`);
+    }
+  }
+  _fase('mostrador');
+
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
   // Si se generó para un día específico (fechaInicio), el encabezado debe
   // mostrar ESE día, no la fecha en la que se corrió la generación.
@@ -7561,6 +7578,7 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
       depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
       movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard.length ? movimientosPpdPorFacturarGuard : null,
+      movimientosMostrador: movimientosMostradorGuard.length ? movimientosMostradorGuard : null,
     }, { transaction: t });
 
     const movimientosFinales = _deduplicarSFRedundante(todosLosMovimientos);

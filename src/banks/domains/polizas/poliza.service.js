@@ -2137,10 +2137,6 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // el ejemplo "9 (4).xls" del 10-jul; el "AUT." se queda solo en NI y en el
     // EFECTIVO de una ficha Banamex.
     const serieBancoReal = referenciaBancoReal;
-    // Efectivo cobrado en la caja de Puerto y depositado a BBVA ("EFECTIVO-COS"
-    // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
-    // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
-    const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
     // Depósito que paga solo esta factura y difiere por centavos del
     // complemento: el banco va por el monto exacto del depósito (2026-10-13,
     // caso real JAVIER DIAZ RODRIGUEZ dep 051726: complemento $1,602.92,
@@ -2180,7 +2176,10 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
       formaPago:      m.formaPago,
       reglaNombre:    m.reglaNombre,
       tipoOrigen:     m.tipoOrigen,
-      _subcodigo:     (esTransferenciaVerificada || esEfectivoCosDepositado) ? subcodigoTransferencia : 0,
+      // El "EFECTIVO-COS" en 1102011001 (efectivo cobrado en otra caja) va con
+      // subcódigo 0, no 20 (2026-10-21, pedido del usuario con la póliza del
+      // 20-oct C0-261001704; antes 20 por las pólizas manuales 19-29/sep).
+      _subcodigo:     esTransferenciaVerificada ? subcodigoTransferencia : 0,
       _referenciaBancoReal: referenciaBancoReal,
     };
   });

@@ -137,6 +137,13 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.JSONB,
     allowNull: true,
   },
+  // Depósitos de Bancos de remisiones PPD pagadas, "POR FACTURAR" y sin
+  // factura (2026-10-22) — tabla "PENDIENTE GENERAR FACTURA" de la hoja
+  // MOSTRADOR, informativo. Ver detectarDepositosPendientesFactura.
+  depositosPendientesFactura: {
+    type:      DataTypes.JSONB,
+    allowNull: true,
+  },
   // "DEPOSITO EN EFECTIVO" sin conciliar (dinero depositado directo en
   // sucursal bancaria, pero sin número de autorización/referencia que
   // permita ligarlo a un BankMovement real todavía) — confirmado con el

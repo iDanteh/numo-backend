@@ -130,4 +130,96 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
   return resultado.sort((a, b) => String(a.folio).localeCompare(String(b.folio)));
 }
 
-module.exports = { detectarMovimientosMostrador };
+/**
+ * Tabla "PENDIENTE GENERAR FACTURA" (2026-10-22, pedido del usuario con su
+ * lista manual de CEDIS): depósitos de Bancos DEL DÍA de la póliza que pagan
+ * remisiones de la sucursal que, según Kore, son PPD, ya están pagadas
+ * (saldo 0), siguen "POR FACTURAR" y NO tienen ninguna factura. Sale el
+ * depósito solo si TODAS sus remisiones de la sucursal cumplen. Verificado
+ * en prod: 31 de los 32 depósitos de la lista (el 32º no tiene remisión
+ * ligada en Bancos) — Kore no cambia el estatus al facturar, por eso la
+ * factura se confirma con `/desgloses-cobro/almacen` (serieFactura).
+ *
+ * @param {object}   p
+ * @param {string}   p.rfc
+ * @param {string[]} p.series    series de la sucursal (A0, …)
+ * @param {string}   p.fechaInicio  YYYY-MM-DD — día de la póliza
+ * @param {string}   [p.fechaFin]   YYYY-MM-DD (default = fechaInicio)
+ * @returns {Promise<{ depositos: object[], remisionesSinRespuesta: number }>}
+ *   depositos: [{ fecha, descripcion, importe, banco, remisiones, cliente, idNumo }]
+ */
+const LOTE_DESGLOSES = 50;
+// Kore limita /cuentas-pendientes (429 con 8 a la vez en prod, 2026-10-22).
+const CONCURRENCIA_CUENTAS = 2;
+
+async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin }) {
+  const seriesSet = new Set((series ?? []).map(s => String(s).trim().toUpperCase()).filter(Boolean));
+  if (!rfc || !seriesSet.size || !fechaInicio) return { depositos: [], remisionesSinRespuesta: 0 };
+
+  // `fecha` de Bancos es el día del estado de cuenta sin hora (medianoche
+  // "ingenua" UTC) — mismo rango que cargarFichasCobranza.
+  const desde = new Date(`${fechaInicio}T00:00:00.000Z`);
+  const hasta = new Date(`${fechaFin || fechaInicio}T23:59:59.999Z`);
+  const linkSinFactura = l => seriesSet.has(String(l.serie ?? '').trim().toUpperCase()) && !l.folioFiscal && l.folioExterno;
+  const bancos = await BankMovement.find({
+    isActive: { $ne: false },
+    deposito: { $gt: 0 },
+    fecha:    { $gte: desde, $lte: hasta },
+    erpLinks: { $elemMatch: { serie: { $in: [...seriesSet] }, $or: [{ folioFiscal: null }, { folioFiscal: '' }] } },
+  }).lean();
+  if (!bancos.length) return { depositos: [], remisionesSinRespuesta: 0 };
+
+  const clave = l => `${String(l.serie).trim().toUpperCase()}|${String(l.folioExterno).trim()}`;
+  const remisiones = [...new Map(bancos.flatMap(b => (b.erpLinks ?? []).filter(linkSinFactura))
+    .map(l => [clave(l), { serie: String(l.serie).trim().toUpperCase(), folio: String(l.folioExterno).trim() }])).values()];
+
+  // Factura que ampara cada remisión (y su fecha de creación, que pide /cuentas-pendientes).
+  const desglose = new Map();
+  for (let i = 0; i < remisiones.length; i += LOTE_DESGLOSES) {
+    const lote = remisiones.slice(i, i + LOTE_DESGLOSES);
+    const cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(r => r.serie), folios: lote.map(r => r.folio) });
+    for (const c of cuentas ?? []) desglose.set(`${c.serieVenta}|${c.folioVenta}`, c);
+  }
+
+  // Tipo de pago, estatus y saldo de Kore — solo de las que no tienen factura.
+  const cuentaKore = new Map();
+  let remisionesSinRespuesta = 0;
+  const pendientes = remisiones.filter(r => { const d = desglose.get(`${r.serie}|${r.folio}`); return d && !d.serieFactura; });
+  for (let i = 0; i < pendientes.length; i += CONCURRENCIA_CUENTAS) {
+    await Promise.all(pendientes.slice(i, i + CONCURRENCIA_CUENTAS).map(async r => {
+      const d = desglose.get(`${r.serie}|${r.folio}`);
+      const info = await obtenerCuentaTicket({ rfc, serie: r.serie, folio: r.folio, fechaCreacion: d.fechaCreacion }).catch(() => null);
+      if (info) cuentaKore.set(`${r.serie}|${r.folio}`, info);
+      else remisionesSinRespuesta++;
+    }));
+  }
+
+  const cumple = l => {
+    const k = clave(l);
+    const d = desglose.get(k);
+    const c = cuentaKore.get(k);
+    return !!(d && !d.serieFactura && c && !c.factura
+      && c.tipoPago === 'PPD'
+      && c.nombreTipoMovimiento === ESTATUS_POR_FACTURAR
+      && Math.abs(Number(c.saldoActual)) < 0.005);
+  };
+
+  const depositos = [];
+  for (const b of bancos) {
+    const links = (b.erpLinks ?? []).filter(linkSinFactura);
+    if (!links.length || !links.every(cumple)) continue;
+    depositos.push({
+      fecha:       b.fecha ?? null,
+      descripcion: b.concepto ?? '',
+      importe:     _r2(b.deposito),
+      banco:       b.banco ?? '',
+      remisiones:  [...new Set(links.map(l => `${String(l.serie).trim().toUpperCase()}-${String(l.folioExterno).trim()}`))],
+      cliente:     [...new Set(links.map(l => cuentaKore.get(clave(l))?.nombre).filter(Boolean))].join(' / '),
+      idNumo:      b.folio ?? '',
+    });
+  }
+  depositos.sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
+  return { depositos, remisionesSinRespuesta };
+}
+
+module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura };

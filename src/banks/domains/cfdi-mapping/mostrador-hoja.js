@@ -17,12 +17,20 @@
  */
 function tablasMostrador(datos) {
   const mostrador = datos?.movimientosMostrador ?? [];
+  // Global y a nombre del cliente: solo depósitos de remisiones PPD "POR
+  // FACTURAR" (2026-10-22, pedido del usuario: "se juntan las PPD que estén
+  // en una factura global" — antes la global salía con todo, p. ej. tickets
+  // PUE "TICKET SENCILLO" pagados por transferencia en la global M0-261000670).
+  // `totalAplicado` es el de lo listado.
+  const soloPpd = fs => fs
+    .map(f => {
+      const depositos = (f.depositos ?? []).filter(d => d.ppdPorFacturar);
+      return { ...f, depositos, totalAplicado: Math.round(depositos.reduce((s, d) => s + (Number(d.aplicado) || 0), 0) * 100) / 100 };
+    })
+    .filter(f => f.depositos.length);
   return {
-    facturasGlobales:    mostrador.filter(f => f.esGlobal === true),
-    ppdFacturadoCliente: mostrador
-      .filter(f => f.esGlobal === false)
-      .map(f => ({ ...f, depositos: (f.depositos ?? []).filter(d => d.ppdPorFacturar) }))
-      .filter(f => f.depositos.length),
+    facturasGlobales:    soloPpd(mostrador.filter(f => f.esGlobal === true)),
+    ppdFacturadoCliente: soloPpd(mostrador.filter(f => f.esGlobal === false)),
     sinClasificar:       mostrador.filter(f => typeof f.esGlobal !== 'boolean'),
     depositosPendientes: datos?.depositosPendientesFactura ?? [],
   };
@@ -144,29 +152,19 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
   if (ppdFacturadoCliente.length) {
     // Solo algunos depósitos de cada factura: el total es el de lo listado,
     // sin "Total facturas".
-    tablaJunta('PPD POR FACTURAR YA FACTURADO A NOMBRE DEL CLIENTE', ppdFacturadoCliente.map(f => ({
-      ...f, totalAplicado: _redondear2(f.depositos.reduce((s, d) => s + (Number(d.aplicado) || 0), 0)),
-    })), null);
+    tablaJunta('PPD POR FACTURAR YA FACTURADO A NOMBRE DEL CLIENTE', ppdFacturadoCliente, null);
   }
   if (sinClasificar.length) {
     seccion('SIN CLASIFICAR (regenerar la póliza)', 9);
     bloquesPorFactura(sinClasificar);
   }
   if (depositosPendientes.length) {
-    // Mismas columnas que la lista manual del usuario (CEDIS, 2026-10-22).
-    seccion('PENDIENTE GENERAR FACTURA', 7);
-    encabezado(wsMos.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO']), 'FF8E7CC3');
-    for (const d of depositosPendientes) {
-      const row = wsMos.addRow([d.fecha ? new Date(d.fecha) : null, d.descripcion, d.importe, d.banco,
-        (d.remisiones ?? []).join('\n'), d.cliente || 'CLIENTE NO IDENTIFICADO', d.idNumo]);
-      row.alignment = { vertical: 'middle', wrapText: true };
-      if (row.getCell(1).value) row.getCell(1).numFmt = 'd/m/yy';
-      row.getCell(3).numFmt = '$#,##0.00';
-    }
-    const total = wsMos.addRow([null, 'TOTAL', _redondear2(depositosPendientes.reduce((s, d) => s + (Number(d.importe) || 0), 0))]);
-    total.font = { bold: true };
-    total.getCell(2).alignment = { horizontal: 'right' };
-    total.getCell(3).numFmt = '$#,##0.00';
+    // Mismas columnas que las otras tablas (2026-10-22, pedido del usuario);
+    // FACTURA vacía porque todavía no tienen.
+    seccion('PENDIENTE GENERAR FACTURA', 10);
+    encabezado(wsMos.addRow([...COLUMNAS, 'FACTURA']), 'FF8E7CC3');
+    for (const d of depositosPendientes) filaDeposito(d, '');
+    filaTotal([{ depositos: depositosPendientes, totalAplicado: _redondear2(depositosPendientes.reduce((s, d) => s + (Number(d.aplicado) || 0), 0)) }], null);
   }
 
   return true;

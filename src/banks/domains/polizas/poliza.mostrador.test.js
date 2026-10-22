@@ -36,16 +36,21 @@ const nancy = {
     remisiones: ['A0-261003190'], cliente: 'NANCY MIGUEL LOPEZ', idNumo: '53714', estatus: 'FACTURADO', ppdPorFacturar: false }],
 };
 
-test('facturas globales: una sola tabla con la leyenda EN FACTURA GLOBAL y columna FACTURA', () => {
+test('facturas globales: una sola tabla con la leyenda EN FACTURA GLOBAL, fecha de cada factura y columna FACTURA', () => {
+  const ppd = d => ({ ...d, ppdPorFacturar: true });
   const otraGlobal = { ...factura, uuid: 'G2', folio: '261009477', esGlobal: true, totalFactura: 100, totalAplicado: 100,
-    depositos: [{ ...factura.depositos[0], idNumo: '9', importe: 100, aplicado: 100 }] };
-  const filas = hoja({ ...factura, esGlobal: true }, otraGlobal);
+    depositos: [ppd({ ...factura.depositos[0], idNumo: '9', importe: 100, aplicado: 100 })] };
+  // Caso real M0-261000670 (2026-10-22): tickets PUE "TICKET SENCILLO" en una global → no salen.
+  const globalTickets = { ...factura, uuid: 'G3', serie: 'M0', folio: '261000670', esGlobal: true,
+    depositos: [{ ...factura.depositos[0], idNumo: '054092', estatus: 'TICKET SENCILLO', ppdPorFacturar: false }] };
+  const filas = hoja({ ...factura, esGlobal: true, depositos: factura.depositos.map(ppd) }, otraGlobal, globalTickets);
   expect(filas[0][0]).toBe('EN FACTURA GLOBAL — A0-261009872 (20/10/26), A0-261009477 (20/10/26)');
   expect(filas[1]).toEqual(COLUMNAS);
   expect(filas[2].slice(1)).toEqual(['DEPOSITO EN EFECTIVO', 11580.53, 11580.53, 'BBVA', 'A0-260901786\nA0-260901831', 'JUAN LOPEZ MORALES', '052586', 'POR FACTURAR', 'A0-261009872']);
   expect(filas[3][6]).toBe('CLIENTE NO IDENTIFICADO');
   expect(filas[4][9]).toBe('A0-261009477');
-  expect(filas[5].slice(1, 7)).toEqual(['TOTAL', 16680.53, 17181.6, undefined, 'Total facturas', 229802.95]);
+  expect(filas[5].slice(1, 7)).toEqual(['TOTAL', 16680.53, 16680.27, undefined, 'Total facturas', 229802.95]);
+  expect(filas.flat()).not.toContain('054092');
 });
 
 test('no global: solo los depósitos PPD "POR FACTURAR" en su tabla; lo FACTURADO (NANCY) no sale', () => {
@@ -72,17 +77,18 @@ test('póliza generada antes de clasificar: bloques por factura bajo "SIN CLASIF
   expect(filas[5].slice(1, 4)).toEqual(['TOTAL', 16580.53, 17081.6]);
 });
 
-test('PENDIENTE GENERAR FACTURA: depósitos con las columnas de la lista manual y total', () => {
+test('PENDIENTE GENERAR FACTURA: mismas columnas que las otras tablas (FACTURA vacía) y total', () => {
   const ws = _construirWorkbookPoliza({ ...poliza, movimientosMostrador: null, depositosPendientesFactura: [
-    { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487' },
-    { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, banco: 'BBVA', remisiones: ['A0-260804886', 'A0-260804887'], cliente: '', idNumo: '053966' },
+    { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, aplicado: 9967.81, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487', estatus: 'POR FACTURAR' },
+    { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, aplicado: 146077.63, banco: 'BBVA', remisiones: ['A0-260804886', 'A0-260804887'], cliente: '', idNumo: '053966', estatus: 'POR FACTURAR' },
   ] }, [], null, new Map()).getWorksheet('MOSTRADOR');
   const filas = valores(ws);
   expect(filas[0][0]).toBe('PENDIENTE GENERAR FACTURA');
-  expect(filas[1]).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO']);
-  expect(filas[2].slice(1)).toEqual(['Depósito de efectivo', 9968, 'Banamex', 'A0-260902675', 'ROMAN SOLANO PAZ', '053487']);
-  expect(filas[3].slice(4)).toEqual(['A0-260804886\nA0-260804887', 'CLIENTE NO IDENTIFICADO', '053966']);
-  expect(filas[4].slice(1, 3)).toEqual(['TOTAL', 156045.63]);
+  expect(filas[1]).toEqual(COLUMNAS);
+  expect(filas[2].slice(1)).toEqual(['Depósito de efectivo', 9968, 9967.81, 'Banamex', 'A0-260902675', 'ROMAN SOLANO PAZ', '053487', 'POR FACTURAR']);
+  expect(filas[2][9]).toBeUndefined();
+  expect(filas[3].slice(5, 8)).toEqual(['A0-260804886\nA0-260804887', 'CLIENTE NO IDENTIFICADO', '053966']);
+  expect(filas[4].slice(1, 4)).toEqual(['TOTAL', 156045.63, 156045.44]);
 });
 
 test('sin facturas de mostrador, o en archivos que no son Ventas, no hay hoja', () => {

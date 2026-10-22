@@ -46,7 +46,12 @@ const LoyaltyPointsLedger = sequelize.define('LoyaltyPointsLedger', {
   montoVenta: {
     type:      DataTypes.DECIMAL(14, 2),
     allowNull: true,
-    comment:   'Solo ACUMULACION',
+    comment:   'Solo ACUMULACION — subtotal (antes de impuesto) de la venta en Kore, usado para calcular puntos',
+  },
+  montoVentaTotal: {
+    type:      DataTypes.DECIMAL(14, 2),
+    allowNull: true,
+    comment:   'Solo ACUMULACION — total de la venta en Kore (con impuesto), solo auditoría, nunca se muestra en la UI',
   },
   porcentajeAplicado: {
     type:      DataTypes.DECIMAL(5, 2),

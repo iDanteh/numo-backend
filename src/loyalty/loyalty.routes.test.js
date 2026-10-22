@@ -80,8 +80,8 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'patch', ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR, body: { nombre: 'Ana' } },
     { metodo: 'post',  ruta: '/cards/1/nip',                permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
     { metodo: 'put',   ruta: '/cards/1/nivel',              permiso: PERMISSIONS.LOYALTY_TARJETAS_NIVEL, body: { nivel: 'Plata' } },
-    { metodo: 'post',  ruta: '/cards/1/acumulaciones',      permiso: PERMISSIONS.LOYALTY_MOVIMIENTOS, body: { montoVenta: 100, centroCostoId: 1 } },
-    { metodo: 'post',  ruta: '/cards/1/canjes',             permiso: PERMISSIONS.LOYALTY_MOVIMIENTOS, body: { puntos: 10, centroCostoId: 1 } },
+    { metodo: 'post',  ruta: '/cards/1/acumulaciones',      permiso: PERMISSIONS.LOYALTY_MOVIMIENTOS, body: { montoVenta: 100, serieFolio: 'A0-123' } },
+    { metodo: 'post',  ruta: '/cards/1/canjes',             permiso: PERMISSIONS.LOYALTY_MOVIMIENTOS, body: { puntos: 10, serie: 'A0' } },
     { metodo: 'post',  ruta: '/cards/1/ajustes',            permiso: PERMISSIONS.LOYALTY_AJUSTES, body: { puntos: 10, reasonId: 1, justificacion: 'bono' } },
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
@@ -138,8 +138,8 @@ describe('read-only (solo loyalty:read) no puede escribir nada', () => {
   });
 
   test('no puede registrar acumulación ni canje', async () => {
-    const r1 = await request(app).post('/cards/1/acumulaciones').set(perms(PERMISSIONS.LOYALTY_READ)).send({ montoVenta: 1, centroCostoId: 1 });
-    const r2 = await request(app).post('/cards/1/canjes').set(perms(PERMISSIONS.LOYALTY_READ)).send({ puntos: 1, centroCostoId: 1 });
+    const r1 = await request(app).post('/cards/1/acumulaciones').set(perms(PERMISSIONS.LOYALTY_READ)).send({ serieFolio: 'A0-1' });
+    const r2 = await request(app).post('/cards/1/canjes').set(perms(PERMISSIONS.LOYALTY_READ)).send({ puntos: 1, serie: 'A0' });
     expect(r1.status).toBe(403);
     expect(r2.status).toBe(403);
   });

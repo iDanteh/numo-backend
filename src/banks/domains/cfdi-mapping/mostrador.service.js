@@ -224,4 +224,35 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
   return { depositos, remisionesSinRespuesta };
 }
 
-module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura };
+/**
+ * Hoja "DEPÓSITOS EN EFECTIVO" del reporte "Por facturar" (2026-10-22, pedido
+ * del usuario): depósitos en efectivo del periodo que todavía NO están
+ * asociados a ninguna venta en Bancos (sin `erpLinks`), p. ej. el 051499
+ * ($1,618.95, 8-oct) — sin deducir a qué remisión corresponden. Sin vínculo
+ * no se sabe de qué sucursal son, así que salen todos los del periodo.
+ *
+ * @returns {Promise<object[]>} [{ fecha, descripcion, importe, banco, ficha, idNumo }]
+ */
+async function detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin }) {
+  if (!fechaInicio) return [];
+  const bancos = await BankMovement.find({
+    isActive: { $ne: false },
+    deposito: { $gt: 0 },
+    // Mismo rango "ingenuo" que detectarDepositosPendientesFactura.
+    fecha:    { $gte: new Date(`${fechaInicio}T00:00:00.000Z`), $lte: new Date(`${fechaFin || fechaInicio}T23:59:59.999Z`) },
+    concepto: { $regex: 'efectivo', $options: 'i' },
+    $or:      [{ erpLinks: { $exists: false } }, { erpLinks: { $size: 0 } }],
+  }).select('fecha concepto deposito banco ficha folio').lean();
+  return bancos
+    .map(b => ({
+      fecha:       b.fecha ?? null,
+      descripcion: b.concepto ?? '',
+      importe:     _r2(b.deposito),
+      banco:       b.banco ?? '',
+      ficha:       b.ficha ?? '',
+      idNumo:      b.folio ?? '',
+    }))
+    .sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
+}
+
+module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar };

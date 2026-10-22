@@ -170,4 +170,41 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
   return true;
 }
 
-module.exports = { agregarHojaMostrador, tablasMostrador };
+/**
+ * Hoja "DEPÓSITOS EN EFECTIVO" (reporte "Por facturar", 2026-10-22):
+ * depósitos en efectivo sin asociar a ninguna venta. Devuelve false si no hay.
+ */
+function agregarHojaDepositosEfectivo(workbook, depositos, nombreHoja = 'DEPÓSITOS EN EFECTIVO') {
+  if (!depositos?.length) return false;
+  const ws = workbook.addWorksheet(nombreHoja);
+  ws.columns = [
+    { key: 'fecha',       width: 11 },
+    { key: 'descripcion', width: 44 },
+    { key: 'importe',     width: 15 },
+    { key: 'banco',       width: 12 },
+    { key: 'ficha',       width: 28 },
+    { key: 'idNumo',      width: 11 },
+  ];
+  const estilo = (row, argb) => row.eachCell(cell => {
+    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  });
+  const titulo = ws.addRow(['DEPÓSITOS EN EFECTIVO — SIN ASOCIAR A NINGUNA VENTA']);
+  ws.mergeCells(titulo.number, 1, titulo.number, 6);
+  estilo(titulo, 'FF5B4A9E');
+  estilo(ws.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FICHA', 'ID NUMO']), 'FF8E7CC3');
+  for (const d of depositos) {
+    const row = ws.addRow({ ...d, fecha: d.fecha ? new Date(d.fecha) : null });
+    row.alignment = { vertical: 'middle', wrapText: true };
+    if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'd/m/yy';
+    row.getCell('importe').numFmt = '$#,##0.00';
+  }
+  const total = ws.addRow({ descripcion: 'TOTAL', importe: Math.round(depositos.reduce((s, d) => s + (Number(d.importe) || 0), 0) * 100) / 100 });
+  total.font = { bold: true };
+  total.getCell('descripcion').alignment = { horizontal: 'right' };
+  total.getCell('importe').numFmt = '$#,##0.00';
+  return true;
+}
+
+module.exports = { agregarHojaMostrador, agregarHojaDepositosEfectivo, tablasMostrador };

@@ -7552,10 +7552,17 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     const metodosPagoNuevos = new Set(todosLosMovimientos.map(m => m.metodoPago));
     const consumeDosFolios = tipoPropuesta === 'I'
       && [...metodosPagoNuevos].some(m => m !== 'PPD') && metodosPagoNuevos.has('PPD');
-    const foliosNecesarios = _esCedisPorSucursal(centroFolio?.sucursal) ? FOLIOS_MAX_CEDIS : (consumeDosFolios ? 2 : 1);
+    // Ingreso: desde 2026-10-16 el folio que va a CONTPAQi se asigna aparte al
+    // exportar (RANGOS_FOLIO_CONTPAQ_INGRESO / contpaq_folio_* en
+    // poliza.service.js), así que `numero` es solo interno de NUMO y cada
+    // póliza ocupa uno. Reservar los 6 de CEDIS agotaba 100–199 a media
+    // quincena (caso real 2026-10-22: "Se agotó el rango de folios de CEDIS").
+    const unFolioPorPoliza = tipoPropuesta === 'I';
+    const foliosNecesarios = unFolioPorPoliza ? 1
+      : _esCedisPorSucursal(centroFolio?.sucursal) ? FOLIOS_MAX_CEDIS : (consumeDosFolios ? 2 : 1);
 
     const { numero, agotado } = await _folioSiguienteDisponible({
-      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t,
+      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t, unFolioPorPoliza,
     });
 
     if (agotado) {

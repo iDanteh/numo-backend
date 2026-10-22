@@ -19,6 +19,7 @@ const AccountPlan       = require('./AccountPlan');
 const Entity            = require('./Entity');
 const PeriodoFiscal     = require('./PeriodoFiscal');
 const CierreMesHistorico = require('./CierreMesHistorico');
+const ReportePorFacturar = require('./ReportePorFacturar');
 const Permission        = require('./Permission');
 const Role              = require('./Role');
 const Poliza            = require('./Poliza');
@@ -52,6 +53,7 @@ CierreMesHistorico.belongsTo(User, { foreignKey: 'cerradoPorId', as: 'cerradoPor
 User.hasMany(CierreMesHistorico,   { foreignKey: 'cerradoPorId', as: 'cierresMesRealizados' });
 CierreMesHistorico.belongsTo(User, { foreignKey: 'revertidoPorId', as: 'revertidoPor' });
 User.hasMany(CierreMesHistorico,   { foreignKey: 'revertidoPorId', as: 'cierresMesRevertidos' });
+ReportePorFacturar.belongsTo(User, { foreignKey: 'creadoPorId', as: 'creadoPor' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -152,6 +154,9 @@ async function syncModels() {
 
   // Historial de cierres de mes — tabla nueva, depende de periodos_fiscales y users.
   await CierreMesHistorico.sync({ force: false });
+
+  // Historial del reporte "Por facturar" (Reportes, 2026-10-22) — tabla nueva, depende de users.
+  await ReportePorFacturar.sync({ force: false });
 
   // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
   // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla
@@ -512,4 +517,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] carga inicial poliza_audit_logs:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, syncModels };

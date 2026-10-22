@@ -20,6 +20,7 @@ const errorHandler = require('./shared/middleware/error-handler');
 const bankRoutes              = require('./banks/domains/banks/bank.routes');
 const accountPlanRoutes       = require('./banks/domains/account-plan/account-plan.routes');
 const centrosCostoRoutes      = require('./banks/domains/centros-costo/centros-costo.routes');
+const reportesPorFacturarRoutes = require('./banks/domains/reportes-por-facturar/reportes-por-facturar.routes');
 const terminalesRoutes        = require('./banks/domains/terminales/terminales.routes');
 const clientesRoutes          = require('./banks/domains/clientes/clientes.routes');
 const collectionRequestRoutes = require('./banks/domains/collection-requests/collection-request.routes');
@@ -122,6 +123,7 @@ app.get('/health', async (_req, res) => {
 app.use('/api/banks',                bankRoutes);
 app.use('/api/account-plan',         accountPlanRoutes);
 app.use('/api/centros-costo',        centrosCostoRoutes);
+app.use('/api/reportes-por-facturar', reportesPorFacturarRoutes);
 app.use('/api/terminales',           terminalesRoutes);
 app.use('/api/clientes',             clientesRoutes);
 app.use('/api/collection-requests',  collectionRequestRoutes);

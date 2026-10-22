@@ -462,7 +462,9 @@ describe('GET /cortes', () => {
       ...FAKE_CORTE,
       inicio: FAKE_CORTE.inicio.toISOString(), // serializado a JSON
     });
-    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', rolEquipo: 'test-role' });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({
+      periodo: 'mensual', banco: 'BBVA', fechaInicio: undefined, fechaFin: undefined, rolEquipo: 'test-role',
+    });
   });
 
   test('sin ?banco: se pasa null (no el string vacío)', async () => {
@@ -471,7 +473,9 @@ describe('GET /cortes', () => {
       .query({ periodo: 'semanal' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null, rolEquipo: 'test-role' });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({
+      periodo: 'semanal', banco: null, fechaInicio: undefined, fechaFin: undefined, rolEquipo: 'test-role',
+    });
   });
 
   test('con fechaInicio/fechaFin: se pasan tal cual al service (corte histórico)', async () => {
@@ -494,7 +498,9 @@ describe('GET /cortes', () => {
       .query({ periodo: 'semanal' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({ periodo: 'semanal', banco: null, rolEquipo: null });
+    expect(indicadoresService.getCorteConciliacion).toHaveBeenCalledWith({
+      periodo: 'semanal', banco: null, fechaInicio: undefined, fechaFin: undefined, rolEquipo: null,
+    });
   });
 });
 
@@ -606,7 +612,9 @@ describe('GET /cortes/reporte', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Corte-Conciliacion-\d{4}-\d{2}-\d{2}\.xlsx"$/);
-    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', rolEquipo: 'test-role' });
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({
+      periodo: 'mensual', banco: 'BBVA', fechaInicio: undefined, fechaFin: undefined, rolEquipo: 'test-role',
+    });
   });
 
   test('con fechaInicio/fechaFin: se pasan tal cual al service (reporte de corte histórico)', async () => {
@@ -628,7 +636,9 @@ describe('GET /cortes/reporte', () => {
       .query({ periodo: 'mensual', banco: 'BBVA' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', rolEquipo: null });
+    expect(indicadoresService.buildReporteCorte).toHaveBeenCalledWith({
+      periodo: 'mensual', banco: 'BBVA', fechaInicio: undefined, fechaFin: undefined, rolEquipo: null,
+    });
   });
 });
 

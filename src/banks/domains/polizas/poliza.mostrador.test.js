@@ -72,6 +72,19 @@ test('póliza generada antes de clasificar: bloques por factura bajo "SIN CLASIF
   expect(filas[5].slice(1, 4)).toEqual(['TOTAL', 16580.53, 17081.6]);
 });
 
+test('PENDIENTE GENERAR FACTURA: depósitos con las columnas de la lista manual y total', () => {
+  const ws = _construirWorkbookPoliza({ ...poliza, movimientosMostrador: null, depositosPendientesFactura: [
+    { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487' },
+    { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, banco: 'BBVA', remisiones: ['A0-260804886', 'A0-260804887'], cliente: '', idNumo: '053966' },
+  ] }, [], null, new Map()).getWorksheet('MOSTRADOR');
+  const filas = valores(ws);
+  expect(filas[0][0]).toBe('PENDIENTE GENERAR FACTURA');
+  expect(filas[1]).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO']);
+  expect(filas[2].slice(1)).toEqual(['Depósito de efectivo', 9968, 'Banamex', 'A0-260902675', 'ROMAN SOLANO PAZ', '053487']);
+  expect(filas[3].slice(4)).toEqual(['A0-260804886\nA0-260804887', 'CLIENTE NO IDENTIFICADO', '053966']);
+  expect(filas[4].slice(1, 3)).toEqual(['TOTAL', 156045.63]);
+});
+
 test('sin facturas de mostrador, o en archivos que no son Ventas, no hay hoja', () => {
   expect(_construirWorkbookPoliza({ ...poliza, movimientosMostrador: null }, [], null, new Map()).getWorksheet('MOSTRADOR')).toBeUndefined();
   expect(_construirWorkbookPoliza(poliza, [], null, new Map(), [], [], null, false).getWorksheet('MOSTRADOR')).toBeUndefined();

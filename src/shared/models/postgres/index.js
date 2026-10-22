@@ -421,6 +421,10 @@ async function syncModels() {
     ALTER TABLE polizas
       ADD COLUMN IF NOT EXISTS movimientos_mostrador JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_mostrador:', e.message));
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS depositos_pendientes_factura JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN depositos_pendientes_factura:', e.message));
 
   // "DEPOSITO EN EFECTIVO" sin conciliar, detectado al generar la póliza —
   // informativo, nunca se contabiliza (idempotente). BUG REAL 2026-09-10:

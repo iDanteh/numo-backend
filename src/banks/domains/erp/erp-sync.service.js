@@ -535,8 +535,10 @@ async function obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen, fechaDesde,
 // pensada para descargas masivas): es solo el nombre para el concepto — si
 // falla o no viene, el caller conserva "CLIENTE NO IDENTIFICADO". Las fallas
 // no se cachean, así una regeneración posterior lo vuelve a intentar.
+// `obtenerCuentaTicket` devuelve además `tipoPago` y `nombreTipoMovimiento`
+// de la misma cuenta (hoja MOSTRADOR, 2026-10-22: PPD "POR FACTURAR").
 const _cacheNombrePersona = new Map();
-async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) {
+async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
   if (!rfc || !serie || !folio || !fechaCreacion) return null;
   const creada = new Date(fechaCreacion);
   if (Number.isNaN(creada.getTime())) return null;
@@ -544,7 +546,7 @@ async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) 
   const cacheado = _leerCache(_cacheNombrePersona, clave);
   if (cacheado !== undefined) return cacheado;
 
-  let nombre = null;
+  let info = null;
   try {
     const response = await axios.get(`${await _cuentasPendientesUrl()}/cuentas-pendientes`, {
       params: {
@@ -558,18 +560,26 @@ async function obtenerNombrePersonaTicket({ rfc, serie, folio, fechaCreacion }) 
     });
     const cuenta = (response.data?.Data?.cuentas ?? [])
       .find(c => c.serieExterna === serie && String(c.folioExterno) === String(folio));
-    nombre = (cuenta?.nombrePersona ?? '').trim() || null;
+    info = {
+      nombre:               (cuenta?.nombrePersona ?? '').trim() || null,
+      tipoPago:             cuenta?.tipoPago ?? null,
+      nombreTipoMovimiento: cuenta?.nombreTipoMovimiento ? String(cuenta.nombreTipoMovimiento).trim().toUpperCase() : null,
+    };
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
     logger.warn(`[ErpSync] nombre de cliente para ${serie}-${folio} no disponible (${err.response?.status ?? err.message})`);
     return null;
   }
-  _cacheNombrePersona.set(clave, { data: nombre, ts: Date.now() });
-  return nombre;
+  _cacheNombrePersona.set(clave, { data: info, ts: Date.now() });
+  return info;
+}
+
+async function obtenerNombrePersonaTicket(params) {
+  return (await obtenerCuentaTicket(params))?.nombre ?? null;
 }
 
 module.exports = {
-  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor, obtenerNombrePersonaTicket,
+  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor, obtenerNombrePersonaTicket, obtenerCuentaTicket,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
   obtenerDesglosesSalidasCajaPorAlmacen,
 };

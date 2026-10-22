@@ -7415,8 +7415,13 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
     } catch (err) {
       advertencias.push(`⚠ No se pudo armar la hoja MOSTRADOR: ${err.message}`);
     }
-    if (movimientosMostradorGuard.length) {
-      advertencias.push(`ℹ ${movimientosMostradorGuard.length} factura(s) de mostrador con depósitos de días anteriores — ver hoja "MOSTRADOR" (no se contabilizan).`);
+    // Solo lo que la hoja enseña: facturas globales y depósitos PPD "POR
+    // FACTURAR" ya facturados a nombre del cliente.
+    const globalesMostrador = movimientosMostradorGuard.filter(f => f.esGlobal).length;
+    const ppdClienteMostrador = movimientosMostradorGuard
+      .filter(f => !f.esGlobal).flatMap(f => f.depositos ?? []).filter(d => d.ppdPorFacturar).length;
+    if (globalesMostrador || ppdClienteMostrador) {
+      advertencias.push(`ℹ Hoja "MOSTRADOR": ${globalesMostrador} factura(s) global(es) y ${ppdClienteMostrador} depósito(s) PPD por facturar ya facturado(s) a nombre del cliente (no se contabilizan).`);
     }
   }
   // 7. Guardar póliza + movimientos en una transacción con advisory lock

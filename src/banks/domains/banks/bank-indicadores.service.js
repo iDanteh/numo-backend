@@ -749,10 +749,16 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
 
   const inicio = periodo === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
 
+  // `importeTotal` (2026-10-22, pedido explícito del usuario): suma de `deposito` junto a cada
+  // conteo existente, para las mismas categorías que ya expone "Ver por estatus" — nunca
+  // reemplaza al conteo, se agrega al lado.
   const agruparPorStatus = (extraMatch) => BankMovement.aggregate([
     { $match: { ...baseMatch, ...extraMatch } },
-    { $group: { _id: '$status', count: { $sum: 1 } } },
-  ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count])));
+    { $group: { _id: '$status', count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+  ]).then(rows => ({
+    counts:   Object.fromEntries(rows.map(r => [r._id, r.count])),
+    importes: Object.fromEntries(rows.map(r => [r._id, r.importeTotal ?? 0])),
+  }));
 
   const [rezagadosPorStatus, nuevosPorStatus, nuevosIdentificadoEquipo, identificadosPorOrigen, pendientesConErp] = await Promise.all([
     agruparPorStatus({ fecha: { $lt: inicio }, status: { $in: BACKLOG_STATUSES } }),
@@ -761,12 +767,18 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
     // no_identificado/reclasificado (que no tienen primeraIdentificacionPor), no solo a los
     // identificados de otro rol.
     agruparPorStatus({ fecha: { $gte: inicio } }),
-    // Conteo de 'identificado' YA acotado al rol — este es el que se expone en `nuevos`.
-    BankMovement.countDocuments({ ...baseMatch, ...matchEquipo, fecha: { $gte: inicio }, status: 'identificado' }),
+    // Conteo + suma de 'identificado' YA acotados al rol — lo que se expone en `nuevos`.
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, ...matchEquipo, fecha: { $gte: inicio }, status: 'identificado' } },
+      { $group: { _id: null, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]).then(rows => ({ count: rows[0]?.count ?? 0, importeTotal: rows[0]?.importeTotal ?? 0 })),
     BankMovement.aggregate([
       { $match: { ...baseMatch, ...matchEquipo, status: 'identificado', primeraIdentificacionAt: { $gte: inicio } } },
-      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
-    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]).then(rows => ({
+      counts:   Object.fromEntries(rows.map(r => [r._id, r.count])),
+      importes: Object.fromEntries(rows.map(r => [r._id, r.importeTotal ?? 0])),
+    })),
     // Pendientes (CUALQUIER fecha, rezago o nuevo) con al menos una CxC vinculada — insumo de
     // "CxC retrasadas" (ver _calcularCxcRetrasadas arriba). Sin scope por rol: mismo criterio
     // que rezagados/nuevos.pendientes, es una propiedad del movimiento, no de quién identifica.
@@ -778,30 +790,49 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
   const cxcRetrasadas = _calcularCxcRetrasadas(pendientesConErp, _anioMesActualMexico());
 
   const rezagados = {
-    no_identificado: rezagadosPorStatus.no_identificado ?? 0,
-    reclasificado:    rezagadosPorStatus.reclasificado    ?? 0,
+    no_identificado: rezagadosPorStatus.counts.no_identificado ?? 0,
+    reclasificado:    rezagadosPorStatus.counts.reclasificado    ?? 0,
   };
   rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+  rezagados.importeTotal = {
+    no_identificado: rezagadosPorStatus.importes.no_identificado ?? 0,
+    reclasificado:    rezagadosPorStatus.importes.reclasificado    ?? 0,
+  };
+  rezagados.importeTotal.total = rezagados.importeTotal.no_identificado + rezagados.importeTotal.reclasificado;
 
   // Total/otros se calculan con el identificado SIN scope (nuevosPorStatus.identificado) —
   // son propiedades del lote completo, no de "mi equipo". Ver comentario grande arriba: la
   // suma de los 4 buckets expuestos puede no coincidir exacto con `nuevos.total` cuando hay
-  // scope (la diferencia es "identificado por otro rol", a propósito no se expone).
-  const nuevosTotal = Object.values(nuevosPorStatus).reduce((a, b) => a + b, 0);
+  // scope (la diferencia es "identificado por otro rol", a propósito no se expone). Mismo
+  // criterio se aplica a `nuevos.importeTotal`.
+  const nuevosTotal = Object.values(nuevosPorStatus.counts).reduce((a, b) => a + b, 0);
+  const nuevosImporteTotal = Object.values(nuevosPorStatus.importes).reduce((a, b) => a + b, 0);
   const nuevos = {
-    no_identificado: nuevosPorStatus.no_identificado ?? 0,
-    reclasificado:    nuevosPorStatus.reclasificado    ?? 0,
-    identificado:     nuevosIdentificadoEquipo,
+    no_identificado: nuevosPorStatus.counts.no_identificado ?? 0,
+    reclasificado:    nuevosPorStatus.counts.reclasificado    ?? 0,
+    identificado:     nuevosIdentificadoEquipo.count,
   };
-  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - (nuevosPorStatus.identificado ?? 0);
+  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - (nuevosPorStatus.counts.identificado ?? 0);
   nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
   nuevos.total = nuevosTotal;
+  nuevos.importeTotal = {
+    no_identificado: nuevosPorStatus.importes.no_identificado ?? 0,
+    reclasificado:    nuevosPorStatus.importes.reclasificado    ?? 0,
+    identificado:     nuevosIdentificadoEquipo.importeTotal,
+  };
+  nuevos.importeTotal.otros = nuevosImporteTotal - nuevos.importeTotal.no_identificado - nuevos.importeTotal.reclasificado - (nuevosPorStatus.importes.identificado ?? 0);
+  nuevos.importeTotal.total = nuevosImporteTotal;
 
   const identificadosEnPeriodo = {
-    deRezagados: identificadosPorOrigen.rezagado ?? 0,
-    deNuevos:    identificadosPorOrigen.nuevo     ?? 0,
+    deRezagados: identificadosPorOrigen.counts.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.counts.nuevo     ?? 0,
   };
   identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+  identificadosEnPeriodo.importeTotal = {
+    deRezagados: identificadosPorOrigen.importes.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.importes.nuevo     ?? 0,
+  };
+  identificadosEnPeriodo.importeTotal.total = identificadosEnPeriodo.importeTotal.deRezagados + identificadosEnPeriodo.importeTotal.deNuevos;
 
   return { periodo, inicio, historico: false, rezagados, nuevos, identificadosEnPeriodo, cxcRetrasadas };
 }
@@ -839,8 +870,11 @@ async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, ma
 
     BankMovement.aggregate([
       { $match: { ...baseMatch, ...matchEquipo, status: 'identificado', primeraIdentificacionAt: { $gte: inicio, $lte: fin } } },
-      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
-    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]).then(rows => ({
+      counts:   Object.fromEntries(rows.map(r => [r._id, r.count])),
+      importes: Object.fromEntries(rows.map(r => [r._id, r.importeTotal ?? 0])),
+    })),
   ]);
 
   let posibleCambioPosterior = 0;
@@ -849,41 +883,69 @@ async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, ma
   // BACKLOG_STATUSES: 'otros' queda afuera, es un estatus terminal, no un pendiente disfrazado.
   const pendientesConErp = [];
 
+  // `importeTotal` (2026-10-22): acumulado en JS junto con el conteo, porque esta rama ya
+  // reconstruye el estado "al cierre" documento por documento (no hay $group de Mongo acá).
   const rezagados = { no_identificado: 0, reclasificado: 0 };
+  const rezagadosImporte = { no_identificado: 0, reclasificado: 0 };
   for (const mov of candidatosRezagados) {
     const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
     if (posibleCambio) posibleCambioPosterior++;
     if (!identificado) {
       const key = mov.status === 'reclasificado' ? 'reclasificado' : 'no_identificado';
       rezagados[key]++;
+      rezagadosImporte[key] += mov.deposito ?? 0;
       pendientesConErp.push(mov);
     }
   }
   rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+  rezagados.importeTotal = {
+    ...rezagadosImporte,
+    total: rezagadosImporte.no_identificado + rezagadosImporte.reclasificado,
+  };
 
   const nuevos = { no_identificado: 0, reclasificado: 0, identificado: 0, otros: 0 };
+  const nuevosImporte = { no_identificado: 0, reclasificado: 0, otros: 0 };
   let identificadoTotalSinScope = 0;
   let identificadoDelEquipo     = 0;
+  let identificadoImporteSinScope = 0;
+  let identificadoImporteEquipo   = 0;
   for (const mov of candidatosNuevos) {
     const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
     if (posibleCambio) posibleCambioPosterior++;
+    const importe = mov.deposito ?? 0;
     if (identificado) {
       identificadoTotalSinScope++;
-      if (_enEquipoRol(mov.primeraIdentificacionPor?.userId, equipoIds)) identificadoDelEquipo++;
+      identificadoImporteSinScope += importe;
+      if (_enEquipoRol(mov.primeraIdentificacionPor?.userId, equipoIds)) {
+        identificadoDelEquipo++;
+        identificadoImporteEquipo += importe;
+      }
     }
-    else if (mov.status === 'reclasificado') { nuevos.reclasificado++; pendientesConErp.push(mov); }
-    else if (mov.status === 'otros')         nuevos.otros++;
-    else                                      { nuevos.no_identificado++; pendientesConErp.push(mov); }
+    else if (mov.status === 'reclasificado') { nuevos.reclasificado++; nuevosImporte.reclasificado += importe; pendientesConErp.push(mov); }
+    else if (mov.status === 'otros')         { nuevos.otros++; nuevosImporte.otros += importe; }
+    else                                      { nuevos.no_identificado++; nuevosImporte.no_identificado += importe; pendientesConErp.push(mov); }
   }
   nuevos.identificado = identificadoDelEquipo;
   nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
   nuevos.total = nuevos.no_identificado + nuevos.reclasificado + identificadoTotalSinScope + nuevos.otros;
+  nuevos.importeTotal = {
+    no_identificado: nuevosImporte.no_identificado,
+    reclasificado:    nuevosImporte.reclasificado,
+    identificado:     identificadoImporteEquipo,
+    otros:            nuevosImporte.otros,
+    total: nuevosImporte.no_identificado + nuevosImporte.reclasificado + identificadoImporteSinScope + nuevosImporte.otros,
+  };
 
   const identificadosEnPeriodo = {
-    deRezagados: identificadosPorOrigen.rezagado ?? 0,
-    deNuevos:    identificadosPorOrigen.nuevo ?? 0,
+    deRezagados: identificadosPorOrigen.counts.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.counts.nuevo ?? 0,
   };
   identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+  identificadosEnPeriodo.importeTotal = {
+    deRezagados: identificadosPorOrigen.importes.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.importes.nuevo ?? 0,
+  };
+  identificadosEnPeriodo.importeTotal.total = identificadosEnPeriodo.importeTotal.deRezagados + identificadosEnPeriodo.importeTotal.deNuevos;
 
   const cxcRetrasadas = _calcularCxcRetrasadas(pendientesConErp, _anioMesDeFecha(fin));
 
@@ -1029,6 +1091,15 @@ async function getCorteTendencia({ periodo = 'semanal', banco = null, puntos = n
       nuevosReclasificado:  corte.nuevos.reclasificado,
       nuevosIdentificado:   corte.nuevos.identificado,
       cxcRetrasadasCount:  corte.cxcRetrasadas.count,
+      // Importes (2026-10-22, pedido explícito del usuario): mismo desglose que ya expone
+      // "Ver por estatus" en counts, junto a cada barra — no reemplaza el conteo.
+      rezagadosTotalImporte:        corte.rezagados.importeTotal.total,
+      rezagadosNoIdentificadoImporte: corte.rezagados.importeTotal.no_identificado,
+      rezagadosReclasificadoImporte:  corte.rezagados.importeTotal.reclasificado,
+      nuevosPendientesImporte:     corte.nuevos.importeTotal.no_identificado + corte.nuevos.importeTotal.reclasificado,
+      nuevosNoIdentificadoImporte: corte.nuevos.importeTotal.no_identificado,
+      nuevosReclasificadoImporte:  corte.nuevos.importeTotal.reclasificado,
+      nuevosIdentificadoImporte:   corte.nuevos.importeTotal.identificado,
       ...(corte.advertencia ? { advertencia: corte.advertencia } : {}),
     };
   }));

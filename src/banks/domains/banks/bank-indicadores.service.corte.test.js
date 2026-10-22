@@ -45,17 +45,26 @@ afterEach(() => {
   jest.useRealTimers();
 });
 
-// `nuevosIdentificadoCount` (2026-10-09): getCorteConciliacion ahora saca el 'identificado' de
-// `nuevos` vía un `countDocuments()` APARTE (acotable por rol), no del aggregate por status.
-// Sin pasarlo explícito, default = el mismo count que ya viene en `nuevos` (_id:'identificado')
-// — mantiene el comportamiento de siempre para los tests que no les importa el scope por rol.
-function mockAggregates({ rezagados = [], nuevos = [], identificados = [], nuevosIdentificadoCount = null, pendientesConErp = [] } = {}) {
+// `nuevosIdentificadoCount` (2026-10-09, actualizado 2026-10-22): getCorteConciliacion saca el
+// 'identificado' de `nuevos` vía un aggregate APARTE con `$group:null` (acotable por rol) — ya
+// no es un `countDocuments()` simple, porque ahora también suma `importeTotal` (ver
+// `nuevosIdentificadoImporte`). Sin pasarlo explícito, default = el mismo count que ya viene en
+// `nuevos` (_id:'identificado') — mantiene el comportamiento de siempre para los tests que no
+// les importa el scope por rol.
+function mockAggregates({
+  rezagados = [], nuevos = [], identificados = [],
+  nuevosIdentificadoCount = null, nuevosIdentificadoImporte = 0,
+  pendientesConErp = [],
+} = {}) {
+  const defaultCount = nuevos.find((r) => r._id === 'identificado')?.count ?? 0;
+  const count = nuevosIdentificadoCount ?? defaultCount;
   BankMovement.aggregate
     .mockResolvedValueOnce(rezagados)
     .mockResolvedValueOnce(nuevos)
+    // nuevosIdentificadoEquipo — $group:null, una sola fila (o ninguna si count es 0, igual
+    // que Mongo real: un $group sin documentos que matcheen no emite fila).
+    .mockResolvedValueOnce(count > 0 ? [{ _id: null, count, importeTotal: nuevosIdentificadoImporte }] : [])
     .mockResolvedValueOnce(identificados);
-  const defaultCount = nuevos.find((r) => r._id === 'identificado')?.count ?? 0;
-  BankMovement.countDocuments = jest.fn().mockResolvedValue(nuevosIdentificadoCount ?? defaultCount);
   // CxC retrasadas (2026-10-22): el modo tiempo real hace UN find().select().lean() más, para
   // los pendientes con erpLinks — encolado con mockReturnValueOnce (no mockReturnValue) para
   // no pisar los find() propios de buildReporteCorte()/mockFinds(), que se encolan DESPUÉS de
@@ -121,29 +130,37 @@ describe('getCorteConciliacion', () => {
   test('rezagados: solo no_identificado/reclasificado con fecha anterior al periodo, con total', async () => {
     mockAggregates({
       rezagados: [
-        { _id: 'no_identificado', count: 12 },
-        { _id: 'reclasificado',    count: 3  },
+        { _id: 'no_identificado', count: 12, importeTotal: 120000 },
+        { _id: 'reclasificado',    count: 3,  importeTotal: 9000   },
       ],
     });
     const { rezagados } = await getCorteConciliacion({ periodo: 'semanal' });
 
-    expect(rezagados).toEqual({ no_identificado: 12, reclasificado: 3, total: 15 });
+    expect(rezagados).toEqual({
+      no_identificado: 12, reclasificado: 3, total: 15,
+      importeTotal: { no_identificado: 120000, reclasificado: 9000, total: 129000 },
+    });
   });
 
   test('rezagados en cero (sin backlog) no explota — defaults a 0', async () => {
     mockAggregates({ rezagados: [] });
     const { rezagados } = await getCorteConciliacion({});
-    expect(rezagados).toEqual({ no_identificado: 0, reclasificado: 0, total: 0 });
+    expect(rezagados).toEqual({
+      no_identificado: 0, reclasificado: 0, total: 0,
+      importeTotal: { no_identificado: 0, reclasificado: 0, total: 0 },
+    });
   });
 
-  test('nuevos: desglosa por estatus del periodo, incluye pendientes/otros/total', async () => {
+  test('nuevos: desglosa por estatus del periodo, incluye pendientes/otros/total (conteo E importe)', async () => {
     mockAggregates({
       nuevos: [
-        { _id: 'no_identificado', count: 20 },
-        { _id: 'reclasificado',    count: 2  },
-        { _id: 'identificado',     count: 30 },
-        { _id: 'otros',            count: 1  },
+        { _id: 'no_identificado', count: 20, importeTotal: 200000 },
+        { _id: 'reclasificado',    count: 2,  importeTotal: 15000  },
+        { _id: 'identificado',     count: 30, importeTotal: 400000 },
+        { _id: 'otros',            count: 1,  importeTotal: 500    },
       ],
+      // nuevosIdentificadoEquipo (sin rolEquipo acá, así que es el mismo 400000 sin acotar).
+      nuevosIdentificadoImporte: 400000,
     });
     const { nuevos } = await getCorteConciliacion({});
 
@@ -154,19 +171,29 @@ describe('getCorteConciliacion', () => {
       otros:           1,
       pendientes:      22, // no_identificado + reclasificado
       total:           53,
+      importeTotal: {
+        no_identificado: 200000,
+        reclasificado:   15000,
+        identificado:    400000,
+        otros:           500,
+        total:           615500, // 200000+15000+400000+500 — suma real, no inventada
+      },
     });
   });
 
   test('identificadosEnPeriodo: separa origen rezagado vs nuevo, con total', async () => {
     mockAggregates({
       identificados: [
-        { _id: 'rezagado', count: 5 },
-        { _id: 'nuevo',    count: 30 },
+        { _id: 'rezagado', count: 5,  importeTotal: 50000 },
+        { _id: 'nuevo',    count: 30, importeTotal: 310000 },
       ],
     });
     const { identificadosEnPeriodo } = await getCorteConciliacion({});
 
-    expect(identificadosEnPeriodo).toEqual({ deRezagados: 5, deNuevos: 30, total: 35 });
+    expect(identificadosEnPeriodo).toEqual({
+      deRezagados: 5, deNuevos: 30, total: 35,
+      importeTotal: { deRezagados: 50000, deNuevos: 310000, total: 360000 },
+    });
   });
 
   // 2026-10-09 — pedido explícito del usuario: el corte mezclaba identificaciones de

@@ -47,6 +47,10 @@ describe('LoyaltyPointsLedger — modelo Sequelize (loyalty_points_ledger)', () 
     expect(LoyaltyPointsLedger.getAttributes().nivelAplicado.allowNull).toBe(true);
   });
 
+  test('montoVentaTotal: nullable, solo auditoría (nunca se muestra en la UI)', () => {
+    expect(LoyaltyPointsLedger.getAttributes().montoVentaTotal.allowNull).toBe(true);
+  });
+
   test('centroCostoId: FK a centros_costo nullable; reasonId: FK a loyalty_adjustment_reasons nullable', () => {
     const cc = LoyaltyPointsLedger.getAttributes().centroCostoId;
     expect(cc.allowNull).toBe(true);

@@ -19,7 +19,10 @@ const BankMovement = require('./BankMovement.model');
 const { User: PgUser } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
-const { getCorteConciliacion, buildReporteCorte, getPeriodoCortePorRol } = require('./bank-indicadores.service');
+const {
+  getCorteConciliacion, getCorteTendencia, buildReporteCorte, getPeriodoCortePorRol,
+  _folioFechaCodificada, _mesesDeAtraso, _calcularCxcRetrasadas,
+} = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
 // (21:00 UTC). Semana en curso → lunes 2026-10-05 00:00 México. Mes en curso → 2026-10-01
@@ -46,13 +49,20 @@ afterEach(() => {
 // `nuevos` vía un `countDocuments()` APARTE (acotable por rol), no del aggregate por status.
 // Sin pasarlo explícito, default = el mismo count que ya viene en `nuevos` (_id:'identificado')
 // — mantiene el comportamiento de siempre para los tests que no les importa el scope por rol.
-function mockAggregates({ rezagados = [], nuevos = [], identificados = [], nuevosIdentificadoCount = null } = {}) {
+function mockAggregates({ rezagados = [], nuevos = [], identificados = [], nuevosIdentificadoCount = null, pendientesConErp = [] } = {}) {
   BankMovement.aggregate
     .mockResolvedValueOnce(rezagados)
     .mockResolvedValueOnce(nuevos)
     .mockResolvedValueOnce(identificados);
   const defaultCount = nuevos.find((r) => r._id === 'identificado')?.count ?? 0;
   BankMovement.countDocuments = jest.fn().mockResolvedValue(nuevosIdentificadoCount ?? defaultCount);
+  // CxC retrasadas (2026-10-22): el modo tiempo real hace UN find().select().lean() más, para
+  // los pendientes con erpLinks — encolado con mockReturnValueOnce (no mockReturnValue) para
+  // no pisar los find() propios de buildReporteCorte()/mockFinds(), que se encolan DESPUÉS de
+  // este en los tests que combinan ambos helpers.
+  const leanErp   = jest.fn().mockResolvedValue(pendientesConErp);
+  const selectErp = jest.fn().mockReturnValue({ lean: leanErp });
+  BankMovement.find.mockReturnValueOnce({ select: selectErp });
 }
 
 // buildReporteCorte() llama primero getCorteConciliacion() (3 aggregate) y DESPUÉS
@@ -317,7 +327,10 @@ describe('getCorteConciliacion — corte histórico (fechaInicio/fechaFin)', () 
 
     expect(result.historico).toBe(false);
     expect(result.fin).toBeUndefined();
-    expect(BankMovement.find).not.toHaveBeenCalled();
+    // Desde 2026-10-22 el modo tiempo real SÍ llama a find() una vez — para los pendientes
+    // con erpLinks que alimentan cxcRetrasadas (ver mockAggregates) — a diferencia de antes,
+    // cuando este find() no existía todavía.
+    expect(BankMovement.find).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -338,7 +351,7 @@ describe('buildReporteCorte', () => {
     resumen.eachRow((row) => filas.push([row.getCell(1).value, row.getCell(2).value]));
 
     expect(filas).toEqual(expect.arrayContaining([
-      ['Rezagados — total', 2],
+      ['No identificados iniciales — total', 2],
       ['Nuevos del periodo — total', 7],
       ['Identificados en el periodo — total', 7],
     ]));
@@ -443,5 +456,240 @@ describe('getPeriodoCortePorRol', () => {
 
     expect(result).toEqual({ periodo: 'semanal', puedeAlternar: true });
     expect(globalConfigService.getValue).not.toHaveBeenCalled();
+  });
+});
+
+// "CxC retrasadas" (2026-10-22) — folio AAMMNNNNNN, CxC vinculada a un depósito pendiente cuyo
+// folio es de un mes calendario anterior al de referencia.
+describe('_folioFechaCodificada', () => {
+  test('folio válido: decodifica año (20 + AA) y mes', () => {
+    expect(_folioFechaCodificada('260901542')).toEqual({ anio: 2026, mes: 9 });
+  });
+
+  test('mes inválido (00 o 13+): null', () => {
+    expect(_folioFechaCodificada('260013000')).toBeNull();
+    expect(_folioFechaCodificada('261300000')).toBeNull();
+  });
+
+  test('formato no numérico o muy corto: null (ej. anticipos OPA)', () => {
+    expect(_folioFechaCodificada('OPA-123')).toBeNull();
+    expect(_folioFechaCodificada('1234')).toBeNull();
+    expect(_folioFechaCodificada(null)).toBeNull();
+  });
+});
+
+describe('_mesesDeAtraso', () => {
+  test('misma anio/mes: 0', () => {
+    expect(_mesesDeAtraso({ anio: 2026, mes: 10 }, { anio: 2026, mes: 10 })).toBe(0);
+  });
+
+  test('folio de un mes antes: 1', () => {
+    expect(_mesesDeAtraso({ anio: 2026, mes: 9 }, { anio: 2026, mes: 10 })).toBe(1);
+  });
+
+  test('cruza el límite de año: cuenta meses calendario, no solo la diferencia de "mes"', () => {
+    expect(_mesesDeAtraso({ anio: 2025, mes: 12 }, { anio: 2026, mes: 2 })).toBe(2);
+  });
+});
+
+describe('_calcularCxcRetrasadas', () => {
+  const REFERENCIA = { anio: 2026, mes: 10 };
+
+  test('folio de mes anterior y depósito pendiente: cuenta como retrasada', () => {
+    const { count, detalle } = _calcularCxcRetrasadas([
+      { _id: 'm1', banco: 'BBVA', fecha: new Date('2026-09-15'), erpLinks: [{ serie: 'A0', folioExterno: '260901542' }] },
+    ], REFERENCIA);
+
+    expect(count).toBe(1);
+    expect(detalle[0]).toMatchObject({ movimientoId: 'm1', serie: 'A0', folioExterno: '260901542', mesFolio: '2026-09', mesesAtraso: 1 });
+  });
+
+  test('folio del mismo mes de referencia: NO cuenta (mesesAtraso <= 0 se descarta)', () => {
+    const { count } = _calcularCxcRetrasadas([
+      { _id: 'm1', erpLinks: [{ serie: 'A0', folioExterno: '261000266' }] },
+    ], REFERENCIA);
+    expect(count).toBe(0);
+  });
+
+  test('folio sin formato reconocible: se ignora, no explota', () => {
+    const { count } = _calcularCxcRetrasadas([
+      { _id: 'm1', erpLinks: [{ serie: 'OPA', folioExterno: 'OPA-1' }] },
+    ], REFERENCIA);
+    expect(count).toBe(0);
+  });
+
+  test('incluye folio Numo, importe y fecha del depósito (no datos de la ficha)', () => {
+    const { detalle } = _calcularCxcRetrasadas([
+      {
+        _id: 'm1', fecha: new Date('2026-03-04'), folio: '020231', deposito: 170.97,
+        erpLinks: [{ serie: 'E0', folioExterno: '260203714' }],
+      },
+    ], REFERENCIA);
+    expect(detalle[0]).toMatchObject({ folioNumo: '020231', importe: 170.97, fechaDeposito: new Date('2026-03-04') });
+    expect(detalle[0].ficha).toBeUndefined();
+  });
+
+  test('sin folio/depósito en el movimiento: quedan null, no explota', () => {
+    const { detalle } = _calcularCxcRetrasadas([
+      { _id: 'm1', erpLinks: [{ serie: 'A0', folioExterno: '260901542' }] },
+    ], REFERENCIA);
+    expect(detalle[0]).toMatchObject({ folioNumo: null, importe: null, fechaDeposito: null });
+  });
+
+  test('count siempre refleja el total real aunque el detalle se acote a 100', () => {
+    const movimientos = Array.from({ length: 120 }, (_, i) => ({
+      _id: `m${i}`, erpLinks: [{ serie: 'A0', folioExterno: '260101000' }], // 2026-01, 9 meses de atraso
+    }));
+    const { count, detalle } = _calcularCxcRetrasadas(movimientos, REFERENCIA);
+    expect(count).toBe(120);
+    expect(detalle).toHaveLength(100);
+  });
+});
+
+describe('getCorteConciliacion — cxcRetrasadas', () => {
+  test('modo tiempo real: referencia es el mes/año de HOY (mockeado a 2026-10-07)', async () => {
+    mockAggregates({
+      pendientesConErp: [
+        { _id: 'm1', banco: 'BBVA', fecha: new Date('2026-09-15'), erpLinks: [{ serie: 'A0', folioExterno: '260901542' }] },
+        { _id: 'm2', banco: 'BBVA', fecha: new Date('2026-10-05'), erpLinks: [{ serie: 'A0', folioExterno: '261000266' }] },
+      ],
+    });
+
+    const { cxcRetrasadas } = await getCorteConciliacion({});
+
+    expect(cxcRetrasadas.count).toBe(1);
+    expect(cxcRetrasadas.detalle[0].movimientoId).toBe('m1');
+  });
+
+  test('modo histórico: referencia es el mes/año del cierre (fechaFin), no el de hoy', async () => {
+    mockFindsHistorico([], [
+      // Pendiente a cierre (2026-09-20): folio de agosto 2026 → 1 mes de atraso respecto al
+      // cierre, aunque respecto a HOY (mockeado a octubre) sería 2.
+      {
+        _id: 'm1', status: 'no_identificado', primeraIdentificacionAt: null, ultimoCambioStatusAt: null,
+        historialVinculacion: [], erpLinks: [{ serie: 'A0', folioExterno: '260801000' }],
+      },
+    ]);
+    BankMovement.aggregate.mockResolvedValueOnce([]); // identificadosPorOrigen
+
+    const { cxcRetrasadas } = await getCorteConciliacion({ fechaInicio: '2026-09-14', fechaFin: '2026-09-20' });
+
+    expect(cxcRetrasadas.count).toBe(1);
+    expect(cxcRetrasadas.detalle[0].mesesAtraso).toBe(1); // sept(09) - ago(08), no oct(10) - ago(08)
+  });
+});
+
+describe('getCorteTendencia', () => {
+  test('puntos:1 — un solo punto, SIEMPRE el periodo en curso (esActual:true)', async () => {
+    mockAggregates({
+      rezagados: [{ _id: 'no_identificado', count: 5 }],
+      nuevos:    [{ _id: 'no_identificado', count: 3 }],
+      pendientesConErp: [
+        { _id: 'm1', erpLinks: [{ serie: 'A0', folioExterno: '260901542' }] },
+      ],
+    });
+
+    const result = await getCorteTendencia({ periodo: 'semanal', puntos: 1 });
+
+    expect(result.periodo).toBe('semanal');
+    expect(result.puntos).toHaveLength(1);
+    expect(result.puntos[0]).toMatchObject({
+      esActual: true,
+      rezagadosTotal: 5,
+      rezagadosNoIdentificado: 5,
+      rezagadosReclasificado: 0,
+      nuevosPendientes: 3,
+      nuevosNoIdentificado: 3,
+      nuevosReclasificado: 0,
+      nuevosIdentificado: 0,
+      cxcRetrasadasCount: 1,
+    });
+  });
+
+  // Desglose por status (2026-10-22, switch "Ver por estatus" del gráfico de tendencia):
+  // además de los totales, cada punto expone no_identificado/reclasificado/identificado por
+  // separado — y la suma debe cuadrar EXACTO con los totales de siempre (rezagadosTotal,
+  // nuevosPendientes), nunca inflarse ni divergir.
+  test('desglose por status — suma exacta de rezagados y de nuevos.pendientes', async () => {
+    mockAggregates({
+      rezagados: [
+        { _id: 'no_identificado', count: 7 },
+        { _id: 'reclasificado',   count: 2 },
+      ],
+      nuevos: [
+        { _id: 'no_identificado', count: 4 },
+        { _id: 'reclasificado',   count: 1 },
+        { _id: 'identificado',    count: 9 },
+      ],
+    });
+
+    const result = await getCorteTendencia({ periodo: 'semanal', puntos: 1 });
+    const punto = result.puntos[0];
+
+    expect(punto.rezagadosNoIdentificado).toBe(7);
+    expect(punto.rezagadosReclasificado).toBe(2);
+    expect(punto.rezagadosTotal).toBe(9);
+    expect(punto.rezagadosNoIdentificado + punto.rezagadosReclasificado).toBe(punto.rezagadosTotal);
+
+    expect(punto.nuevosNoIdentificado).toBe(4);
+    expect(punto.nuevosReclasificado).toBe(1);
+    expect(punto.nuevosPendientes).toBe(5);
+    expect(punto.nuevosNoIdentificado + punto.nuevosReclasificado).toBe(punto.nuevosPendientes);
+
+    // `nuevosIdentificado` es informativo aparte — NO debe sumarse a nuevosPendientes.
+    expect(punto.nuevosIdentificado).toBe(9);
+    expect(punto.nuevosNoIdentificado + punto.nuevosReclasificado + punto.nuevosIdentificado).not.toBe(punto.nuevosPendientes);
+  });
+
+  test('periodo inválido cae a "semanal" (mismo criterio que getCorteConciliacion)', async () => {
+    mockAggregates({});
+    const result = await getCorteTendencia({ periodo: 'quincenal', puntos: 1 });
+    expect(result.periodo).toBe('semanal');
+  });
+});
+
+// Reconciliación panel/Excel (2026-10-22, pedido explícito del usuario: "revisa que las sumas
+// cuadren tanto en la vista como en el reporte que se descarga en excel") — buildReporteCorte()
+// reusa getCorteConciliacion() para su hoja "Resumen" (ver JSDoc de buildReporteCorte), así que
+// panel y Excel comparten la MISMA fuente de datos; este test lo deja explícito en vez de
+// asumirlo, llamando a ambas funciones sobre el mismo mock y comparando los números.
+describe('getCorteConciliacion / buildReporteCorte — misma fuente, mismos números', () => {
+  test('el resumen del Excel coincide exacto con el corte que ve el panel', async () => {
+    mockAggregates({
+      rezagados: [
+        { _id: 'no_identificado', count: 7 },
+        { _id: 'reclasificado',   count: 2 },
+      ],
+      nuevos: [
+        { _id: 'no_identificado', count: 4 },
+        { _id: 'reclasificado',   count: 1 },
+        { _id: 'identificado',    count: 9 },
+      ],
+      identificados: [{ _id: 'rezagado', count: 2 }, { _id: 'nuevo', count: 3 }],
+    });
+    const corte = await getCorteConciliacion({ periodo: 'semanal' });
+
+    mockAggregates({
+      rezagados: [
+        { _id: 'no_identificado', count: 7 },
+        { _id: 'reclasificado',   count: 2 },
+      ],
+      nuevos: [
+        { _id: 'no_identificado', count: 4 },
+        { _id: 'reclasificado',   count: 1 },
+        { _id: 'identificado',    count: 9 },
+      ],
+      identificados: [{ _id: 'rezagado', count: 2 }, { _id: 'nuevo', count: 3 }],
+    });
+    mockFinds([], []);
+    const buffer = await buildReporteCorte({ periodo: 'semanal' });
+    const wb = await leerWorkbook(buffer);
+    const resumen = wb.getWorksheet('Resumen');
+    const valorDe = (etiqueta) => resumen.getRows(1, resumen.rowCount)
+      .find(r => r.getCell('A').value === etiqueta)?.getCell('B').value;
+
+    expect(valorDe('No identificados iniciales — total')).toBe(corte.rezagados.total);
+    expect(valorDe('Nuevos del periodo — total')).toBe(corte.nuevos.total);
+    expect(valorDe('Identificados en el periodo — total')).toBe(corte.identificadosEnPeriodo.total);
   });
 });

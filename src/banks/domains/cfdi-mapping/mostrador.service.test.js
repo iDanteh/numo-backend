@@ -8,7 +8,7 @@ jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacen: jest
 
 const BankMovement = require('../banks/BankMovement.model');
 const erp = require('../erp/erp-sync.service');
-const { detectarMovimientosMostrador } = require('./mostrador.service');
+const { detectarMovimientosMostrador, detectarDepositosPendientesFactura } = require('./mostrador.service');
 
 const UUID = '1C02D46C-FF4C-411E-BF11-7960AB39BA9C';
 const cfdis = [{ uuid: UUID, serie: 'A0', folio: '261009872', fecha: '2026-10-20T17:22:35Z', total: 229702.95, receptor: { rfc: 'XAXX010101000' } }];
@@ -68,4 +68,66 @@ test('PPD del link cuando Kore no trae tipoPago; sin estatus "POR FACTURAR" no c
   expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBe(true);
   erp.obtenerCuentaTicket.mockResolvedValue(null);
   expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBe(false);
+});
+
+// "PENDIENTE GENERAR FACTURA" — datos reales de la lista de CEDIS (2026-10-22).
+describe('PENDIENTE GENERAR FACTURA', () => {
+  const rem = (folio, extra = {}) => ({ serie: 'A0', folioExterno: folio, folioFiscal: null, tipoPago: 'PPD', saldoPagado: 1, ...extra });
+  const kore = { nombre: 'MISAEL ABDIEL JIMENEZ SORIA', tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', saldoActual: 0, factura: null };
+  const cuentasKore = {
+    260804886: kore,                                                  // 053966 → sale
+    260902675: { ...kore, nombre: 'ROMAN SOLANO PAZ' },               // 053487 → sale
+    261002980: { ...kore, saldoActual: 47.79 },                       // 053960 → saldo pendiente, no sale
+    261001844: { ...kore, tipoPago: 'PUE' },                          // 052144 → PUE, no sale
+    260901859: kore,                                                  // 054089 → ya facturada (desgloses), no sale
+    260900887: { ...kore, nombreTipoMovimiento: 'FACTURADO' },        // no "POR FACTURAR", no sale
+  };
+  beforeEach(() => {
+    BankMovement.find.mockReturnValue({ lean: async () => [
+      { folio: '053966', banco: 'BBVA', fecha: '2026-10-21T06:00:00Z', concepto: 'DEPOSITO EN EFECTIVO', deposito: 146077.63, erpLinks: [rem('260804886')] },
+      { folio: '053487', banco: 'Banamex', fecha: '2026-10-19T06:00:00Z', concepto: 'Depósito de efectivo', deposito: 9968, erpLinks: [rem('260902675'), rem('999', { serie: 'B0' })] },
+      { folio: '053960', banco: 'BBVA', fecha: '2026-10-21T06:00:00Z', concepto: 'PAGO', deposito: 1147.04, erpLinks: [rem('261002980')] },
+      { folio: '052144', banco: 'BBVA', fecha: '2026-10-12T06:00:00Z', concepto: 'X', deposito: 2046.88, erpLinks: [rem('261001844')] },
+      { folio: '054089', banco: 'Santander', fecha: '2026-10-21T06:00:00Z', concepto: 'X', deposito: 7067.4, erpLinks: [rem('260901859')] },
+      { folio: '053673', banco: 'BBVA', fecha: '2026-10-19T06:00:00Z', concepto: 'X', deposito: 13590, erpLinks: [rem('260804886'), rem('260900887')] },
+    ] });
+    erp.obtenerDesglosesCobroAlmacen.mockImplementation(async ({ folios }) => folios.map(f => ({
+      serieVenta: 'A0', folioVenta: f, fechaCreacion: '2026-09-01', ...(f === '260901859' ? { serieFactura: 'A0', folioFactura: '261010582' } : {}),
+    })));
+    erp.obtenerCuentaTicket.mockImplementation(async ({ folio }) => cuentasKore[folio] ?? null);
+  });
+
+  test('día de un solo día: fechaFin vacío usa fechaInicio', async () => {
+    await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-21' });
+    const { fecha } = BankMovement.find.mock.calls[0][0];
+    expect([fecha.$gte.toISOString(), fecha.$lte.toISOString()]).toEqual(['2026-10-21T00:00:00.000Z', '2026-10-21T23:59:59.999Z']);
+  });
+
+  test('solo depósitos cuyas remisiones son PPD, saldo 0, "POR FACTURAR" y sin factura', async () => {
+    const { depositos, remisionesSinRespuesta } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });
+    expect(remisionesSinRespuesta).toBe(0);
+    expect(depositos).toEqual([
+      { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487' },
+      { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, banco: 'BBVA', remisiones: ['A0-260804886'], cliente: 'MISAEL ABDIEL JIMENEZ SORIA', idNumo: '053966' },
+    ]);
+    const filtro = BankMovement.find.mock.calls[0][0];
+    expect(filtro.fecha.$gte.toISOString()).toBe('2026-10-19T00:00:00.000Z');
+    expect(filtro.fecha.$lte.toISOString()).toBe('2026-10-21T23:59:59.999Z');
+    expect(filtro.erpLinks.$elemMatch.serie).toEqual({ $in: ['A0'] });
+    // La remisión ya facturada no se consulta en /cuentas-pendientes.
+    expect(erp.obtenerCuentaTicket.mock.calls.map(c => c[0].folio)).not.toContain('260901859');
+  });
+
+  test('si Kore no responde una remisión, su depósito no sale y se cuenta', async () => {
+    erp.obtenerCuentaTicket.mockImplementation(async ({ folio }) => (folio === '260804886' ? null : cuentasKore[folio] ?? null));
+    const { depositos, remisionesSinRespuesta } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });
+    expect(depositos.map(d => d.idNumo)).toEqual(['053487']);
+    expect(remisionesSinRespuesta).toBe(1);
+  });
+
+  test('sin series o sin fecha no consulta nada', async () => {
+    expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: [], fechaInicio: '2026-10-21' })).toEqual({ depositos: [], remisionesSinRespuesta: 0 });
+    expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'] })).toEqual({ depositos: [], remisionesSinRespuesta: 0 });
+    expect(BankMovement.find).not.toHaveBeenCalled();
+  });
 });

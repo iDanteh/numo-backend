@@ -5106,7 +5106,10 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     .map(f => ({ ...f, depositos: (f.depositos ?? []).filter(d => d.ppdPorFacturar) }))
     .filter(f => f.depositos.length);
   const sinClasificar = mostrador.filter(f => typeof f.esGlobal !== 'boolean');
-  if (incluirMostrador && (facturasGlobales.length || ppdFacturadoCliente.length || sinClasificar.length)) {
+  // Depósitos de remisiones PPD pagadas, "POR FACTURAR" y sin factura
+  // (2026-10-22) — ver detectarDepositosPendientesFactura en mostrador.service.js.
+  const depositosPendientes = poliza.depositosPendientesFactura ?? [];
+  if (incluirMostrador && (facturasGlobales.length || ppdFacturadoCliente.length || sinClasificar.length || depositosPendientes.length)) {
     const wsMos = workbook.addWorksheet('MOSTRADOR');
     wsMos.columns = [
       { key: 'fecha',       width: 11 },
@@ -5204,6 +5207,22 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     if (sinClasificar.length) {
       seccion('SIN CLASIFICAR (regenerar la póliza)', 9);
       bloquesPorFactura(sinClasificar);
+    }
+    if (depositosPendientes.length) {
+      // Mismas columnas que la lista manual del usuario (CEDIS, 2026-10-22).
+      seccion('PENDIENTE GENERAR FACTURA', 7);
+      encabezado(wsMos.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO']), 'FF8E7CC3');
+      for (const d of depositosPendientes) {
+        const row = wsMos.addRow([d.fecha ? new Date(d.fecha) : null, d.descripcion, d.importe, d.banco,
+          (d.remisiones ?? []).join('\n'), d.cliente || 'CLIENTE NO IDENTIFICADO', d.idNumo]);
+        row.alignment = { vertical: 'middle', wrapText: true };
+        if (row.getCell(1).value) row.getCell(1).numFmt = 'd/m/yy';
+        row.getCell(3).numFmt = '$#,##0.00';
+      }
+      const total = wsMos.addRow([null, 'TOTAL', _redondear2(depositosPendientes.reduce((s, d) => s + (Number(d.importe) || 0), 0))]);
+      total.font = { bold: true };
+      total.getCell(2).alignment = { horizontal: 'right' };
+      total.getCell(3).numFmt = '$#,##0.00';
     }
   }
 

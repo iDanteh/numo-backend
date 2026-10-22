@@ -54,6 +54,7 @@ User.hasMany(CierreMesHistorico,   { foreignKey: 'cerradoPorId', as: 'cierresMes
 CierreMesHistorico.belongsTo(User, { foreignKey: 'revertidoPorId', as: 'revertidoPor' });
 User.hasMany(CierreMesHistorico,   { foreignKey: 'revertidoPorId', as: 'cierresMesRevertidos' });
 ReportePorFacturar.belongsTo(User, { foreignKey: 'creadoPorId', as: 'creadoPor' });
+ReportePorFacturar.belongsTo(User, { foreignKey: 'eliminadoPorId', as: 'eliminadoPor' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -157,6 +158,12 @@ async function syncModels() {
 
   // Historial del reporte "Por facturar" (Reportes, 2026-10-22) — tabla nueva, depende de users.
   await ReportePorFacturar.sync({ force: false });
+  // Borrado lógico (2026-10-22) — la tabla ya puede existir: sync no la altera.
+  await ReportePorFacturar.sequelize.query(`
+    ALTER TABLE reportes_por_facturar
+      ADD COLUMN IF NOT EXISTS eliminado_por_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS eliminado_en     TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN eliminado (reportes_por_facturar):', e.message));
 
   // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
   // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla

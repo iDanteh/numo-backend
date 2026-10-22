@@ -150,7 +150,7 @@ async function listar({ rfc, page = 1, limit = 5 } = {}) {
   const lim  = Math.min(Math.max(parseInt(limit, 10) || 5, 1), 100);
   const pag  = Math.max(parseInt(page, 10) || 1, 1);
   const { rows, count } = await ReportePorFacturar.findAndCountAll({
-    where:      rfc ? { rfc } : {},
+    where:      { ...(rfc ? { rfc } : {}), eliminadoEn: null },
     attributes: { exclude: ['datos'] },
     include:    _incluirCreador,
     order:      [['createdAt', 'DESC'], ['id', 'DESC']],
@@ -162,9 +162,17 @@ async function listar({ rfc, page = 1, limit = 5 } = {}) {
 
 async function obtener(id) {
   const r = await ReportePorFacturar.findByPk(id, { include: _incluirCreador });
-  if (!r) throw new NotFoundError('Reporte');
+  if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
   const json = r.toJSON();
   return { ...json, tablas: tablasMostrador(json.datos) };
+}
+
+/** Borrado lógico: deja de verse en el historial, guarda quién y cuándo. */
+async function eliminar(id, user) {
+  const r = await ReportePorFacturar.findByPk(id);
+  if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
+  await r.update({ eliminadoEn: new Date(), eliminadoPorId: user?.dbId ? parseInt(user.dbId, 10) : null });
+  return { ok: true, id: r.id };
 }
 
 async function excel(id) {
@@ -178,4 +186,4 @@ async function excel(id) {
   return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { generar, listar, obtener, excel, _movimientosMostradorSinPoliza, _facturasDelRango };
+module.exports = { generar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango };

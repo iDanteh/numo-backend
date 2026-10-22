@@ -145,14 +145,19 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
 
 const _incluirCreador = [{ model: User, as: 'creadoPor', attributes: ['nombre', 'email'] }];
 
-async function listar({ rfc } = {}) {
-  return ReportePorFacturar.findAll({
+// Historial paginado, más recientes primero (5 por página en la pantalla).
+async function listar({ rfc, page = 1, limit = 5 } = {}) {
+  const lim  = Math.min(Math.max(parseInt(limit, 10) || 5, 1), 100);
+  const pag  = Math.max(parseInt(page, 10) || 1, 1);
+  const { rows, count } = await ReportePorFacturar.findAndCountAll({
     where:      rfc ? { rfc } : {},
     attributes: { exclude: ['datos'] },
     include:    _incluirCreador,
-    order:      [['createdAt', 'DESC']],
-    limit:      200,
+    order:      [['createdAt', 'DESC'], ['id', 'DESC']],
+    limit:      lim,
+    offset:     (pag - 1) * lim,
   });
+  return { data: rows, total: count, page: pag, limit: lim };
 }
 
 async function obtener(id) {

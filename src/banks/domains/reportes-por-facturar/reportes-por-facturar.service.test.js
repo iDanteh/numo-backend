@@ -8,7 +8,7 @@ jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../cfdi-mapping/cfdi-poliza-generator.service', () => ({ _uuidsPorFechaEfectiva: jest.fn() }));
-jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn() }));
+jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn() }));
 
 const { ReportePorFacturar } = require('../../../shared/models/postgres');
 const CFDI = require('../../../visor/models/CFDI');
@@ -38,6 +38,7 @@ beforeEach(() => {
   ]));
   mostrador.detectarMovimientosMostrador.mockResolvedValue([{ uuid: GLOBAL, esGlobal: true, depositos: [{ importe: 5000, ppdPorFacturar: true }, { importe: 900, ppdPorFacturar: false }] }]);
   mostrador.detectarDepositosPendientesFactura.mockResolvedValue({ depositos: [{ importe: 146077.63, idNumo: '053966' }], remisionesSinRespuesta: 0 });
+  mostrador.detectarDepositosEfectivoSinAsociar.mockResolvedValue([{ importe: 1618.95, idNumo: '051499' }]);
   ReportePorFacturar.create.mockResolvedValue({ id: 7 });
   ReportePorFacturar.findByPk.mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: ReportePorFacturar.create.mock.calls[0][0].datos }) }));
 });
@@ -56,7 +57,10 @@ test('solo facturas de la sucursal con algún depósito de días anteriores; gua
     facturasGlobales:    { facturas: 1, depositos: 1, importe: 5000 },
     ppdFacturadoCliente: { facturas: 0, depositos: 0, importe: 0 },
     depositosPendientes: { depositos: 1, importe: 146077.63 },
+    depositosEfectivo:   { depositos: 1, importe: 1618.95 },
   });
+  expect(mostrador.detectarDepositosEfectivoSinAsociar).toHaveBeenCalledWith({ fechaInicio: '2026-10-20', fechaFin: '2026-10-20' });
+  expect(r.tablas.depositosEfectivo).toEqual([{ importe: 1618.95, idNumo: '051499' }]);
   expect(r.tablas.facturasGlobales).toHaveLength(1);
   expect(r.tablas.depositosPendientes).toHaveLength(1);
 });

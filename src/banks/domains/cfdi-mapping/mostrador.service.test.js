@@ -8,7 +8,7 @@ jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacen: jest
 
 const BankMovement = require('../banks/BankMovement.model');
 const erp = require('../erp/erp-sync.service');
-const { detectarMovimientosMostrador, detectarDepositosPendientesFactura } = require('./mostrador.service');
+const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar } = require('./mostrador.service');
 
 const UUID = '1C02D46C-FF4C-411E-BF11-7960AB39BA9C';
 const cfdis = [{ uuid: UUID, serie: 'A0', folio: '261009872', fecha: '2026-10-20T17:22:35Z', total: 229702.95, receptor: { rfc: 'XAXX010101000' } }];
@@ -130,4 +130,17 @@ describe('PENDIENTE GENERAR FACTURA', () => {
     expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'] })).toEqual({ depositos: [], remisionesSinRespuesta: 0 });
     expect(BankMovement.find).not.toHaveBeenCalled();
   });
+});
+
+test('DEPÓSITOS EN EFECTIVO: sin ligas, concepto con efectivo, rango del periodo', async () => {
+  const select = jest.fn().mockReturnValue({ lean: async () => [
+    { folio: '051499', banco: 'BBVA', fecha: new Date('2026-10-08T00:00:00Z'), concepto: 'DEPOSITO EN EFECTIVO', deposito: 1618.95, ficha: null },
+  ] });
+  BankMovement.find.mockReturnValue({ select });
+  const r = await detectarDepositosEfectivoSinAsociar({ fechaInicio: '2026-10-08' });
+  expect(r).toEqual([{ fecha: new Date('2026-10-08T00:00:00Z'), descripcion: 'DEPOSITO EN EFECTIVO', importe: 1618.95, banco: 'BBVA', ficha: '', idNumo: '051499' }]);
+  const filtro = BankMovement.find.mock.calls[0][0];
+  expect(filtro.concepto).toEqual({ $regex: 'efectivo', $options: 'i' });
+  expect(filtro.$or).toEqual([{ erpLinks: { $exists: false } }, { erpLinks: { $size: 0 } }]);
+  expect([filtro.fecha.$gte.toISOString(), filtro.fecha.$lte.toISOString()]).toEqual(['2026-10-08T00:00:00.000Z', '2026-10-08T23:59:59.999Z']);
 });

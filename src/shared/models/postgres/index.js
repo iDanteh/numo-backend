@@ -580,6 +580,15 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS promocion_porcentaje  DECIMAL(5,2)
   `).catch(e => console.warn('[syncModels] ADD COLUMN promocion_nombre/promocion_porcentaje (loyalty_points_ledger):', e.message));
 
+  // Total de la venta en Kore, con impuesto (2026-10-21) — columna nueva sobre
+  // loyalty_points_ledger, que YA existía con datos reales: idempotente, solo
+  // auditoría (nunca se muestra en UI, el cálculo de puntos sigue usando
+  // monto_venta = subtotal).
+  await LoyaltyPointsLedger.sequelize.query(`
+    ALTER TABLE loyalty_points_ledger
+      ADD COLUMN IF NOT EXISTS monto_venta_total DECIMAL(14,2)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN monto_venta_total (loyalty_points_ledger):', e.message));
+
   // Columnas nuevas sobre loyalty_cards, que YA existía con datos reales
   // (2026-10-20, recuperación de NIP en 2 pasos) — mismo motivo que el bloque
   // de loyalty_pending_enrollments de abajo: .sync({force:false}) nunca altera

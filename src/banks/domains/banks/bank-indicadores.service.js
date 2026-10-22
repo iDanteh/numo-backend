@@ -613,6 +613,97 @@ async function listUsuariosConIdentificaciones() {
 const SIN_COINCIDENCIA_ROL_CORTE = '__sin-coincidencia-rol-corte__';
 
 /**
+ * "CxC retrasadas" del corte (2026-10-22, pedido explícito del usuario): entre las CxC
+ * vinculadas a depósitos que SIGUEN sin identificarse (no_identificado/reclasificado, sin
+ * importar si el depósito es rezago viejo o del lote nuevo del periodo), cuáles llevan un
+ * folio de un mes calendario ANTERIOR al de referencia (hoy, en tiempo real; el cierre del
+ * corte, en modo histórico) — "¿hay CxC que ya deberían estar resueltas hace 1+ mes y
+ * siguen sin identificar?".
+ *
+ * Folio real de venta, formato AAMMNNNNNN (ej. "260901542" = año 2026, mes 09, consecutivo
+ * 01542) — mismo formato que `_folioFechaCodificada` en erp-modal.component.ts (frontend,
+ * buscador de CxC), portado acá. A diferencia del frontend, no valida contra una lista de
+ * años disponibles (`erpAnios`, un catálogo de UI) — acá alcanza con el formato numérico y un
+ * mes 1-12 válido.
+ */
+function _folioFechaCodificada(folioExterno) {
+  const f = String(folioExterno ?? '').trim();
+  if (!/^\d{8,}$/.test(f)) return null;
+  const anio = 2000 + parseInt(f.slice(0, 2), 10);
+  const mes  = parseInt(f.slice(2, 4), 10);
+  if (mes < 1 || mes > 12) return null;
+  return { anio, mes };
+}
+
+// Diferencia en MESES CALENDARIO (no días) entre 2 pares {anio, mes} — positivo cuando
+// `referencia` es posterior a `folioFecha` (el caso "CxC vieja todavía sin resolver").
+function _mesesDeAtraso(folioFecha, referencia) {
+  return (referencia.anio - folioFecha.anio) * 12 + (referencia.mes - folioFecha.mes);
+}
+
+// {anio, mes} de un instante real, en calendario de MÉXICO (reusa _comoRelojMexico — mismo
+// criterio que el resto de este archivo, nunca el TZ del proceso).
+function _anioMesDeFecha(fechaReal) {
+  const mx = _comoRelojMexico(fechaReal);
+  return { anio: mx.getUTCFullYear(), mes: mx.getUTCMonth() + 1 };
+}
+
+// Equivalente a _hoyMexicoStr() pero devuelve el {anio,mes} de HOY en vez de un string — usado
+// como referencia de "CxC retrasada" en el corte en tiempo real (ver getCorteConciliacion).
+function _anioMesActualMexico() {
+  return _anioMesDeFecha(new Date());
+}
+
+// String YYYY-MM-DD en calendario de MÉXICO para un instante real cualquiera — generalización
+// de _hoyMexicoStr() (que solo cubre "ahora"), usado por getCorteTendencia() para traducir los
+// límites de cada periodo pasado al mismo formato que espera getCorteConciliacion()
+// (fechaInicio/fechaFin).
+function _fechaMxComoString(fechaReal) {
+  const mx = _comoRelojMexico(fechaReal);
+  const yyyy = mx.getUTCFullYear();
+  const mm   = String(mx.getUTCMonth() + 1).padStart(2, '0');
+  const dd   = String(mx.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+// Acotado a los 100 casos más atrasados (orden desc) — `count` siempre es el total real, nunca
+// se miente; solo se trunca el DETALLE para no mandar una respuesta JSON gigante si el backlog
+// es grande (mismo criterio preventivo de siempre: nunca ocultar el número, sí acotar el
+// listado). Folios sin formato reconocible (_folioFechaCodificada → null: anticipos OPA,
+// formatos viejos, etc.) se ignoran — no se adivina su antigüedad con datos parciales, mismo
+// criterio que _calificaPorSaldoRestanteBajo más arriba.
+const CXC_RETRASADAS_DETALLE_LIMITE = 100;
+
+function _calcularCxcRetrasadas(movimientos, referencia) {
+  const detalle = [];
+  for (const mov of movimientos) {
+    for (const link of mov.erpLinks || []) {
+      const folioFecha = _folioFechaCodificada(link.folioExterno);
+      if (!folioFecha) continue;
+      const mesesAtraso = _mesesDeAtraso(folioFecha, referencia);
+      if (mesesAtraso <= 0) continue;
+      detalle.push({
+        movimientoId: String(mov._id),
+        banco: mov.banco ?? null,
+        serie: link.serie ?? null,
+        folioExterno: link.folioExterno,
+        mesFolio: `${folioFecha.anio}-${String(folioFecha.mes).padStart(2, '0')}`,
+        mesesAtraso,
+        // Datos del DEPÓSITO donde esta CxC fue aplicada (2026-10-22, corrección pedida por
+        // el usuario: la ficha depende del depósito, no la CxC de la ficha — mostrar acá la
+        // ficha era la relación al revés). `folio` es el folio auto-incremental de Numo del
+        // movimiento (ver BankMovement.model.js), no el folioExterno del ERP.
+        folioNumo:     mov.folio ?? null,
+        importe:       mov.deposito ?? null,
+        fechaDeposito: mov.fecha ?? null,
+      });
+    }
+  }
+  detalle.sort((a, b) => b.mesesAtraso - a.mesesAtraso);
+  return { count: detalle.length, detalle: detalle.slice(0, CXC_RETRASADAS_DETALLE_LIMITE) };
+}
+
+/**
  * auth0Subs con rol `rol` ACTUAL, o `null` si `rol` es falsy (sin scope — admin/banks:config).
  * Mismo criterio/patrón que bank.routes.js#_cobranzaTeamAuth0Subs: rol HOY, no historial (ver
  * comentario grande de getCorteConciliacion arriba).
@@ -646,65 +737,104 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
     if (fin < inicio) {
       throw new BadRequestError('fechaFin no puede ser anterior a fechaInicio');
     }
-    const { rezagados, nuevos, identificadosEnPeriodo, posibleCambioPosterior } =
+    const { rezagados, nuevos, identificadosEnPeriodo, cxcRetrasadas, posibleCambioPosterior } =
       await _getCorteHistorico({ baseMatch, inicio, fin, equipoIds, matchEquipo });
 
     return {
       periodo, inicio, fin, historico: true,
-      rezagados, nuevos, identificadosEnPeriodo,
+      rezagados, nuevos, identificadosEnPeriodo, cxcRetrasadas,
       ...(posibleCambioPosterior > 0 ? { advertencia: { registrosConCambioPosteriorAlCierre: posibleCambioPosterior } } : {}),
     };
   }
 
   const inicio = periodo === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
 
+  // `importeTotal` (2026-10-22, pedido explícito del usuario): suma de `deposito` junto a cada
+  // conteo existente, para las mismas categorías que ya expone "Ver por estatus" — nunca
+  // reemplaza al conteo, se agrega al lado.
   const agruparPorStatus = (extraMatch) => BankMovement.aggregate([
     { $match: { ...baseMatch, ...extraMatch } },
-    { $group: { _id: '$status', count: { $sum: 1 } } },
-  ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count])));
+    { $group: { _id: '$status', count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+  ]).then(rows => ({
+    counts:   Object.fromEntries(rows.map(r => [r._id, r.count])),
+    importes: Object.fromEntries(rows.map(r => [r._id, r.importeTotal ?? 0])),
+  }));
 
-  const [rezagadosPorStatus, nuevosPorStatus, nuevosIdentificadoEquipo, identificadosPorOrigen] = await Promise.all([
+  const [rezagadosPorStatus, nuevosPorStatus, nuevosIdentificadoEquipo, identificadosPorOrigen, pendientesConErp] = await Promise.all([
     agruparPorStatus({ fecha: { $lt: inicio }, status: { $in: BACKLOG_STATUSES } }),
     // SIN scope a propósito: esta cuenta los 4 estatus juntos para sacar el total real y
     // 'otros' (ver abajo) — aplicarle matchEquipo acá excluiría de TODO el group-by a los
     // no_identificado/reclasificado (que no tienen primeraIdentificacionPor), no solo a los
     // identificados de otro rol.
     agruparPorStatus({ fecha: { $gte: inicio } }),
-    // Conteo de 'identificado' YA acotado al rol — este es el que se expone en `nuevos`.
-    BankMovement.countDocuments({ ...baseMatch, ...matchEquipo, fecha: { $gte: inicio }, status: 'identificado' }),
+    // Conteo + suma de 'identificado' YA acotados al rol — lo que se expone en `nuevos`.
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, ...matchEquipo, fecha: { $gte: inicio }, status: 'identificado' } },
+      { $group: { _id: null, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]).then(rows => ({ count: rows[0]?.count ?? 0, importeTotal: rows[0]?.importeTotal ?? 0 })),
     BankMovement.aggregate([
       { $match: { ...baseMatch, ...matchEquipo, status: 'identificado', primeraIdentificacionAt: { $gte: inicio } } },
-      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
-    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]).then(rows => ({
+      counts:   Object.fromEntries(rows.map(r => [r._id, r.count])),
+      importes: Object.fromEntries(rows.map(r => [r._id, r.importeTotal ?? 0])),
+    })),
+    // Pendientes (CUALQUIER fecha, rezago o nuevo) con al menos una CxC vinculada — insumo de
+    // "CxC retrasadas" (ver _calcularCxcRetrasadas arriba). Sin scope por rol: mismo criterio
+    // que rezagados/nuevos.pendientes, es una propiedad del movimiento, no de quién identifica.
+    BankMovement.find({ ...baseMatch, status: { $in: BACKLOG_STATUSES }, 'erpLinks.0': { $exists: true } })
+      .select('banco fecha folio deposito erpLinks')
+      .lean(),
   ]);
 
+  const cxcRetrasadas = _calcularCxcRetrasadas(pendientesConErp, _anioMesActualMexico());
+
   const rezagados = {
-    no_identificado: rezagadosPorStatus.no_identificado ?? 0,
-    reclasificado:    rezagadosPorStatus.reclasificado    ?? 0,
+    no_identificado: rezagadosPorStatus.counts.no_identificado ?? 0,
+    reclasificado:    rezagadosPorStatus.counts.reclasificado    ?? 0,
   };
   rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+  rezagados.importeTotal = {
+    no_identificado: rezagadosPorStatus.importes.no_identificado ?? 0,
+    reclasificado:    rezagadosPorStatus.importes.reclasificado    ?? 0,
+  };
+  rezagados.importeTotal.total = rezagados.importeTotal.no_identificado + rezagados.importeTotal.reclasificado;
 
   // Total/otros se calculan con el identificado SIN scope (nuevosPorStatus.identificado) —
   // son propiedades del lote completo, no de "mi equipo". Ver comentario grande arriba: la
   // suma de los 4 buckets expuestos puede no coincidir exacto con `nuevos.total` cuando hay
-  // scope (la diferencia es "identificado por otro rol", a propósito no se expone).
-  const nuevosTotal = Object.values(nuevosPorStatus).reduce((a, b) => a + b, 0);
+  // scope (la diferencia es "identificado por otro rol", a propósito no se expone). Mismo
+  // criterio se aplica a `nuevos.importeTotal`.
+  const nuevosTotal = Object.values(nuevosPorStatus.counts).reduce((a, b) => a + b, 0);
+  const nuevosImporteTotal = Object.values(nuevosPorStatus.importes).reduce((a, b) => a + b, 0);
   const nuevos = {
-    no_identificado: nuevosPorStatus.no_identificado ?? 0,
-    reclasificado:    nuevosPorStatus.reclasificado    ?? 0,
-    identificado:     nuevosIdentificadoEquipo,
+    no_identificado: nuevosPorStatus.counts.no_identificado ?? 0,
+    reclasificado:    nuevosPorStatus.counts.reclasificado    ?? 0,
+    identificado:     nuevosIdentificadoEquipo.count,
   };
-  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - (nuevosPorStatus.identificado ?? 0);
+  nuevos.otros = nuevosTotal - nuevos.no_identificado - nuevos.reclasificado - (nuevosPorStatus.counts.identificado ?? 0);
   nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
   nuevos.total = nuevosTotal;
+  nuevos.importeTotal = {
+    no_identificado: nuevosPorStatus.importes.no_identificado ?? 0,
+    reclasificado:    nuevosPorStatus.importes.reclasificado    ?? 0,
+    identificado:     nuevosIdentificadoEquipo.importeTotal,
+  };
+  nuevos.importeTotal.otros = nuevosImporteTotal - nuevos.importeTotal.no_identificado - nuevos.importeTotal.reclasificado - (nuevosPorStatus.importes.identificado ?? 0);
+  nuevos.importeTotal.total = nuevosImporteTotal;
 
   const identificadosEnPeriodo = {
-    deRezagados: identificadosPorOrigen.rezagado ?? 0,
-    deNuevos:    identificadosPorOrigen.nuevo     ?? 0,
+    deRezagados: identificadosPorOrigen.counts.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.counts.nuevo     ?? 0,
   };
   identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+  identificadosEnPeriodo.importeTotal = {
+    deRezagados: identificadosPorOrigen.importes.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.importes.nuevo     ?? 0,
+  };
+  identificadosEnPeriodo.importeTotal.total = identificadosEnPeriodo.importeTotal.deRezagados + identificadosEnPeriodo.importeTotal.deNuevos;
 
-  return { periodo, inicio, historico: false, rezagados, nuevos, identificadosEnPeriodo };
+  return { periodo, inicio, historico: false, rezagados, nuevos, identificadosEnPeriodo, cxcRetrasadas };
 }
 
 /**
@@ -718,6 +848,12 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
  * se acota al rol, `nuevos.total`/`pendientes`/`otros` se calculan con el identificado SIN
  * acotar (`identificadoTotalSinScope`), para no reducir el total real por scope.
  */
+// Campos select() comunes a ambas queries de abajo — se agregaron banco/fecha/folio/deposito/
+// erpLinks (2026-10-22) para poder calcular "CxC retrasadas" (ver _calcularCxcRetrasadas)
+// reusando estos MISMOS documentos ya traídos, sin una query nueva. folio/deposito son del
+// DEPÓSITO (no de la ficha — ver _calcularCxcRetrasadas para el porqué del cambio).
+const _CORTE_HISTORICO_SELECT = 'banco fecha folio deposito status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion erpLinks';
+
 async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, matchEquipo = {} }) {
   const [candidatosRezagados, candidatosNuevos, identificadosPorOrigen] = await Promise.all([
     BankMovement.find({
@@ -727,55 +863,93 @@ async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, ma
         { status: { $in: BACKLOG_STATUSES } },
         { primeraIdentificacionAt: { $ne: null } },
       ],
-    }).select('status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion').lean(),
+    }).select(_CORTE_HISTORICO_SELECT).lean(),
 
     BankMovement.find({ ...baseMatch, fecha: { $gte: inicio, $lte: fin } })
-      .select('status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion').lean(),
+      .select(_CORTE_HISTORICO_SELECT).lean(),
 
     BankMovement.aggregate([
       { $match: { ...baseMatch, ...matchEquipo, status: 'identificado', primeraIdentificacionAt: { $gte: inicio, $lte: fin } } },
-      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 } } },
-    ]).then(rows => Object.fromEntries(rows.map(r => [r._id, r.count]))),
+      { $group: { _id: { $cond: [{ $lt: ['$fecha', inicio] }, 'rezagado', 'nuevo'] }, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]).then(rows => ({
+      counts:   Object.fromEntries(rows.map(r => [r._id, r.count])),
+      importes: Object.fromEntries(rows.map(r => [r._id, r.importeTotal ?? 0])),
+    })),
   ]);
 
   let posibleCambioPosterior = 0;
+  // Pool de movimientos que SIGUEN pendientes al cierre (rezago o nuevo), con CxC vinculada —
+  // insumo de "CxC retrasadas" (ver _calcularCxcRetrasadas). Mismo criterio de exclusión que
+  // BACKLOG_STATUSES: 'otros' queda afuera, es un estatus terminal, no un pendiente disfrazado.
+  const pendientesConErp = [];
 
+  // `importeTotal` (2026-10-22): acumulado en JS junto con el conteo, porque esta rama ya
+  // reconstruye el estado "al cierre" documento por documento (no hay $group de Mongo acá).
   const rezagados = { no_identificado: 0, reclasificado: 0 };
+  const rezagadosImporte = { no_identificado: 0, reclasificado: 0 };
   for (const mov of candidatosRezagados) {
     const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
     if (posibleCambio) posibleCambioPosterior++;
     if (!identificado) {
       const key = mov.status === 'reclasificado' ? 'reclasificado' : 'no_identificado';
       rezagados[key]++;
+      rezagadosImporte[key] += mov.deposito ?? 0;
+      pendientesConErp.push(mov);
     }
   }
   rezagados.total = rezagados.no_identificado + rezagados.reclasificado;
+  rezagados.importeTotal = {
+    ...rezagadosImporte,
+    total: rezagadosImporte.no_identificado + rezagadosImporte.reclasificado,
+  };
 
   const nuevos = { no_identificado: 0, reclasificado: 0, identificado: 0, otros: 0 };
+  const nuevosImporte = { no_identificado: 0, reclasificado: 0, otros: 0 };
   let identificadoTotalSinScope = 0;
   let identificadoDelEquipo     = 0;
+  let identificadoImporteSinScope = 0;
+  let identificadoImporteEquipo   = 0;
   for (const mov of candidatosNuevos) {
     const { identificado, posibleCambio } = _estadoAlCierre(mov, fin);
     if (posibleCambio) posibleCambioPosterior++;
+    const importe = mov.deposito ?? 0;
     if (identificado) {
       identificadoTotalSinScope++;
-      if (_enEquipoRol(mov.primeraIdentificacionPor?.userId, equipoIds)) identificadoDelEquipo++;
+      identificadoImporteSinScope += importe;
+      if (_enEquipoRol(mov.primeraIdentificacionPor?.userId, equipoIds)) {
+        identificadoDelEquipo++;
+        identificadoImporteEquipo += importe;
+      }
     }
-    else if (mov.status === 'reclasificado') nuevos.reclasificado++;
-    else if (mov.status === 'otros')         nuevos.otros++;
-    else                                      nuevos.no_identificado++;
+    else if (mov.status === 'reclasificado') { nuevos.reclasificado++; nuevosImporte.reclasificado += importe; pendientesConErp.push(mov); }
+    else if (mov.status === 'otros')         { nuevos.otros++; nuevosImporte.otros += importe; }
+    else                                      { nuevos.no_identificado++; nuevosImporte.no_identificado += importe; pendientesConErp.push(mov); }
   }
   nuevos.identificado = identificadoDelEquipo;
   nuevos.pendientes = nuevos.no_identificado + nuevos.reclasificado;
   nuevos.total = nuevos.no_identificado + nuevos.reclasificado + identificadoTotalSinScope + nuevos.otros;
+  nuevos.importeTotal = {
+    no_identificado: nuevosImporte.no_identificado,
+    reclasificado:    nuevosImporte.reclasificado,
+    identificado:     identificadoImporteEquipo,
+    otros:            nuevosImporte.otros,
+    total: nuevosImporte.no_identificado + nuevosImporte.reclasificado + identificadoImporteSinScope + nuevosImporte.otros,
+  };
 
   const identificadosEnPeriodo = {
-    deRezagados: identificadosPorOrigen.rezagado ?? 0,
-    deNuevos:    identificadosPorOrigen.nuevo ?? 0,
+    deRezagados: identificadosPorOrigen.counts.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.counts.nuevo ?? 0,
   };
   identificadosEnPeriodo.total = identificadosEnPeriodo.deRezagados + identificadosEnPeriodo.deNuevos;
+  identificadosEnPeriodo.importeTotal = {
+    deRezagados: identificadosPorOrigen.importes.rezagado ?? 0,
+    deNuevos:    identificadosPorOrigen.importes.nuevo ?? 0,
+  };
+  identificadosEnPeriodo.importeTotal.total = identificadosEnPeriodo.importeTotal.deRezagados + identificadosEnPeriodo.importeTotal.deNuevos;
 
-  return { rezagados, nuevos, identificadosEnPeriodo, posibleCambioPosterior };
+  const cxcRetrasadas = _calcularCxcRetrasadas(pendientesConErp, _anioMesDeFecha(fin));
+
+  return { rezagados, nuevos, identificadosEnPeriodo, cxcRetrasadas, posibleCambioPosterior };
 }
 
 // Reconstrucción de "¿estaba identificado al cierre `fin` de un corte histórico?" — de 1 solo
@@ -830,6 +1004,107 @@ async function getPeriodoCortePorRol(role) {
     return { periodo: await _periodoConfigurado(role), puedeAlternar: false };
   }
   return { periodo: 'semanal', puedeAlternar: true };
+}
+
+const TENDENCIA_PUNTOS_DEFAULT = { semanal: 10, mensual: 6 };
+
+/**
+ * Serie histórica de backlog para el gráfico de tendencia del panel de Cortes (2026-10-22,
+ * pedido explícito del usuario: ver si el backlog crece o se achica corte a corte, no solo la
+ * foto del periodo actual). Un punto por periodo pasado (semana o mes, según `periodo`) — el
+ * MÁS RECIENTE siempre en modo TIEMPO REAL (periodo en curso, llama a getCorteConciliacion()
+ * sin fechaInicio/fechaFin, igual que el resto del panel); los anteriores se reconstruyen con
+ * el mismo mecanismo de corte histórico (_getCorteHistorico/_estadoAlCierre — ver las
+ * limitaciones ya documentadas ahí: sin log genérico de cambios de status, lo irreconstruible
+ * se señala vía `advertencia` en cada punto, nunca se oculta).
+ *
+ * SIN rolEquipo a propósito: la serie es de `rezagados.total`/`nuevos.pendientes`/
+ * `cxcRetrasadas.count` (y su desglose por status, ver abajo), ninguno tiene scope por rol
+ * (ver comentario grande de getCorteConciliacion) — ni cobranza ni contabilidad verían un
+ * número distinto entre sí.
+ *
+ * Desglose por status (2026-10-22, pedido explícito del usuario — switch "Ver por estatus"
+ * del gráfico de tendencia): además de los totales de siempre, cada punto expone
+ * `rezagadosNoIdentificado`/`rezagadosReclasificado` (suman EXACTO `rezagadosTotal`, por
+ * construcción — ver `rezagados` en getCorteConciliacion/_getCorteHistorico) y
+ * `nuevosNoIdentificado`/`nuevosReclasificado`/`nuevosIdentificado` (los 2 primeros suman
+ * EXACTO `nuevosPendientes`; `nuevosIdentificado` es informativo aparte — a propósito NO se
+ * suma a `nuevosPendientes`, ese total debe seguir representando solo lo que falta por
+ * identificar, igual que antes de este cambio).
+ *
+ * @param {object} [opts]
+ * @param {'semanal'|'mensual'} [opts.periodo='semanal']
+ * @param {string} [opts.banco]
+ * @param {number} [opts.puntos] Cantidad de periodos a incluir (default 10 semanas / 6 meses,
+ *   ver TENDENCIA_PUNTOS_DEFAULT) — un valor <= 0 o no numérico cae al default.
+ */
+async function getCorteTendencia({ periodo = 'semanal', banco = null, puntos = null } = {}) {
+  const periodoResuelto = periodo === 'mensual' ? 'mensual' : 'semanal';
+  const n = Number.isFinite(puntos) && puntos > 0 ? puntos : TENDENCIA_PUNTOS_DEFAULT[periodoResuelto];
+  const inicioActual = periodoResuelto === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
+  const mxActual = _comoRelojMexico(inicioActual);
+  const anioActual = mxActual.getUTCFullYear();
+  const mesActual   = mxActual.getUTCMonth() + 1;
+
+  // Límites {fechaInicio, fechaFin, esActual} de cada periodo pasado, del más viejo al más
+  // reciente (i de n-1 a 0) — i===0 es SIEMPRE el periodo en curso (esActual).
+  const limites = [];
+  for (let i = n - 1; i >= 0; i--) {
+    if (i === 0) { limites.push({ esActual: true }); continue; }
+    if (periodoResuelto === 'mensual') {
+      // Resta i meses con overflow normalizado por Date (mes puede salir de [1,12] y de
+      // paso ajustar el año — mismo truco ya usado en varios lugares del proyecto).
+      const target = new Date(Date.UTC(anioActual, (mesActual - 1) - i, 1));
+      const rango  = _rangoAnioMesMexico(target.getUTCFullYear(), target.getUTCMonth() + 1);
+      limites.push({
+        esActual: false,
+        fechaInicio: _fechaMxComoString(rango.$gte),
+        fechaFin:    _fechaMxComoString(new Date(rango.$lt.getTime() - 1000)),
+      });
+    } else {
+      // Resta i semanas completas (7*24h reales) — sin horario de verano en México desde
+      // 2022, la resta en ms real preserva "medianoche México" (mismo supuesto que el resto
+      // de este archivo, ver _comoRelojMexico arriba).
+      const inicioSemana = new Date(inicioActual.getTime() - i * 7 * 24 * MS_PER_HOUR);
+      const finSemana    = new Date(inicioSemana.getTime() + 6 * 24 * MS_PER_HOUR);
+      limites.push({
+        esActual: false,
+        fechaInicio: _fechaMxComoString(inicioSemana),
+        fechaFin:    _fechaMxComoString(finSemana),
+      });
+    }
+  }
+
+  const puntosResueltos = await Promise.all(limites.map(async (lim) => {
+    const corte = lim.esActual
+      ? await getCorteConciliacion({ periodo: periodoResuelto, banco })
+      : await getCorteConciliacion({ periodo: periodoResuelto, banco, fechaInicio: lim.fechaInicio, fechaFin: lim.fechaFin });
+    return {
+      inicio: corte.inicio,
+      fin: corte.fin ?? null,
+      esActual: !!lim.esActual,
+      rezagadosTotal:      corte.rezagados.total,
+      rezagadosNoIdentificado: corte.rezagados.no_identificado,
+      rezagadosReclasificado:  corte.rezagados.reclasificado,
+      nuevosPendientes:    corte.nuevos.pendientes,
+      nuevosNoIdentificado: corte.nuevos.no_identificado,
+      nuevosReclasificado:  corte.nuevos.reclasificado,
+      nuevosIdentificado:   corte.nuevos.identificado,
+      cxcRetrasadasCount:  corte.cxcRetrasadas.count,
+      // Importes (2026-10-22, pedido explícito del usuario): mismo desglose que ya expone
+      // "Ver por estatus" en counts, junto a cada barra — no reemplaza el conteo.
+      rezagadosTotalImporte:        corte.rezagados.importeTotal.total,
+      rezagadosNoIdentificadoImporte: corte.rezagados.importeTotal.no_identificado,
+      rezagadosReclasificadoImporte:  corte.rezagados.importeTotal.reclasificado,
+      nuevosPendientesImporte:     corte.nuevos.importeTotal.no_identificado + corte.nuevos.importeTotal.reclasificado,
+      nuevosNoIdentificadoImporte: corte.nuevos.importeTotal.no_identificado,
+      nuevosReclasificadoImporte:  corte.nuevos.importeTotal.reclasificado,
+      nuevosIdentificadoImporte:   corte.nuevos.importeTotal.identificado,
+      ...(corte.advertencia ? { advertencia: corte.advertencia } : {}),
+    };
+  }));
+
+  return { periodo: periodoResuelto, puntos: puntosResueltos };
 }
 
 /**
@@ -941,10 +1216,10 @@ async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInici
     });
   }
 
-  addSeccionResumen('rezagados', 'Rezagados', [
-    { label: 'Rezagados — no identificados', value: corte.rezagados.no_identificado },
-    { label: 'Rezagados — por conciliar',    value: corte.rezagados.reclasificado },
-    { label: 'Rezagados — total',            value: corte.rezagados.total, esTotal: true },
+  addSeccionResumen('rezagados', 'Depósitos no identificados iniciales', [
+    { label: 'No identificados iniciales — no identificados', value: corte.rezagados.no_identificado },
+    { label: 'No identificados iniciales — por conciliar',    value: corte.rezagados.reclasificado },
+    { label: 'No identificados iniciales — total',            value: corte.rezagados.total, esTotal: true },
   ]);
   addSeccionResumen('nuevos', 'Nuevos del periodo', [
     { label: 'Nuevos del periodo — no identificados', value: corte.nuevos.no_identificado },
@@ -1038,6 +1313,7 @@ async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInici
 module.exports = {
   getIndicadoresIdentificacion,
   getCorteConciliacion,
+  getCorteTendencia,
   getPeriodoCortePorRol,
   buildReporteCorte,
   buildReporteIdentificacion,
@@ -1054,4 +1330,9 @@ module.exports = {
   _enScopeUserId,
   _resolverCasiIdentificadosPorSaldoBajo,
   SALDO_RESTANTE_TOLERANCIA,
+  // "CxC retrasadas" del corte (2026-10-22) — exportadas para poder testearlas directo, mismo
+  // criterio que el resto de funciones puras de este archivo.
+  _folioFechaCodificada,
+  _mesesDeAtraso,
+  _calcularCxcRetrasadas,
 };

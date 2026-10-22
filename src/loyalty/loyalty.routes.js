@@ -65,14 +65,14 @@ router.put('/cards/:id/nivel', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS
 
 // ── Movimientos ───────────────────────────────────────────────────────────────
 router.post('/cards/:id/acumulaciones', authenticate, permit(PERMISSIONS.LOYALTY_MOVIMIENTOS), asyncHandler(async (req, res) => {
-  const { montoVenta, centroCostoId } = req.body ?? {};
-  const resultado = await ledgerService.registrarAcumulacion({ cardId: req.params.id, montoVenta, centroCostoId }, req.user);
+  const { serieFolio } = req.body ?? {};
+  const resultado = await ledgerService.registrarAcumulacion({ cardId: req.params.id, serieFolio }, req.user);
   res.status(201).json(resultado);
 }));
 
 router.post('/cards/:id/canjes', authenticate, permit(PERMISSIONS.LOYALTY_MOVIMIENTOS), asyncHandler(async (req, res) => {
-  const { puntos, centroCostoId } = req.body ?? {};
-  const resultado = await ledgerService.registrarCanje({ cardId: req.params.id, puntos, centroCostoId }, req.user);
+  const { puntos, serie } = req.body ?? {};
+  const resultado = await ledgerService.registrarCanje({ cardId: req.params.id, puntos, serie }, req.user);
   res.status(201).json(resultado);
 }));
 

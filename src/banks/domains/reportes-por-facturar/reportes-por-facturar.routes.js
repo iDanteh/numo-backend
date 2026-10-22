@@ -8,9 +8,10 @@ const service                  = require('./reportes-por-facturar.service');
 
 const router = express.Router();
 
-// GET /api/reportes-por-facturar?rfc= — historial (sin los datos)
+// GET /api/reportes-por-facturar?rfc=&page=&limit= — historial paginado (sin los datos)
 router.get('/', authenticate, permit('visor:reports'), asyncHandler(async (req, res) => {
-  res.json({ data: await service.listar({ rfc: req.query.rfc }) });
+  const { rfc, page, limit } = req.query;
+  res.json(await service.listar({ rfc, page, limit }));
 }));
 
 // POST /api/reportes-por-facturar { rfc, centroCostoId?, fechaInicio, fechaFin? }

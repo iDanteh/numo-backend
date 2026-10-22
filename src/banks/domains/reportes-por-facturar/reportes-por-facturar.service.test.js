@@ -82,6 +82,17 @@ test('historial paginado: 5 por página, más recientes primero', async () => {
   const r = await service.listar({ rfc: 'CCO011113663', page: '3' });
   expect(r).toEqual({ data: [{ id: 12 }], total: 12, page: 3, limit: 5 });
   expect(ReportePorFacturar.findAndCountAll.mock.calls[0][0]).toMatchObject({
-    where: { rfc: 'CCO011113663' }, limit: 5, offset: 10, order: [['createdAt', 'DESC'], ['id', 'DESC']],
+    where: { rfc: 'CCO011113663', eliminadoEn: null }, limit: 5, offset: 10, order: [['createdAt', 'DESC'], ['id', 'DESC']],
   });
+});
+
+test('eliminar: borrado lógico con quién lo eliminó; ya no se puede abrir', async () => {
+  const update = jest.fn();
+  ReportePorFacturar.findByPk.mockResolvedValueOnce({ id: 7, eliminadoEn: null, update });
+  expect(await service.eliminar(7, { dbId: '5' })).toEqual({ ok: true, id: 7 });
+  expect(update.mock.calls[0][0]).toMatchObject({ eliminadoPorId: 5, eliminadoEn: expect.any(Date) });
+
+  ReportePorFacturar.findByPk.mockResolvedValue({ id: 7, eliminadoEn: new Date(), update, toJSON: () => ({}) });
+  await expect(service.obtener(7)).rejects.toThrow();
+  await expect(service.eliminar(7, { dbId: '5' })).rejects.toThrow();
 });

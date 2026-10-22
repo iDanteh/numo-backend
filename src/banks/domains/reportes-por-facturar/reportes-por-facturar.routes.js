@@ -25,6 +25,11 @@ router.get('/:id', authenticate, permit('visor:reports'), asyncHandler(async (re
   res.json(await service.obtener(req.params.id));
 }));
 
+// DELETE /api/reportes-por-facturar/:id — borrado lógico (guarda quién lo eliminó)
+router.delete('/:id', authenticate, permit('visor:reports'), asyncHandler(async (req, res) => {
+  res.json(await service.eliminar(req.params.id, req.user));
+}));
+
 // GET /api/reportes-por-facturar/:id/excel
 router.get('/:id/excel', authenticate, permit('visor:reports'), asyncHandler(async (req, res) => {
   const { buffer, filename } = await service.excel(req.params.id);

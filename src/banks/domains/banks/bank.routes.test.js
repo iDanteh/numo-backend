@@ -53,6 +53,7 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
   getCorteConciliacion: jest.fn(),
+  getCorteTendencia: jest.fn(),
   getPeriodoCortePorRol: jest.fn(),
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
@@ -526,6 +527,52 @@ describe('GET /cortes/periodo-rol', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ periodo: 'semanal', puedeAlternar: false });
     expect(indicadoresService.getPeriodoCortePorRol).toHaveBeenCalledWith('contabilidad');
+  });
+});
+
+describe('GET /cortes/tendencia', () => {
+  let app;
+
+  const FAKE_TENDENCIA = {
+    periodo: 'semanal',
+    puntos: [{ inicio: '2026-10-05T06:00:00.000Z', fin: null, esActual: true, rezagadosTotal: 1, nuevosPendientes: 2, cxcRetrasadasCount: 0 }],
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getCorteTendencia.mockResolvedValue(FAKE_TENDENCIA);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/tendencia')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getCorteTendencia).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa periodo/banco/puntos al service y devuelve el resultado', async () => {
+    const res = await request(app)
+      .get('/cortes/tendencia')
+      .query({ periodo: 'mensual', banco: 'BBVA', puntos: '6' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(FAKE_TENDENCIA);
+    expect(indicadoresService.getCorteTendencia).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', puntos: 6 });
+  });
+
+  test('sin ?banco ni ?puntos: se pasan null (no string vacío / NaN)', async () => {
+    await request(app)
+      .get('/cortes/tendencia')
+      .query({ periodo: 'semanal' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteTendencia).toHaveBeenCalledWith({ periodo: 'semanal', banco: null, puntos: null });
   });
 });
 

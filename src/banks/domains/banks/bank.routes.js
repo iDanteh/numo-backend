@@ -237,6 +237,16 @@ router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), 
   res.json(await indicadoresService.getPeriodoCortePorRol(req.user.role));
 }));
 
+// GET /api/banks/cortes/tendencia — serie histórica de backlog (rezagados.total/nuevos.
+// pendientes/cxcRetrasadas.count) para el gráfico de tendencia del panel de Cortes (2026-10-22,
+// pedido explícito del usuario). Mismo permiso que /cortes. SIN rolEquipo (ver JSDoc de
+// getCorteTendencia en bank-indicadores.service.js — ninguno de los 3 valores tiene scope por rol).
+router.get('/cortes/tendencia', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { periodo, banco, puntos } = req.query;
+  const puntosNum = puntos ? parseInt(puntos, 10) : null;
+  res.json(await indicadoresService.getCorteTendencia({ periodo, banco: banco || null, puntos: Number.isFinite(puntosNum) ? puntosNum : null }));
+}));
+
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle
 // de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
 // data ya visible en pantalla (incluido el scope por rol de /cortes, 2026-10-09), solo en

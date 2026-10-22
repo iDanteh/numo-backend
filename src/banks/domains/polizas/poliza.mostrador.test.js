@@ -40,7 +40,7 @@ test('facturas globales: una sola tabla con la leyenda EN FACTURA GLOBAL y colum
   const otraGlobal = { ...factura, uuid: 'G2', folio: '261009477', esGlobal: true, totalFactura: 100, totalAplicado: 100,
     depositos: [{ ...factura.depositos[0], idNumo: '9', importe: 100, aplicado: 100 }] };
   const filas = hoja({ ...factura, esGlobal: true }, otraGlobal);
-  expect(filas[0][0]).toBe('EN FACTURA GLOBAL — A0-261009872, A0-261009477');
+  expect(filas[0][0]).toBe('EN FACTURA GLOBAL — A0-261009872 (20/10/26), A0-261009477 (20/10/26)');
   expect(filas[1]).toEqual(COLUMNAS);
   expect(filas[2].slice(1)).toEqual(['DEPOSITO EN EFECTIVO', 11580.53, 11580.53, 'BBVA', 'A0-260901786\nA0-260901831', 'JUAN LOPEZ MORALES', '052586', 'POR FACTURAR', 'A0-261009872']);
   expect(filas[3][6]).toBe('CLIENTE NO IDENTIFICADO');

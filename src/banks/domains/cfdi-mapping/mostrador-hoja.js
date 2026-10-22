@@ -72,6 +72,7 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
   });
   const COLUMNAS = ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'APLICADO A FACTURA', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO', 'ESTATUS'];
   const folioFactura = f => `${f.serie ?? ''}-${f.folio ?? ''}`;
+  const fechaCorta = d => new Date(d).toLocaleDateString('es-MX', { timeZone: 'America/Mexico_City', day: 'numeric', month: 'numeric', year: '2-digit' });
   const _redondear2 = n => Math.round(n * 100) / 100;
   const seccion = (texto, columnas) => {
     const row = wsMos.addRow([texto]);
@@ -136,7 +137,9 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
   };
 
   if (facturasGlobales.length) {
-    tablaJunta(`EN FACTURA GLOBAL — ${facturasGlobales.map(folioFactura).join(', ')}`, facturasGlobales, 'Total facturas');
+    // Cada factura con su fecha (2026-10-22, pedido del usuario).
+    const conFecha = f => (f.fechaFactura ? `${folioFactura(f)} (${fechaCorta(f.fechaFactura)})` : folioFactura(f));
+    tablaJunta(`EN FACTURA GLOBAL — ${facturasGlobales.map(conFecha).join(', ')}`, facturasGlobales, 'Total facturas');
   }
   if (ppdFacturadoCliente.length) {
     // Solo algunos depósitos de cada factura: el total es el de lo listado,

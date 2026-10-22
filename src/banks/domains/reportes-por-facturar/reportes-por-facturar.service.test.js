@@ -3,7 +3,7 @@
 // Reporte "Por facturar" (2026-10-22): facturas pagadas con depósitos de días
 // anteriores (equivalente sin póliza de "Venta Sin Cobro") + depósitos
 // pendientes de generar factura, con historial.
-jest.mock('../../../shared/models/postgres', () => ({ ReportePorFacturar: { create: jest.fn(), findByPk: jest.fn(), findAll: jest.fn() }, User: {} }));
+jest.mock('../../../shared/models/postgres', () => ({ ReportePorFacturar: { create: jest.fn(), findByPk: jest.fn(), findAndCountAll: jest.fn() }, User: {} }));
 jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
@@ -75,4 +75,13 @@ test('si Kore no respondió remisiones, queda advertencia en el reporte', async 
   mostrador.detectarDepositosPendientesFactura.mockResolvedValue({ depositos: [], remisionesSinRespuesta: 3 });
   await service.generar({ rfc: 'X', centroCostoId: 1, fechaInicio: '2026-10-20' }, null);
   expect(ReportePorFacturar.create.mock.calls[0][0].advertencias[0]).toMatch('no respondió 3');
+});
+
+test('historial paginado: 5 por página, más recientes primero', async () => {
+  ReportePorFacturar.findAndCountAll.mockResolvedValue({ rows: [{ id: 12 }], count: 12 });
+  const r = await service.listar({ rfc: 'CCO011113663', page: '3' });
+  expect(r).toEqual({ data: [{ id: 12 }], total: 12, page: 3, limit: 5 });
+  expect(ReportePorFacturar.findAndCountAll.mock.calls[0][0]).toMatchObject({
+    where: { rfc: 'CCO011113663' }, limit: 5, offset: 10, order: [['createdAt', 'DESC'], ['id', 'DESC']],
+  });
 });

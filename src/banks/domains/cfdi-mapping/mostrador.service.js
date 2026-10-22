@@ -212,10 +212,12 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       fecha:       b.fecha ?? null,
       descripcion: b.concepto ?? '',
       importe:     _r2(b.deposito),
+      aplicado:    _r2(links.reduce((s, l) => s + (Number(l.saldoPagado ?? l.saldoPagadoTotal) || 0), 0)),
       banco:       b.banco ?? '',
       remisiones:  [...new Set(links.map(l => `${String(l.serie).trim().toUpperCase()}-${String(l.folioExterno).trim()}`))],
       cliente:     [...new Set(links.map(l => cuentaKore.get(clave(l))?.nombre).filter(Boolean))].join(' / '),
       idNumo:      b.folio ?? '',
+      estatus:     ESTATUS_POR_FACTURAR,
     });
   }
   depositos.sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));

@@ -107,8 +107,8 @@ describe('PENDIENTE GENERAR FACTURA', () => {
     const { depositos, remisionesSinRespuesta } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });
     expect(remisionesSinRespuesta).toBe(0);
     expect(depositos).toEqual([
-      { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487' },
-      { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, banco: 'BBVA', remisiones: ['A0-260804886'], cliente: 'MISAEL ABDIEL JIMENEZ SORIA', idNumo: '053966' },
+      { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, aplicado: 1, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487', estatus: 'POR FACTURAR' },
+      { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, aplicado: 1, banco: 'BBVA', remisiones: ['A0-260804886'], cliente: 'MISAEL ABDIEL JIMENEZ SORIA', idNumo: '053966', estatus: 'POR FACTURAR' },
     ]);
     const filtro = BankMovement.find.mock.calls[0][0];
     expect(filtro.fecha.$gte.toISOString()).toBe('2026-10-19T00:00:00.000Z');

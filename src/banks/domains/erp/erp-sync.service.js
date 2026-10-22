@@ -562,8 +562,8 @@ async function obtenerDesglosesSalidasCajaPorAlmacen({ rfc, almacen, fechaDesde,
 // pensada para descargas masivas): es solo el nombre para el concepto — si
 // falla o no viene, el caller conserva "CLIENTE NO IDENTIFICADO". Las fallas
 // no se cachean, así una regeneración posterior lo vuelve a intentar.
-// `obtenerCuentaTicket` devuelve además `tipoPago` y `nombreTipoMovimiento`
-// de la misma cuenta (hoja MOSTRADOR, 2026-10-22: PPD "POR FACTURAR").
+// `obtenerCuentaTicket` devuelve además `tipoPago`, `nombreTipoMovimiento`,
+// `saldoActual` y `factura` de la misma cuenta (hoja MOSTRADOR, 2026-10-22).
 const _cacheNombrePersona = new Map();
 async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
   if (!rfc || !serie || !folio || !fechaCreacion) return null;
@@ -576,16 +576,30 @@ async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
   let info = null;
   const inicioNombre = Date.now();
   try {
-    const response = await axios.get(`${await _cuentasPendientesUrl()}/cuentas-pendientes`, {
-      params: {
-        fechaDesde:   new Date(creada.getTime() - MS_UN_DIA).toISOString(),
-        fechaHasta:   new Date(creada.getTime() + MS_UN_DIA).toISOString(),
-        serieExterna: String(serie).trim(),
-        folioExterno: String(folio).trim(),
-      },
-      headers: { Authorization: `Bearer ${await _token()}` },
-      timeout: 15000,
-    });
+    // 429 (rate limit de Kore): espera lo que indique "retry after" y
+    // reintenta, mismo criterio que `_getConReintento` — la hoja MOSTRADOR
+    // consulta cientos de remisiones seguidas (caso real 2026-10-22: 231 de
+    // 347 sin respuesta por 429 sin este reintento).
+    let response;
+    for (let intento = 1; ; intento++) {
+      try {
+        response = await axios.get(`${await _cuentasPendientesUrl()}/cuentas-pendientes`, {
+          params: {
+            fechaDesde:   new Date(creada.getTime() - MS_UN_DIA).toISOString(),
+            fechaHasta:   new Date(creada.getTime() + MS_UN_DIA).toISOString(),
+            serieExterna: String(serie).trim(),
+            folioExterno: String(folio).trim(),
+          },
+          headers: { Authorization: `Bearer ${await _token()}` },
+          timeout: 15000,
+        });
+        break;
+      } catch (axErr) {
+        if (axErr.response?.status !== 429 || intento >= MAX_INTENTOS_429) throw axErr;
+        const match = /retry after:\s*([\d.]+)/i.exec(String(axErr.response?.data?.Data ?? ''));
+        await new Promise(r => setTimeout(r, Math.min((match ? Number(match[1]) : 10) + 1, 60) * 1000));
+      }
+    }
     _registrarLlamadaErp('/cuentas-pendientes (nombre cliente)', Date.now() - inicioNombre);
     const cuenta = (response.data?.Data?.cuentas ?? [])
       .find(c => c.serieExterna === serie && String(c.folioExterno) === String(folio));
@@ -593,6 +607,8 @@ async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
       nombre:               (cuenta?.nombrePersona ?? '').trim() || null,
       tipoPago:             cuenta?.tipoPago ?? null,
       nombreTipoMovimiento: cuenta?.nombreTipoMovimiento ? String(cuenta.nombreTipoMovimiento).trim().toUpperCase() : null,
+      saldoActual:          cuenta ? Number(cuenta.saldoActual) : null,
+      factura:              cuenta?.serieFactura ? `${cuenta.serieFactura}-${cuenta.folioFactura ?? ''}` : null,
     };
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');

@@ -60,6 +60,20 @@ const ReportePorFacturar = sequelize.define('ReportePorFacturar', {
     references: { model: 'users', key: 'id' },
     onDelete:   'SET NULL',
   },
+  /**
+   * Eliminado (2026-10-22, pedido del usuario): borrado lógico — el reporte
+   * ya no se ve en el historial, pero queda guardado quién y cuándo lo quitó.
+   */
+  eliminadoPorId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'users', key: 'id' },
+    onDelete:   'SET NULL',
+  },
+  eliminadoEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName:   'reportes_por_facturar',
   underscored: true,

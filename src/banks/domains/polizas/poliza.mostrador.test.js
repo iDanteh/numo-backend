@@ -36,7 +36,7 @@ const nancy = {
     remisiones: ['A0-261003190'], cliente: 'NANCY MIGUEL LOPEZ', idNumo: '53714', estatus: 'FACTURADO', ppdPorFacturar: false }],
 };
 
-test('facturas globales: una sola tabla con la leyenda EN FACTURA GLOBAL, fecha de cada factura y columna FACTURA', () => {
+test('facturas globales: una tabla por global con su fecha, sus depósitos PPD y su total', () => {
   const ppd = d => ({ ...d, ppdPorFacturar: true });
   const otraGlobal = { ...factura, uuid: 'G2', folio: '261009477', esGlobal: true, totalFactura: 100, totalAplicado: 100,
     depositos: [ppd({ ...factura.depositos[0], idNumo: '9', importe: 100, aplicado: 100 })] };
@@ -44,13 +44,20 @@ test('facturas globales: una sola tabla con la leyenda EN FACTURA GLOBAL, fecha 
   const globalTickets = { ...factura, uuid: 'G3', serie: 'M0', folio: '261000670', esGlobal: true,
     depositos: [{ ...factura.depositos[0], idNumo: '054092', estatus: 'TICKET SENCILLO', ppdPorFacturar: false }] };
   const filas = hoja({ ...factura, esGlobal: true, depositos: factura.depositos.map(ppd) }, otraGlobal, globalTickets);
-  expect(filas[0][0]).toBe('EN FACTURA GLOBAL — A0-261009872 (20/10/26), A0-261009477 (20/10/26)');
+  // Primera global: A0-261009872 con sus 2 depósitos y su total.
+  expect(filas[0][0]).toBe('EN FACTURA GLOBAL — A0-261009872 (20/10/26)');
   expect(filas[1]).toEqual(COLUMNAS);
   expect(filas[2].slice(1)).toEqual(['DEPOSITO EN EFECTIVO', 11580.53, 11580.53, 'BBVA', 'A0-260901786\nA0-260901831', 'JUAN LOPEZ MORALES', '052586', 'POR FACTURAR', 'A0-261009872']);
   expect(filas[3][6]).toBe('CLIENTE NO IDENTIFICADO');
-  expect(filas[4][9]).toBe('A0-261009477');
-  expect(filas[5].slice(1, 7)).toEqual(['TOTAL', 16680.53, 16680.27, undefined, 'Total facturas', 229802.95]);
+  expect(filas[4].slice(1, 7)).toEqual(['TOTAL', 16580.53, 16580.27, undefined, 'Total factura', 229702.95]);
+  expect(filas[5]).toEqual([]);
+  // Segunda global: su propia tabla.
+  expect(filas[6][0]).toBe('EN FACTURA GLOBAL — A0-261009477 (20/10/26)');
+  expect(filas[8][9]).toBe('A0-261009477');
+  expect(filas[9].slice(1, 7)).toEqual(['TOTAL', 100, 100, undefined, 'Total factura', 100]);
+  // La global con solo tickets PUE no genera tabla.
   expect(filas.flat()).not.toContain('054092');
+  expect(filas.filter(r => String(r[0]).startsWith('EN FACTURA GLOBAL'))).toHaveLength(2);
 });
 
 test('no global: solo los depósitos PPD "POR FACTURAR" en su tabla; lo FACTURADO (NANCY) no sale', () => {

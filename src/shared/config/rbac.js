@@ -197,6 +197,12 @@ const PERMISSIONS = Object.freeze({
   // explícito del usuario), mismo criterio que SYSTEM_MONITOR_READ: sin rol asignado.
   POLIZAS_AUDIT_READ:  'polizas:audit:read',
 
+  // Reporte "Por facturar" (Reportes, ver banks/domains/reportes-por-facturar) —
+  // permiso propio para asignar por rol (2026-10-23, pedido del usuario): solo
+  // quien lo tenga puede ver la vista, generar, descargar y eliminar. Sin rol
+  // asignado de inicio (admin lo tiene por '*'); se asigna desde Usuarios y Roles.
+  REPORTES_POR_FACTURAR: 'reportes:por-facturar',
+
   // Sistema de Lealtad (ver src/loyalty/) — ocho permisos finos, cada uno gatea
   // SOLO su propia acción (openspec/changes/sistema-lealtad/specs/loyalty-permissions).
   // El split sigue el riesgo: trabajo rutinario de mostrador (crear, editar, acumular,

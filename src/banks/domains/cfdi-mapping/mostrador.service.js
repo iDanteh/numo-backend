@@ -145,6 +145,11 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
  * @param {string[]} p.series    series de la sucursal (A0, …)
  * @param {string}   p.fechaInicio  YYYY-MM-DD — día de la póliza
  * @param {string}   [p.fechaFin]   YYYY-MM-DD (default = fechaInicio)
+ * @param {boolean}  [p.incluirIdentificados]  también los depósitos de fecha
+ *   anterior que se IDENTIFICARON / VINCULARON dentro del rango (día MX), con
+ *   su `identificadoEl` — solo el reporte "Por facturar" (2026-10-23, pedido
+ *   del usuario: depósitos de ago/sep/oct identificados hoy no salían en el
+ *   reporte de hoy). La póliza no lo usa.
  * @returns {Promise<{ depositos: object[], depositosConSaldo: object[], remisionesSinRespuesta: number }>}
  *   depositos: [{ fecha, descripcion, importe, aplicado, banco, remisiones, cliente, idNumo, estatus }]
  *   depositosConSaldo: mismos campos + `saldo` — PPD, "POR FACTURAR" y sin
@@ -156,7 +161,19 @@ const LOTE_DESGLOSES = 50;
 // Kore limita /cuentas-pendientes (429 con 8 a la vez en prod, 2026-10-22).
 const CONCURRENCIA_CUENTAS = 2;
 
-async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin }) {
+// Último momento en que se identificó / vinculó el depósito (fechas reales,
+// con hora): vinculaciones del historial, identificadoPor y la primera
+// identificación.
+function _identificadoEl(b) {
+  const fechas = [
+    b.primeraIdentificacionAt,
+    ...(b.identificadoPor ?? []).map(i => i.fechaId),
+    ...(b.historialVinculacion ?? []).filter(h => h.accion === 'vinculado').map(h => h.at),
+  ].map(f => (f ? new Date(f) : null)).filter(f => f && !isNaN(f));
+  return fechas.length ? new Date(Math.max(...fechas)) : null;
+}
+
+async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados = false }) {
   const seriesSet = new Set((series ?? []).map(s => String(s).trim().toUpperCase()).filter(Boolean));
   if (!rfc || !seriesSet.size || !fechaInicio) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
 
@@ -165,10 +182,23 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
   const desde = new Date(`${fechaInicio}T00:00:00.000Z`);
   const hasta = new Date(`${fechaFin || fechaInicio}T23:59:59.999Z`);
   const linkSinFactura = l => seriesSet.has(String(l.serie ?? '').trim().toUpperCase()) && !l.folioFiscal && l.folioExterno;
+  const porFechaBanco = { fecha: { $gte: desde, $lte: hasta } };
+  // Identificación: instante real → día de México (UTC-6, sin horario de verano).
+  const enRangoId = {
+    $gte: new Date(`${fechaInicio}T00:00:00.000-06:00`),
+    $lte: new Date(`${fechaFin || fechaInicio}T23:59:59.999-06:00`),
+  };
   const bancos = await BankMovement.find({
     isActive: { $ne: false },
     deposito: { $gt: 0 },
-    fecha:    { $gte: desde, $lte: hasta },
+    ...(incluirIdentificados
+      ? { $or: [
+        porFechaBanco,
+        { primeraIdentificacionAt: enRangoId },
+        { 'identificadoPor.fechaId': enRangoId },
+        { historialVinculacion: { $elemMatch: { accion: 'vinculado', at: enRangoId } } },
+      ] }
+      : porFechaBanco),
     erpLinks: { $elemMatch: { serie: { $in: [...seriesSet] }, $or: [{ folioFiscal: null }, { folioFiscal: '' }] } },
   }).lean();
   if (!bancos.length) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
@@ -228,6 +258,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       cliente:     [...new Set(links.map(l => cuentaKore.get(clave(l))?.nombre).filter(Boolean))].join(' / '),
       idNumo:      b.folio ?? '',
       estatus:     ESTATUS_POR_FACTURAR,
+      ...(incluirIdentificados ? { identificadoEl: _identificadoEl(b) } : {}),
       ...(todasPagadas ? {} : { saldo: _r2(remisionesUnicas.reduce((s, l) => s + saldoDe(l), 0)) }),
     });
   }

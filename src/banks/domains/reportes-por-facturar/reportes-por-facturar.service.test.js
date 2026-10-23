@@ -49,7 +49,7 @@ test('solo facturas de la sucursal con algún depósito de días anteriores; gua
   const [{ cfdis, movimientos }] = mostrador.detectarMovimientosMostrador.mock.calls[0];
   expect(movimientos).toEqual([{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: GLOBAL }]);
   expect(cfdis.map(c => c.folio)).toEqual(['261009872']);
-  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20' });
+  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true });
 
   const guardado = ReportePorFacturar.create.mock.calls[0][0];
   expect(guardado).toMatchObject({ rfc: 'CCO011113663', centroCostoId: 1, sucursal: 'CEDIS', fechaInicio: '2026-10-20', fechaFin: '2026-10-20', creadoPorId: 5, advertencias: null });

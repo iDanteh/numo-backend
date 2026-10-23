@@ -120,6 +120,31 @@ describe('PENDIENTE GENERAR FACTURA', () => {
     expect(erp.obtenerCuentaTicket.mock.calls.map(c => c[0].folio)).not.toContain('260901859');
   });
 
+  test('incluirIdentificados: también los de fecha anterior identificados en el rango (día MX), con identificadoEl', async () => {
+    BankMovement.find.mockReturnValue({ lean: async () => [
+      { folio: '041983', banco: 'BBVA', fecha: '2026-08-20T00:00:00Z', concepto: 'DEPOSITO EN EFECTIVO', deposito: 584, erpLinks: [rem('260804886')],
+        primeraIdentificacionAt: '2026-08-25T18:00:00Z',
+        identificadoPor: [{ fechaId: '2026-10-23T16:10:00Z', erpId: 'x' }],
+        historialVinculacion: [{ accion: 'vinculado', at: '2026-10-23T16:10:00Z' }, { accion: 'desvinculado', at: '2026-10-23T17:00:00Z' }] },
+    ] });
+    const { depositos } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-23', incluirIdentificados: true });
+    expect(depositos.map(d => [d.idNumo, d.identificadoEl.toISOString()])).toEqual([['041983', '2026-10-23T16:10:00.000Z']]);
+    const filtro = BankMovement.find.mock.calls[0][0];
+    expect(filtro.fecha).toBeUndefined();
+    const [porFecha, primera, porUsuario, historial] = filtro.$or;
+    expect(porFecha.fecha.$gte.toISOString()).toBe('2026-10-23T00:00:00.000Z');
+    expect([primera.primeraIdentificacionAt.$gte.toISOString(), primera.primeraIdentificacionAt.$lte.toISOString()])
+      .toEqual(['2026-10-23T06:00:00.000Z', '2026-10-24T05:59:59.999Z']);
+    expect(porUsuario['identificadoPor.fechaId']).toBe(primera.primeraIdentificacionAt);
+    expect(historial.historialVinculacion.$elemMatch.accion).toBe('vinculado');
+  });
+
+  test('sin incluirIdentificados (póliza) no agrega identificadoEl ni busca por identificación', async () => {
+    const { depositos } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });
+    expect(depositos.every(d => !('identificadoEl' in d))).toBe(true);
+    expect(BankMovement.find.mock.calls[0][0].$or).toBeUndefined();
+  });
+
   test('si Kore no responde una remisión, su depósito no sale y se cuenta', async () => {
     erp.obtenerCuentaTicket.mockImplementation(async ({ folio }) => (folio === '260804886' ? null : cuentasKore[folio] ?? null));
     const { depositos, remisionesSinRespuesta } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });

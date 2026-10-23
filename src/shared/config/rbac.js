@@ -161,6 +161,12 @@ const PERMISSIONS = Object.freeze({
   // contabiliza, cancela, revierte y exporta. Exclusivo de admin (2026-10-15, pedido
   // explícito del usuario): sin asignar a ningún rol, admin lo tiene por el wildcard '*'.
   POLIZAS_AUDIT_READ:  'polizas:audit:read',
+
+  // Reporte "Por facturar" (Reportes, ver banks/domains/reportes-por-facturar) —
+  // permiso propio para asignar por rol (2026-10-23, pedido del usuario): solo
+  // quien lo tenga puede ver la vista, generar, descargar y eliminar. Sin rol
+  // asignado de inicio (admin lo tiene por '*'); se asigna desde Usuarios y Roles.
+  REPORTES_POR_FACTURAR: 'reportes:por-facturar',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

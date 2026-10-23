@@ -15,6 +15,12 @@
  * Separa los datos en las tablas que enseña la hoja (y la pantalla del
  * reporte "Por facturar").
  */
+// "IDENTIFICADO EL" (reporte "Por facturar", 2026-10-23): fecha y hora de
+// México como texto — un Date en ExcelJS saldría en UTC.
+const fechaHoraMx = d => (d ? new Date(d).toLocaleString('es-MX', {
+  timeZone: 'America/Mexico_City', day: 'numeric', month: 'numeric', year: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+}).replace(', ', ' ') : '');
+
 function tablasMostrador(datos) {
   const mostrador = datos?.movimientosMostrador ?? [];
   // Global y a nombre del cliente: solo depósitos de remisiones PPD "POR
@@ -40,7 +46,7 @@ function tablasMostrador(datos) {
  * Agrega la hoja al workbook (ExcelJS). Devuelve false si no hay nada que
  * enseñar (no se crea la hoja).
  */
-function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
+function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR', { columnaIdentificado = false } = {}) {
   // Hoja "MOSTRADOR" (2026-10-21, formato del PDF del usuario "MOSTRADOR 20
   // OCT 2026"): depósitos de Bancos de cada factura de mostrador que quedó
   // "Venta Sin Cobro" — informativo, NUNCA se contabiliza. Ver
@@ -71,6 +77,7 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
     { key: 'idNumo',      width: 11 },
     { key: 'estatus',     width: 15 },
     { key: 'factura',     width: 15 },
+    ...(columnaIdentificado ? [{ key: 'identificado', width: 16 }] : []),
   ];
   const relleno = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
   const encabezado = (row, argb) => row.eachCell(cell => {
@@ -87,7 +94,7 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
     wsMos.mergeCells(row.number, 1, row.number, columnas);
     encabezado(row, 'FF5B4A9E');
   };
-  const filaDeposito = (d, factura) => {
+  const filaDeposito = (d, factura, conIdentificado = false) => {
     const row = wsMos.addRow({
       fecha:       d.fecha ? new Date(d.fecha) : null,
       descripcion: d.descripcion,
@@ -99,6 +106,7 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
       idNumo:      d.idNumo,
       estatus:     d.estatus,
       ...(factura ? { factura } : {}),
+      ...(conIdentificado ? { identificado: fechaHoraMx(d.identificadoEl) } : {}),
     });
     row.alignment = { vertical: 'middle', wrapText: true };
     if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'd/m/yy';
@@ -161,10 +169,11 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
   }
   if (depositosPendientes.length) {
     // Mismas columnas que las otras tablas (2026-10-22, pedido del usuario);
-    // FACTURA vacía porque todavía no tienen.
-    seccion('PENDIENTE GENERAR FACTURA', 10);
-    encabezado(wsMos.addRow([...COLUMNAS, 'FACTURA']), 'FF8E7CC3');
-    for (const d of depositosPendientes) filaDeposito(d, '');
+    // FACTURA vacía porque todavía no tienen. En el reporte "Por facturar"
+    // también IDENTIFICADO EL (2026-10-23).
+    seccion('PENDIENTE GENERAR FACTURA', columnaIdentificado ? 11 : 10);
+    encabezado(wsMos.addRow([...COLUMNAS, 'FACTURA', ...(columnaIdentificado ? ['IDENTIFICADO EL'] : [])]), 'FF8E7CC3');
+    for (const d of depositosPendientes) filaDeposito(d, '', columnaIdentificado);
     filaTotal([{ depositos: depositosPendientes, totalAplicado: _redondear2(depositosPendientes.reduce((s, d) => s + (Number(d.aplicado) || 0), 0)) }], null);
   }
 
@@ -227,6 +236,7 @@ function agregarHojaPendientesPago(workbook, depositos, nombreHoja = 'CON PENDIE
     { key: 'idNumo',      width: 11 },
     { key: 'estatus',     width: 15 },
     { key: 'saldo',       width: 15 },
+    { key: 'identificado', width: 16 },
   ];
   const estilo = (row, argb) => row.eachCell(cell => {
     cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -234,14 +244,14 @@ function agregarHojaPendientesPago(workbook, depositos, nombreHoja = 'CON PENDIE
     cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
   });
   const titulo = ws.addRow(['CON PENDIENTES DE PAGO — POR FACTURAR, TODAVÍA DEBEN SALDO']);
-  ws.mergeCells(titulo.number, 1, titulo.number, 10);
+  ws.mergeCells(titulo.number, 1, titulo.number, 11);
   estilo(titulo, 'FF5B4A9E');
-  estilo(ws.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'APLICADO A FACTURA', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO', 'ESTATUS', 'SALDO PENDIENTE']), 'FF8E7CC3');
+  estilo(ws.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'APLICADO A FACTURA', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO', 'ESTATUS', 'SALDO PENDIENTE', 'IDENTIFICADO EL']), 'FF8E7CC3');
   for (const d of depositos) {
     const row = ws.addRow({
       fecha: d.fecha ? new Date(d.fecha) : null, descripcion: d.descripcion, importe: d.importe, aplicado: d.aplicado,
       banco: d.banco, rem: (d.remisiones ?? []).join('\n'), cliente: d.cliente || 'CLIENTE NO IDENTIFICADO',
-      idNumo: d.idNumo, estatus: d.estatus, saldo: d.saldo,
+      idNumo: d.idNumo, estatus: d.estatus, saldo: d.saldo, identificado: fechaHoraMx(d.identificadoEl),
     });
     row.alignment = { vertical: 'middle', wrapText: true };
     if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'd/m/yy';

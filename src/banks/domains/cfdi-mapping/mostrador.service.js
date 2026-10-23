@@ -145,8 +145,12 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
  * @param {string[]} p.series    series de la sucursal (A0, …)
  * @param {string}   p.fechaInicio  YYYY-MM-DD — día de la póliza
  * @param {string}   [p.fechaFin]   YYYY-MM-DD (default = fechaInicio)
- * @returns {Promise<{ depositos: object[], remisionesSinRespuesta: number }>}
- *   depositos: [{ fecha, descripcion, importe, banco, remisiones, cliente, idNumo }]
+ * @returns {Promise<{ depositos: object[], depositosConSaldo: object[], remisionesSinRespuesta: number }>}
+ *   depositos: [{ fecha, descripcion, importe, aplicado, banco, remisiones, cliente, idNumo, estatus }]
+ *   depositosConSaldo: mismos campos + `saldo` — PPD, "POR FACTURAR" y sin
+ *   factura pero alguna remisión todavía debe algo (pestaña "CON PENDIENTES
+ *   DE PAGO" del reporte, 2026-10-23; caso real 053960 / A0-261002980, saldo
+ *   $47.79 = retención del 4% sin registrar en Kore).
  */
 const LOTE_DESGLOSES = 50;
 // Kore limita /cuentas-pendientes (429 con 8 a la vez en prod, 2026-10-22).
@@ -154,7 +158,7 @@ const CONCURRENCIA_CUENTAS = 2;
 
 async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin }) {
   const seriesSet = new Set((series ?? []).map(s => String(s).trim().toUpperCase()).filter(Boolean));
-  if (!rfc || !seriesSet.size || !fechaInicio) return { depositos: [], remisionesSinRespuesta: 0 };
+  if (!rfc || !seriesSet.size || !fechaInicio) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
 
   // `fecha` de Bancos es el día del estado de cuenta sin hora (medianoche
   // "ingenua" UTC) — mismo rango que cargarFichasCobranza.
@@ -167,7 +171,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
     fecha:    { $gte: desde, $lte: hasta },
     erpLinks: { $elemMatch: { serie: { $in: [...seriesSet] }, $or: [{ folioFiscal: null }, { folioFiscal: '' }] } },
   }).lean();
-  if (!bancos.length) return { depositos: [], remisionesSinRespuesta: 0 };
+  if (!bancos.length) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
 
   const clave = l => `${String(l.serie).trim().toUpperCase()}|${String(l.folioExterno).trim()}`;
   const remisiones = [...new Map(bancos.flatMap(b => (b.erpLinks ?? []).filter(linkSinFactura))
@@ -194,21 +198,27 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
     }));
   }
 
-  const cumple = l => {
+  // PPD, "POR FACTURAR" y sin factura (sin importar el saldo).
+  const porFacturar = l => {
     const k = clave(l);
     const d = desglose.get(k);
     const c = cuentaKore.get(k);
     return !!(d && !d.serieFactura && c && !c.factura
       && c.tipoPago === 'PPD'
-      && c.nombreTipoMovimiento === ESTATUS_POR_FACTURAR
-      && Math.abs(Number(c.saldoActual)) < 0.005);
+      && c.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
   };
+  const saldoDe = l => Number(cuentaKore.get(clave(l))?.saldoActual) || 0;
+  const pagada = l => Math.abs(saldoDe(l)) < 0.005;
 
   const depositos = [];
+  const depositosConSaldo = [];
   for (const b of bancos) {
     const links = (b.erpLinks ?? []).filter(linkSinFactura);
-    if (!links.length || !links.every(cumple)) continue;
-    depositos.push({
+    if (!links.length || !links.every(porFacturar)) continue;
+    // Todas pagadas → PENDIENTE GENERAR FACTURA; si alguna debe algo → CON PENDIENTES DE PAGO.
+    const todasPagadas = links.every(pagada);
+    const remisionesUnicas = [...new Map(links.map(l => [clave(l), l])).values()];
+    (todasPagadas ? depositos : depositosConSaldo).push({
       fecha:       b.fecha ?? null,
       descripcion: b.concepto ?? '',
       importe:     _r2(b.deposito),
@@ -218,10 +228,13 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       cliente:     [...new Set(links.map(l => cuentaKore.get(clave(l))?.nombre).filter(Boolean))].join(' / '),
       idNumo:      b.folio ?? '',
       estatus:     ESTATUS_POR_FACTURAR,
+      ...(todasPagadas ? {} : { saldo: _r2(remisionesUnicas.reduce((s, l) => s + saldoDe(l), 0)) }),
     });
   }
-  depositos.sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
-  return { depositos, remisionesSinRespuesta };
+  const porFecha = (a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo));
+  depositos.sort(porFecha);
+  depositosConSaldo.sort(porFecha);
+  return { depositos, depositosConSaldo, remisionesSinRespuesta };
 }
 
 /**

@@ -55,6 +55,7 @@ CierreMesHistorico.belongsTo(User, { foreignKey: 'revertidoPorId', as: 'revertid
 User.hasMany(CierreMesHistorico,   { foreignKey: 'revertidoPorId', as: 'cierresMesRevertidos' });
 ReportePorFacturar.belongsTo(User, { foreignKey: 'creadoPorId', as: 'creadoPor' });
 ReportePorFacturar.belongsTo(User, { foreignKey: 'eliminadoPorId', as: 'eliminadoPor' });
+ReportePorFacturar.belongsTo(User, { foreignKey: 'actualizadoPorId', as: 'actualizadoPor' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -164,6 +165,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS eliminado_por_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
       ADD COLUMN IF NOT EXISTS eliminado_en     TIMESTAMPTZ
   `).catch(e => console.warn('[syncModels] ADD COLUMN eliminado (reportes_por_facturar):', e.message));
+  // Botón "Actualizar" (2026-10-23) — quién y cuándo se recalculó.
+  await ReportePorFacturar.sequelize.query(`
+    ALTER TABLE reportes_por_facturar
+      ADD COLUMN IF NOT EXISTS actualizado_por_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS actualizado_en     TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN actualizado (reportes_por_facturar):', e.message));
 
   // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
   // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla

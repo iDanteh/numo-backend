@@ -114,7 +114,8 @@ function _resumen(datos) {
   };
 }
 
-async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
+// Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
+async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   fechaFin = fechaFin || fechaInicio;
   if (!rfc) throw new BadRequestError('RFC requerido');
   if (!FECHA_RE.test(fechaInicio ?? '') || !FECHA_RE.test(fechaFin ?? '')) throw new BadRequestError('Fechas inválidas (formato YYYY-MM-DD)');
@@ -146,15 +147,39 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
     depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
     depositosEfectivoSinAsociar,
   };
+  return { sucursal, fechaFin, datos, resumen: _resumen(datos), advertencias: advertencias.length ? advertencias : null };
+}
+
+const _userId = user => (user?.dbId ? parseInt(user.dbId, 10) : null);
+
+async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
+  const calc = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin });
   const reporte = await ReportePorFacturar.create({
-    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin,
-    datos, resumen: _resumen(datos), advertencias: advertencias.length ? advertencias : null,
-    creadoPorId: user?.dbId ? parseInt(user.dbId, 10) : null,
+    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, fechaInicio, ...calc,
+    creadoPorId: _userId(user),
   });
   return obtener(reporte.id);
 }
 
-const _incluirCreador = [{ model: User, as: 'creadoPor', attributes: ['nombre', 'email'] }];
+/**
+ * Actualizar (2026-10-23, pedido del usuario): vuelve a consultar Bancos y
+ * Kore con la misma sucursal y fechas y reemplaza los datos del MISMO reporte
+ * (no crea otro); guarda quién y cuándo lo actualizó.
+ */
+async function actualizar(id, user) {
+  const r = await ReportePorFacturar.findByPk(id);
+  if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
+  const { sucursal, datos, resumen, advertencias } = await _calcular({
+    rfc: r.rfc, centroCostoId: r.centroCostoId, fechaInicio: r.fechaInicio, fechaFin: r.fechaFin,
+  });
+  await r.update({ sucursal, datos, resumen, advertencias, actualizadoPorId: _userId(user), actualizadoEn: new Date() });
+  return obtener(r.id);
+}
+
+const _incluirCreador = [
+  { model: User, as: 'creadoPor', attributes: ['nombre', 'email'] },
+  { model: User, as: 'actualizadoPor', attributes: ['nombre', 'email'] },
+];
 
 // Historial paginado, más recientes primero (5 por página en la pantalla).
 async function listar({ rfc, page = 1, limit = 5 } = {}) {
@@ -189,7 +214,7 @@ async function obtener(id) {
 async function eliminar(id, user) {
   const r = await ReportePorFacturar.findByPk(id);
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
-  await r.update({ eliminadoEn: new Date(), eliminadoPorId: user?.dbId ? parseInt(user.dbId, 10) : null });
+  await r.update({ eliminadoEn: new Date(), eliminadoPorId: _userId(user) });
   return { ok: true, id: r.id };
 }
 
@@ -206,4 +231,4 @@ async function excel(id) {
   return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { generar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango };
+module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango };

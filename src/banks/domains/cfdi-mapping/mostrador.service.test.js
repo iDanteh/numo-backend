@@ -104,8 +104,10 @@ describe('PENDIENTE GENERAR FACTURA', () => {
   });
 
   test('solo depósitos cuyas remisiones son PPD, saldo 0, "POR FACTURAR" y sin factura', async () => {
-    const { depositos, remisionesSinRespuesta } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });
+    const { depositos, depositosConSaldo, remisionesSinRespuesta } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-19', fechaFin: '2026-10-21' });
     expect(remisionesSinRespuesta).toBe(0);
+    // 053960: POR FACTURAR pero debe $47.79 → CON PENDIENTES DE PAGO, con su saldo.
+    expect(depositosConSaldo.map(d => [d.idNumo, d.saldo, d.remisiones])).toEqual([['053960', 47.79, ['A0-261002980']]]);
     expect(depositos).toEqual([
       { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, aplicado: 1, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487', estatus: 'POR FACTURAR' },
       { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, aplicado: 1, banco: 'BBVA', remisiones: ['A0-260804886'], cliente: 'MISAEL ABDIEL JIMENEZ SORIA', idNumo: '053966', estatus: 'POR FACTURAR' },
@@ -126,8 +128,8 @@ describe('PENDIENTE GENERAR FACTURA', () => {
   });
 
   test('sin series o sin fecha no consulta nada', async () => {
-    expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: [], fechaInicio: '2026-10-21' })).toEqual({ depositos: [], remisionesSinRespuesta: 0 });
-    expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'] })).toEqual({ depositos: [], remisionesSinRespuesta: 0 });
+    expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: [], fechaInicio: '2026-10-21' })).toEqual({ depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 });
+    expect(await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'] })).toEqual({ depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 });
     expect(BankMovement.find).not.toHaveBeenCalled();
   });
 });

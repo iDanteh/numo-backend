@@ -144,10 +144,11 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR') {
     filaTotal(facturas, etiquetaTotalFactura);
   };
 
-  if (facturasGlobales.length) {
-    // Cada factura con su fecha (2026-10-22, pedido del usuario).
-    const conFecha = f => (f.fechaFactura ? `${folioFactura(f)} (${fechaCorta(f.fechaFactura)})` : folioFactura(f));
-    tablaJunta(`EN FACTURA GLOBAL — ${facturasGlobales.map(conFecha).join(', ')}`, facturasGlobales, 'Total facturas');
+  // Una tabla por factura global, con su fecha en el encabezado y su total
+  // (2026-10-23, pedido del usuario — antes todas iban juntas en una sola).
+  const conFecha = f => (f.fechaFactura ? `${folioFactura(f)} (${fechaCorta(f.fechaFactura)})` : folioFactura(f));
+  for (const f of facturasGlobales) {
+    tablaJunta(`EN FACTURA GLOBAL — ${conFecha(f)}`, [f], 'Total factura');
   }
   if (ppdFacturadoCliente.length) {
     // Solo algunos depósitos de cada factura: el total es el de lo listado,

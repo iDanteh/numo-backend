@@ -15,6 +15,8 @@
  *     un poco respecto a la póliza (allá decide el generador).
  *   • PENDIENTE GENERAR FACTURA: depósitos del rango con remisiones PPD,
  *     saldo 0, "POR FACTURAR" y sin factura (detectarDepositosPendientesFactura).
+ *     Incluye los de fecha anterior identificados dentro del rango (columna
+ *     IDENTIFICADO EL, 2026-10-23); lo mismo CON PENDIENTES DE PAGO.
  */
 
 const ExcelJS = require('exceljs');
@@ -131,7 +133,8 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
   const advertencias = [];
   const facturas = await _facturasDelRango({ rfc, series, fechaInicio, fechaFin });
   const movimientosMostrador = await _movimientosMostradorSinPoliza({ rfc, facturas });
-  const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin });
+  // También los de fecha anterior identificados dentro del rango (2026-10-23).
+  const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true });
   if (pendientes.remisionesSinRespuesta) {
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
   }
@@ -193,7 +196,7 @@ async function eliminar(id, user) {
 async function excel(id) {
   const r = await obtener(id);
   const workbook = new ExcelJS.Workbook();
-  if (!agregarHojaMostrador(workbook, r.datos, 'POR FACTURAR')) {
+  if (!agregarHojaMostrador(workbook, r.datos, 'POR FACTURAR', { columnaIdentificado: true })) {
     workbook.addWorksheet('POR FACTURAR').addRow(['Sin facturas de mostrador ni depósitos pendientes de facturar en el rango.']);
   }
   agregarHojaPendientesPago(workbook, r.datos?.depositosPendientesPago);

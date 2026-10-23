@@ -74,6 +74,17 @@ const ReportePorFacturar = sequelize.define('ReportePorFacturar', {
     type:      DataTypes.DATE,
     allowNull: true,
   },
+  /** Botón "Actualizar" (2026-10-23): último recálculo del mismo reporte. */
+  actualizadoPorId: {
+    type:       DataTypes.INTEGER,
+    allowNull:  true,
+    references: { model: 'users', key: 'id' },
+    onDelete:   'SET NULL',
+  },
+  actualizadoEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
 }, {
   tableName:   'reportes_por_facturar',
   underscored: true,

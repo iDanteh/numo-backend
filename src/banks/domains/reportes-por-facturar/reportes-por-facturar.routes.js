@@ -29,6 +29,11 @@ router.get('/:id', authenticate, permit(PERM), asyncHandler(async (req, res) => 
   res.json(await service.obtener(req.params.id));
 }));
 
+// POST /api/reportes-por-facturar/:id/actualizar — recalcula el mismo reporte (misma sucursal y fechas)
+router.post('/:id/actualizar', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  res.json(await service.actualizar(req.params.id, req.user));
+}));
+
 // DELETE /api/reportes-por-facturar/:id — borrado lógico (guarda quién lo eliminó)
 router.delete('/:id', authenticate, permit(PERM), asyncHandler(async (req, res) => {
   res.json(await service.eliminar(req.params.id, req.user));

@@ -102,3 +102,25 @@ test('eliminar: borrado lógico con quién lo eliminó; ya no se puede abrir', a
   await expect(service.obtener(7)).rejects.toThrow();
   await expect(service.eliminar(7, { dbId: '5' })).rejects.toThrow();
 });
+
+test('actualizar: recalcula con la misma sucursal y fechas y reemplaza los datos del mismo reporte', async () => {
+  const update = jest.fn();
+  ReportePorFacturar.findByPk.mockReset();
+  ReportePorFacturar.findByPk
+    .mockResolvedValueOnce({ id: 7, rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20', fechaFin: '2026-10-20', eliminadoEn: null, update })
+    .mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: update.mock.calls[0][0].datos }) }));
+  const r = await service.actualizar(7, { dbId: '9' });
+  expect(ReportePorFacturar.create).not.toHaveBeenCalled();
+  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true });
+  const cambios = update.mock.calls[0][0];
+  expect(cambios).toMatchObject({ sucursal: 'CEDIS', actualizadoPorId: 9, advertencias: null });
+  expect(cambios.actualizadoEn).toBeInstanceOf(Date);
+  expect(cambios.datos.depositosPendientesFactura.map(d => d.idNumo)).toEqual(['053966']);
+  expect(r.id).toBe(7);
+});
+
+test('actualizar un reporte eliminado → 404', async () => {
+  ReportePorFacturar.findByPk.mockReset();
+  ReportePorFacturar.findByPk.mockResolvedValue({ id: 7, eliminadoEn: new Date() });
+  await expect(service.actualizar(7, {})).rejects.toThrow();
+});

@@ -24,7 +24,7 @@ const BankMovement = require('../banks/BankMovement.model');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
 const { _uuidsPorFechaEfectiva } = require('../cfdi-mapping/cfdi-poliza-generator.service');
 const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar } = require('../cfdi-mapping/mostrador.service');
-const { agregarHojaMostrador, agregarHojaDepositosEfectivo, tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
+const { agregarHojaMostrador, agregarHojaDepositosEfectivo, agregarHojaPendientesPago, tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -108,6 +108,7 @@ function _resumen(datos) {
     ppdFacturadoCliente: { facturas: t.ppdFacturadoCliente.length, depositos: deps(t.ppdFacturadoCliente).length, importe: suma(deps(t.ppdFacturadoCliente)) },
     depositosPendientes: { depositos: t.depositosPendientes.length, importe: suma(t.depositosPendientes) },
     depositosEfectivo:   { depositos: (datos.depositosEfectivoSinAsociar ?? []).length, importe: suma(datos.depositosEfectivoSinAsociar ?? []) },
+    pendientesPago:      { depositos: (datos.depositosPendientesPago ?? []).length, importe: suma(datos.depositosPendientesPago ?? []) },
   };
 }
 
@@ -136,7 +137,12 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
   }
 
   const depositosEfectivoSinAsociar = await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin });
-  const datos = { movimientosMostrador, depositosPendientesFactura: pendientes.depositos, depositosEfectivoSinAsociar };
+  const datos = {
+    movimientosMostrador,
+    depositosPendientesFactura: pendientes.depositos,
+    depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
+    depositosEfectivoSinAsociar,
+  };
   const reporte = await ReportePorFacturar.create({
     rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin,
     datos, resumen: _resumen(datos), advertencias: advertencias.length ? advertencias : null,
@@ -166,7 +172,14 @@ async function obtener(id) {
   const r = await ReportePorFacturar.findByPk(id, { include: _incluirCreador });
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
   const json = r.toJSON();
-  return { ...json, tablas: { ...tablasMostrador(json.datos), depositosEfectivo: json.datos?.depositosEfectivoSinAsociar ?? [] } };
+  return {
+    ...json,
+    tablas: {
+      ...tablasMostrador(json.datos),
+      pendientesPago:    json.datos?.depositosPendientesPago ?? [],
+      depositosEfectivo: json.datos?.depositosEfectivoSinAsociar ?? [],
+    },
+  };
 }
 
 /** Borrado lógico: deja de verse en el historial, guarda quién y cuándo. */
@@ -183,6 +196,7 @@ async function excel(id) {
   if (!agregarHojaMostrador(workbook, r.datos, 'POR FACTURAR')) {
     workbook.addWorksheet('POR FACTURAR').addRow(['Sin facturas de mostrador ni depósitos pendientes de facturar en el rango.']);
   }
+  agregarHojaPendientesPago(workbook, r.datos?.depositosPendientesPago);
   agregarHojaDepositosEfectivo(workbook, r.datos?.depositosEfectivoSinAsociar);
   const rango = r.fechaInicio === r.fechaFin ? r.fechaInicio : `${r.fechaInicio}_${r.fechaFin}`;
   const sucursal = String(r.sucursal ?? 'Todas').replace(/[^\w-]+/g, '_');

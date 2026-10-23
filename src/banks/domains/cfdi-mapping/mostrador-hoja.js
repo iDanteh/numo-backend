@@ -207,4 +207,51 @@ function agregarHojaDepositosEfectivo(workbook, depositos, nombreHoja = 'DEPÓSI
   return true;
 }
 
-module.exports = { agregarHojaMostrador, agregarHojaDepositosEfectivo, tablasMostrador };
+/**
+ * Hoja "CON PENDIENTES DE PAGO" (reporte "Por facturar", 2026-10-23):
+ * depósitos de remisiones PPD "POR FACTURAR" sin factura que todavía deben
+ * algo — mismas columnas que PENDIENTE GENERAR FACTURA + SALDO PENDIENTE.
+ */
+function agregarHojaPendientesPago(workbook, depositos, nombreHoja = 'CON PENDIENTES DE PAGO') {
+  if (!depositos?.length) return false;
+  const ws = workbook.addWorksheet(nombreHoja);
+  ws.columns = [
+    { key: 'fecha',       width: 11 },
+    { key: 'descripcion', width: 44 },
+    { key: 'importe',     width: 15 },
+    { key: 'aplicado',    width: 15 },
+    { key: 'banco',       width: 12 },
+    { key: 'rem',         width: 16 },
+    { key: 'cliente',     width: 30 },
+    { key: 'idNumo',      width: 11 },
+    { key: 'estatus',     width: 15 },
+    { key: 'saldo',       width: 15 },
+  ];
+  const estilo = (row, argb) => row.eachCell(cell => {
+    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  });
+  const titulo = ws.addRow(['CON PENDIENTES DE PAGO — POR FACTURAR, TODAVÍA DEBEN SALDO']);
+  ws.mergeCells(titulo.number, 1, titulo.number, 10);
+  estilo(titulo, 'FF5B4A9E');
+  estilo(ws.addRow(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'APLICADO A FACTURA', 'BANCO', 'REM', 'CLIENTE', 'ID NUMO', 'ESTATUS', 'SALDO PENDIENTE']), 'FF8E7CC3');
+  for (const d of depositos) {
+    const row = ws.addRow({
+      fecha: d.fecha ? new Date(d.fecha) : null, descripcion: d.descripcion, importe: d.importe, aplicado: d.aplicado,
+      banco: d.banco, rem: (d.remisiones ?? []).join('\n'), cliente: d.cliente || 'CLIENTE NO IDENTIFICADO',
+      idNumo: d.idNumo, estatus: d.estatus, saldo: d.saldo,
+    });
+    row.alignment = { vertical: 'middle', wrapText: true };
+    if (row.getCell('fecha').value) row.getCell('fecha').numFmt = 'd/m/yy';
+    for (const k of ['importe', 'aplicado', 'saldo']) row.getCell(k).numFmt = '$#,##0.00';
+  }
+  const suma = k => Math.round(depositos.reduce((s, d) => s + (Number(d[k]) || 0), 0) * 100) / 100;
+  const total = ws.addRow({ descripcion: 'TOTAL', importe: suma('importe'), aplicado: suma('aplicado'), saldo: suma('saldo') });
+  total.font = { bold: true };
+  total.getCell('descripcion').alignment = { horizontal: 'right' };
+  for (const k of ['importe', 'aplicado', 'saldo']) total.getCell(k).numFmt = '$#,##0.00';
+  return true;
+}
+
+module.exports = { agregarHojaMostrador, agregarHojaDepositosEfectivo, agregarHojaPendientesPago, tablasMostrador };

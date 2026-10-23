@@ -37,7 +37,7 @@ beforeEach(() => {
     { fecha: new Date('2026-10-20T00:00:00Z'), erpLinks: [{ folioFiscal: MISMO_DIA.toLowerCase() }] },
   ]));
   mostrador.detectarMovimientosMostrador.mockResolvedValue([{ uuid: GLOBAL, esGlobal: true, depositos: [{ importe: 5000, ppdPorFacturar: true }, { importe: 900, ppdPorFacturar: false }] }]);
-  mostrador.detectarDepositosPendientesFactura.mockResolvedValue({ depositos: [{ importe: 146077.63, idNumo: '053966' }], remisionesSinRespuesta: 0 });
+  mostrador.detectarDepositosPendientesFactura.mockResolvedValue({ depositos: [{ importe: 146077.63, idNumo: '053966' }], depositosConSaldo: [{ importe: 1147.04, saldo: 47.79, idNumo: '053960' }], remisionesSinRespuesta: 0 });
   mostrador.detectarDepositosEfectivoSinAsociar.mockResolvedValue([{ importe: 1618.95, idNumo: '051499' }]);
   ReportePorFacturar.create.mockResolvedValue({ id: 7 });
   ReportePorFacturar.findByPk.mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: ReportePorFacturar.create.mock.calls[0][0].datos }) }));
@@ -58,7 +58,9 @@ test('solo facturas de la sucursal con algún depósito de días anteriores; gua
     ppdFacturadoCliente: { facturas: 0, depositos: 0, importe: 0 },
     depositosPendientes: { depositos: 1, importe: 146077.63 },
     depositosEfectivo:   { depositos: 1, importe: 1618.95 },
+    pendientesPago:      { depositos: 1, importe: 1147.04 },
   });
+  expect(r.tablas.pendientesPago).toEqual([{ importe: 1147.04, saldo: 47.79, idNumo: '053960' }]);
   expect(mostrador.detectarDepositosEfectivoSinAsociar).toHaveBeenCalledWith({ fechaInicio: '2026-10-20', fechaFin: '2026-10-20' });
   expect(r.tablas.depositosEfectivo).toEqual([{ importe: 1618.95, idNumo: '051499' }]);
   expect(r.tablas.facturasGlobales).toHaveLength(1);

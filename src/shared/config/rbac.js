@@ -225,6 +225,14 @@ const PERMISSIONS = Object.freeze({
   // sensibles (teléfonos/saldos de TODA la cartera legada) sin acotar por rol. No se
   // asigna a contabilidad/cobranza/tienda.
   LOYALTY_IMPORTAR:        'loyalty:importar',
+
+  // Kiosco de facturación (2026-10-26) — muestra el espacio "Kiosco de facturación" en
+  // "Espacios de NUMO" y permite pedir el pase con el que se entra a su panel de
+  // administración (ver shared/services/kiosco-pase.service.js). Solo abre la puerta:
+  // lo que la persona puede hacer adentro lo decide el rol que tenga en el kiosco
+  // (entra la primera vez como AUDITOR, solo ver). Sin rol asignado de inicio (admin lo
+  // tiene por '*'); se asigna por persona o por rol desde Usuarios y Roles.
+  KIOSCO_ADMIN:            'kiosco:admin',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

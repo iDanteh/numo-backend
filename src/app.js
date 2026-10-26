@@ -33,6 +33,7 @@ const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mappi
 const notificacionRoutes      = require('./banks/domains/notificaciones/notificacion.routes');
 const configRoutes            = require('./shared/routes/config.routes');
 const systemMonitorRoutes     = require('./system-monitor/system-monitor.routes');
+const espaciosRoutes          = require('./shared/routes/espacios.routes');
 
 // Domain routers — Loyalty module (Sistema de Lealtad, PR4/8 sistema-lealtad)
 const loyaltyPublicRoutes     = require('./loyalty/loyalty-public.routes');
@@ -149,6 +150,7 @@ app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
 app.use('/api/notificaciones',       notificacionRoutes);
 app.use('/api/config',               configRoutes);
 app.use('/api/system-monitor',       systemMonitorRoutes);
+app.use('/api/espacios',             espaciosRoutes);
 
 // Visor module
 app.use('/api/auth',              authRoutes);

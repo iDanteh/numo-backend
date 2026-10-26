@@ -122,56 +122,58 @@ describe('listarReasons', () => {
 });
 
 describe('crearReason', () => {
-  test('signoPermitido inválido → 400, no inserta', async () => {
+  test('nombre vacío → 400, no inserta', async () => {
     await expect(
-      configService.crearReason({ clave: 'x', nombre: 'X', signoPermitido: 'MAS' }),
+      configService.crearReason({ clave: 'x', nombre: '   ' }),
     ).rejects.toMatchObject({ statusCode: 400 });
 
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('signoPermitido válido → crea con activo=true, porcentaje:null (sin % en el payload)', async () => {
+  test('sin puntosFijos → crea en modo manual (puntosFijos: null)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 1 });
 
-    await configService.crearReason({ clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO' });
+    await configService.crearReason({ clave: 'correccion', nombre: 'Corrección' });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO', activo: true, porcentaje: null,
+      clave: 'correccion', nombre: 'Corrección', activo: true, puntosFijos: null,
     });
   });
 
-  test('porcentaje + signoPermitido AMBOS → 400, no inserta (el signo del % automático no puede ser ambiguo)', async () => {
-    await expect(
-      configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'AMBOS', porcentaje: '5' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-
-    expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
-  });
-
   test.each([
-    ['0'], ['-1'], ['100.01'], ['101'], ['3.456'], ['abc'],
-  ])('porcentaje con formato/rango inválido (%s) → 400, no inserta', async (valor) => {
+    [0], ['abc'], [5.5],
+  ])('puntosFijos inválido (%s) → 400, no inserta', async (valor) => {
     await expect(
-      configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', porcentaje: valor }),
+      configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: valor }),
     ).rejects.toMatchObject({ statusCode: 400 });
 
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('porcentaje válido + signo POSITIVO → crea con el % guardado', async () => {
+  test('puntosFijos positivo → crea el motivo con ese valor (ej. "Bono" = 100)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 5 });
 
-    await configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', porcentaje: '7.5' });
+    await configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: 100 });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', activo: true, porcentaje: '7.5',
+      clave: 'bono', nombre: 'Bono', activo: true, puntosFijos: 100,
+    });
+  });
+
+  test('puntosFijos negativo → crea el motivo con ese valor (ej. "Comisión por mora" = -200)', async () => {
+    LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 6 });
+
+    await configService.crearReason({ clave: 'comision_mora', nombre: 'Comisión por mora', puntosFijos: -200 });
+
+    expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
+      clave: 'comision_mora', nombre: 'Comisión por mora', activo: true, puntosFijos: -200,
     });
   });
 });
 
 describe('editarReason', () => {
   function makeReason(overrides = {}) {
-    const reason = { id: 1, clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO', activo: true, ...overrides };
+    const reason = { id: 1, clave: 'bono', nombre: 'Bono', activo: true, puntosFijos: null, ...overrides };
     reason.update = jest.fn(async (changes) => { Object.assign(reason, changes); return reason; });
     return reason;
   }
@@ -193,53 +195,33 @@ describe('editarReason', () => {
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('signoPermitido inválido en edición → 400, no actualiza', async () => {
+  test('puntosFijos inválido en edición → 400, no actualiza', async () => {
     const reason = makeReason();
     LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
 
     await expect(
-      configService.editarReason(1, { signoPermitido: 'RARO' }),
+      configService.editarReason(1, { puntosFijos: 0 }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(reason.update).not.toHaveBeenCalled();
   });
 
-  test('porcentaje con signoPermitido AMBOS ya guardado (no viene en el payload) → 400', async () => {
-    const reason = makeReason({ signoPermitido: 'AMBOS' });
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
-
-    await expect(
-      configService.editarReason(1, { porcentaje: '5' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(reason.update).not.toHaveBeenCalled();
-  });
-
-  test('porcentaje válido junto con signoPermitido POSITIVO en el mismo payload → actualiza ambos', async () => {
-    const reason = makeReason({ signoPermitido: 'AMBOS' });
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
-
-    const resultado = await configService.editarReason(1, { porcentaje: '5', signoPermitido: 'POSITIVO' });
-
-    expect(reason.update).toHaveBeenCalledWith({ signoPermitido: 'POSITIVO', porcentaje: '5' });
-    expect(resultado.porcentaje).toBe('5');
-  });
-
-  test('porcentaje: null explícito quita el % (vuelve el motivo manual)', async () => {
-    const reason = makeReason({ porcentaje: '5.00' });
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
-
-    await configService.editarReason(1, { porcentaje: null });
-
-    expect(reason.update).toHaveBeenCalledWith({ porcentaje: null });
-  });
-
-  test('porcentaje inválido en edición → 400, no actualiza', async () => {
+  test('puntosFijos válido → actualiza el valor fijo', async () => {
     const reason = makeReason();
     LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
 
-    await expect(
-      configService.editarReason(1, { porcentaje: '200' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(reason.update).not.toHaveBeenCalled();
+    const resultado = await configService.editarReason(1, { puntosFijos: 100 });
+
+    expect(reason.update).toHaveBeenCalledWith({ puntosFijos: 100 });
+    expect(resultado.puntosFijos).toBe(100);
+  });
+
+  test('puntosFijos: null explícito vuelve el motivo manual', async () => {
+    const reason = makeReason({ puntosFijos: 100 });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await configService.editarReason(1, { puntosFijos: null });
+
+    expect(reason.update).toHaveBeenCalledWith({ puntosFijos: null });
   });
 });
 

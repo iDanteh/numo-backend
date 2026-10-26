@@ -33,6 +33,7 @@ const { BadRequestError } = require('../../../shared/errors/AppError');
 const { parseClientesCsv, parsePuntosPdf, parseCorreccionesXlsx } = require('./loyalty-import.parser');
 const { construirConcentrado } = require('./loyalty-import.service');
 const applyService = require('./loyalty-import-apply.service');
+const { iniciarMatchKoreJob, obtenerEstadoMatchKoreJob } = require('../kore-match/loyalty-kore-match.service');
 
 const router = express.Router();
 
@@ -170,8 +171,8 @@ router.post('/correcciones', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR),
 
 // GET /api/loyalty/import/pendientes
 router.get('/pendientes', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
-  const { page, limit } = req.query;
-  res.json(await applyService.listarPendientes({ page, limit }));
+  const { page, limit, exportar } = req.query;
+  res.json(await applyService.listarPendientes({ page, limit, exportar: exportar === 'true' }));
 }));
 
 // POST /api/loyalty/import/pendientes/:id/completar
@@ -190,6 +191,39 @@ router.post('/pendientes/:id/rechazar', authenticate, permit(PERMISSIONS.LOYALTY
 // por medio, a diferencia de /aplicar), no hace falta job ni lotes.
 router.post('/pendientes/rechazar-todos', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
   res.json(await applyService.rechazarTodosPendientes(req.user));
+}));
+
+// POST /api/loyalty/import/kore-match
+//
+// Match de clientes entre el Sistema de Lealtad (LoyaltyCard.tarjetaLegada) y Kore (monedero
+// externo, GET /clientes/monedero) — ver loyalty-kore-match.service.js. Sin body. Idempotente:
+// solo UPDATEa koreClienteId/koreMonedero en las tarjetas que matchean, se puede volver a llamar
+// sin efectos destructivos (ej. tras cargar más clientes en Kore). Mismo permiso que el resto de
+// este router — el frontend lo va a consumir desde la vista "Importar clientes" en una tarea
+// futura.
+//
+// Arranca el match en BACKGROUND y responde 202+jobId de inmediato (mismo patrón que
+// POST /aplicar → iniciarAplicarJob, ver docstring de loyalty-kore-match.service.js): el cruce
+// completo pagina ~20 páginas remotas contra Kore (hasta 3 reintentos con backoff de hasta 60s
+// cada uno) y puede terminar actualizando hasta ~2,000 filas de Postgres — correrlo síncrono
+// adentro de la request revienta cualquier timeout. El progreso llega por socket
+// (`lealtad-import:kore-match:progress|done|error`); GET /kore-match-job/:jobId de abajo es el
+// mismo fallback de recuperación que GET /aplicar-job/:jobId.
+router.post('/kore-match', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
+  const { jobId } = iniciarMatchKoreJob(req.user);
+  res.status(202).json({ jobId });
+}));
+
+// GET /api/loyalty/import/kore-match-job/:jobId
+//
+// Fallback de recuperación tras un reload de página — mismo criterio que
+// GET /aplicar-job/:jobId. El socket (`lealtad-import:kore-match:progress|done|error`) es la vía
+// normal de enterarse del progreso; esto es solo para cuando alguien recarga a mitad del job y
+// pierde la suscripción en memoria. SÍ hay chequeo de dueño (userId).
+router.get('/kore-match-job/:jobId', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
+  const estado = obtenerEstadoMatchKoreJob(req.params.jobId, req.user._id);
+  if (!estado) return res.status(404).json({ error: 'Job de match con Kore no encontrado o expirado' });
+  res.json(estado);
 }));
 
 module.exports = router;

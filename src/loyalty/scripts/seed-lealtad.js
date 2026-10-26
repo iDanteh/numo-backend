@@ -27,11 +27,15 @@
 require('dotenv').config();
 
 const { ConfigSection, LoyaltyAdjustmentReason } = require('../../shared/models/postgres');
+const svc = require('../../shared/services/global-config.service');
 
+// puntosFijos: undefined → quedan en modo manual (rediseño 2026-10-23, reemplaza
+// signoPermitido) — ninguno de los 3 motivos originales tenía un valor fijo real
+// pedido por el negocio, así que no se inventa uno acá.
 const REASONS = [
-  { clave: 'bono',       nombre: 'Bono',       signoPermitido: 'POSITIVO' },
-  { clave: 'regalo',     nombre: 'Regalo',     signoPermitido: 'POSITIVO' },
-  { clave: 'correccion', nombre: 'Corrección', signoPermitido: 'AMBOS' },
+  { clave: 'bono',       nombre: 'Bono' },
+  { clave: 'regalo',     nombre: 'Regalo' },
+  { clave: 'correccion', nombre: 'Corrección' },
 ];
 
 async function _asegurarSeccionLealtad() {
@@ -44,11 +48,35 @@ async function _asegurarSeccionLealtad() {
         'PORCENTAJE_BRONCE — % de puntos acumulados en ventas de tarjetas nivel Bronce. Sin valor hasta que se configure acá.',
         'PORCENTAJE_PLATA — % de puntos acumulados en ventas de tarjetas nivel Plata. Sin valor hasta que se configure acá.',
         'PORCENTAJE_ORO — % de puntos acumulados en ventas de tarjetas nivel Oro. Sin valor hasta que se configure acá.',
+        'ESPECIALIDADES — Catálogo de referencia (lista editable desde la UI) de las especialidades válidas para altas futuras de clientes. Informativo: el valor que trae cada cliente del CSV de import se persiste tal cual, sin validar contra este catálogo.',
       ],
     },
   });
   console.log(`[seed-lealtad] Sección 'lealtad' ${creada ? 'creada' : 'ya existía'} (id=${section.id}). % de nivel NO sembrados a propósito (D11) — configurar desde Lealtad → Configuración.`);
   return section;
+}
+
+/**
+ * ESPECIALIDADES (2026-10-23, enriquecimiento del import de clientes.csv) — catálogo de
+ * referencia. `tipo: 'lista'` (igual que bancos.NOMBRE_TIPO_TRANSFERENCIA_PERMITIDOS /
+ * NOMBRE_CAJA_DESTINO_PERMITIDAS en seed-global-config-banks.js) para que Configuraciones
+ * Globales la muestre con el editor de chips (agregar/quitar valores), no como texto libre — sin
+ * esto el admin no tiene forma de dar de alta especialidades nuevas para clientes futuros.
+ * Mismo criterio "solo si no existe": un re-run de este seed nunca debe pisar un catálogo que el
+ * admin ya haya personalizado desde la UI. Default `[]` — sin especialidades conocidas todavía.
+ */
+async function _asegurarEspecialidadesDefault() {
+  const yaExiste = await svc.getValue('lealtad', 'ESPECIALIDADES').then(() => true).catch(() => false);
+  if (yaExiste) {
+    console.log('[seed-lealtad] lealtad.ESPECIALIDADES ya existe — no se pisa.');
+    return;
+  }
+  await svc.setValue('lealtad', 'ESPECIALIDADES', '[]', {
+    esSecreto: false, tipo: 'lista',
+    descripcion: 'Catálogo de especialidades válidas, editable como lista desde la UI — informativo, no bloquea el import.',
+    usuarioNombre: 'seed-script',
+  });
+  console.log('[seed-lealtad] lealtad.ESPECIALIDADES = [] (default vacío — agregar valores desde la UI)');
 }
 
 async function _asegurarReasons() {
@@ -65,7 +93,8 @@ async function _asegurarReasons() {
 async function seedLealtad() {
   await _asegurarSeccionLealtad();
   await _asegurarReasons();
-  console.log('[seed-lealtad] Listo — sección lealtad y catálogo de motivos sembrados correctamente.');
+  await _asegurarEspecialidadesDefault();
+  console.log('[seed-lealtad] Listo — sección lealtad, catálogo de motivos y catálogo de especialidades sembrados correctamente.');
 }
 
 // ── Ejecución directa: node src/loyalty/scripts/seed-lealtad.js ────────────

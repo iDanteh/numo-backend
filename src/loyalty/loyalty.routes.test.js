@@ -25,6 +25,7 @@ jest.mock('./domains/cards/loyalty-card.service', () => ({
   crearTarjeta: jest.fn(),
   listar: jest.fn(),
   obtener: jest.fn(),
+  obtenerParaEditar: jest.fn(),
   editarTarjeta: jest.fn(),
   cambiarNip: jest.fn(),
   cambiarNivel: jest.fn(),
@@ -86,7 +87,7 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
     { metodo: 'get',   ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_READ },
-    { metodo: 'post',  ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_CONFIG, body: { clave: 'x', nombre: 'x', signoPermitido: 'AMBOS' } },
+    { metodo: 'post',  ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_CONFIG, body: { clave: 'x', nombre: 'x' } },
     { metodo: 'patch', ruta: '/reasons/1',                  permiso: PERMISSIONS.LOYALTY_CONFIG, body: { activo: false } },
     { metodo: 'get',   ruta: '/sucursales',                 permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/sucursales/1',                permiso: PERMISSIONS.LOYALTY_CONFIG, body: { participaLealtad: false } },
@@ -168,6 +169,17 @@ describe('wiring hacia los servicios (happy path)', () => {
     );
   });
 
+  test('GET /cards/:id/editar llama a obtenerParaEditar y exige loyalty:tarjetas:editar, no loyalty:read', async () => {
+    cardService.obtenerParaEditar.mockResolvedValue({ id: 42, apodo: 'Juancho' });
+
+    const sinPermiso = await request(app).get('/cards/42/editar').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(sinPermiso.status).toBe(403);
+
+    const res = await request(app).get('/cards/42/editar').set(perms(PERMISSIONS.LOYALTY_TARJETAS_EDITAR));
+    expect(res.status).toBe(200);
+    expect(cardService.obtenerParaEditar).toHaveBeenCalledWith('42');
+  });
+
   test('GET /cards/:id/movimientos llama a listarMovimientos con el id', async () => {
     ledgerService.listarMovimientos.mockResolvedValue({ movimientos: [] });
     const res = await request(app).get('/cards/42/movimientos').set(perms(PERMISSIONS.LOYALTY_READ));
@@ -184,14 +196,14 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(configService.guardarPorcentajes).toHaveBeenCalledWith({ Bronce: 1 }, expect.any(Object));
   });
 
-  test('POST /cards/:id/ajustes pasa montoBase al servicio', async () => {
+  test('POST /cards/:id/ajustes pasa puntos/reasonId/justificacion al servicio', async () => {
     ledgerService.registrarAjuste.mockResolvedValue({ movimiento: { id: 1 } });
     const res = await request(app).post('/cards/1/ajustes')
       .set(perms(PERMISSIONS.LOYALTY_AJUSTES))
-      .send({ montoBase: '100.00', reasonId: 10, justificacion: 'ajuste automático' });
+      .send({ puntos: '20.00', reasonId: 10, justificacion: 'ajuste manual' });
     expect(res.status).toBe(201);
     expect(ledgerService.registrarAjuste).toHaveBeenCalledWith(
-      { cardId: '1', puntos: undefined, montoBase: '100.00', reasonId: 10, justificacion: 'ajuste automático' },
+      { cardId: '1', puntos: '20.00', reasonId: 10, justificacion: 'ajuste manual' },
       expect.any(Object),
     );
   });

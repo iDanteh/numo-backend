@@ -18,6 +18,29 @@ const { generarNip, hashNip } = require('../../shared/nip.util');
 
 const NIVELES_VALIDOS = ['Bronce', 'Plata', 'Oro'];
 
+// "Datos adicionales" (2026-10-23) — mismos campos que el enriquecimiento del import de
+// clientes.csv (ver loyalty-import-apply.service.js#CAMPOS_ENRIQUECIMIENTO), ahora también
+// editables a mano para altas que no vienen de un CSV. Nunca obligatorios, nunca usados para
+// lógica de negocio (nivel/puntos/identidad siguen siendo teléfono+categoría).
+const CAMPOS_OPCIONALES = [
+  'apellidos', 'apodo', 'sexo', 'fechaNacimiento', 'especialidades', 'sucursal', 'calle',
+  'numExterior', 'numInterior', 'colonia', 'municipio', 'estado', 'cp', 'comentarios',
+];
+
+/** Solo toca los campos presentes en `input` (`!== undefined`) — a diferencia del import, acá
+ *  NO se fuerza "" → null para un campo que el caller no mandó, para no borrar un dato ya
+ *  cargado por error de un payload parcial (ej. PATCH que solo manda `nombre`). */
+function _datosOpcionales(input) {
+  const datos = {};
+  for (const campo of CAMPOS_OPCIONALES) {
+    if (input[campo] !== undefined) {
+      const v = String(input[campo] ?? '').trim();
+      datos[campo] = v || null;
+    }
+  }
+  return datos;
+}
+
 function _userLabel(user) {
   return {
     usuarioId:     user?.dbId != null ? String(user.dbId) : (user?._id != null ? String(user._id) : null),
@@ -34,7 +57,7 @@ function _esDuplicadoUnico(err) {
  * validar unicidad — rechaza duplicados contra tarjetas activas E inactivas
  * (un teléfono inactivo sigue siendo "la misma persona" para el programa).
  */
-async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user, { transaction } = {}) {
+async function crearTarjeta({ telefono, nombre, nivel = 'Bronce', ...opcionales }, user, { transaction } = {}) {
   const telefonoNorm = normalizarTelefono(telefono);
   const nombreTrim = String(nombre ?? '').trim();
   if (!nombreTrim) {
@@ -68,6 +91,7 @@ async function crearTarjeta({ telefono, nombre, nivel = 'Bronce' }, user, { tran
     activa: true,
     createdById:     usuarioId,
     createdByNombre: usuarioNombre,
+    ..._datosOpcionales(opcionales),
   };
 
   let card;
@@ -136,12 +160,30 @@ async function obtener(id) {
   return card;
 }
 
+/**
+ * Variante de `obtener` para precargar el formulario de edición (2026-10-23) — a diferencia de
+ * `obtener`/`GET /cards`, acá SÍ se necesitan los campos PII que `defaultScope` excluye (apodo,
+ * dirección, etc. — ver LoyaltyCard.js) para poder editarlos. Gateada en la ruta por
+ * `loyalty:tarjetas:editar` (no `loyalty:read`): el mismo permiso que ya hace falta para llamar
+ * `editarTarjeta` a continuación, no una exposición nueva de PII a un permiso más amplio.
+ * `.unscoped()` en vez de combinar scopes de atributos (include+exclude) porque Sequelize no
+ * garantiza un merge predecible entre dos scopes de `attributes` — se excluyen a mano los dos
+ * hashes de seguridad, que nunca deben salir de acá bajo ningún permiso.
+ */
+async function obtenerParaEditar(id) {
+  const card = await LoyaltyCard.unscoped().findByPk(id, {
+    attributes: { exclude: ['nipHash', 'recuperacionCodigoHash'] },
+  });
+  if (!card) throw new NotFoundError('Tarjeta');
+  return card;
+}
+
 /** Whitelist de campos editables. `telefono` re-aplica la misma unicidad que `crearTarjeta`. */
-async function editarTarjeta(id, { nombre, telefono, activa } = {}, user) {
+async function editarTarjeta(id, { nombre, telefono, activa, ...opcionales } = {}, user) {
   const card = await LoyaltyCard.findByPk(id);
   if (!card) throw new NotFoundError('Tarjeta');
 
-  const updates = {};
+  const updates = { ..._datosOpcionales(opcionales) };
   if (nombre !== undefined) {
     updates.nombre = String(nombre).trim();
   }
@@ -231,4 +273,4 @@ async function cambiarNivel(cardId, nuevoNivel, { motivo } = {}, user) {
   });
 }
 
-module.exports = { crearTarjeta, listar, obtener, editarTarjeta, cambiarNip, cambiarNivel };
+module.exports = { crearTarjeta, listar, obtener, obtenerParaEditar, editarTarjeta, cambiarNip, cambiarNivel };

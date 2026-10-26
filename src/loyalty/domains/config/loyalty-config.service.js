@@ -25,7 +25,6 @@ const globalConfigService = require('../../../shared/services/global-config.serv
 
 const SECTION = 'lealtad';
 const NIVELES = ['BRONCE', 'PLATA', 'ORO'];
-const SIGNOS_VALIDOS = ['POSITIVO', 'NEGATIVO', 'AMBOS'];
 
 // Máximo 2 decimales, mayor a 0 — validado sobre el STRING crudo (nunca sobre
 // el Number ya parseado) para no heredar el mismo riesgo de IEEE-754 que
@@ -103,6 +102,37 @@ async function guardarPorcentajes({ Bronce, Plata, Oro } = {}, user) {
 }
 
 /**
+ * ESPECIALIDADES (2026-10-23) — catálogo de referencia para altas futuras de clientes, vive en
+ * `GlobalConfig` sección `lealtad` (mismo mecanismo que los %), `tipo:'lista'` (JSON array de
+ * strings). Se gestiona DESDE acá (loyalty:config/loyalty:read), nunca desde el `config:manage`
+ * genérico — fusión de UI pedida explícitamente por el usuario para no tener dos pantallas
+ * "Lealtad" distintas (ver config-admin.component.ts, que filtra la sección 'lealtad' del riel
+ * genérico). El valor del CSV de import NO se valida contra este catálogo (es informativo).
+ */
+async function obtenerEspecialidades() {
+  const valor = await globalConfigService.getValue(SECTION, 'ESPECIALIDADES').catch(() => '[]');
+  try {
+    const parsed = JSON.parse(valor || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Reemplaza el catálogo completo (mismo criterio que el editor de chips de Configuraciones
+ *  Globales: cada add/quitar manda la lista entera, no un delta). Limpia vacíos/duplicados. */
+async function guardarEspecialidades(lista, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const limpia = Array.isArray(lista)
+    ? [...new Set(lista.map((v) => String(v ?? '').trim()).filter(Boolean))]
+    : [];
+  await globalConfigService.setValue(SECTION, 'ESPECIALIDADES', JSON.stringify(limpia), {
+    tipo: 'lista', usuarioId, usuarioNombre,
+  });
+  return limpia;
+}
+
+/**
  * Catálogo de motivos de ajuste. `soloActivos` es lo que debe consumir el
  * selector de un AJUSTE nuevo (un motivo desactivado no es seleccionable);
  * sin el flag trae todo, para la pantalla de administración del catálogo
@@ -113,30 +143,33 @@ async function listarReasons({ soloActivos = false } = {}) {
   return LoyaltyAdjustmentReason.findAll({ where, order: [['nombre', 'ASC']] });
 }
 
+// Entero, cualquier signo, distinto de 0 — null/undefined es válido aparte (modo manual).
+function _validarPuntosFijos(valor) {
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n === 0) {
+    throw new BadRequestError('Puntos fijos debe ser un número entero distinto de 0 (o dejarse vacío para modo manual).');
+  }
+  return n;
+}
+
 /**
- * `porcentaje` (2026-10-20): si viene definido, el motivo pasa a calcular sus
- * puntos automáticamente desde `montoBase` al registrar un AJUSTE (ver
- * loyalty-ledger.service.js#registrarAjuste) — un motivo así NUNCA puede
- * tener signoPermitido:'AMBOS', porque el signo de los puntos resultantes
- * depende directamente de él (POSITIVO → tal cual, NEGATIVO → se niega).
+ * `puntosFijos` (rediseño 2026-10-23, reemplaza `signoPermitido`/`porcentaje`): si viene
+ * definido (puede ser negativo), un AJUSTE con este motivo aplica EXACTAMENTE ese valor — ver
+ * loyalty-ledger.service.js#registrarAjuste. Si no, el motivo queda en modo manual (quien aplica
+ * el ajuste escribe los puntos a mano, cualquier signo).
  */
-async function crearReason({ clave, nombre, signoPermitido, porcentaje } = {}) {
-  if (!SIGNOS_VALIDOS.includes(signoPermitido)) {
-    throw new BadRequestError(`signoPermitido debe ser uno de: ${SIGNOS_VALIDOS.join(', ')}.`);
+async function crearReason({ clave, nombre, puntosFijos } = {}) {
+  const nombreTrim = String(nombre ?? '').trim();
+  if (!nombreTrim) {
+    throw new BadRequestError('nombre es requerido.');
   }
 
-  let porcentajeValidado = null;
-  if (porcentaje !== undefined && porcentaje !== null) {
-    porcentajeValidado = _validarPorcentajeGenerico(porcentaje, 'El % del motivo');
-    if (signoPermitido === 'AMBOS') {
-      throw new BadRequestError(
-        'Un motivo con % de cálculo automático no puede tener signo AMBOS — definí si es POSITIVO o NEGATIVO.',
-      );
-    }
-  }
+  const puntosFijosValidado = (puntosFijos === undefined || puntosFijos === null)
+    ? null
+    : _validarPuntosFijos(puntosFijos);
 
   return LoyaltyAdjustmentReason.create({
-    clave, nombre, signoPermitido, activo: true, porcentaje: porcentajeValidado,
+    clave, nombre: nombreTrim, activo: true, puntosFijos: puntosFijosValidado,
   });
 }
 
@@ -146,38 +179,21 @@ async function crearReason({ clave, nombre, signoPermitido, porcentaje } = {}) {
  * referenciándola en entradas históricas (requisito del spec: "Historical
  * entries keep their original reason").
  */
-async function editarReason(id, { nombre, signoPermitido, activo, porcentaje } = {}) {
+async function editarReason(id, { nombre, activo, puntosFijos } = {}) {
   const reason = await LoyaltyAdjustmentReason.findByPk(id);
   if (!reason) throw new NotFoundError('Motivo de ajuste');
 
-  if (signoPermitido !== undefined && !SIGNOS_VALIDOS.includes(signoPermitido)) {
-    throw new BadRequestError(`signoPermitido debe ser uno de: ${SIGNOS_VALIDOS.join(', ')}.`);
-  }
-
-  // `porcentaje: null` explícito es válido (quita el % y vuelve el motivo
-  // manual) — se distingue de `undefined` (campo no tocado). Cuando viene un
-  // valor, se valida contra el signoPermitido RESULTANTE: el del payload si
-  // vino, si no el que ya tiene guardado la fila (nunca asumir que viene).
-  let porcentajeValidado;
-  if (porcentaje !== undefined) {
-    if (porcentaje === null) {
-      porcentajeValidado = null;
-    } else {
-      porcentajeValidado = _validarPorcentajeGenerico(porcentaje, 'El % del motivo');
-      const signoResultante = signoPermitido !== undefined ? signoPermitido : reason.signoPermitido;
-      if (signoResultante === 'AMBOS') {
-        throw new BadRequestError(
-          'Un motivo con % de cálculo automático no puede tener signo AMBOS — definí si es POSITIVO o NEGATIVO.',
-        );
-      }
-    }
+  // `puntosFijos: null` explícito es válido (vuelve el motivo manual) — se distingue de
+  // `undefined` (campo no tocado).
+  let puntosFijosValidado;
+  if (puntosFijos !== undefined) {
+    puntosFijosValidado = puntosFijos === null ? null : _validarPuntosFijos(puntosFijos);
   }
 
   const cambios = {};
   if (nombre !== undefined) cambios.nombre = nombre;
-  if (signoPermitido !== undefined) cambios.signoPermitido = signoPermitido;
   if (activo !== undefined) cambios.activo = activo;
-  if (porcentaje !== undefined) cambios.porcentaje = porcentajeValidado;
+  if (puntosFijos !== undefined) cambios.puntosFijos = puntosFijosValidado;
 
   await reason.update(cambios);
   return reason;
@@ -319,6 +335,8 @@ async function obtenerPromocionVigente(fecha = new Date()) {
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
+  obtenerEspecialidades,
+  guardarEspecialidades,
   listarReasons,
   crearReason,
   editarReason,

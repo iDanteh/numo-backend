@@ -289,6 +289,7 @@ async function seedKore(fallos) {
       'SERVICIO — Identificador de servicio Kore usado en esa misma autenticación de usuario',
       'CAJA_URL — Sesión de caja activa del cajero, verificada antes de aplicar cualquier cobro (obtenerSesionCaja)',
       'CAJA_BASE_URL — Aplicar cobro manual (panel de cobros), aplicar cobro de una Solicitud de Cobro ya aprobada, actualizar estatus de revisión contable ante Kore, y consultar saldo en vivo de una CxC',
+      'PUNTOS_KORE — GET /clientes/monedero: match de clientes entre el Sistema de Lealtad (tarjetaLegada) y Kore (monedero), ver loyalty/domains/kore-match/loyalty-kore-monedero.client.js. El token usado es bancos.TOKEN (mismo valor físico, confirmado 2026-10-23).',
     ],
   });
 
@@ -326,6 +327,26 @@ async function seedKore(fallos) {
       console.log(`[seed-banks] kore.${clave} = ${valor} ${_origen(envVar, !envVal)}`);
     });
   }
+
+  // PUNTOS_KORE / PUNTOS_KORE_TOKEN (2026-10-22, match de clientes Kore↔Lealtad) — a diferencia
+  // de las 4 claves de arriba, apunta a PRODUCCIÓN en todos los ambientes (mismo criterio que
+  // AUTH_URL), y el valor de producción ya es conocido (confirmado con el usuario) así que se
+  // siembra directo, sin pasar por el .env de este ambiente.
+  await _sembrarClave(fallos, 'kore', 'PUNTOS_KORE', async () => {
+    const url = 'https://app.login.tubosyconexiones.mx/clientes/monedero';
+    await svc.setValue('kore', 'PUNTOS_KORE', url, {
+      esSecreto: false, tipo: 'url',
+      descripcion: 'Kore — GET /clientes/monedero (match de clientes Kore↔Lealtad). Apunta a producción en TODOS los ambientes.',
+      usuarioNombre: 'seed-script',
+    });
+    console.log(`[seed-banks] kore.PUNTOS_KORE = ${url} (valor de producción, hardcodeado en el seed)`);
+  });
+
+  // PUNTOS_KORE_TOKEN eliminada (2026-10-23): confirmado por el usuario que PUNTOS_KORE usa el
+  // mismo token físico que bancos.TOKEN — loyalty-kore-monedero.client.js ahora lee esa clave
+  // directo, sin un secreto propio. Si tu ambiente ya sembró kore.PUNTOS_KORE_TOKEN con una
+  // corrida anterior de este script, queda huérfana (placeholder vacío) y puede borrarse a mano
+  // desde Configuraciones Globales — no bloquea nada.
 }
 
 // ── solicitudes ───────────────────────────────────────────────────────────────

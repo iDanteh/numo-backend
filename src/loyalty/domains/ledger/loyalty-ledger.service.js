@@ -356,16 +356,17 @@ async function registrarCanje({ cardId, puntos, serie }, user) {
 }
 
 /**
- * AJUSTE: requiere un motivo activo cuyo `signoPermitido` concuerde con el
- * signo del movimiento, y una justificación no trivial.
+ * AJUSTE: requiere un motivo activo y una justificación no trivial.
  *
- * Motivos con `reason.porcentaje` configurado (2026-10-20) calculan los
- * puntos automáticamente desde `montoBase` (igual criterio D5/D3 que
- * ACUMULACION: snapshot de % + aritmética en centavos) en vez de tomar
- * `puntos` directo del body — ese es el camino manual de siempre, intacto
- * cuando el motivo no tiene % configurado.
+ * REDISEÑO 2026-10-23 (reemplaza `signoPermitido`/el camino de % sobre
+ * `montoBase` — ninguno de los dos tenía datos reales configurados):
+ *   - `reason.puntosFijos` seteado: aplica EXACTAMENTE ese valor (puede ser
+ *     negativo), ignorando cualquier `puntos` que venga en el body.
+ *   - `reason.puntosFijos` null: camino manual de siempre, `puntos` viene
+ *     directo del body, cualquier signo — ya no hay validación de signo
+ *     contra el motivo (no existe más `signoPermitido`).
  */
-async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificacion }, user) {
+async function registrarAjuste({ cardId, puntos, reasonId, justificacion }, user) {
   const justificacionTrim = String(justificacion ?? '').trim();
   if (justificacionTrim.length < 5) {
     throw new BadRequestError('justificacion es requerida (mínimo 5 caracteres).');
@@ -377,33 +378,8 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
   }
 
   let puntosCents;
-  let montoBaseAplicado = null;
-  let porcentajeAplicado = null;
-
-  if (reason.porcentaje != null) {
-    // Camino automático: el signo ya NO se decide por el valor de `puntos`
-    // del body — lo decide `reason.signoPermitido` (bloqueado a POSITIVO o
-    // NEGATIVO al crear/editar el motivo con %, nunca AMBOS).
-    if (!(Number(montoBase) > 0)) {
-      throw new BadRequestError('montoBase debe ser mayor a 0 para un motivo con % de cálculo automático.');
-    }
-    if (reason.signoPermitido !== 'POSITIVO' && reason.signoPermitido !== 'NEGATIVO') {
-      // Defensivo: no debería pasar (crearReason/editarReason lo bloquean),
-      // pero datos legados podrían tener AMBOS + porcentaje configurado.
-      throw new BadRequestError(
-        `El motivo "${reason.nombre}" tiene % de cálculo automático configurado con un signoPermitido inválido (${reason.signoPermitido}); debe ser POSITIVO o NEGATIVO.`,
-      );
-    }
-
-    const montoCents = toCents(montoBase);
-    const puntosCalculados = calcularPuntos(montoCents, reason.porcentaje);
-    puntosCents = reason.signoPermitido === 'NEGATIVO' ? -puntosCalculados : puntosCalculados;
-    if (puntosCents === 0) {
-      throw new BadRequestError('El monto no genera puntos con el % configurado para este motivo.');
-    }
-
-    montoBaseAplicado = montoBase;
-    porcentajeAplicado = reason.porcentaje;
+  if (reason.puntosFijos != null) {
+    puntosCents = toCents(reason.puntosFijos);
   } else {
     // Camino manual, igual que siempre: `puntos` viene directo del body.
     const puntosNum = Number(puntos);
@@ -411,13 +387,6 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
       throw new BadRequestError('puntos debe ser un número distinto de 0.');
     }
     puntosCents = toCents(puntosNum);
-  }
-
-  const signo = puntosCents > 0 ? 'POSITIVO' : 'NEGATIVO';
-  if (reason.signoPermitido !== 'AMBOS' && reason.signoPermitido !== signo) {
-    throw new BadRequestError(
-      `El motivo "${reason.nombre}" no permite ajustes de signo ${signo === 'POSITIVO' ? 'positivo' : 'negativo'}.`,
-    );
   }
 
   return sequelize.transaction(async (t) => {
@@ -432,10 +401,8 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
 
     const { usuarioId, usuarioNombre } = _userLabel(user);
     const entry = await _aplicarMovimiento(t, card, {
-      tipo:               'AJUSTE',
-      puntos:             fromCents(puntosCents),
-      montoVenta:         montoBaseAplicado,
-      porcentajeAplicado,
+      tipo:   'AJUSTE',
+      puntos: fromCents(puntosCents),
       reasonId,
       justificacion: justificacionTrim,
       origen: 'manual',

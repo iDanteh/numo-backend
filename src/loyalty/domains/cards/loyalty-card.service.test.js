@@ -10,10 +10,17 @@
 
 const { Transaction } = require('sequelize');
 
-jest.mock('../../../shared/models/postgres', () => ({
-  LoyaltyCard:        { findOne: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findAndCountAll: jest.fn() },
-  LoyaltyTierHistory: { create: jest.fn() },
-}));
+jest.mock('../../../shared/models/postgres', () => {
+  // `unscoped()` devuelve el MISMO mock (no un modelo scoped real) a propósito: alcanza para que
+  // los tests de `obtenerParaEditar` mockeen `LoyaltyCard.findByPk` como cualquier otro test de
+  // este archivo, sin duplicar el mock de Sequelize.
+  const LoyaltyCard = { findOne: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findAndCountAll: jest.fn() };
+  LoyaltyCard.unscoped = jest.fn(() => LoyaltyCard);
+  return {
+    LoyaltyCard,
+    LoyaltyTierHistory: { create: jest.fn() },
+  };
+});
 jest.mock('../../../config/database.postgres', () => ({
   sequelize: { transaction: jest.fn() },
 }));
@@ -136,6 +143,30 @@ describe('crearTarjeta', () => {
     expect(LoyaltyCard.findOne.mock.calls[0]).toHaveLength(1);
     expect(LoyaltyCard.create.mock.calls[0]).toHaveLength(1);
   });
+
+  // "Datos adicionales" (2026-10-23) — alta manual, mismos campos que el enriquecimiento del
+  // import (ver loyalty-import-apply.service.js), ahora también opcionales acá.
+  test('acepta "datos adicionales" opcionales y los persiste trimeados', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await cardService.crearTarjeta({
+      telefono: '5512345678', nombre: 'Juan Pérez', apellidos: ' Pérez López ', sucursal: 'Matriz',
+    }, USER);
+
+    expect(LoyaltyCard.create).toHaveBeenCalledWith(expect.objectContaining({
+      apellidos: 'Pérez López', sucursal: 'Matriz',
+    }));
+  });
+
+  test('sin "datos adicionales" en el payload, no manda ninguno de esos campos a create', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await cardService.crearTarjeta({ telefono: '5512345678', nombre: 'Juan Pérez' }, USER);
+
+    const [[createArgs]] = LoyaltyCard.create.mock.calls;
+    expect(createArgs.apellidos).toBeUndefined();
+    expect(createArgs.calle).toBeUndefined();
+  });
 });
 
 describe('editarTarjeta', () => {
@@ -181,6 +212,47 @@ describe('editarTarjeta', () => {
 
     expect(card.updatedById).toBe('7');
     expect(card.updatedByNombre).toBe('Admin');
+  });
+
+  test('edita "datos adicionales" sin tocar nombre/teléfono/activa', async () => {
+    const card = makeCard();
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await cardService.editarTarjeta(1, { apodo: 'Juancho', colonia: 'Centro' }, USER);
+
+    expect(card.apodo).toBe('Juancho');
+    expect(card.colonia).toBe('Centro');
+    expect(card.nombre).toBe('Juan Pérez');
+  });
+
+  test('un campo de "datos adicionales" no enviado (undefined) no se toca', async () => {
+    const card = makeCard({ apodo: 'Apodo viejo' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await cardService.editarTarjeta(1, { nombre: 'Solo nombre' }, USER);
+
+    expect(card.update).toHaveBeenCalledWith(expect.not.objectContaining({ apodo: expect.anything() }));
+  });
+});
+
+describe('obtenerParaEditar', () => {
+  test('trae la tarjeta sin nipHash/recuperacionCodigoHash, vía unscoped()', async () => {
+    const card = makeCard({ apodo: 'Juancho' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const resultado = await cardService.obtenerParaEditar(1);
+
+    expect(LoyaltyCard.unscoped).toHaveBeenCalled();
+    expect(LoyaltyCard.findByPk).toHaveBeenCalledWith(1, {
+      attributes: { exclude: ['nipHash', 'recuperacionCodigoHash'] },
+    });
+    expect(resultado.apodo).toBe('Juancho');
+  });
+
+  test('tarjeta inexistente → 404', async () => {
+    LoyaltyCard.findByPk.mockResolvedValue(null);
+
+    await expect(cardService.obtenerParaEditar(999)).rejects.toMatchObject({ statusCode: 404 });
   });
 });
 

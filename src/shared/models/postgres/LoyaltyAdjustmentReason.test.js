@@ -2,8 +2,8 @@
 
 // LoyaltyAdjustmentReason.test.js — verifica el esquema Sequelize
 // (sistema-lealtad, PR1/8, design.md "Data Model" → LoyaltyAdjustmentReason).
-// `signoPermitido` usa palabras (POSITIVO/NEGATIVO/AMBOS) en vez de +/-/±
-// porque un signo menos tipográfico es una trampa de encoding real.
+// Rediseño 2026-10-23: signoPermitido/porcentaje se reemplazaron por puntosFijos
+// (ver comentario del modelo).
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 
 describe('LoyaltyAdjustmentReason — modelo Sequelize (loyalty_adjustment_reasons)', () => {
@@ -25,10 +25,10 @@ describe('LoyaltyAdjustmentReason — modelo Sequelize (loyalty_adjustment_reaso
     expect(attr.allowNull).toBe(false);
   });
 
-  test('signoPermitido: STRING(10) NOT NULL, isIn [POSITIVO,NEGATIVO,AMBOS]', () => {
-    const attr = LoyaltyAdjustmentReason.getAttributes().signoPermitido;
-    expect(attr.allowNull).toBe(false);
-    expect(attr.validate.isIn).toEqual([['POSITIVO', 'NEGATIVO', 'AMBOS']]);
+  test('puntosFijos: INTEGER nullable (null = motivo manual)', () => {
+    const attr = LoyaltyAdjustmentReason.getAttributes().puntosFijos;
+    expect(attr.allowNull).toBe(true);
+    expect(attr.type.constructor.name).toBe('INTEGER');
   });
 
   test('activo: BOOLEAN NOT NULL default true', () => {

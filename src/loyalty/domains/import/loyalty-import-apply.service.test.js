@@ -12,10 +12,10 @@
 const { Transaction } = require('sequelize');
 
 jest.mock('../../../shared/models/postgres', () => ({
-  LoyaltyCard:              { findOne: jest.fn(), findByPk: jest.fn() },
+  LoyaltyCard:              { findOne: jest.fn(), findByPk: jest.fn(), update: jest.fn(), scope: jest.fn() },
   LoyaltyPointsLedger:      { findOne: jest.fn() },
   LoyaltyPendingEnrollment: {
-    create: jest.fn(), findByPk: jest.fn(), findAndCountAll: jest.fn(), update: jest.fn(),
+    create: jest.fn(), findByPk: jest.fn(), findOne: jest.fn(), findAll: jest.fn(), update: jest.fn(),
   },
 }));
 jest.mock('../../../config/database.postgres', () => ({
@@ -57,9 +57,21 @@ function cliente(overrides = {}) {
   };
 }
 
+// Enriquecimiento (2026-10-23) — `cliente()` arriba no setea ninguno de estos campos, así que
+// _datosEnriquecimiento() los resuelve todos a null (ver loyalty-import-apply.service.js).
+// Reusado en los asserts de LoyaltyCard.update de abajo para no repetir el objeto 13 veces.
+const ENRIQUECIMIENTO_VACIO = {
+  apellidos: null, apodo: null, sexo: null, fechaNacimiento: null, especialidades: null, sucursal: null, calle: null,
+  numExterior: null, numInterior: null, colonia: null, municipio: null, estado: null, cp: null, comentarios: null,
+};
+
 beforeEach(() => {
   jest.clearAllMocks();
   sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
+  // Mismo criterio que loyalty-public.service.test.js/loyalty-recovery.service.test.js: el mock
+  // de `.scope(nombre)` devuelve el mismo objeto `LoyaltyCard`, así que `.scope('withDatosPersonales').findOne(...)`
+  // (usado por el backfill de enriquecimiento de 'ya_migrada') es controlable con `LoyaltyCard.findOne`.
+  LoyaltyCard.scope.mockReturnValue(LoyaltyCard);
 });
 
 describe('clasificar', () => {
@@ -221,19 +233,168 @@ describe('aplicar', () => {
     expect(resultado.pendientesCreadas).toBe(1);
     expect(resultado.omitidasYaMigradas).toBe(0);
     expect(resultado.excluidasBloqueantes).toBe(0);
+
+    // Gap real corregido 2026-10-22: el camino 'ok' ahora SÍ persiste `tarjetaLegada` (antes se
+    // usaba solo en memoria durante la clasificación y se descartaba) — necesario para el match
+    // de clientes con Kore (kore-match/). UPDATE puntual por id, además (no en vez) de la única
+    // escritura de ledger permitida.
+    expect(LoyaltyCard.update).toHaveBeenCalledWith(
+      { tarjetaLegada: '9005', ...ENRIQUECIMIENTO_VACIO },
+      expect.objectContaining({ where: { id: 1 }, transaction: expect.anything() }),
+    );
   });
 
-  test('"ya_migrada" se cuenta y se omite sin crear nada', async () => {
-    LoyaltyCard.findOne.mockResolvedValue({ id: 99 });
+  test('telefono_duplicado_bloqueante (2026-10-23): ambas filas crean un pendiente agrupado por el teléfono que comparten', async () => {
+    const resultado = await applyService.aplicar({
+      clientesRows: [
+        cliente({ tarjetaRaw: '1001', tarjetaNormalizada: '1001', nombre: 'UNO', celular: '5559999999' }),
+        cliente({ tarjetaRaw: '1002', tarjetaNormalizada: '1002', nombre: 'DOS', celular: '5559999999' }),
+      ],
+    }, USER);
+
+    expect(cardService.crearTarjeta).not.toHaveBeenCalled();
+    expect(ledgerService._aplicarMovimiento).not.toHaveBeenCalled();
+    expect(LoyaltyPendingEnrollment.create).toHaveBeenCalledTimes(2);
+    expect(LoyaltyPendingEnrollment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nombre: 'UNO', tarjetaLegada: '1001', motivo: 'telefono_duplicado',
+        grupoId: '5559999999', telefonoCandidato: '5559999999', estado: 'pendiente',
+      }),
+      expect.objectContaining({ transaction: expect.anything() }),
+    );
+    expect(LoyaltyPendingEnrollment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        nombre: 'DOS', tarjetaLegada: '1002', motivo: 'telefono_duplicado',
+        grupoId: '5559999999', telefonoCandidato: '5559999999', estado: 'pendiente',
+      }),
+      expect.objectContaining({ transaction: expect.anything() }),
+    );
+    expect(resultado.pendientesCreadas).toBe(2);
+    // Ya NO cuenta como bloqueante excluida (2026-10-23) — ahora es accionable vía Pendientes.
+    expect(resultado.excluidasBloqueantes).toBe(0);
+  });
+
+  test('telefono_duplicado_bloqueante: si ya existe un pendiente con esa tarjeta legada, NO duplica (re-import idempotente)', async () => {
+    LoyaltyPendingEnrollment.findOne.mockResolvedValue({ id: 5 }); // ya existe
+
+    const resultado = await applyService.aplicar({
+      clientesRows: [
+        cliente({ tarjetaRaw: '1001', tarjetaNormalizada: '1001', nombre: 'UNO', celular: '5559999999' }),
+        cliente({ tarjetaRaw: '1002', tarjetaNormalizada: '1002', nombre: 'DOS', celular: '5559999999' }),
+      ],
+    }, USER);
+
+    expect(LoyaltyPendingEnrollment.create).not.toHaveBeenCalled();
+    expect(resultado.pendientesCreadas).toBe(0);
+  });
+
+  test('"ya_migrada" se cuenta y se omite sin crear nada (ni ledger, ni pendiente)', async () => {
+    const cardMock = { id: 99, update: jest.fn() };
+    LoyaltyCard.findOne.mockResolvedValue(cardMock);
     LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
 
     const resultado = await applyService.aplicar({ clientesRows: [cliente()] }, USER);
 
     expect(cardService.crearTarjeta).not.toHaveBeenCalled();
     expect(LoyaltyPendingEnrollment.create).not.toHaveBeenCalled();
+    expect(ledgerService._aplicarMovimiento).not.toHaveBeenCalled();
     expect(resultado.omitidasYaMigradas).toBe(1);
     expect(resultado.creadas).toHaveLength(0);
     expect(resultado.excluidasBloqueantes).toBe(0);
+  });
+
+  describe('re-import repetible: "ya_migrada" backfillea tarjetaLegada/enriquecimiento si falta (2026-10-22/23)', () => {
+    // FIX 2026-10-23 (hallazgo CRÍTICO de revisión): el backfill de 'ya_migrada' ahora lee la
+    // tarjeta real vía `LoyaltyCard.scope('withDatosPersonales').findOne(...)` (mockeado acá como
+    // el mismo `LoyaltyCard.findOne`, ver beforeEach) y escribe con `card.update(...)` — cada gate
+    // (tarjetaLegada / cada campo de enriquecimiento) es independiente, nunca pisa un valor ya
+    // cargado.
+    test('backfillea tarjetaLegada si falta, sin tocar puntos/nivel/nombre', async () => {
+      const cardMock = { id: 99, tarjetaLegada: null, update: jest.fn() };
+      LoyaltyCard.findOne.mockResolvedValue(cardMock);
+      LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+      const resultado = await applyService.aplicar(
+        { clientesRows: [cliente({ tarjetaRaw: '044', tarjetaNormalizada: '44' })] }, USER,
+      );
+
+      // normalizarTarjeta('044') quita los ceros a la izquierda. Sin overrides de enriquecimiento
+      // en `cliente()`, ningún campo de enriquecimiento se agrega (todos null en la fila).
+      expect(cardMock.update).toHaveBeenCalledWith({ tarjetaLegada: '44' }, expect.objectContaining({ transaction: expect.anything() }));
+      expect(resultado.yaMigradaBackfillAplicado).toBe(1);
+      // Nunca se toca puntos/nivel/nombre ni se crea un segundo movimiento de ledger.
+      expect(cardService.crearTarjeta).not.toHaveBeenCalled();
+      expect(ledgerService._aplicarMovimiento).not.toHaveBeenCalled();
+    });
+
+    test('si la tarjeta existente YA tiene tarjetaLegada y ningún campo de enriquecimiento en la fila, no se escribe nada', async () => {
+      const cardMock = { id: 99, tarjetaLegada: '9005', update: jest.fn() };
+      LoyaltyCard.findOne.mockResolvedValue(cardMock);
+      LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+      const resultado = await applyService.aplicar({ clientesRows: [cliente()] }, USER);
+
+      expect(cardMock.update).not.toHaveBeenCalled();
+      expect(resultado.yaMigradaBackfillAplicado).toBe(0);
+      expect(resultado.omitidasYaMigradas).toBe(1);
+    });
+
+    test('tarjetaLegada YA cargada pero con campos de enriquecimiento vacíos → los completa sin tocar tarjetaLegada', async () => {
+      const cardMock = { id: 99, tarjetaLegada: '9005', apodo: null, sucursal: null, update: jest.fn() };
+      LoyaltyCard.findOne.mockResolvedValue(cardMock);
+      LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+      const resultado = await applyService.aplicar(
+        { clientesRows: [cliente({ apodo: 'Cris', sucursal: 'Matriz' })] }, USER,
+      );
+
+      expect(cardMock.update).toHaveBeenCalledWith(
+        { apodo: 'Cris', sucursal: 'Matriz' },
+        expect.objectContaining({ transaction: expect.anything() }),
+      );
+      expect(resultado.yaMigradaBackfillAplicado).toBe(1);
+    });
+
+    test('un campo de enriquecimiento YA cargado nunca se pisa, aunque la fila traiga un valor distinto', async () => {
+      const cardMock = { id: 99, tarjetaLegada: '9005', apodo: 'Apodo viejo', update: jest.fn() };
+      LoyaltyCard.findOne.mockResolvedValue(cardMock);
+      LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+      await applyService.aplicar({ clientesRows: [cliente({ apodo: 'Apodo nuevo' })] }, USER);
+
+      expect(cardMock.update).not.toHaveBeenCalledWith(expect.objectContaining({ apodo: expect.anything() }), expect.anything());
+    });
+
+    test('fila sin tarjetaRawClientes (tarjetaRaw vacío): no rompe, solo backfillea lo que la fila sí trae', async () => {
+      const cardMock = { id: 99, tarjetaLegada: null, update: jest.fn() };
+      LoyaltyCard.findOne.mockResolvedValue(cardMock);
+      LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+      const resultado = await applyService.aplicar(
+        { clientesRows: [cliente({ tarjetaRaw: '', tarjetaNormalizada: '' })] }, USER,
+      );
+
+      // Sin Tarjeta en la fila no hay nada que backfillear (tarjetaLegada sigue null, enriquecimiento
+      // vacío) — no debe lanzar, y no debe reportarse como backfill aplicado.
+      expect(cardMock.update).not.toHaveBeenCalled();
+      expect(resultado.yaMigradaBackfillAplicado).toBe(0);
+    });
+
+    test('red de seguridad: si la tarjeta desaparece entre clasificar y aplicar, se loguea y no se escribe nada (nunca lanza)', async () => {
+      jest.spyOn(logger, 'warn').mockImplementation(() => {});
+      // _clasificarFila (LoyaltyCard.findOne de solo lectura) encuentra la tarjeta, pero el
+      // scoped findOne de _aplicarFila (mismo mock) la devuelve null en la segunda llamada —
+      // simula un borrado concurrente real, aunque extremadamente raro.
+      LoyaltyCard.findOne
+        .mockResolvedValueOnce({ id: 99 }) // clasificar()
+        .mockResolvedValueOnce(null);       // _aplicarFila()
+      LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+      const resultado = await applyService.aplicar({ clientesRows: [cliente()] }, USER);
+
+      expect(resultado.yaMigradaBackfillAplicado).toBe(0);
+      expect(logger.warn).toHaveBeenCalled();
+    });
   });
 });
 
@@ -278,6 +439,28 @@ describe('iniciarAplicarJob / _correrAplicarJob (migración en background, por l
     expect(estado.resultado.creadas).toHaveLength(1);
     expect(estado.resultado.excluidasBloqueantes).toBe(1);
     expect(cardService.crearTarjeta).toHaveBeenCalledTimes(1);
+  });
+
+  test('re-import repetible: "ya_migrada" SÍ es accionable en el job de background — backfillea tarjetaLegada sin crear nada', async () => {
+    const cardMock = { id: 99, tarjetaLegada: null, update: jest.fn() };
+    LoyaltyCard.findOne.mockResolvedValue(cardMock);
+    LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
+
+    const { jobId, total, totalLotes } = await applyService.iniciarAplicarJob({
+      clientesRows: [cliente()], // teléfono con tarjeta existente + movimiento de migración previo → ya_migrada
+    }, USER);
+
+    expect(total).toBe(1); // ya_migrada ahora SÍ cuenta como accionable
+    expect(totalLotes).toBe(1);
+
+    await new Promise((resolve) => setImmediate(resolve));
+    const estado = applyService.obtenerEstadoAplicarJob(jobId, USER._id);
+    expect(estado.status).toBe('done');
+    expect(estado.resultado.omitidasYaMigradas).toBe(1);
+    expect(estado.resultado.yaMigradaBackfillAplicado).toBe(1);
+    expect(estado.resultado.creadas).toHaveLength(0);
+    expect(cardService.crearTarjeta).not.toHaveBeenCalled();
+    expect(cardMock.update).toHaveBeenCalledWith({ tarjetaLegada: '9005' }, expect.objectContaining({ transaction: expect.anything() }));
   });
 
   test('parte las filas accionables en lotes de BATCH_SIZE (200) y responde con jobId+total+totalLotes de inmediato', async () => {
@@ -617,15 +800,67 @@ describe('rechazarTodosPendientes', () => {
 });
 
 describe('listarPendientes', () => {
-  test('pagina con el mismo contrato que loyalty-card.service.js#listar', async () => {
-    LoyaltyPendingEnrollment.findAndCountAll.mockResolvedValue({ count: 3, rows: [{ id: 1 }] });
+  test('pagina por GRUPO, no por fila (2026-10-23) — una fila sin grupoId es su propio grupo de 1', async () => {
+    LoyaltyPendingEnrollment.findAll.mockResolvedValue([
+      { id: 1, grupoId: null, saldoLegado: 50, createdAt: new Date('2026-10-01') },
+    ]);
 
     const resultado = await applyService.listarPendientes({ page: 1, limit: 2 });
 
-    expect(LoyaltyPendingEnrollment.findAndCountAll).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { estado: 'pendiente' }, limit: 2, offset: 0 }),
+    expect(LoyaltyPendingEnrollment.findAll).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { estado: 'pendiente' } }),
     );
-    expect(resultado).toEqual({ total: 3, page: 1, limit: 2, pages: 2, pendientes: [{ id: 1 }] });
+    expect(resultado).toEqual({
+      total: 1, totalRegistros: 1, page: 1, limit: 2, pages: 1,
+      grupos: [{ grupoId: null, saldoMax: 50, items: [{ id: 1, grupoId: null, saldoLegado: 50, createdAt: new Date('2026-10-01') }] }],
+    });
+  });
+
+  // 2026-10-23, pedido explícito del usuario: priorizar a los clientes legados con puntos reales.
+  test('ordena por saldoLegado DESC primero, createdAt ASC como criterio secundario (orden pedido al backend)', async () => {
+    LoyaltyPendingEnrollment.findAll.mockResolvedValue([]);
+
+    await applyService.listarPendientes({});
+
+    expect(LoyaltyPendingEnrollment.findAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['saldoLegado', 'DESC'], ['createdAt', 'ASC']] }),
+    );
+  });
+
+  test('2+ filas con el MISMO grupoId quedan en un solo grupo; totalRegistros cuenta filas, total cuenta grupos', async () => {
+    LoyaltyPendingEnrollment.findAll.mockResolvedValue([
+      { id: 1, grupoId: '5559999999', saldoLegado: 100, createdAt: new Date('2026-10-01') },
+      { id: 2, grupoId: '5559999999', saldoLegado: 40, createdAt: new Date('2026-10-02') },
+      { id: 3, grupoId: null, saldoLegado: 10, createdAt: new Date('2026-10-01') },
+    ]);
+
+    const resultado = await applyService.listarPendientes({ page: 1, limit: 50 });
+
+    expect(resultado.total).toBe(2); // 2 grupos: el par telefono_duplicado + el suelto
+    expect(resultado.totalRegistros).toBe(3); // 3 filas reales
+    const grupoDuplicado = resultado.grupos.find((g) => g.grupoId === '5559999999');
+    expect(grupoDuplicado.items).toHaveLength(2);
+    expect(grupoDuplicado.saldoMax).toBe(100);
+    const grupoSuelto = resultado.grupos.find((g) => g.grupoId === null);
+    expect(grupoSuelto.items).toHaveLength(1);
+    // El grupo con más saldo (100) va primero.
+    expect(resultado.grupos[0].grupoId).toBe('5559999999');
+  });
+
+  // 2026-10-26, pedido explícito del usuario: exportar a Excel necesita el padrón COMPLETO, no
+  // una página — `exportar:true` debe ignorar el corte de página y el tope de 100 por página.
+  test('exportar:true devuelve TODOS los grupos sin recortar por página ni por el tope de 100', async () => {
+    const rows = Array.from({ length: 150 }, (_, i) => ({
+      id: i + 1, grupoId: null, saldoLegado: i, createdAt: new Date('2026-10-01'),
+    }));
+    LoyaltyPendingEnrollment.findAll.mockResolvedValue(rows);
+
+    const resultado = await applyService.listarPendientes({ page: 1, limit: 50, exportar: true });
+
+    expect(resultado.total).toBe(150);
+    expect(resultado.totalRegistros).toBe(150);
+    expect(resultado.pages).toBe(1);
+    expect(resultado.grupos).toHaveLength(150);
   });
 });
 

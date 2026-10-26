@@ -30,8 +30,16 @@ router.get('/cards', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandle
 }));
 
 router.post('/cards', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_CREAR), asyncHandler(async (req, res) => {
-  const { telefono, nombre } = req.body ?? {};
-  const resultado = await cardService.crearTarjeta({ telefono, nombre }, req.user);
+  const {
+    telefono, nombre, nivel,
+    apellidos, apodo, sexo, fechaNacimiento, especialidades, sucursal, calle,
+    numExterior, numInterior, colonia, municipio, estado, cp, comentarios,
+  } = req.body ?? {};
+  const resultado = await cardService.crearTarjeta({
+    telefono, nombre, nivel,
+    apellidos, apodo, sexo, fechaNacimiento, especialidades, sucursal, calle,
+    numExterior, numInterior, colonia, municipio, estado, cp, comentarios,
+  }, req.user);
   res.status(201).json(resultado);
 }));
 
@@ -45,13 +53,29 @@ router.get('/cards/:id/niveles', authenticate, permit(PERMISSIONS.LOYALTY_READ),
   res.json(await ledgerService.listarNiveles(req.params.id));
 }));
 
+// Precarga del formulario de edición (2026-10-23) — trae los campos PII que `GET /cards/:id`
+// excluye por defaultScope. Gateada por loyalty:tarjetas:editar (el mismo permiso que ya hace
+// falta para el PATCH de abajo), no loyalty:read — ruta estática antes de '/:id' por el mismo
+// criterio que movimientos/niveles arriba.
+router.get('/cards/:id/editar', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR), asyncHandler(async (req, res) => {
+  res.json(await cardService.obtenerParaEditar(req.params.id));
+}));
+
 router.get('/cards/:id', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   res.json(await cardService.obtener(req.params.id));
 }));
 
 router.patch('/cards/:id', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR), asyncHandler(async (req, res) => {
-  const { nombre, telefono, activa } = req.body ?? {};
-  res.json(await cardService.editarTarjeta(req.params.id, { nombre, telefono, activa }, req.user));
+  const {
+    nombre, telefono, activa,
+    apellidos, apodo, sexo, fechaNacimiento, especialidades, sucursal, calle,
+    numExterior, numInterior, colonia, municipio, estado, cp, comentarios,
+  } = req.body ?? {};
+  res.json(await cardService.editarTarjeta(req.params.id, {
+    nombre, telefono, activa,
+    apellidos, apodo, sexo, fechaNacimiento, especialidades, sucursal, calle,
+    numExterior, numInterior, colonia, municipio, estado, cp, comentarios,
+  }, req.user));
 }));
 
 router.post('/cards/:id/nip', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR), asyncHandler(async (req, res) => {
@@ -80,8 +104,8 @@ router.post('/cards/:id/canjes', authenticate, permit(PERMISSIONS.LOYALTY_MOVIMI
 // "Ajustes and Tarjetas:Nivel Do Not Imply Each Other") — ninguno de los dos
 // sustituye al otro, cada uno gatea exclusivamente su propia ruta.
 router.post('/cards/:id/ajustes', authenticate, permit(PERMISSIONS.LOYALTY_AJUSTES), asyncHandler(async (req, res) => {
-  const { puntos, montoBase, reasonId, justificacion } = req.body ?? {};
-  const resultado = await ledgerService.registrarAjuste({ cardId: req.params.id, puntos, montoBase, reasonId, justificacion }, req.user);
+  const { puntos, reasonId, justificacion } = req.body ?? {};
+  const resultado = await ledgerService.registrarAjuste({ cardId: req.params.id, puntos, reasonId, justificacion }, req.user);
   res.status(201).json(resultado);
 }));
 
@@ -95,6 +119,17 @@ router.get('/config', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandl
 
 router.put('/config/porcentajes', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json(await configService.guardarPorcentajes(req.body, req.user));
+}));
+
+// Especialidades (2026-10-23) — catálogo de referencia, mismo criterio de permisos que arriba:
+// LOYALTY_READ para leer, LOYALTY_CONFIG para editar. Fusionado acá (en vez del config:manage
+// genérico) para que toda la configuración de Lealtad viva en una sola pantalla.
+router.get('/config/especialidades', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await configService.obtenerEspecialidades());
+}));
+
+router.put('/config/especialidades', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.guardarEspecialidades(req.body?.especialidades, req.user));
 }));
 
 router.get('/reasons', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {

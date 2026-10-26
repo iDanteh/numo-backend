@@ -87,6 +87,7 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
   let totalPosiblesPrueba = 0;
   let totalNivelPorDefault = 0;
   let totalSinContacto = 0;
+  let totalNombreProvisional = 0;
 
   // ── Filas con origen en clientes.csv ─────────────────────────────────────
   for (const c of clientes) {
@@ -138,11 +139,30 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
       info.push('sin_registro_de_saldo');
     }
 
+    // Decisión de negocio 2026-10-23 (pedido explícito del usuario, "maximizar la cantidad de
+    // clientes importados"): Nombre+Apellidos vacíos en clientes.csv ya no bloquea la migración
+    // (antes reventaba en `cardService.crearTarjeta` con "nombre es requerido", excluyendo del
+    // todo a un cliente real que SÍ tiene monedero en Kore). Se arma un nombre provisional a
+    // partir del contacto — el mismo criterio que `nivelSugerido`/`nivel_asignado_por_default`
+    // arriba: dato no disponible, se rellena con un default visible y auditable (`info`, nunca
+    // `advertencias`, porque ya no requiere intervención para poder migrar) en vez de bloquear.
+    // Si tampoco hay contacto, esta fila ya cayó en 'sin_contacto' arriba y nunca llega a crearse
+    // como tarjeta (queda 'pendiente_sin_telefono') — acá siempre hay un contacto real disponible.
+    let nombreResuelto = c.nombre ?? '';
+    if (!nombreResuelto.trim()) {
+      nombreResuelto = contacto ? `Cliente ${contacto}` : '';
+      if (nombreResuelto) {
+        info.push('nombre_provisional');
+        totalNombreProvisional += 1;
+      }
+    }
+
     filas.push({
       tarjetaNormalizada: key,
       tarjetaRawClientes: c.tarjetaRaw ?? '',
       tarjetaRawPuntos: tienePuntos ? matchesPuntos[0].tarjetaRaw : null,
-      nombre: c.nombre ?? '',
+      nombre: nombreResuelto,
+      apellidos: c.apellidos ?? '',
       celular: c.celular ?? '',
       telefono: c.telefono ?? '',
       correo: c.correo ?? '',
@@ -152,6 +172,20 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
       nivelSugerido,
       advertencias,
       info,
+      // Enriquecimiento (2026-10-23) — registro histórico simple, ver loyalty-import.parser.js.
+      apodo: c.apodo ?? '',
+      sexo: c.sexo ?? '',
+      fechaNacimiento: c.fechaNacimiento ?? '',
+      especialidades: c.especialidades ?? '',
+      sucursal: c.sucursal ?? '',
+      calle: c.calle ?? '',
+      numExterior: c.numExterior ?? '',
+      numInterior: c.numInterior ?? '',
+      colonia: c.colonia ?? '',
+      municipio: c.municipio ?? '',
+      estado: c.estado ?? '',
+      cp: c.cp ?? '',
+      comentarios: c.comentarios ?? '',
     });
   }
 
@@ -187,6 +221,10 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
       nivelSugerido: NIVEL_DEFAULT,
       advertencias,
       info: ['nivel_asignado_por_default'],
+      // Huérfano de puntos.pdf: ninguno de estos campos existe en ese archivo (solo clientes.csv
+      // los trae) — se dejan vacíos por consistencia de shape con las filas de arriba.
+      apellidos: '', apodo: '', sexo: '', fechaNacimiento: '', especialidades: '', sucursal: '', calle: '',
+      numExterior: '', numInterior: '', colonia: '', municipio: '', estado: '', cp: '', comentarios: '',
     });
   }
 
@@ -200,6 +238,7 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
       totalPosiblesPrueba,
       totalNivelPorDefault,
       totalSinContacto,
+      totalNombreProvisional,
     },
     filas,
   };

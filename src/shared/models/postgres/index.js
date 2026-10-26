@@ -39,6 +39,7 @@ const LoyaltyTierHistory      = require('./LoyaltyTierHistory');
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 const LoyaltyPendingEnrollment = require('./LoyaltyPendingEnrollment');
 const LoyaltyPromotion        = require('./LoyaltyPromotion');
+const LoyaltySecurityEvent    = require('./LoyaltySecurityEvent');
 const PolizaAuditLog    = require('./PolizaAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
@@ -542,6 +543,10 @@ async function syncModels() {
   // no importa el orden respecto a las demás de Lealtad.
   await LoyaltyPromotion.sync({ force: false });
 
+  // Auditoría append-only del flujo OTP de la ruta pública de consulta
+  // (2026-10-26, ver LoyaltySecurityEvent.js) — tabla nueva sin FKs.
+  await LoyaltySecurityEvent.sync({ force: false });
+
   // REDISEÑO 2026-10-23 (pedido explícito del usuario): `signoPermitido`/`porcentaje` se
   // eliminan por completo (verificado antes del cambio: 0 motivos reales con `porcentaje`
   // seteado, 0 entradas de `loyalty_points_ledger` con `porcentajeAplicado` — ningún dato real
@@ -682,4 +687,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ALTER COLUMN enriquecimiento clientes.csv a tamaños más anchos:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, syncModels };

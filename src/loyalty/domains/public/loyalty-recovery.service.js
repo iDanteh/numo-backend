@@ -3,10 +3,10 @@
 /**
  * domains/public/loyalty-recovery.service.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Sistema de Lealtad — recuperación de NIP en 2 pasos para la consulta pública
- * (cliente final, sin sesión). Mismo threat model que loyalty-public.service.js
- * (D6-D8, Threat Matrix): toda falla debe ser indistinguible desde afuera, con
- * igualación de tiempo e intentos limitados.
+ * Sistema de Lealtad — código de verificación en 2 pasos para la consulta
+ * pública de puntos (cliente final, sin sesión). Mismo threat model que
+ * loyalty-public.service.js (D6-D8, Threat Matrix): toda falla debe ser
+ * indistinguible desde afuera, con igualación de tiempo e intentos limitados.
  *
  * Paso 1 (`solicitarCodigo`): dado un teléfono, genera y persiste (hasheado) un
  * código de 6 dígitos con vencimiento de 10 min. Nunca revela si el teléfono
@@ -19,19 +19,33 @@
  * flujo completo. Buscar `codigoDev` cuando se conecte el proveedor real: hay
  * que borrar esa rama.
  *
- * Paso 2 (`confirmarCodigo`): valida el código contra el hash guardado y, si
- * es correcto, genera un NIP nuevo (el cliente nunca elige su propio NIP —
- * mismo criterio que crearTarjeta/cambiarNip del lado staff) y lo devuelve una
- * única vez. El código es de un solo uso: se limpia al confirmar, sea cual
- * sea el resultado del intento (correcto limpia todo; incorrecto solo
- * incrementa el contador de fallos, el código sigue vivo hasta expirar o
- * hasta el 5to fallo).
+ * Paso 2 (`confirmarCodigoConsulta`, 2026-10-26 — reemplazo del NIP estático en
+ * la ruta pública de consulta de puntos, ver memoria
+ * project_lealtad_consulta_publica_otp): valida el código (factorizado en
+ * `_validarCodigo`) y, si es correcto, devuelve el mismo payload mínimo que
+ * `loyalty-public.service.js#consultaPublica` (nombre, nivel, saldoPuntos). El
+ * código es de un solo uso: se consume solo si el intento tiene éxito
+ * completo. El NIP estático de la tarjeta no se toca acá — sigue existiendo
+ * para uso interno de staff (revelar/cambiar NIP en tarjeta-detail).
+ *
+ * El flujo "recuperar NIP olvidado" que originalmente vivía en este archivo
+ * (`confirmarCodigo`, ruta pública `/recuperacion/confirmar`) se eliminó
+ * 2026-10-26: quedó huérfano una vez que el NIP dejó de ser necesario para
+ * cualquier acción de cara al cliente final.
+ *
+ * Auditoría (2026-10-26, ver LoyaltySecurityEvent.js): cada intento (éxito o
+ * fallo) de los dos pasos se registra en una tabla append-only vía
+ * `_registrarEvento`, llamada desde `_logFallo` y desde los dos caminos de
+ * éxito. Complementa — no reemplaza — el log de Winston existente: permite
+ * investigar patrones de abuso por teléfono o IP a través del tiempo, algo
+ * que el log rotativo y los contadores de `LoyaltyCard` (que se pisan) no
+ * permiten. Fire-and-forget: un fallo al escribir el evento nunca rompe el
+ * flujo de negocio real.
  */
 
-const { LoyaltyCard } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
 const { UnprocessableError } = require('../../../shared/errors/AppError');
 const {
-  generarNip, hashNip,
   generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
   MAX_INTENTOS_FALLIDOS, LOCKOUT_MS,
 } = require('../../shared/nip.util');
@@ -58,12 +72,28 @@ function _maskTelefono(telefono) {
   return str.length >= 4 ? `***${str.slice(-4)}` : '***';
 }
 
-function _logFallo(motivo, telefono, ip) {
+/**
+ * Auditoría append-only (ver LoyaltySecurityEvent.js) — fire-and-forget: un
+ * fallo al escribir el evento nunca debe romper el flujo de negocio real, por
+ * eso se atrapa acá adentro y nunca se relanza ni se espera en el llamador.
+ */
+async function _registrarEvento(tipo, resultado, motivo, telefono, ip) {
+  try {
+    await LoyaltySecurityEvent.create({
+      tipo, resultado, motivo: motivo ?? null, telefono: telefono || null, ip: ip ?? null,
+    });
+  } catch (err) {
+    logger.error(`[loyalty-recovery] No se pudo registrar evento de auditoría (tipo=${tipo}, resultado=${resultado}): ${err.message}`);
+  }
+}
+
+function _logFallo(tipo, motivo, telefono, ip) {
   logger.warn(`[loyalty-recovery] Intento fallido (${motivo}) tel=${_maskTelefono(telefono)} ip=${ip ?? 'desconocida'}`);
+  _registrarEvento(tipo, 'fallo', motivo, telefono, ip);
 }
 
 /**
- * Paso 1: solicita un código de verificación para recuperar el NIP.
+ * Paso 1: solicita un código de verificación para la consulta pública.
  * SIEMPRE responde el mismo mensaje genérico, exista o no la tarjeta — nunca
  * lanza por "teléfono no encontrado" (ese es el punto anti-enumeración).
  *
@@ -78,7 +108,7 @@ async function solicitarCodigo(telefono, { ip } = {}) {
     // Igualación de tiempo: un formato inválido no debería responder más
     // rápido que un teléfono válido pero inexistente.
     await compararCodigo('formato-invalido', DUMMY_CODIGO_HASH);
-    _logFallo('formato inválido', telefonoStr, ip);
+    _logFallo('solicitud_codigo', 'formato invalido', telefonoStr, ip);
     return { mensaje: MENSAJE_SOLICITUD_GENERICO };
   }
 
@@ -90,7 +120,7 @@ async function solicitarCodigo(telefono, { ip } = {}) {
     // más rápido que generar+hashear un código real, una fuga de timing que
     // permitiría enumerar teléfonos registrados.
     await compararCodigo('formato-invalido', DUMMY_CODIGO_HASH);
-    _logFallo('teléfono desconocido', telefonoStr, ip);
+    _logFallo('solicitud_codigo', 'telefono desconocido', telefonoStr, ip);
     return { mensaje: MENSAJE_SOLICITUD_GENERICO };
   }
 
@@ -106,6 +136,7 @@ async function solicitarCodigo(telefono, { ip } = {}) {
   // El código NUNCA en el log, igual que el NIP — solo confirmamos que se
   // generó uno nuevo para ese teléfono (enmascarado).
   logger.info(`[loyalty-recovery] Código generado tel=${_maskTelefono(telefonoStr)}`);
+  _registrarEvento('solicitud_codigo', 'exito', null, telefonoStr, ip);
 
   const respuesta = { mensaje: MENSAJE_SOLICITUD_GENERICO };
   // SIMULACIÓN TEMPORAL — no hay proveedor de mensajería elegido todavía
@@ -118,24 +149,38 @@ async function solicitarCodigo(telefono, { ip } = {}) {
   return respuesta;
 }
 
+/** Campos que limpian el código de un solo uso — se aplican en el `update()`
+ *  de éxito de `confirmarCodigoConsulta` (nunca en la propia validación: un
+ *  código solo se consume si el intento efectivamente tuvo éxito). */
+const CODIGO_CONSUMIDO = {
+  recuperacionCodigoHash: null,
+  recuperacionExpiraEn: null,
+  recuperacionIntentosFallidos: 0,
+  recuperacionBloqueadaHasta: null,
+};
+
 /**
- * Paso 2: confirma el código y, si es válido, genera y devuelve un NIP nuevo.
- * UN SOLO camino de error para: teléfono no encontrado, formato inválido, sin
- * código solicitado, código expirado, tarjeta bloqueada, código incorrecto —
- * nunca distingue la causa (mismo criterio que LookupFailedError).
+ * Valida el código contra el hash guardado y devuelve la tarjeta si es
+ * correcto. Lanza `RecoveryFailedError` en cualquier camino de falla —
+ * teléfono no encontrado, formato inválido, sin código vigente, tarjeta
+ * bloqueada o código incorrecto — nunca distingue la causa. Factorizada
+ * aparte de `confirmarCodigoConsulta` para mantener la validación separada de
+ * qué hacer con el resultado. No persiste nada por sí misma: el llamador
+ * decide cómo consumir el código (ver `CODIGO_CONSUMIDO`) dentro de su propio
+ * `update()`.
  *
  * @param {string} telefono
  * @param {string} codigo
  * @param {{ip?: string}} [ctx]
- * @returns {Promise<{nip: string}>}
+ * @returns {Promise<import('../../../shared/models/postgres').LoyaltyCard>}
  */
-async function confirmarCodigo(telefono, codigo, { ip } = {}) {
+async function _validarCodigo(telefono, codigo, { ip } = {}) {
   const telefonoStr = String(telefono ?? '').trim();
   const codigoStr = String(codigo ?? '').trim();
 
   if (!TELEFONO_RE.test(telefonoStr) || !CODIGO_RE.test(codigoStr)) {
     await compararCodigo(codigoStr || 'formato-invalido', DUMMY_CODIGO_HASH);
-    _logFallo('formato inválido', telefonoStr, ip);
+    _logFallo('confirmacion_codigo', 'formato invalido', telefonoStr, ip);
     throw new RecoveryFailedError();
   }
 
@@ -143,7 +188,7 @@ async function confirmarCodigo(telefono, codigo, { ip } = {}) {
 
   if (!card) {
     await compararCodigo(codigoStr, DUMMY_CODIGO_HASH);
-    _logFallo('teléfono desconocido', telefonoStr, ip);
+    _logFallo('confirmacion_codigo', 'telefono desconocido', telefonoStr, ip);
     throw new RecoveryFailedError();
   }
 
@@ -153,7 +198,7 @@ async function confirmarCodigo(telefono, codigo, { ip } = {}) {
     // para no introducir una fuga de timing entre "bloqueada" y "código
     // incorrecto" — el resultado se descarta a propósito.
     await compararCodigo(codigoStr, card.recuperacionCodigoHash || DUMMY_CODIGO_HASH);
-    _logFallo('recuperación bloqueada', telefonoStr, ip);
+    _logFallo('confirmacion_codigo', 'recuperacion bloqueada', telefonoStr, ip);
     throw new RecoveryFailedError();
   }
 
@@ -163,7 +208,7 @@ async function confirmarCodigo(telefono, codigo, { ip } = {}) {
     new Date(card.recuperacionExpiraEn) <= new Date();
   if (sinCodigoVigente) {
     await compararCodigo(codigoStr, DUMMY_CODIGO_HASH);
-    _logFallo('sin código vigente', telefonoStr, ip);
+    _logFallo('confirmacion_codigo', 'sin codigo vigente', telefonoStr, ip);
     throw new RecoveryFailedError();
   }
 
@@ -175,28 +220,40 @@ async function confirmarCodigo(telefono, codigo, { ip } = {}) {
       cambios.recuperacionBloqueadaHasta = new Date(Date.now() + LOCKOUT_MS);
     }
     await card.update(cambios);
-    _logFallo('código incorrecto', telefonoStr, ip);
+    _logFallo('confirmacion_codigo', 'codigo incorrecto', telefonoStr, ip);
     throw new RecoveryFailedError();
   }
 
-  const nip = generarNip();
-  const nipHash = await hashNip(nip);
-  await card.update({
-    nipHash,
-    nipIntentosFallidos: 0,
-    nipBloqueadoHasta: null,
-    // Código de un solo uso: se limpia por completo al confirmarse.
-    recuperacionCodigoHash: null,
-    recuperacionExpiraEn: null,
-    recuperacionIntentosFallidos: 0,
-    recuperacionBloqueadaHasta: null,
-    // Auditoría mínima (mismo criterio que cambiarNip de staff): quién/cuándo,
-    // sin tabla de historial completo.
-    updatedById: null,
-    updatedByNombre: 'Recuperación pública (auto-servicio)',
-  });
-
-  return { nip };
+  return card;
 }
 
-module.exports = { solicitarCodigo, confirmarCodigo, RecoveryFailedError };
+/**
+ * Paso 2 (flujo "consulta de puntos", reemplaza al NIP estático): confirma
+ * el código y devuelve el mismo payload mínimo que
+ * `loyalty-public.service.js#consultaPublica` — nunca genera ni toca el NIP.
+ *
+ * @param {string} telefono
+ * @param {string} codigo
+ * @param {{ip?: string}} [ctx]
+ * @returns {Promise<{nombre: string, nivel: string, saldoPuntos: string}>}
+ */
+async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
+  const card = await _validarCodigo(telefono, codigo, ctx);
+
+  // Mismo criterio que consultaPublica: una tarjeta inactiva no debe
+  // devolver saldo, con el mismo error genérico (nunca distinguir la causa).
+  // No consume el código acá — un código solo se da por usado si el intento
+  // efectivamente tuvo éxito.
+  if (!card.activa) {
+    _logFallo('confirmacion_codigo', 'tarjeta inactiva', telefono, ctx.ip);
+    throw new RecoveryFailedError();
+  }
+
+  await card.update(CODIGO_CONSUMIDO);
+  _registrarEvento('confirmacion_codigo', 'exito', null, card.telefono, ctx.ip);
+
+  const primerNombre = String(card.nombre ?? '').trim().split(/\s+/)[0] ?? '';
+  return { nombre: primerNombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos };
+}
+
+module.exports = { solicitarCodigo, confirmarCodigoConsulta, RecoveryFailedError };

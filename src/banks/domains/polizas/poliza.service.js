@@ -2070,14 +2070,21 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
     // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
     const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
-    // Depósito que paga solo esta factura y difiere por centavos del
-    // complemento: el banco va por el monto exacto del depósito (2026-10-13,
-    // caso real JAVIER DIAZ RODRIGUEZ dep 051726: complemento $1,602.92,
-    // banco $1,602.93 — "pon el monto tal cual esté en el depósito").
+    // Depósito que paga solo esta factura y difiere del complemento: el banco
+    // va por el monto exacto del depósito (2026-10-13, caso real JAVIER DIAZ
+    // RODRIGUEZ dep 051726: complemento $1,602.92, banco $1,602.93 — "pon el
+    // monto tal cual esté en el depósito"). Sin límite de diferencia desde
+    // 2026-10-27 (OSCAR JIMENEZ LOPEZ dep 054959: complemento $3,033.75,
+    // depósito $3,034.00 — "siempre se toma el monto del depósito"), siempre
+    // que el depósito sea de ESTE cobro: lo que aplicó a la factura en Bancos
+    // es el monto del complemento. Sin ese dato se queda el límite anterior.
     let debeCargo = Number(m.debe);
     if (esTransferenciaVerificada && bancario?.montoBancoReal != null && bancario._facturasDeposito === 1) {
       const diferencia = Math.round((bancario.montoBancoReal - debeCargo) * 100) / 100;
-      if (diferencia !== 0 && Math.abs(diferencia) <= TOLERANCIA_CENTAVOS_DEPOSITO) {
+      const depositoDeEsteCobro = bancario._montoAplicado != null
+        ? Math.abs(bancario._montoAplicado - debeCargo) < 0.005
+        : Math.abs(diferencia) <= TOLERANCIA_CENTAVOS_DEPOSITO;
+      if (diferencia !== 0 && depositoDeEsteCobro) {
         ajustesCentavos.push({ facturaUuid: m.facturaUuid ?? null, cfdiUuid: m.cfdiUuid ?? null, antes: debeCargo, despues: bancario.montoBancoReal });
         debeCargo = bancario.montoBancoReal;
       }

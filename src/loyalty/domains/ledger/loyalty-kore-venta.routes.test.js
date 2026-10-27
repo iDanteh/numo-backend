@@ -19,6 +19,7 @@ jest.mock('../../../shared/middleware/auth', () => ({
 jest.mock('./loyalty-kore-venta.service', () => ({
   consultarSaldoKore: jest.fn(),
   procesarVentaKore: jest.fn(),
+  procesarLoteVentasKore: jest.fn(),
 }));
 jest.mock('./loyalty-venta-fallida.service', () => ({
   listarVentasFallidas: jest.fn(),
@@ -61,6 +62,22 @@ describe('POST /venta', () => {
     expect(res.status).toBe(200);
     expect(ventaService.procesarVentaKore).toHaveBeenCalledWith(expect.objectContaining(body));
     expect(res.body).toEqual({ serieFolio: 'A0-1', status: 'aplicado' });
+  });
+});
+
+describe('POST /ventas (lote)', () => {
+  test('no requiere sesión Numo (solo verifyKoreApiKey, mockeado como no-op) y pasa el arreglo al service', async () => {
+    const ventas = [{ serieFolio: 'A0-1' }, { serieFolio: 'A0-2' }];
+    ventaService.procesarLoteVentasKore.mockResolvedValue({
+      resultados: [
+        { serieFolio: 'A0-1', success: true, status: 'aplicado' },
+        { serieFolio: 'A0-2', success: false, error: 'algo falló', statusCode: 400 },
+      ],
+    });
+    const res = await request(freshApp()).post('/ventas').send({ ventas });
+    expect(res.status).toBe(200);
+    expect(ventaService.procesarLoteVentasKore).toHaveBeenCalledWith(ventas);
+    expect(res.body.resultados).toHaveLength(2);
   });
 });
 

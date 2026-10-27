@@ -418,11 +418,13 @@ describe('registrarAcumulacion con promoción vigente (2026-10-27: filas separad
 });
 
 describe('registrarCanje', () => {
+  // Default global: makeCuentaKore() → subtotal 1000, total 1160 (beforeEach).
+
   test('permiteCanjeLealtad=false → 422, mientras la acumulación en esa misma serie sigue funcionando', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ permiteCanjeLealtad: false, participaLealtad: true }));
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'A0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 422 });
 
     // La misma sucursal, con participaLealtad true, sí deja acumular (flags independientes)
@@ -434,11 +436,49 @@ describe('registrarCanje', () => {
     ).resolves.toBeDefined();
   });
 
-  test('serie no existe en ningún centro de costo → 400', async () => {
+  test('Serie-Folio con serie que no existe en ningún centro de costo → 400, nunca consulta a Kore', async () => {
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'Z9' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'Z9-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(CentroCosto.findByPk).not.toHaveBeenCalled();
+    expect(erpSyncService.sincronizarCuentasPendientes).not.toHaveBeenCalled();
+  });
+
+  test('folio no encontrado en Kore → 400, no se inventa una venta', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({ raw: [] });
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  test('blindaje cruzado: la venta ya tiene un canje aplicado por Kore → 409, nunca consulta a Kore', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 9, origen: 'kore', referenciaExterna: 'A0-260605320:CANJE' });
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(LoyaltyPointsLedger.findOne).toHaveBeenCalledWith({
+      where: { origen: 'kore', referenciaExterna: 'A0-260605320:CANJE' },
+    });
+    expect(erpSyncService.sincronizarCuentasPendientes).not.toHaveBeenCalled();
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  test('puntos a canjear superan el total de la venta en Kore → 400', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    const card = makeCard({ saldoPuntos: '5000.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    // total de la venta (default) = 1160.00
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '1200.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
 
   test('canje mayor al saldo disponible → 409, verificado DESPUÉS del lock de fila', async () => {
@@ -447,7 +487,7 @@ describe('registrarCanje', () => {
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '60.00', serie: 'A0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '60.00', serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 409 });
 
     expect(LoyaltyCard.findByPk).toHaveBeenCalled();
@@ -455,20 +495,33 @@ describe('registrarCanje', () => {
     expect(card.saldoPuntos).toBe('40.00');
   });
 
-  test('canje dentro del saldo se registra con signo negativo y saldoResultante correcto', async () => {
+  test('canje dentro del saldo y del total de la venta se registra con signo negativo, referenciaExterna y saldoResultante correctos', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ saldoPuntos: '100.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     const { movimiento, saldoPuntos } = await ledgerService.registrarCanje(
-      { cardId: 1, puntos: '60.00', serie: 'A0' }, USER,
+      { cardId: 1, puntos: '60.00', serieFolio: 'A0-260605320' }, USER,
     );
 
     expect(movimiento.tipo).toBe('CANJE');
     expect(movimiento.puntos).toBe('-60.00');
     expect(movimiento.saldoResultante).toBe('40.00');
+    expect(movimiento.referenciaExterna).toBe('A0-260605320:CANJE');
     expect(saldoPuntos).toBe('40.00');
     expect(movimiento.centroCostoId).toBe(10);
+  });
+
+  test('idempotencia: reintentar el mismo folio → 409 por índice único, no se reintenta', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '100.00' }));
+    const dupErr = new Error('duplicate');
+    dupErr.name = 'SequelizeUniqueConstraintError';
+    LoyaltyPointsLedger.create.mockRejectedValueOnce(dupErr);
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
   });
 
   test('tarjeta inactiva → 422', async () => {
@@ -476,7 +529,7 @@ describe('registrarCanje', () => {
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ activa: false, saldoPuntos: '100.00' }));
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'A0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 422 });
   });
 
@@ -486,7 +539,7 @@ describe('registrarCanje', () => {
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'a0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'a0-260605320' }, USER),
     ).resolves.toBeDefined();
     expect(CentroCosto.findByPk).toHaveBeenCalledWith(10);
   });
@@ -614,7 +667,7 @@ describe('saldoResultante encadenado', () => {
     const r2 = await ledgerService.registrarAjuste({ cardId: 1, puntos: '5.00', reasonId: 1, justificacion: 'bono extra' }, USER);
     expect(r2.movimiento.saldoResultante).toBe('15.00');
 
-    const r3 = await ledgerService.registrarCanje({ cardId: 1, puntos: '15.00', serie: 'A0' }, USER);
+    const r3 = await ledgerService.registrarCanje({ cardId: 1, puntos: '15.00', serieFolio: 'A0-260605320' }, USER);
     expect(r3.movimiento.saldoResultante).toBe('0.00');
   });
 });

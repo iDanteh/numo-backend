@@ -287,6 +287,18 @@ describe('procesarVentaKore — idempotencia', () => {
     const payload = { ...PAYLOAD_BASE, subtotal: 2000 };
     await expect(ventaService.procesarVentaKore(payload)).rejects.toMatchObject({ statusCode: 409 });
   });
+
+  it('blindaje cruzado de CANJE: si el canje ya se aplicó a mano (origen manual, sufijo :CANJE), responde "aplicado" sin duplicar', async () => {
+    mockCard(makeCard({ saldoPuntos: '50.00' }));
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { tipo: 'CANJE', puntos: '-15.00', referenciaExterna: 'A0-260605320:CANJE', origen: 'manual' },
+    ]);
+    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    expect(res).toEqual({
+      serieFolio: 'A0-260605320', status: 'aplicado', puntosDescontados: 15, puntosAcumulados: 0, saldoResultante: 50,
+    });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('procesarVentaKore — acumulación con promoción vigente (2026-10-27: filas separadas)', () => {
@@ -344,5 +356,50 @@ describe('procesarVentaKore — sin movimientos', () => {
     const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
     expect(res).toMatchObject({ status: 'no_califica', puntosAcumulados: 0, puntosDescontados: 0 });
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('procesarLoteVentasKore', () => {
+  it('ventas vacío → 400', async () => {
+    await expect(ventaService.procesarLoteVentasKore([])).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('ventas no es un arreglo → 400', async () => {
+    await expect(ventaService.procesarLoteVentasKore(undefined)).rejects.toMatchObject({ statusCode: 400 });
+    await expect(ventaService.procesarLoteVentasKore({})).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('más de 100 ventas en un lote → 400, no procesa ninguna', async () => {
+    const ventas = Array.from({ length: 101 }, (_, i) => ({ ...PAYLOAD_BASE, serieFolio: `A0-${260605320 + i}` }));
+    await expect(ventaService.procesarLoteVentasKore(ventas)).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  it('procesa varias ventas reusando procesarVentaKore, cada una independiente', async () => {
+    mockCard(makeCard({ saldoPuntos: '0.00' }));
+    const ventas = [
+      { ...PAYLOAD_BASE, serieFolio: 'A0-260605320' },
+      { ...PAYLOAD_BASE, serieFolio: 'A0-260605321' },
+    ];
+    const { resultados } = await ventaService.procesarLoteVentasKore(ventas);
+    expect(resultados).toHaveLength(2);
+    expect(resultados[0]).toMatchObject({ serieFolio: 'A0-260605320', success: true, status: 'aplicado' });
+    expect(resultados[1]).toMatchObject({ serieFolio: 'A0-260605321', success: true, status: 'aplicado' });
+    expect(LoyaltyPointsLedger.create).toHaveBeenCalledTimes(2); // una fila ACUMULACION por venta
+  });
+
+  it('una venta inválida dentro del lote NO aborta las demás', async () => {
+    mockCard(makeCard({ saldoPuntos: '0.00' }));
+    const ventas = [
+      { ...PAYLOAD_BASE, serieFolio: 'A0-260605320' },
+      { ...PAYLOAD_BASE, serieFolio: 'invalido' }, // formato de Serie-Folio inválido → 400 individual
+      { ...PAYLOAD_BASE, serieFolio: 'A0-260605322' },
+    ];
+    const { resultados } = await ventaService.procesarLoteVentasKore(ventas);
+    expect(resultados).toHaveLength(3);
+    expect(resultados[0]).toMatchObject({ success: true });
+    expect(resultados[1]).toMatchObject({ serieFolio: 'invalido', success: false, statusCode: 400 });
+    expect(resultados[1].error).toEqual(expect.any(String));
+    expect(resultados[2]).toMatchObject({ success: true });
   });
 });

@@ -46,6 +46,14 @@ const collectionRequestSchema = new mongoose.Schema({
       // Solo es obligatorio cuando hay más de una CxC (Modo 2) — en Modo 1 el
       // monto de la única CxC ya se deduce de la suma de formasPago.
       montoAsignado:        { type: Number, default: null },
+      // Subtotal (antes de impuesto) de ESTA CxC específica, opcional — base para
+      // el cálculo de puntos de Lealtad (2026-10-27, ver loyalty-kore-venta.service.js
+      // #procesarVentaKore, reusado tal cual desde identificar()). Va por CxC y no
+      // a nivel solicitud porque cada una puede tener un trato fiscal distinto —
+      // prorratear un solo número combinado entre varias CxC sería una aproximación,
+      // no el valor real de cada venta. Si no viene, esa CxC simplemente no
+      // participa en la acumulación (no es un error).
+      subtotal:             { type: Number, default: null },
     }],
     default: [],
     validate: {
@@ -123,6 +131,14 @@ const collectionRequestSchema = new mongoose.Schema({
   monto:       { type: Number, required: true }, // Σ formasPago[].importe, calculado al crear
   descripcion: { type: String, trim: true, default: null }, // anotación libre del cobro
   conceptoId:  { type: String, trim: true, default: null }, // concepto Kore, si el ERP ya lo resuelve
+
+  // Teléfono del cliente final, opcional — habilita la acumulación de puntos de
+  // Lealtad al identificar() (2026-10-27, ver loyalty-kore-venta.service.js
+  // #procesarVentaKore, reusado tal cual). Va a nivel SOLICITUD y no por CxC
+  // porque es una regla de negocio ya existente de Solicitudes de Cobro: todas
+  // las CxC de una misma solicitud son siempre del mismo cliente. Si no viene,
+  // identificar() no intenta acumular nada — cero cambio de comportamiento.
+  telefono: { type: String, trim: true, default: null },
 
   // ID propio de la solicitud en Kore — opcional, habilita idempotencia (si el
   // ERP reintenta el mismo POST por timeout, se regresa la solicitud existente

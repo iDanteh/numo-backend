@@ -20,6 +20,7 @@ jest.mock('../erp/erp.routes');
 jest.mock('../../shared/utils/mongo-tx');
 jest.mock('../../shared/socket');
 jest.mock('../../shared/utils/logger');
+jest.mock('../../../loyalty/domains/ledger/loyalty-kore-venta.service');
 
 const CollectionRequest = require('./CollectionRequest.model');
 const BankMovement      = require('../banks/BankMovement.model');
@@ -28,6 +29,8 @@ const koreCaja          = require('../erp/kore-caja.service');
 const erpRoutes         = require('../erp/erp.routes');
 const { conTransaccion } = require('../../shared/utils/mongo-tx');
 const { emitToAll, emitToBanco } = require('../../shared/socket');
+const { logger }         = require('../../shared/utils/logger');
+const { procesarVentaKore } = require('../../../loyalty/domains/ledger/loyalty-kore-venta.service');
 
 const service = require('./collection-request.service');
 
@@ -48,7 +51,7 @@ function formaPago(id, descripcion, importe, extra = {}) {
   };
 }
 
-function makeCr({ id = 'cr-1', formasPago, cxcs, monto, conceptoId = 'concepto-1', status = 'pendiente' }) {
+function makeCr({ id = 'cr-1', formasPago, cxcs, monto, conceptoId = 'concepto-1', status = 'pendiente', telefono } = {}) {
   return {
     _id: id,
     solicitudIdErp: 'SOL-1',
@@ -58,6 +61,10 @@ function makeCr({ id = 'cr-1', formasPago, cxcs, monto, conceptoId = 'concepto-1
     formasPago,
     cxcs,
     monto,
+    telefono, // undefined por default a propósito — los tests existentes de ANTES del
+              // gancho de Lealtad (2026-10-27) nunca lo pasan, así que el bloque nuevo
+              // de identificar() (if (cr.telefono)) nunca se ejecuta para ellos: cero
+              // cambio de comportamiento, cero necesidad de tocar esos tests.
     save: jest.fn().mockResolvedValue(undefined),
   };
 }
@@ -649,6 +656,104 @@ describe('identificar() — Kore ya en APLICADO (reintento tras falla post-Kore)
   });
 });
 
+// Incidente real 2026-10-07/08: Kore rechaza aplicarSolicitudOperacion porque
+// la solicitud tiene registrada (del lado de Kore) una forma de pago —
+// típicamente un anticipo — que nunca llegó al registro de Numo (gap en el
+// webhook de creación de Kore, no un bug de parseo de Numo). CONFIRMADO contra
+// un caso real 2026-10-08: para cuando este error ocurre, Kore YA aceptó el
+// aviso APROBADO y no ofrece ninguna forma de revertirlo desde su API — ni
+// reintentando Identificar ni con Rechazar. La única vía que desatascó el caso
+// real fue una corrección manual directa en la base de datos de Kore. Este
+// describe cubre el guard (`esMismatchAnticipo`) que detecta el patrón del
+// mensaje de Kore y avisa explícitamente de esa escalación — antes de este
+// test, NINGÚN test ejercitaba este catch (el único test con "APROBADO" que
+// existía arriba prueba actualizarEstatusSolicitud, una función distinta).
+describe('identificar() — mismatch de anticipo (Kore rechaza aplicarSolicitudOperacion, ya quedó en APROBADO sin forma de revertir)', () => {
+  test('mensaje de Kore menciona "catálogo de anticipos" -> BadRequestError con la advertencia de escalación', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.aplicarSolicitudOperacion.mockRejectedValue(
+      new KoreCajaError('Kore rechazó: no existe ese catálogo de anticipos'),
+    );
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' }),
+    ).rejects.toThrow(/no permite revertir/i);
+
+    // Nunca se llega a la transacción de Mongo — el cobro quedó aprobado en
+    // Kore pero sin escritura correspondiente en Numo (escalado a revisión manual).
+    expect(bankService.setErpIds).not.toHaveBeenCalled();
+    expect(cr.save).not.toHaveBeenCalled();
+  });
+
+  test('mensaje de Kore menciona "forma de pago del anticipo" -> misma advertencia de escalación', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.aplicarSolicitudOperacion.mockRejectedValue(
+      new KoreCajaError('forma de pago del anticipo no configurada'),
+    );
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' }),
+    ).rejects.toThrow(/no permite revertir/i);
+  });
+
+  test('mayúsculas/minúsculas no importan (regex con flag /i)', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.aplicarSolicitudOperacion.mockRejectedValue(
+      new KoreCajaError('FORMA DE PAGO DEL ANTICIPO no configurada'),
+    );
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' }),
+    ).rejects.toThrow(/no permite revertir/i);
+  });
+
+  test('mismatch de anticipo NUNCA marca inconsistenciaPostKore (a diferencia del error de red) -> confirma que toma la rama KoreCajaError, no la de red', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    CollectionRequest.updateOne = jest.fn().mockResolvedValue({ acknowledged: true });
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.aplicarSolicitudOperacion.mockRejectedValue(
+      new KoreCajaError('forma de pago identificable no encontrada'),
+    );
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' }),
+    ).rejects.toThrow(/no permite revertir/i);
+
+    expect(CollectionRequest.updateOne).not.toHaveBeenCalled();
+  });
+
+  test('KoreCajaError cuyo mensaje NO matchea ninguna de las 3 frases -> BadRequestError genérico, SIN la advertencia de escalación', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({ formasPago: [f1], cxcs: [{ erpId: 'CXC-1', total: 100000 }], monto: 100000 });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    koreCaja.aplicarSolicitudOperacion.mockRejectedValue(
+      new KoreCajaError('Datos adicionales inválidos'),
+    );
+
+    const promesa = service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    await expect(promesa).rejects.toThrow(/Kore rechazó el cobro: Datos adicionales inválidos/);
+    await expect(promesa).rejects.not.toThrow(/no permite revertir/i);
+  });
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // TRANSFERENCIA + EFECTIVO — caso real 2026-09-19
 //   Solicitud con 2 formas de pago: TRANSFERENCIA (bancaria, 3 depósitos) y
@@ -823,5 +928,179 @@ describe('identificar() — TRANSFERENCIA + EFECTIVO (3 depósitos, 0 para efect
     // 2 setErpIds solo para TRANSFERENCIA; EFECTIVO no genera setErpIds
     expect(bankService.setErpIds).toHaveBeenCalledTimes(2);
     expect(bankService.setErpIds.mock.calls.map(c => c[0]).sort()).toEqual(['mov-A', 'mov-B']);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Gancho de acumulación de puntos de Lealtad (2026-10-27, EN DISEÑO) — reusa
+// procesarVentaKore() del webhook de Lealtad TAL CUAL, después del commit del
+// paso 7. Mockeado como módulo completo (jest.mock arriba) — acá solo se
+// verifica QUE se llame (o no) con el payload correcto, nunca su lógica interna
+// (eso ya lo prueba loyalty-kore-venta.service.test.js).
+// ══════════════════════════════════════════════════════════════════════════════
+describe('identificar() — gancho de acumulación de puntos de Lealtad', () => {
+  beforeEach(() => {
+    logger.warn = jest.fn();
+  });
+
+  test('cr.telefono ausente -> procesarVentaKore NUNCA se llama', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [{ erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '123', subtotal: 86206.90 }],
+      monto: 100000,
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(procesarVentaKore).not.toHaveBeenCalled();
+  });
+
+  test('Modo 1 (1 CxC) con serie/folioExterno/subtotal y telefono -> procesarVentaKore se llama UNA vez con el payload correcto', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [{ erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '123456', subtotal: 86206.90, tipoPago: 'PUE' }],
+      monto: 100000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    procesarVentaKore.mockResolvedValue({ serieFolio: 'A0-123456', status: 'aplicado' });
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(procesarVentaKore).toHaveBeenCalledTimes(1);
+    expect(procesarVentaKore).toHaveBeenCalledWith(expect.objectContaining({
+      telefono: '5512345678',
+      serieFolio: 'A0-123456',
+      conceptoId: 'concepto-1',
+      metodoPago: 'PUE',
+      formasPago: [{ formaPagoId: 'fp-f1', importe: 100000 }],
+      subtotal: 86206.90,
+      total: 100000,
+      usuarioAplicaId: 'user-1',
+      usuarioAplicaNombre: 'Ana',
+    }));
+  });
+
+  test('Modo 2 (2 CxC, 1 forma de pago global) -> procesarVentaKore se llama DOS veces, una por CxC, cada una con su propio serieFolio/total/formasPago prorrateado', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 150000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [
+        { erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '111', subtotal: 86206.90, tipoPago: 'PUE', montoAsignado: 100000 },
+        { erpId: 'CXC-2', total: 50000, serie: 'A0', folioExterno: '222', subtotal: 43103.45, tipoPago: 'PUE', montoAsignado: 50000 },
+      ],
+      monto: 150000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    procesarVentaKore.mockResolvedValue({ serieFolio: 'A0-x', status: 'aplicado' });
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(procesarVentaKore).toHaveBeenCalledTimes(2);
+    expect(procesarVentaKore).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      serieFolio: 'A0-111', total: 100000, formasPago: [{ formaPagoId: 'fp-f1', importe: 100000 }], subtotal: 86206.90,
+    }));
+    expect(procesarVentaKore).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      serieFolio: 'A0-222', total: 50000, formasPago: [{ formaPagoId: 'fp-f1', importe: 50000 }], subtotal: 43103.45,
+    }));
+  });
+
+  test('una CxC sin serie (o sin folioExterno/subtotal) se omite del loop, las demas CxC validas de Modo 2 si se procesan', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 150000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [
+        { erpId: 'CXC-1', total: 100000, serie: null, folioExterno: '111', subtotal: 86206.90, tipoPago: 'PUE', montoAsignado: 100000 },
+        { erpId: 'CXC-2', total: 50000, serie: 'A0', folioExterno: '222', subtotal: 43103.45, tipoPago: 'PUE', montoAsignado: 50000 },
+      ],
+      monto: 150000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    procesarVentaKore.mockResolvedValue({ serieFolio: 'A0-222', status: 'aplicado' });
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(procesarVentaKore).toHaveBeenCalledTimes(1);
+    expect(procesarVentaKore).toHaveBeenCalledWith(expect.objectContaining({ serieFolio: 'A0-222' }));
+  });
+
+  test('procesarVentaKore rechaza con 404 (cliente sin tarjeta) -> NO loguea warning, y en Modo 2 corta el loop', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 150000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [
+        { erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '111', subtotal: 86206.90, tipoPago: 'PUE', montoAsignado: 100000 },
+        { erpId: 'CXC-2', total: 50000, serie: 'A0', folioExterno: '222', subtotal: 43103.45, tipoPago: 'PUE', montoAsignado: 50000 },
+      ],
+      monto: 150000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    const notFound = new Error('Tarjeta de Lealtad no encontrada');
+    notFound.statusCode = 404;
+    procesarVentaKore.mockRejectedValue(notFound);
+
+    const resultado = await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(procesarVentaKore).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(resultado.status).toBe('identificada');
+  });
+
+  test('procesarVentaKore rechaza con un error que NO es 404 -> loguea warning, pero identificar() sigue devolviendo exito', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [{ erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '123456', subtotal: 86206.90, tipoPago: 'PUE' }],
+      monto: 100000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    const conceptoDesconocido = new Error('Concepto desconocido en Numo: xyz');
+    conceptoDesconocido.statusCode = 422;
+    procesarVentaKore.mockRejectedValue(conceptoDesconocido);
+
+    const resultado = await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toMatch(/Concepto desconocido en Numo/);
+    expect(resultado.status).toBe('identificada');
+  });
+
+  test('si el commit del paso 7 falla, el gancho de Lealtad NUNCA se llega a ejecutar', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [{ erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '123456', subtotal: 86206.90, tipoPago: 'PUE' }],
+      monto: 100000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    conTransaccion.mockRejectedValue(new Error('Mongo no disponible'));
+
+    await expect(
+      service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' }),
+    ).rejects.toThrow(/no se pudo guardar en Numo/);
+
+    expect(procesarVentaKore).not.toHaveBeenCalled();
   });
 });

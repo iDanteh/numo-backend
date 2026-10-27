@@ -1978,6 +1978,13 @@ function agruparNoIdentificadosPorDeposito(lineas) {
   });
 }
 
+// Opciones de `construirVerdadBancaria` al exportar: solo Cobranza (Pagos)
+// descarta el fallback serie+folioExterno cuando la liga trae folioFiscal de
+// otra factura — Ingreso nunca: ahí el fallback se queda igual (2026-10-27).
+function opcionesVerdadBancariaExport(poliza, movimientos) {
+  return { fallbackSoloSinFolioFiscal: poliza.tipo !== 'I' && movimientos.some(m => m.tipoComprobante === 'P') };
+}
+
 // Diferencia máxima entre el depósito y el cobro que se trata como "centavos"
 // (redondeo del complemento) en Cobranza — más que esto es otro depósito.
 const TOLERANCIA_CENTAVOS_DEPOSITO = 0.10;
@@ -4235,8 +4242,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // 12-sep).
   const verdadBancaria = await construirVerdadBancaria(
     movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal,
-    // Solo Cobranza (Pagos) — Ingreso nunca: ahí el fallback se queda igual.
-    { fallbackSoloSinFolioFiscal: poliza.tipo !== 'I' && movimientos.some(m => m.tipoComprobante === 'P') },
+    opcionesVerdadBancariaExport(poliza, movimientos),
   );
   // "Depósitos consolidados (Efectivo)"/"(Tarjeta)" — confirmado con el
   // usuario 2026-09-10: para TODAS las sucursales, ambos van a la cuenta
@@ -5978,7 +5984,7 @@ module.exports = {
   // Exports temporales de diagnóstico (solo lectura, sin cambio de comportamiento
   // — expone funciones ya existentes para poder reproducir el pipeline real de
   // exportContpaqXlsx desde un script aislado). Seguro quitarlos después.
-  _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
+  _construirVerdadBancaria: construirVerdadBancaria, _opcionesVerdadBancariaExport: opcionesVerdadBancariaExport, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
   _construirWorkbookPoliza,

@@ -188,3 +188,28 @@ test('depósito que aplicó otro monto a la factura (no es solo de este cobro) �
   const verdad = new Map([['F7', { ...deposito('o', '054959', 6067.50), _montoAplicado: 6067.50 }]]);
   expect(bancos(anotar(movs, 20, verdad)).map(l => l.debe)).toEqual([3033.75]);
 });
+
+test('sin monto aplicado en Bancos y diferencia > 10 centavos → se queda el complemento (límite anterior)', () => {
+  const movs = factura({ pago: 'P7', fact: 'F7', monto: 3033.75, iva: 418.45, concepto: 'X / D0-1' });
+  const verdad = new Map([['F7', deposito('o', '054959', 3034)]]);
+  const out = anotar(movs, 20, verdad);
+  expect(bancos(out).map(l => l.debe)).toEqual([3033.75]);
+  expect(out.find(l => l.cuenta.codigo === '1103010001').haber).toBe(3033.75);
+});
+
+test('depósito de este cobro pero que paga varias facturas → no se ajusta al depósito', () => {
+  const movs = factura({ pago: 'P7', fact: 'F7', monto: 3033.75, iva: 418.45, concepto: 'X / D0-1' });
+  const verdad = new Map([['F7', { ...deposito('o', '054959', 5000, 2), _montoAplicado: 3033.75 }]]);
+  expect(bancos(anotar(movs, 20, verdad)).map(l => l.debe)).toEqual([3033.75]);
+});
+
+test('depósito de este cobro menor que el complemento → banco y Clientes al depósito, cuadrada', () => {
+  const movs = factura({ pago: 'P7', fact: 'F7', monto: 3033.75, iva: 418.45, concepto: 'X / D0-1' });
+  const verdad = new Map([['F7', { ...deposito('o', '054959', 3000), _montoAplicado: 3033.75 }]]);
+  const out = anotar(movs, 20, verdad);
+  expect(bancos(out).map(l => l.debe)).toEqual([3000]);
+  expect(out.find(l => l.cuenta.codigo === '1103010001').haber).toBe(3000);
+  const debe = out.reduce((s, l) => s + Number(l.debe), 0);
+  const haber = out.reduce((s, l) => s + Number(l.haber), 0);
+  expect(Math.round((debe - haber) * 100)).toBe(0);
+});

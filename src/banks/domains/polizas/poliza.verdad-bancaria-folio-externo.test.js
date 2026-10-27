@@ -14,7 +14,7 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 
 const BankMovement = require('../banks/BankMovement.model');
-const { _construirVerdadBancaria: construir } = require('./poliza.service');
+const { _construirVerdadBancaria: construir, _opcionesVerdadBancariaExport: opciones } = require('./poliza.service');
 
 const FACTURA_BERLI = 'AAAAAAAA-0000-0000-0000-000000000001';
 const deposito047168 = folioFiscal => ({
@@ -43,4 +43,35 @@ test('Ingreso (sin opción): se conserva el fallback aunque traiga folioFiscal d
   BankMovement.find.mockReturnValueOnce(lean([])).mockReturnValueOnce(lean([deposito047168('C0392C92-C652-4DDA-BBB6-AC96D89A4588')]));
   const mapa = await construir([{ cfdiUuid: FACTURA_BERLI, serie: 'A0-260900821' }], undefined, '2026-10-26');
   expect(mapa.get(FACTURA_BERLI)?.referencia).toBe('047168');
+});
+
+test('Cobranza: folioFiscal de ESTA factura → se liga directo por folioFiscal', async () => {
+  BankMovement.find.mockReturnValueOnce(lean([deposito047168(FACTURA_BERLI)])).mockReturnValueOnce(lean([]));
+  const mapa = await construir([{ cfdiUuid: FACTURA_BERLI, serie: 'A0-260900821' }], undefined, '2026-10-26', COBRANZA);
+  expect(mapa.get(FACTURA_BERLI)?.referencia).toBe('047168');
+});
+
+test('Cobranza: folioFiscal de ESTA factura en minúsculas → se liga igual', async () => {
+  BankMovement.find.mockReturnValueOnce(lean([deposito047168(FACTURA_BERLI.toLowerCase())])).mockReturnValueOnce(lean([]));
+  const mapa = await construir([{ cfdiUuid: FACTURA_BERLI, serie: 'A0-260900821' }], undefined, '2026-10-26', COBRANZA);
+  expect(mapa.get(FACTURA_BERLI)?.referencia).toBe('047168');
+});
+
+describe('qué póliza activa el candado al exportar', () => {
+  const pago = { tipoComprobante: 'P' };
+  const venta = { tipoComprobante: 'I' };
+
+  test('Ingreso (aunque traiga Pagos) → no', () => {
+    expect(opciones({ tipo: 'I' }, [venta, pago])).toEqual({ fallbackSoloSinFolioFiscal: false });
+  });
+  test('Ingreso sin Pagos → no', () => {
+    expect(opciones({ tipo: 'I' }, [venta])).toEqual({ fallbackSoloSinFolioFiscal: false });
+  });
+  test('Cobranza (tipo D con Pagos) → sí', () => {
+    expect(opciones({ tipo: 'D' }, [pago, pago])).toEqual({ fallbackSoloSinFolioFiscal: true });
+  });
+  test('Egreso / Diario sin Pagos → no', () => {
+    expect(opciones({ tipo: 'E' }, [venta])).toEqual({ fallbackSoloSinFolioFiscal: false });
+    expect(opciones({ tipo: 'D' }, [venta])).toEqual({ fallbackSoloSinFolioFiscal: false });
+  });
 });

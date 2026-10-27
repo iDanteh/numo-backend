@@ -169,3 +169,22 @@ test('NI de una factura pagada con 2 transferencias → cada cobro con su depós
     ['2104010002', 'NI', 26.95],
   ]);
 });
+
+// 2026-10-27: "siempre se toma el monto del depósito" — OSCAR JIMENEZ LOPEZ
+// dep 054959: complemento $3,033.75, depósito $3,034.00 (aplicó $3,033.75).
+test('depósito de este cobro con diferencia > 10 centavos → banco y Clientes al monto del depósito', () => {
+  const movs = factura({ pago: 'P7', fact: 'F7', monto: 3033.75, iva: 418.45, concepto: 'OSCAR JIMENEZ LOPEZ / D0-261004304' });
+  const verdad = new Map([['F7', { ...deposito('o', '054959', 3034), _montoAplicado: 3033.75 }]]);
+  const out = anotar(movs, 20, verdad);
+  expect(bancos(out).map(l => [l.serie, l.debe])).toEqual([['054959', 3034]]);
+  expect(out.find(l => l.cuenta.codigo === '1103010001').haber).toBe(3034);
+  const debe = out.reduce((s, l) => s + Number(l.debe), 0);
+  const haber = out.reduce((s, l) => s + Number(l.haber), 0);
+  expect(Math.round((debe - haber) * 100)).toBe(0);
+});
+
+test('depósito que aplicó otro monto a la factura (no es solo de este cobro) → se queda el complemento', () => {
+  const movs = factura({ pago: 'P7', fact: 'F7', monto: 3033.75, iva: 418.45, concepto: 'X / D0-1' });
+  const verdad = new Map([['F7', { ...deposito('o', '054959', 6067.50), _montoAplicado: 6067.50 }]]);
+  expect(bancos(anotar(movs, 20, verdad)).map(l => l.debe)).toEqual([3033.75]);
+});

@@ -4178,12 +4178,14 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // 1058 CEDIS 2-sep): un solo renglón con centro de otra sucursal
   // (C0-260900073 "factura cancelada, cobro real", centro CONSTRUCASA) hacía
   // que los 11,710 renglones salieran en un solo archivo, sin separar
-  // Bonificaciones ni Descuentos y Devoluciones. Solo Ingreso: Cobranza y el
-  // resto conservan la regla de "todos los renglones".
+  // Bonificaciones ni Descuentos y Devoluciones.
+  // Solo aplica a Ingreso (2026-10-27, póliza 1427 Cobranza CEDIS 25-oct):
+  // Cobranza/Egreso arman un único bloque con tipoVenta null, así que si todos
+  // sus renglones eran de CEDIS el reparto Ventas/Bonificaciones/Descuentos
+  // tronaba con "Cannot read properties of undefined (reading 'push')".
   const esMovCedis = m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS';
-  const esCedis = movimientos.length > 0 && (poliza.tipo === 'I'
-    ? movimientos.filter(esMovCedis).length * 2 > movimientos.length
-    : movimientos.every(esMovCedis));
+  const esCedis = poliza.tipo === 'I' && movimientos.length > 0
+    && movimientos.filter(esMovCedis).length * 2 > movimientos.length;
 
   const sinCuenta = movimientos.filter(m => m.cuentaFaltante || m.cuentaId == null);
   if (sinCuenta.length > 0) {

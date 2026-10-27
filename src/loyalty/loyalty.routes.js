@@ -165,4 +165,31 @@ router.patch('/promociones/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG
   res.json(await configService.editarPromocion(req.params.id, req.body ?? {}));
 }));
 
+// Catálogos de Kore (conceptos/formas de pago) espejados para configurar qué
+// ventas acumulan puntos (2026-10-26) — `acumulaPuntos`/`esPuntos` son
+// SIEMPRE manuales, un sync nunca los pisa (ver loyalty-config.service.js).
+router.get('/config/conceptos-kore', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await configService.listarConceptosKore({ soloActivos: req.query.soloActivos === 'true' }));
+}));
+
+router.post('/config/conceptos-kore/sync', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.sincronizarConceptosKore());
+}));
+
+router.patch('/config/conceptos-kore/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.actualizarConceptoKore(req.params.id, req.body ?? {}));
+}));
+
+router.get('/config/formas-pago-kore', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await configService.listarFormasPagoKore({ soloActivos: req.query.soloActivos === 'true' }));
+}));
+
+router.post('/config/formas-pago-kore/sync', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.sincronizarFormasPagoKore());
+}));
+
+router.patch('/config/formas-pago-kore/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.actualizarFormaPagoKore(req.params.id, req.body ?? {}));
+}));
+
 module.exports = router;

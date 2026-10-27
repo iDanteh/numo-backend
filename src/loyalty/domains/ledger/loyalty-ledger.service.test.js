@@ -11,11 +11,11 @@
  * (ver tasks.md Phase 2, nota de mocking del prompt de apply).
  */
 
-const { Transaction } = require('sequelize');
+const { Transaction, Op } = require('sequelize');
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard:             { findByPk: jest.fn() },
-  LoyaltyPointsLedger:     { create: jest.fn(), findAndCountAll: jest.fn() },
+  LoyaltyPointsLedger:     { create: jest.fn(), findAndCountAll: jest.fn(), findOne: jest.fn() },
   LoyaltyTierHistory:      { findAll: jest.fn() },
   LoyaltyAdjustmentReason: { findByPk: jest.fn() },
   CentroCosto:             { findByPk: jest.fn() },
@@ -92,6 +92,9 @@ beforeEach(() => {
   // con un objeto distinto de undefined, nada lo inspecciona en estos mocks.
   sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data }));
+  // Sin acreditación previa de Kore por default — mismo comportamiento que hoy
+  // en todos los tests existentes que no mencionan el blindaje cruzado manual/kore.
+  LoyaltyPointsLedger.findOne.mockResolvedValue(null);
   // Sin promo vigente por default — mismo comportamiento que hoy en todos los
   // tests existentes que no la mencionan explícitamente.
   configService.obtenerPromocionVigente.mockResolvedValue(null);
@@ -177,6 +180,8 @@ describe('registrarAcumulacion', () => {
     expect(movimiento.montoVenta).toBe(1000);
     // El total (con impuesto) se guarda aparte, solo para auditoría.
     expect(movimiento.montoVentaTotal).toBe(1160);
+    // montoBaseCalculo (2026-10-27): en el flujo manual nunca hay prorrateo, siempre coincide con montoVenta.
+    expect(movimiento.montoBaseCalculo).toBe(1000);
   });
 
   test('el % aplicado queda congelado aunque la config cambie después (snapshot, no referencia viva)', async () => {
@@ -314,6 +319,21 @@ describe('registrarAcumulacion', () => {
     ).rejects.toMatchObject({ statusCode: 409 });
   });
 
+  test('blindaje cruzado: el folio ya fue acreditado por el webhook de Kore → 409, nunca consulta a Kore ni escribe', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 5, origen: 'kore', referenciaExterna: 'A0-260605320:ACUMULACION' });
+
+    await expect(
+      ledgerService.registrarAcumulacion({ cardId: 1, serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(LoyaltyPointsLedger.findOne).toHaveBeenCalledWith({
+      where: { origen: 'kore', referenciaExterna: { [Op.like]: 'A0-260605320%' } },
+    });
+    expect(erpSyncService.sincronizarCuentasPendientes).not.toHaveBeenCalled();
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
   test('el resultado da 0 puntos → 400', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
@@ -328,15 +348,15 @@ describe('registrarAcumulacion', () => {
   });
 });
 
-describe('registrarAcumulacion con promoción vigente', () => {
-  test('sin promo vigente se comporta exactamente igual que hoy (regresión)', async () => {
+describe('registrarAcumulacion con promoción vigente (2026-10-27: filas separadas nivel/promoción)', () => {
+  test('sin promo vigente se comporta exactamente igual que hoy (regresión) — sin fila de promoción', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
     globalConfigService.getValue.mockResolvedValue('5');
     configService.obtenerPromocionVigente.mockResolvedValue(null);
 
-    const { movimiento } = await ledgerService.registrarAcumulacion(
+    const { movimiento, movimientoPromocion } = await ledgerService.registrarAcumulacion(
       { cardId: 1, serieFolio: 'A0-260605320' }, USER,
     );
 
@@ -344,23 +364,56 @@ describe('registrarAcumulacion con promoción vigente', () => {
     expect(movimiento.puntos).toBe('50.00');
     expect(movimiento.promocionNombre).toBeNull();
     expect(movimiento.promocionPorcentaje).toBeNull();
+    expect(movimientoPromocion).toBeNull();
   });
 
-  test('con promo vigente suma el % de bono al % del nivel y lo audita en el movimiento', async () => {
+  test('con promo vigente genera DOS filas separadas en el ledger: una de nivel y otra de promoción', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
     globalConfigService.getValue.mockResolvedValue('5');
     configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '3' });
 
-    const { movimiento } = await ledgerService.registrarAcumulacion(
+    const { movimiento, movimientoPromocion, saldoPuntos } = await ledgerService.registrarAcumulacion(
       { cardId: 1, serieFolio: 'A0-260605320' }, USER,
     );
 
-    expect(movimiento.porcentajeAplicado).toBe(8);
-    expect(movimiento.puntos).toBe('80.00');
-    expect(movimiento.promocionNombre).toBe('Buen Fin');
-    expect(movimiento.promocionPorcentaje).toBe('3');
+    // Fila del nivel: % propio (NO combinado), sin datos de promoción.
+    expect(movimiento.porcentajeAplicado).toBe(5);
+    expect(movimiento.puntos).toBe('50.00');
+    expect(movimiento.promocionNombre).toBeNull();
+    expect(movimiento.referenciaExterna).toBe('A0-260605320');
+
+    // Fila de la promoción: referenciaExterna con sufijo propio (no choca con la de nivel).
+    expect(movimientoPromocion.porcentajeAplicado).toBe(3);
+    expect(movimientoPromocion.puntos).toBe('30.00');
+    expect(movimientoPromocion.promocionNombre).toBe('Buen Fin');
+    expect(movimientoPromocion.promocionPorcentaje).toBe('3');
+    expect(movimientoPromocion.nivelAplicado).toBeNull();
+    expect(movimientoPromocion.referenciaExterna).toBe('A0-260605320:PROMOCION');
+
+    // El saldo final ya refleja AMBOS movimientos (50 + 30).
+    expect(saldoPuntos).toBe('80.00');
+    expect(card.saldoPuntos).toBe('80.00');
+  });
+
+  test('el bono de promoción redondea a 0 centavos → no escribe fila de promoción', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    globalConfigService.getValue.mockResolvedValue('5');
+    erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({
+      raw: [makeCuentaKore({ subtotal: 1, total: 1 })],
+    });
+    configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Micro Promo', porcentajeBono: '0.01' });
+
+    const { movimiento, movimientoPromocion, saldoPuntos } = await ledgerService.registrarAcumulacion(
+      { cardId: 1, serieFolio: 'A0-260605320' }, USER,
+    );
+
+    expect(movimiento.puntos).toBe('0.05');
+    expect(movimientoPromocion).toBeNull();
+    expect(saldoPuntos).toBe('0.05');
   });
 });
 

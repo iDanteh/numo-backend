@@ -19,9 +19,14 @@
  */
 
 const { Op } = require('sequelize');
-const { LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto } = require('../../../shared/models/postgres');
+const { sequelize } = require('../../../config/database.postgres');
+const {
+  LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
+  LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+} = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
 const globalConfigService = require('../../../shared/services/global-config.service');
+const koreCatalogosClient = require('./loyalty-kore-catalogos.client');
 
 const SECTION = 'lealtad';
 const NIVELES = ['BRONCE', 'PLATA', 'ORO'];
@@ -332,6 +337,146 @@ async function obtenerPromocionVigente(fecha = new Date()) {
   });
 }
 
+/**
+ * CATÁLOGOS DE KORE (2026-10-26) — conceptos (tipos de venta) y formas de
+ * pago, espejados para configurar manualmente qué ventas acumulan puntos (el
+ * webhook Kore→Numo que los va a consumir todavía NO existe, es un tema
+ * aparte). Decisión confirmada con el usuario: `acumulaPuntos`/`esPuntos` son
+ * SIEMPRE manuales — un sync nunca los pisa, solo trae nombre/abreviatura/tipo
+ * (conceptos) o los hints informativos de Kore (formas de pago).
+ */
+
+/** Upsert por `koreId`: solo toca nombre/abreviatura/tipo en los existentes,
+ *  nunca `acumulaPuntos`. Marca `activo:false` en lo que ya no vino de Kore. */
+async function sincronizarConceptosKore() {
+  const conceptosKore = await koreCatalogosClient.obtenerConceptosKore();
+  const idsVistos = new Set();
+  let nuevos = 0;
+  let actualizados = 0;
+
+  for (const c of conceptosKore) {
+    const koreId = String(c.Id ?? '').trim();
+    if (!koreId) continue;
+    idsVistos.add(koreId);
+
+    const datos = {
+      nombre:       String(c.Nombre ?? '').trim(),
+      abreviatura:  c.Abreviatura ?? null,
+      tipo:         c.Tipo ?? null,
+      activo:       true,
+    };
+
+    // eslint-disable-next-line no-await-in-loop -- universo chico (catálogo de conceptos de Kore,
+    // decenas de filas), secuencial sin problema, mismo criterio que correrMatchKore.
+    const [fila, creada] = await LoyaltyKoreConcepto.findOrCreate({
+      where:    { koreId },
+      defaults: { koreId, ...datos, acumulaPuntos: false },
+    });
+    if (creada) {
+      nuevos += 1;
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await fila.update(datos);
+      actualizados += 1;
+    }
+  }
+
+  const existentes = await LoyaltyKoreConcepto.findAll({ where: { activo: true } });
+  const aDesactivar = existentes.filter(f => !idsVistos.has(f.koreId));
+  for (const f of aDesactivar) {
+    // eslint-disable-next-line no-await-in-loop
+    await f.update({ activo: false });
+  }
+
+  return { nuevos, actualizados, desactivados: aDesactivar.length };
+}
+
+/** Mismo criterio que sincronizarConceptosKore, pero además refresca los
+ *  hints informativos de Kore (koreAcumulaPuntosHint/koreEsPuntosHint) en
+ *  cada sync — esos sí se pisan siempre, nunca son la config real. */
+async function sincronizarFormasPagoKore() {
+  const formasPagoKore = await koreCatalogosClient.obtenerFormasPagoKore();
+  const idsVistos = new Set();
+  let nuevos = 0;
+  let actualizados = 0;
+
+  for (const f of formasPagoKore) {
+    const koreId = String(f.ID ?? '').trim();
+    if (!koreId) continue;
+    idsVistos.add(koreId);
+
+    const datos = {
+      nombre:                 String(f.Nombre ?? '').trim(),
+      koreAcumulaPuntosHint:  !!f.AcumulaPuntosTuberos,
+      koreEsPuntosHint:       !!f.EsPuntos,
+      activo:                 true,
+    };
+
+    // eslint-disable-next-line no-await-in-loop -- universo chico, mismo criterio de arriba.
+    const [fila, creada] = await LoyaltyKoreFormaPago.findOrCreate({
+      where:    { koreId },
+      defaults: { koreId, ...datos, acumulaPuntos: false, esPuntos: false },
+    });
+    if (creada) {
+      nuevos += 1;
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await fila.update(datos);
+      actualizados += 1;
+    }
+  }
+
+  const existentes = await LoyaltyKoreFormaPago.findAll({ where: { activo: true } });
+  const aDesactivar = existentes.filter(f => !idsVistos.has(f.koreId));
+  for (const f of aDesactivar) {
+    // eslint-disable-next-line no-await-in-loop
+    await f.update({ activo: false });
+  }
+
+  return { nuevos, actualizados, desactivados: aDesactivar.length };
+}
+
+async function listarConceptosKore({ soloActivos = false } = {}) {
+  const where = soloActivos ? { activo: true } : {};
+  return LoyaltyKoreConcepto.findAll({ where, order: [['nombre', 'ASC']] });
+}
+
+async function listarFormasPagoKore({ soloActivos = false } = {}) {
+  const where = soloActivos ? { activo: true } : {};
+  return LoyaltyKoreFormaPago.findAll({ where, order: [['nombre', 'ASC']] });
+}
+
+async function actualizarConceptoKore(id, { acumulaPuntos } = {}) {
+  const fila = await LoyaltyKoreConcepto.findByPk(id);
+  if (!fila) throw new NotFoundError('Concepto de Kore');
+  if (acumulaPuntos !== undefined) await fila.update({ acumulaPuntos: !!acumulaPuntos });
+  return fila;
+}
+
+/** Si `esPuntos:true`, primero limpia cualquier OTRA fila que ya lo tuviera —
+ *  invariante "como mucho una forma de pago Puntos a la vez", manejada acá de
+ *  forma explícita (en vez de dejar que el índice único parcial tire un error
+ *  de constraint poco legible). */
+async function actualizarFormaPagoKore(id, { acumulaPuntos, esPuntos } = {}) {
+  const fila = await LoyaltyKoreFormaPago.findByPk(id);
+  if (!fila) throw new NotFoundError('Forma de pago de Kore');
+
+  await sequelize.transaction(async (t) => {
+    if (esPuntos === true) {
+      await LoyaltyKoreFormaPago.update(
+        { esPuntos: false },
+        { where: { esPuntos: true, id: { [Op.ne]: fila.id } }, transaction: t },
+      );
+    }
+    const cambios = {};
+    if (acumulaPuntos !== undefined) cambios.acumulaPuntos = !!acumulaPuntos;
+    if (esPuntos !== undefined) cambios.esPuntos = !!esPuntos;
+    await fila.update(cambios, { transaction: t });
+  });
+
+  return fila;
+}
+
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
@@ -346,4 +491,10 @@ module.exports = {
   crearPromocion,
   editarPromocion,
   obtenerPromocionVigente,
+  sincronizarConceptosKore,
+  sincronizarFormasPagoKore,
+  listarConceptosKore,
+  listarFormasPagoKore,
+  actualizarConceptoKore,
+  actualizarFormaPagoKore,
 };

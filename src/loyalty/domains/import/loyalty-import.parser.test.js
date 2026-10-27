@@ -111,6 +111,45 @@ describe('parseClientesCsv', () => {
 
     expect(resultado).toHaveLength(1);
   });
+
+  // Enriquecimiento (2026-10-23) — columnas opcionales, nunca llave de identidad.
+  test('extrae las columnas de enriquecimiento (Apodo, Sexo, Fecha nacimiento, Especialidades, Sucursal, dirección, Comentarios)', async () => {
+    const rows = [
+      '9005,CRISTINA,DIAZ GUTIERREZ,Cris,ORO,F,01/02/1990,,5559876543,,Comercial,JUAN PEREZ,A0,'
+      + 'Hidalgo,123,4B,Centro,Oaxaca,Oaxaca,68000,Cliente frecuente',
+    ];
+    const buffer = csvBuffer(rows);
+
+    const [fila] = await parseClientesCsv(buffer);
+
+    expect(fila.apellidos).toBe('DIAZ GUTIERREZ');
+    expect(fila.nombre).toBe('CRISTINA DIAZ GUTIERREZ');
+    expect(fila.apodo).toBe('Cris');
+    expect(fila.sexo).toBe('F');
+    expect(fila.fechaNacimiento).toBe('01/02/1990');
+    expect(fila.especialidades).toBe('Comercial');
+    expect(fila.sucursal).toBe('A0');
+    expect(fila.calle).toBe('Hidalgo');
+    expect(fila.numExterior).toBe('123');
+    expect(fila.numInterior).toBe('4B');
+    expect(fila.colonia).toBe('Centro');
+    expect(fila.municipio).toBe('Oaxaca');
+    expect(fila.estado).toBe('Oaxaca');
+    expect(fila.cp).toBe('68000');
+    expect(fila.comentarios).toBe('Cliente frecuente');
+  });
+
+  test('columnas de enriquecimiento ausentes del header: no rompen el parseo, quedan vacías (opcionales)', async () => {
+    const headerViejo = 'Tarjeta,Nombre,Apellidos,Categoria,Celular,Telefono';
+    const texto = [headerViejo, '9005,CRISTINA,DIAZ,ORO,5559876543,'].join('\r\n');
+    const buffer = Buffer.from(texto, 'latin1');
+
+    const [fila] = await parseClientesCsv(buffer);
+
+    expect(fila.nombre).toBe('CRISTINA DIAZ');
+    expect(fila.especialidades).toBe('');
+    expect(fila.comentarios).toBe('');
+  });
 });
 
 describe('parsePuntosLines', () => {

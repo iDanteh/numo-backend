@@ -108,7 +108,7 @@ test('crearLimitersConsulta() exporta una factory (MemoryStore fresca por llamad
   expect(par1[0]).not.toBe(par2[0]);
 });
 
-describe('recuperación de NIP en 2 pasos — mismo router público, sin authenticate', () => {
+describe('solicitud de código (paso 1, compartido por consulta) — mismo router público, sin authenticate', () => {
   test('POST /recuperacion/solicitar llega al service sin Authorization', async () => {
     const { app, recoveryService } = freshApp();
     recoveryService.solicitarCodigo.mockResolvedValue({ mensaje: 'Si el teléfono está registrado…' });
@@ -123,38 +123,6 @@ describe('recuperación de NIP en 2 pasos — mismo router público, sin authent
     const { app } = freshApp();
     const res = await request(app).get('/api/loyalty/public/recuperacion/solicitar').query({ telefono: '5512345678' });
     expect(res.status).toBe(404);
-  });
-
-  test('POST /recuperacion/confirmar llega al service sin Authorization', async () => {
-    const { app, recoveryService } = freshApp();
-    recoveryService.confirmarCodigo.mockResolvedValue({ nip: '4821' });
-
-    const res = await request(app).post('/api/loyalty/public/recuperacion/confirmar')
-      .send({ telefono: '5512345678', codigo: '654321' });
-
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ nip: '4821' });
-    expect(recoveryService.confirmarCodigo).toHaveBeenCalledWith('5512345678', '654321', expect.objectContaining({ ip: expect.anything() }));
-  });
-
-  test('GET /recuperacion/confirmar no existe (solo POST, D8: el código nunca en una URL)', async () => {
-    const { app } = freshApp();
-    const res = await request(app).get('/api/loyalty/public/recuperacion/confirmar').query({ telefono: '5512345678', codigo: '654321' });
-    expect(res.status).toBe(404);
-  });
-
-  test('falla de negocio en /confirmar (422 LOYALTY_RECOVERY_FAILED) se propaga con el mismo código', async () => {
-    const { app, recoveryService } = freshApp();
-    const err = Object.assign(new Error('El código no es válido o expiró.'), {
-      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
-    });
-    recoveryService.confirmarCodigo.mockRejectedValue(err);
-
-    const res = await request(app).post('/api/loyalty/public/recuperacion/confirmar')
-      .send({ telefono: '5512345678', codigo: '000000' });
-
-    expect(res.status).toBe(422);
-    expect(res.body.code).toBe('LOYALTY_RECOVERY_FAILED');
   });
 
   test('rate limit de /recuperacion/solicitar es independiente del de /consulta', async () => {
@@ -187,5 +155,53 @@ describe('recuperación de NIP en 2 pasos — mismo router público, sin authent
     const cuarto = await request(app).post('/api/loyalty/public/recuperacion/solicitar').send({ telefono: '5512345678' });
     expect(cuarto.status).toBe(429);
     expect(recoveryService.solicitarCodigo).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('consulta de puntos vía código (2026-10-26, reemplaza al NIP en /consulta)', () => {
+  test('POST /consulta/confirmar llega al service sin Authorization y devuelve el payload mínimo', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.confirmarCodigoConsulta.mockResolvedValue({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1234.5 });
+
+    const res = await request(app).post('/api/loyalty/public/consulta/confirmar')
+      .send({ telefono: '5512345678', codigo: '654321' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1234.5 });
+    expect(recoveryService.confirmarCodigoConsulta).toHaveBeenCalledWith('5512345678', '654321', expect.objectContaining({ ip: expect.anything() }));
+  });
+
+  test('GET /consulta/confirmar no existe (solo POST, D8: el código nunca en una URL)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/consulta/confirmar').query({ telefono: '5512345678', codigo: '654321' });
+    expect(res.status).toBe(404);
+  });
+
+  test('falla de negocio (422 LOYALTY_RECOVERY_FAILED) se propaga con el mismo código', async () => {
+    const { app, recoveryService } = freshApp();
+    const err = Object.assign(new Error('El código no es válido o expiró.'), {
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    recoveryService.confirmarCodigoConsulta.mockRejectedValue(err);
+
+    const res = await request(app).post('/api/loyalty/public/consulta/confirmar')
+      .send({ telefono: '5512345678', codigo: '000000' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('LOYALTY_RECOVERY_FAILED');
+  });
+
+  test('el 11vo request en la misma ventana de 15min → 429, antes de llamar al service', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.confirmarCodigoConsulta.mockResolvedValue({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1 });
+
+    for (let i = 0; i < 10; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await request(app).post('/api/loyalty/public/consulta/confirmar').send({ telefono: '5512345678', codigo: '654321' });
+      expect(r.status).toBe(200);
+    }
+    const onceavo = await request(app).post('/api/loyalty/public/consulta/confirmar').send({ telefono: '5512345678', codigo: '654321' });
+    expect(onceavo.status).toBe(429);
+    expect(recoveryService.confirmarCodigoConsulta).toHaveBeenCalledTimes(10);
   });
 });

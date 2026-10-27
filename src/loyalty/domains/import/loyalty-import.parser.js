@@ -141,6 +141,25 @@ async function parseClientesCsv(buffer) {
     // espera en loyalty_pending_enrollments (ver loyalty-import-apply.service.js).
     const correo = _celda(row, colMap, 'Correo');
 
+    // Enriquecimiento (2026-10-23) — registro histórico simple, nunca llave de identidad ni
+    // usado para lógica de negocio. A propósito NO están en CLIENTES_COLUMNAS_REQUERIDAS: deben
+    // ser opcionales, un CSV sin alguna de ellas no debe romper el import (ej. un CSV viejo
+    // generado antes de que el reporte las incluyera). "Vendedor" se deja afuera a propósito
+    // (a futuro guardará el id de Auth0, fuera de alcance de este cambio).
+    const apodo = _celda(row, colMap, 'Apodo');
+    const sexo = _celda(row, colMap, 'Sexo');
+    const fechaNacimiento = _celda(row, colMap, 'Fecha nacimiento');
+    const especialidades = _celda(row, colMap, 'Especialidades');
+    const sucursal = _celda(row, colMap, 'Sucursal');
+    const calle = _celda(row, colMap, 'Calle');
+    const numExterior = _celda(row, colMap, 'Num exterior');
+    const numInterior = _celda(row, colMap, 'Num Interior');
+    const colonia = _celda(row, colMap, 'Colonia');
+    const municipio = _celda(row, colMap, 'Municipio');
+    const estado = _celda(row, colMap, 'Estado');
+    const cp = _celda(row, colMap, 'CP');
+    const comentarios = _celda(row, colMap, 'Comentarios');
+
     // Fila completamente vacía (línea en blanco al final del archivo) → se
     // descarta; distinto de una fila con Tarjeta vacía pero nombre real,
     // que sí se conserva (es uno de los casos reales de duplicado, ver D4).
@@ -152,10 +171,26 @@ async function parseClientesCsv(buffer) {
       tarjetaRaw,
       tarjetaNormalizada: normalizarTarjeta(tarjetaRaw),
       nombre,
+      // Apellidos (2026-10-23) — enfoque aditivo: `nombre` sigue siendo el combinado de siempre,
+      // esto es solo granularidad extra para quien la necesite (ver LoyaltyCard.js#apellidos).
+      apellidos,
       celular,
       telefono,
       correo,
       categoriaOriginal,
+      apodo,
+      sexo,
+      fechaNacimiento,
+      especialidades,
+      sucursal,
+      calle,
+      numExterior,
+      numInterior,
+      colonia,
+      municipio,
+      estado,
+      cp,
+      comentarios,
     });
   }
 

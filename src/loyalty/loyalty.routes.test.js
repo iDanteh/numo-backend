@@ -25,6 +25,7 @@ jest.mock('./domains/cards/loyalty-card.service', () => ({
   crearTarjeta: jest.fn(),
   listar: jest.fn(),
   obtener: jest.fn(),
+  obtenerParaEditar: jest.fn(),
   editarTarjeta: jest.fn(),
   cambiarNip: jest.fn(),
   cambiarNivel: jest.fn(),
@@ -47,6 +48,12 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   listarPromociones: jest.fn(),
   crearPromocion: jest.fn(),
   editarPromocion: jest.fn(),
+  listarConceptosKore: jest.fn(),
+  sincronizarConceptosKore: jest.fn(),
+  actualizarConceptoKore: jest.fn(),
+  listarFormasPagoKore: jest.fn(),
+  sincronizarFormasPagoKore: jest.fn(),
+  actualizarFormaPagoKore: jest.fn(),
 }));
 
 const express = require('express');
@@ -86,13 +93,19 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
     { metodo: 'get',   ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_READ },
-    { metodo: 'post',  ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_CONFIG, body: { clave: 'x', nombre: 'x', signoPermitido: 'AMBOS' } },
+    { metodo: 'post',  ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_CONFIG, body: { clave: 'x', nombre: 'x' } },
     { metodo: 'patch', ruta: '/reasons/1',                  permiso: PERMISSIONS.LOYALTY_CONFIG, body: { activo: false } },
     { metodo: 'get',   ruta: '/sucursales',                 permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/sucursales/1',                permiso: PERMISSIONS.LOYALTY_CONFIG, body: { participaLealtad: false } },
     { metodo: 'get',   ruta: '/promociones',                 permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'post',  ruta: '/promociones',                 permiso: PERMISSIONS.LOYALTY_CONFIG, body: { nombre: 'Buen Fin', fechaInicio: '2026-11-01', fechaFin: '2026-11-17', porcentajeBono: 5 } },
     { metodo: 'patch', ruta: '/promociones/1',                permiso: PERMISSIONS.LOYALTY_CONFIG, body: { activa: false } },
+    { metodo: 'get',   ruta: '/config/conceptos-kore',         permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'post',  ruta: '/config/conceptos-kore/sync',    permiso: PERMISSIONS.LOYALTY_CONFIG },
+    { metodo: 'patch', ruta: '/config/conceptos-kore/1',       permiso: PERMISSIONS.LOYALTY_CONFIG, body: { acumulaPuntos: true } },
+    { metodo: 'get',   ruta: '/config/formas-pago-kore',       permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'post',  ruta: '/config/formas-pago-kore/sync',  permiso: PERMISSIONS.LOYALTY_CONFIG },
+    { metodo: 'patch', ruta: '/config/formas-pago-kore/1',     permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esPuntos: true } },
   ];
 
   const TODOS = Object.values(PERMISSIONS).filter((p) => p.startsWith('loyalty:'));
@@ -168,6 +181,17 @@ describe('wiring hacia los servicios (happy path)', () => {
     );
   });
 
+  test('GET /cards/:id/editar llama a obtenerParaEditar y exige loyalty:tarjetas:editar, no loyalty:read', async () => {
+    cardService.obtenerParaEditar.mockResolvedValue({ id: 42, apodo: 'Juancho' });
+
+    const sinPermiso = await request(app).get('/cards/42/editar').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(sinPermiso.status).toBe(403);
+
+    const res = await request(app).get('/cards/42/editar').set(perms(PERMISSIONS.LOYALTY_TARJETAS_EDITAR));
+    expect(res.status).toBe(200);
+    expect(cardService.obtenerParaEditar).toHaveBeenCalledWith('42');
+  });
+
   test('GET /cards/:id/movimientos llama a listarMovimientos con el id', async () => {
     ledgerService.listarMovimientos.mockResolvedValue({ movimientos: [] });
     const res = await request(app).get('/cards/42/movimientos').set(perms(PERMISSIONS.LOYALTY_READ));
@@ -184,14 +208,14 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(configService.guardarPorcentajes).toHaveBeenCalledWith({ Bronce: 1 }, expect.any(Object));
   });
 
-  test('POST /cards/:id/ajustes pasa montoBase al servicio', async () => {
+  test('POST /cards/:id/ajustes pasa puntos/reasonId/justificacion al servicio', async () => {
     ledgerService.registrarAjuste.mockResolvedValue({ movimiento: { id: 1 } });
     const res = await request(app).post('/cards/1/ajustes')
       .set(perms(PERMISSIONS.LOYALTY_AJUSTES))
-      .send({ montoBase: '100.00', reasonId: 10, justificacion: 'ajuste automático' });
+      .send({ puntos: '20.00', reasonId: 10, justificacion: 'ajuste manual' });
     expect(res.status).toBe(201);
     expect(ledgerService.registrarAjuste).toHaveBeenCalledWith(
-      { cardId: '1', puntos: undefined, montoBase: '100.00', reasonId: 10, justificacion: 'ajuste automático' },
+      { cardId: '1', puntos: '20.00', reasonId: 10, justificacion: 'ajuste manual' },
       expect.any(Object),
     );
   });
@@ -221,5 +245,55 @@ describe('wiring hacia los servicios (happy path)', () => {
       .send({ activa: false });
     expect(res.status).toBe(200);
     expect(configService.editarPromocion).toHaveBeenCalledWith('1', { activa: false });
+  });
+
+  test('GET /config/conceptos-kore llama a listarConceptosKore con soloActivos', async () => {
+    configService.listarConceptosKore.mockResolvedValue([]);
+    const res = await request(app).get('/config/conceptos-kore?soloActivos=true')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(configService.listarConceptosKore).toHaveBeenCalledWith({ soloActivos: true });
+  });
+
+  test('POST /config/conceptos-kore/sync llama a sincronizarConceptosKore', async () => {
+    configService.sincronizarConceptosKore.mockResolvedValue({ nuevos: 1, actualizados: 0, desactivados: 0 });
+    const res = await request(app).post('/config/conceptos-kore/sync')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    expect(res.status).toBe(200);
+    expect(configService.sincronizarConceptosKore).toHaveBeenCalled();
+  });
+
+  test('PATCH /config/conceptos-kore/:id llama a actualizarConceptoKore', async () => {
+    configService.actualizarConceptoKore.mockResolvedValue({ id: 1, acumulaPuntos: true });
+    const res = await request(app).patch('/config/conceptos-kore/1')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ acumulaPuntos: true });
+    expect(res.status).toBe(200);
+    expect(configService.actualizarConceptoKore).toHaveBeenCalledWith('1', { acumulaPuntos: true });
+  });
+
+  test('GET /config/formas-pago-kore llama a listarFormasPagoKore con soloActivos', async () => {
+    configService.listarFormasPagoKore.mockResolvedValue([]);
+    const res = await request(app).get('/config/formas-pago-kore')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(configService.listarFormasPagoKore).toHaveBeenCalledWith({ soloActivos: false });
+  });
+
+  test('POST /config/formas-pago-kore/sync llama a sincronizarFormasPagoKore', async () => {
+    configService.sincronizarFormasPagoKore.mockResolvedValue({ nuevos: 0, actualizados: 1, desactivados: 0 });
+    const res = await request(app).post('/config/formas-pago-kore/sync')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    expect(res.status).toBe(200);
+    expect(configService.sincronizarFormasPagoKore).toHaveBeenCalled();
+  });
+
+  test('PATCH /config/formas-pago-kore/:id llama a actualizarFormaPagoKore', async () => {
+    configService.actualizarFormaPagoKore.mockResolvedValue({ id: 1, esPuntos: true });
+    const res = await request(app).patch('/config/formas-pago-kore/1')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ esPuntos: true });
+    expect(res.status).toBe(200);
+    expect(configService.actualizarFormaPagoKore).toHaveBeenCalledWith('1', { esPuntos: true });
   });
 });

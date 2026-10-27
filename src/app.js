@@ -39,6 +39,7 @@ const espaciosRoutes          = require('./shared/routes/espacios.routes');
 const loyaltyPublicRoutes     = require('./loyalty/loyalty-public.routes');
 const loyaltyRoutes           = require('./loyalty/loyalty.routes');
 const loyaltyImportRoutes     = require('./loyalty/domains/import/loyalty-import.routes');
+const loyaltyKoreVentaRoutes  = require('./loyalty/domains/ledger/loyalty-kore-venta.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -175,6 +176,9 @@ app.use('/api/loyalty/public',    loyaltyPublicRoutes);
 // Más específica que '/api/loyalty' — se monta antes para no depender del
 // fallthrough del router genérico (que no conoce esta subruta de todos modos).
 app.use('/api/loyalty/import',    loyaltyImportRoutes);
+// Webhook Kore→Numo de venta (acumulación/devengación de puntos, 2026-10-26) — API key
+// server-to-server, no sesión Numo. Más específica que '/api/loyalty', se monta antes.
+app.use('/api/loyalty/kore',      loyaltyKoreVentaRoutes);
 app.use('/api/loyalty',           loyaltyRoutes);
 
 // Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se

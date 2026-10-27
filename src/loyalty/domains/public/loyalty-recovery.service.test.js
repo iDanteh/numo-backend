@@ -9,6 +9,7 @@
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard: { scope: jest.fn(), findOne: jest.fn() },
+  LoyaltySecurityEvent: { create: jest.fn() },
 }));
 jest.mock('../../shared/nip.util', () => ({
   generarNip: jest.fn(),
@@ -24,12 +25,12 @@ jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
 }));
 
-const { LoyaltyCard } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
 const {
-  generarNip, hashNip, generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
+  generarNip, generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
-const { solicitarCodigo, confirmarCodigo } = require('./loyalty-recovery.service');
+const { solicitarCodigo, confirmarCodigoConsulta } = require('./loyalty-recovery.service');
 
 const TELEFONO = '5512345678';
 const CODIGO_REAL = '654321';
@@ -167,14 +168,14 @@ describe('solicitarCodigo — teléfono existente genera y persiste un código n
   });
 });
 
-describe('confirmarCodigo — formato inválido rechaza sin tocar la base de datos', () => {
+describe('confirmarCodigoConsulta — formato inválido rechaza sin tocar la base de datos', () => {
   test.each([
     ['sin código', TELEFONO, undefined],
     ['código de 3 dígitos', TELEFONO, '123'],
     ['código con letras', TELEFONO, 'abcdef'],
     ['teléfono inválido', '551234abcd', CODIGO_REAL],
   ])('%s → 422 genérico, sin findOne', async (_desc, telefono, codigo) => {
-    await expect(confirmarCodigo(telefono, codigo)).rejects.toMatchObject({
+    await expect(confirmarCodigoConsulta(telefono, codigo)).rejects.toMatchObject({
       statusCode: 422,
       code: 'LOYALTY_RECOVERY_FAILED',
     });
@@ -182,22 +183,22 @@ describe('confirmarCodigo — formato inválido rechaza sin tocar la base de dat
   });
 });
 
-describe('confirmarCodigo — caminos de falla, todos indistinguibles entre sí', () => {
+describe('confirmarCodigoConsulta — caminos de falla, todos indistinguibles entre sí', () => {
   test('teléfono desconocido → 422 genérico, corre compararCodigo contra DUMMY_CODIGO_HASH', async () => {
     LoyaltyCard.findOne.mockResolvedValue(null);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
       statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
     });
     expect(compararCodigo).toHaveBeenCalledWith(CODIGO_REAL, DUMMY_CODIGO_HASH);
   });
 
   test('tarjeta bloqueada por intentos → 422 genérico aunque el código sea correcto', async () => {
-    const card = makeCard({ recuperacionBloqueadaHasta: new Date(Date.now() + 5 * 60 * 1000) });
+    const card = makeCard({ activa: true, recuperacionBloqueadaHasta: new Date(Date.now() + 5 * 60 * 1000) });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(true);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
       statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
     });
     expect(card.update).not.toHaveBeenCalled();
@@ -207,7 +208,7 @@ describe('confirmarCodigo — caminos de falla, todos indistinguibles entre sí'
     const card = makeCard({ recuperacionCodigoHash: null, recuperacionExpiraEn: null });
     LoyaltyCard.findOne.mockResolvedValue(card);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
       statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
     });
     expect(compararCodigo).toHaveBeenCalledWith(CODIGO_REAL, DUMMY_CODIGO_HASH);
@@ -217,7 +218,7 @@ describe('confirmarCodigo — caminos de falla, todos indistinguibles entre sí'
     const card = makeCard({ recuperacionExpiraEn: new Date(Date.now() - 1000) });
     LoyaltyCard.findOne.mockResolvedValue(card);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
       statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
     });
   });
@@ -225,12 +226,12 @@ describe('confirmarCodigo — caminos de falla, todos indistinguibles entre sí'
   test('todos los caminos de falla devuelven el mismo code/mensaje', async () => {
     LoyaltyCard.findOne.mockResolvedValueOnce(null);
     let errDesconocido;
-    try { await confirmarCodigo('5500000000', CODIGO_REAL); } catch (e) { errDesconocido = e; }
+    try { await confirmarCodigoConsulta('5500000000', CODIGO_REAL); } catch (e) { errDesconocido = e; }
 
     const cardExpirada = makeCard({ recuperacionExpiraEn: new Date(Date.now() - 1000) });
     LoyaltyCard.findOne.mockResolvedValueOnce(cardExpirada);
     let errExpirado;
-    try { await confirmarCodigo(TELEFONO, CODIGO_REAL); } catch (e) { errExpirado = e; }
+    try { await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL); } catch (e) { errExpirado = e; }
 
     expect(errDesconocido.statusCode).toBe(errExpirado.statusCode);
     expect(errDesconocido.code).toBe(errExpirado.code);
@@ -238,24 +239,24 @@ describe('confirmarCodigo — caminos de falla, todos indistinguibles entre sí'
   });
 });
 
-describe('confirmarCodigo — código incorrecto incrementa intentos y bloquea al 5to', () => {
+describe('confirmarCodigoConsulta — código incorrecto incrementa intentos y bloquea al 5to', () => {
   test('incrementa recuperacionIntentosFallidos en 1', async () => {
-    const card = makeCard({ recuperacionIntentosFallidos: 2 });
+    const card = makeCard({ activa: true, recuperacionIntentosFallidos: 2 });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(false);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
 
     expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ recuperacionIntentosFallidos: 3 }));
   });
 
   test('el 5to fallo consecutivo activa recuperacionBloqueadaHasta ~15 min adelante', async () => {
-    const card = makeCard({ recuperacionIntentosFallidos: 4 });
+    const card = makeCard({ activa: true, recuperacionIntentosFallidos: 4 });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(false);
 
     const antes = Date.now();
-    await expect(confirmarCodigo(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
 
     expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ recuperacionIntentosFallidos: 5 }));
     const [[cambios]] = card.update.mock.calls;
@@ -264,49 +265,24 @@ describe('confirmarCodigo — código incorrecto incrementa intentos y bloquea a
   });
 
   test('el 4to fallo consecutivo NO bloquea todavía', async () => {
-    const card = makeCard({ recuperacionIntentosFallidos: 3 });
+    const card = makeCard({ activa: true, recuperacionIntentosFallidos: 3 });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(false);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
 
     const [[cambios]] = card.update.mock.calls;
     expect(cambios.recuperacionBloqueadaHasta).toBeUndefined();
   });
 });
 
-describe('confirmarCodigo — éxito: NIP nuevo, código de un solo uso', () => {
-  test('genera NIP nuevo, limpia TODO lo de recuperación y audita el cambio', async () => {
-    const card = makeCard();
+describe('confirmarCodigoConsulta — busca la tarjeta con el scope que incluye recuperacionCodigoHash', () => {
+  test('usa el scope withRecuperacionCodigoHash', async () => {
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(true);
-    generarNip.mockReturnValue('4821');
-    hashNip.mockResolvedValue('hash-nip-nuevo');
 
-    const resultado = await confirmarCodigo(TELEFONO, CODIGO_REAL);
-
-    expect(resultado).toEqual({ nip: '4821' });
-    expect(card.update).toHaveBeenCalledWith({
-      nipHash: 'hash-nip-nuevo',
-      nipIntentosFallidos: 0,
-      nipBloqueadoHasta: null,
-      recuperacionCodigoHash: null,
-      recuperacionExpiraEn: null,
-      recuperacionIntentosFallidos: 0,
-      recuperacionBloqueadaHasta: null,
-      updatedById: null,
-      updatedByNombre: 'Recuperación pública (auto-servicio)',
-    });
-  });
-
-  test('busca la tarjeta con el scope que incluye recuperacionCodigoHash', async () => {
-    const card = makeCard();
-    LoyaltyCard.findOne.mockResolvedValue(card);
-    compararCodigo.mockResolvedValue(true);
-    generarNip.mockReturnValue('4821');
-    hashNip.mockResolvedValue('hash-nip-nuevo');
-
-    await confirmarCodigo(TELEFONO, CODIGO_REAL);
+    await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
 
     expect(LoyaltyCard.scope).toHaveBeenCalledWith('withRecuperacionCodigoHash');
   });
@@ -314,11 +290,11 @@ describe('confirmarCodigo — éxito: NIP nuevo, código de un solo uso', () => 
 
 describe('logging — nunca el código en texto plano en logger.warn, sí el teléfono enmascarado', () => {
   test('ningún argumento de logger.warn contiene el código intentado', async () => {
-    const card = makeCard();
+    const card = makeCard({ activa: true });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(false);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
 
     expect(logger.warn).toHaveBeenCalled();
     for (const call of logger.warn.mock.calls) {
@@ -330,14 +306,131 @@ describe('logging — nunca el código en texto plano en logger.warn, sí el tel
   });
 
   test('el teléfono logueado está enmascarado (no aparece completo)', async () => {
-    const card = makeCard();
+    const card = makeCard({ activa: true });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(false);
 
-    await expect(confirmarCodigo(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({ statusCode: 422 });
 
     const loggedFullPhone = logger.warn.mock.calls.some((call) =>
       call.some((arg) => typeof arg === 'string' && arg.includes(TELEFONO)));
     expect(loggedFullPhone).toBe(false);
+  });
+});
+
+describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pública (2026-10-26)', () => {
+  test('código correcto + tarjeta activa → devuelve nombre/nivel/saldoPuntos, nunca un NIP', async () => {
+    const card = makeCard({ activa: true, saldoPuntos: 1234.5 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado).toEqual({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1234.5 });
+    expect(generarNip).not.toHaveBeenCalled();
+    expect(card.update).toHaveBeenCalledWith({
+      recuperacionCodigoHash: null,
+      recuperacionExpiraEn: null,
+      recuperacionIntentosFallidos: 0,
+      recuperacionBloqueadaHasta: null,
+    });
+  });
+
+  test('código incorrecto comparte el mismo camino de error único (_validarCodigo)', async () => {
+    const card = makeCard({ activa: true });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(false);
+
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ recuperacionIntentosFallidos: expect.any(Number) }));
+  });
+
+  test('código correcto pero tarjeta inactiva → 422 genérico, no consume el código ni devuelve saldo', async () => {
+    const card = makeCard({ activa: false });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEvent (2026-10-26)', () => {
+  test('solicitarCodigo: fallo (teléfono desconocido) registra evento de auditoría', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await solicitarCodigo(TELEFONO, { ip: '10.0.0.1' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'solicitud_codigo',
+      resultado: 'fallo',
+      motivo: 'telefono desconocido',
+      telefono: TELEFONO,
+      ip: '10.0.0.1',
+    });
+  });
+
+  test('solicitarCodigo: éxito registra evento sin motivo', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    await solicitarCodigo(TELEFONO, { ip: '10.0.0.1' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'solicitud_codigo',
+      resultado: 'exito',
+      motivo: null,
+      telefono: TELEFONO,
+      ip: '10.0.0.1',
+    });
+  });
+
+  test('confirmarCodigoConsulta: fallo (código incorrecto) registra evento de auditoría', async () => {
+    const card = makeCard({ activa: true });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(false);
+
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_MALO, { ip: '10.0.0.2' })).rejects.toMatchObject({ statusCode: 422 });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'confirmacion_codigo',
+      resultado: 'fallo',
+      motivo: 'codigo incorrecto',
+      telefono: TELEFONO,
+      ip: '10.0.0.2',
+    });
+  });
+
+  test('confirmarCodigoConsulta: éxito registra evento sin motivo', async () => {
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL, { ip: '10.0.0.3' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'confirmacion_codigo',
+      resultado: 'exito',
+      motivo: null,
+      telefono: TELEFONO,
+      ip: '10.0.0.3',
+    });
+  });
+
+  test('si LoyaltySecurityEvent.create rechaza, la función de negocio igual completa normalmente', async () => {
+    LoyaltySecurityEvent.create.mockRejectedValue(new Error('DB caída'));
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).resolves.toEqual({
+      nombre: 'Ana', nivel: 'Plata', saldoPuntos: 100,
+    });
   });
 });

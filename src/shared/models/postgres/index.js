@@ -40,6 +40,10 @@ const LoyaltyTierHistory      = require('./LoyaltyTierHistory');
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 const LoyaltyPendingEnrollment = require('./LoyaltyPendingEnrollment');
 const LoyaltyPromotion        = require('./LoyaltyPromotion');
+const LoyaltySecurityEvent    = require('./LoyaltySecurityEvent');
+const LoyaltyKoreConcepto     = require('./LoyaltyKoreConcepto');
+const LoyaltyKoreFormaPago    = require('./LoyaltyKoreFormaPago');
+const LoyaltyKoreVentaFallida = require('./LoyaltyKoreVentaFallida');
 const PolizaAuditLog    = require('./PolizaAuditLog');
 
 // ── Asociaciones ──────────────────────────────────────────────────────────────
@@ -571,13 +575,31 @@ async function syncModels() {
   // no importa el orden respecto a las demás de Lealtad.
   await LoyaltyPromotion.sync({ force: false });
 
-  // Motivos de ajuste con % de cálculo automático (2026-10-20) — columna nueva
-  // sobre loyalty_adjustment_reasons, que YA existía: .sync({force:false})
-  // nunca altera una tabla existente.
+  // Auditoría append-only del flujo OTP de la ruta pública de consulta
+  // (2026-10-26, ver LoyaltySecurityEvent.js) — tabla nueva sin FKs.
+  await LoyaltySecurityEvent.sync({ force: false });
+
+  // Catálogos de Kore (conceptos/formas de pago) espejados para configurar qué
+  // ventas acumulan puntos (2026-10-26, ver LoyaltyKoreConcepto/
+  // LoyaltyKoreFormaPago.js) — tablas nuevas sin FKs.
+  await LoyaltyKoreConcepto.sync({ force: false });
+  await LoyaltyKoreFormaPago.sync({ force: false });
+  // Registro de procesos fallidos del webhook Kore→Numo de venta (2026-10-26, ver
+  // LoyaltyKoreVentaFallida.js) — tabla nueva sin FKs.
+  await LoyaltyKoreVentaFallida.sync({ force: false });
+
+  // REDISEÑO 2026-10-23 (pedido explícito del usuario): `signoPermitido`/`porcentaje` se
+  // eliminan por completo (verificado antes del cambio: 0 motivos reales con `porcentaje`
+  // seteado, 0 entradas de `loyalty_points_ledger` con `porcentajeAplicado` — ningún dato real
+  // se pierde), reemplazados por `puntosFijos` (ver LoyaltyAdjustmentReason.js). `.sync({force:
+  // false})` nunca borra/altera columnas existentes, por eso el DROP/ADD explícito acá —
+  // idempotente, igual patrón que el resto de este archivo.
   await LoyaltyAdjustmentReason.sequelize.query(`
     ALTER TABLE loyalty_adjustment_reasons
-      ADD COLUMN IF NOT EXISTS porcentaje DECIMAL(5,2)
-  `).catch(e => console.warn('[syncModels] ADD COLUMN porcentaje (loyalty_adjustment_reasons):', e.message));
+      DROP COLUMN IF EXISTS signo_permitido,
+      DROP COLUMN IF EXISTS porcentaje,
+      ADD COLUMN IF NOT EXISTS puntos_fijos INTEGER
+  `).catch(e => console.warn('[syncModels] ALTER COLUMN motivos de ajuste → puntos_fijos (loyalty_adjustment_reasons):', e.message));
 
   // Snapshot de la promoción aplicada en cada acumulación (2026-10-20) —
   // columnas nuevas sobre loyalty_points_ledger, que YA existía: idempotente.
@@ -595,6 +617,14 @@ async function syncModels() {
     ALTER TABLE loyalty_points_ledger
       ADD COLUMN IF NOT EXISTS monto_venta_total DECIMAL(14,2)
   `).catch(e => console.warn('[syncModels] ADD COLUMN monto_venta_total (loyalty_points_ledger):', e.message));
+
+  // Monto exacto usado en el cálculo de puntos (2026-10-27, pedido explícito del usuario: desglose
+  // transaccional específico en el detalle de movimientos) — columna nueva sobre loyalty_points_ledger,
+  // que YA existía: idempotente.
+  await LoyaltyPointsLedger.sequelize.query(`
+    ALTER TABLE loyalty_points_ledger
+      ADD COLUMN IF NOT EXISTS monto_base_calculo DECIMAL(14,2)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN monto_base_calculo (loyalty_points_ledger):', e.message));
 
   // Columnas nuevas sobre loyalty_cards, que YA existía con datos reales
   // (2026-10-20, recuperación de NIP en 2 pasos) — mismo motivo que el bloque
@@ -624,6 +654,16 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS resuelto_at         TIMESTAMPTZ
   `).catch(e => console.warn('[syncModels] ADD COLUMN resuelto_por_id/resuelto_por_nombre/resuelto_at (loyalty_pending_enrollments):', e.message));
 
+  // Columnas nuevas sobre una tabla que YA existía (2026-10-23, pendientes por teléfono
+  // duplicado entre 2+ tarjetas legadas, ver LoyaltyPendingEnrollment.js) — mismo patrón
+  // idempotente que el bloque de arriba.
+  await LoyaltyPendingEnrollment.sequelize.query(`
+    ALTER TABLE loyalty_pending_enrollments
+      ADD COLUMN IF NOT EXISTS motivo              VARCHAR(20) NOT NULL DEFAULT 'sin_telefono',
+      ADD COLUMN IF NOT EXISTS grupo_id            VARCHAR(20),
+      ADD COLUMN IF NOT EXISTS telefono_candidato  VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN motivo/grupo_id/telefono_candidato (loyalty_pending_enrollments):', e.message));
+
   // Respaldo de BD para D4 (consistencia de saldo): ningún script o bug futuro
   // puede dejar saldo_puntos negativo, incluso si algún día alguien escribe
   // fuera de _aplicarMovimiento. Idempotente vía bloque DO + catch duplicate_object.
@@ -632,6 +672,68 @@ async function syncModels() {
       ALTER TABLE loyalty_cards ADD CONSTRAINT loyalty_cards_saldo_no_negativo CHECK (saldo_puntos >= 0);
     EXCEPTION WHEN duplicate_object THEN NULL; END $$
   `).catch(e => console.warn('[syncModels] CHECK loyalty_cards_saldo_no_negativo:', e.message));
+
+  // Match de clientes con Kore (monedero externo) — columnas nuevas sobre loyalty_cards, que YA
+  // existía con datos reales: idempotente, mismo patrón que el resto de este archivo. Ver
+  // LoyaltyCard.js y kore-match/ (loyalty/domains/kore-match).
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS tarjeta_legada   VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS kore_cliente_id  VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS kore_monedero    VARCHAR(50)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN tarjeta_legada/kore_cliente_id/kore_monedero (loyalty_cards):', e.message));
+  // Ensancha una base que ya corrió el ADD COLUMN de arriba con el tamaño viejo (VARCHAR(20)) —
+  // ALTER COLUMN TYPE a un VARCHAR más ancho es metadata-only en Postgres (sin reescritura de
+  // tabla), idempotente: no-op si ya está en el tamaño nuevo. Ver incidente real 2026-10-23 junto
+  // a num_exterior/num_interior más abajo.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ALTER COLUMN tarjeta_legada TYPE VARCHAR(50),
+      ALTER COLUMN kore_monedero  TYPE VARCHAR(50)
+  `).catch(e => console.warn('[syncModels] ALTER COLUMN tarjeta_legada/kore_monedero a VARCHAR(50):', e.message));
+
+  await LoyaltyCard.sequelize.query(`
+    CREATE INDEX IF NOT EXISTS loyalty_cards_tarjeta_legada_idx ON loyalty_cards (tarjeta_legada)
+  `).catch(e => console.warn('[syncModels] CREATE INDEX loyalty_cards_tarjeta_legada_idx:', e.message));
+  await LoyaltyCard.sequelize.query(`
+    CREATE INDEX IF NOT EXISTS loyalty_cards_kore_cliente_id_idx ON loyalty_cards (kore_cliente_id)
+  `).catch(e => console.warn('[syncModels] CREATE INDEX loyalty_cards_kore_cliente_id_idx:', e.message));
+
+  // Enriquecimiento del import de clientes.csv (2026-10-23) — columnas nuevas sobre loyalty_cards,
+  // que YA existía con datos reales: idempotente, mismo patrón que el resto de este archivo. Solo
+  // registro histórico, nunca usado para lógica de negocio (ver LoyaltyCard.js).
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS apellidos         VARCHAR(200)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN apellidos (loyalty_cards):', e.message));
+
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS apodo             VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS sexo              VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS fecha_nacimiento  VARCHAR(50),
+      ADD COLUMN IF NOT EXISTS especialidades    VARCHAR(300),
+      ADD COLUMN IF NOT EXISTS sucursal          VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS calle             VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS num_exterior      VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS num_interior      VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS colonia           VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS municipio         VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS estado            VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS cp                VARCHAR(10),
+      ADD COLUMN IF NOT EXISTS comentarios       TEXT
+  `).catch(e => console.warn('[syncModels] ADD COLUMN enriquecimiento clientes.csv (loyalty_cards):', e.message));
+  // INCIDENTE REAL 2026-10-23: un cliente con Num exterior "CASA 13 CONDOMINIO 26" (21
+  // caracteres) reventó el import con VARCHAR(20) original. Ensancha una base que ya corrió el
+  // ADD COLUMN de arriba con los tamaños viejos — metadata-only, idempotente (ver nota de
+  // tarjeta_legada/kore_monedero más arriba).
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ALTER COLUMN sexo             TYPE VARCHAR(50),
+      ALTER COLUMN fecha_nacimiento TYPE VARCHAR(50),
+      ALTER COLUMN num_exterior     TYPE VARCHAR(100),
+      ALTER COLUMN num_interior     TYPE VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ALTER COLUMN enriquecimiento clientes.csv a tamaños más anchos:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };

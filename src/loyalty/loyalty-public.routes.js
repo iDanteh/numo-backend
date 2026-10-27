@@ -76,9 +76,16 @@ router.post('/recuperacion/solicitar', limitersRecuperacion.solicitar, asyncHand
   res.json(resultado);
 }));
 
-router.post('/recuperacion/confirmar', limitersRecuperacion.confirmar, asyncHandler(async (req, res) => {
+// Consulta de puntos vía código de verificación (2026-10-26, reemplaza al NIP
+// estático en /consulta — ver memoria project_lealtad_consulta_publica_otp).
+// "Solicitar" reusa exactamente /recuperacion/solicitar (mismo código, mismo
+// mensaje genérico); acá solo cambia qué se hace al confirmarlo. La ruta
+// pública `/recuperacion/confirmar` (flujo "recuperar NIP olvidado", único
+// otro consumidor de este mismo limiter) se eliminó el mismo día — quedó
+// huérfana una vez que el NIP dejó de ser necesario para el cliente final.
+router.post('/consulta/confirmar', limitersRecuperacion.confirmar, asyncHandler(async (req, res) => {
   const { telefono, codigo } = req.body ?? {};
-  const resultado = await recoveryService.confirmarCodigo(telefono, codigo, { ip: req.ip });
+  const resultado = await recoveryService.confirmarCodigoConsulta(telefono, codigo, { ip: req.ip });
   res.json(resultado);
 }));
 

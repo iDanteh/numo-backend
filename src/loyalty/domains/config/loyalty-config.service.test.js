@@ -21,14 +21,28 @@ jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyAdjustmentReason: { findAll: jest.fn(), findByPk: jest.fn(), create: jest.fn() },
   LoyaltyPromotion:        { findAll: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findOne: jest.fn() },
   CentroCosto:             { findAll: jest.fn(), findByPk: jest.fn() },
+  LoyaltyKoreConcepto:     { findAll: jest.fn(), findByPk: jest.fn(), findOrCreate: jest.fn() },
+  LoyaltyKoreFormaPago:    { findAll: jest.fn(), findByPk: jest.fn(), findOrCreate: jest.fn(), update: jest.fn() },
 }));
 jest.mock('../../../shared/services/global-config.service', () => ({
   getValue: jest.fn(),
   setValue: jest.fn(),
 }));
+jest.mock('../../../config/database.postgres', () => ({
+  sequelize: { transaction: jest.fn() },
+}));
+jest.mock('./loyalty-kore-catalogos.client', () => ({
+  obtenerConceptosKore: jest.fn(),
+  obtenerFormasPagoKore: jest.fn(),
+}));
 
-const { LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto } = require('../../../shared/models/postgres');
+const {
+  LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
+  LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+} = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
+const { sequelize } = require('../../../config/database.postgres');
+const koreCatalogosClient = require('./loyalty-kore-catalogos.client');
 const configService = require('./loyalty-config.service');
 
 const USER = { dbId: 1, nombre: 'Admin' };
@@ -122,56 +136,58 @@ describe('listarReasons', () => {
 });
 
 describe('crearReason', () => {
-  test('signoPermitido inválido → 400, no inserta', async () => {
+  test('nombre vacío → 400, no inserta', async () => {
     await expect(
-      configService.crearReason({ clave: 'x', nombre: 'X', signoPermitido: 'MAS' }),
+      configService.crearReason({ clave: 'x', nombre: '   ' }),
     ).rejects.toMatchObject({ statusCode: 400 });
 
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('signoPermitido válido → crea con activo=true, porcentaje:null (sin % en el payload)', async () => {
+  test('sin puntosFijos → crea en modo manual (puntosFijos: null)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 1 });
 
-    await configService.crearReason({ clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO' });
+    await configService.crearReason({ clave: 'correccion', nombre: 'Corrección' });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO', activo: true, porcentaje: null,
+      clave: 'correccion', nombre: 'Corrección', activo: true, puntosFijos: null,
     });
   });
 
-  test('porcentaje + signoPermitido AMBOS → 400, no inserta (el signo del % automático no puede ser ambiguo)', async () => {
-    await expect(
-      configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'AMBOS', porcentaje: '5' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-
-    expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
-  });
-
   test.each([
-    ['0'], ['-1'], ['100.01'], ['101'], ['3.456'], ['abc'],
-  ])('porcentaje con formato/rango inválido (%s) → 400, no inserta', async (valor) => {
+    [0], ['abc'], [5.5],
+  ])('puntosFijos inválido (%s) → 400, no inserta', async (valor) => {
     await expect(
-      configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', porcentaje: valor }),
+      configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: valor }),
     ).rejects.toMatchObject({ statusCode: 400 });
 
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('porcentaje válido + signo POSITIVO → crea con el % guardado', async () => {
+  test('puntosFijos positivo → crea el motivo con ese valor (ej. "Bono" = 100)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 5 });
 
-    await configService.crearReason({ clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', porcentaje: '7.5' });
+    await configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: 100 });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'comision', nombre: 'Comisión', signoPermitido: 'POSITIVO', activo: true, porcentaje: '7.5',
+      clave: 'bono', nombre: 'Bono', activo: true, puntosFijos: 100,
+    });
+  });
+
+  test('puntosFijos negativo → crea el motivo con ese valor (ej. "Comisión por mora" = -200)', async () => {
+    LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 6 });
+
+    await configService.crearReason({ clave: 'comision_mora', nombre: 'Comisión por mora', puntosFijos: -200 });
+
+    expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
+      clave: 'comision_mora', nombre: 'Comisión por mora', activo: true, puntosFijos: -200,
     });
   });
 });
 
 describe('editarReason', () => {
   function makeReason(overrides = {}) {
-    const reason = { id: 1, clave: 'bono', nombre: 'Bono', signoPermitido: 'POSITIVO', activo: true, ...overrides };
+    const reason = { id: 1, clave: 'bono', nombre: 'Bono', activo: true, puntosFijos: null, ...overrides };
     reason.update = jest.fn(async (changes) => { Object.assign(reason, changes); return reason; });
     return reason;
   }
@@ -193,53 +209,33 @@ describe('editarReason', () => {
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
   });
 
-  test('signoPermitido inválido en edición → 400, no actualiza', async () => {
+  test('puntosFijos inválido en edición → 400, no actualiza', async () => {
     const reason = makeReason();
     LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
 
     await expect(
-      configService.editarReason(1, { signoPermitido: 'RARO' }),
+      configService.editarReason(1, { puntosFijos: 0 }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(reason.update).not.toHaveBeenCalled();
   });
 
-  test('porcentaje con signoPermitido AMBOS ya guardado (no viene en el payload) → 400', async () => {
-    const reason = makeReason({ signoPermitido: 'AMBOS' });
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
-
-    await expect(
-      configService.editarReason(1, { porcentaje: '5' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(reason.update).not.toHaveBeenCalled();
-  });
-
-  test('porcentaje válido junto con signoPermitido POSITIVO en el mismo payload → actualiza ambos', async () => {
-    const reason = makeReason({ signoPermitido: 'AMBOS' });
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
-
-    const resultado = await configService.editarReason(1, { porcentaje: '5', signoPermitido: 'POSITIVO' });
-
-    expect(reason.update).toHaveBeenCalledWith({ signoPermitido: 'POSITIVO', porcentaje: '5' });
-    expect(resultado.porcentaje).toBe('5');
-  });
-
-  test('porcentaje: null explícito quita el % (vuelve el motivo manual)', async () => {
-    const reason = makeReason({ porcentaje: '5.00' });
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
-
-    await configService.editarReason(1, { porcentaje: null });
-
-    expect(reason.update).toHaveBeenCalledWith({ porcentaje: null });
-  });
-
-  test('porcentaje inválido en edición → 400, no actualiza', async () => {
+  test('puntosFijos válido → actualiza el valor fijo', async () => {
     const reason = makeReason();
     LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
 
-    await expect(
-      configService.editarReason(1, { porcentaje: '200' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(reason.update).not.toHaveBeenCalled();
+    const resultado = await configService.editarReason(1, { puntosFijos: 100 });
+
+    expect(reason.update).toHaveBeenCalledWith({ puntosFijos: 100 });
+    expect(resultado.puntosFijos).toBe(100);
+  });
+
+  test('puntosFijos: null explícito vuelve el motivo manual', async () => {
+    const reason = makeReason({ puntosFijos: 100 });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await configService.editarReason(1, { puntosFijos: null });
+
+    expect(reason.update).toHaveBeenCalledWith({ puntosFijos: null });
   });
 });
 
@@ -427,5 +423,154 @@ describe('actualizarSucursal', () => {
     await configService.actualizarSucursal(10, { participaLealtad: false, permiteCanjeLealtad: false });
 
     expect(centro.update).toHaveBeenCalledWith({ participaLealtad: false, permiteCanjeLealtad: false });
+  });
+});
+
+// ── Catálogos de Kore (conceptos/formas de pago, 2026-10-26) ──────────────────
+// `acumulaPuntos`/`esPuntos` son SIEMPRE manuales — un sync nunca los pisa, solo
+// nombre/abreviatura/tipo (conceptos) o los hints informativos de Kore (formas
+// de pago). Ver loyalty-config.service.js para el detalle de la decisión.
+
+function makeConcepto(overrides = {}) {
+  return { id: 1, koreId: 'c1', nombre: 'COBRO CONTRA ENTREGA', acumulaPuntos: false, activo: true, update: jest.fn(), ...overrides };
+}
+
+function makeFormaPago(overrides = {}) {
+  return {
+    id: 1, koreId: 'f1', nombre: 'EFECTIVO', acumulaPuntos: false, esPuntos: false,
+    koreAcumulaPuntosHint: null, koreEsPuntosHint: null, activo: true, update: jest.fn(), ...overrides,
+  };
+}
+
+describe('sincronizarConceptosKore', () => {
+  test('concepto nuevo: se crea con acumulaPuntos:false, nunca pisa un valor manual existente', async () => {
+    koreCatalogosClient.obtenerConceptosKore.mockResolvedValue([
+      { Id: 'c1', Nombre: 'COBRO CONTRA ENTREGA', Abreviatura: 'CCE', Tipo: 'ENTRADA' },
+    ]);
+    LoyaltyKoreConcepto.findOrCreate.mockResolvedValue([makeConcepto(), true]);
+    LoyaltyKoreConcepto.findAll.mockResolvedValue([]);
+
+    const resultado = await configService.sincronizarConceptosKore();
+
+    expect(LoyaltyKoreConcepto.findOrCreate).toHaveBeenCalledWith({
+      where:    { koreId: 'c1' },
+      defaults: expect.objectContaining({ koreId: 'c1', nombre: 'COBRO CONTRA ENTREGA', acumulaPuntos: false }),
+    });
+    expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
+  test('concepto existente: actualiza nombre/abreviatura/tipo, nunca toca acumulaPuntos', async () => {
+    const existente = makeConcepto({ acumulaPuntos: true });
+    koreCatalogosClient.obtenerConceptosKore.mockResolvedValue([
+      { Id: 'c1', Nombre: 'NUEVO NOMBRE', Abreviatura: 'NN', Tipo: 'SALIDA' },
+    ]);
+    LoyaltyKoreConcepto.findOrCreate.mockResolvedValue([existente, false]);
+    LoyaltyKoreConcepto.findAll.mockResolvedValue([existente]);
+
+    const resultado = await configService.sincronizarConceptosKore();
+
+    expect(existente.update).toHaveBeenCalledWith({ nombre: 'NUEVO NOMBRE', abreviatura: 'NN', tipo: 'SALIDA', activo: true });
+    expect(existente.update).not.toHaveBeenCalledWith(expect.objectContaining({ acumulaPuntos: expect.anything() }));
+    expect(resultado.actualizados).toBe(1);
+  });
+
+  test('concepto que ya no viene de Kore: se marca activo:false, nunca se borra', async () => {
+    const yaNoViene = makeConcepto({ koreId: 'viejo' });
+    koreCatalogosClient.obtenerConceptosKore.mockResolvedValue([]);
+    LoyaltyKoreConcepto.findAll.mockResolvedValue([yaNoViene]);
+
+    const resultado = await configService.sincronizarConceptosKore();
+
+    expect(yaNoViene.update).toHaveBeenCalledWith({ activo: false });
+    expect(resultado.desactivados).toBe(1);
+  });
+});
+
+describe('sincronizarFormasPagoKore', () => {
+  test('forma de pago nueva: se crea con acumulaPuntos/esPuntos en false, guarda los hints de Kore', async () => {
+    koreCatalogosClient.obtenerFormasPagoKore.mockResolvedValue([
+      { ID: 'f1', Nombre: 'EFECTIVO', AcumulaPuntosTuberos: true, EsPuntos: false },
+    ]);
+    LoyaltyKoreFormaPago.findOrCreate.mockResolvedValue([makeFormaPago(), true]);
+    LoyaltyKoreFormaPago.findAll.mockResolvedValue([]);
+
+    const resultado = await configService.sincronizarFormasPagoKore();
+
+    expect(LoyaltyKoreFormaPago.findOrCreate).toHaveBeenCalledWith({
+      where:    { koreId: 'f1' },
+      defaults: expect.objectContaining({
+        koreId: 'f1', nombre: 'EFECTIVO', acumulaPuntos: false, esPuntos: false,
+        koreAcumulaPuntosHint: true, koreEsPuntosHint: false,
+      }),
+    });
+    expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
+  test('forma de pago existente: refresca los hints de Kore, nunca toca acumulaPuntos/esPuntos reales', async () => {
+    const existente = makeFormaPago({ acumulaPuntos: true, esPuntos: true, koreAcumulaPuntosHint: false });
+    koreCatalogosClient.obtenerFormasPagoKore.mockResolvedValue([
+      { ID: 'f1', Nombre: 'EFECTIVO', AcumulaPuntosTuberos: true, EsPuntos: false },
+    ]);
+    LoyaltyKoreFormaPago.findOrCreate.mockResolvedValue([existente, false]);
+    LoyaltyKoreFormaPago.findAll.mockResolvedValue([existente]);
+
+    await configService.sincronizarFormasPagoKore();
+
+    expect(existente.update).toHaveBeenCalledWith({
+      nombre: 'EFECTIVO', koreAcumulaPuntosHint: true, koreEsPuntosHint: false, activo: true,
+    });
+    expect(existente.update).not.toHaveBeenCalledWith(expect.objectContaining({ acumulaPuntos: expect.anything() }));
+    expect(existente.update).not.toHaveBeenCalledWith(expect.objectContaining({ esPuntos: expect.anything() }));
+  });
+});
+
+describe('actualizarConceptoKore', () => {
+  test('actualiza acumulaPuntos', async () => {
+    const concepto = makeConcepto();
+    LoyaltyKoreConcepto.findByPk.mockResolvedValue(concepto);
+
+    await configService.actualizarConceptoKore(1, { acumulaPuntos: true });
+
+    expect(concepto.update).toHaveBeenCalledWith({ acumulaPuntos: true });
+  });
+
+  test('id inexistente: 404', async () => {
+    LoyaltyKoreConcepto.findByPk.mockResolvedValue(null);
+    await expect(configService.actualizarConceptoKore(999, { acumulaPuntos: true })).rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+
+describe('actualizarFormaPagoKore', () => {
+  beforeEach(() => {
+    sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
+  });
+
+  test('actualiza acumulaPuntos sin tocar esPuntos', async () => {
+    const forma = makeFormaPago();
+    LoyaltyKoreFormaPago.findByPk.mockResolvedValue(forma);
+
+    await configService.actualizarFormaPagoKore(1, { acumulaPuntos: true });
+
+    expect(forma.update).toHaveBeenCalledWith({ acumulaPuntos: true }, { transaction: { fake: true } });
+    expect(LoyaltyKoreFormaPago.update).not.toHaveBeenCalled();
+  });
+
+  test('esPuntos:true limpia cualquier otra fila que ya lo tuviera, ANTES de guardar la propia', async () => {
+    const forma = makeFormaPago({ id: 2 });
+    LoyaltyKoreFormaPago.findByPk.mockResolvedValue(forma);
+
+    await configService.actualizarFormaPagoKore(2, { esPuntos: true });
+
+    const { Op } = require('sequelize');
+    expect(LoyaltyKoreFormaPago.update).toHaveBeenCalledWith(
+      { esPuntos: false },
+      { where: { esPuntos: true, id: { [Op.ne]: 2 } }, transaction: { fake: true } },
+    );
+    expect(forma.update).toHaveBeenCalledWith({ esPuntos: true }, { transaction: { fake: true } });
+  });
+
+  test('id inexistente: 404', async () => {
+    LoyaltyKoreFormaPago.findByPk.mockResolvedValue(null);
+    await expect(configService.actualizarFormaPagoKore(999, { esPuntos: true })).rejects.toMatchObject({ statusCode: 404 });
   });
 });

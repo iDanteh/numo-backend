@@ -35,6 +35,9 @@
  *  - Reintentos acotados DENTRO de la misma llamada ante errores inesperados
  *    (mismo criterio que `erp-reversion.service.js`), nunca un 200 que oculte
  *    un fallo en segundo plano.
+ *  - `procesarLoteVentasKore` (2026-10-27, pedido explícito del usuario): variante en lote de
+ *    `POST /venta`, hasta `MAX_VENTAS_POR_LOTE` ventas por request, procesadas en serie, cada una
+ *    independiente (una que falla no aborta las demás) — ver su propio docstring más abajo.
  */
 
 const { Transaction, Op } = require('sequelize');
@@ -70,18 +73,18 @@ function _refCanje(serieFolio) { return `${serieFolio}:CANJE`; }
 function _refPromocion(serieFolio) { return `${serieFolio}:PROMOCION`; }
 
 // Blindaje cruzado manual↔kore (2026-10-27, pedido explícito del usuario, escenario simétrico al
-// ya resuelto del lado manual en loyalty-ledger.service.js#registrarAcumulacion): el botón manual
-// escribe la fila de nivel con referenciaExterna = EL SERIE-FOLIO PLANO (sin sufijo — ver
-// registrarAcumulacion) y, si hubo promoción, `${serieFolio}:PROMOCION` (mismo sufijo que acá). El
-// canje manual nunca referencia un serieFolio (registrarCanje no lo recibe), así que no hay fila
-// 'manual' de tipo CANJE que buscar. Se incluye en el MISMO chequeo de idempotencia que ya existe
-// para 'kore' — si la venta ya fue acreditada a mano, el webhook no debe duplicarla ni fallar: debe
-// responder "aplicado" con lo que ya hay, igual que ante un reenvío propio.
+// ya resuelto del lado manual en loyalty-ledger.service.js#registrarAcumulacion/registrarCanje): el
+// botón manual escribe la fila de nivel con referenciaExterna = EL SERIE-FOLIO PLANO (sin sufijo —
+// ver registrarAcumulacion), y `${serieFolio}:PROMOCION`/`${serieFolio}:CANJE` para promoción y
+// canje (mismos sufijos que acá, ver registrarCanje tras su propio blindaje 2026-10-27). Se incluye
+// en el MISMO chequeo de idempotencia que ya existe para 'kore' — si la venta ya fue acreditada a
+// mano, el webhook no debe duplicarla ni fallar: debe responder "aplicado" con lo que ya hay, igual
+// que ante un reenvío propio.
 function _condicionIdempotencia(serieFolio) {
   return {
     [Op.or]: [
       { origen: ORIGEN_KORE, referenciaExterna: { [Op.in]: [_refAcumulacion(serieFolio), _refCanje(serieFolio), _refPromocion(serieFolio)] } },
-      { origen: 'manual', referenciaExterna: { [Op.in]: [serieFolio, `${serieFolio}:PROMOCION`] } },
+      { origen: 'manual', referenciaExterna: { [Op.in]: [serieFolio, `${serieFolio}:PROMOCION`, `${serieFolio}:CANJE`] } },
     ],
   };
 }
@@ -470,4 +473,42 @@ async function procesarVentaKore(payload) {
   throw ultimoError;
 }
 
-module.exports = { consultarSaldoKore, procesarVentaKore };
+const MAX_VENTAS_POR_LOTE = 100;
+
+/**
+ * `POST /api/loyalty/kore/ventas` (plural, 2026-10-27, pedido explícito del usuario): procesa
+ * varias ventas en un solo request sin tocar `procesarVentaKore` (el endpoint singular sigue
+ * funcionando exactamente igual, cero riesgo de regresión ahí). Cada venta se procesa EN SERIE
+ * (no `Promise.all`): varias ventas del mismo lote pueden ser de la misma tarjeta, y procesarlas en
+ * paralelo pelearía por el mismo `LOCK.UPDATE` de fila — en serie es más lento pero determinístico.
+ * Una venta que falla NUNCA aborta las demás: se reusa `procesarVentaKore` tal cual (con sus propios
+ * reintentos/idempotencia/transacción) y se captura su error por item, igual que un lote de
+ * facturas o pólizas en otros módulos de este proyecto.
+ */
+async function procesarLoteVentasKore(ventas) {
+  if (!Array.isArray(ventas) || ventas.length === 0) {
+    throw new BadRequestError('ventas debe ser un arreglo no vacío.');
+  }
+  if (ventas.length > MAX_VENTAS_POR_LOTE) {
+    throw new BadRequestError(`No se pueden procesar más de ${MAX_VENTAS_POR_LOTE} ventas en un solo lote.`);
+  }
+
+  const resultados = [];
+  for (const venta of ventas) {
+    try {
+      // eslint-disable-next-line no-await-in-loop -- en serie a propósito, ver docstring arriba.
+      const resultado = await procesarVentaKore(venta);
+      resultados.push({ serieFolio: resultado.serieFolio, success: true, ...resultado });
+    } catch (err) {
+      resultados.push({
+        serieFolio: venta?.serieFolio ?? null,
+        success: false,
+        error: err.message,
+        statusCode: err.statusCode ?? 500,
+      });
+    }
+  }
+  return { resultados };
+}
+
+module.exports = { consultarSaldoKore, procesarVentaKore, procesarLoteVentasKore };

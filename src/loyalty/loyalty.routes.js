@@ -95,8 +95,8 @@ router.post('/cards/:id/acumulaciones', authenticate, permit(PERMISSIONS.LOYALTY
 }));
 
 router.post('/cards/:id/canjes', authenticate, permit(PERMISSIONS.LOYALTY_MOVIMIENTOS), asyncHandler(async (req, res) => {
-  const { puntos, serie } = req.body ?? {};
-  const resultado = await ledgerService.registrarCanje({ cardId: req.params.id, puntos, serie }, req.user);
+  const { puntos, serieFolio } = req.body ?? {};
+  const resultado = await ledgerService.registrarCanje({ cardId: req.params.id, puntos, serieFolio }, req.user);
   res.status(201).json(resultado);
 }));
 

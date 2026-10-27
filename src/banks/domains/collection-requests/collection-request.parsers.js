@@ -52,6 +52,7 @@ function parseCxcs(raw) {
     nombrePersona:        c.nombrePersona        ? String(c.nombrePersona).trim()        : null,
     nombreTipoMovimiento: c.nombreTipoMovimiento ? String(c.nombreTipoMovimiento).trim().toUpperCase() : null,
     montoAsignado:        c.montoAsignado != null ? Number(c.montoAsignado) : null,
+    subtotal:             c.subtotal != null      ? Number(c.subtotal)      : null,
   }));
 }
 

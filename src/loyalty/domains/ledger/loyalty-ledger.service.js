@@ -39,10 +39,6 @@ const erpSyncService = require('../../../banks/domains/erp/erp-sync.service');
 // Formato Kore: "SERIE-FOLIO" (p.ej. "A0-260605320"). La serie es alfanumérica
 // corta (clave de sucursal/almacén); el folio es el consecutivo de venta.
 const SERIE_FOLIO_RE = /^([A-Za-z0-9]{1,10})-(\d{1,20})$/;
-// CANJE (2026-10-21, pedido explícito del usuario): mismo reemplazo del select
-// de sucursal, pero solo con la serie (sin folio) — no hay una venta externa
-// que referenciar, solo hace falta saber a qué sucursal pertenece el canje.
-const SERIE_RE = /^[A-Za-z0-9]{1,10}$/;
 
 async function _resolverCentroCostoIdPorSerie(serie) {
   const ccBySerieMap = await centrosCostoService.resolveBySerieMap();
@@ -76,14 +72,6 @@ async function _resolverCentroCostoPorSerieFolio(serieFolioRaw) {
   const serie = serieRaw.toUpperCase();
   const centroCostoId = await _resolverCentroCostoIdPorSerie(serie);
   return { serie, folio, centroCostoId, referenciaExterna: `${serie}-${folio}` };
-}
-
-async function _resolverCentroCostoPorSerie(serieRaw) {
-  const serie = String(serieRaw ?? '').trim().toUpperCase();
-  if (!SERIE_RE.test(serie)) {
-    throw new BadRequestError('Captura la serie de la sucursal (ej. A0).');
-  }
-  return _resolverCentroCostoIdPorSerie(serie);
 }
 
 // Kore folios encode YYMMxxxxx (ej. "260600250" → año=2026, mes=06) — mismo
@@ -367,44 +355,79 @@ async function registrarAcumulacion({ cardId, serieFolio }, user) {
  * CANJE: debita a 1 punto = $1.00 MXN. El tope contra el saldo se valida
  * DESPUÉS de bloquear la fila (evita TOCTOU entre dos canjes concurrentes).
  *
- * `serie` (2026-10-21, pedido explícito del usuario): mismo reemplazo del
- * select de sucursal que ACUMULACION, pero sin folio — el canje no referencia
- * una venta externa, solo necesita saber la sucursal.
+ * BLINDAJE 2026-10-27 (pedido explícito del usuario, mismo criterio que ya
+ * tiene ACUMULACION): `serie` suelta se reemplaza por `serieFolio` — el canje
+ * ya NO acepta una sucursal a secas, exige el Serie-Folio de una venta REAL
+ * en Kore (se consulta su CxC igual que en ACUMULACION) y tope los puntos a
+ * canjear al `total` de esa venta — nunca se inventa un folio ni se canjea
+ * más de lo que la venta vale.
  */
-async function registrarCanje({ cardId, puntos, serie }, user) {
+async function registrarCanje({ cardId, serieFolio, puntos }, user) {
   if (!(Number(puntos) > 0)) {
     throw new BadRequestError('puntos debe ser mayor a 0.');
   }
 
-  const centroCostoId = await _resolverCentroCostoPorSerie(serie);
+  const { serie, folio, centroCostoId, referenciaExterna } = await _resolverCentroCostoPorSerieFolio(serieFolio);
+
   const centroCosto = await _obtenerCentroCosto(centroCostoId);
   if (!centroCosto.permiteCanjeLealtad) {
     throw new UnprocessableError('Esta sucursal no permite canjes de lealtad.');
   }
 
-  return sequelize.transaction(async (t) => {
-    const card = await LoyaltyCard.findByPk(cardId, { transaction: t, lock: Transaction.LOCK.UPDATE });
-    if (!card) throw new NotFoundError('Tarjeta');
-    if (!card.activa) throw new UnprocessableError('La tarjeta está inactiva.');
-
-    const puntosCents = toCents(puntos);
-    const saldoCents  = toCents(card.saldoPuntos);
-    if (puntosCents > saldoCents) {
-      throw new ConflictError('El canje excede el saldo de puntos disponible.');
-    }
-
-    const { usuarioId, usuarioNombre } = _userLabel(user);
-    const entry = await _aplicarMovimiento(t, card, {
-      tipo:   'CANJE',
-      puntos: fromCents(-puntosCents),
-      centroCostoId,
-      origen: 'manual',
-      usuarioId,
-      usuarioNombre,
-    });
-
-    return { movimiento: entry, saldoPuntos: entry.saldoResultante };
+  // Blindaje cruzado (mismo patrón que ACUMULACION): si el webhook de Kore ya
+  // aplicó un canje para esta venta, no se vuelve a capturar a mano.
+  const yaProcesadaPorKore = await LoyaltyPointsLedger.findOne({
+    where: { origen: 'kore', referenciaExterna: `${referenciaExterna}:CANJE` },
   });
+  if (yaProcesadaPorKore) {
+    throw new ConflictError(
+      'Esta venta ya tiene un canje de puntos aplicado por Kore. No se puede registrar de nuevo de forma manual.',
+    );
+  }
+
+  // Confirma que el folio es una venta real en Kore — nunca se inventa un folio de la nada
+  // (mismo _obtenerCuentaKorePorSerieFolio que usa ACUMULACION).
+  const cuentaKore = await _obtenerCuentaKorePorSerieFolio(serie, folio);
+  const puntosCents = toCents(puntos);
+  if (puntosCents > toCents(cuentaKore.total)) {
+    throw new BadRequestError(
+      `Los puntos a canjear no pueden superar el total de la venta ($${cuentaKore.total}).`,
+    );
+  }
+
+  try {
+    return await sequelize.transaction(async (t) => {
+      const card = await LoyaltyCard.findByPk(cardId, { transaction: t, lock: Transaction.LOCK.UPDATE });
+      if (!card) throw new NotFoundError('Tarjeta');
+      if (!card.activa) throw new UnprocessableError('La tarjeta está inactiva.');
+
+      const saldoCents = toCents(card.saldoPuntos);
+      if (puntosCents > saldoCents) {
+        throw new ConflictError('El canje excede el saldo de puntos disponible.');
+      }
+
+      const { usuarioId, usuarioNombre } = _userLabel(user);
+      const entry = await _aplicarMovimiento(t, card, {
+        tipo:   'CANJE',
+        puntos: fromCents(-puntosCents),
+        centroCostoId,
+        referenciaExterna: `${referenciaExterna}:CANJE`,
+        origen: 'manual',
+        usuarioId,
+        usuarioNombre,
+      });
+
+      return { movimiento: entry, saldoPuntos: entry.saldoResultante };
+    });
+  } catch (err) {
+    // Índice único parcial (origen, referencia_externa) — el mismo folio ya tuvo un canje antes.
+    if (err?.name === 'SequelizeUniqueConstraintError') {
+      throw new ConflictError(
+        `Ya se registró un canje con el folio "${referenciaExterna}". Si el monto estaba mal, corrígelo con un ajuste.`,
+      );
+    }
+    throw err;
+  }
 }
 
 /**

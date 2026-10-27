@@ -129,7 +129,7 @@ const CUENTA_NETPAY_AMEX                = '1101010001'; // Renglón "NETPAY AE" 
  *   donde cayó el depósito (ver `BANCO_A_CODIGO_CUENTA`) — null cuando el
  *   banco no tiene cuenta dedicada en el catálogo, o no se pudo determinar.
  */
-async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null) {
+async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null, { fallbackSoloSinFolioFiscal = false } = {}) {
   const mapa = new Map();
   const fechaRefMs = fechaReferencia ? new Date(fechaReferencia).getTime() : null;
   const uuidsUnicos = [...new Set(movimientos.map(m => m.cfdiUuid).filter(Boolean).map(u => u.toUpperCase()))];
@@ -237,9 +237,17 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
       // Resuelve el uuid por folioFiscal si es válido; si no (null o no es
       // uno de los que buscamos), cae al fallback por serie+folioExterno —
       // ver docstring de la función.
+      // Cobranza (`fallbackSoloSinFolioFiscal`): la serie del renglón es el
+      // folio de la FACTURA y folioExterno es el folio interno de la cuenta en
+      // Kore — misma serie, contadores distintos, así que un folioFiscal de
+      // OTRA factura nunca entra al fallback (2026-10-27, Cobranza 1426 del
+      // 26-oct: la factura A0-260900821 de BERLI JEANETH DESALES tomaba el
+      // depósito Azteca 047168 de la cuenta A0-260900821 de JESUS JAIME CRUZ
+      // MIJANGOS). Ingreso conserva el fallback tal cual.
+      const usarFallback = !(fallbackSoloSinFolioFiscal && folioFiscalUpper);
       const uuidResuelto = uuidsSet.has(folioFiscalUpper)
         ? folioFiscalUpper
-        : (link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
+        : (usarFallback && link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
       if (!uuidResuelto) continue;
       // Kore registró este cobro como "DEPOSITO EN EFECTIVO" en este mismo
       // depósito: efectivo que el cliente depositó directo al banco (ver
@@ -4218,7 +4226,11 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // mismo ticket/factura tiene 2+ depósitos reales ligados en fechas
   // distintas (ver docstring de `construirVerdadBancaria`, caso real CEDIS
   // 12-sep).
-  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal);
+  const verdadBancaria = await construirVerdadBancaria(
+    movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal,
+    // Solo Cobranza (Pagos) — Ingreso nunca: ahí el fallback se queda igual.
+    { fallbackSoloSinFolioFiscal: poliza.tipo !== 'I' && movimientos.some(m => m.tipoComprobante === 'P') },
+  );
   // "Depósitos consolidados (Efectivo)"/"(Tarjeta)" — confirmado con el
   // usuario 2026-09-10: para TODAS las sucursales, ambos van a la cuenta
   // bancaria real 1102011001 (BBVA) en vez de las genéricas Caja/Bancos por

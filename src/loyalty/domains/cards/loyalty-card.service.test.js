@@ -350,6 +350,14 @@ describe('listar — orden (sort/sortDir)', () => {
     );
   });
 
+  test('sort="creado" → ordena por la columna real createdAt, no por "creado"', async () => {
+    await cardService.listar({ sort: 'creado', sortDir: 'desc' });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ order: [['createdAt', 'DESC']] }),
+    );
+  });
+
   test.each(['telefono', 'nombre', 'nivel', 'activa'])('sort="%s" es una columna permitida, ASC por default', async (col) => {
     await cardService.listar({ sort: col });
 
@@ -380,5 +388,50 @@ describe('listar — orden (sort/sortDir)', () => {
     expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
       expect.objectContaining({ order: [['nombre', 'ASC']] }),
     );
+  });
+});
+
+describe('listar — filtro por origen (2 fuentes: proceso existente de Numo vs. webhook de Kore)', () => {
+  beforeEach(() => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });
+  });
+
+  test('origen="kore" → filtra createdById="kore-webhook"', async () => {
+    await cardService.listar({ origen: 'kore' });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ createdById: 'kore-webhook' }) }),
+    );
+  });
+
+  test('origen="numo" → excluye "kore-webhook" PERO incluye createdById nulo (tarjetas migradas)', async () => {
+    await cardService.listar({ origen: 'numo' });
+
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    const Sequelize = require('sequelize');
+    const grupoOr = where[Sequelize.Op.and][0][Sequelize.Op.or];
+    expect(grupoOr).toEqual(expect.arrayContaining([
+      { createdById: { [Sequelize.Op.ne]: 'kore-webhook' } },
+      { createdById: { [Sequelize.Op.is]: null } },
+    ]));
+  });
+
+  test('sin origen (u otro valor cualquiera) → no agrega ningún filtro de origen', async () => {
+    await cardService.listar({});
+    const { where: whereSinOrigen } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(whereSinOrigen.createdById).toBeUndefined();
+
+    await cardService.listar({ origen: 'otracosa' });
+    const { where: whereOtroValor } = LoyaltyCard.findAndCountAll.mock.calls[1][0];
+    expect(whereOtroValor.createdById).toBeUndefined();
+  });
+
+  test('origen="numo" + search combinados: ambos filtros sobreviven (no se pisan)', async () => {
+    await cardService.listar({ origen: 'numo', search: 'Juan' });
+
+    const Sequelize = require('sequelize');
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    const grupos = where[Sequelize.Op.and];
+    expect(grupos).toHaveLength(2); // grupo de origen + grupo de search, ninguno pisó al otro
   });
 });

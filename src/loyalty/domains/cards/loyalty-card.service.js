@@ -18,6 +18,12 @@ const { generarNip, hashNip } = require('../../shared/nip.util');
 
 const NIVELES_VALIDOS = ['Bronce', 'Plata', 'Oro'];
 
+// Mismo literal que el actor sintético de loyalty-kore-cliente.service.js (webhook de catálogo de
+// clientes) — único discriminador de origen, no hace falta una columna nueva: cualquier otro valor
+// de `createdById` (incluido `null`, tarjetas migradas sin ese dato histórico) es origen "Numo"
+// (alta manual o import de CSV, ambos corridos por un usuario real).
+const CREATED_BY_KORE_WEBHOOK = 'kore-webhook';
+
 // "Datos adicionales" (2026-10-23) — mismos campos que el enriquecimiento del import de
 // clientes.csv (ver loyalty-import-apply.service.js#CAMPOS_ENRIQUECIMIENTO), ahora también
 // editables a mano para altas que no vienen de un CSV. Nunca obligatorios, nunca usados para
@@ -118,6 +124,7 @@ const SORT_COLUMNAS = {
   nivel:    'nivel',
   saldo:    'saldoPuntos',
   activa:   'activa',
+  creado:   'createdAt',
 };
 
 function _resolverOrden(sort, sortDir) {
@@ -127,19 +134,42 @@ function _resolverOrden(sort, sortDir) {
   return [[columna, dir]];
 }
 
-/** `search` matchea prefijo de teléfono o ILIKE sobre nombre. */
-async function listar({ search, nivel, activa, page = 1, limit = 50, sort, sortDir } = {}) {
+/** `search` matchea prefijo de teléfono o ILIKE sobre nombre. `origen`: 'kore' (creadas por el
+ *  webhook de catálogo de clientes) | 'numo' (alta manual o import de CSV, incluye `createdById`
+ *  nulo de tarjetas migradas) — cualquier otro valor no filtra, igual que el resto de filtros. */
+async function listar({ search, nivel, activa, origen, page = 1, limit = 50, sort, sortDir } = {}) {
   const where = {};
+  // Grupos OR independientes (origen, search) van en `Op.and` — nunca compartiendo la misma clave
+  // `Op.or` del `where`, porque una asignación pisaría a la otra en silencio si ambos filtros se
+  // mandan juntos (ej. buscar por nombre DENTRO del origen "numo").
+  const condiciones = [];
   if (nivel) where.nivel = nivel;
   if (activa !== undefined && activa !== null && activa !== '') {
     where.activa = activa === true || activa === 'true';
   }
+  if (origen === 'kore') {
+    where.createdById = CREATED_BY_KORE_WEBHOOK;
+  } else if (origen === 'numo') {
+    // Op.ne no matchea filas NULL en Postgres — hace falta el Op.or explícito para no dejar
+    // afuera a las tarjetas migradas que nunca tuvieron createdById.
+    condiciones.push({
+      [Op.or]: [
+        { createdById: { [Op.ne]: CREATED_BY_KORE_WEBHOOK } },
+        { createdById: { [Op.is]: null } },
+      ],
+    });
+  }
   if (search) {
     const s = String(search).trim();
-    where[Op.or] = [
-      { telefono: { [Op.like]: `${s}%` } },
-      { nombre:   { [Op.iLike]: `%${s}%` } },
-    ];
+    condiciones.push({
+      [Op.or]: [
+        { telefono: { [Op.like]: `${s}%` } },
+        { nombre:   { [Op.iLike]: `%${s}%` } },
+      ],
+    });
+  }
+  if (condiciones.length) {
+    where[Op.and] = condiciones;
   }
 
   const p = Math.max(1, Number(page) || 1);

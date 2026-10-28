@@ -124,3 +124,38 @@ test('actualizar un reporte eliminado → 404', async () => {
   ReportePorFacturar.findByPk.mockResolvedValue({ id: 7, eliminadoEn: new Date() });
   await expect(service.actualizar(7, {})).rejects.toThrow();
 });
+
+// 2026-10-28: Excel con una hoja por serie (A0, I0…) y, dentro de cada bloque,
+// los depósitos agrupados por cliente con su subtotal.
+test('excel: una hoja por serie y depósitos agrupados por cliente', async () => {
+  const ExcelJS = require('exceljs');
+  const dep = (cliente, importe, rem) => ({ fecha: '2026-10-20T00:00:00Z', descripcion: 'SPEI', importe, aplicado: importe, cliente, remisiones: [rem], ppdPorFacturar: true });
+  ReportePorFacturar.findByPk.mockReset();
+  ReportePorFacturar.findByPk.mockResolvedValue({ id: 3, toJSON: () => ({
+    id: 3, sucursal: 'Todas', fechaInicio: '2026-10-20', fechaFin: '2026-10-20',
+    datos: {
+      // El depósito de GAMA es de una remisión I0 → va a la hoja de I0.
+      movimientosMostrador: [{ serie: 'A0', folio: '1', esGlobal: true, depositos: [dep('ZETA', 10, 'A0-1'), dep('ALFA', 20, 'A0-2'), dep('ZETA', 5, 'A0-3'), dep('GAMA', 50, 'I0-7')] }],
+      depositosPendientesFactura: [dep('', 7, 'I0-9'), dep('BETA', 3, 'I0-8'), dep('ALFA', 1, 'A0-4')],
+    },
+  }) });
+  const { buffer } = await service.excel(3);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  // Con el nombre de la sucursal cuando la serie está en Centros de costo.
+  expect(wb.worksheets.map(w => w.name)).toEqual(['A0 - CEDIS', 'I0']);
+  const col = (ws, c) => ws.getColumn(c).values.filter(v => v != null && v !== '');
+  const a0 = col(wb.getWorksheet('A0 - CEDIS'), 1);
+  // Global: ALFA antes que ZETA; ZETA con sus 2 depósitos juntos.
+  expect(a0.filter(v => ['ALFA', 'ZETA'].includes(v))).toEqual(['ALFA', 'ZETA', 'ALFA']);
+  const subtotales = wb.getWorksheet('A0 - CEDIS').getColumn(2).values.filter(v => String(v).startsWith('Subtotal'));
+  expect(subtotales).toEqual(['Subtotal ALFA', 'Subtotal ZETA', 'Subtotal ALFA']);
+  const i0 = col(wb.getWorksheet('I0'), 1);
+  // Sin cliente al final.
+  expect(i0.filter(v => ['GAMA', 'BETA', 'CLIENTE NO IDENTIFICADO'].includes(v))).toEqual(['GAMA', 'BETA', 'CLIENTE NO IDENTIFICADO']);
+  expect(col(wb.getWorksheet('A0 - CEDIS'), 1)).not.toContain('GAMA');
+  // La pantalla recibe lo mismo por almacén.
+  const r = await service.obtener(3);
+  expect(r.almacenes.map(a => [a.serie, a.sucursal])).toEqual([['A0', 'CEDIS'], ['I0', null]]);
+  expect(r.almacenes[1].tablas.facturasGlobales[0]).toMatchObject({ folio: '1', totalAplicado: 50 });
+});

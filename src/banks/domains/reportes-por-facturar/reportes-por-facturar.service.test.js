@@ -8,7 +8,7 @@ jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../cfdi-mapping/cfdi-poliza-generator.service', () => ({ _uuidsPorFechaEfectiva: jest.fn() }));
-jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn() }));
+jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn(), FORMAS_PAGO: ['efectivo', 'tarjeta', 'transferencia', 'cheque', 'otras'] }));
 
 const { ReportePorFacturar } = require('../../../shared/models/postgres');
 const CFDI = require('../../../visor/models/CFDI');
@@ -125,37 +125,60 @@ test('actualizar un reporte eliminado → 404', async () => {
   await expect(service.actualizar(7, {})).rejects.toThrow();
 });
 
-// 2026-10-28: Excel con una hoja por serie (A0, I0…) y, dentro de cada bloque,
-// los depósitos agrupados por cliente con su subtotal.
-test('excel: una hoja por serie y depósitos agrupados por cliente', async () => {
+// 2026-10-28: 5 pestañas, cada una con su Excel — por almacén (serie de la
+// remisión de cada depósito), agrupadas por cliente y con formas de pago.
+describe('secciones y Excel por pestaña', () => {
   const ExcelJS = require('exceljs');
-  const dep = (cliente, importe, rem) => ({ fecha: '2026-10-20T00:00:00Z', descripcion: 'SPEI', importe, aplicado: importe, cliente, remisiones: [rem], ppdPorFacturar: true });
-  ReportePorFacturar.findByPk.mockReset();
-  ReportePorFacturar.findByPk.mockResolvedValue({ id: 3, toJSON: () => ({
-    id: 3, sucursal: 'Todas', fechaInicio: '2026-10-20', fechaFin: '2026-10-20',
-    datos: {
-      // El depósito de GAMA es de una remisión I0 → va a la hoja de I0.
-      movimientosMostrador: [{ serie: 'A0', folio: '1', esGlobal: true, depositos: [dep('ZETA', 10, 'A0-1'), dep('ALFA', 20, 'A0-2'), dep('ZETA', 5, 'A0-3'), dep('GAMA', 50, 'I0-7')] }],
-      depositosPendientesFactura: [dep('', 7, 'I0-9'), dep('BETA', 3, 'I0-8'), dep('ALFA', 1, 'A0-4')],
-    },
-  }) });
-  const { buffer } = await service.excel(3);
-  const wb = new ExcelJS.Workbook();
-  await wb.xlsx.load(buffer);
-  // Con el nombre de la sucursal cuando la serie está en Centros de costo.
-  expect(wb.worksheets.map(w => w.name)).toEqual(['A0 - CEDIS', 'I0']);
-  const col = (ws, c) => ws.getColumn(c).values.filter(v => v != null && v !== '');
-  const a0 = col(wb.getWorksheet('A0 - CEDIS'), 1);
-  // Global: ALFA antes que ZETA; ZETA con sus 2 depósitos juntos.
-  expect(a0.filter(v => ['ALFA', 'ZETA'].includes(v))).toEqual(['ALFA', 'ZETA', 'ALFA']);
-  const subtotales = wb.getWorksheet('A0 - CEDIS').getColumn(2).values.filter(v => String(v).startsWith('Subtotal'));
-  expect(subtotales).toEqual(['Subtotal ALFA', 'Subtotal ZETA', 'Subtotal ALFA']);
-  const i0 = col(wb.getWorksheet('I0'), 1);
-  // Sin cliente al final.
-  expect(i0.filter(v => ['GAMA', 'BETA', 'CLIENTE NO IDENTIFICADO'].includes(v))).toEqual(['GAMA', 'BETA', 'CLIENTE NO IDENTIFICADO']);
-  expect(col(wb.getWorksheet('A0 - CEDIS'), 1)).not.toContain('GAMA');
-  // La pantalla recibe lo mismo por almacén.
-  const r = await service.obtener(3);
-  expect(r.almacenes.map(a => [a.serie, a.sucursal])).toEqual([['A0', 'CEDIS'], ['I0', null]]);
-  expect(r.almacenes[1].tablas.facturasGlobales[0]).toMatchObject({ folio: '1', totalAplicado: 50 });
+  const fp = (efectivo, transferencia) => ({ efectivo, tarjeta: 0, transferencia, cheque: 0, otras: 0, mixto: efectivo > 0 && transferencia > 0 });
+  const dep = (cliente, importe, rem, formasPago) => ({ fecha: '2026-10-20T00:00:00Z', descripcion: 'SPEI', importe, aplicado: importe, cliente, remisiones: [rem], ppdPorFacturar: true, formasPago });
+  const cargar = () => {
+    ReportePorFacturar.findByPk.mockReset();
+    ReportePorFacturar.findByPk.mockResolvedValue({ id: 3, toJSON: () => ({
+      id: 3, sucursal: 'Todas', fechaInicio: '2026-10-20', fechaFin: '2026-10-20',
+      datos: {
+        // El depósito de GAMA es de una remisión I0 → va al almacén I0.
+        movimientosMostrador: [{ serie: 'A0', folio: '1', esGlobal: true, totalFactura: 999, fechaFactura: '2026-10-21T18:00:00Z', depositos: [
+          dep('ZETA', 10, 'A0-1', fp(4, 6)), dep('ALFA', 20, 'A0-2', fp(0, 20)), dep('ZETA', 5, 'A0-3', fp(5, 0)), dep('GAMA', 50, 'I0-7', fp(0, 50)),
+        ] }],
+        depositosPendientesFactura: [dep('', 7, 'I0-9', null), dep('BETA', 3, 'I0-8', fp(1, 2)), dep('ALFA', 1, 'A0-4', fp(1, 0))],
+        depositosPendientesPago: [{ ...dep('OMEGA', 100, 'A0-5', fp(30, 70)), saldo: 12 }],
+        depositosEfectivoSinAsociar: [{ fecha: '2026-10-20T00:00:00Z', descripcion: 'DEP EFECTIVO', importe: 800, banco: 'BBVA', ficha: '1', idNumo: '051499' }],
+      },
+    }) });
+  };
+
+  test('obtener: secciones por almacén, clientes ordenados y total de efectivo por global', async () => {
+    cargar();
+    const r = await service.obtener(3);
+    const s = r.secciones;
+    expect(s.global.map(a => [a.serie, a.sucursal])).toEqual([['A0', 'CEDIS'], ['I0', null]]);
+    const g = s.global[0].bloques[0];
+    expect(g).toMatchObject({ factura: 'A0-1', totalFactura: 999 });
+    expect(g.grupos.map(x => x.cliente)).toEqual(['ALFA', 'ZETA']);
+    expect(g.grupos[1].totales.formas).toMatchObject({ efectivo: 9, transferencia: 6 });
+    expect(g.totales.formas.efectivo).toBe(9);
+    expect(s.global[1].bloques[0].grupos[0].cliente).toBe('GAMA');
+    // Pendiente: una sola tabla por almacén; sin cliente al final.
+    expect(s.pendiente.map(a => a.serie)).toEqual(['A0', 'I0']);
+    expect(s.pendiente[1].bloques).toHaveLength(1);
+    expect(s.pendiente[1].bloques[0].grupos.map(x => x.cliente)).toEqual(['BETA', 'CLIENTE NO IDENTIFICADO']);
+    expect(s.pendientesPago[0].bloques[0].totales).toMatchObject({ saldo: 12, formas: { efectivo: 30 } });
+    expect(s.efectivo).toHaveLength(1);
+  });
+
+  test('excel de una pestaña: una hoja por almacén; sin sección, todas', async () => {
+    cargar();
+    const leer = async seccion => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load((await service.excel(3, seccion)).buffer); return wb; };
+    const global = await leer('global');
+    expect(global.worksheets.map(w => w.name)).toEqual(['A0 - CEDIS', 'I0']);
+    const textos = global.getWorksheet('A0 - CEDIS').getColumn(2).values.filter(Boolean);
+    expect(textos).toEqual(expect.arrayContaining(['Subtotal ALFA', 'Subtotal ZETA', 'TOTAL', 'Total factura', 'EFECTIVO DE LA FACTURA A0-1']));
+    expect((await leer('efectivo')).worksheets.map(w => w.name)).toEqual(['DEPÓSITOS EN EFECTIVO']);
+    expect((await leer()).worksheets.map(w => w.name)).toEqual([
+      'GLOBAL - A0 - CEDIS', 'GLOBAL - I0', 'PENDIENTE - A0 - CEDIS', 'PENDIENTE - I0', 'PEND PAGO - A0 - CEDIS', 'EFECTIVO',
+    ]);
+    const { filename } = await service.excel(3, 'pendientesPago');
+    expect(filename).toBe('Por_facturar_PEND_PAGO_Todas_2026-10-20.xlsx');
+    await expect(service.excel(3, 'otra')).rejects.toThrow();
+  });
 });

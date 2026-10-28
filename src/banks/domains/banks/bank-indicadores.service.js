@@ -654,18 +654,6 @@ function _anioMesActualMexico() {
   return _anioMesDeFecha(new Date());
 }
 
-// String YYYY-MM-DD en calendario de MÉXICO para un instante real cualquiera — generalización
-// de _hoyMexicoStr() (que solo cubre "ahora"), usado por getCorteTendencia() para traducir los
-// límites de cada periodo pasado al mismo formato que espera getCorteConciliacion()
-// (fechaInicio/fechaFin).
-function _fechaMxComoString(fechaReal) {
-  const mx = _comoRelojMexico(fechaReal);
-  const yyyy = mx.getUTCFullYear();
-  const mm   = String(mx.getUTCMonth() + 1).padStart(2, '0');
-  const dd   = String(mx.getUTCDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
 // Acotado a los 100 casos más atrasados (orden desc) — `count` siempre es el total real, nunca
 // se miente; solo se trunca el DETALLE para no mandar una respuesta JSON gigante si el backlog
 // es grande (mismo criterio preventivo de siempre: nunca ocultar el número, sí acotar el
@@ -1006,105 +994,131 @@ async function getPeriodoCortePorRol(role) {
   return { periodo: 'semanal', puedeAlternar: true };
 }
 
-const TENDENCIA_PUNTOS_DEFAULT = { semanal: 10, mensual: 6 };
+// 5 buckets fijos de antigüedad del backlog (2026-10-28, bucket 'Hoy' agregado el mismo día —
+// antes el bucket más reciente era '0-30', que incluía el día de carga) — ver JSDoc de
+// getCorteAntiguedadBacklog. Orden fijo, de más nuevo a más viejo — es el orden en que el chart
+// del panel pinta las 5 barras.
+const ANTIGUEDAD_BUCKET_ORDER = ['Hoy', '1-30', '30-60', '60-90', '90+'];
+
+// Bucket de antigüedad como expresión de agregación de Mongo. 'Hoy' = `createdAt` cae dentro
+// del día de hoy (hora México, createdAt >= inicioHoyExpr) — MISMO corte que usa `segmento`
+// (ver getCorteAntiguedadBacklog) para decidir 'nuevos', así que 'nuevos' SOLO puede caer en
+// 'Hoy' e 'iniciales' NUNCA cae en 'Hoy' (son mutuamente excluyentes por construcción).
+//
+// Para cualquier `createdAt` ANTERIOR a hoy, el resto de los buckets usa DÍAS CALENDARIO
+// completos transcurridos desde esa fecha hasta hoy — `$ceil` (no floor ni la resta continua
+// contra "ahora" que usaba la versión anterior) de (inicioHoyExpr - createdAt) / día en ms: un
+// `createdAt` de CUALQUIER hora de ayer ya cuenta como "1 día transcurrido completo", no una
+// fracción cercana a 0 — por eso ceil, para que "ayer a las 23:59" y "ayer a las 00:00" caigan
+// en el mismo bucket '1-30'. Intervalos SEMIABIERTOS: 1-29 días → '1-30', 30-59 → '30-60', etc.
+// `inicioHoyExpr` es el mismo Date ya resuelto (`_inicioDiaMx(_hoyMexicoStr())`, ver
+// getCorteAntiguedadBacklog).
+function _bucketAntiguedadExpr(inicioHoyExpr) {
+  const diasExpr = {
+    $ceil: { $divide: [{ $subtract: [inicioHoyExpr, '$createdAt'] }, 1000 * 60 * 60 * 24] },
+  };
+  return {
+    $switch: {
+      branches: [
+        { case: { $gte: ['$createdAt', inicioHoyExpr] }, then: 'Hoy' },
+        { case: { $lt: [diasExpr, 30] }, then: '1-30' },
+        { case: { $lt: [diasExpr, 60] }, then: '30-60' },
+        { case: { $lt: [diasExpr, 90] }, then: '60-90' },
+      ],
+      default: '90+',
+    },
+  };
+}
 
 /**
- * Serie histórica de backlog para el gráfico de tendencia del panel de Cortes (2026-10-22,
- * pedido explícito del usuario: ver si el backlog crece o se achica corte a corte, no solo la
- * foto del periodo actual). Un punto por periodo pasado (semana o mes, según `periodo`) — el
- * MÁS RECIENTE siempre en modo TIEMPO REAL (periodo en curso, llama a getCorteConciliacion()
- * sin fechaInicio/fechaFin, igual que el resto del panel); los anteriores se reconstruyen con
- * el mismo mecanismo de corte histórico (_getCorteHistorico/_estadoAlCierre — ver las
- * limitaciones ya documentadas ahí: sin log genérico de cambios de status, lo irreconstruible
- * se señala vía `advertencia` en cada punto, nunca se oculta).
+ * Antigüedad del backlog ACTUAL (2026-10-28) — reemplaza por completo a la vieja
+ * getCorteTendencia() (serie histórica corte a corte, pedido explícito del usuario: ya no
+ * interesa ver cómo venía evolucionando el backlog semana a semana, sino de un vistazo cuánto
+ * tiempo lleva pendiente el backlog de HOY). SIEMPRE "hoy hacia atrás" — sin periodo de corte,
+ * sin fechaInicio/fechaFin, sin navegación histórica; 100% independiente de
+ * getCorteConciliacion()/getPeriodoCortePorRol (esas 2 funciones siguen intactas, las sigue
+ * usando el resto del panel).
  *
- * SIN rolEquipo a propósito: la serie es de `rezagados.total`/`nuevos.pendientes`/
- * `cxcRetrasadas.count` (y su desglose por status, ver abajo), ninguno tiene scope por rol
- * (ver comentario grande de getCorteConciliacion) — ni cobranza ni contabilidad verían un
- * número distinto entre sí.
+ * Antigüedad medida por `createdAt` (fecha de CARGA a Numo), NUNCA `fecha` (fecha del depósito
+ * en el banco — son 2 campos distintos del modelo, ver INDICADORES_DESDE arriba que ya hace
+ * esta misma distinción). 5 buckets fijos semiabiertos (ver _bucketAntiguedadExpr), de más
+ * reciente a más vieja: 'Hoy' / '1-30' / '30-60' / '60-90' / '90+'. Bucket 'Hoy' agregado
+ * 2026-10-28: antes el bucket más reciente era '0-30' (incluía el día de carga); ahora el día 0
+ * tiene su propio bucket y '0-30' pasa a ser '1-30' (1 ≤ días transcurridos < 30, ya NO incluye
+ * el día 0).
  *
- * Desglose por status (2026-10-22, pedido explícito del usuario — switch "Ver por estatus"
- * del gráfico de tendencia): además de los totales de siempre, cada punto expone
- * `rezagadosNoIdentificado`/`rezagadosReclasificado` (suman EXACTO `rezagadosTotal`, por
- * construcción — ver `rezagados` en getCorteConciliacion/_getCorteHistorico) y
- * `nuevosNoIdentificado`/`nuevosReclasificado`/`nuevosIdentificado` (los 2 primeros suman
- * EXACTO `nuevosPendientes`; `nuevosIdentificado` es informativo aparte — a propósito NO se
- * suma a `nuevosPendientes`, ese total debe seguir representando solo lo que falta por
- * identificar, igual que antes de este cambio).
+ * 3 segmentos por bucket (los 3 también en 'Hoy', por consistencia de leyenda/colores con el
+ * resto — ver comentario de `nuevos` abajo sobre por qué 'iniciales' siempre da 0 ahí):
+ *   - `iniciales`: no_identificado cargado ANTES de hoy (createdAt < inicio del día de hoy,
+ *     hora México). Por construcción, SIEMPRE da 0 en el bucket 'Hoy' — imposible que algo
+ *     cargado antes de hoy caiga en el bucket "hoy". Esperado, no un bug.
+ *   - `nuevos`: no_identificado cargado HOY (createdAt >= inicio del día de hoy). Por
+ *     construcción, solo puede dar >0 en el bucket 'Hoy' — un movimiento cargado hoy siempre
+ *     cae en ese bucket (mismo corte que decide el bucket 'Hoy', ver _bucketAntiguedadExpr); los
+ *     otros 4 buckets quedan siempre en 0 para este segmento, eso es esperado, no un bug.
+ *   - `identificados`: status identificado, sin más split (no diferencia iniciales/nuevos acá,
+ *     es una sola categoría).
+ * `reclasificado` ("Por conciliar") y `otros` quedan AFUERA DEL TODO — pedido explícito del
+ * usuario: "de momento no vamos a considerar los depósitos Por conciliar o Reclasificados".
+ *
+ * Scope por rol en `identificados` (2026-10-28, decisión PROPIA por consistencia con
+ * getCorteConciliacion — no fue pedida explícita, el usuario puede corregirla si no la quiere
+ * así): se acota a `primeraIdentificacionPor.userId` del equipo del rol autenticado
+ * (_equipoAuth0SubsParaRol/_matchIdentificadoEquipo, mismos helpers ya usados ahí), salvo
+ * BANKS_CONFIG (admin, ve el total sin acotar — `rolEquipo: null`, resuelto en la ruta igual
+ * que /cortes). `iniciales`/`nuevos` NUNCA se acotan por rol: son propiedades del movimiento
+ * (cuándo se cargó a Numo), no de quién lo identificó — mismo criterio ya documentado para
+ * rezagados/nuevos.total en getCorteConciliacion.
  *
  * @param {object} [opts]
- * @param {'semanal'|'mensual'} [opts.periodo='semanal']
  * @param {string} [opts.banco]
- * @param {number} [opts.puntos] Cantidad de periodos a incluir (default 10 semanas / 6 meses,
- *   ver TENDENCIA_PUNTOS_DEFAULT) — un valor <= 0 o no numérico cae al default.
+ * @param {string|null} [opts.rolEquipo] Rol cuyo equipo acota `identificados` — null/falsy =
+ *   sin scope (admin con BANKS_CONFIG).
  */
-async function getCorteTendencia({ periodo = 'semanal', banco = null, puntos = null } = {}) {
-  const periodoResuelto = periodo === 'mensual' ? 'mensual' : 'semanal';
-  const n = Number.isFinite(puntos) && puntos > 0 ? puntos : TENDENCIA_PUNTOS_DEFAULT[periodoResuelto];
-  const inicioActual = periodoResuelto === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
-  const mxActual = _comoRelojMexico(inicioActual);
-  const anioActual = mxActual.getUTCFullYear();
-  const mesActual   = mxActual.getUTCMonth() + 1;
+async function getCorteAntiguedadBacklog({ banco = null, rolEquipo = null } = {}) {
+  const baseMatch   = buildBaseMatch({ banco });
+  const equipoIds   = await _equipoAuth0SubsParaRol(rolEquipo);
+  const matchEquipo = _matchIdentificadoEquipo(equipoIds);
 
-  // Límites {fechaInicio, fechaFin, esActual} de cada periodo pasado, del más viejo al más
-  // reciente (i de n-1 a 0) — i===0 es SIEMPRE el periodo en curso (esActual).
-  const limites = [];
-  for (let i = n - 1; i >= 0; i--) {
-    if (i === 0) { limites.push({ esActual: true }); continue; }
-    if (periodoResuelto === 'mensual') {
-      // Resta i meses con overflow normalizado por Date (mes puede salir de [1,12] y de
-      // paso ajustar el año — mismo truco ya usado en varios lugares del proyecto).
-      const target = new Date(Date.UTC(anioActual, (mesActual - 1) - i, 1));
-      const rango  = _rangoAnioMesMexico(target.getUTCFullYear(), target.getUTCMonth() + 1);
-      limites.push({
-        esActual: false,
-        fechaInicio: _fechaMxComoString(rango.$gte),
-        fechaFin:    _fechaMxComoString(new Date(rango.$lt.getTime() - 1000)),
-      });
-    } else {
-      // Resta i semanas completas (7*24h reales) — sin horario de verano en México desde
-      // 2022, la resta en ms real preserva "medianoche México" (mismo supuesto que el resto
-      // de este archivo, ver _comoRelojMexico arriba).
-      const inicioSemana = new Date(inicioActual.getTime() - i * 7 * 24 * MS_PER_HOUR);
-      const finSemana    = new Date(inicioSemana.getTime() + 6 * 24 * MS_PER_HOUR);
-      limites.push({
-        esActual: false,
-        fechaInicio: _fechaMxComoString(inicioSemana),
-        fechaFin:    _fechaMxComoString(finSemana),
-      });
-    }
+  const inicioHoy = _inicioDiaMx(_hoyMexicoStr());
+
+  const [noIdentificadoRows, identificadoRows] = await Promise.all([
+    // 'iniciales'/'nuevos' — SIN scope por rol a propósito (ver JSDoc arriba).
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, status: 'no_identificado' } },
+      { $project: {
+          deposito: 1,
+          bucket:   _bucketAntiguedadExpr(inicioHoy),
+          segmento: { $cond: [{ $gte: ['$createdAt', inicioHoy] }, 'nuevos', 'iniciales'] },
+      } },
+      { $group: { _id: { bucket: '$bucket', segmento: '$segmento' }, count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]),
+    // 'identificados' — CON scope por rol (matchEquipo es {} cuando rolEquipo es null/admin).
+    BankMovement.aggregate([
+      { $match: { ...baseMatch, ...matchEquipo, status: 'identificado' } },
+      { $project: { deposito: 1, bucket: _bucketAntiguedadExpr(inicioHoy) } },
+      { $group: { _id: '$bucket', count: { $sum: 1 }, importeTotal: { $sum: '$deposito' } } },
+    ]),
+  ]);
+
+  const porBucket = Object.fromEntries(ANTIGUEDAD_BUCKET_ORDER.map(b => [b, {
+    iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0,
+  }]));
+
+  for (const row of noIdentificadoRows) {
+    const destino = porBucket[row._id.bucket];
+    if (!destino) continue; // defensivo — _bucketAntiguedadExpr siempre cae en uno de los 5 buckets conocidos
+    destino[row._id.segmento] = row.count;
+    destino[`${row._id.segmento}Importe`] = row.importeTotal ?? 0;
+  }
+  for (const row of identificadoRows) {
+    const destino = porBucket[row._id];
+    if (!destino) continue;
+    destino.identificados = row.count;
+    destino.identificadosImporte = row.importeTotal ?? 0;
   }
 
-  const puntosResueltos = await Promise.all(limites.map(async (lim) => {
-    const corte = lim.esActual
-      ? await getCorteConciliacion({ periodo: periodoResuelto, banco })
-      : await getCorteConciliacion({ periodo: periodoResuelto, banco, fechaInicio: lim.fechaInicio, fechaFin: lim.fechaFin });
-    return {
-      inicio: corte.inicio,
-      fin: corte.fin ?? null,
-      esActual: !!lim.esActual,
-      rezagadosTotal:      corte.rezagados.total,
-      rezagadosNoIdentificado: corte.rezagados.no_identificado,
-      rezagadosReclasificado:  corte.rezagados.reclasificado,
-      nuevosPendientes:    corte.nuevos.pendientes,
-      nuevosNoIdentificado: corte.nuevos.no_identificado,
-      nuevosReclasificado:  corte.nuevos.reclasificado,
-      nuevosIdentificado:   corte.nuevos.identificado,
-      cxcRetrasadasCount:  corte.cxcRetrasadas.count,
-      // Importes (2026-10-22, pedido explícito del usuario): mismo desglose que ya expone
-      // "Ver por estatus" en counts, junto a cada barra — no reemplaza el conteo.
-      rezagadosTotalImporte:        corte.rezagados.importeTotal.total,
-      rezagadosNoIdentificadoImporte: corte.rezagados.importeTotal.no_identificado,
-      rezagadosReclasificadoImporte:  corte.rezagados.importeTotal.reclasificado,
-      nuevosPendientesImporte:     corte.nuevos.importeTotal.no_identificado + corte.nuevos.importeTotal.reclasificado,
-      nuevosNoIdentificadoImporte: corte.nuevos.importeTotal.no_identificado,
-      nuevosReclasificadoImporte:  corte.nuevos.importeTotal.reclasificado,
-      nuevosIdentificadoImporte:   corte.nuevos.importeTotal.identificado,
-      ...(corte.advertencia ? { advertencia: corte.advertencia } : {}),
-    };
-  }));
-
-  return { periodo: periodoResuelto, puntos: puntosResueltos };
+  return { buckets: ANTIGUEDAD_BUCKET_ORDER.map(bucket => ({ bucket, ...porBucket[bucket] })) };
 }
 
 /**
@@ -1313,7 +1327,7 @@ async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInici
 module.exports = {
   getIndicadoresIdentificacion,
   getCorteConciliacion,
-  getCorteTendencia,
+  getCorteAntiguedadBacklog,
   getPeriodoCortePorRol,
   buildReporteCorte,
   buildReporteIdentificacion,

@@ -53,7 +53,7 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
   getCorteConciliacion: jest.fn(),
-  getCorteTendencia: jest.fn(),
+  getCorteAntiguedadBacklog: jest.fn(),
   getPeriodoCortePorRol: jest.fn(),
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
@@ -536,17 +536,23 @@ describe('GET /cortes/periodo-rol', () => {
   });
 });
 
-describe('GET /cortes/tendencia', () => {
+describe('GET /cortes/antiguedad', () => {
   let app;
 
-  const FAKE_TENDENCIA = {
-    periodo: 'semanal',
-    puntos: [{ inicio: '2026-10-05T06:00:00.000Z', fin: null, esActual: true, rezagadosTotal: 1, nuevosPendientes: 2, cxcRetrasadasCount: 0 }],
+  const FAKE_ANTIGUEDAD = {
+    buckets: [
+      { bucket: 'Hoy', iniciales: 0, inicialesImporte: 0, nuevos: 1, nuevosImporte: 100, identificados: 0, identificadosImporte: 0 },
+      { bucket: '1-30', iniciales: 1, inicialesImporte: 100, nuevos: 0, nuevosImporte: 0, identificados: 2, identificadosImporte: 200 },
+      { bucket: '30-60', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
+      { bucket: '60-90', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
+      { bucket: '90+', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
+    ],
   };
 
   beforeEach(() => {
     jest.clearAllMocks();
-    indicadoresService.getCorteTendencia.mockResolvedValue(FAKE_TENDENCIA);
+    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config por defecto
+    indicadoresService.getCorteAntiguedadBacklog.mockResolvedValue(FAKE_ANTIGUEDAD);
     app = express();
     app.use(express.json());
     app.use('/', router);
@@ -554,31 +560,42 @@ describe('GET /cortes/tendencia', () => {
 
   test('responde 403 sin banks:read', async () => {
     const res = await request(app)
-      .get('/cortes/tendencia')
+      .get('/cortes/antiguedad')
       .set('x-test-permissions', JSON.stringify([]));
 
     expect(res.status).toBe(403);
-    expect(indicadoresService.getCorteTendencia).not.toHaveBeenCalled();
+    expect(indicadoresService.getCorteAntiguedadBacklog).not.toHaveBeenCalled();
   });
 
-  test('con banks:read pasa periodo/banco/puntos al service y devuelve el resultado', async () => {
+  test('con banks:read pasa banco y rolEquipo al service y devuelve el resultado', async () => {
     const res = await request(app)
-      .get('/cortes/tendencia')
-      .query({ periodo: 'mensual', banco: 'BBVA', puntos: '6' })
+      .get('/cortes/antiguedad')
+      .query({ banco: 'BBVA' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(FAKE_TENDENCIA);
-    expect(indicadoresService.getCorteTendencia).toHaveBeenCalledWith({ periodo: 'mensual', banco: 'BBVA', puntos: 6 });
+    expect(res.body).toEqual(FAKE_ANTIGUEDAD);
+    expect(indicadoresService.getCorteAntiguedadBacklog).toHaveBeenCalledWith({ banco: 'BBVA', rolEquipo: 'test-role' });
   });
 
-  test('sin ?banco ni ?puntos: se pasan null (no string vacío / NaN)', async () => {
+  test('sin ?banco: se pasa null (no el string vacío)', async () => {
     await request(app)
-      .get('/cortes/tendencia')
-      .query({ periodo: 'semanal' })
+      .get('/cortes/antiguedad')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getCorteTendencia).toHaveBeenCalledWith({ periodo: 'semanal', banco: null, puntos: null });
+    expect(indicadoresService.getCorteAntiguedadBacklog).toHaveBeenCalledWith({ banco: null, rolEquipo: 'test-role' });
+  });
+
+  // Mismo criterio que /cortes: con BANKS_CONFIG, rolEquipo viaja null (admin ve el total real
+  // de "identificados", sin acotar por rol).
+  test('con BANKS_CONFIG: rolEquipo viaja null (sin acotar por rol)', async () => {
+    rbacStore.hasPermission.mockResolvedValue(true);
+
+    await request(app)
+      .get('/cortes/antiguedad')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getCorteAntiguedadBacklog).toHaveBeenCalledWith({ banco: null, rolEquipo: null });
   });
 });
 

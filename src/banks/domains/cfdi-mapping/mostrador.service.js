@@ -33,24 +33,83 @@ const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 
+// ── Formas de pago del cobro de cada remisión (reporte "Por facturar",
+// 2026-10-28, pedido del usuario: "si es un cobro mixto y cuánto tienen de
+// cada uno") ────────────────────────────────────────────────────────────────
+const FORMAS_PAGO = ['efectivo', 'tarjeta', 'transferencia', 'cheque', 'otras'];
+
+// c_FormaPago SAT: 01 efectivo, 02 cheque, 03 transferencia, 04/28 tarjeta.
+// Saldo a favor, anticipo y puntos (no son dinero nuevo) → otras.
+function _formaPago(fp) {
+  const nombre = fp?.nombre ?? fp?.nombreFormaPago ?? '';
+  if (/saldo\s*a\s*favor|anticipo|puntos/i.test(nombre)) return 'otras';
+  const clave = String(fp?.claveSat ?? '').trim();
+  if (clave === '01') return 'efectivo';
+  if (clave === '02') return 'cheque';
+  if (clave === '03') return 'transferencia';
+  if (clave === '04' || clave === '28') return 'tarjeta';
+  if (/efectivo/i.test(nombre)) return 'efectivo';
+  if (/tarjeta|d[eé]bito|cr[eé]dito|amex/i.test(nombre)) return 'tarjeta';
+  if (/transfer|spei/i.test(nombre)) return 'transferencia';
+  if (/cheque/i.test(nombre)) return 'cheque';
+  return 'otras';
+}
+
+/**
+ * Suma por forma de pago de todos los cobros de las cuentas de Kore
+ * (`/desgloses-cobro/almacen`) de un depósito. Kore repite en cada ticket el
+ * total de un pago que cerró varios (ver cfdi-poliza-generator, "Bug del
+ * ERP"): con una sola forma se usa `|cobro.monto|`; con varias que exceden
+ * ese monto se escalan — salvo saldo a favor / anticipo, donde `cobro.monto`
+ * es solo esa porción.
+ * @returns {{ efectivo, tarjeta, transferencia, cheque, otras, mixto: boolean } | null}
+ *   null si Kore no regresó las cuentas o no traen cobros.
+ */
+function formasPagoDeCuentas(cuentas) {
+  const presentes = (cuentas ?? []).filter(Boolean);
+  if (!presentes.length) return null;
+  const total = Object.fromEntries(FORMAS_PAGO.map(f => [f, 0]));
+  let conCobros = false;
+  for (const cuenta of presentes) {
+    for (const cobro of cuenta.cobros ?? []) {
+      const fps = cobro.formasPago ?? [];
+      if (fps.length) conCobros = true;
+      const montoReal = cobro.monto != null ? Math.abs(Number(cobro.monto) || 0) : null;
+      const suma = fps.reduce((s, f) => s + (Number(f.monto) || 0), 0);
+      const conSaldoFavor = fps.some(f => /saldo\s*a\s*favor|anticipo/i.test(f.nombre ?? f.nombreFormaPago ?? ''));
+      const factor = (!conSaldoFavor && fps.length > 1 && montoReal != null && suma > montoReal + 0.05) ? montoReal / suma : 1;
+      for (const fp of fps) {
+        const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
+        total[_formaPago(fp)] += monto;
+      }
+    }
+  }
+  if (!conCobros) return null;
+  for (const f of FORMAS_PAGO) total[f] = _r2(total[f]);
+  return { ...total, mixto: FORMAS_PAGO.filter(f => total[f] > 0.005).length > 1 };
+}
+
 // Cuenta de Kore de cada remisión (`serie|folio` → { nombre, tipoPago,
 // nombreTipoMovimiento }) vía `/cuentas-pendientes`, que necesita la fecha de
 // creación de la remisión (sale de `/desgloses-cobro/almacen`). Si Kore falla,
-// la remisión queda sin datos.
+// la remisión queda sin datos. `desglose` = la cuenta de `/desgloses-cobro/
+// almacen` de cada remisión (sus cobros con formas de pago).
 async function _cuentasPorRemision(rfc, remisiones) {
   const cuentasKore = new Map();
-  if (!remisiones.length) return cuentasKore;
+  const desglose = new Map();
+  if (!remisiones.length) return { cuentasKore, desglose };
   let cuentas = [];
   try {
     cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: remisiones.map(r => r.serie), folios: remisiones.map(r => r.folio) });
   } catch {
-    return cuentasKore;
+    return { cuentasKore, desglose };
   }
+  for (const c of cuentas ?? []) desglose.set(`${c.serieVenta}|${c.folioVenta}`, c);
   await Promise.all((cuentas ?? []).map(async c => {
     const info = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
     if (info) cuentasKore.set(`${c.serieVenta}|${c.folioVenta}`, info);
   }));
-  return cuentasKore;
+  return { cuentasKore, desglose };
 }
 
 /**
@@ -100,7 +159,7 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
   const remisiones = [...new Set([...porFactura.values()].flat().flatMap(d => d.remisiones))]
     .map(r => { const i = r.indexOf('-'); return { serie: r.slice(0, i), folio: r.slice(i + 1) }; })
     .filter(r => r.serie && r.folio);
-  const cuentasKore = await _cuentasPorRemision(rfc, remisiones);
+  const { cuentasKore, desglose } = await _cuentasPorRemision(rfc, remisiones);
 
   const resultado = [];
   for (const [u, depositos] of porFactura) {
@@ -113,6 +172,7 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
       // PPD "POR FACTURAR" en Kore (mismo criterio que `esPpdPorFacturar` del
       // generador); si Kore no regresó la cuenta, tipoPago cae al del link.
       d.ppdPorFacturar = infos.some(i => (i.tipoPago ?? i.tipoPagoLink) === 'PPD' && i.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
+      d.formasPago = formasPagoDeCuentas(d.remisiones.map(r => desglose.get(r.replace('-', '|'))));
       delete d._tipoPagoPorRem;
     }
     depositos.sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
@@ -259,6 +319,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       idNumo:      b.folio ?? '',
       estatus:     ESTATUS_POR_FACTURAR,
       ...(incluirIdentificados ? { identificadoEl: _identificadoEl(b) } : {}),
+      formasPago:  formasPagoDeCuentas(remisionesUnicas.map(l => desglose.get(clave(l)))),
       ...(todasPagadas ? {} : { saldo: _r2(remisionesUnicas.reduce((s, l) => s + saldoDe(l), 0)) }),
     });
   }
@@ -299,4 +360,4 @@ async function detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin }) {
     .sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
 }
 
-module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar };
+module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas, FORMAS_PAGO };

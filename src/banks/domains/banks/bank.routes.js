@@ -237,14 +237,18 @@ router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), 
   res.json(await indicadoresService.getPeriodoCortePorRol(req.user.role));
 }));
 
-// GET /api/banks/cortes/tendencia — serie histórica de backlog (rezagados.total/nuevos.
-// pendientes/cxcRetrasadas.count) para el gráfico de tendencia del panel de Cortes (2026-10-22,
-// pedido explícito del usuario). Mismo permiso que /cortes. SIN rolEquipo (ver JSDoc de
-// getCorteTendencia en bank-indicadores.service.js — ninguno de los 3 valores tiene scope por rol).
-router.get('/cortes/tendencia', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const { periodo, banco, puntos } = req.query;
-  const puntosNum = puntos ? parseInt(puntos, 10) : null;
-  res.json(await indicadoresService.getCorteTendencia({ periodo, banco: banco || null, puntos: Number.isFinite(puntosNum) ? puntosNum : null }));
+// GET /api/banks/cortes/antiguedad — antigüedad del backlog ACTUAL (5 buckets fijos: Hoy/1-30/
+// 30-60/60-90/90+ días desde `createdAt`), para el chart del panel de Cortes (2026-10-28,
+// reemplaza por completo al viejo /cortes/tendencia — pedido explícito del usuario, ver JSDoc
+// de getCorteAntiguedadBacklog en bank-indicadores.service.js). Mismo permiso que /cortes.
+// `rolEquipo` viaja igual que en /cortes: null para BANKS_CONFIG (admin, total sin acotar),
+// req.user.role para el resto — SOLO acota `identificados`, nunca `iniciales`/`nuevos`
+// (propiedades del movimiento, no de quién identifica — ver JSDoc de la función).
+router.get('/cortes/antiguedad', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco } = req.query;
+  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
+  const rolEquipo = hasConfigAccess ? null : req.user.role;
+  res.json(await indicadoresService.getCorteAntiguedadBacklog({ banco: banco || null, rolEquipo }));
 }));
 
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle

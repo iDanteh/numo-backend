@@ -20,7 +20,7 @@ const { User: PgUser } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const {
-  getCorteConciliacion, getCorteTendencia, buildReporteCorte, getPeriodoCortePorRol,
+  getCorteConciliacion, getCorteAntiguedadBacklog, buildReporteCorte, getPeriodoCortePorRol,
   _folioFechaCodificada, _mesesDeAtraso, _calcularCxcRetrasadas,
 } = require('./bank-indicadores.service');
 
@@ -606,72 +606,114 @@ describe('getCorteConciliacion — cxcRetrasadas', () => {
   });
 });
 
-describe('getCorteTendencia', () => {
-  test('puntos:1 — un solo punto, SIEMPRE el periodo en curso (esActual:true)', async () => {
-    mockAggregates({
-      rezagados: [{ _id: 'no_identificado', count: 5 }],
-      nuevos:    [{ _id: 'no_identificado', count: 3 }],
-      pendientesConErp: [
-        { _id: 'm1', erpLinks: [{ serie: 'A0', folioExterno: '260901542' }] },
+describe('getCorteAntiguedadBacklog', () => {
+  // "Ahora" fijo en AHORA_MX (miércoles 2026-10-07 15:00 México = 21:00 UTC) → inicio del día
+  // de hoy en México = 2026-10-07T06:00:00.000Z (ver _inicioDiaMx).
+  const INICIO_HOY_ESPERADO = new Date(Date.UTC(2026, 9, 7, 6, 0, 0));
+
+  test('arma los 5 buckets fijos combinando no_identificado (iniciales/nuevos) e identificados', async () => {
+    BankMovement.aggregate
+      .mockResolvedValueOnce([ // no_identificado, agrupado {bucket, segmento}
+        { _id: { bucket: 'Hoy', segmento: 'nuevos' },    count: 2, importeTotal: 200 },
+        { _id: { bucket: '1-30', segmento: 'iniciales' }, count: 5, importeTotal: 500 },
+        { _id: { bucket: '30-60', segmento: 'iniciales' }, count: 3, importeTotal: 300 },
+        { _id: { bucket: '90+', segmento: 'iniciales' },   count: 1, importeTotal: 100 },
+      ])
+      .mockResolvedValueOnce([ // identificado, agrupado por bucket
+        { _id: '1-30', count: 10, importeTotal: 1000 },
+        { _id: '60-90', count: 4, importeTotal: 400 },
+      ]);
+
+    const result = await getCorteAntiguedadBacklog({});
+
+    expect(result).toEqual({
+      buckets: [
+        { bucket: 'Hoy', iniciales: 0, inicialesImporte: 0, nuevos: 2, nuevosImporte: 200, identificados: 0, identificadosImporte: 0 },
+        { bucket: '1-30', iniciales: 5, inicialesImporte: 500, nuevos: 0, nuevosImporte: 0, identificados: 10, identificadosImporte: 1000 },
+        { bucket: '30-60', iniciales: 3, inicialesImporte: 300, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
+        { bucket: '60-90', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 4, identificadosImporte: 400 },
+        { bucket: '90+', iniciales: 1, inicialesImporte: 100, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
       ],
-    });
-
-    const result = await getCorteTendencia({ periodo: 'semanal', puntos: 1 });
-
-    expect(result.periodo).toBe('semanal');
-    expect(result.puntos).toHaveLength(1);
-    expect(result.puntos[0]).toMatchObject({
-      esActual: true,
-      rezagadosTotal: 5,
-      rezagadosNoIdentificado: 5,
-      rezagadosReclasificado: 0,
-      nuevosPendientes: 3,
-      nuevosNoIdentificado: 3,
-      nuevosReclasificado: 0,
-      nuevosIdentificado: 0,
-      cxcRetrasadasCount: 1,
     });
   });
 
-  // Desglose por status (2026-10-22, switch "Ver por estatus" del gráfico de tendencia):
-  // además de los totales, cada punto expone no_identificado/reclasificado/identificado por
-  // separado — y la suma debe cuadrar EXACTO con los totales de siempre (rezagadosTotal,
-  // nuevosPendientes), nunca inflarse ni divergir.
-  test('desglose por status — suma exacta de rezagados y de nuevos.pendientes', async () => {
-    mockAggregates({
-      rezagados: [
-        { _id: 'no_identificado', count: 7 },
-        { _id: 'reclasificado',   count: 2 },
-      ],
-      nuevos: [
-        { _id: 'no_identificado', count: 4 },
-        { _id: 'reclasificado',   count: 1 },
-        { _id: 'identificado',    count: 9 },
-      ],
-    });
-
-    const result = await getCorteTendencia({ periodo: 'semanal', puntos: 1 });
-    const punto = result.puntos[0];
-
-    expect(punto.rezagadosNoIdentificado).toBe(7);
-    expect(punto.rezagadosReclasificado).toBe(2);
-    expect(punto.rezagadosTotal).toBe(9);
-    expect(punto.rezagadosNoIdentificado + punto.rezagadosReclasificado).toBe(punto.rezagadosTotal);
-
-    expect(punto.nuevosNoIdentificado).toBe(4);
-    expect(punto.nuevosReclasificado).toBe(1);
-    expect(punto.nuevosPendientes).toBe(5);
-    expect(punto.nuevosNoIdentificado + punto.nuevosReclasificado).toBe(punto.nuevosPendientes);
-
-    // `nuevosIdentificado` es informativo aparte — NO debe sumarse a nuevosPendientes.
-    expect(punto.nuevosIdentificado).toBe(9);
-    expect(punto.nuevosNoIdentificado + punto.nuevosReclasificado + punto.nuevosIdentificado).not.toBe(punto.nuevosPendientes);
+  test('buckets sin ningún movimiento quedan en 0 (nunca undefined)', async () => {
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    const result = await getCorteAntiguedadBacklog({});
+    expect(result.buckets).toHaveLength(5);
+    expect(result.buckets.map(b => b.bucket)).toEqual(['Hoy', '1-30', '30-60', '60-90', '90+']);
+    for (const b of result.buckets) {
+      expect(b).toMatchObject({ iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 });
+    }
   });
 
-  test('periodo inválido cae a "semanal" (mismo criterio que getCorteConciliacion)', async () => {
-    mockAggregates({});
-    const result = await getCorteTendencia({ periodo: 'quincenal', puntos: 1 });
-    expect(result.periodo).toBe('semanal');
+  test('excluye reclasificado/otros del todo — cada aggregate matchea un solo status fijo', async () => {
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    await getCorteAntiguedadBacklog({});
+    const [noIdentificadoCall, identificadoCall] = BankMovement.aggregate.mock.calls;
+    expect(noIdentificadoCall[0][0].$match.status).toBe('no_identificado');
+    expect(identificadoCall[0][0].$match.status).toBe('identificado');
+  });
+
+  test('banco se aplica al $match base de ambas queries (buildBaseMatch)', async () => {
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    await getCorteAntiguedadBacklog({ banco: 'BBVA' });
+    const [noIdentificadoCall, identificadoCall] = BankMovement.aggregate.mock.calls;
+    expect(noIdentificadoCall[0][0].$match.banco).toBe('BBVA');
+    expect(identificadoCall[0][0].$match.banco).toBe('BBVA');
+    // Mismo filtro base que el resto de Cortes/indicadores.
+    expect(noIdentificadoCall[0][0].$match.deposito).toEqual({ $gt: 0 });
+    expect(noIdentificadoCall[0][0].$match.oculto).toEqual({ $ne: true });
+    expect(noIdentificadoCall[0][0].$match.isActive).toBe(true);
+  });
+
+  test('rolEquipo acota SOLO identificados — iniciales/nuevos quedan sin scope', async () => {
+    PgUser.findAll.mockResolvedValue([{ auth0Sub: 'user-1' }, { auth0Sub: 'user-2' }]);
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+
+    await getCorteAntiguedadBacklog({ rolEquipo: 'cobranza' });
+
+    expect(PgUser.findAll).toHaveBeenCalledWith({ where: { role: 'cobranza' }, attributes: ['auth0Sub'], raw: true });
+    const [noIdentificadoCall, identificadoCall] = BankMovement.aggregate.mock.calls;
+    expect(noIdentificadoCall[0][0].$match['primeraIdentificacionPor.userId']).toBeUndefined();
+    expect(identificadoCall[0][0].$match['primeraIdentificacionPor.userId']).toEqual({ $in: ['user-1', 'user-2'] });
+  });
+
+  test('rolEquipo null (BANKS_CONFIG/admin) — identificados SIN acotar, sin consultar Postgres', async () => {
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    await getCorteAntiguedadBacklog({ rolEquipo: null });
+    const [, identificadoCall] = BankMovement.aggregate.mock.calls;
+    expect(identificadoCall[0][0].$match['primeraIdentificacionPor.userId']).toBeUndefined();
+    expect(PgUser.findAll).not.toHaveBeenCalled();
+  });
+
+  test('el bucket "Hoy" usa createdAt >= inicio de hoy (MISMO corte que `segmento`), y el resto usa días CALENDARIO completos (ceil) con boundaries semiabiertos 30/60/90 (1-30, 30-60, 60-90, 90+)', async () => {
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    await getCorteAntiguedadBacklog({});
+    const [noIdentificadoCall] = BankMovement.aggregate.mock.calls;
+    const switchExpr = noIdentificadoCall[0][1].$project.bucket.$switch;
+    const branches = switchExpr.branches;
+
+    // 1er branch: 'Hoy', createdAt >= inicio de hoy (mismo instante que INICIO_HOY_ESPERADO).
+    expect(branches[0]).toEqual({ case: { $gte: ['$createdAt', INICIO_HOY_ESPERADO] }, then: 'Hoy' });
+
+    // Resto: días CALENDARIO completos vía $ceil((inicioHoy - createdAt) / díaEnMs) — no floor,
+    // no la resta contra "ahora" de la versión anterior (ver _bucketAntiguedadExpr).
+    const diasExpr = { $ceil: { $divide: [{ $subtract: [INICIO_HOY_ESPERADO, '$createdAt'] }, 1000 * 60 * 60 * 24] } };
+    expect(branches[1]).toEqual({ case: { $lt: [diasExpr, 30] }, then: '1-30' });
+    expect(branches[2]).toEqual({ case: { $lt: [diasExpr, 60] }, then: '30-60' });
+    expect(branches[3]).toEqual({ case: { $lt: [diasExpr, 90] }, then: '60-90' });
+    expect(switchExpr.default).toBe('90+');
+  });
+
+  test('segmento iniciales/nuevos se decide contra el inicio del día de HOY en México', async () => {
+    BankMovement.aggregate.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    await getCorteAntiguedadBacklog({});
+    const [noIdentificadoCall] = BankMovement.aggregate.mock.calls;
+    const segmentoExpr = noIdentificadoCall[0][1].$project.segmento;
+    expect(segmentoExpr.$cond[0].$gte[1]).toEqual(INICIO_HOY_ESPERADO);
+    expect(segmentoExpr.$cond[1]).toBe('nuevos');
+    expect(segmentoExpr.$cond[2]).toBe('iniciales');
   });
 });
 

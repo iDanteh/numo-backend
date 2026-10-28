@@ -10,6 +10,7 @@ const { _getRulesActive, _enrichTasaIvaFromRelatedCfdis, _normalizarEgresoPue99,
 const ErpCuentaPendiente   = require('../erp/ErpCuentaPendiente.model');
 const BankMovement         = require('../banks/BankMovement.model');
 const opaCobranzaSvc       = require('./opa-cobranza.service');
+const { detectarMovimientosMostrador, detectarDepositosPendientesFactura } = require('./mostrador.service');
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket, fotoEstadisticasErp } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
@@ -7500,6 +7501,43 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
 
   _fase('puntos+ppdOrfanos+reversiones');
 
+  // Hoja "MOSTRADOR": depósitos de Bancos de las facturas que quedaron como
+  // "Venta Sin Cobro" (remisiones cobradas días antes) — informativo, ver
+  // mostrador.service.js. Si falla, la póliza se guarda igual sin la hoja.
+  let movimientosMostradorGuard = [];
+  let depositosPendientesGuard = [];
+  if (tipoCfdi === 'I') {
+    // "PENDIENTE GENERAR FACTURA": depósitos de Bancos DEL DÍA de remisiones
+    // PPD ya pagadas, "POR FACTURAR" y sin factura, de las series de esta
+    // sucursal (todas si no hay centro).
+    try {
+      const seriesSucursal = Object.entries(ccBySerieMap ?? {})
+        .filter(([, c]) => !centroCostoId || String(c.id) === String(centroCostoId))
+        .map(([serie]) => serie);
+      const pendientes = await detectarDepositosPendientesFactura({ rfc, series: seriesSucursal, fechaInicio, fechaFin });
+      depositosPendientesGuard = pendientes.depositos;
+      if (pendientes.remisionesSinRespuesta) {
+        advertencias.push(`⚠ Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — la tabla "PENDIENTE GENERAR FACTURA" puede estar incompleta; regenera más tarde.`);
+      }
+    } catch (err) {
+      advertencias.push(`⚠ No se pudo armar la tabla "PENDIENTE GENERAR FACTURA": ${err.message}`);
+    }
+    try {
+      movimientosMostradorGuard = await detectarMovimientosMostrador({ rfc, cfdis: cfdisSinPolizaFinalGuardFiltrado, movimientos: todosLosMovimientos });
+    } catch (err) {
+      advertencias.push(`⚠ No se pudo armar la hoja MOSTRADOR: ${err.message}`);
+    }
+    // Solo lo que la hoja enseña: facturas globales y depósitos PPD "POR
+    // FACTURAR" ya facturados a nombre del cliente.
+    const globalesMostrador = movimientosMostradorGuard.filter(f => f.esGlobal).length;
+    const ppdClienteMostrador = movimientosMostradorGuard
+      .filter(f => !f.esGlobal).flatMap(f => f.depositos ?? []).filter(d => d.ppdPorFacturar).length;
+    if (globalesMostrador || ppdClienteMostrador || depositosPendientesGuard.length) {
+      advertencias.push(`ℹ Hoja "MOSTRADOR": ${globalesMostrador} factura(s) global(es), ${ppdClienteMostrador} depósito(s) PPD por facturar ya facturado(s) a nombre del cliente y ${depositosPendientesGuard.length} depósito(s) pendiente(s) de generar factura (no se contabilizan).`);
+    }
+  }
+  _fase('mostrador');
+
   // 7. Guardar póliza + movimientos en una transacción con advisory lock
   // Si se generó para un día específico (fechaInicio), el encabezado debe
   // mostrar ESE día, no la fecha en la que se corrió la generación.
@@ -7535,10 +7573,17 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
     const metodosPagoNuevos = new Set(todosLosMovimientos.map(m => m.metodoPago));
     const consumeDosFolios = tipoPropuesta === 'I'
       && [...metodosPagoNuevos].some(m => m !== 'PPD') && metodosPagoNuevos.has('PPD');
-    const foliosNecesarios = _esCedisPorSucursal(centroFolio?.sucursal) ? FOLIOS_MAX_CEDIS : (consumeDosFolios ? 2 : 1);
+    // Ingreso: desde 2026-10-16 el folio que va a CONTPAQi se asigna aparte al
+    // exportar (RANGOS_FOLIO_CONTPAQ_INGRESO / contpaq_folio_* en
+    // poliza.service.js), así que `numero` es solo interno de NUMO y cada
+    // póliza ocupa uno. Reservar los 6 de CEDIS agotaba 100–199 a media
+    // quincena (caso real 2026-10-22: "Se agotó el rango de folios de CEDIS").
+    const unFolioPorPoliza = tipoPropuesta === 'I';
+    const foliosNecesarios = unFolioPorPoliza ? 1
+      : _esCedisPorSucursal(centroFolio?.sucursal) ? FOLIOS_MAX_CEDIS : (consumeDosFolios ? 2 : 1);
 
     const { numero, agotado } = await _folioSiguienteDisponible({
-      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t,
+      tipoPropuesta, rfc, ejercicio, periodo, rangoFolio, foliosNecesarios, ccBySerieMap, transaction: t, unFolioPorPoliza,
     });
 
     if (agotado) {
@@ -7561,6 +7606,8 @@ async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = '
       pendientesPorFacturar: pendientesPorFacturarGuard.length ? pendientesPorFacturarGuard : null,
       depositosEfectivoNoConciliados: depositosEfectivoGuard.length ? depositosEfectivoGuard : null,
       movimientosPpdPorFacturar: movimientosPpdPorFacturarGuard.length ? movimientosPpdPorFacturarGuard : null,
+      movimientosMostrador: movimientosMostradorGuard.length ? movimientosMostradorGuard : null,
+      depositosPendientesFactura: depositosPendientesGuard.length ? depositosPendientesGuard : null,
     }, { transaction: t });
 
     const movimientosFinales = _deduplicarSFRedundante(todosLosMovimientos);

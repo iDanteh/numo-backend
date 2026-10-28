@@ -11,6 +11,7 @@ const { sequelize } = require('../../../config/database.postgres');
 const BankMovement = require('../banks/BankMovement.model');
 const CFDI = require('../../../visor/models/CFDI');
 const { esConceptoMarcadorAjuste } = require('../cfdi-mapping/cfdi-mapping.service');
+const { agregarHojaMostrador } = require('../cfdi-mapping/mostrador-hoja');
 // Pólizas Traspasos C.P. (2026-08-25) — reusa el motor de detección/relación 1-1 de
 // traspasos entre cuentas propias. El require va en ESTE sentido (poliza.service.js →
 // traspasos-internos.service.js) y nunca al revés, a propósito: evita un require
@@ -128,7 +129,7 @@ const CUENTA_NETPAY_AMEX                = '1101010001'; // Renglón "NETPAY AE" 
  *   donde cayó el depósito (ver `BANCO_A_CODIGO_CUENTA`) — null cuando el
  *   banco no tiene cuenta dedicada en el catálogo, o no se pudo determinar.
  */
-async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null) {
+async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null, { fallbackSoloSinFolioFiscal = false } = {}) {
   const mapa = new Map();
   const fechaRefMs = fechaReferencia ? new Date(fechaReferencia).getTime() : null;
   const uuidsUnicos = [...new Set(movimientos.map(m => m.cfdiUuid).filter(Boolean).map(u => u.toUpperCase()))];
@@ -236,9 +237,17 @@ async function construirVerdadBancaria(movimientos, rfc, fechaReferencia = null)
       // Resuelve el uuid por folioFiscal si es válido; si no (null o no es
       // uno de los que buscamos), cae al fallback por serie+folioExterno —
       // ver docstring de la función.
+      // Cobranza (`fallbackSoloSinFolioFiscal`): la serie del renglón es el
+      // folio de la FACTURA y folioExterno es el folio interno de la cuenta en
+      // Kore — misma serie, contadores distintos, así que un folioFiscal de
+      // OTRA factura nunca entra al fallback (2026-10-27, Cobranza 1426 del
+      // 26-oct: la factura A0-260900821 de BERLI JEANETH DESALES tomaba el
+      // depósito Azteca 047168 de la cuenta A0-260900821 de JESUS JAIME CRUZ
+      // MIJANGOS). Ingreso conserva el fallback tal cual.
+      const usarFallback = !(fallbackSoloSinFolioFiscal && folioFiscalUpper);
       const uuidResuelto = uuidsSet.has(folioFiscalUpper)
         ? folioFiscalUpper
-        : (link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
+        : (usarFallback && link.serie && link.folioExterno ? uuidPorSerieFolio.get(`${link.serie}|${link.folioExterno}`) : null);
       if (!uuidResuelto) continue;
       // Kore registró este cobro como "DEPOSITO EN EFECTIVO" en este mismo
       // depósito: efectivo que el cliente depositó directo al banco (ver
@@ -2141,14 +2150,21 @@ function anotarCargosPorFacturaSinAgrupar(movs, subcodigoTransferencia, verdadBa
     // en 1102011001, ver cobranza-poliza-generator `_cargoCobroOtraCaja`): las
     // pólizas manuales 19-29/sep lo llevan con subcódigo 20, como un depósito.
     const esEfectivoCosDepositado = m.serie === 'EFECTIVO-COS' && /^1102/.test(m.cuenta?.codigo || '');
-    // Depósito que paga solo esta factura y difiere por centavos del
-    // complemento: el banco va por el monto exacto del depósito (2026-10-13,
-    // caso real JAVIER DIAZ RODRIGUEZ dep 051726: complemento $1,602.92,
-    // banco $1,602.93 — "pon el monto tal cual esté en el depósito").
+    // Depósito que paga solo esta factura y difiere del complemento: el banco
+    // va por el monto exacto del depósito (2026-10-13, caso real JAVIER DIAZ
+    // RODRIGUEZ dep 051726: complemento $1,602.92, banco $1,602.93 — "pon el
+    // monto tal cual esté en el depósito"). Sin límite de diferencia desde
+    // 2026-10-27 (OSCAR JIMENEZ LOPEZ dep 054959: complemento $3,033.75,
+    // depósito $3,034.00 — "siempre se toma el monto del depósito"), siempre
+    // que el depósito sea de ESTE cobro: lo que aplicó a la factura en Bancos
+    // es el monto del complemento. Sin ese dato se queda el límite anterior.
     let debeCargo = Number(m.debe);
     if (esTransferenciaVerificada && bancario?.montoBancoReal != null && bancario._facturasDeposito === 1) {
       const diferencia = Math.round((bancario.montoBancoReal - debeCargo) * 100) / 100;
-      if (diferencia !== 0 && Math.abs(diferencia) <= TOLERANCIA_CENTAVOS_DEPOSITO) {
+      const depositoDeEsteCobro = bancario._montoAplicado != null
+        ? Math.abs(bancario._montoAplicado - debeCargo) < 0.005
+        : Math.abs(diferencia) <= TOLERANCIA_CENTAVOS_DEPOSITO;
+      if (diferencia !== 0 && depositoDeEsteCobro) {
         ajustesCentavos.push({ facturaUuid: m.facturaUuid ?? null, cfdiUuid: m.cfdiUuid ?? null, antes: debeCargo, despues: bancario.montoBancoReal });
         debeCargo = bancario.montoBancoReal;
       }
@@ -4177,12 +4193,14 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // 1058 CEDIS 2-sep): un solo renglón con centro de otra sucursal
   // (C0-260900073 "factura cancelada, cobro real", centro CONSTRUCASA) hacía
   // que los 11,710 renglones salieran en un solo archivo, sin separar
-  // Bonificaciones ni Descuentos y Devoluciones. Solo Ingreso: Cobranza y el
-  // resto conservan la regla de "todos los renglones".
+  // Bonificaciones ni Descuentos y Devoluciones.
+  // Solo aplica a Ingreso (2026-10-27, póliza 1427 Cobranza CEDIS 25-oct):
+  // Cobranza/Egreso arman un único bloque con tipoVenta null, así que si todos
+  // sus renglones eran de CEDIS el reparto Ventas/Bonificaciones/Descuentos
+  // tronaba con "Cannot read properties of undefined (reading 'push')".
   const esMovCedis = m => (m.centroCostoObj?.sucursal || '').trim().toUpperCase() === 'CEDIS';
-  const esCedis = movimientos.length > 0 && (poliza.tipo === 'I'
-    ? movimientos.filter(esMovCedis).length * 2 > movimientos.length
-    : movimientos.every(esMovCedis));
+  const esCedis = poliza.tipo === 'I' && movimientos.length > 0
+    && movimientos.filter(esMovCedis).length * 2 > movimientos.length;
 
   const sinCuenta = movimientos.filter(m => m.cuentaFaltante || m.cuentaId == null);
   if (sinCuenta.length > 0) {
@@ -4215,7 +4233,11 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // mismo ticket/factura tiene 2+ depósitos reales ligados en fechas
   // distintas (ver docstring de `construirVerdadBancaria`, caso real CEDIS
   // 12-sep).
-  const verdadBancaria = await construirVerdadBancaria(movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal);
+  const verdadBancaria = await construirVerdadBancaria(
+    movimientos.map(m => ({ cfdiUuid: m.facturaUuid || m.cfdiUuid, serie: m.serie })), undefined, fechaFinal,
+    // Solo Cobranza (Pagos) — Ingreso nunca: ahí el fallback se queda igual.
+    { fallbackSoloSinFolioFiscal: poliza.tipo !== 'I' && movimientos.some(m => m.tipoComprobante === 'P') },
+  );
   // "Depósitos consolidados (Efectivo)"/"(Tarjeta)" — confirmado con el
   // usuario 2026-09-10: para TODAS las sucursales, ambos van a la cuenta
   // bancaria real 1102011001 (BBVA) en vez de las genéricas Caja/Bancos por
@@ -4556,7 +4578,8 @@ async function exportContpaqXlsx(id, overrides = {}) {
       workbooks.push({
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo),
+        // MOSTRADOR también solo en Ventas (las facturas de mostrador son ventas).
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo, grupo === 'Ventas'),
       });
     }
     return { poliza, workbooks };
@@ -4677,7 +4700,7 @@ async function _unificarRenglonesPorDepositoBancario(bloques) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null, incluirMostrador = true) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -5177,6 +5200,11 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     }
     wsPpd.autoFilter = { from: 'A1', to: 'H1' };
   }
+
+  // Hoja "MOSTRADOR" (2026-10-21) — informativo, NUNCA se contabilizó en esta
+  // póliza. La arma mostrador-hoja.js (la misma que usa el reporte "Por
+  // facturar" de Reportes).
+  if (incluirMostrador) agregarHojaMostrador(workbook, poliza);
 
   return workbook;
 }
@@ -5953,4 +5981,5 @@ module.exports = {
   _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
+  _construirWorkbookPoliza,
 };

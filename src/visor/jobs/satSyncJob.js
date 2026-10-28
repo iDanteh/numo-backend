@@ -1581,8 +1581,23 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
 
                   // Guardar en MongoDB — solo actualizar si NO ya existe como XML
                   // (evita sobrescribir subTotal/origenDescarga de CFDIs descargados como XML en sesiones previas)
+                  // BUG CORREGIDO (2026-10-26, repaso mensual 1–25 oct: "Incompleta (6,965
+                  // de 13,957)" todas las noches): la copia SAT que ya tenía XML de una
+                  // descarga anterior no entra en el filtro ($ne 'xml') → el upsert
+                  // intentaba insertarla y chocaba con el índice único uuid+source
+                  // (E11000) → el fallback caía al catch "no crítico", no se contaba lo
+                  // recuperado y quedaba incompleta. Esas se omiten del guardado (ya
+                  // están completas) pero sí cuentan como recuperadas.
+                  const yaXmlEnBase = new Set((await CFDI.find({
+                    uuid: { $in: soloMetaRows.map(row => row.uuid.toUpperCase()) },
+                    source: 'SAT', origenDescarga: 'xml',
+                  }, 'uuid').lean()).map(c => c.uuid));
+                  const metaPorGuardar = soloMetaRows.filter(row => !yaXmlEnBase.has(row.uuid.toUpperCase()));
+                  if (yaXmlEnBase.size > 0) {
+                    logger.info(`[SatSyncJob] Fallback Metadata (${tipoActual}): ${yaXmlEnBase.size} ya estaban en base con XML — no se tocan.`);
+                  }
                   const _conciliadosPreviosMeta2 = await _uuidsConciliadosPrevios(soloMetaRows.map(row => row.uuid.toUpperCase()));
-                  await CFDI.bulkWrite(soloMetaRows.map(row => ({
+                  if (metaPorGuardar.length > 0) await CFDI.bulkWrite(metaPorGuardar.map(row => ({
                     updateOne: {
                       filter: { uuid: row.uuid.toUpperCase(), source: 'SAT', origenDescarga: { $ne: 'xml' } },
                       update: {
@@ -1616,7 +1631,10 @@ const procesarDescarga = async ({ rfc, fechaInicio, fechaFin, tipoComprobante, t
 
                   // Acumular en resultados de comparación
                   const metaCoinc   = soloMetaRows.filter(m =>  erpUuids.has((m.uuid || '').toUpperCase())).map(normalizarMetadato);
-                  const metaSoloSAT = soloMetaRows.filter(m => !erpUuids.has((m.uuid || '').toUpperCase())).map(normalizarMetadato);
+                  // Los ya conciliados a mano no se re-marcan "solo en SAT" (guardarResultados
+                  // reabriría su discrepancia) — siguen contando como recuperados abajo.
+                  const metaSoloSAT = soloMetaRows.filter(m => !erpUuids.has((m.uuid || '').toUpperCase())
+                    && !_conciliadosPreviosMeta2.has((m.uuid || '').toUpperCase())).map(normalizarMetadato);
                   // Quitar de soloERP los que ahora encontramos en metadata
                   const metaCoincUuids = new Set(metaCoinc.map(c => c.uuid.toUpperCase()));
                   for (let i = allSoloERP.length - 1; i >= 0; i--) {

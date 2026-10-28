@@ -19,6 +19,7 @@ const AccountPlan       = require('./AccountPlan');
 const Entity            = require('./Entity');
 const PeriodoFiscal     = require('./PeriodoFiscal');
 const CierreMesHistorico = require('./CierreMesHistorico');
+const ReportePorFacturar = require('./ReportePorFacturar');
 const Permission        = require('./Permission');
 const Role              = require('./Role');
 const Poliza            = require('./Poliza');
@@ -62,6 +63,9 @@ CierreMesHistorico.belongsTo(User, { foreignKey: 'cerradoPorId', as: 'cerradoPor
 User.hasMany(CierreMesHistorico,   { foreignKey: 'cerradoPorId', as: 'cierresMesRealizados' });
 CierreMesHistorico.belongsTo(User, { foreignKey: 'revertidoPorId', as: 'revertidoPor' });
 User.hasMany(CierreMesHistorico,   { foreignKey: 'revertidoPorId', as: 'cierresMesRevertidos' });
+ReportePorFacturar.belongsTo(User, { foreignKey: 'creadoPorId', as: 'creadoPor' });
+ReportePorFacturar.belongsTo(User, { foreignKey: 'eliminadoPorId', as: 'eliminadoPor' });
+ReportePorFacturar.belongsTo(User, { foreignKey: 'actualizadoPorId', as: 'actualizadoPor' });
 
 /** Pólizas contables */
 Poliza.hasMany        (PolizaMovimiento, { foreignKey: 'polizaId', as: 'movimientos', onDelete: 'CASCADE' });
@@ -175,6 +179,21 @@ async function syncModels() {
 
   // Historial de cierres de mes — tabla nueva, depende de periodos_fiscales y users.
   await CierreMesHistorico.sync({ force: false });
+
+  // Historial del reporte "Por facturar" (Reportes, 2026-10-22) — tabla nueva, depende de users.
+  await ReportePorFacturar.sync({ force: false });
+  // Borrado lógico (2026-10-22) — la tabla ya puede existir: sync no la altera.
+  await ReportePorFacturar.sequelize.query(`
+    ALTER TABLE reportes_por_facturar
+      ADD COLUMN IF NOT EXISTS eliminado_por_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS eliminado_en     TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN eliminado (reportes_por_facturar):', e.message));
+  // Botón "Actualizar" (2026-10-23) — quién y cuándo se recalculó.
+  await ReportePorFacturar.sequelize.query(`
+    ALTER TABLE reportes_por_facturar
+      ADD COLUMN IF NOT EXISTS actualizado_por_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS actualizado_en     TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN actualizado (reportes_por_facturar):', e.message));
 
   // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
   // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla
@@ -419,6 +438,16 @@ async function syncModels() {
     ALTER TABLE polizas
       ADD COLUMN IF NOT EXISTS movimientos_ppd_por_facturar JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_ppd_por_facturar:', e.message));
+
+  // Hoja "MOSTRADOR" de la póliza de Ingreso (2026-10-21) — ver mostrador.service.js.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS movimientos_mostrador JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN movimientos_mostrador:', e.message));
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS depositos_pendientes_factura JSONB
+  `).catch(e => console.warn('[syncModels] ADD COLUMN depositos_pendientes_factura:', e.message));
 
   // "DEPOSITO EN EFECTIVO" sin conciliar, detectado al generar la póliza —
   // informativo, nunca se contabiliza (idempotente). BUG REAL 2026-09-10:
@@ -707,4 +736,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ALTER COLUMN enriquecimiento clientes.csv a tamaños más anchos:', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };

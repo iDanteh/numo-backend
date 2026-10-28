@@ -46,7 +46,7 @@ function tablasMostrador(datos) {
  * Agrega la hoja al workbook (ExcelJS). Devuelve false si no hay nada que
  * enseñar (no se crea la hoja).
  */
-function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR', { columnaIdentificado = false, agruparPorCliente = false } = {}) {
+function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR', { columnaIdentificado = false } = {}) {
   // Hoja "MOSTRADOR" (2026-10-21, formato del PDF del usuario "MOSTRADOR 20
   // OCT 2026"): depósitos de Bancos de cada factura de mostrador que quedó
   // "Venta Sin Cobro" — informativo, NUNCA se contabiliza. Ver
@@ -145,43 +145,10 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR', { colum
     }
   };
 
-  // Reporte "Por facturar" (2026-10-28, pedido del usuario): dentro de cada
-  // bloque, los depósitos agrupados por cliente — renglón con el nombre,
-  // sus depósitos y su subtotal. La póliza los deja en su orden.
-  const NO_IDENTIFICADO = 'CLIENTE NO IDENTIFICADO';
-  const filasDepositos = (pares, columnas, conIdentificado = false) => {
-    if (!agruparPorCliente) {
-      for (const [d, factura] of pares) filaDeposito(d, factura, conIdentificado);
-      return;
-    }
-    const porCliente = new Map();
-    for (const par of pares) {
-      const cliente = par[0].cliente || NO_IDENTIFICADO;
-      if (!porCliente.has(cliente)) porCliente.set(cliente, []);
-      porCliente.get(cliente).push(par);
-    }
-    const clientes = [...porCliente.keys()].sort((a, b) =>
-      (a === NO_IDENTIFICADO) - (b === NO_IDENTIFICADO) || a.localeCompare(b, 'es'));
-    for (const cliente of clientes) {
-      const grupo = porCliente.get(cliente);
-      const nombre = wsMos.addRow([cliente]);
-      wsMos.mergeCells(nombre.number, 1, nombre.number, columnas);
-      nombre.font = { bold: true };
-      nombre.getCell(1).fill = relleno('FFE4DEF5');
-      for (const [d, factura] of grupo) filaDeposito(d, factura, conIdentificado);
-      const suma = k => _redondear2(grupo.reduce((s, [d]) => s + (Number(d[k]) || 0), 0));
-      const sub = wsMos.addRow({ descripcion: `Subtotal ${cliente}`, importe: suma('importe'), aplicado: suma('aplicado') });
-      sub.font = { bold: true, italic: true };
-      sub.getCell('descripcion').alignment = { horizontal: 'right', wrapText: true };
-      sub.getCell('importe').numFmt = '$#,##0.00';
-      sub.getCell('aplicado').numFmt = '$#,##0.00';
-    }
-  };
-
   const tablaJunta = (titulo, facturas, etiquetaTotalFactura) => {
     seccion(titulo, 10);
     encabezado(wsMos.addRow([...COLUMNAS, 'FACTURA']), 'FF8E7CC3');
-    filasDepositos(facturas.flatMap(f => (f.depositos ?? []).map(d => [d, folioFactura(f)])), 10);
+    for (const f of facturas) for (const d of f.depositos ?? []) filaDeposito(d, folioFactura(f));
     filaTotal(facturas, etiquetaTotalFactura);
   };
 
@@ -206,7 +173,7 @@ function agregarHojaMostrador(workbook, datos, nombreHoja = 'MOSTRADOR', { colum
     // también IDENTIFICADO EL (2026-10-23).
     seccion('PENDIENTE GENERAR FACTURA', columnaIdentificado ? 11 : 10);
     encabezado(wsMos.addRow([...COLUMNAS, 'FACTURA', ...(columnaIdentificado ? ['IDENTIFICADO EL'] : [])]), 'FF8E7CC3');
-    filasDepositos(depositosPendientes.map(d => [d, '']), columnaIdentificado ? 11 : 10, columnaIdentificado);
+    for (const d of depositosPendientes) filaDeposito(d, '', columnaIdentificado);
     filaTotal([{ depositos: depositosPendientes, totalAplicado: _redondear2(depositosPendientes.reduce((s, d) => s + (Number(d.aplicado) || 0), 0)) }], null);
   }
 

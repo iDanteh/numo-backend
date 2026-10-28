@@ -26,7 +26,8 @@ const BankMovement = require('../banks/BankMovement.model');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
 const { _uuidsPorFechaEfectiva } = require('../cfdi-mapping/cfdi-poliza-generator.service');
 const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar } = require('../cfdi-mapping/mostrador.service');
-const { agregarHojaMostrador, agregarHojaDepositosEfectivo, agregarHojaPendientesPago, tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
+const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
+const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -200,11 +201,10 @@ async function obtener(id) {
   const r = await ReportePorFacturar.findByPk(id, { include: _incluirCreador });
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
   const json = r.toJSON();
-  const almacenes = (await _almacenes(json.datos)).map(({ datos, ...a }) => a);
   return {
     ...json,
-    // Por almacén (A0, I0…), como las hojas del Excel (2026-10-28).
-    almacenes,
+    // Las 5 pestañas, por almacén y agrupadas por cliente (2026-10-28).
+    secciones: armarSecciones(json.datos, await _sucursalPorSerie()),
     tablas: {
       ...tablasMostrador(json.datos),
       pendientesPago:    json.datos?.depositosPendientesPago ?? [],
@@ -221,70 +221,28 @@ async function eliminar(id, user) {
   return { ok: true, id: r.id };
 }
 
-const _serie = v => String(v ?? '').trim().toUpperCase();
-// Almacén (serie A0, I0…) de un depósito: el de su remisión; sin remisión, el
-// de la factura.
-const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0] ?? '').split('-')[0]) || _serie(serieFactura);
-
-/**
- * Separa los datos por almacén (2026-10-28, pedido del usuario: "en una hoja
- * los A0 y en otra los I0… si hay de otros almacenes igual deben tener su
- * propia hoja"). Se reparte depósito por depósito según la serie de su
- * remisión: una factura con depósitos de remisiones de otro almacén sale en
- * ambos, cada uno con lo suyo. Series en orden alfabético.
- */
-function _datosPorSerie(datos) {
-  const porSerie = new Map();
-  const de = serie => {
-    if (!porSerie.has(serie)) porSerie.set(serie, { movimientosMostrador: [], depositosPendientesFactura: [] });
-    return porSerie.get(serie);
-  };
-  for (const f of datos?.movimientosMostrador ?? []) {
-    const depsPorSerie = new Map();
-    for (const d of f.depositos ?? []) {
-      const serie = _serieDeposito(d, f.serie);
-      if (!depsPorSerie.has(serie)) depsPorSerie.set(serie, []);
-      depsPorSerie.get(serie).push(d);
-    }
-    if (!depsPorSerie.size) depsPorSerie.set(_serie(f.serie), []);
-    for (const [serie, depositos] of depsPorSerie) de(serie).movimientosMostrador.push({ ...f, depositos });
-  }
-  for (const d of datos?.depositosPendientesFactura ?? []) de(_serieDeposito(d)).depositosPendientesFactura.push(d);
-  return [...porSerie.entries()].sort(([a], [b]) => a.localeCompare(b));
-}
-
-/**
- * Tablas por almacén para la pantalla y el Excel: [{ serie, sucursal, tablas }]
- * (solo los que tienen algo que enseñar).
- */
-async function _almacenes(datos) {
+// Nombre de la sucursal de cada serie (A0 → CEDIS), para hojas y pestañas.
+async function _sucursalPorSerie() {
   const ccBySerie = await centrosSvc.resolveBySerieMap().catch(() => ({}));
-  const sucursalDe = serie => Object.entries(ccBySerie ?? {}).find(([s]) => _serie(s) === serie)?.[1]?.sucursal ?? null;
-  return _datosPorSerie(datos)
-    .map(([serie, datosSerie]) => ({ serie, sucursal: sucursalDe(serie), datos: datosSerie, tablas: tablasMostrador(datosSerie) }))
-    .filter(({ tablas: t }) => t.facturasGlobales.length || t.ppdFacturadoCliente.length || t.sinClasificar.length || t.depositosPendientes.length);
+  const porSerie = new Map(Object.entries(ccBySerie ?? {}).map(([s, c]) => [String(s).trim().toUpperCase(), c?.sucursal ?? null]));
+  return serie => porSerie.get(serie) ?? null;
 }
 
-// Nombre de hoja de Excel: máx. 31 caracteres y sin : \ / ? * [ ].
-const _nombreHoja = (serie, sucursal) =>
-  [serie || 'SIN SERIE', sucursal].filter(Boolean).join(' - ').replace(/[:\\/?*[\]]/g, ' ').slice(0, 31);
-
-async function excel(id) {
+/**
+ * Excel de una pestaña (`seccion`: global, pendiente, ppd, pendientesPago,
+ * efectivo — 2026-10-28, cada pestaña con su reporte) o de todas si no viene.
+ */
+async function excel(id, seccion) {
+  if (seccion && !SECCIONES[seccion]) throw new BadRequestError('Sección inválida');
   const r = await obtener(id);
   const workbook = new ExcelJS.Workbook();
-  // Una hoja por almacén, cada una con los mismos bloques y agrupada por cliente.
-  const almacenes = await _almacenes(r.datos);
-  for (const a of almacenes) {
-    agregarHojaMostrador(workbook, a.datos, _nombreHoja(a.serie, a.sucursal), { columnaIdentificado: true, agruparPorCliente: true });
+  if (!agregarHojasSeccion(workbook, r.secciones, seccion)) {
+    workbook.addWorksheet(seccion ? SECCIONES[seccion].hoja : 'POR FACTURAR').addRow(['Sin depósitos en esta sección para el rango.']);
   }
-  if (!almacenes.length) {
-    workbook.addWorksheet('POR FACTURAR').addRow(['Sin facturas de mostrador ni depósitos pendientes de facturar en el rango.']);
-  }
-  agregarHojaPendientesPago(workbook, r.datos?.depositosPendientesPago);
-  agregarHojaDepositosEfectivo(workbook, r.datos?.depositosEfectivoSinAsociar);
   const rango = r.fechaInicio === r.fechaFin ? r.fechaInicio : `${r.fechaInicio}_${r.fechaFin}`;
   const sucursal = String(r.sucursal ?? 'Todas').replace(/[^\w-]+/g, '_');
-  return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar_${sucursal}_${rango}.xlsx` };
+  const parte = seccion ? `_${SECCIONES[seccion].hoja.replace(/\s+/g, '_')}` : '';
+  return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar${parte}_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _datosPorSerie };
+module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango };

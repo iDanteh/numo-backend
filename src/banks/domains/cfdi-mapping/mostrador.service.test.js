@@ -108,7 +108,7 @@ describe('PENDIENTE GENERAR FACTURA', () => {
     expect(remisionesSinRespuesta).toBe(0);
     // 053960: POR FACTURAR pero debe $47.79 → CON PENDIENTES DE PAGO, con su saldo.
     expect(depositosConSaldo.map(d => [d.idNumo, d.saldo, d.remisiones])).toEqual([['053960', 47.79, ['A0-261002980']]]);
-    expect(depositos).toEqual([
+    expect(depositos.map(({ formasPago, ...d }) => d)).toEqual([
       { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, aplicado: 1, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487', estatus: 'POR FACTURAR' },
       { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, aplicado: 1, banco: 'BBVA', remisiones: ['A0-260804886'], cliente: 'MISAEL ABDIEL JIMENEZ SORIA', idNumo: '053966', estatus: 'POR FACTURAR' },
     ]);
@@ -170,4 +170,26 @@ test('DEPÓSITOS EN EFECTIVO: sin ligas, concepto con efectivo, rango del period
   expect(filtro.concepto).toEqual({ $regex: 'efectivo', $options: 'i' });
   expect(filtro.$or).toEqual([{ erpLinks: { $exists: false } }, { erpLinks: { $size: 0 } }]);
   expect([filtro.fecha.$gte.toISOString(), filtro.fecha.$lte.toISOString()]).toEqual(['2026-10-08T00:00:00.000Z', '2026-10-08T23:59:59.999Z']);
+});
+
+// 2026-10-28 (reporte "Por facturar"): cobro de las remisiones por forma de pago.
+describe('formasPagoDeCuentas', () => {
+  const { formasPagoDeCuentas } = require('./mostrador.service');
+  test('mixto: efectivo + transferencia; una sola forma usa |cobro.monto|', () => {
+    const r = formasPagoDeCuentas([{ cobros: [
+      { monto: -300, formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 900 }] },   // Kore repite el total del pago
+      { monto: 200, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 150 }, { claveSat: '04', nombre: 'TARJETA', monto: 50 }] },
+    ] }]);
+    expect(r).toEqual({ efectivo: 150, tarjeta: 50, transferencia: 300, cheque: 0, otras: 0, mixto: true });
+  });
+  test('varias formas que exceden el monto real se escalan; saldo a favor va a otras y no escala', () => {
+    expect(formasPagoDeCuentas([{ cobros: [{ monto: 100, formasPago: [{ claveSat: '01', monto: 150 }, { claveSat: '28', monto: 50 }] }] }]))
+      .toMatchObject({ efectivo: 75, tarjeta: 25, mixto: true });
+    expect(formasPagoDeCuentas([{ cobros: [{ monto: 698.09, formasPago: [{ claveSat: '04', nombre: 'TARJETA', monto: 80.07 }, { claveSat: '', nombre: 'SALDO A FAVOR', monto: 698.09 }] }] }]))
+      .toMatchObject({ tarjeta: 80.07, otras: 698.09 });
+  });
+  test('sin cuentas de Kore → null; una sola forma → no mixto', () => {
+    expect(formasPagoDeCuentas([undefined])).toBeNull();
+    expect(formasPagoDeCuentas([{ cobros: [{ monto: 10, formasPago: [{ claveSat: '01', monto: 10 }] }] }]).mixto).toBe(false);
+  });
 });

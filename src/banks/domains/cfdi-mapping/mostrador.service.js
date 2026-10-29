@@ -36,13 +36,19 @@ const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 // ── Formas de pago del cobro de cada remisión (reporte "Por facturar",
 // 2026-10-28, pedido del usuario: "si es un cobro mixto y cuánto tienen de
 // cada uno") ────────────────────────────────────────────────────────────────
-const FORMAS_PAGO = ['efectivo', 'tarjeta', 'transferencia', 'cheque', 'otras'];
+// 2026-10-29 (pedido del usuario: "se están sumando al efectivo depósitos en
+// efectivo y transferencias … y los abonos"): Kore manda "DEPOSITO EN
+// EFECTIVO" con la misma clave 01 que el efectivo → columna propia; y un
+// abono (origen ABO) en efectivo solo cuenta como EFECTIVO si la nota ya está
+// facturada y liquidada (saldo 0) — si no, va a ABONOS.
+const FORMAS_PAGO = ['efectivo', 'depositoEfectivo', 'transferencia', 'tarjeta', 'cheque', 'abonos', 'otras'];
 
 // c_FormaPago SAT: 01 efectivo, 02 cheque, 03 transferencia, 04/28 tarjeta.
 // Saldo a favor, anticipo y puntos (no son dinero nuevo) → otras.
 function _formaPago(fp) {
   const nombre = fp?.nombre ?? fp?.nombreFormaPago ?? '';
   if (/saldo\s*a\s*favor|anticipo|puntos/i.test(nombre)) return 'otras';
+  if (/dep[oó]sito/i.test(nombre)) return 'depositoEfectivo';
   const clave = String(fp?.claveSat ?? '').trim();
   if (clave === '01') return 'efectivo';
   if (clave === '02') return 'cheque';
@@ -62,16 +68,20 @@ function _formaPago(fp) {
  * ERP"): con una sola forma se usa `|cobro.monto|`; con varias que exceden
  * ese monto se escalan — salvo saldo a favor / anticipo, donde `cobro.monto`
  * es solo esa porción.
- * @returns {{ efectivo, tarjeta, transferencia, cheque, otras, mixto: boolean } | null}
+ * @param {(cuenta) => boolean} [liquidada]  la nota ya está facturada y con
+ *   saldo 0 → sus abonos en efectivo suman a EFECTIVO (si no, a ABONOS).
+ * @returns {{ efectivo, depositoEfectivo, transferencia, tarjeta, cheque, abonos, otras, mixto: boolean } | null}
  *   null si Kore no regresó las cuentas o no traen cobros.
  */
-function formasPagoDeCuentas(cuentas) {
+function formasPagoDeCuentas(cuentas, liquidada = () => false) {
   const presentes = (cuentas ?? []).filter(Boolean);
   if (!presentes.length) return null;
   const total = Object.fromEntries(FORMAS_PAGO.map(f => [f, 0]));
   let conCobros = false;
   for (const cuenta of presentes) {
+    const abonoEsEfectivo = liquidada(cuenta);
     for (const cobro of cuenta.cobros ?? []) {
+      const esAbono = String(cobro.serieOrigen ?? '').trim().toUpperCase() === 'ABO';
       const fps = cobro.formasPago ?? [];
       if (fps.length) conCobros = true;
       const montoReal = cobro.monto != null ? Math.abs(Number(cobro.monto) || 0) : null;
@@ -80,7 +90,8 @@ function formasPagoDeCuentas(cuentas) {
       const factor = (!conSaldoFavor && fps.length > 1 && montoReal != null && suma > montoReal + 0.05) ? montoReal / suma : 1;
       for (const fp of fps) {
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
-        total[_formaPago(fp)] += monto;
+        const forma = _formaPago(fp);
+        total[forma === 'efectivo' && esAbono && !abonoEsEfectivo ? 'abonos' : forma] += monto;
       }
     }
   }
@@ -111,6 +122,13 @@ async function _cuentasPorRemision(rfc, remisiones) {
   }));
   return { cuentasKore, desglose };
 }
+
+// Nota facturada (serieFactura en /desgloses-cobro/almacen) y con saldo 0 en
+// Kore. Sin respuesta de Kore no se sabe el saldo → no liquidada.
+const _facturadaYLiquidada = cuentasKore => cuenta => {
+  const saldo = cuentasKore.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)?.saldoActual;
+  return !!cuenta.serieFactura && saldo != null && Math.abs(Number(saldo)) < 0.005;
+};
 
 /**
  * @param {object}   p
@@ -172,7 +190,7 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
       // PPD "POR FACTURAR" en Kore (mismo criterio que `esPpdPorFacturar` del
       // generador); si Kore no regresó la cuenta, tipoPago cae al del link.
       d.ppdPorFacturar = infos.some(i => (i.tipoPago ?? i.tipoPagoLink) === 'PPD' && i.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
-      d.formasPago = formasPagoDeCuentas(d.remisiones.map(r => desglose.get(r.replace('-', '|'))));
+      d.formasPago = formasPagoDeCuentas(d.remisiones.map(r => desglose.get(r.replace('-', '|'))), _facturadaYLiquidada(cuentasKore));
       delete d._tipoPagoPorRem;
     }
     depositos.sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));

@@ -65,3 +65,26 @@ test('efectivo que ya se depositó (mismo importe en Bancos) no se repite; Kore 
   expect(r.porFactura).toEqual([]);
   expect(r.sinRespuesta).toBe(1);
 });
+
+test('abonos anteriores: depósito ligado a la remisión sin el UUID de la global → sale en su bloque', async () => {
+  erp.obtenerDesglosesCobroPorFactura.mockResolvedValue([
+    { serieVenta: 'A0', folioVenta: '260502856', fechaCreacion: '2026-05-19T10:00:00Z', cobros: [cobro('ABO', 1681.26, '2026-08-13T16:16:30Z', [fp('03', 'TRANSFERENCIA', 2000)])] },
+    { serieVenta: 'A0', folioVenta: '999', fechaCreacion: '2026-10-05T10:00:00Z', cobros: [] },
+  ]);
+  BankMovement.find.mockReturnValue(lean([
+    // Ya trae el UUID → sale por detectarMovimientosMostrador, aquí no.
+    { folio: '40711', fecha: '2026-08-13T00:00:00Z', concepto: 'ABONO TRANSFERENCIA ENLACE', deposito: 2000, banco: 'SANTANDER',
+      erpLinks: [{ serie: 'A0', folioExterno: '260502856', folioFiscal: 'abc', saldoPagado: 1681.26 }] },
+    // Identificado contra la remisión antes de la factura: sin UUID.
+    { folio: '38103', fecha: '2026-07-30T00:00:00Z', concepto: 'ABONO TRANSFERENCIA ENLACE', deposito: 800, banco: 'Santander',
+      erpLinks: [{ serie: 'A0', folioExterno: '260502856', folioFiscal: null, saldoPagado: 800 }] },
+    // De un ticket PUE de la misma global: no sale.
+    { folio: '1', fecha: '2026-10-05T00:00:00Z', concepto: 'SPEI', deposito: 50, banco: 'BBVA', erpLinks: [{ serie: 'A0', folioExterno: '999' }] },
+  ]));
+  const { porFactura } = await cobrosCajaDeGlobales({ rfc: 'X', facturas: [{ uuid: 'abc', serie: 'A0', folio: '261002123' }] });
+  expect(BankMovement.find.mock.calls[0][0].$or[1]).toEqual({ 'erpLinks.folioExterno': { $in: ['260502856', '999'] } });
+  expect(porFactura[0].depositos).toEqual([expect.objectContaining({
+    idNumo: '38103', importe: 800, banco: 'Santander', remisiones: ['A0-260502856'], cliente: 'CARLOS VALENCIA MOLINA', ppdPorFacturar: true,
+  })]);
+  expect(porFactura[0].depositos[0].deKore).toBeUndefined();
+});

@@ -137,6 +137,10 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   const advertencias = [];
   const facturas = await _facturasDelRango({ rfc, series, fechaInicio, fechaFin });
   const movimientosMostrador = await _movimientosMostradorSinPoliza({ rfc, facturas });
+  const sinEstatus = movimientosMostrador.flatMap(f => f.depositos ?? []).filter(d => d.ppdPorFacturar === null);
+  if (sinEstatus.length) {
+    advertencias.push(`Kore no respondió el estatus de las remisiones de ${sinEstatus.length} depósito(s) (ID NUMO ${sinEstatus.map(d => d.idNumo).join(', ')}) — se muestran igual, pero no se pudo confirmar que sean PPD por facturar; vuelve a actualizarlo más tarde.`);
+  }
   // También los de fecha anterior identificados dentro del rango (2026-10-23).
   const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true });
   if (pendientes.remisionesSinRespuesta) {

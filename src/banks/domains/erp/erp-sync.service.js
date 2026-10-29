@@ -311,6 +311,31 @@ async function obtenerDesglosesCobroAlmacen({ rfc, series, folios }) {
   return cuentas;
 }
 
+// Remisiones que ampara UNA factura (serie+folio de la factura, no de la
+// venta), con sus cobros y formas de pago — mismo endpoint y forma de cuenta
+// que `obtenerDesglosesCobroAlmacen`. Reporte "Por facturar" (2026-10-29):
+// cobros en efectivo / saldo a favor de las remisiones de cada factura global.
+async function obtenerDesglosesCobroPorFactura({ rfc, serieFactura, folioFactura }) {
+  if (!rfc) throw new Error('obtenerDesglosesCobroPorFactura: rfc requerido (aísla la caché por empresa)');
+  if (!serieFactura || !folioFactura) return [];
+
+  const clave = `${rfc}::factura::${serieFactura}-${folioFactura}`;
+  const cacheado = _leerCache(_cacheAlmacen, clave);
+  if (cacheado !== undefined) return cacheado;
+
+  const baseUrl = await _cajaBaseUrlPolizas();
+  const response = await _getConReintento(`${baseUrl}/desgloses-cobro/almacen`, {
+    serieFactura: String(serieFactura).trim(),
+    folioFactura: String(folioFactura).trim(),
+  }, '/desgloses-cobro/almacen (por factura)');
+
+  const cuentas = response.data?.Data?.cuentas || [];
+  // Respuesta parcial (ver `obtenerDesglosesCobroAlmacen`): no se cachea.
+  const totalCount = response.data?.Data?.totalCount;
+  if (!(Number.isFinite(totalCount) && cuentas.length < totalCount)) _cacheAlmacen.set(clave, { data: cuentas, ts: Date.now() });
+  return cuentas;
+}
+
 // Consulta, en lote, saldos a favor GENERADOS (por una Devolución) y USADOS
 // (aplicados a otra venta) para una lista de ventas (serie+folio interno,
 // mismo `serieVenta`/`folioVenta` que `obtenerDesglosesCobroAlmacen`). Usado
@@ -549,7 +574,7 @@ async function obtenerNombrePersonaTicket(params) {
 }
 
 module.exports = {
-  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerSaldosFavor, obtenerNombrePersonaTicket, obtenerCuentaTicket,
+  sincronizarCuentasPendientes, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroPorFactura, obtenerSaldosFavor, obtenerNombrePersonaTicket, obtenerCuentaTicket,
   obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro,
   obtenerDesglosesSalidasCajaPorAlmacen,
 };

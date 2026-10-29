@@ -31,7 +31,10 @@ const SECCIONES = {
   efectivo:       { titulo: 'DEPÓSITOS EN EFECTIVO — SIN ASOCIAR A NINGUNA VENTA',        hoja: 'EFECTIVO' },
 };
 
-const ETIQUETA_FORMA = { efectivo: 'EFECTIVO', tarjeta: 'TARJETA', transferencia: 'TRANSFERENCIA', cheque: 'CHEQUE', otras: 'OTRAS' };
+const ETIQUETA_FORMA = {
+  efectivo: 'EFECTIVO', depositoEfectivo: 'DEPÓSITO EN EFECTIVO', transferencia: 'TRANSFERENCIA', tarjeta: 'TARJETA',
+  cheque: 'CHEQUE', abonos: 'ABONOS EN EFECTIVO', otras: 'OTRAS',
+};
 const NO_IDENTIFICADO = 'CLIENTE NO IDENTIFICADO';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;

@@ -5,6 +5,7 @@ const express = require('express');
 const { authenticate, permit } = require('../../shared/middleware/auth.real');
 const { asyncHandler }         = require('../../shared/middleware/error-handler');
 const service                  = require('./reportes-por-facturar.service');
+const estadistica              = require('./reportes-por-facturar.estadistica');
 
 const router = express.Router();
 
@@ -22,6 +23,27 @@ router.get('/', authenticate, permit(PERM), asyncHandler(async (req, res) => {
 router.post('/', authenticate, permit(PERM), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
   res.status(201).json(await service.generar({ rfc, centroCostoId, fechaInicio, fechaFin }, req.user));
+}));
+
+// ── Estadística por facturar (2026-10-29) — antes de /:id ────────────────────
+// POST /api/reportes-por-facturar/estadistica { rfc, centroCostoId?, fechaInicio, fechaFin? } → { id } (corre en segundo plano)
+router.post('/estadistica', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
+  estadistica.validar({ rfc, fechaInicio, fechaFin });
+  res.status(202).json(estadistica.iniciar({ rfc, centroCostoId, fechaInicio, fechaFin }, req.user));
+}));
+
+// GET /api/reportes-por-facturar/estadistica/:id — avance o resultado
+router.get('/estadistica/:id', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  res.json(estadistica.estado(req.params.id));
+}));
+
+// GET /api/reportes-por-facturar/estadistica/:id/excel
+router.get('/estadistica/:id/excel', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  const { buffer, filename } = await estadistica.excel(req.params.id);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(Buffer.from(buffer));
 }));
 
 // GET /api/reportes-por-facturar/:id — reporte con sus tablas

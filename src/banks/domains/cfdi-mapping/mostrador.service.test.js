@@ -46,11 +46,30 @@ test('sin "Venta Sin Cobro" no consulta nada', async () => {
   expect(BankMovement.find).not.toHaveBeenCalled();
 });
 
-test('si Kore falla, sale sin cliente pero con los depósitos', async () => {
+test('si Kore falla, sale sin cliente y con ppdPorFacturar null (no se esconde, 2026-10-29)', async () => {
   erp.obtenerDesglosesCobroAlmacen.mockRejectedValue(new Error('timeout'));
   const [f] = await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos: [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: UUID }] });
   expect(f.depositos).toHaveLength(2);
-  expect(f.depositos.every(d => d.cliente === '' && d.estatus === '' && d.ppdPorFacturar === false)).toBe(true);
+  expect(f.depositos.every(d => d.cliente === '' && d.estatus === 'SIN RESPUESTA DE KORE' && d.ppdPorFacturar === null)).toBe(true);
+});
+
+test('caso 044114: muchas remisiones → Kore en lotes de 50 y cuentas de 2 en 2', async () => {
+  const folios = Array.from({ length: 120 }, (_, i) => String(260700000 + i));
+  BankMovement.find.mockReturnValue({ lean: async () => [
+    { folio: '044114', banco: 'BBVA', fecha: '2026-08-31', concepto: 'SPEI', deposito: 31411.5, erpLinks: folios.map(f => link(f, 1, UUID, 'PPD')) },
+  ] });
+  erp.obtenerDesglosesCobroAlmacen.mockImplementation(async ({ folios: fs }) => fs.map(f => ({ serieVenta: 'A0', folioVenta: f, fechaCreacion: '2026-07-01' })));
+  let enVuelo = 0, maximo = 0;
+  erp.obtenerCuentaTicket.mockImplementation(async () => {
+    enVuelo++; maximo = Math.max(maximo, enVuelo);
+    await new Promise(r => setImmediate(r));
+    enVuelo--;
+    return { nombre: 'GERARDO SOSA QUERO', tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR' };
+  });
+  const [f] = await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos: [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: UUID }] });
+  expect(erp.obtenerDesglosesCobroAlmacen.mock.calls.map(c => c[0].folios.length)).toEqual([50, 50, 20]);
+  expect(maximo).toBeLessThanOrEqual(2);
+  expect(f.depositos[0]).toMatchObject({ idNumo: '044114', cliente: 'GERARDO SOSA QUERO', ppdPorFacturar: true });
 });
 
 test('factura a nombre de un cliente no es global', async () => {
@@ -66,7 +85,11 @@ test('PPD del link cuando Kore no trae tipoPago; sin estatus "POR FACTURAR" no c
   const movimientos = [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: UUID }];
   erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'X', tipoPago: null, nombreTipoMovimiento: 'POR FACTURAR' });
   expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBe(true);
+  // Kore no regresó la cuenta: no se sabe → null (se muestra con aviso).
   erp.obtenerCuentaTicket.mockResolvedValue(null);
+  expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBeNull();
+  // Kore sí respondió y no es "POR FACTURAR": false (no sale).
+  erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'X', tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' });
   expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBe(false);
 });
 

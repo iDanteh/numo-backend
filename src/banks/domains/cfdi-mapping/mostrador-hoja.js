@@ -30,7 +30,9 @@ function tablasMostrador(datos) {
   // `totalAplicado` es el de lo listado.
   const soloPpd = fs => fs
     .map(f => {
-      const depositos = (f.depositos ?? []).filter(d => d.ppdPorFacturar);
+      // null = Kore no respondió por sus remisiones (2026-10-29): se enseña
+      // en vez de esconderlo — el caso 044114 desaparecía del reporte.
+      const depositos = (f.depositos ?? []).filter(d => d.ppdPorFacturar || d.ppdPorFacturar === null);
       return { ...f, depositos, totalAplicado: Math.round(depositos.reduce((s, d) => s + (Number(d.aplicado) || 0), 0) * 100) / 100 };
     })
     .filter(f => f.depositos.length);

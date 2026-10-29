@@ -378,4 +378,4 @@ async function detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin }) {
     .sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
 }
 
-module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas, FORMAS_PAGO };
+module.exports = { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar, formasPagoDeCuentas, FORMAS_PAGO, _identificadoEl };

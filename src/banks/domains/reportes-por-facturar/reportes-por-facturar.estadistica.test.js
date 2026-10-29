@@ -7,6 +7,7 @@ jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacen: jest.fn(), obtenerCuentaTicket: jest.fn() }));
+jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ lean: async () => [] })), bulkWrite: jest.fn(async () => ({})) }));
 
 const CFDI = require('../../../visor/models/CFDI');
 const BankMovement = require('../banks/BankMovement.model');

@@ -32,11 +32,10 @@
  */
 
 const BankMovement = require('../banks/BankMovement.model');
-const { obtenerDesglosesCobroPorFactura, obtenerCuentaTicket } = require('../erp/erp-sync.service');
+const { obtenerDesglosesCobroPorFactura } = require('../erp/erp-sync.service');
+const { infoRemisiones } = require('../erp/kore-remisiones.service');
 
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
-// Kore limita /cuentas-pendientes (429 con 8 a la vez en prod, 2026-10-22).
-const CONCURRENCIA_CUENTAS = 2;
 const TOLERANCIA = 0.05;
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
@@ -117,14 +116,11 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
 
     // Solo remisiones PPD "POR FACTURAR" (como el resto de la hoja MOSTRADOR).
     const consultar = [...new Set([...candidatos.map(x => x.c), ...abonosSinUuid.flatMap(x => x.links.map(l => cuentaDe.get(remDeLink(l))))])];
-    const info = new Map();
-    for (let i = 0; i < consultar.length; i += CONCURRENCIA_CUENTAS) {
-      await Promise.all(consultar.slice(i, i + CONCURRENCIA_CUENTAS).map(async c => {
-        const r = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
-        if (r) info.set(c, r); else sinRespuesta++;
-      }));
-    }
-    const esPorFacturar = c => info.get(c)?.tipoPago === 'PPD' && info.get(c)?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR;
+    // Cliente / tipo de pago / estatus: memoria de NUMO (kore_remisiones); a Kore solo las nuevas.
+    const r = await infoRemisiones({ rfc, remisiones: consultar.map(c => ({ serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion })) });
+    sinRespuesta += r.sinRespuesta;
+    const infoDe = c => r.info.get(`${_serie(c.serieVenta)}|${String(c.folioVenta).trim()}`);
+    const esPorFacturar = c => infoDe(c)?.tipoPago === 'PPD' && infoDe(c)?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR;
     const porFacturar = candidatos.filter(({ c }) => esPorFacturar(c));
 
     const renglones = [];
@@ -138,7 +134,7 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
         aplicado:    _r2(ppd.reduce((s, l) => s + (Number(l.saldoPagado ?? l.saldoPagadoTotal) || 0), 0)),
         banco:       b.banco ?? '',
         remisiones:  [...new Set(ppd.map(remDeLink))],
-        cliente:     [...new Set(ppd.map(l => info.get(cuentaDe.get(remDeLink(l)))?.nombre).filter(Boolean))].join(' / '),
+        cliente:     [...new Set(ppd.map(l => infoDe(cuentaDe.get(remDeLink(l)))?.nombre).filter(Boolean))].join(' / '),
         idNumo:      b.folio ?? '',
         abonoAnterior: true,
       });
@@ -146,7 +142,7 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
     const abonosPorPago = new Map();
     for (const { c, cobros } of porFacturar) {
       const rem = `${c.serieVenta}-${c.folioVenta}`;
-      const cliente = info.get(c)?.nombre ?? '';
+      const cliente = infoDe(c)?.nombre ?? '';
       for (const x of cobros) {
         const origen = `${x.k.serieOrigen ?? ''}-${x.k.folioOrigen ?? ''}`;
         if (x.tipo === 'EFECTIVO') {

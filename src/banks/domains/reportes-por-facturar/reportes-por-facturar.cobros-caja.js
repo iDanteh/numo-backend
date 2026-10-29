@@ -22,6 +22,13 @@
  * Verificado contra el Excel del usuario: A0-261002123 (EFECTIVO $1,500 y
  * SALDO A FAVOR $242.06), I0-261000245 (SALDO A FAVOR $9,089.77) y
  * A0-261014203 (su efectivo de $3,899.27 ya es el depósito 55151 → no se repite).
+ *
+ * Abonos anteriores (2026-10-29, pedido del usuario: "¿muestra los abonos que
+ * liquidaron esa venta, los anteriores?"): un depósito que se identificó
+ * contra la remisión ANTES de que existiera la factura queda en Bancos sin el
+ * UUID de la global (`erpLinks.folioFiscal` vacío hasta que corre "recuperar
+ * folio fiscal") y no salía en su bloque. Aquí también se agregan los
+ * depósitos ligados a las remisiones de la global que no traen su UUID.
  */
 
 const BankMovement = require('../banks/BankMovement.model');
@@ -33,6 +40,7 @@ const CONCURRENCIA_CUENTAS = 2;
 const TOLERANCIA = 0.05;
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+const _serie = v => String(v ?? '').trim().toUpperCase();
 const _diaMx = f => new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10);
 const _fechaCorta = f => { const [y, m, d] = _diaMx(f).split('-'); return `${d}/${m}/${y.slice(2)}`; };
 const _esSaldoFavor = fp => /saldo\s*a\s*favor|anticipo/i.test(fp.nombre ?? fp.nombreFormaPago ?? '');
@@ -83,33 +91,58 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
       }
       if (cobros.length) candidatos.push({ c, cobros });
     }
-    if (!candidatos.length) continue;
-
-    // Solo remisiones PPD "POR FACTURAR" (como el resto de la hoja MOSTRADOR).
-    const info = new Map();
-    for (let i = 0; i < candidatos.length; i += CONCURRENCIA_CUENTAS) {
-      await Promise.all(candidatos.slice(i, i + CONCURRENCIA_CUENTAS).map(async ({ c }) => {
-        const r = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
-        if (r) info.set(c, r); else sinRespuesta++;
-      }));
-    }
-    const porFacturar = candidatos.filter(({ c }) => info.get(c)?.tipoPago === 'PPD' && info.get(c)?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
-    if (!porFacturar.length) continue;
-
-    // Depósitos de Bancos ligados a la factura o a esas remisiones: lo que ya
-    // es un depósito no se repite como efectivo / saldo a favor.
+    // Depósitos de Bancos ligados a la factura o a cualquiera de sus remisiones.
     const uuid = String(f.uuid ?? '').toUpperCase();
-    const bancos = await BankMovement.find({
+    const cuentaDe = new Map((cuentas ?? []).map(c => [`${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}`, c]));
+    const folios = [...new Set([...cuentaDe.values()].map(c => String(c.folioVenta).trim()))];
+    const bancos = (uuid || folios.length) ? await BankMovement.find({
       isActive: { $ne: false },
       deposito: { $gt: 0 },
       $or: [
         ...(uuid ? [{ 'erpLinks.folioFiscal': { $in: [uuid, uuid.toLowerCase()] } }] : []),
-        ...porFacturar.map(({ c }) => ({ erpLinks: { $elemMatch: { serie: c.serieVenta, folioExterno: c.folioVenta } } })),
+        ...(folios.length ? [{ 'erpLinks.folioExterno': { $in: folios } }] : []),
       ],
-    }).select('deposito erpLinks').lean();
+    }).select('fecha concepto deposito banco folio erpLinks').lean() : [];
     const importesFactura = bancos.map(b => _r2(b.deposito));
 
+    // Abonos anteriores: depósitos ligados a remisiones de la global SIN su
+    // UUID (los que sí lo traen ya salen por detectarMovimientosMostrador).
+    const remDeLink = l => `${_serie(l.serie)}-${String(l.folioExterno ?? '').trim()}`;
+    const linkFactura = l => String(l.folioFiscal ?? '').toUpperCase() === uuid;
+    const abonosSinUuid = bancos
+      .filter(b => !(b.erpLinks ?? []).some(linkFactura))
+      .map(b => ({ b, links: (b.erpLinks ?? []).filter(l => cuentaDe.has(remDeLink(l))) }))
+      .filter(x => x.links.length);
+    if (!candidatos.length && !abonosSinUuid.length) continue;
+
+    // Solo remisiones PPD "POR FACTURAR" (como el resto de la hoja MOSTRADOR).
+    const consultar = [...new Set([...candidatos.map(x => x.c), ...abonosSinUuid.flatMap(x => x.links.map(l => cuentaDe.get(remDeLink(l))))])];
+    const info = new Map();
+    for (let i = 0; i < consultar.length; i += CONCURRENCIA_CUENTAS) {
+      await Promise.all(consultar.slice(i, i + CONCURRENCIA_CUENTAS).map(async c => {
+        const r = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
+        if (r) info.set(c, r); else sinRespuesta++;
+      }));
+    }
+    const esPorFacturar = c => info.get(c)?.tipoPago === 'PPD' && info.get(c)?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR;
+    const porFacturar = candidatos.filter(({ c }) => esPorFacturar(c));
+
     const renglones = [];
+    for (const { b, links } of abonosSinUuid) {
+      const ppd = links.filter(l => esPorFacturar(cuentaDe.get(remDeLink(l))));
+      if (!ppd.length) continue;
+      renglones.push({
+        fecha:       b.fecha ?? null,
+        descripcion: b.concepto ?? '',
+        importe:     _r2(b.deposito),
+        aplicado:    _r2(ppd.reduce((s, l) => s + (Number(l.saldoPagado ?? l.saldoPagadoTotal) || 0), 0)),
+        banco:       b.banco ?? '',
+        remisiones:  [...new Set(ppd.map(remDeLink))],
+        cliente:     [...new Set(ppd.map(l => info.get(cuentaDe.get(remDeLink(l)))?.nombre).filter(Boolean))].join(' / '),
+        idNumo:      b.folio ?? '',
+        abonoAnterior: true,
+      });
+    }
     const abonosPorPago = new Map();
     for (const { c, cobros } of porFacturar) {
       const rem = `${c.serieVenta}-${c.folioVenta}`;
@@ -144,7 +177,8 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
     porFactura.push({
       uuid, serie: f.serie ?? null, folio: f.folio ?? null, fechaFactura: f.fecha ?? null, totalFactura: _r2(f.total),
       depositos: renglones
-        .map(r => ({ ...r, aplicado: r.importe, idNumo: 'S/R', estatus: ESTATUS_POR_FACTURAR, ppdPorFacturar: true, deKore: true }))
+        .map(r => (r.abonoAnterior ? { ...r, estatus: ESTATUS_POR_FACTURAR, ppdPorFacturar: true }
+          : { ...r, aplicado: r.importe, idNumo: 'S/R', estatus: ESTATUS_POR_FACTURAR, ppdPorFacturar: true, deKore: true }))
         .sort((a, b) => new Date(a.fecha) - new Date(b.fecha)),
     });
   }

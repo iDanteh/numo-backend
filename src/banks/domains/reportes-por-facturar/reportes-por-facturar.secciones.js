@@ -88,7 +88,11 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
   for (const f of t.facturasGlobales) globales.set(String(f.uuid ?? _folio(f)).toUpperCase(), { ...f, depositos: [...f.depositos] });
   for (const f of datos?.cobrosCajaGlobales ?? []) {
     const k = String(f.uuid ?? _folio(f)).toUpperCase();
-    if (globales.has(k)) globales.get(k).depositos.push(...f.depositos);
+    if (globales.has(k)) {
+      // Un depósito de Bancos (ID NUMO) no se repite en el bloque.
+      const ya = new Set(globales.get(k).depositos.map(d => String(d.idNumo ?? '')).filter(id => id && id !== 'S/R'));
+      globales.get(k).depositos.push(...f.depositos.filter(d => !ya.has(String(d.idNumo ?? ''))));
+    }
     else globales.set(k, { ...f, depositos: [...f.depositos] });
   }
   const bloquesGlobal = [...globales.values()]

@@ -61,7 +61,7 @@ router.delete('/:id', authenticate, permit(PERM), asyncHandler(async (req, res) 
   res.json(await service.eliminar(req.params.id, req.user));
 }));
 
-// GET /api/reportes-por-facturar/:id/excel?seccion= — una pestaña (global, pendiente, ppd, pendientesPago, efectivo) o todas
+// GET /api/reportes-por-facturar/:id/excel?seccion= — una pestaña (mostrador, ref, especiales, ficha, efectivo) o todas
 router.get('/:id/excel', authenticate, permit(PERM), asyncHandler(async (req, res) => {
   const { buffer, filename } = await service.excel(req.params.id, req.query.seccion || undefined);
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');

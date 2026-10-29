@@ -8,6 +8,7 @@ jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../cfdi-mapping/cfdi-poliza-generator.service', () => ({ _uuidsPorFechaEfectiva: jest.fn() }));
+jest.mock('./reportes-por-facturar.cobros-caja', () => ({ cobrosCajaDeGlobales: jest.fn(async () => ({ porFactura: [], sinRespuesta: 0 })) }));
 jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn(), FORMAS_PAGO: ['efectivo', 'depositoEfectivo', 'transferencia', 'tarjeta', 'cheque', 'abonos', 'otras'] }));
 
 const { ReportePorFacturar } = require('../../../shared/models/postgres');
@@ -125,60 +126,71 @@ test('actualizar un reporte eliminado → 404', async () => {
   await expect(service.actualizar(7, {})).rejects.toThrow();
 });
 
-// 2026-10-28: 5 pestañas, cada una con su Excel — por almacén (serie de la
-// remisión de cada depósito), agrupadas por cliente y con formas de pago.
+// 2026-10-29: formato del Excel "MOSTRADOR 2026" del usuario — MOSTRADOR (un
+// bloque por global + pendientes), REF. por almacén, FACT ESPECIALES, X FAC
+// CON FICHA DE DEP y DEPÓSITOS EN EFECTIVO, agrupados por cliente.
 describe('secciones y Excel por pestaña', () => {
   const ExcelJS = require('exceljs');
-  const fp = (efectivo, transferencia) => ({ efectivo, tarjeta: 0, transferencia, cheque: 0, otras: 0, mixto: efectivo > 0 && transferencia > 0 });
-  const dep = (cliente, importe, rem, formasPago) => ({ fecha: '2026-10-20T00:00:00Z', descripcion: 'SPEI', importe, aplicado: importe, cliente, remisiones: [rem], ppdPorFacturar: true, formasPago });
+  const dep = (cliente, importe, rem, extra = {}) => ({ fecha: '2026-10-20T00:00:00Z', descripcion: 'SPEI', importe, aplicado: importe, banco: 'BBVA', cliente, remisiones: [rem], idNumo: '1', ppdPorFacturar: true, ...extra });
   const cargar = () => {
     ReportePorFacturar.findByPk.mockReset();
     ReportePorFacturar.findByPk.mockResolvedValue({ id: 3, toJSON: () => ({
-      id: 3, sucursal: 'Todas', fechaInicio: '2026-10-20', fechaFin: '2026-10-20',
+      id: 3, sucursal: 'Todas', fechaInicio: '2026-10-20', fechaFin: '2026-10-22',
       datos: {
-        // El depósito de GAMA es de una remisión I0 → va al almacén I0.
-        movimientosMostrador: [{ serie: 'A0', folio: '1', esGlobal: true, totalFactura: 999, fechaFactura: '2026-10-21T18:00:00Z', depositos: [
-          dep('ZETA', 10, 'A0-1', fp(4, 6)), dep('ALFA', 20, 'A0-2', fp(0, 20)), dep('ZETA', 5, 'A0-3', fp(5, 0)), dep('GAMA', 50, 'I0-7', fp(0, 50)),
-        ] }],
-        depositosPendientesFactura: [dep('', 7, 'I0-9', null), dep('BETA', 3, 'I0-8', fp(1, 2)), dep('ALFA', 1, 'A0-4', fp(1, 0))],
-        depositosPendientesPago: [{ ...dep('OMEGA', 100, 'A0-5', fp(30, 70)), saldo: 12 }],
+        movimientosMostrador: [
+          { uuid: 'G2', serie: 'I0', folio: '9', esGlobal: true, totalFactura: 50, fechaFactura: '2026-10-22T18:00:00Z', depositos: [dep('GAMA', 50, 'I0-7')] },
+          { uuid: 'G1', serie: 'A0', folio: '1', esGlobal: true, totalFactura: 999, fechaFactura: '2026-10-21T18:00:00Z', depositos: [
+            dep('ZETA', 10, 'A0-1'), dep('ALFA', 20, 'A0-2'), dep('ZETA', 5, 'A0-3'), dep('NO PPD', 99, 'A0-9', { ppdPorFacturar: false }),
+          ] },
+          { uuid: 'C1', serie: 'B0', folio: '50', esGlobal: false, receptorNombre: 'GRUPO CHILI GUAJILI S.A. DE C.V.', fechaFactura: '2026-10-20T18:00:00Z', depositos: [dep('GRUPO CHILI GUAJILI', 30, 'B0-5')] },
+          { uuid: 'C2', serie: 'B0', folio: '51', esGlobal: false, receptorNombre: 'CRISLA', fechaFactura: '2026-10-20T19:00:00Z', depositos: [dep('MARIO VASQUEZ', 40, 'B0-6')] },
+        ],
+        // Cobro de caja de Kore en la global A0-1 y una global solo con efectivo.
+        cobrosCajaGlobales: [
+          { uuid: 'G1', serie: 'A0', folio: '1', depositos: [dep('ALFA', 1500, 'A0-2', { banco: 'EFECTIVO', idNumo: 'S/R', deKore: true })] },
+          { uuid: 'G3', serie: 'A0', folio: '3', fechaFactura: '2026-10-20T18:00:00Z', depositos: [dep('BETA', 242.06, 'A0-8', { banco: 'SALDO A FAVOR', idNumo: 'S/R' })] },
+        ],
+        depositosPendientesFactura: [dep('', 7, 'I0-9'), dep('BETA', 3, 'I0-8')],
+        depositosPendientesPago: [{ ...dep('OLGA PEREZ', 100, 'A0-5'), saldo: 12 }],
         depositosEfectivoSinAsociar: [{ fecha: '2026-10-20T00:00:00Z', descripcion: 'DEP EFECTIVO', importe: 800, banco: 'BBVA', ficha: '1', idNumo: '051499' }],
       },
     }) });
   };
 
-  test('obtener: secciones por almacén, clientes ordenados y total de efectivo por global', async () => {
+  test('obtener: MOSTRADOR por fecha de la global con cobros de caja, pendientes al final; REF. y especiales', async () => {
     cargar();
-    const r = await service.obtener(3);
-    const s = r.secciones;
-    expect(s.global.map(a => [a.serie, a.sucursal])).toEqual([['A0', 'CEDIS'], ['I0', null]]);
-    const g = s.global[0].bloques[0];
-    expect(g).toMatchObject({ factura: 'A0-1', totalFactura: 999 });
-    expect(g.grupos.map(x => x.cliente)).toEqual(['ALFA', 'ZETA']);
-    expect(g.grupos[1].totales.formas).toMatchObject({ efectivo: 9, transferencia: 6 });
-    expect(g.totales.formas.efectivo).toBe(9);
-    expect(s.global[1].bloques[0].grupos[0].cliente).toBe('GAMA');
-    // Pendiente: una sola tabla por almacén; sin cliente al final.
-    expect(s.pendiente.map(a => a.serie)).toEqual(['A0', 'I0']);
-    expect(s.pendiente[1].bloques).toHaveLength(1);
-    expect(s.pendiente[1].bloques[0].grupos.map(x => x.cliente)).toEqual(['BETA', 'CLIENTE NO IDENTIFICADO']);
-    expect(s.pendientesPago[0].bloques[0].totales).toMatchObject({ saldo: 12, formas: { efectivo: 30 } });
+    const s = (await service.obtener(3)).secciones;
+    expect(s.mostrador.map(b => [b.tipo, b.factura ?? null])).toEqual([['global', 'A0-3'], ['global', 'A0-1'], ['global', 'I0-9'], ['pendiente', null]]);
+    const a01 = s.mostrador[1];
+    expect(a01.grupos.map(g => [g.cliente, g.total])).toEqual([['ALFA', 1520], ['ZETA', 15]]);
+    expect(a01.total).toBe(1535);
+    expect(a01.grupos[0].depositos.map(d => d.banco)).toEqual(['BBVA', 'EFECTIVO']);
+    expect(s.mostrador[3].grupos.map(g => g.cliente)).toEqual(['BETA', 'CLIENTE NO IDENTIFICADO']);
+    expect(s.ref.map(a => [a.serie, a.bloques.length])).toEqual([['B0', 1]]);
+    expect(s.ref[0].bloques[0].grupos[0].depositos[0]).toMatchObject({ factura: 'B0-50', clienteFacturado: 'GRUPO CHILI GUAJILI S.A. DE C.V.' });
+    expect(s.especiales).toHaveLength(1);
+    expect(s.especiales[0].grupos[0].depositos[0]).toMatchObject({ cliente: 'MARIO VASQUEZ', clienteFacturado: 'CRISLA' });
+    expect(s.ficha.total).toBe(100);
     expect(s.efectivo).toHaveLength(1);
   });
 
-  test('excel de una pestaña: una hoja por almacén; sin sección, todas', async () => {
+  test('excel: hojas MOSTRADOR, REF. por almacén, FACT ESPECIALES, X FAC CON FICHA y efectivo', async () => {
     cargar();
     const leer = async seccion => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load((await service.excel(3, seccion)).buffer); return wb; };
-    const global = await leer('global');
-    expect(global.worksheets.map(w => w.name)).toEqual(['A0 - CEDIS', 'I0']);
-    const textos = global.getWorksheet('A0 - CEDIS').getColumn(2).values.filter(Boolean);
-    expect(textos).toEqual(expect.arrayContaining(['Subtotal ALFA', 'Subtotal ZETA', 'TOTAL', 'Total factura', 'EFECTIVO DE LA FACTURA A0-1']));
-    expect((await leer('efectivo')).worksheets.map(w => w.name)).toEqual(['DEPÓSITOS EN EFECTIVO']);
-    expect((await leer()).worksheets.map(w => w.name)).toEqual([
-      'GLOBAL - A0 - CEDIS', 'GLOBAL - I0', 'PENDIENTE - A0 - CEDIS', 'PENDIENTE - I0', 'PEND PAGO - A0 - CEDIS', 'EFECTIVO',
-    ]);
-    const { filename } = await service.excel(3, 'pendientesPago');
-    expect(filename).toBe('Por_facturar_PEND_PAGO_Todas_2026-10-20.xlsx');
+    const todo = await leer();
+    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR', 'REF. B0 - HIDALGO', 'FACT ESPECIALES', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO']);
+    const ws = todo.getWorksheet('MOSTRADOR');
+    // Encabezado del bloque de la global A0-1 y sus columnas, como el Excel del usuario.
+    const fila = n => ws.getRow(n).values.slice(1);
+    const enc = ws.getColumn(6).values.indexOf('A0-1');
+    expect(fila(enc)).toEqual([expect.any(Date), undefined, undefined, undefined, 'A0', 'A0-1', 'ID NUMO']);
+    expect(fila(enc + 1)).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE']);
+    expect(ws.getColumn(2).values).toEqual(expect.arrayContaining(['Subtotal ALFA', 'TOTAL', 'PENDIENTE GENERAR FACTURA']));
+    const ref = todo.getWorksheet('REF. B0 - HIDALGO').getRow(2).values.slice(1);
+    expect(ref).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'B0', 'B0 ORIGEN', 'CTE', 'CTE FACTURADO', 'ID DE PAGO']);
+    expect((await leer('ficha')).worksheets.map(w => w.name)).toEqual(['X FAC CON FICHA DE DEP']);
+    const { filename } = await service.excel(3, 'especiales');
+    expect(filename).toBe('Por_facturar_FACT_ESPECIALES_Todas_2026-10-20_2026-10-22.xlsx');
     await expect(service.excel(3, 'otra')).rejects.toThrow();
   });
 });

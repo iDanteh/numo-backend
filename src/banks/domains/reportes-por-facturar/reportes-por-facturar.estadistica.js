@@ -26,7 +26,8 @@ const ExcelJS      = require('exceljs');
 const BankMovement = require('../banks/BankMovement.model');
 const CFDI         = require('../../../visor/models/CFDI');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
-const { obtenerDesglosesCobroAlmacen, obtenerCuentaTicket } = require('../erp/erp-sync.service');
+const { obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
+const { infoRemisiones } = require('../erp/kore-remisiones.service');
 const { _identificadoEl } = require('../cfdi-mapping/mostrador.service');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
 
@@ -35,8 +36,6 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 const LOTE_DESGLOSES = 50;
-// Kore limita /cuentas-pendientes (429 con 8 a la vez en prod, 2026-10-22).
-const CONCURRENCIA_CUENTAS = 2;
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const _diaMx = f => (f ? new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10) : null);
@@ -119,17 +118,15 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
     const cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(r => r.serie), folios: lote.map(r => r.folio) });
     for (const c of cuentas ?? []) desglose.set(`${c.serieVenta}|${c.folioVenta}`, c);
   }
-  const cuentaKore = new Map();
-  let sinRespuesta = 0;
+  // Cliente / tipo de pago / estatus de la memoria de NUMO (kore_remisiones);
+  // a Kore solo las nuevas y, por su saldo, las que todavía no tienen factura.
+  onAvance('Consultando Kore: clientes y estatus de las remisiones nuevas…');
   const conDesglose = remisiones.filter(r => desglose.has(`${r.serie}|${r.folio}`));
-  for (let i = 0; i < conDesglose.length; i += CONCURRENCIA_CUENTAS) {
-    if (i % 20 === 0) onAvance(`Consultando Kore: cuentas ${i} de ${conDesglose.length} remisiones…`);
-    await Promise.all(conDesglose.slice(i, i + CONCURRENCIA_CUENTAS).map(async r => {
-      const k = `${r.serie}|${r.folio}`;
-      const info = await obtenerCuentaTicket({ rfc, serie: r.serie, folio: r.folio, fechaCreacion: desglose.get(k).fechaCreacion }).catch(() => null);
-      if (info) cuentaKore.set(k, info); else sinRespuesta++;
-    }));
-  }
+  const { info: cuentaKore, sinRespuesta } = await infoRemisiones({
+    rfc,
+    remisiones: conDesglose.map(r => ({ ...r, fechaCreacion: desglose.get(`${r.serie}|${r.folio}`).fechaCreacion })),
+    necesitaSaldo: k => !desglose.get(k)?.serieFactura,
+  });
 
   const esPorFacturar = k => { const c = cuentaKore.get(k); return c?.tipoPago === 'PPD' && c?.nombreTipoMovimiento === ESTATUS_POR_FACTURAR; };
   const facturaDe = k => {

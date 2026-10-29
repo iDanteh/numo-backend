@@ -25,7 +25,8 @@
  */
 
 const BankMovement = require('../banks/BankMovement.model');
-const { obtenerDesglosesCobroAlmacen, obtenerCuentaTicket } = require('../erp/erp-sync.service');
+const { obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
+const { infoRemisiones } = require('../erp/kore-remisiones.service');
 
 const TIPO_ORIGEN_VENTA_SIN_COBRO = 'Venta Sin Cobro';
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
@@ -110,12 +111,11 @@ function formasPagoDeCuentas(cuentas, liquidada = () => false) {
 // las remisiones en una sola llamada (con cientos Kore responde 414 "URI Too
 // Large" y no regresaba ninguna) y todas las cuentas a la vez (429 → sin
 // estatus → el depósito quedaba "no PPD" y se escondía). Ahora en lotes de
-// LOTE_DESGLOSES y de CONCURRENCIA_CUENTAS en CONCURRENCIA_CUENTAS, igual que
-// detectarDepositosPendientesFactura.
+// LOTE_DESGLOSES; las cuentas, con la memoria de kore_remisiones (de 2 en 2
+// solo las nuevas), igual que detectarDepositosPendientesFactura.
 async function _cuentasPorRemision(rfc, remisiones) {
-  const cuentasKore = new Map();
   const desglose = new Map();
-  if (!remisiones.length) return { cuentasKore, desglose };
+  if (!remisiones.length) return { cuentasKore: new Map(), desglose };
   for (let i = 0; i < remisiones.length; i += LOTE_DESGLOSES) {
     const lote = remisiones.slice(i, i + LOTE_DESGLOSES);
     try {
@@ -125,22 +125,29 @@ async function _cuentasPorRemision(rfc, remisiones) {
       // Ese lote queda sin datos (sus depósitos salen con ppdPorFacturar null).
     }
   }
-  const cuentas = [...desglose.values()];
-  for (let i = 0; i < cuentas.length; i += CONCURRENCIA_CUENTAS) {
-    await Promise.all(cuentas.slice(i, i + CONCURRENCIA_CUENTAS).map(async c => {
-      const info = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
-      if (info) cuentasKore.set(`${c.serieVenta}|${c.folioVenta}`, info);
-    }));
-  }
+  // Cliente / tipo de pago / estatus: de la memoria de NUMO (kore_remisiones);
+  // solo las que nunca se han visto van a Kore (2026-10-29).
+  const { info: cuentasKore } = await infoRemisiones({
+    rfc, remisiones: [...desglose.values()].map(c => ({ serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion })),
+  });
   return { cuentasKore, desglose };
 }
 
-// Nota facturada (serieFactura en /desgloses-cobro/almacen) y con saldo 0 en
-// Kore. Sin respuesta de Kore no se sabe el saldo → no liquidada.
-const _facturadaYLiquidada = cuentasKore => cuenta => {
-  const saldo = cuentasKore.get(`${cuenta.serieVenta}|${cuenta.folioVenta}`)?.saldoActual;
-  return !!cuenta.serieFactura && saldo != null && Math.abs(Number(saldo)) < 0.005;
+// Nota facturada (serieFactura en /desgloses-cobro/almacen) y con saldo 0.
+// El saldo sale de Bancos (el vínculo quedó cerrado: Kore confirmó saldo 0 —
+// `conciliacionFinalizadaAt`) o, si se pidió, de Kore. Sin dato → no liquidada.
+const _facturadaYLiquidada = (cuentasKore, cerradas = new Set()) => cuenta => {
+  const k = `${cuenta.serieVenta}|${cuenta.folioVenta}`;
+  const saldo = cuentasKore.get(k)?.saldoActual;
+  const cero = saldo != null ? Math.abs(Number(saldo)) < 0.005 : cerradas.has(k);
+  return !!cuenta.serieFactura && cero;
 };
+
+// Remisiones (`SERIE|FOLIO`) cuyo vínculo en Bancos ya está cerrado: Kore
+// confirmó saldo 0 (job "Sync ERP-Kore").
+const _remisionesCerradas = bancos => new Set(bancos.flatMap(b => (b.erpLinks ?? [])
+  .filter(l => l.conciliacionFinalizadaAt && l.serie && l.folioExterno)
+  .map(l => `${String(l.serie).trim().toUpperCase()}|${String(l.folioExterno).trim()}`)));
 
 /**
  * @param {object}   p
@@ -190,6 +197,7 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
     .map(r => { const i = r.indexOf('-'); return { serie: r.slice(0, i), folio: r.slice(i + 1) }; })
     .filter(r => r.serie && r.folio);
   const { cuentasKore, desglose } = await _cuentasPorRemision(rfc, remisiones);
+  const cerradas = _remisionesCerradas(bancos);
 
   const resultado = [];
   for (const [u, depositos] of porFactura) {
@@ -208,7 +216,7 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
         d.ppdPorFacturar = null;
         d.estatus = 'SIN RESPUESTA DE KORE';
       }
-      d.formasPago = formasPagoDeCuentas(d.remisiones.map(r => desglose.get(r.replace('-', '|'))), _facturadaYLiquidada(cuentasKore));
+      d.formasPago = formasPagoDeCuentas(d.remisiones.map(r => desglose.get(r.replace('-', '|'))), _facturadaYLiquidada(cuentasKore, cerradas));
       delete d._tipoPagoPorRem;
     }
     depositos.sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo)));
@@ -254,8 +262,6 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
  *   $47.79 = retención del 4% sin registrar en Kore).
  */
 const LOTE_DESGLOSES = 50;
-// Kore limita /cuentas-pendientes (429 con 8 a la vez en prod, 2026-10-22).
-const CONCURRENCIA_CUENTAS = 2;
 
 // Último momento en que se identificó / vinculó el depósito (fechas reales,
 // con hora): vinculaciones del historial, identificadoPor y la primera
@@ -311,18 +317,16 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
     for (const c of cuentas ?? []) desglose.set(`${c.serieVenta}|${c.folioVenta}`, c);
   }
 
-  // Tipo de pago, estatus y saldo de Kore — solo de las que no tienen factura.
-  const cuentaKore = new Map();
-  let remisionesSinRespuesta = 0;
+  // Tipo de pago, estatus y cliente de la memoria de NUMO (kore_remisiones,
+  // 2026-10-29) — solo de las que no tienen factura. El saldo se pide a Kore
+  // únicamente si Bancos todavía no confirma que la remisión quedó en 0.
+  const cerradas = _remisionesCerradas(bancos);
   const pendientes = remisiones.filter(r => { const d = desglose.get(`${r.serie}|${r.folio}`); return d && !d.serieFactura; });
-  for (let i = 0; i < pendientes.length; i += CONCURRENCIA_CUENTAS) {
-    await Promise.all(pendientes.slice(i, i + CONCURRENCIA_CUENTAS).map(async r => {
-      const d = desglose.get(`${r.serie}|${r.folio}`);
-      const info = await obtenerCuentaTicket({ rfc, serie: r.serie, folio: r.folio, fechaCreacion: d.fechaCreacion }).catch(() => null);
-      if (info) cuentaKore.set(`${r.serie}|${r.folio}`, info);
-      else remisionesSinRespuesta++;
-    }));
-  }
+  const { info: cuentaKore, sinRespuesta: remisionesSinRespuesta } = await infoRemisiones({
+    rfc,
+    remisiones: pendientes.map(r => ({ ...r, fechaCreacion: desglose.get(`${r.serie}|${r.folio}`).fechaCreacion })),
+    necesitaSaldo: k => !cerradas.has(k),
+  });
 
   // PPD, "POR FACTURAR" y sin factura (sin importar el saldo).
   const porFacturar = l => {
@@ -333,7 +337,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       && c.tipoPago === 'PPD'
       && c.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
   };
-  const saldoDe = l => Number(cuentaKore.get(clave(l))?.saldoActual) || 0;
+  const saldoDe = l => { const k = clave(l); const saldo = cuentaKore.get(k)?.saldoActual; return saldo != null ? Number(saldo) || 0 : cerradas.has(k) ? 0 : Number(l.saldoActual) || 0; };
   const pagada = l => Math.abs(saldoDe(l)) < 0.005;
 
   const depositos = [];

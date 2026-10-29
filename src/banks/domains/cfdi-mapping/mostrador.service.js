@@ -105,21 +105,33 @@ function formasPagoDeCuentas(cuentas, liquidada = () => false) {
 // creación de la remisión (sale de `/desgloses-cobro/almacen`). Si Kore falla,
 // la remisión queda sin datos. `desglose` = la cuenta de `/desgloses-cobro/
 // almacen` de cada remisión (sus cobros con formas de pago).
+// 2026-10-29 (caso real 044114 en la global A0-261010907, reporte "Por
+// facturar" del 20 al 29-oct, todas las sucursales): antes se pedían TODAS
+// las remisiones en una sola llamada (con cientos Kore responde 414 "URI Too
+// Large" y no regresaba ninguna) y todas las cuentas a la vez (429 → sin
+// estatus → el depósito quedaba "no PPD" y se escondía). Ahora en lotes de
+// LOTE_DESGLOSES y de CONCURRENCIA_CUENTAS en CONCURRENCIA_CUENTAS, igual que
+// detectarDepositosPendientesFactura.
 async function _cuentasPorRemision(rfc, remisiones) {
   const cuentasKore = new Map();
   const desglose = new Map();
   if (!remisiones.length) return { cuentasKore, desglose };
-  let cuentas = [];
-  try {
-    cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: remisiones.map(r => r.serie), folios: remisiones.map(r => r.folio) });
-  } catch {
-    return { cuentasKore, desglose };
+  for (let i = 0; i < remisiones.length; i += LOTE_DESGLOSES) {
+    const lote = remisiones.slice(i, i + LOTE_DESGLOSES);
+    try {
+      const cuentas = await obtenerDesglosesCobroAlmacen({ rfc, series: lote.map(r => r.serie), folios: lote.map(r => r.folio) });
+      for (const c of cuentas ?? []) desglose.set(`${c.serieVenta}|${c.folioVenta}`, c);
+    } catch {
+      // Ese lote queda sin datos (sus depósitos salen con ppdPorFacturar null).
+    }
   }
-  for (const c of cuentas ?? []) desglose.set(`${c.serieVenta}|${c.folioVenta}`, c);
-  await Promise.all((cuentas ?? []).map(async c => {
-    const info = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
-    if (info) cuentasKore.set(`${c.serieVenta}|${c.folioVenta}`, info);
-  }));
+  const cuentas = [...desglose.values()];
+  for (let i = 0; i < cuentas.length; i += CONCURRENCIA_CUENTAS) {
+    await Promise.all(cuentas.slice(i, i + CONCURRENCIA_CUENTAS).map(async c => {
+      const info = await obtenerCuentaTicket({ rfc, serie: c.serieVenta, folio: c.folioVenta, fechaCreacion: c.fechaCreacion }).catch(() => null);
+      if (info) cuentasKore.set(`${c.serieVenta}|${c.folioVenta}`, info);
+    }));
+  }
   return { cuentasKore, desglose };
 }
 
@@ -190,6 +202,12 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
       // PPD "POR FACTURAR" en Kore (mismo criterio que `esPpdPorFacturar` del
       // generador); si Kore no regresó la cuenta, tipoPago cae al del link.
       d.ppdPorFacturar = infos.some(i => (i.tipoPago ?? i.tipoPagoLink) === 'PPD' && i.nombreTipoMovimiento === ESTATUS_POR_FACTURAR);
+      // Kore no regresó NINGUNA de sus remisiones: no se sabe → null (no se
+      // esconde; el reporte avisa). Antes quedaba false y desaparecía.
+      if (!d.ppdPorFacturar && infos.every(i => !i.nombreTipoMovimiento) && infos.some(i => (i.tipoPagoLink ?? 'PPD') === 'PPD')) {
+        d.ppdPorFacturar = null;
+        d.estatus = 'SIN RESPUESTA DE KORE';
+      }
       d.formasPago = formasPagoDeCuentas(d.remisiones.map(r => desglose.get(r.replace('-', '|'))), _facturadaYLiquidada(cuentasKore));
       delete d._tipoPagoPorRem;
     }

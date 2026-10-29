@@ -28,10 +28,12 @@ const { _uuidsPorFechaEfectiva } = require('../cfdi-mapping/cfdi-poliza-generato
 const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar } = require('../cfdi-mapping/mostrador.service');
 const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
+const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
+const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -142,8 +144,21 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   }
 
   const depositosEfectivoSinAsociar = await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin });
+
+  // A nombre de quién salió cada factura (CTE FACTURADO de REF. / FACT ESPECIALES).
+  const receptorDe = new Map(facturas.map(f => [f.uuid, f.receptor?.nombre ?? null]));
+  for (const m of movimientosMostrador) m.receptorNombre = receptorDe.get(String(m.uuid ?? '').toUpperCase()) ?? null;
+
+  // Cobros en EFECTIVO / SALDO A FAVOR de Kore de cada global (2026-10-29).
+  const globales = facturas.filter(f => (f.receptor?.rfc ?? '').trim().toUpperCase() === RFC_PUBLICO_GENERAL);
+  const cobrosCaja = await cobrosCajaDeGlobales({ rfc, facturas: globales });
+  if (cobrosCaja.sinRespuesta) {
+    advertencias.push(`Kore no respondió ${cobrosCaja.sinRespuesta} consulta(s) de cobros en efectivo / saldo a favor de las facturas globales — pueden faltar renglones; vuelve a actualizarlo más tarde.`);
+  }
+
   const datos = {
     movimientosMostrador,
+    cobrosCajaGlobales: cobrosCaja.porFactura,
     depositosPendientesFactura: pendientes.depositos,
     depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
     depositosEfectivoSinAsociar,
@@ -203,8 +218,8 @@ async function obtener(id) {
   const json = r.toJSON();
   return {
     ...json,
-    // Las 5 pestañas, por almacén y agrupadas por cliente (2026-10-28).
-    secciones: armarSecciones(json.datos, await _sucursalPorSerie()),
+    // Pestañas con el formato del Excel "MOSTRADOR 2026" del usuario (2026-10-29).
+    secciones: armarSecciones(json.datos, await _sucursalPorSerie(), { fechaFin: json.fechaFin }),
     tablas: {
       ...tablasMostrador(json.datos),
       pendientesPago:    json.datos?.depositosPendientesPago ?? [],
@@ -229,8 +244,8 @@ async function _sucursalPorSerie() {
 }
 
 /**
- * Excel de una pestaña (`seccion`: global, pendiente, ppd, pendientesPago,
- * efectivo — 2026-10-28, cada pestaña con su reporte) o de todas si no viene.
+ * Excel de una pestaña (`seccion`: mostrador, ref, especiales, ficha,
+ * efectivo — 2026-10-29) o de todas si no viene.
  */
 async function excel(id, seccion) {
   if (seccion && !SECCIONES[seccion]) throw new BadRequestError('Sección inválida');

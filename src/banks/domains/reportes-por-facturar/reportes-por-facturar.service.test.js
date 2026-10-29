@@ -3,7 +3,7 @@
 // Reporte "Por facturar" (2026-10-22): facturas pagadas con depósitos de días
 // anteriores (equivalente sin póliza de "Venta Sin Cobro") + depósitos
 // pendientes de generar factura, con historial.
-jest.mock('../../../shared/models/postgres', () => ({ ReportePorFacturar: { create: jest.fn(), findByPk: jest.fn(), findAndCountAll: jest.fn() }, User: {} }));
+jest.mock('../../../shared/models/postgres', () => ({ ReportePorFacturar: { create: jest.fn(), findByPk: jest.fn(), findAndCountAll: jest.fn(), update: jest.fn(async () => [1]) }, User: {} }));
 jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
@@ -41,19 +41,31 @@ beforeEach(() => {
   mostrador.detectarDepositosPendientesFactura.mockResolvedValue({ depositos: [{ importe: 146077.63, idNumo: '053966' }], depositosConSaldo: [{ importe: 1147.04, saldo: 47.79, idNumo: '053960' }], remisionesSinRespuesta: 0 });
   mostrador.detectarDepositosEfectivoSinAsociar.mockResolvedValue([{ importe: 1618.95, idNumo: '051499' }]);
   ReportePorFacturar.create.mockResolvedValue({ id: 7 });
-  ReportePorFacturar.findByPk.mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: ReportePorFacturar.create.mock.calls[0][0].datos }) }));
+  ReportePorFacturar.findByPk.mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: terminado()?.datos ?? null }) }));
 });
 
+// 2026-10-29: generar / actualizar guardan el reporte "calculando" y lo
+// completan en segundo plano — `terminado()` = lo que se guardó al terminar.
+const terminado = () => ReportePorFacturar.update.mock.calls.map(c => c[0]).find(x => x.estado === 'listo' || x.estado === 'error');
+const generarYEsperar = async (...args) => { const r = await service.generar(...args); await service._esperar(r.id ?? 7); return service.obtener(7); };
+
 test('solo facturas de la sucursal con algún depósito de días anteriores; guarda quién lo creó', async () => {
-  const r = await service.generar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20' }, { dbId: '5' });
+  const inicial = await service.generar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20' }, { dbId: '5' });
+  // Se guarda de inmediato, sin datos, calculando.
+  expect(ReportePorFacturar.create.mock.calls[0][0]).toMatchObject({ estado: 'calculando', datos: null, sucursal: 'CEDIS', fechaFin: '2026-10-20', creadoPorId: 5 });
+  await service._esperar(7);
+  const r = await service.obtener(7);
+  expect(inicial.id).toBe(7);
 
   const [{ cfdis, movimientos }] = mostrador.detectarMovimientosMostrador.mock.calls[0];
   expect(movimientos).toEqual([{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: GLOBAL }]);
   expect(cfdis.map(c => c.folio)).toEqual(['261009872']);
   expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true });
 
-  const guardado = ReportePorFacturar.create.mock.calls[0][0];
-  expect(guardado).toMatchObject({ rfc: 'CCO011113663', centroCostoId: 1, sucursal: 'CEDIS', fechaInicio: '2026-10-20', fechaFin: '2026-10-20', creadoPorId: 5, advertencias: null });
+  expect(ReportePorFacturar.create.mock.calls[0][0]).toMatchObject({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20' });
+  const guardado = terminado();
+  expect(guardado).toMatchObject({ estado: 'listo', sucursal: 'CEDIS', advertencias: null, error: null });
+  expect(ReportePorFacturar.update.mock.calls.some(c => /Pendientes de generar factura/.test(c[0].avance ?? ''))).toBe(true);
   expect(guardado.resumen).toEqual({
     facturasGlobales:    { facturas: 1, depositos: 1, importe: 5000 },
     ppdFacturadoCliente: { facturas: 0, depositos: 0, importe: 0 },
@@ -69,7 +81,7 @@ test('solo facturas de la sucursal con algún depósito de días anteriores; gua
 });
 
 test('rango: consulta cada día y valida fechas', async () => {
-  await service.generar({ rfc: 'X', fechaInicio: '2026-10-19', fechaFin: '2026-10-21' }, null);
+  await generarYEsperar({ rfc: 'X', fechaInicio: '2026-10-19', fechaFin: '2026-10-21' }, null);
   expect(gen._uuidsPorFechaEfectiva.mock.calls.map(c => c[0].fechaInicio)).toEqual(['2026-10-19', '2026-10-20', '2026-10-21']);
   expect(ReportePorFacturar.create.mock.calls[0][0]).toMatchObject({ sucursal: 'Todas', centroCostoId: null, creadoPorId: null });
 
@@ -80,8 +92,14 @@ test('rango: consulta cada día y valida fechas', async () => {
 
 test('si Kore no respondió remisiones, queda advertencia en el reporte', async () => {
   mostrador.detectarDepositosPendientesFactura.mockResolvedValue({ depositos: [], remisionesSinRespuesta: 3 });
-  await service.generar({ rfc: 'X', centroCostoId: 1, fechaInicio: '2026-10-20' }, null);
-  expect(ReportePorFacturar.create.mock.calls[0][0].advertencias[0]).toMatch('no respondió 3');
+  await generarYEsperar({ rfc: 'X', centroCostoId: 1, fechaInicio: '2026-10-20' }, null);
+  expect(terminado().advertencias[0]).toMatch('no respondió 3');
+});
+
+test('si el cálculo truena, el reporte queda en error con el mensaje', async () => {
+  mostrador.detectarDepositosPendientesFactura.mockRejectedValue(new Error('Kore caído'));
+  await generarYEsperar({ rfc: 'X', centroCostoId: 1, fechaInicio: '2026-10-20' }, null);
+  expect(terminado()).toMatchObject({ estado: 'error', error: 'Kore caído' });
 });
 
 test('historial paginado: 5 por página, más recientes primero', async () => {
@@ -108,16 +126,25 @@ test('actualizar: recalcula con la misma sucursal y fechas y reemplaza los datos
   const update = jest.fn();
   ReportePorFacturar.findByPk.mockReset();
   ReportePorFacturar.findByPk
-    .mockResolvedValueOnce({ id: 7, rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20', fechaFin: '2026-10-20', eliminadoEn: null, update })
-    .mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: update.mock.calls[0][0].datos }) }));
+    .mockResolvedValueOnce({ id: 7, rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20', fechaFin: '2026-10-20', eliminadoEn: null, estado: 'listo', update })
+    .mockImplementation(async () => ({ toJSON: () => ({ id: 7, datos: terminado()?.datos ?? null }) }));
   const r = await service.actualizar(7, { dbId: '9' });
+  // Primero se marca "calculando" (los datos anteriores se siguen viendo).
+  expect(update.mock.calls[0][0]).toMatchObject({ estado: 'calculando', error: null });
+  await service._esperar(7);
   expect(ReportePorFacturar.create).not.toHaveBeenCalled();
   expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true });
-  const cambios = update.mock.calls[0][0];
-  expect(cambios).toMatchObject({ sucursal: 'CEDIS', actualizadoPorId: 9, advertencias: null });
+  const cambios = terminado();
+  expect(cambios).toMatchObject({ estado: 'listo', sucursal: 'CEDIS', actualizadoPorId: 9, advertencias: null });
   expect(cambios.actualizadoEn).toBeInstanceOf(Date);
   expect(cambios.datos.depositosPendientesFactura.map(d => d.idNumo)).toEqual(['053966']);
   expect(r.id).toBe(7);
+});
+
+test('actualizar mientras ya se está calculando → 409', async () => {
+  ReportePorFacturar.findByPk.mockReset();
+  ReportePorFacturar.findByPk.mockResolvedValue({ id: 7, eliminadoEn: null, estado: 'calculando' });
+  await expect(service.actualizar(7, {})).rejects.toThrow('ya se está calculando');
 });
 
 test('actualizar un reporte eliminado → 404', async () => {

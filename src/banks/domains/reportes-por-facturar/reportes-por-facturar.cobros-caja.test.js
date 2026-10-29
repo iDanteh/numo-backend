@@ -4,6 +4,7 @@
 // reales del Excel "MOSTRADOR 2026" del usuario (datos de Kore copiados).
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroPorFactura: jest.fn(), obtenerCuentaTicket: jest.fn() }));
+jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ lean: async () => [] })), bulkWrite: jest.fn(async () => ({})) }));
 
 const BankMovement = require('../banks/BankMovement.model');
 const erp = require('../erp/erp-sync.service');

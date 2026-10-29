@@ -20,9 +20,10 @@ router.get('/', authenticate, permit(PERM), asyncHandler(async (req, res) => {
 }));
 
 // POST /api/reportes-por-facturar { rfc, centroCostoId?, fechaInicio, fechaFin? }
+// → el reporte guardado con estado 'calculando'; se completa en segundo plano (2026-10-29).
 router.post('/', authenticate, permit(PERM), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
-  res.status(201).json(await service.generar({ rfc, centroCostoId, fechaInicio, fechaFin }, req.user));
+  res.status(202).json(await service.generar({ rfc, centroCostoId, fechaInicio, fechaFin }, req.user));
 }));
 
 // ── Estadística por facturar (2026-10-29) — antes de /:id ────────────────────

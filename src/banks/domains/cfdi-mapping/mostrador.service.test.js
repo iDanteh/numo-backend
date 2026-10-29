@@ -4,6 +4,8 @@
 // de Bancos ligados por UUID, cliente de Kore por remisión. Datos reales de la
 // factura A0-261009872 (CEDIS 20-oct).
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
+// Memoria de remisiones (kore_remisiones, 2026-10-29): vacía → todo va a Kore.
+jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ lean: async () => [] })), bulkWrite: jest.fn(async () => ({})) }));
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacen: jest.fn(), obtenerCuentaTicket: jest.fn() }));
 
 const BankMovement = require('../banks/BankMovement.model');

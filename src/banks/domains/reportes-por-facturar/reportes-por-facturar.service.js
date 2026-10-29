@@ -29,7 +29,7 @@ const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detect
 const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
-const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
+const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -117,8 +117,9 @@ function _resumen(datos) {
   };
 }
 
-// Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
-async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
+// Valida la captura y resuelve las series / sucursal (rápido: los errores se
+// responden de inmediato, antes de arrancar el cálculo en segundo plano).
+async function _validar({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   fechaFin = fechaFin || fechaInicio;
   if (!rfc) throw new BadRequestError('RFC requerido');
   if (!FECHA_RE.test(fechaInicio ?? '') || !FECHA_RE.test(fechaFin ?? '')) throw new BadRequestError('Fechas inválidas (formato YYYY-MM-DD)');
@@ -133,15 +134,26 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   const sucursal = centroCostoId
     ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))?.sucursal ?? null
     : 'Todas';
+  return { fechaFin, series, sucursal };
+}
+
+// Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
+// `onAvance(texto)`: en qué paso va (se ve en el historial mientras calcula).
+async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance = async () => {}) {
+  const { series, sucursal } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
+  fechaFin = fechaFin || fechaInicio;
 
   const advertencias = [];
+  await onAvance('Buscando facturas del periodo…');
   const facturas = await _facturasDelRango({ rfc, series, fechaInicio, fechaFin });
+  await onAvance(`Depósitos de ${facturas.length} factura(s) — consultando Kore…`);
   const movimientosMostrador = await _movimientosMostradorSinPoliza({ rfc, facturas });
   const sinEstatus = movimientosMostrador.flatMap(f => f.depositos ?? []).filter(d => d.ppdPorFacturar === null);
   if (sinEstatus.length) {
     advertencias.push(`Kore no respondió el estatus de las remisiones de ${sinEstatus.length} depósito(s) (ID NUMO ${sinEstatus.map(d => d.idNumo).join(', ')}) — se muestran igual, pero no se pudo confirmar que sean PPD por facturar; vuelve a actualizarlo más tarde.`);
   }
   // También los de fecha anterior identificados dentro del rango (2026-10-23).
+  await onAvance('Pendientes de generar factura — consultando Kore…');
   const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true });
   if (pendientes.remisionesSinRespuesta) {
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
@@ -155,6 +167,7 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 
   // Cobros en EFECTIVO / SALDO A FAVOR de Kore de cada global (2026-10-29).
   const globales = facturas.filter(f => (f.receptor?.rfc ?? '').trim().toUpperCase() === RFC_PUBLICO_GENERAL);
+  await onAvance(`Cobros en efectivo / saldo a favor de ${globales.length} global(es) — consultando Kore…`);
   const cobrosCaja = await cobrosCajaDeGlobales({ rfc, facturas: globales });
   if (cobrosCaja.sinRespuesta) {
     advertencias.push(`Kore no respondió ${cobrosCaja.sinRespuesta} consulta(s) de cobros en efectivo / saldo a favor de las facturas globales — pueden faltar renglones; vuelve a actualizarlo más tarde.`);
@@ -172,11 +185,43 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 
 const _userId = user => (user?.dbId ? parseInt(user.dbId, 10) : null);
 
+// ── Cálculo en segundo plano (2026-10-29) ─────────────────────────────────────
+// Con cientos de remisiones Kore responde 429 y el cálculo tarda minutos: la
+// pantalla cortaba la petición y el reporte nunca se guardaba (caso reporte
+// 37). Ahora el reporte se guarda de inmediato con estado "calculando" (con su
+// avance) y se completa solo; si el servidor se reinicia a medio cálculo,
+// syncModels lo marca como error.
+const _enCurso = new Map(); // id → promesa (para esperar en pruebas)
+
+function _enSegundoPlano(id, calcular) {
+  const avance = texto => ReportePorFacturar.update({ avance: texto }, { where: { id } }).catch(() => {});
+  const p = (async () => {
+    try {
+      const cambios = await calcular(avance);
+      await ReportePorFacturar.update({ ...cambios, estado: 'listo', avance: null, error: null }, { where: { id } });
+    } catch (err) {
+      await ReportePorFacturar.update({ estado: 'error', avance: null, error: err?.message ?? String(err) }, { where: { id } }).catch(() => {});
+    } finally {
+      _enCurso.delete(id);
+    }
+  })();
+  _enCurso.set(id, p);
+  return p;
+}
+
+/** Espera a que termine el cálculo en curso de un reporte (pruebas). */
+const _esperar = id => _enCurso.get(Number(id)) ?? Promise.resolve();
+
 async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
-  const calc = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin });
+  const { sucursal, fechaFin: fin } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
   const reporte = await ReportePorFacturar.create({
-    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, fechaInicio, ...calc,
+    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin: fin,
+    datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
     creadoPorId: _userId(user),
+  });
+  _enSegundoPlano(reporte.id, async avance => {
+    const { sucursal: suc, datos, resumen, advertencias } = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin: fin }, avance);
+    return { sucursal: suc, datos, resumen, advertencias };
   });
   return obtener(reporte.id);
 }
@@ -184,15 +229,19 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
 /**
  * Actualizar (2026-10-23, pedido del usuario): vuelve a consultar Bancos y
  * Kore con la misma sucursal y fechas y reemplaza los datos del MISMO reporte
- * (no crea otro); guarda quién y cuándo lo actualizó.
+ * (no crea otro); guarda quién y cuándo lo actualizó. En segundo plano: los
+ * datos anteriores se siguen viendo hasta que termina.
  */
 async function actualizar(id, user) {
   const r = await ReportePorFacturar.findByPk(id);
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
-  const { sucursal, datos, resumen, advertencias } = await _calcular({
-    rfc: r.rfc, centroCostoId: r.centroCostoId, fechaInicio: r.fechaInicio, fechaFin: r.fechaFin,
+  if (r.estado === 'calculando') throw new ConflictError('El reporte ya se está calculando');
+  await r.update({ estado: 'calculando', avance: 'Iniciando…', error: null });
+  const params = { rfc: r.rfc, centroCostoId: r.centroCostoId, fechaInicio: r.fechaInicio, fechaFin: r.fechaFin };
+  _enSegundoPlano(r.id, async avance => {
+    const { sucursal, datos, resumen, advertencias } = await _calcular(params, avance);
+    return { sucursal, datos, resumen, advertencias, actualizadoPorId: _userId(user), actualizadoEn: new Date() };
   });
-  await r.update({ sucursal, datos, resumen, advertencias, actualizadoPorId: _userId(user), actualizadoEn: new Date() });
   return obtener(r.id);
 }
 
@@ -254,6 +303,7 @@ async function _sucursalPorSerie() {
 async function excel(id, seccion) {
   if (seccion && !SECCIONES[seccion]) throw new BadRequestError('Sección inválida');
   const r = await obtener(id);
+  if (!r.datos) throw new ConflictError('El reporte todavía se está calculando');
   const workbook = new ExcelJS.Workbook();
   if (!agregarHojasSeccion(workbook, r.secciones, seccion)) {
     workbook.addWorksheet(seccion ? SECCIONES[seccion].hoja : 'POR FACTURAR').addRow(['Sin depósitos en esta sección para el rango.']);
@@ -264,4 +314,4 @@ async function excel(id, seccion) {
   return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar${parte}_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango };
+module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _esperar };

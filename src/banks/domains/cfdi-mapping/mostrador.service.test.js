@@ -180,13 +180,24 @@ describe('formasPagoDeCuentas', () => {
       { monto: -300, formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 900 }] },   // Kore repite el total del pago
       { monto: 200, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 150 }, { claveSat: '04', nombre: 'TARJETA', monto: 50 }] },
     ] }]);
-    expect(r).toEqual({ efectivo: 150, tarjeta: 50, transferencia: 300, cheque: 0, otras: 0, mixto: true });
+    expect(r).toEqual({ efectivo: 150, depositoEfectivo: 0, tarjeta: 50, transferencia: 300, cheque: 0, abonos: 0, otras: 0, mixto: true });
   });
   test('varias formas que exceden el monto real se escalan; saldo a favor va a otras y no escala', () => {
     expect(formasPagoDeCuentas([{ cobros: [{ monto: 100, formasPago: [{ claveSat: '01', monto: 150 }, { claveSat: '28', monto: 50 }] }] }]))
       .toMatchObject({ efectivo: 75, tarjeta: 25, mixto: true });
     expect(formasPagoDeCuentas([{ cobros: [{ monto: 698.09, formasPago: [{ claveSat: '04', nombre: 'TARJETA', monto: 80.07 }, { claveSat: '', nombre: 'SALDO A FAVOR', monto: 698.09 }] }] }]))
       .toMatchObject({ tarjeta: 80.07, otras: 698.09 });
+  });
+  // 2026-10-29: depósito en efectivo con clave 01 y abonos fuera del EFECTIVO.
+  test('depósito en efectivo va a su columna; abono en efectivo a ABONOS salvo nota facturada y liquidada', () => {
+    const cuenta = { serieVenta: 'A0', folioVenta: '1', serieFactura: 'A0', cobros: [
+      { serieOrigen: 'CPF', monto: -100, formasPago: [{ claveSat: '01', nombre: 'DEPOSITO EN EFECTIVO', monto: 100 }] },
+      { serieOrigen: 'ABO', monto: -40, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 40 }] },
+      { serieOrigen: 'ABO', monto: -60, formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 60 }] },
+      { serieOrigen: 'CBT', monto: -10, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 10 }] },
+    ] };
+    expect(formasPagoDeCuentas([cuenta])).toMatchObject({ efectivo: 10, depositoEfectivo: 100, transferencia: 60, abonos: 40, mixto: true });
+    expect(formasPagoDeCuentas([cuenta], () => true)).toMatchObject({ efectivo: 50, depositoEfectivo: 100, transferencia: 60, abonos: 0 });
   });
   test('sin cuentas de Kore → null; una sola forma → no mixto', () => {
     expect(formasPagoDeCuentas([undefined])).toBeNull();

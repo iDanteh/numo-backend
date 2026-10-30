@@ -336,6 +336,14 @@ bankMovementSchema.index({ status: 1, primeraIdentificacionAt: 1 });
 // (tiempo y backlog) ahora filtran status + createdAt >= INDICADORES_DESDE.
 bankMovementSchema.index({ status: 1, createdAt: 1 });
 bankMovementSchema.index({ erpIds: 1, isActive: 1 });
+// Soporta getCorteConciliacion() (bank-indicadores.service.js): filtra `status` + `fecha` para
+// `rezagados`/`identificadosEnPeriodo` — ninguno de los índices de arriba cubre `fecha` junto a
+// `status` (son sobre `createdAt`/`primeraIdentificacionAt`, campos distintos). Agregado
+// 2026-10-30 pensando en getCorteAntiguedadBacklog() (que en esa fecha agrupaba por `fecha`),
+// pero esa función pasó a agrupar por `createdAt` el mismo día (ya cubierta por el índice
+// `{status:1, createdAt:1}` de arriba) — este índice se queda porque getCorteConciliacion() SÍ
+// lo necesita, no porque lo siga usando la de antigüedad.
+bankMovementSchema.index({ status: 1, fecha: 1 });
 
 // Índice de texto para el buscador
 bankMovementSchema.index({

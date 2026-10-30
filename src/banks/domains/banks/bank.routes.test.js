@@ -53,7 +53,11 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('./bank-indicadores.service', () => ({
   getIndicadoresIdentificacion: jest.fn(),
   getCorteConciliacion: jest.fn(),
-  getCorteAntiguedadBacklog: jest.fn(),
+  getProgresoResolucionPorCorte: jest.fn(),
+  getLedgerDiario: jest.fn(),
+  getLedgerMensual: jest.fn(),
+  getLedgerPorHora: jest.fn(),
+  getUltimosMovimientos: jest.fn(),
   getPeriodoCortePorRol: jest.fn(),
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
@@ -536,23 +540,13 @@ describe('GET /cortes/periodo-rol', () => {
   });
 });
 
-describe('GET /cortes/antiguedad', () => {
+describe('GET /cortes/resolucion (2026-10-30: ledger iniciales/nuevos/identificados/total + mesOrigen)', () => {
   let app;
-
-  const FAKE_ANTIGUEDAD = {
-    buckets: [
-      { bucket: 'Hoy', iniciales: 0, inicialesImporte: 0, nuevos: 1, nuevosImporte: 100, identificados: 0, identificadosImporte: 0 },
-      { bucket: '1-30', iniciales: 1, inicialesImporte: 100, nuevos: 0, nuevosImporte: 0, identificados: 2, identificadosImporte: 200 },
-      { bucket: '30-60', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
-      { bucket: '60-90', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
-      { bucket: '90+', iniciales: 0, inicialesImporte: 0, nuevos: 0, nuevosImporte: 0, identificados: 0, identificadosImporte: 0 },
-    ],
-  };
+  const FAKE_RESOLUCION = { cortes: [{ fechaInicio: new Date(), fechaCierre: new Date(), iniciales: { count: 1, saldo: 100 }, nuevos: { count: 0, saldo: 0 }, identificados: { count: 0, saldo: 0 }, total: { count: 1, saldo: 100 } }] };
 
   beforeEach(() => {
     jest.clearAllMocks();
-    rbacStore.hasPermission = jest.fn().mockResolvedValue(false); // sin banks:config por defecto
-    indicadoresService.getCorteAntiguedadBacklog.mockResolvedValue(FAKE_ANTIGUEDAD);
+    indicadoresService.getProgresoResolucionPorCorte.mockResolvedValue(FAKE_RESOLUCION);
     app = express();
     app.use(express.json());
     app.use('/', router);
@@ -560,42 +554,201 @@ describe('GET /cortes/antiguedad', () => {
 
   test('responde 403 sin banks:read', async () => {
     const res = await request(app)
-      .get('/cortes/antiguedad')
+      .get('/cortes/resolucion')
       .set('x-test-permissions', JSON.stringify([]));
-
     expect(res.status).toBe(403);
-    expect(indicadoresService.getCorteAntiguedadBacklog).not.toHaveBeenCalled();
+    expect(indicadoresService.getProgresoResolucionPorCorte).not.toHaveBeenCalled();
   });
 
-  test('con banks:read pasa banco y rolEquipo al service y devuelve el resultado', async () => {
+  test('con banks:read pasa banco/mesOrigen/desde/hasta/cantidad (numérico) al service', async () => {
     const res = await request(app)
-      .get('/cortes/antiguedad')
+      .get('/cortes/resolucion')
+      .query({ banco: 'BBVA', mesOrigen: '2026-08', desde: '2026-09-01', hasta: '2026-10-04', cantidad: '5' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_RESOLUCION)));
+    expect(indicadoresService.getProgresoResolucionPorCorte).toHaveBeenCalledWith({
+      banco: 'BBVA', mesOrigen: '2026-08', desde: '2026-09-01', hasta: '2026-10-04', cantidad: 5,
+    });
+  });
+
+  test('sin ?cantidad: viaja undefined (el service aplica su propio default)', async () => {
+    await request(app)
+      .get('/cortes/resolucion')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getProgresoResolucionPorCorte).toHaveBeenCalledWith({
+      banco: null, mesOrigen: undefined, desde: undefined, hasta: undefined, cantidad: undefined,
+    });
+  });
+});
+
+describe('GET /cortes/ledger-diario (2026-10-30: mismo ledger, por día)', () => {
+  let app;
+  const FAKE_LEDGER_DIARIO = { dias: [{ fecha: new Date(), iniciales: { count: 1, saldo: 100 }, nuevos: { count: 0, saldo: 0 }, identificados: { count: 0, saldo: 0 }, total: { count: 1, saldo: 100 } }] };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getLedgerDiario.mockResolvedValue(FAKE_LEDGER_DIARIO);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/ledger-diario')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getLedgerDiario).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco/mesOrigen/desde/hasta/cantidad (numérico) al service', async () => {
+    const res = await request(app)
+      .get('/cortes/ledger-diario')
+      .query({ banco: 'BBVA', mesOrigen: '2026-08', desde: '2026-10-01', hasta: '2026-10-07', cantidad: '7' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_LEDGER_DIARIO)));
+    expect(indicadoresService.getLedgerDiario).toHaveBeenCalledWith({
+      banco: 'BBVA', mesOrigen: '2026-08', desde: '2026-10-01', hasta: '2026-10-07', cantidad: 7,
+    });
+  });
+
+  test('sin ?cantidad: viaja undefined (el service aplica su propio default)', async () => {
+    await request(app)
+      .get('/cortes/ledger-diario')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getLedgerDiario).toHaveBeenCalledWith({
+      banco: null, mesOrigen: undefined, desde: undefined, hasta: undefined, cantidad: undefined,
+    });
+  });
+});
+
+describe('GET /cortes/ledger-mensual (2026-10-30: mismo ledger, por mes — reemplaza el corte semanal de este dashboard)', () => {
+  let app;
+  const FAKE_LEDGER_MENSUAL = { meses: [{ mes: '2026-10', fechaInicio: new Date(), fechaFin: new Date(), iniciales: { count: 1, saldo: 100 }, nuevos: { count: 0, saldo: 0 }, identificados: { count: 0, saldo: 0 }, total: { count: 1, saldo: 100 } }] };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getLedgerMensual.mockResolvedValue(FAKE_LEDGER_MENSUAL);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/ledger-mensual')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getLedgerMensual).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco/mesOrigen/desde/hasta/cantidad (numérico) al service', async () => {
+    const res = await request(app)
+      .get('/cortes/ledger-mensual')
+      .query({ banco: 'BBVA', mesOrigen: '2026-08', desde: '2026-04-01', hasta: '2026-10-31', cantidad: '7' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_LEDGER_MENSUAL)));
+    expect(indicadoresService.getLedgerMensual).toHaveBeenCalledWith({
+      banco: 'BBVA', mesOrigen: '2026-08', desde: '2026-04-01', hasta: '2026-10-31', cantidad: 7,
+    });
+  });
+
+  test('sin ?cantidad: viaja undefined (el service aplica su propio default)', async () => {
+    await request(app)
+      .get('/cortes/ledger-mensual')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getLedgerMensual).toHaveBeenCalledWith({
+      banco: null, mesOrigen: undefined, desde: undefined, hasta: undefined, cantidad: undefined,
+    });
+  });
+});
+
+describe('GET /cortes/ledger-por-hora (2026-10-30: ledger por hora, SOLO hoy, en vivo)', () => {
+  let app;
+  const FAKE_LEDGER_HORA = { horas: [{ hora: '15:00', fechaInicio: new Date(), fechaFin: new Date(), iniciales: { count: 1, saldo: 100 }, nuevos: { count: 0, saldo: 0 }, identificados: { count: 0, saldo: 0 }, total: { count: 1, saldo: 100 } }] };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getLedgerPorHora.mockResolvedValue(FAKE_LEDGER_HORA);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/ledger-por-hora')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getLedgerPorHora).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco al service (sin rango de fechas, es siempre "ahora")', async () => {
+    const res = await request(app)
+      .get('/cortes/ledger-por-hora')
       .query({ banco: 'BBVA' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual(FAKE_ANTIGUEDAD);
-    expect(indicadoresService.getCorteAntiguedadBacklog).toHaveBeenCalledWith({ banco: 'BBVA', rolEquipo: 'test-role' });
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_LEDGER_HORA)));
+    expect(indicadoresService.getLedgerPorHora).toHaveBeenCalledWith({ banco: 'BBVA' });
   });
 
-  test('sin ?banco: se pasa null (no el string vacío)', async () => {
+  test('sin ?banco: se pasa null', async () => {
     await request(app)
-      .get('/cortes/antiguedad')
+      .get('/cortes/ledger-por-hora')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getCorteAntiguedadBacklog).toHaveBeenCalledWith({ banco: null, rolEquipo: 'test-role' });
+    expect(indicadoresService.getLedgerPorHora).toHaveBeenCalledWith({ banco: null });
+  });
+});
+
+describe('GET /cortes/ultimos-movimientos (2026-10-30: feed de actividad reciente)', () => {
+  let app;
+  const FAKE_FEED = { movimientos: [{ fechaEvento: new Date(), tipo: 'nuevo', mesOrigen: '2026-10', monto: 100, estatus: 'no_identificado', banco: 'BBVA', folio: 1 }] };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getUltimosMovimientos.mockResolvedValue(FAKE_FEED);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
   });
 
-  // Mismo criterio que /cortes: con BANKS_CONFIG, rolEquipo viaja null (admin ve el total real
-  // de "identificados", sin acotar por rol).
-  test('con BANKS_CONFIG: rolEquipo viaja null (sin acotar por rol)', async () => {
-    rbacStore.hasPermission.mockResolvedValue(true);
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/ultimos-movimientos')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getUltimosMovimientos).not.toHaveBeenCalled();
+  });
 
-    await request(app)
-      .get('/cortes/antiguedad')
+  test('con banks:read pasa banco/limit (numérico) al service', async () => {
+    const res = await request(app)
+      .get('/cortes/ultimos-movimientos')
+      .query({ banco: 'BBVA', limit: '5' })
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getCorteAntiguedadBacklog).toHaveBeenCalledWith({ banco: null, rolEquipo: null });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_FEED)));
+    expect(indicadoresService.getUltimosMovimientos).toHaveBeenCalledWith({ banco: 'BBVA', limit: 5 });
+  });
+
+  test('sin ?limit: viaja undefined (el service aplica su propio default)', async () => {
+    await request(app)
+      .get('/cortes/ultimos-movimientos')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getUltimosMovimientos).toHaveBeenCalledWith({ banco: null, limit: undefined });
   });
 });
 

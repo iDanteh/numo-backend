@@ -4,6 +4,8 @@
 // de Bancos ligados por UUID, cliente de Kore por remisión. Datos reales de la
 // factura A0-261009872 (CEDIS 20-oct).
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
+// Memoria de remisiones (kore_remisiones, 2026-10-29): vacía → todo va a Kore.
+jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ lean: async () => [] })), bulkWrite: jest.fn(async () => ({})) }));
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacen: jest.fn(), obtenerCuentaTicket: jest.fn() }));
 
 const BankMovement = require('../banks/BankMovement.model');
@@ -46,11 +48,30 @@ test('sin "Venta Sin Cobro" no consulta nada', async () => {
   expect(BankMovement.find).not.toHaveBeenCalled();
 });
 
-test('si Kore falla, sale sin cliente pero con los depósitos', async () => {
+test('si Kore falla, sale sin cliente y con ppdPorFacturar null (no se esconde, 2026-10-29)', async () => {
   erp.obtenerDesglosesCobroAlmacen.mockRejectedValue(new Error('timeout'));
   const [f] = await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos: [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: UUID }] });
   expect(f.depositos).toHaveLength(2);
-  expect(f.depositos.every(d => d.cliente === '' && d.estatus === '' && d.ppdPorFacturar === false)).toBe(true);
+  expect(f.depositos.every(d => d.cliente === '' && d.estatus === 'SIN RESPUESTA DE KORE' && d.ppdPorFacturar === null)).toBe(true);
+});
+
+test('caso 044114: muchas remisiones → Kore en lotes de 50 y cuentas de 2 en 2', async () => {
+  const folios = Array.from({ length: 120 }, (_, i) => String(260700000 + i));
+  BankMovement.find.mockReturnValue({ lean: async () => [
+    { folio: '044114', banco: 'BBVA', fecha: '2026-08-31', concepto: 'SPEI', deposito: 31411.5, erpLinks: folios.map(f => link(f, 1, UUID, 'PPD')) },
+  ] });
+  erp.obtenerDesglosesCobroAlmacen.mockImplementation(async ({ folios: fs }) => fs.map(f => ({ serieVenta: 'A0', folioVenta: f, fechaCreacion: '2026-07-01' })));
+  let enVuelo = 0, maximo = 0;
+  erp.obtenerCuentaTicket.mockImplementation(async () => {
+    enVuelo++; maximo = Math.max(maximo, enVuelo);
+    await new Promise(r => setImmediate(r));
+    enVuelo--;
+    return { nombre: 'GERARDO SOSA QUERO', tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR' };
+  });
+  const [f] = await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos: [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: UUID }] });
+  expect(erp.obtenerDesglosesCobroAlmacen.mock.calls.map(c => c[0].folios.length)).toEqual([50, 50, 20]);
+  expect(maximo).toBeLessThanOrEqual(2);
+  expect(f.depositos[0]).toMatchObject({ idNumo: '044114', cliente: 'GERARDO SOSA QUERO', ppdPorFacturar: true });
 });
 
 test('factura a nombre de un cliente no es global', async () => {
@@ -66,7 +87,11 @@ test('PPD del link cuando Kore no trae tipoPago; sin estatus "POR FACTURAR" no c
   const movimientos = [{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: UUID }];
   erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'X', tipoPago: null, nombreTipoMovimiento: 'POR FACTURAR' });
   expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBe(true);
+  // Kore no regresó la cuenta: no se sabe → null (se muestra con aviso).
   erp.obtenerCuentaTicket.mockResolvedValue(null);
+  expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBeNull();
+  // Kore sí respondió y no es "POR FACTURAR": false (no sale).
+  erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'X', tipoPago: 'PPD', nombreTipoMovimiento: 'FACTURADO' });
   expect((await detectarMovimientosMostrador({ rfc: 'X', cfdis, movimientos }))[0].depositos[0].ppdPorFacturar).toBe(false);
 });
 
@@ -108,7 +133,7 @@ describe('PENDIENTE GENERAR FACTURA', () => {
     expect(remisionesSinRespuesta).toBe(0);
     // 053960: POR FACTURAR pero debe $47.79 → CON PENDIENTES DE PAGO, con su saldo.
     expect(depositosConSaldo.map(d => [d.idNumo, d.saldo, d.remisiones])).toEqual([['053960', 47.79, ['A0-261002980']]]);
-    expect(depositos).toEqual([
+    expect(depositos.map(({ formasPago, ...d }) => d)).toEqual([
       { fecha: '2026-10-19T06:00:00Z', descripcion: 'Depósito de efectivo', importe: 9968, aplicado: 1, banco: 'Banamex', remisiones: ['A0-260902675'], cliente: 'ROMAN SOLANO PAZ', idNumo: '053487', estatus: 'POR FACTURAR' },
       { fecha: '2026-10-21T06:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 146077.63, aplicado: 1, banco: 'BBVA', remisiones: ['A0-260804886'], cliente: 'MISAEL ABDIEL JIMENEZ SORIA', idNumo: '053966', estatus: 'POR FACTURAR' },
     ]);
@@ -170,4 +195,37 @@ test('DEPÓSITOS EN EFECTIVO: sin ligas, concepto con efectivo, rango del period
   expect(filtro.concepto).toEqual({ $regex: 'efectivo', $options: 'i' });
   expect(filtro.$or).toEqual([{ erpLinks: { $exists: false } }, { erpLinks: { $size: 0 } }]);
   expect([filtro.fecha.$gte.toISOString(), filtro.fecha.$lte.toISOString()]).toEqual(['2026-10-08T00:00:00.000Z', '2026-10-08T23:59:59.999Z']);
+});
+
+// 2026-10-28 (reporte "Por facturar"): cobro de las remisiones por forma de pago.
+describe('formasPagoDeCuentas', () => {
+  const { formasPagoDeCuentas } = require('./mostrador.service');
+  test('mixto: efectivo + transferencia; una sola forma usa |cobro.monto|', () => {
+    const r = formasPagoDeCuentas([{ cobros: [
+      { monto: -300, formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 900 }] },   // Kore repite el total del pago
+      { monto: 200, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 150 }, { claveSat: '04', nombre: 'TARJETA', monto: 50 }] },
+    ] }]);
+    expect(r).toEqual({ efectivo: 150, depositoEfectivo: 0, tarjeta: 50, transferencia: 300, cheque: 0, abonos: 0, otras: 0, mixto: true });
+  });
+  test('varias formas que exceden el monto real se escalan; saldo a favor va a otras y no escala', () => {
+    expect(formasPagoDeCuentas([{ cobros: [{ monto: 100, formasPago: [{ claveSat: '01', monto: 150 }, { claveSat: '28', monto: 50 }] }] }]))
+      .toMatchObject({ efectivo: 75, tarjeta: 25, mixto: true });
+    expect(formasPagoDeCuentas([{ cobros: [{ monto: 698.09, formasPago: [{ claveSat: '04', nombre: 'TARJETA', monto: 80.07 }, { claveSat: '', nombre: 'SALDO A FAVOR', monto: 698.09 }] }] }]))
+      .toMatchObject({ tarjeta: 80.07, otras: 698.09 });
+  });
+  // 2026-10-29: depósito en efectivo con clave 01 y abonos fuera del EFECTIVO.
+  test('depósito en efectivo va a su columna; abono en efectivo a ABONOS salvo nota facturada y liquidada', () => {
+    const cuenta = { serieVenta: 'A0', folioVenta: '1', serieFactura: 'A0', cobros: [
+      { serieOrigen: 'CPF', monto: -100, formasPago: [{ claveSat: '01', nombre: 'DEPOSITO EN EFECTIVO', monto: 100 }] },
+      { serieOrigen: 'ABO', monto: -40, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 40 }] },
+      { serieOrigen: 'ABO', monto: -60, formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 60 }] },
+      { serieOrigen: 'CBT', monto: -10, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 10 }] },
+    ] };
+    expect(formasPagoDeCuentas([cuenta])).toMatchObject({ efectivo: 10, depositoEfectivo: 100, transferencia: 60, abonos: 40, mixto: true });
+    expect(formasPagoDeCuentas([cuenta], () => true)).toMatchObject({ efectivo: 50, depositoEfectivo: 100, transferencia: 60, abonos: 0 });
+  });
+  test('sin cuentas de Kore → null; una sola forma → no mixto', () => {
+    expect(formasPagoDeCuentas([undefined])).toBeNull();
+    expect(formasPagoDeCuentas([{ cobros: [{ monto: 10, formasPago: [{ claveSat: '01', monto: 10 }] }] }]).mixto).toBe(false);
+  });
 });

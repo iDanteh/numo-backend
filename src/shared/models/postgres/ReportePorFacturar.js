@@ -40,10 +40,11 @@ const ReportePorFacturar = sequelize.define('ReportePorFacturar', {
     type:      DataTypes.DATEONLY,
     allowNull: false,
   },
-  /** { movimientosMostrador, depositosPendientesFactura } — ver mostrador.service.js */
+  /** { movimientosMostrador, depositosPendientesFactura } — ver mostrador.service.js.
+   *  NULL mientras se calcula por primera vez (2026-10-29, cálculo en segundo plano). */
   datos: {
     type:      DataTypes.JSONB,
-    allowNull: false,
+    allowNull: true,
   },
   /** Conteos y totales por tabla, para el historial sin cargar `datos` */
   resumen: {
@@ -83,6 +84,23 @@ const ReportePorFacturar = sequelize.define('ReportePorFacturar', {
   },
   actualizadoEn: {
     type:      DataTypes.DATE,
+    allowNull: true,
+  },
+  /**
+   * Cálculo en segundo plano (2026-10-29): 'calculando' mientras consulta
+   * Bancos y Kore (`avance` = paso actual), 'listo' o 'error' (`error`).
+   */
+  estado: {
+    type:         DataTypes.STRING(20),
+    allowNull:    false,
+    defaultValue: 'listo',
+  },
+  avance: {
+    type:      DataTypes.TEXT,
+    allowNull: true,
+  },
+  error: {
+    type:      DataTypes.TEXT,
     allowNull: true,
   },
 }, {

@@ -194,6 +194,22 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS actualizado_por_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
       ADD COLUMN IF NOT EXISTS actualizado_en     TIMESTAMPTZ
   `).catch(e => console.warn('[syncModels] ADD COLUMN actualizado (reportes_por_facturar):', e.message));
+  // Cálculo en segundo plano (2026-10-29): estado / avance / error y `datos`
+  // vacío mientras se calcula por primera vez.
+  await ReportePorFacturar.sequelize.query(`
+    ALTER TABLE reportes_por_facturar
+      ADD COLUMN IF NOT EXISTS estado VARCHAR(20) NOT NULL DEFAULT 'listo',
+      ADD COLUMN IF NOT EXISTS avance TEXT,
+      ADD COLUMN IF NOT EXISTS error  TEXT,
+      ALTER COLUMN datos DROP NOT NULL
+  `).catch(e => console.warn('[syncModels] ADD COLUMN estado (reportes_por_facturar):', e.message));
+  // Un cálculo que quedó a medias por un reinicio ya no va a terminar.
+  await ReportePorFacturar.sequelize.query(`
+    UPDATE reportes_por_facturar
+       SET estado = 'error', avance = NULL,
+           error  = 'Se reinició el servidor mientras se calculaba — vuelve a actualizarlo.'
+     WHERE estado = 'calculando'
+  `).catch(e => console.warn('[syncModels] reportes_por_facturar calculando → error:', e.message));
 
   // Columna "Revertido por" (2026-09-21, pedido explícito del usuario) — mismo
   // patrón idempotente que arriba: `sync({force:false})` NO altera una tabla

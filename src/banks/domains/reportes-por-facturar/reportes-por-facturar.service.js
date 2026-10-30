@@ -26,11 +26,14 @@ const BankMovement = require('../banks/BankMovement.model');
 const centrosSvc   = require('../centros-costo/centros-costo.service');
 const { _uuidsPorFechaEfectiva } = require('../cfdi-mapping/cfdi-poliza-generator.service');
 const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detectarDepositosEfectivoSinAsociar } = require('../cfdi-mapping/mostrador.service');
-const { agregarHojaMostrador, agregarHojaDepositosEfectivo, agregarHojaPendientesPago, tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
-const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
+const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
+const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
+const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
+const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
+const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -114,8 +117,9 @@ function _resumen(datos) {
   };
 }
 
-// Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
-async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
+// Valida la captura y resuelve las series / sucursal (rápido: los errores se
+// responden de inmediato, antes de arrancar el cálculo en segundo plano).
+async function _validar({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   fechaFin = fechaFin || fechaInicio;
   if (!rfc) throw new BadRequestError('RFC requerido');
   if (!FECHA_RE.test(fechaInicio ?? '') || !FECHA_RE.test(fechaFin ?? '')) throw new BadRequestError('Fechas inválidas (formato YYYY-MM-DD)');
@@ -130,19 +134,48 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   const sucursal = centroCostoId
     ? Object.values(ccBySerieMap).find(c => String(c.id) === String(centroCostoId))?.sucursal ?? null
     : 'Todas';
+  return { fechaFin, series, sucursal };
+}
+
+// Calcula el contenido del reporte (sin guardarlo) — lo usan generar y actualizar.
+// `onAvance(texto)`: en qué paso va (se ve en el historial mientras calcula).
+async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance = async () => {}) {
+  const { series, sucursal } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
+  fechaFin = fechaFin || fechaInicio;
 
   const advertencias = [];
+  await onAvance('Buscando facturas del periodo…');
   const facturas = await _facturasDelRango({ rfc, series, fechaInicio, fechaFin });
+  await onAvance(`Depósitos de ${facturas.length} factura(s) — consultando Kore…`);
   const movimientosMostrador = await _movimientosMostradorSinPoliza({ rfc, facturas });
+  const sinEstatus = movimientosMostrador.flatMap(f => f.depositos ?? []).filter(d => d.ppdPorFacturar === null);
+  if (sinEstatus.length) {
+    advertencias.push(`Kore no respondió el estatus de las remisiones de ${sinEstatus.length} depósito(s) (ID NUMO ${sinEstatus.map(d => d.idNumo).join(', ')}) — se muestran igual, pero no se pudo confirmar que sean PPD por facturar; vuelve a actualizarlo más tarde.`);
+  }
   // También los de fecha anterior identificados dentro del rango (2026-10-23).
+  await onAvance('Pendientes de generar factura — consultando Kore…');
   const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true });
   if (pendientes.remisionesSinRespuesta) {
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
   }
 
   const depositosEfectivoSinAsociar = await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin });
+
+  // A nombre de quién salió cada factura (CTE FACTURADO de REF. / FACT ESPECIALES).
+  const receptorDe = new Map(facturas.map(f => [f.uuid, f.receptor?.nombre ?? null]));
+  for (const m of movimientosMostrador) m.receptorNombre = receptorDe.get(String(m.uuid ?? '').toUpperCase()) ?? null;
+
+  // Cobros en EFECTIVO / SALDO A FAVOR de Kore de cada global (2026-10-29).
+  const globales = facturas.filter(f => (f.receptor?.rfc ?? '').trim().toUpperCase() === RFC_PUBLICO_GENERAL);
+  await onAvance(`Cobros en efectivo / saldo a favor de ${globales.length} global(es) — consultando Kore…`);
+  const cobrosCaja = await cobrosCajaDeGlobales({ rfc, facturas: globales });
+  if (cobrosCaja.sinRespuesta) {
+    advertencias.push(`Kore no respondió ${cobrosCaja.sinRespuesta} consulta(s) de cobros en efectivo / saldo a favor de las facturas globales — pueden faltar renglones; vuelve a actualizarlo más tarde.`);
+  }
+
   const datos = {
     movimientosMostrador,
+    cobrosCajaGlobales: cobrosCaja.porFactura,
     depositosPendientesFactura: pendientes.depositos,
     depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
     depositosEfectivoSinAsociar,
@@ -152,11 +185,43 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 
 const _userId = user => (user?.dbId ? parseInt(user.dbId, 10) : null);
 
+// ── Cálculo en segundo plano (2026-10-29) ─────────────────────────────────────
+// Con cientos de remisiones Kore responde 429 y el cálculo tarda minutos: la
+// pantalla cortaba la petición y el reporte nunca se guardaba (caso reporte
+// 37). Ahora el reporte se guarda de inmediato con estado "calculando" (con su
+// avance) y se completa solo; si el servidor se reinicia a medio cálculo,
+// syncModels lo marca como error.
+const _enCurso = new Map(); // id → promesa (para esperar en pruebas)
+
+function _enSegundoPlano(id, calcular) {
+  const avance = texto => ReportePorFacturar.update({ avance: texto }, { where: { id } }).catch(() => {});
+  const p = (async () => {
+    try {
+      const cambios = await calcular(avance);
+      await ReportePorFacturar.update({ ...cambios, estado: 'listo', avance: null, error: null }, { where: { id } });
+    } catch (err) {
+      await ReportePorFacturar.update({ estado: 'error', avance: null, error: err?.message ?? String(err) }, { where: { id } }).catch(() => {});
+    } finally {
+      _enCurso.delete(id);
+    }
+  })();
+  _enCurso.set(id, p);
+  return p;
+}
+
+/** Espera a que termine el cálculo en curso de un reporte (pruebas). */
+const _esperar = id => _enCurso.get(Number(id)) ?? Promise.resolve();
+
 async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
-  const calc = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin });
+  const { sucursal, fechaFin: fin } = await _validar({ rfc, centroCostoId, fechaInicio, fechaFin });
   const reporte = await ReportePorFacturar.create({
-    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, fechaInicio, ...calc,
+    rfc, centroCostoId: centroCostoId ? Number(centroCostoId) : null, sucursal, fechaInicio, fechaFin: fin,
+    datos: null, resumen: null, advertencias: null, estado: 'calculando', avance: 'Iniciando…',
     creadoPorId: _userId(user),
+  });
+  _enSegundoPlano(reporte.id, async avance => {
+    const { sucursal: suc, datos, resumen, advertencias } = await _calcular({ rfc, centroCostoId, fechaInicio, fechaFin: fin }, avance);
+    return { sucursal: suc, datos, resumen, advertencias };
   });
   return obtener(reporte.id);
 }
@@ -164,15 +229,19 @@ async function generar({ rfc, centroCostoId, fechaInicio, fechaFin }, user) {
 /**
  * Actualizar (2026-10-23, pedido del usuario): vuelve a consultar Bancos y
  * Kore con la misma sucursal y fechas y reemplaza los datos del MISMO reporte
- * (no crea otro); guarda quién y cuándo lo actualizó.
+ * (no crea otro); guarda quién y cuándo lo actualizó. En segundo plano: los
+ * datos anteriores se siguen viendo hasta que termina.
  */
 async function actualizar(id, user) {
   const r = await ReportePorFacturar.findByPk(id);
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
-  const { sucursal, datos, resumen, advertencias } = await _calcular({
-    rfc: r.rfc, centroCostoId: r.centroCostoId, fechaInicio: r.fechaInicio, fechaFin: r.fechaFin,
+  if (r.estado === 'calculando') throw new ConflictError('El reporte ya se está calculando');
+  await r.update({ estado: 'calculando', avance: 'Iniciando…', error: null });
+  const params = { rfc: r.rfc, centroCostoId: r.centroCostoId, fechaInicio: r.fechaInicio, fechaFin: r.fechaFin };
+  _enSegundoPlano(r.id, async avance => {
+    const { sucursal, datos, resumen, advertencias } = await _calcular(params, avance);
+    return { sucursal, datos, resumen, advertencias, actualizadoPorId: _userId(user), actualizadoEn: new Date() };
   });
-  await r.update({ sucursal, datos, resumen, advertencias, actualizadoPorId: _userId(user), actualizadoEn: new Date() });
   return obtener(r.id);
 }
 
@@ -200,11 +269,10 @@ async function obtener(id) {
   const r = await ReportePorFacturar.findByPk(id, { include: _incluirCreador });
   if (!r || r.eliminadoEn) throw new NotFoundError('Reporte');
   const json = r.toJSON();
-  const almacenes = (await _almacenes(json.datos)).map(({ datos, ...a }) => a);
   return {
     ...json,
-    // Por almacén (A0, I0…), como las hojas del Excel (2026-10-28).
-    almacenes,
+    // Pestañas con el formato del Excel "MOSTRADOR 2026" del usuario (2026-10-29).
+    secciones: armarSecciones(json.datos, await _sucursalPorSerie(), { fechaFin: json.fechaFin }),
     tablas: {
       ...tablasMostrador(json.datos),
       pendientesPago:    json.datos?.depositosPendientesPago ?? [],
@@ -221,70 +289,29 @@ async function eliminar(id, user) {
   return { ok: true, id: r.id };
 }
 
-const _serie = v => String(v ?? '').trim().toUpperCase();
-// Almacén (serie A0, I0…) de un depósito: el de su remisión; sin remisión, el
-// de la factura.
-const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0] ?? '').split('-')[0]) || _serie(serieFactura);
-
-/**
- * Separa los datos por almacén (2026-10-28, pedido del usuario: "en una hoja
- * los A0 y en otra los I0… si hay de otros almacenes igual deben tener su
- * propia hoja"). Se reparte depósito por depósito según la serie de su
- * remisión: una factura con depósitos de remisiones de otro almacén sale en
- * ambos, cada uno con lo suyo. Series en orden alfabético.
- */
-function _datosPorSerie(datos) {
-  const porSerie = new Map();
-  const de = serie => {
-    if (!porSerie.has(serie)) porSerie.set(serie, { movimientosMostrador: [], depositosPendientesFactura: [] });
-    return porSerie.get(serie);
-  };
-  for (const f of datos?.movimientosMostrador ?? []) {
-    const depsPorSerie = new Map();
-    for (const d of f.depositos ?? []) {
-      const serie = _serieDeposito(d, f.serie);
-      if (!depsPorSerie.has(serie)) depsPorSerie.set(serie, []);
-      depsPorSerie.get(serie).push(d);
-    }
-    if (!depsPorSerie.size) depsPorSerie.set(_serie(f.serie), []);
-    for (const [serie, depositos] of depsPorSerie) de(serie).movimientosMostrador.push({ ...f, depositos });
-  }
-  for (const d of datos?.depositosPendientesFactura ?? []) de(_serieDeposito(d)).depositosPendientesFactura.push(d);
-  return [...porSerie.entries()].sort(([a], [b]) => a.localeCompare(b));
-}
-
-/**
- * Tablas por almacén para la pantalla y el Excel: [{ serie, sucursal, tablas }]
- * (solo los que tienen algo que enseñar).
- */
-async function _almacenes(datos) {
+// Nombre de la sucursal de cada serie (A0 → CEDIS), para hojas y pestañas.
+async function _sucursalPorSerie() {
   const ccBySerie = await centrosSvc.resolveBySerieMap().catch(() => ({}));
-  const sucursalDe = serie => Object.entries(ccBySerie ?? {}).find(([s]) => _serie(s) === serie)?.[1]?.sucursal ?? null;
-  return _datosPorSerie(datos)
-    .map(([serie, datosSerie]) => ({ serie, sucursal: sucursalDe(serie), datos: datosSerie, tablas: tablasMostrador(datosSerie) }))
-    .filter(({ tablas: t }) => t.facturasGlobales.length || t.ppdFacturadoCliente.length || t.sinClasificar.length || t.depositosPendientes.length);
+  const porSerie = new Map(Object.entries(ccBySerie ?? {}).map(([s, c]) => [String(s).trim().toUpperCase(), c?.sucursal ?? null]));
+  return serie => porSerie.get(serie) ?? null;
 }
 
-// Nombre de hoja de Excel: máx. 31 caracteres y sin : \ / ? * [ ].
-const _nombreHoja = (serie, sucursal) =>
-  [serie || 'SIN SERIE', sucursal].filter(Boolean).join(' - ').replace(/[:\\/?*[\]]/g, ' ').slice(0, 31);
-
-async function excel(id) {
+/**
+ * Excel de una pestaña (`seccion`: mostrador, ref, especiales, ficha,
+ * efectivo — 2026-10-29) o de todas si no viene.
+ */
+async function excel(id, seccion) {
+  if (seccion && !SECCIONES[seccion]) throw new BadRequestError('Sección inválida');
   const r = await obtener(id);
+  if (!r.datos) throw new ConflictError('El reporte todavía se está calculando');
   const workbook = new ExcelJS.Workbook();
-  // Una hoja por almacén, cada una con los mismos bloques y agrupada por cliente.
-  const almacenes = await _almacenes(r.datos);
-  for (const a of almacenes) {
-    agregarHojaMostrador(workbook, a.datos, _nombreHoja(a.serie, a.sucursal), { columnaIdentificado: true, agruparPorCliente: true });
+  if (!agregarHojasSeccion(workbook, r.secciones, seccion)) {
+    workbook.addWorksheet(seccion ? SECCIONES[seccion].hoja : 'POR FACTURAR').addRow(['Sin depósitos en esta sección para el rango.']);
   }
-  if (!almacenes.length) {
-    workbook.addWorksheet('POR FACTURAR').addRow(['Sin facturas de mostrador ni depósitos pendientes de facturar en el rango.']);
-  }
-  agregarHojaPendientesPago(workbook, r.datos?.depositosPendientesPago);
-  agregarHojaDepositosEfectivo(workbook, r.datos?.depositosEfectivoSinAsociar);
   const rango = r.fechaInicio === r.fechaFin ? r.fechaInicio : `${r.fechaInicio}_${r.fechaFin}`;
   const sucursal = String(r.sucursal ?? 'Todas').replace(/[^\w-]+/g, '_');
-  return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar_${sucursal}_${rango}.xlsx` };
+  const parte = seccion ? `_${SECCIONES[seccion].hoja.replace(/\s+/g, '_')}` : '';
+  return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar${parte}_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _datosPorSerie };
+module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _esperar };

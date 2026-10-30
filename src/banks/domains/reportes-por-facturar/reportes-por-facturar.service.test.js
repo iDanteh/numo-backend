@@ -217,12 +217,17 @@ describe('secciones y Excel por pestaña', () => {
     const ws = todo.getWorksheet('MOSTRADOR A0 - CEDIS');
     // Encabezado del bloque de la global A0-1 y sus columnas, como el Excel del usuario.
     const fila = n => ws.getRow(n).values.slice(1);
-    const enc = ws.getColumn(6).values.indexOf('A0-1');
-    expect(fila(enc)).toEqual([expect.any(Date), undefined, undefined, undefined, 'A0', 'A0-1', 'ID NUMO']);
-    expect(fila(enc + 1)).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE']);
+    const enc = ws.getColumn(7).values.indexOf('A0-1');
+    expect(fila(enc)).toEqual([expect.any(Date), undefined, undefined, undefined, undefined, 'A0', 'A0-1', 'ID NUMO']);
+    // 2026-10-30: columna FORMA DE PAGO después de BANCO.
+    expect(fila(enc + 1)).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', 'CLIENTE']);
     expect(ws.getColumn(2).values).toEqual(expect.arrayContaining(['Subtotal ALFA', 'TOTAL']));
+    // Al final: TOTAL EFECTIVO (solo el cobro en caja de $1,500) y, aparte, DEPÓSITO EN EFECTIVO.
+    const totalDe = etiqueta => { const n = ws.getColumn(2).values.indexOf(etiqueta); return n > 0 ? ws.getRow(n).getCell(3).value : null; };
+    expect(totalDe('TOTAL EFECTIVO')).toBe(1500);
+    expect(totalDe('TOTAL DEPÓSITO EN EFECTIVO (APARTE)')).toBe(0);
     const ref = todo.getWorksheet('REF. B0 - HIDALGO').getRow(2).values.slice(1);
-    expect(ref).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'B0', 'B0 ORIGEN', 'CTE', 'CTE FACTURADO', 'ID DE PAGO']);
+    expect(ref).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'B0', 'B0 ORIGEN', 'CTE', 'CTE FACTURADO', 'ID DE PAGO']);
     expect((await leer('ficha')).worksheets.map(w => w.name)).toEqual(['X FAC CON FICHA DE DEP']);
     const { filename } = await service.excel(3, 'especiales');
     expect(filename).toBe('Por_facturar_FACT_ESPECIALES_Todas_2026-10-20_2026-10-22.xlsx');

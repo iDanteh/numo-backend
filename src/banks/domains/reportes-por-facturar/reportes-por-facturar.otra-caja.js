@@ -13,6 +13,7 @@
  */
 
 const { obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
+const { formasPagoDeCuentas } = require('../cfdi-mapping/mostrador.service');
 
 const LOTE = 50;
 const TOLERANCIA = 0.05;
@@ -76,6 +77,7 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
           descripcion: `COBRO ${k.serieOrigen ?? ''}-${k.folioOrigen ?? ''} EN CAJA ${caja}`,
           importe,
           banco:       (k.formasPago ?? []).map(fp => fp.nombre).filter(Boolean).join(' + '),
+          formasPago:  formasPagoDeCuentas([{ cobros: [k] }]),
           remisiones:  [rem],
           factura,
           cliente,

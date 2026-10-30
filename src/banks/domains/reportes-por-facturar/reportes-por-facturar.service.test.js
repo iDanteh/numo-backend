@@ -185,15 +185,19 @@ describe('secciones y Excel por pestaña', () => {
     }) });
   };
 
-  test('obtener: MOSTRADOR por fecha de la global con cobros de caja, pendientes al final; REF. y especiales', async () => {
+  test('obtener: MOSTRADOR por almacén y fecha de la global con cobros de caja, pendientes al final; REF. y especiales', async () => {
     cargar();
     const s = (await service.obtener(3)).secciones;
-    expect(s.mostrador.map(b => [b.tipo, b.factura ?? null])).toEqual([['global', 'A0-3'], ['global', 'A0-1'], ['global', 'I0-9'], ['pendiente', null]]);
-    const a01 = s.mostrador[1];
+    // 2026-10-30: una hoja MOSTRADOR por almacén; el pendiente va en el de su remisión.
+    expect(s.mostrador.map(a => [a.serie, a.sucursal, a.bloques.map(b => [b.tipo, b.factura ?? null])])).toEqual([
+      ['A0', 'CEDIS', [['global', 'A0-3'], ['global', 'A0-1']]],
+      ['I0', null, [['global', 'I0-9'], ['pendiente', null]]],
+    ]);
+    const a01 = s.mostrador[0].bloques[1];
     expect(a01.grupos.map(g => [g.cliente, g.total])).toEqual([['ALFA', 1520], ['ZETA', 15]]);
     expect(a01.total).toBe(1535);
     expect(a01.grupos[0].depositos.map(d => d.banco)).toEqual(['BBVA', 'EFECTIVO']);
-    expect(s.mostrador[3].grupos.map(g => g.cliente)).toEqual(['BETA', 'CLIENTE NO IDENTIFICADO']);
+    expect(s.mostrador[1].bloques[1].grupos.map(g => g.cliente)).toEqual(['BETA', 'CLIENTE NO IDENTIFICADO']);
     expect(s.ref.map(a => [a.serie, a.bloques.length])).toEqual([['B0', 1]]);
     expect(s.ref[0].bloques[0].grupos[0].depositos[0]).toMatchObject({ factura: 'B0-50', clienteFacturado: 'GRUPO CHILI GUAJILI S.A. DE C.V.' });
     expect(s.especiales).toHaveLength(1);
@@ -206,14 +210,16 @@ describe('secciones y Excel por pestaña', () => {
     cargar();
     const leer = async seccion => { const wb = new ExcelJS.Workbook(); await wb.xlsx.load((await service.excel(3, seccion)).buffer); return wb; };
     const todo = await leer();
-    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR', 'REF. B0 - HIDALGO', 'FACT ESPECIALES', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO']);
-    const ws = todo.getWorksheet('MOSTRADOR');
+    expect(todo.worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0', 'REF. B0 - HIDALGO', 'FACT ESPECIALES', 'X FAC CON FICHA DE DEP', 'DEPÓSITOS EN EFECTIVO']);
+    expect(todo.getWorksheet('MOSTRADOR I0').getColumn(2).values).toEqual(expect.arrayContaining(['PENDIENTE GENERAR FACTURA']));
+    expect((await leer('mostrador')).worksheets.map(w => w.name)).toEqual(['MOSTRADOR A0 - CEDIS', 'MOSTRADOR I0']);
+    const ws = todo.getWorksheet('MOSTRADOR A0 - CEDIS');
     // Encabezado del bloque de la global A0-1 y sus columnas, como el Excel del usuario.
     const fila = n => ws.getRow(n).values.slice(1);
     const enc = ws.getColumn(6).values.indexOf('A0-1');
     expect(fila(enc)).toEqual([expect.any(Date), undefined, undefined, undefined, 'A0', 'A0-1', 'ID NUMO']);
     expect(fila(enc + 1)).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE']);
-    expect(ws.getColumn(2).values).toEqual(expect.arrayContaining(['Subtotal ALFA', 'TOTAL', 'PENDIENTE GENERAR FACTURA']));
+    expect(ws.getColumn(2).values).toEqual(expect.arrayContaining(['Subtotal ALFA', 'TOTAL']));
     const ref = todo.getWorksheet('REF. B0 - HIDALGO').getRow(2).values.slice(1);
     expect(ref).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'B0', 'B0 ORIGEN', 'CTE', 'CTE FACTURADO', 'ID DE PAGO']);
     expect((await leer('ficha')).worksheets.map(w => w.name)).toEqual(['X FAC CON FICHA DE DEP']);

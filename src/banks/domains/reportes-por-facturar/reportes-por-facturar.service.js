@@ -105,6 +105,47 @@ async function _movimientosMostradorSinPoliza({ rfc, facturas }) {
   return detectarMovimientosMostrador({ rfc, cfdis: facturas.filter(f => conDepositoAnterior.has(f.uuid)), movimientos });
 }
 
+/**
+ * Refacturación (2026-10-30, pedido del usuario): una remisión repartida en
+ * varias facturas — caso real A0-260804937 ($59,997.42, TIBURCIO GARCIA CRUZ)
+ * facturada el 30-oct en A0-261015291, A0-261015312 y A0-261015397; Kore solo
+ * da una (la del desglose) y el bloque solo mostraba esa. Con las remisiones
+ * de cada factura del reporte busca en las copias ERP (DocumentosRelacionados
+ * de Kore) las OTRAS facturas vigentes que amparan esas mismas remisiones →
+ * `otrasFacturas` (['A0-261015291', …]) para el encabezado.
+ */
+const DIAS_REFACTURACION = 90;
+
+async function _marcarOtrasFacturas(entradas, fechaInicio) {
+  const remisionesDe = f => [...new Set((f.depositos ?? []).flatMap(d => d.remisiones ?? []))];
+  const remisiones = [...new Set(entradas.flatMap(remisionesDe))];
+  if (!remisiones.length) return;
+  const facturasDe = new Map(); // 'A0-260804937' → Set('A0-261015291', …)
+  for (let i = 0; i < remisiones.length; i += 200) {
+    const pares = remisiones.slice(i, i + 200).map(r => { const j = r.indexOf('-'); return { Serie: r.slice(0, j), Folio: r.slice(j + 1) }; });
+    const docs = await CFDI.find({
+      source: 'ERP', tipoDeComprobante: 'I',
+      fecha: { $gte: new Date(new Date(`${fechaInicio}T00:00:00Z`).getTime() - DIAS_REFACTURACION * 86400000) },
+      satStatus: { $ne: 'Cancelado' }, erpStatus: { $nin: ['Cancelado', 'Cancelacion Pendiente'] },
+      documentosRelacionados: { $elemMatch: { $or: pares } },
+    }).select('serie folio documentosRelacionados').lean();
+    for (const c of docs) {
+      const folio = `${String(c.serie ?? '').trim().toUpperCase()}-${String(c.folio ?? '').trim()}`;
+      for (const d of c.documentosRelacionados ?? []) {
+        const rem = `${String(d.Serie ?? '').trim().toUpperCase()}-${String(d.Folio ?? '').trim()}`;
+        if (!facturasDe.has(rem)) facturasDe.set(rem, new Set());
+        facturasDe.get(rem).add(folio);
+      }
+    }
+  }
+  for (const f of entradas) {
+    const propia = `${String(f.serie ?? '').trim().toUpperCase()}-${String(f.folio ?? '').trim()}`;
+    const otras = new Set(remisionesDe(f).flatMap(r => [...(facturasDe.get(r) ?? [])]));
+    otras.delete(propia);
+    if (otras.size) f.otrasFacturas = [...otras].sort();
+  }
+}
+
 function _resumen(datos) {
   const t = tablasMostrador(datos);
   const deps = fs => fs.flatMap(f => f.depositos ?? []);
@@ -179,6 +220,9 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   if (cobrosCaja.sinRespuesta) {
     advertencias.push(`Kore no respondió ${cobrosCaja.sinRespuesta} consulta(s) de cobros en efectivo / saldo a favor de las facturas globales — pueden faltar renglones; vuelve a actualizarlo más tarde.`);
   }
+
+  await onAvance('Buscando refacturaciones…');
+  await _marcarOtrasFacturas([...movimientosMostrador, ...cobrosCaja.porFactura], fechaInicio);
 
   const datos = {
     movimientosMostrador,

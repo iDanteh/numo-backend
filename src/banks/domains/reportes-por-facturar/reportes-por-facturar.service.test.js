@@ -8,6 +8,7 @@ jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../cfdi-mapping/cfdi-poliza-generator.service', () => ({ _uuidsPorFechaEfectiva: jest.fn() }));
+jest.mock('./reportes-por-facturar.facturas-kore', () => ({ traerFacturasRecientes: jest.fn(async () => ({ dias: [], nuevas: 0, error: null })) }));
 jest.mock('./reportes-por-facturar.cobros-caja', () => ({ cobrosCajaDeGlobales: jest.fn(async () => ({ porFactura: [], sinRespuesta: 0 })) }));
 jest.mock('../cfdi-mapping/mostrador.service', () => ({ detectarMovimientosMostrador: jest.fn(), detectarDepositosPendientesFactura: jest.fn(), detectarDepositosEfectivoSinAsociar: jest.fn(), FORMAS_PAGO: ['efectivo', 'depositoEfectivo', 'transferencia', 'tarjeta', 'cheque', 'abonos', 'otras'] }));
 

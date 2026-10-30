@@ -20,6 +20,8 @@
  *   ficha       X FAC CON FICHA DE DEP — depósitos identificados que solo
  *               abonan (las remisiones todavía deben saldo).
  *   efectivo    DEPÓSITOS EN EFECTIVO — sin asociar a ninguna venta.
+ *   otraCaja    "<serie> COBRADAS EN <sucursal>" (2026-10-30) — cobros de Kore en
+ *               la caja de otro almacén (A0 cobradas en Puerto), una hoja por par.
  *
  * Antes (2026-10-28): una hoja por sección y almacén con columnas de formas
  * de pago — el usuario pidió quitarlo y dejar su formato de 7 columnas.
@@ -33,6 +35,7 @@ const SECCIONES = {
   especiales: { titulo: 'FACT ESPECIALES',        hoja: 'FACT ESPECIALES' },
   ficha:      { titulo: 'X FAC CON FICHA DE DEP', hoja: 'X FAC CON FICHA DE DEP' },
   efectivo:   { titulo: 'DEPÓSITOS EN EFECTIVO — SIN ASOCIAR A NINGUNA VENTA', hoja: 'DEPÓSITOS EN EFECTIVO' },
+  otraCaja:   { titulo: 'COBRADAS EN OTRA CAJA',  hoja: 'COBRADAS EN' },
 };
 
 const NO_IDENTIFICADO = 'CLIENTE NO IDENTIFICADO';
@@ -154,7 +157,23 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
       .map(({ depositos, ...b }) => _bloque({ ...b, sucursal: sucursalDe(b.serie) }, depositos)),
     ficha: _bloque({}, datos?.depositosPendientesPago ?? []),
     efectivo: datos?.depositosEfectivoSinAsociar ?? [],
+    otraCaja: _otraCaja(datos?.cobrosOtraCaja ?? [], sucursalDe),
   };
+}
+
+// "A0 COBRADAS EN PUERTO": una entrada por almacén de la remisión + caja que cobró.
+function _otraCaja(cobros, sucursalDe) {
+  const porPar = new Map();
+  for (const c of cobros) {
+    const k = `${c.serie}|${c.caja}`;
+    if (!porPar.has(k)) porPar.set(k, []);
+    porPar.get(k).push(c);
+  }
+  return [...porPar.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, cs]) => {
+    const [serie, caja] = k.split('|');
+    const titulo = `${serie} COBRADAS EN ${sucursalDe(caja) ?? caja}`.toUpperCase();
+    return { serie: k, sucursal: titulo, titulo, bloques: [_bloque({ serie, caja, titulo }, cs)] };
+  });
 }
 
 // ── Excel ─────────────────────────────────────────────────────────────────────
@@ -257,6 +276,23 @@ function agregarHojaRef(workbook, bloques, nombre, etiquetaSerie) {
   return true;
 }
 
+// "A0 COBRADAS EN PUERTO": como REF., con la caja que cobró.
+function agregarHojaOtraCaja(workbook, entrada) {
+  const [b] = entrada.bloques;
+  if (!b?.grupos.length) return false;
+  const ws = workbook.addWorksheet(nombreHoja(entrada.titulo));
+  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 18 }, { width: 30 }, { width: 10 }, { width: 10 }];
+  _escribirBloque(ws, {
+    encabezados: [[entrada.titulo, null, null, null, null, null, null, null, null]],
+    columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'FORMA DE PAGO', 'FACTURA', 'REM', 'CLIENTE', 'CAJA', 'ID NUMO'],
+    grupos: b.grupos,
+    total: b.total,
+    fila: d => [_fecha(d.fecha, true), d.descripcion, d.importe, d.banco, d.factura ?? '', _rem(d), d.cliente || NO_IDENTIFICADO, d.caja, d.idNumo],
+  });
+  ws.mergeCells(1, 1, 1, 9);
+  return true;
+}
+
 function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
   if (!bloque.grupos.length) return false;
   const ws = workbook.addWorksheet(nombre);
@@ -294,6 +330,9 @@ function agregarHojasSeccion(workbook, secciones, seccion) {
     if (s === 'especiales' && agregarHojaRef(workbook, secciones.especiales, SECCIONES.especiales.hoja, 'FACTURA')) hojas++;
     if (s === 'ficha' && agregarHojaFicha(workbook, secciones.ficha)) hojas++;
     if (s === 'efectivo' && agregarHojaDepositosEfectivo(workbook, secciones.efectivo, SECCIONES.efectivo.hoja)) hojas++;
+    if (s === 'otraCaja') {
+      for (const e of secciones.otraCaja ?? []) if (agregarHojaOtraCaja(workbook, e)) hojas++;
+    }
   }
   return hojas > 0;
 }

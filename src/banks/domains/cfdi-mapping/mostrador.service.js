@@ -262,6 +262,9 @@ async function detectarMovimientosMostrador({ rfc, cfdis, movimientos }) {
  *   $47.79 = retención del 4% sin registrar en Kore).
  */
 const LOTE_DESGLOSES = 50;
+// Hasta cuántos días atrás se buscan depósitos que dejaron saldo en su remisión
+// y que pudieron liquidarse dentro del rango (2026-10-30).
+const DIAS_LIQUIDADAS_ANTES = 120;
 
 // Último momento en que se identificó / vinculó el depósito (fechas reales,
 // con hora): vinculaciones del historial, identificadoPor y la primera
@@ -303,10 +306,30 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       : porFechaBanco),
     erpLinks: { $elemMatch: { serie: { $in: [...seriesSet] }, $or: [{ folioFiscal: null }, { folioFiscal: '' }] } },
   }).lean();
-  if (!bancos.length) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
+
+  // Liquidadas dentro del rango (2026-10-30, pedido del usuario: 053049, efectivo
+  // del 15-oct identificado el 19 contra A0-260902996, que quedó en 0 hasta el
+  // 30-oct por un RET de $69.31 — "debería salir porque hoy quedó en 0"):
+  // depósitos ANTERIORES al rango que dejaron saldo en su remisión al
+  // vincularse; salen en PENDIENTE GENERAR FACTURA si Kore dice que la remisión
+  // quedó en 0 dentro del rango (solo el reporte, no la póliza).
+  let anteriores = [];
+  if (incluirIdentificados) {
+    const ya = new Set(bancos.map(b => String(b._id)));
+    anteriores = (await BankMovement.find({
+      isActive: { $ne: false },
+      deposito: { $gt: 0 },
+      fecha: { $gte: new Date(desde.getTime() - DIAS_LIQUIDADAS_ANTES * 86400000), $lt: desde },
+      erpLinks: { $elemMatch: { serie: { $in: [...seriesSet] }, $or: [{ folioFiscal: null }, { folioFiscal: '' }], saldoActual: { $gt: 0.005 } } },
+    }).lean()).filter(b => !ya.has(String(b._id)) && !(_identificadoEl(b) > enRangoId.$lte));
+  }
+  const esAnterior = new Set(anteriores.map(b => String(b._id)));
+  const todos = [...bancos, ...anteriores];
+  if (!todos.length) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
 
   const clave = l => `${String(l.serie).trim().toUpperCase()}|${String(l.folioExterno).trim()}`;
-  const remisiones = [...new Map(bancos.flatMap(b => (b.erpLinks ?? []).filter(linkSinFactura))
+  const remAnteriores = new Set(anteriores.flatMap(b => (b.erpLinks ?? []).filter(linkSinFactura).map(clave)));
+  const remisiones = [...new Map(todos.flatMap(b => (b.erpLinks ?? []).filter(linkSinFactura))
     .map(l => [clave(l), { serie: String(l.serie).trim().toUpperCase(), folio: String(l.folioExterno).trim() }])).values()];
 
   // Factura que ampara cada remisión (y su fecha de creación, que pide /cuentas-pendientes).
@@ -320,12 +343,15 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
   // Tipo de pago, estatus y cliente de la memoria de NUMO (kore_remisiones,
   // 2026-10-29) — solo de las que no tienen factura. El saldo se pide a Kore
   // únicamente si Bancos todavía no confirma que la remisión quedó en 0.
-  const cerradas = _remisionesCerradas(bancos);
+  const cerradas = _remisionesCerradas(todos);
   const pendientes = remisiones.filter(r => { const d = desglose.get(`${r.serie}|${r.folio}`); return d && !d.serieFactura; });
   const { info: cuentaKore, sinRespuesta: remisionesSinRespuesta } = await infoRemisiones({
     rfc,
     remisiones: pendientes.map(r => ({ ...r, fechaCreacion: desglose.get(`${r.serie}|${r.folio}`).fechaCreacion })),
-    necesitaSaldo: k => !cerradas.has(k),
+    // Ya liquidada en la memoria → saldo 0 y su fecha, sin preguntar. Las de
+    // depósitos anteriores se preguntan aunque Bancos las dé por cerradas
+    // (hace falta el día en que quedaron en 0).
+    necesitaSaldo: (k, g) => !g?.liquidadaEl && (!cerradas.has(k) || remAnteriores.has(k)),
   });
 
   // PPD, "POR FACTURAR" y sin factura (sin importar el saldo).
@@ -342,12 +368,17 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
 
   const depositos = [];
   const depositosConSaldo = [];
-  for (const b of bancos) {
+  for (const b of todos) {
     const links = (b.erpLinks ?? []).filter(linkSinFactura);
     if (!links.length || !links.every(porFacturar)) continue;
     // Todas pagadas → PENDIENTE GENERAR FACTURA; si alguna debe algo → CON PENDIENTES DE PAGO.
     const todasPagadas = links.every(pagada);
     const remisionesUnicas = [...new Map(links.map(l => [clave(l), l])).values()];
+    // Día en que quedó en 0 la última de sus remisiones (si Kore lo dio).
+    const liquidaciones = remisionesUnicas.map(l => cuentaKore.get(clave(l))?.liquidadaEl).filter(Boolean).map(f => new Date(f));
+    const liquidadaEl = liquidaciones.length === remisionesUnicas.length ? new Date(Math.max(...liquidaciones)) : null;
+    if (esAnterior.has(String(b._id))
+      && !(todasPagadas && liquidadaEl && liquidadaEl >= enRangoId.$gte && liquidadaEl <= enRangoId.$lte)) continue;
     (todasPagadas ? depositos : depositosConSaldo).push({
       fecha:       b.fecha ?? null,
       descripcion: b.concepto ?? '',
@@ -358,7 +389,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       cliente:     [...new Set(links.map(l => cuentaKore.get(clave(l))?.nombre).filter(Boolean))].join(' / '),
       idNumo:      b.folio ?? '',
       estatus:     ESTATUS_POR_FACTURAR,
-      ...(incluirIdentificados ? { identificadoEl: _identificadoEl(b) } : {}),
+      ...(incluirIdentificados ? { identificadoEl: _identificadoEl(b), liquidadaEl } : {}),
       formasPago:  formasPagoDeCuentas(remisionesUnicas.map(l => desglose.get(clave(l)))),
       ...(todasPagadas ? {} : { saldo: _r2(remisionesUnicas.reduce((s, l) => s + saldoDe(l), 0)) }),
     });

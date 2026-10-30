@@ -17,6 +17,8 @@ const koreRemisionSchema = new mongoose.Schema({
   tipoPago:             { type: String, default: null },
   nombreTipoMovimiento: { type: String, default: null },
   consultadoEn:         { type: Date,   default: null },
+  // Cuándo quedó en saldo 0 (2026-10-30): ya no cambia → no se vuelve a pedir el saldo.
+  liquidadaEl:          { type: Date,   default: null },
 }, { timestamps: true, collection: 'kore_remisiones' });
 
 koreRemisionSchema.index({ rfc: 1, serie: 1, folio: 1 }, { unique: true });

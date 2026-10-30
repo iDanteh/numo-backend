@@ -12,10 +12,14 @@ const { DataTypes } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 
 const LoyaltyCard = sequelize.define('LoyaltyCard', {
+  // UUID (2026-10-29, pedido explícito del usuario, confirmado sin datos reales en ningún
+  // ambiente todavía) — ver migración idempotente en shared/models/postgres/index.js, que
+  // recrea esta tabla y sus 3 FKs entrantes desde cero si encuentra el tipo viejo (integer) y
+  // las 4 tablas relacionadas vacías.
   id: {
-    type:          DataTypes.INTEGER,
-    primaryKey:    true,
-    autoIncrement: true,
+    type:         DataTypes.UUID,
+    primaryKey:   true,
+    defaultValue: DataTypes.UUIDV4,
   },
   telefono: {
     type:      DataTypes.STRING(10),
@@ -201,6 +205,50 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
   },
   comentarios: {
     type:      DataTypes.TEXT,
+    allowNull: true,
+  },
+  // Foto del cliente (2026-10-29) — tomada con la cámara del dispositivo del staff al crear o
+  // editar la tarjeta, 100% capturada en Numo (nunca viene de Kore). Mismo patrón que
+  // BankMovement.fichaDriveWebViewLink: el binario vive en Google Drive (ver
+  // drive-loyalty-foto.service.js), acá solo se guarda el link devuelto por Drive.
+  fotoUrl: {
+    type:      DataTypes.STRING,
+    allowNull: true,
+  },
+  // Bug real corregido (2026-10-29): `fotoUrl` es el `webViewLink` de Drive — un link a la PÁGINA
+  // VISOR, nunca embebible en un `<img src>`. Estas dos columnas nuevas permiten descargar el
+  // binario real vía GET /cards/:id/foto (ver loyalty-card.service.js#obtenerFoto,
+  // drive-loyalty-foto.service.js#descargarFotoCliente) y servirlo con el Content-Type correcto —
+  // mismo patrón que BankMovement.fichaDriveFileId/fichaDriveMimeType. `fotoUrl` se deja tal cual,
+  // sigue sirviendo como link "Abrir en Drive" para ver el archivo en tamaño completo.
+  fotoDriveFileId: {
+    type:      DataTypes.STRING,
+    allowNull: true,
+  },
+  fotoMimeType: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Mimetype real del archivo subido (ej. image/png), persistido en el upload — mismo criterio que BankMovement.fichaDriveMimeType, para no tener que inferirlo al servir el binario.',
+  },
+  // Revisión pendiente de altas creadas por el webhook de catálogo de clientes de Kore
+  // (2026-10-29) — `_procesarAlta` marca `revisionPendiente: true` SOLO en el camino de creación
+  // (nunca en el de actualización), para que staff confirme/complete el registro a mano. Ver
+  // loyalty-card.service.js#listarPendientesRevisionKore/marcarRevisada.
+  revisionPendiente: {
+    type:         DataTypes.BOOLEAN,
+    allowNull:    false,
+    defaultValue: false,
+  },
+  revisadoPorId: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+  },
+  revisadoPorNombre: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+  },
+  revisadoAt: {
+    type:      DataTypes.DATE,
     allowNull: true,
   },
 }, {

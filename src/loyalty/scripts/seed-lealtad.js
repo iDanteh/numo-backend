@@ -49,6 +49,11 @@ async function _asegurarSeccionLealtad() {
         'PORCENTAJE_PLATA — % de puntos acumulados en ventas de tarjetas nivel Plata. Sin valor hasta que se configure acá.',
         'PORCENTAJE_ORO — % de puntos acumulados en ventas de tarjetas nivel Oro. Sin valor hasta que se configure acá.',
         'ESPECIALIDADES — Catálogo de referencia (lista editable desde la UI) de las especialidades válidas para altas futuras de clientes. Informativo: el valor que trae cada cliente del CSV de import se persiste tal cual, sin validar contra este catálogo.',
+        // 2026-10-29: NO se siembra con un valor acá a propósito — mismo criterio que
+        // FICHAS_IMAGEN_FOLDER_ID en seed-global-config-banks.js (bancos): un folder ID de Drive
+        // no es algo que este script pueda adivinar, el usuario lo declara él mismo desde la UI de
+        // Configuraciones Globales una vez que crea/comparte la carpeta con la cuenta de servicio.
+        'FOTO_CLIENTE_FOLDER_ID — Carpeta de Drive para la foto del cliente de una tarjeta de Lealtad (misma cuenta que FICHAS_IMAGEN_FOLDER_ID en Bancos, GOOGLE_SERVICE_ACCOUNT_KEY2). Declarado desde la UI.',
       ],
     },
   });

@@ -238,8 +238,10 @@ describe('aplicar', () => {
     // usaba solo en memoria durante la clasificación y se descartaba) — necesario para el match
     // de clientes con Kore (kore-match/). UPDATE puntual por id, además (no en vez) de la única
     // escritura de ledger permitida.
+    // activa:false (2026-10-29): sin puntosRows en este test, ninguna fila "está en el reporte de
+    // vendedor" → activaSugerida=false para todas, ver construirConcentrado#activaSugerida.
     expect(LoyaltyCard.update).toHaveBeenCalledWith(
-      { tarjetaLegada: '9005', ...ENRIQUECIMIENTO_VACIO },
+      { tarjetaLegada: '9005', ...ENRIQUECIMIENTO_VACIO, activa: false },
       expect.objectContaining({ where: { id: 1 }, transaction: expect.anything() }),
     );
   });
@@ -320,7 +322,9 @@ describe('aplicar', () => {
 
       // normalizarTarjeta('044') quita los ceros a la izquierda. Sin overrides de enriquecimiento
       // en `cliente()`, ningún campo de enriquecimiento se agrega (todos null en la fila).
-      expect(cardMock.update).toHaveBeenCalledWith({ tarjetaLegada: '44' }, expect.objectContaining({ transaction: expect.anything() }));
+      // activa:false (2026-10-29): sin puntosRows, activaSugerida=false; cardMock.activa es
+      // undefined (!= false) → se sobrescribe, a diferencia del resto de campos de enriquecimiento.
+      expect(cardMock.update).toHaveBeenCalledWith({ tarjetaLegada: '44', activa: false }, expect.objectContaining({ transaction: expect.anything() }));
       expect(resultado.yaMigradaBackfillAplicado).toBe(1);
       // Nunca se toca puntos/nivel/nombre ni se crea un segundo movimiento de ledger.
       expect(cardService.crearTarjeta).not.toHaveBeenCalled();
@@ -328,7 +332,10 @@ describe('aplicar', () => {
     });
 
     test('si la tarjeta existente YA tiene tarjetaLegada y ningún campo de enriquecimiento en la fila, no se escribe nada', async () => {
-      const cardMock = { id: 99, tarjetaLegada: '9005', update: jest.fn() };
+      // activa:false (2026-10-29): igual a la activaSugerida que va a traer la fila (sin
+      // puntosRows) — así el test sigue probando "nada que backfillear" en vez de mezclarlo con
+      // el sync de activa, que es una preocupación aparte (ver tests dedicados más abajo).
+      const cardMock = { id: 99, tarjetaLegada: '9005', activa: false, update: jest.fn() };
       LoyaltyCard.findOne.mockResolvedValue(cardMock);
       LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
 
@@ -348,8 +355,10 @@ describe('aplicar', () => {
         { clientesRows: [cliente({ apodo: 'Cris', sucursal: 'Matriz' })] }, USER,
       );
 
+      // activa:false (2026-10-29): sin puntosRows, activaSugerida=false; cardMock.activa es
+      // undefined (!= false) → se suma al mismo UPDATE.
       expect(cardMock.update).toHaveBeenCalledWith(
-        { apodo: 'Cris', sucursal: 'Matriz' },
+        { apodo: 'Cris', sucursal: 'Matriz', activa: false },
         expect.objectContaining({ transaction: expect.anything() }),
       );
       expect(resultado.yaMigradaBackfillAplicado).toBe(1);
@@ -366,7 +375,9 @@ describe('aplicar', () => {
     });
 
     test('fila sin tarjetaRawClientes (tarjetaRaw vacío): no rompe, solo backfillea lo que la fila sí trae', async () => {
-      const cardMock = { id: 99, tarjetaLegada: null, update: jest.fn() };
+      // activa:false (2026-10-29): igual a la activaSugerida de la fila (sin puntosRows) — el test
+      // sigue probando específicamente "nada que backfillear de tarjetaLegada/enriquecimiento".
+      const cardMock = { id: 99, tarjetaLegada: null, activa: false, update: jest.fn() };
       LoyaltyCard.findOne.mockResolvedValue(cardMock);
       LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 1, origen: 'migracion' });
 
@@ -460,7 +471,9 @@ describe('iniciarAplicarJob / _correrAplicarJob (migración en background, por l
     expect(estado.resultado.yaMigradaBackfillAplicado).toBe(1);
     expect(estado.resultado.creadas).toHaveLength(0);
     expect(cardService.crearTarjeta).not.toHaveBeenCalled();
-    expect(cardMock.update).toHaveBeenCalledWith({ tarjetaLegada: '9005' }, expect.objectContaining({ transaction: expect.anything() }));
+    // activa:false (2026-10-29): sin puntosRows, activaSugerida=false; cardMock.activa es
+    // undefined (!= false) → se sobrescribe.
+    expect(cardMock.update).toHaveBeenCalledWith({ tarjetaLegada: '9005', activa: false }, expect.objectContaining({ transaction: expect.anything() }));
   });
 
   test('parte las filas accionables en lotes de BATCH_SIZE (200) y responde con jobId+total+totalLotes de inmediato', async () => {
@@ -849,6 +862,37 @@ describe('listarPendientes', () => {
 
   // 2026-10-26, pedido explícito del usuario: exportar a Excel necesita el padrón COMPLETO, no
   // una página — `exportar:true` debe ignorar el corte de página y el tope de 100 por página.
+  // 2026-10-29, pedido explícito del usuario: mismo criterio que
+  // loyalty-card.service.test.js#listarPendientesRevisionKore — prefijo de teléfono O ILIKE de
+  // nombre, sin romper el filtro `estado:'pendiente'` ya existente.
+  test('search filtra por prefijo de telefonoCandidato O nombre (ILIKE), sin perder estado:pendiente', async () => {
+    LoyaltyPendingEnrollment.findAll.mockResolvedValue([]);
+
+    await applyService.listarPendientes({ search: 'Juan' });
+
+    const { where } = LoyaltyPendingEnrollment.findAll.mock.calls[0][0];
+    const { Op } = require('sequelize');
+    expect(where.estado).toBe('pendiente');
+    expect(where[Op.and]).toEqual([
+      {
+        [Op.or]: [
+          { telefonoCandidato: { [Op.like]: 'Juan%' } },
+          { nombre:            { [Op.iLike]: '%Juan%' } },
+        ],
+      },
+    ]);
+  });
+
+  test('sin search → no agrega Op.and', async () => {
+    LoyaltyPendingEnrollment.findAll.mockResolvedValue([]);
+
+    await applyService.listarPendientes({});
+
+    expect(LoyaltyPendingEnrollment.findAll).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { estado: 'pendiente' } }),
+    );
+  });
+
   test('exportar:true devuelve TODOS los grupos sin recortar por página ni por el tope de 100', async () => {
     const rows = Array.from({ length: 150 }, (_, i) => ({
       id: i + 1, grupoId: null, saldoLegado: i, createdAt: new Date('2026-10-01'),

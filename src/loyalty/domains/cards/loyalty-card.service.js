@@ -9,12 +9,14 @@
  * loguea, y el modelo excluye `nipHash` por `defaultScope` (PR1).
  */
 
+const path = require('path');
 const { Transaction, Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const { LoyaltyCard, LoyaltyTierHistory } = require('../../../shared/models/postgres');
 const { BadRequestError, ConflictError, NotFoundError } = require('../../../shared/errors/AppError');
 const { normalizarTelefono } = require('../../shared/puntos.util');
 const { generarNip, hashNip } = require('../../shared/nip.util');
+const { subirFotoCliente, descargarFotoCliente } = require('./drive-loyalty-foto.service');
 
 const NIVELES_VALIDOS = ['Bronce', 'Plata', 'Oro'];
 
@@ -136,8 +138,30 @@ function _resolverOrden(sort, sortDir) {
 
 /** `search` matchea prefijo de teléfono o ILIKE sobre nombre. `origen`: 'kore' (creadas por el
  *  webhook de catálogo de clientes) | 'numo' (alta manual o import de CSV, incluye `createdById`
- *  nulo de tarjetas migradas) — cualquier otro valor no filtra, igual que el resto de filtros. */
-async function listar({ search, nivel, activa, origen, page = 1, limit = 50, sort, sortDir } = {}) {
+ *  nulo de tarjetas migradas) — cualquier otro valor no filtra, igual que el resto de filtros.
+ *
+ * Reporte "Tarjetas" (2026-10-29, pedido explícito del usuario): `exportar`, `fechaAltaInicio`/
+ * `fechaAltaFin` y `revisionPendiente` son parámetros NUEVOS y opcionales — sin ellos, el
+ * comportamiento paginado de siempre queda 100% intacto (mismos argumentos, mismo resultado).
+ *
+ * `fechaAltaInicio`/`fechaAltaFin` acotan `createdAt`. No existe un helper de rango de fechas
+ * compartido/importable en el backend: `_inicioDiaMx`/`_finDiaMx` (bank.service.js) resuelven el
+ * mismo tipo de bug de huso horario (ya corregido ahí, y también en el `erp-modal` del frontend —
+ * ver isoFirstDay/isoLastDay) pero son privados de ese módulo y están DUPLICADOS a propósito en
+ * cada lugar que los necesita (ver su propio comentario) — no están pensados para importarse fuera
+ * de Bancos. `createdAt` acá es un timestamp de auditoría, no un campo de negocio con semántica de
+ * "día calendario de México" (a diferencia de `BankMovement.fecha`), así que alcanza con
+ * `Op.gte`/`Op.lte` directos; `fechaAltaFin` se trata como fin de día UTC (`T23:59:59.999Z`,
+ * mismo criterio ya usado en `bank.service.js#listMovements` para `fechaAplicacion`) para no
+ * cortar registros dados de alta ese mismo día.
+ *
+ * `exportar===true`: trae TODAS las filas que matchean (sin `limit`/`offset`) — mismo criterio
+ * que `listarPendientes({exportar})` en loyalty-import-apply.service.js.
+ */
+async function listar({
+  search, nivel, activa, origen, page = 1, limit = 50, sort, sortDir,
+  exportar = false, fechaAltaInicio, fechaAltaFin, revisionPendiente,
+} = {}) {
   const where = {};
   // Grupos OR independientes (origen, search) van en `Op.and` — nunca compartiendo la misma clave
   // `Op.or` del `where`, porque una asignación pisaría a la otra en silencio si ambos filtros se
@@ -146,6 +170,15 @@ async function listar({ search, nivel, activa, origen, page = 1, limit = 50, sor
   if (nivel) where.nivel = nivel;
   if (activa !== undefined && activa !== null && activa !== '') {
     where.activa = activa === true || activa === 'true';
+  }
+  if (revisionPendiente !== undefined && revisionPendiente !== null && revisionPendiente !== '') {
+    where.revisionPendiente = revisionPendiente === true || revisionPendiente === 'true';
+  }
+  if (fechaAltaInicio) {
+    where.createdAt = { ...(where.createdAt ?? {}), [Op.gte]: new Date(fechaAltaInicio) };
+  }
+  if (fechaAltaFin) {
+    where.createdAt = { ...(where.createdAt ?? {}), [Op.lte]: new Date(`${fechaAltaFin}T23:59:59.999Z`) };
   }
   if (origen === 'kore') {
     where.createdById = CREATED_BY_KORE_WEBHOOK;
@@ -172,11 +205,18 @@ async function listar({ search, nivel, activa, origen, page = 1, limit = 50, sor
     where[Op.and] = condiciones;
   }
 
+  const order = _resolverOrden(sort, sortDir);
+
+  if (exportar) {
+    const rows = await LoyaltyCard.findAll({ where, order });
+    return { total: rows.length, page: 1, limit: rows.length, pages: 1, cards: rows };
+  }
+
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Number(limit) || 50);
   const { count, rows } = await LoyaltyCard.findAndCountAll({
     where,
-    order:  _resolverOrden(sort, sortDir),
+    order,
     limit:  l,
     offset: (p - 1) * l,
   });
@@ -303,4 +343,120 @@ async function cambiarNivel(cardId, nuevoNivel, { motivo } = {}, user) {
   });
 }
 
-module.exports = { crearTarjeta, listar, obtener, obtenerParaEditar, editarTarjeta, cambiarNip, cambiarNivel };
+// Extensión de respaldo cuando el archivo llega sin una en el nombre original (ej. una foto de
+// cámara/celular sin extensión) — mismos tipos que acepta el multer dedicado de loyalty.routes.js.
+const FOTO_MIME_EXT = {
+  'image/jpeg': '.jpg',
+  'image/png':  '.png',
+  'image/webp': '.webp',
+};
+
+/** Nombre con el que la foto del cliente se guarda en Drive: "teléfono - nombre", mismo criterio
+ *  que _nombreArchivoFichaDrive en bank.service.js (dos datos para poder rastrearla en Drive). */
+function _nombreArchivoFotoCliente(card, imagen) {
+  const extension = path.extname(imagen.originalname || '') || FOTO_MIME_EXT[imagen.mimetype] || '';
+  const nombre = String(card.nombre ?? '').replace(/[\\/:*?"<>|]/g, '').trim();
+  return `${card.telefono} - ${nombre}${extension}`;
+}
+
+/**
+ * Sube la foto del cliente a Drive y guarda el link en `fotoUrl`. `imagen` es el shape de
+ * req.file de multer: { buffer, mimetype, originalname }.
+ *
+ * Bug real corregido (2026-10-29): `fotoUrl`/`driveWebViewLink` es la página VISOR de Drive, no
+ * una imagen embebible — un `<img src>` nunca puede renderizarla. Ahora también se persiste
+ * `fotoDriveFileId` (ya venía en el resultado de `subirFotoCliente`, antes se descartaba) y
+ * `fotoMimeType`, para poder descargar el binario real vía `obtenerFoto()` más abajo.
+ */
+async function subirFoto(cardId, imagen, user) {
+  const card = await LoyaltyCard.findByPk(cardId);
+  if (!card) throw new NotFoundError('Tarjeta');
+
+  const nombreArchivo = _nombreArchivoFotoCliente(card, imagen);
+  const { driveFileId, driveWebViewLink } = await subirFotoCliente(imagen.buffer, imagen.mimetype, nombreArchivo);
+
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  await card.update({
+    fotoUrl: driveWebViewLink,
+    fotoDriveFileId: driveFileId,
+    fotoMimeType: imagen.mimetype,
+    updatedById: usuarioId,
+    updatedByNombre: usuarioNombre,
+  });
+
+  return card;
+}
+
+/**
+ * Descarga el binario de la foto del cliente ya subida — proxy autenticado para el `<img>` del
+ * detalle de tarjeta (bug real corregido 2026-10-29: `fotoUrl` es la página visor de Drive,
+ * nunca embebible). Mismo patrón que bank.service.js#obtenerImagenFicha.
+ */
+async function obtenerFoto(cardId) {
+  const card = await LoyaltyCard.findByPk(cardId);
+  if (!card) throw new NotFoundError('Tarjeta');
+  if (!card.fotoDriveFileId) throw new NotFoundError('Esta tarjeta no tiene ninguna foto adjunta');
+
+  const data = await descargarFotoCliente(card.fotoDriveFileId);
+  return { data, mimetype: card.fotoMimeType };
+}
+
+/**
+ * Altas creadas por el webhook de catálogo de clientes de Kore (`_procesarAlta`), pendientes de
+ * que staff las revise/complete a mano. Mismo criterio de paginación que `listar` (page/limit con
+ * el mismo tope), orden ASC por `createdAt` (las más viejas primero: las que llevan más tiempo
+ * esperando revisión).
+ */
+async function listarPendientesRevisionKore({ page = 1, limit = 50, search } = {}) {
+  const p = Math.max(1, Number(page) || 1);
+  const l = Math.min(100, Number(limit) || 50);
+  const where = { revisionPendiente: true };
+  // Mismo criterio de búsqueda que `listar()` arriba: prefijo de teléfono O ILIKE sobre nombre.
+  if (search) {
+    const s = String(search).trim();
+    where[Op.and] = [
+      {
+        [Op.or]: [
+          { telefono: { [Op.like]: `${s}%` } },
+          { nombre:   { [Op.iLike]: `%${s}%` } },
+        ],
+      },
+    ];
+  }
+  const { count, rows } = await LoyaltyCard.findAndCountAll({
+    where,
+    order:  [['createdAt', 'ASC']],
+    limit:  l,
+    offset: (p - 1) * l,
+  });
+
+  return { total: count, page: p, limit: l, pages: Math.ceil(count / l), cards: rows };
+}
+
+/**
+ * Marca una tarjeta como revisada (contraparte de `revisionPendiente: true` seteado por
+ * `_procesarAlta`). Idempotente: si ya estaba revisada (`revisionPendiente === false`), no es un
+ * error — simplemente devuelve la tarjeta sin tocarla (no pisa quién/cuándo la revisó la primera
+ * vez con una segunda llamada).
+ */
+async function marcarRevisada(cardId, user) {
+  const card = await LoyaltyCard.findByPk(cardId);
+  if (!card) throw new NotFoundError('Tarjeta');
+
+  if (!card.revisionPendiente) return card;
+
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  await card.update({
+    revisionPendiente: false,
+    revisadoPorId:      usuarioId,
+    revisadoPorNombre:  usuarioNombre,
+    revisadoAt:         new Date(),
+  });
+
+  return card;
+}
+
+module.exports = {
+  crearTarjeta, listar, obtener, obtenerParaEditar, editarTarjeta, cambiarNip, cambiarNivel,
+  subirFoto, obtenerFoto, listarPendientesRevisionKore, marcarRevisada,
+};

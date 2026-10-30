@@ -562,6 +562,48 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS permite_canje_lealtad BOOLEAN NOT NULL DEFAULT TRUE
   `).catch(e => console.warn('[syncModels] ADD COLUMN participa_lealtad/permite_canje_lealtad:', e.message));
 
+  // UUID para loyalty_cards.id (2026-10-29, pedido explícito del usuario — confirmado SIN datos
+  // reales todavía en NINGÚN ambiente, local/test/producción). `loyalty_cards.id` tiene 3 FKs
+  // entrantes (loyalty_points_ledger.card_id, loyalty_tier_history.card_id,
+  // loyalty_pending_enrollments.card_id_resultante) — un ALTER COLUMN TYPE integer→uuid con FKs
+  // vivas es frágil (hay que tumbar/recrear 3 constraints + la secuencia); con las tablas
+  // confirmadas vacías es más simple y seguro recrearlas desde cero y dejar que los
+  // `.sync({force:false})` de abajo las vuelvan a crear ya con el tipo nuevo. DOBLE candado antes
+  // de tocar nada: 1) solo corre si `loyalty_cards.id` TODAVÍA es integer (ya migrado → no-op,
+  // seguro de dejar corriendo para siempre en cada boot); 2) aborta sin tocar nada si encuentra
+  // UNA SOLA fila real en cualquiera de las 4 tablas (red de seguridad real, no solo confiar de
+  // palabra en que están vacías).
+  try {
+    const [idColRows] = await LoyaltyCard.sequelize.query(`
+      SELECT data_type FROM information_schema.columns
+      WHERE table_name = 'loyalty_cards' AND column_name = 'id'
+    `);
+    const idColInfo = idColRows[0];
+    if (idColInfo && idColInfo.data_type !== 'uuid') {
+      const [totalRows] = await LoyaltyCard.sequelize.query(`
+        SELECT
+          (SELECT COUNT(*) FROM loyalty_cards) +
+          (SELECT COUNT(*) FROM loyalty_points_ledger) +
+          (SELECT COUNT(*) FROM loyalty_tier_history) +
+          (SELECT COUNT(*) FROM loyalty_pending_enrollments) AS total
+      `);
+      const total = Number(totalRows[0]?.total ?? 0);
+      if (total > 0) {
+        console.warn(`[syncModels] loyalty_cards.id sigue siendo INTEGER pero hay ${total} fila(s) reales en las tablas relacionadas — NO se migra solo a UUID, requiere una migración manual con preservación de datos.`);
+      } else {
+        await LoyaltyCard.sequelize.query(`
+          DROP TABLE IF EXISTS loyalty_pending_enrollments CASCADE;
+          DROP TABLE IF EXISTS loyalty_tier_history CASCADE;
+          DROP TABLE IF EXISTS loyalty_points_ledger CASCADE;
+          DROP TABLE IF EXISTS loyalty_cards CASCADE;
+        `);
+        console.warn('[syncModels] loyalty_cards.id migrado a UUID: tablas relacionadas (confirmadas vacías) recreadas desde cero — loyalty_cards/loyalty_points_ledger/loyalty_tier_history/loyalty_pending_enrollments.');
+      }
+    }
+  } catch (e) {
+    console.warn('[syncModels] chequeo de migración UUID de loyalty_cards.id:', e.message);
+  }
+
   // Sistema de Lealtad — tablas nuevas (ver LoyaltyCard/LoyaltyPointsLedger/
   // LoyaltyTierHistory/LoyaltyAdjustmentReason.js), force:false para solo
   // crearlas si no existen. Orden por FK: cards y reasons antes que
@@ -734,6 +776,30 @@ async function syncModels() {
       ALTER COLUMN num_exterior     TYPE VARCHAR(100),
       ALTER COLUMN num_interior     TYPE VARCHAR(100)
   `).catch(e => console.warn('[syncModels] ALTER COLUMN enriquecimiento clientes.csv a tamaños más anchos:', e.message));
+
+  // Foto del cliente (2026-10-29) — columna nueva sobre loyalty_cards, que YA existía con datos
+  // reales: idempotente, mismo patrón que el resto de este archivo. Ver LoyaltyCard.js y
+  // drive-loyalty-foto.service.js (el binario vive en Drive, acá solo el link devuelto). Incluye
+  // también la revisión pendiente de altas creadas por el webhook de catálogo de clientes de Kore
+  // (ver loyalty-kore-cliente.service.js#_procesarAlta y loyalty-card.service.js#marcarRevisada).
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS foto_url             VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS revision_pendiente    BOOLEAN DEFAULT false,
+      ADD COLUMN IF NOT EXISTS revisado_por_id       VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS revisado_por_nombre   VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS revisado_at           TIMESTAMPTZ
+  `).catch(e => console.warn('[syncModels] ADD COLUMN foto_url (loyalty_cards):', e.message));
+
+  // Foto del cliente, render autenticado (2026-10-29, bug real corregido) — `foto_url` es el
+  // webViewLink de Drive (página visor, nunca embebible en un <img>); estas dos columnas permiten
+  // descargar el binario real y servirlo con su Content-Type correcto. Ver LoyaltyCard.js y
+  // loyalty-card.service.js#obtenerFoto.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS foto_drive_file_id VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS foto_mime_type      VARCHAR(100)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN foto_drive_file_id/foto_mime_type (loyalty_cards):', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };

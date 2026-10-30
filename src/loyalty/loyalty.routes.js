@@ -14,8 +14,10 @@
  * (PR2/PR3): este archivo solo valida permisos y hace el mapeo HTTP↔servicio.
  */
 const express = require('express');
+const multer  = require('multer');
 const { authenticate, permit } = require('../shared/middleware/auth');
 const { asyncHandler } = require('../shared/middleware/error-handler');
+const { BadRequestError } = require('../shared/errors/AppError');
 const { PERMISSIONS } = require('../shared/config/rbac');
 const cardService = require('./domains/cards/loyalty-card.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
@@ -23,10 +25,28 @@ const configService = require('./domains/config/loyalty-config.service');
 
 const router = express.Router();
 
+// Multer dedicado a la foto del cliente — mismo patrón que uploadFichaImagen en
+// bank.routes.js, sin el tipo application/pdf (acá siempre es una foto tomada con cámara).
+const uploadFotoCliente = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ok = /^image\/(jpeg|png|webp)$/.test(file.mimetype);
+    cb(ok ? null : new Error('Solo se aceptan imágenes (jpg/png/webp)'), ok);
+  },
+});
+
 // ── Tarjetas ──────────────────────────────────────────────────────────────────
 router.get('/cards', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
-  const { search, nivel, activa, origen, page, limit, sort, sortDir } = req.query;
-  res.json(await cardService.listar({ search, nivel, activa, origen, page, limit, sort, sortDir }));
+  const { search, nivel, activa, origen, page, limit, sort, sortDir, fechaAltaInicio, fechaAltaFin } = req.query;
+  const exportar = req.query.exportar === 'true';
+  const revisionPendiente = req.query.revisionPendiente === 'true'
+    ? true
+    : (req.query.revisionPendiente === 'false' ? false : undefined);
+  res.json(await cardService.listar({
+    search, nivel, activa, origen, page, limit, sort, sortDir,
+    exportar, fechaAltaInicio, fechaAltaFin, revisionPendiente,
+  }));
 }));
 
 router.post('/cards', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_CREAR), asyncHandler(async (req, res) => {
@@ -44,6 +64,14 @@ router.post('/cards', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_CREAR), 
 }));
 
 // ── Rutas estáticas ANTES que /:id para no colisionar con el parámetro ───────
+// Pendientes de revisión Kore (2026-10-29) — altas creadas por el webhook de catálogo de clientes
+// (`_procesarAlta` en loyalty-kore-cliente.service.js), marcadas `revisionPendiente: true`. Ruta
+// estática antes de 'GET /cards/:id' por el mismo criterio que movimientos/niveles/editar abajo.
+router.get('/cards/pendientes-revision-kore', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  const { page, limit, search } = req.query;
+  res.json(await cardService.listarPendientesRevisionKore({ page, limit, search }));
+}));
+
 router.get('/cards/:id/movimientos', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   const { page, limit } = req.query;
   res.json(await ledgerService.listarMovimientos(req.params.id, { page, limit }));
@@ -51,6 +79,19 @@ router.get('/cards/:id/movimientos', authenticate, permit(PERMISSIONS.LOYALTY_RE
 
 router.get('/cards/:id/niveles', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   res.json(await ledgerService.listarNiveles(req.params.id));
+}));
+
+// Reporte "Movimientos" (2026-10-29) — ledger completo del programa (todas las tarjetas), sin
+// paginar, para exportar/auditar. Mismo permiso que el resto de lectura de ledger (loyalty:read).
+// Ruta estática, agrupada junto al resto de rutas de /cards/:id/* de este dominio.
+router.get('/ledger/export', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  const {
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+  } = req.query;
+  const movimientos = await ledgerService.listarMovimientosGlobal({
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+  });
+  res.json({ movimientos });
 }));
 
 // Precarga del formulario de edición (2026-10-23) — trae los campos PII que `GET /cards/:id`
@@ -80,6 +121,33 @@ router.patch('/cards/:id', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDI
 
 router.post('/cards/:id/nip', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR), asyncHandler(async (req, res) => {
   res.json(await cardService.cambiarNip(req.params.id, req.user));
+}));
+
+// Foto del cliente (2026-10-29) — tomada con la cámara del dispositivo del staff, 100% capturada
+// en Numo (nunca viene de Kore). Mismo permiso que el PATCH de arriba (loyalty:tarjetas:editar).
+router.post('/cards/:id/foto', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR),
+  uploadFotoCliente.single('foto'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw new BadRequestError('No se recibió ningún archivo.');
+    res.json(await cardService.subirFoto(req.params.id, req.file, req.user));
+  }),
+);
+
+// GET /cards/:id/foto (2026-10-29) — binario autenticado de la foto del cliente, proxy hacia
+// Drive (bug real corregido: `fotoUrl` es el webViewLink de la página visor, nunca embebible en
+// un <img src>). Permiso loyalty:read (no loyalty:tarjetas:editar): ver la foto es lectura, mismo
+// criterio que GET /movements/:id/ficha/imagen en bank.routes.js (banks:read, no banks:ficha).
+router.get('/cards/:id/foto', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  const { data, mimetype } = await cardService.obtenerFoto(req.params.id);
+  res.set('Content-Type', mimetype || 'application/octet-stream');
+  res.set('Content-Disposition', 'inline; filename="foto"');
+  res.send(data);
+}));
+
+// Marcar como revisada (2026-10-29) — contraparte de GET /cards/pendientes-revision-kore de
+// arriba. Mismo permiso que el resto de edición de tarjeta (loyalty:tarjetas:editar).
+router.patch('/cards/:id/marcar-revisada', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_EDITAR), asyncHandler(async (req, res) => {
+  res.json(await cardService.marcarRevisada(req.params.id, req.user));
 }));
 
 router.put('/cards/:id/nivel', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_NIVEL), asyncHandler(async (req, res) => {
@@ -130,6 +198,25 @@ router.get('/config/especialidades', authenticate, permit(PERMISSIONS.LOYALTY_RE
 
 router.put('/config/especialidades', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json(await configService.guardarEspecialidades(req.body?.especialidades, req.user));
+}));
+
+// Foto de clientes (2026-10-29) — Folder ID de Drive consumido por drive-loyalty-foto.service.js,
+// gestionado desde acá por el mismo motivo que Especialidades arriba (sección 'lealtad' oculta del
+// riel genérico de Configuraciones Globales).
+router.get('/config/foto-folder', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ folderId: await configService.obtenerFotoFolderId() });
+}));
+
+router.put('/config/foto-folder', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ folderId: await configService.guardarFotoFolderId(req.body?.folderId, req.user) });
+}));
+
+// Historial de un valor de configuración de Lealtad (2026-10-29) — el audit log YA se escribe en
+// cada guardado (ver global-config.service.js#setValue), esto solo expone la UI para verlo desde
+// Lealtad sin pedirle config:manage al staff. Mismo permiso que YA gatea guardar estos valores
+// (LOYALTY_CONFIG), nunca el config:manage genérico de GET /api/config/:configId/audit.
+router.get('/config/historial/:clave', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.obtenerHistorial(req.params.clave));
 }));
 
 router.get('/reasons', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {

@@ -60,7 +60,7 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
   const puntos = Array.isArray(puntosRows) ? puntosRows : [];
 
   if (clientes.length === 0 && puntos.length === 0) {
-    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o puntos.pdf).');
+    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o reporteClientesPorVendedor.xlsx).');
   }
 
   // ── Agrupar clientes por tarjetaNormalizada (detecta duplicados) ─────────
@@ -98,6 +98,13 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
     const matchesPuntos = puntosPorTarjeta.get(key) ?? [];
     const tienePuntos = matchesPuntos.length > 0;
     const saldo = tienePuntos ? matchesPuntos[0].saldo : 0;
+    // Activo/Inactivo controlado por reporteClientesPorVendedor.xlsx (2026-10-29, pedido
+    // explícito del usuario): la sola PRESENCIA de la Tarjeta en ese reporte determina
+    // `activa`, sin importar el saldo (incluso 0) — reusa `tienePuntos`, que es exactamente esa
+    // señal de presencia. A diferencia de TODOS los demás campos de enriquecimiento (que solo
+    // rellenan si están vacíos, ver CAMPOS_ENRIQUECIMIENTO en loyalty-import-apply.service.js),
+    // este SÍ sobrescribe en cada corrida — incluidas tarjetas 'ya_migrada' (ver _aplicarFila).
+    const activaSugerida = tienePuntos;
 
     const advertencias = [];
     const info = [];
@@ -168,6 +175,7 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
       correo: c.correo ?? '',
       contacto,
       saldo,
+      activaSugerida,
       categoriaOriginal: c.categoriaOriginal ?? '',
       nivelSugerido,
       advertencias,
@@ -217,6 +225,9 @@ function construirConcentrado({ clientesRows, puntosRows } = {}) {
       correo: '',
       contacto: '',
       saldo: p.saldo,
+      // Huérfana de reporteClientesPorVendedor.xlsx: está en el reporte (es justo por eso que es
+      // huérfana, no tiene match en clientes.csv) → activa por definición.
+      activaSugerida: true,
       categoriaOriginal: null,
       nivelSugerido: NIVEL_DEFAULT,
       advertencias,

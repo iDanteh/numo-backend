@@ -7,8 +7,8 @@
  * usuario "MOSTRADOR 2026" (2026-10-29, pedido del usuario: "así lo quiero"),
  * con los depósitos agrupados por cliente:
  *
- *   mostrador   MOSTRADOR — un bloque por factura global (orden de fecha,
- *               todos los almacenes juntos): FECHA, DESCRIPCIÓN, IMPORTE,
+ *   mostrador   MOSTRADOR <serie> — una hoja por almacén (2026-10-30), un
+ *               bloque por factura global (orden de fecha): FECHA, DESCRIPCIÓN, IMPORTE,
  *               BANCO, REM, CLIENTE, ID NUMO, con los cobros en EFECTIVO /
  *               SALDO A FAVOR de Kore; al final, un bloque sin folio con los
  *               pendientes de generar factura.
@@ -95,14 +95,26 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
     }
     else globales.set(k, { ...f, depositos: [...f.depositos] });
   }
-  const bloquesGlobal = [...globales.values()]
-    .sort((a, b) => String(_diaMx(a.fechaFactura) ?? '').localeCompare(String(_diaMx(b.fechaFactura) ?? '')) || _folio(a).localeCompare(_folio(b)))
-    .map(f => _bloque({
-      tipo: 'global', serie: _serie(f.serie), sucursal: sucursalDe(_serie(f.serie)), factura: _folio(f),
-      fechaFactura: f.fechaFactura ?? null, totalFactura: f.totalFactura ?? null,
-    }, f.depositos.map(d => ({ ...d, factura: _folio(f) }))));
-  const mostrador = [...bloquesGlobal];
-  if (t.depositosPendientes.length) mostrador.push(_bloque({ tipo: 'pendiente', fecha: fechaFin }, t.depositosPendientes));
+  // Una hoja por almacén (2026-10-30, pedido del usuario: "mostrador A0,
+  // mostrador I0…"): la global va en el de su serie; un pendiente, en el de
+  // su remisión.
+  const mostradorPorSerie = new Map();
+  const almacenMostrador = serie => {
+    if (!mostradorPorSerie.has(serie)) mostradorPorSerie.set(serie, { globales: [], pendientes: [] });
+    return mostradorPorSerie.get(serie);
+  };
+  for (const f of globales.values()) almacenMostrador(_serie(f.serie)).globales.push(f);
+  for (const d of t.depositosPendientes) almacenMostrador(_serieDeposito(d)).pendientes.push(d);
+  const mostrador = [...mostradorPorSerie.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([serie, { globales: gs, pendientes }]) => {
+    const bloques = gs
+      .sort((a, b) => String(_diaMx(a.fechaFactura) ?? '').localeCompare(String(_diaMx(b.fechaFactura) ?? '')) || _folio(a).localeCompare(_folio(b)))
+      .map(f => _bloque({
+        tipo: 'global', serie, sucursal: sucursalDe(serie), factura: _folio(f),
+        fechaFactura: f.fechaFactura ?? null, totalFactura: f.totalFactura ?? null,
+      }, f.depositos.map(d => ({ ...d, factura: _folio(f) }))));
+    if (pendientes.length) bloques.push(_bloque({ tipo: 'pendiente', fecha: fechaFin, serie, sucursal: sucursalDe(serie) }, pendientes));
+    return { serie, sucursal: sucursalDe(serie), bloques };
+  });
 
   // ── REF. (por almacén) y FACT ESPECIALES ──────────────────────────────────
   const refPorSerie = new Map();
@@ -265,7 +277,11 @@ function agregarHojasSeccion(workbook, secciones, seccion) {
   const lista = seccion ? [seccion] : Object.keys(SECCIONES);
   let hojas = 0;
   for (const s of lista) {
-    if (s === 'mostrador' && agregarHojaMostrador(workbook, secciones.mostrador)) hojas++;
+    if (s === 'mostrador') {
+      for (const a of secciones.mostrador ?? []) {
+        if (agregarHojaMostrador(workbook, a.bloques, nombreHoja(`MOSTRADOR ${a.serie || 'SIN SERIE'}`, a.sucursal))) hojas++;
+      }
+    }
     if (s === 'ref') {
       for (const a of secciones.ref ?? []) {
         if (agregarHojaRef(workbook, a.bloques, nombreHoja(`REF. ${a.serie}`, a.sucursal))) hojas++;

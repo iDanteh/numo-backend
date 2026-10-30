@@ -30,6 +30,7 @@ const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
+const { cobrosEnOtraCaja } = require('./reportes-por-facturar.otra-caja');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -231,6 +232,14 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
     depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
     depositosEfectivoSinAsociar,
   };
+
+  // Remisiones cobradas en la caja de otro almacén (2026-10-30, "A0 COBRADAS EN PUERTO").
+  await onAvance('Cobros en la caja de otro almacén — consultando Kore…');
+  const otraCaja = await cobrosEnOtraCaja({ rfc, datos });
+  datos.cobrosOtraCaja = otraCaja.cobros;
+  if (otraCaja.sinRespuesta) {
+    advertencias.push(`Kore no respondió ${otraCaja.sinRespuesta} remisión(es) al buscar cobros en la caja de otro almacén — esa pestaña puede estar incompleta; vuelve a actualizarlo más tarde.`);
+  }
   return { sucursal, fechaFin, datos, resumen: _resumen(datos), advertencias: advertencias.length ? advertencias : null };
 }
 

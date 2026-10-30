@@ -229,3 +229,49 @@ describe('formasPagoDeCuentas', () => {
     expect(formasPagoDeCuentas([{ cobros: [{ monto: 10, formasPago: [{ claveSat: '01', monto: 10 }] }] }]).mixto).toBe(false);
   });
 });
+
+// 2026-10-30: 053049 (efectivo 15-oct, identificado el 19 contra A0-260902996,
+// quedó con $69.31 que se saldaron con un RET el 30-oct) → sale en PENDIENTE
+// GENERAR FACTURA del reporte del 30, no en el de días sin liquidación.
+describe('depósitos anteriores liquidados dentro del rango', () => {
+  const dep053049 = {
+    _id: 'b053049', folio: '053049', banco: 'BBVA', fecha: new Date('2026-10-15T12:00:00Z'), concepto: 'DEPOSITO EN EFECTIVO', deposito: 1663.32,
+    primeraIdentificacionAt: new Date('2026-10-19T16:40:42Z'),
+    erpLinks: [{ serie: 'A0', folioExterno: '260902996', folioFiscal: null, saldoActual: 69.31, saldoPagado: 1663.32, tipoPago: 'PPD' }],
+  };
+  beforeEach(() => {
+    // 1ª consulta (entraron en el rango): nada; 2ª (anteriores con saldo): el 053049.
+    BankMovement.find.mockReset()
+      .mockReturnValueOnce({ lean: async () => [] })
+      .mockReturnValueOnce({ lean: async () => [dep053049] });
+    erp.obtenerDesglosesCobroAlmacen.mockResolvedValue([{ serieVenta: 'A0', folioVenta: '260902996', fechaCreacion: '2026-09-18T19:28:00Z' }]);
+    erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'JUAN ANTONIO LUIS', tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', saldoActual: 0, factura: null, liquidadaEl: new Date('2026-10-30T17:24:14Z') });
+  });
+
+  test('liquidada el 30-oct → sale en el reporte del 30', async () => {
+    const { depositos, depositosConSaldo } = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-30', incluirIdentificados: true });
+    expect(depositos.map(d => [d.idNumo, d.importe, d.cliente, d.remisiones])).toEqual([['053049', 1663.32, 'JUAN ANTONIO LUIS', ['A0-260902996']]]);
+    expect(depositos[0].liquidadaEl).toEqual(new Date('2026-10-30T17:24:14Z'));
+    expect(depositosConSaldo).toEqual([]);
+    // Busca anteriores hasta 120 días antes, solo vínculos que dejaron saldo.
+    const filtro = BankMovement.find.mock.calls[1][0];
+    expect(filtro.fecha.$lt).toEqual(new Date('2026-10-30T00:00:00.000Z'));
+    expect(filtro.erpLinks.$elemMatch.saldoActual).toEqual({ $gt: 0.005 });
+  });
+
+  test('no sale en un rango donde no se liquidó, ni si todavía debe', async () => {
+    let r = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-28', incluirIdentificados: true });
+    expect(r.depositos).toEqual([]);
+    BankMovement.find.mockReset().mockReturnValueOnce({ lean: async () => [] }).mockReturnValueOnce({ lean: async () => [dep053049] });
+    erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'JUAN ANTONIO LUIS', tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', saldoActual: 69.31, factura: null, liquidadaEl: null });
+    r = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-30', incluirIdentificados: true });
+    expect(r.depositos).toEqual([]);
+    expect(r.depositosConSaldo).toEqual([]);
+  });
+
+  test('la póliza (sin incluirIdentificados) no busca anteriores', async () => {
+    BankMovement.find.mockReset().mockReturnValue({ lean: async () => [] });
+    await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-30' });
+    expect(BankMovement.find).toHaveBeenCalledTimes(1);
+  });
+});

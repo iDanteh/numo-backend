@@ -228,3 +228,32 @@ describe('secciones y Excel por pestaña', () => {
     await expect(service.excel(3, 'otra')).rejects.toThrow();
   });
 });
+
+// 2026-10-30: remisión A0-260804937 repartida en 3 facturas el 30-oct → el
+// encabezado de la global dice en qué otras facturas también quedó.
+test('refacturada: encabezado con las otras facturas de sus mismas remisiones', async () => {
+  const ExcelJS = require('exceljs');
+  gen._uuidsPorFechaEfectiva.mockImplementation(async ({ fechaInicio }) => new Set(fechaInicio === '2026-10-20' ? [GLOBAL] : []));
+  CFDI.find.mockImplementation(q => (q.documentosRelacionados
+    ? lean([
+      { serie: 'A0', folio: '261015291', documentosRelacionados: [{ Serie: 'A0', Folio: '260804937' }] },
+      { serie: 'A0', folio: '261015312', documentosRelacionados: [{ Serie: 'A0', Folio: '260804937' }] },
+      { serie: 'A0', folio: '261009872', documentosRelacionados: [{ Serie: 'A0', Folio: '260804937' }] },
+    ])
+    : lean([{ uuid: GLOBAL, serie: 'A0', folio: '261009872', fecha: '2026-10-20T17:22:35Z', total: 12896.62, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' }])));
+  mostrador.detectarMovimientosMostrador.mockResolvedValue([{ uuid: GLOBAL, serie: 'A0', folio: '261009872', esGlobal: true, fechaFactura: '2026-10-20T17:22:35Z',
+    depositos: [{ fecha: '2026-09-03T00:00:00Z', importe: 59997.42, aplicado: 59997.42, remisiones: ['A0-260804937'], cliente: 'TIBURCIO GARCIA CRUZ', idNumo: '1', ppdPorFacturar: true }] }]);
+  await generarYEsperar({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20' }, { dbId: '5' });
+
+  const filtro = CFDI.find.mock.calls.map(c => c[0]).find(q => q.documentosRelacionados);
+  expect(filtro.documentosRelacionados.$elemMatch.$or).toEqual([{ Serie: 'A0', Folio: '260804937' }]);
+  expect(terminado().datos.movimientosMostrador[0].otrasFacturas).toEqual(['A0-261015291', 'A0-261015312']);
+
+  ReportePorFacturar.findByPk.mockResolvedValue({ id: 7, toJSON: () => ({ id: 7, sucursal: 'CEDIS', fechaInicio: '2026-10-20', fechaFin: '2026-10-20', datos: terminado().datos }) });
+  const bloque = (await service.obtener(7)).secciones.mostrador.flatMap(a => a.bloques).find(b => b.tipo === 'global');
+  expect(bloque).toMatchObject({ factura: 'A0-261009872', otrasFacturas: ['A0-261015291', 'A0-261015312'] });
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load((await service.excel(7, 'mostrador')).buffer);
+  const ws = wb.worksheets.find(w => w.name.startsWith('MOSTRADOR A0'));
+  expect(ws.getRow(1).getCell(2).value).toBe('TAMBIÉN FACTURADA EN: A0-261015291, A0-261015312');
+});

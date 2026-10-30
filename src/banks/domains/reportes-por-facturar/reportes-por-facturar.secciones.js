@@ -90,8 +90,10 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
     const k = String(f.uuid ?? _folio(f)).toUpperCase();
     if (globales.has(k)) {
       // Un depósito de Bancos (ID NUMO) no se repite en el bloque.
-      const ya = new Set(globales.get(k).depositos.map(d => String(d.idNumo ?? '')).filter(id => id && id !== 'S/R'));
-      globales.get(k).depositos.push(...f.depositos.filter(d => !ya.has(String(d.idNumo ?? ''))));
+      const g = globales.get(k);
+      const ya = new Set(g.depositos.map(d => String(d.idNumo ?? '')).filter(id => id && id !== 'S/R'));
+      g.depositos.push(...f.depositos.filter(d => !ya.has(String(d.idNumo ?? ''))));
+      if (f.otrasFacturas?.length) g.otrasFacturas = [...new Set([...(g.otrasFacturas ?? []), ...f.otrasFacturas])].sort();
     }
     else globales.set(k, { ...f, depositos: [...f.depositos] });
   }
@@ -111,6 +113,8 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
       .map(f => _bloque({
         tipo: 'global', serie, sucursal: sucursalDe(serie), factura: _folio(f),
         fechaFactura: f.fechaFactura ?? null, totalFactura: f.totalFactura ?? null,
+        // Refacturada (2026-10-30): las otras facturas de sus mismas remisiones.
+        otrasFacturas: f.otrasFacturas ?? [],
       }, f.depositos.map(d => ({ ...d, factura: _folio(f) }))));
     if (pendientes.length) bloques.push(_bloque({ tipo: 'pendiente', fecha: fechaFin, serie, sucursal: sucursalDe(serie) }, pendientes));
     return { serie, sucursal: sucursalDe(serie), bloques };
@@ -224,7 +228,7 @@ function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.ho
   for (const b of bloques) {
     _escribirBloque(ws, {
       encabezados: [b.tipo === 'global'
-        ? [_fecha(b.fechaFactura, true), null, null, null, b.serie, b.factura, 'ID NUMO']
+        ? [_fecha(b.fechaFactura, true), b.otrasFacturas?.length ? `TAMBIÉN FACTURADA EN: ${b.otrasFacturas.join(', ')}` : null, null, null, b.serie, b.factura, 'ID NUMO']
         : [_fecha(b.fecha), 'PENDIENTE GENERAR FACTURA', null, null, null, null, 'ID NUMO']],
       columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE', null],
       grupos: b.grupos,

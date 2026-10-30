@@ -51,3 +51,23 @@ test('Kore no responde → cuenta las remisiones sin respuesta', async () => {
   erp.obtenerDesglosesCobroAlmacen.mockRejectedValue(new Error('429'));
   expect(await cobrosEnOtraCaja({ rfc: 'X', datos })).toEqual({ cobros: [], sinRespuesta: 2 });
 });
+
+// 2026-10-30: forma de pago por renglón; mixto con sus importes; totales sin
+// contar dos veces y DEPÓSITO EN EFECTIVO aparte del EFECTIVO.
+test('forma de pago del renglón y totales por forma', () => {
+  const { formaPagoDe, totalesPorForma, armarSecciones } = require('./reportes-por-facturar.secciones');
+  expect(formaPagoDe({ importe: 100, formasPago: { efectivo: 100 } })).toEqual({ texto: 'EFECTIVO', partes: { efectivo: 100 } });
+  expect(formaPagoDe({ importe: 1000, formasPago: { transferencia: 900, efectivo: 300 } })).toEqual({
+    texto: 'MIXTO: EFECTIVO $300.00 + TRANSFERENCIA $900.00', partes: { efectivo: 250, transferencia: 750 },
+  });
+  expect(formaPagoDe({ importe: 50, deKore: true, banco: 'EFECTIVO' }).partes).toEqual({ efectivo: 50 });
+  expect(formaPagoDe({ importe: 50, deKore: true, banco: 'SALDO A FAVOR' }).texto).toBe('SALDO A FAVOR / OTRAS');
+  expect(formaPagoDe({ importe: 50 }).texto).toBe('—');
+
+  const s = armarSecciones({ depositosPendientesPago: [
+    { importe: 200, formasPago: { depositoEfectivo: 200 }, remisiones: ['A0-1'], cliente: 'X' },
+    { importe: 100, formasPago: { efectivo: 100 }, remisiones: ['A0-2'], cliente: 'Y' },
+  ] });
+  expect(s.ficha.grupos[0].depositos[0].formaPago).toBe('DEPÓSITO EN EFECTIVO');
+  expect(totalesPorForma([s.ficha])).toMatchObject({ efectivo: 100, depositoEfectivo: 200 });
+});

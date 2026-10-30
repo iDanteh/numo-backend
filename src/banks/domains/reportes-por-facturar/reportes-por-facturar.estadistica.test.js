@@ -7,6 +7,7 @@ jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacen: jest.fn(), obtenerCuentaTicket: jest.fn() }));
+jest.mock('./EstadisticaPorFacturarFoto.model', () => ({ findOneAndUpdate: jest.fn(), updateOne: jest.fn(async () => ({})), findOne: jest.fn(), find: jest.fn() }));
 jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ lean: async () => [] })), bulkWrite: jest.fn(async () => ({})) }));
 
 const CFDI = require('../../../visor/models/CFDI');
@@ -14,6 +15,7 @@ const BankMovement = require('../banks/BankMovement.model');
 const centros = require('../centros-costo/centros-costo.service');
 const erp = require('../erp/erp-sync.service');
 const est = require('./reportes-por-facturar.estadistica');
+const Foto = require('./EstadisticaPorFacturarFoto.model');
 
 const lean = v => ({ select: () => ({ lean: async () => v }) });
 const dep = (folio, fecha, importe, links, extra = {}) => ({ folio, fecha: new Date(`${fecha}T00:00:00Z`), deposito: importe, concepto: `DEP ${folio}`, banco: 'BBVA', erpLinks: links, ...extra });
@@ -102,4 +104,45 @@ test('segundo plano + Excel con RESUMEN, DÍA A DÍA, FACTURADOS y FALTAN', asyn
   expect(wb.worksheets.map(w => w.name)).toEqual(['RESUMEN', 'DÍA A DÍA', 'FACTURADOS', 'FALTAN']);
   expect(wb.getWorksheet('FACTURADOS').rowCount).toBe(3);
   expect(wb.getWorksheet('FALTAN').getRow(2).getCell(7).value).toBe('CLIENTE A02');
+});
+
+// 2026-10-30: el mes en curso se guarda y se ve al instante al entrar.
+describe('mes en curso ya calculado', () => {
+  const mes = () => { const hoy = new Date(Date.now() - 6 * 3600000).toISOString().slice(0, 10); return { fechaInicio: `${hoy.slice(0, 8)}01`, fechaFin: hoy }; };
+  const conFoto = foto => Foto.findOneAndUpdate.mockReturnValue({ lean: async () => foto });
+
+  test('sin foto → arranca el cálculo y la guarda', async () => {
+    conFoto({ rfc: 'R' });
+    const r = await est.fotoActual('R');
+    expect(r).toMatchObject({ resultado: null, calculando: true });
+    await est._esperarFotos();
+    const [filtro, { $set }] = Foto.updateOne.mock.calls[0];
+    expect(filtro).toEqual({ rfc: 'R', centroCostoId: null });
+    expect($set).toMatchObject({ ...mes(), error: null });
+    expect($set.resultado.totales).toBeDefined();
+  });
+
+  test('foto reciente del mes → se regresa al instante, sin recalcular', async () => {
+    conFoto({ rfc: 'R', ...mes(), resultado: { totales: { x: 1 } }, calculadoEn: new Date() });
+    const r = await est.fotoActual('R', '2');
+    expect(r).toMatchObject({ resultado: { totales: { x: 1 } }, calculando: false });
+    expect(Foto.findOneAndUpdate.mock.calls[0][0]).toEqual({ rfc: 'R', centroCostoId: 2 });
+    expect(BankMovement.find).not.toHaveBeenCalled();
+  });
+
+  test('foto vieja → se muestra y se recalcula; de otro mes no se muestra', async () => {
+    conFoto({ rfc: 'R', ...mes(), resultado: { viejo: true }, calculadoEn: new Date(Date.now() - 2 * 3600000) });
+    expect(await est.fotoActual('R')).toMatchObject({ resultado: { viejo: true }, calculando: true });
+    await est._esperarFotos();
+    conFoto({ rfc: 'R', fechaInicio: '2020-01-01', resultado: { otroMes: true }, calculadoEn: new Date() });
+    expect(await est.fotoActual('R')).toMatchObject({ resultado: null, calculando: true });
+    await est._esperarFotos();
+  });
+
+  test('cron: solo las abiertas en los últimos 7 días', async () => {
+    Foto.find.mockReturnValue({ select: () => ({ lean: async () => [{ rfc: 'R', centroCostoId: null }, { rfc: 'R', centroCostoId: 1 }] }) });
+    expect(await est.recalcularFotosEnUso()).toBe(2);
+    expect(Foto.find.mock.calls[0][0].consultadaEn.$gte).toBeInstanceOf(Date);
+    expect(Foto.updateOne).toHaveBeenCalledTimes(2);
+  });
 });

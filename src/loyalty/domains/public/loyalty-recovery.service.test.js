@@ -326,7 +326,7 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
 
     const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
 
-    expect(resultado).toEqual({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1234.5 });
+    expect(resultado).toEqual({ nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 1234.5 });
     expect(generarNip).not.toHaveBeenCalled();
     expect(card.update).toHaveBeenCalledWith({
       recuperacionCodigoHash: null,
@@ -430,7 +430,7 @@ describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEven
     compararCodigo.mockResolvedValue(true);
 
     await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).resolves.toEqual({
-      nombre: 'Ana', nivel: 'Plata', saldoPuntos: 100,
+      nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 100,
     });
   });
 });

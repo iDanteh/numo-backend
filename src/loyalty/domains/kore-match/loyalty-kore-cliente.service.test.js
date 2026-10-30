@@ -60,20 +60,20 @@ describe('procesarClienteKore — validación de entrada', () => {
 });
 
 describe('procesarClienteKore — evento alta', () => {
-  test('teléfono nuevo: crea tarjeta vía crearTarjeta() y persiste koreClienteId/koreMonedero', async () => {
+  test('teléfono nuevo sin monedero: crea tarjeta vía crearTarjeta() y persiste solo koreClienteId', async () => {
     LoyaltyCard.findOne.mockResolvedValueOnce(null); // no existe por teléfono
     const nueva = card({ id: 42, telefono: '5551234567' });
     crearTarjeta.mockResolvedValue({ card: nueva, nip: '7777' });
 
     const resultado = await procesarClienteKore({
-      evento: 'alta', koreClienteId: 'K1', monedero: 'M1', telefono: '5551234567', nombre: 'Juan Pérez',
+      evento: 'alta', koreClienteId: 'K1', telefono: '5551234567', nombre: 'Juan Pérez',
     });
 
     expect(crearTarjeta).toHaveBeenCalledWith(
       { telefono: '5551234567', nombre: 'Juan Pérez' },
       expect.objectContaining({ dbId: 'kore-webhook' }),
     );
-    expect(nueva.update).toHaveBeenCalledWith({ koreClienteId: 'K1', koreMonedero: 'M1' });
+    expect(nueva.update).toHaveBeenCalledWith({ koreClienteId: 'K1', revisionPendiente: true });
     expect(resultado).toEqual({ ok: true, evento: 'alta', cardId: 42, creada: true });
   });
 
@@ -86,24 +86,6 @@ describe('procesarClienteKore — evento alta', () => {
     });
 
     expect(JSON.stringify(resultado)).not.toContain('9999');
-  });
-
-  test('monedero faltante al crear una tarjeta nueva -> BadRequestError (400), no crea nada', async () => {
-    LoyaltyCard.findOne.mockResolvedValueOnce(null);
-
-    await expect(
-      procesarClienteKore({ evento: 'alta', koreClienteId: 'K1', telefono: '5551234567', nombre: 'Juan Pérez' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(crearTarjeta).not.toHaveBeenCalled();
-  });
-
-  test('monedero vacío ("") al crear una tarjeta nueva -> BadRequestError (400)', async () => {
-    LoyaltyCard.findOne.mockResolvedValueOnce(null);
-
-    await expect(
-      procesarClienteKore({ evento: 'alta', koreClienteId: 'K1', monedero: '  ', telefono: '5551234567', nombre: 'Juan Pérez' }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(crearTarjeta).not.toHaveBeenCalled();
   });
 
   test('teléfono ya existente SIN monedero: no exige monedero (es una actualización, no una creación)', async () => {
@@ -123,11 +105,11 @@ describe('procesarClienteKore — evento alta', () => {
     LoyaltyCard.findOne.mockResolvedValueOnce(existente);
 
     const resultado = await procesarClienteKore({
-      evento: 'alta', koreClienteId: 'K2', monedero: 'M2', telefono: '5551234567', nombre: 'Juan Pérez',
+      evento: 'alta', koreClienteId: 'K2', telefono: '5551234567', nombre: 'Juan Pérez',
     });
 
     expect(crearTarjeta).not.toHaveBeenCalled();
-    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ koreClienteId: 'K2', koreMonedero: 'M2' }));
+    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ koreClienteId: 'K2' }));
     expect(resultado).toEqual({ ok: true, evento: 'actualizacion', cardId: 10, creada: false });
   });
 
@@ -142,17 +124,17 @@ describe('procesarClienteKore — evento alta', () => {
 });
 
 describe('procesarClienteKore — evento actualizacion', () => {
-  test('encuentra por koreClienteId y actualiza nombre/koreMonedero', async () => {
+  test('encuentra por koreClienteId y actualiza nombre', async () => {
     const existente = card({ id: 20, koreClienteId: 'K9' });
     LoyaltyCard.findOne.mockResolvedValueOnce(existente);
 
     const resultado = await procesarClienteKore({
-      evento: 'actualizacion', koreClienteId: 'K9', monedero: 'M9', telefono: '5551234567', nombre: 'Nombre Nuevo',
+      evento: 'actualizacion', koreClienteId: 'K9', telefono: '5551234567', nombre: 'Nombre Nuevo',
     });
 
     expect(LoyaltyCard.findOne).toHaveBeenCalledWith({ where: { koreClienteId: 'K9' } });
     expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({
-      nombre: 'Nombre Nuevo', koreMonedero: 'M9',
+      nombre: 'Nombre Nuevo',
     }));
     expect(resultado).toEqual({ ok: true, evento: 'actualizacion', cardId: 20, creada: false });
   });

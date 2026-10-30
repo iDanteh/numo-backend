@@ -172,7 +172,7 @@ describe('lockout por tarjeta (D7): 5 fallos consecutivos → 15 min bloqueada',
     compararNip.mockResolvedValue(true);
 
     const resultado = await consultaPublica(TELEFONO, NIP_REAL);
-    expect(resultado.nombre).toBe('Ana');
+    expect(resultado.nombre).toBe('Ana García López');
   });
 });
 
@@ -197,14 +197,14 @@ describe('éxito — resetea el contador y responde el payload mínimo', () => {
     expect(card.update).not.toHaveBeenCalled();
   });
 
-  test('responde solo primer nombre, nivel y saldoPuntos — nunca teléfono/nipHash/createdBy', async () => {
+  test('responde solo nombre completo, nivel y saldoPuntos — nunca teléfono/nipHash/createdBy', async () => {
     const card = makeCard();
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararNip.mockResolvedValue(true);
 
     const resultado = await consultaPublica(TELEFONO, NIP_REAL);
 
-    expect(resultado).toEqual({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: '150.00' });
+    expect(resultado).toEqual({ nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: '150.00' });
     expect(resultado.telefono).toBeUndefined();
     expect(resultado.nipHash).toBeUndefined();
     expect(resultado.createdById).toBeUndefined();

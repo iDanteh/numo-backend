@@ -23,6 +23,7 @@ const { sequelize } = require('../../../config/database.postgres');
 const {
   LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
   LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+  ConfigSection, GlobalConfig,
 } = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
 const globalConfigService = require('../../../shared/services/global-config.service');
@@ -135,6 +136,61 @@ async function guardarEspecialidades(lista, user) {
     tipo: 'lista', usuarioId, usuarioNombre,
   });
   return limpia;
+}
+
+/**
+ * FOTO_CLIENTE_FOLDER_ID (2026-10-29) — Folder ID de Drive consumido por
+ * `drive-loyalty-foto.service.js#folderId()`. Mismo mecanismo que los % y
+ * ESPECIALIDADES (`GlobalConfig` sección `lealtad`), `tipo: 'texto'` (igual
+ * que FICHAS_IMAGEN_FOLDER_ID en `seed-global-config-banks.js`) porque es un
+ * string simple, no una lista. Gestionado DESDE acá (loyalty:config/
+ * loyalty:read) en vez del `config:manage` genérico, mismo criterio que
+ * ESPECIALIDADES arriba — la sección 'lealtad' está oculta del riel genérico
+ * de Configuraciones Globales a propósito (ver config-admin.component.ts).
+ */
+async function obtenerFotoFolderId() {
+  const valor = await globalConfigService.getValue(SECTION, 'FOTO_CLIENTE_FOLDER_ID').catch(() => null);
+  return valor === null ? '' : String(valor).trim();
+}
+
+/** Puede quedar vacío ("no configurado") — `drive-loyalty-foto.service.js#folderId()` ya rechaza
+ *  explícito si al momento de subir una foto el valor sigue vacío. Acá no se valida formato de
+ *  Drive ID: el admin puede pegar la URL completa y recortarla después, no hay forma confiable de
+ *  distinguir un ID válido de uno inventado sin llamar a la API de Drive. */
+async function guardarFotoFolderId(valor, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const limpio = String(valor ?? '').trim();
+  await globalConfigService.setValue(SECTION, 'FOTO_CLIENTE_FOLDER_ID', limpio, {
+    tipo: 'texto', usuarioId, usuarioNombre,
+  });
+  return limpio;
+}
+
+/**
+ * Historial de cambios de UN valor de configuración de Lealtad (% por nivel,
+ * ESPECIALIDADES, FOTO_CLIENTE_FOLDER_ID — cualquier `clave` de la sección
+ * `lealtad`). El audit log YA existe para cada guardado (`ConfigAuditLog`, ver
+ * `global-config.service.js#setValue`) — acá solo se resuelve `sectionClave +
+ * clave` a la fila `GlobalConfig` (mismo criterio que `setValue` usa
+ * internamente para encontrar/crear esa fila) y se delega el armado del
+ * historial a `listAuditLog(configId)` TAL CUAL, sin duplicar su lógica.
+ *
+ * Gateada por `loyalty:config` en la ruta (PR4/8) — nunca por el `config:manage`
+ * genérico, mismo criterio que el resto de esta pantalla (D10).
+ *
+ * Si la clave nunca se guardó (no existe fila todavía en `GlobalConfig`), no
+ * hay nada que auditar: se devuelve `[]` en vez de tirar error (ej. un admin
+ * nuevo abre "Ver historial" de FOTO_CLIENTE_FOLDER_ID antes de haberlo
+ * configurado nunca).
+ */
+async function obtenerHistorial(clave) {
+  const section = await ConfigSection.findOne({ where: { clave: SECTION } });
+  if (!section) return [];
+
+  const config = await GlobalConfig.findOne({ where: { sectionId: section.id, clave } });
+  if (!config) return [];
+
+  return globalConfigService.listAuditLog(config.id);
 }
 
 /**
@@ -482,6 +538,9 @@ module.exports = {
   guardarPorcentajes,
   obtenerEspecialidades,
   guardarEspecialidades,
+  obtenerFotoFolderId,
+  guardarFotoFolderId,
+  obtenerHistorial,
   listarReasons,
   crearReason,
   editarReason,

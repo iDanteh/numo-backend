@@ -15,7 +15,7 @@ const { Transaction, Op } = require('sequelize');
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard:             { findByPk: jest.fn() },
-  LoyaltyPointsLedger:     { create: jest.fn(), findAndCountAll: jest.fn(), findOne: jest.fn() },
+  LoyaltyPointsLedger:     { create: jest.fn(), findAndCountAll: jest.fn(), findOne: jest.fn(), findAll: jest.fn() },
   LoyaltyTierHistory:      { findAll: jest.fn() },
   LoyaltyAdjustmentReason: { findByPk: jest.fn() },
   CentroCosto:             { findByPk: jest.fn() },
@@ -685,6 +685,101 @@ describe('listarMovimientos / listarNiveles', () => {
     const result = await ledgerService.listarNiveles(1);
     expect(result).toHaveLength(1);
     expect(LoyaltyTierHistory.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: { cardId: 1 } }));
+  });
+});
+
+describe('listarMovimientosGlobal — reporte "Movimientos" (2026-10-29)', () => {
+  beforeEach(() => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([{ id: 1 }]);
+  });
+
+  test('sin filtros: where vacío, include de card/reason/centroCosto, order createdAt DESC', async () => {
+    const resultado = await ledgerService.listarMovimientosGlobal();
+
+    expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith({
+      where: {},
+      include: [
+        { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
+        { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
+        { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+      ],
+      order: [['createdAt', 'DESC']],
+    });
+    expect(resultado).toEqual([{ id: 1 }]);
+  });
+
+  test('sin paginación: nunca manda limit/offset a findAll', async () => {
+    await ledgerService.listarMovimientosGlobal({});
+
+    const args = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(args).not.toHaveProperty('limit');
+    expect(args).not.toHaveProperty('offset');
+  });
+
+  test('fechaInicio/fechaFin acotan createdAt (Op.gte/Op.lte), fin de día inclusivo', async () => {
+    await ledgerService.listarMovimientosGlobal({ fechaInicio: '2026-10-01', fechaFin: '2026-10-29' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.createdAt[Op.gte]).toEqual(new Date('2026-10-01'));
+    expect(where.createdAt[Op.lte]).toEqual(new Date('2026-10-29T23:59:59.999Z'));
+  });
+
+  test('tipo comma-separated → Op.in con los valores del enum', async () => {
+    await ledgerService.listarMovimientosGlobal({ tipo: 'ACUMULACION,CANJE' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.tipo[Op.in]).toEqual(['ACUMULACION', 'CANJE']);
+  });
+
+  test('un solo tipo sin coma también resuelve a Op.in', async () => {
+    await ledgerService.listarMovimientosGlobal({ tipo: 'AJUSTE' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.tipo[Op.in]).toEqual(['AJUSTE']);
+  });
+
+  test('nivelAplicado filtra directo', async () => {
+    await ledgerService.listarMovimientosGlobal({ nivelAplicado: 'Oro' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.nivelAplicado).toBe('Oro');
+  });
+
+  test('origen filtra la columna PROPIA del ledger (manual|migracion|kore), no el origen derivado de cards', async () => {
+    await ledgerService.listarMovimientosGlobal({ origen: 'kore' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.origen).toBe('kore');
+  });
+
+  test('reasonId filtra directo', async () => {
+    await ledgerService.listarMovimientosGlobal({ reasonId: 7 });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.reasonId).toBe(7);
+  });
+
+  test('usuarioNombre usa Op.iLike de substring (mismo criterio que search de cards)', async () => {
+    await ledgerService.listarMovimientosGlobal({ usuarioNombre: 'Ana' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.usuarioNombre[Op.iLike]).toBe('%Ana%');
+  });
+
+  test('puntosMin/puntosMax acotan la columna puntos con signo (Op.gte/Op.lte)', async () => {
+    await ledgerService.listarMovimientosGlobal({ puntosMin: -50, puntosMax: 100 });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.puntos[Op.gte]).toBe(-50);
+    expect(where.puntos[Op.lte]).toBe(100);
+  });
+
+  test('solo puntosMin, sin puntosMax → solo agrega Op.gte', async () => {
+    await ledgerService.listarMovimientosGlobal({ puntosMin: 10 });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.puntos[Op.gte]).toBe(10);
+    expect(where.puntos[Op.lte]).toBeUndefined();
   });
 });
 

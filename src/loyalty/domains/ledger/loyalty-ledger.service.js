@@ -507,12 +507,83 @@ async function listarNiveles(cardId) {
   return LoyaltyTierHistory.findAll({ where: { cardId }, order: [['at', 'DESC']] });
 }
 
+/**
+ * Reporte "Movimientos" (2026-10-29, pedido explícito del usuario): ledger GLOBAL del programa
+ * (todas las tarjetas), sin paginar — mismo criterio que `listarPendientes({exportar:true})` en
+ * loyalty-import-apply.service.js: es un reporte completo para exportar/auditar, no una vista
+ * paginada de UI.
+ *
+ * `origen` acá es la columna PROPIA de `LoyaltyPointsLedger` ('manual'|'migracion'|'kore',
+ * resuelta en `_aplicarMovimiento`) — NO confundir con el `origen` DERIVADO ('kore'|'numo' vía
+ * `createdById`) de `loyalty-card.service.js#listar()`: mismos nombres de valor, columnas y
+ * semánticas completamente distintas sobre modelos distintos.
+ */
+async function listarMovimientosGlobal(filtros = {}) {
+  const {
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+  } = filtros;
+
+  const where = {};
+
+  if (fechaInicio || fechaFin) {
+    where.createdAt = {};
+    // Mismo criterio que loyalty-card.service.js#listar (fechaAltaInicio/Fin): sin helper de
+    // rango de fechas compartido en el backend, Op.gte/Op.lte directos sobre createdAt,
+    // fechaFin como fin de día UTC para no cortar movimientos del mismo día.
+    if (fechaInicio) where.createdAt[Op.gte] = new Date(fechaInicio);
+    if (fechaFin)    where.createdAt[Op.lte] = new Date(`${fechaFin}T23:59:59.999Z`);
+  }
+
+  if (tipo) {
+    // Comma-separated: "ACUMULACION,CANJE" → Op.in. Valores fuera del enum del modelo
+    // (ACUMULACION/CANJE/AJUSTE/MIGRACION) simplemente no matchean ninguna fila.
+    const tipos = String(tipo).split(',').map((t) => t.trim()).filter(Boolean);
+    if (tipos.length) where.tipo = { [Op.in]: tipos };
+  }
+
+  if (nivelAplicado) where.nivelAplicado = nivelAplicado;
+  if (origen) where.origen = origen;
+  if (reasonId) where.reasonId = reasonId;
+
+  if (usuarioNombre) {
+    // Mismo criterio que `search` en loyalty-card.service.js#listar: ILIKE de substring.
+    where.usuarioNombre = { [Op.iLike]: `%${String(usuarioNombre).trim()}%` };
+  }
+
+  // `puntos` es columna CON SIGNO (+ abona, - descuenta — ver comentario del modelo
+  // LoyaltyPointsLedger#puntos). puntosMin/puntosMax filtran sobre ese valor firmado tal cual,
+  // nunca sobre su valor absoluto (ej. puntosMin=-50 incluye ajustes negativos desde -50 en
+  // adelante, no "al menos 50 puntos en cualquier dirección").
+  if (puntosMin !== undefined && puntosMin !== null && puntosMin !== '') {
+    where.puntos = { ...(where.puntos ?? {}), [Op.gte]: Number(puntosMin) };
+  }
+  if (puntosMax !== undefined && puntosMax !== null && puntosMax !== '') {
+    where.puntos = { ...(where.puntos ?? {}), [Op.lte]: Number(puntosMax) };
+  }
+
+  return LoyaltyPointsLedger.findAll({
+    where,
+    include: [
+      { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
+      { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
+      // Discrepancia con el enunciado: CentroCosto NO tiene columna `nombre` (ver
+      // shared/models/postgres/CentroCosto.js) — el nombre de la sucursal vive en `sucursal`.
+      // `attributes: ['nombre']` tal cual rompería contra Postgres real (columna inexistente);
+      // se trae la columna real `sucursal` pero se alias-ea como `nombre` en el resultado para
+      // no romper el contrato de API ya acordado con el frontend (`centroCosto.nombre`).
+      { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+    ],
+    order: [['createdAt', 'DESC']],
+  });
+}
+
 module.exports = {
   registrarAcumulacion,
   registrarCanje,
   registrarAjuste,
   listarMovimientos,
   listarNiveles,
+  listarMovimientosGlobal,
   _aplicarMovimiento,
   // Exportados para loyalty-kore-venta.service.js (webhook Kore de venta, 2026-10-26) — mismo
   // mecanismo de resolución de sucursal por Serie-Folio, sin duplicar la lógica.

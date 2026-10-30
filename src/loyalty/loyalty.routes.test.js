@@ -29,6 +29,10 @@ jest.mock('./domains/cards/loyalty-card.service', () => ({
   editarTarjeta: jest.fn(),
   cambiarNip: jest.fn(),
   cambiarNivel: jest.fn(),
+  subirFoto: jest.fn(),
+  obtenerFoto: jest.fn(),
+  listarPendientesRevisionKore: jest.fn(),
+  marcarRevisada: jest.fn(),
 }));
 jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
   registrarAcumulacion: jest.fn(),
@@ -36,10 +40,15 @@ jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
   registrarAjuste: jest.fn(),
   listarMovimientos: jest.fn(),
   listarNiveles: jest.fn(),
+  listarMovimientosGlobal: jest.fn(),
 }));
 jest.mock('./domains/config/loyalty-config.service', () => ({
   obtenerPorcentajes: jest.fn(),
   guardarPorcentajes: jest.fn(),
+  obtenerEspecialidades: jest.fn(),
+  guardarEspecialidades: jest.fn(),
+  obtenerFotoFolderId: jest.fn(),
+  guardarFotoFolderId: jest.fn(),
   listarReasons: jest.fn(),
   crearReason: jest.fn(),
   editarReason: jest.fn(),
@@ -71,6 +80,10 @@ function perms(...list) {
 let app;
 beforeEach(() => {
   jest.clearAllMocks();
+  // Default sano para la matriz de permisos genérica de abajo — a diferencia del resto de rutas
+  // mockeadas (que solo hacen res.json(await ...), inofensivo con undefined), GET /cards/:id/foto
+  // desestructura { data, mimetype } del resultado.
+  cardService.obtenerFoto.mockResolvedValue({ data: Buffer.from('img'), mimetype: 'image/png' });
   app = express();
   app.use(express.json());
   app.use('/', router);
@@ -80,18 +93,26 @@ beforeEach(() => {
 describe('matriz de permisos — independencia (specs/loyalty-permissions)', () => {
   const casos = [
     { metodo: 'get',   ruta: '/cards',                    permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'get',   ruta: '/cards/pendientes-revision-kore', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'patch', ruta: '/cards/1/marcar-revisada',  permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
     { metodo: 'post',  ruta: '/cards',                     permiso: PERMISSIONS.LOYALTY_TARJETAS_CREAR, body: { telefono: '5512345678', nombre: 'Ana' } },
     { metodo: 'get',   ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/1/movimientos',       permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/1/niveles',           permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'get',   ruta: '/ledger/export',             permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR, body: { nombre: 'Ana' } },
     { metodo: 'post',  ruta: '/cards/1/nip',                permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
+    { metodo: 'get',   ruta: '/cards/1/foto',               permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/cards/1/nivel',              permiso: PERMISSIONS.LOYALTY_TARJETAS_NIVEL, body: { nivel: 'Plata' } },
     { metodo: 'post',  ruta: '/cards/1/acumulaciones',      permiso: PERMISSIONS.LOYALTY_MOVIMIENTOS, body: { montoVenta: 100, serieFolio: 'A0-123' } },
     { metodo: 'post',  ruta: '/cards/1/canjes',             permiso: PERMISSIONS.LOYALTY_MOVIMIENTOS, body: { puntos: 10, serieFolio: 'A0-123' } },
     { metodo: 'post',  ruta: '/cards/1/ajustes',            permiso: PERMISSIONS.LOYALTY_AJUSTES, body: { puntos: 10, reasonId: 1, justificacion: 'bono' } },
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
+    { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
+    { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { folderId: 'abc123' } },
     { metodo: 'get',   ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'post',  ruta: '/reasons',                    permiso: PERMISSIONS.LOYALTY_CONFIG, body: { clave: 'x', nombre: 'x' } },
     { metodo: 'patch', ruta: '/reasons/1',                  permiso: PERMISSIONS.LOYALTY_CONFIG, body: { activo: false } },
@@ -199,6 +220,56 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(ledgerService.listarMovimientos).toHaveBeenCalledWith('42', expect.any(Object));
   });
 
+  // Reporte "Movimientos" (2026-10-29).
+  test('GET /ledger/export pasa los filtros de query a listarMovimientosGlobal y responde { movimientos }', async () => {
+    ledgerService.listarMovimientosGlobal.mockResolvedValue([{ id: 1 }, { id: 2 }]);
+
+    const res = await request(app).get(
+      '/ledger/export?fechaInicio=2026-10-01&fechaFin=2026-10-29&tipo=ACUMULACION,CANJE'
+      + '&nivelAplicado=Oro&origen=kore&reasonId=7&usuarioNombre=Ana&puntosMin=-50&puntosMax=100',
+    ).set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ movimientos: [{ id: 1 }, { id: 2 }] });
+    expect(ledgerService.listarMovimientosGlobal).toHaveBeenCalledWith({
+      fechaInicio: '2026-10-01', fechaFin: '2026-10-29', tipo: 'ACUMULACION,CANJE',
+      nivelAplicado: 'Oro', origen: 'kore', reasonId: '7', usuarioNombre: 'Ana',
+      puntosMin: '-50', puntosMax: '100',
+    });
+  });
+
+  // Reporte "Tarjetas" (2026-10-29).
+  test('GET /cards pasa exportar/fechaAlta/revisionPendiente al servicio', async () => {
+    cardService.listar.mockResolvedValue({ total: 0, cards: [] });
+
+    const res = await request(app).get(
+      '/cards?exportar=true&fechaAltaInicio=2026-10-01&fechaAltaFin=2026-10-29&revisionPendiente=true',
+    ).set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(cardService.listar).toHaveBeenCalledWith(expect.objectContaining({
+      exportar: true, fechaAltaInicio: '2026-10-01', fechaAltaFin: '2026-10-29', revisionPendiente: true,
+    }));
+  });
+
+  test('GET /cards con revisionPendiente=false pasa false explícito (no undefined)', async () => {
+    cardService.listar.mockResolvedValue({ total: 0, cards: [] });
+
+    await request(app).get('/cards?revisionPendiente=false').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(cardService.listar).toHaveBeenCalledWith(expect.objectContaining({ revisionPendiente: false }));
+  });
+
+  test('GET /cards sin exportar ni revisionPendiente: exportar=false, revisionPendiente=undefined', async () => {
+    cardService.listar.mockResolvedValue({ total: 0, cards: [] });
+
+    await request(app).get('/cards').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(cardService.listar).toHaveBeenCalledWith(expect.objectContaining({
+      exportar: false, revisionPendiente: undefined,
+    }));
+  });
+
   test('PUT /config/porcentajes llama a guardarPorcentajes', async () => {
     configService.guardarPorcentajes.mockResolvedValue({ Bronce: 1 });
     const res = await request(app).put('/config/porcentajes')
@@ -217,6 +288,34 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(ledgerService.registrarAjuste).toHaveBeenCalledWith(
       { cardId: '1', puntos: '20.00', reasonId: 10, justificacion: 'ajuste manual' },
       expect.any(Object),
+    );
+  });
+
+  test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {
+    configService.obtenerFotoFolderId.mockResolvedValue('abc123');
+    const res = await request(app).get('/config/foto-folder').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ folderId: 'abc123' });
+    expect(configService.obtenerFotoFolderId).toHaveBeenCalled();
+  });
+
+  test('PUT /config/foto-folder llama a guardarFotoFolderId con folderId y el usuario', async () => {
+    configService.guardarFotoFolderId.mockResolvedValue('nuevo-id');
+    const res = await request(app).put('/config/foto-folder')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ folderId: 'nuevo-id' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ folderId: 'nuevo-id' });
+    expect(configService.guardarFotoFolderId).toHaveBeenCalledWith('nuevo-id', expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /cards/pendientes-revision-kore pasa search al servicio', async () => {
+    cardService.listarPendientesRevisionKore.mockResolvedValue({ total: 0, cards: [] });
+    const res = await request(app).get('/cards/pendientes-revision-kore?search=juan')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(cardService.listarPendientesRevisionKore).toHaveBeenCalledWith(
+      expect.objectContaining({ search: 'juan' }),
     );
   });
 
@@ -295,5 +394,131 @@ describe('wiring hacia los servicios (happy path)', () => {
       .send({ esPuntos: true });
     expect(res.status).toBe(200);
     expect(configService.actualizarFormaPagoKore).toHaveBeenCalledWith('1', { esPuntos: true });
+  });
+});
+
+// POST /cards/:id/foto (2026-10-29) — foto del cliente, 100% capturada en Numo (cámara del
+// staff). Mismo criterio de test que POST /movements/:id/ficha/imagen en bank.routes.test.js:
+// requiere .attach() (multipart), separado de la matriz de permisos de arriba (esa manda JSON).
+describe('POST /cards/:id/foto', () => {
+  test('responde 403 sin loyalty:tarjetas:editar', async () => {
+    const res = await request(app)
+      .post('/cards/1/foto')
+      .attach('foto', Buffer.from('fake-image'), { filename: 'foto.png', contentType: 'image/png' })
+      .set(perms());
+
+    expect(res.status).toBe(403);
+    expect(cardService.subirFoto).not.toHaveBeenCalled();
+  });
+
+  test('loyalty:read NO sustituye a loyalty:tarjetas:editar', async () => {
+    const res = await request(app)
+      .post('/cards/1/foto')
+      .attach('foto', Buffer.from('fake-image'), { filename: 'foto.png', contentType: 'image/png' })
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(403);
+    expect(cardService.subirFoto).not.toHaveBeenCalled();
+  });
+
+  test('responde 400 si no se envía ningún archivo', async () => {
+    const res = await request(app)
+      .post('/cards/1/foto')
+      .set(perms(PERMISSIONS.LOYALTY_TARJETAS_EDITAR));
+
+    expect(res.status).toBe(400);
+    expect(cardService.subirFoto).not.toHaveBeenCalled();
+  });
+
+  test('con archivo y permiso, delega en cardService.subirFoto con el archivo recibido', async () => {
+    cardService.subirFoto.mockResolvedValue({ id: 1, fotoUrl: 'https://drive/file-1' });
+
+    const res = await request(app)
+      .post('/cards/1/foto')
+      .attach('foto', Buffer.from('fake-image'), { filename: 'foto.png', contentType: 'image/png' })
+      .set(perms(PERMISSIONS.LOYALTY_TARJETAS_EDITAR));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: 1, fotoUrl: 'https://drive/file-1' });
+    expect(cardService.subirFoto).toHaveBeenCalledTimes(1);
+    const [id, file] = cardService.subirFoto.mock.calls[0];
+    expect(id).toBe('1');
+    expect(file.originalname).toBe('foto.png');
+    expect(file.mimetype).toBe('image/png');
+    expect(Buffer.isBuffer(file.buffer)).toBe(true);
+  });
+});
+
+// GET /cards/:id/foto (2026-10-29) — bug real corregido: card.fotoUrl es el webViewLink de la
+// página visor de Drive, nunca embebible en un <img src>. Este proxy autenticado sirve el binario
+// real. Permiso loyalty:read (no loyalty:tarjetas:editar) — ver la foto es lectura, mismo criterio
+// que GET /movements/:id/ficha/imagen en bank.routes.js (banks:read, no banks:ficha).
+describe('GET /cards/:id/foto', () => {
+  test('responde 403 sin loyalty:read', async () => {
+    const res = await request(app).get('/cards/1/foto').set(perms());
+
+    expect(res.status).toBe(403);
+    expect(cardService.obtenerFoto).not.toHaveBeenCalled();
+  });
+
+  test('con loyalty:read, sirve el binario con el Content-Type correcto', async () => {
+    cardService.obtenerFoto.mockResolvedValue({ data: Buffer.from('contenido-binario'), mimetype: 'image/png' });
+
+    const res = await request(app).get('/cards/1/foto').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(res.body).toEqual(Buffer.from('contenido-binario'));
+    expect(cardService.obtenerFoto).toHaveBeenCalledWith('1');
+  });
+
+  test('sin mimetype guardado, cae a application/octet-stream', async () => {
+    cardService.obtenerFoto.mockResolvedValue({ data: Buffer.from('x'), mimetype: null });
+
+    const res = await request(app).get('/cards/1/foto').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('application/octet-stream');
+  });
+});
+
+// GET /cards/pendientes-revision-kore + PATCH /cards/:id/marcar-revisada (2026-10-29) — altas del
+// webhook de catálogo de clientes de Kore marcadas `revisionPendiente: true`
+// (loyalty-kore-cliente.service.js#_procesarAlta).
+describe('GET /cards/pendientes-revision-kore', () => {
+  test('exige loyalty:read y delega en listarPendientesRevisionKore', async () => {
+    cardService.listarPendientesRevisionKore.mockResolvedValue({ total: 0, page: 1, limit: 50, pages: 0, cards: [] });
+
+    const sinPermiso = await request(app).get('/cards/pendientes-revision-kore').set(perms());
+    expect(sinPermiso.status).toBe(403);
+
+    const res = await request(app).get('/cards/pendientes-revision-kore').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ total: 0, page: 1, limit: 50, pages: 0, cards: [] });
+    expect(cardService.listarPendientesRevisionKore).toHaveBeenCalledWith(
+      expect.objectContaining({ page: undefined, limit: undefined }),
+    );
+  });
+
+  test('ruta estática: no la captura GET /cards/:id (obtener no se llama)', async () => {
+    cardService.listarPendientesRevisionKore.mockResolvedValue({ total: 0, page: 1, limit: 50, pages: 0, cards: [] });
+
+    await request(app).get('/cards/pendientes-revision-kore').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(cardService.obtener).not.toHaveBeenCalled();
+  });
+});
+
+describe('PATCH /cards/:id/marcar-revisada', () => {
+  test('exige loyalty:tarjetas:editar, no loyalty:read', async () => {
+    cardService.marcarRevisada.mockResolvedValue({ id: 42, revisionPendiente: false });
+
+    const sinPermiso = await request(app).patch('/cards/42/marcar-revisada').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(sinPermiso.status).toBe(403);
+
+    const res = await request(app).patch('/cards/42/marcar-revisada').set(perms(PERMISSIONS.LOYALTY_TARJETAS_EDITAR));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ id: 42, revisionPendiente: false });
+    expect(cardService.marcarRevisada).toHaveBeenCalledWith('42', expect.objectContaining({ dbId: '1' }));
   });
 });

@@ -98,7 +98,8 @@ const LoyaltyPendingEnrollment = sequelize.define('LoyaltyPendingEnrollment', {
     allowNull: true,
   },
   cardIdResultante: {
-    type:       DataTypes.INTEGER,
+    // UUID (2026-10-29) — coincide con el tipo de loyalty_cards.id, ver LoyaltyCard.js.
+    type:       DataTypes.UUID,
     allowNull:  true,
     references: { model: 'loyalty_cards', key: 'id' },
     onDelete:   'SET NULL',

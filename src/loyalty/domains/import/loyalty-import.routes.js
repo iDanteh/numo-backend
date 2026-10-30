@@ -8,10 +8,11 @@
  * permiso angosto y exclusivo de admin `loyalty:importar` (rbac.js).
  *
  * SOLO expone la previsualización/concentrado (lectura, sin I/O a base de
- * datos): sube clientes.csv y/o puntos.pdf, los parsea y cruza, y devuelve el
- * reporte para revisión humana. Aplicar la migración (crear tarjetas/ledger)
- * queda fuera de alcance — es un paso posterior, una vez decidido el mapeo
- * Categoria→Nivel (ver loyalty-import.service.js).
+ * datos): sube clientes.csv y/o reporteClientesPorVendedor.xlsx (reemplaza a
+ * puntos.pdf desde 2026-10-29), los parsea y cruza, y devuelve el reporte para
+ * revisión humana. Aplicar la migración (crear tarjetas/ledger) queda fuera de
+ * alcance — es un paso posterior, una vez decidido el mapeo Categoria→Nivel
+ * (ver loyalty-import.service.js).
  *
  * Multer — nota sobre "dos instancias": el patrón de referencia
  * (bank.routes.js `upload`/`uploadFichaImagen`) usa dos instancias de multer,
@@ -30,7 +31,7 @@ const { authenticate, permit } = require('../../../shared/middleware/auth');
 const { asyncHandler } = require('../../../shared/middleware/error-handler');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 const { BadRequestError } = require('../../../shared/errors/AppError');
-const { parseClientesCsv, parsePuntosPdf, parseCorreccionesXlsx } = require('./loyalty-import.parser');
+const { parseClientesCsv, parseVendedorXlsx, parseCorreccionesXlsx } = require('./loyalty-import.parser');
 const { construirConcentrado } = require('./loyalty-import.service');
 const applyService = require('./loyalty-import-apply.service');
 const { iniciarMatchKoreJob, obtenerEstadoMatchKoreJob } = require('../kore-match/loyalty-kore-match.service');
@@ -49,8 +50,11 @@ const upload = multer({
       return cb(ok ? null : new Error('El campo "clientes" solo acepta archivos .csv'), ok);
     }
     if (file.fieldname === 'puntos') {
-      const ok = /\.pdf$/i.test(file.originalname) || file.mimetype === 'application/pdf';
-      return cb(ok ? null : new Error('El campo "puntos" solo acepta archivos .pdf'), ok);
+      // Reemplaza a puntos.pdf (2026-10-29, pedido explícito del usuario) — el campo/nombre
+      // 'puntos' se deja sin tocar para no ensanchar el diff (FormData/multer/rutas), solo
+      // cambia qué tipo de archivo acepta.
+      const ok = /\.xlsx$/i.test(file.originalname);
+      return cb(ok ? null : new Error('El campo "puntos" solo acepta archivos .xlsx'), ok);
     }
     cb(new Error(`Campo de archivo inesperado: "${file.fieldname}"`), false);
   },
@@ -83,14 +87,14 @@ router.post('/concentrado', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), 
   const puntosFile = req.files?.puntos?.[0];
 
   if (!clientesFile && !puntosFile) {
-    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o puntos.pdf).');
+    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o reporteClientesPorVendedor.xlsx).');
   }
   if (clientesFile && clientesFile.size > MAX_CLIENTES_BYTES) {
     throw new BadRequestError('clientes.csv supera el tamaño máximo permitido (15MB).');
   }
 
   const clientesRows = clientesFile ? await parseClientesCsv(clientesFile.buffer) : [];
-  const puntosRows = puntosFile ? await parsePuntosPdf(puntosFile.buffer) : [];
+  const puntosRows = puntosFile ? await parseVendedorXlsx(puntosFile.buffer) : [];
 
   res.json(construirConcentrado({ clientesRows, puntosRows }));
 }));
@@ -113,14 +117,14 @@ router.post('/aplicar', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), uplo
   const puntosFile = req.files?.puntos?.[0];
 
   if (!clientesFile && !puntosFile) {
-    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o puntos.pdf).');
+    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o reporteClientesPorVendedor.xlsx).');
   }
   if (clientesFile && clientesFile.size > MAX_CLIENTES_BYTES) {
     throw new BadRequestError('clientes.csv supera el tamaño máximo permitido (15MB).');
   }
 
   const clientesRows = clientesFile ? await parseClientesCsv(clientesFile.buffer) : [];
-  const puntosRows = puntosFile ? await parsePuntosPdf(puntosFile.buffer) : [];
+  const puntosRows = puntosFile ? await parseVendedorXlsx(puntosFile.buffer) : [];
 
   const confirmar = req.query.confirmar === 'true';
   if (!confirmar) {
@@ -171,8 +175,8 @@ router.post('/correcciones', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR),
 
 // GET /api/loyalty/import/pendientes
 router.get('/pendientes', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
-  const { page, limit, exportar } = req.query;
-  res.json(await applyService.listarPendientes({ page, limit, exportar: exportar === 'true' }));
+  const { page, limit, exportar, search } = req.query;
+  res.json(await applyService.listarPendientes({ page, limit, exportar: exportar === 'true', search }));
 }));
 
 // POST /api/loyalty/import/pendientes/:id/completar

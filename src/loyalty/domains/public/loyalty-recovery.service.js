@@ -252,8 +252,9 @@ async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
   await card.update(CODIGO_CONSUMIDO);
   _registrarEvento('confirmacion_codigo', 'exito', null, card.telefono, ctx.ip);
 
-  const primerNombre = String(card.nombre ?? '').trim().split(/\s+/)[0] ?? '';
-  return { nombre: primerNombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos };
+  // Nombre completo (2026-10-29, pedido explícito del usuario) — antes solo el primer nombre
+  // (`primerNombre`); `card.nombre` ya es el combinado "Nombre Apellidos", no hace falta concatenar.
+  return { nombre: card.nombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos };
 }
 
 module.exports = { solicitarCodigo, confirmarCodigoConsulta, RecoveryFailedError };

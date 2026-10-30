@@ -4,8 +4,7 @@ const ExcelJS = require('exceljs');
 const {
   normalizarTarjeta,
   parseClientesCsv,
-  parsePuntosLines,
-  parsePuntosPdf,
+  parseVendedorXlsx,
   parseCorreccionesXlsx,
 } = require('./loyalty-import.parser');
 
@@ -152,119 +151,81 @@ describe('parseClientesCsv', () => {
   });
 });
 
-describe('parsePuntosLines', () => {
-  // Formato REAL extraído con pdf-parse (verificado a mano contra puntos.pdf,
-  // 2026-10-19): a diferencia de pdfplumber, pdf-parse NO preserva espacios
-  // entre columnas — todo queda concatenado: <rowIndex><tarjeta><nombre><saldo>.
-  // Estas líneas son copia literal de `data.text` para las filas 1, 12 y 19
-  // del reporte real, con el encabezado/pie de página real intercalado (sin
-  // espacios tampoco, p. ej. "TarjetaNombreSaldo" y "1 de 3919/10/2026...").
-  const PAGINA_EJEMPLO = [
-    'Firefoxhttps://www.clubtuberos.com/app/clubtuberos.php',
-    'Club Tuberos',
-    'Hidalgo 1120 Centro',
-    'Oaxaca Oaxaca MEXICO',
-    'Teléfono (951)5021340',
-    'Saldos Totales',
-    'TarjetaNombreSaldo',
-    '199999900CLIENTE PRUEBA2 no borrar238,620',
-    '29005DIEGO OCTAVIO CRUZ BAUTISTA11,802',
-    '35919MAXIMILIANO OJEDA CARRILLO11,560',
-    '48606JONATAN JUAREZ MENDOZA10,786',
-    '5448EMILIO HERNANDEZ JOSE10,219',
-    '68102ARELI MENDEZ HERNANDEZ9,715',
-    '71188CAYETANO GARCIA SANTIAGO9,376',
-    '87186ADOLFO JULIO SANTIAGO JIMENEZ9,053',
-    '910110ALIER SANTILLAN SANPEDRO8,941',
-    '106820ORIOLDO VELASCO VARGAS7,861',
-    '117471DIEGO ENRICO PLA ACEVEDO7,748',
-    '12044RAYMUNDO JAVIER RICARDEZ MORALES7,703',
-    '135779JOSE LUIS CRISOSTOMO PEDRO7,432',
-    '149171ALBINO MARTINEZ CORTES7,096',
-    '158609ISRAEL RODOLFO MARTINEZ RUIZ6,838',
-    '169477DANIELA DIAZ GONZALEZ6,611',
-    '177923ALBERTO RAFAEL CORTES PEREZ5,961',
-    '186430ALEJANDRO VASQUEZ GARCIA5,162',
-    '19CF-3615CRISTINA DIAZ GUTIERREZ5,134',
-    'Firefoxhttps://www.clubtuberos.com/app/clubtuberos.php',
-    '1 de 3919/10/2026, 09:40 a.m.',
-  ].join('\n');
+describe('parseVendedorXlsx', () => {
+  // Fila 1 = título del reporte, fila 2 = vacía, fila 3 = encabezados reales —
+  // calcado de la estructura real de reporteClientesPorVendedor.xlsx.
+  async function vendedorBuffer(rows, { headers = ['Tarjeta', 'Cliente', 'Vendedor', 'Fecha de registro', 'Saldo'] } = {}) {
+    const workbook = new ExcelJS.Workbook();
+    const ws = workbook.addWorksheet('Clientes por Vendedor');
+    ws.addRow(['Clientes por vendedor registrados del 1999-12-31 al 2026-10-29']);
+    ws.addRow([]);
+    ws.addRow(headers);
+    rows.forEach((r) => ws.addRow(r));
+    return workbook.xlsx.writeBuffer();
+  }
 
-  test('extrae solo las filas de datos, descartando encabezado/pie de página', () => {
-    const resultado = parsePuntosLines(PAGINA_EJEMPLO);
-
-    expect(resultado).toHaveLength(19);
-  });
-
-  test('extrae tarjeta/nombre/saldo correctamente pese a la falta de espacios entre columnas', () => {
-    const resultado = parsePuntosLines(PAGINA_EJEMPLO);
-    const prueba = resultado[0];
-    const raymundo = resultado.find((f) => f.nombre.includes('RICARDEZ MORALES'));
-    const cristina = resultado.find((f) => f.nombre.includes('GUTIERREZ'));
-
-    expect(prueba).toEqual(expect.objectContaining({
-      tarjetaRaw: '99999900',
-      tarjetaNormalizada: '99999900',
-      nombre: 'CLIENTE PRUEBA2 no borrar',
-      saldo: 238620,
-    }));
-
-    expect(raymundo).toEqual(expect.objectContaining({
-      tarjetaRaw: '044',
-      tarjetaNormalizada: '44',
-      nombre: 'RAYMUNDO JAVIER RICARDEZ MORALES',
-      saldo: 7703,
-    }));
-
-    expect(cristina).toEqual(expect.objectContaining({
-      tarjetaRaw: 'CF-3615',
-      tarjetaNormalizada: 'CF-3615',
-      nombre: 'CRISTINA DIAZ GUTIERREZ',
-      saldo: 5134,
-    }));
-  });
-
-  test('saldo cero (sin coma de miles) se parsea como número, no se descarta', () => {
-    // Confirmado real al final del reporte: "...JIMENEZ0" (fila con saldo 0,
-    // sin coma de miles porque es menor a 1000).
-    const texto = '159145WILLIAMS RAMIREZ JIMENEZ0';
-
-    const resultado = parsePuntosLines(texto);
-
-    expect(resultado).toEqual([
-      expect.objectContaining({ tarjetaRaw: '59145', nombre: 'WILLIAMS RAMIREZ JIMENEZ', saldo: 0 }),
+  test('extrae Tarjeta/Cliente/Saldo saltando el título y la fila vacía', async () => {
+    const buffer = await vendedorBuffer([
+      ['016', 'PORFIRIO ANTONIO TRUJILLO MORALES', 'WANDA VIRGINIA ZUNIGA', '2015-02-18', 14.31],
+      [9277, 'ARMANDO FAUSTINO LOPEZCUEVAS', 'LUZ ELENA', '2015-02-18', 89.15],
     ]);
+
+    const filas = await parseVendedorXlsx(buffer);
+
+    expect(filas).toHaveLength(2);
+    expect(filas[0]).toEqual({ tarjetaRaw: '016', tarjetaNormalizada: '16', nombre: 'PORFIRIO ANTONIO TRUJILLO MORALES', saldo: 14.31 });
+    expect(filas[1]).toEqual({ tarjetaRaw: '9277', tarjetaNormalizada: '9277', nombre: 'ARMANDO FAUSTINO LOPEZCUEVAS', saldo: 89.15 });
   });
 
-  test('se resincroniza solo: una línea ajena entre filas no rompe el conteo secuencial', () => {
-    const texto = [
-      '199999900CLIENTE PRUEBA2 no borrar238,620',
-      'Firefoxhttps://www.clubtuberos.com/app/clubtuberos.php', // no empieza con "2" → se descarta sin avanzar
-      '29005DIEGO OCTAVIO CRUZ BAUTISTA11,802',
-    ].join('\n');
+  test('Tarjeta con tipo mixto (string con ceros a la izquierda vs número puro) normaliza igual', async () => {
+    const buffer = await vendedorBuffer([
+      ['044', 'UNO', 'V', '2020-01-01', 10],
+      [44, 'DOS', 'V', '2020-01-01', 20],
+    ]);
 
-    const resultado = parsePuntosLines(texto);
+    const filas = await parseVendedorXlsx(buffer);
 
-    expect(resultado).toHaveLength(2);
-    expect(resultado[1].nombre).toBe('DIEGO OCTAVIO CRUZ BAUTISTA');
+    expect(filas[0].tarjetaNormalizada).toBe('44');
+    expect(filas[1].tarjetaNormalizada).toBe('44');
   });
 
-  test('ignora líneas en blanco', () => {
-    const texto = `\n\n${PAGINA_EJEMPLO}\n\n`;
-    const resultado = parsePuntosLines(texto);
+  test('saldo con decimales reales no se trunca (a diferencia del viejo parser de puntos.pdf)', async () => {
+    const buffer = await vendedorBuffer([['7152', 'INES GERARDO GARCIA HERNANDEZ', 'IVAN NUNEZ', '2015-02-18', 0]]);
 
-    expect(resultado).toHaveLength(19);
+    const [fila] = await parseVendedorXlsx(buffer);
+
+    expect(fila.saldo).toBe(0);
+  });
+
+  test('descarta únicamente las filas completamente vacías', async () => {
+    const buffer = await vendedorBuffer([
+      ['016', 'UNO', 'V', '2020-01-01', 10],
+      [],
+    ]);
+
+    const filas = await parseVendedorXlsx(buffer);
+
+    expect(filas).toHaveLength(1);
+  });
+
+  test('match de encabezado case-insensitive', async () => {
+    const buffer = await vendedorBuffer(
+      [['044', 'ANA', 'V', '2020-01-01', 100]],
+      { headers: ['tarjeta', 'cliente', 'vendedor', 'fecha de registro', 'SALDO'] },
+    );
+
+    const [fila] = await parseVendedorXlsx(buffer);
+
+    expect(fila).toEqual({ tarjetaRaw: '044', tarjetaNormalizada: '44', nombre: 'ANA', saldo: 100 });
+  });
+
+  test('columnas faltantes: lanza un error 400 nombrándolas', async () => {
+    const buffer = await vendedorBuffer([['016', 'UNO', 'V', '2020-01-01', 10]], { headers: ['Tarjeta', 'Cliente'] });
+
+    await expect(parseVendedorXlsx(buffer)).rejects.toMatchObject({ statusCode: 400 });
   });
 });
 
-// NOTA DE ORDEN: este describe debe ir ANTES de 'parsePuntosPdf' — ese test hace
-// jest.resetModules() + require('./loyalty-import.parser') a mano para mockear 'pdf-parse',
-// lo que fuerza una SEGUNDA carga de 'exceljs' (vía el nuevo require del módulo) en el mismo
-// proceso de Jest. 'exceljs' usa 'readable-stream' internamente, y dos instancias del mismo
-// paquete de streams cargadas en el mismo proceso rompen `instanceof`/estado interno de los
-// streams ("Cannot read properties of undefined (reading 'objectMode')") para CUALQUIER uso
-// posterior de ExcelJS en este archivo de test. Verificado a mano: corriendo este describe antes
-// no hay colisión; después sí.
 describe('parseCorreccionesXlsx', () => {
   async function xlsxBuffer(headers, rows) {
     const workbook = new ExcelJS.Workbook();
@@ -335,27 +296,5 @@ describe('parseCorreccionesXlsx', () => {
     const buffer = await xlsxBuffer(['Tarjeta', 'Nombre'], [['9005', 'UNO']]);
 
     await expect(parseCorreccionesXlsx(buffer)).rejects.toMatchObject({ statusCode: 400 });
-  });
-});
-
-describe('parsePuntosPdf', () => {
-  test('delega en parsePuntosLines sobre el texto extraído por pdf-parse', async () => {
-    jest.resetModules();
-    jest.doMock('pdf-parse', () => jest.fn().mockResolvedValue({
-      text: '1CF-3615CRISTINA DIAZ GUTIERREZ5,134',
-    }), { virtual: true });
-
-    const { parsePuntosPdf: parsePuntosPdfMockeado } = require('./loyalty-import.parser');
-    const resultado = await parsePuntosPdfMockeado(Buffer.from('contenido-no-usado'));
-
-    expect(resultado).toHaveLength(1);
-    expect(resultado[0]).toEqual(expect.objectContaining({
-      tarjetaNormalizada: 'CF-3615',
-      nombre: 'CRISTINA DIAZ GUTIERREZ',
-      saldo: 5134,
-    }));
-
-    jest.dontMock('pdf-parse');
-    jest.resetModules();
   });
 });

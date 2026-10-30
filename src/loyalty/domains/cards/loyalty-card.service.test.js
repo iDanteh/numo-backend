@@ -14,7 +14,9 @@ jest.mock('../../../shared/models/postgres', () => {
   // `unscoped()` devuelve el MISMO mock (no un modelo scoped real) a propósito: alcanza para que
   // los tests de `obtenerParaEditar` mockeen `LoyaltyCard.findByPk` como cualquier otro test de
   // este archivo, sin duplicar el mock de Sequelize.
-  const LoyaltyCard = { findOne: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findAndCountAll: jest.fn() };
+  const LoyaltyCard = {
+    findOne: jest.fn(), findByPk: jest.fn(), create: jest.fn(), findAndCountAll: jest.fn(), findAll: jest.fn(),
+  };
   LoyaltyCard.unscoped = jest.fn(() => LoyaltyCard);
   return {
     LoyaltyCard,
@@ -24,9 +26,14 @@ jest.mock('../../../shared/models/postgres', () => {
 jest.mock('../../../config/database.postgres', () => ({
   sequelize: { transaction: jest.fn() },
 }));
+jest.mock('./drive-loyalty-foto.service', () => ({
+  subirFotoCliente: jest.fn(),
+  descargarFotoCliente: jest.fn(),
+}));
 
 const { LoyaltyCard, LoyaltyTierHistory } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
+const { subirFotoCliente, descargarFotoCliente } = require('./drive-loyalty-foto.service');
 const cardService = require('./loyalty-card.service');
 
 function makeCard(overrides = {}) {
@@ -433,5 +440,249 @@ describe('listar — filtro por origen (2 fuentes: proceso existente de Numo vs.
     const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
     const grupos = where[Sequelize.Op.and];
     expect(grupos).toHaveLength(2); // grupo de origen + grupo de search, ninguno pisó al otro
+  });
+});
+
+// subirFoto (2026-10-29) — foto del cliente, 100% capturada en Numo. `subirFotoCliente`
+// (drive-loyalty-foto.service.js) se mockea completo: la lógica de Drive en sí ya se prueba en
+// drive-loyalty-foto.service.test.js, acá solo se cubre el wiring (nombre de archivo, guardado
+// del link, quién/cuándo) — mismo criterio que bank.service.js#adjuntarImagenFicha.
+describe('subirFoto', () => {
+  test('tarjeta inexistente → 404, no sube nada a Drive', async () => {
+    LoyaltyCard.findByPk.mockResolvedValue(null);
+
+    await expect(
+      cardService.subirFoto(999, { buffer: Buffer.from('img'), mimetype: 'image/png', originalname: 'foto.png' }, USER),
+    ).rejects.toMatchObject({ statusCode: 404 });
+
+    expect(subirFotoCliente).not.toHaveBeenCalled();
+  });
+
+  test('sube la foto con un nombre de archivo "teléfono - nombre" y guarda el link devuelto', async () => {
+    const card = makeCard({ id: 1, telefono: '5512345678', nombre: 'Juan Pérez' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    subirFotoCliente.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: 'https://drive/file-1' });
+
+    const resultado = await cardService.subirFoto(
+      1, { buffer: Buffer.from('img'), mimetype: 'image/png', originalname: 'foto.png' }, USER,
+    );
+
+    expect(subirFotoCliente).toHaveBeenCalledWith(
+      expect.any(Buffer), 'image/png', '5512345678 - Juan Pérez.png',
+    );
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({
+      fotoUrl: 'https://drive/file-1', updatedById: '7', updatedByNombre: 'Admin',
+    }));
+    expect(resultado.fotoUrl).toBe('https://drive/file-1');
+  });
+
+  // Bug real corregido (2026-10-29): `driveWebViewLink`/`fotoUrl` es la página VISOR de Drive,
+  // nunca embebible en un <img> — `fotoDriveFileId`/`fotoMimeType` son lo que de verdad permite
+  // descargar el binario después (ver obtenerFoto() más abajo). Antes se descartaba `driveFileId`.
+  test('persiste también fotoDriveFileId y fotoMimeType (no solo el link)', async () => {
+    const card = makeCard({ id: 1, telefono: '5512345678', nombre: 'Juan Pérez' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    subirFotoCliente.mockResolvedValue({ driveFileId: 'file-1', driveWebViewLink: 'https://drive/file-1' });
+
+    await cardService.subirFoto(
+      1, { buffer: Buffer.from('img'), mimetype: 'image/png', originalname: 'foto.png' }, USER,
+    );
+
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({
+      fotoDriveFileId: 'file-1', fotoMimeType: 'image/png',
+    }));
+  });
+});
+
+// obtenerFoto (2026-10-29) — bug real corregido: card.fotoUrl es el webViewLink de Drive (página
+// visor), nunca embebible en un <img>. Esto trae el binario real para servirlo vía un proxy
+// autenticado (GET /cards/:id/foto). `descargarFotoCliente` se mockea completo (la lógica de
+// Drive en sí ya se prueba en drive-loyalty-foto.service.test.js).
+describe('obtenerFoto', () => {
+  test('tarjeta inexistente → 404, no pide nada a Drive', async () => {
+    LoyaltyCard.findByPk.mockResolvedValue(null);
+
+    await expect(cardService.obtenerFoto(999)).rejects.toMatchObject({ statusCode: 404 });
+    expect(descargarFotoCliente).not.toHaveBeenCalled();
+  });
+
+  test('tarjeta sin fotoDriveFileId (nunca subió foto, o es de antes de esta columna) → 404', async () => {
+    const card = makeCard({ fotoDriveFileId: null });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await expect(cardService.obtenerFoto(1)).rejects.toMatchObject({ statusCode: 404 });
+    expect(descargarFotoCliente).not.toHaveBeenCalled();
+  });
+
+  test('con fotoDriveFileId, descarga el binario y devuelve data+mimetype', async () => {
+    const card = makeCard({ fotoDriveFileId: 'file-1', fotoMimeType: 'image/png' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    descargarFotoCliente.mockResolvedValue(Buffer.from('contenido-binario'));
+
+    const resultado = await cardService.obtenerFoto(1);
+
+    expect(descargarFotoCliente).toHaveBeenCalledWith('file-1');
+    expect(resultado).toEqual({ data: Buffer.from('contenido-binario'), mimetype: 'image/png' });
+  });
+});
+
+describe('listarPendientesRevisionKore', () => {
+  test('filtra por revisionPendiente:true, ordena por createdAt ASC y pagina', async () => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 3, rows: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+
+    const resultado = await cardService.listarPendientesRevisionKore({ page: 2, limit: 2 });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith({
+      where:  { revisionPendiente: true },
+      order:  [['createdAt', 'ASC']],
+      limit:  2,
+      offset: 2,
+    });
+    expect(resultado).toEqual({ total: 3, page: 2, limit: 2, pages: 2, cards: [{ id: 1 }, { id: 2 }, { id: 3 }] });
+  });
+
+  test('usa page/limit por default cuando no se mandan', async () => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });
+
+    await cardService.listarPendientesRevisionKore();
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(expect.objectContaining({
+      where: { revisionPendiente: true }, limit: 50, offset: 0,
+    }));
+  });
+
+  // search (2026-10-29) — mismo criterio que listar(): prefijo de teléfono O ILIKE sobre nombre.
+  test('search filtra por prefijo de teléfono O nombre (ILIKE), sin perder revisionPendiente:true', async () => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });
+
+    await cardService.listarPendientesRevisionKore({ search: 'Juan' });
+
+    const Sequelize = require('sequelize');
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(where.revisionPendiente).toBe(true);
+    const grupoOr = where[Sequelize.Op.and][0][Sequelize.Op.or];
+    expect(grupoOr).toEqual(expect.arrayContaining([
+      { telefono: { [Sequelize.Op.like]: 'Juan%' } },
+      { nombre:   { [Sequelize.Op.iLike]: '%Juan%' } },
+    ]));
+  });
+
+  test('sin search → no agrega Op.and', async () => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });
+
+    await cardService.listarPendientesRevisionKore({});
+
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(where).toEqual({ revisionPendiente: true });
+  });
+});
+
+// Reporte "Tarjetas" (2026-10-29): exportar / fechaAlta / revisionPendiente en listar().
+describe('listar — reporte "Tarjetas" (exportar, fechaAlta, revisionPendiente)', () => {
+  beforeEach(() => {
+    LoyaltyCard.findAndCountAll.mockResolvedValue({ count: 0, rows: [] });
+    LoyaltyCard.findAll.mockResolvedValue([{ id: 1 }, { id: 2 }]);
+  });
+
+  test('sin exportar (comportamiento previo intacto): usa findAndCountAll con limit/offset', async () => {
+    await cardService.listar({ page: 2, limit: 10 });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(expect.objectContaining({
+      limit: 10, offset: 10,
+    }));
+    expect(LoyaltyCard.findAll).not.toHaveBeenCalled();
+  });
+
+  test('exportar:true trae TODAS las filas vía findAll, sin limit/offset', async () => {
+    const resultado = await cardService.listar({ exportar: true, page: 3, limit: 5 });
+
+    expect(LoyaltyCard.findAll).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.any(Object), order: expect.any(Array),
+    }));
+    expect(LoyaltyCard.findAll.mock.calls[0][0]).not.toHaveProperty('limit');
+    expect(LoyaltyCard.findAll.mock.calls[0][0]).not.toHaveProperty('offset');
+    expect(LoyaltyCard.findAndCountAll).not.toHaveBeenCalled();
+    expect(resultado).toEqual({ total: 2, page: 1, limit: 2, pages: 1, cards: [{ id: 1 }, { id: 2 }] });
+  });
+
+  test('fechaAltaInicio/fechaAltaFin acotan createdAt (Op.gte/Op.lte), fin de día inclusivo', async () => {
+    const Sequelize = require('sequelize');
+    await cardService.listar({ fechaAltaInicio: '2026-10-01', fechaAltaFin: '2026-10-29' });
+
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(where.createdAt[Sequelize.Op.gte]).toEqual(new Date('2026-10-01'));
+    expect(where.createdAt[Sequelize.Op.lte]).toEqual(new Date('2026-10-29T23:59:59.999Z'));
+  });
+
+  test('solo fechaAltaInicio (sin fin) agrega únicamente Op.gte', async () => {
+    const Sequelize = require('sequelize');
+    await cardService.listar({ fechaAltaInicio: '2026-10-01' });
+
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(where.createdAt[Sequelize.Op.gte]).toEqual(new Date('2026-10-01'));
+    expect(where.createdAt[Sequelize.Op.lte]).toBeUndefined();
+  });
+
+  test('sin fechaAlta → no agrega createdAt al where', async () => {
+    await cardService.listar({});
+
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(where.createdAt).toBeUndefined();
+  });
+
+  test('revisionPendiente:true filtra where.revisionPendiente', async () => {
+    await cardService.listar({ revisionPendiente: true });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ revisionPendiente: true }) }),
+    );
+  });
+
+  test('revisionPendiente:false filtra where.revisionPendiente en false (no se confunde con "sin filtro")', async () => {
+    await cardService.listar({ revisionPendiente: false });
+
+    expect(LoyaltyCard.findAndCountAll).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ revisionPendiente: false }) }),
+    );
+  });
+
+  test('sin revisionPendiente → no agrega el filtro', async () => {
+    await cardService.listar({});
+
+    const { where } = LoyaltyCard.findAndCountAll.mock.calls[0][0];
+    expect(where.revisionPendiente).toBeUndefined();
+  });
+});
+
+describe('marcarRevisada', () => {
+  test('tarjeta inexistente → 404', async () => {
+    LoyaltyCard.findByPk.mockResolvedValue(null);
+
+    await expect(cardService.marcarRevisada(999, USER)).rejects.toMatchObject({ statusCode: 404 });
+  });
+
+  test('idempotente: si ya estaba revisada (revisionPendiente:false), devuelve la tarjeta sin tocarla', async () => {
+    const card = makeCard({ revisionPendiente: false });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const resultado = await cardService.marcarRevisada(1, USER);
+
+    expect(card.update).not.toHaveBeenCalled();
+    expect(resultado).toBe(card);
+  });
+
+  test('happy path: marca revisionPendiente:false y setea revisadoPorId/Nombre/revisadoAt', async () => {
+    const card = makeCard({ revisionPendiente: true });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const resultado = await cardService.marcarRevisada(1, USER);
+
+    expect(card.update).toHaveBeenCalledWith({
+      revisionPendiente: false,
+      revisadoPorId:     '7',
+      revisadoPorNombre: 'Admin',
+      revisadoAt:        expect.any(Date),
+    });
+    expect(resultado.revisionPendiente).toBe(false);
   });
 });

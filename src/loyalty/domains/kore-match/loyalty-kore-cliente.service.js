@@ -60,13 +60,12 @@ async function _buscarCard({ koreClienteId, telefono }) {
   return null;
 }
 
-async function _aplicarActualizacion(card, { koreClienteId, monedero, telefono, nombre }) {
+async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre }) {
   const updates = {
     updatedById:     ACTOR_WEBHOOK.dbId,
     updatedByNombre: ACTOR_WEBHOOK.nombre,
   };
   if (koreClienteId) updates.koreClienteId = koreClienteId;
-  if (monedero !== undefined && monedero !== null) updates.koreMonedero = String(monedero);
   if (nombre !== undefined && String(nombre).trim()) updates.nombre = String(nombre).trim();
   if (telefono && telefono !== card.telefono) updates.telefono = telefono;
 
@@ -82,25 +81,16 @@ async function _aplicarActualizacion(card, { koreClienteId, monedero, telefono, 
   return { ok: true, evento: 'actualizacion', cardId: card.id, creada: false };
 }
 
-async function _procesarAlta({ koreClienteId, monedero, telefono, nombre }) {
+async function _procesarAlta({ koreClienteId, telefono, nombre }) {
   const existente = await LoyaltyCard.findOne({ where: { telefono } });
   if (existente) {
     // Idempotente: un "alta" para un teléfono que ya tiene tarjeta se trata como actualización,
     // nunca se duplica ni se lanza error por "ya existe".
-    return _aplicarActualizacion(existente, { koreClienteId, monedero, telefono, nombre });
+    return _aplicarActualizacion(existente, { koreClienteId, telefono, nombre });
   }
 
   if (!String(nombre ?? '').trim()) {
     throw new BadRequestError('nombre es requerido para dar de alta una tarjeta nueva.');
-  }
-  // Validación defensiva (2026-10-27): el contrato documentado le pide a Kore que solo dispare
-  // `alta` para clientes CON monedero — pero el código no lo exigía, dejando a Numo 100% a merced
-  // de que Kore lo respete. Si Kore tuviera un bug y mandara `alta` para cualquier cliente, esto
-  // evita crear tarjetas de Lealtad para gente que nunca debió tenerlas. No aplica al camino de
-  // "ya existe" de arriba (eso es una actualización, no una creación, mismo criterio que el resto
-  // de campos opcionales en actualizacion).
-  if (monedero === undefined || monedero === null || String(monedero).trim() === '') {
-    throw new BadRequestError('monedero es requerido para dar de alta una tarjeta nueva (evita crear tarjetas para clientes sin monedero en Kore).');
   }
 
   let resultado;
@@ -110,7 +100,7 @@ async function _procesarAlta({ koreClienteId, monedero, telefono, nombre }) {
     if (err instanceof ConflictError) {
       // Carrera: otra llamada creó la tarjeta entre el findOne de arriba y este create.
       const card = await LoyaltyCard.findOne({ where: { telefono } });
-      if (card) return _aplicarActualizacion(card, { koreClienteId, monedero, telefono, nombre });
+      if (card) return _aplicarActualizacion(card, { koreClienteId, telefono, nombre });
     }
     throw err;
   }
@@ -118,18 +108,15 @@ async function _procesarAlta({ koreClienteId, monedero, telefono, nombre }) {
   // El NIP que devuelve crearTarjeta() nunca se expone en la respuesta de este webhook — el
   // cliente lo obtiene por la consulta pública (NIP→OTP) ya existente.
   const { card } = resultado;
-  await card.update({
-    koreClienteId,
-    koreMonedero: monedero !== undefined && monedero !== null ? String(monedero) : null,
-  });
+  await card.update({ koreClienteId, revisionPendiente: true });
 
   return { ok: true, evento: 'alta', cardId: card.id, creada: true };
 }
 
-async function _procesarActualizacion({ koreClienteId, monedero, telefono, nombre }) {
+async function _procesarActualizacion({ koreClienteId, telefono, nombre }) {
   const card = await _buscarCard({ koreClienteId, telefono });
   if (!card) throw new NotFoundError('Tarjeta (no se encontró por koreClienteId ni teléfono)');
-  return _aplicarActualizacion(card, { koreClienteId, monedero, telefono, nombre });
+  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre });
 }
 
 async function _procesarBaja({ koreClienteId, telefono }) {
@@ -153,7 +140,7 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * como fallback de búsqueda) para 'baja'.
  */
 async function procesarClienteKore(payload) {
-  const { evento, monedero, telefono, nombre } = payload ?? {};
+  const { evento, telefono, nombre } = payload ?? {};
 
   if (!EVENTOS_VALIDOS.includes(evento)) {
     throw new BadRequestError(`evento inválido: "${evento}". Debe ser uno de: ${EVENTOS_VALIDOS.join(', ')}.`);
@@ -172,9 +159,9 @@ async function procesarClienteKore(payload) {
   }
 
   if (evento === 'alta') {
-    return _procesarAlta({ koreClienteId, monedero, telefono: telefonoNorm, nombre });
+    return _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre });
   }
-  return _procesarActualizacion({ koreClienteId, monedero, telefono: telefonoNorm, nombre });
+  return _procesarActualizacion({ koreClienteId, telefono: telefonoNorm, nombre });
 }
 
 module.exports = { procesarClienteKore };

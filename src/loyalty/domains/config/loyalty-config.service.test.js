@@ -23,10 +23,13 @@ jest.mock('../../../shared/models/postgres', () => ({
   CentroCosto:             { findAll: jest.fn(), findByPk: jest.fn() },
   LoyaltyKoreConcepto:     { findAll: jest.fn(), findByPk: jest.fn(), findOrCreate: jest.fn() },
   LoyaltyKoreFormaPago:    { findAll: jest.fn(), findByPk: jest.fn(), findOrCreate: jest.fn(), update: jest.fn() },
+  ConfigSection:           { findOne: jest.fn() },
+  GlobalConfig:            { findOne: jest.fn() },
 }));
 jest.mock('../../../shared/services/global-config.service', () => ({
   getValue: jest.fn(),
   setValue: jest.fn(),
+  listAuditLog: jest.fn(),
 }));
 jest.mock('../../../config/database.postgres', () => ({
   sequelize: { transaction: jest.fn() },
@@ -39,6 +42,7 @@ jest.mock('./loyalty-kore-catalogos.client', () => ({
 const {
   LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
   LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+  ConfigSection, GlobalConfig,
 } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { sequelize } = require('../../../config/database.postgres');
@@ -110,6 +114,73 @@ describe('obtenerPorcentajes', () => {
     const resultado = await configService.obtenerPorcentajes();
 
     expect(resultado).toEqual({ Bronce: 2.5, Plata: null, Oro: null });
+  });
+});
+
+describe('obtenerFotoFolderId / guardarFotoFolderId', () => {
+  test('obtenerFotoFolderId lee lealtad.FOTO_CLIENTE_FOLDER_ID y recorta espacios', async () => {
+    globalConfigService.getValue.mockResolvedValue('  abc123  ');
+    const valor = await configService.obtenerFotoFolderId();
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'FOTO_CLIENTE_FOLDER_ID');
+    expect(valor).toBe('abc123');
+  });
+
+  test('obtenerFotoFolderId devuelve string vacío si la clave no existe (sin fallback inventado)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerFotoFolderId()).resolves.toBe('');
+  });
+
+  test('guardarFotoFolderId llama a setValue con tipo:"texto" y recorta espacios', async () => {
+    const resultado = await configService.guardarFotoFolderId('  nuevo-id  ', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'FOTO_CLIENTE_FOLDER_ID', 'nuevo-id',
+      expect.objectContaining({ tipo: 'texto', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe('nuevo-id');
+  });
+
+  test('guardarFotoFolderId acepta vacío ("no configurado")', async () => {
+    const resultado = await configService.guardarFotoFolderId('   ', USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'FOTO_CLIENTE_FOLDER_ID', '', expect.anything(),
+    );
+    expect(resultado).toBe('');
+  });
+});
+
+describe('obtenerHistorial', () => {
+  test('resuelve sección lealtad + clave a la fila de GlobalConfig y delega en listAuditLog(configId)', async () => {
+    ConfigSection.findOne.mockResolvedValue({ id: 7, clave: 'lealtad' });
+    GlobalConfig.findOne.mockResolvedValue({ id: 42, clave: 'PORCENTAJE_BRONCE' });
+    const logs = [{ id: 1, accion: 'editado' }];
+    globalConfigService.listAuditLog.mockResolvedValue(logs);
+
+    const resultado = await configService.obtenerHistorial('PORCENTAJE_BRONCE');
+
+    expect(ConfigSection.findOne).toHaveBeenCalledWith({ where: { clave: 'lealtad' } });
+    expect(GlobalConfig.findOne).toHaveBeenCalledWith({ where: { sectionId: 7, clave: 'PORCENTAJE_BRONCE' } });
+    expect(globalConfigService.listAuditLog).toHaveBeenCalledWith(42);
+    expect(resultado).toBe(logs);
+  });
+
+  test('clave nunca guardada (sin fila en GlobalConfig todavía) → array vacío, no tira error', async () => {
+    ConfigSection.findOne.mockResolvedValue({ id: 7, clave: 'lealtad' });
+    GlobalConfig.findOne.mockResolvedValue(null);
+
+    const resultado = await configService.obtenerHistorial('FOTO_CLIENTE_FOLDER_ID');
+
+    expect(resultado).toEqual([]);
+    expect(globalConfigService.listAuditLog).not.toHaveBeenCalled();
+  });
+
+  test('sección lealtad inexistente en el catálogo (caso defensivo) → array vacío', async () => {
+    ConfigSection.findOne.mockResolvedValue(null);
+
+    const resultado = await configService.obtenerHistorial('ESPECIALIDADES');
+
+    expect(resultado).toEqual([]);
+    expect(GlobalConfig.findOne).not.toHaveBeenCalled();
+    expect(globalConfigService.listAuditLog).not.toHaveBeenCalled();
   });
 });
 

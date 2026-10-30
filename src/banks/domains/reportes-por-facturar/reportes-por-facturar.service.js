@@ -29,6 +29,7 @@ const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detect
 const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
+const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -144,6 +145,12 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   fechaFin = fechaFin || fechaInicio;
 
   const advertencias = [];
+  // Hoy / ayer aún no los trae la descarga nocturna → directo de Kore (2026-10-30).
+  await onAvance('Trayendo de Kore las facturas de hoy / ayer…');
+  const recientes = await traerFacturasRecientes({ series, fechaInicio, fechaFin });
+  if (recientes.error) {
+    advertencias.push(`No se pudieron traer de Kore las facturas del ${recientes.dias.join(' y ')} (${recientes.error}) — pueden faltar las de ese día hasta la descarga de la noche; vuelve a actualizarlo más tarde.`);
+  }
   await onAvance('Buscando facturas del periodo…');
   const facturas = await _facturasDelRango({ rfc, series, fechaInicio, fechaFin });
   await onAvance(`Depósitos de ${facturas.length} factura(s) — consultando Kore…`);

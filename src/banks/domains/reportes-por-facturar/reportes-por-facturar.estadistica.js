@@ -30,6 +30,8 @@ const { obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
 const { infoRemisiones } = require('../erp/kore-remisiones.service');
 const { _identificadoEl } = require('../cfdi-mapping/mostrador.service');
 const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
+const Foto = require('./EstadisticaPorFacturarFoto.model');
+const { logger } = require('../../../shared/utils/logger');
 
 const MAX_DIAS_RANGO = 31;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -272,7 +274,10 @@ function validar({ rfc, fechaInicio, fechaFin }) {
 async function excel(id) {
   const t = _trabajos.get(id);
   if (!t || t.estado !== 'listo') throw new NotFoundError('Cálculo');
-  const r = t.resultado;
+  return _excelDe(t.resultado);
+}
+
+async function _excelDe(r) {
   const wb = new ExcelJS.Workbook();
   const dinero = '$#,##0.00';
   const encabezado = row => row.eachCell(c => {
@@ -333,4 +338,83 @@ async function excel(id) {
   return { buffer: await wb.xlsx.writeBuffer(), filename: `Estadistica_por_facturar_${sucursal}_${rango}.xlsx` };
 }
 
-module.exports = { calcular, iniciar, estado, validar, excel };
+// ── Mes en curso, ya calculado (2026-10-30) ──────────────────────────────────
+// "Ya debe verse en cuanto se entra al módulo": el mes en curso de cada
+// empresa / sucursal se guarda (EstadisticaPorFacturarFoto) y se recalcula
+// solo — cada hora (cron) y al abrirla si tiene más de FOTO_VIGENTE_MS. La
+// pantalla muestra al instante la última guardada mientras tanto.
+const FOTO_VIGENTE_MS = 60 * 60000;
+const _fotoEnCurso = new Map(); // `${rfc}|${centroCostoId}` → { avance, promesa }
+
+const _ccId = v => (v === null || v === undefined || v === '' ? null : Number(v));
+const _claveFoto = (rfc, centroCostoId) => `${rfc}|${_ccId(centroCostoId) ?? 'todas'}`;
+const _mesEnCurso = (ahora = new Date()) => {
+  const hoy = _diaMx(ahora);
+  return { fechaInicio: `${hoy.slice(0, 8)}01`, fechaFin: hoy };
+};
+
+/** Recalcula (en segundo plano) la foto del mes en curso; si ya corre, no hace nada. */
+function recalcularFoto(rfc, centroCostoId = null) {
+  const clave = _claveFoto(rfc, centroCostoId);
+  if (_fotoEnCurso.has(clave)) return _fotoEnCurso.get(clave).promesa;
+  const cc = _ccId(centroCostoId);
+  const trabajo = { avance: 'Iniciando…', promesa: null };
+  const periodo = _mesEnCurso();
+  trabajo.promesa = (async () => {
+    try {
+      const resultado = await calcular({ rfc, centroCostoId: cc, ...periodo }, avance => { trabajo.avance = avance; });
+      await Foto.updateOne({ rfc, centroCostoId: cc },
+        { $set: { ...periodo, resultado, calculadoEn: resultado.calculadoEn, error: null } }, { upsert: true });
+    } catch (err) {
+      logger.warn(`[EstadisticaPorFacturar] No se pudo recalcular ${clave}: ${err?.message ?? err}`);
+      await Foto.updateOne({ rfc, centroCostoId: cc }, { $set: { error: err?.message ?? String(err) } }, { upsert: true }).catch(() => {});
+    } finally {
+      _fotoEnCurso.delete(clave);
+    }
+  })();
+  _fotoEnCurso.set(clave, trabajo);
+  return trabajo.promesa;
+}
+
+/**
+ * Lo que ve la pantalla al entrar: la última foto guardada del mes en curso
+ * (al instante) y si se está recalculando. Si no hay, es de otro mes o ya es
+ * vieja, arranca el recálculo en segundo plano.
+ */
+async function fotoActual(rfc, centroCostoId = null) {
+  if (!rfc) throw new BadRequestError('RFC requerido');
+  const cc = _ccId(centroCostoId);
+  const foto = await Foto.findOneAndUpdate({ rfc, centroCostoId: cc }, { $set: { consultadaEn: new Date() } }, { upsert: true, new: true }).lean();
+  const { fechaInicio } = _mesEnCurso();
+  const vigente = foto?.resultado && foto.fechaInicio === fechaInicio
+    && foto.calculadoEn && Date.now() - new Date(foto.calculadoEn).getTime() < FOTO_VIGENTE_MS;
+  if (!vigente) recalcularFoto(rfc, cc);
+  const enCurso = _fotoEnCurso.get(_claveFoto(rfc, cc));
+  return {
+    // Una foto de un mes anterior no se muestra como si fuera la de este.
+    resultado:   foto?.fechaInicio === fechaInicio ? foto.resultado ?? null : null,
+    calculadoEn: foto?.fechaInicio === fechaInicio ? foto.calculadoEn ?? null : null,
+    calculando:  !!enCurso,
+    avance:      enCurso?.avance ?? null,
+    error:       enCurso ? null : foto?.error ?? null,
+  };
+}
+
+/** Excel de la foto guardada del mes en curso. */
+async function excelFoto(rfc, centroCostoId = null) {
+  const foto = await Foto.findOne({ rfc, centroCostoId: _ccId(centroCostoId) }).lean();
+  if (!foto?.resultado) throw new NotFoundError('Estadística');
+  return _excelDe(foto.resultado);
+}
+
+/** Cron: recalcula las fotos que alguien abrió en los últimos 7 días (una a la vez). */
+async function recalcularFotosEnUso() {
+  const fotos = await Foto.find({ consultadaEn: { $gte: new Date(Date.now() - 7 * 86400000) } }).select('rfc centroCostoId').lean();
+  for (const f of fotos) await recalcularFoto(f.rfc, f.centroCostoId);
+  return fotos.length;
+}
+
+/** Espera los recálculos en curso (pruebas). */
+const _esperarFotos = () => Promise.all([..._fotoEnCurso.values()].map(t => t.promesa));
+
+module.exports = { calcular, iniciar, estado, validar, excel, fotoActual, recalcularFoto, excelFoto, recalcularFotosEnUso, _esperarFotos };

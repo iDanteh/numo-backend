@@ -605,6 +605,7 @@ async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
       nombreTipoMovimiento: cuenta?.nombreTipoMovimiento ? String(cuenta.nombreTipoMovimiento).trim().toUpperCase() : null,
       saldoActual:          cuenta ? Number(cuenta.saldoActual) : null,
       factura:              cuenta?.serieFactura ? `${cuenta.serieFactura}-${cuenta.folioFactura ?? ''}` : null,
+      liquidadaEl:          _liquidadaEl(cuenta),
     };
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
@@ -613,6 +614,18 @@ async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
   }
   _cacheNombrePersona.set(clave, { data: info, ts: Date.now() });
   return info;
+}
+
+// Cuándo quedó en saldo 0 la cuenta (2026-10-30, reporte "Por facturar"):
+// fecha del último movimiento que la llevó de un saldo a 0 — p. ej. el RET
+// del 30-oct de A0-260902996 (depósito 053049 del 15-oct). null si debe algo.
+function _liquidadaEl(cuenta) {
+  if (!cuenta || Math.abs(Number(cuenta.saldoActual) || 0) >= 0.005) return null;
+  const cierre = (cuenta.movimientos ?? [])
+    .filter(m => m.fecha && Math.abs(Number(m.saldoActual) || 0) < 0.005 && Math.abs(Number(m.saldoAnterior) || 0) >= 0.005)
+    .map(m => new Date(m.fecha)).filter(f => !isNaN(f))
+    .sort((a, b) => a - b).pop();
+  return cierre ?? null;
 }
 
 async function obtenerNombrePersonaTicket(params) {

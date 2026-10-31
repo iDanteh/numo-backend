@@ -34,6 +34,8 @@ const { cobrosEnOtraCaja } = require('./reportes-por-facturar.otra-caja');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
+// PENDIENTE GENERAR FACTURA / CON PENDIENTES DE PAGO: acumulados desde aquí.
+const PENDIENTES_DESDE = '2026-01-01';
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 
@@ -203,7 +205,8 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   }
   // También los de fecha anterior identificados dentro del rango (2026-10-23).
   await onAvance('Pendientes de generar factura — consultando Kore…');
-  const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true });
+  // Acumulados desde el inicio del año (2026-10-30): todo lo que sigue sin factura.
+  const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true, acumuladoDesde: PENDIENTES_DESDE });
   if (pendientes.remisionesSinRespuesta) {
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
   }

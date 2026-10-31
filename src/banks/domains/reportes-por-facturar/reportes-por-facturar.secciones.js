@@ -127,7 +127,24 @@ function esEspecial(cliente, receptor) {
  * @param {object} datos  `datos` guardados del reporte
  * @param {(serie) => string|null} sucursalDe
  */
-function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}) {
+// Cobradas solo en la caja de otro almacén (2026-10-30): sus renglones salen
+// únicamente en "COBRADAS EN …", no en MOSTRADOR / REF. / pendientes / ficha.
+function _sinCobradasEnOtraCaja(datos) {
+  const solo = new Set(datos?.remisionesSoloOtraCaja ?? []);
+  if (!solo.size) return datos;
+  const queda = d => !(d.remisiones?.length && d.remisiones.every(r => solo.has(r)));
+  const porFactura = fs => (fs ?? []).map(f => ({ ...f, depositos: (f.depositos ?? []).filter(queda) }));
+  return {
+    ...datos,
+    movimientosMostrador:       porFactura(datos.movimientosMostrador),
+    cobrosCajaGlobales:         porFactura(datos.cobrosCajaGlobales).filter(f => f.depositos.length),
+    depositosPendientesFactura: (datos.depositosPendientesFactura ?? []).filter(queda),
+    depositosPendientesPago:    (datos.depositosPendientesPago ?? []).filter(queda),
+  };
+}
+
+function armarSecciones(datosCompletos, sucursalDe = () => null, { fechaFin = null } = {}) {
+  const datos = _sinCobradasEnOtraCaja(datosCompletos);
   const t = tablasMostrador(datos);
 
   // ── MOSTRADOR: globales (depósitos + cobros de caja de Kore) + pendientes ──

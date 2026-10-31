@@ -237,6 +237,7 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   await onAvance('Cobros en la caja de otro almacén — consultando Kore…');
   const otraCaja = await cobrosEnOtraCaja({ rfc, datos });
   datos.cobrosOtraCaja = otraCaja.cobros;
+  datos.remisionesSoloOtraCaja = otraCaja.soloOtraCaja ?? [];
   if (otraCaja.sinRespuesta) {
     advertencias.push(`Kore no respondió ${otraCaja.sinRespuesta} remisión(es) al buscar cobros en la caja de otro almacén — esa pestaña puede estar incompleta; vuelve a actualizarlo más tarde.`);
   }

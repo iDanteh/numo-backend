@@ -32,7 +32,8 @@ test('solo cobros en la caja de otro almacén, con factura, cliente e ID NUMO de
   const { cobros } = await cobrosEnOtraCaja({ rfc: 'X', datos });
   expect(erp.obtenerDesglosesCobroAlmacen).toHaveBeenCalledWith({ rfc: 'X', series: ['A0', 'A0'], folios: ['261003322', '261002139'] });
   expect(cobros.map(c => [c.remisiones[0], c.caja, c.importe, c.banco, c.factura, c.cliente, c.idNumo])).toEqual([
-    ['A0-261002139', 'O0', 2510.71, 'EFECTIVO', 'POR FACTURAR', 'JUANA', 'S/R'],
+    // Solo se cobró en O0 → lleva el ID NUMO de su depósito aunque el importe no cuadre.
+    ['A0-261002139', 'O0', 2510.71, 'EFECTIVO', 'POR FACTURAR', 'JUANA', '054002'],
     ['A0-261003322', 'O0', 689.44, 'EFECTIVO', 'A0-261014387', 'PEDRO', '054001'],
   ]);
 });
@@ -49,7 +50,7 @@ test('pestaña y hoja "A0 COBRADAS EN PUERTO"', async () => {
 
 test('Kore no responde → cuenta las remisiones sin respuesta', async () => {
   erp.obtenerDesglosesCobroAlmacen.mockRejectedValue(new Error('429'));
-  expect(await cobrosEnOtraCaja({ rfc: 'X', datos })).toEqual({ cobros: [], sinRespuesta: 2 });
+  expect(await cobrosEnOtraCaja({ rfc: 'X', datos })).toEqual({ cobros: [], soloOtraCaja: [], sinRespuesta: 2 });
 });
 
 // 2026-10-30: forma de pago por renglón; mixto con sus importes; totales sin
@@ -70,4 +71,35 @@ test('forma de pago del renglón y totales por forma', () => {
   ] });
   expect(s.ficha.grupos[0].depositos[0].formaPago).toBe('DEPÓSITO EN EFECTIVO');
   expect(totalesPorForma([s.ficha])).toMatchObject({ efectivo: 100, depositoEfectivo: 200 });
+});
+
+// 2026-10-30: A0-261000113 (PAULINO ALONZO VALENCIA) — su único cobro fue en
+// la caja O0 → sale solo en "A0 COBRADAS EN PUERTO" (con el ID NUMO de su
+// depósito 043598 aunque el importe no cuadre), no en PENDIENTE de A0.
+test('cobrada solo en otra caja: fuera de las demás pestañas, con su ID NUMO', async () => {
+  erp.obtenerDesglosesCobroAlmacen.mockResolvedValue([
+    { serieVenta: 'A0', folioVenta: '261000113', cobros: [
+      { serieOrigen: 'CPF', folioOrigen: '261000827', claveCentro: 'O0', monto: -4254.09, fecha: '2026-10-08T17:30:08Z', formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 4254.09 }] },
+    ] },
+    { serieVenta: 'A0', folioVenta: '2', cobros: [
+      { claveCentro: 'O0', monto: -10, fecha: '2026-10-08T17:30:08Z', formasPago: [] },
+      { claveCentro: 'A0', monto: -90, fecha: '2026-10-09T17:30:08Z', formasPago: [] }, // también en su caja → se queda
+    ] },
+  ]);
+  const datos = {
+    movimientosMostrador: [],
+    cobrosCajaGlobales: [],
+    depositosPendientesFactura: [
+      { remisiones: ['A0-261000113'], cliente: 'PAULINO ALONZO VALENCIA', importe: 4270.02, idNumo: '043598' },
+      { remisiones: ['A0-2'], cliente: 'OTRO', importe: 90, idNumo: '1' },
+    ],
+    depositosPendientesPago: [],
+  };
+  const r = await cobrosEnOtraCaja({ rfc: 'X', datos });
+  expect(r.soloOtraCaja).toEqual(['A0-261000113']);
+  expect(r.cobros.find(c => c.remisiones[0] === 'A0-261000113').idNumo).toBe('043598');
+  const s = armarSecciones({ ...datos, cobrosOtraCaja: r.cobros, remisionesSoloOtraCaja: r.soloOtraCaja }, () => null);
+  const pendientes = s.mostrador.flatMap(a => a.bloques).flatMap(b => b.grupos.flatMap(g => g.depositos)).map(d => d.idNumo);
+  expect(pendientes).toEqual(['1']);
+  expect(s.otraCaja.flatMap(e => e.bloques[0].grupos.flatMap(g => g.depositos)).map(d => d.remisiones[0])).toEqual(['A0-2', 'A0-261000113']);
 });

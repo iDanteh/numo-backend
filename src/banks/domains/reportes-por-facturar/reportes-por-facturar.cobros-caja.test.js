@@ -89,3 +89,28 @@ test('abonos anteriores: depósito ligado a la remisión sin el UUID de la globa
   })]);
   expect(porFactura[0].depositos[0].deKore).toBeUndefined();
 });
+
+// 2026-10-30: XOCHILT CUEVAS CABRERA (global A0-261015699) — Kore registró el
+// depósito 052352 como un pago de $2,041.92 (Bancos: $2,041.99) repartido en
+// dos abonos; como ya están ligados en Bancos a esas remisiones por el mismo
+// importe, no sale un "SALDO A FAVOR" de más.
+test('abono ya ligado en Bancos a la misma remisión y monto: no se repite aunque el depósito difiera por centavos', async () => {
+  erp.obtenerDesglosesCobroPorFactura.mockResolvedValue([
+    { serieVenta: 'A0', folioVenta: '260804977', fechaCreacion: '2026-08-20T10:00:00Z', cobros: [
+      cobro('ABO', 1860.99, '2026-10-21T22:03:00Z', [fp('01', 'DEPOSITO EN EFECTIVO', 2041.92)]),
+      cobro('ABO', 1776.88, '2026-10-30T23:48:00Z', [fp('03', 'TRANSFERENCIA', 5000)]),
+    ] },
+    { serieVenta: 'A0', folioVenta: '260804990', fechaCreacion: '2026-08-20T10:00:00Z', cobros: [
+      cobro('ABO', 180.93, '2026-10-21T22:03:00Z', [fp('01', 'DEPOSITO EN EFECTIVO', 2041.92)]),
+    ] },
+  ]);
+  BankMovement.find.mockReturnValue(lean([
+    { folio: '052352', deposito: 2041.99, erpLinks: [
+      { serie: 'A0', folioExterno: '260804977', saldoPagado: 1860.99 }, { serie: 'A0', folioExterno: '260804990', saldoPagado: 180.93 }] },
+    { folio: '052353', deposito: 5000, erpLinks: [
+      { serie: 'A0', folioExterno: '260804846', saldoPagado: 3223.12 }, { serie: 'A0', folioExterno: '260804977', saldoPagado: 1776.88 }] },
+  ]));
+  const { porFactura } = await cobrosCajaDeGlobales({ rfc: 'X', facturas: [{ uuid: 'abc', serie: 'A0', folio: '261015699', fecha: '2026-10-30T18:00:00Z', total: 1 }] });
+  const renglones = porFactura.flatMap(f => f.depositos);
+  expect(renglones.filter(d => d.banco === 'SALDO A FAVOR')).toEqual([]);
+});

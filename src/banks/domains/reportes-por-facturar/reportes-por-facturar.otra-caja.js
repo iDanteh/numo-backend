@@ -34,8 +34,12 @@ function _filasDelReporte(datos) {
  * @param {object} p
  * @param {string} p.rfc
  * @param {object} p.datos  datos del reporte (movimientosMostrador, cobrosCajaGlobales, pendientes…)
- * @returns {Promise<{ cobros: object[], sinRespuesta: number }>}
+ * @returns {Promise<{ cobros: object[], soloOtraCaja: string[], sinRespuesta: number }>}
  *   cobros: [{ fecha, descripcion, importe, banco, remisiones, factura, cliente, idNumo, serie, caja, deKore }]
+ *   soloOtraCaja: remisiones cuyos cobros fueron TODOS en la caja de otro
+ *   almacén (2026-10-30, pedido del usuario: A0-261000113, cobrada solo en la
+ *   caja O0, "ya no debería aparecer en la sección de A0") — las demás
+ *   pestañas las quitan; solo salen en "COBRADAS EN …".
  */
 async function cobrosEnOtraCaja({ rfc, datos }) {
   const filas = _filasDelReporte(datos);
@@ -50,6 +54,7 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
     .filter(r => r.serie && r.folio);
 
   const cobros = [];
+  const soloOtraCaja = [];
   let sinRespuesta = 0;
   for (let i = 0; i < remisiones.length; i += LOTE) {
     const lote = remisiones.slice(i, i + LOTE);
@@ -66,6 +71,11 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
       const delReporte = porRemision.get(rem) ?? [];
       const cliente = delReporte.map(d => d.cliente).find(Boolean) ?? '';
       const factura = c.serieFactura ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : 'POR FACTURAR';
+      const reales = (c.cobros ?? []).filter(k => Number(k.monto) < 0);
+      const enOtra = reales.length > 0 && reales.every(k => _serie(k.claveCentro) && _serie(k.claveCentro) !== serie);
+      if (enOtra) soloOtraCaja.push(rem);
+      // Sus depósitos de Bancos (que ya no salen en las otras pestañas) → ID NUMO.
+      const idsBancos = [...new Set(delReporte.map(d => d.idNumo).filter(id => id && id !== 'S/R'))];
       for (const k of c.cobros ?? []) {
         const caja = _serie(k.claveCentro);
         if (!caja || caja === serie || !(Number(k.monto) < 0)) continue;
@@ -81,7 +91,7 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
           remisiones:  [rem],
           factura,
           cliente,
-          idNumo:      deposito?.idNumo ?? 'S/R',
+          idNumo:      deposito?.idNumo ?? (enOtra && idsBancos.length ? idsBancos.join(', ') : 'S/R'),
           serie,
           caja,
           deKore:      true,
@@ -90,7 +100,7 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
     }
   }
   cobros.sort((a, b) => a.serie.localeCompare(b.serie) || a.caja.localeCompare(b.caja) || new Date(a.fecha) - new Date(b.fecha));
-  return { cobros, sinRespuesta };
+  return { cobros, soloOtraCaja, sinRespuesta };
 }
 
 module.exports = { cobrosEnOtraCaja };

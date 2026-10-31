@@ -82,7 +82,7 @@ test('cobrada solo en otra caja: fuera de las demás pestañas, con su ID NUMO',
       { serieOrigen: 'CPF', folioOrigen: '261000827', claveCentro: 'O0', monto: -4254.09, fecha: '2026-10-08T17:30:08Z', formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 4254.09 }] },
     ] },
     { serieVenta: 'A0', folioVenta: '2', cobros: [
-      { claveCentro: 'O0', monto: -10, fecha: '2026-10-08T17:30:08Z', formasPago: [] },
+      { claveCentro: 'O0', monto: -10, fecha: '2026-10-08T17:30:08Z', formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 10 }] },
       { claveCentro: 'A0', monto: -90, fecha: '2026-10-09T17:30:08Z', formasPago: [] }, // también en su caja → se queda
     ] },
   ]);
@@ -102,4 +102,24 @@ test('cobrada solo en otra caja: fuera de las demás pestañas, con su ID NUMO',
   const pendientes = s.mostrador.flatMap(a => a.bloques).flatMap(b => b.grupos.flatMap(g => g.depositos)).map(d => d.idNumo);
   expect(pendientes).toEqual(['1']);
   expect(s.otraCaja.flatMap(e => e.bloques[0].grupos.flatMap(g => g.depositos)).map(d => d.remisiones[0])).toEqual(['A0-2', 'A0-261000113']);
+});
+
+// 2026-10-30: solo EFECTIVO cuenta como "cobrada en otra caja" — una
+// transferencia que Cobranza aplica desde la caja A0 a una remisión I0 (SAUL
+// SOTO, depósito 054676) se queda en su pestaña normal.
+test('transferencia aplicada en otra caja: no cuenta', async () => {
+  erp.obtenerDesglosesCobroAlmacen.mockResolvedValue([
+    { serieVenta: 'I0', folioVenta: '260900160', cobros: [
+      { serieOrigen: 'ABO', folioOrigen: '261031676', claveCentro: 'A0', monto: -91133.12, fecha: '2026-10-27T17:00:00Z', formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 91133.12 }] },
+    ] },
+    { serieVenta: 'I0', folioVenta: '261000329', cobros: [
+      { serieOrigen: 'ABO', folioOrigen: '261031724', claveCentro: 'A0', monto: -11403.22, fecha: '2026-10-27T17:00:00Z', formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 11403.22 }] },
+    ] },
+  ]);
+  const r = await cobrosEnOtraCaja({ rfc: 'X', datos: { depositosPendientesFactura: [
+    { remisiones: ['I0-260900160'], cliente: 'SAUL SOTO HERNANDEZ', importe: 309990.71, idNumo: '054676' },
+    { remisiones: ['I0-261000329'], cliente: 'GRUPO CONSTRUCTOR ALPARA', importe: 11403.22, idNumo: 'S/R' },
+  ] } });
+  expect(r.soloOtraCaja).toEqual(['I0-261000329']);
+  expect(r.cobros.map(c => [c.remisiones[0], c.caja, c.importe])).toEqual([['I0-261000329', 'A0', 11403.22]]);
 });

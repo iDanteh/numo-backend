@@ -103,6 +103,16 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
       ],
     }).select('fecha concepto deposito banco folio erpLinks').lean() : [];
     const importesFactura = bancos.map(b => _r2(b.deposito));
+    // Abonos ya ligados en Bancos a esa remisión por el mismo importe (2026-10-30,
+    // caso XOCHILT CUEVAS CABRERA, global A0-261015699: Kore registró el
+    // 052352 como pago de $2,041.92 repartido en A0-260804977 $1,860.99 y
+    // A0-260804990 $180.93, pero en Bancos el depósito es de $2,041.99 → por 7
+    // centavos salía un "SALDO A FAVOR" de $2,041.92 que es el mismo dinero).
+    const pagadoEnBancos = bancos.flatMap(b => (b.erpLinks ?? []).map(l => ({
+      rem: `${_serie(l.serie)}-${String(l.folioExterno ?? '').trim()}`,
+      monto: _r2(l.saldoPagado ?? l.saldoPagadoTotal),
+    })));
+    const ligadoEnBancos = (rem, monto) => pagadoEnBancos.some(p => p.rem === rem && Math.abs(p.monto - monto) <= TOLERANCIA);
 
     // Abonos anteriores: depósitos ligados a remisiones de la global SIN su
     // UUID (los que sí lo traen ya salen por detectarMovimientosMostrador).
@@ -146,14 +156,14 @@ async function cobrosCajaDeGlobales({ rfc, facturas }) {
       for (const x of cobros) {
         const origen = `${x.k.serieOrigen ?? ''}-${x.k.folioOrigen ?? ''}`;
         if (x.tipo === 'EFECTIVO') {
-          if (_hayImporte(importesFactura, x.importe)) continue;
+          if (_hayImporte(importesFactura, x.importe) || ligadoEnBancos(rem, x.importe)) continue;
           renglones.push({ fecha: x.k.fecha, descripcion: `COBRO EN EFECTIVO EN CAJA ${x.k.claveCentro ?? ''} (${origen})`.replace('  ', ' '),
             importe: x.importe, banco: 'EFECTIVO', remisiones: [rem], cliente });
         } else if (x.tipo === 'SALDO A FAVOR') {
           renglones.push({ fecha: x.k.fecha, descripcion: `${x.forma || 'SALDO A FAVOR'} APLICADO (${origen})`.toUpperCase(),
             importe: x.importe, banco: 'SALDO A FAVOR', remisiones: [rem], cliente });
         } else {
-          if (_hayImporte(importesFactura, x.pago)) continue;
+          if (_hayImporte(importesFactura, x.pago) || ligadoEnBancos(rem, x.importe)) continue;
           // Abonos del mismo pago (mismo día y monto total) → un renglón.
           const clave = `${_diaMx(x.k.fecha)}|${x.pago}|${cliente}`;
           if (!abonosPorPago.has(clave)) {

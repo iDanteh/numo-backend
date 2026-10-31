@@ -275,3 +275,12 @@ describe('depósitos anteriores liquidados dentro del rango', () => {
     expect(BankMovement.find).toHaveBeenCalledTimes(1);
   });
 });
+
+// 2026-10-30: reporte "Por facturar" con pendientes ACUMULADOS desde el 1-ene.
+test('acumuladoDesde: busca desde esa fecha y no hace la búsqueda de anteriores', async () => {
+  BankMovement.find.mockReset().mockReturnValue({ lean: async () => [] });
+  await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-30', incluirIdentificados: true, acumuladoDesde: '2026-01-01' });
+  expect(BankMovement.find).toHaveBeenCalledTimes(1);
+  const filtro = BankMovement.find.mock.calls[0][0];
+  expect(filtro.$or[0].fecha).toEqual({ $gte: new Date('2026-01-01T00:00:00.000Z'), $lte: new Date('2026-10-30T23:59:59.999Z') });
+});

@@ -278,7 +278,12 @@ function _identificadoEl(b) {
   return fechas.length ? new Date(Math.max(...fechas)) : null;
 }
 
-async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados = false }) {
+// `acumuladoDesde` (YYYY-MM-DD, 2026-10-30, solo el reporte "Por facturar",
+// pedido del usuario: 045519, 050352, 048490, 055411… "deben estar pero no
+// aparecen"): PENDIENTE GENERAR FACTURA / CON PENDIENTES DE PAGO ACUMULADOS —
+// todos los depósitos desde esa fecha hasta el fin del rango que siguen sin
+// factura, sin importar cuándo entraron (antes solo los que entraron en el rango).
+async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados = false, acumuladoDesde = null }) {
   const seriesSet = new Set((series ?? []).map(s => String(s).trim().toUpperCase()).filter(Boolean));
   if (!rfc || !seriesSet.size || !fechaInicio) return { depositos: [], depositosConSaldo: [], remisionesSinRespuesta: 0 };
 
@@ -287,7 +292,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
   const desde = new Date(`${fechaInicio}T00:00:00.000Z`);
   const hasta = new Date(`${fechaFin || fechaInicio}T23:59:59.999Z`);
   const linkSinFactura = l => seriesSet.has(String(l.serie ?? '').trim().toUpperCase()) && !l.folioFiscal && l.folioExterno;
-  const porFechaBanco = { fecha: { $gte: desde, $lte: hasta } };
+  const porFechaBanco = { fecha: { $gte: acumuladoDesde ? new Date(`${acumuladoDesde}T00:00:00.000Z`) : desde, $lte: hasta } };
   // Identificación: instante real → día de México (UTC-6, sin horario de verano).
   const enRangoId = {
     $gte: new Date(`${fechaInicio}T00:00:00.000-06:00`),
@@ -314,7 +319,8 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
   // vincularse; salen en PENDIENTE GENERAR FACTURA si Kore dice que la remisión
   // quedó en 0 dentro del rango (solo el reporte, no la póliza).
   let anteriores = [];
-  if (incluirIdentificados) {
+  // Acumulado: ya vienen todos (no hace falta buscar los liquidados en el rango).
+  if (incluirIdentificados && !acumuladoDesde) {
     const ya = new Set(bancos.map(b => String(b._id)));
     anteriores = (await BankMovement.find({
       isActive: { $ne: false },

@@ -62,7 +62,7 @@ test('solo facturas de la sucursal con algún depósito de días anteriores; gua
   const [{ cfdis, movimientos }] = mostrador.detectarMovimientosMostrador.mock.calls[0];
   expect(movimientos).toEqual([{ tipoOrigen: 'Venta Sin Cobro', debe: 1, cfdiUuid: GLOBAL }]);
   expect(cfdis.map(c => c.folio)).toEqual(['261009872']);
-  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true });
+  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true, acumuladoDesde: '2026-01-01' });
 
   expect(ReportePorFacturar.create.mock.calls[0][0]).toMatchObject({ rfc: 'CCO011113663', centroCostoId: 1, fechaInicio: '2026-10-20' });
   const guardado = terminado();
@@ -135,7 +135,7 @@ test('actualizar: recalcula con la misma sucursal y fechas y reemplaza los datos
   expect(update.mock.calls[0][0]).toMatchObject({ estado: 'calculando', error: null });
   await service._esperar(7);
   expect(ReportePorFacturar.create).not.toHaveBeenCalled();
-  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true });
+  expect(mostrador.detectarDepositosPendientesFactura).toHaveBeenCalledWith({ rfc: 'CCO011113663', series: ['A0'], fechaInicio: '2026-10-20', fechaFin: '2026-10-20', incluirIdentificados: true, acumuladoDesde: '2026-01-01' });
   const cambios = terminado();
   expect(cambios).toMatchObject({ estado: 'listo', sucursal: 'CEDIS', actualizadoPorId: 9, advertencias: null });
   expect(cambios.actualizadoEn).toBeInstanceOf(Date);

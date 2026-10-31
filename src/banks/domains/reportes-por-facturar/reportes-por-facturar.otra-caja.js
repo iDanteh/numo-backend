@@ -19,6 +19,9 @@ const LOTE = 50;
 const TOLERANCIA = 0.05;
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const _serie = v => String(v ?? '').trim().toUpperCase();
+// Parte en EFECTIVO de un cobro de Kore (no "DEPÓSITO EN EFECTIVO"); un abono
+// (ABO) en efectivo también cuenta — es dinero que recibió esa caja.
+const _efectivo = k => _r2(formasPagoDeCuentas([{ cobros: [k] }], () => true)?.efectivo ?? 0);
 
 // Todas las filas del reporte (depósitos y cobros de Kore) con sus remisiones.
 function _filasDelReporte(datos) {
@@ -72,14 +75,18 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
       const cliente = delReporte.map(d => d.cliente).find(Boolean) ?? '';
       const factura = c.serieFactura ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : 'POR FACTURAR';
       const reales = (c.cobros ?? []).filter(k => Number(k.monto) < 0);
-      const enOtra = reales.length > 0 && reales.every(k => _serie(k.claveCentro) && _serie(k.claveCentro) !== serie);
+      // Solo EFECTIVO cobrado en la caja de otro almacén (2026-10-30, usuario:
+      // "sí, corrígelo") — las transferencias que Cobranza aplica desde CEDIS
+      // (caja A0) a remisiones de I0/B0/C0 no son "cobradas en otra caja".
+      const efectivoEnOtra = k => _serie(k.claveCentro) && _serie(k.claveCentro) !== serie && _efectivo(k) > 0.005;
+      const enOtra = reales.length > 0 && reales.every(efectivoEnOtra);
       if (enOtra) soloOtraCaja.push(rem);
       // Sus depósitos de Bancos (que ya no salen en las otras pestañas) → ID NUMO.
       const idsBancos = [...new Set(delReporte.map(d => d.idNumo).filter(id => id && id !== 'S/R'))];
-      for (const k of c.cobros ?? []) {
+      for (const k of reales) {
+        if (!efectivoEnOtra(k)) continue;
         const caja = _serie(k.claveCentro);
-        if (!caja || caja === serie || !(Number(k.monto) < 0)) continue;
-        const importe = _r2(Math.abs(Number(k.monto)));
+        const importe = _efectivo(k);
         // ID NUMO del depósito de Bancos de esa remisión con el mismo importe (si lo hay).
         const deposito = delReporte.find(d => d.idNumo && d.idNumo !== 'S/R' && Math.abs((Number(d.importe) || 0) - importe) <= TOLERANCIA);
         cobros.push({
@@ -87,7 +94,7 @@ async function cobrosEnOtraCaja({ rfc, datos }) {
           descripcion: `COBRO ${k.serieOrigen ?? ''}-${k.folioOrigen ?? ''} EN CAJA ${caja}`,
           importe,
           banco:       (k.formasPago ?? []).map(fp => fp.nombre).filter(Boolean).join(' + '),
-          formasPago:  formasPagoDeCuentas([{ cobros: [k] }]),
+          formasPago:  { efectivo: importe },
           remisiones:  [rem],
           factura,
           cliente,

@@ -46,7 +46,9 @@ const _folio = f => `${f.serie ?? ''}-${f.folio ?? ''}`;
 const _diaMx = f => (f ? new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10) : null);
 const _suma = ds => _r2(ds.reduce((s, d) => s + (Number(d.importe) || 0), 0));
 // Almacén (serie A0, I0…) de un depósito: el de su remisión; sin remisión, el de la factura.
-const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0] ?? '').split('-')[0]) || _serie(serieFactura);
+// Abono en efectivo sin ligar (2026-11-03, "¿por qué lo separa de hoja?"): no
+// trae REM, va en el almacén de la remisión de Kore (remisionKore).
+const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0] ?? d.remisionKore ?? '').split('-')[0]) || _serie(serieFactura);
 
 /** Depósitos agrupados por cliente: alfabético, "CLIENTE NO IDENTIFICADO" al final. */
 function agruparPorCliente(depositos) {

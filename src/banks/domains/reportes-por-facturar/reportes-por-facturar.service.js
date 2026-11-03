@@ -211,7 +211,10 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
   }
 
-  const depositosEfectivoSinAsociar = await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin });
+  // Los que ya salen como abono en efectivo de una remisión (2026-11-03) no se repiten.
+  const efectivoAsociado = new Set(pendientes.efectivoAsociado ?? []);
+  const depositosEfectivoSinAsociar = (await detectarDepositosEfectivoSinAsociar({ fechaInicio, fechaFin }))
+    .filter(d => !efectivoAsociado.has(String(d.idNumo ?? '')));
 
   // A nombre de quién salió cada factura (CTE FACTURADO de REF. / FACT ESPECIALES).
   const receptorDe = new Map(facturas.map(f => [f.uuid, f.receptor?.nombre ?? null]));

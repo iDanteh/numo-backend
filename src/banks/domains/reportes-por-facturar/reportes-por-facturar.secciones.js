@@ -52,7 +52,8 @@ const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0]
 function agruparPorCliente(depositos) {
   const porCliente = new Map();
   for (const d of depositos) {
-    const c = d.cliente || NO_IDENTIFICADO;
+    // Abono en efectivo sin ligar (2026-11-03): en el grupo del cliente de su remisión.
+    const c = d.grupoCliente || d.cliente || NO_IDENTIFICADO;
     if (!porCliente.has(c)) porCliente.set(c, []);
     porCliente.get(c).push(d);
   }
@@ -300,6 +301,8 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
 }
 
 const _rem = d => (d.remisiones ?? []).join('\n');
+// Sin ligar en Bancos (2026-11-03): sin cliente en el renglón.
+const _cliente = d => (d.sinLigar ? '' : d.cliente || NO_IDENTIFICADO);
 
 // Al final de cada hoja: TOTAL EFECTIVO y, aparte, TOTAL DEPÓSITO EN EFECTIVO
 // (y las demás formas que haya).
@@ -329,7 +332,7 @@ function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.ho
       columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', 'CLIENTE', null],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.cliente || NO_IDENTIFICADO, d.idNumo],
+      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), _cliente(d), d.idNumo],
     });
   }
   _totalesFormaPago(ws, bloques);
@@ -382,7 +385,7 @@ function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
     columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'CLIENTE', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
     grupos: bloque.grupos,
     total: bloque.total,
-    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, d.cliente || NO_IDENTIFICADO, _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
+    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, _cliente(d), _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
   });
   ws.mergeCells(1, 1, 1, 10);
   ws.eachRow(row => { if (typeof row.getCell(8).value === 'number') row.getCell(8).numFmt = DINERO; });

@@ -284,3 +284,50 @@ test('acumuladoDesde: busca desde esa fecha y no hace la búsqueda de anteriores
   const filtro = BankMovement.find.mock.calls[0][0];
   expect(filtro.$or[0].fecha).toEqual({ $gte: new Date('2026-01-01T00:00:00.000Z'), $lte: new Date('2026-10-30T23:59:59.999Z') });
 });
+
+// 2026-11-03, caso real CESAR EFRAIN JARQUIN ALVARADO (A0-261001321): Kore trae
+// ABO-261010874 en efectivo $2,356.99 (10-oct) + CPF del SPEI 051909 $2,200;
+// en Bancos solo el SPEI está ligado y el efectivo es el 054504 (23-oct, sin
+// ligar) → sale APARTE en el mismo grupo, sin REM ni cliente.
+describe('abono en efectivo sin ligar en Bancos', () => {
+  const spei = { folio: '051909', banco: 'BBVA', fecha: '2026-10-09T12:00:00Z', concepto: 'SPEI RECIBIDOMercado Pago', deposito: 2200,
+    erpLinks: [{ serie: 'A0', folioExterno: '261001321', folioFiscal: null, saldoPagado: 2200, saldoActual: 189.93 }] };
+  const efectivo = { _id: 'e1', folio: '054504', banco: 'BBVA', fecha: '2026-10-23T12:00:00Z', concepto: 'DEPOSITO EN EFECTIVO', deposito: 2356.99, erpLinks: [] };
+  beforeEach(() => {
+    BankMovement.find.mockReset()
+      .mockReturnValueOnce({ lean: async () => [spei] })          // pendientes
+      .mockReturnValueOnce({ lean: async () => [spei] })          // ya ligado a la remisión
+      .mockReturnValueOnce({ lean: async () => [efectivo] });     // efectivo sin ligar del mismo importe
+    erp.obtenerDesglosesCobroAlmacen.mockResolvedValue([{ serieVenta: 'A0', folioVenta: '261001321', fechaCreacion: '2026-10-08', cobros: [
+      { serieOrigen: 'ABO', folioOrigen: '261010874', fecha: '2026-10-10T14:45:00Z', monto: -2356.99, formasPago: [{ claveSat: '01', nombre: 'EFECTIVO', monto: 2356.99 }] },
+      { serieOrigen: 'CPF', folioOrigen: '261004168', fecha: '2026-10-22T18:33:00Z', monto: -2200, formasPago: [{ claveSat: '03', nombre: 'TRANSFERENCIA', monto: 2200 }] },
+    ] }]);
+    erp.obtenerCuentaTicket.mockResolvedValue({ nombre: 'CESAR EFRAIN JARQUIN ALVARADO', tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', saldoActual: 0, factura: null });
+  });
+
+  test('sale aparte con su ID NUMO y se quita de efectivo sin asociar', async () => {
+    const r = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-11-03', incluirIdentificados: true, acumuladoDesde: '2026-01-01' });
+    expect(r.depositos.map(d => [d.idNumo, d.importe, d.remisiones, d.cliente, !!d.sinLigar])).toEqual([
+      ['051909', 2200, ['A0-261001321'], 'CESAR EFRAIN JARQUIN ALVARADO', false],
+      ['054504', 2356.99, [], '', true],
+    ]);
+    expect(r.depositos[1].grupoCliente).toBe('CESAR EFRAIN JARQUIN ALVARADO');
+    expect(r.efectivoAsociado).toEqual(['054504']);
+    const filtro = BankMovement.find.mock.calls[2][0];
+    expect(filtro.deposito).toEqual({ $gte: 2356.99 - 0.05, $lte: 2356.99 + 0.05 });
+  });
+
+  test('ya ligado en Bancos por el mismo importe → no se repite', async () => {
+    BankMovement.find.mockReset()
+      .mockReturnValueOnce({ lean: async () => [spei] })
+      .mockReturnValueOnce({ lean: async () => [spei, { ...efectivo, erpLinks: [{ serie: 'A0', folioExterno: '261001321', saldoPagado: 2356.99 }] }] });
+    const r = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-11-03', incluirIdentificados: true, acumuladoDesde: '2026-01-01' });
+    expect(r.depositos.map(d => d.idNumo)).toEqual(['051909']);
+    expect(BankMovement.find).toHaveBeenCalledTimes(2);
+  });
+
+  test('la póliza (sin incluirIdentificados) no lo agrega', async () => {
+    const r = await detectarDepositosPendientesFactura({ rfc: 'X', series: ['A0'], fechaInicio: '2026-10-09' });
+    expect(r.depositos.map(d => d.idNumo)).toEqual(['051909']);
+  });
+});

@@ -17,6 +17,14 @@
  *   • falta: alguna sin factura (con o sin saldo pendiente).
  * Con la fecha de entrada y la de factura se arma la evolución día por día.
  *
+ * ARRASTRE (2026-11-03, pedido del usuario: "que vaya arrastrando el
+ * historial: si se queda sin facturar se vaya guardando"): también entran los
+ * depósitos ANTERIORES al periodo (desde ARRASTRE_DESDE) que seguían sin
+ * facturar al empezarlo — los que se facturaron antes del periodo no. Salen
+ * marcados `arrastre` ("venían de antes"), cuentan en "había" y en los
+ * pendientes del día a día desde el primer día, y se ven facturar el día que
+ * se facturan.
+ *
  * Consulta Kore remisión por remisión (puede tardar minutos) → corre como
  * trabajo en segundo plano; la pantalla consulta su avance.
  */
@@ -38,6 +46,8 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 const LOTE_DESGLOSES = 50;
+// Desde cuándo se arrastran los pendientes (igual que el reporte "Por facturar").
+const ARRASTRE_DESDE = '2026-01-01';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const _diaMx = f => (f ? new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10) : null);
@@ -105,6 +115,19 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
     'erpLinks.serie': { $in: [...seriesSet] },
   }).select('fecha concepto deposito banco folio erpLinks primeraIdentificacionAt identificadoPor historialVinculacion').lean();
 
+  // Arrastre: depósitos anteriores al periodo con alguna remisión que al
+  // ligarse no tenía factura (las que ya la traían en Bancos no son pendientes).
+  onAvance('Buscando pendientes que vienen de antes…');
+  const ya = new Set(bancos.map(b => String(b._id)));
+  const anteriores = fechaInicio > ARRASTRE_DESDE ? (await BankMovement.find({
+    isActive: { $ne: false },
+    deposito: { $gt: 0 },
+    fecha:    { $gte: new Date(`${ARRASTRE_DESDE}T00:00:00.000Z`), $lt: new Date(`${fechaInicio}T00:00:00.000Z`) },
+    erpLinks: { $elemMatch: { serie: { $in: [...seriesSet] }, $or: [{ folioFiscal: null }, { folioFiscal: '' }] } },
+  }).select('fecha concepto deposito banco folio erpLinks primeraIdentificacionAt identificadoPor historialVinculacion').lean())
+    .filter(b => !ya.has(String(b._id))) : [];
+  bancos.push(...anteriores);
+
   const _serie = l => String(l.serie ?? '').trim().toUpperCase();
   const _clave = l => `${_serie(l)}|${String(l.folioExterno ?? '').trim()}`;
   // Solo PPD (o sin tipo en el vínculo): las PUE nunca son "por facturar" y
@@ -145,13 +168,13 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
     if (!links.length) continue;
     const entradaId = _identificadoEl(b);
     const entrada = [_diaDeposito(b.fecha), entradaId ? _diaMx(entradaId) : null].filter(Boolean).sort().pop();
-    if (!entrada || entrada < fechaInicio || entrada > fechaFin) continue;
-    candidatos.push({ b, links, entrada });
+    if (!entrada || entrada > fechaFin) continue;
+    candidatos.push({ b, links, entrada, arrastre: entrada < fechaInicio });
   }
   const facturasCfdi = await _facturasCfdi(new Set(candidatos.flatMap(c => c.links.map(l => facturaDe(_clave(l)))).filter(Boolean)));
 
   const hoy = _diaMx(new Date());
-  const depositos = candidatos.map(({ b, links, entrada }) => {
+  const depositos = candidatos.map(({ b, links, entrada, arrastre }) => {
     const unicas = [...new Map(links.map(l => [_clave(l), l])).values()];
     const facturas = unicas.map(l => facturaDe(_clave(l)));
     const facturado = facturas.every(Boolean);
@@ -166,6 +189,7 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
       idNumo:      b.folio ?? '',
       fecha:       b.fecha ?? null,
       entrada,
+      arrastre,
       descripcion: b.concepto ?? '',
       banco:       b.banco ?? '',
       importe:     _r2(b.deposito),
@@ -183,7 +207,10 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
       diasSinFacturar:  facturado ? null : _dias(entrada, hoy),
       saldo:       facturado ? 0 : saldo,
     };
-  }).sort((a, b) => a.entrada.localeCompare(b.entrada) || String(a.idNumo).localeCompare(String(b.idNumo)));
+  })
+    // De antes: solo los que seguían sin facturar al empezar el periodo.
+    .filter(d => !d.arrastre || !(d.estado === 'facturado' && d.fechaFactura && d.fechaFactura < fechaInicio))
+    .sort((a, b) => a.entrada.localeCompare(b.entrada) || String(a.idNumo).localeCompare(String(b.idNumo)));
 
   // ── Totales, por almacén y día por día ──────────────────────────────────────
   const resumir = ds => {
@@ -191,8 +218,12 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
     const faltan = ds.filter(d => d.estado === 'falta');
     const suma = xs => _r2(xs.reduce((s, d) => s + d.importe, 0));
     const conDias = fact.filter(d => d.diasParaFacturar != null);
+    const deAntes = ds.filter(d => d.arrastre);
     return {
       habia:      { depositos: ds.length, importe: suma(ds) },
+      // "Había" = venían de antes (sin facturar al empezar) + entraron en el periodo.
+      arrastre:   { depositos: deAntes.length, importe: suma(deAntes) },
+      nuevos:     { depositos: ds.length - deAntes.length, importe: _r2(suma(ds) - suma(deAntes)) },
       facturados: { depositos: fact.length, importe: suma(fact),
         global: fact.filter(d => d.tipoFactura === 'global').length, cliente: fact.filter(d => d.tipoFactura !== 'global').length },
       faltan:     { depositos: faltan.length, importe: suma(faltan),
@@ -224,6 +255,7 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
 
   return {
     sucursal, centroCostoId: centroCostoId ?? null, fechaInicio, fechaFin, calculadoEn: new Date(),
+    arrastreDesde: ARRASTRE_DESDE,
     totales: resumir(depositos),
     porAlmacen,
     diaADia,
@@ -300,6 +332,9 @@ async function _excelDe(r) {
   res.columns = [{ width: 34 }, { width: 14 }, { width: 18 }, { width: 14 }, { width: 18 }, { width: 14 }, { width: 18 }, { width: 10 }];
   res.addRow([`Estadística por facturar — ${r.sucursal ?? 'Todas'} — ${r.fechaInicio} a ${r.fechaFin}`]).font = { bold: true, size: 13 };
   res.addRow([`Calculado el ${new Date(r.calculadoEn).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`]);
+  if (r.totales?.arrastre) {
+    res.addRow([`"Había" incluye ${r.totales.arrastre.depositos} depósito(s) de antes del ${r.fechaInicio} que seguían sin facturar (desde el ${r.arrastreDesde}) + ${r.totales.nuevos.depositos} que entraron en el periodo.`]);
+  }
   res.addRow([]);
   encabezado(res.addRow(['ALMACÉN', 'HABÍA', 'IMPORTE', 'FACTURADOS', 'IMPORTE', 'FALTAN', 'IMPORTE', 'AVANCE']));
   const filaRes = (etiqueta, x, negritas) => {
@@ -322,10 +357,10 @@ async function _excelDe(r) {
   })));
 
   const comunes = [
-    ['entrada', 'ENTRÓ', 11], ['idNumo', 'ID NUMO', 10], ['descripcion', 'DESCRIPCIÓN', 40], ['importe', 'IMPORTE', 14, dinero],
+    ['entrada', 'ENTRÓ', 11], ['deAntes', 'VENÍA DE ANTES', 9], ['idNumo', 'ID NUMO', 10], ['descripcion', 'DESCRIPCIÓN', 40], ['importe', 'IMPORTE', 14, dinero],
     ['almacen', 'ALMACÉN', 16], ['rem', 'REMISIONES', 18], ['cliente', 'CLIENTE', 30],
   ];
-  const base = d => ({ ...d, almacen: [d.serie, d.sucursal].filter(Boolean).join(' - '), rem: d.remisiones.join('\n'), cliente: d.cliente || 'CLIENTE NO IDENTIFICADO' });
+  const base = d => ({ ...d, deAntes: d.arrastre ? 'SÍ' : '', almacen: [d.serie, d.sucursal].filter(Boolean).join(' - '), rem: d.remisiones.join('\n'), cliente: d.cliente || 'CLIENTE NO IDENTIFICADO' });
   hoja('FACTURADOS', [...comunes, ['factura', 'FACTURA', 18], ['tipo', 'TIPO', 10], ['fechaFactura', 'FECHA FACTURA', 13], ['diasParaFacturar', 'DÍAS QUE TARDÓ', 10]],
     r.depositos.filter(d => d.estado === 'facturado').map(d => ({
       ...base(d), factura: d.facturas.join('\n'), tipo: d.tipoFactura === 'global' ? 'GLOBAL' : d.tipoFactura === 'mixto' ? 'MIXTO' : 'CLIENTE',

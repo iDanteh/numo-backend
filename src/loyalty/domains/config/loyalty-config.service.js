@@ -108,6 +108,45 @@ async function guardarPorcentajes({ Bronce, Plata, Oro } = {}, user) {
 }
 
 /**
+ * CONGELAMIENTO_MESES (2026-11-03, pedido explícito del usuario) — "Congelamiento de puntos"
+ * por inactividad: meses sin una ACUMULACIÓN real tras los cuales el job diario
+ * (`loyalty/jobs/congelamiento-puntos.service.js`) resetea el saldo de una tarjeta a 0, vía un
+ * AJUSTE real en el ledger (auditable con el historial existente — PR2, sin UI nueva). Vive en
+ * `GlobalConfig` sección `lealtad` (mismo mecanismo que los % de nivel), `tipo:'numero'`.
+ *
+ * Deshabilitado = sin configurar (D11: nunca default inventado) O configurado EXPLÍCITAMENTE en
+ * 0 — mismo criterio exacto en lectura y escritura, para que `obtenerCongelamientoMeses() ===
+ * null` sea la única señal que el job necesita consultar antes de correr.
+ */
+function _validarCongelamientoMeses(valor) {
+  if (valor === null || valor === undefined || valor === '') return 0;
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestError('Los meses de congelamiento deben ser un número entero positivo (o 0/vacío para deshabilitar).');
+  }
+  return n;
+}
+
+/** `null` cuando no está configurado o está en 0 (deshabilitado) — nunca se asume un valor. */
+async function obtenerCongelamientoMeses() {
+  const valor = await globalConfigService.getValue(SECTION, 'CONGELAMIENTO_MESES').catch(() => null);
+  if (valor === null) return null;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n > 0) ? n : null;
+}
+
+/** Guarda los meses de congelamiento. `meses` null/undefined/0 deshabilita la feature (se
+ *  persiste '0', nunca se borra la fila — mismo criterio que guardarFotoFolderId con vacío). */
+async function guardarCongelamientoMeses(meses, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarCongelamientoMeses(meses);
+  await globalConfigService.setValue(SECTION, 'CONGELAMIENTO_MESES', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n > 0 ? n : null;
+}
+
+/**
  * ESPECIALIDADES (2026-10-23) — catálogo de referencia para altas futuras de clientes, vive en
  * `GlobalConfig` sección `lealtad` (mismo mecanismo que los %), `tipo:'lista'` (JSON array de
  * strings). Se gestiona DESDE acá (loyalty:config/loyalty:read), nunca desde el `config:manage`
@@ -193,14 +232,30 @@ async function obtenerHistorial(clave) {
   return globalConfigService.listAuditLog(config.id);
 }
 
+const CATEGORIAS_REASON = ['ajuste', 'bonificacion'];
+
+function _validarCategoria(categoria) {
+  if (!CATEGORIAS_REASON.includes(categoria)) {
+    throw new BadRequestError(`categoria debe ser una de: ${CATEGORIAS_REASON.join(', ')}.`);
+  }
+  return categoria;
+}
+
 /**
  * Catálogo de motivos de ajuste. `soloActivos` es lo que debe consumir el
  * selector de un AJUSTE nuevo (un motivo desactivado no es seleccionable);
  * sin el flag trae todo, para la pantalla de administración del catálogo
  * (donde también se ven/reactivan los inactivos).
+ *
+ * `categoria` (split 2026-11-03, pedido explícito del usuario): filtra entre
+ * "Motivos de ajuste" y "Catálogo de bonificaciones" — mismo catálogo físico
+ * (ver LoyaltyAdjustmentReason.js), la UI pide cada sección por separado.
+ * Sin el filtro trae ambas categorías juntas (ej. el selector de un AJUSTE
+ * nuevo en movimiento-modal, que puede usar un motivo de cualquiera de las dos).
  */
-async function listarReasons({ soloActivos = false } = {}) {
+async function listarReasons({ soloActivos = false, categoria } = {}) {
   const where = soloActivos ? { activo: true } : {};
+  if (categoria !== undefined) where.categoria = _validarCategoria(categoria);
   return LoyaltyAdjustmentReason.findAll({ where, order: [['nombre', 'ASC']] });
 }
 
@@ -218,19 +273,24 @@ function _validarPuntosFijos(valor) {
  * definido (puede ser negativo), un AJUSTE con este motivo aplica EXACTAMENTE ese valor — ver
  * loyalty-ledger.service.js#registrarAjuste. Si no, el motivo queda en modo manual (quien aplica
  * el ajuste escribe los puntos a mano, cualquier signo).
+ *
+ * `categoria` (split 2026-11-03) es REQUERIDA — columna NOT NULL en `loyalty_adjustment_reasons`
+ * (ver migración en shared/models/postgres/index.js). La UI nunca deja elegirla en el formulario:
+ * cada sección de lealtad-config.component.ts la manda fija según en cuál está parado el usuario.
  */
-async function crearReason({ clave, nombre, puntosFijos } = {}) {
+async function crearReason({ clave, nombre, puntosFijos, categoria } = {}) {
   const nombreTrim = String(nombre ?? '').trim();
   if (!nombreTrim) {
     throw new BadRequestError('nombre es requerido.');
   }
+  const categoriaValidada = _validarCategoria(categoria);
 
   const puntosFijosValidado = (puntosFijos === undefined || puntosFijos === null)
     ? null
     : _validarPuntosFijos(puntosFijos);
 
   return LoyaltyAdjustmentReason.create({
-    clave, nombre: nombreTrim, activo: true, puntosFijos: puntosFijosValidado,
+    clave, nombre: nombreTrim, activo: true, puntosFijos: puntosFijosValidado, categoria: categoriaValidada,
   });
 }
 
@@ -240,7 +300,7 @@ async function crearReason({ clave, nombre, puntosFijos } = {}) {
  * referenciándola en entradas históricas (requisito del spec: "Historical
  * entries keep their original reason").
  */
-async function editarReason(id, { nombre, activo, puntosFijos } = {}) {
+async function editarReason(id, { nombre, activo, puntosFijos, categoria } = {}) {
   const reason = await LoyaltyAdjustmentReason.findByPk(id);
   if (!reason) throw new NotFoundError('Motivo de ajuste');
 
@@ -251,10 +311,16 @@ async function editarReason(id, { nombre, activo, puntosFijos } = {}) {
     puntosFijosValidado = puntosFijos === null ? null : _validarPuntosFijos(puntosFijos);
   }
 
+  // `categoria` (split 2026-11-03): opcional en edición (undefined = no tocar) — la UI nunca la
+  // manda (una sección no mueve un motivo a la otra), pero el servicio la soporta por completitud
+  // del contrato CRUD, validada igual que en crearReason si viene presente.
+  const categoriaValidada = categoria !== undefined ? _validarCategoria(categoria) : undefined;
+
   const cambios = {};
   if (nombre !== undefined) cambios.nombre = nombre;
   if (activo !== undefined) cambios.activo = activo;
   if (puntosFijos !== undefined) cambios.puntosFijos = puntosFijosValidado;
+  if (categoria !== undefined) cambios.categoria = categoriaValidada;
 
   await reason.update(cambios);
   return reason;
@@ -536,6 +602,8 @@ async function actualizarFormaPagoKore(id, { acumulaPuntos, esPuntos } = {}) {
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
+  obtenerCongelamientoMeses,
+  guardarCongelamientoMeses,
   obtenerEspecialidades,
   guardarEspecialidades,
   obtenerFotoFolderId,

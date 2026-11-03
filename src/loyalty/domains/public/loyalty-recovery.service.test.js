@@ -24,12 +24,18 @@ jest.mock('../../shared/nip.util', () => ({
 jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
 }));
+// Historial de movimientos (2026-11-03) — se mockea completo, cubierto aparte en
+// loyalty-ledger.service.test.js; acá solo se verifica que se agrega al payload de éxito.
+jest.mock('../ledger/loyalty-ledger.service', () => ({
+  listarMovimientosPublicos: jest.fn(),
+}));
 
 const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
 const {
   generarNip, generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+const ledgerService = require('../ledger/loyalty-ledger.service');
 const { solicitarCodigo, confirmarCodigoConsulta } = require('./loyalty-recovery.service');
 
 const TELEFONO = '5512345678';
@@ -58,6 +64,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   LoyaltyCard.scope.mockReturnValue(LoyaltyCard);
   process.env.NODE_ENV = 'test';
+  ledgerService.listarMovimientosPublicos.mockResolvedValue([]);
 });
 
 afterAll(() => {
@@ -326,7 +333,9 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
 
     const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
 
-    expect(resultado).toEqual({ nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 1234.5 });
+    expect(resultado).toEqual({
+      nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 1234.5, movimientos: [],
+    });
     expect(generarNip).not.toHaveBeenCalled();
     expect(card.update).toHaveBeenCalledWith({
       recuperacionCodigoHash: null,
@@ -430,7 +439,22 @@ describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEven
     compararCodigo.mockResolvedValue(true);
 
     await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).resolves.toEqual({
-      nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 100,
+      nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 100, movimientos: [],
     });
+  });
+
+  // Historial de movimientos (2026-11-03, pedido explícito del usuario) — reusa
+  // listarMovimientosPublicos del ledger, nunca reasonId/usuarioId/justificacion (D6-D8).
+  test('incluye movimientos (historial público recortado) resueltos por cardId', async () => {
+    const card = makeCard({ activa: true, saldoPuntos: 50 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+    const movimientos = [{ fecha: '2026-11-01', tipoLabel: 'Bonificación', puntos: '100.00', saldoAnterior: '0.00', saldoActual: '100.00' }];
+    ledgerService.listarMovimientosPublicos.mockResolvedValue(movimientos);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(ledgerService.listarMovimientosPublicos).toHaveBeenCalledWith(card.id);
+    expect(resultado.movimientos).toEqual(movimientos);
   });
 });

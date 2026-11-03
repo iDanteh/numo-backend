@@ -50,6 +50,8 @@ const {
   MAX_INTENTOS_FALLIDOS, LOCKOUT_MS,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+// Historial de movimientos (2026-11-03) — mismo criterio que loyalty-public.service.js#consultaPublica.
+const ledgerService = require('../ledger/loyalty-ledger.service');
 
 const CODIGO_VIGENCIA_MS = 10 * 60 * 1000;
 
@@ -235,7 +237,7 @@ async function _validarCodigo(telefono, codigo, { ip } = {}) {
  * @param {string} telefono
  * @param {string} codigo
  * @param {{ip?: string}} [ctx]
- * @returns {Promise<{nombre: string, nivel: string, saldoPuntos: string}>}
+ * @returns {Promise<{nombre: string, nivel: string, saldoPuntos: string, movimientos: object[]}>}
  */
 async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
   const card = await _validarCodigo(telefono, codigo, ctx);
@@ -254,7 +256,9 @@ async function confirmarCodigoConsulta(telefono, codigo, ctx = {}) {
 
   // Nombre completo (2026-10-29, pedido explícito del usuario) — antes solo el primer nombre
   // (`primerNombre`); `card.nombre` ya es el combinado "Nombre Apellidos", no hace falta concatenar.
-  return { nombre: card.nombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos };
+  // Historial de movimientos (2026-11-03) — últimos 20, payload recortado (ver ledgerService.listarMovimientosPublicos).
+  const movimientos = await ledgerService.listarMovimientosPublicos(card.id);
+  return { nombre: card.nombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos, movimientos };
 }
 
 module.exports = { solicitarCodigo, confirmarCodigoConsulta, RecoveryFailedError };

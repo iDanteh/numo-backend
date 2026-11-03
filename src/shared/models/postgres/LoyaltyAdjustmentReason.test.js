@@ -36,4 +36,14 @@ describe('LoyaltyAdjustmentReason — modelo Sequelize (loyalty_adjustment_reaso
     expect(attr.allowNull).toBe(false);
     expect(attr.defaultValue).toBe(true);
   });
+
+  // Split de catálogo (2026-11-03): separa "Motivos de ajuste" de "Catálogo de bonificaciones"
+  // sin tabla nueva — ver comentario del modelo.
+  test('categoria: STRING(20) NOT NULL default "ajuste", solo admite ajuste/bonificacion', () => {
+    const attr = LoyaltyAdjustmentReason.getAttributes().categoria;
+    expect(attr.type.options.length).toBe(20);
+    expect(attr.allowNull).toBe(false);
+    expect(attr.defaultValue).toBe('ajuste');
+    expect(attr.validate.isIn[0]).toEqual(['ajuste', 'bonificacion']);
+  });
 });

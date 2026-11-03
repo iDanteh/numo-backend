@@ -45,6 +45,8 @@ jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
 jest.mock('./domains/config/loyalty-config.service', () => ({
   obtenerPorcentajes: jest.fn(),
   guardarPorcentajes: jest.fn(),
+  obtenerCongelamientoMeses: jest.fn(),
+  guardarCongelamientoMeses: jest.fn(),
   obtenerEspecialidades: jest.fn(),
   guardarEspecialidades: jest.fn(),
   obtenerFotoFolderId: jest.fn(),
@@ -109,6 +111,8 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'post',  ruta: '/cards/1/ajustes',            permiso: PERMISSIONS.LOYALTY_AJUSTES, body: { puntos: 10, reasonId: 1, justificacion: 'bono' } },
     { metodo: 'get',   ruta: '/config',                     permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
+    { metodo: 'get',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { meses: 6 } },
     { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
     { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
@@ -291,6 +295,24 @@ describe('wiring hacia los servicios (happy path)', () => {
     );
   });
 
+  test('GET /config/congelamiento llama a obtenerCongelamientoMeses', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(6);
+    const res = await request(app).get('/config/congelamiento').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ meses: 6 });
+    expect(configService.obtenerCongelamientoMeses).toHaveBeenCalled();
+  });
+
+  test('PUT /config/congelamiento llama a guardarCongelamientoMeses con meses y el usuario', async () => {
+    configService.guardarCongelamientoMeses.mockResolvedValue(6);
+    const res = await request(app).put('/config/congelamiento')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ meses: 6 });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ meses: 6 });
+    expect(configService.guardarCongelamientoMeses).toHaveBeenCalledWith(6, expect.objectContaining({ dbId: '1' }));
+  });
+
   test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {
     configService.obtenerFotoFolderId.mockResolvedValue('abc123');
     const res = await request(app).get('/config/foto-folder').set(perms(PERMISSIONS.LOYALTY_READ));
@@ -344,6 +366,16 @@ describe('wiring hacia los servicios (happy path)', () => {
       .send({ activa: false });
     expect(res.status).toBe(200);
     expect(configService.editarPromocion).toHaveBeenCalledWith('1', { activa: false });
+  });
+
+  // Split de catálogo (2026-11-03): el query param categoria filtra entre "Motivos de ajuste" y
+  // "Catálogo de bonificaciones" — ver loyalty-config.service.js#listarReasons.
+  test('GET /reasons pasa categoria y soloActivos al service', async () => {
+    configService.listarReasons.mockResolvedValue([]);
+    const res = await request(app).get('/reasons?categoria=bonificacion&soloActivos=true')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(configService.listarReasons).toHaveBeenCalledWith({ soloActivos: true, categoria: 'bonificacion' });
   });
 
   test('GET /config/conceptos-kore llama a listarConceptosKore con soloActivos', async () => {

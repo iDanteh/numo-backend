@@ -680,11 +680,78 @@ describe('listarMovimientos / listarNiveles', () => {
     expect(result.movimientos).toHaveLength(2);
   });
 
+  // saldoAnterior/saldoActual (2026-11-03, pedido explícito del usuario): CALCULADOS a partir de
+  // saldoResultante - puntos, nunca persistidos. saldoActual es un alias explícito de
+  // saldoResultante (se conserva también, por compatibilidad con cualquier consumidor existente).
+  test('agrega saldoAnterior (saldoResultante - puntos) y saldoActual (alias de saldoResultante)', async () => {
+    LoyaltyPointsLedger.findAndCountAll.mockResolvedValue({
+      count: 1,
+      rows: [{ id: 1, tipo: 'ACUMULACION', puntos: '15.00', saldoResultante: '115.00' }],
+    });
+
+    const result = await ledgerService.listarMovimientos(1, { page: 1, limit: 50 });
+
+    expect(result.movimientos[0]).toMatchObject({
+      saldoResultante: '115.00', saldoActual: '115.00', saldoAnterior: '100.00',
+    });
+  });
+
+  test('fila con datos incompletos (mock mínimo) nunca revienta — saldoAnterior queda null', async () => {
+    LoyaltyPointsLedger.findAndCountAll.mockResolvedValue({ count: 1, rows: [{ id: 1 }] });
+
+    const result = await ledgerService.listarMovimientos(1, { page: 1, limit: 50 });
+
+    expect(result.movimientos[0].saldoAnterior).toBeNull();
+  });
+
   test('listarNiveles delega en LoyaltyTierHistory', async () => {
     LoyaltyTierHistory.findAll.mockResolvedValue([{ id: 1 }]);
     const result = await ledgerService.listarNiveles(1);
     expect(result).toHaveLength(1);
     expect(LoyaltyTierHistory.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: { cardId: 1 } }));
+  });
+});
+
+describe('listarMovimientosPublicos — historial para la consulta pública (2026-11-03)', () => {
+  test('recorta el payload a fecha/tipoLabel/puntos/saldoAnterior/saldoActual, nunca reasonId/usuarioId/justificacion', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { id: 1, tipo: 'CANJE', puntos: '-10.00', saldoResultante: '90.00', createdAt: '2026-11-01T00:00:00Z', reasonId: 5, usuarioId: 'u1', justificacion: 'x' },
+    ]);
+
+    const result = await ledgerService.listarMovimientosPublicos(1);
+
+    expect(result).toEqual([
+      { fecha: '2026-11-01T00:00:00Z', tipoLabel: 'Canje', puntos: '-10.00', saldoAnterior: '100.00', saldoActual: '90.00' },
+    ]);
+    expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: { cardId: 1 }, limit: 20 }));
+  });
+
+  test('AJUSTE con reason categoria=bonificacion → tipoLabel "Bonificación"', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { id: 1, tipo: 'AJUSTE', puntos: '100.00', saldoResultante: '100.00', createdAt: '2026-11-01', reason: { categoria: 'bonificacion' } },
+    ]);
+
+    const result = await ledgerService.listarMovimientosPublicos(1);
+
+    expect(result[0].tipoLabel).toBe('Bonificación');
+  });
+
+  test('AJUSTE con reason categoria=ajuste (o sin reason resuelto) → tipoLabel "Ajuste"', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { id: 1, tipo: 'AJUSTE', puntos: '-5.00', saldoResultante: '95.00', createdAt: '2026-11-01', reason: { categoria: 'ajuste' } },
+      { id: 2, tipo: 'AJUSTE', puntos: '-5.00', saldoResultante: '90.00', createdAt: '2026-11-02', reason: null },
+    ]);
+
+    const result = await ledgerService.listarMovimientosPublicos(1);
+
+    expect(result[0].tipoLabel).toBe('Ajuste');
+    expect(result[1].tipoLabel).toBe('Ajuste');
+  });
+
+  test('respeta un limit custom', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([]);
+    await ledgerService.listarMovimientosPublicos(1, { limit: 5 });
+    expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith(expect.objectContaining({ limit: 5 }));
   });
 });
 

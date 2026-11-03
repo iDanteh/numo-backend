@@ -189,6 +189,18 @@ router.put('/config/porcentajes', authenticate, permit(PERMISSIONS.LOYALTY_CONFI
   res.json(await configService.guardarPorcentajes(req.body, req.user));
 }));
 
+// Congelamiento de puntos por inactividad (2026-11-03) — meses sin ACUMULACIÓN tras los cuales
+// el job diario (loyalty/jobs/congelamientoPuntosCron.js) resetea el saldo a 0. Mismo criterio de
+// permisos que PORCENTAJES arriba (LOYALTY_READ/LOYALTY_CONFIG). `{ meses: number | null }` —
+// null = feature deshabilitada (sin configurar o en 0, ver loyalty-config.service.js).
+router.get('/config/congelamiento', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ meses: await configService.obtenerCongelamientoMeses() });
+}));
+
+router.put('/config/congelamiento', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ meses: await configService.guardarCongelamientoMeses(req.body?.meses, req.user) });
+}));
+
 // Especialidades (2026-10-23) — catálogo de referencia, mismo criterio de permisos que arriba:
 // LOYALTY_READ para leer, LOYALTY_CONFIG para editar. Fusionado acá (en vez del config:manage
 // genérico) para que toda la configuración de Lealtad viva en una sola pantalla.
@@ -219,8 +231,14 @@ router.get('/config/historial/:clave', authenticate, permit(PERMISSIONS.LOYALTY_
   res.json(await configService.obtenerHistorial(req.params.clave));
 }));
 
+// `categoria` (split 2026-11-03): filtra entre "Motivos de ajuste" y "Catálogo de
+// bonificaciones" — ver loyalty-config.service.js#listarReasons. Query param opcional, sin él
+// trae ambas categorías (ej. el selector de un AJUSTE nuevo en movimiento-modal).
 router.get('/reasons', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
-  res.json(await configService.listarReasons({ soloActivos: req.query.soloActivos === 'true' }));
+  res.json(await configService.listarReasons({
+    soloActivos: req.query.soloActivos === 'true',
+    categoria:   req.query.categoria,
+  }));
 }));
 
 router.post('/reasons', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {

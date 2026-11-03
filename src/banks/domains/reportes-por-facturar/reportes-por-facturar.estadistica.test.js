@@ -59,6 +59,8 @@ test('había / facturados / faltan, por almacén y día a día', async () => {
   ]);
   expect(r.totales).toEqual({
     habia:      { depositos: 4, importe: 2000 },
+    arrastre:   { depositos: 0, importe: 0 },
+    nuevos:     { depositos: 4, importe: 2000 },
     facturados: { depositos: 2, importe: 1300, global: 1, cliente: 1 },
     faltan:     { depositos: 2, importe: 700, conSaldo: 1, saldo: 120.5 },
     avance:     50,
@@ -103,7 +105,41 @@ test('segundo plano + Excel con RESUMEN, DÍA A DÍA, FACTURADOS y FALTAN', asyn
   await wb.xlsx.load(buffer);
   expect(wb.worksheets.map(w => w.name)).toEqual(['RESUMEN', 'DÍA A DÍA', 'FACTURADOS', 'FALTAN']);
   expect(wb.getWorksheet('FACTURADOS').rowCount).toBe(3);
-  expect(wb.getWorksheet('FALTAN').getRow(2).getCell(7).value).toBe('CLIENTE A02');
+  expect(wb.getWorksheet('FALTAN').getRow(2).getCell(8).value).toBe('CLIENTE A02');
+});
+
+// 2026-11-03 ARRASTRE: los de antes del periodo que seguían sin facturar al
+// empezarlo cuentan en "había" (marcados), los facturados antes no.
+test('arrastre: pendientes de antes del periodo', async () => {
+  const actuales = [dep('100', '2026-10-20', 1000, [link('A0', '1')])];
+  const anteriores = [
+    dep('090', '2026-09-10', 400, [link('A0', '7')], { _id: 'a' }),   // sigue sin factura → falta
+    dep('091', '2026-09-11', 250, [link('A0', '8')], { _id: 'b' }),   // facturado el 5-oct (antes del periodo) → no
+    dep('092', '2026-09-12', 600, [link('A0', '9')], { _id: 'c' }),   // facturado el 21-oct (dentro) → sí
+  ];
+  BankMovement.find.mockReset().mockReturnValueOnce(lean(actuales)).mockReturnValueOnce(lean(anteriores));
+  erp.obtenerDesglosesCobroAlmacen.mockImplementation(async ({ series, folios }) => series.map((sr, i) => ({
+    serieVenta: sr, folioVenta: folios[i], fechaCreacion: '2026-09-01',
+    ...({ 1: { serieFactura: 'A0', folioFactura: 'G1' }, 8: { serieFactura: 'A0', folioFactura: 'G0' }, 9: { serieFactura: 'A0', folioFactura: 'G2' } }[folios[i]] ?? {}),
+  })));
+  CFDI.find.mockReturnValue(lean([
+    { serie: 'A0', folio: 'G1', fecha: '2026-10-22T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },
+    { serie: 'A0', folio: 'G0', fecha: '2026-10-05T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },
+    { serie: 'A0', folio: 'G2', fecha: '2026-10-21T18:00:00Z', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },
+  ]));
+  const r = await est.calcular({ rfc: 'R', fechaInicio: '2026-10-20', fechaFin: '2026-10-22' });
+  const filtro = BankMovement.find.mock.calls[1][0];
+  expect(filtro.fecha).toEqual({ $gte: new Date('2026-01-01T00:00:00.000Z'), $lt: new Date('2026-10-20T00:00:00.000Z') });
+  expect(r.depositos.map(d => [d.idNumo, d.estado, d.arrastre])).toEqual([
+    ['090', 'falta', true], ['092', 'facturado', true], ['100', 'facturado', false],
+  ]);
+  expect(r.totales.habia).toEqual({ depositos: 3, importe: 2000 });
+  expect(r.totales.arrastre).toEqual({ depositos: 2, importe: 1000 });
+  expect(r.totales.nuevos).toEqual({ depositos: 1, importe: 1000 });
+  // Pendientes desde el primer día: los 2 de antes + el nuevo; el 21 se factura el 092, el 22 el 100.
+  expect(r.diaADia.map(d => [d.dia, d.nuevos.depositos, d.facturados.depositos, d.pendientes.depositos])).toEqual([
+    ['2026-10-20', 1, 0, 3], ['2026-10-21', 0, 1, 2], ['2026-10-22', 0, 1, 1],
+  ]);
 });
 
 // 2026-10-30: el mes en curso se guarda y se ve al instante al entrar.

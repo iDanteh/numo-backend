@@ -21,7 +21,7 @@
  * historial: si se queda sin facturar se vaya guardando"): también entran los
  * depósitos ANTERIORES al periodo (desde ARRASTRE_DESDE) que seguían sin
  * facturar al empezarlo — los que se facturaron antes del periodo no. Salen
- * marcados `arrastre` ("venían de antes"), cuentan en "había" y en los
+ * marcados `arrastre` (PERIODO = REZAGADO; los del periodo = ACTUAL), cuentan en "había" y en los
  * pendientes del día a día desde el primer día, y se ven facturar el día que
  * se facturan.
  *
@@ -333,7 +333,7 @@ async function _excelDe(r) {
   res.addRow([`Estadística por facturar — ${r.sucursal ?? 'Todas'} — ${r.fechaInicio} a ${r.fechaFin}`]).font = { bold: true, size: 13 };
   res.addRow([`Calculado el ${new Date(r.calculadoEn).toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`]);
   if (r.totales?.arrastre) {
-    res.addRow([`"Había" incluye ${r.totales.arrastre.depositos} depósito(s) de antes del ${r.fechaInicio} que seguían sin facturar (desde el ${r.arrastreDesde}) + ${r.totales.nuevos.depositos} que entraron en el periodo.`]);
+    res.addRow([`"Había" = ${r.totales.nuevos.depositos} ACTUAL(ES) (entraron en el periodo) + ${r.totales.arrastre.depositos} REZAGADO(S) (entraron antes del ${r.fechaInicio}, desde el ${r.arrastreDesde}, y seguían sin facturar).`]);
   }
   res.addRow([]);
   encabezado(res.addRow(['ALMACÉN', 'HABÍA', 'IMPORTE', 'FACTURADOS', 'IMPORTE', 'FALTAN', 'IMPORTE', 'AVANCE']));
@@ -357,10 +357,10 @@ async function _excelDe(r) {
   })));
 
   const comunes = [
-    ['entrada', 'ENTRÓ', 11], ['deAntes', 'VENÍA DE ANTES', 9], ['idNumo', 'ID NUMO', 10], ['descripcion', 'DESCRIPCIÓN', 40], ['importe', 'IMPORTE', 14, dinero],
+    ['entrada', 'ENTRÓ', 11], ['periodo', 'PERIODO', 11], ['idNumo', 'ID NUMO', 10], ['descripcion', 'DESCRIPCIÓN', 40], ['importe', 'IMPORTE', 14, dinero],
     ['almacen', 'ALMACÉN', 16], ['rem', 'REMISIONES', 18], ['cliente', 'CLIENTE', 30],
   ];
-  const base = d => ({ ...d, deAntes: d.arrastre ? 'SÍ' : '', almacen: [d.serie, d.sucursal].filter(Boolean).join(' - '), rem: d.remisiones.join('\n'), cliente: d.cliente || 'CLIENTE NO IDENTIFICADO' });
+  const base = d => ({ ...d, periodo: d.arrastre ? 'REZAGADO' : 'ACTUAL', almacen: [d.serie, d.sucursal].filter(Boolean).join(' - '), rem: d.remisiones.join('\n'), cliente: d.cliente || 'CLIENTE NO IDENTIFICADO' });
   hoja('FACTURADOS', [...comunes, ['factura', 'FACTURA', 18], ['tipo', 'TIPO', 10], ['fechaFactura', 'FECHA FACTURA', 13], ['diasParaFacturar', 'DÍAS QUE TARDÓ', 10]],
     r.depositos.filter(d => d.estado === 'facturado').map(d => ({
       ...base(d), factura: d.facturas.join('\n'), tipo: d.tipoFactura === 'global' ? 'GLOBAL' : d.tipoFactura === 'mixto' ? 'MIXTO' : 'CLIENTE',

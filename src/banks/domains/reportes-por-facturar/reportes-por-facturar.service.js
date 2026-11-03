@@ -29,9 +29,13 @@ const { detectarMovimientosMostrador, detectarDepositosPendientesFactura, detect
 const { tablasMostrador } = require('../cfdi-mapping/mostrador-hoja');
 const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
+const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
+const { cobrosEnOtraCaja } = require('./reportes-por-facturar.otra-caja');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
+// PENDIENTE GENERAR FACTURA / CON PENDIENTES DE PAGO: acumulados desde aquí.
+const PENDIENTES_DESDE = '2026-01-01';
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 
@@ -104,6 +108,47 @@ async function _movimientosMostradorSinPoliza({ rfc, facturas }) {
   return detectarMovimientosMostrador({ rfc, cfdis: facturas.filter(f => conDepositoAnterior.has(f.uuid)), movimientos });
 }
 
+/**
+ * Refacturación (2026-10-30, pedido del usuario): una remisión repartida en
+ * varias facturas — caso real A0-260804937 ($59,997.42, TIBURCIO GARCIA CRUZ)
+ * facturada el 30-oct en A0-261015291, A0-261015312 y A0-261015397; Kore solo
+ * da una (la del desglose) y el bloque solo mostraba esa. Con las remisiones
+ * de cada factura del reporte busca en las copias ERP (DocumentosRelacionados
+ * de Kore) las OTRAS facturas vigentes que amparan esas mismas remisiones →
+ * `otrasFacturas` (['A0-261015291', …]) para el encabezado.
+ */
+const DIAS_REFACTURACION = 90;
+
+async function _marcarOtrasFacturas(entradas, fechaInicio) {
+  const remisionesDe = f => [...new Set((f.depositos ?? []).flatMap(d => d.remisiones ?? []))];
+  const remisiones = [...new Set(entradas.flatMap(remisionesDe))];
+  if (!remisiones.length) return;
+  const facturasDe = new Map(); // 'A0-260804937' → Set('A0-261015291', …)
+  for (let i = 0; i < remisiones.length; i += 200) {
+    const pares = remisiones.slice(i, i + 200).map(r => { const j = r.indexOf('-'); return { Serie: r.slice(0, j), Folio: r.slice(j + 1) }; });
+    const docs = await CFDI.find({
+      source: 'ERP', tipoDeComprobante: 'I',
+      fecha: { $gte: new Date(new Date(`${fechaInicio}T00:00:00Z`).getTime() - DIAS_REFACTURACION * 86400000) },
+      satStatus: { $ne: 'Cancelado' }, erpStatus: { $nin: ['Cancelado', 'Cancelacion Pendiente'] },
+      documentosRelacionados: { $elemMatch: { $or: pares } },
+    }).select('serie folio documentosRelacionados').lean();
+    for (const c of docs) {
+      const folio = `${String(c.serie ?? '').trim().toUpperCase()}-${String(c.folio ?? '').trim()}`;
+      for (const d of c.documentosRelacionados ?? []) {
+        const rem = `${String(d.Serie ?? '').trim().toUpperCase()}-${String(d.Folio ?? '').trim()}`;
+        if (!facturasDe.has(rem)) facturasDe.set(rem, new Set());
+        facturasDe.get(rem).add(folio);
+      }
+    }
+  }
+  for (const f of entradas) {
+    const propia = `${String(f.serie ?? '').trim().toUpperCase()}-${String(f.folio ?? '').trim()}`;
+    const otras = new Set(remisionesDe(f).flatMap(r => [...(facturasDe.get(r) ?? [])]));
+    otras.delete(propia);
+    if (otras.size) f.otrasFacturas = [...otras].sort();
+  }
+}
+
 function _resumen(datos) {
   const t = tablasMostrador(datos);
   const deps = fs => fs.flatMap(f => f.depositos ?? []);
@@ -144,6 +189,12 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   fechaFin = fechaFin || fechaInicio;
 
   const advertencias = [];
+  // Hoy / ayer aún no los trae la descarga nocturna → directo de Kore (2026-10-30).
+  await onAvance('Trayendo de Kore las facturas de hoy / ayer…');
+  const recientes = await traerFacturasRecientes({ series, fechaInicio, fechaFin });
+  if (recientes.error) {
+    advertencias.push(`No se pudieron traer de Kore las facturas del ${recientes.dias.join(' y ')} (${recientes.error}) — pueden faltar las de ese día hasta la descarga de la noche; vuelve a actualizarlo más tarde.`);
+  }
   await onAvance('Buscando facturas del periodo…');
   const facturas = await _facturasDelRango({ rfc, series, fechaInicio, fechaFin });
   await onAvance(`Depósitos de ${facturas.length} factura(s) — consultando Kore…`);
@@ -154,7 +205,8 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   }
   // También los de fecha anterior identificados dentro del rango (2026-10-23).
   await onAvance('Pendientes de generar factura — consultando Kore…');
-  const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true });
+  // Acumulados desde el inicio del año (2026-10-30): todo lo que sigue sin factura.
+  const pendientes = await detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fechaFin, incluirIdentificados: true, acumuladoDesde: PENDIENTES_DESDE });
   if (pendientes.remisionesSinRespuesta) {
     advertencias.push(`Kore no respondió ${pendientes.remisionesSinRespuesta} remisión(es) — "PENDIENTE GENERAR FACTURA" puede estar incompleta; vuelve a generarlo más tarde.`);
   }
@@ -173,6 +225,9 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
     advertencias.push(`Kore no respondió ${cobrosCaja.sinRespuesta} consulta(s) de cobros en efectivo / saldo a favor de las facturas globales — pueden faltar renglones; vuelve a actualizarlo más tarde.`);
   }
 
+  await onAvance('Buscando refacturaciones…');
+  await _marcarOtrasFacturas([...movimientosMostrador, ...cobrosCaja.porFactura], fechaInicio);
+
   const datos = {
     movimientosMostrador,
     cobrosCajaGlobales: cobrosCaja.porFactura,
@@ -180,6 +235,15 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
     depositosPendientesPago:    pendientes.depositosConSaldo ?? [],
     depositosEfectivoSinAsociar,
   };
+
+  // Remisiones cobradas en la caja de otro almacén (2026-10-30, "A0 COBRADAS EN PUERTO").
+  await onAvance('Cobros en la caja de otro almacén — consultando Kore…');
+  const otraCaja = await cobrosEnOtraCaja({ rfc, datos });
+  datos.cobrosOtraCaja = otraCaja.cobros;
+  datos.remisionesSoloOtraCaja = otraCaja.soloOtraCaja ?? [];
+  if (otraCaja.sinRespuesta) {
+    advertencias.push(`Kore no respondió ${otraCaja.sinRespuesta} remisión(es) al buscar cobros en la caja de otro almacén — esa pestaña puede estar incompleta; vuelve a actualizarlo más tarde.`);
+  }
   return { sucursal, fechaFin, datos, resumen: _resumen(datos), advertencias: advertencias.length ? advertencias : null };
 }
 

@@ -34,6 +34,27 @@ router.post('/estadistica', authenticate, permit(PERM), asyncHandler(async (req,
   res.status(202).json(estadistica.iniciar({ rfc, centroCostoId, fechaInicio, fechaFin }, req.user));
 }));
 
+// Mes en curso ya calculado (2026-10-30): se ve al instante al entrar.
+// GET /api/reportes-por-facturar/estadistica/mes-en-curso?rfc=&centroCostoId= → { resultado, calculadoEn, calculando, avance, error }
+router.get('/estadistica/mes-en-curso', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  res.json(await estadistica.fotoActual(req.query.rfc, req.query.centroCostoId));
+}));
+
+// POST /api/reportes-por-facturar/estadistica/mes-en-curso/actualizar { rfc, centroCostoId? } — recalcular ya
+router.post('/estadistica/mes-en-curso/actualizar', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  const { rfc, centroCostoId } = req.body ?? {};
+  estadistica.recalcularFoto(rfc, centroCostoId);
+  res.status(202).json(await estadistica.fotoActual(rfc, centroCostoId));
+}));
+
+// GET /api/reportes-por-facturar/estadistica/mes-en-curso/excel?rfc=&centroCostoId=
+router.get('/estadistica/mes-en-curso/excel', authenticate, permit(PERM), asyncHandler(async (req, res) => {
+  const { buffer, filename } = await estadistica.excelFoto(req.query.rfc, req.query.centroCostoId);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(Buffer.from(buffer));
+}));
+
 // GET /api/reportes-por-facturar/estadistica/:id — avance o resultado
 router.get('/estadistica/:id', authenticate, permit(PERM), asyncHandler(async (req, res) => {
   res.json(estadistica.estado(req.params.id));

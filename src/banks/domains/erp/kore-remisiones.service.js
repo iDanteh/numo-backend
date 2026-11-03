@@ -24,8 +24,9 @@ const _clave = (serie, folio) => `${String(serie ?? '').trim().toUpperCase()}|${
  * @param {object}   p
  * @param {string}   p.rfc
  * @param {object[]} p.remisiones  [{ serie, folio, fechaCreacion }] (fechaCreacion la pide Kore)
- * @param {(clave: string) => boolean} [p.necesitaSaldo]  `SERIE|FOLIO` cuyo saldo / factura
- *   hay que pedir fresco a Kore aunque ya esté guardada
+ * @param {(clave: string, guardada?: object) => boolean} [p.necesitaSaldo]  `SERIE|FOLIO` cuyo
+ *   saldo / factura hay que pedir fresco a Kore aunque ya esté guardada (`guardada` = lo
+ *   que hay en kore_remisiones, p. ej. `liquidadaEl`)
  * @returns {Promise<{ info: Map<string, { nombre, tipoPago, nombreTipoMovimiento, saldoActual?, factura? }>, sinRespuesta: number, consultadas: number }>}
  *   `info` por `SERIE|FOLIO`; `saldoActual` / `factura` solo vienen si se consultó a Kore.
  */
@@ -42,12 +43,18 @@ async function infoRemisiones({ rfc, remisiones, necesitaSaldo = () => false }) 
   } catch {
     // Sin la memoria se consulta todo a Kore, como antes.
   }
+  const guardadaDe = new Map();
   for (const g of guardadas) {
     if (!g.nombreTipoMovimiento) continue; // incompleta → se vuelve a pedir
-    info.set(_clave(g.serie, g.folio), { nombre: g.nombre, tipoPago: g.tipoPago, nombreTipoMovimiento: g.nombreTipoMovimiento });
+    guardadaDe.set(_clave(g.serie, g.folio), g);
+    info.set(_clave(g.serie, g.folio), {
+      nombre: g.nombre, tipoPago: g.tipoPago, nombreTipoMovimiento: g.nombreTipoMovimiento,
+      // Ya liquidada (2026-10-30): su saldo es 0 aunque no se pregunte a Kore.
+      ...(g.liquidadaEl ? { saldoActual: 0, liquidadaEl: g.liquidadaEl } : {}),
+    });
   }
 
-  const pedir = unicas.filter(([k]) => !info.has(k) || necesitaSaldo(k));
+  const pedir = unicas.filter(([k]) => !info.has(k) || necesitaSaldo(k, guardadaDe.get(k)));
   let sinRespuesta = 0;
   const nuevas = [];
   for (let i = 0; i < pedir.length; i += CONCURRENCIA) {
@@ -62,7 +69,7 @@ async function infoRemisiones({ rfc, remisiones, necesitaSaldo = () => false }) 
     await KoreRemision.bulkWrite(nuevas.map(({ r, c }) => ({
       updateOne: {
         filter: { rfc, serie: String(r.serie).trim().toUpperCase(), folio: String(r.folio).trim() },
-        update: { $set: { nombre: c.nombre ?? null, tipoPago: c.tipoPago ?? null, nombreTipoMovimiento: c.nombreTipoMovimiento, consultadoEn: new Date() } },
+        update: { $set: { nombre: c.nombre ?? null, tipoPago: c.tipoPago ?? null, nombreTipoMovimiento: c.nombreTipoMovimiento, consultadoEn: new Date(), liquidadaEl: c.liquidadaEl ?? null } },
         upsert: true,
       },
     })), { ordered: false }).catch(() => {});

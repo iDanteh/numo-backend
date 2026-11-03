@@ -7,8 +7,8 @@
  * usuario "MOSTRADOR 2026" (2026-10-29, pedido del usuario: "así lo quiero"),
  * con los depósitos agrupados por cliente:
  *
- *   mostrador   MOSTRADOR — un bloque por factura global (orden de fecha,
- *               todos los almacenes juntos): FECHA, DESCRIPCIÓN, IMPORTE,
+ *   mostrador   MOSTRADOR <serie> — una hoja por almacén (2026-10-30), un
+ *               bloque por factura global (orden de fecha): FECHA, DESCRIPCIÓN, IMPORTE,
  *               BANCO, REM, CLIENTE, ID NUMO, con los cobros en EFECTIVO /
  *               SALDO A FAVOR de Kore; al final, un bloque sin folio con los
  *               pendientes de generar factura.
@@ -20,6 +20,8 @@
  *   ficha       X FAC CON FICHA DE DEP — depósitos identificados que solo
  *               abonan (las remisiones todavía deben saldo).
  *   efectivo    DEPÓSITOS EN EFECTIVO — sin asociar a ninguna venta.
+ *   otraCaja    "<serie> COBRADAS EN <sucursal>" (2026-10-30) — cobros de Kore en
+ *               la caja de otro almacén (A0 cobradas en Puerto), una hoja por par.
  *
  * Antes (2026-10-28): una hoja por sección y almacén con columnas de formas
  * de pago — el usuario pidió quitarlo y dejar su formato de 7 columnas.
@@ -33,6 +35,7 @@ const SECCIONES = {
   especiales: { titulo: 'FACT ESPECIALES',        hoja: 'FACT ESPECIALES' },
   ficha:      { titulo: 'X FAC CON FICHA DE DEP', hoja: 'X FAC CON FICHA DE DEP' },
   efectivo:   { titulo: 'DEPÓSITOS EN EFECTIVO — SIN ASOCIAR A NINGUNA VENTA', hoja: 'DEPÓSITOS EN EFECTIVO' },
+  otraCaja:   { titulo: 'COBRADAS EN OTRA CAJA',  hoja: 'COBRADAS EN' },
 };
 
 const NO_IDENTIFICADO = 'CLIENTE NO IDENTIFICADO';
@@ -58,7 +61,51 @@ function agruparPorCliente(depositos) {
     .map(cliente => ({ cliente, depositos: porCliente.get(cliente), total: _suma(porCliente.get(cliente)) }));
 }
 
-const _bloque = (extra, depositos) => ({ ...extra, grupos: agruparPorCliente(depositos), total: _suma(depositos) });
+// ── Forma de pago (2026-10-30, pedido del usuario: "que venga la forma de pago
+// — efectivo, transferencia, depósito… por si hubo un pago mixto — y al final
+// el total de EFECTIVO; ojo, solo efectivo, el DEPÓSITO EN EFECTIVO va aparte").
+// Sale de `formasPago` de cada depósito (cobros de Kore de sus remisiones,
+// mostrador.service.formasPagoDeCuentas); los renglones de Kore (cobro en
+// caja / saldo a favor) son de su propia forma. Para los totales, el importe
+// del renglón se reparte en proporción a sus formas (un mixto no cuenta dos
+// veces ni más que su importe).
+const FORMAS = [
+  ['efectivo', 'EFECTIVO'], ['depositoEfectivo', 'DEPÓSITO EN EFECTIVO'], ['transferencia', 'TRANSFERENCIA'],
+  ['tarjeta', 'TARJETA'], ['cheque', 'CHEQUE'], ['abonos', 'ABONO EN EFECTIVO'], ['otras', 'SALDO A FAVOR / OTRAS'],
+];
+const ETIQUETA_FORMA = Object.fromEntries(FORMAS);
+const _dinero = n => `$${(Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+function formaPagoDe(d) {
+  const importe = Number(d.importe) || 0;
+  let montos = d.formasPago;
+  if (!montos && d.deKore) {
+    montos = /efectivo/i.test(d.banco ?? '') ? { efectivo: importe } : { otras: importe };
+  }
+  const presentes = FORMAS.map(([f]) => f).filter(f => (Number(montos?.[f]) || 0) > 0.005);
+  if (!presentes.length) return { texto: '—', partes: {} };
+  const suma = presentes.reduce((s, f) => s + Number(montos[f]), 0);
+  const partes = Object.fromEntries(presentes.map(f => [f, _r2(importe * Number(montos[f]) / suma)]));
+  const texto = presentes.length === 1
+    ? ETIQUETA_FORMA[presentes[0]]
+    : `MIXTO: ${presentes.map(f => `${ETIQUETA_FORMA[f]} ${_dinero(montos[f])}`).join(' + ')}`;
+  return { texto, partes };
+}
+
+/** Totales por forma de pago de una lista de bloques ({ efectivo, depositoEfectivo, … }). */
+function totalesPorForma(bloques) {
+  const t = Object.fromEntries(FORMAS.map(([f]) => [f, 0]));
+  for (const b of bloques ?? []) for (const f of Object.keys(t)) t[f] = _r2(t[f] + (Number(b.formas?.[f]) || 0));
+  return t;
+}
+
+const _bloque = (extra, depositos) => {
+  const filas = depositos.map(d => { const fp = formaPagoDe(d); return { ...d, formaPago: fp.texto, _partes: fp.partes }; });
+  const formas = Object.fromEntries(FORMAS.map(([f]) => [f, 0]));
+  for (const d of filas) for (const [f, m] of Object.entries(d._partes)) formas[f] = _r2(formas[f] + m);
+  for (const d of filas) delete d._partes;
+  return { ...extra, grupos: agruparPorCliente(filas), total: _suma(filas), formas };
+};
 
 // Nombre comparable: sin acentos, signos ni "SA DE CV" y similares.
 const _norm = s => String(s ?? '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
@@ -80,7 +127,24 @@ function esEspecial(cliente, receptor) {
  * @param {object} datos  `datos` guardados del reporte
  * @param {(serie) => string|null} sucursalDe
  */
-function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}) {
+// Cobradas solo en la caja de otro almacén (2026-10-30): sus renglones salen
+// únicamente en "COBRADAS EN …", no en MOSTRADOR / REF. / pendientes / ficha.
+function _sinCobradasEnOtraCaja(datos) {
+  const solo = new Set(datos?.remisionesSoloOtraCaja ?? []);
+  if (!solo.size) return datos;
+  const queda = d => !(d.remisiones?.length && d.remisiones.every(r => solo.has(r)));
+  const porFactura = fs => (fs ?? []).map(f => ({ ...f, depositos: (f.depositos ?? []).filter(queda) }));
+  return {
+    ...datos,
+    movimientosMostrador:       porFactura(datos.movimientosMostrador),
+    cobrosCajaGlobales:         porFactura(datos.cobrosCajaGlobales).filter(f => f.depositos.length),
+    depositosPendientesFactura: (datos.depositosPendientesFactura ?? []).filter(queda),
+    depositosPendientesPago:    (datos.depositosPendientesPago ?? []).filter(queda),
+  };
+}
+
+function armarSecciones(datosCompletos, sucursalDe = () => null, { fechaFin = null } = {}) {
+  const datos = _sinCobradasEnOtraCaja(datosCompletos);
   const t = tablasMostrador(datos);
 
   // ── MOSTRADOR: globales (depósitos + cobros de caja de Kore) + pendientes ──
@@ -90,19 +154,35 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
     const k = String(f.uuid ?? _folio(f)).toUpperCase();
     if (globales.has(k)) {
       // Un depósito de Bancos (ID NUMO) no se repite en el bloque.
-      const ya = new Set(globales.get(k).depositos.map(d => String(d.idNumo ?? '')).filter(id => id && id !== 'S/R'));
-      globales.get(k).depositos.push(...f.depositos.filter(d => !ya.has(String(d.idNumo ?? ''))));
+      const g = globales.get(k);
+      const ya = new Set(g.depositos.map(d => String(d.idNumo ?? '')).filter(id => id && id !== 'S/R'));
+      g.depositos.push(...f.depositos.filter(d => !ya.has(String(d.idNumo ?? ''))));
+      if (f.otrasFacturas?.length) g.otrasFacturas = [...new Set([...(g.otrasFacturas ?? []), ...f.otrasFacturas])].sort();
     }
     else globales.set(k, { ...f, depositos: [...f.depositos] });
   }
-  const bloquesGlobal = [...globales.values()]
-    .sort((a, b) => String(_diaMx(a.fechaFactura) ?? '').localeCompare(String(_diaMx(b.fechaFactura) ?? '')) || _folio(a).localeCompare(_folio(b)))
-    .map(f => _bloque({
-      tipo: 'global', serie: _serie(f.serie), sucursal: sucursalDe(_serie(f.serie)), factura: _folio(f),
-      fechaFactura: f.fechaFactura ?? null, totalFactura: f.totalFactura ?? null,
-    }, f.depositos.map(d => ({ ...d, factura: _folio(f) }))));
-  const mostrador = [...bloquesGlobal];
-  if (t.depositosPendientes.length) mostrador.push(_bloque({ tipo: 'pendiente', fecha: fechaFin }, t.depositosPendientes));
+  // Una hoja por almacén (2026-10-30, pedido del usuario: "mostrador A0,
+  // mostrador I0…"): la global va en el de su serie; un pendiente, en el de
+  // su remisión.
+  const mostradorPorSerie = new Map();
+  const almacenMostrador = serie => {
+    if (!mostradorPorSerie.has(serie)) mostradorPorSerie.set(serie, { globales: [], pendientes: [] });
+    return mostradorPorSerie.get(serie);
+  };
+  for (const f of globales.values()) almacenMostrador(_serie(f.serie)).globales.push(f);
+  for (const d of t.depositosPendientes) almacenMostrador(_serieDeposito(d)).pendientes.push(d);
+  const mostrador = [...mostradorPorSerie.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([serie, { globales: gs, pendientes }]) => {
+    const bloques = gs
+      .sort((a, b) => String(_diaMx(a.fechaFactura) ?? '').localeCompare(String(_diaMx(b.fechaFactura) ?? '')) || _folio(a).localeCompare(_folio(b)))
+      .map(f => _bloque({
+        tipo: 'global', serie, sucursal: sucursalDe(serie), factura: _folio(f),
+        fechaFactura: f.fechaFactura ?? null, totalFactura: f.totalFactura ?? null,
+        // Refacturada (2026-10-30): las otras facturas de sus mismas remisiones.
+        otrasFacturas: f.otrasFacturas ?? [],
+      }, f.depositos.map(d => ({ ...d, factura: _folio(f) }))));
+    if (pendientes.length) bloques.push(_bloque({ tipo: 'pendiente', fecha: fechaFin, serie, sucursal: sucursalDe(serie) }, pendientes));
+    return { serie, sucursal: sucursalDe(serie), bloques };
+  });
 
   // ── REF. (por almacén) y FACT ESPECIALES ──────────────────────────────────
   const refPorSerie = new Map();
@@ -138,7 +218,23 @@ function armarSecciones(datos, sucursalDe = () => null, { fechaFin = null } = {}
       .map(({ depositos, ...b }) => _bloque({ ...b, sucursal: sucursalDe(b.serie) }, depositos)),
     ficha: _bloque({}, datos?.depositosPendientesPago ?? []),
     efectivo: datos?.depositosEfectivoSinAsociar ?? [],
+    otraCaja: _otraCaja(datos?.cobrosOtraCaja ?? [], sucursalDe),
   };
+}
+
+// "A0 COBRADAS EN PUERTO": una entrada por almacén de la remisión + caja que cobró.
+function _otraCaja(cobros, sucursalDe) {
+  const porPar = new Map();
+  for (const c of cobros) {
+    const k = `${c.serie}|${c.caja}`;
+    if (!porPar.has(k)) porPar.set(k, []);
+    porPar.get(k).push(c);
+  }
+  return [...porPar.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([k, cs]) => {
+    const [serie, caja] = k.split('|');
+    const titulo = `${serie} COBRADAS EN ${sucursalDe(caja) ?? caja}`.toUpperCase();
+    return { serie: k, sucursal: titulo, titulo, bloques: [_bloque({ serie, caja, titulo }, cs)] };
+  });
 }
 
 // ── Excel ─────────────────────────────────────────────────────────────────────
@@ -205,21 +301,38 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
 
 const _rem = d => (d.remisiones ?? []).join('\n');
 
+// Al final de cada hoja: TOTAL EFECTIVO y, aparte, TOTAL DEPÓSITO EN EFECTIVO
+// (y las demás formas que haya).
+function _totalesFormaPago(ws, bloques, colImporte = 3) {
+  const t = totalesPorForma(bloques);
+  const filas = [['TOTAL EFECTIVO', t.efectivo], ['TOTAL DEPÓSITO EN EFECTIVO (APARTE)', t.depositoEfectivo],
+    ...FORMAS.filter(([f]) => !['efectivo', 'depositoEfectivo'].includes(f) && t[f] > 0.005).map(([f, e]) => [`TOTAL ${e}`, t[f]])];
+  for (const [i, [etiqueta, monto]] of filas.entries()) {
+    const row = ws.addRow([]);
+    row.getCell(2).value = etiqueta;
+    row.getCell(colImporte).value = monto;
+    row.getCell(colImporte).numFmt = DINERO;
+    row.font = { bold: true };
+    if (i === 0) { row.getCell(2).fill = _relleno('FFFDE68A'); row.getCell(colImporte).fill = _relleno('FFFDE68A'); }
+  }
+}
+
 function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.hoja) {
   if (!bloques.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 18 }, { width: 32 }, { width: 10 }];
+  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 18 }, { width: 32 }, { width: 10 }];
   for (const b of bloques) {
     _escribirBloque(ws, {
       encabezados: [b.tipo === 'global'
-        ? [_fecha(b.fechaFactura, true), null, null, null, b.serie, b.factura, 'ID NUMO']
-        : [_fecha(b.fecha), 'PENDIENTE GENERAR FACTURA', null, null, null, null, 'ID NUMO']],
-      columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'REM', 'CLIENTE', null],
+        ? [_fecha(b.fechaFactura, true), b.otrasFacturas?.length ? `TAMBIÉN FACTURADA EN: ${b.otrasFacturas.join(', ')}` : null, null, null, null, b.serie, b.factura, 'ID NUMO']
+        : [_fecha(b.fecha), 'PENDIENTE GENERAR FACTURA', null, null, null, null, null, 'ID NUMO']],
+      columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', 'CLIENTE', null],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, _rem(d), d.cliente || NO_IDENTIFICADO, d.idNumo],
+      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.cliente || NO_IDENTIFICADO, d.idNumo],
     });
   }
+  _totalesFormaPago(ws, bloques);
   return true;
 }
 
@@ -227,33 +340,53 @@ function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.ho
 function agregarHojaRef(workbook, bloques, nombre, etiquetaSerie) {
   if (!bloques.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 16 }, { width: 22 }, { width: 30 }, { width: 30 }, { width: 11 }];
+  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 16 }, { width: 22 }, { width: 30 }, { width: 30 }, { width: 11 }];
   for (const b of bloques) {
     const serie = etiquetaSerie ?? b.serie;
     _escribirBloque(ws, {
-      encabezados: [[b.sucursal || b.serie || '', _fecha(b.fecha), null, null, null, 'INFORMACIÓN ADICIONAL', null, null, null]],
-      columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', serie || 'FACTURA', etiquetaSerie ? 'ORIGEN' : `${serie || ''} ORIGEN`.trim(), 'CTE', 'CTE FACTURADO', 'ID DE PAGO'],
+      encabezados: [[b.sucursal || b.serie || '', _fecha(b.fecha), null, null, null, null, 'INFORMACIÓN ADICIONAL', null, null, null]],
+      columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', serie || 'FACTURA', etiquetaSerie ? 'ORIGEN' : `${serie || ''} ORIGEN`.trim(), 'CTE', 'CTE FACTURADO', 'ID DE PAGO'],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.factura ?? '', _rem(d), d.cliente || NO_IDENTIFICADO, d.clienteFacturado ?? '', d.idNumo],
+      fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, d.factura ?? '', _rem(d), d.cliente || NO_IDENTIFICADO, d.clienteFacturado ?? '', d.idNumo],
     });
   }
+  _totalesFormaPago(ws, bloques);
+  return true;
+}
+
+// "A0 COBRADAS EN PUERTO": como REF., con la caja que cobró.
+function agregarHojaOtraCaja(workbook, entrada) {
+  const [b] = entrada.bloques;
+  if (!b?.grupos.length) return false;
+  const ws = workbook.addWorksheet(nombreHoja(entrada.titulo));
+  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 18 }, { width: 30 }, { width: 10 }, { width: 10 }];
+  _escribirBloque(ws, {
+    encabezados: [[entrada.titulo, null, null, null, null, null, null, null, null]],
+    columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'FORMA DE PAGO', 'FACTURA', 'REM', 'CLIENTE', 'CAJA', 'ID NUMO'],
+    grupos: b.grupos,
+    total: b.total,
+    fila: d => [_fecha(d.fecha, true), d.descripcion, d.importe, d.formaPago, d.factura ?? '', _rem(d), d.cliente || NO_IDENTIFICADO, d.caja, d.idNumo],
+  });
+  ws.mergeCells(1, 1, 1, 9);
+  _totalesFormaPago(ws, entrada.bloques);
   return true;
 }
 
 function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
   if (!bloque.grupos.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 30 }, { width: 18 }, { width: 15 }, { width: 12 }, { width: 10 }];
+  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 30 }, { width: 18 }, { width: 15 }, { width: 12 }, { width: 10 }];
   _escribirBloque(ws, {
-    encabezados: [['X FAC CON FICHA DE DEP — POR FACTURAR, TODAVÍA DEBEN SALDO', null, null, null, null, null, null, null, null]],
-    columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'CLIENTE', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
+    encabezados: [['X FAC CON FICHA DE DEP — POR FACTURAR, TODAVÍA DEBEN SALDO', null, null, null, null, null, null, null, null, null]],
+    columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'CLIENTE', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
     grupos: bloque.grupos,
     total: bloque.total,
-    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.cliente || NO_IDENTIFICADO, _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
+    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, d.cliente || NO_IDENTIFICADO, _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
   });
-  ws.mergeCells(1, 1, 1, 9);
-  ws.eachRow(row => { if (typeof row.getCell(7).value === 'number') row.getCell(7).numFmt = DINERO; });
+  ws.mergeCells(1, 1, 1, 10);
+  ws.eachRow(row => { if (typeof row.getCell(8).value === 'number') row.getCell(8).numFmt = DINERO; });
+  _totalesFormaPago(ws, [bloque]);
   return true;
 }
 
@@ -265,7 +398,11 @@ function agregarHojasSeccion(workbook, secciones, seccion) {
   const lista = seccion ? [seccion] : Object.keys(SECCIONES);
   let hojas = 0;
   for (const s of lista) {
-    if (s === 'mostrador' && agregarHojaMostrador(workbook, secciones.mostrador)) hojas++;
+    if (s === 'mostrador') {
+      for (const a of secciones.mostrador ?? []) {
+        if (agregarHojaMostrador(workbook, a.bloques, nombreHoja(`MOSTRADOR ${a.serie || 'SIN SERIE'}`, a.sucursal))) hojas++;
+      }
+    }
     if (s === 'ref') {
       for (const a of secciones.ref ?? []) {
         if (agregarHojaRef(workbook, a.bloques, nombreHoja(`REF. ${a.serie}`, a.sucursal))) hojas++;
@@ -274,8 +411,11 @@ function agregarHojasSeccion(workbook, secciones, seccion) {
     if (s === 'especiales' && agregarHojaRef(workbook, secciones.especiales, SECCIONES.especiales.hoja, 'FACTURA')) hojas++;
     if (s === 'ficha' && agregarHojaFicha(workbook, secciones.ficha)) hojas++;
     if (s === 'efectivo' && agregarHojaDepositosEfectivo(workbook, secciones.efectivo, SECCIONES.efectivo.hoja)) hojas++;
+    if (s === 'otraCaja') {
+      for (const e of secciones.otraCaja ?? []) if (agregarHojaOtraCaja(workbook, e)) hojas++;
+    }
   }
   return hojas > 0;
 }
 
-module.exports = { SECCIONES, armarSecciones, agregarHojasSeccion, agruparPorCliente, esEspecial };
+module.exports = { SECCIONES, armarSecciones, agregarHojasSeccion, agruparPorCliente, esEspecial, formaPagoDe, totalesPorForma };

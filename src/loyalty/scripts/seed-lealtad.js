@@ -32,10 +32,18 @@ const svc = require('../../shared/services/global-config.service');
 // puntosFijos: undefined → quedan en modo manual (rediseño 2026-10-23, reemplaza
 // signoPermitido) — ninguno de los 3 motivos originales tenía un valor fijo real
 // pedido por el negocio, así que no se inventa uno acá.
+// categoria (split 2026-11-03): 'bono'/'regalo' son el catálogo de bonificaciones,
+// 'correccion' es un motivo de ajuste — mismo criterio de backfill aplicado en
+// shared/models/postgres/index.js#syncModels para datos ya existentes.
+// 'congelamiento_inactividad' (2026-11-03): motivo usado por el job diario de "Congelamiento de
+// puntos" (ver loyalty/jobs/congelamiento-puntos.service.js) — puntosFijos queda en modo manual
+// (undefined → null) a propósito, igual que 'correccion': el monto a restar es el saldo completo
+// de CADA tarjeta al momento del congelamiento, nunca un valor fijo.
 const REASONS = [
-  { clave: 'bono',       nombre: 'Bono' },
-  { clave: 'regalo',     nombre: 'Regalo' },
-  { clave: 'correccion', nombre: 'Corrección' },
+  { clave: 'bono',       nombre: 'Bono',       categoria: 'bonificacion' },
+  { clave: 'regalo',     nombre: 'Regalo',     categoria: 'bonificacion' },
+  { clave: 'correccion', nombre: 'Corrección', categoria: 'ajuste' },
+  { clave: 'congelamiento_inactividad', nombre: 'Congelamiento por inactividad', categoria: 'ajuste' },
 ];
 
 async function _asegurarSeccionLealtad() {

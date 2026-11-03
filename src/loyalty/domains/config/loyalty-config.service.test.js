@@ -117,6 +117,51 @@ describe('obtenerPorcentajes', () => {
   });
 });
 
+describe('obtenerCongelamientoMeses / guardarCongelamientoMeses (Congelamiento de puntos, 2026-11-03)', () => {
+  test('obtenerCongelamientoMeses devuelve null cuando getValue tira (no configurado, D11)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerCongelamientoMeses()).resolves.toBeNull();
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'CONGELAMIENTO_MESES');
+  });
+
+  test('obtenerCongelamientoMeses devuelve null cuando el valor guardado es "0" (deshabilitado explícito)', async () => {
+    globalConfigService.getValue.mockResolvedValue('0');
+    await expect(configService.obtenerCongelamientoMeses()).resolves.toBeNull();
+  });
+
+  test('obtenerCongelamientoMeses devuelve el entero configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('6');
+    await expect(configService.obtenerCongelamientoMeses()).resolves.toBe(6);
+  });
+
+  test('guardarCongelamientoMeses(6) llama a setValue con tipo:"numero" y devuelve 6', async () => {
+    const resultado = await configService.guardarCongelamientoMeses(6, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'CONGELAMIENTO_MESES', '6',
+      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(6);
+  });
+
+  test.each([null, undefined, 0])('guardarCongelamientoMeses(%p) deshabilita: persiste "0" y devuelve null', async (valor) => {
+    const resultado = await configService.guardarCongelamientoMeses(valor, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'CONGELAMIENTO_MESES', '0', expect.objectContaining({ tipo: 'numero' }),
+    );
+    expect(resultado).toBeNull();
+  });
+
+  test.each([[-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico']])(
+    'guardarCongelamientoMeses(%p) inválido (%s) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarCongelamientoMeses(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('obtenerFotoFolderId / guardarFotoFolderId', () => {
   test('obtenerFotoFolderId lee lealtad.FOTO_CLIENTE_FOLDER_ID y recorta espacios', async () => {
     globalConfigService.getValue.mockResolvedValue('  abc123  ');
@@ -204,12 +249,46 @@ describe('listarReasons', () => {
       expect.objectContaining({ where: {} }),
     );
   });
+
+  // Split de catálogo (2026-11-03): filtro por categoria para las dos secciones de
+  // lealtad-config.component.ts ("Motivos de ajuste" / "Catálogo de bonificaciones").
+  test('categoria="ajuste" filtra el where por categoria', async () => {
+    LoyaltyAdjustmentReason.findAll.mockResolvedValue([]);
+
+    await configService.listarReasons({ categoria: 'ajuste' });
+
+    expect(LoyaltyAdjustmentReason.findAll).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { categoria: 'ajuste' } }),
+    );
+  });
+
+  test('categoria inválida → 400', async () => {
+    await expect(configService.listarReasons({ categoria: 'otra' })).rejects.toMatchObject({ statusCode: 400 });
+  });
 });
 
 describe('crearReason', () => {
   test('nombre vacío → 400, no inserta', async () => {
     await expect(
-      configService.crearReason({ clave: 'x', nombre: '   ' }),
+      configService.crearReason({ clave: 'x', nombre: '   ', categoria: 'ajuste' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
+  });
+
+  // Split de catálogo (2026-11-03): categoria es NOT NULL en el modelo — requerida siempre,
+  // la UI la manda fija según la sección (nunca la elige el usuario en el formulario).
+  test('sin categoria → 400, no inserta', async () => {
+    await expect(
+      configService.crearReason({ clave: 'x', nombre: 'X' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
+  });
+
+  test('categoria inválida → 400, no inserta', async () => {
+    await expect(
+      configService.crearReason({ clave: 'x', nombre: 'X', categoria: 'otra' }),
     ).rejects.toMatchObject({ statusCode: 400 });
 
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
@@ -218,10 +297,10 @@ describe('crearReason', () => {
   test('sin puntosFijos → crea en modo manual (puntosFijos: null)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 1 });
 
-    await configService.crearReason({ clave: 'correccion', nombre: 'Corrección' });
+    await configService.crearReason({ clave: 'correccion', nombre: 'Corrección', categoria: 'ajuste' });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'correccion', nombre: 'Corrección', activo: true, puntosFijos: null,
+      clave: 'correccion', nombre: 'Corrección', activo: true, puntosFijos: null, categoria: 'ajuste',
     });
   });
 
@@ -229,7 +308,7 @@ describe('crearReason', () => {
     [0], ['abc'], [5.5],
   ])('puntosFijos inválido (%s) → 400, no inserta', async (valor) => {
     await expect(
-      configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: valor }),
+      configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: valor, categoria: 'bonificacion' }),
     ).rejects.toMatchObject({ statusCode: 400 });
 
     expect(LoyaltyAdjustmentReason.create).not.toHaveBeenCalled();
@@ -238,20 +317,22 @@ describe('crearReason', () => {
   test('puntosFijos positivo → crea el motivo con ese valor (ej. "Bono" = 100)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 5 });
 
-    await configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: 100 });
+    await configService.crearReason({ clave: 'bono', nombre: 'Bono', puntosFijos: 100, categoria: 'bonificacion' });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'bono', nombre: 'Bono', activo: true, puntosFijos: 100,
+      clave: 'bono', nombre: 'Bono', activo: true, puntosFijos: 100, categoria: 'bonificacion',
     });
   });
 
   test('puntosFijos negativo → crea el motivo con ese valor (ej. "Comisión por mora" = -200)', async () => {
     LoyaltyAdjustmentReason.create.mockResolvedValue({ id: 6 });
 
-    await configService.crearReason({ clave: 'comision_mora', nombre: 'Comisión por mora', puntosFijos: -200 });
+    await configService.crearReason({
+      clave: 'comision_mora', nombre: 'Comisión por mora', puntosFijos: -200, categoria: 'ajuste',
+    });
 
     expect(LoyaltyAdjustmentReason.create).toHaveBeenCalledWith({
-      clave: 'comision_mora', nombre: 'Comisión por mora', activo: true, puntosFijos: -200,
+      clave: 'comision_mora', nombre: 'Comisión por mora', activo: true, puntosFijos: -200, categoria: 'ajuste',
     });
   });
 });
@@ -307,6 +388,27 @@ describe('editarReason', () => {
     await configService.editarReason(1, { puntosFijos: null });
 
     expect(reason.update).toHaveBeenCalledWith({ puntosFijos: null });
+  });
+
+  // Split de catálogo (2026-11-03): categoria es opcional en edición (undefined = no tocar) —
+  // la UI nunca la manda, pero el servicio la soporta por completitud del contrato CRUD.
+  test('sin categoria en el payload → no se toca ese campo', async () => {
+    const reason = makeReason();
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await configService.editarReason(1, { nombre: 'Bono renombrado' });
+
+    expect(reason.update).toHaveBeenCalledWith({ nombre: 'Bono renombrado' });
+  });
+
+  test('categoria inválida en edición → 400, no actualiza', async () => {
+    const reason = makeReason();
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(reason);
+
+    await expect(
+      configService.editarReason(1, { categoria: 'otra' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(reason.update).not.toHaveBeenCalled();
   });
 });
 

@@ -659,6 +659,37 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS puntos_fijos INTEGER
   `).catch(e => console.warn('[syncModels] ALTER COLUMN motivos de ajuste → puntos_fijos (loyalty_adjustment_reasons):', e.message));
 
+  // SPLIT DE CATÁLOGO (2026-11-03, pedido explícito del usuario): separa visualmente "Motivos de
+  // ajuste" de "Catálogo de bonificaciones" sin tabla nueva — ver LoyaltyAdjustmentReason.js.
+  // Columna nullable primero (no se puede agregar NOT NULL sin default sobre una tabla con filas),
+  // backfill explícito, DEFAULT para altas futuras, y recién al final el NOT NULL — mismo patrón
+  // idempotente de 3 pasos que ya usa este archivo en otras columnas aditivas sobre tablas con datos
+  // reales (ver kore_cliente_id/participa_lealtad arriba).
+  await LoyaltyAdjustmentReason.sequelize.query(`
+    ALTER TABLE loyalty_adjustment_reasons
+      ADD COLUMN IF NOT EXISTS categoria VARCHAR(20)
+  `).catch(e => console.warn('[syncModels] ADD COLUMN categoria (loyalty_adjustment_reasons):', e.message));
+  // Backfill (regla confirmada contra el seed real, ver seed-lealtad.js): los 3 motivos
+  // originales son manuales (puntosFijos null) — 'bono'/'regalo' son conceptualmente
+  // bonificaciones aunque hoy no tengan puntosFijos fijo configurado, 'correccion' es un ajuste.
+  // Cualquier motivo FUTURO sin categoria (creado antes de este deploy) cae a la regla general:
+  // con puntosFijos → 'bonificacion' (un valor fijo es la forma típica de un bono/regalo), sin
+  // puntosFijos → 'ajuste' (modo manual, típico de una corrección).
+  await LoyaltyAdjustmentReason.sequelize.query(`
+    UPDATE loyalty_adjustment_reasons
+       SET categoria = 'bonificacion'
+     WHERE categoria IS NULL
+       AND (puntos_fijos IS NOT NULL OR clave IN ('bono', 'regalo'))
+  `).catch(e => console.warn('[syncModels] backfill categoria=bonificacion (loyalty_adjustment_reasons):', e.message));
+  await LoyaltyAdjustmentReason.sequelize.query(`
+    UPDATE loyalty_adjustment_reasons SET categoria = 'ajuste' WHERE categoria IS NULL
+  `).catch(e => console.warn('[syncModels] backfill categoria=ajuste (loyalty_adjustment_reasons):', e.message));
+  await LoyaltyAdjustmentReason.sequelize.query(`
+    ALTER TABLE loyalty_adjustment_reasons
+      ALTER COLUMN categoria SET DEFAULT 'ajuste',
+      ALTER COLUMN categoria SET NOT NULL
+  `).catch(e => console.warn('[syncModels] ALTER COLUMN categoria NOT NULL (loyalty_adjustment_reasons):', e.message));
+
   // Snapshot de la promoción aplicada en cada acumulación (2026-10-20) —
   // columnas nuevas sobre loyalty_points_ledger, que YA existía: idempotente.
   await LoyaltyPointsLedger.sequelize.query(`

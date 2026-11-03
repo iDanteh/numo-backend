@@ -489,18 +489,94 @@ async function registrarAjuste({ cardId, puntos, reasonId, justificacion }, user
   });
 }
 
+/**
+ * Etiqueta amigable de `tipo` (usada por el admin — tarjeta-detail.component.ts ya tiene su
+ * propio TIPO_LABELS para ACUMULACION/CANJE/MIGRACION, esto solo cubre AJUSTE según la categoria
+ * del reason) y por la consulta pública (listarMovimientosPublicos, que no repite el enum crudo).
+ * `AJUSTE` sin reason resuelto (motivo borrado — nunca debería pasar, D4, pero defensivo) cae a
+ * 'Ajuste' por default, nunca revienta.
+ */
+const TIPO_LABELS_PUBLICOS = {
+  ACUMULACION: 'Acumulación de puntos',
+  CANJE:       'Canje',
+  MIGRACION:   'Migración',
+};
+
+function _tipoLabel(mov) {
+  if (mov.tipo === 'AJUSTE') {
+    return mov.reason?.categoria === 'bonificacion' ? 'Bonificación' : 'Ajuste';
+  }
+  return TIPO_LABELS_PUBLICOS[mov.tipo] ?? mov.tipo;
+}
+
+/**
+ * `saldoAnterior`/`saldoActual` (2026-11-03, pedido explícito del usuario): CALCULADOS, nunca
+ * persistidos — no existe columna `saldoAnterior` en el modelo (ver LoyaltyPointsLedger.js).
+ * `saldoActual` es un alias explícito de `saldoResultante` (se mantiene este último también, por
+ * compatibilidad con cualquier consumidor existente del contrato). Aritmética en centavos enteros
+ * (D3, mismo criterio que el resto de este servicio) para no arrastrar error de IEEE-754.
+ *
+ * Defensivo (`try/catch`): si `saldoResultante`/`puntos` vinieran ausentes (fila cruda de un test
+ * con mocks mínimos, nunca el caso real), devuelve `null` en vez de reventar — nunca debe tronar
+ * un listado completo por una fila con datos incompletos.
+ */
+function _conSaldoDetalle(row) {
+  const json = typeof row.toJSON === 'function' ? row.toJSON() : { ...row };
+  let saldoAnterior = null;
+  if (json.saldoResultante != null && json.puntos != null) {
+    try {
+      saldoAnterior = fromCents(toCents(json.saldoResultante) - toCents(json.puntos));
+    } catch { /* fila incompleta (solo en tests con mocks mínimos) — se deja null */ }
+  }
+  return { ...json, saldoActual: json.saldoResultante ?? null, saldoAnterior };
+}
+
 async function listarMovimientos(cardId, { page = 1, limit = 50 } = {}) {
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Number(limit) || 50);
 
   const { count, rows } = await LoyaltyPointsLedger.findAndCountAll({
     where:  { cardId },
+    // Motivo resuelto (2026-11-03): la categoria del reason distingue "Ajuste" de "Bonificación"
+    // en el detalle del historial (tarjeta-detail.component.html); el nombre ya lo resolvía el
+    // frontend aparte vía listarReasons() — se trae acá también para no duplicar esa llamada.
+    include: [{ model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['id', 'nombre', 'categoria'] }],
     order:  [['createdAt', 'DESC']],
     limit:  l,
     offset: (p - 1) * l,
   });
 
-  return { total: count, page: p, limit: l, pages: Math.ceil(count / l), movimientos: rows };
+  const movimientos = rows.map(_conSaldoDetalle);
+
+  return { total: count, page: p, limit: l, pages: Math.ceil(count / l), movimientos };
+}
+
+/**
+ * Historial para la consulta pública (2026-11-03, pedido explícito del usuario) — payload
+ * reducido a propósito (D6-D8, mismo threat model que loyalty-public.service.js): NUNCA expone
+ * reasonId/usuarioId/justificacion/referenciaExterna ni ningún otro campo interno, solo lo que el
+ * cliente final necesita ver de su propio historial. `limit` por default 20 (decisión de producto
+ * sin spec exacto — 20 movimientos recientes es suficiente para el caso de uso de "¿qué pasó con
+ * mis puntos últimamente?" sin convertir la respuesta anónima en un reporte completo).
+ */
+async function listarMovimientosPublicos(cardId, { limit = 20 } = {}) {
+  const rows = await LoyaltyPointsLedger.findAll({
+    where:   { cardId },
+    include: [{ model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['categoria'] }],
+    order:   [['createdAt', 'DESC']],
+    limit,
+  });
+
+  return rows.map((row) => {
+    const conSaldo = _conSaldoDetalle(row);
+    return {
+      fecha:         conSaldo.createdAt,
+      tipoLabel:     _tipoLabel(conSaldo),
+      puntos:        conSaldo.puntos,
+      saldoAnterior: conSaldo.saldoAnterior,
+      saldoActual:   conSaldo.saldoActual,
+    };
+  });
 }
 
 async function listarNiveles(cardId) {
@@ -582,6 +658,7 @@ module.exports = {
   registrarCanje,
   registrarAjuste,
   listarMovimientos,
+  listarMovimientosPublicos,
   listarNiveles,
   listarMovimientosGlobal,
   _aplicarMovimiento,

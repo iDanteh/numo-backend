@@ -95,6 +95,7 @@ const PERM_META = {
   'loyalty:ajustes':         { label: 'Crear ajustes discrecionales',         module: 'Lealtad' },
   'loyalty:tarjetas:nivel':  { label: 'Cambiar nivel de una tarjeta',         module: 'Lealtad' },
   'loyalty:config':          { label: 'Configurar % por nivel, motivos y sucursales', module: 'Lealtad' },
+  'kiosco:admin':            { label: 'Entrar al panel del Kiosco de facturación', module: 'Kiosco' },
 };
 
 async function seedRbac() {

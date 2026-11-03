@@ -237,18 +237,50 @@ router.get('/cortes/periodo-rol', authenticate, permit(PERMISSIONS.BANKS_READ), 
   res.json(await indicadoresService.getPeriodoCortePorRol(req.user.role));
 }));
 
-// GET /api/banks/cortes/antiguedad — antigüedad del backlog ACTUAL (5 buckets fijos: Hoy/1-30/
-// 30-60/60-90/90+ días desde `createdAt`), para el chart del panel de Cortes (2026-10-28,
-// reemplaza por completo al viejo /cortes/tendencia — pedido explícito del usuario, ver JSDoc
-// de getCorteAntiguedadBacklog en bank-indicadores.service.js). Mismo permiso que /cortes.
-// `rolEquipo` viaja igual que en /cortes: null para BANKS_CONFIG (admin, total sin acotar),
-// req.user.role para el resto — SOLO acota `identificados`, nunca `iniciales`/`nuevos`
-// (propiedades del movimiento, no de quién identifica — ver JSDoc de la función).
-router.get('/cortes/antiguedad', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
-  const { banco } = req.query;
-  const hasConfigAccess = await rbacStore.hasPermission(req.user.role, PERMISSIONS.BANKS_CONFIG, req.user.extraPermissions);
-  const rolEquipo = hasConfigAccess ? null : req.user.role;
-  res.json(await indicadoresService.getCorteAntiguedadBacklog({ banco: banco || null, rolEquipo }));
+// GET /api/banks/cortes/resolucion — ledger de resolución del backlog, corte a corte (semanal,
+// 2026-10-30, ver JSDoc de getProgresoResolucionPorCorte/_calcularLedgerBacklog): iniciales +
+// nuevos − identificados = total por cada corte, total que pasa a ser `iniciales` del siguiente.
+// Mismo permiso. `mesOrigen` (YYYY-MM) acota el ledger a lo cargado ese mes (drill-down "cómo
+// bajó agosto corte a corte"). Siempre semanal — no pasa por getPeriodoCortePorRol
+// (infraestructura de periodo mensual dejada dormida a propósito, este chart nunca dependió de
+// ella).
+router.get('/cortes/resolucion', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, mesOrigen, desde, hasta, cantidad } = req.query;
+  res.json(await indicadoresService.getProgresoResolucionPorCorte({ banco: banco || null, mesOrigen, desde, hasta, cantidad: cantidad ? Number(cantidad) : undefined }));
+}));
+
+// GET /api/banks/cortes/ledger-diario — mismo ledger que /cortes/resolucion pero por DÍA en vez
+// de por semana (2026-10-30, pedido explícito del usuario: "nuevos" son los depósitos del día; lo
+// no resuelto pasa a ser "iniciales" del día siguiente). A diferencia del semanal, el día de HOY
+// SÍ se incluye (periodo en curso). Mismo permiso/`mesOrigen`.
+router.get('/cortes/ledger-diario', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, mesOrigen, desde, hasta, cantidad } = req.query;
+  res.json(await indicadoresService.getLedgerDiario({ banco: banco || null, mesOrigen, desde, hasta, cantidad: cantidad ? Number(cantidad) : undefined }));
+}));
+
+// GET /api/banks/cortes/ledger-mensual — mismo ledger que /cortes/resolucion pero por MES en vez
+// de por semana (2026-10-30, reemplaza al corte semanal para este dashboard — pedido explícito
+// del usuario tras ver un mockup de referencia: la comparativa corte-a-corte que importa es mes a
+// mes). El mes EN CURSO SÍ se incluye, en vivo. Mismo permiso/`mesOrigen`.
+router.get('/cortes/ledger-mensual', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, mesOrigen, desde, hasta, cantidad } = req.query;
+  res.json(await indicadoresService.getLedgerMensual({ banco: banco || null, mesOrigen, desde, hasta, cantidad: cantidad ? Number(cantidad) : undefined }));
+}));
+
+// GET /api/banks/cortes/ledger-por-hora — mismo ledger, por HORA, de un día (2026-10-30,
+// monitoreo en tiempo real). Sin `fecha`: hoy en vivo. Con `fecha` (YYYY-MM-DD): ese día, cerrado
+// — tab "Ayer" del dashboard. Mismo permiso.
+router.get('/cortes/ledger-por-hora', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, fecha } = req.query;
+  res.json(await indicadoresService.getLedgerPorHora({ banco: banco || null, fecha }));
+}));
+
+// GET /api/banks/cortes/ultimos-movimientos — feed de actividad reciente (2026-10-30, "Últimos
+// movimientos" del dashboard de Día actual): cargados y identificados más recientes, combinados.
+// Mismo permiso.
+router.get('/cortes/ultimos-movimientos', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, limit } = req.query;
+  res.json(await indicadoresService.getUltimosMovimientos({ banco: banco || null, limit: limit ? Number(limit) : undefined }));
 }));
 
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle

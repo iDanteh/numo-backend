@@ -312,6 +312,10 @@ describe('abono en efectivo sin ligar en Bancos', () => {
     ]);
     expect(r.depositos[1].grupoCliente).toBe('CESAR EFRAIN JARQUIN ALVARADO');
     expect(r.depositos[1].banco).toBe('EFECTIVO');
+    // Forma de pago: el abono solo la suya; el SPEI sigue diciendo MIXTO pero sin contar el abono dos veces.
+    expect(r.depositos[1].formasPago).toEqual({ abonos: 2356.99 });
+    expect(r.depositos[0].formasPagoTexto).toMatchObject({ transferencia: 2200, abonos: 2356.99 });
+    expect(r.depositos[0].formasPago).toMatchObject({ transferencia: 2200, abonos: 0 });
     expect(BankMovement.find).toHaveBeenCalledTimes(2);
   });
 

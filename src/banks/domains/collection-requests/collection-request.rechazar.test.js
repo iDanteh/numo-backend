@@ -69,3 +69,31 @@ describe('rechazar() — Kore ya en APLICADO (el cobro real ya se realizó)', ()
     expect(resultado.status).toBe('rechazada');
   });
 });
+
+// Gap #5 (2026-10-27): espejo del mismo caso ya cubierto en identificar() — acá
+// no hay guard esMismatchAnticipo porque rechazar() nunca llama a
+// aplicarSolicitudOperacion, pero SÍ comparte el mismo callejón sin salida:
+// Kore quedó en APROBADO (el aviso de revisión contable se confirmó, pero el
+// cobro nunca se aplicó) y ni Identificar ni Rechazar pueden revertirlo desde
+// la API — hacía falta un test que lo pruebe explícitamente, antes no existía
+// ninguno para esta rama.
+describe('rechazar() — Kore ya en APROBADO (atascado, sin forma de revertir vía API)', () => {
+  test('estatusActualDeErrorKore=APROBADO -> BadRequestError explicando que hay que escalar con quien administra Kore, y NO marca rechazada', async () => {
+    const cr = makeCr();
+    CollectionRequest.findOne.mockResolvedValue(cr);
+    CollectionRequest.findOneAndUpdate = jest.fn();
+    koreCaja.actualizarEstatusSolicitud.mockRejectedValue(
+      new KoreCajaError('No puede cambiar el estatus de la solicitud con estatus: APROBADO'),
+    );
+    koreCaja.estatusActualDeErrorKore.mockReturnValue('APROBADO');
+
+    await expect(
+      service.rechazar('cr-1', 'motivo cualquiera', { _id: 'user-1' }),
+    ).rejects.toThrow(/APROBADO.*no permite revertir.*escalar/is);
+
+    // Mismo criterio que el caso APLICADO: nunca llega a marcar la solicitud
+    // como rechazada en Mongo, ni avisa por socket.
+    expect(CollectionRequest.findOneAndUpdate).not.toHaveBeenCalled();
+    expect(emitToAll).not.toHaveBeenCalled();
+  });
+});

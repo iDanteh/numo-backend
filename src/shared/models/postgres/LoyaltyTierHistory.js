@@ -18,7 +18,8 @@ const LoyaltyTierHistory = sequelize.define('LoyaltyTierHistory', {
     autoIncrement: true,
   },
   cardId: {
-    type:       DataTypes.INTEGER,
+    // UUID (2026-10-29) — coincide con el tipo de loyalty_cards.id, ver LoyaltyCard.js.
+    type:       DataTypes.UUID,
     allowNull:  false,
     references: { model: 'loyalty_cards', key: 'id' },
     onDelete:   'RESTRICT',

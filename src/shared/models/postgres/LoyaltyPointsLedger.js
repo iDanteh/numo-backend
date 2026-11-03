@@ -23,7 +23,8 @@ const LoyaltyPointsLedger = sequelize.define('LoyaltyPointsLedger', {
     autoIncrement: true,
   },
   cardId: {
-    type:       DataTypes.INTEGER,
+    // UUID (2026-10-29) — coincide con el tipo de loyalty_cards.id, ver LoyaltyCard.js.
+    type:       DataTypes.UUID,
     allowNull:  false,
     references: { model: 'loyalty_cards', key: 'id' },
     onDelete:   'RESTRICT',
@@ -47,6 +48,15 @@ const LoyaltyPointsLedger = sequelize.define('LoyaltyPointsLedger', {
     type:      DataTypes.DECIMAL(14, 2),
     allowNull: true,
     comment:   'Solo ACUMULACION — subtotal (antes de impuesto) de la venta en Kore, usado para calcular puntos',
+  },
+  montoBaseCalculo: {
+    type:      DataTypes.DECIMAL(14, 2),
+    allowNull: true,
+    comment:   'Solo ACUMULACION (2026-10-27) — monto EXACTO que se multiplicó por porcentajeAplicado para '
+      + 'dar puntos. Casi siempre igual a montoVenta, salvo en el webhook con formas de pago mixtas, donde '
+      + 'el cálculo real corre sobre el monto prorrateado (solo la porción pagada con formas que acumulan), '
+      + 'no sobre el subtotal completo. Filas previas a este campo lo tienen null — la UI usa montoVenta '
+      + 'como fallback para esas.',
   },
   montoVentaTotal: {
     type:      DataTypes.DECIMAL(14, 2),

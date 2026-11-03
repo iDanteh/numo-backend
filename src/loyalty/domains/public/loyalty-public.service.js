@@ -28,6 +28,11 @@ const { LoyaltyCard } = require('../../../shared/models/postgres');
 const { UnprocessableError } = require('../../../shared/errors/AppError');
 const { compararNip, DUMMY_HASH, MAX_INTENTOS_FALLIDOS, LOCKOUT_MS } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+// Historial de movimientos (2026-11-03, pedido explícito del usuario) — reusa
+// listarMovimientosPublicos (loyalty-ledger.service.js), que ya recorta el payload a lo que una
+// consulta anónima puede exponer (D6-D8, nunca reasonId/usuarioId/justificacion/etc). Sin require
+// circular: loyalty-ledger.service.js no importa nada de este archivo (verificado).
+const ledgerService = require('../ledger/loyalty-ledger.service');
 
 const TELEFONO_RE = /^\d{10}$/;
 const NIP_RE = /^\d{4}$/;
@@ -57,7 +62,7 @@ function _logFallo(motivo, telefono, ip) {
  * @param {string} telefono
  * @param {string} nip
  * @param {{ip?: string}} [ctx]  IP del request, solo para logging (nunca se usa para autenticar).
- * @returns {Promise<{nombre: string, nivel: string, saldoPuntos: string}>}
+ * @returns {Promise<{nombre: string, nivel: string, saldoPuntos: string, movimientos: object[]}>}
  */
 async function consultaPublica(telefono, nip, { ip } = {}) {
   const telefonoStr = String(telefono ?? '').trim();
@@ -108,8 +113,11 @@ async function consultaPublica(telefono, nip, { ip } = {}) {
     await card.update({ nipIntentosFallidos: 0, nipBloqueadoHasta: null });
   }
 
-  const primerNombre = String(card.nombre ?? '').trim().split(/\s+/)[0] ?? '';
-  return { nombre: primerNombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos };
+  // Nombre completo (2026-10-29, pedido explícito del usuario) — antes solo el primer nombre
+  // (`primerNombre`); `card.nombre` ya es el combinado "Nombre Apellidos", no hace falta concatenar.
+  // Historial de movimientos (2026-11-03) — últimos 20, payload recortado (ver ledgerService.listarMovimientosPublicos).
+  const movimientos = await ledgerService.listarMovimientosPublicos(card.id);
+  return { nombre: card.nombre, nivel: card.nivel, saldoPuntos: card.saldoPuntos, movimientos };
 }
 
 module.exports = { consultaPublica, LookupFailedError };

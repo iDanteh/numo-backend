@@ -22,8 +22,16 @@
  *                                 (no se pisa una tarjeta real en uso).
  *   5. ya_migrada               — ya existe una LoyaltyCard con ese teléfono
  *                                 Y sí fue creada por una migración previa
- *                                 (re-correr `aplicar` es idempotente).
- *   6. ok                       — se crea la tarjeta + movimiento MIGRACION.
+ *                                 (re-correr `aplicar` es idempotente). Desde 2026-10-22 SÍ es
+ *                                 accionable (ver _aplicarFila): si a esa tarjeta le falta
+ *                                 `tarjetaLegada` y/o alguno de los 13 campos de enriquecimiento
+ *                                 (apodo/dirección/etc., desde 2026-10-23, cada uno con su propio
+ *                                 gate independiente — ver _aplicarFila), se completan desde esta
+ *                                 fila, SIN tocar puntos/nivel/nombre ni crear un segundo
+ *                                 movimiento de ledger. Es el mecanismo de "re-import repetible":
+ *                                 volver a subir el MISMO CSV completa el dato faltante de las
+ *                                 tarjetas ya migradas, sin un script de backfill aparte.
+ *   6. ok                       — se crea la tarjeta + movimiento MIGRACION + `tarjetaLegada`.
  *
  * Decisión de negocio 2026-10-19 (reemplaza el criterio anterior de "abortar
  * con CERO escrituras si hay bloqueantes"): `aplicar`/`iniciarAplicarJob` YA
@@ -36,7 +44,7 @@
  * que reutilizan exactamente la misma clasificación/aplicación/batching.
  */
 
-const { Transaction } = require('sequelize');
+const { Transaction, Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const { LoyaltyCard, LoyaltyPointsLedger, LoyaltyPendingEnrollment } = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
@@ -50,6 +58,23 @@ const ledgerService = require('../ledger/loyalty-ledger.service');
 // físicamente bajo banks/ por ser el primer dominio que lo necesitó.
 const { emitToUser } = require('../../../banks/shared/socket');
 const { logger } = require('../../../shared/utils/logger');
+
+// Enriquecimiento del import (2026-10-23) — registro histórico simple, ver LoyaltyCard.js.
+// '' → null (no tiene sentido persistir cadenas vacías en columnas opcionales).
+// 'apellidos' sumado 2026-10-23 (enfoque aditivo: `nombre` combinado sigue intacto, ver
+// LoyaltyCard.js#apellidos) — reusa EXACTAMENTE el mismo mecanismo de backfill campo-por-campo
+// que el resto de columnas de enriquecimiento, sin lógica nueva.
+const CAMPOS_ENRIQUECIMIENTO = [
+  'apellidos', 'apodo', 'sexo', 'fechaNacimiento', 'especialidades', 'sucursal', 'calle',
+  'numExterior', 'numInterior', 'colonia', 'municipio', 'estado', 'cp', 'comentarios',
+];
+function _datosEnriquecimiento(fila) {
+  const datos = {};
+  for (const campo of CAMPOS_ENRIQUECIMIENTO) {
+    datos[campo] = fila[campo] ? fila[campo] : null;
+  }
+  return datos;
+}
 
 function _userLabel(user) {
   return {
@@ -67,13 +92,35 @@ const CAMPO_POR_CATEGORIA = {
   invalido_bloqueante:         'invalidoBloqueante',
   conflicto_bloqueante:        'conflictoBloqueante',
   telefono_duplicado_bloqueante: 'telefonoDuplicadoBloqueante',
+  // Descarte automático por duplicidad de teléfono (2026-10-29, pedido explícito del usuario):
+  // dentro de un grupo de 2+ filas con el mismo teléfono, cuando EXACTAMENTE UNA trae saldo > 0,
+  // esa gana su clasificación normal (ok/ya_migrada/conflicto) y las demás (saldo 0) se descartan
+  // acá — nunca se escriben, nunca generan LoyaltyPendingEnrollment. Si hay 0 o 2+ con saldo > 0
+  // (empate real o nadie tiene puntos), sigue el camino manual de siempre
+  // (telefono_duplicado_bloqueante para todas, ver _clasificarFilasYaConstruidas).
+  descartado_duplicado_sin_puntos: 'descartadoDuplicadoSinPuntos',
 };
 
 function _clasificacionResumenVacio() {
   return {
     ok: 0, pendienteSinTelefono: 0, yaMigrada: 0,
     duplicadoBloqueante: 0, invalidoBloqueante: 0, conflictoBloqueante: 0,
-    telefonoDuplicadoBloqueante: 0,
+    telefonoDuplicadoBloqueante: 0, descartadoDuplicadoSinPuntos: 0,
+  };
+}
+
+/** Shape de UNA fila descartada automáticamente por duplicidad de teléfono (saldo 0, perdió
+ *  contra otra fila del mismo grupo con saldo > 0) — usado tanto en `aplicar()` como en el job en
+ *  background, pensado para el Excel descargable del frontend (ver
+ *  importar-clientes.component.ts). Incluye `telefonoConflicto` (el teléfono compartido) para que
+ *  el admin pueda rastrear con quién compitió esta fila. */
+function _descartadoDesdeFila(fila) {
+  return {
+    nombre: fila.nombre,
+    telefono: fila.contacto,
+    tarjetaLegada: fila.tarjetaRawClientes ?? null,
+    saldo: fila.saldo,
+    telefonoConflicto: fila.telefonoNormalizado ?? null,
   };
 }
 
@@ -132,9 +179,16 @@ async function _clasificarFila(fila, esTelefonoDuplicadoEnSet) {
  * (que exige el shape de dos archivos fuente). Función de solo lectura — nunca
  * crea/edita nada, puede llamarse tantas veces como se quiera (dry-run).
  *
- * Primera pasada (sin DB): normaliza el teléfono de cada fila candidata y cuenta cuántas veces
- * se repite DENTRO de este mismo set — ver `_clasificarFila` para por qué (caso real 2026-10-19,
- * dos Tarjetas legadas distintas con el mismo teléfono).
+ * Primera pasada (sin DB): normaliza el teléfono de cada fila candidata y agrupa los ÍNDICES por
+ * teléfono repetido DENTRO de este mismo set — ver `_clasificarFila` para por qué (caso real
+ * 2026-10-19, dos Tarjetas legadas distintas con el mismo teléfono).
+ *
+ * Segunda pasada, SOLO sobre los grupos duplicados (2026-10-29, pedido explícito del usuario):
+ * si EXACTAMENTE UNA fila del grupo trae saldo > 0, esa es la "ganadora" — sigue su clasificación
+ * normal (ok/ya_migrada/conflicto, con su lookup real a la DB) como si no hubiera conflicto; las
+ * demás ("perdedoras", saldo 0) se descartan directo, sin lookup a la DB (nunca se van a escribir).
+ * Cualquier otro caso (0 o 2+ con saldo > 0 — empate real o nadie tiene puntos) sigue el camino
+ * manual de siempre: todas quedan `telefono_duplicado_bloqueante`.
  */
 async function _clasificarFilasYaConstruidas(filas) {
   const telefonosNormalizados = filas.map((fila) => {
@@ -146,10 +200,29 @@ async function _clasificarFilasYaConstruidas(filas) {
       return null;
     }
   });
-  const conteoTelefonos = new Map();
-  for (const tel of telefonosNormalizados) {
+
+  const indicesPorTelefono = new Map();
+  for (let i = 0; i < telefonosNormalizados.length; i++) {
+    const tel = telefonosNormalizados[i];
     if (!tel) continue;
-    conteoTelefonos.set(tel, (conteoTelefonos.get(tel) ?? 0) + 1);
+    if (!indicesPorTelefono.has(tel)) indicesPorTelefono.set(tel, []);
+    indicesPorTelefono.get(tel).push(i);
+  }
+
+  // decisionPorIndice[i] === undefined → sin conflicto (teléfono único en el set).
+  // decisionPorIndice[i] === 'ambiguo'  → grupo con 0 o 2+ filas con saldo > 0, sigue bloqueante manual.
+  // decisionPorIndice[i] === 'ganador'  → única fila del grupo con saldo > 0, sigue clasificación normal.
+  // decisionPorIndice[i] === 'perdedor' → resto del grupo (saldo 0), se descarta sin lookup a la DB.
+  const decisionPorIndice = new Map();
+  for (const indices of indicesPorTelefono.values()) {
+    if (indices.length <= 1) continue; // no es un duplicado real
+    const conSaldo = indices.filter((i) => Number(filas[i].saldo) > 0);
+    if (conSaldo.length === 1) {
+      const ganadorIdx = conSaldo[0];
+      for (const i of indices) decisionPorIndice.set(i, i === ganadorIdx ? 'ganador' : 'perdedor');
+    } else {
+      for (const i of indices) decisionPorIndice.set(i, 'ambiguo');
+    }
   }
 
   const clasificacionResumen = _clasificacionResumenVacio();
@@ -157,7 +230,22 @@ async function _clasificarFilasYaConstruidas(filas) {
   const filasClasificadas = [];
   for (let i = 0; i < filas.length; i++) {
     const fila = filas[i];
-    const esTelefonoDuplicadoEnSet = (conteoTelefonos.get(telefonosNormalizados[i]) ?? 0) > 1;
+    const decision = decisionPorIndice.get(i);
+
+    if (decision === 'perdedor') {
+      clasificacionResumen.descartadoDuplicadoSinPuntos += 1;
+      filasClasificadas.push({
+        ...fila,
+        categoria: 'descartado_duplicado_sin_puntos',
+        telefonoNormalizado: telefonosNormalizados[i],
+      });
+      continue;
+    }
+
+    // 'ganador' → sin conflicto real (esTelefonoDuplicadoEnSet=false), sigue el camino normal.
+    // 'ambiguo' → mismo criterio que antes (telefono_duplicado_bloqueante para todas).
+    // undefined → sin duplicado, también camino normal.
+    const esTelefonoDuplicadoEnSet = decision === 'ambiguo';
     // eslint-disable-next-line no-await-in-loop -- clasificación secuencial de solo lectura, cada
     // fila puede depender de una consulta a la DB (findOne por teléfono).
     const { categoria, telefonoNormalizado } = await _clasificarFila(fila, esTelefonoDuplicadoEnSet);
@@ -168,14 +256,19 @@ async function _clasificarFilasYaConstruidas(filas) {
   return { filas: filasClasificadas, clasificacionResumen };
 }
 
-/** Suma las cuatro categorías bloqueantes — mismo criterio usado antes por el
+/** Suma las categorías realmente EXCLUIDAS (nunca escritas, nunca recuperables salvo por el Excel
+ * de "Descargar bloqueantes" + Correcciones) — mismo criterio usado antes por el
  * `_errorBloqueantes` ya retirado (decisión de negocio 2026-10-19: ya no abortan,
- * solo se cuentan/excluyen, ver docstring del archivo). */
+ * solo se cuentan/excluyen, ver docstring del archivo).
+ *
+ * `telefonoDuplicadoBloqueante` NO entra acá desde 2026-10-23: dejó de ser una categoría excluida
+ * — ahora `_aplicarFila` la procesa y crea un `LoyaltyPendingEnrollment` (motivo
+ * 'telefono_duplicado'), visible y resoluble desde "Clientes pendientes", así que ya no se
+ * "pierde" como las demás bloqueantes. */
 function _totalBloqueantes(clasificacionResumen) {
   return clasificacionResumen.duplicadoBloqueante
     + clasificacionResumen.invalidoBloqueante
-    + clasificacionResumen.conflictoBloqueante
-    + clasificacionResumen.telefonoDuplicadoBloqueante;
+    + clasificacionResumen.conflictoBloqueante;
 }
 
 /**
@@ -241,6 +334,11 @@ function construirFilasDesdeCorrecciones(filasCrudas) {
       nivelSugerido,
       advertencias,
       info,
+      // El Excel de correcciones no trae ninguna de las columnas de enriquecimiento (solo
+      // Tarjeta/Nombre/Celular/Telefono/Categoria/Saldo, ver CORRECCIONES_COLUMNAS en
+      // loyalty-import.parser.js) — se dejan vacías por consistencia de shape.
+      apellidos: '', apodo: '', sexo: '', fechaNacimiento: '', especialidades: '', sucursal: '', calle: '',
+      numExterior: '', numInterior: '', colonia: '', municipio: '', estado: '', cp: '', comentarios: '',
     };
   });
 }
@@ -265,11 +363,11 @@ function _construirMensaje({ nombre, nip, url }) {
 }
 
 /**
- * Aplica UNA fila 'ok' o 'pendiente_sin_telefono' dentro de una transacción YA
- * abierta — lógica compartida entre `aplicar()` (todo en un solo lote, para
- * batches chicos / otros callers) y `_correrAplicarJob()` (un lote de
- * `BATCH_SIZE` filas por transacción, para la migración completa en background).
- * Nunca se llama con una fila bloqueante ni 'ya_migrada' — ambos call sites las
+ * Aplica UNA fila 'ok', 'pendiente_sin_telefono' o 'ya_migrada' (esta última solo backfillea
+ * `tarjetaLegada` si falta, ver rama de abajo) dentro de una transacción YA abierta — lógica
+ * compartida entre `aplicar()` (todo en un solo lote, para batches chicos / otros callers) y
+ * `_correrAplicarJob()` (un lote de `BATCH_SIZE` filas por transacción, para la migración
+ * completa en background). Nunca se llama con una fila bloqueante — ambos call sites las
  * filtran antes de llegar acá.
  */
 async function _aplicarFila(t, fila, user, { url }) {
@@ -286,6 +384,34 @@ async function _aplicarFila(t, fila, user, { url }) {
 
     // 2) Bloquea la fila recién creada antes de aplicar el movimiento.
     const tarjetaBloqueada = await LoyaltyCard.findByPk(card.id, { transaction: t, lock: Transaction.LOCK.UPDATE });
+
+    // 2.1) Persiste `tarjetaLegada` (gap real corregido 2026-10-22: el camino feliz nunca
+    //      guardaba el número de Tarjeta del CSV legado — se usaba solo en memoria durante la
+    //      clasificación y se descartaba, a diferencia de 'pendiente_sin_telefono', que SÍ lo
+    //      persiste. Necesario para el match de clientes con Kore, ver kore-match/). Menos
+    //      invasivo que extender `cardService.crearTarjeta` (su firma/contrato no cambia, lo
+    //      siguen llamando otros callers como `completarRegistroPendiente`): un UPDATE puntual
+    //      por id, antes de la única escritura de ledger permitida (mismo estilo de `LoyaltyCard.
+    //      update(...)` usado por la rama 'ya_migrada' de abajo).
+    // 2.2) Enriquecimiento (2026-10-23): mismo UPDATE puntual, mismo criterio que tarjetaLegada
+    //      arriba — se persiste siempre (incluso si todos los campos vienen vacíos, para que una
+    //      tarjeta creada hoy nunca dependa de una corrida de re-import futura).
+    // Activo/Inactivo (2026-10-29): a diferencia del resto de campos de enriquecimiento (que solo
+    // rellenan si están vacíos), `activa` viene directo de `fila.activaSugerida` — en 'ok' la
+    // tarjeta recién se crea (siempre `activa:true` por default en `crearTarjeta`), así que esto
+    // es la primera escritura real del valor, no un overwrite.
+    const activaPatch = fila.activaSugerida !== undefined ? { activa: fila.activaSugerida } : {};
+    if (fila.tarjetaRawClientes) {
+      await LoyaltyCard.update(
+        { tarjetaLegada: normalizarTarjeta(fila.tarjetaRawClientes), ..._datosEnriquecimiento(fila), ...activaPatch },
+        { where: { id: card.id }, transaction: t },
+      );
+    } else {
+      await LoyaltyCard.update(
+        { ..._datosEnriquecimiento(fila), ...activaPatch },
+        { where: { id: card.id }, transaction: t },
+      );
+    }
 
     // 3) Única escritura del ledger (D4, `_aplicarMovimiento`).
     await ledgerService._aplicarMovimiento(t, tarjetaBloqueada, {
@@ -305,7 +431,83 @@ async function _aplicarFila(t, fila, user, { url }) {
     };
   }
 
+  if (fila.categoria === 'ya_migrada') {
+    // Re-import repetible (pedido explícito 2026-10-22, sirve además como backfill único para las
+    // ~9,633 tarjetas ya migradas antes del fix de `tarjetaLegada` de arriba): volver a subir el
+    // MISMO CSV rellena `tarjetaLegada` para una tarjeta que ya existe, SIN tocar puntos/nivel/
+    // nombre y SIN crear un segundo movimiento de ledger (nunca se llama a `ledgerService`/
+    // `cardService.crearTarjeta` acá).
+    //
+    // FIX 2026-10-23 (hallazgo CRÍTICO de revisión: confiabilidad + resiliencia): la versión
+    // anterior ataba el backfill de los 13 campos de enriquecimiento al MISMO gate que
+    // `tarjetaLegada` (`WHERE tarjetaLegada IS NULL`), así que para las tarjetas que ya tenían
+    // `tarjetaLegada` cargada (el caso real en producción, backfilleado el 2026-10-22) el
+    // enriquecimiento NUNCA se aplicaba — en silencio, sin error. Ahora cada gate es independiente:
+    // `tarjetaLegada` se backfillea solo si falta (igual que antes); cada uno de los 13 campos de
+    // enriquecimiento se backfillea campo por campo, solo si ESE campo está vacío en la tarjeta Y
+    // la fila trae un valor — nunca se pisa un dato ya cargado (semántica confirmada por el
+    // usuario). `withDatosPersonales` es necesario acá: `LoyaltyCard` excluye estos campos por
+    // defaultScope (ver LoyaltyCard.js), así que sin ese scope `card[campo]` siempre sería
+    // `undefined` y el backfill pisaría datos reales creyendo que estaban vacíos.
+    const card = await LoyaltyCard.scope('withDatosPersonales').findOne({
+      where: { telefono: fila.telefonoNormalizado },
+      transaction: t,
+      lock: Transaction.LOCK.UPDATE,
+    });
+
+    if (!card) {
+      // No debería pasar — esta fila se clasificó como 'ya_migrada' porque `_clasificarFila`
+      // encontró una tarjeta con este teléfono. Red de seguridad para un caso raro (borrado
+      // concurrente entre clasificar y aplicar): se loguea para que no quede como éxito silencioso.
+      logger.warn(`[LealtadImport] fila 'ya_migrada' sin tarjeta real para teléfono ${fila.telefonoNormalizado} — se omite sin backfillear nada.`);
+      return { yaMigradaBackfill: false };
+    }
+
+    const updates = {};
+    if (!card.tarjetaLegada && fila.tarjetaRawClientes) {
+      updates.tarjetaLegada = normalizarTarjeta(fila.tarjetaRawClientes);
+    }
+    const datosFila = _datosEnriquecimiento(fila);
+    for (const campo of CAMPOS_ENRIQUECIMIENTO) {
+      if (!card[campo] && datosFila[campo]) {
+        updates[campo] = datosFila[campo];
+      }
+    }
+    // Activo/Inactivo (2026-10-29, pedido explícito del usuario): a diferencia de TODOS los
+    // campos de arriba (que solo backfillean si están vacíos), `activa` se SOBRESCRIBE siempre
+    // que la fila traiga `activaSugerida` — reporteClientesPorVendedor.xlsx es la fuente de
+    // verdad de estatus en cada corrida, incluso si la tarjeta ya tenía un valor distinto (puede
+    // pisar un cambio manual anterior del staff; decisión confirmada explícitamente). Las filas
+    // de `construirFilasDesdeCorrecciones` (re-subida de Excel de bloqueantes) NUNCA traen
+    // `activaSugerida` (ese flujo no vuelve a cruzar contra el reporte de vendedor) — en ese caso
+    // no se toca `activa` para nada, nunca se interpreta `undefined` como `false`.
+    if (fila.activaSugerida !== undefined && card.activa !== fila.activaSugerida) {
+      updates.activa = fila.activaSugerida;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      // Ni tarjetaLegada ni ningún campo de enriquecimiento tenían algo para completar — resultado
+      // legítimo (la tarjeta ya estaba completa), no un fallo, pero se distingue explícitamente del
+      // caso "sí se backfilleó algo" en el conteo que se reporta (antes era un UPDATE ciego sin
+      // forma de saber si había tocado 0 filas).
+      return { yaMigradaBackfill: false };
+    }
+
+    await card.update(updates, { transaction: t });
+    return { yaMigradaBackfill: true };
+  }
+
   if (fila.categoria === 'pendiente_sin_telefono') {
+    // Dedup (2026-10-23): aplicar()/el job pueden correr más de una vez sobre el mismo CSV
+    // (re-import idempotente, ver docstring del archivo) — sin esto, cada corrida duplicaría el
+    // pendiente para la misma tarjeta legada.
+    const yaExiste = fila.tarjetaRawClientes
+      ? await LoyaltyPendingEnrollment.findOne({ where: { tarjetaLegada: fila.tarjetaRawClientes }, transaction: t })
+      : null;
+    if (yaExiste) {
+      return { pendiente: false };
+    }
+
     await LoyaltyPendingEnrollment.create({
       nombre:          fila.nombre,
       correo:          fila.correo || null,
@@ -313,8 +515,37 @@ async function _aplicarFila(t, fila, user, { url }) {
       saldoLegado:     fila.saldo,
       nivelSugerido:   fila.nivelSugerido,
       estado:          'pendiente',
+      motivo:          'sin_telefono',
       createdById:     usuarioId,
       createdByNombre: usuarioNombre,
+    }, { transaction: t });
+    return { pendiente: true };
+  }
+
+  if (fila.categoria === 'telefono_duplicado_bloqueante') {
+    // Dedup: mismo criterio que la rama 'pendiente_sin_telefono' de arriba — aplicar()/el job
+    // pueden correr más de una vez sobre el mismo CSV (re-import idempotente), sin esto cada
+    // corrida duplicaría el pendiente.
+    const tarjetaLegadaNorm = fila.tarjetaRawClientes ? normalizarTarjeta(fila.tarjetaRawClientes) : null;
+    const yaExiste = tarjetaLegadaNorm
+      ? await LoyaltyPendingEnrollment.findOne({ where: { tarjetaLegada: tarjetaLegadaNorm }, transaction: t })
+      : null;
+    if (yaExiste) {
+      return { pendiente: false };
+    }
+
+    await LoyaltyPendingEnrollment.create({
+      nombre:            fila.nombre,
+      correo:            fila.correo || null,
+      tarjetaLegada:     tarjetaLegadaNorm,
+      saldoLegado:       fila.saldo,
+      nivelSugerido:     fila.nivelSugerido,
+      estado:            'pendiente',
+      motivo:            'telefono_duplicado',
+      grupoId:           fila.telefonoNormalizado,
+      telefonoCandidato: fila.contacto,
+      createdById:       usuarioId,
+      createdByNombre:   usuarioNombre,
     }, { transaction: t });
     return { pendiente: true };
   }
@@ -339,18 +570,30 @@ async function aplicar({ clientesRows, puntosRows }, user, { url } = {}) {
   const dataset = [];
   let pendientesCreadas = 0;
   let omitidasYaMigradas = 0;
+  let yaMigradaBackfillAplicado = 0;
+  // Descarte automático por duplicidad de teléfono (2026-10-29): no necesita lookup/escritura en
+  // DB (ver _clasificarFilasYaConstruidas), así que se arma directo acá, FUERA de la transacción
+  // — no tiene sentido abrir una transacción Postgres para una fila que nunca se va a tocar.
+  const descartadosPorDuplicidad = filas
+    .filter((f) => f.categoria === 'descartado_duplicado_sin_puntos')
+    .map(_descartadoDesdeFila);
 
   await sequelize.transaction(async (t) => {
     for (const fila of filas) {
-      if (fila.categoria === 'ok' || fila.categoria === 'pendiente_sin_telefono') {
+      if (fila.categoria === 'ok' || fila.categoria === 'pendiente_sin_telefono' || fila.categoria === 'telefono_duplicado_bloqueante') {
         const r = await _aplicarFila(t, fila, user, { url });
         if (r?.creada) dataset.push(r.creada);
         if (r?.pendiente) pendientesCreadas += 1;
       } else if (fila.categoria === 'ya_migrada') {
+        // Re-import repetible (ver _aplicarFila): backfillea tarjetaLegada/enriquecimiento si
+        // falta, nunca crea ledger/pendiente ni toca puntos/nivel/nombre.
+        const r = await _aplicarFila(t, fila, user, { url });
+        if (r?.yaMigradaBackfill) yaMigradaBackfillAplicado += 1;
         omitidasYaMigradas += 1;
       }
       // duplicado_bloqueante / invalido_bloqueante / conflicto_bloqueante: excluidas a propósito,
       // ni se escriben ni abortan el resto de la corrida (ver excluidasBloqueantes abajo).
+      // descartado_duplicado_sin_puntos: ya resuelta arriba, fuera de la transacción.
     }
   });
 
@@ -359,7 +602,14 @@ async function aplicar({ clientesRows, puntosRows }, user, { url } = {}) {
     creadas: dataset,
     pendientesCreadas,
     omitidasYaMigradas,
+    // Hallazgo de resiliencia 2026-10-23: antes el backfill de 'ya_migrada' era un UPDATE ciego
+    // (nunca se sabía si había tocado alguna fila). Este contador distingue, de las
+    // `omitidasYaMigradas`, cuántas tuvieron al menos un campo (tarjetaLegada o enriquecimiento)
+    // realmente completado — si queda muy por debajo de lo esperado, es señal de un desajuste real
+    // (ej. formato de teléfono) en vez de asumir éxito silencioso.
+    yaMigradaBackfillAplicado,
     excluidasBloqueantes: _totalBloqueantes(clasificacionResumen),
+    descartadosPorDuplicidad,
     erroresFilas: [], // aplicar() usa una sola transacción compartida (ver docstring) — una fila
                        // que falla aborta esa transacción entera, no hay nada que listar acá. Solo
                        // _correrAplicarJob (per-fila) puede producir entradas reales.
@@ -416,12 +666,25 @@ function _resumenDesdeFilasClasificadas(filas) {
  * inmediato) y devuelve `{jobId,total,totalLotes}`. Extraído de `iniciarAplicarJob` para que
  * `iniciarAplicarCorreccionesJob` reuse la MISMA máquina de batching/progreso/sockets.
  *
- * Las filas bloqueantes/'ya_migrada' NO son accionables — nunca entran a un lote, solo se
- * cuentan (`clasificacionResumen.yaMigrada`/`excluidasBloqueantes` en el resultado final).
+ * Las filas bloqueantes NO son accionables — nunca entran a un lote, solo se cuentan
+ * (`excluidasBloqueantes` en el resultado final). 'ya_migrada' SÍ es accionable desde
+ * 2026-10-22 (re-import repetible, ver _aplicarFila) — pasa por `_aplicarFila` para backfillear
+ * `tarjetaLegada`/enriquecimiento si falta, aunque nunca crea nada; su conteo total sigue viniendo
+ * de `clasificacionResumen.yaMigrada`, pero `yaMigradaBackfillAplicado` en el resultado final
+ * distingue cuántas de esas realmente tuvieron algún campo completado.
  */
 function _iniciarJobDesdeFilasClasificadas(filas, user, { url } = {}) {
   const clasificacionResumen = _resumenDesdeFilasClasificadas(filas);
-  const actionable = filas.filter((f) => f.categoria === 'ok' || f.categoria === 'pendiente_sin_telefono');
+  const actionable = filas.filter((f) => (
+    f.categoria === 'ok' || f.categoria === 'pendiente_sin_telefono' || f.categoria === 'ya_migrada'
+      || f.categoria === 'telefono_duplicado_bloqueante'
+  ));
+  // Descarte automático por duplicidad de teléfono (2026-10-29): nunca es accionable (no entra a
+  // ningún lote, no necesita lookup/escritura en DB) — se calcula directo acá y viaja aparte hasta
+  // el resultado final del job (ver _correrAplicarJob).
+  const descartadosPorDuplicidad = filas
+    .filter((f) => f.categoria === 'descartado_duplicado_sin_puntos')
+    .map(_descartadoDesdeFila);
   const lotes = _chunk(actionable, BATCH_SIZE);
 
   const jobId = _nuevoJobIdAplicar();
@@ -437,7 +700,7 @@ function _iniciarJobDesdeFilasClasificadas(filas, user, { url } = {}) {
   // Sin await a propósito — mismo patrón que netpay-reporte.service.js#iniciarCargaReporteJob:
   // es justo lo que permite responder 202 de inmediato sin bloquear la request mientras los
   // lotes corren.
-  _correrAplicarJob(jobId, lotes, user, { url }, clasificacionResumen);
+  _correrAplicarJob(jobId, lotes, user, { url }, clasificacionResumen, descartadosPorDuplicidad);
 
   return { jobId, total: actionable.length, totalLotes: lotes.length };
 }
@@ -476,11 +739,12 @@ async function iniciarAplicarCorreccionesJob(filasCrudas, user, { url } = {}) {
  * sigue con la siguiente — nunca pasa a `status: 'error'` por esto. Ese estado queda reservado
  * para algo catastrófico fuera del try/catch por fila (no debería ocurrir en la práctica).
  */
-async function _correrAplicarJob(jobId, lotes, user, { url }, clasificacionResumen) {
+async function _correrAplicarJob(jobId, lotes, user, { url }, clasificacionResumen, descartadosPorDuplicidad = []) {
   const total = lotes.reduce((acc, lote) => acc + lote.length, 0);
   const dataset = [];
   const erroresFilas = [];
   let pendientesCreadas = 0;
+  let yaMigradaBackfillAplicado = 0;
   let procesados = 0;
   let loteActual = 0;
 
@@ -494,6 +758,7 @@ async function _correrAplicarJob(jobId, lotes, user, { url }, clasificacionResum
             const r = await _aplicarFila(t, fila, user, { url });
             if (r?.creada) dataset.push(r.creada);
             if (r?.pendiente) pendientesCreadas += 1;
+            if (r?.yaMigradaBackfill) yaMigradaBackfillAplicado += 1;
           });
         } catch (err) {
           // Caso real conocido (2026-10-19): dos filas con Tarjeta legada distinta pero el MISMO
@@ -526,7 +791,9 @@ async function _correrAplicarJob(jobId, lotes, user, { url }, clasificacionResum
       creadas: dataset,
       pendientesCreadas,
       omitidasYaMigradas: clasificacionResumen.yaMigrada,
+      yaMigradaBackfillAplicado,
       excluidasBloqueantes: _totalBloqueantes(clasificacionResumen),
+      descartadosPorDuplicidad,
       erroresFilas,
     };
     LEALTAD_APPLY_JOBS.set(jobId, {
@@ -575,19 +842,75 @@ function obtenerEstadoAplicarJob(jobId, userId) {
   return estado;
 }
 
-/** Mismo criterio de paginación que `loyalty-card.service.js#listar`. */
-async function listarPendientes({ page = 1, limit = 50 } = {}) {
+/**
+ * Orden (2026-10-23, pedido explícito del usuario): `saldoLegado` DESC primero — un cliente
+ * legado con puntos reales esperando es más urgente de resolver (conseguirle el teléfono) que uno
+ * sin saldo, independientemente de cuándo quedó pendiente. `createdAt` ASC como criterio
+ * secundario (el de siempre) para los que empatan en saldo, incluido el caso común de saldo 0.
+ *
+ * Agrupado por `grupoId` (2026-10-23, pedido explícito del usuario): 2+ filas de motivo
+ * 'telefono_duplicado' que comparten el mismo teléfono se devuelven juntas en un mismo grupo, para
+ * que el admin las resuelva viendo el conflicto completo en vez de encontrarlas sueltas en páginas
+ * distintas. Las filas de motivo 'sin_telefono' (grupoId null) quedan cada una en su propio grupo
+ * de 1 — se paginan por GRUPO, no por fila, así un par en conflicto nunca queda partido entre dos
+ * páginas. El volumen real hoy (~1.800 filas pendientes) es perfectamente razonable de traer
+ * completo a memoria para un panel admin (no es un hot path).
+ */
+async function listarPendientes({ page = 1, limit = 50, exportar = false, search } = {}) {
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Number(limit) || 50);
 
-  const { count, rows } = await LoyaltyPendingEnrollment.findAndCountAll({
-    where:  { estado: 'pendiente' },
-    order:  [['createdAt', 'ASC']],
-    limit:  l,
-    offset: (p - 1) * l,
+  // Buscador (2026-10-29, pedido explícito del usuario) — mismo criterio que
+  // loyalty-card.service.js#listarPendientesRevisionKore: prefijo de teléfono O ILIKE de nombre.
+  // Este modelo no tiene columna `telefono` propia (ver LoyaltyPendingEnrollment.js) — el único
+  // candidato disponible es `telefonoCandidato` (solo se llena para motivo=telefono_duplicado).
+  const where = { estado: 'pendiente' };
+  if (search) {
+    const s = String(search).trim();
+    where[Op.and] = [
+      {
+        [Op.or]: [
+          { telefonoCandidato: { [Op.like]: `${s}%` } },
+          { nombre:            { [Op.iLike]: `%${s}%` } },
+        ],
+      },
+    ];
+  }
+
+  const rows = await LoyaltyPendingEnrollment.findAll({
+    where,
+    order: [['saldoLegado', 'DESC'], ['createdAt', 'ASC']],
   });
 
-  return { total: count, page: p, limit: l, pages: Math.ceil(count / l), pendientes: rows };
+  const gruposMap = new Map();
+  for (const row of rows) {
+    const key = row.grupoId || `solo-${row.id}`;
+    if (!gruposMap.has(key)) gruposMap.set(key, []);
+    gruposMap.get(key).push(row);
+  }
+
+  const grupos = Array.from(gruposMap.values()).map((items) => ({
+    grupoId: items[0].grupoId, // null para los grupos de 1 (motivo sin_telefono)
+    saldoMax: Math.max(...items.map((i) => Number(i.saldoLegado))),
+    items,
+  }));
+  grupos.sort((a, b) => b.saldoMax - a.saldoMax || a.items[0].createdAt - b.items[0].createdAt);
+
+  const total = grupos.length;
+  const totalRegistros = rows.length;
+
+  // Exportación a Excel (2026-10-26, pedido explícito del usuario): trae TODOS los grupos de una
+  // sola vez, sin el corte de página ni el tope de 100 por página — el admin necesita el padrón
+  // completo para compartirlo y resolverlo a mano, no una página a la vez. Los `rows` ya están
+  // completos en memoria desde el `findAll` de arriba (mismo criterio de volumen documentado en
+  // el comentario original de esta función), así que no hace falta una query aparte.
+  if (exportar) {
+    return { total, totalRegistros, page: 1, limit: total, pages: 1, grupos };
+  }
+
+  const pageSlice = grupos.slice((p - 1) * l, (p - 1) * l + l);
+
+  return { total, totalRegistros, page: p, limit: l, pages: Math.ceil(total / l) || 1, grupos: pageSlice };
 }
 
 /**

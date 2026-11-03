@@ -8,10 +8,11 @@
  * permiso angosto y exclusivo de admin `loyalty:importar` (rbac.js).
  *
  * SOLO expone la previsualización/concentrado (lectura, sin I/O a base de
- * datos): sube clientes.csv y/o puntos.pdf, los parsea y cruza, y devuelve el
- * reporte para revisión humana. Aplicar la migración (crear tarjetas/ledger)
- * queda fuera de alcance — es un paso posterior, una vez decidido el mapeo
- * Categoria→Nivel (ver loyalty-import.service.js).
+ * datos): sube clientes.csv y/o reporteClientesPorVendedor.xlsx (reemplaza a
+ * puntos.pdf desde 2026-10-29), los parsea y cruza, y devuelve el reporte para
+ * revisión humana. Aplicar la migración (crear tarjetas/ledger) queda fuera de
+ * alcance — es un paso posterior, una vez decidido el mapeo Categoria→Nivel
+ * (ver loyalty-import.service.js).
  *
  * Multer — nota sobre "dos instancias": el patrón de referencia
  * (bank.routes.js `upload`/`uploadFichaImagen`) usa dos instancias de multer,
@@ -30,9 +31,10 @@ const { authenticate, permit } = require('../../../shared/middleware/auth');
 const { asyncHandler } = require('../../../shared/middleware/error-handler');
 const { PERMISSIONS } = require('../../../shared/config/rbac');
 const { BadRequestError } = require('../../../shared/errors/AppError');
-const { parseClientesCsv, parsePuntosPdf, parseCorreccionesXlsx } = require('./loyalty-import.parser');
+const { parseClientesCsv, parseVendedorXlsx, parseCorreccionesXlsx } = require('./loyalty-import.parser');
 const { construirConcentrado } = require('./loyalty-import.service');
 const applyService = require('./loyalty-import-apply.service');
+const { iniciarMatchKoreJob, obtenerEstadoMatchKoreJob } = require('../kore-match/loyalty-kore-match.service');
 
 const router = express.Router();
 
@@ -48,8 +50,11 @@ const upload = multer({
       return cb(ok ? null : new Error('El campo "clientes" solo acepta archivos .csv'), ok);
     }
     if (file.fieldname === 'puntos') {
-      const ok = /\.pdf$/i.test(file.originalname) || file.mimetype === 'application/pdf';
-      return cb(ok ? null : new Error('El campo "puntos" solo acepta archivos .pdf'), ok);
+      // Reemplaza a puntos.pdf (2026-10-29, pedido explícito del usuario) — el campo/nombre
+      // 'puntos' se deja sin tocar para no ensanchar el diff (FormData/multer/rutas), solo
+      // cambia qué tipo de archivo acepta.
+      const ok = /\.xlsx$/i.test(file.originalname);
+      return cb(ok ? null : new Error('El campo "puntos" solo acepta archivos .xlsx'), ok);
     }
     cb(new Error(`Campo de archivo inesperado: "${file.fieldname}"`), false);
   },
@@ -82,14 +87,14 @@ router.post('/concentrado', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), 
   const puntosFile = req.files?.puntos?.[0];
 
   if (!clientesFile && !puntosFile) {
-    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o puntos.pdf).');
+    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o reporteClientesPorVendedor.xlsx).');
   }
   if (clientesFile && clientesFile.size > MAX_CLIENTES_BYTES) {
     throw new BadRequestError('clientes.csv supera el tamaño máximo permitido (15MB).');
   }
 
   const clientesRows = clientesFile ? await parseClientesCsv(clientesFile.buffer) : [];
-  const puntosRows = puntosFile ? await parsePuntosPdf(puntosFile.buffer) : [];
+  const puntosRows = puntosFile ? await parseVendedorXlsx(puntosFile.buffer) : [];
 
   res.json(construirConcentrado({ clientesRows, puntosRows }));
 }));
@@ -112,14 +117,14 @@ router.post('/aplicar', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), uplo
   const puntosFile = req.files?.puntos?.[0];
 
   if (!clientesFile && !puntosFile) {
-    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o puntos.pdf).');
+    throw new BadRequestError('Debes subir al menos un archivo (clientes.csv o reporteClientesPorVendedor.xlsx).');
   }
   if (clientesFile && clientesFile.size > MAX_CLIENTES_BYTES) {
     throw new BadRequestError('clientes.csv supera el tamaño máximo permitido (15MB).');
   }
 
   const clientesRows = clientesFile ? await parseClientesCsv(clientesFile.buffer) : [];
-  const puntosRows = puntosFile ? await parsePuntosPdf(puntosFile.buffer) : [];
+  const puntosRows = puntosFile ? await parseVendedorXlsx(puntosFile.buffer) : [];
 
   const confirmar = req.query.confirmar === 'true';
   if (!confirmar) {
@@ -170,8 +175,8 @@ router.post('/correcciones', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR),
 
 // GET /api/loyalty/import/pendientes
 router.get('/pendientes', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
-  const { page, limit } = req.query;
-  res.json(await applyService.listarPendientes({ page, limit }));
+  const { page, limit, exportar, search } = req.query;
+  res.json(await applyService.listarPendientes({ page, limit, exportar: exportar === 'true', search }));
 }));
 
 // POST /api/loyalty/import/pendientes/:id/completar
@@ -190,6 +195,39 @@ router.post('/pendientes/:id/rechazar', authenticate, permit(PERMISSIONS.LOYALTY
 // por medio, a diferencia de /aplicar), no hace falta job ni lotes.
 router.post('/pendientes/rechazar-todos', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
   res.json(await applyService.rechazarTodosPendientes(req.user));
+}));
+
+// POST /api/loyalty/import/kore-match
+//
+// Match de clientes entre el Sistema de Lealtad (LoyaltyCard.tarjetaLegada) y Kore (monedero
+// externo, GET /clientes/monedero) — ver loyalty-kore-match.service.js. Sin body. Idempotente:
+// solo UPDATEa koreClienteId/koreMonedero en las tarjetas que matchean, se puede volver a llamar
+// sin efectos destructivos (ej. tras cargar más clientes en Kore). Mismo permiso que el resto de
+// este router — el frontend lo va a consumir desde la vista "Importar clientes" en una tarea
+// futura.
+//
+// Arranca el match en BACKGROUND y responde 202+jobId de inmediato (mismo patrón que
+// POST /aplicar → iniciarAplicarJob, ver docstring de loyalty-kore-match.service.js): el cruce
+// completo pagina ~20 páginas remotas contra Kore (hasta 3 reintentos con backoff de hasta 60s
+// cada uno) y puede terminar actualizando hasta ~2,000 filas de Postgres — correrlo síncrono
+// adentro de la request revienta cualquier timeout. El progreso llega por socket
+// (`lealtad-import:kore-match:progress|done|error`); GET /kore-match-job/:jobId de abajo es el
+// mismo fallback de recuperación que GET /aplicar-job/:jobId.
+router.post('/kore-match', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
+  const { jobId } = iniciarMatchKoreJob(req.user);
+  res.status(202).json({ jobId });
+}));
+
+// GET /api/loyalty/import/kore-match-job/:jobId
+//
+// Fallback de recuperación tras un reload de página — mismo criterio que
+// GET /aplicar-job/:jobId. El socket (`lealtad-import:kore-match:progress|done|error`) es la vía
+// normal de enterarse del progreso; esto es solo para cuando alguien recarga a mitad del job y
+// pierde la suscripción en memoria. SÍ hay chequeo de dueño (userId).
+router.get('/kore-match-job/:jobId', authenticate, permit(PERMISSIONS.LOYALTY_IMPORTAR), asyncHandler(async (req, res) => {
+  const estado = obtenerEstadoMatchKoreJob(req.params.jobId, req.user._id);
+  if (!estado) return res.status(404).json({ error: 'Job de match con Kore no encontrado o expirado' });
+  res.json(estado);
 }));
 
 module.exports = router;

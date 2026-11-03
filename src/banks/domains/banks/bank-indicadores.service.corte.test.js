@@ -20,8 +20,13 @@ const { User: PgUser } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { BadRequestError } = require('../../shared/errors/AppError');
 const {
-  getCorteConciliacion, getCorteTendencia, buildReporteCorte, getPeriodoCortePorRol,
+  getCorteConciliacion, buildReporteCorte, getPeriodoCortePorRol,
+  getProgresoResolucionPorCorte, getLedgerDiario,
   _folioFechaCodificada, _mesesDeAtraso, _calcularCxcRetrasadas,
+  _enumerarCortesSemanales, _calcularLedgerBacklog, _enumerarDiasEnRango,
+  _resolverMesOrigen,
+  getLedgerMensual, _enumerarMesesParaLedger, getLedgerPorHora, _enumerarHorasDelDia,
+  getUltimosMovimientos,
 } = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
@@ -606,72 +611,334 @@ describe('getCorteConciliacion — cxcRetrasadas', () => {
   });
 });
 
-describe('getCorteTendencia', () => {
-  test('puntos:1 — un solo punto, SIEMPRE el periodo en curso (esActual:true)', async () => {
-    mockAggregates({
-      rezagados: [{ _id: 'no_identificado', count: 5 }],
-      nuevos:    [{ _id: 'no_identificado', count: 3 }],
-      pendientesConErp: [
-        { _id: 'm1', erpLinks: [{ serie: 'A0', folioExterno: '260901542' }] },
-      ],
-    });
+// Última semana YA CERRADA bajo AHORA_MX (miércoles 2026-10-07): semana en curso arranca el
+// lunes 2026-10-05 (INICIO_SEMANA_ESPERADO) → el corte anterior arrancó el lunes 2026-09-28 y
+// cerró el domingo 2026-10-04 a las 23:59:59.999 México.
+const CIERRE_ESPERADO = new Date(INICIO_SEMANA_ESPERADO.getTime() - 1);
+const INICIO_CORTE_ESPERADO = new Date(CIERRE_ESPERADO.getTime() - 7 * 86400000 + 1);
 
-    const result = await getCorteTendencia({ periodo: 'semanal', puntos: 1 });
+describe('_calcularLedgerBacklog (2026-10-30: ledger genérico, misma fórmula para día o semana)', () => {
+  test('iniciales/nuevos/identificados/total — un movimiento ya resuelto ANTES de empezar el periodo queda totalmente excluido', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // A: iniciales, nunca identificado — sigue pendiente.
+      { deposito: 100, createdAt: new Date('2026-09-01T12:00:00.000Z'), primeraIdentificacionAt: null, historialVinculacion: [] },
+      // B: iniciales, se identificó DENTRO del periodo.
+      { deposito: 200, createdAt: new Date('2026-09-01T12:00:00.000Z'), primeraIdentificacionAt: new Date(INICIO_CORTE_ESPERADO.getTime() + 2 * 86400000), historialVinculacion: [] },
+      // C: ya estaba identificado ANTES de empezar el periodo — excluido del todo (ni iniciales ni identificados).
+      { deposito: 300, createdAt: new Date('2026-09-01T12:00:00.000Z'), primeraIdentificacionAt: new Date('2026-08-01T12:00:00.000Z'), historialVinculacion: [] },
+      // D: nuevo del periodo, sigue pendiente.
+      { deposito: 400, createdAt: new Date(INICIO_CORTE_ESPERADO.getTime() + 3 * 86400000), primeraIdentificacionAt: null, historialVinculacion: [] },
+      // E: nuevo del periodo, se identificó dentro del mismo periodo.
+      { deposito: 500, createdAt: new Date(INICIO_CORTE_ESPERADO.getTime() + 1 * 86400000), primeraIdentificacionAt: new Date(INICIO_CORTE_ESPERADO.getTime() + 4 * 86400000), historialVinculacion: [] },
+    ]) }) });
 
-    expect(result.periodo).toBe('semanal');
-    expect(result.puntos).toHaveLength(1);
-    expect(result.puntos[0]).toMatchObject({
-      esActual: true,
-      rezagadosTotal: 5,
-      rezagadosNoIdentificado: 5,
-      rezagadosReclasificado: 0,
-      nuevosPendientes: 3,
-      nuevosNoIdentificado: 3,
-      nuevosReclasificado: 0,
-      nuevosIdentificado: 0,
-      cxcRetrasadasCount: 1,
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO });
+
+    expect(ledger.iniciales).toEqual({ count: 2, saldo: 300 });     // A + B
+    expect(ledger.nuevos).toEqual({ count: 2, saldo: 900 });        // D + E
+    expect(ledger.identificados).toEqual({ count: 2, saldo: 700 }); // B + E
+    expect(ledger.total).toEqual({ count: 2, saldo: 500 });         // A (100) + D (400), lo que sigue pendiente
+    // Partido por origen (2026-10-30): B viene de iniciales, E viene de nuevos — nunca mezclados.
+    expect(ledger.identificadosDeIniciales).toEqual({ count: 1, saldo: 200 }); // B
+    expect(ledger.identificadosDeNuevos).toEqual({ count: 1, saldo: 500 });    // E
+  });
+
+  test('una identificación revertida ANTES del fin del periodo no cuenta como identificados — sigue pendiente', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      {
+        deposito: 500, createdAt: new Date('2026-09-01T12:00:00.000Z'),
+        primeraIdentificacionAt: new Date(INICIO_CORTE_ESPERADO.getTime() + 1 * 86400000),
+        historialVinculacion: [{ accion: 'desvinculado', at: new Date(INICIO_CORTE_ESPERADO.getTime() + 3 * 86400000) }],
+      },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO });
+    expect(ledger.iniciales).toEqual({ count: 1, saldo: 500 });
+    expect(ledger.identificados).toEqual({ count: 0, saldo: 0 });
+    expect(ledger.total).toEqual({ count: 1, saldo: 500 });
+  });
+
+  test('solo consulta status no_identificado/identificado — reclasificado/otros quedan fuera del query', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO });
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.status).toEqual({ $in: ['no_identificado', 'identificado'] });
+    expect(filtro.createdAt).toEqual({ $lte: CIERRE_ESPERADO });
+  });
+
+  test('mesOrigenInicio/mesOrigenFin acota createdAt a ese mes exacto, combinado con el $lte de periodoFin', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    const mesOrigenInicio = new Date(Date.UTC(2026, 7, 1, 6, 0, 0));
+    const mesOrigenFin = new Date(Date.UTC(2026, 8, 1, 6, 0, 0));
+    await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO, mesOrigenInicio, mesOrigenFin });
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.createdAt).toEqual({ $lte: CIERRE_ESPERADO, $gte: mesOrigenInicio, $lt: mesOrigenFin });
+  });
+});
+
+describe('Consistencia día↔semana (garantía central del diseño del ledger, no una suposición)', () => {
+  test('sumar nuevos/identificados de los 7 días de una semana da EXACTO lo mismo que calcular la semana directo', async () => {
+    const candidatos = [
+      // Iniciales de la semana: ya existía antes del lunes, nunca se resuelve.
+      { deposito: 1000, createdAt: new Date('2026-08-01T12:00:00.000Z'), primeraIdentificacionAt: null, historialVinculacion: [] },
+      // Iniciales de la semana, se identifica el miércoles (día 3).
+      { deposito: 2000, createdAt: new Date('2026-08-01T12:00:00.000Z'), primeraIdentificacionAt: new Date(Date.UTC(2026, 8, 30, 15, 0, 0)), historialVinculacion: [] },
+      // Nuevo del lunes (día 1), se identifica el mismo lunes.
+      { deposito: 3000, createdAt: new Date(Date.UTC(2026, 8, 28, 10, 0, 0)), primeraIdentificacionAt: new Date(Date.UTC(2026, 8, 28, 18, 0, 0)), historialVinculacion: [] },
+      // Nuevo del viernes (día 5), sigue pendiente al cierre de la semana.
+      { deposito: 4000, createdAt: new Date(Date.UTC(2026, 9, 2, 10, 0, 0)), primeraIdentificacionAt: null, historialVinculacion: [] },
+      // Nuevo del domingo (día 7), se identifica el mismo domingo.
+      { deposito: 5000, createdAt: new Date(Date.UTC(2026, 9, 4, 10, 0, 0)), primeraIdentificacionAt: new Date(Date.UTC(2026, 9, 4, 20, 0, 0)), historialVinculacion: [] },
+    ];
+    // mockImplementation (no Once): simula el filtro real de Mongo por `createdAt` en cada
+    // llamada — sin esto, un ítem creado el viernes aparecería como candidato también en el
+    // cálculo del lunes (cuyo periodoFin es antes de que el ítem exista), lo que ninguna query
+    // real de Mongo haría. Las 8 llamadas de este test (7 días + 1 semana) reusan el mismo mock.
+    BankMovement.find.mockImplementation((filtro) => ({
+      select: () => ({ lean: () => Promise.resolve(candidatos.filter((c) => {
+        if (c.createdAt > filtro.createdAt.$lte) return false;
+        if (filtro.createdAt.$gte && c.createdAt < filtro.createdAt.$gte) return false;
+        if (filtro.createdAt.$lt && c.createdAt >= filtro.createdAt.$lt) return false;
+        return true;
+      })) }),
+    }));
+
+    const semanaDirecta = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO });
+
+    const dias = _enumerarDiasEnRango({ desde: '2026-09-28', hasta: '2026-10-04' });
+    expect(dias).toHaveLength(7);
+
+    let nuevosSumaCount = 0, nuevosSumaSaldo = 0, identificadosSumaCount = 0, identificadosSumaSaldo = 0;
+    let idDeInicialesSumaCount = 0, idDeInicialesSumaSaldo = 0, idDeNuevosSumaCount = 0, idDeNuevosSumaSaldo = 0;
+    for (const { inicio, fin } of dias) {
+      const ledgerDia = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: inicio, periodoFin: fin });
+      nuevosSumaCount += ledgerDia.nuevos.count;
+      nuevosSumaSaldo += ledgerDia.nuevos.saldo;
+      identificadosSumaCount += ledgerDia.identificados.count;
+      identificadosSumaSaldo += ledgerDia.identificados.saldo;
+      idDeInicialesSumaCount += ledgerDia.identificadosDeIniciales.count;
+      idDeInicialesSumaSaldo += ledgerDia.identificadosDeIniciales.saldo;
+      idDeNuevosSumaCount += ledgerDia.identificadosDeNuevos.count;
+      idDeNuevosSumaSaldo += ledgerDia.identificadosDeNuevos.saldo;
+    }
+
+    // Verificación no trivial: confirma que el dataset realmente ejercita ambas cosas antes de
+    // comparar (si diera 0 de los dos lados, el test pasaría sin probar nada real).
+    expect(semanaDirecta.nuevos.count).toBeGreaterThan(0);
+    expect(semanaDirecta.identificados.count).toBeGreaterThan(0);
+    expect(semanaDirecta.identificadosDeIniciales.count).toBeGreaterThan(0);
+    expect(semanaDirecta.identificadosDeNuevos.count).toBeGreaterThan(0);
+
+    expect(nuevosSumaCount).toBe(semanaDirecta.nuevos.count);
+    expect(nuevosSumaSaldo).toBe(semanaDirecta.nuevos.saldo);
+    expect(identificadosSumaCount).toBe(semanaDirecta.identificados.count);
+    expect(identificadosSumaSaldo).toBe(semanaDirecta.identificados.saldo);
+    // El invariante también vale partido por origen (2026-10-30), no solo en el total combinado.
+    expect(idDeInicialesSumaCount).toBe(semanaDirecta.identificadosDeIniciales.count);
+    expect(idDeInicialesSumaSaldo).toBe(semanaDirecta.identificadosDeIniciales.saldo);
+    expect(idDeNuevosSumaCount).toBe(semanaDirecta.identificadosDeNuevos.count);
+    expect(idDeNuevosSumaSaldo).toBe(semanaDirecta.identificadosDeNuevos.saldo);
+  });
+});
+
+describe('getProgresoResolucionPorCorte (2026-10-30: vista semanal del ledger genérico)', () => {
+  test('arma {fechaInicio, fechaCierre, iniciales, nuevos, identificados, total} por corte, reusando _calcularLedgerBacklog', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 100, createdAt: new Date('2026-09-01T12:00:00.000Z'), primeraIdentificacionAt: null, historialVinculacion: [] },
+      { deposito: 200, createdAt: new Date('2026-09-01T12:00:00.000Z'), primeraIdentificacionAt: new Date(CIERRE_ESPERADO.getTime() - 2 * 86400000), historialVinculacion: [] },
+    ]) }) });
+
+    const { cortes } = await getProgresoResolucionPorCorte({ desde: '2026-10-04', hasta: '2026-10-04' });
+
+    expect(cortes).toHaveLength(1);
+    expect(cortes[0]).toEqual({
+      fechaInicio: INICIO_CORTE_ESPERADO,
+      fechaCierre: CIERRE_ESPERADO,
+      iniciales:                { count: 2, saldo: 300 },
+      nuevos:                   { count: 0, saldo: 0 },
+      identificados:            { count: 1, saldo: 200 },
+      identificadosDeIniciales: { count: 1, saldo: 200 },
+      identificadosDeNuevos:    { count: 0, saldo: 0 },
+      total:                    { count: 1, saldo: 100 },
     });
   });
 
-  // Desglose por status (2026-10-22, switch "Ver por estatus" del gráfico de tendencia):
-  // además de los totales, cada punto expone no_identificado/reclasificado/identificado por
-  // separado — y la suma debe cuadrar EXACTO con los totales de siempre (rezagadosTotal,
-  // nuevosPendientes), nunca inflarse ni divergir.
-  test('desglose por status — suma exacta de rezagados y de nuevos.pendientes', async () => {
-    mockAggregates({
-      rezagados: [
-        { _id: 'no_identificado', count: 7 },
-        { _id: 'reclasificado',   count: 2 },
-      ],
-      nuevos: [
-        { _id: 'no_identificado', count: 4 },
-        { _id: 'reclasificado',   count: 1 },
-        { _id: 'identificado',    count: 9 },
-      ],
-    });
-
-    const result = await getCorteTendencia({ periodo: 'semanal', puntos: 1 });
-    const punto = result.puntos[0];
-
-    expect(punto.rezagadosNoIdentificado).toBe(7);
-    expect(punto.rezagadosReclasificado).toBe(2);
-    expect(punto.rezagadosTotal).toBe(9);
-    expect(punto.rezagadosNoIdentificado + punto.rezagadosReclasificado).toBe(punto.rezagadosTotal);
-
-    expect(punto.nuevosNoIdentificado).toBe(4);
-    expect(punto.nuevosReclasificado).toBe(1);
-    expect(punto.nuevosPendientes).toBe(5);
-    expect(punto.nuevosNoIdentificado + punto.nuevosReclasificado).toBe(punto.nuevosPendientes);
-
-    // `nuevosIdentificado` es informativo aparte — NO debe sumarse a nuevosPendientes.
-    expect(punto.nuevosIdentificado).toBe(9);
-    expect(punto.nuevosNoIdentificado + punto.nuevosReclasificado + punto.nuevosIdentificado).not.toBe(punto.nuevosPendientes);
+  test('mesOrigen inválido tira BadRequestError', async () => {
+    await expect(getProgresoResolucionPorCorte({ mesOrigen: '2026-13' })).rejects.toThrow(BadRequestError);
   });
 
-  test('periodo inválido cae a "semanal" (mismo criterio que getCorteConciliacion)', async () => {
-    mockAggregates({});
-    const result = await getCorteTendencia({ periodo: 'quincenal', puntos: 1 });
-    expect(result.periodo).toBe('semanal');
+  test('sin desde/hasta, enumera los últimos 8 cortes semanales cerrados (la semana en curso no se incluye)', () => {
+    const cortes = _enumerarCortesSemanales({});
+    expect(cortes).toHaveLength(8);
+    expect(cortes[cortes.length - 1]).toEqual({ inicio: INICIO_CORTE_ESPERADO, fin: CIERRE_ESPERADO });
+    expect(cortes[cortes.length - 2].fin).toEqual(new Date(CIERRE_ESPERADO.getTime() - 7 * 86400000));
+  });
+});
+
+describe('getLedgerDiario (2026-10-30: vista diaria del ledger genérico, HOY incluido en vivo)', () => {
+  test('arma {fecha, iniciales, nuevos, identificados, total} por día, reusando _calcularLedgerBacklog', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 700, createdAt: AHORA_MX, primeraIdentificacionAt: null, historialVinculacion: [] },
+    ]) }) });
+
+    const { dias } = await getLedgerDiario({ desde: '2026-10-07', hasta: '2026-10-07' });
+
+    expect(dias).toHaveLength(1);
+    expect(dias[0].fecha).toEqual(new Date(Date.UTC(2026, 9, 7, 6, 0, 0))); // inicio del día de hoy
+    expect(dias[0].nuevos).toEqual({ count: 1, saldo: 700 });
+  });
+
+  test('el día de HOY usa "ahora" real como fin (no medianoche) — un día pasado usa medianoche', () => {
+    const dias = _enumerarDiasEnRango({ desde: '2026-10-06', hasta: '2026-10-07' });
+    expect(dias).toHaveLength(2);
+    expect(dias[0].fin).toEqual(new Date(Date.UTC(2026, 9, 7, 5, 59, 59, 999))); // ayer, cerrado
+    expect(dias[1].fin).toEqual(AHORA_MX); // hoy, en vivo
+  });
+});
+
+describe('_resolverMesOrigen', () => {
+  test('resuelve YYYY-MM a los límites $gte/$lt del mes', () => {
+    expect(_resolverMesOrigen('2026-08')).toEqual({
+      mesOrigenInicio: new Date(Date.UTC(2026, 7, 1, 6, 0, 0)),
+      mesOrigenFin: new Date(Date.UTC(2026, 8, 1, 6, 0, 0)),
+    });
+  });
+
+  test('sin mesOrigen, devuelve ambos null', () => {
+    expect(_resolverMesOrigen(null)).toEqual({ mesOrigenInicio: null, mesOrigenFin: null });
+  });
+
+  test('mesOrigen con formato inválido tira BadRequestError', () => {
+    expect(() => _resolverMesOrigen('agosto-2026')).toThrow(BadRequestError);
+  });
+});
+
+describe('_enumerarMesesParaLedger (2026-10-30: límites mensuales para getLedgerMensual, mes en curso incluido en vivo)', () => {
+  test('sin desde/hasta, enumera los últimos `cantidad` meses, el mes en curso con fin en vivo', () => {
+    const meses = _enumerarMesesParaLedger({ cantidad: 3 });
+    expect(meses).toHaveLength(3);
+    expect(meses.map(m => m.mes)).toEqual(['2026-08', '2026-09', '2026-10']);
+    expect(meses[0].inicio).toEqual(new Date(Date.UTC(2026, 7, 1, 6, 0, 0)));
+    // Agosto y septiembre ya cerraron: fin = último instante del mes, no AHORA_MX.
+    expect(meses[0].fin).toEqual(new Date(Date.UTC(2026, 8, 1, 6, 0, 0) - 1));
+    // Octubre es el mes en curso bajo AHORA_MX (miércoles 2026-10-07 15:00 México): fin EN VIVO.
+    expect(meses[2].fin).toEqual(AHORA_MX);
+  });
+
+  test('con `hasta` explícito, ningún mes del rango se trata como "en curso" (fin siempre cierre de mes)', () => {
+    const meses = _enumerarMesesParaLedger({ desde: '2026-06-01', hasta: '2026-07-31' });
+    expect(meses.map(m => m.mes)).toEqual(['2026-06', '2026-07']);
+    expect(meses[1].fin).toEqual(new Date(Date.UTC(2026, 7, 1, 6, 0, 0) - 1));
+  });
+
+  test('cruza el límite de año correctamente', () => {
+    const meses = _enumerarMesesParaLedger({ desde: '2025-11-01', hasta: '2026-02-01' });
+    expect(meses.map(m => m.mes)).toEqual(['2025-11', '2025-12', '2026-01', '2026-02']);
+  });
+});
+
+describe('getLedgerMensual (2026-10-30: vista mensual del ledger genérico — reemplaza el corte semanal para este dashboard)', () => {
+  test('arma {mes, fechaInicio, fechaFin, iniciales, nuevos, identificados, total} por mes, reusando _calcularLedgerBacklog', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // Cargado en septiembre, antes del inicio de octubre — es "iniciales" del mes de octubre.
+      { deposito: 300, createdAt: new Date('2026-09-15T12:00:00.000Z'), primeraIdentificacionAt: null, historialVinculacion: [] },
+    ]) }) });
+
+    const { meses } = await getLedgerMensual({ desde: '2026-10-01', hasta: '2026-10-31' });
+
+    expect(meses).toHaveLength(1);
+    expect(meses[0].mes).toBe('2026-10');
+    expect(meses[0].iniciales).toEqual({ count: 1, saldo: 300 });
+  });
+
+  test('mesOrigen inválido tira BadRequestError', async () => {
+    await expect(getLedgerMensual({ mesOrigen: '2026-13' })).rejects.toThrow(BadRequestError);
+  });
+});
+
+describe('_enumerarHorasDelDia (2026-10-30: límites horarios de un día para getLedgerPorHora — hoy en vivo, otro día cerrado)', () => {
+  test('sin fecha (hoy), bajo AHORA_MX (miércoles 2026-10-07 15:00 México), enumera de 00:00 a 15:00, la hora en curso con fin en vivo', () => {
+    const horas = _enumerarHorasDelDia();
+    expect(horas).toHaveLength(16); // 00:00 .. 15:00 inclusive
+    expect(horas[0].hora).toBe('00:00');
+    expect(horas[0].inicio).toEqual(new Date(Date.UTC(2026, 9, 7, 6, 0, 0))); // medianoche de hoy, hora México
+    expect(horas[horas.length - 1].hora).toBe('15:00');
+    // La hora en curso (15:00) tiene fin EN VIVO (AHORA_MX), no el cierre de esa hora.
+    expect(horas[horas.length - 1].fin).toEqual(AHORA_MX);
+    // Una hora ya cerrada (ej. 14:00, que va de las 14:00 a las 14:59:59.999 México =
+    // 20:00 a 20:59:59.999 UTC) tiene fin = último instante de esa hora, no medianoche.
+    const hora14 = horas.find(h => h.hora === '14:00');
+    expect(hora14.fin).toEqual(new Date(Date.UTC(2026, 9, 7, 21, 0, 0) - 1));
+  });
+
+  test('con fecha de un día pasado (ayer), enumera las 24 horas completas, TODAS cerradas — nunca "ahora", ni la última', () => {
+    const horas = _enumerarHorasDelDia('2026-10-06');
+    expect(horas).toHaveLength(24);
+    expect(horas[0].hora).toBe('00:00');
+    expect(horas[0].inicio).toEqual(new Date(Date.UTC(2026, 9, 6, 6, 0, 0)));
+    expect(horas[horas.length - 1].hora).toBe('23:00');
+    // La hora 23:00 de un día YA PASADO tiene fin fijo (cierre de esa hora), nunca AHORA_MX.
+    expect(horas[horas.length - 1].fin).not.toEqual(AHORA_MX);
+    expect(horas[horas.length - 1].fin).toEqual(new Date(Date.UTC(2026, 9, 7, 6, 0, 0) - 1));
+  });
+});
+
+describe('getLedgerPorHora (2026-10-30: vista por hora del ledger genérico, SOLO hoy, en vivo)', () => {
+  test('arma {hora, fechaInicio, fechaFin, iniciales, nuevos, identificados, total} por cada hora transcurrida de hoy', async () => {
+    BankMovement.find.mockReturnValue({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    const { horas } = await getLedgerPorHora({});
+    expect(horas.length).toBeGreaterThan(0);
+    expect(horas[horas.length - 1].hora).toBe('15:00');
+    expect(horas[0]).toHaveProperty('iniciales');
+    expect(horas[0]).toHaveProperty('nuevos');
+    expect(horas[0]).toHaveProperty('identificados');
+    expect(horas[0]).toHaveProperty('total');
+  });
+});
+
+describe('getUltimosMovimientos (2026-10-30: feed de actividad reciente — cargados e identificados, combinados y deduplicados)', () => {
+  test('clasifica tipo por createdAt (nuevo = hoy, inicial = antes de hoy) y arma mesOrigen por hora México', async () => {
+    BankMovement.find
+      .mockReturnValueOnce({ sort: () => ({ limit: () => ({ select: () => ({ lean: () => Promise.resolve([
+        { _id: 'a', folio: 1, deposito: 500, banco: 'BBVA', status: 'no_identificado', createdAt: AHORA_MX, primeraIdentificacionAt: null },
+      ]) }) }) }) })
+      .mockReturnValueOnce({ sort: () => ({ limit: () => ({ select: () => ({ lean: () => Promise.resolve([
+        { _id: 'b', folio: 2, deposito: 700, banco: 'Santander', status: 'identificado', createdAt: new Date('2026-08-15T12:00:00.000Z'), primeraIdentificacionAt: AHORA_MX },
+      ]) }) }) }) });
+
+    const { movimientos } = await getUltimosMovimientos({});
+
+    expect(movimientos).toHaveLength(2);
+    const nuevo = movimientos.find(m => m.folio === 1);
+    expect(nuevo.tipo).toBe('nuevo');
+    const inicial = movimientos.find(m => m.folio === 2);
+    expect(inicial.tipo).toBe('inicial');
+    expect(inicial.mesOrigen).toBe('2026-08');
+    expect(inicial.fechaEvento).toEqual(AHORA_MX); // evento relevante = cuándo se identificó, no cuándo se cargó
+  });
+
+  test('el mismo movimiento en ambas queries (cargado Y identificado) no se duplica — se queda con la fecha de evento más reciente', async () => {
+    const mismoMov = { _id: 'x', folio: 9, deposito: 900, banco: 'BBVA', status: 'identificado', createdAt: AHORA_MX, primeraIdentificacionAt: AHORA_MX };
+    BankMovement.find
+      .mockReturnValueOnce({ sort: () => ({ limit: () => ({ select: () => ({ lean: () => Promise.resolve([mismoMov]) }) }) }) })
+      .mockReturnValueOnce({ sort: () => ({ limit: () => ({ select: () => ({ lean: () => Promise.resolve([mismoMov]) }) }) }) });
+
+    const { movimientos } = await getUltimosMovimientos({ limit: 10 });
+    expect(movimientos).toHaveLength(1);
+  });
+
+  test('respeta `limit` tras combinar y deduplicar', async () => {
+    const movs = Array.from({ length: 5 }, (_, i) => ({
+      _id: `m${i}`, folio: i, deposito: 100, banco: 'BBVA', status: 'no_identificado',
+      createdAt: new Date(AHORA_MX.getTime() - i * 60000), primeraIdentificacionAt: null,
+    }));
+    BankMovement.find
+      .mockReturnValueOnce({ sort: () => ({ limit: () => ({ select: () => ({ lean: () => Promise.resolve(movs) }) }) }) })
+      .mockReturnValueOnce({ sort: () => ({ limit: () => ({ select: () => ({ lean: () => Promise.resolve([]) }) }) }) });
+
+    const { movimientos } = await getUltimosMovimientos({ limit: 2 });
+    expect(movimientos).toHaveLength(2);
+    expect(movimientos[0].folio).toBe(0); // el más reciente primero
   });
 });
 

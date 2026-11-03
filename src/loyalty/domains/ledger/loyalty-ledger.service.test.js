@@ -11,11 +11,11 @@
  * (ver tasks.md Phase 2, nota de mocking del prompt de apply).
  */
 
-const { Transaction } = require('sequelize');
+const { Transaction, Op } = require('sequelize');
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard:             { findByPk: jest.fn() },
-  LoyaltyPointsLedger:     { create: jest.fn(), findAndCountAll: jest.fn() },
+  LoyaltyPointsLedger:     { create: jest.fn(), findAndCountAll: jest.fn(), findOne: jest.fn(), findAll: jest.fn() },
   LoyaltyTierHistory:      { findAll: jest.fn() },
   LoyaltyAdjustmentReason: { findByPk: jest.fn() },
   CentroCosto:             { findByPk: jest.fn() },
@@ -92,6 +92,9 @@ beforeEach(() => {
   // con un objeto distinto de undefined, nada lo inspecciona en estos mocks.
   sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data }));
+  // Sin acreditación previa de Kore por default — mismo comportamiento que hoy
+  // en todos los tests existentes que no mencionan el blindaje cruzado manual/kore.
+  LoyaltyPointsLedger.findOne.mockResolvedValue(null);
   // Sin promo vigente por default — mismo comportamiento que hoy en todos los
   // tests existentes que no la mencionan explícitamente.
   configService.obtenerPromocionVigente.mockResolvedValue(null);
@@ -177,6 +180,8 @@ describe('registrarAcumulacion', () => {
     expect(movimiento.montoVenta).toBe(1000);
     // El total (con impuesto) se guarda aparte, solo para auditoría.
     expect(movimiento.montoVentaTotal).toBe(1160);
+    // montoBaseCalculo (2026-10-27): en el flujo manual nunca hay prorrateo, siempre coincide con montoVenta.
+    expect(movimiento.montoBaseCalculo).toBe(1000);
   });
 
   test('el % aplicado queda congelado aunque la config cambie después (snapshot, no referencia viva)', async () => {
@@ -314,6 +319,21 @@ describe('registrarAcumulacion', () => {
     ).rejects.toMatchObject({ statusCode: 409 });
   });
 
+  test('blindaje cruzado: el folio ya fue acreditado por el webhook de Kore → 409, nunca consulta a Kore ni escribe', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 5, origen: 'kore', referenciaExterna: 'A0-260605320:ACUMULACION' });
+
+    await expect(
+      ledgerService.registrarAcumulacion({ cardId: 1, serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(LoyaltyPointsLedger.findOne).toHaveBeenCalledWith({
+      where: { origen: 'kore', referenciaExterna: { [Op.like]: 'A0-260605320%' } },
+    });
+    expect(erpSyncService.sincronizarCuentasPendientes).not.toHaveBeenCalled();
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
   test('el resultado da 0 puntos → 400', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
@@ -328,15 +348,15 @@ describe('registrarAcumulacion', () => {
   });
 });
 
-describe('registrarAcumulacion con promoción vigente', () => {
-  test('sin promo vigente se comporta exactamente igual que hoy (regresión)', async () => {
+describe('registrarAcumulacion con promoción vigente (2026-10-27: filas separadas nivel/promoción)', () => {
+  test('sin promo vigente se comporta exactamente igual que hoy (regresión) — sin fila de promoción', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
     globalConfigService.getValue.mockResolvedValue('5');
     configService.obtenerPromocionVigente.mockResolvedValue(null);
 
-    const { movimiento } = await ledgerService.registrarAcumulacion(
+    const { movimiento, movimientoPromocion } = await ledgerService.registrarAcumulacion(
       { cardId: 1, serieFolio: 'A0-260605320' }, USER,
     );
 
@@ -344,32 +364,67 @@ describe('registrarAcumulacion con promoción vigente', () => {
     expect(movimiento.puntos).toBe('50.00');
     expect(movimiento.promocionNombre).toBeNull();
     expect(movimiento.promocionPorcentaje).toBeNull();
+    expect(movimientoPromocion).toBeNull();
   });
 
-  test('con promo vigente suma el % de bono al % del nivel y lo audita en el movimiento', async () => {
+  test('con promo vigente genera DOS filas separadas en el ledger: una de nivel y otra de promoción', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
     globalConfigService.getValue.mockResolvedValue('5');
     configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '3' });
 
-    const { movimiento } = await ledgerService.registrarAcumulacion(
+    const { movimiento, movimientoPromocion, saldoPuntos } = await ledgerService.registrarAcumulacion(
       { cardId: 1, serieFolio: 'A0-260605320' }, USER,
     );
 
-    expect(movimiento.porcentajeAplicado).toBe(8);
-    expect(movimiento.puntos).toBe('80.00');
-    expect(movimiento.promocionNombre).toBe('Buen Fin');
-    expect(movimiento.promocionPorcentaje).toBe('3');
+    // Fila del nivel: % propio (NO combinado), sin datos de promoción.
+    expect(movimiento.porcentajeAplicado).toBe(5);
+    expect(movimiento.puntos).toBe('50.00');
+    expect(movimiento.promocionNombre).toBeNull();
+    expect(movimiento.referenciaExterna).toBe('A0-260605320');
+
+    // Fila de la promoción: referenciaExterna con sufijo propio (no choca con la de nivel).
+    expect(movimientoPromocion.porcentajeAplicado).toBe(3);
+    expect(movimientoPromocion.puntos).toBe('30.00');
+    expect(movimientoPromocion.promocionNombre).toBe('Buen Fin');
+    expect(movimientoPromocion.promocionPorcentaje).toBe('3');
+    expect(movimientoPromocion.nivelAplicado).toBeNull();
+    expect(movimientoPromocion.referenciaExterna).toBe('A0-260605320:PROMOCION');
+
+    // El saldo final ya refleja AMBOS movimientos (50 + 30).
+    expect(saldoPuntos).toBe('80.00');
+    expect(card.saldoPuntos).toBe('80.00');
+  });
+
+  test('el bono de promoción redondea a 0 centavos → no escribe fila de promoción', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    globalConfigService.getValue.mockResolvedValue('5');
+    erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({
+      raw: [makeCuentaKore({ subtotal: 1, total: 1 })],
+    });
+    configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Micro Promo', porcentajeBono: '0.01' });
+
+    const { movimiento, movimientoPromocion, saldoPuntos } = await ledgerService.registrarAcumulacion(
+      { cardId: 1, serieFolio: 'A0-260605320' }, USER,
+    );
+
+    expect(movimiento.puntos).toBe('0.05');
+    expect(movimientoPromocion).toBeNull();
+    expect(saldoPuntos).toBe('0.05');
   });
 });
 
 describe('registrarCanje', () => {
+  // Default global: makeCuentaKore() → subtotal 1000, total 1160 (beforeEach).
+
   test('permiteCanjeLealtad=false → 422, mientras la acumulación en esa misma serie sigue funcionando', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ permiteCanjeLealtad: false, participaLealtad: true }));
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'A0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 422 });
 
     // La misma sucursal, con participaLealtad true, sí deja acumular (flags independientes)
@@ -381,11 +436,49 @@ describe('registrarCanje', () => {
     ).resolves.toBeDefined();
   });
 
-  test('serie no existe en ningún centro de costo → 400', async () => {
+  test('Serie-Folio con serie que no existe en ningún centro de costo → 400, nunca consulta a Kore', async () => {
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'Z9' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'Z9-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(CentroCosto.findByPk).not.toHaveBeenCalled();
+    expect(erpSyncService.sincronizarCuentasPendientes).not.toHaveBeenCalled();
+  });
+
+  test('folio no encontrado en Kore → 400, no se inventa una venta', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({ raw: [] });
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  test('blindaje cruzado: la venta ya tiene un canje aplicado por Kore → 409, nunca consulta a Kore', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    LoyaltyPointsLedger.findOne.mockResolvedValue({ id: 9, origen: 'kore', referenciaExterna: 'A0-260605320:CANJE' });
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(LoyaltyPointsLedger.findOne).toHaveBeenCalledWith({
+      where: { origen: 'kore', referenciaExterna: 'A0-260605320:CANJE' },
+    });
+    expect(erpSyncService.sincronizarCuentasPendientes).not.toHaveBeenCalled();
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  test('puntos a canjear superan el total de la venta en Kore → 400', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    const card = makeCard({ saldoPuntos: '5000.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    // total de la venta (default) = 1160.00
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '1200.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
 
   test('canje mayor al saldo disponible → 409, verificado DESPUÉS del lock de fila', async () => {
@@ -394,7 +487,7 @@ describe('registrarCanje', () => {
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '60.00', serie: 'A0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '60.00', serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 409 });
 
     expect(LoyaltyCard.findByPk).toHaveBeenCalled();
@@ -402,20 +495,33 @@ describe('registrarCanje', () => {
     expect(card.saldoPuntos).toBe('40.00');
   });
 
-  test('canje dentro del saldo se registra con signo negativo y saldoResultante correcto', async () => {
+  test('canje dentro del saldo y del total de la venta se registra con signo negativo, referenciaExterna y saldoResultante correctos', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ saldoPuntos: '100.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     const { movimiento, saldoPuntos } = await ledgerService.registrarCanje(
-      { cardId: 1, puntos: '60.00', serie: 'A0' }, USER,
+      { cardId: 1, puntos: '60.00', serieFolio: 'A0-260605320' }, USER,
     );
 
     expect(movimiento.tipo).toBe('CANJE');
     expect(movimiento.puntos).toBe('-60.00');
     expect(movimiento.saldoResultante).toBe('40.00');
+    expect(movimiento.referenciaExterna).toBe('A0-260605320:CANJE');
     expect(saldoPuntos).toBe('40.00');
     expect(movimiento.centroCostoId).toBe(10);
+  });
+
+  test('idempotencia: reintentar el mismo folio → 409 por índice único, no se reintenta', async () => {
+    CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '100.00' }));
+    const dupErr = new Error('duplicate');
+    dupErr.name = 'SequelizeUniqueConstraintError';
+    LoyaltyPointsLedger.create.mockRejectedValueOnce(dupErr);
+
+    await expect(
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
+    ).rejects.toMatchObject({ statusCode: 409 });
   });
 
   test('tarjeta inactiva → 422', async () => {
@@ -423,7 +529,7 @@ describe('registrarCanje', () => {
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ activa: false, saldoPuntos: '100.00' }));
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'A0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 422 });
   });
 
@@ -433,33 +539,32 @@ describe('registrarCanje', () => {
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     await expect(
-      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serie: 'a0' }, USER),
+      ledgerService.registrarCanje({ cardId: 1, puntos: '10.00', serieFolio: 'a0-260605320' }, USER),
     ).resolves.toBeDefined();
     expect(CentroCosto.findByPk).toHaveBeenCalledWith(10);
   });
 });
 
-describe('registrarAjuste', () => {
-  test('signo contrario al permitido por el motivo → 400', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 2, nombre: 'regalo', signoPermitido: 'POSITIVO', activo: true });
-
-    await expect(
-      ledgerService.registrarAjuste({ cardId: 1, puntos: '-20.00', reasonId: 2, justificacion: 'corrección de prueba' }, USER),
-    ).rejects.toMatchObject({ statusCode: 400 });
-
-    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
-  });
-
+describe('registrarAjuste — motivo manual (puntosFijos: null)', () => {
   test('falta justificacion → 400', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 3, nombre: 'correccion', signoPermitido: 'AMBOS', activo: true });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 3, nombre: 'correccion', activo: true, puntosFijos: null });
 
     await expect(
       ledgerService.registrarAjuste({ cardId: 1, puntos: '20.00', reasonId: 3, justificacion: '  ' }, USER),
     ).rejects.toMatchObject({ statusCode: 400 });
   });
 
-  test('ajuste positivo con motivo permitido actualiza el saldo', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', signoPermitido: 'POSITIVO', activo: true });
+  test('puntos del body en 0 → 400, no escribe nada', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 3, nombre: 'correccion', activo: true, puntosFijos: null });
+
+    await expect(
+      ledgerService.registrarAjuste({ cardId: 1, puntos: '0', reasonId: 3, justificacion: 'ajuste sin monto' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+
+  test('ajuste positivo manual actualiza el saldo', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', activo: true, puntosFijos: null });
     const card = makeCard({ saldoPuntos: '10.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
@@ -472,8 +577,21 @@ describe('registrarAjuste', () => {
     expect(saldoPuntos).toBe('30.00');
   });
 
+  test('ajuste negativo manual (ya no hay signoPermitido que lo restrinja)', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 3, nombre: 'correccion', activo: true, puntosFijos: null });
+    const card = makeCard({ saldoPuntos: '30.00' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
+      { cardId: 1, puntos: '-20.00', reasonId: 3, justificacion: 'corrección de prueba' }, USER,
+    );
+
+    expect(movimiento.puntos).toBe('-20.00');
+    expect(saldoPuntos).toBe('10.00');
+  });
+
   test('motivo inactivo → 400', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 4, nombre: 'viejo', signoPermitido: 'AMBOS', activo: false });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 4, nombre: 'viejo', activo: false, puntosFijos: null });
 
     await expect(
       ledgerService.registrarAjuste({ cardId: 1, puntos: '20.00', reasonId: 4, justificacion: 'motivo inactivo' }, USER),
@@ -481,7 +599,7 @@ describe('registrarAjuste', () => {
   });
 
   test('el ajuste no puede dejar el saldo en negativo', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 3, nombre: 'correccion', signoPermitido: 'AMBOS', activo: true });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 3, nombre: 'correccion', activo: true, puntosFijos: null });
     const card = makeCard({ saldoPuntos: '10.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
@@ -493,97 +611,40 @@ describe('registrarAjuste', () => {
   });
 });
 
-describe('registrarAjuste — motivo SIN % (regresión del flujo manual existente)', () => {
-  test('sigue calculando los puntos directo del body, sin tocar montoBase', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', signoPermitido: 'POSITIVO', activo: true });
-    const card = makeCard({ saldoPuntos: '10.00' });
-    LoyaltyCard.findByPk.mockResolvedValue(card);
-
-    const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
-      { cardId: 1, puntos: '20.00', reasonId: 1, justificacion: 'bono de cumpleaños' }, USER,
-    );
-
-    expect(movimiento.tipo).toBe('AJUSTE');
-    expect(movimiento.puntos).toBe('20.00');
-    expect(movimiento.montoVenta).toBeNull();
-    expect(movimiento.porcentajeAplicado).toBeNull();
-    expect(saldoPuntos).toBe('30.00');
-  });
-});
-
-describe('registrarAjuste — motivo CON % de cálculo automático', () => {
-  function makeReasonPct(overrides = {}) {
-    return { id: 10, nombre: 'comision', signoPermitido: 'POSITIVO', activo: true, porcentaje: '5.00', ...overrides };
-  }
-
-  test('montoBase faltante → 400, no escribe nada', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct());
-
-    await expect(
-      ledgerService.registrarAjuste({ cardId: 1, reasonId: 10, justificacion: 'ajuste automático' }, USER),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
-  });
-
-  test('montoBase = 0 → 400', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct());
-
-    await expect(
-      ledgerService.registrarAjuste({ cardId: 1, montoBase: '0', reasonId: 10, justificacion: 'ajuste automático' }, USER),
-    ).rejects.toMatchObject({ statusCode: 400 });
-  });
-
-  test('motivo POSITIVO calcula puntos positivos desde montoBase y audita montoVenta/porcentajeAplicado', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'POSITIVO' }));
+describe('registrarAjuste — motivo con puntosFijos (rediseño 2026-10-23)', () => {
+  test('ignora "puntos" del body y aplica EXACTAMENTE el valor fijo positivo (ej. "Bono" = 100)', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 10, nombre: 'Bono', activo: true, puntosFijos: 100 });
     const card = makeCard({ saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
-      { cardId: 1, montoBase: '1000.00', reasonId: 10, justificacion: 'ajuste automático' }, USER,
+      { cardId: 1, puntos: '999.00', reasonId: 10, justificacion: 'bono de bienvenida' }, USER,
     );
 
-    expect(movimiento.puntos).toBe('50.00');
-    expect(movimiento.montoVenta).toBe('1000.00');
-    expect(movimiento.porcentajeAplicado).toBe('5.00');
-    expect(saldoPuntos).toBe('50.00');
+    expect(movimiento.puntos).toBe('100.00');
+    expect(saldoPuntos).toBe('100.00');
   });
 
-  test('motivo NEGATIVO calcula puntos negativos desde montoBase', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'NEGATIVO' }));
-    const card = makeCard({ saldoPuntos: '100.00' });
+  test('aplica EXACTAMENTE el valor fijo negativo (ej. "Comisión por mora" = -200)', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 11, nombre: 'Comisión por mora', activo: true, puntosFijos: -200 });
+    const card = makeCard({ saldoPuntos: '500.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     const { movimiento, saldoPuntos } = await ledgerService.registrarAjuste(
-      { cardId: 1, montoBase: '1000.00', reasonId: 10, justificacion: 'ajuste automático' }, USER,
+      { cardId: 1, reasonId: 11, justificacion: 'mora de octubre' }, USER,
     );
 
-    expect(movimiento.puntos).toBe('-50.00');
-    expect(saldoPuntos).toBe('50.00');
+    expect(movimiento.puntos).toBe('-200.00');
+    expect(saldoPuntos).toBe('300.00');
   });
 
-  test('el monto no genera puntos con el % configurado → 400', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ porcentaje: '0.01' }));
-
-    await expect(
-      ledgerService.registrarAjuste({ cardId: 1, montoBase: '0.01', reasonId: 10, justificacion: 'ajuste automático' }, USER),
-    ).rejects.toMatchObject({ statusCode: 400 });
-  });
-
-  test('datos legados: motivo con % y signoPermitido AMBOS → 400 (estado inválido, no se asume que nunca pasa)', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'AMBOS' }));
-
-    await expect(
-      ledgerService.registrarAjuste({ cardId: 1, montoBase: '100.00', reasonId: 10, justificacion: 'caso legado' }, USER),
-    ).rejects.toMatchObject({ statusCode: 400 });
-  });
-
-  test('el ajuste automático no puede dejar el saldo en negativo (NEGATIVO mayor al saldo)', async () => {
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue(makeReasonPct({ signoPermitido: 'NEGATIVO', porcentaje: '50.00' }));
+  test('un puntosFijos negativo que deja el saldo en negativo → 409, no escribe nada', async () => {
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 11, nombre: 'Comisión por mora', activo: true, puntosFijos: -200 });
     const card = makeCard({ saldoPuntos: '10.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
 
     await expect(
-      ledgerService.registrarAjuste({ cardId: 1, montoBase: '1000.00', reasonId: 10, justificacion: 'ajuste automático' }, USER),
+      ledgerService.registrarAjuste({ cardId: 1, reasonId: 11, justificacion: 'mora de octubre' }, USER),
     ).rejects.toMatchObject({ statusCode: 409 });
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
@@ -595,7 +656,7 @@ describe('saldoResultante encadenado', () => {
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
     globalConfigService.getValue.mockResolvedValue('10');
-    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', signoPermitido: 'POSITIVO', activo: true });
+    LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', activo: true, puntosFijos: null });
     // Subtotal 100 × 10% = 10 puntos, para que la cadena coincida con los
     // valores de siempre (antes montoVenta='100.00' venía directo del body).
     erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({ raw: [makeCuentaKore({ subtotal: 100, total: 116 })] });
@@ -606,7 +667,7 @@ describe('saldoResultante encadenado', () => {
     const r2 = await ledgerService.registrarAjuste({ cardId: 1, puntos: '5.00', reasonId: 1, justificacion: 'bono extra' }, USER);
     expect(r2.movimiento.saldoResultante).toBe('15.00');
 
-    const r3 = await ledgerService.registrarCanje({ cardId: 1, puntos: '15.00', serie: 'A0' }, USER);
+    const r3 = await ledgerService.registrarCanje({ cardId: 1, puntos: '15.00', serieFolio: 'A0-260605320' }, USER);
     expect(r3.movimiento.saldoResultante).toBe('0.00');
   });
 });
@@ -619,11 +680,173 @@ describe('listarMovimientos / listarNiveles', () => {
     expect(result.movimientos).toHaveLength(2);
   });
 
+  // saldoAnterior/saldoActual (2026-11-03, pedido explícito del usuario): CALCULADOS a partir de
+  // saldoResultante - puntos, nunca persistidos. saldoActual es un alias explícito de
+  // saldoResultante (se conserva también, por compatibilidad con cualquier consumidor existente).
+  test('agrega saldoAnterior (saldoResultante - puntos) y saldoActual (alias de saldoResultante)', async () => {
+    LoyaltyPointsLedger.findAndCountAll.mockResolvedValue({
+      count: 1,
+      rows: [{ id: 1, tipo: 'ACUMULACION', puntos: '15.00', saldoResultante: '115.00' }],
+    });
+
+    const result = await ledgerService.listarMovimientos(1, { page: 1, limit: 50 });
+
+    expect(result.movimientos[0]).toMatchObject({
+      saldoResultante: '115.00', saldoActual: '115.00', saldoAnterior: '100.00',
+    });
+  });
+
+  test('fila con datos incompletos (mock mínimo) nunca revienta — saldoAnterior queda null', async () => {
+    LoyaltyPointsLedger.findAndCountAll.mockResolvedValue({ count: 1, rows: [{ id: 1 }] });
+
+    const result = await ledgerService.listarMovimientos(1, { page: 1, limit: 50 });
+
+    expect(result.movimientos[0].saldoAnterior).toBeNull();
+  });
+
   test('listarNiveles delega en LoyaltyTierHistory', async () => {
     LoyaltyTierHistory.findAll.mockResolvedValue([{ id: 1 }]);
     const result = await ledgerService.listarNiveles(1);
     expect(result).toHaveLength(1);
     expect(LoyaltyTierHistory.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: { cardId: 1 } }));
+  });
+});
+
+describe('listarMovimientosPublicos — historial para la consulta pública (2026-11-03)', () => {
+  test('recorta el payload a fecha/tipoLabel/puntos/saldoAnterior/saldoActual, nunca reasonId/usuarioId/justificacion', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { id: 1, tipo: 'CANJE', puntos: '-10.00', saldoResultante: '90.00', createdAt: '2026-11-01T00:00:00Z', reasonId: 5, usuarioId: 'u1', justificacion: 'x' },
+    ]);
+
+    const result = await ledgerService.listarMovimientosPublicos(1);
+
+    expect(result).toEqual([
+      { fecha: '2026-11-01T00:00:00Z', tipoLabel: 'Canje', puntos: '-10.00', saldoAnterior: '100.00', saldoActual: '90.00' },
+    ]);
+    expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith(expect.objectContaining({ where: { cardId: 1 }, limit: 20 }));
+  });
+
+  test('AJUSTE con reason categoria=bonificacion → tipoLabel "Bonificación"', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { id: 1, tipo: 'AJUSTE', puntos: '100.00', saldoResultante: '100.00', createdAt: '2026-11-01', reason: { categoria: 'bonificacion' } },
+    ]);
+
+    const result = await ledgerService.listarMovimientosPublicos(1);
+
+    expect(result[0].tipoLabel).toBe('Bonificación');
+  });
+
+  test('AJUSTE con reason categoria=ajuste (o sin reason resuelto) → tipoLabel "Ajuste"', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { id: 1, tipo: 'AJUSTE', puntos: '-5.00', saldoResultante: '95.00', createdAt: '2026-11-01', reason: { categoria: 'ajuste' } },
+      { id: 2, tipo: 'AJUSTE', puntos: '-5.00', saldoResultante: '90.00', createdAt: '2026-11-02', reason: null },
+    ]);
+
+    const result = await ledgerService.listarMovimientosPublicos(1);
+
+    expect(result[0].tipoLabel).toBe('Ajuste');
+    expect(result[1].tipoLabel).toBe('Ajuste');
+  });
+
+  test('respeta un limit custom', async () => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([]);
+    await ledgerService.listarMovimientosPublicos(1, { limit: 5 });
+    expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith(expect.objectContaining({ limit: 5 }));
+  });
+});
+
+describe('listarMovimientosGlobal — reporte "Movimientos" (2026-10-29)', () => {
+  beforeEach(() => {
+    LoyaltyPointsLedger.findAll.mockResolvedValue([{ id: 1 }]);
+  });
+
+  test('sin filtros: where vacío, include de card/reason/centroCosto, order createdAt DESC', async () => {
+    const resultado = await ledgerService.listarMovimientosGlobal();
+
+    expect(LoyaltyPointsLedger.findAll).toHaveBeenCalledWith({
+      where: {},
+      include: [
+        { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
+        { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
+        { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+      ],
+      order: [['createdAt', 'DESC']],
+    });
+    expect(resultado).toEqual([{ id: 1 }]);
+  });
+
+  test('sin paginación: nunca manda limit/offset a findAll', async () => {
+    await ledgerService.listarMovimientosGlobal({});
+
+    const args = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(args).not.toHaveProperty('limit');
+    expect(args).not.toHaveProperty('offset');
+  });
+
+  test('fechaInicio/fechaFin acotan createdAt (Op.gte/Op.lte), fin de día inclusivo', async () => {
+    await ledgerService.listarMovimientosGlobal({ fechaInicio: '2026-10-01', fechaFin: '2026-10-29' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.createdAt[Op.gte]).toEqual(new Date('2026-10-01'));
+    expect(where.createdAt[Op.lte]).toEqual(new Date('2026-10-29T23:59:59.999Z'));
+  });
+
+  test('tipo comma-separated → Op.in con los valores del enum', async () => {
+    await ledgerService.listarMovimientosGlobal({ tipo: 'ACUMULACION,CANJE' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.tipo[Op.in]).toEqual(['ACUMULACION', 'CANJE']);
+  });
+
+  test('un solo tipo sin coma también resuelve a Op.in', async () => {
+    await ledgerService.listarMovimientosGlobal({ tipo: 'AJUSTE' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.tipo[Op.in]).toEqual(['AJUSTE']);
+  });
+
+  test('nivelAplicado filtra directo', async () => {
+    await ledgerService.listarMovimientosGlobal({ nivelAplicado: 'Oro' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.nivelAplicado).toBe('Oro');
+  });
+
+  test('origen filtra la columna PROPIA del ledger (manual|migracion|kore), no el origen derivado de cards', async () => {
+    await ledgerService.listarMovimientosGlobal({ origen: 'kore' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.origen).toBe('kore');
+  });
+
+  test('reasonId filtra directo', async () => {
+    await ledgerService.listarMovimientosGlobal({ reasonId: 7 });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.reasonId).toBe(7);
+  });
+
+  test('usuarioNombre usa Op.iLike de substring (mismo criterio que search de cards)', async () => {
+    await ledgerService.listarMovimientosGlobal({ usuarioNombre: 'Ana' });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.usuarioNombre[Op.iLike]).toBe('%Ana%');
+  });
+
+  test('puntosMin/puntosMax acotan la columna puntos con signo (Op.gte/Op.lte)', async () => {
+    await ledgerService.listarMovimientosGlobal({ puntosMin: -50, puntosMax: 100 });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.puntos[Op.gte]).toBe(-50);
+    expect(where.puntos[Op.lte]).toBe(100);
+  });
+
+  test('solo puntosMin, sin puntosMax → solo agrega Op.gte', async () => {
+    await ledgerService.listarMovimientosGlobal({ puntosMin: 10 });
+
+    const { where } = LoyaltyPointsLedger.findAll.mock.calls[0][0];
+    expect(where.puntos[Op.gte]).toBe(10);
+    expect(where.puntos[Op.lte]).toBeUndefined();
   });
 });
 

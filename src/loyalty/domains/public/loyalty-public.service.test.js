@@ -20,10 +20,16 @@ jest.mock('../../shared/nip.util', () => ({
 jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
 }));
+// Historial de movimientos (2026-11-03) — se mockea completo, cubierto aparte en
+// loyalty-ledger.service.test.js; acá solo se verifica que se agrega al payload de éxito.
+jest.mock('../ledger/loyalty-ledger.service', () => ({
+  listarMovimientosPublicos: jest.fn(),
+}));
 
 const { LoyaltyCard } = require('../../../shared/models/postgres');
 const { compararNip, DUMMY_HASH } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
+const ledgerService = require('../ledger/loyalty-ledger.service');
 const { consultaPublica } = require('./loyalty-public.service');
 
 const TELEFONO = '5512345678';
@@ -49,6 +55,7 @@ function makeCard(overrides = {}) {
 beforeEach(() => {
   jest.clearAllMocks();
   LoyaltyCard.scope.mockReturnValue(LoyaltyCard);
+  ledgerService.listarMovimientosPublicos.mockResolvedValue([]);
 });
 
 describe('formato inválido — rechaza SIN tocar la base de datos', () => {
@@ -172,7 +179,7 @@ describe('lockout por tarjeta (D7): 5 fallos consecutivos → 15 min bloqueada',
     compararNip.mockResolvedValue(true);
 
     const resultado = await consultaPublica(TELEFONO, NIP_REAL);
-    expect(resultado.nombre).toBe('Ana');
+    expect(resultado.nombre).toBe('Ana García López');
   });
 });
 
@@ -197,17 +204,34 @@ describe('éxito — resetea el contador y responde el payload mínimo', () => {
     expect(card.update).not.toHaveBeenCalled();
   });
 
-  test('responde solo primer nombre, nivel y saldoPuntos — nunca teléfono/nipHash/createdBy', async () => {
+  test('responde solo nombre completo, nivel y saldoPuntos — nunca teléfono/nipHash/createdBy', async () => {
     const card = makeCard();
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararNip.mockResolvedValue(true);
 
     const resultado = await consultaPublica(TELEFONO, NIP_REAL);
 
-    expect(resultado).toEqual({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: '150.00' });
+    expect(resultado).toEqual({
+      nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: '150.00', movimientos: [],
+    });
     expect(resultado.telefono).toBeUndefined();
     expect(resultado.nipHash).toBeUndefined();
     expect(resultado.createdById).toBeUndefined();
+  });
+
+  // Historial de movimientos (2026-11-03, pedido explícito del usuario) — reusa
+  // listarMovimientosPublicos del ledger, nunca reasonId/usuarioId/justificacion (D6-D8).
+  test('incluye movimientos (historial público recortado) resueltos por cardId', async () => {
+    const card = makeCard();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararNip.mockResolvedValue(true);
+    const movimientos = [{ fecha: '2026-11-01', tipoLabel: 'Canje', puntos: '-10.00', saldoAnterior: '20.00', saldoActual: '10.00' }];
+    ledgerService.listarMovimientosPublicos.mockResolvedValue(movimientos);
+
+    const resultado = await consultaPublica(TELEFONO, NIP_REAL);
+
+    expect(ledgerService.listarMovimientosPublicos).toHaveBeenCalledWith(card.id);
+    expect(resultado.movimientos).toEqual(movimientos);
   });
 });
 

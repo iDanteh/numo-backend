@@ -127,6 +127,21 @@ const config = Object.freeze({
     horasAntes: parseInt(process.env.SAT_CREDENCIALES_ALERTA_HORAS_ANTES, 10) || 4,
   }),
 
+  /**
+   * Pase al panel del Kiosco de facturación desde "Espacios de NUMO" (ver
+   * shared/services/kiosco-pase.service.js). Sin llave o sin URL, el espacio
+   * responde 503 y no se puede entrar.
+   */
+  kioscoPase: Object.freeze({
+    // Llave PRIVADA ES256 (PEM). Solo vive en NUMO: el kiosco tiene la pública.
+    // En un .env de una sola línea los saltos van escritos como "\n".
+    llavePrivada: process.env.KIOSCO_PASE_LLAVE_PRIVADA?.replace(/\\n/g, '\n').trim() || null,
+    // Uno por ambiente (numo-pruebas, numo): un pase de pruebas no sirve en producción.
+    emisor:       process.env.KIOSCO_PASE_EMISOR?.trim() || 'numo',
+    // Dirección del panel, p. ej. https://kiosko-pruebas.tubosyconexiones.mx/admin
+    urlPanel:     process.env.KIOSCO_ADMIN_URL?.trim().replace(/\/+$/, '') || null,
+  }),
+
 });
 
 module.exports = config;

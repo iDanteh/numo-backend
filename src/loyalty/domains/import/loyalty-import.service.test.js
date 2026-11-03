@@ -49,6 +49,28 @@ describe('construirConcentrado', () => {
     expect(resultado.filas[0].advertencias).toContain('tarjeta_sin_match_en_puntos');
   });
 
+  // Enriquecimiento (2026-10-23) — se llevan tal cual, nunca afectan clasificación/advertencias.
+  test('lleva las columnas de enriquecimiento en cada fila del concentrado', () => {
+    const resultado = construirConcentrado({
+      clientesRows: [cliente({ apellidos: 'DIAZ GUTIERREZ', apodo: 'Cris', especialidades: 'Comercial', comentarios: 'VIP' })],
+    });
+
+    const [fila] = resultado.filas;
+    expect(fila.apellidos).toBe('DIAZ GUTIERREZ');
+    expect(fila.apodo).toBe('Cris');
+    expect(fila.especialidades).toBe('Comercial');
+    expect(fila.comentarios).toBe('VIP');
+  });
+
+  test('fila huérfana de puntos.pdf: columnas de enriquecimiento vacías (ese archivo no las trae)', () => {
+    const resultado = construirConcentrado({ puntosRows: [punto()] });
+
+    const [fila] = resultado.filas;
+    expect(fila.apellidos).toBe('');
+    expect(fila.especialidades).toBe('');
+    expect(fila.comentarios).toBe('');
+  });
+
   test('cliente con match en puntos: saldo correcto, sin advertencia de saldo', () => {
     const resultado = construirConcentrado({
       clientesRows: [cliente()],
@@ -122,6 +144,30 @@ describe('construirConcentrado', () => {
     expect(fila.info).toContain('nivel_asignado_por_default');
     expect(fila.advertencias).not.toContain('nivel_asignado_por_default');
     expect(resultado.resumen.totalNivelPorDefault).toBe(1);
+  });
+
+  test('Nombre+Apellidos vacíos pero con contacto: nombre provisional "Cliente <contacto>", NO bloquea (es info, no advertencia)', () => {
+    const resultado = construirConcentrado({
+      clientesRows: [cliente({ nombre: '', celular: '9514405733', telefono: '' })],
+    });
+
+    const [fila] = resultado.filas;
+    expect(fila.nombre).toBe('Cliente 9514405733');
+    expect(fila.info).toContain('nombre_provisional');
+    expect(fila.advertencias).not.toContain('nombre_provisional');
+    expect(resultado.resumen.totalNombreProvisional).toBe(1);
+  });
+
+  test('Nombre vacío y sin contacto: NO arma nombre provisional (la fila ya cae en sin_contacto/pendiente)', () => {
+    const resultado = construirConcentrado({
+      clientesRows: [cliente({ nombre: '', celular: '', telefono: '' })],
+    });
+
+    const [fila] = resultado.filas;
+    expect(fila.nombre).toBe('');
+    expect(fila.info).not.toContain('nombre_provisional');
+    expect(fila.advertencias).toContain('sin_contacto');
+    expect(resultado.resumen.totalNombreProvisional).toBe(0);
   });
 
   test.each([

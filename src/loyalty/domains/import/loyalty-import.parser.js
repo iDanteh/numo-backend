@@ -10,10 +10,14 @@
  * capa que cruza ambos arrays).
  *
  * Fuentes:
- *  - clientes.csv  — Windows-1252/ISO-8859-1, columnas con teléfono/nombre
- *                     pero SIN saldo de puntos.
- *  - puntos.pdf    — texto plano (no escaneado), 39 páginas, con el saldo
- *                     por Tarjeta pero SIN teléfono.
+ *  - clientes.csv                  — Windows-1252/ISO-8859-1, columnas con
+ *                                     teléfono/nombre pero SIN saldo de puntos.
+ *  - reporteClientesPorVendedor.xlsx — reemplaza a puntos.pdf (2026-10-29, pedido
+ *                                     explícito del usuario): saldo CON decimales
+ *                                     reales por Tarjeta, SIN teléfono. La sola
+ *                                     presencia de una Tarjeta acá es además la
+ *                                     señal de "cliente activo" (ver
+ *                                     loyalty-import.service.js#activaSugerida).
  *
  * Ambos se cruzan por `Tarjeta` (normalizada, ver `normalizarTarjeta`) porque
  * el sistema nuevo identifica la tarjeta por teléfono, no por el folio legado.
@@ -141,6 +145,25 @@ async function parseClientesCsv(buffer) {
     // espera en loyalty_pending_enrollments (ver loyalty-import-apply.service.js).
     const correo = _celda(row, colMap, 'Correo');
 
+    // Enriquecimiento (2026-10-23) — registro histórico simple, nunca llave de identidad ni
+    // usado para lógica de negocio. A propósito NO están en CLIENTES_COLUMNAS_REQUERIDAS: deben
+    // ser opcionales, un CSV sin alguna de ellas no debe romper el import (ej. un CSV viejo
+    // generado antes de que el reporte las incluyera). "Vendedor" se deja afuera a propósito
+    // (a futuro guardará el id de Auth0, fuera de alcance de este cambio).
+    const apodo = _celda(row, colMap, 'Apodo');
+    const sexo = _celda(row, colMap, 'Sexo');
+    const fechaNacimiento = _celda(row, colMap, 'Fecha nacimiento');
+    const especialidades = _celda(row, colMap, 'Especialidades');
+    const sucursal = _celda(row, colMap, 'Sucursal');
+    const calle = _celda(row, colMap, 'Calle');
+    const numExterior = _celda(row, colMap, 'Num exterior');
+    const numInterior = _celda(row, colMap, 'Num Interior');
+    const colonia = _celda(row, colMap, 'Colonia');
+    const municipio = _celda(row, colMap, 'Municipio');
+    const estado = _celda(row, colMap, 'Estado');
+    const cp = _celda(row, colMap, 'CP');
+    const comentarios = _celda(row, colMap, 'Comentarios');
+
     // Fila completamente vacía (línea en blanco al final del archivo) → se
     // descarta; distinto de una fila con Tarjeta vacía pero nombre real,
     // que sí se conserva (es uno de los casos reales de duplicado, ver D4).
@@ -152,117 +175,104 @@ async function parseClientesCsv(buffer) {
       tarjetaRaw,
       tarjetaNormalizada: normalizarTarjeta(tarjetaRaw),
       nombre,
+      // Apellidos (2026-10-23) — enfoque aditivo: `nombre` sigue siendo el combinado de siempre,
+      // esto es solo granularidad extra para quien la necesite (ver LoyaltyCard.js#apellidos).
+      apellidos,
       celular,
       telefono,
       correo,
       categoriaOriginal,
+      apodo,
+      sexo,
+      fechaNacimiento,
+      especialidades,
+      sucursal,
+      calle,
+      numExterior,
+      numInterior,
+      colonia,
+      municipio,
+      estado,
+      cp,
+      comentarios,
     });
   }
 
   return filas;
 }
 
-// ── puntos.pdf ───────────────────────────────────────────────────────────────
+// ── reporteClientesPorVendedor.xlsx (reemplaza a puntos.pdf, 2026-10-29) ─────
 
-// CORRECCIÓN 2026-10-19: verificado a mano contra el puntos.pdf real con
-// pdf-parse — a diferencia de pdfplumber (Python), pdf-parse/pdfjs-dist NO
-// preserva los espacios que separaban visualmente las columnas de la tabla en
-// el PDF. El texto real que entrega es, por ejemplo:
-//   "12044RAYMUNDO JAVIER RICARDEZ MORALES7,703"
-//   "199999900CLIENTE PRUEBA2 no borrar238,620"
-//   "19CF-3615CRISTINA DIAZ GUTIERREZ5,134"
-// es decir, <rowIndex><tarjeta><nombre con sus propios espacios><saldo>, TODO
-// concatenado sin separador entre rowIndex/tarjeta y entre nombre/saldo. Una
-// versión anterior de este archivo asumía espacios (y sus tests lo
-// confirmaban con fixtures escritos a mano) pero nunca se verificó contra el
-// PDF real — contra el archivo real parseaba 0 de 2,161 filas.
-//
-// Para separar rowIndex de tarjeta (ambos corridas de dígitos pegadas, sin
-// delimitador) se aprovecha que el índice de fila es GLOBAL y estrictamente
-// secuencial a lo largo de las 39 páginas (1..2161, verificado contra el
-// archivo real, sin reinicios por página) — se lleva un contador del índice
-// esperado y se exige que la línea empiece EXACTAMENTE con ese número seguido
-// inmediatamente (sin espacio) por dígitos (tarjeta numérica) o por "CF"
-// (tarjeta con prefijo). Cualquier línea que no calce así (encabezados, pies
-// de página, líneas en blanco) se descarta sin avanzar el contador, de forma
-// que el parser se resincroniza solo en la siguiente fila de datos real.
-const PUNTOS_TARJETA_CF_RE = /^CF[\s-]*(\d+)/i;
-const PUNTOS_TARJETA_NUM_RE = /^\d+/;
-// Saldo: token final compuesto solo por dígitos y comas (incluye "0" plano,
-// sin coma de miles, para saldos cero — confirmado real al final del reporte).
-const PUNTOS_NOMBRE_SALDO_RE = /^(.+?)([\d,]+)$/;
+// Fila 1 = título del reporte generado ("Clientes por vendedor registrados del...
+// al..."), fila 2 = vacía, fila 3 = encabezados reales (Tarjeta, Cliente,
+// Vendedor, Fecha de registro, Saldo) — verificado contra el archivo real.
+const VENDEDOR_HEADER_ROW = 3;
+const VENDEDOR_COLUMNAS_REQUERIDAS = ['Tarjeta', 'Saldo'];
 
 /**
- * Parsea las líneas de texto plano ya extraídas de puntos.pdf. Separado de
- * `parsePuntosPdf` a propósito (ver tests) para poder probar la lógica de
- * parseo de líneas sin tener que generar un PDF real en memoria.
+ * Parsea el Excel "reporteClientesPorVendedor" (reemplaza a puntos.pdf, pedido
+ * explícito del usuario 2026-10-29) — hoja "Clientes por Vendedor", encabezados
+ * en la FILA 3 (no la 1), datos desde la fila 4. Solo se usan `Tarjeta` y
+ * `Saldo` — `Cliente`/`Vendedor`/`Fecha de registro` no aportan nada que
+ * clientes.csv no traiga ya igual o mejor.
  *
- * @param {string} texto
- * @returns {Array<{ tarjetaRaw: string, tarjetaNormalizada: string, nombre: string, saldo: number }>}
- */
-function parsePuntosLines(texto) {
-  const lineas = String(texto ?? '').split(/\r?\n/);
-  const filas = [];
-  let indiceEsperado = 1;
-
-  for (const lineaCruda of lineas) {
-    const linea = lineaCruda.trim();
-    if (!linea) continue;
-
-    const prefijo = String(indiceEsperado);
-    if (!linea.startsWith(prefijo)) continue; // encabezado/pie/línea ajena — no avanza el contador
-
-    const resto = linea.slice(prefijo.length);
-
-    let tarjetaRaw = null;
-    let restoSinTarjeta = null;
-    const cfMatch = resto.match(PUNTOS_TARJETA_CF_RE);
-    if (cfMatch) {
-      tarjetaRaw = cfMatch[0];
-      restoSinTarjeta = resto.slice(cfMatch[0].length);
-    } else {
-      const numMatch = resto.match(PUNTOS_TARJETA_NUM_RE);
-      if (numMatch) {
-        tarjetaRaw = numMatch[0];
-        restoSinTarjeta = resto.slice(numMatch[0].length);
-      }
-    }
-    // Ni dígitos ni "CF" justo después del índice esperado → esta línea no es
-    // la fila de datos de ese índice (ej. pie de página "1 de 3919/10/2026...");
-    // se descarta sin avanzar el contador, para resincronizar en la próxima.
-    if (tarjetaRaw === null) continue;
-
-    const nombreSaldoMatch = restoSinTarjeta.match(PUNTOS_NOMBRE_SALDO_RE);
-    if (!nombreSaldoMatch) continue;
-
-    const [, nombreCrudo, saldoToken] = nombreSaldoMatch;
-    const saldo = parseInt(saldoToken.replace(/,/g, ''), 10);
-    if (Number.isNaN(saldo)) continue;
-
-    filas.push({
-      tarjetaRaw,
-      tarjetaNormalizada: normalizarTarjeta(tarjetaRaw),
-      nombre: nombreCrudo.replace(/\s+/g, ' ').trim(),
-      saldo,
-    });
-    indiceEsperado += 1;
-  }
-
-  return filas;
-}
-
-/**
- * Parsea el buffer de puntos.pdf (PDF con texto embebido, NO escaneado) con
- * `pdf-parse` — ya es dependencia del proyecto (usada en
- * `banks/domains/collection-requests/ocr-engine.js#extractTextFromPdf`).
+ * `Tarjeta` viene con tipo mixto en el archivo real: a veces string con ceros a
+ * la izquierda ("016"), a veces número puro (9277) — `_celda()` ya la lee como
+ * `String(val).trim()`, y `normalizarTarjeta()` tolera ambos formatos igual.
+ *
+ * `Saldo` SÍ trae decimales reales (14.31, 294.75) — a diferencia del viejo
+ * `parsePuntosLines` (que hacía `parseInt` sobre saldos sin decimales del PDF),
+ * acá se usa `Number()` para no truncarlos (el schema ya soporta decimales,
+ * `LoyaltyPointsLedger.puntos` es `DECIMAL(10,2)`).
+ *
+ * La sola PRESENCIA de una Tarjeta en este reporte (con cualquier Saldo,
+ * incluido 0) es también la señal de "cliente activo" que usa
+ * `construirConcentrado` (ver loyalty-import.service.js#activaSugerida) — por
+ * eso nunca se descarta una fila por tener Saldo 0, igual que hacía el parser
+ * de puntos.pdf que reemplaza.
  *
  * @param {Buffer} buffer
  * @returns {Promise<Array<{ tarjetaRaw: string, tarjetaNormalizada: string, nombre: string, saldo: number }>>}
  */
-async function parsePuntosPdf(buffer) {
-  const pdfParse = require('pdf-parse');
-  const data = await pdfParse(buffer);
-  return parsePuntosLines(data.text || '');
+async function parseVendedorXlsx(buffer) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer);
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet || worksheet.rowCount < VENDEDOR_HEADER_ROW) return [];
+
+  const headerRow = worksheet.getRow(VENDEDOR_HEADER_ROW);
+  const colMap = _mapearEncabezado(headerRow);
+
+  const faltantes = VENDEDOR_COLUMNAS_REQUERIDAS.filter((c) => colMap[c.toLowerCase()] === undefined);
+  if (faltantes.length) {
+    const err = new Error(`reporteClientesPorVendedor.xlsx no tiene las columnas esperadas: ${faltantes.join(', ')}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const filas = [];
+  for (let rowIdx = VENDEDOR_HEADER_ROW + 1; rowIdx <= worksheet.rowCount; rowIdx++) {
+    const row = worksheet.getRow(rowIdx);
+
+    const tarjetaRaw = _celda(row, colMap, 'Tarjeta');
+    const nombre = _celda(row, colMap, 'Cliente');
+    const saldoRaw = _celda(row, colMap, 'Saldo');
+
+    // Fila completamente vacía (línea en blanco al final del reporte) → se descarta.
+    if (!tarjetaRaw && !nombre) continue;
+
+    const saldoNum = Number(String(saldoRaw).replace(/,/g, ''));
+    const saldo = Number.isFinite(saldoNum) ? saldoNum : 0;
+
+    filas.push({
+      tarjetaRaw,
+      tarjetaNormalizada: normalizarTarjeta(tarjetaRaw),
+      nombre,
+      saldo,
+    });
+  }
+
+  return filas;
 }
 
 // ── correcciones.xlsx (re-subida de filas bloqueantes corregidas a mano) ─────
@@ -327,7 +337,6 @@ async function parseCorreccionesXlsx(buffer) {
 module.exports = {
   normalizarTarjeta,
   parseClientesCsv,
-  parsePuntosLines,
-  parsePuntosPdf,
+  parseVendedorXlsx,
   parseCorreccionesXlsx,
 };

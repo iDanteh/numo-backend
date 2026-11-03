@@ -2,8 +2,8 @@
 
 // LoyaltyAdjustmentReason.test.js — verifica el esquema Sequelize
 // (sistema-lealtad, PR1/8, design.md "Data Model" → LoyaltyAdjustmentReason).
-// `signoPermitido` usa palabras (POSITIVO/NEGATIVO/AMBOS) en vez de +/-/±
-// porque un signo menos tipográfico es una trampa de encoding real.
+// Rediseño 2026-10-23: signoPermitido/porcentaje se reemplazaron por puntosFijos
+// (ver comentario del modelo).
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 
 describe('LoyaltyAdjustmentReason — modelo Sequelize (loyalty_adjustment_reasons)', () => {
@@ -25,15 +25,25 @@ describe('LoyaltyAdjustmentReason — modelo Sequelize (loyalty_adjustment_reaso
     expect(attr.allowNull).toBe(false);
   });
 
-  test('signoPermitido: STRING(10) NOT NULL, isIn [POSITIVO,NEGATIVO,AMBOS]', () => {
-    const attr = LoyaltyAdjustmentReason.getAttributes().signoPermitido;
-    expect(attr.allowNull).toBe(false);
-    expect(attr.validate.isIn).toEqual([['POSITIVO', 'NEGATIVO', 'AMBOS']]);
+  test('puntosFijos: INTEGER nullable (null = motivo manual)', () => {
+    const attr = LoyaltyAdjustmentReason.getAttributes().puntosFijos;
+    expect(attr.allowNull).toBe(true);
+    expect(attr.type.constructor.name).toBe('INTEGER');
   });
 
   test('activo: BOOLEAN NOT NULL default true', () => {
     const attr = LoyaltyAdjustmentReason.getAttributes().activo;
     expect(attr.allowNull).toBe(false);
     expect(attr.defaultValue).toBe(true);
+  });
+
+  // Split de catálogo (2026-11-03): separa "Motivos de ajuste" de "Catálogo de bonificaciones"
+  // sin tabla nueva — ver comentario del modelo.
+  test('categoria: STRING(20) NOT NULL default "ajuste", solo admite ajuste/bonificacion', () => {
+    const attr = LoyaltyAdjustmentReason.getAttributes().categoria;
+    expect(attr.type.options.length).toBe(20);
+    expect(attr.allowNull).toBe(false);
+    expect(attr.defaultValue).toBe('ajuste');
+    expect(attr.validate.isIn[0]).toEqual(['ajuste', 'bonificacion']);
   });
 });

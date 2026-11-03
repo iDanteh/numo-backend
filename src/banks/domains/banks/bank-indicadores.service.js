@@ -654,18 +654,6 @@ function _anioMesActualMexico() {
   return _anioMesDeFecha(new Date());
 }
 
-// String YYYY-MM-DD en calendario de MÉXICO para un instante real cualquiera — generalización
-// de _hoyMexicoStr() (que solo cubre "ahora"), usado por getCorteTendencia() para traducir los
-// límites de cada periodo pasado al mismo formato que espera getCorteConciliacion()
-// (fechaInicio/fechaFin).
-function _fechaMxComoString(fechaReal) {
-  const mx = _comoRelojMexico(fechaReal);
-  const yyyy = mx.getUTCFullYear();
-  const mm   = String(mx.getUTCMonth() + 1).padStart(2, '0');
-  const dd   = String(mx.getUTCDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
 // Acotado a los 100 casos más atrasados (orden desc) — `count` siempre es el total real, nunca
 // se miente; solo se trunca el DETALLE para no mandar una respuesta JSON gigante si el backlog
 // es grande (mismo criterio preventivo de siempre: nunca ocultar el número, sí acotar el
@@ -1006,105 +994,383 @@ async function getPeriodoCortePorRol(role) {
   return { periodo: 'semanal', puedeAlternar: true };
 }
 
-const TENDENCIA_PUNTOS_DEFAULT = { semanal: 10, mensual: 6 };
+// Mismo criterio de _hoyMexicoStr (línea ~105) pero para un instante arbitrario, no solo "ahora"
+// — insumo de _enumerarDiasEnRango para saber si cada día del rango es HOY (fin = ahora real, en
+// vivo) o un día ya cerrado (fin = medianoche de ese día). No se tocó _hoyMexicoStr (la siguen
+// usando otras funciones de este archivo) para no arriesgar una regresión ajena a este cambio.
+function _fechaMexicoStr(fechaReal) {
+  const mx = _comoRelojMexico(fechaReal);
+  const yyyy = mx.getUTCFullYear();
+  const mm = String(mx.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(mx.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
 
 /**
- * Serie histórica de backlog para el gráfico de tendencia del panel de Cortes (2026-10-22,
- * pedido explícito del usuario: ver si el backlog crece o se achica corte a corte, no solo la
- * foto del periodo actual). Un punto por periodo pasado (semana o mes, según `periodo`) — el
- * MÁS RECIENTE siempre en modo TIEMPO REAL (periodo en curso, llama a getCorteConciliacion()
- * sin fechaInicio/fechaFin, igual que el resto del panel); los anteriores se reconstruyen con
- * el mismo mecanismo de corte histórico (_getCorteHistorico/_estadoAlCierre — ver las
- * limitaciones ya documentadas ahí: sin log genérico de cambios de status, lo irreconstruible
- * se señala vía `advertencia` en cada punto, nunca se oculta).
+ * Ledger de backlog `no_identificado`/`identificado` para UN periodo (2026-10-30, pedido
+ * explícito del usuario) — MISMA fórmula sea el periodo un día o una semana, nunca duplicada por
+ * granularidad: `iniciales` (lo que ya era no_identificado al INICIO del periodo) + `nuevos` (lo
+ * cargado — `createdAt` — DENTRO del periodo) − `identificados` (lo que pasó de no-identificado a
+ * identificado DURANTE este mismo periodo) = `total`, que es el `iniciales` del SIGUIENTE periodo
+ * (identidad matemática exacta, no una aproximación — ver nota abajo).
  *
- * SIN rolEquipo a propósito: la serie es de `rezagados.total`/`nuevos.pendientes`/
- * `cxcRetrasadas.count` (y su desglose por status, ver abajo), ninguno tiene scope por rol
- * (ver comentario grande de getCorteConciliacion) — ni cobranza ni contabilidad verían un
- * número distinto entre sí.
+ * `identificados` viene además partido en `identificadosDeIniciales`/`identificadosDeNuevos`
+ * (2026-10-30, pedido explícito del usuario: quiere ver cuánto de lo resuelto era backlog VIEJO
+ * vs. cuánto era del mismo día, no un número combinado) — `identificados` sigue siendo la suma de
+ * los dos, no se duplica el cálculo, solo se separa el contador según el pool (`iniciales`/
+ * `nuevos`) al que pertenecía el movimiento.
  *
- * Desglose por status (2026-10-22, pedido explícito del usuario — switch "Ver por estatus"
- * del gráfico de tendencia): además de los totales de siempre, cada punto expone
- * `rezagadosNoIdentificado`/`rezagadosReclasificado` (suman EXACTO `rezagadosTotal`, por
- * construcción — ver `rezagados` en getCorteConciliacion/_getCorteHistorico) y
- * `nuevosNoIdentificado`/`nuevosReclasificado`/`nuevosIdentificado` (los 2 primeros suman
- * EXACTO `nuevosPendientes`; `nuevosIdentificado` es informativo aparte — a propósito NO se
- * suma a `nuevosPendientes`, ese total debe seguir representando solo lo que falta por
- * identificar, igual que antes de este cambio).
+ * NO usa snapshots: recalcula on-demand reusando `_estadoAlCierre()` en AMBOS extremos del
+ * periodo (inicio Y fin) — nunca el status "actual" crudo para decidir `identificados`. Esto es
+ * a propósito y DISTINTO de cómo lo hacía la versión anterior de este mismo chart
+ * (getProgresoResolucionPorCorte, que comparaba contra el status de HOY sin importar el periodo):
+ * usar "status de hoy" hace que un mismo movimiento resuelto, por ejemplo, el miércoles, se
+ * cuente como "identificado" en CADA periodo que lo tenga en su pool de candidatos (lunes,
+ * martes, miércoles...) porque "hoy" no cambia entre esos cálculos — se cuenta varias veces. Con
+ * `_estadoAlCierre` evaluado en los dos extremos, la transición no-identificado→identificado
+ * queda atada EXACTAMENTE al periodo en que ocurrió (nunca antes, nunca después, nunca dos
+ * veces), y por eso: (a) sumar los `nuevos`/`identificados` de los 7 días de una semana da EXACTO
+ * lo mismo que calcular la semana directo (test de este archivo lo prueba), y (b) el `total` de
+ * un periodo es EXACTO el `iniciales` del siguiente, sin importar si ambos se piden por separado.
+ *
+ * `mesOrigenInicio`/`mesOrigenFin` (opcional, ambos `Date` o ambos `null`): acota `iniciales`+
+ * `nuevos` a lo cargado (`createdAt`) dentro de un mes de origen específico (drill-down "cómo
+ * bajó agosto corte a corte") — para un mes ya cerrado consultado desde un periodo posterior,
+ * `nuevos` da 0 solo, sin caso especial (nada puede nacer en agosto desde octubre).
+ *
+ * @param {object} opts
+ * @param {object} opts.baseMatch Mismo `buildBaseMatch({banco})` que el resto del dominio.
+ * @param {Date} opts.periodoInicio
+ * @param {Date} opts.periodoFin
+ * @param {Date} [opts.mesOrigenInicio]
+ * @param {Date} [opts.mesOrigenFin]
+ */
+async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, mesOrigenInicio = null, mesOrigenFin = null }) {
+  const createdAtMatch = { $lte: periodoFin };
+  if (mesOrigenInicio) createdAtMatch.$gte = mesOrigenInicio;
+  if (mesOrigenFin) createdAtMatch.$lt = mesOrigenFin;
+
+  const candidatos = await BankMovement.find({
+    ...baseMatch,
+    createdAt: createdAtMatch,
+    status: { $in: ['no_identificado', 'identificado'] },
+  }).select('deposito createdAt primeraIdentificacionAt historialVinculacion').lean();
+
+  let inicialesCount = 0, inicialesSaldo = 0;
+  let nuevosCount = 0, nuevosSaldo = 0;
+  let idDeInicialesCount = 0, idDeInicialesSaldo = 0;
+  let idDeNuevosCount = 0, idDeNuevosSaldo = 0;
+
+  for (const mov of candidatos) {
+    const importe = mov.deposito ?? 0;
+    const esNuevo = mov.createdAt >= periodoInicio;
+    // Un "nuevo" no existía antes de periodoInicio — no puede estar identificado a esa fecha,
+    // ahorra la llamada a _estadoAlCierre.
+    const identificadoAlInicio = esNuevo ? false : _estadoAlCierre(mov, periodoInicio).identificado;
+    if (identificadoAlInicio) continue; // ya resuelto ANTES de empezar el periodo, no es su backlog
+
+    const identificadoAlFin = _estadoAlCierre(mov, periodoFin).identificado;
+    if (esNuevo) {
+      nuevosCount++; nuevosSaldo += importe;
+      if (identificadoAlFin) { idDeNuevosCount++; idDeNuevosSaldo += importe; }
+    } else {
+      inicialesCount++; inicialesSaldo += importe;
+      if (identificadoAlFin) { idDeInicialesCount++; idDeInicialesSaldo += importe; }
+    }
+  }
+
+  const identificadosCount = idDeInicialesCount + idDeNuevosCount;
+  const identificadosSaldo = idDeInicialesSaldo + idDeNuevosSaldo;
+
+  return {
+    iniciales:              { count: inicialesCount, saldo: inicialesSaldo },
+    nuevos:                 { count: nuevosCount, saldo: nuevosSaldo },
+    identificados:          { count: identificadosCount, saldo: identificadosSaldo },
+    identificadosDeIniciales: { count: idDeInicialesCount, saldo: idDeInicialesSaldo },
+    identificadosDeNuevos:    { count: idDeNuevosCount, saldo: idDeNuevosSaldo },
+    total: {
+      count: inicialesCount + nuevosCount - identificadosCount,
+      saldo: inicialesSaldo + nuevosSaldo - identificadosSaldo,
+    },
+  };
+}
+
+// Resuelve mesOrigen ('YYYY-MM') a los límites {$gte,$lt} que espera _calcularLedgerBacklog —
+// compartido por la vista semanal y la diaria para no repetir la validación/parseo dos veces.
+function _resolverMesOrigen(mesOrigen) {
+  if (!mesOrigen) return { mesOrigenInicio: null, mesOrigenFin: null };
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(mesOrigen)) throw new BadRequestError('mesOrigen inválido (YYYY-MM)');
+  const [anio, mesNum] = mesOrigen.split('-').map(Number);
+  const { $gte: mesOrigenInicio, $lt: mesOrigenFin } = _rangoAnioMesMexico(anio, mesNum);
+  return { mesOrigenInicio, mesOrigenFin };
+}
+
+/**
+ * Progreso de resolución del backlog, corte a corte (semanal, 2026-10-30 — caso semanal de
+ * `_calcularLedgerBacklog`, ver su JSDoc para la fórmula completa y la garantía de consistencia).
+ * El corte SIEMPRE es semanal acá — no depende de getPeriodoCortePorRol (el usuario decidió dejar
+ * esa infraestructura dormida, no tocarla; este chart nunca dependió de un periodo configurable).
+ *
+ * `mesOrigen` (opcional, 2026-10-30) acota el ledger a lo cargado ese mes — el drill-down "cómo
+ * bajó agosto corte a corte" que pidió el usuario.
  *
  * @param {object} [opts]
- * @param {'semanal'|'mensual'} [opts.periodo='semanal']
  * @param {string} [opts.banco]
- * @param {number} [opts.puntos] Cantidad de periodos a incluir (default 10 semanas / 6 meses,
- *   ver TENDENCIA_PUNTOS_DEFAULT) — un valor <= 0 o no numérico cae al default.
+ * @param {string} [opts.mesOrigen] `YYYY-MM`.
+ * @param {string} [opts.desde] `YYYY-MM-DD` — corte de cierre más antiguo a incluir.
+ * @param {string} [opts.hasta] `YYYY-MM-DD` — corte de cierre más reciente a incluir (default:
+ *   el último corte semanal YA CERRADO — la semana en curso, todavía abierta, no se incluye).
+ * @param {number} [opts.cantidad=8] Cuántos cortes traer hacia atrás cuando no viene `desde`.
  */
-async function getCorteTendencia({ periodo = 'semanal', banco = null, puntos = null } = {}) {
-  const periodoResuelto = periodo === 'mensual' ? 'mensual' : 'semanal';
-  const n = Number.isFinite(puntos) && puntos > 0 ? puntos : TENDENCIA_PUNTOS_DEFAULT[periodoResuelto];
-  const inicioActual = periodoResuelto === 'mensual' ? _inicioMesMexico() : _inicioSemanaMexico();
-  const mxActual = _comoRelojMexico(inicioActual);
-  const anioActual = mxActual.getUTCFullYear();
-  const mesActual   = mxActual.getUTCMonth() + 1;
+async function getProgresoResolucionPorCorte({ banco = null, mesOrigen = null, desde = null, hasta = null, cantidad = 8 } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const { mesOrigenInicio, mesOrigenFin } = _resolverMesOrigen(mesOrigen);
+  const cortes = _enumerarCortesSemanales({ desde, hasta, cantidad });
 
-  // Límites {fechaInicio, fechaFin, esActual} de cada periodo pasado, del más viejo al más
-  // reciente (i de n-1 a 0) — i===0 es SIEMPRE el periodo en curso (esActual).
-  const limites = [];
-  for (let i = n - 1; i >= 0; i--) {
-    if (i === 0) { limites.push({ esActual: true }); continue; }
-    if (periodoResuelto === 'mensual') {
-      // Resta i meses con overflow normalizado por Date (mes puede salir de [1,12] y de
-      // paso ajustar el año — mismo truco ya usado en varios lugares del proyecto).
-      const target = new Date(Date.UTC(anioActual, (mesActual - 1) - i, 1));
-      const rango  = _rangoAnioMesMexico(target.getUTCFullYear(), target.getUTCMonth() + 1);
-      limites.push({
-        esActual: false,
-        fechaInicio: _fechaMxComoString(rango.$gte),
-        fechaFin:    _fechaMxComoString(new Date(rango.$lt.getTime() - 1000)),
-      });
-    } else {
-      // Resta i semanas completas (7*24h reales) — sin horario de verano en México desde
-      // 2022, la resta en ms real preserva "medianoche México" (mismo supuesto que el resto
-      // de este archivo, ver _comoRelojMexico arriba).
-      const inicioSemana = new Date(inicioActual.getTime() - i * 7 * 24 * MS_PER_HOUR);
-      const finSemana    = new Date(inicioSemana.getTime() + 6 * 24 * MS_PER_HOUR);
-      limites.push({
-        esActual: false,
-        fechaInicio: _fechaMxComoString(inicioSemana),
-        fechaFin:    _fechaMxComoString(finSemana),
+  const resultados = await Promise.all(cortes.map(async ({ inicio, fin }) => {
+    const ledger = await _calcularLedgerBacklog({ baseMatch, periodoInicio: inicio, periodoFin: fin, mesOrigenInicio, mesOrigenFin });
+    return { fechaInicio: inicio, fechaCierre: fin, ...ledger };
+  }));
+
+  return { cortes: resultados };
+}
+
+/**
+ * Ledger DIARIO del backlog (2026-10-30, pedido explícito del usuario: "nuevos" son
+ * específicamente los depósitos DEL DÍA — lo no resuelto pasa a ser "iniciales" del día
+ * siguiente). Caso diario de `_calcularLedgerBacklog` (ver su JSDoc) — a diferencia de la vista
+ * semanal, el día de HOY SÍ se incluye (es un periodo en curso: "cuántos nuevos cayeron hoy"
+ * tiene sentido en vivo, a diferencia de una semana todavía abierta).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {string} [opts.mesOrigen] `YYYY-MM`.
+ * @param {string} [opts.desde] `YYYY-MM-DD`.
+ * @param {string} [opts.hasta] `YYYY-MM-DD` (default: hoy).
+ * @param {number} [opts.cantidad=14] Cuántos días traer hacia atrás cuando no viene `desde`.
+ */
+async function getLedgerDiario({ banco = null, mesOrigen = null, desde = null, hasta = null, cantidad = 14 } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const { mesOrigenInicio, mesOrigenFin } = _resolverMesOrigen(mesOrigen);
+  const dias = _enumerarDiasEnRango({ desde, hasta, cantidad });
+
+  const resultados = await Promise.all(dias.map(async ({ inicio, fin }) => {
+    const ledger = await _calcularLedgerBacklog({ baseMatch, periodoInicio: inicio, periodoFin: fin, mesOrigenInicio, mesOrigenFin });
+    return { fecha: inicio, ...ledger };
+  }));
+
+  return { dias: resultados };
+}
+
+// Límites {inicio,fin} de cortes semanales PASADOS (lunes-a-domingo, mismo criterio que
+// _inicioSemanaMexico) — insumo de getProgresoResolucionPorCorte. Devuelve el PAR inicio/fin
+// (antes solo devolvía `fechaCierre`, suficiente para la versión vieja que no necesitaba saber
+// dónde empezaba la semana) porque _calcularLedgerBacklog necesita ambos extremos para separar
+// "iniciales" de "nuevos". La semana EN CURSO nunca se incluye — todavía no cerró, "resueltos"/
+// "pendientes" de un corte abierto no tiene sentido (compara contra un cierre que no existe).
+// `fin` = último instante (23:59:59.999) del domingo de esa semana, en hora México.
+function _enumerarCortesSemanales({ desde = null, hasta = null, cantidad = 8 } = {}) {
+  const UNA_SEMANA_MS = 7 * 24 * MS_PER_HOUR;
+  const cierreUltimaSemanaCerrada = new Date(_inicioSemanaMexico().getTime() - 1);
+  const techo = hasta ? Math.min(_finDiaMx(hasta).getTime(), cierreUltimaSemanaCerrada.getTime()) : cierreUltimaSemanaCerrada.getTime();
+  const piso  = desde ? _inicioDiaMx(desde).getTime() : null;
+
+  const cortes = [];
+  for (let t = techo; ; t -= UNA_SEMANA_MS) {
+    if (piso !== null && t < piso) break;
+    const fin = new Date(t);
+    const inicio = new Date(t - UNA_SEMANA_MS + 1);
+    cortes.push({ inicio, fin });
+    if (piso === null && cortes.length >= cantidad) break;
+  }
+  return cortes.reverse(); // cronológico, más viejo primero
+}
+
+// Límites {inicio,fin} de días PASADOS + HOY (2026-10-30) — insumo de getLedgerDiario. A
+// diferencia de _enumerarCortesSemanales, el día en curso SÍ se incluye: su `fin` es `new Date()`
+// real (ahora), no medianoche, para que "nuevos de hoy" refleje lo cargado hasta este instante;
+// cualquier día anterior usa `_finDiaMx` (medianoche de ese día, ya cerrado).
+function _enumerarDiasEnRango({ desde = null, hasta = null, cantidad = 14 } = {}) {
+  const UN_DIA_MS = 24 * MS_PER_HOUR;
+  const hoyStr = _hoyMexicoStr();
+  const techoInicio = _inicioDiaMx(hasta || hoyStr).getTime();
+  const piso = desde ? _inicioDiaMx(desde).getTime() : null;
+
+  const dias = [];
+  for (let t = techoInicio; ; t -= UN_DIA_MS) {
+    if (piso !== null && t < piso) break;
+    const inicio = new Date(t);
+    const diaStr = _fechaMexicoStr(inicio);
+    const fin = diaStr === hoyStr ? new Date() : _finDiaMx(diaStr);
+    dias.push({ inicio, fin });
+    if (piso === null && dias.length >= cantidad) break;
+  }
+  return dias.reverse();
+}
+
+// Límites {inicio,fin,mes:'YYYY-MM'} de meses PASADOS + el mes EN CURSO (2026-10-30, insumo de
+// getLedgerMensual) — mismo criterio que _enumerarDiasEnRango para "hoy": el mes en curso SÍ se
+// incluye, con `fin = new Date()` real (la comparativa "corte anterior vs. corte actual" del
+// dashboard mensual necesita ver el mes de hoy en vivo). Reusa `_rangoAnioMesMexico` (mismo
+// offset fijo -06:00 ya establecido en bank.service.js) para los límites de cada mes — nunca
+// aritmética de fecha nueva.
+function _enumerarMesesParaLedger({ desde = null, hasta = null, cantidad = 7 } = {}) {
+  const hoyMx = _comoRelojMexico(hasta ? _finDiaMx(hasta) : new Date());
+  let anio = hoyMx.getUTCFullYear();
+  let mes  = hoyMx.getUTCMonth() + 1; // 1-indexado, lo que espera _rangoAnioMesMexico
+
+  const piso = desde ? _comoRelojMexico(_inicioDiaMx(desde)) : null;
+  const pisoAnio = piso ? piso.getUTCFullYear() : null;
+  const pisoMes  = piso ? piso.getUTCMonth() + 1 : null;
+
+  const meses = [];
+  for (;;) {
+    if (piso !== null && (anio < pisoAnio || (anio === pisoAnio && mes < pisoMes))) break;
+    const { $gte: inicio, $lt: finExclusivo } = _rangoAnioMesMexico(anio, mes);
+    const esMesActual = anio === hoyMx.getUTCFullYear() && mes === hoyMx.getUTCMonth() + 1 && !hasta;
+    const fin = esMesActual ? new Date() : new Date(finExclusivo.getTime() - 1);
+    meses.push({ inicio, fin, mes: `${anio}-${String(mes).padStart(2, '0')}` });
+    mes--;
+    if (mes < 1) { mes = 12; anio--; }
+    if (piso === null && meses.length >= cantidad) break;
+  }
+  return meses.reverse(); // cronológico, más viejo primero
+}
+
+/**
+ * Ledger MENSUAL del backlog (2026-10-30, reemplaza por completo la idea de un corte semanal
+ * para este dashboard — pedido explícito del usuario tras ver un mockup de referencia: la
+ * comparativa corte-a-corte que importa es mes a mes, no semana a semana). Caso mensual de
+ * `_calcularLedgerBacklog` (ver su JSDoc para la fórmula/garantía de consistencia) — el mes EN
+ * CURSO SÍ se incluye, con `fin` en vivo (mismo criterio que getLedgerDiario para "hoy"), porque
+ * el dashboard necesita comparar "corte anterior (mes cerrado) vs. corte actual (mes en curso)"
+ * en toda su UI (KPIs, tabla resumen, avance del mes).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {string} [opts.mesOrigen] `YYYY-MM`.
+ * @param {string} [opts.desde] `YYYY-MM-DD`.
+ * @param {string} [opts.hasta] `YYYY-MM-DD` (default: hoy, mes en curso incluido).
+ * @param {number} [opts.cantidad=7] Cuántos meses traer hacia atrás cuando no viene `desde`.
+ */
+async function getLedgerMensual({ banco = null, mesOrigen = null, desde = null, hasta = null, cantidad = 7 } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const { mesOrigenInicio, mesOrigenFin } = _resolverMesOrigen(mesOrigen);
+  const meses = _enumerarMesesParaLedger({ desde, hasta, cantidad });
+
+  const resultados = await Promise.all(meses.map(async ({ inicio, fin, mes }) => {
+    const ledger = await _calcularLedgerBacklog({ baseMatch, periodoInicio: inicio, periodoFin: fin, mesOrigenInicio, mesOrigenFin });
+    return { mes, fechaInicio: inicio, fechaFin: fin, ...ledger };
+  }));
+
+  return { meses: resultados };
+}
+
+// Límites {hora:'HH:00',inicio,fin} de cada hora de UN día (2026-10-30, insumo de
+// getLedgerPorHora) — `fechaStr` (`YYYY-MM-DD`, default HOY) permite reusar esto para el tab
+// "Ayer" del dashboard sin otro mecanismo. Si `fechaStr` es HOY, es una vista "ahora mismo":
+// arranca a medianoche (hora México) y corta en la hora en curso, cuyo `fin` es `new Date()` real
+// (en vivo). Para cualquier OTRO día (ya cerrado), se enumeran las 24 horas completas, cada una
+// con su `fin` fijo (nunca "ahora" — ese día ya pasó).
+function _enumerarHorasDelDia(fechaStr = null) {
+  const hoyStr = _hoyMexicoStr();
+  const esHoy = !fechaStr || fechaStr === hoyStr;
+  const ahora = new Date();
+  const inicioDelDia = _inicioDiaMx(fechaStr || hoyStr);
+  const horaTope = esHoy ? _comoRelojMexico(ahora).getUTCHours() : 23;
+
+  const horas = [];
+  for (let h = 0; h <= horaTope; h++) {
+    const inicio = new Date(inicioDelDia.getTime() + h * MS_PER_HOUR);
+    const esHoraActual = esHoy && h === horaTope;
+    const fin = esHoraActual ? ahora : new Date(inicio.getTime() + MS_PER_HOUR - 1);
+    horas.push({ hora: `${String(h).padStart(2, '0')}:00`, inicio, fin });
+  }
+  return horas;
+}
+
+/**
+ * Ledger POR HORA del backlog, de UN día (2026-10-30, monitoreo en tiempo real pedido por el
+ * usuario: "para poder ver cómo se está trabajando en tiempo real y cómo va disminuyendo la
+ * información"). Caso horario de `_calcularLedgerBacklog`. Sin `opts.fecha`, es HOY en vivo
+ * (`fin` de la última hora es `new Date()` real); con `opts.fecha` (`YYYY-MM-DD`, ej. ayer), las
+ * 24 horas quedan cerradas — mismo tab "Ayer" del mockup de referencia, ningún mecanismo nuevo.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {string} [opts.fecha] `YYYY-MM-DD` (default: hoy).
+ */
+async function getLedgerPorHora({ banco = null, fecha = null } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const horas = _enumerarHorasDelDia(fecha);
+
+  const resultados = await Promise.all(horas.map(async ({ hora, inicio, fin }) => {
+    const ledger = await _calcularLedgerBacklog({ baseMatch, periodoInicio: inicio, periodoFin: fin });
+    return { hora, fechaInicio: inicio, fechaFin: fin, ...ledger };
+  }));
+
+  return { horas: resultados };
+}
+
+/**
+ * Feed de actividad reciente (2026-10-30, "Últimos movimientos" del dashboard de Día actual) —
+ * NO reusa `_calcularLedgerBacklog` (es una lista de eventos puntuales, no un agregado por
+ * periodo). Combina 2 criterios de "evento reciente" — cargado (`createdAt`) e identificado
+ * (`primeraIdentificacionAt`) — porque un movimiento puede ser noticia reciente por cualquiera de
+ * los dos motivos y un solo `find` ordenado por un campo se perdería al otro (un inicial
+ * identificado HOY tiene `createdAt` viejo, pero es justo la actividad que el usuario quiere ver
+ * en el feed).
+ *
+ * `tipo` se decide por `createdAt`, no por si está identificado o no: 'nuevo' = se cargó HOY
+ * (hora México, mismo corte que usa el resto del ledger para "Hoy"), 'inicial' = se cargó antes
+ * de hoy (esté o no ya identificado) — es la misma distinción iniciales/nuevos de
+ * `_calcularLedgerBacklog`, no un concepto nuevo.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {number} [opts.limit=10]
+ */
+async function getUltimosMovimientos({ banco = null, limit = 10 } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const inicioHoy = _inicioDiaMx(_hoyMexicoStr());
+  const campos = 'folio deposito banco status createdAt primeraIdentificacionAt';
+
+  const [recienCargados, recienIdentificados] = await Promise.all([
+    BankMovement.find({ ...baseMatch, status: { $in: ['no_identificado', 'identificado'] } })
+      .sort({ createdAt: -1 }).limit(limit).select(campos).lean(),
+    BankMovement.find({ ...baseMatch, status: 'identificado', primeraIdentificacionAt: { $ne: null } })
+      .sort({ primeraIdentificacionAt: -1 }).limit(limit).select(campos).lean(),
+  ]);
+
+  const porId = new Map();
+  for (const mov of [...recienCargados, ...recienIdentificados]) {
+    const esNuevo = mov.createdAt >= inicioHoy;
+    const fechaEvento = esNuevo ? mov.createdAt : (mov.primeraIdentificacionAt ?? mov.createdAt);
+    const existente = porId.get(String(mov._id));
+    // El mismo movimiento puede venir de ambas queries (ej. cargado Y identificado hoy) — se
+    // queda con la fecha de evento más reciente entre las dos, nunca se duplica en el feed.
+    if (!existente || fechaEvento > existente.fechaEvento) {
+      // mesOrigen SIEMPRE por hora México, nunca componentes UTC crudos de createdAt — un
+      // createdAt entre las 00:00-05:59 UTC es todavía el día/mes anterior en México (mismo tipo
+      // de bug de huso horario ya corregido antes en este proyecto).
+      const createdAtMx = _comoRelojMexico(mov.createdAt);
+      porId.set(String(mov._id), {
+        fechaEvento,
+        tipo: esNuevo ? 'nuevo' : 'inicial',
+        mesOrigen: `${createdAtMx.getUTCFullYear()}-${String(createdAtMx.getUTCMonth() + 1).padStart(2, '0')}`,
+        monto: mov.deposito ?? 0,
+        estatus: mov.status,
+        banco: mov.banco,
+        folio: mov.folio,
       });
     }
   }
 
-  const puntosResueltos = await Promise.all(limites.map(async (lim) => {
-    const corte = lim.esActual
-      ? await getCorteConciliacion({ periodo: periodoResuelto, banco })
-      : await getCorteConciliacion({ periodo: periodoResuelto, banco, fechaInicio: lim.fechaInicio, fechaFin: lim.fechaFin });
-    return {
-      inicio: corte.inicio,
-      fin: corte.fin ?? null,
-      esActual: !!lim.esActual,
-      rezagadosTotal:      corte.rezagados.total,
-      rezagadosNoIdentificado: corte.rezagados.no_identificado,
-      rezagadosReclasificado:  corte.rezagados.reclasificado,
-      nuevosPendientes:    corte.nuevos.pendientes,
-      nuevosNoIdentificado: corte.nuevos.no_identificado,
-      nuevosReclasificado:  corte.nuevos.reclasificado,
-      nuevosIdentificado:   corte.nuevos.identificado,
-      cxcRetrasadasCount:  corte.cxcRetrasadas.count,
-      // Importes (2026-10-22, pedido explícito del usuario): mismo desglose que ya expone
-      // "Ver por estatus" en counts, junto a cada barra — no reemplaza el conteo.
-      rezagadosTotalImporte:        corte.rezagados.importeTotal.total,
-      rezagadosNoIdentificadoImporte: corte.rezagados.importeTotal.no_identificado,
-      rezagadosReclasificadoImporte:  corte.rezagados.importeTotal.reclasificado,
-      nuevosPendientesImporte:     corte.nuevos.importeTotal.no_identificado + corte.nuevos.importeTotal.reclasificado,
-      nuevosNoIdentificadoImporte: corte.nuevos.importeTotal.no_identificado,
-      nuevosReclasificadoImporte:  corte.nuevos.importeTotal.reclasificado,
-      nuevosIdentificadoImporte:   corte.nuevos.importeTotal.identificado,
-      ...(corte.advertencia ? { advertencia: corte.advertencia } : {}),
-    };
-  }));
+  const movimientos = [...porId.values()]
+    .sort((a, b) => b.fechaEvento - a.fechaEvento)
+    .slice(0, limit);
 
-  return { periodo: periodoResuelto, puntos: puntosResueltos };
+  return { movimientos };
 }
 
 /**
@@ -1313,7 +1579,7 @@ async function buildReporteCorte({ periodo = 'semanal', banco = null, fechaInici
 module.exports = {
   getIndicadoresIdentificacion,
   getCorteConciliacion,
-  getCorteTendencia,
+  getProgresoResolucionPorCorte,
   getPeriodoCortePorRol,
   buildReporteCorte,
   buildReporteIdentificacion,
@@ -1335,4 +1601,21 @@ module.exports = {
   _folioFechaCodificada,
   _mesesDeAtraso,
   _calcularCxcRetrasadas,
+  // Progreso de resolución (2026-10-30) — exportadas para testearlas directo.
+  _enumerarCortesSemanales,
+  // Ledger genérico de backlog (2026-10-30, reemplaza la primera versión de
+  // getProgresoResolucionPorCorte) — exportadas para testearlas directo.
+  getLedgerDiario,
+  _calcularLedgerBacklog,
+  _enumerarDiasEnRango,
+  _resolverMesOrigen,
+  _fechaMexicoStr,
+  // Dashboard mensual/por hora/feed de actividad (2026-10-30, reemplaza la vista de antigüedad
+  // por rango de días — descartada a pedido del usuario tras ver un mockup de referencia) —
+  // exportadas para testearlas directo, mismo criterio que el resto de este archivo.
+  getLedgerMensual,
+  _enumerarMesesParaLedger,
+  getLedgerPorHora,
+  _enumerarHorasDelDia,
+  getUltimosMovimientos,
 };

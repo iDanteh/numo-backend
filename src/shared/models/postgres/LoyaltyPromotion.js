@@ -5,13 +5,17 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Sistema de Lealtad — catálogo de promociones de bono extra sobre la
  * acumulación normal, vigentes por un rango de fechas (ej. "Buen Fin"). El %
- * de la promoción vigente se SUMA al % del nivel de la tarjeta al acumular
- * (ver loyalty-ledger.service.js#registrarAcumulacion).
+ * de la promoción vigente genera puntos ADEMÁS de los del nivel de la tarjeta
+ * al acumular — desde 2026-10-27 (pedido explícito del usuario) cada uno es
+ * su PROPIO movimiento en el ledger, no un solo % combinado (ver
+ * loyalty-ledger.service.js#registrarAcumulacion y
+ * loyalty-kore-venta.service.js#_procesarVentaKoreInterno).
  *
  * `activa:false` NUNCA borra la fila (mismo criterio que
  * LoyaltyAdjustmentReason#activo) — por auditoría/histórico, ya que
  * `LoyaltyPointsLedger` guarda un snapshot de la promoción aplicada
- * (promocionNombre/promocionPorcentaje) en cada acumulación.
+ * (promocionNombre/promocionPorcentaje) en la fila de promoción de cada
+ * acumulación.
  */
 
 const { DataTypes } = require('sequelize');

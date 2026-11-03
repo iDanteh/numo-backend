@@ -19,13 +19,18 @@
  */
 
 const { Op } = require('sequelize');
-const { LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto } = require('../../../shared/models/postgres');
+const { sequelize } = require('../../../config/database.postgres');
+const {
+  LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
+  LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+  ConfigSection, GlobalConfig,
+} = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
 const globalConfigService = require('../../../shared/services/global-config.service');
+const koreCatalogosClient = require('./loyalty-kore-catalogos.client');
 
 const SECTION = 'lealtad';
 const NIVELES = ['BRONCE', 'PLATA', 'ORO'];
-const SIGNOS_VALIDOS = ['POSITIVO', 'NEGATIVO', 'AMBOS'];
 
 // Máximo 2 decimales, mayor a 0 — validado sobre el STRING crudo (nunca sobre
 // el Number ya parseado) para no heredar el mismo riesgo de IEEE-754 que
@@ -103,40 +108,189 @@ async function guardarPorcentajes({ Bronce, Plata, Oro } = {}, user) {
 }
 
 /**
+ * CONGELAMIENTO_MESES (2026-11-03, pedido explícito del usuario) — "Congelamiento de puntos"
+ * por inactividad: meses sin una ACUMULACIÓN real tras los cuales el job diario
+ * (`loyalty/jobs/congelamiento-puntos.service.js`) resetea el saldo de una tarjeta a 0, vía un
+ * AJUSTE real en el ledger (auditable con el historial existente — PR2, sin UI nueva). Vive en
+ * `GlobalConfig` sección `lealtad` (mismo mecanismo que los % de nivel), `tipo:'numero'`.
+ *
+ * Deshabilitado = sin configurar (D11: nunca default inventado) O configurado EXPLÍCITAMENTE en
+ * 0 — mismo criterio exacto en lectura y escritura, para que `obtenerCongelamientoMeses() ===
+ * null` sea la única señal que el job necesita consultar antes de correr.
+ */
+function _validarCongelamientoMeses(valor) {
+  if (valor === null || valor === undefined || valor === '') return 0;
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestError('Los meses de congelamiento deben ser un número entero positivo (o 0/vacío para deshabilitar).');
+  }
+  return n;
+}
+
+/** `null` cuando no está configurado o está en 0 (deshabilitado) — nunca se asume un valor. */
+async function obtenerCongelamientoMeses() {
+  const valor = await globalConfigService.getValue(SECTION, 'CONGELAMIENTO_MESES').catch(() => null);
+  if (valor === null) return null;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n > 0) ? n : null;
+}
+
+/** Guarda los meses de congelamiento. `meses` null/undefined/0 deshabilita la feature (se
+ *  persiste '0', nunca se borra la fila — mismo criterio que guardarFotoFolderId con vacío). */
+async function guardarCongelamientoMeses(meses, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarCongelamientoMeses(meses);
+  await globalConfigService.setValue(SECTION, 'CONGELAMIENTO_MESES', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n > 0 ? n : null;
+}
+
+/**
+ * ESPECIALIDADES (2026-10-23) — catálogo de referencia para altas futuras de clientes, vive en
+ * `GlobalConfig` sección `lealtad` (mismo mecanismo que los %), `tipo:'lista'` (JSON array de
+ * strings). Se gestiona DESDE acá (loyalty:config/loyalty:read), nunca desde el `config:manage`
+ * genérico — fusión de UI pedida explícitamente por el usuario para no tener dos pantallas
+ * "Lealtad" distintas (ver config-admin.component.ts, que filtra la sección 'lealtad' del riel
+ * genérico). El valor del CSV de import NO se valida contra este catálogo (es informativo).
+ */
+async function obtenerEspecialidades() {
+  const valor = await globalConfigService.getValue(SECTION, 'ESPECIALIDADES').catch(() => '[]');
+  try {
+    const parsed = JSON.parse(valor || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Reemplaza el catálogo completo (mismo criterio que el editor de chips de Configuraciones
+ *  Globales: cada add/quitar manda la lista entera, no un delta). Limpia vacíos/duplicados. */
+async function guardarEspecialidades(lista, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const limpia = Array.isArray(lista)
+    ? [...new Set(lista.map((v) => String(v ?? '').trim()).filter(Boolean))]
+    : [];
+  await globalConfigService.setValue(SECTION, 'ESPECIALIDADES', JSON.stringify(limpia), {
+    tipo: 'lista', usuarioId, usuarioNombre,
+  });
+  return limpia;
+}
+
+/**
+ * FOTO_CLIENTE_FOLDER_ID (2026-10-29) — Folder ID de Drive consumido por
+ * `drive-loyalty-foto.service.js#folderId()`. Mismo mecanismo que los % y
+ * ESPECIALIDADES (`GlobalConfig` sección `lealtad`), `tipo: 'texto'` (igual
+ * que FICHAS_IMAGEN_FOLDER_ID en `seed-global-config-banks.js`) porque es un
+ * string simple, no una lista. Gestionado DESDE acá (loyalty:config/
+ * loyalty:read) en vez del `config:manage` genérico, mismo criterio que
+ * ESPECIALIDADES arriba — la sección 'lealtad' está oculta del riel genérico
+ * de Configuraciones Globales a propósito (ver config-admin.component.ts).
+ */
+async function obtenerFotoFolderId() {
+  const valor = await globalConfigService.getValue(SECTION, 'FOTO_CLIENTE_FOLDER_ID').catch(() => null);
+  return valor === null ? '' : String(valor).trim();
+}
+
+/** Puede quedar vacío ("no configurado") — `drive-loyalty-foto.service.js#folderId()` ya rechaza
+ *  explícito si al momento de subir una foto el valor sigue vacío. Acá no se valida formato de
+ *  Drive ID: el admin puede pegar la URL completa y recortarla después, no hay forma confiable de
+ *  distinguir un ID válido de uno inventado sin llamar a la API de Drive. */
+async function guardarFotoFolderId(valor, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const limpio = String(valor ?? '').trim();
+  await globalConfigService.setValue(SECTION, 'FOTO_CLIENTE_FOLDER_ID', limpio, {
+    tipo: 'texto', usuarioId, usuarioNombre,
+  });
+  return limpio;
+}
+
+/**
+ * Historial de cambios de UN valor de configuración de Lealtad (% por nivel,
+ * ESPECIALIDADES, FOTO_CLIENTE_FOLDER_ID — cualquier `clave` de la sección
+ * `lealtad`). El audit log YA existe para cada guardado (`ConfigAuditLog`, ver
+ * `global-config.service.js#setValue`) — acá solo se resuelve `sectionClave +
+ * clave` a la fila `GlobalConfig` (mismo criterio que `setValue` usa
+ * internamente para encontrar/crear esa fila) y se delega el armado del
+ * historial a `listAuditLog(configId)` TAL CUAL, sin duplicar su lógica.
+ *
+ * Gateada por `loyalty:config` en la ruta (PR4/8) — nunca por el `config:manage`
+ * genérico, mismo criterio que el resto de esta pantalla (D10).
+ *
+ * Si la clave nunca se guardó (no existe fila todavía en `GlobalConfig`), no
+ * hay nada que auditar: se devuelve `[]` en vez de tirar error (ej. un admin
+ * nuevo abre "Ver historial" de FOTO_CLIENTE_FOLDER_ID antes de haberlo
+ * configurado nunca).
+ */
+async function obtenerHistorial(clave) {
+  const section = await ConfigSection.findOne({ where: { clave: SECTION } });
+  if (!section) return [];
+
+  const config = await GlobalConfig.findOne({ where: { sectionId: section.id, clave } });
+  if (!config) return [];
+
+  return globalConfigService.listAuditLog(config.id);
+}
+
+const CATEGORIAS_REASON = ['ajuste', 'bonificacion'];
+
+function _validarCategoria(categoria) {
+  if (!CATEGORIAS_REASON.includes(categoria)) {
+    throw new BadRequestError(`categoria debe ser una de: ${CATEGORIAS_REASON.join(', ')}.`);
+  }
+  return categoria;
+}
+
+/**
  * Catálogo de motivos de ajuste. `soloActivos` es lo que debe consumir el
  * selector de un AJUSTE nuevo (un motivo desactivado no es seleccionable);
  * sin el flag trae todo, para la pantalla de administración del catálogo
  * (donde también se ven/reactivan los inactivos).
+ *
+ * `categoria` (split 2026-11-03, pedido explícito del usuario): filtra entre
+ * "Motivos de ajuste" y "Catálogo de bonificaciones" — mismo catálogo físico
+ * (ver LoyaltyAdjustmentReason.js), la UI pide cada sección por separado.
+ * Sin el filtro trae ambas categorías juntas (ej. el selector de un AJUSTE
+ * nuevo en movimiento-modal, que puede usar un motivo de cualquiera de las dos).
  */
-async function listarReasons({ soloActivos = false } = {}) {
+async function listarReasons({ soloActivos = false, categoria } = {}) {
   const where = soloActivos ? { activo: true } : {};
+  if (categoria !== undefined) where.categoria = _validarCategoria(categoria);
   return LoyaltyAdjustmentReason.findAll({ where, order: [['nombre', 'ASC']] });
 }
 
-/**
- * `porcentaje` (2026-10-20): si viene definido, el motivo pasa a calcular sus
- * puntos automáticamente desde `montoBase` al registrar un AJUSTE (ver
- * loyalty-ledger.service.js#registrarAjuste) — un motivo así NUNCA puede
- * tener signoPermitido:'AMBOS', porque el signo de los puntos resultantes
- * depende directamente de él (POSITIVO → tal cual, NEGATIVO → se niega).
- */
-async function crearReason({ clave, nombre, signoPermitido, porcentaje } = {}) {
-  if (!SIGNOS_VALIDOS.includes(signoPermitido)) {
-    throw new BadRequestError(`signoPermitido debe ser uno de: ${SIGNOS_VALIDOS.join(', ')}.`);
+// Entero, cualquier signo, distinto de 0 — null/undefined es válido aparte (modo manual).
+function _validarPuntosFijos(valor) {
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n === 0) {
+    throw new BadRequestError('Puntos fijos debe ser un número entero distinto de 0 (o dejarse vacío para modo manual).');
   }
+  return n;
+}
 
-  let porcentajeValidado = null;
-  if (porcentaje !== undefined && porcentaje !== null) {
-    porcentajeValidado = _validarPorcentajeGenerico(porcentaje, 'El % del motivo');
-    if (signoPermitido === 'AMBOS') {
-      throw new BadRequestError(
-        'Un motivo con % de cálculo automático no puede tener signo AMBOS — definí si es POSITIVO o NEGATIVO.',
-      );
-    }
+/**
+ * `puntosFijos` (rediseño 2026-10-23, reemplaza `signoPermitido`/`porcentaje`): si viene
+ * definido (puede ser negativo), un AJUSTE con este motivo aplica EXACTAMENTE ese valor — ver
+ * loyalty-ledger.service.js#registrarAjuste. Si no, el motivo queda en modo manual (quien aplica
+ * el ajuste escribe los puntos a mano, cualquier signo).
+ *
+ * `categoria` (split 2026-11-03) es REQUERIDA — columna NOT NULL en `loyalty_adjustment_reasons`
+ * (ver migración en shared/models/postgres/index.js). La UI nunca deja elegirla en el formulario:
+ * cada sección de lealtad-config.component.ts la manda fija según en cuál está parado el usuario.
+ */
+async function crearReason({ clave, nombre, puntosFijos, categoria } = {}) {
+  const nombreTrim = String(nombre ?? '').trim();
+  if (!nombreTrim) {
+    throw new BadRequestError('nombre es requerido.');
   }
+  const categoriaValidada = _validarCategoria(categoria);
+
+  const puntosFijosValidado = (puntosFijos === undefined || puntosFijos === null)
+    ? null
+    : _validarPuntosFijos(puntosFijos);
 
   return LoyaltyAdjustmentReason.create({
-    clave, nombre, signoPermitido, activo: true, porcentaje: porcentajeValidado,
+    clave, nombre: nombreTrim, activo: true, puntosFijos: puntosFijosValidado, categoria: categoriaValidada,
   });
 }
 
@@ -146,38 +300,27 @@ async function crearReason({ clave, nombre, signoPermitido, porcentaje } = {}) {
  * referenciándola en entradas históricas (requisito del spec: "Historical
  * entries keep their original reason").
  */
-async function editarReason(id, { nombre, signoPermitido, activo, porcentaje } = {}) {
+async function editarReason(id, { nombre, activo, puntosFijos, categoria } = {}) {
   const reason = await LoyaltyAdjustmentReason.findByPk(id);
   if (!reason) throw new NotFoundError('Motivo de ajuste');
 
-  if (signoPermitido !== undefined && !SIGNOS_VALIDOS.includes(signoPermitido)) {
-    throw new BadRequestError(`signoPermitido debe ser uno de: ${SIGNOS_VALIDOS.join(', ')}.`);
+  // `puntosFijos: null` explícito es válido (vuelve el motivo manual) — se distingue de
+  // `undefined` (campo no tocado).
+  let puntosFijosValidado;
+  if (puntosFijos !== undefined) {
+    puntosFijosValidado = puntosFijos === null ? null : _validarPuntosFijos(puntosFijos);
   }
 
-  // `porcentaje: null` explícito es válido (quita el % y vuelve el motivo
-  // manual) — se distingue de `undefined` (campo no tocado). Cuando viene un
-  // valor, se valida contra el signoPermitido RESULTANTE: el del payload si
-  // vino, si no el que ya tiene guardado la fila (nunca asumir que viene).
-  let porcentajeValidado;
-  if (porcentaje !== undefined) {
-    if (porcentaje === null) {
-      porcentajeValidado = null;
-    } else {
-      porcentajeValidado = _validarPorcentajeGenerico(porcentaje, 'El % del motivo');
-      const signoResultante = signoPermitido !== undefined ? signoPermitido : reason.signoPermitido;
-      if (signoResultante === 'AMBOS') {
-        throw new BadRequestError(
-          'Un motivo con % de cálculo automático no puede tener signo AMBOS — definí si es POSITIVO o NEGATIVO.',
-        );
-      }
-    }
-  }
+  // `categoria` (split 2026-11-03): opcional en edición (undefined = no tocar) — la UI nunca la
+  // manda (una sección no mueve un motivo a la otra), pero el servicio la soporta por completitud
+  // del contrato CRUD, validada igual que en crearReason si viene presente.
+  const categoriaValidada = categoria !== undefined ? _validarCategoria(categoria) : undefined;
 
   const cambios = {};
   if (nombre !== undefined) cambios.nombre = nombre;
-  if (signoPermitido !== undefined) cambios.signoPermitido = signoPermitido;
   if (activo !== undefined) cambios.activo = activo;
-  if (porcentaje !== undefined) cambios.porcentaje = porcentajeValidado;
+  if (puntosFijos !== undefined) cambios.puntosFijos = puntosFijosValidado;
+  if (categoria !== undefined) cambios.categoria = categoriaValidada;
 
   await reason.update(cambios);
   return reason;
@@ -316,9 +459,156 @@ async function obtenerPromocionVigente(fecha = new Date()) {
   });
 }
 
+/**
+ * CATÁLOGOS DE KORE (2026-10-26) — conceptos (tipos de venta) y formas de
+ * pago, espejados para configurar manualmente qué ventas acumulan puntos (el
+ * webhook Kore→Numo que los va a consumir todavía NO existe, es un tema
+ * aparte). Decisión confirmada con el usuario: `acumulaPuntos`/`esPuntos` son
+ * SIEMPRE manuales — un sync nunca los pisa, solo trae nombre/abreviatura/tipo
+ * (conceptos) o los hints informativos de Kore (formas de pago).
+ */
+
+/** Upsert por `koreId`: solo toca nombre/abreviatura/tipo en los existentes,
+ *  nunca `acumulaPuntos`. Marca `activo:false` en lo que ya no vino de Kore. */
+async function sincronizarConceptosKore() {
+  const conceptosKore = await koreCatalogosClient.obtenerConceptosKore();
+  const idsVistos = new Set();
+  let nuevos = 0;
+  let actualizados = 0;
+
+  for (const c of conceptosKore) {
+    const koreId = String(c.Id ?? '').trim();
+    if (!koreId) continue;
+    idsVistos.add(koreId);
+
+    const datos = {
+      nombre:       String(c.Nombre ?? '').trim(),
+      abreviatura:  c.Abreviatura ?? null,
+      tipo:         c.Tipo ?? null,
+      activo:       true,
+    };
+
+    // eslint-disable-next-line no-await-in-loop -- universo chico (catálogo de conceptos de Kore,
+    // decenas de filas), secuencial sin problema, mismo criterio que correrMatchKore.
+    const [fila, creada] = await LoyaltyKoreConcepto.findOrCreate({
+      where:    { koreId },
+      defaults: { koreId, ...datos, acumulaPuntos: false },
+    });
+    if (creada) {
+      nuevos += 1;
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await fila.update(datos);
+      actualizados += 1;
+    }
+  }
+
+  const existentes = await LoyaltyKoreConcepto.findAll({ where: { activo: true } });
+  const aDesactivar = existentes.filter(f => !idsVistos.has(f.koreId));
+  for (const f of aDesactivar) {
+    // eslint-disable-next-line no-await-in-loop
+    await f.update({ activo: false });
+  }
+
+  return { nuevos, actualizados, desactivados: aDesactivar.length };
+}
+
+/** Mismo criterio que sincronizarConceptosKore, pero además refresca los
+ *  hints informativos de Kore (koreAcumulaPuntosHint/koreEsPuntosHint) en
+ *  cada sync — esos sí se pisan siempre, nunca son la config real. */
+async function sincronizarFormasPagoKore() {
+  const formasPagoKore = await koreCatalogosClient.obtenerFormasPagoKore();
+  const idsVistos = new Set();
+  let nuevos = 0;
+  let actualizados = 0;
+
+  for (const f of formasPagoKore) {
+    const koreId = String(f.ID ?? '').trim();
+    if (!koreId) continue;
+    idsVistos.add(koreId);
+
+    const datos = {
+      nombre:                 String(f.Nombre ?? '').trim(),
+      koreAcumulaPuntosHint:  !!f.AcumulaPuntosTuberos,
+      koreEsPuntosHint:       !!f.EsPuntos,
+      activo:                 true,
+    };
+
+    // eslint-disable-next-line no-await-in-loop -- universo chico, mismo criterio de arriba.
+    const [fila, creada] = await LoyaltyKoreFormaPago.findOrCreate({
+      where:    { koreId },
+      defaults: { koreId, ...datos, acumulaPuntos: false, esPuntos: false },
+    });
+    if (creada) {
+      nuevos += 1;
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await fila.update(datos);
+      actualizados += 1;
+    }
+  }
+
+  const existentes = await LoyaltyKoreFormaPago.findAll({ where: { activo: true } });
+  const aDesactivar = existentes.filter(f => !idsVistos.has(f.koreId));
+  for (const f of aDesactivar) {
+    // eslint-disable-next-line no-await-in-loop
+    await f.update({ activo: false });
+  }
+
+  return { nuevos, actualizados, desactivados: aDesactivar.length };
+}
+
+async function listarConceptosKore({ soloActivos = false } = {}) {
+  const where = soloActivos ? { activo: true } : {};
+  return LoyaltyKoreConcepto.findAll({ where, order: [['nombre', 'ASC']] });
+}
+
+async function listarFormasPagoKore({ soloActivos = false } = {}) {
+  const where = soloActivos ? { activo: true } : {};
+  return LoyaltyKoreFormaPago.findAll({ where, order: [['nombre', 'ASC']] });
+}
+
+async function actualizarConceptoKore(id, { acumulaPuntos } = {}) {
+  const fila = await LoyaltyKoreConcepto.findByPk(id);
+  if (!fila) throw new NotFoundError('Concepto de Kore');
+  if (acumulaPuntos !== undefined) await fila.update({ acumulaPuntos: !!acumulaPuntos });
+  return fila;
+}
+
+/** Si `esPuntos:true`, primero limpia cualquier OTRA fila que ya lo tuviera —
+ *  invariante "como mucho una forma de pago Puntos a la vez", manejada acá de
+ *  forma explícita (en vez de dejar que el índice único parcial tire un error
+ *  de constraint poco legible). */
+async function actualizarFormaPagoKore(id, { acumulaPuntos, esPuntos } = {}) {
+  const fila = await LoyaltyKoreFormaPago.findByPk(id);
+  if (!fila) throw new NotFoundError('Forma de pago de Kore');
+
+  await sequelize.transaction(async (t) => {
+    if (esPuntos === true) {
+      await LoyaltyKoreFormaPago.update(
+        { esPuntos: false },
+        { where: { esPuntos: true, id: { [Op.ne]: fila.id } }, transaction: t },
+      );
+    }
+    const cambios = {};
+    if (acumulaPuntos !== undefined) cambios.acumulaPuntos = !!acumulaPuntos;
+    if (esPuntos !== undefined) cambios.esPuntos = !!esPuntos;
+    await fila.update(cambios, { transaction: t });
+  });
+
+  return fila;
+}
+
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
+  obtenerCongelamientoMeses,
+  guardarCongelamientoMeses,
+  obtenerEspecialidades,
+  guardarEspecialidades,
+  obtenerFotoFolderId,
+  guardarFotoFolderId,
+  obtenerHistorial,
   listarReasons,
   crearReason,
   editarReason,
@@ -328,4 +618,10 @@ module.exports = {
   crearPromocion,
   editarPromocion,
   obtenerPromocionVigente,
+  sincronizarConceptosKore,
+  sincronizarFormasPagoKore,
+  listarConceptosKore,
+  listarFormasPagoKore,
+  actualizarConceptoKore,
+  actualizarFormaPagoKore,
 };

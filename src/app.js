@@ -33,11 +33,14 @@ const cfdiMappingRoutes       = require('./banks/domains/cfdi-mapping/cfdi-mappi
 const notificacionRoutes      = require('./banks/domains/notificaciones/notificacion.routes');
 const configRoutes            = require('./shared/routes/config.routes');
 const systemMonitorRoutes     = require('./system-monitor/system-monitor.routes');
+const espaciosRoutes          = require('./shared/routes/espacios.routes');
 
 // Domain routers — Loyalty module (Sistema de Lealtad, PR4/8 sistema-lealtad)
 const loyaltyPublicRoutes     = require('./loyalty/loyalty-public.routes');
 const loyaltyRoutes           = require('./loyalty/loyalty.routes');
 const loyaltyImportRoutes     = require('./loyalty/domains/import/loyalty-import.routes');
+const loyaltyKoreVentaRoutes  = require('./loyalty/domains/ledger/loyalty-kore-venta.routes');
+const loyaltyKoreClienteRoutes = require('./loyalty/domains/kore-match/loyalty-kore-cliente.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -149,6 +152,7 @@ app.use('/api/cfdi-mapping',         cfdiMappingRoutes);
 app.use('/api/notificaciones',       notificacionRoutes);
 app.use('/api/config',               configRoutes);
 app.use('/api/system-monitor',       systemMonitorRoutes);
+app.use('/api/espacios',             espaciosRoutes);
 
 // Visor module
 app.use('/api/auth',              authRoutes);
@@ -173,6 +177,12 @@ app.use('/api/loyalty/public',    loyaltyPublicRoutes);
 // Más específica que '/api/loyalty' — se monta antes para no depender del
 // fallthrough del router genérico (que no conoce esta subruta de todos modos).
 app.use('/api/loyalty/import',    loyaltyImportRoutes);
+// Webhook Kore→Numo de venta (acumulación/devengación de puntos, 2026-10-26) — API key
+// server-to-server, no sesión Numo. Más específica que '/api/loyalty', se monta antes.
+app.use('/api/loyalty/kore',      loyaltyKoreVentaRoutes);
+// Webhook Kore→Numo de catálogo de clientes (altas/bajas/actualizaciones, 2026-10-27) — mismo
+// prefijo que loyaltyKoreVentaRoutes, router separado por dominio (venta vs. catálogo).
+app.use('/api/loyalty/kore',      loyaltyKoreClienteRoutes);
 app.use('/api/loyalty',           loyaltyRoutes);
 
 // Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se
@@ -218,6 +228,7 @@ const startServer = async () => {
   require('./banks/jobs/estadisticaPorFacturarCron');
   require('./banks/jobs/cajaTransferenciaSyncCron');
   require('./banks/jobs/anticipoGeneradoReconciliacionCron');
+  require('./loyalty/jobs/congelamientoPuntosCron');
   require('./visor/jobs/credencialesAlertJob');
   require('./visor/jobs/cfdiCanceladoNotificacionJob');
   require('./system-monitor/system-monitor.cron');

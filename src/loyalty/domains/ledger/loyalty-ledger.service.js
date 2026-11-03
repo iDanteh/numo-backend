@@ -13,7 +13,7 @@
  * `shared/puntos.util.js`) — el modelo guarda/lee DECIMAL como string.
  */
 
-const { Transaction } = require('sequelize');
+const { Transaction, Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const {
   LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, CentroCosto,
@@ -39,10 +39,6 @@ const erpSyncService = require('../../../banks/domains/erp/erp-sync.service');
 // Formato Kore: "SERIE-FOLIO" (p.ej. "A0-260605320"). La serie es alfanumérica
 // corta (clave de sucursal/almacén); el folio es el consecutivo de venta.
 const SERIE_FOLIO_RE = /^([A-Za-z0-9]{1,10})-(\d{1,20})$/;
-// CANJE (2026-10-21, pedido explícito del usuario): mismo reemplazo del select
-// de sucursal, pero solo con la serie (sin folio) — no hay una venta externa
-// que referenciar, solo hace falta saber a qué sucursal pertenece el canje.
-const SERIE_RE = /^[A-Za-z0-9]{1,10}$/;
 
 async function _resolverCentroCostoIdPorSerie(serie) {
   const ccBySerieMap = await centrosCostoService.resolveBySerieMap();
@@ -76,14 +72,6 @@ async function _resolverCentroCostoPorSerieFolio(serieFolioRaw) {
   const serie = serieRaw.toUpperCase();
   const centroCostoId = await _resolverCentroCostoIdPorSerie(serie);
   return { serie, folio, centroCostoId, referenciaExterna: `${serie}-${folio}` };
-}
-
-async function _resolverCentroCostoPorSerie(serieRaw) {
-  const serie = String(serieRaw ?? '').trim().toUpperCase();
-  if (!SERIE_RE.test(serie)) {
-    throw new BadRequestError('Captura la serie de la sucursal (ej. A0).');
-  }
-  return _resolverCentroCostoIdPorSerie(serie);
 }
 
 // Kore folios encode YYMMxxxxx (ej. "260600250" → año=2026, mes=06) — mismo
@@ -198,6 +186,9 @@ async function _aplicarMovimiento(t, card, mov) {
     puntos:             fromCents(puntosCents),
     saldoResultante:    fromCents(saldoResultanteCents),
     montoVenta:          mov.montoVenta ?? null,
+    // Monto exacto multiplicado por porcentajeAplicado (2026-10-27) — casi siempre igual a
+    // montoVenta, salvo el webhook con formas de pago mixtas (ver loyalty-kore-venta.service.js).
+    montoBaseCalculo:    mov.montoBaseCalculo ?? null,
     // Total de la venta en Kore (CON impuesto) — solo auditoría, nunca se
     // expone en la UI (2026-10-21, pedido explícito del usuario). El cálculo
     // de puntos usa SIEMPRE `montoVenta` (subtotal), nunca este campo.
@@ -247,6 +238,25 @@ async function registrarAcumulacion({ cardId, serieFolio }, user) {
     throw new UnprocessableError('Esta sucursal no participa en el programa de lealtad.');
   }
 
+  // Blindaje (2026-10-27, pedido explícito del usuario): el índice único es por
+  // (origen, referencia_externa) — 'manual' y 'kore' NO chocan entre sí a propósito
+  // (ver comentario del modelo), así que sin este chequeo el mismo Serie-Folio que
+  // el webhook de Kore YA acreditó podría volver a capturarse a mano sin que la base
+  // lo bloquee, duplicando el punto. Se revisa ANTES de consultar a Kore (falla
+  // rápido, sin gastar la llamada externa) con un LIKE sobre el prefijo porque el
+  // webhook siempre sufija la referencia (`:ACUMULACION`/`:CANJE`/`:PROMOCION`, ver
+  // loyalty-kore-venta.service.js#_refAcumulacion/_refCanje/_refPromocion) — alcanza
+  // con que el webhook haya tocado esta venta en CUALQUIER movimiento para
+  // considerarla ya procesada por el sistema automático.
+  const yaProcesadaPorKore = await LoyaltyPointsLedger.findOne({
+    where: { origen: 'kore', referenciaExterna: { [Op.like]: `${referenciaExterna}%` } },
+  });
+  if (yaProcesadaPorKore) {
+    throw new ConflictError(
+      `Esta venta ya fue utilizada: el folio "${referenciaExterna}" ya fue acreditado automáticamente por Kore. No se puede registrar de nuevo de forma manual.`,
+    );
+  }
+
   const cuentaKore = await _obtenerCuentaKorePorSerieFolio(serie, folio);
   const montoVenta = cuentaKore.subtotal;
   const montoVentaTotal = cuentaKore.total ?? null;
@@ -267,35 +277,65 @@ async function registrarAcumulacion({ cardId, serieFolio }, user) {
       }
       const pct = Number(pctRaw);
 
-      // Promoción vigente (2026-10-20): su % de bono se SUMA al % del nivel —
-      // sin promo vigente, pctTotal === pct (comportamiento idéntico a hoy).
+      // Promoción vigente (2026-10-20, ajustado 2026-10-27, pedido explícito del usuario): el bono
+      // de la promoción YA NO se suma al % del nivel en un solo cálculo — cada uno genera su propio
+      // movimiento en el ledger, para que el detalle de movimientos muestre el registro del nivel y
+      // el de la promoción por separado (antes era una sola fila con el % combinado, que no dejaba
+      // ver cuánto vino de cada fuente sin derivarlo y reconciliar redondeos de centavos después).
       const promoVigente = await configService.obtenerPromocionVigente();
-      const pctTotal = promoVigente ? pct + Number(promoVigente.porcentajeBono) : pct;
-
       const montoCents = toCents(montoVenta);
-      const puntosCents = calcularPuntos(montoCents, pctTotal);
-      if (puntosCents === 0) {
+      const puntosNivelCents = calcularPuntos(montoCents, pct);
+      const puntosPromoCents = promoVigente ? calcularPuntos(montoCents, Number(promoVigente.porcentajeBono)) : 0;
+      if (puntosNivelCents === 0 && puntosPromoCents === 0) {
         throw new BadRequestError('El monto de venta no genera puntos con el % configurado.');
       }
 
       const { usuarioId, usuarioNombre } = _userLabel(user);
-      const entry = await _aplicarMovimiento(t, card, {
-        tipo:                'ACUMULACION',
-        puntos:              fromCents(puntosCents),
-        montoVenta,
-        montoVentaTotal,
-        porcentajeAplicado:  pctTotal,
-        nivelAplicado:       card.nivel,
-        promocionNombre:     promoVigente?.nombre ?? null,
-        promocionPorcentaje: promoVigente?.porcentajeBono ?? null,
-        centroCostoId,
-        referenciaExterna,
-        origen: 'manual',
-        usuarioId,
-        usuarioNombre,
-      });
 
-      return { movimiento: entry, saldoPuntos: entry.saldoResultante };
+      let entry = null;
+      if (puntosNivelCents !== 0) {
+        entry = await _aplicarMovimiento(t, card, {
+          tipo:               'ACUMULACION',
+          puntos:             fromCents(puntosNivelCents),
+          montoVenta,
+          // Manual: nunca hay prorrateo, el monto base del cálculo siempre es montoVenta tal cual
+          // (a diferencia del webhook con formas de pago mixtas — ver loyalty-kore-venta.service.js).
+          montoBaseCalculo:   montoVenta,
+          montoVentaTotal,
+          porcentajeAplicado: pct,
+          nivelAplicado:      card.nivel,
+          centroCostoId,
+          referenciaExterna,
+          origen: 'manual',
+          usuarioId,
+          usuarioNombre,
+        });
+      }
+
+      // Fila separada de la promoción (sufijo `:PROMOCION` en referenciaExterna, mismo patrón ya
+      // usado por el webhook para que ACUMULACION/CANJE convivan bajo el mismo índice único — ver
+      // loyalty-kore-venta.service.js#_refAcumulacion/_refCanje).
+      let entryPromocion = null;
+      if (puntosPromoCents !== 0) {
+        entryPromocion = await _aplicarMovimiento(t, card, {
+          tipo:                'ACUMULACION',
+          puntos:              fromCents(puntosPromoCents),
+          montoVenta,
+          montoBaseCalculo:    montoVenta,
+          montoVentaTotal,
+          porcentajeAplicado:  Number(promoVigente.porcentajeBono),
+          promocionNombre:     promoVigente.nombre,
+          promocionPorcentaje: promoVigente.porcentajeBono,
+          centroCostoId,
+          referenciaExterna: `${referenciaExterna}:PROMOCION`,
+          origen: 'manual',
+          usuarioId,
+          usuarioNombre,
+        });
+      }
+
+      const saldoPuntos = (entryPromocion ?? entry).saldoResultante;
+      return { movimiento: entry, movimientoPromocion: entryPromocion, saldoPuntos };
     });
   } catch (err) {
     // Índice único parcial (origen, referencia_externa) — el mismo folio ya
@@ -315,57 +355,93 @@ async function registrarAcumulacion({ cardId, serieFolio }, user) {
  * CANJE: debita a 1 punto = $1.00 MXN. El tope contra el saldo se valida
  * DESPUÉS de bloquear la fila (evita TOCTOU entre dos canjes concurrentes).
  *
- * `serie` (2026-10-21, pedido explícito del usuario): mismo reemplazo del
- * select de sucursal que ACUMULACION, pero sin folio — el canje no referencia
- * una venta externa, solo necesita saber la sucursal.
+ * BLINDAJE 2026-10-27 (pedido explícito del usuario, mismo criterio que ya
+ * tiene ACUMULACION): `serie` suelta se reemplaza por `serieFolio` — el canje
+ * ya NO acepta una sucursal a secas, exige el Serie-Folio de una venta REAL
+ * en Kore (se consulta su CxC igual que en ACUMULACION) y tope los puntos a
+ * canjear al `total` de esa venta — nunca se inventa un folio ni se canjea
+ * más de lo que la venta vale.
  */
-async function registrarCanje({ cardId, puntos, serie }, user) {
+async function registrarCanje({ cardId, serieFolio, puntos }, user) {
   if (!(Number(puntos) > 0)) {
     throw new BadRequestError('puntos debe ser mayor a 0.');
   }
 
-  const centroCostoId = await _resolverCentroCostoPorSerie(serie);
+  const { serie, folio, centroCostoId, referenciaExterna } = await _resolverCentroCostoPorSerieFolio(serieFolio);
+
   const centroCosto = await _obtenerCentroCosto(centroCostoId);
   if (!centroCosto.permiteCanjeLealtad) {
     throw new UnprocessableError('Esta sucursal no permite canjes de lealtad.');
   }
 
-  return sequelize.transaction(async (t) => {
-    const card = await LoyaltyCard.findByPk(cardId, { transaction: t, lock: Transaction.LOCK.UPDATE });
-    if (!card) throw new NotFoundError('Tarjeta');
-    if (!card.activa) throw new UnprocessableError('La tarjeta está inactiva.');
-
-    const puntosCents = toCents(puntos);
-    const saldoCents  = toCents(card.saldoPuntos);
-    if (puntosCents > saldoCents) {
-      throw new ConflictError('El canje excede el saldo de puntos disponible.');
-    }
-
-    const { usuarioId, usuarioNombre } = _userLabel(user);
-    const entry = await _aplicarMovimiento(t, card, {
-      tipo:   'CANJE',
-      puntos: fromCents(-puntosCents),
-      centroCostoId,
-      origen: 'manual',
-      usuarioId,
-      usuarioNombre,
-    });
-
-    return { movimiento: entry, saldoPuntos: entry.saldoResultante };
+  // Blindaje cruzado (mismo patrón que ACUMULACION): si el webhook de Kore ya
+  // aplicó un canje para esta venta, no se vuelve a capturar a mano.
+  const yaProcesadaPorKore = await LoyaltyPointsLedger.findOne({
+    where: { origen: 'kore', referenciaExterna: `${referenciaExterna}:CANJE` },
   });
+  if (yaProcesadaPorKore) {
+    throw new ConflictError(
+      'Esta venta ya tiene un canje de puntos aplicado por Kore. No se puede registrar de nuevo de forma manual.',
+    );
+  }
+
+  // Confirma que el folio es una venta real en Kore — nunca se inventa un folio de la nada
+  // (mismo _obtenerCuentaKorePorSerieFolio que usa ACUMULACION).
+  const cuentaKore = await _obtenerCuentaKorePorSerieFolio(serie, folio);
+  const puntosCents = toCents(puntos);
+  if (puntosCents > toCents(cuentaKore.total)) {
+    throw new BadRequestError(
+      `Los puntos a canjear no pueden superar el total de la venta ($${cuentaKore.total}).`,
+    );
+  }
+
+  try {
+    return await sequelize.transaction(async (t) => {
+      const card = await LoyaltyCard.findByPk(cardId, { transaction: t, lock: Transaction.LOCK.UPDATE });
+      if (!card) throw new NotFoundError('Tarjeta');
+      if (!card.activa) throw new UnprocessableError('La tarjeta está inactiva.');
+
+      const saldoCents = toCents(card.saldoPuntos);
+      if (puntosCents > saldoCents) {
+        throw new ConflictError('El canje excede el saldo de puntos disponible.');
+      }
+
+      const { usuarioId, usuarioNombre } = _userLabel(user);
+      const entry = await _aplicarMovimiento(t, card, {
+        tipo:   'CANJE',
+        puntos: fromCents(-puntosCents),
+        centroCostoId,
+        referenciaExterna: `${referenciaExterna}:CANJE`,
+        origen: 'manual',
+        usuarioId,
+        usuarioNombre,
+      });
+
+      return { movimiento: entry, saldoPuntos: entry.saldoResultante };
+    });
+  } catch (err) {
+    // Índice único parcial (origen, referencia_externa) — el mismo folio ya tuvo un canje antes.
+    if (err?.name === 'SequelizeUniqueConstraintError') {
+      throw new ConflictError(
+        `Ya se registró un canje con el folio "${referenciaExterna}". Si el monto estaba mal, corrígelo con un ajuste.`,
+      );
+    }
+    throw err;
+  }
 }
 
 /**
- * AJUSTE: requiere un motivo activo cuyo `signoPermitido` concuerde con el
- * signo del movimiento, y una justificación no trivial.
+ * AJUSTE: requiere un motivo activo y una justificación no trivial.
  *
- * Motivos con `reason.porcentaje` configurado (2026-10-20) calculan los
- * puntos automáticamente desde `montoBase` (igual criterio D5/D3 que
- * ACUMULACION: snapshot de % + aritmética en centavos) en vez de tomar
- * `puntos` directo del body — ese es el camino manual de siempre, intacto
- * cuando el motivo no tiene % configurado.
+ * REDISEÑO 2026-10-23 (reemplaza `signoPermitido`/el camino de % sobre
+ * `montoBase` — ninguno de los dos tenía datos reales configurados):
+ *   - `reason.puntosFijos` seteado: aplica EXACTAMENTE ese valor (puede ser
+ *     negativo), ignorando cualquier `puntos` que venga en el body.
+ *   - `reason.puntosFijos` null: camino manual de siempre, `puntos` viene
+ *     directo del body, cualquier signo — ya no hay validación de signo
+ *     contra el motivo (no existe más `signoPermitido`).
  */
-async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificacion }, user) {
+async function registrarAjuste({ cardId, puntos, reasonId, justificacion }, user) {
   const justificacionTrim = String(justificacion ?? '').trim();
   if (justificacionTrim.length < 5) {
     throw new BadRequestError('justificacion es requerida (mínimo 5 caracteres).');
@@ -377,33 +453,8 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
   }
 
   let puntosCents;
-  let montoBaseAplicado = null;
-  let porcentajeAplicado = null;
-
-  if (reason.porcentaje != null) {
-    // Camino automático: el signo ya NO se decide por el valor de `puntos`
-    // del body — lo decide `reason.signoPermitido` (bloqueado a POSITIVO o
-    // NEGATIVO al crear/editar el motivo con %, nunca AMBOS).
-    if (!(Number(montoBase) > 0)) {
-      throw new BadRequestError('montoBase debe ser mayor a 0 para un motivo con % de cálculo automático.');
-    }
-    if (reason.signoPermitido !== 'POSITIVO' && reason.signoPermitido !== 'NEGATIVO') {
-      // Defensivo: no debería pasar (crearReason/editarReason lo bloquean),
-      // pero datos legados podrían tener AMBOS + porcentaje configurado.
-      throw new BadRequestError(
-        `El motivo "${reason.nombre}" tiene % de cálculo automático configurado con un signoPermitido inválido (${reason.signoPermitido}); debe ser POSITIVO o NEGATIVO.`,
-      );
-    }
-
-    const montoCents = toCents(montoBase);
-    const puntosCalculados = calcularPuntos(montoCents, reason.porcentaje);
-    puntosCents = reason.signoPermitido === 'NEGATIVO' ? -puntosCalculados : puntosCalculados;
-    if (puntosCents === 0) {
-      throw new BadRequestError('El monto no genera puntos con el % configurado para este motivo.');
-    }
-
-    montoBaseAplicado = montoBase;
-    porcentajeAplicado = reason.porcentaje;
+  if (reason.puntosFijos != null) {
+    puntosCents = toCents(reason.puntosFijos);
   } else {
     // Camino manual, igual que siempre: `puntos` viene directo del body.
     const puntosNum = Number(puntos);
@@ -411,13 +462,6 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
       throw new BadRequestError('puntos debe ser un número distinto de 0.');
     }
     puntosCents = toCents(puntosNum);
-  }
-
-  const signo = puntosCents > 0 ? 'POSITIVO' : 'NEGATIVO';
-  if (reason.signoPermitido !== 'AMBOS' && reason.signoPermitido !== signo) {
-    throw new BadRequestError(
-      `El motivo "${reason.nombre}" no permite ajustes de signo ${signo === 'POSITIVO' ? 'positivo' : 'negativo'}.`,
-    );
   }
 
   return sequelize.transaction(async (t) => {
@@ -432,10 +476,8 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
 
     const { usuarioId, usuarioNombre } = _userLabel(user);
     const entry = await _aplicarMovimiento(t, card, {
-      tipo:               'AJUSTE',
-      puntos:             fromCents(puntosCents),
-      montoVenta:         montoBaseAplicado,
-      porcentajeAplicado,
+      tipo:   'AJUSTE',
+      puntos: fromCents(puntosCents),
       reasonId,
       justificacion: justificacionTrim,
       origen: 'manual',
@@ -447,22 +489,168 @@ async function registrarAjuste({ cardId, puntos, montoBase, reasonId, justificac
   });
 }
 
+/**
+ * Etiqueta amigable de `tipo` (usada por el admin — tarjeta-detail.component.ts ya tiene su
+ * propio TIPO_LABELS para ACUMULACION/CANJE/MIGRACION, esto solo cubre AJUSTE según la categoria
+ * del reason) y por la consulta pública (listarMovimientosPublicos, que no repite el enum crudo).
+ * `AJUSTE` sin reason resuelto (motivo borrado — nunca debería pasar, D4, pero defensivo) cae a
+ * 'Ajuste' por default, nunca revienta.
+ */
+const TIPO_LABELS_PUBLICOS = {
+  ACUMULACION: 'Acumulación de puntos',
+  CANJE:       'Canje',
+  MIGRACION:   'Migración',
+};
+
+function _tipoLabel(mov) {
+  if (mov.tipo === 'AJUSTE') {
+    return mov.reason?.categoria === 'bonificacion' ? 'Bonificación' : 'Ajuste';
+  }
+  return TIPO_LABELS_PUBLICOS[mov.tipo] ?? mov.tipo;
+}
+
+/**
+ * `saldoAnterior`/`saldoActual` (2026-11-03, pedido explícito del usuario): CALCULADOS, nunca
+ * persistidos — no existe columna `saldoAnterior` en el modelo (ver LoyaltyPointsLedger.js).
+ * `saldoActual` es un alias explícito de `saldoResultante` (se mantiene este último también, por
+ * compatibilidad con cualquier consumidor existente del contrato). Aritmética en centavos enteros
+ * (D3, mismo criterio que el resto de este servicio) para no arrastrar error de IEEE-754.
+ *
+ * Defensivo (`try/catch`): si `saldoResultante`/`puntos` vinieran ausentes (fila cruda de un test
+ * con mocks mínimos, nunca el caso real), devuelve `null` en vez de reventar — nunca debe tronar
+ * un listado completo por una fila con datos incompletos.
+ */
+function _conSaldoDetalle(row) {
+  const json = typeof row.toJSON === 'function' ? row.toJSON() : { ...row };
+  let saldoAnterior = null;
+  if (json.saldoResultante != null && json.puntos != null) {
+    try {
+      saldoAnterior = fromCents(toCents(json.saldoResultante) - toCents(json.puntos));
+    } catch { /* fila incompleta (solo en tests con mocks mínimos) — se deja null */ }
+  }
+  return { ...json, saldoActual: json.saldoResultante ?? null, saldoAnterior };
+}
+
 async function listarMovimientos(cardId, { page = 1, limit = 50 } = {}) {
   const p = Math.max(1, Number(page) || 1);
   const l = Math.min(100, Number(limit) || 50);
 
   const { count, rows } = await LoyaltyPointsLedger.findAndCountAll({
     where:  { cardId },
+    // Motivo resuelto (2026-11-03): la categoria del reason distingue "Ajuste" de "Bonificación"
+    // en el detalle del historial (tarjeta-detail.component.html); el nombre ya lo resolvía el
+    // frontend aparte vía listarReasons() — se trae acá también para no duplicar esa llamada.
+    include: [{ model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['id', 'nombre', 'categoria'] }],
     order:  [['createdAt', 'DESC']],
     limit:  l,
     offset: (p - 1) * l,
   });
 
-  return { total: count, page: p, limit: l, pages: Math.ceil(count / l), movimientos: rows };
+  const movimientos = rows.map(_conSaldoDetalle);
+
+  return { total: count, page: p, limit: l, pages: Math.ceil(count / l), movimientos };
+}
+
+/**
+ * Historial para la consulta pública (2026-11-03, pedido explícito del usuario) — payload
+ * reducido a propósito (D6-D8, mismo threat model que loyalty-public.service.js): NUNCA expone
+ * reasonId/usuarioId/justificacion/referenciaExterna ni ningún otro campo interno, solo lo que el
+ * cliente final necesita ver de su propio historial. `limit` por default 20 (decisión de producto
+ * sin spec exacto — 20 movimientos recientes es suficiente para el caso de uso de "¿qué pasó con
+ * mis puntos últimamente?" sin convertir la respuesta anónima en un reporte completo).
+ */
+async function listarMovimientosPublicos(cardId, { limit = 20 } = {}) {
+  const rows = await LoyaltyPointsLedger.findAll({
+    where:   { cardId },
+    include: [{ model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['categoria'] }],
+    order:   [['createdAt', 'DESC']],
+    limit,
+  });
+
+  return rows.map((row) => {
+    const conSaldo = _conSaldoDetalle(row);
+    return {
+      fecha:         conSaldo.createdAt,
+      tipoLabel:     _tipoLabel(conSaldo),
+      puntos:        conSaldo.puntos,
+      saldoAnterior: conSaldo.saldoAnterior,
+      saldoActual:   conSaldo.saldoActual,
+    };
+  });
 }
 
 async function listarNiveles(cardId) {
   return LoyaltyTierHistory.findAll({ where: { cardId }, order: [['at', 'DESC']] });
+}
+
+/**
+ * Reporte "Movimientos" (2026-10-29, pedido explícito del usuario): ledger GLOBAL del programa
+ * (todas las tarjetas), sin paginar — mismo criterio que `listarPendientes({exportar:true})` en
+ * loyalty-import-apply.service.js: es un reporte completo para exportar/auditar, no una vista
+ * paginada de UI.
+ *
+ * `origen` acá es la columna PROPIA de `LoyaltyPointsLedger` ('manual'|'migracion'|'kore',
+ * resuelta en `_aplicarMovimiento`) — NO confundir con el `origen` DERIVADO ('kore'|'numo' vía
+ * `createdById`) de `loyalty-card.service.js#listar()`: mismos nombres de valor, columnas y
+ * semánticas completamente distintas sobre modelos distintos.
+ */
+async function listarMovimientosGlobal(filtros = {}) {
+  const {
+    fechaInicio, fechaFin, tipo, nivelAplicado, origen, reasonId, usuarioNombre, puntosMin, puntosMax,
+  } = filtros;
+
+  const where = {};
+
+  if (fechaInicio || fechaFin) {
+    where.createdAt = {};
+    // Mismo criterio que loyalty-card.service.js#listar (fechaAltaInicio/Fin): sin helper de
+    // rango de fechas compartido en el backend, Op.gte/Op.lte directos sobre createdAt,
+    // fechaFin como fin de día UTC para no cortar movimientos del mismo día.
+    if (fechaInicio) where.createdAt[Op.gte] = new Date(fechaInicio);
+    if (fechaFin)    where.createdAt[Op.lte] = new Date(`${fechaFin}T23:59:59.999Z`);
+  }
+
+  if (tipo) {
+    // Comma-separated: "ACUMULACION,CANJE" → Op.in. Valores fuera del enum del modelo
+    // (ACUMULACION/CANJE/AJUSTE/MIGRACION) simplemente no matchean ninguna fila.
+    const tipos = String(tipo).split(',').map((t) => t.trim()).filter(Boolean);
+    if (tipos.length) where.tipo = { [Op.in]: tipos };
+  }
+
+  if (nivelAplicado) where.nivelAplicado = nivelAplicado;
+  if (origen) where.origen = origen;
+  if (reasonId) where.reasonId = reasonId;
+
+  if (usuarioNombre) {
+    // Mismo criterio que `search` en loyalty-card.service.js#listar: ILIKE de substring.
+    where.usuarioNombre = { [Op.iLike]: `%${String(usuarioNombre).trim()}%` };
+  }
+
+  // `puntos` es columna CON SIGNO (+ abona, - descuenta — ver comentario del modelo
+  // LoyaltyPointsLedger#puntos). puntosMin/puntosMax filtran sobre ese valor firmado tal cual,
+  // nunca sobre su valor absoluto (ej. puntosMin=-50 incluye ajustes negativos desde -50 en
+  // adelante, no "al menos 50 puntos en cualquier dirección").
+  if (puntosMin !== undefined && puntosMin !== null && puntosMin !== '') {
+    where.puntos = { ...(where.puntos ?? {}), [Op.gte]: Number(puntosMin) };
+  }
+  if (puntosMax !== undefined && puntosMax !== null && puntosMax !== '') {
+    where.puntos = { ...(where.puntos ?? {}), [Op.lte]: Number(puntosMax) };
+  }
+
+  return LoyaltyPointsLedger.findAll({
+    where,
+    include: [
+      { model: LoyaltyCard, as: 'card', attributes: ['telefono', 'nombre'] },
+      { model: LoyaltyAdjustmentReason, as: 'reason', attributes: ['nombre'] },
+      // Discrepancia con el enunciado: CentroCosto NO tiene columna `nombre` (ver
+      // shared/models/postgres/CentroCosto.js) — el nombre de la sucursal vive en `sucursal`.
+      // `attributes: ['nombre']` tal cual rompería contra Postgres real (columna inexistente);
+      // se trae la columna real `sucursal` pero se alias-ea como `nombre` en el resultado para
+      // no romper el contrato de API ya acordado con el frontend (`centroCosto.nombre`).
+      { model: CentroCosto, as: 'centroCosto', attributes: [['sucursal', 'nombre']] },
+    ],
+    order: [['createdAt', 'DESC']],
+  });
 }
 
 module.exports = {
@@ -470,6 +658,12 @@ module.exports = {
   registrarCanje,
   registrarAjuste,
   listarMovimientos,
+  listarMovimientosPublicos,
   listarNiveles,
+  listarMovimientosGlobal,
   _aplicarMovimiento,
+  // Exportados para loyalty-kore-venta.service.js (webhook Kore de venta, 2026-10-26) — mismo
+  // mecanismo de resolución de sucursal por Serie-Folio, sin duplicar la lógica.
+  _resolverCentroCostoPorSerieFolio,
+  _obtenerCentroCosto,
 };

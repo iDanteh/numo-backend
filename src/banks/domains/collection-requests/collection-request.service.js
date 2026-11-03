@@ -37,6 +37,13 @@ const driveComprobantes                  = require('./drive-comprobantes.service
 const { NotFoundError, BadRequestError, ForbiddenError } = require('../../shared/errors/AppError');
 const { emitToAll, emitToBanco }         = require('../../shared/socket');
 const { logger }                         = require('../../shared/utils/logger');
+// Acumulación de puntos de Lealtad vía identificar() (2026-10-27, EN DISEÑO —
+// ver Docs/integracion-kore-puntos-lealtad-DRAFT.md §10). Reusa el webhook de
+// Lealtad TAL CUAL, sin reimplementar nada de su lógica (idempotencia, gates,
+// registro de procesos fallidos) — ver el bloque dentro de identificar() más
+// abajo. Sin dependencia circular: loyalty-kore-venta.service.js no importa
+// nada de banks/.
+const { procesarVentaKore } = require('../../../loyalty/domains/ledger/loyalty-kore-venta.service');
 
 // Payload mínimo para 'collection-request:updated' — mismo criterio que
 // bank:movement:updated en bank.service.js: solo lo que la bandeja necesita
@@ -136,6 +143,11 @@ async function create(data, files = []) {
   const {
     cxcs, formasPago, descripcion, conceptoId, solicitudIdErp,
     usuarioSolicitanteId, usuarioSolicitanteNombre,
+    // Teléfono del cliente final (2026-10-27, opcional) — para acumulación de
+    // puntos de Lealtad al identificar(), ver CollectionRequest.model.js. Sin
+    // validación de formato ni obligatoriedad a propósito: debe ser 100% inerte
+    // si no viene (el 100% de las solicitudes de hoy).
+    telefono,
   } = data;
 
   if (!usuarioSolicitanteId) throw new BadRequestError('usuarioSolicitanteId es requerido');
@@ -221,6 +233,7 @@ async function create(data, files = []) {
         ? String(descripcion).trim()
         : `Solicitud de cobro de ${usuarioSolicitanteNombre || usuarioSolicitanteId} con fecha ${new Date().toISOString().slice(0, 10)}`,
       conceptoId:       conceptoId ? String(conceptoId).trim() : null,
+      telefono:         telefono ? String(telefono).trim() : null,
       solicitudIdErp:   solicitudIdErpTrim,
       comprobantes:      comprobantesSubidos,
       solicitanteUserId: String(usuarioSolicitanteId).trim(),
@@ -1210,6 +1223,58 @@ async function identificar(id, body, user) {
   // admin) y a la tienda que la solicitó — sin esto, cualquier otra sesión con la
   // vista abierta se queda con el estado viejo hasta que alguien recargue a mano.
   emitToAll('collection-request:updated', _eventoActualizacion(cr, movsOrdenados));
+
+  // 10. Acumulación de puntos de Lealtad (2026-10-27, EN DISEÑO, opcional) — SIEMPRE
+  // después del commit de arriba: el cobro de Bancos ya quedó confirmado e
+  // irreversible en Kore/Mongo, así que nada de lo que pase acá puede (ni debe)
+  // afectarlo. Reusa procesarVentaKore() del webhook de Lealtad tal cual, una vez
+  // por CxC (Modo 1 = 1 sola vuelta, Modo 2 = varias, cada una su propia "venta").
+  // Si cr.telefono no viene (el 100% de las solicitudes de hoy), este bloque ni
+  // se ejecuta — cero costo, cero cambio de comportamiento.
+  if (cr.telefono) {
+    const esModo2 = cr.cxcs.length > 1;
+    for (const cxc of cr.cxcs) {
+      // Esta CxC no trae lo necesario para acumular — se omite en silencio, no
+      // es un error (la mayoría de las CxC de hoy no van a traer subtotal).
+      if (!cxc.serie || !cxc.folioExterno || !(cxc.subtotal > 0)) continue;
+      const serieFolio = `${cxc.serie}-${cxc.folioExterno}`;
+      const totalCxc = esModo2 ? cxc.montoAsignado : cr.monto;
+      // Modo 2: 1 sola forma de pago global (ya validado en create()), prorateada
+      // por CxC vía montoAsignado — nunca prorratea subtotal (viene real por CxC).
+      const formasPagoCxc = esModo2
+        ? [{ formaPagoId: cr.formasPago[0].formaPagoId, importe: cxc.montoAsignado }]
+        : cr.formasPago.map(f => ({ formaPagoId: f.formaPagoId, importe: f.importe }));
+      try {
+        // eslint-disable-next-line no-await-in-loop -- en serie a propósito: todas
+        // las CxC de esta solicitud son del mismo cliente (regla ya existente),
+        // no hace falta paralelizar.
+        await procesarVentaKore({
+          telefono: cr.telefono,
+          serieFolio,
+          conceptoId: cr.conceptoId, // ya validado non-null al inicio de identificar()
+          metodoPago: cxc.tipoPago,
+          formasPago: formasPagoCxc,
+          subtotal: cxc.subtotal,
+          total: totalCxc,
+          usuarioAplicaId: user._id,
+          usuarioAplicaNombre: user.nombre,
+          fecha: new Date().toISOString(),
+        });
+      } catch (err) {
+        // 404 = el cliente no tiene tarjeta de Lealtad — es el camino ESPERADO
+        // (la mayoría de clientes de Solicitudes de Cobro no participan), nunca
+        // se loguea como advertencia. Mismo cliente en TODAS las CxC de esta
+        // solicitud, así que si no tiene tarjeta no vale la pena seguir
+        // intentando con las demás.
+        if (err.statusCode === 404) break;
+        // Cualquier otro error (catálogo desconocido, validación, etc.) se
+        // loguea para revisión — procesarVentaKore ya registra sus propios
+        // procesos fallidos reales en LoyaltyKoreVentaFallida, acá no se
+        // duplica eso, solo se dejá constancia de que no se aplicó.
+        logger.warn(`[collection-requests] identificar ${id}: acumulación de Lealtad no se aplicó para ${serieFolio} (no bloquea el cobro, ya confirmado en Kore/Mongo): ${err.message}`);
+      }
+    }
+  }
 
   return { ..._toSafeJSON(cr), reconciliacion };
 }

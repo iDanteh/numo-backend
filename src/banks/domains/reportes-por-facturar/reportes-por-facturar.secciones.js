@@ -385,7 +385,7 @@ function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
     columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'CLIENTE', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
     grupos: bloque.grupos,
     total: bloque.total,
-    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, _cliente(d), _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
+    fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _cliente(d), _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
   });
   ws.mergeCells(1, 1, 1, 10);
   ws.eachRow(row => { if (typeof row.getCell(8).value === 'number') row.getCell(8).numFmt = DINERO; });

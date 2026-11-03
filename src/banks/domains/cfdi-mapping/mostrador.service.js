@@ -469,6 +469,14 @@ async function _efectivoSinLigar(conRemisiones) {
           if (monto <= 0 || vistos.has(idCobro) || yaLigado(rem, monto)) continue;
           vistos.add(idCobro);
           const etiqueta = forma === 'depositoEfectivo' ? 'DEPÓSITO EN EFECTIVO' : (origen === 'ABO' ? 'ABONO EN EFECTIVO' : 'COBRO EN EFECTIVO');
+          // Forma de pago (2026-11-03, "¿por qué aparece dos veces $2,356.99?"):
+          // el renglón del abono lleva SOLO la suya; el depósito ligado sigue
+          // diciendo MIXTO (formasPagoTexto), pero para los totales por forma
+          // se le resta lo que ya sale aparte (no se cuenta dos veces).
+          const fpFila = fila.formasPago ?? {};
+          const llave = [forma, 'abonos', 'efectivo', 'depositoEfectivo'].find(f => (Number(fpFila[f]) || 0) >= monto - TOLERANCIA_EFECTIVO) ?? forma;
+          if (fila.formasPago && !fila.formasPagoTexto) fila.formasPagoTexto = { ...fila.formasPago };
+          if (fila.formasPago && fpFila[llave] != null) fila.formasPago = { ...fpFila, [llave]: _r2(Math.max(0, fpFila[llave] - monto)) };
           lista.push({
             fecha:        k.fecha,
             descripcion:  `${etiqueta}${k.claveCentro ? ` EN CAJA ${k.claveCentro}` : ''} (${cobro})`,
@@ -485,7 +493,7 @@ async function _efectivoSinLigar(conRemisiones) {
             remisionKore: rem.replace('|', '-'),
             idNumo:       'S/R',
             estatus:      fila.estatus,
-            formasPago:   fila.formasPago,
+            formasPago:   { [llave]: monto },
             ...('saldo' in fila ? { saldo: null } : {}),
           });
         }

@@ -87,9 +87,13 @@ function formaPagoDe(d) {
   if (!presentes.length) return { texto: '—', partes: {} };
   const suma = presentes.reduce((s, f) => s + Number(montos[f]), 0);
   const partes = Object.fromEntries(presentes.map(f => [f, _r2(importe * Number(montos[f]) / suma)]));
-  const texto = presentes.length === 1
-    ? ETIQUETA_FORMA[presentes[0]]
-    : `MIXTO: ${presentes.map(f => `${ETIQUETA_FORMA[f]} ${_dinero(montos[f])}`).join(' + ')}`;
+  // El texto puede venir de las formas completas (2026-11-03: depósito ligado
+  // cuyo abono en efectivo sale aparte → sigue diciendo MIXTO).
+  const montosTexto = d.formasPagoTexto ?? montos;
+  const enTexto = FORMAS.map(([f]) => f).filter(f => (Number(montosTexto?.[f]) || 0) > 0.005);
+  const texto = enTexto.length === 1
+    ? ETIQUETA_FORMA[enTexto[0]]
+    : `MIXTO: ${enTexto.map(f => `${ETIQUETA_FORMA[f]} ${_dinero(montosTexto[f])}`).join(' + ')}`;
   return { texto, partes };
 }
 

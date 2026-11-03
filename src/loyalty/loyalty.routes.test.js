@@ -42,6 +42,9 @@ jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
   listarNiveles: jest.fn(),
   listarMovimientosGlobal: jest.fn(),
 }));
+jest.mock('./jobs/congelamiento-puntos.service', () => ({
+  tarjetasPorVencer: jest.fn(),
+}));
 jest.mock('./domains/config/loyalty-config.service', () => ({
   obtenerPorcentajes: jest.fn(),
   guardarPorcentajes: jest.fn(),
@@ -73,6 +76,7 @@ const router = require('./loyalty.routes');
 const cardService = require('./domains/cards/loyalty-card.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
+const congelamientoService = require('./jobs/congelamiento-puntos.service');
 const { PERMISSIONS } = require('../shared/config/rbac');
 
 function perms(...list) {
@@ -96,6 +100,7 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
   const casos = [
     { metodo: 'get',   ruta: '/cards',                    permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/pendientes-revision-kore', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'get',   ruta: '/cards/por-vencer',          permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/cards/1/marcar-revisada',  permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
     { metodo: 'post',  ruta: '/cards',                     permiso: PERMISSIONS.LOYALTY_TARJETAS_CREAR, body: { telefono: '5512345678', nombre: 'Ana' } },
     { metodo: 'get',   ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_READ },
@@ -222,6 +227,26 @@ describe('wiring hacia los servicios (happy path)', () => {
     const res = await request(app).get('/cards/42/movimientos').set(perms(PERMISSIONS.LOYALTY_READ));
     expect(res.status).toBe(200);
     expect(ledgerService.listarMovimientos).toHaveBeenCalledWith('42', expect.any(Object));
+  });
+
+  // Reporte "Puntos por vencer" (2026-11-03).
+  test('GET /cards/por-vencer pasa `dias` como diasVentana y responde { tarjetas }', async () => {
+    congelamientoService.tarjetasPorVencer.mockResolvedValue([{ id: 1 }]);
+
+    const res = await request(app).get('/cards/por-vencer?dias=15').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ tarjetas: [{ id: 1 }] });
+    expect(congelamientoService.tarjetasPorVencer).toHaveBeenCalledWith({ diasVentana: 15 });
+  });
+
+  test('GET /cards/por-vencer sin `dias` deja que el servicio aplique su propio default', async () => {
+    congelamientoService.tarjetasPorVencer.mockResolvedValue([]);
+
+    const res = await request(app).get('/cards/por-vencer').set(perms(PERMISSIONS.LOYALTY_READ));
+
+    expect(res.status).toBe(200);
+    expect(congelamientoService.tarjetasPorVencer).toHaveBeenCalledWith({});
   });
 
   // Reporte "Movimientos" (2026-10-29).

@@ -60,7 +60,7 @@ async function _buscarCard({ koreClienteId, telefono }) {
   return null;
 }
 
-async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre }) {
+async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo }) {
   const updates = {
     updatedById:     ACTOR_WEBHOOK.dbId,
     updatedByNombre: ACTOR_WEBHOOK.nombre,
@@ -68,6 +68,11 @@ async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre }) 
   if (koreClienteId) updates.koreClienteId = koreClienteId;
   if (nombre !== undefined && String(nombre).trim()) updates.nombre = String(nombre).trim();
   if (telefono && telefono !== card.telefono) updates.telefono = telefono;
+  // `activo` (2026-11-03, pedido explícito del usuario): reactiva una tarjeta que un `baja`
+  // anterior dejó en activa:false — hasta ahora NINGÚN evento podía revertir eso (gap real
+  // encontrado al responder una pregunta del usuario sobre reactivación de monedero en Kore).
+  // Opcional: si Kore no lo manda, `activa` queda intacta (mismo criterio que nombre/telefono).
+  if (activo !== undefined) updates.activa = Boolean(activo);
 
   try {
     await card.update(updates);
@@ -113,10 +118,10 @@ async function _procesarAlta({ koreClienteId, telefono, nombre }) {
   return { ok: true, evento: 'alta', cardId: card.id, creada: true };
 }
 
-async function _procesarActualizacion({ koreClienteId, telefono, nombre }) {
+async function _procesarActualizacion({ koreClienteId, telefono, nombre, activo }) {
   const card = await _buscarCard({ koreClienteId, telefono });
   if (!card) throw new NotFoundError('Tarjeta (no se encontró por koreClienteId ni teléfono)');
-  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre });
+  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo });
 }
 
 async function _procesarBaja({ koreClienteId, telefono }) {
@@ -138,9 +143,12 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * `evento`: 'alta' | 'actualizacion' | 'baja'. `koreClienteId` siempre requerido;
  * `telefono` requerido (10 dígitos) para 'alta'/'actualizacion', opcional (solo
  * como fallback de búsqueda) para 'baja'.
+ * `activo` (2026-11-03): SOLO se lee/aplica en 'actualizacion' — a propósito, no en 'alta'
+ * (una tarjeta recién creada siempre nace activa, reactivar es un caso de "ya existe y
+ * estaba dada de baja", no de alta) ni en 'baja' (ya tiene su propio camino fijo a false).
  */
 async function procesarClienteKore(payload) {
-  const { evento, telefono, nombre } = payload ?? {};
+  const { evento, telefono, nombre, activo } = payload ?? {};
 
   if (!EVENTOS_VALIDOS.includes(evento)) {
     throw new BadRequestError(`evento inválido: "${evento}". Debe ser uno de: ${EVENTOS_VALIDOS.join(', ')}.`);
@@ -161,7 +169,7 @@ async function procesarClienteKore(payload) {
   if (evento === 'alta') {
     return _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre });
   }
-  return _procesarActualizacion({ koreClienteId, telefono: telefonoNorm, nombre });
+  return _procesarActualizacion({ koreClienteId, telefono: telefonoNorm, nombre, activo });
 }
 
 module.exports = { procesarClienteKore };

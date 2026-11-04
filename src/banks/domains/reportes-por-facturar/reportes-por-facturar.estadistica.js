@@ -302,7 +302,7 @@ function validar({ rfc, fechaInicio, fechaFin }) {
   if (_diasDelRango(fechaInicio, fechaFin).length > MAX_DIAS_RANGO) throw new BadRequestError(`El rango no puede pasar de ${MAX_DIAS_RANGO} días`);
 }
 
-/** Excel de un cálculo terminado: RESUMEN, DÍA A DÍA, FACTURADOS y FALTAN. */
+/** Excel de un cálculo terminado: RESUMEN, FACTURADOS y FALTAN (sin DÍA A DÍA desde 2026-11-04, pedido del usuario). */
 async function excel(id) {
   const t = _trabajos.get(id);
   if (!t || t.estado !== 'listo') throw new NotFoundError('Cálculo');
@@ -346,15 +346,6 @@ async function _excelDe(r) {
   };
   for (const a of r.porAlmacen) filaRes([a.serie, a.sucursal].filter(Boolean).join(' - '), a);
   filaRes('TOTAL', r.totales, true);
-
-  hoja('DÍA A DÍA', [
-    ['dia', 'DÍA', 12], ['nuevosN', 'NUEVOS', 10], ['nuevosI', 'IMPORTE NUEVOS', 16, dinero],
-    ['factN', 'FACTURADOS', 12], ['factI', 'IMPORTE FACTURADOS', 18, dinero],
-    ['pendN', 'PENDIENTES AL CIERRE', 14], ['pendI', 'IMPORTE PENDIENTE', 18, dinero],
-  ], r.diaADia.map(d => ({
-    dia: d.dia, nuevosN: d.nuevos.depositos, nuevosI: d.nuevos.importe, factN: d.facturados.depositos,
-    factI: d.facturados.importe, pendN: d.pendientes.depositos, pendI: d.pendientes.importe,
-  })));
 
   const comunes = [
     ['entrada', 'ENTRÓ', 11], ['periodo', 'PERIODO', 11], ['idNumo', 'ID NUMO', 10], ['descripcion', 'DESCRIPCIÓN', 40], ['importe', 'IMPORTE', 14, dinero],

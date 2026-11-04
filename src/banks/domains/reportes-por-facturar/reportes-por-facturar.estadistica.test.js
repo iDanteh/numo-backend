@@ -93,7 +93,7 @@ test('valida rango', () => {
   expect(() => est.validar({ rfc: 'X', fechaInicio: '2026-10-05', fechaFin: '2026-10-01' })).toThrow(/anterior/);
 });
 
-test('segundo plano + Excel con RESUMEN, DÍA A DÍA, FACTURADOS y FALTAN', async () => {
+test('segundo plano + Excel con RESUMEN, FACTURADOS y FALTAN', async () => {
   const ExcelJS = require('exceljs');
   const { id } = est.iniciar({ rfc: 'CCO011113663', fechaInicio: '2026-10-20', fechaFin: '2026-10-22' }, { nombre: 'X' });
   for (let i = 0; i < 50 && est.estado(id).estado === 'calculando'; i++) await new Promise(r => setImmediate(r));
@@ -103,7 +103,7 @@ test('segundo plano + Excel con RESUMEN, DÍA A DÍA, FACTURADOS y FALTAN', asyn
   expect(filename).toBe('Estadistica_por_facturar_Todas_2026-10-20_2026-10-22.xlsx');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
-  expect(wb.worksheets.map(w => w.name)).toEqual(['RESUMEN', 'DÍA A DÍA', 'FACTURADOS', 'FALTAN']);
+  expect(wb.worksheets.map(w => w.name)).toEqual(['RESUMEN', 'FACTURADOS', 'FALTAN']);
   expect(wb.getWorksheet('FACTURADOS').rowCount).toBe(3);
   expect(wb.getWorksheet('FALTAN').getRow(2).getCell(8).value).toBe('CLIENTE A02');
 });

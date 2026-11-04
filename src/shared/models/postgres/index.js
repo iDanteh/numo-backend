@@ -37,6 +37,7 @@ const ConfigAuditLog    = require('./ConfigAuditLog');
 const LoyaltyCard             = require('./LoyaltyCard');
 const LoyaltyPointsLedger     = require('./LoyaltyPointsLedger');
 const LoyaltyTierHistory      = require('./LoyaltyTierHistory');
+const LoyaltyCardAuditLog     = require('./LoyaltyCardAuditLog');
 const LoyaltyAdjustmentReason = require('./LoyaltyAdjustmentReason');
 const LoyaltyPendingEnrollment = require('./LoyaltyPendingEnrollment');
 const LoyaltyPromotion        = require('./LoyaltyPromotion');
@@ -100,6 +101,8 @@ LoyaltyCard.hasMany(LoyaltyPointsLedger,   { foreignKey: 'cardId', as: 'movimien
 LoyaltyPointsLedger.belongsTo(LoyaltyCard, { foreignKey: 'cardId', as: 'card' });
 LoyaltyCard.hasMany(LoyaltyTierHistory,    { foreignKey: 'cardId', as: 'historialNiveles', onDelete: 'RESTRICT' });
 LoyaltyTierHistory.belongsTo(LoyaltyCard,  { foreignKey: 'cardId', as: 'card' });
+LoyaltyCard.hasMany(LoyaltyCardAuditLog,   { foreignKey: 'cardId', as: 'historialCambios', onDelete: 'RESTRICT' });
+LoyaltyCardAuditLog.belongsTo(LoyaltyCard, { foreignKey: 'cardId', as: 'card' });
 LoyaltyPointsLedger.belongsTo(CentroCosto, { foreignKey: 'centroCostoId', as: 'centroCosto' });
 CentroCosto.hasMany(LoyaltyPointsLedger,   { foreignKey: 'centroCostoId', as: 'movimientosLealtad' });
 LoyaltyPointsLedger.belongsTo(LoyaltyAdjustmentReason, { foreignKey: 'reasonId', as: 'reason' });
@@ -633,6 +636,9 @@ async function syncModels() {
   await LoyaltyAdjustmentReason.sync({ force: false });
   await LoyaltyPointsLedger.sync({ force: false });
   await LoyaltyTierHistory.sync({ force: false });
+  // Historial de cambios de catálogo de tarjeta (ver LoyaltyCardAuditLog.js) — tabla nueva,
+  // mismo criterio que LoyaltyTierHistory (FK a loyalty_cards, ya creada arriba).
+  await LoyaltyCardAuditLog.sync({ force: false });
   // Catálogo de promociones (bono extra por periodo) — tabla nueva sin FKs,
   // no importa el orden respecto a las demás de Lealtad.
   await LoyaltyPromotion.sync({ force: false });
@@ -855,4 +861,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ADD COLUMN foto_drive_file_id/foto_mime_type (loyalty_cards):', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyCardAuditLog, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };

@@ -12,6 +12,7 @@
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard: { findAll: jest.fn() },
+  LoyaltyCardAuditLog: { create: jest.fn() },
 }));
 jest.mock('./loyalty-kore-monedero.client', () => ({
   obtenerClientesConMonedero: jest.fn(),
@@ -22,7 +23,7 @@ jest.mock('../../../shared/utils/logger', () => ({
 }));
 
 const { Op } = require('sequelize');
-const { LoyaltyCard } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltyCardAuditLog } = require('../../../shared/models/postgres');
 const { obtenerClientesConMonedero } = require('./loyalty-kore-monedero.client');
 const { emitToUser } = require('../../../banks/shared/socket');
 const { logger } = require('../../../shared/utils/logger');
@@ -78,6 +79,27 @@ describe('correrMatchKore', () => {
     expect(resumen.matcheadosDetalle).toEqual([
       { telefono: '5551234567', nombre: 'CLIENTE', tarjetaLegada: '44', koreClienteId: '1066bvfaevunm', koreMonedero: '044' },
     ]);
+  });
+
+  // Historial de cambios de catálogo (gap real cerrado 2026-11-04).
+  test('registra el match en LoyaltyCardAuditLog con koreClienteId/koreMonedero anteriores y nuevos', async () => {
+    const c = card({ id: 9, tarjetaLegada: '44', koreClienteId: null, koreMonedero: null });
+    LoyaltyCard.findAll.mockResolvedValue([c]);
+    obtenerClientesConMonedero.mockResolvedValue([
+      { id: '1066bvfaevunm', nombre: 'ALBERTO', monedero: '044' },
+    ]);
+
+    await correrMatchKore();
+
+    expect(LoyaltyCardAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      cardId: 9,
+      accion: 'match_kore',
+      origen: 'kore',
+      cambios: {
+        koreClienteId: { antes: null, despues: '1066bvfaevunm' },
+        koreMonedero: { antes: null, despues: '044' },
+      },
+    }));
   });
 
   test('cliente de Kore sin match en Lealtad: se reporta en sinMatchEnLealtad, nunca escribe nada', async () => {

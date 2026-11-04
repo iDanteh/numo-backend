@@ -21,6 +21,7 @@ jest.mock('../../../shared/models/postgres', () => {
   return {
     LoyaltyCard,
     LoyaltyTierHistory: { create: jest.fn() },
+    LoyaltyCardAuditLog: { create: jest.fn(), findAll: jest.fn() },
   };
 });
 jest.mock('../../../config/database.postgres', () => ({
@@ -31,7 +32,7 @@ jest.mock('./drive-loyalty-foto.service', () => ({
   descargarFotoCliente: jest.fn(),
 }));
 
-const { LoyaltyCard, LoyaltyTierHistory } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltyTierHistory, LoyaltyCardAuditLog } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
 const { subirFotoCliente, descargarFotoCliente } = require('./drive-loyalty-foto.service');
 const cardService = require('./loyalty-card.service');
@@ -239,6 +240,52 @@ describe('editarTarjeta', () => {
     await cardService.editarTarjeta(1, { nombre: 'Solo nombre' }, USER);
 
     expect(card.update).toHaveBeenCalledWith(expect.not.objectContaining({ apodo: expect.anything() }));
+  });
+
+  // Historial de cambios de catálogo (gap real cerrado 2026-11-04).
+  test('registra en LoyaltyCardAuditLog el teléfono anterior y nuevo', async () => {
+    const card = makeCard({ telefono: '5512345678' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await cardService.editarTarjeta(1, { telefono: '5599999999' }, USER);
+
+    expect(LoyaltyCardAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      cardId: 1,
+      accion: 'edicion_staff',
+      origen: 'numo',
+      usuarioId: '7',
+      usuarioNombre: 'Admin',
+      cambios: { telefono: { antes: '5512345678', despues: '5599999999' } },
+    }));
+  });
+
+  test('editar un campo que queda con el mismo valor no genera fila en el historial', async () => {
+    const card = makeCard({ nombre: 'Juan Pérez' });
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await cardService.editarTarjeta(1, { nombre: 'Juan Pérez' }, USER);
+
+    expect(LoyaltyCardAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  test('cambiar teléfono a uno ya usado por otra tarjeta (409) no genera fila en el historial', async () => {
+    const card = makeCard();
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+    LoyaltyCard.findOne.mockResolvedValue(makeCard({ id: 2, telefono: '5599999999' }));
+
+    await expect(cardService.editarTarjeta(1, { telefono: '5599999999' }, USER)).rejects.toMatchObject({ statusCode: 409 });
+
+    expect(LoyaltyCardAuditLog.create).not.toHaveBeenCalled();
+  });
+
+  test('no audita "datos adicionales" (apodo, colonia, etc.) — fuera de alcance a propósito', async () => {
+    const card = makeCard();
+    LoyaltyCard.findByPk.mockResolvedValue(card);
+
+    await cardService.editarTarjeta(1, { apodo: 'Juancho' }, USER);
+
+    expect(LoyaltyCardAuditLog.create).not.toHaveBeenCalled();
   });
 });
 

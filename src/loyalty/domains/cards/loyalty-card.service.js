@@ -17,6 +17,7 @@ const { BadRequestError, ConflictError, NotFoundError } = require('../../../shar
 const { normalizarTelefono } = require('../../shared/puntos.util');
 const { generarNip, hashNip } = require('../../shared/nip.util');
 const { subirFotoCliente, descargarFotoCliente } = require('./drive-loyalty-foto.service');
+const { registrarCambioTarjeta } = require('./loyalty-card-audit.service');
 
 const NIVELES_VALIDOS = ['Bronce', 'Plata', 'Oro'];
 
@@ -253,9 +254,15 @@ async function editarTarjeta(id, { nombre, telefono, activa, ...opcionales } = {
   const card = await LoyaltyCard.findByPk(id);
   if (!card) throw new NotFoundError('Tarjeta');
 
+  // Snapshot ANTES de `.update()` — ver docstring de `registrarCambioTarjeta`
+  // (loyalty-card-audit.service.js) sobre por qué esto tiene que capturarse en este orden.
+  const antes = { telefono: card.telefono, nombre: card.nombre, activa: card.activa };
+  const despues = {};
+
   const updates = { ..._datosOpcionales(opcionales) };
   if (nombre !== undefined) {
     updates.nombre = String(nombre).trim();
+    despues.nombre = updates.nombre;
   }
   if (telefono !== undefined) {
     const telefonoNorm = normalizarTelefono(telefono);
@@ -266,9 +273,11 @@ async function editarTarjeta(id, { nombre, telefono, activa, ...opcionales } = {
       }
       updates.telefono = telefonoNorm;
     }
+    despues.telefono = telefonoNorm;
   }
   if (activa !== undefined) {
     updates.activa = Boolean(activa);
+    despues.activa = updates.activa;
   }
 
   const { usuarioId, usuarioNombre } = _userLabel(user);
@@ -283,6 +292,10 @@ async function editarTarjeta(id, { nombre, telefono, activa, ...opcionales } = {
     }
     throw err;
   }
+
+  await registrarCambioTarjeta({
+    cardId: card.id, antes, despues, accion: 'edicion_staff', origen: 'numo', usuarioId, usuarioNombre,
+  });
 
   return card;
 }

@@ -27,7 +27,6 @@
 const BankMovement = require('../banks/BankMovement.model');
 const { obtenerDesglosesCobroAlmacen } = require('../erp/erp-sync.service');
 const { infoRemisiones } = require('../erp/kore-remisiones.service');
-const { logger } = require('../../../shared/utils/logger');
 
 const TIPO_ORIGEN_VENTA_SIN_COBRO = 'Venta Sin Cobro';
 const ESTATUS_POR_FACTURAR = 'POR FACTURAR';
@@ -375,7 +374,6 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
 
   const depositos = [];
   const depositosConSaldo = [];
-  const conRemisiones = [];
   for (const b of todos) {
     const links = (b.erpLinks ?? []).filter(linkSinFactura);
     if (!links.length || !links.every(porFacturar)) continue;
@@ -387,8 +385,7 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
     const liquidadaEl = liquidaciones.length === remisionesUnicas.length ? new Date(Math.max(...liquidaciones)) : null;
     if (esAnterior.has(String(b._id))
       && !(todasPagadas && liquidadaEl && liquidadaEl >= enRangoId.$gte && liquidadaEl <= enRangoId.$lte)) continue;
-    const lista = todasPagadas ? depositos : depositosConSaldo;
-    lista.push({
+    (todasPagadas ? depositos : depositosConSaldo).push({
       fecha:       b.fecha ?? null,
       descripcion: b.concepto ?? '',
       importe:     _r2(b.deposito),
@@ -402,104 +399,11 @@ async function detectarDepositosPendientesFactura({ rfc, series, fechaInicio, fe
       formasPago:  formasPagoDeCuentas(remisionesUnicas.map(l => desglose.get(clave(l)))),
       ...(todasPagadas ? {} : { saldo: _r2(remisionesUnicas.reduce((s, l) => s + saldoDe(l), 0)) }),
     });
-    conRemisiones.push({ fila: lista[lista.length - 1], lista, cuentas: remisionesUnicas.map(l => ({ rem: clave(l), cuenta: desglose.get(clave(l)) })) });
-  }
-  // Abonos en efectivo de Kore cuyo depósito NO está ligado en Bancos (solo el reporte).
-  if (incluirIdentificados) {
-    try {
-      await _efectivoSinLigar(conRemisiones);
-    } catch (err) {
-      // Es un extra: si falla, el reporte sale igual (sin esos renglones).
-      logger.warn(`[mostrador] abonos en efectivo sin ligar: ${err.message}`);
-    }
   }
   const porFecha = (a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0) || String(a.idNumo).localeCompare(String(b.idNumo));
   depositos.sort(porFecha);
   depositosConSaldo.sort(porFecha);
   return { depositos, depositosConSaldo, remisionesSinRespuesta };
-}
-
-/**
- * Abonos en efectivo sin ligar (2026-11-03, pedido del usuario, caso CESAR
- * EFRAIN JARQUIN ALVARADO, A0-261001321): Kore registra en la remisión un
- * ABO-261010874 en EFECTIVO de $2,356.99 (10-oct) y el SPEI 051909 de $2,200,
- * pero en Bancos solo el SPEI está ligado. "Que sí diga MIXTO pero que sí lo
- * separe" y "¿no puede salir sin ligar nada?": el renglón del depósito ligado
- * sigue diciendo MIXTO y el abono sale APARTE, tal como lo trae Kore (fecha,
- * caja, folio del abono, importe), con ID NUMO "S/R", en el grupo del mismo
- * cliente y sin REM ni cliente. NO se busca su depósito en Bancos por importe
- * (no sería seguro) ni se liga nada: el depósito en efectivo sin ligar sigue
- * en "DEPÓSITOS EN EFECTIVO — SIN ASOCIAR" hasta que alguien lo ligue.
- *
- * Solo cobros EFECTIVO / DEPÓSITO EN EFECTIVO de las remisiones que ya están
- * en PENDIENTE / FICHA y que no estén ligados en Bancos a esa remisión por el
- * mismo importe (si alguien lo liga, sale el depósito y este renglón ya no).
- * Muta las listas.
- */
-const TOLERANCIA_EFECTIVO = 0.05;
-async function _efectivoSinLigar(conRemisiones) {
-  const folios = [...new Set(conRemisiones.flatMap(x => x.cuentas.map(c => c.rem.split('|')[1])))];
-  if (!folios.length) return;
-  // Lo ya ligado en Bancos a cada remisión (de cualquier depósito).
-  const ligados = await BankMovement.find({ isActive: { $ne: false }, deposito: { $gt: 0 }, 'erpLinks.folioExterno': { $in: folios } }, 'deposito erpLinks')
-    .lean();
-  const pagado = new Map();
-  for (const b of ligados ?? []) {
-    for (const l of b.erpLinks ?? []) {
-      const k = `${String(l.serie ?? '').trim().toUpperCase()}|${String(l.folioExterno ?? '').trim()}`;
-      if (!pagado.has(k)) pagado.set(k, []);
-      pagado.get(k).push(_r2(l.saldoPagado ?? l.saldoPagadoTotal), _r2(b.deposito));
-    }
-  }
-  const yaLigado = (rem, monto) => (pagado.get(rem) ?? []).some(m => Math.abs(m - monto) <= TOLERANCIA_EFECTIVO);
-
-  const vistos = new Set();
-  for (const { fila, lista, cuentas } of conRemisiones) {
-    for (const { rem, cuenta } of cuentas) {
-      for (const k of cuenta?.cobros ?? []) {
-        const origen = String(k.serieOrigen ?? '').trim().toUpperCase();
-        if (!k.fecha || origen === 'CBT') continue;
-        const fps = k.formasPago ?? [];
-        for (const fp of fps) {
-          const forma = _formaPago(fp);
-          if (forma !== 'efectivo' && forma !== 'depositoEfectivo') continue;
-          const monto = _r2(fps.length === 1 && k.monto != null ? Math.abs(Number(k.monto) || 0) : Number(fp.monto) || 0);
-          const cobro = `${origen}-${String(k.folioOrigen ?? '').trim()}`;
-          const idCobro = `${rem}|${cobro}|${forma}`;
-          if (monto <= 0 || vistos.has(idCobro) || yaLigado(rem, monto)) continue;
-          vistos.add(idCobro);
-          const etiqueta = forma === 'depositoEfectivo' ? 'DEPÓSITO EN EFECTIVO' : (origen === 'ABO' ? 'ABONO EN EFECTIVO' : 'COBRO EN EFECTIVO');
-          // Forma de pago (2026-11-03, "¿por qué aparece dos veces $2,356.99?"):
-          // el renglón del abono lleva SOLO la suya; el depósito ligado sigue
-          // diciendo MIXTO (formasPagoTexto), pero para los totales por forma
-          // se le resta lo que ya sale aparte (no se cuenta dos veces).
-          const fpFila = fila.formasPago ?? {};
-          const llave = [forma, 'abonos', 'efectivo', 'depositoEfectivo'].find(f => (Number(fpFila[f]) || 0) >= monto - TOLERANCIA_EFECTIVO) ?? forma;
-          if (fila.formasPago && !fila.formasPagoTexto) fila.formasPagoTexto = { ...fila.formasPago };
-          if (fila.formasPago && fpFila[llave] != null) fila.formasPago = { ...fpFila, [llave]: _r2(Math.max(0, fpFila[llave] - monto)) };
-          lista.push({
-            fecha:        k.fecha,
-            descripcion:  `${etiqueta}${k.claveCentro ? ` EN CAJA ${k.claveCentro}` : ''} (${cobro})`,
-            importe:      monto,
-            aplicado:     monto,
-            banco:        'EFECTIVO',
-            remisiones:   [],
-            cliente:      '',
-            // Va en el grupo del cliente de la remisión, pero sin REM ni cliente.
-            grupoCliente: fila.cliente || '',
-            sinLigar:     true,
-            deKore:       true,
-            cobroKore:    cobro,
-            remisionKore: rem.replace('|', '-'),
-            idNumo:       'S/R',
-            estatus:      fila.estatus,
-            formasPago:   { [llave]: monto },
-            ...('saldo' in fila ? { saldo: null } : {}),
-          });
-        }
-      }
-    }
-  }
 }
 
 /**

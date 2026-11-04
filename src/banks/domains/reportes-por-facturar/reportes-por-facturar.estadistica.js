@@ -50,6 +50,8 @@ const LOTE_DESGLOSES = 50;
 const ARRASTRE_DESDE = '2026-01-01';
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+// Orden en FALTAN: 0 = todavía debe, 1 = saldo a favor (negativo), 2 = saldado.
+const _ordenSaldo = s => ((Number(s) || 0) > 0.005 ? 0 : (Number(s) || 0) < -0.005 ? 1 : 2);
 const _diaMx = f => (f ? new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10) : null);
 // `fecha` de Bancos = día del estado de cuenta a medianoche UTC ("ingenua").
 const _diaDeposito = f => (f ? new Date(f).toISOString().slice(0, 10) : null);
@@ -361,7 +363,9 @@ async function _excelDe(r) {
       ...base(d), factura: d.facturas.join('\n'), tipo: d.tipoFactura === 'global' ? 'GLOBAL' : d.tipoFactura === 'mixto' ? 'MIXTO' : 'CLIENTE',
     })));
   hoja('FALTAN', [...comunes, ['saldo', 'SALDO PENDIENTE', 14, dinero], ['diasSinFacturar', 'DÍAS SIN FACTURAR', 10]],
-    r.depositos.filter(d => d.estado === 'falta').map(base));
+    // Primero los que todavía deben, luego saldo a favor (negativo) y al final
+    // los saldados (2026-11-04, pedido del usuario; mismo orden que la pantalla).
+    r.depositos.filter(d => d.estado === 'falta').sort((a, b) => _ordenSaldo(a.saldo) - _ordenSaldo(b.saldo)).map(base));
 
   const rango = r.fechaInicio === r.fechaFin ? r.fechaInicio : `${r.fechaInicio}_${r.fechaFin}`;
   const sucursal = String(r.sucursal ?? 'Todas').replace(/[^\w-]+/g, '_');

@@ -115,6 +115,25 @@ test('segundo plano + Excel con RESUMEN, FACTURADOS y FALTAN', async () => {
   expect(wb.getWorksheet('FALTAN').getRow(2).getCell(8).value).toBe('CLIENTE A02');
 });
 
+test('Excel FALTAN: primero los que deben, luego saldo a favor y al final los saldados', async () => {
+  const ExcelJS = require('exceljs');
+  BankMovement.find.mockReturnValue(lean([
+    dep('201', '2026-10-20', 100, [link('A0', '21')]),   // saldado
+    dep('202', '2026-10-20', 100, [link('A0', '22')]),   // saldo a favor
+    dep('203', '2026-10-21', 100, [link('A0', '23')]),   // debe
+  ]));
+  const saldos = { 21: 0, 22: -1, 23: 50 };
+  erp.obtenerCuentaTicket.mockImplementation(async ({ serie, folio }) => ({
+    tipoPago: 'PPD', nombreTipoMovimiento: 'POR FACTURAR', saldoActual: saldos[folio], nombre: `CLIENTE ${serie}${folio}`,
+  }));
+  const { id } = est.iniciar({ rfc: 'CCO011113663', fechaInicio: '2026-10-20', fechaFin: '2026-10-22' }, { nombre: 'X' });
+  for (let i = 0; i < 50 && est.estado(id).estado === 'calculando'; i++) await new Promise(r => setImmediate(r));
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load((await est.excel(id)).buffer);
+  const ws = wb.getWorksheet('FALTAN');
+  expect([2, 3, 4].map(n => ws.getRow(n).getCell(3).value)).toEqual(['203', '202', '201']);
+});
+
 // 2026-11-03 ARRASTRE: los de antes del periodo que seguían sin facturar al
 // empezarlo cuentan en "había" (marcados), los facturados antes no.
 test('arrastre: pendientes de antes del periodo', async () => {

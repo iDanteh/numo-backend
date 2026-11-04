@@ -47,8 +47,14 @@ router.post('/ventas', verifyKoreApiKey, asyncHandler(async (req, res) => {
 }));
 
 router.post('/venta-cancelada', verifyKoreApiKey, asyncHandler(async (req, res) => {
-  const { serieFolio, motivoCancelacion } = req.body ?? {};
-  res.json(await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio, motivoCancelacion }));
+  const {
+    serieFolio, serieFolioCancelacion, tipoCancelacion, importeCancelado,
+    montoVenta, motivoCancelacion, clienteId, nombreCliente,
+  } = req.body ?? {};
+  res.json(await ventaCanceladaService.procesarVentaCanceladaKore({
+    serieFolio, serieFolioCancelacion, tipoCancelacion, importeCancelado,
+    montoVenta, motivoCancelacion, clienteId, nombreCliente,
+  }));
 }));
 
 router.get('/ventas-fallidas', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {

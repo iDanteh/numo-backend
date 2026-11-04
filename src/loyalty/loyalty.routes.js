@@ -20,6 +20,7 @@ const { asyncHandler } = require('../shared/middleware/error-handler');
 const { BadRequestError } = require('../shared/errors/AppError');
 const { PERMISSIONS } = require('../shared/config/rbac');
 const cardService = require('./domains/cards/loyalty-card.service');
+const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
 const congelamientoService = require('./jobs/congelamiento-puntos.service');
@@ -91,6 +92,12 @@ router.get('/cards/:id/movimientos', authenticate, permit(PERMISSIONS.LOYALTY_RE
 
 router.get('/cards/:id/niveles', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   res.json(await ledgerService.listarNiveles(req.params.id));
+}));
+
+// Historial de cambios de catálogo (teléfono, nombre, activa, tarjetaLegada, koreClienteId,
+// koreMonedero) — ver loyalty-card-audit.service.js. Mismo permiso que /niveles (lectura).
+router.get('/cards/:id/historial', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await cardAuditService.listarHistorialCambios(req.params.id));
 }));
 
 // Reporte "Movimientos" (2026-10-29) — ledger completo del programa (todas las tarjetas), sin

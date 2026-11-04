@@ -39,6 +39,7 @@ const { normalizarTarjeta } = require('../import/loyalty-import.parser');
 const { obtenerClientesConMonedero } = require('./loyalty-kore-monedero.client');
 const { emitToUser } = require('../../../banks/shared/socket');
 const { logger } = require('../../../shared/utils/logger');
+const { registrarCambioTarjeta } = require('../cards/loyalty-card-audit.service');
 
 // Listas de "sin match"/duplicados/errores en el resumen: truncadas para no devolver un JSON
 // gigante si el universo real tiene miles de filas — el conteo total SIEMPRE es completo (via
@@ -121,9 +122,18 @@ async function correrMatchKore({ onProgress } = {}) {
       tarjetasMatcheadas.add(monederoNormalizado);
       for (const card of candidatos) {
         try {
+          const antes = { koreClienteId: card.koreClienteId, koreMonedero: card.koreMonedero };
           // eslint-disable-next-line no-await-in-loop -- secuencial a propósito, universo acotado
           // (miles de filas, no millones) y cada UPDATE es independiente — no hace falta batchear.
           await card.update({ koreClienteId: cliente.id, koreMonedero: cliente.monedero });
+          // eslint-disable-next-line no-await-in-loop -- misma justificación que el update de arriba.
+          await registrarCambioTarjeta({
+            cardId: card.id,
+            antes,
+            despues: { koreClienteId: cliente.id, koreMonedero: cliente.monedero },
+            accion: 'match_kore',
+            origen: 'kore',
+          });
           matcheados += 1;
           matcheadosDetalle.push({
             telefono: card.telefono,

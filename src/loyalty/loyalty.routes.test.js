@@ -34,6 +34,9 @@ jest.mock('./domains/cards/loyalty-card.service', () => ({
   listarPendientesRevisionKore: jest.fn(),
   marcarRevisada: jest.fn(),
 }));
+jest.mock('./domains/cards/loyalty-card-audit.service', () => ({
+  listarHistorialCambios: jest.fn(),
+}));
 jest.mock('./domains/ledger/loyalty-ledger.service', () => ({
   registrarAcumulacion: jest.fn(),
   registrarCanje: jest.fn(),
@@ -74,6 +77,7 @@ const express = require('express');
 const request = require('supertest');
 const router = require('./loyalty.routes');
 const cardService = require('./domains/cards/loyalty-card.service');
+const cardAuditService = require('./domains/cards/loyalty-card-audit.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
 const congelamientoService = require('./jobs/congelamiento-puntos.service');
@@ -106,6 +110,7 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/1/movimientos',       permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/cards/1/niveles',           permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'get',   ruta: '/cards/1/historial',         permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'get',   ruta: '/ledger/export',             permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'patch', ruta: '/cards/1',                   permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR, body: { nombre: 'Ana' } },
     { metodo: 'post',  ruta: '/cards/1/nip',                permiso: PERMISSIONS.LOYALTY_TARJETAS_EDITAR },
@@ -227,6 +232,13 @@ describe('wiring hacia los servicios (happy path)', () => {
     const res = await request(app).get('/cards/42/movimientos').set(perms(PERMISSIONS.LOYALTY_READ));
     expect(res.status).toBe(200);
     expect(ledgerService.listarMovimientos).toHaveBeenCalledWith('42', expect.any(Object));
+  });
+
+  test('GET /cards/:id/historial llama a listarHistorialCambios con el id', async () => {
+    cardAuditService.listarHistorialCambios.mockResolvedValue([]);
+    const res = await request(app).get('/cards/42/historial').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(cardAuditService.listarHistorialCambios).toHaveBeenCalledWith('42');
   });
 
   // Reporte "Puntos por vencer" (2026-11-03).

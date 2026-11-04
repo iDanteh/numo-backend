@@ -11,12 +11,13 @@
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard: { findOne: jest.fn() },
+  LoyaltyCardAuditLog: { create: jest.fn() },
 }));
 jest.mock('../cards/loyalty-card.service', () => ({
   crearTarjeta: jest.fn(),
 }));
 
-const { LoyaltyCard } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltyCardAuditLog } = require('../../../shared/models/postgres');
 const { crearTarjeta } = require('../cards/loyalty-card.service');
 const { procesarClienteKore } = require('./loyalty-kore-cliente.service');
 
@@ -290,6 +291,43 @@ describe('procesarClienteKore — evento actualizacion', () => {
     const updates = existente.update.mock.calls[0][0];
     expect(updates).not.toHaveProperty('tarjetaLegada');
   });
+
+  // Historial de cambios de catálogo (gap real cerrado 2026-11-04).
+  test('registra en LoyaltyCardAuditLog el teléfono/tarjetaLegada anteriores y nuevos', async () => {
+    const existente = card({
+      id: 33, telefono: '5551234567', tarjetaLegada: '5', koreClienteId: 'K-viejo',
+    });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K33', telefono: '5559999999', nombre: 'X', tarjetaLegada: '0099',
+    });
+
+    expect(LoyaltyCardAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      cardId: 33,
+      accion: 'webhook_kore_actualizacion',
+      origen: 'kore',
+      cambios: {
+        koreClienteId: { antes: 'K-viejo', despues: 'K33' },
+        nombre: { antes: 'CLIENTE', despues: 'X' },
+        telefono: { antes: '5551234567', despues: '5559999999' },
+        tarjetaLegada: { antes: '5', despues: '99' },
+      },
+    }));
+  });
+
+  test('si nada cambió de verdad (Kore reenvía los mismos valores), no registra nada en el historial', async () => {
+    const existente = card({
+      id: 34, telefono: '5551234567', nombre: 'CLIENTE', koreClienteId: 'K34', tarjetaLegada: '5',
+    });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K34', telefono: '5551234567', nombre: 'CLIENTE', tarjetaLegada: '5',
+    });
+
+    expect(LoyaltyCardAuditLog.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('procesarClienteKore — evento baja', () => {
@@ -302,6 +340,20 @@ describe('procesarClienteKore — evento baja', () => {
     expect(existente.destroy).toBeUndefined(); // ni siquiera se define un método de borrado en el mock
     expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ activa: false }));
     expect(resultado).toEqual({ ok: true, evento: 'baja', cardId: 30 });
+  });
+
+  test('registra la baja en LoyaltyCardAuditLog', async () => {
+    const existente = card({ id: 35, activa: true });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({ evento: 'baja', koreClienteId: 'K35' });
+
+    expect(LoyaltyCardAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      cardId: 35,
+      accion: 'webhook_kore_baja',
+      origen: 'kore',
+      cambios: { activa: { antes: true, despues: false } },
+    }));
   });
 
   test('baja sin telefono (solo koreClienteId) es válida', async () => {

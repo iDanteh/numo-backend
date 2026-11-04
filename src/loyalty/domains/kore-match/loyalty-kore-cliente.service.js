@@ -26,6 +26,7 @@ const { crearTarjeta } = require('../cards/loyalty-card.service');
 // de match (loyalty-kore-match.service.js) para `tarjetaLegada` — reusada acá para que el webhook
 // y esas dos vías nunca puedan dejar el campo con un formato distinto entre sí.
 const { normalizarTarjeta } = require('../import/loyalty-import.parser');
+const { registrarCambioTarjeta } = require('../cards/loyalty-card-audit.service');
 
 const EVENTOS_VALIDOS = ['alta', 'actualizacion', 'baja'];
 
@@ -65,6 +66,12 @@ async function _buscarCard({ koreClienteId, telefono }) {
 }
 
 async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada }) {
+  // Snapshot ANTES de armar `updates`/llamar a `.update()` — ver docstring de
+  // `registrarCambioTarjeta` sobre por qué esto tiene que pasar en este orden.
+  const antes = {
+    koreClienteId: card.koreClienteId, nombre: card.nombre, telefono: card.telefono,
+    activa: card.activa, tarjetaLegada: card.tarjetaLegada,
+  };
   const updates = {
     updatedById:     ACTOR_WEBHOOK.dbId,
     updatedByNombre: ACTOR_WEBHOOK.nombre,
@@ -95,6 +102,14 @@ async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, ac
     }
     throw err;
   }
+
+  // `updatedById`/`updatedByNombre` son metadata de quién hizo el cambio, no un dato de
+  // catálogo en sí — se excluyen del diff para no generar una fila falsa "cambió" en cada
+  // actualización aunque ningún campo de negocio se haya tocado de verdad.
+  const { updatedById, updatedByNombre, ...despues } = updates;
+  await registrarCambioTarjeta({
+    cardId: card.id, antes, despues, accion: 'webhook_kore_actualizacion', origen: 'kore',
+  });
 
   return { ok: true, evento: 'actualizacion', cardId: card.id, creada: false };
 }
@@ -141,11 +156,17 @@ async function _procesarBaja({ koreClienteId, telefono }) {
   const card = await _buscarCard({ koreClienteId, telefono });
   if (!card) throw new NotFoundError('Tarjeta (no se encontró por koreClienteId ni teléfono)');
 
+  const antes = { activa: card.activa };
+
   // Nunca se borra el registro — hay saldo de puntos real detrás de la tarjeta.
   await card.update({
     activa:          false,
     updatedById:     ACTOR_WEBHOOK.dbId,
     updatedByNombre: ACTOR_WEBHOOK.nombre,
+  });
+
+  await registrarCambioTarjeta({
+    cardId: card.id, antes, despues: { activa: false }, accion: 'webhook_kore_baja', origen: 'kore',
   });
 
   return { ok: true, evento: 'baja', cardId: card.id };

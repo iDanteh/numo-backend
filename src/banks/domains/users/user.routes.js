@@ -5,6 +5,10 @@ const { authenticate, permit } = require('../../shared/middleware/auth.real');
 const { asyncHandler }         = require('../../shared/middleware/error-handler');
 const userSvc = require('./user.service');
 const roleSvc = require('./role.service');
+const userRepo = require('./repositories/user.repository');
+const rbacStore = require('../../../shared/services/rbac-store');
+// Permisos que solo un administrador puede dar o quitar (2026-11-04, "Fichas de efectivo").
+const { exigirAdminSiCambia } = require('./permisos-solo-admin');
 
 const router = express.Router();
 
@@ -19,12 +23,16 @@ router.get('/roles', authenticate,
 
 router.post('/roles', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
+    await exigirAdminSiCambia(req.user, [], req.body?.permissions);
     res.status(201).json(await roleSvc.createRole(req.body));
   }),
 );
 
 router.patch('/roles/:value', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
+    if (req.body?.permissions !== undefined) {
+      await exigirAdminSiCambia(req.user, await rbacStore.getPermissions(req.params.value), req.body.permissions);
+    }
     res.json(await roleSvc.updateRole(req.params.value, req.body));
   }),
 );
@@ -54,6 +62,7 @@ router.post('/permissions', authenticate, permit('users:manage'),
 // :key contiene ":" (ej: banks:read) — Express lo maneja correctamente
 router.delete('/permissions/:key', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
+    await exigirAdminSiCambia(req.user, [req.params.key], []);
     await roleSvc.deletePermission(req.params.key);
     res.json({ message: 'Permiso eliminado correctamente.' });
   }),
@@ -95,6 +104,11 @@ router.get('/', authenticate, permit('users:manage'),
 
 router.patch('/:id/role', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
+    // Cambiar a / desde un rol que trae un permiso exclusivo de admin también lo da / quita.
+    const actual = await userRepo.findById(req.params.id);
+    if (actual) {
+      await exigirAdminSiCambia(req.user, await rbacStore.getPermissions(actual.role), await rbacStore.getPermissions(req.body?.role));
+    }
     res.json(await userSvc.updateRole(req.params.id, req.body.role));
   }),
 );
@@ -112,6 +126,8 @@ router.patch('/:id/empresas', authenticate, permit('users:manage'),
 // Body: { extraPermissions: string[] } — reemplaza la lista completa ([] = ninguno extra).
 router.patch('/:id/permissions', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
+    const actual = await userRepo.findById(req.params.id);
+    if (actual) await exigirAdminSiCambia(req.user, actual.extraPermissions ?? [], req.body?.extraPermissions ?? []);
     res.json(await userSvc.updateExtraPermissions(req.params.id, req.body.extraPermissions));
   }),
 );

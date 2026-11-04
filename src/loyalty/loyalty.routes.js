@@ -22,6 +22,7 @@ const { PERMISSIONS } = require('../shared/config/rbac');
 const cardService = require('./domains/cards/loyalty-card.service');
 const ledgerService = require('./domains/ledger/loyalty-ledger.service');
 const configService = require('./domains/config/loyalty-config.service');
+const congelamientoService = require('./jobs/congelamiento-puntos.service');
 
 const router = express.Router();
 
@@ -70,6 +71,17 @@ router.post('/cards', authenticate, permit(PERMISSIONS.LOYALTY_TARJETAS_CREAR), 
 router.get('/cards/pendientes-revision-kore', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
   const { page, limit, search } = req.query;
   res.json(await cardService.listarPendientesRevisionKore({ page, limit, search }));
+}));
+
+// Reporte "Puntos por vencer" (2026-11-03) — tarjetas a `dias` o menos de llegar a la fecha límite
+// de congelamiento por inactividad (ver congelamiento-puntos.service.js#tarjetasPorVencer). Ruta
+// estática antes de 'GET /cards/:id' por el mismo criterio que pendientes-revision-kore arriba.
+router.get('/cards/por-vencer', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  const dias = req.query.dias !== undefined ? Number(req.query.dias) : undefined;
+  const tarjetas = await congelamientoService.tarjetasPorVencer(
+    dias !== undefined ? { diasVentana: dias } : {},
+  );
+  res.json({ tarjetas });
 }));
 
 router.get('/cards/:id/movimientos', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {

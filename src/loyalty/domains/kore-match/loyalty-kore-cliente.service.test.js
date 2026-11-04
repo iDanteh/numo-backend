@@ -181,6 +181,54 @@ describe('procesarClienteKore — evento actualizacion', () => {
     expect(updates).not.toHaveProperty('nivel');
     expect(updates).not.toHaveProperty('saldoPuntos');
   });
+
+  // `activo` (2026-11-03, pedido explícito del usuario): reactiva una tarjeta que un `baja`
+  // anterior dejó en activa:false — antes NINGÚN evento podía revertir eso.
+  test('activo:true reactiva una tarjeta que estaba dada de baja', async () => {
+    const existente = card({ id: 24, activa: false });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    const resultado = await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K24', telefono: '5551234567', nombre: 'X', activo: true,
+    });
+
+    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ activa: true }));
+    expect(resultado).toEqual({ ok: true, evento: 'actualizacion', cardId: 24, creada: false });
+  });
+
+  test('activo:false desactiva una tarjeta (mismo efecto que un evento baja, vía actualizacion)', async () => {
+    const existente = card({ id: 25, activa: true });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K25', telefono: '5551234567', nombre: 'X', activo: false,
+    });
+
+    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ activa: false }));
+  });
+
+  test('sin activo en el payload -> no toca activa (deja el valor que ya tenía la tarjeta)', async () => {
+    const existente = card({ id: 26, activa: false });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({ evento: 'actualizacion', koreClienteId: 'K26', telefono: '5551234567', nombre: 'X' });
+
+    const updates = existente.update.mock.calls[0][0];
+    expect(updates).not.toHaveProperty('activa');
+  });
+
+  test('un alta sobre tarjeta existente (cae a actualización) NUNCA toca activa, aunque el payload traiga activo', async () => {
+    const existente = card({ id: 27, activa: false });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    // 'alta' no desestructura `activo` del payload — este test documenta esa exclusión a propósito.
+    await procesarClienteKore({
+      evento: 'alta', koreClienteId: 'K27', telefono: '5551234567', nombre: 'X', activo: true,
+    });
+
+    const updates = existente.update.mock.calls[0][0];
+    expect(updates).not.toHaveProperty('activa');
+  });
 });
 
 describe('procesarClienteKore — evento baja', () => {

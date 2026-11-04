@@ -23,13 +23,19 @@ jest.mock('../domains/ledger/loyalty-ledger.service', () => ({
 const { LoyaltyCard, LoyaltyPointsLedger, LoyaltyAdjustmentReason } = require('../../shared/models/postgres');
 const configService = require('../domains/config/loyalty-config.service');
 const ledgerService = require('../domains/ledger/loyalty-ledger.service');
-const { congelarTarjetasInactivas } = require('./congelamiento-puntos.service');
+const { congelarTarjetasInactivas, tarjetasPorVencer } = require('./congelamiento-puntos.service');
 
 const REASON = { id: 99, clave: 'congelamiento_inactividad', activo: true };
 
 function haceMeses(meses) {
   const d = new Date();
   d.setMonth(d.getMonth() - meses);
+  return d;
+}
+
+function haceDias(dias) {
+  const d = new Date();
+  d.setDate(d.getDate() - dias);
   return d;
 }
 
@@ -127,5 +133,82 @@ describe('congelarTarjetasInactivas', () => {
     expect(ledgerService.registrarAjuste).toHaveBeenCalledTimes(2);
     expect(resultado.errores).toBe(1);
     expect(resultado.congeladas).toBe(1);
+  });
+});
+
+describe('tarjetasPorVencer', () => {
+  test('config deshabilitada/no seteada (null) → reporte vacío sin consultar tarjetas', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(null);
+
+    const resultado = await tarjetasPorVencer();
+
+    expect(resultado).toEqual([]);
+    expect(LoyaltyCard.findAll).not.toHaveBeenCalled();
+  });
+
+  test('tarjeta sin ninguna ACUMULACION registrada nunca → no aparece', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(1);
+    LoyaltyCard.findAll.mockResolvedValue([{ id: 13, telefono: '555', nombre: 'X', nivel: 'Bronce', saldoPuntos: '50.00' }]);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([]);
+
+    const resultado = await tarjetasPorVencer();
+
+    expect(resultado).toEqual([]);
+  });
+
+  test('fecha límite dentro de la ventana (default 30 días) → aparece con fechaLimite y diasRestantes', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(1); // ~30 días de umbral
+    LoyaltyCard.findAll.mockResolvedValue([
+      { id: 10, telefono: '5551234567', nombre: 'Ana', nivel: 'Bronce', saldoPuntos: '50.00' },
+    ]);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { cardId: 10, ultimaAcumulacion: haceDias(20) }, // límite ≈ hoy + 10 días
+    ]);
+
+    const resultado = await tarjetasPorVencer();
+
+    expect(resultado).toHaveLength(1);
+    expect(resultado[0]).toMatchObject({ id: 10, telefono: '5551234567', nombre: 'Ana', nivel: 'Bronce', saldoPuntos: 50 });
+    expect(resultado[0].fechaLimite).toEqual(expect.any(String));
+    expect(resultado[0].diasRestantes).toBeGreaterThan(0);
+    expect(resultado[0].diasRestantes).toBeLessThanOrEqual(30);
+  });
+
+  test('fecha límite ya pasada → no aparece (ya venció, no es "por vencer")', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(1);
+    LoyaltyCard.findAll.mockResolvedValue([{ id: 11, saldoPuntos: '50.00' }]);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { cardId: 11, ultimaAcumulacion: haceMeses(5) },
+    ]);
+
+    const resultado = await tarjetasPorVencer();
+
+    expect(resultado).toEqual([]);
+  });
+
+  test('fecha límite fuera de la ventana pedida → no aparece', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(3); // ~90 días de umbral
+    LoyaltyCard.findAll.mockResolvedValue([{ id: 12, saldoPuntos: '50.00' }]);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { cardId: 12, ultimaAcumulacion: haceDias(5) }, // límite ≈ hoy + 3 meses, muy fuera de 30 días
+    ]);
+
+    const resultado = await tarjetasPorVencer();
+
+    expect(resultado).toEqual([]);
+  });
+
+  test('diasVentana custom se respeta', async () => {
+    configService.obtenerCongelamientoMeses.mockResolvedValue(1);
+    LoyaltyCard.findAll.mockResolvedValue([{ id: 14, saldoPuntos: '50.00' }]);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([
+      { cardId: 14, ultimaAcumulacion: haceDias(20) }, // límite ≈ hoy + 10 días
+    ]);
+
+    const conVentanaChica = await tarjetasPorVencer({ diasVentana: 5 });
+    expect(conVentanaChica).toEqual([]);
+
+    const conVentanaAmplia = await tarjetasPorVencer({ diasVentana: 15 });
+    expect(conVentanaAmplia).toHaveLength(1);
   });
 });

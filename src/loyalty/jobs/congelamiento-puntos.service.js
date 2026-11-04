@@ -46,6 +46,14 @@ function _restarMeses(fecha, meses) {
   return d;
 }
 
+// Inverso de _restarMeses — usado por tarjetasPorVencer() para proyectar la fecha límite de
+// congelamiento hacia ADELANTE desde la última acumulación (en vez de hacia atrás desde hoy).
+function _sumarMeses(fecha, meses) {
+  const d = new Date(fecha);
+  d.setMonth(d.getMonth() + meses);
+  return d;
+}
+
 /**
  * Mapa cardId → fecha de la ACUMULACIÓN más reciente, en UNA sola query agregada (GROUP BY) —
  * nunca N+1 contra loyalty_points_ledger. Una tarjeta sin ninguna fila ACUMULACION simplemente no
@@ -128,4 +136,52 @@ async function congelarTarjetasInactivas() {
   return { deshabilitado: false, evaluadas: tarjetas.length, congeladas, errores };
 }
 
-module.exports = { congelarTarjetasInactivas };
+/**
+ * "Puntos por vencer" (2026-11-03, reporte de Lealtad) — tarjetas con saldo > 0 cuya fecha límite
+ * de congelamiento (última ACUMULACIÓN real + `CONGELAMIENTO_MESES`) cae dentro de los próximos
+ * `diasVentana` días. Reusa LA MISMA query agregada de última acumulación que
+ * `congelarTarjetasInactivas()` — nunca se duplica esa lógica (pedido explícito del prompt).
+ *
+ * Mismo criterio que el job de congelamiento:
+ *   - Sin `CONGELAMIENTO_MESES` configurado (o en 0) → sin umbral del cual contar, reporte vacío.
+ *   - Tarjeta sin ninguna ACUMULACIÓN real nunca entra (no hay fecha contra qué proyectar).
+ *   - Tarjeta cuya fecha límite ya pasó (debería estar congelada en la próxima corrida del job,
+ *     o la corrida de hoy ya la tocó) NO es "por vencer" — ya venció o está por vencer HOY mismo
+ *     en la corrida del cron, no es información accionable de anticipación.
+ */
+async function tarjetasPorVencer({ diasVentana = 30 } = {}) {
+  const meses = await configService.obtenerCongelamientoMeses();
+  if (!meses) return [];
+
+  const tarjetas = await LoyaltyCard.findAll({ where: { saldoPuntos: { [Op.gt]: 0 } } });
+  if (!tarjetas.length) return [];
+
+  const ultimasAcumulaciones = await _ultimasAcumulacionesPorTarjeta(tarjetas.map((t) => t.id));
+  const ahora = new Date();
+  const limiteVentana = new Date(ahora.getTime() + diasVentana * 24 * 60 * 60 * 1000);
+  const msPorDia = 24 * 60 * 60 * 1000;
+
+  const resultado = [];
+  for (const tarjeta of tarjetas) {
+    const ultimaAcumulacion = ultimasAcumulaciones.get(tarjeta.id);
+    if (!ultimaAcumulacion) continue; // nunca tuvo una ACUMULACIÓN real → mismo criterio que el job
+
+    const fechaLimite = _sumarMeses(new Date(ultimaAcumulacion), meses);
+    if (fechaLimite <= ahora) continue;          // ya venció (o vence hoy) — no es "por vencer"
+    if (fechaLimite > limiteVentana) continue;   // fuera de la ventana pedida
+
+    resultado.push({
+      id:            tarjeta.id,
+      telefono:      tarjeta.telefono,
+      nombre:        tarjeta.nombre,
+      nivel:         tarjeta.nivel,
+      saldoPuntos:   Number(tarjeta.saldoPuntos),
+      fechaLimite:   fechaLimite.toISOString(),
+      diasRestantes: Math.ceil((fechaLimite.getTime() - ahora.getTime()) / msPorDia),
+    });
+  }
+
+  return resultado;
+}
+
+module.exports = { congelarTarjetasInactivas, tarjetasPorVencer };

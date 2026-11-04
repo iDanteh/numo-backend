@@ -23,7 +23,7 @@ const { procesarClienteKore } = require('./loyalty-kore-cliente.service');
 function card(overrides = {}) {
   return {
     id: 1, telefono: '5551234567', nombre: 'CLIENTE', koreClienteId: null, koreMonedero: null,
-    activa: true,
+    activa: true, tarjetaLegada: null,
     update: jest.fn(async function update(changes) { Object.assign(this, changes); }),
     ...overrides,
   };
@@ -228,6 +228,67 @@ describe('procesarClienteKore — evento actualizacion', () => {
 
     const updates = existente.update.mock.calls[0][0];
     expect(updates).not.toHaveProperty('activa');
+  });
+
+  // `tarjetaLegada` (gap real cerrado): un cliente ya matcheado que cambia de número de
+  // tarjeta/monedero en Kore ahora sí se actualiza del lado de Numo vía este evento.
+  test('tarjetaLegada: actualiza el número de tarjeta normalizado', async () => {
+    const existente = card({ id: 28, tarjetaLegada: '44' });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    const resultado = await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K28', telefono: '5551234567', nombre: 'X', tarjetaLegada: '0098765432',
+    });
+
+    // normalizarTarjeta() quita ceros a la izquierda de valores puramente numéricos.
+    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ tarjetaLegada: '98765432' }));
+    expect(resultado).toEqual({ ok: true, evento: 'actualizacion', cardId: 28, creada: false });
+  });
+
+  test('tarjetaLegada con formato "CF-": se normaliza igual que en el import/match', async () => {
+    const existente = card({ id: 29 });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K29', telefono: '5551234567', nombre: 'X', tarjetaLegada: 'CF 2221',
+    });
+
+    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ tarjetaLegada: 'CF-2221' }));
+  });
+
+  test('sin tarjetaLegada en el payload -> no toca el campo (deja el valor que ya tenía la tarjeta)', async () => {
+    const existente = card({ id: 30, tarjetaLegada: '5' });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({ evento: 'actualizacion', koreClienteId: 'K30', telefono: '5551234567', nombre: 'X' });
+
+    const updates = existente.update.mock.calls[0][0];
+    expect(updates).not.toHaveProperty('tarjetaLegada');
+  });
+
+  test('tarjetaLegada vacío -> no borra el valor existente', async () => {
+    const existente = card({ id: 31, tarjetaLegada: '5' });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K31', telefono: '5551234567', nombre: 'X', tarjetaLegada: '   ',
+    });
+
+    const updates = existente.update.mock.calls[0][0];
+    expect(updates).not.toHaveProperty('tarjetaLegada');
+  });
+
+  test('un alta sobre tarjeta existente (cae a actualización) NUNCA toca tarjetaLegada, aunque el payload lo traiga', async () => {
+    const existente = card({ id: 32, tarjetaLegada: '7' });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    // 'alta' no desestructura `tarjetaLegada` del payload — mismo criterio que `activo`.
+    await procesarClienteKore({
+      evento: 'alta', koreClienteId: 'K32', telefono: '5551234567', nombre: 'X', tarjetaLegada: '999',
+    });
+
+    const updates = existente.update.mock.calls[0][0];
+    expect(updates).not.toHaveProperty('tarjetaLegada');
   });
 });
 

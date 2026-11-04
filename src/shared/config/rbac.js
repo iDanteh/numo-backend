@@ -160,6 +160,12 @@ const PERMISSIONS = Object.freeze({
   // quien lo tenga puede ver la vista, generar, descargar y eliminar. Sin rol
   // asignado de inicio (admin lo tiene por '*'); se asigna desde Usuarios y Roles.
   REPORTES_POR_FACTURAR: 'reportes:por-facturar',
+
+  // Fichas de efectivo (Reportes, 2026-11-04, ver reportes-por-facturar.fichas.js) —
+  // efectivo de la caja del día por sucursal. Permiso propio que SOLO un administrador
+  // puede dar o quitar (pedido del usuario): ver users/permisos-solo-admin.js. Sin rol
+  // asignado de inicio (admin lo tiene por '*').
+  REPORTES_FICHAS_EFECTIVO: 'reportes:fichas-efectivo',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

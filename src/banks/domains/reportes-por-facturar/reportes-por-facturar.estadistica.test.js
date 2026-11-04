@@ -75,6 +75,13 @@ test('había / facturados / faltan, por almacén y día a día', async () => {
   expect(r.advertencias).toBeNull();
 });
 
+test('FALTAN: solo las remisiones que todavía no tienen factura (cliente y saldo de esas)', async () => {
+  BankMovement.find.mockReturnValue(lean([dep('005240', '2026-10-20', 66128.39, [link('A0', '1'), link('A0', '2')])]));
+  const r = await est.calcular({ rfc: 'CCO011113663', fechaInicio: '2026-10-20', fechaFin: '2026-10-22' });
+  expect(r.depositos).toHaveLength(1);
+  expect(r.depositos[0]).toMatchObject({ estado: 'falta', remisiones: ['A0-2'], cliente: 'CLIENTE A02', facturas: [], saldo: 120.5, importe: 66128.39 });
+});
+
 test('sucursal elegida: solo sus series', async () => {
   const r = await est.calcular({ rfc: 'CCO011113663', centroCostoId: 2, fechaInicio: '2026-10-20', fechaFin: '2026-10-22' });
   expect(BankMovement.find.mock.calls[0][0]['erpLinks.serie']).toEqual({ $in: ['I0'] });

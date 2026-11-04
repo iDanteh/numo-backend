@@ -183,7 +183,11 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
       ? cfdis.map(f => (f.cfdi?.fecha ? _diaMx(f.cfdi.fecha) : null)).filter(Boolean).sort().pop() ?? null
       : null;
     const tipos = new Set(cfdis.map(f => ((f.cfdi?.receptor?.rfc ?? '').trim().toUpperCase() === RFC_PUBLICO_GENERAL ? 'global' : 'cliente')));
-    const saldo = _r2(unicas.reduce((s, l) => s + (Number(cuentaKore.get(_clave(l))?.saldoActual) || 0), 0));
+    // En FALTAN solo las remisiones que todavía no tienen factura (2026-11-04,
+    // pedido del usuario, caso depósito 005240: A0-260203053 ya facturada pero
+    // el depósito seguía por A0-260300603). Cliente y saldo, de esas mismas.
+    const mostrar = facturado ? unicas : unicas.filter(l => !facturaDe(_clave(l)));
+    const saldo = _r2(mostrar.reduce((s, l) => s + (Number(cuentaKore.get(_clave(l))?.saldoActual) || 0), 0));
     const serie = _serie(unicas[0]);
     return {
       idNumo:      b.folio ?? '',
@@ -196,10 +200,10 @@ async function calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance 
       aplicado:    _r2(links.reduce((s, l) => s + (Number(l.saldoPagado ?? l.saldoPagadoTotal) || 0), 0)),
       serie,
       sucursal:    sucursalDe.get(serie) ?? null,
-      remisiones:  unicas.map(l => `${_serie(l)}-${String(l.folioExterno).trim()}`),
-      cliente:     [...new Set(unicas.map(l => cuentaKore.get(_clave(l))?.nombre).filter(Boolean))].join(' / '),
+      remisiones:  mostrar.map(l => `${_serie(l)}-${String(l.folioExterno).trim()}`),
+      cliente:     [...new Set(mostrar.map(l => cuentaKore.get(_clave(l))?.nombre).filter(Boolean))].join(' / '),
       estado:      facturado ? 'facturado' : 'falta',
-      facturas:    cfdis.map(f => f.folio),
+      facturas:    facturado ? cfdis.map(f => f.folio) : [],
       tipoFactura: facturado ? (tipos.size > 1 ? 'mixto' : [...tipos][0] ?? null) : null,
       fechaFactura,
       // Factura anterior a la entrada (se facturó antes de identificar el depósito) → 0.

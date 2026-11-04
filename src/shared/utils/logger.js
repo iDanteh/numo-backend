@@ -22,7 +22,13 @@ const logFormat = printf((info) => {
         .map(a => (a instanceof Error ? a.stack : typeof a === 'object' ? JSON.stringify(a) : String(a)))
         .join(' ')
     : '';
-  return `${ts} [${level}]: ${stack || message}${extra}`;
+  // Bug real encontrado 2026-11-04 (import de clientes con error sin mensaje legible): `stack ||
+  // message` descartaba el mensaje SIEMPRE que hubiera un `.stack` adjunto (prácticamente todos los
+  // `logger.error(err)`), incluso cuando ese stack no incluye el mensaje real (ej. Sequelize
+  // reemplaza `.stack` por uno genérico capturado antes de ejecutar la query). Ahora el mensaje
+  // siempre se imprime, y el stack se agrega debajo como detalle adicional.
+  const stackSuffix = stack ? `\n${stack}` : '';
+  return `${ts} [${level}]: ${message}${extra}${stackSuffix}`;
 });
 
 const logger = winston.createLogger({

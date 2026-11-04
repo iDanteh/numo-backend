@@ -263,17 +263,3 @@ test('refacturada: encabezado con las otras facturas de sus mismas remisiones', 
   const ws = wb.worksheets.find(w => w.name.startsWith('MOSTRADOR A0'));
   expect(ws.getRow(1).getCell(2).value).toBe('TAMBIÉN FACTURADA EN: A0-261015291, A0-261015312');
 });
-
-// 2026-11-03 ("¿por qué lo separa de hoja?"): el abono en efectivo sin ligar
-// (sin REM) va en la hoja del almacén de su remisión de Kore, junto al cliente.
-test('abono en efectivo sin ligar: misma hoja (almacén) y grupo que su remisión', () => {
-  const { armarSecciones } = require('./reportes-por-facturar.secciones');
-  const s = armarSecciones({ depositosPendientesFactura: [
-    { fecha: '2026-09-03T12:00:00Z', descripcion: 'DEPOSITO EN EFECTIVO', importe: 2000, banco: 'BBVA', remisiones: ['A0-260702030'], cliente: 'ANGELA GONZALEZ GARCIA', idNumo: '044626' },
-    { fecha: '2026-09-14T15:55:41Z', descripcion: 'ABONO EN EFECTIVO EN CAJA A0 (ABO-260914220)', importe: 2000.73, banco: 'EFECTIVO', remisiones: [], cliente: '',
-      grupoCliente: 'ANGELA GONZALEZ GARCIA', sinLigar: true, deKore: true, remisionKore: 'A0-260702030', idNumo: 'S/R' },
-  ] });
-  expect(s.mostrador.map(a => a.serie)).toEqual(['A0']);
-  const [grupo] = s.mostrador[0].bloques[0].grupos;
-  expect([grupo.cliente, grupo.depositos.map(d => d.idNumo), grupo.total]).toEqual(['ANGELA GONZALEZ GARCIA', ['044626', 'S/R'], 4000.73]);
-});

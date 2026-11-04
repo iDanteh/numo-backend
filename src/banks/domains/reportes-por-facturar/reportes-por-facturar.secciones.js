@@ -46,16 +46,13 @@ const _folio = f => `${f.serie ?? ''}-${f.folio ?? ''}`;
 const _diaMx = f => (f ? new Date(new Date(f).getTime() - 6 * 3600000).toISOString().slice(0, 10) : null);
 const _suma = ds => _r2(ds.reduce((s, d) => s + (Number(d.importe) || 0), 0));
 // Almacén (serie A0, I0…) de un depósito: el de su remisión; sin remisión, el de la factura.
-// Abono en efectivo sin ligar (2026-11-03, "¿por qué lo separa de hoja?"): no
-// trae REM, va en el almacén de la remisión de Kore (remisionKore).
-const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0] ?? d.remisionKore ?? '').split('-')[0]) || _serie(serieFactura);
+const _serieDeposito = (d, serieFactura = '') => _serie(String(d.remisiones?.[0] ?? '').split('-')[0]) || _serie(serieFactura);
 
 /** Depósitos agrupados por cliente: alfabético, "CLIENTE NO IDENTIFICADO" al final. */
 function agruparPorCliente(depositos) {
   const porCliente = new Map();
   for (const d of depositos) {
-    // Abono en efectivo sin ligar (2026-11-03): en el grupo del cliente de su remisión.
-    const c = d.grupoCliente || d.cliente || NO_IDENTIFICADO;
+    const c = d.cliente || NO_IDENTIFICADO;
     if (!porCliente.has(c)) porCliente.set(c, []);
     porCliente.get(c).push(d);
   }
@@ -89,13 +86,9 @@ function formaPagoDe(d) {
   if (!presentes.length) return { texto: '—', partes: {} };
   const suma = presentes.reduce((s, f) => s + Number(montos[f]), 0);
   const partes = Object.fromEntries(presentes.map(f => [f, _r2(importe * Number(montos[f]) / suma)]));
-  // El texto puede venir de las formas completas (2026-11-03: depósito ligado
-  // cuyo abono en efectivo sale aparte → sigue diciendo MIXTO).
-  const montosTexto = d.formasPagoTexto ?? montos;
-  const enTexto = FORMAS.map(([f]) => f).filter(f => (Number(montosTexto?.[f]) || 0) > 0.005);
-  const texto = enTexto.length === 1
-    ? ETIQUETA_FORMA[enTexto[0]]
-    : `MIXTO: ${enTexto.map(f => `${ETIQUETA_FORMA[f]} ${_dinero(montosTexto[f])}`).join(' + ')}`;
+  const texto = presentes.length === 1
+    ? ETIQUETA_FORMA[presentes[0]]
+    : `MIXTO: ${presentes.map(f => `${ETIQUETA_FORMA[f]} ${_dinero(montos[f])}`).join(' + ')}`;
   return { texto, partes };
 }
 
@@ -307,8 +300,6 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
 }
 
 const _rem = d => (d.remisiones ?? []).join('\n');
-// Sin ligar en Bancos (2026-11-03): sin cliente en el renglón.
-const _cliente = d => (d.sinLigar ? '' : d.cliente || NO_IDENTIFICADO);
 
 // Al final de cada hoja: TOTAL EFECTIVO y, aparte, TOTAL DEPÓSITO EN EFECTIVO
 // (y las demás formas que haya).
@@ -338,7 +329,7 @@ function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.ho
       columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', 'CLIENTE', null],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), _cliente(d), d.idNumo],
+      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.cliente || NO_IDENTIFICADO, d.idNumo],
     });
   }
   _totalesFormaPago(ws, bloques);
@@ -391,7 +382,7 @@ function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
     columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'CLIENTE', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
     grupos: bloque.grupos,
     total: bloque.total,
-    fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _cliente(d), _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
+    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, d.cliente || NO_IDENTIFICADO, _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
   });
   ws.mergeCells(1, 1, 1, 10);
   ws.eachRow(row => { if (typeof row.getCell(8).value === 'number') row.getCell(8).numFmt = DINERO; });

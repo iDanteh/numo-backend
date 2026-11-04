@@ -203,6 +203,12 @@ const PERMISSIONS = Object.freeze({
   // asignado de inicio (admin lo tiene por '*'); se asigna desde Usuarios y Roles.
   REPORTES_POR_FACTURAR: 'reportes:por-facturar',
 
+  // Fichas de efectivo (Reportes, 2026-11-04, ver reportes-por-facturar.fichas.js) —
+  // efectivo de la caja del día por sucursal. Permiso propio que SOLO un administrador
+  // puede dar o quitar (pedido del usuario): ver users/permisos-solo-admin.js. Sin rol
+  // asignado de inicio (admin lo tiene por '*').
+  REPORTES_FICHAS_EFECTIVO: 'reportes:fichas-efectivo',
+
   // Sistema de Lealtad (ver src/loyalty/) — ocho permisos finos, cada uno gatea
   // SOLO su propia acción (openspec/changes/sistema-lealtad/specs/loyalty-permissions).
   // El split sigue el riesgo: trabajo rutinario de mostrador (crear, editar, acumular,

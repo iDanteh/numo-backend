@@ -6,6 +6,7 @@ const { authenticate, permit } = require('../../shared/middleware/auth.real');
 const { asyncHandler }         = require('../../shared/middleware/error-handler');
 const service                  = require('./reportes-por-facturar.service');
 const estadistica              = require('./reportes-por-facturar.estadistica');
+const fichas                   = require('./reportes-por-facturar.fichas');
 
 const router = express.Router();
 
@@ -66,6 +67,22 @@ router.get('/estadistica/:id/excel', authenticate, permit(PERM), asyncHandler(as
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(Buffer.from(buffer));
+}));
+
+// ── Fichas de efectivo (2026-11-04) — antes de /:id ──────────────────────────
+// Permiso propio que solo un administrador puede asignar (rbac.js REPORTES_FICHAS_EFECTIVO).
+const PERM_FICHAS = 'reportes:fichas-efectivo';
+
+// GET /api/reportes-por-facturar/fichas/globales?rfc=&centroCostoId=&fechaInicio=&fechaFin= → facturas globales del periodo
+router.get('/fichas/globales', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  const { rfc, centroCostoId, fechaInicio, fechaFin } = req.query;
+  res.json(await fichas.listarGlobales({ rfc, centroCostoId: centroCostoId || null, fechaInicio, fechaFin }));
+}));
+
+// POST /api/reportes-por-facturar/fichas { rfc, uuids: [...] } → efectivo de la caja de cada sucursal / día elegidos y la suma
+router.post('/fichas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  const { rfc, uuids } = req.body ?? {};
+  res.json(await fichas.calcularFicha({ rfc, uuids }));
 }));
 
 // GET /api/reportes-por-facturar/:id — reporte con sus tablas

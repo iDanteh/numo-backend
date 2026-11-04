@@ -22,6 +22,10 @@ const { LoyaltyCard } = require('../../../shared/models/postgres');
 const { BadRequestError, ConflictError, NotFoundError } = require('../../../shared/errors/AppError');
 const { normalizarTelefono } = require('../../shared/puntos.util');
 const { crearTarjeta } = require('../cards/loyalty-card.service');
+// Misma normalización que usa el import de migración (loyalty-import-apply.service.js) y el job
+// de match (loyalty-kore-match.service.js) para `tarjetaLegada` — reusada acá para que el webhook
+// y esas dos vías nunca puedan dejar el campo con un formato distinto entre sí.
+const { normalizarTarjeta } = require('../import/loyalty-import.parser');
 
 const EVENTOS_VALIDOS = ['alta', 'actualizacion', 'baja'];
 
@@ -60,7 +64,7 @@ async function _buscarCard({ koreClienteId, telefono }) {
   return null;
 }
 
-async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo }) {
+async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada }) {
   const updates = {
     updatedById:     ACTOR_WEBHOOK.dbId,
     updatedByNombre: ACTOR_WEBHOOK.nombre,
@@ -73,6 +77,15 @@ async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, ac
   // encontrado al responder una pregunta del usuario sobre reactivación de monedero en Kore).
   // Opcional: si Kore no lo manda, `activa` queda intacta (mismo criterio que nombre/telefono).
   if (activo !== undefined) updates.activa = Boolean(activo);
+  // `tarjetaLegada` (gap real cerrado): antes de esto, el número de tarjeta/monedero de un
+  // cliente YA matcheado nunca se actualizaba — `tarjetaLegada` solo se setea una vez, en el
+  // match inicial (loyalty-kore-match.service.js) o en el import de migración. Si Kore manda este
+  // evento con un número nuevo, ahora se persiste acá — mismo `normalizarTarjeta()` que usan esas
+  // otras dos vías, para que el formato nunca diverja entre ellas. String vacío se trata igual que
+  // "no vino" (no borra el valor existente) — un evento real siempre trae un número real.
+  if (tarjetaLegada !== undefined && String(tarjetaLegada).trim()) {
+    updates.tarjetaLegada = normalizarTarjeta(tarjetaLegada);
+  }
 
   try {
     await card.update(updates);
@@ -118,10 +131,10 @@ async function _procesarAlta({ koreClienteId, telefono, nombre }) {
   return { ok: true, evento: 'alta', cardId: card.id, creada: true };
 }
 
-async function _procesarActualizacion({ koreClienteId, telefono, nombre, activo }) {
+async function _procesarActualizacion({ koreClienteId, telefono, nombre, activo, tarjetaLegada }) {
   const card = await _buscarCard({ koreClienteId, telefono });
   if (!card) throw new NotFoundError('Tarjeta (no se encontró por koreClienteId ni teléfono)');
-  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo });
+  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada });
 }
 
 async function _procesarBaja({ koreClienteId, telefono }) {
@@ -146,9 +159,12 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * `activo` (2026-11-03): SOLO se lee/aplica en 'actualizacion' — a propósito, no en 'alta'
  * (una tarjeta recién creada siempre nace activa, reactivar es un caso de "ya existe y
  * estaba dada de baja", no de alta) ni en 'baja' (ya tiene su propio camino fijo a false).
+ * `tarjetaLegada`: mismo criterio que `activo` — SOLO 'actualizacion' lo lee. Una 'alta' siempre
+ * crea la tarjeta sin este dato (lo trae después el match inicial o un `actualizacion` posterior),
+ * y 'baja' no tiene nada que ver con el número de tarjeta.
  */
 async function procesarClienteKore(payload) {
-  const { evento, telefono, nombre, activo } = payload ?? {};
+  const { evento, telefono, nombre, activo, tarjetaLegada } = payload ?? {};
 
   if (!EVENTOS_VALIDOS.includes(evento)) {
     throw new BadRequestError(`evento inválido: "${evento}". Debe ser uno de: ${EVENTOS_VALIDOS.join(', ')}.`);
@@ -169,7 +185,9 @@ async function procesarClienteKore(payload) {
   if (evento === 'alta') {
     return _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre });
   }
-  return _procesarActualizacion({ koreClienteId, telefono: telefonoNorm, nombre, activo });
+  return _procesarActualizacion({
+    koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada,
+  });
 }
 
 module.exports = { procesarClienteKore };

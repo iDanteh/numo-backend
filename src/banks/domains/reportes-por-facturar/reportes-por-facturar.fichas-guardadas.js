@@ -20,6 +20,39 @@ const { BadRequestError, NotFoundError, ConflictError, ForbiddenError } = requir
 const TOLERANCIA = 1;
 const VALORES = { Billete: [1000, 500, 200, 100, 50, 20], Moneda: [20, 10, 5, 2, 1, 0.5, 0.2, 0.1, 0.05] };
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+/**
+ * Folio de 5 dígitos = MES (2) + CONSECUTIVO DEL MES (3) — 2026-11-05, decisión
+ * del usuario: noviembre 11001, 11002…; diciembre 12001…; enero 01001…
+ * Hasta 999 fichas por mes. Con 5 dígitos no cabe el año: el folio es único
+ * dentro de cada año (índice único año + folio) y nunca se reusa — una ficha
+ * cancelada conserva el suyo. El mes es el de México al guardar.
+ */
+const POR_MES_MAX = 999;
+const folioTexto = n => String(n ?? '').padStart(5, '0');
+const _anioMesMx = (d = new Date()) => {
+  const [anio, mes] = d.toLocaleDateString('en-CA', { timeZone: 'America/Mexico_City' }).split('-').map(Number);
+  return { anio, mes };
+};
+
+// Índices de versiones previas que impedirían repetir el folio en otro año.
+let _indicesViejosQuitados = false;
+async function _quitarIndicesViejos() {
+  if (_indicesViejosQuitados) return;
+  _indicesViejosQuitados = true;
+  for (const nombre of ['rfc_1_folio_1', 'folio_1']) {
+    await FichaEfectivo.collection.dropIndex(nombre).catch(() => {});
+  }
+}
+
+/** Siguiente folio del mes: MM001, MM002… */
+async function _siguienteFolio(ahora = new Date()) {
+  await _quitarIndicesViejos();
+  const { anio, mes } = _anioMesMx(ahora);
+  const { seq } = await Counter.nextSeq(`fichaEfectivo_${anio}${String(mes).padStart(2, '0')}`);
+  if (seq > POR_MES_MAX) throw new ConflictError(`Se acabaron los folios de este mes (máximo ${POR_MES_MAX} fichas por mes)`);
+  return { anio, folio: mes * 1000 + seq };
+}
+
 const _usuario = u => ({ id: u?.dbId ?? u?._id ?? null, nombre: u?.nombre ?? u?.email ?? null });
 
 /** Fichas vigentes que ya tienen alguna de estas cajas (`SERIE|DIA`). */
@@ -71,7 +104,7 @@ async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucu
   if (ficha.incompleta) throw new ConflictError('Kore no respondió alguna caja; vuelve a generar la ficha antes de guardarla.');
   if (!ficha.cortes.length) throw new BadRequestError('No hay efectivo en la caja en esas fechas');
   if (ficha.yaEnFicha.length) {
-    const folios = [...new Set(ficha.yaEnFicha.map(x => x.folio))].join(', ');
+    const folios = [...new Set(ficha.yaEnFicha.map(x => folioTexto(x.folio)))].join(', ');
     throw new ConflictError(`Ya hay días de esta sucursal en la ficha ${folios}. Cancélala o cambia las fechas.`);
   }
   const totalContado = _r2(dens.reduce((s, d) => s + d.importe, 0));
@@ -90,16 +123,24 @@ async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucu
     }
   }
 
-  const { seq } = await Counter.nextSeq(`fichaEfectivo_${rfc}`);
-  const doc = await FichaEfectivo.create({
-    folio: seq, rfc, centroCostoId: ficha.centroCostoId, sucursal: ficha.sucursal, series: ficha.series,
+  // Índice único en folio: si dos se guardan al mismo tiempo y chocan, se toma el siguiente.
+  let doc;
+  for (let intento = 1; !doc; intento++) {
+    const { anio, folio } = await _siguienteFolio();
+    try {
+      doc = await FichaEfectivo.create({
+    folio, anio, rfc, centroCostoId: ficha.centroCostoId, sucursal: ficha.sucursal, series: ficha.series,
     fechaInicio: ficha.fechaInicio, fechaFin: ficha.fechaFin,
     cajas: ficha.cortes.map(c => `${c.serie}|${c.dia}`),
     bancos: elegidos, sucursalBanco: String(sucursalBanco ?? '').trim().slice(0, 40) || null,
     denominaciones: dens, totalContado, diferencia,
     totales: ficha.totales, cortes: ficha.cortes, detalle: ficha.detalle,
     creadoPor: _usuario(user),
-  });
+      });
+    } catch (err) {
+      if (err?.code !== 11000 || intento >= 3) throw err;
+    }
+  }
   return doc.toObject();
 }
 
@@ -147,4 +188,4 @@ async function cancelar({ rfc, id, motivo }, user) {
   return { ...doc, id: String(doc._id) };
 }
 
-module.exports = { cajasYaGuardadas, guardar, listar, obtener, cancelar, _validarDenominaciones, TOLERANCIA };
+module.exports = { folioTexto, cajasYaGuardadas, guardar, listar, obtener, cancelar, _validarDenominaciones, TOLERANCIA };

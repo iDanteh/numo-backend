@@ -2,8 +2,8 @@
 
 // Fichas de efectivo guardadas (2026-11-05): folio, denominaciones que cuadran,
 // una caja en una sola ficha vigente, cancelar solo admin.
-jest.mock('./FichaEfectivo.model', () => ({ find: jest.fn(), create: jest.fn(), findOneAndUpdate: jest.fn(), findOne: jest.fn() }));
-jest.mock('../../shared/models/Counter', () => ({ nextSeq: jest.fn(async () => ({ seq: 7 })) }));
+jest.mock('./FichaEfectivo.model', () => ({ find: jest.fn(), create: jest.fn(), findOneAndUpdate: jest.fn(), findOne: jest.fn(), collection: { dropIndex: jest.fn(async () => ({})) } }));
+jest.mock('../../shared/models/Counter', () => ({ nextSeq: jest.fn(async () => ({ seq: 1 })) }));
 jest.mock('../users/permisos-solo-admin', () => ({ esAdmin: jest.fn() }));
 jest.mock('./reportes-por-facturar.fichas', () => ({ calcularFicha: jest.fn(), listarBancos: jest.fn() }));
 
@@ -29,12 +29,31 @@ beforeEach(() => {
   fichas.listarBancos.mockResolvedValue([{ banco: 'Banorte', numeroCuenta: '0123' }, { banco: 'BBVA', numeroCuenta: null }]);
   fichas.calcularFicha.mockResolvedValue(fichaCalc());
   FichaEfectivo.create.mockImplementation(async d => ({ toObject: () => d }));
+  jest.useFakeTimers({ now: new Date('2026-11-05T18:00:00Z'), doNotFake: ['nextTick', 'setImmediate', 'setTimeout'] });
+});
+afterEach(() => jest.useRealTimers());
+
+test('folio: mes + consecutivo del mes (11001, 11002…), único por año; choque → siguiente; tope 999', async () => {
+  const Counter = require('../../shared/models/Counter');
+  const r1 = await svc.guardar({ ...base, denominaciones: DEN }, {});
+  expect(Counter.nextSeq).toHaveBeenLastCalledWith('fichaEfectivo_202611');
+  expect(r1).toMatchObject({ folio: 11001, anio: 2026 });
+  Counter.nextSeq.mockResolvedValueOnce({ seq: 2 }).mockResolvedValueOnce({ seq: 3 });
+  FichaEfectivo.create.mockRejectedValueOnce(Object.assign(new Error('dup'), { code: 11000 }));
+  expect((await svc.guardar({ ...base, denominaciones: DEN }, {})).folio).toBe(11003);
+  // Enero: 01001 (se muestra con el cero).
+  jest.setSystemTime(new Date('2027-01-10T18:00:00Z'));
+  const r3 = await svc.guardar({ ...base, denominaciones: DEN }, {});
+  expect(Counter.nextSeq).toHaveBeenLastCalledWith('fichaEfectivo_202701');
+  expect(svc.folioTexto(r3.folio)).toBe('01001');
+  Counter.nextSeq.mockResolvedValueOnce({ seq: 1000 });
+  await expect(svc.guardar({ ...base, denominaciones: DEN }, {})).rejects.toThrow(/999/);
 });
 
 test('guardar: recalcula, valida denominaciones y guarda con folio, banco, cajas y detalle', async () => {
   const r = await svc.guardar({ ...base, sucursalBanco: ' 123 ', denominaciones: DEN }, { dbId: '5', nombre: 'Ana' });
   expect(r).toMatchObject({
-    folio: 7, bancos: [{ banco: 'Banorte', numeroCuenta: '0123', importe: 1520 }], sucursalBanco: '123', cajas: ['C0|2026-10-31'],
+    folio: 11001, bancos: [{ banco: 'Banorte', numeroCuenta: '0123', importe: 1520 }], sucursalBanco: '123', cajas: ['C0|2026-10-31'],
     totalContado: 1520, diferencia: -0.39, creadoPor: { id: '5', nombre: 'Ana' },
   });
   expect(r.denominaciones).toEqual([{ tipo: 'Billete', valor: 500, cantidad: 3, importe: 1500 }, { tipo: 'Moneda', valor: 10, cantidad: 2, importe: 20 }]);
@@ -53,7 +72,7 @@ test('guardar: denominación inventada o cantidad con decimales → 400', async 
 
 test('guardar: caja ya en otra ficha vigente o Kore incompleto → 409; banco fuera de Bancos → 400', async () => {
   fichas.calcularFicha.mockResolvedValueOnce(fichaCalc({ yaEnFicha: [{ caja: 'C0|2026-10-31', folio: 3 }] }));
-  await expect(svc.guardar({ ...base, denominaciones: DEN }, {})).rejects.toThrow(/ficha 3/);
+  await expect(svc.guardar({ ...base, denominaciones: DEN }, {})).rejects.toThrow(/ficha 00003/);
   fichas.calcularFicha.mockResolvedValueOnce(fichaCalc({ incompleta: true }));
   await expect(svc.guardar({ ...base, denominaciones: DEN }, {})).rejects.toThrow(/Kore no respondió/);
   await expect(svc.guardar({ ...base, bancos: [{ banco: 'Otro' }], denominaciones: DEN }, {})).rejects.toThrow(/no está en Bancos/);

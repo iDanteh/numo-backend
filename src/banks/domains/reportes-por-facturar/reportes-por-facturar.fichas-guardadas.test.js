@@ -99,6 +99,14 @@ test('listar: busca por remisión / factura y devuelve los renglones que coincid
   expect(r[0].detalle).toBeUndefined();
 });
 
+test('listar: usuario con sucursales asignadas solo ve las suyas', async () => {
+  FichaEfectivo.find.mockReturnValue({ sort: () => ({ limit: () => ({ select: () => ({ lean: async () => [] }) }) }) });
+  await svc.listar({ rfc: 'R', centroCostoIds: [5, 9] });
+  expect(FichaEfectivo.find.mock.calls[0][0]).toEqual({ rfc: 'R', centroCostoId: { $in: [5, 9] } });
+  await svc.listar({ rfc: 'R', centroCostoId: '5', centroCostoIds: [5, 9] });
+  expect(FichaEfectivo.find.mock.calls[1][0]).toEqual({ rfc: 'R', centroCostoId: 5 });
+});
+
 test('cancelar: solo admin y con motivo', async () => {
   esAdmin.mockResolvedValue(false);
   await expect(svc.cancelar({ rfc: 'R', id: 'x', motivo: 'error de captura' }, {})).rejects.toThrow(/administrador/);

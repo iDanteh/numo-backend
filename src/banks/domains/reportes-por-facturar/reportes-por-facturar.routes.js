@@ -79,10 +79,15 @@ router.get('/fichas/globales', authenticate, permit(PERM_FICHAS), asyncHandler(a
   res.json(await fichas.listarGlobales({ rfc, centroCostoId: centroCostoId || null, fechaInicio, fechaFin }));
 }));
 
-// POST /api/reportes-por-facturar/fichas { rfc, uuids: [...] } → efectivo de la caja de cada sucursal / día elegidos y la suma
+// GET /api/reportes-por-facturar/fichas/bancos → bancos dados de alta en Bancos (con número de cuenta)
+router.get('/fichas/bancos', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  res.json(await fichas.listarBancos());
+}));
+
+// POST /api/reportes-por-facturar/fichas { rfc, centroCostoId, fechaInicio, fechaFin } → efectivo de la caja de la sucursal en cada día del rango y la suma
 router.post('/fichas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
-  const { rfc, uuids } = req.body ?? {};
-  res.json(await fichas.calcularFicha({ rfc, uuids }));
+  const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
+  res.json(await fichas.calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }));
 }));
 
 // GET /api/reportes-por-facturar/:id — reporte con sus tablas

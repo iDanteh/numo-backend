@@ -4,13 +4,11 @@
  * reportes-por-facturar.fichas.js
  * ─────────────────────────────────────────────────────────────────────────────
  * "Fichas de efectivo" (Reportes, 2026-11-04, pedido del usuario con la foto
- * de su ficha de entrega de efectivo a traslado de valores): eliges sucursal
- * y periodo, salen las FACTURAS GLOBALES del periodo (con buscador y
- * casillas) y de las que marques se arma UNA ficha imprimible.
- *
- * Cada global elegida indica una SUCURSAL y un DÍA; la ficha suma el efectivo
- * de la CAJA de esa sucursal ese día (corte de caja de Kore — el usuario eligió
- * esto porque lo que ampara la global no incluye la cobranza y no cuadraba):
+ * de su ficha de entrega de efectivo a traslado de valores). 2026-11-05: ya
+ * no se eligen facturas globales — solo SUCURSAL y RANGO de fechas (más banco
+ * y denominaciones, que captura la pantalla). La ficha suma el efectivo de la
+ * CAJA de la sucursal en cada día del rango (corte de caja de Kore — lo que
+ * ampara la global no incluye la cobranza y no cuadraba):
  *
  *   cobros con claveCentro = serie de la sucursal y fecha (día MX) = ese día
  *   (`/desgloses-cobro/almacen?centro=`), solo la parte en EFECTIVO:
@@ -36,7 +34,6 @@ const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kor
 const { BadRequestError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
-const MAX_GLOBALES_FICHA = 60;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
@@ -167,56 +164,69 @@ async function _corteDeCaja({ rfc, serie, dia }) {
 const _total = m => _r2(ENTRADAS.reduce((s, k) => s + m[k], 0) - SALIDAS.reduce((s, k) => s + m[k], 0));
 
 /**
- * Ficha de las globales elegidas (por UUID): efectivo de la caja de cada
- * sucursal / día que indican, y la suma. Las facturas se vuelven a leer de la
- * base (no se confía en lo que manda la pantalla).
+ * Ficha de una sucursal en un rango de fechas (2026-11-05: el usuario ya no
+ * quiere elegir globales — solo sucursal, rango, banco y denominaciones): el
+ * efectivo de la caja de cada serie de la sucursal en cada día del rango, y la
+ * suma. Los días sin ningún movimiento de efectivo no salen en el desglose.
+ * Las cajas se consultan una por una para no provocar 429 en Kore.
  */
-async function calcularFicha({ rfc, uuids }) {
+async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
+  fechaFin = fechaFin || fechaInicio;
   if (!rfc) throw new BadRequestError('RFC requerido');
-  const lista = [...new Set((Array.isArray(uuids) ? uuids : []).map(u => String(u ?? '').trim().toUpperCase()).filter(Boolean))];
-  if (!lista.length) throw new BadRequestError('Elige al menos una factura global');
-  if (lista.length > MAX_GLOBALES_FICHA) throw new BadRequestError(`Máximo ${MAX_GLOBALES_FICHA} facturas por ficha`);
+  if (centroCostoId == null || centroCostoId === '') throw new BadRequestError('Elige la sucursal');
+  if (!FECHA_RE.test(fechaInicio ?? '') || !FECHA_RE.test(fechaFin ?? '')) throw new BadRequestError('Fechas inválidas (formato YYYY-MM-DD)');
+  if (fechaFin < fechaInicio) throw new BadRequestError('La fecha final no puede ser anterior a la inicial');
+  if (_dias(fechaInicio, fechaFin) > MAX_DIAS_RANGO) throw new BadRequestError(`El rango no puede pasar de ${MAX_DIAS_RANGO} días`);
 
-  const docs = await CFDI.find({ uuid: { $in: [...lista, ...lista.map(u => u.toLowerCase())] }, tipoDeComprobante: 'I', 'emisor.rfc': rfc })
-    .select('uuid serie folio fecha total receptor satStatus erpStatus source').lean();
-  const vigentes = new Map(_vigentesPorUuid(docs));
   const ccBySerieMap = await centrosSvc.resolveBySerieMap();
-  const sucursalDe = new Map(Object.entries(ccBySerieMap).map(([s, c]) => [_serie(s), c?.sucursal ?? null]));
+  const entradas = Object.entries(ccBySerieMap).filter(([, c]) => String(c?.id) === String(centroCostoId));
+  if (!entradas.length) throw new BadRequestError('La sucursal no tiene serie de facturación configurada');
+  const series = [...new Set(entradas.map(([s]) => _serie(s)))].sort();
+  const sucursal = entradas[0][1]?.sucursal ?? null;
+
+  const dias = [];
+  for (let d = fechaInicio; d <= fechaFin; d = new Date(new Date(`${d}T00:00:00Z`).getTime() + 86400000).toISOString().slice(0, 10)) dias.push(d);
 
   const advertencias = [];
-  // Sucursal + día de cada global elegida (varias globales del mismo día = una caja).
-  const cortes = new Map();
-  for (const u of lista) {
-    const c = vigentes.get(u);
-    if (!c) { advertencias.push(`No se encontró la factura ${u} (o está cancelada).`); continue; }
-    if (_serie(c.receptor?.rfc) !== RFC_PUBLICO_GENERAL) { advertencias.push(`${_serie(c.serie)}-${c.folio} no es factura global; se omitió.`); continue; }
-    const serie = _serie(c.serie);
-    const dia = _diaMx(c.fecha);
-    const clave = `${serie}|${dia}`;
-    if (!cortes.has(clave)) cortes.set(clave, { serie, dia, sucursal: sucursalDe.get(serie) ?? null, globales: [] });
-    cortes.get(clave).globales.push(`${serie}-${String(c.folio ?? '').trim()}`);
-  }
-
   const filas = [];
-  for (const corte of [...cortes.values()].sort(_orden)) {
-    corte.globales.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    try {
-      const montos = await _corteDeCaja({ rfc, serie: corte.serie, dia: corte.dia });
-      filas.push({ ...corte, ...montos, totalEntregar: _total(montos) });
-    } catch (err) {
-      advertencias.push(`Kore no respondió la caja ${corte.serie} del ${corte.dia} (${err.message}); no se incluyó en la ficha — vuelve a generarla más tarde.`);
+  for (const dia of dias) {
+    for (const serie of series) {
+      try {
+        const montos = await _corteDeCaja({ rfc, serie, dia });
+        if (!CONCEPTOS.some(k => montos[k])) continue; // día sin movimiento de efectivo
+        filas.push({ serie, dia, sucursal, ...montos, totalEntregar: _total(montos) });
+      } catch (err) {
+        advertencias.push(`Kore no respondió la caja ${serie} del ${dia} (${err.message}); no se incluyó en la ficha — vuelve a generarla más tarde.`);
+      }
     }
   }
 
   const totales = Object.fromEntries([...CONCEPTOS, 'totalEntregar'].map(k => [k, _r2(filas.reduce((s, f) => s + f[k], 0))]));
   return {
     generadoEn: new Date(),
-    sucursales: [...new Set(filas.map(f => f.sucursal).filter(Boolean))],
-    dias: [...new Set(filas.map(f => f.dia))].sort(),
+    sucursal,
+    series,
+    fechaInicio,
+    fechaFin,
     cortes: filas,
     totales,
     advertencias: advertencias.length ? advertencias : null,
   };
 }
 
-module.exports = { listarGlobales, calcularFicha, _corteDeCaja };
+/**
+ * Bancos dados de alta en Bancos (los que tienen movimientos o configuración),
+ * con su número de cuenta para la ficha.
+ */
+async function listarBancos() {
+  const BankMovement = require('../banks/BankMovement.model');
+  const bankConfigRepo = require('../banks/repositories/bank-config.repository');
+  const [nombres, configs] = await Promise.all([
+    BankMovement.distinct('banco'),
+    bankConfigRepo.findAllAsMap().catch(() => new Map()),
+  ]);
+  const todos = [...new Set([...nombres, ...configs.keys()].filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  return todos.map(banco => ({ banco, numeroCuenta: configs.get(banco)?.numeroCuenta ?? null }));
+}
+
+module.exports = { listarGlobales, calcularFicha, listarBancos, _corteDeCaja };

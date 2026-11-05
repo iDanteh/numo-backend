@@ -5,6 +5,8 @@
 jest.mock('../../../visor/models/CFDI', () => ({ find: jest.fn() }));
 jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: jest.fn() }));
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(), obtenerDesglosesSalidasCajaPorAlmacen: jest.fn() }));
+jest.mock('../banks/BankMovement.model', () => ({ distinct: jest.fn() }));
+jest.mock('../banks/repositories/bank-config.repository', () => ({ findAllAsMap: jest.fn() }));
 jest.mock('./reportes-por-facturar.facturas-kore', () => ({ traerFacturasRecientes: jest.fn(async () => ({ dias: [], nuevas: 0, error: null })) }));
 
 const CFDI = require('../../../visor/models/CFDI');
@@ -41,11 +43,6 @@ test('listarGlobales valida el rango', async () => {
 });
 
 test('calcularFicha: efectivo de la caja del día por concepto, menos devoluciones y faltante', async () => {
-  CFDI.find.mockReturnValue(lean([
-    { uuid: 'G1', serie: 'C0', folio: '1990', fecha: '2026-10-31T23:00:00Z', total: 5000, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },
-    { uuid: 'G2', serie: 'C0', folio: '1991', fecha: '2026-10-31T23:10:00Z', total: 10, receptor: { rfc: 'XAXX010101000' }, source: 'ERP' },  // misma caja/día
-    { uuid: 'C1', serie: 'C0', folio: '1992', fecha: '2026-10-31T18:00:00Z', total: 10, receptor: { rfc: 'ABC010101AB1' }, source: 'ERP' },
-  ]));
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
     { serieVenta: 'C0', folioVenta: '1', serieFactura: 'C0', cobros: [
       cobro('CBT', 1000, [EF(1000)]),                                                      // facturado
@@ -66,31 +63,50 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
     salida('RETD', 20.78), salida('RPF', 0.55), salida('ST', 50000), salida('CIC', 100000),
   ]);
 
-  const r = await fichas.calcularFicha({ rfc: 'CCO011113663', uuids: ['g1', 'G2', 'C1'] });
-  // Una sola consulta por caja / día aunque haya dos globales.
+  const r = await fichas.calcularFicha({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(1);
   expect(erp.obtenerDesglosesCobroAlmacenPorCentro.mock.calls[0][0]).toMatchObject({ centro: 'C0', fechaDesde: '2026-10-31T06:00:00.000Z', fechaHasta: '2026-11-01T05:59:59.999Z' });
   expect(r.cortes).toHaveLength(1);
   expect(r.cortes[0]).toMatchObject({
-    serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA', globales: ['C0-1990', 'C0-1991'],
+    serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA',
     efectivoFacturado: 1050, efectivoPorFacturar: 170.39, cobranzaEfectivo: 300, abonosEfectivo: 150,
     devoluciones: 20.78, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
     totalEntregar: 1649.06,
   });
   expect(r.totales.totalEntregar).toBe(1649.06);
-  expect(r.dias).toEqual(['2026-10-31']);
-  expect(r.advertencias).toEqual(['C0-1992 no es factura global; se omitió.']);
+  expect(r.sucursal).toBe('CONSTRUCASA');
+  expect(r.advertencias).toBeNull();
+});
+
+test('calcularFicha: rango de varios días — una caja por día, días sin efectivo no salen', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ fechaDesde }) =>
+    fechaDesde.startsWith('2026-11-01') ? [{ serieFactura: null, cobros: [cobro('CBT', 100, [EF(100)], { fecha: '2026-11-01T18:00:00Z' })] }] : []);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-11-02' });
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(3);
+  expect(r.cortes.map(c => [c.dia, c.totalEntregar])).toEqual([['2026-11-01', 100]]);
+  expect(r.totales.efectivoPorFacturar).toBe(100);
 });
 
 test('calcularFicha: Kore sin respuesta → se omite esa caja con advertencia', async () => {
-  CFDI.find.mockReturnValue(lean([{ uuid: 'G1', serie: 'C0', folio: '1990', fecha: '2026-10-31T18:00:00Z', total: 1, receptor: { rfc: 'XAXX010101000' } }]));
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockRejectedValue(new Error('429'));
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
-  const r = await fichas.calcularFicha({ rfc: 'CCO011113663', uuids: ['G1'] });
+  const r = await fichas.calcularFicha({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(r.cortes).toEqual([]);
   expect(r.advertencias[0]).toMatch(/no respondió la caja C0 del 2026-10-31/);
 });
 
-test('calcularFicha sin facturas → 400', async () => {
-  await expect(fichas.calcularFicha({ rfc: 'X', uuids: [] })).rejects.toThrow(/al menos una/);
+test('calcularFicha sin sucursal o con rango largo → 400', async () => {
+  await expect(fichas.calcularFicha({ rfc: 'X', fechaInicio: '2026-10-31' })).rejects.toThrow(/sucursal/);
+  await expect(fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-01', fechaFin: '2026-11-15' })).rejects.toThrow(/31 días/);
+});
+
+test('listarBancos: los de Bancos (movimientos + configuración) con su cuenta', async () => {
+  const BankMovement = require('../banks/BankMovement.model');
+  const repo = require('../banks/repositories/bank-config.repository');
+  BankMovement.distinct.mockResolvedValue(['BBVA', 'Banorte']);
+  repo.findAllAsMap.mockResolvedValue(new Map([['Banorte', { numeroCuenta: '0123' }], ['Azteca', { numeroCuenta: null }]]));
+  expect(await fichas.listarBancos()).toEqual([
+    { banco: 'Azteca', numeroCuenta: null }, { banco: 'Banorte', numeroCuenta: '0123' }, { banco: 'BBVA', numeroCuenta: null },
+  ]);
 });

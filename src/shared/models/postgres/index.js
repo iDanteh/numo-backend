@@ -530,6 +530,12 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS extra_permissions TEXT[] NOT NULL DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN extra_permissions (users):', e.message));
 
+  // Sucursales permitidas por usuario (2026-11-05) — por ahora solo Fichas de efectivo. Ver User.js.
+  await User.sequelize.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS sucursal_ids INTEGER[] NOT NULL DEFAULT '{}'
+  `).catch(e => console.warn('[syncModels] ADD COLUMN sucursal_ids (users):', e.message));
+
   // Configuraciones Globales (ver ConfigSection/GlobalConfig/ConfigAuditLog) — tablas
   // nuevas, force:false para solo crearlas si no existen. Orden: ConfigSection primero
   // (GlobalConfig tiene FK a ella), GlobalConfig antes que ConfigAuditLog (FK a GlobalConfig).

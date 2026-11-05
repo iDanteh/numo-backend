@@ -83,6 +83,8 @@ async function resolveUser(payload, req, res, next) {
       // le da su rol — se leen aquí porque el registro ya se consulta en cada
       // request (sin round-trip extra). Puramente aditivo, ver rbac-store.js.
       extraPermissions: userDoc.extraPermissions ?? [],
+      // Sucursales permitidas (ids de centros de costo) — [] = todas. Por ahora solo Fichas de efectivo.
+      sucursalIds: userDoc.sucursalIds ?? [],
     };
 
     next();

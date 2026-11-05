@@ -10,7 +10,7 @@
  */
 
 jest.mock('../../../shared/models/postgres', () => ({
-  LoyaltyCard: { findOne: jest.fn() },
+  LoyaltyCard: { findOne: jest.fn(), findAll: jest.fn() },
   LoyaltyCardAuditLog: { create: jest.fn() },
 }));
 jest.mock('../cards/loyalty-card.service', () => ({
@@ -32,6 +32,9 @@ function card(overrides = {}) {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // Por defecto, ningún evento de `alta` encuentra tarjetas anteriores con el mismo
+  // koreClienteId que liberar — los tests que sí lo necesitan lo sobreescriben.
+  LoyaltyCard.findAll.mockResolvedValue([]);
 });
 
 describe('procesarClienteKore — validación de entrada', () => {
@@ -121,6 +124,46 @@ describe('procesarClienteKore — evento alta', () => {
       procesarClienteKore({ evento: 'alta', koreClienteId: 'K1', telefono: '5551234567' }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(crearTarjeta).not.toHaveBeenCalled();
+  });
+
+  // Bug real 2026-11-05: `koreClienteId` identifica al CLIENTE en Kore, no al monedero — si un
+  // cliente elimina su tarjeta y se registra de nuevo con OTRO teléfono, Kore reusa el mismo
+  // koreClienteId. Sin liberarlo de la tarjeta vieja, quedaban 2 filas con el mismo id y
+  // `_buscarCard` podía resolver a cualquiera de las dos (causa real del 409 visto en producción
+  // al reactivar la tarjeta nueva).
+  test('teléfono nuevo con koreClienteId ya usado por otra tarjeta: libera el koreClienteId de la vieja', async () => {
+    LoyaltyCard.findOne.mockResolvedValueOnce(null); // no existe tarjeta con el teléfono nuevo
+    const vieja = card({ id: 50, telefono: '5550000001', koreClienteId: 'K1', activa: false });
+    LoyaltyCard.findAll.mockResolvedValueOnce([vieja]);
+    const nueva = card({ id: 51, telefono: '5559999999' });
+    crearTarjeta.mockResolvedValue({ card: nueva, nip: '1234' });
+
+    const resultado = await procesarClienteKore({
+      evento: 'alta', koreClienteId: 'K1', telefono: '5559999999', nombre: 'Juan Pérez',
+    });
+
+    expect(LoyaltyCard.findAll).toHaveBeenCalledWith({ where: { koreClienteId: 'K1' } });
+    expect(vieja.update).toHaveBeenCalledWith({ koreClienteId: null });
+    expect(LoyaltyCardAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      cardId: 50,
+      accion: 'webhook_kore_alta_telefono_nuevo',
+      origen: 'kore',
+      cambios: { koreClienteId: { antes: 'K1', despues: null } },
+    }));
+    expect(nueva.update).toHaveBeenCalledWith({ koreClienteId: 'K1', revisionPendiente: true });
+    expect(resultado).toEqual({ ok: true, evento: 'alta', cardId: 51, creada: true });
+  });
+
+  test('teléfono nuevo sin ninguna tarjeta previa con ese koreClienteId: no libera nada', async () => {
+    LoyaltyCard.findOne.mockResolvedValueOnce(null);
+    const nueva = card({ id: 52, telefono: '5551112222' });
+    crearTarjeta.mockResolvedValue({ card: nueva, nip: '1234' });
+
+    await procesarClienteKore({
+      evento: 'alta', koreClienteId: 'K-nuevo', telefono: '5551112222', nombre: 'Juan Pérez',
+    });
+
+    expect(LoyaltyCardAuditLog.create).not.toHaveBeenCalled();
   });
 });
 
@@ -218,17 +261,19 @@ describe('procesarClienteKore — evento actualizacion', () => {
     expect(updates).not.toHaveProperty('activa');
   });
 
-  test('un alta sobre tarjeta existente (cae a actualización) NUNCA toca activa, aunque el payload traiga activo', async () => {
+  // Bug real 2026-11-05: Kore manda 'alta' tanto para un cliente nuevo como para uno que había
+  // eliminado su tarjeta (evento `baja`) y se registra de nuevo — antes de esta fix, ese segundo
+  // caso dejaba la tarjeta reactivada por koreClienteId/nombre pero SIGUIENDO inactiva para
+  // siempre, porque 'alta' nunca forzaba `activa:true`.
+  test('un alta sobre tarjeta existente (cae a actualización) SIEMPRE la reactiva (activa:true)', async () => {
     const existente = card({ id: 27, activa: false });
     LoyaltyCard.findOne.mockResolvedValueOnce(existente);
 
-    // 'alta' no desestructura `activo` del payload — este test documenta esa exclusión a propósito.
     await procesarClienteKore({
-      evento: 'alta', koreClienteId: 'K27', telefono: '5551234567', nombre: 'X', activo: true,
+      evento: 'alta', koreClienteId: 'K27', telefono: '5551234567', nombre: 'X',
     });
 
-    const updates = existente.update.mock.calls[0][0];
-    expect(updates).not.toHaveProperty('activa');
+    expect(existente.update).toHaveBeenCalledWith(expect.objectContaining({ activa: true }));
   });
 
   // `tarjetaLegada` (gap real cerrado): un cliente ya matcheado que cambia de número de

@@ -173,6 +173,9 @@ const PERMISSIONS = Object.freeze({
   // puede dar o quitar (pedido del usuario): ver users/permisos-solo-admin.js. Sin rol
   // asignado de inicio (admin lo tiene por '*').
   REPORTES_FICHAS_EFECTIVO: 'reportes:fichas-efectivo',
+  // Anexo de la ficha (detalle de cada venta, cliente, factura / global) — 2026-11-05:
+  // solo administrador o quien tenga este permiso; también solo lo asigna el administrador.
+  REPORTES_FICHAS_EFECTIVO_ANEXO: 'reportes:fichas-efectivo:anexo',
 });
 
 // ── Roles y sus permisos ──────────────────────────────────────────────────────

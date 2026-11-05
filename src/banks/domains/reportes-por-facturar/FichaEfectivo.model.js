@@ -50,7 +50,10 @@ const denominacionSchema = new mongoose.Schema({
 }, { _id: false });
 
 const fichaEfectivoSchema = new mongoose.Schema({
-  folio:          { type: Number, required: true },
+  /** 5 dígitos = mes (2) + consecutivo del mes (3): 11001, 11002… (2026-11-05). Único por año. */
+  folio:          { type: Number, required: true, min: 1, max: 99999 },
+  /** Año (México) en que se guardó: el folio solo es único dentro del año. */
+  anio:           { type: Number, default: null },
   rfc:            { type: String, required: true },
   centroCostoId:  { type: Number, default: null },
   sucursal:       { type: String, default: null },
@@ -75,7 +78,7 @@ const fichaEfectivoSchema = new mongoose.Schema({
   motivoCancelacion: { type: String, default: null },
 }, { timestamps: true, collection: 'fichas_efectivo' });
 
-fichaEfectivoSchema.index({ rfc: 1, folio: 1 }, { unique: true });
+fichaEfectivoSchema.index({ anio: 1, folio: 1 }, { unique: true });
 fichaEfectivoSchema.index({ rfc: 1, estado: 1, cajas: 1 });
 fichaEfectivoSchema.index({ rfc: 1, 'detalle.remision': 1 });
 fichaEfectivoSchema.index({ rfc: 1, 'detalle.factura': 1 });

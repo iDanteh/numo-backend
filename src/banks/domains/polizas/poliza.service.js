@@ -947,7 +947,7 @@ const PALABRAS_CLIENTES_SHOPIFY = ['ECOMMERCE', 'SHOPIFY', 'ROTOPLAS'];
 const RE_CLIENTES_SHOPIFY = /ECOMMERCE|SHOPIFY|ROTOPLAS/i;
 const CONCEPTO_VENTAS_SHOPIFY = 'VENTAS SHOPIFY';
 const DIAS_ATRAS_TICKETS_SHOPIFY = 3; // ventas de medianoche / cobradas un día después
-const _cacheTicketsShopify = new Map(); // día → { en, tickets:Set }
+const _cacheTicketsShopify = new Map(); // día → { en, tickets: Map(ticket → cliente de Kore) }
 
 async function _ticketsClientesShopify(dia) {
   const hoy = new Date().toISOString().slice(0, 10);
@@ -958,13 +958,13 @@ async function _ticketsClientesShopify(dia) {
   const desde = new Date(Date.parse(`${dia}T00:00:00Z`) - DIAS_ATRAS_TICKETS_SHOPIFY * 86400000).toISOString().slice(0, 10);
   const respuestas = await Promise.all(PALABRAS_CLIENTES_SHOPIFY.map(nombrePersona =>
     sincronizarCuentasPendientes({ fechaDesde: `${desde}T00:00:00-06:00`, fechaHasta: `${dia}T23:59:59-06:00`, nombrePersona })));
-  const tickets = new Set();
+  const tickets = new Map();
   for (const { raw } of respuestas) {
     for (const cta of raw ?? []) {
       if (!RE_CLIENTES_SHOPIFY.test(cta?.nombrePersona || '')) continue;
       const serie = cta.serieExterna || cta.serie;
       const folio = cta.folioExterno || cta.folio;
-      if (serie && folio) tickets.add(`${serie}-${folio}`);
+      if (serie && folio) tickets.set(`${serie}-${folio}`, String(cta.nombrePersona).trim());
     }
   }
   _cacheTicketsShopify.set(dia, { en: Date.now(), tickets });
@@ -1002,7 +1002,7 @@ async function construirVentasShopifyInfo(movimientos, fechaFinal, obtenerTicket
     if (!porCentro.has(cc.id)) porCentro.set(cc.id, { gross: 0, centroCostoObj: cc, detalle: [] });
     const p = porCentro.get(cc.id);
     p.gross = Math.round((p.gross + Number(m.debe)) * 100) / 100;
-    p.detalle.push({ fila: m, ticket, monto: Number(m.debe) });
+    p.detalle.push({ fila: m, ticket, cliente: tickets.get(ticket) || '', monto: Number(m.debe) });
   }
   return { ids, porCentro };
 }
@@ -4998,7 +4998,8 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       desgloseConsolidado.push({
         cuenta: null, centroCosto, tipo: 'Venta', transferencia: 'No', formaPago: CONCEPTO_VENTAS_SHOPIFY,
         cfdiSerie: d.fila.serie || '', ventaSerie: d.ticket,
-        cliente: nombresClientes.get((d.fila.cfdiUuid || '').toUpperCase()) || '',
+        // El cliente de Kore (la factura Global dice PUBLICO EN GENERAL).
+        cliente: d.cliente || nombresClientes.get((d.fila.cfdiUuid || '').toUpperCase()) || '',
         monto: d.monto, nota: 'Tarjeta de cliente Shopify / ecommerce (sin comisión)',
       });
     }
@@ -5102,8 +5103,9 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     // cambia la forma de pago. Transferencia/Cheque agrupados (cuando
     // comparten referencia bancaria real) y cualquier forma de pago sin
     // mapear caen después, en el orden en que ya llegan.
-    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1, NETPAY: 2 };
-    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6', NETPAY: 'FFE2D9F3' };
+    // VENTAS SHOPIFY (2026-11-05) justo después de NETPAY, con su propio color.
+    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1, NETPAY: 2, [CONCEPTO_VENTAS_SHOPIFY]: 2.5 };
+    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6', NETPAY: 'FFE2D9F3', [CONCEPTO_VENTAS_SHOPIFY]: 'FFD9F2E3' };
     desgloseConsolidado.sort((a, b) =>
       (ORDEN_FORMA_PAGO_DESGLOSE[a.formaPago] ?? 3) - (ORDEN_FORMA_PAGO_DESGLOSE[b.formaPago] ?? 3)
       || (a.cuenta - b.cuenta) || a.centroCosto.localeCompare(b.centroCosto),

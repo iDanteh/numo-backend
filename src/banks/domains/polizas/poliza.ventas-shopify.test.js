@@ -17,7 +17,7 @@ const mov = (id, ticket, debe, extra = {}) => {
 const dia = new Date('2026-10-28T12:00:00Z');
 
 test('solo la Tarjeta de los tickets de clientes Shopify, acumulada por almacén', async () => {
-  const tickets = new Set(['B0-261007885', 'B0-261007380', 'D0-261005264']);
+  const tickets = new Map([['B0-261007885', 'CLIENTE MOSTRADOR SHOPIFY'], ['B0-261007380', 'MOSTRADOR ECOMMERCE CLIENTE'], ['D0-261005264', 'MOSTRADOR ECOMMERCE CLIENTE']]);
   const movs = [
     mov(1, 'B0-261007885', 473.05),
     mov(2, 'B0-261007380', 1314.74),                       // mixta: su línea de tarjeta
@@ -32,6 +32,7 @@ test('solo la Tarjeta de los tickets de clientes Shopify, acumulada por almacén
   expect([...r.ids].sort()).toEqual([1, 2, 5]);
   expect(r.porCentro.get(2).gross).toBe(1787.79);
   expect(r.porCentro.get(4).gross).toBe(98.46);
+  expect(r.porCentro.get(2).detalle.map(d => d.cliente)).toEqual(['CLIENTE MOSTRADOR SHOPIFY', 'MOSTRADOR ECOMMERCE CLIENTE']);
   expect(_lineaVentasShopify(r.porCentro.get(2), { codigo: '1102011001' })).toMatchObject({
     cuenta: { codigo: '1102011001' }, serie: 'SHOPIFY', concepto: 'VENTAS SHOPIFY', centroCosto: 'B0-CC', debe: 1787.79, haber: 0,
   });

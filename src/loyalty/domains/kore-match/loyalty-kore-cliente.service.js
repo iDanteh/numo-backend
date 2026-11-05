@@ -115,36 +115,26 @@ async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, ac
 }
 
 async function _procesarAlta({ koreClienteId, telefono, nombre }) {
-  const existente = await LoyaltyCard.findOne({ where: { telefono } });
+  // Busca primero por `koreClienteId` (identidad real y estable del cliente en Kore), igual que
+  // `actualizacion`/`baja` — recién si no aparece, por teléfono. Bug real encontrado 2026-11-05:
+  // `koreClienteId` identifica al CLIENTE, no al monedero — si elimina su tarjeta y se registra de
+  // nuevo con un teléfono DISTINTO, Kore reusa el MISMO koreClienteId. Buscando por ahí primero,
+  // ese "alta" reactiva y actualiza la MISMA fila (mismo saldo/nivel, línea de tiempo continua en
+  // `LoyaltyCardAuditLog`: alta→baja→actualizacion→...) en vez de crear una tarjeta nueva separada
+  // para el mismo cliente real — antes esto producía 2+ filas con el mismo koreClienteId, y
+  // `_buscarCard` podía resolver a la vieja en vez de la nueva (causa real del 409 "ya existe otra
+  // tarjeta con ese teléfono" al reactivar, visto en producción).
+  const existente = await _buscarCard({ koreClienteId, telefono });
   if (existente) {
-    // Idempotente: un "alta" para un teléfono que ya tiene tarjeta se trata como actualización,
-    // nunca se duplica ni se lanza error por "ya existe". `activo:true` (bug real 2026-11-05):
-    // un "alta" sobre un teléfono cuya tarjeta había sido eliminada/desactivada antes debe
+    // Idempotente: un "alta" para un cliente que ya tiene tarjeta (por koreClienteId o teléfono)
+    // se trata como actualización, nunca se duplica ni se lanza error por "ya existe". `activo:
+    // true`: un "alta" sobre una tarjeta que había sido eliminada/desactivada antes debe
     // reactivarla — para Kore esto ES un alta, no manda un evento de reactivación aparte.
     return _aplicarActualizacion(existente, { koreClienteId, telefono, nombre, activo: true });
   }
 
   if (!String(nombre ?? '').trim()) {
     throw new BadRequestError('nombre es requerido para dar de alta una tarjeta nueva.');
-  }
-
-  // Bug real encontrado 2026-11-05: `koreClienteId` identifica al CLIENTE en Kore, no al
-  // monedero — cuando un cliente elimina su tarjeta y se registra de nuevo con un teléfono
-  // DISTINTO, Kore reusa el MISMO koreClienteId para la tarjeta nueva. Como koreClienteId no es
-  // unique acá (telefono es la única llave real, D1), sin este paso quedarían 2+ filas con el
-  // mismo koreClienteId, y `_buscarCard` (que busca por koreClienteId primero) podía resolver a
-  // la fila vieja en vez de la nueva — causando que `baja`/`actualizacion` pisaran la tarjeta
-  // equivocada, o intentaran pisar su teléfono con uno ya usado por la tarjeta nueva (409 real
-  // visto en producción). Se libera el koreClienteId de cualquier tarjeta anterior ANTES de
-  // crear la nueva, para que esta quede como única dueña de ese id.
-  const anteriores = await LoyaltyCard.findAll({ where: { koreClienteId } });
-  for (const anterior of anteriores) {
-    const antes = { koreClienteId: anterior.koreClienteId };
-    await anterior.update({ koreClienteId: null });
-    await registrarCambioTarjeta({
-      cardId: anterior.id, antes, despues: { koreClienteId: null },
-      accion: 'webhook_kore_alta_telefono_nuevo', origen: 'kore',
-    });
   }
 
   let resultado;

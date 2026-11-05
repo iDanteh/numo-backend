@@ -18,7 +18,8 @@ const { BadRequestError, NotFoundError, ConflictError, ForbiddenError } = requir
 
 /** Diferencia aceptada: solo los centavos que no se juntan con monedas. */
 const TOLERANCIA = 1;
-const VALORES = { Billete: [1000, 500, 200, 100, 50, 20], Moneda: [20, 10, 5, 2, 1, 0.5, 0.2, 0.1, 0.05] };
+// Sin monedas menores a 50 centavos (2026-11-05, pedido del usuario).
+const VALORES = { Billete: [1000, 500, 200, 100, 50, 20], Moneda: [20, 10, 5, 2, 1, 0.5] };
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 /**
  * Folio de 5 dígitos = MES (2) + CONSECUTIVO DEL MES (3) — 2026-11-05, decisión

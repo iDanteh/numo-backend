@@ -8,6 +8,7 @@ const service                  = require('./reportes-por-facturar.service');
 const estadistica              = require('./reportes-por-facturar.estadistica');
 const fichas                   = require('./reportes-por-facturar.fichas');
 const fichasGuardadas          = require('./reportes-por-facturar.fichas-guardadas');
+const rbacStore                = require('../../../shared/services/rbac-store');
 
 const router = express.Router();
 
@@ -73,6 +74,15 @@ router.get('/estadistica/:id/excel', authenticate, permit(PERM), asyncHandler(as
 // ── Fichas de efectivo (2026-11-04) — antes de /:id ──────────────────────────
 // Permiso propio que solo un administrador puede asignar (rbac.js REPORTES_FICHAS_EFECTIVO).
 const PERM_FICHAS = 'reportes:fichas-efectivo';
+// Anexo (detalle de cada venta): solo administrador ('*') o este permiso (2026-11-05).
+const PERM_ANEXO = 'reportes:fichas-efectivo:anexo';
+const _puedeAnexo = req => rbacStore.hasPermission(req.user?.role, PERM_ANEXO, req.user?.extraPermissions);
+/** Quita el anexo (detalle / coincidencias) si el usuario no puede verlo. */
+async function _sinAnexoSiNoPuede(req, data) {
+  if (await _puedeAnexo(req)) return data;
+  const quitar = d => (d && typeof d === 'object') ? (({ detalle, coincidencias, ...resto }) => resto)(d) : d;
+  return Array.isArray(data) ? data.map(quitar) : quitar(data);
+}
 
 // GET /api/reportes-por-facturar/fichas/globales?rfc=&centroCostoId=&fechaInicio=&fechaFin= → facturas globales del periodo
 router.get('/fichas/globales', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
@@ -88,30 +98,30 @@ router.get('/fichas/bancos', authenticate, permit(PERM_FICHAS), asyncHandler(asy
 // POST /api/reportes-por-facturar/fichas { rfc, centroCostoId, fechaInicio, fechaFin } → efectivo de la caja de la sucursal en cada día del rango y la suma
 router.post('/fichas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
-  res.json(await fichas.calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }));
+  res.json(await _sinAnexoSiNoPuede(req, await fichas.calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin })));
 }));
 
 // ── Fichas guardadas (2026-11-05): rastro venta → factura / global → ficha ──
-// POST /api/reportes-por-facturar/fichas/guardar { rfc, centroCostoId, fechaInicio, fechaFin, banco, sucursalBanco, denominaciones }
+// POST /api/reportes-por-facturar/fichas/guardar { rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucursalBanco, denominaciones }
 router.post('/fichas/guardar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
-  res.status(201).json(await fichasGuardadas.guardar(req.body ?? {}, req.user));
+  res.status(201).json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.guardar(req.body ?? {}, req.user)));
 }));
 
 // GET /api/reportes-por-facturar/fichas/guardadas?rfc=&centroCostoId=&q= (q = folio de ficha, remisión o factura / global)
 router.get('/fichas/guardadas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, q } = req.query;
-  res.json(await fichasGuardadas.listar({ rfc, centroCostoId, q }));
+  res.json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.listar({ rfc, centroCostoId, q })));
 }));
 
 // GET /api/reportes-por-facturar/fichas/guardadas/:id?rfc=
 router.get('/fichas/guardadas/:id', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
-  res.json(await fichasGuardadas.obtener({ rfc: req.query.rfc, id: req.params.id }));
+  res.json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.obtener({ rfc: req.query.rfc, id: req.params.id })));
 }));
 
 // POST /api/reportes-por-facturar/fichas/guardadas/:id/cancelar { rfc, motivo } — solo administrador
 router.post('/fichas/guardadas/:id/cancelar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, motivo } = req.body ?? {};
-  res.json(await fichasGuardadas.cancelar({ rfc, id: req.params.id, motivo }, req.user));
+  res.json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.cancelar({ rfc, id: req.params.id, motivo }, req.user)));
 }));
 
 // GET /api/reportes-por-facturar/:id — reporte con sus tablas

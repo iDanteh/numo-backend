@@ -14,7 +14,7 @@ const { PERMISSIONS } = require('../../../shared/config/rbac');
 const rbacStore = require('../../../shared/services/rbac-store');
 const { ForbiddenError } = require('../../../shared/errors/AppError');
 
-const SOLO_ADMIN_ASIGNA = Object.freeze([PERMISSIONS.REPORTES_FICHAS_EFECTIVO]);
+const SOLO_ADMIN_ASIGNA = Object.freeze([PERMISSIONS.REPORTES_FICHAS_EFECTIVO, PERMISSIONS.REPORTES_FICHAS_EFECTIVO_ANEXO]);
 
 const _tiene = (permisos, p) => Array.isArray(permisos) && (permisos.includes('*') || permisos.includes(p));
 

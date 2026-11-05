@@ -10,7 +10,7 @@
  */
 
 jest.mock('../../../shared/models/postgres', () => ({
-  LoyaltyCard: { findOne: jest.fn(), findAll: jest.fn() },
+  LoyaltyCard: { findOne: jest.fn() },
   LoyaltyCardAuditLog: { create: jest.fn() },
 }));
 jest.mock('../cards/loyalty-card.service', () => ({
@@ -32,9 +32,6 @@ function card(overrides = {}) {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  // Por defecto, ningún evento de `alta` encuentra tarjetas anteriores con el mismo
-  // koreClienteId que liberar — los tests que sí lo necesitan lo sobreescriben.
-  LoyaltyCard.findAll.mockResolvedValue([]);
 });
 
 describe('procesarClienteKore — validación de entrada', () => {
@@ -126,44 +123,42 @@ describe('procesarClienteKore — evento alta', () => {
     expect(crearTarjeta).not.toHaveBeenCalled();
   });
 
-  // Bug real 2026-11-05: `koreClienteId` identifica al CLIENTE en Kore, no al monedero — si un
-  // cliente elimina su tarjeta y se registra de nuevo con OTRO teléfono, Kore reusa el mismo
-  // koreClienteId. Sin liberarlo de la tarjeta vieja, quedaban 2 filas con el mismo id y
-  // `_buscarCard` podía resolver a cualquiera de las dos (causa real del 409 visto en producción
-  // al reactivar la tarjeta nueva).
-  test('teléfono nuevo con koreClienteId ya usado por otra tarjeta: libera el koreClienteId de la vieja', async () => {
-    LoyaltyCard.findOne.mockResolvedValueOnce(null); // no existe tarjeta con el teléfono nuevo
-    const vieja = card({ id: 50, telefono: '5550000001', koreClienteId: 'K1', activa: false });
-    LoyaltyCard.findAll.mockResolvedValueOnce([vieja]);
-    const nueva = card({ id: 51, telefono: '5559999999' });
-    crearTarjeta.mockResolvedValue({ card: nueva, nip: '1234' });
+  // Bug real 2026-11-05, rediseño pedido por el usuario: `koreClienteId` identifica al CLIENTE en
+  // Kore, no al monedero — si elimina su tarjeta y se registra de nuevo con OTRO teléfono, Kore
+  // reusa el mismo koreClienteId. En vez de crear una fila nueva (y terminar con 2 registros para
+  // el mismo cliente real), un 'alta' con un koreClienteId ya conocido reactiva y actualiza la
+  // MISMA fila — mismo saldo/nivel, línea de tiempo continua en LoyaltyCardAuditLog.
+  test('alta con koreClienteId de una tarjeta existente (otro teléfono): reactiva la MISMA fila, no crea una nueva', async () => {
+    const vieja = card({
+      id: 50, telefono: '5550000001', koreClienteId: 'K1', activa: false, nombre: 'CLIENTE',
+    });
+    LoyaltyCard.findOne.mockResolvedValueOnce(vieja); // encontrada por koreClienteId
 
     const resultado = await procesarClienteKore({
       evento: 'alta', koreClienteId: 'K1', telefono: '5559999999', nombre: 'Juan Pérez',
     });
 
-    expect(LoyaltyCard.findAll).toHaveBeenCalledWith({ where: { koreClienteId: 'K1' } });
-    expect(vieja.update).toHaveBeenCalledWith({ koreClienteId: null });
-    expect(LoyaltyCardAuditLog.create).toHaveBeenCalledWith(expect.objectContaining({
-      cardId: 50,
-      accion: 'webhook_kore_alta_telefono_nuevo',
-      origen: 'kore',
-      cambios: { koreClienteId: { antes: 'K1', despues: null } },
+    expect(LoyaltyCard.findOne).toHaveBeenCalledWith({ where: { koreClienteId: 'K1' } });
+    expect(crearTarjeta).not.toHaveBeenCalled();
+    expect(vieja.update).toHaveBeenCalledWith(expect.objectContaining({
+      telefono: '5559999999', activa: true,
     }));
-    expect(nueva.update).toHaveBeenCalledWith({ koreClienteId: 'K1', revisionPendiente: true });
-    expect(resultado).toEqual({ ok: true, evento: 'alta', cardId: 51, creada: true });
+    expect(resultado).toEqual({ ok: true, evento: 'actualizacion', cardId: 50, creada: false });
   });
 
-  test('teléfono nuevo sin ninguna tarjeta previa con ese koreClienteId: no libera nada', async () => {
-    LoyaltyCard.findOne.mockResolvedValueOnce(null);
+  test('alta con koreClienteId nuevo (ninguna tarjeta lo tiene aún): crea una tarjeta de verdad', async () => {
+    LoyaltyCard.findOne
+      .mockResolvedValueOnce(null)  // por koreClienteId
+      .mockResolvedValueOnce(null); // fallback por teléfono
     const nueva = card({ id: 52, telefono: '5551112222' });
     crearTarjeta.mockResolvedValue({ card: nueva, nip: '1234' });
 
-    await procesarClienteKore({
+    const resultado = await procesarClienteKore({
       evento: 'alta', koreClienteId: 'K-nuevo', telefono: '5551112222', nombre: 'Juan Pérez',
     });
 
-    expect(LoyaltyCardAuditLog.create).not.toHaveBeenCalled();
+    expect(crearTarjeta).toHaveBeenCalled();
+    expect(resultado).toEqual({ ok: true, evento: 'alta', cardId: 52, creada: true });
   });
 });
 

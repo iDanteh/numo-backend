@@ -944,7 +944,10 @@ function _lineaNetpayAmex({ grossAmex, centroCostoObj, amexSinReporte = 0 }, cue
 // a Kore /cuentas-pendientes, que filtra por palabra del nombre (una palabra por
 // consulta; probado 2026-11-05, 'SHOPIFY' → solo sus cuentas en ~3 s).
 const PALABRAS_CLIENTES_SHOPIFY = ['ECOMMERCE', 'SHOPIFY', 'ROTOPLAS'];
-const RE_CLIENTES_SHOPIFY = /ECOMMERCE|SHOPIFY|ROTOPLAS/i;
+// Nombres EXACTOS: la búsqueda por palabra también trae otros clientes (ej.
+// "DANIEL LOPEZ GARCIA ECOMMERCE", que NO es venta en línea).
+const CLIENTES_SHOPIFY = new Set(['MOSTRADOR ECOMMERCE CLIENTE', 'CLIENTE MOSTRADOR SHOPIFY', 'CLIENTE MOSTRADOR ROTOPLAS']);
+const _esClienteShopify = nombre => CLIENTES_SHOPIFY.has(String(nombre || '').trim().replace(/\s+/g, ' ').toUpperCase());
 const CONCEPTO_VENTAS_SHOPIFY = 'VENTAS SHOPIFY';
 const DIAS_ATRAS_TICKETS_SHOPIFY = 3; // ventas de medianoche / cobradas un día después
 const _cacheTicketsShopify = new Map(); // día → { en, tickets: Map(ticket → cliente de Kore) }
@@ -961,7 +964,7 @@ async function _ticketsClientesShopify(dia) {
   const tickets = new Map();
   for (const { raw } of respuestas) {
     for (const cta of raw ?? []) {
-      if (!RE_CLIENTES_SHOPIFY.test(cta?.nombrePersona || '')) continue;
+      if (!_esClienteShopify(cta?.nombrePersona)) continue;
       const serie = cta.serieExterna || cta.serie;
       const folio = cta.folioExterno || cta.folio;
       if (serie && folio) tickets.set(`${serie}-${folio}`, String(cta.nombrePersona).trim());
@@ -6099,6 +6102,6 @@ module.exports = {
   _construirVerdadBancaria: construirVerdadBancaria, _opcionesVerdadBancariaExport: opcionesVerdadBancariaExport, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
-  _construirVentasShopifyInfo: construirVentasShopifyInfo, _lineaVentasShopify, _ticketsClientesShopify,
+  _construirVentasShopifyInfo: construirVentasShopifyInfo, _lineaVentasShopify, _ticketsClientesShopify, _esClienteShopify,
   _construirWorkbookPoliza,
 };

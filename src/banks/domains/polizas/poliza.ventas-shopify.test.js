@@ -6,7 +6,7 @@ jest.mock('../../../shared/models/postgres', () => ({
   AccountPlan: {}, CfdiMappingRule: {}, PolizaMovimiento: {}, Poliza: {}, CentroCosto: {}, Terminal: {},
 }));
 
-const { _construirVentasShopifyInfo, _lineaVentasShopify } = require('./poliza.service');
+const { _construirVentasShopifyInfo, _lineaVentasShopify, _esClienteShopify } = require('./poliza.service');
 
 const B0 = { id: 2, clave: 'B0-CC', serieFacturacion: 'B0', sucursal: 'FERROCARRIL' };
 const D0 = { id: 4, clave: 'D0-CC', serieFacturacion: 'D0', sucursal: 'HIDALGO' };
@@ -49,4 +49,12 @@ test('sin Tarjeta no consulta a Kore', async () => {
   const r = await _construirVentasShopifyInfo([mov(1, 'B0-261007885', 50, { formaPago: '01' })], dia, consulta);
   expect(consulta).not.toHaveBeenCalled();
   expect(r.ids.size).toBe(0);
+});
+
+test('solo los tres clientes exactos (la palabra ECOMMERCE sola no basta)', () => {
+  expect(_esClienteShopify('MOSTRADOR ECOMMERCE CLIENTE')).toBe(true);
+  expect(_esClienteShopify(' cliente mostrador  shopify ')).toBe(true);
+  expect(_esClienteShopify('CLIENTE MOSTRADOR ROTOPLAS')).toBe(true);
+  expect(_esClienteShopify('DANIEL LOPEZ GARCIA ECOMMERCE')).toBe(false);
+  expect(_esClienteShopify('CLIENTE MOSTRADOR')).toBe(false);
 });

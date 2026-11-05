@@ -65,6 +65,7 @@ const PERM_META = {
   'visor:reports':      { label: 'Reportes CFDI',                   module: 'Visor' },
   'reportes:por-facturar': { label: 'Reporte Por facturar (ver, generar y eliminar)', module: 'Visor' },
   'reportes:fichas-efectivo': { label: 'Fichas de efectivo (solo el administrador puede asignarlo)', module: 'Visor' },
+  'reportes:fichas-efectivo:anexo': { label: 'Fichas de efectivo: ver el anexo de ventas (solo el administrador puede asignarlo)', module: 'Visor' },
   'visor:cierre-mes:revertir': { label: 'Revertir cierre de mes',   module: 'Visor' },
   'drive:read':         { label: 'Google Drive (leer)',             module: 'Drive' },
   'drive:import':       { label: 'Google Drive (importar)',         module: 'Drive' },

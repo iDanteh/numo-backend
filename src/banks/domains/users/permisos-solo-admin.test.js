@@ -14,7 +14,9 @@ beforeEach(() => {
 test('detecta cuando se pone o se quita (también por rol con *)', () => {
   expect(cambiosSoloAdmin([], [FICHAS])).toEqual([FICHAS]);
   expect(cambiosSoloAdmin([FICHAS], ['banks:read'])).toEqual([FICHAS]);
-  expect(cambiosSoloAdmin(['*'], ['banks:read'])).toEqual([FICHAS]);
+  expect(cambiosSoloAdmin(['*'], ['banks:read'])).toEqual([FICHAS, 'reportes:fichas-efectivo:anexo']);
+  // Anexo de la ficha (2026-11-05): también solo lo asigna el administrador.
+  expect(cambiosSoloAdmin([], ['reportes:fichas-efectivo:anexo'])).toEqual(['reportes:fichas-efectivo:anexo']);
   expect(cambiosSoloAdmin(['banks:read'], ['banks:read', 'visor:read'])).toEqual([]);
   expect(cambiosSoloAdmin([FICHAS], [FICHAS, 'visor:read'])).toEqual([]);
 });

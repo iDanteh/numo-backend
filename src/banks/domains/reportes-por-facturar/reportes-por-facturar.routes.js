@@ -7,6 +7,7 @@ const { asyncHandler }         = require('../../shared/middleware/error-handler'
 const service                  = require('./reportes-por-facturar.service');
 const estadistica              = require('./reportes-por-facturar.estadistica');
 const fichas                   = require('./reportes-por-facturar.fichas');
+const fichasGuardadas          = require('./reportes-por-facturar.fichas-guardadas');
 
 const router = express.Router();
 
@@ -88,6 +89,29 @@ router.get('/fichas/bancos', authenticate, permit(PERM_FICHAS), asyncHandler(asy
 router.post('/fichas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
   res.json(await fichas.calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }));
+}));
+
+// ── Fichas guardadas (2026-11-05): rastro venta → factura / global → ficha ──
+// POST /api/reportes-por-facturar/fichas/guardar { rfc, centroCostoId, fechaInicio, fechaFin, banco, sucursalBanco, denominaciones }
+router.post('/fichas/guardar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  res.status(201).json(await fichasGuardadas.guardar(req.body ?? {}, req.user));
+}));
+
+// GET /api/reportes-por-facturar/fichas/guardadas?rfc=&centroCostoId=&q= (q = folio de ficha, remisión o factura / global)
+router.get('/fichas/guardadas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  const { rfc, centroCostoId, q } = req.query;
+  res.json(await fichasGuardadas.listar({ rfc, centroCostoId, q }));
+}));
+
+// GET /api/reportes-por-facturar/fichas/guardadas/:id?rfc=
+router.get('/fichas/guardadas/:id', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  res.json(await fichasGuardadas.obtener({ rfc: req.query.rfc, id: req.params.id }));
+}));
+
+// POST /api/reportes-por-facturar/fichas/guardadas/:id/cancelar { rfc, motivo } — solo administrador
+router.post('/fichas/guardadas/:id/cancelar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  const { rfc, motivo } = req.body ?? {};
+  res.json(await fichasGuardadas.cancelar({ rfc, id: req.params.id, motivo }, req.user));
 }));
 
 // GET /api/reportes-por-facturar/:id — reporte con sus tablas

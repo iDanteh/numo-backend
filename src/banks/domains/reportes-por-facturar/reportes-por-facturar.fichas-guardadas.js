@@ -44,17 +44,28 @@ function _validarDenominaciones(denominaciones) {
   return lista;
 }
 
+/** Uno o varios bancos de Bancos, sin repetir: [{ banco, importe? }] → [{ banco, numeroCuenta, importe }]. */
+async function _validarBancos(bancos, catalogo) {
+  const lista = Array.isArray(bancos) ? bancos : [];
+  if (!lista.length) throw new BadRequestError('Elige al menos un banco');
+  const vistos = new Set();
+  return lista.map(x => {
+    const b = catalogo.find(c => c.banco === x?.banco);
+    if (!b) throw new BadRequestError(`El banco ${x?.banco} no está en Bancos`);
+    if (vistos.has(b.banco)) throw new BadRequestError(`El banco ${b.banco} está repetido`);
+    vistos.add(b.banco);
+    return { banco: b.banco, numeroCuenta: b.numeroCuenta ?? null, importe: _r2(x?.importe) };
+  });
+}
+
 /**
  * Recalcula la ficha, valida y la guarda con folio. 409 si alguna caja ya está
  * en otra ficha vigente o si Kore no respondió alguna caja.
  */
-async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin, banco, sucursalBanco, denominaciones }, user) {
+async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucursalBanco, denominaciones }, user) {
   const { calcularFicha, listarBancos } = require('./reportes-por-facturar.fichas');
-  if (!banco) throw new BadRequestError('Elige el banco');
-  const bancos = await listarBancos();
-  const b = bancos.find(x => x.banco === banco);
-  if (!b) throw new BadRequestError(`El banco ${banco} no está en Bancos`);
   const dens = _validarDenominaciones(denominaciones);
+  const elegidos = await _validarBancos(bancos, await listarBancos());
 
   const ficha = await calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin });
   if (ficha.incompleta) throw new ConflictError('Kore no respondió alguna caja; vuelve a generar la ficha antes de guardarla.');
@@ -69,12 +80,22 @@ async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin, banco, sucur
     throw new BadRequestError(`Las denominaciones ($${totalContado.toFixed(2)}) no dan el total a entregar ($${ficha.totales.totalEntregar.toFixed(2)}).`);
   }
 
+  // Un banco: se le deposita todo lo contado. Varios: lo que se capturó en cada uno, que tiene que sumar lo contado.
+  if (elegidos.length === 1) elegidos[0].importe = totalContado;
+  else {
+    if (elegidos.some(b => !(b.importe > 0))) throw new BadRequestError('Pon cuánto se deposita en cada banco');
+    const suma = _r2(elegidos.reduce((s, b) => s + b.importe, 0));
+    if (Math.abs(suma - totalContado) >= 0.01) {
+      throw new BadRequestError(`Lo de los bancos ($${suma.toFixed(2)}) no da lo contado ($${totalContado.toFixed(2)}).`);
+    }
+  }
+
   const { seq } = await Counter.nextSeq(`fichaEfectivo_${rfc}`);
   const doc = await FichaEfectivo.create({
     folio: seq, rfc, centroCostoId: ficha.centroCostoId, sucursal: ficha.sucursal, series: ficha.series,
     fechaInicio: ficha.fechaInicio, fechaFin: ficha.fechaFin,
     cajas: ficha.cortes.map(c => `${c.serie}|${c.dia}`),
-    banco: b.banco, numeroCuenta: b.numeroCuenta, sucursalBanco: String(sucursalBanco ?? '').trim().slice(0, 40) || null,
+    bancos: elegidos, sucursalBanco: String(sucursalBanco ?? '').trim().slice(0, 40) || null,
     denominaciones: dens, totalContado, diferencia,
     totales: ficha.totales, cortes: ficha.cortes, detalle: ficha.detalle,
     creadoPor: _usuario(user),
@@ -97,7 +118,7 @@ async function listar({ rfc, centroCostoId, q, limite = 100 }) {
     filtro.$or = or;
   }
   const docs = await FichaEfectivo.find(filtro).sort({ createdAt: -1 }).limit(Math.min(Number(limite) || 100, 500))
-    .select('folio sucursal series fechaInicio fechaFin banco numeroCuenta totales.totalEntregar totalContado estado creadoPor createdAt canceladaEn motivoCancelacion' + (texto ? ' detalle' : ''))
+    .select('folio sucursal series fechaInicio fechaFin bancos totales.totalEntregar totalContado estado creadoPor createdAt canceladaEn motivoCancelacion' + (texto ? ' detalle' : ''))
     .lean();
   return docs.map(d => {
     const { detalle, ...resto } = d;

@@ -20,13 +20,13 @@ const fichaCalc = (extra = {}) => ({
   detalle: [{ dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-2', importe: 1520.39 }],
   yaEnFicha: [], incompleta: false, ...extra,
 });
-const base = { rfc: 'R', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31', banco: 'Banorte' };
+const base = { rfc: 'R', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31', bancos: [{ banco: 'Banorte' }] };
 // $1,520.00 contado vs $1,520.39 → diferencia de centavos, aceptada.
 const DEN = [{ tipo: 'Billete', valor: 500, cantidad: 3 }, { tipo: 'Moneda', valor: 10, cantidad: 2 }, { tipo: 'Moneda', valor: 1, cantidad: 0 }];
 
 beforeEach(() => {
   jest.clearAllMocks();
-  fichas.listarBancos.mockResolvedValue([{ banco: 'Banorte', numeroCuenta: '0123' }]);
+  fichas.listarBancos.mockResolvedValue([{ banco: 'Banorte', numeroCuenta: '0123' }, { banco: 'BBVA', numeroCuenta: null }]);
   fichas.calcularFicha.mockResolvedValue(fichaCalc());
   FichaEfectivo.create.mockImplementation(async d => ({ toObject: () => d }));
 });
@@ -34,7 +34,7 @@ beforeEach(() => {
 test('guardar: recalcula, valida denominaciones y guarda con folio, banco, cajas y detalle', async () => {
   const r = await svc.guardar({ ...base, sucursalBanco: ' 123 ', denominaciones: DEN }, { dbId: '5', nombre: 'Ana' });
   expect(r).toMatchObject({
-    folio: 7, banco: 'Banorte', numeroCuenta: '0123', sucursalBanco: '123', cajas: ['C0|2026-10-31'],
+    folio: 7, bancos: [{ banco: 'Banorte', numeroCuenta: '0123', importe: 1520 }], sucursalBanco: '123', cajas: ['C0|2026-10-31'],
     totalContado: 1520, diferencia: -0.39, creadoPor: { id: '5', nombre: 'Ana' },
   });
   expect(r.denominaciones).toEqual([{ tipo: 'Billete', valor: 500, cantidad: 3, importe: 1500 }, { tipo: 'Moneda', valor: 10, cantidad: 2, importe: 20 }]);
@@ -56,8 +56,18 @@ test('guardar: caja ya en otra ficha vigente o Kore incompleto → 409; banco fu
   await expect(svc.guardar({ ...base, denominaciones: DEN }, {})).rejects.toThrow(/ficha 3/);
   fichas.calcularFicha.mockResolvedValueOnce(fichaCalc({ incompleta: true }));
   await expect(svc.guardar({ ...base, denominaciones: DEN }, {})).rejects.toThrow(/Kore no respondió/);
-  await expect(svc.guardar({ ...base, banco: 'Otro', denominaciones: DEN }, {})).rejects.toThrow(/no está en Bancos/);
+  await expect(svc.guardar({ ...base, bancos: [{ banco: 'Otro' }], denominaciones: DEN }, {})).rejects.toThrow(/no está en Bancos/);
+  await expect(svc.guardar({ ...base, bancos: [], denominaciones: DEN }, {})).rejects.toThrow(/al menos un banco/);
   expect(FichaEfectivo.create).not.toHaveBeenCalled();
+});
+
+test('guardar: varios bancos — cada uno con su importe y que sumen lo contado', async () => {
+  const dos = (a, b) => ({ ...base, bancos: [{ banco: 'Banorte', importe: a }, { banco: 'BBVA', importe: b }], denominaciones: DEN });
+  await expect(svc.guardar(dos(1000, 0), {})).rejects.toThrow(/cada banco/);
+  await expect(svc.guardar(dos(1000, 500), {})).rejects.toThrow(/no da lo contado/);
+  await expect(svc.guardar({ ...base, bancos: [{ banco: 'BBVA' }, { banco: 'BBVA' }], denominaciones: DEN }, {})).rejects.toThrow(/repetido/);
+  const r = await svc.guardar(dos(1000, 520), {});
+  expect(r.bancos).toEqual([{ banco: 'Banorte', numeroCuenta: '0123', importe: 1000 }, { banco: 'BBVA', numeroCuenta: null, importe: 520 }]);
 });
 
 test('listar: busca por remisión / factura y devuelve los renglones que coinciden', async () => {

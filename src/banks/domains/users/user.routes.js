@@ -8,7 +8,8 @@ const roleSvc = require('./role.service');
 const userRepo = require('./repositories/user.repository');
 const rbacStore = require('../../../shared/services/rbac-store');
 // Permisos que solo un administrador puede dar o quitar (2026-11-04, "Fichas de efectivo").
-const { exigirAdminSiCambia } = require('./permisos-solo-admin');
+const { exigirAdminSiCambia, esAdmin } = require('./permisos-solo-admin');
+const { ForbiddenError } = require('../../../shared/errors/AppError');
 
 const router = express.Router();
 
@@ -90,6 +91,8 @@ router.get('/me', authenticate,
       role:   req.user.role,
       permissions,
       empresas,
+      // Sucursales permitidas (ids) — [] = todas. Por ahora solo Fichas de efectivo.
+      sucursalIds: req.user.sucursalIds ?? [],
     });
   }),
 );
@@ -129,6 +132,15 @@ router.patch('/:id/permissions', authenticate, permit('users:manage'),
     const actual = await userRepo.findById(req.params.id);
     if (actual) await exigirAdminSiCambia(req.user, actual.extraPermissions ?? [], req.body?.extraPermissions ?? []);
     res.json(await userSvc.updateExtraPermissions(req.params.id, req.body.extraPermissions));
+  }),
+);
+
+// Sucursales que puede consultar el usuario (2026-11-05) — por ahora solo Fichas de
+// efectivo. Body: { sucursalIds: number[] } — reemplaza la lista ([] = todas). Solo administrador.
+router.patch('/:id/sucursales', authenticate, permit('users:manage'),
+  asyncHandler(async (req, res) => {
+    if (!(await esAdmin(req.user))) throw new ForbiddenError('Solo un administrador puede asignar sucursales');
+    res.json(await userSvc.updateSucursales(req.params.id, req.body?.sucursalIds));
   }),
 );
 

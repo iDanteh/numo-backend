@@ -83,6 +83,11 @@ async function updateEmpresas(id, empresaRfcs) {
   return User.findByPk(id);
 }
 
+async function updateSucursales(id, sucursalIds) {
+  await User.update({ sucursalIds }, { where: { id } });
+  return User.findByPk(id);
+}
+
 async function updateExtraPermissions(id, extraPermissions) {
   await User.update({ extraPermissions }, { where: { id } });
   return User.findByPk(id);
@@ -93,6 +98,7 @@ async function create(data) {
 }
 
 module.exports = {
+  updateSucursales,
   findByAuth0Sub,
   claimSeedUser,
   findOrCreate,

@@ -7,6 +7,8 @@ jest.mock('../centros-costo/centros-costo.service', () => ({ resolveBySerieMap: 
 jest.mock('../erp/erp-sync.service', () => ({ obtenerDesglosesCobroAlmacenPorCentro: jest.fn(), obtenerDesglosesSalidasCajaPorAlmacen: jest.fn() }));
 jest.mock('../banks/BankMovement.model', () => ({ distinct: jest.fn() }));
 jest.mock('../banks/repositories/bank-config.repository', () => ({ findAllAsMap: jest.fn() }));
+jest.mock('../erp/KoreRemision.model', () => ({ find: jest.fn(() => ({ select: () => ({ lean: async () => [{ serie: 'C0', folio: '2', nombre: 'JUAN PEREZ' }] }) })) }));
+jest.mock('./reportes-por-facturar.fichas-guardadas', () => ({ cajasYaGuardadas: jest.fn(async () => []) }));
 jest.mock('./reportes-por-facturar.facturas-kore', () => ({ traerFacturasRecientes: jest.fn(async () => ({ dias: [], nuevas: 0, error: null })) }));
 
 const CFDI = require('../../../visor/models/CFDI');
@@ -43,8 +45,10 @@ test('listarGlobales valida el rango', async () => {
 });
 
 test('calcularFicha: efectivo de la caja del día por concepto, menos devoluciones y faltante', async () => {
+  // Facturas del detalle: C0-1 es la global (público en general).
+  CFDI.find.mockReturnValue(lean([{ uuid: 'G1', serie: 'C0', folio: '1', receptor: { rfc: 'XAXX010101000', nombre: 'PUBLICO EN GENERAL' }, source: 'ERP' }]));
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
-    { serieVenta: 'C0', folioVenta: '1', serieFactura: 'C0', cobros: [
+    { serieVenta: 'C0', folioVenta: '1', serieFactura: 'C0', folioFactura: '1', cobros: [
       cobro('CBT', 1000, [EF(1000)]),                                                      // facturado
       cobro('CBT', 100, [EF(100), { claveSat: '04', nombre: 'TARJETA DE CREDITO', monto: 100 }]), // mixto que excede → 50
       cobro('CBT', 500, [{ claveSat: '28', nombre: 'TARJETA DE DEBITO', monto: 500 }]),    // no va
@@ -76,12 +80,22 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   expect(r.totales.totalEntregar).toBe(1649.06);
   expect(r.sucursal).toBe('CONSTRUCASA');
   expect(r.advertencias).toBeNull();
+  expect(r.incompleta).toBe(false);
+  // Rastro: el detalle suma lo mismo que el total y cada cobro trae remisión / factura / global.
+  expect(Math.round(r.detalle.reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1649.06);
+  const porFacturar = r.detalle.find(d => d.concepto === 'efectivoPorFacturar');
+  expect(porFacturar).toMatchObject({ remision: 'C0-2', factura: null, cliente: 'JUAN PEREZ', importe: 170.39 });
+  const facturado = r.detalle.find(d => d.concepto === 'efectivoFacturado');
+  expect(facturado).toMatchObject({ remision: 'C0-1', factura: 'C0-1', facturaUuid: 'G1', esGlobal: true });
+  expect(r.detalle.find(d => d.concepto === 'devoluciones')).toMatchObject({ importe: -20.78 });
+  expect(r.detalle.some(d => d.concepto === 'depositoEfectivo' || d.concepto === 'saldoFavor')).toBe(false);
 });
 
 test('calcularFicha: rango de varios días — una caja por día, días sin efectivo no salen', async () => {
   erp.obtenerDesglosesCobroAlmacenPorCentro.mockImplementation(async ({ fechaDesde }) =>
     fechaDesde.startsWith('2026-11-01') ? [{ serieFactura: null, cobros: [cobro('CBT', 100, [EF(100)], { fecha: '2026-11-01T18:00:00Z' })] }] : []);
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  CFDI.find.mockReturnValue(lean([]));
   const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-11-02' });
   expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(3);
   expect(r.cortes.map(c => [c.dia, c.totalEntregar])).toEqual([['2026-11-01', 100]]);
@@ -93,6 +107,7 @@ test('calcularFicha: Kore sin respuesta → se omite esa caja con advertencia', 
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
   const r = await fichas.calcularFicha({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
   expect(r.cortes).toEqual([]);
+  expect(r.incompleta).toBe(true);
   expect(r.advertencias[0]).toMatch(/no respondió la caja C0 del 2026-10-31/);
 });
 

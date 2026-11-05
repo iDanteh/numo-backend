@@ -55,6 +55,7 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
       cobro('CBT', 50.78, [{ claveSat: '01', nombre: 'PUNTOS', monto: 50.78 }]),           // puntos: no es efectivo
       cobro('CFC', 300, [EF(300)]),                                                        // cobranza
       cobro('ABO', 150, [EF(150)]),                                                        // abono
+      cobro('MIS', 40, [EF(40)]),                                                          // venta miscelánea
       cobro('APA', 80, [EF(5), { claveSat: '30', nombre: 'SALDO A FAVOR', monto: 80 }]),  // fuera
       cobro('CBT', 70, [{ claveSat: '30', nombre: 'SALDO A FAVOR', monto: 70 }]),          // informativo
       cobro('CPF', 400, [{ claveSat: '01', nombre: 'DEPOSITO EN EFECTIVO', monto: 400 }]), // informativo
@@ -73,16 +74,17 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   expect(r.cortes).toHaveLength(1);
   expect(r.cortes[0]).toMatchObject({
     serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA',
-    efectivoFacturado: 1050, efectivoPorFacturar: 170.39, cobranzaEfectivo: 300, abonosEfectivo: 150,
+    efectivoFacturado: 1050, efectivoPorFacturar: 170.39, miscelaneaEfectivo: 40, cobranzaEfectivo: 300, abonosEfectivo: 150,
     devoluciones: 20.78, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
-    totalEntregar: 1649.06,
+    totalEntregar: 1689.06,
   });
-  expect(r.totales.totalEntregar).toBe(1649.06);
+  expect(r.totales.totalEntregar).toBe(1689.06);
   expect(r.sucursal).toBe('CONSTRUCASA');
   expect(r.advertencias).toBeNull();
   expect(r.incompleta).toBe(false);
   // Rastro: el detalle suma lo mismo que el total y cada cobro trae remisión / factura / global.
-  expect(Math.round(r.detalle.reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1649.06);
+  expect(Math.round(r.detalle.reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1689.06);
+  expect(r.detalle.find(d => d.concepto === 'miscelaneaEfectivo')).toMatchObject({ cobro: 'MIS-1', importe: 40 });
   const porFacturar = r.detalle.find(d => d.concepto === 'efectivoPorFacturar');
   expect(porFacturar).toMatchObject({ remision: 'C0-2', factura: null, cliente: 'JUAN PEREZ', importe: 170.39 });
   const facturado = r.detalle.find(d => d.concepto === 'efectivoFacturado');

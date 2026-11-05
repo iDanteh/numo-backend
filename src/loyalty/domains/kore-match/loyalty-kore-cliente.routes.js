@@ -15,11 +15,17 @@
 const express = require('express');
 const { verifyKoreApiKey } = require('../../../shared/middleware/kore-api-key-auth');
 const { asyncHandler } = require('../../../shared/middleware/error-handler');
+const { logger } = require('../../../shared/utils/logger');
 const clienteService = require('./loyalty-kore-cliente.service');
 
 const router = express.Router();
 
 router.post('/clientes', verifyKoreApiKey, asyncHandler(async (req, res) => {
+  // Diagnóstico temporal (2026-11-05): no había forma de correlacionar un 409/404 de este
+  // webhook con el payload real que lo disparó — los logs de error solo traían el stack y la
+  // URL. Loguear el body entero en cada request permite reconstruir la secuencia exacta de
+  // eventos (alta/actualizacion/baja) que manda Kore al reproducir un caso en producción.
+  logger.info('[KoreClienteWebhook] payload recibido', req.body);
   res.json(await clienteService.procesarClienteKore(req.body));
 }));
 

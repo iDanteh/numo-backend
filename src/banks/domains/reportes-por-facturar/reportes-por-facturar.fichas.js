@@ -35,6 +35,9 @@ const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kor
 const { BadRequestError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
+// Ficha (2026-11-05, decisión del usuario): ~3 s por día en Kore, consultados uno por uno — con
+// más días la petición se acerca al tiempo de espera de nginx (60 s).
+const MAX_DIAS_FICHA = 10;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
@@ -243,7 +246,7 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   if (centroCostoId == null || centroCostoId === '') throw new BadRequestError('Elige la sucursal');
   if (!FECHA_RE.test(fechaInicio ?? '') || !FECHA_RE.test(fechaFin ?? '')) throw new BadRequestError('Fechas inválidas (formato YYYY-MM-DD)');
   if (fechaFin < fechaInicio) throw new BadRequestError('La fecha final no puede ser anterior a la inicial');
-  if (_dias(fechaInicio, fechaFin) > MAX_DIAS_RANGO) throw new BadRequestError(`El rango no puede pasar de ${MAX_DIAS_RANGO} días`);
+  if (_dias(fechaInicio, fechaFin) > MAX_DIAS_FICHA) throw new BadRequestError(`El rango no puede pasar de ${MAX_DIAS_FICHA} días`);
 
   const ccBySerieMap = await centrosSvc.resolveBySerieMap();
   const entradas = Object.entries(ccBySerieMap).filter(([, c]) => String(c?.id) === String(centroCostoId));

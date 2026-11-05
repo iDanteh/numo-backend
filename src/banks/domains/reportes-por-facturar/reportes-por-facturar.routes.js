@@ -9,6 +9,7 @@ const estadistica              = require('./reportes-por-facturar.estadistica');
 const fichas                   = require('./reportes-por-facturar.fichas');
 const fichasGuardadas          = require('./reportes-por-facturar.fichas-guardadas');
 const rbacStore                = require('../../../shared/services/rbac-store');
+const { ForbiddenError, NotFoundError } = require('../../../shared/errors/AppError');
 
 const router = express.Router();
 
@@ -77,6 +78,25 @@ const PERM_FICHAS = 'reportes:fichas-efectivo';
 // Anexo (detalle de cada venta): solo administrador ('*') o este permiso (2026-11-05).
 const PERM_ANEXO = 'reportes:fichas-efectivo:anexo';
 const _puedeAnexo = req => rbacStore.hasPermission(req.user?.role, PERM_ANEXO, req.user?.extraPermissions);
+/**
+ * Sucursales que puede consultar el usuario en Fichas de efectivo (2026-11-05):
+ * null = todas (administrador o sin sucursales asignadas); si no, Set de ids.
+ */
+async function _sucursalesPermitidas(req) {
+  const ids = (req.user?.sucursalIds ?? []).map(Number).filter(Number.isInteger);
+  if (!ids.length) return null;
+  if (await rbacStore.hasPermission(req.user?.role, '*', [])) return null;
+  return new Set(ids);
+}
+/** 403 si la sucursal pedida no es de las suyas. */
+async function _exigirSucursal(req, centroCostoId) {
+  const permitidas = await _sucursalesPermitidas(req);
+  if (permitidas && !permitidas.has(Number(centroCostoId))) {
+    throw new ForbiddenError('No tienes acceso a esa sucursal');
+  }
+  return permitidas;
+}
+
 /** Quita el anexo (detalle / coincidencias) si el usuario no puede verlo. */
 async function _sinAnexoSiNoPuede(req, data) {
   if (await _puedeAnexo(req)) return data;
@@ -87,6 +107,7 @@ async function _sinAnexoSiNoPuede(req, data) {
 // GET /api/reportes-por-facturar/fichas/globales?rfc=&centroCostoId=&fechaInicio=&fechaFin= → facturas globales del periodo
 router.get('/fichas/globales', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, fechaInicio, fechaFin } = req.query;
+  await _exigirSucursal(req, centroCostoId);
   res.json(await fichas.listarGlobales({ rfc, centroCostoId: centroCostoId || null, fechaInicio, fechaFin }));
 }));
 
@@ -98,24 +119,31 @@ router.get('/fichas/bancos', authenticate, permit(PERM_FICHAS), asyncHandler(asy
 // POST /api/reportes-por-facturar/fichas { rfc, centroCostoId, fechaInicio, fechaFin } → efectivo de la caja de la sucursal en cada día del rango y la suma
 router.post('/fichas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, fechaInicio, fechaFin } = req.body ?? {};
+  await _exigirSucursal(req, centroCostoId);
   res.json(await _sinAnexoSiNoPuede(req, await fichas.calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin })));
 }));
 
 // ── Fichas guardadas (2026-11-05): rastro venta → factura / global → ficha ──
 // POST /api/reportes-por-facturar/fichas/guardar { rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucursalBanco, denominaciones }
 router.post('/fichas/guardar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  await _exigirSucursal(req, req.body?.centroCostoId);
   res.status(201).json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.guardar(req.body ?? {}, req.user)));
 }));
 
 // GET /api/reportes-por-facturar/fichas/guardadas?rfc=&centroCostoId=&q= (q = folio de ficha, remisión o factura / global)
 router.get('/fichas/guardadas', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
   const { rfc, centroCostoId, q } = req.query;
-  res.json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.listar({ rfc, centroCostoId, q })));
+  const permitidas = centroCostoId ? await _exigirSucursal(req, centroCostoId) : await _sucursalesPermitidas(req);
+  const centroCostoIds = permitidas ? [...permitidas] : null;
+  res.json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.listar({ rfc, centroCostoId, centroCostoIds, q })));
 }));
 
 // GET /api/reportes-por-facturar/fichas/guardadas/:id?rfc=
 router.get('/fichas/guardadas/:id', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
-  res.json(await _sinAnexoSiNoPuede(req, await fichasGuardadas.obtener({ rfc: req.query.rfc, id: req.params.id })));
+  const ficha = await fichasGuardadas.obtener({ rfc: req.query.rfc, id: req.params.id });
+  const permitidas = await _sucursalesPermitidas(req);
+  if (permitidas && !permitidas.has(Number(ficha.centroCostoId))) throw new NotFoundError('Ficha no encontrada');
+  res.json(await _sinAnexoSiNoPuede(req, ficha));
 }));
 
 // POST /api/reportes-por-facturar/fichas/guardadas/:id/cancelar { rfc, motivo } — solo administrador

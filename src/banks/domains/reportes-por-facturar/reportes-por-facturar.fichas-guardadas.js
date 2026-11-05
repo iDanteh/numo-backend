@@ -148,10 +148,12 @@ async function guardar({ rfc, centroCostoId, fechaInicio, fechaFin, bancos, sucu
  * Historial. `q`: folio de ficha, remisión (C0-261100086) o factura / global
  * (A0-261100676); sin q, las últimas.
  */
-async function listar({ rfc, centroCostoId, q, limite = 100 }) {
+async function listar({ rfc, centroCostoId, centroCostoIds = null, q, limite = 100 }) {
   if (!rfc) throw new BadRequestError('RFC requerido');
   const filtro = { rfc };
   if (centroCostoId != null && centroCostoId !== '') filtro.centroCostoId = Number(centroCostoId);
+  // Usuario con sucursales asignadas (2026-11-05): solo las suyas.
+  else if (Array.isArray(centroCostoIds)) filtro.centroCostoId = { $in: centroCostoIds.map(Number) };
   const texto = String(q ?? '').trim().toUpperCase().replace(/\s+/g, '');
   if (texto) {
     const or = [{ 'detalle.remision': texto }, { 'detalle.factura': texto }];

@@ -80,12 +80,12 @@ const PERM_ANEXO = 'reportes:fichas-efectivo:anexo';
 const _puedeAnexo = req => rbacStore.hasPermission(req.user?.role, PERM_ANEXO, req.user?.extraPermissions);
 /**
  * Sucursales que puede consultar el usuario en Fichas de efectivo (2026-11-05):
- * null = todas (administrador o sin sucursales asignadas); si no, Set de ids.
+ * null = todas (sin sucursales asignadas); si no, Set de ids. Aplica también al
+ * administrador (2026-11-05, pedido del usuario): si tiene sucursales, solo ve esas.
  */
 async function _sucursalesPermitidas(req) {
   const ids = (req.user?.sucursalIds ?? []).map(Number).filter(Number.isInteger);
   if (!ids.length) return null;
-  if (await rbacStore.hasPermission(req.user?.role, '*', [])) return null;
   return new Set(ids);
 }
 /** 403 si la sucursal pedida no es de las suyas. */

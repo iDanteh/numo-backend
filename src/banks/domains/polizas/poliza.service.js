@@ -933,6 +933,85 @@ function _lineaNetpayAmex({ grossAmex, centroCostoObj, amexSinReporte = 0 }, cue
     debe: grossAmex, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null };
 }
 
+// ── VENTAS SHOPIFY (2026-11-05, pedido del usuario) ─────────────────────────
+// La Tarjeta de las ventas en línea (clientes de Kore "MOSTRADOR ECOMMERCE
+// CLIENTE", "CLIENTE MOSTRADOR SHOPIFY", "CLIENTE MOSTRADOR ROTOPLAS") sale del
+// total de Tarjeta (consolidado y NetPay) y va en UN renglón "VENTAS SHOPIFY"
+// por almacén de la póliza, a 1102011001, SIN desglose de comisión (por ahora).
+// En un pago mixto solo entra la parte de Tarjeta (la línea de la póliza ya es
+// solo el monto de esa forma de pago).
+// El cliente no viene en la póliza (la Global dice PUBLICO EN GENERAL): se pide
+// a Kore /cuentas-pendientes, que filtra por palabra del nombre (una palabra por
+// consulta; probado 2026-11-05, 'SHOPIFY' → solo sus cuentas en ~3 s).
+const PALABRAS_CLIENTES_SHOPIFY = ['ECOMMERCE', 'SHOPIFY', 'ROTOPLAS'];
+const RE_CLIENTES_SHOPIFY = /ECOMMERCE|SHOPIFY|ROTOPLAS/i;
+const CONCEPTO_VENTAS_SHOPIFY = 'VENTAS SHOPIFY';
+const DIAS_ATRAS_TICKETS_SHOPIFY = 3; // ventas de medianoche / cobradas un día después
+const _cacheTicketsShopify = new Map(); // día → { en, tickets:Set }
+
+async function _ticketsClientesShopify(dia) {
+  const hoy = new Date().toISOString().slice(0, 10);
+  const c = _cacheTicketsShopify.get(dia);
+  const ttl = dia >= hoy ? 10 * 60 * 1000 : 6 * 60 * 60 * 1000;
+  if (c && Date.now() - c.en < ttl) return c.tickets;
+  const { sincronizarCuentasPendientes } = require('../erp/erp-sync.service');
+  const desde = new Date(Date.parse(`${dia}T00:00:00Z`) - DIAS_ATRAS_TICKETS_SHOPIFY * 86400000).toISOString().slice(0, 10);
+  const respuestas = await Promise.all(PALABRAS_CLIENTES_SHOPIFY.map(nombrePersona =>
+    sincronizarCuentasPendientes({ fechaDesde: `${desde}T00:00:00-06:00`, fechaHasta: `${dia}T23:59:59-06:00`, nombrePersona })));
+  const tickets = new Set();
+  for (const { raw } of respuestas) {
+    for (const cta of raw ?? []) {
+      if (!RE_CLIENTES_SHOPIFY.test(cta?.nombrePersona || '')) continue;
+      const serie = cta.serieExterna || cta.serie;
+      const folio = cta.folioExterno || cta.folio;
+      if (serie && folio) tickets.add(`${serie}-${folio}`);
+    }
+  }
+  _cacheTicketsShopify.set(dia, { en: Date.now(), tickets });
+  return tickets;
+}
+
+/**
+ * Líneas de Tarjeta (ventas del día) de clientes Shopify/ecommerce, por centro.
+ * Si Kore falla, regresa vacío: la Tarjeta se queda en el total como antes.
+ * `obtenerTickets` es inyectable para pruebas.
+ */
+async function construirVentasShopifyInfo(movimientos, fechaFinal, obtenerTickets = _ticketsClientesShopify) {
+  const vacio = { ids: new Set(), porCentro: new Map() };
+  // Solo Contado (PUE): es el único bloque que consolida la Tarjeta y respeta
+  // `matchedIds`; una venta PPD va en Crédito y no debe contarse dos veces.
+  const tarjeta = (movimientos ?? []).filter(m => m.tipoOrigen === 'Venta' && m.metodoPago !== 'PPD' && Number(m.debe) > 0 && !(Number(m.haber) > 0)
+    && LABEL_FORMA_PAGO_CONSOLIDADO[m.formaPago] === 'TARJETA' && m.serieVentaTicket && m.folioVentaTicket && m.centroCostoObj?.id);
+  if (!tarjeta.length) return vacio;
+  let tickets;
+  try {
+    tickets = await obtenerTickets(fechaFinal.toISOString().slice(0, 10));
+  } catch (err) {
+    const { logger } = require('../../../shared/utils/logger');
+    logger.warn(`[Poliza] No se pudo consultar en Kore los clientes Shopify, la Tarjeta queda en el total: ${err.message}`);
+    return vacio;
+  }
+  if (!tickets?.size) return vacio;
+  const ids = new Set();
+  const porCentro = new Map();
+  for (const m of tarjeta) {
+    const ticket = `${m.serieVentaTicket}-${m.folioVentaTicket}`;
+    if (!tickets.has(ticket)) continue;
+    ids.add(m.id);
+    const cc = m.centroCostoObj;
+    if (!porCentro.has(cc.id)) porCentro.set(cc.id, { gross: 0, centroCostoObj: cc, detalle: [] });
+    const p = porCentro.get(cc.id);
+    p.gross = Math.round((p.gross + Number(m.debe)) * 100) / 100;
+    p.detalle.push({ fila: m, ticket, monto: Number(m.debe) });
+  }
+  return { ids, porCentro };
+}
+
+function _lineaVentasShopify({ gross, centroCostoObj }, cuentaDepositosReal) {
+  return { cuenta: cuentaDepositosReal, serie: 'SHOPIFY', concepto: CONCEPTO_VENTAS_SHOPIFY, centroCosto: centroCostoObj.clave,
+    debe: gross, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null };
+}
+
 // Elige, de las entradas bancarias reales ligadas a un ticket (ver
 // `construirBancoRealPorTicket`), la que corresponde a una línea puntual por
 // su MONTO — normalmente hay una sola entrada y no hace falta elegir; cuando
@@ -2387,7 +2466,7 @@ const NOTA_AJUSTE_SIN_CFDI = {
 // sucursal → cobros sin factura → Otros Ingresos. Cada renglón de cobro lleva
 // su grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
 const ORDEN_COBRO = {
-  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NO_IDENTIFICADO: 4.5, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, SF: 7,
+  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NO_IDENTIFICADO: 4.5, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, VENTAS_SHOPIFY: 6.7, SF: 7,
   COBRO_OTRA_SUCURSAL: 8, COBRO_SIN_FACTURA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
 };
 // Cobranza: cobro de un mes anterior al complemento (ver cobranza-poliza-generator.service.js).
@@ -2908,6 +2987,12 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       if (infoCentro.grossAmex > 0 && netpayInfo.cuentaAmex) {
         lineasNetpay.push({ ..._lineaNetpayAmex(infoCentro, netpayInfo.cuentaAmex), _ordenCobro: ORDEN_COBRO.NETPAY_AMEX });
       }
+    }
+  }
+  // VENTAS SHOPIFY (2026-11-05): un renglón por almacén, sin comisión.
+  if (netpayInfo?.shopifyPorCentro?.size && cuentaDepositosReal) {
+    for (const infoCentro of netpayInfo.shopifyPorCentro.values()) {
+      if (infoCentro.gross > 0) lineasNetpay.push({ ..._lineaVentasShopify(infoCentro, cuentaDepositosReal), _ordenCobro: ORDEN_COBRO.VENTAS_SHOPIFY });
     }
   }
 
@@ -4263,9 +4348,17 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // `construirNetpayInfo`), así que esta consulta nunca aportaba nada ahí;
   // se condiciona para no pagar el costo de las queries a AccountPlan/Terminal
   // en cada export de Cobranza (2026-09-21, pedido explícito del usuario).
+  // VENTAS SHOPIFY (2026-11-05): su Tarjeta sale antes de NetPay y del
+  // consolidado (ver `construirVentasShopifyInfo`).
+  const shopifyInfo = poliza.tipo === 'I' && cuentaDepositosReal
+    ? await construirVentasShopifyInfo(movimientos, fechaFinal)
+    : { ids: new Set(), porCentro: new Map() };
   const netpayInfo = poliza.tipo === 'I'
-    ? await construirNetpayInfo(movimientos, fechaFinal)
+    ? await construirNetpayInfo(shopifyInfo.ids.size ? movimientos.filter(m => !shopifyInfo.ids.has(m.id)) : movimientos, fechaFinal)
     : { matchedIds: new Set(), porCentro: new Map(), cuentasComision: null };
+  // Mismo camino que una línea ligada a NetPay: fuera del consolidado de Tarjeta.
+  for (const id of shopifyInfo.ids) netpayInfo.matchedIds.add(id);
+  netpayInfo.shopifyPorCentro = shopifyInfo.porCentro;
   // Autorización real de Tarjeta por TICKET (no por CFDI completo, ver
   // `construirBancoRealPorTicket`) — solo las líneas partidas por
   // el desglose real de cobro traen `serieVentaTicket`/`folioVentaTicket`.
@@ -4898,6 +4991,23 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // del día en la póliza, `_lineasNetpay`); esta sección deja rastrear el
   // detalle venta por venta detrás de esos totales, igual que ya se hace para
   // Depósitos/Anticipos arriba.
+  // VENTAS SHOPIFY (2026-11-05): qué ventas forman el renglón de cada almacén.
+  for (const infoCentro of netpayInfo?.shopifyPorCentro?.values() ?? []) {
+    const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
+    for (const d of infoCentro.detalle ?? []) {
+      desgloseConsolidado.push({
+        cuenta: null, centroCosto, tipo: 'Venta', transferencia: 'No', formaPago: CONCEPTO_VENTAS_SHOPIFY,
+        cfdiSerie: d.fila.serie || '', ventaSerie: d.ticket,
+        cliente: nombresClientes.get((d.fila.cfdiUuid || '').toUpperCase()) || '',
+        monto: d.monto, nota: 'Tarjeta de cliente Shopify / ecommerce (sin comisión)',
+      });
+    }
+    desgloseConsolidado.push({
+      cuenta: null, centroCosto, tipo: 'Resumen', transferencia: 'No', formaPago: CONCEPTO_VENTAS_SHOPIFY, cfdiSerie: '', cliente: '',
+      monto: infoCentro.gross, nota: `${CONCEPTO_VENTAS_SHOPIFY}: ${infoCentro.detalle.length} venta(s) con tarjeta, fuera del total de Tarjeta y de NetPay`,
+    });
+  }
+
   if (netpayInfo?.porCentro?.size) {
     for (const infoCentro of netpayInfo.porCentro.values()) {
       const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
@@ -5987,5 +6097,6 @@ module.exports = {
   _construirVerdadBancaria: construirVerdadBancaria, _opcionesVerdadBancariaExport: opcionesVerdadBancariaExport, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
+  _construirVentasShopifyInfo: construirVentasShopifyInfo, _lineaVentasShopify, _ticketsClientesShopify,
   _construirWorkbookPoliza,
 };

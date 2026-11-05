@@ -11,6 +11,7 @@ const mongoose = require('mongoose');
 const montosSchema = new mongoose.Schema({
   efectivoFacturado:   Number,
   efectivoPorFacturar: Number,
+  miscelaneaEfectivo:  Number,
   cobranzaEfectivo:    Number,
   abonosEfectivo:      Number,
   devoluciones:        Number,
@@ -58,8 +59,8 @@ const fichaEfectivoSchema = new mongoose.Schema({
   fechaFin:       String,
   /** `SERIE|YYYY-MM-DD` de cada caja incluida. */
   cajas:          [String],
-  banco:          { type: String, default: null },
-  numeroCuenta:   { type: String, default: null },
+  /** Uno o varios bancos (2026-11-05) con lo que se deposita en cada uno. */
+  bancos:         [new mongoose.Schema({ banco: String, numeroCuenta: String, importe: Number }, { _id: false })],
   sucursalBanco:  { type: String, default: null },
   denominaciones: [denominacionSchema],
   totalContado:   Number,

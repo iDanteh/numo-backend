@@ -16,6 +16,7 @@
  *     • Efectivo por facturar: cobros (no abonos) de ventas SIN factura todavía.
  *     • Cobranza en efectivo:  otros cobros (CFC, CPF, APS, MIS…) de ventas ya facturadas.
  *     • Abonos en efectivo:    abonos (ABO).
+ *     • Venta miscelánea:      cobros MIS ("TIENDITA TYC"), facturados o no.
  *     • APA = aplicación de saldo a favor: no es dinero nuevo → fuera.
  *   menos salidas de la caja ese día (`/desgloses-salidas/caja`):
  *     • Devoluciones en efectivo (RETD) y faltante en el cierre (RPF).
@@ -37,7 +38,8 @@ const MAX_DIAS_RANGO = 31;
 const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
-const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo'];
+// miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
+const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'miscelaneaEfectivo', 'cobranzaEfectivo', 'abonosEfectivo'];
 const SALIDAS = ['devoluciones', 'faltante'];
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS];
@@ -152,6 +154,7 @@ async function _corteDeCaja({ rfc, serie, dia }) {
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
         let concepto;
         if (forma !== 'efectivo') concepto = forma;
+        else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (origen === 'ABO') concepto = 'abonosEfectivo';
         else if (!facturada) concepto = 'efectivoPorFacturar';
         else if (origen === 'CBT') concepto = 'efectivoFacturado';

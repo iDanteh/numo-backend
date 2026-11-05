@@ -115,7 +115,8 @@ test('calcularFicha: Kore sin respuesta → se omite esa caja con advertencia', 
 
 test('calcularFicha sin sucursal o con rango largo → 400', async () => {
   await expect(fichas.calcularFicha({ rfc: 'X', fechaInicio: '2026-10-31' })).rejects.toThrow(/sucursal/);
-  await expect(fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-01', fechaFin: '2026-11-15' })).rejects.toThrow(/31 días/);
+  await expect(fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-01', fechaFin: '2026-11-15' })).rejects.toThrow(/10 días/);
+  await expect(fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-01', fechaFin: '2026-10-11' })).rejects.toThrow(/10 días/);
 });
 
 test('listarBancos: los de Bancos (movimientos + configuración) con su cuenta', async () => {

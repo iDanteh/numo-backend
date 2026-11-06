@@ -463,12 +463,14 @@ async function obtenerSaldosFavor({ rfc, series, folios }) {
 // Ya liberado en producción (confirmado con el usuario 2026-08-14) —
 // polizas.CAJA_BASE_URL debe apuntar a https://app.cajas.tubosyconexiones.mx
 // igual que el resto de los endpoints de este archivo.
-async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, fechaHasta }) {
+// `sinCache` (2026-11-06, Fichas de efectivo › Actualizar anexo): pregunta a
+// Kore aunque haya caché, para ver si una remisión ya se facturó.
+async function obtenerDesglosesCobroAlmacenPorCentro({ rfc, centro, fechaDesde, fechaHasta, sinCache = false }) {
   if (!rfc) throw new Error('obtenerDesglosesCobroAlmacenPorCentro: rfc requerido (aísla la caché por empresa)');
   if (!centro || !fechaDesde || !fechaHasta) return [];
 
   const clave = `${rfc}::${centro}::${fechaDesde}::${fechaHasta}`;
-  const cacheado = _leerCache(_cacheAlmacenPorCentro, clave);
+  const cacheado = sinCache ? undefined : _leerCache(_cacheAlmacenPorCentro, clave);
   if (cacheado !== undefined) return cacheado;
 
   const baseUrl = await _cajaBaseUrlPolizas();

@@ -13,7 +13,8 @@
  *   cobros con claveCentro = serie de la sucursal y fecha (día MX) = ese día
  *   (`/desgloses-cobro/almacen?centro=`), solo la parte en EFECTIVO:
  *     • Efectivo facturado:    cobro del ticket (CBT) de una venta ya facturada.
- *     • Efectivo por facturar: cobros (no abonos) de ventas SIN factura todavía.
+ *     • Efectivo consignación (clave efectivoPorFacturar; antes "por facturar",
+ *       2026-11-06): cobros (no abonos) de ventas SIN factura todavía.
  *     • Cobranza en efectivo:  otros cobros (CFC, CPF, APS, MIS…) de ventas ya facturadas.
  *     • Abonos en efectivo:    abonos (ABO).
  *     • Venta miscelánea:      cobros MIS ("TIENDITA TYC"), facturados o no.
@@ -42,7 +43,8 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
-const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'miscelaneaEfectivo', 'cobranzaEfectivo', 'abonosEfectivo'];
+// Orden (2026-11-06, pedido del usuario): facturado, consignación, cobranza, abonos, venta miscelánea; luego lo demás.
+const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo'];
 const SALIDAS = ['devoluciones', 'faltante'];
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS];
@@ -298,6 +300,53 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 }
 
 /**
+ * Anexo › Actualizar (2026-11-06, pedido del usuario): ¿las ventas que estaban
+ * sin factura (consignación, miscelánea…) ya se facturaron? Vuelve a pedir a
+ * Kore, SIN caché, el corte de las cajas (serie + día) que tienen renglones
+ * sin factura y les pone la factura que tengan ahora (`facturadaDespues`).
+ * Los importes y conceptos NO cambian: la ficha ya se entregó así. Muta y
+ * regresa `detalle`. Las cajas se consultan una por una (429 de Kore).
+ */
+async function actualizarFacturasDetalle({ rfc, detalle }) {
+  if (!rfc) throw new BadRequestError('RFC requerido');
+  const lista = Array.isArray(detalle) ? detalle : [];
+  const sinFactura = lista.filter(d => d?.remision && !d.factura && ENTRADAS.includes(d.concepto));
+  const cajas = [...new Set(sinFactura.map(d => `${_serie(d.serie)}|${d.dia}`))]
+    .filter(c => FECHA_RE.test(c.split('|')[1] ?? ''));
+  const facturaDe = new Map(); // remisión → factura actual
+  const advertencias = [];
+  for (const caja of cajas) {
+    const [serie, dia] = caja.split('|');
+    try {
+      const cuentas = await obtenerDesglosesCobroAlmacenPorCentro({
+        rfc, centro: serie, sinCache: true,
+        fechaDesde: new Date(`${dia}T00:00:00.000-06:00`).toISOString(),
+        fechaHasta: new Date(`${dia}T23:59:59.999-06:00`).toISOString(),
+      });
+      for (const c of cuentas ?? []) {
+        if (!c.serieFactura || !c.serieVenta || !c.folioVenta) continue;
+        facturaDe.set(`${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}`, `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`);
+      }
+    } catch (err) {
+      advertencias.push(`Kore no respondió la caja ${serie} del ${dia} (${err.message}); vuelve a intentarlo.`);
+    }
+  }
+  let nuevas = 0;
+  for (const d of sinFactura) {
+    const f = facturaDe.get(d.remision);
+    if (f) { d.factura = f; d.facturadaDespues = true; nuevas++; }
+  }
+  if (nuevas) await _completarDetalle({ rfc, detalle: lista });
+  return {
+    detalle: lista,
+    nuevas,
+    siguenSinFactura: sinFactura.filter(d => !d.factura).length,
+    actualizadoEn: new Date(),
+    advertencias: advertencias.length ? advertencias : null,
+  };
+}
+
+/**
  * Bancos dados de alta en Bancos (los que tienen movimientos o configuración),
  * con su número de cuenta para la ficha.
  */
@@ -312,4 +361,4 @@ async function listarBancos() {
   return todos.map(banco => ({ banco, numeroCuenta: configs.get(banco)?.numeroCuenta ?? null }));
 }
 
-module.exports = { listarGlobales, calcularFicha, listarBancos, _corteDeCaja, ENTRADAS, SALIDAS, CONCEPTOS };
+module.exports = { listarGlobales, calcularFicha, listarBancos, actualizarFacturasDetalle, _corteDeCaja, ENTRADAS, SALIDAS, CONCEPTOS };

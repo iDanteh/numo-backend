@@ -20,7 +20,9 @@
  *     • Venta miscelánea:      cobros MIS ("TIENDITA TYC"), facturados o no.
  *     • APA = aplicación de saldo a favor: no es dinero nuevo → fuera.
  *   menos salidas de la caja ese día (`/desgloses-salidas/caja`):
- *     • Devoluciones en efectivo (RETD) y faltante en el cierre (RPF).
+ *     • Devoluciones en efectivo (RETD), retiro de efectivo (RETEF, 2026-11-06:
+ *       Reforma 31-oct $2,601.03 — la póliza ya lo resta) y faltante en el cierre (RPF).
+ *       "Salida por Transferencia" (ST) y "CIERRE CAJA" (CIC) NO restan.
  *   Informativos (no suman): depósito en efectivo (no pasa por la caja) y
  *   saldo a favor aplicado.
  *
@@ -45,7 +47,7 @@ const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
 // Orden (2026-11-06, pedido del usuario): facturado, consignación, cobranza, abonos, venta miscelánea; luego lo demás.
 const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo'];
-const SALIDAS = ['devoluciones', 'faltante'];
+const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS];
 
@@ -177,7 +179,9 @@ async function _corteDeCaja({ rfc, serie, dia }) {
   for (const s of salidas ?? []) {
     if (!s.fecha || _diaMx(s.fecha) !== dia) continue;
     const tipo = _serie(s.tipoMovimiento?.abreviatura);
-    const concepto = tipo === 'RETD' ? 'devoluciones' : tipo === 'RPF' ? 'faltante' : null;
+    const concepto = tipo === 'RETD' ? 'devoluciones'
+      : (tipo === 'RETEF' || /^RETIRO DE EFECTIVO$/i.test(String(s.tipoMovimiento?.nombre ?? '').trim())) ? 'retiroEfectivo'
+      : tipo === 'RPF' ? 'faltante' : null;
     if (!concepto) continue;
     const monto = Number(s.montoRetirado) || 0;
     montos[concepto] += monto;

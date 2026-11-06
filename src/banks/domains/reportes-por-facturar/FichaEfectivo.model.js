@@ -14,6 +14,7 @@ const montosSchema = new mongoose.Schema({
   miscelaneaEfectivo:  Number,
   cobranzaEfectivo:    Number,
   abonosEfectivo:      Number,
+  cobroOtraSucursal:   Number,
   devoluciones:        Number,
   retiroEfectivo:      Number,
   faltante:            Number,

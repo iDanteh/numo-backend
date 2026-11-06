@@ -58,6 +58,7 @@ jest.mock('./bank-indicadores.service', () => ({
   getLedgerMensual: jest.fn(),
   getLedgerPorHora: jest.fn(),
   getUltimosMovimientos: jest.fn(),
+  getAntiguedadDepositos: jest.fn(),
   getPeriodoCortePorRol: jest.fn(),
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
@@ -749,6 +750,54 @@ describe('GET /cortes/ultimos-movimientos (2026-10-30: feed de actividad recient
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
     expect(indicadoresService.getUltimosMovimientos).toHaveBeenCalledWith({ banco: null, limit: undefined });
+  });
+});
+
+describe('GET /cortes/antiguedad (2026-11-06: antigüedad del backlog vacío, por rango de días)', () => {
+  let app;
+  const FAKE_ANTIGUEDAD = {
+    rangos: [
+      { rango: '1 a 30 días', count: 1, saldo: 100 },
+      { rango: '31 a 60 días', count: 0, saldo: 0 },
+      { rango: '61 a 90 días', count: 0, saldo: 0 },
+      { rango: 'Más de 90 días', count: 0, saldo: 0 },
+    ],
+    total: { count: 1, saldo: 100 },
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getAntiguedadDepositos.mockResolvedValue(FAKE_ANTIGUEDAD);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/antiguedad')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getAntiguedadDepositos).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco al service', async () => {
+    const res = await request(app)
+      .get('/cortes/antiguedad')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_ANTIGUEDAD)));
+    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: 'BBVA' });
+  });
+
+  test('sin ?banco: se pasa null', async () => {
+    await request(app)
+      .get('/cortes/antiguedad')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: null });
   });
 });
 

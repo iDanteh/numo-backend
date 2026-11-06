@@ -18,6 +18,10 @@
  *     • Cobranza en efectivo:  otros cobros (CFC, CPF, APS, MIS…) de ventas ya facturadas.
  *     • Abonos en efectivo:    abonos (ABO).
  *     • Venta miscelánea:      cobros MIS ("TIENDITA TYC"), facturados o no.
+ *     • Cobros de otras sucursales (2026-11-06, pedido del usuario): cualquier
+ *       cobro o abono en efectivo de una remisión de OTRA sucursal hecho en esta
+ *       caja (Puerto 31-oct: remisiones y abonos de CEDIS $10,785.42). Va antes
+ *       que las demás clasificaciones; la póliza los lleva a la otra sucursal o a Cobranza.
  *     • APA = aplicación de saldo a favor: no es dinero nuevo → fuera.
  *   menos salidas de la caja ese día (`/desgloses-salidas/caja`):
  *     • Devoluciones en efectivo (RETD), retiro de efectivo (RETEF, 2026-11-06:
@@ -46,7 +50,7 @@ const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
 // Orden (2026-11-06, pedido del usuario): facturado, consignación, cobranza, abonos, venta miscelánea; luego lo demás.
-const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo'];
+const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo', 'cobroOtraSucursal'];
 const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS];
@@ -129,7 +133,8 @@ async function listarGlobales({ rfc, centroCostoId, fechaInicio, fechaFin }) {
  * cada cobro / salida que lo forma (2026-11-05: el usuario quiere el rastro
  * venta → factura / global → ficha).
  */
-async function _corteDeCaja({ rfc, serie, dia }) {
+async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
+  const propias = new Set(seriesSucursal.map(_serie));
   const montos = Object.fromEntries(CONCEPTOS.map(k => [k, 0]));
   const detalle = [];
   const fechaDesde = new Date(`${dia}T00:00:00.000-06:00`).toISOString();
@@ -142,6 +147,8 @@ async function _corteDeCaja({ rfc, serie, dia }) {
   for (const c of cuentas ?? []) {
     const facturada = !!c.serieFactura;
     const remision = c.serieVenta && c.folioVenta ? `${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}` : null;
+    // Remisión de otra sucursal cobrada en esta caja (2026-11-06).
+    const deOtraSucursal = !!c.serieVenta && !propias.has(_serie(c.serieVenta));
     const factura = facturada ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : null;
     for (const k of c.cobros ?? []) {
       if (_serie(k.claveCentro) !== serie || !k.fecha || _diaMx(k.fecha) !== dia) continue;
@@ -161,6 +168,7 @@ async function _corteDeCaja({ rfc, serie, dia }) {
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
         let concepto;
         if (forma !== 'efectivo') concepto = forma;
+        else if (deOtraSucursal) concepto = 'cobroOtraSucursal';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (origen === 'ABO') concepto = 'abonosEfectivo';
         else if (!facturada) concepto = 'efectivoPorFacturar';
@@ -270,7 +278,7 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   for (const dia of dias) {
     for (const serie of series) {
       try {
-        const { montos, detalle: det } = await _corteDeCaja({ rfc, serie, dia });
+        const { montos, detalle: det } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series });
         if (!CONCEPTOS.some(k => montos[k])) continue; // día sin movimiento de efectivo
         filas.push({ serie, dia, sucursal, ...montos, totalEntregar: _total(montos) });
         detalle = detalle.concat(det);

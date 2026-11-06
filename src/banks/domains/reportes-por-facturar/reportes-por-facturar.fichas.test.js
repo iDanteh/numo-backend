@@ -159,3 +159,16 @@ test('Anexo › Actualizar: si Kore falla, avisa y no cambia nada', async () => 
   expect(r.advertencias[0]).toMatch(/C0 del 2026-10-31/);
   expect(detalle[0].factura).toBeNull();
 });
+
+test('calcularFicha: cobros y abonos de remisiones de OTRA sucursal van en su propio renglón (2026-11-06)', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'A0', folioVenta: '5411', serieFactura: null, cobros: [cobro('CPF', 6737.09, [EF(6737.09)])] },
+    { serieVenta: 'A0', folioVenta: '4991', serieFactura: 'A0', folioFactura: '14603', cobros: [cobro('ABO', 2725.73, [EF(2725.73)])] },
+    { serieVenta: 'C0', folioVenta: '9', serieFactura: 'C0', folioFactura: '9', cobros: [cobro('CBT', 100, [EF(100)])] },
+  ]);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  CFDI.find.mockReturnValue(lean([]));
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 9462.82, efectivoPorFacturar: 0, abonosEfectivo: 0, efectivoFacturado: 100, totalEntregar: 9562.82 });
+  expect(r.detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => d.remision)).toEqual(['A0-5411', 'A0-4991']);
+});

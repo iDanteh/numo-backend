@@ -501,6 +501,11 @@ async function syncModels() {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS sucursal_ids INTEGER[] NOT NULL DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN sucursal_ids (users):', e.message));
+  // Casilla "Todas" (2026-11-06): sin sucursales y sin esta bandera = no ve ninguna.
+  await User.sequelize.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS todas_sucursales BOOLEAN NOT NULL DEFAULT false
+  `).catch(e => console.warn('[syncModels] ADD COLUMN todas_sucursales (users):', e.message));
 
   // Configuraciones Globales (ver ConfigSection/GlobalConfig/ConfigAuditLog) — tablas
   // nuevas, force:false para solo crearlas si no existen. Orden: ConfigSection primero

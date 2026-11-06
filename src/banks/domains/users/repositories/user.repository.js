@@ -83,8 +83,8 @@ async function updateEmpresas(id, empresaRfcs) {
   return User.findByPk(id);
 }
 
-async function updateSucursales(id, sucursalIds) {
-  await User.update({ sucursalIds }, { where: { id } });
+async function updateSucursales(id, sucursalIds, todasSucursales = false) {
+  await User.update({ sucursalIds, todasSucursales }, { where: { id } });
   return User.findByPk(id);
 }
 

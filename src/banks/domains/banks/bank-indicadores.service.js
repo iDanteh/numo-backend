@@ -840,7 +840,7 @@ async function getCorteConciliacion({ periodo = 'semanal', banco = null, fechaIn
 // erpLinks (2026-10-22) para poder calcular "CxC retrasadas" (ver _calcularCxcRetrasadas)
 // reusando estos MISMOS documentos ya traídos, sin una query nueva. folio/deposito son del
 // DEPÓSITO (no de la ficha — ver _calcularCxcRetrasadas para el porqué del cambio).
-const _CORTE_HISTORICO_SELECT = 'banco fecha folio deposito status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion erpLinks';
+const _CORTE_HISTORICO_SELECT = 'banco fecha folio deposito status primeraIdentificacionAt primeraIdentificacionPor ultimoCambioStatusAt historialVinculacion erpLinks identificadoPor';
 
 async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, matchEquipo = {} }) {
   const [candidatosRezagados, candidatosNuevos, identificadosPorOrigen] = await Promise.all([
@@ -940,9 +940,27 @@ async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, ma
   return { rezagados, nuevos, identificadosEnPeriodo, cxcRetrasadas, posibleCambioPosterior };
 }
 
+// Bug real encontrado 2026-11-06, verificado contra una copia real de producción: `primeraIdentificacionAt`
+// se agregó al schema recién el 2026-08-14 (ver git blame de BankMovement.model.js), SIN backfill
+// histórico — ~30,383 de 48,105 movimientos `identificado` nunca tuvieron este campo seteado
+// porque se identificaron ANTES de esa fecha. Como `_estadoAlCierre` dependía solo de él, esos
+// movimientos quedaban "atrapados" como backlog pendiente para siempre en cualquier corte —
+// incluido el de hoy (reproducido: getLedgerMensual daba identificados:0 en mayo/junio/julio
+// pese a haber miles de identificaciones reales esos meses, y un total inflado a ~30,615 en
+// noviembre contra un backlog real de 210). `identificadoPor[]` sí tiene historial completo desde
+// el commit inicial del proyecto (2026-04-15) — se usa acá como respaldo.
+function _primeraIdentificacionEfectiva(mov) {
+  if (mov.primeraIdentificacionAt) return mov.primeraIdentificacionAt;
+  const fechas = (mov.identificadoPor || [])
+    .map(p => p.fechaId)
+    .filter(Boolean);
+  if (!fechas.length) return null;
+  return fechas.reduce((min, f) => (f < min ? f : min), fechas[0]);
+}
+
 // Reconstrucción de "¿estaba identificado al cierre `fin` de un corte histórico?" — de 1 solo
 // salto (no un replay completo de eventos, ver limitación documentada en BankMovement.model.js
-// #ultimoCambioStatusAt). `primeraIdentificacionAt` es confiable y forward-only: si existe y es
+// #ultimoCambioStatusAt). `_primeraIdentificacionEfectiva()` es forward-only: si existe y es
 // <= fin, el movimiento SE IDENTIFICÓ por primera vez a tiempo. Pero pudo haberse revertido
 // después (desvinculación de CxC) y ANTES del cierre — eso sí lo sabemos con certeza via
 // historialVinculacion (timestamp exacto de 'desvinculado'/'ajustado'). Lo que NO podemos saber
@@ -950,7 +968,7 @@ async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, ma
 // que alteró el estatus actual respecto al de `fin` — eso se expone como `posibleCambio`, nunca
 // se oculta ni se asume silenciosamente que el dato es exacto.
 function _estadoAlCierre(mov, fin) {
-  const pid = mov.primeraIdentificacionAt;
+  const pid = _primeraIdentificacionEfectiva(mov);
   const identificadoBase = !!(pid && pid <= fin);
   const revertidoAntesDeCierre = identificadoBase && (mov.historialVinculacion || []).some(h =>
     (h.accion === 'desvinculado' || h.accion === 'ajustado') && h.at > pid && h.at <= fin
@@ -1054,7 +1072,7 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
     ...baseMatch,
     createdAt: createdAtMatch,
     status: { $in: ['no_identificado', 'identificado'] },
-  }).select('deposito createdAt primeraIdentificacionAt historialVinculacion').lean();
+  }).select('deposito createdAt primeraIdentificacionAt historialVinculacion identificadoPor').lean();
 
   let inicialesCount = 0, inicialesSaldo = 0;
   let nuevosCount = 0, nuevosSaldo = 0;
@@ -1373,6 +1391,65 @@ async function getUltimosMovimientos({ banco = null, limit = 10 } = {}) {
   return { movimientos };
 }
 
+// Rangos de antigüedad del backlog "vacío" (2026-11-06, pedido explícito del usuario tras revisar
+// un mockup de referencia: retoma la idea de buckets por rango de días que se había descartado el
+// 30-oct para el dashboard mensual/diario/por-hora, pero con 2 correcciones de diseño sobre esa
+// primera versión (getCorteAntiguedadBacklog, ya eliminada de este archivo): agrupa por `fecha`
+// del depósito (el día real en el banco), no por `createdAt` (día de carga a Numo); y exige el
+// depósito COMPLETAMENTE vacío (sin ninguna CxC vinculada, ni un pago parcial) — un depósito con
+// pagos PPD en curso sigue en `no_identificado` pero ya no está "vacío", así que queda afuera. El
+// corte es SIEMPRE hoy (medianoche México): a diferencia del mockup, que ofrecía elegir una fecha
+// de corte pasada, el usuario pidió explícitamente simplificar a "hoy" para esta primera versión
+// — reconstruir si un depósito tenía o no CxC vinculada en una fecha pasada necesitaría caminar
+// `historialVinculacion[]`, fuera de alcance acá.
+const ANTIGUEDAD_RANGOS = Object.freeze(['1 a 30 días', '31 a 60 días', '61 a 90 días', 'Más de 90 días']);
+
+// Índice de rango (0-3) según días de antigüedad — mismos cortes que el mockup de referencia:
+// <=30, <=60, <=90, el resto.
+function _rangoAntiguedad(dias) {
+  if (dias <= 30) return 0;
+  if (dias <= 60) return 1;
+  if (dias <= 90) return 2;
+  return 3;
+}
+
+/**
+ * Antigüedad del backlog de depósitos no identificados y completamente vacíos (sin ninguna CxC
+ * vinculada), agrupados en 4 rangos fijos de días desde la fecha del depósito en el banco hasta
+ * HOY (medianoche México) — ver comentario de ANTIGUEDAD_RANGOS arriba para el porqué de cada
+ * decisión de diseño.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ */
+async function getAntiguedadDepositos({ banco = null } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const corteHoy = _inicioDiaMx(_hoyMexicoStr());
+  const unDiaMs = 24 * MS_PER_HOUR;
+
+  const depositos = await BankMovement.find({
+    ...baseMatch,
+    status: 'no_identificado',
+    erpIds: { $size: 0 },
+  }).select('fecha deposito').lean();
+
+  const rangos = ANTIGUEDAD_RANGOS.map((rango) => ({ rango, count: 0, saldo: 0 }));
+  let totalCount = 0, totalSaldo = 0;
+
+  for (const dep of depositos) {
+    const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
+    const dias = Math.max(0, Math.round((corteHoy.getTime() - inicioDiaDeposito.getTime()) / unDiaMs));
+    const importe = dep.deposito ?? 0;
+    const bucket = rangos[_rangoAntiguedad(dias)];
+    bucket.count += 1;
+    bucket.saldo += importe;
+    totalCount += 1;
+    totalSaldo += importe;
+  }
+
+  return { rangos, total: { count: totalCount, saldo: totalSaldo } };
+}
+
 /**
  * Excel descargable del corte de conciliación (2026-10-02, pedido explícito del usuario:
  * "que también traiga el detallado de los movimientos involucrados con su clasificación").
@@ -1610,6 +1687,9 @@ module.exports = {
   _enumerarDiasEnRango,
   _resolverMesOrigen,
   _fechaMexicoStr,
+  // Fallback de primeraIdentificacionAt vía identificadoPor[] (2026-11-06, bug real) —
+  // exportada para testearla directo.
+  _primeraIdentificacionEfectiva,
   // Dashboard mensual/por hora/feed de actividad (2026-10-30, reemplaza la vista de antigüedad
   // por rango de días — descartada a pedido del usuario tras ver un mockup de referencia) —
   // exportadas para testearlas directo, mismo criterio que el resto de este archivo.
@@ -1618,4 +1698,8 @@ module.exports = {
   getLedgerPorHora,
   _enumerarHorasDelDia,
   getUltimosMovimientos,
+  // Antigüedad del backlog vacío (2026-11-06) — exportadas para testearlas directo.
+  getAntiguedadDepositos,
+  _rangoAntiguedad,
+  ANTIGUEDAD_RANGOS,
 };

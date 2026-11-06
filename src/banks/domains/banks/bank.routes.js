@@ -283,6 +283,15 @@ router.get('/cortes/ultimos-movimientos', authenticate, permit(PERMISSIONS.BANKS
   res.json(await indicadoresService.getUltimosMovimientos({ banco: banco || null, limit: limit ? Number(limit) : undefined }));
 }));
 
+// GET /api/banks/cortes/antiguedad — antigüedad del backlog de depósitos no identificados y
+// completamente vacíos (sin ninguna CxC vinculada), en 4 rangos fijos de días desde la fecha del
+// depósito hasta hoy (2026-11-06, pedido explícito del usuario tras revisar un mockup de
+// referencia). Corte siempre "hoy" — sin fecha de corte seleccionable. Mismo permiso.
+router.get('/cortes/antiguedad', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco } = req.query;
+  res.json(await indicadoresService.getAntiguedadDepositos({ banco: banco || null }));
+}));
+
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle
 // de movimientos involucrados. Mismo permiso/criterio que /indicadores/reporte: es la MISMA
 // data ya visible en pantalla (incluido el scope por rol de /cortes, 2026-10-09), solo en

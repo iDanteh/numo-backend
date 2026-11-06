@@ -24,9 +24,10 @@ const {
   getProgresoResolucionPorCorte, getLedgerDiario,
   _folioFechaCodificada, _mesesDeAtraso, _calcularCxcRetrasadas,
   _enumerarCortesSemanales, _calcularLedgerBacklog, _enumerarDiasEnRango,
-  _resolverMesOrigen,
+  _resolverMesOrigen, _primeraIdentificacionEfectiva,
   getLedgerMensual, _enumerarMesesParaLedger, getLedgerPorHora, _enumerarHorasDelDia,
   getUltimosMovimientos,
+  getAntiguedadDepositos, _rangoAntiguedad,
 } = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
@@ -674,6 +675,58 @@ describe('_calcularLedgerBacklog (2026-10-30: ledger genérico, misma fórmula p
     const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.createdAt).toEqual({ $lte: CIERRE_ESPERADO, $gte: mesOrigenInicio, $lt: mesOrigenFin });
   });
+
+  // Bug real 2026-11-06 (verificado contra una copia de producción): `primeraIdentificacionAt`
+  // se agregó al schema el 2026-08-14 sin backfill — un movimiento identificado ANTES de esa
+  // fecha nunca tiene el campo seteado, y sin el fallback de `identificadoPor[]` quedaba
+  // "atrapado" como backlog pendiente para siempre, sin importar qué tan viejo fuera el
+  // movimiento o cuántos periodos pasaran.
+  test('bug real: movimiento identificado antes de que existiera primeraIdentificacionAt (null) se resuelve via identificadoPor[]', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // Iniciales (createdAt de un mes anterior al periodo), primeraIdentificacionAt NUNCA se
+      // seteó (identificado antes del 2026-08-14), pero identificadoPor[] sí tiene el historial
+      // real: se identificó DENTRO del periodo consultado.
+      {
+        deposito: 700, createdAt: new Date('2026-05-01T12:00:00.000Z'),
+        primeraIdentificacionAt: null, historialVinculacion: [],
+        identificadoPor: [{ nombre: 'cristiangarcia', fechaId: new Date(INICIO_CORTE_ESPERADO.getTime() + 2 * 86400000) }],
+      },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO });
+
+    expect(ledger.iniciales).toEqual({ count: 1, saldo: 700 });
+    expect(ledger.identificados).toEqual({ count: 1, saldo: 700 }); // antes del fix: 0, atrapado para siempre
+    expect(ledger.total).toEqual({ count: 0, saldo: 0 });
+  });
+});
+
+describe('_primeraIdentificacionEfectiva (2026-11-06, bug real — fallback de primeraIdentificacionAt)', () => {
+  test('si primeraIdentificacionAt existe, se usa tal cual (ignora identificadoPor)', () => {
+    const fecha = new Date('2026-08-20T10:00:00.000Z');
+    const mov = {
+      primeraIdentificacionAt: fecha,
+      identificadoPor: [{ nombre: 'katia', fechaId: new Date('2026-05-01T00:00:00.000Z') }],
+    };
+    expect(_primeraIdentificacionEfectiva(mov)).toBe(fecha);
+  });
+
+  test('sin primeraIdentificacionAt, usa el MÍNIMO de identificadoPor[].fechaId (incluye Motor ERP)', () => {
+    const mov = {
+      primeraIdentificacionAt: null,
+      identificadoPor: [
+        { nombre: 'Motor ERP', fechaId: new Date('2026-05-22T19:37:04.523Z') },
+        { nombre: 'cristiangarcia', fechaId: new Date('2026-05-06T15:56:38.305Z') },
+        { nombre: 'luisfelipe', fechaId: new Date('2026-05-18T16:44:09.703Z') },
+      ],
+    };
+    expect(_primeraIdentificacionEfectiva(mov)).toEqual(new Date('2026-05-06T15:56:38.305Z'));
+  });
+
+  test('sin primeraIdentificacionAt ni identificadoPor (o vacío) -> null', () => {
+    expect(_primeraIdentificacionEfectiva({ primeraIdentificacionAt: null, identificadoPor: [] })).toBeNull();
+    expect(_primeraIdentificacionEfectiva({ primeraIdentificacionAt: null })).toBeNull();
+  });
 });
 
 describe('Consistencia día↔semana (garantía central del diseño del ledger, no una suposición)', () => {
@@ -985,5 +1038,83 @@ describe('getCorteConciliacion / buildReporteCorte — misma fuente, mismos núm
     expect(valorDe('No identificados iniciales — total')).toBe(corte.rezagados.total);
     expect(valorDe('Nuevos del periodo — total')).toBe(corte.nuevos.total);
     expect(valorDe('Identificados en el periodo — total')).toBe(corte.identificadosEnPeriodo.total);
+  });
+});
+
+describe('_rangoAntiguedad (2026-11-06) — límites exactos de cada bucket', () => {
+  test.each([
+    [0, 0], [30, 0], [31, 1], [60, 1], [61, 2], [90, 2], [91, 3], [500, 3],
+  ])('%i días de antigüedad -> bucket %i', (dias, esperado) => {
+    expect(_rangoAntiguedad(dias)).toBe(esperado);
+  });
+});
+
+// getAntiguedadDepositos (2026-11-06, pedido explícito del usuario tras revisar un mockup de
+// referencia): retoma la idea de rangos de días que se había descartado el 30-oct, con 2
+// correcciones sobre esa primera versión — agrupa por `fecha` del depósito (no `createdAt`), y
+// exige el depósito completamente vacío (status no_identificado Y sin ninguna CxC vinculada).
+// Bajo AHORA_MX (miércoles 2026-10-07 15:00 México), "hoy" = 2026-10-07, corte = medianoche de
+// ese día (2026-10-07T06:00:00Z).
+describe('getAntiguedadDepositos', () => {
+  test('agrupa en los 4 rangos fijos según días desde `fecha` (no createdAt) hasta hoy', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // 10 días de antigüedad (2026-09-27 -> 2026-10-07) -> "1 a 30 días".
+      { deposito: 100, fecha: new Date('2026-09-27T12:00:00.000Z'), createdAt: new Date('2020-01-01') },
+      // 40 días -> "31 a 60 días".
+      { deposito: 200, fecha: new Date('2026-08-28T12:00:00.000Z') },
+      // 70 días -> "61 a 90 días".
+      { deposito: 300, fecha: new Date('2026-07-29T12:00:00.000Z') },
+      // 100 días -> "Más de 90 días".
+      { deposito: 400, fecha: new Date('2026-06-29T12:00:00.000Z') },
+    ]) }) });
+
+    const { rangos, total } = await getAntiguedadDepositos({});
+
+    expect(rangos).toEqual([
+      { rango: '1 a 30 días', count: 1, saldo: 100 },
+      { rango: '31 a 60 días', count: 1, saldo: 200 },
+      { rango: '61 a 90 días', count: 1, saldo: 300 },
+      { rango: 'Más de 90 días', count: 1, saldo: 400 },
+    ]);
+    expect(total).toEqual({ count: 4, saldo: 1000 });
+  });
+
+  test('varios depósitos en el mismo rango se acumulan (count y saldo)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 100, fecha: new Date('2026-10-05T12:00:00.000Z') }, // 2 días
+      { deposito: 50,  fecha: new Date('2026-10-01T12:00:00.000Z') }, // 6 días
+    ]) }) });
+
+    const { rangos, total } = await getAntiguedadDepositos({});
+
+    expect(rangos[0]).toEqual({ rango: '1 a 30 días', count: 2, saldo: 150 });
+    expect(total).toEqual({ count: 2, saldo: 150 });
+  });
+
+  test('consulta SOLO status no_identificado y erpIds vacío — un depósito con CxC vinculada (aunque parcial) o reclasificado/otros nunca llega acá, los excluye el propio filtro de Mongo', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await getAntiguedadDepositos({});
+
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.status).toBe('no_identificado');
+    expect(filtro.erpIds).toEqual({ $size: 0 });
+  });
+
+  test('banco: se pasa al $match (buildBaseMatch)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await getAntiguedadDepositos({ banco: 'BBVA' });
+
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.banco).toBe('BBVA');
+    expect(filtro.deposito).toEqual({ $gt: 0 });
+  });
+
+  test('sin depósitos: los 4 rangos y el total quedan en cero — no explota', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    const { rangos, total } = await getAntiguedadDepositos({});
+
+    expect(rangos.every((r) => r.count === 0 && r.saldo === 0)).toBe(true);
+    expect(rangos.map((r) => r.rango)).toEqual(['1 a 30 días', '31 a 60 días', '61 a 90 días', 'Más de 90 días']);
+    expect(total).toEqual({ count: 0, saldo: 0 });
   });
 });

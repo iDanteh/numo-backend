@@ -115,11 +115,22 @@ async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, ac
 }
 
 async function _procesarAlta({ koreClienteId, telefono, nombre }) {
-  const existente = await LoyaltyCard.findOne({ where: { telefono } });
+  // Busca primero por `koreClienteId` (identidad real y estable del cliente en Kore), igual que
+  // `actualizacion`/`baja` — recién si no aparece, por teléfono. Bug real encontrado 2026-11-05:
+  // `koreClienteId` identifica al CLIENTE, no al monedero — si elimina su tarjeta y se registra de
+  // nuevo con un teléfono DISTINTO, Kore reusa el MISMO koreClienteId. Buscando por ahí primero,
+  // ese "alta" reactiva y actualiza la MISMA fila (mismo saldo/nivel, línea de tiempo continua en
+  // `LoyaltyCardAuditLog`: alta→baja→actualizacion→...) en vez de crear una tarjeta nueva separada
+  // para el mismo cliente real — antes esto producía 2+ filas con el mismo koreClienteId, y
+  // `_buscarCard` podía resolver a la vieja en vez de la nueva (causa real del 409 "ya existe otra
+  // tarjeta con ese teléfono" al reactivar, visto en producción).
+  const existente = await _buscarCard({ koreClienteId, telefono });
   if (existente) {
-    // Idempotente: un "alta" para un teléfono que ya tiene tarjeta se trata como actualización,
-    // nunca se duplica ni se lanza error por "ya existe".
-    return _aplicarActualizacion(existente, { koreClienteId, telefono, nombre });
+    // Idempotente: un "alta" para un cliente que ya tiene tarjeta (por koreClienteId o teléfono)
+    // se trata como actualización, nunca se duplica ni se lanza error por "ya existe". `activo:
+    // true`: un "alta" sobre una tarjeta que había sido eliminada/desactivada antes debe
+    // reactivarla — para Kore esto ES un alta, no manda un evento de reactivación aparte.
+    return _aplicarActualizacion(existente, { koreClienteId, telefono, nombre, activo: true });
   }
 
   if (!String(nombre ?? '').trim()) {
@@ -133,7 +144,7 @@ async function _procesarAlta({ koreClienteId, telefono, nombre }) {
     if (err instanceof ConflictError) {
       // Carrera: otra llamada creó la tarjeta entre el findOne de arriba y este create.
       const card = await LoyaltyCard.findOne({ where: { telefono } });
-      if (card) return _aplicarActualizacion(card, { koreClienteId, telefono, nombre });
+      if (card) return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo: true });
     }
     throw err;
   }
@@ -177,12 +188,14 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * `evento`: 'alta' | 'actualizacion' | 'baja'. `koreClienteId` siempre requerido;
  * `telefono` requerido (10 dígitos) para 'alta'/'actualizacion', opcional (solo
  * como fallback de búsqueda) para 'baja'.
- * `activo` (2026-11-03): SOLO se lee/aplica en 'actualizacion' — a propósito, no en 'alta'
- * (una tarjeta recién creada siempre nace activa, reactivar es un caso de "ya existe y
- * estaba dada de baja", no de alta) ni en 'baja' (ya tiene su propio camino fijo a false).
- * `tarjetaLegada`: mismo criterio que `activo` — SOLO 'actualizacion' lo lee. Una 'alta' siempre
- * crea la tarjeta sin este dato (lo trae después el match inicial o un `actualizacion` posterior),
- * y 'baja' no tiene nada que ver con el número de tarjeta.
+ * `activo`: Kore lo manda explícitamente solo en 'actualizacion'. 'alta' nunca lo lee del
+ * payload, pero SIEMPRE fuerza `activa:true` en la tarjeta resultante (bug real 2026-11-05: Kore
+ * manda 'alta' tanto para un cliente nuevo como para uno que había eliminado su tarjeta y se
+ * registra de nuevo — en ambos casos la tarjeta debe quedar activa). 'baja' ya tiene su propio
+ * camino fijo a false.
+ * `tarjetaLegada`: SOLO 'actualizacion' lo lee. Una 'alta' siempre crea la tarjeta sin este dato
+ * (lo trae después el match inicial o un `actualizacion` posterior), y 'baja' no tiene nada que
+ * ver con el número de tarjeta.
  */
 async function procesarClienteKore(payload) {
   const { evento, telefono, nombre, activo, tarjetaLegada } = payload ?? {};

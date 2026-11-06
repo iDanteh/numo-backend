@@ -128,3 +128,32 @@ test('listarBancos: los de Bancos (movimientos + configuración) con su cuenta',
     { banco: 'Azteca', numeroCuenta: null }, { banco: 'Banorte', numeroCuenta: '0123' }, { banco: 'BBVA', numeroCuenta: null },
   ]);
 });
+
+test('Anexo › Actualizar: pone la factura que ya tiene la remisión (sin caché), sin tocar importes ni conceptos', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'C0', folioVenta: '2', serieFactura: 'C0', folioFactura: '900' },
+    { serieVenta: 'C0', folioVenta: '3' }, // sigue sin factura
+  ]);
+  CFDI.find.mockReturnValue(lean([{ uuid: 'U9', serie: 'C0', folio: '900', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' }]));
+  const detalle = [
+    { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-2', factura: null, importe: 100 },
+    { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-3', factura: null, importe: 50 },
+    { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoFacturado', remision: 'C0-1', factura: 'C0-800', importe: 10 },
+  ];
+  const r = await fichas.actualizarFacturasDetalle({ rfc: 'R', detalle });
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(1);
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro.mock.calls[0][0]).toMatchObject({ centro: 'C0', sinCache: true });
+  expect(r.nuevas).toBe(1);
+  expect(r.siguenSinFactura).toBe(1);
+  expect(detalle[0]).toMatchObject({ factura: 'C0-900', facturadaDespues: true, esGlobal: true, concepto: 'efectivoPorFacturar', importe: 100 });
+  expect(detalle[1].factura).toBeNull();
+});
+
+test('Anexo › Actualizar: si Kore falla, avisa y no cambia nada', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockRejectedValue(new Error('429'));
+  const detalle = [{ dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-2', factura: null, importe: 100 }];
+  const r = await fichas.actualizarFacturasDetalle({ rfc: 'R', detalle });
+  expect(r.nuevas).toBe(0);
+  expect(r.advertencias[0]).toMatch(/C0 del 2026-10-31/);
+  expect(detalle[0].factura).toBeNull();
+});

@@ -177,6 +177,24 @@ async function obtener({ rfc, id }) {
   return { ...doc, id: String(doc._id) };
 }
 
+/**
+ * Anexo › Actualizar de una ficha guardada (2026-11-06): pone la factura a las
+ * ventas que ya se facturaron después y lo guarda (el buscador del historial
+ * las encuentra por esa factura). Los importes no cambian.
+ */
+async function actualizarAnexo({ rfc, id }) {
+  const { actualizarFacturasDetalle } = require('./reportes-por-facturar.fichas');
+  const doc = await FichaEfectivo.findOne({ _id: id, rfc }).catch(() => null);
+  if (!doc) throw new NotFoundError('Ficha no encontrada');
+  const detalle = (doc.detalle ?? []).map(d => (d.toObject ? d.toObject() : { ...d }));
+  const r = await actualizarFacturasDetalle({ rfc, detalle });
+  doc.detalle = r.detalle;
+  doc.anexoActualizadoEn = r.actualizadoEn;
+  await doc.save();
+  const obj = doc.toObject();
+  return { ...obj, id: String(obj._id), resultadoActualizar: { nuevas: r.nuevas, siguenSinFactura: r.siguenSinFactura, advertencias: r.advertencias } };
+}
+
 /** Solo administrador; libera las cajas para volver a generarlas. */
 async function cancelar({ rfc, id, motivo }, user) {
   if (!(await esAdmin(user))) throw new ForbiddenError('Solo un administrador puede cancelar una ficha');
@@ -191,4 +209,4 @@ async function cancelar({ rfc, id, motivo }, user) {
   return { ...doc, id: String(doc._id) };
 }
 
-module.exports = { folioTexto, cajasYaGuardadas, guardar, listar, obtener, cancelar, _validarDenominaciones, TOLERANCIA };
+module.exports = { folioTexto, cajasYaGuardadas, guardar, listar, obtener, cancelar, actualizarAnexo, _validarDenominaciones, TOLERANCIA };

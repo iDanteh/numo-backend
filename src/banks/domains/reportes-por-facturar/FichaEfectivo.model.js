@@ -15,6 +15,7 @@ const montosSchema = new mongoose.Schema({
   cobranzaEfectivo:    Number,
   abonosEfectivo:      Number,
   devoluciones:        Number,
+  retiroEfectivo:      Number,
   faltante:            Number,
   depositoEfectivo:    Number,
   saldoFavor:          Number,

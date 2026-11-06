@@ -91,8 +91,9 @@ router.get('/me', authenticate,
       role:   req.user.role,
       permissions,
       empresas,
-      // Sucursales permitidas (ids) — [] = todas. Por ahora solo Fichas de efectivo.
+      // Sucursales permitidas (ids) — por ahora solo Fichas de efectivo. todasSucursales = todas; [] sin ella = ninguna.
       sucursalIds: req.user.sucursalIds ?? [],
+      todasSucursales: req.user.todasSucursales === true,
     });
   }),
 );
@@ -136,11 +137,12 @@ router.patch('/:id/permissions', authenticate, permit('users:manage'),
 );
 
 // Sucursales que puede consultar el usuario (2026-11-05) — por ahora solo Fichas de
-// efectivo. Body: { sucursalIds: number[] } — reemplaza la lista ([] = todas). Solo administrador.
+// efectivo. Body: { sucursalIds: number[], todas?: boolean } — reemplaza la lista; todas=true = todas
+// las sucursales; [] sin todas = ninguna (2026-11-06). Solo administrador.
 router.patch('/:id/sucursales', authenticate, permit('users:manage'),
   asyncHandler(async (req, res) => {
     if (!(await esAdmin(req.user))) throw new ForbiddenError('Solo un administrador puede asignar sucursales');
-    res.json(await userSvc.updateSucursales(req.params.id, req.body?.sucursalIds));
+    res.json(await userSvc.updateSucursales(req.params.id, req.body?.sucursalIds, req.body?.todas === true));
   }),
 );
 

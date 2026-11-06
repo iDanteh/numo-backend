@@ -73,13 +73,20 @@ const User = sequelize.define('User', {
   },
   // Sucursales (ids de centros de costo) que puede consultar este usuario
   // (2026-11-05, pedido del usuario). Por ahora SOLO aplica a Fichas de
-  // efectivo. [] = sin restricción (todas). Aplica también al administrador: si
-  // tiene sucursales asignadas, solo ve esas (puede quitárselas él mismo).
+  // efectivo. Aplica también al administrador. 2026-11-06 (pedido del usuario):
+  // [] ya NO es "todas" — sin sucursales no ve ninguna; "todas" es la bandera
+  // todasSucursales (casilla Todas en Usuarios).
   // Solo el administrador las asigna (PATCH /users/:id/sucursales).
   sucursalIds: {
     type:         DataTypes.ARRAY(DataTypes.INTEGER),
     allowNull:    false,
     defaultValue: [],
+  },
+  // true = puede consultar todas las sucursales (2026-11-06). Ver sucursalIds.
+  todasSucursales: {
+    type:         DataTypes.BOOLEAN,
+    allowNull:    false,
+    defaultValue: false,
   },
 }, {
   tableName:  'users',

@@ -49,6 +49,18 @@ router.get('/sin-timbrar',
   }),
 );
 
+// GET /api/polizas/sin-timbrar-por-poliza?ids=1,2,3
+// Aviso "⏳ N sin timbrar" por póliza de Ingreso (su sucursal y día).
+router.get('/sin-timbrar-por-poliza',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { sinTimbrarDePolizas } = require('../cfdi-mapping/sin-timbrar.service');
+    const ids = String(req.query.ids || '').split(',').map(s => Number(s.trim())).filter(Number.isFinite);
+    res.json(await sinTimbrarDePolizas(ids));
+  }),
+);
+
 // GET /api/polizas/reporte-descuadradas?rfc=&ejercicio=&periodo=&estado=&format=csv
 router.get('/reporte-descuadradas',
   authenticate,

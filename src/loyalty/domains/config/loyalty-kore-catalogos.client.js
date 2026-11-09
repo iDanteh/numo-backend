@@ -3,13 +3,14 @@
 /**
  * loyalty/domains/config/loyalty-kore-catalogos.client.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Sistema de Lealtad — cliente HTTP de SOLO LECTURA de dos catálogos de Kore
- * usados para configurar qué ventas acumulan puntos (webhook Kore→Numo, tema
- * aparte, todavía sin construir): `GET /conceptos` (tipos de venta) y
- * `GET /api/formasdepago` (formas de pago). Ninguno de los dos pagina.
+ * Sistema de Lealtad — cliente HTTP de SOLO LECTURA de tres catálogos de Kore
+ * usados para configurar qué ventas acumulan puntos: `GET /conceptos` (tipos
+ * de venta), `GET /api/formasdepago` (formas de pago) y el catálogo de
+ * niveles (2026-11-06, URL a confirmar con Kore — ver NIVELES_URL abajo).
+ * Ninguno pagina.
  *
  * Configuraciones Globales (sección `kore`, ver global-config.service.js):
- *   - CONCEPTOS_URL / FORMAS_PAGO_URL → URLs base de cada catálogo.
+ *   - CONCEPTOS_URL / FORMAS_PAGO_URL / NIVELES_URL → URLs base de cada catálogo.
  *
  * Token: reusa `bancos.TOKEN`, mismo criterio que
  * `loyalty/domains/kore-match/loyalty-kore-monedero.client.js`.
@@ -98,4 +99,17 @@ async function obtenerFormasPagoKore() {
   return Array.isArray(response.data?.Data) ? response.data.Data : [];
 }
 
-module.exports = { obtenerConceptosKore, obtenerFormasPagoKore };
+/**
+ * Catálogo de niveles de Lealtad (2026-11-06, Kore pasa a gestionarlo
+ * INCLUYENDO el % de acumulación). Devuelve `Data` tal cual Kore lo entrega —
+ * shape exacto todavía A CONFIRMAR con Kore, se asume `{ Id, Nombre,
+ * Porcentaje, ... }[]` por consistencia con los otros 2 catálogos (ver
+ * Docs/integracion-kore-catalogo-niveles-DRAFT.md).
+ */
+async function obtenerNivelesKore() {
+  const url = await globalConfigService.getValue('kore', 'NIVELES_URL');
+  const response = await _getConReintento(url, 'GET /niveles');
+  return Array.isArray(response.data?.Data) ? response.data.Data : [];
+}
+
+module.exports = { obtenerConceptosKore, obtenerFormasPagoKore, obtenerNivelesKore };

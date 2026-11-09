@@ -71,6 +71,9 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   listarFormasPagoKore: jest.fn(),
   sincronizarFormasPagoKore: jest.fn(),
   actualizarFormaPagoKore: jest.fn(),
+  listarNivelesKore: jest.fn(),
+  sincronizarNivelesKore: jest.fn(),
+  actualizarNivelKore: jest.fn(),
 }));
 
 const express = require('express');
@@ -141,6 +144,9 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/config/formas-pago-kore',       permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'post',  ruta: '/config/formas-pago-kore/sync',  permiso: PERMISSIONS.LOYALTY_CONFIG },
     { metodo: 'patch', ruta: '/config/formas-pago-kore/1',     permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esPuntos: true } },
+    { metodo: 'get',   ruta: '/config/niveles-kore',           permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'post',  ruta: '/config/niveles-kore/sync',      permiso: PERMISSIONS.LOYALTY_CONFIG },
+    { metodo: 'patch', ruta: '/config/niveles-kore/1',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esInicial: true } },
   ];
 
   const TODOS = Object.values(PERMISSIONS).filter((p) => p.startsWith('loyalty:'));
@@ -463,6 +469,31 @@ describe('wiring hacia los servicios (happy path)', () => {
       .send({ esPuntos: true });
     expect(res.status).toBe(200);
     expect(configService.actualizarFormaPagoKore).toHaveBeenCalledWith('1', { esPuntos: true });
+  });
+
+  test('GET /config/niveles-kore llama a listarNivelesKore con soloActivos', async () => {
+    configService.listarNivelesKore.mockResolvedValue([]);
+    const res = await request(app).get('/config/niveles-kore?soloActivos=true')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(configService.listarNivelesKore).toHaveBeenCalledWith({ soloActivos: true });
+  });
+
+  test('POST /config/niveles-kore/sync llama a sincronizarNivelesKore', async () => {
+    configService.sincronizarNivelesKore.mockResolvedValue({ nuevos: 1, actualizados: 0, desactivados: 0 });
+    const res = await request(app).post('/config/niveles-kore/sync')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    expect(res.status).toBe(200);
+    expect(configService.sincronizarNivelesKore).toHaveBeenCalled();
+  });
+
+  test('PATCH /config/niveles-kore/:id llama a actualizarNivelKore', async () => {
+    configService.actualizarNivelKore.mockResolvedValue({ id: 1, esInicial: true });
+    const res = await request(app).patch('/config/niveles-kore/1')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ esInicial: true });
+    expect(res.status).toBe(200);
+    expect(configService.actualizarNivelKore).toHaveBeenCalledWith('1', { esInicial: true });
   });
 });
 

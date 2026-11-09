@@ -2,9 +2,12 @@
 
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
+const CorteDescarga = require('./CorteDescarga.model');
 const { _rangoAnioMesMexico, _inicioDiaMx, _finDiaMx } = require('./bank.service');
 const globalConfigService = require('../../../shared/services/global-config.service');
-const { BadRequestError } = require('../../shared/errors/AppError');
+const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
+const { subirReporteCorte, descargarReporteCorte } = require('./drive-cortes.service');
+const { logger } = require('../../../shared/utils/logger');
 
 // Importación deferida (mismo patrón que users/role.service.js#db y bank.routes.js
 // #_postgresModels) para evitar dependencia circular durante el bootstrap.
@@ -1397,11 +1400,7 @@ async function getUltimosMovimientos({ banco = null, limit = 10 } = {}) {
 // primera versión (getCorteAntiguedadBacklog, ya eliminada de este archivo): agrupa por `fecha`
 // del depósito (el día real en el banco), no por `createdAt` (día de carga a Numo); y exige el
 // depósito COMPLETAMENTE vacío (sin ninguna CxC vinculada, ni un pago parcial) — un depósito con
-// pagos PPD en curso sigue en `no_identificado` pero ya no está "vacío", así que queda afuera. El
-// corte es SIEMPRE hoy (medianoche México): a diferencia del mockup, que ofrecía elegir una fecha
-// de corte pasada, el usuario pidió explícitamente simplificar a "hoy" para esta primera versión
-// — reconstruir si un depósito tenía o no CxC vinculada en una fecha pasada necesitaría caminar
-// `historialVinculacion[]`, fuera de alcance acá.
+// pagos PPD en curso sigue en `no_identificado` pero ya no está "vacío", así que queda afuera.
 const ANTIGUEDAD_RANGOS = Object.freeze(['1 a 30 días', '31 a 60 días', '61 a 90 días', 'Más de 90 días']);
 
 // Índice de rango (0-3) según días de antigüedad — mismos cortes que el mockup de referencia:
@@ -1414,31 +1413,88 @@ function _rangoAntiguedad(dias) {
 }
 
 /**
- * Antigüedad del backlog de depósitos no identificados y completamente vacíos (sin ninguna CxC
- * vinculada), agrupados en 4 rangos fijos de días desde la fecha del depósito en el banco hasta
- * HOY (medianoche México) — ver comentario de ANTIGUEDAD_RANGOS arriba para el porqué de cada
- * decisión de diseño.
+ * Primera vez que un depósito quedó RESUELTO por CUALQUIER vía — vinculación a CxC (parcial o
+ * total), ficha física, o cualquier otro camino que haya dejado seteado el campo canónico
+ * `primeraIdentificacionAt` (`resolvePrimeraIdentificacion()`, ver `identificacion-timestamp.
+ * util.js`). Distinta a propósito de `_primeraIdentificacionEfectiva` (identificación COMPLETA,
+ * usada por el ledger — no tocada acá): esta es para la reconstrucción histórica de Antigüedad
+ * (`_vacioAlCorteHistorico`), que necesita saber "¿tuvo ALGUNA señal de resolución, sea cual sea?".
  *
- * @param {object} [opts]
- * @param {string} [opts.banco]
+ * Tres fuentes, en orden de confiabilidad:
+ *  1. `primeraIdentificacionAt` — campo canónico (fix del 2026-11-05).
+ *  2. `identificadoPor[].fechaId` — vinculación a CxC, histórico completo desde el commit inicial
+ *     del proyecto (2026-04-15).
+ *  3. `fichaAt` — identificación por comprobante físico (2026-11-06, bug real: de un residuo de
+ *     635 depósitos de enero 2026 que el chart de Antigüedad mostraba como "pendientes" pese a
+ *     estar `status:'identificado'`, el 96.5% tenía `fichaAt` poblado sin `primeraIdentificacionAt`
+ *     ni `identificadoPor` — ficha más vieja que la adopción de `resolvePrimeraIdentificacion()`).
+ *
+ * LIMITACIÓN ACEPTADA (mismo criterio que el resto de este archivo): un depósito cuyo `status` se
+ * editó a mano sin pasar por ninguna de las 3 vías de arriba no deja ningún rastro — para un corte
+ * de fecha pasada no hay forma de saber cuándo se resolvió, así que queda contado como backlog
+ * pendiente en los cortes históricos anteriores a hoy. Residuo real pero minoritario (~3.5% de la
+ * muestra de enero 2026 investigada), no bloqueante — mismo tipo de residuo ya aceptado por el
+ * usuario en el fix del 2026-11-05.
  */
-async function getAntiguedadDepositos({ banco = null } = {}) {
-  const baseMatch = buildBaseMatch({ banco });
-  const corteHoy = _inicioDiaMx(_hoyMexicoStr());
-  const unDiaMs = 24 * MS_PER_HOUR;
+function _primeraResueltaEfectiva(dep) {
+  if (dep.primeraIdentificacionAt) return dep.primeraIdentificacionAt;
+  const fechas = (dep.identificadoPor || [])
+    .map(p => p.fechaId)
+    .filter(Boolean);
+  if (fechas.length) return fechas.reduce((min, f) => (f < min ? f : min), fechas[0]);
+  if (dep.fichaAt) return dep.fichaAt;
+  return null;
+}
 
-  const depositos = await BankMovement.find({
+/**
+ * Candidatos de antigüedad para HOY — `status:'no_identificado'` + `erpIds` vacío, filtro DIRECTO
+ * en Mongo, SIN reconstrucción de ningún tipo (2026-11-06, cuarta ronda: simplificación pedida por
+ * el usuario tras encontrar que la reconstrucción histórica —pensada para el modo Año— generaba
+ * falsos positivos para depósitos ya resueltos sin `identificadoPor`, ej. identificados por ficha o
+ * editados a mano). Para "hoy", `status` YA ES la fuente de verdad: no importa CÓMO se resolvió un
+ * depósito — si dice `identificado`, no es backlog, punto. Usada por `getAntiguedadDepositos` sin
+ * `fecha` y por `getAntiguedadDepositosPorAnio` (que siempre es "hoy", nunca histórico).
+ */
+async function _antiguedadCandidatosHoy(baseMatch) {
+  return BankMovement.find({
     ...baseMatch,
     status: 'no_identificado',
     erpIds: { $size: 0 },
-  }).select('fecha deposito').lean();
+  // `folio`/`banco` (2026-11-06, pedido explícito del usuario: "que al exportar esto me diga qué
+  // depósitos son los que están siendo involucrados") — ninguno de los 2 callers existentes
+  // (getAntiguedadDepositos/getAntiguedadDepositosPorAnio) los necesitaba, pero agregarlos acá
+  // evita que buildReporteCortes#"Detalle de depósitos" tenga que repetir esta misma query con un
+  // criterio de filtro que podría desincronizarse del real con el tiempo.
+  }).select('folio banco fecha deposito').lean();
+}
 
+/**
+ * Candidatos de antigüedad para un corte de fecha PASADA — trae también los `identificado` de HOY,
+ * porque pudieron estar completamente vacíos en el pasado. El filtrado real ("¿seguía vacío a tal
+ * corte?") pasa a `_vacioAlCorteHistorico`, que sí necesita reconstruir cuándo (si acaso) se
+ * resolvió cada uno vía `_primeraResueltaEfectiva`.
+ */
+async function _antiguedadCandidatosHistorico(baseMatch) {
+  return BankMovement.find({
+    ...baseMatch,
+    status: { $in: ['no_identificado', 'identificado'] },
+  }).select('fecha deposito erpIds identificadoPor primeraIdentificacionAt fichaAt').lean();
+}
+
+// Agrupa los candidatos ya traídos en los 4 rangos fijos, a una fecha de corte dada — reusada
+// tanto por el corte de un solo día (getAntiguedadDepositos) como por cada uno de los 12 cortes
+// de fin de mes del modo año (getAntiguedadDepositosPorAnio), nunca duplicada. Un depósito con
+// fecha POSTERIOR al corte no existía todavía a esa fecha — se excluye (nunca antigüedad
+// negativa).
+function _bucketsAntiguedadAlCorte(depositos, corte) {
+  const unDiaMs = 24 * MS_PER_HOUR;
   const rangos = ANTIGUEDAD_RANGOS.map((rango) => ({ rango, count: 0, saldo: 0 }));
   let totalCount = 0, totalSaldo = 0;
 
   for (const dep of depositos) {
     const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
-    const dias = Math.max(0, Math.round((corteHoy.getTime() - inicioDiaDeposito.getTime()) / unDiaMs));
+    if (inicioDiaDeposito.getTime() > corte.getTime()) continue;
+    const dias = Math.max(0, Math.round((corte.getTime() - inicioDiaDeposito.getTime()) / unDiaMs));
     const importe = dep.deposito ?? 0;
     const bucket = rangos[_rangoAntiguedad(dias)];
     bucket.count += 1;
@@ -1448,6 +1504,321 @@ async function getAntiguedadDepositos({ banco = null } = {}) {
   }
 
   return { rangos, total: { count: totalCount, saldo: totalSaldo } };
+}
+
+/**
+ * Candidatos que seguían "completamente vacíos" a un corte de fecha PASADA — reconstrucción
+ * histórica: un depósito cuenta acá si ya existía (`fecha <= corte`) Y su primera resolución (si
+ * la tuvo, ver `_primeraResueltaEfectiva`) fue DESPUÉS de este corte (o nunca la tuvo). Solo se usa
+ * para fecha pasada real — el camino "hoy" ya viene filtrado desde Mongo
+ * (`_antiguedadCandidatosHoy`), no necesita este paso.
+ */
+function _vacioAlCorteHistorico(candidatos, corte) {
+  const vacio = [];
+  for (const dep of candidatos) {
+    const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
+    if (inicioDiaDeposito.getTime() > corte.getTime()) continue; // no existía todavía a este corte
+    const primeraResuelta = _primeraResueltaEfectiva(dep);
+    if (primeraResuelta && primeraResuelta.getTime() <= corte.getTime()) continue; // ya resuelto a este corte
+    vacio.push(dep);
+  }
+  return vacio;
+}
+
+/**
+ * Antigüedad del backlog de depósitos no identificados y completamente vacíos, a un corte de UN
+ * SOLO DÍA. Dos caminos (2026-11-06, cuarta ronda — separados a propósito, ver
+ * `_antiguedadCandidatosHoy`): sin `fecha` (o `fecha` = hoy), status actual directo, sin
+ * reconstrucción; con una `fecha` pasada real, reconstrucción histórica vía
+ * `_vacioAlCorteHistorico`. Shape idéntico en ambos casos (`rangos`/`total`).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {string} [opts.fecha] `YYYY-MM-DD` — corte de un día pasado. Default: hoy.
+ */
+async function getAntiguedadDepositos({ banco = null, fecha = null } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const hoyStr = _hoyMexicoStr();
+
+  if (!fecha || fecha === hoyStr) {
+    const corte = _inicioDiaMx(hoyStr);
+    const candidatos = await _antiguedadCandidatosHoy(baseMatch);
+    return _bucketsAntiguedadAlCorte(candidatos, corte);
+  }
+
+  const corte = _inicioDiaMx(fecha);
+  const candidatos = await _antiguedadCandidatosHistorico(baseMatch);
+  const vacioAlCorte = _vacioAlCorteHistorico(candidatos, corte);
+  return _bucketsAntiguedadAlCorte(vacioAlCorte, corte);
+}
+
+/**
+ * Antigüedad del backlog ACTUAL (depósitos que siguen sin identificar y completamente vacíos HOY
+ * MISMO — NUNCA una reconstrucción histórica), agrupado por el MES DE ORIGEN del depósito (su
+ * `fecha`, no un corte de fin de mes artificial) dentro de `anio`.
+ *
+ * CUARTA RONDA (2026-11-06): reemplaza el diseño anterior (un corte-de-fin-de-mes distinto por
+ * mes, con un campo `resuelto` separando "backlog a ese cierre" de "lo que se resolvió después").
+ * El usuario reportó que ese diseño, aunque correcto en sus propios términos, confundía: enero
+ * mostraba depósitos "pendientes" (en `resuelto`) pese a que HOY no queda ningún depósito de enero
+ * sin identificar. Pedido explícito: volver a la lógica simple de antes (antigüedad SIEMPRE contra
+ * HOY, igual que `getAntiguedadDepositos` sin `fecha`), agrupada por mes de origen — un depósito
+ * viejo de enero que sigue sin identificar hoy cae en "Más de 90 días" dentro del grupo "2026-01",
+ * nunca se repite en los demás meses. Un mes sin ningún pendiente hoy devuelve `total.count === 0`
+ * — el frontend lo pinta como "resuelto" (verde) a partir de eso, ya no hace falta un campo aparte
+ * ni una cantidad.
+ *
+ * Reusa `_antiguedadCandidatosHoy` (status actual directo, sin reconstrucción — ver su docstring)
+ * y `_bucketsAntiguedadAlCorte` para el desglose por rango — nunca duplica la fórmula.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {string|number} opts.anio `YYYY`.
+ */
+async function getAntiguedadDepositosPorAnio({ banco = null, anio } = {}) {
+  if (!/^\d{4}$/.test(String(anio ?? ''))) {
+    throw new BadRequestError('anio inválido (YYYY)');
+  }
+  const anioNum = Number(anio);
+  const baseMatch = buildBaseMatch({ banco });
+  const hoyStr = _hoyMexicoStr();
+  const hoy = _inicioDiaMx(hoyStr);
+  const mesActualStr = hoyStr.slice(0, 7);
+
+  const candidatos = await _antiguedadCandidatosHoy(baseMatch);
+
+  const porMesOrigen = new Map();
+  for (const dep of candidatos) {
+    const mesOrigen = _fechaMexicoStr(dep.fecha).slice(0, 7);
+    if (!porMesOrigen.has(mesOrigen)) porMesOrigen.set(mesOrigen, []);
+    porMesOrigen.get(mesOrigen).push(dep);
+  }
+
+  const meses = [];
+  for (let mes = 1; mes <= 12; mes++) {
+    const periodo = `${anioNum}-${String(mes).padStart(2, '0')}`;
+    if (periodo > mesActualStr) break; // sin meses futuros
+    const { rangos, total } = _bucketsAntiguedadAlCorte(porMesOrigen.get(periodo) || [], hoy);
+    meses.push({ periodo, corte: hoy, rangos, total });
+  }
+
+  return { meses };
+}
+
+// Columnas compartidas por las hojas "Mensual"/"Diario" de buildReporteCortes — mismo orden que
+// la tabla "Resultados por mes"/"Resultados por día" del frontend (bank-corte-panel.component.html):
+// 5 columnas de monto + 5 de conteo de depósitos, con el mismo rótulo.
+function _columnasLedgerExcel(etiquetaPeriodo) {
+  return [
+    { header: etiquetaPeriodo, key: 'periodo', width: 14 },
+    { header: 'Saldo inicial', key: 'inicialSaldo', width: 16 },
+    { header: '+ Nuevos', key: 'nuevosSaldo', width: 16 },
+    { header: '= Al cierre', key: 'cierreSaldo', width: 16 },
+    { header: '− Identificados', key: 'idSaldo', width: 16 },
+    { header: '= Depósitos por identificar', key: 'totalSaldo', width: 22 },
+    { header: 'Dep. saldo inicial', key: 'inicialCount', width: 16 },
+    { header: '+ Dep. nuevos', key: 'nuevosCount', width: 14 },
+    { header: '= Dep. al cierre', key: 'cierreCount', width: 14 },
+    { header: '− Dep. identificados', key: 'idCount', width: 18 },
+    { header: '= Dep. por identificar', key: 'totalCount', width: 18 },
+  ];
+}
+
+// "Al cierre" (iniciales+nuevos) no viene armado en la respuesta de _calcularLedgerBacklog —
+// se suma acá mismo, igual que ya lo hace el frontend (bank-corte-panel.component.ts).
+function _filaLedgerExcel(periodo, ledger) {
+  return {
+    periodo,
+    inicialSaldo: ledger.iniciales.saldo,
+    nuevosSaldo:  ledger.nuevos.saldo,
+    cierreSaldo:  ledger.iniciales.saldo + ledger.nuevos.saldo,
+    idSaldo:      ledger.identificados.saldo,
+    totalSaldo:   ledger.total.saldo,
+    inicialCount: ledger.iniciales.count,
+    nuevosCount:  ledger.nuevos.count,
+    cierreCount:  ledger.iniciales.count + ledger.nuevos.count,
+    idCount:      ledger.identificados.count,
+    totalCount:   ledger.total.count,
+  };
+}
+
+function _estilizarHojaCorte(ws) {
+  const header = ws.getRow(1);
+  header.height = 22;
+  header.font = { bold: true, color: { argb: 'FFE0E7FF' }, size: 10 };
+  header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E1B4B' } };
+  header.alignment = { vertical: 'middle', horizontal: 'center' };
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+}
+
+/**
+ * Excel descargable de TODO el panel de Cortes (2026-11-06, pedido explícito del usuario: un
+ * solo botón de exportar para las 3 vistas — Mensual/Diario/Antigüedad —, no uno por tab, con un
+ * solo historial de descargas compartido). 3 hojas, mismas columnas que sus tablas en pantalla.
+ * La ancla `desde:'2026-05'` de la hoja Mensual es la MISMA que usa el frontend
+ * (LEDGER_MENSUAL_DESDE) — verificada contra producción, ver bank-corte-panel.component.ts.
+ *
+ * Antes de devolver el buffer, deja un registro en `CorteDescarga` con el backlog vigente al
+ * momento ("depósitos no identificados", el mismo número del encabezado del panel) — el
+ * snapshot sale del día MÁS RECIENTE de la misma llamada a `getLedgerDiario` que ya se usó para
+ * la hoja "Diario", nunca de una consulta aparte (ver `listarDescargasCorte` para cómo se arma
+ * el delta contra la descarga anterior).
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ * @param {object} [opts.usuario] `{userId, nombre}` — quién generó la descarga (puede venir
+ *   `null` en contextos sin usuario autenticado, ej. un test directo del servicio).
+ */
+async function buildReporteCortes({ banco = null, usuario = null } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const [{ meses }, { dias }, antiguedad, candidatosDetalle] = await Promise.all([
+    getLedgerMensual({ banco, desde: '2026-05' }),
+    getLedgerDiario({ banco }),
+    getAntiguedadDepositos({ banco }),
+    // Misma población EXACTA que ya ve el usuario en el tab Antigüedad (nunca una query paralela
+    // que pueda desincronizarse) — se re-deriva fecha de origen/antigüedad/rango por depósito acá
+    // mismo, reusando _rangoAntiguedad (mismos 4 cortes fijos que el chart).
+    _antiguedadCandidatosHoy(baseMatch),
+  ]);
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Numo — Cortes de conciliación';
+  wb.created = new Date();
+
+  const wsMensual = wb.addWorksheet('Mensual');
+  wsMensual.columns = _columnasLedgerExcel('Mes');
+  for (const m of meses) wsMensual.addRow(_filaLedgerExcel(m.mes, m));
+  ['inicialSaldo', 'nuevosSaldo', 'cierreSaldo', 'idSaldo', 'totalSaldo'].forEach((k) => { wsMensual.getColumn(k).numFmt = '#,##0.00'; });
+  _estilizarHojaCorte(wsMensual);
+
+  const wsDiario = wb.addWorksheet('Diario');
+  wsDiario.columns = _columnasLedgerExcel('Día');
+  for (const d of dias) wsDiario.addRow(_filaLedgerExcel(_fechaMexicoStr(d.fecha), d));
+  ['inicialSaldo', 'nuevosSaldo', 'cierreSaldo', 'idSaldo', 'totalSaldo'].forEach((k) => { wsDiario.getColumn(k).numFmt = '#,##0.00'; });
+  _estilizarHojaCorte(wsDiario);
+
+  const wsAntiguedad = wb.addWorksheet('Antigüedad');
+  wsAntiguedad.columns = [
+    { header: 'Rango', key: 'rango', width: 20 },
+    { header: 'Depósitos', key: 'count', width: 14 },
+    { header: 'Importe', key: 'saldo', width: 18 },
+  ];
+  for (const r of antiguedad.rangos) wsAntiguedad.addRow(r);
+  wsAntiguedad.addRow({ rango: 'Total', count: antiguedad.total.count, saldo: antiguedad.total.saldo });
+  wsAntiguedad.getColumn('saldo').numFmt = '#,##0.00';
+  _estilizarHojaCorte(wsAntiguedad);
+
+  // "Detalle de depósitos" (2026-11-06, pedido explícito del usuario: "que al exportar esto me
+  // diga qué depósitos son los que están siendo involucrados") — el listado real, depósito por
+  // depósito, de la MISMA población que arma "Antigüedad" (hoja de arriba) y el saldo final de
+  // "Mensual"/"Diario" — es un solo backlog vigente, no hace falta una hoja de detalle por vista.
+  // Orden: antigüedad descendente (lo más viejo primero) — es lo que normalmente más le importa
+  // revisar primero a alguien auditando este reporte.
+  const hoyMx = _inicioDiaMx(_hoyMexicoStr());
+  const unDiaMs = 24 * MS_PER_HOUR;
+  const filasDetalle = candidatosDetalle
+    .map((dep) => {
+      const fechaStr = _fechaMexicoStr(dep.fecha);
+      const dias = Math.max(0, Math.round((hoyMx.getTime() - _inicioDiaMx(fechaStr).getTime()) / unDiaMs));
+      return {
+        folio: dep.folio,
+        banco: dep.banco,
+        fecha: fechaStr,
+        importe: dep.deposito ?? 0,
+        mesOrigen: fechaStr.slice(0, 7),
+        antiguedadDias: dias,
+        rango: ANTIGUEDAD_RANGOS[_rangoAntiguedad(dias)],
+      };
+    })
+    .sort((a, b) => b.antiguedadDias - a.antiguedadDias);
+
+  const wsDetalle = wb.addWorksheet('Detalle de depósitos');
+  wsDetalle.columns = [
+    { header: 'Folio', key: 'folio', width: 12 },
+    { header: 'Banco', key: 'banco', width: 14 },
+    { header: 'Fecha del depósito', key: 'fecha', width: 18 },
+    { header: 'Importe', key: 'importe', width: 16 },
+    { header: 'Mes de origen', key: 'mesOrigen', width: 14 },
+    { header: 'Antigüedad (días)', key: 'antiguedadDias', width: 16 },
+    { header: 'Rango', key: 'rango', width: 16 },
+  ];
+  for (const fila of filasDetalle) wsDetalle.addRow(fila);
+  wsDetalle.getColumn('importe').numFmt = '#,##0.00';
+  _estilizarHojaCorte(wsDetalle);
+
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+
+  // Sube el Excel a Drive (2026-11-06, pedido explícito del usuario: poder volver a bajar
+  // cualquier reporte de un punto pasado de la historia) — best-effort, NUNCA bloquea la
+  // descarga que el usuario está pidiendo en este momento: si Drive falla (carpeta sin
+  // configurar, cuota, red), se loguea y `driveFileId` queda `null` — esa fila del historial
+  // simplemente no será redescargable después.
+  const fechaArchivo = new Date().toISOString().slice(0, 10);
+  let driveFileId = null;
+  try {
+    driveFileId = await subirReporteCorte(buffer, `Cortes-${fechaArchivo}.xlsx`);
+  } catch (err) {
+    logger.warn(`[cortes] No se pudo subir el reporte a Drive, esta descarga no será redescargable después: ${err.message}`);
+  }
+
+  const hoy = dias[dias.length - 1];
+  await CorteDescarga.create({
+    usuario,
+    banco,
+    depositosNoIdentificados: { count: hoy.total.count, saldo: hoy.total.saldo },
+    driveFileId,
+  });
+
+  return buffer;
+}
+
+/**
+ * Descarga el archivo real de una fila del historial de Cortes (ver listarDescargasCorte) desde
+ * Drive — permite volver a bajar cualquier reporte generado en el pasado, no solo ver su delta.
+ * `driveFileId` es `null` si la subida a Drive falló en el momento de generarlo (ver
+ * buildReporteCortes) — ese caso puntual no es descargable después, por diseño (no bloqueante).
+ */
+async function descargarReporteCorteHistorico(id) {
+  const registro = await CorteDescarga.findById(id).lean();
+  if (!registro) throw new NotFoundError('Descarga de Cortes');
+  if (!registro.driveFileId) {
+    throw new BadRequestError('Esta descarga no tiene un archivo disponible para volver a bajar.');
+  }
+  const buffer = await descargarReporteCorte(registro.driveFileId);
+  const fecha = new Date(registro.fecha).toISOString().slice(0, 10);
+  return { buffer, filename: `Cortes-${fecha}.xlsx` };
+}
+
+/**
+ * Historial de descargas de Cortes (2026-11-06), con el delta de "depósitos no identificados"
+ * contra la descarga INMEDIATAMENTE ANTERIOR (cronológicamente) con el MISMO `banco` — nunca
+ * compara un snapshot de "BBVA" contra uno de "Todos" (`null`). `delta` es `null` en la primera
+ * descarga de cada banco, porque no hay contra qué comparar.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco] Si se omite, trae TODOS los bancos mezclados en una sola lista
+ *   (cada fila igual se compara solo contra su propio historial por banco, nunca entre sí).
+ */
+async function listarDescargasCorte({ banco = null } = {}) {
+  const filtro = banco ? { banco } : {};
+  const descargas = await CorteDescarga.find(filtro).sort({ fecha: -1 }).lean();
+
+  return descargas.map((d, i) => {
+    const clave = d.banco ?? null;
+    let delta = null;
+    for (let j = i + 1; j < descargas.length; j++) {
+      if ((descargas[j].banco ?? null) !== clave) continue;
+      const anterior = descargas[j].depositosNoIdentificados;
+      const actual = d.depositosNoIdentificados;
+      delta = {
+        countPct: anterior.count === 0 ? null : ((actual.count - anterior.count) / anterior.count) * 100,
+        saldoPct: anterior.saldo === 0 ? null : ((actual.saldo - anterior.saldo) / anterior.saldo) * 100,
+        direccion: actual.count > anterior.count ? 'subio' : (actual.count < anterior.count ? 'bajo' : 'igual'),
+      };
+      break;
+    }
+    return { ...d, delta };
+  });
 }
 
 /**
@@ -1700,6 +2071,16 @@ module.exports = {
   getUltimosMovimientos,
   // Antigüedad del backlog vacío (2026-11-06) — exportadas para testearlas directo.
   getAntiguedadDepositos,
+  getAntiguedadDepositosPorAnio,
+  _antiguedadCandidatosHoy,
+  _antiguedadCandidatosHistorico,
+  _bucketsAntiguedadAlCorte,
+  _vacioAlCorteHistorico,
+  _primeraResueltaEfectiva,
   _rangoAntiguedad,
   ANTIGUEDAD_RANGOS,
+  // Exportar + historial de descargas de Cortes (2026-11-06) — exportadas para testearlas directo.
+  buildReporteCortes,
+  listarDescargasCorte,
+  descargarReporteCorteHistorico,
 };

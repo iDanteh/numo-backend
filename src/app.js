@@ -41,6 +41,7 @@ const loyaltyRoutes           = require('./loyalty/loyalty.routes');
 const loyaltyImportRoutes     = require('./loyalty/domains/import/loyalty-import.routes');
 const loyaltyKoreVentaRoutes  = require('./loyalty/domains/ledger/loyalty-kore-venta.routes');
 const loyaltyKoreClienteRoutes = require('./loyalty/domains/kore-match/loyalty-kore-cliente.routes');
+const loyaltyKoreNivelRoutes  = require('./loyalty/domains/kore-match/loyalty-kore-nivel.routes');
 
 // Domain routers — Visor module
 const authRoutes             = require('./visor/routes/auth');
@@ -183,6 +184,9 @@ app.use('/api/loyalty/kore',      loyaltyKoreVentaRoutes);
 // Webhook Kore→Numo de catálogo de clientes (altas/bajas/actualizaciones, 2026-10-27) — mismo
 // prefijo que loyaltyKoreVentaRoutes, router separado por dominio (venta vs. catálogo).
 app.use('/api/loyalty/kore',      loyaltyKoreClienteRoutes);
+// Webhook Kore→Numo de catálogo de niveles (altas/ajustes/bajas, 2026-11-06) — mismo prefijo,
+// router separado por dominio (venta vs. catálogo de clientes vs. catálogo de niveles).
+app.use('/api/loyalty/kore',      loyaltyKoreNivelRoutes);
 app.use('/api/loyalty',           loyaltyRoutes);
 
 // Dev-only: emite tokens de prueba (HS256) sin pasar por Auth0. Nunca se

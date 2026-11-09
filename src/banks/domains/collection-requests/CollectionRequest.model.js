@@ -54,6 +54,16 @@ const collectionRequestSchema = new mongoose.Schema({
       // no el valor real de cada venta. Si no viene, esa CxC simplemente no
       // participa en la acumulación (no es un error).
       subtotal:             { type: Number, default: null },
+      // Pre-cálculo de puntos de Lealtad para esta CxC (2026-11-06), que Kore manda
+      // YA AL CREAR la solicitud (cuando todavía está 'pendiente') — NO se aplica en
+      // ese momento, solo se guarda. Se acredita tal cual (Numo no recalcula) SOLO
+      // si la solicitud se aprueba vía identificar() — ver el bloque de Lealtad ahí.
+      // Si la solicitud se rechaza, este valor queda guardado pero nunca se usa (no
+      // hay ninguna ruta de código que lea cxcs[].puntosAbonados fuera de
+      // identificar()). Opcional: si no viene, identificar() deja que
+      // loyalty-kore-venta.service.js calcule con el % del catálogo de niveles como
+      // red de seguridad (ver LoyaltyKoreNivel).
+      puntosAbonados:       { type: Number, default: null },
     }],
     default: [],
     validate: {

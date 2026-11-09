@@ -316,4 +316,19 @@ router.patch('/config/formas-pago-kore/:id', authenticate, permit(PERMISSIONS.LO
   res.json(await configService.actualizarFormaPagoKore(req.params.id, req.body ?? {}));
 }));
 
+// Catálogo de niveles de Kore (2026-11-06) — a diferencia de conceptos/formas de pago, acá
+// `porcentaje` SÍ viene autoritativo de Kore (Numo ya no configura % propio). `esInicial` es el
+// ÚNICO campo editable por Numo (qué nivel le toca a una tarjeta nueva).
+router.get('/config/niveles-kore', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await configService.listarNivelesKore({ soloActivos: req.query.soloActivos === 'true' }));
+}));
+
+router.post('/config/niveles-kore/sync', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.sincronizarNivelesKore());
+}));
+
+router.patch('/config/niveles-kore/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.actualizarNivelKore(req.params.id, req.body ?? {}));
+}));
+
 module.exports = router;

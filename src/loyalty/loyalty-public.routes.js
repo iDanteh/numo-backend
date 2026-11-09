@@ -45,6 +45,21 @@ function crearLimitersConsulta() {
 // algo (simulado por ahora, ver loyalty-recovery.service.js) — limitar cuánto
 // puede spamear un mismo IP, independiente del lockout por tarjeta que ya
 // cubre fuerza bruta del código en /confirmar.
+//
+// STRESS_TEST_*_MAX (2026-11-09, ampliado 2026-11-10): override SOLO para la réplica local de
+// stress-test (ver stress-test/docker-compose.stress.yml) — todo el tráfico de k6 sale de una
+// sola IP, así que CUALQUIERA de estos límites reales (pensados para distinguir IPs distintas)
+// lo taparía casi de inmediato. Mismo candado que TEST_AUTH_SECRET/codigoDev: nunca se activa en
+// producción, y en cualquier otro ambiente requiere setear la variable a propósito.
+// Bug real encontrado 2026-11-10: solo `solicitar` tenía este override — `confirmar`/`ver`
+// seguían fijos en 10/15min, así que con >10 confirmaciones en toda la corrida (triv ial con
+// varios VUs) la inmensa mayoría de los flujos fallaba con 429 a partir del 11vo — un techo
+// plano de "10 en total", no una señal real de capacidad del servidor. Invalida los resultados
+// de fallas de las corridas anteriores a este fix.
+function _maxConStress(envVar, defaultMax) {
+  return (process.env.NODE_ENV !== 'production' && Number(process.env[envVar])) || defaultMax;
+}
+
 function crearLimitersRecuperacion() {
   const handler = (_req, res) => res.status(429).json({
     success: false,
@@ -54,8 +69,8 @@ function crearLimitersRecuperacion() {
   });
   const base = { standardHeaders: true, legacyHeaders: false, handler };
   return {
-    solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: 3 }),
-    confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: 10 }),
+    solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_SOLICITAR_MAX', 3) }),
+    confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_CONFIRMAR_MAX', 10) }),
   };
 }
 
@@ -75,8 +90,8 @@ function crearLimitersSesion() {
   });
   const base = { standardHeaders: true, legacyHeaders: false, handler };
   return {
-    ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: 10 }),
-    email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: 20 }),
+    ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10) }),
+    email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20) }),
   };
 }
 

@@ -20,7 +20,11 @@ const sequelize = new Sequelize(config.postgres.uri, {
   dialect: 'postgres',
   logging: (msg) => logger.debug(`[PG] ${msg}`),
   pool: {
-    max:     10,
+    // POSTGRES_POOL_MAX (2026-11-10) — override SOLO para medir en stress-test (ver
+    // stress-test/docker-compose.stress.yml): sin la variable, el default sigue siendo 10, cero
+    // cambio de comportamiento en producción. Hallazgo real: con 10 fijo, un pico de tráfico en
+    // CUALQUIER feature satura el pool compartido por TODA la app, no solo quien generó el pico.
+    max:     Number(process.env.POSTGRES_POOL_MAX) || 10,
     min:     0,
     acquire: 30_000,
     idle:    10_000,

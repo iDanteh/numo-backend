@@ -4448,6 +4448,20 @@ async function exportContpaqXlsx(id, overrides = {}) {
   if (poliza.tipo === 'I') await _unificarRenglonesPorDepositoBancario(bloques);
   if (poliza.tipo === 'I') _ordenarCobrosIngreso(bloques);
 
+  // Hoja informativa "Facturas Sin Timbrar" (2026-11-09): facturas/NC de esta
+  // sucursal y día que existen en Kore pero aún no se timbran. NO toca los
+  // movimientos; si la consulta falla, el export sale igual sin la hoja.
+  if (poliza.tipo === 'I') {
+    try {
+      const { sinTimbrarDePolizas } = require('../cfdi-mapping/sin-timbrar.service');
+      poliza.facturasSinTimbrar = (await sinTimbrarDePolizas([poliza.id]))[poliza.id]?.facturas ?? [];
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[exportContpaqXlsx] sin timbrar no disponible para póliza ${poliza.id}: ${err.message}`);
+      poliza.facturasSinTimbrar = [];
+    }
+  }
+
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
     // Crédito) y Descuentos y Devoluciones (Contado+Crédito). Cada archivo
@@ -5093,6 +5107,40 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // póliza. La arma mostrador-hoja.js (la misma que usa el reporte "Por
   // facturar" de Reportes).
   if (incluirMostrador) agregarHojaMostrador(workbook, poliza);
+
+  // Hoja "Facturas Sin Timbrar" (2026-11-09) — informativo, al final. Mismo
+  // criterio que MOSTRADOR: en CEDIS solo en el archivo de Ventas.
+  if (incluirMostrador && poliza.facturasSinTimbrar?.length > 0) {
+    const wsSt = workbook.addWorksheet('Facturas Sin Timbrar');
+    wsSt.columns = [
+      { header: 'Folio',            key: 'serieFolio',     width: 16 },
+      { header: 'Día',              key: 'dia',            width: 12 },
+      { header: 'Días sin timbrar', key: 'diasSinTimbrar', width: 16 },
+      { header: 'Tipo',             key: 'tipo',           width: 16 },
+      { header: 'Pago',             key: 'metodoPago',     width: 8 },
+      { header: 'Forma',            key: 'formaPago',      width: 8 },
+      { header: 'Subtotal',         key: 'subTotal',       width: 14 },
+      { header: 'Total',            key: 'total',          width: 14 },
+      { header: 'Cliente',          key: 'cliente',        width: 36 },
+      { header: 'RFC cliente',      key: 'rfcCliente',     width: 15 },
+      { header: 'Sucursal',         key: 'sucursal',       width: 16 },
+    ];
+    wsSt.getRow(1).font = { bold: true };
+    wsSt.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFE699' } };
+    });
+    for (const f of poliza.facturasSinTimbrar) {
+      const [y, m, d] = String(f.dia || '').split('-');
+      const row = wsSt.addRow({
+        ...f,
+        dia: d ? `${d}/${m}/${y}` : '',
+        tipo: f.tipo === 'E' ? 'Nota de crédito' : 'Factura',
+      });
+      row.getCell('subTotal').numFmt = '#,##0.00';
+      row.getCell('total').numFmt = '#,##0.00';
+    }
+    wsSt.autoFilter = { from: 'A1', to: 'K1' };
+  }
 
   return workbook;
 }

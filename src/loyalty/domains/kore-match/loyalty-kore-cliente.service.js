@@ -21,7 +21,7 @@
 const { LoyaltyCard } = require('../../../shared/models/postgres');
 const { BadRequestError, ConflictError, NotFoundError } = require('../../../shared/errors/AppError');
 const { normalizarTelefono } = require('../../shared/puntos.util');
-const { crearTarjeta } = require('../cards/loyalty-card.service');
+const { crearTarjeta, cambiarNivel, nivelEsValido } = require('../cards/loyalty-card.service');
 // Misma normalización que usa el import de migración (loyalty-import-apply.service.js) y el job
 // de match (loyalty-kore-match.service.js) para `tarjetaLegada` — reusada acá para que el webhook
 // y esas dos vías nunca puedan dejar el campo con un formato distinto entre sí.
@@ -38,6 +38,25 @@ const ACTOR_WEBHOOK = { dbId: 'kore-webhook', nombre: 'Kore (webhook catálogo)'
 
 function _esDuplicadoUnico(err) {
   return err?.name === 'SequelizeUniqueConstraintError';
+}
+
+// `nivel` (2026-11-06, pedido explícito del usuario): Kore ahora también manda el nivel del cliente
+// en el webhook de catálogo — antes esto era 100% asignación manual del staff, nunca tocado acá.
+// REDISEÑO 2026-11-06 (mismo día, segunda ronda): el catálogo de niveles pasa a gestionarlo Kore
+// (ver LoyaltyKoreNivel.js) — ya no hay un array fijo que validar contra, `nivelEsValido()` consulta
+// el catálogo real.
+// REDISEÑO 2026-11-06 (mismo día, tercera ronda, pedido explícito del usuario): `nivel` pasa de
+// opcional a OBLIGATORIO en 'alta'/'actualizacion' — Kore controla el nivel por completo, Numo lo
+// necesita siempre, incluso en un ajuste. `_validarNivel` ahora exige presencia ADEMÁS de validez
+// (defensa en profundidad: el gate principal vive en `procesarClienteKore`, ver abajo, pero esta
+// función también se usa directo desde `_aplicarActualizacion`). `baja` nunca llama a esto.
+async function _validarNivel(nivel) {
+  if (nivel === undefined || nivel === null || String(nivel).trim() === '') {
+    throw new BadRequestError('nivel es requerido.');
+  }
+  if (!(await nivelEsValido(nivel))) {
+    throw new BadRequestError(`nivel inválido: "${nivel}".`);
+  }
 }
 
 function _requiereKoreClienteId(koreClienteId) {
@@ -65,7 +84,9 @@ async function _buscarCard({ koreClienteId, telefono }) {
   return null;
 }
 
-async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada }) {
+async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada, nivel }) {
+  await _validarNivel(nivel);
+
   // Snapshot ANTES de armar `updates`/llamar a `.update()` — ver docstring de
   // `registrarCambioTarjeta` sobre por qué esto tiene que pasar en este orden.
   const antes = {
@@ -111,10 +132,23 @@ async function _aplicarActualizacion(card, { koreClienteId, telefono, nombre, ac
     cardId: card.id, antes, despues, accion: 'webhook_kore_actualizacion', origen: 'kore',
   });
 
+  // `nivel` (2026-11-06, pedido explícito del usuario, ahora OBLIGATORIO — ver _validarNivel arriba
+  // y el gate en procesarClienteKore): NUNCA se mete en `updates`/`registrarCambioTarjeta` de arriba
+  // a propósito, porque ese log excluye `nivel` deliberadamente (ver docstring de
+  // loyalty-card-audit.service.js: el historial de nivel vive en `LoyaltyTierHistory`, no se duplica
+  // en `LoyaltyCardAuditLog`). Se reusa `cambiarNivel()` — el mismo primitivo que ya usa el botón
+  // manual "Cambiar nivel" — para que un cambio de nivel disparado por Kore quede en el mismo
+  // historial que uno hecho a mano. Guard `nivel !== card.nivel`: `cambiarNivel()` lanza si el nivel
+  // nuevo es igual al actual, y Kore puede reenviar el mismo valor en cada actualización (catálogo
+  // "último valor gana").
+  if (nivel !== card.nivel) {
+    await cambiarNivel(card.id, nivel, { motivo: 'Webhook Kore (catálogo de clientes)' }, ACTOR_WEBHOOK);
+  }
+
   return { ok: true, evento: 'actualizacion', cardId: card.id, creada: false };
 }
 
-async function _procesarAlta({ koreClienteId, telefono, nombre }) {
+async function _procesarAlta({ koreClienteId, telefono, nombre, nivel }) {
   // Busca primero por `koreClienteId` (identidad real y estable del cliente en Kore), igual que
   // `actualizacion`/`baja` — recién si no aparece, por teléfono. Bug real encontrado 2026-11-05:
   // `koreClienteId` identifica al CLIENTE, no al monedero — si elimina su tarjeta y se registra de
@@ -130,7 +164,7 @@ async function _procesarAlta({ koreClienteId, telefono, nombre }) {
     // se trata como actualización, nunca se duplica ni se lanza error por "ya existe". `activo:
     // true`: un "alta" sobre una tarjeta que había sido eliminada/desactivada antes debe
     // reactivarla — para Kore esto ES un alta, no manda un evento de reactivación aparte.
-    return _aplicarActualizacion(existente, { koreClienteId, telefono, nombre, activo: true });
+    return _aplicarActualizacion(existente, { koreClienteId, telefono, nombre, activo: true, nivel });
   }
 
   if (!String(nombre ?? '').trim()) {
@@ -139,12 +173,16 @@ async function _procesarAlta({ koreClienteId, telefono, nombre }) {
 
   let resultado;
   try {
-    resultado = await crearTarjeta({ telefono, nombre }, ACTOR_WEBHOOK);
+    // `nivel`: OBLIGATORIO en este webhook (ver el gate en procesarClienteKore, más abajo) — a
+    // diferencia del alta MANUAL del panel (que sigue sin mandarlo, y ahí sí aplica el fallback de
+    // `obtenerNivelInicial()` dentro de crearTarjeta()), acá siempre viaja el nivel real de Kore.
+    // `crearTarjeta()` igual valida contra el catálogo (`nivelEsValido()`) como salvaguarda.
+    resultado = await crearTarjeta({ telefono, nombre, nivel }, ACTOR_WEBHOOK);
   } catch (err) {
     if (err instanceof ConflictError) {
       // Carrera: otra llamada creó la tarjeta entre el findOne de arriba y este create.
       const card = await LoyaltyCard.findOne({ where: { telefono } });
-      if (card) return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo: true });
+      if (card) return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo: true, nivel });
     }
     throw err;
   }
@@ -157,10 +195,10 @@ async function _procesarAlta({ koreClienteId, telefono, nombre }) {
   return { ok: true, evento: 'alta', cardId: card.id, creada: true };
 }
 
-async function _procesarActualizacion({ koreClienteId, telefono, nombre, activo, tarjetaLegada }) {
+async function _procesarActualizacion({ koreClienteId, telefono, nombre, activo, tarjetaLegada, nivel }) {
   const card = await _buscarCard({ koreClienteId, telefono });
   if (!card) throw new NotFoundError('Tarjeta (no se encontró por koreClienteId ni teléfono)');
-  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada });
+  return _aplicarActualizacion(card, { koreClienteId, telefono, nombre, activo, tarjetaLegada, nivel });
 }
 
 async function _procesarBaja({ koreClienteId, telefono }) {
@@ -196,9 +234,17 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * `tarjetaLegada`: SOLO 'actualizacion' lo lee. Una 'alta' siempre crea la tarjeta sin este dato
  * (lo trae después el match inicial o un `actualizacion` posterior), y 'baja' no tiene nada que
  * ver con el número de tarjeta.
+ * `nivel`: OBLIGATORIO en 'alta' y 'actualizacion' (2026-11-06, pedido explícito del usuario — Kore
+ * controla el nivel por completo, Numo lo necesita siempre, incluso en un ajuste). Si no viene
+ * (undefined/null/vacío), 400 "nivel es requerido." ANTES de llegar a _procesarAlta/
+ * _procesarActualizacion. Debe ser uno de los niveles activos del catálogo real (`nivelEsValido()`,
+ * ver LoyaltyKoreNivel.js), otro valor responde 400. 'alta' sobre una tarjeta nueva lo usa como
+ * nivel inicial. 'actualizacion' (y 'alta' cuando cae a actualización) lo cambia vía
+ * `cambiarNivel()` si viene distinto al actual — mismo primitivo que el botón manual "Cambiar
+ * nivel", queda en `LoyaltyTierHistory`. 'baja' no lo lee ni lo exige.
  */
 async function procesarClienteKore(payload) {
-  const { evento, telefono, nombre, activo, tarjetaLegada } = payload ?? {};
+  const { evento, telefono, nombre, activo, tarjetaLegada, nivel } = payload ?? {};
 
   if (!EVENTOS_VALIDOS.includes(evento)) {
     throw new BadRequestError(`evento inválido: "${evento}". Debe ser uno de: ${EVENTOS_VALIDOS.join(', ')}.`);
@@ -209,6 +255,13 @@ async function procesarClienteKore(payload) {
     return _procesarBaja({ koreClienteId, telefono });
   }
 
+  // `nivel` obligatorio (2026-11-06, tercera ronda) — gate único acá para que 'alta' (tarjeta nueva
+  // Y tarjeta existente que cae a actualización) y 'actualizacion' lo exijan por igual, sin
+  // duplicar el chequeo en cada rama interna.
+  if (nivel === undefined || nivel === null || String(nivel).trim() === '') {
+    throw new BadRequestError('nivel es requerido.');
+  }
+
   let telefonoNorm;
   try {
     telefonoNorm = normalizarTelefono(telefono);
@@ -217,10 +270,10 @@ async function procesarClienteKore(payload) {
   }
 
   if (evento === 'alta') {
-    return _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre });
+    return _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre, nivel });
   }
   return _procesarActualizacion({
-    koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada,
+    koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada, nivel,
   });
 }
 

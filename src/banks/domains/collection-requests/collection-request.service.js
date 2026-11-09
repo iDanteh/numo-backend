@@ -1224,13 +1224,28 @@ async function identificar(id, body, user) {
   // vista abierta se queda con el estado viejo hasta que alguien recargue a mano.
   emitToAll('collection-request:updated', _eventoActualizacion(cr, movsOrdenados));
 
-  // 10. Acumulación de puntos de Lealtad (2026-10-27, EN DISEÑO, opcional) — SIEMPRE
-  // después del commit de arriba: el cobro de Bancos ya quedó confirmado e
-  // irreversible en Kore/Mongo, así que nada de lo que pase acá puede (ni debe)
-  // afectarlo. Reusa procesarVentaKore() del webhook de Lealtad tal cual, una vez
-  // por CxC (Modo 1 = 1 sola vuelta, Modo 2 = varias, cada una su propia "venta").
-  // Si cr.telefono no viene (el 100% de las solicitudes de hoy), este bloque ni
-  // se ejecuta — cero costo, cero cambio de comportamiento.
+  // 10. Acumulación de puntos de Lealtad (2026-10-27, ACTIVO desde 2026-11-06: Kore
+  // ya confirmó que manda `cr.telefono`) — SIEMPRE después del commit de arriba: el
+  // cobro de Bancos ya quedó confirmado e irreversible en Kore/Mongo, así que nada
+  // de lo que pase acá puede (ni debe) afectarlo. Reusa procesarVentaKore() del
+  // webhook de Lealtad tal cual, una vez por CxC (Modo 1 = 1 sola vuelta, Modo 2 =
+  // varias, cada una su propia "venta"). Si cr.telefono no viene, este bloque ni se
+  // ejecuta — cero costo.
+  //
+  // Contrato `abonos[]` (2026-11-06): esta vía no distingue abonos parciales — cada
+  // CxC de esta solicitud es UN solo abono, identificado por su propio `serieFolio`
+  // (no hay un id de movimiento de Kore más granular acá, a diferencia del webhook
+  // de venta directo). `puntosAbonados` (2026-11-06, ajuste de diseño): Kore SÍ manda
+  // el pre-cálculo de puntos, pero al CREAR la solicitud (`cxc.puntosAbonados`, ver
+  // CollectionRequest.model.js), no en este momento — acá solo se pasa tal cual, sin
+  // recalcular nada. Si una CxC nunca trajo ese pre-cálculo (`cxc.puntosAbonados`
+  // null), se pasa `undefined` y `loyalty-kore-venta.service.js` calcula por su
+  // cuenta con el % del catálogo de niveles (`LoyaltyKoreNivel.porcentaje`) como red
+  // de seguridad — no es el camino esperado para esta vía, solo un fallback genérico
+  // que ya existe para cualquier consumidor de `procesarVentaKore`. Si la solicitud
+  // se RECHAZA en cambio de aprobarse, este bloque nunca corre (vive solo acá, no en
+  // `rechazar()`) — cualquier pre-cálculo guardado en `cxcs[].puntosAbonados` queda
+  // sin usar, nunca se abona.
   if (cr.telefono) {
     const esModo2 = cr.cxcs.length > 1;
     for (const cxc of cr.cxcs) {
@@ -1248,18 +1263,32 @@ async function identificar(id, body, user) {
         // eslint-disable-next-line no-await-in-loop -- en serie a propósito: todas
         // las CxC de esta solicitud son del mismo cliente (regla ya existente),
         // no hace falta paralelizar.
-        await procesarVentaKore({
+        const resultadoVenta = await procesarVentaKore({
           telefono: cr.telefono,
           serieFolio,
           conceptoId: cr.conceptoId, // ya validado non-null al inicio de identificar()
           metodoPago: cxc.tipoPago,
-          formasPago: formasPagoCxc,
-          subtotal: cxc.subtotal,
-          total: totalCxc,
-          usuarioAplicaId: user._id,
-          usuarioAplicaNombre: user.nombre,
-          fecha: new Date().toISOString(),
+          abonos: [{
+            idAbono: serieFolio,
+            fecha: new Date().toISOString(),
+            subtotal: cxc.subtotal,
+            total: totalCxc,
+            formasPago: formasPagoCxc,
+            usuarioAplicaId: user._id,
+            // Pre-cálculo de Kore (guardado en create(), nunca recalculado acá) —
+            // `undefined` si esa CxC no lo trajo, dejando el fallback genérico.
+            puntosAbonados: cxc.puntosAbonados ?? undefined,
+          }],
         });
+        // Un abono con error de negocio (tarjeta inactiva, saldo insuficiente, un
+        // reenvío con datos distintos, etc.) ya NO lanza excepción con el contrato
+        // de `abonos[]` (queda aislado por savepoint) — se refleja en `abonos[0]`
+        // con `success:false` en vez de un throw. Mismo criterio de logging que el
+        // catch de abajo: se deja constancia, nunca bloquea el cobro ya confirmado.
+        const abonoResultado = resultadoVenta.abonos?.[0];
+        if (abonoResultado && !abonoResultado.success) {
+          logger.warn(`[collection-requests] identificar ${id}: acumulación de Lealtad no se aplicó para ${serieFolio} (no bloquea el cobro, ya confirmado en Kore/Mongo): ${abonoResultado.error}`);
+        }
       } catch (err) {
         // 404 = el cliente no tiene tarjeta de Lealtad — es el camino ESPERADO
         // (la mayoría de clientes de Solicitudes de Cobro no participan), nunca
@@ -1267,10 +1296,10 @@ async function identificar(id, body, user) {
         // solicitud, así que si no tiene tarjeta no vale la pena seguir
         // intentando con las demás.
         if (err.statusCode === 404) break;
-        // Cualquier otro error (catálogo desconocido, validación, etc.) se
-        // loguea para revisión — procesarVentaKore ya registra sus propios
-        // procesos fallidos reales en LoyaltyKoreVentaFallida, acá no se
-        // duplica eso, solo se dejá constancia de que no se aplicó.
+        // Cualquier otro error inesperado (el request completo abortó, ver
+        // loyalty-kore-venta.service.js) se loguea para revisión — procesarVentaKore
+        // ya registra sus propios procesos fallidos reales en LoyaltyKoreVentaFallida,
+        // acá no se duplica eso, solo se deja constancia de que no se aplicó.
         logger.warn(`[collection-requests] identificar ${id}: acumulación de Lealtad no se aplicó para ${serieFolio} (no bloquea el cobro, ya confirmado en Kore/Mongo): ${err.message}`);
       }
     }
@@ -1286,6 +1315,14 @@ async function identificar(id, body, user) {
 // o nada: si Kore rechaza este aviso, no se marca "rechazada" en Numo tampoco.
 // El `motivo` que ya captura el usuario es el mismo texto que viaja como
 // Comentario a Kore — no hace falta pedir un campo aparte.
+//
+// Lealtad (2026-11-06): el bloque de acumulación de puntos (bloque "10" de
+// identificar(), ver arriba) vive SOLO ahí — rechazar() nunca lo invoca. Por
+// diseño, una solicitud rechazada nunca abona nada: cualquier pre-cálculo de
+// Kore guardado en `cxcs[].puntosAbonados` (ver CollectionRequest.model.js)
+// queda en el documento sin usarse, nunca se procesa ni se descarta
+// explícitamente — simplemente no hay ninguna ruta de código que lo lea fuera
+// de identificar().
 async function rechazar(id, motivo, user) {
   const cr = await CollectionRequest.findOne({ _id: id, status: { $ne: 'identificada' } });
   if (!cr) throw new NotFoundError('Solicitud no encontrada o ya identificada');

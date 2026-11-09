@@ -26,7 +26,7 @@
 
 require('dotenv').config();
 
-const { ConfigSection, LoyaltyAdjustmentReason } = require('../../shared/models/postgres');
+const { ConfigSection, LoyaltyAdjustmentReason, LoyaltyKoreNivel } = require('../../shared/models/postgres');
 const svc = require('../../shared/services/global-config.service');
 
 // puntosFijos: undefined → quedan en modo manual (rediseño 2026-10-23, reemplaza
@@ -103,11 +103,52 @@ async function _asegurarReasons() {
   }
 }
 
+/**
+ * Catálogo de niveles gestionado por Kore (2026-11-06, ver LoyaltyKoreNivel.js) — bootstrap
+ * TRANSICIONAL: siembra Bronce/Plata/Oro con `koreId: null` (identidad real todavía no llega de
+ * Kore) para que el alta/cambio de nivel no se rompa mientras el catálogo real no existe. El
+ * `porcentaje` se backfillea desde `lealtad.PORCENTAJE_<NIVEL>` si el dueño del negocio ya lo
+ * había configurado antes de este cambio; si no, queda `null` (sin inventar un valor — mismo
+ * criterio D11 que ya aplicaba a esas claves). `esInicial:true` SOLO en Bronce (criterio ya vigente
+ * antes de este cambio: toda tarjeta nueva arranca en el nivel más bajo). Mismo criterio
+ * "findOrCreate, nunca pisa" que `_asegurarReasons` — un re-run no duplica ni resetea ediciones que
+ * ya hizo un sync/webhook real de Kore (que ADOPTA estas filas por nombre, ver
+ * loyalty-config.service.js#_buscarOAdoptarNivelKore).
+ */
+const NIVELES_BOOTSTRAP = [
+  { nombre: 'Bronce', claveGlobalConfig: 'PORCENTAJE_BRONCE', esInicial: true },
+  { nombre: 'Plata', claveGlobalConfig: 'PORCENTAJE_PLATA', esInicial: false },
+  { nombre: 'Oro', claveGlobalConfig: 'PORCENTAJE_ORO', esInicial: false },
+];
+
+async function _asegurarNivelesBootstrap() {
+  for (const { nombre, claveGlobalConfig, esInicial } of NIVELES_BOOTSTRAP) {
+    // eslint-disable-next-line no-await-in-loop
+    const existente = await LoyaltyKoreNivel.findOne({ where: { nombre } });
+    if (existente) {
+      console.log(`[seed-lealtad] Nivel '${nombre}' ya existe (id=${existente.id}, koreId=${existente.koreId ?? 'transicional'}) — no se pisa.`);
+      continue; // eslint-disable-line no-continue
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const porcentajeViejo = await svc.getValue('lealtad', claveGlobalConfig).catch(() => null);
+    // eslint-disable-next-line no-await-in-loop
+    const fila = await LoyaltyKoreNivel.create({
+      koreId: null,
+      nombre,
+      porcentaje: porcentajeViejo != null ? Number(porcentajeViejo) : null,
+      esInicial,
+      activo: true,
+    });
+    console.log(`[seed-lealtad] Nivel '${nombre}' creado (id=${fila.id}, transicional, porcentaje=${fila.porcentaje ?? 'sin configurar'}).`);
+  }
+}
+
 async function seedLealtad() {
   await _asegurarSeccionLealtad();
   await _asegurarReasons();
   await _asegurarEspecialidadesDefault();
-  console.log('[seed-lealtad] Listo — sección lealtad, catálogo de motivos y catálogo de especialidades sembrados correctamente.');
+  await _asegurarNivelesBootstrap();
+  console.log('[seed-lealtad] Listo — sección lealtad, catálogo de motivos, catálogo de especialidades y catálogo de niveles (bootstrap) sembrados correctamente.');
 }
 
 // ── Ejecución directa: node src/loyalty/scripts/seed-lealtad.js ────────────

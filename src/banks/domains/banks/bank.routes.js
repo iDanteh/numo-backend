@@ -285,11 +285,54 @@ router.get('/cortes/ultimos-movimientos', authenticate, permit(PERMISSIONS.BANKS
 
 // GET /api/banks/cortes/antiguedad — antigüedad del backlog de depósitos no identificados y
 // completamente vacíos (sin ninguna CxC vinculada), en 4 rangos fijos de días desde la fecha del
-// depósito hasta hoy (2026-11-06, pedido explícito del usuario tras revisar un mockup de
-// referencia). Corte siempre "hoy" — sin fecha de corte seleccionable. Mismo permiso.
+// depósito hasta un corte (2026-11-06, pedido explícito del usuario tras revisar un mockup de
+// referencia). `fecha` (YYYY-MM-DD, opcional, default hoy) pide el corte de UN día puntual;
+// `anio` (YYYY) pide los 12 cortes de fin de mes de ese año (segunda ronda, 2026-11-06: el
+// usuario pidió poder ver cómo se fueron cerrando los meses/años, no solo el día de hoy) — `anio`
+// gana si viene junto con `fecha`. Mismo permiso.
 router.get('/cortes/antiguedad', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco, fecha, anio } = req.query;
+  if (anio) {
+    res.json(await indicadoresService.getAntiguedadDepositosPorAnio({ banco: banco || null, anio }));
+    return;
+  }
+  res.json(await indicadoresService.getAntiguedadDepositos({ banco: banco || null, fecha: fecha || null }));
+}));
+
+// GET /api/banks/cortes/descargar — Excel de TODO el panel de Cortes (Mensual/Diario/Antigüedad
+// en 3 hojas, 2026-11-06, pedido explícito del usuario: un solo botón de exportar, no uno por
+// tab). Cada llamada deja un registro en el historial de descargas (ver
+// buildReporteCortes/listarDescargasCorte). Mismo permiso.
+router.get('/cortes/descargar', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
   const { banco } = req.query;
-  res.json(await indicadoresService.getAntiguedadDepositos({ banco: banco || null }));
+  const buffer = await indicadoresService.buildReporteCortes({
+    banco: banco || null,
+    usuario: { userId: req.user._id, nombre: req.user.nombre },
+  });
+  const fecha = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="Cortes-${fecha}.xlsx"`);
+  res.send(buffer);
+}));
+
+// GET /api/banks/cortes/descargas — historial de descargas de Cortes, con el delta de
+// "depósitos no identificados" contra la descarga anterior del mismo banco (2026-11-06). Mismo
+// permiso.
+router.get('/cortes/descargas', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { banco } = req.query;
+  res.json(await indicadoresService.listarDescargasCorte({ banco: banco || null }));
+}));
+
+// GET /api/banks/cortes/descargas/:id/descargar — vuelve a bajar el archivo real de una fila del
+// historial (2026-11-06, pedido explícito del usuario: el historial solo mostraba el delta de
+// backlog, no permitía recuperar el Excel de un punto pasado). 400 si esa descarga en particular
+// no se pudo subir a Drive en su momento (ver buildReporteCortes) — no es un error del cliente,
+// pero tampoco hay nada que servir. Mismo permiso.
+router.get('/cortes/descargas/:id/descargar', authenticate, permit(PERMISSIONS.BANKS_READ), asyncHandler(async (req, res) => {
+  const { buffer, filename } = await indicadoresService.descargarReporteCorteHistorico(req.params.id);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(buffer);
 }));
 
 // GET /api/banks/cortes/reporte — Excel descargable del corte (2026-10-02), con el detalle

@@ -22,7 +22,7 @@ const { Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
 const {
   LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
-  LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+  LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreNivel,
   ConfigSection, GlobalConfig,
 } = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
@@ -599,6 +599,113 @@ async function actualizarFormaPagoKore(id, { acumulaPuntos, esPuntos } = {}) {
   return fila;
 }
 
+/**
+ * CATÁLOGO DE NIVELES DE KORE (2026-11-06, pedido explícito del usuario) — a diferencia de
+ * conceptos/formas de pago, acá `porcentaje` SÍ es autoritativo de Kore: Numo ya no configura
+ * ningún % propio (reemplaza PORCENTAJE_BRONCE/PLATA/ORO de GlobalConfig como fuente viva — esas
+ * claves quedan sin UI de edición desde esta pantalla, pero el mecanismo de GlobalConfig en sí no
+ * se tocó, por si algo más lo sigue leyendo). `esInicial` es la ÚNICA columna manual de Numo.
+ *
+ * Bootstrap transicional (ver seed-lealtad.js): existen filas con `koreId:null` para Bronce/Plata/
+ * Oro hasta que el primer sync/webhook real de Kore llegue. `_buscarOAdoptarNivelKore` busca
+ * primero por `koreId` real; si no aparece, busca por `nombre` entre las filas transicionales
+ * (`koreId IS NULL`) y la ADOPTA (le asigna el koreId real) en vez de crear una duplicada.
+ */
+async function _buscarOAdoptarNivelKore({ koreId, nombre }) {
+  let fila = await LoyaltyKoreNivel.findOne({ where: { koreId } });
+  if (!fila && nombre) {
+    fila = await LoyaltyKoreNivel.findOne({ where: { koreId: null, nombre } });
+  }
+  return fila;
+}
+
+/** Upsert por `koreId` (con adopción de fila transicional por nombre, ver arriba). `porcentaje` SÍ
+ *  se pisa en cada sync (a diferencia de `acumulaPuntos` en conceptos/formas de pago) porque acá
+ *  es la fuente real, no un hint. `esInicial` nunca se toca por un sync. Marca `activo:false` en
+ *  lo que ya no vino de Kore — las filas transicionales (`koreId` todavía null) se excluyen de esa
+ *  desactivación, nunca se apagan solas por no aparecer en una corrida puntual. */
+async function sincronizarNivelesKore() {
+  const nivelesKore = await koreCatalogosClient.obtenerNivelesKore();
+  const idsVistos = new Set();
+  let nuevos = 0;
+  let actualizados = 0;
+
+  for (const n of nivelesKore) {
+    const koreId = String(n.Id ?? n.ID ?? '').trim();
+    if (!koreId) continue;
+    idsVistos.add(koreId);
+
+    const datos = {
+      koreId,
+      nombre:     String(n.Nombre ?? '').trim(),
+      porcentaje: n.Porcentaje != null && n.Porcentaje !== '' ? Number(n.Porcentaje) : null,
+      activo:     true,
+    };
+
+    // eslint-disable-next-line no-await-in-loop -- universo chico (catálogo de niveles de Kore,
+    // un puñado de filas), mismo criterio secuencial que los otros 2 sync de este archivo.
+    const fila = await _buscarOAdoptarNivelKore({ koreId, nombre: datos.nombre });
+    if (!fila) {
+      // eslint-disable-next-line no-await-in-loop
+      await LoyaltyKoreNivel.create({ ...datos, esInicial: false });
+      nuevos += 1;
+    } else {
+      // eslint-disable-next-line no-await-in-loop
+      await fila.update(datos); // adopta el koreId real si la fila era transicional
+      actualizados += 1;
+    }
+  }
+
+  const existentes = await LoyaltyKoreNivel.findAll({ where: { activo: true } });
+  const aDesactivar = existentes.filter(f => f.koreId && !idsVistos.has(f.koreId));
+  for (const f of aDesactivar) {
+    // eslint-disable-next-line no-await-in-loop
+    await f.update({ activo: false });
+  }
+
+  return { nuevos, actualizados, desactivados: aDesactivar.length };
+}
+
+async function listarNivelesKore({ soloActivos = false } = {}) {
+  const where = soloActivos ? { activo: true } : {};
+  return LoyaltyKoreNivel.findAll({ where, order: [['porcentaje', 'ASC']] });
+}
+
+/** % de acumulación real de un nivel — fuente única `LoyaltyKoreNivel.porcentaje` (autoritativo de
+ *  Kore, ya no `GlobalConfig.lealtad.PORCENTAJE_<NIVEL>`). Devuelve `null` si el nivel no existe,
+ *  está inactivo, o no tiene `porcentaje` configurado — nunca lanza, el caller decide qué hacer
+ *  (bloquear con un mensaje, registrar un proceso fallido, etc.). Reusada por
+ *  `loyalty-ledger.service.js#registrarAcumulacion` (flujo manual, bloqueante) y
+ *  `loyalty-kore-venta.service.js` (webhook: metadata informativa siempre, y cálculo de respaldo
+ *  cuando Kore no manda `puntosAbonados`) para no duplicar la fuente de verdad. */
+async function obtenerPorcentajeNivel(nombre) {
+  if (!nombre) return null;
+  const fila = await LoyaltyKoreNivel.findOne({ where: { nombre, activo: true } });
+  if (!fila || fila.porcentaje == null) return null;
+  return Number(fila.porcentaje);
+}
+
+/** Único campo editable por Numo. `esInicial:true` limpia cualquier otra fila que ya lo tuviera —
+ *  mismo criterio explícito que `esPuntos` en actualizarFormaPagoKore (en vez de dejar que el
+ *  índice único parcial tire un error de constraint poco legible). */
+async function actualizarNivelKore(id, { esInicial } = {}) {
+  const fila = await LoyaltyKoreNivel.findByPk(id);
+  if (!fila) throw new NotFoundError('Nivel de Kore');
+  if (esInicial === undefined) return fila;
+
+  await sequelize.transaction(async (t) => {
+    if (esInicial === true) {
+      await LoyaltyKoreNivel.update(
+        { esInicial: false },
+        { where: { esInicial: true, id: { [Op.ne]: fila.id } }, transaction: t },
+      );
+    }
+    await fila.update({ esInicial: !!esInicial }, { transaction: t });
+  });
+
+  return fila;
+}
+
 module.exports = {
   obtenerPorcentajes,
   guardarPorcentajes,
@@ -624,4 +731,12 @@ module.exports = {
   listarFormasPagoKore,
   actualizarConceptoKore,
   actualizarFormaPagoKore,
+  sincronizarNivelesKore,
+  listarNivelesKore,
+  actualizarNivelKore,
+  obtenerPorcentajeNivel,
+  // Reexportada (prefijo `_`, mismo criterio que loyalty-ledger.service.js#_resolverCentroCostoPorSerieFolio)
+  // para que loyalty-kore-nivel.service.js (webhook) reuse la MISMA lógica de adopción de fila
+  // transicional que el sync, sin duplicarla.
+  _buscarOAdoptarNivelKore,
 };

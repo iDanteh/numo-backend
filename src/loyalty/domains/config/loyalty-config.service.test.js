@@ -23,6 +23,7 @@ jest.mock('../../../shared/models/postgres', () => ({
   CentroCosto:             { findAll: jest.fn(), findByPk: jest.fn() },
   LoyaltyKoreConcepto:     { findAll: jest.fn(), findByPk: jest.fn(), findOrCreate: jest.fn() },
   LoyaltyKoreFormaPago:    { findAll: jest.fn(), findByPk: jest.fn(), findOrCreate: jest.fn(), update: jest.fn() },
+  LoyaltyKoreNivel:        { findAll: jest.fn(), findByPk: jest.fn(), findOne: jest.fn(), create: jest.fn(), update: jest.fn() },
   ConfigSection:           { findOne: jest.fn() },
   GlobalConfig:            { findOne: jest.fn() },
 }));
@@ -37,11 +38,12 @@ jest.mock('../../../config/database.postgres', () => ({
 jest.mock('./loyalty-kore-catalogos.client', () => ({
   obtenerConceptosKore: jest.fn(),
   obtenerFormasPagoKore: jest.fn(),
+  obtenerNivelesKore: jest.fn(),
 }));
 
 const {
   LoyaltyAdjustmentReason, LoyaltyPromotion, CentroCosto,
-  LoyaltyKoreConcepto, LoyaltyKoreFormaPago,
+  LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreNivel,
   ConfigSection, GlobalConfig,
 } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
@@ -745,5 +747,125 @@ describe('actualizarFormaPagoKore', () => {
   test('id inexistente: 404', async () => {
     LoyaltyKoreFormaPago.findByPk.mockResolvedValue(null);
     await expect(configService.actualizarFormaPagoKore(999, { esPuntos: true })).rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+
+// ── Catálogo de niveles de Kore (2026-11-06) ──────────────────────────────────
+// A diferencia de conceptos/formas de pago, `porcentaje` SÍ es autoritativo de Kore (se pisa en
+// cada sync) — `esInicial` es el único campo manual de Numo. Bootstrap transicional: filas con
+// `koreId:null` (sembradas por seed-lealtad.js) deben ADOPTARSE por nombre en el primer sync real,
+// nunca duplicarse.
+
+function makeNivel(overrides = {}) {
+  return { id: 1, koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, esInicial: false, activo: true, update: jest.fn(), ...overrides };
+}
+
+describe('sincronizarNivelesKore', () => {
+  test('nivel nuevo (sin fila transicional previa): se crea con esInicial:false', async () => {
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ Id: 'n1', Nombre: 'Bronce', Porcentaje: 1.5 }]);
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(null); // por koreId
+    LoyaltyKoreNivel.create.mockResolvedValue(makeNivel());
+    LoyaltyKoreNivel.findAll.mockResolvedValue([]);
+
+    const resultado = await configService.sincronizarNivelesKore();
+
+    expect(LoyaltyKoreNivel.findOne).toHaveBeenCalledWith({ where: { koreId: 'n1' } });
+    expect(LoyaltyKoreNivel.create).toHaveBeenCalledWith({
+      koreId: 'n1', nombre: 'Bronce', porcentaje: 1.5, activo: true, esInicial: false,
+    });
+    expect(resultado).toEqual({ nuevos: 1, actualizados: 0, desactivados: 0 });
+  });
+
+  test('adopta una fila transicional (koreId:null) por nombre en vez de duplicarla, preserva esInicial', async () => {
+    const transicional = makeNivel({ id: 5, koreId: null, nombre: 'Bronce', porcentaje: null, esInicial: true });
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ Id: 'n1', Nombre: 'Bronce', Porcentaje: 2 }]);
+    LoyaltyKoreNivel.findOne
+      .mockResolvedValueOnce(null) // por koreId: todavía no existe con ese id real
+      .mockResolvedValueOnce(transicional); // por nombre, koreId:null: la fila de bootstrap
+    LoyaltyKoreNivel.findAll.mockResolvedValue([transicional]);
+
+    const resultado = await configService.sincronizarNivelesKore();
+
+    expect(LoyaltyKoreNivel.findOne).toHaveBeenNthCalledWith(2, { where: { koreId: null, nombre: 'Bronce' } });
+    expect(transicional.update).toHaveBeenCalledWith({ koreId: 'n1', nombre: 'Bronce', porcentaje: 2, activo: true });
+    expect(LoyaltyKoreNivel.create).not.toHaveBeenCalled();
+    expect(resultado.actualizados).toBe(1);
+  });
+
+  test('nivel existente (ya con koreId real): refresca porcentaje/nombre, nunca toca esInicial', async () => {
+    const existente = makeNivel({ esInicial: true, porcentaje: 1 });
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([{ Id: 'n1', Nombre: 'Bronce Plus', Porcentaje: 1.75 }]);
+    LoyaltyKoreNivel.findOne.mockResolvedValueOnce(existente);
+    LoyaltyKoreNivel.findAll.mockResolvedValue([existente]);
+
+    await configService.sincronizarNivelesKore();
+
+    expect(existente.update).toHaveBeenCalledWith({ koreId: 'n1', nombre: 'Bronce Plus', porcentaje: 1.75, activo: true });
+    expect(existente.update).not.toHaveBeenCalledWith(expect.objectContaining({ esInicial: expect.anything() }));
+  });
+
+  test('nivel que ya no viene de Kore se marca activo:false; una fila transicional (koreId:null) NUNCA se desactiva sola', async () => {
+    const yaNoViene = makeNivel({ id: 2, koreId: 'viejo' });
+    const transicionalSinAdoptar = makeNivel({ id: 3, koreId: null, nombre: 'Platino' });
+    koreCatalogosClient.obtenerNivelesKore.mockResolvedValue([]);
+    LoyaltyKoreNivel.findAll.mockResolvedValue([yaNoViene, transicionalSinAdoptar]);
+
+    const resultado = await configService.sincronizarNivelesKore();
+
+    expect(yaNoViene.update).toHaveBeenCalledWith({ activo: false });
+    expect(transicionalSinAdoptar.update).not.toHaveBeenCalled();
+    expect(resultado.desactivados).toBe(1);
+  });
+});
+
+describe('listarNivelesKore', () => {
+  test('ordena por porcentaje ascendente', async () => {
+    LoyaltyKoreNivel.findAll.mockResolvedValue([]);
+    await configService.listarNivelesKore({ soloActivos: true });
+    expect(LoyaltyKoreNivel.findAll).toHaveBeenCalledWith({ where: { activo: true }, order: [['porcentaje', 'ASC']] });
+  });
+});
+
+describe('actualizarNivelKore', () => {
+  beforeEach(() => {
+    sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
+  });
+
+  test('esInicial:true limpia cualquier otra fila que ya lo tuviera, ANTES de guardar la propia', async () => {
+    const nivel = makeNivel({ id: 2, esInicial: false });
+    LoyaltyKoreNivel.findByPk.mockResolvedValue(nivel);
+
+    await configService.actualizarNivelKore(2, { esInicial: true });
+
+    const { Op } = require('sequelize');
+    expect(LoyaltyKoreNivel.update).toHaveBeenCalledWith(
+      { esInicial: false },
+      { where: { esInicial: true, id: { [Op.ne]: 2 } }, transaction: { fake: true } },
+    );
+    expect(nivel.update).toHaveBeenCalledWith({ esInicial: true }, { transaction: { fake: true } });
+  });
+
+  test('esInicial:false no toca las demás filas', async () => {
+    const nivel = makeNivel({ esInicial: true });
+    LoyaltyKoreNivel.findByPk.mockResolvedValue(nivel);
+
+    await configService.actualizarNivelKore(1, { esInicial: false });
+
+    expect(LoyaltyKoreNivel.update).not.toHaveBeenCalled();
+    expect(nivel.update).toHaveBeenCalledWith({ esInicial: false }, { transaction: { fake: true } });
+  });
+
+  test('sin esInicial en el payload: no toca nada, no abre transacción de más', async () => {
+    const nivel = makeNivel();
+    LoyaltyKoreNivel.findByPk.mockResolvedValue(nivel);
+
+    await configService.actualizarNivelKore(1, {});
+
+    expect(nivel.update).not.toHaveBeenCalled();
+  });
+
+  test('id inexistente: 404', async () => {
+    LoyaltyKoreNivel.findByPk.mockResolvedValue(null);
+    await expect(configService.actualizarNivelKore(999, { esInicial: true })).rejects.toMatchObject({ statusCode: 404 });
   });
 });

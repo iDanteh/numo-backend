@@ -44,6 +44,7 @@ const LoyaltyPromotion        = require('./LoyaltyPromotion');
 const LoyaltySecurityEvent    = require('./LoyaltySecurityEvent');
 const LoyaltyKoreConcepto     = require('./LoyaltyKoreConcepto');
 const LoyaltyKoreFormaPago    = require('./LoyaltyKoreFormaPago');
+const LoyaltyKoreNivel        = require('./LoyaltyKoreNivel');
 const LoyaltyKoreVentaFallida = require('./LoyaltyKoreVentaFallida');
 const PolizaAuditLog    = require('./PolizaAuditLog');
 
@@ -658,6 +659,10 @@ async function syncModels() {
   // LoyaltyKoreFormaPago.js) — tablas nuevas sin FKs.
   await LoyaltyKoreConcepto.sync({ force: false });
   await LoyaltyKoreFormaPago.sync({ force: false });
+  // Catálogo de niveles gestionado por Kore (2026-11-06, ver LoyaltyKoreNivel.js) — tabla nueva
+  // sin FKs. Las 3 filas transicionales (Bronce/Plata/Oro, koreId:null) se siembran aparte vía
+  // `npm run seed:lealtad` (mismo criterio que LoyaltyAdjustmentReason), no acá.
+  await LoyaltyKoreNivel.sync({ force: false });
   // Registro de procesos fallidos del webhook Kore→Numo de venta (2026-10-26, ver
   // LoyaltyKoreVentaFallida.js) — tabla nueva sin FKs.
   await LoyaltyKoreVentaFallida.sync({ force: false });
@@ -867,4 +872,4 @@ async function syncModels() {
   `).catch(e => console.warn('[syncModels] ADD COLUMN foto_drive_file_id/foto_mime_type (loyalty_cards):', e.message));
 }
 
-module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyCardAuditLog, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreVentaFallida, syncModels };
+module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyCardAuditLog, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreNivel, LoyaltyKoreVentaFallida, syncModels };

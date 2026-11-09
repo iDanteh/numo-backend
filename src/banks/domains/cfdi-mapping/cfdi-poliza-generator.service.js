@@ -6036,6 +6036,93 @@ async function _uuidsDePoliza(polizaId) {
   return new Set(rows.map(r => r.cfdiUuid));
 }
 
+// ── Aviso "faltan CFDIs" (2026-11-09) ───────────────────────────────────────
+// Por cada póliza de Ingreso (no cancelada) cuenta las facturas/NC del SAT de
+// su MISMA sucursal y día (fecha efectiva, igual que la generación) que:
+//   - están vigentes,
+//   - llegaron a NUMO DESPUÉS de generar la póliza (createdAt de la copia SAT),
+//   - no están en ninguna póliza no cancelada,
+//   - no son sustitutos (tipoRelacion 04: la generación siempre los excluye).
+// Solo "llegaron después" para que el aviso desaparezca al actualizar y no
+// marque para siempre algo que la generación deja fuera a propósito (sin regla…).
+async function facturasTardiasDePolizas(polizaIds) {
+  const ids = [...new Set((polizaIds || []).map(Number).filter(Number.isFinite))].slice(0, 100);
+  if (!ids.length) return {};
+  const polizas = await Poliza.findAll({
+    where: { id: { [Op.in]: ids }, tipo: 'I', estado: { [Op.ne]: 'cancelada' } },
+    attributes: ['id', 'rfc', 'ejercicio', 'periodo', 'concepto', 'createdAt'],
+  });
+  const ccBySerieMap = await centrosSvc.resolveBySerieMap();
+  const cacheDia = new Map(); // rfc|ejercicio|periodo|ini|fin → Set uuids (I + E)
+  const resultado = {};
+
+  for (const p of polizas) {
+    let params;
+    try { params = await _parametrosRegeneracionIngreso(p); } catch (_) { continue; }
+    const k = [p.rfc, p.ejercicio, p.periodo, params.fechaInicio, params.fechaFin].join('|');
+    if (!cacheDia.has(k)) {
+      const base = { rfc: p.rfc, ejercicio: p.ejercicio, periodo: p.periodo, fechaInicio: params.fechaInicio, fechaFin: params.fechaFin };
+      const [ingresos, egresos] = await Promise.all([
+        _uuidsPorFechaEfectiva({ ...base, tipoCfdi: 'I' }),
+        _uuidsPorFechaEfectiva({ ...base, tipoCfdi: 'E' }),
+      ]);
+      cacheDia.set(k, [...ingresos, ...egresos]);
+    }
+    const uuidsDia = cacheDia.get(k);
+    if (!uuidsDia.length) continue;
+
+    let candidatos = (await CFDI.find({
+      uuid: { $in: uuidsDia }, source: 'SAT', satStatus: 'Vigente', isActive: true,
+      'emisor.rfc': p.rfc, createdAt: { $gt: p.createdAt },
+    }).select('uuid serie folio total tipoDeComprobante cfdiRelacionados createdAt').lean())
+      .filter(c => String(ccBySerieMap[c.serie]?.id ?? '') === String(params.centroCostoId))
+      .filter(c => !(c.cfdiRelacionados || []).some(r => String(r?.tipoRelacion ?? '') === '04'));
+    if (!candidatos.length) continue;
+
+    // NC (E): solo las que la generación por día SÍ fusiona a la póliza de
+    // Ingreso — mismo criterio que `_fetchNotasCreditoParaFusion` (rama por
+    // día): tipoRelacion 01/03 en SAT, o en el ERP indicador de serie
+    // (BON/BCT/CANCELACION…) o anticipo (tipoOrigen 'Egreso' / relación 07).
+    // Las demás nunca entrarían y el aviso no se quitaría al actualizar.
+    const ncsCand = candidatos.filter(c => c.tipoDeComprobante === 'E');
+    let ncsFusionables = new Set();
+    if (ncsCand.length) {
+      const porSat = ncsCand.filter(c => (c.cfdiRelacionados || []).some(r => r?.tipoRelacion === '01' || r?.tipoRelacion === '03'));
+      const erp = await CFDI.find({
+        uuid: { $in: ncsCand.map(c => c.uuid) }, source: 'ERP',
+        $or: [
+          { 'documentosRelacionados.Serie': { $in: SERIES_FUSION_NC } },
+          { tipoOrigen: 'Egreso' },
+          { 'cfdiRelacionados.tipoRelacion': '07' },
+        ],
+      }).select('uuid').lean();
+      ncsFusionables = new Set([...porSat.map(c => c.uuid), ...erp.map(c => c.uuid)]);
+    }
+    candidatos = candidatos.filter(c => c.tipoDeComprobante !== 'E' || ncsFusionables.has(c.uuid));
+    if (!candidatos.length) continue;
+
+    const usados = new Set((await PolizaMovimiento.findAll({
+      where: { cfdiUuid: { [Op.in]: candidatos.map(c => c.uuid) } },
+      attributes: ['cfdiUuid'],
+      include: [{ model: Poliza, as: 'poliza', attributes: [], where: { estado: { [Op.ne]: 'cancelada' } }, required: true }],
+      raw: true,
+    })).map(r => r.cfdiUuid));
+    const faltan = candidatos.filter(c => !usados.has(c.uuid));
+    if (!faltan.length) continue;
+
+    resultado[p.id] = {
+      total: faltan.length,
+      facturas: faltan
+        .sort((a, b) => String(a.folio).localeCompare(String(b.folio)))
+        .map(c => ({
+          uuid: c.uuid, serieFolio: [c.serie, c.folio].filter(Boolean).join('-'),
+          tipo: c.tipoDeComprobante, total: c.total, llegoEn: c.createdAt,
+        })),
+    };
+  }
+  return resultado;
+}
+
 // Una sola actualización a la vez (pedido del usuario 2026-11-09): mientras
 // una corre, las demás se rechazan (el front también bloquea los botones).
 let _regeneracionEnCurso = null;
@@ -8181,7 +8268,7 @@ async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, 
 }
 
 module.exports = {
-  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso,
+  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso, facturasTardiasDePolizas,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,

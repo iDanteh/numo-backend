@@ -481,6 +481,14 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS depositos_efectivo_no_conciliados JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN depositos_efectivo_no_conciliados:', e.message));
 
+  // "↻ Actualizar" (2026-11-09) — ver Poliza.actualizadaPor.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS actualizada_por VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS actualizada_at  TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS actualizada_de  INTEGER
+  `).catch(e => console.warn('[syncModels] ADD COLUMN actualizada_*:', e.message));
+
   // Folios CONTPAQi de las NC de CEDIS (201–299) — ver Poliza.contpaqFoliosNc.
   await Poliza.sequelize.query(`
     ALTER TABLE polizas

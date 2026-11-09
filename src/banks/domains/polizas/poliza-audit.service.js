@@ -23,6 +23,7 @@ const { logger }     = require('../../../shared/utils/logger');
 const ACCIONES = Object.freeze([
   'creada', 'editada', 'contabilizada', 'cancelada', 'revertida',
   'exportada', 'exportada_xml_sat', 'folio_contpaq', 'cuenta_reemplazada',
+  'actualizada',
 ]);
 
 // Mismo criterio que userLabel() de poliza.service.js — así los nombres de la

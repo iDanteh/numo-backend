@@ -126,4 +126,36 @@ async function listarSinTimbrar({ rfc, desde, hasta, centroCostoId }) {
   };
 }
 
-module.exports = { listarSinTimbrar };
+// Por póliza de Ingreso (no cancelada): las sin timbrar de SU sucursal y día
+// (pedido del usuario 2026-11-09: aviso "⏳ N sin timbrar" en cada póliza).
+// Response: { [polizaId]: { total, desde, hasta, centroCostoId, facturas: [...] } }
+async function sinTimbrarDePolizas(polizaIds) {
+  const ids = [...new Set((polizaIds || []).map(Number).filter(Number.isFinite))].slice(0, 100);
+  if (!ids.length) return {};
+  const { _parametrosRegeneracionIngreso } = require('./cfdi-poliza-generator.service');
+  const polizas = await Poliza.findAll({
+    where: { id: { [Op.in]: ids }, tipo: 'I', estado: { [Op.ne]: 'cancelada' } },
+    attributes: ['id', 'rfc', 'concepto'],
+  });
+  const cache = new Map();
+  const resultado = {};
+  for (const p of polizas) {
+    let params;
+    try { params = await _parametrosRegeneracionIngreso(p); } catch (_) { continue; }
+    const k = [p.rfc, params.fechaInicio, params.fechaFin, params.centroCostoId].join('|');
+    if (!cache.has(k)) {
+      cache.set(k, await listarSinTimbrar({
+        rfc: p.rfc, desde: params.fechaInicio, hasta: params.fechaFin, centroCostoId: params.centroCostoId,
+      }).catch(() => null));
+    }
+    const r = cache.get(k);
+    if (!r || !r.total) continue;
+    resultado[p.id] = {
+      total: r.total, desde: params.fechaInicio, hasta: params.fechaFin, centroCostoId: params.centroCostoId,
+      facturas: r.facturas.map(f => ({ serieFolio: f.serieFolio, tipo: f.tipo, total: f.total, cliente: f.cliente })),
+    };
+  }
+  return resultado;
+}
+
+module.exports = { listarSinTimbrar, sinTimbrarDePolizas };

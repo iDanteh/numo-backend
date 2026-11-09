@@ -1336,6 +1336,9 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
             !/puntos|saldo\s*a\s*favor|anticipo/i.test(fp.nombre ?? ''));
           if (!tieneFormaReal) continue;
         } else if (origen === 'MIS') {
+          // 2026-11-09 (pedido del usuario): las ventas MISCELÁNEA ya NO se
+          // toman en cuenta en la póliza de Ingreso — se ignora el cobro.
+          continue;
           // 'MIS' (2026-08-20, confirmado con el usuario contra el "Reporte
           // de Movimientos en Cajas" real de Hidalgo/B0 11-ago): es "VENTA
           // MISCELANEA" (ej. "TIENDITA TYC" — venta de refresco/artículos
@@ -1729,7 +1732,8 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
         // 'CCE' (Cobro Contra Entrega): dinero real, se trata igual que cualquier
         // otro cobro según la caja donde se hizo (`claveCentro`) — ver
         // comentario 2026-09-23 en `_prefetchAjustesFacturaPropia`.
-        if (origen !== 'APS' && origen !== 'MIS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
+        // MIS se ignora desde 2026-11-09 (pedido del usuario).
+        if (origen !== 'APS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
         for (const fp of (cobro.formasPago ?? [])) {
           if (/puntos|saldo\s*a\s*favor/i.test(fp.nombre ?? '')) continue;
           // "ANTICIPO" — mismo criterio que `desglosePagoReal` (línea ~1175)
@@ -3278,7 +3282,8 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       // factura lo marca `yaContabilizadoOtroDia` (acepta 'CCE' igual que
       // 'CBT'). Revierte 3e154b2 (2026-09-23), que lo había quitado por
       // precaución (CEDIS 18-sep, $140,928.60) — re-verificado antes de subir.
-      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'MIS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
+      // MIS se ignora desde 2026-11-09 (pedido del usuario).
+      if (origen !== 'CBT' && origen !== 'APS' && origen !== 'CCE' && !SERIES_CON_AUTH.includes(origen)) continue;
 
       const dedupeKey = `${cobro.serieOrigen}|${cobro.folioOrigen}|${cuenta.serieVenta}|${cuenta.folioVenta}`;
       if (vistos.has(dedupeKey)) continue;

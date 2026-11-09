@@ -8268,7 +8268,7 @@ async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, 
 }
 
 module.exports = {
-  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso, facturasTardiasDePolizas,
+  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso, facturasTardiasDePolizas, _parametrosRegeneracionIngreso,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,

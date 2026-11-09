@@ -152,7 +152,13 @@ async function sinTimbrarDePolizas(polizaIds) {
     if (!r || !r.total) continue;
     resultado[p.id] = {
       total: r.total, desde: params.fechaInicio, hasta: params.fechaFin, centroCostoId: params.centroCostoId,
-      facturas: r.facturas.map(f => ({ serieFolio: f.serieFolio, tipo: f.tipo, total: f.total, cliente: f.cliente })),
+      // Campos completos: los usan el desglose del detalle de la póliza y la
+      // hoja "Facturas Sin Timbrar" del export (2026-11-09).
+      facturas: r.facturas.map(f => ({
+        serieFolio: f.serieFolio, dia: f.dia, diasSinTimbrar: f.diasSinTimbrar, tipo: f.tipo,
+        metodoPago: f.metodoPago, formaPago: f.formaPago, subTotal: f.subTotal, total: f.total,
+        cliente: f.cliente, rfcCliente: f.rfcCliente, sucursal: f.sucursal,
+      })),
     };
   }
   return resultado;

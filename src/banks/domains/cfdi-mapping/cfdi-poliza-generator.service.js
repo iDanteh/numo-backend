@@ -14,7 +14,7 @@ const { detectarMovimientosMostrador, detectarDepositosPendientesFactura } = req
 const { construirMovimientosPuente, _extraerDocumentosRelacionados, _sincronizarCobroSucursalPendiente } = require('./cobros-sucursal-puente.service');
 const { obtenerSaldosFavor, obtenerDesglosesCobroAlmacen, obtenerDesglosesCobroAlmacenPorCentro, obtenerSaldosFavorPorCentro, sincronizarCuentasPendientes, obtenerNombrePersonaTicket } = require('../erp/erp-sync.service');
 const { SERIES_CON_AUTH } = require('../erp/erp-auth.utils');
-const { BadRequestError }          = require('../../shared/errors/AppError');
+const { BadRequestError, ConflictError } = require('../../shared/errors/AppError');
 const { repararSubtotalDesdeXml }  = require('../../../visor/services/cfdiSubtotalRepair');
 const {
   _splitUuids,
@@ -5914,6 +5914,132 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
 // Mismo criterio que userLabel() en poliza.service.js (create() manual) —
 // duplicado aquí en vez de importar para no crear una dependencia cruzada
 // entre ambos servicios de pólizas.
+// ── Actualizar (regenerar) una póliza de Ingreso ya generada ────────────────
+// Pedido del usuario 2026-11-09 (reporte "NO REGISTRADOS COMPAQ"): CEDIS
+// factura con la fecha de la venta pero timbra 1–3 días después, así que la
+// factura llega del SAT cuando la póliza de ese día ya se generó y queda
+// fuera. "Actualizar" cancela la póliza (solo borrador) y la genera de nuevo
+// con la MISMA sucursal y día, ya con todo lo que hay hoy en NUMO. Si la
+// generación nueva falla, la anterior se restaura a borrador.
+// La póliza no guarda centroCostoId ni rango: se leen del concepto que arma
+// `_construirConceptoIngresoBase` ("Ingresos por Ventas Suc. X Día: dd/mm/aaaa[ al dd/mm/aaaa]").
+const RE_CONCEPTO_INGRESO = /^Ingresos por Ventas Suc\. (.+?) Día: (\d{2})\/(\d{2})\/(\d{4})(?: al (\d{2})\/(\d{2})\/(\d{4}))?\s*$/;
+
+async function _parametrosRegeneracionIngreso(poliza) {
+  const m = RE_CONCEPTO_INGRESO.exec(String(poliza.concepto ?? '').trim());
+  if (!m) {
+    throw new BadRequestError('No se puede actualizar: el concepto de la póliza no dice la sucursal y el día (¿se editó a mano?). Genérala de nuevo desde "Generar".');
+  }
+  const sucursal    = m[1].trim();
+  const fechaInicio = `${m[4]}-${m[3]}-${m[2]}`;
+  const fechaFin    = m[5] ? `${m[7]}-${m[6]}-${m[5]}` : fechaInicio;
+  const ccBySerieMap = await centrosSvc.resolveBySerieMap();
+  const norm = (x) => String(x ?? '').trim().toLowerCase();
+  const centro = Object.values(ccBySerieMap).find(c => norm(c.sucursal) === norm(sucursal));
+  if (!centro) throw new BadRequestError(`No se encontró la sucursal "${sucursal}" del concepto de la póliza.`);
+  return { centroCostoId: centro.id, sucursal: centro.sucursal, fechaInicio, fechaFin };
+}
+
+async function _uuidsDePoliza(polizaId) {
+  const rows = await PolizaMovimiento.findAll({
+    where: { polizaId, cfdiUuid: { [Op.ne]: null } }, attributes: ['cfdiUuid'], raw: true,
+  });
+  return new Set(rows.map(r => r.cfdiUuid));
+}
+
+// Una sola actualización a la vez (pedido del usuario 2026-11-09): mientras
+// una corre, las demás se rechazan (el front también bloquea los botones).
+let _regeneracionEnCurso = null;
+
+async function regenerarPolizaIngreso(polizaId, user) {
+  if (_regeneracionEnCurso != null) {
+    throw new ConflictError('Ya se está actualizando otra póliza — espera a que termine.');
+  }
+  _regeneracionEnCurso = polizaId;
+  try {
+    return await _regenerarPolizaIngresoCore(polizaId, user);
+  } finally {
+    _regeneracionEnCurso = null;
+  }
+}
+
+async function _regenerarPolizaIngresoCore(polizaId, user) {
+  const polizaService = require('../polizas/poliza.service');
+  const poliza = await Poliza.findByPk(polizaId);
+  if (!poliza) throw new BadRequestError('Póliza no encontrada');
+  if (poliza.tipo !== 'I') throw new BadRequestError('Solo se pueden actualizar pólizas de Ingreso');
+  if (poliza.estado === 'cancelada') throw new BadRequestError('La póliza está cancelada');
+  if (poliza.estado !== 'borrador') {
+    throw new BadRequestError('La póliza está contabilizada: revírtela a borrador antes de actualizarla');
+  }
+  const params = await _parametrosRegeneracionIngreso(poliza);
+  const uuidsAntes = await _uuidsDePoliza(poliza.id);
+  const anterior = {
+    id: poliza.id, numero: poliza.numero,
+    contpaqFolioContado: poliza.contpaqFolioContado ?? null,
+    contpaqFolioCredito: poliza.contpaqFolioCredito ?? null,
+  };
+
+  await polizaService.cancel(poliza.id, user, 'Actualizada: se generó de nuevo con las facturas que llegaron después');
+
+  let res;
+  try {
+    res = await generarYGuardar({
+      rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo,
+      tipoCfdi: 'I', tipoPropuesta: 'I',
+      centroCostoId: params.centroCostoId, fechaInicio: params.fechaInicio, fechaFin: params.fechaFin,
+      user,
+    });
+  } catch (err) {
+    // Restaurar la anterior tal cual estaba — el día no debe quedarse sin póliza.
+    await Poliza.update(
+      { estado: 'borrador', canceladoPor: null, canceladaAt: null, motivoCancelacion: null },
+      { where: { id: anterior.id } },
+    );
+    throw err;
+  }
+
+  // Quién generó la actualización (queda en la póliza nueva y en la bitácora).
+  await Poliza.update(
+    { actualizadaPor: _userLabel(user), actualizadaAt: new Date(), actualizadaDe: anterior.id },
+    { where: { id: res.polizaId } },
+  );
+
+  const uuidsDespues = await _uuidsDePoliza(res.polizaId);
+  const etiquetas = async (uuids) => {
+    if (!uuids.length) return [];
+    const docs = await CFDI.find({ uuid: { $in: uuids }, source: 'SAT' }).select('uuid serie folio total').lean();
+    const porUuid = new Map(docs.map(d => [d.uuid, d]));
+    return uuids.map(u => {
+      const d = porUuid.get(u);
+      return { uuid: u, serieFolio: d ? [d.serie, d.folio].filter(Boolean).join('-') : null, total: d?.total ?? null };
+    });
+  };
+  const nueva = await Poliza.findByPk(res.polizaId);
+  const facturasAgregadas = await etiquetas([...uuidsDespues].filter(u => !uuidsAntes.has(u)));
+  const facturasQuitadas  = await etiquetas([...uuidsAntes].filter(u => !uuidsDespues.has(u)));
+  await require('../polizas/poliza-audit.service').registrar('actualizada', nueva, user, {
+    estadoNuevo: 'borrador',
+    detalle: {
+      anteriorId: anterior.id, anteriorNumero: anterior.numero,
+      facturasAgregadas: facturasAgregadas.map(f => f.serieFolio || f.uuid),
+      facturasQuitadas:  facturasQuitadas.map(f => f.serieFolio || f.uuid),
+    },
+  });
+
+  return {
+    ...res,
+    numero: nueva?.numero ?? null,
+    anterior,
+    sucursal:    params.sucursal,
+    fechaInicio: params.fechaInicio,
+    fechaFin:    params.fechaFin,
+    actualizadaPor: nueva?.actualizadaPor ?? null,
+    facturasAgregadas,
+    facturasQuitadas,
+  };
+}
+
 function _userLabel(user) {
   return user?.nombre || user?.email || String(user?.dbId ?? 'sistema');
 }
@@ -7948,7 +8074,7 @@ async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, 
 }
 
 module.exports = {
-  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
+  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,

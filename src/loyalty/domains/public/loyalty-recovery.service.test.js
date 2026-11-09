@@ -20,6 +20,12 @@ jest.mock('../../shared/nip.util', () => ({
   DUMMY_CODIGO_HASH: '$2a$10$dummyCodigoHashModuleLevelXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
   MAX_INTENTOS_FALLIDOS: 5,
   LOCKOUT_MS: 15 * 60 * 1000,
+  // Sesión de consulta (2026-11-09) — generarSesionToken/hashSesionToken son deterministas acá
+  // (no bcrypt): el test controla directamente qué hash "guardado" matchea con compararSesionToken.
+  generarSesionToken: jest.fn(),
+  hashSesionToken: jest.fn((token) => `hash-de-${token}`),
+  compararSesionToken: jest.fn(),
+  DUMMY_SESION_TOKEN_HASH: 'dummy-sesion-token-hash',
 }));
 jest.mock('../../../shared/utils/logger', () => ({
   logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn(), debug: jest.fn() },
@@ -29,18 +35,35 @@ jest.mock('../../../shared/utils/logger', () => ({
 jest.mock('../ledger/loyalty-ledger.service', () => ({
   listarMovimientosPublicos: jest.fn(),
 }));
+// Historial de cambios de catálogo (2026-11-09) — se mockea completo, cubierto aparte en
+// loyalty-card-audit.service.test.js; acá solo se verifica QUÉ se le pasa (antes/despues/accion/
+// origen), no su comportamiento interno de comparación.
+jest.mock('../cards/loyalty-card-audit.service', () => ({
+  registrarCambioTarjeta: jest.fn(),
+}));
+// Límite mensual de consultas con código (2026-11-09) — se mockea completo, cubierto aparte en
+// loyalty-config.service.test.js; acá solo se verifica que solicitarCodigo lo consulte y respete.
+jest.mock('../config/loyalty-config.service', () => ({
+  obtenerConsultaCodigoMaxMes: jest.fn(),
+}));
 
 const { LoyaltyCard, LoyaltySecurityEvent } = require('../../../shared/models/postgres');
 const {
   generarNip, generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
+  generarSesionToken, compararSesionToken, DUMMY_SESION_TOKEN_HASH,
 } = require('../../shared/nip.util');
 const { logger } = require('../../../shared/utils/logger');
 const ledgerService = require('../ledger/loyalty-ledger.service');
-const { solicitarCodigo, confirmarCodigoConsulta } = require('./loyalty-recovery.service');
+const { registrarCambioTarjeta } = require('../cards/loyalty-card-audit.service');
+const configService = require('../config/loyalty-config.service');
+const {
+  solicitarCodigo, confirmarCodigoConsulta, verConsultaSesion, guardarEmailConsulta,
+} = require('./loyalty-recovery.service');
 
 const TELEFONO = '5512345678';
 const CODIGO_REAL = '654321';
 const CODIGO_MALO = '111111';
+const SESION_TOKEN = 'token-de-sesion-real';
 
 function makeCard(overrides = {}) {
   return {
@@ -53,9 +76,29 @@ function makeCard(overrides = {}) {
     recuperacionExpiraEn: new Date(Date.now() + 5 * 60 * 1000),
     recuperacionIntentosFallidos: 0,
     recuperacionBloqueadaHasta: null,
+    consultaSesionTokenHash: null,
+    consultaSesionUsosRestantes: null,
+    consultaSesionExpiraEn: null,
+    totalConsultas: 0,
+    emailContacto: null,
+    consultaCodigoMesPeriodo: null,
+    consultaCodigoMesContador: 0,
     update: jest.fn(function (cambios) { Object.assign(this, cambios); return Promise.resolve(this); }),
     ...overrides,
   };
+}
+
+/** Tarjeta con una sesión de consulta vigente (post-confirmarCodigoConsulta) — usada por los
+ *  describe de verConsultaSesion/guardarEmailConsulta. `compararSesionToken` se mockea aparte en
+ *  cada test (no es determinista por defecto, a diferencia de hashSesionToken). */
+function makeCardConSesion(overrides = {}) {
+  return makeCard({
+    activa: true,
+    consultaSesionTokenHash: 'hash-del-token-real',
+    consultaSesionUsosRestantes: 3,
+    consultaSesionExpiraEn: new Date(Date.now() + 10 * 60 * 1000),
+    ...overrides,
+  });
 }
 
 const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
@@ -65,6 +108,10 @@ beforeEach(() => {
   LoyaltyCard.scope.mockReturnValue(LoyaltyCard);
   process.env.NODE_ENV = 'test';
   ledgerService.listarMovimientosPublicos.mockResolvedValue([]);
+  generarSesionToken.mockReturnValue(SESION_TOKEN);
+  // Default: sin límite configurado (preserva el comportamiento de todos los tests que no
+  // ejercitan el límite mensual explícitamente) — ver describe dedicado más abajo.
+  configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(null);
 });
 
 afterAll(() => {
@@ -326,7 +373,7 @@ describe('logging — nunca el código en texto plano en logger.warn, sí el tel
 });
 
 describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pública (2026-10-26)', () => {
-  test('código correcto + tarjeta activa → devuelve nombre/nivel/saldoPuntos, nunca un NIP', async () => {
+  test('código correcto + tarjeta activa → devuelve nombre/nivel/saldoPuntos + token/usosRestantes de sesión, nunca un NIP', async () => {
     const card = makeCard({ activa: true, saldoPuntos: 1234.5 });
     LoyaltyCard.findOne.mockResolvedValue(card);
     compararCodigo.mockResolvedValue(true);
@@ -335,6 +382,7 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
 
     expect(resultado).toEqual({
       nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 1234.5, movimientos: [],
+      token: SESION_TOKEN, usosRestantes: 3, emailContacto: null,
     });
     expect(generarNip).not.toHaveBeenCalled();
     expect(card.update).toHaveBeenCalledWith({
@@ -342,7 +390,50 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
       recuperacionExpiraEn: null,
       recuperacionIntentosFallidos: 0,
       recuperacionBloqueadaHasta: null,
+      consultaSesionTokenHash: `hash-de-${SESION_TOKEN}`,
+      consultaSesionUsosRestantes: 3,
+      consultaSesionExpiraEn: expect.any(Date),
+      ultimaConsultaAt: expect.any(Date),
+      totalConsultas: 1,
+      consultaCodigoMesPeriodo: expect.any(String),
+      consultaCodigoMesContador: 1,
     });
+  });
+
+  test('token de sesión emitido tiene ventana de ~15 minutos', async () => {
+    const card = makeCard({ activa: true, saldoPuntos: 100 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const antes = Date.now();
+    await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    const [[cambios]] = card.update.mock.calls;
+    const deltaMs = cambios.consultaSesionExpiraEn.getTime() - antes;
+    expect(deltaMs).toBeGreaterThanOrEqual(15 * 60 * 1000 - 1000);
+    expect(deltaMs).toBeLessThanOrEqual(15 * 60 * 1000 + 1000);
+  });
+
+  test('totalConsultas acumula sobre el valor previo de la tarjeta (nunca reinicia a 1)', async () => {
+    const card = makeCard({ activa: true, totalConsultas: 7 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({ totalConsultas: 8 }));
+  });
+
+  // Correo ya registrado en una sesión anterior (2026-11-09) — el frontend lo usa para mostrar el
+  // campo ya bloqueado desde el primer vistazo, sin depender de guardarEmail() en esta sesión.
+  test('tarjeta con emailContacto ya guardado → lo incluye en la respuesta', async () => {
+    const card = makeCard({ activa: true, emailContacto: 'previo@correo.com' });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    const resultado = await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(resultado.emailContacto).toBe('previo@correo.com');
   });
 
   test('código incorrecto comparte el mismo camino de error único (_validarCodigo)', async () => {
@@ -365,6 +456,103 @@ describe('confirmarCodigoConsulta — reemplazo del NIP estático en la ruta pú
       statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
     });
     expect(card.update).not.toHaveBeenCalled();
+  });
+});
+
+// Mismo cálculo que _periodoActualMexico() (privada, no exportada) — duplicado acá a propósito
+// para comparar en negro contra el comportamiento real, sin mockear Date/Intl.
+const periodoActualMexico = () => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/Mexico_City', month: '2-digit', year: 'numeric',
+}).format(new Date());
+
+describe('Límite mensual de consultas CON CÓDIGO (2026-11-09, blindaje adicional)', () => {
+  test('sin límite configurado (null) → genera código normalmente aunque el contador sea alto', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(null);
+    const card = makeCard({ consultaCodigoMesPeriodo: periodoActualMexico(), consultaCodigoMesContador: 999 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    const resultado = await solicitarCodigo(TELEFONO);
+
+    expect(hashCodigo).toHaveBeenCalledWith(CODIGO_REAL);
+    expect(resultado.codigoDev).toBe(CODIGO_REAL);
+  });
+
+  test('límite alcanzado en el período vigente → NO genera código real, mismo mensaje genérico, timing igualado', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(2);
+    const card = makeCard({ consultaCodigoMesPeriodo: periodoActualMexico(), consultaCodigoMesContador: 2 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    const resultado = await solicitarCodigo(TELEFONO);
+
+    expect(resultado).toEqual({ mensaje: expect.any(String) });
+    expect(resultado.codigoDev).toBeUndefined();
+    expect(hashCodigo).not.toHaveBeenCalled();
+    expect(card.update).not.toHaveBeenCalled();
+    // Igualación de tiempo: corre el mismo dummy compare que los otros 2 caminos de rechazo.
+    expect(compararCodigo).toHaveBeenCalledWith(expect.any(String), DUMMY_CODIGO_HASH);
+  });
+
+  test('contador por encima del límite (no solo igual) también bloquea', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(1);
+    const card = makeCard({ consultaCodigoMesPeriodo: periodoActualMexico(), consultaCodigoMesContador: 5 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await solicitarCodigo(TELEFONO);
+
+    expect(hashCodigo).not.toHaveBeenCalled();
+  });
+
+  test('período guardado distinto al actual (mes nuevo) → reset perezoso, genera código aunque el contador viejo ya estuviera en el límite', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(1);
+    const card = makeCard({ consultaCodigoMesPeriodo: '2020-01', consultaCodigoMesContador: 99 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    const resultado = await solicitarCodigo(TELEFONO);
+
+    expect(hashCodigo).toHaveBeenCalledWith(CODIGO_REAL);
+    expect(resultado.codigoDev).toBe(CODIGO_REAL);
+  });
+
+  test('tarjeta que nunca usó el mecanismo (consultaCodigoMesPeriodo null) → no bloquea bajo el límite', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(3);
+    const card = makeCard({ consultaCodigoMesPeriodo: null, consultaCodigoMesContador: 0 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    generarCodigoRecuperacion.mockReturnValue(CODIGO_REAL);
+    hashCodigo.mockResolvedValue('hash-nuevo');
+
+    await solicitarCodigo(TELEFONO);
+
+    expect(hashCodigo).toHaveBeenCalledWith(CODIGO_REAL);
+  });
+
+  test('confirmarCodigoConsulta exitoso incrementa el contador cuando el período coincide', async () => {
+    const card = makeCard({ activa: true, consultaCodigoMesPeriodo: periodoActualMexico(), consultaCodigoMesContador: 1 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({
+      consultaCodigoMesPeriodo: periodoActualMexico(),
+      consultaCodigoMesContador: 2,
+    }));
+  });
+
+  test('confirmarCodigoConsulta exitoso reinicia el contador a 1 cuando el período guardado es distinto (o nunca se usó)', async () => {
+    const card = makeCard({ activa: true, consultaCodigoMesPeriodo: '2020-01', consultaCodigoMesContador: 50 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararCodigo.mockResolvedValue(true);
+
+    await confirmarCodigoConsulta(TELEFONO, CODIGO_REAL);
+
+    expect(card.update).toHaveBeenCalledWith(expect.objectContaining({
+      consultaCodigoMesPeriodo: periodoActualMexico(),
+      consultaCodigoMesContador: 1,
+    }));
   });
 });
 
@@ -440,6 +628,7 @@ describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEven
 
     await expect(confirmarCodigoConsulta(TELEFONO, CODIGO_REAL)).resolves.toEqual({
       nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 100, movimientos: [],
+      token: SESION_TOKEN, usosRestantes: 3, emailContacto: null,
     });
   });
 
@@ -456,5 +645,219 @@ describe('Auditoría — eventos de seguridad persistidos en LoyaltySecurityEven
 
     expect(ledgerService.listarMovimientosPublicos).toHaveBeenCalledWith(card.id);
     expect(resultado.movimientos).toEqual(movimientos);
+  });
+});
+
+describe('verConsultaSesion — "ver de nuevo" sin pedir un código nuevo (2026-11-09)', () => {
+  test('formato inválido (sin token) → 422 genérico, sin findOne', async () => {
+    await expect(verConsultaSesion(TELEFONO, '')).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(LoyaltyCard.findOne).not.toHaveBeenCalled();
+    expect(compararSesionToken).toHaveBeenCalledWith(expect.any(String), DUMMY_SESION_TOKEN_HASH);
+  });
+
+  test('teléfono desconocido → 422 genérico, corre compararSesionToken contra el dummy (timing parity)', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({ statusCode: 422 });
+    expect(compararSesionToken).toHaveBeenCalledWith(SESION_TOKEN, DUMMY_SESION_TOKEN_HASH);
+  });
+
+  test('sin sesión vigente (consultaSesionTokenHash null) → 422 genérico', async () => {
+    const card = makeCard({ activa: true });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({ statusCode: 422 });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+
+  test('sesión expirada → 422 genérico', async () => {
+    const card = makeCardConSesion({ consultaSesionExpiraEn: new Date(Date.now() - 1000) });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({ statusCode: 422 });
+  });
+
+  test('usos agotados (consultaSesionUsosRestantes = 0) → 422 genérico', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 0 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({ statusCode: 422 });
+  });
+
+  test('token incorrecto → 422 genérico', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(false);
+
+    await expect(verConsultaSesion(TELEFONO, 'token-malo')).rejects.toMatchObject({ statusCode: 422 });
+  });
+
+  test('tarjeta inactiva → 422 genérico aunque el token sea correcto', async () => {
+    const card = makeCardConSesion({ activa: false });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(verConsultaSesion(TELEFONO, SESION_TOKEN)).rejects.toMatchObject({ statusCode: 422 });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+
+  test('token correcto + usos restantes > 1 → decrementa usos, NO limpia la sesión', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 3, saldoPuntos: 500 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await verConsultaSesion(TELEFONO, SESION_TOKEN);
+
+    expect(resultado).toEqual({
+      nombre: 'Ana García López', nivel: 'Plata', saldoPuntos: 500, movimientos: [],
+      usosRestantes: 2, emailContacto: null,
+    });
+    expect(card.update).toHaveBeenCalledWith({
+      consultaSesionUsosRestantes: 2,
+      ultimaConsultaAt: expect.any(Date),
+      totalConsultas: 1,
+    });
+  });
+
+  test('última vista permitida (usos restantes = 1) → limpia la sesión entera, usosRestantes: 0', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 1 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await verConsultaSesion(TELEFONO, SESION_TOKEN);
+
+    expect(resultado.usosRestantes).toBe(0);
+    expect(card.update).toHaveBeenCalledWith({
+      consultaSesionTokenHash: null,
+      consultaSesionUsosRestantes: null,
+      consultaSesionExpiraEn: null,
+      ultimaConsultaAt: expect.any(Date),
+      totalConsultas: 1,
+    });
+  });
+
+  test('tarjeta con emailContacto ya guardado → lo incluye en la respuesta', async () => {
+    const card = makeCardConSesion({ emailContacto: 'previo@correo.com' });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await verConsultaSesion(TELEFONO, SESION_TOKEN);
+
+    expect(resultado.emailContacto).toBe('previo@correo.com');
+  });
+
+  test('registra auditoría de éxito (tipo ver_consulta)', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await verConsultaSesion(TELEFONO, SESION_TOKEN, { ip: '10.0.0.4' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'ver_consulta', resultado: 'exito', motivo: null, telefono: TELEFONO, ip: '10.0.0.4',
+    });
+  });
+});
+
+describe('guardarEmailConsulta — correo de contacto futuro, no consume un uso de sesión (2026-11-09)', () => {
+  test('sin sesión vigente → 422 genérico (mismo error que verConsultaSesion)', async () => {
+    const card = makeCard({ activa: true });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+
+    await expect(guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'cliente@correo.com')).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+  });
+
+  test('email con formato inválido → error DISTINTO (LOYALTY_EMAIL_INVALIDO, no RecoveryFailedError)', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'no-es-un-correo')).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_EMAIL_INVALIDO',
+    });
+    expect(card.update).not.toHaveBeenCalled();
+  });
+
+  test('email válido → persiste emailContacto, NO toca usosRestantes/ultimaConsultaAt/totalConsultas, devuelve emailContacto', async () => {
+    const card = makeCardConSesion({ consultaSesionUsosRestantes: 3, totalConsultas: 5 });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    const resultado = await guardarEmailConsulta(TELEFONO, SESION_TOKEN, '  Cliente@Correo.com  '.trim());
+
+    expect(resultado).toEqual({ mensaje: expect.any(String), emailContacto: 'Cliente@Correo.com' });
+    expect(card.update).toHaveBeenCalledWith({ emailContacto: 'Cliente@Correo.com' });
+  });
+
+  // Historial de cambios (2026-11-09, solo interno/staff — ver tarjeta-detail.component.ts) —
+  // reusa registrarCambioTarjeta, mismo mecanismo que teléfono/nombre/activa.
+  describe('historial de cambios (registrarCambioTarjeta)', () => {
+    test('primera vez (sin email previo) → antes:null, despues:el nuevo, origen cliente', async () => {
+      const card = makeCardConSesion({ emailContacto: null });
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+
+      await guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'nuevo@correo.com');
+
+      expect(registrarCambioTarjeta).toHaveBeenCalledWith({
+        cardId: card.id,
+        antes: { emailContacto: null },
+        despues: { emailContacto: 'nuevo@correo.com' },
+        accion: 'actualizacion_email_publico',
+        origen: 'cliente',
+      });
+    });
+
+    // CRÍTICO (mismo criterio que loyalty-card.service.js#editarTarjeta): `antes` se captura ANTES
+    // del `.update()` — si se leyera card.emailContacto DESPUÉS, ya tendría el valor nuevo de los
+    // dos lados (Sequelize muta la instancia en memoria apenas resuelve el update).
+    test('actualización (con email previo distinto) → antes:el viejo, despues:el nuevo', async () => {
+      const card = makeCardConSesion({ emailContacto: 'viejo@correo.com' });
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+
+      await guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'nuevo@correo.com');
+
+      expect(registrarCambioTarjeta).toHaveBeenCalledWith(expect.objectContaining({
+        antes: { emailContacto: 'viejo@correo.com' },
+        despues: { emailContacto: 'nuevo@correo.com' },
+      }));
+    });
+
+    test('si registrarCambioTarjeta rechaza, el error se propaga (no es fire-and-forget)', async () => {
+      const card = makeCardConSesion();
+      LoyaltyCard.findOne.mockResolvedValue(card);
+      compararSesionToken.mockReturnValue(true);
+      registrarCambioTarjeta.mockRejectedValueOnce(new Error('DB caída'));
+
+      await expect(guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'nuevo@correo.com')).rejects.toThrow('DB caída');
+    });
+  });
+
+  test('registra auditoría de éxito (tipo guardar_email)', async () => {
+    const card = makeCardConSesion();
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'cliente@correo.com', { ip: '10.0.0.5' });
+
+    expect(LoyaltySecurityEvent.create).toHaveBeenCalledWith({
+      tipo: 'guardar_email', resultado: 'exito', motivo: null, telefono: TELEFONO, ip: '10.0.0.5',
+    });
+  });
+
+  test('tarjeta inactiva → 422 genérico, nunca persiste el email', async () => {
+    const card = makeCardConSesion({ activa: false });
+    LoyaltyCard.findOne.mockResolvedValue(card);
+    compararSesionToken.mockReturnValue(true);
+
+    await expect(guardarEmailConsulta(TELEFONO, SESION_TOKEN, 'cliente@correo.com')).rejects.toMatchObject({
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    expect(card.update).not.toHaveBeenCalled();
   });
 });

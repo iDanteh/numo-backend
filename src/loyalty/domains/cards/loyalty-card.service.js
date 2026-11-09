@@ -12,14 +12,35 @@
 const path = require('path');
 const { Transaction, Op } = require('sequelize');
 const { sequelize } = require('../../../config/database.postgres');
-const { LoyaltyCard, LoyaltyTierHistory } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltyTierHistory, LoyaltyKoreNivel } = require('../../../shared/models/postgres');
 const { BadRequestError, ConflictError, NotFoundError } = require('../../../shared/errors/AppError');
 const { normalizarTelefono } = require('../../shared/puntos.util');
 const { generarNip, hashNip } = require('../../shared/nip.util');
 const { subirFotoCliente, descargarFotoCliente } = require('./drive-loyalty-foto.service');
 const { registrarCambioTarjeta } = require('./loyalty-card-audit.service');
+const { logger } = require('../../../shared/utils/logger');
 
-const NIVELES_VALIDOS = ['Bronce', 'Plata', 'Oro'];
+// REDISEÑO 2026-11-06 (pedido explícito del usuario): el catálogo de niveles pasa a gestionarlo
+// Kore (ver LoyaltyKoreNivel.js) — `NIVELES_VALIDOS` deja de ser un array fijo. `nivelEsValido()`
+// consulta el catálogo real (activo:true); `obtenerNivelInicial()` resuelve la fila `esInicial:true`
+// (única decisión manual de Numo) para el alta de una tarjeta nueva sin nivel explícito. Fallback
+// defensivo a 'Bronce' SOLO si el catálogo todavía no tiene ninguna fila `esInicial` configurada
+// (no debería pasar tras correr `npm run seed:lealtad`, pero una alta nunca debe romperse por esto).
+const NIVEL_FALLBACK_SIN_CATALOGO = 'Bronce';
+
+async function nivelEsValido(nombre) {
+  if (!nombre) return false;
+  const fila = await LoyaltyKoreNivel.findOne({ where: { nombre, activo: true } });
+  return !!fila;
+}
+
+async function obtenerNivelInicial() {
+  const fila = await LoyaltyKoreNivel.findOne({ where: { esInicial: true, activo: true } });
+  if (fila) return fila.nombre;
+  logger.warn('[loyalty-card.service] Ningún nivel marcado esInicial en LoyaltyKoreNivel — usando fallback defensivo '
+    + `'${NIVEL_FALLBACK_SIN_CATALOGO}'. Correr seed:lealtad o marcar esInicial desde Configuración de Lealtad.`);
+  return NIVEL_FALLBACK_SIN_CATALOGO;
+}
 
 // Mismo literal que el actor sintético de loyalty-kore-cliente.service.js (webhook de catálogo de
 // clientes) — único discriminador de origen, no hace falta una columna nueva: cualquier otro valor
@@ -66,14 +87,17 @@ function _esDuplicadoUnico(err) {
  * validar unicidad — rechaza duplicados contra tarjetas activas E inactivas
  * (un teléfono inactivo sigue siendo "la misma persona" para el programa).
  */
-async function crearTarjeta({ telefono, nombre, nivel = 'Bronce', ...opcionales }, user, { transaction } = {}) {
+async function crearTarjeta({ telefono, nombre, nivel, ...opcionales }, user, { transaction } = {}) {
   const telefonoNorm = normalizarTelefono(telefono);
   const nombreTrim = String(nombre ?? '').trim();
   if (!nombreTrim) {
     throw new BadRequestError('nombre es requerido.');
   }
-  if (!NIVELES_VALIDOS.includes(nivel)) {
-    throw new BadRequestError(`nivel inválido: "${nivel}".`);
+  // `nivel` ya no tiene un default síncrono fijo ('Bronce') — se resuelve contra el catálogo real
+  // (ver obtenerNivelInicial arriba) solo cuando el caller no lo manda explícito.
+  const nivelFinal = nivel !== undefined ? nivel : await obtenerNivelInicial();
+  if (!(await nivelEsValido(nivelFinal))) {
+    throw new BadRequestError(`nivel inválido: "${nivelFinal}".`);
   }
 
   // `transaction` es opcional (PR8: el script de migración reutiliza este servicio dentro
@@ -94,7 +118,7 @@ async function crearTarjeta({ telefono, nombre, nivel = 'Bronce', ...opcionales 
   const datosCard = {
     telefono: telefonoNorm,
     nombre:   nombreTrim,
-    nivel,
+    nivel:    nivelFinal,
     nipHash,
     saldoPuntos: 0,
     activa: true,
@@ -328,7 +352,7 @@ async function cambiarNip(cardId, user) {
 
 /** Cambia el nivel y audita en `loyalty_tier_history`, en una sola transacción. No mueve `saldoPuntos`. */
 async function cambiarNivel(cardId, nuevoNivel, { motivo } = {}, user) {
-  if (!NIVELES_VALIDOS.includes(nuevoNivel)) {
+  if (!(await nivelEsValido(nuevoNivel))) {
     throw new BadRequestError(`nivel inválido: "${nuevoNivel}".`);
   }
 
@@ -472,4 +496,5 @@ async function marcarRevisada(cardId, user) {
 module.exports = {
   crearTarjeta, listar, obtener, obtenerParaEditar, editarTarjeta, cambiarNip, cambiarNivel,
   subirFoto, obtenerFoto, listarPendientesRevisionKore, marcarRevisada,
+  nivelEsValido, obtenerNivelInicial,
 };

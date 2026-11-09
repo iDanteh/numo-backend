@@ -1,0 +1,86 @@
+# stress-test/docker-compose.stress.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Réplica LOCAL y descartable del servidor de producción (4 vCPU / 8GB RAM,
+# Ubuntu 24.04 sobre KVM) para medir el impacto de la sesión OTP/email/límite
+# mensual de Lealtad antes de liberar — NUNCA toca el servidor real.
+#
+# Uso (PowerShell, parado en numo-backend/):
+#
+#   docker compose -f stress-test/docker-compose.stress.yml up --build -d
+#
+#   $env:POSTGRES_URI = "postgres://stress:stress@localhost:5433/numo_stress"
+#   node stress-test/seed-stress-cards.js 500
+#
+#   docker run --rm --network stress-test_default -p 5665:5665 -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_PORT=5665 -e K6_WEB_DASHBOARD_EXPORT=/report.html -v "${PWD}/stress-test:/stress-test" grafana/k6 run -e BASE_URL=http://backend:3000 -e TEST_AUTH_KEY=stress-local-secret /stress-test/k6-otp-flow.js
+#
+#   # abrir http://localhost:5665 durante la corrida para el dashboard en vivo
+#   # (el backend queda en localhost:3001 desde tu máquina — 3000 queda libre para tu dev normal)
+#
+# Para medir con el margen REAL de hoy (servidor casi sin swap libre), correr
+# una segunda vez bajando mem_limit del backend a 3g.
+#
+# Al terminar de probar: docker compose -f stress-test/docker-compose.stress.yml down
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    cpus: "4"
+    mem_limit: "8g"
+    environment:
+      NODE_ENV: development
+      PORT: "3000"
+      POSTGRES_URI: postgres://stress:stress@postgres:5432/numo_stress
+      MONGODB_URI: mongodb://mongo:27017/numo_stress
+      TEST_AUTH_SECRET: stress-local-secret
+      STRESS_TEST_SOLICITAR_MAX: "100000"
+      # Bug real encontrado 2026-11-10: solo había override para 'solicitar' — 'confirmar'/'ver'
+      # seguían fijos en 10/15min, tapando casi todos los flujos después del 10mo (ver
+      # loyalty-public.routes.js). Sin esto, los resultados de fallas NO son capacidad real.
+      STRESS_TEST_CONFIRMAR_MAX: "100000"
+      STRESS_TEST_VER_MAX: "100000"
+      STRESS_TEST_EMAIL_MAX: "100000"
+      # Limiter GLOBAL de /api/ (app.js) — default 600/15min por IP, config/env.js ya lo lee de
+      # estas variables. Todo el tráfico de k6 sale de una sola IP (el contenedor) — sin esto, se
+      # agota en los primeros segundos de la corrida y el resto es puro 429 (ver hallazgo real
+      # 2026-11-09: 98.9% http_req_failed con latencias de ~1ms, rechazo instantáneo, no el
+      # servidor cayéndose). Nunca tocar en producción — es la variable real que ya existía.
+      RATE_LIMIT_MAX: "1000000"
+      RATE_LIMIT_WINDOW_MS: "60000"
+      # POSTGRES_POOL_MAX probado en 30 (2026-11-10) — DESCARTADO como cuello de botella real: los
+      # resultados fueron idénticos a pool=10. El límite real es que el backend corre como UN SOLO
+      # proceso Node (sin cluster/PM2) — solo usa 1 de los 4 vCPU para JS, confirmado con `docker
+      # stats` (102% de CPU durante una ráfaga de 120 requests, nunca ~400%). Se deja sin setear
+      # (vuelve al default real de 10) para probar la configuración de producción tal cual es hoy.
+      # Requeridas por config/env.js para arrancar — dummy, no se ejercitan de verdad en este
+      # flujo (JWT_SECRET: Auth0 real, bypaseado por TEST_AUTH_SECRET; CREDS_MASTER_KEY/ERP_TOKEN:
+      # e.firma SAT / ERP, fuera de alcance de esta prueba).
+      JWT_SECRET: stress-test-jwt-secret-dummy
+      CREDS_MASTER_KEY: stress-test-creds-master-key-dummy
+      ERP_TOKEN: stress-test-erp-token-dummy
+      # auth.js construye el verificador JWT real de Auth0 al cargar el módulo (aunque nunca se
+      # use — el atajo TEST_AUTH_SECRET lo reemplaza en runtime), necesita valores no vacíos acá.
+      AUTH0_DOMAIN: stress-test.us.auth0.com
+      AUTH0_AUDIENCE: stress-test-audience-dummy
+    ports:
+      - "3001:3000" # 3000 suele estar ocupado por tu backend de desarrollo normal
+    depends_on:
+      - postgres
+      - mongo
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: stress
+      POSTGRES_PASSWORD: stress
+      POSTGRES_DB: numo_stress
+    ports:
+      - "5433:5432" # expuesto SOLO para que seed-stress-cards.js (corre en tu máquina, no en Docker)
+                    # se conecte acá — puerto distinto de 5432 para no chocar con tu Postgres real
+    tmpfs:
+      - /var/lib/postgresql/data # efímero a propósito — datos descartables entre corridas
+
+  mongo:
+    image: mongo:7
+    tmpfs:
+      - /data/db

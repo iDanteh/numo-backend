@@ -59,6 +59,10 @@ jest.mock('./bank-indicadores.service', () => ({
   getLedgerPorHora: jest.fn(),
   getUltimosMovimientos: jest.fn(),
   getAntiguedadDepositos: jest.fn(),
+  getAntiguedadDepositosPorAnio: jest.fn(),
+  buildReporteCortes: jest.fn(),
+  listarDescargasCorte: jest.fn(),
+  descargarReporteCorteHistorico: jest.fn(),
   getPeriodoCortePorRol: jest.fn(),
   buildReporteCorte: jest.fn(),
   buildReporteIdentificacion: jest.fn(),
@@ -789,7 +793,7 @@ describe('GET /cortes/antiguedad (2026-11-06: antigüedad del backlog vacío, po
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_ANTIGUEDAD)));
-    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: 'BBVA' });
+    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: 'BBVA', fecha: null });
   });
 
   test('sin ?banco: se pasa null', async () => {
@@ -797,7 +801,169 @@ describe('GET /cortes/antiguedad (2026-11-06: antigüedad del backlog vacío, po
       .get('/cortes/antiguedad')
       .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
 
-    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: null });
+    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: null, fecha: null });
+  });
+
+  // Corte por Día/Año (2026-11-06, segunda ronda) — `fecha` pasa al corte de un día puntual;
+  // `anio` cambia de servicio por completo (getAntiguedadDepositosPorAnio).
+  test('con ?fecha, se pasa al service (modo día, corte pasado)', async () => {
+    await request(app)
+      .get('/cortes/antiguedad')
+      .query({ fecha: '2026-09-10' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getAntiguedadDepositos).toHaveBeenCalledWith({ banco: null, fecha: '2026-09-10' });
+    expect(indicadoresService.getAntiguedadDepositosPorAnio).not.toHaveBeenCalled();
+  });
+
+  test('con ?anio, llama a getAntiguedadDepositosPorAnio en vez de getAntiguedadDepositos', async () => {
+    const FAKE_POR_ANIO = { meses: [{ periodo: '2026-01', corte: '2026-01-31', rangos: FAKE_ANTIGUEDAD.rangos, total: FAKE_ANTIGUEDAD.total }] };
+    indicadoresService.getAntiguedadDepositosPorAnio.mockResolvedValue(FAKE_POR_ANIO);
+
+    const res = await request(app)
+      .get('/cortes/antiguedad')
+      .query({ anio: '2026', banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_POR_ANIO)));
+    expect(indicadoresService.getAntiguedadDepositosPorAnio).toHaveBeenCalledWith({ banco: 'BBVA', anio: '2026' });
+    expect(indicadoresService.getAntiguedadDepositos).not.toHaveBeenCalled();
+  });
+
+  test('?anio junto con ?fecha: gana anio', async () => {
+    indicadoresService.getAntiguedadDepositosPorAnio.mockResolvedValue({ meses: [] });
+
+    await request(app)
+      .get('/cortes/antiguedad')
+      .query({ anio: '2026', fecha: '2026-09-10' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getAntiguedadDepositosPorAnio).toHaveBeenCalled();
+    expect(indicadoresService.getAntiguedadDepositos).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /cortes/descargar (2026-11-06: Excel de todo Cortes + registro en el historial)', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.buildReporteCortes.mockResolvedValue(Buffer.from('fake-xlsx'));
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/descargar')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.buildReporteCortes).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco + usuario (de req.user) y responde con headers de descarga', async () => {
+    const res = await request(app)
+      .get('/cortes/descargar')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    expect(res.headers['content-disposition']).toMatch(/^attachment; filename="Cortes-\d{4}-\d{2}-\d{2}\.xlsx"$/);
+    expect(indicadoresService.buildReporteCortes).toHaveBeenCalledWith({
+      banco: 'BBVA', usuario: { userId: 'user-test', nombre: undefined },
+    });
+  });
+
+  test('sin ?banco: se pasa null', async () => {
+    await request(app)
+      .get('/cortes/descargar')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.buildReporteCortes).toHaveBeenCalledWith({
+      banco: null, usuario: { userId: 'user-test', nombre: undefined },
+    });
+  });
+});
+
+describe('GET /cortes/descargas (2026-11-06: historial de descargas de Cortes)', () => {
+  let app;
+  const FAKE_DESCARGAS = [
+    { fecha: '2026-11-06', banco: null, depositosNoIdentificados: { count: 80, saldo: 8000 }, delta: { countPct: -20, saldoPct: -20, direccion: 'bajo' } },
+  ];
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.listarDescargasCorte.mockResolvedValue(FAKE_DESCARGAS);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/descargas')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.listarDescargasCorte).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco al service', async () => {
+    const res = await request(app)
+      .get('/cortes/descargas')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_DESCARGAS)));
+    expect(indicadoresService.listarDescargasCorte).toHaveBeenCalledWith({ banco: 'BBVA' });
+  });
+
+  test('sin ?banco: se pasa null', async () => {
+    await request(app)
+      .get('/cortes/descargas')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.listarDescargasCorte).toHaveBeenCalledWith({ banco: null });
+  });
+});
+
+describe('GET /cortes/descargas/:id/descargar (2026-11-06: redescargar el archivo real de una fila del historial)', () => {
+  let app;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/descargas/1/descargar')
+      .set('x-test-permissions', JSON.stringify([]));
+
+    expect(res.status).toBe(403);
+    expect(indicadoresService.descargarReporteCorteHistorico).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read, devuelve el binario con el content-type/nombre correctos', async () => {
+    indicadoresService.descargarReporteCorteHistorico.mockResolvedValue({
+      buffer: Buffer.from('fake-xlsx'), filename: 'Cortes-2026-10-05.xlsx',
+    });
+
+    const res = await request(app)
+      .get('/cortes/descargas/abc123/descargar')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    expect(res.headers['content-disposition']).toContain('Cortes-2026-10-05.xlsx');
+    expect(indicadoresService.descargarReporteCorteHistorico).toHaveBeenCalledWith('abc123');
   });
 });
 

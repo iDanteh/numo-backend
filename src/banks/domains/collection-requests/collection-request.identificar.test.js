@@ -932,10 +932,12 @@ describe('identificar() — TRANSFERENCIA + EFECTIVO (3 depósitos, 0 para efect
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Gancho de acumulación de puntos de Lealtad (2026-10-27, EN DISEÑO) — reusa
-// procesarVentaKore() del webhook de Lealtad TAL CUAL, después del commit del
-// paso 7. Mockeado como módulo completo (jest.mock arriba) — acá solo se
-// verifica QUE se llame (o no) con el payload correcto, nunca su lógica interna
+// Gancho de acumulación de puntos de Lealtad (2026-10-27, ACTIVO desde 2026-11-06)
+// — reusa procesarVentaKore() del webhook de Lealtad TAL CUAL, después del commit
+// del paso 7, adaptado al contrato `abonos[]` (1 CxC = 1 abono, sin `puntosAbonados`
+// — Numo lo calcula con el % real del nivel). Mockeado como módulo completo
+// (jest.mock arriba) — acá solo se verifica QUE se llame (o no) con el payload
+// correcto y cómo se maneja su respuesta/error, nunca la lógica interna del webhook
 // (eso ya lo prueba loyalty-kore-venta.service.test.js).
 // ══════════════════════════════════════════════════════════════════════════════
 describe('identificar() — gancho de acumulación de puntos de Lealtad', () => {
@@ -980,12 +982,42 @@ describe('identificar() — gancho de acumulación de puntos de Lealtad', () => 
       serieFolio: 'A0-123456',
       conceptoId: 'concepto-1',
       metodoPago: 'PUE',
-      formasPago: [{ formaPagoId: 'fp-f1', importe: 100000 }],
-      subtotal: 86206.90,
-      total: 100000,
-      usuarioAplicaId: 'user-1',
-      usuarioAplicaNombre: 'Ana',
+      abonos: [expect.objectContaining({
+        idAbono: 'A0-123456',
+        formasPago: [{ formaPagoId: 'fp-f1', importe: 100000 }],
+        subtotal: 86206.90,
+        total: 100000,
+        usuarioAplicaId: 'user-1',
+      })],
     }));
+    // `usuarioAplicaNombre` (eliminado del contrato) nunca debe viajar. `puntosAbonados`
+    // (2026-11-06): esta CxC no trajo pre-cálculo de Kore al crearse -> undefined, deja
+    // el fallback genérico de loyalty-kore-venta.service.js.
+    const abonoEnviado = procesarVentaKore.mock.calls[0][0].abonos[0];
+    expect(abonoEnviado).not.toHaveProperty('usuarioAplicaNombre');
+    expect(abonoEnviado.puntosAbonados).toBeUndefined();
+  });
+
+  test('CxC con puntosAbonados pre-calculado por Kore (guardado en create()) -> se pasa TAL CUAL al abono, sin recalcular', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [{
+        erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '123456',
+        subtotal: 86206.90, tipoPago: 'PUE', puntosAbonados: 8.69,
+      }],
+      monto: 100000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    procesarVentaKore.mockResolvedValue({ serieFolio: 'A0-123456', status: 'aplicado' });
+
+    await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    const abonoEnviado = procesarVentaKore.mock.calls[0][0].abonos[0];
+    expect(abonoEnviado.puntosAbonados).toBe(8.69);
   });
 
   test('Modo 2 (2 CxC, 1 forma de pago global) -> procesarVentaKore se llama DOS veces, una por CxC, cada una con su propio serieFolio/total/formasPago prorrateado', async () => {
@@ -1008,10 +1040,16 @@ describe('identificar() — gancho de acumulación de puntos de Lealtad', () => 
 
     expect(procesarVentaKore).toHaveBeenCalledTimes(2);
     expect(procesarVentaKore).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      serieFolio: 'A0-111', total: 100000, formasPago: [{ formaPagoId: 'fp-f1', importe: 100000 }], subtotal: 86206.90,
+      serieFolio: 'A0-111',
+      abonos: [expect.objectContaining({
+        idAbono: 'A0-111', total: 100000, formasPago: [{ formaPagoId: 'fp-f1', importe: 100000 }], subtotal: 86206.90,
+      })],
     }));
     expect(procesarVentaKore).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      serieFolio: 'A0-222', total: 50000, formasPago: [{ formaPagoId: 'fp-f1', importe: 50000 }], subtotal: 43103.45,
+      serieFolio: 'A0-222',
+      abonos: [expect.objectContaining({
+        idAbono: 'A0-222', total: 50000, formasPago: [{ formaPagoId: 'fp-f1', importe: 50000 }], subtotal: 43103.45,
+      })],
     }));
   });
 
@@ -1081,6 +1119,35 @@ describe('identificar() — gancho de acumulación de puntos de Lealtad', () => 
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
     expect(logger.warn.mock.calls[0][0]).toMatch(/Concepto desconocido en Numo/);
+    expect(resultado.status).toBe('identificada');
+  });
+
+  test('procesarVentaKore resuelve con el abono fallido (sin throw, contrato abonos[] aisla el error) -> loguea warning, pero identificar() sigue devolviendo exito', async () => {
+    const f1 = formaPago('f1', 'Transferencia', 100000);
+    const cr = makeCr({
+      formasPago: [f1],
+      cxcs: [{ erpId: 'CXC-1', total: 100000, serie: 'A0', folioExterno: '123456', subtotal: 86206.90, tipoPago: 'PUE' }],
+      monto: 100000,
+      telefono: '5512345678',
+    });
+    CollectionRequest.findById.mockResolvedValue(cr);
+    BankMovement.find.mockResolvedValue([bankMovement('mov-1')]);
+    setupHappyKore();
+    // Con el contrato `abonos[]` (2026-11-06), un error de negocio del abono (tarjeta
+    // inactiva, saldo insuficiente, etc.) ya NO lanza — queda aislado en `abonos[0]`.
+    procesarVentaKore.mockResolvedValue({
+      serieFolio: 'A0-123456',
+      status: 'fallido',
+      abonos: [{
+        idAbono: 'A0-123456', success: false, statusCode: 400,
+        error: 'La tarjeta está inactiva, no se puede acumular puntos (abono "A0-123456").',
+      }],
+    });
+
+    const resultado = await service.identificar('cr-1', { bankMovementId: 'mov-1' }, { _id: 'user-1', nombre: 'Ana' });
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][0]).toMatch(/tarjeta está inactiva/);
     expect(resultado.status).toBe('identificada');
   });
 

@@ -220,6 +220,18 @@ router.put('/config/congelamiento', authenticate, permit(PERMISSIONS.LOYALTY_CON
   res.json({ meses: await configService.guardarCongelamientoMeses(req.body?.meses, req.user) });
 }));
 
+// Límite mensual de consultas con código (2026-11-09) — tope de ciclos de código completos
+// ("solicitar" + "confirmar" exitoso) por tarjeta por mes calendario, en la consulta pública de
+// puntos. Mismo criterio de permisos/contrato que CONGELAMIENTO arriba. `{ max: number | null }` —
+// null = sin límite (sin configurar o en 0, ver loyalty-config.service.js).
+router.get('/config/consulta-codigo-max-mes', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json({ max: await configService.obtenerConsultaCodigoMaxMes() });
+}));
+
+router.put('/config/consulta-codigo-max-mes', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json({ max: await configService.guardarConsultaCodigoMaxMes(req.body?.max, req.user) });
+}));
+
 // Especialidades (2026-10-23) — catálogo de referencia, mismo criterio de permisos que arriba:
 // LOYALTY_READ para leer, LOYALTY_CONFIG para editar. Fusionado acá (en vez del config:manage
 // genérico) para que toda la configuración de Lealtad viva en una sola pantalla.
@@ -314,6 +326,21 @@ router.post('/config/formas-pago-kore/sync', authenticate, permit(PERMISSIONS.LO
 
 router.patch('/config/formas-pago-kore/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
   res.json(await configService.actualizarFormaPagoKore(req.params.id, req.body ?? {}));
+}));
+
+// Catálogo de niveles de Kore (2026-11-06) — a diferencia de conceptos/formas de pago, acá
+// `porcentaje` SÍ viene autoritativo de Kore (Numo ya no configura % propio). `esInicial` es el
+// ÚNICO campo editable por Numo (qué nivel le toca a una tarjeta nueva).
+router.get('/config/niveles-kore', authenticate, permit(PERMISSIONS.LOYALTY_READ), asyncHandler(async (req, res) => {
+  res.json(await configService.listarNivelesKore({ soloActivos: req.query.soloActivos === 'true' }));
+}));
+
+router.post('/config/niveles-kore/sync', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.sincronizarNivelesKore());
+}));
+
+router.patch('/config/niveles-kore/:id', authenticate, permit(PERMISSIONS.LOYALTY_CONFIG), asyncHandler(async (req, res) => {
+  res.json(await configService.actualizarNivelKore(req.params.id, req.body ?? {}));
 }));
 
 module.exports = router;

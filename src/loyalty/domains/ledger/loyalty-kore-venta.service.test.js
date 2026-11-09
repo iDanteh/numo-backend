@@ -2,14 +2,20 @@
 
 /**
  * loyalty-kore-venta.service.test.js — webhook Kore→Numo de venta (acumulación +
- * devengación combinadas). Mismo patrón de mocking que loyalty-ledger.service.test.js
+ * devengación combinadas), contrato 2026-11-06 con `abonos[]` (una CxC puede recibir
+ * varios abonos/cobros parciales). Mismo patrón de mocking que loyalty-ledger.service.test.js
  * (modelos planos + sequelize.transaction invocando el callback con una tx falsa) — la
  * diferencia es que acá `./loyalty-ledger.service` NO se mockea: corre real sobre los
  * mismos modelos mockeados, para no reimplementar _aplicarMovimiento/_resolverCentroCosto*
  * en un doble.
+ *
+ * `sequelize.transaction` ahora se usa en DOS formas: `transaction(cb)` (la del request
+ * completo) y `transaction({transaction: t}, cb)` (el savepoint de cada abono) — el mock
+ * soporta ambas firmas, invocando el callback con un objeto de transacción falso en
+ * cualquier caso (no se simula un ROLLBACK TO SAVEPOINT real; los tests que necesitan
+ * verificar aislamiento entre abonos lo hacen con escenarios donde el abono que falla
+ * nunca llega a escribir nada, no con una escritura que se revierte).
  */
-
-const { Transaction } = require('sequelize');
 
 jest.mock('../../../shared/models/postgres', () => ({
   LoyaltyCard: { findOne: jest.fn(), findByPk: jest.fn() },
@@ -24,11 +30,9 @@ jest.mock('../../../config/database.postgres', () => ({
 jest.mock('../../../banks/domains/centros-costo/centros-costo.service', () => ({
   resolveBySerieMap: jest.fn(),
 }));
-jest.mock('../../../shared/services/global-config.service', () => ({
-  getValue: jest.fn(),
-}));
 jest.mock('../config/loyalty-config.service', () => ({
   obtenerPromocionVigente: jest.fn(),
+  obtenerPorcentajeNivel: jest.fn(),
   sincronizarConceptosKore: jest.fn(),
   sincronizarFormasPagoKore: jest.fn(),
 }));
@@ -41,7 +45,6 @@ const {
 } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
 const centrosCostoService = require('../../../banks/domains/centros-costo/centros-costo.service');
-const globalConfigService = require('../../../shared/services/global-config.service');
 const configService = require('../config/loyalty-config.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
 const ventaService = require('./loyalty-kore-venta.service');
@@ -60,12 +63,35 @@ function makeCentroCosto(overrides = {}) {
 }
 
 /** `_resolverTarjeta` usa `findOne` (fuera de transacción); una vez dentro de la transacción, el
- *  servicio vuelve a leer la MISMA fila con `findByPk` bajo candado de fila — ambos deben resolver
- *  a la misma instancia para que las mutaciones de `_aplicarMovimiento` se reflejen en el resultado. */
+ *  servicio vuelve a leer la MISMA fila con `findByPk` bajo candado de fila (una vez al tomar el
+ *  lock y una vez más tras CADA abono, para resincronizar el saldo) — todas deben resolver a la
+ *  misma instancia para que las mutaciones de `_aplicarMovimiento` se reflejen en el resultado. */
 function mockCard(card) {
   LoyaltyCard.findOne.mockResolvedValue(card);
   LoyaltyCard.findByPk.mockResolvedValue(card);
   return card;
+}
+
+/** `LoyaltyPointsLedger.findAll` se llama con `where.origen` distinto para el blindaje manual
+ *  ('manual') y para la idempotencia por abono ('kore') — este helper permite mockear cada uno por
+ *  separado sin depender del orden de las llamadas. */
+function mockLedgerRows({ manual = [], kore = [] } = {}) {
+  LoyaltyPointsLedger.findAll.mockImplementation(async (opts) => (
+    opts?.where?.origen === 'manual' ? manual : kore
+  ));
+}
+
+function abono(overrides = {}) {
+  return {
+    idAbono: 'ABONO-1',
+    fecha: '2026-10-26T12:00:00Z',
+    formasPago: [{ formaPagoId: 'FP-EFECTIVO', importe: 1160 }],
+    subtotal: 1000,
+    total: 1160,
+    usuarioAplicaId: 'U1',
+    puntosAbonados: 50,
+    ...overrides,
+  };
 }
 
 const PAYLOAD_BASE = {
@@ -73,22 +99,20 @@ const PAYLOAD_BASE = {
   serieFolio: 'A0-260605320',
   conceptoId: 'CONCEPTO-1',
   metodoPago: 'PUE',
-  formasPago: [{ formaPagoId: 'FP-EFECTIVO', importe: 1160 }],
-  subtotal: 1000,
-  total: 1160,
-  usuarioAplicaId: 'U1',
-  usuarioAplicaNombre: 'Cajero Uno',
-  fecha: '2026-10-26T12:00:00Z',
+  abonos: [abono()],
 };
 
 beforeEach(() => {
   jest.clearAllMocks();
-  sequelize.transaction.mockImplementation(async (cb) => cb({}));
+  sequelize.transaction.mockImplementation(async (optionsOrCb, maybeCb) => {
+    const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;
+    return cb({});
+  });
   centrosCostoService.resolveBySerieMap.mockResolvedValue({ A0: makeCentroCosto() });
   CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
-  LoyaltyPointsLedger.findAll.mockResolvedValue([]);
+  mockLedgerRows();
   LoyaltyPointsLedger.create.mockImplementation(async (data) => ({ ...data, saldoResultante: data.saldoResultante }));
-  globalConfigService.getValue.mockResolvedValue('5.00');
+  configService.obtenerPorcentajeNivel.mockResolvedValue(5);
   configService.obtenerPromocionVigente.mockResolvedValue(null);
   LoyaltyKoreConcepto.findOne.mockResolvedValue({ koreId: 'CONCEPTO-1', acumulaPuntos: true });
   LoyaltyKoreFormaPago.findOne.mockImplementation(({ where }) => {
@@ -123,8 +147,27 @@ describe('procesarVentaKore — validación', () => {
     await expect(ventaService.procesarVentaKore({ telefono: '5512345678' })).rejects.toMatchObject({ statusCode: 400 });
   });
 
-  it('400 si la suma de formasPago no coincide con total', async () => {
-    const payload = { ...PAYLOAD_BASE, formasPago: [{ formaPagoId: 'FP-EFECTIVO', importe: 500 }] };
+  it('400 si abonos está vacío', async () => {
+    await expect(ventaService.procesarVentaKore({ ...PAYLOAD_BASE, abonos: [] })).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('400 si un abono no tiene idAbono', async () => {
+    const payload = { ...PAYLOAD_BASE, abonos: [abono({ idAbono: undefined })] };
+    await expect(ventaService.procesarVentaKore(payload)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('400 si puntosAbonados es negativo (cuando SÍ viene)', async () => {
+    const payload = { ...PAYLOAD_BASE, abonos: [abono({ puntosAbonados: -5 })] };
+    await expect(ventaService.procesarVentaKore(payload)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('400 si dos abonos del mismo request traen el mismo idAbono', async () => {
+    const payload = { ...PAYLOAD_BASE, abonos: [abono(), abono()] };
+    await expect(ventaService.procesarVentaKore(payload)).rejects.toMatchObject({ statusCode: 400 });
+  });
+
+  it('400 si la suma de formasPago de un abono no coincide con su total', async () => {
+    const payload = { ...PAYLOAD_BASE, abonos: [abono({ formasPago: [{ formaPagoId: 'FP-EFECTIVO', importe: 500 }] })] };
     await expect(ventaService.procesarVentaKore(payload)).rejects.toMatchObject({ statusCode: 400 });
   });
 
@@ -139,15 +182,65 @@ describe('procesarVentaKore — validación', () => {
   });
 });
 
-describe('procesarVentaKore — acumulación pura', () => {
-  it('acumula proporcional al subtotal cuando todo califica', async () => {
+describe('procesarVentaKore — acumulación pura (nivel confiado de Kore)', () => {
+  it('acredita exactamente puntosAbonados cuando el abono califica', async () => {
     mockCard(makeCard());
     const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
     expect(res.status).toBe('aplicado');
     expect(res.puntosDescontados).toBe(0);
-    // subtotal 1000 * 5% = 50
-    expect(res.puntosAcumulados).toBe(50);
+    expect(res.puntosAcumulados).toBe(50); // puntosAbonados del payload, NO recalculado
     expect(res.saldoResultante).toBe(150);
+    expect(res.abonos).toEqual([
+      { idAbono: 'ABONO-1', success: true, status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 50 },
+    ]);
+  });
+
+  it('si el % de nivel no está configurado pero Kore mandó puntosAbonados, igual acredita (ya no bloquea)', async () => {
+    mockCard(makeCard());
+    configService.obtenerPorcentajeNivel.mockResolvedValue(null);
+    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    expect(res.status).toBe('aplicado');
+    expect(res.puntosAcumulados).toBe(50);
+    expect(registrarVentaFallida).not.toHaveBeenCalled();
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel.porcentajeAplicado).toBeNull();
+  });
+
+  it('sin puntosAbonados, calcula con el % real del nivel (LoyaltyKoreNivel vía configService)', async () => {
+    mockCard(makeCard());
+    const payload = { ...PAYLOAD_BASE, abonos: [abono({ puntosAbonados: undefined })] };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res.status).toBe('aplicado');
+    // subtotal 1000, única forma de pago (EFECTIVO, acumula) => prorrateado = 1000, 5% => 50.
+    expect(res.puntosAcumulados).toBe(50);
+    expect(registrarVentaFallida).not.toHaveBeenCalled();
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel.porcentajeAplicado).toBe(5);
+  });
+
+  it('sin puntosAbonados y sin % de nivel configurado: no acredita nivel, pero canje sigue aplicándose y queda registrado como proceso fallido', async () => {
+    configService.obtenerPorcentajeNivel.mockResolvedValue(null);
+    mockCard(makeCard({ saldoPuntos: '600.00' }));
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [abono({
+        formasPago: [
+          { formaPagoId: 'FP-EFECTIVO', importe: 660 },
+          { formaPagoId: 'FP-PUNTOS', importe: 500 },
+        ],
+        total: 1160,
+        puntosAbonados: undefined,
+      })],
+    };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res.status).toBe('aplicado'); // el canje sí generó movimiento
+    expect(res.puntosDescontados).toBe(500);
+    expect(res.puntosAcumulados).toBe(0); // nivel no se pudo calcular
+    expect(registrarVentaFallida).toHaveBeenCalledWith(
+      'A0-260605320', expect.anything(), expect.stringContaining('ABONO-1'),
+    );
+    const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
+    expect(filaNivel).toBeUndefined();
   });
 
   it('no_califica si metodoPago es PPD', async () => {
@@ -173,7 +266,7 @@ describe('procesarVentaKore — acumulación pura', () => {
 });
 
 describe('procesarVentaKore — formas de pago mixtas (proporcional)', () => {
-  it('calcula puntos solo sobre la porción calificante', async () => {
+  it('montoBaseCalculo sigue prorrateándose aunque los puntos vengan de Kore', async () => {
     mockCard(makeCard());
     LoyaltyKoreFormaPago.findOne.mockImplementation(({ where }) => {
       if (where.koreId === 'FP-EFECTIVO') return Promise.resolve({ koreId: 'FP-EFECTIVO', acumulaPuntos: true, esPuntos: false });
@@ -182,20 +275,22 @@ describe('procesarVentaKore — formas de pago mixtas (proporcional)', () => {
     });
     const payload = {
       ...PAYLOAD_BASE,
-      formasPago: [
-        { formaPagoId: 'FP-EFECTIVO', importe: 580 },
-        { formaPagoId: 'FP-TRANSFERENCIA', importe: 580 },
-      ],
-      subtotal: 1000, total: 1160,
+      abonos: [abono({
+        formasPago: [
+          { formaPagoId: 'FP-EFECTIVO', importe: 580 },
+          { formaPagoId: 'FP-TRANSFERENCIA', importe: 580 },
+        ],
+        subtotal: 1000,
+        total: 1160,
+        puntosAbonados: 25, // lo que Kore calculó para la porción calificante
+      })],
     };
     const res = await ventaService.procesarVentaKore(payload);
-    // montoCalificable = 580 (solo efectivo). Prorrateado: 580/1160*1000 = 500. 5% de 500 = 25.
-    expect(res.puntosAcumulados).toBe(25);
+    expect(res.puntosAcumulados).toBe(25); // directo de puntosAbonados, no recalculado
 
-    // montoBaseCalculo (2026-10-27): debe guardar el monto REAL usado en el cálculo (500, el
-    // prorrateado), NUNCA el subtotal completo (1000) — es justo el caso que motivó el campo.
     const filaNivel = LoyaltyPointsLedger.create.mock.calls.map(([d]) => d).find(d => d.tipo === 'ACUMULACION');
     expect(filaNivel.montoVenta).toBe(1000);
+    // Prorrateo: 580/1160*1000 = 500 — se sigue guardando como metadata informativa.
     expect(filaNivel.montoBaseCalculo).toBe('500.00');
   });
 
@@ -213,14 +308,16 @@ describe('procesarVentaKore — formas de pago mixtas (proporcional)', () => {
 describe('procesarVentaKore — devengación (canje)', () => {
   const payloadConPuntos = {
     ...PAYLOAD_BASE,
-    formasPago: [
-      { formaPagoId: 'FP-EFECTIVO', importe: 660 },
-      { formaPagoId: 'FP-PUNTOS', importe: 500 },
-    ],
-    total: 1160,
+    abonos: [abono({
+      formasPago: [
+        { formaPagoId: 'FP-EFECTIVO', importe: 660 },
+        { formaPagoId: 'FP-PUNTOS', importe: 500 },
+      ],
+      total: 1160,
+    })],
   };
 
-  it('descuenta puntos independientemente de si la venta acumula', async () => {
+  it('descuenta puntos independientemente de si el abono acumula', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto({ participaLealtad: false })); // no acumula
     mockCard(makeCard({ saldoPuntos: '600.00' }));
     const res = await ventaService.procesarVentaKore(payloadConPuntos);
@@ -230,107 +327,179 @@ describe('procesarVentaKore — devengación (canje)', () => {
     expect(res.saldoResultante).toBe(100);
   });
 
-  it('400 si el saldo no alcanza', async () => {
+  it('el abono falla (statusCode 400) sin abortar la respuesta si el saldo no alcanza', async () => {
     mockCard(makeCard({ saldoPuntos: '100.00' }));
-    await expect(ventaService.procesarVentaKore(payloadConPuntos)).rejects.toMatchObject({ statusCode: 400 });
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos).toEqual([
+      expect.objectContaining({ idAbono: 'ABONO-1', success: false, statusCode: 400 }),
+    ]);
   });
 
-  it('400 si la tarjeta está inactiva', async () => {
+  it('el abono falla (statusCode 400) si la tarjeta está inactiva', async () => {
     mockCard(makeCard({ activa: false, saldoPuntos: '600.00' }));
-    await expect(ventaService.procesarVentaKore(payloadConPuntos)).rejects.toMatchObject({ statusCode: 400 });
+    const res = await ventaService.procesarVentaKore(payloadConPuntos);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos[0]).toMatchObject({ success: false, statusCode: 400 });
   });
 });
 
-describe('procesarVentaKore — idempotencia', () => {
-  it('devuelve el resultado ya aplicado sin volver a escribir si el serieFolio ya se procesó', async () => {
-    mockCard(makeCard({ saldoPuntos: '150.00' }));
-    LoyaltyPointsLedger.findAll.mockResolvedValue([
-      { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:ACUMULACION' },
+describe('procesarVentaKore — múltiples abonos en un mismo request', () => {
+  it('2 abonos que califican generan 2 filas ACUMULACION y el saldo se acumula correctamente', async () => {
+    mockCard(makeCard({ saldoPuntos: '0.00' }));
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [
+        abono({ idAbono: 'ABONO-1', puntosAbonados: 10 }),
+        abono({ idAbono: 'ABONO-2', puntosAbonados: 15 }),
+      ],
+    };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res.status).toBe('aplicado');
+    expect(res.puntosAcumulados).toBe(25);
+    expect(res.saldoResultante).toBe(25);
+    expect(res.abonos).toEqual([
+      { idAbono: 'ABONO-1', success: true, status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 10 },
+      { idAbono: 'ABONO-2', success: true, status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 15 },
     ]);
-    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
-    expect(res).toEqual({
-      serieFolio: 'A0-260605320', status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 50, saldoResultante: 150,
-    });
-    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+    expect(LoyaltyPointsLedger.create).toHaveBeenCalledTimes(2);
   });
 
-  it('con nivel + promoción ya aplicados, suma AMBAS filas al reconstruir la respuesta idempotente', async () => {
-    mockCard(makeCard({ saldoPuntos: '180.00' }));
-    LoyaltyPointsLedger.findAll.mockResolvedValue([
-      { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:ACUMULACION' },
-      { tipo: 'ACUMULACION', puntos: '30.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:PROMOCION' },
-    ]);
-    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
-    expect(res).toEqual({
-      serieFolio: 'A0-260605320', status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 80, saldoResultante: 180,
-    });
-    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  it('un abono que falla por saldo insuficiente no aborta a los demás abonos del mismo request', async () => {
+    mockCard(makeCard({ saldoPuntos: '100.00' }));
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [
+        abono({
+          idAbono: 'ABONO-CANJE-OK',
+          formasPago: [{ formaPagoId: 'FP-PUNTOS', importe: 50 }],
+          subtotal: 50, total: 50, puntosAbonados: 0,
+        }),
+        abono({
+          idAbono: 'ABONO-CANJE-EXCEDE',
+          formasPago: [{ formaPagoId: 'FP-PUNTOS', importe: 200 }],
+          subtotal: 200, total: 200, puntosAbonados: 0,
+        }),
+      ],
+    };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res.status).toBe('parcial');
+    expect(res.abonos[0]).toMatchObject({ idAbono: 'ABONO-CANJE-OK', success: true, puntosDescontados: 50 });
+    expect(res.abonos[1]).toMatchObject({ idAbono: 'ABONO-CANJE-EXCEDE', success: false, statusCode: 400 });
+    // Solo el primer canje (50) se descuenta: 100 - 50 = 50, nunca llega a tocar el segundo.
+    expect(res.saldoResultante).toBe(50);
   });
 
-  it('blindaje cruzado: si la venta ya se acreditó a mano (origen manual, sin sufijo), responde "aplicado" sin duplicar', async () => {
+  it('reenvío con 1 abono ya procesado + 1 abono nuevo: el viejo responde idempotente, el nuevo se procesa', async () => {
     mockCard(makeCard({ saldoPuntos: '50.00' }));
-    LoyaltyPointsLedger.findAll.mockResolvedValue([
-      { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320', origen: 'manual' },
+    mockLedgerRows({
+      kore: [
+        { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:ABONO-OLD:ACUMULACION' },
+      ],
+    });
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [
+        abono({ idAbono: 'ABONO-OLD', subtotal: 1000, total: 1160 }), // mismo subtotal que la fila guardada
+        abono({ idAbono: 'ABONO-NEW', subtotal: 500, total: 580, formasPago: [{ formaPagoId: 'FP-EFECTIVO', importe: 580 }], puntosAbonados: 20 }),
+      ],
+    };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res.abonos).toEqual([
+      { idAbono: 'ABONO-OLD', success: true, status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 50 },
+      { idAbono: 'ABONO-NEW', success: true, status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 20 },
     ]);
-    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
-    expect(res).toEqual({
+    expect(res.puntosAcumulados).toBe(70);
+    // Solo el abono NUEVO escribe — el viejo no vuelve a crear nada.
+    expect(LoyaltyPointsLedger.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('abono reenviado con un subtotal distinto al guardado responde 409 aislado a ese abono', async () => {
+    mockCard(makeCard({ saldoPuntos: '50.00' }));
+    mockLedgerRows({
+      kore: [
+        { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:ABONO-1:ACUMULACION' },
+      ],
+    });
+    const payload = { ...PAYLOAD_BASE, abonos: [abono({ subtotal: 2000 })] };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res.status).toBe('fallido');
+    expect(res.abonos[0]).toMatchObject({ idAbono: 'ABONO-1', success: false, statusCode: 409 });
+    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('procesarVentaKore — blindaje cruzado manual↔kore', () => {
+  it('si la venta ya se acreditó a mano, TODOS los abonos del request responden "aplicado" sin duplicar', async () => {
+    mockCard(makeCard({ saldoPuntos: '50.00' }));
+    mockLedgerRows({
+      manual: [
+        { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320', origen: 'manual' },
+      ],
+    });
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [abono({ idAbono: 'ABONO-1' }), abono({ idAbono: 'ABONO-2' })],
+    };
+    const res = await ventaService.procesarVentaKore(payload);
+    expect(res).toMatchObject({
       serieFolio: 'A0-260605320', status: 'aplicado', puntosDescontados: 0, puntosAcumulados: 50, saldoResultante: 50,
     });
+    expect(res.abonos).toHaveLength(2);
+    expect(res.abonos[0]).toMatchObject({ idAbono: 'ABONO-1', success: true, status: 'aplicado' });
+    expect(res.abonos[1]).toMatchObject({ idAbono: 'ABONO-2', success: true, status: 'aplicado' });
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
 
-  it('409 si el mismo serieFolio ya se reportó con un subtotal distinto', async () => {
-    mockCard(makeCard());
-    LoyaltyPointsLedger.findAll.mockResolvedValue([
-      { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:ACUMULACION' },
-    ]);
-    const payload = { ...PAYLOAD_BASE, subtotal: 2000 };
-    await expect(ventaService.procesarVentaKore(payload)).rejects.toMatchObject({ statusCode: 409 });
-  });
-
-  it('blindaje cruzado de CANJE: si el canje ya se aplicó a mano (origen manual, sufijo :CANJE), responde "aplicado" sin duplicar', async () => {
+  it('blindaje cruzado de CANJE: si el canje ya se aplicó a mano, responde "aplicado" sin duplicar', async () => {
     mockCard(makeCard({ saldoPuntos: '50.00' }));
-    LoyaltyPointsLedger.findAll.mockResolvedValue([
-      { tipo: 'CANJE', puntos: '-15.00', referenciaExterna: 'A0-260605320:CANJE', origen: 'manual' },
-    ]);
+    mockLedgerRows({
+      manual: [
+        { tipo: 'CANJE', puntos: '-15.00', referenciaExterna: 'A0-260605320:CANJE', origen: 'manual' },
+      ],
+    });
     const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
-    expect(res).toEqual({
+    expect(res).toMatchObject({
       serieFolio: 'A0-260605320', status: 'aplicado', puntosDescontados: 15, puntosAcumulados: 0, saldoResultante: 50,
     });
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
 });
 
-describe('procesarVentaKore — acumulación con promoción vigente (2026-10-27: filas separadas)', () => {
-  it('genera DOS filas ACUMULACION (nivel y promoción) con referenciaExterna distintos', async () => {
+describe('procesarVentaKore — acumulación con promoción vigente (filas separadas, por abono)', () => {
+  it('genera DOS filas ACUMULACION (nivel y promoción) con referenciaExterna distintos para el mismo abono', async () => {
     mockCard(makeCard());
     configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '3' });
 
     const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
 
-    // subtotal 1000 * 5% (nivel) = 50; subtotal 1000 * 3% (promo) = 30; total 80.
+    // Nivel: puntosAbonados=50 (de Kore). Promo: subtotal 1000 * 3% = 30. Total 80.
     expect(res.status).toBe('aplicado');
     expect(res.puntosAcumulados).toBe(80);
     expect(res.saldoResultante).toBe(180);
 
     const llamadas = LoyaltyPointsLedger.create.mock.calls.map(([data]) => data);
-    const filaNivel = llamadas.find(d => d.referenciaExterna === 'A0-260605320:ACUMULACION');
-    const filaPromo = llamadas.find(d => d.referenciaExterna === 'A0-260605320:PROMOCION');
+    const filaNivel = llamadas.find(d => d.referenciaExterna === 'A0-260605320:ABONO-1:ACUMULACION');
+    const filaPromo = llamadas.find(d => d.referenciaExterna === 'A0-260605320:ABONO-1:PROMOCION');
     expect(filaNivel).toMatchObject({ tipo: 'ACUMULACION', puntos: '50.00', nivelAplicado: 'Plata', promocionNombre: null });
     expect(filaPromo).toMatchObject({ tipo: 'ACUMULACION', puntos: '30.00', promocionNombre: 'Buen Fin', promocionPorcentaje: '3' });
   });
 
-  it('idempotencia: la fila de promoción también entra en el chequeo de referencias ya procesadas', async () => {
-    mockCard(makeCard({ saldoPuntos: '180.00' }));
-    configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '3' });
-    LoyaltyPointsLedger.findAll.mockResolvedValue([
-      { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:ACUMULACION' },
-      { tipo: 'ACUMULACION', puntos: '30.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320:PROMOCION' },
-    ]);
-
-    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
-    expect(res.puntosAcumulados).toBe(80);
-    expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
+  it('cada abono prorratea su propia promoción sobre su propio monto', async () => {
+    mockCard(makeCard({ saldoPuntos: '0.00' }));
+    configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '10' });
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [
+        abono({ idAbono: 'ABONO-1', subtotal: 1000, total: 1160, puntosAbonados: 50 }),
+        abono({ idAbono: 'ABONO-2', subtotal: 200, total: 232, formasPago: [{ formaPagoId: 'FP-EFECTIVO', importe: 232 }], puntosAbonados: 10 }),
+      ],
+    };
+    const res = await ventaService.procesarVentaKore(payload);
+    // Abono 1: nivel 50 + promo (1000*10%=100) = 150. Abono 2: nivel 10 + promo (200*10%=20) = 30.
+    expect(res.abonos[0].puntosAcumulados).toBe(150);
+    expect(res.abonos[1].puntosAcumulados).toBe(30);
+    expect(res.puntosAcumulados).toBe(180);
   });
 });
 

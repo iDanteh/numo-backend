@@ -5,8 +5,10 @@
 // Mismas dependencias mockeadas que bank-indicadores.service.test.js (requiere bank.service.js
 // para reusar _rangoAnioMesMexico/_inicioDiaMx/_finDiaMx).
 jest.mock('./BankMovement.model');
+jest.mock('./CorteDescarga.model');
 jest.mock('../../shared/socket');
 jest.mock('./drive-fichas.service');
+jest.mock('./drive-cortes.service');
 jest.mock('../../../shared/services/global-config.service');
 // Scope por rol (2026-10-09): getCorteConciliacion consulta Postgres solo cuando se pasa
 // `rolEquipo` — mismo patrón/mock que bank.routes.test.js.
@@ -16,9 +18,11 @@ jest.mock('../../../shared/models/postgres', () => ({
 
 const ExcelJS = require('exceljs');
 const BankMovement = require('./BankMovement.model');
+const CorteDescarga = require('./CorteDescarga.model');
+const { subirReporteCorte, descargarReporteCorte } = require('./drive-cortes.service');
 const { User: PgUser } = require('../../../shared/models/postgres');
 const globalConfigService = require('../../../shared/services/global-config.service');
-const { BadRequestError } = require('../../shared/errors/AppError');
+const { BadRequestError, NotFoundError } = require('../../shared/errors/AppError');
 const {
   getCorteConciliacion, buildReporteCorte, getPeriodoCortePorRol,
   getProgresoResolucionPorCorte, getLedgerDiario,
@@ -27,7 +31,8 @@ const {
   _resolverMesOrigen, _primeraIdentificacionEfectiva,
   getLedgerMensual, _enumerarMesesParaLedger, getLedgerPorHora, _enumerarHorasDelDia,
   getUltimosMovimientos,
-  getAntiguedadDepositos, _rangoAntiguedad,
+  getAntiguedadDepositos, getAntiguedadDepositosPorAnio, _rangoAntiguedad,
+  buildReporteCortes, listarDescargasCorte, descargarReporteCorteHistorico,
 } = require('./bank-indicadores.service');
 
 // "Ahora" fijo para que los tests sean deterministas: miércoles 2026-10-07, 15:00 México
@@ -1091,13 +1096,63 @@ describe('getAntiguedadDepositos', () => {
     expect(total).toEqual({ count: 2, saldo: 150 });
   });
 
-  test('consulta SOLO status no_identificado y erpIds vacío — un depósito con CxC vinculada (aunque parcial) o reclasificado/otros nunca llega acá, los excluye el propio filtro de Mongo', async () => {
+  // 2026-11-06, cuarta ronda: "hoy" (sin `fecha`, o `fecha`=hoy) usa `status` directo en Mongo,
+  // sin reconstrucción — más simple y más correcto que reconstruir, porque `status` YA es la
+  // fuente de verdad del presente sin importar cómo se resolvió el depósito (ficha, CxC, edición
+  // manual, match automático).
+  test('sin `fecha` (hoy), filtra status:"no_identificado" + erpIds vacío DIRECTO en Mongo — sin traer "identificado"', async () => {
     BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
     await getAntiguedadDepositos({});
 
     const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.status).toBe('no_identificado');
     expect(filtro.erpIds).toEqual({ $size: 0 });
+  });
+
+  // Bug real corregido 2026-11-06 (tercera ronda): un depósito que estaba vacío en un mes pasado
+  // pero se vinculó después no debe quedar invisible para TODOS los cortes — un corte pasado
+  // anterior a su primera resolución sí debe contarlo como backlog de ese momento. Esto solo
+  // aplica al camino histórico (`fecha` pasada); el camino "hoy" ya lo excluye a nivel de Mongo
+  // (ver test de arriba), no hace falta re-probarlo acá con un mock que no respeta el filtro real.
+  test('con `fecha` pasada, consulta status no_identificado/identificado (nunca otros/reclasificado) SIN filtrar por erpIds — y un depósito ya resuelto hoy SÍ cuenta como backlog en un corte anterior a su resolución', async () => {
+    const mockDeposito = {
+      deposito: 100,
+      fecha: new Date('2026-03-01T12:00:00.000Z'),
+      erpIds: ['cxc-1'], // ya vinculado hoy
+      identificadoPor: [{ fechaId: new Date('2026-06-15T00:00:00.000Z') }],
+    };
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([mockDeposito]) }) });
+
+    const marzo = await getAntiguedadDepositos({ fecha: '2026-03-10' });
+    expect(marzo.total).toEqual({ count: 1, saldo: 100 });
+
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.status).toEqual({ $in: ['no_identificado', 'identificado'] });
+    expect(filtro.erpIds).toBeUndefined();
+  });
+
+  // Bug real 2026-11-06 (cuarta ronda): de un residuo de 635 depósitos de enero 2026 que el chart
+  // de Antigüedad mostraba como "pendientes" pese a `status:'identificado'`, el 96.5% tenía
+  // `fichaAt` poblado sin `primeraIdentificacionAt` ni `identificadoPor` (ficha física, más vieja
+  // que la adopción de `resolvePrimeraIdentificacion()`). `_primeraResueltaEfectiva` necesita el
+  // fallback a `fichaAt` para reconstruir bien un corte pasado anterior/posterior a esa ficha.
+  test('con `fecha` pasada, un depósito identificado por FICHA (sin identificadoPor ni primeraIdentificacionAt) cuenta como backlog antes de fichaAt y no después', async () => {
+    const mockDeposito = {
+      deposito: 250,
+      fecha: new Date('2026-01-08T12:00:00.000Z'),
+      erpIds: [],
+      identificadoPor: [],
+      primeraIdentificacionAt: null,
+      fichaAt: new Date('2026-02-01T00:00:00.000Z'),
+    };
+
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([mockDeposito]) }) });
+    const antes = await getAntiguedadDepositos({ fecha: '2026-01-31' });
+    expect(antes.total).toEqual({ count: 1, saldo: 250 });
+
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([mockDeposito]) }) });
+    const despues = await getAntiguedadDepositos({ fecha: '2026-02-15' });
+    expect(despues.total).toEqual({ count: 0, saldo: 0 });
   });
 
   test('banco: se pasa al $match (buildBaseMatch)', async () => {
@@ -1116,5 +1171,262 @@ describe('getAntiguedadDepositos', () => {
     expect(rangos.every((r) => r.count === 0 && r.saldo === 0)).toBe(true);
     expect(rangos.map((r) => r.rango)).toEqual(['1 a 30 días', '31 a 60 días', '61 a 90 días', 'Más de 90 días']);
     expect(total).toEqual({ count: 0, saldo: 0 });
+  });
+
+  // Corte por fecha pasada (2026-11-06, segunda ronda — el usuario revisó de nuevo el mockup de
+  // referencia y pidió poder elegir un corte histórico, no solo "hoy").
+  test('con `fecha` pasada, recorta la antigüedad a ESE corte, no a hoy', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // Al corte 2026-09-10: 9 días de antigüedad -> "1 a 30 días" (sería "31 a 60" si se
+      // calculara contra hoy, 2026-10-07).
+      { deposito: 100, fecha: new Date('2026-09-01T12:00:00.000Z') },
+    ]) }) });
+
+    const { rangos, total } = await getAntiguedadDepositos({ fecha: '2026-09-10' });
+
+    expect(rangos[0]).toEqual({ rango: '1 a 30 días', count: 1, saldo: 100 });
+    expect(total).toEqual({ count: 1, saldo: 100 });
+  });
+
+  test('un depósito con fecha POSTERIOR al corte no existía todavía — se excluye (nunca antigüedad negativa)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 100, fecha: new Date('2026-09-15T12:00:00.000Z') },
+    ]) }) });
+
+    const { total } = await getAntiguedadDepositos({ fecha: '2026-09-10' });
+
+    expect(total).toEqual({ count: 0, saldo: 0 });
+  });
+});
+
+describe('getAntiguedadDepositosPorAnio', () => {
+  test('agrupa por MES DE ORIGEN del depósito, no por un corte de fin de mes — un depósito de enero aparece SOLO en enero, con antigüedad contra HOY', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 100, fecha: new Date('2026-01-15T12:00:00.000Z') },
+    ]) }) });
+
+    const { meses } = await getAntiguedadDepositosPorAnio({ anio: '2026' });
+
+    // Bajo AHORA_MX (2026-10-07), el mes en curso es octubre — no hay meses futuros.
+    expect(meses.map((m) => m.periodo)).toEqual([
+      '2026-01', '2026-02', '2026-03', '2026-04', '2026-05', '2026-06',
+      '2026-07', '2026-08', '2026-09', '2026-10',
+    ]);
+    const enero = meses.find((m) => m.periodo === '2026-01');
+    expect(enero.total).toEqual({ count: 1, saldo: 100 });
+    expect(enero.rangos[3].count).toBe(1); // contra HOY (2026-10-07): ~265 días -> "Más de 90 días"
+    // El depósito NO se repite en ningún otro mes — a diferencia del diseño anterior (un corte
+    // histórico por mes), acá cada depósito vive solo en su mes de origen.
+    for (const mes of meses.filter((m) => m.periodo !== '2026-01')) {
+      expect(mes.total).toEqual({ count: 0, saldo: 0 });
+    }
+  });
+
+  // 2026-11-06, cuarta ronda: ya no hay filtrado en JS acá — un depósito `identificado` (por CxC,
+  // ficha, o lo que sea) nunca llega siquiera a este código porque la query a Mongo ya pide
+  // `status:'no_identificado'` directo (ver `_antiguedadCandidatosHoy`). Este test confirma la
+  // query real, no un post-filtrado — mockear un `identificado` acá y esperar que "desaparezca"
+  // ya no prueba nada real (el mock no respeta el filtro, a diferencia de Mongo real).
+  test('consulta status:"no_identificado" + erpIds vacío DIRECTO en Mongo — un depósito identificado nunca es candidato, sea cual sea su rastro de identificación', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await getAntiguedadDepositosPorAnio({ anio: '2026' });
+
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.status).toBe('no_identificado');
+    expect(filtro.erpIds).toEqual({ $size: 0 });
+  });
+
+  test('un depósito con fecha posterior a todos los cortes del año no aparece en ningún mes', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 100, fecha: new Date('2026-11-15T12:00:00.000Z') },
+    ]) }) });
+
+    const { meses } = await getAntiguedadDepositosPorAnio({ anio: '2026' });
+
+    expect(meses.every((m) => m.total.count === 0)).toBe(true);
+  });
+
+  test.each(['abcd', '26', '', null, undefined])('anio inválido (%p) lanza BadRequestError', async (anio) => {
+    await expect(getAntiguedadDepositosPorAnio({ anio })).rejects.toThrow(BadRequestError);
+  });
+
+  test('banco: se pasa al $match (buildBaseMatch)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await getAntiguedadDepositosPorAnio({ anio: '2026', banco: 'BBVA' });
+
+    const [filtro] = BankMovement.find.mock.calls[0];
+    expect(filtro.banco).toBe('BBVA');
+  });
+});
+
+// buildReporteCortes/listarDescargasCorte (2026-11-06, pedido explícito del usuario: un solo
+// botón de exportar para todo Cortes + un historial de descargas con delta vs. la anterior).
+// `BankMovement.find` se mockea con `mockReturnValue` (no `mockReturnValueOnce`) a propósito:
+// getLedgerMensual/getLedgerDiario/getAntiguedadDepositos hacen VARIAS llamadas (una por
+// mes/día + una de antigüedad), pero el filtrado por periodo real pasa en JS dentro de
+// _calcularLedgerBacklog/_estadoAlCierre, no en el mock — devolver el MISMO set de documentos a
+// cada llamada es suficiente para ejercitar la integración real sin encolar 20+ mocks.
+describe('buildReporteCortes', () => {
+  test('arma 4 hojas (Mensual/Diario/Antigüedad/Detalle de depósitos) y deja un registro en CorteDescarga con el backlog del día más reciente', async () => {
+    BankMovement.find.mockReturnValue({ select: () => ({ lean: () => Promise.resolve([
+      {
+        folio: '012345', banco: 'BBVA', deposito: 500, fecha: AHORA_MX, createdAt: AHORA_MX,
+        primeraIdentificacionAt: null, historialVinculacion: [], erpIds: [],
+      },
+    ]) }) });
+    CorteDescarga.create.mockResolvedValue({});
+    subirReporteCorte.mockResolvedValue('drive-id-1');
+
+    const buffer = await buildReporteCortes({ usuario: { userId: 'u1', nombre: 'Ana' } });
+    const wb = await leerWorkbook(buffer);
+
+    expect(wb.getWorksheet('Mensual')).toBeDefined();
+    expect(wb.getWorksheet('Diario')).toBeDefined();
+    expect(wb.getWorksheet('Antigüedad')).toBeDefined();
+    // "Detalle de depósitos" (2026-11-06, pedido explícito del usuario: "que al exportar esto me
+    // diga qué depósitos son los que están siendo involucrados") — misma población que la hoja
+    // "Antigüedad", pero depósito por depósito.
+    const wsDetalle = wb.getWorksheet('Detalle de depósitos');
+    expect(wsDetalle).toBeDefined();
+    expect(wsDetalle.getRow(1).values.filter(Boolean)).toEqual([
+      'Folio', 'Banco', 'Fecha del depósito', 'Importe', 'Mes de origen', 'Antigüedad (días)', 'Rango',
+    ]);
+    const filaDetalle = wsDetalle.getRow(2).values.filter((v) => v !== undefined && v !== null);
+    // AHORA_MX = 2026-10-07 15:00 hora México (ver mock de tiempo del archivo) — mismo día que el
+    // corte de "hoy", así que la antigüedad es 0 días ("1 a 30 días").
+    expect(filaDetalle).toEqual(['012345', 'BBVA', '2026-10-07', 500, '2026-10', 0, '1 a 30 días']);
+    // Encabezados de la hoja Mensual — mismo orden que la tabla "Resultados por mes" del frontend.
+    const headerMensual = wb.getWorksheet('Mensual').getRow(1).values.filter(Boolean);
+    expect(headerMensual).toEqual([
+      'Mes', 'Saldo inicial', '+ Nuevos', '= Al cierre', '− Identificados',
+      '= Depósitos por identificar', 'Dep. saldo inicial', '+ Dep. nuevos', '= Dep. al cierre',
+      '− Dep. identificados', '= Dep. por identificar',
+    ]);
+
+    expect(CorteDescarga.create).toHaveBeenCalledTimes(1);
+    const [doc] = CorteDescarga.create.mock.calls[0];
+    expect(doc.usuario).toEqual({ userId: 'u1', nombre: 'Ana' });
+    expect(doc.banco).toBeNull();
+    // El depósito cargado HOY, no_identificado y sin historial, es "nuevo" y sigue pendiente al
+    // cierre de hoy — el snapshot debe reflejarlo (1 depósito, $500).
+    expect(doc.depositosNoIdentificados).toEqual({ count: 1, saldo: 500 });
+    // Subida a Drive exitosa (2026-11-06) — el registro guarda el driveFileId real.
+    expect(subirReporteCorte).toHaveBeenCalledTimes(1);
+    expect(doc.driveFileId).toBe('drive-id-1');
+  });
+
+  test('pasa `banco` a las 3 fuentes y al registro de CorteDescarga', async () => {
+    BankMovement.find.mockReturnValue({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    CorteDescarga.create.mockResolvedValue({});
+    subirReporteCorte.mockResolvedValue('drive-id-2');
+
+    await buildReporteCortes({ banco: 'BBVA', usuario: { userId: 'u1', nombre: 'Ana' } });
+
+    expect(BankMovement.find.mock.calls.every(([filtro]) => filtro.banco === 'BBVA')).toBe(true);
+    const [doc] = CorteDescarga.create.mock.calls[0];
+    expect(doc.banco).toBe('BBVA');
+    expect(doc.depositosNoIdentificados).toEqual({ count: 0, saldo: 0 });
+  });
+
+  // Drive best-effort (2026-11-06, pedido explícito del usuario: poder volver a bajar el Excel de
+  // un punto pasado) — si la subida falla, la descarga EN CURSO del usuario nunca se bloquea.
+  test('si falla la subida a Drive, igual devuelve el buffer y guarda driveFileId:null (nunca rompe la descarga en curso)', async () => {
+    BankMovement.find.mockReturnValue({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    CorteDescarga.create.mockResolvedValue({});
+    subirReporteCorte.mockRejectedValue(new Error('carpeta no configurada'));
+
+    const buffer = await buildReporteCortes({ usuario: { userId: 'u1', nombre: 'Ana' } });
+
+    expect(buffer).toBeInstanceOf(Buffer);
+    const wb = await leerWorkbook(buffer);
+    expect(wb.getWorksheet('Mensual')).toBeDefined();
+    const [doc] = CorteDescarga.create.mock.calls[0];
+    expect(doc.driveFileId).toBeNull();
+  });
+});
+
+describe('descargarReporteCorteHistorico', () => {
+  test('resuelve el registro por id y descarga el binario real de Drive', async () => {
+    CorteDescarga.findById.mockReturnValue({ lean: () => Promise.resolve({
+      _id: '1', fecha: new Date('2026-10-05T12:00:00.000Z'), driveFileId: 'drive-id-1',
+    }) });
+    descargarReporteCorte.mockResolvedValue(Buffer.from('xlsx-real'));
+
+    const { buffer, filename } = await descargarReporteCorteHistorico('1');
+
+    expect(descargarReporteCorte).toHaveBeenCalledWith('drive-id-1');
+    expect(buffer.toString()).toBe('xlsx-real');
+    expect(filename).toBe('Cortes-2026-10-05.xlsx');
+  });
+
+  test('id inexistente -> NotFoundError', async () => {
+    CorteDescarga.findById.mockReturnValue({ lean: () => Promise.resolve(null) });
+
+    await expect(descargarReporteCorteHistorico('x')).rejects.toThrow(NotFoundError);
+    expect(descargarReporteCorte).not.toHaveBeenCalled();
+  });
+
+  test('descarga sin driveFileId (la subida falló en su momento) -> BadRequestError, nunca llama a Drive', async () => {
+    CorteDescarga.findById.mockReturnValue({ lean: () => Promise.resolve({
+      _id: '2', fecha: new Date('2026-10-05'), driveFileId: null,
+    }) });
+
+    await expect(descargarReporteCorteHistorico('2')).rejects.toThrow(BadRequestError);
+    expect(descargarReporteCorte).not.toHaveBeenCalled();
+  });
+});
+
+describe('listarDescargasCorte', () => {
+  test('la descarga más reciente trae delta contra la inmediatamente anterior del MISMO banco', async () => {
+    CorteDescarga.find.mockReturnValue({ sort: () => ({ lean: () => Promise.resolve([
+      // Orden desc (más reciente primero) — mismo orden que devuelve el find real.
+      { _id: '3', fecha: new Date('2026-10-07'), banco: null, depositosNoIdentificados: { count: 80, saldo: 8000 } },
+      { _id: '2', fecha: new Date('2026-10-06'), banco: null, depositosNoIdentificados: { count: 100, saldo: 10000 } },
+      { _id: '1', fecha: new Date('2026-10-05'), banco: null, depositosNoIdentificados: { count: 100, saldo: 10000 } },
+    ]) }) });
+
+    const descargas = await listarDescargasCorte({});
+
+    // 80 vs 100 -> bajó 20%.
+    expect(descargas[0].delta).toEqual({ countPct: -20, saldoPct: -20, direccion: 'bajo' });
+    // 100 vs 100 -> igual.
+    expect(descargas[1].delta).toEqual({ countPct: 0, saldoPct: 0, direccion: 'igual' });
+    // La más vieja no tiene contra qué compararse.
+    expect(descargas[2].delta).toBeNull();
+  });
+
+  test('nunca compara un banco contra otro — cada uno se compara solo contra su propio historial', async () => {
+    CorteDescarga.find.mockReturnValue({ sort: () => ({ lean: () => Promise.resolve([
+      { _id: '2', fecha: new Date('2026-10-07'), banco: 'BBVA', depositosNoIdentificados: { count: 50, saldo: 5000 } },
+      { _id: '1', fecha: new Date('2026-10-06'), banco: 'Banamex', depositosNoIdentificados: { count: 999, saldo: 99900 } },
+    ]) }) });
+
+    const descargas = await listarDescargasCorte({});
+
+    // La única descarga de BBVA no tiene una anterior CON EL MISMO banco — nunca compara contra
+    // la de Banamex aunque sea la fila inmediatamente siguiente en la lista.
+    expect(descargas[0].delta).toBeNull();
+    expect(descargas[1].delta).toBeNull();
+  });
+
+  test('con `count` anterior en 0, el porcentaje de conteo es null (no divide por cero) pero `direccion` sigue siendo correcta', async () => {
+    CorteDescarga.find.mockReturnValue({ sort: () => ({ lean: () => Promise.resolve([
+      { _id: '2', fecha: new Date('2026-10-07'), banco: null, depositosNoIdentificados: { count: 5, saldo: 500 } },
+      { _id: '1', fecha: new Date('2026-10-06'), banco: null, depositosNoIdentificados: { count: 0, saldo: 0 } },
+    ]) }) });
+
+    const descargas = await listarDescargasCorte({});
+
+    expect(descargas[0].delta).toEqual({ countPct: null, saldoPct: null, direccion: 'subio' });
+  });
+
+  test('`banco` filtra el historial a ese banco exacto', async () => {
+    const lean = jest.fn().mockResolvedValue([]);
+    const sort = jest.fn().mockReturnValue({ lean });
+    CorteDescarga.find.mockReturnValue({ sort });
+
+    await listarDescargasCorte({ banco: 'BBVA' });
+
+    expect(CorteDescarga.find).toHaveBeenCalledWith({ banco: 'BBVA' });
   });
 });

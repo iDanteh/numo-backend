@@ -309,6 +309,19 @@ describe('create() — campos opcionales de Lealtad (telefono/subtotal)', () => 
     const docCreado = CollectionRequest.create.mock.calls[0][0];
     expect(docCreado.cxcs[0].subtotal).toBeNull();
   });
+
+  test('un CxC con puntosAbonados (pre-cálculo de Kore) -> se parsea y persiste', async () => {
+    const data = validData({ cxcs: [{ erpId: 'CXC-1', serie: 'A0', folioExterno: '123', subtotal: 431.03, puntosAbonados: 8.69 }] });
+    await service.create(data);
+    const docCreado = CollectionRequest.create.mock.calls[0][0];
+    expect(docCreado.cxcs[0]).toMatchObject({ erpId: 'CXC-1', subtotal: 431.03, puntosAbonados: 8.69 });
+  });
+
+  test('CxC sin puntosAbonados -> queda null, no truena (comportamiento actual sin cambios)', async () => {
+    await service.create(validData());
+    const docCreado = CollectionRequest.create.mock.calls[0][0];
+    expect(docCreado.cxcs[0].puntosAbonados).toBeNull();
+  });
 });
 
 // ── Comprobantes (suben a Drive ANTES de crear el documento) ────────────────

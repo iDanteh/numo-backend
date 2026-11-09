@@ -53,6 +53,8 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   guardarPorcentajes: jest.fn(),
   obtenerCongelamientoMeses: jest.fn(),
   guardarCongelamientoMeses: jest.fn(),
+  obtenerConsultaCodigoMaxMes: jest.fn(),
+  guardarConsultaCodigoMaxMes: jest.fn(),
   obtenerEspecialidades: jest.fn(),
   guardarEspecialidades: jest.fn(),
   obtenerFotoFolderId: jest.fn(),
@@ -71,6 +73,9 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   listarFormasPagoKore: jest.fn(),
   sincronizarFormasPagoKore: jest.fn(),
   actualizarFormaPagoKore: jest.fn(),
+  listarNivelesKore: jest.fn(),
+  sincronizarNivelesKore: jest.fn(),
+  actualizarNivelKore: jest.fn(),
 }));
 
 const express = require('express');
@@ -123,6 +128,8 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
     { metodo: 'get',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { meses: 6 } },
+    { metodo: 'get',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 1 } },
     { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
     { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
@@ -141,6 +148,9 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'get',   ruta: '/config/formas-pago-kore',       permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'post',  ruta: '/config/formas-pago-kore/sync',  permiso: PERMISSIONS.LOYALTY_CONFIG },
     { metodo: 'patch', ruta: '/config/formas-pago-kore/1',     permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esPuntos: true } },
+    { metodo: 'get',   ruta: '/config/niveles-kore',           permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'post',  ruta: '/config/niveles-kore/sync',      permiso: PERMISSIONS.LOYALTY_CONFIG },
+    { metodo: 'patch', ruta: '/config/niveles-kore/1',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { esInicial: true } },
   ];
 
   const TODOS = Object.values(PERMISSIONS).filter((p) => p.startsWith('loyalty:'));
@@ -350,6 +360,24 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(configService.guardarCongelamientoMeses).toHaveBeenCalledWith(6, expect.objectContaining({ dbId: '1' }));
   });
 
+  test('GET /config/consulta-codigo-max-mes llama a obtenerConsultaCodigoMaxMes', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(1);
+    const res = await request(app).get('/config/consulta-codigo-max-mes').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 1 });
+    expect(configService.obtenerConsultaCodigoMaxMes).toHaveBeenCalled();
+  });
+
+  test('PUT /config/consulta-codigo-max-mes llama a guardarConsultaCodigoMaxMes con max y el usuario', async () => {
+    configService.guardarConsultaCodigoMaxMes.mockResolvedValue(1);
+    const res = await request(app).put('/config/consulta-codigo-max-mes')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ max: 1 });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 1 });
+    expect(configService.guardarConsultaCodigoMaxMes).toHaveBeenCalledWith(1, expect.objectContaining({ dbId: '1' }));
+  });
+
   test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {
     configService.obtenerFotoFolderId.mockResolvedValue('abc123');
     const res = await request(app).get('/config/foto-folder').set(perms(PERMISSIONS.LOYALTY_READ));
@@ -463,6 +491,31 @@ describe('wiring hacia los servicios (happy path)', () => {
       .send({ esPuntos: true });
     expect(res.status).toBe(200);
     expect(configService.actualizarFormaPagoKore).toHaveBeenCalledWith('1', { esPuntos: true });
+  });
+
+  test('GET /config/niveles-kore llama a listarNivelesKore con soloActivos', async () => {
+    configService.listarNivelesKore.mockResolvedValue([]);
+    const res = await request(app).get('/config/niveles-kore?soloActivos=true')
+      .set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(configService.listarNivelesKore).toHaveBeenCalledWith({ soloActivos: true });
+  });
+
+  test('POST /config/niveles-kore/sync llama a sincronizarNivelesKore', async () => {
+    configService.sincronizarNivelesKore.mockResolvedValue({ nuevos: 1, actualizados: 0, desactivados: 0 });
+    const res = await request(app).post('/config/niveles-kore/sync')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG));
+    expect(res.status).toBe(200);
+    expect(configService.sincronizarNivelesKore).toHaveBeenCalled();
+  });
+
+  test('PATCH /config/niveles-kore/:id llama a actualizarNivelKore', async () => {
+    configService.actualizarNivelKore.mockResolvedValue({ id: 1, esInicial: true });
+    const res = await request(app).patch('/config/niveles-kore/1')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ esInicial: true });
+    expect(res.status).toBe(200);
+    expect(configService.actualizarNivelKore).toHaveBeenCalledWith('1', { esInicial: true });
   });
 });
 

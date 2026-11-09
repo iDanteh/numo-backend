@@ -18,16 +18,18 @@ jest.mock('../../../shared/utils/logger', () => ({
 const axios = require('axios');
 const globalConfigService = require('../../../shared/services/global-config.service');
 const { logger } = require('../../../shared/utils/logger');
-const { obtenerConceptosKore, obtenerFormasPagoKore } = require('./loyalty-kore-catalogos.client');
+const { obtenerConceptosKore, obtenerFormasPagoKore, obtenerNivelesKore } = require('./loyalty-kore-catalogos.client');
 
 const CONCEPTOS_URL = 'https://test.cajas.koreingenieria.com/conceptos';
 const FORMAS_PAGO_URL = 'https://test.formaspagos.koreingenieria.com/api/formasdepago';
+const NIVELES_URL = 'https://test.cajas.koreingenieria.com/niveles';
 
 beforeEach(() => {
   jest.clearAllMocks();
   globalConfigService.getValue.mockImplementation(async (section, clave) => {
     if (section === 'kore' && clave === 'CONCEPTOS_URL') return CONCEPTOS_URL;
     if (section === 'kore' && clave === 'FORMAS_PAGO_URL') return FORMAS_PAGO_URL;
+    if (section === 'kore' && clave === 'NIVELES_URL') return NIVELES_URL;
     if (section === 'bancos' && clave === 'TOKEN') return 'tok-123';
     throw new Error(`config no mockeada: ${section}.${clave}`);
   });
@@ -124,5 +126,25 @@ describe('obtenerFormasPagoKore', () => {
   test('Data ausente o no es array: devuelve []', async () => {
     axios.get.mockResolvedValue({ data: {} });
     expect(await obtenerFormasPagoKore()).toEqual([]);
+  });
+});
+
+describe('obtenerNivelesKore', () => {
+  test('devuelve Data tal cual, con bearer token', async () => {
+    const data = [{ Id: 'n1', Nombre: 'Bronce', Porcentaje: 1.5 }];
+    axios.get.mockResolvedValue({ data: { Mensaje: 'ok', Data: data } });
+
+    const niveles = await obtenerNivelesKore();
+
+    expect(niveles).toEqual(data);
+    expect(axios.get).toHaveBeenCalledWith(NIVELES_URL, {
+      headers: { Authorization: 'Bearer tok-123' },
+      timeout: 60000,
+    });
+  });
+
+  test('Data ausente o no es array: devuelve []', async () => {
+    axios.get.mockResolvedValue({ data: {} });
+    expect(await obtenerNivelesKore()).toEqual([]);
   });
 });

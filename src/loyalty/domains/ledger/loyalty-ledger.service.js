@@ -20,7 +20,6 @@ const {
 } = require('../../../shared/models/postgres');
 const { BadRequestError, ConflictError, UnprocessableError, NotFoundError } = require('../../../shared/errors/AppError');
 const { toCents, fromCents, calcularPuntos } = require('../../shared/puntos.util');
-const globalConfigService = require('../../../shared/services/global-config.service');
 // Sin require circular: loyalty-config.service.js no importa nada de este
 // archivo (verificado), así que un require normal al tope basta — no hace
 // falta el patrón de require perezoso que usa p.ej. shared/middleware/auth.js.
@@ -267,15 +266,15 @@ async function registrarAcumulacion({ cardId, serieFolio }, user) {
       if (!card) throw new NotFoundError('Tarjeta');
       if (!card.activa) throw new UnprocessableError('La tarjeta está inactiva.');
 
-      let pctRaw;
-      try {
-        pctRaw = await globalConfigService.getValue('lealtad', `PORCENTAJE_${card.nivel.toUpperCase()}`);
-      } catch (err) {
+      // % de nivel (2026-11-06, pedido explícito del usuario): fuente única `LoyaltyKoreNivel.porcentaje`
+      // (autoritativo de Kore) en vez de `GlobalConfig.lealtad.PORCENTAJE_<NIVEL>` — ver
+      // configService#obtenerPorcentajeNivel, reusada también por loyalty-kore-venta.service.js.
+      const pct = await configService.obtenerPorcentajeNivel(card.nivel);
+      if (pct == null) {
         throw new UnprocessableError(
-          `Configure el % del nivel ${card.nivel} en Lealtad → Configuración.`,
+          `El nivel "${card.nivel}" no tiene un % de acumulación configurado en el catálogo de niveles de Kore.`,
         );
       }
-      const pct = Number(pctRaw);
 
       // Promoción vigente (2026-10-20, ajustado 2026-10-27, pedido explícito del usuario): el bono
       // de la promoción YA NO se suma al % del nivel en un solo cálculo — cada uno genera su propio

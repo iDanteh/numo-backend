@@ -85,4 +85,59 @@ describe('LoyaltyCard — modelo Sequelize (loyalty_cards)', () => {
   test('timestamps de Sequelize (created_at/updated_at) activos — no declara timestamps:false', () => {
     expect(LoyaltyCard.options.timestamps).not.toBe(false);
   });
+
+  describe('sesión de consulta + email de contacto + contadores (2026-11-09)', () => {
+    test('consultaSesionTokenHash: STRING(100) NULL, excluido del defaultScope, con scope propio', () => {
+      const attr = LoyaltyCard.getAttributes().consultaSesionTokenHash;
+      expect(attr.type.constructor.name).toBe('STRING');
+      expect(attr.type.options.length).toBe(100);
+      expect(attr.allowNull).toBe(true);
+
+      expect(LoyaltyCard.options.defaultScope.attributes.exclude).toContain('consultaSesionTokenHash');
+      expect(LoyaltyCard.options.scopes.withConsultaSesionTokenHash.attributes.include).toContain('consultaSesionTokenHash');
+    });
+
+    test('consultaSesionUsosRestantes: INTEGER NULL; consultaSesionExpiraEn: DATE NULL', () => {
+      const usos = LoyaltyCard.getAttributes().consultaSesionUsosRestantes;
+      expect(usos.allowNull).toBe(true);
+
+      const expira = LoyaltyCard.getAttributes().consultaSesionExpiraEn;
+      expect(expira.allowNull).toBe(true);
+    });
+
+    test('emailContacto: STRING(200) NULL', () => {
+      const attr = LoyaltyCard.getAttributes().emailContacto;
+      expect(attr.type.constructor.name).toBe('STRING');
+      expect(attr.type.options.length).toBe(200);
+      expect(attr.allowNull).toBe(true);
+    });
+
+    test('ultimaConsultaAt: DATE NULL; totalConsultas: INTEGER NOT NULL default 0', () => {
+      const ultima = LoyaltyCard.getAttributes().ultimaConsultaAt;
+      expect(ultima.allowNull).toBe(true);
+
+      const total = LoyaltyCard.getAttributes().totalConsultas;
+      expect(total.allowNull).toBe(false);
+      expect(total.defaultValue).toBe(0);
+    });
+  });
+
+  describe('límite mensual de consultas con código (2026-11-09)', () => {
+    test('consultaCodigoMesPeriodo: STRING(7) NULL, NO excluido del defaultScope (no es secreto)', () => {
+      const attr = LoyaltyCard.getAttributes().consultaCodigoMesPeriodo;
+      expect(attr.type.constructor.name).toBe('STRING');
+      expect(attr.type.options.length).toBe(7);
+      expect(attr.allowNull).toBe(true);
+
+      expect(LoyaltyCard.options.defaultScope.attributes.exclude).not.toContain('consultaCodigoMesPeriodo');
+    });
+
+    test('consultaCodigoMesContador: INTEGER NOT NULL default 0, NO excluido del defaultScope', () => {
+      const attr = LoyaltyCard.getAttributes().consultaCodigoMesContador;
+      expect(attr.allowNull).toBe(false);
+      expect(attr.defaultValue).toBe(0);
+
+      expect(LoyaltyCard.options.defaultScope.attributes.exclude).not.toContain('consultaCodigoMesContador');
+    });
+  });
 });

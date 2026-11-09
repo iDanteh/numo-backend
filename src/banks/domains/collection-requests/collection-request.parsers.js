@@ -53,6 +53,9 @@ function parseCxcs(raw) {
     nombreTipoMovimiento: c.nombreTipoMovimiento ? String(c.nombreTipoMovimiento).trim().toUpperCase() : null,
     montoAsignado:        c.montoAsignado != null ? Number(c.montoAsignado) : null,
     subtotal:             c.subtotal != null      ? Number(c.subtotal)      : null,
+    // Pre-cálculo de puntos de Lealtad (2026-11-06) — ver CollectionRequest.model.js.
+    // Aditivo e inerte si no viene, mismo criterio que subtotal.
+    puntosAbonados:       c.puntosAbonados != null ? Number(c.puntosAbonados) : null,
   }));
 }
 

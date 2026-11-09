@@ -23,14 +23,13 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('../../../config/database.postgres', () => ({
   sequelize: { transaction: jest.fn() },
 }));
-jest.mock('../../../shared/services/global-config.service', () => ({
-  getValue: jest.fn(),
-}));
 // loyalty-config.service.js se mockea completo (no hay require circular real:
-// config no importa nada de ledger, verificado en el código — se mockea igual
-// que global-config.service para no acoplar este test al modelo LoyaltyPromotion).
+// config no importa nada de ledger, verificado en el código). `obtenerPorcentajeNivel`
+// (2026-11-06) reemplazó a `globalConfigService.getValue('lealtad','PORCENTAJE_<NIVEL>')`
+// como fuente del % de nivel — ya no se mockea global-config.service para esto.
 jest.mock('../config/loyalty-config.service', () => ({
   obtenerPromocionVigente: jest.fn(),
+  obtenerPorcentajeNivel: jest.fn(),
 }));
 // Serie-Folio (2026-10-21): registrarAcumulacion/registrarCanje ya no reciben
 // centroCostoId directo — resuelven la serie contra este mapa (mismo que usa
@@ -48,7 +47,6 @@ const {
   LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyAdjustmentReason, CentroCosto,
 } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
-const globalConfigService = require('../../../shared/services/global-config.service');
 const configService = require('../config/loyalty-config.service');
 const centrosCostoService = require('../../../banks/domains/centros-costo/centros-costo.service');
 const erpSyncService = require('../../../banks/domains/erp/erp-sync.service');
@@ -146,13 +144,13 @@ describe('registrarAcumulacion', () => {
   test('falta configurar el % del nivel (D11) → 422, nunca usa 0%', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard({ nivel: 'Oro' }));
-    globalConfigService.getValue.mockRejectedValue(new Error("No existe la configuración 'lealtad.PORCENTAJE_ORO'"));
+    configService.obtenerPorcentajeNivel.mockResolvedValue(null);
 
     await expect(
       ledgerService.registrarAcumulacion({ cardId: 1, serieFolio: 'A0-260605320' }, USER),
     ).rejects.toMatchObject({ statusCode: 422 });
 
-    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'PORCENTAJE_ORO');
+    expect(configService.obtenerPorcentajeNivel).toHaveBeenCalledWith('Oro');
     expect(LoyaltyPointsLedger.create).not.toHaveBeenCalled();
   });
 
@@ -160,7 +158,7 @@ describe('registrarAcumulacion', () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({
       raw: [makeCuentaKore({ subtotal: 1000, total: 1160 })],
     });
@@ -188,7 +186,7 @@ describe('registrarAcumulacion', () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
 
     const primera = await ledgerService.registrarAcumulacion(
       { cardId: 1, serieFolio: 'A0-260605320' }, USER,
@@ -197,7 +195,7 @@ describe('registrarAcumulacion', () => {
 
     // La configuración "cambia" — una acumulación nueva usa el valor nuevo,
     // pero la fila ya escrita (verificada arriba) nunca se recalcula.
-    globalConfigService.getValue.mockResolvedValue('8');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(8);
     const segunda = await ledgerService.registrarAcumulacion(
       { cardId: 1, serieFolio: 'A0-260605320' }, USER,
     );
@@ -225,7 +223,7 @@ describe('registrarAcumulacion', () => {
   test('la serie se resuelve sin distinguir mayúsculas/minúsculas', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
 
     await expect(
       ledgerService.registrarAcumulacion({ cardId: 1, serieFolio: 'a0-260605320' }, USER),
@@ -236,7 +234,7 @@ describe('registrarAcumulacion', () => {
   test('consulta Kore con serieExterna/folioExterno y el rango de fecha derivado del folio (YYMM)', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
 
     await ledgerService.registrarAcumulacion({ cardId: 1, serieFolio: 'A0-260605320' }, USER);
 
@@ -252,7 +250,7 @@ describe('registrarAcumulacion', () => {
   test('si el rango normal no encuentra nada, reintenta con la ventana de spillover de fin de mes', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     erpSyncService.sincronizarCuentasPendientes
       .mockResolvedValueOnce({ raw: [] })
       .mockResolvedValueOnce({ raw: [makeCuentaKore()] });
@@ -309,7 +307,7 @@ describe('registrarAcumulacion', () => {
   test('idempotencia: el mismo folio no puede generar puntos dos veces → 409, sin recalcular', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     const dupErr = new Error('duplicate');
     dupErr.name = 'SequelizeUniqueConstraintError';
     LoyaltyPointsLedger.create.mockRejectedValueOnce(dupErr);
@@ -337,7 +335,7 @@ describe('registrarAcumulacion', () => {
   test('el resultado da 0 puntos → 400', async () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     LoyaltyCard.findByPk.mockResolvedValue(makeCard());
-    globalConfigService.getValue.mockResolvedValue('0.01');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(0.01);
     erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({
       raw: [makeCuentaKore({ subtotal: 0.01, total: 0.01 })],
     });
@@ -353,7 +351,7 @@ describe('registrarAcumulacion con promoción vigente (2026-10-27: filas separad
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     configService.obtenerPromocionVigente.mockResolvedValue(null);
 
     const { movimiento, movimientoPromocion } = await ledgerService.registrarAcumulacion(
@@ -371,7 +369,7 @@ describe('registrarAcumulacion con promoción vigente (2026-10-27: filas separad
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     configService.obtenerPromocionVigente.mockResolvedValue({ nombre: 'Buen Fin', porcentajeBono: '3' });
 
     const { movimiento, movimientoPromocion, saldoPuntos } = await ledgerService.registrarAcumulacion(
@@ -401,7 +399,7 @@ describe('registrarAcumulacion con promoción vigente (2026-10-27: filas separad
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     erpSyncService.sincronizarCuentasPendientes.mockResolvedValue({
       raw: [makeCuentaKore({ subtotal: 1, total: 1 })],
     });
@@ -430,7 +428,7 @@ describe('registrarCanje', () => {
     // La misma sucursal, con participaLealtad true, sí deja acumular (flags independientes)
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('5');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(5);
     await expect(
       ledgerService.registrarAcumulacion({ cardId: 1, serieFolio: 'A0-260605320' }, USER),
     ).resolves.toBeDefined();
@@ -655,7 +653,7 @@ describe('saldoResultante encadenado', () => {
     CentroCosto.findByPk.mockResolvedValue(makeCentroCosto());
     const card = makeCard({ nivel: 'Plata', saldoPuntos: '0.00' });
     LoyaltyCard.findByPk.mockResolvedValue(card);
-    globalConfigService.getValue.mockResolvedValue('10');
+    configService.obtenerPorcentajeNivel.mockResolvedValue(10);
     LoyaltyAdjustmentReason.findByPk.mockResolvedValue({ id: 1, nombre: 'bono', activo: true, puntosFijos: null });
     // Subtotal 100 × 10% = 10 puntos, para que la cadena coincida con los
     // valores de siempre (antes montoVenta='100.00' venía directo del body).

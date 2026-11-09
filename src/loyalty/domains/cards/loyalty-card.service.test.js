@@ -22,6 +22,10 @@ jest.mock('../../../shared/models/postgres', () => {
     LoyaltyCard,
     LoyaltyTierHistory: { create: jest.fn() },
     LoyaltyCardAuditLog: { create: jest.fn(), findAll: jest.fn() },
+    // REDISEÑO 2026-11-06: catálogo de niveles gestionado por Kore — reemplaza el array fijo
+    // NIVELES_VALIDOS. Mockeado con un catálogo fijo equivalente (Bronce/Plata/Oro, Bronce
+    // esInicial) en beforeEach, para no reescribir todos los tests de este archivo.
+    LoyaltyKoreNivel: { findOne: jest.fn() },
   };
 });
 jest.mock('../../../config/database.postgres', () => ({
@@ -31,8 +35,9 @@ jest.mock('./drive-loyalty-foto.service', () => ({
   subirFotoCliente: jest.fn(),
   descargarFotoCliente: jest.fn(),
 }));
+jest.mock('../../../shared/utils/logger', () => ({ logger: { warn: jest.fn(), error: jest.fn(), info: jest.fn() } }));
 
-const { LoyaltyCard, LoyaltyTierHistory, LoyaltyCardAuditLog } = require('../../../shared/models/postgres');
+const { LoyaltyCard, LoyaltyTierHistory, LoyaltyCardAuditLog, LoyaltyKoreNivel } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
 const { subirFotoCliente, descargarFotoCliente } = require('./drive-loyalty-foto.service');
 const cardService = require('./loyalty-card.service');
@@ -57,10 +62,19 @@ function makeCard(overrides = {}) {
 
 const USER = { dbId: 7, nombre: 'Admin' };
 
+const NIVELES_CATALOGO_MOCK = ['Bronce', 'Plata', 'Oro'];
+
 beforeEach(() => {
   jest.clearAllMocks();
   sequelize.transaction.mockImplementation(async (cb) => cb({ fake: true }));
   LoyaltyCard.create.mockImplementation(async (data) => ({ ...makeCard(), ...data }));
+  // Catálogo de niveles mockeado (ver nota de arriba): Bronce/Plata/Oro activos, Bronce esInicial —
+  // mismo comportamiento efectivo que el NIVELES_VALIDOS fijo que reemplaza.
+  LoyaltyKoreNivel.findOne.mockImplementation(async ({ where } = {}) => {
+    if (where?.esInicial) return { nombre: 'Bronce' };
+    if (where?.nombre) return NIVELES_CATALOGO_MOCK.includes(where.nombre) ? { nombre: where.nombre } : null;
+    return null;
+  });
 });
 
 describe('crearTarjeta', () => {
@@ -102,6 +116,32 @@ describe('crearTarjeta', () => {
     await cardService.crearTarjeta({ telefono: '5512345678', nombre: 'Juan Pérez', nivel: 'Oro' }, USER);
 
     expect(LoyaltyCard.create).toHaveBeenCalledWith(expect.objectContaining({ nivel: 'Oro' }));
+  });
+
+  // REDISEÑO 2026-11-06: `nivel` ya no valida contra un array fijo — consulta LoyaltyKoreNivel.
+  test('nivel explícito inválido (fuera del catálogo de Kore) → 400, no crea', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+
+    await expect(
+      cardService.crearTarjeta({ telefono: '5512345678', nombre: 'Juan Pérez', nivel: 'Diamante' }, USER),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(LoyaltyCard.create).not.toHaveBeenCalled();
+  });
+
+  // Fallback defensivo (ver obtenerNivelInicial en loyalty-card.service.js): si el catálogo todavía
+  // no tiene ninguna fila esInicial:true (ej. recién migrado, antes de correr seed:lealtad), el alta
+  // nunca debe romperse — usa 'Bronce' como último recurso y deja constancia en el log.
+  test('sin ningún nivel esInicial configurado, usa Bronce como fallback defensivo', async () => {
+    LoyaltyCard.findOne.mockResolvedValue(null);
+    LoyaltyKoreNivel.findOne.mockImplementation(async ({ where } = {}) => {
+      if (where?.esInicial) return null; // catálogo sin fila esInicial todavía
+      if (where?.nombre) return NIVELES_CATALOGO_MOCK.includes(where.nombre) ? { nombre: where.nombre } : null;
+      return null;
+    });
+
+    await cardService.crearTarjeta({ telefono: '5512345678', nombre: 'Juan Pérez' }, USER);
+
+    expect(LoyaltyCard.create).toHaveBeenCalledWith(expect.objectContaining({ nivel: 'Bronce' }));
   });
 
   test('normaliza el teléfono antes de buscar/crear (+52, espacios, guiones)', async () => {

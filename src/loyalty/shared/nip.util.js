@@ -69,8 +69,41 @@ function compararCodigo(codigo, hash) {
 // tarjeta real, usado para igualar tiempos cuando el teléfono no existe.
 const DUMMY_CODIGO_HASH = bcrypt.hashSync('no-such-recovery-code', BCRYPT_COST);
 
+// ── Token de sesión de consulta (2026-11-09) ──────────────────────────────
+// Distinto del código OTP de arriba: NO es un secreto de baja entropía que un
+// humano tipea (como el NIP o el código de 6 dígitos), es generado y
+// comparado 100% por máquina — 32 bytes aleatorios (CSPRNG) ya son
+// infactibles de fuerza bruta, así que acá alcanza con SHA-256 + comparación
+// timing-safe (`crypto.timingSafeEqual`) en vez de bcrypt: más barato, y este
+// token se revalida varias veces seguidas (hasta 3 "vistas" por sesión) sin
+// el costo de bcrypt en cada una.
+function generarSesionToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+function hashSesionToken(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+/** Comparación timing-safe de dos hashes hex de igual longitud. Si alguno de
+ *  los dos (típicamente el guardado, cuando no hay sesión vigente) no mide lo
+ *  mismo que el otro, igual se compara contra `DUMMY_SESION_TOKEN_HASH` para
+ *  no filtrar por timing si hay o no una sesión real detrás del teléfono. */
+function compararSesionToken(token, hashGuardado) {
+  const tokenHash = Buffer.from(hashSesionToken(token), 'hex');
+  const contraHash = Buffer.from(hashGuardado || DUMMY_SESION_TOKEN_HASH, 'hex');
+  if (tokenHash.length !== contraHash.length) return false;
+  return crypto.timingSafeEqual(tokenHash, contraHash);
+}
+
+// Mismo criterio que DUMMY_HASH/DUMMY_CODIGO_HASH: un hash que nunca se
+// asigna a ninguna tarjeta real, usado para igualar tiempos cuando no hay
+// sesión de consulta vigente.
+const DUMMY_SESION_TOKEN_HASH = hashSesionToken('no-such-consulta-session-token');
+
 module.exports = {
   generarNip, hashNip, compararNip, DUMMY_HASH, NIPS_DEBILES,
   MAX_INTENTOS_FALLIDOS, LOCKOUT_MS,
   generarCodigoRecuperacion, hashCodigo, compararCodigo, DUMMY_CODIGO_HASH,
+  generarSesionToken, hashSesionToken, compararSesionToken, DUMMY_SESION_TOKEN_HASH,
 };

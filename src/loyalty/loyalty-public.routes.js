@@ -45,6 +45,21 @@ function crearLimitersConsulta() {
 // algo (simulado por ahora, ver loyalty-recovery.service.js) — limitar cuánto
 // puede spamear un mismo IP, independiente del lockout por tarjeta que ya
 // cubre fuerza bruta del código en /confirmar.
+//
+// STRESS_TEST_*_MAX (2026-11-09, ampliado 2026-11-10): override SOLO para la réplica local de
+// stress-test (ver stress-test/docker-compose.stress.yml) — todo el tráfico de k6 sale de una
+// sola IP, así que CUALQUIERA de estos límites reales (pensados para distinguir IPs distintas)
+// lo taparía casi de inmediato. Mismo candado que TEST_AUTH_SECRET/codigoDev: nunca se activa en
+// producción, y en cualquier otro ambiente requiere setear la variable a propósito.
+// Bug real encontrado 2026-11-10: solo `solicitar` tenía este override — `confirmar`/`ver`
+// seguían fijos en 10/15min, así que con >10 confirmaciones en toda la corrida (triv ial con
+// varios VUs) la inmensa mayoría de los flujos fallaba con 429 a partir del 11vo — un techo
+// plano de "10 en total", no una señal real de capacidad del servidor. Invalida los resultados
+// de fallas de las corridas anteriores a este fix.
+function _maxConStress(envVar, defaultMax) {
+  return (process.env.NODE_ENV !== 'production' && Number(process.env[envVar])) || defaultMax;
+}
+
 function crearLimitersRecuperacion() {
   const handler = (_req, res) => res.status(429).json({
     success: false,
@@ -54,13 +69,35 @@ function crearLimitersRecuperacion() {
   });
   const base = { standardHeaders: true, legacyHeaders: false, handler };
   return {
-    solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: 3 }),
-    confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: 10 }),
+    solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_SOLICITAR_MAX', 3) }),
+    confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_CONFIRMAR_MAX', 10) }),
+  };
+}
+
+// Sesión de consulta post-código (2026-11-09): "ver de nuevo" y "guardar email". Misma factory
+// que crearLimitersRecuperacion — presupuesto propio, no comparten contador con
+// /consulta/confirmar. `ver` reusa el mismo presupuesto que confirmar (10/15min): es el mismo
+// vector de fuerza bruta (adivinar un secreto de 15 min de vida por teléfono), solo que acá el
+// secreto es el token de sesión en vez del código OTP. `email` es más laxo (20/15min): no es un
+// vector de fuerza bruta por sí solo (ya exige una sesión vigente, que ya pasó por el limiter de
+// `confirmar` para existir), solo evita spam de formato.
+function crearLimitersSesion() {
+  const handler = (_req, res) => res.status(429).json({
+    success: false,
+    error: 'Demasiados intentos. Intenta de nuevo más tarde.',
+    code: 'RATE_LIMIT_EXCEEDED',
+    retryAfter: 60,
+  });
+  const base = { standardHeaders: true, legacyHeaders: false, handler };
+  return {
+    ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10) }),
+    email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20) }),
   };
 }
 
 const router = express.Router();
 const limitersRecuperacion = crearLimitersRecuperacion();
+const limitersSesion = crearLimitersSesion();
 
 router.post('/consulta', ...crearLimitersConsulta(), asyncHandler(async (req, res) => {
   const { telefono, nip } = req.body ?? {};
@@ -89,6 +126,27 @@ router.post('/consulta/confirmar', limitersRecuperacion.confirmar, asyncHandler(
   res.json(resultado);
 }));
 
+// Sesión de consulta post-código (2026-11-09, ver memoria project_lealtad_consulta_publica_otp):
+// "ver de nuevo" el saldo con el token emitido por /consulta/confirmar, sin pedir un código
+// nuevo — hasta 3 veces por sesión (ver loyalty-recovery.service.js#verConsultaSesion). POST,
+// nunca GET (D8, mismo criterio que el resto de este router: un GET filtraría el token a los
+// logs de tráfico vía querystring).
+router.post('/consulta/ver', limitersSesion.ver, asyncHandler(async (req, res) => {
+  const { telefono, token } = req.body ?? {};
+  const resultado = await recoveryService.verConsultaSesion(telefono, token, { ip: req.ip });
+  res.json(resultado);
+}));
+
+// Deja un correo de contacto futuro (2026-11-09) — requiere la misma sesión vigente que
+// /consulta/ver, pero no consume un uso de vista (ver guardarEmailConsulta). Opcional: el
+// cliente puede ignorar este campo.
+router.post('/consulta/email', limitersSesion.email, asyncHandler(async (req, res) => {
+  const { telefono, token, email } = req.body ?? {};
+  const resultado = await recoveryService.guardarEmailConsulta(telefono, token, email, { ip: req.ip });
+  res.json(resultado);
+}));
+
 module.exports = router;
 module.exports.crearLimitersConsulta = crearLimitersConsulta;
 module.exports.crearLimitersRecuperacion = crearLimitersRecuperacion;
+module.exports.crearLimitersSesion = crearLimitersSesion;

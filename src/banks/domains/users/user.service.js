@@ -133,9 +133,15 @@ async function updateExtraPermissions(id, extraPermissions) {
 
 /**
  * Reemplaza la lista COMPLETA de sucursales (ids de centros de costo) que puede
- * consultar el usuario — [] = todas (2026-11-05, por ahora solo Fichas de efectivo).
+ * consultar el usuario (2026-11-05, por ahora solo Fichas de efectivo).
+ * todas=true → todas las sucursales (se limpia la lista); [] sin todas → ninguna (2026-11-06).
  */
-async function updateSucursales(id, sucursalIds) {
+async function updateSucursales(id, sucursalIds, todas = false) {
+  if (todas) {
+    const u = await userRepo.updateSucursales(id, [], true);
+    if (!u) throw new NotFoundError('Usuario');
+    return u;
+  }
   const { CentroCosto } = require('../../../shared/models/postgres');
   const { Op } = require('sequelize');
   const ids = [...new Set((Array.isArray(sucursalIds) ? sucursalIds : []).map(Number))];
@@ -145,7 +151,7 @@ async function updateSucursales(id, sucursalIds) {
     const faltan = ids.filter(n => !rows.some(r => Number(r.id) === n));
     if (faltan.length) throw new BadRequestError(`No existe la sucursal: ${faltan.join(', ')}`);
   }
-  const user = await userRepo.updateSucursales(id, ids.sort((a, b) => a - b));
+  const user = await userRepo.updateSucursales(id, ids.sort((a, b) => a - b), false);
   if (!user) throw new NotFoundError('Usuario');
   return user;
 }

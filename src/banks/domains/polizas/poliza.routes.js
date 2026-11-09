@@ -22,6 +22,45 @@ router.get('/',
   }),
 );
 
+// GET /api/polizas/facturas-tardias?ids=1,2,3
+// Aviso "faltan CFDIs": por póliza de Ingreso, facturas/NC de su sucursal y día
+// que llegaron del SAT después de generarla y no están en ninguna póliza.
+// Response: { [polizaId]: { total, facturas: [{ uuid, serieFolio, tipo, total, llegoEn }] } }
+router.get('/facturas-tardias',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const generator = require('../cfdi-mapping/cfdi-poliza-generator.service');
+    const ids = String(req.query.ids || '').split(',').map(s => Number(s.trim())).filter(Number.isFinite);
+    res.json(await generator.facturasTardiasDePolizas(ids));
+  }),
+);
+
+// GET /api/polizas/sin-timbrar?rfc=&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&centroCostoId=
+// Facturas/NC activas en Kore que todavía no se timbran en el SAT (llegarán
+// tarde a la póliza de Ingreso). Ver sin-timbrar.service.js.
+router.get('/sin-timbrar',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { listarSinTimbrar } = require('../cfdi-mapping/sin-timbrar.service');
+    const { rfc, desde, hasta, centroCostoId } = req.query;
+    res.json(await listarSinTimbrar({ rfc, desde, hasta, centroCostoId: centroCostoId || null }));
+  }),
+);
+
+// GET /api/polizas/sin-timbrar-por-poliza?ids=1,2,3
+// Aviso "⏳ N sin timbrar" por póliza de Ingreso (su sucursal y día).
+router.get('/sin-timbrar-por-poliza',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { sinTimbrarDePolizas } = require('../cfdi-mapping/sin-timbrar.service');
+    const ids = String(req.query.ids || '').split(',').map(s => Number(s.trim())).filter(Number.isFinite);
+    res.json(await sinTimbrarDePolizas(ids));
+  }),
+);
+
 // GET /api/polizas/reporte-descuadradas?rfc=&ejercicio=&periodo=&estado=&format=csv
 router.get('/reporte-descuadradas',
   authenticate,
@@ -318,6 +357,20 @@ router.post('/:id/reemplazar-cuenta',
   permit('polizas:write'),
   asyncHandler(async (req, res) => {
     res.json(await service.reemplazarCuenta(req.params.id, req.body, req.user));
+  }),
+);
+
+// POST /api/polizas/:id/regenerar
+// "↻ Actualizar" (solo Ingreso en borrador): cancela la póliza y la genera de
+// nuevo para la misma sucursal y día, con las facturas que llegaron del SAT
+// después. Ver regenerarPolizaIngreso (cfdi-poliza-generator.service.js).
+// Response: { polizaId, numero, totalCfdis, anterior, facturasAgregadas, facturasQuitadas, advertencias, ... }
+router.post('/:id/regenerar',
+  authenticate,
+  permit('polizas:write'),
+  asyncHandler(async (req, res) => {
+    const generator = require('../cfdi-mapping/cfdi-poliza-generator.service');
+    res.json(await generator.regenerarPolizaIngreso(Number(req.params.id), req.user));
   }),
 );
 

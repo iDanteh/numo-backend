@@ -943,12 +943,22 @@ function _lineaNetpayAmex({ grossAmex, centroCostoObj, amexSinReporte = 0 }, cue
 // El cliente no viene en la póliza (la Global dice PUBLICO EN GENERAL): se pide
 // a Kore /cuentas-pendientes, que filtra por palabra del nombre (una palabra por
 // consulta; probado 2026-11-05, 'SHOPIFY' → solo sus cuentas en ~3 s).
-const PALABRAS_CLIENTES_SHOPIFY = ['ECOMMERCE', 'SHOPIFY', 'ROTOPLAS'];
+// 2026-11-06 (pedido del usuario): se parte en DOS renglones por almacén, uno
+// por cliente — "CLIENTE MOSTRADOR SHOPIFY" con STRIPE y "MOSTRADOR ECOMMERCE
+// CLIENTE" con SHOPIFY PAYMENTS en la columna donde va TARJETA / NETPAY, y el
+// nombre del cliente como concepto. ROTOPLAS queda FUERA (su tarjeta vuelve al
+// total normal de Tarjeta / NetPay).
+const PALABRAS_CLIENTES_SHOPIFY = ['ECOMMERCE', 'SHOPIFY'];
 // Nombres EXACTOS: la búsqueda por palabra también trae otros clientes (ej.
 // "DANIEL LOPEZ GARCIA ECOMMERCE", que NO es venta en línea).
-const CLIENTES_SHOPIFY = new Set(['MOSTRADOR ECOMMERCE CLIENTE', 'CLIENTE MOSTRADOR SHOPIFY', 'CLIENTE MOSTRADOR ROTOPLAS']);
-const _esClienteShopify = nombre => CLIENTES_SHOPIFY.has(String(nombre || '').trim().replace(/\s+/g, ' ').toUpperCase());
-const CONCEPTO_VENTAS_SHOPIFY = 'VENTAS SHOPIFY';
+const PROCESADOR_CLIENTE_SHOPIFY = new Map([
+  ['CLIENTE MOSTRADOR SHOPIFY', 'STRIPE'],
+  ['MOSTRADOR ECOMMERCE CLIENTE', 'SHOPIFY PAYMENTS'],
+]);
+const _normNombreCliente = nombre => String(nombre || '').trim().replace(/\s+/g, ' ').toUpperCase();
+const _esClienteShopify = nombre => PROCESADOR_CLIENTE_SHOPIFY.has(_normNombreCliente(nombre));
+// Orden de los renglones / apartados en la póliza y en Desglose Consolidado.
+const PROCESADORES_SHOPIFY = ['STRIPE', 'SHOPIFY PAYMENTS'];
 const DIAS_ATRAS_TICKETS_SHOPIFY = 3; // ventas de medianoche / cobradas un día después
 const _cacheTicketsShopify = new Map(); // día → { en, tickets: Map(ticket → cliente de Kore) }
 
@@ -967,7 +977,7 @@ async function _ticketsClientesShopify(dia) {
       if (!_esClienteShopify(cta?.nombrePersona)) continue;
       const serie = cta.serieExterna || cta.serie;
       const folio = cta.folioExterno || cta.folio;
-      if (serie && folio) tickets.set(`${serie}-${folio}`, String(cta.nombrePersona).trim());
+      if (serie && folio) tickets.set(`${serie}-${folio}`, _normNombreCliente(cta.nombrePersona));
     }
   }
   _cacheTicketsShopify.set(dia, { en: Date.now(), tickets });
@@ -999,19 +1009,23 @@ async function construirVentasShopifyInfo(movimientos, fechaFinal, obtenerTicket
   const porCentro = new Map();
   for (const m of tarjeta) {
     const ticket = `${m.serieVentaTicket}-${m.folioVentaTicket}`;
-    if (!tickets.has(ticket)) continue;
+    const cliente = _normNombreCliente(tickets.get(ticket));
+    const procesador = PROCESADOR_CLIENTE_SHOPIFY.get(cliente);
+    if (!procesador) continue;
     ids.add(m.id);
     const cc = m.centroCostoObj;
-    if (!porCentro.has(cc.id)) porCentro.set(cc.id, { gross: 0, centroCostoObj: cc, detalle: [] });
-    const p = porCentro.get(cc.id);
+    // Un renglón por almacén Y por cliente (2026-11-06).
+    const clave = `${cc.id}|${procesador}`;
+    if (!porCentro.has(clave)) porCentro.set(clave, { gross: 0, centroCostoObj: cc, procesador, cliente, detalle: [] });
+    const p = porCentro.get(clave);
     p.gross = Math.round((p.gross + Number(m.debe)) * 100) / 100;
-    p.detalle.push({ fila: m, ticket, cliente: tickets.get(ticket) || '', monto: Number(m.debe) });
+    p.detalle.push({ fila: m, ticket, cliente, monto: Number(m.debe) });
   }
   return { ids, porCentro };
 }
 
-function _lineaVentasShopify({ gross, centroCostoObj }, cuentaDepositosReal) {
-  return { cuenta: cuentaDepositosReal, serie: 'SHOPIFY', concepto: CONCEPTO_VENTAS_SHOPIFY, centroCosto: centroCostoObj.clave,
+function _lineaVentasShopify({ gross, centroCostoObj, procesador, cliente }, cuentaDepositosReal) {
+  return { cuenta: cuentaDepositosReal, serie: procesador, concepto: cliente, centroCosto: centroCostoObj.clave,
     debe: gross, haber: 0, cfdiUuid: null, _subcodigo: 0, _categoria: null };
 }
 
@@ -2469,7 +2483,7 @@ const NOTA_AJUSTE_SIN_CFDI = {
 // sucursal → cobros sin factura → Otros Ingresos. Cada renglón de cobro lleva
 // su grupo en `_ordenCobro`; `_ordenarCobrosIngreso` los ordena al final.
 const ORDEN_COBRO = {
-  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NO_IDENTIFICADO: 4.5, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, VENTAS_SHOPIFY: 6.7, SF: 7,
+  PUNTOS: 1, EFECTIVO: 2, TARJETA: 3, TRANSFERENCIA: 4, NO_IDENTIFICADO: 4.5, NETPAY: 5, COMISION_NETPAY: 6, NETPAY_AMEX: 6.5, VENTAS_SHOPIFY: 6.7, SHOPIFY_PAYMENTS: 6.8, SF: 7,
   COBRO_OTRA_SUCURSAL: 8, COBRO_SIN_FACTURA: 9, OTRO: 9.5, OTROS_INGRESOS: 10,
 };
 // Cobranza: cobro de un mes anterior al complemento (ver cobranza-poliza-generator.service.js).
@@ -2992,10 +3006,12 @@ function consolidarCargos(movs, subcodigoTransferencia, detectarAnticipo = false
       }
     }
   }
-  // VENTAS SHOPIFY (2026-11-05): un renglón por almacén, sin comisión.
+  // VENTAS SHOPIFY (2026-11-05): sin comisión. 2026-11-06: un renglón por
+  // almacén y cliente — STRIPE primero, luego SHOPIFY PAYMENTS.
   if (netpayInfo?.shopifyPorCentro?.size && cuentaDepositosReal) {
     for (const infoCentro of netpayInfo.shopifyPorCentro.values()) {
-      if (infoCentro.gross > 0) lineasNetpay.push({ ..._lineaVentasShopify(infoCentro, cuentaDepositosReal), _ordenCobro: ORDEN_COBRO.VENTAS_SHOPIFY });
+      if (infoCentro.gross > 0) lineasNetpay.push({ ..._lineaVentasShopify(infoCentro, cuentaDepositosReal),
+        _ordenCobro: infoCentro.procesador === 'STRIPE' ? ORDEN_COBRO.VENTAS_SHOPIFY : ORDEN_COBRO.SHOPIFY_PAYMENTS });
     }
   }
 
@@ -4999,16 +5015,16 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     const centroCosto = infoCentro.centroCostoObj?.clave ?? '';
     for (const d of infoCentro.detalle ?? []) {
       desgloseConsolidado.push({
-        cuenta: null, centroCosto, tipo: 'Venta', transferencia: 'No', formaPago: CONCEPTO_VENTAS_SHOPIFY,
+        cuenta: null, centroCosto, tipo: 'Venta', transferencia: 'No', formaPago: infoCentro.procesador,
         cfdiSerie: d.fila.serie || '', ventaSerie: d.ticket,
         // El cliente de Kore (la factura Global dice PUBLICO EN GENERAL).
         cliente: d.cliente || nombresClientes.get((d.fila.cfdiUuid || '').toUpperCase()) || '',
-        monto: d.monto, nota: 'Tarjeta de cliente Shopify / ecommerce (sin comisión)',
+        monto: d.monto, nota: `Tarjeta de ${infoCentro.cliente} (sin comisión)`,
       });
     }
     desgloseConsolidado.push({
-      cuenta: null, centroCosto, tipo: 'Resumen', transferencia: 'No', formaPago: CONCEPTO_VENTAS_SHOPIFY, cfdiSerie: '', cliente: '',
-      monto: infoCentro.gross, nota: `${CONCEPTO_VENTAS_SHOPIFY}: ${infoCentro.detalle.length} venta(s) con tarjeta, fuera del total de Tarjeta y de NetPay`,
+      cuenta: null, centroCosto, tipo: 'Resumen', transferencia: 'No', formaPago: infoCentro.procesador, cfdiSerie: '', cliente: infoCentro.cliente,
+      monto: infoCentro.gross, nota: `${infoCentro.procesador}: ${infoCentro.detalle.length} venta(s) con tarjeta, fuera del total de Tarjeta y de NetPay`,
     });
   }
 
@@ -5106,9 +5122,9 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
     // cambia la forma de pago. Transferencia/Cheque agrupados (cuando
     // comparten referencia bancaria real) y cualquier forma de pago sin
     // mapear caen después, en el orden en que ya llegan.
-    // VENTAS SHOPIFY (2026-11-05) justo después de NETPAY, con su propio color.
-    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1, NETPAY: 2, [CONCEPTO_VENTAS_SHOPIFY]: 2.5 };
-    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6', NETPAY: 'FFE2D9F3', [CONCEPTO_VENTAS_SHOPIFY]: 'FFD9F2E3' };
+    // STRIPE y SHOPIFY PAYMENTS (2026-11-06, antes un solo VENTAS SHOPIFY) justo después de NETPAY, con su propio color.
+    const ORDEN_FORMA_PAGO_DESGLOSE = { EFECTIVO: 0, TARJETA: 1, NETPAY: 2, [PROCESADORES_SHOPIFY[0]]: 2.5, [PROCESADORES_SHOPIFY[1]]: 2.6 };
+    const FILL_HEADER_FORMA_PAGO = { EFECTIVO: 'FFD9E8FB', TARJETA: 'FFFCE4D6', NETPAY: 'FFE2D9F3', [PROCESADORES_SHOPIFY[0]]: 'FFE0E7FF', [PROCESADORES_SHOPIFY[1]]: 'FFD9F2E3' };
     desgloseConsolidado.sort((a, b) =>
       (ORDEN_FORMA_PAGO_DESGLOSE[a.formaPago] ?? 3) - (ORDEN_FORMA_PAGO_DESGLOSE[b.formaPago] ?? 3)
       || (a.cuenta - b.cuenta) || a.centroCosto.localeCompare(b.centroCosto),

@@ -9,7 +9,7 @@ const estadistica              = require('./reportes-por-facturar.estadistica');
 const fichas                   = require('./reportes-por-facturar.fichas');
 const fichasGuardadas          = require('./reportes-por-facturar.fichas-guardadas');
 const rbacStore                = require('../../../shared/services/rbac-store');
-const { ForbiddenError, NotFoundError } = require('../../../shared/errors/AppError');
+const { BadRequestError, ForbiddenError, NotFoundError } = require('../../../shared/errors/AppError');
 
 const router = express.Router();
 
@@ -80,17 +80,17 @@ const PERM_ANEXO = 'reportes:fichas-efectivo:anexo';
 const _puedeAnexo = req => rbacStore.hasPermission(req.user?.role, PERM_ANEXO, req.user?.extraPermissions);
 /**
  * Sucursales que puede consultar el usuario en Fichas de efectivo (2026-11-05):
- * null = todas (sin sucursales asignadas); si no, Set de ids. Aplica también al
- * administrador (2026-11-05, pedido del usuario): si tiene sucursales, solo ve esas.
+ * null = todas (casilla "Todas"); si no, Set de ids — vacío = NINGUNA (2026-11-06,
+ * pedido del usuario). Aplica también al administrador.
  */
 async function _sucursalesPermitidas(req) {
-  const ids = (req.user?.sucursalIds ?? []).map(Number).filter(Number.isInteger);
-  if (!ids.length) return null;
-  return new Set(ids);
+  if (req.user?.todasSucursales === true) return null;
+  return new Set((req.user?.sucursalIds ?? []).map(Number).filter(Number.isInteger));
 }
 /** 403 si la sucursal pedida no es de las suyas. */
 async function _exigirSucursal(req, centroCostoId) {
   const permitidas = await _sucursalesPermitidas(req);
+  if (permitidas && !permitidas.size) throw new ForbiddenError('No tienes sucursales asignadas; pide al administrador que te asigne');
   if (permitidas && !permitidas.has(Number(centroCostoId))) {
     throw new ForbiddenError('No tienes acceso a esa sucursal');
   }
@@ -144,6 +144,25 @@ router.get('/fichas/guardadas/:id', authenticate, permit(PERM_FICHAS), asyncHand
   const permitidas = await _sucursalesPermitidas(req);
   if (permitidas && !permitidas.has(Number(ficha.centroCostoId))) throw new NotFoundError('Ficha no encontrada');
   res.json(await _sinAnexoSiNoPuede(req, ficha));
+}));
+
+// Anexo › Actualizar (2026-11-06): ¿las ventas sin factura ya se facturaron? Solo quien ve el anexo.
+// POST /api/reportes-por-facturar/fichas/anexo/actualizar { rfc, centroCostoId, detalle } — ficha generada sin guardar
+router.post('/fichas/anexo/actualizar', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  if (!(await _puedeAnexo(req))) throw new ForbiddenError('No tienes acceso al anexo');
+  const { rfc, centroCostoId, detalle } = req.body ?? {};
+  await _exigirSucursal(req, centroCostoId);
+  if (!Array.isArray(detalle) || detalle.length > 20000) throw new BadRequestError('Detalle inválido');
+  res.json(await fichas.actualizarFacturasDetalle({ rfc, detalle }));
+}));
+
+// POST /api/reportes-por-facturar/fichas/guardadas/:id/actualizar-anexo { rfc } — ficha guardada (se guarda la factura nueva)
+router.post('/fichas/guardadas/:id/actualizar-anexo', authenticate, permit(PERM_FICHAS), asyncHandler(async (req, res) => {
+  if (!(await _puedeAnexo(req))) throw new ForbiddenError('No tienes acceso al anexo');
+  const ficha = await fichasGuardadas.obtener({ rfc: req.body?.rfc, id: req.params.id });
+  const permitidas = await _sucursalesPermitidas(req);
+  if (permitidas && !permitidas.has(Number(ficha.centroCostoId))) throw new NotFoundError('Ficha no encontrada');
+  res.json(await fichasGuardadas.actualizarAnexo({ rfc: req.body?.rfc, id: req.params.id }));
 }));
 
 // POST /api/reportes-por-facturar/fichas/guardadas/:id/cancelar { rfc, motivo } — solo administrador

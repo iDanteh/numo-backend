@@ -65,7 +65,7 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
     { serieVenta: 'C0', folioVenta: '2', serieFactura: null, cobros: [cobro('CBT', 170.39, [EF(170.39)])] },  // por facturar
   ]);
   erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([
-    salida('RETD', 20.78), salida('RPF', 0.55), salida('ST', 50000), salida('CIC', 100000),
+    salida('RETD', 20.78), salida('RETEF', 100), salida('RPF', 0.55), salida('ST', 50000), salida('CIC', 100000),
   ]);
 
   const r = await fichas.calcularFicha({ rfc: 'CCO011113663', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
@@ -75,21 +75,23 @@ test('calcularFicha: efectivo de la caja del día por concepto, menos devolucion
   expect(r.cortes[0]).toMatchObject({
     serie: 'C0', dia: '2026-10-31', sucursal: 'CONSTRUCASA',
     efectivoFacturado: 1050, efectivoPorFacturar: 170.39, miscelaneaEfectivo: 40, cobranzaEfectivo: 300, abonosEfectivo: 150,
-    devoluciones: 20.78, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
-    totalEntregar: 1689.06,
+    devoluciones: 20.78, retiroEfectivo: 100, faltante: 0.55, depositoEfectivo: 400, saldoFavor: 70,
+    totalEntregar: 1589.06,
   });
-  expect(r.totales.totalEntregar).toBe(1689.06);
+  expect(r.totales.totalEntregar).toBe(1589.06);
   expect(r.sucursal).toBe('CONSTRUCASA');
   expect(r.advertencias).toBeNull();
   expect(r.incompleta).toBe(false);
   // Rastro: el detalle suma lo mismo que el total y cada cobro trae remisión / factura / global.
-  expect(Math.round(r.detalle.reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1689.06);
+  expect(Math.round(r.detalle.reduce((s, d) => s + d.importe, 0) * 100) / 100).toBe(1589.06);
   expect(r.detalle.find(d => d.concepto === 'miscelaneaEfectivo')).toMatchObject({ cobro: 'MIS-1', importe: 40 });
   const porFacturar = r.detalle.find(d => d.concepto === 'efectivoPorFacturar');
   expect(porFacturar).toMatchObject({ remision: 'C0-2', factura: null, cliente: 'JUAN PEREZ', importe: 170.39 });
   const facturado = r.detalle.find(d => d.concepto === 'efectivoFacturado');
   expect(facturado).toMatchObject({ remision: 'C0-1', factura: 'C0-1', facturaUuid: 'G1', esGlobal: true });
   expect(r.detalle.find(d => d.concepto === 'devoluciones')).toMatchObject({ importe: -20.78 });
+  // RETIRO DE EFECTIVO (RETEF, 2026-11-06) resta; ST y CIC no.
+  expect(r.detalle.find(d => d.concepto === 'retiroEfectivo')).toMatchObject({ importe: -100 });
   expect(r.detalle.some(d => d.concepto === 'depositoEfectivo' || d.concepto === 'saldoFavor')).toBe(false);
 });
 
@@ -127,4 +129,46 @@ test('listarBancos: los de Bancos (movimientos + configuración) con su cuenta',
   expect(await fichas.listarBancos()).toEqual([
     { banco: 'Azteca', numeroCuenta: null }, { banco: 'Banorte', numeroCuenta: '0123' }, { banco: 'BBVA', numeroCuenta: null },
   ]);
+});
+
+test('Anexo › Actualizar: pone la factura que ya tiene la remisión (sin caché), sin tocar importes ni conceptos', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'C0', folioVenta: '2', serieFactura: 'C0', folioFactura: '900' },
+    { serieVenta: 'C0', folioVenta: '3' }, // sigue sin factura
+  ]);
+  CFDI.find.mockReturnValue(lean([{ uuid: 'U9', serie: 'C0', folio: '900', receptor: { rfc: 'XAXX010101000' }, source: 'ERP' }]));
+  const detalle = [
+    { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-2', factura: null, importe: 100 },
+    { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-3', factura: null, importe: 50 },
+    { dia: '2026-10-31', serie: 'C0', concepto: 'efectivoFacturado', remision: 'C0-1', factura: 'C0-800', importe: 10 },
+  ];
+  const r = await fichas.actualizarFacturasDetalle({ rfc: 'R', detalle });
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro).toHaveBeenCalledTimes(1);
+  expect(erp.obtenerDesglosesCobroAlmacenPorCentro.mock.calls[0][0]).toMatchObject({ centro: 'C0', sinCache: true });
+  expect(r.nuevas).toBe(1);
+  expect(r.siguenSinFactura).toBe(1);
+  expect(detalle[0]).toMatchObject({ factura: 'C0-900', facturadaDespues: true, esGlobal: true, concepto: 'efectivoPorFacturar', importe: 100 });
+  expect(detalle[1].factura).toBeNull();
+});
+
+test('Anexo › Actualizar: si Kore falla, avisa y no cambia nada', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockRejectedValue(new Error('429'));
+  const detalle = [{ dia: '2026-10-31', serie: 'C0', concepto: 'efectivoPorFacturar', remision: 'C0-2', factura: null, importe: 100 }];
+  const r = await fichas.actualizarFacturasDetalle({ rfc: 'R', detalle });
+  expect(r.nuevas).toBe(0);
+  expect(r.advertencias[0]).toMatch(/C0 del 2026-10-31/);
+  expect(detalle[0].factura).toBeNull();
+});
+
+test('calcularFicha: cobros y abonos de remisiones de OTRA sucursal van en su propio renglón (2026-11-06)', async () => {
+  erp.obtenerDesglosesCobroAlmacenPorCentro.mockResolvedValue([
+    { serieVenta: 'A0', folioVenta: '5411', serieFactura: null, cobros: [cobro('CPF', 6737.09, [EF(6737.09)])] },
+    { serieVenta: 'A0', folioVenta: '4991', serieFactura: 'A0', folioFactura: '14603', cobros: [cobro('ABO', 2725.73, [EF(2725.73)])] },
+    { serieVenta: 'C0', folioVenta: '9', serieFactura: 'C0', folioFactura: '9', cobros: [cobro('CBT', 100, [EF(100)])] },
+  ]);
+  erp.obtenerDesglosesSalidasCajaPorAlmacen.mockResolvedValue([]);
+  CFDI.find.mockReturnValue(lean([]));
+  const r = await fichas.calcularFicha({ rfc: 'X', centroCostoId: 3, fechaInicio: '2026-10-31', fechaFin: '2026-10-31' });
+  expect(r.totales).toMatchObject({ cobroOtraSucursal: 9462.82, efectivoPorFacturar: 0, abonosEfectivo: 0, efectivoFacturado: 100, totalEntregar: 9562.82 });
+  expect(r.detalle.filter(d => d.concepto === 'cobroOtraSucursal').map(d => d.remision)).toEqual(['A0-5411', 'A0-4991']);
 });

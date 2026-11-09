@@ -482,6 +482,14 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS depositos_efectivo_no_conciliados JSONB
   `).catch(e => console.warn('[syncModels] ADD COLUMN depositos_efectivo_no_conciliados:', e.message));
 
+  // "↻ Actualizar" (2026-11-09) — ver Poliza.actualizadaPor.
+  await Poliza.sequelize.query(`
+    ALTER TABLE polizas
+      ADD COLUMN IF NOT EXISTS actualizada_por VARCHAR(150),
+      ADD COLUMN IF NOT EXISTS actualizada_at  TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS actualizada_de  INTEGER
+  `).catch(e => console.warn('[syncModels] ADD COLUMN actualizada_*:', e.message));
+
   // Folios CONTPAQi de las NC de CEDIS (201–299) — ver Poliza.contpaqFoliosNc.
   await Poliza.sequelize.query(`
     ALTER TABLE polizas
@@ -536,6 +544,11 @@ async function syncModels() {
     ALTER TABLE users
       ADD COLUMN IF NOT EXISTS sucursal_ids INTEGER[] NOT NULL DEFAULT '{}'
   `).catch(e => console.warn('[syncModels] ADD COLUMN sucursal_ids (users):', e.message));
+  // Casilla "Todas" (2026-11-06): sin sucursales y sin esta bandera = no ve ninguna.
+  await User.sequelize.query(`
+    ALTER TABLE users
+      ADD COLUMN IF NOT EXISTS todas_sucursales BOOLEAN NOT NULL DEFAULT false
+  `).catch(e => console.warn('[syncModels] ADD COLUMN todas_sucursales (users):', e.message));
 
   // Configuraciones Globales (ver ConfigSection/GlobalConfig/ConfigAuditLog) — tablas
   // nuevas, force:false para solo crearlas si no existen. Orden: ConfigSection primero

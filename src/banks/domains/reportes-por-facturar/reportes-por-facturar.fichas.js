@@ -13,13 +13,20 @@
  *   cobros con claveCentro = serie de la sucursal y fecha (día MX) = ese día
  *   (`/desgloses-cobro/almacen?centro=`), solo la parte en EFECTIVO:
  *     • Efectivo facturado:    cobro del ticket (CBT) de una venta ya facturada.
- *     • Efectivo por facturar: cobros (no abonos) de ventas SIN factura todavía.
+ *     • Efectivo consignación (clave efectivoPorFacturar; antes "por facturar",
+ *       2026-11-06): cobros (no abonos) de ventas SIN factura todavía.
  *     • Cobranza en efectivo:  otros cobros (CFC, CPF, APS, MIS…) de ventas ya facturadas.
  *     • Abonos en efectivo:    abonos (ABO).
  *     • Venta miscelánea:      cobros MIS ("TIENDITA TYC"), facturados o no.
+ *     • Cobros de otras sucursales (2026-11-06, pedido del usuario): cualquier
+ *       cobro o abono en efectivo de una remisión de OTRA sucursal hecho en esta
+ *       caja (Puerto 31-oct: remisiones y abonos de CEDIS $10,785.42). Va antes
+ *       que las demás clasificaciones; la póliza los lleva a la otra sucursal o a Cobranza.
  *     • APA = aplicación de saldo a favor: no es dinero nuevo → fuera.
  *   menos salidas de la caja ese día (`/desgloses-salidas/caja`):
- *     • Devoluciones en efectivo (RETD) y faltante en el cierre (RPF).
+ *     • Devoluciones en efectivo (RETD), retiro de efectivo (RETEF, 2026-11-06:
+ *       Reforma 31-oct $2,601.03 — la póliza ya lo resta) y faltante en el cierre (RPF).
+ *       "Salida por Transferencia" (ST) y "CIERRE CAJA" (CIC) NO restan.
  *   Informativos (no suman): depósito en efectivo (no pasa por la caja) y
  *   saldo a favor aplicado.
  *
@@ -42,8 +49,9 @@ const FECHA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RFC_PUBLICO_GENERAL = 'XAXX010101000';
 // Suman al total a entregar (las salidas restan).
 // miscelaneaEfectivo (2026-11-05): ventas MISCELÁNEA (MIS, 'TIENDITA TYC') en su propio renglón — antes caían en por facturar.
-const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'miscelaneaEfectivo', 'cobranzaEfectivo', 'abonosEfectivo'];
-const SALIDAS = ['devoluciones', 'faltante'];
+// Orden (2026-11-06, pedido del usuario): facturado, consignación, cobranza, abonos, venta miscelánea; luego lo demás.
+const ENTRADAS = ['efectivoFacturado', 'efectivoPorFacturar', 'cobranzaEfectivo', 'abonosEfectivo', 'miscelaneaEfectivo', 'cobroOtraSucursal'];
+const SALIDAS = ['devoluciones', 'retiroEfectivo', 'faltante'];
 const INFORMATIVOS = ['depositoEfectivo', 'saldoFavor'];
 const CONCEPTOS = [...ENTRADAS, ...SALIDAS, ...INFORMATIVOS];
 
@@ -125,7 +133,8 @@ async function listarGlobales({ rfc, centroCostoId, fechaInicio, fechaFin }) {
  * cada cobro / salida que lo forma (2026-11-05: el usuario quiere el rastro
  * venta → factura / global → ficha).
  */
-async function _corteDeCaja({ rfc, serie, dia }) {
+async function _corteDeCaja({ rfc, serie, dia, seriesSucursal = [serie] }) {
+  const propias = new Set(seriesSucursal.map(_serie));
   const montos = Object.fromEntries(CONCEPTOS.map(k => [k, 0]));
   const detalle = [];
   const fechaDesde = new Date(`${dia}T00:00:00.000-06:00`).toISOString();
@@ -138,6 +147,8 @@ async function _corteDeCaja({ rfc, serie, dia }) {
   for (const c of cuentas ?? []) {
     const facturada = !!c.serieFactura;
     const remision = c.serieVenta && c.folioVenta ? `${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}` : null;
+    // Remisión de otra sucursal cobrada en esta caja (2026-11-06).
+    const deOtraSucursal = !!c.serieVenta && !propias.has(_serie(c.serieVenta));
     const factura = facturada ? `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}` : null;
     for (const k of c.cobros ?? []) {
       if (_serie(k.claveCentro) !== serie || !k.fecha || _diaMx(k.fecha) !== dia) continue;
@@ -157,6 +168,7 @@ async function _corteDeCaja({ rfc, serie, dia }) {
         const monto = (fps.length === 1 && montoReal != null) ? montoReal : (Number(fp.monto) || 0) * factor;
         let concepto;
         if (forma !== 'efectivo') concepto = forma;
+        else if (deOtraSucursal) concepto = 'cobroOtraSucursal';
         else if (origen === 'MIS') concepto = 'miscelaneaEfectivo';
         else if (origen === 'ABO') concepto = 'abonosEfectivo';
         else if (!facturada) concepto = 'efectivoPorFacturar';
@@ -175,7 +187,9 @@ async function _corteDeCaja({ rfc, serie, dia }) {
   for (const s of salidas ?? []) {
     if (!s.fecha || _diaMx(s.fecha) !== dia) continue;
     const tipo = _serie(s.tipoMovimiento?.abreviatura);
-    const concepto = tipo === 'RETD' ? 'devoluciones' : tipo === 'RPF' ? 'faltante' : null;
+    const concepto = tipo === 'RETD' ? 'devoluciones'
+      : (tipo === 'RETEF' || /^RETIRO DE EFECTIVO$/i.test(String(s.tipoMovimiento?.nombre ?? '').trim())) ? 'retiroEfectivo'
+      : tipo === 'RPF' ? 'faltante' : null;
     if (!concepto) continue;
     const monto = Number(s.montoRetirado) || 0;
     montos[concepto] += monto;
@@ -264,7 +278,7 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
   for (const dia of dias) {
     for (const serie of series) {
       try {
-        const { montos, detalle: det } = await _corteDeCaja({ rfc, serie, dia });
+        const { montos, detalle: det } = await _corteDeCaja({ rfc, serie, dia, seriesSucursal: series });
         if (!CONCEPTOS.some(k => montos[k])) continue; // día sin movimiento de efectivo
         filas.push({ serie, dia, sucursal, ...montos, totalEntregar: _total(montos) });
         detalle = detalle.concat(det);
@@ -298,6 +312,53 @@ async function calcularFicha({ rfc, centroCostoId, fechaInicio, fechaFin }) {
 }
 
 /**
+ * Anexo › Actualizar (2026-11-06, pedido del usuario): ¿las ventas que estaban
+ * sin factura (consignación, miscelánea…) ya se facturaron? Vuelve a pedir a
+ * Kore, SIN caché, el corte de las cajas (serie + día) que tienen renglones
+ * sin factura y les pone la factura que tengan ahora (`facturadaDespues`).
+ * Los importes y conceptos NO cambian: la ficha ya se entregó así. Muta y
+ * regresa `detalle`. Las cajas se consultan una por una (429 de Kore).
+ */
+async function actualizarFacturasDetalle({ rfc, detalle }) {
+  if (!rfc) throw new BadRequestError('RFC requerido');
+  const lista = Array.isArray(detalle) ? detalle : [];
+  const sinFactura = lista.filter(d => d?.remision && !d.factura && ENTRADAS.includes(d.concepto));
+  const cajas = [...new Set(sinFactura.map(d => `${_serie(d.serie)}|${d.dia}`))]
+    .filter(c => FECHA_RE.test(c.split('|')[1] ?? ''));
+  const facturaDe = new Map(); // remisión → factura actual
+  const advertencias = [];
+  for (const caja of cajas) {
+    const [serie, dia] = caja.split('|');
+    try {
+      const cuentas = await obtenerDesglosesCobroAlmacenPorCentro({
+        rfc, centro: serie, sinCache: true,
+        fechaDesde: new Date(`${dia}T00:00:00.000-06:00`).toISOString(),
+        fechaHasta: new Date(`${dia}T23:59:59.999-06:00`).toISOString(),
+      });
+      for (const c of cuentas ?? []) {
+        if (!c.serieFactura || !c.serieVenta || !c.folioVenta) continue;
+        facturaDe.set(`${_serie(c.serieVenta)}-${String(c.folioVenta).trim()}`, `${_serie(c.serieFactura)}-${String(c.folioFactura ?? '').trim()}`);
+      }
+    } catch (err) {
+      advertencias.push(`Kore no respondió la caja ${serie} del ${dia} (${err.message}); vuelve a intentarlo.`);
+    }
+  }
+  let nuevas = 0;
+  for (const d of sinFactura) {
+    const f = facturaDe.get(d.remision);
+    if (f) { d.factura = f; d.facturadaDespues = true; nuevas++; }
+  }
+  if (nuevas) await _completarDetalle({ rfc, detalle: lista });
+  return {
+    detalle: lista,
+    nuevas,
+    siguenSinFactura: sinFactura.filter(d => !d.factura).length,
+    actualizadoEn: new Date(),
+    advertencias: advertencias.length ? advertencias : null,
+  };
+}
+
+/**
  * Bancos dados de alta en Bancos (los que tienen movimientos o configuración),
  * con su número de cuenta para la ficha.
  */
@@ -312,4 +373,4 @@ async function listarBancos() {
   return todos.map(banco => ({ banco, numeroCuenta: configs.get(banco)?.numeroCuenta ?? null }));
 }
 
-module.exports = { listarGlobales, calcularFicha, listarBancos, _corteDeCaja, ENTRADAS, SALIDAS, CONCEPTOS };
+module.exports = { listarGlobales, calcularFicha, listarBancos, actualizarFacturasDetalle, _corteDeCaja, ENTRADAS, SALIDAS, CONCEPTOS };

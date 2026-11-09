@@ -147,6 +147,43 @@ async function guardarCongelamientoMeses(meses, user) {
 }
 
 /**
+ * CONSULTA_CODIGO_MAX_MES (2026-11-09, pedido explícito del usuario) — blindaje adicional sobre
+ * la consulta pública de puntos: tope de cuántos ciclos de código ("solicitar código" +
+ * "confirmar código" exitoso) puede completar UNA tarjeta por mes calendario (zona
+ * America/Mexico_City). Las vistas de sesión (3 extra sin código, ver loyalty-recovery.service.js)
+ * NO cuentan aparte — son parte del mismo ciclo ya contado. Mismo mecanismo que
+ * CONGELAMIENTO_MESES (`GlobalConfig` sección `lealtad`, `tipo:'numero'`), idéntico criterio
+ * deshabilitado = sin configurar o en 0 (D11: nunca default inventado).
+ */
+function _validarConsultaCodigoMaxMes(valor) {
+  if (valor === null || valor === undefined || valor === '') return 0;
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequestError('El máximo de consultas con código por mes debe ser un número entero positivo (o 0/vacío para deshabilitar).');
+  }
+  return n;
+}
+
+/** `null` cuando no está configurado o está en 0 (sin límite) — nunca se asume un valor. */
+async function obtenerConsultaCodigoMaxMes() {
+  const valor = await globalConfigService.getValue(SECTION, 'CONSULTA_CODIGO_MAX_MES').catch(() => null);
+  if (valor === null) return null;
+  const n = Number(valor);
+  return (Number.isInteger(n) && n > 0) ? n : null;
+}
+
+/** Guarda el máximo de consultas con código por mes. `max` null/undefined/0 deshabilita el límite
+ *  (se persiste '0', nunca se borra la fila — mismo criterio que guardarCongelamientoMeses). */
+async function guardarConsultaCodigoMaxMes(max, user) {
+  const { usuarioId, usuarioNombre } = _userLabel(user);
+  const n = _validarConsultaCodigoMaxMes(max);
+  await globalConfigService.setValue(SECTION, 'CONSULTA_CODIGO_MAX_MES', String(n), {
+    tipo: 'numero', usuarioId, usuarioNombre,
+  });
+  return n > 0 ? n : null;
+}
+
+/**
  * ESPECIALIDADES (2026-10-23) — catálogo de referencia para altas futuras de clientes, vive en
  * `GlobalConfig` sección `lealtad` (mismo mecanismo que los %), `tipo:'lista'` (JSON array de
  * strings). Se gestiona DESDE acá (loyalty:config/loyalty:read), nunca desde el `config:manage`
@@ -711,6 +748,8 @@ module.exports = {
   guardarPorcentajes,
   obtenerCongelamientoMeses,
   guardarCongelamientoMeses,
+  obtenerConsultaCodigoMaxMes,
+  guardarConsultaCodigoMaxMes,
   obtenerEspecialidades,
   guardarEspecialidades,
   obtenerFotoFolderId,

@@ -25,7 +25,7 @@ const LoyaltySecurityEvent = sequelize.define('LoyaltySecurityEvent', {
     allowNull: true,
   },
   tipo: {
-    type:      DataTypes.STRING(30), // 'solicitud_codigo' | 'confirmacion_codigo'
+    type:      DataTypes.STRING(30), // 'solicitud_codigo' | 'confirmacion_codigo' | 'ver_consulta' | 'guardar_email'
     allowNull: false,
   },
   resultado: {

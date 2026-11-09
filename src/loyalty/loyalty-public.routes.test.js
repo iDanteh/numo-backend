@@ -205,3 +205,113 @@ describe('consulta de puntos vía código (2026-10-26, reemplaza al NIP en /cons
     expect(recoveryService.confirmarCodigoConsulta).toHaveBeenCalledTimes(10);
   });
 });
+
+describe('sesión de consulta post-código (2026-11-09) — "ver de nuevo" + email de contacto', () => {
+  test('POST /consulta/ver llega al service sin Authorization y devuelve el payload con usosRestantes', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.verConsultaSesion.mockResolvedValue({
+      nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1234.5, movimientos: [], usosRestantes: 2,
+    });
+
+    const res = await request(app).post('/api/loyalty/public/consulta/ver')
+      .send({ telefono: '5512345678', token: 'token-real' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1234.5, movimientos: [], usosRestantes: 2 });
+    expect(recoveryService.verConsultaSesion).toHaveBeenCalledWith('5512345678', 'token-real', expect.objectContaining({ ip: expect.anything() }));
+  });
+
+  test('GET /consulta/ver no existe (solo POST, D8: el token nunca en una URL)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/consulta/ver').query({ telefono: '5512345678', token: 'token-real' });
+    expect(res.status).toBe(404);
+  });
+
+  test('falla de negocio (422 LOYALTY_RECOVERY_FAILED) se propaga con el mismo código', async () => {
+    const { app, recoveryService } = freshApp();
+    const err = Object.assign(new Error('El código no es válido o expiró.'), {
+      statusCode: 422, code: 'LOYALTY_RECOVERY_FAILED',
+    });
+    recoveryService.verConsultaSesion.mockRejectedValue(err);
+
+    const res = await request(app).post('/api/loyalty/public/consulta/ver')
+      .send({ telefono: '5512345678', token: 'token-malo' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('LOYALTY_RECOVERY_FAILED');
+  });
+
+  test('el 11vo request a /consulta/ver en 15min → 429, antes de llamar al service', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.verConsultaSesion.mockResolvedValue({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1, movimientos: [], usosRestantes: 2 });
+
+    for (let i = 0; i < 10; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await request(app).post('/api/loyalty/public/consulta/ver').send({ telefono: '5512345678', token: 'token-real' });
+      expect(r.status).toBe(200);
+    }
+    const onceavo = await request(app).post('/api/loyalty/public/consulta/ver').send({ telefono: '5512345678', token: 'token-real' });
+    expect(onceavo.status).toBe(429);
+    expect(recoveryService.verConsultaSesion).toHaveBeenCalledTimes(10);
+  });
+
+  test('rate limit de /consulta/ver es independiente del de /consulta/confirmar', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.verConsultaSesion.mockResolvedValue({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1, movimientos: [], usosRestantes: 2 });
+    recoveryService.confirmarCodigoConsulta.mockResolvedValue({ nombre: 'Ana', nivel: 'Plata', saldoPuntos: 1 });
+
+    for (let i = 0; i < 10; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await request(app).post('/api/loyalty/public/consulta/ver').send({ telefono: '5512345678', token: 'token-real' });
+    }
+    const verBloqueado = await request(app).post('/api/loyalty/public/consulta/ver').send({ telefono: '5512345678', token: 'token-real' });
+    expect(verBloqueado.status).toBe(429);
+
+    const confirmar = await request(app).post('/api/loyalty/public/consulta/confirmar').send({ telefono: '5512345678', codigo: '654321' });
+    expect(confirmar.status).toBe(200);
+  });
+
+  test('POST /consulta/email llega al service sin Authorization y devuelve el mensaje', async () => {
+    const { app, recoveryService } = freshApp();
+    recoveryService.guardarEmailConsulta.mockResolvedValue({ mensaje: 'Listo, guardamos tu correo.' });
+
+    const res = await request(app).post('/api/loyalty/public/consulta/email')
+      .send({ telefono: '5512345678', token: 'token-real', email: 'cliente@correo.com' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ mensaje: 'Listo, guardamos tu correo.' });
+    expect(recoveryService.guardarEmailConsulta).toHaveBeenCalledWith(
+      '5512345678', 'token-real', 'cliente@correo.com', expect.objectContaining({ ip: expect.anything() }),
+    );
+  });
+
+  test('GET /consulta/email no existe (solo POST)', async () => {
+    const { app } = freshApp();
+    const res = await request(app).get('/api/loyalty/public/consulta/email').query({ telefono: '5512345678' });
+    expect(res.status).toBe(404);
+  });
+
+  test('falla de negocio (422 LOYALTY_EMAIL_INVALIDO, distinto de LOYALTY_RECOVERY_FAILED) se propaga con su propio código', async () => {
+    const { app, recoveryService } = freshApp();
+    const err = Object.assign(new Error('Ingresá un correo electrónico válido.'), {
+      statusCode: 422, code: 'LOYALTY_EMAIL_INVALIDO',
+    });
+    recoveryService.guardarEmailConsulta.mockRejectedValue(err);
+
+    const res = await request(app).post('/api/loyalty/public/consulta/email')
+      .send({ telefono: '5512345678', token: 'token-real', email: 'no-es-un-correo' });
+
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe('LOYALTY_EMAIL_INVALIDO');
+  });
+
+  test('crearLimitersSesion() exporta una factory (MemoryStore fresca por llamada, no singleton)', () => {
+    const { loyaltyPublicRoutes } = freshApp();
+    const { crearLimitersSesion } = loyaltyPublicRoutes;
+    expect(typeof crearLimitersSesion).toBe('function');
+    const par1 = crearLimitersSesion();
+    const par2 = crearLimitersSesion();
+    expect(par1.ver).not.toBe(par2.ver);
+    expect(par1.email).not.toBe(par2.email);
+  });
+});

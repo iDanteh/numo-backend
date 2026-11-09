@@ -6003,6 +6003,107 @@ async function generarYGuardar(params) {
   }
 }
 
+// ── Actualizar (regenerar) una póliza de Ingreso ya generada ────────────────
+// Pedido del usuario 2026-11-09 (reporte "NO REGISTRADOS COMPAQ"): CEDIS
+// factura con la fecha de la venta pero timbra 1–3 días después, así que la
+// factura llega del SAT cuando la póliza de ese día ya se generó y queda
+// fuera. "Actualizar" cancela la póliza (solo borrador) y la genera de nuevo
+// con la MISMA sucursal y día, ya con todo lo que hay hoy en NUMO. Si la
+// generación nueva falla, la anterior se restaura a borrador.
+// La póliza no guarda centroCostoId ni rango: se leen del concepto que arma
+// `_construirConceptoIngresoBase` ("Ingresos por Ventas Suc. X Día: dd/mm/aaaa[ al dd/mm/aaaa]").
+const RE_CONCEPTO_INGRESO = /^Ingresos por Ventas Suc\. (.+?) Día: (\d{2})\/(\d{2})\/(\d{4})(?: al (\d{2})\/(\d{2})\/(\d{4}))?\s*$/;
+
+async function _parametrosRegeneracionIngreso(poliza) {
+  const m = RE_CONCEPTO_INGRESO.exec(String(poliza.concepto ?? '').trim());
+  if (!m) {
+    throw new BadRequestError('No se puede actualizar: el concepto de la póliza no dice la sucursal y el día (¿se editó a mano?). Genérala de nuevo desde "Generar".');
+  }
+  const sucursal    = m[1].trim();
+  const fechaInicio = `${m[4]}-${m[3]}-${m[2]}`;
+  const fechaFin    = m[5] ? `${m[7]}-${m[6]}-${m[5]}` : fechaInicio;
+  const ccBySerieMap = await centrosSvc.resolveBySerieMap();
+  const norm = (x) => String(x ?? '').trim().toLowerCase();
+  const centro = Object.values(ccBySerieMap).find(c => norm(c.sucursal) === norm(sucursal));
+  if (!centro) throw new BadRequestError(`No se encontró la sucursal "${sucursal}" del concepto de la póliza.`);
+  return { centroCostoId: centro.id, sucursal: centro.sucursal, fechaInicio, fechaFin };
+}
+
+async function _uuidsDePoliza(polizaId) {
+  const rows = await PolizaMovimiento.findAll({
+    where: { polizaId, cfdiUuid: { [Op.ne]: null } }, attributes: ['cfdiUuid'], raw: true,
+  });
+  return new Set(rows.map(r => r.cfdiUuid));
+}
+
+async function regenerarPolizaIngreso(polizaId, user) {
+  const polizaService = require('../polizas/poliza.service');
+  const poliza = await Poliza.findByPk(polizaId);
+  if (!poliza) throw new BadRequestError('Póliza no encontrada');
+  if (poliza.tipo !== 'I') throw new BadRequestError('Solo se pueden actualizar pólizas de Ingreso');
+  if (poliza.estado === 'cancelada') throw new BadRequestError('La póliza está cancelada');
+  if (poliza.estado !== 'borrador') {
+    throw new BadRequestError('La póliza está contabilizada: revírtela a borrador antes de actualizarla');
+  }
+  const params = await _parametrosRegeneracionIngreso(poliza);
+  const clave = _claveGeneracion({
+    rfc: poliza.rfc, tipoCfdi: 'I', ejercicio: poliza.ejercicio, periodo: poliza.periodo,
+    centroCostoId: params.centroCostoId, fechaInicio: params.fechaInicio, fechaFin: params.fechaFin,
+  });
+  if (_generacionesEnCurso.has(clave)) {
+    throw new ConflictError('Ya se está generando esta póliza (misma sucursal y fecha) — espera a que termine antes de intentar de nuevo.');
+  }
+
+  const uuidsAntes = await _uuidsDePoliza(poliza.id);
+  const anterior = {
+    id: poliza.id, numero: poliza.numero,
+    contpaqFolioContado: poliza.contpaqFolioContado ?? null,
+    contpaqFolioCredito: poliza.contpaqFolioCredito ?? null,
+  };
+
+  await polizaService.cancel(poliza.id, user, 'Actualizada: se generó de nuevo con las facturas que llegaron después');
+
+  let res;
+  try {
+    res = await generarYGuardar({
+      rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo,
+      tipoCfdi: 'I', tipoPropuesta: 'I',
+      centroCostoId: params.centroCostoId, fechaInicio: params.fechaInicio, fechaFin: params.fechaFin,
+      user,
+    });
+  } catch (err) {
+    // Restaurar la anterior tal cual estaba — el día no debe quedarse sin póliza.
+    await Poliza.update(
+      { estado: 'borrador', canceladoPor: null, canceladaAt: null, motivoCancelacion: null },
+      { where: { id: anterior.id } },
+    );
+    throw err;
+  }
+
+  const uuidsDespues = await _uuidsDePoliza(res.polizaId);
+  const etiquetas = async (uuids) => {
+    if (!uuids.length) return [];
+    const docs = await CFDI.find({ uuid: { $in: uuids }, source: 'SAT' }).select('uuid serie folio total').lean();
+    const porUuid = new Map(docs.map(d => [d.uuid, d]));
+    return uuids.map(u => {
+      const d = porUuid.get(u);
+      return { uuid: u, serieFolio: d ? [d.serie, d.folio].filter(Boolean).join('-') : null, total: d?.total ?? null };
+    });
+  };
+  const nueva = await Poliza.findByPk(res.polizaId, { attributes: ['id', 'numero'] });
+
+  return {
+    ...res,
+    numero: nueva?.numero ?? null,
+    anterior,
+    sucursal:    params.sucursal,
+    fechaInicio: params.fechaInicio,
+    fechaFin:    params.fechaFin,
+    facturasAgregadas: await etiquetas([...uuidsDespues].filter(u => !uuidsAntes.has(u))),
+    facturasQuitadas:  await etiquetas([...uuidsAntes].filter(u => !uuidsDespues.has(u))),
+  };
+}
+
 async function _generarYGuardarCore({ rfc, ejercicio, periodo, tipoPropuesta = 'D', tipoCfdi, centroCostoId, fechaInicio, fechaFin, formaPagoFiltro, user, _medidor = null }) {
   const _fase = (nombre) => _medidor?.marca(nombre);
   if (!rfc)       throw new BadRequestError('RFC requerido');
@@ -8047,7 +8148,7 @@ async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, 
 }
 
 module.exports = {
-  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal,
+  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,

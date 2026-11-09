@@ -22,6 +22,20 @@ router.get('/',
   }),
 );
 
+// GET /api/polizas/facturas-tardias?ids=1,2,3
+// Aviso "faltan CFDIs": por póliza de Ingreso, facturas/NC de su sucursal y día
+// que llegaron del SAT después de generarla y no están en ninguna póliza.
+// Response: { [polizaId]: { total, facturas: [{ uuid, serieFolio, tipo, total, llegoEn }] } }
+router.get('/facturas-tardias',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const generator = require('../cfdi-mapping/cfdi-poliza-generator.service');
+    const ids = String(req.query.ids || '').split(',').map(s => Number(s.trim())).filter(Number.isFinite);
+    res.json(await generator.facturasTardiasDePolizas(ids));
+  }),
+);
+
 // GET /api/polizas/reporte-descuadradas?rfc=&ejercicio=&periodo=&estado=&format=csv
 router.get('/reporte-descuadradas',
   authenticate,

@@ -251,6 +251,57 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     type:      DataTypes.DATE,
     allowNull: true,
   },
+  // ── Sesión corta post-código + email de contacto + contadores (2026-11-09, consulta pública) ──
+  // Tras confirmar el código OTP (ver loyalty-recovery.service.js#confirmarCodigoConsulta), se
+  // habilita un token de sesión que permite "ver de nuevo" el saldo unas pocas veces sin pedir un
+  // código nuevo — nunca el código OTP en sí (ese ya se consume al confirmar).
+  consultaSesionTokenHash: {
+    type:      DataTypes.STRING(100),
+    allowNull: true,
+    comment:   'Hash SHA-256 (hex) del token de sesión de consulta — alta entropía (32 bytes random), no bcrypt (ver nip.util.js). Null cuando no hay sesión vigente.',
+  },
+  consultaSesionUsosRestantes: {
+    type:      DataTypes.INTEGER,
+    allowNull: true,
+    comment:   'Vistas restantes sin pedir código nuevo (arranca en 3 al confirmar el código; la vista del propio código no cuenta contra este número). Null cuando no hay sesión vigente.',
+  },
+  consultaSesionExpiraEn: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Vencimiento de la sesión de consulta (15 min desde que se confirmó el código).',
+  },
+  emailContacto: {
+    type:      DataTypes.STRING(200),
+    allowNull: true,
+    comment:   'Email que el cliente deja desde la consulta pública para contacto futuro. Sin flujo de verificación — se persiste tal cual, validado solo en formato.',
+  },
+  ultimaConsultaAt: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+    comment:   'Timestamp de la vista de saldo más reciente (vía código o vía sesión) en la consulta pública.',
+  },
+  totalConsultas: {
+    type:         DataTypes.INTEGER,
+    allowNull:    false,
+    defaultValue: 0,
+    comment:      'Contador histórico de vistas de saldo en la consulta pública — nunca decrementa, independiente de consultaSesionUsosRestantes.',
+  },
+  // ── Límite mensual de consultas CON CÓDIGO (2026-11-09, pedido explícito del usuario) ──
+  // Blindaje adicional sobre la consulta pública: cuántos ciclos de código (solicitarCodigo +
+  // confirmarCodigoConsulta exitoso) lleva ESTA tarjeta en el mes vigente — tope configurable en
+  // Configuración de Tuberos (CONSULTA_CODIGO_MAX_MES, ver loyalty-config.service.js). NO cuenta
+  // las vistas de sesión (consultaSesionUsosRestantes) — esas son parte del mismo ciclo ya contado.
+  consultaCodigoMesPeriodo: {
+    type:      DataTypes.STRING(7),
+    allowNull: true,
+    comment:   'Período "YYYY-MM" (zona America/Mexico_City) al que corresponde consultaCodigoMesContador. Null = nunca se usó este mecanismo.',
+  },
+  consultaCodigoMesContador: {
+    type:         DataTypes.INTEGER,
+    allowNull:    false,
+    defaultValue: 0,
+    comment:      'Ciclos de código exitosos en el período consultaCodigoMesPeriodo. Se reinicia solo (lectura perezosa) cuando el mes actual ya no coincide con el período guardado.',
+  },
 }, {
   tableName:   'loyalty_cards',
   underscored: true,
@@ -266,7 +317,7 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     // negocio, no PII sensible.
     attributes: {
       exclude: [
-        'nipHash', 'recuperacionCodigoHash',
+        'nipHash', 'recuperacionCodigoHash', 'consultaSesionTokenHash',
         'apodo', 'sexo', 'fechaNacimiento', 'calle', 'numExterior', 'numInterior',
         'colonia', 'municipio', 'estado', 'cp', 'comentarios',
       ],
@@ -278,6 +329,9 @@ const LoyaltyCard = sequelize.define('LoyaltyCard', {
     },
     withRecuperacionCodigoHash: {
       attributes: { include: ['recuperacionCodigoHash'] },
+    },
+    withConsultaSesionTokenHash: {
+      attributes: { include: ['consultaSesionTokenHash'] },
     },
     // Uso interno del propio dominio loyalty (ej. backfill de enriquecimiento en
     // loyalty-import-apply.service.js) — nunca para servir una respuesta HTTP directa.

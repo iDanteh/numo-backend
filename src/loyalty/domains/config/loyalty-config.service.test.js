@@ -164,6 +164,51 @@ describe('obtenerCongelamientoMeses / guardarCongelamientoMeses (Congelamiento d
   );
 });
 
+describe('obtenerConsultaCodigoMaxMes / guardarConsultaCodigoMaxMes (límite mensual de consultas con código, 2026-11-09)', () => {
+  test('obtenerConsultaCodigoMaxMes devuelve null cuando getValue tira (no configurado, D11)', async () => {
+    globalConfigService.getValue.mockRejectedValue(new Error('no existe'));
+    await expect(configService.obtenerConsultaCodigoMaxMes()).resolves.toBeNull();
+    expect(globalConfigService.getValue).toHaveBeenCalledWith('lealtad', 'CONSULTA_CODIGO_MAX_MES');
+  });
+
+  test('obtenerConsultaCodigoMaxMes devuelve null cuando el valor guardado es "0" (deshabilitado explícito)', async () => {
+    globalConfigService.getValue.mockResolvedValue('0');
+    await expect(configService.obtenerConsultaCodigoMaxMes()).resolves.toBeNull();
+  });
+
+  test('obtenerConsultaCodigoMaxMes devuelve el entero configurado', async () => {
+    globalConfigService.getValue.mockResolvedValue('3');
+    await expect(configService.obtenerConsultaCodigoMaxMes()).resolves.toBe(3);
+  });
+
+  test('guardarConsultaCodigoMaxMes(3) llama a setValue con tipo:"numero" y devuelve 3', async () => {
+    const resultado = await configService.guardarConsultaCodigoMaxMes(3, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'CONSULTA_CODIGO_MAX_MES', '3',
+      expect.objectContaining({ tipo: 'numero', usuarioId: '1', usuarioNombre: 'Admin' }),
+    );
+    expect(resultado).toBe(3);
+  });
+
+  test.each([null, undefined, 0])('guardarConsultaCodigoMaxMes(%p) deshabilita: persiste "0" y devuelve null', async (valor) => {
+    const resultado = await configService.guardarConsultaCodigoMaxMes(valor, USER);
+    expect(globalConfigService.setValue).toHaveBeenCalledWith(
+      'lealtad', 'CONSULTA_CODIGO_MAX_MES', '0', expect.objectContaining({ tipo: 'numero' }),
+    );
+    expect(resultado).toBeNull();
+  });
+
+  test.each([[-1, 'negativo'], [1.5, 'decimal'], ['abc', 'no numérico']])(
+    'guardarConsultaCodigoMaxMes(%p) inválido (%s) → 400, no llama a setValue',
+    async (valor) => {
+      await expect(
+        configService.guardarConsultaCodigoMaxMes(valor, USER),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(globalConfigService.setValue).not.toHaveBeenCalled();
+    },
+  );
+});
+
 describe('obtenerFotoFolderId / guardarFotoFolderId', () => {
   test('obtenerFotoFolderId lee lealtad.FOTO_CLIENTE_FOLDER_ID y recorta espacios', async () => {
     globalConfigService.getValue.mockResolvedValue('  abc123  ');

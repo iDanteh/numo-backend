@@ -870,6 +870,27 @@ async function syncModels() {
       ADD COLUMN IF NOT EXISTS foto_drive_file_id VARCHAR(255),
       ADD COLUMN IF NOT EXISTS foto_mime_type      VARCHAR(100)
   `).catch(e => console.warn('[syncModels] ADD COLUMN foto_drive_file_id/foto_mime_type (loyalty_cards):', e.message));
+
+  // Sesión corta post-código + email de contacto + contadores (2026-11-09, consulta pública) —
+  // columnas nuevas sobre loyalty_cards, que YA existía con datos reales: idempotente, mismo
+  // patrón que el resto de este archivo. Ver LoyaltyCard.js y loyalty-recovery.service.js.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS consulta_sesion_token_hash     VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS consulta_sesion_usos_restantes INTEGER,
+      ADD COLUMN IF NOT EXISTS consulta_sesion_expira_en      TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS email_contacto                 VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS ultima_consulta_at             TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS total_consultas                INTEGER NOT NULL DEFAULT 0
+  `).catch(e => console.warn('[syncModels] ADD COLUMN consulta_sesion_*/email_contacto/ultima_consulta_at/total_consultas (loyalty_cards):', e.message));
+
+  // Límite mensual de consultas CON CÓDIGO (2026-11-09, consulta pública) — ver LoyaltyCard.js y
+  // loyalty-recovery.service.js. Mismo patrón idempotente que el bloque anterior.
+  await LoyaltyCard.sequelize.query(`
+    ALTER TABLE loyalty_cards
+      ADD COLUMN IF NOT EXISTS consulta_codigo_mes_periodo  VARCHAR(7),
+      ADD COLUMN IF NOT EXISTS consulta_codigo_mes_contador INTEGER NOT NULL DEFAULT 0
+  `).catch(e => console.warn('[syncModels] ADD COLUMN consulta_codigo_mes_periodo/consulta_codigo_mes_contador (loyalty_cards):', e.message));
 }
 
 module.exports = { User, BankConfig, BankRule, AccountPlan, Entity, PeriodoFiscal, CierreMesHistorico, ReportePorFacturar, Permission, Role, Poliza, PolizaMovimiento, CfdiMappingRule, CentroCosto, Terminal, ClienteCatalogo, CobroSucursalPendiente, CobroSucursalPendienteCobranza, Notificacion, ConfigSection, GlobalConfig, ConfigAuditLog, PolizaAuditLog, LoyaltyCard, LoyaltyPointsLedger, LoyaltyTierHistory, LoyaltyCardAuditLog, LoyaltyAdjustmentReason, LoyaltyPendingEnrollment, LoyaltyPromotion, LoyaltySecurityEvent, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, LoyaltyKoreNivel, LoyaltyKoreVentaFallida, syncModels };

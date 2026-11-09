@@ -53,6 +53,8 @@ jest.mock('./domains/config/loyalty-config.service', () => ({
   guardarPorcentajes: jest.fn(),
   obtenerCongelamientoMeses: jest.fn(),
   guardarCongelamientoMeses: jest.fn(),
+  obtenerConsultaCodigoMaxMes: jest.fn(),
+  guardarConsultaCodigoMaxMes: jest.fn(),
   obtenerEspecialidades: jest.fn(),
   guardarEspecialidades: jest.fn(),
   obtenerFotoFolderId: jest.fn(),
@@ -126,6 +128,8 @@ describe('matriz de permisos — independencia (specs/loyalty-permissions)', () 
     { metodo: 'put',   ruta: '/config/porcentajes',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { Bronce: 1 } },
     { metodo: 'get',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/congelamiento',         permiso: PERMISSIONS.LOYALTY_CONFIG, body: { meses: 6 } },
+    { metodo: 'get',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_READ },
+    { metodo: 'put',   ruta: '/config/consulta-codigo-max-mes', permiso: PERMISSIONS.LOYALTY_CONFIG, body: { max: 1 } },
     { metodo: 'get',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_READ },
     { metodo: 'put',   ruta: '/config/especialidades',      permiso: PERMISSIONS.LOYALTY_CONFIG, body: { especialidades: ['a'] } },
     { metodo: 'get',   ruta: '/config/foto-folder',         permiso: PERMISSIONS.LOYALTY_READ },
@@ -354,6 +358,24 @@ describe('wiring hacia los servicios (happy path)', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ meses: 6 });
     expect(configService.guardarCongelamientoMeses).toHaveBeenCalledWith(6, expect.objectContaining({ dbId: '1' }));
+  });
+
+  test('GET /config/consulta-codigo-max-mes llama a obtenerConsultaCodigoMaxMes', async () => {
+    configService.obtenerConsultaCodigoMaxMes.mockResolvedValue(1);
+    const res = await request(app).get('/config/consulta-codigo-max-mes').set(perms(PERMISSIONS.LOYALTY_READ));
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 1 });
+    expect(configService.obtenerConsultaCodigoMaxMes).toHaveBeenCalled();
+  });
+
+  test('PUT /config/consulta-codigo-max-mes llama a guardarConsultaCodigoMaxMes con max y el usuario', async () => {
+    configService.guardarConsultaCodigoMaxMes.mockResolvedValue(1);
+    const res = await request(app).put('/config/consulta-codigo-max-mes')
+      .set(perms(PERMISSIONS.LOYALTY_CONFIG))
+      .send({ max: 1 });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ max: 1 });
+    expect(configService.guardarConsultaCodigoMaxMes).toHaveBeenCalledWith(1, expect.objectContaining({ dbId: '1' }));
   });
 
   test('GET /config/foto-folder llama a obtenerFotoFolderId', async () => {

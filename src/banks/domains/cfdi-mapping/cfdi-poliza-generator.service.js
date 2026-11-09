@@ -6036,7 +6036,23 @@ async function _uuidsDePoliza(polizaId) {
   return new Set(rows.map(r => r.cfdiUuid));
 }
 
+// Una sola actualización a la vez (pedido del usuario 2026-11-09): mientras
+// una corre, las demás se rechazan (el front también bloquea los botones).
+let _regeneracionEnCurso = null;
+
 async function regenerarPolizaIngreso(polizaId, user) {
+  if (_regeneracionEnCurso != null) {
+    throw new ConflictError('Ya se está actualizando otra póliza — espera a que termine.');
+  }
+  _regeneracionEnCurso = polizaId;
+  try {
+    return await _regenerarPolizaIngresoCore(polizaId, user);
+  } finally {
+    _regeneracionEnCurso = null;
+  }
+}
+
+async function _regenerarPolizaIngresoCore(polizaId, user) {
   const polizaService = require('../polizas/poliza.service');
   const poliza = await Poliza.findByPk(polizaId);
   if (!poliza) throw new BadRequestError('Póliza no encontrada');
@@ -6080,6 +6096,12 @@ async function regenerarPolizaIngreso(polizaId, user) {
     throw err;
   }
 
+  // Quién generó la actualización (queda en la póliza nueva y en la bitácora).
+  await Poliza.update(
+    { actualizadaPor: _userLabel(user), actualizadaAt: new Date(), actualizadaDe: anterior.id },
+    { where: { id: res.polizaId } },
+  );
+
   const uuidsDespues = await _uuidsDePoliza(res.polizaId);
   const etiquetas = async (uuids) => {
     if (!uuids.length) return [];
@@ -6090,7 +6112,17 @@ async function regenerarPolizaIngreso(polizaId, user) {
       return { uuid: u, serieFolio: d ? [d.serie, d.folio].filter(Boolean).join('-') : null, total: d?.total ?? null };
     });
   };
-  const nueva = await Poliza.findByPk(res.polizaId, { attributes: ['id', 'numero'] });
+  const nueva = await Poliza.findByPk(res.polizaId);
+  const facturasAgregadas = await etiquetas([...uuidsDespues].filter(u => !uuidsAntes.has(u)));
+  const facturasQuitadas  = await etiquetas([...uuidsAntes].filter(u => !uuidsDespues.has(u)));
+  await require('../polizas/poliza-audit.service').registrar('actualizada', nueva, user, {
+    estadoNuevo: 'borrador',
+    detalle: {
+      anteriorId: anterior.id, anteriorNumero: anterior.numero,
+      facturasAgregadas: facturasAgregadas.map(f => f.serieFolio || f.uuid),
+      facturasQuitadas:  facturasQuitadas.map(f => f.serieFolio || f.uuid),
+    },
+  });
 
   return {
     ...res,
@@ -6099,8 +6131,9 @@ async function regenerarPolizaIngreso(polizaId, user) {
     sucursal:    params.sucursal,
     fechaInicio: params.fechaInicio,
     fechaFin:    params.fechaFin,
-    facturasAgregadas: await etiquetas([...uuidsDespues].filter(u => !uuidsAntes.has(u))),
-    facturasQuitadas:  await etiquetas([...uuidsAntes].filter(u => !uuidsDespues.has(u))),
+    actualizadaPor: nueva?.actualizadaPor ?? null,
+    facturasAgregadas,
+    facturasQuitadas,
   };
 }
 

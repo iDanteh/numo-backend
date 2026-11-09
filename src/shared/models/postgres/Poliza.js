@@ -112,6 +112,20 @@ const Poliza = sequelize.define('Poliza', {
     type:      DataTypes.DATE,
     allowNull: true,
   },
+  // "↻ Actualizar" (2026-11-09): quién y cuándo regeneró la póliza, y el id de
+  // la póliza anterior (cancelada) a la que reemplaza. Ver regenerarPolizaIngreso.
+  actualizadaPor: {
+    type:      DataTypes.STRING(150),
+    allowNull: true,
+  },
+  actualizadaAt: {
+    type:      DataTypes.DATE,
+    allowNull: true,
+  },
+  actualizadaDe: {
+    type:      DataTypes.INTEGER,
+    allowNull: true,
+  },
   // CFDIs sustitutos (tipoRelacion='04') detectados y excluidos automáticamente
   // del cálculo al generar esta póliza — se listan aparte (no se contabilizan)
   // para que el contador decida caso por caso si ya se contabilizaron en el

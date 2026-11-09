@@ -36,6 +36,19 @@ router.get('/facturas-tardias',
   }),
 );
 
+// GET /api/polizas/sin-timbrar?rfc=&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&centroCostoId=
+// Facturas/NC activas en Kore que todavía no se timbran en el SAT (llegarán
+// tarde a la póliza de Ingreso). Ver sin-timbrar.service.js.
+router.get('/sin-timbrar',
+  authenticate,
+  permit('polizas:read'),
+  asyncHandler(async (req, res) => {
+    const { listarSinTimbrar } = require('../cfdi-mapping/sin-timbrar.service');
+    const { rfc, desde, hasta, centroCostoId } = req.query;
+    res.json(await listarSinTimbrar({ rfc, desde, hasta, centroCostoId: centroCostoId || null }));
+  }),
+);
+
 // GET /api/polizas/reporte-descuadradas?rfc=&ejercicio=&periodo=&estado=&format=csv
 router.get('/reporte-descuadradas',
   authenticate,

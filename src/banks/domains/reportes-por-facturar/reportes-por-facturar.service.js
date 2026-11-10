@@ -31,6 +31,7 @@ const { SECCIONES, armarSecciones, agregarHojasSeccion } = require('./reportes-p
 const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
 const { cobrosEnOtraCaja } = require('./reportes-por-facturar.otra-caja');
+const { agregarHistorialAbonos } = require('./reportes-por-facturar.abonos');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -243,6 +244,13 @@ async function _calcular({ rfc, centroCostoId, fechaInicio, fechaFin }, onAvance
   datos.remisionesSoloOtraCaja = otraCaja.soloOtraCaja ?? [];
   if (otraCaja.sinRespuesta) {
     advertencias.push(`Kore no respondió ${otraCaja.sinRespuesta} remisión(es) al buscar cobros en la caja de otro almacén — esa pestaña puede estar incompleta; vuelve a actualizarlo más tarde.`);
+  }
+
+  // Historial de abonos de cada remisión hasta que quedó saldada (2026-11-10).
+  await onAvance('Historial de abonos de las remisiones — consultando Kore…');
+  const abonos = await agregarHistorialAbonos({ rfc, datos });
+  if (abonos.sinRespuesta) {
+    advertencias.push(`Kore no respondió el historial de abonos de ${abonos.sinRespuesta} remisión(es) — esas salen sin sus abonos; vuelve a actualizarlo más tarde.`);
   }
   return { sucursal, fechaFin, datos, resumen: _resumen(datos), advertencias: advertencias.length ? advertencias : null };
 }

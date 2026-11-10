@@ -19,6 +19,9 @@ const koreRemisionSchema = new mongoose.Schema({
   consultadoEn:         { type: Date,   default: null },
   // Cuándo quedó en saldo 0 (2026-10-30): ya no cambia → no se vuelve a pedir el saldo.
   liquidadaEl:          { type: Date,   default: null },
+  // Historial de abonos (2026-11-10, reporte "Por facturar"): ya liquidada no
+  // cambia → no se vuelve a pedir. [{ fecha, movimiento, forma, importe, saldo, idNumo, … }]
+  abonos:               { type: [mongoose.Schema.Types.Mixed], default: undefined },
 }, { timestamps: true, collection: 'kore_remisiones' });
 
 koreRemisionSchema.index({ rfc: 1, serie: 1, folio: 1 }, { unique: true });

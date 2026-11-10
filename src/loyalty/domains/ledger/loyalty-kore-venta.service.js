@@ -91,6 +91,7 @@ const configService = require('../config/loyalty-config.service');
 const { _resolverCentroCostoPorSerieFolio, _obtenerCentroCosto, _aplicarMovimiento } = require('./loyalty-ledger.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
 const { logger } = require('../../../shared/utils/logger');
+const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 
 const ORIGEN_KORE = 'kore';
 const TOLERANCIA_PESOS = 0.01;
@@ -469,6 +470,10 @@ async function _procesarVentaKoreInterno(datos) {
     const puntosAcumulados = filasManual.filter(f => f.tipo === 'ACUMULACION').reduce((s, f) => s + Number(f.puntos), 0);
     const puntosDescontados = canje ? Math.abs(Number(canje.puntos)) : 0;
     return {
+      // Interno, nunca viaja en la respuesta pública del webhook (ver `procesarVentaKore`, que lo
+      // extrae y lo quita antes de responder) — Kore no lo pidió ni lo necesita, es solo para
+      // orientar la notificación en vivo a la sala correcta.
+      cardId: card.id,
       serieFolio: datos.serieFolio,
       status: 'aplicado',
       puntosDescontados,
@@ -608,6 +613,8 @@ async function _procesarVentaKoreInterno(datos) {
   else status = 'no_califica';
 
   return {
+    // Interno, nunca viaja en la respuesta pública — ver nota equivalente arriba.
+    cardId: card.id,
     serieFolio: datos.serieFolio,
     status,
     puntosDescontados,
@@ -624,6 +631,15 @@ async function _procesarVentaKoreInterno(datos) {
  * Un error de negocio aislado a UN abono nunca llega hasta acá (se captura y
  * se refleja en `abonos[]` de la respuesta 200) — solo un error que abortó el
  * request COMPLETO (ver `_procesarVentaKoreInterno`) pasa por este reintento.
+ *
+ * Notificación en vivo (2026-11-10, pedido explícito del usuario): UNA sola emisión por
+ * webhook, nunca una por abono — un solo request puede traer varios abonos y emitir por
+ * cada uno dispararía una ráfaga de refetches en `tarjeta-detail.component.ts` sin ninguna
+ * ganancia real (el frontend solo necesita saber "hay algo nuevo", no cuántos abonos hubo).
+ * Señal de invalidación pura (sin datos de negocio) a la sala de ESA tarjeta — nunca
+ * `emitToAll`, a diferencia de los webhooks de catálogo: acá sí hay una dimensión de scoping
+ * real (la tarjeta puntual), broadcastear a todos sería ruido para cualquiera que no la tenga
+ * abierta.
  */
 async function procesarVentaKore(payload) {
   const datos = _validarPayloadVenta(payload);
@@ -637,7 +653,10 @@ async function procesarVentaKore(payload) {
     }
     try {
       // eslint-disable-next-line no-await-in-loop
-      return await _procesarVentaKoreInterno(datos);
+      const resultado = await _procesarVentaKoreInterno(datos);
+      const { cardId, ...respuestaPublica } = resultado;
+      emitToLoyaltyCard(cardId, 'lealtad-tarjeta:actualizada', { cardId, motivo: 'venta-kore' });
+      return respuestaPublica;
     } catch (err) {
       // Errores de negocio (AppError: 400/404/409/422) nunca se reintentan — reintentar no los
       // arregla, y el contrato exige que Kore reciba el rechazo real de inmediato.

@@ -27,12 +27,15 @@ jest.mock('../../../banks/domains/collection-requests/CollectionRequest.model', 
 jest.mock('../../../banks/domains/collection-requests/collection-request-asignaciones', () => ({
   movimientosDe: jest.fn(),
 }));
+// Notificación en vivo (2026-11-10) — ver mismo criterio en loyalty-kore-venta.service.test.js.
+jest.mock('../../../banks/shared/socket', () => ({ emitToLoyaltyCard: jest.fn() }));
 
 const { LoyaltyCard, LoyaltyPointsLedger } = require('../../../shared/models/postgres');
 const { sequelize } = require('../../../config/database.postgres');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
 const CollectionRequest = require('../../../banks/domains/collection-requests/CollectionRequest.model');
 const { movimientosDe } = require('../../../banks/domains/collection-requests/collection-request-asignaciones');
+const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 const ventaCanceladaService = require('./loyalty-kore-venta-cancelada.service');
 
 function makeCard(overrides = {}) {
@@ -303,6 +306,62 @@ describe('procesarVentaCanceladaKore — carrera (SequelizeUniqueConstraintError
 
     await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
       .rejects.toThrow('DB caída');
+  });
+});
+
+// Notificación en vivo (2026-11-10, pedido explícito del usuario): a la sala de la tarjeta
+// puntual, nunca emitToAll (ver docstring del archivo). Se emite incluso en los caminos
+// idempotentes/carrera (inofensivo), pero NUNCA si no se escribió ningún movimiento real.
+describe('procesarVentaCanceladaKore — notificación en vivo (emitToLoyaltyCard)', () => {
+  it('ya revertida (idempotente): emite con el cardId de la fila ya existente', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(filaLedger({
+      cardId: 5, tipo: 'AJUSTE', referenciaExterna: `${SF}:REVERSION:${SFC1}`,
+    }));
+
+    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(5, 'lealtad-tarjeta:actualizada', { cardId: 5, motivo: 'cancelacion-kore' });
+  });
+
+  it('cancelación total aplicada con éxito: emite con el cardId de la venta original', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(null);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger({ cardId: 9, tipo: 'ACUMULACION', puntos: '50.00' })]);
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ id: 9, saldoPuntos: '200.00' }));
+
+    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(9, 'lealtad-tarjeta:actualizada', { cardId: 9, motivo: 'cancelacion-kore' });
+  });
+
+  it('saldo insuficiente: NO emite (no se escribió ningún movimiento real)', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(null);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger({ tipo: 'ACUMULACION', puntos: '50.00' })]);
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ saldoPuntos: '10.00' }));
+
+    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+
+    expect(emitToLoyaltyCard).not.toHaveBeenCalled();
+  });
+
+  it('carrera (SequelizeUniqueConstraintError): emite igual, es inofensivo', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(null);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([filaLedger({ cardId: 3 })]);
+    LoyaltyCard.findByPk.mockResolvedValue(makeCard({ id: 3 }));
+    const err = new Error('duplicate'); err.name = 'SequelizeUniqueConstraintError';
+    LoyaltyPointsLedger.create.mockRejectedValue(err);
+
+    await ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' });
+
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(3, 'lealtad-tarjeta:actualizada', { cardId: 3, motivo: 'cancelacion-kore' });
+  });
+
+  it('404 (no hay venta original que revertir): nunca emite', async () => {
+    LoyaltyPointsLedger.findOne.mockResolvedValue(null);
+    LoyaltyPointsLedger.findAll.mockResolvedValue([]);
+
+    await expect(ventaCanceladaService.procesarVentaCanceladaKore({ serieFolio: SF, serieFolioCancelacion: SFC1, tipoCancelacion: 'total' }))
+      .rejects.toMatchObject({ statusCode: 404 });
+    expect(emitToLoyaltyCard).not.toHaveBeenCalled();
   });
 });
 

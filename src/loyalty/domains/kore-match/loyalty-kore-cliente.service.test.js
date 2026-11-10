@@ -22,9 +22,14 @@ jest.mock('../cards/loyalty-card.service', () => ({
   // no tener que reescribir todos los tests existentes de este archivo.
   nivelEsValido: jest.fn(async (nombre) => ['Bronce', 'Plata', 'Oro'].includes(nombre)),
 }));
+// Notificación en vivo (2026-11-10) — mockeado para poder verificar que se emite sin depender de
+// una instancia real de Socket.IO (en test, el real ya es un no-op seguro porque `_io` nunca se
+// inicializa, pero mockearlo permite afirmar CON QUÉ se llamó).
+jest.mock('../../../banks/shared/socket', () => ({ emitToAll: jest.fn() }));
 
 const { LoyaltyCard, LoyaltyCardAuditLog } = require('../../../shared/models/postgres');
 const { crearTarjeta, cambiarNivel } = require('../cards/loyalty-card.service');
+const { emitToAll } = require('../../../banks/shared/socket');
 const { procesarClienteKore } = require('./loyalty-kore-cliente.service');
 
 function card(overrides = {}) {
@@ -540,5 +545,50 @@ describe('procesarClienteKore — evento baja', () => {
     await expect(
       procesarClienteKore({ evento: 'baja', koreClienteId: 'K-x', telefono: '5551234567' }),
     ).rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+
+// Notificación en vivo (2026-11-10, pedido explícito del usuario): broadcast GLOBAL (sin sala)
+// tras procesar cualquiera de los 3 eventos con éxito — alimenta la bandeja "pendientes de
+// revisión Kore" en el frontend. Señal de invalidación pura (solo cardId).
+describe('procesarClienteKore — notificación en vivo (emitToAll)', () => {
+  test('alta: emite lealtad-cliente-kore:actualizado con el cardId de la tarjeta creada', async () => {
+    LoyaltyCard.findOne.mockResolvedValueOnce(null);
+    const nueva = card({ id: 60, telefono: '5551112222' });
+    crearTarjeta.mockResolvedValue({ card: nueva, nip: '1234' });
+
+    await procesarClienteKore({
+      evento: 'alta', koreClienteId: 'K-emit', telefono: '5551112222', nombre: 'Juan Pérez', nivel: 'Bronce',
+    });
+
+    expect(emitToAll).toHaveBeenCalledWith('lealtad-cliente-kore:actualizado', { cardId: 60 });
+  });
+
+  test('actualizacion: emite con el cardId de la tarjeta existente', async () => {
+    const existente = card({ id: 61, nivel: 'Bronce' });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({
+      evento: 'actualizacion', koreClienteId: 'K61', telefono: '5551234567', nivel: 'Bronce',
+    });
+
+    expect(emitToAll).toHaveBeenCalledWith('lealtad-cliente-kore:actualizado', { cardId: 61 });
+  });
+
+  test('baja: emite con el cardId de la tarjeta dada de baja', async () => {
+    const existente = card({ id: 62 });
+    LoyaltyCard.findOne.mockResolvedValueOnce(existente);
+
+    await procesarClienteKore({ evento: 'baja', koreClienteId: 'K62' });
+
+    expect(emitToAll).toHaveBeenCalledWith('lealtad-cliente-kore:actualizado', { cardId: 62 });
+  });
+
+  test('error de validación (400) antes de procesar nada: nunca emite', async () => {
+    await expect(
+      procesarClienteKore({ evento: 'otracosa', koreClienteId: 'K1', telefono: '5551234567' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    expect(emitToAll).not.toHaveBeenCalled();
   });
 });

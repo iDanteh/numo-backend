@@ -28,6 +28,7 @@
 const { LoyaltyKoreNivel } = require('../../../shared/models/postgres');
 const { BadRequestError, NotFoundError } = require('../../../shared/errors/AppError');
 const { _buscarOAdoptarNivelKore } = require('../config/loyalty-config.service');
+const { emitToAll } = require('../../../banks/shared/socket');
 
 const EVENTOS_VALIDOS = ['alta', 'actualizacion', 'baja'];
 
@@ -120,6 +121,12 @@ async function _procesarBaja({ koreId }) {
  * `activo`) — vía más directa que 'baja' para lo mismo, no la reemplaza. 'baja' no lee ninguno de
  * estos campos.
  */
+// Notificación en vivo (2026-11-10, pedido explícito del usuario — "relevante para el registro
+// de acumulaciones manuales": el staff consulta esta tabla para saber qué % va a aplicar antes
+// de ir a registrar una acumulación a mano, aunque el cálculo real en `registrarAcumulacion()`
+// siempre usa el catálogo vigente sin importar el socket). Broadcast GLOBAL (sin sala, mismo
+// criterio que `lealtad-cliente-kore:actualizado` de arriba) — alimenta la tabla "Niveles Kore"
+// de `lealtad-config.component.ts`. Señal de invalidación pura, sin payload de negocio.
 async function procesarNivelKore(payload) {
   const {
     evento, nombre, porcentaje, estatus,
@@ -131,13 +138,20 @@ async function procesarNivelKore(payload) {
   const koreId = _requiereKoreId(payload?.koreId);
   const nombreTrim = nombre !== undefined ? String(nombre).trim() : undefined;
 
-  if (evento === 'baja') return _procesarBaja({ koreId });
-  if (evento === 'alta') return _procesarAlta({
-    koreId, nombre: nombreTrim, porcentaje, estatus,
-  });
-  return _procesarActualizacion({
-    koreId, nombre: nombreTrim, porcentaje, estatus,
-  });
+  let resultado;
+  if (evento === 'baja') {
+    resultado = await _procesarBaja({ koreId });
+  } else if (evento === 'alta') {
+    resultado = await _procesarAlta({
+      koreId, nombre: nombreTrim, porcentaje, estatus,
+    });
+  } else {
+    resultado = await _procesarActualizacion({
+      koreId, nombre: nombreTrim, porcentaje, estatus,
+    });
+  }
+  emitToAll('lealtad-niveles-kore:actualizado', { nivelId: resultado.nivelId });
+  return resultado;
 }
 
 module.exports = { procesarNivelKore };

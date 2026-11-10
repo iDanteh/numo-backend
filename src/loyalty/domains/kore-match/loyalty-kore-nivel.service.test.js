@@ -14,9 +14,12 @@ jest.mock('../../../shared/models/postgres', () => ({
 jest.mock('../config/loyalty-config.service', () => ({
   _buscarOAdoptarNivelKore: jest.fn(),
 }));
+// Notificación en vivo (2026-11-10) — ver mismo criterio en loyalty-kore-cliente.service.test.js.
+jest.mock('../../../banks/shared/socket', () => ({ emitToAll: jest.fn() }));
 
 const { LoyaltyKoreNivel } = require('../../../shared/models/postgres');
 const { _buscarOAdoptarNivelKore } = require('../config/loyalty-config.service');
+const { emitToAll } = require('../../../banks/shared/socket');
 const { procesarNivelKore } = require('./loyalty-kore-nivel.service');
 
 function nivel(overrides = {}) {
@@ -203,5 +206,44 @@ describe('evento baja', () => {
     LoyaltyKoreNivel.findOne.mockResolvedValue(null);
     await expect(procesarNivelKore({ evento: 'baja', koreId: 'n404' }))
       .rejects.toMatchObject({ statusCode: 404 });
+  });
+});
+
+// Notificación en vivo (2026-11-10, pedido explícito del usuario — "relevante para el registro
+// de acumulaciones manuales"): broadcast GLOBAL tras alta/actualización/baja con éxito, alimenta
+// la tabla "Niveles Kore" de Configuración de Lealtad.
+describe('procesarNivelKore — notificación en vivo (emitToAll)', () => {
+  test('alta: emite lealtad-niveles-kore:actualizado con el nivelId creado', async () => {
+    _buscarOAdoptarNivelKore.mockResolvedValue(null);
+    LoyaltyKoreNivel.create.mockResolvedValue(nivel({ id: 70 }));
+
+    await procesarNivelKore({ evento: 'alta', koreId: 'n70', nombre: 'Platino', porcentaje: 3 });
+
+    expect(emitToAll).toHaveBeenCalledWith('lealtad-niveles-kore:actualizado', { nivelId: 70 });
+  });
+
+  test('actualizacion: emite con el nivelId existente', async () => {
+    const existente = nivel({ id: 71 });
+    LoyaltyKoreNivel.findOne.mockResolvedValue(existente);
+
+    await procesarNivelKore({ evento: 'actualizacion', koreId: 'n71', estatus: false });
+
+    expect(emitToAll).toHaveBeenCalledWith('lealtad-niveles-kore:actualizado', { nivelId: 71 });
+  });
+
+  test('baja: emite con el nivelId desactivado', async () => {
+    const existente = nivel({ id: 72 });
+    LoyaltyKoreNivel.findOne.mockResolvedValue(existente);
+
+    await procesarNivelKore({ evento: 'baja', koreId: 'n72' });
+
+    expect(emitToAll).toHaveBeenCalledWith('lealtad-niveles-kore:actualizado', { nivelId: 72 });
+  });
+
+  test('error de validación (400): nunca emite', async () => {
+    await expect(procesarNivelKore({ evento: 'foo', koreId: 'n1' }))
+      .rejects.toMatchObject({ statusCode: 400 });
+
+    expect(emitToAll).not.toHaveBeenCalled();
   });
 });

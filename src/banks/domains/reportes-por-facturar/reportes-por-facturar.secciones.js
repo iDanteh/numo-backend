@@ -242,7 +242,6 @@ function _otraCaja(cobros, sucursalDe) {
 const nombreHoja = (...partes) => partes.filter(Boolean).join(' - ').replace(/[:\\/?*[\]]/g, ' ').slice(0, 31);
 
 const MORADO = 'FF8E7CC3';
-const CLIENTE = 'FFE4DEF5';
 const GRIS = 'FFF3F3F3';
 const DINERO = '$#,##0.00';
 const _relleno = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
@@ -266,18 +265,16 @@ function _encabezado(row, n) {
 }
 
 /**
- * Escribe un bloque: encabezado(s), filas agrupadas por cliente (renglón del
- * cliente + depósitos + subtotal) y TOTAL. `fila(d)` → arreglo de celdas.
+ * Escribe un bloque: encabezado(s), filas agrupadas por cliente (depósitos +
+ * subtotal) y TOTAL. `fila(d)` → arreglo de celdas.
+ * 2026-11-10 (pedido del usuario): sin el renglón con el nombre del cliente
+ * arriba de cada grupo — la agrupación y el "Subtotal <cliente>" se quedan.
  */
 function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colImporte = 3 }) {
   const n = columnas.length;
   for (const e of encabezados) _encabezado(ws.addRow(e), n);
   _encabezado(ws.addRow(columnas), n);
   for (const g of grupos) {
-    const nombre = ws.addRow([g.cliente]);
-    ws.mergeCells(nombre.number, 1, nombre.number, n);
-    nombre.font = { bold: true };
-    nombre.getCell(1).fill = _relleno(CLIENTE);
     for (const d of g.depositos) {
       const row = ws.addRow(fila(d));
       row.alignment = { vertical: 'middle', wrapText: true };
@@ -309,9 +306,11 @@ const _rem = d => (d.remisiones ?? []).join('\n');
 const _diaTexto = v => { const f = _fecha(v, true); return f ? `${f.getUTCDate()}/${f.getUTCMonth() + 1}/${String(f.getUTCFullYear()).slice(2)}` : ''; };
 const GRIS_ABONO = 'FF6B7280';
 
+// 2026-11-10 (usuario): "saldo pendiente a esa fecha" — lo que quedó debiendo
+// la remisión después de ese movimiento.
 function textoAbono(a, remision, varias) {
   const partes = [`↳ ${a.movimiento}`, a.forma, varias ? `REM ${remision}` : null, a.idNumo ? `ID NUMO ${a.idNumo}` : null].filter(Boolean);
-  return `${partes.join(' · ')} — ${a.importe < 0 ? 'CARGO ' : ''}${_dinero(Math.abs(a.importe))} · saldo ${_dinero(a.saldo)}`;
+  return `${partes.join(' · ')} — ${a.importe < 0 ? 'CARGO ' : ''}${_dinero(Math.abs(a.importe))} · saldo pendiente a esa fecha ${_dinero(a.saldo)}`;
 }
 
 function textoCierre(h, varias) {
@@ -319,19 +318,23 @@ function textoCierre(h, varias) {
   return h.saldadaEl ? `✔ SALDADA EL ${_diaTexto(h.saldadaEl)}${rem}` : `PENDIENTE: DEBE ${_dinero(h.saldo)}${rem}`;
 }
 
+// Renglón de abono: FECHA | CLIENTE | movimiento… (2026-11-10, usuario: "más
+// grande" y "después de la fecha, el nombre del cliente").
 function _escribirAbonos(ws, d, n) {
   const historial = d.historialAbonos ?? [];
   const varias = historial.length > 1;
+  const cliente = d.cliente || NO_IDENTIFICADO;
   for (const h of historial) {
     for (const a of h.abonos) {
-      const row = ws.addRow([_fecha(a.fecha, true), textoAbono(a, h.remision, varias)]);
+      const row = ws.addRow([_fecha(a.fecha, true), cliente, textoAbono(a, h.remision, varias)]);
       row.getCell(1).numFmt = 'd/m/yy';
-      row.font = { italic: true, size: 9, color: { argb: GRIS_ABONO } };
-      ws.mergeCells(row.number, 2, row.number, n);
+      row.font = { italic: true, size: 11, color: { argb: GRIS_ABONO } };
+      row.alignment = { vertical: 'middle', wrapText: true };
+      ws.mergeCells(row.number, 3, row.number, n);
     }
-    const cierre = ws.addRow([null, textoCierre(h, varias)]);
-    cierre.font = { bold: true, size: 9, color: { argb: h.saldadaEl ? 'FF15803D' : 'FFB45309' } };
-    ws.mergeCells(cierre.number, 2, cierre.number, n);
+    const cierre = ws.addRow([null, cliente, textoCierre(h, varias)]);
+    cierre.font = { bold: true, size: 11, color: { argb: h.saldadaEl ? 'FF15803D' : 'FFB45309' } };
+    ws.mergeCells(cierre.number, 3, cierre.number, n);
   }
 }
 

@@ -324,8 +324,8 @@ function textoCierre(h, varias) {
   return h.saldadaEl ? `✔ SALDADA EL ${_diaTexto(h.saldadaEl)}${rem}` : `PENDIENTE: DEBE ${_dinero(h.saldo)}${rem}`;
 }
 
-// Renglón de abono: FECHA | CLIENTE | movimiento… (2026-11-10, usuario: "más
-// grande" y "después de la fecha, el nombre del cliente").
+// Renglón de abono: FECHA | CLIENTE | movimiento… (2026-11-10, usuario: "después
+// de la fecha, el nombre del cliente"; letra 9 — se probó 11 y pidió regresar a 9).
 function _escribirAbonos(ws, d, n) {
   const historial = d.historialAbonos ?? [];
   const varias = historial.length > 1;
@@ -334,12 +334,12 @@ function _escribirAbonos(ws, d, n) {
     for (const a of h.abonos) {
       const row = ws.addRow([_fecha(a.fecha, true), cliente, textoAbono(a, h.remision, varias)]);
       row.getCell(1).numFmt = 'd/m/yy';
-      row.font = { italic: true, size: 11, color: { argb: GRIS_ABONO } };
+      row.font = { italic: true, size: 9, color: { argb: GRIS_ABONO } };
       row.alignment = { vertical: 'middle', wrapText: true };
       ws.mergeCells(row.number, 3, row.number, n);
     }
     const cierre = ws.addRow([null, cliente, textoCierre(h, varias)]);
-    cierre.font = { bold: true, size: 11, color: { argb: h.saldadaEl ? 'FF15803D' : 'FFB45309' } };
+    cierre.font = { bold: true, size: 9, color: { argb: h.saldadaEl ? 'FF15803D' : 'FFB45309' } };
     ws.mergeCells(cierre.number, 3, cierre.number, n);
   }
 }

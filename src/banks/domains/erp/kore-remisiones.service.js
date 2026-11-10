@@ -51,6 +51,7 @@ async function infoRemisiones({ rfc, remisiones, necesitaSaldo = () => false }) 
       nombre: g.nombre, tipoPago: g.tipoPago, nombreTipoMovimiento: g.nombreTipoMovimiento,
       // Ya liquidada (2026-10-30): su saldo es 0 aunque no se pregunte a Kore.
       ...(g.liquidadaEl ? { saldoActual: 0, liquidadaEl: g.liquidadaEl } : {}),
+      ...(Array.isArray(g.abonos) ? { abonos: g.abonos } : {}),
     });
   }
 
@@ -69,7 +70,7 @@ async function infoRemisiones({ rfc, remisiones, necesitaSaldo = () => false }) 
     await KoreRemision.bulkWrite(nuevas.map(({ r, c }) => ({
       updateOne: {
         filter: { rfc, serie: String(r.serie).trim().toUpperCase(), folio: String(r.folio).trim() },
-        update: { $set: { nombre: c.nombre ?? null, tipoPago: c.tipoPago ?? null, nombreTipoMovimiento: c.nombreTipoMovimiento, consultadoEn: new Date(), liquidadaEl: c.liquidadaEl ?? null } },
+        update: { $set: { nombre: c.nombre ?? null, tipoPago: c.tipoPago ?? null, nombreTipoMovimiento: c.nombreTipoMovimiento, consultadoEn: new Date(), liquidadaEl: c.liquidadaEl ?? null, ...(Array.isArray(c.abonos) ? { abonos: c.abonos } : {}) } },
         upsert: true,
       },
     })), { ordered: false }).catch(() => {});

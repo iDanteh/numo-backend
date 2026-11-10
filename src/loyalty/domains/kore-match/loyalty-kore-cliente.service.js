@@ -27,6 +27,7 @@ const { crearTarjeta, cambiarNivel, nivelEsValido } = require('../cards/loyalty-
 // y esas dos vías nunca puedan dejar el campo con un formato distinto entre sí.
 const { normalizarTarjeta } = require('../import/loyalty-import.parser');
 const { registrarCambioTarjeta } = require('../cards/loyalty-card-audit.service');
+const { emitToAll } = require('../../../banks/shared/socket');
 
 const EVENTOS_VALIDOS = ['alta', 'actualizacion', 'baja'];
 
@@ -243,6 +244,14 @@ async function _procesarBaja({ koreClienteId, telefono }) {
  * `cambiarNivel()` si viene distinto al actual — mismo primitivo que el botón manual "Cambiar
  * nivel", queda en `LoyaltyTierHistory`. 'baja' no lo lee ni lo exige.
  */
+// Notificación en vivo (2026-11-10, pedido explícito del usuario): los 4 webhooks de Kore en
+// Lealtad no emitían nada por socket hasta hoy — esto alimenta la bandeja "pendientes de
+// revisión Kore" (clientes-pendientes.component.ts) para que se autorefresque sin que alguien
+// tenga que recargar. Broadcast GLOBAL (sin sala, `emitToAll`) a propósito: no hay una dimensión
+// de scoping real acá (cualquiera con `loyalty:read` ve la misma bandeja completa), mismo
+// criterio ya usado por `ErpReversionCreatedEvent`/`CollectionRequestCreatedEvent` en el
+// dominio de Bancos. Señal de invalidación pura (solo `cardId`, sin datos de negocio) — el
+// frontend vuelve a pedir el listado por REST, nunca se duplica el dato en el socket.
 async function procesarClienteKore(payload) {
   const { evento, telefono, nombre, activo, tarjetaLegada, nivel } = payload ?? {};
 
@@ -252,7 +261,9 @@ async function procesarClienteKore(payload) {
   const koreClienteId = _requiereKoreClienteId(payload?.koreClienteId);
 
   if (evento === 'baja') {
-    return _procesarBaja({ koreClienteId, telefono });
+    const resultado = await _procesarBaja({ koreClienteId, telefono });
+    emitToAll('lealtad-cliente-kore:actualizado', { cardId: resultado.cardId });
+    return resultado;
   }
 
   // `nivel` obligatorio (2026-11-06, tercera ronda) — gate único acá para que 'alta' (tarjeta nueva
@@ -269,12 +280,13 @@ async function procesarClienteKore(payload) {
     throw new BadRequestError(err.message);
   }
 
-  if (evento === 'alta') {
-    return _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre, nivel });
-  }
-  return _procesarActualizacion({
-    koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada, nivel,
-  });
+  const resultado = evento === 'alta'
+    ? await _procesarAlta({ koreClienteId, telefono: telefonoNorm, nombre, nivel })
+    : await _procesarActualizacion({
+      koreClienteId, telefono: telefonoNorm, nombre, activo, tarjetaLegada, nivel,
+    });
+  emitToAll('lealtad-cliente-kore:actualizado', { cardId: resultado.cardId });
+  return resultado;
 }
 
 module.exports = { procesarClienteKore };

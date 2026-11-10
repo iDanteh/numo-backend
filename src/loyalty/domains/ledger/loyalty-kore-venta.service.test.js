@@ -39,6 +39,8 @@ jest.mock('../config/loyalty-config.service', () => ({
 jest.mock('./loyalty-venta-fallida.service', () => ({
   registrarVentaFallida: jest.fn(),
 }));
+// Notificación en vivo (2026-11-10) — ver mismo criterio en loyalty-kore-cliente.service.test.js.
+jest.mock('../../../banks/shared/socket', () => ({ emitToLoyaltyCard: jest.fn() }));
 
 const {
   LoyaltyCard, LoyaltyPointsLedger, LoyaltyKoreConcepto, LoyaltyKoreFormaPago, CentroCosto,
@@ -47,6 +49,7 @@ const { sequelize } = require('../../../config/database.postgres');
 const centrosCostoService = require('../../../banks/domains/centros-costo/centros-costo.service');
 const configService = require('../config/loyalty-config.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
+const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 const ventaService = require('./loyalty-kore-venta.service');
 
 function makeCard(overrides = {}) {
@@ -570,5 +573,47 @@ describe('procesarLoteVentasKore', () => {
     expect(resultados[1]).toMatchObject({ serieFolio: 'invalido', success: false, statusCode: 400 });
     expect(resultados[1].error).toEqual(expect.any(String));
     expect(resultados[2]).toMatchObject({ success: true });
+  });
+});
+
+// Notificación en vivo (2026-11-10, pedido explícito del usuario): UNA sola emisión por webhook,
+// a la sala de la tarjeta puntual — nunca una por abono (ver docstring de procesarVentaKore).
+// `cardId` es interno (orienta el socket) y nunca debe viajar en la respuesta pública del webhook.
+describe('procesarVentaKore — notificación en vivo (emitToLoyaltyCard)', () => {
+  it('emite lealtad-tarjeta:actualizada UNA sola vez aunque el request traiga 2 abonos', async () => {
+    mockCard(makeCard({ id: 77 }));
+    const payload = {
+      ...PAYLOAD_BASE,
+      abonos: [abono({ idAbono: 'ABONO-1' }), abono({ idAbono: 'ABONO-2' })],
+    };
+
+    await ventaService.procesarVentaKore(payload);
+
+    expect(emitToLoyaltyCard).toHaveBeenCalledTimes(1);
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(77, 'lealtad-tarjeta:actualizada', { cardId: 77, motivo: 'venta-kore' });
+  });
+
+  it('el cardId interno nunca viaja en la respuesta pública del webhook', async () => {
+    mockCard(makeCard({ id: 77 }));
+    const res = await ventaService.procesarVentaKore(PAYLOAD_BASE);
+    expect(res.cardId).toBeUndefined();
+  });
+
+  it('blindaje cruzado manual↔kore: también emite (nada nuevo se escribió, pero es inofensivo)', async () => {
+    mockCard(makeCard({ id: 78, saldoPuntos: '50.00' }));
+    mockLedgerRows({
+      manual: [
+        { tipo: 'ACUMULACION', puntos: '50.00', montoVenta: '1000.00', referenciaExterna: 'A0-260605320', origen: 'manual' },
+      ],
+    });
+
+    await ventaService.procesarVentaKore(PAYLOAD_BASE);
+
+    expect(emitToLoyaltyCard).toHaveBeenCalledWith(78, 'lealtad-tarjeta:actualizada', { cardId: 78, motivo: 'venta-kore' });
+  });
+
+  it('error de validación (400) antes de resolver la tarjeta: nunca emite', async () => {
+    await expect(ventaService.procesarVentaKore({ telefono: '5512345678' })).rejects.toMatchObject({ statusCode: 400 });
+    expect(emitToLoyaltyCard).not.toHaveBeenCalled();
   });
 });

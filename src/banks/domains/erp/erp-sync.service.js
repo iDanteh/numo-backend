@@ -562,6 +562,7 @@ async function obtenerCuentaTicket({ rfc, serie, folio, fechaCreacion }) {
       saldoActual:          cuenta ? Number(cuenta.saldoActual) : null,
       factura:              cuenta?.serieFactura ? `${cuenta.serieFactura}-${cuenta.folioFactura ?? ''}` : null,
       liquidadaEl:          _liquidadaEl(cuenta),
+      abonos:               cuenta ? _abonosDeCuenta(cuenta) : null,
     };
   } catch (err) {
     const { logger } = require('../../../shared/utils/logger');
@@ -582,6 +583,39 @@ function _liquidadaEl(cuenta) {
     .map(m => new Date(m.fecha)).filter(f => !isNaN(f))
     .sort((a, b) => a - b).pop();
   return cierre ?? null;
+}
+
+// Historial de abonos de la cuenta (2026-11-10, reporte "Por facturar", pedido
+// del usuario: "la fecha y el movimiento de todos los abonos hasta que quedó
+// saldada"): cada movimiento de Kore menos el cargo de la venta, en orden —
+// p. ej. A0-260902996: CPF-261003396 19-oct DEPÓSITO EN EFECTIVO $1,663.32
+// (saldo $69.31) y RET-261024429 30-oct $69.31 (saldo 0). `importe` positivo
+// = abona; negativo = vuelve a cargar (p. ej. un abono cancelado).
+function _abonosDeCuenta(cuenta) {
+  const r2 = n => Math.round((Number(n) || 0) * 100) / 100;
+  const serieVenta = String(cuenta.serieExterna ?? '').trim().toUpperCase();
+  const folioVenta = String(cuenta.folioExterno ?? '').trim();
+  return (cuenta.movimientos ?? [])
+    // El cargo de la venta (origen = la propia remisión, saldo de 0 a total).
+    .filter(m => !(String(m.serieOrigen ?? '').trim().toUpperCase() === serieVenta && String(m.folioOrigen ?? '').trim() === folioVenta
+      && Math.abs(Number(m.saldoAnterior) || 0) < 0.005))
+    .map(m => {
+      const fps = m.formasPago ?? [];
+      const adicional = nombre => fps.flatMap(f => f.adicionales ?? [])
+        .find(a => String(a.nombre ?? '').trim().toLowerCase() === nombre && a.valor && a.valor !== 'NULL')?.valor ?? null;
+      return {
+        fecha:         m.fecha ?? null,
+        movimiento:    `${m.serie ?? ''}-${m.folio ?? ''}`,
+        origen:        m.serieOrigen ? `${m.serieOrigen}-${m.folioOrigen ?? ''}` : null,
+        forma:         fps.map(f => String(f.nombreFormaPago ?? f.nombre ?? '').trim()).filter(Boolean).join(' + ') || null,
+        importe:       r2(-(Number(m.total) || 0)),
+        saldoAnterior: r2(m.saldoAnterior),
+        saldo:         r2(m.saldoActual),
+        idNumo:        adicional('numo'),
+        banco:         adicional('banco'),
+      };
+    })
+    .sort((a, b) => new Date(a.fecha ?? 0) - new Date(b.fecha ?? 0));
 }
 
 async function obtenerNombrePersonaTicket(params) {

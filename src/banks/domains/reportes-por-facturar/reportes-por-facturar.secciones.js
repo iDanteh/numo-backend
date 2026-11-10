@@ -284,6 +284,7 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
       if (row.getCell(1).value instanceof Date) row.getCell(1).numFmt = 'd/m/yy';
       row.getCell(2).fill = _relleno(GRIS);
       row.getCell(colImporte).numFmt = DINERO;
+      _escribirAbonos(ws, d, n);
     }
     const sub = ws.addRow([]);
     sub.getCell(2).value = `Subtotal ${g.cliente}`;
@@ -300,6 +301,39 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
 }
 
 const _rem = d => (d.remisiones ?? []).join('\n');
+
+// Historial de abonos debajo del renglón (2026-11-10, pedido del usuario): un
+// renglón por abono — fecha, "↳ movimiento · forma · REM", importe y saldo en
+// el texto (la columna IMPORTE se deja vacía para no alterar sumas) — y al
+// final "✔ SALDADA el …" o el saldo que todavía debe.
+const _diaTexto = v => { const f = _fecha(v, true); return f ? `${f.getUTCDate()}/${f.getUTCMonth() + 1}/${String(f.getUTCFullYear()).slice(2)}` : ''; };
+const GRIS_ABONO = 'FF6B7280';
+
+function textoAbono(a, remision, varias) {
+  const partes = [`↳ ${a.movimiento}`, a.forma, varias ? `REM ${remision}` : null, a.idNumo ? `ID NUMO ${a.idNumo}` : null].filter(Boolean);
+  return `${partes.join(' · ')} — ${a.importe < 0 ? 'CARGO ' : ''}${_dinero(Math.abs(a.importe))} · saldo ${_dinero(a.saldo)}`;
+}
+
+function textoCierre(h, varias) {
+  const rem = varias ? ` (REM ${h.remision})` : '';
+  return h.saldadaEl ? `✔ SALDADA EL ${_diaTexto(h.saldadaEl)}${rem}` : `PENDIENTE: DEBE ${_dinero(h.saldo)}${rem}`;
+}
+
+function _escribirAbonos(ws, d, n) {
+  const historial = d.historialAbonos ?? [];
+  const varias = historial.length > 1;
+  for (const h of historial) {
+    for (const a of h.abonos) {
+      const row = ws.addRow([_fecha(a.fecha, true), textoAbono(a, h.remision, varias)]);
+      row.getCell(1).numFmt = 'd/m/yy';
+      row.font = { italic: true, size: 9, color: { argb: GRIS_ABONO } };
+      ws.mergeCells(row.number, 2, row.number, n);
+    }
+    const cierre = ws.addRow([null, textoCierre(h, varias)]);
+    cierre.font = { bold: true, size: 9, color: { argb: h.saldadaEl ? 'FF15803D' : 'FFB45309' } };
+    ws.mergeCells(cierre.number, 2, cierre.number, n);
+  }
+}
 
 // Al final de cada hoja: TOTAL EFECTIVO y, aparte, TOTAL DEPÓSITO EN EFECTIVO
 // (y las demás formas que haya).

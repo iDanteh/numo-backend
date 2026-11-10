@@ -65,8 +65,14 @@ test('Excel: un renglón por abono debajo del depósito y SALDADA / PENDIENTE al
   const filas = [];
   wb.worksheets[0].eachRow(r => filas.push(r.values.slice(1)));
   const i = filas.findIndex(f => f[1] === 'DEP EFECTIVO');
-  expect(filas[i + 1][1]).toBe('↳ CPF-261003396 · DEPOSITO EN EFECTIVO · ID NUMO 053049 — $1,663.32 · saldo $69.31');
-  expect(filas[i + 1][2]).not.toBe(1663.32);
-  expect(filas[i + 2][1]).toBe('↳ RET-261024429 — $69.31 · saldo $0.00');
-  expect(filas[i + 3][1]).toBe('✔ SALDADA EL 30/10/26');
+  // Sin renglón de encabezado con el nombre del cliente (2026-11-10).
+  expect(filas[i - 1][0]).toBe('FECHA');
+  // FECHA | CLIENTE | movimiento (la columna IMPORTE no lleva número).
+  expect(filas[i + 1][1]).toBe('JUAN');
+  expect(filas[i + 1][2]).toBe('↳ CPF-261003396 · DEPOSITO EN EFECTIVO · ID NUMO 053049 — $1,663.32 · saldo pendiente a esa fecha $69.31');
+  expect(filas[i + 2][2]).toBe('↳ RET-261024429 — $69.31 · saldo pendiente a esa fecha $0.00');
+  expect(filas[i + 3][1]).toBe('JUAN');
+  expect(filas[i + 3][2]).toBe('✔ SALDADA EL 30/10/26');
+  // La agrupación sigue: subtotal del cliente.
+  expect(filas[i + 4][1]).toBe('Subtotal JUAN');
 });

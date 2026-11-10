@@ -45,7 +45,7 @@ test('pestaña y hoja "A0 COBRADAS EN PUERTO"', async () => {
   const wb = new ExcelJS.Workbook();
   agregarHojasSeccion(wb, s, 'otraCaja');
   expect(wb.worksheets.map(w => w.name)).toEqual(['A0 COBRADAS EN PUERTO']);
-  expect(wb.worksheets[0].getRow(2).values.slice(1)).toEqual(['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'FORMA DE PAGO', 'FACTURA', 'REM', 'CLIENTE', 'CAJA', 'ID NUMO']);
+  expect(wb.worksheets[0].getRow(2).values.slice(1)).toEqual(['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'FORMA DE PAGO', 'FACTURA', 'REM', 'CAJA', 'ID NUMO']);
 });
 
 test('Kore no responde → cuenta las remisiones sin respuesta', async () => {

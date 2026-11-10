@@ -64,7 +64,9 @@ test('Excel: un renglón por abono debajo del depósito y SALDADA / PENDIENTE al
   expect(agregarHojasSeccion(wb, secciones, 'mostrador')).toBe(true);
   const filas = [];
   wb.worksheets[0].eachRow(r => filas.push(r.values.slice(1)));
-  const i = filas.findIndex(f => f[1] === 'DEP EFECTIVO');
+  const i = filas.findIndex(f => f[2] === 'DEP EFECTIVO');
+  // CLIENTE junto a la FECHA en el renglón del depósito.
+  expect(filas[i][1]).toBe('JUAN');
   // Sin renglón de encabezado con el nombre del cliente (2026-11-10).
   expect(filas[i - 1][0]).toBe('FECHA');
   // FECHA | CLIENTE | movimiento (la columna IMPORTE no lleva número).

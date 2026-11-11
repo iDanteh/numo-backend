@@ -242,7 +242,6 @@ function _otraCaja(cobros, sucursalDe) {
 const nombreHoja = (...partes) => partes.filter(Boolean).join(' - ').replace(/[:\\/?*[\]]/g, ' ').slice(0, 31);
 
 const MORADO = 'FF8E7CC3';
-const CLIENTE = 'FFE4DEF5';
 const GRIS = 'FFF3F3F3';
 const DINERO = '$#,##0.00';
 const _relleno = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
@@ -266,24 +265,29 @@ function _encabezado(row, n) {
 }
 
 /**
- * Escribe un bloque: encabezado(s), filas agrupadas por cliente (renglón del
- * cliente + depósitos + subtotal) y TOTAL. `fila(d)` → arreglo de celdas.
+ * Escribe un bloque: encabezado(s), filas agrupadas por cliente (depósitos +
+ * subtotal) y TOTAL. `fila(d)` → arreglo de celdas.
+ * 2026-11-10 (pedido del usuario): sin el renglón con el nombre del cliente
+ * arriba de cada grupo — la agrupación y el "Subtotal <cliente>" se quedan.
  */
-function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colImporte = 3 }) {
+// 2026-11-10 (usuario: "el cliente debe estar a un lado de la fecha y se
+// recorre lo demás"): en todas las hojas la 2ª columna es el CLIENTE, la
+// DESCRIPCIÓN pasa a la 3ª y el IMPORTE a la 4ª.
+const COL_IMPORTE = 4;
+const COL_DESCRIPCION = 3;
+
+function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colImporte = COL_IMPORTE }) {
   const n = columnas.length;
   for (const e of encabezados) _encabezado(ws.addRow(e), n);
   _encabezado(ws.addRow(columnas), n);
   for (const g of grupos) {
-    const nombre = ws.addRow([g.cliente]);
-    ws.mergeCells(nombre.number, 1, nombre.number, n);
-    nombre.font = { bold: true };
-    nombre.getCell(1).fill = _relleno(CLIENTE);
     for (const d of g.depositos) {
       const row = ws.addRow(fila(d));
       row.alignment = { vertical: 'middle', wrapText: true };
       if (row.getCell(1).value instanceof Date) row.getCell(1).numFmt = 'd/m/yy';
-      row.getCell(2).fill = _relleno(GRIS);
+      row.getCell(COL_DESCRIPCION).fill = _relleno(GRIS);
       row.getCell(colImporte).numFmt = DINERO;
+      _escribirAbonos(ws, d, n);
     }
     const sub = ws.addRow([]);
     sub.getCell(2).value = `Subtotal ${g.cliente}`;
@@ -301,9 +305,48 @@ function _escribirBloque(ws, { encabezados, columnas, grupos, total, fila, colIm
 
 const _rem = d => (d.remisiones ?? []).join('\n');
 
+// Historial de abonos debajo del renglón (2026-11-10, pedido del usuario): un
+// renglón por abono — fecha, "↳ movimiento · forma · REM", importe y saldo en
+// el texto (la columna IMPORTE se deja vacía para no alterar sumas) — y al
+// final "✔ SALDADA el …" o el saldo que todavía debe.
+const _diaTexto = v => { const f = _fecha(v, true); return f ? `${f.getUTCDate()}/${f.getUTCMonth() + 1}/${String(f.getUTCFullYear()).slice(2)}` : ''; };
+const GRIS_ABONO = 'FF6B7280';
+
+// 2026-11-10 (usuario): "saldo pendiente a esa fecha" — lo que quedó debiendo
+// la remisión después de ese movimiento.
+function textoAbono(a, remision, varias) {
+  const partes = [`↳ ${a.movimiento}`, a.forma, varias ? `REM ${remision}` : null, a.idNumo ? `ID NUMO ${a.idNumo}` : null].filter(Boolean);
+  return `${partes.join(' · ')} — ${a.importe < 0 ? 'CARGO ' : ''}${_dinero(Math.abs(a.importe))} · saldo pendiente a esa fecha ${_dinero(a.saldo)}`;
+}
+
+function textoCierre(h, varias) {
+  const rem = varias ? ` (REM ${h.remision})` : '';
+  return h.saldadaEl ? `✔ SALDADA EL ${_diaTexto(h.saldadaEl)}${rem}` : `PENDIENTE: DEBE ${_dinero(h.saldo)}${rem}`;
+}
+
+// Renglón de abono: FECHA | CLIENTE | movimiento… (2026-11-10, usuario: "después
+// de la fecha, el nombre del cliente"; letra 9 — se probó 11 y pidió regresar a 9).
+function _escribirAbonos(ws, d, n) {
+  const historial = d.historialAbonos ?? [];
+  const varias = historial.length > 1;
+  const cliente = d.cliente || NO_IDENTIFICADO;
+  for (const h of historial) {
+    for (const a of h.abonos) {
+      const row = ws.addRow([_fecha(a.fecha, true), cliente, textoAbono(a, h.remision, varias)]);
+      row.getCell(1).numFmt = 'd/m/yy';
+      row.font = { italic: true, size: 9, color: { argb: GRIS_ABONO } };
+      row.alignment = { vertical: 'middle', wrapText: true };
+      ws.mergeCells(row.number, 3, row.number, n);
+    }
+    const cierre = ws.addRow([null, cliente, textoCierre(h, varias)]);
+    cierre.font = { bold: true, size: 9, color: { argb: h.saldadaEl ? 'FF15803D' : 'FFB45309' } };
+    ws.mergeCells(cierre.number, 3, cierre.number, n);
+  }
+}
+
 // Al final de cada hoja: TOTAL EFECTIVO y, aparte, TOTAL DEPÓSITO EN EFECTIVO
 // (y las demás formas que haya).
-function _totalesFormaPago(ws, bloques, colImporte = 3) {
+function _totalesFormaPago(ws, bloques, colImporte = COL_IMPORTE) {
   const t = totalesPorForma(bloques);
   const filas = [['TOTAL EFECTIVO', t.efectivo], ['TOTAL DEPÓSITO EN EFECTIVO (APARTE)', t.depositoEfectivo],
     ...FORMAS.filter(([f]) => !['efectivo', 'depositoEfectivo'].includes(f) && t[f] > 0.005).map(([f, e]) => [`TOTAL ${e}`, t[f]])];
@@ -320,16 +363,16 @@ function _totalesFormaPago(ws, bloques, colImporte = 3) {
 function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.hoja) {
   if (!bloques.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 18 }, { width: 32 }, { width: 10 }];
+  ws.columns = [{ width: 11 }, { width: 32 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 18 }, { width: 10 }];
   for (const b of bloques) {
     _escribirBloque(ws, {
       encabezados: [b.tipo === 'global'
         ? [_fecha(b.fechaFactura, true), b.otrasFacturas?.length ? `TAMBIÉN FACTURADA EN: ${b.otrasFacturas.join(', ')}` : null, null, null, null, b.serie, b.factura, 'ID NUMO']
         : [_fecha(b.fecha), 'PENDIENTE GENERAR FACTURA', null, null, null, null, null, 'ID NUMO']],
-      columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', 'CLIENTE', null],
+      columnas: ['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', null],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha, d.deKore), d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.cliente || NO_IDENTIFICADO, d.idNumo],
+      fila: d => [_fecha(d.fecha, d.deKore), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.idNumo],
     });
   }
   _totalesFormaPago(ws, bloques);
@@ -340,15 +383,15 @@ function agregarHojaMostrador(workbook, bloques, nombre = SECCIONES.mostrador.ho
 function agregarHojaRef(workbook, bloques, nombre, etiquetaSerie) {
   if (!bloques.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 16 }, { width: 22 }, { width: 30 }, { width: 30 }, { width: 11 }];
+  ws.columns = [{ width: 11 }, { width: 30 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 16 }, { width: 22 }, { width: 30 }, { width: 11 }];
   for (const b of bloques) {
     const serie = etiquetaSerie ?? b.serie;
     _escribirBloque(ws, {
       encabezados: [[b.sucursal || b.serie || '', _fecha(b.fecha), null, null, null, null, 'INFORMACIÓN ADICIONAL', null, null, null]],
-      columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', serie || 'FACTURA', etiquetaSerie ? 'ORIGEN' : `${serie || ''} ORIGEN`.trim(), 'CTE', 'CTE FACTURADO', 'ID DE PAGO'],
+      columnas: ['FECHA', 'CTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', serie || 'FACTURA', etiquetaSerie ? 'ORIGEN' : `${serie || ''} ORIGEN`.trim(), 'CTE FACTURADO', 'ID DE PAGO'],
       grupos: b.grupos,
       total: b.total,
-      fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, d.factura ?? '', _rem(d), d.cliente || NO_IDENTIFICADO, d.clienteFacturado ?? '', d.idNumo],
+      fila: d => [_fecha(d.fecha), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.banco, d.formaPago, d.factura ?? '', _rem(d), d.clienteFacturado ?? '', d.idNumo],
     });
   }
   _totalesFormaPago(ws, bloques);
@@ -360,13 +403,13 @@ function agregarHojaOtraCaja(workbook, entrada) {
   const [b] = entrada.bloques;
   if (!b?.grupos.length) return false;
   const ws = workbook.addWorksheet(nombreHoja(entrada.titulo));
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 18 }, { width: 30 }, { width: 10 }, { width: 10 }];
+  ws.columns = [{ width: 11 }, { width: 30 }, { width: 40 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 18 }, { width: 10 }, { width: 10 }];
   _escribirBloque(ws, {
     encabezados: [[entrada.titulo, null, null, null, null, null, null, null, null]],
-    columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'FORMA DE PAGO', 'FACTURA', 'REM', 'CLIENTE', 'CAJA', 'ID NUMO'],
+    columnas: ['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'FORMA DE PAGO', 'FACTURA', 'REM', 'CAJA', 'ID NUMO'],
     grupos: b.grupos,
     total: b.total,
-    fila: d => [_fecha(d.fecha, true), d.descripcion, d.importe, d.formaPago, d.factura ?? '', _rem(d), d.cliente || NO_IDENTIFICADO, d.caja, d.idNumo],
+    fila: d => [_fecha(d.fecha, true), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.formaPago, d.factura ?? '', _rem(d), d.caja, d.idNumo],
   });
   ws.mergeCells(1, 1, 1, 9);
   _totalesFormaPago(ws, entrada.bloques);
@@ -376,13 +419,13 @@ function agregarHojaOtraCaja(workbook, entrada) {
 function agregarHojaFicha(workbook, bloque, nombre = SECCIONES.ficha.hoja) {
   if (!bloque.grupos.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [{ width: 11 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 30 }, { width: 18 }, { width: 15 }, { width: 12 }, { width: 10 }];
+  ws.columns = [{ width: 11 }, { width: 30 }, { width: 40 }, { width: 14 }, { width: 13 }, { width: 24 }, { width: 18 }, { width: 15 }, { width: 12 }, { width: 10 }];
   _escribirBloque(ws, {
     encabezados: [['X FAC CON FICHA DE DEP — POR FACTURAR, TODAVÍA DEBEN SALDO', null, null, null, null, null, null, null, null, null]],
-    columnas: ['FECHA', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'CLIENTE', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
+    columnas: ['FECHA', 'CLIENTE', 'DESCRIPCIÓN', 'IMPORTE', 'BANCO', 'FORMA DE PAGO', 'REM', 'SALDO PENDIENTE', 'ESTATUS', 'ID NUMO'],
     grupos: bloque.grupos,
     total: bloque.total,
-    fila: d => [_fecha(d.fecha), d.descripcion, d.importe, d.banco, d.formaPago, d.cliente || NO_IDENTIFICADO, _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
+    fila: d => [_fecha(d.fecha), d.cliente || NO_IDENTIFICADO, d.descripcion, d.importe, d.banco, d.formaPago, _rem(d), d.saldo ?? null, 'ABONADO', d.idNumo],
   });
   ws.mergeCells(1, 1, 1, 10);
   ws.eachRow(row => { if (typeof row.getCell(8).value === 'number') row.getCell(8).numFmt = DINERO; });

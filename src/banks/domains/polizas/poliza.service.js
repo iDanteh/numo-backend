@@ -1403,6 +1403,11 @@ const CODIGOS_CUENTA_PUENTE = new Set(['1101010003', '1102010004', '1102011005']
 // tiene cuenta dedicada en BANCO_A_CODIGO_CUENTA (ver generarYGuardarTraspasos).
 const CODIGO_CUENTA_PUENTE_BANCOS = '1102011005';
 
+// Cobros de otra sucursal sin depósito real ligado: Efectivo (y lo demás) a
+// Caja por identificar; TARJETA a Caja (2026-11-10, pedido del usuario).
+const CODIGO_CUENTA_CAJA_POR_IDENTIFICAR = '1101010003';
+const CODIGO_CUENTA_CAJA_TARJETA_COS     = '1101010001';
+
 /**
  * Reemplaza, en los movimientos de la póliza, la cuenta genérica ("Bancos por
  * identificar") por la cuenta bancaria real — usando el mismo cruce
@@ -3290,7 +3295,7 @@ function _categoriaCobroSucursal(f) {
   return 5;
 }
 
-function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, netpayMatchedIds = null) {
+function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, netpayMatchedIds = null, cuentaTarjetaCobroSucursal = null) {
   const resto = [];
   const filas = [];
   // SF-OCULTO: generados y usados el mismo día en la misma sucursal — no van
@@ -3676,9 +3681,17 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
   // usuario 2026-09-24. Los que SÍ traen folio/autorización de un depósito
   // real conservan su cuenta de banco (BBVA/Banamex). SF/Puntos no se tocan.
   const CUENTAS_COS_A_CAJA = new Set(['1102011005', '2103040001']);
+  // 2026-11-10 (pedido del usuario: "solo tarjetas en cobros de otra sucursal
+  // se vaya 1101010001"): la TARJETA de otra sucursal sin depósito real ligado
+  // va a Caja (1101010001) en vez de Caja por identificar — el Efectivo y lo
+  // demás siguen en 1101010003. También la que ya venía en 1101010003.
+  const CUENTAS_COS_TARJETA_A_CAJA = new Set([...CUENTAS_COS_A_CAJA, CODIGO_CUENTA_CAJA_POR_IDENTIFICAR]);
+  const _esTarjetaCos = f => (f._formaPagoLabel ?? '').toUpperCase().includes('TARJETA');
   for (const f of filas) {
-    if (cuentaCajaCobroSucursal && CUENTAS_COS_A_CAJA.has(f.cuenta?.codigo)
-        && !_esReferenciaBancoRealGenuina(f._referenciaBancoReal)) {
+    const sinBancoReal = !_esReferenciaBancoRealGenuina(f._referenciaBancoReal);
+    if (cuentaTarjetaCobroSucursal && _esTarjetaCos(f) && sinBancoReal && CUENTAS_COS_TARJETA_A_CAJA.has(f.cuenta?.codigo)) {
+      f.cuenta = cuentaTarjetaCobroSucursal;
+    } else if (cuentaCajaCobroSucursal && CUENTAS_COS_A_CAJA.has(f.cuenta?.codigo) && sinBancoReal) {
       f.cuenta = cuentaCajaCobroSucursal;
     }
     f.serie = f._esVentaSinCobro
@@ -4390,8 +4403,10 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
   const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(
     movimientos,
-    await AccountPlan.findOne({ where: { codigo: '1101010003' }, attributes: ['id', 'codigo', 'nombre'], raw: true }),
+    await AccountPlan.findOne({ where: { codigo: CODIGO_CUENTA_CAJA_POR_IDENTIFICAR }, attributes: ['id', 'codigo', 'nombre'], raw: true }),
     netpayInfo.matchedIds,
+    // Tarjeta de otra sucursal → Caja (2026-11-10).
+    await AccountPlan.findOne({ where: { codigo: CODIGO_CUENTA_CAJA_TARJETA_COS }, attributes: ['id', 'codigo', 'nombre'], raw: true }),
   );
   movimientos = movimientosSinCobroSucursal;
 
@@ -4661,6 +4676,20 @@ async function exportContpaqXlsx(id, overrides = {}) {
   _conservarAdDeEgresosOcultos(bloques, movimientos);
   if (poliza.tipo === 'I') await _unificarRenglonesPorDepositoBancario(bloques);
   if (poliza.tipo === 'I') _ordenarCobrosIngreso(bloques);
+
+  // Hoja informativa "Facturas Sin Timbrar" (2026-11-09): facturas/NC de esta
+  // sucursal y día que existen en Kore pero aún no se timbran. NO toca los
+  // movimientos; si la consulta falla, el export sale igual sin la hoja.
+  if (poliza.tipo === 'I') {
+    try {
+      const { sinTimbrarDePolizas } = require('../cfdi-mapping/sin-timbrar.service');
+      poliza.facturasSinTimbrar = (await sinTimbrarDePolizas([poliza.id]))[poliza.id]?.facturas ?? [];
+    } catch (err) {
+      const { logger } = require('../../../shared/utils/logger');
+      logger.warn(`[exportContpaqXlsx] sin timbrar no disponible para póliza ${poliza.id}: ${err.message}`);
+      poliza.facturasSinTimbrar = [];
+    }
+  }
 
   if (esCedis) {
     // CEDIS: 3 archivos — Ventas (Contado+Crédito), Bonificaciones (Contado+
@@ -5342,6 +5371,40 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // póliza. La arma mostrador-hoja.js (la misma que usa el reporte "Por
   // facturar" de Reportes).
   if (incluirMostrador) agregarHojaMostrador(workbook, poliza);
+
+  // Hoja "Facturas Sin Timbrar" (2026-11-09) — informativo, al final. Mismo
+  // criterio que MOSTRADOR: en CEDIS solo en el archivo de Ventas.
+  if (incluirMostrador && poliza.facturasSinTimbrar?.length > 0) {
+    const wsSt = workbook.addWorksheet('Facturas Sin Timbrar');
+    wsSt.columns = [
+      { header: 'Folio',            key: 'serieFolio',     width: 16 },
+      { header: 'Día',              key: 'dia',            width: 12 },
+      { header: 'Días sin timbrar', key: 'diasSinTimbrar', width: 16 },
+      { header: 'Tipo',             key: 'tipo',           width: 16 },
+      { header: 'Pago',             key: 'metodoPago',     width: 8 },
+      { header: 'Forma',            key: 'formaPago',      width: 8 },
+      { header: 'Subtotal',         key: 'subTotal',       width: 14 },
+      { header: 'Total',            key: 'total',          width: 14 },
+      { header: 'Cliente',          key: 'cliente',        width: 36 },
+      { header: 'RFC cliente',      key: 'rfcCliente',     width: 15 },
+      { header: 'Sucursal',         key: 'sucursal',       width: 16 },
+    ];
+    wsSt.getRow(1).font = { bold: true };
+    wsSt.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFE699' } };
+    });
+    for (const f of poliza.facturasSinTimbrar) {
+      const [y, m, d] = String(f.dia || '').split('-');
+      const row = wsSt.addRow({
+        ...f,
+        dia: d ? `${d}/${m}/${y}` : '',
+        tipo: f.tipo === 'E' ? 'Nota de crédito' : 'Factura',
+      });
+      row.getCell('subTotal').numFmt = '#,##0.00';
+      row.getCell('total').numFmt = '#,##0.00';
+    }
+    wsSt.autoFilter = { from: 'A1', to: 'K1' };
+  }
 
   return workbook;
 }

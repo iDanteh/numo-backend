@@ -72,3 +72,22 @@ test('efectivo del mismo mes: a Caja, como siempre', () => {
   expect(movs.filter(m => m.reglaNombre === 'NI')).toHaveLength(0);
   expect(cargoA(movs, CAJA)).toBe(6498.00);
 });
+
+// 2026-11-11, IRAN MARINO SAGUILAN VASQUEZ: Pago A0-261101641 ($5,662.70, transferencia) con regla de
+// tasa mixta (16%+0%): no se parte por factura, y el Cargo no llevaba el uuid de la factura que liquida,
+// así que el export no lo cruzaba con su depósito real (BBVA 057027, ligado a esa factura).
+test('regla mixta con una sola factura: el Cargo lleva el uuid de la factura para cruzar el depósito', () => {
+  const reglaMixta = { ...rule, tasaIva: 'mixto', cuentaAbono2: '1103010002' };
+  const cfdi = {
+    uuid: '53EDF60E-0A78-45D6-94CA-0845667AB437', serie: 'A0', folio: '261101641', tipoDeComprobante: 'P', fecha: '2026-11-06T11:31:50.000Z',
+    receptor: { nombre: 'IRAN MARINO SAGUILAN VASQUEZ', rfc: 'SAVI000000XX0' }, emisor: { rfc: 'EMISOR' },
+    complementoPago: { totales: { montoTotalPagos: 5662.7, totalTrasladosBaseIVA16: 4756.41, totalTrasladosImpuestoIVA16: 761.03 }, pagos: [{ formaDePagoP: '03' }] },
+  };
+  const doctosPago = [{ serie: 'A0', folio: '261011176', monto: 5662.7, ivaDoc: 761.03, idDocumento: 'E5E7C573-77EE-46F5-89CA-70712578AF0E' }];
+  const { movs } = cfdiToMovimientosCobranza(cfdi, reglaMixta, { ...cuentaMap, '1103010002': 10 }, { doctosPago });
+  const cargo = movs.find(m => m._esCargoPrincipal);
+  expect(cargo).toMatchObject({ debe: 5662.7, facturaUuid: 'E5E7C573-77EE-46F5-89CA-70712578AF0E', cfdiUuid: cfdi.uuid });
+  // Con dos facturas no se atribuye a ninguna.
+  const dos = cfdiToMovimientosCobranza(cfdi, reglaMixta, { ...cuentaMap, '1103010002': 10 }, { doctosPago: [...doctosPago, { ...doctosPago[0], idDocumento: 'OTRA' }] }).movs;
+  expect(dos.find(m => m._esCargoPrincipal).facturaUuid).toBeUndefined();
+});

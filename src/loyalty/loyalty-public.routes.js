@@ -82,7 +82,12 @@ function crearLimitersRecuperacion() {
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfter: 60,
   });
-  const base = { standardHeaders: true, legacyHeaders: false, handler };
+  // `passOnStoreError: true` (hallazgo real 2026-11-11, ver mismo criterio en
+  // app.js): un fallo del store de Redis degrada a "sin límite" en vez de
+  // bloquear la request — Redis caído nunca debe tumbar el tráfico real.
+  const base = {
+    standardHeaders: true, legacyHeaders: false, handler, passOnStoreError: true,
+  };
   return {
     solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_SOLICITAR_MAX', 3), store: _redisStore('rl:loyalty-solicitar:') }),
     confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_CONFIRMAR_MAX', 10), store: _redisStore('rl:loyalty-confirmar:') }),
@@ -103,7 +108,10 @@ function crearLimitersSesion() {
     code: 'RATE_LIMIT_EXCEEDED',
     retryAfter: 60,
   });
-  const base = { standardHeaders: true, legacyHeaders: false, handler };
+  // `passOnStoreError: true` — ver el mismo comentario en crearLimitersRecuperacion().
+  const base = {
+    standardHeaders: true, legacyHeaders: false, handler, passOnStoreError: true,
+  };
   return {
     ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10), store: _redisStore('rl:loyalty-ver:') }),
     email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20), store: _redisStore('rl:loyalty-email:') }),

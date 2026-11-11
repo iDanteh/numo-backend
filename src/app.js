@@ -115,6 +115,15 @@ const limiter = rateLimit({
   max:      config.rateLimit.max,
   standardHeaders: true,
   legacyHeaders:   false,
+  // `passOnStoreError: true` (hallazgo real 2026-11-11, bloqueaba TODO el tráfico
+  // en dev local sin Redis levantado): sin esto, un error del store (Redis caído,
+  // o el cliente en estado 'closed' tras agotar el reconnectStrategy acotado de
+  // redis-client.js) hace que express-rate-limit llame `next(error)` — el error
+  // termina frenando la request entera en vez de solo perder el rate limit
+  // distribuido. Con esto, un fallo de Redis degrada a "sin límite" (logueado por
+  // la propia librería), nunca tumba el tráfico — mismo criterio de "Redis caído
+  // nunca debe bloquear nada" ya aplicado al adapter de sockets.
+  passOnStoreError: true,
   store: new RedisStore({
     prefix:      'rl:global:',
     sendCommand: (...args) => redisClient.sendCommand(args),

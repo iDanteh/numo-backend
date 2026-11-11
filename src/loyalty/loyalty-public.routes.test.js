@@ -14,6 +14,48 @@
 jest.mock('./domains/public/loyalty-public.service');
 jest.mock('./domains/public/loyalty-recovery.service');
 
+// Store en Redis de los 4 limiters dedicados (solicitar/confirmar/ver/email,
+// consultoría de desempeño 2026-11-11: cluster nativo + Redis) — mockea
+// `rate-limit-redis` y `./shared/utils/redis-client` de la misma forma que el
+// resto de este archivo mockea los services: `express-rate-limit` en sí sigue
+// siendo REAL (no mockeado, mismo criterio que ya usaba este archivo), así
+// que el `store` que le pasamos SÍ debe implementar el contrato real
+// (`increment`/`decrement`/`resetKey`, más `init(options)` opcional donde
+// express-rate-limit le inyecta `windowMs`) para que el conteo de 429 sea
+// idéntico al que ya afirman los tests de abajo — un mock "tonto" (solo
+// jest.fn() vacíos) rompería todas las aserciones de "el Nvo request → 429".
+// `./shared/utils/redis-client` se mockea para no disparar su side-effect de
+// connect() real (no hay Redis en CI/local para estos tests).
+jest.mock('../shared/utils/redis-client', () => ({ sendCommand: jest.fn() }));
+jest.mock('rate-limit-redis', () => {
+  function FakeRedisStore(options) {
+    this.options = options;
+    this.hits = new Map();
+    this.windowMs = 0;
+    this.init = (opts) => { this.windowMs = opts.windowMs; };
+    this.increment = async (key) => {
+      const now = Date.now();
+      let entry = this.hits.get(key);
+      if (!entry || entry.resetTime.getTime() <= now) {
+        entry = { totalHits: 0, resetTime: new Date(now + this.windowMs) };
+      }
+      entry.totalHits += 1;
+      this.hits.set(key, entry);
+      return { totalHits: entry.totalHits, resetTime: entry.resetTime };
+    };
+    this.decrement = async (key) => {
+      const entry = this.hits.get(key);
+      if (entry && entry.totalHits > 0) entry.totalHits -= 1;
+    };
+    this.resetKey = async (key) => { this.hits.delete(key); };
+  }
+  // jest.fn(impl) sigue siendo `new`-able — permite afirmar sobre
+  // `RedisStore.mock.calls`/`.mock.instances` (una instancia nueva, con su
+  // propio Map, por cada `new RedisStore(...)` — ver _redisStore() en
+  // loyalty-public.routes.js: NUNCA un store compartido entre limiters).
+  return { RedisStore: jest.fn(FakeRedisStore) };
+});
+
 const express = require('express');
 const request = require('supertest');
 const errorHandler = require('../shared/middleware/error-handler');
@@ -24,6 +66,7 @@ function freshApp() {
   jest.resetModules();
   const publicService = require('./domains/public/loyalty-public.service');
   const recoveryService = require('./domains/public/loyalty-recovery.service');
+  const { RedisStore } = require('rate-limit-redis');
   const loyaltyPublicRoutes = require('./loyalty-public.routes');
 
   const app = express();
@@ -31,7 +74,7 @@ function freshApp() {
   app.use('/api/loyalty/public', loyaltyPublicRoutes);
   app.use(errorHandler);
 
-  return { app, publicService, recoveryService, loyaltyPublicRoutes };
+  return { app, publicService, recoveryService, loyaltyPublicRoutes, RedisStore };
 }
 
 test('no hay authenticate en la cadena: sin Authorization igual llega al service', async () => {
@@ -313,5 +356,35 @@ describe('sesión de consulta post-código (2026-11-09) — "ver de nuevo" + ema
     const par2 = crearLimitersSesion();
     expect(par1.ver).not.toBe(par2.ver);
     expect(par1.email).not.toBe(par2.email);
+  });
+});
+
+describe('store en Redis de los 4 limiters dedicados (cluster nativo + Redis, 2026-11-11)', () => {
+  test('cargar el router construye 4 RedisStore — uno por limiter, cada uno con su propio prefix (nunca un store compartido)', () => {
+    const { RedisStore } = freshApp();
+
+    // app.js también usa RedisStore (limiter global, prefix 'rl:global:'), pero ese vive
+    // en otro módulo (app.js no se requiere en este test) — acá solo cargan los 4 de
+    // loyalty-public.routes.js: solicitar/confirmar (crearLimitersRecuperacion, ya
+    // instanciados a nivel de módulo) + ver/email (crearLimitersSesion, ídem).
+    expect(RedisStore).toHaveBeenCalledTimes(4);
+
+    const prefixes = RedisStore.mock.calls.map(([options]) => options.prefix);
+    expect(new Set(prefixes).size).toBe(4); // los 4 prefixes son distintos entre sí
+    expect(prefixes).toEqual(expect.arrayContaining([
+      'rl:loyalty-solicitar:', 'rl:loyalty-confirmar:', 'rl:loyalty-ver:', 'rl:loyalty-email:',
+    ]));
+
+    // Cada llamada recibe un `sendCommand` propio que delega al redisClient compartido —
+    // no literalmente la misma función entre limiters, pero sí la misma firma/contrato.
+    RedisStore.mock.calls.forEach(([options]) => {
+      expect(typeof options.sendCommand).toBe('function');
+    });
+
+    // 4 instancias distintas (cada `new RedisStore(...)` arma su propio Map interno) —
+    // es justo lo que evita que, p. ej., /recuperacion/solicitar y /recuperacion/confirmar
+    // (o /consulta/ver y /consulta/email) pisen el contador del otro en Redis.
+    const instancias = new Set(RedisStore.mock.instances);
+    expect(instancias.size).toBe(4);
   });
 });

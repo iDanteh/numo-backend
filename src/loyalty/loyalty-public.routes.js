@@ -22,6 +22,8 @@
  */
 const express = require('express');
 const rateLimit = require('express-rate-limit');
+const { RedisStore } = require('rate-limit-redis');
+const redisClient = require('../shared/utils/redis-client');
 const { asyncHandler } = require('../shared/middleware/error-handler');
 const publicService = require('./domains/public/loyalty-public.service');
 const recoveryService = require('./domains/public/loyalty-recovery.service');
@@ -60,6 +62,19 @@ function _maxConStress(envVar, defaultMax) {
   return (process.env.NODE_ENV !== 'production' && Number(process.env[envVar])) || defaultMax;
 }
 
+// Store en Redis para que el presupuesto de cada limiter sea real cross-worker bajo
+// cluster nativo (src/cluster.js) — sin esto, cada worker llevaría su propia cuenta en
+// memoria y el límite efectivo sería `max * workers`. UN `RedisStore` nuevo POR limiter
+// (nunca uno compartido en `base`, pese a que `base` sí se comparte entre los dos
+// limiters de cada factory de abajo): `rate-limit-redis` arma la key de Redis como
+// `prefix + key` y `key` por default es solo la IP — si `solicitar`/`confirmar` (o
+// `ver`/`email`) compartieran la MISMA instancia con el MISMO prefix, un request a
+// cualquiera de los dos incrementaría el mismo contador en Redis y sus presupuestos
+// (3/15min vs. 10/15min, o 10/15min vs. 20/15min) dejarían de ser independientes.
+function _redisStore(prefix) {
+  return new RedisStore({ prefix, sendCommand: (...args) => redisClient.sendCommand(args) });
+}
+
 function crearLimitersRecuperacion() {
   const handler = (_req, res) => res.status(429).json({
     success: false,
@@ -69,8 +84,8 @@ function crearLimitersRecuperacion() {
   });
   const base = { standardHeaders: true, legacyHeaders: false, handler };
   return {
-    solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_SOLICITAR_MAX', 3) }),
-    confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_CONFIRMAR_MAX', 10) }),
+    solicitar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_SOLICITAR_MAX', 3), store: _redisStore('rl:loyalty-solicitar:') }),
+    confirmar: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_CONFIRMAR_MAX', 10), store: _redisStore('rl:loyalty-confirmar:') }),
   };
 }
 
@@ -90,8 +105,8 @@ function crearLimitersSesion() {
   });
   const base = { standardHeaders: true, legacyHeaders: false, handler };
   return {
-    ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10) }),
-    email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20) }),
+    ver:   rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_VER_MAX', 10), store: _redisStore('rl:loyalty-ver:') }),
+    email: rateLimit({ ...base, windowMs: 15 * 60 * 1000, max: _maxConStress('STRESS_TEST_EMAIL_MAX', 20), store: _redisStore('rl:loyalty-email:') }),
   };
 }
 

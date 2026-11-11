@@ -1,5 +1,6 @@
 require('dotenv').config();
 const config = require('./config/env');
+const cluster     = require('cluster');
 const http        = require('http');
 const express     = require('express');
 const helmet      = require('helmet');
@@ -7,14 +8,40 @@ const cors        = require('cors');
 const morgan      = require('morgan');
 const compression = require('compression');
 const rateLimit   = require('express-rate-limit');
+const { RedisStore } = require('rate-limit-redis');
+const redisClient = require('./shared/utils/redis-client');
 const socketMgr   = require('./banks/shared/socket');
 const { trafficTracker } = require('./system-monitor/traffic-tracker.middleware');
+
+// Bajo cluster nativo (src/cluster.js), este proceso es un worker — solo el
+// primero (id===1) corre tareas de arranque "una sola vez" (cron jobs, seed,
+// housekeeping). Sin cluster (node src/app.js directo, como en dev local),
+// cluster.isWorker es false y esta condición es simplemente true siempre —
+// cero regresión para quien no usa cluster.js todavía.
+const ES_WORKER_PRIMARIO = !cluster.isWorker || cluster.worker.id === 1;
 
 const { connectDB, disconnectDB } = require('./config/database');
 const { checkMongoOk, checkPostgresOk } = require('./shared/utils/db-health');
 const seed             = require('./banks/scripts/seed');
 const { logger }   = require('./shared/utils/logger');
 const errorHandler = require('./shared/middleware/error-handler');
+
+// Registrado ACÁ (antes de `new RedisStore(...)` más abajo, tanto el del limiter
+// global de este archivo como los 4 de loyalty-public.routes.js) y no dentro de
+// `startServer()` como el resto de los handlers de proceso (ver el comentario
+// junto a 'uncaughtException', más abajo, que explica el motivo): sin Redis
+// levantado, `RedisStore` (rate-limit-redis) dispara sus llamadas SCRIPT LOAD de
+// forma async-sin-await al CONSTRUIRSE — mucho antes de que `startServer()`
+// llegara a registrar este mismo handler. Esa promesa rechaza, y sin un handler
+// YA puesto en ese momento el proceso moría con un crash crudo (reproducido
+// corriendo el proceso real sin Redis), pasando por encima del criterio de este
+// proyecto de "un fallo de infra no fatal se loguea y sigue".
+process.on('unhandledRejection', (reason) => {
+  // Antes se interpolaba `reason` directo en el string, perdiendo el .stack — el
+  // logger sí lo soporta (mismo mecanismo que ya usa error-handler.js) si se lo
+  // pasamos como meta en vez de stringificarlo de entrada.
+  logger.error(`[unhandledRejection] ${reason?.message || reason}`, { stack: reason?.stack });
+});
 
 // Domain routers — Banks module
 const bankRoutes              = require('./banks/domains/banks/bank.routes');
@@ -75,12 +102,23 @@ app.use(cors({
   credentials: true,
 }));
 
-// Rate limiting — global: 600 req / 15 min (40/min promedio)
+// Rate limiting — global: 600 req / 15 min (40/min promedio). Store en Redis
+// (RedisStore de rate-limit-redis) para que el límite sea real cross-worker
+// bajo cluster nativo (src/cluster.js) — sin esto, cada worker llevaría su
+// propia cuenta en memoria y el límite efectivo sería `max * workers`.
+// `prefix` propio ('rl:global:') para no compartir keys de Redis con los
+// limiters dedicados de loyalty-public.routes.js (mismo redisClient, mismo
+// IP como key por default — sin prefijos distintos, dos limiters distintos
+// pisarían el mismo contador).
 const limiter = rateLimit({
   windowMs: config.rateLimit.windowMs,
   max:      config.rateLimit.max,
   standardHeaders: true,
   legacyHeaders:   false,
+  store: new RedisStore({
+    prefix:      'rl:global:',
+    sendCommand: (...args) => redisClient.sendCommand(args),
+  }),
   handler: (req, res) => {
     const resetMs = req.rateLimit.resetTime instanceof Date
       ? req.rateLimit.resetTime.getTime()
@@ -211,42 +249,51 @@ const PORT = process.env.PORT || 3000;
 const startServer = async () => {
   await connectDB();
 
-  // Limpiar sesiones de comparación que quedaron en 'running' por un reinicio anterior.
-  // Si el proceso fue interrumpido (deploy, OOM, SIGKILL) mientras corría un batch,
-  // la sesión nunca llegó a marcarse 'completed' o 'failed' → queda en 'running' para siempre.
-  try {
-    const ComparisonSession = require('./visor/models/ComparisonSession');
-    const { modifiedCount } = await ComparisonSession.updateMany(
-      { status: 'running' },
-      { $set: { status: 'failed', completedAt: new Date(), failureReason: 'Servidor reiniciado mientras el proceso estaba en curso' } },
-    );
-    if (modifiedCount > 0) {
-      logger.warn(`[startup] ${modifiedCount} sesión(es) de comparación quedaron en 'running' — marcadas como 'failed'`);
+  // Cron jobs, seed y housekeeping de arranque corren UNA SOLA VEZ — bajo cluster
+  // nativo (src/cluster.js) con N workers, si este bloque corriera en todos, los
+  // 9 cron jobs se registrarían N veces (puntos de Lealtad descontados N veces,
+  // alertas mandadas N veces, etc.) y N workers competirían sembrando el catálogo
+  // en paralelo. `connectDB()` (arriba) y el server HTTP (abajo) quedan FUERA del
+  // gate: toda instancia de Node, sea primario standalone o cada worker, necesita
+  // su propia conexión a BD y debe levantar su propio servidor para atender requests.
+  if (ES_WORKER_PRIMARIO) {
+    // Limpiar sesiones de comparación que quedaron en 'running' por un reinicio anterior.
+    // Si el proceso fue interrumpido (deploy, OOM, SIGKILL) mientras corría un batch,
+    // la sesión nunca llegó a marcarse 'completed' o 'failed' → queda en 'running' para siempre.
+    try {
+      const ComparisonSession = require('./visor/models/ComparisonSession');
+      const { modifiedCount } = await ComparisonSession.updateMany(
+        { status: 'running' },
+        { $set: { status: 'failed', completedAt: new Date(), failureReason: 'Servidor reiniciado mientras el proceso estaba en curso' } },
+      );
+      if (modifiedCount > 0) {
+        logger.warn(`[startup] ${modifiedCount} sesión(es) de comparación quedaron en 'running' — marcadas como 'failed'`);
+      }
+    } catch (err) {
+      logger.error('[startup] No se pudieron limpiar sesiones zombie:', err.message);
     }
-  } catch (err) {
-    logger.error('[startup] No se pudieron limpiar sesiones zombie:', err.message);
-  }
 
-  require('./visor/jobs/satSyncJob');
-  require('./banks/jobs/erpSyncCron');
-  require('./banks/jobs/estadisticaPorFacturarCron');
-  require('./banks/jobs/cajaTransferenciaSyncCron');
-  require('./banks/jobs/anticipoGeneradoReconciliacionCron');
-  require('./loyalty/jobs/congelamientoPuntosCron');
-  require('./visor/jobs/credencialesAlertJob');
-  require('./visor/jobs/cfdiCanceladoNotificacionJob');
-  require('./system-monitor/system-monitor.cron');
-  require('./visor/jobs/cfdisNoRecuperadosAlertJob');
-  await require('./visor/sat/credenciales').asegurarTtlIndice();
-  await require('./visor/jobs/satSyncJob').liberarVerificandoHuerfanos();
-  await require('./visor/jobs/backendCaidoAlertJob').revisarCaidaAlArrancar();
-  try {
-    await seed();
-  } catch (err) {
-    logger.error('[seed] Error en seed (no fatal):', err.message);
+    require('./visor/jobs/satSyncJob');
+    require('./banks/jobs/erpSyncCron');
+    require('./banks/jobs/estadisticaPorFacturarCron');
+    require('./banks/jobs/cajaTransferenciaSyncCron');
+    require('./banks/jobs/anticipoGeneradoReconciliacionCron');
+    require('./loyalty/jobs/congelamientoPuntosCron');
+    require('./visor/jobs/credencialesAlertJob');
+    require('./visor/jobs/cfdiCanceladoNotificacionJob');
+    require('./system-monitor/system-monitor.cron');
+    require('./visor/jobs/cfdisNoRecuperadosAlertJob');
+    await require('./visor/sat/credenciales').asegurarTtlIndice();
+    await require('./visor/jobs/satSyncJob').liberarVerificandoHuerfanos();
+    await require('./visor/jobs/backendCaidoAlertJob').revisarCaidaAlArrancar();
+    try {
+      await seed();
+    } catch (err) {
+      logger.error('[seed] Error en seed (no fatal):', err.message);
+    }
   }
   const server = http.createServer(app);
-  socketMgr.init(server);
+  await socketMgr.init(server);
   server.listen(PORT, () => {
     logger.info(`Servidor corriendo en puerto ${PORT} [${process.env.NODE_ENV || 'development'}]`);
   });
@@ -289,6 +336,15 @@ const startServer = async () => {
       logger.error(`[Shutdown] Error cerrando DBs: ${dbErr.message}`);
     }
 
+    // 4. Cerrar conexiones Redis (cliente de rate limiters + adapter de sockets)
+    try {
+      await redisClient.quit();
+      await socketMgr.closeRedisAdapter();
+      logger.info('[Shutdown] Conexiones Redis cerradas');
+    } catch (redisErr) {
+      logger.error(`[Shutdown] Error cerrando Redis: ${redisErr.message}`);
+    }
+
     clearTimeout(forceExit);
     logger.info('[Shutdown] Completado — saliendo con código 0');
     process.exit(0);
@@ -302,12 +358,15 @@ const startServer = async () => {
     logger.error(`[uncaughtException] ${err.message}`, err);
     shutdown('uncaughtException');
   });
-  process.on('unhandledRejection', (reason) => {
-    // Antes se interpolaba `reason` directo en el string, perdiendo el .stack — el
-    // logger sí lo soporta (mismo mecanismo que ya usa error-handler.js) si se lo
-    // pasamos como meta en vez de stringificarlo de entrada.
-    logger.error(`[unhandledRejection] ${reason?.message || reason}`, { stack: reason?.stack });
-  });
+  // El handler de 'unhandledRejection' vive al TOPE del archivo (ver arriba, cerca de
+  // `require('./shared/utils/logger')`) — no acá. Motivo (hallado corriendo el proceso
+  // real sin Redis levantado, 2026-11-11): `RedisStore` (rate-limit-redis) dispara sus
+  // llamadas SCRIPT LOAD de forma async-sin-await al construirse (`new RedisStore(...)`,
+  // en `const limiter = ...` más arriba Y en loyalty-public.routes.js), ANTES de que
+  // `startServer()` llegara a esta línea. Sin Redis disponible, esa promesa rechaza, y
+  // sin un handler YA registrado en ese momento el proceso moría con un crash sin pasar
+  // por el logger — justo lo que esta sección decía evitar ("un fallo de infra no fatal
+  // se loguea y sigue"), así que el registro se adelantó al require de este módulo.
 };
 
 startServer().catch((err) => {

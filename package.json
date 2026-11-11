@@ -42,6 +42,7 @@
     "backfill:fp-movimiento": "node src/banks/scripts/backfill-formaspago-bankmovementid.js"
   },
   "dependencies": {
+    "@socket.io/redis-adapter": "^8.3.0",
     "adm-zip": "^0.5.16",
     "axios": "^1.6.0",
     "bcryptjs": "^2.4.3",
@@ -70,6 +71,8 @@
     "pg": "^8.20.0",
     "pg-hstore": "^2.3.4",
     "ppu-paddle-ocr": "^6.0.0",
+    "rate-limit-redis": "^4.3.1",
+    "redis": "^6.3.1",
     "sequelize": "^6.37.8",
     "sharp": "^0.34.5",
     "soap": "^1.0.0",

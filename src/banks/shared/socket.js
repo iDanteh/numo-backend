@@ -1,12 +1,22 @@
 'use strict';
 
 const { Server } = require('socket.io');
+const { createClient } = require('redis');
+const { createAdapter } = require('@socket.io/redis-adapter');
 const { authenticate }       = require('../../shared/middleware/auth');
 const rbacStore              = require('../../shared/services/rbac-store');
 const { PERMISSIONS }        = require('../../shared/config/rbac');
+const config                 = require('../../config/env');
 const { logger }             = require('../shared/utils/logger');
 
 let _io = null;
+// Clientes dedicados del adapter Redis (pub/sub cross-worker) — separados a
+// propósito del redisClient compartido de shared/utils/redis-client.js: un
+// cliente en modo *subscribe* deja de aceptar otros comandos, así que el
+// adapter necesita los suyos propios (uno para publicar, su `duplicate()`
+// para suscribirse).
+let _pubClient = null;
+let _subClient = null;
 
 // Adapta el middleware Express `authenticate` (src/shared/middleware/auth.js) a
 // Socket.IO vía un shim mínimo de req/res — mismo criterio que usan desde hace
@@ -63,13 +73,63 @@ function _authenticateSocket(socket, next) {
  * conexión, la sala personal se une sola desde la identidad ya verificada
  * (`socket.data.user`, nunca del parámetro que manda el cliente), y unirse a un
  * canal de banco exige `banks:read` igual que las rutas REST.
+ *
+ * Adapter Redis (consultoría de desempeño 2026-11-11, cluster nativo + Redis,
+ * ver src/cluster.js): `_pubClient`/`_subClient` se conectan ANTES de crear el
+ * `Server`, y el adapter ya armado se pasa en el constructor de `Server` — no
+ * se llama `_io.adapter(...)` después, para evitar la condición de carrera de
+ * "el adapter se reemplaza cuando ya hay conexiones aceptadas". Con esto,
+ * `.to(...).emit()`/`.emit()` (ver `emitToUser`/`emitToBanco`/etc. abajo)
+ * cruzan workers solos — cada worker del cluster solo tiene en memoria los
+ * sockets que él mismo aceptó, el adapter es quien reenvía el evento al resto
+ * vía pub/sub de Redis. `init` pasa a ser `async` por este motivo: conectar
+ * ambos clientes es una operación async que debe completarse ANTES de poder
+ * construir el `Server` con el adapter ya listo.
+ *
+ * Degradación SIN Redis (hallazgo real corriendo el proceso sin Redis
+ * levantado, 2026-11-11): si `connect()` rechaza (acotado por
+ * `reconnectStrategy` abajo — sin tope, colgaría este `await` para siempre),
+ * `init()` NO propaga ese error. Socket.IO arranca igual, sin adapter — mismo
+ * comportamiento que hoy sin cluster (sockets solo locales a este proceso,
+ * sin cross-worker). Dejar que este error tumbara `init()` tumbaría
+ * `startServer()` entero en app.js (sin try/catch alrededor de
+ * `await socketMgr.init(server)`) — Redis caído NUNCA debe bajar el servidor
+ * HTTP completo, exactamente el criterio que ya pide la sección de Redis en
+ * config/env.js.
  */
-function init(httpServer) {
+async function init(httpServer) {
+  // `reconnectStrategy` acotada (mismo motivo que shared/utils/redis-client.js): sin
+  // Redis levantado, un cliente sin tope reintenta reconectar para siempre — acá
+  // además dejaría colgado el `await connect()` de abajo esperando una conexión que
+  // nunca llega. Con el tope, `connect()` rechaza después de ~10 intentos (ver el
+  // try/catch de abajo, que por eso nunca deja que ese rechazo tumbe `init()`).
+  const redisSocketOpts = {
+    reconnectStrategy: (retries) => {
+      if (retries > 10) return false;
+      return Math.min(retries * 100, 3000);
+    },
+  };
+  _pubClient = createClient({ url: config.redis.url, socket: redisSocketOpts });
+  _subClient = _pubClient.duplicate();
+  _pubClient.on('error', (err) => logger.error(`[socket][redis] pubClient error: ${err.message}`));
+  _subClient.on('error', (err) => logger.error(`[socket][redis] subClient error: ${err.message}`));
+
+  let adapter;
+  try {
+    await Promise.all([_pubClient.connect(), _subClient.connect()]);
+    adapter = createAdapter(_pubClient, _subClient);
+  } catch (err) {
+    logger.error(`[socket][redis] No se pudo conectar el adapter — Socket.IO sigue sin cross-worker: ${err.message}`);
+  }
+
   _io = new Server(httpServer, {
     cors: {
       origin:  process.env.CORS_ORIGIN || 'http://localhost:4200',
       methods: ['GET', 'POST'],
     },
+    // Sin `adapter` (Redis no disponible) Socket.IO usa su adapter in-memory
+    // default — mismo comportamiento que antes de esta consultoría.
+    ...(adapter ? { adapter } : {}),
   });
 
   _io.use(_authenticateSocket);
@@ -132,6 +192,12 @@ function getIo() {
   return _io;
 }
 
+/** Cierra los clientes Redis del adapter — llamado desde el shutdown de app.js. */
+async function closeRedisAdapter() {
+  if (_pubClient) await _pubClient.quit();
+  if (_subClient) await _subClient.quit();
+}
+
 /** Emite un evento solo al usuario identificado por su auth0Sub. */
 function emitToUser(auth0Sub, event, data) {
   if (_io && auth0Sub) _io.to(`user:${auth0Sub}`).emit(event, data);
@@ -157,5 +223,5 @@ function emitToAll(event, data) {
 }
 
 module.exports = {
-  init, getIo, emitToUser, emitToBanco, emitToLoyaltyCard, emitToAll, _authenticateSocket,
+  init, getIo, closeRedisAdapter, emitToUser, emitToBanco, emitToLoyaltyCard, emitToAll, _authenticateSocket,
 };

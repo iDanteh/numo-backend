@@ -704,6 +704,59 @@ describe('_calcularLedgerBacklog (2026-10-30: ledger genérico, misma fórmula p
     expect(ledger.identificados).toEqual({ count: 1, saldo: 700 }); // antes del fix: 0, atrapado para siempre
     expect(ledger.total).toEqual({ count: 0, saldo: 0 });
   });
+
+  // Bug real 2026-11-10 (confirmado con 6 movimientos reales de producción, ver nota REAPARECIDOS
+  // en el JSDoc de _calcularLedgerBacklog): un depósito YA resuelto antes de periodoInicio que se
+  // DESVINCULA dentro del periodo y sigue sin resolver al periodoFin, antes de este fix quedaba
+  // totalmente invisible para el `total` de este periodo (el mismo caso que el test C de arriba,
+  // "ya estaba identificado ANTES de empezar el periodo"), rompiendo la garantía documentada
+  // "total(A) == iniciales(B)": reaparecía de la nada como `iniciales` del periodo siguiente.
+  test('reaparecido: resuelto antes del periodo, se revierte DENTRO del periodo y sigue sin resolver al cierre -> cuenta como nuevo, no se pierde', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      {
+        deposito: 600, createdAt: new Date('2026-08-01T12:00:00.000Z'),
+        primeraIdentificacionAt: new Date('2026-08-05T12:00:00.000Z'),
+        identificadoPor: [],
+        historialVinculacion: [
+          { accion: 'desvinculado', at: new Date(INICIO_CORTE_ESPERADO.getTime() + 2 * 86400000) },
+        ],
+      },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_CORTE_ESPERADO, periodoFin: CIERRE_ESPERADO });
+
+    expect(ledger.iniciales).toEqual({ count: 0, saldo: 0 });        // nunca estuvo en el backlog al ARRANCAR el periodo
+    expect(ledger.nuevos).toEqual({ count: 1, saldo: 600 });         // entra como "nuevo" (reaparecido) de este periodo
+    expect(ledger.identificados).toEqual({ count: 0, saldo: 0 });    // sigue sin resolver al cierre
+    expect(ledger.total).toEqual({ count: 1, saldo: 600 });          // antes del fix: 0 — invisible, reaparecía en el periodo siguiente
+  });
+
+  // Conservación end-to-end (la garantía documentada "total(A) == iniciales(B)"): el MISMO
+  // movimiento reaparecido del test anterior sigue sin resolver al cierre del periodo — así que,
+  // en el periodo SIGUIENTE, ya NO está "resuelto al arrancar" (identificadoAlInicio=false): entra
+  // normal por la rama de `iniciales`, exactamente como cualquier otro backlog real. Antes del fix
+  // no lo contaba NINGÚN periodo (invisible en el primero, pero el segundo igual lo levantaba
+  // porque esa rama nunca cambió) — eso era justo la asimetría: aparecía de la nada. Ahora
+  // total(periodo1)=1 y iniciales(periodo2)=1: EXACTAMENTE uno, nunca cero ni dos veces.
+  test('conservación: el mismo movimiento reaparecido es el `total` de un periodo Y el `iniciales` del siguiente', async () => {
+    const mov = {
+      deposito: 600, createdAt: new Date('2026-08-01T12:00:00.000Z'),
+      primeraIdentificacionAt: new Date('2026-08-05T12:00:00.000Z'),
+      identificadoPor: [],
+      historialVinculacion: [
+        { accion: 'desvinculado', at: new Date(INICIO_CORTE_ESPERADO.getTime() + 2 * 86400000) },
+      ],
+    };
+    const siguientePeriodoInicio = new Date(CIERRE_ESPERADO.getTime() + 1);
+    const siguientePeriodoFin = new Date(siguientePeriodoInicio.getTime() + 7 * 86400000 - 1);
+
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([mov]) }) });
+    const ledgerSiguiente = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: siguientePeriodoInicio, periodoFin: siguientePeriodoFin });
+
+    expect(ledgerSiguiente.iniciales).toEqual({ count: 1, saldo: 600 }); // == total del periodo anterior (test de arriba)
+    expect(ledgerSiguiente.nuevos).toEqual({ count: 0, saldo: 0 });
+    expect(ledgerSiguiente.total).toEqual({ count: 1, saldo: 600 });
+  });
 });
 
 describe('_primeraIdentificacionEfectiva (2026-11-06, bug real — fallback de primeraIdentificacionAt)', () => {
@@ -731,6 +784,27 @@ describe('_primeraIdentificacionEfectiva (2026-11-06, bug real — fallback de p
   test('sin primeraIdentificacionAt ni identificadoPor (o vacío) -> null', () => {
     expect(_primeraIdentificacionEfectiva({ primeraIdentificacionAt: null, identificadoPor: [] })).toBeNull();
     expect(_primeraIdentificacionEfectiva({ primeraIdentificacionAt: null })).toBeNull();
+  });
+
+  // Bug real 2026-11-10: el fallback a `fichaAt` que ya tenía `_primeraResueltaEfectiva` (desde
+  // 2026-11-06, para Antigüedad) nunca se había portado acá, así que el ledger de Mensual/Diario
+  // seguía subestimando identificaciones hechas por comprobante físico.
+  test('sin primeraIdentificacionAt ni identificadoPor, usa fichaAt', () => {
+    const fichaAt = new Date('2026-02-01T00:00:00.000Z');
+    expect(_primeraIdentificacionEfectiva({ identificadoPor: [], fichaAt })).toBe(fichaAt);
+    expect(_primeraIdentificacionEfectiva({ fichaAt })).toBe(fichaAt);
+  });
+
+  test('fichaAt nunca gana sobre identificadoPor, aunque fichaAt sea más antigua', () => {
+    const mov = {
+      identificadoPor: [{ nombre: 'katia', fechaId: new Date('2026-05-06T15:56:38.305Z') }],
+      fichaAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+    expect(_primeraIdentificacionEfectiva(mov)).toEqual(new Date('2026-05-06T15:56:38.305Z'));
+  });
+
+  test('sin ningún campo (ni fichaAt) -> null', () => {
+    expect(_primeraIdentificacionEfectiva({})).toBeNull();
   });
 });
 

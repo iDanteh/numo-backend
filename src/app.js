@@ -19,8 +19,6 @@ const { trafficTracker } = require('./system-monitor/traffic-tracker.middleware'
 // cluster.isWorker es false y esta condición es simplemente true siempre —
 // cero regresión para quien no usa cluster.js todavía.
 const ES_WORKER_PRIMARIO = !cluster.isWorker || cluster.worker.id === 1;
-// eslint-disable-next-line no-console
-console.log(`[DEBUG-cluster] pid=${process.pid} isWorker=${cluster.isWorker} isPrimary=${cluster.isPrimary} worker.id=${cluster.worker?.id} ES_WORKER_PRIMARIO=${ES_WORKER_PRIMARIO}`);
 
 const { connectDB, disconnectDB } = require('./config/database');
 const { checkMongoOk, checkPostgresOk } = require('./shared/utils/db-health');

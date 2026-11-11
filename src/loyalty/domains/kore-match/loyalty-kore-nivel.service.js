@@ -41,8 +41,10 @@ function _requiereKoreId(koreId) {
 /** `alta`: requiere koreId+nombre+porcentaje (a diferencia de clientes, acá no hay alta parcial —
  *  un nivel sin % no tiene sentido de negocio). Idempotente: si ya existe por koreId, o si adopta
  *  una fila transicional por nombre, actualiza en vez de duplicar. `estatus` (2026-11-06, pedido
- *  explícito del usuario): opcional — si Kore lo manda, define el `activo` inicial; si se omite,
- *  sigue el default de siempre (`true`), cero regresión. */
+ *  explícito del usuario, OBLIGATORIO desde 2026-11-11 — ver el gate en `procesarNivelKore`, mismo
+ *  criterio que el gate de `nivel` en `loyalty-kore-cliente.service.js`): booleano, define el
+ *  `activo` inicial del nivel. Ya no hay default por ausencia — la presencia está garantizada por
+ *  el gate de arriba antes de llegar acá. */
 async function _procesarAlta({
   koreId, nombre, porcentaje, estatus,
 }) {
@@ -54,7 +56,7 @@ async function _procesarAlta({
   }
 
   const datos = {
-    koreId, nombre, porcentaje: Number(porcentaje), activo: estatus === undefined ? true : Boolean(estatus),
+    koreId, nombre, porcentaje: Number(porcentaje), activo: Boolean(estatus),
   };
   const existente = await _buscarOAdoptarNivelKore({ koreId, nombre });
   if (existente) {
@@ -78,12 +80,17 @@ async function _procesarAlta({
   }
 }
 
-/** `actualizacion`: ajuste de nombre/porcentaje/estatus por `koreId`, campos opcionales (igual
- *  criterio que el webhook de clientes — si no viene, Numo no lo toca). `estatus` (2026-11-06,
- *  pedido explícito del usuario: "controlar qué niveles están activos o no"): booleano, mapea
- *  directo a `activo` — mismo criterio que `activo` en `loyalty-kore-cliente.service.js`. No
- *  reemplaza al evento `baja` (que sigue funcionando igual), solo da una vía más directa para
- *  activar/desactivar sin tener que mandar un evento aparte. */
+/** `actualizacion`: ajuste de nombre/porcentaje/estatus por `koreId`. `nombre`/`porcentaje` siguen
+ *  siendo opcionales (igual criterio que el webhook de clientes — si no vienen, Numo no los toca).
+ *  `estatus` (2026-11-06, pedido explícito del usuario: "controlar qué niveles están activos o
+ *  no"; OBLIGATORIO desde 2026-11-11 — ver el gate en `procesarNivelKore`, mismo criterio que el
+ *  gate de `nivel` en `loyalty-kore-cliente.service.js`): booleano, mapea directo a `activo` —
+ *  mismo criterio que `activo` en `loyalty-kore-cliente.service.js`. Al ser obligatorio, `activo`
+ *  ya SIEMPRE se incluye en el `update()` de este evento (ya no es parcial para este campo
+ *  específico, aunque `nombre`/`porcentaje` siguen siéndolo). No reemplaza al evento `baja` (que
+ *  sigue funcionando igual, y sigue sin leer `estatus`), solo da una vía más directa para
+ *  activar/desactivar sin tener que mandar un evento aparte — incluyendo "reactivar" un nivel que
+ *  un `baja` anterior dejó inactivo, mandando `actualizacion` con `estatus:true`. */
 async function _procesarActualizacion({
   koreId, nombre, porcentaje, estatus,
 }) {
@@ -98,7 +105,7 @@ async function _procesarActualizacion({
     }
     updates.porcentaje = Number(porcentaje);
   }
-  if (estatus !== undefined) updates.activo = Boolean(estatus);
+  updates.activo = Boolean(estatus);
   await fila.update(updates);
   return { ok: true, evento: 'actualizacion', nivelId: fila.id };
 }
@@ -116,10 +123,15 @@ async function _procesarBaja({ koreId }) {
  * Punto de entrada del webhook `POST /api/loyalty/kore/niveles`.
  * `evento`: 'alta' | 'actualizacion' | 'baja'. `koreId` siempre requerido.
  * `nombre'/`porcentaje`: requeridos en 'alta', opcionales en 'actualizacion' (si se omiten, Numo no
- * los toca). `estatus` (2026-11-06): booleano opcional, válido en 'alta' (define el `activo`
- * inicial, default `true` si se omite) y 'actualizacion' (activa/desactiva, si se omite no toca
- * `activo`) — vía más directa que 'baja' para lo mismo, no la reemplaza. 'baja' no lee ninguno de
- * estos campos.
+ * los toca). `estatus` (2026-11-06, pedido explícito del usuario; OBLIGATORIO desde 2026-11-11,
+ * pedido explícito del usuario, mismo criterio que el gate de `nivel` en
+ * `loyalty-kore-cliente.service.js`): booleano, OBLIGATORIO en 'alta' (define el `activo` inicial,
+ * ya no hay default) y 'actualizacion' (activa/desactiva, ya siempre toca `activo`). Si no viene
+ * (undefined/null) en 'alta'/'actualizacion', 400 "estatus es requerido." ANTES de llegar a
+ * `_procesarAlta`/`_procesarActualizacion` — ver el gate único más abajo. 'baja' NUNCA lee este
+ * campo (desactiva incondicionalmente) y no lo exige. Nota: no existe un evento de "reactivación"
+ * separado — se logra mandando 'actualizacion' con `estatus:true` sobre un nivel que un 'baja'
+ * anterior dejó inactivo (o un nuevo 'alta' si Kore re-manda el mismo `koreId`).
  */
 // Notificación en vivo (2026-11-10, pedido explícito del usuario — "relevante para el registro
 // de acumulaciones manuales": el staff consulta esta tabla para saber qué % va a aplicar antes
@@ -136,6 +148,19 @@ async function procesarNivelKore(payload) {
     throw new BadRequestError(`evento inválido: "${evento}". Debe ser uno de: ${EVENTOS_VALIDOS.join(', ')}.`);
   }
   const koreId = _requiereKoreId(payload?.koreId);
+
+  // `estatus` obligatorio en 'alta'/'actualizacion' (2026-11-11, pedido explícito del usuario) —
+  // gate único acá, ANTES de branchear por evento, para que ambas ramas lo exijan por igual sin
+  // duplicar el chequeo en cada una. Mismo criterio que el gate de `nivel` en
+  // `procesarClienteKore` (loyalty-kore-cliente.service.js): Kore controla el dato por completo,
+  // Numo lo necesita siempre, incluso en un ajuste — ya no hay un default razonable que asumir en
+  // su ausencia. `estatus` es booleano: el chequeo es solo de presencia (undefined/null), nunca de
+  // "truthy" — `false` es un valor válido y legítimo, no debe disparar este error. 'baja' nunca
+  // entra acá (desactiva incondicionalmente, no lee este campo).
+  if (evento !== 'baja' && (estatus === undefined || estatus === null)) {
+    throw new BadRequestError('estatus es requerido.');
+  }
+
   const nombreTrim = nombre !== undefined ? String(nombre).trim() : undefined;
 
   let resultado;

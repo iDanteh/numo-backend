@@ -135,6 +135,8 @@ async function init(httpServer) {
   _io.use(_authenticateSocket);
 
   _io.on('connection', (socket) => {
+    // eslint-disable-next-line no-console
+    console.log(`[DEBUG-socket] pid=${process.pid} worker.id=${require('cluster').worker?.id} socket=${socket.id} conectado`);
     // Identidad ya verificada por el middleware de arriba — se une solo,
     // nunca a partir de un valor que mande el cliente.
     socket.join(`user:${socket.data.user._id}`);
@@ -219,6 +221,8 @@ function emitToLoyaltyCard(cardId, event, data) {
 
 /** Emite un evento a todos los clientes conectados. */
 function emitToAll(event, data) {
+  // eslint-disable-next-line no-console
+  console.log(`[DEBUG-socket] pid=${process.pid} worker.id=${require('cluster').worker?.id} emitToAll('${event}') disparado`);
   if (_io) _io.emit(event, data);
 }
 

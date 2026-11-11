@@ -22,6 +22,7 @@ const { verifyCFDIWithSAT }      = require('../services/satVerification');
 const { fetchTodasLasFacturas } = require('../services/erp.service');
 const { transformarTolerante } = require('../services/erp-transformer.service');
 const { upsertFromERP } = require('../repositories/cfdi.repository');
+const { esWorkerPrimario } = require('../../shared/utils/cluster-primario');
 
 const CRON_HORA = config.sat.cronHora;
 
@@ -2219,10 +2220,15 @@ const ejecutarVerificacionEstadosCriticos = async () => {
 
 // Job horario fijo — no configurable por el usuario (se programa independientemente
 // de reprogramarJobs para que no sea destruido al cambiar los horarios nocturnos).
-cron.schedule('0 * * * *', async () => {
-  try { await ejecutarVerificacionEstadosCriticos(); }
-  catch (err) { logger.error(`[VerifCriticos] Error fatal: ${err.message}`); }
-}, { timezone: 'America/Mexico_City' });
+// Gateado por esWorkerPrimario(): este archivo se require() también desde
+// sat.controller.js (rutas, sin gate), así que el auto-registro al cargar el
+// módulo necesita su propio chequeo — ver shared/utils/cluster-primario.js.
+if (esWorkerPrimario()) {
+  cron.schedule('0 * * * *', async () => {
+    try { await ejecutarVerificacionEstadosCriticos(); }
+    catch (err) { logger.error(`[VerifCriticos] Error fatal: ${err.message}`); }
+  }, { timezone: 'America/Mexico_City' });
+}
 
 /**
  * ejecutarVerificacionTimbradosSATCancelado
@@ -2318,11 +2324,14 @@ const ejecutarVerificacionTimbradosSATCancelado = async () => {
   }
 };
 
-// Job cada 5 minutos — detecta cancelaciones SAT que el ERP aún no ha procesado
-cron.schedule('*/5 * * * *', async () => {
-  try { await ejecutarVerificacionTimbradosSATCancelado(); }
-  catch (err) { logger.error(`[VerifTimbrados] Error fatal: ${err.message}`); }
-}, { timezone: 'America/Mexico_City' });
+// Job cada 5 minutos — detecta cancelaciones SAT que el ERP aún no ha procesado.
+// Gateado por el mismo motivo que el cron de VerifCriticos (ver arriba).
+if (esWorkerPrimario()) {
+  cron.schedule('*/5 * * * *', async () => {
+    try { await ejecutarVerificacionTimbradosSATCancelado(); }
+    catch (err) { logger.error(`[VerifTimbrados] Error fatal: ${err.message}`); }
+  }, { timezone: 'America/Mexico_City' });
+}
 
 /**
  * (Re)programa los cuatro jobs con los horarios indicados.
@@ -2355,7 +2364,23 @@ const reprogramarJobs = ({
 };
 
 // ── Arranque inicial: leer horario guardado en BD o usar defaults ─────────────
+// Gateado por esWorkerPrimario() (early return, no se envuelve el cuerpo completo
+// para no reindentar el try/catch) — mismo motivo que los dos cron.schedule de
+// arriba: este archivo se require() también desde sat.controller.js y
+// schedule.controller.js (rutas, sin gate), así que el auto-registro al cargar
+// el módulo necesita su propio chequeo, no solo el que ya existe en app.js.
+//
+// Hallazgo real sin resolver (2026-11-11, documentado, NO arreglado acá): si un
+// usuario cambia el horario vía POST a schedule.controller.js mientras corre bajo
+// cluster, esa request puede caer en CUALQUIER worker (load balanceado) —
+// reprogramarJobs() se ejecutaría en el worker que atendió la request, pero el
+// cron REAL corriendo en producción vive en el worker primario (id===1), que
+// podría ser un proceso DISTINTO. Es un gap real de consistencia cross-worker
+// para cambios de horario en caliente, pendiente para una sesión futura (posible
+// solución: Redis pub/sub para propagar el cambio a todos los workers, o forzar
+// que ese endpoint puntual solo lo atienda el worker primario).
 (async () => {
+  if (!esWorkerPrimario()) return;
   try {
     const AppConfig = require('../models/AppConfig');
     const configs   = await AppConfig.find({ key: { $in: ['satDescarga', 'satDescargaRecibidos', 'erpDescarga', 'erpVerificacion', 'comparacion', 'satVerificacionRecibidos'] } }).lean();

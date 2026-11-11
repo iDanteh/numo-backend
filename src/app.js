@@ -1,6 +1,5 @@
 require('dotenv').config();
 const config = require('./config/env');
-const cluster     = require('cluster');
 const http        = require('http');
 const express     = require('express');
 const helmet      = require('helmet');
@@ -18,9 +17,8 @@ const { trafficTracker } = require('./system-monitor/traffic-tracker.middleware'
 // housekeeping). Sin cluster (node src/app.js directo, como en dev local),
 // cluster.isWorker es false y esta condición es simplemente true siempre —
 // cero regresión para quien no usa cluster.js todavía.
-const ES_WORKER_PRIMARIO = !cluster.isWorker || cluster.worker.id === 1;
-// eslint-disable-next-line no-console
-console.log(`[DEBUG-cluster] pid=${process.pid} isWorker=${cluster.isWorker} worker.id=${cluster.worker?.id} ES_WORKER_PRIMARIO=${ES_WORKER_PRIMARIO}`);
+const { esWorkerPrimario } = require('./shared/utils/cluster-primario');
+const ES_WORKER_PRIMARIO = esWorkerPrimario();
 
 const { connectDB, disconnectDB } = require('./config/database');
 const { checkMongoOk, checkPostgresOk } = require('./shared/utils/db-health');
@@ -259,8 +257,6 @@ const startServer = async () => {
   // gate: toda instancia de Node, sea primario standalone o cada worker, necesita
   // su propia conexión a BD y debe levantar su propio servidor para atender requests.
   if (ES_WORKER_PRIMARIO) {
-    // eslint-disable-next-line no-console
-    console.log(`[DEBUG-cluster] pid=${process.pid} ENTRANDO AL GATE (ES_WORKER_PRIMARIO era true)`);
     // Limpiar sesiones de comparación que quedaron en 'running' por un reinicio anterior.
     // Si el proceso fue interrumpido (deploy, OOM, SIGKILL) mientras corría un batch,
     // la sesión nunca llegó a marcarse 'completed' o 'failed' → queda en 'running' para siempre.

@@ -75,6 +75,7 @@ const { toCents, fromCents } = require('../../shared/puntos.util');
 const { _aplicarMovimiento } = require('./loyalty-ledger.service');
 const { registrarVentaFallida } = require('./loyalty-venta-fallida.service');
 const { logger } = require('../../../shared/utils/logger');
+const { emitToLoyaltyCard } = require('../../../banks/shared/socket');
 // Cruzado con Bancos/Solicitudes de Cobro (Mongo) para la bandeja de auditoría
 // (Pieza 2) — mismo sentido de import que ya usa, en reversa,
 // `collection-request.service.js` para llamar a
@@ -201,6 +202,10 @@ async function procesarVentaCanceladaKore(payload) {
     where: { origen: ORIGEN_KORE, referenciaExterna: refReversion },
   });
   if (yaRevertida) {
+    // Notificación en vivo (2026-11-10): aviso reenviado (Kore reintentando), nada cambió de
+    // verdad, pero emitir igual es inofensivo y evita tratar este caso distinto del resto —
+    // mismo criterio que el blindaje cruzado manual↔kore de loyalty-kore-venta.service.js.
+    emitToLoyaltyCard(yaRevertida.cardId, 'lealtad-tarjeta:actualizada', { cardId: yaRevertida.cardId, motivo: 'cancelacion-kore' });
     return { ok: true, yaRevertida: true };
   }
 
@@ -307,15 +312,22 @@ async function procesarVentaCanceladaKore(payload) {
         },
         'Saldo insuficiente para revertir cancelación de venta',
       );
+      // Sin emitir acá a propósito: no se escribió ningún movimiento nuevo en el ledger, un
+      // refetch de tarjeta-detail no tendría nada distinto que mostrar.
       return { ok: true, revertido: false, motivo: 'saldo_insuficiente' };
     }
+    // Notificación en vivo (2026-11-10) — ver docstring del archivo/pedido del usuario. `cardId`
+    // ya resuelto arriba (línea de `originales[0].cardId`), antes de entrar a la transacción.
+    emitToLoyaltyCard(cardId, 'lealtad-tarjeta:actualizada', { cardId, motivo: 'cancelacion-kore' });
     return resultado;
   } catch (err) {
     if (err?.name === 'SequelizeUniqueConstraintError') {
       // Carrera: otro request con el mismo serieFolio+serieFolioCancelacion (reenvío de Kore en
       // paralelo) ganó el insert de la fila :REVERSION:... entre el chequeo de idempotencia de
-      // arriba y este insert — ya quedó revertida.
+      // arriba y este insert — ya quedó revertida. Mismo criterio que el `yaRevertida` de arriba:
+      // emite igual, es inofensivo.
       logger.warn(`[loyalty-kore-venta-cancelada] serieFolio=${serieFolio} serieFolioCancelacion=${serieFolioCancelacion}: carrera detectada al insertar la reversión, ya la aplicó otro request concurrente.`);
+      emitToLoyaltyCard(cardId, 'lealtad-tarjeta:actualizada', { cardId, motivo: 'cancelacion-kore' });
       return { ok: true, yaRevertida: true };
     }
     throw err;

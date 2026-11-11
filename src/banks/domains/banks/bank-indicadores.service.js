@@ -952,13 +952,20 @@ async function _getCorteHistorico({ baseMatch, inicio, fin, equipoIds = null, ma
 // pese a haber miles de identificaciones reales esos meses, y un total inflado a ~30,615 en
 // noviembre contra un backlog real de 210). `identificadoPor[]` sí tiene historial completo desde
 // el commit inicial del proyecto (2026-04-15) — se usa acá como respaldo.
+//
+// Segundo bug, mismo origen, encontrado 2026-11-10: el fallback a `fichaAt` que sí se agregó a
+// `_primeraResueltaEfectiva` el 2026-11-06 (identificación por comprobante físico, sin pasar por
+// `identificadoPor`) nunca se portó acá — el ledger de Mensual/Diario (`_calcularLedgerBacklog`)
+// seguía subestimando identificaciones hechas vía ficha. Misma prioridad de fuentes que la otra
+// función: primeraIdentificacionAt > identificadoPor[].fechaId > fichaAt.
 function _primeraIdentificacionEfectiva(mov) {
   if (mov.primeraIdentificacionAt) return mov.primeraIdentificacionAt;
   const fechas = (mov.identificadoPor || [])
     .map(p => p.fechaId)
     .filter(Boolean);
-  if (!fechas.length) return null;
-  return fechas.reduce((min, f) => (f < min ? f : min), fechas[0]);
+  if (fechas.length) return fechas.reduce((min, f) => (f < min ? f : min), fechas[0]);
+  if (mov.fichaAt) return mov.fichaAt;
+  return null;
 }
 
 // Reconstrucción de "¿estaba identificado al cierre `fin` de un corte histórico?" — de 1 solo
@@ -1059,6 +1066,16 @@ function _fechaMexicoStr(fechaReal) {
  * bajó agosto corte a corte") — para un mes ya cerrado consultado desde un periodo posterior,
  * `nuevos` da 0 solo, sin caso especial (nada puede nacer en agosto desde octubre).
  *
+ * REAPARECIDOS (bug real 2026-11-10, confirmado con 6 movimientos reales de producción): un
+ * depósito ya resuelto ANTES de `periodoInicio` que se DESVINCULA (revierte) dentro del periodo y
+ * sigue sin resolver al `periodoFin` se cuenta como "nuevo" de ESTE periodo (`nuevos`, no
+ * `iniciales` — nunca estuvo en el backlog al arrancar el periodo, entra recién cuando se
+ * revierte). Antes se descartaba sin dejar rastro (invisible para el `total` de este periodo) y
+ * reaparecía "de la nada" como `iniciales` del periodo SIGUIENTE, rompiendo la garantía de
+ * conservación de arriba. Si en cambio se revierte y se vuelve a resolver DENTRO del mismo
+ * periodo (resuelto en ambos extremos), sigue sin contarse en ningún lado — no afecta ningún
+ * `total` de borde, es un caso aceptado, no el que rompía la garantía.
+ *
  * @param {object} opts
  * @param {object} opts.baseMatch Mismo `buildBaseMatch({banco})` que el resto del dominio.
  * @param {Date} opts.periodoInicio
@@ -1075,7 +1092,7 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
     ...baseMatch,
     createdAt: createdAtMatch,
     status: { $in: ['no_identificado', 'identificado'] },
-  }).select('deposito createdAt primeraIdentificacionAt historialVinculacion identificadoPor').lean();
+  }).select('deposito createdAt primeraIdentificacionAt historialVinculacion identificadoPor fichaAt').lean();
 
   let inicialesCount = 0, inicialesSaldo = 0;
   let nuevosCount = 0, nuevosSaldo = 0;
@@ -1084,20 +1101,27 @@ async function _calcularLedgerBacklog({ baseMatch, periodoInicio, periodoFin, me
 
   for (const mov of candidatos) {
     const importe = mov.deposito ?? 0;
-    const esNuevo = mov.createdAt >= periodoInicio;
-    // Un "nuevo" no existía antes de periodoInicio — no puede estar identificado a esa fecha,
-    // ahorra la llamada a _estadoAlCierre.
-    const identificadoAlInicio = esNuevo ? false : _estadoAlCierre(mov, periodoInicio).identificado;
-    if (identificadoAlInicio) continue; // ya resuelto ANTES de empezar el periodo, no es su backlog
 
-    const identificadoAlFin = _estadoAlCierre(mov, periodoFin).identificado;
-    if (esNuevo) {
+    if (mov.createdAt >= periodoInicio) {
+      // No existía antes de periodoInicio — no puede estar identificado a esa fecha, ahorra la
+      // llamada a _estadoAlCierre(mov, periodoInicio).
+      const identificadoAlFin = _estadoAlCierre(mov, periodoFin).identificado;
       nuevosCount++; nuevosSaldo += importe;
       if (identificadoAlFin) { idDeNuevosCount++; idDeNuevosSaldo += importe; }
-    } else {
-      inicialesCount++; inicialesSaldo += importe;
-      if (identificadoAlFin) { idDeInicialesCount++; idDeInicialesSaldo += importe; }
+      continue;
     }
+
+    const identificadoAlInicio = _estadoAlCierre(mov, periodoInicio).identificado;
+    const identificadoAlFin = _estadoAlCierre(mov, periodoFin).identificado;
+
+    if (identificadoAlInicio) {
+      if (identificadoAlFin) continue; // resuelto antes de empezar y sigue (o se re-)resuelto al cierre: no es backlog de este periodo
+      nuevosCount++; nuevosSaldo += importe; // reaparecido dentro del periodo — ver nota REAPARECIDOS arriba
+      continue;
+    }
+
+    inicialesCount++; inicialesSaldo += importe;
+    if (identificadoAlFin) { idDeInicialesCount++; idDeInicialesSaldo += importe; }
   }
 
   const identificadosCount = idDeInicialesCount + idDeNuevosCount;
@@ -1417,7 +1441,8 @@ function _rangoAntiguedad(dias) {
  * total), ficha física, o cualquier otro camino que haya dejado seteado el campo canónico
  * `primeraIdentificacionAt` (`resolvePrimeraIdentificacion()`, ver `identificacion-timestamp.
  * util.js`). Distinta a propósito de `_primeraIdentificacionEfectiva` (identificación COMPLETA,
- * usada por el ledger — no tocada acá): esta es para la reconstrucción histórica de Antigüedad
+ * usada por el ledger — desde 2026-11-10 comparte el mismo fallback a `fichaAt` que esta función,
+ * pero sigue siendo una función separada): esta es para la reconstrucción histórica de Antigüedad
  * (`_vacioAlCorteHistorico`), que necesita saber "¿tuvo ALGUNA señal de resolución, sea cual sea?".
  *
  * Tres fuentes, en orden de confiabilidad:
@@ -2061,6 +2086,7 @@ module.exports = {
   // Fallback de primeraIdentificacionAt vía identificadoPor[] (2026-11-06, bug real) —
   // exportada para testearla directo.
   _primeraIdentificacionEfectiva,
+  _estadoAlCierre,
   // Dashboard mensual/por hora/feed de actividad (2026-10-30, reemplaza la vista de antigüedad
   // por rango de días — descartada a pedido del usuario tras ver un mockup de referencia) —
   // exportadas para testearlas directo, mismo criterio que el resto de este archivo.

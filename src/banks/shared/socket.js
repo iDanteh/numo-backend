@@ -48,8 +48,12 @@ function _authenticateSocket(socket, next) {
 /**
  * init — adjunta Socket.IO al servidor HTTP y registra eventos base.
  * Salas disponibles:
- *   user:{auth0Sub}  — notificaciones personales (roles, importación)
- *   banco:{banco}    — actualizaciones en tiempo real del banco activo
+ *   user:{auth0Sub}      — notificaciones personales (roles, importación)
+ *   banco:{banco}        — actualizaciones en tiempo real del banco activo
+ *   lealtad-tarjeta:{id} — actualizaciones en tiempo real de UNA tarjeta de Lealtad
+ *    (2026-11-10, ver `emitToLoyaltyCard`: igual patrón que `banco:{banco}`/`bank:join`,
+ *    gateado por `loyalty:read` en vez de `banks:read` — los webhooks de Kore no emitían
+ *    nada hasta hoy, ver el commit que agrega esto).
  *
  * Fix de seguridad (2026-10-14, hallazgo de auditoría): antes cualquiera con
  * acceso de red podía conectarse sin sesión y pedir cualquier canal (incluido
@@ -97,6 +101,27 @@ function init(httpServer) {
         socket.leave(`banco:${banco.trim()}`);
       }
     });
+
+    // Sala por tarjeta de Lealtad (2026-11-10) — mismo patrón que `bank:join`/`bank:leave`
+    // de arriba, gateado por `loyalty:read` (el mismo permiso que ya protege `GET /cards/:id`
+    // y `/cards/:id/historial`) en vez de `banks:read`.
+    socket.on('lealtad-tarjeta:join', async (cardId) => {
+      if (typeof cardId !== 'string' || !cardId.trim()) return;
+      const puede = await rbacStore.hasPermission(
+        socket.data.user.role, PERMISSIONS.LOYALTY_READ, socket.data.user.extraPermissions,
+      );
+      if (!puede) {
+        logger.debug(`[socket] lealtad-tarjeta:join rechazado (sin loyalty:read): user=${socket.data.user._id} cardId=${cardId}`);
+        return;
+      }
+      socket.join(`lealtad-tarjeta:${cardId.trim()}`);
+    });
+
+    socket.on('lealtad-tarjeta:leave', (cardId) => {
+      if (typeof cardId === 'string' && cardId.trim()) {
+        socket.leave(`lealtad-tarjeta:${cardId.trim()}`);
+      }
+    });
   });
 
   return _io;
@@ -117,9 +142,20 @@ function emitToBanco(banco, event, data) {
   if (_io && banco) _io.to(`banco:${banco}`).emit(event, data);
 }
 
+/** Emite un evento a todos los clientes suscritos a una tarjeta de Lealtad (2026-11-10) —
+ *  cualquier código del servidor puede invocarla sin tener identidad propia (igual que
+ *  `emitToBanco`/`emitToUser`): un webhook server-to-server autenticado por `X-Api-Key`
+ *  (sin usuario humano detrás) la llama tal cual, la autenticación de socket solo le
+ *  importa a quien SE CONECTA (JWT), nunca a quien emite. */
+function emitToLoyaltyCard(cardId, event, data) {
+  if (_io && cardId) _io.to(`lealtad-tarjeta:${cardId}`).emit(event, data);
+}
+
 /** Emite un evento a todos los clientes conectados. */
 function emitToAll(event, data) {
   if (_io) _io.emit(event, data);
 }
 
-module.exports = { init, getIo, emitToUser, emitToBanco, emitToAll, _authenticateSocket };
+module.exports = {
+  init, getIo, emitToUser, emitToBanco, emitToLoyaltyCard, emitToAll, _authenticateSocket,
+};

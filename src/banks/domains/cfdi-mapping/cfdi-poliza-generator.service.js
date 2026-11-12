@@ -2178,7 +2178,18 @@ async function _inyectarSaldoFavorGenerado({ cfdi, mapaGenerados, cuentaSaldoFav
   // consolidados ($256,295.27 / $114,363.62 en el caso real) NO deben
   // moverse, así que este ajuste se queda en su línea separada, solo con el
   // monto corregido.
-  const montoPropio = Number(cfdi.total) || 0;
+  // Tope: lo que Kore REALMENTE dejó como saldo a favor para este marcador
+  // (`generado.montoGenerado`, suma de `saldosFavorGenerados[].monto`) — 2026-11-12,
+  // caso JOSUE ISIDRO LOPEZ MARTINEZ, BON-325848 (NC A0-261102119 $329.86, CEDIS
+  // 7-nov): la bonificación se aplicó directo al saldo de la venta A0-261001339
+  // (RET-261103385 $329.85) y Kore solo generó $0.01 de saldo a favor, pero aquí
+  // salía el total de la NC como SF (2103090001 + IVA). Mismo caso en 28 NC de
+  // CEDIS de noviembre (BON/CAC aplicadas a la cuenta, Kore $0.01). Con 2+ NC del
+  // mismo marcador cada una sigue llevando su propio total (≤ al generado).
+  const montoGeneradoKore = Number(generado.montoGenerado) || 0;
+  const montoPropio = montoGeneradoKore > 0
+    ? Math.min(Number(cfdi.total) || 0, Math.round(montoGeneradoKore * 100) / 100)
+    : (Number(cfdi.total) || 0);
   if (montoPropio <= 0) return [];
   // Respaldo de `_esConversionAAnticipoPorMonto` cuando `/cuentas-pendientes`
   // ya no trae la `anotacion` (ver docstring de esa función) — mismo caso

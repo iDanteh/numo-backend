@@ -31,7 +31,7 @@ const {
   _resolverMesOrigen, _primeraIdentificacionEfectiva,
   getLedgerMensual, _enumerarMesesParaLedger, getLedgerPorHora, _enumerarHorasDelDia,
   getUltimosMovimientos,
-  getAntiguedadDepositos, getAntiguedadDepositosPorAnio, _rangoAntiguedad,
+  getAntiguedadDepositos, getAntiguedadDepositosPorAnio, getAntiguedadPorDiaMesActual, _rangoAntiguedad,
   buildReporteCortes, listarDescargasCorte, descargarReporteCorteHistorico,
 } = require('./bank-indicadores.service');
 
@@ -1259,9 +1259,10 @@ describe('_rangoAntiguedad (2026-11-06) — límites exactos de cada bucket', ()
 });
 
 // getAntiguedadDepositos (2026-11-06, pedido explícito del usuario tras revisar un mockup de
-// referencia): retoma la idea de rangos de días que se había descartado el 30-oct, con 2
-// correcciones sobre esa primera versión — agrupa por `fecha` del depósito (no `createdAt`), y
-// exige el depósito completamente vacío (status no_identificado Y sin ninguna CxC vinculada).
+// referencia): retoma la idea de rangos de días que se había descartado el 30-oct, agrupando por
+// `fecha` del depósito (no `createdAt`). 2026-11-12: ya NO exige el depósito completamente vacío
+// (se quitó el filtro `erpIds` vacío, alineado al Dashboard "Estatus") — cuenta cualquier
+// `no_identificado`, neteando el monto por `saldoErp` cuando hay vinculación parcial.
 // Bajo AHORA_MX (miércoles 2026-10-07 15:00 México), "hoy" = 2026-10-07, corte = medianoche de
 // ese día (2026-10-07T06:00:00Z).
 describe('getAntiguedadDepositos', () => {
@@ -1304,13 +1305,26 @@ describe('getAntiguedadDepositos', () => {
   // sin reconstrucción — más simple y más correcto que reconstruir, porque `status` YA es la
   // fuente de verdad del presente sin importar cómo se resolvió el depósito (ficha, CxC, edición
   // manual, match automático).
-  test('sin `fecha` (hoy), filtra status:"no_identificado" + erpIds vacío DIRECTO en Mongo — sin traer "identificado"', async () => {
+  test('sin `fecha` (hoy), filtra status:"no_identificado" DIRECTO en Mongo — sin traer "identificado"', async () => {
     BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
     await getAntiguedadDepositos({});
 
     const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.status).toBe('no_identificado');
-    expect(filtro.erpIds).toEqual({ $size: 0 });
+  });
+
+  // 2026-11-12 (alineado al Dashboard "Estatus"): un depósito con vinculación PARCIAL ya NO queda
+  // afuera — cuenta con el residuo neteado (deposito - saldoErp), no con el depósito completo.
+  test('depósito no_identificado con vinculación parcial: cuenta con el residuo neteado, no el depósito completo', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 1000, saldoErp: 600, fecha: new Date('2026-10-05T12:00:00.000Z') }, // 2 días, residuo 400
+      { deposito: 500, saldoErp: null, fecha: new Date('2026-10-05T12:00:00.000Z') }, // sin vínculo, completo
+    ]) }) });
+
+    const { rangos, total } = await getAntiguedadDepositos({});
+
+    expect(rangos[0]).toEqual({ rango: '1 a 30 días', count: 2, saldo: 900 }); // 400 + 500
+    expect(total).toEqual({ count: 2, saldo: 900 });
   });
 
   // Bug real corregido 2026-11-06 (tercera ronda): un depósito que estaba vacío en un mes pasado
@@ -1431,13 +1445,12 @@ describe('getAntiguedadDepositosPorAnio', () => {
   // `status:'no_identificado'` directo (ver `_antiguedadCandidatosHoy`). Este test confirma la
   // query real, no un post-filtrado — mockear un `identificado` acá y esperar que "desaparezca"
   // ya no prueba nada real (el mock no respeta el filtro, a diferencia de Mongo real).
-  test('consulta status:"no_identificado" + erpIds vacío DIRECTO en Mongo — un depósito identificado nunca es candidato, sea cual sea su rastro de identificación', async () => {
+  test('consulta status:"no_identificado" DIRECTO en Mongo — un depósito identificado nunca es candidato, sea cual sea su rastro de identificación', async () => {
     BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
     await getAntiguedadDepositosPorAnio({ anio: '2026' });
 
     const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.status).toBe('no_identificado');
-    expect(filtro.erpIds).toEqual({ $size: 0 });
   });
 
   test('un depósito con fecha posterior a todos los cortes del año no aparece en ningún mes', async () => {
@@ -1460,6 +1473,63 @@ describe('getAntiguedadDepositosPorAnio', () => {
 
     const [filtro] = BankMovement.find.mock.calls[0];
     expect(filtro.banco).toBe('BBVA');
+  });
+});
+
+// getAntiguedadPorDiaMesActual (2026-11-12, pedido explícito del usuario: serie diaria del mes en
+// curso + cierre del mes anterior, para un gráfico apilado que muestre cómo avanza la distribución
+// día a día). Bajo AHORA_MX (2026-10-07), "hoy" = día 7 de octubre — mes anterior = septiembre.
+// 2 llamadas a BankMovement.find en orden fijo: 1ra = _antiguedadCandidatosHistorico (población de
+// cierreMesAnterior + días 1-6), 2da = _antiguedadCandidatosHoy (SOLO el día 7, camino en vivo).
+describe('getAntiguedadPorDiaMesActual', () => {
+  test('arma cierreMesAnterior (set) + un día por cada día de octubre hasta hoy — el día de hoy usa el camino en vivo, no la reconstrucción histórica', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // Depósito de septiembre, nunca resuelto — cuenta en cierreMesAnterior y en TODOS los días de octubre.
+      { deposito: 300, fecha: new Date('2026-09-10T12:00:00.000Z'), erpIds: [], identificadoPor: [], primeraIdentificacionAt: null, fichaAt: null, saldoErp: null },
+    ]) }) });
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      // Depósito distinto, SOLO del camino "hoy" — nunca debe aparecer en los días históricos.
+      { deposito: 900, saldoErp: 400, fecha: new Date('2026-10-06T12:00:00.000Z') },
+    ]) }) });
+
+    const { cierreMesAnterior, dias } = await getAntiguedadPorDiaMesActual({});
+
+    expect(cierreMesAnterior.periodo).toBe('2026-09');
+    expect(cierreMesAnterior.total).toEqual({ count: 1, saldo: 300 });
+
+    expect(dias.map((d) => d.fecha)).toEqual([
+      '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05', '2026-10-06', '2026-10-07',
+    ]);
+    // Días 1-6 (histórico): solo el depósito de septiembre, siempre vacío.
+    for (const d of dias.slice(0, 6)) {
+      expect(d.total).toEqual({ count: 1, saldo: 300 });
+    }
+    // Día 7 (hoy, en vivo): SOLO el depósito del camino "hoy" (900-400 neteado=500) — el de
+    // septiembre no aparece porque viene de una consulta distinta (separación por diseño).
+    expect(dias[6].total).toEqual({ count: 1, saldo: 500 });
+  });
+
+  test('un depósito cargado a mitad de mes no aparece en los días anteriores a su `fecha` (no `createdAt`)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 200, fecha: new Date('2026-10-05T12:00:00.000Z'), createdAt: new Date('2020-01-01'), erpIds: [], identificadoPor: [], primeraIdentificacionAt: null, fichaAt: null, saldoErp: null },
+    ]) }) });
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([]) }) });
+
+    const { dias } = await getAntiguedadPorDiaMesActual({});
+
+    expect(dias.find((d) => d.fecha === '2026-10-04').total.count).toBe(0);
+    expect(dias.find((d) => d.fecha === '2026-10-05').total.count).toBe(1);
+    expect(dias.find((d) => d.fecha === '2026-10-06').total.count).toBe(1);
+  });
+
+  test('banco: se pasa al $match (buildBaseMatch) en ambas consultas', async () => {
+    BankMovement.find.mockReturnValue({ select: () => ({ lean: () => Promise.resolve([]) }) });
+    await getAntiguedadPorDiaMesActual({ banco: 'BBVA' });
+
+    const [filtroHistorico] = BankMovement.find.mock.calls[0];
+    const [filtroHoy] = BankMovement.find.mock.calls[1];
+    expect(filtroHistorico.banco).toBe('BBVA');
+    expect(filtroHoy.banco).toBe('BBVA');
   });
 });
 

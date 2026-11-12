@@ -14,6 +14,7 @@
  *   I FACTURADO = G + H − J · J BN (bonificación) = 20 % de G + H si B = "01" ·
  *   K Observaciones · L Valida descuento extra · M Caja
  *   + N Fecha · O ID NUMO · P Banco (extra, para no perder de dónde salió)
+ *   + Q No. abonos · R Último abono · S Fecha de cada abono (2026-11-12)
  *
  * No consulta nada: se arma de las secciones ya calculadas (MOSTRADOR, REF.,
  * FACT ESPECIALES y X FAC CON FICHA); un depósito MIXTO se parte en un renglón
@@ -71,12 +72,14 @@ function filasResumen(secciones, formaPagoDe) {
     const serie = _serie(String(remisiones[0] ?? '').split('-')[0]) || _serie(String(d.factura ?? '').split('-')[0]);
     const dia = _diaFila(d);
     let abonosAnteriores = 0;
+    const abonos = []; // los que suman en ABONOS ANTERIORES, con su fecha (2026-11-12)
     for (const h of d.historialAbonos ?? []) {
       for (const a of h.abonos ?? []) {
         const imp = Number(a.importe) || 0;
         if (imp <= 0 || !dia || !a.fecha || _diaMx(a.fecha) >= dia) continue;
         if (a.idNumo && (String(a.idNumo) === String(d.idNumo ?? '') || idsEnResumen.has(String(a.idNumo)))) continue;
         abonosAnteriores += imp;
+        abonos.push({ dia: _diaMx(a.fecha), importe: _r2(imp), movimiento: a.movimiento ?? '', forma: a.forma ?? '', remision: h.remision });
       }
     }
     const { partes } = formaPagoDe(d);
@@ -90,12 +93,21 @@ function filasResumen(secciones, formaPagoDe) {
       cliente: d.cliente || 'CLIENTE NO IDENTIFICADO',
       importe: _r2(monto),
       abonosAnteriores: i === 0 ? _r2(abonosAnteriores) : 0,
+      abonos: i === 0 ? abonos.sort((x, y) => x.dia.localeCompare(y.dia)) : [],
       fecha: dia,
       idNumo: d.idNumo ?? '',
       banco: d.banco ?? '',
     }));
   }
   return filas.sort((a, b) => a.serie.localeCompare(b.serie) || String(a.fecha).localeCompare(String(b.fecha)) || a.cliente.localeCompare(b.cliente, 'es'));
+}
+
+// "5/11/26 $250.00 · ABO-261010874 · EFECTIVO" (+ "· REM …" si el renglón tiene varias remisiones).
+function textoAbonoResumen(a, _i, todos) {
+  const [y, m, d] = a.dia.split('-');
+  const varias = new Set(todos.map(x => x.remision)).size > 1;
+  const dinero = `$${a.importe.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return [`${Number(d)}/${Number(m)}/${y.slice(2)} ${dinero}`, a.movimiento, a.forma, varias ? `REM ${a.remision}` : null].filter(Boolean).join(' · ');
 }
 
 const _textoDia = dia => { const [y, m, d] = dia.split('-').map(Number); return `${d} ${MESES[m - 1]} ${y}`; };
@@ -108,7 +120,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   const filas = filasResumen(secciones, formaPagoDe);
   if (!filas.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [8, 15, 7, 22, 16, 34, 15, 15, 15, 13, 16, 12, 12, 11, 10, 22].map(width => ({ width }));
+  ws.columns = [8, 15, 7, 22, 16, 34, 15, 15, 15, 13, 16, 12, 12, 11, 10, 22, 10, 12, 60].map(width => ({ width }));
 
   const { fechaInicio, fechaFin, sucursal } = meta;
   ws.addRow(['RELACIÓN DE CHEQUES Y DOCUMENTOS']).font = { bold: true, size: 13 };
@@ -116,7 +128,8 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   ws.addRow([sucursal ? `SUCURSAL: ${sucursal}` : null, null, null, null, null, periodo]).font = { bold: true };
   ws.addRow([]);
   const enc = ws.addRow(['Base', 'Forma de Pago', 'Serie', 'Folio', 'Factura', 'NOMBRE DEL CLIENTE', 'IMPORTE COBRADO', 'ABONOS ANTERIORES',
-    'FACTURADO', 'BN', 'Observaciones', 'Valida Descuento Extra', 'Caja', 'Fecha', 'ID NUMO', 'Banco']);
+    'FACTURADO', 'BN', 'Observaciones', 'Valida Descuento Extra', 'Caja', 'Fecha', 'ID NUMO', 'Banco',
+    'No. ABONOS', 'ÚLTIMO ABONO', 'FECHA DE CADA ABONO']);
   enc.eachCell(c => { c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = _relleno(MORADO); c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
   ws.views = [{ state: 'frozen', ySplit: enc.number }];
 
@@ -125,17 +138,24 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   // (2026-11-12, pedido del usuario).
   for (const f of filas) {
     const row = ws.addRow(['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
-      f.fecha ? new Date(`${f.fecha}T12:00:00Z`) : null, f.idNumo, f.banco]);
+      f.fecha ? new Date(`${f.fecha}T12:00:00Z`) : null, f.idNumo, f.banco,
+      // Abonos anteriores (2026-11-12, pedido del usuario: "cuántos abonos y la
+      // fecha de cada abono"): uno por línea en la misma celda, para no romper los filtros.
+      f.abonos.length || null,
+      f.abonos.length ? new Date(`${f.abonos[f.abonos.length - 1].dia}T12:00:00Z`) : null,
+      f.abonos.map(textoAbonoResumen).join('\n') || null]);
     const n = row.number;
     const bn = f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0;
     row.getCell(10).value = { formula: `IF(B${n}="01",(G${n}+H${n})*${BN_PORCENTAJE},0)`, result: bn };
     row.getCell(9).value = { formula: `G${n}+H${n}-J${n}`, result: _r2(f.importe + f.abonosAnteriores - bn) };
     for (const c of [7, 8, 9, 10]) row.getCell(c).numFmt = DINERO;
     row.getCell(14).numFmt = 'd/m/yy';
+    row.getCell(18).numFmt = 'd/m/yy';
     row.getCell(4).alignment = { wrapText: true };
+    row.getCell(19).alignment = { wrapText: true, vertical: 'top' };
   }
   const ultima = ws.lastRow.number;
-  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 16 } };
+  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 19 } };
   const rango = col => `${col}${primera}:${col}${ultima}`;
   const suma = (col, filtro) => filas.filter(filtro ?? (() => true)).reduce((s, f) => s + (Number(f[col]) || 0), 0);
   const bnDe = f => (f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0);

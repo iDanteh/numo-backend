@@ -65,6 +65,9 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect(fila(8).getCell(9).value.result).toBe(600);
   expect(fila(8).getCell(17).value).toBe(2);
   expect(fila(8).getCell(18).value).toEqual(new Date('2026-11-05T12:00:00Z'));
+  // No. ABONOS: PEDRO solo tiene su pago inicial → 0 (no vacío); ANA sin historial de Kore → vacío.
+  expect(fila(7).getCell(17).value).toBe(0);
+  expect(fila(5).getCell(17).value).toBeNull();
   // IMPORTE TOTAL VENTA (S) = lo que debía antes del primer movimiento: JUANA 750 + 100; PEDRO 0 + 1000; ANA sin historial.
   expect(fila(4).getCell(19).value).toBe('IMPORTE TOTAL VENTA');
   expect([19, 20, 21, 22].map(c => fila(8).getCell(c).value)).toEqual([850, 'ABONADA', 50, null]);

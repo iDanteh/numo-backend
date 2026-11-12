@@ -361,9 +361,10 @@ router.post('/:id/reemplazar-cuenta',
 );
 
 // POST /api/polizas/:id/regenerar
-// "↻ Actualizar" (solo Ingreso en borrador): cancela la póliza y la genera de
-// nuevo para la misma sucursal y día, con las facturas que llegaron del SAT
-// después. Ver regenerarPolizaIngreso (cfdi-poliza-generator.service.js).
+// "↻ Actualizar" (Ingreso o Cobranza en borrador): cancela la póliza y la genera
+// de nuevo para la misma sucursal y día (Cobranza: el mismo día, todas las
+// sucursales), con lo que llegó del SAT después. Ver regenerarPolizaIngreso
+// (cfdi-poliza-generator.service.js).
 // Response: { polizaId, numero, totalCfdis, anterior, facturasAgregadas, facturasQuitadas, advertencias, ... }
 router.post('/:id/regenerar',
   authenticate,

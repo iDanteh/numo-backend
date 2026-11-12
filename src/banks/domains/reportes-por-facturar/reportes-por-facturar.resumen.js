@@ -121,10 +121,9 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   ws.views = [{ state: 'frozen', ySplit: enc.number }];
 
   const primera = enc.number + 1;
-  let serieAnterior = null;
+  // Renglones seguidos, sin vacío entre almacenes, para poder usar los filtros
+  // (2026-11-12, pedido del usuario).
   for (const f of filas) {
-    if (serieAnterior !== null && f.serie !== serieAnterior) ws.addRow([]); // separa almacenes, como su hoja
-    serieAnterior = f.serie;
     const row = ws.addRow(['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
       f.fecha ? new Date(`${f.fecha}T12:00:00Z`) : null, f.idNumo, f.banco]);
     const n = row.number;
@@ -136,6 +135,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
     row.getCell(4).alignment = { wrapText: true };
   }
   const ultima = ws.lastRow.number;
+  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 16 } };
   const rango = col => `${col}${primera}:${col}${ultima}`;
   const suma = (col, filtro) => filas.filter(filtro ?? (() => true)).reduce((s, f) => s + (Number(f[col]) || 0), 0);
   const bnDe = f => (f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0);

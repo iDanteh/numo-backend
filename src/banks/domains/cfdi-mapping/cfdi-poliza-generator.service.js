@@ -813,6 +813,21 @@ function _diferenciaDiasMx(fechaIso, diaYaResuelto) {
 // siguen excluidos de este mecanismo, esos los maneja Cobranza.
 const TOLERANCIA_DIAS_FACTURACION_DIFERIDA = 0;
 
+// Cobro de una venta que se factura DESPUÉS (2026-11-11, pedido del usuario,
+// caso real EUGENIO CORTES JIMENEZ A0-261004610: cobrada el 7-nov, entró a la
+// Factura Global A0-261103732 del 10-nov): desde los cobros del 1-nov el
+// dinero se contabiliza el día en que se timbra su factura, no el día del
+// cobro. El día del cobro sale solo en la hoja informativa "Cobros pendientes
+// de facturar" (`ETIQUETA_COBRO_PENDIENTE_FACTURA`); el día de la factura su
+// Cargo ya no se oculta (`yaContabilizadoOtroDia`). Cobros anteriores al
+// corte siguen como antes (día del cobro), para no duplicar los que ya están
+// en pólizas de septiembre/octubre. Un cobro cuya factura se timbró ANTES
+// tampoco cambia (no hay "día de factura" después).
+const FECHA_CORTE_COBRO_EN_DIA_FACTURA = '2026-11-01';
+const ETIQUETA_COBRO_PENDIENTE_FACTURA = 'COBRO-PENDIENTE-FACTURA';
+const _cobroVaAlDiaDeFactura = (diaCobro, diaFactura) =>
+  !!diaCobro && diaCobro >= FECHA_CORTE_COBRO_EN_DIA_FACTURA && !(diaFactura && diaFactura < diaCobro);
+
 /**
  * Fusión de `_prefetchDesglosePagoReal` + `_prefetchSaldoFavorUsadoPropio`
  * (2026-08-07, optimización): ambas funciones filtraban EXACTAMENTE el mismo
@@ -1452,7 +1467,11 @@ async function _prefetchAjustesFacturaPropia(cfdiConRegla, rfc, opciones = {}) {
             // la factura, debe quedar oculto de "Depósitos consolidados" para
             // no contar el mismo dinero dos veces (fix 2026-08-25, caso real
             // E48070D3 $618.81: Tarjeta duplicada entre el 7-ago y el 11-ago).
-            yaContabilizadoOtroDia: !!(diaCfdi && diffDias !== null && diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA),
+            // Desde el corte del 1-nov, un cobro ANTERIOR a su factura se
+            // contabiliza aquí (día de la factura) y ya no se oculta — ver
+            // `FECHA_CORTE_COBRO_EN_DIA_FACTURA`.
+            yaContabilizadoOtroDia: !!(diaCfdi && diffDias !== null && diffDias > TOLERANCIA_DIAS_FACTURACION_DIFERIDA)
+              && !_cobroVaAlDiaDeFactura(_diaMx(cobro.fecha), diaCfdi),
           });
         }
       }
@@ -3244,6 +3263,12 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
       fechaCobroMx.setHours(fechaCobroMx.getHours() - 6);
       const diaCobro = fechaCobroMx.toISOString().slice(0, 10);
       if (diaCobro < fechaInicio || diaCobro > fechaFin) continue;
+      // Desde el 1-nov va al día de su factura (ver `FECHA_CORTE_COBRO_EN_DIA_FACTURA`),
+      // salvo que la factura confirmada por el ERP se haya timbrado antes. Solo
+      // la confirmada: el respaldo por folio de ticket puede caer en un CFDI de
+      // otro cliente con la misma numeración (ver `_facturaConfirmada`).
+      const diaFacturaConfirmada = facturaKey && _facturaConfirmada(cuenta) ? (diaCfdiPorFolioFactura.get(facturaKey) ?? null) : null;
+      const pendienteFactura = _cobroVaAlDiaDeFactura(diaCobro, diaFacturaConfirmada);
 
       if (facturaKey) {
         // PPD: su cobro es de Cobranza (CFDI de Pago), sin importar cuánto
@@ -3307,7 +3332,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
         const clave = (fp.claveSat ?? '').trim();
         if (!clave || monto <= 0) continue;
         if (!porVenta.has(ventaKey)) porVenta.set(ventaKey, []);
-        porVenta.get(ventaKey).push({ clave, monto });
+        porVenta.get(ventaKey).push({ clave, monto, pendienteFactura, diaCobro });
       }
     }
   }
@@ -3332,7 +3357,7 @@ async function _cobrosSinFacturaPorCentro({ rfc, centro, fechaInicio, fechaFin }
     const [ventaSerie, ventaFolio] = ventaKey.split('|');
     for (const r of renglones) {
       if (r.monto <= 0) continue;
-      detalle.push({ ventaSerie, ventaFolio, clave: r.clave, monto: Math.round(r.monto * 100) / 100 });
+      detalle.push({ ventaSerie, ventaFolio, clave: r.clave, monto: Math.round(r.monto * 100) / 100, pendienteFactura: !!r.pendienteFactura, diaCobro: r.diaCobro ?? null });
     }
   }
   return detalle;
@@ -5490,7 +5515,7 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
       const cuentaDestinoSF = t.clave === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
       if (!cuentaDestinoSF || t.monto <= 0) continue;
       movimientosResult.push({
-        concepto:      `Cobros sin factura / ${t.ventaSerie}-${t.ventaFolio}`,
+        concepto:      `${t.pendienteFactura ? 'Cobro pendiente de facturar' : 'Cobros sin factura'} / ${t.ventaSerie}-${t.ventaFolio}`,
         serie:         null,
         centroCosto:   ccSinFacturaProp?.clave ?? null,
         centroCostoId: ccSinFacturaProp?.id    ?? null,
@@ -5499,7 +5524,8 @@ async function generarPropuesta({ rfc, ejercicio, periodo, tipoPropuesta = 'D', 
         debe:          t.monto,
         haber:         0,
         tipoOrigen:    'Venta',
-        reglaNombre:   'COBRO-SIN-FACTURA',
+        reglaNombre:   t.pendienteFactura ? ETIQUETA_COBRO_PENDIENTE_FACTURA : 'COBRO-SIN-FACTURA',
+        ...(t.pendienteFactura ? { ventaFecha: t.diaCobro } : {}),
         formaPago:     t.clave,
         serieVentaTicket: t.ventaSerie,
         folioVentaTicket: t.ventaFolio,
@@ -7371,7 +7397,7 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
       const cuentaDestinoSFG = t.clave === '01' ? (cuentaMap[CODIGO_CUENTA_CAJA] ?? null) : (cuentaMap[CODIGO_CUENTA_BANCOS] ?? null);
       if (!cuentaDestinoSFG || t.monto <= 0) continue;
       todosLosMovimientos.push({
-        concepto:      `Cobros sin factura / ${t.ventaSerie}-${t.ventaFolio}`,
+        concepto:      `${t.pendienteFactura ? 'Cobro pendiente de facturar' : 'Cobros sin factura'} / ${t.ventaSerie}-${t.ventaFolio}`,
         serie:         null,
         centroCosto:   ccSinFacturaGuard?.clave ?? null,
         centroCostoId: ccSinFacturaGuard?.id    ?? null,
@@ -7380,7 +7406,8 @@ async function generarYGuardar({ rfc, ejercicio, periodo, tipoPropuesta = 'D', t
         debe:          t.monto,
         haber:         0,
         tipoOrigen:    'Venta',
-        reglaNombre:   'COBRO-SIN-FACTURA',
+        reglaNombre:   t.pendienteFactura ? ETIQUETA_COBRO_PENDIENTE_FACTURA : 'COBRO-SIN-FACTURA',
+        ...(t.pendienteFactura ? { ventaFecha: t.diaCobro } : {}),
         formaPago:     t.clave,
         serieVentaTicket: t.ventaSerie,
         folioVentaTicket: t.ventaFolio,
@@ -8173,6 +8200,7 @@ module.exports = {
   _prefetchSaldosFavorGenerados, _inyectarSaldoFavorGenerado, _formaPagoDominante,
   _prefetchAjustesFacturaPropia, _prefetchCuentasPendientesAnticipo,
   _sfUsadoAntesDeFacturarPorCentro,
+  _cobrosSinFacturaPorCentro, _cobroVaAlDiaDeFactura,
   // Utilidades genéricas (numeración de folio, fechas) expuestas ÚNICAMENTE
   // para que cobranza-poliza-generator.service.js las reutilice sin duplicar
   // la numeración de folio (comparte el mismo contador/rango por sucursal que

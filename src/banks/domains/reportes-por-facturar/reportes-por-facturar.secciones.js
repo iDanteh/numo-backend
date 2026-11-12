@@ -368,7 +368,7 @@ function _totalesFormaPago(ws, bloques, colImporte = COL_IMPORTE) {
 // ABONADA) y SALDO PENDIENTE (2026-11-12, usuario: "a la de mostrador CEDIS A0
 // quítale los abonos y agrega una columna de estatus saldada o abonada"). El
 // desglose de abonos queda en la hoja RESUMEN POR FACTURAR.
-const ESTATUS_MOSTRADOR = { PAGADA: 'SALDADA', ABONADA: 'ABONADA' };
+const ESTATUS_MOSTRADOR = { SALDADA: 'SALDADA', ABONADA: 'ABONADA' };
 function _estatusMostrador(d, tipoBloque) {
   const e = estatusDe({ ...d, _seccion: tipoBloque === 'pendiente' ? 'pendiente' : null });
   return { estatus: ESTATUS_MOSTRADOR[e.estatus] ?? null, saldo: e.estatus === 'ABONADA' ? e.saldo : null, el: e.pagadaEl };

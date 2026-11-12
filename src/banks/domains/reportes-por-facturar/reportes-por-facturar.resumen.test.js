@@ -69,12 +69,12 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect([19, 20, 21].map(c => fila(7).getCell(c).value)).toEqual(['PAGADA', 0, new Date('2026-11-09T12:00:00Z')]);
   expect(fila(4).getCell(27).value).toBe('SALDO DESPUÉS DE ESTE MOVIMIENTO');
   const mov = n => [22, 23, 24, 25, 26, 27].map(c => fila(n).getCell(c).value);
-  expect(mov(7)).toEqual([new Date('2026-11-09T12:00:00Z'), 'ESTE PAGO', 1000, 'CPF-9', '', 0]);
+  expect(mov(7)).toEqual([new Date('2026-11-09T12:00:00Z'), 'PAGO INICIAL', 1000, 'CPF-9', '', 0]);
   expect([8, 9, 10, 11, 12].map(mov)).toEqual([
     [new Date('2026-11-03T12:00:00Z'), 'ABONO ANTERIOR', 100, 'ABO-0', 'TRANSFERENCIA', 750],
     [new Date('2026-11-04T12:00:00Z'), 'DEVOLUCIÓN', 30, 'RET-5', 'DE DEV-1', 720],
     [new Date('2026-11-05T12:00:00Z'), 'ABONO ANTERIOR', 250, 'ABO-1', 'EFECTIVO', 470],
-    [new Date('2026-11-12T12:00:00Z'), 'ESTE PAGO', 400, 'ABO-2', 'EFECTIVO', 70], // Kore lo registró 2 días después
+    [new Date('2026-11-12T12:00:00Z'), 'PAGO INICIAL', 400, 'ABO-2', 'EFECTIVO', 70], // Kore lo registró 2 días después
     [new Date('2026-11-12T12:00:00Z'), 'BONIFICACIÓN', 20, 'RET-6', 'DE BON-2', 50],
   ]);
   // Combinadas sin perder el texto de abajo (para los filtros); importes solo arriba.
@@ -99,10 +99,10 @@ test('TIPO de movimiento: caso real INTI CESAR A0-261000641 (depósito 057403 de
   const d = { idNumo: '057403', importe: 1264 };
   const tipo = a => tipoMovimiento(a, d, '2026-11-09', new Set(['057403']));
   expect(tipo({ fecha: '2026-10-06T01:27:39Z', forma: 'DE DEV-058156', importe: 247.52 })).toBe('DEVOLUCIÓN');
-  expect(tipo({ fecha: '2026-11-11T23:03:56Z', forma: 'DEPOSITO EN EFECTIVO', importe: 1264, idNumo: '057403' })).toBe('ESTE PAGO');
+  expect(tipo({ fecha: '2026-11-11T23:03:56Z', forma: 'DEPOSITO EN EFECTIVO', importe: 1264, idNumo: '057403' })).toBe('PAGO INICIAL');
   expect(tipo({ fecha: '2026-11-11T23:44:49Z', forma: 'DE BON-326705', importe: 74.77 })).toBe('BONIFICACIÓN');
   expect(tipo({ fecha: '2026-10-20T17:00:00Z', forma: 'EFECTIVO', importe: 100 })).toBe('ABONO ANTERIOR');
-  expect(tipo({ fecha: '2026-11-15T17:00:00Z', forma: 'TRANSFERENCIA', importe: 100 })).toBe('PAGO POSTERIOR');
+  expect(tipo({ fecha: '2026-11-15T17:00:00Z', forma: 'TRANSFERENCIA', importe: 100 })).toBe('ABONO POSTERIOR');
   expect(tipo({ fecha: '2026-10-20T17:00:00Z', forma: 'DE XYZ-1', importe: 5 })).toBe('AJUSTE');
   expect(tipo({ fecha: '2026-10-20T17:00:00Z', forma: 'X', importe: -5 })).toBe('CARGO');
 });

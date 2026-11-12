@@ -92,6 +92,8 @@ async function _enriquecerSustitutosConPeriodoOriginal(sustitutos) {
     .filter(s => s.originales.length > 0);
 }
 
+// ⚠ Desde 2026-11-12 `mismoPeriodo` siempre es false (ver abajo): lo que sigue
+// describe la regla anterior, ya sin efecto.
 // Confirmado con el usuario 2026-08-13: cuando el/los CFDI(s) original(es)
 // sustituido(s) son del MISMO periodo que se está generando (y se pudo
 // determinar su periodo — si el original no se encontró en Mongo no hay nada
@@ -113,10 +115,13 @@ function _particionarSustitutosPorRiesgo(sustitutosEnriquecidos, { uuidsYaUsados
         (Number(o.ejercicio) === Number(ejercicio) && Number(o.periodo) < Number(periodo))
       ),
     );
-    const mismoPeriodo = s.originales.length > 0 && s.originales.every(o =>
-      o.ejercicio != null && o.periodo != null &&
-      Number(o.ejercicio) === Number(ejercicio) && Number(o.periodo) === Number(periodo),
-    );
+    // REVERTIDO 2026-11-12 (pedido del usuario: "un CFDI tipo 04 no se debe
+    // contabilizar, se va a la pestaña de CFDIs sustitutos"; casos SANTA ROSA
+    // I-1018 28-oct M0-261000874 y HIDALGO I-341 31-oct B0-261004295/4197/4207
+    // salían en la póliza con su original + reversión). Ya ningún sustituto se
+    // contabiliza automático, sin importar el periodo del original: todos
+    // quedan fuera de la póliza y se listan en "CFDIs Sustitutos".
+    const mismoPeriodo = false;
     const motivo = yaEnNumo ? 'ya_contabilizado_en_numo' : periodoAnterior ? 'periodo_anterior' : 'sin_riesgo_detectado';
     return { ...s, motivo, mismoPeriodo };
   });

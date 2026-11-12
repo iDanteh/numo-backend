@@ -29,7 +29,7 @@ const FACTURAS = [
   { folio: '261005362', monto: 3713.92, iva: 512.27 },
 ];
 
-function caso({ fechaPago, formaPago }) {
+function caso({ fechaPago, formaPago, nombre = null }) {
   const total = FACTURAS.reduce((s, f) => s + f.monto, 0);
   const iva = FACTURAS.reduce((s, f) => s + f.iva, 0);
   const cfdi = {
@@ -40,7 +40,7 @@ function caso({ fechaPago, formaPago }) {
   const doctosPago = FACTURAS.map(f => ({
     serie: 'A0', folio: f.folio, monto: f.monto, montoSF: 0, ivaDoc: f.iva, idDocumento: null,
     tickets: [`A0-${f.folio}`], fechaPagoReal: fechaPago,
-    desglosePagoReal: [{ monto: f.monto, claveSat: formaPago, claveCentro: '300', grupoPago: '300|2026-11-03T09:19|6498.00' }],
+    desglosePagoReal: [{ monto: f.monto, claveSat: formaPago, nombre, claveCentro: '300', grupoPago: '300|2026-11-03T09:19|6498.00' }],
   }));
   return cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, { doctosPago }).movs;
 }
@@ -65,6 +65,23 @@ test('transferencia de un mes anterior: sigue contra Depósitos No Identificados
   expect(cargoA(movs, DNI)).toBe(5601.72);
   expect(cargoA(movs, IVA_NI)).toBe(896.28);
   expect(cargoA(movs, CAJA)).toBe(0);
+});
+
+// Regla del usuario (2026-11-12): en efectivo, el NI solo aplica a depósitos/transferencias
+// hechos el mes pasado y cobrados/reportados el mes siguiente. "DEPÓSITO EN EFECTIVO" viene
+// de Kore con claveSat '01' (igual que el efectivo de caja) y solo el nombre lo distingue.
+test.each(['DEPOSITO EN EFECTIVO', 'DEP. EFECTIVO', 'Depósito en efectivo'])(
+  'depósito en efectivo (%s) de un mes anterior: sigue contra Depósitos No Identificados', (nombre) => {
+    const movs = caso({ fechaPago: '2026-10-31T00:00:00.000Z', formaPago: '01', nombre });
+    expect(cargoA(movs, DNI)).toBe(5601.72);
+    expect(cargoA(movs, IVA_NI)).toBe(896.28);
+    expect(cargoA(movs, CAJA)).toBe(0);
+  });
+
+test('efectivo de caja (nombre EFECTIVO) con FechaPago del mes anterior: a Caja', () => {
+  const movs = caso({ fechaPago: '2026-10-31T00:00:00.000Z', formaPago: '01', nombre: 'EFECTIVO' });
+  expect(movs.filter(m => m.reglaNombre === 'NI')).toHaveLength(0);
+  expect(cargoA(movs, CAJA)).toBe(6498.00);
 });
 
 test('efectivo del mismo mes: a Caja, como siempre', () => {

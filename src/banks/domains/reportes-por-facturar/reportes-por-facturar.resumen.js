@@ -14,7 +14,12 @@
  *   I FACTURADO = G + H − J · J BN (bonificación) = 20 % de G + H si B = "01" ·
  *   K Observaciones · L Valida descuento extra · M Caja
  *   + N Fecha · O ID NUMO · P Banco (extra, para no perder de dónde salió)
- *   + Q No. abonos · R Último abono · S Fecha de cada abono (2026-11-12)
+ *   + Q No. abonos · R Último abono (2026-11-12)
+ *   + S ESTATUS (ABONADA / PAGADA) · T Saldo pendiente · U Pagada el
+ *   + V–Z desglose de cada abono anterior: fecha, importe, movimiento, forma
+ *     y saldo a esa fecha — un sub-renglón por abono; las columnas A–U de la
+ *     venta quedan combinadas a lo alto de sus abonos (2026-11-12, pedido del
+ *     usuario: "dentro de la celda de esa venta se hagan más celdas").
  *
  * No consulta nada: se arma de las secciones ya calculadas (MOSTRADOR, REF.,
  * FACT ESPECIALES y X FAC CON FICHA); un depósito MIXTO se parte en un renglón
@@ -38,6 +43,7 @@ const MESES = ['ENERO', 'FEBRERO', 'MARZO', 'ABRIL', 'MAYO', 'JUNIO', 'JULIO', '
 const DINERO = '$#,##0.00';
 const MORADO = 'FF8E7CC3';
 const _relleno = argb => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
+const AdmZip = require('adm-zip');
 
 const _r2 = n => Math.round((Number(n) || 0) * 100) / 100;
 const _serie = v => String(v ?? '').trim().toUpperCase();
@@ -45,14 +51,35 @@ const _diaMx = f => (f ? new Date(new Date(f).getTime() - 6 * 3600000).toISOStri
 // Día del renglón: Bancos = día del estado de cuenta (medianoche UTC); Kore = instante real.
 const _diaFila = d => (!d.fecha ? null : String(d.fecha).length === 10 ? d.fecha : d.deKore ? _diaMx(d.fecha) : new Date(d.fecha).toISOString().slice(0, 10));
 
+/**
+ * ESTATUS de la venta (2026-11-12, pedido del usuario: "saber si está abonada o
+ * pagada por completo"), al momento de calcular / ↻ Actualizar el reporte:
+ * con el historial de Kore, PAGADA si todas sus remisiones quedaron en saldo 0
+ * (fecha = la última en saldarse), si no ABONADA con lo que deben. Sin
+ * historial: X FAC CON FICHA (todavía deben) → ABONADA; PENDIENTE GENERAR
+ * FACTURA (saldo 0 por definición) → PAGADA; lo demás "SIN DATO".
+ */
+function estatusDe(d) {
+  const hs = d.historialAbonos ?? [];
+  if (hs.length) {
+    const deben = hs.filter(h => !h.saldadaEl);
+    if (!deben.length) return { estatus: 'PAGADA', saldo: 0, pagadaEl: hs.map(h => _diaMx(h.saldadaEl)).sort().at(-1) };
+    return { estatus: 'ABONADA', saldo: _r2(deben.reduce((s, h) => s + (Number(h.saldo) || 0), 0)), pagadaEl: null };
+  }
+  if ((Number(d.saldo) || 0) > 0.005 || d._seccion === 'ficha') return { estatus: 'ABONADA', saldo: d.saldo != null ? _r2(d.saldo) : null, pagadaEl: null };
+  if (d._seccion === 'pendiente') return { estatus: 'PAGADA', saldo: 0, pagadaEl: null };
+  return { estatus: 'SIN DATO', saldo: null, pagadaEl: null };
+}
+
 /** Depósitos de las secciones que entran al resumen (con la factura, si ya tiene). */
 function _depositos(secciones) {
-  const deBloques = bloques => (bloques ?? []).flatMap(b => (b.grupos ?? []).flatMap(g => g.depositos ?? []));
+  const deBloques = (bloques, seccion) => (bloques ?? []).flatMap(b => (b.grupos ?? []).flatMap(g => g.depositos ?? [])
+    .map(d => ({ ...d, _seccion: seccion ?? (b.tipo === 'pendiente' ? 'pendiente' : null) })));
   return [
     ...(secciones?.mostrador ?? []).flatMap(a => deBloques(a.bloques)),
     ...(secciones?.ref ?? []).flatMap(a => deBloques(a.bloques)),
     ...deBloques(secciones?.especiales),
-    ...deBloques(secciones?.ficha ? [secciones.ficha] : []),
+    ...deBloques(secciones?.ficha ? [secciones.ficha] : [], 'ficha'),
   ];
 }
 
@@ -79,9 +106,10 @@ function filasResumen(secciones, formaPagoDe) {
         if (imp <= 0 || !dia || !a.fecha || _diaMx(a.fecha) >= dia) continue;
         if (a.idNumo && (String(a.idNumo) === String(d.idNumo ?? '') || idsEnResumen.has(String(a.idNumo)))) continue;
         abonosAnteriores += imp;
-        abonos.push({ dia: _diaMx(a.fecha), importe: _r2(imp), movimiento: a.movimiento ?? '', forma: a.forma ?? '', remision: h.remision });
+        abonos.push({ dia: _diaMx(a.fecha), importe: _r2(imp), movimiento: a.movimiento ?? '', forma: a.forma ?? '', remision: h.remision, saldo: a.saldo ?? null });
       }
     }
+    const estatus = estatusDe(d);
     const { partes } = formaPagoDe(d);
     const formas = Object.entries(partes).filter(([, m]) => Math.abs(m) > 0.005);
     const lista = formas.length ? formas : [[null, Number(d.importe) || 0]];
@@ -94,20 +122,15 @@ function filasResumen(secciones, formaPagoDe) {
       importe: _r2(monto),
       abonosAnteriores: i === 0 ? _r2(abonosAnteriores) : 0,
       abonos: i === 0 ? abonos.sort((x, y) => x.dia.localeCompare(y.dia)) : [],
+      estatus: estatus.estatus,
+      saldo: i === 0 ? estatus.saldo : null,
+      pagadaEl: estatus.pagadaEl,
       fecha: dia,
       idNumo: d.idNumo ?? '',
       banco: d.banco ?? '',
     }));
   }
   return filas.sort((a, b) => a.serie.localeCompare(b.serie) || String(a.fecha).localeCompare(String(b.fecha)) || a.cliente.localeCompare(b.cliente, 'es'));
-}
-
-// "5/11/26 $250.00 · ABO-261010874 · EFECTIVO" (+ "· REM …" si el renglón tiene varias remisiones).
-function textoAbonoResumen(a, _i, todos) {
-  const [y, m, d] = a.dia.split('-');
-  const varias = new Set(todos.map(x => x.remision)).size > 1;
-  const dinero = `$${a.importe.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  return [`${Number(d)}/${Number(m)}/${y.slice(2)} ${dinero}`, a.movimiento, a.forma, varias ? `REM ${a.remision}` : null].filter(Boolean).join(' · ');
 }
 
 const _textoDia = dia => { const [y, m, d] = dia.split('-').map(Number); return `${d} ${MESES[m - 1]} ${y}`; };
@@ -120,7 +143,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   const filas = filasResumen(secciones, formaPagoDe);
   if (!filas.length) return false;
   const ws = workbook.addWorksheet(nombre);
-  ws.columns = [8, 15, 7, 22, 16, 34, 15, 15, 15, 13, 16, 12, 12, 11, 10, 22, 10, 12, 60].map(width => ({ width }));
+  ws.columns = [8, 15, 7, 22, 16, 34, 15, 15, 15, 13, 16, 12, 12, 11, 10, 22, 10, 12, 12, 14, 11, 11, 14, 18, 16, 14].map(width => ({ width }));
 
   const { fechaInicio, fechaFin, sucursal } = meta;
   ws.addRow(['RELACIÓN DE CHEQUES Y DOCUMENTOS']).font = { bold: true, size: 13 };
@@ -129,33 +152,51 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   ws.addRow([]);
   const enc = ws.addRow(['Base', 'Forma de Pago', 'Serie', 'Folio', 'Factura', 'NOMBRE DEL CLIENTE', 'IMPORTE COBRADO', 'ABONOS ANTERIORES',
     'FACTURADO', 'BN', 'Observaciones', 'Valida Descuento Extra', 'Caja', 'Fecha', 'ID NUMO', 'Banco',
-    'No. ABONOS', 'ÚLTIMO ABONO', 'FECHA DE CADA ABONO']);
+    'No. ABONOS', 'ÚLTIMO ABONO', 'ESTATUS', 'SALDO PENDIENTE', 'PAGADA EL',
+    'FECHA ABONO', 'IMPORTE ABONO', 'MOVIMIENTO', 'FORMA', 'SALDO A ESA FECHA']);
   enc.eachCell(c => { c.font = { bold: true, color: { argb: 'FFFFFFFF' } }; c.fill = _relleno(MORADO); c.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true }; });
   ws.views = [{ state: 'frozen', ySplit: enc.number }];
 
   const primera = enc.number + 1;
+  const _dia = v => (v ? new Date(`${v}T12:00:00Z`) : null);
   // Renglones seguidos, sin vacío entre almacenes, para poder usar los filtros
-  // (2026-11-12, pedido del usuario).
+  // (2026-11-12, pedido del usuario). Una venta con N abonos ocupa N
+  // sub-renglones: los abonos en V–Z, uno por sub-renglón; A–U combinadas.
+  // En las combinadas el texto se repite por debajo (Excel no lo enseña, pero
+  // el filtro sí lo ve: filtrar por Serie / Cliente no esconde los abonos);
+  // los importes van solo en el primer sub-renglón para no sumar doble.
+  const SOLO_PRIMERO = new Set([7, 8, 9, 10, 17, 20]); // G H I J, No. abonos, saldo
+  const combinadas = [];
   for (const f of filas) {
-    const row = ws.addRow(['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
-      f.fecha ? new Date(`${f.fecha}T12:00:00Z`) : null, f.idNumo, f.banco,
-      // Abonos anteriores (2026-11-12, pedido del usuario: "cuántos abonos y la
-      // fecha de cada abono"): uno por línea en la misma celda, para no romper los filtros.
-      f.abonos.length || null,
-      f.abonos.length ? new Date(`${f.abonos[f.abonos.length - 1].dia}T12:00:00Z`) : null,
-      f.abonos.map(textoAbonoResumen).join('\n') || null]);
-    const n = row.number;
+    const altura = Math.max(f.abonos.length, 1);
+    const venta = ['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
+      _dia(f.fecha), f.idNumo, f.banco,
+      f.abonos.length || null, f.abonos.length ? _dia(f.abonos[f.abonos.length - 1].dia) : null,
+      f.estatus, f.saldo, _dia(f.pagadaEl)];
+    let n = null;
+    for (let k = 0; k < altura; k++) {
+      const a = f.abonos[k];
+      const valores = venta.map((v, c) => (k > 0 && SOLO_PRIMERO.has(c + 1) ? null : v));
+      const abono = a ? [_dia(a.dia), a.importe, f.abonos.some(x => x.remision !== a.remision) ? `${a.movimiento} · REM ${a.remision}` : a.movimiento, a.forma, a.saldo] : [];
+      const row = ws.addRow([...valores, ...abono]);
+      if (k === 0) n = row.number;
+      for (const c of [7, 8, 9, 10, 20, 23, 26]) row.getCell(c).numFmt = DINERO;
+      for (const c of [14, 18, 21, 22]) row.getCell(c).numFmt = 'd/m/yy';
+      row.getCell(19).font = { bold: true, color: { argb: f.estatus === 'PAGADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
+    }
     const bn = f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0;
-    row.getCell(10).value = { formula: `IF(B${n}="01",(G${n}+H${n})*${BN_PORCENTAJE},0)`, result: bn };
-    row.getCell(9).value = { formula: `G${n}+H${n}-J${n}`, result: _r2(f.importe + f.abonosAnteriores - bn) };
-    for (const c of [7, 8, 9, 10]) row.getCell(c).numFmt = DINERO;
-    row.getCell(14).numFmt = 'd/m/yy';
-    row.getCell(18).numFmt = 'd/m/yy';
-    row.getCell(4).alignment = { wrapText: true };
-    row.getCell(19).alignment = { wrapText: true, vertical: 'top' };
+    ws.getCell(n, 10).value = { formula: `IF(B${n}="01",(G${n}+H${n})*${BN_PORCENTAJE},0)`, result: bn };
+    ws.getCell(n, 9).value = { formula: `G${n}+H${n}-J${n}`, result: _r2(f.importe + f.abonosAnteriores - bn) };
+    for (let c = 1; c <= 21; c++) {
+      ws.getCell(n, c).alignment = { vertical: 'middle', wrapText: c === 4 };
+      if (altura > 1) combinadas.push(`${ws.getCell(n, c).address}:${ws.getCell(n + altura - 1, c).address}`);
+    }
   }
+  // Se combinan al final en el .xlsx (aplicarCombinadas): mergeCells de ExcelJS
+  // borraría el texto de abajo y el filtro escondería los abonos.
+  if (combinadas.length) (workbook._combinadasOcultas ??= []).push({ ws, rangos: combinadas });
   const ultima = ws.lastRow.number;
-  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 19 } };
+  ws.autoFilter = { from: { row: enc.number, column: 1 }, to: { row: ultima, column: 26 } };
   const rango = col => `${col}${primera}:${col}${ultima}`;
   const suma = (col, filtro) => filas.filter(filtro ?? (() => true)).reduce((s, f) => s + (Number(f[col]) || 0), 0);
   const bnDe = f => (f.forma === '01' ? _r2((f.importe + f.abonosAnteriores) * BN_PORCENTAJE) : 0);
@@ -171,8 +212,10 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   tot.getCell(8).value = { formula: `SUBTOTAL(9,${rango('H')})`, result: totH };
   tot.getCell(9).value = { formula: `SUBTOTAL(9,${rango('I')})`, result: totI };
   tot.getCell(10).value = { formula: `SUBTOTAL(9,${rango('J')})`, result: totBn };
+  tot.getCell(20).value = { formula: `SUBTOTAL(9,${rango('T')})`, result: _r2(filas.reduce((s, f) => s + (Number(f.saldo) || 0), 0)) };
+  tot.getCell(23).value = { formula: `SUBTOTAL(9,${rango('W')})`, result: _r2(filas.reduce((s, f) => s + f.abonos.reduce((x, a) => x + a.importe, 0), 0)) };
   tot.font = { bold: true };
-  for (const c of [7, 8, 9, 10]) tot.getCell(c).numFmt = DINERO;
+  for (const c of [7, 8, 9, 10, 20, 23]) tot.getCell(c).numFmt = DINERO;
   ws.addRow([]);
   ws.addRow([]);
 
@@ -231,4 +274,28 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   return true;
 }
 
-module.exports = { agregarHojaResumen, filasResumen, CLAVE_FORMA, BN_PORCENTAJE };
+/**
+ * Combina las celdas de la venta en el .xlsx ya generado SIN borrar el texto
+ * de las celdas de abajo (Excel lo guarda oculto y el filtro lo usa). ExcelJS
+ * no lo permite: su mergeCells vacía esas celdas. Inserta <mergeCells> justo
+ * después de <autoFilter> (el orden que pide el formato).
+ */
+function aplicarCombinadas(buffer, workbook) {
+  const pendientes = (workbook?._combinadasOcultas ?? []).filter(p => p.rangos.length);
+  if (!pendientes.length) return buffer;
+  const zip = new AdmZip(Buffer.from(buffer));
+  for (const { ws, rangos } of pendientes) {
+    const nombre = `xl/worksheets/sheet${ws.id}.xml`;
+    const entry = zip.getEntry(nombre);
+    if (!entry) continue;
+    let xml = entry.getData().toString('utf8');
+    if (xml.includes('<mergeCells')) continue;
+    const tag = `<mergeCells count="${rangos.length}">${rangos.map(r => `<mergeCell ref="${r}"/>`).join('')}</mergeCells>`;
+    const filtro = xml.match(/<autoFilter[^>]*\/>|<autoFilter[\s\S]*?<\/autoFilter>/);
+    xml = filtro ? xml.replace(filtro[0], filtro[0] + tag) : xml.replace('</sheetData>', `</sheetData>${tag}`);
+    zip.updateFile(nombre, Buffer.from(xml, 'utf8'));
+  }
+  return zip.toBuffer();
+}
+
+module.exports = { agregarHojaResumen, aplicarCombinadas, filasResumen, estatusDe, CLAVE_FORMA, BN_PORCENTAJE };

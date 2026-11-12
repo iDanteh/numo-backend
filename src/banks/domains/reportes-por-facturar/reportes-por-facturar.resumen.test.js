@@ -65,10 +65,14 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect(fila(8).getCell(9).value.result).toBe(600);
   expect(fila(8).getCell(17).value).toBe(2);
   expect(fila(8).getCell(18).value).toEqual(new Date('2026-11-05T12:00:00Z'));
-  expect([19, 20, 21].map(c => fila(8).getCell(c).value)).toEqual(['ABONADA', 50, null]);
-  expect([19, 20, 21].map(c => fila(7).getCell(c).value)).toEqual(['PAGADA', 0, new Date('2026-11-09T12:00:00Z')]);
-  expect(fila(4).getCell(27).value).toBe('SALDO DESPUÉS DE ESTE MOVIMIENTO');
-  const mov = n => [22, 23, 24, 25, 26, 27].map(c => fila(n).getCell(c).value);
+  // IMPORTE TOTAL VENTA (S) = lo que debía antes del primer movimiento: JUANA 750 + 100; PEDRO 0 + 1000; ANA sin historial.
+  expect(fila(4).getCell(19).value).toBe('IMPORTE TOTAL VENTA');
+  expect([19, 20, 21, 22].map(c => fila(8).getCell(c).value)).toEqual([850, 'ABONADA', 50, null]);
+  expect([19, 20, 21, 22].map(c => fila(7).getCell(c).value)).toEqual([1000, 'PAGADA', 0, new Date('2026-11-09T12:00:00Z')]);
+  expect(fila(5).getCell(19).value).toBeNull();
+  expect(fila(9).getCell(19).value).toBeNull(); // sub-renglón: no suma doble
+  expect(fila(4).getCell(28).value).toBe('SALDO DESPUÉS DE ESTE MOVIMIENTO');
+  const mov = n => [23, 24, 25, 26, 27, 28].map(c => fila(n).getCell(c).value);
   expect(mov(7)).toEqual([new Date('2026-11-09T12:00:00Z'), 'PAGO INICIAL', 1000, 'CPF-9', '', 0]);
   expect([8, 9, 10, 11, 12].map(mov)).toEqual([
     [new Date('2026-11-03T12:00:00Z'), 'ABONO ANTERIOR', 100, 'ABO-0', 'TRANSFERENCIA', 750],
@@ -79,12 +83,12 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   ]);
   // Combinadas sin perder el texto de abajo (para los filtros); importes solo arriba.
   const rangos = wb._combinadasOcultas[0].rangos;
-  expect(rangos).toHaveLength(21); // A–U de JUANA
-  expect(rangos).toEqual(expect.arrayContaining(['C8:C12', 'U8:U12']));
-  expect(rangos.some(r => r.startsWith('V'))).toBe(false);
+  expect(rangos).toHaveLength(22); // A–V de JUANA
+  expect(rangos).toEqual(expect.arrayContaining(['C8:C12', 'S8:S12', 'V8:V12']));
+  expect(rangos.some(r => r.startsWith('W'))).toBe(false);
   // En el .xlsx: <mergeCells> después de <autoFilter> y el texto de abajo se conserva.
   const xml = new AdmZip(aplicarCombinadas(await wb.xlsx.writeBuffer(), wb)).getEntry(`xl/worksheets/sheet${ws.id}.xml`).getData().toString('utf8');
-  expect(xml).toMatch(/<autoFilter ref="A4:AA12"\/><mergeCells count="21"><mergeCell ref="A8:A12"\/>/);
+  expect(xml).toMatch(/<autoFilter ref="A4:AB12"\/><mergeCells count="22"><mergeCell ref="A8:A12"\/>/);
   expect(xml).toMatch(/<c r="F12"[^>]*t="(s|str|inlineStr)"/);
   expect([fila(12).getCell(3).value, fila(12).getCell(6).value, fila(12).getCell(7).value, fila(12).getCell(9).value]).toEqual(['I0', 'JUANA', null, null]);
   const tot = fila(14);
@@ -92,7 +96,9 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect(tot.getCell(7).value).toEqual({ formula: 'SUBTOTAL(9,G5:G12)', result: 1900 });
   expect(tot.getCell(8).value.result).toBe(350);
   expect(tot.getCell(10).value.result).toBe(350);
-  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 12, column: 27 } });
+  expect(tot.getCell(19).value).toEqual({ formula: 'SUBTOTAL(9,S5:S12)', result: 1850 });
+  expect(tot.getCell(21).value).toEqual({ formula: 'SUBTOTAL(9,U5:U12)', result: 50 });
+  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 12, column: 28 } });
 });
 
 test('TIPO de movimiento: caso real INTI CESAR A0-261000641 (depósito 057403 del 9-nov)', () => {

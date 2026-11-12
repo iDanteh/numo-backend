@@ -67,6 +67,10 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect(fila(8).getCell(18).value).toEqual(new Date('2026-11-05T12:00:00Z'));
   // No. ABONOS: PEDRO solo tiene su pago inicial → 0 (no vacío); ANA sin historial de Kore → vacío.
   expect(fila(7).getCell(17).value).toBe(0);
+  // Gris / blanco intercalado por venta: ANA (5) gris, ANA (6) blanco, PEDRO (7) gris, JUANA (8–12) blanco.
+  const gris = n => fila(n).getCell(1).fill?.fgColor?.argb ?? null;
+  expect([5, 6, 7, 8, 12].map(gris)).toEqual(['FFE5E7EB', null, 'FFE5E7EB', null, null]);
+  expect(fila(7).getCell(28).fill.fgColor.argb).toBe('FFE5E7EB');
   expect(fila(5).getCell(17).value).toBeNull();
   // IMPORTE TOTAL VENTA (S) = lo que debía antes del primer movimiento: JUANA 750 + 100; PEDRO 0 + 1000; ANA sin historial.
   expect(fila(4).getCell(19).value).toBe('IMPORTE TOTAL VENTA');
@@ -80,9 +84,9 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect([8, 9, 10, 11, 12].map(mov)).toEqual([
     // Pago inicial arriba (aunque Kore lo registró 2 días después); lo demás por fecha.
     [new Date('2026-11-12T12:00:00Z'), 'PAGO INICIAL', 400, 'ABO-2', 'EFECTIVO', 70],
-    [new Date('2026-11-03T12:00:00Z'), 'ABONO ANTERIOR', 100, 'ABO-0', 'TRANSFERENCIA', 750],
+    [new Date('2026-11-03T12:00:00Z'), 'ABONO', 100, 'ABO-0', 'TRANSFERENCIA', 750],
     [new Date('2026-11-04T12:00:00Z'), 'DEVOLUCIÓN', 30, 'RET-5', 'DE DEV-1', 720],
-    [new Date('2026-11-05T12:00:00Z'), 'ABONO ANTERIOR', 250, 'ABO-1', 'EFECTIVO', 470],
+    [new Date('2026-11-05T12:00:00Z'), 'ABONO', 250, 'ABO-1', 'EFECTIVO', 470],
     [new Date('2026-11-12T12:00:00Z'), 'BONIFICACIÓN', 20, 'RET-6', 'DE BON-2', 50],
   ]);
   // Combinadas sin perder el texto de abajo (para los filtros); importes solo arriba.

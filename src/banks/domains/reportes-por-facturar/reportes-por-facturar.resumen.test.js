@@ -9,16 +9,17 @@ const { filasResumen, aplicarCombinadas, tipoMovimiento } = require('./reportes-
 const datos = {
   movimientosMostrador: [{
     serie: 'A0', folio: '261014387', uuid: 'U1', esGlobal: true, fechaFactura: '2026-11-10T18:00:00Z', receptorNombre: 'PUBLICO EN GENERAL',
-    depositos: [
+    // Ya facturado en la global: NO entra al resumen (2026-11-12, "cuando se facturen salga").
+    depositos: [{ remisiones: ['A0-261003999'], cliente: 'LUIS', importe: 777, idNumo: '054099', banco: 'BBVA', fecha: '2026-11-09T00:00:00Z', ppdPorFacturar: true, formasPago: { efectivo: 777 } }],
+  }],
+  cobrosCajaGlobales: [],
+  depositosPendientesFactura: [
       { remisiones: ['A0-261003322'], cliente: 'PEDRO', importe: 1000, idNumo: '054001', banco: 'BBVA', fecha: '2026-11-09T00:00:00Z', ppdPorFacturar: true, formasPago: { efectivo: 1000 },
         historialAbonos: [{ remision: 'A0-261003322', saldo: 0, saldadaEl: '2026-11-09T18:00:00Z', abonos: [
           { fecha: '2026-11-09T18:00:00Z', movimiento: 'CPF-9', importe: 1000, saldo: 0, idNumo: '054001' }] }] },
       // Mixto: se parte en dos renglones.
       { remisiones: ['A0-261003400', 'A0-261003401'], cliente: 'ANA', importe: 500, idNumo: '054003', banco: 'BBVA', fecha: '2026-11-09T00:00:00Z', ppdPorFacturar: true, formasPago: { transferencia: 300, depositoEfectivo: 200 } },
-    ],
-  }],
-  cobrosCajaGlobales: [],
-  depositosPendientesFactura: [],
+  ],
   depositosPendientesPago: [
     { remisiones: ['I0-261000010'], cliente: 'JUANA', importe: 400, idNumo: '054010', banco: 'AZTECA', fecha: '2026-11-10T00:00:00Z', saldo: 50, formasPago: { efectivo: 400 },
       // Historial completo: la devolución y la bonificación NO son abonos (caso INTI CESAR, 2026-11-12).
@@ -35,14 +36,14 @@ const datos = {
 test('un renglón por forma de pago, claves SAT y abonos anteriores', () => {
   const filas = filasResumen(armarSecciones(datos), formaPagoDe);
   expect(filas.map(f => [f.serie, f.forma, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores])).toEqual([
-    ['A0', '01 DEP', '261003400, 261003401', 'A0-261014387', 'ANA', 200, 0],
-    ['A0', '03', '261003400, 261003401', 'A0-261014387', 'ANA', 300, 0],
-    ['A0', '01', '261003322', 'A0-261014387', 'PEDRO', 1000, 0],
+    ['A0', '01 DEP', '261003400, 261003401', 'POR FACTURAR', 'ANA', 200, 0],
+    ['A0', '03', '261003400, 261003401', 'POR FACTURAR', 'ANA', 300, 0],
+    ['A0', '01', '261003322', 'POR FACTURAR', 'PEDRO', 1000, 0],
     ['I0', '01', '261000010', 'POR FACTURAR', 'JUANA', 400, 350],
   ]);
-  // Estatus (2026-11-12): PEDRO saldada el 9-nov; JUANA todavía debe $50; ANA sin historial de Kore.
+  // Estatus (2026-11-12): PEDRO saldada el 9-nov; JUANA todavía debe $50; ANA sin historial (pendiente → PAGADA).
   expect(filas.map(f => [f.cliente, f.estatus, f.saldo, f.pagadaEl])).toEqual([
-    ['ANA', 'SIN DATO', null, null], ['ANA', 'SIN DATO', null, null],
+    ['ANA', 'PAGADA', 0, null], ['ANA', 'PAGADA', null, null], // saldo solo en el 1er renglón del mixto
     ['PEDRO', 'PAGADA', 0, '2026-11-09'], ['JUANA', 'ABONADA', 50, null],
   ]);
 });

@@ -25,8 +25,11 @@
  *     se hagan más celdas"; y caso INTI CESAR GARCIA MENDEZ A0-261000641: antes
  *     solo salían los anteriores y la devolución contaba como abono).
  *
- * No consulta nada: se arma de las secciones ya calculadas (MOSTRADOR, REF.,
- * FACT ESPECIALES y X FAC CON FICHA); un depósito MIXTO se parte en un renglón
+ * No consulta nada: se arma de las secciones ya calculadas, SOLO con lo que
+ * todavía no tiene factura: PENDIENTE GENERAR FACTURA y X FAC CON FICHA
+ * (2026-11-12, usuario: "cuando se facturen salga de resumen por facturar";
+ * lo ya facturado — global, REF., FACT ESPECIALES — sigue en sus hojas). Al
+ * facturarse sale con ↻ Actualizar. Un depósito MIXTO se parte en un renglón
  * por forma. Se dejan VACÍOS para captura a mano: Observaciones ("LIR" =
  * liquidación), Valida descuento extra y Caja (cajera: Kore no la da). Fuera
  * de esta hoja: "Desglose de depósitos" y el bloque de Contabilidad (en su
@@ -75,7 +78,7 @@ function estatusDe(d) {
   return { estatus: 'SIN DATO', saldo: null, pagadaEl: null };
 }
 
-/** Depósitos de las secciones que entran al resumen (con la factura, si ya tiene). */
+/** Depósitos que entran al resumen: solo los que siguen sin factura (2026-11-12). */
 function _depositos(secciones) {
   const deBloques = (bloques, seccion) => (bloques ?? []).flatMap(b => (b.grupos ?? []).flatMap(g => g.depositos ?? [])
     .map(d => ({ ...d, _seccion: seccion ?? (b.tipo === 'pendiente' ? 'pendiente' : null) })));
@@ -84,7 +87,7 @@ function _depositos(secciones) {
     ...(secciones?.ref ?? []).flatMap(a => deBloques(a.bloques)),
     ...deBloques(secciones?.especiales),
     ...deBloques(secciones?.ficha ? [secciones.ficha] : [], 'ficha'),
-  ];
+  ].filter(d => !d.factura);
 }
 
 /**

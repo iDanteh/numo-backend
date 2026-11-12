@@ -32,6 +32,7 @@ const { cobrosCajaDeGlobales } = require('./reportes-por-facturar.cobros-caja');
 const { traerFacturasRecientes } = require('./reportes-por-facturar.facturas-kore');
 const { cobrosEnOtraCaja } = require('./reportes-por-facturar.otra-caja');
 const { agregarHistorialAbonos } = require('./reportes-por-facturar.abonos');
+const { aplicarCombinadas } = require('./reportes-por-facturar.resumen');
 const { BadRequestError, NotFoundError, ConflictError } = require('../../shared/errors/AppError');
 
 const MAX_DIAS_RANGO = 31;
@@ -383,7 +384,8 @@ async function excel(id, seccion) {
   const rango = r.fechaInicio === r.fechaFin ? r.fechaInicio : `${r.fechaInicio}_${r.fechaFin}`;
   const sucursal = String(r.sucursal ?? 'Todas').replace(/[^\w-]+/g, '_');
   const parte = seccion ? `_${SECCIONES[seccion].hoja.replace(/\s+/g, '_')}` : '';
-  return { buffer: await workbook.xlsx.writeBuffer(), filename: `Por_facturar${parte}_${sucursal}_${rango}.xlsx` };
+  // Hoja RESUMEN: celdas de la venta combinadas a lo alto de sus abonos (2026-11-12).
+  return { buffer: aplicarCombinadas(await workbook.xlsx.writeBuffer(), workbook), filename: `Por_facturar${parte}_${sucursal}_${rango}.xlsx` };
 }
 
 module.exports = { generar, actualizar, listar, obtener, eliminar, excel, _movimientosMostradorSinPoliza, _facturasDelRango, _esperar };

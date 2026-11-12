@@ -78,10 +78,11 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   const mov = n => [23, 24, 25, 26, 27, 28].map(c => fila(n).getCell(c).value);
   expect(mov(7)).toEqual([new Date('2026-11-09T12:00:00Z'), 'PAGO INICIAL', 1000, 'CPF-9', '', 0]);
   expect([8, 9, 10, 11, 12].map(mov)).toEqual([
+    // Pago inicial arriba (aunque Kore lo registró 2 días después); lo demás por fecha.
+    [new Date('2026-11-12T12:00:00Z'), 'PAGO INICIAL', 400, 'ABO-2', 'EFECTIVO', 70],
     [new Date('2026-11-03T12:00:00Z'), 'ABONO ANTERIOR', 100, 'ABO-0', 'TRANSFERENCIA', 750],
     [new Date('2026-11-04T12:00:00Z'), 'DEVOLUCIÓN', 30, 'RET-5', 'DE DEV-1', 720],
     [new Date('2026-11-05T12:00:00Z'), 'ABONO ANTERIOR', 250, 'ABO-1', 'EFECTIVO', 470],
-    [new Date('2026-11-12T12:00:00Z'), 'PAGO INICIAL', 400, 'ABO-2', 'EFECTIVO', 70], // Kore lo registró 2 días después
     [new Date('2026-11-12T12:00:00Z'), 'BONIFICACIÓN', 20, 'RET-6', 'DE BON-2', 50],
   ]);
   // Combinadas sin perder el texto de abajo (para los filtros); importes solo arriba.

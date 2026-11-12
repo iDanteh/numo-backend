@@ -245,7 +245,7 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         // puede liquidar varios tickets: Kore repite el total del pago en
         // `fp.monto` de cada uno) — ver cobranza-ficha-efectivo.service.js.
         const grupoPago = `${cobro.claveCentro ?? ''}|${String(cobro.fecha ?? '').slice(0, 16)}|${(Number(fp.monto) || 0).toFixed(2)}`;
-        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null, claveCentro: cobro.claveCentro ?? null, grupoPago });
+        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null, nombre: fp.nombre ?? null, claveCentro: cobro.claveCentro ?? null, grupoPago });
       }
     }
     return formasPago;
@@ -558,38 +558,64 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
         const mesComplemento = mesDe(cfdi.fecha);
         const esNoIdentificado = restanteLinea > 0 && mesCobro && mesComplemento && mesCobro < mesComplemento
           && !!cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS] && !!cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR];
+        // Split del Cargo por forma de pago REAL — ver `_prefetchDoctosPago`.
+        // Efectivo real → Caja; cualquier otra → la cuenta genérica de la
+        // regla (la consolidación por depósito real/sucursal ocurre después,
+        // en poliza.service.js). Sin desglose: una sola línea, sin adivinar.
+        const desgloseFactura = Array.isArray(d.desglosePagoReal) ? d.desglosePagoReal : [];
+        const puedeSplitReal = desgloseFactura.length > 0 && !!cuentaMap[CODIGO_CUENTA_CAJA] && !!cuentaMap[CODIGO_CUENTA_BANCOS];
+        const cargoReal = (fp, montoLinea) => {
+          const esEfectivo = fp.claveSat === '01';
+          const otraCaja = _cargoCobroOtraCaja(fp, cuentaMap, context.ccBySerieMap);
+          movs.push({
+            ...baseFactura,
+            cuentaId: esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : (cuentaMap[rule.cuentaCargo] ?? null),
+            debe: montoLinea, haber: 0, _esCargoPrincipal: true,
+            _formaPagoReal: fp.claveSat ?? null,
+            _claveCentroCobro: fp.claveCentro ?? null, _grupoPago: fp.grupoPago ?? null,
+            ...(otraCaja ?? {}),
+          });
+        };
         if (esNoIdentificado) {
-          // IVA real de esta factura (proporcional si parte se pagó con SF);
-          // sin él, 16% del cobro.
+          // El EFECTIVO cobrado en caja el día del complemento nunca es un
+          // depósito no identificado: entró ese día, aunque Kore ponga en
+          // FechaPago una "fecha real de pago" del mes anterior (2026-11-11,
+          // JOSE MANUEL SANTIAGO OLIVERA: cobro múltiple en efectivo 03-nov de
+          // A0-261005361/5399/5362, FechaPago 31-oct → salía Cargo NI y el
+          // efectivo del día quedaba corto $6,498.00). Va a Caja (y de ahí al
+          // efectivo del día, `_efectivoABanco`); solo lo demás (transferencia,
+          // depósito, tarjeta) sigue contra Depósitos No Identificados.
+          // Ojo: "DEPÓSITO EN EFECTIVO" / "DEP. EFECTIVO" también viene con
+          // claveSat '01', pero es dinero depositado en el banco (puede ser del
+          // mes anterior y reportado después) → ese SÍ sigue la regla NI.
+          // Regla del usuario (2026-11-12): en efectivo, el NI solo aplica a
+          // depósitos/transferencias hechos el mes pasado y cobrados después.
+          let restanteNI = restanteLinea;
+          if (puedeSplitReal) {
+            for (const fp of desgloseFactura) {
+              if (fp.claveSat !== '01' || /\bdep(\.|[oó]sito)?\s*(en\s*)?efectivo/i.test(fp.nombre ?? '')) continue;
+              const montoEf = Math.min(Math.round((Number(fp.monto) || 0) * 100) / 100, restanteNI);
+              if (montoEf <= 0) continue;
+              cargoReal(fp, montoEf);
+              restanteNI = parseFloat((restanteNI - montoEf).toFixed(2));
+            }
+          }
+          // IVA real de esta factura (proporcional si parte se pagó con SF o en
+          // efectivo); sin él, 16% del cobro.
           const ivaDocto = Number(d.ivaDoc) || 0;
           const ivaNI = ivaDocto > 0
-            ? Math.min(Math.round(ivaDocto * (restanteLinea / montoLineaCargo) * 100) / 100, restanteLinea)
-            : Math.round((restanteLinea - restanteLinea / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
-          const subtotalNI = parseFloat((restanteLinea - ivaNI).toFixed(2));
+            ? Math.min(Math.round(ivaDocto * (restanteNI / montoLineaCargo) * 100) / 100, restanteNI)
+            : Math.round((restanteNI - restanteNI / (1 + TASA_IVA_SALDO_FAVOR)) * 100) / 100;
+          const subtotalNI = parseFloat((restanteNI - ivaNI).toFixed(2));
           const baseNI = { ...baseFactura, haber: 0, reglaNombre: REGLA_NO_IDENTIFICADO, _preservarRegla: true };
           if (subtotalNI > 0) movs.push({ ...baseNI, cuentaId: cuentaMap[CODIGO_CUENTA_DEPOSITOS_NO_IDENTIFICADOS], debe: subtotalNI, _esSubtotalNI: true });
           if (ivaNI > 0)      movs.push({ ...baseNI, cuentaId: cuentaMap[CODIGO_CUENTA_IVA_SALDO_FAVOR],            debe: ivaNI });
         } else if (restanteLinea > 0) {
-          // Split del Cargo por forma de pago REAL — ver `_prefetchDoctosPago`.
-          // Efectivo real → Caja; cualquier otra → la cuenta genérica de la
-          // regla (la consolidación por depósito real/sucursal ocurre después,
-          // en poliza.service.js). Sin desglose: una sola línea, sin adivinar.
-          const desgloseFactura = Array.isArray(d.desglosePagoReal) ? d.desglosePagoReal : [];
-          const puedeSplitReal = desgloseFactura.length > 0 && !!cuentaMap[CODIGO_CUENTA_CAJA] && !!cuentaMap[CODIGO_CUENTA_BANCOS];
           if (puedeSplitReal) {
             desgloseFactura.forEach(fp => {
               const montoLinea = Math.round((Number(fp.monto) || 0) * 100) / 100;
               if (montoLinea <= 0) return;
-              const esEfectivo = fp.claveSat === '01';
-              const otraCaja = _cargoCobroOtraCaja(fp, cuentaMap, context.ccBySerieMap);
-              movs.push({
-                ...baseFactura,
-                cuentaId: esEfectivo ? cuentaMap[CODIGO_CUENTA_CAJA] : (cuentaMap[rule.cuentaCargo] ?? null),
-                debe: montoLinea, haber: 0, _esCargoPrincipal: true,
-                _formaPagoReal: fp.claveSat ?? null,
-                _claveCentroCobro: fp.claveCentro ?? null, _grupoPago: fp.grupoPago ?? null,
-                ...(otraCaja ?? {}),
-              });
+              cargoReal(fp, montoLinea);
             });
           } else {
             movs.push({ ...baseFactura, cuentaId: cuentaMap[rule.cuentaCargo] ?? null, debe: restanteLinea, haber: 0, _esCargoPrincipal: true });
@@ -651,7 +677,16 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     // caían a Bancos por identificar en vez de Caja).
     const esEfectivoCfdi = (cfdi.formaPago ?? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? '') === '01';
     const cuentaCargoFallback = (esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS]) ?? cuentaMap[rule.cuentaCargo] ?? null;
-    movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
+    // Uuid de la FACTURA que liquida el Pago (2026-11-11, caso IRAN MARINO
+    // SAGUILAN VASQUEZ, Pago A0-261101641, regla 7B-mixto): el export cruza el
+    // depósito real por `facturaUuid` (bank_movements.erpLinks.folioFiscal es
+    // el de la factura, no el del Pago) — sin él, un Pago de regla mixta se
+    // quedaba en "Bancos por identificar" aunque su depósito (BBVA 057027)
+    // estuviera identificado. Solo con UNA factura: con varias no hay un solo
+    // depósito al cual atribuir este renglón agregado.
+    const facturasDelPago = [...new Set((context.doctosPago ?? []).map(d => d.idDocumento).filter(Boolean))];
+    const facturaUuidUnica = facturasDelPago.length === 1 ? facturasDelPago[0] : null;
+    movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true, ...(facturaUuidUnica ? { facturaUuid: facturaUuidUnica } : {}) });
     movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 

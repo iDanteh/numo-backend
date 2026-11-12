@@ -321,6 +321,47 @@ describe('getCorteConciliacion — corte histórico (fechaInicio/fechaFin)', () 
     expect(result.nuevos.pendientes).toBe(1);
   });
 
+  // Bug real 2026-11-12, confirmado con 48 movimientos reales de producción ($1,072,364.69):
+  // la versión anterior de _estadoAlCierre hacía "¿hubo ALGÚN desvinculado/ajustado después de
+  // pid?" (1 solo salto) — daba falso positivo acá, marcando como pendiente un movimiento que ya
+  // estaba de nuevo 100% vinculado al momento del cierre.
+  test('(d) identificado, desvinculado y RE-vinculado antes del cierre: cuenta como identificado (bug real corregido)', async () => {
+    const pid = new Date(Date.UTC(2026, 8, 16, 12, 0, 0));
+    mockFindsHistorico([], [{
+      _id: 'm4', status: 'identificado',
+      primeraIdentificacionAt: pid,
+      ultimoCambioStatusAt: null,
+      historialVinculacion: [
+        { at: new Date(Date.UTC(2026, 8, 17, 9, 0, 0)), accion: 'desvinculado', erpId: 'CXC-1', origen: 'manual' },
+        { at: new Date(Date.UTC(2026, 8, 17, 10, 0, 0)), accion: 'vinculado', erpId: 'CXC-1', origen: 'manual' },
+      ],
+    }]);
+    BankMovement.aggregate.mockResolvedValueOnce([]);
+
+    const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN });
+
+    expect(result.nuevos.identificado).toBe(1);
+    expect(result.nuevos.no_identificado).toBe(0);
+  });
+
+  test('(e) identificado con "ajustado" posterior (sin desvincular): sigue contando como identificado', async () => {
+    const pid = new Date(Date.UTC(2026, 8, 16, 12, 0, 0));
+    mockFindsHistorico([], [{
+      _id: 'm5', status: 'identificado',
+      primeraIdentificacionAt: pid,
+      ultimoCambioStatusAt: null,
+      historialVinculacion: [
+        { at: new Date(Date.UTC(2026, 8, 17, 9, 0, 0)), accion: 'ajustado', erpId: 'CXC-1', origen: 'kore-reversion' },
+      ],
+    }]);
+    BankMovement.aggregate.mockResolvedValueOnce([]);
+
+    const result = await getCorteConciliacion({ fechaInicio: FECHA_INICIO, fechaFin: FECHA_FIN });
+
+    expect(result.nuevos.identificado).toBe(1);
+    expect(result.nuevos.no_identificado).toBe(0);
+  });
+
   test('(c) ultimoCambioStatusAt posterior a fin: aparece en advertencia.registrosConCambioPosteriorAlCierre', async () => {
     mockFindsHistorico([{
       _id: 'm3', status: 'no_identificado',
@@ -870,6 +911,95 @@ describe('Consistencia día↔semana (garantía central del diseño del ledger, 
     expect(idDeInicialesSumaSaldo).toBe(semanaDirecta.identificadosDeIniciales.saldo);
     expect(idDeNuevosSumaCount).toBe(semanaDirecta.identificadosDeNuevos.count);
     expect(idDeNuevosSumaSaldo).toBe(semanaDirecta.identificadosDeNuevos.saldo);
+  });
+
+  // Segundo bug real 2026-11-12, mismo día que el de arriba: el replay de un solo booleano
+  // (vinculado/desvinculado) seguía dando falso positivo con 2+ CxC vinculadas simultáneas (acá
+  // probado indirecto, vía status) y falso negativo si el status se puso en no_identificado por
+  // una vía sin rastro en historialVinculacion. Fix real: cuando `periodoFin` es AHORA MISMO (no
+  // un corte ya cerrado), se confía en `status` directo — cero reconstrucción. Estos tests usan
+  // AHORA_MX como `periodoFin` (periodo EN VIVO, el mismo criterio que getLedgerDiario/
+  // getLedgerMensual para "hoy"/"mes en curso") con historiales que la reconstrucción vieja
+  // clasificaría mal, para probar que ahora se ignoran y gana `status`.
+  test('periodoFin EN VIVO (ahora): status="identificado" manda, aunque historialVinculacion tenga un desvinculado sin re-vincular', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      {
+        deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'identificado',
+        primeraIdentificacionAt: new Date('2026-09-05T12:00:00.000Z'),
+        historialVinculacion: [{ at: new Date('2026-09-06T12:00:00.000Z'), accion: 'desvinculado', erpId: 'CXC-1' }],
+      },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
+
+    // La reconstrucción histórica (mismo historial, mismo pid) daría "pendiente" — en vivo, no.
+    expect(ledger.total).toEqual({ count: 0, saldo: 0 });
+  });
+
+  test('periodoFin EN VIVO (ahora): status="no_identificado" manda, aunque historialVinculacion sugiera que sigue vinculado', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      {
+        deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'no_identificado',
+        primeraIdentificacionAt: new Date('2026-09-05T12:00:00.000Z'),
+        historialVinculacion: [{ at: new Date('2026-09-06T12:00:00.000Z'), accion: 'vinculado', erpId: 'CXC-1' }],
+      },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
+
+    // La reconstrucción histórica diría "identificado" (vinculado después de pid, sin reversión
+    // posterior) — en vivo, status manda y dice que NO.
+    expect(ledger.total).toEqual({ count: 1, saldo: 1000 });
+  });
+
+  // Tercer ajuste real 2026-11-12, mismo día, decisión explícita del usuario: un depósito
+  // no_identificado con vinculación PARCIAL (saldoErp ya tiene algún valor) deja de ser
+  // "pendiente sin revisar" para Cortes — eso lo cubre el Dashboard "Estatus" restando lo ya
+  // cubierto. Cortes en vivo solo cuenta lo que NADIE tocó todavía (saldoErp vacío).
+  test('periodoFin EN VIVO: no_identificado CON saldoErp parcial ya no es pendiente para Cortes', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'no_identificado', saldoErp: 300 },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
+
+    // Vinculación parcial (saldoErp:300 de 1000) — ya no es "sin revisar", sale del pendiente de Cortes.
+    expect(ledger.total).toEqual({ count: 0, saldo: 0 });
+  });
+
+  test('periodoFin EN VIVO: no_identificado CON saldoErp vacío sigue siendo el pendiente real', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'no_identificado', saldoErp: null },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
+
+    // Nadie lo tocó todavía — sigue siendo el pendiente real que Cortes debe mostrar.
+    expect(ledger.total).toEqual({ count: 1, saldo: 1000 });
+  });
+
+  // Regresión crítica: ~12,909 movimientos reales de producción tienen status:'identificado' Y
+  // saldoErp:null (identificaciones viejas, ej. por ficha, que nunca pasaron por el flujo que
+  // llena ese campo). Si la regla mirara solo saldoErp, estos volverían a contarse como
+  // pendientes — mucho peor que el bug original. `status` sigue siendo la condición primaria.
+  test('periodoFin EN VIVO: identificado CON saldoErp vacío sigue identificado (caso real de producción, NO regresión)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'identificado', saldoErp: null },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
+
+    expect(ledger.total).toEqual({ count: 0, saldo: 0 });
+  });
+
+  test('periodoFin EN VIVO: identificado CON saldoErp cubierto sigue identificado (caso normal)', async () => {
+    BankMovement.find.mockReturnValueOnce({ select: () => ({ lean: () => Promise.resolve([
+      { deposito: 1000, createdAt: new Date('2026-09-01T12:00:00.000Z'), status: 'identificado', saldoErp: 1000 },
+    ]) }) });
+
+    const ledger = await _calcularLedgerBacklog({ baseMatch: {}, periodoInicio: INICIO_MES_ESPERADO, periodoFin: AHORA_MX });
+
+    expect(ledger.total).toEqual({ count: 0, saldo: 0 });
   });
 });
 

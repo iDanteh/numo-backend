@@ -3225,6 +3225,11 @@ const ETIQUETA_SALDO_FAVOR_MENOR_SIN_USAR = 'SF-MENOR-SIN-USAR';
 // fuera de tolerancia, ver `yaContabilizadoOtroDia`): se oculta del export
 // igual que SF-OCULTO, para no duplicar el dinero entre los dos días.
 const ETIQUETA_COBRO_YA_CONTABILIZADO = 'COBRO-DIA-REAL';
+// Mismo texto que ETIQUETA_COBRO_PENDIENTE_FACTURA en cfdi-poliza-generator.service.js
+// (2026-11-11): cobro de una venta que aún no se factura — se contabiliza el día
+// que se timbre su factura; aquí solo va a la hoja informativa "Cobros
+// pendientes de facturar", nunca a la póliza.
+const ETIQUETA_COBRO_PENDIENTE_FACTURA = 'COBRO-PENDIENTE-FACTURA';
 // Mismo texto que ETIQUETA_PUNTOS en cobros-sucursal-puente.service.js —
 // monedero electrónico Club Tuberos aplicado como forma de pago, columna C =
 // "PAGO" sin prefijo, mismo criterio que SF (confirmado con el usuario
@@ -3306,6 +3311,8 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
   // abajo para aparecer en "Movimientos de Saldos a Favor" en vez de
   // "Otros Ingresos" — ver comentario junto al `if` que lo llena.
   const filasCobroDiaRealOcultas = [];
+  // Cobros de ventas aún sin factura (2026-11-11): hoja informativa aparte.
+  const filasCobroPendienteFactura = [];
   // Pre-calcular los cfdiUuids de las entradas 'Cobro Sucursal' HABER para
   // poder identificar y también extraer el DEBE correspondiente ('Venta') del
   // mismo par. Sin esto, el DEBE queda en `resto` → `consolidarCargos` →
@@ -3465,6 +3472,17 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
     // desbalanceado contra el Abono de Ingresos/IVA de esa misma factura
     // (mismo criterio que otros residuos ya ocultados hoy).
     if (m.tipoOrigen === 'Venta Sin Cobro') continue;
+    if (m.reglaNombre === ETIQUETA_COBRO_PENDIENTE_FACTURA) {
+      filasCobroPendienteFactura.push({
+        cuenta:      m.cuenta,
+        centroCosto: m.centroCostoObj?.clave ?? m.centroCosto ?? '',
+        ticket:      m.serieVentaTicket && m.folioVentaTicket ? `${m.serieVentaTicket}-${m.folioVentaTicket}` : (m.concepto || ''),
+        formaPago:   m.formaPago ?? '',
+        fechaCobro:  m.ventaFecha ?? '',
+        monto:       Number(m.debe) || 0,
+      });
+      continue;
+    }
     if (m.tipoOrigen !== 'Cobro Sucursal' && m.tipoOrigen !== TIPO_ORIGEN_PENDIENTE_PROPIO && m.tipoOrigen !== TIPO_ORIGEN_CARGO_ESPECIAL) { resto.push(m); continue; }
     // Ver `_cobroSucursalHaberKeys` arriba — el Cargo del par se omite cuando
     // ya existe su Abono correspondiente.
@@ -3742,7 +3760,7 @@ function _extraerCobrosSucursal(movimientos, cuentaCajaCobroSucursal = null, net
     delete f._cargoVentaYaEnConsolidado;
   }
 
-  return { resto, filas, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal };
+  return { resto, filas, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal, filasCobroPendienteFactura };
 }
 
 // Inyecta las filas de cobro-sucursal en el bloque correspondiente — PUE en
@@ -4335,6 +4353,11 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   const fechaFinal = overrides.fecha ? new Date(overrides.fecha) : new Date(poliza.fecha);
 
+  // Sin 'AD' para facturas de otra sucursal (2026-11-12, pedido del usuario,
+  // caso Global HIDALGO B0-261100739 / CE43C1DB… saliendo en CEDIS, ATZOMPA,
+  // REFORMA y SIMBOLOS del 7-nov): ver `_uuidsSoloCobroOtraSucursal`.
+  const uuidsSinAD = poliza.tipo === 'I' ? _uuidsSoloCobroOtraSucursal(movimientos) : null;
+
   // Verdad bancaria: para saber si un cobro fue realmente por transferencia,
   // se prefiere el movimiento bancario real (bank_movements) sobre el
   // `formaPago` que el CFDI declara — ver `construirVerdadBancaria`. Solo
@@ -4401,7 +4424,7 @@ async function exportContpaqXlsx(id, overrides = {}) {
   // Cobros de sucursal: se sacan ANTES del pipeline de Contado/Crédito (nunca
   // deben pasar por consolidarCargos) y se reinyectan ya armados una vez que
   // `bloques` está listo (ver _inyectarCobrosSucursal más abajo).
-  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal } = _extraerCobrosSucursal(
+  const { resto: movimientosSinCobroSucursal, filas: filasCobroSucursal, filasOtrosIngresos, filasSaldoFavorUsado, filasTarjetaCobroSucursal, filasCobroPendienteFactura } = _extraerCobrosSucursal(
     movimientos,
     await AccountPlan.findOne({ where: { codigo: CODIGO_CUENTA_CAJA_POR_IDENTIFICAR }, attributes: ['id', 'codigo', 'nombre'], raw: true }),
     netpayInfo.matchedIds,
@@ -4726,14 +4749,36 @@ async function exportContpaqXlsx(id, overrides = {}) {
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
         // MOSTRADOR también solo en Ventas (las facturas de mostrador son ventas).
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo, grupo === 'Ventas'),
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo, grupo === 'Ventas', grupo === 'Ventas' ? filasCobroPendienteFactura : [], uuidsSinAD),
       });
     }
     return { poliza, workbooks };
   }
 
-  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado, netpayInfo);
+  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado, netpayInfo, true, filasCobroPendienteFactura, uuidsSinAD);
   return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
+}
+
+/**
+ * UUIDs que en esta póliza de Ingreso aparecen SOLO como cobro de otra
+ * sucursal (2026-11-12, pedido del usuario): no llevan su renglón 'AD'. El
+ * asiento no cambia; el UUID solo debe ir en la póliza donde está la venta de
+ * esa factura (su abono de Ingresos/IVA/Clientes), p. ej. la Global de
+ * HIDALGO B0-261100739 solo en HIDALGO 7-nov, no en CEDIS/ATZOMPA/REFORMA/
+ * SIMBOLOS donde se cobraron tickets suyos.
+ * Criterio: ningún renglón con ese uuid es un Abono distinto de 'Cobro
+ * Sucursal' (el abono a la cuenta puente del lado cobrador). Lo que queda son
+ * solo Cargos (Venta/Cargo Especial del dinero recibido) y el puente.
+ */
+function _uuidsSoloCobroOtraSucursal(movimientos) {
+  const conVentaPropia = new Set();
+  const todos = new Set();
+  for (const m of movimientos ?? []) {
+    if (!m.cfdiUuid) continue;
+    todos.add(m.cfdiUuid);
+    if (Number(m.haber) > 0 && m.tipoOrigen !== 'Cobro Sucursal') conVentaPropia.add(m.cfdiUuid);
+  }
+  return new Set([...todos].filter(u => !conVentaPropia.has(u)));
 }
 
 /**
@@ -4847,7 +4892,7 @@ async function _unificarRenglonesPorDepositoBancario(bloques) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null, incluirMostrador = true) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null, incluirMostrador = true, filasCobroPendienteFactura = [], uuidsSinAD = null) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -5000,7 +5045,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       }
 
       for (const uuid of [m.cfdiUuid, ...(m._cfdiUuidsExtra ?? [])]) {
-        if (!uuid || uuidsVistos.has(uuid)) continue;
+        if (!uuid || uuidsVistos.has(uuid) || uuidsSinAD?.has(uuid)) continue;
         uuidsVistos.add(uuid);
         uuidsOrdenados.push(uuid);
       }
@@ -5292,6 +5337,35 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
   // factura ligada — ej. venta de mostrador que nunca se globalizó. Solo
   // informativo: NUNCA se contabilizaron en esta póliza — ver
   // `_detectarPendientesPorFacturar` en cobros-sucursal-puente.service.js.
+  // Cobros del día de ventas que aún no se facturan (2026-11-11, pedido del
+  // usuario): informativo, NO está en la póliza — se contabiliza el día que se
+  // timbre su factura (ver ETIQUETA_COBRO_PENDIENTE_FACTURA).
+  if (filasCobroPendienteFactura.length > 0) {
+    const wsCobrosPend = workbook.addWorksheet('Cobros pendientes de facturar');
+    wsCobrosPend.columns = [
+      { header: 'Cuenta',          key: 'cuenta',      width: 14 },
+      { header: 'Sucursal',        key: 'centroCosto', width: 12 },
+      { header: 'Ticket',          key: 'ticket',      width: 22 },
+      { header: 'Forma de pago',   key: 'formaPago',   width: 14 },
+      { header: 'Fecha del cobro', key: 'fechaCobro',  width: 16 },
+      { header: 'Monto',           key: 'monto',       width: 16 },
+      { header: 'Nota',            key: 'nota',        width: 60 },
+    ];
+    wsCobrosPend.getRow(1).font = { bold: true };
+    wsCobrosPend.getRow(1).eachCell(cell => {
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9D9D9' } };
+    });
+    for (const f of filasCobroPendienteFactura) {
+      const row = wsCobrosPend.addRow({
+        cuenta: f.cuenta?.codigo ?? '', centroCosto: f.centroCosto ?? '', ticket: f.ticket ?? '',
+        formaPago: f.formaPago ?? '', fechaCobro: f.fechaCobro ?? '', monto: f.monto,
+        nota: 'No se contabiliza aquí: entra en la póliza del día en que se timbre su factura',
+      });
+      row.getCell('monto').numFmt = '#,##0.00';
+    }
+    wsCobrosPend.autoFilter = { from: 'A1', to: 'G1' };
+  }
+
   if (poliza.pendientesPorFacturar?.length > 0) {
     const wsPorFacturar = workbook.addWorksheet('Pendientes Por Facturar');
     wsPorFacturar.columns = [
@@ -6183,4 +6257,5 @@ module.exports = {
   _construirNetpayInfo: construirNetpayInfo, _lineasNetpay, _lineaNetpayAmex,
   _construirVentasShopifyInfo: construirVentasShopifyInfo, _lineaVentasShopify, _ticketsClientesShopify, _esClienteShopify,
   _construirWorkbookPoliza,
+  _uuidsSoloCobroOtraSucursal,
 };

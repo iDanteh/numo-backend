@@ -4165,6 +4165,11 @@ async function exportContpaqXlsx(id, overrides = {}) {
 
   const fechaFinal = overrides.fecha ? new Date(overrides.fecha) : new Date(poliza.fecha);
 
+  // Sin 'AD' para facturas de otra sucursal (2026-11-12, pedido del usuario,
+  // caso Global HIDALGO B0-261100739 / CE43C1DB… saliendo en CEDIS, ATZOMPA,
+  // REFORMA y SIMBOLOS del 7-nov): ver `_uuidsSoloCobroOtraSucursal`.
+  const uuidsSinAD = poliza.tipo === 'I' ? _uuidsSoloCobroOtraSucursal(movimientos) : null;
+
   // Verdad bancaria: para saber si un cobro fue realmente por transferencia,
   // se prefiere el movimiento bancario real (bank_movements) sobre el
   // `formaPago` que el CFDI declara — ver `construirVerdadBancaria`. Solo
@@ -4549,14 +4554,36 @@ async function exportContpaqXlsx(id, overrides = {}) {
         tipoVenta: grupo,
         folio:     bloquesGrupo[0].folio,
         // MOSTRADOR también solo en Ventas (las facturas de mostrador son ventas).
-        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo, grupo === 'Ventas', grupo === 'Ventas' ? filasCobroPendienteFactura : []),
+        workbook:  _construirWorkbookPoliza(poliza, bloquesGrupo, fechaFinal, nombresClientes, otrosIngresosGrupo, saldoFavorUsadoGrupo, netpayInfoGrupo, grupo === 'Ventas', grupo === 'Ventas' ? filasCobroPendienteFactura : [], uuidsSinAD),
       });
     }
     return { poliza, workbooks };
   }
 
-  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado, netpayInfo, true, filasCobroPendienteFactura);
+  const workbook = _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos, filasSaldoFavorUsado, netpayInfo, true, filasCobroPendienteFactura, uuidsSinAD);
   return { poliza, workbooks: [{ tipoVenta: null, folio: bloques[0]?.folio, workbook }] };
+}
+
+/**
+ * UUIDs que en esta póliza de Ingreso aparecen SOLO como cobro de otra
+ * sucursal (2026-11-12, pedido del usuario): no llevan su renglón 'AD'. El
+ * asiento no cambia; el UUID solo debe ir en la póliza donde está la venta de
+ * esa factura (su abono de Ingresos/IVA/Clientes), p. ej. la Global de
+ * HIDALGO B0-261100739 solo en HIDALGO 7-nov, no en CEDIS/ATZOMPA/REFORMA/
+ * SIMBOLOS donde se cobraron tickets suyos.
+ * Criterio: ningún renglón con ese uuid es un Abono distinto de 'Cobro
+ * Sucursal' (el abono a la cuenta puente del lado cobrador). Lo que queda son
+ * solo Cargos (Venta/Cargo Especial del dinero recibido) y el puente.
+ */
+function _uuidsSoloCobroOtraSucursal(movimientos) {
+  const conVentaPropia = new Set();
+  const todos = new Set();
+  for (const m of movimientos ?? []) {
+    if (!m.cfdiUuid) continue;
+    todos.add(m.cfdiUuid);
+    if (Number(m.haber) > 0 && m.tipoOrigen !== 'Cobro Sucursal') conVentaPropia.add(m.cfdiUuid);
+  }
+  return new Set([...todos].filter(u => !conVentaPropia.has(u)));
 }
 
 /**
@@ -4670,7 +4697,7 @@ async function _unificarRenglonesPorDepositoBancario(bloques) {
  * (todos los bloques en un archivo) o 1 llamada POR bloque para CEDIS (cada
  * bloque en su propio archivo).
  */
-function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null, incluirMostrador = true, filasCobroPendienteFactura = []) {
+function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, filasOtrosIngresos = [], filasSaldoFavorUsado = [], netpayInfo = null, incluirMostrador = true, filasCobroPendienteFactura = [], uuidsSinAD = null) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet('poliza');
 
@@ -4823,7 +4850,7 @@ function _construirWorkbookPoliza(poliza, bloques, fechaFinal, nombresClientes, 
       }
 
       for (const uuid of [m.cfdiUuid, ...(m._cfdiUuidsExtra ?? [])]) {
-        if (!uuid || uuidsVistos.has(uuid)) continue;
+        if (!uuid || uuidsVistos.has(uuid) || uuidsSinAD?.has(uuid)) continue;
         uuidsVistos.add(uuid);
         uuidsOrdenados.push(uuid);
       }
@@ -5998,4 +6025,5 @@ module.exports = {
   _construirVerdadBancaria: construirVerdadBancaria, _categorizarAjusteContado: categorizarAjusteContado, _anotarCargosPorFacturaSinAgrupar: anotarCargosPorFacturaSinAgrupar, _enriquecerConceptoConCliente: enriquecerConceptoConCliente, _construirBancoRealPorTicket: construirBancoRealPorTicket,
   _extraerCobrosSucursal, _ordenarCobrosIngreso, _armarBloqueContado: armarBloqueContado,
   _construirWorkbookPoliza,
+  _uuidsSoloCobroOtraSucursal,
 };

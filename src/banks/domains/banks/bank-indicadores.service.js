@@ -1488,11 +1488,16 @@ async function getUltimosMovimientos({ banco = null, limit = 10 } = {}) {
 
 // Rangos de antigüedad del backlog "vacío" (2026-11-06, pedido explícito del usuario tras revisar
 // un mockup de referencia: retoma la idea de buckets por rango de días que se había descartado el
-// 30-oct para el dashboard mensual/diario/por-hora, pero con 2 correcciones de diseño sobre esa
-// primera versión (getCorteAntiguedadBacklog, ya eliminada de este archivo): agrupa por `fecha`
-// del depósito (el día real en el banco), no por `createdAt` (día de carga a Numo); y exige el
-// depósito COMPLETAMENTE vacío (sin ninguna CxC vinculada, ni un pago parcial) — un depósito con
-// pagos PPD en curso sigue en `no_identificado` pero ya no está "vacío", así que queda afuera.
+// 30-oct para el dashboard mensual/diario/por-hora, con una corrección de diseño sobre esa primera
+// versión (getCorteAntiguedadBacklog, ya eliminada de este archivo): agrupa por `fecha` del
+// depósito (el día real en el banco), no por `createdAt` (día de carga a Numo).
+//
+// 2026-11-12 (alineado al Dashboard "Estatus", mismo criterio ya aplicado a Cortes mensual/
+// diario): ANTES exigía el depósito completamente vacío (sin ninguna CxC vinculada, ni un pago
+// parcial) — un depósito con vinculación parcial quedaba afuera por completo. Eso hacía que el
+// total diera distinto al Dashboard (160 vs 183 reales, verificado). AHORA cuenta cualquier
+// depósito `no_identificado` sin importar vinculación parcial, pero neteando el monto por lo ya
+// cubierto (`saldoErp`) — ver `_bucketsAntiguedadAlCorte`.
 const ANTIGUEDAD_RANGOS = Object.freeze(['1 a 30 días', '31 a 60 días', '61 a 90 días', 'Más de 90 días']);
 
 // Índice de rango (0-3) según días de antigüedad — mismos cortes que el mockup de referencia:
@@ -1540,45 +1545,57 @@ function _primeraResueltaEfectiva(dep) {
 }
 
 /**
- * Candidatos de antigüedad para HOY — `status:'no_identificado'` + `erpIds` vacío, filtro DIRECTO
- * en Mongo, SIN reconstrucción de ningún tipo (2026-11-06, cuarta ronda: simplificación pedida por
- * el usuario tras encontrar que la reconstrucción histórica —pensada para el modo Año— generaba
- * falsos positivos para depósitos ya resueltos sin `identificadoPor`, ej. identificados por ficha o
+ * Candidatos de antigüedad para HOY — `status:'no_identificado'`, filtro DIRECTO en Mongo, SIN
+ * reconstrucción de ningún tipo (2026-11-06, cuarta ronda: simplificación pedida por el usuario
+ * tras encontrar que la reconstrucción histórica —pensada para el modo Año— generaba falsos
+ * positivos para depósitos ya resueltos sin `identificadoPor`, ej. identificados por ficha o
  * editados a mano). Para "hoy", `status` YA ES la fuente de verdad: no importa CÓMO se resolvió un
  * depósito — si dice `identificado`, no es backlog, punto. Usada por `getAntiguedadDepositos` sin
- * `fecha` y por `getAntiguedadDepositosPorAnio` (que siempre es "hoy", nunca histórico).
+ * `fecha`, por `getAntiguedadDepositosPorAnio` (siempre "hoy") y por `getAntiguedadPorDiaMesActual`
+ * (el día de hoy de la serie, nunca reconstruido).
+ *
+ * 2026-11-12: el filtro `erpIds: { $size: 0 }` (exigir CERO vinculación) se quitó — alinea el
+ * conteo al Dashboard "Estatus" (`bank.service.js#getCards`, que no distingue vinculación parcial
+ * para `status:'no_identificado'`). `saldoErp` se trae al `.select()` para que
+ * `_bucketsAntiguedadAlCorte` pueda netear el monto de los parcialmente vinculados en vez de
+ * sumarlos completos.
  */
 async function _antiguedadCandidatosHoy(baseMatch) {
   return BankMovement.find({
     ...baseMatch,
     status: 'no_identificado',
-    erpIds: { $size: 0 },
   // `folio`/`banco` (2026-11-06, pedido explícito del usuario: "que al exportar esto me diga qué
   // depósitos son los que están siendo involucrados") — ninguno de los 2 callers existentes
   // (getAntiguedadDepositos/getAntiguedadDepositosPorAnio) los necesitaba, pero agregarlos acá
   // evita que buildReporteCortes#"Detalle de depósitos" tenga que repetir esta misma query con un
   // criterio de filtro que podría desincronizarse del real con el tiempo.
-  }).select('folio banco fecha deposito').lean();
+  }).select('folio banco fecha deposito saldoErp').lean();
 }
 
 /**
  * Candidatos de antigüedad para un corte de fecha PASADA — trae también los `identificado` de HOY,
- * porque pudieron estar completamente vacíos en el pasado. El filtrado real ("¿seguía vacío a tal
+ * porque pudieron estar sin resolver en el pasado. El filtrado real ("¿seguía sin resolver a tal
  * corte?") pasa a `_vacioAlCorteHistorico`, que sí necesita reconstruir cuándo (si acaso) se
- * resolvió cada uno vía `_primeraResueltaEfectiva`.
+ * resolvió cada uno vía `_primeraResueltaEfectiva`. `saldoErp` (2026-11-12) viaja para que
+ * `_bucketsAntiguedadAlCorte` netee el monto igual que el camino de hoy.
  */
 async function _antiguedadCandidatosHistorico(baseMatch) {
   return BankMovement.find({
     ...baseMatch,
     status: { $in: ['no_identificado', 'identificado'] },
-  }).select('fecha deposito erpIds identificadoPor primeraIdentificacionAt fichaAt').lean();
+  }).select('fecha deposito erpIds identificadoPor primeraIdentificacionAt fichaAt saldoErp').lean();
 }
 
 // Agrupa los candidatos ya traídos en los 4 rangos fijos, a una fecha de corte dada — reusada
 // tanto por el corte de un solo día (getAntiguedadDepositos) como por cada uno de los 12 cortes
-// de fin de mes del modo año (getAntiguedadDepositosPorAnio), nunca duplicada. Un depósito con
-// fecha POSTERIOR al corte no existía todavía a esa fecha — se excluye (nunca antigüedad
-// negativa).
+// de fin de mes del modo año (getAntiguedadDepositosPorAnio) y por cada día de
+// getAntiguedadPorDiaMesActual, nunca duplicada. Un depósito con fecha POSTERIOR al corte no
+// existía todavía a esa fecha — se excluye (nunca antigüedad negativa).
+//
+// Importe neteado (2026-11-12, mismo criterio que `bank.service.js#saldoRestanteCxC` y que
+// `_calcularLedgerBacklog` para el total en vivo de Cortes): un depósito con vinculación parcial
+// (`saldoErp` seteado, sin cubrir el 100%) solo aporta el residuo real, no el depósito completo —
+// evita inflar el monto "pendiente" con plata que ya tiene una CxC parcialmente cubierta.
 function _bucketsAntiguedadAlCorte(depositos, corte) {
   const unDiaMs = 24 * MS_PER_HOUR;
   const rangos = ANTIGUEDAD_RANGOS.map((rango) => ({ rango, count: 0, saldo: 0 }));
@@ -1588,7 +1605,7 @@ function _bucketsAntiguedadAlCorte(depositos, corte) {
     const inicioDiaDeposito = _inicioDiaMx(_fechaMexicoStr(dep.fecha));
     if (inicioDiaDeposito.getTime() > corte.getTime()) continue;
     const dias = Math.max(0, Math.round((corte.getTime() - inicioDiaDeposito.getTime()) / unDiaMs));
-    const importe = dep.deposito ?? 0;
+    const importe = dep.saldoErp != null ? Math.max(0, (dep.deposito ?? 0) - dep.saldoErp) : (dep.deposito ?? 0);
     const bucket = rangos[_rangoAntiguedad(dias)];
     bucket.count += 1;
     bucket.saldo += importe;
@@ -1696,6 +1713,67 @@ async function getAntiguedadDepositosPorAnio({ banco = null, anio } = {}) {
   }
 
   return { meses };
+}
+
+/**
+ * Serie diaria de Antigüedad del mes EN CURSO + cierre del mes anterior (2026-11-12, pedido
+ * explícito del usuario: "ver cómo avanza la distribución día a día dentro del mes, apilando
+ * barras"). Reusa los mismos candidatos/buckets que getAntiguedadDepositos/
+ * getAntiguedadDepositosPorAnio, nunca duplica la fórmula — 2 consultas a Mongo en total (una para
+ * "hoy" en vivo, una para el resto reconstruido en memoria), nunca una consulta por día.
+ *
+ * SEMÁNTICA DE "CIERRE DE UN DÍA" DISTINTA A PROPÓSITO de `getAntiguedadDepositos({fecha})` (que
+ * usa el INICIO del día pasado como corte, vía `_inicioDiaMx`) — acá cada "Día N" representa el
+ * backlog DESPUÉS de las operaciones de ese día (corte con `_finDiaMx`), mismo criterio que ya usa
+ * el ledger de Cortes para días ya cerrados (ver `_enumerarDiasEnRango`). No es un error de
+ * copy-paste si se nota la diferencia contra `getAntiguedadDepositos`: son 2 preguntas distintas
+ * ("¿cómo estaba el backlog ENTRANDO a ese día?" vs "¿cómo quedó AL CERRAR ese día?") — esta
+ * función responde la segunda, que es la que el usuario pidió para esta serie.
+ *
+ * HOY siempre usa el camino en vivo (`_antiguedadCandidatosHoy`, status/saldoErp actuales
+ * directos) — NUNCA la reconstrucción histórica, mismo criterio ya establecido hoy en
+ * `_estadoAlCierre` (Cortes mensual/diario): para "ahora mismo" el estado actual YA ES la verdad;
+ * reconstruir introduciría los mismos falsos positivos/negativos que ya se depuraron esta sesión.
+ *
+ * @param {object} [opts]
+ * @param {string} [opts.banco]
+ */
+async function getAntiguedadPorDiaMesActual({ banco = null } = {}) {
+  const baseMatch = buildBaseMatch({ banco });
+  const hoyStr = _hoyMexicoStr();
+  const [anioActual, mesActual] = hoyStr.slice(0, 7).split('-').map(Number);
+
+  // Último día de calendario antes del 1ro del mes en curso — aritmética de calendario pura
+  // (Date.UTC como herramienta neutra para sumar/restar días, no un instante real de México;
+  // válido porque México corre en offset fijo -06:00 en todo este archivo, sin horario de verano).
+  const primerDiaMesActualUTC = Date.UTC(anioActual, mesActual - 1, 1);
+  const ultimoDiaMesAnteriorUTC = new Date(primerDiaMesActualUTC - 24 * MS_PER_HOUR);
+  const mesAnteriorStr = `${ultimoDiaMesAnteriorUTC.getUTCFullYear()}-${String(ultimoDiaMesAnteriorUTC.getUTCMonth() + 1).padStart(2, '0')}`;
+  const ultimoDiaMesAnteriorStr = `${mesAnteriorStr}-${String(ultimoDiaMesAnteriorUTC.getUTCDate()).padStart(2, '0')}`;
+
+  const [candidatosHistoricos, candidatosHoy] = await Promise.all([
+    _antiguedadCandidatosHistorico(baseMatch),
+    _antiguedadCandidatosHoy(baseMatch),
+  ]);
+
+  const corteMesAnterior = _finDiaMx(ultimoDiaMesAnteriorStr);
+  const vacioMesAnterior = _vacioAlCorteHistorico(candidatosHistoricos, corteMesAnterior);
+  const cierreMesAnterior = { periodo: mesAnteriorStr, ..._bucketsAntiguedadAlCorte(vacioMesAnterior, corteMesAnterior) };
+
+  const dias = [];
+  const hoyNum = Number(hoyStr.slice(8, 10));
+  for (let d = 1; d <= hoyNum; d++) {
+    const diaStr = `${hoyStr.slice(0, 7)}-${String(d).padStart(2, '0')}`;
+    if (diaStr === hoyStr) {
+      dias.push({ fecha: diaStr, ..._bucketsAntiguedadAlCorte(candidatosHoy, _inicioDiaMx(hoyStr)) });
+      continue;
+    }
+    const corteDia = _finDiaMx(diaStr);
+    const vacioDia = _vacioAlCorteHistorico(candidatosHistoricos, corteDia);
+    dias.push({ fecha: diaStr, ..._bucketsAntiguedadAlCorte(vacioDia, corteDia) });
+  }
+
+  return { cierreMesAnterior, dias };
 }
 
 // Columnas compartidas por las hojas "Mensual"/"Diario" de buildReporteCortes — mismo orden que
@@ -2166,6 +2244,7 @@ module.exports = {
   // Antigüedad del backlog vacío (2026-11-06) — exportadas para testearlas directo.
   getAntiguedadDepositos,
   getAntiguedadDepositosPorAnio,
+  getAntiguedadPorDiaMesActual,
   _antiguedadCandidatosHoy,
   _antiguedadCandidatosHistorico,
   _bucketsAntiguedadAlCorte,

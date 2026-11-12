@@ -6071,6 +6071,25 @@ async function _parametrosRegeneracionIngreso(poliza) {
   return { centroCostoId: centro.id, sucursal: centro.sucursal, fechaInicio, fechaFin };
 }
 
+// Cobranza (2026-11-12, pedido del usuario): una sola póliza por día para
+// TODAS las sucursales, tipo 'D', concepto de `_construirConceptoCobranza`
+// ("Ingresos por Cobranza del Día: dd/mm/aaaa[ al dd/mm/aaaa]").
+const RE_CONCEPTO_COBRANZA = /^Ingresos por Cobranza del Día: (\d{2})\/(\d{2})\/(\d{4})(?: al (\d{2})\/(\d{2})\/(\d{4}))?\s*$/;
+
+/** Parámetros para volver a generar una póliza de Ingreso (I) o de Cobranza (D). */
+async function _parametrosRegeneracion(poliza) {
+  if (poliza.tipo === 'I') {
+    return { ...(await _parametrosRegeneracionIngreso(poliza)), tipoCfdi: 'I', tipoPropuesta: 'I' };
+  }
+  const m = RE_CONCEPTO_COBRANZA.exec(String(poliza.concepto ?? '').trim());
+  if (poliza.tipo !== 'D' || !m) {
+    throw new BadRequestError('Solo se pueden actualizar pólizas de Ingreso o de Cobranza');
+  }
+  const fechaInicio = `${m[3]}-${m[2]}-${m[1]}`;
+  const fechaFin    = m[4] ? `${m[6]}-${m[5]}-${m[4]}` : fechaInicio;
+  return { tipoCfdi: 'P', tipoPropuesta: 'D', centroCostoId: null, sucursal: 'Todas las sucursales', fechaInicio, fechaFin };
+}
+
 async function _uuidsDePoliza(polizaId) {
   const rows = await PolizaMovimiento.findAll({
     where: { polizaId, cfdiUuid: { [Op.ne]: null } }, attributes: ['cfdiUuid'], raw: true,
@@ -6185,14 +6204,13 @@ async function _regenerarPolizaIngresoCore(polizaId, user) {
   const polizaService = require('../polizas/poliza.service');
   const poliza = await Poliza.findByPk(polizaId);
   if (!poliza) throw new BadRequestError('Póliza no encontrada');
-  if (poliza.tipo !== 'I') throw new BadRequestError('Solo se pueden actualizar pólizas de Ingreso');
   if (poliza.estado === 'cancelada') throw new BadRequestError('La póliza está cancelada');
   if (poliza.estado !== 'borrador') {
     throw new BadRequestError('La póliza está contabilizada: revírtela a borrador antes de actualizarla');
   }
-  const params = await _parametrosRegeneracionIngreso(poliza);
+  const params = await _parametrosRegeneracion(poliza);
   const clave = _claveGeneracion({
-    rfc: poliza.rfc, tipoCfdi: 'I', ejercicio: poliza.ejercicio, periodo: poliza.periodo,
+    rfc: poliza.rfc, tipoCfdi: params.tipoCfdi, ejercicio: poliza.ejercicio, periodo: poliza.periodo,
     centroCostoId: params.centroCostoId, fechaInicio: params.fechaInicio, fechaFin: params.fechaFin,
   });
   if (_generacionesEnCurso.has(clave)) {
@@ -6206,13 +6224,15 @@ async function _regenerarPolizaIngresoCore(polizaId, user) {
     contpaqFolioCredito: poliza.contpaqFolioCredito ?? null,
   };
 
-  await polizaService.cancel(poliza.id, user, 'Actualizada: se generó de nuevo con las facturas que llegaron después');
+  await polizaService.cancel(poliza.id, user, params.tipoCfdi === 'P'
+    ? 'Actualizada: se generó de nuevo con los complementos de pago que llegaron después'
+    : 'Actualizada: se generó de nuevo con las facturas que llegaron después');
 
   let res;
   try {
     res = await generarYGuardar({
       rfc: poliza.rfc, ejercicio: poliza.ejercicio, periodo: poliza.periodo,
-      tipoCfdi: 'I', tipoPropuesta: 'I',
+      tipoCfdi: params.tipoCfdi, tipoPropuesta: params.tipoPropuesta,
       centroCostoId: params.centroCostoId, fechaInicio: params.fechaInicio, fechaFin: params.fechaFin,
       user,
     });
@@ -8311,7 +8331,7 @@ async function desgloseAnticiposAplicados({ rfc, series, folios, centroCostoId, 
 }
 
 module.exports = {
-  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso, facturasTardiasDePolizas, _parametrosRegeneracionIngreso,
+  generarPropuesta, generarYGuardar, generarYGuardarPorSucursal, regenerarPolizaIngreso, facturasTardiasDePolizas, _parametrosRegeneracionIngreso, _parametrosRegeneracion,
   generarYGuardarPorDia, generarYGuardarPorSucursalYDia,
   desgloseAnticiposAplicados,
   _uuidsPorFechaEfectiva,

@@ -86,17 +86,18 @@ function _depositos(secciones) {
 }
 
 /**
- * TIPO de un movimiento del historial de Kore respecto al renglón (2026-11-12):
+ * TIPO de un movimiento del historial de Kore respecto al renglón (2026-11-12;
+ * nombres del usuario: "PAGO INICIAL" en vez de "este pago", los demás pagos "ABONO"):
  *   DEVOLUCIÓN / BONIFICACIÓN / AJUSTE — RET sin forma de pago (origen DEV,
  *     BON u otro): no es dinero, NO suma en ABONOS ANTERIORES (caso INTI CESAR,
  *     RET-261002931 de DEV-058156 $247.52 inflaba FACTURADO).
- *   CARGO — importe negativo (sube el saldo).
- *   ESTE PAGO — el depósito del renglón (mismo ID NUMO; sin ID NUMO, mismo día
+ *   CARGO — importe negativo: sube el saldo (p. ej. un abono cancelado o un cheque devuelto).
+ *   PAGO INICIAL — el depósito del renglón (mismo ID NUMO; sin ID NUMO, mismo día
  *     y mismo importe). Kore puede registrarlo días después que el banco.
  *   ABONO ANTERIOR — pago real de un día anterior al renglón que no es renglón
  *     propio en el resumen: es lo que suma en ABONOS ANTERIORES.
- *   OTRO PAGO — pago que sale como su propio renglón en el resumen, o del mismo día.
- *   PAGO POSTERIOR — pago real de un día posterior al renglón.
+ *   ABONO — pago que sale como su propio renglón en el resumen, o del mismo día.
+ *   ABONO POSTERIOR — pago real de un día posterior al renglón.
  */
 const ORIGEN_TIPO = { DEV: 'DEVOLUCIÓN', BON: 'BONIFICACIÓN' };
 function tipoMovimiento(a, d, dia, idsEnResumen) {
@@ -106,12 +107,12 @@ function tipoMovimiento(a, d, dia, idsEnResumen) {
   if (origen) return ORIGEN_TIPO[origen[1].toUpperCase()] ?? 'AJUSTE';
   const diaMov = _diaMx(a.fecha);
   const id = String(a.idNumo ?? '');
-  if (id && id === String(d.idNumo ?? '')) return 'ESTE PAGO';
-  if (!id && diaMov === dia && Math.abs(imp - (Number(d.importe) || 0)) < 0.05) return 'ESTE PAGO';
-  if (id && idsEnResumen.has(id)) return 'OTRO PAGO';
-  if (!dia || !diaMov) return 'OTRO PAGO';
+  if (id && id === String(d.idNumo ?? '')) return 'PAGO INICIAL';
+  if (!id && diaMov === dia && Math.abs(imp - (Number(d.importe) || 0)) < 0.05) return 'PAGO INICIAL';
+  if (id && idsEnResumen.has(id)) return 'ABONO';
+  if (!dia || !diaMov) return 'ABONO';
   if (diaMov < dia) return 'ABONO ANTERIOR';
-  return diaMov > dia ? 'PAGO POSTERIOR' : 'OTRO PAGO';
+  return diaMov > dia ? 'ABONO POSTERIOR' : 'ABONO';
 }
 
 /**
@@ -161,7 +162,7 @@ function filasResumen(secciones, formaPagoDe) {
 
 // Color del TIPO: lo que suma en verde/azul; devoluciones y bonificaciones en ámbar.
 const COLOR_TIPO = {
-  'ABONO ANTERIOR': 'FF15803D', 'ESTE PAGO': 'FF1D4ED8', DEVOLUCIÓN: 'FFB45309', BONIFICACIÓN: 'FFB45309',
+  'ABONO ANTERIOR': 'FF15803D', 'PAGO INICIAL': 'FF1D4ED8', DEVOLUCIÓN: 'FFB45309', BONIFICACIÓN: 'FFB45309',
   AJUSTE: 'FFB45309', CARGO: 'FFB91C1C',
 };
 
@@ -213,7 +214,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
       const row = ws.addRow([...valores, ...mov]);
       if (k === 0) n = row.number;
       for (const c of [7, 8, 9, 10, 20, 24, 27]) row.getCell(c).numFmt = DINERO;
-      if (a) row.getCell(23).font = { bold: a.tipo === 'ABONO ANTERIOR' || a.tipo === 'ESTE PAGO', color: { argb: COLOR_TIPO[a.tipo] ?? 'FF374151' } };
+      if (a) row.getCell(23).font = { bold: a.tipo === 'ABONO ANTERIOR' || a.tipo === 'PAGO INICIAL', color: { argb: COLOR_TIPO[a.tipo] ?? 'FF374151' } };
       for (const c of [14, 18, 21, 22]) row.getCell(c).numFmt = 'd/m/yy';
       row.getCell(19).font = { bold: true, color: { argb: f.estatus === 'PAGADA' ? 'FF15803D' : f.estatus === 'ABONADA' ? 'FFB45309' : 'FF6B7280' } };
     }

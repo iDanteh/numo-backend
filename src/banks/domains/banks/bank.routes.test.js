@@ -60,6 +60,7 @@ jest.mock('./bank-indicadores.service', () => ({
   getUltimosMovimientos: jest.fn(),
   getAntiguedadDepositos: jest.fn(),
   getAntiguedadDepositosPorAnio: jest.fn(),
+  getAntiguedadPorDiaMesActual: jest.fn(),
   buildReporteCortes: jest.fn(),
   listarDescargasCorte: jest.fn(),
   descargarReporteCorteHistorico: jest.fn(),
@@ -841,6 +842,49 @@ describe('GET /cortes/antiguedad (2026-11-06: antigüedad del backlog vacío, po
 
     expect(indicadoresService.getAntiguedadDepositosPorAnio).toHaveBeenCalled();
     expect(indicadoresService.getAntiguedadDepositos).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /cortes/antiguedad-por-dia (2026-11-12: serie diaria del mes en curso + cierre del mes anterior)', () => {
+  let app;
+  const FAKE_SERIE = {
+    cierreMesAnterior: { periodo: '2026-09', rangos: [], total: { count: 1, saldo: 300 } },
+    dias: [{ fecha: '2026-10-01', rangos: [], total: { count: 1, saldo: 300 } }],
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    indicadoresService.getAntiguedadPorDiaMesActual.mockResolvedValue(FAKE_SERIE);
+    app = express();
+    app.use(express.json());
+    app.use('/', router);
+  });
+
+  test('responde 403 sin banks:read', async () => {
+    const res = await request(app)
+      .get('/cortes/antiguedad-por-dia')
+      .set('x-test-permissions', JSON.stringify([]));
+    expect(res.status).toBe(403);
+    expect(indicadoresService.getAntiguedadPorDiaMesActual).not.toHaveBeenCalled();
+  });
+
+  test('con banks:read pasa banco al service y devuelve la serie', async () => {
+    const res = await request(app)
+      .get('/cortes/antiguedad-por-dia')
+      .query({ banco: 'BBVA' })
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(JSON.parse(JSON.stringify(FAKE_SERIE)));
+    expect(indicadoresService.getAntiguedadPorDiaMesActual).toHaveBeenCalledWith({ banco: 'BBVA' });
+  });
+
+  test('sin ?banco: se pasa null', async () => {
+    await request(app)
+      .get('/cortes/antiguedad-por-dia')
+      .set('x-test-permissions', JSON.stringify([PERMISSIONS.BANKS_READ]));
+
+    expect(indicadoresService.getAntiguedadPorDiaMesActual).toHaveBeenCalledWith({ banco: null });
   });
 });
 

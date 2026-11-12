@@ -377,7 +377,7 @@ async function excel(id, seccion) {
   const r = await obtener(id);
   if (!r.datos) throw new ConflictError('El reporte todavía se está calculando');
   const workbook = new ExcelJS.Workbook();
-  if (!agregarHojasSeccion(workbook, r.secciones, seccion)) {
+  if (!agregarHojasSeccion(workbook, r.secciones, seccion, { fechaInicio: r.fechaInicio, fechaFin: r.fechaFin, sucursal: r.sucursal })) {
     workbook.addWorksheet(seccion ? SECCIONES[seccion].hoja : 'POR FACTURAR').addRow(['Sin depósitos en esta sección para el rango.']);
   }
   const rango = r.fechaInicio === r.fechaFin ? r.fechaInicio : `${r.fechaInicio}_${r.fechaFin}`;

@@ -245,7 +245,7 @@ async function _prefetchDoctosPago(cfdiConRegla, rfc) {
         // puede liquidar varios tickets: Kore repite el total del pago en
         // `fp.monto` de cada uno) — ver cobranza-ficha-efectivo.service.js.
         const grupoPago = `${cobro.claveCentro ?? ''}|${String(cobro.fecha ?? '').slice(0, 16)}|${(Number(fp.monto) || 0).toFixed(2)}`;
-        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null, claveCentro: cobro.claveCentro ?? null, grupoPago });
+        if (monto > 0) formasPago.push({ monto, claveSat: (fp.claveSat ?? '').trim() || null, nombre: fp.nombre ?? null, claveCentro: cobro.claveCentro ?? null, grupoPago });
       }
     }
     return formasPago;
@@ -585,10 +585,15 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
           // efectivo del día quedaba corto $6,498.00). Va a Caja (y de ahí al
           // efectivo del día, `_efectivoABanco`); solo lo demás (transferencia,
           // depósito, tarjeta) sigue contra Depósitos No Identificados.
+          // Ojo: "DEPÓSITO EN EFECTIVO" / "DEP. EFECTIVO" también viene con
+          // claveSat '01', pero es dinero depositado en el banco (puede ser del
+          // mes anterior y reportado después) → ese SÍ sigue la regla NI.
+          // Regla del usuario (2026-11-12): en efectivo, el NI solo aplica a
+          // depósitos/transferencias hechos el mes pasado y cobrados después.
           let restanteNI = restanteLinea;
           if (puedeSplitReal) {
             for (const fp of desgloseFactura) {
-              if (fp.claveSat !== '01') continue;
+              if (fp.claveSat !== '01' || /\bdep(\.|[oó]sito)?\s*(en\s*)?efectivo/i.test(fp.nombre ?? '')) continue;
               const montoEf = Math.min(Math.round((Number(fp.monto) || 0) * 100) / 100, restanteNI);
               if (montoEf <= 0) continue;
               cargoReal(fp, montoEf);

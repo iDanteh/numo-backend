@@ -102,6 +102,7 @@ function _depositos(secciones) {
  *   ABONO POSTERIOR — pago real de un día posterior al renglón.
  */
 const ORIGEN_TIPO = { DEV: 'DEVOLUCIÓN', BON: 'BONIFICACIÓN' };
+const TIPOS_ABONO = new Set(['ABONO ANTERIOR', 'ABONO', 'ABONO POSTERIOR']);
 function tipoMovimiento(a, d, dia, idsEnResumen) {
   const imp = Number(a.importe) || 0;
   if (imp < 0) return 'CARGO';
@@ -212,7 +213,14 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
     const altura = Math.max(f.movimientos.length, 1);
     const venta = ['Kore', f.forma, f.serie, f.folio, f.factura, f.cliente, f.importe, f.abonosAnteriores, null, null, null, null, null,
       _dia(f.fecha), f.idNumo, f.banco,
-      f.abonos.length || null, f.abonos.length ? _dia(f.abonos[f.abonos.length - 1].dia) : null,
+      // No. ABONOS / ÚLTIMO ABONO (2026-11-12, usuario: "¿por qué sale vacía?"):
+      // TODOS los abonos de dinero de la remisión (anteriores, en otro renglón
+      // y posteriores; no el pago inicial ni devoluciones / bonificaciones), no
+      // solo los que suman en ABONOS ANTERIORES. 0 si tiene historial y ninguno.
+      ...(() => {
+        const todos = f.movimientos.filter(m => TIPOS_ABONO.has(m.tipo));
+        return [f.movimientos.length ? todos.length : null, todos.length ? _dia(todos[todos.length - 1].dia) : null];
+      })(),
       f.totalVenta, f.estatus, f.saldo, _dia(f.pagadaEl)];
     let n = null;
     for (let k = 0; k < altura; k++) {

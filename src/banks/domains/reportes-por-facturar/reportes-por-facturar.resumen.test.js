@@ -4,7 +4,7 @@
 const ExcelJS = require('exceljs');
 const { armarSecciones, agregarHojasSeccion, formaPagoDe } = require('./reportes-por-facturar.secciones');
 const AdmZip = require('adm-zip');
-const { filasResumen, aplicarCombinadas } = require('./reportes-por-facturar.resumen');
+const { filasResumen, aplicarCombinadas, tipoMovimiento } = require('./reportes-por-facturar.resumen');
 
 const datos = {
   movimientosMostrador: [{
@@ -21,10 +21,13 @@ const datos = {
   depositosPendientesFactura: [],
   depositosPendientesPago: [
     { remisiones: ['I0-261000010'], cliente: 'JUANA', importe: 400, idNumo: '054010', banco: 'AZTECA', fecha: '2026-11-10T00:00:00Z', saldo: 50, formasPago: { efectivo: 400 },
+      // Historial completo: la devolución y la bonificación NO son abonos (caso INTI CESAR, 2026-11-12).
       historialAbonos: [{ remision: 'I0-261000010', saldo: 50, abonos: [
-        { fecha: '2026-11-03T17:00:00Z', movimiento: 'ABO-0', forma: 'TRANSFERENCIA', importe: 100, saldo: 700 },
-        { fecha: '2026-11-05T17:00:00Z', movimiento: 'ABO-1', forma: 'EFECTIVO', importe: 250, saldo: 450 },
-        { fecha: '2026-11-10T17:00:00Z', movimiento: 'ABO-2', forma: 'EFECTIVO', importe: 400, saldo: 50, idNumo: '054010' },
+        { fecha: '2026-11-03T17:00:00Z', movimiento: 'ABO-0', forma: 'TRANSFERENCIA', importe: 100, saldo: 750 },
+        { fecha: '2026-11-04T17:00:00Z', movimiento: 'RET-5', forma: 'DE DEV-1', importe: 30, saldo: 720 },
+        { fecha: '2026-11-05T17:00:00Z', movimiento: 'ABO-1', forma: 'EFECTIVO', importe: 250, saldo: 470 },
+        { fecha: '2026-11-12T17:00:00Z', movimiento: 'ABO-2', forma: 'EFECTIVO', importe: 400, saldo: 70, idNumo: '054010' },
+        { fecha: '2026-11-12T18:00:00Z', movimiento: 'RET-6', forma: 'DE BON-2', importe: 20, saldo: 50 },
       ] }] },
   ],
 };
@@ -56,32 +59,52 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect(fila(5).getCell(10).value.result || 0).toBe(0); // 01 DEP: sin BN
   expect(fila(7).getCell(10).value.result).toBe(200);
   expect(fila(7).getCell(9).value).toEqual({ formula: 'G7+H7-J7', result: 800 });
-  // JUANA: 2 abonos anteriores → 2 sub-renglones (8 y 9), A–U combinadas.
+  // JUANA: 5 movimientos en Kore → 5 sub-renglones (8–12), A–U combinadas.
+  // Solo los 2 pagos anteriores suman (350); la devolución no.
   expect(fila(8).getCell(10).value.result).toBe(150); // (400 + 350) × 20 %
   expect(fila(8).getCell(9).value.result).toBe(600);
   expect(fila(8).getCell(17).value).toBe(2);
   expect(fila(8).getCell(18).value).toEqual(new Date('2026-11-05T12:00:00Z'));
   expect([19, 20, 21].map(c => fila(8).getCell(c).value)).toEqual(['ABONADA', 50, null]);
   expect([19, 20, 21].map(c => fila(7).getCell(c).value)).toEqual(['PAGADA', 0, new Date('2026-11-09T12:00:00Z')]);
-  expect([22, 23, 24, 25, 26].map(c => fila(8).getCell(c).value)).toEqual([new Date('2026-11-03T12:00:00Z'), 100, 'ABO-0', 'TRANSFERENCIA', 700]);
-  expect([22, 23, 24, 25, 26].map(c => fila(9).getCell(c).value)).toEqual([new Date('2026-11-05T12:00:00Z'), 250, 'ABO-1', 'EFECTIVO', 450]);
+  expect(fila(4).getCell(27).value).toBe('SALDO DESPUÉS DE ESTE MOVIMIENTO');
+  const mov = n => [22, 23, 24, 25, 26, 27].map(c => fila(n).getCell(c).value);
+  expect(mov(7)).toEqual([new Date('2026-11-09T12:00:00Z'), 'ESTE PAGO', 1000, 'CPF-9', '', 0]);
+  expect([8, 9, 10, 11, 12].map(mov)).toEqual([
+    [new Date('2026-11-03T12:00:00Z'), 'ABONO ANTERIOR', 100, 'ABO-0', 'TRANSFERENCIA', 750],
+    [new Date('2026-11-04T12:00:00Z'), 'DEVOLUCIÓN', 30, 'RET-5', 'DE DEV-1', 720],
+    [new Date('2026-11-05T12:00:00Z'), 'ABONO ANTERIOR', 250, 'ABO-1', 'EFECTIVO', 470],
+    [new Date('2026-11-12T12:00:00Z'), 'ESTE PAGO', 400, 'ABO-2', 'EFECTIVO', 70], // Kore lo registró 2 días después
+    [new Date('2026-11-12T12:00:00Z'), 'BONIFICACIÓN', 20, 'RET-6', 'DE BON-2', 50],
+  ]);
   // Combinadas sin perder el texto de abajo (para los filtros); importes solo arriba.
   const rangos = wb._combinadasOcultas[0].rangos;
   expect(rangos).toHaveLength(21); // A–U de JUANA
-  expect(rangos).toEqual(expect.arrayContaining(['C8:C9', 'U8:U9']));
+  expect(rangos).toEqual(expect.arrayContaining(['C8:C12', 'U8:U12']));
   expect(rangos.some(r => r.startsWith('V'))).toBe(false);
   // En el .xlsx: <mergeCells> después de <autoFilter> y el texto de abajo se conserva.
   const xml = new AdmZip(aplicarCombinadas(await wb.xlsx.writeBuffer(), wb)).getEntry(`xl/worksheets/sheet${ws.id}.xml`).getData().toString('utf8');
-  expect(xml).toMatch(/<autoFilter ref="A4:Z9"\/><mergeCells count="21"><mergeCell ref="A8:A9"\/>/);
-  expect(xml).toMatch(/<c r="F9"[^>]*t="(s|str|inlineStr)"/);
-  expect([fila(9).getCell(3).value, fila(9).getCell(6).value, fila(9).getCell(7).value, fila(9).getCell(9).value]).toEqual(['I0', 'JUANA', null, null]);
-  const tot = fila(11);
+  expect(xml).toMatch(/<autoFilter ref="A4:AA12"\/><mergeCells count="21"><mergeCell ref="A8:A12"\/>/);
+  expect(xml).toMatch(/<c r="F12"[^>]*t="(s|str|inlineStr)"/);
+  expect([fila(12).getCell(3).value, fila(12).getCell(6).value, fila(12).getCell(7).value, fila(12).getCell(9).value]).toEqual(['I0', 'JUANA', null, null]);
+  const tot = fila(14);
   expect(tot.getCell(6).value).toBe('TOTALES');
-  expect(tot.getCell(7).value).toEqual({ formula: 'SUBTOTAL(9,G5:G9)', result: 1900 });
+  expect(tot.getCell(7).value).toEqual({ formula: 'SUBTOTAL(9,G5:G12)', result: 1900 });
   expect(tot.getCell(8).value.result).toBe(350);
   expect(tot.getCell(10).value.result).toBe(350);
-  expect(tot.getCell(23).value).toEqual({ formula: 'SUBTOTAL(9,W5:W9)', result: 350 });
-  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 9, column: 26 } });
+  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 12, column: 27 } });
+});
+
+test('TIPO de movimiento: caso real INTI CESAR A0-261000641 (depósito 057403 del 9-nov)', () => {
+  const d = { idNumo: '057403', importe: 1264 };
+  const tipo = a => tipoMovimiento(a, d, '2026-11-09', new Set(['057403']));
+  expect(tipo({ fecha: '2026-10-06T01:27:39Z', forma: 'DE DEV-058156', importe: 247.52 })).toBe('DEVOLUCIÓN');
+  expect(tipo({ fecha: '2026-11-11T23:03:56Z', forma: 'DEPOSITO EN EFECTIVO', importe: 1264, idNumo: '057403' })).toBe('ESTE PAGO');
+  expect(tipo({ fecha: '2026-11-11T23:44:49Z', forma: 'DE BON-326705', importe: 74.77 })).toBe('BONIFICACIÓN');
+  expect(tipo({ fecha: '2026-10-20T17:00:00Z', forma: 'EFECTIVO', importe: 100 })).toBe('ABONO ANTERIOR');
+  expect(tipo({ fecha: '2026-11-15T17:00:00Z', forma: 'TRANSFERENCIA', importe: 100 })).toBe('PAGO POSTERIOR');
+  expect(tipo({ fecha: '2026-10-20T17:00:00Z', forma: 'DE XYZ-1', importe: 5 })).toBe('AJUSTE');
+  expect(tipo({ fecha: '2026-10-20T17:00:00Z', forma: 'X', importe: -5 })).toBe('CARGO');
 });
 
 test('el Excel completo incluye la hoja RESUMEN al final', async () => {

@@ -158,7 +158,7 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
 
   // ── Cuadre (mismas fórmulas que su hoja) ─────────────────────────────────────
   // Izquierda: formas de pago (efectivo sobre lo cobrado, las demás sobre lo
-  // facturado) y efectivo por cajera (se llena al capturar la columna Caja).
+  // facturado).
   // Derecha: facturación y otros movimientos ("LIR" en Observaciones).
   const sumIf = (colCrit, crit, colSuma) => `SUMIF($${colCrit}$${primera}:$${colCrit}$${ultima},"${crit}",$${colSuma}$${primera}:$${colSuma}$${ultima})`;
   const resultado = (crit, colSuma) => _r2(filas.filter(f => f.forma === crit).reduce((s, f) => s + (colSuma === 'G' ? f.importe : facturadoDe(f)), 0));
@@ -176,12 +176,10 @@ function agregarHojaResumen(workbook, secciones, formaPagoDe, meta = {}, nombre 
   const inicio = ws.lastRow.number + 1;
   const filaTotalValores = inicio + izquierda.length;
   const filaEfe = inicio + 1;
-  const cajeras = ['MARISOL', 'ELIZABETH', 'MARITZA'];
   izquierda.push(['Total Valores', { formula: `SUM(B${inicio + 1}:B${filaTotalValores - 1})`, result: _r2(izquierda.slice(1).reduce((s, [, v]) => s + v.result, 0)) }, true]);
-  izquierda.push([null]);
-  for (const c of cajeras) izquierda.push([`Efectivo (01) ${c[0]}${c.slice(1).toLowerCase()}`, { formula: sumIf('M', c, 'G'), result: 0 }]);
-  const filaPrimeraCajera = filaTotalValores + 2;
-  izquierda.push(['Efectivo por Entregar', { formula: `B${filaEfe}-SUM(B${filaPrimeraCajera}:B${filaPrimeraCajera + cajeras.length - 1})`, result: izquierda[1][1].result }, true]);
+  // Sin "Efectivo (01) Marisol / Elizabeth / Maritza" ni "Efectivo por
+  // Entregar" (2026-11-12, usuario: "no iría, no se sabe por caja" — Kore no
+  // dice qué cajera cobró).
 
   const totKore = totI;
   const liquidacion = 0;

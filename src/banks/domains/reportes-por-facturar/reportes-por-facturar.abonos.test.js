@@ -60,8 +60,9 @@ test('Excel: un renglón por abono debajo del depósito y SALDADA / PENDIENTE al
     fecha: '2026-10-15T00:00:00Z', descripcion: 'DEP EFECTIVO', importe: 1663.32, banco: 'BBVA', remisiones: ['A0-260902996'], cliente: 'JUAN', idNumo: '053049',
     historialAbonos: [{ remision: 'A0-260902996', abonos: ABONOS_2996, saldo: 0, saldadaEl: '2026-10-30T17:24:14Z' }],
   };
-  const secciones = { mostrador: [{ serie: 'A0', sucursal: 'CEDIS', bloques: [{ tipo: 'pendiente', fecha: '2026-10-30', grupos: [{ cliente: 'JUAN', depositos: [d], total: 1663.32 }], total: 1663.32 }] }] };
-  expect(agregarHojasSeccion(wb, secciones, 'mostrador')).toBe(true);
+  // En REF. sigue el historial debajo (MOSTRADOR ya no: ver la prueba de abajo).
+  const secciones = { ref: [{ serie: 'A0', sucursal: 'CEDIS', bloques: [{ fecha: '2026-10-30', grupos: [{ cliente: 'JUAN', depositos: [d], total: 1663.32 }], total: 1663.32 }] }] };
+  expect(agregarHojasSeccion(wb, secciones, 'ref')).toBe(true);
   const filas = [];
   wb.worksheets[0].eachRow(r => filas.push(r.values.slice(1)));
   const i = filas.findIndex(f => f[2] === 'DEP EFECTIVO');
@@ -77,4 +78,31 @@ test('Excel: un renglón por abono debajo del depósito y SALDADA / PENDIENTE al
   expect(filas[i + 3][2]).toBe('✔ SALDADA EL 30/10/26');
   // La agrupación sigue: subtotal del cliente.
   expect(filas[i + 4][1]).toBe('Subtotal JUAN');
+});
+
+test('MOSTRADOR: sin abonos debajo, con ESTATUS SALDADA / ABONADA y saldo (2026-11-12)', () => {
+  const ExcelJS = require('exceljs');
+  const { agregarHojasSeccion } = require('./reportes-por-facturar.secciones');
+  const wb = new ExcelJS.Workbook();
+  const saldada = {
+    fecha: '2026-10-15T00:00:00Z', descripcion: 'DEP EFECTIVO', importe: 1663.32, banco: 'BBVA', remisiones: ['A0-260902996'], cliente: 'JUAN', idNumo: '053049',
+    historialAbonos: [{ remision: 'A0-260902996', abonos: ABONOS_2996, saldo: 0, saldadaEl: '2026-10-30T17:24:14Z' }],
+  };
+  const abonada = {
+    fecha: '2026-10-16T00:00:00Z', descripcion: 'SPEI', importe: 500, banco: 'BBVA', remisiones: ['A0-260900001'], cliente: 'LUIS', idNumo: '053050',
+    historialAbonos: [{ remision: 'A0-260900001', abonos: [{ fecha: '2026-10-16T17:00:00Z', movimiento: 'ABO-1', importe: 500, saldo: 120 }], saldo: 120, saldadaEl: null }],
+  };
+  const secciones = { mostrador: [{ serie: 'A0', sucursal: 'CEDIS', bloques: [{ tipo: 'global', serie: 'A0', factura: 'A0-1', fechaFactura: '2026-10-30T18:00:00Z',
+    grupos: [{ cliente: 'JUAN', depositos: [saldada], total: 1663.32 }, { cliente: 'LUIS', depositos: [abonada], total: 500 }], total: 2163.32 }] }] };
+  expect(agregarHojasSeccion(wb, secciones, 'mostrador')).toBe(true);
+  const filas = [];
+  wb.worksheets[0].eachRow(r => filas.push(r.values.slice(1)));
+  const enc = filas.findIndex(f => f[0] === 'FECHA');
+  expect(filas[enc].slice(8)).toEqual(['ESTATUS', 'SALDO PENDIENTE', 'SALDADA EL']);
+  // Depósito → directo su subtotal (sin renglones de abonos ni "✔ SALDADA EL").
+  expect(filas[enc + 1].slice(8)).toEqual(['SALDADA', undefined, new Date('2026-10-30T12:00:00Z')]);
+  expect(filas[enc + 2][1]).toBe('Subtotal JUAN');
+  expect(filas[enc + 3].slice(8)).toEqual(['ABONADA', 120]);
+  expect(filas[enc + 4][1]).toBe('Subtotal LUIS');
+  expect(filas.some(f => String(f[2] ?? '').startsWith('↳'))).toBe(false);
 });

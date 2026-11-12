@@ -53,7 +53,12 @@ test('Excel: fórmulas BN 20 % solo en 01 y FACTURADO = cobrado + abonos − BN'
   expect(tot.getCell(6).value).toBe('TOTALES');
   expect(tot.getCell(7).value).toEqual({ formula: 'SUBTOTAL(9,G5:G8)', result: 1900 });
   expect(tot.getCell(10).value.result).toBe(330);
-  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 8, column: 16 } });
+  expect(ws.autoFilter).toEqual({ from: { row: 4, column: 1 }, to: { row: 8, column: 19 } });
+  // Abonos anteriores: cuántos, último y la fecha de cada uno (solo el de días anteriores).
+  expect(fila(8).getCell(17).value).toBe(1);
+  expect(fila(8).getCell(18).value).toEqual(new Date('2026-11-05T12:00:00Z'));
+  expect(fila(8).getCell(19).value).toBe('5/11/26 $250.00 · ABO-1 · EFECTIVO');
+  expect(fila(7).getCell(17).value).toBeNull();
 });
 
 test('el Excel completo incluye la hoja RESUMEN al final', async () => {

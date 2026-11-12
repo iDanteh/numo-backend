@@ -672,7 +672,16 @@ function cfdiToMovimientosCobranza(cfdi, rule, cuentaMap, context = {}) {
     // caían a Bancos por identificar en vez de Caja).
     const esEfectivoCfdi = (cfdi.formaPago ?? cfdi.complementoPago?.pagos?.[0]?.formaDePagoP ?? '') === '01';
     const cuentaCargoFallback = (esEfectivoCfdi ? cuentaMap[CODIGO_CUENTA_CAJA] : cuentaMap[CODIGO_CUENTA_BANCOS]) ?? cuentaMap[rule.cuentaCargo] ?? null;
-    movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true });
+    // Uuid de la FACTURA que liquida el Pago (2026-11-11, caso IRAN MARINO
+    // SAGUILAN VASQUEZ, Pago A0-261101641, regla 7B-mixto): el export cruza el
+    // depósito real por `facturaUuid` (bank_movements.erpLinks.folioFiscal es
+    // el de la factura, no el del Pago) — sin él, un Pago de regla mixta se
+    // quedaba en "Bancos por identificar" aunque su depósito (BBVA 057027)
+    // estuviera identificado. Solo con UNA factura: con varias no hay un solo
+    // depósito al cual atribuir este renglón agregado.
+    const facturasDelPago = [...new Set((context.doctosPago ?? []).map(d => d.idDocumento).filter(Boolean))];
+    const facturaUuidUnica = facturasDelPago.length === 1 ? facturasDelPago[0] : null;
+    movs.push({ cuentaId: cuentaCargoFallback, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: montoCargo, haber: 0, cfdiUuid: cfdi.uuid, rfcTercero, _esCargoPrincipal: true, ...(facturaUuidUnica ? { facturaUuid: facturaUuidUnica } : {}) });
     movs.push({ cuentaId: cuentaMap[rule.cuentaAbono] ?? null, concepto: conceptoPago, centroCosto, ventaFecha, serie: serieCfdi, debe: 0, haber: montoAbonoFinal, cfdiUuid: cfdi.uuid, rfcTercero });
   }
 

@@ -135,7 +135,10 @@ function filasResumen(secciones, formaPagoDe) {
     const movimientos = (d.historialAbonos ?? []).flatMap(h => (h.abonos ?? []).map(a => ({
       fecha: a.fecha ?? null, dia: _diaMx(a.fecha), tipo: tipoMovimiento(a, d, dia, idsEnResumen),
       importe: _r2(a.importe), movimiento: a.movimiento ?? '', forma: a.forma ?? '', remision: h.remision, saldo: a.saldo ?? null,
-    }))).sort((x, y) => String(x.fecha ?? '').localeCompare(String(y.fecha ?? '')));
+    // Orden (2026-11-12, usuario: "está desordenado" → eligió "pago inicial
+    // primero"): el PAGO INICIAL arriba y después lo demás por fecha.
+    }))).sort((x, y) => (y.tipo === 'PAGO INICIAL') - (x.tipo === 'PAGO INICIAL')
+      || String(x.fecha ?? '').localeCompare(String(y.fecha ?? '')));
     const abonos = movimientos.filter(m => m.tipo === 'ABONO ANTERIOR');
     // Importe total de la venta = lo que debía antes del primer movimiento
     // (saldo después + importe), sumado por remisión. Sin historial: no se sabe.
